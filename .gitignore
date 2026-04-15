@@ -1,0 +1,25 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.dylib
+
+# IDE / editor
+.cache/
+.vscode/
+.idea/
+*.swp
+*~
+compile_commands.json
+
+# macOS
+.DS_Store
+
+# Rust / Cargo
+tui/target/
+tui/Cargo.lock
+
+# Test artifacts
+/tmp/stratum_test_*
+*.stm

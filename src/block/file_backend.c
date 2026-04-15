@@ -1,0 +1,112 @@
+#include "stratum/block.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <string.h>
+
+struct file_ctx {
+    FILE *fp;
+    uint64_t size;
+};
+
+static int file_read(void *ctx, uint64_t offset, void *buf, uint32_t len)
+{
+    struct file_ctx *fc = ctx;
+    if (fseek(fc->fp, (long)offset, SEEK_SET) != 0)
+        return -errno;
+    size_t n = fread(buf, 1, len, fc->fp);
+    if (n != len)
+        return ferror(fc->fp) ? -EIO : -EIO;
+    return 0;
+}
+
+static int file_write(void *ctx, uint64_t offset, const void *buf, uint32_t len)
+{
+    struct file_ctx *fc = ctx;
+    if (fseek(fc->fp, (long)offset, SEEK_SET) != 0)
+        return -errno;
+    size_t n = fwrite(buf, 1, len, fc->fp);
+    if (n != len)
+        return -EIO;
+    return 0;
+}
+
+static int file_sync(void *ctx)
+{
+    struct file_ctx *fc = ctx;
+    if (fflush(fc->fp) != 0)
+        return -errno;
+    return 0;
+}
+
+static void file_close(void *ctx)
+{
+    struct file_ctx *fc = ctx;
+    if (fc->fp)
+        fclose(fc->fp);
+    free(fc);
+}
+
+static int file_size(void *ctx, uint64_t *out_bytes)
+{
+    struct file_ctx *fc = ctx;
+    *out_bytes = fc->size;
+    return 0;
+}
+
+static int file_resize(void *ctx, uint64_t new_size)
+{
+    struct file_ctx *fc = ctx;
+    if (fseek(fc->fp, (long)(new_size - 1), SEEK_SET) != 0)
+        return -errno;
+    if (fputc(0, fc->fp) == EOF)
+        return -errno;
+    fc->size = new_size;
+    return 0;
+}
+
+static const struct stm_block_ops file_ops = {
+    .read   = file_read,
+    .write  = file_write,
+    .sync   = file_sync,
+    .close  = file_close,
+    .size   = file_size,
+    .resize = file_resize,
+};
+
+int stm_file_backend_open(const char *path, int create, uint64_t size,
+                          struct stm_block_dev *dev)
+{
+    struct file_ctx *fc = calloc(1, sizeof(*fc));
+    if (!fc)
+        return -ENOMEM;
+
+    if (create) {
+        fc->fp = fopen(path, "w+b");
+        if (!fc->fp) {
+            free(fc);
+            return -errno;
+        }
+        /* Extend file to requested size */
+        if (fseek(fc->fp, (long)(size - 1), SEEK_SET) != 0 ||
+            fputc(0, fc->fp) == EOF) {
+            fclose(fc->fp);
+            free(fc);
+            return -errno;
+        }
+        fc->size = size;
+    } else {
+        fc->fp = fopen(path, "r+b");
+        if (!fc->fp) {
+            free(fc);
+            return -errno;
+        }
+        fseek(fc->fp, 0, SEEK_END);
+        fc->size = (uint64_t)ftell(fc->fp);
+    }
+
+    dev->ops = &file_ops;
+    dev->ctx = fc;
+    return 0;
+}

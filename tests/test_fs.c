@@ -1,0 +1,257 @@
+#include "test_main.h"
+#include "stratum/fs.h"
+
+#include <unistd.h>
+#include <errno.h>
+
+static const char *img = "/tmp/stratum_test_fs.img";
+static void cleanup(void) { unlink(img); }
+
+/* ── format + open + stat root ──────────────────────────────────────── */
+
+STM_TEST(test_fs_create_open)
+{
+    int rc = stm_fs_create(img, 64 * 1024 * 1024, NULL);
+    STM_ASSERT_EQ(rc, 0);
+
+    struct stm_fs *fs;
+    rc = stm_fs_open(img, NULL, &fs);
+    STM_ASSERT_EQ(rc, 0);
+
+    struct stm_inode root;
+    rc = stm_fs_stat(fs, STM_ROOT_INO, &root);
+    STM_ASSERT_EQ(rc, 0);
+    STM_ASSERT_EQ(le64_to_cpu(root.si_ino), (uint64_t)STM_ROOT_INO);
+    STM_ASSERT((le32_to_cpu(root.si_mode) & STM_S_IFMT) == (uint32_t)STM_S_IFDIR);
+
+    stm_fs_close(fs);
+    cleanup();
+}
+
+/* ── mkdir + readdir ────────────────────────────────────────────────── */
+
+struct dir_entry {
+    char name[256];
+    uint64_t ino;
+    uint8_t type;
+};
+
+struct dir_list {
+    struct dir_entry entries[64];
+    int count;
+};
+
+static int collect_dir(const char *name, uint64_t ino, uint8_t type, void *ctx)
+{
+    struct dir_list *dl = ctx;
+    if (dl->count < 64) {
+        strncpy(dl->entries[dl->count].name, name, 255);
+        dl->entries[dl->count].ino = ino;
+        dl->entries[dl->count].type = type;
+        dl->count++;
+    }
+    return 0;
+}
+
+STM_TEST(test_fs_mkdir_readdir)
+{
+    stm_fs_create(img, 64 * 1024 * 1024, NULL);
+    struct stm_fs *fs;
+    stm_fs_open(img, NULL, &fs);
+
+    uint64_t ino_a, ino_b;
+    int rc = stm_fs_mkdir(fs, STM_ROOT_INO, "alpha", 0755, &ino_a);
+    STM_ASSERT_EQ(rc, 0);
+    rc = stm_fs_mkdir(fs, STM_ROOT_INO, "beta", 0755, &ino_b);
+    STM_ASSERT_EQ(rc, 0);
+    STM_ASSERT(ino_a != ino_b);
+
+    /* readdir */
+    struct dir_list dl;
+    memset(&dl, 0, sizeof(dl));
+    rc = stm_fs_readdir(fs, STM_ROOT_INO, collect_dir, &dl);
+    STM_ASSERT_EQ(rc, 0);
+    STM_ASSERT_EQ(dl.count, 2);
+
+    stm_fs_close(fs);
+    cleanup();
+}
+
+/* ── lookup ─────────────────────────────────────────────────────────── */
+
+STM_TEST(test_fs_lookup)
+{
+    stm_fs_create(img, 64 * 1024 * 1024, NULL);
+    struct stm_fs *fs;
+    stm_fs_open(img, NULL, &fs);
+
+    uint64_t ino;
+    stm_fs_mkdir(fs, STM_ROOT_INO, "docs", 0755, &ino);
+
+    uint64_t found;
+    int rc = stm_fs_lookup(fs, STM_ROOT_INO, "docs", &found);
+    STM_ASSERT_EQ(rc, 0);
+    STM_ASSERT_EQ(found, ino);
+
+    rc = stm_fs_lookup(fs, STM_ROOT_INO, "nope", &found);
+    STM_ASSERT_EQ(rc, -ENOENT);
+
+    stm_fs_close(fs);
+    cleanup();
+}
+
+/* ── file write + read ──────────────────────────────────────────────── */
+
+STM_TEST(test_fs_file_io)
+{
+    stm_fs_create(img, 64 * 1024 * 1024, NULL);
+    struct stm_fs *fs;
+    stm_fs_open(img, NULL, &fs);
+
+    uint64_t ino;
+    int rc = stm_fs_create_file(fs, STM_ROOT_INO, "hello.txt", 0644, &ino);
+    STM_ASSERT_EQ(rc, 0);
+
+    const char *data = "Hello, Stratum filesystem!";
+    rc = stm_fs_write(fs, ino, 0, data, (uint32_t)strlen(data));
+    STM_ASSERT_EQ(rc, 0);
+
+    char buf[256];
+    uint32_t nread = 0;
+    memset(buf, 0, sizeof(buf));
+    rc = stm_fs_read(fs, ino, 0, buf, sizeof(buf), &nread);
+    STM_ASSERT_EQ(rc, 0);
+    STM_ASSERT_EQ(nread, (uint32_t)strlen(data));
+    STM_ASSERT_MEM_EQ(buf, data, strlen(data));
+
+    /* check inode size */
+    struct stm_inode st;
+    stm_fs_stat(fs, ino, &st);
+    STM_ASSERT_EQ(le64_to_cpu(st.si_size), (uint64_t)strlen(data));
+
+    stm_fs_close(fs);
+    cleanup();
+}
+
+/* ── large file spanning multiple chunks ────────────────────────────── */
+
+STM_TEST(test_fs_large_write)
+{
+    stm_fs_create(img, 128 * 1024 * 1024, NULL);
+    struct stm_fs *fs;
+    stm_fs_open(img, NULL, &fs);
+
+    uint64_t ino;
+    stm_fs_create_file(fs, STM_ROOT_INO, "big.bin", 0644, &ino);
+
+    /* write 10 KiB of patterned data (spans 3 chunks at 4K each) */
+    uint32_t size = 10240;
+    uint8_t *wbuf = malloc(size);
+    uint32_t i;
+    for (i = 0; i < size; i++) wbuf[i] = (uint8_t)(i & 0xFF);
+
+    int rc = stm_fs_write(fs, ino, 0, wbuf, size);
+    STM_ASSERT_EQ(rc, 0);
+
+    uint8_t *rbuf = calloc(1, size);
+    uint32_t nread = 0;
+    rc = stm_fs_read(fs, ino, 0, rbuf, size, &nread);
+    STM_ASSERT_EQ(rc, 0);
+    STM_ASSERT_EQ(nread, size);
+    STM_ASSERT_MEM_EQ(wbuf, rbuf, size);
+
+    /* partial read from middle of file */
+    uint32_t mid_read = 0;
+    memset(rbuf, 0, 100);
+    rc = stm_fs_read(fs, ino, 5000, rbuf, 100, &mid_read);
+    STM_ASSERT_EQ(rc, 0);
+    STM_ASSERT_EQ(mid_read, 100u);
+    STM_ASSERT_MEM_EQ(rbuf, wbuf + 5000, 100);
+
+    free(wbuf);
+    free(rbuf);
+    stm_fs_close(fs);
+    cleanup();
+}
+
+/* ── unlink ─────────────────────────────────────────────────────────── */
+
+STM_TEST(test_fs_unlink)
+{
+    stm_fs_create(img, 64 * 1024 * 1024, NULL);
+    struct stm_fs *fs;
+    stm_fs_open(img, NULL, &fs);
+
+    uint64_t ino;
+    stm_fs_create_file(fs, STM_ROOT_INO, "tmp.txt", 0644, &ino);
+
+    int rc = stm_fs_unlink(fs, STM_ROOT_INO, "tmp.txt");
+    STM_ASSERT_EQ(rc, 0);
+
+    uint64_t found;
+    rc = stm_fs_lookup(fs, STM_ROOT_INO, "tmp.txt", &found);
+    STM_ASSERT_EQ(rc, -ENOENT);
+
+    stm_fs_close(fs);
+    cleanup();
+}
+
+/* ── sync + reopen persistence ──────────────────────────────────────── */
+
+STM_TEST(test_fs_persist)
+{
+    stm_fs_create(img, 64 * 1024 * 1024, NULL);
+
+    {
+        struct stm_fs *fs;
+        stm_fs_open(img, NULL, &fs);
+
+        uint64_t ino;
+        stm_fs_mkdir(fs, STM_ROOT_INO, "persist", 0755, &ino);
+        stm_fs_create_file(fs, STM_ROOT_INO, "data.txt", 0644, &ino);
+        stm_fs_write(fs, ino, 0, "saved", 5);
+
+        int rc = stm_fs_sync(fs);
+        STM_ASSERT_EQ(rc, 0);
+        stm_fs_close(fs);
+    }
+
+    /* reopen and verify */
+    {
+        struct stm_fs *fs;
+        int rc = stm_fs_open(img, NULL, &fs);
+        STM_ASSERT_EQ(rc, 0);
+
+        uint64_t dir_ino;
+        rc = stm_fs_lookup(fs, STM_ROOT_INO, "persist", &dir_ino);
+        STM_ASSERT_EQ(rc, 0);
+
+        uint64_t file_ino;
+        rc = stm_fs_lookup(fs, STM_ROOT_INO, "data.txt", &file_ino);
+        STM_ASSERT_EQ(rc, 0);
+
+        char buf[32] = {0};
+        uint32_t nread = 0;
+        rc = stm_fs_read(fs, file_ino, 0, buf, sizeof(buf), &nread);
+        STM_ASSERT_EQ(rc, 0);
+        STM_ASSERT_EQ(nread, 5u);
+        STM_ASSERT_MEM_EQ(buf, "saved", 5);
+
+        stm_fs_close(fs);
+    }
+    cleanup();
+}
+
+int main(void)
+{
+    STM_SUITE("fs");
+    STM_RUN(test_fs_create_open);
+    STM_RUN(test_fs_mkdir_readdir);
+    STM_RUN(test_fs_lookup);
+    STM_RUN(test_fs_file_io);
+    STM_RUN(test_fs_large_write);
+    STM_RUN(test_fs_unlink);
+    STM_RUN(test_fs_persist);
+    printf("all passed\n");
+    return 0;
+}
