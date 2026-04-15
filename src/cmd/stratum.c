@@ -57,6 +57,18 @@ static uint64_t parse_size(const char *s)
 
 /* ── 9P socket server ───────────────────────────────────────────────── */
 
+/* read exactly `len` bytes, looping on partial reads */
+static int read_exact(int fd, void *buf, size_t len)
+{
+    size_t done = 0;
+    while (done < len) {
+        ssize_t n = read(fd, (uint8_t *)buf + done, len - done);
+        if (n <= 0) return -1;
+        done += (size_t)n;
+    }
+    return 0;
+}
+
 static int serve_client(int fd, struct stm_fs *fs)
 {
     struct stm_9p *srv = NULL;
@@ -71,22 +83,17 @@ static int serve_client(int fd, struct stm_fs *fs)
     if (!req || !resp) { rc = -1; goto out; }
 
     while (running) {
-        uint8_t hdr[4];
-        ssize_t n;
         uint32_t size, resp_len;
 
-        /* read 4-byte size */
-        n = read(fd, hdr, 4);
-        if (n <= 0) break;
-        if (n < 4) { rc = -1; break; }
+        /* read 4-byte size header */
+        if (read_exact(fd, req, 4) != 0) break;
 
-        size = (uint32_t)hdr[0] | ((uint32_t)hdr[1] << 8) |
-               ((uint32_t)hdr[2] << 16) | ((uint32_t)hdr[3] << 24);
+        size = (uint32_t)req[0] | ((uint32_t)req[1] << 8) |
+               ((uint32_t)req[2] << 16) | ((uint32_t)req[3] << 24);
         if (size < 7 || size > msize) { rc = -1; break; }
 
-        memcpy(req, hdr, 4);
-        n = read(fd, req + 4, size - 4);
-        if (n < (ssize_t)(size - 4)) { rc = -1; break; }
+        /* read rest of message */
+        if (read_exact(fd, req + 4, size - 4) != 0) { rc = -1; break; }
 
         resp_len = msize;
         stm_9p_handle(srv, req, size, resp, &resp_len);
@@ -95,9 +102,9 @@ static int serve_client(int fd, struct stm_fs *fs)
         {
             uint32_t written = 0;
             while (written < resp_len) {
-                n = write(fd, resp + written, resp_len - written);
-                if (n <= 0) { rc = -1; goto out; }
-                written += (uint32_t)n;
+                ssize_t w = write(fd, resp + written, resp_len - written);
+                if (w <= 0) { rc = -1; goto out; }
+                written += (uint32_t)w;
             }
         }
     }
