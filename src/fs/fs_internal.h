@@ -13,6 +13,14 @@
 #include <string.h>
 #include <errno.h>
 
+/* On-disk extent record — stored as btree value for DATA keys.
+ * Points to file data blocks on disk. */
+struct __attribute__((packed)) stm_extent {
+    le64 se_paddr;   /* physical byte address of data on disk */
+    le32 se_dlen;    /* logical data length (before encryption) */
+};
+STM_STATIC_ASSERT(sizeof(struct stm_extent) == 12, stm_extent_size);
+
 struct stm_fs {
     struct stm_block_dev dev;
     struct stm_btree    *tree;

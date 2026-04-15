@@ -13,11 +13,12 @@
 #define STM_S_IFDIR  0040000
 #define STM_S_IFREG  0100000
 
-/* Data chunk size for inline file data.
- * Larger = fewer btree entries = much faster bulk I/O.
- * 64 KiB gives ~11K entries for 746MB vs 186K at 4KB. */
-#define STM_DATA_CHUNK    65536
-#define STM_NAME_MAX      255
+/* Extent-based data storage: file data lives on disk blocks outside the
+ * btree.  The btree stores 12-byte extent records pointing to the data.
+ * 128 KiB per extent = 32 blocks; 746 MB file = ~5,800 btree entries. */
+#define STM_EXTENT_SIZE    131072
+#define STM_EXTENT_BLOCKS  (STM_EXTENT_SIZE / 4096)
+#define STM_NAME_MAX       255
 
 /* Dirent type tags */
 #define STM_DT_REG   1

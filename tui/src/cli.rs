@@ -49,6 +49,16 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        // SIGTERM for graceful shutdown (server syncs before exit)
+        unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM); }
+        // Give the server up to 10s to sync and exit gracefully
+        for _ in 0..100 {
+            match self.child.try_wait() {
+                Ok(Some(_)) => { let _ = std::fs::remove_file(&self.sock); return; }
+                _ => std::thread::sleep(Duration::from_millis(100)),
+            }
+        }
+        // Force kill if still alive
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_file(&self.sock);
@@ -93,7 +103,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let root_fid = client.attach("user", "")?;
     eprintln!("[cli] connected.");
 
-    match cmd.as_str() {
+    let result = match cmd.as_str() {
         "ls" => cmd_ls(&mut client, root_fid, rest),
         "mkdir" => cmd_mkdir(&mut client, root_fid, rest),
         "rm" => cmd_rm(&mut client, root_fid, rest),
@@ -101,7 +111,14 @@ pub fn run(args: &[String]) -> Result<()> {
         "cp-out" => cmd_cp_out(&mut client, root_fid, rest),
         "snap" => cmd_snap(&mut client, root_fid, rest),
         _ => bail!("unknown command: {cmd}"),
-    }
+    };
+
+    // Drop client first (closes 9P connection), then wait for server to sync.
+    // The server calls stm_fs_sync after the client disconnects.
+    drop(client);
+    // Now Server drops (SIGTERM) — sync is already done.
+
+    result
 }
 
 fn cmd_ls(c: &mut P9Client, root: u32, args: &[String]) -> Result<()> {
@@ -156,8 +173,11 @@ fn cmd_cp_in(c: &mut P9Client, root: u32, args: &[String]) -> Result<()> {
     let total = data.len();
     eprintln!("[cli] {} bytes, writing to stratum:/{dest_name}...", total);
 
-    // create file
+    // remove existing file if present, then create
     let dir_fid = c.walk(root, &[])?;
+    if let Ok(old_fid) = c.walk(root, &[&dest_name]) {
+        let _ = c.remove(old_fid);
+    }
     c.create(dir_fid, &dest_name, 0o644, ORDWR)?;
 
     // write in chunks

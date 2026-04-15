@@ -50,4 +50,16 @@ int stm_btree_walk_from(struct stm_btree *tree, struct stm_bptr root,
                         int (*visit)(uint64_t paddr, uint32_t csize, void *ctx),
                         void *ctx);
 
+/* Walk every node AND leaf entry / message.  entry_cb is called for each
+ * leaf entry and each INSERT message in internal nodes (may be NULL). */
+int stm_btree_walk_entries(struct stm_btree *tree, struct stm_bptr root,
+                           int (*visit)(uint64_t paddr, uint32_t csize, void *ctx),
+                           int (*entry_cb)(const struct stm_key *key,
+                                           const void *val, uint32_t vlen,
+                                           void *ctx),
+                           void *ctx);
+
+/* Access the tree's crypto context (NULL if unencrypted). */
+struct stm_crypto *stm_btree_get_crypto(struct stm_btree *tree);
+
 #endif /* STM_BTREE_H */

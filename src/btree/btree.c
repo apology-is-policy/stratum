@@ -311,6 +311,10 @@ static int flush_node(struct stm_btree *tree, struct stm_node *parent);
  * Split `child` (leaf or internal), write both halves with COW,
  * and insert the new pivot into `parent`.  Frees `child`.
  */
+/*
+ * Split `child` (leaf or internal), write both halves with COW,
+ * and insert the new pivot into `parent`.  Frees `child`.
+ */
 static int split_child(struct stm_btree *tree, struct stm_node *parent,
                        uint32_t child_idx, struct stm_node *child)
 {
@@ -662,4 +666,71 @@ int stm_btree_walk_from(struct stm_btree *tree, struct stm_bptr root,
 {
     if (stm_bptr_is_null(&root)) return 0;
     return walk_rec(tree, &root, visit, ctx);
+}
+
+/* ── walk with leaf-entry visitor ──────────────────────────────────── */
+
+static int walk_entries_rec(struct stm_btree *tree, struct stm_bptr *bptr,
+                            int (*visit)(uint64_t, uint32_t, void *),
+                            int (*entry_cb)(const struct stm_key *, const void *,
+                                            uint32_t, void *),
+                            void *ctx)
+{
+    struct stm_node *node;
+    uint32_t i;
+    int rc;
+
+    if (stm_bptr_is_null(bptr)) return 0;
+
+    rc = visit(le64_to_cpu(bptr->bp_paddr), le32_to_cpu(bptr->bp_csize), ctx);
+    if (rc) return rc;
+
+    rc = stm_btree_read_node(tree, bptr, &node);
+    if (rc) return rc;
+
+    if (node->flags & STM_NODE_LEAF) {
+        if (entry_cb) {
+            for (i = 0; i < node->nentries; i++) {
+                rc = entry_cb(&node->entries[i].key,
+                              node->entries[i].val,
+                              node->entries[i].vlen, ctx);
+                if (rc) { stm_node_free(node); return rc; }
+            }
+        }
+    } else {
+        /* Visit extent records in buffered messages too */
+        if (entry_cb) {
+            for (i = 0; i < node->nmsgs; i++) {
+                if (node->msgs[i].op == STM_MSG_INSERT) {
+                    rc = entry_cb(&node->msgs[i].key,
+                                  node->msgs[i].val,
+                                  node->msgs[i].vlen, ctx);
+                    if (rc) { stm_node_free(node); return rc; }
+                }
+            }
+        }
+        for (i = 0; i <= node->nkeys; i++) {
+            rc = walk_entries_rec(tree, &node->children[i],
+                                 visit, entry_cb, ctx);
+            if (rc) { stm_node_free(node); return rc; }
+        }
+    }
+    stm_node_free(node);
+    return 0;
+}
+
+int stm_btree_walk_entries(struct stm_btree *tree, struct stm_bptr root,
+                           int (*visit)(uint64_t paddr, uint32_t csize, void *ctx),
+                           int (*entry_cb)(const struct stm_key *key,
+                                           const void *val, uint32_t vlen,
+                                           void *ctx),
+                           void *ctx)
+{
+    if (stm_bptr_is_null(&root)) return 0;
+    return walk_entries_rec(tree, &root, visit, entry_cb, ctx);
+}
+
+struct stm_crypto *stm_btree_get_crypto(struct stm_btree *tree)
+{
+    return tree->crypto;
 }

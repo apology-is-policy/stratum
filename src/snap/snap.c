@@ -8,19 +8,53 @@
 #define fnv1a    stm_fnv1a
 
 /* allocator callbacks for snapshot refcount management */
-static int ref_block(uint64_t paddr, uint32_t csize, void *ctx)
+static int ref_block_fs(uint64_t paddr, uint32_t csize, void *ctx)
 {
-    struct stm_alloc *a = ctx;
+    struct stm_fs *fs = ctx;
     uint32_t nb = (csize + STM_BLOCK_SIZE - 1) / STM_BLOCK_SIZE;
-    stm_alloc_ref(a, paddr / STM_BLOCK_SIZE, nb);
+    stm_alloc_ref(fs->alloc, paddr / STM_BLOCK_SIZE, nb);
     return 0;
 }
 
-static int free_block(uint64_t paddr, uint32_t csize, void *ctx)
+static int ref_extent_entry(const struct stm_key *key, const void *val,
+                            uint32_t vlen, void *ctx)
 {
-    struct stm_alloc *a = ctx;
+    struct stm_fs *fs = ctx;
+    struct stm_key_cpu kc = stm_key_to_cpu(key);
+    if (kc.type != STM_KEY_DATA || vlen != sizeof(struct stm_extent))
+        return 0;
+    struct stm_extent ext;
+    memcpy(&ext, val, sizeof(ext));
+    struct stm_crypto *crypto = stm_btree_get_crypto(fs->tree);
+    uint32_t dlen = le32_to_cpu(ext.se_dlen);
+    uint32_t disk_len = crypto ? (dlen + STM_CRYPTO_TAG_LEN) : dlen;
+    uint32_t nb = (disk_len + STM_BLOCK_SIZE - 1) / STM_BLOCK_SIZE;
+    stm_alloc_ref(fs->alloc, le64_to_cpu(ext.se_paddr) / STM_BLOCK_SIZE, nb);
+    return 0;
+}
+
+static int free_block_fs(uint64_t paddr, uint32_t csize, void *ctx)
+{
+    struct stm_fs *fs = ctx;
     uint32_t nb = (csize + STM_BLOCK_SIZE - 1) / STM_BLOCK_SIZE;
-    stm_alloc_free(a, paddr / STM_BLOCK_SIZE, nb);
+    stm_alloc_free(fs->alloc, paddr / STM_BLOCK_SIZE, nb);
+    return 0;
+}
+
+static int free_extent_entry(const struct stm_key *key, const void *val,
+                             uint32_t vlen, void *ctx)
+{
+    struct stm_fs *fs = ctx;
+    struct stm_key_cpu kc = stm_key_to_cpu(key);
+    if (kc.type != STM_KEY_DATA || vlen != sizeof(struct stm_extent))
+        return 0;
+    struct stm_extent ext;
+    memcpy(&ext, val, sizeof(ext));
+    struct stm_crypto *crypto = stm_btree_get_crypto(fs->tree);
+    uint32_t dlen = le32_to_cpu(ext.se_dlen);
+    uint32_t disk_len = crypto ? (dlen + STM_CRYPTO_TAG_LEN) : dlen;
+    uint32_t nb = (disk_len + STM_BLOCK_SIZE - 1) / STM_BLOCK_SIZE;
+    stm_alloc_free(fs->alloc, le64_to_cpu(ext.se_paddr) / STM_BLOCK_SIZE, nb);
     return 0;
 }
 
@@ -167,7 +201,8 @@ int stm_snap_create(struct stm_fs *fs, const char *name, uint64_t *out_id)
     /* increment refcounts on all blocks in the snapshotted tree,
      * so COW doesn't reclaim shared blocks */
     if (fs->alloc) {
-        stm_btree_walk_from(fs->tree, snap.ssp_root, ref_block, fs->alloc);
+        stm_btree_walk_entries(fs->tree, snap.ssp_root,
+                               ref_block_fs, ref_extent_entry, fs);
     }
 
     if (out_id) *out_id = id;
@@ -274,7 +309,8 @@ int stm_snap_delete(struct stm_fs *fs, uint64_t snap_id)
 
     /* decrement refcounts on all blocks in the snapshot's tree */
     if (fs->alloc) {
-        stm_btree_walk_from(fs->tree, snap.ssp_root, free_block, fs->alloc);
+        stm_btree_walk_entries(fs->tree, snap.ssp_root,
+                               free_block_fs, free_extent_entry, fs);
     }
 
     /* remove snapshot descriptor and name index */

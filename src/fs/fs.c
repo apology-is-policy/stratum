@@ -9,12 +9,32 @@
 #define mk_key   stm_mk_key
 #define fnv1a    stm_fnv1a
 
-/* allocator reconstruction callbacks */
-static int mark_block(uint64_t paddr, uint32_t csize, void *ctx)
+/* ── allocator reconstruction callbacks ─────────────────────────────── */
+
+static int mark_block_fs(uint64_t paddr, uint32_t csize, void *ctx)
 {
-    struct stm_alloc *a = ctx;
+    struct stm_fs *fs = ctx;
     uint32_t nblocks = (csize + STM_BLOCK_SIZE - 1) / STM_BLOCK_SIZE;
-    stm_alloc_mark(a, paddr / STM_BLOCK_SIZE, nblocks);
+    stm_alloc_mark(fs->alloc, paddr / STM_BLOCK_SIZE, nblocks);
+    return 0;
+}
+
+/* Also mark blocks referenced by extent records in DATA entries. */
+static int mark_extent_entry(const struct stm_key *key, const void *val,
+                             uint32_t vlen, void *ctx)
+{
+    struct stm_fs *fs = ctx;
+    struct stm_key_cpu kc = stm_key_to_cpu(key);
+    if (kc.type != STM_KEY_DATA || vlen != sizeof(struct stm_extent))
+        return 0;
+    struct stm_extent ext;
+    memcpy(&ext, val, sizeof(ext));
+    struct stm_crypto *crypto = stm_btree_get_crypto(fs->tree);
+    uint64_t paddr = le64_to_cpu(ext.se_paddr);
+    uint32_t dlen  = le32_to_cpu(ext.se_dlen);
+    uint32_t disk_len = crypto ? (dlen + STM_CRYPTO_TAG_LEN) : dlen;
+    uint32_t nblocks = (disk_len + STM_BLOCK_SIZE - 1) / STM_BLOCK_SIZE;
+    stm_alloc_mark(fs->alloc, paddr / STM_BLOCK_SIZE, nblocks);
     return 0;
 }
 
@@ -26,7 +46,8 @@ static int walk_snap_cb(const struct stm_key *key, const void *val,
     (void)key;
     if (vlen < sizeof(snap)) return 0;
     memcpy(&snap, val, sizeof(snap));
-    stm_btree_walk_from(fs->tree, snap.ssp_root, mark_block, fs->alloc);
+    stm_btree_walk_entries(fs->tree, snap.ssp_root,
+                           mark_block_fs, mark_extent_entry, fs);
     return 0;
 }
 
@@ -319,12 +340,13 @@ int stm_fs_open(const char *path, const char *passphrase, struct stm_fs **out)
                    stm_block_close(&fs->dev); free(fs); return rc; }
         /* mark superblock blocks */
         stm_alloc_mark(fs->alloc, 0, 2);
-        /* walk main tree */
-        stm_btree_walk_from(fs->tree, stm_btree_root(fs->tree), mark_block, fs->alloc);
+        /* walk main tree — marks btree node blocks AND data extent blocks */
+        stm_btree_walk_entries(fs->tree, stm_btree_root(fs->tree),
+                               mark_block_fs, mark_extent_entry, fs);
         /* walk snapshot tree */
         if (fs->snap_tree)
-            stm_btree_walk_from(fs->snap_tree, stm_btree_root(fs->snap_tree),
-                                mark_block, fs->alloc);
+            stm_btree_walk_entries(fs->snap_tree, stm_btree_root(fs->snap_tree),
+                                   mark_block_fs, mark_extent_entry, fs);
         /* walk each snapshot's saved tree */
         if (fs->snap_tree) {
             struct stm_key lo = stm_mk_key(0, STM_KEY_SNAP, 0);
@@ -505,6 +527,71 @@ int stm_fs_create_file(struct stm_fs *fs, uint64_t parent_ino,
                         STM_DT_REG, out_ino);
 }
 
+/* ── extent helpers ─────────────────────────────────────────────────── */
+
+static int extent_write_data(struct stm_fs *fs, const void *data,
+                             uint32_t dlen, struct stm_extent *out_ext)
+{
+    struct stm_crypto *crypto = stm_btree_get_crypto(fs->tree);
+    uint32_t disk_len = crypto ? (dlen + STM_CRYPTO_TAG_LEN) : dlen;
+    uint32_t nblocks = (disk_len + STM_BLOCK_SIZE - 1) / STM_BLOCK_SIZE;
+    uint64_t paddr;
+    int rc;
+
+    rc = stm_alloc_extent(fs->alloc, nblocks, &paddr);
+    if (rc) return rc;
+
+    if (crypto) {
+        uint8_t *cipher = malloc(disk_len);
+        uint32_t clen;
+        if (!cipher) return -ENOMEM;
+        rc = stm_crypto_encrypt(crypto, paddr, data, dlen, cipher, &clen);
+        if (rc) { free(cipher); return rc; }
+        rc = stm_block_write(&fs->dev, paddr, cipher, clen);
+        free(cipher);
+    } else {
+        rc = stm_block_write(&fs->dev, paddr, data, dlen);
+    }
+    if (rc) return rc;
+
+    out_ext->se_paddr = cpu_to_le64(paddr);
+    out_ext->se_dlen  = cpu_to_le32(dlen);
+    return 0;
+}
+
+static int extent_read_data(struct stm_fs *fs, const struct stm_extent *ext,
+                            void *buf, uint32_t buf_len)
+{
+    struct stm_crypto *crypto = stm_btree_get_crypto(fs->tree);
+    uint64_t paddr = le64_to_cpu(ext->se_paddr);
+    uint32_t dlen  = le32_to_cpu(ext->se_dlen);
+    int rc;
+
+    if (crypto) {
+        uint32_t disk_len = dlen + STM_CRYPTO_TAG_LEN;
+        uint8_t *cipher = malloc(disk_len);
+        uint32_t plain_len;
+        if (!cipher) return -ENOMEM;
+        rc = stm_block_read(&fs->dev, paddr, cipher, disk_len);
+        if (rc) { free(cipher); return rc; }
+        rc = stm_crypto_decrypt(crypto, paddr, cipher, disk_len, buf, &plain_len);
+        free(cipher);
+        return rc;
+    }
+    rc = stm_block_read(&fs->dev, paddr, buf, dlen < buf_len ? dlen : buf_len);
+    return rc;
+}
+
+static void extent_free_blocks(struct stm_fs *fs, const struct stm_extent *ext)
+{
+    struct stm_crypto *crypto = stm_btree_get_crypto(fs->tree);
+    uint64_t paddr = le64_to_cpu(ext->se_paddr);
+    uint32_t dlen  = le32_to_cpu(ext->se_dlen);
+    uint32_t disk_len = crypto ? (dlen + STM_CRYPTO_TAG_LEN) : dlen;
+    uint32_t nblocks = (disk_len + STM_BLOCK_SIZE - 1) / STM_BLOCK_SIZE;
+    stm_alloc_free(fs->alloc, paddr / STM_BLOCK_SIZE, nblocks);
+}
+
 /* ── file I/O ───────────────────────────────────────────────────────── */
 
 int stm_fs_write(struct stm_fs *fs, uint64_t ino, uint64_t offset,
@@ -516,48 +603,67 @@ int stm_fs_write(struct stm_fs *fs, uint64_t ino, uint64_t offset,
     int rc;
 
     while (remaining > 0) {
-        uint64_t chunk_off = pos & ~((uint64_t)(STM_DATA_CHUNK - 1));
-        uint32_t inner     = (uint32_t)(pos - chunk_off);
-        uint32_t towrite   = STM_DATA_CHUNK - inner;
+        uint64_t ext_off = pos & ~((uint64_t)(STM_EXTENT_SIZE - 1));
+        uint32_t inner   = (uint32_t)(pos - ext_off);
+        uint32_t towrite = STM_EXTENT_SIZE - inner;
         if (towrite > remaining) towrite = remaining;
 
-        struct stm_key k = mk_key(ino, STM_KEY_DATA, chunk_off);
-        uint8_t chunk[STM_DATA_CHUNK];
+        struct stm_key k = mk_key(ino, STM_KEY_DATA, ext_off);
+        uint8_t *ebuf;
+        struct stm_extent old_ext, new_ext;
+        uint32_t extent_data_len;
+        int had_old = 0;
 
-        if (inner != 0 || towrite != STM_DATA_CHUNK) {
-            /* partial chunk: read-modify-write */
-            uint32_t vlen = STM_DATA_CHUNK;
-            rc = stm_btree_lookup(fs->tree, &k, chunk, &vlen);
-            if (rc == -ENOENT) { memset(chunk, 0, STM_DATA_CHUNK); vlen = 0; }
-            else if (rc < 0) return rc;
-            /* extend with zeros if needed */
-            if (vlen < inner + towrite) memset(chunk + vlen, 0, inner + towrite - vlen);
-        }
+        ebuf = malloc(STM_EXTENT_SIZE);
+        if (!ebuf) return -ENOMEM;
 
-        memcpy(chunk + inner, src, towrite);
-
-        {
-            uint32_t clen = inner + towrite;
-            if (clen < STM_DATA_CHUNK) {
-                /* store only what we need */
+        if (inner != 0 || towrite != (uint32_t)STM_EXTENT_SIZE) {
+            /* partial extent: read-modify-write */
+            uint32_t vlen = sizeof(old_ext);
+            rc = stm_btree_lookup(fs->tree, &k, &old_ext, &vlen);
+            if (rc == -ENOENT) {
+                memset(ebuf, 0, STM_EXTENT_SIZE);
+                extent_data_len = inner + towrite;
+            } else if (rc < 0) {
+                free(ebuf); return rc;
+            } else {
+                had_old = 1;
+                rc = extent_read_data(fs, &old_ext, ebuf, STM_EXTENT_SIZE);
+                if (rc) { free(ebuf); return rc; }
+                extent_data_len = le32_to_cpu(old_ext.se_dlen);
+                if (extent_data_len < inner + towrite)
+                    extent_data_len = inner + towrite;
             }
-            rc = stm_btree_insert(fs->tree, &k, chunk, clen, fs->gen);
-            if (rc) return rc;
+        } else {
+            /* full extent write — check if overwriting */
+            uint32_t vlen = sizeof(old_ext);
+            rc = stm_btree_lookup(fs->tree, &k, &old_ext, &vlen);
+            if (rc == 0) had_old = 1;
+            extent_data_len = STM_EXTENT_SIZE;
         }
+
+        memcpy(ebuf + inner, src, towrite);
+
+        rc = extent_write_data(fs, ebuf, extent_data_len, &new_ext);
+        free(ebuf);
+        if (rc) return rc;
+
+        if (had_old) extent_free_blocks(fs, &old_ext);
+
+        rc = stm_btree_insert(fs->tree, &k, &new_ext, sizeof(new_ext), fs->gen);
+        if (rc) return rc;
 
         src       += towrite;
         pos       += towrite;
         remaining -= towrite;
     }
 
-    /* update inode size — batched: first write + every 1 MiB crossing.
-     * The 9P server does a final precise update on clunk for correctness. */
+    /* update inode size — batched: first write + every 1 MiB crossing */
     {
         uint64_t new_end = offset + len;
         int do_update = 0;
-        if (offset == 0) do_update = 1;  /* first write always updates */
+        if (offset == 0) do_update = 1;
         else {
-            /* update when crossing a 1 MiB boundary */
             uint64_t prev_mb = offset >> 20;
             uint64_t curr_mb = new_end >> 20;
             if (curr_mb > prev_mb) do_update = 1;
@@ -567,7 +673,7 @@ int stm_fs_write(struct stm_fs *fs, uint64_t ino, uint64_t offset,
             rc = read_inode(fs, ino, &in);
             if (rc) return rc;
             if (new_end > le64_to_cpu(in.si_size)) {
-                in.si_size       = cpu_to_le64(new_end);
+                in.si_size = cpu_to_le64(new_end);
                 rc = write_inode(fs, ino, &in);
                 if (rc) return rc;
             }
@@ -596,25 +702,32 @@ int stm_fs_read(struct stm_fs *fs, uint64_t ino, uint64_t offset,
     remaining = len;
 
     while (remaining > 0) {
-        uint64_t chunk_off = pos & ~((uint64_t)(STM_DATA_CHUNK - 1));
-        uint32_t inner     = (uint32_t)(pos - chunk_off);
-        uint32_t toread    = STM_DATA_CHUNK - inner;
+        uint64_t ext_off = pos & ~((uint64_t)(STM_EXTENT_SIZE - 1));
+        uint32_t inner   = (uint32_t)(pos - ext_off);
+        uint32_t toread  = STM_EXTENT_SIZE - inner;
         if (toread > remaining) toread = remaining;
 
-        struct stm_key k = mk_key(ino, STM_KEY_DATA, chunk_off);
-        uint8_t chunk[STM_DATA_CHUNK];
-        uint32_t vlen = STM_DATA_CHUNK;
+        struct stm_key k = mk_key(ino, STM_KEY_DATA, ext_off);
+        struct stm_extent ext;
+        uint32_t vlen = sizeof(ext);
 
-        rc = stm_btree_lookup(fs->tree, &k, chunk, &vlen);
+        rc = stm_btree_lookup(fs->tree, &k, &ext, &vlen);
         if (rc == -ENOENT) {
             memset(dst, 0, toread);  /* sparse: zeros */
         } else if (rc < 0) {
             return rc;
         } else {
-            uint32_t avail = (vlen > inner) ? vlen - inner : 0;
-            uint32_t copy  = (toread < avail) ? toread : avail;
-            if (copy > 0) memcpy(dst, chunk + inner, copy);
+            uint8_t *ebuf = malloc(STM_EXTENT_SIZE);
+            uint32_t dlen, avail, copy;
+            if (!ebuf) return -ENOMEM;
+            rc = extent_read_data(fs, &ext, ebuf, STM_EXTENT_SIZE);
+            if (rc) { free(ebuf); return rc; }
+            dlen = le32_to_cpu(ext.se_dlen);
+            avail = (dlen > inner) ? dlen - inner : 0;
+            copy  = (toread < avail) ? toread : avail;
+            if (copy > 0) memcpy(dst, ebuf + inner, copy);
             if (copy < toread) memset(dst + copy, 0, toread - copy);
+            free(ebuf);
         }
 
         dst       += toread;
@@ -666,6 +779,41 @@ int stm_fs_readdir(struct stm_fs *fs, uint64_t dir_ino,
 
 /* ── unlink ─────────────────────────────────────────────────────────── */
 
+/* ── unlink helpers ─────────────────────────────────────────────────── */
+
+struct unlink_ctx {
+    struct stm_fs  *fs;
+    struct stm_key *keys;
+    uint32_t        count;
+    uint32_t        cap;
+};
+
+static int collect_extent_cb(const struct stm_key *key, const void *val,
+                             uint32_t vlen, void *ctx)
+{
+    struct unlink_ctx *uc = ctx;
+    struct stm_key_cpu kc = stm_key_to_cpu(key);
+    if (kc.type != STM_KEY_DATA) return 0;
+
+    /* Free extent data blocks */
+    if (vlen == sizeof(struct stm_extent)) {
+        struct stm_extent ext;
+        memcpy(&ext, val, sizeof(ext));
+        extent_free_blocks(uc->fs, &ext);
+    }
+
+    /* Collect key for later btree deletion */
+    if (uc->count >= uc->cap) {
+        uint32_t nc = uc->cap ? uc->cap * 2 : 64;
+        struct stm_key *nk = realloc(uc->keys, nc * sizeof(*nk));
+        if (!nk) return -ENOMEM;
+        uc->keys = nk;
+        uc->cap = nc;
+    }
+    uc->keys[uc->count++] = *key;
+    return 0;
+}
+
 int stm_fs_unlink(struct stm_fs *fs, uint64_t parent_ino, const char *name)
 {
     struct stm_key dkey;
@@ -680,7 +828,7 @@ int stm_fs_unlink(struct stm_fs *fs, uint64_t parent_ino, const char *name)
     rc = stm_btree_delete(fs->tree, &dkey, fs->gen);
     if (rc) return rc;
 
-    /* decrement nlink; if 0, remove inode (but not data — no GC yet) */
+    /* decrement nlink; if 0, remove inode + free data extents */
     {
         struct stm_inode in;
         rc = read_inode(fs, child_ino, &in);
@@ -689,6 +837,20 @@ int stm_fs_unlink(struct stm_fs *fs, uint64_t parent_ino, const char *name)
         if (nl > 0) nl--;
         in.si_nlink = cpu_to_le32(nl);
         if (nl == 0) {
+            /* Free all data extents and collect their keys */
+            struct stm_key lo = mk_key(child_ino, STM_KEY_DATA, 0);
+            struct stm_key hi = mk_key(child_ino, STM_KEY_DATA, UINT64_MAX);
+            struct unlink_ctx uc = { .fs = fs, .keys = NULL, .count = 0, .cap = 0 };
+            uint32_t i;
+
+            stm_btree_scan(fs->tree, &lo, &hi, collect_extent_cb, &uc);
+
+            /* Delete data entries */
+            for (i = 0; i < uc.count; i++)
+                stm_btree_delete(fs->tree, &uc.keys[i], fs->gen);
+            free(uc.keys);
+
+            /* Delete inode */
             struct stm_key ik = mk_key(child_ino, STM_KEY_INODE, 0);
             stm_btree_delete(fs->tree, &ik, fs->gen);
         } else {
