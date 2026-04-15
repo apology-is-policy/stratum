@@ -6,6 +6,11 @@ use crate::p9::{P9Client, DMDIR, OREAD, ORDWR};
 use anyhow::{anyhow, Result};
 use std::path::Path;
 
+pub enum WriteHandle {
+    P9Fid(u32),
+    HostFile(std::fs::File),
+}
+
 #[derive(Clone)]
 pub struct Entry {
     pub name: String,
@@ -201,6 +206,65 @@ impl Panel {
             }
             Backend::Host(h) => { h.mkdir(name)?; self.refresh() }
             Backend::None => Err(anyhow!("not connected")),
+        }
+    }
+
+    /// Open a persistent write handle — file is created and stays open.
+    pub fn begin_write(&mut self, name: &str) -> Result<WriteHandle> {
+        match &mut self.backend {
+            Backend::P9 { client, root_fid, path } => {
+                let names: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                let dir_fid = client.walk(*root_fid, &names)?;
+                client.create(dir_fid, name, 0o644, ORDWR)?;
+                // dir_fid now points to the open file
+                Ok(WriteHandle::P9Fid(dir_fid))
+            }
+            Backend::Host(h) => {
+                let f = std::fs::File::create(h.cwd.join(name))?;
+                Ok(WriteHandle::HostFile(f))
+            }
+            Backend::None => Err(anyhow!("not connected")),
+        }
+    }
+
+    /// Write through a persistent handle (no walk/open/clunk overhead).
+    pub fn write_to_handle(&mut self, handle: &mut WriteHandle,
+                           offset: u64, data: &[u8]) -> Result<()> {
+        match handle {
+            WriteHandle::P9Fid(fid) => {
+                let client = match &mut self.backend {
+                    Backend::P9 { client, .. } => client,
+                    _ => return Err(anyhow!("backend mismatch")),
+                };
+                let mut off = offset;
+                for chunk in data.chunks(32768) {
+                    client.write_data(*fid, off, chunk)?;
+                    off += chunk.len() as u64;
+                }
+                Ok(())
+            }
+            WriteHandle::HostFile(f) => {
+                use std::io::{Seek, SeekFrom, Write};
+                f.seek(SeekFrom::Start(offset))?;
+                f.write_all(data)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Close a write handle.
+    pub fn end_write(&mut self, handle: WriteHandle) -> Result<()> {
+        match handle {
+            WriteHandle::P9Fid(fid) => {
+                if let Backend::P9 { client, .. } = &mut self.backend {
+                    client.clunk(fid)?;
+                }
+                Ok(())
+            }
+            WriteHandle::HostFile(_f) => {
+                // File is closed on drop
+                Ok(())
+            }
         }
     }
 

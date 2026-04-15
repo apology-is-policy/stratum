@@ -1,7 +1,7 @@
 //! Application state machine.
 
 use crate::config::Config;
-use crate::panel::Panel;
+use crate::panel::{Panel, WriteHandle};
 use std::process::{Child, Command};
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -45,8 +45,9 @@ pub struct CopyState {
     pub data: Vec<u8>,
     pub written: usize,
     pub total: usize,
-    pub dest: Focus,       // which panel gets the file
+    pub dest: Focus,
     pub cancelled: bool,
+    pub handle: Option<WriteHandle>,
 }
 
 impl App {
@@ -322,7 +323,7 @@ impl App {
     }
 
     fn copy_file(&mut self) {
-        if self.copy_state.is_some() { return; } // already copying
+        if self.copy_state.is_some() { return; }
 
         let entry = match self.active().selected() {
             Some(e) => e.clone(),
@@ -344,15 +345,15 @@ impl App {
             Focus::Right => Focus::Left,
         };
 
-        // create empty destination file
+        // open a persistent write handle on the destination
         let dest_panel = match dest {
             Focus::Left => &mut self.left,
             Focus::Right => &mut self.right,
         };
-        if let Err(e) = dest_panel.create_empty_file(&entry.name) {
-            self.status = format!("Create error: {e}");
-            return;
-        }
+        let handle = match dest_panel.begin_write(&entry.name) {
+            Ok(h) => h,
+            Err(e) => { self.status = format!("Create error: {e}"); return; }
+        };
 
         let total = data.len();
         self.copy_state = Some(CopyState {
@@ -362,38 +363,35 @@ impl App {
             total,
             dest,
             cancelled: false,
+            handle: Some(handle),
         });
     }
 
     /// Drive one chunk of the copy. Called each frame from the main loop.
-    /// Returns true if copy is still in progress.
     pub fn copy_tick(&mut self) -> bool {
-        const CHUNK: usize = 32768;
+        const CHUNK: usize = 262144; // 256 KiB per tick
 
         let mut state = match self.copy_state.take() {
             Some(s) => s,
             None => return false,
         };
 
-        if state.cancelled {
-            self.status = format!("Copy cancelled: {}", state.filename);
-            let dest = match state.dest {
-                Focus::Left => &mut self.left,
-                Focus::Right => &mut self.right,
-            };
-            let _ = dest.refresh();
-            return false;
-        }
-
-        if state.written >= state.total {
-            // done
-            self.status = format!("Copied {} ({} bytes)", state.filename,
-                                  human_size(state.total as u64));
-            let dest = match state.dest {
-                Focus::Left => &mut self.left,
-                Focus::Right => &mut self.right,
-            };
-            let _ = dest.refresh();
+        if state.cancelled || state.written >= state.total {
+            // finish: close the write handle
+            if let Some(handle) = state.handle.take() {
+                let dest = match state.dest {
+                    Focus::Left => &mut self.left,
+                    Focus::Right => &mut self.right,
+                };
+                let _ = dest.end_write(handle);
+                let _ = dest.refresh();
+            }
+            if state.cancelled {
+                self.status = format!("Copy cancelled: {}", state.filename);
+            } else {
+                self.status = format!("Copied {} ({})",
+                    state.filename, human_size(state.total as u64));
+            }
             return false;
         }
 
@@ -405,10 +403,12 @@ impl App {
             Focus::Right => &mut self.right,
         };
 
-        match dest.write_chunk_at(&state.filename, state.written as u64, &chunk) {
+        match dest.write_to_handle(state.handle.as_mut().unwrap(),
+                                   state.written as u64, &chunk) {
             Ok(()) => state.written = end,
             Err(e) => {
                 self.status = format!("Copy error: {e}");
+                if let Some(h) = state.handle.take() { let _ = dest.end_write(h); }
                 return false;
             }
         }
@@ -417,7 +417,6 @@ impl App {
         true
     }
 
-    /// Cancel an in-progress copy (called on Esc during copy).
     pub fn cancel_copy(&mut self) {
         if let Some(ref mut s) = self.copy_state {
             s.cancelled = true;
