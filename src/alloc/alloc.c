@@ -5,6 +5,7 @@
 #include <errno.h>
 
 #define GROW_INCREMENT  (16 * 1024)  /* grow by 16K blocks = 64 MiB */
+#define REFCOUNT_PENDING 0xFFFF     /* sentinel: freed but not yet reclaimable */
 
 struct deferred_free {
     uint64_t block_nr;
@@ -135,18 +136,24 @@ void stm_alloc_free(struct stm_alloc *a, uint64_t block_nr, uint32_t count)
 {
     uint32_t i;
     for (i = 0; i < count && block_nr + i < a->total; i++) {
-        if (a->refcounts[block_nr + i] == 0) continue;
-        a->refcounts[block_nr + i]--;
-        if (a->refcounts[block_nr + i] == 0) {
-            /* defer: don't make available until commit */
+        uint64_t b = block_nr + i;
+        if (a->refcounts[b] == 0 || a->refcounts[b] == REFCOUNT_PENDING)
+            continue;
+        a->refcounts[b]--;
+        if (a->refcounts[b] == 0) {
+            /*
+             * Don't set to 0 yet — that would let stm_alloc_extent
+             * reuse this block before the superblock commits.
+             * Use a sentinel so the scan skips it.
+             */
+            a->refcounts[b] = REFCOUNT_PENDING;
             if (a->ndeferred >= a->deferred_cap) {
                 uint32_t nc = a->deferred_cap * 2;
                 struct deferred_free *nd = realloc(a->deferred, nc * sizeof(*nd));
                 if (nd) { a->deferred = nd; a->deferred_cap = nc; }
-                /* if realloc fails, just skip deferral (leak the block) */
             }
             if (a->ndeferred < a->deferred_cap) {
-                a->deferred[a->ndeferred].block_nr = block_nr + i;
+                a->deferred[a->ndeferred].block_nr = b;
                 a->deferred[a->ndeferred].count = 1;
                 a->ndeferred++;
             }
@@ -167,8 +174,10 @@ void stm_alloc_commit(struct stm_alloc *a)
     uint32_t i;
     for (i = 0; i < a->ndeferred; i++) {
         uint64_t b = a->deferred[i].block_nr;
-        if (b < a->total && a->refcounts[b] == 0)
+        if (b < a->total && a->refcounts[b] == REFCOUNT_PENDING) {
+            a->refcounts[b] = 0;   /* now truly free */
             a->free_count++;
+        }
     }
     a->ndeferred = 0;
 }
