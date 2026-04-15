@@ -48,4 +48,8 @@ int  stm_fs_unlink(struct stm_fs *fs, uint64_t parent_ino, const char *name);
 int  stm_fs_lookup(struct stm_fs *fs, uint64_t parent_ino,
                    const char *name, uint64_t *out_ino);
 
+/* Accessors for 9P server's deferred inode updates */
+struct stm_btree *stm_fs_get_tree(struct stm_fs *fs);
+uint64_t stm_fs_get_gen(struct stm_fs *fs);
+
 #endif /* STM_FS_H */

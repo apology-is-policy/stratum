@@ -428,6 +428,9 @@ static int write_inode(struct stm_fs *fs, uint64_t ino,
     return stm_btree_insert(fs->tree, &k, in, sizeof(*in), fs->gen);
 }
 
+struct stm_btree *stm_fs_get_tree(struct stm_fs *fs) { return fs->tree; }
+uint64_t stm_fs_get_gen(struct stm_fs *fs) { return fs->gen; }
+
 /* ── public operations ──────────────────────────────────────────────── */
 
 int stm_fs_stat(struct stm_fs *fs, uint64_t ino, struct stm_inode *out)
@@ -547,19 +550,27 @@ int stm_fs_write(struct stm_fs *fs, uint64_t ino, uint64_t offset,
         remaining -= towrite;
     }
 
-    /* update inode size */
+    /* update inode size — batched: first write + every 1 MiB crossing.
+     * The 9P server does a final precise update on clunk for correctness. */
     {
-        struct stm_inode in;
-        rc = read_inode(fs, ino, &in);
-        if (rc) return rc;
-        if (offset + len > le64_to_cpu(in.si_size)) {
-            uint64_t ts; uint32_t tns;
-            stm_now(&ts, &tns);
-            in.si_size       = cpu_to_le64(offset + len);
-            in.si_mtime_sec  = cpu_to_le64(ts);
-            in.si_mtime_nsec = cpu_to_le32(tns);
-            rc = write_inode(fs, ino, &in);
+        uint64_t new_end = offset + len;
+        int do_update = 0;
+        if (offset == 0) do_update = 1;  /* first write always updates */
+        else {
+            /* update when crossing a 1 MiB boundary */
+            uint64_t prev_mb = offset >> 20;
+            uint64_t curr_mb = new_end >> 20;
+            if (curr_mb > prev_mb) do_update = 1;
+        }
+        if (do_update) {
+            struct stm_inode in;
+            rc = read_inode(fs, ino, &in);
             if (rc) return rc;
+            if (new_end > le64_to_cpu(in.si_size)) {
+                in.si_size       = cpu_to_le64(new_end);
+                rc = write_inode(fs, ino, &in);
+                if (rc) return rc;
+            }
         }
     }
     return 0;

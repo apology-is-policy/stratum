@@ -2,6 +2,8 @@
 #include "stratum/fs.h"
 #include "stratum/snap.h"
 #include "stratum/inode.h"
+#include "stratum/btree.h"
+#include "stratum/key.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -53,10 +55,12 @@ struct p9_fid {
     uint32_t fid;
     uint64_t ino;
     uint64_t parent_ino;
-    char     name[256];     /* name in parent directory */
+    char     name[256];
     int      active;
     int      is_open;
     int      is_dir;
+    uint64_t write_end;     /* highest byte written (for deferred size update) */
+    int      size_dirty;
 };
 
 struct stm_9p {
@@ -441,6 +445,15 @@ static int h_write(struct stm_9p *s, const uint8_t *body, uint16_t tag,
 
     rc = stm_fs_write(s->fs, f->ino, offset, data, count);
 
+    /* track highest write offset — inode size updated on clunk, not here */
+    if (rc == 0) {
+        uint64_t end = offset + count;
+        if (end > f->write_end) {
+            f->write_end = end;
+            f->size_dirty = 1;
+        }
+    }
+
     wp = resp + 4;
     *wp++ = P9_RWRITE;
     p16(wp, tag); wp += 2;
@@ -452,9 +465,29 @@ static int h_write(struct stm_9p *s, const uint8_t *body, uint16_t tag,
 static int h_clunk(struct stm_9p *s, const uint8_t *body, uint16_t tag,
                    uint8_t *resp, uint32_t *resp_len)
 {
-    uint32_t fid = g32(body);
+    uint32_t fid_nr = g32(body);
+    struct p9_fid *f = fid_get(s, fid_nr);
     uint8_t *wp;
-    fid_free(s, fid);
+
+    /* flush deferred inode size update */
+    if (f && f->size_dirty) {
+        struct stm_inode in;
+        if (stm_fs_stat(s->fs, f->ino, &in) == 0) {
+            if (f->write_end > le64_to_cpu(in.si_size)) {
+                in.si_size = cpu_to_le64(f->write_end);
+                /* write inode via the fs layer's btree */
+                struct stm_key k;
+                {
+                    struct stm_key_cpu kc = { f->ino, STM_KEY_INODE, 0 };
+                    k = stm_key_from_cpu(&kc);
+                }
+                stm_btree_insert(stm_fs_get_tree(s->fs), &k,
+                                 &in, sizeof(in), stm_fs_get_gen(s->fs));
+            }
+        }
+    }
+
+    fid_free(s, fid_nr);
     wp = resp + 4;
     *wp++ = P9_RCLUNK;
     p16(wp, tag); wp += 2;

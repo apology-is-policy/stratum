@@ -89,46 +89,57 @@ static int try_grow(struct stm_alloc *a)
 
 int stm_alloc_extent(struct stm_alloc *a, uint32_t count, uint64_t *out_paddr)
 {
-    uint64_t start, i;
-    uint32_t run;
-    int attempts = 0;
+    uint32_t j;
 
-retry:
-    /* scan from hint for a contiguous run of `count` free blocks */
-    start = a->hint;
-    run = 0;
+    /* Fast path: allocate sequentially from hint (O(count), not O(total)) */
+    if (a->hint + count <= a->total) {
+        int ok = 1;
+        for (j = 0; j < count; j++) {
+            if (a->refcounts[a->hint + j] != 0) { ok = 0; break; }
+        }
+        if (ok) {
+            uint64_t base = a->hint;
+            for (j = 0; j < count; j++)
+                a->refcounts[base + j] = 1;
+            a->free_count -= count;
+            a->hint = base + count;
+            *out_paddr = base * STM_BLOCK_SIZE;
+            return 0;
+        }
+    }
 
-    for (i = 0; i < a->total; i++) {
-        uint64_t idx = (start + i) % a->total;
-        if (idx == 0 && i > 0 && run < count) run = 0; /* don't wrap a run */
-        if (a->refcounts[idx] == 0) {
-            run++;
-            if (run == count) {
-                uint64_t base = idx - count + 1;
-                uint32_t j;
-                for (j = 0; j < count; j++) {
-                    a->refcounts[base + j] = 1;
+    /* Hint area is used or past end — try growing to get fresh space. */
+    {
+        uint64_t old_total = a->total;
+        if (try_grow(a) == 0) {
+            /* Set hint to start of newly grown area (guaranteed free) */
+            a->hint = old_total;
+            return stm_alloc_extent(a, count, out_paddr);
+        }
+    }
+    /* Can't grow — fall back to slow scan of existing free space. */
+
+slow_scan:
+    {
+        uint64_t start = 0, i;
+        uint32_t run = 0;
+        for (i = 0; i < a->total; i++) {
+            if (a->refcounts[i] == 0) {
+                run++;
+                if (run == count) {
+                    uint64_t base = i - count + 1;
+                    for (j = 0; j < count; j++)
+                        a->refcounts[base + j] = 1;
+                    a->free_count -= count;
+                    a->hint = base + count;
+                    *out_paddr = base * STM_BLOCK_SIZE;
+                    return 0;
                 }
-                a->free_count -= count;
-                a->hint = (base + count) % a->total;
-                *out_paddr = base * STM_BLOCK_SIZE;
-                return 0;
+            } else {
+                run = 0;
             }
-        } else {
-            run = 0;
         }
     }
-
-    /* no space — try auto-grow */
-    if (attempts == 0) {
-        while (a->free_count < count) {
-            if (try_grow(a) != 0) return -ENOSPC;
-        }
-        a->hint = a->total - GROW_INCREMENT; /* start scanning from new area */
-        attempts++;
-        goto retry;
-    }
-
     return -ENOSPC;
 }
 
