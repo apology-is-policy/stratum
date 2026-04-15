@@ -1,6 +1,6 @@
 //! FAR Commander-style TUI rendering.
 
-use crate::app::{App, Focus, Mode};
+use crate::app::{App, CopyState, Focus, Mode};
 use crate::panel::Panel;
 use ratatui::prelude::*;
 use ratatui::symbols::border;
@@ -59,6 +59,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
     // input overlay
     if let Mode::Input { prompt, .. } = &app.mode {
         draw_input_dialog(frame, area, prompt, &app.input_buf);
+    }
+
+    // copy progress overlay
+    if let Some(ref cs) = app.copy_state {
+        draw_copy_dialog(frame, area, cs);
     }
 }
 
@@ -288,6 +293,58 @@ fn draw_input_dialog(frame: &mut Frame, area: Rect, prompt: &str, input: &str) {
         )),
     ];
     frame.render_widget(Paragraph::new(text), inner);
+}
+
+fn draw_copy_dialog(frame: &mut Frame, area: Rect, cs: &CopyState) {
+    let w = 50u16.min(area.width.saturating_sub(4));
+    let h = 8u16;
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green))
+        .title(" Copying ")
+        .style(Style::default().bg(Color::DarkGray));
+
+    let inner = block.inner(rect);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(block, rect);
+
+    let pct = if cs.total > 0 { cs.written * 100 / cs.total } else { 0 };
+    let bar_width = inner.width.saturating_sub(2) as usize;
+    let filled = bar_width * pct / 100;
+
+    let bar: String = format!("{}{}",
+        "\u{2588}".repeat(filled),       // ████
+        "\u{2591}".repeat(bar_width - filled),  // ░░░░
+    );
+
+    let lines = vec![
+        Line::from(Span::styled(
+            format!(" {}", cs.filename),
+            Style::default().fg(Color::White).bold(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(" [{bar}]"),
+            Style::default().fg(Color::Green),
+        )),
+        Line::from(Span::styled(
+            format!(" {} / {}  ({}%)",
+                human_size(cs.written as u64),
+                human_size(cs.total as u64),
+                pct),
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            " Press Esc to cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn human_size(bytes: u64) -> String {

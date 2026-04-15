@@ -8,7 +8,7 @@ mod ui;
 use anyhow::Result;
 use app::App;
 use crossterm::{
-    event::{self, Event, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
@@ -20,10 +20,8 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mut app = App::new();
 
-    // right panel always starts with host FS
     app.init_host_panel();
 
-    // if a volume path is given as first arg, open it on the left panel
     if args.len() > 1 {
         let vol = &args[1];
         let pass = args.get(2).map(|s| s.as_str());
@@ -37,6 +35,21 @@ fn main() -> Result<()> {
 
     loop {
         terminal.draw(|f| ui::draw(f, &app))?;
+
+        // drive copy progress (non-blocking, one chunk per frame)
+        if app.copy_state.is_some() {
+            app.copy_tick();
+
+            // quick poll for Esc to cancel
+            if event::poll(Duration::from_millis(5))? {
+                if let Event::Key(key) = event::read()? {
+                    if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc {
+                        app.cancel_copy();
+                    }
+                }
+            }
+            continue; // skip normal input handling during copy
+        }
 
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {

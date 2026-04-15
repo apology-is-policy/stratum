@@ -33,10 +33,20 @@ pub struct App {
     pub status: String,
     pub quit: bool,
     pub config: Config,
+    pub copy_state: Option<CopyState>,
     // server management
     server_proc: Option<Child>,
     server_sock: Option<String>,
     pending_volume: Option<String>,
+}
+
+pub struct CopyState {
+    pub filename: String,
+    pub data: Vec<u8>,
+    pub written: usize,
+    pub total: usize,
+    pub dest: Focus,       // which panel gets the file
+    pub cancelled: bool,
 }
 
 impl App {
@@ -50,6 +60,7 @@ impl App {
             status: "F2:Open volume  F7:Mkdir  F8:Delete  F5:Copy  F10:Quit".into(),
             quit: false,
             config: Config::load(),
+            copy_state: None,
             server_proc: None,
             server_sock: None,
             pending_volume: None,
@@ -311,6 +322,8 @@ impl App {
     }
 
     fn copy_file(&mut self) {
+        if self.copy_state.is_some() { return; } // already copying
+
         let entry = match self.active().selected() {
             Some(e) => e.clone(),
             None => return,
@@ -319,17 +332,95 @@ impl App {
             self.status = "Cannot copy directories yet".into();
             return;
         }
+
+        self.status = format!("Reading {}...", entry.name);
         let data = match self.active().read_file(&entry.name) {
             Ok(d) => d,
             Err(e) => { self.status = format!("Read error: {e}"); return; }
         };
-        let name = entry.name.clone();
-        let len = data.len();
-        if let Err(e) = self.inactive().write_file(&name, &data) {
-            self.status = format!("Write error: {e}");
-        } else {
-            self.status = format!("Copied {name} ({len} bytes)");
-            let _ = self.inactive().refresh();
+
+        let dest = match self.focus {
+            Focus::Left => Focus::Right,
+            Focus::Right => Focus::Left,
+        };
+
+        // create empty destination file
+        let dest_panel = match dest {
+            Focus::Left => &mut self.left,
+            Focus::Right => &mut self.right,
+        };
+        if let Err(e) = dest_panel.create_empty_file(&entry.name) {
+            self.status = format!("Create error: {e}");
+            return;
+        }
+
+        let total = data.len();
+        self.copy_state = Some(CopyState {
+            filename: entry.name,
+            data,
+            written: 0,
+            total,
+            dest,
+            cancelled: false,
+        });
+    }
+
+    /// Drive one chunk of the copy. Called each frame from the main loop.
+    /// Returns true if copy is still in progress.
+    pub fn copy_tick(&mut self) -> bool {
+        const CHUNK: usize = 32768;
+
+        let mut state = match self.copy_state.take() {
+            Some(s) => s,
+            None => return false,
+        };
+
+        if state.cancelled {
+            self.status = format!("Copy cancelled: {}", state.filename);
+            let dest = match state.dest {
+                Focus::Left => &mut self.left,
+                Focus::Right => &mut self.right,
+            };
+            let _ = dest.refresh();
+            return false;
+        }
+
+        if state.written >= state.total {
+            // done
+            self.status = format!("Copied {} ({} bytes)", state.filename,
+                                  human_size(state.total as u64));
+            let dest = match state.dest {
+                Focus::Left => &mut self.left,
+                Focus::Right => &mut self.right,
+            };
+            let _ = dest.refresh();
+            return false;
+        }
+
+        let end = (state.written + CHUNK).min(state.total);
+        let chunk = state.data[state.written..end].to_vec();
+
+        let dest = match state.dest {
+            Focus::Left => &mut self.left,
+            Focus::Right => &mut self.right,
+        };
+
+        match dest.write_chunk_at(&state.filename, state.written as u64, &chunk) {
+            Ok(()) => state.written = end,
+            Err(e) => {
+                self.status = format!("Copy error: {e}");
+                return false;
+            }
+        }
+
+        self.copy_state = Some(state);
+        true
+    }
+
+    /// Cancel an in-progress copy (called on Esc during copy).
+    pub fn cancel_copy(&mut self) {
+        if let Some(ref mut s) = self.copy_state {
+            s.cancelled = true;
         }
     }
 }
@@ -370,4 +461,14 @@ fn find_stratum_bin() -> String {
 
 fn short_path(p: &str) -> &str {
     p.rsplit('/').next().unwrap_or(p)
+}
+
+fn human_size(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
+    let mut val = bytes as f64;
+    for u in UNITS {
+        if val < 1024.0 { return format!("{val:.1} {u}"); }
+        val /= 1024.0;
+    }
+    format!("{val:.1} TB")
 }

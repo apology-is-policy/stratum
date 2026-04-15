@@ -204,6 +204,52 @@ impl Panel {
         }
     }
 
+    /// Create an empty file (for chunked copy destination).
+    pub fn create_empty_file(&mut self, name: &str) -> Result<()> {
+        match &mut self.backend {
+            Backend::P9 { client, root_fid, path } => {
+                let names: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                let dir_fid = client.walk(*root_fid, &names)?;
+                client.create(dir_fid, name, 0o644, ORDWR)?;
+                client.clunk(dir_fid)?;
+                Ok(())
+            }
+            Backend::Host(h) => {
+                std::fs::File::create(h.cwd.join(name))?;
+                Ok(())
+            }
+            Backend::None => Err(anyhow!("not connected")),
+        }
+    }
+
+    /// Write a chunk at a specific offset (for chunked copy).
+    pub fn write_chunk_at(&mut self, name: &str, offset: u64, data: &[u8]) -> Result<()> {
+        match &mut self.backend {
+            Backend::P9 { client, root_fid, path } => {
+                let mut fpath: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                fpath.push(name);
+                let fid = client.walk(*root_fid, &fpath)?;
+                client.open(fid, ORDWR)?;
+                let mut off = offset;
+                for chunk in data.chunks(8192) {
+                    client.write_data(fid, off, chunk)?;
+                    off += chunk.len() as u64;
+                }
+                client.clunk(fid)?;
+                Ok(())
+            }
+            Backend::Host(h) => {
+                use std::io::{Seek, SeekFrom, Write};
+                let path = h.cwd.join(name);
+                let mut f = std::fs::OpenOptions::new().write(true).open(path)?;
+                f.seek(SeekFrom::Start(offset))?;
+                f.write_all(data)?;
+                Ok(())
+            }
+            Backend::None => Err(anyhow!("not connected")),
+        }
+    }
+
     pub fn delete_selected(&mut self) -> Result<()> {
         let entry = match self.selected() {
             Some(e) if e.name != ".." => e.clone(),
