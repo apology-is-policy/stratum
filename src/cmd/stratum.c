@@ -86,14 +86,23 @@ static int serve_client(int fd, struct stm_fs *fs)
         uint32_t size, resp_len;
 
         /* read 4-byte size header */
-        if (read_exact(fd, req, 4) != 0) break;
+        if (read_exact(fd, req, 4) != 0) {
+            fprintf(stderr, "[9p] client disconnected (read header)\n");
+            break;
+        }
 
         size = (uint32_t)req[0] | ((uint32_t)req[1] << 8) |
                ((uint32_t)req[2] << 16) | ((uint32_t)req[3] << 24);
-        if (size < 7 || size > msize) { rc = -1; break; }
+        if (size < 7 || size > msize) {
+            fprintf(stderr, "[9p] bad message size: %u (msize=%u)\n", size, msize);
+            rc = -1; break;
+        }
 
         /* read rest of message */
-        if (read_exact(fd, req + 4, size - 4) != 0) { rc = -1; break; }
+        if (read_exact(fd, req + 4, size - 4) != 0) {
+            fprintf(stderr, "[9p] client disconnected (read body, size=%u)\n", size);
+            rc = -1; break;
+        }
 
         resp_len = msize;
         stm_9p_handle(srv, req, size, resp, &resp_len);
@@ -103,7 +112,10 @@ static int serve_client(int fd, struct stm_fs *fs)
             uint32_t written = 0;
             while (written < resp_len) {
                 ssize_t w = write(fd, resp + written, resp_len - written);
-                if (w <= 0) { rc = -1; goto out; }
+                if (w <= 0) {
+                    fprintf(stderr, "[9p] write response failed (errno=%d)\n", errno);
+                    rc = -1; goto out;
+                }
                 written += (uint32_t)w;
             }
         }

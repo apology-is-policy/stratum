@@ -13,8 +13,10 @@
 #define STM_S_IFDIR  0040000
 #define STM_S_IFREG  0100000
 
-/* Data chunk size for inline file data */
-#define STM_DATA_CHUNK    4096
+/* Data chunk size for inline file data.
+ * Larger = fewer btree entries = much faster bulk I/O.
+ * 64 KiB gives ~11K entries for 746MB vs 186K at 4KB. */
+#define STM_DATA_CHUNK    65536
 #define STM_NAME_MAX      255
 
 /* Dirent type tags */

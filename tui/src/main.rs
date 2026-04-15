@@ -1,4 +1,5 @@
 mod app;
+mod cli;
 mod config;
 mod hostfs;
 mod p9;
@@ -18,8 +19,13 @@ use std::time::Duration;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let mut app = App::new();
 
+    // CLI mode: stratum-tui cli <volume> <command> [args...]
+    if args.len() >= 2 && args[1] == "cli" {
+        return cli::run(&args[2..]);
+    }
+
+    let mut app = App::new();
     app.init_host_panel();
 
     if args.len() > 1 {
@@ -36,11 +42,8 @@ fn main() -> Result<()> {
     loop {
         terminal.draw(|f| ui::draw(f, &app))?;
 
-        // drive copy progress (non-blocking, one chunk per frame)
         if app.copy_state.is_some() {
             app.copy_tick();
-
-            // quick poll for Esc to cancel
             if event::poll(Duration::from_millis(5))? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc {
@@ -48,7 +51,7 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            continue; // skip normal input handling during copy
+            continue;
         }
 
         if event::poll(Duration::from_millis(50))? {
