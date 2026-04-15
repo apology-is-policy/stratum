@@ -341,19 +341,29 @@ impl Drop for App {
 }
 
 fn find_stratum_bin() -> String {
-    // look next to our own binary first
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
+            // 1. same directory as the TUI binary
             let candidate = dir.join("stratum");
             if candidate.exists() {
                 return candidate.display().to_string();
             }
-            // also check ../../build/stratum (for dev layout)
-            let dev = dir.join("../../build/stratum");
-            if dev.exists() {
-                return dev.display().to_string();
+            // 2. dev layout: tui binary is at tui/target/debug/stratum-tui,
+            //    C binary is at build/stratum → walk up to project root
+            let mut d = dir.to_path_buf();
+            for _ in 0..5 {
+                let try_path = d.join("build/stratum");
+                if try_path.exists() {
+                    return try_path.display().to_string();
+                }
+                if !d.pop() { break; }
             }
         }
+    }
+    // 3. check cwd/build/stratum (running from project root)
+    let cwd_build = std::path::Path::new("build/stratum");
+    if cwd_build.exists() {
+        return cwd_build.display().to_string();
     }
     "stratum".to_string() // fallback: hope it's in PATH
 }

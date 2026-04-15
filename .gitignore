@@ -20,6 +20,9 @@ compile_commands.json
 tui/target/
 tui/Cargo.lock
 
+# Dist output
+dist/
+
 # Test artifacts
 /tmp/stratum_test_*
 *.stm
