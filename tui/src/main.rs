@@ -1,4 +1,6 @@
 mod app;
+mod config;
+mod hostfs;
 mod p9;
 mod panel;
 mod ui;
@@ -18,32 +20,14 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mut app = App::new();
 
-    // auto-connect panels from CLI args
-    // Usage: stratum-tui [left-addr] [right-addr]
-    // Addr format: unix:/path/to/socket  or  host:port
+    // right panel always starts with host FS
+    app.init_host_panel();
+
+    // if a volume path is given as first arg, open it on the left panel
     if args.len() > 1 {
-        let addr = &args[1];
-        let res = if addr.starts_with("unix:") {
-            app.left.connect_unix(&addr[5..])
-        } else {
-            app.left.connect_tcp(addr)
-        };
-        match res {
-            Ok(()) => app.status = format!("Left connected to {addr}"),
-            Err(e) => app.status = format!("Left connect error: {e}"),
-        }
-    }
-    if args.len() > 2 {
-        let addr = &args[2];
-        let res = if addr.starts_with("unix:") {
-            app.right.connect_unix(&addr[5..])
-        } else {
-            app.right.connect_tcp(addr)
-        };
-        match res {
-            Ok(()) => app.status = format!("Right connected to {addr}"),
-            Err(e) => app.status = format!("Right connect error: {e}"),
-        }
+        let vol = &args[1];
+        let pass = args.get(2).map(|s| s.as_str());
+        app.try_open_volume_from_cli(vol, pass);
     }
 
     enable_raw_mode()?;
@@ -54,7 +38,7 @@ fn main() -> Result<()> {
     loop {
         terminal.draw(|f| ui::draw(f, &app))?;
 
-        if event::poll(Duration::from_millis(100))? {
+        if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     app.handle_key(key);
