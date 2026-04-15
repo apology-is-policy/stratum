@@ -32,12 +32,13 @@ int stm_msg_insert(struct stm_node *n, const struct stm_key *key,
         e.val = NULL;
     }
 
-    /* binary-search insertion point */
+    /* binary-search insertion point — insert AFTER equal entries so that
+     * msg_find (which returns the last match) returns the newest insert. */
     lo = 0; hi = n->nmsgs;
     while (lo < hi) {
         uint32_t mid = lo + (hi - lo) / 2;
-        if (msg_cmp(&n->msgs[mid], &e) < 0) lo = mid + 1;
-        else                                 hi = mid;
+        if (msg_cmp(&n->msgs[mid], &e) <= 0) lo = mid + 1;
+        else                                  hi = mid;
     }
 
     memmove(&n->msgs[lo + 1], &n->msgs[lo],

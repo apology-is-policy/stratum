@@ -658,25 +658,16 @@ int stm_fs_write(struct stm_fs *fs, uint64_t ino, uint64_t offset,
         remaining -= towrite;
     }
 
-    /* update inode size — batched: first write + every 1 MiB crossing */
+    /* update inode size */
     {
         uint64_t new_end = offset + len;
-        int do_update = 0;
-        if (offset == 0) do_update = 1;
-        else {
-            uint64_t prev_mb = offset >> 20;
-            uint64_t curr_mb = new_end >> 20;
-            if (curr_mb > prev_mb) do_update = 1;
-        }
-        if (do_update) {
-            struct stm_inode in;
-            rc = read_inode(fs, ino, &in);
+        struct stm_inode in;
+        rc = read_inode(fs, ino, &in);
+        if (rc) return rc;
+        if (new_end > le64_to_cpu(in.si_size)) {
+            in.si_size = cpu_to_le64(new_end);
+            rc = write_inode(fs, ino, &in);
             if (rc) return rc;
-            if (new_end > le64_to_cpu(in.si_size)) {
-                in.si_size = cpu_to_le64(new_end);
-                rc = write_inode(fs, ino, &in);
-                if (rc) return rc;
-            }
         }
     }
     return 0;
