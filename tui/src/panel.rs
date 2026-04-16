@@ -299,7 +299,7 @@ impl Panel {
                     _ => return Err(anyhow!("backend mismatch")),
                 };
                 let mut off = offset;
-                for chunk in data.chunks(32768) {
+                for chunk in data.chunks(1048576 - 24) {
                     client.write_data(*fid, off, chunk)?;
                     off += chunk.len() as u64;
                 }

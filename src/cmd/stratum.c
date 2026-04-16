@@ -73,7 +73,7 @@ static int serve_client(int fd, struct stm_fs *fs)
 {
     struct stm_9p *srv = NULL;
     uint8_t *req = NULL, *resp = NULL;
-    uint32_t msize = 65536;
+    uint32_t msize = P9_MSIZE_DEFAULT;
     int rc = 0;
 
     if (stm_9p_create(fs, &srv) != 0) return -1;

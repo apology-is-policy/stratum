@@ -30,7 +30,7 @@ const RSTAT: u8 = 125;
 
 const NOTAG: u16 = 0xFFFF;
 const NOFID: u32 = 0xFFFFFFFF;
-const MSIZE: u32 = 65536;
+const MSIZE: u32 = 1 << 20;  // 1 MiB — matches P9_MSIZE_DEFAULT
 
 pub const OREAD: u8 = 0;
 pub const OWRITE: u8 = 1;

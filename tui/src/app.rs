@@ -49,6 +49,11 @@ pub struct App {
     pending_volume: Option<String>,
 }
 
+pub struct ThroughputSample {
+    pub bytes_per_sec: f64,
+    pub timestamp: std::time::Instant,
+}
+
 pub struct CopyState {
     pub filename: String,
     pub copied: u64,
@@ -58,6 +63,10 @@ pub struct CopyState {
     pub cancelled: bool,
     pub read_handle: Option<ReadHandle>,
     pub write_handle: Option<WriteHandle>,
+    pub start_time: std::time::Instant,
+    pub samples: Vec<ThroughputSample>,
+    pub last_sample_bytes: u64,
+    pub last_sample_time: std::time::Instant,
 }
 
 impl App {
@@ -395,6 +404,7 @@ impl App {
             }
         };
 
+        let now = std::time::Instant::now();
         self.copy_state = Some(CopyState {
             filename: entry.name.clone(),
             copied: 0,
@@ -404,6 +414,10 @@ impl App {
             cancelled: false,
             read_handle: Some(rh),
             write_handle: Some(wh),
+            start_time: now,
+            samples: Vec::new(),
+            last_sample_bytes: 0,
+            last_sample_time: now,
         });
         self.status = format!("Copying {} ({})...", entry.name, human_size(size));
     }
@@ -492,6 +506,21 @@ impl App {
                 self.copy_state = Some(state);
                 return false;
             }
+        }
+
+        // Record throughput sample every ~0.5s
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(state.last_sample_time).as_secs_f64();
+        if dt >= 0.5 {
+            let db = (state.copied - state.last_sample_bytes) as f64;
+            state.samples.push(ThroughputSample {
+                bytes_per_sec: db / dt,
+                timestamp: now,
+            });
+            // Keep at most 60 samples (30 seconds at 0.5s intervals)
+            if state.samples.len() > 60 { state.samples.remove(0); }
+            state.last_sample_bytes = state.copied;
+            state.last_sample_time = now;
         }
 
         self.copy_state = Some(state);

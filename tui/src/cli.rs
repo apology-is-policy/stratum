@@ -181,7 +181,7 @@ fn cmd_cp_in(c: &mut P9Client, root: u32, args: &[String]) -> Result<()> {
     c.create(dir_fid, &dest_name, 0o644, ORDWR)?;
 
     // write in chunks
-    let chunk_size = 32768usize;
+    let chunk_size = 1048576 - 24;  // ~1MB, within 9P msize
     let mut offset = 0u64;
     let start = Instant::now();
     let mut last_report = Instant::now();
@@ -219,7 +219,7 @@ fn cmd_cp_out(c: &mut P9Client, root: u32, args: &[String]) -> Result<()> {
     let mut data = Vec::new();
     let mut offset = 0u64;
     loop {
-        let chunk = c.read(fid, offset, 32768)?;
+        let chunk = c.read(fid, offset, 1048576 - 24)?;
         if chunk.is_empty() { break; }
         offset += chunk.len() as u64;
         data.extend_from_slice(&chunk);

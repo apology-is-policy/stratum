@@ -39,7 +39,7 @@ enum {
 #define P9_QID_SIZE    13
 #define P9_NOTAG       ((uint16_t)0xFFFF)
 #define P9_NOFID       ((uint32_t)0xFFFFFFFF)
-#define P9_MSIZE_DEFAULT 65536
+#define P9_MSIZE_DEFAULT (1U << 20)   /* 1 MiB — large messages for bulk I/O */
 
 struct stm_fs;
 struct stm_9p;

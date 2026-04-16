@@ -301,8 +301,9 @@ fn draw_input_dialog(frame: &mut Frame, area: Rect, prompt: &str, input: &str) {
 }
 
 fn draw_copy_dialog(frame: &mut Frame, area: Rect, cs: &CopyState) {
-    let w = 50u16.min(area.width.saturating_sub(4));
-    let h = 8u16;
+    let w = 60u16.min(area.width.saturating_sub(4));
+    let chart_h = 8u16;
+    let h = 12 + chart_h;
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let rect = Rect::new(x, y, w, h);
@@ -322,11 +323,25 @@ fn draw_copy_dialog(frame: &mut Frame, area: Rect, cs: &CopyState) {
     let filled = bar_width * pct / 100;
 
     let bar: String = format!("{}{}",
-        "\u{2588}".repeat(filled),       // ████
-        "\u{2591}".repeat(bar_width - filled),  // ░░░░
+        "\u{2588}".repeat(filled),
+        "\u{2591}".repeat(bar_width - filled),
     );
 
-    let lines = vec![
+    // Compute stats
+    let elapsed = cs.start_time.elapsed().as_secs_f64();
+    let avg_speed = if elapsed > 0.1 { cs.copied as f64 / elapsed } else { 0.0 };
+    let cur_speed = cs.samples.last().map_or(avg_speed, |s| s.bytes_per_sec);
+    let remaining_bytes = cs.total.saturating_sub(cs.copied) as f64;
+    let eta = if cur_speed > 1.0 { remaining_bytes / cur_speed } else { 0.0 };
+
+    let elapsed_str = format_duration(elapsed);
+    let eta_str = if cs.copied > 0 && cs.copied < cs.total {
+        format_duration(eta)
+    } else {
+        "--:--".into()
+    };
+
+    let mut lines = vec![
         Line::from(Span::styled(
             format!(" {}", cs.filename),
             Style::default().fg(Color::White).bold(),
@@ -338,18 +353,64 @@ fn draw_copy_dialog(frame: &mut Frame, area: Rect, cs: &CopyState) {
         )),
         Line::from(Span::styled(
             format!(" {} / {}  ({}%)",
-                human_size(cs.copied),
-                human_size(cs.total),
-                pct),
+                human_size(cs.copied), human_size(cs.total), pct),
             Style::default().fg(Color::Cyan),
         )),
-        Line::from(""),
         Line::from(Span::styled(
-            " Press Esc to cancel",
-            Style::default().fg(Color::DarkGray),
+            format!(" {}/s   elapsed {}   ETA {}",
+                human_size(cur_speed as u64), elapsed_str, eta_str),
+            Style::default().fg(Color::Yellow),
         )),
+        Line::from(""),
     ];
+
+    // Throughput bar chart (last ~30 seconds)
+    if cs.samples.len() >= 2 {
+        let chart_width = inner.width.saturating_sub(2) as usize;
+        let samples = &cs.samples;
+        let n = samples.len().min(chart_width);
+        let display = &samples[samples.len() - n..];
+        let max_bps = display.iter()
+            .map(|s| s.bytes_per_sec)
+            .fold(1.0f64, f64::max);
+
+        // Render chart rows (chart_h - 1 rows for bars, 1 for label)
+        let rows = (chart_h - 2) as usize;
+        for row in 0..rows {
+            let threshold = max_bps * (rows - row) as f64 / rows as f64;
+            let mut spans = vec![Span::raw(" ")];
+            for s in display {
+                let ch = if s.bytes_per_sec >= threshold { "\u{2588}" } else { " " };
+                let color = if s.bytes_per_sec >= threshold {
+                    if s.bytes_per_sec > max_bps * 0.7 { Color::Green }
+                    else if s.bytes_per_sec > max_bps * 0.3 { Color::Yellow }
+                    else { Color::Red }
+                } else {
+                    Color::DarkGray
+                };
+                spans.push(Span::styled(ch, Style::default().fg(color)));
+            }
+            lines.push(Line::from(spans));
+        }
+        lines.push(Line::from(Span::styled(
+            format!(" peak: {}/s", human_size(max_bps as u64)),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " Press Esc to cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn format_duration(secs: f64) -> String {
+    let s = secs as u64;
+    if s >= 3600 { format!("{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60) }
+    else { format!("{}:{:02}", s / 60, s % 60) }
 }
 
 fn draw_busy_dialog(frame: &mut Frame, area: Rect, msg: &str) {
