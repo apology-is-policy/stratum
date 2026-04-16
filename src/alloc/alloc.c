@@ -91,24 +91,38 @@ int stm_alloc_extent(struct stm_alloc *a, uint32_t count, uint64_t *out_paddr)
 {
     uint32_t j;
 
-    /* Fast path: allocate sequentially from hint (O(count), not O(total)) */
-    if (a->hint + count <= a->total) {
-        int ok = 1;
-        for (j = 0; j < count; j++) {
-            if (a->refcounts[a->hint + j] != 0) { ok = 0; break; }
+    /* Fast path: scan forward from hint looking for a contiguous free run.
+     * Covers the common case (sequential writes) and also finds free space
+     * left by COW reclaim or deletes without a full O(total) scan.
+     * Limit the scan to avoid degrading to slow path on fragmented volumes. */
+    {
+        uint64_t pos = a->hint;
+        uint64_t limit = pos + 4096;  /* scan up to 4K blocks ahead */
+        if (limit > a->total) limit = a->total;
+        uint32_t run = 0;
+
+        while (pos + count <= limit) {
+            if (a->refcounts[pos] == 0) {
+                run++;
+                if (run == count) {
+                    uint64_t base = pos - count + 1;
+                    for (j = 0; j < count; j++)
+                        a->refcounts[base + j] = 1;
+                    a->free_count -= count;
+                    a->hint = base + count;
+                    *out_paddr = base * STM_BLOCK_SIZE;
+                    return 0;
+                }
+            } else {
+                run = 0;
+            }
+            pos++;
         }
-        if (ok) {
-            uint64_t base = a->hint;
-            for (j = 0; j < count; j++)
-                a->refcounts[base + j] = 1;
-            a->free_count -= count;
-            a->hint = base + count;
-            *out_paddr = base * STM_BLOCK_SIZE;
-            return 0;
-        }
+        /* Update hint past what we scanned so we don't re-scan next time */
+        a->hint = pos;
     }
 
-    /* Slow path: scan all blocks for a contiguous free run. */
+    /* Slow path: full scan from block 0. */
     {
         uint64_t i;
         uint32_t run = 0;
@@ -181,19 +195,14 @@ void stm_alloc_ref(struct stm_alloc *a, uint64_t block_nr, uint32_t count)
 void stm_alloc_commit(struct stm_alloc *a)
 {
     uint32_t i;
-    uint64_t lowest_freed = a->total;
     for (i = 0; i < a->ndeferred; i++) {
         uint64_t b = a->deferred[i].block_nr;
         if (b < a->total && a->refcounts[b] == REFCOUNT_PENDING) {
             a->refcounts[b] = 0;   /* now truly free */
             a->free_count++;
-            if (b < lowest_freed) lowest_freed = b;
         }
     }
     a->ndeferred = 0;
-    /* Reset hint to reuse freed space — avoids slow scans after deletes. */
-    if (lowest_freed < a->hint)
-        a->hint = lowest_freed;
 }
 
 uint64_t stm_alloc_free_count(struct stm_alloc *a)
