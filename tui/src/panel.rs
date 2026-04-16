@@ -385,7 +385,8 @@ impl Panel {
     pub fn begin_write(&mut self, name: &str) -> Result<WriteHandle> {
         match &mut self.backend {
             Backend::P9 { client, root_fid, path } => {
-                // Remove existing file if present
+                // Remove existing file if present (walk now properly
+                // rejects partial walks, so this won't hit a parent dir)
                 let mut full: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
                 for part in name.split('/').filter(|s| !s.is_empty()) {
                     full.push(part);

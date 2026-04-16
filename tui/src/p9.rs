@@ -228,6 +228,14 @@ impl P9Client {
         if resp[4] != RWALK {
             bail!("walk failed");
         }
+        // Check for partial walk — server walked fewer names than requested.
+        // The newfid is assigned to the partial path, which is wrong for us.
+        let nwqid = u16::from_le_bytes([resp[7], resp[8]]);
+        if !names.is_empty() && (nwqid as usize) < names.len() {
+            // Partial walk — clunk the partial fid and report failure
+            let _ = self.clunk(newfid);
+            bail!("walk: path component not found");
+        }
         Ok(newfid)
     }
 
