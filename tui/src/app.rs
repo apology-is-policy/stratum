@@ -538,8 +538,10 @@ impl App {
         };
 
         if state.cancelled || state.copied >= state.total {
-            // Current file done — close its handles
-            state.total_copied += state.copied;
+            // Current file done — close its handles (only count once)
+            if state.write_handle.is_some() || state.read_handle.is_some() {
+                state.total_copied += state.copied;
+            }
             if let Some(wh) = state.write_handle.take() {
                 let dp = match state.dest {
                     Focus::Left => &mut self.left,

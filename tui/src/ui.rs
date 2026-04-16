@@ -398,7 +398,7 @@ fn draw_copy_dialog(frame: &mut Frame, area: Rect, cs: &CopyState) {
     // Use aggregate progress for multi-file copies
     let agg_copied = cs.total_copied + cs.copied;
     let agg_total = cs.total_bytes;
-    let pct = if agg_total > 0 { (agg_copied * 100 / agg_total) as usize } else { 0 };
+    let pct = if agg_total > 0 { ((agg_copied * 100 / agg_total) as usize).min(100) } else { 0 };
     {
         let pb = Block::default()
             .borders(Borders::ALL)
@@ -409,7 +409,7 @@ fn draw_copy_dialog(frame: &mut Frame, area: Rect, cs: &CopyState) {
         frame.render_widget(pb, sections[2]);
 
         let bw = pi.width as usize;
-        let filled = bw * pct / 100;
+        let filled = (bw * pct / 100).min(bw);
         let bar = format!("{}{}", "\u{2588}".repeat(filled), "\u{2591}".repeat(bw - filled));
         frame.render_widget(Paragraph::new(Span::styled(bar, Style::default().fg(CLR_COPY_PBAR_FILL))), pi);
     }
