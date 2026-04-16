@@ -11,6 +11,11 @@ pub enum WriteHandle {
     HostFile(std::fs::File),
 }
 
+pub enum ReadHandle {
+    P9Fid(u32),
+    HostFile(std::fs::File),
+}
+
 #[derive(Clone)]
 pub struct Entry {
     pub name: String,
@@ -206,6 +211,63 @@ impl Panel {
             }
             Backend::Host(h) => { h.mkdir(name)?; self.refresh() }
             Backend::None => Err(anyhow!("not connected")),
+        }
+    }
+
+    /// Open a persistent read handle — file is opened and stays open.
+    pub fn begin_read(&mut self, name: &str) -> Result<(ReadHandle, u64)> {
+        match &mut self.backend {
+            Backend::P9 { client, root_fid, path } => {
+                let mut fpath: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                fpath.push(name);
+                let fid = client.walk(*root_fid, &fpath)?;
+                let stat = client.stat(fid)?;
+                client.open(fid, OREAD)?;
+                Ok((ReadHandle::P9Fid(fid), stat.length))
+            }
+            Backend::Host(h) => {
+                use std::io::Read;
+                let p = h.cwd.join(name);
+                let meta = std::fs::metadata(&p)?;
+                let f = std::fs::File::open(p)?;
+                Ok((ReadHandle::HostFile(f), meta.len()))
+            }
+            Backend::None => Err(anyhow!("not connected")),
+        }
+    }
+
+    /// Read a chunk from a persistent read handle.
+    pub fn read_from_handle(&mut self, handle: &mut ReadHandle,
+                            offset: u64, len: u32) -> Result<Vec<u8>> {
+        match handle {
+            ReadHandle::P9Fid(fid) => {
+                let client = match &mut self.backend {
+                    Backend::P9 { client, .. } => client,
+                    _ => return Err(anyhow!("backend mismatch")),
+                };
+                client.read(*fid, offset, len)
+            }
+            ReadHandle::HostFile(f) => {
+                use std::io::{Read, Seek, SeekFrom};
+                f.seek(SeekFrom::Start(offset))?;
+                let mut buf = vec![0u8; len as usize];
+                let n = f.read(&mut buf)?;
+                buf.truncate(n);
+                Ok(buf)
+            }
+        }
+    }
+
+    /// Close a read handle.
+    pub fn end_read(&mut self, handle: ReadHandle) -> Result<()> {
+        match handle {
+            ReadHandle::P9Fid(fid) => {
+                if let Backend::P9 { client, .. } = &mut self.backend {
+                    client.clunk(fid)?;
+                }
+                Ok(())
+            }
+            ReadHandle::HostFile(_) => Ok(()),
         }
     }
 

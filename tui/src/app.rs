@@ -1,7 +1,7 @@
 //! Application state machine.
 
 use crate::config::Config;
-use crate::panel::{Panel, WriteHandle};
+use crate::panel::{Panel, ReadHandle, WriteHandle};
 use std::process::{Child, Command};
 use std::time::Duration;
 
@@ -51,12 +51,13 @@ pub struct App {
 
 pub struct CopyState {
     pub filename: String,
-    pub data: Vec<u8>,
-    pub written: usize,
-    pub total: usize,
+    pub copied: u64,
+    pub total: u64,
+    pub src: Focus,
     pub dest: Focus,
     pub cancelled: bool,
-    pub handle: Option<WriteHandle>,
+    pub read_handle: Option<ReadHandle>,
+    pub write_handle: Option<WriteHandle>,
 }
 
 impl App {
@@ -360,90 +361,135 @@ impl App {
             return;
         }
 
-        self.status = format!("Reading {}...", entry.name);
-        let data = match self.active().read_file(&entry.name) {
-            Ok(d) => d,
-            Err(e) => { self.status = format!("Read error: {e}"); return; }
-        };
-
-        let dest = match self.focus {
+        let src = self.focus;
+        let dest = match src {
             Focus::Left => Focus::Right,
             Focus::Right => Focus::Left,
         };
 
-        // open a persistent write handle on the destination
+        // open read handle on source
+        let src_panel = match src {
+            Focus::Left => &mut self.left,
+            Focus::Right => &mut self.right,
+        };
+        let (rh, size) = match src_panel.begin_read(&entry.name) {
+            Ok(r) => r,
+            Err(e) => { self.status = format!("Read error: {e}"); return; }
+        };
+
+        // open write handle on destination
         let dest_panel = match dest {
             Focus::Left => &mut self.left,
             Focus::Right => &mut self.right,
         };
-        let handle = match dest_panel.begin_write(&entry.name) {
+        let wh = match dest_panel.begin_write(&entry.name) {
             Ok(h) => h,
-            Err(e) => { self.status = format!("Create error: {e}"); return; }
+            Err(e) => {
+                let sp = match src {
+                    Focus::Left => &mut self.left,
+                    Focus::Right => &mut self.right,
+                };
+                let _ = sp.end_read(rh);
+                self.status = format!("Create error: {e}");
+                return;
+            }
         };
 
-        let total = data.len();
         self.copy_state = Some(CopyState {
-            filename: entry.name,
-            data,
-            written: 0,
-            total,
+            filename: entry.name.clone(),
+            copied: 0,
+            total: size,
+            src,
             dest,
             cancelled: false,
-            handle: Some(handle),
+            read_handle: Some(rh),
+            write_handle: Some(wh),
         });
+        self.status = format!("Copying {} ({})...", entry.name, human_size(size));
     }
 
-    /// Drive one chunk of the copy. Called each frame from the main loop.
+    /// Drive one chunk of the streaming copy. Called each frame from the main loop.
     pub fn copy_tick(&mut self) -> bool {
-        const CHUNK: usize = 262144; // 256 KiB per tick
+        // 1 MiB per tick — large chunks for throughput, small enough
+        // that the progress bar updates visibly on big files.
+        const CHUNK: u32 = 1048576;
 
         let mut state = match self.copy_state.take() {
             Some(s) => s,
             None => return false,
         };
 
-        if state.cancelled || state.written >= state.total {
-            if !state.cancelled && state.handle.is_some()
+        if state.cancelled || state.copied >= state.total {
+            if !state.cancelled && state.write_handle.is_some()
                && self.busy_message.is_none() {
-                // First pass: set the busy message and return true so the
-                // main loop draws "Syncing..." before we do the blocking clunk.
                 self.busy_message = Some("Syncing to disk...".into());
                 self.copy_state = Some(state);
                 return true;
             }
-            // Second pass (or cancel): actually finalize
-            if let Some(handle) = state.handle.take() {
-                let dest = match state.dest {
+            // Finalize: close handles
+            if let Some(wh) = state.write_handle.take() {
+                let dp = match state.dest {
                     Focus::Left => &mut self.left,
                     Focus::Right => &mut self.right,
                 };
-                let _ = dest.end_write(handle);
-                let _ = dest.refresh();
+                let _ = dp.end_write(wh);
+                let _ = dp.refresh();
+            }
+            if let Some(rh) = state.read_handle.take() {
+                let sp = match state.src {
+                    Focus::Left => &mut self.left,
+                    Focus::Right => &mut self.right,
+                };
+                let _ = sp.end_read(rh);
             }
             self.busy_message = None;
             if state.cancelled {
                 self.status = format!("Copy cancelled: {}", state.filename);
             } else {
                 self.status = format!("Copied {} ({})",
-                    state.filename, human_size(state.total as u64));
+                    state.filename, human_size(state.total));
             }
             return false;
         }
 
-        let end = (state.written + CHUNK).min(state.total);
-        let chunk = state.data[state.written..end].to_vec();
+        // Read a chunk from source
+        let remain = state.total - state.copied;
+        let ask = if remain < CHUNK as u64 { remain as u32 } else { CHUNK };
 
-        let dest = match state.dest {
+        let src_panel = match state.src {
             Focus::Left => &mut self.left,
             Focus::Right => &mut self.right,
         };
-
-        match dest.write_to_handle(state.handle.as_mut().unwrap(),
-                                   state.written as u64, &chunk) {
-            Ok(()) => state.written = end,
+        let data = match src_panel.read_from_handle(
+            state.read_handle.as_mut().unwrap(), state.copied, ask)
+        {
+            Ok(d) if d.is_empty() => {
+                // EOF — mark as done
+                state.copied = state.total;
+                self.copy_state = Some(state);
+                return true;
+            }
+            Ok(d) => d,
             Err(e) => {
-                self.status = format!("Copy error: {e}");
-                if let Some(h) = state.handle.take() { let _ = dest.end_write(h); }
+                self.status = format!("Read error: {e}");
+                self.copy_state = Some(state);
+                return false;
+            }
+        };
+
+        // Write the chunk to destination
+        let n = data.len() as u64;
+        let dest_panel = match state.dest {
+            Focus::Left => &mut self.left,
+            Focus::Right => &mut self.right,
+        };
+        match dest_panel.write_to_handle(
+            state.write_handle.as_mut().unwrap(), state.copied, &data)
+        {
+            Ok(()) => state.copied += n,
+            Err(e) => {
+                self.status = format!("Write error: {e}");
+                self.copy_state = Some(state);
                 return false;
             }
         }

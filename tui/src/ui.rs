@@ -317,7 +317,7 @@ fn draw_copy_dialog(frame: &mut Frame, area: Rect, cs: &CopyState) {
     frame.render_widget(Clear, rect);
     frame.render_widget(block, rect);
 
-    let pct = if cs.total > 0 { cs.written * 100 / cs.total } else { 0 };
+    let pct = if cs.total > 0 { (cs.copied * 100 / cs.total) as usize } else { 0 };
     let bar_width = inner.width.saturating_sub(2) as usize;
     let filled = bar_width * pct / 100;
 
@@ -338,8 +338,8 @@ fn draw_copy_dialog(frame: &mut Frame, area: Rect, cs: &CopyState) {
         )),
         Line::from(Span::styled(
             format!(" {} / {}  ({}%)",
-                human_size(cs.written as u64),
-                human_size(cs.total as u64),
+                human_size(cs.copied),
+                human_size(cs.total),
                 pct),
             Style::default().fg(Color::Cyan),
         )),
