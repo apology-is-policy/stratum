@@ -122,8 +122,9 @@ int stm_alloc_extent(struct stm_alloc *a, uint32_t count, uint64_t *out_paddr)
         a->hint = pos;
     }
 
-    /* Slow path: full scan from block 0. */
-    {
+    /* Slow path: full scan from block 0.
+     * Skip if there aren't enough free blocks — go straight to grow. */
+    if (a->free_count >= count) {
         uint64_t i;
         uint32_t run = 0;
         for (i = 0; i < a->total; i++) {
@@ -144,7 +145,7 @@ int stm_alloc_extent(struct stm_alloc *a, uint32_t count, uint64_t *out_paddr)
         }
     }
 
-    /* No contiguous run found — grow the volume and retry. */
+    /* No free space (or too fragmented) — grow the volume and retry. */
     {
         uint64_t old_total = a->total;
         if (try_grow(a) == 0) {
