@@ -1,6 +1,7 @@
 //! FAR Commander-style TUI rendering.
 
 use crate::app::{App, CopyState, Focus, InputAction, Mode};
+use crate::editor::EditorMode;
 use crate::panel::Panel;
 use ratatui::prelude::*;
 use ratatui::symbols::border;
@@ -32,27 +33,27 @@ const CLR_FKEY_LABEL_FG: Color = Color::Black;
 const CLR_FKEY_LABEL_BG: Color = Color::Cyan;
 
 const CLR_POPUP_BORDER: Color = Color::White;
-const CLR_POPUP_BG: Color = Color::DarkGray;
-const CLR_INFO_TEXT: Color = Color::Cyan;
+const CLR_POPUP_BG: Color = Color::Black;
+const CLR_INFO_TEXT: Color = Color::White;
 
 // ── copy dialog colors (edit these to tweak) ──────────────────────────
 //
 // Outer frame:
-const CLR_COPY_BORDER: Color = Color::White;       // ui.rs ~ line 171
-const CLR_COPY_BG: Color = Color::DarkGray;         // ui.rs ~ line 172
+const CLR_COPY_BORDER: Color = Color::Cyan;       // ui.rs ~ line 171
+const CLR_COPY_BG: Color = Color::Black;         // ui.rs ~ line 172
 // Progress bar frame:
-const CLR_COPY_PBAR_BORDER: Color = Color::Green;   // ui.rs ~ line 186
-const CLR_COPY_PBAR_FILL: Color = Color::Green;     // ui.rs ~ line 195
+const CLR_COPY_PBAR_BORDER: Color = Color::White;   // ui.rs ~ line 186
+const CLR_COPY_PBAR_FILL: Color = Color::White;     // ui.rs ~ line 195
 // Stats frame:
-const CLR_COPY_STATS_BORDER: Color = Color::DarkGray;  // ui.rs ~ line 211
-const CLR_COPY_SPEED: Color = Color::Yellow;         // ui.rs ~ line 217
-const CLR_COPY_TIME: Color = Color::Cyan;            // ui.rs ~ line 219
+const CLR_COPY_STATS_BORDER: Color = Color::White;  // ui.rs ~ line 211
+const CLR_COPY_SPEED: Color = Color::White;         // ui.rs ~ line 217
+const CLR_COPY_TIME: Color = Color::White;            // ui.rs ~ line 219
 // Throughput chart frame:
-const CLR_COPY_CHART_BORDER: Color = Color::DarkGray;  // ui.rs ~ line 228
+const CLR_COPY_CHART_BORDER: Color = Color::White;  // ui.rs ~ line 228
 const CLR_COPY_CHART_BG: Color = Color::Black;      // ui.rs ~ line 230
-const CLR_CHART_HIGH: Color = Color::Green;          // ui.rs ~ line 244
-const CLR_CHART_MID: Color = Color::Yellow;          // ui.rs ~ line 245
-const CLR_CHART_LOW: Color = Color::Red;             // ui.rs ~ line 246
+const CLR_CHART_HIGH: Color = Color::LightGreen;          // ui.rs ~ line 244
+const CLR_CHART_MID: Color = Color::LightYellow;          // ui.rs ~ line 245
+const CLR_CHART_LOW: Color = Color::LightRed;             // ui.rs ~ line 246
 
 // ── main draw ─────────────────────────────────────────────────────────
 
@@ -87,6 +88,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
     frame.render_widget(status, rows[1]);
 
     draw_fkey_bar(frame, rows[2]);
+
+    // editor overlay (full screen)
+    if let Some(ref ed) = app.editor {
+        draw_editor(frame, area, ed);
+        return; // editor takes over the entire screen
+    }
 
     // overlays
     if let Mode::Input { prompt, callback, .. } = &app.mode {
@@ -284,7 +291,7 @@ fn draw_info_panel(frame: &mut Frame, _panel: &Panel, area: Rect, focused: bool,
 
 fn draw_fkey_bar(frame: &mut Frame, area: Rect) {
     let keys: &[(&str, &str)] = &[
-        ("1", ""), ("2", "Open"), ("3", ""), ("4", ""),
+        ("1", ""), ("2", "Open"), ("3", "View"), ("4", "Edit"),
         ("5", "Copy"), ("6", ""), ("7", "MkDir"), ("8", "Delete"),
         ("9", ""), ("10", "Quit"),
     ];
@@ -465,6 +472,98 @@ fn draw_copy_dialog(frame: &mut Frame, area: Rect, cs: &CopyState) {
     frame.render_widget(Paragraph::new(Line::from(Span::styled(
         " Esc to cancel", Style::default().fg(Color::DarkGray),
     ))), sections[5]);
+}
+
+// ── editor (full-screen) ──────────────────────────────────────────
+
+fn draw_editor(frame: &mut Frame, area: Rect, ed: &crate::editor::EditorState) {
+    frame.render_widget(Block::default().style(Style::default().bg(CLR_BG)), area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(3),     // textarea
+            Constraint::Length(1),  // status bar
+        ])
+        .split(area);
+
+    // Textarea with border
+    let title_style = if ed.readonly {
+        Style::default().fg(Color::DarkGray)
+    } else if ed.modified {
+        Style::default().fg(Color::Yellow).bold()
+    } else {
+        Style::default().fg(Color::White).bold()
+    };
+
+    let modified_mark = if ed.modified { " [+]" } else { "" };
+    let title = format!(" {}{modified_mark} ", ed.filename);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(dbl_border())
+        .border_style(Style::default().fg(if ed.readonly { Color::DarkGray } else { CLR_BORDER_ACTIVE }).bold())
+        .title(Line::from(Span::styled(title, title_style)).centered())
+        .style(Style::default().bg(CLR_BG));
+
+    let inner = block.inner(rows[0]);
+    frame.render_widget(block, rows[0]);
+    frame.render_widget(&ed.textarea, inner);
+
+    // Status bar: mode | command buffer | status message | position
+    let mode_clr = match ed.mode {
+        EditorMode::Normal => if ed.readonly { Color::DarkGray } else { Color::Blue },
+        EditorMode::Insert => Color::Green,
+        EditorMode::Command(_) => Color::Yellow,
+    };
+
+    let (cy, cx) = ed.textarea.cursor();
+    let mut spans = vec![
+        Span::styled(
+            format!(" {} ", ed.mode_str()),
+            Style::default().fg(Color::Black).bg(mode_clr).bold(),
+        ),
+    ];
+
+    if let Some(cmd) = ed.command_buf() {
+        spans.push(Span::styled(
+            format!(" {cmd}"),
+            Style::default().fg(Color::Yellow).bold(),
+        ));
+    } else if let Some(ref msg) = ed.status_msg {
+        spans.push(Span::styled(
+            format!(" {msg}"),
+            Style::default().fg(Color::Cyan),
+        ));
+    } else if ed.readonly {
+        spans.push(Span::styled(
+            " [readonly]  q/Esc to close",
+            Style::default().fg(Color::DarkGray),
+        ));
+    } else {
+        spans.push(Span::styled(
+            " i:insert  ::command  :w :q :wq :q!",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    // Right-align the cursor position
+    let pos_str = format!(" {}:{} ", cy + 1, cx + 1);
+    let used: usize = spans.iter().map(|s| s.content.len()).sum();
+    let pad = (area.width as usize).saturating_sub(used + pos_str.len());
+    spans.push(Span::styled(
+        " ".repeat(pad),
+        Style::default().bg(CLR_BG),
+    ));
+    spans.push(Span::styled(
+        pos_str,
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(CLR_BG)),
+        rows[1],
+    );
 }
 
 // ── busy dialog ───────────────────────────────────────────────────────

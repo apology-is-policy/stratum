@@ -1,6 +1,7 @@
 //! Application state machine.
 
 use crate::config::Config;
+use crate::editor::EditorState;
 use crate::panel::{Panel, ReadHandle, WriteHandle};
 use std::process::{Child, Command};
 use std::time::Duration;
@@ -43,6 +44,7 @@ pub struct App {
     pub copy_state: Option<CopyState>,
     pub busy_message: Option<String>,
     pub pending_action: Option<PendingAction>,
+    pub editor: Option<EditorState>,
     // server management
     server_proc: Option<Child>,
     server_sock: Option<String>,
@@ -83,6 +85,7 @@ impl App {
             copy_state: None,
             busy_message: None,
             pending_action: None,
+            editor: None,
             server_proc: None,
             server_sock: None,
             pending_volume: None,
@@ -174,6 +177,8 @@ impl App {
         match key.code {
             // function keys
             KeyCode::F(2) => self.prompt_open_volume(),
+            KeyCode::F(3) => self.open_editor(true),
+            KeyCode::F(4) => self.open_editor(false),
             KeyCode::F(5) => self.copy_file(),
             KeyCode::F(7) => {
                 self.mode = Mode::Input {
@@ -363,6 +368,59 @@ impl App {
         }
         self.server_proc = None;
         self.server_sock = None;
+    }
+
+    fn open_editor(&mut self, readonly: bool) {
+        let entry = match self.active().selected() {
+            Some(e) => e.clone(),
+            None => return,
+        };
+        if entry.is_dir || entry.name == ".." {
+            self.status = "Cannot edit directories".into();
+            return;
+        }
+        if entry.size > EditorState::max_file_size() {
+            self.status = format!("File too large for editor (max {})",
+                human_size(EditorState::max_file_size()));
+            return;
+        }
+
+        let data = match self.active().read_file(&entry.name) {
+            Ok(d) => d,
+            Err(e) => { self.status = format!("Read error: {e}"); return; }
+        };
+
+        let text = String::from_utf8_lossy(&data).into_owned();
+        let src = self.focus;
+        self.editor = Some(EditorState::new(entry.name, &text, readonly, src));
+    }
+
+    pub fn editor_tick(&mut self) {
+        let ed = match self.editor.as_mut() {
+            Some(e) => e,
+            None => return,
+        };
+
+        if ed.save_requested {
+            ed.save_requested = false;
+            let content = ed.content();
+            let name = ed.filename.clone();
+            let panel = match ed.src {
+                Focus::Left => &mut self.left,
+                Focus::Right => &mut self.right,
+            };
+            if let Err(e) = panel.write_file(&name, content.as_bytes()) {
+                if let Some(ref mut ed) = self.editor {
+                    ed.status_msg = Some(format!("Save error: {e}"));
+                    ed.modified = true;
+                }
+            }
+        }
+
+        if self.editor.as_ref().map_or(false, |e| e.quit_requested) {
+            self.editor = None;
+            let _ = self.active().refresh();
+        }
     }
 
     fn copy_file(&mut self) {

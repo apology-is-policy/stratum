@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod config;
+mod editor;
 mod hostfs;
 mod p9;
 mod panel;
@@ -42,13 +43,28 @@ fn main() -> Result<()> {
     loop {
         terminal.draw(|f| ui::draw(f, &app))?;
 
-        // Execute deferred blocking actions AFTER the draw so the
-        // busy dialog is visible while the operation runs.
+        // Execute deferred blocking actions AFTER the draw
         if app.pending_action.is_some() {
             app.run_pending_action();
             continue;
         }
 
+        // Editor mode — all keys go to editor
+        if app.editor.is_some() {
+            if event::poll(Duration::from_millis(50))? {
+                if let Event::Key(key) = event::read()? {
+                    if key.kind == KeyEventKind::Press {
+                        if let Some(ref mut ed) = app.editor {
+                            ed.handle_key(key);
+                        }
+                    }
+                }
+            }
+            app.editor_tick();
+            continue;
+        }
+
+        // Copy mode
         if app.copy_state.is_some() {
             app.copy_tick();
             if event::poll(Duration::from_millis(5))? {
@@ -61,6 +77,7 @@ fn main() -> Result<()> {
             continue;
         }
 
+        // Normal mode
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
