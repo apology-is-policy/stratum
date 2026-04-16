@@ -4,9 +4,12 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/file.h>
 
 struct file_ctx {
     FILE *fp;
+    int   fd;       /* for fsync + flock */
     uint64_t size;
 };
 
@@ -35,7 +38,13 @@ static int file_write(void *ctx, uint64_t offset, const void *buf, uint32_t len)
 static int file_sync(void *ctx)
 {
     struct file_ctx *fc = ctx;
+    /* fflush: stdio buffer → kernel page cache */
     if (fflush(fc->fp) != 0)
+        return -errno;
+    /* fsync: kernel page cache → disk.  Critical for crash safety —
+     * without this, a power failure can lose data that fflush sent
+     * to the kernel but that the kernel hasn't written to disk yet. */
+    if (fsync(fc->fd) != 0)
         return -errno;
     return 0;
 }
@@ -43,8 +52,10 @@ static int file_sync(void *ctx)
 static void file_close(void *ctx)
 {
     struct file_ctx *fc = ctx;
-    if (fc->fp)
+    if (fc->fp) {
+        /* flock released automatically on close */
         fclose(fc->fp);
+    }
     free(fc);
 }
 
@@ -88,7 +99,6 @@ int stm_file_backend_open(const char *path, int create, uint64_t size,
             free(fc);
             return -errno;
         }
-        /* Extend file to requested size */
         if (fseek(fc->fp, (long)(size - 1), SEEK_SET) != 0 ||
             fputc(0, fc->fp) == EOF) {
             fclose(fc->fp);
@@ -104,6 +114,19 @@ int stm_file_backend_open(const char *path, int create, uint64_t size,
         }
         fseek(fc->fp, 0, SEEK_END);
         fc->size = (uint64_t)ftell(fc->fp);
+    }
+
+    fc->fd = fileno(fc->fp);
+
+    /* Exclusive lock — prevents two servers from opening the same volume.
+     * LOCK_NB: non-blocking, returns EWOULDBLOCK if already locked. */
+    if (flock(fc->fd, LOCK_EX | LOCK_NB) != 0) {
+        int err = errno;
+        fclose(fc->fp);
+        free(fc);
+        if (err == EWOULDBLOCK)
+            fprintf(stderr, "Volume is already in use by another process.\n");
+        return -err;
     }
 
     dev->ops = &file_ops;
