@@ -477,6 +477,7 @@ fn draw_copy_dialog(frame: &mut Frame, area: Rect, cs: &CopyState) {
 // ── editor (full-screen) ──────────────────────────────────────────
 
 fn draw_editor(frame: &mut Frame, area: Rect, ed: &crate::editor::EditorState) {
+    frame.render_widget(Clear, area);
     frame.render_widget(Block::default().style(Style::default().bg(CLR_BG)), area);
 
     let rows = Layout::default()
