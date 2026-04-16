@@ -3,6 +3,7 @@
 use crate::config::Config;
 use crate::panel::{Panel, WriteHandle};
 use std::process::{Child, Command};
+use std::time::Duration;
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Focus { Left, Right }
@@ -312,6 +313,16 @@ impl App {
 
     fn stop_server(&mut self) {
         if let Some(ref mut proc) = self.server_proc {
+            // SIGTERM for graceful shutdown (server syncs before exit)
+            unsafe { libc::kill(proc.id() as i32, libc::SIGTERM); }
+            // Wait up to 10s for sync to complete
+            for _ in 0..100 {
+                match proc.try_wait() {
+                    Ok(Some(_)) => break,
+                    _ => std::thread::sleep(Duration::from_millis(100)),
+                }
+            }
+            // Force kill if still alive
             let _ = proc.kill();
             let _ = proc.wait();
         }
