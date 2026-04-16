@@ -59,6 +59,10 @@ impl Panel {
         !matches!(self.backend, Backend::None)
     }
 
+    pub fn selected_entry(&self) -> Option<&Entry> {
+        self.entries.get(self.cursor)
+    }
+
     pub fn path_str(&self) -> String {
         match &self.backend {
             Backend::None => String::new(),
@@ -383,19 +387,24 @@ impl Panel {
     }
 
     pub fn delete_selected(&mut self) -> Result<()> {
-        let entry = match self.selected() {
+        let entry = match self.selected_entry() {
             Some(e) if e.name != ".." => e.clone(),
             _ => return Ok(()),
         };
+        self.delete_by_name(&entry.name)?;
+        self.refresh()
+    }
+
+    pub fn delete_by_name(&mut self, name: &str) -> Result<()> {
         match &mut self.backend {
             Backend::P9 { client, root_fid, path } => {
                 let mut fpath: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
-                fpath.push(&entry.name);
+                fpath.push(name);
                 let fid = client.walk(*root_fid, &fpath)?;
                 client.remove(fid)?;
-                self.refresh()
+                Ok(())
             }
-            Backend::Host(h) => { h.delete(&entry.name)?; self.refresh() }
+            Backend::Host(h) => h.delete(name),
             Backend::None => Err(anyhow!("not connected")),
         }
     }

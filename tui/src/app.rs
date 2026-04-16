@@ -57,18 +57,24 @@ pub struct ThroughputSample {
 }
 
 pub struct CopyState {
-    pub filename: String,
-    pub copied: u64,
-    pub total: u64,
+    pub filename: String,       // current file
+    pub copied: u64,            // bytes copied of current file
+    pub total: u64,             // size of current file
     pub src: Focus,
     pub dest: Focus,
     pub cancelled: bool,
     pub read_handle: Option<ReadHandle>,
     pub write_handle: Option<WriteHandle>,
+    // Aggregate stats (persist across files in a multi-file copy)
     pub start_time: std::time::Instant,
     pub samples: Vec<ThroughputSample>,
     pub last_sample_bytes: u64,
     pub last_sample_time: std::time::Instant,
+    pub total_bytes: u64,       // total bytes across all files
+    pub total_copied: u64,      // bytes copied across all files
+    pub file_index: usize,      // current file (0-based)
+    pub file_count: usize,      // total files in queue
+    pub queue: Vec<String>,     // remaining filenames to copy
 }
 
 impl App {
@@ -188,10 +194,34 @@ impl App {
                 };
             }
             KeyCode::F(8) => {
-                if let Err(e) = self.active().delete_selected() {
-                    self.status = format!("Delete error: {e}");
+                let panel = self.active();
+                if panel.selected.is_empty() {
+                    // Delete cursor item
+                    if let Err(e) = panel.delete_selected() {
+                        self.status = format!("Delete error: {e}");
+                    } else {
+                        self.status = "Deleted".into();
+                    }
                 } else {
-                    self.status = "Deleted".into();
+                    // Delete all selected items
+                    let names: Vec<String> = panel.selected.iter()
+                        .filter_map(|&i| panel.entries.get(i))
+                        .filter(|e| !e.is_dir && e.name != "..")
+                        .map(|e| e.name.clone())
+                        .collect();
+                    let mut ok = 0;
+                    let mut errs = 0;
+                    for name in &names {
+                        if let Err(_) = panel.delete_by_name(name) { errs += 1; }
+                        else { ok += 1; }
+                    }
+                    panel.selected.clear();
+                    let _ = panel.refresh();
+                    if errs > 0 {
+                        self.status = format!("Deleted {ok}, {errs} error(s)");
+                    } else {
+                        self.status = format!("Deleted {ok} file(s)");
+                    }
                 }
             }
             KeyCode::F(10) | KeyCode::Char('q') => self.quit = true,
@@ -332,7 +362,7 @@ impl App {
                 // connect left panel
                 match self.left.connect_9p_unix(&sock) {
                     Ok(()) => {
-                        self.left.label = format!("Stratum: {}", short_path(path));
+                        self.left.label = format!("[{}]", short_path(path));
                         self.config.add_volume(path);
                         self.status = format!("Opened {path}");
                     }
@@ -371,7 +401,7 @@ impl App {
     }
 
     fn open_editor(&mut self, readonly: bool) {
-        let entry = match self.active().selected() {
+        let entry = match self.active().selected_entry() {
             Some(e) => e.clone(),
             None => return,
         };
@@ -426,56 +456,61 @@ impl App {
     fn copy_file(&mut self) {
         if self.copy_state.is_some() { return; }
 
-        let entry = match self.active().selected() {
-            Some(e) => e.clone(),
-            None => return,
-        };
-        if entry.is_dir || entry.name == ".." {
-            self.status = "Cannot copy directories yet".into();
-            return;
-        }
-
         let src = self.focus;
-        let dest = match src {
-            Focus::Left => Focus::Right,
-            Focus::Right => Focus::Left,
+        let dest = match src { Focus::Left => Focus::Right, Focus::Right => Focus::Left };
+        let panel = self.active();
+
+        // Build file list: selected items, or just the cursor item
+        let files: Vec<String> = if panel.selected.is_empty() {
+            match panel.selected_entry() {
+                Some(e) if !e.is_dir && e.name != ".." => vec![e.name.clone()],
+                _ => { self.status = "Cannot copy directories yet".into(); return; }
+            }
+        } else {
+            let mut names = Vec::new();
+            for &idx in &panel.selected {
+                if let Some(e) = panel.entries.get(idx) {
+                    if !e.is_dir && e.name != ".." {
+                        names.push(e.name.clone());
+                    }
+                }
+            }
+            if names.is_empty() { self.status = "No files selected".into(); return; }
+            names
         };
 
-        // open read handle on source
-        let src_panel = match src {
-            Focus::Left => &mut self.left,
-            Focus::Right => &mut self.right,
-        };
-        let (rh, size) = match src_panel.begin_read(&entry.name) {
+        // Compute total size across all files
+        let panel = match src { Focus::Left => &self.left, Focus::Right => &self.right };
+        let total_bytes: u64 = files.iter().filter_map(|n| {
+            panel.entries.iter().find(|e| e.name == *n).map(|e| e.size)
+        }).sum();
+
+        let file_count = files.len();
+        let mut queue = files;
+        let first = queue.remove(0);
+
+        // Open handles for the first file
+        let src_panel = match src { Focus::Left => &mut self.left, Focus::Right => &mut self.right };
+        let (rh, size) = match src_panel.begin_read(&first) {
             Ok(r) => r,
             Err(e) => { self.status = format!("Read error: {e}"); return; }
         };
-
-        // open write handle on destination
-        let dest_panel = match dest {
-            Focus::Left => &mut self.left,
-            Focus::Right => &mut self.right,
-        };
-        let wh = match dest_panel.begin_write(&entry.name) {
+        let dest_panel = match dest { Focus::Left => &mut self.left, Focus::Right => &mut self.right };
+        let wh = match dest_panel.begin_write(&first) {
             Ok(h) => h,
             Err(e) => {
-                let sp = match src {
-                    Focus::Left => &mut self.left,
-                    Focus::Right => &mut self.right,
-                };
+                let sp = match src { Focus::Left => &mut self.left, Focus::Right => &mut self.right };
                 let _ = sp.end_read(rh);
-                self.status = format!("Create error: {e}");
-                return;
+                self.status = format!("Create error: {e}"); return;
             }
         };
 
         let now = std::time::Instant::now();
         self.copy_state = Some(CopyState {
-            filename: entry.name.clone(),
+            filename: first.clone(),
             copied: 0,
             total: size,
-            src,
-            dest,
+            src, dest,
             cancelled: false,
             read_handle: Some(rh),
             write_handle: Some(wh),
@@ -483,8 +518,12 @@ impl App {
             samples: Vec::new(),
             last_sample_bytes: 0,
             last_sample_time: now,
+            total_bytes,
+            total_copied: 0,
+            file_index: 0,
+            file_count,
+            queue,
         });
-        self.status = format!("Copying {} ({})...", entry.name, human_size(size));
     }
 
     /// Drive one chunk of the streaming copy. Called each frame from the main loop.
@@ -499,20 +538,14 @@ impl App {
         };
 
         if state.cancelled || state.copied >= state.total {
-            if !state.cancelled && state.write_handle.is_some()
-               && self.busy_message.is_none() {
-                self.busy_message = Some("Syncing to disk...".into());
-                self.copy_state = Some(state);
-                return true;
-            }
-            // Finalize: close handles
+            // Current file done — close its handles
+            state.total_copied += state.copied;
             if let Some(wh) = state.write_handle.take() {
                 let dp = match state.dest {
                     Focus::Left => &mut self.left,
                     Focus::Right => &mut self.right,
                 };
                 let _ = dp.end_write(wh);
-                let _ = dp.refresh();
             }
             if let Some(rh) = state.read_handle.take() {
                 let sp = match state.src {
@@ -521,14 +554,70 @@ impl App {
                 };
                 let _ = sp.end_read(rh);
             }
-            self.busy_message = None;
-            if state.cancelled {
-                self.status = format!("Copy cancelled: {}", state.filename);
-            } else {
-                self.status = format!("Copied {} ({})",
-                    state.filename, human_size(state.total));
+
+            if state.cancelled || state.queue.is_empty() {
+                // All done — sync and finalize
+                if !state.cancelled && self.busy_message.is_none() {
+                    self.busy_message = Some("Syncing to disk...".into());
+                    self.copy_state = Some(state);
+                    return true;
+                }
+                self.busy_message = None;
+                // Clear multi-select
+                let panel = match state.src {
+                    Focus::Left => &mut self.left,
+                    Focus::Right => &mut self.right,
+                };
+                panel.selected.clear();
+                let _ = match state.dest {
+                    Focus::Left => self.left.refresh(),
+                    Focus::Right => self.right.refresh(),
+                };
+                if state.cancelled {
+                    self.status = format!("Copy cancelled ({} of {} files)",
+                        state.file_index, state.file_count);
+                } else {
+                    self.status = format!("Copied {} file(s) ({})",
+                        state.file_count, human_size(state.total_copied));
+                }
+                return false;
             }
-            return false;
+
+            // Advance to next file in queue
+            let next = state.queue.remove(0);
+            state.file_index += 1;
+
+            let src_panel = match state.src {
+                Focus::Left => &mut self.left,
+                Focus::Right => &mut self.right,
+            };
+            match src_panel.begin_read(&next) {
+                Ok((rh, size)) => {
+                    state.read_handle = Some(rh);
+                    state.filename = next.clone();
+                    state.copied = 0;
+                    state.total = size;
+                    let dest_panel = match state.dest {
+                        Focus::Left => &mut self.left,
+                        Focus::Right => &mut self.right,
+                    };
+                    match dest_panel.begin_write(&next) {
+                        Ok(wh) => { state.write_handle = Some(wh); }
+                        Err(e) => {
+                            self.status = format!("Create error on {next}: {e}");
+                            self.copy_state = Some(state);
+                            return false;
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.status = format!("Read error on {next}: {e}");
+                    self.copy_state = Some(state);
+                    return false;
+                }
+            }
+            self.copy_state = Some(state);
+            return true;
         }
 
         // Copy in a tight loop for up to 200ms before yielding to redraw.
@@ -577,18 +666,18 @@ impl App {
             if std::time::Instant::now() >= tick_deadline { break; }
         }
 
-        // Record throughput sample every ~0.5s
+        // Record throughput sample every ~0.5s (aggregate across files)
         let now = std::time::Instant::now();
         let dt = now.duration_since(state.last_sample_time).as_secs_f64();
+        let aggregate = state.total_copied + state.copied;
         if dt >= 0.5 {
-            let db = (state.copied - state.last_sample_bytes) as f64;
+            let db = (aggregate - state.last_sample_bytes) as f64;
             state.samples.push(ThroughputSample {
                 bytes_per_sec: db / dt,
                 timestamp: now,
             });
-            // Keep at most 60 samples (30 seconds at 0.5s intervals)
             if state.samples.len() > 60 { state.samples.remove(0); }
-            state.last_sample_bytes = state.copied;
+            state.last_sample_bytes = aggregate;
             state.last_sample_time = now;
         }
 

@@ -222,8 +222,9 @@ fn draw_panel(frame: &mut Frame, panel: &Panel, area: Rect, focused: bool) {
                 name_display, date_str, size_str,
                 nc = name_col, dc = date_col, sc = size_col);
 
+            let cursor_fg = if is_sel { CLR_SELECTED } else { CLR_CURSOR_FG };
             let style = if i == panel.cursor {
-                Style::default().fg(CLR_CURSOR_FG).bg(cursor_bg).bold()
+                Style::default().fg(cursor_fg).bg(cursor_bg).bold()
             } else {
                 Style::default().fg(fg).bg(CLR_BG)
             };
@@ -382,19 +383,27 @@ fn draw_copy_dialog(frame: &mut Frame, area: Rect, cs: &CopyState) {
         ])
         .split(inner);
 
-    // Filename
+    // Filename (with file index for multi-file)
+    let file_label = if cs.file_count > 1 {
+        format!(" {} ({}/{})", cs.filename, cs.file_index + 1, cs.file_count)
+    } else {
+        format!(" {}", cs.filename)
+    };
     frame.render_widget(Paragraph::new(Line::from(Span::styled(
-        format!(" {}", cs.filename),
+        file_label,
         Style::default().fg(Color::White).bold(),
     ))), sections[0]);
 
     // Progress bar
-    let pct = if cs.total > 0 { (cs.copied * 100 / cs.total) as usize } else { 0 };
+    // Use aggregate progress for multi-file copies
+    let agg_copied = cs.total_copied + cs.copied;
+    let agg_total = cs.total_bytes;
+    let pct = if agg_total > 0 { (agg_copied * 100 / agg_total) as usize } else { 0 };
     {
         let pb = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(CLR_COPY_PBAR_BORDER))
-            .title(format!(" {} / {}  ({}%) ", human_size(cs.copied), human_size(cs.total), pct))
+            .title(format!(" {} / {}  ({}%) ", human_size(agg_copied), human_size(agg_total), pct))
             .style(Style::default().bg(CLR_COPY_BG));
         let pi = pb.inner(sections[2]);
         frame.render_widget(pb, sections[2]);
