@@ -671,15 +671,6 @@ int stm_fs_write(struct stm_fs *fs, uint64_t ino, uint64_t offset,
         }
     }
 
-    /* Periodic checkpoint: sync every 256 MiB of writes.
-     * This commits PENDING blocks from COW, making them reusable.
-     * Similar to btrfs/ZFS transaction group commits (~5-30s). */
-    fs->bytes_since_sync += len;
-    if (fs->bytes_since_sync >= (256ULL * 1024 * 1024)) {
-        stm_fs_sync(fs);
-        fs->bytes_since_sync = 0;
-    }
-
     return 0;
 }
 
