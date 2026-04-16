@@ -231,12 +231,104 @@ impl Panel {
         }
     }
 
+    /// Create a directory at a relative path (creates parents as needed).
+    pub fn mkdir_path(&mut self, rel: &str) -> Result<()> {
+        let parts: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+        match &mut self.backend {
+            Backend::P9 { client, root_fid, path } => {
+                let base: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                // Create each component incrementally
+                for i in 0..parts.len() {
+                    let mut walk_path = base.clone();
+                    walk_path.extend_from_slice(&parts[..=i]);
+                    // Try walking to it — if it exists, skip
+                    if let Ok(fid) = client.walk(*root_fid, &walk_path) {
+                        client.clunk(fid)?;
+                        continue;
+                    }
+                    // Doesn't exist — create it
+                    let mut parent_path = base.clone();
+                    parent_path.extend_from_slice(&parts[..i]);
+                    let dir_fid = client.walk(*root_fid, &parent_path)?;
+                    client.create(dir_fid, parts[i], DMDIR | 0o755, OREAD)?;
+                    client.clunk(dir_fid)?;
+                }
+                Ok(())
+            }
+            Backend::Host(h) => {
+                let full = h.cwd.join(rel);
+                std::fs::create_dir_all(full)?;
+                Ok(())
+            }
+            Backend::None => Err(anyhow!("not connected")),
+        }
+    }
+
+    /// Recursively list all files under a directory (returns relative paths).
+    pub fn list_recursive(&mut self, dir_name: &str) -> Result<Vec<(String, bool, u64)>> {
+        let mut result = Vec::new();
+        self.list_recursive_inner(dir_name, dir_name, &mut result)?;
+        Ok(result)
+    }
+
+    fn list_recursive_inner(&mut self, base: &str, rel: &str,
+                            out: &mut Vec<(String, bool, u64)>) -> Result<()> {
+        // Add the directory itself
+        out.push((rel.to_string(), true, 0));
+
+        match &mut self.backend {
+            Backend::P9 { client, root_fid, path } => {
+                let mut fpath: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                for part in rel.split('/').filter(|s| !s.is_empty()) {
+                    fpath.push(part);
+                }
+                let dir_fid = client.walk(*root_fid, &fpath)?;
+                let stats = client.readdir(dir_fid)?;
+                client.clunk(dir_fid)?;
+
+                let entries: Vec<(String, bool, u64)> = stats.iter()
+                    .map(|s| (s.name.clone(), s.is_dir(), s.length))
+                    .collect();
+                // Need to drop the borrow on self before recursing
+                for (name, is_dir, size) in entries {
+                    let child_rel = format!("{rel}/{name}");
+                    if is_dir {
+                        self.list_recursive_inner(base, &child_rel, out)?;
+                    } else {
+                        out.push((child_rel, false, size));
+                    }
+                }
+            }
+            Backend::Host(h) => {
+                let dir_path = h.cwd.join(rel);
+                if let Ok(rd) = std::fs::read_dir(&dir_path) {
+                    let entries: Vec<_> = rd.filter_map(|e| e.ok()).collect();
+                    for e in entries {
+                        let meta = e.metadata()?;
+                        let name = e.file_name().to_string_lossy().into_owned();
+                        let child_rel = format!("{rel}/{name}");
+                        if meta.is_dir() {
+                            self.list_recursive_inner(base, &child_rel, out)?;
+                        } else {
+                            out.push((child_rel, false, meta.len()));
+                        }
+                    }
+                }
+            }
+            Backend::None => {}
+        }
+        Ok(())
+    }
+
     /// Open a persistent read handle — file is opened and stays open.
+    /// Name can contain "/" for nested paths.
     pub fn begin_read(&mut self, name: &str) -> Result<(ReadHandle, u64)> {
         match &mut self.backend {
             Backend::P9 { client, root_fid, path } => {
                 let mut fpath: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
-                fpath.push(name);
+                for part in name.split('/').filter(|s| !s.is_empty()) {
+                    fpath.push(part);
+                }
                 let fid = client.walk(*root_fid, &fpath)?;
                 let stat = client.stat(fid)?;
                 client.open(fid, OREAD)?;
@@ -289,17 +381,34 @@ impl Panel {
     }
 
     /// Open a persistent write handle — file is created and stays open.
+    /// Open a persistent write handle. Name can contain "/" for nested paths.
     pub fn begin_write(&mut self, name: &str) -> Result<WriteHandle> {
         match &mut self.backend {
             Backend::P9 { client, root_fid, path } => {
-                let names: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
-                let dir_fid = client.walk(*root_fid, &names)?;
-                client.create(dir_fid, name, 0o644, ORDWR)?;
-                // dir_fid now points to the open file
+                // Remove existing file if present
+                let mut full: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                for part in name.split('/').filter(|s| !s.is_empty()) {
+                    full.push(part);
+                }
+                if let Ok(old_fid) = client.walk(*root_fid, &full) {
+                    let _ = client.remove(old_fid);
+                }
+                // Walk to parent directory, create file
+                let parts: Vec<&str> = name.split('/').filter(|s| !s.is_empty()).collect();
+                let file_name = parts.last().ok_or_else(|| anyhow!("empty filename"))?;
+                let mut parent: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                parent.extend_from_slice(&parts[..parts.len() - 1]);
+                let dir_fid = client.walk(*root_fid, &parent)?;
+                client.create(dir_fid, file_name, 0o644, ORDWR)?;
                 Ok(WriteHandle::P9Fid(dir_fid))
             }
             Backend::Host(h) => {
-                let f = std::fs::File::create(h.cwd.join(name))?;
+                let full = h.cwd.join(name);
+                // Ensure parent directory exists
+                if let Some(parent) = full.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let f = std::fs::File::create(&full)?;
                 Ok(WriteHandle::HostFile(f))
             }
             Backend::None => Err(anyhow!("not connected")),

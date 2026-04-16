@@ -460,30 +460,62 @@ impl App {
         let dest = match src { Focus::Left => Focus::Right, Focus::Right => Focus::Left };
         let panel = self.active();
 
-        // Build file list: selected items, or just the cursor item
-        let files: Vec<String> = if panel.selected.is_empty() {
+        // Build list of items to process (files + directories)
+        let items: Vec<(String, bool)> = if panel.selected.is_empty() {
             match panel.selected_entry() {
-                Some(e) if !e.is_dir && e.name != ".." => vec![e.name.clone()],
-                _ => { self.status = "Cannot copy directories yet".into(); return; }
+                Some(e) if e.name != ".." => vec![(e.name.clone(), e.is_dir)],
+                _ => { self.status = "Nothing to copy".into(); return; }
             }
         } else {
-            let mut names = Vec::new();
-            for &idx in &panel.selected {
-                if let Some(e) = panel.entries.get(idx) {
-                    if !e.is_dir && e.name != ".." {
-                        names.push(e.name.clone());
-                    }
+            panel.selected.iter()
+                .filter_map(|&i| panel.entries.get(i))
+                .filter(|e| e.name != "..")
+                .map(|e| (e.name.clone(), e.is_dir))
+                .collect()
+        };
+        if items.is_empty() { self.status = "Nothing to copy".into(); return; }
+
+        // Expand directories recursively into a flat (path, is_dir, size) list
+        let src_panel = match src { Focus::Left => &mut self.left, Focus::Right => &mut self.right };
+        let mut all_entries: Vec<(String, bool, u64)> = Vec::new();
+        for (name, is_dir) in &items {
+            if *is_dir {
+                match src_panel.list_recursive(name) {
+                    Ok(entries) => all_entries.extend(entries),
+                    Err(e) => { self.status = format!("Error listing {name}: {e}"); return; }
+                }
+            } else {
+                let size = src_panel.entries.iter()
+                    .find(|e| e.name == *name).map(|e| e.size).unwrap_or(0);
+                all_entries.push((name.clone(), false, size));
+            }
+        }
+
+        // Separate: create dirs first, then queue files
+        let dest_panel = match dest { Focus::Left => &mut self.left, Focus::Right => &mut self.right };
+        for (path, is_dir, _) in &all_entries {
+            if *is_dir {
+                if let Err(e) = dest_panel.mkdir_path(path) {
+                    self.status = format!("Mkdir error {path}: {e}");
+                    return;
                 }
             }
-            if names.is_empty() { self.status = "No files selected".into(); return; }
-            names
-        };
+        }
 
-        // Compute total size across all files
-        let panel = match src { Focus::Left => &self.left, Focus::Right => &self.right };
-        let total_bytes: u64 = files.iter().filter_map(|n| {
-            panel.entries.iter().find(|e| e.name == *n).map(|e| e.size)
-        }).fold(0u64, |a, b| a.saturating_add(b));
+        let files: Vec<String> = all_entries.iter()
+            .filter(|(_, is_dir, _)| !*is_dir)
+            .map(|(p, _, _)| p.clone())
+            .collect();
+        let total_bytes: u64 = all_entries.iter()
+            .filter(|(_, is_dir, _)| !*is_dir)
+            .map(|(_, _, s)| *s)
+            .fold(0u64, |a, b| a.saturating_add(b));
+
+        if files.is_empty() {
+            self.status = "No files to copy (empty directories created)".into();
+            let _ = match dest { Focus::Left => self.left.refresh(), Focus::Right => self.right.refresh() };
+            return;
+        }
 
         let file_count = files.len();
         let mut queue = files;
