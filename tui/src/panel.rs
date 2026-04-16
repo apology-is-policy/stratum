@@ -115,6 +115,12 @@ impl Panel {
                     let is_dir = s.is_dir();
                     entries.push(Entry { name: s.name, is_dir, size: s.length, mtime: s.mtime });
                 }
+                // Sort: directories first, then alphabetical (case-insensitive)
+                let start = if !path.is_empty() { 1 } else { 0 }; // skip ".."
+                entries[start..].sort_by(|a, b| {
+                    b.is_dir.cmp(&a.is_dir)
+                        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                });
                 entries
             }
             Backend::Host(h) => h.list()?,
