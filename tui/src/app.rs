@@ -466,46 +466,50 @@ impl App {
             return false;
         }
 
-        // Read a chunk from source
-        let remain = state.total - state.copied;
-        let ask = if remain < CHUNK as u64 { remain as u32 } else { CHUNK };
+        // Copy in a tight loop for up to 200ms before yielding to redraw.
+        // This amortizes the draw/poll overhead across many chunks.
+        let tick_deadline = std::time::Instant::now() + Duration::from_millis(200);
 
-        let src_panel = match state.src {
-            Focus::Left => &mut self.left,
-            Focus::Right => &mut self.right,
-        };
-        let data = match src_panel.read_from_handle(
-            state.read_handle.as_mut().unwrap(), state.copied, ask)
-        {
-            Ok(d) if d.is_empty() => {
-                // EOF — mark as done
-                state.copied = state.total;
-                self.copy_state = Some(state);
-                return true;
-            }
-            Ok(d) => d,
-            Err(e) => {
-                self.status = format!("Read error: {e}");
-                self.copy_state = Some(state);
-                return false;
-            }
-        };
+        while state.copied < state.total && !state.cancelled {
+            let remain = state.total - state.copied;
+            let ask = if remain < CHUNK as u64 { remain as u32 } else { CHUNK };
 
-        // Write the chunk to destination
-        let n = data.len() as u64;
-        let dest_panel = match state.dest {
-            Focus::Left => &mut self.left,
-            Focus::Right => &mut self.right,
-        };
-        match dest_panel.write_to_handle(
-            state.write_handle.as_mut().unwrap(), state.copied, &data)
-        {
-            Ok(()) => state.copied += n,
-            Err(e) => {
-                self.status = format!("Write error: {e}");
-                self.copy_state = Some(state);
-                return false;
+            let src_panel = match state.src {
+                Focus::Left => &mut self.left,
+                Focus::Right => &mut self.right,
+            };
+            let data = match src_panel.read_from_handle(
+                state.read_handle.as_mut().unwrap(), state.copied, ask)
+            {
+                Ok(d) if d.is_empty() => {
+                    state.copied = state.total;
+                    break;
+                }
+                Ok(d) => d,
+                Err(e) => {
+                    self.status = format!("Read error: {e}");
+                    self.copy_state = Some(state);
+                    return false;
+                }
+            };
+
+            let n = data.len() as u64;
+            let dest_panel = match state.dest {
+                Focus::Left => &mut self.left,
+                Focus::Right => &mut self.right,
+            };
+            match dest_panel.write_to_handle(
+                state.write_handle.as_mut().unwrap(), state.copied, &data)
+            {
+                Ok(()) => state.copied += n,
+                Err(e) => {
+                    self.status = format!("Write error: {e}");
+                    self.copy_state = Some(state);
+                    return false;
+                }
             }
+
+            if std::time::Instant::now() >= tick_deadline { break; }
         }
 
         // Record throughput sample every ~0.5s
