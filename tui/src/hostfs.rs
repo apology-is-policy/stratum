@@ -24,7 +24,8 @@ impl HostFs {
 
     pub fn list(&self) -> Result<Vec<Entry>> {
         let mut entries = Vec::new();
-        if self.cwd != self.root {
+        // Always show ".." unless we're at the filesystem root
+        if self.cwd.parent().is_some() {
             entries.push(Entry {
                 name: "..".into(),
                 is_dir: true,
@@ -48,16 +49,18 @@ impl HostFs {
                 mtime,
             });
         }
-        entries[if self.cwd != self.root { 1 } else { 0 }..]
-            .sort_by(|a, b| {
-                b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-            });
+        let start = if self.cwd.parent().is_some() { 1 } else { 0 }; // skip ".."
+        entries[start..].sort_by(|a, b| {
+            b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
         Ok(entries)
     }
 
     pub fn enter(&mut self, name: &str) {
         if name == ".." {
-            self.cwd.pop();
+            if let Some(parent) = self.cwd.parent() {
+                self.cwd = parent.to_path_buf();
+            }
         } else {
             self.cwd.push(name);
         }

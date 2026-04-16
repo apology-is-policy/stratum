@@ -274,7 +274,8 @@ fn draw_info_panel(frame: &mut Frame, _panel: &Panel, area: Rect, focused: bool,
     } else {
         lines.push(Line::from(Span::styled("  No volume loaded.", Style::default().fg(Color::Gray))));
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("  Press F2 to open a volume.", Style::default().fg(CLR_INFO_TEXT))));
+        lines.push(Line::from(Span::styled("  F2: mount Stratum volume", Style::default().fg(CLR_INFO_TEXT))));
+        lines.push(Line::from(Span::styled("  Shift+F2: mount host filesystem", Style::default().fg(CLR_INFO_TEXT))));
     }
 
     if !app.config.history.is_empty() {
@@ -292,7 +293,7 @@ fn draw_info_panel(frame: &mut Frame, _panel: &Panel, area: Rect, focused: bool,
 
 fn draw_fkey_bar(frame: &mut Frame, area: Rect) {
     let keys: &[(&str, &str)] = &[
-        ("1", ""), ("2", "Open"), ("3", "View"), ("4", "Edit"),
+        ("1", ""), ("2", "Mount"), ("3", "View"), ("4", "Edit"),
         ("5", "Copy"), ("6", ""), ("7", "MkDir"), ("8", "Delete"),
         ("9", ""), ("10", "Quit"),
     ];

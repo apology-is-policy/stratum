@@ -180,8 +180,20 @@ impl App {
         }
 
         // normal mode
+        use crossterm::event::KeyModifiers;
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+
         match key.code {
-            // function keys
+            // F2: mount stratum | Shift+F2: mount host | Alt+Shift+F2: raw 9P
+            KeyCode::F(2) if alt && shift => {
+                self.mode = Mode::Input {
+                    prompt: "9P address (unix:/path or host:port):".into(),
+                    callback: InputAction::ConnectAddr,
+                    history_cursor: None,
+                };
+            }
+            KeyCode::F(2) if shift => self.mount_host(),
             KeyCode::F(2) => self.prompt_open_volume(),
             KeyCode::F(3) => self.open_editor(true),
             KeyCode::F(4) => self.open_editor(false),
@@ -258,14 +270,17 @@ impl App {
                     self.status = format!("Refresh error: {e}");
                 }
             }
-            KeyCode::Char('c') => {
-                self.mode = Mode::Input {
-                    prompt: "9P address (unix:/path or host:port):".into(),
-                    callback: InputAction::ConnectAddr,
-                    history_cursor: None,
-                };
-            }
             _ => {}
+        }
+    }
+
+    fn mount_host(&mut self) {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
+        let panel = self.active();
+        if let Err(e) = panel.connect_host(&cwd) {
+            self.status = format!("Host FS error: {e}");
+        } else {
+            self.status = "Mounted host filesystem".into();
         }
     }
 
@@ -368,10 +383,14 @@ impl App {
                         }
                     }
                 }
-                // connect left panel
-                match self.left.connect_9p_unix(&sock) {
+                // connect active panel
+                let panel = match self.focus {
+                    Focus::Left => &mut self.left,
+                    Focus::Right => &mut self.right,
+                };
+                match panel.connect_9p_unix(&sock) {
                     Ok(()) => {
-                        self.left.label = format!("[{}]", short_path(path));
+                        panel.label = format!("[{}]", short_path(path));
                         self.config.add_volume(path);
                         self.status = format!("Opened {path}");
                     }
