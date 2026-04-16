@@ -483,7 +483,7 @@ impl App {
         let panel = match src { Focus::Left => &self.left, Focus::Right => &self.right };
         let total_bytes: u64 = files.iter().filter_map(|n| {
             panel.entries.iter().find(|e| e.name == *n).map(|e| e.size)
-        }).sum();
+        }).fold(0u64, |a, b| a.saturating_add(b));
 
         let file_count = files.len();
         let mut queue = files;

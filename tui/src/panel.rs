@@ -100,6 +100,7 @@ impl Panel {
     }
 
     pub fn refresh(&mut self) -> Result<()> {
+        self.selected.clear(); // indices become stale after refresh
         self.entries = match &mut self.backend {
             Backend::None => Vec::new(),
             Backend::P9 { client, root_fid, path } => {
