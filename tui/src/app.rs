@@ -437,6 +437,10 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        // Disconnect panels first — closes the 9P socket so the server's
+        // read() unblocks and it can process the SIGTERM gracefully.
+        self.left.disconnect();
+        self.right.disconnect();
         self.stop_server();
     }
 }
