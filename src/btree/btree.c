@@ -141,18 +141,8 @@ int stm_btree_write_node(struct stm_btree *tree, struct stm_node *n,
         if (rc) return rc;
     }
 
-    /* COW: free the old location if it existed */
-    if (n->paddr != STM_BADDR_NONE) {
-        struct stm_bptr old_bp;
-        memset(&old_bp, 0, sizeof(old_bp));
-        old_bp.bp_paddr = cpu_to_le64(n->paddr);
-        /* We don't know old csize exactly, use write_len as estimate.
-         * For correct block count, callers should use free_old_bptr on
-         * the parent's child bptr which has the exact csize. */
-        old_bp.bp_csize = cpu_to_le32(write_len);
-        free_old_bptr(tree, &old_bp);
-    }
-
+    /* Note: COW reclaim is done by callers who have the accurate old bptr
+     * (with correct csize).  write_node only updates the node's address. */
     n->paddr = addr;
     n->dirty = 0;
 
@@ -320,6 +310,7 @@ static int split_child(struct stm_btree *tree, struct stm_node *parent,
 {
     struct stm_key split_key;
     struct stm_node *right = NULL;
+    struct stm_bptr old_cbp = parent->children[child_idx]; /* save for COW free */
     struct stm_bptr lbp, rbp;
     int rc;
 
@@ -336,6 +327,7 @@ static int split_child(struct stm_btree *tree, struct stm_node *parent,
     stm_node_free(right);
     if (rc) { stm_node_free(child); return rc; }
 
+    free_old_bptr(tree, &old_cbp); /* free old child's blocks (correct csize) */
     parent->children[child_idx] = lbp;
     rc = stm_node_insert_pivot(parent, child_idx, &split_key, rbp);
     stm_node_free(child);
@@ -367,12 +359,15 @@ static int flush_node(struct stm_btree *tree, struct stm_node *parent)
         if (rc) { stm_node_free(child); return rc; }
     }
 
-    rc = stm_btree_write_node(tree, child, &cbp);
-    stm_node_free(child);
-    if (rc) return rc;
-
-    parent->children[ci] = cbp;
-    parent->dirty = 1;
+    {
+        struct stm_bptr old_cbp = parent->children[ci]; /* save before overwrite */
+        rc = stm_btree_write_node(tree, child, &cbp);
+        stm_node_free(child);
+        if (rc) return rc;
+        free_old_bptr(tree, &old_cbp);
+        parent->children[ci] = cbp;
+        parent->dirty = 1;
+    }
     return 0;
 }
 
@@ -502,9 +497,11 @@ static int drain_all(struct stm_btree *tree, struct stm_node *node)
             rc = split_child(tree, node, ci, child);
             if (rc) return rc;
         } else {
+            struct stm_bptr old_cbp = node->children[ci];
             rc = stm_btree_write_node(tree, child, &cbp);
             stm_node_free(child);
             if (rc) return rc;
+            free_old_bptr(tree, &old_cbp);
             node->children[ci] = cbp;
             node->dirty = 1;
         }
@@ -517,12 +514,14 @@ static int drain_all(struct stm_btree *tree, struct stm_node *node)
         if (rc) return rc;
 
         if (!(child->flags & STM_NODE_LEAF) && child->nmsgs > 0) {
+            struct stm_bptr old_cbp = node->children[i];
             struct stm_bptr cbp;
             rc = drain_all(tree, child);
             if (rc) { stm_node_free(child); return rc; }
             rc = stm_btree_write_node(tree, child, &cbp);
             stm_node_free(child);
             if (rc) return rc;
+            free_old_bptr(tree, &old_cbp);
             node->children[i] = cbp;
             node->dirty = 1;
         } else {
@@ -543,8 +542,10 @@ int stm_btree_flush(struct stm_btree *tree)
     if (rc) return rc;
 
     if (tree->root->dirty) {
+        struct stm_bptr old_root = tree->root_bptr;
         rc = stm_btree_write_node(tree, tree->root, &tree->root_bptr);
         if (rc) return rc;
+        free_old_bptr(tree, &old_root);
     }
     return stm_block_sync(tree->dev);
 }
