@@ -39,6 +39,7 @@ pub struct Panel {
     pub entries: Vec<Entry>,
     pub cursor: usize,
     pub scroll_offset: usize,
+    pub selected: std::collections::HashSet<usize>,
     backend: Backend,
 }
 
@@ -49,6 +50,7 @@ impl Panel {
             entries: Vec::new(),
             cursor: 0,
             scroll_offset: 0,
+            selected: std::collections::HashSet::new(),
             backend: Backend::None,
         }
     }

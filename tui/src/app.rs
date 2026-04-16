@@ -204,6 +204,13 @@ impl App {
             KeyCode::PageDown => self.active().page_down(20),
             KeyCode::Home => self.active().home(),
             KeyCode::End => self.active().end(),
+            KeyCode::Char(' ') => {
+                let p = self.active();
+                let c = p.cursor;
+                if p.selected.contains(&c) { p.selected.remove(&c); }
+                else { p.selected.insert(c); }
+                p.move_down();
+            }
             KeyCode::Enter => {
                 if let Err(e) = self.active().enter() {
                     self.status = format!("Error: {e}");
