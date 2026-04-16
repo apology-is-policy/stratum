@@ -12,15 +12,15 @@ const CLR_BG: Color = Color::Black;
 
 const CLR_BORDER_ACTIVE: Color = Color::Blue;
 const CLR_BORDER_INACTIVE: Color = Color::DarkGray;
-const CLR_TITLE_ACTIVE: Color = Color::Yellow;
-const CLR_TITLE_INACTIVE: Color = Color::White;
+const CLR_TITLE_ACTIVE: Color = Color::White;
+const CLR_TITLE_INACTIVE: Color = Color::DarkGray;
 
 const CLR_HEADER: Color = Color::Yellow;
 const CLR_DIR: Color = Color::White;
 const CLR_FILE: Color = Color::Cyan;
 const CLR_SELECTED: Color = Color::Red;
 
-const CLR_CURSOR_FG: Color = Color::Yellow;
+const CLR_CURSOR_FG: Color = Color::Black;
 const CLR_CURSOR_ACTIVE_BG: Color = Color::Blue;
 const CLR_CURSOR_INACTIVE_BG: Color = Color::DarkGray;
 
@@ -35,12 +35,29 @@ const CLR_POPUP_BORDER: Color = Color::White;
 const CLR_POPUP_BG: Color = Color::DarkGray;
 const CLR_INFO_TEXT: Color = Color::Cyan;
 
+// ── copy dialog colors (edit these to tweak) ──────────────────────────
+//
+// Outer frame:
+const CLR_COPY_BORDER: Color = Color::White;       // ui.rs ~ line 171
+const CLR_COPY_BG: Color = Color::DarkGray;         // ui.rs ~ line 172
+// Progress bar frame:
+const CLR_COPY_PBAR_BORDER: Color = Color::Green;   // ui.rs ~ line 186
+const CLR_COPY_PBAR_FILL: Color = Color::Green;     // ui.rs ~ line 195
+// Stats frame:
+const CLR_COPY_STATS_BORDER: Color = Color::DarkGray;  // ui.rs ~ line 211
+const CLR_COPY_SPEED: Color = Color::Yellow;         // ui.rs ~ line 217
+const CLR_COPY_TIME: Color = Color::Cyan;            // ui.rs ~ line 219
+// Throughput chart frame:
+const CLR_COPY_CHART_BORDER: Color = Color::DarkGray;  // ui.rs ~ line 228
+const CLR_COPY_CHART_BG: Color = Color::Black;      // ui.rs ~ line 230
+const CLR_CHART_HIGH: Color = Color::Green;          // ui.rs ~ line 244
+const CLR_CHART_MID: Color = Color::Yellow;          // ui.rs ~ line 245
+const CLR_CHART_LOW: Color = Color::Red;             // ui.rs ~ line 246
+
 // ── main draw ─────────────────────────────────────────────────────────
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
-
-    // black background everywhere
     frame.render_widget(Block::default().style(Style::default().bg(CLR_BG)), area);
 
     let rows = Layout::default()
@@ -64,20 +81,16 @@ pub fn draw(frame: &mut Frame, app: &App) {
         draw_info_panel(frame, &app.right, cols[1], app.focus == Focus::Right, app);
     }
 
-    // status line — black bg
     let status = Paragraph::new(Line::from(Span::styled(
-        &app.status,
-        Style::default().fg(CLR_STATUS_FG),
+        &app.status, Style::default().fg(CLR_STATUS_FG),
     ))).style(Style::default().bg(CLR_STATUS_BG));
     frame.render_widget(status, rows[1]);
 
-    // function key bar — stretched across full width
     draw_fkey_bar(frame, rows[2]);
 
     // overlays
     if let Mode::Input { prompt, callback, .. } = &app.mode {
-        let is_password = *callback == InputAction::Password;
-        draw_input_dialog(frame, area, prompt, &app.input_buf, is_password);
+        draw_input_dialog(frame, area, prompt, &app.input_buf, *callback == InputAction::Password);
     }
     if let Some(ref cs) = app.copy_state {
         draw_copy_dialog(frame, area, cs);
@@ -124,27 +137,51 @@ fn draw_panel(frame: &mut Frame, panel: &Panel, area: Rect, focused: bool) {
 
     if panel.entries.is_empty() {
         let msg = if panel.is_connected() { "(empty)" } else { "Not connected" };
-        let p = Paragraph::new(msg)
-            .style(Style::default().fg(Color::DarkGray))
-            .alignment(Alignment::Center);
-        frame.render_widget(p, inner);
+        frame.render_widget(
+            Paragraph::new(msg).style(Style::default().fg(Color::DarkGray)).alignment(Alignment::Center),
+            inner,
+        );
         return;
     }
 
+    // Header (2 rows: text + rule)
     let header_area = Rect { height: 1, ..inner };
-    let list_area = Rect { y: inner.y + 1, height: inner.height.saturating_sub(1), ..inner };
+    let rule_area = Rect { y: inner.y + 1, height: 1, ..inner };
+    let list_area = Rect { y: inner.y + 2, height: inner.height.saturating_sub(2), ..inner };
 
-    // column header
-    let hdr = Line::from(Span::styled(
-        format!(" {:<w$} {:>8}", "Name", "Size", w = inner.width as usize - 11),
-        Style::default().fg(CLR_HEADER),
-    ));
+    // Column layout: name | modified | size
+    // Compute column widths
+    let w = inner.width as usize;
+    let size_col = 8;
+    let date_col = 12;
+    let name_col = w.saturating_sub(size_col + date_col + 3); // 3 for spacing
+
+    let hdr = Line::from(vec![
+        Span::styled(
+            format!(" {:<nc$}", "Name", nc = name_col),
+            Style::default().fg(CLR_HEADER),
+        ),
+        Span::styled(
+            format!("{:<dc$}", "Modified", dc = date_col),
+            Style::default().fg(CLR_HEADER),
+        ),
+        Span::styled(
+            format!("{:>sc$}", "Size", sc = size_col),
+            Style::default().fg(CLR_HEADER),
+        ),
+    ]);
     frame.render_widget(Paragraph::new(hdr), header_area);
 
-    // file listing
+    // Horizontal rule under header
+    let rule = "\u{2500}".repeat(w); // ─
+    frame.render_widget(
+        Paragraph::new(Span::styled(rule, Style::default().fg(Color::DarkGray))),
+        rule_area,
+    );
+
+    // File listing
     let visible = list_area.height as usize;
     let scroll = if panel.cursor >= visible { panel.cursor - visible + 1 } else { 0 };
-    let name_width = inner.width as usize - 11;
 
     let items: Vec<ListItem> = panel
         .entries
@@ -158,14 +195,25 @@ fn draw_panel(frame: &mut Frame, panel: &Panel, area: Rect, focused: bool) {
             let fg = if is_sel { CLR_SELECTED } else { base_clr };
 
             let size_str = if e.is_dir {
-                " <DIR>".to_string()
+                "<DIR>".to_string()
             } else {
-                format!("{:>8}", human_size(e.size))
+                human_size(e.size)
+            };
+
+            let date_str = if e.mtime > 0 {
+                format_timestamp(e.mtime)
+            } else {
+                String::new()
             };
 
             let mut name_display = format!("{icon}{}", e.name);
-            name_display.truncate(name_width - 1);
-            let line = format!(" {:<w$}{size_str}", name_display, w = name_width - 7);
+            if name_display.len() > name_col - 1 {
+                name_display.truncate(name_col - 1);
+            }
+
+            let line = format!(" {:<nc$}{:<dc$}{:>sc$}",
+                name_display, date_str, size_str,
+                nc = name_col, dc = date_col, sc = size_col);
 
             let style = if i == panel.cursor {
                 Style::default().fg(CLR_CURSOR_FG).bg(cursor_bg).bold()
@@ -241,7 +289,6 @@ fn draw_fkey_bar(frame: &mut Frame, area: Rect) {
         ("9", ""), ("10", "Quit"),
     ];
 
-    // Spread keys evenly across the full width
     let total_keys = keys.len();
     let cell_w = area.width as usize / total_keys;
 
@@ -249,13 +296,14 @@ fn draw_fkey_bar(frame: &mut Frame, area: Rect) {
     for (num, label) in keys {
         spans.push(Span::styled(
             format!("{num}"),
-            Style::default().fg(CLR_FKEY_NUM).bg(CLR_BG),
+            Style::default().fg(CLR_FKEY_NUM).bg(CLR_BG).bold(),
         ));
-        let label_w = cell_w.saturating_sub(num.len());
+        let label_w = cell_w.saturating_sub(num.len() + 1); // +1 for gap
         spans.push(Span::styled(
             format!("{:<w$}", label, w = label_w),
-            Style::default().fg(CLR_FKEY_LABEL_FG).bg(CLR_FKEY_LABEL_BG),
+            Style::default().fg(CLR_FKEY_LABEL_FG).bg(CLR_FKEY_LABEL_BG).bold(),
         ));
+        spans.push(Span::styled(" ", Style::default().bg(CLR_BG))); // 1-char gap
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -283,12 +331,7 @@ fn draw_input_dialog(frame: &mut Frame, area: Rect, prompt: &str, input: &str, i
     frame.render_widget(Clear, rect);
     frame.render_widget(block, rect);
 
-    let display = if is_password {
-        "*".repeat(input.len())
-    } else {
-        input.to_string()
-    };
-
+    let display = if is_password { "*".repeat(input.len()) } else { input.to_string() };
     let text = vec![
         Line::from(Span::styled(prompt, Style::default().fg(prompt_clr))),
         Line::from(Span::styled(
@@ -300,11 +343,11 @@ fn draw_input_dialog(frame: &mut Frame, area: Rect, prompt: &str, input: &str, i
 }
 
 // ── copy dialog ───────────────────────────────────────────────────────
+// Colors defined at the top of this file under "copy dialog colors".
 
 fn draw_copy_dialog(frame: &mut Frame, area: Rect, cs: &CopyState) {
     let w = 64u16.min(area.width.saturating_sub(4));
     let chart_rows: u16 = 8;
-    // Layout: filename(1) + blank(1) + progress_frame(3) + blank(1) + stats_frame(3) + chart_frame(chart+2) + esc(1) = dynamic
     let h = 14 + chart_rows;
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
@@ -312,24 +355,23 @@ fn draw_copy_dialog(frame: &mut Frame, area: Rect, cs: &CopyState) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(CLR_POPUP_BORDER).bold())
+        .border_style(Style::default().fg(CLR_COPY_BORDER).bold())
         .title(" Copying ")
-        .style(Style::default().bg(CLR_POPUP_BG));
+        .style(Style::default().bg(CLR_COPY_BG));
 
     let inner = block.inner(rect);
     frame.render_widget(Clear, rect);
     frame.render_widget(block, rect);
 
-    // Use sub-layout for clean arrangement
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),  // filename
             Constraint::Length(1),  // spacer
-            Constraint::Length(3),  // progress bar (framed)
-            Constraint::Length(3),  // stats (framed)
-            Constraint::Length(chart_rows + 2), // chart (framed)
-            Constraint::Length(1),  // esc hint
+            Constraint::Length(3),  // progress bar
+            Constraint::Length(3),  // stats
+            Constraint::Length(chart_rows + 2), // chart
+            Constraint::Length(1),  // esc
         ])
         .split(inner);
 
@@ -339,65 +381,59 @@ fn draw_copy_dialog(frame: &mut Frame, area: Rect, cs: &CopyState) {
         Style::default().fg(Color::White).bold(),
     ))), sections[0]);
 
-    // Progress bar in a frame
+    // Progress bar
     let pct = if cs.total > 0 { (cs.copied * 100 / cs.total) as usize } else { 0 };
     {
-        let pbar_block = Block::default()
+        let pb = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Green))
-            .title(format!(" {} / {}  ({}%) ",
-                human_size(cs.copied), human_size(cs.total), pct))
-            .style(Style::default().bg(CLR_POPUP_BG));
-        let pbar_inner = pbar_block.inner(sections[2]);
-        frame.render_widget(pbar_block, sections[2]);
+            .border_style(Style::default().fg(CLR_COPY_PBAR_BORDER))
+            .title(format!(" {} / {}  ({}%) ", human_size(cs.copied), human_size(cs.total), pct))
+            .style(Style::default().bg(CLR_COPY_BG));
+        let pi = pb.inner(sections[2]);
+        frame.render_widget(pb, sections[2]);
 
-        let bar_w = pbar_inner.width as usize;
-        let filled = bar_w * pct / 100;
-        let bar = format!("{}{}", "\u{2588}".repeat(filled), "\u{2591}".repeat(bar_w - filled));
-        frame.render_widget(Paragraph::new(Span::styled(
-            bar, Style::default().fg(Color::Green),
-        )), pbar_inner);
+        let bw = pi.width as usize;
+        let filled = bw * pct / 100;
+        let bar = format!("{}{}", "\u{2588}".repeat(filled), "\u{2591}".repeat(bw - filled));
+        frame.render_widget(Paragraph::new(Span::styled(bar, Style::default().fg(CLR_COPY_PBAR_FILL))), pi);
     }
 
-    // Stats in a frame
+    // Stats
     let elapsed = cs.start_time.elapsed().as_secs_f64();
     let avg_speed = if elapsed > 0.1 { cs.copied as f64 / elapsed } else { 0.0 };
     let cur_speed = cs.samples.last().map_or(avg_speed, |s| s.bytes_per_sec);
     let remaining = cs.total.saturating_sub(cs.copied) as f64;
     let eta = if cur_speed > 1.0 { remaining / cur_speed } else { 0.0 };
-    let eta_str = if cs.copied > 0 && cs.copied < cs.total {
-        format_duration(eta)
-    } else { "--:--".into() };
+    let eta_str = if cs.copied > 0 && cs.copied < cs.total { format_duration(eta) } else { "--:--".into() };
     {
-        let stats_block = Block::default()
+        let sb = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
-            .style(Style::default().bg(CLR_POPUP_BG));
-        let stats_inner = stats_block.inner(sections[3]);
-        frame.render_widget(stats_block, sections[3]);
+            .border_style(Style::default().fg(CLR_COPY_STATS_BORDER))
+            .style(Style::default().bg(CLR_COPY_BG));
+        let si = sb.inner(sections[3]);
+        frame.render_widget(sb, sections[3]);
 
-        let stats_line = Line::from(vec![
+        frame.render_widget(Paragraph::new(Line::from(vec![
             Span::styled(format!(" {}/s", human_size(cur_speed as u64)),
-                Style::default().fg(Color::Yellow).bold()),
+                Style::default().fg(CLR_COPY_SPEED).bold()),
             Span::styled(format!("   elapsed {}   ETA {}", format_duration(elapsed), eta_str),
-                Style::default().fg(Color::Cyan)),
-        ]);
-        frame.render_widget(Paragraph::new(stats_line), stats_inner);
+                Style::default().fg(CLR_COPY_TIME)),
+        ])), si);
     }
 
-    // Throughput chart in a frame with black bg
+    // Throughput chart
     {
-        let chart_block = Block::default()
+        let cb = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
+            .border_style(Style::default().fg(CLR_COPY_CHART_BORDER))
             .title(" Throughput ")
-            .style(Style::default().bg(CLR_BG));
-        let chart_inner = chart_block.inner(sections[4]);
-        frame.render_widget(chart_block, sections[4]);
+            .style(Style::default().bg(CLR_COPY_CHART_BG));
+        let ci = cb.inner(sections[4]);
+        frame.render_widget(cb, sections[4]);
 
         if cs.samples.len() >= 2 {
-            let cw = chart_inner.width as usize;
-            let ch = chart_inner.height as usize;
+            let cw = ci.width as usize;
+            let ch = ci.height as usize;
             let n = cs.samples.len().min(cw);
             let display = &cs.samples[cs.samples.len() - n..];
             let max_bps = display.iter().map(|s| s.bytes_per_sec).fold(1.0f64, f64::max);
@@ -407,21 +443,21 @@ fn draw_copy_dialog(frame: &mut Frame, area: Rect, cs: &CopyState) {
                 let threshold = max_bps * (ch - row) as f64 / ch as f64;
                 let spans: Vec<Span> = display.iter().map(|s| {
                     if s.bytes_per_sec >= threshold {
-                        let clr = if s.bytes_per_sec > max_bps * 0.7 { Color::Green }
-                                  else if s.bytes_per_sec > max_bps * 0.3 { Color::Yellow }
-                                  else { Color::Red };
+                        let clr = if s.bytes_per_sec > max_bps * 0.7 { CLR_CHART_HIGH }
+                                  else if s.bytes_per_sec > max_bps * 0.3 { CLR_CHART_MID }
+                                  else { CLR_CHART_LOW };
                         Span::styled("\u{2588}", Style::default().fg(clr))
                     } else {
-                        Span::styled(" ", Style::default())
+                        Span::raw(" ")
                     }
                 }).collect();
                 lines.push(Line::from(spans));
             }
-            frame.render_widget(Paragraph::new(lines), chart_inner);
+            frame.render_widget(Paragraph::new(lines), ci);
         } else {
             frame.render_widget(Paragraph::new(
                 Span::styled(" Waiting for data...", Style::default().fg(Color::DarkGray))
-            ), chart_inner);
+            ), ci);
         }
     }
 
@@ -450,11 +486,10 @@ fn draw_busy_dialog(frame: &mut Frame, area: Rect, msg: &str) {
     frame.render_widget(Clear, rect);
     frame.render_widget(block, rect);
 
-    let lines = vec![
+    frame.render_widget(Paragraph::new(vec![
         Line::from(""),
         Line::from(Span::styled(format!("  {msg}"), Style::default().fg(Color::White).bold())),
-    ];
-    frame.render_widget(Paragraph::new(lines), inner);
+    ]), inner);
 }
 
 // ── helpers ───────────────────────────────────────────────────────────
@@ -463,6 +498,34 @@ fn format_duration(secs: f64) -> String {
     let s = secs as u64;
     if s >= 3600 { format!("{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60) }
     else { format!("{}:{:02}", s / 60, s % 60) }
+}
+
+fn format_timestamp(epoch: u32) -> String {
+    // Convert Unix epoch to "YYYY-MM-DD" — lightweight, no chrono dependency.
+    // Uses a simple days-from-epoch calculation.
+    let secs = epoch as i64;
+    let days = secs / 86400;
+    let mut y = 1970i32;
+    let mut rem = days;
+    loop {
+        let ydays = if is_leap(y) { 366 } else { 365 };
+        if rem < ydays { break; }
+        rem -= ydays;
+        y += 1;
+    }
+    let leap = is_leap(y);
+    let mdays: [i64; 12] = [31, if leap {29} else {28}, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut m = 0usize;
+    for md in &mdays {
+        if rem < *md { break; }
+        rem -= md;
+        m += 1;
+    }
+    format!("{y}-{:02}-{:02}", m + 1, rem + 1)
+}
+
+fn is_leap(y: i32) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
 fn human_size(bytes: u64) -> String {
