@@ -38,6 +38,19 @@
 static volatile int running = 1;
 static void on_signal(int sig) { (void)sig; running = 0; }
 
+/* Read password from stdin (one line, no trailing newline). */
+static char stdin_pass_buf[256];
+static const char *read_pass_stdin(void)
+{
+    if (!fgets(stdin_pass_buf, sizeof(stdin_pass_buf), stdin))
+        return NULL;
+    size_t len = strlen(stdin_pass_buf);
+    while (len > 0 && (stdin_pass_buf[len-1] == '\n' || stdin_pass_buf[len-1] == '\r'))
+        stdin_pass_buf[--len] = '\0';
+    return len > 0 ? stdin_pass_buf : NULL;
+}
+
+
 static int print_snap_cb(uint64_t id, const char *name, uint64_t gen, void *ctx)
 {
     if (ctx) { (*(int *)ctx)++; }
@@ -191,9 +204,9 @@ static int cmd_mkfs(int argc, char **argv)
     int i;
 
     for (i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "--pass") == 0 && i + 1 < argc)
-            pass = argv[++i];
-        else if (!path) path = argv[i];
+        if (strcmp(argv[i], "--pass") == 0 && i + 1 < argc) { pass = argv[++i]; continue; }
+        if (strcmp(argv[i], "--pass-stdin") == 0) { pass = read_pass_stdin(); continue; }
+        if (!path) path = argv[i];
         else if (!size) size = parse_size(argv[i]);
     }
 
@@ -219,16 +232,14 @@ static int cmd_serve(int argc, char **argv)
     int listen_fd = -1, client_fd, i, rc;
 
     for (i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "--pass") == 0 && i + 1 < argc)
-            pass = argv[++i];
-        else if (strcmp(argv[i], "--listen") == 0 && i + 1 < argc)
-            listen_addr = argv[++i];
-        else if (!path)
-            path = argv[i];
+        if (strcmp(argv[i], "--pass") == 0 && i + 1 < argc) { pass = argv[++i]; continue; }
+        if (strcmp(argv[i], "--pass-stdin") == 0) { pass = read_pass_stdin(); continue; }
+        if (strcmp(argv[i], "--listen") == 0 && i + 1 < argc) { listen_addr = argv[++i]; continue; }
+        if (!path) path = argv[i];
     }
 
     if (!path) {
-        fprintf(stderr, "Usage: stratum serve <path> [--pass <pass>] [--listen <addr>]\n");
+        fprintf(stderr, "Usage: stratum serve <path> [--pass <pass>|--pass-stdin] [--listen <addr>]\n");
         fprintf(stderr, "  Addr: unix:/path  or  tcp:host:port (default: unix:/tmp/stratum.sock)\n");
         return 1;
     }
@@ -299,13 +310,13 @@ static int cmd_info(int argc, char **argv)
     int i, rc;
 
     for (i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "--pass") == 0 && i + 1 < argc)
-            pass = argv[++i];
-        else if (!path) path = argv[i];
+        if (strcmp(argv[i], "--pass") == 0 && i + 1 < argc) { pass = argv[++i]; continue; }
+        if (strcmp(argv[i], "--pass-stdin") == 0) { pass = read_pass_stdin(); continue; }
+        if (!path) path = argv[i];
     }
 
     if (!path) {
-        fprintf(stderr, "Usage: stratum info <path> [--pass <passphrase>]\n");
+        fprintf(stderr, "Usage: stratum info <path> [--pass <pass>|--pass-stdin]\n");
         return 1;
     }
 
@@ -336,9 +347,9 @@ static int cmd_snap(int argc, char **argv)
     int i, rc;
 
     for (i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "--pass") == 0 && i + 1 < argc)
-            pass = argv[++i];
-        else if (!path) path = argv[i];
+        if (strcmp(argv[i], "--pass") == 0 && i + 1 < argc) { pass = argv[++i]; continue; }
+        if (strcmp(argv[i], "--pass-stdin") == 0) { pass = read_pass_stdin(); continue; }
+        if (!path) path = argv[i];
         else if (!subcmd) subcmd = argv[i];
         else if (!arg) arg = argv[i];
     }
@@ -485,13 +496,13 @@ static int cmd_check(int argc, char **argv)
     int i, rc;
 
     for (i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "--pass") == 0 && i + 1 < argc)
-            pass = argv[++i];
-        else if (!path) path = argv[i];
+        if (strcmp(argv[i], "--pass") == 0 && i + 1 < argc) { pass = argv[++i]; continue; }
+        if (strcmp(argv[i], "--pass-stdin") == 0) { pass = read_pass_stdin(); continue; }
+        if (!path) path = argv[i];
     }
 
     if (!path) {
-        fprintf(stderr, "Usage: stratum check <path> [--pass <passphrase>]\n");
+        fprintf(stderr, "Usage: stratum check <path> [--pass <pass>|--pass-stdin]\n");
         return 1;
     }
 
@@ -624,11 +635,11 @@ static void usage(void)
         "Usage: stratum <command> [options]\n"
         "\n"
         "Commands:\n"
-        "  mkfs  <path> <size> [--pass <passphrase>]    Create a new filesystem\n"
-        "  serve <path> [--pass <pass>] [--listen <addr>] Serve over 9P\n"
-        "  info  <path> [--pass <passphrase>]            Show filesystem info\n"
-        "  check <path> [--pass <passphrase>]            Check filesystem integrity\n"
-        "  snap  <path> [--pass <p>] <create|list|delete|rollback> [name|id]\n"
+        "  mkfs  <path> <size> [--pass <p>|--pass-stdin]   Create a new filesystem\n"
+        "  serve <path> [--pass <p>|--pass-stdin] [--listen <addr>]  Serve over 9P\n"
+        "  info  <path> [--pass <p>|--pass-stdin]        Show filesystem info\n"
+        "  check <path> [--pass <p>|--pass-stdin]        Check filesystem integrity\n"
+        "  snap  <path> [--pass <p>|--pass-stdin] <create|list|delete|rollback> [name]\n"
         "\n"
         "Listen address: unix:/path (default: unix:/tmp/stratum.sock) or tcp:host:port\n"
     );

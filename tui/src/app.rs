@@ -327,14 +327,23 @@ impl App {
         let mut cmd = Command::new(&stratum_bin);
         cmd.arg("serve").arg(path);
         cmd.arg("--listen").arg(format!("unix:{sock}"));
-        if let Some(p) = pass {
-            cmd.arg("--pass").arg(p);
+        if pass.is_some() {
+            // Pass password via stdin (not visible in ps output)
+            cmd.arg("--pass-stdin");
+            cmd.stdin(std::process::Stdio::piped());
         }
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::piped());
 
         match cmd.spawn() {
-            Ok(child) => {
+            Ok(mut child) => {
+                // Write password to server's stdin if needed
+                if let Some(p) = pass {
+                    if let Some(ref mut stdin) = child.stdin.take() {
+                        use std::io::Write;
+                        let _ = writeln!(stdin, "{p}");
+                    }
+                }
                 self.server_proc = Some(child);
                 self.server_sock = Some(sock.clone());
                 // wait briefly for socket to appear
