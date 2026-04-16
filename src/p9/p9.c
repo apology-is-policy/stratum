@@ -509,6 +509,12 @@ static int h_remove(struct stm_9p *s, const uint8_t *body, uint16_t tag,
     stm_fs_unlink(s->fs, f->parent_ino, f->name);
     fid_free(s, fid_nr);
 
+    /* Sync after delete: flushes the btree AND commits freed extent
+     * blocks so the allocator can reuse them immediately. Without this,
+     * freed blocks stay PENDING until the next write-clunk sync, and
+     * the allocator grows the volume instead of reusing space. */
+    stm_fs_sync(s->fs);
+
     wp = resp + 4;
     *wp++ = P9_RREMOVE;
     p16(wp, tag); wp += 2;
