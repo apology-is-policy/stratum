@@ -181,14 +181,19 @@ void stm_alloc_ref(struct stm_alloc *a, uint64_t block_nr, uint32_t count)
 void stm_alloc_commit(struct stm_alloc *a)
 {
     uint32_t i;
+    uint64_t lowest_freed = a->total;
     for (i = 0; i < a->ndeferred; i++) {
         uint64_t b = a->deferred[i].block_nr;
         if (b < a->total && a->refcounts[b] == REFCOUNT_PENDING) {
             a->refcounts[b] = 0;   /* now truly free */
             a->free_count++;
+            if (b < lowest_freed) lowest_freed = b;
         }
     }
     a->ndeferred = 0;
+    /* Reset hint to reuse freed space — avoids slow scans after deletes. */
+    if (lowest_freed < a->hint)
+        a->hint = lowest_freed;
 }
 
 uint64_t stm_alloc_free_count(struct stm_alloc *a)
