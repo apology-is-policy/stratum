@@ -38,6 +38,7 @@ struct stm_fs {
     uint8_t  dek[STM_CRYPTO_KEY_LEN];
     int      encrypted;
     struct stm_alloc *alloc;
+    uint64_t bytes_since_sync;  /* auto-checkpoint counter */
 };
 
 static inline struct stm_key stm_mk_key(uint64_t ino, uint8_t type,

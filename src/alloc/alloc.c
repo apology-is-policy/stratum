@@ -4,7 +4,8 @@
 #include <string.h>
 #include <errno.h>
 
-#define GROW_INCREMENT  (16 * 1024)  /* grow by 16K blocks = 64 MiB */
+#define GROW_MIN    (16 * 1024)       /* minimum grow: 64 MiB */
+#define GROW_MAX    (256 * 1024)      /* maximum grow: 1 GiB */
 #define REFCOUNT_PENDING 0xFFFF     /* sentinel: freed but not yet reclaimable */
 
 struct deferred_free {
@@ -72,7 +73,13 @@ static int try_grow(struct stm_alloc *a)
     if (!a->dev || !a->dev->ops->resize)
         return -ENOSPC;
 
-    new_total = a->total + GROW_INCREMENT;
+    /* Grow proportional to current size (12.5%), clamped to [64MB, 1GB] */
+    {
+        uint64_t inc = a->total / 8;
+        if (inc < GROW_MIN) inc = GROW_MIN;
+        if (inc > GROW_MAX) inc = GROW_MAX;
+        new_total = a->total + inc;
+    }
     new_size  = new_total * STM_BLOCK_SIZE;
 
     if (a->dev->ops->resize(a->dev->ctx, new_size) != 0)
