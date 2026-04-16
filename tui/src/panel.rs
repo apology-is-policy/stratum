@@ -186,6 +186,10 @@ impl Panel {
     pub fn write_file(&mut self, name: &str, data: &[u8]) -> Result<()> {
         match &mut self.backend {
             Backend::P9 { client, root_fid, path } => {
+                // Remove existing file first (create fails if it exists)
+                if let Ok(old_fid) = client.walk(*root_fid, &[name]) {
+                    let _ = client.remove(old_fid);
+                }
                 let names: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
                 let dir_fid = client.walk(*root_fid, &names)?;
                 client.create(dir_fid, name, 0o644, ORDWR)?;
