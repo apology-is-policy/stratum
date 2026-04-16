@@ -513,8 +513,9 @@ fn draw_editor(frame: &mut Frame, area: Rect, ed: &crate::editor::EditorState) {
 
     // Status bar: mode | command buffer | status message | position
     let mode_clr = match ed.mode {
-        EditorMode::Normal => if ed.readonly { Color::DarkGray } else { Color::Blue },
-        EditorMode::Insert => Color::Green,
+        EditorMode::Normal => if ed.readonly { Color::DarkGray } else { Color::Green },
+        EditorMode::Insert => Color::Red,
+        EditorMode::Visual => Color::Blue,
         EditorMode::Command(_) => Color::Yellow,
     };
 
@@ -543,7 +544,7 @@ fn draw_editor(frame: &mut Frame, area: Rect, ed: &crate::editor::EditorState) {
         ));
     } else {
         spans.push(Span::styled(
-            " i:insert  ::command  :w :q :wq :q!",
+            " i:insert  v:select  p:paste  ::command",
             Style::default().fg(Color::DarkGray),
         ));
     }
