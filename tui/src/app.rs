@@ -25,6 +25,12 @@ pub enum Mode {
     },
 }
 
+/// Deferred blocking operations — set before a draw so the UI
+/// shows a busy message, then executed after the draw completes.
+pub enum PendingAction {
+    OpenVolume { path: String, pass: Option<String> },
+}
+
 pub struct App {
     pub left: Panel,
     pub right: Panel,
@@ -35,6 +41,8 @@ pub struct App {
     pub quit: bool,
     pub config: Config,
     pub copy_state: Option<CopyState>,
+    pub busy_message: Option<String>,
+    pub pending_action: Option<PendingAction>,
     // server management
     server_proc: Option<Child>,
     server_sock: Option<String>,
@@ -63,6 +71,8 @@ impl App {
             quit: false,
             config: Config::load(),
             copy_state: None,
+            busy_message: None,
+            pending_action: None,
             server_proc: None,
             server_sock: None,
             pending_volume: None,
@@ -220,12 +230,17 @@ impl App {
             InputAction::OpenVolume => {
                 if value.is_empty() { return; }
                 self.pending_volume = Some(value.to_string());
-                // try opening without password first
-                self.try_open_volume(value, None);
+                self.busy_message = Some("Opening volume...".into());
+                self.pending_action = Some(PendingAction::OpenVolume {
+                    path: value.to_string(), pass: None,
+                });
             }
             InputAction::Password => {
                 if let Some(vol) = self.pending_volume.take() {
-                    self.try_open_volume(&vol, Some(value));
+                    self.busy_message = Some("Decrypting volume...".into());
+                    self.pending_action = Some(PendingAction::OpenVolume {
+                        path: vol, pass: Some(value.to_string()),
+                    });
                 }
             }
             InputAction::Mkdir => {
@@ -388,7 +403,15 @@ impl App {
         };
 
         if state.cancelled || state.written >= state.total {
-            // finish: close the write handle
+            if !state.cancelled && state.handle.is_some()
+               && self.busy_message.is_none() {
+                // First pass: set the busy message and return true so the
+                // main loop draws "Syncing..." before we do the blocking clunk.
+                self.busy_message = Some("Syncing to disk...".into());
+                self.copy_state = Some(state);
+                return true;
+            }
+            // Second pass (or cancel): actually finalize
             if let Some(handle) = state.handle.take() {
                 let dest = match state.dest {
                     Focus::Left => &mut self.left,
@@ -397,6 +420,7 @@ impl App {
                 let _ = dest.end_write(handle);
                 let _ = dest.refresh();
             }
+            self.busy_message = None;
             if state.cancelled {
                 self.status = format!("Copy cancelled: {}", state.filename);
             } else {
@@ -432,6 +456,20 @@ impl App {
         if let Some(ref mut s) = self.copy_state {
             s.cancelled = true;
         }
+    }
+
+    /// Execute deferred blocking action (call after drawing the busy dialog).
+    pub fn run_pending_action(&mut self) {
+        let action = match self.pending_action.take() {
+            Some(a) => a,
+            None => return,
+        };
+        match action {
+            PendingAction::OpenVolume { path, pass } => {
+                self.try_open_volume(&path, pass.as_deref());
+            }
+        }
+        self.busy_message = None;
     }
 }
 

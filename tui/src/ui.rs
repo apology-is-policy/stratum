@@ -65,6 +65,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if let Some(ref cs) = app.copy_state {
         draw_copy_dialog(frame, area, cs);
     }
+
+    // busy overlay (shown during blocking operations)
+    if let Some(ref msg) = app.busy_message {
+        draw_busy_dialog(frame, area, msg);
+    }
 }
 
 fn draw_panel(frame: &mut Frame, panel: &Panel, area: Rect, focused: bool) {
@@ -342,6 +347,33 @@ fn draw_copy_dialog(frame: &mut Frame, area: Rect, cs: &CopyState) {
         Line::from(Span::styled(
             " Press Esc to cancel",
             Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_busy_dialog(frame: &mut Frame, area: Rect, msg: &str) {
+    let w = 40u16.min(area.width.saturating_sub(4));
+    let h = 5u16;
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(" Please wait ")
+        .style(Style::default().bg(Color::DarkGray));
+
+    let inner = block.inner(rect);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(block, rect);
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {msg}"),
+            Style::default().fg(Color::White).bold(),
         )),
     ];
     frame.render_widget(Paragraph::new(lines), inner);

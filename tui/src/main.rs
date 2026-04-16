@@ -42,6 +42,13 @@ fn main() -> Result<()> {
     loop {
         terminal.draw(|f| ui::draw(f, &app))?;
 
+        // Execute deferred blocking actions AFTER the draw so the
+        // busy dialog is visible while the operation runs.
+        if app.pending_action.is_some() {
+            app.run_pending_action();
+            continue;
+        }
+
         if app.copy_state.is_some() {
             app.copy_tick();
             if event::poll(Duration::from_millis(5))? {
