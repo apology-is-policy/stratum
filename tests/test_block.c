@@ -1,6 +1,7 @@
 #include "test_main.h"
 #include "stratum/block.h"
 
+#include <errno.h>
 #include <unistd.h>
 
 static const char *test_path = "/tmp/stratum_test_block.img";
@@ -104,6 +105,38 @@ STM_TEST(test_file_backend_boundary_write)
     cleanup();
 }
 
+/* Hardlinked volume files cannot be safely mediated by flock (which is
+ * per-open-file-description, not per-inode). Confirm the backend
+ * refuses to open a file with st_nlink > 1. */
+STM_TEST(test_file_backend_refuses_hardlinked)
+{
+    static const char *link_path = "/tmp/stratum_test_block.link";
+
+    /* Create a real volume first. */
+    struct stm_block_dev dev;
+    int rc = stm_file_backend_open(test_path, 1, 1024 * 1024, &dev);
+    STM_ASSERT_EQ(rc, 0);
+    stm_block_close(&dev);
+
+    /* Create a hardlink to it. */
+    unlink(link_path);
+    STM_ASSERT_EQ(link(test_path, link_path), 0);
+
+    /* Opening either path must now fail with -EMLINK. */
+    rc = stm_file_backend_open(test_path, 0, 0, &dev);
+    STM_ASSERT_EQ(rc, -EMLINK);
+
+    rc = stm_file_backend_open(link_path, 0, 0, &dev);
+    STM_ASSERT_EQ(rc, -EMLINK);
+
+    /* Removing the extra link brings st_nlink back to 1, allowing open. */
+    unlink(link_path);
+    rc = stm_file_backend_open(test_path, 0, 0, &dev);
+    STM_ASSERT_EQ(rc, 0);
+    stm_block_close(&dev);
+    cleanup();
+}
+
 int main(void)
 {
     STM_SUITE("block");
@@ -111,6 +144,7 @@ int main(void)
     STM_RUN(test_file_backend_write_read);
     STM_RUN(test_file_backend_reopen);
     STM_RUN(test_file_backend_boundary_write);
+    STM_RUN(test_file_backend_refuses_hardlinked);
     printf("all passed\n");
     return 0;
 }

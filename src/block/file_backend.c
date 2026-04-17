@@ -107,6 +107,20 @@ int stm_file_backend_open(const char *path, int create, uint64_t size,
             close(fc->fd); free(fc); return -errno;
         }
         fc->size = (uint64_t)st.st_size;
+
+        /* Refuse multi-linked volume files. flock is per-open-file-
+         * description, so two `serve` processes each opening a different
+         * hardlink to the same inode will BOTH acquire LOCK_EX and race
+         * into cross-writer corruption. A single link is the only shape
+         * we can safely guarantee mutual exclusion for. */
+        if (st.st_nlink > 1) {
+            fprintf(stderr,
+                "Refusing to open %s: file has %u hard links. "
+                "flock cannot mediate between hardlinked paths — "
+                "remove the extra links (ls -li to find them) and retry.\n",
+                path, (unsigned)st.st_nlink);
+            close(fc->fd); free(fc); return -EMLINK;
+        }
     }
 
     /* Exclusive lock — prevents two servers from opening the same volume. */
