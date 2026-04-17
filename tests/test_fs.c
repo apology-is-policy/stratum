@@ -334,6 +334,31 @@ STM_TEST(test_fs_copy_delete_cycles_encrypted)
     unlink(path);
 }
 
+/* stm_fs_write must reject offset + len that would overflow uint64 */
+STM_TEST(test_fs_write_overflow_guard)
+{
+    const char *path = "/tmp/stratum_test_ovf.img";
+    struct stm_fs *fs;
+    unlink(path);
+    STM_ASSERT_EQ(stm_fs_create(path, 8ULL*1024*1024, NULL), 0);
+    STM_ASSERT_EQ(stm_fs_open(path, NULL, &fs), 0);
+
+    uint64_t ino;
+    STM_ASSERT_EQ(stm_fs_create_file(fs, 1, "f.bin", 0644, &ino), 0);
+
+    char data[16] = "0123456789abcdef";
+    /* offset + len wraps → must reject */
+    int rc = stm_fs_write(fs, ino, UINT64_MAX - 4, data, 16);
+    STM_ASSERT_EQ(rc, -EFBIG);
+
+    /* exact fit (offset + len == UINT64_MAX) is allowed; the subsequent
+     * extent allocations will fail at the allocator but the overflow
+     * check itself must not trip. Stop after checking the reject path. */
+
+    stm_fs_close(fs);
+    unlink(path);
+}
+
 int main(void)
 {
     STM_SUITE("fs");
@@ -346,6 +371,7 @@ int main(void)
     STM_RUN(test_fs_persist);
     STM_RUN(test_fs_copy_delete_cycles);
     STM_RUN(test_fs_copy_delete_cycles_encrypted);
+    STM_RUN(test_fs_write_overflow_guard);
     printf("all passed\n");
     return 0;
 }

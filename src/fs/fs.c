@@ -742,6 +742,14 @@ int stm_fs_write(struct stm_fs *fs, uint64_t ino, uint64_t offset,
     uint64_t pos = offset;
     int rc;
 
+    /* Reject offset + len that would wrap uint64. Without this guard a
+     * malicious or buggy client can plant extent records at both ends of
+     * the 64-bit offset space (the inner loop wraps through zero), and
+     * the inode size update silently does nothing (new_end also wraps).
+     * End up with ghost extents the inode can't see. */
+    if (len > 0 && offset > UINT64_MAX - (uint64_t)len)
+        return -EFBIG;
+
     /* Get current file size to skip old-extent lookups for growing writes */
     uint64_t cur_size = 0;
     {
