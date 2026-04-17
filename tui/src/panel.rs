@@ -68,6 +68,25 @@ impl Panel {
         matches!(self.backend, Backend::Host(_))
     }
 
+    /// True if a file/dir with `name` (possibly nested via "/") exists
+    /// at the current directory.
+    pub fn exists(&mut self, name: &str) -> bool {
+        match &mut self.backend {
+            Backend::P9 { client, root_fid, path } => {
+                let mut fpath: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                for part in name.split('/').filter(|s| !s.is_empty()) {
+                    fpath.push(part);
+                }
+                match client.walk(*root_fid, &fpath) {
+                    Ok(fid) => { let _ = client.clunk(fid); true }
+                    Err(_) => false,
+                }
+            }
+            Backend::Host(h) => h.cwd.join(name).exists(),
+            Backend::None => false,
+        }
+    }
+
     pub fn selected_entry(&self) -> Option<&Entry> {
         self.entries.get(self.cursor)
     }
@@ -563,6 +582,56 @@ impl Panel {
                 Ok(())
             }
             Backend::Host(h) => h.delete(name),
+            Backend::None => Err(anyhow!("not connected")),
+        }
+    }
+
+    /// Delete by path relative to the current directory. For P9, walks
+    /// multi-component paths; for Host, resolves against `cwd`.
+    pub fn delete_by_path(&mut self, rel: &str) -> Result<()> {
+        let parts: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() { return Ok(()); }
+        match &mut self.backend {
+            Backend::P9 { client, root_fid, path } => {
+                let mut fpath: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                fpath.extend(parts.iter().copied());
+                let fid = client.walk(*root_fid, &fpath)?;
+                client.remove(fid)?;
+                Ok(())
+            }
+            Backend::Host(h) => {
+                let p = h.cwd.join(rel);
+                if p.is_dir() { std::fs::remove_dir_all(p)?; }
+                else          { std::fs::remove_file(p)?; }
+                Ok(())
+            }
+            Backend::None => Err(anyhow!("not connected")),
+        }
+    }
+
+    /// Recursively delete a top-level child by name (directory or file).
+    /// For P9 we walk list_recursive in reverse order (leaves first);
+    /// for Host, remove_dir_all handles it in one shot.
+    pub fn delete_recursive(&mut self, name: &str) -> Result<()> {
+        let is_dir = self.entries.iter()
+            .find(|e| e.name == name)
+            .map(|e| e.is_dir)
+            .unwrap_or(false);
+        if !is_dir {
+            return self.delete_by_name(name);
+        }
+        match &self.backend {
+            Backend::Host(_) => self.delete_by_name(name),
+            Backend::P9 { .. } => {
+                let mut all = self.list_recursive(name)?;
+                // list_recursive emits pre-order; reverse for post-order
+                // so children are removed before their parent directory.
+                all.reverse();
+                for (path, _is_dir, _size) in &all {
+                    self.delete_by_path(path)?;
+                }
+                Ok(())
+            }
             Backend::None => Err(anyhow!("not connected")),
         }
     }

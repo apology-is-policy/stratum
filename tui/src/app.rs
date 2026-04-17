@@ -25,6 +25,41 @@ pub struct SnapshotDialog {
     pub cursor: usize,
 }
 
+/// Generic yes/no confirmation. The action to run on "yes" is stored
+/// alongside so the dialog can be shown and dismissed uniformly.
+#[derive(Clone)]
+pub struct ConfirmDialog {
+    pub title: String,
+    pub message: String,
+    pub action: ConfirmAction,
+}
+
+#[derive(Clone)]
+pub enum ConfirmAction {
+    /// Delete the given top-level names from `panel`, recursively.
+    Delete { panel: Focus, names: Vec<String> },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ConflictChoice { Skip, Overwrite, KeepBoth }
+
+pub struct ConflictDialog {
+    /// Original source filename (may be nested like "dir/file.bin").
+    pub filename: String,
+    /// Currently-highlighted choice.
+    pub choice: ConflictChoice,
+    /// Whether the "apply to all" checkbox is ticked.
+    pub apply_to_all: bool,
+    /// UI focus: 0=Skip, 1=Overwrite, 2=KeepBoth, 3=ApplyToAll
+    pub field: u8,
+}
+
+impl ConflictDialog {
+    pub fn new(filename: String) -> Self {
+        Self { filename, choice: ConflictChoice::Overwrite, apply_to_all: false, field: 1 }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum MkVolField {
     Name, Size, Encrypt, Passphrase, Compress, Ok, Cancel,
@@ -127,6 +162,8 @@ pub struct App {
     pub editor: Option<EditorState>,
     pub snap_dialog: Option<SnapshotDialog>,
     pub mkvol_dialog: Option<MkVolDialog>,
+    pub confirm_dialog: Option<ConfirmDialog>,
+    pub conflict_dialog: Option<ConflictDialog>,
     // server management
     server_proc: Option<Child>,
     server_sock: Option<String>,
@@ -144,7 +181,8 @@ pub struct ThroughputSample {
 }
 
 pub struct CopyState {
-    pub filename: String,       // current file
+    pub filename: String,       // source filename (progress bar uses this)
+    pub target_filename: String,// destination filename (differs if KeepBoth renamed)
     pub copied: u64,            // bytes copied of current file
     pub total: u64,             // size of current file
     pub src: Focus,
@@ -162,6 +200,11 @@ pub struct CopyState {
     pub file_index: usize,      // current file (0-based)
     pub file_count: usize,      // total files in queue
     pub queue: Vec<String>,     // remaining filenames to copy
+    /// Sticky conflict policy from an "apply to all" checkbox. None means
+    /// we will pause and ask on every conflict.
+    pub conflict_policy: Option<ConflictChoice>,
+    /// Number of files skipped due to conflict resolution (informational).
+    pub skipped: usize,
 }
 
 impl App {
@@ -181,6 +224,8 @@ impl App {
             editor: None,
             snap_dialog: None,
             mkvol_dialog: None,
+            confirm_dialog: None,
+            conflict_dialog: None,
             server_proc: None,
             server_sock: None,
             pending_volume: None,
@@ -302,37 +347,7 @@ impl App {
                     history_cursor: None,
                 };
             }
-            KeyCode::F(8) => {
-                let status = {
-                    let panel = self.active();
-                    if panel.selected.is_empty() {
-                        match panel.delete_selected() {
-                            Err(e) => format!("Delete error: {e}"),
-                            Ok(()) => "Deleted".into(),
-                        }
-                    } else {
-                        let names: Vec<String> = panel.selected.iter()
-                            .filter_map(|&i| panel.entries.get(i))
-                            .filter(|e| !e.is_dir && e.name != "..")
-                            .map(|e| e.name.clone())
-                            .collect();
-                        let mut ok = 0;
-                        let mut errs = 0;
-                        for name in &names {
-                            if panel.delete_by_name(name).is_err() { errs += 1; }
-                            else { ok += 1; }
-                        }
-                        panel.selected.clear();
-                        if errs > 0 {
-                            format!("Deleted {ok}, {errs} error(s)")
-                        } else {
-                            format!("Deleted {ok} file(s)")
-                        }
-                    }
-                };
-                self.refresh_both();
-                self.status = status;
-            }
+            KeyCode::F(8) => self.begin_delete(),
             KeyCode::F(10) | KeyCode::Char('q') => self.quit = true,
             KeyCode::F(9) | KeyCode::Char('s') => self.open_snap_dialog(),
 
@@ -560,6 +575,100 @@ impl App {
     }
 
     // ── snapshot dialog ──────────────────────────────────────────────
+
+    fn begin_delete(&mut self) {
+        let focus = self.focus;
+        let panel = self.active();
+        let names: Vec<String>;
+        let dir_count;
+
+        if panel.selected.is_empty() {
+            // Single cursor item.
+            let e = match panel.selected_entry() {
+                Some(e) if e.name != ".." => e.clone(),
+                _ => { self.status = "Nothing to delete".into(); return; }
+            };
+            dir_count = if e.is_dir { 1 } else { 0 };
+            names = vec![e.name];
+        } else {
+            // Multi-selection (include directories this time).
+            let items: Vec<(String, bool)> = panel.selected.iter()
+                .filter_map(|&i| panel.entries.get(i))
+                .filter(|e| e.name != "..")
+                .map(|e| (e.name.clone(), e.is_dir))
+                .collect();
+            if items.is_empty() { self.status = "Nothing to delete".into(); return; }
+            dir_count = items.iter().filter(|(_, d)| *d).count();
+            names = items.into_iter().map(|(n, _)| n).collect();
+        }
+
+        // No directory in the selection: delete files straight through, as before.
+        if dir_count == 0 {
+            let panel = self.active();
+            let mut ok = 0;
+            let mut errs = 0;
+            for name in &names {
+                if panel.delete_by_name(name).is_err() { errs += 1; } else { ok += 1; }
+            }
+            panel.selected.clear();
+            self.refresh_both();
+            self.status = if errs > 0 { format!("Deleted {ok}, {errs} error(s)") }
+                          else        { format!("Deleted {ok} item(s)") };
+            return;
+        }
+
+        // Otherwise, confirm before recursing.
+        let message = if names.len() == 1 {
+            format!("Recursively delete directory '{}'?", names[0])
+        } else {
+            format!("Delete {} items (including {} director{}) recursively?",
+                names.len(), dir_count,
+                if dir_count == 1 { "y" } else { "ies" })
+        };
+        self.confirm_dialog = Some(ConfirmDialog {
+            title: "Confirm delete".into(),
+            message,
+            action: ConfirmAction::Delete { panel: focus, names },
+        });
+    }
+
+    pub fn confirm_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::KeyCode;
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                let action = self.confirm_dialog.take().map(|d| d.action);
+                if let Some(a) = action { self.run_confirm(a); }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.confirm_dialog = None;
+                self.status = "Cancelled".into();
+            }
+            _ => {}
+        }
+    }
+
+    fn run_confirm(&mut self, action: ConfirmAction) {
+        match action {
+            ConfirmAction::Delete { panel: focus, names } => {
+                let panel = match focus {
+                    Focus::Left => &mut self.left,
+                    Focus::Right => &mut self.right,
+                };
+                let mut ok = 0;
+                let mut errs = 0;
+                for name in &names {
+                    if panel.delete_recursive(name).is_err() { errs += 1; } else { ok += 1; }
+                }
+                panel.selected.clear();
+                self.refresh_both();
+                self.status = if errs > 0 {
+                    format!("Deleted {ok}, {errs} error(s)")
+                } else {
+                    format!("Deleted {ok} item(s)")
+                };
+            }
+        }
+    }
 
     fn open_mkvol_dialog(&mut self) {
         let target = self.focus;
@@ -937,31 +1046,19 @@ impl App {
         let mut queue = files;
         let first = queue.remove(0);
 
-        // Open handles for the first file
-        let src_panel = match src { Focus::Left => &mut self.left, Focus::Right => &mut self.right };
-        let (rh, size) = match src_panel.begin_read(&first) {
-            Ok(r) => r,
-            Err(e) => { self.status = format!("Read error: {e}"); return; }
-        };
-        let dest_panel = match dest { Focus::Left => &mut self.left, Focus::Right => &mut self.right };
-        let wh = match dest_panel.begin_write(&first) {
-            Ok(h) => h,
-            Err(e) => {
-                let sp = match src { Focus::Left => &mut self.left, Focus::Right => &mut self.right };
-                let _ = sp.end_read(rh);
-                self.status = format!("Create error: {e}"); return;
-            }
-        };
-
+        // Defer opening the first file's handles to copy_tick — it runs
+        // the conflict check and, if needed, opens the conflict dialog
+        // before any I/O happens.
         let now = std::time::Instant::now();
         self.copy_state = Some(CopyState {
             filename: first.clone(),
+            target_filename: first,
             copied: 0,
-            total: size,
+            total: 0,
             src, dest,
             cancelled: false,
-            read_handle: Some(rh),
-            write_handle: Some(wh),
+            read_handle: None,
+            write_handle: None,
             start_time: now,
             samples: Vec::new(),
             last_sample_bytes: 0,
@@ -971,6 +1068,8 @@ impl App {
             file_index: 0,
             file_count,
             queue,
+            conflict_policy: None,
+            skipped: 0,
         });
     }
 
@@ -984,6 +1083,34 @@ impl App {
             Some(s) => s,
             None => return false,
         };
+
+        // Stage A: open handles for the current file if we haven't yet.
+        // Conflict handling lives here; may pause to ask the user.
+        if !state.cancelled
+            && state.read_handle.is_none()
+            && state.write_handle.is_none()
+        {
+            match self.prepare_current_file(&mut state) {
+                PrepareResult::Opened => { /* fall through to copy */ }
+                PrepareResult::NeedDialog => {
+                    self.conflict_dialog =
+                        Some(ConflictDialog::new(state.filename.clone()));
+                    self.copy_state = Some(state);
+                    return true;
+                }
+                PrepareResult::Skipped => {
+                    state.skipped += 1;
+                    self.advance_or_finish(&mut state);
+                    self.copy_state = Some(state);
+                    return true;
+                }
+                PrepareResult::Error(msg) => {
+                    self.status = msg;
+                    self.copy_state = Some(state);
+                    return false;
+                }
+            }
+        }
 
         if state.cancelled || state.copied >= state.total {
             // Current file done — close its handles (only count once)
@@ -1013,7 +1140,6 @@ impl App {
                     return true;
                 }
                 self.busy_message = None;
-                // Clear multi-select
                 {
                     let panel = match state.src {
                         Focus::Left => &mut self.left,
@@ -1022,9 +1148,13 @@ impl App {
                     panel.selected.clear();
                 }
                 self.refresh_both();
+                let done = state.file_count.saturating_sub(state.skipped);
                 if state.cancelled {
                     self.status = format!("Copy cancelled ({} of {} files)",
                         state.file_index, state.file_count);
+                } else if state.skipped > 0 {
+                    self.status = format!("Copied {done} file(s) ({}), {} skipped",
+                        human_size(state.total_copied), state.skipped);
                 } else {
                     self.status = format!("Copied {} file(s) ({})",
                         state.file_count, human_size(state.total_copied));
@@ -1032,39 +1162,8 @@ impl App {
                 return false;
             }
 
-            // Advance to next file in queue
-            let next = state.queue.remove(0);
-            state.file_index += 1;
-
-            let src_panel = match state.src {
-                Focus::Left => &mut self.left,
-                Focus::Right => &mut self.right,
-            };
-            match src_panel.begin_read(&next) {
-                Ok((rh, size)) => {
-                    state.read_handle = Some(rh);
-                    state.filename = next.clone();
-                    state.copied = 0;
-                    state.total = size;
-                    let dest_panel = match state.dest {
-                        Focus::Left => &mut self.left,
-                        Focus::Right => &mut self.right,
-                    };
-                    match dest_panel.begin_write(&next) {
-                        Ok(wh) => { state.write_handle = Some(wh); }
-                        Err(e) => {
-                            self.status = format!("Create error on {next}: {e}");
-                            self.copy_state = Some(state);
-                            return false;
-                        }
-                    }
-                }
-                Err(e) => {
-                    self.status = format!("Read error on {next}: {e}");
-                    self.copy_state = Some(state);
-                    return false;
-                }
-            }
+            // Advance to next file; the next tick's Stage A will open its handles.
+            self.advance_or_finish(&mut state);
             self.copy_state = Some(state);
             return true;
         }
@@ -1137,6 +1236,209 @@ impl App {
     pub fn cancel_copy(&mut self) {
         if let Some(ref mut s) = self.copy_state {
             s.cancelled = true;
+        }
+    }
+
+    /// Open read/write handles for the current file. Enforces conflict
+    /// policy (Skip/Overwrite/KeepBoth) or requests a dialog when none
+    /// is set.
+    fn prepare_current_file(&mut self, state: &mut CopyState) -> PrepareResult {
+        // Dest-side existence check against the current target name.
+        let exists = {
+            let dest_panel = match state.dest {
+                Focus::Left => &mut self.left,
+                Focus::Right => &mut self.right,
+            };
+            dest_panel.exists(&state.target_filename)
+        };
+
+        if exists {
+            match state.conflict_policy {
+                None => return PrepareResult::NeedDialog,
+                Some(ConflictChoice::Skip) => return PrepareResult::Skipped,
+                Some(ConflictChoice::Overwrite) => { /* begin_write will replace */ }
+                Some(ConflictChoice::KeepBoth) => {
+                    let dp = match state.dest {
+                        Focus::Left => &mut self.left,
+                        Focus::Right => &mut self.right,
+                    };
+                    state.target_filename = unused_name(dp, &state.filename);
+                }
+            }
+        }
+
+        // Open source read handle.
+        let src_panel = match state.src {
+            Focus::Left => &mut self.left,
+            Focus::Right => &mut self.right,
+        };
+        let (rh, size) = match src_panel.begin_read(&state.filename) {
+            Ok(r) => r,
+            Err(e) => return PrepareResult::Error(
+                format!("Read error on {}: {e}", state.filename)),
+        };
+        state.read_handle = Some(rh);
+        state.total = size;
+        state.copied = 0;
+
+        // Open dest write handle under the (possibly renamed) target.
+        let dest_panel = match state.dest {
+            Focus::Left => &mut self.left,
+            Focus::Right => &mut self.right,
+        };
+        match dest_panel.begin_write(&state.target_filename) {
+            Ok(wh) => { state.write_handle = Some(wh); PrepareResult::Opened }
+            Err(e) => {
+                // Undo the read handle we just opened.
+                if let Some(rh) = state.read_handle.take() {
+                    let sp = match state.src {
+                        Focus::Left => &mut self.left,
+                        Focus::Right => &mut self.right,
+                    };
+                    let _ = sp.end_read(rh);
+                }
+                PrepareResult::Error(
+                    format!("Create error on {}: {e}", state.target_filename))
+            }
+        }
+    }
+
+    /// Advance `state` to the next file in the queue, resetting per-file
+    /// fields. Caller is responsible for stashing state back into copy_state.
+    fn advance_or_finish(&self, state: &mut CopyState) {
+        if let Some(next) = state.queue.first().cloned() {
+            state.queue.remove(0);
+            state.file_index += 1;
+            state.filename = next.clone();
+            state.target_filename = next;
+            state.copied = 0;
+            state.total = 0;
+            // Handles were already closed (or never opened if we skipped).
+        }
+    }
+
+    /// Handle a key while the conflict dialog is open.
+    pub fn conflict_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let Some(d) = self.conflict_dialog.as_mut() else { return; };
+
+        let choice_from_field = |f: u8| -> Option<ConflictChoice> {
+            match f {
+                0 => Some(ConflictChoice::Skip),
+                1 => Some(ConflictChoice::Overwrite),
+                2 => Some(ConflictChoice::KeepBoth),
+                _ => None,
+            }
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                // Treat as cancel-entire-copy for safety.
+                self.conflict_dialog = None;
+                if let Some(s) = self.copy_state.as_mut() { s.cancelled = true; }
+                return;
+            }
+            KeyCode::Tab => { d.field = if shift {
+                (d.field + 3) % 4
+            } else { (d.field + 1) % 4 }; return; }
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Up =>
+                { d.field = (d.field + 3) % 4; return; }
+            KeyCode::Right | KeyCode::Down =>
+                { d.field = (d.field + 1) % 4; return; }
+            KeyCode::Char(' ') if d.field == 3 => {
+                d.apply_to_all = !d.apply_to_all; return;
+            }
+            KeyCode::Char(' ') => {
+                if let Some(c) = choice_from_field(d.field) { d.choice = c; return; }
+            }
+            KeyCode::Enter => { /* confirm current selection below */ }
+            // Quick keys
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                d.choice = ConflictChoice::Skip; self.confirm_conflict_choice(); return;
+            }
+            KeyCode::Char('o') | KeyCode::Char('O') => {
+                d.choice = ConflictChoice::Overwrite; self.confirm_conflict_choice(); return;
+            }
+            KeyCode::Char('k') | KeyCode::Char('K') => {
+                d.choice = ConflictChoice::KeepBoth; self.confirm_conflict_choice(); return;
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                d.apply_to_all = !d.apply_to_all; return;
+            }
+            _ => return,
+        }
+
+        // Enter: commit whichever button is focused. If focus is on the
+        // checkbox, pick the currently-highlighted choice.
+        if let Some(c) = choice_from_field(d.field) { d.choice = c; }
+        self.confirm_conflict_choice();
+    }
+
+    fn confirm_conflict_choice(&mut self) {
+        let (choice, apply_to_all) = match self.conflict_dialog.take() {
+            Some(d) => (d.choice, d.apply_to_all),
+            None => return,
+        };
+        let mut state = match self.copy_state.take() {
+            Some(s) => s,
+            None => return,
+        };
+        if apply_to_all { state.conflict_policy = Some(choice); }
+
+        match choice {
+            ConflictChoice::Skip => {
+                state.skipped += 1;
+                self.advance_or_finish(&mut state);
+            }
+            ConflictChoice::Overwrite => {
+                // Proceed: begin_write will replace the existing file.
+                if let Err(msg) = self.open_handles_for_current(&mut state) {
+                    self.status = msg;
+                }
+            }
+            ConflictChoice::KeepBoth => {
+                let dp = match state.dest {
+                    Focus::Left => &mut self.left,
+                    Focus::Right => &mut self.right,
+                };
+                state.target_filename = unused_name(dp, &state.filename);
+                if let Err(msg) = self.open_handles_for_current(&mut state) {
+                    self.status = msg;
+                }
+            }
+        }
+        self.copy_state = Some(state);
+    }
+
+    fn open_handles_for_current(&mut self, state: &mut CopyState)
+        -> Result<(), String>
+    {
+        let src_panel = match state.src {
+            Focus::Left => &mut self.left,
+            Focus::Right => &mut self.right,
+        };
+        let (rh, size) = src_panel.begin_read(&state.filename)
+            .map_err(|e| format!("Read error on {}: {e}", state.filename))?;
+        state.read_handle = Some(rh);
+        state.total = size;
+        state.copied = 0;
+        let dest_panel = match state.dest {
+            Focus::Left => &mut self.left,
+            Focus::Right => &mut self.right,
+        };
+        match dest_panel.begin_write(&state.target_filename) {
+            Ok(wh) => { state.write_handle = Some(wh); Ok(()) }
+            Err(e) => {
+                if let Some(rh) = state.read_handle.take() {
+                    let sp = match state.src {
+                        Focus::Left => &mut self.left,
+                        Focus::Right => &mut self.right,
+                    };
+                    let _ = sp.end_read(rh);
+                }
+                Err(format!("Create error on {}: {e}", state.target_filename))
+            }
         }
     }
 
@@ -1216,6 +1518,34 @@ fn human_size(bytes: u64) -> String {
         val /= 1024.0;
     }
     format!("{val:.1} TB")
+}
+
+enum PrepareResult {
+    Opened,
+    NeedDialog,
+    Skipped,
+    Error(String),
+}
+
+/// Produce a fresh filename that doesn't collide with anything in `panel`.
+/// Strategy: insert "_new" before the extension; repeat if still taken.
+///   foo.txt -> foo_new.txt -> foo_new_new.txt ...
+///   archive -> archive_new -> archive_new_new ...
+fn unused_name(panel: &mut Panel, original: &str) -> String {
+    let (dir, base) = match original.rfind('/') {
+        Some(i) => (&original[..=i], &original[i + 1..]),
+        None => ("", original),
+    };
+    let (stem, ext) = match base.rfind('.') {
+        Some(i) if i > 0 => (&base[..i], &base[i..]),
+        _ => (base, ""),
+    };
+    let mut stem_buf = format!("{stem}_new");
+    loop {
+        let candidate = format!("{dir}{stem_buf}{ext}");
+        if !panel.exists(&candidate) { return candidate; }
+        stem_buf.push_str("_new");
+    }
 }
 
 /// Parse a size string like "64M", "1G", "1024" into bytes. Returns None

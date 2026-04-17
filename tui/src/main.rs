@@ -73,6 +73,30 @@ fn main() -> Result<()> {
             continue;
         }
 
+        // Confirm dialog — Y/N modal, takes priority over everything below
+        if app.confirm_dialog.is_some() {
+            if event::poll(Duration::from_millis(50))? {
+                if let Event::Key(key) = event::read()? {
+                    if key.kind == KeyEventKind::Press {
+                        app.confirm_key(key);
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Conflict dialog (during copy) — modal; copy_tick is paused.
+        if app.conflict_dialog.is_some() {
+            if event::poll(Duration::from_millis(50))? {
+                if let Event::Key(key) = event::read()? {
+                    if key.kind == KeyEventKind::Press {
+                        app.conflict_key(key);
+                    }
+                }
+            }
+            continue;
+        }
+
         // Editor mode — all keys go to editor
         if app.editor.is_some() {
             if event::poll(Duration::from_millis(50))? {

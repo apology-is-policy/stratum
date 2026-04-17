@@ -1,6 +1,7 @@
 //! FAR Commander-style TUI rendering.
 
-use crate::app::{App, CopyState, Focus, InputAction, MkVolDialog, MkVolField, Mode, SnapshotDialog};
+use crate::app::{App, ConflictChoice, ConflictDialog, ConfirmDialog, CopyState,
+                  Focus, InputAction, MkVolDialog, MkVolField, Mode, SnapshotDialog};
 use crate::editor::EditorMode;
 use crate::panel::Panel;
 use ratatui::prelude::*;
@@ -119,6 +120,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     if let Some(ref md) = app.mkvol_dialog {
         draw_mkvol_dialog(frame, area, md);
+    }
+    if let Some(ref cd) = app.confirm_dialog {
+        draw_confirm_dialog(frame, area, cd);
+    }
+    if let Some(ref cd) = app.conflict_dialog {
+        draw_conflict_dialog(frame, area, cd);
     }
 }
 
@@ -852,6 +859,142 @@ fn draw_mkvol_dialog(frame: &mut Frame, area: Rect, md: &MkVolDialog) {
             Style::default().fg(Color::DarkGray),
         ))),
         rows[11],
+    );
+}
+
+fn draw_conflict_dialog(frame: &mut Frame, area: Rect, cd: &ConflictDialog) {
+    let w = 66u16.min(area.width.saturating_sub(4));
+    let h = 10u16.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow).bold())
+        .title(" File already exists ")
+        .style(Style::default().bg(CLR_POPUP_BG));
+
+    let inner = block.inner(rect);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(block, rect);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),  // filename message
+            Constraint::Length(1),  // spacer
+            Constraint::Length(1),  // buttons
+            Constraint::Length(1),  // spacer
+            Constraint::Length(1),  // apply-to-all
+            Constraint::Min(0),
+            Constraint::Length(1),  // hint
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(&cd.filename, Style::default().fg(Color::Cyan).bold()),
+            Span::styled(" already exists at destination.",
+                Style::default().fg(Color::White)),
+        ])),
+        rows[0],
+    );
+
+    let btn_style = |is_focused: bool, is_selected: bool| {
+        if is_focused {
+            Style::default().fg(Color::Black).bg(Color::Yellow).bold()
+        } else if is_selected {
+            Style::default().fg(Color::Black).bg(Color::Cyan).bold()
+        } else {
+            Style::default().fg(Color::White).bold()
+        }
+    };
+
+    let spans = vec![
+        Span::raw("  "),
+        Span::styled(" Skip (S) ",
+            btn_style(cd.field == 0, cd.choice == ConflictChoice::Skip)),
+        Span::raw("  "),
+        Span::styled(" Overwrite (O) ",
+            btn_style(cd.field == 1, cd.choice == ConflictChoice::Overwrite)),
+        Span::raw("  "),
+        Span::styled(" Keep both (K) ",
+            btn_style(cd.field == 2, cd.choice == ConflictChoice::KeepBoth)),
+    ];
+    frame.render_widget(Paragraph::new(Line::from(spans)), rows[2]);
+
+    let cb_style = if cd.field == 3 {
+        Style::default().fg(Color::Yellow).bold()
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let box_txt = if cd.apply_to_all { "[X]" } else { "[ ]" };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("{box_txt} Apply to all remaining conflicts (A)"), cb_style),
+        ])),
+        rows[4],
+    );
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " Tab moves focus  Enter confirms  Esc cancels copy",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[6],
+    );
+}
+
+fn draw_confirm_dialog(frame: &mut Frame, area: Rect, cd: &ConfirmDialog) {
+    let w = 60u16.min(area.width.saturating_sub(4));
+    let h = 7u16;
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red).bold())
+        .title(format!(" {} ", cd.title))
+        .style(Style::default().bg(CLR_POPUP_BG));
+
+    let inner = block.inner(rect);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(block, rect);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),      // message
+            Constraint::Length(1),   // spacer
+            Constraint::Length(1),   // buttons
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {}", cd.message),
+            Style::default().fg(Color::White),
+        ))).wrap(Wrap { trim: false }),
+        rows[0],
+    );
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("   "),
+            Span::styled(" Yes (Y) ",
+                Style::default().fg(Color::Black).bg(Color::Red).bold()),
+            Span::raw("    "),
+            Span::styled(" No (N) ",
+                Style::default().fg(Color::Black).bg(Color::Cyan).bold()),
+            Span::raw("    "),
+            Span::styled("Enter=Yes  Esc=No",
+                Style::default().fg(Color::DarkGray)),
+        ])),
+        rows[2],
     );
 }
 
