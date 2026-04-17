@@ -36,3 +36,8 @@ if(STM_HAVE_ZSTD)
     target_include_directories(stratum-lib PUBLIC ${ZSTD_INCLUDE_DIR})
     target_link_libraries(stratum-lib PUBLIC ${ZSTD_LIBRARY})
 endif()
+
+if(STM_HAVE_XXHASH)
+    target_include_directories(stratum-lib PUBLIC ${XXHASH_INCLUDE_DIR})
+    target_link_libraries(stratum-lib PUBLIC ${XXHASH_LIBRARY})
+endif()

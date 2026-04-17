@@ -1,4 +1,5 @@
 #include "fs_internal.h"
+#include "stratum/csum.h"
 
 #include <time.h>
 
@@ -245,6 +246,8 @@ int stm_fs_create(const char *path, uint64_t size_bytes,
     sb.ss_snap_height  = cpu_to_le16(0);
     sb.ss_next_snap_id = cpu_to_le64(1);
 
+    memset(sb.ss_csum, 0, sizeof(sb.ss_csum));
+    stm_csum_compute(&sb, sizeof(sb), sb.ss_csum);
     stm_block_write(&dev, STM_SB_OFFSET_A, &sb, sizeof(sb));
     stm_block_write(&dev, STM_SB_OFFSET_B, &sb, sizeof(sb));
     stm_block_sync(&dev);
@@ -278,6 +281,21 @@ int stm_fs_open(const char *path, const char *passphrase, struct stm_fs **out)
     {
         int a_ok = (le64_to_cpu(sa.ss_magic) == STM_MAGIC);
         int b_ok = (le64_to_cpu(sb.ss_magic) == STM_MAGIC);
+        /* Verify superblock checksums (all-zeros = old volume, passes) */
+        if (a_ok) {
+            uint8_t saved[STM_CSUM_LEN];
+            memcpy(saved, sa.ss_csum, STM_CSUM_LEN);
+            memset(sa.ss_csum, 0, STM_CSUM_LEN);
+            if (stm_csum_verify(&sa, sizeof(sa), saved) != 0) a_ok = 0;
+            memcpy(sa.ss_csum, saved, STM_CSUM_LEN);
+        }
+        if (b_ok) {
+            uint8_t saved[STM_CSUM_LEN];
+            memcpy(saved, sb.ss_csum, STM_CSUM_LEN);
+            memset(sb.ss_csum, 0, STM_CSUM_LEN);
+            if (stm_csum_verify(&sb, sizeof(sb), saved) != 0) b_ok = 0;
+            memcpy(sb.ss_csum, saved, STM_CSUM_LEN);
+        }
         if (!a_ok && !b_ok) { stm_block_close(&fs->dev); free(fs); return -EINVAL; }
 
         if (a_ok && b_ok)
@@ -410,6 +428,10 @@ int stm_fs_sync(struct stm_fs *fs)
     memcpy(sb.ss_enc_kdf_salt, fs->enc_kdf_salt, sizeof(sb.ss_enc_kdf_salt));
     memcpy(sb.ss_enc_wrapped_key, fs->enc_wrapped_key, sizeof(sb.ss_enc_wrapped_key));
     memcpy(sb.ss_enc_nonce, fs->enc_nonce, sizeof(sb.ss_enc_nonce));
+
+    /* Compute superblock checksum (over everything except the csum field itself) */
+    memset(sb.ss_csum, 0, sizeof(sb.ss_csum));
+    stm_csum_compute(&sb, sizeof(sb), sb.ss_csum);
 
     new_slot = 1 - fs->sb_slot;
     rc = stm_block_write(&fs->dev,

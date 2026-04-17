@@ -1,5 +1,6 @@
 #include "btree_internal.h"
 #include "stratum/compress.h"
+#include "stratum/csum.h"
 
 /* ── block I/O helpers ──────────────────────────────────────────────── */
 
@@ -42,6 +43,12 @@ int stm_btree_read_node(struct stm_btree *tree, struct stm_bptr *bptr,
 
     rc = stm_block_read(tree->dev, le64_to_cpu(bptr->bp_paddr), raw, disk_size);
     if (rc) { free(raw); return rc; }
+
+    /* Verify on-disk checksum (before decrypt/decompress) */
+    if (stm_csum_verify(raw, disk_size, bptr->bp_csum) != 0) {
+        free(raw);
+        return -EIO;  /* block pointer checksum mismatch */
+    }
 
     /* decrypt if needed */
     data_len = disk_size;
@@ -128,34 +135,34 @@ int stm_btree_write_node(struct stm_btree *tree, struct stm_node *n,
         rc = stm_btree_alloc(tree, disk_len, &addr);
         if (rc) { free(enc_buf); free(comp_buf); free(buf); return rc; }
 
+        memset(out, 0, sizeof(*out));
+
         if (tree->crypto) {
             uint32_t clen;
             rc = stm_crypto_encrypt(tree->crypto, addr,
                                     write_buf, write_len, enc_buf, &clen);
             free(comp_buf); free(buf);
             if (rc) { free(enc_buf); return rc; }
+            stm_csum_compute(enc_buf, clen, out->bp_csum);
             rc = stm_block_write(tree->dev, addr, enc_buf, clen);
             write_len = clen;
             free(enc_buf);
         } else {
+            stm_csum_compute(write_buf, write_len, out->bp_csum);
             rc = stm_block_write(tree->dev, addr, write_buf, write_len);
             free(comp_buf); free(buf);
         }
         if (rc) return rc;
     }
 
-    /* Note: COW reclaim is done by callers who have the accurate old bptr
-     * (with correct csize).  write_node only updates the node's address. */
     n->paddr = addr;
     n->dirty = 0;
 
-    memset(out, 0, sizeof(*out));
     out->bp_paddr = cpu_to_le64(addr);
     out->bp_laddr = cpu_to_le64(addr);
     out->bp_comp  = algo;
     out->bp_csize = cpu_to_le32(write_len);
     out->bp_lsize = cpu_to_le32(used);
-    /* TODO: BLAKE3 into bp_csum */
     return 0;
 }
 

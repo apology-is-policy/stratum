@@ -1,4 +1,5 @@
 #include "btree_internal.h"
+#include "stratum/csum.h"
 
 #define INITIAL_CAP 16
 
@@ -159,7 +160,6 @@ int stm_node_encode(const struct stm_node *n, uint8_t *buf,
     }
 
     memcpy(buf, &hdr, sizeof(hdr));
-    /* TODO: BLAKE3 checksum into sn_csum */
     if (out_used) *out_used = (uint32_t)(p - buf);
     return 0;
 }
@@ -226,6 +226,10 @@ int stm_node_decode(const uint8_t *buf, uint32_t buflen, struct stm_node **out)
     memcpy(&hdr, buf, sizeof(hdr));
     if (le32_to_cpu(hdr.sn_magic) != STM_NODE_MAGIC)
         return -EINVAL;
+
+    /* Note: integrity is verified by the bptr checksum in stm_btree_read_node,
+     * which covers the on-disk bytes (after compress + encrypt). The sn_csum
+     * field is reserved for future use. */
 
     level = le16_to_cpu(hdr.sn_level);
     flags = le16_to_cpu(hdr.sn_flags);
