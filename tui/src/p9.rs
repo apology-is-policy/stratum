@@ -27,6 +27,15 @@ const RCLUNK: u8 = 121;
 const TREMOVE: u8 = 122;
 const TSTAT: u8 = 124;
 const RSTAT: u8 = 125;
+// Stratum extensions
+const TSNAP_CREATE: u8 = 128;
+const RSNAP_CREATE: u8 = 129;
+const TSNAP_LIST: u8 = 130;
+const RSNAP_LIST: u8 = 131;
+const TSNAP_DELETE: u8 = 132;
+const RSNAP_DELETE: u8 = 133;
+const TSNAP_ROLLBACK: u8 = 134;
+const RSNAP_ROLLBACK: u8 = 135;
 
 const NOTAG: u16 = 0xFFFF;
 const NOFID: u32 = 0xFFFFFFFF;
@@ -357,6 +366,78 @@ impl P9Client {
         }
         Ok(entries)
     }
+
+    // ── snapshot extensions ──────────────────────────────────────────
+
+    pub fn snap_create(&mut self, name: &str) -> Result<u64> {
+        let tag = self.next_tag();
+        let mut body = Vec::new();
+        put_str(&mut body, name);
+        let msg = self.build_msg(TSNAP_CREATE, tag, &body);
+        self.send(&msg)?;
+        let resp = self.recv()?;
+        if resp[4] != RSNAP_CREATE {
+            bail!("snap create failed");
+        }
+        let id = u64::from_le_bytes(resp[7..15].try_into()?);
+        Ok(id)
+    }
+
+    pub fn snap_list(&mut self) -> Result<Vec<SnapshotInfo>> {
+        let tag = self.next_tag();
+        let msg = self.build_msg(TSNAP_LIST, tag, &[]);
+        self.send(&msg)?;
+        let resp = self.recv()?;
+        if resp[4] != RSNAP_LIST {
+            bail!("snap list failed");
+        }
+        let count = u16::from_le_bytes([resp[7], resp[8]]) as usize;
+        let mut pos = 9;
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            if pos + 18 > resp.len() { bail!("snap list truncated"); }
+            let id = u64::from_le_bytes(resp[pos..pos+8].try_into()?);
+            pos += 8;
+            let gen = u64::from_le_bytes(resp[pos..pos+8].try_into()?);
+            pos += 8;
+            let nlen = u16::from_le_bytes([resp[pos], resp[pos+1]]) as usize;
+            pos += 2;
+            if pos + nlen > resp.len() { bail!("snap name truncated"); }
+            let name = String::from_utf8_lossy(&resp[pos..pos+nlen]).into_owned();
+            pos += nlen;
+            out.push(SnapshotInfo { id, gen, name });
+        }
+        Ok(out)
+    }
+
+    pub fn snap_delete(&mut self, id: u64) -> Result<()> {
+        let tag = self.next_tag();
+        let msg = self.build_msg(TSNAP_DELETE, tag, &id.to_le_bytes());
+        self.send(&msg)?;
+        let resp = self.recv()?;
+        if resp[4] != RSNAP_DELETE {
+            bail!("snap delete failed");
+        }
+        Ok(())
+    }
+
+    pub fn snap_rollback(&mut self, id: u64) -> Result<()> {
+        let tag = self.next_tag();
+        let msg = self.build_msg(TSNAP_ROLLBACK, tag, &id.to_le_bytes());
+        self.send(&msg)?;
+        let resp = self.recv()?;
+        if resp[4] != RSNAP_ROLLBACK {
+            bail!("snap rollback failed");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SnapshotInfo {
+    pub id: u64,
+    pub gen: u64,
+    pub name: String,
 }
 
 // ── wire format helpers ──────────────────────────────────────────────

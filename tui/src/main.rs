@@ -49,6 +49,18 @@ fn main() -> Result<()> {
             continue;
         }
 
+        // Snapshot dialog — all keys go there
+        if app.snap_dialog.is_some() {
+            if event::poll(Duration::from_millis(50))? {
+                if let Event::Key(key) = event::read()? {
+                    if key.kind == KeyEventKind::Press {
+                        app.snap_key(key);
+                    }
+                }
+            }
+            continue;
+        }
+
         // Editor mode — all keys go to editor
         if app.editor.is_some() {
             if event::poll(Duration::from_millis(50))? {

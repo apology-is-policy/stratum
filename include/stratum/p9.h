@@ -18,7 +18,12 @@ enum {
     P9_TCLUNK   = 120, P9_RCLUNK   = 121,
     P9_TREMOVE  = 122, P9_RREMOVE  = 123,
     P9_TSTAT    = 124, P9_RSTAT    = 125,
-    P9_TWSTAT   = 126, P9_RWSTAT   = 127
+    P9_TWSTAT   = 126, P9_RWSTAT   = 127,
+    /* Stratum extensions (not in 9P2000 spec) */
+    P9_TSNAP_CREATE    = 128, P9_RSNAP_CREATE    = 129,
+    P9_TSNAP_LIST      = 130, P9_RSNAP_LIST      = 131,
+    P9_TSNAP_DELETE    = 132, P9_RSNAP_DELETE    = 133,
+    P9_TSNAP_ROLLBACK  = 134, P9_RSNAP_ROLLBACK  = 135
 };
 
 /* QID types */

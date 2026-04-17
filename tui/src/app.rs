@@ -2,6 +2,7 @@
 
 use crate::config::Config;
 use crate::editor::EditorState;
+use crate::p9::SnapshotInfo;
 use crate::panel::{Panel, ReadHandle, WriteHandle};
 use std::process::{Child, Command};
 use std::time::Duration;
@@ -15,6 +16,13 @@ pub enum InputAction {
     Password,
     Mkdir,
     ConnectAddr,
+    SnapCreate,
+}
+
+pub struct SnapshotDialog {
+    pub panel: Focus,                 // which panel's volume
+    pub snapshots: Vec<SnapshotInfo>,
+    pub cursor: usize,
 }
 
 pub enum Mode {
@@ -45,6 +53,7 @@ pub struct App {
     pub busy_message: Option<String>,
     pub pending_action: Option<PendingAction>,
     pub editor: Option<EditorState>,
+    pub snap_dialog: Option<SnapshotDialog>,
     // server management
     server_proc: Option<Child>,
     server_sock: Option<String>,
@@ -92,6 +101,7 @@ impl App {
             busy_message: None,
             pending_action: None,
             editor: None,
+            snap_dialog: None,
             server_proc: None,
             server_sock: None,
             pending_volume: None,
@@ -237,6 +247,7 @@ impl App {
                 }
             }
             KeyCode::F(10) | KeyCode::Char('q') => self.quit = true,
+            KeyCode::F(9) | KeyCode::Char('s') => self.open_snap_dialog(),
 
             // navigation
             KeyCode::Tab => {
@@ -326,6 +337,11 @@ impl App {
                 match res {
                     Ok(()) => self.status = format!("Connected to {value}"),
                     Err(e) => self.status = format!("Connect error: {e}"),
+                }
+            }
+            InputAction::SnapCreate => {
+                if !value.is_empty() {
+                    self.snap_create_with_name(value);
                 }
             }
         }
@@ -426,6 +442,124 @@ impl App {
         }
         self.server_proc = None;
         self.server_sock = None;
+    }
+
+    // ── snapshot dialog ──────────────────────────────────────────────
+
+    fn open_snap_dialog(&mut self) {
+        let panel_side = self.focus;
+        let panel = self.active();
+        let snaps = match panel.snap_list() {
+            Ok(s) => s,
+            Err(e) => {
+                self.status = format!("Snap list: {e}");
+                return;
+            }
+        };
+        self.snap_dialog = Some(SnapshotDialog {
+            panel: panel_side,
+            snapshots: snaps,
+            cursor: 0,
+        });
+    }
+
+    pub fn snap_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::KeyCode;
+        let close = match key.code {
+            KeyCode::Esc => true,
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(d) = &mut self.snap_dialog {
+                    if d.cursor > 0 { d.cursor -= 1; }
+                }
+                false
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(d) = &mut self.snap_dialog {
+                    if d.cursor + 1 < d.snapshots.len() { d.cursor += 1; }
+                }
+                false
+            }
+            KeyCode::Char('n') | KeyCode::Char('c') => {
+                // Prompt for snapshot name
+                self.snap_dialog = None;
+                self.mode = Mode::Input {
+                    prompt: "Snapshot name:".into(),
+                    callback: InputAction::SnapCreate,
+                    history_cursor: None,
+                };
+                false
+            }
+            KeyCode::Char('d') | KeyCode::Delete => {
+                self.snap_delete_selected();
+                false
+            }
+            KeyCode::Char('r') | KeyCode::Enter => {
+                self.snap_rollback_selected();
+                true
+            }
+            _ => false,
+        };
+        if close {
+            self.snap_dialog = None;
+        }
+    }
+
+    fn snap_target_panel(&mut self) -> &mut Panel {
+        let side = self.snap_dialog.as_ref().map(|d| d.panel).unwrap_or(self.focus);
+        match side {
+            Focus::Left => &mut self.left,
+            Focus::Right => &mut self.right,
+        }
+    }
+
+    fn snap_delete_selected(&mut self) {
+        let id = match self.snap_dialog.as_ref() {
+            Some(d) if !d.snapshots.is_empty() => d.snapshots[d.cursor].id,
+            _ => return,
+        };
+        let (result, new_list) = {
+            let panel = self.snap_target_panel();
+            let r = panel.snap_delete(id);
+            let l = if r.is_ok() { panel.snap_list().ok() } else { None };
+            (r, l)
+        };
+        match result {
+            Ok(()) => {
+                self.status = format!("Deleted snapshot #{id}");
+                if let (Some(new_list), Some(d)) = (new_list, self.snap_dialog.as_mut()) {
+                    d.snapshots = new_list;
+                    if d.cursor >= d.snapshots.len() && d.cursor > 0 {
+                        d.cursor = d.snapshots.len().saturating_sub(1);
+                    }
+                }
+            }
+            Err(e) => self.status = format!("Delete failed: {e}"),
+        }
+    }
+
+    fn snap_rollback_selected(&mut self) {
+        let id = match self.snap_dialog.as_ref() {
+            Some(d) if !d.snapshots.is_empty() => d.snapshots[d.cursor].id,
+            _ => return,
+        };
+        let result = {
+            let panel = self.snap_target_panel();
+            let r = panel.snap_rollback(id);
+            if r.is_ok() { let _ = panel.refresh(); }
+            r
+        };
+        match result {
+            Ok(()) => self.status = format!("Rolled back to snapshot #{id}"),
+            Err(e) => self.status = format!("Rollback failed: {e}"),
+        }
+    }
+
+    pub fn snap_create_with_name(&mut self, name: &str) {
+        let panel = self.active();
+        match panel.snap_create(name) {
+            Ok(id) => self.status = format!("Created snapshot '{name}' (#{id})"),
+            Err(e) => self.status = format!("Snap create: {e}"),
+        }
     }
 
     fn open_editor(&mut self, readonly: bool) {

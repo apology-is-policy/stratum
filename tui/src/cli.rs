@@ -231,10 +231,40 @@ fn cmd_cp_out(c: &mut P9Client, root: u32, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_snap(_c: &mut P9Client, _root: u32, args: &[String]) -> Result<()> {
-    // snapshots require the fs layer directly — for now just print help
-    if args.is_empty() { bail!("snap requires: create <name> | list"); }
-    eprintln!("snapshot operations via CLI require direct fs access (not yet via 9P)");
-    eprintln!("use: stratum snap <volume> create|list|delete|rollback");
+fn cmd_snap(c: &mut P9Client, _root: u32, args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        bail!("snap requires: create <name> | list | delete <id> | rollback <id>");
+    }
+    match args[0].as_str() {
+        "create" => {
+            if args.len() < 2 { bail!("snap create <name>"); }
+            let id = c.snap_create(&args[1])?;
+            println!("Created snapshot #{id} '{}'", args[1]);
+        }
+        "list" => {
+            let snaps = c.snap_list()?;
+            if snaps.is_empty() {
+                println!("(no snapshots)");
+            } else {
+                println!("{:<8} {:<12} {:<}", "ID", "Gen", "Name");
+                for s in snaps {
+                    println!("{:<8} {:<12} {}", s.id, s.gen, s.name);
+                }
+            }
+        }
+        "delete" => {
+            if args.len() < 2 { bail!("snap delete <id>"); }
+            let id: u64 = args[1].parse().context("invalid id")?;
+            c.snap_delete(id)?;
+            println!("Deleted snapshot #{id}");
+        }
+        "rollback" => {
+            if args.len() < 2 { bail!("snap rollback <id>"); }
+            let id: u64 = args[1].parse().context("invalid id")?;
+            c.snap_rollback(id)?;
+            println!("Rolled back to snapshot #{id}");
+        }
+        _ => bail!("unknown snap subcommand: {}", args[0]),
+    }
     Ok(())
 }

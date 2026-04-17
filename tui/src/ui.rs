@@ -1,6 +1,6 @@
 //! FAR Commander-style TUI rendering.
 
-use crate::app::{App, CopyState, Focus, InputAction, Mode};
+use crate::app::{App, CopyState, Focus, InputAction, Mode, SnapshotDialog};
 use crate::editor::EditorMode;
 use crate::panel::Panel;
 use ratatui::prelude::*;
@@ -104,6 +104,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     if let Some(ref msg) = app.busy_message {
         draw_busy_dialog(frame, area, msg);
+    }
+    if let Some(ref sd) = app.snap_dialog {
+        draw_snap_dialog(frame, area, sd);
     }
 }
 
@@ -295,7 +298,7 @@ fn draw_fkey_bar(frame: &mut Frame, area: Rect) {
     let keys: &[(&str, &str)] = &[
         ("1", ""), ("2", "Mount"), ("3", "View"), ("4", "Edit"),
         ("5", "Copy"), ("6", ""), ("7", "MkDir"), ("8", "Delete"),
-        ("9", ""), ("10", "Quit"),
+        ("9", "Snap"), ("10", "Quit"),
     ];
 
     let total_keys = keys.len();
@@ -579,6 +582,80 @@ fn draw_editor(frame: &mut Frame, area: Rect, ed: &crate::editor::EditorState) {
 }
 
 // ── busy dialog ───────────────────────────────────────────────────────
+
+fn draw_snap_dialog(frame: &mut Frame, area: Rect, sd: &SnapshotDialog) {
+    let w = 70u16.min(area.width.saturating_sub(4));
+    let h = 20u16.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(CLR_POPUP_BORDER).bold())
+        .title(" Snapshots ")
+        .style(Style::default().bg(CLR_POPUP_BG));
+
+    let inner = block.inner(rect);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(block, rect);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),   // header
+            Constraint::Min(3),      // list
+            Constraint::Length(1),   // hint
+        ])
+        .split(inner);
+
+    // Header
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {:<8} {:<12} {:<}", "ID", "Gen", "Name"),
+            Style::default().fg(CLR_HEADER).bold(),
+        ))),
+        rows[0],
+    );
+
+    // List
+    if sd.snapshots.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  (no snapshots — press N to create)",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            rows[1],
+        );
+    } else {
+        let visible = rows[1].height as usize;
+        let scroll = if sd.cursor >= visible { sd.cursor - visible + 1 } else { 0 };
+        let items: Vec<ListItem> = sd.snapshots.iter()
+            .enumerate()
+            .skip(scroll)
+            .take(visible)
+            .map(|(i, s)| {
+                let line = format!(" {:<8} {:<12} {}", s.id, s.gen, s.name);
+                let style = if i == sd.cursor {
+                    Style::default().fg(Color::Black).bg(Color::Blue).bold()
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                ListItem::new(line).style(style)
+            })
+            .collect();
+        frame.render_widget(List::new(items), rows[1]);
+    }
+
+    // Hint
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " N:new  R/Enter:rollback  D:delete  Esc:close",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[2],
+    );
+}
 
 fn draw_busy_dialog(frame: &mut Frame, area: Rect, msg: &str) {
     let w = 40u16.min(area.width.saturating_sub(4));

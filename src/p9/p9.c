@@ -566,6 +566,12 @@ int stm_9p_create(struct stm_fs *fs, struct stm_9p **out)
     return 0;
 }
 
+/* Forward declarations for snapshot extension handlers (defined below). */
+static int h_snap_create(struct stm_9p *, const uint8_t *, uint16_t, uint8_t *, uint32_t *);
+static int h_snap_list(struct stm_9p *, const uint8_t *, uint16_t, uint8_t *, uint32_t *);
+static int h_snap_delete(struct stm_9p *, const uint8_t *, uint16_t, uint8_t *, uint32_t *);
+static int h_snap_rollback(struct stm_9p *, const uint8_t *, uint16_t, uint8_t *, uint32_t *);
+
 int stm_9p_handle(struct stm_9p *s,
                   const uint8_t *req, uint32_t req_len,
                   uint8_t *resp, uint32_t *resp_len)
@@ -595,9 +601,124 @@ int stm_9p_handle(struct stm_9p *s,
     case P9_TFLUSH:   /* just ACK */
         { uint8_t *wp = resp + 4; *wp++ = P9_RFLUSH; p16(wp, tag); wp += 2;
           resp_finish(resp, resp_len, wp); return 0; }
+    case P9_TSNAP_CREATE:   return h_snap_create(s, body, tag, resp, resp_len);
+    case P9_TSNAP_LIST:     return h_snap_list(s, body, tag, resp, resp_len);
+    case P9_TSNAP_DELETE:   return h_snap_delete(s, body, tag, resp, resp_len);
+    case P9_TSNAP_ROLLBACK: return h_snap_rollback(s, body, tag, resp, resp_len);
     default:
         return resp_error(resp, resp_len, tag, "unknown message type");
     }
+}
+
+/* ── snapshot extensions ──────────────────────────────────────────── */
+
+static int h_snap_create(struct stm_9p *s, const uint8_t *body, uint16_t tag,
+                         uint8_t *resp, uint32_t *resp_len)
+{
+    const uint8_t *p = body;
+    uint16_t nlen;
+    const char *name = gstr(&p, &nlen);
+    char nbuf[256];
+    uint64_t id = 0;
+    int rc;
+    uint8_t *wp;
+
+    if (nlen >= sizeof(nbuf))
+        return resp_error(resp, resp_len, tag, "name too long");
+    memcpy(nbuf, name, nlen); nbuf[nlen] = '\0';
+
+    rc = stm_snap_create(s->fs, nbuf, &id);
+    if (rc) return resp_error(resp, resp_len, tag, "snap create failed");
+
+    /* Sync so the snapshot is durable before we respond */
+    stm_fs_sync(s->fs);
+
+    wp = resp + 4;
+    *wp++ = P9_RSNAP_CREATE;
+    p16(wp, tag); wp += 2;
+    p64(wp, id); wp += 8;
+    resp_finish(resp, resp_len, wp);
+    return 0;
+}
+
+struct snap_list_build_ctx {
+    uint8_t *wp;
+    uint8_t *end;
+    uint16_t count;
+    int overflow;
+};
+
+static int snap_list_build_cb(uint64_t id, const char *name,
+                              uint64_t gen, void *ctx)
+{
+    struct snap_list_build_ctx *c = ctx;
+    size_t nlen = strlen(name);
+    /* id(8) + gen(8) + name_len(2) + name */
+    if (c->wp + 18 + nlen > c->end) { c->overflow = 1; return 1; }
+    p64(c->wp, id); c->wp += 8;
+    p64(c->wp, gen); c->wp += 8;
+    p16(c->wp, (uint16_t)nlen); c->wp += 2;
+    memcpy(c->wp, name, nlen); c->wp += nlen;
+    c->count++;
+    return 0;
+}
+
+static int h_snap_list(struct stm_9p *s, const uint8_t *body, uint16_t tag,
+                       uint8_t *resp, uint32_t *resp_len)
+{
+    (void)body;
+    uint8_t *wp = resp + 4;
+    *wp++ = P9_RSNAP_LIST;
+    p16(wp, tag); wp += 2;
+    uint8_t *count_pos = wp;
+    wp += 2;
+
+    struct snap_list_build_ctx ctx = {
+        .wp = wp, .end = resp + s->msize, .count = 0, .overflow = 0,
+    };
+    stm_snap_list(s->fs, snap_list_build_cb, &ctx);
+    if (ctx.overflow)
+        return resp_error(resp, resp_len, tag, "snapshot list too large");
+
+    p16(count_pos, ctx.count);
+    resp_finish(resp, resp_len, ctx.wp);
+    return 0;
+}
+
+static int h_snap_delete(struct stm_9p *s, const uint8_t *body, uint16_t tag,
+                         uint8_t *resp, uint32_t *resp_len)
+{
+    uint64_t id = g64(body);
+    int rc;
+    uint8_t *wp;
+
+    rc = stm_snap_delete(s->fs, id);
+    if (rc) return resp_error(resp, resp_len, tag, "snap delete failed");
+    stm_fs_sync(s->fs);
+
+    wp = resp + 4;
+    *wp++ = P9_RSNAP_DELETE;
+    p16(wp, tag); wp += 2;
+    resp_finish(resp, resp_len, wp);
+    return 0;
+}
+
+static int h_snap_rollback(struct stm_9p *s, const uint8_t *body, uint16_t tag,
+                           uint8_t *resp, uint32_t *resp_len)
+{
+    uint64_t id = g64(body);
+    int rc;
+    uint8_t *wp;
+
+    rc = stm_snap_rollback(s->fs, id);
+    if (rc) return resp_error(resp, resp_len, tag, "snap rollback failed");
+    stm_fs_sync(s->fs);
+
+    wp = resp + 4;
+    *wp++ = P9_RSNAP_ROLLBACK;
+    p16(wp, tag); wp += 2;
+    resp_finish(resp, resp_len, wp);
+    return 0;
 }
 
 void stm_9p_destroy(struct stm_9p *s) { free(s); }

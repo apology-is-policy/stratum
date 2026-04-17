@@ -2,7 +2,7 @@
 //! Supports both 9P (stratum) and host FS (direct std::fs) backends.
 
 use crate::hostfs::HostFs;
-use crate::p9::{P9Client, DMDIR, OREAD, ORDWR};
+use crate::p9::{P9Client, SnapshotInfo, DMDIR, OREAD, ORDWR};
 use anyhow::{anyhow, Result};
 use std::path::Path;
 
@@ -523,6 +523,36 @@ impl Panel {
             }
             Backend::Host(h) => h.delete(name),
             Backend::None => Err(anyhow!("not connected")),
+        }
+    }
+
+    // ── snapshots (stratum only) ─────────────────────────────────────
+
+    pub fn snap_create(&mut self, name: &str) -> Result<u64> {
+        match &mut self.backend {
+            Backend::P9 { client, .. } => client.snap_create(name),
+            _ => Err(anyhow!("snapshots only supported on stratum")),
+        }
+    }
+
+    pub fn snap_list(&mut self) -> Result<Vec<SnapshotInfo>> {
+        match &mut self.backend {
+            Backend::P9 { client, .. } => client.snap_list(),
+            _ => Err(anyhow!("snapshots only supported on stratum")),
+        }
+    }
+
+    pub fn snap_delete(&mut self, id: u64) -> Result<()> {
+        match &mut self.backend {
+            Backend::P9 { client, .. } => client.snap_delete(id),
+            _ => Err(anyhow!("snapshots only supported on stratum")),
+        }
+    }
+
+    pub fn snap_rollback(&mut self, id: u64) -> Result<()> {
+        match &mut self.backend {
+            Backend::P9 { client, .. } => client.snap_rollback(id),
+            _ => Err(anyhow!("snapshots only supported on stratum")),
         }
     }
 }
