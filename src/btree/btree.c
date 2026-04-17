@@ -67,7 +67,10 @@ int stm_btree_read_node(struct stm_btree *tree, struct stm_bptr *bptr,
         raw = decompressed;
     }
 
-    rc = stm_node_decode(raw, out);
+    {
+        uint32_t decode_len = (comp != STM_COMP_NONE) ? lsize : data_len;
+        rc = stm_node_decode(raw, decode_len, out);
+    }
     free(raw);
     if (rc) return rc;
     (*out)->paddr = le64_to_cpu(bptr->bp_paddr);

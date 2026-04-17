@@ -16,7 +16,7 @@ struct file_ctx {
 static int file_read(void *ctx, uint64_t offset, void *buf, uint32_t len)
 {
     struct file_ctx *fc = ctx;
-    if (fseek(fc->fp, (long)offset, SEEK_SET) != 0)
+    if (fseeko(fc->fp, (off_t)offset, SEEK_SET) != 0)
         return -errno;
     size_t n = fread(buf, 1, len, fc->fp);
     if (n != len)
@@ -27,7 +27,7 @@ static int file_read(void *ctx, uint64_t offset, void *buf, uint32_t len)
 static int file_write(void *ctx, uint64_t offset, const void *buf, uint32_t len)
 {
     struct file_ctx *fc = ctx;
-    if (fseek(fc->fp, (long)offset, SEEK_SET) != 0)
+    if (fseeko(fc->fp, (off_t)offset, SEEK_SET) != 0)
         return -errno;
     size_t n = fwrite(buf, 1, len, fc->fp);
     if (n != len)
@@ -69,7 +69,7 @@ static int file_size(void *ctx, uint64_t *out_bytes)
 static int file_resize(void *ctx, uint64_t new_size)
 {
     struct file_ctx *fc = ctx;
-    if (fseek(fc->fp, (long)(new_size - 1), SEEK_SET) != 0)
+    if (fseeko(fc->fp, (off_t)(new_size - 1), SEEK_SET) != 0)
         return -errno;
     if (fputc(0, fc->fp) == EOF)
         return -errno;
@@ -99,7 +99,7 @@ int stm_file_backend_open(const char *path, int create, uint64_t size,
             free(fc);
             return -errno;
         }
-        if (fseek(fc->fp, (long)(size - 1), SEEK_SET) != 0 ||
+        if (fseeko(fc->fp, (off_t)(size - 1), SEEK_SET) != 0 ||
             fputc(0, fc->fp) == EOF) {
             fclose(fc->fp);
             free(fc);
@@ -112,8 +112,8 @@ int stm_file_backend_open(const char *path, int create, uint64_t size,
             free(fc);
             return -errno;
         }
-        fseek(fc->fp, 0, SEEK_END);
-        fc->size = (uint64_t)ftell(fc->fp);
+        fseeko(fc->fp, 0, SEEK_END);
+        fc->size = (uint64_t)ftello(fc->fp);
     }
 
     fc->fd = fileno(fc->fp);

@@ -201,20 +201,27 @@ int ensure_key_cap(struct stm_node *n, uint32_t need)
     if (!kp) return -ENOMEM;
     n->pivots = kp;
     cp = realloc(n->children, (cap + 1) * sizeof(*cp));
-    if (!cp) return -ENOMEM;
+    if (!cp) {
+        /* pivots was reallocated but children failed — pivots is larger
+         * than keys_cap indicates, but that's harmless (realloc from a
+         * larger block works). Don't update keys_cap. */
+        return -ENOMEM;
+    }
     n->children = cp;
     n->keys_cap = cap;
     return 0;
 }
 
-int stm_node_decode(const uint8_t *buf, struct stm_node **out)
+int stm_node_decode(const uint8_t *buf, uint32_t buflen, struct stm_node **out)
 {
     struct stm_node_hdr hdr;
     uint16_t level, flags;
     uint64_t gen;
     uint32_t i;
-    const uint8_t *p;
+    const uint8_t *p, *end;
     struct stm_node *n;
+
+    if (buflen < STM_NODE_HDR_SIZE) return -EINVAL;
 
     memcpy(&hdr, buf, sizeof(hdr));
     if (le32_to_cpu(hdr.sn_magic) != STM_NODE_MAGIC)
@@ -224,6 +231,9 @@ int stm_node_decode(const uint8_t *buf, struct stm_node **out)
     flags = le16_to_cpu(hdr.sn_flags);
     gen   = le64_to_cpu(hdr.sn_gen);
     p     = buf + STM_NODE_HDR_SIZE;
+    end   = buf + buflen;
+
+#define DECODE_CHECK(need) do { if (p + (need) > end) { stm_node_free(n); return -EIO; } } while(0)
 
     if (flags & STM_NODE_LEAF) {
         uint32_t nentries = le32_to_cpu(hdr.sn_nkeys);
@@ -235,6 +245,7 @@ int stm_node_decode(const uint8_t *buf, struct stm_node **out)
         for (i = 0; i < nentries; i++) {
             le32 vl;
             uint32_t vlen;
+            DECODE_CHECK(sizeof(struct stm_key) + sizeof(le32));
             memcpy(&n->entries[i].key, p, sizeof(struct stm_key));
             p += sizeof(struct stm_key);
             memcpy(&vl, p, sizeof(le32));
@@ -242,6 +253,7 @@ int stm_node_decode(const uint8_t *buf, struct stm_node **out)
             vlen = le32_to_cpu(vl);
             n->entries[i].vlen = vlen;
             if (vlen) {
+                DECODE_CHECK(vlen);
                 n->entries[i].val = malloc(vlen);
                 if (!n->entries[i].val) {
                     n->nentries = i;
@@ -273,11 +285,13 @@ int stm_node_decode(const uint8_t *buf, struct stm_node **out)
         if (ensure_key_cap(n, nkeys)) { stm_node_free(n); return -ENOMEM; }
 
         for (i = 0; i < nkeys; i++) {
+            DECODE_CHECK(sizeof(struct stm_key));
             memcpy(&n->pivots[i], p, sizeof(struct stm_key));
             p += sizeof(struct stm_key);
         }
         n->nkeys = nkeys;
         for (i = 0; i <= nkeys; i++) {
+            DECODE_CHECK(sizeof(struct stm_bptr));
             memcpy(&n->children[i], p, sizeof(struct stm_bptr));
             p += sizeof(struct stm_bptr);
         }
@@ -287,6 +301,7 @@ int stm_node_decode(const uint8_t *buf, struct stm_node **out)
         for (i = 0; i < nmsgs; i++) {
             struct stm_msg m;
             uint32_t vlen;
+            DECODE_CHECK(sizeof(m));
             memcpy(&m, p, sizeof(m));
             p += sizeof(m);
             n->msgs[i].key  = m.sm_key;
@@ -295,6 +310,7 @@ int stm_node_decode(const uint8_t *buf, struct stm_node **out)
             vlen = le32_to_cpu(m.sm_vlen);
             n->msgs[i].vlen = vlen;
             if (vlen) {
+                DECODE_CHECK(vlen);
                 n->msgs[i].val = malloc(vlen);
                 if (!n->msgs[i].val) {
                     n->nmsgs = i;
@@ -314,6 +330,7 @@ int stm_node_decode(const uint8_t *buf, struct stm_node **out)
         *out = n;
         return 0;
     }
+#undef DECODE_CHECK
 }
 
 /* ── leaf operations ────────────────────────────────────────────────── */

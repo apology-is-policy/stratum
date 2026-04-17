@@ -80,7 +80,7 @@ void             stm_node_free(struct stm_node *n);
 
 int      stm_node_encode(const struct stm_node *n, uint8_t *buf,
                          uint32_t *out_used);
-int      stm_node_decode(const uint8_t *buf, struct stm_node **out);
+int      stm_node_decode(const uint8_t *buf, uint32_t buflen, struct stm_node **out);
 uint32_t stm_node_used_bytes(const struct stm_node *n);
 int      stm_node_is_full(const struct stm_node *n);
 

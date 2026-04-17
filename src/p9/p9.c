@@ -475,25 +475,10 @@ static int h_clunk(struct stm_9p *s, const uint8_t *body, uint16_t tag,
     struct p9_fid *f = fid_get(s, fid_nr);
     uint8_t *wp;
 
-    /* flush deferred inode size update + sync */
-    if (f && f->size_dirty) {
-        struct stm_inode in;
-        if (stm_fs_stat(s->fs, f->ino, &in) == 0) {
-            if (f->write_end > le64_to_cpu(in.si_size)) {
-                in.si_size = cpu_to_le64(f->write_end);
-                struct stm_key k;
-                {
-                    struct stm_key_cpu kc = { f->ino, STM_KEY_INODE, 0 };
-                    k = stm_key_from_cpu(&kc);
-                }
-                stm_btree_insert(stm_fs_get_tree(s->fs), &k,
-                                 &in, sizeof(in), stm_fs_get_gen(s->fs));
-            }
-        }
-        /* Sync after writes: flushes the btree (so subsequent reads are
-         * fast) and commits the superblock (so data is durable). */
+    /* Sync after writes: flushes the btree and commits the superblock.
+     * The inode size is already updated by stm_fs_write. */
+    if (f && f->size_dirty)
         stm_fs_sync(s->fs);
-    }
 
     fid_free(s, fid_nr);
     wp = resp + 4;

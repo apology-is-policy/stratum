@@ -113,7 +113,7 @@ STM_TEST(test_leaf_encode_decode)
     STM_ASSERT_EQ(rc, 0);
 
     struct stm_node *decoded = NULL;
-    rc = stm_node_decode(buf, &decoded);
+    rc = stm_node_decode(buf, STM_NODE_SIZE, &decoded);
     STM_ASSERT_EQ(rc, 0);
 
     STM_ASSERT_EQ(decoded->nentries, orig->nentries);
@@ -160,7 +160,7 @@ STM_TEST(test_internal_encode_decode)
     STM_ASSERT_EQ(rc, 0);
 
     struct stm_node *dec = NULL;
-    rc = stm_node_decode(buf, &dec);
+    rc = stm_node_decode(buf, STM_NODE_SIZE, &dec);
     STM_ASSERT_EQ(rc, 0);
 
     STM_ASSERT_EQ(dec->level, 1u);
