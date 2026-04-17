@@ -406,7 +406,19 @@ static int split_root(struct stm_btree *tree, uint64_t gen)
     if (rc) { stm_node_free(right); stm_node_free(new_root); return rc; }
     rc = stm_btree_write_node(tree, right, &rbp);
     stm_node_free(right);
-    if (rc) { stm_node_free(new_root); return rc; }
+    if (rc) {
+        /* lbp was written to disk but the new_root that would have
+         * pointed at it is being abandoned. Return lbp's blocks to the
+         * allocator so they don't leak until the next mount's walk. */
+        if (tree->alloc) {
+            uint64_t lpaddr = le64_to_cpu(lbp.bp_paddr);
+            uint32_t lcsize = le32_to_cpu(lbp.bp_csize);
+            uint32_t nblk = (lcsize + STM_BLOCK_SIZE - 1) / STM_BLOCK_SIZE;
+            stm_alloc_free(tree->alloc, lpaddr / STM_BLOCK_SIZE, nblk);
+        }
+        stm_node_free(new_root);
+        return rc;
+    }
 
     new_root->pivots[0]   = split_key;
     new_root->nkeys        = 1;

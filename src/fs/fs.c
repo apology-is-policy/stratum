@@ -663,15 +663,22 @@ static int extent_write_data(struct stm_fs *fs, const void *data,
         uint32_t enc_len;
         rc = stm_crypto_encrypt(crypto, paddr, fs->gen, payload, clen,
                                 fs->cipher_buf, &enc_len);
-        if (rc) return rc;
+        if (rc) goto fail_free;
         rc = stm_block_write(&fs->dev, paddr, fs->cipher_buf, enc_len);
     } else {
         rc = stm_block_write(&fs->dev, paddr, payload, clen);
     }
-    if (rc) return rc;
+    if (rc) goto fail_free;
 
     stm_extent_set(out_ext, paddr, fs->gen, dlen, clen, comp);
     return 0;
+
+fail_free:
+    /* Encrypt or write failed — no btree entry will reference these
+     * blocks, so return them to the allocator (deferred pool; PENDING
+     * until the next successful sync). */
+    stm_alloc_free(fs->alloc, paddr / STM_BLOCK_SIZE, nblocks);
+    return rc;
 }
 
 /* Read an extent into buf (at least STM_EXTENT_SIZE bytes).
