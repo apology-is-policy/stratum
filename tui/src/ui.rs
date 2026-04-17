@@ -333,16 +333,22 @@ fn draw_shift_fkey_bar(frame: &mut Frame, area: Rect) {
 
 fn draw_fkey_row(frame: &mut Frame, area: Rect, keys: &[(&str, &str)],
                  num_fg: Color, label_fg: Color, label_bg: Color) {
-    let total_keys = keys.len();
-    let cell_w = area.width as usize / total_keys;
+    // Distribute width across all cells so they sum to area.width exactly —
+    // otherwise integer division leaves `area.width % n` blank columns on
+    // the right edge. First `extra` cells get one extra column.
+    let n = keys.len();
+    let total = area.width as usize;
+    let base = total / n;
+    let extra = total % n;
 
     let mut spans = Vec::new();
-    for (num, label) in keys {
+    for (i, (num, label)) in keys.iter().enumerate() {
+        let cw = base + if i < extra { 1 } else { 0 };
         spans.push(Span::styled(
             format!("{num}"),
             Style::default().fg(num_fg).bg(CLR_BG).bold(),
         ));
-        let label_w = cell_w.saturating_sub(num.len() + 1);
+        let label_w = cw.saturating_sub(num.len() + 1);
         spans.push(Span::styled(
             format!("{:<w$}", label, w = label_w),
             Style::default().fg(label_fg).bg(label_bg).bold(),
