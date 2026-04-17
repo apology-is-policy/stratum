@@ -242,6 +242,98 @@ STM_TEST(test_fs_persist)
     cleanup();
 }
 
+/* ── stress: copy-delete cycles ─────────────────────────────────── */
+
+STM_TEST(test_fs_copy_delete_cycles)
+{
+    const char *path = "/tmp/stratum_test_cycles.img";
+    struct stm_fs *fs;
+    uint8_t *buf;
+    int cycle, mb, rc;
+
+    unlink(path);
+    STM_ASSERT_EQ(stm_fs_create(path, 32ULL*1024*1024, NULL), 0);
+    STM_ASSERT_EQ(stm_fs_open(path, NULL, &fs), 0);
+
+    buf = malloc(1048576);
+    STM_ASSERT(buf);
+    memset(buf, 'Z', 1048576);
+
+    for (cycle = 0; cycle < 10; cycle++) {
+        uint64_t ino;
+        STM_ASSERT_EQ(stm_fs_create_file(fs, 1, "stress.bin", 0644, &ino), 0);
+        for (mb = 0; mb < 100; mb++) {
+            rc = stm_fs_write(fs, ino, (uint64_t)mb * 1048576, buf, 1048576);
+            STM_ASSERT_EQ(rc, 0);
+        }
+        STM_ASSERT_EQ(stm_fs_sync(fs), 0);
+
+        { /* verify read-back */
+            uint8_t *rbuf = malloc(1048576);
+            uint32_t nread;
+            STM_ASSERT(rbuf);
+            STM_ASSERT_EQ(stm_fs_read(fs, ino, 50*1048576, rbuf, 1048576, &nread), 0);
+            STM_ASSERT_EQ(nread, (uint32_t)1048576);
+            STM_ASSERT(rbuf[0] == 'Z' && rbuf[1048575] == 'Z');
+            free(rbuf);
+        }
+
+        STM_ASSERT_EQ(stm_fs_unlink(fs, 1, "stress.bin"), 0);
+        STM_ASSERT_EQ(stm_fs_sync(fs), 0);
+    }
+    stm_fs_close(fs);
+
+    STM_ASSERT_EQ(stm_fs_open(path, NULL, &fs), 0);
+    stm_fs_close(fs);
+    free(buf);
+    unlink(path);
+}
+
+STM_TEST(test_fs_copy_delete_cycles_encrypted)
+{
+    const char *path = "/tmp/stratum_test_cycles_enc.img";
+    const char *pass = "testpass";
+    struct stm_fs *fs;
+    uint8_t *buf;
+    int cycle, mb, rc;
+
+    unlink(path);
+    STM_ASSERT_EQ(stm_fs_create(path, 32ULL*1024*1024, pass), 0);
+    STM_ASSERT_EQ(stm_fs_open(path, pass, &fs), 0);
+
+    buf = malloc(1048576);
+    STM_ASSERT(buf);
+    memset(buf, 'E', 1048576);
+
+    for (cycle = 0; cycle < 10; cycle++) {
+        uint64_t ino;
+        STM_ASSERT_EQ(stm_fs_create_file(fs, 1, "enc.bin", 0644, &ino), 0);
+        for (mb = 0; mb < 100; mb++) {
+            rc = stm_fs_write(fs, ino, (uint64_t)mb * 1048576, buf, 1048576);
+            STM_ASSERT_EQ(rc, 0);
+        }
+        STM_ASSERT_EQ(stm_fs_sync(fs), 0);
+
+        { /* verify */
+            uint8_t *rbuf = malloc(1048576);
+            uint32_t nread;
+            STM_ASSERT(rbuf);
+            STM_ASSERT_EQ(stm_fs_read(fs, ino, 50*1048576, rbuf, 1048576, &nread), 0);
+            STM_ASSERT(rbuf[0] == 'E' && rbuf[1048575] == 'E');
+            free(rbuf);
+        }
+
+        STM_ASSERT_EQ(stm_fs_unlink(fs, 1, "enc.bin"), 0);
+        STM_ASSERT_EQ(stm_fs_sync(fs), 0);
+    }
+    stm_fs_close(fs);
+
+    STM_ASSERT_EQ(stm_fs_open(path, pass, &fs), 0);
+    stm_fs_close(fs);
+    free(buf);
+    unlink(path);
+}
+
 int main(void)
 {
     STM_SUITE("fs");
@@ -252,6 +344,8 @@ int main(void)
     STM_RUN(test_fs_large_write);
     STM_RUN(test_fs_unlink);
     STM_RUN(test_fs_persist);
+    STM_RUN(test_fs_copy_delete_cycles);
+    STM_RUN(test_fs_copy_delete_cycles_encrypted);
     printf("all passed\n");
     return 0;
 }
