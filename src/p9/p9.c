@@ -487,10 +487,19 @@ static int h_clunk(struct stm_9p *s, const uint8_t *body, uint16_t tag,
     uint8_t *wp;
 
     /* Sync after writes — ensures durability when copy dialog closes.
-     * Much faster now that scan doesn't drain the whole tree. */
+     * Much faster now that scan doesn't drain the whole tree.
+     *
+     * If the sync fails (ENOSPC, EIO on disk flush, AEAD/csum problem
+     * surfaced by the flush path), the client needs to know — otherwise
+     * it thinks its writes are durable when they aren't. Propagate as
+     * Rerror even though clunk would normally always succeed. */
     if (f && f->size_dirty) {
-        stm_fs_sync(s->fs);
+        int rc = stm_fs_sync(s->fs);
         s->dirty = 0;
+        if (rc) {
+            fid_free(s, fid_nr);
+            return resp_error(resp, resp_len, tag, "sync failed on clunk");
+        }
     }
 
     fid_free(s, fid_nr);
@@ -514,9 +523,13 @@ static int h_remove(struct stm_9p *s, const uint8_t *body, uint16_t tag,
     fid_free(s, fid_nr);
 
     /* Sync to commit freed extent blocks so they're reusable.
-     * Without this, blocks stay PENDING until session end. */
-    stm_fs_sync(s->fs);
-    s->dirty = 0;
+     * Without this, blocks stay PENDING until session end.
+     * Propagate sync failure so the client knows the delete wasn't durable. */
+    {
+        int rc = stm_fs_sync(s->fs);
+        s->dirty = 0;
+        if (rc) return resp_error(resp, resp_len, tag, "sync failed on remove");
+    }
 
     wp = resp + 4;
     *wp++ = P9_RREMOVE;
@@ -630,8 +643,11 @@ static int h_snap_create(struct stm_9p *s, const uint8_t *body, uint16_t tag,
     rc = stm_snap_create(s->fs, nbuf, &id);
     if (rc) return resp_error(resp, resp_len, tag, "snap create failed");
 
-    /* Sync so the snapshot is durable before we respond */
-    stm_fs_sync(s->fs);
+    /* Sync so the snapshot is durable before we respond. If this fails,
+     * the snapshot exists in memory only — the next mount won't see it.
+     * Report the error rather than lying about persistence. */
+    rc = stm_fs_sync(s->fs);
+    if (rc) return resp_error(resp, resp_len, tag, "sync failed on snap create");
 
     wp = resp + 4;
     *wp++ = P9_RSNAP_CREATE;
@@ -694,7 +710,8 @@ static int h_snap_delete(struct stm_9p *s, const uint8_t *body, uint16_t tag,
 
     rc = stm_snap_delete(s->fs, id);
     if (rc) return resp_error(resp, resp_len, tag, "snap delete failed");
-    stm_fs_sync(s->fs);
+    rc = stm_fs_sync(s->fs);
+    if (rc) return resp_error(resp, resp_len, tag, "sync failed on snap delete");
 
     wp = resp + 4;
     *wp++ = P9_RSNAP_DELETE;
@@ -712,7 +729,8 @@ static int h_snap_rollback(struct stm_9p *s, const uint8_t *body, uint16_t tag,
 
     rc = stm_snap_rollback(s->fs, id);
     if (rc) return resp_error(resp, resp_len, tag, "snap rollback failed");
-    stm_fs_sync(s->fs);
+    rc = stm_fs_sync(s->fs);
+    if (rc) return resp_error(resp, resp_len, tag, "sync failed on snap rollback");
 
     wp = resp + 4;
     *wp++ = P9_RSNAP_ROLLBACK;
