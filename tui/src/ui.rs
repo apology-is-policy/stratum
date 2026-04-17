@@ -37,7 +37,7 @@ const CLR_FKEY_LABEL_BG: Color = Color::Cyan;
 // so the row reads as "there's a modifier layer" without shouting.
 const CLR_SHIFT_FKEY_NUM: Color = Color::DarkGray;
 const CLR_SHIFT_FKEY_LABEL_FG: Color = Color::Yellow;
-const CLR_SHIFT_FKEY_LABEL_BG: Color = Color::Rgb(40, 40, 40);
+const CLR_SHIFT_FKEY_LABEL_BG: Color = Color::DarkGray;
 
 const CLR_POPUP_BORDER: Color = Color::White;
 const CLR_POPUP_BG: Color = Color::Black;
