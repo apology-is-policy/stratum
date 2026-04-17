@@ -289,6 +289,24 @@ int stm_snap_list(struct stm_fs *fs,
     return stm_btree_scan(fs->snap_tree, &lo, &hi, snap_scan_cb, &sl);
 }
 
+/* For each SNAP descriptor in the snap tree, walk its saved root and
+ * mark every reachable block. Parallel to walk_snap_cb in fs.c, but
+ * uses the snap-side mark callbacks for log labeling consistency. */
+static int mark_saved_snap_cb(const struct stm_key *key, const void *val,
+                              uint32_t vlen, void *ctx)
+{
+    struct stm_fs *fs = ctx;
+    struct stm_snapshot snap;
+    (void)key;
+    if (vlen < sizeof(snap)) return 0;
+    memcpy(&snap, val, sizeof(snap));
+    /* Walk this snapshot's tree under the main tree's config (same volume,
+     * same crypto). */
+    stm_btree_walk_entries(fs->tree, snap.ssp_root,
+                           mark_block_snap, mark_extent_snap, fs);
+    return 0;
+}
+
 /* ── rollback ───────────────────────────────────────────────────────── */
 
 int stm_snap_rollback(struct stm_fs *fs, uint64_t snap_id)
@@ -333,8 +351,15 @@ int stm_snap_rollback(struct stm_fs *fs, uint64_t snap_id)
         stm_btree_walk_entries(fs->tree, stm_btree_root(fs->tree),
                                mark_block_snap, mark_extent_snap, fs);
         if (fs->snap_tree) {
+            /* Snap tree's own metadata nodes. */
             stm_btree_walk_entries(fs->snap_tree, stm_btree_root(fs->snap_tree),
                                    mark_block_snap, mark_extent_snap, fs);
+            /* Each remaining snapshot's saved root — otherwise rollback
+             * leaves other snapshots' private blocks marked free, and the
+             * next write silently overwrites them. */
+            struct stm_key lo = mk_key(0, STM_KEY_SNAP, 0);
+            struct stm_key hi = mk_key(UINT64_MAX, STM_KEY_SNAP, UINT64_MAX);
+            stm_btree_scan(fs->snap_tree, &lo, &hi, mark_saved_snap_cb, fs);
         }
         stm_alloc_commit(fs->alloc);
         stm_btree_set_allocator(fs->tree, fs->alloc);

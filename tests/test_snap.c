@@ -243,6 +243,79 @@ STM_TEST(test_snap_create_doesnt_corrupt_main_tree)
     cleanup();
 }
 
+/* ── regression: rollback must not overwrite other snapshots ───────── */
+/*
+ * Bug: stm_snap_rollback's allocator rebuild only marked the main tree
+ * and snap_tree's own metadata blocks — not the blocks reachable from
+ * each individual saved snapshot. After rollback, any snapshot that
+ * wasn't the rollback target had its private blocks marked free, so
+ * subsequent writes silently overwrote them. Reading the untouched
+ * snapshot afterward returned -EIO (csum / AEAD fail) or garbage.
+ *
+ * This test:
+ *   - creates snapshot A capturing "v1"
+ *   - writes "v2" (private blocks for A remain, pointed to by A's root)
+ *   - creates snapshot B capturing "v2"
+ *   - writes "v3" (private blocks for B remain)
+ *   - rolls back to A (main tree is now "v1")
+ *   - writes "v4" a few times to churn through the allocator
+ *   - snapshot B must still be readable. Before the fix, B's private
+ *     blocks had been reallocated and overwritten.
+ */
+STM_TEST(test_rollback_preserves_other_snapshots)
+{
+    stm_fs_create(img, 64 * 1024 * 1024, NULL);
+    struct stm_fs *fs;
+    stm_fs_open(img, NULL, &fs);
+
+    /* Build the history. */
+    uint64_t ino;
+    stm_fs_create_file(fs, STM_ROOT_INO, "f.bin", 0644, &ino);
+
+    char payload[200 * 1024];
+    memset(payload, '1', sizeof(payload));
+    stm_fs_write(fs, ino, 0, payload, sizeof(payload));
+
+    uint64_t sid_a = 0;
+    STM_ASSERT_EQ(stm_snap_create(fs, "A", &sid_a), 0);
+
+    memset(payload, '2', sizeof(payload));
+    stm_fs_write(fs, ino, 0, payload, sizeof(payload));
+
+    uint64_t sid_b = 0;
+    STM_ASSERT_EQ(stm_snap_create(fs, "B", &sid_b), 0);
+
+    memset(payload, '3', sizeof(payload));
+    stm_fs_write(fs, ino, 0, payload, sizeof(payload));
+    stm_fs_sync(fs);
+
+    /* Rollback to A. */
+    STM_ASSERT_EQ(stm_snap_rollback(fs, sid_a), 0);
+
+    /* Churn the allocator: if B's blocks are wrongly free, these writes
+     * land right on top of them. */
+    for (int i = 0; i < 8; i++) {
+        memset(payload, '4' + (i & 3), sizeof(payload));
+        stm_fs_write(fs, ino, 0, payload, sizeof(payload));
+    }
+    stm_fs_sync(fs);
+    stm_fs_close(fs);
+
+    /* Reopen, rollback to B, verify B's contents. */
+    stm_fs_open(img, NULL, &fs);
+    STM_ASSERT_EQ(stm_snap_rollback(fs, sid_b), 0);
+
+    STM_ASSERT_EQ(stm_fs_lookup(fs, STM_ROOT_INO, "f.bin", &ino), 0);
+    char buf[256];
+    uint32_t nread = 0;
+    STM_ASSERT_EQ(stm_fs_read(fs, ino, 0, buf, sizeof(buf), &nread), 0);
+    STM_ASSERT_EQ(nread, sizeof(buf));
+    for (size_t i = 0; i < sizeof(buf); i++) STM_ASSERT_EQ(buf[i], '2');
+
+    stm_fs_close(fs);
+    cleanup();
+}
+
 int main(void)
 {
     STM_SUITE("snap");
@@ -251,6 +324,7 @@ int main(void)
     STM_RUN(test_snap_read_isolation);
     STM_RUN(test_snap_persist);
     STM_RUN(test_snap_create_doesnt_corrupt_main_tree);
+    STM_RUN(test_rollback_preserves_other_snapshots);
     printf("all passed\n");
     return 0;
 }
