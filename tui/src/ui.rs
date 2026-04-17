@@ -18,8 +18,8 @@ const CLR_TITLE_INACTIVE: Color = Color::DarkGray;
 
 const CLR_HEADER: Color = Color::Yellow;
 const CLR_DIR: Color = Color::White;
-const CLR_FILE: Color = Color::Gray;
-const CLR_STM: Color = Color::Cyan;
+const CLR_FILE: Color = Color::Cyan;
+const CLR_STM: Color = Color::Yellow;
 const CLR_SELECTED: Color = Color::Red;
 
 const CLR_CURSOR_FG: Color = Color::Black;

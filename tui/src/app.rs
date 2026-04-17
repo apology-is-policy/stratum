@@ -510,7 +510,10 @@ impl App {
                         panel.label = format!("[{}]", short_path(path));
                         self.config.add_volume(path);
                         self.status = format!("Opened {path}");
-                        self.focus = target;
+                        // Focus stays where it was: F2 targets the active
+                        // panel (no-op), Enter-on-.stm targets the other
+                        // panel and leaves focus on the host browser so
+                        // the user can immediately F5 copy across.
                     }
                     Err(e) => {
                         self.status = format!("Connect error: {e}");
