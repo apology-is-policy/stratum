@@ -377,6 +377,10 @@ int stm_fs_open(const char *path, const char *passphrase, struct stm_fs **out)
             stm_btree_set_allocator(fs->snap_tree, fs->alloc);
     }
 
+    /* Allocate reusable scratch buffers for extent I/O */
+    fs->extent_buf = malloc(STM_EXTENT_SIZE);
+    fs->cipher_buf = malloc(STM_EXTENT_SIZE + STM_CRYPTO_TAG_LEN);
+
     *out = fs;
     return 0;
 }
@@ -453,6 +457,8 @@ void stm_fs_close(struct stm_fs *fs)
     stm_alloc_close(fs->alloc);
     stm_block_close(&fs->dev);
     memset(fs->dek, 0, sizeof(fs->dek));
+    free(fs->extent_buf);
+    free(fs->cipher_buf);
     free(fs);
 }
 
@@ -564,13 +570,10 @@ static int extent_write_data(struct stm_fs *fs, const void *data,
     if (rc) return rc;
 
     if (crypto) {
-        uint8_t *cipher = malloc(disk_len);
         uint32_t clen;
-        if (!cipher) return -ENOMEM;
-        rc = stm_crypto_encrypt(crypto, paddr, data, dlen, cipher, &clen);
-        if (rc) { free(cipher); return rc; }
-        rc = stm_block_write(&fs->dev, paddr, cipher, clen);
-        free(cipher);
+        rc = stm_crypto_encrypt(crypto, paddr, data, dlen, fs->cipher_buf, &clen);
+        if (rc) return rc;
+        rc = stm_block_write(&fs->dev, paddr, fs->cipher_buf, clen);
     } else {
         rc = stm_block_write(&fs->dev, paddr, data, dlen);
     }
@@ -591,13 +594,10 @@ static int extent_read_data(struct stm_fs *fs, const struct stm_extent *ext,
 
     if (crypto) {
         uint32_t disk_len = dlen + STM_CRYPTO_TAG_LEN;
-        uint8_t *cipher = malloc(disk_len);
         uint32_t plain_len;
-        if (!cipher) return -ENOMEM;
-        rc = stm_block_read(&fs->dev, paddr, cipher, disk_len);
-        if (rc) { free(cipher); return rc; }
-        rc = stm_crypto_decrypt(crypto, paddr, cipher, disk_len, buf, &plain_len);
-        free(cipher);
+        rc = stm_block_read(&fs->dev, paddr, fs->cipher_buf, disk_len);
+        if (rc) return rc;
+        rc = stm_crypto_decrypt(crypto, paddr, fs->cipher_buf, disk_len, buf, &plain_len);
         return rc;
     }
     rc = stm_block_read(&fs->dev, paddr, buf, dlen < buf_len ? dlen : buf_len);
@@ -624,6 +624,16 @@ int stm_fs_write(struct stm_fs *fs, uint64_t ino, uint64_t offset,
     uint64_t pos = offset;
     int rc;
 
+    /* Get current file size to skip old-extent lookups for growing writes */
+    uint64_t cur_size = 0;
+    {
+        struct stm_inode sz_in;
+        if (read_inode(fs, ino, &sz_in) == 0)
+            cur_size = le64_to_cpu(sz_in.si_size);
+    }
+
+    uint8_t *ebuf = fs->extent_buf;
+
     while (remaining > 0) {
         uint64_t ext_off = pos & ~((uint64_t)(STM_EXTENT_SIZE - 1));
         uint32_t inner   = (uint32_t)(pos - ext_off);
@@ -631,43 +641,45 @@ int stm_fs_write(struct stm_fs *fs, uint64_t ino, uint64_t offset,
         if (towrite > remaining) towrite = remaining;
 
         struct stm_key k = mk_key(ino, STM_KEY_DATA, ext_off);
-        uint8_t *ebuf;
         struct stm_extent old_ext, new_ext;
         uint32_t extent_data_len;
         int had_old = 0;
 
-        ebuf = malloc(STM_EXTENT_SIZE);
-        if (!ebuf) return -ENOMEM;
-
         if (inner != 0 || towrite != (uint32_t)STM_EXTENT_SIZE) {
             /* partial extent: read-modify-write */
-            uint32_t vlen = sizeof(old_ext);
-            rc = stm_btree_lookup(fs->tree, &k, &old_ext, &vlen);
-            if (rc == -ENOENT) {
+            if (ext_off < cur_size) {
+                uint32_t vlen = sizeof(old_ext);
+                rc = stm_btree_lookup(fs->tree, &k, &old_ext, &vlen);
+                if (rc == 0) {
+                    had_old = 1;
+                    rc = extent_read_data(fs, &old_ext, ebuf, STM_EXTENT_SIZE);
+                    if (rc) return rc;
+                    extent_data_len = le32_to_cpu(old_ext.se_dlen);
+                    if (extent_data_len < inner + towrite)
+                        extent_data_len = inner + towrite;
+                } else if (rc == -ENOENT) {
+                    memset(ebuf, 0, STM_EXTENT_SIZE);
+                    extent_data_len = inner + towrite;
+                } else {
+                    return rc;
+                }
+            } else {
                 memset(ebuf, 0, STM_EXTENT_SIZE);
                 extent_data_len = inner + towrite;
-            } else if (rc < 0) {
-                free(ebuf); return rc;
-            } else {
-                had_old = 1;
-                rc = extent_read_data(fs, &old_ext, ebuf, STM_EXTENT_SIZE);
-                if (rc) { free(ebuf); return rc; }
-                extent_data_len = le32_to_cpu(old_ext.se_dlen);
-                if (extent_data_len < inner + towrite)
-                    extent_data_len = inner + towrite;
             }
         } else {
-            /* full extent write — check if overwriting */
-            uint32_t vlen = sizeof(old_ext);
-            rc = stm_btree_lookup(fs->tree, &k, &old_ext, &vlen);
-            if (rc == 0) had_old = 1;
+            /* full extent write — skip lookup if writing past file end */
+            if (ext_off < cur_size) {
+                uint32_t vlen = sizeof(old_ext);
+                rc = stm_btree_lookup(fs->tree, &k, &old_ext, &vlen);
+                if (rc == 0) had_old = 1;
+            }
             extent_data_len = STM_EXTENT_SIZE;
         }
 
         memcpy(ebuf + inner, src, towrite);
 
         rc = extent_write_data(fs, ebuf, extent_data_len, &new_ext);
-        free(ebuf);
         if (rc) return rc;
 
         if (had_old) extent_free_blocks(fs, &old_ext);
@@ -731,17 +743,14 @@ int stm_fs_read(struct stm_fs *fs, uint64_t ino, uint64_t offset,
         } else if (rc < 0) {
             return rc;
         } else {
-            uint8_t *ebuf = malloc(STM_EXTENT_SIZE);
             uint32_t dlen, avail, copy;
-            if (!ebuf) return -ENOMEM;
-            rc = extent_read_data(fs, &ext, ebuf, STM_EXTENT_SIZE);
-            if (rc) { free(ebuf); return rc; }
+            rc = extent_read_data(fs, &ext, fs->extent_buf, STM_EXTENT_SIZE);
+            if (rc) return rc;
             dlen = le32_to_cpu(ext.se_dlen);
             avail = (dlen > inner) ? dlen - inner : 0;
             copy  = (toread < avail) ? toread : avail;
-            if (copy > 0) memcpy(dst, ebuf + inner, copy);
+            if (copy > 0) memcpy(dst, fs->extent_buf + inner, copy);
             if (copy < toread) memset(dst + copy, 0, toread - copy);
-            free(ebuf);
         }
 
         dst       += toread;

@@ -557,7 +557,9 @@ int stm_btree_flush(struct stm_btree *tree)
         if (rc) return rc;
         free_old_bptr(tree, &old_root);
     }
-    return stm_block_sync(tree->dev);
+    /* No fsync here — stm_fs_sync does a single fsync after writing
+     * both the btree nodes AND the superblock. */
+    return 0;
 }
 
 /* ── range scan ─────────────────────────────────────────────────────── */

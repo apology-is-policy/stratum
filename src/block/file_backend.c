@@ -5,45 +5,48 @@
 #include <errno.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 
 struct file_ctx {
-    FILE *fp;
-    int   fd;       /* for fsync + flock */
+    int      fd;
     uint64_t size;
 };
 
 static int file_read(void *ctx, uint64_t offset, void *buf, uint32_t len)
 {
     struct file_ctx *fc = ctx;
-    if (fseeko(fc->fp, (off_t)offset, SEEK_SET) != 0)
-        return -errno;
-    size_t n = fread(buf, 1, len, fc->fp);
-    if (n != len)
-        return ferror(fc->fp) ? -EIO : -EIO;
+    uint8_t *p = buf;
+    uint32_t remaining = len;
+    while (remaining > 0) {
+        ssize_t n = pread(fc->fd, p, remaining, (off_t)offset);
+        if (n <= 0) return -EIO;
+        p += n;
+        offset += (uint32_t)n;
+        remaining -= (uint32_t)n;
+    }
     return 0;
 }
 
 static int file_write(void *ctx, uint64_t offset, const void *buf, uint32_t len)
 {
     struct file_ctx *fc = ctx;
-    if (fseeko(fc->fp, (off_t)offset, SEEK_SET) != 0)
-        return -errno;
-    size_t n = fwrite(buf, 1, len, fc->fp);
-    if (n != len)
-        return -EIO;
+    const uint8_t *p = buf;
+    uint32_t remaining = len;
+    while (remaining > 0) {
+        ssize_t n = pwrite(fc->fd, p, remaining, (off_t)offset);
+        if (n <= 0) return -EIO;
+        p += n;
+        offset += (uint32_t)n;
+        remaining -= (uint32_t)n;
+    }
     return 0;
 }
 
 static int file_sync(void *ctx)
 {
     struct file_ctx *fc = ctx;
-    /* fflush: stdio buffer → kernel page cache */
-    if (fflush(fc->fp) != 0)
-        return -errno;
-    /* fsync: kernel page cache → disk.  Critical for crash safety —
-     * without this, a power failure can lose data that fflush sent
-     * to the kernel but that the kernel hasn't written to disk yet. */
     if (fsync(fc->fd) != 0)
         return -errno;
     return 0;
@@ -52,10 +55,8 @@ static int file_sync(void *ctx)
 static void file_close(void *ctx)
 {
     struct file_ctx *fc = ctx;
-    if (fc->fp) {
-        /* flock released automatically on close */
-        fclose(fc->fp);
-    }
+    if (fc->fd >= 0)
+        close(fc->fd);
     free(fc);
 }
 
@@ -69,9 +70,7 @@ static int file_size(void *ctx, uint64_t *out_bytes)
 static int file_resize(void *ctx, uint64_t new_size)
 {
     struct file_ctx *fc = ctx;
-    if (fseeko(fc->fp, (off_t)(new_size - 1), SEEK_SET) != 0)
-        return -errno;
-    if (fputc(0, fc->fp) == EOF)
+    if (ftruncate(fc->fd, (off_t)new_size) != 0)
         return -errno;
     fc->size = new_size;
     return 0;
@@ -94,35 +93,26 @@ int stm_file_backend_open(const char *path, int create, uint64_t size,
         return -ENOMEM;
 
     if (create) {
-        fc->fp = fopen(path, "w+b");
-        if (!fc->fp) {
-            free(fc);
-            return -errno;
-        }
-        if (fseeko(fc->fp, (off_t)(size - 1), SEEK_SET) != 0 ||
-            fputc(0, fc->fp) == EOF) {
-            fclose(fc->fp);
-            free(fc);
-            return -errno;
+        fc->fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (fc->fd < 0) { free(fc); return -errno; }
+        if (ftruncate(fc->fd, (off_t)size) != 0) {
+            close(fc->fd); free(fc); return -errno;
         }
         fc->size = size;
     } else {
-        fc->fp = fopen(path, "r+b");
-        if (!fc->fp) {
-            free(fc);
-            return -errno;
+        fc->fd = open(path, O_RDWR);
+        if (fc->fd < 0) { free(fc); return -errno; }
+        struct stat st;
+        if (fstat(fc->fd, &st) != 0) {
+            close(fc->fd); free(fc); return -errno;
         }
-        fseeko(fc->fp, 0, SEEK_END);
-        fc->size = (uint64_t)ftello(fc->fp);
+        fc->size = (uint64_t)st.st_size;
     }
 
-    fc->fd = fileno(fc->fp);
-
-    /* Exclusive lock — prevents two servers from opening the same volume.
-     * LOCK_NB: non-blocking, returns EWOULDBLOCK if already locked. */
+    /* Exclusive lock — prevents two servers from opening the same volume. */
     if (flock(fc->fd, LOCK_EX | LOCK_NB) != 0) {
         int err = errno;
-        fclose(fc->fp);
+        close(fc->fd);
         free(fc);
         if (err == EWOULDBLOCK)
             fprintf(stderr, "Volume is already in use by another process.\n");
