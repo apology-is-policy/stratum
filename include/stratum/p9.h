@@ -53,4 +53,8 @@ int  stm_9p_handle(struct stm_9p *srv,
 
 void stm_9p_destroy(struct stm_9p *srv);
 
+/* Returns non-zero if there are unsaved changes. Caller should sync. */
+int  stm_9p_is_dirty(struct stm_9p *srv);
+void stm_9p_clear_dirty(struct stm_9p *srv);
+
 #endif /* STM_P9_H */

@@ -66,6 +66,7 @@ struct p9_fid {
 struct stm_9p {
     struct stm_fs *fs;
     uint32_t msize;
+    int dirty;              /* set when writes happen; cleared by sync */
     struct p9_fid fids[MAX_FIDS];
 };
 
@@ -475,10 +476,12 @@ static int h_clunk(struct stm_9p *s, const uint8_t *body, uint16_t tag,
     struct p9_fid *f = fid_get(s, fid_nr);
     uint8_t *wp;
 
-    /* Sync after writes: flushes the btree and commits the superblock.
-     * The inode size is already updated by stm_fs_write. */
-    if (f && f->size_dirty)
+    /* Sync after writes — ensures durability when copy dialog closes.
+     * Much faster now that scan doesn't drain the whole tree. */
+    if (f && f->size_dirty) {
         stm_fs_sync(s->fs);
+        s->dirty = 0;
+    }
 
     fid_free(s, fid_nr);
     wp = resp + 4;
@@ -500,11 +503,10 @@ static int h_remove(struct stm_9p *s, const uint8_t *body, uint16_t tag,
     stm_fs_unlink(s->fs, f->parent_ino, f->name);
     fid_free(s, fid_nr);
 
-    /* Sync after delete: flushes the btree AND commits freed extent
-     * blocks so the allocator can reuse them immediately. Without this,
-     * freed blocks stay PENDING until the next write-clunk sync, and
-     * the allocator grows the volume instead of reusing space. */
+    /* Sync to commit freed extent blocks so they're reusable.
+     * Without this, blocks stay PENDING until session end. */
     stm_fs_sync(s->fs);
+    s->dirty = 0;
 
     wp = resp + 4;
     *wp++ = P9_RREMOVE;
@@ -589,3 +591,5 @@ int stm_9p_handle(struct stm_9p *s,
 }
 
 void stm_9p_destroy(struct stm_9p *s) { free(s); }
+int  stm_9p_is_dirty(struct stm_9p *s) { return s->dirty; }
+void stm_9p_clear_dirty(struct stm_9p *s) { s->dirty = 0; }
