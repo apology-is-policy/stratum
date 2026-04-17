@@ -133,10 +133,18 @@ fn test_large_file_roundtrip() {
 
 #[test]
 fn test_autogrow_large_file() {
-    // start with 4MB volume, copy 20MB file → volume must auto-grow
+    // start with 4MB volume, copy 20MB file → volume must auto-grow.
+    // Payload must be incompressible (LZ4 compression would otherwise let
+    // it fit in the original volume without growing).
     let vol = TestVolume::new("autogrow", "4M");
     let size = 20 * 1024 * 1024;
-    let data: Vec<u8> = (0..size).map(|i| ((i * 7 + 13) % 256) as u8).collect();
+    let mut data = Vec::with_capacity(size);
+    let mut s: u64 = 0xdeadbeefcafebabe;
+    while data.len() < size {
+        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        data.extend_from_slice(&s.to_le_bytes());
+    }
+    data.truncate(size);
     let src = write_host_file(vol.host_dir(), "grow.bin", &data);
 
     vol.cli_ok(&["cp-in", src.to_str().unwrap(), "grow.bin"]);

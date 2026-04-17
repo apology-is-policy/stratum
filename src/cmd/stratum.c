@@ -455,6 +455,8 @@ static int check_entry_cb(const struct stm_key *key, const void *val,
         memcpy(&ext, val, sizeof(ext));
         uint64_t paddr = le64_to_cpu(ext.se_paddr);
         uint32_t dlen = le32_to_cpu(ext.se_dlen);
+        uint32_t clen = stm_extent_clen(&ext);
+        uint8_t  comp = stm_extent_comp(&ext);
         c->extent_bytes += dlen;
 
         if (paddr == 0) {
@@ -473,9 +475,23 @@ static int check_entry_cb(const struct stm_key *key, const void *val,
                     dlen, (uint32_t)STM_EXTENT_SIZE);
             c->errors++;
         }
+        /* Compression invariants: uncompressed ⇒ clen == dlen; compressed
+         * should be strictly smaller (we only keep compressed form if it wins). */
+        if (comp == STM_COMP_NONE && clen != dlen) {
+            fprintf(stderr, "  ERROR: ino %llu offset %llu: comp=NONE but clen=%u != dlen=%u\n",
+                    (unsigned long long)kc.ino, (unsigned long long)kc.offset,
+                    clen, dlen);
+            c->errors++;
+        }
+        if (comp != STM_COMP_NONE && clen >= dlen) {
+            fprintf(stderr, "  WARN: ino %llu offset %llu: compressed extent clen=%u >= dlen=%u\n",
+                    (unsigned long long)kc.ino, (unsigned long long)kc.offset,
+                    clen, dlen);
+            c->warnings++;
+        }
 
         struct stm_crypto *crypto = stm_btree_get_crypto(c->fs->tree);
-        uint32_t disk_len = crypto ? (dlen + STM_CRYPTO_TAG_LEN) : dlen;
+        uint32_t disk_len = crypto ? (clen + STM_CRYPTO_TAG_LEN) : clen;
         uint32_t nblocks = (disk_len + STM_BLOCK_SIZE - 1) / STM_BLOCK_SIZE;
         uint64_t block = paddr / STM_BLOCK_SIZE;
 

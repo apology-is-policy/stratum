@@ -42,7 +42,7 @@ Stratum is a **user-space copy-on-write filesystem** that stores a single volume
 
 - **Correctness on crash** — any torn write must leave the previous transaction intact.
 - **Data integrity** — per-block xxHash3-128 checksums detect bit rot; optional XChaCha20-Poly1305 encryption provides AEAD integrity.
-- **Space efficiency** — LZ4 or ZSTD compression per Bε-tree node; COW deferred-free to avoid double allocation.
+- **Space efficiency** — LZ4 or ZSTD compression for both Bε-tree nodes and file-data extents; COW deferred-free to avoid double allocation.
 - **Scalability** — Bε-tree absorbs point writes in an internal message buffer, batching them into leaves.
 - **Snapshots** — O(1) create, refcount-based block sharing, rollback, deletion, accessible via TUI and 9P.
 - **Pluggable storage** — block device is a vtable (`struct stm_block_ops`), the file backend is the first implementation.
@@ -63,7 +63,7 @@ Stratum is a **user-space copy-on-write filesystem** that stores a single volume
 | Data structure | **Bε-tree** | B-tree | object set + tree | B-tree |
 | Block integrity | xxHash3-128 | CRC32C | fletcher2/4 / SHA-256 | none |
 | Encryption | per-block XChaCha20-Poly1305 (nonce = paddr) | via dm-crypt | AES-CCM/GCM | AES-XTS |
-| Compression | per-node LZ4 / ZSTD | per-extent LZO/ZSTD | per-block LZ4/ZSTD/gzip | LZFSE/ZLib |
+| Compression | per-node + per-extent LZ4 / ZSTD | per-extent LZO/ZSTD | per-block LZ4/ZSTD/gzip | LZFSE/ZLib |
 | Snapshots | refcount-based, saved root bptr | same | same | same |
 | Superblock | ping-pong (2 slots) | multiple copies | uberblock ring | container superblock |
 | Auto-grow | yes (proportional ftruncate) | no | pools | container resize |
@@ -206,14 +206,27 @@ Sort order is lexicographic `(ino, type, offset)`. All data for one inode is con
 
 Contains ino, gen, mode, uid, gid, nlink, size, atime/mtime/ctime (sec + nsec), and flags. Stored under `(ino, STM_KEY_INODE, 0)`.
 
-### 2.7 `struct stm_extent` (12 bytes)
+### 2.7 `struct stm_extent` (16 bytes)
 
 ```
-0       8      le64    se_paddr          on-disk address of extent data
-8       4      le32    se_dlen           logical data length
+0       8      le64    se_paddr           on-disk address of extent data
+8       4      le32    se_dlen            logical (uncompressed) data length
+12      4      le32    se_clen_and_comp   low 24 bits: stored disk length (pre-AEAD-tag)
+                                          high 8 bits: compression algo (STM_COMP_*)
 ```
 
 Stored as the btree value for `STM_KEY_DATA` keys.
+
+The compression algo is packed into the high byte of `se_clen_and_comp`; the low 24 bits hold the stored length on disk (covers up to 16 MiB, more than enough for the 128 KiB max extent). If compression did not shrink the data, the raw form is stored and `se_clen == se_dlen`, `comp == STM_COMP_NONE`.
+
+Access via helpers:
+
+```c
+uint32_t stm_extent_clen(const struct stm_extent *e);
+uint8_t  stm_extent_comp(const struct stm_extent *e);
+void     stm_extent_set(struct stm_extent *e, uint64_t paddr,
+                        uint32_t dlen, uint32_t clen, uint8_t comp);
+```
 
 ### 2.8 `struct stm_node_hdr` (64 bytes)
 
@@ -262,24 +275,39 @@ Messages sort by `(key, gen ascending)`. Binary search in `stm_msg_insert` uses 
 
 ### 4.1 Model
 
-File data lives on disk OUTSIDE the btree. The btree stores only 12-byte `stm_extent` records pointing to where the data lives. Each extent covers up to 128 KiB.
+File data lives on disk OUTSIDE the btree. The btree stores only 16-byte `stm_extent` records pointing to where the data lives. Each extent covers up to 128 KiB of logical data, stored on disk in compressed and/or encrypted form.
 
-### 4.2 Write path (`stm_fs_write`)
+### 4.2 Write path (`stm_fs_write` → `extent_write_data`)
 
 For each 128 KiB-aligned extent chunk:
 1. Full-extent write past current file size: skip old-extent lookup (nothing to free).
-2. Partial write within file: fetch old extent, read data into scratch buffer, modify.
-3. Allocate new blocks, encrypt if needed, write to disk.
-4. Free old extent's blocks (if any).
-5. Insert new 12-byte extent record in btree.
+2. Partial write within file: fetch old extent, read + decrypt + decompress into scratch buffer, modify.
+3. **Compress** plaintext into `comp_buf` (LZ4 by default). Keep the compressed form only if `csize < dlen`; otherwise fall back to raw.
+4. **Encrypt** (if configured) the payload using `paddr` as the nonce prefix; output to `cipher_buf` with a 16-byte Poly1305 tag appended.
+5. Allocate `ceil((clen + tag) / 4096)` blocks, write to disk.
+6. Free old extent's blocks (if any).
+7. Insert new 16-byte extent record in btree. `stm_extent_set` packs `clen` and `comp` into one 32-bit field.
 
-Uses reusable scratch buffers (`fs->extent_buf`, `fs->cipher_buf`) — no per-extent malloc.
+Transform pipeline: `plaintext ── compress? ──► payload ── encrypt? ──► disk`
 
-### 4.3 Read path (`stm_fs_read`)
+Uses reusable scratch buffers (`fs->extent_buf`, `fs->comp_buf`, `fs->cipher_buf`) — no per-extent malloc.
+
+### 4.3 Read path (`stm_fs_read` → `extent_read_data`)
 
 1. Clamp request against file size.
-2. For each extent in range: lookup extent record → read from disk → decrypt if needed → copy relevant portion to user buffer.
-3. Missing extents fill with zeros (sparse holes).
+2. For each extent in range, look up the 16-byte record.
+3. **Decrypt** (if encrypted) the `clen + tag` bytes from disk into a payload buffer.
+4. **Decompress** (if `comp != NONE`) from the payload buffer into the final extent buffer.
+5. Copy the relevant portion to the user's buffer.
+6. Missing extents fill with zeros (sparse holes).
+
+Zero-copy fast path: for uncompressed, unencrypted extents the on-disk bytes are read straight into the user-supplied buffer (no intermediate copy).
+
+### 4.4 Compression policy
+
+The filesystem's default algorithm (`fs->comp_algo`) is set at mount time — LZ4 when built with `STM_HAVE_LZ4`, otherwise `STM_COMP_NONE`. Per-extent, we attempt compression, measure, and only keep the compressed form if it's strictly smaller than the plaintext. This avoids pathological growth on incompressible data (random, already-compressed files) while still winning on text, code, and sparse-ish data.
+
+The stored `comp` byte is persisted with the extent record, so readers always know how to decode — mixing compressed and uncompressed extents in one file is fine.
 
 ---
 
@@ -419,7 +447,25 @@ Poly1305 tag (16 bytes) detects tampering and corruption. Decrypt fails with `-E
 
 ## 10. Compression
 
-LZ4 (default) or ZSTD, per btree node. Skipped if compressed size ≥ original. `bp_comp` in the bptr records which algorithm was used. Data extents are NOT compressed currently.
+Two independent compression paths share the same codec layer (`src/compress/compress.c` — LZ4 or ZSTD, selected by a one-byte `STM_COMP_*` tag).
+
+### 10.1 Per-node compression (btree)
+
+Each Bε-tree node is compressed on write, recorded in `bp_comp` / `bp_csize` / `bp_lsize` of its parent pointer. Skipped if compressed size ≥ original — the raw form is stored.
+
+### 10.2 Per-extent compression (data)
+
+File-data extents go through the same pipeline: every extent is trial-compressed on write, kept compressed only if it shrinks. The algorithm and stored length are persisted alongside the extent record (`se_clen_and_comp`). Mixed compression within a single file is fine — each extent decodes independently.
+
+Default is LZ4 (fast, good-enough ratio). ZSTD is available at compile time but not wired into the default `fs->comp_algo` — switching is a one-line change if a volume wants denser packing at higher CPU cost.
+
+### 10.3 Observed results
+
+On a volume with 10 MiB of repeating-text payload stored in 80 extents:
+- Raw: 2560 blocks (10 MiB) allocated for data
+- LZ4-compressed: 83 blocks (~332 KiB) allocated — a ~30× reduction
+
+Incompressible data (random bytes, pre-compressed archives) pays a few microseconds per extent for the trial-compress, then falls back to raw storage. The `se_clen == se_dlen`, `comp == NONE` invariant is verified by `stratum check`.
 
 ---
 
@@ -616,9 +662,10 @@ cd tui && cargo build --release
 
 Key optimizations applied (git history):
 - Extent-based storage (vs inline btree values)
+- Per-extent LZ4 compression (~30× on compressible data, free on random)
 - Single fsync per sync (not one per tree)
 - pread/pwrite (not stdio)
-- Reusable scratch buffers
+- Reusable scratch buffers (extent_buf, comp_buf, cipher_buf)
 - Drain-free scan (no full tree drain per readdir)
 - Readdir result caching in 9P server
 - Allocator hint wraparound
@@ -640,12 +687,11 @@ Key optimizations applied (git history):
 
 1. **No intermediate commits during long writes**. A 50 GB copy loses everything on crash before sync. (Attempted; reverted due to encryption corruption.)
 2. **No node cache**. Every `stm_btree_read_node` does full malloc + I/O + decrypt + decompress + decode.
-3. **No per-extent compression**. Only btree nodes are compressed.
-4. **No defragmentation**.
-5. **Allocator state not persisted**. Rebuilt via tree walk on mount (O(total nodes + extents)).
-6. **No hard links, symlinks, xattrs, rename, chown, utime**.
-7. **No FUSE / kernel mount**. 9P only.
-8. **No CRC on extent data independent of AEAD**. Unencrypted volumes have no integrity check on data.
+3. **No defragmentation**.
+4. **Allocator state not persisted**. Rebuilt via tree walk on mount (O(total nodes + extents)).
+5. **No hard links, symlinks, xattrs, rename, chown, utime**.
+6. **No FUSE / kernel mount**. 9P only.
+7. **No CRC on extent data independent of AEAD**. Unencrypted volumes have no integrity check on data.
 
 ---
 

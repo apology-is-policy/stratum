@@ -1,5 +1,6 @@
 #include "fs_internal.h"
 #include "stratum/csum.h"
+#include "stratum/compress.h"
 
 #include <time.h>
 
@@ -32,8 +33,8 @@ static int mark_extent_entry(const struct stm_key *key, const void *val,
     memcpy(&ext, val, sizeof(ext));
     struct stm_crypto *crypto = stm_btree_get_crypto(fs->tree);
     uint64_t paddr = le64_to_cpu(ext.se_paddr);
-    uint32_t dlen  = le32_to_cpu(ext.se_dlen);
-    uint32_t disk_len = crypto ? (dlen + STM_CRYPTO_TAG_LEN) : dlen;
+    uint32_t clen  = stm_extent_clen(&ext);
+    uint32_t disk_len = crypto ? (clen + STM_CRYPTO_TAG_LEN) : clen;
     uint32_t nblocks = (disk_len + STM_BLOCK_SIZE - 1) / STM_BLOCK_SIZE;
     stm_alloc_mark(fs->alloc, paddr / STM_BLOCK_SIZE, nblocks);
     return 0;
@@ -380,6 +381,20 @@ int stm_fs_open(const char *path, const char *passphrase, struct stm_fs **out)
     /* Allocate reusable scratch buffers for extent I/O */
     fs->extent_buf = malloc(STM_EXTENT_SIZE);
     fs->cipher_buf = malloc(STM_EXTENT_SIZE + STM_CRYPTO_TAG_LEN);
+#ifdef STM_HAVE_LZ4
+    fs->comp_algo = STM_COMP_LZ4;
+#else
+    fs->comp_algo = STM_COMP_NONE;
+#endif
+    {
+        /* comp_buf sized to hold worst-case compressed output for any extent */
+        uint32_t cbound = STM_EXTENT_SIZE;
+        if (fs->comp_algo != STM_COMP_NONE) {
+            uint32_t b = stm_compress_bound(fs->comp_algo, STM_EXTENT_SIZE);
+            if (b > cbound) cbound = b;
+        }
+        fs->comp_buf = malloc(cbound);
+    }
 
     *out = fs;
     return 0;
@@ -459,6 +474,7 @@ void stm_fs_close(struct stm_fs *fs)
     memset(fs->dek, 0, sizeof(fs->dek));
     free(fs->extent_buf);
     free(fs->cipher_buf);
+    free(fs->comp_buf);
     free(fs);
 }
 
@@ -557,59 +573,109 @@ int stm_fs_create_file(struct stm_fs *fs, uint64_t parent_ino,
 
 /* ── extent helpers ─────────────────────────────────────────────────── */
 
+/* Write an extent with optional compression + encryption.
+ *
+ * Pipeline:
+ *   plaintext ──(optional)compress──► payload ──(optional)encrypt──► disk
+ *
+ * If compression is configured but doesn't shrink the data, we fall back
+ * to storing uncompressed. The extent record encodes the final state
+ * (clen = stored bytes pre-AEAD-tag, comp = algorithm used). */
 static int extent_write_data(struct stm_fs *fs, const void *data,
                              uint32_t dlen, struct stm_extent *out_ext)
 {
     struct stm_crypto *crypto = stm_btree_get_crypto(fs->tree);
-    uint32_t disk_len = crypto ? (dlen + STM_CRYPTO_TAG_LEN) : dlen;
-    uint32_t nblocks = (disk_len + STM_BLOCK_SIZE - 1) / STM_BLOCK_SIZE;
-    uint64_t paddr;
+    uint8_t  comp = STM_COMP_NONE;
+    const uint8_t *payload = data;
+    uint32_t clen = dlen;
     int rc;
 
+    /* Try compression. Only keep the result if it saves space.
+     * comp_buf is sized to the worst-case compressed bound, so the output
+     * always fits. */
+    if (fs->comp_algo != STM_COMP_NONE && dlen > 0) {
+        uint32_t csize = stm_compress_bound(fs->comp_algo, dlen);
+        if (stm_compress(fs->comp_algo, data, dlen,
+                         fs->comp_buf, &csize) == 0 && csize < dlen) {
+            payload = fs->comp_buf;
+            clen = csize;
+            comp = fs->comp_algo;
+        }
+    }
+
+    uint32_t disk_len = crypto ? (clen + STM_CRYPTO_TAG_LEN) : clen;
+    uint32_t nblocks = (disk_len + STM_BLOCK_SIZE - 1) / STM_BLOCK_SIZE;
+    uint64_t paddr;
     rc = stm_alloc_extent(fs->alloc, nblocks, &paddr);
     if (rc) return rc;
 
     if (crypto) {
-        uint32_t clen;
-        rc = stm_crypto_encrypt(crypto, paddr, data, dlen, fs->cipher_buf, &clen);
+        uint32_t enc_len;
+        rc = stm_crypto_encrypt(crypto, paddr, payload, clen,
+                                fs->cipher_buf, &enc_len);
         if (rc) return rc;
-        rc = stm_block_write(&fs->dev, paddr, fs->cipher_buf, clen);
+        rc = stm_block_write(&fs->dev, paddr, fs->cipher_buf, enc_len);
     } else {
-        rc = stm_block_write(&fs->dev, paddr, data, dlen);
+        rc = stm_block_write(&fs->dev, paddr, payload, clen);
     }
     if (rc) return rc;
 
-    out_ext->se_paddr = cpu_to_le64(paddr);
-    out_ext->se_dlen  = cpu_to_le32(dlen);
+    stm_extent_set(out_ext, paddr, dlen, clen, comp);
     return 0;
 }
 
+/* Read an extent into buf (at least STM_EXTENT_SIZE bytes).
+ *
+ * Pipeline: disk ──(optional)decrypt──► payload ──(optional)decompress──► buf
+ *
+ * For uncompressed, unencrypted data we read directly into buf (no extra copy). */
 static int extent_read_data(struct stm_fs *fs, const struct stm_extent *ext,
                             void *buf, uint32_t buf_len)
 {
     struct stm_crypto *crypto = stm_btree_get_crypto(fs->tree);
     uint64_t paddr = le64_to_cpu(ext->se_paddr);
     uint32_t dlen  = le32_to_cpu(ext->se_dlen);
+    uint32_t clen  = stm_extent_clen(ext);
+    uint8_t  comp  = stm_extent_comp(ext);
     int rc;
 
+    /* Determine compression destination: if uncompressed, decrypt/read
+     * straight into buf. Otherwise use comp_buf as an intermediate. */
+    uint8_t *payload;
+    if (comp == STM_COMP_NONE) {
+        payload = (uint8_t *)buf;
+    } else {
+        payload = fs->comp_buf;
+    }
+
     if (crypto) {
-        uint32_t disk_len = dlen + STM_CRYPTO_TAG_LEN;
+        uint32_t disk_len = clen + STM_CRYPTO_TAG_LEN;
         uint32_t plain_len;
         rc = stm_block_read(&fs->dev, paddr, fs->cipher_buf, disk_len);
         if (rc) return rc;
-        rc = stm_crypto_decrypt(crypto, paddr, fs->cipher_buf, disk_len, buf, &plain_len);
-        return rc;
+        rc = stm_crypto_decrypt(crypto, paddr, fs->cipher_buf, disk_len,
+                                payload, &plain_len);
+        if (rc) return rc;
+    } else {
+        uint32_t to_read = clen;
+        if (comp == STM_COMP_NONE && to_read > buf_len) to_read = buf_len;
+        rc = stm_block_read(&fs->dev, paddr, payload, to_read);
+        if (rc) return rc;
     }
-    rc = stm_block_read(&fs->dev, paddr, buf, dlen < buf_len ? dlen : buf_len);
-    return rc;
+
+    if (comp != STM_COMP_NONE) {
+        rc = stm_decompress(comp, payload, clen, buf, dlen);
+        if (rc) return rc;
+    }
+    return 0;
 }
 
 static void extent_free_blocks(struct stm_fs *fs, const struct stm_extent *ext)
 {
     struct stm_crypto *crypto = stm_btree_get_crypto(fs->tree);
     uint64_t paddr = le64_to_cpu(ext->se_paddr);
-    uint32_t dlen  = le32_to_cpu(ext->se_dlen);
-    uint32_t disk_len = crypto ? (dlen + STM_CRYPTO_TAG_LEN) : dlen;
+    uint32_t clen  = stm_extent_clen(ext);
+    uint32_t disk_len = crypto ? (clen + STM_CRYPTO_TAG_LEN) : clen;
     uint32_t nblocks = (disk_len + STM_BLOCK_SIZE - 1) / STM_BLOCK_SIZE;
     stm_alloc_free(fs->alloc, paddr / STM_BLOCK_SIZE, nblocks);
 }

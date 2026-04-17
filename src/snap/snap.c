@@ -26,8 +26,8 @@ static int mark_extent_snap(const struct stm_key *key, const void *val,
     struct stm_extent ext;
     memcpy(&ext, val, sizeof(ext));
     struct stm_crypto *crypto = stm_btree_get_crypto(fs->tree);
-    uint32_t dlen = le32_to_cpu(ext.se_dlen);
-    uint32_t disk_len = crypto ? (dlen + STM_CRYPTO_TAG_LEN) : dlen;
+    uint32_t clen = stm_extent_clen(&ext);
+    uint32_t disk_len = crypto ? (clen + STM_CRYPTO_TAG_LEN) : clen;
     uint32_t nb = (disk_len + STM_BLOCK_SIZE - 1) / STM_BLOCK_SIZE;
     stm_alloc_mark(fs->alloc, le64_to_cpu(ext.se_paddr) / STM_BLOCK_SIZE, nb);
     return 0;
@@ -52,8 +52,8 @@ static int ref_extent_entry(const struct stm_key *key, const void *val,
     struct stm_extent ext;
     memcpy(&ext, val, sizeof(ext));
     struct stm_crypto *crypto = stm_btree_get_crypto(fs->tree);
-    uint32_t dlen = le32_to_cpu(ext.se_dlen);
-    uint32_t disk_len = crypto ? (dlen + STM_CRYPTO_TAG_LEN) : dlen;
+    uint32_t clen = stm_extent_clen(&ext);
+    uint32_t disk_len = crypto ? (clen + STM_CRYPTO_TAG_LEN) : clen;
     uint32_t nb = (disk_len + STM_BLOCK_SIZE - 1) / STM_BLOCK_SIZE;
     stm_alloc_ref(fs->alloc, le64_to_cpu(ext.se_paddr) / STM_BLOCK_SIZE, nb);
     return 0;
@@ -77,8 +77,8 @@ static int free_extent_entry(const struct stm_key *key, const void *val,
     struct stm_extent ext;
     memcpy(&ext, val, sizeof(ext));
     struct stm_crypto *crypto = stm_btree_get_crypto(fs->tree);
-    uint32_t dlen = le32_to_cpu(ext.se_dlen);
-    uint32_t disk_len = crypto ? (dlen + STM_CRYPTO_TAG_LEN) : dlen;
+    uint32_t clen = stm_extent_clen(&ext);
+    uint32_t disk_len = crypto ? (clen + STM_CRYPTO_TAG_LEN) : clen;
     uint32_t nb = (disk_len + STM_BLOCK_SIZE - 1) / STM_BLOCK_SIZE;
     stm_alloc_free(fs->alloc, le64_to_cpu(ext.se_paddr) / STM_BLOCK_SIZE, nb);
     return 0;

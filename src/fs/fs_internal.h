@@ -14,12 +14,40 @@
 #include <errno.h>
 
 /* On-disk extent record — stored as btree value for DATA keys.
- * Points to file data blocks on disk. */
+ *
+ * Layout: 16 bytes total. The compression algorithm is packed into the
+ * high byte of se_clen; the low 24 bits hold the stored (compressed
+ * and/or encrypted) disk length. 24 bits covers up to 16 MiB, far more
+ * than needed for 128 KiB extents (max dlen = STM_EXTENT_SIZE).
+ *
+ * If the data wouldn't compress smaller, se_clen equals se_dlen and
+ * se_comp is STM_COMP_NONE — the data is stored raw. */
 struct __attribute__((packed)) stm_extent {
-    le64 se_paddr;   /* physical byte address of data on disk */
-    le32 se_dlen;    /* logical data length (before encryption) */
+    le64 se_paddr;          /* physical byte address of data on disk */
+    le32 se_dlen;            /* logical (uncompressed) data length */
+    le32 se_clen_and_comp;   /* low 24 bits: stored disk length (pre-AEAD-tag)
+                              * high 8 bits: compression algo (STM_COMP_*) */
 };
-STM_STATIC_ASSERT(sizeof(struct stm_extent) == 12, stm_extent_size);
+STM_STATIC_ASSERT(sizeof(struct stm_extent) == 16, stm_extent_size);
+
+static inline uint32_t stm_extent_clen(const struct stm_extent *e)
+{
+    return le32_to_cpu(e->se_clen_and_comp) & 0x00FFFFFFu;
+}
+
+static inline uint8_t stm_extent_comp(const struct stm_extent *e)
+{
+    return (uint8_t)((le32_to_cpu(e->se_clen_and_comp) >> 24) & 0xFFu);
+}
+
+static inline void stm_extent_set(struct stm_extent *e, uint64_t paddr,
+                                  uint32_t dlen, uint32_t clen, uint8_t comp)
+{
+    e->se_paddr = cpu_to_le64(paddr);
+    e->se_dlen  = cpu_to_le32(dlen);
+    e->se_clen_and_comp =
+        cpu_to_le32((clen & 0x00FFFFFFu) | ((uint32_t)comp << 24));
+}
 
 struct stm_fs {
     struct stm_block_dev dev;
@@ -39,8 +67,11 @@ struct stm_fs {
     int      encrypted;
     struct stm_alloc *alloc;
     /* Reusable scratch buffers for extent I/O (avoid malloc per extent) */
-    uint8_t *extent_buf;     /* STM_EXTENT_SIZE bytes */
+    uint8_t *extent_buf;     /* STM_EXTENT_SIZE bytes — plaintext */
+    uint8_t *comp_buf;       /* compression bound bytes — compressed plaintext */
     uint8_t *cipher_buf;     /* STM_EXTENT_SIZE + STM_CRYPTO_TAG_LEN bytes */
+    /* Default compression algorithm for new extents (STM_COMP_*) */
+    uint8_t  comp_algo;
 };
 
 static inline struct stm_key stm_mk_key(uint64_t ino, uint8_t type,
