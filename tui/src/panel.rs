@@ -41,6 +41,10 @@ pub struct Panel {
     pub scroll_offset: usize,
     pub selected: std::collections::HashSet<usize>,
     backend: Backend,
+    /// Per-path cursor memory: key is the path we were in, value is the
+    /// name of the entry under the cursor at the time we descended. On
+    /// returning via "..", we restore the cursor to that entry.
+    cursor_memory: std::collections::HashMap<String, String>,
 }
 
 impl Panel {
@@ -52,11 +56,16 @@ impl Panel {
             scroll_offset: 0,
             selected: std::collections::HashSet::new(),
             backend: Backend::None,
+            cursor_memory: std::collections::HashMap::new(),
         }
     }
 
     pub fn is_connected(&self) -> bool {
         !matches!(self.backend, Backend::None)
+    }
+
+    pub fn is_host(&self) -> bool {
+        matches!(self.backend, Backend::Host(_))
     }
 
     pub fn selected_entry(&self) -> Option<&Entry> {
@@ -97,6 +106,8 @@ impl Panel {
         self.backend = Backend::None;
         self.entries.clear();
         self.cursor = 0;
+        // Cursor memory is per-volume; stale if we switch backends.
+        self.cursor_memory.clear();
     }
 
     pub fn refresh(&mut self) -> Result<()> {
@@ -159,6 +170,20 @@ impl Panel {
             None => return Ok(()),
         };
         if !entry.is_dir { return Ok(()); }
+
+        // Remember the name under the cursor in the current directory, so
+        // when we navigate back via ".." we can land on the same entry.
+        // For ascending (entry.name == ".."), we'll want the cursor to
+        // land on the directory we're leaving.
+        let current_path = self.path_str();
+        let leaving_into_name = if entry.name == ".." {
+            // Record the leaf of current path as the target for the parent
+            Some(Self::leaf_name(&current_path))
+        } else {
+            self.cursor_memory.insert(current_path.clone(), entry.name.clone());
+            None
+        };
+
         match &mut self.backend {
             Backend::P9 { path, .. } => {
                 if entry.name == ".." { path.pop(); }
@@ -168,7 +193,23 @@ impl Panel {
             Backend::None => return Ok(()),
         }
         self.cursor = 0;
-        self.refresh()
+        self.refresh()?;
+
+        // Restore cursor: on ascent, land on the directory we came from.
+        // On descent, restore whatever the user had selected there previously.
+        let target_name = leaving_into_name
+            .or_else(|| self.cursor_memory.get(&self.path_str()).cloned());
+        if let Some(name) = target_name {
+            if let Some(idx) = self.entries.iter().position(|e| e.name == name) {
+                self.cursor = idx;
+            }
+        }
+        Ok(())
+    }
+
+    fn leaf_name(path: &str) -> String {
+        // path examples: "/", "/foo", "/foo/bar", on host: "/home/user/..."
+        path.rsplit('/').find(|s| !s.is_empty()).unwrap_or("").to_string()
     }
 
     pub fn read_file(&mut self, name: &str) -> Result<Vec<u8>> {

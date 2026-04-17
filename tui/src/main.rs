@@ -61,6 +61,18 @@ fn main() -> Result<()> {
             continue;
         }
 
+        // MkVolume dialog — all keys go there
+        if app.mkvol_dialog.is_some() {
+            if event::poll(Duration::from_millis(50))? {
+                if let Event::Key(key) = event::read()? {
+                    if key.kind == KeyEventKind::Press {
+                        app.mkvol_key(key);
+                    }
+                }
+            }
+            continue;
+        }
+
         // Editor mode — all keys go to editor
         if app.editor.is_some() {
             if event::poll(Duration::from_millis(50))? {

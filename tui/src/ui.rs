@@ -1,6 +1,6 @@
 //! FAR Commander-style TUI rendering.
 
-use crate::app::{App, CopyState, Focus, InputAction, Mode, SnapshotDialog};
+use crate::app::{App, CopyState, Focus, InputAction, MkVolDialog, MkVolField, Mode, SnapshotDialog};
 use crate::editor::EditorMode;
 use crate::panel::Panel;
 use ratatui::prelude::*;
@@ -18,7 +18,8 @@ const CLR_TITLE_INACTIVE: Color = Color::DarkGray;
 
 const CLR_HEADER: Color = Color::Yellow;
 const CLR_DIR: Color = Color::White;
-const CLR_FILE: Color = Color::Cyan;
+const CLR_FILE: Color = Color::Gray;
+const CLR_STM: Color = Color::Cyan;
 const CLR_SELECTED: Color = Color::Red;
 
 const CLR_CURSOR_FG: Color = Color::Black;
@@ -31,6 +32,12 @@ const CLR_STATUS_BG: Color = Color::Black;
 const CLR_FKEY_NUM: Color = Color::White;
 const CLR_FKEY_LABEL_FG: Color = Color::Black;
 const CLR_FKEY_LABEL_BG: Color = Color::Cyan;
+
+// Shift row uses the same num color, but yellow-on-dark for the hints,
+// so the row reads as "there's a modifier layer" without shouting.
+const CLR_SHIFT_FKEY_NUM: Color = Color::DarkGray;
+const CLR_SHIFT_FKEY_LABEL_FG: Color = Color::Yellow;
+const CLR_SHIFT_FKEY_LABEL_BG: Color = Color::Rgb(40, 40, 40);
 
 const CLR_POPUP_BORDER: Color = Color::White;
 const CLR_POPUP_BG: Color = Color::Black;
@@ -65,8 +72,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(6),
-            Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(1), // status line
+            Constraint::Length(1), // F-key row
+            Constraint::Length(1), // Shift+F-key row
         ])
         .split(area);
 
@@ -88,6 +96,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     frame.render_widget(status, rows[1]);
 
     draw_fkey_bar(frame, rows[2]);
+    draw_shift_fkey_bar(frame, rows[3]);
 
     // editor overlay (full screen)
     if let Some(ref ed) = app.editor {
@@ -107,6 +116,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     if let Some(ref sd) = app.snap_dialog {
         draw_snap_dialog(frame, area, sd);
+    }
+    if let Some(ref md) = app.mkvol_dialog {
+        draw_mkvol_dialog(frame, area, md);
     }
 }
 
@@ -200,7 +212,13 @@ fn draw_panel(frame: &mut Frame, panel: &Panel, area: Rect, focused: bool) {
         .skip(scroll)
         .take(visible)
         .map(|(i, e)| {
-            let (icon, base_clr) = if e.is_dir { ("/", CLR_DIR) } else { (" ", CLR_FILE) };
+            let (icon, base_clr) = if e.is_dir {
+                ("/", CLR_DIR)
+            } else if e.name.ends_with(".stm") {
+                (" ", CLR_STM)
+            } else {
+                (" ", CLR_FILE)
+            };
             let is_sel = panel.selected.contains(&i);
             let fg = if is_sel { CLR_SELECTED } else { base_clr };
 
@@ -300,7 +318,21 @@ fn draw_fkey_bar(frame: &mut Frame, area: Rect) {
         ("5", "Copy"), ("6", ""), ("7", "MkDir"), ("8", "Delete"),
         ("9", "Snap"), ("10", "Quit"),
     ];
+    draw_fkey_row(frame, area, keys, CLR_FKEY_NUM, CLR_FKEY_LABEL_FG, CLR_FKEY_LABEL_BG);
+}
 
+fn draw_shift_fkey_bar(frame: &mut Frame, area: Rect) {
+    let keys: &[(&str, &str)] = &[
+        ("S1", ""), ("S2", "Host"), ("S3", ""), ("S4", ""),
+        ("S5", ""), ("S6", ""), ("S7", "MkVol"), ("S8", ""),
+        ("S9", ""), ("S10", ""),
+    ];
+    draw_fkey_row(frame, area, keys,
+                  CLR_SHIFT_FKEY_NUM, CLR_SHIFT_FKEY_LABEL_FG, CLR_SHIFT_FKEY_LABEL_BG);
+}
+
+fn draw_fkey_row(frame: &mut Frame, area: Rect, keys: &[(&str, &str)],
+                 num_fg: Color, label_fg: Color, label_bg: Color) {
     let total_keys = keys.len();
     let cell_w = area.width as usize / total_keys;
 
@@ -308,14 +340,14 @@ fn draw_fkey_bar(frame: &mut Frame, area: Rect) {
     for (num, label) in keys {
         spans.push(Span::styled(
             format!("{num}"),
-            Style::default().fg(CLR_FKEY_NUM).bg(CLR_BG).bold(),
+            Style::default().fg(num_fg).bg(CLR_BG).bold(),
         ));
-        let label_w = cell_w.saturating_sub(num.len() + 1); // +1 for gap
+        let label_w = cell_w.saturating_sub(num.len() + 1);
         spans.push(Span::styled(
             format!("{:<w$}", label, w = label_w),
-            Style::default().fg(CLR_FKEY_LABEL_FG).bg(CLR_FKEY_LABEL_BG).bold(),
+            Style::default().fg(label_fg).bg(label_bg).bold(),
         ));
-        spans.push(Span::styled(" ", Style::default().bg(CLR_BG))); // 1-char gap
+        spans.push(Span::styled(" ", Style::default().bg(CLR_BG)));
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -654,6 +686,166 @@ fn draw_snap_dialog(frame: &mut Frame, area: Rect, sd: &SnapshotDialog) {
             Style::default().fg(Color::DarkGray),
         ))),
         rows[2],
+    );
+}
+
+fn draw_mkvol_dialog(frame: &mut Frame, area: Rect, md: &MkVolDialog) {
+    let w = 64u16.min(area.width.saturating_sub(4));
+    let h = 16u16.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(CLR_POPUP_BORDER).bold())
+        .title(" Create Stratum Volume ")
+        .style(Style::default().bg(CLR_POPUP_BG));
+
+    let inner = block.inner(rect);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(block, rect);
+
+    // Vertical layout: one line per field + hint
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),   // Name
+            Constraint::Length(1),   // Size
+            Constraint::Length(1),   // spacer
+            Constraint::Length(1),   // Encrypt
+            Constraint::Length(1),   // Passphrase (visible only if encrypt)
+            Constraint::Length(1),   // spacer
+            Constraint::Length(1),   // Compression
+            Constraint::Length(1),   // spacer
+            Constraint::Length(1),   // Error / tip
+            Constraint::Min(0),      // filler
+            Constraint::Length(1),   // buttons
+            Constraint::Length(1),   // hint
+        ])
+        .split(inner);
+
+    let render_field = |frame: &mut Frame, row: Rect, label: &str, value: &str,
+                        focused: bool, masked: bool| {
+        let label_w = 14usize;
+        let disp = if masked { "*".repeat(value.chars().count()) } else { value.to_string() };
+        let cursor = if focused { "_" } else { "" };
+        let value_line = format!("{disp}{cursor}");
+        let lstyle = if focused {
+            Style::default().fg(Color::Yellow).bold()
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let vstyle = if focused {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::Cyan)
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!(" {:<w$}", label, w = label_w), lstyle),
+                Span::styled(format!(" {value_line:<40} "), vstyle),
+            ])),
+            row,
+        );
+    };
+
+    render_field(frame, rows[0], "Name:", &md.name,
+                 md.field == MkVolField::Name, false);
+    render_field(frame, rows[1], "Size:", &md.size,
+                 md.field == MkVolField::Size, false);
+
+    // Encrypt checkbox
+    {
+        let focused = md.field == MkVolField::Encrypt;
+        let box_txt = if md.encrypt { "[X]" } else { "[ ]" };
+        let lstyle = if focused { Style::default().fg(Color::Yellow).bold() }
+                     else { Style::default().fg(Color::White) };
+        let vstyle = if focused { Style::default().fg(Color::Black).bg(Color::Cyan) }
+                     else { Style::default().fg(Color::White) };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!(" {:<14}", "Encryption:"), lstyle),
+                Span::styled(format!(" {box_txt} {}", if md.encrypt { "on " } else { "off" }), vstyle),
+            ])),
+            rows[3],
+        );
+    }
+
+    // Passphrase — only if encrypt is on, otherwise a disabled-looking row
+    if md.encrypt {
+        render_field(frame, rows[4], "Passphrase:", &md.passphrase,
+                     md.field == MkVolField::Passphrase, true);
+    } else {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " Passphrase:    (enable encryption to set)",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            rows[4],
+        );
+    }
+
+    // Compression selector — render all three, highlight current, focus-box the row
+    {
+        let focused = md.field == MkVolField::Compress;
+        let lstyle = if focused { Style::default().fg(Color::Yellow).bold() }
+                     else { Style::default().fg(Color::White) };
+        let mk_seg = |label: &'static str, is_sel: bool| {
+            let style = if is_sel {
+                if focused { Style::default().fg(Color::Black).bg(Color::Cyan).bold() }
+                else       { Style::default().fg(Color::Cyan).bold() }
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            Span::styled(format!(" {label} "), style)
+        };
+        let spans = vec![
+            Span::styled(format!(" {:<14}", "Compression:"), lstyle),
+            Span::raw(" "),
+            mk_seg("lz4",  md.compression == crate::app::CompAlgo::Lz4),
+            mk_seg("zstd", md.compression == crate::app::CompAlgo::Zstd),
+            mk_seg("none", md.compression == crate::app::CompAlgo::None),
+        ];
+        frame.render_widget(Paragraph::new(Line::from(spans)), rows[6]);
+    }
+
+    // Error line
+    if let Some(ref err) = md.error {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {err}"),
+                Style::default().fg(Color::Red).bold(),
+            ))),
+            rows[8],
+        );
+    }
+
+    // Buttons: [ OK ]  [ Cancel ]
+    {
+        let ok_focused = md.field == MkVolField::Ok;
+        let cancel_focused = md.field == MkVolField::Cancel;
+        let btn_style = |focused: bool| if focused {
+            Style::default().fg(Color::Black).bg(Color::Cyan).bold()
+        } else {
+            Style::default().fg(Color::White).bold()
+        };
+        let spans = vec![
+            Span::raw("        "),
+            Span::styled("  OK  ", btn_style(ok_focused)),
+            Span::raw("    "),
+            Span::styled("  Cancel  ", btn_style(cancel_focused)),
+        ];
+        frame.render_widget(Paragraph::new(Line::from(spans)), rows[10]);
+    }
+
+    // Hint
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " Tab/Shift-Tab: next/prev field   Space: toggle   Esc: cancel",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[11],
     );
 }
 

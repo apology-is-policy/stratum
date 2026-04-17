@@ -25,6 +25,76 @@ pub struct SnapshotDialog {
     pub cursor: usize,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MkVolField {
+    Name, Size, Encrypt, Passphrase, Compress, Ok, Cancel,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CompAlgo { Lz4, Zstd, None }
+
+impl CompAlgo {
+    pub fn label(self) -> &'static str {
+        match self { Self::Lz4 => "lz4", Self::Zstd => "zstd", Self::None => "none" }
+    }
+    pub fn next(self) -> Self {
+        match self { Self::Lz4 => Self::Zstd, Self::Zstd => Self::None, Self::None => Self::Lz4 }
+    }
+    pub fn prev(self) -> Self {
+        match self { Self::Lz4 => Self::None, Self::Zstd => Self::Lz4, Self::None => Self::Zstd }
+    }
+}
+
+pub struct MkVolDialog {
+    pub name: String,
+    pub size: String,
+    pub encrypt: bool,
+    pub passphrase: String,
+    pub compression: CompAlgo,
+    pub field: MkVolField,
+    pub target: Focus,      // which panel's cwd to create into
+    pub error: Option<String>,
+}
+
+impl MkVolDialog {
+    pub fn new(target: Focus) -> Self {
+        Self {
+            name: "volume.stm".into(),
+            size: "256M".into(),
+            encrypt: false,
+            passphrase: String::new(),
+            compression: CompAlgo::Lz4,
+            field: MkVolField::Name,
+            target,
+            error: None,
+        }
+    }
+
+    /// Visible fields in tab order, respecting encrypt toggle.
+    pub fn tab_order(&self) -> Vec<MkVolField> {
+        let mut v = vec![MkVolField::Name, MkVolField::Size, MkVolField::Encrypt];
+        if self.encrypt { v.push(MkVolField::Passphrase); }
+        v.push(MkVolField::Compress);
+        v.push(MkVolField::Ok);
+        v.push(MkVolField::Cancel);
+        v
+    }
+
+    pub fn next_field(&mut self) {
+        let order = self.tab_order();
+        if let Some(i) = order.iter().position(|f| *f == self.field) {
+            self.field = order[(i + 1) % order.len()];
+        }
+    }
+
+    pub fn prev_field(&mut self) {
+        let order = self.tab_order();
+        if let Some(i) = order.iter().position(|f| *f == self.field) {
+            self.field = order[(i + order.len() - 1) % order.len()];
+        }
+    }
+}
+
 pub enum Mode {
     Normal,
     Input {
@@ -37,7 +107,9 @@ pub enum Mode {
 /// Deferred blocking operations — set before a draw so the UI
 /// shows a busy message, then executed after the draw completes.
 pub enum PendingAction {
-    OpenVolume { path: String, pass: Option<String> },
+    OpenVolume { path: String, pass: Option<String>, target: Focus },
+    MkVolume { host_path: String, size_bytes: u64,
+               passphrase: Option<String>, comp: CompAlgo, target: Focus },
 }
 
 pub struct App {
@@ -54,6 +126,7 @@ pub struct App {
     pub pending_action: Option<PendingAction>,
     pub editor: Option<EditorState>,
     pub snap_dialog: Option<SnapshotDialog>,
+    pub mkvol_dialog: Option<MkVolDialog>,
     // server management
     server_proc: Option<Child>,
     server_sock: Option<String>,
@@ -102,6 +175,7 @@ impl App {
             pending_action: None,
             editor: None,
             snap_dialog: None,
+            mkvol_dialog: None,
             server_proc: None,
             server_sock: None,
             pending_volume: None,
@@ -116,7 +190,12 @@ impl App {
     }
 
     pub fn try_open_volume_from_cli(&mut self, path: &str, pass: Option<&str>) {
-        self.try_open_volume(path, pass);
+        let f = self.focus;
+        self.try_open_volume(path, pass, f);
+    }
+
+    fn other_focus(f: Focus) -> Focus {
+        match f { Focus::Left => Focus::Right, Focus::Right => Focus::Left }
     }
 
     pub fn active(&mut self) -> &mut Panel {
@@ -208,6 +287,7 @@ impl App {
             KeyCode::F(3) => self.open_editor(true),
             KeyCode::F(4) => self.open_editor(false),
             KeyCode::F(5) => self.copy_file(),
+            KeyCode::F(7) if shift => self.open_mkvol_dialog(),
             KeyCode::F(7) => {
                 self.mode = Mode::Input {
                     prompt: "Create directory:".into(),
@@ -216,35 +296,35 @@ impl App {
                 };
             }
             KeyCode::F(8) => {
-                let panel = self.active();
-                if panel.selected.is_empty() {
-                    // Delete cursor item
-                    if let Err(e) = panel.delete_selected() {
-                        self.status = format!("Delete error: {e}");
+                let status = {
+                    let panel = self.active();
+                    if panel.selected.is_empty() {
+                        match panel.delete_selected() {
+                            Err(e) => format!("Delete error: {e}"),
+                            Ok(()) => "Deleted".into(),
+                        }
                     } else {
-                        self.status = "Deleted".into();
+                        let names: Vec<String> = panel.selected.iter()
+                            .filter_map(|&i| panel.entries.get(i))
+                            .filter(|e| !e.is_dir && e.name != "..")
+                            .map(|e| e.name.clone())
+                            .collect();
+                        let mut ok = 0;
+                        let mut errs = 0;
+                        for name in &names {
+                            if panel.delete_by_name(name).is_err() { errs += 1; }
+                            else { ok += 1; }
+                        }
+                        panel.selected.clear();
+                        if errs > 0 {
+                            format!("Deleted {ok}, {errs} error(s)")
+                        } else {
+                            format!("Deleted {ok} file(s)")
+                        }
                     }
-                } else {
-                    // Delete all selected items
-                    let names: Vec<String> = panel.selected.iter()
-                        .filter_map(|&i| panel.entries.get(i))
-                        .filter(|e| !e.is_dir && e.name != "..")
-                        .map(|e| e.name.clone())
-                        .collect();
-                    let mut ok = 0;
-                    let mut errs = 0;
-                    for name in &names {
-                        if let Err(_) = panel.delete_by_name(name) { errs += 1; }
-                        else { ok += 1; }
-                    }
-                    panel.selected.clear();
-                    let _ = panel.refresh();
-                    if errs > 0 {
-                        self.status = format!("Deleted {ok}, {errs} error(s)");
-                    } else {
-                        self.status = format!("Deleted {ok} file(s)");
-                    }
-                }
+                };
+                self.refresh_both();
+                self.status = status;
             }
             KeyCode::F(10) | KeyCode::Char('q') => self.quit = true,
             KeyCode::F(9) | KeyCode::Char('s') => self.open_snap_dialog(),
@@ -270,6 +350,29 @@ impl App {
                 p.move_down();
             }
             KeyCode::Enter => {
+                // If cursor is on a .stm file on the host side, open it as
+                // a stratum volume in the OTHER panel and move focus there.
+                let stm_path = self.active().selected_entry().and_then(|e| {
+                    if !e.is_dir && e.name.ends_with(".stm") {
+                        Some(e.name.clone())
+                    } else { None }
+                });
+                if let Some(name) = stm_path {
+                    // Resolve to absolute host path (only meaningful on host backend).
+                    let full = {
+                        let cwd = self.active().path_str();
+                        if cwd.is_empty() { name } else { format!("{cwd}/{name}") }
+                    };
+                    if std::path::Path::new(&full).exists() {
+                        let other = Self::other_focus(self.focus);
+                        self.pending_volume = Some(full.clone());
+                        self.busy_message = Some("Opening volume...".into());
+                        self.pending_action = Some(PendingAction::OpenVolume {
+                            path: full, pass: None, target: other,
+                        });
+                        return;
+                    }
+                }
                 if let Err(e) = self.active().enter() {
                     self.status = format!("Error: {e}");
                 }
@@ -277,9 +380,7 @@ impl App {
 
             // quick keys
             KeyCode::Char('r') => {
-                if let Err(e) = self.active().refresh() {
-                    self.status = format!("Refresh error: {e}");
-                }
+                self.refresh_both();
             }
             _ => {}
         }
@@ -310,14 +411,14 @@ impl App {
                 self.pending_volume = Some(value.to_string());
                 self.busy_message = Some("Opening volume...".into());
                 self.pending_action = Some(PendingAction::OpenVolume {
-                    path: value.to_string(), pass: None,
+                    path: value.to_string(), pass: None, target: self.focus,
                 });
             }
             InputAction::Password => {
                 if let Some(vol) = self.pending_volume.take() {
                     self.busy_message = Some("Decrypting volume...".into());
                     self.pending_action = Some(PendingAction::OpenVolume {
-                        path: vol, pass: Some(value.to_string()),
+                        path: vol, pass: Some(value.to_string()), target: self.focus,
                     });
                 }
             }
@@ -347,7 +448,7 @@ impl App {
         }
     }
 
-    fn try_open_volume(&mut self, path: &str, pass: Option<&str>) {
+    fn try_open_volume(&mut self, path: &str, pass: Option<&str>, target: Focus) {
         // find the stratum binary (same directory as ourselves, or in PATH)
         let stratum_bin = find_stratum_bin();
         let sock = format!("/tmp/stratum-{}.sock", std::process::id());
@@ -399,8 +500,8 @@ impl App {
                         }
                     }
                 }
-                // connect active panel
-                let panel = match self.focus {
+                // connect target panel (may be the active or inactive one)
+                let panel = match target {
                     Focus::Left => &mut self.left,
                     Focus::Right => &mut self.right,
                 };
@@ -409,6 +510,7 @@ impl App {
                         panel.label = format!("[{}]", short_path(path));
                         self.config.add_volume(path);
                         self.status = format!("Opened {path}");
+                        self.focus = target;
                     }
                     Err(e) => {
                         self.status = format!("Connect error: {e}");
@@ -445,6 +547,145 @@ impl App {
     }
 
     // ── snapshot dialog ──────────────────────────────────────────────
+
+    fn open_mkvol_dialog(&mut self) {
+        let target = self.focus;
+        if !self.active().is_host() {
+            self.status = "Shift+F7 creates a volume file on the host filesystem — focus a host panel first".into();
+            return;
+        }
+        self.mkvol_dialog = Some(MkVolDialog::new(target));
+    }
+
+    pub fn mkvol_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let Some(d) = self.mkvol_dialog.as_mut() else { return; };
+
+        match key.code {
+            KeyCode::Esc => { self.mkvol_dialog = None; return; }
+            KeyCode::Tab => { if shift { d.prev_field(); } else { d.next_field(); } return; }
+            KeyCode::BackTab => { d.prev_field(); return; }
+            KeyCode::Up => { d.prev_field(); return; }
+            KeyCode::Down => { d.next_field(); return; }
+            _ => {}
+        }
+
+        match d.field {
+            MkVolField::Name => Self::mkvol_text_edit(&mut d.name, key.code),
+            MkVolField::Size => Self::mkvol_text_edit(&mut d.size, key.code),
+            MkVolField::Passphrase => Self::mkvol_text_edit(&mut d.passphrase, key.code),
+            MkVolField::Encrypt => {
+                if matches!(key.code, KeyCode::Char(' ') | KeyCode::Enter | KeyCode::Left | KeyCode::Right) {
+                    d.encrypt = !d.encrypt;
+                    if !d.encrypt { d.passphrase.clear(); }
+                }
+            }
+            MkVolField::Compress => {
+                match key.code {
+                    KeyCode::Left => d.compression = d.compression.prev(),
+                    KeyCode::Right | KeyCode::Char(' ') => d.compression = d.compression.next(),
+                    _ => {}
+                }
+            }
+            MkVolField::Ok => {
+                if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
+                    self.mkvol_submit();
+                }
+            }
+            MkVolField::Cancel => {
+                if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
+                    self.mkvol_dialog = None;
+                }
+            }
+        }
+    }
+
+    fn mkvol_text_edit(buf: &mut String, code: crossterm::event::KeyCode) {
+        use crossterm::event::KeyCode;
+        match code {
+            KeyCode::Char(c) => buf.push(c),
+            KeyCode::Backspace => { buf.pop(); }
+            _ => {}
+        }
+    }
+
+    fn mkvol_submit(&mut self) {
+        let d = match self.mkvol_dialog.as_mut() { Some(d) => d, None => return };
+
+        // validate
+        let name = d.name.trim().to_string();
+        if name.is_empty() || name.contains('/') {
+            d.error = Some("Invalid name".into()); return;
+        }
+        if d.encrypt && d.passphrase.is_empty() {
+            d.error = Some("Passphrase required when encryption is on".into()); return;
+        }
+        let size_bytes = match parse_size(&d.size) {
+            Some(n) if n >= 1024 * 1024 => n,
+            Some(_) => { d.error = Some("Size must be at least 1 MiB".into()); return; }
+            None    => { d.error = Some("Cannot parse size (try 64M, 1G, or bytes)".into()); return; }
+        };
+
+        // Build host path from target panel's cwd.
+        let (dir_str, target) = {
+            let panel = match d.target { Focus::Left => &self.left, Focus::Right => &self.right };
+            (panel.path_str(), d.target)
+        };
+        let full = if dir_str.is_empty() { name.clone() } else { format!("{dir_str}/{name}") };
+        if std::path::Path::new(&full).exists() {
+            self.mkvol_dialog.as_mut().unwrap().error =
+                Some(format!("File already exists: {full}"));
+            return;
+        }
+
+        let passphrase = if d.encrypt { Some(d.passphrase.clone()) } else { None };
+        let comp = d.compression;
+
+        self.mkvol_dialog = None;
+        self.busy_message = Some(format!("Creating volume {name}..."));
+        self.pending_action = Some(PendingAction::MkVolume {
+            host_path: full, size_bytes, passphrase, comp, target,
+        });
+    }
+
+    fn run_mkvol(&mut self, host_path: &str, size_bytes: u64,
+                 passphrase: Option<&str>, comp: CompAlgo, _target: Focus) {
+        use std::io::Write;
+        let bin = find_stratum_bin();
+        let mut cmd = Command::new(&bin);
+        cmd.arg("mkfs").arg(host_path).arg(format!("{size_bytes}"));
+        cmd.arg("--compress").arg(comp.label());
+        if passphrase.is_some() {
+            cmd.arg("--pass-stdin");
+            cmd.stdin(std::process::Stdio::piped());
+        }
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::piped());
+
+        match cmd.spawn() {
+            Ok(mut child) => {
+                if let Some(p) = passphrase {
+                    if let Some(ref mut stdin) = child.stdin.take() {
+                        let _ = writeln!(stdin, "{p}");
+                    }
+                }
+                let out = child.wait_with_output();
+                match out {
+                    Ok(o) if o.status.success() => {
+                        self.status = format!("Created volume {host_path}");
+                        self.refresh_both();
+                    }
+                    Ok(o) => {
+                        let err = String::from_utf8_lossy(&o.stderr);
+                        self.status = format!("mkfs failed: {}", err.trim());
+                    }
+                    Err(e) => self.status = format!("mkfs: {e}"),
+                }
+            }
+            Err(e) => self.status = format!("Cannot run stratum: {e}"),
+        }
+    }
 
     fn open_snap_dialog(&mut self) {
         let panel_side = self.focus;
@@ -544,10 +785,9 @@ impl App {
         };
         let result = {
             let panel = self.snap_target_panel();
-            let r = panel.snap_rollback(id);
-            if r.is_ok() { let _ = panel.refresh(); }
-            r
+            panel.snap_rollback(id)
         };
+        if result.is_ok() { self.refresh_both(); }
         match result {
             Ok(()) => self.status = format!("Rolled back to snapshot #{id}"),
             Err(e) => self.status = format!("Rollback failed: {e}"),
@@ -611,7 +851,7 @@ impl App {
 
         if self.editor.as_ref().map_or(false, |e| e.quit_requested) {
             self.editor = None;
-            let _ = self.active().refresh();
+            self.refresh_both();
         }
     }
 
@@ -675,7 +915,8 @@ impl App {
 
         if files.is_empty() {
             self.status = "No files to copy (empty directories created)".into();
-            let _ = match dest { Focus::Left => self.left.refresh(), Focus::Right => self.right.refresh() };
+            self.refresh_both();
+            let _ = dest;
             return;
         }
 
@@ -760,15 +1001,14 @@ impl App {
                 }
                 self.busy_message = None;
                 // Clear multi-select
-                let panel = match state.src {
-                    Focus::Left => &mut self.left,
-                    Focus::Right => &mut self.right,
-                };
-                panel.selected.clear();
-                let _ = match state.dest {
-                    Focus::Left => self.left.refresh(),
-                    Focus::Right => self.right.refresh(),
-                };
+                {
+                    let panel = match state.src {
+                        Focus::Left => &mut self.left,
+                        Focus::Right => &mut self.right,
+                    };
+                    panel.selected.clear();
+                }
+                self.refresh_both();
                 if state.cancelled {
                     self.status = format!("Copy cancelled ({} of {} files)",
                         state.file_index, state.file_count);
@@ -887,6 +1127,14 @@ impl App {
         }
     }
 
+    /// Refresh both panels. Used after any state-changing op so that a
+    /// bystander view (e.g. same volume mounted twice, or sibling directory)
+    /// doesn't drift stale.
+    pub fn refresh_both(&mut self) {
+        let _ = self.left.refresh();
+        let _ = self.right.refresh();
+    }
+
     /// Execute deferred blocking action (call after drawing the busy dialog).
     pub fn run_pending_action(&mut self) {
         let action = match self.pending_action.take() {
@@ -894,8 +1142,11 @@ impl App {
             None => return,
         };
         match action {
-            PendingAction::OpenVolume { path, pass } => {
-                self.try_open_volume(&path, pass.as_deref());
+            PendingAction::OpenVolume { path, pass, target } => {
+                self.try_open_volume(&path, pass.as_deref(), target);
+            }
+            PendingAction::MkVolume { host_path, size_bytes, passphrase, comp, target } => {
+                self.run_mkvol(&host_path, size_bytes, passphrase.as_deref(), comp, target);
             }
         }
         self.busy_message = None;
@@ -952,4 +1203,25 @@ fn human_size(bytes: u64) -> String {
         val /= 1024.0;
     }
     format!("{val:.1} TB")
+}
+
+/// Parse a size string like "64M", "1G", "1024" into bytes. Returns None
+/// on garbage input.
+pub fn parse_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() { return None; }
+    let (num, suffix) = match s.chars().last() {
+        Some(c) if c.is_ascii_alphabetic() => (&s[..s.len() - c.len_utf8()], c.to_ascii_uppercase()),
+        _ => (s, '\0'),
+    };
+    let n: u64 = num.trim().parse().ok()?;
+    let mult: u64 = match suffix {
+        '\0' => 1,
+        'K' => 1024,
+        'M' => 1024 * 1024,
+        'G' => 1024 * 1024 * 1024,
+        'T' => 1024u64.pow(4),
+        _   => return None,
+    };
+    n.checked_mul(mult)
 }
