@@ -689,6 +689,20 @@ static int extent_read_data(struct stm_fs *fs, const struct stm_extent *ext,
     uint8_t  comp  = stm_extent_comp(ext);
     int rc;
 
+    /* Defense-in-depth: on encrypted volumes a corrupted extent record
+     * can't slip through (AEAD catches any bit flip) but on unencrypted
+     * volumes the extent record is only protected by the surrounding
+     * btree-node xxHash3. Adversarial disk edits could produce dlen /
+     * clen values that would overflow the output / scratch buffers
+     * below. Reject anything beyond what we allocate. */
+    if (dlen > STM_EXTENT_SIZE) return -EIO;
+    if (dlen > buf_len)         return -EIO;
+    if (comp == STM_COMP_NONE && clen != dlen) return -EIO;
+    if (comp != STM_COMP_NONE) {
+        uint32_t bound = stm_compress_bound(comp, STM_EXTENT_SIZE);
+        if (clen > bound) return -EIO;
+    }
+
     /* Determine compression destination: if uncompressed, decrypt/read
      * straight into buf. Otherwise use comp_buf as an intermediate. */
     uint8_t *payload;
