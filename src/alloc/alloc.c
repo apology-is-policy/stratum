@@ -126,8 +126,12 @@ int stm_alloc_extent(struct stm_alloc *a, uint32_t count, uint64_t *out_paddr)
             }
             pos++;
         }
-        /* Update hint past what we scanned so we don't re-scan next time */
-        a->hint = pos;
+        /* Wrap hint when it reaches the end — avoids getting stuck at
+         * the end of a grown volume where all new blocks are used. */
+        if (pos >= a->total)
+            a->hint = 2;  /* skip superblock blocks 0-1 */
+        else
+            a->hint = pos;
     }
 
     /* Slow path: full scan from block 0.

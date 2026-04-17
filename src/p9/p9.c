@@ -61,6 +61,9 @@ struct p9_fid {
     int      is_dir;
     uint64_t write_end;     /* highest byte written (for deferred size update) */
     int      size_dirty;
+    /* Cached readdir listing — avoids re-scanning the btree on each 9P read */
+    uint8_t *dir_cache;
+    uint32_t dir_cache_len;
 };
 
 struct stm_9p {
@@ -94,6 +97,8 @@ static void fid_free(struct stm_9p *s, uint32_t fid) {
     int i;
     for (i = 0; i < MAX_FIDS; i++)
         if (s->fids[i].active && s->fids[i].fid == fid) {
+            free(s->fids[i].dir_cache);
+            s->fids[i].dir_cache = NULL;
             s->fids[i].active = 0;
             return;
         }
@@ -409,17 +414,22 @@ static int h_read(struct stm_9p *s, const uint8_t *body, uint16_t tag,
     p16(wp, tag); wp += 2;
 
     if (f->is_dir) {
-        /* serialize directory listing */
-        uint8_t *tbuf = calloc(1, s->msize);
-        struct rdir_ctx rd = { .srv = s, .buf = tbuf, .cap = s->msize, .pos = 0 };
-        stm_fs_readdir(s->fs, f->ino, rdir_cb, &rd);
+        /* Build and cache the directory listing on first read.
+         * Subsequent reads at different offsets use the cache. */
+        if (!f->dir_cache) {
+            uint8_t *tbuf = calloc(1, s->msize);
+            struct rdir_ctx rd = { .srv = s, .buf = tbuf, .cap = s->msize, .pos = 0 };
+            stm_fs_readdir(s->fs, f->ino, rdir_cb, &rd);
+            f->dir_cache = tbuf;
+            f->dir_cache_len = rd.pos;
+        }
         {
-            uint32_t avail = (offset < rd.pos) ? rd.pos - (uint32_t)offset : 0;
+            uint32_t avail = (offset < f->dir_cache_len) ?
+                             f->dir_cache_len - (uint32_t)offset : 0;
             uint32_t n = avail < count ? avail : count;
             p32(wp, n); wp += 4;
-            if (n) { memcpy(wp, tbuf + offset, n); wp += n; }
+            if (n) { memcpy(wp, f->dir_cache + offset, n); wp += n; }
         }
-        free(tbuf);
     } else {
         /* read file data */
         uint32_t nread = 0;
