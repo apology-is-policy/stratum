@@ -27,18 +27,31 @@ STM_TEST(test_crypto_roundtrip)
 
     for (i = 0; i < 128; i++) plain[i] = (uint8_t)i;
 
-    rc = stm_crypto_encrypt(ctx, 42, plain, 128, cipher, &clen);
+    rc = stm_crypto_encrypt(ctx, 42, 7, plain, 128, cipher, &clen);
     STM_ASSERT_EQ(rc, 0);
     STM_ASSERT_EQ(clen, 128u + STM_CRYPTO_TAG_LEN);
 
-    rc = stm_crypto_decrypt(ctx, 42, cipher, clen, back, &plen);
+    rc = stm_crypto_decrypt(ctx, 42, 7, cipher, clen, back, &plen);
     STM_ASSERT_EQ(rc, 0);
     STM_ASSERT_EQ(plen, 128u);
     STM_ASSERT_MEM_EQ(plain, back, 128);
 
-    /* wrong address (nonce) should fail */
-    rc = stm_crypto_decrypt(ctx, 99, cipher, clen, back, &plen);
+    /* wrong paddr should fail */
+    rc = stm_crypto_decrypt(ctx, 99, 7, cipher, clen, back, &plen);
     STM_ASSERT_EQ(rc, -EIO);
+
+    /* wrong write_gen should fail */
+    rc = stm_crypto_decrypt(ctx, 42, 8, cipher, clen, back, &plen);
+    STM_ASSERT_EQ(rc, -EIO);
+
+    /* different write_gen at same paddr must yield different ciphertext
+     * (this is the whole reason write_gen is in the nonce) */
+    uint8_t cipher2[128 + STM_CRYPTO_TAG_LEN];
+    uint32_t clen2;
+    rc = stm_crypto_encrypt(ctx, 42, 8, plain, 128, cipher2, &clen2);
+    STM_ASSERT_EQ(rc, 0);
+    STM_ASSERT_EQ(clen, clen2);
+    STM_ASSERT(memcmp(cipher, cipher2, clen) != 0);
 
     stm_crypto_free(ctx);
 #endif

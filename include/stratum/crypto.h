@@ -14,14 +14,27 @@ struct stm_crypto;
 int  stm_crypto_init(const uint8_t *key, struct stm_crypto **ctx);
 
 /* Encrypt plain_len bytes. cipher must hold plain_len + STM_CRYPTO_TAG_LEN.
- * block_addr is used as nonce (unique per COW write). */
-int  stm_crypto_encrypt(struct stm_crypto *ctx, uint64_t block_addr,
+ *
+ * The 24-byte XChaCha20-Poly1305 nonce is constructed as
+ *     nonce = block_addr_le64 || write_gen_le64 || 8 zero bytes
+ *
+ * Both inputs matter: block_addr alone is NOT unique across COW
+ * reallocation (the same paddr can be freed and handed back to a
+ * later write), which would cause (key, nonce) reuse with different
+ * plaintexts and catastrophic loss of confidentiality. write_gen is
+ * a per-write counter supplied by the caller — usually `fs->gen` or
+ * the btree node's `gen`. The caller must persist enough state
+ * alongside the ciphertext to reproduce `write_gen` at decrypt. */
+int  stm_crypto_encrypt(struct stm_crypto *ctx,
+                        uint64_t block_addr, uint64_t write_gen,
                         const void *plain, uint32_t plain_len,
                         void *cipher, uint32_t *cipher_len);
 
 /* Decrypt cipher_len bytes (includes tag).
- * plain must hold cipher_len - STM_CRYPTO_TAG_LEN. */
-int  stm_crypto_decrypt(struct stm_crypto *ctx, uint64_t block_addr,
+ * plain must hold cipher_len - STM_CRYPTO_TAG_LEN.
+ * Both block_addr and write_gen must match what was used at encrypt. */
+int  stm_crypto_decrypt(struct stm_crypto *ctx,
+                        uint64_t block_addr, uint64_t write_gen,
                         const void *cipher, uint32_t cipher_len,
                         void *plain, uint32_t *plain_len);
 

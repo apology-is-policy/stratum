@@ -652,7 +652,7 @@ static int extent_write_data(struct stm_fs *fs, const void *data,
 
     if (crypto) {
         uint32_t enc_len;
-        rc = stm_crypto_encrypt(crypto, paddr, payload, clen,
+        rc = stm_crypto_encrypt(crypto, paddr, fs->gen, payload, clen,
                                 fs->cipher_buf, &enc_len);
         if (rc) return rc;
         rc = stm_block_write(&fs->dev, paddr, fs->cipher_buf, enc_len);
@@ -661,7 +661,7 @@ static int extent_write_data(struct stm_fs *fs, const void *data,
     }
     if (rc) return rc;
 
-    stm_extent_set(out_ext, paddr, dlen, clen, comp);
+    stm_extent_set(out_ext, paddr, fs->gen, dlen, clen, comp);
     return 0;
 }
 
@@ -692,9 +692,11 @@ static int extent_read_data(struct stm_fs *fs, const struct stm_extent *ext,
     if (crypto) {
         uint32_t disk_len = clen + STM_CRYPTO_TAG_LEN;
         uint32_t plain_len;
+        uint64_t write_gen = le64_to_cpu(ext->se_write_gen);
         rc = stm_block_read(&fs->dev, paddr, fs->cipher_buf, disk_len);
         if (rc) return rc;
-        rc = stm_crypto_decrypt(crypto, paddr, fs->cipher_buf, disk_len,
+        rc = stm_crypto_decrypt(crypto, paddr, write_gen,
+                                fs->cipher_buf, disk_len,
                                 payload, &plain_len);
         if (rc) return rc;
     } else {

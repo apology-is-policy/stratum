@@ -62,7 +62,7 @@ Stratum is a **user-space copy-on-write filesystem** that stores a single volume
 | --- | --- | --- | --- | --- |
 | Data structure | **Bε-tree** | B-tree | object set + tree | B-tree |
 | Block integrity | xxHash3-128 | CRC32C | fletcher2/4 / SHA-256 | none |
-| Encryption | per-block XChaCha20-Poly1305 (nonce = paddr) | via dm-crypt | AES-CCM/GCM | AES-XTS |
+| Encryption | per-block XChaCha20-Poly1305 (nonce = paddr ‖ write_gen) | via dm-crypt | AES-CCM/GCM | AES-XTS |
 | Compression | per-node + per-extent LZ4 / ZSTD | per-extent LZO/ZSTD | per-block LZ4/ZSTD/gzip | LZFSE/ZLib |
 | Snapshots | refcount-based, saved root bptr | same | same | same |
 | Superblock | ping-pong (2 slots) | multiple copies | uberblock ring | container superblock |
@@ -175,7 +175,7 @@ Offset Size   Field                     Notes
 
 ```
 0       8      le64    bp_paddr          physical byte address
-8       8      le64    bp_laddr          logical address (reserved)
+8       8      le64    bp_write_gen      write-gen counter (AEAD nonce uniqueness)
 16      32     u8[32]  bp_csum           checksum of on-disk bytes
 48      1      u8      bp_comp           0=none, 1=LZ4, 2=ZSTD
 49      4      le32    bp_csize          compressed size on disk
@@ -207,16 +207,19 @@ Sort order is lexicographic `(ino, type, offset)`. All data for one inode is con
 
 Contains ino, gen, mode, uid, gid, nlink, size, atime/mtime/ctime (sec + nsec), and flags. Stored under `(ino, STM_KEY_INODE, 0)`.
 
-### 2.7 `struct stm_extent` (16 bytes)
+### 2.7 `struct stm_extent` (24 bytes)
 
 ```
 0       8      le64    se_paddr           on-disk address of extent data
-8       4      le32    se_dlen            logical (uncompressed) data length
-12      4      le32    se_clen_and_comp   low 24 bits: stored disk length (pre-AEAD-tag)
+8       8      le64    se_write_gen       write-gen counter (AEAD nonce uniqueness)
+16      4      le32    se_dlen            logical (uncompressed) data length
+20      4      le32    se_clen_and_comp   low 24 bits: stored disk length (pre-AEAD-tag)
                                           high 8 bits: compression algo (STM_COMP_*)
 ```
 
 Stored as the btree value for `STM_KEY_DATA` keys.
+
+`se_write_gen` holds `fs->gen` at encrypt time. The crypto layer feeds `(paddr, write_gen)` into the XChaCha20-Poly1305 nonce so a paddr reused across free+realloc produces a distinct (key, nonce) pair. It's populated on unencrypted volumes too, for format consistency.
 
 The compression algo is packed into the high byte of `se_clen_and_comp`; the low 24 bits hold the stored length on disk (covers up to 16 MiB, more than enough for the 128 KiB max extent). If compression did not shrink the data, the raw form is stored and `se_clen == se_dlen`, `comp == STM_COMP_NONE`.
 
@@ -226,6 +229,7 @@ Access via helpers:
 uint32_t stm_extent_clen(const struct stm_extent *e);
 uint8_t  stm_extent_comp(const struct stm_extent *e);
 void     stm_extent_set(struct stm_extent *e, uint64_t paddr,
+                        uint64_t write_gen,
                         uint32_t dlen, uint32_t clen, uint8_t comp);
 ```
 
@@ -350,7 +354,7 @@ Never overwrite live data. Every modification produces a new bptr; the old one i
 1. Encode node to scratch buffer.
 2. Compress (optional, skip if no size win).
 3. Allocate new blocks.
-4. Encrypt (optional); nonce = paddr.
+4. Encrypt (optional); nonce = paddr ‖ write_gen. See §9.3.
 5. Compute xxHash3-128 csum over on-disk bytes.
 6. Write to disk.
 7. Populate new bptr; update parent pointer.
@@ -440,9 +444,19 @@ DEK (32 B random)               │ wrap
                           wrapped DEK (48 B) in ss_enc_wrapped_key
 ```
 
-DEK is unwrapped on mount and used for all subsequent encrypt/decrypt. Nonce for each encryption = `cpu_to_le64(paddr)` followed by 16 zero bytes.
+DEK is unwrapped on mount and used for all subsequent encrypt/decrypt.
 
-### 9.3 AEAD integrity
+### 9.3 Nonce construction
+
+Nonce (24 B) = `le64(paddr) ‖ le64(write_gen) ‖ 8 zero bytes`.
+
+`write_gen` is the sync generation (`fs->gen` for data extents; the owning node's `n->gen` for btree nodes). It is persisted alongside the ciphertext:
+- Btree nodes store it in `bp_write_gen` of the parent's bptr.
+- Data extents store it in `se_write_gen` of the extent record.
+
+Why it matters: `paddr` alone is not unique across time. Under COW, a block may be freed and later re-allocated for a different piece of data; encrypting that new plaintext under `(DEK, nonce=paddr)` would reuse the same nonce with the same key, destroying confidentiality (XOR of the two ciphertexts = XOR of the two plaintexts — a classic stream-cipher catastrophe). Mixing `write_gen` into the nonce makes every re-use distinct, because `fs->gen` strictly increases across syncs and any two writes at the same paddr are in different syncs.
+
+### 9.4 AEAD integrity
 
 Poly1305 tag (16 bytes) detects tampering and corruption. Decrypt fails with `-EIO` on any mismatch.
 
@@ -733,7 +747,7 @@ Key optimizations applied (git history):
 | **KEK** | Key Encryption Key (derived from passphrase) |
 | **Magic** | `0x004d555441525453` = "STRATUM\0" |
 | **msize** | 9P maximum message size (1 MiB default) |
-| **nonce** | XChaCha20 nonce (24 B; Stratum uses paddr LE + zeros) |
+| **nonce** | XChaCha20 nonce (24 B; Stratum uses paddr LE ‖ write_gen LE ‖ zeros) |
 | **paddr** | Physical byte address on device |
 | **PENDING** | Refcount sentinel 0xFFFF for freed-but-not-committed |
 | **QID** | 9P unique-id tuple |

@@ -164,7 +164,9 @@ static enum probe_status probe_bptr(struct stm_block_dev *dev,
         uint8_t *dec = malloc(csize);
         if (!dec) { free(raw); return PROBE_READ_FAIL; }
         uint32_t plen = 0;
-        int rc = stm_crypto_decrypt(crypto, paddr, raw, csize, dec, &plen);
+        uint64_t write_gen = le64_to_cpu(bptr->bp_write_gen);
+        int rc = stm_crypto_decrypt(crypto, paddr, write_gen,
+                                    raw, csize, dec, &plen);
         free(raw);
         if (rc != 0) { free(dec); return PROBE_DECRYPT_FAIL; }
         plain = dec;

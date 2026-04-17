@@ -15,20 +15,27 @@
 
 /* On-disk extent record — stored as btree value for DATA keys.
  *
- * Layout: 16 bytes total. The compression algorithm is packed into the
- * high byte of se_clen; the low 24 bits hold the stored (compressed
+ * Layout: 24 bytes total. se_write_gen holds the sync generation at
+ * encrypt time; the crypto layer uses (paddr, write_gen) as the AEAD
+ * nonce input, so a paddr reused across free+realloc cycles still gets
+ * a unique (key, nonce) pair. Unused on unencrypted volumes but always
+ * populated for consistency.
+ *
+ * The compression algorithm is packed into the high byte of
+ * se_clen_and_comp; the low 24 bits hold the stored (compressed
  * and/or encrypted) disk length. 24 bits covers up to 16 MiB, far more
  * than needed for 128 KiB extents (max dlen = STM_EXTENT_SIZE).
  *
  * If the data wouldn't compress smaller, se_clen equals se_dlen and
- * se_comp is STM_COMP_NONE — the data is stored raw. */
+ * the comp algo is STM_COMP_NONE — the data is stored raw. */
 struct __attribute__((packed)) stm_extent {
     le64 se_paddr;          /* physical byte address of data on disk */
+    le64 se_write_gen;       /* write-gen counter (nonce uniqueness) */
     le32 se_dlen;            /* logical (uncompressed) data length */
     le32 se_clen_and_comp;   /* low 24 bits: stored disk length (pre-AEAD-tag)
                               * high 8 bits: compression algo (STM_COMP_*) */
 };
-STM_STATIC_ASSERT(sizeof(struct stm_extent) == 16, stm_extent_size);
+STM_STATIC_ASSERT(sizeof(struct stm_extent) == 24, stm_extent_size);
 
 static inline uint32_t stm_extent_clen(const struct stm_extent *e)
 {
@@ -41,10 +48,12 @@ static inline uint8_t stm_extent_comp(const struct stm_extent *e)
 }
 
 static inline void stm_extent_set(struct stm_extent *e, uint64_t paddr,
+                                  uint64_t write_gen,
                                   uint32_t dlen, uint32_t clen, uint8_t comp)
 {
-    e->se_paddr = cpu_to_le64(paddr);
-    e->se_dlen  = cpu_to_le32(dlen);
+    e->se_paddr     = cpu_to_le64(paddr);
+    e->se_write_gen = cpu_to_le64(write_gen);
+    e->se_dlen      = cpu_to_le32(dlen);
     e->se_clen_and_comp =
         cpu_to_le32((clen & 0x00FFFFFFu) | ((uint32_t)comp << 24));
 }

@@ -56,7 +56,9 @@ int stm_btree_read_node(struct stm_btree *tree, struct stm_bptr *bptr,
         uint32_t plain_len;
         decrypted = malloc(disk_size);
         if (!decrypted) { free(raw); return -ENOMEM; }
-        rc = stm_crypto_decrypt(tree->crypto, le64_to_cpu(bptr->bp_paddr),
+        rc = stm_crypto_decrypt(tree->crypto,
+                                le64_to_cpu(bptr->bp_paddr),
+                                le64_to_cpu(bptr->bp_write_gen),
                                 raw, disk_size, decrypted, &plain_len);
         free(raw);
         if (rc) { free(decrypted); return rc; }
@@ -139,7 +141,7 @@ int stm_btree_write_node(struct stm_btree *tree, struct stm_node *n,
 
         if (tree->crypto) {
             uint32_t clen;
-            rc = stm_crypto_encrypt(tree->crypto, addr,
+            rc = stm_crypto_encrypt(tree->crypto, addr, n->gen,
                                     write_buf, write_len, enc_buf, &clen);
             free(comp_buf); free(buf);
             if (rc) { free(enc_buf); return rc; }
@@ -158,8 +160,8 @@ int stm_btree_write_node(struct stm_btree *tree, struct stm_node *n,
     n->paddr = addr;
     n->dirty = 0;
 
-    out->bp_paddr = cpu_to_le64(addr);
-    out->bp_laddr = cpu_to_le64(addr);
+    out->bp_paddr     = cpu_to_le64(addr);
+    out->bp_write_gen = cpu_to_le64(n->gen);
     out->bp_comp  = algo;
     out->bp_csize = cpu_to_le32(write_len);
     out->bp_lsize = cpu_to_le32(used);

@@ -16,7 +16,12 @@
 
 struct __attribute__((packed)) stm_bptr {
     le64    bp_paddr;                     /* physical block address */
-    le64    bp_laddr;                     /* logical block address (COW remapping) */
+    le64    bp_write_gen;                 /* write-gen counter for AEAD nonce
+                                           * (formerly bp_laddr, unused). Set to
+                                           * the owning tree's gen at write time
+                                           * so that same-paddr re-use across
+                                           * free+realloc produces distinct
+                                           * (key, nonce) pairs. */
     uint8_t bp_csum[STM_BLAKE3_LEN];     /* BLAKE3-256 of on-disk data */
     uint8_t bp_comp;                      /* compression algorithm */
     le32    bp_csize;                     /* compressed size in bytes */
@@ -35,7 +40,7 @@ static inline struct stm_bptr stm_bptr_null(void)
     struct stm_bptr bp;
     memset(&bp, 0, sizeof(bp));
     bp.bp_paddr = cpu_to_le64(STM_BADDR_NONE);
-    bp.bp_laddr = cpu_to_le64(STM_BADDR_NONE);
+    bp.bp_write_gen = cpu_to_le64(0);
     return bp;
 }
 
