@@ -131,6 +131,11 @@ pub struct App {
     server_proc: Option<Child>,
     server_sock: Option<String>,
     pending_volume: Option<String>,
+    /// Target panel for the pending (password-awaiting) open. None
+    /// defaults to the currently focused panel. Set when Enter-on-.stm
+    /// wants to open in the inactive panel but the volume turns out to
+    /// be encrypted.
+    pending_target: Option<Focus>,
 }
 
 pub struct ThroughputSample {
@@ -179,6 +184,7 @@ impl App {
             server_proc: None,
             server_sock: None,
             pending_volume: None,
+            pending_target: None,
         }
     }
 
@@ -233,6 +239,7 @@ impl App {
                     self.mode = Mode::Normal;
                     self.input_buf.clear();
                     self.pending_volume = None;
+                    self.pending_target = None;
                 }
                 KeyCode::Backspace => { self.input_buf.pop(); }
                 KeyCode::Char(ch) => { self.input_buf.push(ch); }
@@ -366,6 +373,7 @@ impl App {
                     if std::path::Path::new(&full).exists() {
                         let other = Self::other_focus(self.focus);
                         self.pending_volume = Some(full.clone());
+                        self.pending_target = Some(other);
                         self.busy_message = Some("Opening volume...".into());
                         self.pending_action = Some(PendingAction::OpenVolume {
                             path: full, pass: None, target: other,
@@ -409,6 +417,7 @@ impl App {
             InputAction::OpenVolume => {
                 if value.is_empty() { return; }
                 self.pending_volume = Some(value.to_string());
+                self.pending_target = Some(self.focus);
                 self.busy_message = Some("Opening volume...".into());
                 self.pending_action = Some(PendingAction::OpenVolume {
                     path: value.to_string(), pass: None, target: self.focus,
@@ -416,9 +425,10 @@ impl App {
             }
             InputAction::Password => {
                 if let Some(vol) = self.pending_volume.take() {
+                    let target = self.pending_target.take().unwrap_or(self.focus);
                     self.busy_message = Some("Decrypting volume...".into());
                     self.pending_action = Some(PendingAction::OpenVolume {
-                        path: vol, pass: Some(value.to_string()), target: self.focus,
+                        path: vol, pass: Some(value.to_string()), target,
                     });
                 }
             }
