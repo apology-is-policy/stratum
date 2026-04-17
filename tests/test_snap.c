@@ -169,6 +169,80 @@ STM_TEST(test_snap_persist)
     cleanup();
 }
 
+/* ── regression: first snap must not stomp on main tree ────────────── */
+/*
+ * Repro for the bug where ensure_snap_tree didn't wire the refcount
+ * allocator, so the snap tree's first bump-allocation landed on a
+ * block that the main tree already held. The corruption manifests
+ * as a checksum/AEAD-tag mismatch on the main tree root after close
+ * and reopen.
+ */
+STM_TEST(test_snap_create_doesnt_corrupt_main_tree)
+{
+    stm_fs_create(img, 64 * 1024 * 1024, NULL);
+
+    /* Round 1: write enough data to push main-tree allocations past
+     * the mount-time bump cursor, then sync and close so the on-disk
+     * ss_alloc_next is committed. */
+    {
+        struct stm_fs *fs;
+        STM_ASSERT_EQ(stm_fs_open(img, NULL, &fs), 0);
+        uint64_t ino;
+        stm_fs_create_file(fs, STM_ROOT_INO, "seed.bin", 0644, &ino);
+        char buf[200 * 1024];
+        memset(buf, 'A', sizeof(buf));
+        stm_fs_write(fs, ino, 0, buf, sizeof(buf));
+        stm_fs_sync(fs);
+        stm_fs_close(fs);
+    }
+
+    /* Round 2: reopen, create the first snapshot. Before the fix, this
+     * path allocated snap-tree nodes via bump allocator from the stale
+     * cursor — right on top of main-tree blocks. */
+    uint64_t sid = 0;
+    {
+        struct stm_fs *fs;
+        STM_ASSERT_EQ(stm_fs_open(img, NULL, &fs), 0);
+        STM_ASSERT_EQ(stm_snap_create(fs, "S", &sid), 0);
+
+        /* Write more data after the snap to exercise the main tree. */
+        uint64_t ino;
+        stm_fs_create_file(fs, STM_ROOT_INO, "post.bin", 0644, &ino);
+        char buf[200 * 1024];
+        memset(buf, 'B', sizeof(buf));
+        stm_fs_write(fs, ino, 0, buf, sizeof(buf));
+        stm_fs_sync(fs);
+        stm_fs_close(fs);
+    }
+
+    /* Round 3: reopen. If the snap tree trampled main-tree blocks in
+     * round 2, reopening fails immediately or the main-tree walk
+     * returns -EIO. */
+    {
+        struct stm_fs *fs;
+        STM_ASSERT_EQ(stm_fs_open(img, NULL, &fs), 0);
+
+        /* Verify we can still read seed.bin. */
+        uint64_t ino;
+        STM_ASSERT_EQ(stm_fs_lookup(fs, STM_ROOT_INO, "seed.bin", &ino), 0);
+        char buf[256];
+        uint32_t nread = 0;
+        STM_ASSERT_EQ(stm_fs_read(fs, ino, 0, buf, sizeof(buf), &nread), 0);
+        STM_ASSERT_EQ(nread, sizeof(buf));
+        for (size_t i = 0; i < sizeof(buf); i++) STM_ASSERT_EQ(buf[i], 'A');
+
+        /* And post.bin. */
+        STM_ASSERT_EQ(stm_fs_lookup(fs, STM_ROOT_INO, "post.bin", &ino), 0);
+        STM_ASSERT_EQ(stm_fs_read(fs, ino, 0, buf, sizeof(buf), &nread), 0);
+        STM_ASSERT_EQ(nread, sizeof(buf));
+        for (size_t i = 0; i < sizeof(buf); i++) STM_ASSERT_EQ(buf[i], 'B');
+
+        stm_fs_close(fs);
+    }
+
+    cleanup();
+}
+
 int main(void)
 {
     STM_SUITE("snap");
@@ -176,6 +250,7 @@ int main(void)
     STM_RUN(test_snap_name_collision);
     STM_RUN(test_snap_read_isolation);
     STM_RUN(test_snap_persist);
+    STM_RUN(test_snap_create_doesnt_corrupt_main_tree);
     printf("all passed\n");
     return 0;
 }

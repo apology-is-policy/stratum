@@ -103,6 +103,12 @@ static int ensure_snap_tree(struct stm_fs *fs)
     if (rc) return rc;
     stm_btree_set_alloc(fs->snap_tree, stm_btree_next_alloc(fs->tree));
     stm_fs_configure_tree(fs, fs->snap_tree);
+    /* CRITICAL: wire the refcount allocator. Without this, the snap tree
+     * falls through to bump allocation and writes its nodes on top of
+     * blocks the main tree is using — corrupting the main tree the
+     * moment the first snapshot is created on a volume that has prior
+     * writes. (See test_snap_create_doesnt_corrupt_main_tree.) */
+    if (fs->alloc) stm_btree_set_allocator(fs->snap_tree, fs->alloc);
     return 0;
 }
 
