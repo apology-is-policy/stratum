@@ -3,6 +3,7 @@
 #include "stratum/compress.h"
 
 #include <time.h>
+#include <unistd.h>
 
 /* ── local aliases ──────────────────────────────────────────────────── */
 
@@ -273,16 +274,24 @@ int stm_fs_create_ex(const char *path, uint64_t size_bytes,
 
     memset(sb.ss_csum, 0, sizeof(sb.ss_csum));
     stm_csum_compute(&sb, sizeof(sb), sb.ss_csum);
-    stm_block_write(&dev, STM_SB_OFFSET_A, &sb, sizeof(sb));
-    stm_block_write(&dev, STM_SB_OFFSET_B, &sb, sizeof(sb));
-    stm_block_sync(&dev);
+    rc = stm_block_write(&dev, STM_SB_OFFSET_A, &sb, sizeof(sb));
+    if (rc) goto fail_tree;
+    rc = stm_block_write(&dev, STM_SB_OFFSET_B, &sb, sizeof(sb));
+    if (rc) goto fail_tree;
+    rc = stm_block_sync(&dev);
+    if (rc) goto fail_tree;
 
     stm_btree_close(tree);
     stm_block_close(&dev);
     return 0;
 
 fail_tree: stm_btree_close(tree);
-fail_dev:  stm_block_close(&dev);
+fail_dev:
+    stm_block_close(&dev);
+    /* Don't leave a half-initialized volume on disk — the user will
+     * mount it, fail with -EINVAL, and have to reformat. Remove the
+     * backing file so `mkfs` is effectively atomic. */
+    unlink(path);
     return rc;
 }
 
