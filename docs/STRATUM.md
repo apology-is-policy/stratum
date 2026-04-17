@@ -376,15 +376,17 @@ stm_fs_sync:
     2. Flush snap tree if present
     3. Construct new superblock, compute csum
     4. Write superblock to alternate slot
-    5. fsync(fd)                   ← single fsync, crash boundary
+    5. fsync(fd)                   ← single sync, crash boundary
     6. stm_alloc_commit             ← PENDING → free
 ```
 
-A single fsync is sufficient because `pwrite` orders correctly through the kernel page cache.
+A single sync is sufficient because `pwrite` orders correctly through the kernel page cache.
+
+On Darwin, step 5 uses `fcntl(F_FULLFSYNC)` instead of `fsync()` — plain `fsync()` on macOS returns after writes reach the OS page cache but before the drive's volatile cache is flushed, so a power loss can drop a "committed" transaction and leave the next mount looking at torn state (old superblock + partially-landed new nodes). `F_FULLFSYNC` forces a real disk-cache flush. On Linux we keep `fsync()` (which on ext4/xfs does issue the disk flush).
 
 ### 7.3 File locking
 
-`flock(LOCK_EX | LOCK_NB)` on open prevents two processes from opening the same volume. Released automatically on process exit (kernel handles even SIGKILL).
+`flock(LOCK_EX | LOCK_NB)` on open prevents two processes from opening the same volume path. Released automatically on process exit (kernel handles even SIGKILL). One caveat: `flock` is per-open-file-description, so two processes opening two *hardlinks* to the same inode both acquire the lock. The file backend refuses to open any file with `st_nlink > 1` as a defense.
 
 ### 7.4 Recovery
 

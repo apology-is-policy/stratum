@@ -47,6 +47,22 @@ static int file_write(void *ctx, uint64_t offset, const void *buf, uint32_t len)
 static int file_sync(void *ctx)
 {
     struct file_ctx *fc = ctx;
+#ifdef __APPLE__
+    /* On Darwin, fsync() only flushes the OS page cache; the drive's
+     * volatile write cache may still hold the data at return. A power
+     * loss then drops the "committed" transaction, and the next mount
+     * sees a torn state (old superblock vs partially-landed new nodes).
+     * F_FULLFSYNC is the documented way to issue a real disk cache
+     * flush. It's slower but is the only correct durability primitive
+     * on macOS.
+     *
+     * If F_FULLFSYNC is unsupported (rare, non-Apple filesystems
+     * mounted on macOS), fall back to fsync rather than failing — the
+     * caller will still see a successful sync but without power-loss
+     * guarantees. */
+    if (fcntl(fc->fd, F_FULLFSYNC) == 0) return 0;
+    /* fall through to fsync on ENOTSUP / EINVAL */
+#endif
     if (fsync(fc->fd) != 0)
         return -errno;
     return 0;
