@@ -199,29 +199,49 @@ static int listen_tcp(const char *host, int port)
 
 static int cmd_mkfs(int argc, char **argv)
 {
-    const char *path = NULL, *pass = NULL;
+    const char *path = NULL, *pass = NULL, *comp_name = NULL;
     uint64_t size = 0;
+    uint8_t comp_algo;
     int i;
+
+#ifdef STM_HAVE_LZ4
+    comp_algo = STM_COMP_LZ4;
+#else
+    comp_algo = STM_COMP_NONE;
+#endif
 
     for (i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--pass") == 0 && i + 1 < argc) { pass = argv[++i]; continue; }
         if (strcmp(argv[i], "--pass-stdin") == 0) { pass = read_pass_stdin(); continue; }
+        if (strcmp(argv[i], "--compress") == 0 && i + 1 < argc) { comp_name = argv[++i]; continue; }
         if (!path) path = argv[i];
         else if (!size) size = parse_size(argv[i]);
     }
 
     if (!path || !size) {
-        fprintf(stderr, "Usage: stratum mkfs <path> <size> [--pass <passphrase>]\n");
+        fprintf(stderr, "Usage: stratum mkfs <path> <size> [--pass <passphrase>] [--compress lz4|zstd|none]\n");
         fprintf(stderr, "  Size: e.g. 256M, 1G, 4096\n");
+        fprintf(stderr, "  Compression default: lz4 (if available)\n");
         return 1;
     }
 
-    int rc = stm_fs_create(path, size, pass);
+    if (comp_name) {
+        if (strcmp(comp_name, "none") == 0)      comp_algo = STM_COMP_NONE;
+        else if (strcmp(comp_name, "lz4") == 0)  comp_algo = STM_COMP_LZ4;
+        else if (strcmp(comp_name, "zstd") == 0) comp_algo = STM_COMP_ZSTD;
+        else { fprintf(stderr, "Unknown --compress value: %s (use lz4, zstd, or none)\n", comp_name); return 1; }
+    }
+
+    int rc = stm_fs_create_ex(path, size, pass, comp_algo);
     if (rc) {
         fprintf(stderr, "mkfs failed: %s\n", strerror(-rc));
         return 1;
     }
-    printf("Created %s (%.1f MiB)\n", path, (double)size / (1024 * 1024));
+    const char *cn = comp_algo == STM_COMP_LZ4  ? "lz4"
+                   : comp_algo == STM_COMP_ZSTD ? "zstd"
+                   : "none";
+    printf("Created %s (%.1f MiB, compress=%s)\n",
+           path, (double)size / (1024 * 1024), cn);
     return 0;
 }
 
@@ -320,13 +340,43 @@ static int cmd_info(int argc, char **argv)
         return 1;
     }
 
+    /* Read superblock first so we can show metadata without mounting. */
+    {
+        struct stm_block_dev dev;
+        struct stm_superblock sa, sb, *chosen;
+        int a_ok, b_ok;
+        if (stm_file_backend_open(path, 0, 0, &dev) == 0) {
+            stm_block_read(&dev, STM_SB_OFFSET_A, &sa, sizeof(sa));
+            stm_block_read(&dev, STM_SB_OFFSET_B, &sb, sizeof(sb));
+            a_ok = (le64_to_cpu(sa.ss_magic) == STM_MAGIC);
+            b_ok = (le64_to_cpu(sb.ss_magic) == STM_MAGIC);
+            chosen = (a_ok && (!b_ok || le64_to_cpu(sa.ss_gen) >= le64_to_cpu(sb.ss_gen))) ? &sa
+                   : b_ok ? &sb : NULL;
+            if (chosen) {
+                const char *enc = chosen->ss_enc_algo == STM_ENC_XCHACHA ? "XChaCha20-Poly1305"
+                                : chosen->ss_enc_algo == STM_ENC_PQ      ? "ML-KEM + XChaCha20"
+                                : "none";
+                const char *comp = chosen->ss_comp_algo == STM_COMP_LZ4  ? "lz4"
+                                 : chosen->ss_comp_algo == STM_COMP_ZSTD ? "zstd"
+                                 : "none";
+                uint64_t blocks = le64_to_cpu(chosen->ss_total_blocks);
+                printf("Stratum filesystem: %s\n", path);
+                printf("  Size:        %llu blocks (%.1f MiB)\n",
+                       (unsigned long long)blocks,
+                       (double)blocks * STM_BLOCK_SIZE / (1024.0 * 1024.0));
+                printf("  Generation:  %llu\n", (unsigned long long)le64_to_cpu(chosen->ss_gen));
+                printf("  Encryption:  %s\n", enc);
+                printf("  Compression: %s\n", comp);
+            }
+            stm_block_close(&dev);
+        }
+    }
+
     rc = stm_fs_open(path, pass, &fs);
     if (rc) {
         fprintf(stderr, "open failed: %s\n", strerror(-rc));
         return 1;
     }
-
-    printf("Stratum filesystem: %s\n", path);
 
     /* list snapshots */
     printf("\nSnapshots:\n");

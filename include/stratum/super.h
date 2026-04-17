@@ -50,6 +50,10 @@ struct __attribute__((packed)) stm_superblock {
     uint8_t ss_enc_wrapped_key[64];           /*  64 */
     uint8_t ss_enc_nonce[24];                 /*  24 */
 
+    /* Compression (STM_COMP_*). Applies to file-data extents.
+     * 0 = none, 1 = LZ4, 2 = ZSTD. */
+    uint8_t ss_comp_algo;                     /*   1 */
+
     /* Allocator state */
     le64    ss_alloc_next;                    /*   8 */
 
@@ -61,7 +65,7 @@ struct __attribute__((packed)) stm_superblock {
     uint8_t ss_csum[STM_BLAKE3_LEN];         /*  32 */
 
     /* Pad to 512 bytes */
-    uint8_t ss_reserved[112];                 /* 112 */
+    uint8_t ss_reserved[111];                 /* 111 */
 };
 
 STM_STATIC_ASSERT(sizeof(struct stm_superblock) == 512, stm_superblock_size);

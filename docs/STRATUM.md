@@ -163,11 +163,12 @@ Offset Size   Field                     Notes
 230     32     u8[32]  ss_enc_kdf_salt   Argon2id salt
 262     64     u8[64]  ss_enc_wrapped_key  DEK wrapped with KEK (48B used)
 326     24     u8[24]  ss_enc_nonce      nonce used to wrap DEK
-350     8      le64    ss_alloc_next     legacy bump-allocator cursor
-358     2      le16    ss_snap_height    height of snap tree
-360     8      le64    ss_next_snap_id   next snapshot id
-368     32     u8[32]  ss_csum           xxHash3-128 + zero padding
-400     112    u8[112] ss_reserved       padding
+350     1      u8      ss_comp_algo      0=none, 1=LZ4, 2=ZSTD (file-data)
+351     8      le64    ss_alloc_next     legacy bump-allocator cursor
+359     2      le16    ss_snap_height    height of snap tree
+361     8      le64    ss_next_snap_id   next snapshot id
+369     32     u8[32]  ss_csum           xxHash3-128 + zero padding
+401     111    u8[111] ss_reserved       padding
 ```
 
 ### 2.4 `struct stm_bptr` (57 bytes)
@@ -457,13 +458,29 @@ Each Bε-tree node is compressed on write, recorded in `bp_comp` / `bp_csize` / 
 
 File-data extents go through the same pipeline: every extent is trial-compressed on write, kept compressed only if it shrinks. The algorithm and stored length are persisted alongside the extent record (`se_clen_and_comp`). Mixed compression within a single file is fine — each extent decodes independently.
 
-Default is LZ4 (fast, good-enough ratio). ZSTD is available at compile time but not wired into the default `fs->comp_algo` — switching is a one-line change if a volume wants denser packing at higher CPU cost.
+Default is LZ4 (fast, good-enough ratio). ZSTD is available when built with `STM_HAVE_ZSTD` and can be selected at mkfs time.
 
-### 10.3 Observed results
+### 10.3 Per-volume selection
 
-On a volume with 10 MiB of repeating-text payload stored in 80 extents:
-- Raw: 2560 blocks (10 MiB) allocated for data
-- LZ4-compressed: 83 blocks (~332 KiB) allocated — a ~30× reduction
+The algorithm is chosen at `mkfs` and persisted in `ss_comp_algo` in the superblock:
+
+```
+stratum mkfs <path> <size> [--compress lz4|zstd|none]
+```
+
+Default: `lz4` when the build has LZ4, else `none`. The choice is stable for the life of the volume — `stm_fs_open` reads `ss_comp_algo` and refuses to mount if the codec isn't compiled into the current binary (otherwise existing compressed extents would be unreadable).
+
+Because every `stm_extent` carries its own `comp` byte, a volume that is later "re-created" with a different default still reads cleanly — each extent decodes via its own persisted algo.
+
+### 10.4 Observed results
+
+On a volume with 45 MiB of repeating-text payload:
+
+| mkfs flag | Blocks used | Ratio |
+| --- | --- | --- |
+| `--compress none` | 10993 (~43 MiB) | 1.0× |
+| `--compress lz4`  | 347 (~1.4 MiB)   | ~31× |
+| `--compress zstd` | 347 (~1.4 MiB)   | ~31× |
 
 Incompressible data (random bytes, pre-compressed archives) pays a few microseconds per extent for the trial-compress, then falls back to raw storage. The `se_clen == se_dlen`, `comp == NONE` invariant is verified by `stratum check`.
 
@@ -548,7 +565,7 @@ Standard 9P2000: Tversion, Tattach, Twalk, Topen, Tcreate, Tread, Twrite, Tclunk
 ## 14. CLI (stratum binary)
 
 ```
-stratum mkfs  <path> <size>  [--pass <p>|--pass-stdin]
+stratum mkfs  <path> <size>  [--pass <p>|--pass-stdin] [--compress lz4|zstd|none]
 stratum serve <path>          [--pass <p>|--pass-stdin] [--listen <addr>]
 stratum info  <path>          [--pass <p>|--pass-stdin]
 stratum check <path>          [--pass <p>|--pass-stdin]

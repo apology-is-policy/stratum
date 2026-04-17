@@ -160,6 +160,16 @@ static uint64_t alloc_ino(struct stm_fs *fs)
 int stm_fs_create(const char *path, uint64_t size_bytes,
                   const char *passphrase)
 {
+#ifdef STM_HAVE_LZ4
+    return stm_fs_create_ex(path, size_bytes, passphrase, STM_COMP_LZ4);
+#else
+    return stm_fs_create_ex(path, size_bytes, passphrase, STM_COMP_NONE);
+#endif
+}
+
+int stm_fs_create_ex(const char *path, uint64_t size_bytes,
+                     const char *passphrase, uint8_t comp_algo)
+{
     struct stm_block_dev dev;
     struct stm_btree *tree = NULL;
     struct stm_bptr null_root = stm_bptr_null();
@@ -168,6 +178,19 @@ int stm_fs_create(const char *path, uint64_t size_bytes,
     struct stm_key k;
     uint64_t ts; uint32_t tns;
     int rc;
+
+    /* Reject codecs not compiled into this build. */
+    if (comp_algo == STM_COMP_LZ4) {
+#ifndef STM_HAVE_LZ4
+        return -ENOTSUP;
+#endif
+    } else if (comp_algo == STM_COMP_ZSTD) {
+#ifndef STM_HAVE_ZSTD
+        return -ENOTSUP;
+#endif
+    } else if (comp_algo != STM_COMP_NONE) {
+        return -EINVAL;
+    }
 
     rc = stm_file_backend_open(path, 1, size_bytes, &dev);
     if (rc) return rc;
@@ -246,6 +269,7 @@ int stm_fs_create(const char *path, uint64_t size_bytes,
     sb.ss_alloc_next   = cpu_to_le64(stm_btree_next_alloc(tree));
     sb.ss_snap_height  = cpu_to_le16(0);
     sb.ss_next_snap_id = cpu_to_le64(1);
+    sb.ss_comp_algo    = comp_algo;
 
     memset(sb.ss_csum, 0, sizeof(sb.ss_csum));
     stm_csum_compute(&sb, sizeof(sb), sb.ss_csum);
@@ -381,11 +405,27 @@ int stm_fs_open(const char *path, const char *passphrase, struct stm_fs **out)
     /* Allocate reusable scratch buffers for extent I/O */
     fs->extent_buf = malloc(STM_EXTENT_SIZE);
     fs->cipher_buf = malloc(STM_EXTENT_SIZE + STM_CRYPTO_TAG_LEN);
-#ifdef STM_HAVE_LZ4
-    fs->comp_algo = STM_COMP_LZ4;
-#else
-    fs->comp_algo = STM_COMP_NONE;
+
+    /* Compression algo from superblock. Refuse to mount if the persisted
+     * codec isn't in this build — otherwise we'd silently fail to decode
+     * existing compressed extents. */
+    fs->comp_algo = chosen->ss_comp_algo;
+    if (fs->comp_algo == STM_COMP_LZ4) {
+#ifndef STM_HAVE_LZ4
+        stm_alloc_close(fs->alloc); stm_btree_close(fs->snap_tree);
+        stm_btree_close(fs->tree); stm_block_close(&fs->dev);
+        free(fs->extent_buf); free(fs->cipher_buf); free(fs);
+        return -ENOTSUP;
 #endif
+    } else if (fs->comp_algo == STM_COMP_ZSTD) {
+#ifndef STM_HAVE_ZSTD
+        stm_alloc_close(fs->alloc); stm_btree_close(fs->snap_tree);
+        stm_btree_close(fs->tree); stm_block_close(&fs->dev);
+        free(fs->extent_buf); free(fs->cipher_buf); free(fs);
+        return -ENOTSUP;
+#endif
+    }
+
     {
         /* comp_buf sized to hold worst-case compressed output for any extent */
         uint32_t cbound = STM_EXTENT_SIZE;
@@ -447,6 +487,7 @@ int stm_fs_sync(struct stm_fs *fs)
     memcpy(sb.ss_enc_kdf_salt, fs->enc_kdf_salt, sizeof(sb.ss_enc_kdf_salt));
     memcpy(sb.ss_enc_wrapped_key, fs->enc_wrapped_key, sizeof(sb.ss_enc_wrapped_key));
     memcpy(sb.ss_enc_nonce, fs->enc_nonce, sizeof(sb.ss_enc_nonce));
+    sb.ss_comp_algo    = fs->comp_algo;
 
     /* Compute superblock checksum (over everything except the csum field itself) */
     memset(sb.ss_csum, 0, sizeof(sb.ss_csum));

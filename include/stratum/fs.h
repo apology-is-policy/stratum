@@ -29,6 +29,11 @@ struct stm_fs;
 /* passphrase may be NULL (no encryption). */
 int  stm_fs_create(const char *path, uint64_t size_bytes,
                    const char *passphrase);
+
+/* Extended mkfs: also selects compression for file-data extents.
+ * `comp_algo` is one of STM_COMP_NONE / STM_COMP_LZ4 / STM_COMP_ZSTD. */
+int  stm_fs_create_ex(const char *path, uint64_t size_bytes,
+                      const char *passphrase, uint8_t comp_algo);
 int  stm_fs_open(const char *path, const char *passphrase,
                  struct stm_fs **fs);
 int  stm_fs_sync(struct stm_fs *fs);
