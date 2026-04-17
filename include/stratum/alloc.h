@@ -32,4 +32,8 @@ void stm_alloc_commit(struct stm_alloc *a);
 uint64_t stm_alloc_free_count(struct stm_alloc *a);
 uint64_t stm_alloc_total(struct stm_alloc *a);
 
+/* Read the raw refcount of a block. 0 = free, 0xFFFF = REFCOUNT_PENDING
+ * (freed this sync, not yet reclaimed). Out-of-bounds returns 0. */
+uint16_t stm_alloc_get_refcount(struct stm_alloc *a, uint64_t block_nr);
+
 #endif /* STM_ALLOC_H */

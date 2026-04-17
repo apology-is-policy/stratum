@@ -440,22 +440,11 @@ static int cmd_snap(int argc, char **argv)
     return rc ? 1 : 0;
 }
 
-/* ── check (fsck) ──────────────────────────────────────────────────── */
+/* ── check (fsck) — lives in check.c ───────────────────────────────── */
 
-static const char *human_size_buf(uint64_t bytes);  /* forward decl */
+int stm_cmd_check(int argc, char **argv);
 
-struct check_ctx {
-    struct stm_fs *fs;
-    uint64_t dev_blocks;
-    int errors;
-    int warnings;
-    uint64_t node_count;
-    uint64_t entry_count;
-    uint64_t extent_count;
-    uint64_t extent_bytes;
-    uint64_t inode_count;
-};
-
+#if 0  /* moved to src/cmd/check.c */
 static int check_node_cb(uint64_t paddr, uint32_t csize, void *ctx)
 {
     struct check_ctx *c = ctx;
@@ -681,17 +670,7 @@ static int cmd_check(int argc, char **argv)
     stm_fs_close(fs);
     return ctx.errors > 0 ? 1 : 0;
 }
-
-static const char *human_size_buf(uint64_t bytes)
-{
-    static char buf[32];
-    const char *units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
-    double val = (double)bytes;
-    int u = 0;
-    while (val >= 1024.0 && u < 4) { val /= 1024.0; u++; }
-    snprintf(buf, sizeof(buf), "%.1f %s", val, units[u]);
-    return buf;
-}
+#endif  /* end old check — moved to src/cmd/check.c */
 
 /* ── main ───────────────────────────────────────────────────────────── */
 
@@ -719,7 +698,7 @@ int main(int argc, char **argv)
     if (strcmp(cmd, "mkfs") == 0)  return cmd_mkfs(argc - 2, argv + 2);
     if (strcmp(cmd, "serve") == 0) return cmd_serve(argc - 2, argv + 2);
     if (strcmp(cmd, "info") == 0)  return cmd_info(argc - 2, argv + 2);
-    if (strcmp(cmd, "check") == 0) return cmd_check(argc - 2, argv + 2);
+    if (strcmp(cmd, "check") == 0) return stm_cmd_check(argc - 2, argv + 2);
     if (strcmp(cmd, "snap") == 0)  return cmd_snap(argc - 2, argv + 2);
     if (strcmp(cmd, "help") == 0 || strcmp(cmd, "--help") == 0) { usage(); return 0; }
 

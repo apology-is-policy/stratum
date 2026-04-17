@@ -232,3 +232,9 @@ uint64_t stm_alloc_total(struct stm_alloc *a)
 {
     return a->total;
 }
+
+uint16_t stm_alloc_get_refcount(struct stm_alloc *a, uint64_t block_nr)
+{
+    if (block_nr >= a->total) return 0;
+    return a->refcounts[block_nr];
+}
