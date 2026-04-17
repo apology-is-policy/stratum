@@ -100,19 +100,31 @@ int stm_msg_flush_child(struct stm_node *parent, uint32_t child_idx,
         }
 
         if (child->flags & STM_NODE_LEAF) {
-            /* apply directly to leaf */
+            int frc = 0;
             if (parent->msgs[i].op == STM_MSG_INSERT)
-                stm_leaf_insert(child, &parent->msgs[i].key,
-                                parent->msgs[i].val, parent->msgs[i].vlen);
+                frc = stm_leaf_insert(child, &parent->msgs[i].key,
+                                      parent->msgs[i].val, parent->msgs[i].vlen);
             else if (parent->msgs[i].op == STM_MSG_DELETE)
-                stm_leaf_delete(child, &parent->msgs[i].key);
-            /* message consumed */
+                frc = stm_leaf_delete(child, &parent->msgs[i].key);
+            if (frc && frc != -ENOENT) {
+                /* Insert/delete failed (OOM) — keep message in parent */
+                if (kept != i) parent->msgs[kept] = parent->msgs[i];
+                new_msg_bytes += parent->msgs[i].vlen;
+                kept++;
+                continue;
+            }
             free(parent->msgs[i].val);
         } else {
-            /* add to child's buffer (makes its own copy) */
-            stm_msg_insert(child, &parent->msgs[i].key,
-                           parent->msgs[i].op, parent->msgs[i].gen,
-                           parent->msgs[i].val, parent->msgs[i].vlen);
+            int frc = stm_msg_insert(child, &parent->msgs[i].key,
+                                     parent->msgs[i].op, parent->msgs[i].gen,
+                                     parent->msgs[i].val, parent->msgs[i].vlen);
+            if (frc) {
+                /* Failed to buffer in child — keep in parent */
+                if (kept != i) parent->msgs[kept] = parent->msgs[i];
+                new_msg_bytes += parent->msgs[i].vlen;
+                kept++;
+                continue;
+            }
             free(parent->msgs[i].val);
         }
     }

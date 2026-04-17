@@ -58,9 +58,10 @@ void stm_alloc_mark(struct stm_alloc *a, uint64_t block_nr, uint32_t count)
 {
     uint32_t i;
     for (i = 0; i < count && block_nr + i < a->total; i++) {
-        if (a->refcounts[block_nr + i] == 0)
-            a->free_count--;
-        a->refcounts[block_nr + i]++;
+        uint16_t rc = a->refcounts[block_nr + i];
+        if (rc == 0) a->free_count--;
+        if (rc < REFCOUNT_PENDING - 1) /* clamp to avoid colliding with sentinel */
+            a->refcounts[block_nr + i]++;
     }
 }
 
@@ -177,16 +178,20 @@ void stm_alloc_free(struct stm_alloc *a, uint64_t block_nr, uint32_t count)
              * reuse this block before the superblock commits.
              * Use a sentinel so the scan skips it.
              */
-            a->refcounts[b] = REFCOUNT_PENDING;
             if (a->ndeferred >= a->deferred_cap) {
-                uint32_t nc = a->deferred_cap * 2;
+                uint32_t nc = a->deferred_cap ? a->deferred_cap * 2 : 256;
                 struct deferred_free *nd = realloc(a->deferred, nc * sizeof(*nd));
                 if (nd) { a->deferred = nd; a->deferred_cap = nc; }
             }
             if (a->ndeferred < a->deferred_cap) {
+                a->refcounts[b] = REFCOUNT_PENDING;
                 a->deferred[a->ndeferred].block_nr = b;
                 a->deferred[a->ndeferred].count = 1;
                 a->ndeferred++;
+            } else {
+                /* Cannot record deferred free — revert to keep refcount
+                 * consistent. Block leaks until next mount rebuild. */
+                a->refcounts[b] = 1;
             }
         }
     }
@@ -196,7 +201,8 @@ void stm_alloc_ref(struct stm_alloc *a, uint64_t block_nr, uint32_t count)
 {
     uint32_t i;
     for (i = 0; i < count && block_nr + i < a->total; i++) {
-        a->refcounts[block_nr + i]++;
+        if (a->refcounts[block_nr + i] < REFCOUNT_PENDING - 1)
+            a->refcounts[block_nr + i]++;
     }
 }
 

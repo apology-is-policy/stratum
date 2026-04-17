@@ -269,6 +269,12 @@ static int h_walk(struct stm_9p *s, const uint8_t *body, uint16_t tag,
     if (nwname > 0 && nwqid == 0)
         return resp_error(resp, resp_len, tag, "file not found");
 
+    /* Partial walk (some but not all components found): per 9P2000 spec,
+     * newfid is only affected when nwqid == nwname. Don't create a fid
+     * at the intermediate path — it confuses clients. */
+    if (nwname > 0 && nwqid < nwname && newfid != fid)
+        return resp_error(resp, resp_len, tag, "file not found");
+
     /* allocate or clone fid */
     if (newfid == fid) {
         nf = f;

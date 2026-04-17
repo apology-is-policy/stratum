@@ -7,6 +7,32 @@
 #define mk_key   stm_mk_key
 #define fnv1a    stm_fnv1a
 
+/* allocator mark callbacks (for rollback rebuild) */
+static int mark_block_snap(uint64_t paddr, uint32_t csize, void *ctx)
+{
+    struct stm_fs *fs = ctx;
+    uint32_t nb = (csize + STM_BLOCK_SIZE - 1) / STM_BLOCK_SIZE;
+    stm_alloc_mark(fs->alloc, paddr / STM_BLOCK_SIZE, nb);
+    return 0;
+}
+
+static int mark_extent_snap(const struct stm_key *key, const void *val,
+                            uint32_t vlen, void *ctx)
+{
+    struct stm_fs *fs = ctx;
+    struct stm_key_cpu kc = stm_key_to_cpu(key);
+    if (kc.type != STM_KEY_DATA || vlen != sizeof(struct stm_extent))
+        return 0;
+    struct stm_extent ext;
+    memcpy(&ext, val, sizeof(ext));
+    struct stm_crypto *crypto = stm_btree_get_crypto(fs->tree);
+    uint32_t dlen = le32_to_cpu(ext.se_dlen);
+    uint32_t disk_len = crypto ? (dlen + STM_CRYPTO_TAG_LEN) : dlen;
+    uint32_t nb = (disk_len + STM_BLOCK_SIZE - 1) / STM_BLOCK_SIZE;
+    stm_alloc_mark(fs->alloc, le64_to_cpu(ext.se_paddr) / STM_BLOCK_SIZE, nb);
+    return 0;
+}
+
 /* allocator callbacks for snapshot refcount management */
 static int ref_block_fs(uint64_t paddr, uint32_t csize, void *ctx)
 {
@@ -286,6 +312,29 @@ int stm_snap_rollback(struct stm_fs *fs, uint64_t snap_id)
         fs->snap_tree ? stm_btree_next_alloc(fs->snap_tree)
                       : stm_btree_next_alloc(fs->tree));
     stm_fs_configure_tree(fs, fs->tree);
+
+    /* Rebuild allocator for the restored tree — old refcounts are stale.
+     * Without this, the allocator thinks pre-rollback blocks are in use
+     * and the restored tree's blocks are free → double allocation. */
+    if (fs->alloc) {
+        uint64_t dev_bytes = 0;
+        stm_alloc_close(fs->alloc);
+        fs->alloc = NULL;
+        stm_block_size(&fs->dev, &dev_bytes);
+        rc = stm_alloc_open(&fs->dev, dev_bytes / STM_BLOCK_SIZE, &fs->alloc);
+        if (rc) return rc;
+        stm_alloc_mark(fs->alloc, 0, 2); /* superblocks */
+        stm_btree_walk_entries(fs->tree, stm_btree_root(fs->tree),
+                               mark_block_snap, mark_extent_snap, fs);
+        if (fs->snap_tree) {
+            stm_btree_walk_entries(fs->snap_tree, stm_btree_root(fs->snap_tree),
+                                   mark_block_snap, mark_extent_snap, fs);
+        }
+        stm_alloc_commit(fs->alloc);
+        stm_btree_set_allocator(fs->tree, fs->alloc);
+        if (fs->snap_tree)
+            stm_btree_set_allocator(fs->snap_tree, fs->alloc);
+    }
 
     return 0;
 }

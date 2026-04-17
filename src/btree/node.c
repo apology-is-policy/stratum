@@ -128,10 +128,14 @@ int stm_node_encode(const struct stm_node *n, uint8_t *buf,
         hdr.sn_data_bytes = cpu_to_le32(0);
 
         for (i = 0; i < n->nkeys; i++) {
+            if ((uint32_t)(p - buf) + sizeof(struct stm_key) > STM_NODE_SIZE)
+                return -ENOSPC;
             memcpy(p, &n->pivots[i], sizeof(struct stm_key));
             p += sizeof(struct stm_key);
         }
         for (i = 0; i <= n->nkeys; i++) {
+            if ((uint32_t)(p - buf) + sizeof(struct stm_bptr) > STM_NODE_SIZE)
+                return -ENOSPC;
             memcpy(p, &n->children[i], sizeof(struct stm_bptr));
             p += sizeof(struct stm_bptr);
         }
