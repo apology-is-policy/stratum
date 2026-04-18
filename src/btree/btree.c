@@ -445,28 +445,53 @@ static int flush_node(struct stm_btree *tree, struct stm_node *parent)
 static int split_root(struct stm_btree *tree, uint64_t gen)
 {
     struct stm_key split_key;
-    struct stm_node *right = NULL, *new_root;
+    struct stm_node *left = NULL, *right = NULL, *new_root = NULL;
     struct stm_bptr lbp, rbp;
     int rc;
 
-    if (tree->root->flags & STM_NODE_LEAF)
-        rc = stm_leaf_split(tree->root, &split_key, &right);
-    else
-        rc = stm_internal_split(tree->root, &split_key, &right);
-    if (rc) return rc;
+    /* Work on a CLONE of tree->root. Without this, any allocation or
+     * disk write failure below leaves tree->root truncated (leaf/internal
+     * split mutates the source node destructively, shallow-copying val
+     * pointers into `right`; freeing `right` frees those vals out from
+     * under the original root). The next sync would then commit the
+     * truncated root → silent data loss on an op that returned an error.
+     * With the clone, any failure leaves tree->root fully intact. */
+    left = stm_node_clone(tree->root);
+    if (!left) return -ENOMEM;
 
-    new_root = stm_node_alloc_internal(tree->root->level + 1, gen);
-    if (!new_root) { stm_node_free(right); return -ENOMEM; }
+    if (left->flags & STM_NODE_LEAF)
+        rc = stm_leaf_split(left, &split_key, &right);
+    else
+        rc = stm_internal_split(left, &split_key, &right);
+    if (rc) { stm_node_free(left); return rc; }
+
+    new_root = stm_node_alloc_internal(left->level + 1, gen);
+    if (!new_root) {
+        stm_node_free(right); stm_node_free(left); return -ENOMEM;
+    }
     new_root->flags |= STM_NODE_ROOT;
 
-    rc = stm_btree_write_node(tree, tree->root, &lbp);
-    if (rc) { stm_node_free(right); stm_node_free(new_root); return rc; }
+    /* Pre-reserve new_root's pivot/children cap (same defense as the
+     * #R3-1 fix in split_child): insert_pivot-at-end must not be
+     * the step that trips ENOMEM after disk writes have committed. */
+    rc = ensure_key_cap(new_root, 1);
+    if (rc) {
+        stm_node_free(new_root);
+        stm_node_free(right); stm_node_free(left);
+        return rc;
+    }
+
+    rc = stm_btree_write_node(tree, left, &lbp);
+    if (rc) {
+        stm_node_free(new_root);
+        stm_node_free(right); stm_node_free(left);
+        return rc;
+    }
     rc = stm_btree_write_node(tree, right, &rbp);
     stm_node_free(right);
     if (rc) {
-        /* lbp was written to disk but the new_root that would have
-         * pointed at it is being abandoned. Return lbp's blocks to the
-         * allocator so they don't leak until the next mount's walk. */
+        /* lbp was written to disk; no parent will reference it. Return
+         * its blocks to the allocator so they don't leak. */
         if (tree->alloc) {
             uint64_t lpaddr = le64_to_cpu(lbp.bp_paddr);
             uint32_t lcsize = le32_to_cpu(lbp.bp_csize);
@@ -474,15 +499,19 @@ static int split_root(struct stm_btree *tree, uint64_t gen)
             stm_alloc_free(tree->alloc, lpaddr / STM_BLOCK_SIZE, nblk);
         }
         stm_node_free(new_root);
+        stm_node_free(left);
         return rc;
     }
 
+    /* Everything succeeded. Wire up new_root and swap. */
     new_root->pivots[0]   = split_key;
-    new_root->nkeys        = 1;
-    new_root->children[0]  = lbp;
-    new_root->children[1]  = rbp;
+    new_root->nkeys       = 1;
+    new_root->children[0] = lbp;
+    new_root->children[1] = rbp;
+    new_root->dirty       = 1;
 
-    stm_node_free(tree->root);
+    stm_node_free(left);           /* in-memory clone; disk copy at lbp lives on */
+    stm_node_free(tree->root);     /* old in-memory root; bptr freed at next flush */
     tree->root = new_root;
     tree->height++;
     return 0;

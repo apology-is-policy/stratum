@@ -190,6 +190,77 @@ int ensure_msg_cap(struct stm_node *n, uint32_t need)
     return 0;
 }
 
+/* Deep-copy a node. Used by split_root so an in-progress split can be
+ * abandoned without having mutated the live tree->root. Returns NULL on
+ * any allocation failure, leaving no partial state. */
+struct stm_node *stm_node_clone(const struct stm_node *src)
+{
+    struct stm_node *n;
+
+    if (src->flags & STM_NODE_LEAF) {
+        n = stm_node_alloc_leaf(src->gen);
+        if (!n) return NULL;
+        n->flags = src->flags;
+        if (ensure_entry_cap(n, src->nentries ? src->nentries : 1)) {
+            stm_node_free(n); return NULL;
+        }
+        for (uint32_t i = 0; i < src->nentries; i++) {
+            n->entries[i].key  = src->entries[i].key;
+            n->entries[i].vlen = src->entries[i].vlen;
+            n->entries[i].val  = NULL;
+            if (src->entries[i].vlen) {
+                n->entries[i].val = malloc(src->entries[i].vlen);
+                if (!n->entries[i].val) {
+                    n->nentries = i;
+                    stm_node_free(n);
+                    return NULL;
+                }
+                memcpy(n->entries[i].val, src->entries[i].val, src->entries[i].vlen);
+            }
+        }
+        n->nentries   = src->nentries;
+        n->data_bytes = src->data_bytes;
+        return n;
+    }
+
+    n = stm_node_alloc_internal(src->level, src->gen);
+    if (!n) return NULL;
+    n->flags = src->flags;
+    if (ensure_key_cap(n, src->nkeys ? src->nkeys : 1)) {
+        stm_node_free(n); return NULL;
+    }
+    if (ensure_msg_cap(n, src->nmsgs ? src->nmsgs : 1)) {
+        stm_node_free(n); return NULL;
+    }
+    if (src->nkeys) {
+        memcpy(n->pivots,   src->pivots,   src->nkeys * sizeof(*src->pivots));
+        memcpy(n->children, src->children, (src->nkeys + 1) * sizeof(*src->children));
+    } else if (src->children) {
+        /* Empty internal node still has children[0]. */
+        n->children[0] = src->children[0];
+    }
+    for (uint32_t i = 0; i < src->nmsgs; i++) {
+        n->msgs[i].key  = src->msgs[i].key;
+        n->msgs[i].op   = src->msgs[i].op;
+        n->msgs[i].gen  = src->msgs[i].gen;
+        n->msgs[i].vlen = src->msgs[i].vlen;
+        n->msgs[i].val  = NULL;
+        if (src->msgs[i].vlen) {
+            n->msgs[i].val = malloc(src->msgs[i].vlen);
+            if (!n->msgs[i].val) {
+                n->nmsgs = i;
+                stm_node_free(n);
+                return NULL;
+            }
+            memcpy(n->msgs[i].val, src->msgs[i].val, src->msgs[i].vlen);
+        }
+    }
+    n->nkeys     = src->nkeys;
+    n->nmsgs     = src->nmsgs;
+    n->msg_bytes = src->msg_bytes;
+    return n;
+}
+
 int ensure_key_cap(struct stm_node *n, uint32_t need)
 {
     uint32_t cap = n->keys_cap;

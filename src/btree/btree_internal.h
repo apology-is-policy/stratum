@@ -82,6 +82,7 @@ struct stm_btree {
 
 struct stm_node *stm_node_alloc_leaf(uint64_t gen);
 struct stm_node *stm_node_alloc_internal(uint16_t level, uint64_t gen);
+struct stm_node *stm_node_clone(const struct stm_node *src);
 void             stm_node_free(struct stm_node *n);
 
 int      stm_node_encode(const struct stm_node *n, uint8_t *buf,
