@@ -83,12 +83,23 @@ static int try_grow(struct stm_alloc *a)
     }
     new_size  = new_total * STM_BLOCK_SIZE;
 
-    if (a->dev->ops->resize(a->dev->ctx, new_size) != 0)
-        return -ENOSPC;
-
+    /* Grow the refcount array FIRST. If this fails we haven't touched
+     * the backing file, so there's no leaked disk space to clean up.
+     * (Old order was ftruncate → realloc, which on realloc-fail left
+     * the backing file permanently enlarged with no allocator visibility
+     * into the new blocks.) */
     nr = realloc(a->refcounts, new_total * sizeof(uint16_t));
     if (!nr) return -ENOMEM;
     memset(nr + a->total, 0, (size_t)(new_total - a->total) * sizeof(uint16_t));
+
+    if (a->dev->ops->resize(a->dev->ctx, new_size) != 0) {
+        /* Shrink the array back so we don't silently keep the bigger
+         * buffer on the next attempt. */
+        uint16_t *shrink = realloc(nr, a->total * sizeof(uint16_t));
+        a->refcounts = shrink ? shrink : nr;
+        return -ENOSPC;
+    }
+
     a->refcounts = nr;
     a->free_count += new_total - a->total;
     a->total = new_total;
