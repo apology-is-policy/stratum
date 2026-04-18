@@ -579,10 +579,24 @@ int stm_btree_flush(struct stm_btree *tree)
 /* ── range scan ─────────────────────────────────────────────────────── */
 
 /*
- * Collect pending INSERT messages in [lo, hi) from an internal node.
- * Returns a malloc'd array (caller frees), sorted by key.
+ * Collect pending INSERT and DELETE messages in [lo, hi) from an
+ * internal node, deduped by key (keeping the highest-gen message per
+ * key). Returns a malloc'd array (caller frees), sorted by key.
+ *
+ * Messages in a node's buffer are sorted by (key, gen ASC) — see
+ * msg.c — so a contiguous run of same-key entries has the newest at
+ * the end; overwriting the running tail gives us the latest op.
+ *
+ * DELETEs must be included so scan can correctly shadow leaf entries
+ * that have a pending DELETE in an ancestor buffer.
  */
-struct pending_msg { struct stm_key key; const void *val; uint32_t vlen; };
+struct pending_msg {
+    struct stm_key key;
+    const void *val;
+    uint32_t    vlen;
+    uint8_t     op;
+    uint64_t    gen;
+};
 
 static int collect_pending(const struct stm_node *node,
                            const struct stm_key *lo, const struct stm_key *hi,
@@ -592,35 +606,37 @@ static int collect_pending(const struct stm_node *node,
     struct pending_msg *msgs = NULL;
 
     for (i = 0; i < node->nmsgs; i++) {
-        if (node->msgs[i].op != STM_MSG_INSERT) continue;
+        uint8_t op = node->msgs[i].op;
+        if (op != STM_MSG_INSERT && op != STM_MSG_DELETE) continue;
         if (stm_key_cmp(&node->msgs[i].key, lo) < 0) continue;
         if (stm_key_cmp(&node->msgs[i].key, hi) >= 0) continue;
+
+        /* Same-key dedup: if the running tail has the same key, this
+         * entry is newer (msgs are sorted gen ASC within a key), so
+         * replace rather than append. */
+        if (n > 0 && stm_key_cmp(&msgs[n - 1].key, &node->msgs[i].key) == 0) {
+            msgs[n - 1].val  = node->msgs[i].val;
+            msgs[n - 1].vlen = node->msgs[i].vlen;
+            msgs[n - 1].op   = op;
+            msgs[n - 1].gen  = node->msgs[i].gen;
+            continue;
+        }
+
         if (n >= cap) {
             cap = cap ? cap * 2 : 16;
             struct pending_msg *tmp = realloc(msgs, cap * sizeof(*tmp));
             if (!tmp) { free(msgs); return -ENOMEM; }
             msgs = tmp;
         }
-        msgs[n].key = node->msgs[i].key;
-        msgs[n].val = node->msgs[i].val;
+        msgs[n].key  = node->msgs[i].key;
+        msgs[n].val  = node->msgs[i].val;
         msgs[n].vlen = node->msgs[i].vlen;
+        msgs[n].op   = op;
+        msgs[n].gen  = node->msgs[i].gen;
         n++;
     }
     *out = msgs;
     *out_n = n;
-    return 0;
-}
-
-/* Check if a key has a pending DELETE in any ancestor's message buffer. */
-static int is_deleted(const struct stm_node *node,
-                      const struct stm_key *key)
-{
-    uint32_t i;
-    for (i = 0; i < node->nmsgs; i++) {
-        if (node->msgs[i].op == STM_MSG_DELETE &&
-            stm_key_cmp(&node->msgs[i].key, key) == 0)
-            return 1;
-    }
     return 0;
 }
 
@@ -634,7 +650,13 @@ static int scan_rec(struct stm_btree *tree, struct stm_node *node,
 
     if (node->flags & STM_NODE_LEAF) {
         /* Merge leaf entries with ancestor pending messages.
-         * Both are sorted by key — do a merge-scan. */
+         * Both are sorted by key — do a merge-scan.
+         *
+         * ancestor_msgs is deduped per key (one entry per key) and carries
+         * an op tag, so at the leaf level we just dispatch:
+         *   - INSERT  : emit the pending value (overrides any leaf entry)
+         *   - DELETE  : suppress emission (shadows any leaf entry)
+         */
         uint32_t li = 0, pi = 0;
         stm_leaf_find(node, lo, &li);
 
@@ -648,27 +670,23 @@ static int scan_rec(struct stm_btree *tree, struct stm_node *node,
             if (!lk && !pk) break;
 
             if (lk && pk && stm_key_cmp(lk, pk) == 0) {
-                /* Pending message overrides leaf — use pending (newer) */
-                rc = cb(pk, ancestor_msgs[pi].val, ancestor_msgs[pi].vlen, ctx);
-                if (rc) return rc;
+                /* Pending message shadows / overrides leaf. */
+                if (ancestor_msgs[pi].op == STM_MSG_INSERT) {
+                    rc = cb(pk, ancestor_msgs[pi].val, ancestor_msgs[pi].vlen, ctx);
+                    if (rc) return rc;
+                }
+                /* DELETE: emit nothing. */
                 li++; pi++;
             } else if (pk && (!lk || stm_key_cmp(pk, lk) < 0)) {
-                /* Pending insert not in leaf */
-                rc = cb(pk, ancestor_msgs[pi].val, ancestor_msgs[pi].vlen, ctx);
-                if (rc) return rc;
+                /* Pending key not in leaf. */
+                if (ancestor_msgs[pi].op == STM_MSG_INSERT) {
+                    rc = cb(pk, ancestor_msgs[pi].val, ancestor_msgs[pi].vlen, ctx);
+                    if (rc) return rc;
+                }
+                /* DELETE of a key not in this leaf is a no-op here. */
                 pi++;
             } else {
-                /* Leaf entry — check it's not deleted by a pending message */
-                /* (ancestor deletes are rare; check linearly) */
-                int deleted = 0;
-                uint32_t d;
-                for (d = 0; d < n_ancestor; d++) {
-                    /* We reuse ancestor_msgs for inserts only; deletes are
-                     * handled by checking the node's own message buffer.
-                     * For correctness, we'd need to pass delete messages too.
-                     * For now, leaf entries are authoritative unless overridden. */
-                }
-                (void)deleted;
+                /* Leaf entry with no pending message at this key — emit. */
                 rc = cb(lk, node->entries[li].val, node->entries[li].vlen, ctx);
                 if (rc) return rc;
                 li++;
@@ -685,23 +703,33 @@ static int scan_rec(struct stm_btree *tree, struct stm_node *node,
         rc = collect_pending(node, lo, hi, &my_msgs, &n_my);
         if (rc) return rc;
 
-        /* Merge ancestor + my messages into one sorted array */
+        /* Merge ancestor + my messages into one sorted, deduped array.
+         * If both sides carry the same key, ancestor wins — messages
+         * higher up the tree are newer (they haven't been flushed down
+         * yet, whereas this node's messages are leftovers from an
+         * earlier flush pass). */
         uint32_t total = n_ancestor + n_my;
         struct pending_msg *merged = NULL;
+        uint32_t total_used = 0;
         if (total > 0) {
             merged = malloc(total * sizeof(*merged));
             if (!merged) { free(my_msgs); return -ENOMEM; }
-            /* Simple merge of two sorted-ish arrays (msgs are sorted by key in the buffer) */
-            uint32_t ai = 0, mi = 0, wi = 0;
+            uint32_t ai = 0, mi = 0;
             while (ai < n_ancestor && mi < n_my) {
-                if (stm_key_cmp(&ancestor_msgs[ai].key, &my_msgs[mi].key) <= 0)
-                    merged[wi++] = ancestor_msgs[ai++];
-                else
-                    merged[wi++] = my_msgs[mi++];
+                int kc = stm_key_cmp(&ancestor_msgs[ai].key, &my_msgs[mi].key);
+                if (kc == 0) {
+                    merged[total_used++] = ancestor_msgs[ai++];
+                    mi++;  /* drop my_msgs (older) */
+                } else if (kc < 0) {
+                    merged[total_used++] = ancestor_msgs[ai++];
+                } else {
+                    merged[total_used++] = my_msgs[mi++];
+                }
             }
-            while (ai < n_ancestor) merged[wi++] = ancestor_msgs[ai++];
-            while (mi < n_my) merged[wi++] = my_msgs[mi++];
+            while (ai < n_ancestor) merged[total_used++] = ancestor_msgs[ai++];
+            while (mi < n_my)       merged[total_used++] = my_msgs[mi++];
         }
+        total = total_used;
         free(my_msgs);
 
         uint32_t first = stm_node_find_child(node, lo);

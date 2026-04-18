@@ -222,6 +222,76 @@ STM_TEST(test_btree_flush_reopen)
     cleanup();
 }
 
+/* scan must respect buffered DELETE messages. Previously scan_rec's
+ * leaf branch only handled buffered INSERTs; buffered DELETEs (not
+ * yet flushed down to the leaf) silently leaked stale entries. */
+
+struct scan_keys_ctx {
+    uint64_t seen[32];
+    int      n;
+};
+
+static int scan_keys_cb(const struct stm_key *key, const void *val,
+                        uint32_t vlen, void *ctx)
+{
+    struct scan_keys_ctx *c = ctx;
+    (void)val; (void)vlen;
+    struct stm_key_cpu kc = stm_key_to_cpu(key);
+    if (c->n < 32) c->seen[c->n++] = kc.ino;
+    return 0;
+}
+
+STM_TEST(test_btree_scan_respects_buffered_delete)
+{
+    struct stm_block_dev dev;
+    struct stm_btree *tree;
+    STM_ASSERT_EQ(stm_file_backend_open(img, 1, 64 * 1024 * 1024, &dev), 0);
+    STM_ASSERT_EQ(stm_btree_open(&dev, stm_bptr_null(), 0, &tree), 0);
+
+    /* Stuff the tree with enough entries to force a split so the root
+     * is internal. Delete then targets the buffered-message path. */
+    uint32_t planted = 0;
+    uint64_t pad[128];
+    memset(pad, 0xAB, sizeof(pad));
+    for (uint32_t i = 1; i <= 4000; i++) {
+        struct stm_key k = mk_key(i, STM_KEY_INODE, 0);
+        STM_ASSERT_EQ(stm_btree_insert(tree, &k, pad, sizeof(pad), i), 0);
+        planted++;
+    }
+    STM_ASSERT_EQ(stm_btree_flush(tree), 0);
+    /* After flush the tree has internal nodes with empty buffers.
+     * The next delete below buffers its DELETE in the root. */
+    STM_ASSERT(stm_btree_height(tree) >= 2);
+
+    /* Delete a key living in some leaf — DELETE lands in root's buffer
+     * and does NOT get flushed to the leaf (one delete is well below
+     * the flush threshold). */
+    const uint64_t victim = 1234;
+    {
+        struct stm_key k = mk_key(victim, STM_KEY_INODE, 0);
+        STM_ASSERT_EQ(stm_btree_delete(tree, &k, 10000), 0);
+    }
+
+    /* Scan the full range. Before the fix, ino=victim was returned by
+     * the leaf branch since the ancestor DELETE wasn't honored. */
+    struct scan_keys_ctx c = { .n = 0 };
+    /* Use a narrow range near the victim so the seen buffer doesn't
+     * need to hold thousands of keys — scan_keys_ctx caps at 32. */
+    struct stm_key lo = mk_key(victim - 5, 0, 0);
+    struct stm_key hi = mk_key(victim + 5, UINT8_MAX, UINT64_MAX);
+    STM_ASSERT_EQ(stm_btree_scan(tree, &lo, &hi, scan_keys_cb, &c), 0);
+
+    int found_victim = 0;
+    for (int i = 0; i < c.n; i++)
+        if (c.seen[i] == victim) found_victim = 1;
+    STM_ASSERT_EQ(found_victim, 0);
+
+    stm_btree_close(tree);
+    stm_block_close(&dev);
+    cleanup();
+    (void)planted;
+}
+
 int main(void)
 {
     STM_SUITE("btree");
@@ -230,6 +300,7 @@ int main(void)
     STM_RUN(test_btree_delete);
     STM_RUN(test_btree_overwrite);
     STM_RUN(test_btree_flush_reopen);
+    STM_RUN(test_btree_scan_respects_buffered_delete);
     printf("all passed\n");
     return 0;
 }
