@@ -1025,35 +1025,38 @@ int stm_fs_readdir(struct stm_fs *fs, uint64_t dir_ino,
 /* ── unlink helpers ─────────────────────────────────────────────────── */
 
 struct unlink_ctx {
-    struct stm_fs  *fs;
-    struct stm_key *keys;
-    uint32_t        count;
-    uint32_t        cap;
+    struct stm_fs     *fs;
+    struct stm_key    *keys;
+    struct stm_extent *exts;    /* parallel array to keys */
+    uint32_t           count;
+    uint32_t           cap;
 };
 
+/* Collect extent keys + records. Does NOT free extent blocks — that's
+ * done only after all btree deletes succeed, so a mid-delete failure
+ * can't leave us with PENDING-freed blocks while stale records still
+ * point at them. */
 static int collect_extent_cb(const struct stm_key *key, const void *val,
                              uint32_t vlen, void *ctx)
 {
     struct unlink_ctx *uc = ctx;
     struct stm_key_cpu kc = stm_key_to_cpu(key);
     if (kc.type != STM_KEY_DATA) return 0;
+    if (vlen != sizeof(struct stm_extent)) return 0;
 
-    /* Free extent data blocks */
-    if (vlen == sizeof(struct stm_extent)) {
-        struct stm_extent ext;
-        memcpy(&ext, val, sizeof(ext));
-        extent_free_blocks(uc->fs, &ext);
-    }
-
-    /* Collect key for later btree deletion */
     if (uc->count >= uc->cap) {
         uint32_t nc = uc->cap ? uc->cap * 2 : 64;
-        struct stm_key *nk = realloc(uc->keys, nc * sizeof(*nk));
+        struct stm_key    *nk = realloc(uc->keys, nc * sizeof(*nk));
+        struct stm_extent *nx = realloc(uc->exts, nc * sizeof(*nx));
         if (!nk) return -ENOMEM;
         uc->keys = nk;
-        uc->cap = nc;
+        if (!nx) return -ENOMEM;
+        uc->exts = nx;
+        uc->cap  = nc;
     }
-    uc->keys[uc->count++] = *key;
+    uc->keys[uc->count] = *key;
+    memcpy(&uc->exts[uc->count], val, sizeof(struct stm_extent));
+    uc->count++;
     return 0;
 }
 
@@ -1118,37 +1121,50 @@ int stm_fs_unlink(struct stm_fs *fs, uint64_t parent_ino, const char *name)
     if (nl > 0) nl--;
     in.si_nlink = cpu_to_le32(nl);
 
-    /* If nlink will hit 0, pre-scan the data extents so we know we
-     * can reach them. If the scan fails we also bail before touching
-     * the dirent. */
-    struct unlink_ctx uc = { .fs = fs, .keys = NULL, .count = 0, .cap = 0 };
+    /* If nlink will hit 0, pre-scan the data extents (collect keys +
+     * records; do NOT free blocks yet). If the scan fails we bail
+     * before touching the dirent. */
+    struct unlink_ctx uc = { .fs = fs, .keys = NULL, .exts = NULL,
+                             .count = 0, .cap = 0 };
     if (nl == 0) {
         struct stm_key lo = mk_key(child_ino, STM_KEY_DATA, 0);
         struct stm_key hi = mk_key(child_ino, STM_KEY_DATA, UINT64_MAX);
         rc = stm_btree_scan(fs->tree, &lo, &hi, collect_extent_cb, &uc);
-        if (rc) { free(uc.keys); return rc; }
+        if (rc) { free(uc.keys); free(uc.exts); return rc; }
     }
 
-    /* Now the mutations: dirent → inode / extents. Failures here
-     * can still leave partial state (the btree doesn't do multi-op
-     * transactions), but at minimum the dirent is only tombstoned
-     * after we've proven we can finish. */
+    /* Mutations in this order:
+     *   1. tombstone the dirent in parent
+     *   2. delete every extent record (btree-level)
+     *   3. delete the inode record
+     *   4. finally, free extent blocks to the allocator (deferred)
+     *
+     * Freeing blocks is the ONLY thing that's unrecoverable if something
+     * fails later: a PENDING block + an extent record still pointing at
+     * it is a soon-to-be-silent-corruption pair. By doing all btree
+     * deletes first, any failure leaves extent blocks live and the
+     * state retriable. */
     rc = tombstone_dirent(fs->tree, &dkey, fs->gen);
-    if (rc) { free(uc.keys); return rc; }
+    if (rc) { free(uc.keys); free(uc.exts); return rc; }
 
     if (nl == 0) {
-        /* Delete every extent record. If any delete fails (typically
-         * -ENOMEM from the msg buffer growing), propagate — leaving
-         * stale extent records behind while their data blocks are
-         * already PENDING-freed creates a "refcount 2 on next mount"
-         * leak when new writes reallocate the paddr. */
         for (uint32_t i = 0; i < uc.count; i++) {
             rc = stm_btree_delete(fs->tree, &uc.keys[i], fs->gen);
-            if (rc) { free(uc.keys); return rc; }
+            if (rc) { free(uc.keys); free(uc.exts); return rc; }
         }
-        free(uc.keys);
         struct stm_key ik = mk_key(child_ino, STM_KEY_INODE, 0);
-        return stm_btree_delete(fs->tree, &ik, fs->gen);
+        rc = stm_btree_delete(fs->tree, &ik, fs->gen);
+        if (rc) { free(uc.keys); free(uc.exts); return rc; }
+
+        /* All btree deletes committed in-memory; now release the data
+         * blocks. extent_free_blocks goes through the deferred list, so
+         * a later OOM there is tolerable — the blocks stay live at the
+         * allocator refcount and just leak until the next mount walk. */
+        for (uint32_t i = 0; i < uc.count; i++)
+            extent_free_blocks(fs, &uc.exts[i]);
+        free(uc.keys); free(uc.exts);
+        return 0;
     }
+    free(uc.keys); free(uc.exts);
     return write_inode(fs, child_ino, &in);
 }
