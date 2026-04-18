@@ -46,12 +46,17 @@ static int walk_snap_cb(const struct stm_key *key, const void *val,
 {
     struct stm_fs *fs = ctx;
     struct stm_snapshot snap;
+    int rc;
     (void)key;
     if (vlen < sizeof(snap)) return 0;
     memcpy(&snap, val, sizeof(snap));
-    stm_btree_walk_entries(fs->tree, snap.ssp_root,
-                           mark_block_fs, mark_extent_entry, fs);
-    return 0;
+    /* Propagate the walk return — if any saved snapshot's tree has a
+     * corrupt node, we'd otherwise silently mark only the reachable
+     * prefix, and blocks exclusively owned by the broken snapshot
+     * stay at refcount 0 → the next write reallocates them. */
+    rc = stm_btree_walk_entries(fs->tree, snap.ssp_root,
+                                mark_block_fs, mark_extent_entry, fs);
+    return rc;
 }
 
 static void stm_now(uint64_t *sec, uint32_t *nsec)
@@ -392,24 +397,43 @@ int stm_fs_open(const char *path, const char *passphrase, struct stm_fs **out)
                    stm_block_close(&fs->dev); free(fs); return rc; }
         /* mark superblock blocks */
         stm_alloc_mark(fs->alloc, 0, 2);
-        /* walk main tree — marks btree node blocks AND data extent blocks */
-        stm_btree_walk_entries(fs->tree, stm_btree_root(fs->tree),
-                               mark_block_fs, mark_extent_entry, fs);
-        /* walk snapshot tree */
-        if (fs->snap_tree)
-            stm_btree_walk_entries(fs->snap_tree, stm_btree_root(fs->snap_tree),
-                                   mark_block_fs, mark_extent_entry, fs);
-        /* walk each snapshot's saved tree */
+        /* Walk main tree — marks btree node blocks AND data extent blocks.
+         * Any walk failure (corrupt node, AEAD tag mismatch, torn write)
+         * means the allocator would only be marked for the reachable
+         * prefix; unreachable-but-live blocks would be handed out for
+         * reuse on the next write → mass silent overwrite. Refuse the
+         * mount instead. The user's fallback is `stratum check`, which
+         * performs the same walk as a diagnostic with deeper reporting. */
+        rc = stm_btree_walk_entries(fs->tree, stm_btree_root(fs->tree),
+                                    mark_block_fs, mark_extent_entry, fs);
+        if (rc) goto fail_alloc;
         if (fs->snap_tree) {
+            rc = stm_btree_walk_entries(fs->snap_tree, stm_btree_root(fs->snap_tree),
+                                        mark_block_fs, mark_extent_entry, fs);
+            if (rc) goto fail_alloc;
+            /* Walk each snapshot's saved tree. walk_snap_cb now propagates
+             * its inner walk error as a non-zero return, so stm_btree_scan
+             * stops at the first broken snapshot. */
             struct stm_key lo = stm_mk_key(0, STM_KEY_SNAP, 0);
             struct stm_key hi = stm_mk_key(UINT64_MAX, STM_KEY_SNAP, UINT64_MAX);
-            stm_btree_scan(fs->snap_tree, &lo, &hi, walk_snap_cb, fs);
+            rc = stm_btree_scan(fs->snap_tree, &lo, &hi, walk_snap_cb, fs);
+            if (rc) goto fail_alloc;
         }
         stm_alloc_commit(fs->alloc);
         stm_btree_set_allocator(fs->tree, fs->alloc);
         if (fs->snap_tree)
             stm_btree_set_allocator(fs->snap_tree, fs->alloc);
+        goto alloc_ok;
+
+    fail_alloc:
+        stm_alloc_close(fs->alloc);
+        stm_btree_close(fs->snap_tree);
+        stm_btree_close(fs->tree);
+        stm_block_close(&fs->dev);
+        free(fs);
+        return rc;
     }
+alloc_ok:
 
     /* Allocate reusable scratch buffers for extent I/O */
     fs->extent_buf = malloc(STM_EXTENT_SIZE);
