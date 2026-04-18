@@ -1,6 +1,6 @@
 # Stratum — The Definitive Technical Reference
 
-**Version**: repository state at commit `3998786` (P2 perf: allocator hint wrap + readdir cache), updated through snapshot/CLI 9P extensions.
+**Version**: repository state at commit `405c4fb` (R14: counter wraparound defense), updated through the R0–R14 soundness audit loop. The three-phase sync and AEAD nonce invariant machinery in §7 and §22 is load-bearing — see `CLAUDE.md` for the audit-triggering change policy.
 **Scope**: This document describes every user-visible behavior, every on-disk structure, every algorithm, and every known quirk of the Stratum filesystem. It is written to be exhaustive: a future engineer should be able to reimplement Stratum from scratch using only this document, or debug any concrete issue without reading the source.
 
 ---
@@ -28,6 +28,7 @@
 19. [Edge cases and gotchas](#19-edge-cases-and-gotchas)
 20. [Known limitations / future work](#20-known-limitations--future-work)
 21. [Glossary](#21-glossary)
+22. [Soundness invariants](#22-soundness-invariants)
 
 ---
 
@@ -372,36 +373,80 @@ An earlier version freed old blocks using the NEW node's compressed size — wro
 
 ### 7.1 Ping-pong superblocks
 
-Two slots (blocks 0 and 1). On each sync, write to the slot NOT most recently written. On mount, both are read and verified; higher `ss_gen` with valid csum wins.
+Two SB slots at block 0 and block 1. On mount, both are read, csum-verified, version-checked (only v1 accepted; non-v1 deterministically loses the tiebreak even at higher gen), and the higher-`ss_gen` valid slot wins. See §22 for the full mount selection policy.
 
-### 7.2 Write ordering
+### 7.2 The generation invariant
+
+**Every crash-safety guarantee on encrypted volumes rests on one invariant:**
+
+> At every observable on-disk state, `max(valid SB's ss_gen) > fs->gen` (where `fs->gen` is the write_gen that the session is currently encrypting under, i.e. the gen that would be used for the next ciphertext write).
+
+The AEAD nonce is `(paddr ‖ write_gen)`. If two writes ever share that pair, XChaCha20 stream-cipher semantics leak `plaintext_1 XOR plaintext_2`. The invariant guarantees no two sessions can ever reuse a gen: the next session's `fs->gen` is read from the durable SB's `ss_gen`, and because disk `ss_gen` is always strictly greater than anything this session wrote under, the next session starts above every prior orphan gen.
+
+Maintaining it is non-trivial. It is **not** true that `fs->gen` simply advances monotonically on disk — a crash between a flush and its SB commit would leave orphan ciphertexts at `fs->gen` while the SB still says the same `ss_gen` for the next mount to reuse. The invariant is maintained by three mechanisms working in concert:
+
+1. **Mount-time gen bump** (encrypted volumes only): `stm_fs_open` writes an SB at `ss_gen = chosen_gen + 1` to the opposite slot + fsync, before returning. This establishes `disk ss_gen > fs->gen` *before* any session write can touch disk.
+
+2. **Three-phase sync** (every successful sync):
+   - **Phase 1 (reservation)**: write SB at `ss_gen = G+1` with the *pre-flush* root to the opposite slot, fsync. At this point no new ciphertexts at G have hit disk yet; if anything up to Phase 3's fsync fails, next mount reads G+1 and any orphans at G can't collide.
+   - **Phase 2 (flush)**: tree flush at `write_gen = G`. Disk ss_gen is already G+1 (from Phase 1), so orphans at G are safe.
+   - **Phase 3 (final)**: write SB at `ss_gen = G+2` with the *post-flush* root to the current slot, fsync. `fs->gen` advances to G+1. Strict inequality `disk ss_gen = G+2 > fs->gen = G+1` preserves the invariant for the next inter-sync window.
+   - Torn-write on Phase 3: reservation at G+1 survives; mount picks it; next session writes at G+1 and doesn't collide with Phase 2 orphans at G.
+
+3. **Rollback-bump before allocator swap**: `stm_snap_rollback` on encrypted volumes advances `fs->gen` by 1 and writes a bump SB (ss_gen = new_gen + 1) to the opposite slot **before** committing the new allocator swap. Without this, pre-rollback in-session orphans at old `fs->gen` would be marked FREE by the new allocator and could collide with post-rollback writes at the same gen. If the bump write fails, the old allocator still holds their refcounts — rollback is cleanly aborted.
+
+The invariant also requires **counter-wraparound defense**: `ss_gen > UINT64_MAX - 2^32` is rejected at mount. Without that clamp, an adversarial SB pinned at `UINT64_MAX` would cause every mount to start at that gen, with mount-bump wrapping to 0 and subsequent writes colliding with the pinned-gen orphans.
+
+### 7.3 Ordering of disk writes
 
 ```
-stm_fs_sync:
-    1. Flush main btree → writes dirty nodes (no fsync here)
-    2. Flush snap tree if present
-    3. Construct new superblock, compute csum
-    4. Write superblock to alternate slot
-    5. fsync(fd)                   ← single sync, crash boundary
-    6. stm_alloc_commit             ← PENDING → free
+stm_fs_sync(fs):
+    gen_used     = fs->gen
+    gen_reserve  = gen_used + 1
+    gen_final    = gen_used + 2
+
+    # Phase 1: reservation
+    build_sb(ss_gen=gen_reserve, ss_root=stm_btree_root(tree))  # PRE-flush root
+    write_sb(1 - fs->sb_slot)
+    block_sync()                      ← crash boundary 1
+
+    # Phase 2: flush
+    stm_btree_flush(tree, gen_used)
+    # snap_tree flush if present
+
+    # Phase 3: final commit
+    build_sb(ss_gen=gen_final, ss_root=stm_btree_root(tree))   # POST-flush root
+    write_sb(fs->sb_slot)
+    block_sync()                      ← crash boundary 2
+
+    fs->gen = gen_used + 1            # advance by 1, not 2
+    stm_alloc_commit()                # PENDING → free
 ```
 
-A single sync is sufficient because `pwrite` orders correctly through the kernel page cache.
+On Darwin, `block_sync()` uses `fcntl(F_FULLFSYNC)` instead of `fsync()` — plain `fsync()` on macOS returns after writes reach the OS page cache but before the drive's volatile cache is flushed; `F_FULLFSYNC` forces a real disk-cache flush. On Linux we keep `fsync()` (which on ext4/xfs does issue the disk flush).
 
-On Darwin, step 5 uses `fcntl(F_FULLFSYNC)` instead of `fsync()` — plain `fsync()` on macOS returns after writes reach the OS page cache but before the drive's volatile cache is flushed, so a power loss can drop a "committed" transaction and leave the next mount looking at torn state (old superblock + partially-landed new nodes). `F_FULLFSYNC` forces a real disk-cache flush. On Linux we keep `fsync()` (which on ext4/xfs does issue the disk flush).
-
-### 7.3 File locking
+### 7.4 File locking
 
 `flock(LOCK_EX | LOCK_NB)` on open prevents two processes from opening the same volume path. Released automatically on process exit (kernel handles even SIGKILL). One caveat: `flock` is per-open-file-description, so two processes opening two *hardlinks* to the same inode both acquire the lock. The file backend refuses to open any file with `st_nlink > 1` as a defense.
 
-### 7.4 Recovery
+### 7.5 Recovery
 
-If we crash anywhere during sync:
-- Superblock torn → csum mismatch → old slot wins.
-- Superblock fully written → new slot wins.
-- Allocator is rebuilt from scratch at next mount.
+Crash at any point during sync:
+- **Before Phase 1 write**: no change; next mount picks the prior final. No orphans.
+- **During Phase 1 (torn)**: opposite slot has garbage → csum fails. Mount picks the prior final. Same as above.
+- **After Phase 1 but before Phase 3**: opposite slot has `(gen_reserve, pre-flush root)`. Mount picks it. Session's in-flight changes are lost; fs state reverts to pre-sync. Phase 2 orphans at `gen_used` are unreachable and safe (next session starts at `gen_reserve > gen_used`).
+- **During Phase 3 (torn)**: current slot garbage. Mount falls back to reservation at `gen_reserve`. Same as above.
+- **After Phase 3**: normal success.
 
-Worst case: lose the current uncommitted transaction. No corruption.
+In all cases: worst outcome is losing the current uncommitted transaction. No corruption. No nonce reuse. The allocator is rebuilt from scratch at next mount by walking the tree; orphans at any gen are correctly recognized as free and get a fresh gen on reallocation.
+
+### 7.6 Wedged and read-only states
+
+Two runtime `fs` flags protect invariants that can't be checked statically:
+
+- **`fs->wedged`** — set when an internal failure (notably `stm_snap_rollback` reopen-original failures) leaves `fs->tree` NULL or otherwise unusable. Every public `stm_fs_*` and `stm_snap_*` API checks this via `STM_FS_GUARD_READ` / `STM_FS_GUARD_WRITE` and returns `-EIO`. Only `stm_fs_close` remains legal. Monotonic — once set, requires remount.
+
+- **`fs->read_only`** — set by `stm_fs_open_ro`. Mutation APIs return `-EROFS`; read APIs proceed. `stratum check` uses this to inspect volumes without triggering the encrypted-mount gen bump, so it can run on degraded volumes. Callers of `stm_fs_open_ro` MUST NOT bypass the guards by reaching into `fs` internals — doing so on an encrypted volume produces orphan ciphertexts that violate the nonce invariant.
 
 ---
 
@@ -452,11 +497,15 @@ DEK is unwrapped on mount and used for all subsequent encrypt/decrypt.
 
 Nonce (24 B) = `le64(paddr) ‖ le64(write_gen) ‖ 8 zero bytes`.
 
-`write_gen` is the sync generation (`fs->gen` for data extents; the owning node's `n->gen` for btree nodes). It is persisted alongside the ciphertext:
+`write_gen` is the current-write sync generation:
+- For data extents: `fs->gen` at the time of `extent_write_data`.
+- For btree nodes: `tree->write_gen`, which every public btree entry point (`stm_btree_insert`, `stm_btree_delete`, `stm_btree_flush`) sets to its caller's gen before any writes fire. Critically, this is *not* the node's frozen creation gen (`n->gen`), which stays fixed for the node's lifetime and would cause nonce reuse on any COW-rewrite of the same paddr.
+
+It is persisted alongside the ciphertext:
 - Btree nodes store it in `bp_write_gen` of the parent's bptr.
 - Data extents store it in `se_write_gen` of the extent record.
 
-Why it matters: `paddr` alone is not unique across time. Under COW, a block may be freed and later re-allocated for a different piece of data; encrypting that new plaintext under `(DEK, nonce=paddr)` would reuse the same nonce with the same key, destroying confidentiality (XOR of the two ciphertexts = XOR of the two plaintexts — a classic stream-cipher catastrophe). Mixing `write_gen` into the nonce makes every re-use distinct, because `fs->gen` strictly increases across syncs and any two writes at the same paddr are in different syncs.
+Why it matters: `paddr` alone is not unique across time. Under COW, a block may be freed and later re-allocated for a different piece of data; encrypting that new plaintext under `(DEK, nonce=paddr)` would reuse the same nonce with the same key, destroying confidentiality (XOR of the two ciphertexts = XOR of the two plaintexts — a classic stream-cipher catastrophe). Mixing `write_gen` into the nonce makes every re-use distinct, because `fs->gen` strictly increases across syncs — **but only if the disk generation counter stays strictly ahead of any gen ever used for ciphertext, across every mount boundary and every crash**. See §7.2 for the three-phase sync + mount-bump + rollback-bump machinery that maintains that strict inequality, and §22 for the full invariant statement.
 
 ### 9.4 AEAD integrity
 
@@ -757,3 +806,96 @@ Key optimizations applied (git history):
 | **Scratch buffer** | Reusable per-fs buffer for extent I/O |
 | **Sync** | Full checkpoint (flush trees + write superblock + fsync + commit) |
 | **Tag** | Poly1305 MAC (16 bytes) |
+| **Wedged** | fs-level flag set when internal failure leaves `fs->tree` unusable; public APIs reject until close |
+
+---
+
+## 22. Soundness invariants
+
+This section is the **contract** that future changes must not break. Each invariant below has a history — every one was discovered by an adversarial audit (R0–R14, commits `bb39db8` → `405c4fb`, ~60 corruption-class fixes) — and each has at least one test in `tests/` that fails without its fix. Modifying any code path listed under "enforced at" triggers a fresh audit round before merge (see `CLAUDE.md`).
+
+### 22.1 AEAD nonce uniqueness
+
+**Invariant**: for every ciphertext ever written to disk under the current DEK, the pair `(paddr, write_gen)` is globally unique across the volume's lifetime.
+
+Enforced at:
+- `src/crypto/crypto.c::build_nonce` (nonce = `le64(paddr) ‖ le64(write_gen) ‖ zeros`).
+- `src/btree/btree.c::stm_btree_write_node` uses `tree->write_gen`, set by every public entry point (`stm_btree_insert/delete/flush`) before any disk write. Not the frozen `n->gen`.
+- `src/fs/fs.c::extent_write_data` uses `fs->gen`.
+
+Depends on the generation invariant below.
+
+### 22.2 Generation invariant
+
+**Invariant**: at every observable on-disk state, `max(valid SB ss_gen) > fs->gen`. The strict inequality must hold across: mount → first write, every inter-sync window, every sync phase transition, every crash boundary, every rollback.
+
+Enforced at:
+- `src/fs/fs.c::stm_fs_open_impl` — mount-time gen bump on encrypted volumes (writes `ss_gen = fs->gen + 1` to opposite slot + fsync before returning).
+- `src/fs/fs.c::stm_fs_sync` — three-phase commit (Phase 1 reservation at G+1, Phase 2 flush at G, Phase 3 final at G+2, then `fs->gen = G+1`).
+- `src/snap/snap.c::stm_snap_rollback` — rollback-bump BEFORE allocator swap; revert on bump failure is clean because `old_alloc` still holds pre-rollback refcounts.
+
+See §7.2 for the full argument. Regression tests: `test_fs_sync_two_phase_gen_invariant`, `test_fs_mount_bump_encrypted`, `test_snap_rollback_bumps_gen_encrypted`.
+
+### 22.3 Counter wraparound rejection
+
+**Invariant**: `ss_gen`, `ss_next_ino`, `ss_next_snap_id` are each `≤ UINT64_MAX - 2³²` on a valid volume. Mount rejects anything above that with `-ENOTSUP`.
+
+Enforced at: `src/fs/fs.c::stm_fs_open_impl` post-SB-parse clamps. Walk-side guards in `mark_extent_entry` refuse on-disk INODE/SNAP keys near the cliff. `alloc_ino` defensively skips 0 and `STM_ROOT_INO`.
+
+Without this, an adversarial SB (plaintext + unkeyed xxHash3 csum) could pin `fs->gen` at `UINT64_MAX` across mounts, causing mount-bump to wrap and next-session writes to collide with pinned-gen orphans.
+
+### 22.4 Walk-derived counter clamps
+
+**Invariant**: at end of mount, `fs->next_ino > max_ino_ever_allocated_in_any_tree` and `fs->next_snap_id > max_snap_id_ever_created`.
+
+Enforced at: `mark_extent_entry` raises `fs->next_ino` / `fs->next_snap_id` from every INODE / SNAP key observed during the mount-time tree walk (main tree, snap tree, every saved snapshot's tree).
+
+Without this, an adversarial `ss_next_ino = K` (where K is any live inode) causes the next create to alias K — overwriting its inode record and inheriting its extents.
+
+### 22.5 Extent write ordering
+
+**Invariant**: on `stm_fs_write`, the btree record for a new extent lands before the old extent's blocks are freed. On insert failure, the new extent's blocks are reclaimed.
+
+Enforced at: `src/fs/fs.c::stm_fs_write` (`extent_write_data` → `stm_btree_insert` → `extent_free_blocks(old)`; on insert failure: `extent_free_blocks(new)`).
+
+Without this, `-ENOMEM` mid-write silently loses data: file's btree record still points at `old_ext`, but `old_ext`'s blocks are PENDING → freed → reallocated at next alloc → next read gets garbage or AEAD tag mismatch.
+
+### 22.6 Extent scratch-buffer hygiene
+
+**Invariant**: on partial-extent read-modify-write, `fs->extent_buf` tail is zeroed after the old extent's plaintext lands, so no residue from a prior extent operation is encrypted into the new ciphertext.
+
+Enforced at: `src/fs/fs.c::stm_fs_write`, after `extent_read_data` in the `had_old` branch: `memset(ebuf + old_dlen, 0, STM_EXTENT_SIZE - old_dlen)`.
+
+Without this, on encrypted volumes, one file's plaintext leaks into another file's encrypted extent when their write offsets and extent lifetimes interleave just so. Regression test: `test_fs_write_gap_is_zeroed*`.
+
+### 22.7 Wedged / read-only runtime containment
+
+**Invariant**: once `fs->wedged` is set, every public `stm_fs_*` / `stm_snap_*` API returns `-EIO` (or in `stm_fs_open_ro`'s case, `-EROFS` for mutations). The fs is only legal to `stm_fs_close` from that point.
+
+Enforced at: top of every public API in `fs.c` and `snap.c` via `STM_FS_GUARD_READ` / `STM_FS_GUARD_WRITE` / `STM_SNAP_GUARD_*` macros.
+
+Without this, `stm_snap_rollback` failure paths leave `fs->tree = NULL` and the next op dereferences NULL.
+
+### 22.8 Superblock tiebreak
+
+**Invariant**: mount picks the highest-gen valid SB whose `ss_version == 1`. If only one slot is v1, it wins regardless of gen. If neither is v1, mount fails with `-ENOTSUP`.
+
+Enforced at: `src/fs/fs.c::stm_fs_open_impl` SB selection block.
+
+Without this, an adversarial one-byte write (`ss_version = 2` + recomputed xxHash + bumped gen) wedges mount for a volume whose other slot is still legitimate.
+
+### 22.9 9P wire validation
+
+**Invariant**: every handler validates its body against `body_len` before reading fixed offsets. `gstr` bounds-checks against `end`. `h_read` and `h_write` clamp count against `s->msize - P9_HDR_SIZE - 4` in both file and directory branches. `s->msize` is clamped to `[P9_MSIZE_MIN=256, P9_MSIZE_DEFAULT]` in `h_version`.
+
+Enforced at: `src/p9/p9.c::stm_9p_handle` and every handler.
+
+Without this, malformed wire inputs cause heap OOB writes, heap OOB reads encoded into the volume (exposing server heap as file content on encrypted volumes), or remote DoS via segfault on unauthenticated 9P.
+
+### 22.10 Fid lifecycle
+
+**Invariant**: every allocated fid is freed on every exit path of its creating handler (including error paths). `dir_cache` is invalidated when a fid's ino changes (h_walk, h_create) or when a directory is mutated through any other fid (h_create, h_remove, snap ops). Duplicate `fid_alloc` on an already-active fid fails.
+
+Enforced at: `src/p9/p9.c::fid_alloc`, `fid_free`, `fid_cache_drop`, `invalidate_dir_caches`, `invalidate_all_dir_caches`. `stm_9p_destroy` frees every fid's `dir_cache` on client disconnect.
+
+Without this, long-running servers leak memory under misbehaving clients; fid-table exhaustion causes DoS; stale readdir caches serve wrong directory state to clients.
