@@ -994,38 +994,45 @@ int stm_fs_unlink(struct stm_fs *fs, uint64_t parent_ino, const char *name)
                        &child_ino, &dkey);
     if (rc) return rc;
 
-    /* remove dirent */
-    rc = stm_btree_delete(fs->tree, &dkey, fs->gen);
+    /* Validate the inode BEFORE deleting the dirent. If we can't read
+     * the inode we must bail out with the dirent still in place —
+     * otherwise we'd orphan the inode and all its extents with no
+     * path back. (Pre-fix behavior was: delete dirent first, read
+     * inode second; any EIO in the read left the volume with a
+     * permanent leak and the dirent gone.) */
+    struct stm_inode in;
+    rc = read_inode(fs, child_ino, &in);
     if (rc) return rc;
+    uint32_t nl = le32_to_cpu(in.si_nlink);
+    if (nl > 0) nl--;
+    in.si_nlink = cpu_to_le32(nl);
 
-    /* decrement nlink; if 0, remove inode + free data extents */
-    {
-        struct stm_inode in;
-        rc = read_inode(fs, child_ino, &in);
-        if (rc) return rc;
-        uint32_t nl = le32_to_cpu(in.si_nlink);
-        if (nl > 0) nl--;
-        in.si_nlink = cpu_to_le32(nl);
-        if (nl == 0) {
-            /* Free all data extents and collect their keys */
-            struct stm_key lo = mk_key(child_ino, STM_KEY_DATA, 0);
-            struct stm_key hi = mk_key(child_ino, STM_KEY_DATA, UINT64_MAX);
-            struct unlink_ctx uc = { .fs = fs, .keys = NULL, .count = 0, .cap = 0 };
-            uint32_t i;
+    /* If nlink will hit 0, pre-scan the data extents so we know we
+     * can reach them. If the scan fails we also bail before touching
+     * the dirent. */
+    struct unlink_ctx uc = { .fs = fs, .keys = NULL, .count = 0, .cap = 0 };
+    if (nl == 0) {
+        struct stm_key lo = mk_key(child_ino, STM_KEY_DATA, 0);
+        struct stm_key hi = mk_key(child_ino, STM_KEY_DATA, UINT64_MAX);
+        rc = stm_btree_scan(fs->tree, &lo, &hi, collect_extent_cb, &uc);
+        if (rc) { free(uc.keys); return rc; }
+    }
 
-            stm_btree_scan(fs->tree, &lo, &hi, collect_extent_cb, &uc);
+    /* Now the mutations: dirent → inode / extents. Failures here
+     * can still leave partial state (the btree doesn't do multi-op
+     * transactions), but at minimum the dirent is only removed after
+     * we've proven we can finish. */
+    rc = stm_btree_delete(fs->tree, &dkey, fs->gen);
+    if (rc) { free(uc.keys); return rc; }
 
-            /* Delete data entries */
-            for (i = 0; i < uc.count; i++)
-                stm_btree_delete(fs->tree, &uc.keys[i], fs->gen);
-            free(uc.keys);
-
-            /* Delete inode */
-            struct stm_key ik = mk_key(child_ino, STM_KEY_INODE, 0);
-            stm_btree_delete(fs->tree, &ik, fs->gen);
-        } else {
-            write_inode(fs, child_ino, &in);
-        }
+    if (nl == 0) {
+        for (uint32_t i = 0; i < uc.count; i++)
+            stm_btree_delete(fs->tree, &uc.keys[i], fs->gen);
+        free(uc.keys);
+        struct stm_key ik = mk_key(child_ino, STM_KEY_INODE, 0);
+        stm_btree_delete(fs->tree, &ik, fs->gen);
+    } else {
+        write_inode(fs, child_ino, &in);
     }
     return 0;
 }
