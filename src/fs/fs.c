@@ -1137,13 +1137,18 @@ int stm_fs_unlink(struct stm_fs *fs, uint64_t parent_ino, const char *name)
     if (rc) { free(uc.keys); return rc; }
 
     if (nl == 0) {
-        for (uint32_t i = 0; i < uc.count; i++)
-            stm_btree_delete(fs->tree, &uc.keys[i], fs->gen);
+        /* Delete every extent record. If any delete fails (typically
+         * -ENOMEM from the msg buffer growing), propagate — leaving
+         * stale extent records behind while their data blocks are
+         * already PENDING-freed creates a "refcount 2 on next mount"
+         * leak when new writes reallocate the paddr. */
+        for (uint32_t i = 0; i < uc.count; i++) {
+            rc = stm_btree_delete(fs->tree, &uc.keys[i], fs->gen);
+            if (rc) { free(uc.keys); return rc; }
+        }
         free(uc.keys);
         struct stm_key ik = mk_key(child_ino, STM_KEY_INODE, 0);
-        stm_btree_delete(fs->tree, &ik, fs->gen);
-    } else {
-        write_inode(fs, child_ino, &in);
+        return stm_btree_delete(fs->tree, &ik, fs->gen);
     }
-    return 0;
+    return write_inode(fs, child_ino, &in);
 }

@@ -438,27 +438,28 @@ int stm_snap_delete(struct stm_fs *fs, uint64_t snap_id)
     if (vlen < sizeof(snap)) return -EINVAL;
     memcpy(&snap, vbuf, sizeof(snap));
 
-    /* Decrement refcounts on all blocks in the snapshot's tree. Do a
-     * read-only dry-run first: if any node can't be read we must bail
-     * BEFORE mutating refcounts, otherwise the partial decrements
-     * leave the allocator inconsistent with actual block ownership.
-     * The descriptor stays — the next mount's walk rebuilds the
-     * allocator from truth, and the user gets a `stratum check`
-     * signal that this snapshot needs attention. */
+    /* Dry-run the saved tree to prove every node is readable before
+     * we start mutating anything. */
     if (fs->alloc) {
-        int vrc = stm_btree_walk_entries(fs->tree, snap.ssp_root,
-                                         noop_visit, NULL, NULL);
-        if (vrc) return vrc;
-
-        int wrc = stm_btree_walk_entries(fs->tree, snap.ssp_root,
-                                         free_block_fs, free_extent_entry, fs);
-        if (wrc) return wrc;  /* should not happen after dry-run, but safe */
+        rc = stm_btree_walk_entries(fs->tree, snap.ssp_root,
+                                    noop_visit, NULL, NULL);
+        if (rc) return rc;
     }
 
-    /* remove snapshot descriptor and name index */
-    stm_btree_delete(fs->snap_tree, &skey, fs->gen);
+    /* Remove descriptor + name index BEFORE the refcount walk.
+     * Rationale: if either delete fails (typically -ENOMEM from the
+     * msg-buffer growing), the saved tree is still fully referenced —
+     * every block retains its refcount, and the descriptor is still
+     * consulted on next mount. We can safely retry the whole operation.
+     *
+     * If instead we decremented refcounts first and then hit an OOM
+     * on the descriptor-delete, we'd be stuck with a still-present
+     * descriptor whose subtree has decremented refcounts — next sync
+     * could commit that to disk and the next write could reallocate
+     * blocks the descriptor still claims. */
+    rc = stm_btree_delete(fs->snap_tree, &skey, fs->gen);
+    if (rc) return rc;
 
-    /* remove name index entry — extract name from value */
     if (vlen > sizeof(snap) + 1) {
         uint8_t name_len = vbuf[sizeof(snap)];
         const char *name = (const char *)vbuf + sizeof(snap) + 1;
@@ -472,11 +473,22 @@ int stm_snap_delete(struct stm_fs *fs, uint64_t snap_id)
             if (rc) break;
             if (nl >= 8 && nl - 8 == name_len &&
                 memcmp(nb + 8, name, name_len) == 0) {
-                stm_btree_delete(fs->snap_tree, &nk, fs->gen);
+                rc = stm_btree_delete(fs->snap_tree, &nk, fs->gen);
+                if (rc) return rc;
                 break;
             }
         }
     }
 
+    /* Decrement refcounts. Dry-run above proved all nodes read OK;
+     * the callback only decrements, so it cannot fail. Even in the
+     * unlikely event of a later failure, the descriptor is already
+     * gone — the next mount rebuild sees the now-smaller tree and
+     * correctly assigns refcounts to the surviving blocks. */
+    if (fs->alloc) {
+        rc = stm_btree_walk_entries(fs->tree, snap.ssp_root,
+                                    free_block_fs, free_extent_entry, fs);
+        if (rc) return rc;
+    }
     return 0;
 }
