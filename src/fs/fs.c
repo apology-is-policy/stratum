@@ -1008,6 +1008,15 @@ static int collect_extent_cb(const struct stm_key *key, const void *val,
     return 0;
 }
 
+/* Scan callback that flips a flag on the first hit and stops. */
+static int empty_check_cb(const struct stm_key *key, const void *val,
+                          uint32_t vlen, void *ctx)
+{
+    (void)key; (void)val; (void)vlen;
+    *(int *)ctx = 1;
+    return 1;  /* stop the scan */
+}
+
 int stm_fs_unlink(struct stm_fs *fs, uint64_t parent_ino, const char *name)
 {
     struct stm_key dkey;
@@ -1027,6 +1036,32 @@ int stm_fs_unlink(struct stm_fs *fs, uint64_t parent_ino, const char *name)
     struct stm_inode in;
     rc = read_inode(fs, child_ino, &in);
     if (rc) return rc;
+
+    /* Refuse to unlink a non-empty directory. Without this guard the
+     * caller-visible behavior would be "dir removed successfully" but
+     * the dir's children become permanently unreachable — every dirent
+     * and inode under it stays live in the btree, and on encrypted
+     * volumes their ciphertext stays allocated too. */
+    uint32_t mode = le32_to_cpu(in.si_mode);
+    if ((mode & STM_S_IFDIR) == STM_S_IFDIR) {
+        int found = 0;
+        struct stm_key lo = mk_key(child_ino, STM_KEY_DIRENT, 0);
+        struct stm_key hi = mk_key(child_ino, STM_KEY_DATA, 0);
+        /* scan returns 1 on "stop"; treat that as "found" signal, not
+         * an error. A real error propagates as before. */
+        int srv = stm_btree_scan(fs->tree, &lo, &hi, empty_check_cb, &found);
+        if (srv < 0) return srv;
+        if (found) return -ENOTEMPTY;
+
+        /* Empty directory: remove the dirent in the parent and the
+         * inode record itself. Skip the nlink dance below — directories
+         * don't participate in hardlinking in this FS. */
+        rc = stm_btree_delete(fs->tree, &dkey, fs->gen);
+        if (rc) return rc;
+        struct stm_key ik = mk_key(child_ino, STM_KEY_INODE, 0);
+        return stm_btree_delete(fs->tree, &ik, fs->gen);
+    }
+
     uint32_t nl = le32_to_cpu(in.si_nlink);
     if (nl > 0) nl--;
     in.si_nlink = cpu_to_le32(nl);

@@ -334,6 +334,37 @@ STM_TEST(test_fs_copy_delete_cycles_encrypted)
     unlink(path);
 }
 
+/* stm_fs_unlink on a directory must refuse if the directory isn't empty.
+ * Before the fix, the parent dirent was removed and the child's contents
+ * (dirents + inodes + data) were silently orphaned. */
+STM_TEST(test_fs_rmdir_refuses_nonempty)
+{
+    const char *path = "/tmp/stratum_test_rmdir.img";
+    struct stm_fs *fs;
+    unlink(path);
+    STM_ASSERT_EQ(stm_fs_create(path, 8ULL*1024*1024, NULL), 0);
+    STM_ASSERT_EQ(stm_fs_open(path, NULL, &fs), 0);
+
+    uint64_t dino, fino;
+    STM_ASSERT_EQ(stm_fs_mkdir(fs, 1, "d", 0755, &dino), 0);
+    STM_ASSERT_EQ(stm_fs_create_file(fs, dino, "x.txt", 0644, &fino), 0);
+    STM_ASSERT_EQ(stm_fs_write(fs, fino, 0, "hi", 2), 0);
+
+    /* Non-empty → ENOTEMPTY */
+    STM_ASSERT_EQ(stm_fs_unlink(fs, 1, "d"), -ENOTEMPTY);
+
+    /* Remove the child, then rmdir succeeds */
+    STM_ASSERT_EQ(stm_fs_unlink(fs, dino, "x.txt"), 0);
+    STM_ASSERT_EQ(stm_fs_unlink(fs, 1, "d"), 0);
+
+    /* "d" is gone */
+    uint64_t dummy;
+    STM_ASSERT_EQ(stm_fs_lookup(fs, 1, "d", &dummy), -ENOENT);
+
+    stm_fs_close(fs);
+    unlink(path);
+}
+
 /* stm_fs_write must reject offset + len that would overflow uint64 */
 STM_TEST(test_fs_write_overflow_guard)
 {
@@ -372,6 +403,7 @@ int main(void)
     STM_RUN(test_fs_copy_delete_cycles);
     STM_RUN(test_fs_copy_delete_cycles_encrypted);
     STM_RUN(test_fs_write_overflow_guard);
+    STM_RUN(test_fs_rmdir_refuses_nonempty);
     printf("all passed\n");
     return 0;
 }
