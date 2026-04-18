@@ -838,12 +838,18 @@ int stm_fs_write(struct stm_fs *fs, uint64_t ino, uint64_t offset,
     if (len > 0 && offset > UINT64_MAX - (uint64_t)len)
         return -EFBIG;
 
-    /* Get current file size to skip old-extent lookups for growing writes */
-    uint64_t cur_size = 0;
+    /* Get current file size to skip old-extent lookups for growing writes.
+     * Propagate read errors: swallowing an EIO here means cur_size stays
+     * 0, every write is treated as past-EOF, existing extents at these
+     * offsets are NOT freed, and the inode-size update at the end is
+     * skipped → ghost extents + orphaned blocks + ciphertext leakage
+     * on encrypted volumes. */
+    uint64_t cur_size;
     {
         struct stm_inode sz_in;
-        if (read_inode(fs, ino, &sz_in) == 0)
-            cur_size = le64_to_cpu(sz_in.si_size);
+        rc = read_inode(fs, ino, &sz_in);
+        if (rc) return rc;
+        cur_size = le64_to_cpu(sz_in.si_size);
     }
 
     uint8_t *ebuf = fs->extent_buf;
