@@ -22,12 +22,27 @@ static int mark_block_fs(uint64_t paddr, uint32_t csize, void *ctx)
     return 0;
 }
 
-/* Also mark blocks referenced by extent records in DATA entries. */
+/* Per-entry callback used during the mount-time tree walk. Three jobs:
+ *  1. Mark blocks referenced by extent records (R3-era allocator rebuild).
+ *  2. R13-2: track the highest inode number observed across all INODE keys,
+ *     so a post-walk clamp can repair adversarial `ss_next_ino` that would
+ *     otherwise cause the next create to alias an existing inode.
+ *  3. R13-4: track the highest snap_id observed across all SNAP keys, for
+ *     the same reason against `ss_next_snap_id`. */
 static int mark_extent_entry(const struct stm_key *key, const void *val,
                              uint32_t vlen, void *ctx)
 {
     struct stm_fs *fs = ctx;
     struct stm_key_cpu kc = stm_key_to_cpu(key);
+
+    if (kc.type == STM_KEY_INODE) {
+        if (kc.ino >= fs->next_ino) fs->next_ino = kc.ino + 1;
+        return 0;
+    }
+    if (kc.type == STM_KEY_SNAP) {
+        if (kc.ino >= fs->next_snap_id) fs->next_snap_id = kc.ino + 1;
+        return 0;
+    }
     if (kc.type != STM_KEY_DATA || vlen != sizeof(struct stm_extent))
         return 0;
     struct stm_extent ext;
@@ -447,17 +462,27 @@ static int stm_fs_open_impl(const char *path, const char *passphrase,
     }
 
     fs->gen         = le64_to_cpu(chosen->ss_gen);
+    /* R13-3: reject extreme ss_gen. The AEAD nonce uniqueness invariant
+     * requires fs->gen + 1 (mount-bump) and fs->gen + 2 (sync's
+     * gen_final) to not wrap. At UINT64_MAX a single bump wraps to 0,
+     * the tampered UINT64_MAX slot stays the tiebreak winner forever,
+     * and every future session pins fs->gen at UINT64_MAX — reusing
+     * the same nonce across sessions. Leave generous margin; legitimate
+     * workloads can't approach even 2^32 syncs in any human timeframe. */
+    if (fs->gen > UINT64_MAX - (UINT64_C(1) << 32)) {
+        stm_block_close(&fs->dev); free(fs); return -ENOTSUP;
+    }
     fs->next_ino    = le64_to_cpu(chosen->ss_next_ino);
-    /* R12-1: clamp next_ino > STM_ROOT_INO. The SB is plaintext and
-     * protected only by xxHash3-128 (unkeyed, not a MAC). An attacker
-     * with raw disk write but no passphrase could set ss_next_ino = 1
-     * (== STM_ROOT_INO) and recompute ss_csum. User mounts and the
-     * next create_file overwrites the root inode at key (1, INODE, 0),
-     * destroying the root directory. Defense-in-depth: a freshly
-     * mkfs'd volume has next_ino = STM_ROOT_INO + 1, so any lower
-     * value is adversarial. */
+    /* R12-1 + R13-2: defense-in-depth against adversarial ss_next_ino.
+     * Initial clamp ensures next_ino > STM_ROOT_INO (preventing root-
+     * inode overwrite); the mount-time tree walk below (via the
+     * mark_extent_entry callback) raises this further to max(
+     * fs->next_ino, max_ino_seen + 1), closing the general case
+     * where the attacker set next_ino to any live inode's value. */
     if (fs->next_ino <= STM_ROOT_INO) fs->next_ino = STM_ROOT_INO + 1;
     fs->next_snap_id = le64_to_cpu(chosen->ss_next_snap_id);
+    /* R13-4: same pattern for snap_id. Initial clamp to >=1; the
+     * snap-tree walk raises to max_snap_id + 1. */
     if (fs->next_snap_id == 0) fs->next_snap_id = 1;
     fs->enc_algo = chosen->ss_enc_algo;
     memcpy(fs->enc_kdf_salt, chosen->ss_enc_kdf_salt, sizeof(fs->enc_kdf_salt));

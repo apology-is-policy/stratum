@@ -551,6 +551,14 @@ static int h_read(struct stm_9p *s, const uint8_t *body, uint32_t body_len,
             f->dir_cache_len = rd.pos;
         }
         {
+            /* R13-1: clamp `count` to the same bound the file branch uses.
+             * Without this, a malicious Tread with count=UINT32_MAX against
+             * a directory whose dir_cache has approached the msize cap
+             * (dir_cache_len ≈ msize - 2) makes memcpy write up to 9 bytes
+             * past the response buffer end — heap OOB write of server-
+             * controlled stat data. */
+            uint32_t maxrd = s->msize - P9_HDR_SIZE - 4;
+            if (count > maxrd) count = maxrd;
             uint32_t avail = (offset < f->dir_cache_len) ?
                              f->dir_cache_len - (uint32_t)offset : 0;
             uint32_t n = avail < count ? avail : count;
