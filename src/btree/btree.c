@@ -332,15 +332,46 @@ static int split_child(struct stm_btree *tree, struct stm_node *parent,
         rc = stm_internal_split(child, &split_key, &right);
     if (rc) return rc;
 
+    /* Pre-reserve parent's pivot/children arrays BEFORE any disk write.
+     * Without this, stm_node_insert_pivot at the end could fail with
+     * -ENOMEM after we've already written lbp/rbp, freed old_cbp, and
+     * overwritten parent->children[child_idx] = lbp — at which point
+     * rbp is an orphan on disk and the right half of the split is
+     * permanently unreachable from the tree (silent data loss on the
+     * next successful sync). ensure_key_cap is our atomic-grow helper;
+     * after it succeeds, insert_pivot is pure memmove and cannot fail. */
+    rc = ensure_key_cap(parent, parent->nkeys + 1);
+    if (rc) {
+        stm_node_free(right);
+        /* child was NOT written to disk yet — caller frees it? In the
+         * current call sites split_child always owns `child` (frees on
+         * both success and failure). Match that here. */
+        stm_node_free(child);
+        return rc;
+    }
+
     rc = stm_btree_write_node(tree, child, &lbp);
     if (rc) { stm_node_free(right); stm_node_free(child); return rc; }
 
     rc = stm_btree_write_node(tree, right, &rbp);
     stm_node_free(right);
-    if (rc) { stm_node_free(child); return rc; }
+    if (rc) {
+        /* lbp was written to disk but the new_root that would have
+         * pointed at it is being abandoned. Return lbp's blocks to the
+         * allocator so they don't leak until the next mount's walk. */
+        if (tree->alloc) {
+            uint64_t lpaddr = le64_to_cpu(lbp.bp_paddr);
+            uint32_t lcsize = le32_to_cpu(lbp.bp_csize);
+            uint32_t nblk = (lcsize + STM_BLOCK_SIZE - 1) / STM_BLOCK_SIZE;
+            stm_alloc_free(tree->alloc, lpaddr / STM_BLOCK_SIZE, nblk);
+        }
+        stm_node_free(child);
+        return rc;
+    }
 
     free_old_bptr(tree, &old_cbp); /* free old child's blocks (correct csize) */
     parent->children[child_idx] = lbp;
+    /* Must not fail after the pre-reservation above. */
     rc = stm_node_insert_pivot(parent, child_idx, &split_key, rbp);
     stm_node_free(child);
     return rc;
