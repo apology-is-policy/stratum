@@ -376,7 +376,15 @@ int stm_snap_rollback(struct stm_fs *fs, uint64_t snap_id)
     return 0;
 }
 
-/* ── delete (stub) ──────────────────────────────────────────────────── */
+/* Walk visitor that does nothing — used to dry-run a tree to verify every
+ * node reads cleanly before we start mutating refcounts. */
+static int noop_visit(uint64_t paddr, uint32_t csize, void *ctx)
+{
+    (void)paddr; (void)csize; (void)ctx;
+    return 0;
+}
+
+/* ── delete ─────────────────────────────────────────────────────────── */
 
 int stm_snap_delete(struct stm_fs *fs, uint64_t snap_id)
 {
@@ -393,10 +401,21 @@ int stm_snap_delete(struct stm_fs *fs, uint64_t snap_id)
     if (vlen < sizeof(snap)) return -EINVAL;
     memcpy(&snap, vbuf, sizeof(snap));
 
-    /* decrement refcounts on all blocks in the snapshot's tree */
+    /* Decrement refcounts on all blocks in the snapshot's tree. Do a
+     * read-only dry-run first: if any node can't be read we must bail
+     * BEFORE mutating refcounts, otherwise the partial decrements
+     * leave the allocator inconsistent with actual block ownership.
+     * The descriptor stays — the next mount's walk rebuilds the
+     * allocator from truth, and the user gets a `stratum check`
+     * signal that this snapshot needs attention. */
     if (fs->alloc) {
-        stm_btree_walk_entries(fs->tree, snap.ssp_root,
-                               free_block_fs, free_extent_entry, fs);
+        int vrc = stm_btree_walk_entries(fs->tree, snap.ssp_root,
+                                         noop_visit, NULL, NULL);
+        if (vrc) return vrc;
+
+        int wrc = stm_btree_walk_entries(fs->tree, snap.ssp_root,
+                                         free_block_fs, free_extent_entry, fs);
+        if (wrc) return wrc;  /* should not happen after dry-run, but safe */
     }
 
     /* remove snapshot descriptor and name index */
