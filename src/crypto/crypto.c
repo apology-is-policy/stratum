@@ -95,10 +95,23 @@ int stm_crypto_derive_key(const char *pass, size_t pass_len,
                           const uint8_t *salt, uint8_t *key_out)
 {
     ensure_sodium_init();
+    /* Argon2id parameters tuned for data-at-rest, not interactive login.
+     * INTERACTIVE (~0.5s, 64 MiB) is appropriate for web sessions where
+     * latency matters and brute-force attempts hit a rate-limiter in
+     * front. A disk volume has neither constraint: mount happens once
+     * per session, and a determined attacker with raw-disk access can
+     * grind offline on whatever hardware they rent.
+     *
+     * SENSITIVE (~3-5s, 1 GiB) is libsodium's data-at-rest tier. The
+     * ~10x CPU slowdown matters, but the real defense is the 1 GiB
+     * memory cost: GPUs and ASICs have comparatively scarce RAM, so
+     * parallelism drops from "every core" to "however many 1 GiB slots
+     * fit on the attacker's hardware." Breaking a modestly-strong
+     * passphrase goes from hours to years. */
     if (crypto_pwhash(key_out, STM_CRYPTO_KEY_LEN,
                       pass, pass_len, salt,
-                      crypto_pwhash_OPSLIMIT_INTERACTIVE,
-                      crypto_pwhash_MEMLIMIT_INTERACTIVE,
+                      crypto_pwhash_OPSLIMIT_SENSITIVE,
+                      crypto_pwhash_MEMLIMIT_SENSITIVE,
                       crypto_pwhash_ALG_ARGON2ID13) != 0)
         return -ENOMEM;
     return 0;

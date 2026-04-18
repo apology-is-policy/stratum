@@ -493,6 +493,8 @@ DEK (32 B random)               │ wrap
 
 DEK is unwrapped on mount and used for all subsequent encrypt/decrypt.
 
+Argon2id is parameterized at libsodium's `SENSITIVE` tier — `OPSLIMIT_SENSITIVE` (4 iterations) and `MEMLIMIT_SENSITIVE` (1 GiB). This is the data-at-rest tier: mount takes ~3-5 seconds on a modern laptop; the memory cost is what actually defeats GPU/ASIC brute force, since parallelism on those accelerators is limited by their (much smaller) RAM per compute unit. The cost is paid exactly once per mount, so the overhead is invisible to interactive use.
+
 ### 9.3 Nonce construction
 
 Nonce (24 B) = `le64(paddr) ‖ le64(write_gen) ‖ 8 zero bytes`.
