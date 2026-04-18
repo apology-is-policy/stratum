@@ -363,6 +363,15 @@ int stm_snap_rollback(struct stm_fs *fs, uint64_t snap_id)
                       : stm_btree_next_alloc(fs->tree));
     stm_fs_configure_tree(fs, fs->tree);
 
+    /* The freshly-reopened fs->tree was calloc'd, so its alloc pointer
+     * is NULL. Connect it to the CURRENT allocator (A_old) up front —
+     * if the allocator rebuild below fails, the restored state must
+     * leave fs->tree->alloc pointing at a valid allocator, not NULL.
+     * Without this, rollback_restore would leave tree->alloc as NULL,
+     * and the next write through fs->tree would fall into the bump-
+     * allocator branch and silently trample live blocks. */
+    if (fs->alloc) stm_btree_set_allocator(fs->tree, fs->alloc);
+
     /* Rebuild allocator for the restored tree — old refcounts are stale.
      * Without this, the allocator thinks pre-rollback blocks are in use
      * and the restored tree's blocks are free → double allocation.
