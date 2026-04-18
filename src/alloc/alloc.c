@@ -6,7 +6,7 @@
 
 #define GROW_MIN    (16 * 1024)       /* minimum grow: 64 MiB */
 #define GROW_MAX    (256 * 1024)      /* maximum grow: 1 GiB */
-#define REFCOUNT_PENDING 0xFFFF     /* sentinel: freed but not yet reclaimable */
+#define REFCOUNT_PENDING 0xFFFFFFFFu /* sentinel: freed but not yet reclaimable */
 
 struct deferred_free {
     uint64_t block_nr;
@@ -18,7 +18,9 @@ struct stm_alloc {
     uint64_t  total;             /* total blocks */
     uint64_t  free_count;
     uint64_t  hint;              /* roving cursor for next-fit */
-    uint16_t *refcounts;         /* refcount per block */
+    uint32_t *refcounts;         /* refcount per block — widened from
+                                  * uint16_t so blocks shared by many
+                                  * snapshots don't saturate at 65534 */
     struct deferred_free *deferred;
     uint32_t  ndeferred;
     uint32_t  deferred_cap;
@@ -35,7 +37,7 @@ int stm_alloc_open(struct stm_block_dev *dev, uint64_t total_blocks,
     a->free_count = total_blocks;
     a->hint  = 0;
 
-    a->refcounts = calloc(total_blocks, sizeof(uint16_t));
+    a->refcounts = calloc(total_blocks, sizeof(uint32_t));
     if (!a->refcounts) { free(a); return -ENOMEM; }
 
     a->deferred_cap = 256;
@@ -58,7 +60,7 @@ void stm_alloc_mark(struct stm_alloc *a, uint64_t block_nr, uint32_t count)
 {
     uint32_t i;
     for (i = 0; i < count && block_nr + i < a->total; i++) {
-        uint16_t rc = a->refcounts[block_nr + i];
+        uint32_t rc = a->refcounts[block_nr + i];
         if (rc == 0) a->free_count--;
         if (rc < REFCOUNT_PENDING - 1) /* clamp to avoid colliding with sentinel */
             a->refcounts[block_nr + i]++;
@@ -69,7 +71,7 @@ void stm_alloc_mark(struct stm_alloc *a, uint64_t block_nr, uint32_t count)
 static int try_grow(struct stm_alloc *a)
 {
     uint64_t new_total, new_size;
-    uint16_t *nr;
+    uint32_t *nr;
 
     if (!a->dev || !a->dev->ops->resize)
         return -ENOSPC;
@@ -88,14 +90,14 @@ static int try_grow(struct stm_alloc *a)
      * (Old order was ftruncate → realloc, which on realloc-fail left
      * the backing file permanently enlarged with no allocator visibility
      * into the new blocks.) */
-    nr = realloc(a->refcounts, new_total * sizeof(uint16_t));
+    nr = realloc(a->refcounts, new_total * sizeof(uint32_t));
     if (!nr) return -ENOMEM;
-    memset(nr + a->total, 0, (size_t)(new_total - a->total) * sizeof(uint16_t));
+    memset(nr + a->total, 0, (size_t)(new_total - a->total) * sizeof(uint32_t));
 
     if (a->dev->ops->resize(a->dev->ctx, new_size) != 0) {
         /* Shrink the array back so we don't silently keep the bigger
          * buffer on the next attempt. */
-        uint16_t *shrink = realloc(nr, a->total * sizeof(uint16_t));
+        uint32_t *shrink = realloc(nr, a->total * sizeof(uint32_t));
         a->refcounts = shrink ? shrink : nr;
         return -ENOSPC;
     }
@@ -244,7 +246,7 @@ uint64_t stm_alloc_total(struct stm_alloc *a)
     return a->total;
 }
 
-uint16_t stm_alloc_get_refcount(struct stm_alloc *a, uint64_t block_nr)
+uint32_t stm_alloc_get_refcount(struct stm_alloc *a, uint64_t block_nr)
 {
     if (block_nr >= a->total) return 0;
     return a->refcounts[block_nr];

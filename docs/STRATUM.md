@@ -320,10 +320,12 @@ The stored `comp` byte is persisted with the extent record, so readers always kn
 
 ### 5.1 Structure
 
-Per-block 16-bit refcount array. Values:
+Per-block 32-bit refcount array (widened from 16-bit so volumes with very many snapshots sharing a root block don't saturate and mis-free). Values:
 - `0` — free
-- `1..0xFFFE` — in use (clamped to avoid sentinel collision)
-- `0xFFFF` — `REFCOUNT_PENDING` (freed, not yet reusable)
+- `1..0xFFFFFFFE` — in use (clamped to avoid sentinel collision)
+- `0xFFFFFFFF` — `REFCOUNT_PENDING` (freed, not yet reusable)
+
+The array costs 4 bytes per 4 KiB block — 1 MiB per 1 GiB of volume.
 
 ### 5.2 Allocation strategy
 
@@ -711,7 +713,7 @@ Key optimizations applied (git history):
 - **128 KiB extent + AEAD tag**: encrypted extent uses 33 blocks (128 KiB + 16 B tag rounds up).
 - **Partial 9P walks**: server rejects when `newfid != fid`; client also guards.
 - **Dirent collisions**: FNV1a + 256-slot linear probe. No tombstones — deletion leaves a hole that subsequent lookups respect.
-- **Refcount clamp at 0xFFFE**: prevents collision with `REFCOUNT_PENDING = 0xFFFF`.
+- **Refcount clamp at 0xFFFFFFFE**: prevents collision with `REFCOUNT_PENDING = 0xFFFFFFFF`.
 - **Deferred free under OOM**: if the deferred list can't grow, free silently reverts the refcount. Block is leaked until next mount's tree-walk rebuild.
 
 ---
@@ -749,7 +751,7 @@ Key optimizations applied (git history):
 | **msize** | 9P maximum message size (1 MiB default) |
 | **nonce** | XChaCha20 nonce (24 B; Stratum uses paddr LE ‖ write_gen LE ‖ zeros) |
 | **paddr** | Physical byte address on device |
-| **PENDING** | Refcount sentinel 0xFFFF for freed-but-not-committed |
+| **PENDING** | Refcount sentinel 0xFFFFFFFF for freed-but-not-committed |
 | **QID** | 9P unique-id tuple |
 | **Refcount** | Per-block reference count for snapshot sharing |
 | **Scratch buffer** | Reusable per-fs buffer for extent I/O |

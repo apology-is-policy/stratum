@@ -536,12 +536,12 @@ static void reconcile(struct walk_ctx *w, struct stm_alloc *alloc)
     /* Scan all blocks except the two superblock slots. */
     for (uint64_t b = 2; b < w->dev_blocks; b++) {
         uint32_t expected = w->refmap[b];
-        uint16_t actual = stm_alloc_get_refcount(alloc, b);
+        uint32_t actual = stm_alloc_get_refcount(alloc, b);
 
-        if (actual == 0xFFFF) continue; /* REFCOUNT_PENDING: transient */
+        if (actual == 0xFFFFFFFFu) continue; /* REFCOUNT_PENDING: transient */
         if (expected == 0 && actual != 0) over_counts++;
         else if (expected != 0 && actual == 0) expected_leaks++;
-        else if (expected != (uint32_t)actual) under_counts++;
+        else if (expected != actual) under_counts++;
     }
 
     if (expected_leaks + over_counts + under_counts == 0) {
@@ -561,9 +561,9 @@ static void reconcile(struct walk_ctx *w, struct stm_alloc *alloc)
         int shown = 0;
         for (uint64_t b = 2; b < w->dev_blocks && shown < 40; b++) {
             uint32_t expected = w->refmap[b];
-            uint16_t actual = stm_alloc_get_refcount(alloc, b);
-            if (actual == 0xFFFF) continue;
-            if (expected != (uint32_t)actual) {
+            uint32_t actual = stm_alloc_get_refcount(alloc, b);
+            if (actual == 0xFFFFFFFFu) continue;
+            if (expected != actual) {
                 printf("      block %llu: expected %u, allocator=%u\n",
                        (unsigned long long)b, expected, actual);
                 shown++;
