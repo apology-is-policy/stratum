@@ -448,6 +448,15 @@ static int stm_fs_open_impl(const char *path, const char *passphrase,
 
     fs->gen         = le64_to_cpu(chosen->ss_gen);
     fs->next_ino    = le64_to_cpu(chosen->ss_next_ino);
+    /* R12-1: clamp next_ino > STM_ROOT_INO. The SB is plaintext and
+     * protected only by xxHash3-128 (unkeyed, not a MAC). An attacker
+     * with raw disk write but no passphrase could set ss_next_ino = 1
+     * (== STM_ROOT_INO) and recompute ss_csum. User mounts and the
+     * next create_file overwrites the root inode at key (1, INODE, 0),
+     * destroying the root directory. Defense-in-depth: a freshly
+     * mkfs'd volume has next_ino = STM_ROOT_INO + 1, so any lower
+     * value is adversarial. */
+    if (fs->next_ino <= STM_ROOT_INO) fs->next_ino = STM_ROOT_INO + 1;
     fs->next_snap_id = le64_to_cpu(chosen->ss_next_snap_id);
     if (fs->next_snap_id == 0) fs->next_snap_id = 1;
     fs->enc_algo = chosen->ss_enc_algo;
@@ -564,9 +573,14 @@ static int stm_fs_open_impl(const char *path, const char *passphrase,
     }
 alloc_ok:
 
-    /* Allocate reusable scratch buffers for extent I/O */
+    /* R12-2: check scratch-buffer allocations. NULL here would segfault
+     * the first stm_fs_write/read; mount failure is the correct response. */
     fs->extent_buf = malloc(STM_EXTENT_SIZE);
     fs->cipher_buf = malloc(STM_EXTENT_SIZE + STM_CRYPTO_TAG_LEN);
+    if (!fs->extent_buf || !fs->cipher_buf) {
+        rc = -ENOMEM;
+        goto fail_bufs;
+    }
 
     /* Compression algo from superblock. Refuse to mount if the persisted
      * codec isn't in this build — otherwise we'd silently fail to decode
@@ -574,19 +588,11 @@ alloc_ok:
     fs->comp_algo = chosen->ss_comp_algo;
     if (fs->comp_algo == STM_COMP_LZ4) {
 #ifndef STM_HAVE_LZ4
-        memset(fs->dek, 0, sizeof(fs->dek));
-        stm_alloc_close(fs->alloc); stm_btree_close(fs->snap_tree);
-        stm_btree_close(fs->tree); stm_block_close(&fs->dev);
-        free(fs->extent_buf); free(fs->cipher_buf); free(fs);
-        return -ENOTSUP;
+        rc = -ENOTSUP; goto fail_bufs;
 #endif
     } else if (fs->comp_algo == STM_COMP_ZSTD) {
 #ifndef STM_HAVE_ZSTD
-        memset(fs->dek, 0, sizeof(fs->dek));
-        stm_alloc_close(fs->alloc); stm_btree_close(fs->snap_tree);
-        stm_btree_close(fs->tree); stm_block_close(&fs->dev);
-        free(fs->extent_buf); free(fs->cipher_buf); free(fs);
-        return -ENOTSUP;
+        rc = -ENOTSUP; goto fail_bufs;
 #endif
     }
 
@@ -598,6 +604,7 @@ alloc_ok:
             if (b > cbound) cbound = b;
         }
         fs->comp_buf = malloc(cbound);
+        if (!fs->comp_buf) { rc = -ENOMEM; goto fail_bufs; }
     }
 
     /* Mount-time gen bump. Extends R7-1's crash-safety invariant from
@@ -638,6 +645,7 @@ alloc_ok:
     *out = fs;
     return 0;
 
+fail_bufs:
 fail_bump:
     memset(fs->dek, 0, sizeof(fs->dek));
     free(fs->comp_buf);

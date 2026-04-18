@@ -310,11 +310,15 @@ int stm_btree_lookup(struct stm_btree *tree, const struct stm_key *key,
 
 /* ── flush machinery ────────────────────────────────────────────────── */
 
-static uint32_t find_heaviest_child(const struct stm_node *n)
+/* Out param variant — returns -ENOMEM if the count-array calloc fails.
+ * The original silently returned 0, which made flush_node/drain_all
+ * repeatedly flush to child 0 regardless of actual traffic, churning
+ * new paddrs until the allocator errored out. */
+static int find_heaviest_child(const struct stm_node *n, uint32_t *out_ci)
 {
     uint32_t *counts, best, i;
     counts = calloc(n->nkeys + 1, sizeof(*counts));
-    if (!counts) return 0;
+    if (!counts) return -ENOMEM;
 
     for (i = 0; i < n->nmsgs; i++) {
         uint32_t ci = stm_node_find_child(n, &n->msgs[i].key);
@@ -324,7 +328,8 @@ static uint32_t find_heaviest_child(const struct stm_node *n)
     for (i = 1; i <= n->nkeys; i++)
         if (counts[i] > counts[best]) best = i;
     free(counts);
-    return best;
+    *out_ci = best;
+    return 0;
 }
 
 static int flush_node(struct stm_btree *tree, struct stm_node *parent);
@@ -408,7 +413,8 @@ static int flush_node(struct stm_btree *tree, struct stm_node *parent)
 
     if (parent_nmsgs == 0) return 0;
 
-    ci = find_heaviest_child(parent);
+    rc = find_heaviest_child(parent, &ci);
+    if (rc) return rc;
     rc = stm_btree_read_node(tree, &parent->children[ci], &child);
     if (rc) return rc;
 
@@ -615,12 +621,14 @@ static int drain_all(struct stm_btree *tree, struct stm_node *node)
      * child write succeeds. On failure, parent's msgs stay intact
      * and the next retry re-applies from a clean re-read of child. */
     while (node->nmsgs > 0) {
-        uint32_t ci = find_heaviest_child(node);
+        uint32_t ci;
         struct stm_node *child = NULL;
         struct stm_bptr cbp;
         int *flushed = NULL;
         uint32_t node_nmsgs = node->nmsgs;
 
+        rc = find_heaviest_child(node, &ci);
+        if (rc) return rc;
         rc = stm_btree_read_node(tree, &node->children[ci], &child);
         if (rc) return rc;
         flushed = calloc(node_nmsgs, sizeof(*flushed));
