@@ -329,17 +329,30 @@ static int cmd_serve(int argc, char **argv)
         close(client_fd);
         printf("Client disconnected.\n");
 
-        /* sync after each client session */
-        stm_fs_sync(fs);
+        /* sync after each client session. If sync fails here (EIO,
+         * ENOSPC mid-flush), the LAST session's writes aren't durable
+         * — shout at the operator rather than silently accepting
+         * another client who'd see phantom state. */
+        rc = stm_fs_sync(fs);
+        if (rc) {
+            fprintf(stderr, "ERROR: post-session sync failed (%s); "
+                    "stopping the server to preserve volume state.\n",
+                    strerror(-rc));
+            break;
+        }
     }
 
     printf("\nShutting down...\n");
-    stm_fs_sync(fs);
+    rc = stm_fs_sync(fs);
+    if (rc) {
+        fprintf(stderr, "ERROR: shutdown sync failed (%s); last writes "
+                "may be lost on next mount.\n", strerror(-rc));
+    }
     close(listen_fd);
     if (strncmp(listen_addr, "unix:", 5) == 0)
         unlink(listen_addr + 5);
     stm_fs_close(fs);
-    return 0;
+    return rc ? 1 : 0;
 }
 
 static int cmd_info(int argc, char **argv)

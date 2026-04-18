@@ -92,7 +92,8 @@ int stm_btree_write_node(struct stm_btree *tree, struct stm_node *n,
     uint8_t *buf, *write_buf, *comp_buf = NULL;
     uint32_t used, write_len;
     uint8_t algo;
-    uint64_t addr;
+    uint64_t addr = 0;
+    uint32_t disk_len_allocated = 0;  /* for failure-path block reclaim */
     int rc;
 
     buf = calloc(1, STM_NODE_SIZE);
@@ -136,6 +137,7 @@ int stm_btree_write_node(struct stm_btree *tree, struct stm_node *n,
 
         rc = stm_btree_alloc(tree, disk_len, &addr);
         if (rc) { free(enc_buf); free(comp_buf); free(buf); return rc; }
+        disk_len_allocated = disk_len;
 
         memset(out, 0, sizeof(*out));
 
@@ -153,7 +155,7 @@ int stm_btree_write_node(struct stm_btree *tree, struct stm_node *n,
             rc = stm_crypto_encrypt(tree->crypto, addr, tree->write_gen,
                                     write_buf, write_len, enc_buf, &clen);
             free(comp_buf); free(buf);
-            if (rc) { free(enc_buf); return rc; }
+            if (rc) { free(enc_buf); goto fail_free_alloc; }
             stm_csum_compute(enc_buf, clen, out->bp_csum);
             rc = stm_block_write(tree->dev, addr, enc_buf, clen);
             write_len = clen;
@@ -163,7 +165,7 @@ int stm_btree_write_node(struct stm_btree *tree, struct stm_node *n,
             rc = stm_block_write(tree->dev, addr, write_buf, write_len);
             free(comp_buf); free(buf);
         }
-        if (rc) return rc;
+        if (rc) goto fail_free_alloc;
     }
 
     n->paddr = addr;
@@ -175,6 +177,15 @@ int stm_btree_write_node(struct stm_btree *tree, struct stm_node *n,
     out->bp_csize = cpu_to_le32(write_len);
     out->bp_lsize = cpu_to_le32(used);
     return 0;
+
+fail_free_alloc:
+    /* Encrypt or write failed after allocation — return blocks to the
+     * allocator so they don't leak until next mount's walk. */
+    if (tree->alloc && disk_len_allocated) {
+        uint32_t nblk = (disk_len_allocated + STM_BLOCK_SIZE - 1) / STM_BLOCK_SIZE;
+        stm_alloc_free(tree->alloc, addr / STM_BLOCK_SIZE, nblk);
+    }
+    return rc;
 }
 
 /* ── open / close ───────────────────────────────────────────────────── */

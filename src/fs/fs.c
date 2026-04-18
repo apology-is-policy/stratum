@@ -932,12 +932,16 @@ int stm_fs_write(struct stm_fs *fs, uint64_t ino, uint64_t offset,
                 extent_data_len = inner + towrite;
             }
         } else {
-            /* full extent write — skip lookup if writing past file end */
-            if (ext_off < cur_size) {
-                uint32_t vlen = sizeof(old_ext);
-                rc = stm_btree_lookup(fs->tree, &k, &old_ext, &vlen);
-                if (rc == 0) had_old = 1;
-            }
+            /* Full extent write. Must always look up the old record —
+             * without this, a retry after a partial-write failure would
+             * see cur_size unchanged (inode size is only bumped after
+             * all extents succeed) and skip the lookup for extent
+             * offsets from the first attempt. The old extent's blocks
+             * would then leak as btree_insert replaces the record. */
+            uint32_t vlen = sizeof(old_ext);
+            rc = stm_btree_lookup(fs->tree, &k, &old_ext, &vlen);
+            if (rc == 0) had_old = 1;
+            else if (rc != -ENOENT) return rc;
             extent_data_len = STM_EXTENT_SIZE;
         }
 

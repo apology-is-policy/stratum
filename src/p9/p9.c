@@ -69,7 +69,6 @@ struct p9_fid {
 struct stm_9p {
     struct stm_fs *fs;
     uint32_t msize;
-    int dirty;              /* set when writes happen; cleared by sync */
     struct p9_fid fids[MAX_FIDS];
 };
 
@@ -418,6 +417,8 @@ static int h_read(struct stm_9p *s, const uint8_t *body, uint16_t tag,
          * Subsequent reads at different offsets use the cache. */
         if (!f->dir_cache) {
             uint8_t *tbuf = calloc(1, s->msize);
+            if (!tbuf) return resp_error(resp, resp_len, tag,
+                                         "no memory for readdir");
             struct rdir_ctx rd = { .srv = s, .buf = tbuf, .cap = s->msize, .pos = 0 };
             stm_fs_readdir(s->fs, f->ino, rdir_cb, &rd);
             f->dir_cache = tbuf;
@@ -495,7 +496,6 @@ static int h_clunk(struct stm_9p *s, const uint8_t *body, uint16_t tag,
      * Rerror even though clunk would normally always succeed. */
     if (f && f->size_dirty) {
         int rc = stm_fs_sync(s->fs);
-        s->dirty = 0;
         if (rc) {
             fid_free(s, fid_nr);
             return resp_error(resp, resp_len, tag, "sync failed on clunk");
@@ -540,7 +540,6 @@ static int h_remove(struct stm_9p *s, const uint8_t *body, uint16_t tag,
      * Propagate sync failure so the client knows the delete wasn't durable. */
     {
         int rc = stm_fs_sync(s->fs);
-        s->dirty = 0;
         if (rc) return resp_error(resp, resp_len, tag, "sync failed on remove");
     }
 
@@ -753,5 +752,3 @@ static int h_snap_rollback(struct stm_9p *s, const uint8_t *body, uint16_t tag,
 }
 
 void stm_9p_destroy(struct stm_9p *s) { free(s); }
-int  stm_9p_is_dirty(struct stm_9p *s) { return s->dirty; }
-void stm_9p_clear_dirty(struct stm_9p *s) { s->dirty = 0; }
