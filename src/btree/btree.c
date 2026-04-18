@@ -351,34 +351,51 @@ static int flush_node(struct stm_btree *tree, struct stm_node *parent)
     uint32_t ci;
     struct stm_node *child = NULL;
     struct stm_bptr cbp;
+    int *flushed = NULL;
+    uint32_t parent_nmsgs = parent->nmsgs;
     int rc;
 
-    if (parent->nmsgs == 0) return 0;
+    if (parent_nmsgs == 0) return 0;
 
     ci = find_heaviest_child(parent);
     rc = stm_btree_read_node(tree, &parent->children[ci], &child);
     if (rc) return rc;
 
-    rc = stm_msg_flush_child(parent, ci, child);
-    if (rc) { stm_node_free(child); return rc; }
+    flushed = calloc(parent_nmsgs, sizeof(*flushed));
+    if (!flushed) { stm_node_free(child); return -ENOMEM; }
 
-    if (stm_node_is_full(child))
-        return split_child(tree, parent, ci, child);  /* frees child */
+    rc = stm_msg_apply_to_child(parent, ci, child, flushed);
+    if (rc) { free(flushed); stm_node_free(child); return rc; }
+
+    if (stm_node_is_full(child)) {
+        /* split_child writes both halves and mutates parent->children.
+         * If it succeeds, we commit parent's msg compaction; on failure,
+         * parent is untouched and flushed[] is discarded. */
+        rc = split_child(tree, parent, ci, child);  /* frees child */
+        if (rc) { free(flushed); return rc; }
+        stm_msg_commit_flush(parent, flushed);
+        free(flushed);
+        return 0;
+    }
 
     /* recurse if child's own buffer overflows */
     if (!(child->flags & STM_NODE_LEAF) && stm_msg_buffer_full(child)) {
         rc = flush_node(tree, child);
-        if (rc) { stm_node_free(child); return rc; }
+        if (rc) { free(flushed); stm_node_free(child); return rc; }
     }
 
     {
         struct stm_bptr old_cbp = parent->children[ci]; /* save before overwrite */
         rc = stm_btree_write_node(tree, child, &cbp);
         stm_node_free(child);
-        if (rc) return rc;
+        if (rc) { free(flushed); return rc; }
+        /* Write succeeded — now compact parent's msg buffer. Before this
+         * point parent is fully intact, so a failure would have left the
+         * flushed messages still pending for a retry. */
+        stm_msg_commit_flush(parent, flushed);
+        free(flushed);
         free_old_bptr(tree, &old_cbp);
         parent->children[ci] = cbp;
-        parent->dirty = 1;
     }
     return 0;
 }
@@ -506,28 +523,40 @@ static int drain_all(struct stm_btree *tree, struct stm_node *node)
 
     if (node->flags & STM_NODE_LEAF) return 0;
 
-    /* phase 1: push this node's messages down one level */
+    /* phase 1: push this node's messages down one level.
+     * Two-phase flush: apply to child (in memory) + remember which
+     * messages landed; only commit parent's compaction after the
+     * child write succeeds. On failure, parent's msgs stay intact
+     * and the next retry re-applies from a clean re-read of child. */
     while (node->nmsgs > 0) {
         uint32_t ci = find_heaviest_child(node);
         struct stm_node *child = NULL;
         struct stm_bptr cbp;
+        int *flushed = NULL;
+        uint32_t node_nmsgs = node->nmsgs;
 
         rc = stm_btree_read_node(tree, &node->children[ci], &child);
         if (rc) return rc;
-        rc = stm_msg_flush_child(node, ci, child);
-        if (rc) { stm_node_free(child); return rc; }
+        flushed = calloc(node_nmsgs, sizeof(*flushed));
+        if (!flushed) { stm_node_free(child); return -ENOMEM; }
+
+        rc = stm_msg_apply_to_child(node, ci, child, flushed);
+        if (rc) { free(flushed); stm_node_free(child); return rc; }
 
         if (stm_node_is_full(child)) {
             rc = split_child(tree, node, ci, child);
-            if (rc) return rc;
+            if (rc) { free(flushed); return rc; }
+            stm_msg_commit_flush(node, flushed);
+            free(flushed);
         } else {
             struct stm_bptr old_cbp = node->children[ci];
             rc = stm_btree_write_node(tree, child, &cbp);
             stm_node_free(child);
-            if (rc) return rc;
+            if (rc) { free(flushed); return rc; }
+            stm_msg_commit_flush(node, flushed);
+            free(flushed);
             free_old_bptr(tree, &old_cbp);
             node->children[ci] = cbp;
-            node->dirty = 1;
         }
     }
 

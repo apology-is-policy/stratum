@@ -84,20 +84,15 @@ int stm_msg_buffer_full(const struct stm_node *n)
     return (structural + msg_used) > (STM_NODE_BODY_SIZE * 9 / 10);
 }
 
-int stm_msg_flush_child(struct stm_node *parent, uint32_t child_idx,
-                        struct stm_node *child)
+int stm_msg_apply_to_child(const struct stm_node *parent, uint32_t child_idx,
+                           struct stm_node *child, int *flushed_out)
 {
-    uint32_t i, kept = 0, new_msg_bytes = 0;
+    uint32_t i;
 
     for (i = 0; i < parent->nmsgs; i++) {
+        flushed_out[i] = 0;
         uint32_t dest = stm_node_find_child(parent, &parent->msgs[i].key);
-        if (dest != child_idx) {
-            /* keep in parent */
-            if (kept != i) parent->msgs[kept] = parent->msgs[i];
-            new_msg_bytes += parent->msgs[i].vlen;
-            kept++;
-            continue;
-        }
+        if (dest != child_idx) continue;
 
         if (child->flags & STM_NODE_LEAF) {
             int frc = 0;
@@ -106,32 +101,36 @@ int stm_msg_flush_child(struct stm_node *parent, uint32_t child_idx,
                                       parent->msgs[i].val, parent->msgs[i].vlen);
             else if (parent->msgs[i].op == STM_MSG_DELETE)
                 frc = stm_leaf_delete(child, &parent->msgs[i].key);
-            if (frc && frc != -ENOENT) {
-                /* Insert/delete failed (OOM) — keep message in parent */
-                if (kept != i) parent->msgs[kept] = parent->msgs[i];
-                new_msg_bytes += parent->msgs[i].vlen;
-                kept++;
-                continue;
-            }
-            free(parent->msgs[i].val);
+            if (frc && frc != -ENOENT) continue;   /* leave in parent */
+            flushed_out[i] = 1;
         } else {
             int frc = stm_msg_insert(child, &parent->msgs[i].key,
                                      parent->msgs[i].op, parent->msgs[i].gen,
                                      parent->msgs[i].val, parent->msgs[i].vlen);
-            if (frc) {
-                /* Failed to buffer in child — keep in parent */
-                if (kept != i) parent->msgs[kept] = parent->msgs[i];
-                new_msg_bytes += parent->msgs[i].vlen;
-                kept++;
-                continue;
-            }
-            free(parent->msgs[i].val);
+            if (frc) continue;                     /* leave in parent */
+            flushed_out[i] = 1;
         }
     }
 
+    child->dirty = 1;
+    /* parent->dirty stays as-is until commit */
+    return 0;
+}
+
+void stm_msg_commit_flush(struct stm_node *parent, const int *flushed)
+{
+    uint32_t i, kept = 0, new_msg_bytes = 0;
+
+    for (i = 0; i < parent->nmsgs; i++) {
+        if (flushed[i]) {
+            free(parent->msgs[i].val);
+            continue;
+        }
+        if (kept != i) parent->msgs[kept] = parent->msgs[i];
+        new_msg_bytes += parent->msgs[i].vlen;
+        kept++;
+    }
     parent->nmsgs     = kept;
     parent->msg_bytes = new_msg_bytes;
     parent->dirty     = 1;
-    child->dirty      = 1;
-    return 0;
 }

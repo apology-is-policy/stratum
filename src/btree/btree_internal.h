@@ -114,8 +114,20 @@ int stm_msg_insert(struct stm_node *n, const struct stm_key *key,
 int stm_msg_find(const struct stm_node *n, const struct stm_key *key,
                  const struct stm_msg_entry **out);
 int stm_msg_buffer_full(const struct stm_node *n);
-int stm_msg_flush_child(struct stm_node *parent, uint32_t child_idx,
-                        struct stm_node *child);
+/* Two-phase flush so a later write failure doesn't orphan messages:
+ *   stm_msg_apply_to_child(parent, ci, child, flushed_out)
+ *     applies parent's messages targeted at `child` to `child`. Sets
+ *     flushed_out[i] = 1 for each parent message that landed. Parent's
+ *     msg array is NOT mutated and no vals are freed.
+ *   stm_msg_commit_flush(parent, flushed)
+ *     called AFTER the caller successfully wrote `child` to disk:
+ *     compacts parent's msg array (removing flushed entries) and frees
+ *     their vals. Sets parent->dirty = 1.
+ * On a write failure, the caller skips commit — parent state is intact
+ * and a later retry re-reads `child` from disk and re-applies. */
+int  stm_msg_apply_to_child(const struct stm_node *parent, uint32_t child_idx,
+                            struct stm_node *child, int *flushed_out);
+void stm_msg_commit_flush(struct stm_node *parent, const int *flushed);
 
 /* --- btree.c (internal helpers) --------------------------------------- */
 
