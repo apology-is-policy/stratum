@@ -453,6 +453,118 @@ STM_TEST(test_fs_write_overflow_guard)
     unlink(path);
 }
 
+/* Regression for R6-1: the partial-extent `had_old` path in stm_fs_write
+ * used to leave ebuf[old_dlen .. inner] uninitialized, reading back residue
+ * from any previous extent operation on any file. On encrypted volumes that
+ * is cross-file plaintext leakage; on unencrypted it violates sparse-hole
+ * semantics. Setup:
+ *   1. Write file A, 128 KiB of 'A' pattern → ebuf primed with 'A'.
+ *   2. Write file B with a short value (creates the extent), then a second
+ *      write past the short tail but within the same 128 KiB extent
+ *      boundary — exercises the `had_old` branch with inner > old_dlen.
+ *   3. Read the gap. Must be zeros, not 'A'. */
+STM_TEST(test_fs_write_gap_is_zeroed)
+{
+    const char *path = "/tmp/stratum_test_gap_zero.img";
+    struct stm_fs *fs;
+    unlink(path);
+    STM_ASSERT_EQ(stm_fs_create(path, 64ULL*1024*1024, NULL), 0);
+    STM_ASSERT_EQ(stm_fs_open(path, NULL, &fs), 0);
+
+    uint64_t ino_a, ino_b;
+    STM_ASSERT_EQ(stm_fs_create_file(fs, 1, "a.bin", 0644, &ino_a), 0);
+    STM_ASSERT_EQ(stm_fs_create_file(fs, 1, "b.bin", 0644, &ino_b), 0);
+
+    /* File B: short write at offset 0 (ENOENT branch — memsets ebuf to 0,
+     * which actually clears any residue, so we have to re-prime afterward). */
+    STM_ASSERT_EQ(stm_fs_write(fs, ino_b, 0, "BB", 2), 0);
+
+    /* Re-prime the shared extent_buf with 'A' via a full 128 KiB write to
+     * file A. Full-extent path does not memset — memcpy overwrites the whole
+     * extent — so ebuf is left holding all 'A'. */
+    uint8_t *abuf = malloc(131072);
+    STM_ASSERT(abuf);
+    memset(abuf, 'A', 131072);
+    STM_ASSERT_EQ(stm_fs_write(fs, ino_a, 0, abuf, 131072), 0);
+
+    /* Gap-producing write on file B: inner=50000, old_dlen=2. Without the
+     * R6-1 memset, ebuf[2..50000] retains 'A' from the step above and gets
+     * encrypted into file B's new extent. With the fix, that region is zero. */
+    STM_ASSERT_EQ(stm_fs_write(fs, ino_b, 50000, "XX", 2), 0);
+
+    /* Read the gap. All bytes between offset 2 and offset 50_000 must be
+     * zero — a sparse hole. If residue leaked, bytes will be 'A' (0x41). */
+    uint8_t *rbuf = malloc(50000);
+    STM_ASSERT(rbuf);
+    memset(rbuf, 0xEE, 50000);
+    uint32_t nread = 0;
+    STM_ASSERT_EQ(stm_fs_read(fs, ino_b, 2, rbuf, 49998, &nread), 0);
+    STM_ASSERT_EQ(nread, 49998u);
+    int i;
+    for (i = 0; i < 49998; i++) {
+        if (rbuf[i] != 0) {
+            fprintf(stderr, "leak at gap offset %d: byte=0x%02x\n",
+                    i, rbuf[i]);
+            STM_ASSERT(0);
+        }
+    }
+
+    /* Sanity: the written bytes themselves survive. */
+    uint8_t tail[2];
+    STM_ASSERT_EQ(stm_fs_read(fs, ino_b, 50000, tail, 2, &nread), 0);
+    STM_ASSERT_EQ(nread, 2u);
+    STM_ASSERT(tail[0] == 'X' && tail[1] == 'X');
+
+    free(abuf); free(rbuf);
+    stm_fs_close(fs);
+    unlink(path);
+}
+
+/* Encrypted variant of the above — the real damage from R6-1 is ciphertext
+ * that decrypts to another file's plaintext. */
+STM_TEST(test_fs_write_gap_is_zeroed_encrypted)
+{
+    const char *path = "/tmp/stratum_test_gap_zero_enc.img";
+    const char *pass = "gapzero";
+    struct stm_fs *fs;
+    unlink(path);
+    STM_ASSERT_EQ(stm_fs_create(path, 64ULL*1024*1024, pass), 0);
+    STM_ASSERT_EQ(stm_fs_open(path, pass, &fs), 0);
+
+    uint64_t ino_a, ino_b;
+    STM_ASSERT_EQ(stm_fs_create_file(fs, 1, "a.bin", 0644, &ino_a), 0);
+    STM_ASSERT_EQ(stm_fs_create_file(fs, 1, "b.bin", 0644, &ino_b), 0);
+
+    STM_ASSERT_EQ(stm_fs_write(fs, ino_b, 0, "BB", 2), 0);
+
+    uint8_t *abuf = malloc(131072);
+    STM_ASSERT(abuf);
+    memset(abuf, 'A', 131072);
+    STM_ASSERT_EQ(stm_fs_write(fs, ino_a, 0, abuf, 131072), 0);
+
+    STM_ASSERT_EQ(stm_fs_write(fs, ino_b, 50000, "XX", 2), 0);
+    STM_ASSERT_EQ(stm_fs_sync(fs), 0);
+
+    uint8_t *rbuf = malloc(50000);
+    STM_ASSERT(rbuf);
+    memset(rbuf, 0xEE, 50000);
+    uint32_t nread = 0;
+    STM_ASSERT_EQ(stm_fs_read(fs, ino_b, 2, rbuf, 49998, &nread), 0);
+    STM_ASSERT_EQ(nread, 49998u);
+    int i;
+    for (i = 0; i < 49998; i++) {
+        if (rbuf[i] != 0) {
+            fprintf(stderr, "enc leak at gap offset %d: byte=0x%02x\n",
+                    i, rbuf[i]);
+            STM_ASSERT(0);
+        }
+    }
+
+    free(abuf); free(rbuf);
+    stm_fs_close(fs);
+    unlink(path);
+}
+
 int main(void)
 {
     STM_SUITE("fs");
@@ -468,6 +580,8 @@ int main(void)
     STM_RUN(test_fs_write_overflow_guard);
     STM_RUN(test_fs_rmdir_refuses_nonempty);
     STM_RUN(test_fs_unlink_preserves_probe_chain);
+    STM_RUN(test_fs_write_gap_is_zeroed);
+    STM_RUN(test_fs_write_gap_is_zeroed_encrypted);
     printf("all passed\n");
     return 0;
 }

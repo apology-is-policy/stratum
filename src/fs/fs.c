@@ -918,7 +918,17 @@ int stm_fs_write(struct stm_fs *fs, uint64_t ino, uint64_t offset,
                     had_old = 1;
                     rc = extent_read_data(fs, &old_ext, ebuf, STM_EXTENT_SIZE);
                     if (rc) return rc;
-                    extent_data_len = le32_to_cpu(old_ext.se_dlen);
+                    uint32_t old_dlen = le32_to_cpu(old_ext.se_dlen);
+                    /* extent_read_data only populates [0..old_dlen]; the tail
+                     * still holds residue from a previous extent operation on
+                     * this or any other file (fs->extent_buf is shared and
+                     * never zeroed between uses). If the new write leaves a
+                     * gap past old_dlen, that residue would be encrypted into
+                     * the new ciphertext and become cross-file plaintext
+                     * leakage on encrypted volumes. Purge it. */
+                    if (old_dlen < STM_EXTENT_SIZE)
+                        memset(ebuf + old_dlen, 0, STM_EXTENT_SIZE - old_dlen);
+                    extent_data_len = old_dlen;
                     if (extent_data_len < inner + towrite)
                         extent_data_len = inner + towrite;
                 } else if (rc == -ENOENT) {
