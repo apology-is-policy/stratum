@@ -876,10 +876,16 @@ static int extent_read_data(struct stm_fs *fs, const struct stm_extent *ext,
     if (dlen > STM_EXTENT_SIZE) return -EIO;
     if (dlen > buf_len)         return -EIO;
     if (comp == STM_COMP_NONE && clen != dlen) return -EIO;
-    if (comp != STM_COMP_NONE) {
-        uint32_t bound = stm_compress_bound(comp, STM_EXTENT_SIZE);
-        if (clen > bound) return -EIO;
-    }
+    /* Tight upper bound on clen. The compress-bound formula admits values
+     * up to ~131628 (LZ4) / ~131714 (ZSTD) for a 128 KiB input, which would
+     * make disk_len = clen + tag exceed fs->cipher_buf capacity
+     * (STM_EXTENT_SIZE + STM_CRYPTO_TAG_LEN = 131088). A legitimate
+     * extent_write_data never stores clen >= dlen (it drops the compressed
+     * form and stores plaintext instead), so clen < dlen <= STM_EXTENT_SIZE
+     * is an invariant of writer-produced extents. Adversarial extents can
+     * still have large clen; rejecting them here prevents heap OOB reads
+     * into fs->cipher_buf. */
+    if (clen > STM_EXTENT_SIZE) return -EIO;
 
     /* Determine compression destination: if uncompressed, decrypt/read
      * straight into buf. Otherwise use comp_buf as an intermediate. */
@@ -970,36 +976,37 @@ int stm_fs_write(struct stm_fs *fs, uint64_t ino, uint64_t offset,
         int had_old = 0;
 
         if (inner != 0 || towrite != (uint32_t)STM_EXTENT_SIZE) {
-            /* partial extent: read-modify-write */
-            if (ext_off < cur_size) {
-                uint32_t vlen = sizeof(old_ext);
-                rc = stm_btree_lookup(fs->tree, &k, &old_ext, &vlen);
-                if (rc == 0) {
-                    had_old = 1;
-                    rc = extent_read_data(fs, &old_ext, ebuf, STM_EXTENT_SIZE);
-                    if (rc) return rc;
-                    uint32_t old_dlen = le32_to_cpu(old_ext.se_dlen);
-                    /* extent_read_data only populates [0..old_dlen]; the tail
-                     * still holds residue from a previous extent operation on
-                     * this or any other file (fs->extent_buf is shared and
-                     * never zeroed between uses). If the new write leaves a
-                     * gap past old_dlen, that residue would be encrypted into
-                     * the new ciphertext and become cross-file plaintext
-                     * leakage on encrypted volumes. Purge it. */
-                    if (old_dlen < STM_EXTENT_SIZE)
-                        memset(ebuf + old_dlen, 0, STM_EXTENT_SIZE - old_dlen);
-                    extent_data_len = old_dlen;
-                    if (extent_data_len < inner + towrite)
-                        extent_data_len = inner + towrite;
-                } else if (rc == -ENOENT) {
-                    memset(ebuf, 0, STM_EXTENT_SIZE);
+            /* partial extent: read-modify-write. Always look up the old
+             * record (not conditional on ext_off < cur_size) to handle
+             * retry-after-failure: if a prior partial write inserted a
+             * ghost extent at this key but failed before bumping
+             * si_size, cur_size stays old. Skipping the lookup would
+             * leak the ghost extent's blocks when btree_insert replaces
+             * it. Symmetric to the same fix on the full-extent branch. */
+            uint32_t vlen = sizeof(old_ext);
+            rc = stm_btree_lookup(fs->tree, &k, &old_ext, &vlen);
+            if (rc == 0) {
+                had_old = 1;
+                rc = extent_read_data(fs, &old_ext, ebuf, STM_EXTENT_SIZE);
+                if (rc) return rc;
+                uint32_t old_dlen = le32_to_cpu(old_ext.se_dlen);
+                /* extent_read_data only populates [0..old_dlen]; the tail
+                 * still holds residue from a previous extent operation on
+                 * this or any other file (fs->extent_buf is shared and
+                 * never zeroed between uses). If the new write leaves a
+                 * gap past old_dlen, that residue would be encrypted into
+                 * the new ciphertext and become cross-file plaintext
+                 * leakage on encrypted volumes. Purge it. */
+                if (old_dlen < STM_EXTENT_SIZE)
+                    memset(ebuf + old_dlen, 0, STM_EXTENT_SIZE - old_dlen);
+                extent_data_len = old_dlen;
+                if (extent_data_len < inner + towrite)
                     extent_data_len = inner + towrite;
-                } else {
-                    return rc;
-                }
-            } else {
+            } else if (rc == -ENOENT) {
                 memset(ebuf, 0, STM_EXTENT_SIZE);
                 extent_data_len = inner + towrite;
+            } else {
+                return rc;
             }
         } else {
             /* Full extent write. Must always look up the old record —
@@ -1020,10 +1027,25 @@ int stm_fs_write(struct stm_fs *fs, uint64_t ino, uint64_t offset,
         rc = extent_write_data(fs, ebuf, extent_data_len, &new_ext);
         if (rc) return rc;
 
-        if (had_old) extent_free_blocks(fs, &old_ext);
-
+        /* Insert the new extent record BEFORE freeing the old extent's
+         * blocks. If btree_insert fails (e.g. -ENOMEM), the file's
+         * btree record is unchanged — it still points at old_ext which
+         * still owns its blocks. We roll back by freeing the new
+         * extent's just-allocated blocks. Net effect: file state is
+         * unchanged, no data lost.
+         *
+         * If we freed old_ext first (the previous ordering) and then
+         * btree_insert failed, the file's btree record would still
+         * point at old_ext (no insert happened), but old_ext's blocks
+         * would be PENDING → freed → reallocated at next alloc —
+         * permanent silent data loss at that offset. */
         rc = stm_btree_insert(fs->tree, &k, &new_ext, sizeof(new_ext), fs->gen);
-        if (rc) return rc;
+        if (rc) {
+            extent_free_blocks(fs, &new_ext);
+            return rc;
+        }
+
+        if (had_old) extent_free_blocks(fs, &old_ext);
 
         src       += towrite;
         pos       += towrite;

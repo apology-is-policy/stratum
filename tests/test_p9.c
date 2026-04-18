@@ -315,6 +315,92 @@ STM_TEST(test_p9_wire_validation)
     cleanup();
 }
 
+/* R7-5: (a) Creating a file while another fid caches the parent's listing
+ * must invalidate the other fid's cache; (b) fid_alloc on an already-active
+ * fid must refuse. */
+STM_TEST(test_p9_fid_cache_and_dup)
+{
+    stm_fs_create(img, 32 * 1024 * 1024, NULL);
+    struct stm_fs *fs;
+    stm_fs_open(img, NULL, &fs);
+    struct stm_9p *srv;
+    stm_9p_create(fs, &srv);
+
+    /* Tversion + Tattach */
+    { uint8_t *wp = reqbuf; uint32_t rl;
+      whdr(&wp, P9_TVERSION, P9_NOTAG);
+      w32(&wp, P9_MSIZE_DEFAULT);
+      wstr(&wp, "9P2000");
+      p9call(srv, reqbuf, wfinish(reqbuf, wp), rspbuf, &rl); }
+    { uint8_t *wp = reqbuf; uint32_t rl;
+      whdr(&wp, P9_TATTACH, 1);
+      w32(&wp, 0); w32(&wp, P9_NOFID); wstr(&wp, "u"); wstr(&wp, "");
+      p9call(srv, reqbuf, wfinish(reqbuf, wp), rspbuf, &rl);
+      STM_ASSERT_EQ(rspbuf[4], P9_RATTACH); }
+
+    /* Walk fid 0 to a fresh fid 1 at root (nwname=0 → stays at root). */
+    { uint8_t *wp = reqbuf; uint32_t rl;
+      whdr(&wp, P9_TWALK, 2);
+      w32(&wp, 0); w32(&wp, 1); w16(&wp, 0);
+      p9call(srv, reqbuf, wfinish(reqbuf, wp), rspbuf, &rl);
+      STM_ASSERT_EQ(rspbuf[4], P9_RWALK); }
+
+    /* Open fid 1 for read. */
+    { uint8_t *wp = reqbuf; uint32_t rl;
+      whdr(&wp, P9_TOPEN, 3);
+      w32(&wp, 1); *wp++ = P9_OREAD;
+      p9call(srv, reqbuf, wfinish(reqbuf, wp), rspbuf, &rl);
+      STM_ASSERT_EQ(rspbuf[4], P9_ROPEN); }
+
+    /* First readdir populates fid 1's cache (possibly empty at this point). */
+    { uint8_t *wp = reqbuf; uint32_t rl;
+      whdr(&wp, P9_TREAD, 4);
+      w32(&wp, 1); w64(&wp, 0); w32(&wp, 65000);
+      p9call(srv, reqbuf, wfinish(reqbuf, wp), rspbuf, &rl);
+      STM_ASSERT_EQ(rspbuf[4], P9_RREAD); }
+
+    /* Now create a file via fid 0 (same dir as fid 1 — both at root). */
+    { uint8_t *wp = reqbuf; uint32_t rl;
+      whdr(&wp, P9_TCREATE, 5);
+      w32(&wp, 0); wstr(&wp, "late_entry.txt"); w32(&wp, 0644); *wp++ = P9_ORDWR;
+      p9call(srv, reqbuf, wfinish(reqbuf, wp), rspbuf, &rl);
+      STM_ASSERT_EQ(rspbuf[4], P9_RCREATE); }
+
+    /* fid 1's cache MUST have been invalidated. Re-read from offset 0 —
+     * the listing should now include "late_entry.txt". */
+    { uint8_t *wp = reqbuf; uint32_t rl;
+      whdr(&wp, P9_TREAD, 6);
+      w32(&wp, 1); w64(&wp, 0); w32(&wp, 65000);
+      p9call(srv, reqbuf, wfinish(reqbuf, wp), rspbuf, &rl);
+      STM_ASSERT_EQ(rspbuf[4], P9_RREAD);
+      uint32_t count = r32(rspbuf + P9_HDR_SIZE);
+      int found = 0;
+      /* Scan the readdir buffer for our filename — simple substring search
+       * suffices (the name is encoded as [u16 len][bytes]). */
+      const uint8_t *p = rspbuf + P9_HDR_SIZE + 4;
+      uint32_t i;
+      for (i = 0; i + 14 <= count; i++) {
+          if (memcmp(p + i, "late_entry.txt", 14) == 0) { found = 1; break; }
+      }
+      STM_ASSERT(found);
+    }
+
+    /* Duplicate fid_alloc: walking fid 0 to newfid 0 with nwname=0 is
+     * the "same fid" case (clone, not alloc) — that one should succeed.
+     * But TATTACH with fid=1 (already active) must refuse. */
+    { uint8_t *wp = reqbuf; uint32_t rl;
+      whdr(&wp, P9_TATTACH, 7);
+      w32(&wp, 1);                   /* fid = 1, already bound */
+      w32(&wp, P9_NOFID); wstr(&wp, "u"); wstr(&wp, "");
+      p9call(srv, reqbuf, wfinish(reqbuf, wp), rspbuf, &rl);
+      STM_ASSERT_EQ(rspbuf[4], P9_RERROR);
+    }
+
+    stm_9p_destroy(srv);
+    stm_fs_close(fs);
+    cleanup();
+}
+
 int main(void)
 {
     STM_SUITE("p9");
@@ -322,6 +408,7 @@ int main(void)
     STM_RUN(test_p9_create_write_read);
     STM_RUN(test_p9_readdir);
     STM_RUN(test_p9_wire_validation);
+    STM_RUN(test_p9_fid_cache_and_dup);
     printf("all passed\n");
     return 0;
 }

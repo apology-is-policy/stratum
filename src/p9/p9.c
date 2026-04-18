@@ -100,6 +100,13 @@ static struct p9_fid *fid_get(struct stm_9p *s, uint32_t fid) {
 
 static struct p9_fid *fid_alloc(struct stm_9p *s, uint32_t fid) {
     int i;
+    /* Refuse if the fid is already bound. 9P requires clients to clunk a
+     * fid before rebinding it; a client that re-attaches or re-walks to
+     * the same fid without a clunk is either buggy or hostile. Silently
+     * creating a duplicate slot produced two active entries for one fid
+     * number — fid_get returned the first, leaving the second as dead
+     * state that came back to life when the first was clunked. */
+    if (fid_get(s, fid) != NULL) return NULL;
     for (i = 0; i < MAX_FIDS; i++) {
         if (!s->fids[i].active) {
             memset(&s->fids[i], 0, sizeof(s->fids[i]));
@@ -109,6 +116,29 @@ static struct p9_fid *fid_alloc(struct stm_9p *s, uint32_t fid) {
         }
     }
     return NULL;
+}
+
+/* Invalidate cached readdir listing on a fid. Cache is always torn down
+ * when the fid's ino changes or when an external mutation (create/remove)
+ * could affect the view of a directory another fid is caching. */
+static void fid_cache_drop(struct p9_fid *f) {
+    if (f->dir_cache) {
+        free(f->dir_cache);
+        f->dir_cache = NULL;
+        f->dir_cache_len = 0;
+    }
+}
+
+/* Invalidate every fid's cache of `dir_ino`. Called after any operation
+ * that mutates the directory's contents (create_file, mkdir, unlink) so
+ * other concurrently-open fids don't serve stale listings. */
+static void invalidate_dir_caches(struct stm_9p *s, uint64_t dir_ino) {
+    int i;
+    for (i = 0; i < MAX_FIDS; i++) {
+        struct p9_fid *f = &s->fids[i];
+        if (f->active && f->is_dir && f->ino == dir_ino)
+            fid_cache_drop(f);
+    }
 }
 
 static void fid_free(struct stm_9p *s, uint32_t fid) {
@@ -329,8 +359,12 @@ static int h_walk(struct stm_9p *s, const uint8_t *body, uint32_t body_len,
         nf = f;
     } else {
         nf = fid_alloc(s, newfid);
-        if (!nf) return resp_error(resp, resp_len, tag, "fid table full");
+        if (!nf) return resp_error(resp, resp_len, tag,
+                                    "fid table full or newfid in use");
     }
+    /* If the fid's ino is moving (either nf reused from fid or nf repurposed
+     * across walks), drop any stale cached directory listing. */
+    if (nf->ino != cur_ino) fid_cache_drop(nf);
     nf->ino = cur_ino;
     nf->parent_ino = parent_ino;
     nf->is_dir = is_dir;
@@ -411,13 +445,20 @@ static int h_create(struct stm_9p *s, const uint8_t *body, uint32_t body_len,
         return resp_error(resp, resp_len, tag, "name too long");
     memcpy(nbuf, name, nlen); nbuf[nlen] = '\0';
 
-    if (perm & P9_DMDIR)
-        rc = stm_fs_mkdir(s->fs, f->ino, nbuf, perm & 0777, &new_ino);
-    else
-        rc = stm_fs_create_file(s->fs, f->ino, nbuf, perm & 0777, &new_ino);
-    if (rc) return resp_error(resp, resp_len, tag, "create failed");
+    {
+        uint64_t parent_ino = f->ino;
+        if (perm & P9_DMDIR)
+            rc = stm_fs_mkdir(s->fs, parent_ino, nbuf, perm & 0777, &new_ino);
+        else
+            rc = stm_fs_create_file(s->fs, parent_ino, nbuf, perm & 0777, &new_ino);
+        if (rc) return resp_error(resp, resp_len, tag, "create failed");
+        /* Other fids caching the parent's listing now see stale data. */
+        invalidate_dir_caches(s, parent_ino);
+    }
 
-    /* fid now points to the new file */
+    /* fid now points to the new file. The fid's ino changed — drop any
+     * cached listing of the previous directory it referenced. */
+    fid_cache_drop(f);
     f->parent_ino = f->ino;
     f->ino = new_ino;
     f->is_dir = (perm & P9_DMDIR) ? 1 : 0;
@@ -617,13 +658,17 @@ static int h_remove(struct stm_9p *s, const uint8_t *body, uint32_t body_len,
      * would durably commit whatever half-state the fs is in, and the
      * client would see Rremove success on a broken operation. */
     {
-        int rc = stm_fs_unlink(s->fs, f->parent_ino, f->name);
+        uint64_t parent_ino = f->parent_ino;
+        int rc = stm_fs_unlink(s->fs, parent_ino, f->name);
         if (rc) {
             fid_free(s, fid_nr);
             return resp_error(resp, resp_len, tag,
                               rc == -ENOTEMPTY ? "directory not empty"
                                                : "remove failed");
         }
+        /* Directory contents changed; any other fid caching a listing of
+         * parent_ino now has stale data. */
+        invalidate_dir_caches(s, parent_ino);
     }
     fid_free(s, fid_nr);
 
