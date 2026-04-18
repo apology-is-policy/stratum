@@ -565,6 +565,75 @@ STM_TEST(test_fs_write_gap_is_zeroed_encrypted)
     unlink(path);
 }
 
+/* Regression for R7-1 (P0): verify the two-phase sync leaves both SB slots
+ * at ss_gen >= gen used for the most recent writes, so that a crash mid-sync
+ * (or a torn final-SB write) cannot leave the next mount reading a gen value
+ * that aliases orphan ciphertexts' gen. We can't inject a crash in a unit
+ * test, but we can inspect the on-disk SBs: after a successful sync, the
+ * slot that lost the tiebreak (the reservation) should hold ss_gen_reserve
+ * and the winner should hold ss_gen_final > ss_gen_reserve > any gen used
+ * for writes. */
+#include <sys/stat.h>
+#include <fcntl.h>
+STM_TEST(test_fs_sync_two_phase_gen_invariant)
+{
+    const char *path = "/tmp/stratum_test_two_phase.img";
+    struct stm_fs *fs;
+    unlink(path);
+    STM_ASSERT_EQ(stm_fs_create(path, 64ULL*1024*1024, NULL), 0);
+    STM_ASSERT_EQ(stm_fs_open(path, NULL, &fs), 0);
+
+    uint64_t ino;
+    STM_ASSERT_EQ(stm_fs_create_file(fs, 1, "r7.bin", 0644, &ino), 0);
+    STM_ASSERT_EQ(stm_fs_write(fs, ino, 0, "hello", 5), 0);
+    STM_ASSERT_EQ(stm_fs_sync(fs), 0);
+
+    /* Read both SBs and verify both are valid; the higher-gen one is the
+     * final commit and the lower-gen one is the reservation from this sync
+     * (or an earlier reservation if this was the first sync after mkfs). */
+    int fd = open(path, O_RDONLY);
+    STM_ASSERT(fd >= 0);
+    uint8_t sb_a[512], sb_b[512];
+    STM_ASSERT_EQ((int)pread(fd, sb_a, 512, 0), 512);
+    STM_ASSERT_EQ((int)pread(fd, sb_b, 512, 4096), 512);
+    close(fd);
+
+    /* Extract ss_gen at offset 16 (after ss_magic=8 + ss_version=4 + ss_flags=4). */
+    uint64_t gen_a, gen_b;
+    memcpy(&gen_a, sb_a + 16, 8);
+    memcpy(&gen_b, sb_b + 16, 8);
+    /* gens differ by at least 1 (final vs reservation) and both are > 0. */
+    STM_ASSERT(gen_a != 0 && gen_b != 0);
+    STM_ASSERT(gen_a != gen_b);
+    uint64_t lo = gen_a < gen_b ? gen_a : gen_b;
+    uint64_t hi = gen_a < gen_b ? gen_b : gen_a;
+    STM_ASSERT(hi == lo + 1);
+
+    /* Three more sync cycles — verify gen advances by 2 each cycle. */
+    uint64_t prev_hi = hi;
+    int i;
+    for (i = 0; i < 3; i++) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "cycle %d", i);
+        STM_ASSERT_EQ(stm_fs_write(fs, ino, 0, buf, strlen(buf)), 0);
+        STM_ASSERT_EQ(stm_fs_sync(fs), 0);
+
+        fd = open(path, O_RDONLY);
+        STM_ASSERT(fd >= 0);
+        STM_ASSERT_EQ((int)pread(fd, sb_a, 512, 0), 512);
+        STM_ASSERT_EQ((int)pread(fd, sb_b, 512, 4096), 512);
+        close(fd);
+        memcpy(&gen_a, sb_a + 16, 8);
+        memcpy(&gen_b, sb_b + 16, 8);
+        uint64_t cur_hi = gen_a > gen_b ? gen_a : gen_b;
+        STM_ASSERT(cur_hi >= prev_hi + 2);
+        prev_hi = cur_hi;
+    }
+
+    stm_fs_close(fs);
+    unlink(path);
+}
+
 int main(void)
 {
     STM_SUITE("fs");
@@ -582,6 +651,7 @@ int main(void)
     STM_RUN(test_fs_unlink_preserves_probe_chain);
     STM_RUN(test_fs_write_gap_is_zeroed);
     STM_RUN(test_fs_write_gap_is_zeroed_encrypted);
+    STM_RUN(test_fs_sync_two_phase_gen_invariant);
     printf("all passed\n");
     return 0;
 }

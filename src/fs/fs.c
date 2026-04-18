@@ -557,70 +557,130 @@ alloc_ok:
     return 0;
 }
 
+/* Serialize an on-disk SB at the given gen + current metadata. The caller
+ * fills the root fields before/after this returns — this centralizes the
+ * invariant fields and the csum computation. */
+static void build_sb(struct stm_fs *fs, struct stm_superblock *sb,
+                     uint64_t gen, struct stm_bptr root,
+                     struct stm_bptr snap_root,
+                     uint64_t dev_sz)
+{
+    memset(sb, 0, sizeof(*sb));
+    sb->ss_magic        = cpu_to_le64(STM_MAGIC);
+    sb->ss_version      = cpu_to_le32(1);
+    sb->ss_gen          = cpu_to_le64(gen);
+    sb->ss_root         = root;
+    sb->ss_snap_root    = snap_root;
+    sb->ss_space_root   = stm_bptr_null();
+    sb->ss_tree_height  = cpu_to_le16(stm_btree_height(fs->tree));
+    sb->ss_block_size   = cpu_to_le32(STM_BLOCK_SIZE);
+    sb->ss_node_size    = cpu_to_le32(STM_NODE_SIZE);
+    sb->ss_total_blocks = cpu_to_le64(dev_sz / STM_BLOCK_SIZE);
+    sb->ss_free_blocks  = cpu_to_le64(0);
+    sb->ss_next_ino     = cpu_to_le64(fs->next_ino);
+    sb->ss_alloc_next   = cpu_to_le64(stm_btree_next_alloc(fs->tree));
+    sb->ss_snap_height  = fs->snap_tree
+                        ? cpu_to_le16(stm_btree_height(fs->snap_tree)) : cpu_to_le16(0);
+    sb->ss_next_snap_id = cpu_to_le64(fs->next_snap_id);
+    sb->ss_enc_algo     = fs->enc_algo;
+    memcpy(sb->ss_enc_kdf_salt, fs->enc_kdf_salt, sizeof(sb->ss_enc_kdf_salt));
+    memcpy(sb->ss_enc_wrapped_key, fs->enc_wrapped_key, sizeof(sb->ss_enc_wrapped_key));
+    memcpy(sb->ss_enc_nonce, fs->enc_nonce, sizeof(sb->ss_enc_nonce));
+    sb->ss_comp_algo    = fs->comp_algo;
+
+    memset(sb->ss_csum, 0, sizeof(sb->ss_csum));
+    stm_csum_compute(sb, sizeof(*sb), sb->ss_csum);
+}
+
+/* Two-phase durable sync. Cross-mount AEAD nonce uniqueness depends on:
+ *
+ *   INVARIANT: on-disk ss_gen (at least one valid SB) is STRICTLY GREATER
+ *              than the max write_gen ever used to encrypt a block that
+ *              could become a reachable orphan after a crash.
+ *
+ * Before this two-phase rewrite, a single failed SB write after a successful
+ * flush left orphan ciphertexts at gen G on disk while the SB still said G.
+ * Next mount read gen G, reused it for fresh writes to reallocated paddrs,
+ * and produced (DEK, nonce=paddr‖G) collisions with the orphans — XOR of the
+ * two ciphertexts = XOR of plaintexts (stream-cipher catastrophe).
+ *
+ * Phase 1 (reservation): write an SB at ss_gen = G+1 with the PRE-flush root
+ * to the opposite slot; fsync. On crash after this point, next mount reads
+ * gen G+1, not G — orphan ciphertexts at G can't collide.
+ *
+ * Phase 2 (flush): now that the reservation is durable, flush tree writes at
+ * write_gen = G.
+ *
+ * Phase 3 (final commit): write an SB at ss_gen = G+2 (strictly greater than
+ * reservation, so mount's tiebreak picks the final), with the post-flush
+ * root, to the current slot. On torn-write, reservation survives and next
+ * mount uses gen G+1 — still > G, so still safe. fs->gen advances by 2 per
+ * successful sync cycle. */
 int stm_fs_sync(struct stm_fs *fs)
 {
     struct stm_superblock sb;
     uint64_t dev_sz = 0;
     int new_slot, rc;
-
-    /* Flush main tree. All writes during this sync (node COWs, splits,
-     * drain_all) use fs->gen as the AEAD nonce generation. fs->gen is
-     * bumped below once everything is persisted, so the next sync gets
-     * a distinct gen and can safely reuse PENDING-freed paddrs. */
-    rc = stm_btree_flush(fs->tree, fs->gen);
-    if (rc) return rc;
-
-    /* flush snap tree, synchronize allocators */
-    if (fs->snap_tree) {
-        uint64_t a = stm_btree_next_alloc(fs->tree);
-        uint64_t b = stm_btree_next_alloc(fs->snap_tree);
-        if (b < a) stm_btree_set_alloc(fs->snap_tree, a);
-        rc = stm_btree_flush(fs->snap_tree, fs->gen);
-        if (rc) return rc;
-        a = stm_btree_next_alloc(fs->snap_tree);
-        if (stm_btree_next_alloc(fs->tree) < a)
-            stm_btree_set_alloc(fs->tree, a);
-    }
+    uint64_t gen_used = fs->gen;            /* writes in this sync use this */
+    uint64_t gen_reserve = gen_used + 1;    /* disk ss_gen during flush */
+    uint64_t gen_final   = gen_used + 2;    /* disk ss_gen after success */
 
     stm_block_size(&fs->dev, &dev_sz);
 
-    memset(&sb, 0, sizeof(sb));
-    sb.ss_magic        = cpu_to_le64(STM_MAGIC);
-    sb.ss_version      = cpu_to_le32(1);
-    fs->gen++;
-    sb.ss_gen          = cpu_to_le64(fs->gen);
-    sb.ss_root         = stm_btree_root(fs->tree);
-    sb.ss_snap_root    = fs->snap_tree
-                       ? stm_btree_root(fs->snap_tree) : stm_bptr_null();
-    sb.ss_space_root   = stm_bptr_null();
-    sb.ss_tree_height  = cpu_to_le16(stm_btree_height(fs->tree));
-    sb.ss_block_size   = cpu_to_le32(STM_BLOCK_SIZE);
-    sb.ss_node_size    = cpu_to_le32(STM_NODE_SIZE);
-    sb.ss_total_blocks = cpu_to_le64(dev_sz / STM_BLOCK_SIZE);
-    sb.ss_free_blocks  = cpu_to_le64(0);
-    sb.ss_next_ino     = cpu_to_le64(fs->next_ino);
-    sb.ss_alloc_next   = cpu_to_le64(stm_btree_next_alloc(fs->tree));
-    sb.ss_snap_height  = fs->snap_tree
-                       ? cpu_to_le16(stm_btree_height(fs->snap_tree)) : cpu_to_le16(0);
-    sb.ss_next_snap_id = cpu_to_le64(fs->next_snap_id);
-    sb.ss_enc_algo     = fs->enc_algo;
-    memcpy(sb.ss_enc_kdf_salt, fs->enc_kdf_salt, sizeof(sb.ss_enc_kdf_salt));
-    memcpy(sb.ss_enc_wrapped_key, fs->enc_wrapped_key, sizeof(sb.ss_enc_wrapped_key));
-    memcpy(sb.ss_enc_nonce, fs->enc_nonce, sizeof(sb.ss_enc_nonce));
-    sb.ss_comp_algo    = fs->comp_algo;
-
-    /* Compute superblock checksum (over everything except the csum field itself) */
-    memset(sb.ss_csum, 0, sizeof(sb.ss_csum));
-    stm_csum_compute(&sb, sizeof(sb), sb.ss_csum);
-
+    /* Phase 1: reservation. Commit ss_gen = G+1 with PRE-flush root before
+     * any ciphertext at gen G touches disk. Opposite of current sb_slot so
+     * if this write torns, the prior good SB at fs->sb_slot (ss_gen = prev
+     * gen_final, which is also > G) remains intact. */
     new_slot = 1 - fs->sb_slot;
+    build_sb(fs, &sb, gen_reserve,
+             stm_btree_root(fs->tree),
+             fs->snap_tree ? stm_btree_root(fs->snap_tree) : stm_bptr_null(),
+             dev_sz);
     rc = stm_block_write(&fs->dev,
                          new_slot ? STM_SB_OFFSET_B : STM_SB_OFFSET_A,
                          &sb, sizeof(sb));
     if (rc) return rc;
     rc = stm_block_sync(&fs->dev);
     if (rc) return rc;
-    fs->sb_slot = new_slot;
+
+    /* Phase 2: flush. All writes use write_gen = gen_used. Disk now holds an
+     * SB at ss_gen = gen_reserve > gen_used at the opposite slot, so a crash
+     * mid-flush leaves next mount using gen_reserve, not gen_used. */
+    rc = stm_btree_flush(fs->tree, gen_used);
+    if (rc) return rc;
+
+    if (fs->snap_tree) {
+        uint64_t a = stm_btree_next_alloc(fs->tree);
+        uint64_t b = stm_btree_next_alloc(fs->snap_tree);
+        if (b < a) stm_btree_set_alloc(fs->snap_tree, a);
+        rc = stm_btree_flush(fs->snap_tree, gen_used);
+        if (rc) return rc;
+        a = stm_btree_next_alloc(fs->snap_tree);
+        if (stm_btree_next_alloc(fs->tree) < a)
+            stm_btree_set_alloc(fs->tree, a);
+    }
+
+    /* Phase 3: final commit. ss_gen = gen_final = gen_reserve + 1 guarantees
+     * mount's gen tiebreak picks this SB over the reservation when both are
+     * valid. Write to current sb_slot (overwriting the prior good SB): if
+     * this write torns, the reservation at opposite slot survives (with
+     * ss_gen = gen_reserve > gen_used — still safe). */
+    build_sb(fs, &sb, gen_final,
+             stm_btree_root(fs->tree),
+             fs->snap_tree ? stm_btree_root(fs->snap_tree) : stm_bptr_null(),
+             dev_sz);
+    rc = stm_block_write(&fs->dev,
+                         fs->sb_slot ? STM_SB_OFFSET_B : STM_SB_OFFSET_A,
+                         &sb, sizeof(sb));
+    if (rc) return rc;
+    rc = stm_block_sync(&fs->dev);
+    if (rc) return rc;
+
+    fs->gen = gen_final;
+    /* fs->sb_slot stays the same: final landed there. Next sync's Phase 1
+     * writes reservation to (1 - fs->sb_slot) — overwriting this sync's
+     * reservation. Standard ping-pong where the final and reservation slots
+     * alternate their roles every two syncs. */
     if (fs->alloc) stm_alloc_commit(fs->alloc);
     return 0;
 }
