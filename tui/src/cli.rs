@@ -34,11 +34,15 @@ impl Server {
             .spawn()
             .context("cannot start stratum serve")?;
 
-        // wait for socket
+        // Wait for socket. Upper bound sized to cover Argon2id at
+        // libsodium's SENSITIVE tier (~3-5 s fast laptop, 10-20 s on
+        // slower hosts). CLI doesn't yet support --pass, so today this
+        // is only exercised on unencrypted volumes — but future-proofed
+        // so extending CLI to encrypted volumes doesn't silently break.
         let start = Instant::now();
         while !Path::new(&sock).exists() {
-            if start.elapsed() > Duration::from_secs(5) {
-                bail!("server did not create socket within 5s");
+            if start.elapsed() > Duration::from_secs(30) {
+                bail!("server did not create socket within 30s");
             }
             std::thread::sleep(Duration::from_millis(50));
         }

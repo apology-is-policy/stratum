@@ -1,6 +1,7 @@
 #include "stratum/crypto.h"
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <errno.h>
 
@@ -112,8 +113,17 @@ int stm_crypto_derive_key(const char *pass, size_t pass_len,
                       pass, pass_len, salt,
                       crypto_pwhash_OPSLIMIT_SENSITIVE,
                       crypto_pwhash_MEMLIMIT_SENSITIVE,
-                      crypto_pwhash_ALG_ARGON2ID13) != 0)
+                      crypto_pwhash_ALG_ARGON2ID13) != 0) {
+        /* libsodium returns -1 on OOM (almost always the MEMLIMIT_SENSITIVE
+         * 1 GiB allocation failing on low-RAM hosts). The generic ENOMEM the
+         * caller gets is indistinguishable from a tiny malloc failure —
+         * without this hint a user on a 512 MiB VM has no way to connect
+         * "Cannot allocate memory" to "Argon2id needs 1 GiB free." */
+        fprintf(stderr,
+                "stratum: passphrase KDF (Argon2id) failed — requires "
+                "~1 GiB free RAM at SENSITIVE tier\n");
         return -ENOMEM;
+    }
     return 0;
 }
 

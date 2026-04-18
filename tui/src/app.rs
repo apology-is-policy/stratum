@@ -503,10 +503,28 @@ impl App {
                 }
                 self.server_proc = Some(child);
                 self.server_sock = Some(sock.clone());
-                // wait briefly for socket to appear
-                for _ in 0..20 {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                // Wait for the socket to appear OR the child to exit. The
+                // child's startup cost is dominated by Argon2id on encrypted
+                // volumes; at libsodium's SENSITIVE tier (post-SOTA-#9) that's
+                // ~3-5 s on a fast laptop and 10-20 s on VMs / battery-saver.
+                // We poll every 100 ms and bail only when the child exits
+                // (wrong password / bad path / mount failure) or we've burned
+                // a generous upper bound. Without this the TUI would kill
+                // the child mid-KDF after 2 s and encrypted mounts would
+                // always fail with a misleading "Connect error."
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_secs(30);
+                loop {
                     if std::path::Path::new(&sock).exists() { break; }
+                    if let Some(ref mut proc) = self.server_proc {
+                        if let Ok(Some(_)) = proc.try_wait() {
+                            // Child exited before socket appeared — handled
+                            // by the status-check block immediately below.
+                            break;
+                        }
+                    }
+                    if std::time::Instant::now() >= deadline { break; }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
                 }
                 // check if server died (wrong password, etc.)
                 if let Some(ref mut proc) = self.server_proc {
