@@ -364,7 +364,21 @@ static void build_sb(struct stm_fs *fs, struct stm_superblock *sb,
 
 /* ── open / close / sync ────────────────────────────────────────────── */
 
+static int stm_fs_open_impl(const char *path, const char *passphrase,
+                            int read_only, struct stm_fs **out);
+
 int stm_fs_open(const char *path, const char *passphrase, struct stm_fs **out)
+{
+    return stm_fs_open_impl(path, passphrase, 0, out);
+}
+
+int stm_fs_open_ro(const char *path, const char *passphrase, struct stm_fs **out)
+{
+    return stm_fs_open_impl(path, passphrase, 1, out);
+}
+
+static int stm_fs_open_impl(const char *path, const char *passphrase,
+                            int read_only, struct stm_fs **out)
 {
     struct stm_fs *fs = calloc(1, sizeof(*fs));
     struct stm_superblock sa, sb;
@@ -404,6 +418,14 @@ int stm_fs_open(const char *path, const char *passphrase, struct stm_fs **out)
                    ? (fs->sb_slot = 0, &sa) : (fs->sb_slot = 1, &sb);
         else
             chosen = a_ok ? (fs->sb_slot = 0, &sa) : (fs->sb_slot = 1, &sb);
+    }
+
+    /* R9-4: reject on-disk format versions we don't understand. Without
+     * this, a future v2 volume or a tampered SB claiming v2 would be
+     * mounted and on-disk fields would be reinterpreted under the wrong
+     * layout. Symmetric to the ss_comp_algo compile-time-codec reject. */
+    if (le32_to_cpu(chosen->ss_version) != 1) {
+        stm_block_close(&fs->dev); free(fs); return -ENOTSUP;
     }
 
     fs->gen         = le64_to_cpu(chosen->ss_gen);
@@ -590,21 +612,8 @@ alloc_ok:
      * established. (RO-only use cases that must tolerate write failure
      * — e.g., `stratum check` on a degraded volume — can re-audit this
      * later, but currently all callers expect RW semantics.) */
-    if (fs->encrypted) {
-        struct stm_superblock sb;
-        uint64_t dev_sz = 0;
-        int bump_slot;
-        stm_block_size(&fs->dev, &dev_sz);
-        build_sb(fs, &sb, fs->gen + 1,
-                 stm_btree_root(fs->tree),
-                 fs->snap_tree ? stm_btree_root(fs->snap_tree) : stm_bptr_null(),
-                 dev_sz);
-        bump_slot = 1 - fs->sb_slot;
-        rc = stm_block_write(&fs->dev,
-                             bump_slot ? STM_SB_OFFSET_B : STM_SB_OFFSET_A,
-                             &sb, sizeof(sb));
-        if (rc) goto fail_bump;
-        rc = stm_block_sync(&fs->dev);
+    if (fs->encrypted && !read_only) {
+        rc = stm_fs_gen_bump_disk(fs);
         if (rc) goto fail_bump;
     }
 
@@ -657,6 +666,24 @@ static void build_sb(struct stm_fs *fs, struct stm_superblock *sb,
 
     memset(sb->ss_csum, 0, sizeof(sb->ss_csum));
     stm_csum_compute(sb, sizeof(*sb), sb->ss_csum);
+}
+
+int stm_fs_gen_bump_disk(struct stm_fs *fs)
+{
+    struct stm_superblock sb;
+    uint64_t dev_sz = 0;
+    int bump_slot, rc;
+    stm_block_size(&fs->dev, &dev_sz);
+    build_sb(fs, &sb, fs->gen + 1,
+             stm_btree_root(fs->tree),
+             fs->snap_tree ? stm_btree_root(fs->snap_tree) : stm_bptr_null(),
+             dev_sz);
+    bump_slot = 1 - fs->sb_slot;
+    rc = stm_block_write(&fs->dev,
+                         bump_slot ? STM_SB_OFFSET_B : STM_SB_OFFSET_A,
+                         &sb, sizeof(sb));
+    if (rc) return rc;
+    return stm_block_sync(&fs->dev);
 }
 
 /* Two-phase durable sync. Cross-mount AEAD nonce uniqueness depends on:

@@ -125,4 +125,14 @@ static inline int stm_fs_configure_tree(struct stm_fs *fs,
     return 0;
 }
 
+/* Write an SB at ss_gen = fs->gen + 1 with the current tree roots to the
+ * opposite slot and fsync. Establishes/refreshes the R8-1 invariant:
+ * disk ss_gen > fs->gen. Used at mount time (encrypted volumes) and after
+ * stm_snap_rollback (R9-1) where the allocator has been rebuilt and any
+ * pre-rollback in-session orphans need to be decoupled from future writes
+ * by advancing the write-gen floor. Returns 0 on success, negative on
+ * write/fsync failure — caller must handle (typically by refusing mount or
+ * unwinding the operation). */
+int stm_fs_gen_bump_disk(struct stm_fs *fs);
+
 #endif /* STM_FS_INTERNAL_H */

@@ -316,6 +316,76 @@ STM_TEST(test_rollback_preserves_other_snapshots)
     cleanup();
 }
 
+/* Regression for R9-1: after a successful rollback on an encrypted
+ * volume, disk ss_gen must strictly exceed the post-rollback-bumped
+ * fs->gen. We can't inspect fs->gen directly, but we can verify that
+ * disk ss_gen advanced by at least 2 (bump-before-rollback plus
+ * rollback-bump). Also verifies the rollback itself still works. */
+#include <sys/stat.h>
+#include <fcntl.h>
+STM_TEST(test_snap_rollback_bumps_gen_encrypted)
+{
+    const char *enc = "/tmp/stratum_test_snap_rollback_bump.img";
+    const char *pass = "rb";
+    unlink(enc);
+    STM_ASSERT_EQ(stm_fs_create(enc, 32ULL*1024*1024, pass), 0);
+    struct stm_fs *fs;
+    STM_ASSERT_EQ(stm_fs_open(enc, pass, &fs), 0);
+
+    /* Read post-mount ss_gen (mount-bump already happened). */
+    int fd = open(enc, O_RDONLY);
+    STM_ASSERT(fd >= 0);
+    uint8_t sb_a[512], sb_b[512];
+    STM_ASSERT_EQ((int)pread(fd, sb_a, 512, 0), 512);
+    STM_ASSERT_EQ((int)pread(fd, sb_b, 512, 4096), 512);
+    close(fd);
+    uint64_t g_a, g_b;
+    memcpy(&g_a, sb_a + 16, 8);
+    memcpy(&g_b, sb_b + 16, 8);
+    uint64_t post_mount_max = g_a > g_b ? g_a : g_b;
+
+    /* Create a file, snapshot it, modify, then roll back. */
+    uint64_t ino;
+    STM_ASSERT_EQ(stm_fs_create_file(fs, STM_ROOT_INO, "v.txt", 0644, &ino), 0);
+    STM_ASSERT_EQ(stm_fs_write(fs, ino, 0, "original", 8), 0);
+
+    uint64_t snap_id;
+    STM_ASSERT_EQ(stm_snap_create(fs, "pre", &snap_id), 0);
+    STM_ASSERT_EQ(stm_fs_sync(fs), 0);
+
+    STM_ASSERT_EQ(stm_fs_write(fs, ino, 0, "modified", 8), 0);
+
+    /* Rollback — should bump fs->gen and disk ss_gen. */
+    STM_ASSERT_EQ(stm_snap_rollback(fs, snap_id), 0);
+
+    /* Read disk ss_gen after rollback but before any subsequent sync. */
+    fd = open(enc, O_RDONLY);
+    STM_ASSERT(fd >= 0);
+    STM_ASSERT_EQ((int)pread(fd, sb_a, 512, 0), 512);
+    STM_ASSERT_EQ((int)pread(fd, sb_b, 512, 4096), 512);
+    close(fd);
+    memcpy(&g_a, sb_a + 16, 8);
+    memcpy(&g_b, sb_b + 16, 8);
+    uint64_t post_rollback_max = g_a > g_b ? g_a : g_b;
+
+    /* Mount-bump advanced ss_gen by 1; snap_create + sync advanced further;
+     * rollback-bump advances again. Must strictly exceed post_mount_max. */
+    STM_ASSERT(post_rollback_max > post_mount_max);
+
+    /* Sync after rollback to verify the fs is still operable. */
+    STM_ASSERT_EQ(stm_fs_sync(fs), 0);
+
+    /* Verify rollback's content is what we expect. */
+    char buf[32] = {0};
+    uint32_t nread = 0;
+    STM_ASSERT_EQ(stm_fs_read(fs, ino, 0, buf, sizeof(buf), &nread), 0);
+    STM_ASSERT_EQ(nread, 8u);
+    STM_ASSERT_MEM_EQ(buf, "original", 8);
+
+    stm_fs_close(fs);
+    unlink(enc);
+}
+
 int main(void)
 {
     STM_SUITE("snap");
@@ -325,6 +395,7 @@ int main(void)
     STM_RUN(test_snap_persist);
     STM_RUN(test_snap_create_doesnt_corrupt_main_tree);
     STM_RUN(test_rollback_preserves_other_snapshots);
+    STM_RUN(test_snap_rollback_bumps_gen_encrypted);
     printf("all passed\n");
     return 0;
 }

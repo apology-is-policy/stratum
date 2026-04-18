@@ -739,7 +739,12 @@ int stm_cmd_check(int argc, char **argv)
     stm_block_close(&dev);
     struct stm_fs *fs = NULL;
     printf("Opening filesystem...\n");
-    rc = stm_fs_open(path, pass, &fs);
+    /* Use the read-only open path. `check` is a diagnostic tool and must
+     * not modify the volume — in particular, it must NOT trigger the
+     * encrypted-mount gen bump that stm_fs_open performs. Users running
+     * `check` on a degraded volume (bad sector at an SB slot) need a path
+     * that doesn't require writes to succeed. */
+    rc = stm_fs_open_ro(path, pass, &fs);
     if (rc) {
         fprintf(stderr, "FATAL: cannot open: %s\n", strerror(-rc));
         return 1;

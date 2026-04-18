@@ -141,6 +141,16 @@ static void invalidate_dir_caches(struct stm_9p *s, uint64_t dir_ino) {
     }
 }
 
+/* Drop all cached readdir listings across all fids. Called after snapshot
+ * ops (rollback, delete) that may have changed the shape of the tree in
+ * ways that affect every cached directory view. */
+static void invalidate_all_dir_caches(struct stm_9p *s) {
+    int i;
+    for (i = 0; i < MAX_FIDS; i++) {
+        if (s->fids[i].active) fid_cache_drop(&s->fids[i]);
+    }
+}
+
 static void fid_free(struct stm_9p *s, uint32_t fid) {
     int i;
     for (i = 0; i < MAX_FIDS; i++)
@@ -877,6 +887,11 @@ static int h_snap_delete(struct stm_9p *s, const uint8_t *body, uint32_t body_le
     rc = stm_fs_sync(s->fs);
     if (rc) return resp_error(resp, resp_len, tag, "sync failed on snap delete");
 
+    /* Snapshot delete can free extent blocks that may have been shared
+     * with the main tree's directory entries; invalidate all cached
+     * readdir listings defensively. */
+    invalidate_all_dir_caches(s);
+
     wp = resp + 4;
     *wp++ = P9_RSNAP_DELETE;
     p16(wp, tag); wp += 2;
@@ -899,6 +914,14 @@ static int h_snap_rollback(struct stm_9p *s, const uint8_t *body, uint32_t body_
     if (rc) return resp_error(resp, resp_len, tag, "snap rollback failed");
     rc = stm_fs_sync(s->fs);
     if (rc) return resp_error(resp, resp_len, tag, "sync failed on snap rollback");
+
+    /* Rollback replaces fs->tree with the snapshot's tree — every cached
+     * readdir listing is now stale (pre-rollback directory contents).
+     * Fids themselves stay valid (their inode numbers may or may not
+     * exist in the new tree; subsequent ops will fail cleanly) but
+     * serving a cached listing of a directory that no longer exists
+     * or has different contents is a silent lie. */
+    invalidate_all_dir_caches(s);
 
     wp = resp + 4;
     *wp++ = P9_RSNAP_ROLLBACK;

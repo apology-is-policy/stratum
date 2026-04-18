@@ -415,8 +415,20 @@ reopen_original:
          * and we're left with fs->tree == NULL — better than lying. */
         int rc2 = stm_btree_open(&fs->dev, orig_root, orig_height, &fs->tree);
         if (rc2 == 0) {
-            (void)stm_fs_configure_tree(fs, fs->tree);
-            if (fs->alloc) stm_btree_set_allocator(fs->tree, fs->alloc);
+            /* R9-2: propagate configure_tree failure. If crypto_init
+             * fails (OOM on encrypted volumes), leaving fs->tree with
+             * NULL crypto context would make subsequent writes emit
+             * PLAINTEXT to disk on what the user considers an encrypted
+             * volume. Close the tree and fail hard; fs->tree = NULL is
+             * still safer than a tree that writes plaintext. */
+            int rc3 = stm_fs_configure_tree(fs, fs->tree);
+            if (rc3) {
+                stm_btree_close(fs->tree);
+                fs->tree = NULL;
+                if (!rc) rc = rc3;
+            } else if (fs->alloc) {
+                stm_btree_set_allocator(fs->tree, fs->alloc);
+            }
         } else {
             /* rc2 takes precedence only if it's worse than the primary rc */
             if (!rc) rc = rc2;
@@ -450,7 +462,7 @@ after_reopen:
         uint64_t dev_bytes = 0;
         stm_block_size(&fs->dev, &dev_bytes);
         rc = stm_alloc_open(&fs->dev, dev_bytes / STM_BLOCK_SIZE, &new_alloc);
-        if (rc) return rc;
+        if (rc) goto rollback_alloc_open_fail;
 
         /* Mark superblocks + walk trees against the new allocator.
          * Temporarily point fs->alloc at the new one so the walk
@@ -481,11 +493,61 @@ after_reopen:
         if (fs->snap_tree)
             stm_btree_set_allocator(fs->snap_tree, new_alloc);
         stm_alloc_close(old_alloc);
+
+        /* R9-1: rollback-bump. Any pre-rollback in-session writes
+         * created ciphertexts at (paddr, write_gen = fs->gen) whose
+         * paddrs the allocator just marked as FREE (the new_alloc walk
+         * didn't reach them from the rolled-back tree). Post-rollback
+         * writes at the same fs->gen that reuse those paddrs would
+         * produce the same (DEK, nonce) pair — stream-cipher catastrophe.
+         *
+         * Advance fs->gen by 1 so post-rollback writes use a distinct
+         * write_gen from the pre-rollback orphans; then bump disk
+         * ss_gen to new fs->gen + 1 to preserve the R8-1 invariant
+         * (disk ss_gen > fs->gen) for subsequent inter-sync writes. */
+        if (fs->encrypted) {
+            fs->gen += 1;
+            rc = stm_fs_gen_bump_disk(fs);
+            if (rc) {
+                /* Hard failure: we've advanced fs->gen in memory but
+                 * couldn't persist the matching disk bump. Any future
+                 * write would violate the invariant. Refuse to stay
+                 * operable — the caller must close and remount. Revert
+                 * fs->gen so a remount starts from a consistent state. */
+                fs->gen -= 1;
+                return rc;
+            }
+        }
         return 0;
 
     rollback_restore:
         fs->alloc = old_alloc;                   /* trees still connected here */
         stm_alloc_close(new_alloc);
+        /* fall through to tree restore */
+
+    rollback_alloc_open_fail:
+        /* R9-3: fs->tree currently points at the rolled-back snapshot
+         * tree (opened at the top of this function). Caller was told
+         * rollback failed; they must see the pre-rollback tree. Close
+         * the snap tree and reopen from orig_root — matching the
+         * reopen_original path's semantics. */
+        stm_btree_close(fs->tree);
+        fs->tree = NULL;
+        {
+            int rc2 = stm_btree_open(&fs->dev, orig_root, orig_height, &fs->tree);
+            if (rc2 == 0) {
+                int rc3 = stm_fs_configure_tree(fs, fs->tree);
+                if (rc3) {
+                    stm_btree_close(fs->tree);
+                    fs->tree = NULL;
+                    if (!rc) rc = rc3;
+                } else if (fs->alloc) {
+                    stm_btree_set_allocator(fs->tree, fs->alloc);
+                }
+            } else if (!rc) {
+                rc = rc2;
+            }
+        }
         return rc;
     }
 

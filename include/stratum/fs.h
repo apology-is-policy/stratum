@@ -36,6 +36,16 @@ int  stm_fs_create_ex(const char *path, uint64_t size_bytes,
                       const char *passphrase, uint8_t comp_algo);
 int  stm_fs_open(const char *path, const char *passphrase,
                  struct stm_fs **fs);
+
+/* Read-only variant: opens without the encrypted-mount gen bump (R8-1),
+ * so diagnostic tools like `stratum check` can inspect a volume without
+ * modifying on-disk state. Writes through the returned fs will violate
+ * the AEAD nonce-uniqueness invariant — the caller MUST NOT call any
+ * mutation API (stm_fs_write, stm_fs_create_file, stm_fs_mkdir,
+ * stm_fs_unlink, stm_fs_sync, stm_snap_*) on an fs opened this way.
+ * Intended for read-only forensic walks and recovery. */
+int  stm_fs_open_ro(const char *path, const char *passphrase,
+                    struct stm_fs **fs);
 int  stm_fs_sync(struct stm_fs *fs);
 void stm_fs_close(struct stm_fs *fs);
 
