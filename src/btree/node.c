@@ -193,21 +193,29 @@ int ensure_msg_cap(struct stm_node *n, uint32_t need)
 int ensure_key_cap(struct stm_node *n, uint32_t need)
 {
     uint32_t cap = n->keys_cap;
-    struct stm_key *kp;
-    struct stm_bptr *cp;
     if (cap >= need) return 0;
     while (cap < need) cap *= 2;
-    kp = realloc(n->pivots, cap * sizeof(*kp));
-    if (!kp) return -ENOMEM;
-    n->pivots = kp;
-    cp = realloc(n->children, (cap + 1) * sizeof(*cp));
-    if (!cp) {
-        /* pivots was reallocated but children failed — pivots is larger
-         * than keys_cap indicates, but that's harmless (realloc from a
-         * larger block works). Don't update keys_cap. */
-        return -ENOMEM;
-    }
-    n->children = cp;
+
+    /* Grow pivots and children atomically: allocate fresh buffers for
+     * both, copy, then swap. If either malloc fails we free the one
+     * that succeeded and return -ENOMEM with the node untouched — no
+     * more "pivots is bigger than keys_cap says" invariant hole. */
+    struct stm_key  *new_pivots   = malloc((size_t)cap * sizeof(*new_pivots));
+    if (!new_pivots) return -ENOMEM;
+    struct stm_bptr *new_children = malloc((size_t)(cap + 1) * sizeof(*new_children));
+    if (!new_children) { free(new_pivots); return -ENOMEM; }
+
+    if (n->pivots && n->nkeys > 0)
+        memcpy(new_pivots, n->pivots, (size_t)n->nkeys * sizeof(*new_pivots));
+    if (n->children && n->nkeys > 0)
+        memcpy(new_children, n->children, (size_t)(n->nkeys + 1) * sizeof(*new_children));
+    else if (n->children)
+        new_children[0] = n->children[0];  /* empty node still has one child slot */
+
+    free(n->pivots);
+    free(n->children);
+    n->pivots   = new_pivots;
+    n->children = new_children;
     n->keys_cap = cap;
     return 0;
 }
