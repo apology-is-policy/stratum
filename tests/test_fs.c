@@ -609,7 +609,11 @@ STM_TEST(test_fs_sync_two_phase_gen_invariant)
     uint64_t hi = gen_a < gen_b ? gen_b : gen_a;
     STM_ASSERT(hi == lo + 1);
 
-    /* Three more sync cycles — verify gen advances by 2 each cycle. */
+    /* Three more sync cycles. Per R8-1, each sync advances the max disk
+     * ss_gen by at least 1 (Phase 3 final at fs->gen_pre + 2; fs->gen
+     * itself advances by 1). disk ss_gen must remain strictly greater
+     * than fs->gen across every cycle. We can only observe disk here,
+     * so assert strict monotonic advance. */
     uint64_t prev_hi = hi;
     int i;
     for (i = 0; i < 3; i++) {
@@ -626,9 +630,87 @@ STM_TEST(test_fs_sync_two_phase_gen_invariant)
         memcpy(&gen_a, sb_a + 16, 8);
         memcpy(&gen_b, sb_b + 16, 8);
         uint64_t cur_hi = gen_a > gen_b ? gen_a : gen_b;
-        STM_ASSERT(cur_hi >= prev_hi + 2);
+        STM_ASSERT(cur_hi > prev_hi);
         prev_hi = cur_hi;
     }
+
+    stm_fs_close(fs);
+    unlink(path);
+}
+
+/* Regression for R8-1: on encrypted volumes, mount-time gen bump must
+ * establish disk ss_gen STRICTLY GREATER than fs->gen (the write_gen used
+ * for ciphertext). Without mount-bump, fs->gen == disk ss_gen after every
+ * successful sync, and inter-sync writes (which encrypt at fs->gen) could
+ * collide with orphans from a crashed prior session after remount.
+ *
+ * Probe: mkfs encrypted volume (fs->gen starts at 1, disk ss_gen=1 post
+ * mkfs). Mount. Mount-bump writes disk ss_gen=2. Read disk. Assert max
+ * ss_gen >= 2 even though NO sync has been called yet. */
+STM_TEST(test_fs_mount_bump_encrypted)
+{
+    const char *path = "/tmp/stratum_test_mount_bump.img";
+    const char *pass = "bumper";
+    struct stm_fs *fs;
+    unlink(path);
+    STM_ASSERT_EQ(stm_fs_create(path, 64ULL*1024*1024, pass), 0);
+
+    /* Inspect SBs immediately after mkfs — before any mount. */
+    int fd = open(path, O_RDONLY);
+    STM_ASSERT(fd >= 0);
+    uint8_t sb_a[512], sb_b[512];
+    STM_ASSERT_EQ((int)pread(fd, sb_a, 512, 0), 512);
+    STM_ASSERT_EQ((int)pread(fd, sb_b, 512, 4096), 512);
+    close(fd);
+    uint64_t gen_a_mkfs, gen_b_mkfs;
+    memcpy(&gen_a_mkfs, sb_a + 16, 8);
+    memcpy(&gen_b_mkfs, sb_b + 16, 8);
+    uint64_t mkfs_max = gen_a_mkfs > gen_b_mkfs ? gen_a_mkfs : gen_b_mkfs;
+
+    /* Mount — should trigger mount-bump (encrypted). */
+    STM_ASSERT_EQ(stm_fs_open(path, pass, &fs), 0);
+
+    /* Inspect SBs NOW — before any sync. Max ss_gen must have advanced
+     * beyond the post-mkfs value. */
+    fd = open(path, O_RDONLY);
+    STM_ASSERT(fd >= 0);
+    STM_ASSERT_EQ((int)pread(fd, sb_a, 512, 0), 512);
+    STM_ASSERT_EQ((int)pread(fd, sb_b, 512, 4096), 512);
+    close(fd);
+    uint64_t gen_a_mounted, gen_b_mounted;
+    memcpy(&gen_a_mounted, sb_a + 16, 8);
+    memcpy(&gen_b_mounted, sb_b + 16, 8);
+    uint64_t mounted_max = gen_a_mounted > gen_b_mounted
+                         ? gen_a_mounted : gen_b_mounted;
+    STM_ASSERT(mounted_max > mkfs_max);
+
+    /* Do a write + sync. All session ciphertexts use write_gen = fs->gen
+     * (= mkfs_max). Mount-bump ensured disk ss_gen > fs->gen. */
+    uint64_t ino;
+    STM_ASSERT_EQ(stm_fs_create_file(fs, 1, "r8.bin", 0644, &ino), 0);
+    STM_ASSERT_EQ(stm_fs_write(fs, ino, 0, "pre-sync", 8), 0);
+    /* Simulate a crash-equivalent by closing without sync — reopen must
+     * still work. (stm_fs_close implicitly flushes any OS-level caches
+     * but does not call stm_fs_sync.) */
+    stm_fs_close(fs);
+
+    /* Reopen — mount-bump again bumps disk ss_gen. On an encrypted
+     * volume that never synced, the reopen must succeed and subsequent
+     * writes must be at a gen different from mkfs's and different from
+     * the previous session's fs->gen. */
+    STM_ASSERT_EQ(stm_fs_open(path, pass, &fs), 0);
+
+    fd = open(path, O_RDONLY);
+    STM_ASSERT(fd >= 0);
+    STM_ASSERT_EQ((int)pread(fd, sb_a, 512, 0), 512);
+    STM_ASSERT_EQ((int)pread(fd, sb_b, 512, 4096), 512);
+    close(fd);
+    uint64_t gen_a_remounted, gen_b_remounted;
+    memcpy(&gen_a_remounted, sb_a + 16, 8);
+    memcpy(&gen_b_remounted, sb_b + 16, 8);
+    uint64_t remounted_max = gen_a_remounted > gen_b_remounted
+                           ? gen_a_remounted : gen_b_remounted;
+    STM_ASSERT(remounted_max > mounted_max);
 
     stm_fs_close(fs);
     unlink(path);
@@ -652,6 +734,7 @@ int main(void)
     STM_RUN(test_fs_write_gap_is_zeroed);
     STM_RUN(test_fs_write_gap_is_zeroed_encrypted);
     STM_RUN(test_fs_sync_two_phase_gen_invariant);
+    STM_RUN(test_fs_mount_bump_encrypted);
     printf("all passed\n");
     return 0;
 }

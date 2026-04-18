@@ -28,11 +28,10 @@ static inline int stm_csum_verify(const void *data, uint32_t len,
                                   const uint8_t expected[STM_CSUM_LEN])
 {
     uint8_t actual[STM_CSUM_LEN];
-    /* All-zero checksum = not computed (backward compat with old volumes) */
-    uint8_t zero[STM_CSUM_LEN];
-    memset(zero, 0, STM_CSUM_LEN);
-    if (memcmp(expected, zero, STM_CSUM_LEN) == 0)
-        return 0;  /* no checksum stored — pass */
+    /* No zero-csum backward-compat clause — all v1 volumes carry a
+     * computed xxHash3-128 csum, and accepting a zeroed field would let
+     * an attacker with raw-disk access substitute SB/node content with
+     * a zeroed csum and pass verification. */
     stm_csum_compute(data, len, actual);
     return memcmp(actual, expected, STM_CSUM_LEN) == 0 ? 0 : -1;
 }

@@ -355,6 +355,13 @@ fail_dev:
     return rc;
 }
 
+/* Forward declaration — build_sb is defined further down but needed in
+ * stm_fs_open for the mount-time gen bump (R8-1). */
+static void build_sb(struct stm_fs *fs, struct stm_superblock *sb,
+                     uint64_t gen, struct stm_bptr root,
+                     struct stm_bptr snap_root,
+                     uint64_t dev_sz);
+
 /* ── open / close / sync ────────────────────────────────────────────── */
 
 int stm_fs_open(const char *path, const char *passphrase, struct stm_fs **out)
@@ -553,8 +560,68 @@ alloc_ok:
         fs->comp_buf = malloc(cbound);
     }
 
+    /* Mount-time gen bump. Extends R7-1's crash-safety invariant from
+     * "sync-internal windows" to "every session". R7-1 alone guarantees
+     * ss_gen > max_write_gen across a sync's Phase 1 → Phase 3 — but
+     * *after* a successful sync, fs->gen equals disk ss_gen. Any
+     * inter-sync write (user-driven stm_fs_write, btree flush triggered
+     * by message-buffer overflow on insert/delete, snap_create's pre-sync
+     * flush) encrypts ciphertexts at write_gen = fs->gen = disk ss_gen.
+     * A crash before the next sync leaves those orphan ciphertexts on
+     * disk; next mount reads the same disk ss_gen and reuses it, and the
+     * allocator hands out the freed orphan paddrs. Fresh writes at those
+     * paddrs produce (DEK, nonce=paddr‖write_gen) collisions with the
+     * orphan ciphertexts — classic stream-cipher nonce-reuse leak.
+     *
+     * Fix: immediately after loading the volume, write an SB at
+     * ss_gen = chosen_gen + 1 to the opposite slot and fsync. fs->gen
+     * stays at chosen_gen (used for session writes). Invariant becomes
+     * disk ss_gen (= chosen_gen + 1) STRICTLY GREATER than fs->gen
+     * (= chosen_gen) — holds from mount through first sync. Subsequent
+     * syncs maintain the same offset: Phase 1 reservation at ss_gen =
+     * fs->gen + 1 (already durable from mount-bump; Phase 1 just refreshes
+     * the root field), Phase 3 final at ss_gen = fs->gen + 2, and
+     * fs->gen advances by 1 (to fs->gen + 1), preserving the strict
+     * inequality.
+     *
+     * Only needed on encrypted volumes — unencrypted volumes have no
+     * AEAD-nonce invariant to protect. If the bump write fails, refuse
+     * the mount: we cannot safely write ciphertexts without the floor
+     * established. (RO-only use cases that must tolerate write failure
+     * — e.g., `stratum check` on a degraded volume — can re-audit this
+     * later, but currently all callers expect RW semantics.) */
+    if (fs->encrypted) {
+        struct stm_superblock sb;
+        uint64_t dev_sz = 0;
+        int bump_slot;
+        stm_block_size(&fs->dev, &dev_sz);
+        build_sb(fs, &sb, fs->gen + 1,
+                 stm_btree_root(fs->tree),
+                 fs->snap_tree ? stm_btree_root(fs->snap_tree) : stm_bptr_null(),
+                 dev_sz);
+        bump_slot = 1 - fs->sb_slot;
+        rc = stm_block_write(&fs->dev,
+                             bump_slot ? STM_SB_OFFSET_B : STM_SB_OFFSET_A,
+                             &sb, sizeof(sb));
+        if (rc) goto fail_bump;
+        rc = stm_block_sync(&fs->dev);
+        if (rc) goto fail_bump;
+    }
+
     *out = fs;
     return 0;
+
+fail_bump:
+    memset(fs->dek, 0, sizeof(fs->dek));
+    free(fs->comp_buf);
+    free(fs->extent_buf);
+    free(fs->cipher_buf);
+    stm_alloc_close(fs->alloc);
+    stm_btree_close(fs->snap_tree);
+    stm_btree_close(fs->tree);
+    stm_block_close(&fs->dev);
+    free(fs);
+    return rc;
 }
 
 /* Serialize an on-disk SB at the given gen + current metadata. The caller
@@ -598,39 +665,68 @@ static void build_sb(struct stm_fs *fs, struct stm_superblock *sb,
  *              than the max write_gen ever used to encrypt a block that
  *              could become a reachable orphan after a crash.
  *
- * Before this two-phase rewrite, a single failed SB write after a successful
- * flush left orphan ciphertexts at gen G on disk while the SB still said G.
- * Next mount read gen G, reused it for fresh writes to reallocated paddrs,
- * and produced (DEK, nonce=paddr‖G) collisions with the orphans — XOR of the
- * two ciphertexts = XOR of plaintexts (stream-cipher catastrophe).
+ * Before R7-1, a single failed SB write after a successful flush left
+ * orphan ciphertexts at gen G on disk while the SB still said G. R7-1
+ * fixed the sync-internal window; R8-1 extends it with a mount-time
+ * gen bump (stm_fs_open) so the invariant also holds across inter-sync
+ * writes — otherwise user data writes between syncs encrypt at write_gen
+ * equal to disk ss_gen, and a crash before the next sync leaves orphan
+ * ciphertexts at the same gen the next mount would reuse.
  *
- * Phase 1 (reservation): write an SB at ss_gen = G+1 with the PRE-flush root
- * to the opposite slot; fsync. On crash after this point, next mount reads
- * gen G+1, not G — orphan ciphertexts at G can't collide.
+ * The overall invariant maintained by mount-bump + sync: disk ss_gen is
+ * always >= fs->gen + 1. Sync preserves this as follows:
  *
- * Phase 2 (flush): now that the reservation is durable, flush tree writes at
- * write_gen = G.
+ * Entry state: fs->gen = G, disk ss_gen = G+1 (from mount-bump OR the
+ * prior sync's Phase 3). Session writes in this sync use write_gen = G.
  *
- * Phase 3 (final commit): write an SB at ss_gen = G+2 (strictly greater than
- * reservation, so mount's tiebreak picks the final), with the post-flush
- * root, to the current slot. On torn-write, reservation survives and next
- * mount uses gen G+1 — still > G, so still safe. fs->gen advances by 2 per
- * successful sync cycle. */
+ * Phase 1 (reservation): write an SB at ss_gen = G+1 (same as mount-bump
+ * or prior reservation) with the PRE-flush root to the opposite slot;
+ * fsync. This refreshes the reservation with the session's pre-flush
+ * root — important because the root may have changed since mount-bump
+ * via buffered inserts/deletes.
+ *
+ * Phase 2 (flush): tree flush at write_gen = G. All ciphertexts produced
+ * have nonce (paddr ‖ G). Invariant holds: disk ss_gen = G+1 > G.
+ *
+ * Phase 3 (final): write an SB at ss_gen = G+2 with the post-flush root
+ * to the current slot; fsync. fs->gen advances to G+1. Invariant holds:
+ * disk ss_gen = G+2 > fs->gen = G+1.
+ *
+ * Crash-safety:
+ *   - Crash after Phase 1: disk has (G+1, pre-flush root) at opposite
+ *     slot, (G, old root) at current. Mount picks (G+1). fs->gen = G.
+ *     Mount-bump establishes new disk ss_gen = G+1 (no advance because
+ *     the SB was already at G+1 — but the opposite slot now has the
+ *     bumped version with NEW mount-time state). Actually this crash
+ *     means session's modifications are LOST (pre-flush root), and
+ *     next session writes at G. Old session's orphans (from Phase 2
+ *     if it started) at G. SAME GEN — possible collision!
+ *
+ * To avoid this: mount-bump must write at ss_gen = chosen_gen + 1, but
+ * session writes must use chosen_gen. So if mount reads G+1 (from a
+ * failed-mid-sync state), session writes at G+1, mount-bump establishes
+ * disk ss_gen = G+2. Orphans from the failed sync at G (Phase 2 writes
+ * before the crash) have different gen from G+1. Safe.
+ *
+ * On torn-write of Phase 3: opposite slot survives with (G+1, pre-flush
+ * root). Same as above — safe.
+ */
 int stm_fs_sync(struct stm_fs *fs)
 {
     struct stm_superblock sb;
     uint64_t dev_sz = 0;
     int new_slot, rc;
     uint64_t gen_used = fs->gen;            /* writes in this sync use this */
-    uint64_t gen_reserve = gen_used + 1;    /* disk ss_gen during flush */
+    uint64_t gen_reserve = gen_used + 1;    /* disk ss_gen during flush (matches mount-bump / prior reservation) */
     uint64_t gen_final   = gen_used + 2;    /* disk ss_gen after success */
 
     stm_block_size(&fs->dev, &dev_sz);
 
-    /* Phase 1: reservation. Commit ss_gen = G+1 with PRE-flush root before
-     * any ciphertext at gen G touches disk. Opposite of current sb_slot so
-     * if this write torns, the prior good SB at fs->sb_slot (ss_gen = prev
-     * gen_final, which is also > G) remains intact. */
+    /* Phase 1: reservation. ss_gen = gen_reserve = G+1 (same as mount-bump
+     * or prior reservation). Refresh the reservation SB with the session's
+     * current pre-flush root so a crash between Phase 1 and Phase 3 lands
+     * at a consistent tree snapshot. Write to opposite of current sb_slot
+     * — if this write torns, the prior good SB at fs->sb_slot remains. */
     new_slot = 1 - fs->sb_slot;
     build_sb(fs, &sb, gen_reserve,
              stm_btree_root(fs->tree),
@@ -643,9 +739,9 @@ int stm_fs_sync(struct stm_fs *fs)
     rc = stm_block_sync(&fs->dev);
     if (rc) return rc;
 
-    /* Phase 2: flush. All writes use write_gen = gen_used. Disk now holds an
-     * SB at ss_gen = gen_reserve > gen_used at the opposite slot, so a crash
-     * mid-flush leaves next mount using gen_reserve, not gen_used. */
+    /* Phase 2: flush at write_gen = gen_used = G. Disk ss_gen = G+1 > G
+     * already (from Phase 1 / mount-bump), so orphans from an aborted
+     * flush can't collide with next session's writes at G+1. */
     rc = stm_btree_flush(fs->tree, gen_used);
     if (rc) return rc;
 
@@ -660,11 +756,12 @@ int stm_fs_sync(struct stm_fs *fs)
             stm_btree_set_alloc(fs->tree, a);
     }
 
-    /* Phase 3: final commit. ss_gen = gen_final = gen_reserve + 1 guarantees
-     * mount's gen tiebreak picks this SB over the reservation when both are
-     * valid. Write to current sb_slot (overwriting the prior good SB): if
-     * this write torns, the reservation at opposite slot survives (with
-     * ss_gen = gen_reserve > gen_used — still safe). */
+    /* Phase 3: final commit. ss_gen = gen_final = G+2 (strictly greater
+     * than reservation, so mount's gen tiebreak picks this SB). Write to
+     * current sb_slot (overwriting prior final): if this torns, the
+     * reservation at opposite slot survives with ss_gen = G+1 > G.
+     * Advance fs->gen to G+1 — still one less than the new disk ss_gen,
+     * preserving the invariant for inter-sync writes in the NEXT window. */
     build_sb(fs, &sb, gen_final,
              stm_btree_root(fs->tree),
              fs->snap_tree ? stm_btree_root(fs->snap_tree) : stm_bptr_null(),
@@ -676,11 +773,7 @@ int stm_fs_sync(struct stm_fs *fs)
     rc = stm_block_sync(&fs->dev);
     if (rc) return rc;
 
-    fs->gen = gen_final;
-    /* fs->sb_slot stays the same: final landed there. Next sync's Phase 1
-     * writes reservation to (1 - fs->sb_slot) — overwriting this sync's
-     * reservation. Standard ping-pong where the final and reservation slots
-     * alternate their roles every two syncs. */
+    fs->gen = gen_used + 1;  /* advance by 1; disk ss_gen = G+2 stays ahead */
     if (fs->alloc) stm_alloc_commit(fs->alloc);
     return 0;
 }
@@ -948,18 +1041,16 @@ int stm_fs_write(struct stm_fs *fs, uint64_t ino, uint64_t offset,
     if (len > 0 && offset > UINT64_MAX - (uint64_t)len)
         return -EFBIG;
 
-    /* Get current file size to skip old-extent lookups for growing writes.
-     * Propagate read errors: swallowing an EIO here means cur_size stays
-     * 0, every write is treated as past-EOF, existing extents at these
-     * offsets are NOT freed, and the inode-size update at the end is
-     * skipped → ghost extents + orphaned blocks + ciphertext leakage
-     * on encrypted volumes. */
-    uint64_t cur_size;
+    /* Verify the inode exists before touching the extent loop. Propagate
+     * read errors: swallowing an EIO here would silently do no work and
+     * then skip the inode-size update at the end → ghost extents +
+     * orphaned blocks. (cur_size itself is no longer consulted because
+     * both extent branches always look up the old record unconditionally,
+     * per R7-6.) */
     {
         struct stm_inode sz_in;
         rc = read_inode(fs, ino, &sz_in);
         if (rc) return rc;
-        cur_size = le64_to_cpu(sz_in.si_size);
     }
 
     uint8_t *ebuf = fs->extent_buf;
@@ -1186,10 +1277,14 @@ static int collect_extent_cb(const struct stm_key *key, const void *val,
 
     if (uc->count >= uc->cap) {
         uint32_t nc = uc->cap ? uc->cap * 2 : 64;
-        struct stm_key    *nk = realloc(uc->keys, nc * sizeof(*nk));
-        struct stm_extent *nx = realloc(uc->exts, nc * sizeof(*nx));
+        /* Check each realloc return BEFORE the next call. Doing both then
+         * checking after would leave us with one array reallocated (old
+         * pointer possibly freed) and the other stale — the outer free()
+         * would touch a dangling pointer. */
+        struct stm_key *nk = realloc(uc->keys, nc * sizeof(*nk));
         if (!nk) return -ENOMEM;
         uc->keys = nk;
+        struct stm_extent *nx = realloc(uc->exts, nc * sizeof(*nx));
         if (!nx) return -ENOMEM;
         uc->exts = nx;
         uc->cap  = nc;
