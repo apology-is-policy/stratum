@@ -443,7 +443,11 @@ int stm_fs_open(const char *path, const char *passphrase, struct stm_fs **out)
         stm_block_close(&fs->dev); free(fs); return rc;
     }
     stm_btree_set_alloc(fs->tree, le64_to_cpu(chosen->ss_alloc_next));
-    stm_fs_configure_tree(fs, fs->tree);
+    rc = stm_fs_configure_tree(fs, fs->tree);
+    if (rc) {
+        memset(fs->dek, 0, sizeof(fs->dek));
+        stm_btree_close(fs->tree); stm_block_close(&fs->dev); free(fs); return rc;
+    }
 
     /* open snapshot tree if it exists */
     if (!stm_bptr_is_null(&chosen->ss_snap_root)) {
@@ -454,7 +458,12 @@ int stm_fs_open(const char *path, const char *passphrase, struct stm_fs **out)
             stm_btree_close(fs->tree); stm_block_close(&fs->dev); free(fs); return rc;
         }
         stm_btree_set_alloc(fs->snap_tree, le64_to_cpu(chosen->ss_alloc_next));
-        stm_fs_configure_tree(fs, fs->snap_tree);
+        rc = stm_fs_configure_tree(fs, fs->snap_tree);
+        if (rc) {
+            memset(fs->dek, 0, sizeof(fs->dek));
+            stm_btree_close(fs->snap_tree); stm_btree_close(fs->tree);
+            stm_block_close(&fs->dev); free(fs); return rc;
+        }
     }
 
     /* build allocator from tree walks */

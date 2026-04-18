@@ -110,7 +110,14 @@ static int ensure_snap_tree(struct stm_fs *fs)
     rc = stm_btree_open(&fs->dev, stm_bptr_null(), 0, &fs->snap_tree);
     if (rc) return rc;
     stm_btree_set_alloc(fs->snap_tree, stm_btree_next_alloc(fs->tree));
-    stm_fs_configure_tree(fs, fs->snap_tree);
+    rc = stm_fs_configure_tree(fs, fs->snap_tree);
+    if (rc) {
+        /* Without crypto wired up, the snap tree would write plaintext
+         * on an encrypted volume — refuse cleanly instead. */
+        stm_btree_close(fs->snap_tree);
+        fs->snap_tree = NULL;
+        return rc;
+    }
     /* CRITICAL: wire the refcount allocator. Without this, the snap tree
      * falls through to bump allocation and writes its nodes on top of
      * blocks the main tree is using — corrupting the main tree the
@@ -234,10 +241,30 @@ int stm_snap_create(struct stm_fs *fs, const char *name, uint64_t *out_id)
     memcpy(vbuf + sizeof(snap) + 1, name, nlen);
     vlen = (uint32_t)(sizeof(snap) + 1 + nlen);
 
+    /* Bump refcounts FIRST. If we inserted the descriptor first and
+     * then an ENOMEM on name-index (or refcount walk) left us with a
+     * persisted descriptor whose blocks were never ref-protected, the
+     * next COW would silently reclaim them → next mount corruption.
+     * With this ordering, a failure after the bump leaves only a
+     * benign "orphan ref-count" (blocks stay live until next mount
+     * rebuild); no descriptor references them yet, so no corruption. */
+    if (fs->alloc) {
+        rc = stm_btree_walk_entries(fs->tree, snap.ssp_root,
+                                    ref_block_fs, ref_extent_entry, fs);
+        if (rc) return rc;
+    }
+
     {
         struct stm_key skey = mk_key(id, STM_KEY_SNAP, 0);
         rc = stm_btree_insert(fs->snap_tree, &skey, vbuf, vlen, fs->gen);
-        if (rc) return rc;
+        if (rc) {
+            /* Undo the refcount bumps so blocks don't stay live forever. */
+            if (fs->alloc) {
+                stm_btree_walk_entries(fs->tree, snap.ssp_root,
+                                       free_block_fs, free_extent_entry, fs);
+            }
+            return rc;
+        }
     }
 
     /* name-to-ID index */
@@ -247,17 +274,21 @@ int stm_snap_create(struct stm_fs *fs, const char *name, uint64_t *out_id)
         memcpy(nbuf + 8, name, nlen);
         nblen = (uint32_t)(8 + nlen);
         rc = stm_btree_insert(fs->snap_tree, &nkey, nbuf, nblen, fs->gen);
-        if (rc) return rc;
-    }
-
-    /* Increment refcounts on all blocks in the snapshotted tree so COW
-     * doesn't reclaim shared blocks. The dry-run above already proved
-     * every node is readable, so this walk is expected to succeed —
-     * but we still check the rc for belt-and-suspenders. */
-    if (fs->alloc) {
-        rc = stm_btree_walk_entries(fs->tree, snap.ssp_root,
-                                    ref_block_fs, ref_extent_entry, fs);
-        if (rc) return rc;
+        if (rc) {
+            /* Undo both the descriptor insert and the refcount bumps.
+             * The descriptor-delete itself can fail with another ENOMEM;
+             * if it does we'd leave a nameless-but-valid snapshot — the
+             * user can still roll back by id. That's worse than success
+             * but not corruption: the descriptor's blocks ARE protected
+             * by the earlier ref walk. */
+            struct stm_key skey = mk_key(id, STM_KEY_SNAP, 0);
+            (void)stm_btree_delete(fs->snap_tree, &skey, fs->gen);
+            if (fs->alloc) {
+                stm_btree_walk_entries(fs->tree, snap.ssp_root,
+                                       free_block_fs, free_extent_entry, fs);
+            }
+            return rc;
+        }
     }
 
     if (out_id) *out_id = id;
@@ -361,7 +392,17 @@ int stm_snap_rollback(struct stm_fs *fs, uint64_t snap_id)
     stm_btree_set_alloc(fs->tree,
         fs->snap_tree ? stm_btree_next_alloc(fs->snap_tree)
                       : stm_btree_next_alloc(fs->tree));
-    stm_fs_configure_tree(fs, fs->tree);
+    rc = stm_fs_configure_tree(fs, fs->tree);
+    if (rc) {
+        /* Without crypto wired up, writes through the reopened tree
+         * would go to disk as plaintext on an encrypted volume. Refuse
+         * the rollback. fs->tree is still the reopened (unconfigured)
+         * tree — the caller's next mount sees the un-rolled-back state
+         * on disk and can retry. */
+        stm_btree_close(fs->tree);
+        fs->tree = NULL;
+        return rc;
+    }
 
     /* The freshly-reopened fs->tree was calloc'd, so its alloc pointer
      * is NULL. Connect it to the CURRENT allocator (A_old) up front —

@@ -101,9 +101,15 @@ static inline uint64_t stm_fnv1a(const char *data, size_t len)
     return h;
 }
 
-/* Configure compression + crypto on a btree from fs state. */
-static inline void stm_fs_configure_tree(struct stm_fs *fs,
-                                         struct stm_btree *t)
+/* Configure compression + crypto on a btree from fs state. Returns
+ * non-zero on failure (stm_crypto_init OOM) — callers MUST propagate,
+ * otherwise the tree is left without a crypto context and subsequent
+ * writes go out as plaintext on what the user considers an encrypted
+ * volume. That plaintext persists to disk, breaks the AEAD invariant
+ * on next mount (decrypt of plaintext as ciphertext fails), and worst
+ * case exposes the data to any reader of the raw device. */
+static inline int stm_fs_configure_tree(struct stm_fs *fs,
+                                        struct stm_btree *t)
 {
 #ifdef STM_HAVE_LZ4
     stm_btree_set_compression(t, STM_COMP_LZ4);
@@ -112,9 +118,11 @@ static inline void stm_fs_configure_tree(struct stm_fs *fs,
 #endif
     if (fs->encrypted) {
         struct stm_crypto *ctx = NULL;
-        stm_crypto_init(fs->dek, &ctx);
+        int rc = stm_crypto_init(fs->dek, &ctx);
+        if (rc) return rc;
         stm_btree_set_crypto(t, ctx);
     }
+    return 0;
 }
 
 #endif /* STM_FS_INTERNAL_H */
