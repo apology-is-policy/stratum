@@ -36,10 +36,16 @@ static int mark_extent_entry(const struct stm_key *key, const void *val,
     struct stm_key_cpu kc = stm_key_to_cpu(key);
 
     if (kc.type == STM_KEY_INODE) {
+        /* R14-1: refuse adversarial INODE keys planted near UINT64_MAX
+         * that would cause (kc.ino + 1) to wrap when raising
+         * fs->next_ino. Walk abort propagates to mount-abort via the
+         * existing fail_alloc path — safer than silently wrapping. */
+        if (kc.ino > UINT64_MAX - (UINT64_C(1) << 32)) return -EINVAL;
         if (kc.ino >= fs->next_ino) fs->next_ino = kc.ino + 1;
         return 0;
     }
     if (kc.type == STM_KEY_SNAP) {
+        if (kc.ino > UINT64_MAX - (UINT64_C(1) << 32)) return -EINVAL;
         if (kc.ino >= fs->next_snap_id) fs->next_snap_id = kc.ino + 1;
         return 0;
     }
@@ -216,6 +222,14 @@ static int tombstone_dirent(struct stm_btree *tree,
 
 static uint64_t alloc_ino(struct stm_fs *fs)
 {
+    /* Defensive skip of STM_ROOT_INO and 0. Mount-time high clamp
+     * (R14-1) should prevent fs->next_ino from reaching a value that
+     * would wrap to these, but a runtime bug or intentional overflow
+     * downstream could still hand out 0 or STM_ROOT_INO. Skipping them
+     * costs nothing (u64 counter) and hardens against the
+     * root-inode-overwrite vector at the allocation site. */
+    while (fs->next_ino == 0 || fs->next_ino == STM_ROOT_INO)
+        fs->next_ino++;
     return fs->next_ino++;
 }
 
@@ -473,17 +487,25 @@ static int stm_fs_open_impl(const char *path, const char *passphrase,
         stm_block_close(&fs->dev); free(fs); return -ENOTSUP;
     }
     fs->next_ino    = le64_to_cpu(chosen->ss_next_ino);
-    /* R12-1 + R13-2: defense-in-depth against adversarial ss_next_ino.
-     * Initial clamp ensures next_ino > STM_ROOT_INO (preventing root-
-     * inode overwrite); the mount-time tree walk below (via the
-     * mark_extent_entry callback) raises this further to max(
-     * fs->next_ino, max_ino_seen + 1), closing the general case
-     * where the attacker set next_ino to any live inode's value. */
+    /* R12-1 + R13-2 + R14-1: defense-in-depth against adversarial
+     * ss_next_ino. Low clamp (> STM_ROOT_INO) prevents root-inode
+     * overwrite on first create. Walk-derived raise (via
+     * mark_extent_entry) closes the "alias any live inode" case.
+     * High clamp here closes the wraparound case: attacker sets
+     * ss_next_ino near UINT64_MAX, alloc_ino returns max, increments
+     * wrap to 0/1 (= STM_ROOT_INO) on subsequent creates, overwriting
+     * root. 2^32 headroom is astronomical (no legitimate workload
+     * creates 4 billion inodes in a reasonable timeframe). */
     if (fs->next_ino <= STM_ROOT_INO) fs->next_ino = STM_ROOT_INO + 1;
+    if (fs->next_ino > UINT64_MAX - (UINT64_C(1) << 32)) {
+        stm_block_close(&fs->dev); free(fs); return -ENOTSUP;
+    }
     fs->next_snap_id = le64_to_cpu(chosen->ss_next_snap_id);
-    /* R13-4: same pattern for snap_id. Initial clamp to >=1; the
-     * snap-tree walk raises to max_snap_id + 1. */
+    /* R13-4 + R14-2: same low-then-high pattern for snap_id. */
     if (fs->next_snap_id == 0) fs->next_snap_id = 1;
+    if (fs->next_snap_id > UINT64_MAX - (UINT64_C(1) << 32)) {
+        stm_block_close(&fs->dev); free(fs); return -ENOTSUP;
+    }
     fs->enc_algo = chosen->ss_enc_algo;
     memcpy(fs->enc_kdf_salt, chosen->ss_enc_kdf_salt, sizeof(fs->enc_kdf_salt));
     memcpy(fs->enc_wrapped_key, chosen->ss_enc_wrapped_key, sizeof(fs->enc_wrapped_key));
