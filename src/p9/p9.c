@@ -284,7 +284,15 @@ static int h_attach(struct stm_9p *s, const uint8_t *body, uint32_t body_len,
     strcpy(f->name, "/");
 
     rc = stm_fs_stat(s->fs, STM_ROOT_INO, &in);
-    if (rc) return resp_error(resp, resp_len, tag, "cannot stat root");
+    if (rc) {
+        /* R11-2: free the fid we just allocated — otherwise a client
+         * repeatedly Tattach'ing against a wedged fs (stat returns
+         * -EIO) burns through all MAX_FIDS slots and DoS's legitimate
+         * operations. The fid state is unreachable to the client
+         * anyway; we told them attach failed. */
+        fid_free(s, fid);
+        return resp_error(resp, resp_len, tag, "cannot stat root");
+    }
 
     wp = resp + 4;
     *wp++ = P9_RATTACH;
@@ -927,4 +935,16 @@ static int h_snap_rollback(struct stm_9p *s, const uint8_t *body, uint32_t body_
     return 0;
 }
 
-void stm_9p_destroy(struct stm_9p *s) { free(s); }
+void stm_9p_destroy(struct stm_9p *s)
+{
+    int i;
+    if (!s) return;
+    /* Free every fid's readdir cache. Without this, a client that
+     * disconnects without clunking its fids leaks up to
+     * MAX_FIDS * msize bytes per disconnect. Malicious clients can
+     * OOM the server via rapid connect/disconnect cycles. */
+    for (i = 0; i < MAX_FIDS; i++) {
+        if (s->fids[i].dir_cache) free(s->fids[i].dir_cache);
+    }
+    free(s);
+}

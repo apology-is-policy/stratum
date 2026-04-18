@@ -863,9 +863,6 @@ static int write_inode(struct stm_fs *fs, uint64_t ino,
     return stm_btree_insert(fs->tree, &k, in, sizeof(*in), fs->gen);
 }
 
-struct stm_btree *stm_fs_get_tree(struct stm_fs *fs) { return fs->tree; }
-uint64_t stm_fs_get_gen(struct stm_fs *fs) { return fs->gen; }
-
 /* ── public operations ──────────────────────────────────────────────── */
 
 int stm_fs_stat(struct stm_fs *fs, uint64_t ino, struct stm_inode *out)
