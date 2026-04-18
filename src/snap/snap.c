@@ -381,28 +381,49 @@ int stm_snap_rollback(struct stm_fs *fs, uint64_t snap_id)
     if (vlen < sizeof(snap)) return -EINVAL;
     memcpy(&snap, vbuf, sizeof(snap));
 
+    /* Save the CURRENT tree's root bptr + height before closing, so that
+     * any failure in the open-and-configure sequence below can reopen
+     * the original tree and leave fs->tree pointing at a usable struct.
+     * Without this, the server would be left with fs->tree == NULL and
+     * every subsequent op would SEGV. */
+    struct stm_bptr orig_root    = stm_btree_root(fs->tree);
+    uint16_t        orig_height  = stm_btree_height(fs->tree);
+
     /* close current main tree, open from snapshot root */
     stm_btree_close(fs->tree);
     fs->tree = NULL;
 
     rc = stm_btree_open(&fs->dev, snap.ssp_root,
                         le16_to_cpu(snap.ssp_tree_height), &fs->tree);
-    if (rc) return rc;
+    if (rc) goto reopen_original;
 
     stm_btree_set_alloc(fs->tree,
         fs->snap_tree ? stm_btree_next_alloc(fs->snap_tree)
                       : stm_btree_next_alloc(fs->tree));
     rc = stm_fs_configure_tree(fs, fs->tree);
     if (rc) {
-        /* Without crypto wired up, writes through the reopened tree
-         * would go to disk as plaintext on an encrypted volume. Refuse
-         * the rollback. fs->tree is still the reopened (unconfigured)
-         * tree — the caller's next mount sees the un-rolled-back state
-         * on disk and can retry. */
         stm_btree_close(fs->tree);
         fs->tree = NULL;
+        goto reopen_original;
+    }
+    goto after_reopen;
+
+reopen_original:
+    {
+        /* Put fs->tree back where it was. If this fails too the fs is
+         * genuinely wedged; the caller (h_snap_rollback) returns Rerror
+         * and we're left with fs->tree == NULL — better than lying. */
+        int rc2 = stm_btree_open(&fs->dev, orig_root, orig_height, &fs->tree);
+        if (rc2 == 0) {
+            (void)stm_fs_configure_tree(fs, fs->tree);
+            if (fs->alloc) stm_btree_set_allocator(fs->tree, fs->alloc);
+        } else {
+            /* rc2 takes precedence only if it's worse than the primary rc */
+            if (!rc) rc = rc2;
+        }
         return rc;
     }
+after_reopen:
 
     /* The freshly-reopened fs->tree was calloc'd, so its alloc pointer
      * is NULL. Connect it to the CURRENT allocator (A_old) up front —
