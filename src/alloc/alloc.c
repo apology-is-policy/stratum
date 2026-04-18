@@ -206,9 +206,14 @@ void stm_alloc_free(struct stm_alloc *a, uint64_t block_nr, uint32_t count)
                 a->deferred[a->ndeferred].count = 1;
                 a->ndeferred++;
             } else {
-                /* Cannot record deferred free — revert to keep refcount
-                 * consistent. Block leaks until next mount rebuild. */
-                a->refcounts[b] = 1;
+                /* Cannot record deferred free. Undo the decrement that
+                 * led us here (re-increment), not assign 1 — otherwise
+                 * a block that was shared at refcount 2 would now read
+                 * as refcount 1, losing one tracker, leading to a
+                 * double-free later when the other owner decrements.
+                 * Block stays live and leaks until the next mount
+                 * rebuild or until another deferred slot opens up. */
+                a->refcounts[b]++;
             }
         }
     }
