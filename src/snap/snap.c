@@ -342,35 +342,57 @@ int stm_snap_rollback(struct stm_fs *fs, uint64_t snap_id)
 
     /* Rebuild allocator for the restored tree — old refcounts are stale.
      * Without this, the allocator thinks pre-rollback blocks are in use
-     * and the restored tree's blocks are free → double allocation. */
+     * and the restored tree's blocks are free → double allocation.
+     *
+     * Careful: fs->tree->alloc and fs->snap_tree->alloc both point at
+     * the *current* allocator (A_old). If we free A_old first and an
+     * intermediate step then fails, those tree pointers dangle — any
+     * subsequent write (e.g. another snap op on the same session) is
+     * a use-after-free. Build the new allocator FIRST, then atomically
+     * swap, then free the old one. */
     if (fs->alloc) {
+        struct stm_alloc *old_alloc = fs->alloc;
+        struct stm_alloc *new_alloc = NULL;
         uint64_t dev_bytes = 0;
-        stm_alloc_close(fs->alloc);
-        fs->alloc = NULL;
         stm_block_size(&fs->dev, &dev_bytes);
-        rc = stm_alloc_open(&fs->dev, dev_bytes / STM_BLOCK_SIZE, &fs->alloc);
+        rc = stm_alloc_open(&fs->dev, dev_bytes / STM_BLOCK_SIZE, &new_alloc);
         if (rc) return rc;
-        stm_alloc_mark(fs->alloc, 0, 2); /* superblocks */
-        /* Propagate all walk returns — a single corrupt node anywhere in
-         * these walks would otherwise leave the allocator under-marked
-         * and expose live blocks to reuse. */
+
+        /* Mark superblocks + walk trees against the new allocator.
+         * Temporarily point fs->alloc at the new one so the walk
+         * callbacks (mark_block_snap / mark_extent_snap) target it.
+         * On failure, restore the old allocator binding and free the
+         * half-built new one — trees stay connected to the still-valid
+         * old allocator. */
+        fs->alloc = new_alloc;
+        stm_alloc_mark(new_alloc, 0, 2);
         rc = stm_btree_walk_entries(fs->tree, stm_btree_root(fs->tree),
                                     mark_block_snap, mark_extent_snap, fs);
-        if (rc) return rc;
+        if (rc) goto rollback_restore;
         if (fs->snap_tree) {
             rc = stm_btree_walk_entries(fs->snap_tree,
                                         stm_btree_root(fs->snap_tree),
                                         mark_block_snap, mark_extent_snap, fs);
-            if (rc) return rc;
+            if (rc) goto rollback_restore;
             struct stm_key lo = mk_key(0, STM_KEY_SNAP, 0);
             struct stm_key hi = mk_key(UINT64_MAX, STM_KEY_SNAP, UINT64_MAX);
             rc = stm_btree_scan(fs->snap_tree, &lo, &hi, mark_saved_snap_cb, fs);
-            if (rc) return rc;
+            if (rc) goto rollback_restore;
         }
-        stm_alloc_commit(fs->alloc);
-        stm_btree_set_allocator(fs->tree, fs->alloc);
+        stm_alloc_commit(new_alloc);
+
+        /* Commit the swap: point both trees at the new allocator, then
+         * free the old one. After this point no dangling pointers. */
+        stm_btree_set_allocator(fs->tree, new_alloc);
         if (fs->snap_tree)
-            stm_btree_set_allocator(fs->snap_tree, fs->alloc);
+            stm_btree_set_allocator(fs->snap_tree, new_alloc);
+        stm_alloc_close(old_alloc);
+        return 0;
+
+    rollback_restore:
+        fs->alloc = old_alloc;                   /* trees still connected here */
+        stm_alloc_close(new_alloc);
+        return rc;
     }
 
     return 0;
