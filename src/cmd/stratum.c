@@ -38,36 +38,8 @@
 static volatile int running = 1;
 static void on_signal(int sig) { (void)sig; running = 0; }
 
-/* Read password from stdin (one line, no trailing newline).
- *
- * Reads byte-by-byte via getchar() instead of fgets so we can detect
- * an embedded NUL before the line terminator. fgets + strlen silently
- * truncates at the first NUL, which would reduce the effective
- * passphrase entropy without the user noticing. Reject that case
- * with a clear error. */
-static char stdin_pass_buf[256];
-static const char *read_pass_stdin(void)
-{
-    size_t len = 0;
-    for (;;) {
-        int c = getchar();
-        if (c == EOF || c == '\n') break;
-        if (c == '\0') {
-            fprintf(stderr, "Passphrase contains a NUL byte — rejected "
-                            "(would be silently truncated otherwise).\n");
-            return NULL;
-        }
-        if (c == '\r') continue;
-        if (len + 1 >= sizeof(stdin_pass_buf)) {
-            fprintf(stderr, "Passphrase too long (max %zu bytes).\n",
-                    sizeof(stdin_pass_buf) - 1);
-            return NULL;
-        }
-        stdin_pass_buf[len++] = (char)c;
-    }
-    stdin_pass_buf[len] = '\0';
-    return len > 0 ? stdin_pass_buf : NULL;
-}
+#include "cli_common.h"
+#define read_pass_stdin() stm_cli_read_pass_stdin()
 
 
 static int print_snap_cb(uint64_t id, const char *name, uint64_t gen, void *ctx)

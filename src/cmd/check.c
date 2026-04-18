@@ -70,14 +70,8 @@ static const char *enc_name(uint8_t a)
     }
 }
 
-static const char *read_pass_stdin_local(void)
-{
-    static char buf[256];
-    if (!fgets(buf, sizeof(buf), stdin)) return NULL;
-    size_t n = strlen(buf);
-    if (n > 0 && buf[n - 1] == '\n') buf[n - 1] = 0;
-    return buf;
-}
+#include "cli_common.h"
+#define read_pass_stdin_local() stm_cli_read_pass_stdin()
 
 /* Print a hex digest. */
 static void print_hex(const uint8_t *b, size_t n)

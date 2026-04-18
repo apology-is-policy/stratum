@@ -22,6 +22,7 @@
 #include "stratum/snapshot.h"
 #include "../btree/btree_internal.h"
 #include "../fs/fs_internal.h"
+#include "cli_common.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -141,15 +142,6 @@ static int scrub_snap_cb(const struct stm_key *key, const void *val,
     return 0;
 }
 
-static const char *read_pass_stdin_local(void)
-{
-    static char buf[256];
-    if (!fgets(buf, sizeof(buf), stdin)) return NULL;
-    size_t n = strlen(buf);
-    if (n > 0 && buf[n - 1] == '\n') buf[n - 1] = 0;
-    return buf;
-}
-
 int stm_cmd_scrub(int argc, char **argv)
 {
     const char *path = NULL, *pass = NULL;
@@ -158,7 +150,7 @@ int stm_cmd_scrub(int argc, char **argv)
 
     for (i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--pass") == 0 && i + 1 < argc) { pass = argv[++i]; continue; }
-        if (strcmp(argv[i], "--pass-stdin") == 0) { pass = read_pass_stdin_local(); continue; }
+        if (strcmp(argv[i], "--pass-stdin") == 0) { pass = stm_cli_read_pass_stdin(); continue; }
         if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) { verbose = 1; continue; }
         if (!path) path = argv[i];
     }
@@ -169,6 +161,10 @@ int stm_cmd_scrub(int argc, char **argv)
         return 2;
     }
 
+    /* F3: on encrypted volumes stm_fs_open_ro pays ~3-5s for Argon2id
+     * at SENSITIVE tier. Without a pre-open message the user sees a
+     * dead terminal during that window. */
+    fprintf(stderr, "Opening %s...\n", path);
     struct stm_fs *fs = NULL;
     int rc = stm_fs_open_ro(path, pass, &fs);
     if (rc) {
@@ -222,7 +218,7 @@ int stm_cmd_scrub(int argc, char **argv)
     /* Flush the progress line and emit summary. */
     char hb[32];
     human_bytes(c.bytes, hb, sizeof(hb));
-    fprintf(stderr, "\r%*s\r", 72, "");  /* clear the progress line */
+    fprintf(stderr, "\r%*s\r", 128, "");  /* clear the progress line */
     printf("\n  Nodes verified:   %llu\n", (unsigned long long)c.nodes);
     printf("  Extents verified: %llu\n",   (unsigned long long)c.extents);
     printf("  Bytes scrubbed:   %s\n",     hb);

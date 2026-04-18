@@ -63,7 +63,7 @@ endif()
 add_subdirectory(src)
 
 # CLI executable
-add_executable(stratum src/cmd/stratum.c src/cmd/check.c src/cmd/scrub.c)
+add_executable(stratum src/cmd/stratum.c src/cmd/check.c src/cmd/scrub.c src/cmd/cli_common.c)
 target_link_libraries(stratum PRIVATE stratum-lib)
 # rename to avoid collision with the library target
 set_target_properties(stratum PROPERTIES OUTPUT_NAME stratum)
