@@ -637,7 +637,8 @@ Standard 9P2000: Tversion, Tattach, Twalk, Topen, Tcreate, Tread, Twrite, Tclunk
 stratum mkfs  <path> <size>  [--pass <p>|--pass-stdin] [--compress lz4|zstd|none]
 stratum serve <path>          [--pass <p>|--pass-stdin] [--listen <addr>]
 stratum info  <path>          [--pass <p>|--pass-stdin]
-stratum check <path>          [--pass <p>|--pass-stdin]
+stratum check <path>          [--pass <p>|--pass-stdin] [--verbose]
+stratum scrub <path>          [--pass <p>|--pass-stdin] [--verbose]
 stratum snap  <path> <create|list|delete|rollback> [name|id]
                                [--pass <p>|--pass-stdin]
 ```
@@ -647,14 +648,35 @@ stratum snap  <path> <create|list|delete|rollback> [name|id]
 - `--pass <value>`: password on command line (visible in `ps`).
 - `--pass-stdin`: read one line from stdin (not visible). Used by TUI to pipe password securely.
 
-### 14.2 `check` command (fsck)
+### 14.2 `check` command (fsck — structural)
 
 1. Read both superblocks, verify magic + csum.
-2. `stm_fs_open` — fails on any bptr corruption.
+2. `stm_fs_open_ro` — fails on any bptr corruption.
 3. Walk every btree node + every leaf entry + every INSERT message in internal nodes.
-4. Validate: csize > 0, paddr within device, data values are 12-byte extent records with valid paddr/dlen.
+4. Validate: csize > 0, paddr within device, data values are 24-byte extent records with valid paddr/dlen.
 5. Verify root inode exists.
-6. Summary: node count, entry count, inode count, extent count + bytes, free blocks.
+6. Refcount reconciliation: mark every reachable block and cross-check against the rebuilt allocator.
+7. Summary: node count, entry count, inode count, extent count + bytes, free blocks.
+
+Fast. Skips extent payload bytes — does not catch bitrot in file data.
+
+### 14.3 `scrub` command (deep integrity)
+
+Online integrity sweep. Reads every byte of every extent and forces AEAD tag or xxHash3 csum verification on the read path.
+
+1. `stm_fs_open_ro` (skip mount-bump — does not modify the volume).
+2. Walk main tree via `stm_btree_walk_entries`: each node visit forces `stm_btree_read_node` → csum + AEAD verify; each DATA leaf entry triggers a full `extent_read_data` → AEAD tag verify (encrypted) or bounds/decompress verify (unencrypted).
+3. Walk snap tree (descriptors + name index).
+4. For each saved snapshot descriptor, walk its subtree.
+5. Progress on stderr every ~1s: nodes, extents, bytes, errors. Summary on stdout.
+
+Exit code: `0` clean, `1` errors found, `2` couldn't run (bad path, bad passphrase, unmountable volume — use `check` for structural diagnosis in that case).
+
+On **encrypted volumes** scrub is airtight — every extent carries a Poly1305 tag, so any bitrot surfaces as `-EIO` on first read. On **unencrypted volumes** today, extent payload bytes have no per-extent integrity field; scrub exercises btree-node csums but cannot verify extent data. SOTA #7 (per-extent AEAD on unencrypted volumes) closes this gap.
+
+Complements `check`:
+- `check` = metadata integrity (tree shape, refcounts). Fast. Run on every mount / after suspected metadata corruption.
+- `scrub` = data integrity (every stored byte decodes). Slow. Run periodically (cron), before backups, after hardware trouble.
 
 ---
 
