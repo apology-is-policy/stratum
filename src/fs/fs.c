@@ -263,15 +263,27 @@ int stm_fs_create_ex(const char *path, uint64_t size_bytes,
         stm_crypto_random(salt, sizeof(salt));
 
         rc = stm_crypto_derive_key(passphrase, strlen(passphrase), salt, kek);
-        if (rc) goto fail_tree;
+        if (rc) {
+            memset(kek, 0, sizeof(kek));
+            memset(dek, 0, sizeof(dek));
+            goto fail_tree;
+        }
 
         memcpy(sb.ss_enc_kdf_salt, salt, STM_CRYPTO_SALT_LEN);
         rc = stm_crypto_wrap_key(kek, dek, sb.ss_enc_wrapped_key,
                                  sb.ss_enc_nonce);
-        if (rc) goto fail_tree;
+        if (rc) {
+            memset(kek, 0, sizeof(kek));
+            memset(dek, 0, sizeof(dek));
+            goto fail_tree;
+        }
         sb.ss_enc_algo = STM_ENC_XCHACHA;
 
         rc = stm_crypto_init(dek, &crypto);
+        /* stm_crypto_init copies dek into its own context; we can
+         * safely wipe the stack copy now regardless of outcome. */
+        memset(kek, 0, sizeof(kek));
+        memset(dek, 0, sizeof(dek));
         if (rc) goto fail_tree;
         stm_btree_set_crypto(tree, crypto);
 #else
@@ -405,10 +417,18 @@ int stm_fs_open(const char *path, const char *passphrase, struct stm_fs **out)
         }
         rc = stm_crypto_derive_key(passphrase, strlen(passphrase),
                                    chosen->ss_enc_kdf_salt, kek);
-        if (rc) { stm_block_close(&fs->dev); free(fs); return rc; }
+        if (rc) {
+            memset(kek, 0, sizeof(kek));
+            stm_block_close(&fs->dev); free(fs); return rc;
+        }
         rc = stm_crypto_unwrap_key(kek, chosen->ss_enc_wrapped_key,
                                    chosen->ss_enc_nonce, fs->dek);
-        if (rc) { stm_block_close(&fs->dev); free(fs); return rc; }
+        memset(kek, 0, sizeof(kek));
+        if (rc) {
+            /* unwrap writes into fs->dek; wipe it on failure too */
+            memset(fs->dek, 0, sizeof(fs->dek));
+            stm_block_close(&fs->dev); free(fs); return rc;
+        }
         fs->encrypted = 1;
 #else
         stm_block_close(&fs->dev); free(fs); return -ENOTSUP;
@@ -418,7 +438,10 @@ int stm_fs_open(const char *path, const char *passphrase, struct stm_fs **out)
     /* open main tree */
     rc = stm_btree_open(&fs->dev, chosen->ss_root,
                         le16_to_cpu(chosen->ss_tree_height), &fs->tree);
-    if (rc) { stm_block_close(&fs->dev); free(fs); return rc; }
+    if (rc) {
+        memset(fs->dek, 0, sizeof(fs->dek));
+        stm_block_close(&fs->dev); free(fs); return rc;
+    }
     stm_btree_set_alloc(fs->tree, le64_to_cpu(chosen->ss_alloc_next));
     stm_fs_configure_tree(fs, fs->tree);
 
@@ -426,7 +449,10 @@ int stm_fs_open(const char *path, const char *passphrase, struct stm_fs **out)
     if (!stm_bptr_is_null(&chosen->ss_snap_root)) {
         rc = stm_btree_open(&fs->dev, chosen->ss_snap_root,
                             le16_to_cpu(chosen->ss_snap_height), &fs->snap_tree);
-        if (rc) { stm_btree_close(fs->tree); stm_block_close(&fs->dev); free(fs); return rc; }
+        if (rc) {
+            memset(fs->dek, 0, sizeof(fs->dek));
+            stm_btree_close(fs->tree); stm_block_close(&fs->dev); free(fs); return rc;
+        }
         stm_btree_set_alloc(fs->snap_tree, le64_to_cpu(chosen->ss_alloc_next));
         stm_fs_configure_tree(fs, fs->snap_tree);
     }
@@ -436,8 +462,11 @@ int stm_fs_open(const char *path, const char *passphrase, struct stm_fs **out)
         uint64_t dev_bytes = 0;
         stm_block_size(&fs->dev, &dev_bytes);
         rc = stm_alloc_open(&fs->dev, dev_bytes / STM_BLOCK_SIZE, &fs->alloc);
-        if (rc) { stm_btree_close(fs->snap_tree); stm_btree_close(fs->tree);
-                   stm_block_close(&fs->dev); free(fs); return rc; }
+        if (rc) {
+            memset(fs->dek, 0, sizeof(fs->dek));
+            stm_btree_close(fs->snap_tree); stm_btree_close(fs->tree);
+            stm_block_close(&fs->dev); free(fs); return rc;
+        }
         /* mark superblock blocks */
         stm_alloc_mark(fs->alloc, 0, 2);
         /* Walk main tree — marks btree node blocks AND data extent blocks.
@@ -469,6 +498,7 @@ int stm_fs_open(const char *path, const char *passphrase, struct stm_fs **out)
         goto alloc_ok;
 
     fail_alloc:
+        memset(fs->dek, 0, sizeof(fs->dek));
         stm_alloc_close(fs->alloc);
         stm_btree_close(fs->snap_tree);
         stm_btree_close(fs->tree);
@@ -488,6 +518,7 @@ alloc_ok:
     fs->comp_algo = chosen->ss_comp_algo;
     if (fs->comp_algo == STM_COMP_LZ4) {
 #ifndef STM_HAVE_LZ4
+        memset(fs->dek, 0, sizeof(fs->dek));
         stm_alloc_close(fs->alloc); stm_btree_close(fs->snap_tree);
         stm_btree_close(fs->tree); stm_block_close(&fs->dev);
         free(fs->extent_buf); free(fs->cipher_buf); free(fs);
@@ -495,6 +526,7 @@ alloc_ok:
 #endif
     } else if (fs->comp_algo == STM_COMP_ZSTD) {
 #ifndef STM_HAVE_ZSTD
+        memset(fs->dek, 0, sizeof(fs->dek));
         stm_alloc_close(fs->alloc); stm_btree_close(fs->snap_tree);
         stm_btree_close(fs->tree); stm_block_close(&fs->dev);
         free(fs->extent_buf); free(fs->cipher_buf); free(fs);

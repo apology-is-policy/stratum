@@ -519,7 +519,20 @@ static int h_remove(struct stm_9p *s, const uint8_t *body, uint16_t tag,
 
     if (!f) return resp_error(resp, resp_len, tag, "unknown fid");
 
-    stm_fs_unlink(s->fs, f->parent_ino, f->name);
+    /* Propagate the unlink rc. stm_fs_unlink can leave partial state on
+     * failure (e.g. -ENOTEMPTY for a populated directory, or -ENOMEM
+     * mid-way through the deletes). If we swallowed it, the next sync
+     * would durably commit whatever half-state the fs is in, and the
+     * client would see Rremove success on a broken operation. */
+    {
+        int rc = stm_fs_unlink(s->fs, f->parent_ino, f->name);
+        if (rc) {
+            fid_free(s, fid_nr);
+            return resp_error(resp, resp_len, tag,
+                              rc == -ENOTEMPTY ? "directory not empty"
+                                               : "remove failed");
+        }
+    }
     fid_free(s, fid_nr);
 
     /* Sync to commit freed extent blocks so they're reusable.
