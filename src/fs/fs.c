@@ -311,7 +311,7 @@ int stm_fs_create_ex(const char *path, uint64_t size_bytes,
     rc = stm_btree_insert(tree, &k, &root_ino, sizeof(root_ino), 1);
     if (rc) goto fail_tree;
 
-    rc = stm_btree_flush(tree);
+    rc = stm_btree_flush(tree, 1);  /* gen=1 for initial mkfs */
     if (rc) goto fail_tree;
 
     /* build superblock (sb was zeroed above, enc fields already set) */
@@ -554,8 +554,11 @@ int stm_fs_sync(struct stm_fs *fs)
     uint64_t dev_sz = 0;
     int new_slot, rc;
 
-    /* flush main tree */
-    rc = stm_btree_flush(fs->tree);
+    /* Flush main tree. All writes during this sync (node COWs, splits,
+     * drain_all) use fs->gen as the AEAD nonce generation. fs->gen is
+     * bumped below once everything is persisted, so the next sync gets
+     * a distinct gen and can safely reuse PENDING-freed paddrs. */
+    rc = stm_btree_flush(fs->tree, fs->gen);
     if (rc) return rc;
 
     /* flush snap tree, synchronize allocators */
@@ -563,7 +566,7 @@ int stm_fs_sync(struct stm_fs *fs)
         uint64_t a = stm_btree_next_alloc(fs->tree);
         uint64_t b = stm_btree_next_alloc(fs->snap_tree);
         if (b < a) stm_btree_set_alloc(fs->snap_tree, a);
-        rc = stm_btree_flush(fs->snap_tree);
+        rc = stm_btree_flush(fs->snap_tree, fs->gen);
         if (rc) return rc;
         a = stm_btree_next_alloc(fs->snap_tree);
         if (stm_btree_next_alloc(fs->tree) < a)

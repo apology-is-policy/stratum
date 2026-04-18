@@ -141,7 +141,16 @@ int stm_btree_write_node(struct stm_btree *tree, struct stm_node *n,
 
         if (tree->crypto) {
             uint32_t clen;
-            rc = stm_crypto_encrypt(tree->crypto, addr, n->gen,
+            /* Use tree->write_gen (the CURRENT sync's gen) for the AEAD
+             * nonce, NOT n->gen (which is frozen at node creation). Two
+             * distinct nodes can share a frozen n->gen and be COW-
+             * allocated to the same paddr at different points in time;
+             * that would reuse the same (DEK, nonce) pair with different
+             * plaintexts — a classic stream-cipher catastrophe. See the
+             * #R4-1 commit message. tree->write_gen is advanced by
+             * every public entry point (insert/delete/flush) before any
+             * write path can run. */
+            rc = stm_crypto_encrypt(tree->crypto, addr, tree->write_gen,
                                     write_buf, write_len, enc_buf, &clen);
             free(comp_buf); free(buf);
             if (rc) { free(enc_buf); return rc; }
@@ -161,7 +170,7 @@ int stm_btree_write_node(struct stm_btree *tree, struct stm_node *n,
     n->dirty = 0;
 
     out->bp_paddr     = cpu_to_le64(addr);
-    out->bp_write_gen = cpu_to_le64(n->gen);
+    out->bp_write_gen = cpu_to_le64(tree->write_gen);
     out->bp_comp  = algo;
     out->bp_csize = cpu_to_le32(write_len);
     out->bp_lsize = cpu_to_le32(used);
@@ -486,6 +495,10 @@ int stm_btree_insert(struct stm_btree *tree, const struct stm_key *key,
 {
     int rc;
 
+    /* Set the current write generation so any disk writes triggered by
+     * this op (including flush/split) use a unique nonce. */
+    tree->write_gen = gen;
+
     /* lazy-create root on first insert */
     if (!tree->root) {
         if (stm_bptr_is_null(&tree->root_bptr)) {
@@ -524,6 +537,8 @@ int stm_btree_delete(struct stm_btree *tree, const struct stm_key *key,
                      uint64_t gen)
 {
     int rc;
+
+    tree->write_gen = gen;
 
     if (!tree->root) {
         if (stm_bptr_is_null(&tree->root_bptr))
@@ -617,9 +632,12 @@ static int drain_all(struct stm_btree *tree, struct stm_node *node)
 
 /* ── flush ──────────────────────────────────────────────────────────── */
 
-int stm_btree_flush(struct stm_btree *tree)
+int stm_btree_flush(struct stm_btree *tree, uint64_t gen)
 {
     int rc;
+
+    tree->write_gen = gen;
+
     if (!tree->root) return 0;
 
     rc = drain_all(tree, tree->root);

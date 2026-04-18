@@ -189,7 +189,7 @@ int stm_snap_create(struct stm_fs *fs, const char *name, uint64_t *out_id)
     if (nlen > STM_NAME_MAX) return -EINVAL;
 
     /* flush main tree so the root reflects current state */
-    rc = stm_btree_flush(fs->tree);
+    rc = stm_btree_flush(fs->tree, fs->gen);
     if (rc) return rc;
 
     rc = ensure_snap_tree(fs);

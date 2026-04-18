@@ -16,7 +16,11 @@ int  stm_btree_insert(struct stm_btree *tree, const struct stm_key *key,
                       const void *val, uint32_t vlen, uint64_t gen);
 int  stm_btree_delete(struct stm_btree *tree, const struct stm_key *key,
                       uint64_t gen);
-int  stm_btree_flush(struct stm_btree *tree);
+/* Flush buffered messages to leaves and write all dirty nodes. `gen`
+ * is the write generation for any AEAD-encrypted node writes — must be
+ * unique across syncs to prevent (key, nonce) reuse over COW-reclaimed
+ * paddrs. Typically the caller passes `fs->gen`. */
+int  stm_btree_flush(struct stm_btree *tree, uint64_t gen);
 struct stm_bptr stm_btree_root(struct stm_btree *tree);
 uint16_t stm_btree_height(struct stm_btree *tree);
 void stm_btree_close(struct stm_btree *tree);

@@ -110,7 +110,7 @@ static void test_btree_with_algo(uint8_t algo, const char *name)
     }
 
     /* flush and verify space used is less than uncompressed */
-    rc = stm_btree_flush(tree);
+    rc = stm_btree_flush(tree, 1);
     STM_ASSERT_EQ(rc, 0);
     uint64_t used = stm_btree_next_alloc(tree) - 2 * STM_BLOCK_SIZE;
 

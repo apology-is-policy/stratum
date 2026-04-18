@@ -66,6 +66,12 @@ struct stm_btree {
     uint8_t  comp_algo;     /* compression for new writes */
     struct stm_crypto *crypto; /* NULL = no encryption */
     struct stm_alloc  *alloc;  /* NULL = bump allocator fallback */
+    uint64_t write_gen;     /* AEAD nonce gen for node writes. Set by
+                             * stm_btree_insert / delete / flush at entry.
+                             * Must advance across syncs so the same paddr
+                             * can't be encrypted twice under the same
+                             * (key, nonce) even when COW reclaims paddrs.
+                             * See #R4-1 commit message. */
 };
 
 /* Per-entry serialized overhead (bytes) */

@@ -193,7 +193,7 @@ STM_TEST(test_btree_flush_reopen)
         stm_btree_insert(tree, &k, &i, sizeof(i), i);
     }
 
-    rc = stm_btree_flush(tree);
+    rc = stm_btree_flush(tree, 100);
     STM_ASSERT_EQ(rc, 0);
 
     root = stm_btree_root(tree);
@@ -258,7 +258,7 @@ STM_TEST(test_btree_scan_respects_buffered_delete)
         STM_ASSERT_EQ(stm_btree_insert(tree, &k, pad, sizeof(pad), i), 0);
         planted++;
     }
-    STM_ASSERT_EQ(stm_btree_flush(tree), 0);
+    STM_ASSERT_EQ(stm_btree_flush(tree, 9999), 0);
     /* After flush the tree has internal nodes with empty buffers.
      * The next delete below buffers its DELETE in the root. */
     STM_ASSERT(stm_btree_height(tree) >= 2);
