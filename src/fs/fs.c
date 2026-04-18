@@ -1060,9 +1060,13 @@ fail_free:
  *
  * Pipeline: disk ──(optional)decrypt──► payload ──(optional)decompress──► buf
  *
- * For uncompressed, unencrypted data we read directly into buf (no extra copy). */
-static int extent_read_data(struct stm_fs *fs, const struct stm_extent *ext,
-                            void *buf, uint32_t buf_len)
+ * For uncompressed, unencrypted data we read directly into buf (no extra copy).
+ *
+ * Non-static so the scrub CLI (src/cmd/scrub.c) can verify every extent's
+ * AEAD tag + compress/decompress bounds by forcing a full read-back.
+ * Still internal API — consumers include fs_internal.h. */
+int extent_read_data(struct stm_fs *fs, const struct stm_extent *ext,
+                     void *buf, uint32_t buf_len)
 {
     struct stm_crypto *crypto = stm_btree_get_crypto(fs->tree);
     uint64_t paddr = le64_to_cpu(ext->se_paddr);

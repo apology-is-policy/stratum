@@ -147,4 +147,10 @@ static inline int stm_fs_configure_tree(struct stm_fs *fs,
  * unwinding the operation). */
 int stm_fs_gen_bump_disk(struct stm_fs *fs);
 
+/* Read + decrypt + decompress an extent into buf (>= STM_EXTENT_SIZE bytes).
+ * Exposed for the scrub CLI so it can force AEAD tag verification on every
+ * extent. Returns 0 on success, -EIO on csum/AEAD/bounds failure. */
+int extent_read_data(struct stm_fs *fs, const struct stm_extent *ext,
+                     void *buf, uint32_t buf_len);
+
 #endif /* STM_FS_INTERNAL_H */

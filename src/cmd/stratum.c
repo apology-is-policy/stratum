@@ -478,6 +478,7 @@ static int cmd_snap(int argc, char **argv)
 /* ── check (fsck) — lives in check.c ───────────────────────────────── */
 
 int stm_cmd_check(int argc, char **argv);
+int stm_cmd_scrub(int argc, char **argv);
 
 #if 0  /* moved to src/cmd/check.c */
 static int check_node_cb(uint64_t paddr, uint32_t csize, void *ctx)
@@ -718,7 +719,8 @@ static void usage(void)
         "  mkfs  <path> <size> [--pass <p>|--pass-stdin]   Create a new filesystem\n"
         "  serve <path> [--pass <p>|--pass-stdin] [--listen <addr>]  Serve over 9P\n"
         "  info  <path> [--pass <p>|--pass-stdin]        Show filesystem info\n"
-        "  check <path> [--pass <p>|--pass-stdin]        Check filesystem integrity\n"
+        "  check <path> [--pass <p>|--pass-stdin]        Check filesystem structural integrity\n"
+        "  scrub <path> [--pass <p>|--pass-stdin]        Deep verify — read every extent's AEAD tag\n"
         "  snap  <path> [--pass <p>|--pass-stdin] <create|list|delete|rollback> [name]\n"
         "\n"
         "Listen address: unix:/path (default: unix:/tmp/stratum.sock) or tcp:host:port\n"
@@ -734,6 +736,7 @@ int main(int argc, char **argv)
     if (strcmp(cmd, "serve") == 0) return cmd_serve(argc - 2, argv + 2);
     if (strcmp(cmd, "info") == 0)  return cmd_info(argc - 2, argv + 2);
     if (strcmp(cmd, "check") == 0) return stm_cmd_check(argc - 2, argv + 2);
+    if (strcmp(cmd, "scrub") == 0) return stm_cmd_scrub(argc - 2, argv + 2);
     if (strcmp(cmd, "snap") == 0)  return cmd_snap(argc - 2, argv + 2);
     if (strcmp(cmd, "help") == 0 || strcmp(cmd, "--help") == 0) { usage(); return 0; }
 
