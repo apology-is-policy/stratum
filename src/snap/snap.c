@@ -7,6 +7,14 @@
 #define mk_key   stm_mk_key
 #define fnv1a    stm_fnv1a
 
+/* Walk visitor that does nothing — used to dry-run a tree to verify every
+ * node reads cleanly before we start mutating refcounts. */
+static int noop_visit(uint64_t paddr, uint32_t csize, void *ctx)
+{
+    (void)paddr; (void)csize; (void)ctx;
+    return 0;
+}
+
 /* allocator mark callbacks (for rollback rebuild) */
 static int mark_block_snap(uint64_t paddr, uint32_t csize, void *ctx)
 {
@@ -198,6 +206,18 @@ int stm_snap_create(struct stm_fs *fs, const char *name, uint64_t *out_id)
     rc = find_snap_name_slot(fs->snap_tree, name, nlen, &nkey);
     if (rc) return rc;
 
+    /* Dry-run the main-tree walk before we commit the snapshot.
+     * If any node of the just-flushed main tree can't be read, we must
+     * bail BEFORE inserting the descriptor — otherwise the snap_tree
+     * would hold a descriptor pointing at a root whose subtree is
+     * only partially ref-protected, and COW on any unwalked block
+     * would silently free a block the descriptor still references. */
+    {
+        struct stm_bptr root = stm_btree_root(fs->tree);
+        rc = stm_btree_walk_entries(fs->tree, root, noop_visit, NULL, NULL);
+        if (rc) return rc;
+    }
+
     id = fs->next_snap_id++;
 
     /* build snapshot descriptor */
@@ -230,11 +250,14 @@ int stm_snap_create(struct stm_fs *fs, const char *name, uint64_t *out_id)
         if (rc) return rc;
     }
 
-    /* increment refcounts on all blocks in the snapshotted tree,
-     * so COW doesn't reclaim shared blocks */
+    /* Increment refcounts on all blocks in the snapshotted tree so COW
+     * doesn't reclaim shared blocks. The dry-run above already proved
+     * every node is readable, so this walk is expected to succeed —
+     * but we still check the rc for belt-and-suspenders. */
     if (fs->alloc) {
-        stm_btree_walk_entries(fs->tree, snap.ssp_root,
-                               ref_block_fs, ref_extent_entry, fs);
+        rc = stm_btree_walk_entries(fs->tree, snap.ssp_root,
+                                    ref_block_fs, ref_extent_entry, fs);
+        if (rc) return rc;
     }
 
     if (out_id) *out_id = id;
@@ -395,14 +418,6 @@ int stm_snap_rollback(struct stm_fs *fs, uint64_t snap_id)
         return rc;
     }
 
-    return 0;
-}
-
-/* Walk visitor that does nothing — used to dry-run a tree to verify every
- * node reads cleanly before we start mutating refcounts. */
-static int noop_visit(uint64_t paddr, uint32_t csize, void *ctx)
-{
-    (void)paddr; (void)csize; (void)ctx;
     return 0;
 }
 
