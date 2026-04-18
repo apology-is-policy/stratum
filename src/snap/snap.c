@@ -179,6 +179,16 @@ static int find_snap_name_slot(struct stm_btree *tree,
 
 /* ── create ─────────────────────────────────────────────────────────── */
 
+/* R10-2 / R10-3 guards mirroring fs.c: snap ops mutate, refuse on wedged
+ * or read-only fs. snap_list is read-only so it only checks wedged. */
+#define STM_SNAP_GUARD_WRITE(fs) do { \
+    if ((fs)->wedged) return -EIO; \
+    if ((fs)->read_only) return -EROFS; \
+} while (0)
+#define STM_SNAP_GUARD_READ(fs) do { \
+    if ((fs)->wedged) return -EIO; \
+} while (0)
+
 int stm_snap_create(struct stm_fs *fs, const char *name, uint64_t *out_id)
 {
     size_t nlen;
@@ -190,6 +200,8 @@ int stm_snap_create(struct stm_fs *fs, const char *name, uint64_t *out_id)
     uint8_t nbuf[8 + STM_NAME_MAX];
     uint32_t nblen;
     int rc;
+
+    STM_SNAP_GUARD_WRITE(fs);
 
     if (!name || !name[0]) return -EINVAL;
     nlen = strlen(name);
@@ -334,6 +346,7 @@ int stm_snap_list(struct stm_fs *fs,
     struct stm_key lo, hi;
     struct snap_list_ctx sl;
 
+    STM_SNAP_GUARD_READ(fs);
     if (!fs->snap_tree) return 0;
 
     lo = mk_key(0, STM_KEY_SNAP, 0);
@@ -374,6 +387,7 @@ int stm_snap_rollback(struct stm_fs *fs, uint64_t snap_id)
     struct stm_snapshot snap;
     int rc;
 
+    STM_SNAP_GUARD_WRITE(fs);
     if (!fs->snap_tree) return -ENOENT;
 
     rc = stm_btree_lookup(fs->snap_tree, &skey, vbuf, &vlen);
@@ -411,26 +425,27 @@ int stm_snap_rollback(struct stm_fs *fs, uint64_t snap_id)
 reopen_original:
     {
         /* Put fs->tree back where it was. If this fails too the fs is
-         * genuinely wedged; the caller (h_snap_rollback) returns Rerror
-         * and we're left with fs->tree == NULL — better than lying. */
+         * genuinely wedged; mark it so public APIs refuse further
+         * mutations instead of dereferencing NULL. */
         int rc2 = stm_btree_open(&fs->dev, orig_root, orig_height, &fs->tree);
         if (rc2 == 0) {
             /* R9-2: propagate configure_tree failure. If crypto_init
              * fails (OOM on encrypted volumes), leaving fs->tree with
              * NULL crypto context would make subsequent writes emit
              * PLAINTEXT to disk on what the user considers an encrypted
-             * volume. Close the tree and fail hard; fs->tree = NULL is
-             * still safer than a tree that writes plaintext. */
+             * volume. Close the tree and fail hard; fs->wedged = 1
+             * ensures no future op touches the invalid state. */
             int rc3 = stm_fs_configure_tree(fs, fs->tree);
             if (rc3) {
                 stm_btree_close(fs->tree);
                 fs->tree = NULL;
+                fs->wedged = 1;  /* R10-2 */
                 if (!rc) rc = rc3;
             } else if (fs->alloc) {
                 stm_btree_set_allocator(fs->tree, fs->alloc);
             }
         } else {
-            /* rc2 takes precedence only if it's worse than the primary rc */
+            fs->wedged = 1;  /* R10-2: fs->tree stays NULL */
             if (!rc) rc = rc2;
         }
         return rc;
@@ -487,37 +502,38 @@ after_reopen:
         }
         stm_alloc_commit(new_alloc);
 
+        /* R9-1 / R10-1: rollback-bump — advance fs->gen so post-rollback
+         * writes use a distinct write_gen from any pre-rollback in-session
+         * orphan ciphertexts (those paddrs are marked FREE in new_alloc),
+         * then persist a disk ss_gen bump to preserve R8-1's invariant
+         * (disk ss_gen > fs->gen).
+         *
+         * CRITICAL: this MUST happen BEFORE the allocator swap and before
+         * old_alloc is freed. If the disk bump write fails, we want to
+         * abort the whole rollback cleanly — restore fs->alloc to
+         * old_alloc, close new_alloc, and reopen the original tree. The
+         * old allocator still holds live refcounts for the pre-rollback
+         * paddrs so no nonce collision is possible on subsequent writes.
+         *
+         * If the bump were after the swap (R9-1 pre-R10-1 ordering),
+         * old_alloc would already be destroyed and the trees bound to
+         * new_alloc, with no way to revert — a bump failure would leave
+         * the fs in exactly the state that causes nonce collision. */
+        if (fs->encrypted) {
+            fs->gen += 1;
+            rc = stm_fs_gen_bump_disk(fs);
+            if (rc) {
+                fs->gen -= 1;
+                goto rollback_restore;
+            }
+        }
+
         /* Commit the swap: point both trees at the new allocator, then
          * free the old one. After this point no dangling pointers. */
         stm_btree_set_allocator(fs->tree, new_alloc);
         if (fs->snap_tree)
             stm_btree_set_allocator(fs->snap_tree, new_alloc);
         stm_alloc_close(old_alloc);
-
-        /* R9-1: rollback-bump. Any pre-rollback in-session writes
-         * created ciphertexts at (paddr, write_gen = fs->gen) whose
-         * paddrs the allocator just marked as FREE (the new_alloc walk
-         * didn't reach them from the rolled-back tree). Post-rollback
-         * writes at the same fs->gen that reuse those paddrs would
-         * produce the same (DEK, nonce) pair — stream-cipher catastrophe.
-         *
-         * Advance fs->gen by 1 so post-rollback writes use a distinct
-         * write_gen from the pre-rollback orphans; then bump disk
-         * ss_gen to new fs->gen + 1 to preserve the R8-1 invariant
-         * (disk ss_gen > fs->gen) for subsequent inter-sync writes. */
-        if (fs->encrypted) {
-            fs->gen += 1;
-            rc = stm_fs_gen_bump_disk(fs);
-            if (rc) {
-                /* Hard failure: we've advanced fs->gen in memory but
-                 * couldn't persist the matching disk bump. Any future
-                 * write would violate the invariant. Refuse to stay
-                 * operable — the caller must close and remount. Revert
-                 * fs->gen so a remount starts from a consistent state. */
-                fs->gen -= 1;
-                return rc;
-            }
-        }
         return 0;
 
     rollback_restore:
@@ -540,12 +556,14 @@ after_reopen:
                 if (rc3) {
                     stm_btree_close(fs->tree);
                     fs->tree = NULL;
+                    fs->wedged = 1;  /* R10-2 */
                     if (!rc) rc = rc3;
                 } else if (fs->alloc) {
                     stm_btree_set_allocator(fs->tree, fs->alloc);
                 }
-            } else if (!rc) {
-                rc = rc2;
+            } else {
+                fs->wedged = 1;  /* R10-2: fs->tree stays NULL */
+                if (!rc) rc = rc2;
             }
         }
         return rc;
@@ -564,6 +582,7 @@ int stm_snap_delete(struct stm_fs *fs, uint64_t snap_id)
     struct stm_snapshot snap;
     int rc;
 
+    STM_SNAP_GUARD_WRITE(fs);
     if (!fs->snap_tree) return -ENOENT;
 
     rc = stm_btree_lookup(fs->snap_tree, &skey, vbuf, &vlen);

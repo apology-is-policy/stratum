@@ -386,6 +386,7 @@ static int stm_fs_open_impl(const char *path, const char *passphrase,
     int rc;
 
     if (!fs) return -ENOMEM;
+    fs->read_only = read_only ? 1 : 0;
 
     rc = stm_file_backend_open(path, 0, 0, &fs->dev);
     if (rc) { free(fs); return rc; }
@@ -413,17 +414,34 @@ static int stm_fs_open_impl(const char *path, const char *passphrase,
         }
         if (!a_ok && !b_ok) { stm_block_close(&fs->dev); free(fs); return -EINVAL; }
 
-        if (a_ok && b_ok)
-            chosen = (le64_to_cpu(sa.ss_gen) >= le64_to_cpu(sb.ss_gen))
-                   ? (fs->sb_slot = 0, &sa) : (fs->sb_slot = 1, &sb);
-        else
+        /* R10-6: version-aware tiebreak. If both slots pass csum but
+         * the higher-gen one has an unsupported ss_version, the lower-
+         * gen slot may still be recoverable — an attacker with raw disk
+         * access could tamper one slot to a bogus version with a higher
+         * gen specifically to DoS mount. Try the version-1 slot if the
+         * preferred one isn't v1. */
+        if (a_ok && b_ok) {
+            int a_v1 = (le32_to_cpu(sa.ss_version) == 1);
+            int b_v1 = (le32_to_cpu(sb.ss_version) == 1);
+            if (a_v1 && b_v1)
+                chosen = (le64_to_cpu(sa.ss_gen) >= le64_to_cpu(sb.ss_gen))
+                       ? (fs->sb_slot = 0, &sa) : (fs->sb_slot = 1, &sb);
+            else if (a_v1)
+                chosen = (fs->sb_slot = 0, &sa);
+            else if (b_v1)
+                chosen = (fs->sb_slot = 1, &sb);
+            else { stm_block_close(&fs->dev); free(fs); return -ENOTSUP; }
+        } else {
             chosen = a_ok ? (fs->sb_slot = 0, &sa) : (fs->sb_slot = 1, &sb);
+        }
     }
 
     /* R9-4: reject on-disk format versions we don't understand. Without
      * this, a future v2 volume or a tampered SB claiming v2 would be
      * mounted and on-disk fields would be reinterpreted under the wrong
-     * layout. Symmetric to the ss_comp_algo compile-time-codec reject. */
+     * layout. Symmetric to the ss_comp_algo compile-time-codec reject.
+     * After R10-6, we only reach here if BOTH slots are !v1 (or the
+     * single-valid slot is !v1); either way ENOTSUP is correct. */
     if (le32_to_cpu(chosen->ss_version) != 1) {
         stm_block_close(&fs->dev); free(fs); return -ENOTSUP;
     }
@@ -738,8 +756,18 @@ int stm_fs_gen_bump_disk(struct stm_fs *fs)
  * On torn-write of Phase 3: opposite slot survives with (G+1, pre-flush
  * root). Same as above — safe.
  */
+/* R10-2 / R10-3: guard macros applied at the top of each public API. */
+#define STM_FS_GUARD_READ(fs)  do { \
+    if ((fs)->wedged) return -EIO; \
+} while (0)
+#define STM_FS_GUARD_WRITE(fs) do { \
+    if ((fs)->wedged) return -EIO; \
+    if ((fs)->read_only) return -EROFS; \
+} while (0)
+
 int stm_fs_sync(struct stm_fs *fs)
 {
+    STM_FS_GUARD_WRITE(fs);
     struct stm_superblock sb;
     uint64_t dev_sz = 0;
     int new_slot, rc;
@@ -842,12 +870,14 @@ uint64_t stm_fs_get_gen(struct stm_fs *fs) { return fs->gen; }
 
 int stm_fs_stat(struct stm_fs *fs, uint64_t ino, struct stm_inode *out)
 {
+    STM_FS_GUARD_READ(fs);
     return read_inode(fs, ino, out);
 }
 
 int stm_fs_lookup(struct stm_fs *fs, uint64_t parent_ino,
                   const char *name, uint64_t *out_ino)
 {
+    STM_FS_GUARD_READ(fs);
     return lookup_dirent(fs->tree, parent_ino, name, strlen(name),
                          out_ino, NULL);
 }
@@ -901,6 +931,7 @@ static int create_entry(struct stm_fs *fs, uint64_t parent_ino,
 int stm_fs_mkdir(struct stm_fs *fs, uint64_t parent_ino, const char *name,
                  uint32_t mode, uint64_t *out_ino)
 {
+    STM_FS_GUARD_WRITE(fs);
     return create_entry(fs, parent_ino, name, STM_S_IFDIR | mode,
                         STM_DT_DIR, out_ino);
 }
@@ -908,6 +939,7 @@ int stm_fs_mkdir(struct stm_fs *fs, uint64_t parent_ino, const char *name,
 int stm_fs_create_file(struct stm_fs *fs, uint64_t parent_ino,
                        const char *name, uint32_t mode, uint64_t *out_ino)
 {
+    STM_FS_GUARD_WRITE(fs);
     return create_entry(fs, parent_ino, name, STM_S_IFREG | mode,
                         STM_DT_REG, out_ino);
 }
@@ -1060,6 +1092,8 @@ int stm_fs_write(struct stm_fs *fs, uint64_t ino, uint64_t offset,
     uint64_t pos = offset;
     int rc;
 
+    STM_FS_GUARD_WRITE(fs);
+
     /* Reject offset + len that would wrap uint64. Without this guard a
      * malicious or buggy client can plant extent records at both ends of
      * the 64-bit offset space (the inner loop wraps through zero), and
@@ -1195,6 +1229,8 @@ int stm_fs_read(struct stm_fs *fs, uint64_t ino, uint64_t offset,
     uint64_t pos, fsize;
     int rc;
 
+    STM_FS_GUARD_READ(fs);
+
     rc = read_inode(fs, ino, &in);
     if (rc) return rc;
 
@@ -1272,6 +1308,7 @@ int stm_fs_readdir(struct stm_fs *fs, uint64_t dir_ino,
                              uint8_t type, void *ctx),
                    void *ctx)
 {
+    STM_FS_GUARD_READ(fs);
     struct stm_key lo = mk_key(dir_ino, STM_KEY_DIRENT, 0);
     struct stm_key hi = mk_key(dir_ino, STM_KEY_DATA, 0);
     struct readdir_ctx rd = { .user_cb = cb, .user_ctx = ctx };
@@ -1338,6 +1375,8 @@ int stm_fs_unlink(struct stm_fs *fs, uint64_t parent_ino, const char *name)
     struct stm_key dkey;
     uint64_t child_ino;
     int rc;
+
+    STM_FS_GUARD_WRITE(fs);
 
     rc = lookup_dirent(fs->tree, parent_ino, name, strlen(name),
                        &child_ino, &dkey);

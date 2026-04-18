@@ -456,9 +456,12 @@ static int cmd_snap(int argc, char **argv)
     } else if (strcmp(subcmd, "delete") == 0) {
         if (!arg) { fprintf(stderr, "snap delete requires an id\n"); stm_fs_close(fs); return 1; }
         rc = stm_snap_delete(fs, (uint64_t)atoll(arg));
+        /* R10-7: only sync on success. A partial delete (descriptor
+         * removed but refcount walk failed mid-way) would otherwise
+         * persist the inconsistent state; gating on rc == 0 lets the
+         * user retry after the transient failure. */
         if (rc) fprintf(stderr, "snap delete failed: %s\n", strerror(-rc));
-        else printf("Snapshot deleted.\n");
-        stm_fs_sync(fs);
+        else { printf("Snapshot deleted.\n"); stm_fs_sync(fs); }
     } else if (strcmp(subcmd, "rollback") == 0) {
         if (!arg) { fprintf(stderr, "snap rollback requires an id\n"); stm_fs_close(fs); return 1; }
         rc = stm_snap_rollback(fs, (uint64_t)atoll(arg));

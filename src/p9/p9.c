@@ -911,17 +911,14 @@ static int h_snap_rollback(struct stm_9p *s, const uint8_t *body, uint32_t body_
     id = g64(body);
 
     rc = stm_snap_rollback(s->fs, id);
+    /* R10-4: invalidate caches BEFORE checking rc. stm_snap_rollback
+     * may have replaced fs->tree (with snap root, then maybe restored
+     * or maybe left wedged) even on failure paths. Cached listings
+     * from before the call are unreliable regardless of outcome. */
+    invalidate_all_dir_caches(s);
     if (rc) return resp_error(resp, resp_len, tag, "snap rollback failed");
     rc = stm_fs_sync(s->fs);
     if (rc) return resp_error(resp, resp_len, tag, "sync failed on snap rollback");
-
-    /* Rollback replaces fs->tree with the snapshot's tree — every cached
-     * readdir listing is now stale (pre-rollback directory contents).
-     * Fids themselves stay valid (their inode numbers may or may not
-     * exist in the new tree; subsequent ops will fail cleanly) but
-     * serving a cached listing of a directory that no longer exists
-     * or has different contents is a silent lie. */
-    invalidate_all_dir_caches(s);
 
     wp = resp + 4;
     *wp++ = P9_RSNAP_ROLLBACK;

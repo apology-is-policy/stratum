@@ -716,6 +716,50 @@ STM_TEST(test_fs_mount_bump_encrypted)
     unlink(path);
 }
 
+/* Regression for R10-3: stm_fs_open_ro must enforce read-only contract at
+ * runtime. Mutation APIs return -EROFS; read APIs succeed. */
+STM_TEST(test_fs_open_ro_rejects_writes)
+{
+    const char *path = "/tmp/stratum_test_ro.img";
+    unlink(path);
+    STM_ASSERT_EQ(stm_fs_create(path, 32ULL*1024*1024, NULL), 0);
+
+    /* Seed some state via normal open. */
+    {
+        struct stm_fs *fs;
+        STM_ASSERT_EQ(stm_fs_open(path, NULL, &fs), 0);
+        uint64_t ino;
+        STM_ASSERT_EQ(stm_fs_create_file(fs, 1, "seed.txt", 0644, &ino), 0);
+        STM_ASSERT_EQ(stm_fs_write(fs, ino, 0, "data", 4), 0);
+        STM_ASSERT_EQ(stm_fs_sync(fs), 0);
+        stm_fs_close(fs);
+    }
+
+    /* Reopen RO. Reads must work, writes must be rejected with -EROFS. */
+    struct stm_fs *fs;
+    STM_ASSERT_EQ(stm_fs_open_ro(path, NULL, &fs), 0);
+
+    /* Read succeeds. */
+    uint64_t ino;
+    STM_ASSERT_EQ(stm_fs_lookup(fs, 1, "seed.txt", &ino), 0);
+    char buf[16] = {0};
+    uint32_t nread = 0;
+    STM_ASSERT_EQ(stm_fs_read(fs, ino, 0, buf, sizeof(buf), &nread), 0);
+    STM_ASSERT_EQ(nread, 4u);
+    STM_ASSERT_MEM_EQ(buf, "data", 4);
+
+    /* Mutations rejected. */
+    uint64_t dummy;
+    STM_ASSERT_EQ(stm_fs_create_file(fs, 1, "x.txt", 0644, &dummy), -EROFS);
+    STM_ASSERT_EQ(stm_fs_mkdir(fs, 1, "d", 0755, &dummy), -EROFS);
+    STM_ASSERT_EQ(stm_fs_write(fs, ino, 4, "more", 4), -EROFS);
+    STM_ASSERT_EQ(stm_fs_unlink(fs, 1, "seed.txt"), -EROFS);
+    STM_ASSERT_EQ(stm_fs_sync(fs), -EROFS);
+
+    stm_fs_close(fs);
+    unlink(path);
+}
+
 int main(void)
 {
     STM_SUITE("fs");
@@ -735,6 +779,7 @@ int main(void)
     STM_RUN(test_fs_write_gap_is_zeroed_encrypted);
     STM_RUN(test_fs_sync_two_phase_gen_invariant);
     STM_RUN(test_fs_mount_bump_encrypted);
+    STM_RUN(test_fs_open_ro_rejects_writes);
     printf("all passed\n");
     return 0;
 }

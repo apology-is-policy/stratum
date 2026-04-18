@@ -81,6 +81,18 @@ struct stm_fs {
     uint8_t *cipher_buf;     /* STM_EXTENT_SIZE + STM_CRYPTO_TAG_LEN bytes */
     /* Default compression algorithm for new extents (STM_COMP_*) */
     uint8_t  comp_algo;
+    /* R10-3: set to 1 by stm_fs_open_ro; mutation APIs return -EROFS
+     * when set. Without this the RO contract was docstring-only —
+     * a buggy caller issuing writes through an RO-opened fs would
+     * produce orphan ciphertexts that violate the AEAD nonce invariant
+     * once the next RW session mounts. */
+    int      read_only;
+    /* R10-2: set to 1 when an internal failure (e.g. rollback reopen)
+     * leaves fs->tree in an unusable state (NULL or inconsistent).
+     * Public mutation / read APIs early-return -EIO rather than
+     * dereferencing a NULL tree and crashing the server. The only
+     * legal subsequent op on a wedged fs is stm_fs_close. */
+    int      wedged;
 };
 
 static inline struct stm_key stm_mk_key(uint64_t ino, uint8_t type,
