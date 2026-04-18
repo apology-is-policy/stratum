@@ -71,8 +71,13 @@ static void stm_now(uint64_t *sec, uint32_t *nsec)
  * Dirent value layout:
  *   [le64 child_ino][uint8 type][name bytes...]
  *   total = 9 + name_len
+ *
+ * Tombstone: vlen == 1. Any value byte. Distinct from real dirents
+ * (which always have vlen >= DIRENT_HDR == 9). See `tombstone_dirent`
+ * and the lookup_dirent / find_dirent_slot probing discussion.
  */
 #define DIRENT_HDR 9
+#define DIRENT_TOMBSTONE_VLEN 1
 
 static void encode_dirent(uint64_t ino, uint8_t type,
                           const char *name, size_t nlen,
@@ -97,7 +102,13 @@ static void decode_dirent(const uint8_t *buf, uint32_t blen,
     *nlen = blen - 9;
 }
 
-/* Look up a directory entry by name, handling hash collisions. */
+/* Look up a directory entry by name, handling hash collisions.
+ *
+ * A slot can be in one of three states:
+ *   - never used (btree lookup returns -ENOENT) → probe chain ends
+ *   - tombstone  (vlen == 1, set on unlink)     → keep probing
+ *   - live dirent (vlen >= DIRENT_HDR)          → match name or keep probing
+ */
 static int lookup_dirent(struct stm_btree *tree, uint64_t parent,
                          const char *name, size_t nlen,
                          uint64_t *out_ino, struct stm_key *out_key)
@@ -111,8 +122,10 @@ static int lookup_dirent(struct stm_btree *tree, uint64_t parent,
         uint32_t vlen = sizeof(vbuf);
         int rc = stm_btree_lookup(tree, &k, vbuf, &vlen);
 
-        if (rc == -ENOENT) return -ENOENT;
+        if (rc == -ENOENT) return -ENOENT;  /* end of probe chain */
         if (rc < 0) return rc;
+
+        if (vlen == DIRENT_TOMBSTONE_VLEN) continue;  /* tombstone → keep probing */
 
         if (vlen >= DIRENT_HDR) {
             uint32_t elen = vlen - DIRENT_HDR;
@@ -129,13 +142,22 @@ static int lookup_dirent(struct stm_btree *tree, uint64_t parent,
     return -ENOENT;
 }
 
-/* Find a free dirent slot for a new name. */
+/* Find a free dirent slot for a new name.
+ *
+ * To avoid duplicate inserts when an older tombstone shares the probe
+ * chain with a live entry for the same name, we scan the full chain:
+ *   - if we find a live dirent with the same name → -EEXIST
+ *   - otherwise, reuse the first tombstone we saw (if any)
+ *   - else, use the first never-used slot
+ */
 static int find_dirent_slot(struct stm_btree *tree, uint64_t parent,
                             const char *name, size_t nlen,
                             struct stm_key *out_key)
 {
     uint64_t h = fnv1a(name, nlen);
     int attempt;
+    int have_tombstone = 0;
+    struct stm_key tombstone_key;
 
     for (attempt = 0; attempt < 256; attempt++) {
         struct stm_key k = mk_key(parent, STM_KEY_DIRENT, h + (uint64_t)attempt);
@@ -143,10 +165,23 @@ static int find_dirent_slot(struct stm_btree *tree, uint64_t parent,
         uint32_t vlen = sizeof(vbuf);
         int rc = stm_btree_lookup(tree, &k, vbuf, &vlen);
 
-        if (rc == -ENOENT) { *out_key = k; return 0; }
+        if (rc == -ENOENT) {
+            /* End of probe chain. Reuse a tombstone if we saw one,
+             * otherwise use this fresh slot. */
+            *out_key = have_tombstone ? tombstone_key : k;
+            return 0;
+        }
         if (rc < 0) return rc;
 
-        /* slot taken — same name? */
+        if (vlen == DIRENT_TOMBSTONE_VLEN) {
+            if (!have_tombstone) {
+                tombstone_key = k;
+                have_tombstone = 1;
+            }
+            continue;
+        }
+
+        /* Live dirent — is it a duplicate? */
         if (vlen >= DIRENT_HDR) {
             uint32_t elen = vlen - DIRENT_HDR;
             if (elen == nlen && memcmp(vbuf + 9, name, nlen) == 0)
@@ -154,6 +189,14 @@ static int find_dirent_slot(struct stm_btree *tree, uint64_t parent,
         }
     }
     return -ENOSPC;
+}
+
+/* Replace a dirent with a tombstone so the probe chain stays intact. */
+static int tombstone_dirent(struct stm_btree *tree,
+                            const struct stm_key *key, uint64_t gen)
+{
+    uint8_t marker = 0;
+    return stm_btree_insert(tree, key, &marker, DIRENT_TOMBSTONE_VLEN, gen);
 }
 
 static uint64_t alloc_ino(struct stm_fs *fs)
@@ -1008,13 +1051,15 @@ static int collect_extent_cb(const struct stm_key *key, const void *val,
     return 0;
 }
 
-/* Scan callback that flips a flag on the first hit and stops. */
+/* Scan callback that flips a flag on the first live-dirent hit and stops.
+ * Tombstones (vlen == DIRENT_TOMBSTONE_VLEN) don't count as "present". */
 static int empty_check_cb(const struct stm_key *key, const void *val,
                           uint32_t vlen, void *ctx)
 {
-    (void)key; (void)val; (void)vlen;
+    (void)key; (void)val;
+    if (vlen == DIRENT_TOMBSTONE_VLEN) return 0;  /* keep scanning */
     *(int *)ctx = 1;
-    return 1;  /* stop the scan */
+    return 1;  /* stop the scan — found a live dirent */
 }
 
 int stm_fs_unlink(struct stm_fs *fs, uint64_t parent_ino, const char *name)
@@ -1053,10 +1098,11 @@ int stm_fs_unlink(struct stm_fs *fs, uint64_t parent_ino, const char *name)
         if (srv < 0) return srv;
         if (found) return -ENOTEMPTY;
 
-        /* Empty directory: remove the dirent in the parent and the
-         * inode record itself. Skip the nlink dance below — directories
-         * don't participate in hardlinking in this FS. */
-        rc = stm_btree_delete(fs->tree, &dkey, fs->gen);
+        /* Empty directory: tombstone the dirent in the parent (preserves
+         * the probe chain for any collided names) and delete the inode
+         * record. Skip the nlink dance below — directories don't
+         * participate in hardlinking in this FS. */
+        rc = tombstone_dirent(fs->tree, &dkey, fs->gen);
         if (rc) return rc;
         struct stm_key ik = mk_key(child_ino, STM_KEY_INODE, 0);
         return stm_btree_delete(fs->tree, &ik, fs->gen);
@@ -1079,9 +1125,9 @@ int stm_fs_unlink(struct stm_fs *fs, uint64_t parent_ino, const char *name)
 
     /* Now the mutations: dirent → inode / extents. Failures here
      * can still leave partial state (the btree doesn't do multi-op
-     * transactions), but at minimum the dirent is only removed after
-     * we've proven we can finish. */
-    rc = stm_btree_delete(fs->tree, &dkey, fs->gen);
+     * transactions), but at minimum the dirent is only tombstoned
+     * after we've proven we can finish. */
+    rc = tombstone_dirent(fs->tree, &dkey, fs->gen);
     if (rc) { free(uc.keys); return rc; }
 
     if (nl == 0) {

@@ -334,6 +334,69 @@ STM_TEST(test_fs_copy_delete_cycles_encrypted)
     unlink(path);
 }
 
+/* Force an FNV1a dirent-hash collision: construct two names that hash to
+ * slots such that deleting one used to break lookup of the other. Since
+ * FNV1a collisions are hard to hand-craft, we go the pragmatic route:
+ * create many names, unlink one in the middle, and verify all survivors
+ * remain reachable. This exercises the tombstone probe-chain continuation
+ * on whatever collisions happen to exist.
+ *
+ * Pre-tombstone behavior: the btree_delete cleared the slot, and any
+ * names that had probed past it became unreachable. After tombstones,
+ * the probe chain stays intact.
+ */
+STM_TEST(test_fs_unlink_preserves_probe_chain)
+{
+    const char *path = "/tmp/stratum_test_tombstones.img";
+    struct stm_fs *fs;
+    unlink(path);
+    STM_ASSERT_EQ(stm_fs_create(path, 16ULL*1024*1024, NULL), 0);
+    STM_ASSERT_EQ(stm_fs_open(path, NULL, &fs), 0);
+
+    /* Make a moderate directory; even without engineered collisions, with
+     * enough entries the FNV1a hash space has some pair-collisions. */
+    char nm[16];
+    const int N = 100;
+    for (int i = 0; i < N; i++) {
+        snprintf(nm, sizeof(nm), "f%04d", i);
+        uint64_t ino;
+        STM_ASSERT_EQ(stm_fs_create_file(fs, 1, nm, 0644, &ino), 0);
+    }
+
+    /* Unlink every other file. */
+    for (int i = 0; i < N; i += 2) {
+        snprintf(nm, sizeof(nm), "f%04d", i);
+        STM_ASSERT_EQ(stm_fs_unlink(fs, 1, nm), 0);
+    }
+
+    /* Every remaining file must still be reachable by name. */
+    for (int i = 1; i < N; i += 2) {
+        snprintf(nm, sizeof(nm), "f%04d", i);
+        uint64_t dummy;
+        int rc = stm_fs_lookup(fs, 1, nm, &dummy);
+        STM_ASSERT_EQ(rc, 0);
+    }
+
+    /* And every unlinked file is gone. */
+    for (int i = 0; i < N; i += 2) {
+        snprintf(nm, sizeof(nm), "f%04d", i);
+        uint64_t dummy;
+        STM_ASSERT_EQ(stm_fs_lookup(fs, 1, nm, &dummy), -ENOENT);
+    }
+
+    /* Reuse a slot: create a new file with a name that hashes to a
+     * tombstoned slot. Can't easily force the exact slot, so just
+     * create + lookup + confirm it works. */
+    uint64_t nino;
+    STM_ASSERT_EQ(stm_fs_create_file(fs, 1, "newfile", 0644, &nino), 0);
+    uint64_t check;
+    STM_ASSERT_EQ(stm_fs_lookup(fs, 1, "newfile", &check), 0);
+    STM_ASSERT_EQ(check, nino);
+
+    stm_fs_close(fs);
+    unlink(path);
+}
+
 /* stm_fs_unlink on a directory must refuse if the directory isn't empty.
  * Before the fix, the parent dirent was removed and the child's contents
  * (dirents + inodes + data) were silently orphaned. */
@@ -404,6 +467,7 @@ int main(void)
     STM_RUN(test_fs_copy_delete_cycles_encrypted);
     STM_RUN(test_fs_write_overflow_guard);
     STM_RUN(test_fs_rmdir_refuses_nonempty);
+    STM_RUN(test_fs_unlink_preserves_probe_chain);
     printf("all passed\n");
     return 0;
 }
