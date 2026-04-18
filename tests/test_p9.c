@@ -245,12 +245,83 @@ STM_TEST(test_p9_readdir)
     cleanup();
 }
 
+/* R7-2 regressions: malformed wire inputs must not crash or leak. */
+STM_TEST(test_p9_wire_validation)
+{
+    stm_fs_create(img, 32 * 1024 * 1024, NULL);
+    struct stm_fs *fs;
+    stm_fs_open(img, NULL, &fs);
+    struct stm_9p *srv;
+    stm_9p_create(fs, &srv);
+
+    /* Attacker sends Tversion with msize=0. Must clamp to P9_MSIZE_MIN. */
+    { uint8_t *wp = reqbuf; uint32_t rl;
+      whdr(&wp, P9_TVERSION, P9_NOTAG);
+      w32(&wp, 0);          /* client_msize = 0 */
+      wstr(&wp, "9P2000");
+      p9call(srv, reqbuf, wfinish(reqbuf, wp), rspbuf, &rl);
+      STM_ASSERT_EQ(rspbuf[4], P9_RVERSION);
+      uint32_t negotiated = r32(rspbuf + P9_HDR_SIZE);
+      STM_ASSERT(negotiated >= 256);
+    }
+
+    /* Now attach so subsequent calls reach the real handlers. */
+    { uint8_t *wp = reqbuf; uint32_t rl;
+      whdr(&wp, P9_TATTACH, 1);
+      w32(&wp, 0); w32(&wp, P9_NOFID); wstr(&wp, "u"); wstr(&wp, "");
+      p9call(srv, reqbuf, wfinish(reqbuf, wp), rspbuf, &rl);
+      STM_ASSERT_EQ(rspbuf[4], P9_RATTACH);
+    }
+
+    /* Create a file so we have an open fid to write to. */
+    { uint8_t *wp = reqbuf; uint32_t rl;
+      whdr(&wp, P9_TCREATE, 2);
+      w32(&wp, 0); wstr(&wp, "victim.bin"); w32(&wp, 0644); *wp++ = P9_ORDWR;
+      p9call(srv, reqbuf, wfinish(reqbuf, wp), rspbuf, &rl);
+      STM_ASSERT_EQ(rspbuf[4], P9_RCREATE);
+    }
+
+    /* P1-2: Twrite with count > actual payload must Rerror, not crash. */
+    { uint8_t *wp = reqbuf; uint32_t rl;
+      whdr(&wp, P9_TWRITE, 3);
+      w32(&wp, 0);                  /* fid */
+      w64(&wp, 0);                  /* offset */
+      w32(&wp, 1000000);            /* count wildly > payload */
+      /* NO payload follows — just the header + 16 bytes */
+      p9call(srv, reqbuf, wfinish(reqbuf, wp), rspbuf, &rl);
+      STM_ASSERT_EQ(rspbuf[4], P9_RERROR);
+    }
+
+    /* P1-3: Twalk with nwname=5 but no name strings. Must Rerror. */
+    { uint8_t *wp = reqbuf; uint32_t rl;
+      whdr(&wp, P9_TWALK, 4);
+      w32(&wp, 0);                  /* fid */
+      w32(&wp, 99);                 /* newfid */
+      w16(&wp, 5);                  /* nwname = 5, but no strings follow */
+      p9call(srv, reqbuf, wfinish(reqbuf, wp), rspbuf, &rl);
+      STM_ASSERT_EQ(rspbuf[4], P9_RERROR);
+    }
+
+    /* Truncated Tread header (only 8 bytes instead of 16). */
+    { uint8_t *wp = reqbuf; uint32_t rl;
+      whdr(&wp, P9_TREAD, 5);
+      w32(&wp, 0); w32(&wp, 0);     /* only 8 bytes of body instead of 16 */
+      p9call(srv, reqbuf, wfinish(reqbuf, wp), rspbuf, &rl);
+      STM_ASSERT_EQ(rspbuf[4], P9_RERROR);
+    }
+
+    stm_9p_destroy(srv);
+    stm_fs_close(fs);
+    cleanup();
+}
+
 int main(void)
 {
     STM_SUITE("p9");
     STM_RUN(test_p9_version_attach);
     STM_RUN(test_p9_create_write_read);
     STM_RUN(test_p9_readdir);
+    STM_RUN(test_p9_wire_validation);
     printf("all passed\n");
     return 0;
 }

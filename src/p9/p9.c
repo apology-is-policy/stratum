@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <stddef.h>
 
 /* ── wire format helpers ────────────────────────────────────────────── */
 
@@ -33,14 +34,32 @@ static void pstr(uint8_t **pp, const char *s, uint16_t len) {
     if (len) { memcpy(*pp, s, len); *pp += len; }
 }
 
-/* read a 9P string, return pointer into buf and length */
-static const char *gstr(const uint8_t **pp, uint16_t *out_len) {
-    uint16_t len = g16(*pp); *pp += 2;
-    const char *s = (const char *)*pp;
+/* Read a 9P string, bounds-checked against `end`. Returns NULL and leaves
+ * *pp unchanged if the message is truncated (either the 2-byte length
+ * prefix or the declared payload would read past end). The caller MUST
+ * check for NULL before using the result — blindly reading uninitialized
+ * heap past the wire message is how remote-unauthenticated memory
+ * disclosure / DoS bugs happen. */
+static const char *gstr(const uint8_t **pp, const uint8_t *end,
+                        uint16_t *out_len)
+{
+    uint16_t len;
+    const char *s;
+    if (end - *pp < 2) { *out_len = 0; return NULL; }
+    len = g16(*pp);
+    if (end - *pp - 2 < (ptrdiff_t)len) { *out_len = 0; return NULL; }
+    *pp += 2;
+    s = (const char *)*pp;
     *pp += len;
     *out_len = len;
     return s;
 }
+
+/* Minimum msize a client can negotiate. Anything smaller causes
+ * `s->msize - P9_HDR_SIZE - 4` in h_read/h_open/h_create/etc. to underflow
+ * the unsigned type and turn the "clamp to max payload" checks into no-ops.
+ * Chosen well above P9_HDR_SIZE + TREAD overhead; 256 is generous. */
+#define P9_MSIZE_MIN 256
 
 /* write QID: [u8 type][u32 vers][u64 path] = 13 bytes */
 static void pqid(uint8_t *p, uint8_t type, uint32_t vers, uint64_t path) {
@@ -172,18 +191,28 @@ static uint32_t encode_stat(uint8_t *buf, uint32_t cap,
 
 /* ── message handlers ───────────────────────────────────────────────── */
 
-static int h_version(struct stm_9p *s, const uint8_t *body, uint16_t tag,
-                     uint8_t *resp, uint32_t *resp_len)
+static int h_version(struct stm_9p *s, const uint8_t *body, uint32_t body_len,
+                     uint16_t tag, uint8_t *resp, uint32_t *resp_len)
 {
-    uint32_t client_msize = g32(body);
+    const uint8_t *end = body + body_len;
+    uint32_t client_msize;
     uint16_t vlen;
     const char *ver;
     uint8_t *wp;
 
+    if (body_len < 4)
+        return resp_error(resp, resp_len, tag, "truncated Tversion");
+    client_msize = g32(body);
     body += 4;
-    ver = gstr(&body, &vlen);
-    (void)ver;
+    ver = gstr(&body, end, &vlen);
+    if (!ver)
+        return resp_error(resp, resp_len, tag, "truncated Tversion version");
 
+    /* Clamp msize into a safe range. Below P9_MSIZE_MIN, arithmetic in
+     * h_read/h_open/h_create (msize - P9_HDR_SIZE - 4) underflows the
+     * unsigned type and downstream count-clamp checks become no-ops,
+     * enabling heap OOB writes in h_read on large file reads. */
+    if (client_msize < P9_MSIZE_MIN) client_msize = P9_MSIZE_MIN;
     s->msize = client_msize < P9_MSIZE_DEFAULT ? client_msize : P9_MSIZE_DEFAULT;
 
     wp = resp + 4;
@@ -195,10 +224,13 @@ static int h_version(struct stm_9p *s, const uint8_t *body, uint16_t tag,
     return 0;
 }
 
-static int h_attach(struct stm_9p *s, const uint8_t *body, uint16_t tag,
-                    uint8_t *resp, uint32_t *resp_len)
+static int h_attach(struct stm_9p *s, const uint8_t *body, uint32_t body_len,
+                    uint16_t tag, uint8_t *resp, uint32_t *resp_len)
 {
-    uint32_t fid = g32(body);
+    uint32_t fid;
+    if (body_len < 4)
+        return resp_error(resp, resp_len, tag, "truncated Tattach");
+    fid = g32(body);
     struct p9_fid *f;
     struct stm_inode in;
     uint8_t *wp;
@@ -222,13 +254,13 @@ static int h_attach(struct stm_9p *s, const uint8_t *body, uint16_t tag,
     return 0;
 }
 
-static int h_walk(struct stm_9p *s, const uint8_t *body, uint16_t tag,
-                  uint8_t *resp, uint32_t *resp_len)
+static int h_walk(struct stm_9p *s, const uint8_t *body, uint32_t body_len,
+                  uint16_t tag, uint8_t *resp, uint32_t *resp_len)
 {
-    uint32_t fid = g32(body);
-    uint32_t newfid = g32(body + 4);
-    uint16_t nwname = g16(body + 8);
-    const uint8_t *bp = body + 10;
+    const uint8_t *end = body + body_len;
+    uint32_t fid, newfid;
+    uint16_t nwname;
+    const uint8_t *bp;
     uint8_t qids[16 * P9_QID_SIZE];
     uint16_t nwqid = 0;
     struct p9_fid *f, *nf;
@@ -237,6 +269,13 @@ static int h_walk(struct stm_9p *s, const uint8_t *body, uint16_t tag,
     char last_name[256];
     int is_dir;
     uint16_t i;
+
+    if (body_len < 10)
+        return resp_error(resp, resp_len, tag, "truncated Twalk");
+    fid    = g32(body);
+    newfid = g32(body + 4);
+    nwname = g16(body + 8);
+    bp = body + 10;
 
     f = fid_get(s, fid);
     if (!f) return resp_error(resp, resp_len, tag, "unknown fid");
@@ -248,12 +287,17 @@ static int h_walk(struct stm_9p *s, const uint8_t *body, uint16_t tag,
 
     for (i = 0; i < nwname && i < 16; i++) {
         uint16_t slen;
-        const char *name = gstr(&bp, &slen);
+        const char *name = gstr(&bp, end, &slen);
         char nbuf[256];
         uint64_t child_ino;
         struct stm_inode child_in;
         int rc;
 
+        /* Truncated message: a malformed client sent nwname=N but fewer
+         * actual name strings. Refuse rather than reading heap past the
+         * end of the wire buffer. */
+        if (!name)
+            return resp_error(resp, resp_len, tag, "truncated Twalk names");
         if (slen >= sizeof(nbuf)) break;
         memcpy(nbuf, name, slen); nbuf[slen] = '\0';
 
@@ -303,13 +347,18 @@ static int h_walk(struct stm_9p *s, const uint8_t *body, uint16_t tag,
     return 0;
 }
 
-static int h_open(struct stm_9p *s, const uint8_t *body, uint16_t tag,
-                  uint8_t *resp, uint32_t *resp_len)
+static int h_open(struct stm_9p *s, const uint8_t *body, uint32_t body_len,
+                  uint16_t tag, uint8_t *resp, uint32_t *resp_len)
 {
-    uint32_t fid = g32(body);
-    struct p9_fid *f = fid_get(s, fid);
+    uint32_t fid;
+    struct p9_fid *f;
     struct stm_inode in;
     uint8_t *wp;
+
+    if (body_len < 5)  /* fid(4) + mode(1) */
+        return resp_error(resp, resp_len, tag, "truncated Topen");
+    fid = g32(body);
+    f = fid_get(s, fid);
 
     if (!f) return resp_error(resp, resp_len, tag, "unknown fid");
 
@@ -327,14 +376,15 @@ static int h_open(struct stm_9p *s, const uint8_t *body, uint16_t tag,
     return 0;
 }
 
-static int h_create(struct stm_9p *s, const uint8_t *body, uint16_t tag,
-                    uint8_t *resp, uint32_t *resp_len)
+static int h_create(struct stm_9p *s, const uint8_t *body, uint32_t body_len,
+                    uint16_t tag, uint8_t *resp, uint32_t *resp_len)
 {
-    uint32_t fid_nr = g32(body);
-    const uint8_t *bp = body + 4;
+    const uint8_t *end = body + body_len;
+    uint32_t fid_nr;
+    const uint8_t *bp;
     uint16_t nlen;
-    const char *name = gstr(&bp, &nlen);
-    uint32_t perm = g32(bp); bp += 4;
+    const char *name;
+    uint32_t perm;
     char nbuf[256];
     struct p9_fid *f;
     uint64_t new_ino;
@@ -342,7 +392,17 @@ static int h_create(struct stm_9p *s, const uint8_t *body, uint16_t tag,
     uint8_t *wp;
     int rc;
 
-    (void)bp; /* mode byte, not used yet */
+    if (body_len < 4)
+        return resp_error(resp, resp_len, tag, "truncated Tcreate");
+    fid_nr = g32(body);
+    bp = body + 4;
+    name = gstr(&bp, end, &nlen);
+    if (!name)
+        return resp_error(resp, resp_len, tag, "truncated Tcreate name");
+    if (end - bp < 5)  /* perm(4) + mode(1) */
+        return resp_error(resp, resp_len, tag, "truncated Tcreate perm");
+    perm = g32(bp); bp += 4;
+    /* mode byte (bp+4) is protocol-required but unused server-side */
 
     f = fid_get(s, fid_nr);
     if (!f || !f->is_dir)
@@ -396,14 +456,21 @@ static int rdir_cb(const char *name, uint64_t ino, uint8_t type, void *ctx)
     return 0;
 }
 
-static int h_read(struct stm_9p *s, const uint8_t *body, uint16_t tag,
-                  uint8_t *resp, uint32_t *resp_len)
+static int h_read(struct stm_9p *s, const uint8_t *body, uint32_t body_len,
+                  uint16_t tag, uint8_t *resp, uint32_t *resp_len)
 {
-    uint32_t fid_nr = g32(body);
-    uint64_t offset = g64(body + 4);
-    uint32_t count  = g32(body + 12);
-    struct p9_fid *f = fid_get(s, fid_nr);
+    uint32_t fid_nr;
+    uint64_t offset;
+    uint32_t count;
+    struct p9_fid *f;
     uint8_t *wp;
+
+    if (body_len < 16)
+        return resp_error(resp, resp_len, tag, "truncated Tread");
+    fid_nr = g32(body);
+    offset = g64(body + 4);
+    count  = g32(body + 12);
+    f = fid_get(s, fid_nr);
 
     if (!f || !f->is_open)
         return resp_error(resp, resp_len, tag, "not open");
@@ -447,16 +514,31 @@ static int h_read(struct stm_9p *s, const uint8_t *body, uint16_t tag,
     return 0;
 }
 
-static int h_write(struct stm_9p *s, const uint8_t *body, uint16_t tag,
-                   uint8_t *resp, uint32_t *resp_len)
+static int h_write(struct stm_9p *s, const uint8_t *body, uint32_t body_len,
+                   uint16_t tag, uint8_t *resp, uint32_t *resp_len)
 {
-    uint32_t fid_nr = g32(body);
-    uint64_t offset = g64(body + 4);
-    uint32_t count  = g32(body + 12);
-    const uint8_t *data = body + 16;
-    struct p9_fid *f = fid_get(s, fid_nr);
+    uint32_t fid_nr;
+    uint64_t offset;
+    uint32_t count;
+    const uint8_t *data;
+    struct p9_fid *f;
     uint8_t *wp;
     int rc;
+
+    if (body_len < 16)
+        return resp_error(resp, resp_len, tag, "truncated Twrite");
+    fid_nr = g32(body);
+    offset = g64(body + 4);
+    count  = g32(body + 12);
+    data   = body + 16;
+    /* Client-supplied count must fit within the message payload. Without
+     * this check, the server reads `count` bytes of uninitialized heap
+     * past the wire buffer and encrypts/stores them in the volume — on
+     * encrypted volumes, this is a heap-contents leak that round-trips
+     * through the disk and is readable back by the client as plaintext. */
+    if (count > body_len - 16)
+        return resp_error(resp, resp_len, tag, "Twrite count exceeds payload");
+    f = fid_get(s, fid_nr);
 
     if (!f || !f->is_open)
         return resp_error(resp, resp_len, tag, "not open");
@@ -480,12 +562,17 @@ static int h_write(struct stm_9p *s, const uint8_t *body, uint16_t tag,
     return 0;
 }
 
-static int h_clunk(struct stm_9p *s, const uint8_t *body, uint16_t tag,
-                   uint8_t *resp, uint32_t *resp_len)
+static int h_clunk(struct stm_9p *s, const uint8_t *body, uint32_t body_len,
+                   uint16_t tag, uint8_t *resp, uint32_t *resp_len)
 {
-    uint32_t fid_nr = g32(body);
-    struct p9_fid *f = fid_get(s, fid_nr);
+    uint32_t fid_nr;
+    struct p9_fid *f;
     uint8_t *wp;
+
+    if (body_len < 4)
+        return resp_error(resp, resp_len, tag, "truncated Tclunk");
+    fid_nr = g32(body);
+    f = fid_get(s, fid_nr);
 
     /* Sync after writes — ensures durability when copy dialog closes.
      * Much faster now that scan doesn't drain the whole tree.
@@ -510,12 +597,17 @@ static int h_clunk(struct stm_9p *s, const uint8_t *body, uint16_t tag,
     return 0;
 }
 
-static int h_remove(struct stm_9p *s, const uint8_t *body, uint16_t tag,
-                    uint8_t *resp, uint32_t *resp_len)
+static int h_remove(struct stm_9p *s, const uint8_t *body, uint32_t body_len,
+                    uint16_t tag, uint8_t *resp, uint32_t *resp_len)
 {
-    uint32_t fid_nr = g32(body);
-    struct p9_fid *f = fid_get(s, fid_nr);
+    uint32_t fid_nr;
+    struct p9_fid *f;
     uint8_t *wp;
+
+    if (body_len < 4)
+        return resp_error(resp, resp_len, tag, "truncated Tremove");
+    fid_nr = g32(body);
+    f = fid_get(s, fid_nr);
 
     if (!f) return resp_error(resp, resp_len, tag, "unknown fid");
 
@@ -550,14 +642,19 @@ static int h_remove(struct stm_9p *s, const uint8_t *body, uint16_t tag,
     return 0;
 }
 
-static int h_stat(struct stm_9p *s, const uint8_t *body, uint16_t tag,
-                  uint8_t *resp, uint32_t *resp_len)
+static int h_stat(struct stm_9p *s, const uint8_t *body, uint32_t body_len,
+                  uint16_t tag, uint8_t *resp, uint32_t *resp_len)
 {
-    uint32_t fid_nr = g32(body);
-    struct p9_fid *f = fid_get(s, fid_nr);
+    uint32_t fid_nr;
+    struct p9_fid *f;
     struct stm_inode in;
     uint8_t *wp;
     uint32_t slen;
+
+    if (body_len < 4)
+        return resp_error(resp, resp_len, tag, "truncated Tstat");
+    fid_nr = g32(body);
+    f = fid_get(s, fid_nr);
 
     if (!f) return resp_error(resp, resp_len, tag, "unknown fid");
     if (stm_fs_stat(s->fs, f->ino, &in))
@@ -592,10 +689,10 @@ int stm_9p_create(struct stm_fs *fs, struct stm_9p **out)
 }
 
 /* Forward declarations for snapshot extension handlers (defined below). */
-static int h_snap_create(struct stm_9p *, const uint8_t *, uint16_t, uint8_t *, uint32_t *);
-static int h_snap_list(struct stm_9p *, const uint8_t *, uint16_t, uint8_t *, uint32_t *);
-static int h_snap_delete(struct stm_9p *, const uint8_t *, uint16_t, uint8_t *, uint32_t *);
-static int h_snap_rollback(struct stm_9p *, const uint8_t *, uint16_t, uint8_t *, uint32_t *);
+static int h_snap_create(struct stm_9p *, const uint8_t *, uint32_t, uint16_t, uint8_t *, uint32_t *);
+static int h_snap_list(struct stm_9p *, const uint8_t *, uint32_t, uint16_t, uint8_t *, uint32_t *);
+static int h_snap_delete(struct stm_9p *, const uint8_t *, uint32_t, uint16_t, uint8_t *, uint32_t *);
+static int h_snap_rollback(struct stm_9p *, const uint8_t *, uint32_t, uint16_t, uint8_t *, uint32_t *);
 
 int stm_9p_handle(struct stm_9p *s,
                   const uint8_t *req, uint32_t req_len,
@@ -604,6 +701,7 @@ int stm_9p_handle(struct stm_9p *s,
     uint8_t type;
     uint16_t tag;
     const uint8_t *body;
+    uint32_t body_len;
 
     if (req_len < P9_HDR_SIZE)
         return resp_error(resp, resp_len, 0, "runt message");
@@ -611,25 +709,26 @@ int stm_9p_handle(struct stm_9p *s,
     type = req[4];
     tag  = g16(req + 5);
     body = req + P9_HDR_SIZE;
+    body_len = req_len - P9_HDR_SIZE;
 
     switch (type) {
-    case P9_TVERSION: return h_version(s, body, tag, resp, resp_len);
-    case P9_TATTACH:  return h_attach(s, body, tag, resp, resp_len);
-    case P9_TWALK:    return h_walk(s, body, tag, resp, resp_len);
-    case P9_TOPEN:    return h_open(s, body, tag, resp, resp_len);
-    case P9_TCREATE:  return h_create(s, body, tag, resp, resp_len);
-    case P9_TREAD:    return h_read(s, body, tag, resp, resp_len);
-    case P9_TWRITE:   return h_write(s, body, tag, resp, resp_len);
-    case P9_TCLUNK:   return h_clunk(s, body, tag, resp, resp_len);
-    case P9_TREMOVE:  return h_remove(s, body, tag, resp, resp_len);
-    case P9_TSTAT:    return h_stat(s, body, tag, resp, resp_len);
+    case P9_TVERSION: return h_version(s, body, body_len, tag, resp, resp_len);
+    case P9_TATTACH:  return h_attach(s, body, body_len, tag, resp, resp_len);
+    case P9_TWALK:    return h_walk(s, body, body_len, tag, resp, resp_len);
+    case P9_TOPEN:    return h_open(s, body, body_len, tag, resp, resp_len);
+    case P9_TCREATE:  return h_create(s, body, body_len, tag, resp, resp_len);
+    case P9_TREAD:    return h_read(s, body, body_len, tag, resp, resp_len);
+    case P9_TWRITE:   return h_write(s, body, body_len, tag, resp, resp_len);
+    case P9_TCLUNK:   return h_clunk(s, body, body_len, tag, resp, resp_len);
+    case P9_TREMOVE:  return h_remove(s, body, body_len, tag, resp, resp_len);
+    case P9_TSTAT:    return h_stat(s, body, body_len, tag, resp, resp_len);
     case P9_TFLUSH:   /* just ACK */
         { uint8_t *wp = resp + 4; *wp++ = P9_RFLUSH; p16(wp, tag); wp += 2;
           resp_finish(resp, resp_len, wp); return 0; }
-    case P9_TSNAP_CREATE:   return h_snap_create(s, body, tag, resp, resp_len);
-    case P9_TSNAP_LIST:     return h_snap_list(s, body, tag, resp, resp_len);
-    case P9_TSNAP_DELETE:   return h_snap_delete(s, body, tag, resp, resp_len);
-    case P9_TSNAP_ROLLBACK: return h_snap_rollback(s, body, tag, resp, resp_len);
+    case P9_TSNAP_CREATE:   return h_snap_create(s, body, body_len, tag, resp, resp_len);
+    case P9_TSNAP_LIST:     return h_snap_list(s, body, body_len, tag, resp, resp_len);
+    case P9_TSNAP_DELETE:   return h_snap_delete(s, body, body_len, tag, resp, resp_len);
+    case P9_TSNAP_ROLLBACK: return h_snap_rollback(s, body, body_len, tag, resp, resp_len);
     default:
         return resp_error(resp, resp_len, tag, "unknown message type");
     }
@@ -637,17 +736,21 @@ int stm_9p_handle(struct stm_9p *s,
 
 /* ── snapshot extensions ──────────────────────────────────────────── */
 
-static int h_snap_create(struct stm_9p *s, const uint8_t *body, uint16_t tag,
-                         uint8_t *resp, uint32_t *resp_len)
+static int h_snap_create(struct stm_9p *s, const uint8_t *body, uint32_t body_len,
+                         uint16_t tag, uint8_t *resp, uint32_t *resp_len)
 {
     const uint8_t *p = body;
+    const uint8_t *end = body + body_len;
     uint16_t nlen;
-    const char *name = gstr(&p, &nlen);
+    const char *name;
     char nbuf[256];
     uint64_t id = 0;
     int rc;
     uint8_t *wp;
 
+    name = gstr(&p, end, &nlen);
+    if (!name)
+        return resp_error(resp, resp_len, tag, "truncated Tsnap_create");
     if (nlen >= sizeof(nbuf))
         return resp_error(resp, resp_len, tag, "name too long");
     memcpy(nbuf, name, nlen); nbuf[nlen] = '\0';
@@ -691,10 +794,10 @@ static int snap_list_build_cb(uint64_t id, const char *name,
     return 0;
 }
 
-static int h_snap_list(struct stm_9p *s, const uint8_t *body, uint16_t tag,
-                       uint8_t *resp, uint32_t *resp_len)
+static int h_snap_list(struct stm_9p *s, const uint8_t *body, uint32_t body_len,
+                       uint16_t tag, uint8_t *resp, uint32_t *resp_len)
 {
-    (void)body;
+    (void)body; (void)body_len;  /* Tsnap_list has no body fields */
     uint8_t *wp = resp + 4;
     *wp++ = P9_RSNAP_LIST;
     p16(wp, tag); wp += 2;
@@ -713,12 +816,16 @@ static int h_snap_list(struct stm_9p *s, const uint8_t *body, uint16_t tag,
     return 0;
 }
 
-static int h_snap_delete(struct stm_9p *s, const uint8_t *body, uint16_t tag,
-                         uint8_t *resp, uint32_t *resp_len)
+static int h_snap_delete(struct stm_9p *s, const uint8_t *body, uint32_t body_len,
+                         uint16_t tag, uint8_t *resp, uint32_t *resp_len)
 {
-    uint64_t id = g64(body);
+    uint64_t id;
     int rc;
     uint8_t *wp;
+
+    if (body_len < 8)
+        return resp_error(resp, resp_len, tag, "truncated Tsnap_delete");
+    id = g64(body);
 
     rc = stm_snap_delete(s->fs, id);
     if (rc) return resp_error(resp, resp_len, tag, "snap delete failed");
@@ -732,12 +839,16 @@ static int h_snap_delete(struct stm_9p *s, const uint8_t *body, uint16_t tag,
     return 0;
 }
 
-static int h_snap_rollback(struct stm_9p *s, const uint8_t *body, uint16_t tag,
-                           uint8_t *resp, uint32_t *resp_len)
+static int h_snap_rollback(struct stm_9p *s, const uint8_t *body, uint32_t body_len,
+                           uint16_t tag, uint8_t *resp, uint32_t *resp_len)
 {
-    uint64_t id = g64(body);
+    uint64_t id;
     int rc;
     uint8_t *wp;
+
+    if (body_len < 8)
+        return resp_error(resp, resp_len, tag, "truncated Tsnap_rollback");
+    id = g64(body);
 
     rc = stm_snap_rollback(s->fs, id);
     if (rc) return resp_error(resp, resp_len, tag, "snap rollback failed");
