@@ -82,9 +82,22 @@ static int fill_attr(uint64_t ino, struct stat *st)
     st->st_uid   = le32_to_cpu(in.si_uid);
     st->st_gid   = le32_to_cpu(in.si_gid);
     st->st_size  = le64_to_cpu(in.si_size);
+    /* Full (sec, nsec) timestamps. Modern FUSE carries struct stat with
+     * nanosecond fields; spelled differently on Linux vs macOS. Writing
+     * only the seconds (as the initial Group A commit did) silently
+     * zeroed the nsec half on every stat reply. */
     st->st_atime = le64_to_cpu(in.si_atime_sec);
     st->st_mtime = le64_to_cpu(in.si_mtime_sec);
     st->st_ctime = le64_to_cpu(in.si_ctime_sec);
+#ifdef __APPLE__
+    st->st_atimespec.tv_nsec = le32_to_cpu(in.si_atime_nsec);
+    st->st_mtimespec.tv_nsec = le32_to_cpu(in.si_mtime_nsec);
+    st->st_ctimespec.tv_nsec = le32_to_cpu(in.si_ctime_nsec);
+#else
+    st->st_atim.tv_nsec = le32_to_cpu(in.si_atime_nsec);
+    st->st_mtim.tv_nsec = le32_to_cpu(in.si_mtime_nsec);
+    st->st_ctim.tv_nsec = le32_to_cpu(in.si_ctime_nsec);
+#endif
     st->st_blksize = 4096;
     st->st_blocks  = (st->st_size + 511) / 512;
     return 0;
@@ -166,15 +179,23 @@ static void ll_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
         clock_gettime(CLOCK_REALTIME, &now);
         uint64_t as = 0, ms = 0;
         uint32_t an = 0, mn = 0;
+        /* Pull nanoseconds via the platform-appropriate field name. */
+#ifdef __APPLE__
+        uint32_t attr_an = (uint32_t)attr->st_atimespec.tv_nsec;
+        uint32_t attr_mn = (uint32_t)attr->st_mtimespec.tv_nsec;
+#else
+        uint32_t attr_an = (uint32_t)attr->st_atim.tv_nsec;
+        uint32_t attr_mn = (uint32_t)attr->st_mtim.tv_nsec;
+#endif
         if (to_set & FUSE_SET_ATTR_ATIME_NOW) {
             as = (uint64_t)now.tv_sec; an = (uint32_t)now.tv_nsec;
         } else if (to_set & FUSE_SET_ATTR_ATIME) {
-            as = (uint64_t)attr->st_atime; an = 0;
+            as = (uint64_t)attr->st_atime; an = attr_an;
         }
         if (to_set & FUSE_SET_ATTR_MTIME_NOW) {
             ms = (uint64_t)now.tv_sec; mn = (uint32_t)now.tv_nsec;
         } else if (to_set & FUSE_SET_ATTR_MTIME) {
-            ms = (uint64_t)attr->st_mtime; mn = 0;
+            ms = (uint64_t)attr->st_mtime; mn = attr_mn;
         }
         rc = stm_fs_utimes(g_fs, ino, set_at, as, an, set_mt, ms, mn);
         if (rc) { fuse_reply_err(req, -rc); return; }
@@ -230,6 +251,20 @@ static void ll_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 static void ll_unlink(fuse_req_t req, fuse_ino_t parent, const char *name)
 {
     int rc = stm_fs_unlink(g_fs, parent, name);
+    fuse_reply_err(req, rc ? -rc : 0);
+}
+
+static void ll_rename(fuse_req_t req, fuse_ino_t parent, const char *name,
+                      fuse_ino_t newparent, const char *newname,
+                      unsigned int flags)
+{
+    /* FUSE 3 added flags (RENAME_EXCHANGE, RENAME_NOREPLACE) but libfuse3
+     * only invokes the callback with them set when the kernel was told
+     * the backend supports them. We don't advertise the capability, so
+     * in practice flags is 0 here. Defensive check: reject anything we
+     * don't implement. */
+    if (flags != 0) { fuse_reply_err(req, ENOTSUP); return; }
+    int rc = stm_fs_rename(g_fs, parent, name, newparent, newname);
     fuse_reply_err(req, rc ? -rc : 0);
 }
 
@@ -384,8 +419,9 @@ static const struct fuse_lowlevel_ops ops = {
     .release  = ll_release,
     .readdir  = ll_readdir,
     .statfs   = ll_statfs,
-    /* Unimplemented (SOTA #5 POSIX completion):
-     *   rename, link, symlink, readlink, mknod, access,
+    .rename   = ll_rename,
+    /* Unimplemented (SOTA #5 Groups C/D):
+     *   link, symlink, readlink, mknod, access,
      *   setxattr, getxattr, listxattr, removexattr, bmap.
      * libfuse returns ENOSYS for any op left NULL. */
 };

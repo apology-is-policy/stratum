@@ -1511,6 +1511,15 @@ int stm_fs_truncate(struct stm_fs *fs, uint64_t ino, uint64_t new_size)
 {
     STM_FS_GUARD_WRITE(fs);
 
+    /* Reject file sizes too close to UINT64_MAX. The shrink path
+     * computes `align + STM_EXTENT_SIZE` which would wrap to 0 for
+     * new_size > UINT64_MAX - STM_EXTENT_SIZE, turning the scan bound
+     * into [0, UINT64_MAX) and wiping every extent. FUSE limits sizes
+     * to INT64_MAX (off_t), so this is unreachable via a POSIX mount,
+     * but the C API is callable directly and should reject pathological
+     * inputs rather than corrupt the tree. */
+    if (new_size > UINT64_MAX - STM_EXTENT_SIZE) return -EFBIG;
+
     struct stm_inode in;
     int rc = read_inode(fs, ino, &in);
     if (rc) return rc;
@@ -1604,6 +1613,118 @@ int stm_fs_truncate(struct stm_fs *fs, uint64_t ino, uint64_t new_size)
     in.si_ctime_sec  = cpu_to_le64(ts);
     in.si_ctime_nsec = cpu_to_le32(tns);
     return write_inode(fs, ino, &in);
+}
+
+/* POSIX Group B: rename.
+ *
+ * rename(old_parent/old_name, new_parent/new_name) atomically moves or
+ * renames a directory entry. The inode number is preserved — only the
+ * dirent's (parent, hash, name) record changes. POSIX semantics require:
+ *
+ *   - Success iff the source exists, source name is valid, target can
+ *     be replaced (doesn't exist OR is a non-dir OR is an empty dir).
+ *   - If target exists, it's atomically unlinked (nlink decremented;
+ *     data freed if nlink hits 0).
+ *   - Rename-to-self (same parent + same name) is a no-op.
+ *   - Crash atomicity: after recovery, state is either pre- or
+ *     post-rename. Stratum's two-phase sync gives this for free —
+ *     all three btree ops below are buffered in the tree's message
+ *     buffer and commit together on the next sync.
+ *
+ * Ordering:
+ *   1. Look up source; validate it exists.
+ *   2. Rename-to-self → 0.
+ *   3. Check target: if present, stm_fs_unlink it (propagates
+ *      -ENOTEMPTY for non-empty directories, matching POSIX).
+ *   4. find_dirent_slot for the new name.
+ *   5. Insert new dirent pointing at source's ino.
+ *   6. Tombstone the old dirent.
+ *
+ * Failure modes between (5) and (6): new dirent inserted but old not
+ * yet tombstoned → inode is reachable via both paths (a transient
+ * hardlink-like state). Subsequent unlink of either path would decrement
+ * nlink to 0 and free the inode, breaking the other path. We return
+ * the tombstone error; retry typically succeeds. In-session-only, no
+ * disk state yet.
+ *
+ * Failure at (3) → no change yet (target unchanged, source unchanged).
+ * Failure at (5) → target already gone but source still exists; caller
+ * sees -ENOSPC/ENOMEM and knows data was lost. Real POSIX filesystems
+ * have the same issue under ENOSPC. For Stratum's COW model the target's
+ * extent blocks are PENDING (freed on next sync commit); they don't
+ * reappear as the new dirent's data. */
+int stm_fs_rename(struct stm_fs *fs,
+                  uint64_t old_parent, const char *old_name,
+                  uint64_t new_parent, const char *new_name)
+{
+    STM_FS_GUARD_WRITE(fs);
+
+    size_t old_nlen = strlen(old_name);
+    size_t new_nlen = strlen(new_name);
+    if (old_nlen == 0 || old_nlen > STM_NAME_MAX) return -EINVAL;
+    if (new_nlen == 0 || new_nlen > STM_NAME_MAX) return -EINVAL;
+
+    /* 1. Source must exist. */
+    uint64_t old_ino;
+    struct stm_key old_dkey;
+    int rc = lookup_dirent(fs->tree, old_parent, old_name, old_nlen,
+                           &old_ino, &old_dkey);
+    if (rc) return rc;  /* -ENOENT if missing */
+
+    /* 2. Rename-to-self: POSIX says this must return success with no
+     *    side effects. */
+    if (old_parent == new_parent && old_nlen == new_nlen &&
+        memcmp(old_name, new_name, old_nlen) == 0) {
+        return 0;
+    }
+
+    /* 3. If the target exists, remove it first. Same-inode target (the
+     *    source and destination names alias the same ino, e.g. via a
+     *    hardlink — not created today but possible once Group D lands)
+     *    is a no-op: just tombstone the old name. */
+    uint64_t tgt_ino;
+    rc = lookup_dirent(fs->tree, new_parent, new_name, new_nlen,
+                       &tgt_ino, NULL);
+    if (rc == 0) {
+        if (tgt_ino == old_ino) {
+            return tombstone_dirent(fs->tree, &old_dkey, fs->gen);
+        }
+        /* stm_fs_unlink handles both files and dirs — dirs get the
+         * ENOTEMPTY check, nlink-0 files get fully reaped. */
+        rc = stm_fs_unlink(fs, new_parent, new_name);
+        if (rc) return rc;
+    } else if (rc != -ENOENT) {
+        return rc;
+    }
+
+    /* 4. Read source inode to derive the dirent type byte (DT_DIR vs
+     *    DT_REG). Needed for the encoded dirent value. */
+    struct stm_inode old_in;
+    rc = read_inode(fs, old_ino, &old_in);
+    if (rc) return rc;
+    uint32_t old_mode = le32_to_cpu(old_in.si_mode);
+    uint8_t dtype = ((old_mode & STM_S_IFMT) == STM_S_IFDIR)
+                  ? STM_DT_DIR : STM_DT_REG;
+
+    /* 5. Find a slot for the new name and insert the dirent. If the
+     *    name's probe chain is full (256 collisions) we return -ENOSPC
+     *    without modifying anything further. */
+    struct stm_key new_dkey;
+    rc = find_dirent_slot(fs->tree, new_parent, new_name, new_nlen, &new_dkey);
+    if (rc) return rc;
+
+    uint8_t dbuf[STM_NAME_MAX + 16];
+    uint32_t dlen;
+    encode_dirent(old_ino, dtype, new_name, new_nlen, dbuf, &dlen);
+    rc = stm_btree_insert(fs->tree, &new_dkey, dbuf, dlen, fs->gen);
+    if (rc) return rc;
+
+    /* 6. Tombstone the old dirent. If this fails the inode is reachable
+     *    via both old and new paths — a logical hardlink with nlink=1.
+     *    Retry-safe: a second rename() with the same arguments will
+     *    find the new dirent already in place (tgt_ino == old_ino) and
+     *    succeed by just tombstoning the old dirent. */
+    return tombstone_dirent(fs->tree, &old_dkey, fs->gen);
 }
 
 int stm_fs_unlink(struct stm_fs *fs, uint64_t parent_ino, const char *name)
