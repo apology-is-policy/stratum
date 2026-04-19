@@ -57,6 +57,8 @@ struct stm_node {
     uint32_t data_bytes;    /* total value payload bytes */
 };
 
+struct stm_node_cache;  /* in cache.c */
+
 struct stm_btree {
     struct stm_block_dev *dev;
     struct stm_bptr root_bptr;
@@ -72,7 +74,23 @@ struct stm_btree {
                              * can't be encrypted twice under the same
                              * (key, nonce) even when COW reclaims paddrs.
                              * See #R4-1 commit message. */
+    struct stm_node_cache *node_cache;  /* NULL = no cache (bypass); populated
+                                         * by stm_btree_open. See cache.c. */
 };
+
+/* --- cache.c ---------------------------------------------------------- */
+
+struct stm_node_cache *stm_node_cache_new(uint32_t capacity);
+void                   stm_node_cache_free(struct stm_node_cache *c);
+void                   stm_node_cache_flush(struct stm_node_cache *c);
+void                   stm_node_cache_insert(struct stm_node_cache *c,
+                                             uint64_t paddr,
+                                             struct stm_node *node);
+struct stm_node       *stm_node_cache_get(struct stm_node_cache *c,
+                                          uint64_t paddr);
+uint32_t               stm_node_cache_count(const struct stm_node_cache *c);
+void                   stm_node_cache_invalidate(struct stm_node_cache *c,
+                                                 uint64_t paddr);
 
 /* Per-entry serialized overhead (bytes) */
 #define STM_LEAF_OVERHEAD  21   /* sizeof(stm_key)=17 + sizeof(le32)=4 */

@@ -31,12 +31,21 @@ static void free_old_bptr(struct stm_btree *tree, const struct stm_bptr *old)
 int stm_btree_read_node(struct stm_btree *tree, struct stm_bptr *bptr,
                         struct stm_node **out)
 {
+    uint64_t paddr     = le64_to_cpu(bptr->bp_paddr);
     uint32_t disk_size = le32_to_cpu(bptr->bp_csize);
     uint32_t lsize     = le32_to_cpu(bptr->bp_lsize);
     uint8_t  comp      = bptr->bp_comp;
     uint8_t *raw, *decrypted = NULL, *decompressed = NULL;
     uint32_t data_len;
     int rc;
+
+    /* Cache lookup (SOTA #3). On hit, we return a clone — caller owns it
+     * and may mutate without affecting the cache. Skips the full disk +
+     * csum + decrypt + decompress + decode pipeline. */
+    if (tree->node_cache) {
+        struct stm_node *hit = stm_node_cache_get(tree->node_cache, paddr);
+        if (hit) { *out = hit; return 0; }
+    }
 
     raw = malloc(disk_size);
     if (!raw) return -ENOMEM;
@@ -82,7 +91,16 @@ int stm_btree_read_node(struct stm_btree *tree, struct stm_bptr *bptr,
     }
     free(raw);
     if (rc) return rc;
-    (*out)->paddr = le64_to_cpu(bptr->bp_paddr);
+    (*out)->paddr = paddr;
+
+    /* Populate the cache with a clone of the successfully-decoded node.
+     * Only reached on full-pipeline success — bad-csum / decrypt-fail /
+     * decompress-fail / decode-fail paths all return early above, so the
+     * cache never holds corrupt content. */
+    if (tree->node_cache) {
+        struct stm_node *cached = stm_node_clone(*out);
+        if (cached) stm_node_cache_insert(tree->node_cache, paddr, cached);
+    }
     return 0;
 }
 
@@ -176,6 +194,19 @@ int stm_btree_write_node(struct stm_btree *tree, struct stm_node *n,
     out->bp_comp  = algo;
     out->bp_csize = cpu_to_le32(write_len);
     out->bp_lsize = cpu_to_le32(used);
+
+    /* Cache maintenance on write: every write goes to a FRESH paddr from
+     * the allocator (COW), so a stale entry at `addr` is only possible
+     * across sync boundaries (paddr frees PENDING → commits free → alloc
+     * hands back out). In that case the cache's old entry is wrong.
+     * Invalidate it; next read of this paddr will fetch fresh from disk
+     * and repopulate. (We do NOT clone-and-insert here — the clone cost
+     * on every write dominates write-heavy workloads, and the write path
+     * is cold from the cache's perspective: we already have the node in
+     * memory.) */
+    if (tree->node_cache) {
+        stm_node_cache_invalidate(tree->node_cache, addr);
+    }
     return 0;
 
 fail_free_alloc:
@@ -207,6 +238,20 @@ int stm_btree_open(struct stm_block_dev *dev, struct stm_bptr root,
         if (end > t->next_alloc) t->next_alloc = end;
     }
 
+    /* SOTA #3: per-tree LRU node cache. Size overridable via STM_CACHE_SIZE
+     * (number of nodes); default 64 ≈ 8 MiB at 128 KiB/node. Cache is
+     * best-effort: if new() fails we run uncached rather than failing open. */
+    {
+        uint32_t cap = 64;
+        const char *env = getenv("STM_CACHE_SIZE");
+        if (env) {
+            long v = strtol(env, NULL, 10);
+            if (v > 0 && v < 100000) cap = (uint32_t)v;
+            else if (v == 0) cap = 0;  /* explicit disable */
+        }
+        if (cap > 0) t->node_cache = stm_node_cache_new(cap);
+    }
+
     *out = t;
     return 0;
 }
@@ -224,6 +269,7 @@ uint16_t stm_btree_height(struct stm_btree *tree)
 void stm_btree_close(struct stm_btree *tree)
 {
     if (!tree) return;
+    stm_node_cache_free(tree->node_cache);
     stm_node_free(tree->root);
     stm_crypto_free(tree->crypto);
     free(tree);

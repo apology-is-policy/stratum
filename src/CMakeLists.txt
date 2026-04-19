@@ -4,6 +4,7 @@ add_library(stratum-lib STATIC
     btree/btree.c
     btree/node.c
     btree/msg.c
+    btree/cache.c
     alloc/alloc.c
     alloc/space_map.c
     cow/cow.c
