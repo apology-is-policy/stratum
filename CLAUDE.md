@@ -2,9 +2,53 @@
 
 Operating notes for Claude when working on Stratum.
 
+## Mission
+
+Stratum is aiming to be a first-class peer of ZFS and btrfs — not a demo, not a hobby project, a production-grade COW filesystem that a POSIX-compatible OS can be built on. Beyond peer status, Stratum is intended to pioneer in a chosen set of areas where the state of the art is ripe for advance:
+
+1. **Formally verified sync + crash-safety protocol.** TLA+ (or similar) specification of the three-phase sync, allocator invariants, and AEAD nonce machinery, proved correct under arbitrary write reordering. No mainline filesystem has this.
+2. **Post-quantum encryption as default.** ML-KEM-768 + XChaCha20-Poly1305 hybrid wrap keys. Stratum ships PQ-ready out of the box.
+3. **Content-defined extent boundaries.** Rolling-hash chunking at the extent layer (shift-resistant dedup for real-world data patterns — VMs, container images, backups). No production filesystem integrates this.
+4. **Lock-free metadata path.** The Bε-tree's message-buffer model is an unusually good fit for lock-free operation. Pair with MVCC readers for zero-contention reads.
+5. **Merkle-rooted metadata integrity.** Tamper-evident semantics stronger than per-block csums: any offline edit to any metadata block is cryptographically detectable.
+6. **Tiered storage with learned migration.** Beyond heuristic hot/cold tiering — access-pattern models for policy decisions.
+7. **io_uring-native, zero-copy write path.** Designed for 2026+ NVMe workloads, not retrofitted from POSIX block I/O.
+
+These are long-horizon commitments. The existing code is a **foundation, not the destination**. Components will be preserved where they still serve the vision (Bε-tree core, crypto primitives, xxHash helpers) and rewritten where they don't (superblock layout, allocator, namespace model, block-device abstraction). Salvage rate of the existing ~20 KLOC is expected to be 30–50%. That's fine. The cost of preserving code against architectural constraints it doesn't fit is higher than the cost of rewriting it right.
+
+## Design-first policy (Phase 0)
+
+Architectural decisions compound. A wrong choice in the concurrency model, storage pool layout, or namespace structure becomes irrevocable once thousands of lines of code depend on it. **Phase 0 — active as of 2026-04-19 — pauses implementation of new features until major architectural decisions are specified in writing.**
+
+Phase 0 outputs (all go into `docs/` — written, reviewed, versioned):
+
+- `docs/VISION.md` — target workloads, scale targets, property ranking (perf / reliability / security / concurrency / portability). Identifies the non-goals.
+- `docs/COMPARISON.md` — feature matrix vs ZFS, btrfs, bcachefs. Three columns: match, lead, deliberately-not-doing. Annotated with *why* for each.
+- `docs/NOVEL.md` — the committed novel angles from the mission list. For each: concrete scope, what "done" looks like, dependencies on other decisions.
+- `docs/ARCHITECTURE.md` — the foundational decisions:
+    - Concurrency model (MVCC + lock-free readers / fine-grained writer locks / something else)
+    - Storage pool model (device roster, redundancy domains, nonce construction under multi-device)
+    - Namespace model (subvolumes, datasets, property inheritance, per-dataset encryption keys)
+    - Allocator model (tree-embedded vs side channel; relation to sync)
+    - Superblock / quorum model (per-device uberblock trees, commit ordering across devices)
+    - Block-device abstraction (io_uring-native, DAX-compatible, zero-copy affordances)
+    - Integrity model (Merkle root placement, verification cadence)
+    - Crypto model (per-dataset keys, PQ wrap, key rotation, rekey)
+- `docs/ROADMAP-V2.md` — the phased plan that builds on the above. Replaces the prior SOTA roadmap.
+
+Only after `ARCHITECTURE.md` is signed off does implementation resume — likely from a mostly-fresh tree in a sibling directory (`stratum-v2/` or similar), with salvageable components ported one at a time with their own justification.
+
+**Process notes during Phase 0:**
+- Every design decision gets a written rationale. Assume we'll need to justify it in a year when the context has faded.
+- Assume every decision gets challenged. The mission is ambitious enough that "we chose X because it was easier" isn't a legitimate answer for foundational choices.
+- Design sessions produce documents, not code. No implementation pressure during Phase 0.
+- Load-bearing invariants identified during design become candidates for formal specification (TLA+ / Alloy / similar). The spec is the source of truth; code is an implementation of the spec.
+
 ## Audit-triggering changes
 
-Stratum went through 15 rounds of adversarial soundness audits (R0–R14, commits `bb39db8` → `405c4fb`) that landed ~60 corruption-class fixes. The invariants those audits established are load-bearing and non-obvious. **Any change to the surfaces below MUST spawn a focused soundness audit against the changed code before merge** — not as ceremony, but because each round has surfaced a previously-invisible bug, and the pattern is that regressions in these areas are not caught by the test suite.
+**Applies to**: any change to the current codebase during Phase 0 (e.g. bug fixes to the foundation) AND to Stratum v2 code once implementation resumes. The policy survives the redesign — the invariants are filesystem invariants, not stratum-v1 invariants.
+
+Stratum v1 went through 15 rounds of adversarial soundness audits (R0–R14, commits `bb39db8` → `405c4fb`) that landed ~60 corruption-class fixes. The invariants those audits established are load-bearing and non-obvious — many will carry forward to v2. **Any change to the surfaces below MUST spawn a focused soundness audit against the changed code before merge** — not as ceremony, but because each round has surfaced a previously-invisible bug, and the pattern is that regressions in these areas are not caught by the test suite.
 
 **Trigger list** — changes to any of these require an audit round:
 
