@@ -1,6 +1,6 @@
 # Stratum — The Definitive Technical Reference
 
-**Version**: repository state at commit `0d674ee` (SOTA #1 FUSE backend), updated through the R0–R14 soundness audit loop and the Phase A–C feature work. The three-phase sync and AEAD nonce invariant machinery in §7 and §23 is load-bearing — see `CLAUDE.md` for the audit-triggering change policy.
+**Version**: repository state at commit `0d674ee` (SOTA #1 FUSE backend), updated through the R0–R14 soundness audit loop, Phase A–C feature work, SOTA #5 POSIX completion, and Phase D item #8 (AEAD AD binding — ss_version bumped to 2). The three-phase sync and AEAD nonce invariant machinery in §7 and §23 is load-bearing — see `CLAUDE.md` for the audit-triggering change policy.
 **Scope**: This document describes every user-visible behavior, every on-disk structure, every algorithm, and every known quirk of the Stratum filesystem. It is written to be exhaustive: a future engineer should be able to reimplement Stratum from scratch using only this document, or debug any concrete issue without reading the source.
 
 ---
@@ -149,7 +149,7 @@ Block addresses in `stm_bptr::bp_paddr` are **byte offsets**. `paddr / STM_BLOCK
 Offset Size   Field                     Notes
 ──────  ────   ────────────────────     ──────────────────────────
 0       8      le64    ss_magic          = STM_MAGIC
-8       4      le32    ss_version        currently 1
+8       4      le32    ss_version        currently 2 (Phase D AEAD AD binding)
 12      4      le32    ss_flags          unused (0)
 16      8      le64    ss_gen            monotonic per-sync
 24      57     stm_bptr ss_root          root of main Bε-tree
@@ -374,7 +374,7 @@ An earlier version freed old blocks using the NEW node's compressed size — wro
 
 ### 7.1 Ping-pong superblocks
 
-Two SB slots at block 0 and block 1. On mount, both are read, csum-verified, version-checked (only v1 accepted; non-v1 deterministically loses the tiebreak even at higher gen), and the higher-`ss_gen` valid slot wins. See §23 for the full mount selection policy.
+Two SB slots at block 0 and block 1. On mount, both are read, csum-verified, version-checked (only v2 accepted; non-v2 deterministically loses the tiebreak even at higher gen), and the higher-`ss_gen` valid slot wins. See §23 for the full mount selection policy.
 
 ### 7.2 The generation invariant
 
@@ -960,6 +960,33 @@ Enforced at:
 
 Depends on the generation invariant below.
 
+### 22.1.1 AEAD associated data (ss_version ≥ 2)
+
+**Invariant**: every ciphertext is produced with a context-specific AD struct bound into its tag. Extents bind `(magic=EXTD, version=1, ino, offset)`; btree nodes bind `(magic=BTND, version=1, tree_id)`. Decrypt MUST pass byte-identical AD, or AEAD fails.
+
+Enforced at:
+- `src/crypto/crypto.c::stm_crypto_{encrypt,decrypt}` — AD threaded into `crypto_aead_xchacha20poly1305_ietf_{encrypt,decrypt}`.
+- `src/fs/fs.c::extent_write_data` / `extent_read_data` construct `stm_ad_extent` from `(ino, offset)` at every call site. `stm_fs_truncate`'s straddle RMW passes `(ino, align)` because that's the extent key.
+- `src/btree/btree.c::stm_btree_{read,write}_node` construct `stm_ad_node` from `tree->tree_id`. `tree_id` is set on tree creation by `stm_btree_set_id` (main-format path) or `stm_fs_configure_tree` (every mount / snap / rollback path; snapshot subtrees walked via the main tree inherit `STM_TREE_ID_MAIN`).
+- `src/cmd/check.c::probe_bptr` and `walk_ctx.tree_id` — set to MAIN / SNAP / MAIN-for-saved-subtrees around each walk phase.
+- `src/cmd/scrub.c::visit_entry` passes `(kc.ino, kc.offset)` through `extent_read_data`.
+
+Why: paddr+gen uniqueness alone doesn't stop an attacker with raw-disk write access from copying an extent's ciphertext to a different `(ino, offset)` btree key (the key is stored in a separately-encrypted btree node, but an attacker with key material could produce both swaps; more realistically, an attacker without the DEK can still tamper at the btree-value level if AD is absent — AEAD accepts the cipher as long as paddr+gen match, oblivious to location). Binding the location into AD fails AEAD the instant the read-side AD disagrees.
+
+Without this, extent-swap / cross-tree node-swap go undetected by the crypto layer; only downstream sanity checks would catch them, and most plausibly mis-associated data reads succeed with wrong content. Rejected at mount: any `ss_version != 2` SB is refused with `-ENOTSUP`; see regression `test_fs_rejects_ss_version_1`.
+
+### 22.1.2 Tree identity binding
+
+**Invariant**: every `struct stm_btree` has a `tree_id` set at configure time (`STM_TREE_ID_MAIN` = 1 for main tree, `STM_TREE_ID_SNAP` = 2 for snap tree, `STM_TREE_ID_NONE` = 0 for unscoped unit-test trees). Every node encrypt/decrypt binds that id into AD. Tests that open a btree without `stm_fs_configure_tree` get id=0 (unscoped) — fine because those tests don't encrypt.
+
+Enforced at:
+- `include/stratum/btree.h` declares `stm_btree_set_id`.
+- `src/fs/fs.c::stm_fs_create` (format path) calls `stm_btree_set_id(tree, STM_TREE_ID_MAIN)` before first write.
+- `src/fs/fs_internal.h::stm_fs_configure_tree` takes a `tree_id` parameter and calls `stm_btree_set_id` first — before `stm_btree_set_crypto`, so the id is in place before any encrypted write can occur.
+- All call sites (mount main, mount snap, ensure_snap_tree, rollback reopen, rollback failure-path reopen) pass an explicit id.
+
+Without this, a node written under tree_id=MAIN and later referenced (via parent bptr rewrite) by code that reads it under tree_id=SNAP (or vice versa) would fail AEAD — catching the attack cryptographically. The tree_id is itself not secret (anyone can guess 1 or 2), but it's an invariant that the code at write and read agrees on; any refactor that changes which tree wrote a node MUST propagate the matching tree_id to the reader.
+
 ### 22.2 Generation invariant
 
 **Invariant**: at every observable on-disk state, `max(valid SB ss_gen) > fs->gen`. The strict inequality must hold across: mount → first write, every inter-sync window, every sync phase transition, every crash boundary, every rollback.
@@ -1013,11 +1040,11 @@ Without this, `stm_snap_rollback` failure paths leave `fs->tree = NULL` and the 
 
 ### 22.8 Superblock tiebreak
 
-**Invariant**: mount picks the highest-gen valid SB whose `ss_version == 1`. If only one slot is v1, it wins regardless of gen. If neither is v1, mount fails with `-ENOTSUP`.
+**Invariant**: mount picks the highest-gen valid SB whose `ss_version == 2`. If only one slot is v2, it wins regardless of gen. If neither is v2, mount fails with `-ENOTSUP`. (As of Phase D, v2 is current; v1 volumes — no AEAD AD binding — must be recreated.)
 
 Enforced at: `src/fs/fs.c::stm_fs_open_impl` SB selection block.
 
-Without this, an adversarial one-byte write (`ss_version = 2` + recomputed xxHash + bumped gen) wedges mount for a volume whose other slot is still legitimate.
+Without this, an adversarial one-byte write (`ss_version = 3` + recomputed xxHash + bumped gen) wedges mount for a volume whose other slot is still legitimate.
 
 ### 22.9 9P wire validation
 

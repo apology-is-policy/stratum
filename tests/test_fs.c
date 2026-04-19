@@ -1,8 +1,12 @@
 #include "test_main.h"
 #include "stratum/fs.h"
+#include "stratum/super.h"
+#include "stratum/csum.h"
 
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 static const char *img = "/tmp/stratum_test_fs.img";
 static void cleanup(void) { unlink(img); }
@@ -1213,6 +1217,41 @@ STM_TEST(test_fs_posix_hardlinks)
     unlink(path);
 }
 
+/* Phase D #8 regression: mounting an ss_version=1 volume must fail cleanly
+ * with -ENOTSUP (rather than silently mis-decrypting or crashing). We
+ * construct a plausible v1 volume by downgrading a freshly-created v2
+ * volume's SB version field and refreshing the SB csum. Because v1
+ * nodes were written with empty AD and this build expects the v2 AD
+ * on decrypt, even if mount didn't check the version the first btree
+ * read would fail AEAD — but the version check is the first-line
+ * defense and is what this test pins. */
+STM_TEST(test_fs_rejects_ss_version_1)
+{
+    const char *path = "/tmp/stratum_test_v1_reject.img";
+    unlink(path);
+    STM_ASSERT_EQ(stm_fs_create(path, 32ULL*1024*1024, NULL), 0);
+
+    for (int slot = 0; slot < 2; slot++) {
+        int fd = open(path, O_RDWR);
+        STM_ASSERT(fd >= 0);
+        off_t off = slot == 0 ? 0 : 4096;
+        struct stm_superblock sb;
+        STM_ASSERT_EQ((int)pread(fd, &sb, sizeof(sb), off), (int)sizeof(sb));
+        sb.ss_version = cpu_to_le32(1);
+        memset(sb.ss_csum, 0, sizeof(sb.ss_csum));
+        stm_csum_compute(&sb, sizeof(sb), sb.ss_csum);
+        STM_ASSERT_EQ((int)pwrite(fd, &sb, sizeof(sb), off), (int)sizeof(sb));
+        close(fd);
+    }
+
+    struct stm_fs *fs = NULL;
+    int rc = stm_fs_open(path, NULL, &fs);
+    STM_ASSERT_EQ(rc, -ENOTSUP);
+    STM_ASSERT(fs == NULL);
+
+    unlink(path);
+}
+
 int main(void)
 {
     STM_SUITE("fs");
@@ -1237,6 +1276,7 @@ int main(void)
     STM_RUN(test_fs_posix_rename);
     STM_RUN(test_fs_posix_xattr);
     STM_RUN(test_fs_posix_hardlinks);
+    STM_RUN(test_fs_rejects_ss_version_1);
     printf("all passed\n");
     return 0;
 }

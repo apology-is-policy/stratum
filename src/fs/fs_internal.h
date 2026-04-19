@@ -113,20 +113,25 @@ static inline uint64_t stm_fnv1a(const char *data, size_t len)
     return h;
 }
 
-/* Configure compression + crypto on a btree from fs state. Returns
- * non-zero on failure (stm_crypto_init OOM) — callers MUST propagate,
- * otherwise the tree is left without a crypto context and subsequent
- * writes go out as plaintext on what the user considers an encrypted
- * volume. That plaintext persists to disk, breaks the AEAD invariant
- * on next mount (decrypt of plaintext as ciphertext fails), and worst
- * case exposes the data to any reader of the raw device. */
+/* Configure compression + crypto + tree identity on a btree from fs state.
+ * `tree_id` (STM_TREE_ID_*) is bound into the AEAD AD for node writes so a
+ * ciphertext written under one tree can't be smuggled into another at the
+ * same (paddr, write_gen) nonce. Returns non-zero on failure
+ * (stm_crypto_init OOM) — callers MUST propagate, otherwise the tree is
+ * left without a crypto context and subsequent writes go out as plaintext
+ * on what the user considers an encrypted volume. That plaintext persists
+ * to disk, breaks the AEAD invariant on next mount (decrypt of plaintext
+ * as ciphertext fails), and worst case exposes the data to any reader of
+ * the raw device. */
 static inline int stm_fs_configure_tree(struct stm_fs *fs,
-                                        struct stm_btree *t)
+                                        struct stm_btree *t,
+                                        uint32_t tree_id)
 {
+    stm_btree_set_id(t, tree_id);
 #ifdef STM_HAVE_LZ4
     stm_btree_set_compression(t, STM_COMP_LZ4);
 #else
-    (void)fs; (void)t;
+    (void)fs;
 #endif
     if (fs->encrypted) {
         struct stm_crypto *ctx = NULL;
@@ -149,8 +154,11 @@ int stm_fs_gen_bump_disk(struct stm_fs *fs);
 
 /* Read + decrypt + decompress an extent into buf (>= STM_EXTENT_SIZE bytes).
  * Exposed for the scrub CLI so it can force AEAD tag verification on every
- * extent. Returns 0 on success, -EIO on csum/AEAD/bounds failure. */
+ * extent. (ino, ext_off) bind into the AEAD AD (ss_version>=2); callers
+ * must pass the same values used at write. Returns 0 on success, -EIO on
+ * csum/AEAD/bounds failure. */
 int extent_read_data(struct stm_fs *fs, const struct stm_extent *ext,
+                     uint64_t ino, uint64_t ext_off,
                      void *buf, uint32_t buf_len);
 
 #endif /* STM_FS_INTERNAL_H */

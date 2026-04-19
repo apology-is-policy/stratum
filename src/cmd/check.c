@@ -125,6 +125,7 @@ static const char *probe_status_name(enum probe_status s)
 
 static enum probe_status probe_bptr(struct stm_block_dev *dev,
                                     struct stm_crypto *crypto,
+                                    uint32_t tree_id,
                                     uint64_t dev_blocks,
                                     const struct stm_bptr *bptr,
                                     struct stm_node **out_node)
@@ -159,7 +160,14 @@ static enum probe_status probe_bptr(struct stm_block_dev *dev,
         if (!dec) { free(raw); return PROBE_READ_FAIL; }
         uint32_t plen = 0;
         uint64_t write_gen = le64_to_cpu(bptr->bp_write_gen);
+        struct stm_ad_node ad = {
+            .ad_magic    = cpu_to_le32(STM_AD_MAGIC_NODE),
+            .ad_version  = cpu_to_le32(1),
+            .ad_tree_id  = cpu_to_le32(tree_id),
+            .ad_reserved = cpu_to_le32(0),
+        };
         int rc = stm_crypto_decrypt(crypto, paddr, write_gen,
+                                    &ad, sizeof(ad),
                                     raw, csize, dec, &plen);
         free(raw);
         if (rc != 0) { free(dec); return PROBE_DECRYPT_FAIL; }
@@ -216,6 +224,8 @@ struct walk_ctx {
     int verbose;
     /* filename for reporting */
     const char *tree_label;
+    /* AEAD AD context — matches the encrypting tree's stm_btree_set_id. */
+    uint32_t tree_id;
 };
 
 static void ref_add(struct walk_ctx *w, uint64_t block, uint32_t count)
@@ -324,8 +334,8 @@ static void walk_node_rec(struct walk_ctx *w,
     if (stm_bptr_is_null(bptr)) return;
 
     struct stm_node *n = NULL;
-    enum probe_status st = probe_bptr(w->dev, w->crypto, w->dev_blocks,
-                                      bptr, &n);
+    enum probe_status st = probe_bptr(w->dev, w->crypto, w->tree_id,
+                                      w->dev_blocks, bptr, &n);
     if (st != PROBE_OK) {
         report_probe_failure(w, bptr, st, expected_level);
         return;
@@ -502,14 +512,20 @@ static int snap_scan_cb(const struct stm_key *key, const void *val,
            (unsigned long long)le64_to_cpu(snap.ssp_root.bp_paddr),
            name);
 
-    /* Walk this snapshot's tree for additional diagnostics. */
+    /* Walk this snapshot's tree for additional diagnostics. Snapshot
+     * subtrees are frozen main-tree roots — their nodes were written
+     * with tree_id = MAIN, so swap the AEAD AD context before descent
+     * and restore after. */
     char lbl[64];
     snprintf(lbl, sizeof(lbl), "snap#%llu",
              (unsigned long long)le64_to_cpu(snap.ssp_id));
     const char *old_label = s->w->tree_label;
+    uint32_t old_tree_id  = s->w->tree_id;
     s->w->tree_label = lbl;
+    s->w->tree_id    = STM_TREE_ID_MAIN;
     walk_node_rec(s->w, &snap.ssp_root, le16_to_cpu(snap.ssp_tree_height));
     s->w->tree_label = old_label;
+    s->w->tree_id    = old_tree_id;
     return 0;
 }
 
@@ -756,6 +772,7 @@ int stm_cmd_check(int argc, char **argv)
     /* ── Phase 3: walk main tree ───────────────────────────────────── */
     printf("\n── Main tree ─────────────────────────────────────\n");
     ctx.tree_label = "main";
+    ctx.tree_id    = STM_TREE_ID_MAIN;
     struct stm_bptr main_root = stm_btree_root(fs->tree);
     if (stm_bptr_is_null(&main_root)) {
         printf("  (main tree root is null — empty or newly created)\n");
@@ -797,6 +814,7 @@ int stm_cmd_check(int argc, char **argv)
         printf("  (no snapshot tree)\n");
     } else {
         ctx.tree_label = "snap_tree";
+        ctx.tree_id    = STM_TREE_ID_SNAP;
         struct stm_bptr snap_root = stm_btree_root(fs->snap_tree);
         walk_node_rec(&ctx, &snap_root, stm_btree_height(fs->snap_tree));
         printf("  nodes: %llu (%s)\n",

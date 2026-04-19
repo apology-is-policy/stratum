@@ -110,7 +110,7 @@ static int ensure_snap_tree(struct stm_fs *fs)
     rc = stm_btree_open(&fs->dev, stm_bptr_null(), 0, &fs->snap_tree);
     if (rc) return rc;
     stm_btree_set_alloc(fs->snap_tree, stm_btree_next_alloc(fs->tree));
-    rc = stm_fs_configure_tree(fs, fs->snap_tree);
+    rc = stm_fs_configure_tree(fs, fs->snap_tree, STM_TREE_ID_SNAP);
     if (rc) {
         /* Without crypto wired up, the snap tree would write plaintext
          * on an encrypted volume — refuse cleanly instead. */
@@ -414,7 +414,7 @@ int stm_snap_rollback(struct stm_fs *fs, uint64_t snap_id)
     stm_btree_set_alloc(fs->tree,
         fs->snap_tree ? stm_btree_next_alloc(fs->snap_tree)
                       : stm_btree_next_alloc(fs->tree));
-    rc = stm_fs_configure_tree(fs, fs->tree);
+    rc = stm_fs_configure_tree(fs, fs->tree, STM_TREE_ID_MAIN);
     if (rc) {
         stm_btree_close(fs->tree);
         fs->tree = NULL;
@@ -435,7 +435,7 @@ reopen_original:
              * PLAINTEXT to disk on what the user considers an encrypted
              * volume. Close the tree and fail hard; fs->wedged = 1
              * ensures no future op touches the invalid state. */
-            int rc3 = stm_fs_configure_tree(fs, fs->tree);
+            int rc3 = stm_fs_configure_tree(fs, fs->tree, STM_TREE_ID_MAIN);
             if (rc3) {
                 stm_btree_close(fs->tree);
                 fs->tree = NULL;
@@ -552,7 +552,7 @@ after_reopen:
         {
             int rc2 = stm_btree_open(&fs->dev, orig_root, orig_height, &fs->tree);
             if (rc2 == 0) {
-                int rc3 = stm_fs_configure_tree(fs, fs->tree);
+                int rc3 = stm_fs_configure_tree(fs, fs->tree, STM_TREE_ID_MAIN);
                 if (rc3) {
                     stm_btree_close(fs->tree);
                     fs->tree = NULL;

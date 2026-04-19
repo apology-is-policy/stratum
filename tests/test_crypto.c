@@ -27,31 +27,55 @@ STM_TEST(test_crypto_roundtrip)
 
     for (i = 0; i < 128; i++) plain[i] = (uint8_t)i;
 
-    rc = stm_crypto_encrypt(ctx, 42, 7, plain, 128, cipher, &clen);
+    rc = stm_crypto_encrypt(ctx, 42, 7, NULL, 0,
+                            plain, 128, cipher, &clen);
     STM_ASSERT_EQ(rc, 0);
     STM_ASSERT_EQ(clen, 128u + STM_CRYPTO_TAG_LEN);
 
-    rc = stm_crypto_decrypt(ctx, 42, 7, cipher, clen, back, &plen);
+    rc = stm_crypto_decrypt(ctx, 42, 7, NULL, 0, cipher, clen, back, &plen);
     STM_ASSERT_EQ(rc, 0);
     STM_ASSERT_EQ(plen, 128u);
     STM_ASSERT_MEM_EQ(plain, back, 128);
 
     /* wrong paddr should fail */
-    rc = stm_crypto_decrypt(ctx, 99, 7, cipher, clen, back, &plen);
+    rc = stm_crypto_decrypt(ctx, 99, 7, NULL, 0, cipher, clen, back, &plen);
     STM_ASSERT_EQ(rc, -EIO);
 
     /* wrong write_gen should fail */
-    rc = stm_crypto_decrypt(ctx, 42, 8, cipher, clen, back, &plen);
+    rc = stm_crypto_decrypt(ctx, 42, 8, NULL, 0, cipher, clen, back, &plen);
     STM_ASSERT_EQ(rc, -EIO);
 
     /* different write_gen at same paddr must yield different ciphertext
      * (this is the whole reason write_gen is in the nonce) */
     uint8_t cipher2[128 + STM_CRYPTO_TAG_LEN];
     uint32_t clen2;
-    rc = stm_crypto_encrypt(ctx, 42, 8, plain, 128, cipher2, &clen2);
+    rc = stm_crypto_encrypt(ctx, 42, 8, NULL, 0,
+                            plain, 128, cipher2, &clen2);
     STM_ASSERT_EQ(rc, 0);
     STM_ASSERT_EQ(clen, clen2);
     STM_ASSERT(memcmp(cipher, cipher2, clen) != 0);
+
+    /* AD binding: same (key, paddr, gen) but different AD → different
+     * ciphertext tags, and decrypt with mismatched AD must fail. */
+    uint8_t ad1[] = "ctx-alpha";
+    uint8_t ad2[] = "ctx-beta";
+    uint8_t cipher3[128 + STM_CRYPTO_TAG_LEN];
+    uint8_t cipher4[128 + STM_CRYPTO_TAG_LEN];
+    uint32_t clen3, clen4;
+    rc = stm_crypto_encrypt(ctx, 1000, 1, ad1, sizeof(ad1) - 1,
+                            plain, 128, cipher3, &clen3);
+    STM_ASSERT_EQ(rc, 0);
+    rc = stm_crypto_encrypt(ctx, 1000, 1, ad2, sizeof(ad2) - 1,
+                            plain, 128, cipher4, &clen4);
+    STM_ASSERT_EQ(rc, 0);
+    STM_ASSERT(memcmp(cipher3, cipher4, clen3) != 0);  /* tags differ */
+    rc = stm_crypto_decrypt(ctx, 1000, 1, ad2, sizeof(ad2) - 1,
+                            cipher3, clen3, back, &plen);
+    STM_ASSERT_EQ(rc, -EIO);  /* wrong AD fails */
+    rc = stm_crypto_decrypt(ctx, 1000, 1, ad1, sizeof(ad1) - 1,
+                            cipher3, clen3, back, &plen);
+    STM_ASSERT_EQ(rc, 0);
+    STM_ASSERT_MEM_EQ(plain, back, 128);
 
     stm_crypto_free(ctx);
 #endif

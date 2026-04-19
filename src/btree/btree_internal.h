@@ -74,6 +74,11 @@ struct stm_btree {
                              * can't be encrypted twice under the same
                              * (key, nonce) even when COW reclaims paddrs.
                              * See #R4-1 commit message. */
+    uint32_t tree_id;       /* STM_TREE_ID_* — bound into node AEAD AD so a
+                             * node from one tree can't be smuggled into a
+                             * different tree at the same (paddr, write_gen).
+                             * 0 = unscoped (tests). Set by the fs layer via
+                             * stm_btree_set_id after open. */
     struct stm_node_cache *node_cache;  /* NULL = no cache (bypass); populated
                                          * by stm_btree_open. See cache.c. */
 };

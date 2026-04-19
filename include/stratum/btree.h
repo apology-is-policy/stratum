@@ -66,4 +66,10 @@ int stm_btree_walk_entries(struct stm_btree *tree, struct stm_bptr root,
 /* Access the tree's crypto context (NULL if unencrypted). */
 struct stm_crypto *stm_btree_get_crypto(struct stm_btree *tree);
 
+/* Set the tree identity — bound into node AEAD AD so a ciphertext written
+ * under (paddr, write_gen) for one tree can't be swapped onto a different
+ * tree that happens to share the same DEK. Pass STM_TREE_ID_MAIN /
+ * _SNAP / _SAVED from crypto.h. Must be called once, before any write. */
+void stm_btree_set_id(struct stm_btree *tree, uint32_t tree_id);
+
 #endif /* STM_BTREE_H */

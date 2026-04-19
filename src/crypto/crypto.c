@@ -51,6 +51,7 @@ static void build_nonce(uint8_t nonce[STM_CRYPTO_NONCE_LEN],
 
 int stm_crypto_encrypt(struct stm_crypto *ctx,
                        uint64_t block_addr, uint64_t write_gen,
+                       const void *ad, uint32_t ad_len,
                        const void *plain, uint32_t plain_len,
                        void *cipher, uint32_t *cipher_len)
 {
@@ -60,7 +61,7 @@ int stm_crypto_encrypt(struct stm_crypto *ctx,
 
     if (crypto_aead_xchacha20poly1305_ietf_encrypt(
             cipher, &clen, plain, plain_len,
-            NULL, 0, NULL, nonce, ctx->key) != 0)
+            ad, ad_len, NULL, nonce, ctx->key) != 0)
         return -EIO;
 
     *cipher_len = (uint32_t)clen;
@@ -69,6 +70,7 @@ int stm_crypto_encrypt(struct stm_crypto *ctx,
 
 int stm_crypto_decrypt(struct stm_crypto *ctx,
                        uint64_t block_addr, uint64_t write_gen,
+                       const void *ad, uint32_t ad_len,
                        const void *cipher, uint32_t cipher_len,
                        void *plain, uint32_t *plain_len)
 {
@@ -78,7 +80,7 @@ int stm_crypto_decrypt(struct stm_crypto *ctx,
 
     if (crypto_aead_xchacha20poly1305_ietf_decrypt(
             plain, &mlen, NULL, cipher, cipher_len,
-            NULL, 0, nonce, ctx->key) != 0)
+            ad, ad_len, nonce, ctx->key) != 0)
         return -EIO;
 
     *plain_len = (uint32_t)mlen;
@@ -165,11 +167,13 @@ void stm_crypto_random(void *buf, size_t len)
 int  stm_crypto_init(const uint8_t *key, struct stm_crypto **ctx)
     { (void)key; *ctx = NULL; return -ENOTSUP; }
 int  stm_crypto_encrypt(struct stm_crypto *ctx, uint64_t a, uint64_t g,
+                        const void *ad, uint32_t adl,
                         const void *p, uint32_t pl, void *c, uint32_t *cl)
-    { (void)ctx;(void)a;(void)g;(void)p;(void)pl;(void)c;(void)cl; return -ENOTSUP; }
+    { (void)ctx;(void)a;(void)g;(void)ad;(void)adl;(void)p;(void)pl;(void)c;(void)cl; return -ENOTSUP; }
 int  stm_crypto_decrypt(struct stm_crypto *ctx, uint64_t a, uint64_t g,
+                        const void *ad, uint32_t adl,
                         const void *c, uint32_t cl, void *p, uint32_t *pl)
-    { (void)ctx;(void)a;(void)g;(void)c;(void)cl;(void)p;(void)pl; return -ENOTSUP; }
+    { (void)ctx;(void)a;(void)g;(void)ad;(void)adl;(void)c;(void)cl;(void)p;(void)pl; return -ENOTSUP; }
 void stm_crypto_free(struct stm_crypto *ctx) { (void)ctx; }
 int  stm_crypto_derive_key(const char *p, size_t l,
                            const uint8_t *s, uint8_t *k)

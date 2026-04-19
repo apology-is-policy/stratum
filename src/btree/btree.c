@@ -2,6 +2,18 @@
 #include "stratum/compress.h"
 #include "stratum/csum.h"
 
+/* Build the AEAD associated-data struct for a btree node. Binds the
+ * node to its tree identity so an attacker who rewrites a parent bptr
+ * to point at a node that lives in a different tree (same DEK, same
+ * {paddr, write_gen} as far as the nonce is concerned) fails AEAD. */
+static void build_node_ad(struct stm_ad_node *ad, uint32_t tree_id)
+{
+    ad->ad_magic    = cpu_to_le32(STM_AD_MAGIC_NODE);
+    ad->ad_version  = cpu_to_le32(1);
+    ad->ad_tree_id  = cpu_to_le32(tree_id);
+    ad->ad_reserved = cpu_to_le32(0);
+}
+
 /* ── block I/O helpers ──────────────────────────────────────────────── */
 
 int stm_btree_alloc(struct stm_btree *tree, uint32_t size, uint64_t *out)
@@ -63,11 +75,14 @@ int stm_btree_read_node(struct stm_btree *tree, struct stm_bptr *bptr,
     data_len = disk_size;
     if (tree->crypto) {
         uint32_t plain_len;
+        struct stm_ad_node ad;
+        build_node_ad(&ad, tree->tree_id);
         decrypted = malloc(disk_size);
         if (!decrypted) { free(raw); return -ENOMEM; }
         rc = stm_crypto_decrypt(tree->crypto,
                                 le64_to_cpu(bptr->bp_paddr),
                                 le64_to_cpu(bptr->bp_write_gen),
+                                &ad, sizeof(ad),
                                 raw, disk_size, decrypted, &plain_len);
         free(raw);
         if (rc) { free(decrypted); return rc; }
@@ -170,7 +185,10 @@ int stm_btree_write_node(struct stm_btree *tree, struct stm_node *n,
              * #R4-1 commit message. tree->write_gen is advanced by
              * every public entry point (insert/delete/flush) before any
              * write path can run. */
+            struct stm_ad_node ad;
+            build_node_ad(&ad, tree->tree_id);
             rc = stm_crypto_encrypt(tree->crypto, addr, tree->write_gen,
+                                    &ad, sizeof(ad),
                                     write_buf, write_len, enc_buf, &clen);
             free(comp_buf); free(buf);
             if (rc) { free(enc_buf); goto fail_free_alloc; }
@@ -259,6 +277,11 @@ int stm_btree_open(struct stm_block_dev *dev, struct stm_bptr root,
 struct stm_bptr stm_btree_root(struct stm_btree *tree)
 {
     return tree->root_bptr;
+}
+
+void stm_btree_set_id(struct stm_btree *tree, uint32_t tree_id)
+{
+    tree->tree_id = tree_id;
 }
 
 uint16_t stm_btree_height(struct stm_btree *tree)

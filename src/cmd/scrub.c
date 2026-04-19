@@ -99,7 +99,8 @@ static int visit_entry(const struct stm_key *key, const void *val,
     struct stm_extent ext;
     memcpy(&ext, val, sizeof(ext));
 
-    int rc = extent_read_data(c->fs, &ext, c->buf, STM_EXTENT_SIZE);
+    int rc = extent_read_data(c->fs, &ext, kc.ino, kc.offset,
+                              c->buf, STM_EXTENT_SIZE);
     c->extents++;
     if (rc == 0) {
         /* extent_read_data returns the logical (dlen) length on success;

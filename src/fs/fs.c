@@ -2,6 +2,7 @@
 #include "stratum/csum.h"
 #include "stratum/compress.h"
 
+#include <stdio.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -276,6 +277,8 @@ int stm_fs_create_ex(const char *path, uint64_t size_bytes,
     rc = stm_btree_open(&dev, null_root, 0, &tree);
     if (rc) goto fail_dev;
 
+    stm_btree_set_id(tree, STM_TREE_ID_MAIN);
+
 #ifdef STM_HAVE_LZ4
     stm_btree_set_compression(tree, STM_COMP_LZ4);
 #endif
@@ -345,7 +348,7 @@ int stm_fs_create_ex(const char *path, uint64_t size_bytes,
 
     /* build superblock (sb was zeroed above, enc fields already set) */
     sb.ss_magic        = cpu_to_le64(STM_MAGIC);
-    sb.ss_version      = cpu_to_le32(1);
+    sb.ss_version      = cpu_to_le32(2);
     sb.ss_gen          = cpu_to_le64(1);
     sb.ss_root         = stm_btree_root(tree);
     sb.ss_snap_root    = stm_bptr_null();
@@ -447,17 +450,16 @@ static int stm_fs_open_impl(const char *path, const char *passphrase,
          * the higher-gen one has an unsupported ss_version, the lower-
          * gen slot may still be recoverable — an attacker with raw disk
          * access could tamper one slot to a bogus version with a higher
-         * gen specifically to DoS mount. Try the version-1 slot if the
-         * preferred one isn't v1. */
+         * gen specifically to DoS mount. Prefer the v2 slot. */
         if (a_ok && b_ok) {
-            int a_v1 = (le32_to_cpu(sa.ss_version) == 1);
-            int b_v1 = (le32_to_cpu(sb.ss_version) == 1);
-            if (a_v1 && b_v1)
+            int a_v2 = (le32_to_cpu(sa.ss_version) == 2);
+            int b_v2 = (le32_to_cpu(sb.ss_version) == 2);
+            if (a_v2 && b_v2)
                 chosen = (le64_to_cpu(sa.ss_gen) >= le64_to_cpu(sb.ss_gen))
                        ? (fs->sb_slot = 0, &sa) : (fs->sb_slot = 1, &sb);
-            else if (a_v1)
+            else if (a_v2)
                 chosen = (fs->sb_slot = 0, &sa);
-            else if (b_v1)
+            else if (b_v2)
                 chosen = (fs->sb_slot = 1, &sb);
             else { stm_block_close(&fs->dev); free(fs); return -ENOTSUP; }
         } else {
@@ -465,13 +467,16 @@ static int stm_fs_open_impl(const char *path, const char *passphrase,
         }
     }
 
-    /* R9-4: reject on-disk format versions we don't understand. Without
-     * this, a future v2 volume or a tampered SB claiming v2 would be
-     * mounted and on-disk fields would be reinterpreted under the wrong
-     * layout. Symmetric to the ss_comp_algo compile-time-codec reject.
-     * After R10-6, we only reach here if BOTH slots are !v1 (or the
-     * single-valid slot is !v1); either way ENOTSUP is correct. */
-    if (le32_to_cpu(chosen->ss_version) != 1) {
+    /* R9-4: reject on-disk format versions we don't understand. v2
+     * introduced AEAD associated-data binding (Phase D) on extents +
+     * nodes — a v1 volume has ciphertexts produced with empty AD, which
+     * would fail AEAD decrypt under the v2 code path. We refuse rather
+     * than silently mis-decrypt. Recreate the volume with mkfs to get v2. */
+    if (le32_to_cpu(chosen->ss_version) != 2) {
+        fprintf(stderr,
+                "stratum: volume is ss_version=%u; this build requires v2 "
+                "(AEAD AD binding). Recreate the volume with stratum mkfs.\n",
+                le32_to_cpu(chosen->ss_version));
         stm_block_close(&fs->dev); free(fs); return -ENOTSUP;
     }
 
@@ -546,7 +551,7 @@ static int stm_fs_open_impl(const char *path, const char *passphrase,
         stm_block_close(&fs->dev); free(fs); return rc;
     }
     stm_btree_set_alloc(fs->tree, le64_to_cpu(chosen->ss_alloc_next));
-    rc = stm_fs_configure_tree(fs, fs->tree);
+    rc = stm_fs_configure_tree(fs, fs->tree, STM_TREE_ID_MAIN);
     if (rc) {
         memset(fs->dek, 0, sizeof(fs->dek));
         stm_btree_close(fs->tree); stm_block_close(&fs->dev); free(fs); return rc;
@@ -561,7 +566,7 @@ static int stm_fs_open_impl(const char *path, const char *passphrase,
             stm_btree_close(fs->tree); stm_block_close(&fs->dev); free(fs); return rc;
         }
         stm_btree_set_alloc(fs->snap_tree, le64_to_cpu(chosen->ss_alloc_next));
-        rc = stm_fs_configure_tree(fs, fs->snap_tree);
+        rc = stm_fs_configure_tree(fs, fs->snap_tree, STM_TREE_ID_SNAP);
         if (rc) {
             memset(fs->dek, 0, sizeof(fs->dek));
             stm_btree_close(fs->snap_tree); stm_btree_close(fs->tree);
@@ -716,7 +721,7 @@ static void build_sb(struct stm_fs *fs, struct stm_superblock *sb,
 {
     memset(sb, 0, sizeof(*sb));
     sb->ss_magic        = cpu_to_le64(STM_MAGIC);
-    sb->ss_version      = cpu_to_le32(1);
+    sb->ss_version      = cpu_to_le32(2);
     sb->ss_gen          = cpu_to_le64(gen);
     sb->ss_root         = root;
     sb->ss_snap_root    = snap_root;
@@ -998,6 +1003,20 @@ int stm_fs_create_file(struct stm_fs *fs, uint64_t parent_ino,
 
 /* ── extent helpers ─────────────────────────────────────────────────── */
 
+/* Build the AEAD associated-data struct for a file-data extent. The AD
+ * binds (inode, offset) to the ciphertext so an attacker who rewrites
+ * an extent record to point at a different ciphertext — or who copies
+ * one extent's ciphertext to a different (ino, offset) btree key —
+ * gets a tag mismatch on decrypt. */
+static void build_extent_ad(struct stm_ad_extent *ad,
+                            uint64_t ino, uint64_t offset)
+{
+    ad->ad_magic   = cpu_to_le32(STM_AD_MAGIC_EXTENT);
+    ad->ad_version = cpu_to_le32(1);
+    ad->ad_ino     = cpu_to_le64(ino);
+    ad->ad_offset  = cpu_to_le64(offset);
+}
+
 /* Write an extent with optional compression + encryption.
  *
  * Pipeline:
@@ -1007,7 +1026,8 @@ int stm_fs_create_file(struct stm_fs *fs, uint64_t parent_ino,
  * to storing uncompressed. The extent record encodes the final state
  * (clen = stored bytes pre-AEAD-tag, comp = algorithm used). */
 static int extent_write_data(struct stm_fs *fs, const void *data,
-                             uint32_t dlen, struct stm_extent *out_ext)
+                             uint32_t dlen, uint64_t ino, uint64_t ext_off,
+                             struct stm_extent *out_ext)
 {
     struct stm_crypto *crypto = stm_btree_get_crypto(fs->tree);
     uint8_t  comp = STM_COMP_NONE;
@@ -1035,8 +1055,12 @@ static int extent_write_data(struct stm_fs *fs, const void *data,
     if (rc) return rc;
 
     if (crypto) {
+        struct stm_ad_extent ad;
+        build_extent_ad(&ad, ino, ext_off);
         uint32_t enc_len;
-        rc = stm_crypto_encrypt(crypto, paddr, fs->gen, payload, clen,
+        rc = stm_crypto_encrypt(crypto, paddr, fs->gen,
+                                &ad, sizeof(ad),
+                                payload, clen,
                                 fs->cipher_buf, &enc_len);
         if (rc) goto fail_free;
         rc = stm_block_write(&fs->dev, paddr, fs->cipher_buf, enc_len);
@@ -1062,10 +1086,16 @@ fail_free:
  *
  * For uncompressed, unencrypted data we read directly into buf (no extra copy).
  *
+ * The `ino` / `ext_off` parameters bind the extent's AEAD tag to its (file,
+ * offset) location. Callers MUST pass the same values at read as were used
+ * at write; any mismatch fails decrypt with -EIO, which is the whole point
+ * (ss_version>=2 defense against extent-record swap attacks).
+ *
  * Non-static so the scrub CLI (src/cmd/scrub.c) can verify every extent's
  * AEAD tag + compress/decompress bounds by forcing a full read-back.
  * Still internal API — consumers include fs_internal.h. */
 int extent_read_data(struct stm_fs *fs, const struct stm_extent *ext,
+                     uint64_t ino, uint64_t ext_off,
                      void *buf, uint32_t buf_len)
 {
     struct stm_crypto *crypto = stm_btree_get_crypto(fs->tree);
@@ -1108,9 +1138,12 @@ int extent_read_data(struct stm_fs *fs, const struct stm_extent *ext,
         uint32_t disk_len = clen + STM_CRYPTO_TAG_LEN;
         uint32_t plain_len;
         uint64_t write_gen = le64_to_cpu(ext->se_write_gen);
+        struct stm_ad_extent ad;
+        build_extent_ad(&ad, ino, ext_off);
         rc = stm_block_read(&fs->dev, paddr, fs->cipher_buf, disk_len);
         if (rc) return rc;
         rc = stm_crypto_decrypt(crypto, paddr, write_gen,
+                                &ad, sizeof(ad),
                                 fs->cipher_buf, disk_len,
                                 payload, &plain_len);
         if (rc) return rc;
@@ -1195,7 +1228,8 @@ int stm_fs_write(struct stm_fs *fs, uint64_t ino, uint64_t offset,
             rc = stm_btree_lookup(fs->tree, &k, &old_ext, &vlen);
             if (rc == 0) {
                 had_old = 1;
-                rc = extent_read_data(fs, &old_ext, ebuf, STM_EXTENT_SIZE);
+                rc = extent_read_data(fs, &old_ext, ino, ext_off,
+                                      ebuf, STM_EXTENT_SIZE);
                 if (rc) return rc;
                 uint32_t old_dlen = le32_to_cpu(old_ext.se_dlen);
                 /* extent_read_data only populates [0..old_dlen]; the tail
@@ -1232,7 +1266,8 @@ int stm_fs_write(struct stm_fs *fs, uint64_t ino, uint64_t offset,
 
         memcpy(ebuf + inner, src, towrite);
 
-        rc = extent_write_data(fs, ebuf, extent_data_len, &new_ext);
+        rc = extent_write_data(fs, ebuf, extent_data_len,
+                               ino, ext_off, &new_ext);
         if (rc) return rc;
 
         /* Insert the new extent record BEFORE freeing the old extent's
@@ -1314,7 +1349,8 @@ int stm_fs_read(struct stm_fs *fs, uint64_t ino, uint64_t offset,
             return rc;
         } else {
             uint32_t dlen, avail, copy;
-            rc = extent_read_data(fs, &ext, fs->extent_buf, STM_EXTENT_SIZE);
+            rc = extent_read_data(fs, &ext, ino, ext_off,
+                                  fs->extent_buf, STM_EXTENT_SIZE);
             if (rc) return rc;
             dlen = le32_to_cpu(ext.se_dlen);
             avail = (dlen > inner) ? dlen - inner : 0;
@@ -1582,12 +1618,14 @@ int stm_fs_truncate(struct stm_fs *fs, uint64_t ino, uint64_t new_size)
                  * residue would otherwise leak into the new ciphertext
                  * as cross-extent plaintext on encrypted volumes. */
                 uint8_t *ebuf = fs->extent_buf;
-                rc = extent_read_data(fs, &old_ext, ebuf, STM_EXTENT_SIZE);
+                rc = extent_read_data(fs, &old_ext, ino, align,
+                                      ebuf, STM_EXTENT_SIZE);
                 if (rc) { free(uc.keys); free(uc.exts); return rc; }
                 if (inner < STM_EXTENT_SIZE)
                     memset(ebuf + inner, 0, STM_EXTENT_SIZE - inner);
                 struct stm_extent new_ext;
-                rc = extent_write_data(fs, ebuf, inner, &new_ext);
+                rc = extent_write_data(fs, ebuf, inner,
+                                       ino, align, &new_ext);
                 if (rc) { free(uc.keys); free(uc.exts); return rc; }
                 rc = stm_btree_insert(fs->tree, &sk, &new_ext,
                                       sizeof(new_ext), fs->gen);
