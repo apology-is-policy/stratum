@@ -1,0 +1,797 @@
+# Stratum v2 Roadmap
+
+**Status**: Phase 0 final deliverable, 2026-04-19. The phased implementation plan from "design is done" to "v2.0 release." Built on VISION.md, COMPARISON.md, NOVEL.md, and ARCHITECTURE.md.
+
+## 1. Purpose
+
+ROADMAP-V2.md translates Phase 0's design into a staged implementation plan. It answers:
+
+- **What do we build, in what order, and why?**
+- **What is each phase's scope, exit criteria, and deliverables?**
+- **What are the dependencies between phases?**
+- **Where does formal verification live in the plan?**
+- **Where does the audit loop apply?**
+- **What are the risk hot spots, and what's the fallback for each?**
+
+The roadmap is a commitment to an ordering, not a commitment to specific dates. Time estimates are guidance, not deadlines.
+
+## 2. Phase structure at a glance
+
+```
+Phase 0 ─ Design (DONE)
+          ├─ VISION.md
+          ├─ COMPARISON.md
+          ├─ NOVEL.md
+          ├─ ARCHITECTURE.md  (15 sections, ~5050 lines)
+          └─ ROADMAP-V2.md    (this document)
+
+Phase 1 ─ Foundations                          (~3 months)
+          Block device + crypto primitives + TLA+ environment
+
+Phase 2 ─ Tree + concurrency                   (~4 months)
+          Bw-tree-style Bε-tree + MVCC + EBR
+
+Phase 3 ─ Persistence + allocator              (~3 months)
+          Uberblock + four-phase commit + allocator + mount/unmount
+
+Phase 4 ─ Integrity + crypto integration       (~3 months)
+          Merkle + AEAD-SIV + key hierarchy + key agent
+
+Phase 5 ─ Multi-device + redundancy            (~3 months)
+          Pool layer + RS + LRC + scrub + repair
+
+Phase 6 ─ Namespaces                           (~2 months)
+          Datasets + snapshots (O(1)) + clones + dead-list
+
+Phase 7 ─ Cold tier + features                 (~3 months)
+          FastCDC + CAS tier + migration + send/recv + reflinks
+
+Phase 8 ─ Client interfaces                    (~2 months)
+          9P server + FUSE shim + CLI + /ctl/ + bindings
+
+Phase 9 ─ Hardening                            (~2 months)
+          Fuzzers, audits, benchmarks, docs
+
+Phase 10 ─ v2.0 release                        (~1 month)
+          Final audit + format freeze + tag + announce
+
+Post-v2.0 (v2.1, v2.2+)                        (ongoing)
+          Kernel driver, learned tiering, Windows, zoned storage, …
+```
+
+Total Phase 1 → Phase 10: **~26 months** from design-freeze to v2.0. Aggressive but bounded. Some phases can overlap (notes per-phase).
+
+## 3. Principles that apply throughout
+
+Before the phase-by-phase detail, six principles that inform every phase:
+
+### 3.1 Formal verification happens alongside, not at the end
+
+TLA+ specs are written *before* the corresponding code, not after. A spec forces the designer to state invariants precisely, then the implementation translates them. Writing specs after the code is a patch, not a proof.
+
+| Spec | Phase | What it proves |
+|---|---|---|
+| `sync.tla` | Phase 1 | Three-phase sync crash safety (carried from v1) |
+| `concurrency.tla` | Phase 2 | Reader snapshot consistency, non-blocking writers, EBR safety |
+| `nonce.tla` | Phase 3 | AEAD nonce uniqueness across commits and crashes |
+| `allocator.tla` | Phase 3 | Refcount invariants under MVCC |
+| `merkle.tla` | Phase 4 | Hash propagation correctness under COW |
+| `quorum.tla` | Phase 5 | Multi-device commit quorum semantics |
+| `namespace.tla` | Phase 8 | Per-connection namespace isolation |
+
+CI runs TLC on every PR that touches a specified file.
+
+### 3.2 The audit loop applies every phase
+
+Per `CLAUDE.md`'s audit-trigger policy:
+
+- Every change to concurrency, sync, crypto, or tree-write paths spawns a focused soundness audit.
+- Phase exit includes an audit pass against the phase's load-bearing surfaces.
+- Findings at P0/P1/P2 severity block phase exit.
+
+The audit loop proved itself on v1 (15 rounds, ~60 corruption-class fixes). It's a permanent part of the development cadence.
+
+### 3.3 Tests are tiered
+
+Every deliverable ships with three tiers of testing:
+
+- **Unit tests**: per-function correctness.
+- **Property-based tests**: randomized ops verifying stated invariants (inspired by ZFS's `ztest`, btrfs's `btrfs-progs` tests).
+- **Fuzzers**: long-running randomized workloads with crash injection.
+
+Property-based tests complement TLA+ specs: specs prove protocol-level properties; property tests verify implementation correctness against a reference.
+
+### 3.4 Fallback paths are designed, not discovered
+
+Every high-risk commitment has a defined fallback before implementation begins:
+
+- Lock-free Bw-tree fails → fine-grained per-node rwlocks (§3.8).
+- Succinct allocator underperforms → straightforward encoding at more RAM cost (§6.6).
+- AEGIS-256 has an implementation issue → XChaCha20-SIV as universal default.
+- io_uring on an LTS kernel without needed features → libaio compile-time opt-in.
+
+Fallbacks are compile-time flags so we can A/B-test correctness and performance.
+
+### 3.5 Performance is measured continuously
+
+Starting at Phase 2, every phase adds benchmarks:
+
+- Throughput (sequential + random, read + write).
+- Latency percentiles (p50, p99, p99.9).
+- Memory footprint.
+- CPU utilization per op.
+
+Regressions > 10% block the phase from exit. Regressions between 5% and 10% are justified in writing.
+
+Baselines: ext4 (minimum acceptable for latency), ZFS (comparable for throughput), btrfs (reference for feature-compatible workloads).
+
+### 3.6 Documentation updates are part of every PR
+
+`ARCHITECTURE.md`, section-specific design notes, user-facing docs, and code comments are updated in the same PR as code changes. "Docs lag by one commit" is a common failure mode; we don't allow it.
+
+---
+
+## 4. Phase 1: Foundations
+
+**Scope**: block device abstraction, crypto primitives, TLA+ environment, test harness, CI.
+
+Produces the substrate every subsequent phase depends on. No user-visible filesystem.
+
+### 4.1 Deliverables
+
+- **Block device library** (`src/block/`):
+  - io_uring backend (Linux ≥ 5.11 for stable features).
+  - POSIX backend (for macOS / loopback).
+  - DAX path (mmap-based; detected at device open).
+  - Fixed-buffer + registered-fd support.
+  - Capability probing + graceful degradation.
+  - Cross-platform build (Linux primary, macOS portable via POSIX backend).
+- **Crypto library** (`src/crypto/`):
+  - AEGIS-256 wrapper (via BoringSSL or libsodium + upstream SIV patches).
+  - XChaCha20-SIV wrapper (software; works without AES-NI).
+  - BLAKE3-256 via the BLAKE3 reference implementation.
+  - HKDF-SHA256.
+  - Argon2id (via libsodium).
+  - X25519 (via libsodium) + ML-KEM-768 (via liboqs) HPKE-style hybrid wrap.
+  - Test vectors for every primitive (NIST FIPS 203, RFC 9180, BLAKE3 test suite, CAESAR KAT).
+- **xxHash3-64** wrapper (carried from v1).
+- **Test harness**:
+  - Unit test framework (probably Criterion or custom minimal harness).
+  - Property-based test framework (via hypothesis-style C library or custom).
+  - Fuzzer infrastructure (AFL++, LibFuzzer).
+  - CI pipeline (GitHub Actions or similar): build on Linux + macOS, run all tests, TSAN + ASAN + UBSAN sanitizer builds.
+- **TLA+ environment**:
+  - TLC model checker installed in CI.
+  - Skeleton `sync.tla` proving the three-phase sync protocol (carried from v1).
+  - `docs/specs/SPEC-TO-CODE.md` mapping conventions.
+
+### 4.2 Exit criteria
+
+- [ ] io_uring backend submits, completes, and verifies integrity on a loopback file at ≥ 90% of direct-pread throughput.
+- [ ] AEGIS-256 + XChaCha20-SIV pass all KAT vectors.
+- [ ] ML-KEM-768 hybrid wrap pass-through test works end-to-end.
+- [ ] CI builds with TSAN, ASAN, UBSAN on Linux + macOS.
+- [ ] `sync.tla` TLC model checks cleanly at N=4 devices, 10 commit cycles.
+- [ ] All primitive benchmarks documented; baselines committed.
+
+### 4.3 Risks
+
+- **Risk**: ML-KEM-768 library (liboqs) is newer than classical crypto. Mitigation: pin liboqs version; contribute upstream fixes as needed; keep XChaCha20-Poly1305 (non-SIV, non-PQ) as compile-time fallback for v2.0-minus-1 scenarios.
+- **Risk**: AEGIS-256 has fewer production implementations than AES-GCM. Mitigation: use BoringSSL (Google-maintained) or commit to implementing from RFC/CAESAR spec with heavy KAT testing.
+
+### 4.4 Parallel opportunities
+
+- Block layer and crypto library are independent — two devs can work in parallel.
+- TLA+ environment setup can happen in parallel with either.
+
+---
+
+## 5. Phase 2: Tree + concurrency
+
+**Scope**: Bε-tree core with Bw-tree-style lock-free delta chains, MVCC readers, epoch-based reclamation.
+
+The most architecturally risky phase (per NOVEL #4). Extensive TLA+ spec work + stress testing.
+
+### 5.1 Deliverables
+
+- **Bε-tree core** (`src/btree/`):
+  - Node format (header, keys, values, delta chain head, Merkle hash field).
+  - Lock-free insert via CAS delta-chain prepend.
+  - MVCC readers with atomic root pointer snapshotting.
+  - Consolidation via the helping pattern.
+  - Structural operations: split, merge.
+  - Node encode / decode (serialization).
+- **Epoch-based reclamation** (`src/ebr/`):
+  - Per-thread local epochs.
+  - Retire list with rotation.
+  - Stall detection + heartbeat.
+- **MVCC reader infrastructure**:
+  - `epoch_enter` / `epoch_exit`.
+  - Root pointer snapshotting.
+  - Per-operation vs pinned snapshots.
+- **TLA+ spec**: `concurrency.tla`.
+- **Property-based tests**:
+  - Tree invariants (ordered keys, balanced, no duplicates).
+  - Concurrent reader-writer correctness (readers always see consistent snapshots).
+  - EBR safety (no use-after-free under randomized op schedules).
+- **Benchmarks**:
+  - Single-writer throughput baseline.
+  - Multi-reader concurrent scaling (target: linear to ~32 cores).
+
+### 5.2 Exit criteria
+
+- [ ] Bε-tree passes all property-based tests under TSAN for 24+ hour runs.
+- [ ] Tree operations (insert, lookup, scan, delete) work correctly.
+- [ ] Concurrent read scaling: ≥ 90% linear to 32 cores on 4KiB lookups.
+- [ ] Consolidation triggers correctly; delta chains bounded at ≤ 8 under normal load.
+- [ ] Split and merge operations are atomically visible (no structural-tear states in the spec).
+- [ ] `concurrency.tla` TLC passes at N=4 writers, N=8 readers, 16-step traces.
+- [ ] Fallback path (per-node rwlock) compiles and passes tree tests too (compile-time flag).
+
+### 5.3 Risks
+
+- **HIGH**: Lock-free Bw-tree complexity. Fallback: compile-time flag to fine-grained per-node rwlocks. If lock-free tests flake consistently, we ship with the fallback.
+- **Medium**: Consolidation correctness under concurrent writes. Mitigation: TLA+ spec proves atomic visibility; heavy fuzz testing.
+
+### 5.4 Dependencies
+
+- Phase 1 block device + crypto (for node encryption in Phase 4).
+- TLA+ environment.
+
+### 5.5 Parallel opportunities
+
+- EBR and tree-core are somewhat independent.
+- Property-based test harness can be built early.
+
+---
+
+## 6. Phase 3: Persistence + allocator
+
+**Scope**: uberblock format, four-phase commit protocol (single-device first), allocator tree with bootstrap pool, succinct in-RAM state, basic mount/unmount.
+
+### 6.1 Deliverables
+
+- **Uberblock** (`src/sb/`):
+  - Per-device label format (4 labels per device, 63-slot uberblock ring).
+  - Uberblock encode/decode with BLAKE3 csum.
+  - Label placement (byte 0, 256K, end-256K, end).
+- **Four-phase commit** (`src/sync/`):
+  - Phase 0 freeze.
+  - Phase 1 reservation (single-device first; multi-device in Phase 5).
+  - Phase 2 flush (parallel consolidation internally).
+  - Phase 3 final.
+  - Phase 4 publish (MVCC root swing + retirement).
+- **Allocator** (`src/alloc/`):
+  - Per-device allocator tree.
+  - Bootstrap pool placement + bitmap.
+  - SDArray in-RAM representation.
+  - xor filter for negative lookups.
+  - W-TinyLFU cache.
+  - Stripe allocation API (single-device stripe at this phase; multi-device in Phase 5).
+  - Deferred-free (PENDING) state.
+- **Mount / unmount** (`src/mount/`):
+  - Read labels, select authoritative uberblock.
+  - Walk allocator trees → rebuild in-RAM state.
+  - Mount-time gen bump.
+  - Clean unmount protocol.
+- **TLA+ specs**: `nonce.tla`, `allocator.tla`.
+- **Tests**:
+  - Crash-injection fuzzer (partial writes, power loss simulation).
+  - Mount/unmount round-trips.
+  - Allocator under concurrent alloc/free.
+
+### 6.2 Exit criteria
+
+- [ ] Single-device pool can be created, written to, synced, unmounted, remounted with integrity preserved.
+- [ ] Crash at any point (per fuzzer) recovers to a consistent state on mount.
+- [ ] Allocator in-RAM state ≤ 25 MiB / TiB for workloads tested up to 10 TiB.
+- [ ] Bootstrap pool usage < 50% in normal workloads.
+- [ ] `nonce.tla` proves uniqueness across commits + crashes at realistic bounds.
+- [ ] `allocator.tla` proves refcount invariants.
+
+### 6.3 Risks
+
+- **Medium**: Bootstrap pool sizing — if 0.1% of device is too small for high-fragmentation workloads, grows pool dynamically (complex). Monitoring via `/ctl/...`.
+- **Medium**: Succinct data structure correctness under concurrent updates. Mitigate via stress tests.
+
+### 6.4 Dependencies
+
+- Phase 1 block device.
+- Phase 2 tree.
+
+### 6.5 Parallel opportunities
+
+- Uberblock + commit protocol can be specified in TLA+ in parallel with allocator design.
+
+---
+
+## 7. Phase 4: Integrity + crypto integration
+
+**Scope**: Merkle root integration, AEAD-SIV encrypt/decrypt on extents + nodes, per-dataset key hierarchy, PQ-hybrid wrap, key agent.
+
+### 7.1 Deliverables
+
+- **Merkle integrity** (`src/integrity/`):
+  - Per-node hash fields populated.
+  - Incremental hash propagation at commit (§7.12).
+  - Pool Merkle root in uberblock.
+  - Three verify paths: mount-time, on-read, scrub.
+- **AEAD on data extents**:
+  - Encryption path: compress → hash → encrypt → write.
+  - Decryption path: read → decrypt → verify → decompress → return.
+  - AD struct binding (pool, dataset, ino, offset).
+- **AEAD on metadata nodes**:
+  - Tree node encryption with `stm_ad_node`.
+  - Decryption on read with AD verification.
+- **Key hierarchy** (`src/keyagent/`):
+  - Key agent process (`stratum-keyagent`).
+  - 9P protocol between daemon and agent (§7.9).
+  - Backends: passphrase, file (for automation).
+  - Key unwrap/rewrap/rotate primitives.
+- **Per-dataset encryption state** in uberblock.
+- **TLA+ spec**: `merkle.tla`.
+- **Tests**:
+  - End-to-end encrypted write + read + verify.
+  - Tamper-evidence: offline metadata edit detection.
+  - Key rotation without re-encryption.
+  - AD mismatch rejects cross-context reads.
+
+### 7.2 Exit criteria
+
+- [ ] Encrypted writes round-trip correctly with AEGIS-256 and XChaCha20-SIV.
+- [ ] Mount-time full verify (opt-in) works on 1 TiB test volume.
+- [ ] On-read verify has ≤ 5% overhead vs disabled.
+- [ ] Tampering with a metadata block is cryptographically detected.
+- [ ] Key agent + daemon integrated; passphrase backend works.
+- [ ] `merkle.tla` proves hash-propagation correctness under COW.
+
+### 7.3 Risks
+
+- **Medium**: Merkle-on-commit overhead. Mitigate via incremental (only dirty subtrees) + batching.
+- **Low-Medium**: liboqs API stability. Mitigate: pin version, vendor if needed.
+
+### 7.4 Dependencies
+
+- Phase 1 crypto primitives.
+- Phase 2 tree (for per-node hash propagation).
+- Phase 3 commit protocol (for Merkle root advance).
+
+### 7.5 Parallel opportunities
+
+- Key agent can be developed in parallel with integrity work (orthogonal subsystems).
+
+---
+
+## 8. Phase 5: Multi-device + redundancy
+
+**Scope**: multi-device pool, quorum-based commit, RS + LRC erasure coding, scrub with repair, device lifecycle.
+
+### 8.1 Deliverables
+
+- **Pool layer** (`src/pool/`):
+  - Device roster management.
+  - Pool config (redundancy profile, feature flags, per-dataset overrides).
+  - Device identity (UUIDs, classes, roles).
+- **Multi-device commit**:
+  - Phase 1 quorum-confirmed reservation.
+  - Phase 2 parallel multi-device flush.
+  - Phase 3 quorum-confirmed final.
+  - Device BEHIND state + reconcile on return.
+- **Erasure coding** (`src/ec/`):
+  - RS implementation (via Intel ISA-L SIMD + fallback pure-C).
+  - LRC layout + encode/decode.
+  - Stripe allocation API for multi-device.
+- **Device lifecycle** (`src/device-mgmt/`):
+  - `pool add` / `pool remove` / `pool replace` / device fail handling.
+  - Rebalance (incremental, IO-throttled).
+- **Scrub** (`src/scrub/`):
+  - State machine (IDLE / RUNNING / PAUSED / COMPLETED).
+  - Pause/resume persistence.
+  - IO throttling per priority.
+  - Repair from redundancy.
+- **TLA+ spec**: `quorum.tla`.
+- **Tests**:
+  - Pool with 3+ devices; quorum cases.
+  - Device failure simulation (kill one device, verify graceful degradation).
+  - Rebuild from redundancy.
+  - Rebalance incremental correctness.
+
+### 8.2 Exit criteria
+
+- [ ] 4-device RAID-Z-equivalent pool survives single-device failure without data loss.
+- [ ] LRC repair is 2-3× faster than RS for single-failure scenarios (per the LRC lead position).
+- [ ] Scrub detects + repairs injected corruption.
+- [ ] Rebalance progress persists across restart.
+- [ ] `quorum.tla` proves commit-under-partial-failure semantics.
+
+### 8.3 Risks
+
+- **Medium**: Rebalance correctness — moving data while system is live is tricky. Mitigate: extensive crash-injection tests during rebalance.
+- **Medium**: LRC decode complexity. Mitigate: start with RS-only; add LRC as a feature-flagged addition after RS is stable.
+
+### 8.4 Dependencies
+
+- Phase 3 single-device persistence.
+- Phase 4 crypto (encrypt across devices correctly via device_id in AD).
+
+### 8.5 Parallel opportunities
+
+- Scrub + repair infrastructure can be built in parallel with multi-device commit.
+
+---
+
+## 9. Phase 6: Namespaces
+
+**Scope**: dataset hierarchy, properties + inheritance, snapshots via birth-txg (O(1)), clones, dead-list maintenance.
+
+### 9.1 Deliverables
+
+- **Dataset layer** (`src/dataset/`):
+  - Dataset index tree.
+  - Property system with inheritance.
+  - Dataset create / destroy / rename / move.
+- **Snapshot mechanics**:
+  - Birth-txg tracking in every tree node + extent record.
+  - Snapshot create (O(1)).
+  - Snapshot index tree.
+  - Visibility via `.snaps/<name>/`.
+  - Holds.
+- **Dead-list maintenance**:
+  - Per-snapshot dead lists.
+  - Incremental updates on COW events.
+  - Snapshot delete walk.
+- **Clones** (writable snapshots):
+  - Clone create (O(1)).
+  - Promote / destroy.
+- **Tests**:
+  - Snapshot create / read / delete lifecycle.
+  - Clone lifecycle with origin-hold.
+  - Many-snapshot scaling (100+ snapshots of same dataset).
+  - Property inheritance correctness.
+
+### 9.2 Exit criteria
+
+- [ ] Snapshot create < 10 ms regardless of dataset size.
+- [ ] Snapshot delete's work proportional to blocks freed, not total tree.
+- [ ] Clone + writes + COW produce correct divergence.
+- [ ] Property inheritance resolves correctly across multi-level datasets.
+- [ ] Datasets survive mount/unmount round-trips.
+
+### 9.3 Risks
+
+- **Medium**: Dead-list incremental maintenance overhead. Mitigate: profile + tune; fall back to on-delete full walk if incremental proves too expensive.
+
+### 9.4 Dependencies
+
+- Phase 3 persistence.
+- Phase 4 crypto (per-dataset keys).
+
+### 9.5 Parallel opportunities
+
+- Dataset + snapshot + clone lifecycles can be built in parallel with dead-list implementation.
+
+---
+
+## 10. Phase 7: Cold tier + features
+
+**Scope**: FastCDC chunking, CAS cold tier, migration policy, send/recv, reflinks.
+
+### 10.1 Deliverables
+
+- **FastCDC** (`src/cdc/`):
+  - Content-defined chunking implementation.
+  - Configurable avg / min / max chunk size.
+- **CAS tier** (`src/cas/`):
+  - Content-addressed index tree.
+  - Chunk write + dedup-on-write.
+  - Migration engine (hot → cold).
+  - Rehydration on write (cold → hot).
+  - CAS GC.
+- **Send / recv** (`src/send-recv/`):
+  - Wire format: full + incremental; raw-encrypted + decrypted.
+  - Incremental diff via birth-txg.
+  - Receive-side state reconstruction.
+- **Reflinks**:
+  - `copy_file_range` + `FICLONE` ioctl support.
+  - Refcount bumps on reflink.
+  - Cross-dataset with encryption compat check.
+- **Tests**:
+  - Cold-tier dedup ratio benchmark (1 TiB of VM images with 80% overlap).
+  - Migration correctness.
+  - Send/recv roundtrip (full + incremental).
+  - Reflink correctness.
+
+### 10.2 Exit criteria
+
+- [ ] Cold-tier dedup achieves target 3-5× on VM-image test set.
+- [ ] Migration policy heuristic produces reasonable hot/cold placement on synthetic workloads.
+- [ ] Send + receive roundtrip preserves data + metadata + snapshots.
+- [ ] Reflink is O(extent count) not O(data size).
+
+### 10.3 Risks
+
+- **Medium**: CAS GC under concurrent writes. Mitigate: incremental GC with per-chunk refcount locking.
+- **Medium**: FastCDC parameter tuning. Default 8 MiB avg per NOVEL #3; adjust based on benchmarks.
+
+### 10.4 Dependencies
+
+- Phase 3, 4, 5, 6.
+
+### 10.5 Parallel opportunities
+
+- Send/recv and CAS tier are somewhat independent; can be built in parallel.
+
+---
+
+## 11. Phase 8: Client interfaces
+
+**Scope**: 9P server with Stratum extensions, FUSE shim, CLI, /ctl/, libstratum-9p, language bindings.
+
+### 11.1 Deliverables
+
+- **9P server** (`src/9p/`):
+  - 9P2000.L support.
+  - Stratum extensions (Tbind, Tunbind, Tpin, Tunpin, Tsync, Treflink, Tfallocate).
+  - Per-connection namespaces.
+  - Authentication backends (none, factotum, SASL, token).
+- **FUSE shim** (`stratum-fuse`):
+  - FUSE ↔ 9P translator.
+  - Linux + macOS support.
+  - Multi-threaded op handling.
+- **CLI** (`stratum`):
+  - Subcommands: pool, dataset, snapshot, clone, send, recv, key.
+  - Output formats: human (default), JSON, TSV.
+- **/ctl/ synthetic filesystem**:
+  - Full tree per §14.3.
+  - Write-triggers-action semantics.
+- **libstratum-9p** (C library):
+  - Stable public ABI.
+  - Sync + async variants of all 9P ops.
+- **Language bindings**:
+  - Rust crate `stratum-fs`.
+  - Go package.
+  - Python module.
+- **TLA+ spec**: `namespace.tla`.
+- **Tests**:
+  - End-to-end: mount via FUSE, standard POSIX ops work.
+  - Per-connection namespace isolation.
+  - CLI smoke tests.
+
+### 11.2 Exit criteria
+
+- [ ] Mount a pool via FUSE; standard POSIX operations succeed.
+- [ ] Multiple concurrent 9P connections with different namespaces work correctly.
+- [ ] CLI covers all admin operations via /ctl/.
+- [ ] libstratum-9p + Rust / Go / Python bindings pass smoke tests.
+- [ ] `namespace.tla` proves cross-connection isolation.
+
+### 11.3 Risks
+
+- **Low**: 9P2000.L is well-understood; our extensions are straightforward.
+- **Medium**: FUSE shim performance tuning.
+
+### 11.4 Dependencies
+
+- All prior phases (this is where users touch Stratum).
+
+### 11.5 Parallel opportunities
+
+- 9P server, FUSE shim, CLI, libstratum-9p all independent; multiple devs can work in parallel.
+
+---
+
+## 12. Phase 9: Hardening
+
+**Scope**: fuzzer expansion, audit passes, benchmarks, documentation, pre-release polish.
+
+### 12.1 Deliverables
+
+- **Fuzzer expansion**:
+  - Extended crash-injection fuzzer.
+  - Multi-client concurrency fuzzer.
+  - Format-corruption fuzzer (malformed on-disk states).
+- **Audit passes**:
+  - Focused audits per CLAUDE.md surfaces, round-by-round.
+  - Cross-cutting audit (integration-level correctness).
+- **Benchmarks**:
+  - Full benchmark suite vs ZFS, btrfs, bcachefs, ext4, XFS.
+  - Results documented in `docs/BENCHMARKS.md`.
+- **Documentation**:
+  - User-facing: install guide, admin guide, migration guide.
+  - Developer: API docs, contribution guide.
+  - Operator: troubleshooting, backup strategies.
+- **Performance tuning**:
+  - Fix p99.9 outliers.
+  - Optimize hot paths identified by profiling.
+
+### 12.2 Exit criteria
+
+- [ ] Fuzzers run for 1,000+ CPU-hours without finding new correctness bugs.
+- [ ] All audit rounds converge with zero P0/P1/P2 findings.
+- [ ] p99.9 latency budgets (VISION §4.14) met.
+- [ ] Throughput targets met.
+- [ ] Documentation reviewed end-to-end.
+
+### 12.3 Risks
+
+- Low by design — this phase is about confidence, not features.
+
+### 12.4 Dependencies
+
+- All prior phases complete.
+
+---
+
+## 13. Phase 10: v2.0 release
+
+**Scope**: final audit, format freeze, tag, announce.
+
+### 13.1 Deliverables
+
+- **Final audit**: comprehensive pass across every audit-trigger surface, with findings < P2.
+- **Format freeze**: tag the on-disk format as "v2.0 stable." No further changes to field layouts without feature flags.
+- **Release artifacts**: binaries (stratum, stratum-fuse, stratum-keyagent, stratum-cli), debug packages, source tarball.
+- **Announcement**: blog post, release notes, benchmark summary.
+
+### 13.2 Exit criteria
+
+- [ ] Stratum v2.0 tagged in git.
+- [ ] Binaries reproducibly built.
+- [ ] Format documented and frozen.
+- [ ] Announcement published.
+
+---
+
+## 14. Post-v2.0 roadmap
+
+### 14.1 v2.1 candidates (6–12 months post-v2.0)
+
+- **In-kernel Linux driver**: bypass FUSE for high-IOPS workloads. ~10-20 KLOC kernel code.
+- **Log device** (ZFS ZIL equivalent): dedicated fast-device for commit latency.
+- **Learned tiering policy** (NOVEL #6): ML-based hot/cold migration replacing heuristic.
+- **Zero-copy receive** (`MSG_ZEROCOPY`, AF_XDP): true zero-copy write path.
+- **Wavelet-tree succinct refinement**: target 5 MiB/TiB allocator RAM (from 25 MiB/TiB at v2.0).
+
+### 14.2 v2.2+ candidates (12–24+ months)
+
+- **Windows driver** (via WinFsp or native kernel).
+- **Zoned Namespace (ZNS NVMe)** native support.
+- **NVMe-oF** for network-attached block storage.
+- **SPDK integration** for extreme-IOPS userspace NVMe.
+- **Coq / Lean verification** of specific subsystems (allocator data structures).
+- **NFSv4 ACLs** (alternative to POSIX ACLs).
+
+### 14.3 Ruled out
+
+Per VISION §6 non-goals:
+
+- Distributed multi-node.
+- Object storage API.
+- Parallel HPC filesystem.
+- Backward compat with ZFS / btrfs / ext4 volumes.
+- Deduplication-as-background-job (CAS tier makes it redundant).
+- General-purpose defragmenter.
+
+---
+
+## 15. Cross-phase concerns
+
+### 15.1 Git workflow
+
+- Main branch: `main`, always passes CI.
+- Feature branches: `phase-N-<feature>`.
+- Every PR includes: code + tests + docs update + TLA+ spec update if applicable.
+- CI required: all tests pass, ASAN/TSAN/UBSAN clean, linter clean.
+- Audit-triggered PRs require additional approval from the audit subagent.
+
+### 15.2 Versioning during development
+
+- `main` HEAD: "v2.0-dev".
+- Phase exits tagged: `phase-N-complete`.
+- No API stability promise until v2.0 release.
+
+### 15.3 Telemetry / feedback
+
+During the development phases, internal deployments generate telemetry that guides tuning:
+
+- Deploy to internal test pools.
+- Collect performance + reliability metrics via `/ctl/`.
+- Feed back into fuzzer corpus + benchmark baselines.
+
+### 15.4 Contributor onboarding
+
+Expected team size: 3–5 core contributors at v2.0 trajectory. Each phase has a "driver" who owns it; reviewers rotate.
+
+`docs/CONTRIBUTING.md` lays out:
+- Local dev setup.
+- CI expectations.
+- Audit process.
+- Code style.
+
+---
+
+## 16. Risk register
+
+A consolidated view of risks across phases, ordered by severity.
+
+| # | Risk | Phase | Severity | Mitigation |
+|---|---|---|---|---|
+| 1 | Lock-free Bw-tree complexity / correctness | 2 | HIGH | Per-node rwlock fallback (compile-time flag); TLA+ spec before implementation; extensive TSAN + fuzz |
+| 2 | TLA+ specs don't match implementation | All | MEDIUM | SPEC-TO-CODE mapping file maintained + CI-checked; specs written before code |
+| 3 | Multi-device quorum edge cases | 5 | MEDIUM | TLA+ spec; chaos testing (kill devices during commits) |
+| 4 | Succinct allocator underperforms | 3 | MEDIUM | Fallback to straight encoding at more RAM; monitored via `/ctl/` |
+| 5 | ML-KEM-768 library immaturity | 4 | MEDIUM | Pinned liboqs version; fall back to classical-only wrap if needed |
+| 6 | Merkle-on-commit overhead | 4 | MEDIUM | Incremental (dirty subtrees only); benchmark gates |
+| 7 | CAS GC under concurrency | 7 | MEDIUM | Incremental + per-chunk locking |
+| 8 | Rebalance correctness during live system | 5 | MEDIUM | Crash-injection tests; COW preserves old state until new is durable |
+| 9 | FUSE shim performance | 8 | LOW-MED | Multi-threaded; profile-guided optimization |
+| 10 | Bootstrap pool sizing | 3 | LOW-MED | Monitor via `/ctl/`; dynamic growth path defined |
+| 11 | Performance regression | All | LOW | Continuous benchmarking; 10% regression blocks |
+| 12 | Documentation lag | All | LOW | Docs-in-PR policy |
+
+HIGH-risk items dominate: everything else is bounded by the "fallback is defined" principle.
+
+---
+
+## 17. Timeline
+
+Estimates are guidance, not commitments. Each phase's duration assumes full-time engineering on the driver role + reasonable reviewer availability.
+
+```
+Phase 1 ─ Foundations            ~3 months  (months 1-3)
+Phase 2 ─ Tree + concurrency     ~4 months  (months 4-7)      [critical path]
+Phase 3 ─ Persistence            ~3 months  (months 8-10)
+Phase 4 ─ Integrity + crypto     ~3 months  (months 10-13)    [overlap w/ P3 tail]
+Phase 5 ─ Multi-device           ~3 months  (months 14-16)
+Phase 6 ─ Namespaces             ~2 months  (months 15-17)    [overlap w/ P5 tail]
+Phase 7 ─ Cold tier + features   ~3 months  (months 18-20)
+Phase 8 ─ Client interfaces      ~2 months  (months 19-21)    [overlap w/ P7 tail]
+Phase 9 ─ Hardening              ~2 months  (months 22-24)
+Phase 10 ─ v2.0 release          ~1 month   (month 25)
+
+Total (with overlaps)                       ~25 months
+Total (no overlaps, single-thread)          ~28 months
+```
+
+Aggressive but bounded for a filesystem of this ambition. For reference:
+- bcachefs: ~15 years from inception to mainline (2009 → 2024).
+- btrfs: ~10 years from inception to stable (2007 → 2017).
+- ZFS: ~5 years from inception to release (2001 → 2005).
+
+Our 25-month target assumes: we're starting from a solid v1 foundation + formal design (Phase 0), adequate staffing, and a well-defined scope. It's ambitious but informed by prior work.
+
+---
+
+## 18. Summary
+
+Stratum v2 is a 10-phase implementation journey from "design complete" to "v2.0 released":
+
+1. **Phase 0 (DONE)**: design documents — VISION, COMPARISON, NOVEL, ARCHITECTURE, ROADMAP-V2.
+2. **Phases 1-10**: ~25 months to v2.0 release.
+3. **Post-v2.0**: kernel driver, learned tiering, zero-copy, Windows, more.
+
+Key commitments:
+- Formal verification alongside (not after) implementation.
+- Audit loop every phase.
+- Three tiers of testing (unit, property, fuzz).
+- Fallback paths designed, not discovered.
+- Continuous performance measurement.
+- Docs updated in every PR.
+
+The plan is aggressive, staged, and risk-aware. Every high-risk element has a defined fallback. Every phase has concrete exit criteria. Every novel angle is scoped concretely.
+
+**Phase 0 ends here.** Phase 1 begins when the implementation team is ready.
+
+This document — along with VISION.md, COMPARISON.md, NOVEL.md, and ARCHITECTURE.md — is the contract between the design and the implementation. Changes to the design require explicit revision of these documents + justification in writing, per CLAUDE.md.
+
+---
+
+## Appendix: Phase 0 completion checklist
+
+- [x] VISION.md — mission, target workloads, property ranking, committed design choices, Plan 9 inheritances.
+- [x] COMPARISON.md — feature matrix vs ZFS, btrfs, bcachefs, ext4, XFS.
+- [x] NOVEL.md — 10 lead positions with scope, done definition, dependencies, complexity, risk.
+- [x] ARCHITECTURE.md — 15 committed sections covering every subsystem.
+- [x] ROADMAP-V2.md — this document; phased implementation plan.
+
+**Phase 0 is complete.** The design is done. Implementation begins when the team is ready.
