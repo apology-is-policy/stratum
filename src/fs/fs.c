@@ -1426,6 +1426,186 @@ static int empty_check_cb(const struct stm_key *key, const void *val,
     return 1;  /* stop the scan — found a live dirent */
 }
 
+/* ── POSIX Group A: chmod / chown / utimes / truncate ──────────────── */
+
+/* Set the permission bits on an inode, preserving the IFMT (file-type)
+ * bits. Updates ctime to now (POSIX: any attribute change bumps ctime).
+ * mode is the new permission word; only the low 12 bits (rwx + setuid /
+ * setgid / sticky) are taken, file-type bits retained from the existing
+ * inode. */
+int stm_fs_chmod(struct stm_fs *fs, uint64_t ino, uint32_t mode)
+{
+    STM_FS_GUARD_WRITE(fs);
+    struct stm_inode in;
+    int rc = read_inode(fs, ino, &in);
+    if (rc) return rc;
+    uint32_t cur = le32_to_cpu(in.si_mode);
+    uint32_t new_mode = (cur & STM_S_IFMT) | (mode & 07777);
+    in.si_mode = cpu_to_le32(new_mode);
+    uint64_t ts; uint32_t tns;
+    stm_now(&ts, &tns);
+    in.si_ctime_sec  = cpu_to_le64(ts);
+    in.si_ctime_nsec = cpu_to_le32(tns);
+    return write_inode(fs, ino, &in);
+}
+
+/* Change ownership of an inode. A uid or gid of 0xFFFFFFFF means "leave
+ * this field alone" (matches POSIX chown(-1, gid) and chown(uid, -1)
+ * semantics — the kernel translates these to UINT_MAX). */
+int stm_fs_chown(struct stm_fs *fs, uint64_t ino, uint32_t uid, uint32_t gid)
+{
+    STM_FS_GUARD_WRITE(fs);
+    struct stm_inode in;
+    int rc = read_inode(fs, ino, &in);
+    if (rc) return rc;
+    if (uid != (uint32_t)-1) in.si_uid = cpu_to_le32(uid);
+    if (gid != (uint32_t)-1) in.si_gid = cpu_to_le32(gid);
+    uint64_t ts; uint32_t tns;
+    stm_now(&ts, &tns);
+    in.si_ctime_sec  = cpu_to_le64(ts);
+    in.si_ctime_nsec = cpu_to_le32(tns);
+    return write_inode(fs, ino, &in);
+}
+
+/* Set atime and mtime. Each (sec, nsec) pair is applied only if
+ * `set_atime` / `set_mtime` is non-zero — lets callers change one without
+ * disturbing the other. ctime always updates (POSIX). */
+int stm_fs_utimes(struct stm_fs *fs, uint64_t ino,
+                  int set_atime, uint64_t atime_sec, uint32_t atime_nsec,
+                  int set_mtime, uint64_t mtime_sec, uint32_t mtime_nsec)
+{
+    STM_FS_GUARD_WRITE(fs);
+    struct stm_inode in;
+    int rc = read_inode(fs, ino, &in);
+    if (rc) return rc;
+    if (set_atime) {
+        in.si_atime_sec  = cpu_to_le64(atime_sec);
+        in.si_atime_nsec = cpu_to_le32(atime_nsec);
+    }
+    if (set_mtime) {
+        in.si_mtime_sec  = cpu_to_le64(mtime_sec);
+        in.si_mtime_nsec = cpu_to_le32(mtime_nsec);
+    }
+    uint64_t ts; uint32_t tns;
+    stm_now(&ts, &tns);
+    in.si_ctime_sec  = cpu_to_le64(ts);
+    in.si_ctime_nsec = cpu_to_le32(tns);
+    return write_inode(fs, ino, &in);
+}
+
+/* Resize a file.
+ *
+ * Extend (new_size > cur_size): no extent allocation — stratum's
+ * extent-based read path already returns zeros for unreferenced ranges
+ * (sparse semantics). Just update si_size.
+ *
+ * Shrink (new_size < cur_size): walk DATA extents at offset ≥ new_size
+ * and drop them; the extent that STRADDLES new_size (if any) is
+ * read-modify-written to its truncated shorter form.
+ *
+ * Follows the R3-3 unlink pattern for crash safety: collect extent
+ * records and keys, perform btree deletes first, then free allocator
+ * blocks last. If anything fails mid-way the extents stay live and the
+ * operation is retriable. */
+int stm_fs_truncate(struct stm_fs *fs, uint64_t ino, uint64_t new_size)
+{
+    STM_FS_GUARD_WRITE(fs);
+
+    struct stm_inode in;
+    int rc = read_inode(fs, ino, &in);
+    if (rc) return rc;
+    uint64_t cur_size = le64_to_cpu(in.si_size);
+    if (new_size == cur_size) return 0;
+
+    if (new_size > cur_size) {
+        /* Extend: pure metadata update; sparse bytes read as zero. */
+        in.si_size = cpu_to_le64(new_size);
+        uint64_t ts; uint32_t tns;
+        stm_now(&ts, &tns);
+        in.si_mtime_sec  = cpu_to_le64(ts);
+        in.si_mtime_nsec = cpu_to_le32(tns);
+        in.si_ctime_sec  = cpu_to_le64(ts);
+        in.si_ctime_nsec = cpu_to_le32(tns);
+        return write_inode(fs, ino, &in);
+    }
+
+    /* Shrink. Collect extents entirely past new_size; handle the
+     * straddling extent (if any) separately via read-modify-write. */
+    uint64_t align = new_size & ~((uint64_t)(STM_EXTENT_SIZE - 1));
+    uint32_t inner = (uint32_t)(new_size - align);  /* bytes to keep in
+                                                      * the straddling ext */
+
+    struct unlink_ctx uc = { .fs = fs, .keys = NULL, .exts = NULL,
+                             .count = 0, .cap = 0 };
+    /* Scan range: the FIRST extent whose offset > new_size (i.e. wholly
+     * past the new end) starts at `align + STM_EXTENT_SIZE`. Inclusive
+     * at both ends via UINT64_MAX. */
+    uint64_t first_full_off = align + STM_EXTENT_SIZE;
+    if (inner == 0) first_full_off = align;  /* new_size is extent-aligned
+                                              * → the extent at `align`
+                                              * is wholly past too */
+    struct stm_key lo = mk_key(ino, STM_KEY_DATA, first_full_off);
+    struct stm_key hi = mk_key(ino, STM_KEY_DATA, UINT64_MAX);
+    rc = stm_btree_scan(fs->tree, &lo, &hi, collect_extent_cb, &uc);
+    if (rc) { free(uc.keys); free(uc.exts); return rc; }
+
+    /* Handle the straddling extent (only when new_size is NOT aligned). */
+    if (inner != 0) {
+        struct stm_key sk = mk_key(ino, STM_KEY_DATA, align);
+        struct stm_extent old_ext;
+        uint32_t vlen = sizeof(old_ext);
+        rc = stm_btree_lookup(fs->tree, &sk, &old_ext, &vlen);
+        if (rc == 0 && vlen == sizeof(old_ext)) {
+            uint32_t old_dlen = le32_to_cpu(old_ext.se_dlen);
+            if (old_dlen > inner) {
+                /* Read the extent into the scratch buffer, truncate it
+                 * to `inner` bytes, write a new shorter replacement.
+                 * Zero the tail past `inner` BEFORE writing — same
+                 * R6-1 hygiene as stm_fs_write: unencrypted extent_buf
+                 * residue would otherwise leak into the new ciphertext
+                 * as cross-extent plaintext on encrypted volumes. */
+                uint8_t *ebuf = fs->extent_buf;
+                rc = extent_read_data(fs, &old_ext, ebuf, STM_EXTENT_SIZE);
+                if (rc) { free(uc.keys); free(uc.exts); return rc; }
+                if (inner < STM_EXTENT_SIZE)
+                    memset(ebuf + inner, 0, STM_EXTENT_SIZE - inner);
+                struct stm_extent new_ext;
+                rc = extent_write_data(fs, ebuf, inner, &new_ext);
+                if (rc) { free(uc.keys); free(uc.exts); return rc; }
+                rc = stm_btree_insert(fs->tree, &sk, &new_ext,
+                                      sizeof(new_ext), fs->gen);
+                if (rc) {
+                    extent_free_blocks(fs, &new_ext);
+                    free(uc.keys); free(uc.exts); return rc;
+                }
+                extent_free_blocks(fs, &old_ext);
+            }
+        } else if (rc != -ENOENT) {
+            free(uc.keys); free(uc.exts); return rc;
+        }
+    }
+
+    /* Delete all wholly-past extents' btree records first, then free
+     * their blocks (R3-3 ordering). */
+    for (uint32_t i = 0; i < uc.count; i++) {
+        rc = stm_btree_delete(fs->tree, &uc.keys[i], fs->gen);
+        if (rc) { free(uc.keys); free(uc.exts); return rc; }
+    }
+    for (uint32_t i = 0; i < uc.count; i++)
+        extent_free_blocks(fs, &uc.exts[i]);
+    free(uc.keys); free(uc.exts);
+
+    /* Finally update inode size + timestamps. */
+    in.si_size = cpu_to_le64(new_size);
+    uint64_t ts; uint32_t tns;
+    stm_now(&ts, &tns);
+    in.si_mtime_sec  = cpu_to_le64(ts);
+    in.si_mtime_nsec = cpu_to_le32(tns);
+    in.si_ctime_sec  = cpu_to_le64(ts);
+    in.si_ctime_nsec = cpu_to_le32(tns);
+    return write_inode(fs, ino, &in);
+}
+
 int stm_fs_unlink(struct stm_fs *fs, uint64_t parent_ino, const char *name)
 {
     struct stm_key dkey;

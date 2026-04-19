@@ -764,10 +764,10 @@ stm_fs_* API  →  Bε-tree  →  block device  (same backend 9P uses)
 |---|---|---|
 | `lookup(parent, name)` | `stm_fs_lookup` + `stm_fs_stat` | wired |
 | `getattr(ino)` | `stm_fs_stat` | wired |
-| `setattr(ino, attr, to_set)` | — | **accept-and-ignore** until #5 |
-| `mkdir(parent, name, mode)` | `stm_fs_mkdir` | wired |
+| `setattr(ino, attr, to_set)` | `stm_fs_chmod` / `_chown` / `_utimes` / `_truncate` | wired (SOTA #5 Group A) |
+| `mkdir(parent, name, mode)` | `stm_fs_mkdir` + `stm_fs_chown` (from fuse_req_ctx) | wired |
 | `rmdir(parent, name)` | `stm_fs_unlink` | wired (checks empty via -ENOTEMPTY) |
-| `create(parent, name, mode)` | `stm_fs_create_file` | wired |
+| `create(parent, name, mode)` | `stm_fs_create_file` + `stm_fs_chown` (from fuse_req_ctx) | wired |
 | `unlink(parent, name)` | `stm_fs_unlink` | wired |
 | `open(ino, flags)` | noop | wired (no per-handle state) |
 | `read(ino, size, off)` | `stm_fs_read` | wired |
@@ -777,9 +777,11 @@ stm_fs_* API  →  Bε-tree  →  block device  (same backend 9P uses)
 | `fsync(ino, datasync)` | `stm_fs_sync` | wired |
 | `readdir(ino, size, off)` | `stm_fs_readdir` | wired (via `fuse_add_direntry`) |
 | `statfs(ino)` | placeholder | wired (generic values until SOTA #2) |
-| `rename`, `link`, `symlink`, `readlink`, `mknod`, `setxattr`, `getxattr`, `listxattr`, `removexattr`, `access` | — | **ENOSYS** until SOTA #5 |
+| `rename`, `link`, `symlink`, `readlink`, `mknod`, `setxattr`, `getxattr`, `listxattr`, `removexattr`, `access` | — | **ENOSYS** until SOTA #5 Groups B/C/D |
 
-**`setattr` accept-and-ignore rationale**: POSIX tools (`touch`, `cp -p`, editor saves) call setattr after create to adjust timestamps. Returning ENOSYS would break them loudly. Accepting (and returning the current unchanged attrs) lets them proceed. When SOTA #5 wires real mutation through, we swap the implementation without breaking callers.
+**`setattr` dispatch (SOTA #5 Group A)**: the FUSE layer inspects the `to_set` bitmask and routes each field independently to the corresponding stm_fs_* mutation. `FUSE_SET_ATTR_MODE` → `stm_fs_chmod`, `UID`/`GID` → `stm_fs_chown` (with the other field passed as `(uint32_t)-1` to mean "don't change"), `ATIME`/`MTIME` (plain or `_NOW`) → `stm_fs_utimes`, `SIZE` → `stm_fs_truncate`. After all mutations succeed, getattr is re-run and the refreshed attrs are returned so FUSE's kernel cache stays consistent.
+
+**Creation-time ownership**: `ll_create` and `ll_mkdir` call `stm_fs_chown(uid, gid)` with the values from `fuse_req_ctx()` immediately after create — so a user mounting the volume and touching a file sees the file owned by them (not uid 0). Pre-Group-A behavior returned `getuid()` from `fill_attr` regardless of the stored inode values.
 
 ### 16.3 Concurrency
 

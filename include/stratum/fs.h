@@ -66,4 +66,18 @@ int  stm_fs_unlink(struct stm_fs *fs, uint64_t parent_ino, const char *name);
 int  stm_fs_lookup(struct stm_fs *fs, uint64_t parent_ino,
                    const char *name, uint64_t *out_ino);
 
+/* POSIX Group A (SOTA #5): attribute mutations. All update ctime.
+ *
+ * chmod: low 12 bits of mode replace the inode's permission bits;
+ *        IFMT (file-type) bits are preserved.
+ * chown: uid or gid of (uint32_t)-1 means "leave this field alone"
+ *        (matches POSIX chown(-1, gid) semantics). */
+int  stm_fs_chmod(struct stm_fs *fs, uint64_t ino, uint32_t mode);
+int  stm_fs_chown(struct stm_fs *fs, uint64_t ino,
+                  uint32_t uid, uint32_t gid);
+int  stm_fs_utimes(struct stm_fs *fs, uint64_t ino,
+                   int set_atime, uint64_t atime_sec, uint32_t atime_nsec,
+                   int set_mtime, uint64_t mtime_sec, uint32_t mtime_nsec);
+int  stm_fs_truncate(struct stm_fs *fs, uint64_t ino, uint64_t new_size);
+
 #endif /* STM_FS_H */

@@ -74,8 +74,13 @@ static int fill_attr(uint64_t ino, struct stat *st)
     st->st_ino   = ino;
     st->st_mode  = le32_to_cpu(in.si_mode);
     st->st_nlink = le32_to_cpu(in.si_nlink);
-    st->st_uid   = getuid();        /* see security note in file header */
-    st->st_gid   = getgid();
+    /* Return the inode's stored uid/gid. On a freshly-mkfs'd volume
+     * every file is 0:0; ll_create/ll_mkdir chown to the caller's
+     * identity immediately after create, so ordinary use sees real
+     * ownership. Pre-Group-A volumes saw getuid()/getgid() here — the
+     * stored values were ignored. */
+    st->st_uid   = le32_to_cpu(in.si_uid);
+    st->st_gid   = le32_to_cpu(in.si_gid);
     st->st_size  = le64_to_cpu(in.si_size);
     st->st_atime = le64_to_cpu(in.si_atime_sec);
     st->st_mtime = le64_to_cpu(in.si_mtime_sec);
@@ -128,20 +133,74 @@ static void ll_getattr(fuse_req_t req, fuse_ino_t ino,
     fuse_reply_attr(req, &st, 1.0);
 }
 
-/* setattr: POSIX chmod/utimens/truncate/chown all route through here.
- * None of these are wired into stm_fs_* yet (SOTA #5 territory), but
- * several common tools (touch, cp -p, editors) call setattr for timestamp
- * touch-up after create and will fail loudly with ENOSYS. For now we
- * ACCEPT and discard the mutation, then return the (unchanged) attrs.
- * When #5 lands we switch to real mutation. */
+/* setattr: POSIX chmod/chown/utimens/truncate all route through here.
+ * `to_set` is a bitmask of FUSE_SET_ATTR_* flags indicating which fields
+ * in `attr` the caller wants to change. We dispatch each bit to the
+ * corresponding stm_fs_* mutation (SOTA #5 Group A) and then reply with
+ * the refreshed attrs so FUSE's cache stays consistent. */
 static void ll_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
                        int to_set, struct fuse_file_info *fi)
 {
-    (void)attr; (void)to_set; (void)fi;
+    (void)fi;
+    int rc;
+
+    if (to_set & FUSE_SET_ATTR_MODE) {
+        rc = stm_fs_chmod(g_fs, ino, attr->st_mode);
+        if (rc) { fuse_reply_err(req, -rc); return; }
+    }
+
+    if (to_set & (FUSE_SET_ATTR_UID | FUSE_SET_ATTR_GID)) {
+        uint32_t uid = (to_set & FUSE_SET_ATTR_UID) ? attr->st_uid : (uint32_t)-1;
+        uint32_t gid = (to_set & FUSE_SET_ATTR_GID) ? attr->st_gid : (uint32_t)-1;
+        rc = stm_fs_chown(g_fs, ino, uid, gid);
+        if (rc) { fuse_reply_err(req, -rc); return; }
+    }
+
+    /* atime / mtime. FUSE splits the "set to now" from "set to specific
+     * value" via separate flags (*_NOW); we resolve _NOW to the current
+     * wall-clock before passing to stm_fs_utimes. */
+    int set_at = (to_set & (FUSE_SET_ATTR_ATIME | FUSE_SET_ATTR_ATIME_NOW)) != 0;
+    int set_mt = (to_set & (FUSE_SET_ATTR_MTIME | FUSE_SET_ATTR_MTIME_NOW)) != 0;
+    if (set_at || set_mt) {
+        struct timespec now;
+        clock_gettime(CLOCK_REALTIME, &now);
+        uint64_t as = 0, ms = 0;
+        uint32_t an = 0, mn = 0;
+        if (to_set & FUSE_SET_ATTR_ATIME_NOW) {
+            as = (uint64_t)now.tv_sec; an = (uint32_t)now.tv_nsec;
+        } else if (to_set & FUSE_SET_ATTR_ATIME) {
+            as = (uint64_t)attr->st_atime; an = 0;
+        }
+        if (to_set & FUSE_SET_ATTR_MTIME_NOW) {
+            ms = (uint64_t)now.tv_sec; mn = (uint32_t)now.tv_nsec;
+        } else if (to_set & FUSE_SET_ATTR_MTIME) {
+            ms = (uint64_t)attr->st_mtime; mn = 0;
+        }
+        rc = stm_fs_utimes(g_fs, ino, set_at, as, an, set_mt, ms, mn);
+        if (rc) { fuse_reply_err(req, -rc); return; }
+    }
+
+    if (to_set & FUSE_SET_ATTR_SIZE) {
+        rc = stm_fs_truncate(g_fs, ino, (uint64_t)attr->st_size);
+        if (rc) { fuse_reply_err(req, -rc); return; }
+    }
+
+    /* Reply with the post-mutation attrs so FUSE's cache refreshes. */
     struct stat st;
-    int rc = fill_attr(ino, &st);
+    rc = fill_attr(ino, &st);
     if (rc) { fuse_reply_err(req, -rc); return; }
     fuse_reply_attr(req, &st, 1.0);
+}
+
+/* After a successful create/mkdir, stamp the new inode's uid/gid with
+ * the caller's identity (from the FUSE request context). stm_fs_create_*
+ * don't take uid/gid params today, so we do a follow-up chown. Failure
+ * is non-fatal — the inode exists, just with 0:0 ownership; caller can
+ * chown explicitly. */
+static void stamp_ownership(fuse_req_t req, uint64_t ino)
+{
+    const struct fuse_ctx *ctx = fuse_req_ctx(req);
+    if (ctx) (void)stm_fs_chown(g_fs, ino, ctx->uid, ctx->gid);
 }
 
 static void ll_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name,
@@ -150,6 +209,7 @@ static void ll_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name,
     uint64_t new_ino;
     int rc = stm_fs_mkdir(g_fs, parent, name, mode & 0777, &new_ino);
     if (rc) { fuse_reply_err(req, -rc); return; }
+    stamp_ownership(req, new_ino);
     struct fuse_entry_param e;
     make_entry(new_ino, &e);
     fuse_reply_entry(req, &e);
@@ -161,6 +221,7 @@ static void ll_create(fuse_req_t req, fuse_ino_t parent, const char *name,
     uint64_t new_ino;
     int rc = stm_fs_create_file(g_fs, parent, name, mode & 0777, &new_ino);
     if (rc) { fuse_reply_err(req, -rc); return; }
+    stamp_ownership(req, new_ino);
     struct fuse_entry_param e;
     make_entry(new_ino, &e);
     fuse_reply_create(req, &e, fi);

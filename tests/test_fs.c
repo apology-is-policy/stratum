@@ -760,6 +760,118 @@ STM_TEST(test_fs_open_ro_rejects_writes)
     unlink(path);
 }
 
+/* POSIX Group A (SOTA #5): chmod / chown / utimes / truncate. */
+STM_TEST(test_fs_posix_attr_mutations)
+{
+    const char *path = "/tmp/stratum_test_posix_attr.img";
+    unlink(path);
+    STM_ASSERT_EQ(stm_fs_create(path, 32ULL*1024*1024, NULL), 0);
+    struct stm_fs *fs;
+    STM_ASSERT_EQ(stm_fs_open(path, NULL, &fs), 0);
+
+    uint64_t ino;
+    STM_ASSERT_EQ(stm_fs_create_file(fs, 1, "attr.txt", 0644, &ino), 0);
+
+    /* chmod: 0644 → 0600, preserving IFREG. */
+    STM_ASSERT_EQ(stm_fs_chmod(fs, ino, 0600), 0);
+    struct stm_inode in;
+    STM_ASSERT_EQ(stm_fs_stat(fs, ino, &in), 0);
+    STM_ASSERT_EQ(le32_to_cpu(in.si_mode) & 07777, (uint32_t)0600);
+    STM_ASSERT_EQ(le32_to_cpu(in.si_mode) & STM_S_IFMT, (uint32_t)STM_S_IFREG);
+
+    /* chown: set to 1000:1000. */
+    STM_ASSERT_EQ(stm_fs_chown(fs, ino, 1000, 1000), 0);
+    STM_ASSERT_EQ(stm_fs_stat(fs, ino, &in), 0);
+    STM_ASSERT_EQ(le32_to_cpu(in.si_uid), 1000u);
+    STM_ASSERT_EQ(le32_to_cpu(in.si_gid), 1000u);
+
+    /* chown with -1 only changes the named field. */
+    STM_ASSERT_EQ(stm_fs_chown(fs, ino, (uint32_t)-1, 2000), 0);
+    STM_ASSERT_EQ(stm_fs_stat(fs, ino, &in), 0);
+    STM_ASSERT_EQ(le32_to_cpu(in.si_uid), 1000u);   /* unchanged */
+    STM_ASSERT_EQ(le32_to_cpu(in.si_gid), 2000u);
+
+    /* utimes: set only mtime, preserve atime. */
+    uint64_t orig_atime = le64_to_cpu(in.si_atime_sec);
+    STM_ASSERT_EQ(stm_fs_utimes(fs, ino, 0, 0, 0, 1, 1234567890ULL, 500), 0);
+    STM_ASSERT_EQ(stm_fs_stat(fs, ino, &in), 0);
+    STM_ASSERT_EQ(le64_to_cpu(in.si_atime_sec), orig_atime);
+    STM_ASSERT_EQ(le64_to_cpu(in.si_mtime_sec), 1234567890ULL);
+    STM_ASSERT_EQ(le32_to_cpu(in.si_mtime_nsec), 500u);
+
+    /* truncate extend: pure metadata; sparse read returns zero. */
+    STM_ASSERT_EQ(stm_fs_truncate(fs, ino, 4096), 0);
+    STM_ASSERT_EQ(stm_fs_stat(fs, ino, &in), 0);
+    STM_ASSERT_EQ(le64_to_cpu(in.si_size), 4096u);
+
+    uint8_t rbuf[128];
+    memset(rbuf, 0xAA, sizeof(rbuf));
+    uint32_t nread = 0;
+    STM_ASSERT_EQ(stm_fs_read(fs, ino, 0, rbuf, sizeof(rbuf), &nread), 0);
+    STM_ASSERT_EQ(nread, (uint32_t)sizeof(rbuf));
+    for (size_t i = 0; i < sizeof(rbuf); i++) STM_ASSERT_EQ(rbuf[i], 0);
+
+    /* truncate shrink — multi-extent file then truncate to non-aligned
+     * size that lands inside an extent. Checks the read-modify-write
+     * path for the straddling extent. */
+    uint8_t *wbuf = malloc(256 * 1024);
+    STM_ASSERT(wbuf);
+    for (size_t i = 0; i < 256 * 1024; i++) wbuf[i] = (uint8_t)(i & 0xFF);
+    STM_ASSERT_EQ(stm_fs_write(fs, ino, 0, wbuf, 256 * 1024), 0);
+
+    /* Truncate to 150 KiB — straddles the second extent (131072..262143). */
+    STM_ASSERT_EQ(stm_fs_truncate(fs, ino, 150 * 1024), 0);
+    STM_ASSERT_EQ(stm_fs_stat(fs, ino, &in), 0);
+    STM_ASSERT_EQ(le64_to_cpu(in.si_size), (uint64_t)(150 * 1024));
+
+    /* First 150 KiB must read back original bytes. */
+    uint8_t *rfull = malloc(150 * 1024);
+    STM_ASSERT(rfull);
+    STM_ASSERT_EQ(stm_fs_read(fs, ino, 0, rfull, 150 * 1024, &nread), 0);
+    STM_ASSERT_EQ(nread, (uint32_t)(150 * 1024));
+    STM_ASSERT_MEM_EQ(rfull, wbuf, 150 * 1024);
+    free(rfull); free(wbuf);
+
+    /* Beyond the truncation point: read returns 0 bytes (past EOF). */
+    uint8_t tail[32];
+    STM_ASSERT_EQ(stm_fs_read(fs, ino, 150 * 1024, tail, sizeof(tail), &nread), 0);
+    STM_ASSERT_EQ(nread, 0u);
+
+    /* Truncate to aligned size (exactly one extent) — no straddle path. */
+    STM_ASSERT_EQ(stm_fs_truncate(fs, ino, 128 * 1024), 0);
+    STM_ASSERT_EQ(stm_fs_stat(fs, ino, &in), 0);
+    STM_ASSERT_EQ(le64_to_cpu(in.si_size), (uint64_t)(128 * 1024));
+
+    /* Truncate to zero. */
+    STM_ASSERT_EQ(stm_fs_truncate(fs, ino, 0), 0);
+    STM_ASSERT_EQ(stm_fs_stat(fs, ino, &in), 0);
+    STM_ASSERT_EQ(le64_to_cpu(in.si_size), 0u);
+    STM_ASSERT_EQ(stm_fs_read(fs, ino, 0, tail, sizeof(tail), &nread), 0);
+    STM_ASSERT_EQ(nread, 0u);
+
+    /* Sync + reopen — the chmod/chown/utimes/truncate mutations must
+     * round-trip through disk. */
+    STM_ASSERT_EQ(stm_fs_sync(fs), 0);
+    stm_fs_close(fs);
+    STM_ASSERT_EQ(stm_fs_open(path, NULL, &fs), 0);
+
+    uint64_t ino2;
+    STM_ASSERT_EQ(stm_fs_lookup(fs, 1, "attr.txt", &ino2), 0);
+    STM_ASSERT_EQ(ino2, ino);
+    STM_ASSERT_EQ(stm_fs_stat(fs, ino, &in), 0);
+    /* mtime is intentionally NOT checked across reopen — every
+     * subsequent op (write, truncate) updates it to "now" per POSIX,
+     * so the explicit 1234567890 we set earlier has been overwritten.
+     * mode / uid / gid / size are all mutation-persistent. */
+    STM_ASSERT_EQ(le32_to_cpu(in.si_mode) & 07777, (uint32_t)0600);
+    STM_ASSERT_EQ(le32_to_cpu(in.si_uid), 1000u);
+    STM_ASSERT_EQ(le32_to_cpu(in.si_gid), 2000u);
+    STM_ASSERT_EQ(le64_to_cpu(in.si_size), 0u);
+
+    stm_fs_close(fs);
+    unlink(path);
+}
+
 int main(void)
 {
     STM_SUITE("fs");
@@ -780,6 +892,7 @@ int main(void)
     STM_RUN(test_fs_sync_two_phase_gen_invariant);
     STM_RUN(test_fs_mount_bump_encrypted);
     STM_RUN(test_fs_open_ro_rejects_writes);
+    STM_RUN(test_fs_posix_attr_mutations);
     printf("all passed\n");
     return 0;
 }
