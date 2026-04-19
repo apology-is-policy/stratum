@@ -147,6 +147,20 @@ uint16_t        stm_space_height(struct stm_space *sp);
                                        STM_SPACE_LOG_HDR_SIZE) / \
                                       sizeof(struct stm_space_entry))
 
+/* Pool layout, stamped into the SB at mkfs. Pool occupies a contiguous
+ * block range starting just after the two superblock slots. The main
+ * allocator NEVER hands out blocks from this range — log chunks go
+ * through the pool-internal allocator (pool.c) which doesn't recurse
+ * through stm_alloc. Sizing: 2048 blocks × 4 KiB = 8 MiB pool, which
+ * holds up to 2048 log chunks × 126 entries = 258k deltas before fold.
+ * At ≈1 sync/s with ~100 deltas/sync, that's about 40 minutes of
+ * unfolded log — Stage 4+ adds periodic fold; Stage 3 relies on the
+ * sizing to not run out. */
+#define STM_SPACE_POOL_START_BLOCK   2u
+#define STM_SPACE_POOL_BLOCKS        2048u
+#define STM_SPACE_POOL_END_BLOCK     (STM_SPACE_POOL_START_BLOCK + \
+                                      STM_SPACE_POOL_BLOCKS)
+
 struct __attribute__((packed)) stm_space_log_hdr {
     le64    slh_magic;         /* STM_SPACE_LOG_MAGIC */
     le64    slh_gen;            /* commit generation for this chunk */

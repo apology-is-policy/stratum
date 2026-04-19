@@ -8,6 +8,7 @@
 #include "stratum/bptr.h"
 #include "stratum/crypto.h"
 #include "stratum/alloc.h"
+#include "stratum/space.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -106,6 +107,17 @@ struct stm_fs {
      * dereferencing a NULL tree and crashing the server. The only
      * legal subsequent op on a wedged fs is stm_fs_close. */
     int      wedged;
+    /* Phase D #2 Stage 3: persistent allocator delta log (dual-source
+     * validation). space_log is the in-memory handle; space_log_head
+     * tracks the on-disk head paddr (updated at each commit, written
+     * to SB). space_pool_* describe the reserved log-chunk region.
+     * space_pool_next is a bump cursor for chunk allocation — Stage 3
+     * doesn't reclaim pool blocks; Stage 4's fold machinery will. */
+    struct stm_space_log *space_log;
+    uint64_t space_log_head;
+    uint64_t space_pool_start_block;
+    uint64_t space_pool_blocks;
+    uint64_t space_pool_next;       /* bump cursor (blocks) */
 };
 
 static inline struct stm_key stm_mk_key(uint64_t ino, uint8_t type,

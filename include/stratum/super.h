@@ -64,8 +64,18 @@ struct __attribute__((packed)) stm_superblock {
     /* Integrity */
     uint8_t ss_csum[STM_BLAKE3_LEN];         /*  32 */
 
+    /* Phase D #2 Stage 3: persistent allocator delta log.
+     * ss_space_log_head is the byte paddr of the newest log chunk
+     * (chain head, backward-linked); 0 = empty log.
+     * [ss_space_pool_start, ss_space_pool_start + ss_space_pool_blocks*4096)
+     * is the reserved block range used for log chunks — carved out at
+     * mkfs and never touched by the main allocator. */
+    le64    ss_space_log_head;                /*   8 */
+    le64    ss_space_pool_start;              /*   8 */
+    le64    ss_space_pool_blocks;             /*   8 */
+
     /* Pad to 512 bytes */
-    uint8_t ss_reserved[111];                 /* 111 */
+    uint8_t ss_reserved[87];                  /*  87 */
 };
 
 STM_STATIC_ASSERT(sizeof(struct stm_superblock) == 512, stm_superblock_size);

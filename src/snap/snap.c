@@ -487,6 +487,13 @@ after_reopen:
          * old allocator. */
         fs->alloc = new_alloc;
         stm_alloc_mark(new_alloc, 0, 2);
+        /* Phase D #2 Stage 3: reserve the pool on the new allocator so
+         * post-rollback writes never touch log-chunk blocks. Skip on
+         * volumes without a pool (pre-Stage-3). */
+        if (fs->space_pool_blocks > 0) {
+            stm_alloc_set_pool(new_alloc, fs->space_pool_start_block,
+                               fs->space_pool_blocks);
+        }
         rc = stm_btree_walk_entries(fs->tree, stm_btree_root(fs->tree),
                                     mark_block_snap, mark_extent_snap, fs);
         if (rc) goto rollback_restore;
@@ -533,6 +540,11 @@ after_reopen:
         stm_btree_set_allocator(fs->tree, new_alloc);
         if (fs->snap_tree)
             stm_btree_set_allocator(fs->snap_tree, new_alloc);
+        /* Phase D #2 Stage 3: reattach the log. old_alloc gets its
+         * log pointer cleared by the close so no dangling reference.
+         * new_alloc keeps logging post-rollback deltas. */
+        stm_alloc_attach_log(old_alloc, NULL);
+        stm_alloc_attach_log(new_alloc, fs->space_log);
         stm_alloc_close(old_alloc);
         return 0;
 

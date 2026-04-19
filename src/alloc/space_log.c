@@ -15,6 +15,7 @@
 #include "stratum/block.h"
 #include "stratum/csum.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -296,6 +297,11 @@ int stm_space_log_fold_into(struct stm_space_log *log,
                 rc = stm_space_unref(tree, paddr, gen);
                 break;
             default:
+                fprintf(stderr,
+                        "stm_space_log fold: entry %u has unknown op=%u "
+                        "(paddr=%llu count=%llu)\n",
+                        i, e->se_op,
+                        (unsigned long long)paddr, (unsigned long long)count);
                 return -EIO;
         }
         if (rc) return rc;

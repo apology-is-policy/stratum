@@ -36,4 +36,22 @@ uint64_t stm_alloc_total(struct stm_alloc *a);
  * (freed this sync, not yet reclaimed). Out-of-bounds returns 0. */
 uint32_t stm_alloc_get_refcount(struct stm_alloc *a, uint64_t block_nr);
 
+/* ── Phase D #2 Stage 3: persistent-log shadow ─────────────────────── */
+
+struct stm_space_log;
+
+/* Attach a delta log. After this, every stm_alloc_extent / _free / _ref
+ * also appends an entry to the log. stm_alloc_mark does NOT log —
+ * marks are mount-walk reconstruction of existing state, not new
+ * operations. Pass log=NULL to detach. The alloc does not take
+ * ownership; caller owns the log lifetime. */
+void stm_alloc_attach_log(struct stm_alloc *a, struct stm_space_log *log);
+
+/* Reserve a pool of blocks that the main allocator will NEVER hand out.
+ * Those blocks are intended for log-chunk storage via pool.c. Call once
+ * after stm_alloc_open, before any stm_alloc_extent call. Implementation:
+ * bumps refcounts in the array to 1 so the forward-scan skips them. */
+void stm_alloc_set_pool(struct stm_alloc *a,
+                        uint64_t pool_start_block, uint64_t pool_blocks);
+
 #endif /* STM_ALLOC_H */

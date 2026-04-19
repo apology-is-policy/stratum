@@ -1,4 +1,6 @@
 #include "stratum/alloc.h"
+#include "stratum/space.h"
+#include "stratum/types.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -18,12 +20,19 @@ struct stm_alloc {
     uint64_t  total;             /* total blocks */
     uint64_t  free_count;
     uint64_t  hint;              /* roving cursor for next-fit */
+    uint64_t  hint_floor;        /* minimum the hint can wrap to; 2 by
+                                  * default, bumped past the pool when
+                                  * stm_alloc_set_pool is called (Phase
+                                  * D #2 Stage 3) so the allocator never
+                                  * wastes a scan pass over the pool. */
     uint32_t *refcounts;         /* refcount per block — widened from
                                   * uint16_t so blocks shared by many
                                   * snapshots don't saturate at 65534 */
     struct deferred_free *deferred;
     uint32_t  ndeferred;
     uint32_t  deferred_cap;
+    /* Phase D #2 Stage 3: optional delta log. NULL = not wired. */
+    struct stm_space_log *log;
 };
 
 int stm_alloc_open(struct stm_block_dev *dev, uint64_t total_blocks,
@@ -36,6 +45,8 @@ int stm_alloc_open(struct stm_block_dev *dev, uint64_t total_blocks,
     a->total = total_blocks;
     a->free_count = total_blocks;
     a->hint  = 0;
+    a->hint_floor = 2;  /* default: skip the two SB slots on wrap. */
+    a->log = NULL;
 
     a->refcounts = calloc(total_blocks, sizeof(uint32_t));
     if (!a->refcounts) { free(a); return -ENOMEM; }
@@ -132,6 +143,15 @@ int stm_alloc_extent(struct stm_alloc *a, uint32_t count, uint64_t *out_paddr)
                     a->free_count -= count;
                     a->hint = base + count;
                     *out_paddr = base * STM_BLOCK_SIZE;
+                    if (a->log) {
+                        struct stm_space_entry e;
+                        memset(&e, 0, sizeof(e));
+                        e.se_op       = STM_SPACE_ALLOC;
+                        e.se_paddr    = cpu_to_le64(base);
+                        e.se_count    = cpu_to_le64(count);
+                        e.se_refcount = cpu_to_le32(1);
+                        (void)stm_space_log_append(a->log, &e);
+                    }
                     return 0;
                 }
             } else {
@@ -140,9 +160,11 @@ int stm_alloc_extent(struct stm_alloc *a, uint32_t count, uint64_t *out_paddr)
             pos++;
         }
         /* Wrap hint when it reaches the end — avoids getting stuck at
-         * the end of a grown volume where all new blocks are used. */
+         * the end of a grown volume where all new blocks are used.
+         * hint_floor skips past the pool (if configured) so wrap doesn't
+         * waste a scan pass over perma-marked pool blocks. */
         if (pos >= a->total)
-            a->hint = 2;  /* skip superblock blocks 0-1 */
+            a->hint = a->hint_floor;
         else
             a->hint = pos;
     }
@@ -162,6 +184,15 @@ int stm_alloc_extent(struct stm_alloc *a, uint32_t count, uint64_t *out_paddr)
                     a->free_count -= count;
                     a->hint = base + count;
                     *out_paddr = base * STM_BLOCK_SIZE;
+                    if (a->log) {
+                        struct stm_space_entry e;
+                        memset(&e, 0, sizeof(e));
+                        e.se_op       = STM_SPACE_ALLOC;
+                        e.se_paddr    = cpu_to_le64(base);
+                        e.se_count    = cpu_to_le64(count);
+                        e.se_refcount = cpu_to_le32(1);
+                        (void)stm_space_log_append(a->log, &e);
+                    }
                     return 0;
                 }
             } else {
@@ -184,11 +215,13 @@ int stm_alloc_extent(struct stm_alloc *a, uint32_t count, uint64_t *out_paddr)
 void stm_alloc_free(struct stm_alloc *a, uint64_t block_nr, uint32_t count)
 {
     uint32_t i;
+    int decremented = 0;
     for (i = 0; i < count && block_nr + i < a->total; i++) {
         uint64_t b = block_nr + i;
         if (a->refcounts[b] == 0 || a->refcounts[b] == REFCOUNT_PENDING)
             continue;
         a->refcounts[b]--;
+        decremented = 1;
         if (a->refcounts[b] == 0) {
             /*
              * Don't set to 0 yet — that would let stm_alloc_extent
@@ -214,17 +247,41 @@ void stm_alloc_free(struct stm_alloc *a, uint64_t block_nr, uint32_t count)
                  * Block stays live and leaks until the next mount
                  * rebuild or until another deferred slot opens up. */
                 a->refcounts[b]++;
+                decremented = 0;
             }
         }
+    }
+    /* Phase D #2 Stage 3: only log FREE if we actually decremented at
+     * least one refcount. A no-op free (block already 0 or PENDING)
+     * would produce a log entry without a matching tree entry, causing
+     * fold to fail on the next mount. */
+    if (a->log && decremented) {
+        struct stm_space_entry e;
+        memset(&e, 0, sizeof(e));
+        e.se_op    = STM_SPACE_FREE;
+        e.se_paddr = cpu_to_le64(block_nr);
+        e.se_count = cpu_to_le64(count);
+        (void)stm_space_log_append(a->log, &e);
     }
 }
 
 void stm_alloc_ref(struct stm_alloc *a, uint64_t block_nr, uint32_t count)
 {
     uint32_t i;
+    int incremented = 0;
     for (i = 0; i < count && block_nr + i < a->total; i++) {
-        if (a->refcounts[block_nr + i] < REFCOUNT_PENDING - 1)
+        if (a->refcounts[block_nr + i] < REFCOUNT_PENDING - 1) {
             a->refcounts[block_nr + i]++;
+            incremented = 1;
+        }
+    }
+    if (a->log && incremented) {
+        struct stm_space_entry e;
+        memset(&e, 0, sizeof(e));
+        e.se_op    = STM_SPACE_REF;
+        e.se_paddr = cpu_to_le64(block_nr);
+        e.se_count = cpu_to_le64(count);
+        (void)stm_space_log_append(a->log, &e);
     }
 }
 
@@ -255,4 +312,29 @@ uint32_t stm_alloc_get_refcount(struct stm_alloc *a, uint64_t block_nr)
 {
     if (block_nr >= a->total) return 0;
     return a->refcounts[block_nr];
+}
+
+void stm_alloc_attach_log(struct stm_alloc *a, struct stm_space_log *log)
+{
+    a->log = log;
+}
+
+void stm_alloc_set_pool(struct stm_alloc *a,
+                        uint64_t pool_start_block, uint64_t pool_blocks)
+{
+    /* Mark pool blocks with refcount=1 so the main allocator's forward
+     * scan skips them. Only blocks that are currently 0 (unmarked) need
+     * bumping — a double call (e.g. if mount re-runs this after grow)
+     * must be idempotent. */
+    for (uint64_t i = 0; i < pool_blocks; i++) {
+        uint64_t b = pool_start_block + i;
+        if (b >= a->total) break;
+        if (a->refcounts[b] == 0) {
+            a->refcounts[b] = 1;
+            if (a->free_count > 0) a->free_count--;
+        }
+    }
+    uint64_t end = pool_start_block + pool_blocks;
+    if (end > a->hint_floor) a->hint_floor = end;
+    if (a->hint < a->hint_floor) a->hint = a->hint_floor;
 }

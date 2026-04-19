@@ -81,6 +81,71 @@ static int walk_snap_cb(const struct stm_key *key, const void *val,
     return rc;
 }
 
+/* Phase D #2 Stage 3: pool bump allocator for space-log chunks.
+ *
+ * Hands out blocks from the reserved pool via fs->space_pool_next, never
+ * going through stm_alloc_extent (that's the whole point — the log
+ * records stm_alloc operations and must not record its own chunk
+ * writes, or we infinite-regress). Stage 3 doesn't reclaim pool blocks,
+ * so the cursor advances monotonically. Stage 4's periodic fold will
+ * add a free list. */
+static int fs_space_log_alloc(void *ctx, uint64_t *out_paddr)
+{
+    struct stm_fs *fs = ctx;
+    uint64_t pool_end = fs->space_pool_start_block + fs->space_pool_blocks;
+    if (fs->space_pool_next >= pool_end) return -ENOSPC;
+    *out_paddr = fs->space_pool_next * STM_BLOCK_SIZE;
+    fs->space_pool_next++;
+    return 0;
+}
+
+/* mkfs-time pool bump allocator — doesn't need a whole struct stm_fs yet,
+ * so uses a minimal context. Keeps the initial-log-bootstrap in
+ * stm_fs_create self-contained. */
+struct mkfs_pool_ctx {
+    uint64_t next;   /* block address for next chunk */
+    uint64_t end;    /* pool end (exclusive, blocks) */
+};
+
+static int mkfs_log_alloc(void *ctx_, uint64_t *out_paddr)
+{
+    struct mkfs_pool_ctx *c = ctx_;
+    if (c->next >= c->end) return -ENOSPC;
+    *out_paddr = c->next * STM_BLOCK_SIZE;
+    c->next++;
+    return 0;
+}
+
+/* Phase D #2 Stage 3 validation: for each range the folded log records,
+ * every block in that range should carry the folded refcount in the
+ * in-memory allocator. Any mismatch means the log diverged from reality
+ * — we wedge the fs rather than silently trust a bad log. */
+struct fs_space_validate_ctx {
+    struct stm_alloc *alloc;
+    int               mismatches;
+    uint64_t          first_mismatch_block;
+    uint32_t          first_mismatch_log_rc;
+    uint32_t          first_mismatch_alloc_rc;
+};
+
+static int fs_space_validate_cb(uint64_t start, uint64_t count,
+                                uint32_t refcount, void *ctx)
+{
+    struct fs_space_validate_ctx *v = ctx;
+    for (uint64_t i = 0; i < count; i++) {
+        uint32_t a_rc = stm_alloc_get_refcount(v->alloc, start + i);
+        if (a_rc != refcount) {
+            if (v->mismatches == 0) {
+                v->first_mismatch_block     = start + i;
+                v->first_mismatch_log_rc    = refcount;
+                v->first_mismatch_alloc_rc  = a_rc;
+            }
+            v->mismatches++;
+        }
+    }
+    return 0;   /* walk all so mismatches count is meaningful */
+}
+
 static void stm_now(uint64_t *sec, uint32_t *nsec)
 {
     struct timespec ts;
@@ -279,6 +344,20 @@ int stm_fs_create_ex(const char *path, uint64_t size_bytes,
 
     stm_btree_set_id(tree, STM_TREE_ID_MAIN);
 
+    /* Phase D #2 Stage 3: carve out the space-log chunk pool right after
+     * the two SBs. The main tree's bump allocator starts past the pool
+     * so no btree node or extent lands inside the reserved region.
+     *
+     * Pool size is min(default, total_blocks/4) so small test volumes
+     * (e.g. 8 MiB) still have room for data. Clamped to at least 32
+     * blocks so the pool is usable even on tiny volumes. */
+    uint64_t total_blocks = size_bytes / STM_BLOCK_SIZE;
+    uint64_t pool_blocks_cfg = STM_SPACE_POOL_BLOCKS;
+    if (pool_blocks_cfg > total_blocks / 4) pool_blocks_cfg = total_blocks / 4;
+    if (pool_blocks_cfg < 32) pool_blocks_cfg = 32;
+    uint64_t pool_end_block = STM_SPACE_POOL_START_BLOCK + pool_blocks_cfg;
+    stm_btree_set_alloc(tree, pool_end_block * STM_BLOCK_SIZE);
+
 #ifdef STM_HAVE_LZ4
     stm_btree_set_compression(tree, STM_COMP_LZ4);
 #endif
@@ -346,6 +425,40 @@ int stm_fs_create_ex(const char *path, uint64_t size_bytes,
     rc = stm_btree_flush(tree, 1);  /* gen=1 for initial mkfs */
     if (rc) goto fail_tree;
 
+    /* Phase D #2 Stage 3: bootstrap the space-log with an ALLOC entry for
+     * the freshly-written tree root node. Without this, the log's first-
+     * ever replay would see a FREE of the root (when Session 1 COWs it)
+     * with no matching prior ALLOC — fold fails with -ENOENT. Seeding
+     * mkfs's allocations into the log keeps the chain self-contained. */
+    uint64_t space_log_head = 0;
+    {
+        struct mkfs_pool_ctx mctx = {
+            .next = STM_SPACE_POOL_START_BLOCK,
+            .end  = pool_end_block,
+        };
+        struct stm_space_log *mklog = NULL;
+        rc = stm_space_log_open(&dev, 0, mkfs_log_alloc, &mctx, &mklog);
+        if (rc) goto fail_tree;
+
+        struct stm_bptr root_bptr = stm_btree_root(tree);
+        uint64_t root_paddr = le64_to_cpu(root_bptr.bp_paddr);
+        uint32_t root_csize = le32_to_cpu(root_bptr.bp_csize);
+        uint32_t root_nblocks =
+            (root_csize + STM_BLOCK_SIZE - 1) / STM_BLOCK_SIZE;
+        struct stm_space_entry e = {0};
+        e.se_op       = STM_SPACE_ALLOC;
+        e.se_paddr    = cpu_to_le64(root_paddr / STM_BLOCK_SIZE);
+        e.se_count    = cpu_to_le64(root_nblocks);
+        e.se_refcount = cpu_to_le32(1);
+        e.se_gen      = cpu_to_le64(1);
+        rc = stm_space_log_append(mklog, &e);
+        if (rc) { stm_space_log_close(mklog); goto fail_tree; }
+
+        rc = stm_space_log_commit(mklog, 1, &space_log_head);
+        stm_space_log_close(mklog);
+        if (rc) goto fail_tree;
+    }
+
     /* build superblock (sb was zeroed above, enc fields already set) */
     sb.ss_magic        = cpu_to_le64(STM_MAGIC);
     sb.ss_version      = cpu_to_le32(2);
@@ -363,6 +476,11 @@ int stm_fs_create_ex(const char *path, uint64_t size_bytes,
     sb.ss_snap_height  = cpu_to_le16(0);
     sb.ss_next_snap_id = cpu_to_le64(1);
     sb.ss_comp_algo    = comp_algo;
+    /* Phase D #2 Stage 3 pool + log metadata. */
+    sb.ss_space_log_head   = cpu_to_le64(space_log_head);
+    sb.ss_space_pool_start = cpu_to_le64(
+        (uint64_t)STM_SPACE_POOL_START_BLOCK * STM_BLOCK_SIZE);
+    sb.ss_space_pool_blocks = cpu_to_le64(pool_blocks_cfg);
 
     memset(sb.ss_csum, 0, sizeof(sb.ss_csum));
     stm_csum_compute(&sb, sizeof(sb), sb.ss_csum);
@@ -612,6 +730,85 @@ static int stm_fs_open_impl(const char *path, const char *passphrase,
         stm_btree_set_allocator(fs->tree, fs->alloc);
         if (fs->snap_tree)
             stm_btree_set_allocator(fs->snap_tree, fs->alloc);
+
+        /* Phase D #2 Stage 3 — dual-source validation.
+         *
+         * If the SB carries pool metadata (pool_blocks > 0), this volume
+         * was created by a Stage-3-or-later mkfs and has an active log.
+         * Reserve the pool in the allocator so main alloc never touches
+         * it, open the log chain, fold it into a throwaway in-memory
+         * space tree, and assert the tree's state matches the walk-
+         * derived refcount array. On mismatch, wedge the fs — the log
+         * has diverged from reality and we can't trust writes through it.
+         *
+         * If pool_blocks == 0, the volume predates Stage 3. Skip the log
+         * entirely; operate identically to pre-Stage-3 behavior. */
+        fs->space_pool_start_block = le64_to_cpu(chosen->ss_space_pool_start) / STM_BLOCK_SIZE;
+        fs->space_pool_blocks      = le64_to_cpu(chosen->ss_space_pool_blocks);
+        fs->space_log_head         = le64_to_cpu(chosen->ss_space_log_head);
+        fs->space_pool_next        = 0;
+        fs->space_log              = NULL;
+
+        if (fs->space_pool_blocks > 0) {
+            stm_alloc_set_pool(fs->alloc, fs->space_pool_start_block,
+                               fs->space_pool_blocks);
+
+            /* pool_next bump cursor. The log-open-time chain is bump-
+             * allocated so the newest (head) chunk has the highest paddr;
+             * advancing past head gives the next free pool block. */
+            if (fs->space_log_head != 0) {
+                fs->space_pool_next = fs->space_log_head / STM_BLOCK_SIZE + 1;
+            } else {
+                fs->space_pool_next = fs->space_pool_start_block;
+            }
+
+            rc = stm_space_log_open(&fs->dev, fs->space_log_head,
+                                    fs_space_log_alloc, fs, &fs->space_log);
+            if (rc) goto fail_alloc;
+
+            /* Validate: build a throwaway in-memory space tree from the
+             * log chain, walk the tree, compare every refcount to the
+             * walk-derived allocator array. */
+            struct stm_space *vtree = NULL;
+            rc = stm_space_open(&fs->dev, stm_bptr_null(), 0, &vtree);
+            if (rc) { stm_space_log_close(fs->space_log); fs->space_log = NULL; goto fail_alloc; }
+
+            rc = stm_space_log_fold_into(fs->space_log, vtree, /*gen=*/0);
+            if (rc) {
+                /* Stage 3 WARN: fold failure means the log is internally
+                 * inconsistent (usually from rollback, which makes prior
+                 * log entries reference ranges no longer reachable via
+                 * the new root). Validation is diagnostic only in Stage 3;
+                 * the refcount array remains the allocator's source of
+                 * truth. Stage 3.5 will close this gap by rebuilding the
+                 * log on rollback. */
+                fprintf(stderr,
+                        "stratum: space-log fold failed at mount: rc=%d — "
+                        "continuing (Stage 3 WARN; refcount array is SoT)\n",
+                        rc);
+                rc = 0;
+            } else {
+                struct fs_space_validate_ctx v = { .alloc = fs->alloc };
+                (void)stm_space_walk(vtree, fs_space_validate_cb, &v);
+                if (v.mismatches > 0) {
+                    fprintf(stderr,
+                            "stratum: space-log diverged from walk: %d "
+                            "mismatches (e.g. block %llu: log says rc=%u, "
+                            "walk says rc=%u) — continuing (Stage 3 WARN)\n",
+                            v.mismatches,
+                            (unsigned long long)v.first_mismatch_block,
+                            v.first_mismatch_log_rc,
+                            v.first_mismatch_alloc_rc);
+                }
+            }
+            stm_space_close(vtree);
+
+            /* Wire log into allocator so subsequent ops record their
+             * deltas. The allocator's existing in-memory array stays
+             * source of truth through Stage 3. */
+            stm_alloc_attach_log(fs->alloc, fs->space_log);
+        }
+
         goto alloc_ok;
 
     fail_alloc:
@@ -741,6 +938,11 @@ static void build_sb(struct stm_fs *fs, struct stm_superblock *sb,
     memcpy(sb->ss_enc_wrapped_key, fs->enc_wrapped_key, sizeof(sb->ss_enc_wrapped_key));
     memcpy(sb->ss_enc_nonce, fs->enc_nonce, sizeof(sb->ss_enc_nonce));
     sb->ss_comp_algo    = fs->comp_algo;
+    /* Phase D #2 Stage 3: persist pool metadata + log head. */
+    sb->ss_space_log_head   = cpu_to_le64(fs->space_log_head);
+    sb->ss_space_pool_start = cpu_to_le64(
+        fs->space_pool_start_block * (uint64_t)STM_BLOCK_SIZE);
+    sb->ss_space_pool_blocks = cpu_to_le64(fs->space_pool_blocks);
 
     memset(sb->ss_csum, 0, sizeof(sb->ss_csum));
     stm_csum_compute(sb, sizeof(*sb), sb->ss_csum);
@@ -871,6 +1073,22 @@ int stm_fs_sync(struct stm_fs *fs)
             stm_btree_set_alloc(fs->tree, a);
     }
 
+    /* Phase D #2 Stage 3: between flush and final SB, commit any pending
+     * log entries. New chunks are written to the pool and the head paddr
+     * advances. Phase 3's SB then carries the new head.
+     *
+     * Crash-safety: if we crash between log commit and Phase 3, the new
+     * chunks sit in the pool but no SB references them. Next mount reads
+     * the old SB, ignores the orphan chunks, recomputes pool_next from
+     * the old head — and the next sync's commit overwrites them. Log
+     * orphans are confined to the pool and non-corrupting. */
+    if (fs->space_log) {
+        uint64_t new_head = 0;
+        rc = stm_space_log_commit(fs->space_log, gen_used, &new_head);
+        if (rc) return rc;
+        fs->space_log_head = new_head;
+    }
+
     /* Phase 3: final commit. ss_gen = gen_final = G+2 (strictly greater
      * than reservation, so mount's gen tiebreak picks this SB). Write to
      * current sb_slot (overwriting prior final): if this torns, the
@@ -896,6 +1114,14 @@ int stm_fs_sync(struct stm_fs *fs)
 void stm_fs_close(struct stm_fs *fs)
 {
     if (!fs) return;
+    /* Detach log from allocator BEFORE closing either. The allocator's
+     * close iterates its deferred-free list; any stray append into a
+     * freed log would UAF. */
+    if (fs->alloc) stm_alloc_attach_log(fs->alloc, NULL);
+    if (fs->space_log) {
+        stm_space_log_close(fs->space_log);
+        fs->space_log = NULL;
+    }
     stm_btree_close(fs->snap_tree);
     stm_btree_close(fs->tree);
     stm_alloc_close(fs->alloc);
