@@ -2286,37 +2286,459 @@ Status: DRAFT → awaiting review, push-back, then COMMITTED.
 
 ## 8. Namespace model (subvolumes, datasets, snapshots, clones)
 
-**STATUS**: STUB
+**STATUS**: DRAFT
 
-### 8.1 Goals
+### 8.1 Goals and non-goals
 
-- Hierarchical dataset structure.
-- Per-dataset property inheritance.
-- Per-dataset encryption keys.
-- Snapshots and clones as first-class primitives.
-- Per-connection namespace composition (NOVEL #8).
+**Goals**:
 
-### 8.2 Decisions committed (VISION §5.5, NOVEL #8)
+- Hierarchical dataset structure (ZFS-style), with per-dataset properties inherited from parents.
+- Per-dataset encryption keys, redundancy profiles, compression modes (§7, §4).
+- O(1) snapshot creation.
+- O(1) clone creation (clones are writable snapshots).
+- Send/recv for replication, both plaintext and raw-encrypted.
+- Per-9P-connection namespace composition (NOVEL #8).
+- Dataset rename / move without data movement.
+- Snapshot visibility via `<dataset>/.snaps/<name>/` synthetic paths.
 
-- Per-connection 9P namespaces for client isolation.
-- Datasets have separate tree roots.
+**Non-goals**:
 
-### 8.3 Subsections to write
+- Snapshot scheduling inside the filesystem. Expose the atomic create-snapshot primitive; let userspace cron / systemd / sanoid schedule.
+- Cross-pool namespace composition. A 9P connection sees one pool's namespace, not aggregates across pools.
+- Legacy btrfs-style "flat subvolume" model where subvolumes aren't nested. Ours is strictly hierarchical.
+- Strict POSIX namespace semantics across datasets. `rename(2)` across dataset boundaries is `-EXDEV` (same as across mount points), matching Linux convention.
+- Inline cross-dataset hard links. A file in dataset A cannot hard-link to a file in dataset B. Reflinks are the cross-dataset way.
 
-- **8.3.1** Dataset hierarchy — paths, tree of datasets, depth policy.
-- **8.3.2** Property inheritance — what's inherited, overridable, how recorded.
-- **8.3.3** Snapshot mechanics — freeze tree root, refcount bumps, visibility.
-- **8.3.4** Clone mechanics — writable snapshot, diverging tree root.
-- **8.3.5** Send / recv — wire format, incremental via tree diff.
-- **8.3.6** Per-connection namespace composition — `Tbind`, union mounts.
-- **8.3.7** Dataset properties — canonical list, defaults, validation.
-- **8.3.8** Dataset rename / move.
+### 8.2 Decisions already committed
 
-### 8.4 Open questions
+From earlier docs and sections:
 
-- Arbitrary-depth dataset tree vs fixed depth.
-- Snapshot deletion: immediate refcount drop vs mark-and-sweep.
-- Cross-dataset hard links: allowed (rare use case, complicated) or disallowed.
+- **Per-connection 9P namespaces** (NOVEL #8).
+- **Datasets have separate tree roots** (VISION §5.5).
+- **Per-dataset encryption keys** (§7.3.2).
+- **Per-dataset redundancy override** (§4.5.2).
+- **Snapshot creation is O(1)** — the mechanism is birth-txg tracking, described here.
+
+Decisions taken in this section:
+
+- **Dataset IDs are u64**, assigned at creation time, stable across renames. Names are path-like human labels that can change.
+- **Dataset tree structure is arbitrary-depth hierarchical**. No artificial cap.
+- **Birth-txg tracking** for snapshot accounting. Snapshot create is O(1); snapshot delete walks with birth-txg logic.
+- **Refcount-based tracking remains** for cross-dataset sharing (clones, CAS dedup) — birth-txg handles intra-dataset snapshot accounting; refcounts handle inter-dataset shares.
+- **Dataset index** is a pool-wide btree (keyed by dataset_id) rooted at `ub_main_root`. Each entry points at the dataset's own inode-and-extent tree.
+- **Send/recv wire format** is Stratum-specific; no backward compatibility with ZFS streams.
+- **9P `Tbind` extension** for per-connection namespace composition.
+- **Snapshot visibility**: `.snaps/<name>/` synthetic entries within each dataset's root directory.
+
+### 8.3 Dataset hierarchy
+
+Datasets form a tree. The root dataset (typically the pool name, e.g., `tank`) is created at pool initialization; all other datasets descend from it.
+
+```
+tank                           (root dataset, id=1)
+├── tank/home                  (id=2)
+│   ├── tank/home/alice        (id=3)
+│   │   └── tank/home/alice/.snaps/
+│   │       ├── daily-2026-04-19  (read-only view of snapshot id=100)
+│   │       └── weekly-2026-04   (id=95)
+│   └── tank/home/bob          (id=4)
+├── tank/var                   (id=5)
+│   └── tank/var/log           (id=6)
+└── tank/srv                   (id=7)
+    └── tank/srv/www           (id=8)
+```
+
+Each dataset's full path is a slash-separated sequence from the root. Max name length per component: 255 bytes. Max full path depth: no hard limit in the format; 64 is a practical policy default (guards against recursion bugs and accidental deep hierarchies).
+
+#### 8.3.1 Dataset ID vs name
+
+- **ID**: `u64`, assigned at creation. Stable across renames. Used in internal on-disk structures.
+- **Name**: a path of `/`-separated components, user-visible. Can be renamed (§8.10).
+
+Storing ID (not name) in extent ADs and in the dataset index means renames are O(1) — just update the name field in one place.
+
+#### 8.3.2 Dataset index
+
+A pool-wide btree keyed by dataset ID. Root in `ub_main_root`. Each entry:
+
+```c
+struct stm_dataset_index_entry {
+    le64    di_id;                    // dataset ID (key)
+    le64    di_parent_id;             // parent dataset ID (0 for root)
+    le32    di_name_len;
+    uint8_t di_name[256];             // component name (up to 255 bytes + NUL)
+    struct stm_bptr di_tree_root;     // root of this dataset's inode-and-extent tree
+    le64    di_created_txg;           // txg at creation
+    le64    di_key_slot;              // index into ub_key_schema
+    le32    di_flags;                 // encrypted, readonly, etc.
+
+    // Property-inheritance-local values (set by this dataset, not inherited).
+    // Bit-vector indicating which properties are local, plus the values.
+    uint8_t di_local_props[128];
+};
+```
+
+Walking the dataset index produces the full hierarchy. Enumerating children of a dataset: scan entries with `di_parent_id == X`.
+
+A secondary index (`dataset_name → id`) is maintained for name-based lookups — implemented as a second btree within the main tree, keyed by the full path hash.
+
+#### 8.3.3 Per-dataset tree
+
+Each dataset's `di_tree_root` points at a standard Bε-tree holding that dataset's inodes and extents. The tree structure is identical to any other inode-and-extent tree (§11).
+
+Datasets have independent inode number spaces. A dataset's `next_ino` is stored in its index entry (not pool-wide).
+
+### 8.4 Property inheritance
+
+Properties apply to datasets: `compression=zstd`, `encryption=aegis-256`, `redundancy=mirror(2)`, `recordsize=1M`, etc.
+
+#### 8.4.1 Inherited vs local
+
+- **Local**: set explicitly on this dataset. Stored in `di_local_props`.
+- **Inherited**: effective value comes from the nearest ancestor that has it set.
+- **Default**: effective value comes from the pool default if no ancestor sets it.
+
+Resolution algorithm:
+```
+effective(dataset, prop):
+    if dataset has local prop: return local value
+    if dataset has parent: return effective(parent, prop)
+    return pool_default[prop]
+```
+
+O(depth) lookup. Cache effective values per-dataset to avoid recomputation.
+
+#### 8.4.2 Canonical property list
+
+| Property | Type | Default | Inherited? | Notes |
+|---|---|---|---|---|
+| `compression` | `lz4` / `zstd` / `zstd-<N>` / `none` | `lz4` | yes | Per-extent on write |
+| `encryption` | `aegis-256` / `xchacha20-siv` / `none` | inherited or `aegis-256` | special | See §7.8 |
+| `redundancy` | profile string | pool default | yes | See §4.5 |
+| `recordsize` | bytes | 128 KiB | yes | Max extent size |
+| `atime` | `on` / `off` / `relatime` | `relatime` | yes | atime update policy |
+| `exec` | `on` / `off` | `on` | yes | Allow exec of files |
+| `readonly` | `on` / `off` | `off` | yes | Reject writes |
+| `quota` | bytes or `none` | `none` | no | Max dataset size |
+| `reservation` | bytes or `none` | `none` | no | Guaranteed space |
+| `casesensitive` | `sensitive` / `insensitive` / `mixed` | `sensitive` | yes | Name lookup semantics |
+| `copies` | 1–3 | inherited or 1 | yes | Ditto-block count for data |
+| `dedup` | `off` / `on` | `off` | yes | CAS cold-tier dedup eligibility |
+| `cas_chunk_size` | bytes | 8 MiB | yes | FastCDC average target |
+
+Properties marked "no" inheritance are per-dataset only (quota and reservation are inherently non-inheritable — they apply specifically to that dataset's storage).
+
+`encryption` is "special" because it's immutable after creation — you can inherit from parent or declare independent at creation, but cannot change later without full re-encryption (§7.8).
+
+#### 8.4.3 Property storage encoding
+
+`di_local_props[128]` bytes per dataset entry. Encoding:
+
+- 16 bytes: bit-vector of which properties are locally set (up to 128 properties).
+- 112 bytes: packed values of locally-set properties. Type-dependent encoding.
+
+If properties grow beyond what fits in 128 bytes, a feature flag (`COMPAT_EXTENDED_PROPERTIES`) enables an overflow-properties object stored in the main tree, referenced by `di_local_props`'s last-byte tag.
+
+### 8.5 Snapshot mechanics
+
+Snapshots are frozen-in-time references to a dataset's tree root. Creation is O(1) via birth-txg tracking.
+
+#### 8.5.1 Birth-txg tracking
+
+Every tree node and every extent record carries a `birth_txg` field — the transaction group in which it was written.
+
+- A fresh write gets `birth_txg = current_txg`.
+- A block that persists across commits retains its original `birth_txg`.
+- COW creates new blocks with new `birth_txgs`; old blocks retain theirs.
+
+This gives us "temporal ordering" of on-disk objects, free of charge — we already track txg for nonce uniqueness (§7.4); just surface it in every node header.
+
+Storage: 8 bytes per node (in node header), 8 bytes per extent record (already stored as `se_write_gen` in v1's Phase D #8).
+
+#### 8.5.2 Snapshot index
+
+A pool-wide btree keyed by `(dataset_id, snapshot_id)`. Each entry:
+
+```c
+struct stm_snapshot_entry {
+    le64    se_dataset_id;           // which dataset
+    le64    se_snapshot_id;           // unique within dataset
+    le32    se_name_len;
+    uint8_t se_name[256];             // human-readable snapshot name
+    struct stm_bptr se_tree_root;     // the dataset's tree root at snapshot time
+    le64    se_created_txg;           // txg at snapshot creation
+    le64    se_prev_snap_id;          // previous snapshot in this dataset's history (for delete walks)
+    le32    se_flags;                 // held / immutable / etc.
+};
+```
+
+Root of this index is in `ub_main_root`'s pool-metadata subtree (same tree as the dataset index, different keyspace via `STM_KEY_SNAP`).
+
+#### 8.5.3 Snapshot create (O(1))
+
+1. Coordinator flushes any buffered writes for the dataset (phase of the current commit).
+2. Allocate next `snapshot_id` for this dataset (from a pool counter).
+3. Write a new `stm_snapshot_entry` with:
+   - `se_tree_root = dataset's current di_tree_root`.
+   - `se_created_txg = current_txg`.
+   - `se_prev_snap_id = dataset's most-recent-snapshot-id`.
+4. Update the dataset index: this dataset's "most recent snapshot" pointer advances to the new snapshot.
+5. Commit.
+
+No refcount bumps, no tree walks. O(log N) to write the new snapshot entry; O(1) everything else.
+
+The snapshot's tree root shares nodes with the live dataset's tree — they start identical. As the live dataset is modified, COW diverges them.
+
+#### 8.5.4 Snapshot visibility
+
+A read-only view is exposed at `<dataset_path>/.snaps/<snapshot_name>/`:
+
+- Synthetic directory entry in the dataset's root; doesn't consume a real inode.
+- Each `.snaps/<name>` is rooted at the snapshot's `se_tree_root`.
+- Read-only: write attempts return `-EROFS`.
+- Filename conflicts with a real `.snaps` directory in the dataset are resolved by prefixing the real dir (it gets renamed with a trailing `~` at visibility time; rarely matters in practice).
+
+Users can `cd` into `.snaps/` and see the snapshot history as directories.
+
+#### 8.5.5 Snapshot delete (walk with birth-txg logic)
+
+Deletion requires finding blocks unique to the snapshot being deleted.
+
+For a snapshot `S` with `created_txg = T_s` and previous snapshot `P` with `created_txg = T_p`:
+- Blocks created *between* `T_p` and `T_s` are candidate for freeing.
+- But only if they are *not* also referenced by any subsequent snapshot `Q` or the live dataset.
+
+Algorithm (ZFS-style):
+
+```
+dead_list(S) = { blocks born in (T_p, T_s] ∩ reachable from S ∩ not reachable from Q or L }
+```
+
+Computing this requires walking S's tree and comparing birth_txgs against the alive snapshots' and live dataset's trees.
+
+**Incremental dead-list maintenance**: rather than computing dead_list at delete time (expensive walk), maintain a per-snapshot "next_dead" list continuously. When a block is COW'd away from the live dataset:
+- If the block is older than the most recent snapshot, it's now dead from the live dataset's perspective but still held by that snapshot.
+- Record the block on the most recent snapshot's "next_dead" list.
+
+On snapshot delete:
+- Free blocks on S's "next_dead" list that are ALSO not in S's successor's "next_dead".
+- Merge S's "next_dead" into its predecessor's "next_dead" (so its predecessor takes responsibility).
+
+This is ZFS's dead-list algorithm. O(blocks freed during S's lifetime) to delete, not O(snapshot tree).
+
+Incremental maintenance cost: small per-COW-event. Dead-list entries are compact (paddr + length + birth_txg).
+
+#### 8.5.6 Snapshot holds
+
+Users or operations can "hold" a snapshot to prevent accidental deletion:
+
+- `hold <snapshot> <tag>`: add a hold with label `<tag>`.
+- Snapshot can't be deleted while any hold exists.
+- Send/recv automatically holds the source snapshot during transfer.
+- `release <snapshot> <tag>`: remove hold.
+
+Holds are stored in a list attached to the snapshot entry.
+
+### 8.6 Clone mechanics
+
+Clones are writable snapshots. Creating a clone:
+
+1. Given source snapshot `S` with tree root `R_s`.
+2. Create a new dataset `C` as a child of some parent dataset.
+3. `C.di_tree_root = R_s` (same root; shared nodes).
+4. `C.origin_snapshot = S.snapshot_id`.
+5. Mark `S` as "has clones" (in its `se_flags`).
+
+No data copied. Clone starts as an exact duplicate.
+
+#### 8.6.1 Clone writes
+
+As `C` is modified, COW:
+- Writes produce new nodes with `birth_txg = current_txg`.
+- Old nodes (from `R_s`) remain referenced by the snapshot `S`.
+- Clone's tree diverges from `S` over time.
+
+#### 8.6.2 Clone lifecycle
+
+- **Clone holds its origin snapshot**: `S` cannot be deleted while any clone exists. The `has_clones` flag blocks delete; user must destroy the clone first (`destroy <clone>`) or "promote" the clone.
+- **Promote**: reverse the dependency. Clone becomes the "original" and the snapshot becomes a descendant of the clone. Used to "graduate" a clone out of its dependency on the snapshot, allowing the original snapshot to be deleted.
+- **Destroy**: similar to snapshot delete, but the clone has local writes. Walks the clone's tree for blocks born after the clone's creation_txg; frees them; then deletes the dataset entry.
+
+#### 8.6.3 Reflinks across datasets
+
+A different form of sharing: a file in one dataset can be reflinked (shallow-copied) to a path in another dataset. The two files share extent records; writes to either trigger COW.
+
+- Implemented via allocator refcount bumps on the shared extents.
+- Requires both datasets to use the same encryption key, or to be unencrypted. Otherwise, the shared extent is readable by only one dataset (the one whose AD matches the ciphertext).
+- `stratum reflink <src> <dst>` surfaces this; `cp --reflink` maps to it.
+
+### 8.7 Send and recv
+
+Stratum's send/recv is for replication, backup, migration.
+
+#### 8.7.1 Send modes
+
+- **Full**: sends the entire content of a snapshot.
+- **Incremental**: sends only the diff from snapshot `A` to snapshot `B` (requires both to exist on the target, or just `B` if target receives incrementally).
+- **Raw**: ciphertext + wrapped keys, preserving encryption. Target stores as-is.
+- **Decrypted**: plaintext on the wire (over a secure transport like TLS or SSH), re-encrypted on the target with the target's key.
+
+Combinable: `--full --raw`, `--incremental --decrypted`, etc.
+
+#### 8.7.2 Send wire format
+
+A framed stream:
+
+```
+Header:
+  magic: "STRMSEND"
+  version: 1
+  pool_uuid (source pool)
+  source_snapshot_name
+  base_snapshot_name (empty for full)
+  flags (raw / decrypted / compressed-during-transfer)
+  target_path_hint
+
+Body: sequence of records. Each record:
+  kind: one of CREATE_DATASET, CREATE_INODE, CREATE_EXTENT,
+              DELETE_INODE, DELETE_EXTENT, UPDATE_INODE_ATTR,
+              CREATE_XATTR, DELETE_XATTR, CREATE_SNAPSHOT, END
+  payload: depends on kind
+
+Trailer:
+  sha256 of wire stream
+  sender_signature (optional)
+```
+
+For raw-encrypted send, extent records include the on-disk ciphertext + AEAD tag verbatim. No decryption happens at the sender.
+
+#### 8.7.3 Receive
+
+Target pool reads the stream, reconstructs state:
+
+- Creates the target dataset if it doesn't exist.
+- Applies records in order.
+- For incremental receives, validates the base snapshot exists.
+- On completion, the target has a replica of the source snapshot.
+
+On error (corruption, missing base, version mismatch), receive aborts and cleans up partial state.
+
+#### 8.7.4 Incremental diff computation
+
+Source uses birth-txg to efficiently compute "what changed between snapshot A and snapshot B":
+
+- Walk B's tree, emit anything with `birth_txg > A.created_txg`.
+- Traverse deletions from A's dead-list entries since A.
+
+O(changes), not O(full tree).
+
+#### 8.7.5 Send/recv authentication
+
+Stratum doesn't dictate transport. Typical:
+- `stratum send tank/home@snap1 | ssh remote "stratum receive tank/"` — SSH handles transport auth.
+- Raw-encrypted over untrusted transport: target needs wrap key out-of-band (key agent on target, separately provisioned).
+
+### 8.8 Per-connection 9P namespaces
+
+Each 9P connection has its own mount table. Different connections see different namespaces.
+
+#### 8.8.1 Attach semantics
+
+`Tattach(afid, fid, uname, aname)`:
+
+- `aname` is interpreted as a **namespace specification**.
+- Options:
+  - `aname = ""` or `/`: default view — root dataset at `/`.
+  - `aname = "tank/home/alice"`: root the connection's view at this dataset.
+  - `aname = "spec:tank/home=/home,tank/var/log=/var/log"`: compose a custom namespace.
+
+The spec syntax allows multiple mount points in one `Tattach`. Subsequent `Twalk` traverses this composed view.
+
+#### 8.8.2 Tbind — runtime namespace composition
+
+Stratum extends 9P with `Tbind`:
+
+```
+Tbind:
+  fid       // fid referring to a source path
+  name      // target path in connection's namespace
+  mode      // REPLACE | UNION_OVER | UNION_UNDER
+```
+
+Semantics:
+- `REPLACE`: bind the source at the target path, hiding whatever was there.
+- `UNION_OVER`: overlay the source on top (source's files shadow target's).
+- `UNION_UNDER`: overlay the source below (existing files take precedence).
+
+Plan 9's `bind(1)` semantics, translated to 9P.
+
+`Tunbind` reverses.
+
+#### 8.8.3 Namespace state storage
+
+Per-connection state:
+- A binding tree: hierarchical, each node lists bind specs.
+- Enumerable via synthetic files at `/ctl/9p/<connection-id>/namespace`.
+
+State is in-memory only; not persisted. On disconnect, namespace is discarded.
+
+#### 8.8.4 Use cases
+
+- **Container isolation**: container starts with `aname = "spec:pool/containers/cnt-42=/"`. All subsequent operations happen within `cnt-42`. The container can't see siblings or the host.
+- **Per-user homes**: login shell Tattaches with `aname = "tank/home/$USER"`. User's shell sees its home as `/`.
+- **Cross-dataset composition**: a backup tool binds `tank/home` and `tank/srv` together under `/backup-source/`, then backs up the union.
+
+### 8.9 Dataset rename / move
+
+Rename a dataset: changes its `di_name` and optionally its `di_parent_id`.
+
+#### 8.9.1 Rename within parent
+
+`dataset rename tank/home/alice tank/home/alice-old`:
+- Update `di_name` in the dataset index entry.
+- O(1) operation on-disk.
+- Paths of descendants implicitly updated (they reference parent by ID, not name).
+
+#### 8.9.2 Move across parents
+
+`dataset move tank/home/alice tank/archive/alice-2026`:
+- Update `di_name` AND `di_parent_id` in the index entry.
+- Check for property-inheritance changes: if parent's properties differ, the effective values for this dataset shift; refresh property cache.
+- Check for encryption boundary: moving into a differently-encrypted parent requires that the moving dataset has `encryption=independent` (its own key). Cannot cross encryption boundaries via move.
+
+### 8.10 Interactions with other subsystems
+
+- **§3 Concurrency**: dataset mutations (create, destroy, rename, snapshot) are commit-atomic. Serialization at the commit coordinator ensures no concurrent mutation produces half-created state.
+- **§5 SB / quorum**: dataset index root is in `ub_main_root`. Dataset operations update the main tree and commit through the standard protocol.
+- **§6 Allocator**: snapshot/clone relationships affect allocator refcounts for CAS tier sharing. Birth-txg tracking is the hot-tier mechanism; refcount is CAS tier + cross-dataset reflink mechanism.
+- **§7 Crypto + integrity**: each dataset has its own key (or inherits). Snapshot creation uses the same key as the live dataset. Clone inherits from source snapshot.
+- **§9 Block device**: invisible at this layer. Dataset ops go through the main tree write path like any other.
+- **§11 POSIX**: per-dataset `next_ino`, per-dataset POSIX semantics (atime, exec, etc.). Cross-dataset `rename(2)` returns `-EXDEV`.
+
+### 8.11 Open questions
+
+- **Dataset depth policy**: hard cap at 64 or deeper? Pragmatic compromise; can be raised post-v2.0 via feature flag if anyone hits it.
+- **Dead-list storage**: list-per-snapshot attached to the snapshot entry, or a separate pool-wide dead-list tree? Current lean: per-snapshot list in the snapshot entry (compact for most snapshots), overflow to separate object via pointer if list grows large.
+- **Snapshot name uniqueness**: required within a dataset, or globally across pool? Per-dataset is conventional (`tank/home@daily`, `tank/var@daily` both valid).
+- **Auto-holds during send**: always on, or opt-in via `--hold`? Lean toward always-on (prevents race where receiver is mid-transfer and admin deletes source snap).
+- **Max bindings per connection**: 128? 1024? Namespace composition isn't typically that deep; cap at 128 initially.
+- **Encryption-boundary-crossing moves**: allowed for `encryption=independent` datasets; what about `encryption=inherited`? Probably refuse; force explicit change first.
+- **9P connection lifetime and namespace persistence**: disconnect discards all state. For long-running workloads with complex namespaces, that could be painful. Optional: snapshot namespace state to `/ctl/9p/saved-namespaces/<tag>` for reuse on next connection.
+
+### 8.12 Summary
+
+The namespace model is Stratum's user-facing organizational layer. Key commitments:
+
+1. **Hierarchical datasets** (ZFS-style), u64 IDs stable across renames, arbitrary-depth with 64-level policy cap.
+2. **Per-dataset properties with inheritance**: compression, encryption, redundancy, POSIX behavior.
+3. **O(1) snapshot creation** via birth-txg tracking. No refcount bumps, no tree walks.
+4. **Snapshot delete via incremental dead-list**: O(blocks freed during snapshot's lifetime), ZFS-style.
+5. **Clones as writable snapshots**: O(1) create; origin snapshot held; promote/destroy for lifecycle management.
+6. **Send/recv with raw-encrypted mode**: ciphertext-preserving, enables backup to untrusted storage.
+7. **Per-connection 9P namespaces** via `Tbind`. Container isolation, per-user views, cross-dataset composition — all native.
+8. **Reflinks across datasets**: O(1) copy via allocator refcount bumps; respects encryption boundaries.
+
+Status: DRAFT → awaiting review, push-back, then COMMITTED.
 
 ---
 
@@ -2600,8 +3022,8 @@ Each of §3–§5 and §7 is probably its own Phase 0 session. §6, §8, §9–�
 | §4 Storage pool | DRAFT | 2 |
 | §5 Superblock / quorum | DRAFT | 3 |
 | §6 Allocator | DRAFT | 4 |
-| §7 Cryptography + integrity | **DRAFT** (this session) | 5 |
-| §8 Namespace | STUB | 6 |
+| §7 Cryptography + integrity | DRAFT | 5 |
+| §8 Namespace | **DRAFT** (this session) | 6 |
 | §9 Block device | STUB | 7 |
 | §10 Client interfaces | STUB | 8 |
 | §11 POSIX surface | STUB | 9 |
