@@ -68,5 +68,27 @@ target_link_libraries(stratum PRIVATE stratum-lib)
 # rename to avoid collision with the library target
 set_target_properties(stratum PROPERTIES OUTPUT_NAME stratum)
 
+# FUSE executable — built only if libfuse3 is available. On Linux install
+# libfuse3-dev (Debian/Ubuntu) or fuse3-devel (Fedora). On macOS install
+# macFUSE (which provides fuse3). If not found, the rest of the build
+# succeeds; users can still use the 9P server + TUI.
+find_package(PkgConfig QUIET)
+if (PkgConfig_FOUND)
+    pkg_check_modules(FUSE3 IMPORTED_TARGET fuse3)
+endif()
+if (FUSE3_FOUND)
+    add_executable(stratum-fuse src/cmd/fuse.c src/cmd/cli_common.c)
+    target_link_libraries(stratum-fuse PRIVATE stratum-lib PkgConfig::FUSE3)
+    # macFUSE's fuse_lowlevel.h uses `typeof` (a GNU extension) to route
+    # Darwin-specific extended signatures. Relax the C standard for this
+    # one target so the header compiles. libfuse3 on Linux doesn't need
+    # this but the flag is harmless.
+    target_compile_options(stratum-fuse PRIVATE -std=gnu99)
+    message(STATUS "Found libfuse3: building stratum-fuse")
+else()
+    message(STATUS "libfuse3 not found: stratum-fuse will be skipped "
+                   "(install libfuse3-dev / macFUSE to enable)")
+endif()
+
 enable_testing()
 add_subdirectory(tests)
