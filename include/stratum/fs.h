@@ -80,4 +80,13 @@ int  stm_fs_utimes(struct stm_fs *fs, uint64_t ino,
                    int set_mtime, uint64_t mtime_sec, uint32_t mtime_nsec);
 int  stm_fs_truncate(struct stm_fs *fs, uint64_t ino, uint64_t new_size);
 
+/* POSIX Group B (SOTA #5): rename a directory entry. Preserves the
+ * inode number — only the dirent's (parent, hash, name) record changes.
+ * If a target with `new_name` exists it is atomically unlinked first
+ * (propagates -ENOTEMPTY for non-empty directories, -EACCES / -EPERM
+ * where applicable). Rename-to-self is a successful no-op. */
+int  stm_fs_rename(struct stm_fs *fs,
+                   uint64_t old_parent, const char *old_name,
+                   uint64_t new_parent, const char *new_name);
+
 #endif /* STM_FS_H */

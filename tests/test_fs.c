@@ -872,6 +872,93 @@ STM_TEST(test_fs_posix_attr_mutations)
     unlink(path);
 }
 
+/* POSIX Group B (SOTA #5): rename. */
+STM_TEST(test_fs_posix_rename)
+{
+    const char *path = "/tmp/stratum_test_posix_rename.img";
+    unlink(path);
+    STM_ASSERT_EQ(stm_fs_create(path, 32ULL*1024*1024, NULL), 0);
+    struct stm_fs *fs;
+    STM_ASSERT_EQ(stm_fs_open(path, NULL, &fs), 0);
+
+    uint64_t a_ino, b_ino, dir_ino, file2_ino;
+
+    /* Seed: /a with content "hello"; /b empty; /dir/ ; /dir/file2 */
+    STM_ASSERT_EQ(stm_fs_create_file(fs, 1, "a", 0644, &a_ino), 0);
+    STM_ASSERT_EQ(stm_fs_write(fs, a_ino, 0, "hello", 5), 0);
+    STM_ASSERT_EQ(stm_fs_create_file(fs, 1, "b", 0644, &b_ino), 0);
+    STM_ASSERT_EQ(stm_fs_write(fs, b_ino, 0, "world!!", 7), 0);
+    STM_ASSERT_EQ(stm_fs_mkdir(fs, 1, "dir", 0755, &dir_ino), 0);
+    STM_ASSERT_EQ(stm_fs_create_file(fs, dir_ino, "file2", 0644, &file2_ino), 0);
+    STM_ASSERT_EQ(stm_fs_write(fs, file2_ino, 0, "inner", 5), 0);
+
+    /* Case 1: rename /a → /c (target doesn't exist). Inode preserved,
+     * old name gone, new name reachable. */
+    STM_ASSERT_EQ(stm_fs_rename(fs, 1, "a", 1, "c"), 0);
+    uint64_t chk;
+    STM_ASSERT_EQ(stm_fs_lookup(fs, 1, "a", &chk), -ENOENT);
+    STM_ASSERT_EQ(stm_fs_lookup(fs, 1, "c", &chk), 0);
+    STM_ASSERT_EQ(chk, a_ino);
+    char buf[16] = {0};
+    uint32_t nread = 0;
+    STM_ASSERT_EQ(stm_fs_read(fs, a_ino, 0, buf, sizeof(buf), &nread), 0);
+    STM_ASSERT_EQ(nread, 5u);
+    STM_ASSERT_MEM_EQ(buf, "hello", 5);
+
+    /* Case 2: rename-to-self — no-op success. */
+    STM_ASSERT_EQ(stm_fs_rename(fs, 1, "c", 1, "c"), 0);
+    STM_ASSERT_EQ(stm_fs_lookup(fs, 1, "c", &chk), 0);
+    STM_ASSERT_EQ(chk, a_ino);
+
+    /* Case 3: rename /c → /b (target exists as regular file). b's inode
+     * should be gone; c's inode should now be reachable via "b". */
+    STM_ASSERT_EQ(stm_fs_rename(fs, 1, "c", 1, "b"), 0);
+    STM_ASSERT_EQ(stm_fs_lookup(fs, 1, "c", &chk), -ENOENT);
+    STM_ASSERT_EQ(stm_fs_lookup(fs, 1, "b", &chk), 0);
+    STM_ASSERT_EQ(chk, a_ino);   /* a's inode now lives at "b" */
+    /* Old "b" inode must be fully reaped (target's nlink was 1). */
+    struct stm_inode chk_in;
+    STM_ASSERT_EQ(stm_fs_stat(fs, b_ino, &chk_in), -ENOENT);
+
+    /* Case 4: rename into subdirectory. /b → /dir/nested. */
+    STM_ASSERT_EQ(stm_fs_rename(fs, 1, "b", dir_ino, "nested"), 0);
+    STM_ASSERT_EQ(stm_fs_lookup(fs, 1, "b", &chk), -ENOENT);
+    STM_ASSERT_EQ(stm_fs_lookup(fs, dir_ino, "nested", &chk), 0);
+    STM_ASSERT_EQ(chk, a_ino);
+    /* Content preserved. */
+    memset(buf, 0, sizeof(buf));
+    STM_ASSERT_EQ(stm_fs_read(fs, a_ino, 0, buf, sizeof(buf), &nread), 0);
+    STM_ASSERT_EQ(nread, 5u);
+    STM_ASSERT_MEM_EQ(buf, "hello", 5);
+
+    /* Case 5: rename over a non-empty directory — ENOTEMPTY. */
+    /* First make /dir non-empty (it has "file2" and "nested"). */
+    uint64_t foo_ino;
+    STM_ASSERT_EQ(stm_fs_create_file(fs, 1, "foo", 0644, &foo_ino), 0);
+    STM_ASSERT_EQ(stm_fs_rename(fs, 1, "foo", 1, "dir"), -ENOTEMPTY);
+    /* foo and dir both survive. */
+    STM_ASSERT_EQ(stm_fs_lookup(fs, 1, "foo", &chk), 0);
+    STM_ASSERT_EQ(chk, foo_ino);
+    STM_ASSERT_EQ(stm_fs_lookup(fs, 1, "dir", &chk), 0);
+    STM_ASSERT_EQ(chk, dir_ino);
+
+    /* Case 6: rename non-existent source — ENOENT. */
+    STM_ASSERT_EQ(stm_fs_rename(fs, 1, "does_not_exist", 1, "whatever"), -ENOENT);
+
+    /* Case 7: sync + reopen, state persists. */
+    STM_ASSERT_EQ(stm_fs_sync(fs), 0);
+    stm_fs_close(fs);
+    STM_ASSERT_EQ(stm_fs_open(path, NULL, &fs), 0);
+    STM_ASSERT_EQ(stm_fs_lookup(fs, dir_ino, "nested", &chk), 0);
+    STM_ASSERT_EQ(chk, a_ino);
+    memset(buf, 0, sizeof(buf));
+    STM_ASSERT_EQ(stm_fs_read(fs, a_ino, 0, buf, sizeof(buf), &nread), 0);
+    STM_ASSERT_MEM_EQ(buf, "hello", 5);
+
+    stm_fs_close(fs);
+    unlink(path);
+}
+
 int main(void)
 {
     STM_SUITE("fs");
@@ -893,6 +980,7 @@ int main(void)
     STM_RUN(test_fs_mount_bump_encrypted);
     STM_RUN(test_fs_open_ro_rejects_writes);
     STM_RUN(test_fs_posix_attr_mutations);
+    STM_RUN(test_fs_posix_rename);
     printf("all passed\n");
     return 0;
 }
