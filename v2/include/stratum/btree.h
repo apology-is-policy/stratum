@@ -136,6 +136,48 @@ typedef struct {
 
 void stm_btree_stats_of(const stm_btree *t, stm_btree_stats *out);
 
+/* ========================================================================= */
+/* Concurrent wrapper — Phase 2 fallback                                      */
+/* ========================================================================= */
+
+/*
+ * A thread-safe wrapper over stm_btree. The fallback per ARCHITECTURE §3.8.
+ * At Phase 2 this uses a single tree-wide rwlock — writers exclude everyone,
+ * readers share. Per-node lock coupling (the proper §3.8 design) and the
+ * lock-free Bw-tree path (§3.4, the default at runtime) are Phase 2-tail
+ * work.
+ *
+ * API mirrors the single-threaded API with "_mt" suffix. Internally
+ * delegates to stm_btree_*.
+ */
+typedef struct stm_btree_mt stm_btree_mt;
+
+STM_MUST_USE
+stm_status stm_btree_mt_new(const stm_btree_opts *opts, stm_btree_mt **out);
+
+void stm_btree_mt_free(stm_btree_mt *t);
+
+STM_MUST_USE
+stm_status stm_btree_mt_insert(stm_btree_mt *t,
+                               const void *key, size_t key_len,
+                               const void *value, size_t value_len);
+
+STM_MUST_USE
+stm_status stm_btree_mt_lookup(stm_btree_mt *t,
+                               const void *key, size_t key_len,
+                               void *buf, size_t buf_cap,
+                               size_t *out_value_len);
+
+STM_MUST_USE
+stm_status stm_btree_mt_delete(stm_btree_mt *t,
+                               const void *key, size_t key_len);
+
+STM_MUST_USE
+stm_status stm_btree_mt_scan(stm_btree_mt *t,
+                             const void *lo_key, size_t lo_key_len,
+                             const void *hi_key, size_t hi_key_len,
+                             stm_btree_scan_cb cb, void *ctx);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1,6 +1,7 @@
 add_library(stm_btree STATIC
     node.c
-    btree.c)
+    btree.c
+    btree_mt.c)
 
 target_include_directories(stm_btree PUBLIC
     ${CMAKE_SOURCE_DIR}/include)
