@@ -17,6 +17,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <liburing.h>
 #include <linux/fs.h>
 #include <pthread.h>
@@ -156,11 +157,21 @@ static stm_status submit_locked(iouring_bdev *d, pending *p,
 /* Sync ops — issue async, drain until our pending completes.                 */
 /* ------------------------------------------------------------------------- */
 
+/* Forward decls for the async entry points used by the sync wrappers. */
+static stm_status op_submit_read (stm_bdev *d, uint64_t offset, void *buf,
+                                  size_t len,
+                                  stm_bdev_completion_cb cb, void *user);
+static stm_status op_submit_write(stm_bdev *d, uint64_t offset, const void *buf,
+                                  size_t len,
+                                  stm_bdev_completion_cb cb, void *user);
+static stm_status op_submit_fsync(stm_bdev *d,
+                                  stm_bdev_completion_cb cb, void *user);
+
 typedef struct {
     pthread_mutex_t m;
     pthread_cond_t  c;
     stm_op_result   res;
-    bool            done;
+    atomic_bool     done;       /* atomic — read without lock is safe */
 } sync_wait;
 
 static void sync_cb(const stm_op_result *r)
@@ -168,30 +179,50 @@ static void sync_cb(const stm_op_result *r)
     sync_wait *w = (sync_wait *)r->user;
     pthread_mutex_lock(&w->m);
     w->res = *r;
-    w->done = true;
+    atomic_store_explicit(&w->done, true, memory_order_release);
     pthread_cond_signal(&w->c);
     pthread_mutex_unlock(&w->m);
 }
 
-static stm_status sync_run(iouring_bdev *d,
-                           stm_status (*submit)(stm_bdev *, uint64_t, void *,
-                                                size_t, stm_bdev_completion_cb,
-                                                void *),
-                           uint64_t off, void *buf, size_t len)
+/* Submit one op and wait for completion. One-shot — caller handles looping
+ * for short transfers. */
+static stm_status sync_one(iouring_bdev *d,
+                           stm_op_kind kind,
+                           uint64_t off, void *buf, size_t len,
+                           stm_op_result *out)
 {
-    sync_wait w = { .done = false };
+    sync_wait w;
+    w.res = (stm_op_result){ 0 };
+    atomic_init(&w.done, false);
     pthread_mutex_init(&w.m, NULL);
     pthread_cond_init (&w.c, NULL);
 
-    stm_status s = submit(&d->base, off, buf, len, sync_cb, &w);
+    /* Submit via the appropriate async entry point. */
+    stm_status s;
+    switch (kind) {
+    case STM_OP_READ:
+        s = op_submit_read (&d->base, off, buf, len, sync_cb, &w);
+        break;
+    case STM_OP_WRITE:
+        s = op_submit_write(&d->base, off, buf, len, sync_cb, &w);
+        break;
+    case STM_OP_FSYNC:
+        s = op_submit_fsync(&d->base, sync_cb, &w);
+        break;
+    default:
+        s = STM_EINVAL;
+        break;
+    }
     if (s != STM_OK) {
         pthread_mutex_destroy(&w.m);
         pthread_cond_destroy (&w.c);
         return s;
     }
 
-    /* Drive completions from this thread until ours fires. */
-    while (!w.done) {
+    /* Drive completions from this thread until ours fires. Using acquire
+     * load pairs with the release in sync_cb — no data race, and the
+     * compiler cannot hoist the load out of the loop. */
+    while (!atomic_load_explicit(&w.done, memory_order_acquire)) {
         int n = drain_cqes(d, 16, true);
         if (n < 0) {
             pthread_mutex_destroy(&w.m);
@@ -200,66 +231,54 @@ static stm_status sync_run(iouring_bdev *d,
         }
     }
 
+    if (out) *out = w.res;
     s = w.res.status;
     pthread_mutex_destroy(&w.m);
     pthread_cond_destroy (&w.c);
     return s;
 }
 
-static stm_status op_submit_read (stm_bdev *, uint64_t, void *, size_t,
-                                  stm_bdev_completion_cb, void *);
-static stm_status op_submit_write(stm_bdev *, uint64_t, const void *, size_t,
-                                  stm_bdev_completion_cb, void *);
-static stm_status op_submit_fsync(stm_bdev *, stm_bdev_completion_cb, void *);
-
+/*
+ * Sync read: loop on short transfers the same way POSIX pread_full does.
+ * A short completion indicates EOF hit mid-buffer or (on raw devices) a
+ * transient partial. Zero bytes with OK status is treated as EOF → STM_EIO,
+ * matching POSIX backend semantics so callers see one contract.
+ */
 static stm_status op_read(stm_bdev *base, uint64_t off, void *buf, size_t len)
 {
-    return sync_run((iouring_bdev *)base, op_submit_read, off, buf, len);
+    iouring_bdev *d = (iouring_bdev *)base;
+    uint8_t *p = (uint8_t *)buf;
+    while (len > 0) {
+        stm_op_result res;
+        stm_status s = sync_one(d, STM_OP_READ, off, p, len, &res);
+        if (s != STM_OK) return s;
+        if (res.bytes == 0) return STM_EIO;  /* EOF with bytes remaining */
+        p   += res.bytes;
+        off += res.bytes;
+        len -= res.bytes;
+    }
+    return STM_OK;
 }
 
 static stm_status op_write(stm_bdev *base, uint64_t off, const void *buf, size_t len)
 {
-    /* Cast for the generic sync_run signature; write_submit knows it's RO. */
     iouring_bdev *d = (iouring_bdev *)base;
-    sync_wait w = { .done = false };
-    pthread_mutex_init(&w.m, NULL);
-    pthread_cond_init (&w.c, NULL);
-    stm_status s = op_submit_write(base, off, buf, len, sync_cb, &w);
-    if (s != STM_OK) {
-        pthread_mutex_destroy(&w.m);
-        pthread_cond_destroy (&w.c);
-        return s;
+    const uint8_t *p = (const uint8_t *)buf;
+    while (len > 0) {
+        stm_op_result res;
+        stm_status s = sync_one(d, STM_OP_WRITE, off, (void *)p, len, &res);
+        if (s != STM_OK) return s;
+        if (res.bytes == 0) return STM_EIO;
+        p   += res.bytes;
+        off += res.bytes;
+        len -= res.bytes;
     }
-    while (!w.done) {
-        int n = drain_cqes(d, 16, true);
-        if (n < 0) { pthread_mutex_destroy(&w.m); pthread_cond_destroy(&w.c); return (stm_status)n; }
-    }
-    s = w.res.status;
-    pthread_mutex_destroy(&w.m);
-    pthread_cond_destroy (&w.c);
-    return s;
+    return STM_OK;
 }
 
 static stm_status op_fsync(stm_bdev *base)
 {
-    iouring_bdev *d = (iouring_bdev *)base;
-    sync_wait w = { .done = false };
-    pthread_mutex_init(&w.m, NULL);
-    pthread_cond_init (&w.c, NULL);
-    stm_status s = op_submit_fsync(base, sync_cb, &w);
-    if (s != STM_OK) {
-        pthread_mutex_destroy(&w.m);
-        pthread_cond_destroy (&w.c);
-        return s;
-    }
-    while (!w.done) {
-        int n = drain_cqes(d, 16, true);
-        if (n < 0) { pthread_mutex_destroy(&w.m); pthread_cond_destroy(&w.c); return (stm_status)n; }
-    }
-    s = w.res.status;
-    pthread_mutex_destroy(&w.m);
-    pthread_cond_destroy (&w.c);
-    return s;
+    return sync_one((iouring_bdev *)base, STM_OP_FSYNC, 0, NULL, 0, NULL);
 }
 
 static stm_status op_fdatasync(stm_bdev *base)
@@ -272,17 +291,46 @@ static stm_status op_fdatasync(stm_bdev *base)
 static stm_status op_discard(stm_bdev *base, uint64_t off, uint64_t len)
 {
     iouring_bdev *d = (iouring_bdev *)base;
+
+    /*
+     * Decide the path by the fd's type. On block devices we use BLKDISCARD
+     * and propagate real errors (EIO, EBUSY, etc.). On regular files we use
+     * fallocate(PUNCH_HOLE). Don't cross the branches: falling from a
+     * BLKDISCARD EIO into fallocate's EINVAL path used to mask genuine
+     * hardware failures as STM_ENOTSUPPORTED.
+     */
+    struct stat st;
+    if (fstat(d->fd, &st) == -1) return errno_to_status_ur(errno);
+
+    if ((st.st_mode & S_IFMT) == S_IFBLK) {
 #ifdef BLKDISCARD
-    uint64_t range[2] = { off, len };
-    if (ioctl(d->fd, BLKDISCARD, &range) == 0) return STM_OK;
+        uint64_t range[2] = { off, len };
+        if (ioctl(d->fd, BLKDISCARD, &range) == 0) return STM_OK;
+        /* ENOTTY means the kernel / driver doesn't support discard on this
+         * block device — treat as not-supported. Anything else is a real
+         * error (EIO, EBUSY, ...) and MUST propagate. */
+        if (errno == ENOTTY) return STM_ENOTSUPPORTED;
+        return errno_to_status_ur(errno);
+#else
+        (void)off; (void)len;
+        return STM_ENOTSUPPORTED;
 #endif
+    }
+
+    if ((st.st_mode & S_IFMT) == S_IFREG) {
 #ifdef FALLOC_FL_PUNCH_HOLE
-    int r = fallocate(d->fd,
-                      FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
-                      (off_t)off, (off_t)len);
-    if (r == 0) return STM_OK;
-    if (errno != EOPNOTSUPP && errno != EINVAL) return errno_to_status_ur(errno);
+        int r = fallocate(d->fd,
+                          FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                          (off_t)off, (off_t)len);
+        if (r == 0) return STM_OK;
+        if (errno == EOPNOTSUPP || errno == ENOTSUP) return STM_ENOTSUPPORTED;
+        return errno_to_status_ur(errno);
+#else
+        (void)off; (void)len;
+        return STM_ENOTSUPPORTED;
 #endif
+    }
+
     return STM_ENOTSUPPORTED;
 }
 
@@ -302,11 +350,20 @@ static stm_status op_resize(stm_bdev *base, uint64_t new_size)
 /* Async ops.                                                                 */
 /* ------------------------------------------------------------------------- */
 
+/*
+ * Per-op length clamp. liburing's prep_read/prep_write take an `unsigned`
+ * length argument, so values > UINT_MAX silently truncate. Callers with
+ * oversize ops get STM_ERANGE rather than a silent partial transfer. A
+ * future phase may add auto-split at the façade layer.
+ */
+static bool len_fits_io_uring(size_t len) { return len <= UINT_MAX; }
+
 static stm_status op_submit_read(stm_bdev *base, uint64_t off, void *buf,
                                  size_t len,
                                  stm_bdev_completion_cb cb, void *user)
 {
     iouring_bdev *d = (iouring_bdev *)base;
+    if (!len_fits_io_uring(len)) return STM_ERANGE;
 
     pthread_mutex_lock(&d->lock);
     pending *p = pending_alloc(d);
@@ -330,6 +387,7 @@ static stm_status op_submit_write(stm_bdev *base, uint64_t off, const void *buf,
                                   stm_bdev_completion_cb cb, void *user)
 {
     iouring_bdev *d = (iouring_bdev *)base;
+    if (!len_fits_io_uring(len)) return STM_ERANGE;
 
     pthread_mutex_lock(&d->lock);
     pending *p = pending_alloc(d);
@@ -401,23 +459,41 @@ static stm_status op_register_buffers(stm_bdev *base, void **bufs,
 /* Close.                                                                     */
 /* ------------------------------------------------------------------------- */
 
+/*
+ * Close contract: caller guarantees no concurrent ops are in flight from
+ * *other threads* at the time close is called. That is, any submit/poll/
+ * wait on this bdev must have returned before stm_bdev_close fires. The
+ * block layer does not (at Phase 1) provide internal serialization across
+ * close + concurrent ops — doing so would require holding d->lock across
+ * the submit path for every op, which is a performance hit we're not
+ * paying for a rare operation.
+ *
+ * What close MUST guarantee: every already-submitted op is fully drained
+ * before the ring exits. Otherwise the kernel can DMA into freed user
+ * buffers after close returns (P1 issue R0 audit). We achieve this by
+ * blocking with wait_cqe until inflight reaches zero; callback functions
+ * are NOT invoked during close — we just reap the completion and recycle
+ * the pending slot.
+ */
 static void op_close(stm_bdev *base)
 {
     iouring_bdev *d = (iouring_bdev *)base;
 
-    /* Drain any remaining in-flight without firing callbacks (tear-down). */
-    int tries = 1000;
-    while (atomic_load(&d->inflight) > 0 && tries-- > 0) {
+    while (atomic_load(&d->inflight) > 0) {
         struct io_uring_cqe *cqe = NULL;
-        if (io_uring_peek_cqe(&d->ring, &cqe) == 0) {
-            pending *p = (pending *)io_uring_cqe_get_data(cqe);
-            io_uring_cqe_seen(&d->ring, cqe);
-            if (p) {
-                pending_release(d, p);
-                atomic_fetch_sub(&d->inflight, 1);
-            }
-        } else {
+        int r = io_uring_wait_cqe(&d->ring, &cqe);
+        if (r < 0) {
+            /* Unexpected — but if the ring itself is broken we still need to
+             * tear down. Break the loop; below we exit the ring anyway, and
+             * any still-pending CQE will be discarded along with it. The fd
+             * close under the ring exit is what actually stops DMA. */
             break;
+        }
+        pending *p = (pending *)io_uring_cqe_get_data(cqe);
+        io_uring_cqe_seen(&d->ring, cqe);
+        if (p) {
+            pending_release(d, p);
+            atomic_fetch_sub(&d->inflight, 1);
         }
     }
 

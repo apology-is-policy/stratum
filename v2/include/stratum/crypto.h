@@ -53,11 +53,16 @@ typedef enum {
 /* Returns tag length for a given mode, or 0 for invalid. */
 size_t stm_aead_tag_len(stm_aead_mode m);
 
-/* Nonces are unified at 32 bytes: the real nonce occupies some prefix and the
- * suffix is zero/reserved/pool-UUID. See ARCHITECTURE §7.4.1.
+/* Nonces are unified at 32 bytes. See ARCHITECTURE §7.4.1.
  *
- *   AEGIS-256      : uses all 32 bytes.
- *   XChaCha20-SIV  : uses the first 24 bytes; bytes 24..31 must be zero.
+ *   AEGIS-256      : all 32 bytes feed the cipher directly.
+ *   XChaCha20-SIV  : all 32 bytes enter the MAC input (TAG depends on the full
+ *                    nonce); the cipher runs with a 24-byte nonce derived as
+ *                    TAG[0:16] || N[24:32], where N[24:32] typically carries
+ *                    pool-UUID bits for cross-pool domain separation.
+ *
+ * Caller guarantees global uniqueness of the 32-byte nonce value for the
+ * lifetime of the key, as dictated by the commit coordinator (End A).
  */
 #define STM_AEAD_NONCE_LEN      32
 

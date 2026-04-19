@@ -8,7 +8,7 @@
  *   Key K (64 bytes) is split as K_MAC || K_ENC, 32 bytes each.
  *
  *   Encrypt(K, N_32, AD, PT):
- *       mac_input = N_32[0:24]
+ *       mac_input = N_32[0:32]
  *                || le64(|AD|) || AD
  *                || le64(|PT|) || PT
  *       V         = HMAC-SHA256(K_MAC, mac_input)     -- 32 bytes
@@ -20,7 +20,7 @@
  *   Decrypt(K, N_32, AD, TAG || CT):
  *       xnonce24  = TAG || N_32[24:32]
  *       PT        = XChaCha20(K_ENC, xnonce24, CT)
- *       V'        = HMAC-SHA256(K_MAC, N_32[0:24] ||
+ *       V'        = HMAC-SHA256(K_MAC, N_32[0:32] ||
  *                                     le64(|AD|) || AD ||
  *                                     le64(|PT|) || PT)
  *       if not ct_equal(TAG, V'[0:16]): reject
@@ -58,11 +58,25 @@ STM_STATIC_ASSERT(crypto_auth_hmacsha256_BYTES >= 16, "HMAC too small for SIV ta
 STM_STATIC_ASSERT(crypto_stream_xchacha20_NONCEBYTES == 24, "XChaCha20 nonce len");
 
 /*
- * Compute V = HMAC-SHA256(K_MAC, N24 || le64(|AD|) || AD || le64(|PT|) || PT).
+ * Compute V = HMAC-SHA256(K_MAC, N32 || le64(|AD|) || AD || le64(|PT|) || PT).
  * Writes 32 bytes to `out_v`.
+ *
+ * Includes the full 32-byte nonce (N[0:32]) rather than just the first 24.
+ * This binds the TAG to the pool-UUID bits that travel in N[24:32] per
+ * ARCHITECTURE §7.4.1 — a ciphertext encrypted under one pool can never
+ * verify under another, even at the MAC layer (belt-and-suspenders beyond
+ * what AD already provides).
+ *
+ * Length fields are serialized as le64 by *casting to uint64_t first* — on
+ * platforms where `size_t` is 32 bits, `ad_len >> 32` is UB per C11 6.5.7p3.
  */
+static void store_le64(uint8_t out[8], uint64_t n)
+{
+    for (int i = 0; i < 8; i++) out[i] = (uint8_t)(n >> (8 * i));
+}
+
 static stm_status compute_mac(const uint8_t k_mac[32],
-                              const uint8_t n24[24],
+                              const uint8_t n32[32],
                               const void *ad, size_t ad_len,
                               const void *pt, size_t pt_len,
                               uint8_t out_v[32])
@@ -70,17 +84,17 @@ static stm_status compute_mac(const uint8_t k_mac[32],
     crypto_auth_hmacsha256_state st;
     if (crypto_auth_hmacsha256_init(&st, k_mac, 32) != 0) return STM_EBACKEND;
 
-    /* Feed N (24 bytes). */
-    if (crypto_auth_hmacsha256_update(&st, n24, 24) != 0) return STM_EBACKEND;
+    /* Feed the full 32-byte nonce. */
+    if (crypto_auth_hmacsha256_update(&st, n32, 32) != 0) return STM_EBACKEND;
 
     /* Feed le64(|AD|) || AD. */
     uint8_t lenbuf[8];
-    for (int i = 0; i < 8; i++) lenbuf[i] = (uint8_t)(ad_len >> (8 * i));
+    store_le64(lenbuf, (uint64_t)ad_len);
     if (crypto_auth_hmacsha256_update(&st, lenbuf, 8) != 0) return STM_EBACKEND;
     if (ad_len > 0 && crypto_auth_hmacsha256_update(&st, ad, ad_len) != 0) return STM_EBACKEND;
 
     /* Feed le64(|PT|) || PT. */
-    for (int i = 0; i < 8; i++) lenbuf[i] = (uint8_t)(pt_len >> (8 * i));
+    store_le64(lenbuf, (uint64_t)pt_len);
     if (crypto_auth_hmacsha256_update(&st, lenbuf, 8) != 0) return STM_EBACKEND;
     if (pt_len > 0 && crypto_auth_hmacsha256_update(&st, pt, pt_len) != 0) return STM_EBACKEND;
 
@@ -106,8 +120,13 @@ stm_status stm_xchacha20_siv_encrypt(const uint8_t key[64],
     memcpy(xnonce, V, 16);
     memcpy(xnonce + 16, nonce + 24, 8);
 
+    /* Stage tag locally; write to caller buffer only on success, so that a
+     * mid-operation failure leaves the caller's buffer untouched (honoring
+     * the "no partial ciphertext on failure" contract in crypto.h). */
+    uint8_t tag_local[16];
+    memcpy(tag_local, V, 16);
+
     uint8_t *out = (uint8_t *)ct_and_tag;
-    memcpy(out, V, 16);                            /* tag */
 
     /* XChaCha20 encrypt plaintext into out+16. */
     if (crypto_stream_xchacha20_xor(out + 16,
@@ -116,13 +135,18 @@ stm_status stm_xchacha20_siv_encrypt(const uint8_t key[64],
                                     xnonce, k_enc) != 0)
     {
         stm_ct_memzero(V, sizeof V);
+        stm_ct_memzero(tag_local, sizeof tag_local);
         stm_ct_memzero(xnonce, sizeof xnonce);
         return STM_EBACKEND;
     }
 
+    /* Commit tag only after ciphertext is in place. */
+    memcpy(out, tag_local, 16);
+
     if (out_len) *out_len = pt_len + 16;
 
     stm_ct_memzero(V, sizeof V);
+    stm_ct_memzero(tag_local, sizeof tag_local);
     stm_ct_memzero(xnonce, sizeof xnonce);
     return STM_OK;
 }

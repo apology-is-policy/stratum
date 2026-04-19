@@ -187,21 +187,36 @@ static stm_status op_fdatasync(stm_bdev *base)
 static stm_status op_discard(stm_bdev *base, uint64_t off, uint64_t len)
 {
     posix_bdev *d = (posix_bdev *)base;
+
+    /*
+     * Split by fd type so that a BLKDISCARD failure on a block device
+     * propagates its real error instead of being masked by a subsequent
+     * fallocate EINVAL (the audit-called-out P2 issue).
+     */
+    struct stat st;
+    if (fstat(d->fd, &st) == -1) return errno_to_status(errno);
+
 #if defined(__linux__) && defined(BLKDISCARD)
-    /* On Linux block devices, BLKDISCARD. */
-    uint64_t range[2] = { off, len };
-    if (ioctl(d->fd, BLKDISCARD, &range) == 0) return STM_OK;
-    /* fall through to file-hole-punching for regular files */
+    if ((st.st_mode & S_IFMT) == S_IFBLK) {
+        uint64_t range[2] = { off, len };
+        if (ioctl(d->fd, BLKDISCARD, &range) == 0) return STM_OK;
+        if (errno == ENOTTY) return STM_ENOTSUPPORTED;
+        return errno_to_status(errno);
+    }
 #endif
+
 #if defined(__linux__) && defined(FALLOC_FL_PUNCH_HOLE)
-    int r = fallocate(d->fd,
-                      FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
-                      (off_t)off, (off_t)len);
-    if (r == 0) return STM_OK;
-    if (errno != EOPNOTSUPP && errno != EINVAL) return errno_to_status(errno);
-#else
-    (void)d; (void)off; (void)len;
+    if ((st.st_mode & S_IFMT) == S_IFREG) {
+        int r = fallocate(d->fd,
+                          FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                          (off_t)off, (off_t)len);
+        if (r == 0) return STM_OK;
+        if (errno == EOPNOTSUPP || errno == ENOTSUP) return STM_ENOTSUPPORTED;
+        return errno_to_status(errno);
+    }
 #endif
+
+    (void)off; (void)len;
     return STM_ENOTSUPPORTED;
 }
 
@@ -377,19 +392,30 @@ static int op_poll(stm_bdev *base, int max_events)
     return delivered;
 }
 
+/*
+ * Wait until we have delivered at least one completion. A parallel caller
+ * can race us between the cond-wait wake and our poll, draining the only
+ * completion; we MUST retry rather than return 0, since the public API
+ * contract is "≥ 1 on success". We exit early only on close-time stop.
+ */
 static int op_wait(stm_bdev *base, int max_events)
 {
     posix_bdev *d = (posix_bdev *)base;
-    pthread_mutex_lock(&d->clock);
-    while (!d->c_head) {
-        if (atomic_load(&d->stop)) {
-            pthread_mutex_unlock(&d->clock);
-            return 0;
+    for (;;) {
+        pthread_mutex_lock(&d->clock);
+        while (!d->c_head) {
+            if (atomic_load(&d->stop)) {
+                pthread_mutex_unlock(&d->clock);
+                return 0;
+            }
+            pthread_cond_wait(&d->ccond, &d->clock);
         }
-        pthread_cond_wait(&d->ccond, &d->clock);
+        pthread_mutex_unlock(&d->clock);
+
+        int n = op_poll(base, max_events);
+        if (n != 0) return n;
+        /* Lost the race to a parallel poller. Go back to sleep. */
     }
-    pthread_mutex_unlock(&d->clock);
-    return op_poll(base, max_events);
 }
 
 static stm_status op_register_buffers(stm_bdev *base, void **bufs,

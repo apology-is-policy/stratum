@@ -121,6 +121,23 @@ STM_TEST(bdev_caps_populated) {
     unlink(g_tmp_path);
 }
 
+/* R0-P1-1 regression: sync read past EOF must return STM_EIO, not silently
+ * succeed with partial data. Both backends must agree on this contract. */
+STM_TEST(bdev_sync_read_past_eof_is_eio) {
+    make_tmp("eof");
+    stm_bdev_open_opts opts = stm_bdev_open_opts_default();
+    stm_bdev *d = NULL;
+    STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &opts, &d));
+    STM_ASSERT_OK(stm_bdev_resize(d, 4096));
+
+    uint8_t buf[4096];
+    /* Read crossing the EOF boundary at offset 2048 for 4096 bytes. */
+    STM_ASSERT_ERR(stm_bdev_read(d, 2048, buf, sizeof buf), STM_EIO);
+
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
 STM_TEST(bdev_resize_grow_only) {
     make_tmp("resz");
     stm_bdev_open_opts opts = stm_bdev_open_opts_default();

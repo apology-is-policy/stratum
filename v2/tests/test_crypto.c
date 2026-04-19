@@ -10,6 +10,7 @@
 #include "tharness.h"
 #include <stratum/crypto.h>
 
+#include <stdlib.h>
 #include <string.h>
 
 static void init_once(void)
@@ -348,6 +349,123 @@ STM_TEST(ct_memzero_clears) {
     stm_ct_memzero(a, sizeof a);
     uint8_t zero[16] = { 0 };
     STM_ASSERT_MEM_EQ(a, zero, 16);
+}
+
+/* -------------------------------------------------------------------------
+ * Audit-driven regression tests (R0 findings).
+ * -------------------------------------------------------------------------
+ */
+
+/* Regression for R0-P2-6 + strengthened MAC: N[24:32] is part of the MAC
+ * input, so two encryptions that differ only in N[24:32] must produce
+ * differing tags (and differing ciphertexts). */
+STM_TEST(xchacha20siv_nonce_high_bytes_affect_tag) {
+    init_once();
+    uint8_t key[64];
+    stm_random_bytes(key, sizeof key);
+
+    uint8_t n1[32] = { 0 };
+    uint8_t n2[32] = { 0 };
+    /* Identical first 24 bytes. */
+    stm_random_bytes(n1, 24);
+    memcpy(n2, n1, 24);
+    /* Differ only in N[24..32]. */
+    n2[24] = 1;
+
+    const char pt[] = "same plaintext";
+    uint8_t ct1[sizeof pt + STM_AEAD_TAG_LEN_MAX];
+    uint8_t ct2[sizeof pt + STM_AEAD_TAG_LEN_MAX];
+    size_t l1 = 0, l2 = 0;
+    STM_ASSERT_OK(stm_aead_encrypt(STM_AEAD_XCHACHA20_SIV, key, n1,
+                                   NULL, 0, pt, sizeof pt, ct1, &l1));
+    STM_ASSERT_OK(stm_aead_encrypt(STM_AEAD_XCHACHA20_SIV, key, n2,
+                                   NULL, 0, pt, sizeof pt, ct2, &l2));
+    /* Tag (first 16 bytes) must differ — N[24..32] is part of MAC input. */
+    STM_ASSERT_MEM_NE(ct1, ct2, 16);
+}
+
+/* Regression for R0-P2-1: on a forced XChaCha20 failure the caller's buffer
+ * must be untouched. libsodium's XChaCha20 doesn't fail on any sane inputs,
+ * so we can only test the positive path here: verify a successful encrypt
+ * writes exactly the expected ciphertext + tag length. */
+STM_TEST(xchacha20siv_success_writes_tag_and_ct_contiguous) {
+    init_once();
+    uint8_t key[64], nonce[32];
+    stm_random_bytes(key, sizeof key);
+    stm_random_bytes(nonce, sizeof nonce);
+
+    uint8_t canary = 0xA5;
+    uint8_t buf[128 + STM_AEAD_TAG_LEN_MAX + 16];
+    memset(buf, canary, sizeof buf);
+
+    const char pt[128] = "foo";
+    size_t outlen = 0;
+    STM_ASSERT_OK(stm_aead_encrypt(STM_AEAD_XCHACHA20_SIV, key, nonce,
+                                   NULL, 0, pt, sizeof pt,
+                                   buf, &outlen));
+    STM_ASSERT_EQ(outlen, sizeof pt + stm_aead_tag_len(STM_AEAD_XCHACHA20_SIV));
+    /* Trailing canary bytes must be untouched. */
+    for (size_t i = outlen; i < sizeof buf; i++) {
+        STM_ASSERT_EQ(buf[i], canary);
+    }
+}
+
+/* Regression for R0-P1-4: wrap under a pk whose ML-KEM half is all zero
+ * (classical-only origin) must round-trip. */
+STM_TEST(hybrid_wrap_zero_mlkem_pk_roundtrips) {
+    init_once();
+
+    uint8_t pk[STM_HYBRID_PK_LEN];
+    uint8_t sk[STM_HYBRID_SK_LEN];
+    stm_x25519_keygen(pk, sk);
+    /* Zero both ML-KEM halves, emulating a pool created without liboqs. */
+    memset(pk + STM_X25519_PK_LEN, 0, STM_MLKEM768_PK_LEN);
+    memset(sk + STM_X25519_SK_LEN, 0, STM_MLKEM768_SK_LEN);
+
+    uint8_t dek[32];
+    stm_random_bytes(dek, sizeof dek);
+
+    uint8_t wrapped[sizeof dek + STM_HYBRID_WRAP_OVERHEAD];
+    size_t wlen = 0;
+    STM_ASSERT_OK(stm_hybrid_wrap(pk, dek, sizeof dek, wrapped, &wlen));
+
+    uint8_t out[sizeof dek];
+    size_t olen = 0;
+    STM_ASSERT_OK(stm_hybrid_unwrap(sk, wrapped, wlen, out, &olen));
+    STM_ASSERT_EQ(olen, sizeof dek);
+    STM_ASSERT_MEM_EQ(out, dek, sizeof dek);
+}
+
+/* Regression for R0-P1-2: length serialization in MAC must handle inputs
+ * that would need a 64-bit shift on 32-bit platforms. Direct test is
+ * impossible (we're not on a 32-bit platform), but we can verify that the
+ * encrypt/decrypt path handles a modest AD length correctly via roundtrip. */
+STM_TEST(xchacha20siv_roundtrip_with_long_ad) {
+    init_once();
+    uint8_t key[64], nonce[32];
+    stm_random_bytes(key, sizeof key);
+    stm_random_bytes(nonce, sizeof nonce);
+
+    size_t ad_len = 1 << 16;   /* 64 KiB AD */
+    uint8_t *ad = malloc(ad_len);
+    STM_ASSERT(ad != NULL);
+    stm_prop_seed(0xdead);
+    stm_prop_fill(ad, ad_len);
+
+    const uint8_t pt[64] = { 1, 2, 3 };
+    uint8_t ct[sizeof pt + STM_AEAD_TAG_LEN_MAX];
+    size_t clen = 0;
+    STM_ASSERT_OK(stm_aead_encrypt(STM_AEAD_XCHACHA20_SIV, key, nonce,
+                                   ad, ad_len, pt, sizeof pt, ct, &clen));
+
+    uint8_t rec[sizeof pt];
+    size_t plen = 0;
+    STM_ASSERT_OK(stm_aead_decrypt(STM_AEAD_XCHACHA20_SIV, key, nonce,
+                                   ad, ad_len, ct, clen, rec, &plen));
+    STM_ASSERT_EQ(plen, sizeof pt);
+    STM_ASSERT_MEM_EQ(rec, pt, sizeof pt);
+
+    free(ad);
 }
 
 STM_TEST_MAIN("crypto")

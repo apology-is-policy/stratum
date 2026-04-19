@@ -102,10 +102,26 @@ stm_status stm_hybrid_wrap(const uint8_t pk[STM_HYBRID_PK_LEN],
         return s;
     }
 
-    /* (3) ML-KEM encap (or zero-fill if liboqs unavailable). */
+    /*
+     * (3) ML-KEM encap — only if BOTH liboqs is available locally AND the
+     * peer's ML-KEM public key slot is populated. A keypair generated on a
+     * classical-only host has an all-zero ML-KEM half; invoking encap on
+     * such a key would pass zero-valued bytes into a ML-KEM implementation
+     * that performs no input validation, producing garbage that the decap
+     * side (even on PQ-capable hosts) cannot reverse. Detect that here and
+     * take the classical fallback path so the wire format stays uniform.
+     */
     uint8_t mlkem_ct[STM_MLKEM768_CT_LEN];
     uint8_t ss2[32];
-    if (stm_mlkem768_available()) {
+    bool peer_has_mlkem = false;
+    {
+        const uint8_t *peer_mlkem_pk = pk + STM_X25519_PK_LEN;
+        for (size_t i = 0; i < STM_MLKEM768_PK_LEN; i++) {
+            if (peer_mlkem_pk[i] != 0) { peer_has_mlkem = true; break; }
+        }
+    }
+
+    if (stm_mlkem768_available() && peer_has_mlkem) {
         s = stm_mlkem768_encap(pk + STM_X25519_PK_LEN, mlkem_ct, ss2);
         if (s != STM_OK) {
             stm_ct_memzero(ephem_sk, sizeof ephem_sk);
