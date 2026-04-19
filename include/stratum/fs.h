@@ -122,4 +122,13 @@ int  stm_fs_xattr_list(struct stm_fs *fs, uint64_t ino,
                        int (*cb)(const char *name, void *ctx), void *ctx);
 int  stm_fs_xattr_remove(struct stm_fs *fs, uint64_t ino, const char *name);
 
+/* POSIX Group D (SOTA #5): create a hardlink. Inserts a new dirent at
+ * (new_parent, new_name) pointing at an existing inode, then bumps
+ * si_nlink on the target. Directory hardlinks are rejected with -EPERM
+ * (POSIX). -EMLINK if nlink would overflow. stm_fs_unlink already
+ * handles nlink > 1 correctly — it tombstones one dirent, decrements
+ * nlink, and only reaps data when nlink reaches 0. */
+int  stm_fs_link(struct stm_fs *fs, uint64_t target_ino,
+                 uint64_t new_parent, const char *new_name);
+
 #endif /* STM_FS_H */

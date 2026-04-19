@@ -342,6 +342,19 @@ static void ll_removexattr(fuse_req_t req, fuse_ino_t ino, const char *name)
     fuse_reply_err(req, rc ? -rc : 0);
 }
 
+/* POSIX Group D: hardlink. FUSE passes the TARGET inode (source of the
+ * link) and the new parent+name. We defer all policy (dir rejection,
+ * EMLINK) to stm_fs_link, then reply with the new dirent param. */
+static void ll_link(fuse_req_t req, fuse_ino_t ino,
+                    fuse_ino_t newparent, const char *newname)
+{
+    int rc = stm_fs_link(g_fs, ino, newparent, newname);
+    if (rc) { fuse_reply_err(req, -rc); return; }
+    struct fuse_entry_param e;
+    make_entry(ino, &e);
+    fuse_reply_entry(req, &e);
+}
+
 static void ll_rename(fuse_req_t req, fuse_ino_t parent, const char *name,
                       fuse_ino_t newparent, const char *newname,
                       unsigned int flags)
@@ -508,6 +521,7 @@ static const struct fuse_lowlevel_ops ops = {
     .readdir  = ll_readdir,
     .statfs   = ll_statfs,
     .rename      = ll_rename,
+    .link        = ll_link,
     .setxattr    = ll_setxattr,
     .getxattr    = ll_getxattr,
     .listxattr   = ll_listxattr,

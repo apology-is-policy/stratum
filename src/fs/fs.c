@@ -2021,6 +2021,91 @@ int stm_fs_rename(struct stm_fs *fs,
     return tombstone_dirent(fs->tree, &old_dkey, fs->gen);
 }
 
+/* POSIX Group D: hardlinks.
+ *
+ * stm_fs_link inserts a new dirent at (new_parent, new_name) pointing at
+ * an existing inode, and bumps si_nlink on that inode. The existing
+ * stm_fs_unlink already honors nlink > 1 (it decrements, tombstones one
+ * dirent, and only reaps data when nlink reaches 0), so hardlinks
+ * "just work" once stm_fs_link is in place.
+ *
+ * POSIX-strict: hardlinks are legal only on NON-directory files.
+ * Directory hardlinks would create cycles and break readdir + orphan
+ * detection; the kernel VFS has always rejected them with -EPERM.
+ * We do the same.
+ *
+ * Ordering for crash safety:
+ *   1. Read target inode (source of the link).
+ *   2. Reject -EPERM for directories.
+ *   3. find_dirent_slot for the new name (returns -EEXIST if live).
+ *   4. Insert new dirent → after this, two dirents point at target,
+ *      nlink is still stale (= old value).
+ *   5. Bump nlink and write the inode → after this, nlink matches
+ *      the dirent count.
+ *
+ * Failure modes:
+ *   - find_dirent_slot fails → no changes, retry-safe.
+ *   - btree_insert fails after slot resolution → nlink unchanged,
+ *     no new dirent, retry-safe.
+ *   - write_inode fails AFTER the new dirent insert → volume has
+ *     two dirents with nlink still = old value. Subsequent unlink
+ *     of either path decrements nlink below the real count, and
+ *     eventually nlink hits 0 while a dirent still lives. `stratum
+ *     check` would flag this as "dangling dirent" / "nlink mismatch"
+ *     mismatch. Practically this only triggers on btree-level OOM
+ *     mid-insert, which is extremely rare. Retry of stm_fs_link
+ *     hits -EEXIST on find_dirent_slot because the new dirent is
+ *     already there; the caller can detect this and issue a
+ *     follow-up write_inode itself.
+ *
+ * The reverse order (write_inode first, then insert dirent) would
+ * leave a stale bump on failure — nlink N+1 with only N dirents, and
+ * a later unlink would see nlink=1 and skip the reap when in fact
+ * this was the last dirent. Worse outcome. Insert-then-bump is
+ * correct: too-low-nlink reports an inconsistency statically without
+ * hiding data reachable from unbalanced dirents. */
+int stm_fs_link(struct stm_fs *fs, uint64_t target_ino,
+                uint64_t new_parent, const char *new_name)
+{
+    STM_FS_GUARD_WRITE(fs);
+    if (!new_name || !new_name[0]) return -EINVAL;
+    size_t nlen = strlen(new_name);
+    if (nlen > STM_NAME_MAX) return -ENAMETOOLONG;
+
+    struct stm_inode in;
+    int rc = read_inode(fs, target_ino, &in);
+    if (rc) return rc;
+
+    uint32_t mode = le32_to_cpu(in.si_mode);
+    if ((mode & STM_S_IFMT) == STM_S_IFDIR) return -EPERM;
+
+    /* Overflow guard: si_nlink is u32; practically unreachable but
+     * worth rejecting symbolically. 2^32 hardlinks would require 2^32
+     * dirents which would blow the address space long before. */
+    uint32_t cur_nl = le32_to_cpu(in.si_nlink);
+    if (cur_nl >= 0xFFFFFFFEu) return -EMLINK;
+
+    struct stm_key new_dkey;
+    rc = find_dirent_slot(fs->tree, new_parent, new_name, nlen, &new_dkey);
+    if (rc) return rc;  /* -EEXIST if name already in use */
+
+    uint8_t dtype = ((mode & STM_S_IFMT) == STM_S_IFDIR)
+                  ? STM_DT_DIR : STM_DT_REG;
+    uint8_t dbuf[STM_NAME_MAX + 16];
+    uint32_t dlen;
+    encode_dirent(target_ino, dtype, new_name, nlen, dbuf, &dlen);
+    rc = stm_btree_insert(fs->tree, &new_dkey, dbuf, dlen, fs->gen);
+    if (rc) return rc;
+
+    /* Bump nlink + ctime (attr change). */
+    in.si_nlink = cpu_to_le32(cur_nl + 1);
+    uint64_t ts; uint32_t tns;
+    stm_now(&ts, &tns);
+    in.si_ctime_sec  = cpu_to_le64(ts);
+    in.si_ctime_nsec = cpu_to_le32(tns);
+    return write_inode(fs, target_ino, &in);
+}
+
 int stm_fs_unlink(struct stm_fs *fs, uint64_t parent_ino, const char *name)
 {
     struct stm_key dkey;

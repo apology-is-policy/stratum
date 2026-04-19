@@ -1093,6 +1093,94 @@ STM_TEST(test_fs_posix_xattr)
     unlink(path);
 }
 
+/* POSIX Group D (SOTA #5): hardlinks. */
+STM_TEST(test_fs_posix_hardlinks)
+{
+    const char *path = "/tmp/stratum_test_posix_hardlinks.img";
+    unlink(path);
+    STM_ASSERT_EQ(stm_fs_create(path, 32ULL*1024*1024, NULL), 0);
+    struct stm_fs *fs;
+    STM_ASSERT_EQ(stm_fs_open(path, NULL, &fs), 0);
+
+    /* Create /a with content, hardlink it to /b. */
+    uint64_t ino;
+    STM_ASSERT_EQ(stm_fs_create_file(fs, 1, "a", 0644, &ino), 0);
+    STM_ASSERT_EQ(stm_fs_write(fs, ino, 0, "shared!", 7), 0);
+
+    struct stm_inode in;
+    STM_ASSERT_EQ(stm_fs_stat(fs, ino, &in), 0);
+    STM_ASSERT_EQ(le32_to_cpu(in.si_nlink), 1u);
+
+    STM_ASSERT_EQ(stm_fs_link(fs, ino, 1, "b"), 0);
+    STM_ASSERT_EQ(stm_fs_stat(fs, ino, &in), 0);
+    STM_ASSERT_EQ(le32_to_cpu(in.si_nlink), 2u);
+
+    /* Both names resolve to the same inode; both read the same content. */
+    uint64_t chk_a, chk_b;
+    STM_ASSERT_EQ(stm_fs_lookup(fs, 1, "a", &chk_a), 0);
+    STM_ASSERT_EQ(stm_fs_lookup(fs, 1, "b", &chk_b), 0);
+    STM_ASSERT_EQ(chk_a, ino);
+    STM_ASSERT_EQ(chk_b, ino);
+
+    char buf[16] = {0};
+    uint32_t nread = 0;
+    STM_ASSERT_EQ(stm_fs_read(fs, ino, 0, buf, sizeof(buf), &nread), 0);
+    STM_ASSERT_MEM_EQ(buf, "shared!", 7);
+
+    /* Writing through one name visible through the other (same inode). */
+    STM_ASSERT_EQ(stm_fs_write(fs, ino, 0, "changed", 7), 0);
+    memset(buf, 0, sizeof(buf));
+    STM_ASSERT_EQ(stm_fs_read(fs, ino, 0, buf, sizeof(buf), &nread), 0);
+    STM_ASSERT_MEM_EQ(buf, "changed", 7);
+
+    /* Third link; nlink = 3. */
+    STM_ASSERT_EQ(stm_fs_link(fs, ino, 1, "c"), 0);
+    STM_ASSERT_EQ(stm_fs_stat(fs, ino, &in), 0);
+    STM_ASSERT_EQ(le32_to_cpu(in.si_nlink), 3u);
+
+    /* Linking to an already-existing name → -EEXIST. */
+    STM_ASSERT_EQ(stm_fs_link(fs, ino, 1, "a"), -EEXIST);
+
+    /* Unlink one — nlink drops to 2, inode still there, data intact. */
+    STM_ASSERT_EQ(stm_fs_unlink(fs, 1, "a"), 0);
+    STM_ASSERT_EQ(stm_fs_stat(fs, ino, &in), 0);
+    STM_ASSERT_EQ(le32_to_cpu(in.si_nlink), 2u);
+    STM_ASSERT_EQ(stm_fs_lookup(fs, 1, "a", &chk_a), -ENOENT);
+    STM_ASSERT_EQ(stm_fs_lookup(fs, 1, "b", &chk_b), 0);
+    STM_ASSERT_EQ(chk_b, ino);
+    memset(buf, 0, sizeof(buf));
+    STM_ASSERT_EQ(stm_fs_read(fs, ino, 0, buf, sizeof(buf), &nread), 0);
+    STM_ASSERT_MEM_EQ(buf, "changed", 7);
+
+    /* Unlink second — nlink drops to 1. */
+    STM_ASSERT_EQ(stm_fs_unlink(fs, 1, "b"), 0);
+    STM_ASSERT_EQ(stm_fs_stat(fs, ino, &in), 0);
+    STM_ASSERT_EQ(le32_to_cpu(in.si_nlink), 1u);
+
+    /* Unlink the last remaining — inode fully reaped. */
+    STM_ASSERT_EQ(stm_fs_unlink(fs, 1, "c"), 0);
+    STM_ASSERT_EQ(stm_fs_stat(fs, ino, &in), -ENOENT);
+    STM_ASSERT_EQ(stm_fs_lookup(fs, 1, "c", &chk_a), -ENOENT);
+
+    /* Cannot hardlink a directory. */
+    uint64_t dir_ino;
+    STM_ASSERT_EQ(stm_fs_mkdir(fs, 1, "mydir", 0755, &dir_ino), 0);
+    STM_ASSERT_EQ(stm_fs_link(fs, dir_ino, 1, "mydir_alias"), -EPERM);
+
+    /* Sync + reopen — link count persists. */
+    uint64_t x_ino;
+    STM_ASSERT_EQ(stm_fs_create_file(fs, 1, "x", 0644, &x_ino), 0);
+    STM_ASSERT_EQ(stm_fs_link(fs, x_ino, 1, "y"), 0);
+    STM_ASSERT_EQ(stm_fs_sync(fs), 0);
+    stm_fs_close(fs);
+    STM_ASSERT_EQ(stm_fs_open(path, NULL, &fs), 0);
+    STM_ASSERT_EQ(stm_fs_stat(fs, x_ino, &in), 0);
+    STM_ASSERT_EQ(le32_to_cpu(in.si_nlink), 2u);
+
+    stm_fs_close(fs);
+    unlink(path);
+}
+
 int main(void)
 {
     STM_SUITE("fs");
@@ -1116,6 +1204,7 @@ int main(void)
     STM_RUN(test_fs_posix_attr_mutations);
     STM_RUN(test_fs_posix_rename);
     STM_RUN(test_fs_posix_xattr);
+    STM_RUN(test_fs_posix_hardlinks);
     printf("all passed\n");
     return 0;
 }

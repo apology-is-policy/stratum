@@ -777,7 +777,10 @@ stm_fs_* API  →  Bε-tree  →  block device  (same backend 9P uses)
 | `fsync(ino, datasync)` | `stm_fs_sync` | wired |
 | `readdir(ino, size, off)` | `stm_fs_readdir` | wired (via `fuse_add_direntry`) |
 | `statfs(ino)` | placeholder | wired (generic values until SOTA #2) |
-| `rename`, `link`, `symlink`, `readlink`, `mknod`, `setxattr`, `getxattr`, `listxattr`, `removexattr`, `access` | — | **ENOSYS** until SOTA #5 Groups B/C/D |
+| `rename(parent, name, newparent, newname)` | `stm_fs_rename` | wired (SOTA #5 Group B) |
+| `setxattr` / `getxattr` / `listxattr` / `removexattr` | `stm_fs_xattr_{set,get,list,remove}` | wired (SOTA #5 Group C) |
+| `link(ino, newparent, newname)` | `stm_fs_link` | wired (SOTA #5 Group D) |
+| `symlink`, `readlink`, `mknod`, `access` | — | ENOSYS (symlinks + special files out of roadmap scope) |
 
 **`setattr` dispatch (SOTA #5 Group A)**: the FUSE layer inspects the `to_set` bitmask and routes each field independently to the corresponding stm_fs_* mutation. `FUSE_SET_ATTR_MODE` → `stm_fs_chmod`, `UID`/`GID` → `stm_fs_chown` (with the other field passed as `(uint32_t)-1` to mean "don't change"), `ATIME`/`MTIME` (plain or `_NOW`) → `stm_fs_utimes`, `SIZE` → `stm_fs_truncate`. After all mutations succeed, getattr is re-run and the refreshed attrs are returned so FUSE's kernel cache stays consistent.
 
