@@ -1652,53 +1652,635 @@ Status: DRAFT → awaiting review, push-back, then COMMITTED.
 
 ## 7. Cryptography and integrity
 
-**STATUS**: STUB
+**STATUS**: DRAFT
 
-*(Merged from previous §9 Integrity + §10 Crypto — they're inseparable. AEAD tags are integrity on encrypted volumes; Merkle covers metadata; per-extent csum covers unencrypted data. Unified treatment.)*
+*(Merged from earlier-draft §9 Integrity + §10 Crypto — they're inseparable. AEAD tags are integrity on encrypted volumes; Merkle covers metadata; per-extent csum covers unencrypted data. Unified treatment here.)*
 
-### 7.1 Goals
+### 7.1 Goals and non-goals
 
-- PQ-hybrid wrap keys (NOVEL #2).
-- Nonce-misuse-resistant AEAD (NOVEL #2).
-- Per-dataset keys with inheritance.
-- Key agent separation (NOVEL #10).
-- Merkle-rooted metadata integrity (NOVEL #5).
-- Per-extent data integrity (xxHash3 on unencrypted, AEAD tag on encrypted).
-- Online scrub with repair.
+**Goals**:
 
-### 7.2 Decisions committed (VISION §5.2, NOVEL #2, NOVEL #5, NOVEL #10)
+- PQ-hybrid wrap keys (ML-KEM-768 + X25519) as the default (NOVEL #2).
+- Nonce-misuse-resistant AEAD for data (XChaCha20-SIV or AEGIS-256) (NOVEL #2).
+- Per-dataset keys with inheritance and rotation.
+- Key material lives in a separate process (key agent, NOVEL #10) — filesystem only sees wrapped keys.
+- Merkle-rooted metadata integrity (NOVEL #5): every metadata block's hash is chained to the pool's Merkle root in the uberblock.
+- Per-extent data integrity: AEAD tag on encrypted, xxHash3-64 on unencrypted.
+- Online scrub with repair from redundancy.
+- Tamper-evidence at the whole-pool level: any offline modification to metadata is cryptographically detectable.
 
-- Data: XChaCha20-SIV or AEGIS-256 (pick after benchmark).
-- Wrap: X25519 + ML-KEM-768 hybrid.
-- Nonce construction under End A (serialized txg commit).
-- Merkle via BLAKE3-256; root in SB.
-- Key agent is separate process.
+**Non-goals**:
 
-### 7.3 Subsections to write
+- Homomorphic operations on encrypted data (search over ciphertext, etc.). Research-grade; not a filesystem concern.
+- Format-preserving encryption. Not needed for our threat model.
+- Client-side encryption (app encrypts before writing). Orthogonal to FS-level encryption; stacks fine.
+- Full-disk encryption with OPAL/SED hardware offload. That's a layer below; we plug into it rather than duplicate.
+- Cross-pool federation of encryption keys. Single-pool key hierarchy only.
 
-- **7.3.1** Key hierarchy — master wrap → per-dataset wrap → per-object data key.
-- **7.3.2** Nonce construction — `(pool_id, device_id, paddr, txg, seq)`; proved unique in TLA+.
-- **7.3.3** AEAD construction — specific SIV mode, test vectors, performance targets.
-- **7.3.4** Associated-data design — multi-device + dataset context; extends v1's `stm_ad_extent`.
-- **7.3.5** Key rotation — wrap-key rotation without data re-encrypt; data-key rotation.
-- **7.3.6** Per-dataset encryption inheritance — key-from-parent vs independent-key.
-- **7.3.7** Key agent protocol — FS↔agent request/response, audit logging.
-- **7.3.8** Encrypted send / recv — raw-send preserving encryption.
-- **7.3.9** Merkle hash placement — per-node subtree hash in Bε-tree node.
-- **7.3.10** Hash update protocol — incremental, propagates to root on commit.
-- **7.3.11** Verify paths — mount-time full verify (opt-in), on-read path verify (default), background scrub.
-- **7.3.12** Scrub — scheduling, IO weight, progress reporting.
-- **7.3.13** Repair — reconstruction from redundancy, repair logging.
-- **7.3.14** Unrecoverable corruption handling.
-- **7.3.15** Per-data-extent integrity — xxHash3 on unencrypted, AEAD tag on encrypted.
+### 7.2 Decisions already committed
 
-### 7.4 Open questions
+From earlier docs:
 
-- SIV final choice: XChaCha20-SIV (conservative, no HW req) vs AEGIS-256 (faster with AES-NI).
-- Per-dataset key derivation: HKDF from master + dataset-path vs separate generate + master-wrap.
-- Agent protocol: 9P over Unix socket vs bespoke RPC.
-- Merkle over all metadata vs only SB-adjacent (root + tree roots).
-- Scrub priority model.
+- **PQ-hybrid wrap keys**: X25519 + ML-KEM-768 (VISION §5.2, NOVEL #2).
+- **AEAD candidate modes**: XChaCha20-SIV or AEGIS-256 (NOVEL #2).
+- **Nonce allocation under End A**: serialized at commit coordinator (§3.7.4).
+- **Merkle root via BLAKE3-256 in uberblock** (§5, NOVEL #5).
+- **Key agent is a separate process** (NOVEL #10).
+
+Decisions taken in this section:
+
+- **Support both AEAD modes** — AEGIS-256 by default on hardware with AES acceleration (x86-64 + AES-NI, ARMv8 + crypto extensions); XChaCha20-SIV as fallback and as explicit-override option. Detected at pool creation, settable per-dataset.
+- **Three-level logical key hierarchy**: (1) wrap key at agent, (2) dataset key stored wrapped in uberblock, (3) per-object logical key derived from dataset key + AD context. Only (1) and (2) are physical keys; (3) is derivation at encrypt/decrypt time.
+- **AD struct layout** extends v1's to multi-device + dataset: see §7.6.
+- **Retired-key list** in uberblock: old dataset keys kept for reading historical data without forcing re-encryption on rotation.
+- **Merkle over ALL metadata**: every metadata block is in the Merkle tree, rooted at the uberblock.
+- **Per-extent integrity** (xxHash3 vs AEAD tag) is mode-dependent, carried forward from v1's Phase D #7.
+
+### 7.3 Key hierarchy
+
+Three-level logical structure:
+
+```
+┌──────────────────────────────────────────┐
+│  Wrap key (W)                             │  lives in key agent
+│  ────────────────────                      │  (passphrase-derived / TPM / HSM /
+│  Argon2id from passphrase, OR              │   PKCS#11 / YubiKey-backed)
+│  TPM-sealed, OR PKCS#11 session key        │
+│                                             │
+└───────────────┬──────────────────────────┘
+                │ wraps
+                ▼
+┌──────────────────────────────────────────┐
+│  Dataset key (D_i)                         │  per-dataset, 32 bytes (AEGIS-256
+│  ────────────────────                      │   master key; XChaCha20-SIV uses
+│  Randomly generated on dataset create.     │   48 bytes).
+│  Wrapped by W, stored in ub_key_schema     │  Wrapped form: D_i encrypted under W
+│  in the uberblock.                         │   + HMAC tag for integrity.
+│                                             │
+└───────────────┬──────────────────────────┘
+                │ + (ino, offset, txg, seq) via AD → derives
+                ▼
+┌──────────────────────────────────────────┐
+│  Per-object key (logical)                  │  not stored; computed at
+│  ────────────────────                      │  encrypt/decrypt time.
+│  k_obj = AEAD-derive(D_i, AD struct)       │  SIV modes naturally derive
+│                                             │  per-object effective keys from
+│                                             │  the AD; no separate step needed.
+└──────────────────────────────────────────┘
+```
+
+#### 7.3.1 Wrap key
+
+- Held in the key agent process only. Never seen by the filesystem.
+- Derived from a user passphrase via **Argon2id(salt, params)** (same as v1), or stored in a hardware-backed key slot (TPM 2.0, PKCS#11 HSM, YubiKey via FIDO2, Secure Enclave).
+- Multiple wrap keys possible per pool: primary + backup + emergency. The pool tracks which wrap key is current; dataset keys are wrapped by the current wrap key.
+
+#### 7.3.2 Dataset key
+
+- 32-byte symmetric key for AEGIS-256, or 48-byte for XChaCha20-SIV (includes extended nonce state).
+- Randomly generated at dataset creation (CSPRNG: libsodium `randombytes_buf`).
+- Wrapped under the wrap key using PQ-hybrid:
+  ```
+  wrapped_D_i = HPKE-seal(wrap_key_pk, D_i)
+  ```
+  Where HPKE (RFC 9180) is instantiated with the hybrid KEM: X25519 || ML-KEM-768, plus XChaCha20-Poly1305 AEAD for the wrapping.
+- Stored in the uberblock's `ub_key_schema` (§5.4), 512 bytes reserved.
+- Key rotation generates a new D_i, marks the old as "retired" (§7.7).
+
+#### 7.3.3 Per-object logical key
+
+Not physically stored. When encrypting or decrypting, the SIV construction treats the combination `(D_i, AD struct)` as the effective keying context. Two writes with different AD structs effectively use different "keys" from the attacker's perspective, even though the same physical D_i is input to the algorithm.
+
+This means the AD is load-bearing for security — changing AD fields changes the effective key. Subverting the AD (e.g., swapping an extent's AD at read time) breaks decryption. This is by design.
+
+#### 7.3.4 PQ-hybrid wrapping details
+
+The wrap operation:
+
+```
+// Hybrid public key: concatenation of X25519 + ML-KEM-768 public keys.
+// Stored in the key agent; exposed to pool at wrap time.
+wrap_pk = X25519_pk || MLKEM_pk        (32 + 1184 = 1216 bytes)
+wrap_sk = X25519_sk || MLKEM_sk
+
+// Wrap:
+ephemeral_sk = X25519_keygen()
+ss1 = X25519_DH(ephemeral_sk.x25519, wrap_pk.x25519)  // 32 bytes
+ct2, ss2 = ML-KEM-768.encap(wrap_pk.mlkem)           // ct2 = 1088 bytes, ss2 = 32 bytes
+ss = HKDF-SHA256(ss1 || ss2, "stratum-wrap-v1")      // 32 bytes combined
+
+// Encrypt dataset key under the combined shared secret
+wrapped_D_i = XChaCha20-Poly1305(ss, nonce=0, D_i) || ephemeral_pk.x25519 || ct2
+
+// Stored in uberblock: wrapped_D_i (~1152 bytes per dataset)
+```
+
+Security properties:
+- X25519 broken but ML-KEM unbroken → still secure (ss2 protects).
+- ML-KEM broken but X25519 unbroken → still secure (ss1 protects).
+- Both broken → compromised (same for any hybrid).
+
+This is NIST's recommended hybrid pattern post-FIPS 203 (2024).
+
+### 7.4 Nonce construction and uniqueness
+
+AEGIS-256 takes a 32-byte nonce. XChaCha20-SIV takes 24 bytes. We use 24 bytes and pad to 32 for AEGIS (the extra 8 bytes are reserved; see §7.4.3).
+
+#### 7.4.1 Nonce layout
+
+```
+Bytes 0..7:  paddr (16-bit device_id | 48-bit offset)
+Bytes 8..15: txg (64-bit transaction group number)
+Bytes 16..19: seq_in_txg (32-bit sequence within this txg)
+Bytes 20..23: 0 (reserved for future use)
+Bytes 24..31: 0 (only used by AEGIS-256; padded with pool_uuid high bits)
+```
+
+For AEGIS-256's extra 8 bytes, we pack the pool UUID's high 64 bits. This means: even if two pools somehow shared a key (they shouldn't, but defense in depth), nonces differ by pool.
+
+#### 7.4.2 Uniqueness argument
+
+(paddr, txg) is unique because:
+- paddr uniquely identifies a physical location (§4.4).
+- txg is monotonic and global per pool.
+- The same paddr can be reused across txgs (COW reclaim), but only with a different txg.
+
+(paddr, txg, seq_in_txg) adds granularity within a single txg:
+- Multiple blocks can be written to different paddrs within one txg.
+- seq_in_txg starts at 0, increments per allocation within the txg.
+- Assigned by the commit coordinator under End A (§3.7.4); single writer, trivially unique.
+
+The TLA+ spec `docs/specs/nonce.tla` formalizes these claims. Key lemmas:
+- `UniquePerTxg`: within a single txg, no two nonces collide.
+- `UniqueAcrossTxgs`: across all historical txgs, no two nonces collide — because `txg` is monotonic and part of the nonce.
+- `SurvivesCOW`: reassigning paddr in a later txg produces a different nonce than any prior use of that paddr.
+
+#### 7.4.3 Reserved bits
+
+8 bytes (bits 160..191 and 192..255 for AEGIS) are reserved:
+
+- Allows future extension for sub-block addressing, multi-key rotation indices, or additional context without breaking format.
+- Enabled via feature flag when needed.
+
+### 7.5 AEAD construction
+
+#### 7.5.1 AEGIS-256 (default on hardware with AES acceleration)
+
+- 32-byte key, 32-byte nonce, 16-byte tag.
+- CAESAR portfolio winner for high-performance + robustness (2019).
+- ~6–10 GB/s/core on x86-64 + AES-NI + VAES.
+- ~1–2 GB/s/core on ARMv8 + crypto extensions.
+- On CPUs without hardware AES: software fallback at ~100 MB/s (unacceptable for production; fallback to XChaCha20-SIV on such hardware).
+
+Standards reference: CAESAR; proposed as ISO/IEC 18033-7.
+
+#### 7.5.2 XChaCha20-SIV (default on hardware without AES acceleration; also explicit-override)
+
+- 32-byte key + 32-byte SIV-derived subkey, 24-byte nonce, 16-byte tag.
+- Based on XChaCha20 stream cipher + Poly1305 MAC, with SIV wrapping (Harris et al. 2019).
+- Nonce-misuse resistant: if nonce accidentally repeats, attacker learns only that two plaintexts were equal. No CPA-break.
+- ~1–2 GB/s/core without hardware acceleration; uniform performance across CPUs.
+- Software-side mature; libsodium has XChaCha20-Poly1305 (need to add SIV wrapper — modest code, ~500 LOC).
+
+#### 7.5.3 Mode selection
+
+At pool creation: auto-detect hardware (AES-NI on x86, crypto extensions on ARM). Select AEGIS-256 if available, XChaCha20-SIV otherwise.
+
+Per-dataset override: `dataset set encryption=xchacha20-siv tank/archive` forces XChaCha20-SIV even on AES-capable hardware. Useful for cross-platform portability (a dataset encrypted with AEGIS might be slow to decrypt on ARM without crypto extensions).
+
+Mode is stored in the dataset's uberblock entry. All blocks in a dataset use the same mode. Mode change requires re-encryption (expensive; rarely done).
+
+#### 7.5.4 Ciphertext layout on disk
+
+For a block of N bytes plaintext:
+```
+[ciphertext: N bytes] [tag: 16 bytes]
+```
+
+Disk allocation size: `N + 16` rounded up to 4 KiB. For a 128 KiB metadata node, disk footprint is 128 KiB + 16 bytes → 132 KiB → 33 blocks of 4 KiB (with waste in last block).
+
+For extent data, compression (§11) can shrink N; the 16-byte tag overhead is fixed.
+
+### 7.6 Associated data
+
+AD binds ciphertext to its context. A ciphertext encrypted with AD X cannot be decrypted with AD Y — the AEAD tag fails.
+
+#### 7.6.1 Data-extent AD
+
+```c
+struct stm_ad_extent {
+    le32    magic;          // STM_AD_MAGIC_EXTENT = 'EXTD'
+    le32    version;        // 1
+    le64    pool_uuid[2];   // pool UUID (16 bytes)
+    le64    dataset_id;     // dataset within pool (8 bytes)
+    le64    ino;            // inode number (8 bytes)
+    le64    offset;         // byte offset within file (8 bytes)
+    le64    content_kind;   // 0 = file data, 1 = xattr, 2 = inline, ...
+};  // 56 bytes total
+```
+
+Extends v1's `stm_ad_extent` (16 bytes) to include pool UUID and dataset ID. A ciphertext written in pool A, dataset X, cannot be smuggled into pool B — different `pool_uuid` in AD → decrypt fails.
+
+#### 7.6.2 Metadata-node AD
+
+```c
+struct stm_ad_node {
+    le32    magic;          // STM_AD_MAGIC_NODE = 'BTND'
+    le32    version;        // 1
+    le64    pool_uuid[2];   // pool UUID
+    le32    tree_id;        // main / allocator[dev_id] / snap / cas_index
+    le32    node_level;     // 0 = leaf, >0 = internal at that level
+    le64    dataset_id;     // dataset (0 for pool-level trees)
+    le64    reserved;
+};  // 56 bytes total
+```
+
+Node swap attacks (a ciphertext smuggled from one tree to another) are detected by `tree_id` mismatch; attacks across datasets detected by `dataset_id` mismatch; attacks across pools detected by `pool_uuid`.
+
+#### 7.6.3 CAS-entry AD
+
+```c
+struct stm_ad_cas {
+    le32    magic;          // STM_AD_MAGIC_CAS = 'CASE'
+    le32    version;        // 1
+    le64    pool_uuid[2];   // pool UUID
+    le64    content_hash[4]; // BLAKE3-256 of plaintext content (32 bytes)
+};  // 56 bytes total
+```
+
+CAS chunks are keyed by content hash. AD binds ciphertext to its content hash — an attacker can't substitute a chunk for another without breaking AEAD.
+
+### 7.7 Key rotation
+
+Two kinds of rotation, independent:
+
+#### 7.7.1 Wrap-key rotation
+
+The wrap key W changes (user changes passphrase, HSM key rotation policy, etc.).
+
+Procedure:
+1. Key agent generates new W' (or derives from new passphrase).
+2. FS iterates over `ub_key_schema`: for each wrapped dataset key, unwrap with W, re-wrap with W'.
+3. Updated `ub_key_schema` committed in next txg.
+
+Wrap-key rotation does not re-encrypt data. It only re-wraps the dataset keys. Fast: O(number of datasets), typically seconds.
+
+#### 7.7.2 Dataset-key rotation
+
+A dataset's key D_i changes.
+
+Procedure:
+1. FS requests agent to generate new D_i' and wrap under W. Agent returns `wrapped_D_i'`.
+2. FS commits both old and new keys: old marked `RETIRED`, new marked `CURRENT`.
+3. New writes use D_i'. Old data is readable via D_i (retired keys are still unwrap-able).
+4. Optional: FS can run a background "re-encrypt with new key" pass, eventually retiring D_i entirely.
+
+Retired keys stay in `ub_key_schema` indefinitely unless explicitly pruned. They're cheap to store (few KB each).
+
+#### 7.7.3 Retired key storage
+
+`ub_key_schema` (512 bytes) layout:
+
+```
+[num_keys: 1 byte][reserved: 7 bytes]
+[key[0]: 128 bytes: id + state + wrapped_bytes]
+[key[1]: 128 bytes]
+[key[2]: 128 bytes]
+[key[3]: 128 bytes]
+```
+
+Max 4 keys per dataset entry; one current, up to 3 retired. Rotations beyond 3 force pruning of the oldest retired key (which requires verifying no data still uses it — background scan task).
+
+For datasets with complex rotation histories, a pointer to an "extended key schema" object stored in the main tree is used (feature flag `COMPAT_EXTENDED_KEY_SCHEMA`).
+
+### 7.8 Per-dataset encryption inheritance
+
+At dataset creation, the new dataset can:
+
+- **Inherit parent's encryption** (default): use the same dataset key as the parent. Simplest; data written in child is readable by anyone with parent's key.
+- **Independent encryption**: generate a new D_i for the child. Parent's key cannot decrypt child's data.
+- **Unencrypted child of encrypted parent**: allowed. Child's data is plaintext.
+- **Encrypted child of unencrypted parent**: allowed. Child has its own key, parent is plaintext.
+
+The `encryption` property is set at dataset creation and cannot be changed afterward without re-encryption (expensive, not automatic).
+
+`inherit` vs `independent` is the subtle distinction. In the inherit case, the child's entry in `ub_key_schema` is an *alias* pointing at the parent's key rather than its own wrapped key. This matters for key rotation: rotating the parent rotates the inherit-aliased children atomically.
+
+### 7.9 Key agent protocol
+
+The filesystem and the key agent are separate processes. They communicate via a 9P connection on a Unix socket at `/var/run/stratum-agent.sock` (path configurable; default uses the system's run directory).
+
+Why 9P? We already implement 9P for client access; reusing it for the agent avoids a bespoke RPC. The agent exposes a small synthetic filesystem with keyed operations.
+
+#### 7.9.1 Agent synthetic FS
+
+```
+/agent/
+├── pools/
+│   └── <pool_uuid>/
+│       ├── wrap-key-info        (read: describes current wrap key backend)
+│       ├── datasets/
+│       │   └── <dataset_id>/
+│       │       ├── wrapped-key   (read: current wrapped key; write: update
+│       │       │                   with a new wrapped key as part of rotation)
+│       │       └── unwrap        (write: a challenge; read: the unwrap result
+│       │                          after agent performs its backend op)
+│       └── rotate-wrap           (write: trigger wrap-key rotation)
+└── backends/
+    ├── passphrase/               (admin-configurable)
+    ├── tpm/
+    ├── yubikey/
+    └── pkcs11/
+```
+
+FS-side ops:
+- Unwrap a dataset key: `cat /agent/pools/P/datasets/D/unwrap` (with context in a file write operation).
+- Rotate wrap key: `echo command > /agent/pools/P/rotate-wrap`.
+
+The agent logs every op to `/agent/audit-log`, which is append-only and human-readable.
+
+#### 7.9.2 Authentication between FS and agent
+
+Unix socket permissions + optional capability token. FS must be running as a UID authorized to talk to the agent; the agent checks socket peer credentials via `SO_PEERCRED` on Linux.
+
+Token mode (alternative): at pool-open time, FS obtains a short-lived capability token from the agent (via backend auth); subsequent ops present this token. Token expires on agent restart or after a timeout.
+
+#### 7.9.3 Agent backends
+
+- **`passphrase`**: interactive passphrase input via a pipe or tty. For laptops and personal use.
+- **`tpm`**: TPM 2.0 sealed object. Uses `tpm2-tss` library. Binds key to platform state (PCR registers).
+- **`pkcs11`**: standard cryptographic token interface. For enterprise HSMs, Nitrokey, and cloud KMS proxies.
+- **`yubikey`**: FIDO2/hmac-secret challenge-response. Touch-to-decrypt UX.
+- **`file`**: raw key file (for automation; discouraged; for containers).
+
+Each backend is a module; the agent selects based on configuration.
+
+### 7.10 Encrypted send and recv
+
+Stratum send/recv (defined in §8) can operate in two modes:
+
+- **Decrypted send**: sender decrypts locally, sends plaintext over (secure) channel. Receiver re-encrypts with its own key. Used when target is trusted but has different encryption policy.
+- **Raw send**: sender transmits ciphertext + wrapped keys directly. Receiver stores as-is without decrypting. Target decrypts only when reading; requires target to have the wrap key out of band.
+
+Raw send is the ZFS pattern. Enabled via `stratum send --raw ...`. The wire format includes the wrapped dataset key; the receiver installs it into its own uberblock.
+
+Security: raw send allows backup to untrusted storage without exposing plaintext. Wrap key never traverses the wire.
+
+### 7.11 Merkle root and hash placement
+
+Every metadata block carries its own hash; the hash chain ends at the uberblock's `ub_merkle_root`.
+
+#### 7.11.1 Node hash definition
+
+For a Bε-tree node at level L:
+```
+node_hash = BLAKE3-256(
+    node_encoding_bytes ||            // the node's serialized form (pre-encrypt)
+    child_hash[0] || child_hash[1] || ... || child_hash[n]   // for internal nodes
+)
+```
+
+For leaves, the concatenation is just the encoding bytes (no children).
+
+For internal nodes, child hashes are appended in key-order.
+
+For allocator-tree nodes, snap-tree nodes, CAS-index nodes: same pattern, different node encoding.
+
+#### 7.11.2 Per-extent data
+
+Data extents carry their integrity differently:
+
+- **Encrypted extent**: AEAD tag is the integrity proof. The tag is included in the extent record's stored bytes (§11). No separate Merkle entry.
+- **Unencrypted extent**: xxHash3-64 of on-disk bytes stored in the extent record (`se_xxh`, from v1 Phase D #7).
+
+Extent integrity is verified at the per-extent level, not as part of the Merkle tree. The Merkle tree covers the metadata (the extent record itself), not the extent's content — except transitively via AEAD tag / xxHash.
+
+The metadata containing the extent record IS Merkle-covered. So: offline edit to an extent's `se_paddr` or `se_xxh` value is detected by the Merkle tree; offline edit to the extent's content (at paddr) is detected by the tag/hash comparison against the metadata's claimed value.
+
+#### 7.11.3 Pool Merkle root
+
+```
+pool_merkle_root = BLAKE3-256(
+    main_tree_root_hash ||
+    allocator_roots_object_hash ||
+    snap_tree_root_hash ||
+    cas_index_root_hash ||
+    ub_merkle_root_salt        // 32 bytes random; stored in uberblock
+)
+```
+
+The root salt is a per-pool random value set at pool creation. Prevents certain precomputation attacks. Stored in the uberblock (`ub_merkle_root_salt`, carved from `ub_reserved`).
+
+### 7.12 Hash update protocol
+
+During commit (§3.7.3 Phase 2):
+
+1. For each dirty node (node with a non-empty delta chain or modified content):
+   a. Consolidate delta chain → fresh base node.
+   b. Encode → compute `node_hash` = BLAKE3(encoding || child_hashes).
+   c. Encrypt (if applicable) using the computed hash as part of integrity.
+   d. Write to disk.
+2. Propagate hash change up the tree:
+   a. Parent of a dirty node is also dirty (its child_hash changed).
+   b. Parent's hash must be recomputed.
+   c. Continue up to the tree root.
+3. Tree root's hash → stored in the uberblock's `ub_main_root` / `ub_alloc_root` etc.
+4. Pool Merkle root computed from all tree roots + salt.
+5. Committed in the new uberblock.
+
+Incremental: only dirty subtrees are re-hashed. Commit work is O(dirty paths to root) = O(dirty × log N).
+
+### 7.13 Verification paths
+
+Three verification modes, different tradeoffs:
+
+#### 7.13.1 Mount-time full verify (opt-in)
+
+`stratum mount --verify pool/...`:
+
+- Walk all metadata, verify every hash from leaves up to `ub_merkle_root`.
+- Walk all extents, verify AEAD tag / xxHash.
+- Report any discrepancy.
+- Slow: proportional to metadata + data. For 100 TiB pool: minutes to tens of minutes on NVMe.
+
+Used when:
+- Administrator suspects tampering.
+- After a hardware event (drive replacement, RAID controller issue).
+- First mount of a pool imported from untrusted storage.
+
+#### 7.13.2 On-read verification (default)
+
+Every read verifies the Merkle path from the leaf being read up to the tree root:
+
+- Read a leaf.
+- Verify leaf's hash matches what parent says.
+- Verify parent's hash matches grandparent's record.
+- ... up to the tree root.
+- Tree root verified against uberblock (cached at mount).
+
+Cost: O(log N) hash computations per read. At ~1 GB/s BLAKE3 throughput and 5-level tree, overhead is microseconds per read.
+
+Default behavior for all reads.
+
+#### 7.13.3 Background scrub
+
+Continuous low-priority walk verifying everything:
+
+- Walk metadata: verify every Merkle chain.
+- Walk extents: verify every tag / hash.
+- Report discrepancies to error log; auto-repair if possible (§7.15).
+
+Default schedule: weekly, at low IO priority.
+
+### 7.14 Scrub
+
+#### 7.14.1 Scrub state machine
+
+- `IDLE`: no scrub running.
+- `RUNNING`: scrub in progress; progress tracked per device.
+- `PAUSED`: scrub stopped by user; state preserved for resume.
+- `COMPLETED`: last scrub finished; results summary available.
+
+Persisted across mounts: if a scrub was running when the pool shut down, it resumes on next mount (unless admin clears it).
+
+#### 7.14.2 Scrub scope
+
+Per scrub invocation, admin chooses:
+- `full`: all metadata + all extents.
+- `metadata-only`: metadata Merkle chains only (fast).
+- `dataset <path>`: restricted to one dataset's extents.
+- `snapshot <id>`: restricted to one snapshot.
+- `last-day`: only data written in the last 24 hours.
+
+Default: `full`.
+
+#### 7.14.3 Scrub priority
+
+- `low` (default): scrub IO is throttled to ~10% of device bandwidth. Never starves foreground.
+- `medium`: ~30% bandwidth. For on-demand scrubs when admin wants faster completion.
+- `high`: ~80% bandwidth. For emergencies.
+
+Priority settable via `/ctl/.../scrub/priority`.
+
+#### 7.14.4 Progress reporting
+
+`/ctl/.../scrub/progress` reports:
+- Total bytes to scrub.
+- Bytes scrubbed so far.
+- Current device / dataset position.
+- ETA.
+- Error count (corruption detections).
+- Repair count.
+
+### 7.15 Repair from redundancy
+
+When scrub (or on-read) detects corruption:
+
+#### 7.15.1 Repair triggers
+
+Any of:
+- Metadata Merkle-chain verification failure.
+- Data extent AEAD tag failure or xxHash mismatch.
+- Device-reported read error.
+
+#### 7.15.2 Repair paths
+
+Depends on redundancy profile:
+
+- **Mirror(n)**: read from a surviving mirror copy. Verify that copy's integrity. If good, copy to the corrupted device.
+- **RS(k, p)**: read k surviving blocks. Reconstruct via Reed-Solomon decode. Write reconstruction to the corrupted device.
+- **LRC(k, l, g)**: try local parity group first (faster); fall back to global parity for multi-failure.
+- **No redundancy (single-device pool)**: cannot repair. Log corrupt block; return EIO on reads of that block.
+
+#### 7.15.3 Repair verification
+
+After writing the reconstructed block, verify the write with a round-trip read-and-verify. Don't trust a writeback without confirmation.
+
+#### 7.15.4 Repair logging
+
+Every repair is logged to `/ctl/.../repair-log`:
+
+- Timestamp.
+- paddr repaired.
+- Type of corruption (metadata / data).
+- Redundancy source used.
+- Verification result.
+
+Admins review the repair log periodically; sustained repair activity on one device suggests imminent hardware failure (warrants replacement).
+
+### 7.16 Unrecoverable corruption
+
+When detection finds corruption and no redundancy is available:
+
+#### 7.16.1 Metadata corruption
+
+Serious. Can mean parts of the tree are unreachable.
+
+- Log the corrupted node's paddr.
+- Mark the node in an "unrecoverable metadata" list in the pool's error log.
+- Reads that would traverse this node fail with `-EIO`.
+- The affected subtree is effectively orphaned; admin may need to rebuild from backups or accept loss of affected files.
+- Scrub continues; doesn't halt.
+
+#### 7.16.2 Data corruption
+
+- Log the extent's paddr + owning `(dataset, inode, offset)`.
+- Reads of the corrupted range return `-EIO`.
+- The file containing the range is partially accessible (other parts fine).
+- Admins can:
+  - Delete the file (releases the bad block; allocator recovers).
+  - Restore from backup (overwrites with good data).
+  - Ignore (keep file, accept EIO on affected range).
+
+#### 7.16.3 Self-healing is opt-in
+
+We do NOT auto-fill corrupted blocks with zeros or placeholder data. Surprising the application with silently-wrong data is worse than EIO.
+
+Admin can opt into self-filling via `/ctl/.../error-policy/unrecoverable-action`. Default: `error` (EIO). Alternatives: `zero` (fill with zeros, log loud warning), `delete-file` (unlink file automatically).
+
+### 7.17 Per-extent integrity
+
+Already noted in §7.11.2; restating for completeness:
+
+- **Encrypted extents**: AEAD tag (16 bytes) embedded in extent's on-disk bytes. Integrity via AEAD verification at read. The tag is integrity + authenticity (not just a csum).
+- **Unencrypted extents**: xxHash3-64 of on-disk bytes, stored in the extent record's `se_xxh` field. Integrity via hash comparison at read.
+
+Both are per-extent, independent of the Merkle tree. The Merkle tree covers the metadata (extent record's paddr, len, xxh fields); the AEAD tag / xxHash covers the extent's content.
+
+### 7.18 Interactions with other subsystems
+
+- **§3 Concurrency**: Merkle hashes are computed at Phase 2 of commit, per dirty node. Nonce assignment is done by the commit coordinator (End A) — trivially unique under serialization.
+- **§4 Storage pool**: paddr's device_id is part of the nonce, so cross-device replay isn't possible.
+- **§5 SB / quorum**: uberblock stores Merkle root, wrapped dataset keys, per-dataset key schema state. Quorum ensures all devices agree on the Merkle root.
+- **§6 Allocator**: allocator-tree nodes are metadata → Merkle-covered. Bootstrap-pool bitmap is metadata → Merkle-covered. CAS index entries are metadata → Merkle-covered.
+- **§8 Namespace**: dataset creation generates a dataset key; dataset destroy retires and eventually removes the key.
+- **§9 Block device**: block writes and reads are transport-layer; AEAD and Merkle ops live above.
+- **§14 Observability**: scrub progress, repair logs, error logs all exposed via `/ctl/`.
+
+### 7.19 Open questions
+
+- **Root salt randomness source**: at pool creation, we pull 32 bytes from `/dev/urandom` (or libsodium `randombytes_buf`). OS-level entropy is assumed sufficient. If this becomes a concern (e.g., containerized environments without good entropy), we could require the key agent to provide the salt.
+- **Retired key retention policy**: how long do we keep retired keys around? Until no extent references them (scrub can prove this), then prune. Default: never prune automatically; admin-triggered.
+- **Merkle tree fan-out**: we implicitly use the Bε-tree's structure (fan-out ~100 for internal nodes). Alternative: a separate, flatter Merkle tree specifically for integrity. Probably not worth the overhead; using the Bε-tree structure is sufficient.
+- **SIV mode final choice**: AEGIS-256 vs XChaCha20-SIV depends on benchmarks on target hardware. Current plan: auto-detect + per-dataset override. If benchmarks reveal AEGIS is universally faster, we might default to it everywhere.
+- **Key agent protocol**: 9P vs bespoke. Committed to 9P for consistency. Bespoke would be marginally simpler but introduces another wire format.
+- **Scrub parallelism**: single-threaded scrub is simple; parallel scrub (many devices in parallel) is faster. Default: parallel, one thread per device.
+- **Merkle salt per-commit vs per-pool**: a per-commit salt would thwart precomputation attacks more thoroughly, at the cost of changing the Merkle tree entirely on every commit (bad for incremental updates). Current decision: per-pool salt, acceptable tradeoff.
+
+### 7.20 Summary
+
+The cryptography and integrity layer is where Stratum claims its strongest lead positions. Key commitments:
+
+1. **Three-level key hierarchy**: wrap key (agent) → dataset key (wrapped in uberblock) → per-object derivation (from AD).
+2. **PQ-hybrid wrap**: X25519 + ML-KEM-768 via HPKE (RFC 9180). Secure against both classical and quantum adversaries.
+3. **Nonce-misuse-resistant AEAD**: AEGIS-256 default with hardware acceleration, XChaCha20-SIV fallback. Bugs in nonce allocation can't cause CPA-breaks.
+4. **Associated data everywhere**: extent / node / CAS entries all AD-bound. Cross-context attacks (extent smuggled to another dataset, node swapped between trees) fail AEAD cryptographically.
+5. **Merkle root of all metadata**: BLAKE3-256 chained from leaves to uberblock. Tamper-evident at the pool level.
+6. **Three verification modes**: mount-time full verify (opt-in), on-read path verify (default), background scrub (continuous).
+7. **Repair from redundancy**: mirrors, RS, LRC. Unrecoverable corruption returns EIO, not silent bad data.
+8. **Key agent via 9P**: backends for passphrase, TPM, YubiKey, PKCS#11. Audit-logged.
+
+Status: DRAFT → awaiting review, push-back, then COMMITTED.
 
 ---
 
@@ -2017,8 +2599,8 @@ Each of §3–§5 and §7 is probably its own Phase 0 session. §6, §8, §9–�
 | §3 Concurrency | DRAFT | 1 |
 | §4 Storage pool | DRAFT | 2 |
 | §5 Superblock / quorum | DRAFT | 3 |
-| §6 Allocator | **DRAFT** (this session) | 4 |
-| §7 Cryptography + integrity | STUB | 5 |
+| §6 Allocator | DRAFT | 4 |
+| §7 Cryptography + integrity | **DRAFT** (this session) | 5 |
 | §8 Namespace | STUB | 6 |
 | §9 Block device | STUB | 7 |
 | §10 Client interfaces | STUB | 8 |
