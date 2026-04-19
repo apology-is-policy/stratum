@@ -17,11 +17,14 @@
 /* Tree identity, bound into btree node AD. A tree_id=0 means "unscoped"
  * (e.g. unit tests that skip the fs mount layer). Production trees get
  * distinct ids so a node from the snap tree can't be smuggled into the
- * main tree via bptr rewrite even if both share the same DEK. */
+ * main tree via bptr rewrite even if both share the same DEK.
+ *
+ * Note: saved-snapshot subtrees are walked via the live main tree (they
+ * were written under MAIN when they WERE the main tree), so no separate
+ * ID is needed for them — MAIN is the correct AD on both write and read. */
 #define STM_TREE_ID_NONE      0
 #define STM_TREE_ID_MAIN      1
 #define STM_TREE_ID_SNAP      2
-#define STM_TREE_ID_SAVED     3  /* per-snapshot saved subtree (rollback read) */
 
 /* AD for a file-data extent. Bound at encrypt time so a re-aimed extent
  * record (same ciphertext, different btree key) fails AEAD on read. */

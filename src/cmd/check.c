@@ -760,13 +760,17 @@ int stm_cmd_check(int argc, char **argv)
         return 1;
     }
 
-    /* Shared context for every walk. refmap sized over the whole device. */
+    /* Shared context for every walk. refmap sized over the whole device.
+     * tree_id is set explicitly to NONE and overwritten per-phase below;
+     * a missing per-phase assignment would fail AEAD loudly at the first
+     * node read rather than silently cross-verifying. */
     struct walk_ctx ctx = {
         .dev         = &fs->dev,
         .crypto      = stm_btree_get_crypto(fs->tree),
         .dev_blocks  = dev_blocks,
         .refmap      = calloc(dev_blocks, sizeof(uint32_t)),
         .verbose     = verbose,
+        .tree_id     = STM_TREE_ID_NONE,
     };
 
     /* ── Phase 3: walk main tree ───────────────────────────────────── */
