@@ -838,37 +838,425 @@ Status: DRAFT → awaiting review, push-back, then COMMITTED.
 
 ## 5. Superblock and quorum
 
-**STATUS**: STUB
+**STATUS**: DRAFT
 
-### 5.1 Goals
+### 5.1 Goals and non-goals
 
-- Per-device uberblock chain (rotating ring, like ZFS).
-- Quorum across devices — majority of original roster must agree.
-- Crash-safe update via atomic uberblock pointer advance.
-- Merkle root of metadata in uberblock.
+**Goals**:
 
-### 5.2 Decisions committed (VISION §5, NOVEL #1, NOVEL #5)
+- Every device carries its own uberblock history — the pool can be reconstructed from any sufficient subset.
+- Crash-safe commit: a power loss at any point leaves the pool in a recoverable state, possibly losing only the in-progress transaction.
+- Merkle root of all metadata in the uberblock, verified on mount and tracked across commits.
+- Multi-device commit with quorum semantics: a majority of the roster must confirm for a commit to be durable.
+- Graceful degradation: quorum-insufficient states produce read-only emergency mounts, not crashes.
+- Feature flags (ext4 pattern) for format evolution without breaking old readers.
 
-- Merkle root in the superblock.
-- Three-phase sync protocol (refined for multi-device from v1).
-- SB format versioned, feature-flag-aware.
+**Non-goals**:
 
-### 5.3 Subsections to write
+- Distributed consensus (Raft, Paxos). Single-host filesystem; "consensus" here is just "which device's uberblock is authoritative" and is resolved deterministically by gen ordering, not a distributed algorithm.
+- Byzantine fault tolerance. Devices may fail (silently, even), but they don't actively lie. Our threat model for the device layer is silent bit rot + torn writes + device disappearance, not malicious devices.
+- Uberblock updates finer than transaction-group granularity. Every commit is a txg; every txg produces one new uberblock per device.
 
-- **5.3.1** Uberblock format — rotating ring on each device, size, count.
-- **5.3.2** Quorum semantics — majority-of-roster counting; behavior under partial failure.
-- **5.3.3** Commit protocol — multi-device commit ordering, barrier sequencing.
-- **5.3.4** Torn-write handling — per-uberblock csum; recovery.
-- **5.3.5** Metadata root pointers — SB fields for main tree, allocator tree, snap tree, CAS tier index.
-- **5.3.6** Feature flags — RO-compat vs incompat flag categories (ext4 pattern).
-- **5.3.7** Version migration — forward-only reads, format-upgrade command.
-- **5.3.8** Emergency recovery — degraded-mode mount when quorum is impossible.
+### 5.2 Decisions already committed
 
-### 5.4 Open questions
+From earlier Phase 0 docs and sections:
 
-- Merkle root in every uberblock vs only at sync boundaries.
-- Quorum counting: Raft-style "majority of original roster" vs "majority of currently-live members."
-- Device identity: persistent UUID.
+- **Merkle root in the uberblock** (VISION §5, NOVEL #5).
+- **Commit is the only point of serialization** across writers (§3, End A).
+- **Multi-device commit extends the v1 three-phase sync** to four phases (§3.7.3).
+- **Per-device uberblocks** (§4 references this section as the specifier).
+- **paddr is (16-bit device, 48-bit offset)** (§4.4).
+
+Decisions taken in this section:
+
+- **Ring of 64 uberblock slots per label**, per device; 4 labels per device for redundancy against localized damage. Total: 256 uberblock slots per device.
+- **Quorum = majority of the roster at commit time**. Device add / remove advances the roster hash; quorum is computed against the active roster.
+- **Label placement**: byte 0, 256 KiB, 256 KiB-before-end, end. 4 × 256 KiB = 1 MiB reserved per device for labels.
+- **BLAKE3-256 everywhere**: uberblock csum, Merkle root.
+- **Feature flags in three categories** (ext4 pattern): `compat`, `ro-compat`, `incompat`. Bit-allocated within a fixed-size feature-flag field.
+
+### 5.3 Per-device labels and uberblock ring
+
+Every device in the pool carries **four labels** at fixed offsets. Each label contains the device's identity, a copy of the pool configuration, and a ring of uberblocks.
+
+#### 5.3.1 Label placement
+
+```
+Device layout (conceptual):
+
+  ┌─────────────┐ byte 0
+  │   Label 0   │  256 KiB
+  ├─────────────┤ byte 262144
+  │   Label 1   │  256 KiB
+  ├─────────────┤ byte 524288
+  │             │
+  │             │  ... pool data ...
+  │             │
+  ├─────────────┤ end - 524288
+  │   Label 2   │  256 KiB
+  ├─────────────┤ end - 262144
+  │   Label 3   │  256 KiB
+  └─────────────┘ end
+```
+
+Why four labels? Localized damage (controller scribble, cable-induced torn writes, partial firmware update) tends to affect contiguous ranges. Four labels separated by large spans make total loss vanishingly unlikely on any single-device failure mode.
+
+Mount reads **all four labels** on every device; picks the best. "Best" = highest valid gen with quorum across the roster.
+
+#### 5.3.2 Label contents
+
+Each 256 KiB label contains:
+
+```
+┌──────────────────────────────────────┐
+│  Device info block (4 KiB)           │  device UUID, pool UUID,
+│                                      │  roster snapshot at label creation,
+│                                      │  label index (0..3), label csum
+├──────────────────────────────────────┤
+│  Uberblock ring: 63 slots × 4 KiB    │  rotating ring of commits
+│                                      │  (slot 63 reserved for pool metadata
+│                                      │   mirror: a full copy of the
+│                                      │   current pool config + feature flags
+│                                      │   for emergency recovery)
+└──────────────────────────────────────┘
+```
+
+- **63 uberblock slots** of 4 KiB each: ~256 KiB of ring, holding the last 63 commits' worth of state.
+- **Slot 63 (or whichever we pick)**: pool-config mirror. Used when uberblock ring data is damaged but the pool config needs to be recovered.
+
+#### 5.3.3 Ring rotation
+
+Commits advance through the ring round-robin:
+
+- Commit N writes to slot `N % 63`.
+- Mount computes "current commit" = highest `gen` that both validates (csum) and has quorum across devices.
+- Recent history (last 63 commits) is preserved for forensics and emergency rollback.
+
+The ring size (63) is chosen so that a pool-wide panic has a generous window of recoverable history. ZFS uses 128; our 63 is a compromise between recovery window and per-device space.
+
+### 5.4 Uberblock format
+
+An uberblock is a 4 KiB block containing the pool's state as of one commit.
+
+```c
+struct stm_uberblock {
+    // Identity
+    le64    ub_magic;              //  8 B — STM_UB_MAGIC
+    le32    ub_version;            //  4 B — pool-format version
+    le32    ub_flags_compat;       //  4 B — compat feature flags
+    le32    ub_flags_ro_compat;    //  4 B — RO-compat flags
+    le32    ub_flags_incompat;     //  4 B — incompat flags
+    le64    ub_pool_uuid[2];       // 16 B — pool UUID
+    le64    ub_device_uuid[2];     // 16 B — this device's UUID
+
+    // Transaction state
+    le64    ub_gen;                //  8 B — generation (monotonic per commit)
+    le64    ub_txg;                //  8 B — transaction group counter
+    le64    ub_roster_hash;        //  8 B — hash of active roster
+    le16    ub_device_count;       //  2 B — devices in roster at this commit
+    le16    ub_device_id;          //  2 B — this device's slot in roster (0..count-1)
+
+    // Metadata roots (see §6, §7, §8)
+    struct stm_bptr ub_main_root;       // 57 B — main fs tree
+    struct stm_bptr ub_alloc_root;      // 57 B — allocator tree
+    struct stm_bptr ub_snap_root;       // 57 B — snapshot tree
+    struct stm_bptr ub_cas_index_root;  // 57 B — CAS tier index
+
+    // Integrity
+    uint8_t ub_merkle_root[32];    // 32 B — BLAKE3-256 of all metadata
+
+    // Pool-wide counters
+    le64    ub_next_ino;
+    le64    ub_next_dataset_id;
+    le64    ub_next_snap_id;
+    le64    ub_total_blocks;       // summed across roster
+    le64    ub_free_blocks;        // summed across roster
+
+    // Default redundancy profile (§4.5)
+    uint8_t ub_redundancy_kind;    // mirror / rs / lrc
+    uint8_t ub_redundancy_params[15];
+
+    // Key schema state (§7)
+    uint8_t ub_key_schema[512];    // wrapped keys + IV + KDF salt + version
+
+    // Device class (so every uberblock mirror carries placement info)
+    uint8_t ub_device_class;       // SSD / HDD / PMEM / ZNS
+    uint8_t ub_device_role;        // DATA / LOG / CACHE / SPARE
+
+    // Compact roster (for emergency recovery without reading peer devices)
+    uint8_t ub_roster[2048];       // up to 64 devices × 32 B each: UUID + class + role + status
+
+    // Reserved
+    uint8_t ub_reserved[1024];
+
+    // Checksum (BLAKE3-256 over the rest of the uberblock with this field zeroed)
+    uint8_t ub_csum[32];           // 32 B
+};
+
+STM_STATIC_ASSERT(sizeof(struct stm_uberblock) == 4096, stm_uberblock_is_4k);
+```
+
+Key design choices:
+
+- **Every uberblock is self-describing**: contains the roster, feature flags, key schema. A single-device recovery scenario (all peers lost) can bootstrap from any valid uberblock on the surviving device.
+- **Merkle root is always present**: every commit produces a new Merkle root of all metadata; this is the anchor for integrity verification (§7).
+- **Compact roster embedded**: up to 64 devices' worth of identity, enough for every realistic pool.
+- **BLAKE3 csum** over the whole block (with csum field zeroed) — self-verifying.
+
+### 5.5 Quorum semantics
+
+A commit requires **quorum**: a majority of the roster must confirm the commit's Phase 1 (reservation) and Phase 3 (final) uberblock writes.
+
+#### 5.5.1 Quorum arithmetic
+
+For a roster of `N` devices:
+- Quorum threshold = `⌊N/2⌋ + 1`.
+- `N=1` → 1 (trivially).
+- `N=2` → 2 (no quorum without both — mirror-class pools).
+- `N=3` → 2.
+- `N=5` → 3.
+- `N=8` → 5.
+
+Two-device pools are a special case: quorum requires both, which means no tolerance for device failure. This is a property of 2-device pools in general; btrfs and ZFS both handle it this way. Users who want failure tolerance use `N >= 3`.
+
+#### 5.5.2 Quorum at commit time
+
+During a commit (§3.7.3 Phase 1 and Phase 3), the coordinator:
+
+1. Issues write + fsync to every online device in parallel.
+2. Counts confirmed fsyncs.
+3. If confirmed ≥ quorum_threshold → commit succeeds.
+4. If confirmed < quorum_threshold within a timeout → commit fails; pool rolls back to previous state.
+
+Devices that didn't confirm in time are marked `BEHIND`. On return, they reconcile (§5.8).
+
+#### 5.5.3 Quorum at mount
+
+On mount, Stratum reads every device's labels and collects valid uberblocks (csum passes, magic correct). For each gen observed, it counts how many devices have a valid uberblock at that gen.
+
+- The highest gen with quorum is the "authoritative gen."
+- Any device at a lower gen is `BEHIND`.
+- Any device at a higher gen than the authoritative gen had a partial commit — its state is discarded and it reconciles to the authoritative gen.
+
+#### 5.5.4 Quorum under roster changes
+
+Device add / remove changes the roster. The roster_hash in uberblocks advances on every roster change.
+
+- Quorum is computed against the roster at the commit's time, not the current roster.
+- On device add, the new device is at gen 0 (effectively); it reconciles up to current gen on join.
+- On device remove, the removed device is no longer in the roster; quorum computation excludes it.
+
+#### 5.5.5 The split-brain non-problem
+
+Conventional distributed systems worry about split-brain: two partitions each think they're the majority. This can't happen in Stratum because:
+
+- There's only one kernel / process mounting the pool at a time. Stratum doesn't support cluster mounting.
+- If devices become unreachable mid-commit, the one coordinator (us) observes the outage and either proceeds (if quorum still available) or aborts.
+- Devices don't have agency — they don't initiate anything. They're passive storage.
+
+So "quorum" for Stratum is about correctness under partial failure, not coordination across independent actors.
+
+### 5.6 Multi-device commit protocol
+
+The four-phase commit from §3.7.3, expanded for multi-device.
+
+#### 5.6.1 Phase 0: freeze
+
+Coordinator elected (§3.7.2). Delta chain heads frozen. No multi-device interaction yet — this is in-memory state.
+
+#### 5.6.2 Phase 1: reservation uberblock
+
+For each device in the roster:
+1. Coordinator prepares the new uberblock with `gen = current_gen + 1`, pre-flush root pointers, pre-flush Merkle root.
+2. Writes to the **opposite** ring slot from current (ping-pong pattern — if current gen is at slot `K`, reservation goes to slot `K XOR 1` or similar safe offset).
+3. Issues fsync.
+
+Phase 1 waits for **quorum** confirmations. If quorum fails:
+- Commit aborts. Coordinator releases commit state; no tree updates are persisted. Session state reverts to the current gen.
+
+On quorum success: the pool now has a reservation at `gen+1` referencing the pre-flush tree. A crash between Phase 1 and Phase 3 recovers to this reservation (pre-flush state; current txg's updates lost).
+
+#### 5.6.3 Phase 2: flush
+
+Coordinator walks dirty delta chains (per §3). For each:
+1. Consolidates chain → fresh base node.
+2. Allocates stripe(s) via the allocator, respecting redundancy profile (§4).
+3. For redundant profiles, data is striped across multiple devices per §4.6.
+4. Computes Merkle hash of the new base; propagates up.
+5. Writes data + parity blocks to their respective devices.
+
+Phase 2's per-block writes don't each require quorum — the block becomes valid when the Phase 3 uberblock referencing it is durable. If Phase 3 fails, the Phase 2 writes are garbage (not referenced by any durable root).
+
+Phase 2 **parallelizes internally**: many dirty nodes processed concurrently by a worker pool.
+
+Final Merkle root computed at end of Phase 2.
+
+#### 5.6.4 Phase 3: final uberblock
+
+For each device in the roster:
+1. Coordinator prepares the final uberblock with `gen = current_gen + 2`, post-flush root pointers, post-flush Merkle root.
+2. Writes to the **next** ring slot (advance by one from the reservation slot).
+3. Issues fsync.
+
+Waits for **quorum** confirmations.
+
+On quorum success: commit is durable. The `fs->gen` advances to `current_gen + 1` (session state); disk is at `gen + 2`, preserving the `disk ss_gen > fs->gen` invariant (§3.7.3).
+
+On quorum failure: commit aborts. Partial Phase 3 writes may exist but aren't authoritative — mount selects the Phase 1 reservation (gen+1) as the most recent confirmed state. Session retries or gives up.
+
+#### 5.6.5 Phase 4: publish
+
+After Phase 3 quorum success, coordinator:
+1. CAS-swings `fs->root` to the new post-commit tree root.
+2. Retires old delta chain bases and nodes to the current epoch (§3.6).
+3. Releases `commit_state` → `IDLE`.
+
+Readers that were running during the commit finish their ops under the old tree; new readers see the new tree.
+
+#### 5.6.6 Crash states
+
+| Crash point | Recoverable state | Data lost |
+|---|---|---|
+| During Phase 1 | prior commit's state (gen) | Current txg's in-flight ops |
+| After Phase 1, during Phase 2 | Phase 1 reservation (gen+1), pre-flush tree | Current txg |
+| After Phase 2, during Phase 3 | Phase 1 reservation (gen+1), pre-flush tree. Phase 2 writes are orphan blocks in pool, not referenced. | Current txg |
+| After Phase 3 confirmed by quorum | Phase 3 state (gen+2), post-flush tree | Nothing (commit succeeded) |
+| After Phase 3 partial (< quorum) | Phase 1 reservation (gen+1) — quorum rule picks it. Partial-Phase-3 devices have gen+2 uberblocks but no quorum; they're discarded as "ahead of consensus." | Current txg |
+
+Every crash state is recoverable. Either the previous commit's state or the current commit's pre-flush state — the worst loss is the current transaction group.
+
+### 5.7 Torn-write handling
+
+Uberblocks are 4 KiB. Modern NVMe guarantees 4 KiB atomic writes; older hardware may not.
+
+- Every uberblock is csummed (BLAKE3-256 over the block with `ub_csum` zeroed).
+- On mount, csum mismatch → uberblock is discarded.
+- The ring has 63 slots; we won't run out of valid uberblocks unless something catastrophic happened.
+
+For pre-NVMe hardware without 4 KiB atomicity:
+- Coordinator could write the uberblock with a tagged structure (head/tail copies of the gen) and the csum; a torn write shows up as head/tail mismatch *and* csum mismatch.
+- Default policy: declare 4 KiB atomicity as a requirement. If running on pre-atomic hardware, admin opts into a compatibility mode with extra overhead.
+
+Modern storage (NVMe, modern SAS/SATA SSD) all guarantee 4 KiB atomicity. This is not a practical concern for 2026+ deployments.
+
+### 5.8 Device rejoin and reconciliation
+
+When a `BEHIND` device returns:
+
+1. Pool reads the returning device's current uberblock. Its gen is `behind_gen`.
+2. Pool identifies missed commits: all commits with gen > `behind_gen` up to current.
+3. Reconciliation replays those commits for this device:
+    - For each missed commit, re-apply the allocator deltas for this device.
+    - For mirror redundancy: re-copy any blocks that should exist on this device.
+    - For RS/LRC: reconstruct this device's contribution from other devices' data + parity.
+4. Once the device is caught up, its state transitions from `BEHIND` to `ONLINE`.
+
+Reconciliation is incremental (can be paused / resumed), IO-throttled (doesn't starve foreground), and progress-reported at `/ctl/.../pool/reconcile-progress`.
+
+If a device returns with a gen that's *neither* behind-of-quorum *nor* in-quorum — i.e., a partial-commit device that wrote a gen no other device confirmed — its state is discarded. It's treated as if it were at its last known confirmed gen, and reconciled forward from there.
+
+### 5.9 Feature flags
+
+ext4 pattern, three categories:
+
+#### 5.9.1 Compat flags
+
+The feature is present but old code can ignore it and still read the pool. Used for additive, non-structural changes.
+
+Examples:
+- `COMPAT_SCRUB_PROGRESS_LOG` — an extended progress log for scrub. Old code skips the log; reads the pool normally.
+- `COMPAT_EVENT_LOG_EXT` — richer event logging.
+
+#### 5.9.2 RO-compat flags
+
+Old code can read but not write. Typically used for features that would corrupt the pool if written by old code.
+
+Examples:
+- `ROCOMPAT_LRC_REDUNDANCY` — pool uses LRC. Old code (without LRC support) can read because the data is recoverable from k data blocks, but writing new data without LRC awareness would break the code's assumptions.
+- `ROCOMPAT_ML_KEM_WRAP_KEY` — pool uses PQ-hybrid wrap keys. Old code can decrypt (if it supports the data key algorithms) but shouldn't rotate keys.
+
+#### 5.9.3 Incompat flags
+
+Old code can't mount the pool at all.
+
+Examples:
+- `INCOMPAT_EXT_PADDR` — paddr is 12 bytes instead of 8. Every record format changed.
+- `INCOMPAT_CAS_TIER` — cold tier is active; old code doesn't understand the content-addressed store.
+- `INCOMPAT_MERKLE_V2` — Merkle tree structure changed (e.g., wider fan-out).
+
+#### 5.9.4 Flag allocation
+
+Each category has a 32-bit field in the uberblock (`ub_flags_compat`, `ub_flags_ro_compat`, `ub_flags_incompat`). Bits are allocated as features land; we reserve a registry in `docs/FEATURE-FLAGS.md` that records every assigned bit.
+
+Once allocated, a bit is never reused (even if the feature is deprecated). Deprecation path: mark the feature obsolete in the registry; old pools with that bit set still mount; new pools never set it.
+
+### 5.10 Version migration
+
+Pools migrate forward only. There's no downgrade path.
+
+#### 5.10.1 Forward migration
+
+`stratum pool upgrade <pool>`:
+- Admin confirms.
+- Stratum enables new RO-compat or incompat flags that correspond to features the current binary implements.
+- Pool version field bumps to the current binary's version.
+- Commits one txg with the new flags set.
+
+Upgrade is one-way: once a RO-compat or incompat bit is set, older binaries refuse to write / mount.
+
+#### 5.10.2 Transparent upgrades
+
+Some features auto-upgrade on first write without explicit admin action. Example: `COMPAT_SCRUB_PROGRESS_LOG` — if the current binary supports it and no version issue, the flag is set on the next sync.
+
+Explicit admin action is required only for RO-compat and incompat bits, because they break backward readability / mountability.
+
+### 5.11 Emergency recovery
+
+When quorum is impossible (too many devices offline or faulted):
+
+```
+stratum pool import <pool> --emergency [--force-readonly]
+```
+
+- Mounts the pool using the best-available uberblock, even without quorum.
+- Refuses to write by default; admin can force read-only to recover data.
+- Logs loud warnings at mount time and during every operation.
+- Reports which devices are missing and what data they held.
+
+Use case: "3 of my 5 devices died in a raid card fire; I want to recover what I can from the 2 survivors." Emergency mode lets the admin read out whatever data is still complete on the survivors, dump it to a new pool, and move on.
+
+**Emergency mode is destructive if used carelessly**: writes in emergency mode break quorum assumptions. Stratum defaults to read-only; writing requires `--force-readwrite` with stern warnings.
+
+### 5.12 Interactions with other subsystems
+
+- **§3 Concurrency**: the commit protocol (§3.7.3) is extended to multi-device here. Quorum semantics at Phase 1 and Phase 3. Four-phase structure preserved.
+- **§4 Storage pool**: the roster is persisted in uberblocks. Every device's uberblock carries a compact roster — sufficient to reconstruct pool membership from any single device.
+- **§6 Allocator**: allocator tree root is in the uberblock. Allocator's per-device bootstrap pool coordinates with this section's uberblock writes (they must not conflict with label offsets).
+- **§7 Crypto + integrity**: Merkle root in the uberblock. Key schema (wrapped keys, KDF state) in the uberblock. AEAD over data blocks uses paddr + txg + seq, all derivable from the uberblock's gen/txg fields.
+- **§13 Format versioning**: feature flag registry lives in `docs/FEATURE-FLAGS.md`; this section defines the three-category scheme.
+
+### 5.13 Open questions
+
+- **Ring size**: 63 slots vs more/fewer. 63 gives ~63 txg of forensic history. Could be smaller (e.g., 15) if per-device label space is precious.
+- **Atomic 4 KiB guarantee**: do we require it, or support a compat mode? Require it at v2.0; compat mode is a future consideration if demanded.
+- **Slot selection**: strict round-robin vs skip-known-bad-slots. Probably round-robin; slots don't wear out on modern storage.
+- **Key schema size**: 512 bytes for wrapped keys + metadata. Enough for ML-KEM-768 + XChaCha20-SIV + room for rotation state. Could tighten or loosen as §7 design settles.
+- **Emergency mount behavior**: read-only by default, `--force-readwrite` with warnings, or write-disabled flat? Current lean: read-only default, `--force-readwrite` with stern warnings and a log entry.
+- **Compact roster in uberblock**: 2 KiB for up to 64 devices. What about 65+? Edge case; accept the limit, or use a separate "roster object" referenced from the uberblock? Probably accept the 64-device-per-roster-in-uberblock limit; at 65+ devices, emergency recovery needs peer-device help anyway.
+
+### 5.14 Summary
+
+The superblock / quorum layer is how Stratum persists pool state durably across power loss and device failure. Key commitments:
+
+1. **Per-device labels** (4 per device) each contain a **63-slot uberblock ring**.
+2. **Uberblocks are self-describing** — include roster, feature flags, key schema, so any single device can bootstrap the pool.
+3. **Quorum at commit time**: majority of roster must confirm Phase 1 and Phase 3. Two-device pools have no failure tolerance (mirror-style pools must go N≥3 for resilience).
+4. **Four-phase multi-device commit**: freeze → reservation (with quorum) → flush (parallel) → final (with quorum) → publish. Every crash state is recoverable.
+5. **Merkle root in every uberblock**: the anchor for metadata integrity.
+6. **Feature flags in three categories** (compat, RO-compat, incompat) — ext4 pattern.
+7. **Emergency mount** for quorum-impossible scenarios; read-only by default.
+
+Status: DRAFT → awaiting review, push-back, then COMMITTED.
 
 ---
 
@@ -1278,8 +1666,8 @@ Each of §3–§5 and §7 is probably its own Phase 0 session. §6, §8, §9–�
 | §1 Purpose | DRAFT | n/a |
 | §2 Layer cake | STUB | 11 (thin pass once rest is settled) |
 | §3 Concurrency | DRAFT | 1 |
-| §4 Storage pool | **DRAFT** (this session) | 2 |
-| §5 Superblock / quorum | STUB | 3 |
+| §4 Storage pool | DRAFT | 2 |
+| §5 Superblock / quorum | **DRAFT** (this session) | 3 |
 | §6 Allocator | STUB | 4 |
 | §7 Cryptography + integrity | STUB | 5 |
 | §8 Namespace | STUB | 6 |
