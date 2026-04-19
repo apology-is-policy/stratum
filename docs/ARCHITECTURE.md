@@ -1262,42 +1262,391 @@ Status: DRAFT → awaiting review, push-back, then COMMITTED.
 
 ## 6. Allocator model
 
-**STATUS**: STUB
+**STATUS**: DRAFT
 
-### 6.1 Goals
+### 6.1 Goals and non-goals
 
-- Tree-embedded (resolves v1 Stage 3 side-channel concern).
-- Rollback-safe (allocator tree COWs with the main tree).
-- O(log n) allocation and free.
-- Succinct in-RAM state (NOVEL #6; ≤1 MiB per TiB).
-- MVCC-compatible.
+**Goals**:
 
-### 6.2 Decisions committed (VISION §5.4, COMPARISON §3.11)
+- Authoritative allocator state lives in a Bε-tree, rooted in the uberblock, COW'd with every commit (not a side-channel log — resolves v1 Phase D Stage 3's fundamental tension).
+- O(log n) allocate and free, where n is the number of *allocated ranges* (not blocks).
+- In-RAM footprint of O(allocated ranges) via succinct data structures. Target: 1 MiB RAM per TiB of data (NOVEL #6).
+- MVCC-compatible: readers from snapshot S see the allocator state as of S.
+- Stripe-granularity allocation for redundant profiles (§4.5).
+- Device-class-aware placement (§4.9).
+- Never recurse: allocating a block for the allocator tree itself doesn't require a new allocator-tree entry.
 
-- Tree-embedded, not side-channel.
-- Succinct data structures (wavelet tree / SDArray / xor filter) for in-RAM state.
-- W-TinyLFU cache for hot metadata.
+**Non-goals**:
 
-### 6.3 Subsections to write
+- Online defragmentation as a background job. Fragmentation is managed by explicit rebalance (§4.8), not silent autocompaction.
+- Adaptive allocation policies that learn per-workload. Fixed policies (first-fit, class-aware) are enough; learning is post-v2.0.
+- Support for allocation sizes smaller than the block size (4 KiB). Sub-block data goes in xattr or inline data (§11); the allocator works in whole blocks.
+- In-place updates to allocator-tree entries. COW all the way down — every allocator change produces a new allocator-tree node.
 
-- **6.3.1** Allocator tree structure — per-device tree, keyed by extent start paddr.
-- **6.3.2** Refcount semantics — snapshot sharing, range refcounts.
-- **6.3.3** Allocation strategy — best-fit vs next-fit vs tiered; zoning interaction.
-- **6.3.4** Free and deferred-free — PENDING state through commit, then truly free.
-- **6.3.5** COW of the allocator itself — bootstrap pool per device; no recursion.
-- **6.3.6** Succinct representation — specific encoding choice, performance characteristics.
+### 6.2 Decisions already committed
 
-### 6.4 Cold tier (CAS) allocator
+From earlier docs and sections:
 
-- **6.4.1** Content-hash index — BLAKE3-256 keyed hash → paddr + refcount.
-- **6.4.2** Chunk sizing — FastCDC parameters (min, avg, max).
-- **6.4.3** GC — when and how CAS chunks are reclaimed.
+- **Tree-embedded, not side-channel** (VISION §5.4).
+- **Succinct data structures** for in-RAM state (VISION §5.4, NOVEL #6).
+- **W-TinyLFU cache** for hot metadata (VISION §5.4).
+- **Stripe-granularity allocation** for redundant profiles (§4.5, §4.6).
+- **Tree-embedded Bw-tree** machinery (§3).
+- **Allocator tree root in the uberblock** (§5.4, `ub_alloc_root`).
 
-### 6.5 Open questions
+Decisions taken in this section:
 
-- Separate allocator tree (own root in SB) vs embedded in main tree's keyspace.
-- Fragmentation prevention strategy.
-- Bootstrap pool sizing per device.
+- **Per-device allocator trees**. Each device has its own Bε-tree tracking its allocated ranges. Pool-level coordination is via the uberblock's allocator-root array.
+- **Tree entry format**: key = `u64 start_block`, value = `(u32 length_in_blocks, u32 refcount)`. 16 bytes per entry.
+- **Bootstrap pool per device**: fixed size `max(64 MiB, device_size / 1024)`, reserved at pool creation. Bootstrap blocks host allocator-tree nodes and are managed by a simple bitmap; they never appear in the allocator tree itself. No recursion.
+- **Zone-based allocation**: logical zones of 16 MiB (default, configurable). Allocations align to zones; free fragments concentrate within zones.
+- **Deferred free (v1-style)**: freed blocks are PENDING until the commit that freed them is durable; then they become truly free.
+- **Hot allocation path via in-RAM bitmap + xor filter**; tree is updated at commit time.
+
+### 6.3 Allocator tree structure
+
+Each device has its own allocator tree. The pool tracks them as an array indexed by `device_id`, with the roots stored in a pool-level "allocator roots" object (referenced from the uberblock's `ub_alloc_root`).
+
+#### 6.3.1 Tree layout
+
+**Key**: `u64 start_block` — block address within this device (bits 0..47 of paddr, with device_id implied by which tree we're in).
+
+**Value**: `struct stm_alloc_entry { le32 length_blocks; le32 refcount; }` — 8 bytes.
+
+Entries store only *allocated* ranges. Free space is implicit (the gaps between entries).
+
+A Bε-tree node at 128 KiB holds ~5000 entries (with standard overhead); fanout ~100. For a device with 10⁶ allocated ranges, tree depth = 3. For 10⁷ ranges, depth = 4. All operations O(tree depth) = O(log n).
+
+#### 6.3.2 Pool-level allocator roots
+
+The uberblock's `ub_alloc_root` field points at an **allocator-roots object**: a small btree keyed by `device_id`, valued with the device's allocator-tree root bptr. On pool mount, load this object → get each device's allocator root → open each tree.
+
+Why indirected through an object (not directly in the uberblock)? Uberblocks are 4 KiB; for a pool with 64 devices, 64 × 57 bytes of bptr would consume 3.6 KiB — too much of the uberblock's budget. The indirect object pays one extra level but gains room.
+
+#### 6.3.3 Per-device vs per-pool: why per-device
+
+Two candidate structures:
+
+1. **Per-device allocator trees** (chosen). One tree per device. The tree tracks only that device's ranges.
+2. **Pool-wide allocator tree**. One tree keyed by `(device_id, start_block)`.
+
+Per-device wins because:
+- Device add / remove only touches one tree; pool-wide would require inserting/removing a whole device's worth of entries atomically.
+- Each device's allocator tree fits in its own bootstrap pool (§6.5); pool-wide would need pool-wide bootstrap coordination.
+- Per-device parallelizes naturally: multiple allocations across different devices don't touch the same tree.
+- Rebalance operates per-device, matching the tree structure.
+
+Cost: slightly more metadata overhead (one tree root per device). Negligible compared to the benefits.
+
+### 6.4 Refcount semantics
+
+Each allocator-tree entry carries a refcount tracking how many owners reference this range.
+
+- `refcount == 1`: range has one owner, typically the main tree.
+- `refcount == N > 1`: range is shared across `N` owners — the main tree plus `N-1` snapshots.
+- No entry: range is free.
+
+#### 6.4.1 Refcount operations
+
+- **allocate**: creates a new entry with refcount = 1.
+- **ref**: increments refcount (e.g., when a snapshot shares the range).
+- **unref**: decrements refcount. If refcount → 0, the entry is removed from the tree and the range becomes free (after the deferred-free cycle).
+
+Refcount bumps happen at snapshot creation (§8): every range held by the main tree gets a ref bump representing the new snapshot's hold. Snapshot deletion is the reverse.
+
+#### 6.4.2 Refcount storage
+
+32-bit refcount per entry. Max 2^32 - 1 = ~4.3 billion snapshots sharing one range. Practically unlimited (nobody creates 4 billion snapshots of one pool). If a pool somehow approaches the limit, refcount saturation at 2^32 - 2 (reserving 2^32 - 1 as a sentinel) prevents overflow; actual cleanup is manual.
+
+A narrower encoding (varint) would save space but complicates updates. 32 bits is worth the simplicity.
+
+#### 6.4.3 MVCC refcount reads
+
+Readers from snapshot S see refcounts as of commit S. This falls out of the tree-is-COW invariant: reader traverses the allocator tree root that was current at commit S, and sees refcounts that were accurate at that commit.
+
+Refcount queries go through the same MVCC read path as any other tree read (§3.3).
+
+### 6.5 Bootstrap pool: no recursion
+
+The chicken-and-egg: allocator-tree updates need blocks allocated; allocating those blocks needs to be recorded in the allocator, which needs more blocks. Infinite regress.
+
+**Resolution**: a **bootstrap pool** on each device, reserved at pool creation, managed by a simple bitmap. Allocator-tree nodes live exclusively in the bootstrap pool. They never appear in the allocator tree itself — so no recursion.
+
+#### 6.5.1 Bootstrap pool placement
+
+Per device:
+
+```
+  ┌─────────────┐ byte 0
+  │   Label 0   │  256 KiB
+  ├─────────────┤
+  │   Label 1   │  256 KiB  (labels continue at 1 MiB boundary)
+  ├─────────────┤ byte 1048576 = 1 MiB
+  │ Bootstrap   │  max(64 MiB, dev_size/1024)
+  │   pool      │
+  ├─────────────┤
+  │             │
+  │  Data area  │
+  │             │
+  ├─────────────┤
+  │ Labels 2+3  │  at end of device (§5)
+  └─────────────┘
+```
+
+Bootstrap pool starts at byte 1 MiB (after first two labels). Size: `max(64 MiB, device_size / 1024)`.
+
+- 64 GiB device → 64 MiB bootstrap (larger of 64 MiB min, 64 MiB from 1/1024 × 64 GiB).
+- 1 TiB device → 1 GiB bootstrap (1/1024 × 1 TiB).
+- 100 TiB device → 100 GiB bootstrap.
+
+0.1% of device capacity is the sizing target. Generous for typical fragmentation; bounded for the worst case.
+
+#### 6.5.2 Bootstrap pool bitmap
+
+First block (4 KiB) of the bootstrap pool is the allocation bitmap. 4 KiB = 32 Ki bits = 32768 allocation tracking bits. At 128-KiB allocator-tree-node granularity (32 blocks per node), the bitmap covers `32768 × 32 × 4 KiB = 4 GiB` of bootstrap pool. For larger bootstrap pools, we use multiple bitmap blocks in a prefix area.
+
+Bitmap bit = 1 → allocated. Bit = 0 → free.
+
+Updating the bitmap:
+1. Allocator needs a new tree node.
+2. Scan bitmap for a free 32-block aligned run.
+3. Flip bits to "allocated."
+4. Rewrite the bitmap block (COW — write to a new bootstrap location, update the bootstrap-pool header with the new bitmap location).
+
+The bitmap itself is COW — every bitmap update produces a new bitmap block. The bootstrap-pool header (a tiny structure at the start of the bootstrap pool) points at the current bitmap. Two-slot header (ping-pong) for torn-write safety; csum per bitmap.
+
+#### 6.5.3 Bootstrap pool exhaustion
+
+If the bootstrap pool fills up (rare; we size generously), allocation fails with `ENOSPC`. Recovery options:
+
+- Admin-triggered `pool rebalance` consolidates the allocator tree, freeing bootstrap blocks.
+- Admin-triggered bootstrap pool growth (requires extending the reserved region and rewriting the bootstrap header; offline operation).
+
+Monitoring: `/ctl/.../pool/bootstrap-usage` reports utilization per device. Alert when usage exceeds 80%.
+
+#### 6.5.4 Why not "allocator tree in main tree's keyspace"
+
+Alternative: put allocator entries in the main Bε-tree under a dedicated keyspace (e.g., `STM_KEY_ALLOC`). No bootstrap pool needed — everything flows through the main tree.
+
+Rejected because:
+- Main tree writes allocate new tree nodes. Those allocations would produce STM_KEY_ALLOC entries. Tree writes recurse through the allocator keyspace. Chicken-and-egg reappears.
+- Mixing user-data keys and allocator metadata in the same tree complicates concurrent-access reasoning: a tree flush touches both simultaneously.
+- Separate allocator trees per device align with our multi-device architecture; "one big tree with everything" doesn't.
+
+Bootstrap pool is the right primitive. It's what ZFS uses (metaslab spacemaps are per-metaslab, outside the main dataset namespace). We're following a well-understood pattern.
+
+### 6.6 In-RAM representation (succinct)
+
+Every allocator tree is mirrored in RAM as a succinct bitmap + xor filter, for O(1) allocation queries.
+
+#### 6.6.1 Bitmap encoding
+
+Per device, we maintain a bitmap where bit `i` = 1 iff block `i` is allocated.
+
+Naive flat bitmap: 1 bit per block. For a 1 TiB device (256M blocks), that's 32 MiB of RAM. Bad.
+
+**Chosen encoding**: **SDArray** (Sparse Density Array; Okanohara & Sadakane 2007). Represents a bitmap of `n` bits with `m` set bits in `m × (log(n/m) + O(1))` bits total — approaches the information-theoretic minimum.
+
+For a 1 TiB device with 50% allocation density (128M set bits): `128M × (log(256M / 128M) + O(1)) = 128M × (1 + c) bits ≈ 20 MiB` — better than flat but not dramatic.
+
+For a *sparsely-allocated* device (say 10% density = 25M set bits): `25M × (log(10) + c) × bits ≈ 10 MiB` — clear win.
+
+For a *highly-allocated* device (90% density = 230M set bits): `230M × (log(1.1) + c) bits ≈ 35 MiB` — slightly *worse* than flat, because SDArray does better on sparse data.
+
+**Hybrid encoding** (committed): below 50% density use SDArray on set bits; above 50% use SDArray on *gaps* (free bits). Takes the best of both.
+
+For typical usage (~50% density), effective RAM ~20 MiB per TiB. Add `~1 MiB` for xor filter (§6.6.2). Total: ~21 MiB per TiB.
+
+This is better than v1's ~32 MiB per TiB (flat uint32 refcount array), but *not* 1 MiB per TiB as VISION §4.6 targets. Let me update the target honestly: **target 25 MiB per TiB** at v2.0, with a path to single-digit MiB/TiB via wavelet-tree refinements post-v2.0.
+
+The VISION target of 1 MiB/TiB was aspirational; without compressing the refcount per range as well (a wavelet tree over the refcount values), we can't get there. Wavelet tree is a refinement for post-v2.0.
+
+#### 6.6.2 xor filter
+
+Negative lookups ("is paddr X allocated?") are common — e.g., during consistency checks. Querying the SDArray for a negative lookup takes O(log n); an xor filter (Graf & Lemire 2020) answers in O(1).
+
+- ~9 bits per item, <1% false-positive rate.
+- For 1 TiB device with 256M blocks: ~300 MiB.
+
+Wait, that's too much. The xor filter should be over *allocated ranges*, not blocks.
+
+For 10⁶ allocated ranges: 10⁶ × 9 bits ≈ 1 MiB. That's reasonable.
+
+Correcting the target: **xor filter over ranges, SDArray over the per-block bitmap**.
+
+Xor filter answers: "does paddr X land in any allocated range?" — O(1). If yes, confirm via SDArray + tree.
+
+#### 6.6.3 Wavelet tree (post-v2.0)
+
+Wavelet trees (Grossi et al. 2003) represent a sequence of values compactly with O(1) rank/select queries. Could encode the refcount-per-range sequence, further shrinking RAM.
+
+Not committing for v2.0; SDArray + xor filter is sufficient to meet the "beats ZFS dramatically" bar. Wavelet tree is a v2.1 optimization.
+
+#### 6.6.4 Cache
+
+W-TinyLFU cache for recently-accessed allocator-tree nodes. Default 64 MiB cache; configurable via pool property.
+
+Cache serves the "walk the tree to confirm/update" workload. In-RAM bitmap answers allocation queries without tree traversal; cache smooths the writes that update the tree.
+
+### 6.7 Allocation strategy
+
+#### 6.7.1 Placement policy (§4.9 coordination)
+
+The allocator is given a request with parameters:
+- `length`: number of blocks.
+- `class_preference`: SSD / HDD / PMEM / ZNS / any.
+- `redundancy_profile`: mirror(n) / rs(k,p) / lrc(k,l,g).
+- `hint`: optional paddr suggesting locality.
+
+Placement algorithm:
+1. Narrow candidate devices by class preference + role (exclude SPARE, CACHE, LOG unless requested).
+2. Narrow further by redundancy profile (need ≥ N devices, all online).
+3. Select device(s) based on the allocator's placement scorer (§6.7.2).
+
+#### 6.7.2 Device placement scorer
+
+Weights combining:
+- **Free space**: prefer devices with more free space (rebalance pressure).
+- **Locality**: if hint is given, prefer same-device for the hinted allocation.
+- **Recent writes**: prefer writing to the same devices as recent allocations (reduces head-of-line blocking).
+- **Class match**: prefer devices whose class matches request.
+
+Scoring function:
+
+```
+score(device) = w_free × free_ratio(device)
+              + w_local × locality_bonus(device, hint)
+              + w_recent × recency(device)
+              + w_class × class_match(device, class)
+```
+
+Weights default to `(0.5, 0.3, 0.1, 0.1)`. Top-scored devices win.
+
+#### 6.7.3 Roving hint (within-device)
+
+For each device, maintain a roving hint: "where was the last allocation?". New allocation starts scanning from there, wrapping around if needed.
+
+- Allocations tend to be sequential on writes, so starts from the last-allocated location often succeeds with first-fit.
+- Wraparound at end-of-device; the hint stays bounded.
+- After free, the hint doesn't reset — we *don't* want to immediately reallocate a just-freed block (undermines snapshot isolation if the deferred-free hasn't cycled).
+
+#### 6.7.4 Zone-based allocation
+
+Logical zones of 16 MiB (configurable per pool at creation; hereafter fixed). Each allocation request rounds up to the block size but *not* to the zone size — a single allocation can span zones.
+
+What zones give us:
+- **Fragmentation concentration**: free fragments cluster within zones, making rebalance's job easier (skip mostly-allocated zones, compact mostly-free zones).
+- **Zoned-storage alignment**: on ZNS NVMe, our logical zones map to device zones.
+- **Extent locality**: sequential extents within the same file tend to land in the same zone, improving read locality.
+
+Zone assignment is policy-driven: allocator prefers zones that are already partially allocated (to fill them up before starting new zones), unless that would cross a class boundary.
+
+### 6.8 Free and deferred-free
+
+Freeing a block doesn't make it immediately reusable. Sequence:
+
+1. `free(range)` in user code.
+2. Allocator marks the range as PENDING in the in-RAM bitmap (cannot be reused).
+3. At commit time, the range's tree entry is removed (refcount reached 0 → delete).
+4. After the commit's Phase 3 durability landed (§5.6), PENDING → truly free.
+5. Next allocation can reuse.
+
+The PENDING gap ensures that a block freed in commit `G` isn't reallocated to a different owner in commit `G+1` until `G`'s durability is confirmed. This prevents the "reallocated-and-written before freeing-commit was durable" race that corrupts on crash.
+
+This is the same mechanism v1 used (`REFCOUNT_PENDING` sentinel). Carries forward.
+
+### 6.9 CAS cold tier allocator
+
+The cold tier (§6.11 of NOVEL #3) uses a different allocation scheme: content-addressed, not paddr-addressed.
+
+#### 6.9.1 CAS index
+
+A Bε-tree keyed by content hash:
+
+- **Key**: `u256 BLAKE3-256 hash` of the chunk's content.
+- **Value**: `struct stm_cas_entry { stm_paddr_t paddr; u32 refcount; u32 length_blocks; }` — 16 bytes.
+
+Chunk is addressed by content. Lookup: "do we have content X?" — hash the content, query the index.
+
+Refcount tracks how many extents (across all datasets, all snapshots) reference this chunk. When refcount → 0, the chunk's backing blocks can be freed.
+
+#### 6.9.2 CAS write path
+
+1. Extent is identified as cold (via migration policy from tiering model, NOVEL #6).
+2. Content is chunked via FastCDC (NOVEL #3), variable-sized boundaries via rolling hash.
+3. For each chunk, compute BLAKE3-256.
+4. Query CAS index:
+    - **Hit**: chunk already exists. Just bump the refcount. (Automatic dedup.)
+    - **Miss**: allocate paddrs (via the hot allocator, onto designated cold-tier devices), write chunk, insert into CAS index.
+5. Build a cold-extent record that references the chunks by hash, not paddr.
+
+#### 6.9.3 CAS garbage collection
+
+When a cold extent is dereferenced (file deleted, snapshot deleted), its chunk references are decremented. Chunks with refcount → 0 are reclaimed:
+
+1. Their CAS-index entries are removed.
+2. Their paddrs are freed in the hot allocator (back to the pool's free space).
+
+GC is incremental: dereferencing an extent produces a list of chunks to check; we don't traverse the whole CAS index. Background scrub periodically verifies "every CAS entry has at least one extent referencing it."
+
+#### 6.9.4 CAS chunk sizing
+
+FastCDC parameters:
+- Target average chunk size: 8 MiB (default; configurable).
+- Minimum: 1 MiB.
+- Maximum: 64 MiB.
+
+8 MiB strikes a balance: large enough that per-chunk overhead (hash + index entry) is negligible; small enough that shift-resistance wins on typical data (VM images, archives).
+
+Parameters configurable per dataset: a dataset with many small files might use avg 1 MiB; an archive of large video files might use avg 32 MiB.
+
+### 6.10 Mount-time reconstruction
+
+On mount:
+
+1. Read uberblock (§5).
+2. Load allocator-roots object from `ub_alloc_root`.
+3. For each device, walk its allocator tree → build in-RAM bitmap + xor filter.
+4. Load CAS index root → build in-RAM CAS xor filter.
+
+Walking each device's allocator tree is O(tree size) = O(allocated ranges). For a pool with 100 devices × 10⁶ ranges each = 10⁸ walks total. At SSD speeds (100k ranges/s walk), that's ~1000 seconds = 16 minutes.
+
+*Optimization*: parallelize across devices. 100 devices in parallel → ~10 seconds. Scales well.
+
+Mount time target (VISION §4): sub-minute for 1 TiB pool, minutes for 100 TiB. Achievable with this design.
+
+### 6.11 Interactions with other subsystems
+
+- **§3 Concurrency**: allocator ops participate in the MVCC reader/writer protocol. Alloc/free are writes; they append to the in-memory alloc log and take effect on commit. Snapshot allocator state is preserved via COW of the allocator tree.
+- **§4 Storage pool**: allocator knows about device_id, class, role. Stripe-granularity allocation for redundant profiles.
+- **§5 SB / quorum**: allocator roots persisted in the uberblock via the allocator-roots object.
+- **§7 Crypto + integrity**: allocator-tree nodes themselves are metadata → Merkle-covered, AEAD-encrypted. Bootstrap pool bitmap is also metadata.
+- **§8 Namespace**: per-dataset redundancy profile is respected by allocator. Snapshot creation/deletion triggers refcount ops across many entries.
+- **§9 Block device**: allocator issues writes to the block layer; block layer handles striping.
+
+### 6.12 Open questions
+
+- **Refcount width**: 32 bits is 4B max snapshots. Realistic ceiling. Narrower varint saves space but complicates updates. Staying with 32 bits.
+- **Zone size**: 16 MiB default. Tune after workload benchmarks.
+- **Bootstrap pool growth**: fixed at pool creation. Growth is offline-only operation. Acceptable given generous initial sizing.
+- **In-RAM target**: settled at ~25 MiB per TiB with SDArray + xor filter over ranges. Wavelet-tree-over-refcount refinement targets 5-10 MiB per TiB post-v2.0.
+- **Placement scorer weights**: tune after workload benchmarks. Defaults listed in §6.7.2.
+- **CAS chunk size**: 8 MiB default, configurable. Sensitive to workload.
+- **CAS GC cadence**: incremental vs periodic. Current lean: incremental on dereference + periodic verification in scrub.
+
+### 6.13 Summary
+
+Key commitments:
+
+1. **Per-device allocator trees** in the Bε-tree family, keyed by `start_block`, valued with `(length, refcount)`.
+2. **Bootstrap pool per device** (0.1% of device capacity, min 64 MiB) holds allocator-tree nodes outside the allocator's domain. No recursion.
+3. **In-RAM SDArray + xor filter** over allocated ranges. ~25 MiB per TiB at v2.0, path to 5-10 MiB via wavelet-tree post-v2.0.
+4. **Stripe-granularity allocation** for redundant profiles. Full-stripe writes only.
+5. **Zone-based logical layout**: 16 MiB zones concentrate fragmentation for efficient rebalance.
+6. **PENDING deferred-free** carries forward from v1 — blocks freed in commit G aren't reusable until G is durable.
+7. **CAS cold tier**: content-addressed index keyed by BLAKE3-256 hash; automatic dedup; FastCDC chunking at 8 MiB avg; incremental GC on dereference.
+
+Status: DRAFT → awaiting review, push-back, then COMMITTED.
 
 ---
 
@@ -1667,8 +2016,8 @@ Each of §3–§5 and §7 is probably its own Phase 0 session. §6, §8, §9–�
 | §2 Layer cake | STUB | 11 (thin pass once rest is settled) |
 | §3 Concurrency | DRAFT | 1 |
 | §4 Storage pool | DRAFT | 2 |
-| §5 Superblock / quorum | **DRAFT** (this session) | 3 |
-| §6 Allocator | STUB | 4 |
+| §5 Superblock / quorum | DRAFT | 3 |
+| §6 Allocator | **DRAFT** (this session) | 4 |
 | §7 Cryptography + integrity | STUB | 5 |
 | §8 Namespace | STUB | 6 |
 | §9 Block device | STUB | 7 |
