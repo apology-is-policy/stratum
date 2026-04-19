@@ -361,13 +361,19 @@ RAM becomes O(distinct ranges). Mount becomes a space-tree open (log N) instead 
 
 **Staging plan** — the change touches the sync-ordering invariants in §7, so it lands incrementally with audits at each stage:
 
-1. **Stage 1** (landed) — space-tree operations in isolation: `stm_space_insert`, `stm_space_lookup`, `stm_space_ref`, `stm_space_unref`, `stm_space_find_gap`, `stm_space_walk`, `stm_space_commit`. Unit-tested in `tests/test_space.c`. Not wired into the running fs. Existing allocator array remains source of truth.
-2. **Stage 2** — delta log: each sync emits a compact log block of the session's alloc/free deltas, referenced from the SB. Mount replays logs since last tree-fold on top of the tree. Solves the chicken-and-egg where the space tree's own node allocations would otherwise need to be recorded in itself.
+1. **Stage 1** (landed `45c54fd`) — space-tree operations in isolation: `stm_space_insert`, `stm_space_lookup`, `stm_space_ref`, `stm_space_unref`, `stm_space_find_gap`, `stm_space_walk`, `stm_space_commit`. Unit-tested in `tests/test_space.c`. Not wired into the running fs. Existing allocator array remains source of truth.
+2. **Stage 2** (landed) — delta log in isolation: per-sync allocator deltas appended to a backward-linked chain of 4 KiB log chunks; commit writes any pending entries as new chunks; fold-into applies entries to the tree. Unit-tested in `tests/test_space_log.c`. Not wired into the running fs either.
 3. **Stage 3** — dual-source validation mode: mount builds the in-memory array from the space tree + log AND from the full walk, asserts they match. Proves correctness over wide test coverage before flipping sources.
 4. **Stage 4** — drop the full walk; space tree + log becomes source of truth. The O(`total_blocks`) refcount array is still maintained in memory during a session for fast allocation, but it's initialized from the persistent structure, not rebuilt from a walk.
 5. **Stage 5** — on-demand space-tree queries replace the in-memory array entirely. RAM becomes O(distinct ranges) at runtime too. Focused audit covers every sync crash boundary.
 
-`stm_space_entry` in `stratum/space.h` is the LOG entry form (per-delta, with `op` and `gen`) for Stage 2. Stage 1 does not use it.
+**Stage 2 log design.** Each 4 KiB chunk holds a 64-byte `stm_space_log_hdr` (magic, gen, `slh_prev_paddr`, count, xxHash3-128 csum) + up to 126 `stm_space_entry` structs. Chunks are BACKWARD-linked: a new chunk's `slh_prev_paddr` points at the previous newest chunk. The SB's `ss_space_log` field (to be added in Stage 3) will store the head paddr = the NEWEST chunk. Mount walks head → prev until prev=0, reverses the chunk list, and replays entries in insert order on top of the space tree.
+
+Why backward-linked? COW-friendliness: an old chunk's header is never rewritten once committed. Forward-linking would require an old chunk's "next" field to be patched when a new chunk is appended — a mutating write that either breaks COW or requires an extra COW dance per append.
+
+Log entry ops are `STM_SPACE_ALLOC` (insert new range — `count`, initial `refcount`), `STM_SPACE_FREE` (decrement refcount at paddr; delete at 0), and `STM_SPACE_REF` (increment refcount at paddr — used for snapshot sharing).
+
+**Breaking the allocator recursion.** Log-chunk allocation goes through a caller-supplied `stm_space_log_alloc_cb`, not `stm_alloc_extent`. Stage 2 tests use a bump allocator. Stage 3 will use a small reserved pool outside the main allocator's domain so chunk writes can never recurse into the space tree that's trying to record them. Without this, every log commit would try to record its own chunk allocations in the space tree → back into the log → infinite regress.
 
 ---
 
