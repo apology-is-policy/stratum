@@ -3176,37 +3176,410 @@ Status: DRAFT → awaiting review, push-back, then COMMITTED.
 
 ## 10. Client interfaces
 
-**STATUS**: STUB
+**STATUS**: DRAFT
 
-*(New section — captures how applications and OSes reach the filesystem. Separate from §9 block device layer (which is stratum's backing storage) and from §8 9P server (covered in namespace section as the protocol endpoint).)*
+*(Captures how applications and OSes reach the filesystem. Separate from §9 block device layer (stratum's backing storage) and from §8 9P server (the namespace / protocol endpoint).)*
 
-### 10.1 Goals
+### 10.1 Goals and non-goals
 
-- Support multiple client paths: FUSE, in-kernel Linux module (post-v2.0), CLI, library bindings.
-- 9P is the universal transport; clients are 9P consumers.
-- Authentication + authorization at the 9P boundary, not per-client.
+**Goals**:
 
-### 10.2 Decisions committed (VISION §5.5, COMPARISON §1)
+- Support multiple client paths: FUSE shim, CLI, 9P C library, language bindings, in-kernel Linux driver (post-v2.0), Windows driver (post-v2.0).
+- 9P is the universal transport; every client is a 9P consumer.
+- Authentication and authorization happen at the 9P boundary, not per-client.
+- Encryption and per-connection namespaces (§7, §8) work uniformly across all clients.
+- Straightforward path for a user to access Stratum — FUSE mount + standard Unix tools.
 
-- 9P-first architectural stance.
-- FUSE shim is a client of 9P, not the native interface.
-- In-kernel Linux driver is post-v2.0.
+**Non-goals**:
 
-### 10.3 Subsections to write
+- Direct-library FS access bypassing 9P. A "libstratum-fs" that reads/writes without going through 9P fragments the architecture; every client pays the same 9P cost.
+- NFS / SMB protocol servers. Separate daemons using stratum as storage; we don't bundle them.
+- WebDAV, SFTP, ObjectStore (S3) endpoints. Same.
+- Deep integration with specific containers (Docker CSI, Kubernetes). Users mount stratum however they mount filesystems; we don't ship container-specific plumbing.
 
-- **10.3.1** FUSE shim — how it translates kernel VFS ops to 9P messages.
-- **10.3.2** CLI tool — thin wrapper over `/ctl/` synthetic filesystem.
-- **10.3.3** 9P client library — stable C API for applications that want direct 9P.
-- **10.3.4** Language bindings — Rust, Go, Python. Thin wrappers over the C API.
-- **10.3.5** In-kernel Linux driver (post-v2.0) — design sketch only.
-- **10.3.6** Windows driver (post-v2.0, optional) — design sketch only.
-- **10.3.7** Authentication at mount — how clients authenticate to 9P server.
+### 10.2 Decisions already committed
 
-### 10.4 Open questions
+From earlier docs:
 
-- Should the FUSE shim run as a separate process or linked into stratum?
-- Language bindings ownership — upstream or community-maintained?
-- Kernel-module timeline.
+- **9P-first architectural stance** (VISION §5.5, COMPARISON §1).
+- **FUSE shim is a 9P client**, not a native backend (VISION §5.5).
+- **In-kernel Linux driver post-v2.0** (VISION §5.5, NOVEL §4).
+
+Decisions taken in this section:
+
+- **9P2000.L** as the baseline protocol dialect. POSIX-complete, xattr-aware, commonly implemented.
+- **Stratum-specific 9P extensions**: `Tbind` / `Tunbind` (namespace composition, §8.8.2), `Tpin` / `Tunpin` (explicit snapshot pinning, §3.3.2), `Tsync` (client-initiated commit), `Treflink` (O(1) copy). Extensions version-gated; a non-stratum 9P client sees a standard 9P server.
+- **FUSE shim runs as a separate daemon** (`stratum-fuse`), not linked into the stratum daemon. Decouples mount lifetime from stratum lifetime; allows multiple mounts of one pool.
+- **CLI is thin over `/ctl/`** — ~1000 LOC, parses subcommands, translates to cat/echo on synthetic paths.
+- **C 9P client library (`libstratum-9p`) is the stable public ABI**. All language bindings wrap it.
+- **Language bindings for Rust, Go, Python at v2.0**; community-maintained thereafter.
+- **Auth**: Unix socket uses SO_PEERCRED; TCP requires TLS wrapping; 9P `Tauth` delegates to pluggable backends.
+
+### 10.3 The 9P-first stance, expanded
+
+The stance has second-order consequences worth spelling out.
+
+#### 10.3.1 Every client goes through the same boundary
+
+The stratum daemon exposes one surface: a 9P server on a Unix socket (or TCP). Everything — FUSE, CLI, libraries, future kernel module — is a 9P client.
+
+Benefits:
+- **One authentication model**: 9P `Tauth`/`Rauth`. Not one model for FUSE, another for CLI, another for the kernel module.
+- **One authorization path**: every operation goes through a 9P handler that checks perms.
+- **One audit log**: every client's operations are visible in the same place.
+- **Uniform encryption**: encryption happens at the 9P layer; every client sees the same ciphertext boundary.
+- **Multi-client by construction**: 9P is inherently multi-client. No retrofit.
+
+Costs:
+- Every access pays a 9P message round-trip. For local clients (Unix socket), this is ~5–20 µs. Measurable but small.
+- Protocol evolution happens at the 9P layer. A new feature (e.g., reflinks) requires a 9P extension, not a per-client patch.
+
+#### 10.3.2 9P over Unix socket is the primary transport
+
+Default: `stratum` listens on `/var/run/stratum.sock` (configurable). Clients connect locally. TCP is optional (remote admin, testing).
+
+#### 10.3.3 The kernel-module question is a transport question
+
+Post-v2.0, an in-kernel Linux driver lets the kernel's VFS talk to stratum without FUSE hops. In our model, the kernel module is *still a 9P client* — it just uses a more efficient transport (shared memory + eventfds). The protocol doesn't change; only the transport does. All existing 9P client code continues to work.
+
+### 10.4 FUSE shim
+
+`stratum-fuse` is a small daemon that bridges the Linux FUSE kernel interface to 9P.
+
+#### 10.4.1 Deployment model
+
+```
+┌─────────────────┐
+│  Application    │  reads /mnt/tank/file
+└────────┬────────┘
+         │ syscall
+         ▼
+┌─────────────────┐
+│  Linux kernel   │  VFS → FUSE
+└────────┬────────┘
+         │ FUSE wire protocol
+         ▼
+┌─────────────────┐
+│  stratum-fuse   │  translates FUSE ops to 9P messages
+│   (daemon)      │
+└────────┬────────┘
+         │ 9P over Unix socket
+         ▼
+┌─────────────────┐
+│  stratum        │  the filesystem daemon
+└─────────────────┘
+```
+
+Three processes on the host (`stratum-fuse`, `stratum`, application). Mount:
+
+```
+$ stratum-fuse /mnt/tank --server /var/run/stratum.sock --pool tank
+```
+
+Unmount via `fusermount -u /mnt/tank`.
+
+One `stratum-fuse` instance per mount point. Multiple mount points coexist.
+
+#### 10.4.2 FUSE → 9P translation
+
+FUSE ops map to 9P:
+- `FUSE_LOOKUP` → `Twalk`.
+- `FUSE_OPEN` / `FUSE_OPENDIR` → `Topen`.
+- `FUSE_READ` → `Tread`.
+- `FUSE_WRITE` → `Twrite`.
+- `FUSE_GETATTR` → `Tgetattr` (9P2000.L).
+- `FUSE_SETATTR` → `Tsetattr`.
+- `FUSE_MKDIR` / `FUSE_CREATE` / `FUSE_UNLINK` / `FUSE_RMDIR` → `Tmkdir` / `Tcreate` / `Tremove`.
+- `FUSE_RENAME` → `Trenameat` (9P2000.L).
+- `FUSE_LINK` → `Tlink` (9P2000.L).
+- `FUSE_SYMLINK` / `FUSE_READLINK` → `Tsymlink` / `Treadlink`.
+- `FUSE_GETXATTR` / `FUSE_SETXATTR` / `FUSE_LISTXATTR` / `FUSE_REMOVEXATTR` → 9P2000.L xattr ops.
+- `FUSE_FALLOCATE` → 9P extension `Tfallocate`.
+- `FUSE_COPY_FILE_RANGE` → 9P extension `Treflink` (O(1) reflink when possible).
+- `FUSE_FSYNC` → `Tsync`.
+
+Stratum extensions documented in `docs/9P-EXTENSIONS.md` (to be created).
+
+#### 10.4.3 FUSE shim internals
+
+The daemon:
+- Receives FUSE events from the kernel via the FUSE device.
+- Maintains a 9P session with stratum.
+- Each FUSE op becomes one or more 9P ops.
+- Caches 9P fids to avoid repeated Twalks (FUSE's inode cache helps).
+- Submits 9P ops asynchronously, pipelining for throughput.
+
+Expected overhead vs direct 9P: 5–15 µs per op (kernel ↔ daemon hop), partially offset by FUSE's writeback cache.
+
+#### 10.4.4 macOS via macFUSE
+
+Same shim, different FUSE backend library. Uses `libfuse3` (Linux) or `libfuse-macfuse` (macOS). The daemon abstracts the platform difference; the 9P path is identical.
+
+### 10.5 CLI tool (`stratum`)
+
+User-facing command-line binary. Parses subcommands and translates to operations on the `/ctl/` synthetic filesystem (§14).
+
+#### 10.5.1 Command shape
+
+```
+stratum pool create tank /dev/nvme0n1 /dev/nvme1n1 redundancy=mirror(2)
+stratum pool status tank
+stratum pool scrub tank [--priority=medium]
+
+stratum dataset create tank/home
+stratum dataset set tank/home compression=zstd
+stratum dataset list tank
+
+stratum snapshot create tank/home@daily-$(date -I)
+stratum snapshot list tank/home
+stratum snapshot rollback tank/home@daily-2026-04-19
+stratum snapshot delete tank/home@daily-2026-04-10
+
+stratum clone create tank/home@daily-2026-04-19 tank/scratch
+stratum clone promote tank/scratch
+
+stratum send tank/home@daily-2026-04-19 | \
+    ssh remote "stratum recv tank/backup/"
+
+stratum key rotate tank
+stratum key agent status
+```
+
+Each subcommand is thin — 50–100 LOC. The work happens in the `/ctl/` interface.
+
+#### 10.5.2 Output formats
+
+- Default: human-readable, column-aligned.
+- `--json`: JSON for scripts.
+- `--tsv`: tab-separated values for shell pipelines.
+
+Human-readable default because Plan 9. JSON added because the real world has scripts.
+
+#### 10.5.3 Why a CLI at all if everything is `/ctl/`
+
+UX convenience. Users expect a `stratum` tool; discoverable via shell completion; matches convention (`zfs`, `btrfs`, `bcachefs`). Power users skip it and `cat`/`echo` `/ctl/` directly.
+
+### 10.6 C 9P client library (`libstratum-9p`)
+
+The stable public C ABI. All language bindings wrap this library.
+
+#### 10.6.1 API surface
+
+```c
+// Connect/disconnect.
+struct stm9p_conn *stm9p_connect(const char *endpoint, const char *auth_spec);
+void stm9p_close(struct stm9p_conn *c);
+
+// Filesystem ops (9P2000.L-level).
+int stm9p_walk(struct stm9p_conn *c, uint32_t fid, uint32_t newfid,
+               const char **wnames, uint32_t nwname);
+int stm9p_open(struct stm9p_conn *c, uint32_t fid, int flags);
+int stm9p_read(struct stm9p_conn *c, uint32_t fid, uint64_t offset,
+               void *buf, uint32_t len, uint32_t *out_read);
+int stm9p_write(struct stm9p_conn *c, uint32_t fid, uint64_t offset,
+                const void *buf, uint32_t len, uint32_t *out_written);
+int stm9p_getattr(struct stm9p_conn *c, uint32_t fid,
+                  struct stm9p_stat *out);
+// ... full 9P2000.L surface ...
+
+// Stratum extensions.
+int stm9p_bind(struct stm9p_conn *c, uint32_t src_fid, const char *target,
+               uint32_t mode);
+int stm9p_unbind(struct stm9p_conn *c, const char *target);
+int stm9p_pin(struct stm9p_conn *c, uint32_t fid, uint32_t *out_pin_id);
+int stm9p_unpin(struct stm9p_conn *c, uint32_t pin_id);
+int stm9p_sync(struct stm9p_conn *c, uint32_t fid);
+int stm9p_reflink(struct stm9p_conn *c, uint32_t src_fid,
+                  uint32_t dst_parent_fid, const char *name);
+
+// Async variants.
+struct stm9p_future;
+struct stm9p_future *stm9p_read_async(struct stm9p_conn *c, ...);
+int stm9p_future_poll(struct stm9p_future *f);
+int stm9p_future_wait(struct stm9p_future *f);
+```
+
+Stable ABI: once published at v2.0, signatures don't change in v2.x. New functions added; existing ones retained.
+
+#### 10.6.2 Threading model
+
+Thread-safe. Multiple threads can use the same `stm9p_conn` concurrently; internal locking serializes 9P message sends per connection.
+
+For high concurrency, applications can open multiple connections to the same server.
+
+#### 10.6.3 Error handling
+
+All ops return `int`: `0` on success, negative POSIX errno on error.
+
+Extended error info available via `stm9p_last_error(c) → const char *`.
+
+### 10.7 Language bindings
+
+Thin wrappers over `libstratum-9p`. Maintained in the Stratum monorepo at v2.0; community ownership thereafter.
+
+#### 10.7.1 Rust crate `stratum-fs`
+
+```rust
+use stratum_fs::Connection;
+
+let conn = Connection::connect("unix:/var/run/stratum.sock")?;
+let mut file = conn.open("/tank/home/alice/file.txt", OpenOptions::read())?;
+let mut buf = vec![0u8; 4096];
+let n = file.read(&mut buf)?;
+```
+
+Safe wrapper via RAII; `Drop` closes fids. Typed error variants.
+
+#### 10.7.2 Go package `stratum`
+
+```go
+import "github.com/anthropic-stratum/stratum-go"
+
+conn, err := stratum.Connect("unix:/var/run/stratum.sock")
+defer conn.Close()
+
+file, err := conn.Open("/tank/home/alice/file.txt", stratum.O_RDONLY)
+defer file.Close()
+buf := make([]byte, 4096)
+n, err := file.Read(buf)
+```
+
+CGO-based; standard Go error conventions.
+
+#### 10.7.3 Python module `pystratum`
+
+```python
+from pystratum import Connection
+
+with Connection("unix:/var/run/stratum.sock") as conn:
+    with conn.open("/tank/home/alice/file.txt", "rb") as f:
+        data = f.read(4096)
+```
+
+CFFI-based; Pythonic context managers + file-like objects.
+
+### 10.8 In-kernel Linux driver (post-v2.0 sketch)
+
+Brief design sketch so we don't architect ourselves into a corner.
+
+#### 10.8.1 Motivation
+
+FUSE has ~5–15 µs overhead per VFS op and can't participate in kernel features like direct page-cache integration, real `mmap`, or NFS export. For high-IOPS workloads, FUSE becomes the bottleneck.
+
+An in-kernel driver bypasses FUSE and talks directly to the stratum daemon via a purpose-built transport.
+
+#### 10.8.2 Architecture
+
+```
+┌─────────────────┐
+│  Application    │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│  Linux kernel   │
+│  ┌───────────┐  │
+│  │ stratum-km│  │  kernel module, implements VFS ops
+│  └─────┬─────┘  │
+└────────┼────────┘
+         │ shared-memory + eventfd transport
+         ▼
+┌─────────────────┐
+│  stratum        │
+└─────────────────┘
+```
+
+The kernel module handles VFS ops. For each op:
+- If satisfiable from kernel page cache, return immediately.
+- Otherwise, submit a 9P message via the shared-memory transport; wait for response.
+- Writeback cache is managed by the kernel.
+
+Transport: shared memory ring buffers (like io_uring in reverse) + eventfds. No syscall per op.
+
+#### 10.8.3 What the kernel module gives us
+
+- Direct page-cache integration — `mmap()` works properly.
+- NFS export works (kernel's nfsd exports stratum-backed dirs).
+- Quota enforcement at syscall layer.
+- Per-process namespace integration.
+- ~2x throughput for small-op workloads vs FUSE.
+
+#### 10.8.4 Estimated timeline
+
+v2.1 at earliest. Requires kernel upstreaming or out-of-tree module distribution. Substantial effort (~10–20 KLOC of kernel code). Not blocking v2.0.
+
+### 10.9 Windows driver (post-v2.0 sketch)
+
+Further post-v2.0.
+
+Windows has no native FUSE equivalent. **WinFsp** (MIT-licensed) provides FUSE-like userspace filesystems on Windows. Porting `stratum-fuse` to WinFsp gets Windows support with similar architecture.
+
+Alternative: a proper Windows kernel driver. More work; better integration with Explorer, shell, NTFS features.
+
+Timeline: v2.x+ if demand materializes. Not a v2.0 commitment.
+
+### 10.10 Authentication at mount
+
+Clients authenticate using 9P's `Tauth`/`Rauth` machinery.
+
+#### 10.10.1 Unix socket authentication
+
+Unix sockets expose peer credentials via `SO_PEERCRED` (Linux) / `LOCAL_PEERCRED` (macOS/BSD). Stratum reads connecting UID/GID/PID and checks its ACL.
+
+Default: any local UID can connect; per-dataset permissions apply per-op. Admin ops (pool create/destroy, scrub, key rotate) restricted to an admin UID list in pool metadata.
+
+#### 10.10.2 TCP + TLS authentication
+
+TCP listeners require TLS. Authentication via:
+- **Client certificates (mTLS)**: cert subject identifies the client; stratum maps subject → access rules.
+- **Bearer tokens**: short-lived tokens from an external auth service.
+
+Stratum delegates to pluggable auth modules (`stratum-auth-pam`, `stratum-auth-oauth2`, etc.).
+
+#### 10.10.3 9P `Tauth` backends
+
+For non-trivial scenarios (remote + auth required), 9P's `Tauth`/`Rauth` handshake runs a sub-protocol over an "auth fid." Stratum supports:
+
+- **`none`**: trusted environment.
+- **`factotum`**: challenge/response via the key agent.
+- **`sasl`**: SASL over 9P (GSSAPI, SCRAM, etc.).
+- **`token`**: bearer token validation.
+
+Admin configures which backends are allowed per-listener.
+
+### 10.11 Interactions with other subsystems
+
+- **§3 Concurrency**: client ops submit through 9P → fs layer → MVCC reader protocol. Per-connection namespace state (§8.8) is connection-local.
+- **§7 Crypto + integrity**: mount-auth is separate from key agent (which handles key unwraps). Authenticated client gets 9P access; decryption additionally requires key agent approval.
+- **§8 Namespace**: every 9P connection starts with an attach; `Tbind`/`Tunbind` shape the connection's namespace.
+- **§9 Block device**: client ops eventually drive block I/O. FUSE shim and kernel module (post-v2.0) go through 9P, never the block layer directly.
+- **§14 Observability**: connection counts, op rates per client, auth failures surfaced via `/ctl/`.
+
+### 10.12 Open questions
+
+- **libstratum-9p ABI versioning**: stable across v2.x; new 9P extensions add functions (additive). Old ones remain.
+- **FUSE shim single- vs multi-thread**: multi-threaded serves more ops/sec but needs state management. v2.0: multi-threaded by default, configurable thread cap.
+- **Kernel-module transport**: shared memory vs vsock vs netlink. Shared memory is fastest; netlink is most conventional. Decide at design time (post-v2.0).
+- **Windows: WinFsp or native driver**: WinFsp faster to implement; native driver better long-term. Community-driven decision.
+- **Language binding maintainer model**: stratum monorepo at v2.0; community-maintained via federated repos thereafter. Needs clear contribution policies.
+- **Authentication module interface**: pluggable via dlopen? Compiled-in at v2.0; add plugin later if demanded.
+
+### 10.13 Summary
+
+The client interface layer is intentionally thin — the real work happens at the 9P boundary.
+
+Key commitments:
+
+1. **9P-first**: every client is a 9P consumer. One auth model, one authorization path, one audit log, one encryption boundary. Same protocol across FUSE, CLI, libraries, future kernel/Windows drivers.
+2. **9P2000.L** dialect baseline, with Stratum extensions (`Tbind`, `Tpin`, `Tsync`, `Treflink`, `Tfallocate`).
+3. **FUSE shim** as a separate daemon (`stratum-fuse`). Works on Linux and macOS.
+4. **CLI tool** thin (~1000 LOC) over `/ctl/` synthetic filesystem.
+5. **C 9P client library** (`libstratum-9p`) is the stable public ABI.
+6. **Language bindings** for Rust, Go, Python at v2.0. Upstream-maintained initially.
+7. **In-kernel Linux driver** and **Windows driver** sketched as post-v2.0.
+8. **Authentication** via Unix socket peer creds, TLS client certs, or 9P `Tauth` backends.
+
+Status: DRAFT → awaiting review, push-back, then COMMITTED.
 
 ---
 
@@ -3421,8 +3794,8 @@ Each of §3–§5 and §7 is probably its own Phase 0 session. §6, §8, §9–�
 | §6 Allocator | DRAFT | 4 |
 | §7 Cryptography + integrity | DRAFT | 5 |
 | §8 Namespace | DRAFT | 6 |
-| §9 Block device | **DRAFT** (this session) | 7 |
-| §10 Client interfaces | STUB | 8 |
+| §9 Block device | DRAFT | 7 |
+| §10 Client interfaces | **DRAFT** (this session) | 8 |
 | §11 POSIX surface | STUB | 9 |
 | §12 I/O paths | STUB | 10 (integration) |
 | §13 Format versioning | STUB | 11 |
