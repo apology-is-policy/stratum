@@ -48,8 +48,17 @@ target_compile_options(stm_warnings INTERFACE
     -Wstrict-prototypes -Wmissing-prototypes
     -Wformat=2 -Wnull-dereference
     -fno-common
-    -fstack-protector-strong
-    -D_FORTIFY_SOURCE=2)
+    -fstack-protector-strong)
+
+# _FORTIFY_SOURCE is useful but platforms disagree on when it's safe to set.
+# - Linux: glibc wants it at -O1+ and never under sanitizers (conflicts with
+#   ASan's interceptors).
+# - macOS: Clang on recent SDKs already defines _FORTIFY_SOURCE via system
+#   headers; setting it here triggers -Wmacro-redefined.
+# Gate on platform + sanitizer.
+if(NOT STM_PLATFORM_DARWIN AND STM_SANITIZE STREQUAL "off")
+    target_compile_options(stm_warnings INTERFACE -D_FORTIFY_SOURCE=2)
+endif()
 if(STM_WERROR)
     target_compile_options(stm_warnings INTERFACE -Werror)
 endif()

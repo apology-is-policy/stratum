@@ -42,7 +42,24 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
               build-essential pkg-config cmake ninja-build \
-              libsodium-dev liburing-dev
+              liburing-dev
+
+      - name: install libsodium
+        run: |
+          # ubuntu-24.04's apt ships libsodium 1.0.18; we need 1.0.19+ for
+          # AEGIS-256. Build from source if apt's version is too old.
+          if apt list --installed 2>/dev/null | grep -q libsodium; then
+              sudo apt-get remove -y libsodium-dev libsodium23 || true
+          fi
+          wget -q -O /tmp/libsodium.tar.gz \
+              https://download.libsodium.org/libsodium/releases/libsodium-1.0.20.tar.gz
+          tar xzf /tmp/libsodium.tar.gz -C /tmp
+          cd /tmp/libsodium-1.0.20
+          ./configure --prefix=/usr/local --disable-debug
+          make -j$(nproc)
+          sudo make install
+          sudo ldconfig
+          pkg-config --modversion libsodium
 
       - name: install liboqs
         run: |
@@ -108,7 +125,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        spec: [sync]
+        spec: [sync, concurrency]
     steps:
       - uses: actions/checkout@v4
 

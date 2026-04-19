@@ -7,6 +7,12 @@ compile_commands.json
 *.so
 *.dylib
 
+# TLC model-checker artifacts
+specs/states/
+specs/*_TTrace_*.tla
+specs/*_TTrace_*.bin
+specs/*.toolbox/
+
 # Vendored git checkouts (tracked separately as git submodules would be nicer
 # long-term; for now we .gitignore the .git directory inside each)
 third_party/BLAKE3_src/.git/

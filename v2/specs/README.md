@@ -5,15 +5,16 @@ is exercised by TLC in CI.
 
 ## Current specs
 
-| File             | Spec             | Status       | Phase | Subject of ARCH |
-|------------------|------------------|--------------|-------|-----------------|
-| `sync.tla`       | four-phase commit | Phase 1      | P1    | §3.7, §5.6      |
-| `nonce.tla`      | AEAD nonce uniqueness | stub   | P3    | §7.4            |
-| `allocator.tla`  | refcount MVCC    | stub         | P3    | §6.4            |
-| `concurrency.tla`| MVCC+EBR readers | stub         | P2    | §3              |
-| `merkle.tla`     | hash propagation | stub         | P4    | §7.11, §7.12    |
-| `quorum.tla`     | multi-device commit | stub      | P5    | §5.6            |
-| `namespace.tla`  | per-conn isolation | stub       | P8    | §8.8            |
+| File             | Spec                  | Status  | Phase | Subject of ARCH |
+|------------------|-----------------------|---------|-------|-----------------|
+| `sync.tla`       | four-phase commit     | landed  | P1    | §3.7, §5.6      |
+| `concurrency.tla`| MVCC + EBR + deltas   | landed  | P2    | §3.3, §3.4, §3.6|
+| `nonce.tla`      | AEAD nonce uniqueness | stub    | P3    | §7.4            |
+| `allocator.tla`  | refcount MVCC         | stub    | P3    | §6.4            |
+| `merkle.tla`     | hash propagation      | stub    | P4    | §7.11, §7.12    |
+| `quorum.tla`     | multi-device commit   | stub    | P5    | §5.6            |
+| `structural.tla` | split/merge atomicity | stub    | P2+   | §3.5            |
+| `namespace.tla`  | per-conn isolation    | stub    | P8    | §8.8            |
 
 ## Running TLC locally
 
