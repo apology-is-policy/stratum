@@ -1,12 +1,12 @@
 # Stratum v2 Architecture
 
-**Status**: Phase 0 — structural skeleton, 2026-04-19. Each section is stubbed with its goals, decisions already made (from VISION.md and NOVEL.md), open questions, and subsections to write. Filled in section-by-section in subsequent Phase 0 sessions.
+**Status**: Phase 0. Each section is stubbed with goals, decisions already committed, open questions, and subsections to write. Filled in across Phase 0 sessions.
 
 ## Section status legend
 
 - **STUB** — structure only, no content yet.
 - **DRAFT** — first-pass content, under discussion.
-- **COMMITTED** — signed off; changes require explicit reopening.
+- **COMMITTED** — signed off; changes require explicit reopening and re-audit.
 
 ---
 
@@ -14,28 +14,30 @@
 
 **STATUS**: DRAFT
 
-This is the design specification for Stratum v2. It translates the properties in `VISION.md` and the novel-lead scopes in `NOVEL.md` into concrete architectural decisions. Every later implementation document (per-subsystem design notes, code comments, test plans) references this file as the source of truth.
+Source-of-truth design document for Stratum v2. Translates the properties in `VISION.md` and the novel-lead scopes in `NOVEL.md` into concrete architectural decisions. Every later implementation document references this file.
 
 ### 1.1 How to read
 
-- Sections 2–3 give the big picture: the layer cake and the principles.
-- Sections 4–13 cover specific subsystems. Each has its own goals, decisions, and open questions.
-- Sections 14–15 cover cross-cutting concerns (format versioning, observability).
-- Appendices collect reference material: glossaries, derivations, algorithm pseudocode.
+- §§1–2 set up the big picture.
+- §§3–10 cover specific subsystems, roughly foundations-first: concurrency, storage, SB/quorum, allocator, crypto/integrity, namespace, block device, client interfaces.
+- §§11–12 cover operational surfaces: POSIX semantics, I/O paths.
+- §§13–15 cover cross-cutting concerns: format versioning, observability, policy.
+- §16 is appendices.
+- §§17–18 are the writing-order proposal and status summary.
 
 ### 1.2 Relationship to other Phase 0 documents
 
-- **VISION.md** — what we're building and why (workloads, properties, priorities).
-- **COMPARISON.md** — how we position against ZFS, btrfs, bcachefs (what we match / lead / skip).
+- **VISION.md** — what we're building and why.
+- **COMPARISON.md** — positioning vs ZFS, btrfs, bcachefs.
 - **NOVEL.md** — per-angle scope and sequencing for the 10 lead positions.
-- **ARCHITECTURE.md** (this document) — concrete design decisions for every subsystem.
-- **ROADMAP-V2.md** (next) — phased implementation plan built on this document.
+- **ARCHITECTURE.md** (this document) — concrete design decisions.
+- **ROADMAP-V2.md** (after architecture) — phased implementation plan.
 
 ### 1.3 Change management
 
-- Once a section reaches **COMMITTED**, changing it requires a written rationale and explicit re-opening. The audit-trigger policy in `CLAUDE.md` applies to the architecture, not just to code.
-- Sections in **DRAFT** are open for discussion; push back whenever the reasoning feels thin.
-- **STUB** sections exist to claim the space and list the questions; content comes in dedicated passes.
+- Once a section reaches **COMMITTED**, changing it requires written rationale and explicit re-opening. CLAUDE.md's audit-trigger policy applies to architecture, not just to code.
+- **DRAFT** sections are open for discussion.
+- **STUB** sections claim the space and list the questions; content comes in dedicated passes.
 
 ---
 
@@ -43,87 +45,80 @@ This is the design specification for Stratum v2. It translates the properties in
 
 **STATUS**: STUB
 
-The overall stack, top to bottom. Each layer has a clearly defined interface; layers don't reach around each other.
+### 2.1 The stack
+
+Top to bottom. Each layer has a clearly defined interface; layers don't reach around each other.
 
 ```
-┌─────────────────────────────────────────────────┐
-│  Clients: FUSE shim / in-kernel driver / CLI    │   (external)
-├─────────────────────────────────────────────────┤
-│  9P server + per-connection namespaces          │   §5, §8
-├─────────────────────────────────────────────────┤
-│  Filesystem (POSIX surface, extents, inodes)    │   §5, §13
-├─────────────────────────────────────────────────┤
-│  Namespace / subvolume layer                    │   §5
-├─────────────────────────────────────────────────┤
-│  Metadata tree (Bε-tree, MVCC, lock-free)       │   §3, §9
-├─────────────────────────────────────────────────┤
-│  Integrity layer (Merkle, per-extent csum)      │   §9
-├─────────────────────────────────────────────────┤
-│  Crypto layer (AEAD-SIV, key hierarchy)         │   §10
-├─────────────────────────────────────────────────┤
-│  Allocator (succinct, tree-embedded)            │   §6
-├─────────────────────────────────────────────────┤
-│  Cold tier (Venti-style CAS + CDC)              │   §6.3
-├─────────────────────────────────────────────────┤
-│  Superblock / quorum (per-device uberblocks)    │   §7
-├─────────────────────────────────────────────────┤
-│  Block device abstraction (io_uring, DAX)       │   §8 (§4 of NOVEL)
-├─────────────────────────────────────────────────┤
-│  Storage pool (multi-device, redundancy)        │   §4
-└─────────────────────────────────────────────────┘
+                                            │ control plane │ data plane │
+ ───────────────────────────────────────────┼───────────────┼────────────┤
+  Client interfaces (FUSE, CLI, kernel mod) │      ●        │     ●      │   §10
+  9P server + per-connection namespaces     │      ●        │     ●      │   §8
+  Filesystem (POSIX, extents, inodes)       │               │     ●      │   §8, §11
+  Namespace / subvolume layer               │      ●        │     ●      │   §8
+  Metadata tree (Bε-tree, MVCC, lock-free)  │               │     ●      │   §3, §6
+  Cryptography + integrity                  │               │     ●      │   §7
+  Allocator (tree-embedded, succinct)       │               │     ●      │   §6
+  Superblock + quorum                       │      ●        │            │   §5
+  Block device abstraction (io_uring, DAX)  │               │     ●      │   §9
+  Storage pool (multi-device, redundancy)   │      ●        │     ●      │   §4
 ```
 
-### 2.1 Key abstractions (to be defined precisely per section)
+### 2.2 Key abstractions
 
 - **Pool**: a collection of one or more devices hosting a single Stratum instance.
 - **Volume**: a pool's top-level namespace.
-- **Subvolume / dataset**: a nested namespace with independent snapshots, properties, and optionally keys.
-- **Snapshot**: a frozen-in-time reference to a subvolume's tree root.
-- **Clone**: a writable subvolume sharing initial state with a snapshot.
-- **Extent**: a contiguous byte range of file data, either hot (paddr-addressed) or cold (content-hash-addressed).
-- **Chunk**: the content-defined unit in the cold tier, boundaries determined by FastCDC.
+- **Dataset** (aka subvolume): a nested namespace with independent snapshots, properties, and optionally keys.
+- **Snapshot**: a frozen-in-time reference to a dataset's tree root.
+- **Clone**: a writable dataset sharing initial state with a snapshot.
+- **Extent**: a contiguous byte range of file data — either *hot* (paddr-addressed, at a specific device location) or *cold* (content-hash-addressed, stored in the CAS tier).
+- **Chunk**: the content-defined unit in the cold tier. Boundaries determined by FastCDC.
+- **Transaction group (txg)**: a batch of writes committed atomically. Advances `write_gen`.
+
+Precise definitions and invariants go in their subsystem sections.
 
 TO FILL IN:
-- Precise definitions and invariants per abstraction.
 - Relationship diagram (what references what).
+- Formal invariants each abstraction maintains.
 
 ---
 
 ## 3. Concurrency model
 
-**STATUS**: STUB — the most consequential section. Draft first.
+**STATUS**: STUB — next writing session.
 
 ### 3.1 Goals
 
 - Lock-free reads under all conditions.
 - N concurrent writers parallelize up to the commit point; commit is serialized (End A).
-- Readers always see a consistent tree snapshot.
+- Readers always see a consistent tree snapshot via MVCC.
 - No reader-writer starvation.
 
-### 3.2 Decisions already committed (from VISION §5.2, NOVEL #4)
+### 3.2 Decisions already committed (VISION §5.2, NOVEL #4)
 
 - MVCC for readers.
-- Lock-free Bε-tree writers on the hot path (message buffer appends via CAS delta chains; Bw-tree-style pattern).
-- Single-writer transaction-group commit (End A of the concurrency-vs-security rift).
+- Lock-free Bε-tree writers on the hot path (Bw-tree-style delta chains via CAS).
+- Single-writer txg commit (End A of the concurrency-vs-security rift).
 - Epoch-based reclamation for old tree versions.
-- TLA+ spec (`docs/specs/concurrency.tla`) proves the invariants; see NOVEL #1.
+- TLA+ spec (`docs/specs/concurrency.tla`) proves the invariants (NOVEL #1).
 
 ### 3.3 Subsections to write
 
-- **3.3.1** MVCC readers — root pointer protocol, snapshot lifetime, reader-epoch machinery.
-- **3.3.2** Writer pipeline — submit, pre-commit validate, commit, publish. Where locks do and don't exist.
-- **3.3.3** Bw-tree-style delta chains — the delta record format, chain length policy, consolidation trigger.
+- **3.3.1** MVCC reader protocol — root pointer snapshotting, snapshot lifetime, reader-epoch machinery.
+- **3.3.2** Writer pipeline — submit, pre-commit, buffer append, commit accumulation.
+- **3.3.3** Bw-tree delta chains — record format, consolidation, split/merge under concurrency.
 - **3.3.4** Epoch-based reclamation — epoch lifecycle, retired-object list, safe memory reclamation.
-- **3.3.5** Commit path — transaction group boundaries, commit serialization, ordering with Merkle root update and SB quorum.
-- **3.3.6** Fallback — fine-grained per-node locks + MVCC readers if lock-free writers prove intractable.
-- **3.3.7** TLA+ spec summary — what invariants the spec proves, and what properties it doesn't (and why).
+- **3.3.5** Commit protocol — txg boundary triggers, commit coordinator election, ordering with SB quorum and Merkle root update.
+- **3.3.6** Fallback — fine-grained per-node rwlocks if full lock-free proves intractable.
+- **3.3.7** TLA+ spec summary — what invariants are proved; what's out of scope.
 
 ### 3.4 Open questions
 
-- Bw-tree vs B-link-tree as the specific structure. Bw-tree delta chains match our Bε-tree message-buffer model naturally; B-link-tree has simpler correctness proofs.
-- Reclamation: EBR (simplest), VBR (2022, better latency under high churn), hazard pointers (per-operation cost). Recommend EBR for v2.0.
-- Per-node ordering of delta records — FIFO vs LIFO vs timestamped. Affects consolidation complexity.
-- Whether we should mandate that writers declare their working set up front (enables MVCC conflict detection pre-commit, at cost of ergonomics).
+- Bw-tree vs B-link-tree. Bw-tree matches our message-buffer model; B-link-tree has simpler correctness proofs. Current lean: Bw-tree.
+- Reclamation scheme: EBR (simple), VBR (2022; better latency under churn), hazard pointers (per-op cost). Current lean: EBR.
+- Per-node delta order: FIFO vs LIFO vs timestamped. Affects consolidation correctness.
+- Whether writers pre-declare working set (enables MVCC conflict detection pre-commit; costs API ergonomics).
+- Reader snapshot duration: per-op (simple) vs explicit pin API (needed for scrub / send-recv).
 
 ---
 
@@ -135,10 +130,10 @@ TO FILL IN:
 
 - Multi-device pool with declared redundancy profile.
 - Online add / remove / replace devices.
-- Redundancy domains (for RAID, LRC, mirrors) expressed independently of physical topology.
+- Redundancy domains expressed independently of physical topology.
 - Graceful degradation under device failure.
 
-### 4.2 Decisions already committed (from COMPARISON §3.7)
+### 4.2 Decisions committed (COMPARISON §3.7)
 
 - RS + LRC erasure coding.
 - Mirror profile for small pools or hot metadata.
@@ -147,55 +142,54 @@ TO FILL IN:
 
 - **4.3.1** Pool composition — device roster, pool version, feature flags.
 - **4.3.2** Physical address space — `paddr = (device_id: u16, offset: u64)`. Nonce construction accommodates multi-device.
-- **4.3.3** Redundancy profile definition — RS(k, n), LRC(k, l, r), mirror(n). Per-pool default + per-dataset override.
-- **4.3.4** Stripe geometry — how blocks map to device stripes; interaction with block-device abstraction.
+- **4.3.3** Redundancy profile — RS(k, n), LRC(k, l, r), mirror(n). Per-pool default + per-dataset override.
+- **4.3.4** Stripe geometry — block-to-device-stripe mapping.
 - **4.3.5** Device lifecycle — add (rebalance), remove (evacuate), replace (rebuild), fail (degrade).
-- **4.3.6** Rebalance — when, how, by whom (user-triggered vs automatic).
-- **4.3.7** Mixed-class pools — SSD + HDD in one pool; per-extent placement via tier hints.
+- **4.3.6** Rebalance — triggers, progress reporting, IO throttling.
+- **4.3.7** Mixed-class pools — SSD + HDD co-existence; per-extent placement.
 - **4.3.8** Hot-spare policy.
 
 ### 4.4 Open questions
 
-- Device metadata location: per-device uberblock vs pool-wide SB. Probably both — each device has its own uberblock tree (ZFS pattern, needed for quorum; see §7), pool-wide SB is derived.
-- How strict is the "add device online" path? Requires rebalance; rebalance is expensive; worth it vs "offline add with downtime"?
-- Do we support heterogeneous-size devices? ZFS does (grudgingly); btrfs does (happily); both have problems at the edges.
+- Per-device uberblocks vs pool-wide SB. Probably both (per-device for quorum; pool-wide derived view).
+- Strictness of online-add: always requires rebalance (expensive) vs deferred rebalance mode.
+- Heterogeneous-size devices: supported (like btrfs) or not (more like ZFS before late-career relaxations).
 
 ---
 
-## 5. Namespace model (subvolumes, datasets, snapshots, clones)
+## 5. Superblock and quorum
 
 **STATUS**: STUB
 
 ### 5.1 Goals
 
-- Hierarchical subvolume / dataset structure (ZFS-style).
-- Per-dataset property inheritance.
-- Per-dataset encryption keys.
-- Snapshots and clones as first-class primitives.
-- Per-connection namespace composition (NOVEL #8).
+- Per-device uberblock chain (rotating ring, like ZFS).
+- Quorum across devices — majority of original roster must agree.
+- Crash-safe update via atomic uberblock pointer advance.
+- Merkle root of metadata in uberblock.
 
-### 5.2 Decisions already committed (from VISION §5.5, NOVEL #8)
+### 5.2 Decisions committed (VISION §5, NOVEL #1, NOVEL #5)
 
-- Per-connection 9P namespaces for client isolation.
-- Subvolumes have separate tree roots.
+- Merkle root in the superblock.
+- Three-phase sync protocol (refined for multi-device from v1).
+- SB format versioned, feature-flag-aware.
 
 ### 5.3 Subsections to write
 
-- **5.3.1** Dataset hierarchy — names, paths, the tree of datasets.
-- **5.3.2** Property inheritance — what's inherited, what's overridable, how overrides are recorded.
-- **5.3.3** Snapshot mechanics — how "freeze tree root" works, refcount bumps, visibility.
-- **5.3.4** Clone mechanics — writable snapshot, tree root diverges from parent.
-- **5.3.5** Send / recv — wire format, incremental send via tree diff.
-- **5.3.6** Per-connection namespace composition — 9P `Tbind` semantics, stack mounts.
-- **5.3.7** Per-dataset encryption — key hierarchy (§10), key inheritance, key rotation across datasets.
-- **5.3.8** Dataset properties — canonical list, defaults, validation.
+- **5.3.1** Uberblock format — rotating ring on each device, size, count.
+- **5.3.2** Quorum semantics — majority-of-roster counting; behavior under partial failure.
+- **5.3.3** Commit protocol — multi-device commit ordering, barrier sequencing.
+- **5.3.4** Torn-write handling — per-uberblock csum; recovery.
+- **5.3.5** Metadata root pointers — SB fields for main tree, allocator tree, snap tree, CAS tier index.
+- **5.3.6** Feature flags — RO-compat vs incompat flag categories (ext4 pattern).
+- **5.3.7** Version migration — forward-only reads, format-upgrade command.
+- **5.3.8** Emergency recovery — degraded-mode mount when quorum is impossible.
 
 ### 5.4 Open questions
 
-- How deep should the dataset tree be? ZFS allows arbitrary depth; btrfs has subvolumes (flat-ish). Arbitrary depth is more flexible; flat is simpler.
-- Can a dataset be "moved" in the hierarchy? (ZFS: yes via `zfs rename`.) At what cost?
-- What's the interaction between per-connection namespaces and dataset-level mount points? Does `Tbind` operate at the dataset level or below?
-- Snapshot deletion: immediate (block-level refcount drop) or lazy (mark-and-sweep)?
+- Merkle root in every uberblock vs only at sync boundaries.
+- Quorum counting: Raft-style "majority of original roster" vs "majority of currently-live members."
+- Device identity: persistent UUID.
 
 ---
 
@@ -205,13 +199,13 @@ TO FILL IN:
 
 ### 6.1 Goals
 
-- Tree-embedded (resolves the v1 Stage 3 side-channel concern).
-- Rollback-safe (COW of the allocator tree follows COW of the main tree).
+- Tree-embedded (resolves v1 Stage 3 side-channel concern).
+- Rollback-safe (allocator tree COWs with the main tree).
 - O(log n) allocation and free.
-- Succinct in-RAM state (NOVEL #6; 1 MiB per TiB target).
-- MVCC-compatible (readers see consistent allocator state per their snapshot).
+- Succinct in-RAM state (NOVEL #6; ≤1 MiB per TiB).
+- MVCC-compatible.
 
-### 6.2 Decisions already committed (from VISION §5.4, COMPARISON §3.11)
+### 6.2 Decisions committed (VISION §5.4, COMPARISON §3.11)
 
 - Tree-embedded, not side-channel.
 - Succinct data structures (wavelet tree / SDArray / xor filter) for in-RAM state.
@@ -220,204 +214,217 @@ TO FILL IN:
 ### 6.3 Subsections to write
 
 - **6.3.1** Allocator tree structure — per-device tree, keyed by extent start paddr.
-- **6.3.2** Refcount semantics — how refcounts track snapshot sharing.
-- **6.3.3** Allocation strategy — best-fit vs next-fit vs tiered; interaction with zoning.
+- **6.3.2** Refcount semantics — snapshot sharing, range refcounts.
+- **6.3.3** Allocation strategy — best-fit vs next-fit vs tiered; zoning interaction.
 - **6.3.4** Free and deferred-free — PENDING state through commit, then truly free.
-- **6.3.5** COW of the allocator itself — how allocator-tree nodes are allocated without recursion (the problem Phase D Stage 3 struggled with; the tree-embedded model solves it).
-- **6.3.6** Succinct representation — specific choice of wavelet tree / SDArray / EF encoding, performance characteristics.
-- **6.3.7** Cold tier allocation — CAS tier uses a different allocator (content-hash-indexed); see §6.4.
+- **6.3.5** COW of the allocator itself — bootstrap pool per device; no recursion.
+- **6.3.6** Succinct representation — specific encoding choice, performance characteristics.
 
-### 6.4 Cold tier allocator (CAS tier)
+### 6.4 Cold tier (CAS) allocator
 
 - **6.4.1** Content-hash index — BLAKE3-256 keyed hash → paddr + refcount.
-- **6.4.2** Chunk sizing — FastCDC parameters (min, max, average).
-- **6.4.3** GC — when and how CAS chunks get reclaimed.
+- **6.4.2** Chunk sizing — FastCDC parameters (min, avg, max).
+- **6.4.3** GC — when and how CAS chunks are reclaimed.
 
 ### 6.5 Open questions
 
-- Tree-embedded allocator: is the allocator tree a separate Bε-tree (own root in SB) or embedded in the main tree's keyspace? Former is cleaner; latter is more compact.
-- How do we handle allocator-tree COW's own allocations? The recursion ghost from v1 Phase D Stage 3. Resolve by having a small pool of pre-reserved "bootstrap" blocks per device, used only for allocator tree updates.
-- Fragmentation prevention. Over time, COW + free + alloc can fragment the address space. Defrag-as-you-go (bubble-sort-like) vs periodic offline compaction vs accept fragmentation.
+- Separate allocator tree (own root in SB) vs embedded in main tree's keyspace.
+- Fragmentation prevention strategy.
+- Bootstrap pool sizing per device.
 
 ---
 
-## 7. Superblock and quorum model
+## 7. Cryptography and integrity
 
 **STATUS**: STUB
+
+*(Merged from previous §9 Integrity + §10 Crypto — they're inseparable. AEAD tags are integrity on encrypted volumes; Merkle covers metadata; per-extent csum covers unencrypted data. Unified treatment.)*
 
 ### 7.1 Goals
-
-- Per-device uberblock chains (like ZFS).
-- Quorum across devices (majority of live devices must agree on current pool state).
-- Crash-safe update via atomic SB pointer advance.
-- Merkle root of metadata in SB.
-
-### 7.2 Decisions committed (from VISION §5, NOVEL #1, NOVEL #5)
-
-- Merkle root in the superblock.
-- Three-phase sync protocol (carried forward from v1; refined for multi-device).
-- SB format versioned, feature-flag-aware.
-
-### 7.3 Subsections to write
-
-- **7.3.1** Uberblock format — per device, rotating ring of uberblocks (ZFS-style).
-- **7.3.2** Quorum semantics — how many devices must agree for the pool to be mountable.
-- **7.3.3** Commit protocol — multi-device commit ordering; what "committed" means across devices.
-- **7.3.4** Torn write handling — uberblock csum, how we detect torn writes, recovery.
-- **7.3.5** Metadata root pointer — how the SB points at the main tree, allocator tree, snap tree, CAS tree.
-- **7.3.6** Feature flags — how new format features opt in without breaking old volumes.
-- **7.3.7** Version migration — forward-only (old code can't read new volumes) vs backward-compat paths.
-- **7.3.8** Emergency recovery — degraded-mode mount when quorum can't be achieved.
-
-### 7.4 Open questions
-
-- Should we embed the Merkle root in every uberblock or only at sync boundaries? Every uberblock is safer but costs hashing on every partial update.
-- Quorum counting: pool of 3 devices needs 2 for quorum; pool of 4 needs 3? Go with Raft-like "majority of the original roster" rather than "majority of live members."
-- Device identity: UUID per device? Persistent across re-mount, survives renaming.
-
----
-
-## 8. Block device abstraction
-
-**STATUS**: STUB
-
-### 8.1 Goals
-
-- io_uring-native on Linux.
-- Zero-copy where possible (fixed buffers, registered files).
-- Portable (FUSE on non-Linux, libaio fallback for old kernels).
-- DAX-compatible for persistent memory.
-
-### 8.2 Decisions committed (from NOVEL #7)
-
-- io_uring as the primary submission path.
-- Fixed buffers for zero-copy.
-- DAX path for pmem.
-
-### 8.3 Subsections to write
-
-- **8.3.1** Abstract interface — what every backend must implement.
-- **8.3.2** io_uring backend — submission queue management, completion loop, SQ polling mode, registered files + buffers.
-- **8.3.3** libaio backend (fallback for old Linux).
-- **8.3.4** FUSE backend (for non-Linux hosts, or when stratum is running as an unprivileged user daemon).
-- **8.3.5** DAX path — mmap-based, byte-addressable.
-- **8.3.6** Sync semantics — fsync, fdatasync, barriers. Per-device vs pool-wide.
-- **8.3.7** Retry / error handling — transient failures, permanent failures, device removal.
-
-### 8.4 Open questions
-
-- How aggressive about fixed buffers? Pinning a fixed buffer for each concurrent operation consumes pinned kernel memory; not free.
-- SQ polling mode: kernel thread vs CPU-polling user thread. Latency win, CPU cost.
-- How do we handle partial writes on devices that don't guarantee atomic sector writes? (All modern NVMe guarantees 4K atomicity; older hardware doesn't.)
-
----
-
-## 9. Integrity model
-
-**STATUS**: STUB
-
-### 9.1 Goals
-
-- Merkle-rooted metadata integrity (NOVEL #5).
-- Per-extent data integrity (xxHash3-64 on unencrypted, AEAD tag on encrypted).
-- Detection + repair from redundancy (§4).
-- Online scrub with progress / repair accounting.
-
-### 9.2 Decisions committed (from NOVEL #5)
-
-- BLAKE3-256 for Merkle hashes.
-- Root in SB.
-- Mount-time verify is opt-in; on-read verify is the default; scrub is continuous.
-
-### 9.3 Subsections to write
-
-- **9.3.1** Hash placement — each Bε-tree node carries its subtree hash.
-- **9.3.2** Hash update protocol — incremental hash update on node modification, propagation to root.
-- **9.3.3** Verify paths — mount-time full verify, on-read path verify, background scrub.
-- **9.3.4** Scrub scheduling — default cadence, priority / IO weight, progress reporting.
-- **9.3.5** Repair — when detection finds corruption, reconstruction from redundancy; repair logging.
-- **9.3.6** Unrecoverable corruption — what to do when no redundancy exists; wedge vs IO-error-and-continue.
-- **9.3.7** Per-data-extent integrity — xxHash3 on unencrypted extents, AEAD tag on encrypted.
-
-### 9.4 Open questions
-
-- Merkle over all metadata, or just "load-bearing" metadata (SB + tree roots)? Probably all, so every metadata block is covered.
-- How do we handle intentional changes to metadata (snapshot creation updates many things)? Update hashes in the same commit; the Merkle root advances with the commit.
-- Scrub priority: user-visible scrub (blocking) vs background scrub (low priority). Both modes.
-
----
-
-## 10. Crypto model
-
-**STATUS**: STUB
-
-### 10.1 Goals
 
 - PQ-hybrid wrap keys (NOVEL #2).
 - Nonce-misuse-resistant AEAD (NOVEL #2).
 - Per-dataset keys with inheritance.
 - Key agent separation (NOVEL #10).
+- Merkle-rooted metadata integrity (NOVEL #5).
+- Per-extent data integrity (xxHash3 on unencrypted, AEAD tag on encrypted).
+- Online scrub with repair.
 
-### 10.2 Decisions committed (from VISION §5.2, NOVEL #2, NOVEL #10)
+### 7.2 Decisions committed (VISION §5.2, NOVEL #2, NOVEL #5, NOVEL #10)
 
-- Data encryption: XChaCha20-SIV or AEGIS-256 (pick after benchmark).
-- Key wrap: X25519 + ML-KEM-768 hybrid.
-- Key agent is separate process.
+- Data: XChaCha20-SIV or AEGIS-256 (pick after benchmark).
+- Wrap: X25519 + ML-KEM-768 hybrid.
 - Nonce construction under End A (serialized txg commit).
+- Merkle via BLAKE3-256; root in SB.
+- Key agent is separate process.
 
-### 10.3 Subsections to write
+### 7.3 Subsections to write
 
-- **10.3.1** Key hierarchy — master wrap key → per-dataset wrap key → per-object data key.
-- **10.3.2** Nonce construction — `(pool_id, device_id, paddr, txg, seq)` or similar; proved unique in TLA+ spec.
-- **10.3.3** AEAD construction — specific SIV mode, test vectors, performance targets.
-- **10.3.4** Associated data — extends v1's `stm_ad_extent` / `stm_ad_node` to multi-device + dataset context.
-- **10.3.5** Key rotation — wrap key rotation without data re-encryption; data key rotation mechanics.
-- **10.3.6** Per-dataset encryption — how keys are inherited from parent dataset; how to detach.
-- **10.3.7** Key agent protocol — FS↔agent request/response, authentication, audit logging.
-- **10.3.8** Encrypted send/recv — raw send preserving encryption on target (ZFS-style).
+- **7.3.1** Key hierarchy — master wrap → per-dataset wrap → per-object data key.
+- **7.3.2** Nonce construction — `(pool_id, device_id, paddr, txg, seq)`; proved unique in TLA+.
+- **7.3.3** AEAD construction — specific SIV mode, test vectors, performance targets.
+- **7.3.4** Associated-data design — multi-device + dataset context; extends v1's `stm_ad_extent`.
+- **7.3.5** Key rotation — wrap-key rotation without data re-encrypt; data-key rotation.
+- **7.3.6** Per-dataset encryption inheritance — key-from-parent vs independent-key.
+- **7.3.7** Key agent protocol — FS↔agent request/response, audit logging.
+- **7.3.8** Encrypted send / recv — raw-send preserving encryption.
+- **7.3.9** Merkle hash placement — per-node subtree hash in Bε-tree node.
+- **7.3.10** Hash update protocol — incremental, propagates to root on commit.
+- **7.3.11** Verify paths — mount-time full verify (opt-in), on-read path verify (default), background scrub.
+- **7.3.12** Scrub — scheduling, IO weight, progress reporting.
+- **7.3.13** Repair — reconstruction from redundancy, repair logging.
+- **7.3.14** Unrecoverable corruption handling.
+- **7.3.15** Per-data-extent integrity — xxHash3 on unencrypted, AEAD tag on encrypted.
 
-### 10.4 Open questions
+### 7.4 Open questions
 
-- SIV mode final choice: XChaCha20-SIV (conservative, no hardware requirement) vs AEGIS-256 (faster with AES-NI, CAESAR winner, newer). Probably AEGIS-256 default on x86-64+AES-NI; XChaCha20-SIV fallback.
-- Nonce field layout: encoding `(pool, device, paddr, txg, seq)` into 24 bytes. Room for 128 bits of key-material identifier? Probably enough.
-- Per-dataset key derivation: HKDF from master + dataset-path, vs per-dataset key generation + master-wrap. Latter is more flexible for rotation.
-- Agent protocol: 9P over Unix socket (consistency) vs custom bespoke (simpler). Probably 9P — already have the machinery.
+- SIV final choice: XChaCha20-SIV (conservative, no HW req) vs AEGIS-256 (faster with AES-NI).
+- Per-dataset key derivation: HKDF from master + dataset-path vs separate generate + master-wrap.
+- Agent protocol: 9P over Unix socket vs bespoke RPC.
+- Merkle over all metadata vs only SB-adjacent (root + tree roots).
+- Scrub priority model.
 
 ---
 
-## 11. On-disk format
+## 8. Namespace model (subvolumes, datasets, snapshots, clones)
+
+**STATUS**: STUB
+
+### 8.1 Goals
+
+- Hierarchical dataset structure.
+- Per-dataset property inheritance.
+- Per-dataset encryption keys.
+- Snapshots and clones as first-class primitives.
+- Per-connection namespace composition (NOVEL #8).
+
+### 8.2 Decisions committed (VISION §5.5, NOVEL #8)
+
+- Per-connection 9P namespaces for client isolation.
+- Datasets have separate tree roots.
+
+### 8.3 Subsections to write
+
+- **8.3.1** Dataset hierarchy — paths, tree of datasets, depth policy.
+- **8.3.2** Property inheritance — what's inherited, overridable, how recorded.
+- **8.3.3** Snapshot mechanics — freeze tree root, refcount bumps, visibility.
+- **8.3.4** Clone mechanics — writable snapshot, diverging tree root.
+- **8.3.5** Send / recv — wire format, incremental via tree diff.
+- **8.3.6** Per-connection namespace composition — `Tbind`, union mounts.
+- **8.3.7** Dataset properties — canonical list, defaults, validation.
+- **8.3.8** Dataset rename / move.
+
+### 8.4 Open questions
+
+- Arbitrary-depth dataset tree vs fixed depth.
+- Snapshot deletion: immediate refcount drop vs mark-and-sweep.
+- Cross-dataset hard links: allowed (rare use case, complicated) or disallowed.
+
+---
+
+## 9. Block device abstraction
+
+**STATUS**: STUB
+
+### 9.1 Goals
+
+- io_uring-native on Linux.
+- Zero-copy via fixed buffers and registered files.
+- DAX-compatible for persistent memory.
+- Portable fallback (libaio on older Linux; FUSE path on non-Linux).
+
+### 9.2 Decisions committed (NOVEL #7)
+
+- io_uring as primary submission path.
+- Fixed buffers for zero-copy.
+- DAX path for pmem.
+
+### 9.3 Subsections to write
+
+- **9.3.1** Abstract interface — what every backend implements.
+- **9.3.2** io_uring backend — SQ/CQ management, SQ polling, registered files + buffers.
+- **9.3.3** libaio backend (fallback).
+- **9.3.4** FUSE backend (for non-Linux hosts).
+- **9.3.5** DAX path — mmap-based, byte-addressable.
+- **9.3.6** Sync semantics — fsync, fdatasync, barriers.
+- **9.3.7** Error handling — transient, permanent, device removal.
+
+### 9.4 Open questions
+
+- Fixed-buffer aggressiveness (pinned-memory cost).
+- SQ polling mode (kernel thread vs user thread).
+- Atomicity assumptions for old hardware.
+
+---
+
+## 10. Client interfaces
+
+**STATUS**: STUB
+
+*(New section — captures how applications and OSes reach the filesystem. Separate from §9 block device layer (which is stratum's backing storage) and from §8 9P server (covered in namespace section as the protocol endpoint).)*
+
+### 10.1 Goals
+
+- Support multiple client paths: FUSE, in-kernel Linux module (post-v2.0), CLI, library bindings.
+- 9P is the universal transport; clients are 9P consumers.
+- Authentication + authorization at the 9P boundary, not per-client.
+
+### 10.2 Decisions committed (VISION §5.5, COMPARISON §1)
+
+- 9P-first architectural stance.
+- FUSE shim is a client of 9P, not the native interface.
+- In-kernel Linux driver is post-v2.0.
+
+### 10.3 Subsections to write
+
+- **10.3.1** FUSE shim — how it translates kernel VFS ops to 9P messages.
+- **10.3.2** CLI tool — thin wrapper over `/ctl/` synthetic filesystem.
+- **10.3.3** 9P client library — stable C API for applications that want direct 9P.
+- **10.3.4** Language bindings — Rust, Go, Python. Thin wrappers over the C API.
+- **10.3.5** In-kernel Linux driver (post-v2.0) — design sketch only.
+- **10.3.6** Windows driver (post-v2.0, optional) — design sketch only.
+- **10.3.7** Authentication at mount — how clients authenticate to 9P server.
+
+### 10.4 Open questions
+
+- Should the FUSE shim run as a separate process or linked into stratum?
+- Language bindings ownership — upstream or community-maintained?
+- Kernel-module timeline.
+
+---
+
+## 11. POSIX surface
 
 **STATUS**: STUB
 
 ### 11.1 Goals
 
-- Self-describing (new code can parse old volumes; feature flags announce compat level).
-- Versioned (SB version + feature flags).
-- Extensible (padding fields, flag reservations).
-- Stable at v2.0 release (backward-compat for 10+ years).
+- Modern POSIX — everything in the ext4/XFS surface still relevant.
+- Skip legacy quirks (noatime, no mandatory locking, etc.).
 
-### 11.2 Decisions committed (from VISION §4.11)
+### 11.2 Decisions committed (VISION §6 non-goals)
 
-- Pre-v2.0 (i.e., Phase 0 work) is throwaway.
-- v2.0 freezes format; future changes via feature flags.
+- O_TMPFILE, F_SEAL_*, relatime, pipes-as-files: yes.
+- Mandatory locking, atime: no.
+- Obscure BSD extensions: no.
 
 ### 11.3 Subsections to write
 
-- **11.3.1** Version / feature-flag scheme.
-- **11.3.2** SB layout — all fields, byte layout, alignment.
-- **11.3.3** Bε-tree node format — header, key/value encoding, Merkle hash field, delta chain representation.
-- **11.3.4** Extent record format — hot and cold variants, AEAD tag placement.
-- **11.3.5** Allocator tree node format.
-- **11.3.6** Snap tree node format (snapshot descriptors, refcount).
-- **11.3.7** CAS entry format — content hash, refcount, compression/encryption state.
-- **11.3.8** Key material format — wrapped keys in SB, per-dataset key slots.
-- **11.3.9** Log formats (if any) — space-log style audit logs.
+- **11.3.1** Inode format — fields, timestamps, xattr, embedded-small-file (if any).
+- **11.3.2** Directory format — hash-table / B-tree hybrid.
+- **11.3.3** Extended attributes — tree location, size limits.
+- **11.3.4** File data — extent tree, inline data for tiny files.
+- **11.3.5** Locking — advisory (flock, fcntl); no mandatory.
+- **11.3.6** ACLs — POSIX ACLs as xattr.
+- **11.3.7** Timestamps — ns resolution; btime, mtime, atime (relatime), ctime.
+- **11.3.8** Special files — FIFO, socket, device, symlink.
+- **11.3.9** Reflinks (copy_file_range).
+- **11.3.10** Hard links (same-dataset only).
 
 ### 11.4 Open questions
 
-- Endianness policy: little-endian on disk always (already v1 convention); keep it.
-- Variable-length fields: bzip2-style self-describing vs fixed-size with padding. V1 used fixed-size; continue.
-- How do we express "this volume requires feature X, refuse to mount without it"? RO-compatible vs RW-incompatible feature flags (ext4 pattern).
+- Inline small-file data in inode (ext4 `inline_data`): yes or no.
+- Max filename length, max path depth.
 
 ---
 
@@ -428,55 +435,48 @@ TO FILL IN:
 ### 12.1 Goals
 
 - Document the happy path and recovery path for every operation.
-- Make the invariants explicit — what's true at every step.
+- Make the invariants explicit — what holds at every step.
 
 ### 12.2 Subsections to write
 
 - **12.2.1** Read path — lookup, integrity verify, decrypt, decompress, return.
-- **12.2.2** Write path — allocate, compress, encrypt, hash-propagate, insert, commit.
-- **12.2.3** Sync path — three-phase commit detail.
-- **12.2.4** Rollback path — how a snapshot rollback reconstructs allocator state.
+- **12.2.2** Write path — allocate, compress, encrypt, hash-propagate, insert, accumulate-commit.
+- **12.2.3** Sync path — three-phase commit (multi-device).
+- **12.2.4** Rollback path — reconstruction of allocator state; Merkle reverify.
 - **12.2.5** Scrub path — walk, verify, repair.
-- **12.2.6** Mount path — SB selection, quorum, verify (opt-in), open trees, attach.
+- **12.2.6** Mount path — SB selection, quorum check, verify (opt-in), open trees, attach.
 - **12.2.7** Unmount path — flush, sync, detach, safe-close.
-- **12.2.8** Error recovery — transient IO error, permanent IO error, corruption detection.
-- **12.2.9** Crash recovery — what state is possible at mount after crash; how we resolve.
+- **12.2.8** Migration path (hot ↔ cold tier).
+- **12.2.9** Error recovery — transient, permanent, corruption.
+- **12.2.10** Crash recovery — possible post-crash states; resolution protocol.
 
 ---
 
-## 13. Filesystem surface (POSIX)
+## 13. Format versioning policy
 
 **STATUS**: STUB
 
+*(Shortened from the original §11 "On-disk format." Each subsystem documents its own format in its section; this section is just the cross-cutting versioning policy.)*
+
 ### 13.1 Goals
 
-- Modern POSIX — everything in the ext4/XFS surface that's still relevant.
-- Skip legacy quirks (noatime default, no mandatory locking, etc.).
+- v2.0 format is stable; future changes via feature flags.
+- Self-describing (new code can parse old volumes).
+- Forward readability (old code refuses new-feature volumes cleanly, not by crashing).
 
-### 13.2 Decisions committed (from VISION §6 non-goals)
+### 13.2 Decisions committed (VISION §4.11)
 
-- O_TMPFILE, F_SEAL_*, relatime, pipes-as-files: yes.
-- Mandatory locking, atime: no.
-- Obscure BSD extensions: no.
+- Pre-v2.0 (Phase 0 implementation work) is throwaway.
+- v2.0 freezes the format; changes via feature flags.
 
 ### 13.3 Subsections to write
 
-- **13.3.1** Inode format — fields, timestamps, extended attributes, embedded-small-file optimization (if any).
-- **13.3.2** Directory format — hash table + sorted list hybrid? B-tree? Evaluate.
-- **13.3.3** Extended attributes — tree location, size limits.
-- **13.3.4** File data — extent tree, inline data for small files.
-- **13.3.5** Locking — advisory-only (flock/fcntl); no mandatory.
-- **13.3.6** ACLs — POSIX ACLs as xattr, standard encoding.
-- **13.3.7** Timestamps — nanosecond resolution, btime (creation time), mtime, atime (relatime), ctime.
-- **13.3.8** Special files — FIFO, socket, device-node, symlink.
-- **13.3.9** Reflinks (copy_file_range O(1)).
-- **13.3.10** Hard links (cross-dataset? same-dataset only?).
-
-### 13.4 Open questions
-
-- Inline small-file data in the inode (ext4 `inline_data`) — yes or no? ZFS doesn't; btrfs does. Worth it for many-small-files workloads.
-- Directory structure — btrfs uses a B-tree indexed by filename hash; that's probably what we do too, consistent with our Bε-tree.
-- Max filename length, max path depth — go beyond 255 / 4096 for future-proofing?
+- **13.3.1** Feature flag taxonomy — incompat, RO-compat, compat (ext4 pattern).
+- **13.3.2** SB version field vs feature flags — when each is bumped.
+- **13.3.3** Migration paths — no in-place migration from v1; v2→v2.x via feature flag stabilization.
+- **13.3.4** Endian policy — little-endian on disk, always.
+- **13.3.5** Alignment rules — natural alignment; no unnecessary padding.
+- **13.3.6** Stable-over-10-years commitment and what that means concretely.
 
 ---
 
@@ -488,20 +488,20 @@ TO FILL IN:
 
 - Every subsystem exposes counters, events, histograms via `/ctl/`.
 - Structured event log for forensic review.
-- Debug dumps (tree walks, extent maps, integrity reports) accessible via `/ctl/`.
+- Debug dumps (tree walks, extent maps, integrity reports).
 
-### 14.2 Decisions committed (from NOVEL #9)
+### 14.2 Decisions committed (NOVEL #9)
 
 - `/ctl/` synthetic filesystem.
 - Administration via cat/echo.
 
 ### 14.3 Subsections to write
 
-- **14.3.1** Counter schema — namespaces, naming, units.
-- **14.3.2** Event log — format, retention, scope (per-pool, per-dataset).
-- **14.3.3** Tracing — per-request sampling, correlation IDs across layers.
+- **14.3.1** Counter schema — naming, units, per-pool / per-dataset scoping.
+- **14.3.2** Event log — format, retention, rotation.
+- **14.3.3** Tracing — per-request sampling, correlation IDs.
 - **14.3.4** Debug dumps — tree walk, extent map, allocator state, integrity verify.
-- **14.3.5** Integration with Prometheus / OpenTelemetry — optional, via a sidecar scraper reading `/ctl/`.
+- **14.3.5** Metrics integration — Prometheus / OpenTelemetry via sidecar scrapers reading `/ctl/`.
 
 ---
 
@@ -511,27 +511,27 @@ TO FILL IN:
 
 ### 15.1 Feature-flag lifecycle
 
-How features are introduced, stabilized, deprecated.
+Introduction → stabilization → deprecation.
 
 ### 15.2 Error model
 
-How errors propagate across layers; what the user sees.
+Error propagation across layers; user-visible errors.
 
 ### 15.3 Resource limits
 
-Memory budgets, IO concurrency caps, CPU limits.
+Memory budgets, IO concurrency caps, CPU budgets.
 
 ### 15.4 Cancellation and timeouts
 
-Long-running operations (scrub, rebalance) support progress reporting and cancellation.
+Long-running ops (scrub, rebalance, migration) support progress reporting and cancellation.
 
 ### 15.5 Backward compatibility
 
-What old data a new binary can still read. Per-feature opt-in.
+What old data a new binary can read. Per-feature opt-in.
 
 ### 15.6 Thread / task model
 
-Threads the stratum process creates; what they do; how they coordinate.
+Threads stratum creates; their roles; coordination.
 
 ---
 
@@ -539,7 +539,7 @@ Threads the stratum process creates; what they do; how they coordinate.
 
 ### 16.1 Glossary
 
-(Will grow as sections get filled in.)
+(Grows as sections get filled in.)
 
 ### 16.2 Reference algorithms
 
@@ -548,9 +548,11 @@ Threads the stratum process creates; what they do; how they coordinate.
 - XChaCha20-SIV / AEGIS-256 construction.
 - ML-KEM-768 hybrid key agreement (HPKE pattern).
 - Epoch-based reclamation protocol.
-- Bw-tree delta chain consolidation.
+- Bw-tree delta-chain consolidation.
+- Reed-Solomon encode/decode (over GF(2⁸)).
+- Locally Repairable Codes layout.
 
-### 16.3 Known bibliography
+### 16.3 Bibliography
 
 - Bε-tree: Brodal et al. 2003; Bender et al. 2007.
 - Bw-tree: Levandoski et al. 2013.
@@ -558,53 +560,55 @@ Threads the stratum process creates; what they do; how they coordinate.
 - Venti: Quinlan & Dorward 2002.
 - BLAKE3: O'Connor et al. 2020.
 - ML-KEM: NIST FIPS 203, 2024.
-- AEGIS-256: Wu & Preneel, CAESAR 2013-2019.
+- AEGIS-256: Wu & Preneel, CAESAR 2013–2019.
 - XChaCha20-SIV: Harris et al. 2019.
 - LRC: Papailiopoulos & Dimakis 2012; Sathiamoorthy et al. 2013.
 - TLA+: Lamport 2002+; 25 years of storage-industry use.
+- RCU / EBR / VBR: McKenney 2001+; Kirsch 2022.
+- Wavelet trees / SDArray: Jacobson 1989; Munro & Raman 1997; Okanohara & Sadakane 2007.
+- W-TinyLFU: Mazi et al. 2015.
+- xor filters: Graf & Lemire 2020.
 
 ---
 
-## 17. Section writing order (proposal)
+## 17. Section writing order
 
-Not every section needs the same depth. Proposed writing order for Phase 0 sessions, reflecting foundational-ness:
+Not every section needs equal depth. Writing order for Phase 0 sessions, reflecting foundational-ness and dependencies:
 
-1. **§3 Concurrency** (largest blast radius; must be right first).
-2. **§4 Storage pool** (shapes every layer below).
-3. **§7 Superblock / quorum** (depends on §4; precondition for sync).
-4. **§6 Allocator** (depends on §3, §4, §7).
-5. **§10 Crypto** (depends on §7 for SB key-slot layout).
-6. **§9 Integrity** (depends on §3 for hash update protocol).
-7. **§8 Block device** (relatively standalone).
-8. **§5 Namespace** (depends on §4, §6, §7, §10).
-9. **§11 On-disk format** (derived from 3–10; committed last).
-10. **§12 I/O paths** (integration document; tie it all together).
-11. **§13 POSIX surface** (relatively standalone).
-12. **§14, §15** (operational polish).
+1. **§3 Concurrency** — largest blast radius; must be right first. (This session.)
+2. **§4 Storage pool** — shapes every layer below.
+3. **§5 Superblock / quorum** — depends on §4; precondition for sync machinery.
+4. **§6 Allocator** — depends on §3, §4, §5.
+5. **§7 Cryptography + integrity** — depends on §5 for key-slot layout in SB; depends on §3 for hash update protocol.
+6. **§8 Namespace** — depends on §4, §5, §6, §7.
+7. **§9 Block device** — relatively standalone.
+8. **§10 Client interfaces** — depends on §8 for 9P surface.
+9. **§11 POSIX surface** — relatively standalone.
+10. **§12 I/O paths** — integration document, written last.
+11. **§13 Format versioning** — derived from 3–10; committed last.
+12. **§§14–15 operational polish** — continuous, mostly filled in once others are settled.
 
-Each of §3–§6 is its own dedicated Phase 0 session at minimum. §10, §9, §5, §11, §12 can be paired with adjacent sections.
+Each of §3–§5 and §7 is probably its own Phase 0 session. §6, §8, §9–§11 can be paired with adjacent sections. §12 and §13 are integration passes.
 
 ---
 
 ## 18. Status summary
 
-| Section | Status | Writing priority |
+| Section | Status | Priority |
 |---|---|---|
 | §1 Purpose | DRAFT | n/a |
-| §2 Layer cake | STUB | 1 (small) |
-| §3 Concurrency | STUB | 2 (large) |
-| §4 Storage pool | STUB | 2 (large) |
-| §5 Namespace | STUB | 4 |
-| §6 Allocator | STUB | 3 |
-| §7 SB / quorum | STUB | 3 |
-| §8 Block device | STUB | 5 |
-| §9 Integrity | STUB | 4 |
-| §10 Crypto | STUB | 4 |
-| §11 On-disk format | STUB | 6 (late) |
-| §12 I/O paths | STUB | 6 (late) |
-| §13 POSIX surface | STUB | 5 |
-| §14 Observability | STUB | 7 |
-| §15 Cross-cutting | STUB | 7 |
+| §2 Layer cake | STUB | 11 (thin pass once rest is settled) |
+| §3 Concurrency | **next** | 1 |
+| §4 Storage pool | STUB | 2 |
+| §5 Superblock / quorum | STUB | 3 |
+| §6 Allocator | STUB | 4 |
+| §7 Cryptography + integrity | STUB | 5 |
+| §8 Namespace | STUB | 6 |
+| §9 Block device | STUB | 7 |
+| §10 Client interfaces | STUB | 8 |
+| §11 POSIX surface | STUB | 9 |
+| §12 I/O paths | STUB | 10 (integration) |
+| §13 Format versioning | STUB | 11 |
+| §14 Observability | STUB | 12 |
+| §15 Cross-cutting | STUB | 12 |
 | §16 Appendices | STUB | continuous |
-
-Ten sections in STUB state, ready to be filled in. §3 (Concurrency) is the natural next candidate.
