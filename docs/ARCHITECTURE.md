@@ -12,7 +12,7 @@
 
 ## 1. Purpose and how to read this document
 
-**STATUS**: DRAFT
+**STATUS**: COMMITTED
 
 Source-of-truth design document for Stratum v2. Translates the properties in `VISION.md` and the novel-lead scopes in `NOVEL.md` into concrete architectural decisions. Every later implementation document references this file.
 
@@ -85,7 +85,7 @@ TO FILL IN:
 
 ## 3. Concurrency model
 
-**STATUS**: DRAFT
+**STATUS**: COMMITTED
 
 ### 3.1 Goals and non-goals
 
@@ -521,7 +521,7 @@ Status: DRAFT → awaiting review, push-back, and then COMMITTED.
 
 ## 4. Storage pool model
 
-**STATUS**: DRAFT
+**STATUS**: COMMITTED
 
 ### 4.1 Goals and non-goals
 
@@ -838,7 +838,7 @@ Status: DRAFT → awaiting review, push-back, then COMMITTED.
 
 ## 5. Superblock and quorum
 
-**STATUS**: DRAFT
+**STATUS**: COMMITTED
 
 ### 5.1 Goals and non-goals
 
@@ -1262,7 +1262,7 @@ Status: DRAFT → awaiting review, push-back, then COMMITTED.
 
 ## 6. Allocator model
 
-**STATUS**: DRAFT
+**STATUS**: COMMITTED
 
 ### 6.1 Goals and non-goals
 
@@ -1652,7 +1652,7 @@ Status: DRAFT → awaiting review, push-back, then COMMITTED.
 
 ## 7. Cryptography and integrity
 
-**STATUS**: DRAFT
+**STATUS**: COMMITTED
 
 *(Merged from earlier-draft §9 Integrity + §10 Crypto — they're inseparable. AEAD tags are integrity on encrypted volumes; Merkle covers metadata; per-extent csum covers unencrypted data. Unified treatment here.)*
 
@@ -2286,7 +2286,7 @@ Status: DRAFT → awaiting review, push-back, then COMMITTED.
 
 ## 8. Namespace model (subvolumes, datasets, snapshots, clones)
 
-**STATUS**: DRAFT
+**STATUS**: COMMITTED
 
 ### 8.1 Goals and non-goals
 
@@ -2744,7 +2744,7 @@ Status: DRAFT → awaiting review, push-back, then COMMITTED.
 
 ## 9. Block device abstraction
 
-**STATUS**: DRAFT
+**STATUS**: COMMITTED
 
 ### 9.1 Goals and non-goals
 
@@ -3176,7 +3176,7 @@ Status: DRAFT → awaiting review, push-back, then COMMITTED.
 
 ## 10. Client interfaces
 
-**STATUS**: DRAFT
+**STATUS**: COMMITTED
 
 *(Captures how applications and OSes reach the filesystem. Separate from §9 block device layer (stratum's backing storage) and from §8 9P server (the namespace / protocol endpoint).)*
 
@@ -3585,7 +3585,7 @@ Status: DRAFT → awaiting review, push-back, then COMMITTED.
 
 ## 11. POSIX surface
 
-**STATUS**: DRAFT
+**STATUS**: COMMITTED
 
 *(This section specifies WHAT POSIX semantics Stratum exposes. The HOW is distributed across §§3–9 — concurrency, tree, allocator, crypto, block device.)*
 
@@ -4081,7 +4081,7 @@ Status: DRAFT → awaiting review, push-back, then COMMITTED.
 
 ## 12. I/O paths
 
-**STATUS**: DRAFT
+**STATUS**: COMMITTED
 
 *(Integration document. No new design decisions — narrates how the subsystems in §§3-11 compose for each operation. Refers heavily to earlier sections.)*
 
@@ -5019,19 +5019,19 @@ Each of §3–§5 and §7 is probably its own Phase 0 session. §6, §8, §9–�
 
 | Section | Status | Priority |
 |---|---|---|
-| §1 Purpose | DRAFT | n/a |
+| §1 Purpose | COMMITTED | n/a |
 | §2 Layer cake | STUB | 11 (thin pass once rest is settled) |
-| §3 Concurrency | DRAFT | 1 |
-| §4 Storage pool | DRAFT | 2 |
-| §5 Superblock / quorum | DRAFT | 3 |
-| §6 Allocator | DRAFT | 4 |
-| §7 Cryptography + integrity | DRAFT | 5 |
-| §8 Namespace | DRAFT | 6 |
-| §9 Block device | DRAFT | 7 |
-| §10 Client interfaces | DRAFT | 8 |
-| §11 POSIX surface | DRAFT | 9 |
-| §12 I/O paths | **DRAFT** (this session) | 10 (integration) |
-| §13 Format versioning | STUB | 11 |
+| §3 Concurrency | COMMITTED | 1 |
+| §4 Storage pool | COMMITTED | 2 |
+| §5 Superblock / quorum | COMMITTED | 3 |
+| §6 Allocator | COMMITTED | 4 |
+| §7 Cryptography + integrity | COMMITTED | 5 |
+| §8 Namespace | COMMITTED | 6 |
+| §9 Block device | COMMITTED | 7 |
+| §10 Client interfaces | COMMITTED | 8 |
+| §11 POSIX surface | COMMITTED | 9 |
+| §12 I/O paths | COMMITTED | 10 (integration) |
+| §13 Format versioning | **next** | 11 |
 | §14 Observability | STUB | 12 |
 | §15 Cross-cutting | STUB | 12 |
 | §16 Appendices | STUB | continuous |
