@@ -760,6 +760,7 @@ cd tui && cargo build --release
 
 - **11 C test suites** in `tests/`, covering types, keys, blocks, nodes, btree, fs (including 10-cycle copy-delete stress tests both plain and encrypted), compression, crypto, snapshots, 9P, allocator.
 - **Rust integration tests** in `tui/tests/integration.rs`: 10 scenarios via CLI (small/large files, overwrite, sparse, binary integrity, autogrow, 200 small files, performance scaling).
+- **Crash-injection fuzzer** in `tui/tests/fuzz.rs` (SOTA #4): seeded-random operation sequences against a live `stratum serve`, SIGKILL at random mid-sequence points, remount + `check` + `scrub` + model verification per iteration. Default `cargo test` budget runs 3 iterations × 20 ops (~350 ms); stress campaigns via `FUZZ_ITERS=1000 FUZZ_OPS=60 cargo test --test fuzz --release` cover 60 000 ops + 1 000 crash boundaries in ~3 minutes. Every audit-derived invariant (nonce uniqueness, two-phase sync, wedged/RO containment, counter clamps) is re-validated in every iteration.
 
 ---
 
