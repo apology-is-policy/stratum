@@ -50,17 +50,22 @@ target_compile_options(stm_warnings INTERFACE
     -fno-common
     -fstack-protector-strong)
 
-# Feature-test macros for POSIX APIs under -std=c17.
+# Feature-test macros for POSIX + GNU APIs under -std=c17.
 #
 # Linux + glibc hides pread/pwrite, posix_memalign, fdatasync, ftruncate,
 # S_IFMT/S_IFBLK/S_IFREG, ioctl, BLKDISCARD, fallocate, etc. behind feature-
-# test macros when compiled with -std=c17. _DEFAULT_SOURCE re-exposes both
-# POSIX ≤ 2008 and the common GNU extensions.
+# test macros when -std=c17 is in effect (which sets __STRICT_ANSI__ and
+# disables _DEFAULT_SOURCE-by-default). We need all of POSIX 2008 +
+# XOpen 7 + GNU extensions.
 #
-# macOS exposes most of these by default; adding _POSIX_C_SOURCE there would
-# HIDE macOS-specific symbols (F_FULLFSYNC, _SC_NPROCESSORS_ONLN). So we gate.
+# macOS exposes most of these by default; setting _POSIX_C_SOURCE there
+# would HIDE macOS-specific symbols (F_FULLFSYNC, _SC_NPROCESSORS_ONLN). So
+# we gate per-platform.
 if(STM_PLATFORM_LINUX)
     target_compile_definitions(stm_warnings INTERFACE
+        _POSIX_C_SOURCE=200809L
+        _XOPEN_SOURCE=700
+        _GNU_SOURCE
         _DEFAULT_SOURCE)
 endif()
 
