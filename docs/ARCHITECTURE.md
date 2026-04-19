@@ -4081,25 +4081,797 @@ Status: DRAFT → awaiting review, push-back, then COMMITTED.
 
 ## 12. I/O paths
 
-**STATUS**: STUB
+**STATUS**: DRAFT
+
+*(Integration document. No new design decisions — narrates how the subsystems in §§3-11 compose for each operation. Refers heavily to earlier sections.)*
 
 ### 12.1 Goals
 
-- Document the happy path and recovery path for every operation.
-- Make the invariants explicit — what holds at every step.
+- Enumerate every significant I/O path from client request to durable completion.
+- Make the **invariants** at each step explicit — what holds before, during, after.
+- Cover happy path + partial failures + full crashes.
+- Serve as the reference for implementers: "which subsystem is responsible for what at which point."
 
-### 12.2 Subsections to write
+### 12.2 Notation
 
-- **12.2.1** Read path — lookup, integrity verify, decrypt, decompress, return.
-- **12.2.2** Write path — allocate, compress, encrypt, hash-propagate, insert, accumulate-commit.
-- **12.2.3** Sync path — three-phase commit (multi-device).
-- **12.2.4** Rollback path — reconstruction of allocator state; Merkle reverify.
-- **12.2.5** Scrub path — walk, verify, repair.
-- **12.2.6** Mount path — SB selection, quorum check, verify (opt-in), open trees, attach.
-- **12.2.7** Unmount path — flush, sync, detach, safe-close.
-- **12.2.8** Migration path (hot ↔ cold tier).
-- **12.2.9** Error recovery — transient, permanent, corruption.
-- **12.2.10** Crash recovery — possible post-crash states; resolution protocol.
+Throughout this section:
+
+- Operations in `monospace` refer to specific functions or 9P ops.
+- `→` = "causes" or "invokes."
+- `‖` = "in parallel with."
+- Invariants at step boundaries shown as `⊢ <condition>`.
+- References to prior sections: `[§3.7.3]` etc.
+
+---
+
+### 12.3 Read path
+
+**Trigger**: client issues a read op (9P `Tread` or equivalent via FUSE).
+
+#### 12.3.1 Happy path
+
+```
+1. 9P Tread received → fs/read.c dispatches to read handler.
+   ⊢ Connection authenticated [§10.10]
+   ⊢ Connection has valid namespace, fid resolves to an inode.
+
+2. Acquire reader snapshot of tree root:
+     epoch = epoch_enter()                             [§3.6]
+     root = atomic_load(&fs->current_root)
+   ⊢ Reader sees a consistent tree snapshot.
+
+3. Walk main tree for (dataset_id, ino, STM_KEY_DATA, offset):
+     extent = tree_lookup(root, key)
+   For each metadata node visited:
+     verify_merkle_path(node)                          [§7.13.2]
+   ⊢ Metadata integrity verified to root.
+
+4. For each covering extent:
+     read_from_disk(extent.paddr, extent.clen)          [§9 block layer]
+     verify_integrity(bytes, extent):
+       if encrypted: aead_decrypt(bytes, key, nonce=(paddr,txg,seq), ad)  [§7.5]
+       else:         check xxhash3(bytes) == extent.xxh                    [§7.17]
+     if compressed: decompress(bytes) → plaintext
+
+   ⊢ Returned data is authentic (either AEAD-verified or csum-verified).
+
+5. Copy plaintext to caller's buffer.
+6. epoch_exit(epoch)
+7. Reply 9P Rread.
+```
+
+#### 12.3.2 Performance
+
+- Tree traversal: O(log n) metadata nodes, each a cache hit in the common case (W-TinyLFU cache §6.6.4).
+- Disk read: one async submission via io_uring [§9.4.3].
+- Decrypt: AEGIS-256 at ~6 GB/s/core or XChaCha20-SIV at ~1 GB/s/core [§7.5].
+- Decompression (if enabled): LZ4 ~5 GB/s/core; ZSTD ~1 GB/s/core.
+
+Target p99.9: 500 µs on cache miss (§4.14 VISION budget).
+
+#### 12.3.3 Partial failures
+
+- **Metadata csum / Merkle mismatch**: report to error log, attempt repair from redundancy [§7.15]. Retry read. If unrepairable → return `-EIO`.
+- **Decrypt tag mismatch**: same as csum failure. AEAD guarantees plaintext is never returned if tag fails.
+- **Block device transient error**: retry up to 5 times with backoff [§9.11.2]. Escalate to permanent → redundancy repair.
+- **Device gone**: fail with `-EIO` unless another device has the data [§9.11.4]. Redundancy profile determines outcome.
+- **Reader epoch held too long** (> 30 s): forcibly released [§3.6.5]; reader's next op fails, must retry.
+
+#### 12.3.4 Sparse file reads (holes)
+
+Tree lookup returns `-ENOENT` for offsets in a hole. Read handler:
+- Fills caller's buffer with zeros.
+- Does not allocate or write anything.
+- No integrity check (no data to verify).
+
+---
+
+### 12.4 Write path
+
+**Trigger**: client issues a write op (`Twrite`).
+
+#### 12.4.1 Happy path (buffered, pre-commit)
+
+```
+1. 9P Twrite received → fs/write.c dispatches.
+   ⊢ Connection authenticated, dataset is not readonly.
+
+2. epoch = epoch_enter()  [§3.6]
+
+3. Check permissions: file perms, ACLs, per-dataset quota.
+
+4. For each block to write:
+   a. If dataset uses CoW (always, in Stratum) and current file
+      has existing extent at this offset:
+         plan read-modify-write for partial-block boundaries.
+   b. Prepare new extent:
+         - Compress (optional, per dataset.compression):      [§11.6.1]
+             compressed, clen = compress(plaintext, dlen)
+         - If encrypted:
+             tag, ciphertext = aead_seal(dataset_key,
+                                          nonce=(paddr,txg,seq),
+                                          ad=stm_ad_extent(...),
+                                          compressed)          [§7.5]
+             payload = ciphertext || tag
+         - Else:
+             xxh = xxhash3_64(compressed)                      [§7.17]
+             payload = compressed
+         - Allocate disk space:
+             paddr = stm_alloc_stripe(length, device_class,
+                                       dataset.redundancy)     [§6.7]
+         - Write to block layer:
+             submit_write_fixed(paddr, payload)                [§9.4.3]
+         - Build extent record with (paddr, write_gen=current_txg,
+                                      dlen, clen, comp, xxh).
+
+5. Insert extent record into the fs tree via Bw-tree delta chain [§3.4]:
+      cas_prepend(node.chain, new_delta)
+   ⊢ Write is now visible to new readers (via MVCC delta chain).
+   ⊢ Not yet durable — will be durable after next commit.
+
+6. If consolidation threshold hit (chain length ≥ 8):
+      try_consolidate(node)                              [§3.4.3]
+
+7. Update inode metadata (mtime, ctime, si_size if extended):
+      append update-delta to inode's tree node.
+
+8. epoch_exit(epoch)
+9. Reply 9P Rwrite.
+```
+
+#### 12.4.2 Performance
+
+- Compression: LZ4 ~3 GB/s/core write-side; ZSTD ~0.5–1 GB/s/core.
+- AEAD encrypt: matches decrypt bandwidth [§12.3.2].
+- Allocation: O(log n) on the allocator tree [§6.3], O(1) on in-RAM SDArray.
+- Disk write: async via io_uring data ring.
+- Commit accumulation: no I/O on the client thread; completes at next txg.
+
+Target p99.9: 2 ms for small writes, limited by the fsync-is-a-separate-op rule.
+
+#### 12.4.3 The fsync path
+
+If the client calls `fsync` (9P `Tsync` [§10.2]):
+
+```
+1. Handler calls commit_request() on the coordinator [§3.7].
+2. Coordinator may be:
+   - Idle: initiate commit immediately.
+   - Already committing: this fsync joins the next batch.
+   - Accumulating: this fsync triggers a commit.
+3. Handler waits for commit completion (barrier).
+4. Reply 9P Rsync.
+```
+
+Commit path detailed in §12.5.
+
+#### 12.4.4 Partial failures
+
+- **Allocation failure (ENOSPC)**: return `-ENOSPC` to client. No side effects — the write never happened.
+- **Compression failure**: fall back to uncompressed for this extent. Tag extent record accordingly.
+- **Encryption failure**: fatal; abort the op with `-EIO`. Crypto should not fail in practice — this indicates a serious bug.
+- **Disk write failure**: free the just-allocated blocks [§6.8 PENDING mechanism]; return `-EIO`. If redundancy available, retry on a different stripe.
+- **Delta-chain CAS failure (another writer prepended)**: retry. CAS failure is common under load; back off briefly and retry.
+
+---
+
+### 12.5 Sync path (txg commit)
+
+**Trigger**: fsync request, 5-second timer, memory pressure, or writer-count threshold [§3.7.1].
+
+Carries forward v1's three-phase sync, extended to four phases for multi-device [§3.7.3, §5.6].
+
+#### 12.5.1 Phase 0: freeze
+
+```
+1. Acquire commit-coordinator role via CAS on fs->commit_state.   [§3.7.2]
+   On success: commit_epoch = current_epoch.
+   On failure: this sync merges into the winner's txg.
+
+2. Freeze delta chains:
+   For each Bε-tree node with non-empty chain:
+     freeze chain head at chain_head(node) at commit_epoch.
+   New writer deltas after this point go to the NEXT txg.
+   ⊢ Writers continuing in parallel don't affect the committing txg.
+
+3. Snapshot pool state: enumerate dirty nodes for consolidation.
+```
+
+No disk I/O in Phase 0 — all in-memory.
+
+#### 12.5.2 Phase 1: reservation uberblock
+
+```
+1. Build reservation uberblock per device:
+     ub.gen = current_gen + 1
+     ub.tree_roots = PRE-flush (not yet consolidated)
+     ub.merkle_root = PRE-flush merkle root
+     ub.roster = current roster
+     ub.csum = blake3(ub)                               [§5.4]
+
+2. For each device in roster, submit parallel write of ub to
+   the OPPOSITE ring slot + fsync:                       [§5.6.2]
+     write(device, ring_slot(current+1 mod ring_size), ub)
+     fsync(device)                                       [§9.8.2]
+
+3. Wait for QUORUM of devices to confirm.                [§5.5.2]
+   ⊢ If quorum succeeds: a crash from here recovers to the PRE-flush
+     tree, losing only this txg's session updates. Still-safe.
+   ⊢ If quorum fails: abort commit, release coordinator, return
+     error. Pool state unchanged.
+
+4. Mark BEHIND any devices that didn't confirm.
+```
+
+#### 12.5.3 Phase 2: flush (parallel)
+
+```
+For each dirty Bε-tree node (consolidation):
+  1. Walk delta chain, build fresh consolidated base node.   [§3.4.3]
+  2. Compute node's merkle hash = blake3(encoding || child_hashes).
+     [§7.12]
+  3. Allocate stripe from allocator:                       [§6.7]
+     Respect dataset.redundancy (mirror / rs / lrc).
+  4. If encrypted: aead_seal as in §12.4.1 step 4b.
+  5. Submit stripe writes across devices.                  [§9.4.3]
+  6. Record new bptr (old bptr freed to PENDING in allocator).
+
+Aggregate:
+  7. Propagate hashes up to tree root.                     [§7.12]
+  8. Compute new pool_merkle_root.                         [§7.11.3]
+
+Phase 2 is internally parallel (thread pool consolidates multiple
+nodes concurrently). All writes submitted via io_uring data ring.
+
+⊢ Phase 2 writes are orphan until Phase 3 references them.
+⊢ A crash here: Phase 2 writes exist on disk but no uberblock
+  references them. Next mount selects Phase 1 reservation.
+  Those orphan blocks are implicitly free.
+```
+
+#### 12.5.4 Phase 3: final uberblock
+
+```
+1. Build final uberblock per device:
+     ub.gen = current_gen + 2
+     ub.tree_roots = POST-flush
+     ub.merkle_root = POST-flush
+     ub.key_schema = current
+
+2. For each device, submit parallel write + fsync to NEXT ring slot.
+
+3. Wait for QUORUM of devices to confirm.
+   ⊢ If quorum succeeds: commit is durable. Advance fs->gen to
+     current_gen + 1.
+   ⊢ If quorum fails: commit aborts. Pool state logically at Phase 1
+     reservation. In-memory state must reconstruct — retry commit.
+```
+
+#### 12.5.5 Phase 4: publish
+
+```
+1. Atomically swing fs->current_root to the new post-commit root:
+     atomic_store(&fs->current_root, new_root)           [§3.3.1]
+   ⊢ New readers see post-commit state.
+   ⊢ In-flight readers continue under their pre-commit snapshot.
+
+2. Retire old delta chain bases and allocator PENDING blocks:
+     for each retired object:
+       retire(obj, commit_epoch)                         [§3.6.3]
+
+3. Wake writers waiting on this txg's fsync.
+
+4. Release commit_state → IDLE.
+
+5. Advance allocator: PENDING → truly FREE for all blocks that were
+   freed during this txg.                                [§6.8]
+```
+
+#### 12.5.6 Timing
+
+Typical commit latency targets:
+- Phase 0 freeze: microseconds.
+- Phase 1 fsync: 1-10 ms depending on storage (NVMe fast, HDD slow).
+- Phase 2 flush: O(dirty nodes) × consolidation cost. 1-50 ms typical.
+- Phase 3 fsync: same as Phase 1.
+- Phase 4 publish: microseconds.
+
+Total: 3-100 ms depending on workload. p99.9 target: 10 ms [§4.14 VISION].
+
+---
+
+### 12.6 Rollback path
+
+**Trigger**: admin invokes `stratum snapshot rollback <snap>`.
+
+Rollback reverts a dataset to a specific snapshot. The dataset's live tree root becomes the snapshot's tree root; writes after the snapshot are discarded.
+
+#### 12.6.1 Happy path
+
+```
+1. Verify precondition: no clones of the target snapshot exist
+   (would force promote first) [§8.6.2].
+
+2. Acquire commit coordinator (rollback is a specialized txg).
+
+3. Load the snapshot's tree root: R_snap = snapshot.tree_root.
+
+4. Collect all blocks written since snapshot (via birth-txg):
+   scan current tree for blocks with birth_txg > snapshot.created_txg.
+   These are blocks that existed only in post-snapshot state.
+
+5. Free the post-snapshot blocks via allocator:
+   for each block: stm_alloc_free(paddr).
+   Goes to PENDING; durable-free after commit.
+
+6. Update the dataset index entry:
+   dataset.tree_root = R_snap.
+   dataset.rolled_back_from_snapshot = snapshot_id (for audit).
+
+7. Commit via standard four-phase.                        [§12.5]
+   ⊢ After Phase 3 durability: dataset tree is at snapshot state.
+   ⊢ All blocks post-snapshot are in PENDING; Phase 4 makes them
+     truly free.
+```
+
+#### 12.6.2 Encryption considerations
+
+If the dataset is encrypted with AEAD-SIV and current txg is T:
+
+- Pre-rollback, the dataset used dataset_key D with nonces (paddr, T-K, seq) for some recent K.
+- After rollback, writes happen at txg T+1 onwards. Nonces (paddr, T+1, seq) differ from any pre-rollback use. No reuse.
+
+This is carried forward from v1's R9-1 rollback-bump machinery — the `disk ss_gen > fs->gen` invariant (§3.7, §5.5) ensures nonce non-collision across rollback boundaries.
+
+#### 12.6.3 Merkle reverify
+
+After rollback, the dataset's merkle chain is back to the snapshot's state. The pool merkle root changes (different tree roots composed in). Next commit recomputes.
+
+Scrub will eventually re-walk and verify; optional `stratum scrub --dataset <dataset>` to verify immediately.
+
+#### 12.6.4 Partial failures
+
+- **Allocation tree walk fails** (corruption detected): abort rollback; return `-EIO`; admin must scrub first.
+- **Commit fails at Phase 1 quorum**: rollback aborts; original state preserved. No data loss (nothing was freed yet).
+- **Commit fails at Phase 3 quorum**: Phase 2 wrote nothing durably (we didn't overwrite). Pool at Phase 1 reservation state. Next mount recovers cleanly.
+
+---
+
+### 12.7 Scrub path
+
+**Trigger**: scheduled (weekly default) or admin-initiated (`stratum pool scrub`).
+
+#### 12.7.1 Happy path
+
+```
+Scrub state: IDLE → RUNNING → COMPLETED (or PAUSED).       [§7.14.1]
+
+1. Coordinator starts the scrub thread pool (one per device, IO-throttled).
+
+2. For each device in parallel:
+   a. Walk metadata tree rooted at ub.main_root:
+      For each metadata node (Bε-tree, allocator, snap, CAS index):
+        - read bytes.
+        - verify merkle hash matches parent's claim.        [§7.13.3]
+        - On mismatch: attempt repair [§7.15]; log.
+      For each extent record encountered:
+        - Verify the extent's integrity:
+            read extent payload from disk
+            if encrypted: aead_verify
+            else: xxhash3_64 matches se_xxh                  [§7.17]
+          On mismatch: repair [§7.15].
+
+   b. Progress reported via /ctl/.../scrub/progress.
+
+3. When all devices complete → state COMPLETED; persist results.
+
+4. Event log entry:
+      scrub_complete(pool, start_time, end_time, errors, repaired)
+```
+
+#### 12.7.2 IO throttling
+
+Scrub respects `/ctl/.../scrub/priority`:
+- `low` (default): ~10% of device bandwidth. Never visible on foreground p99.9.
+- `medium`: ~30%.
+- `high`: ~80%.
+
+Implemented via token-bucket rate-limiting on scrub's submit rate.
+
+#### 12.7.3 Pause / resume
+
+```
+State transition: RUNNING → PAUSED via /ctl/.../scrub/pause.
+Persisted: (device, key, progress_offset) per device.
+Resume: READ progress from persisted state, continue from there.
+```
+
+Pause/resume survives mounts — a scrub interrupted by shutdown can resume on next mount.
+
+#### 12.7.4 Partial failures
+
+- **Corruption found, redundancy available**: repair + log + continue.
+- **Corruption found, no redundancy**: mark block as known-bad in `/ctl/.../unrecoverable`; log; continue.
+- **Scrub worker thread crashes**: state rolled back to last checkpoint; scrub marked FAILED with diagnostics; admin re-initiates.
+- **Device removed mid-scrub**: scrub for that device pauses at its current progress; resumes when device returns.
+
+---
+
+### 12.8 Mount path
+
+**Trigger**: daemon startup, or `stratum pool import <pool>` (post-mount).
+
+#### 12.8.1 Happy path
+
+```
+1. Read device UUIDs from all visible devices, group by pool_uuid.
+   Identify target pool's device set.
+
+2. For each device in the pool:
+   a. Read all 4 labels [§5.3.1].
+   b. For each label, validate csum and extract uberblock ring.
+   c. Collect all valid uberblocks across labels.
+
+3. Select authoritative uberblock:
+   highest_gen = max(gen of uberblocks that have QUORUM across devices)
+   selected_ub = the uberblock at highest_gen [§5.5.3].
+
+4. Verify selected_ub.merkle_root matches expected Merkle state:
+   - If --verify flag: full metadata walk + merkle verify [§7.13.1].
+   - Else: trust the root for now; on-read and scrub will catch any
+     issue [§7.13.2 and §7.14].
+
+5. Open metadata trees:
+     main_tree      = tree_open(ub.main_root, "main", dataset_id=0)
+     for each device d:
+       alloc_tree[d] = tree_open(ub.alloc_root[d], "alloc", device=d)
+     snap_tree      = tree_open(ub.snap_root, "snap")
+     cas_index      = tree_open(ub.cas_index_root, "cas")
+
+6. Reconstruct in-RAM state:
+   For each device in parallel:
+     Walk alloc_tree[d] → build SDArray + xor filter [§6.10].
+
+7. Read dataset index, instantiate datasets:
+     for each dataset in index:
+       instantiate per-dataset context (key slot, redundancy profile,
+       inheritance-resolved properties).
+
+8. Initialize key agent connection (§7.9):
+     connect to agent's Unix socket.
+     request unwrap of current wrap key (interactive, if backed by
+     passphrase).
+     cache unwrapped dataset keys for each referenced dataset.
+
+9. Mount-time gen bump:                                   [§5.6, §3.7.4]
+     commit a fresh minimal txg that advances gen.
+     ⊢ disk ss_gen > fs->gen is maintained across the mount boundary.
+
+10. Start 9P server, listen for client connections.
+11. Mark pool state: ONLINE. Set mount-time timestamp.
+12. /ctl/.../state = ONLINE; event log entry logged.
+```
+
+#### 12.8.2 Emergency mount
+
+If quorum is impossible:
+
+```
+--emergency flag required. --force-readonly required by default.
+
+1. Mount without quorum check.
+2. Use best-available uberblock per device.
+3. Trust nothing by default; all reads go through scrub-like
+   verification.
+4. Writes refused (unless --force-readwrite with stern warning).
+5. Goal: read data out; dump to a new pool; recover what's possible.
+```
+
+Logs prominent warnings at every op.
+
+#### 12.8.3 Partial failures
+
+- **No quorum-satisfying uberblock**: refuse to mount; suggest `--emergency`.
+- **Uberblock with valid csum but inconsistent Merkle root**: refuse; suggest scrub or emergency.
+- **Key agent unreachable**: refuse unless pool is unencrypted.
+- **Key agent unwraps fail**: report which dataset can't be opened; admin can still access unencrypted datasets.
+- **Tree open fails** (corrupt root): refuse; emergency recovery.
+
+---
+
+### 12.9 Unmount path
+
+**Trigger**: `stratum pool export <pool>` or daemon shutdown.
+
+#### 12.9.1 Happy path
+
+```
+1. Stop accepting new 9P connections.
+
+2. Complete in-flight operations:
+   - Wait for all outstanding reads to finish (their reader epochs
+     drain naturally within a few hundred ms).
+   - Wait for in-progress writes to complete.
+
+3. Flush and commit all pending state:
+     trigger_commit()                                      [§12.5]
+     wait for Phase 3 durability.
+   ⊢ All client-visible writes are durable.
+
+4. Close all 9P connections gracefully.
+
+5. Close trees (flushes any transient state):
+     tree_close(main_tree)
+     for each device: tree_close(alloc_tree[d])
+     tree_close(snap_tree, cas_index)
+
+6. Key material zeroed from memory:
+     for each cached dataset key: sodium_memzero(key).
+
+7. Close key agent connection.
+
+8. Close block-device backends:
+     for each device: io_uring_queue_exit; close fd.
+
+9. Final state: pool marked OFFLINE.
+   /ctl/.../state = OFFLINE; event log entry.
+```
+
+#### 12.9.2 Forced unmount
+
+If clients refuse to disconnect or ops hang:
+
+```
+stratum pool export --force <pool>
+
+1. Forcibly close all 9P connections (clients see abrupt disconnect).
+2. Abort in-flight ops (best-effort; underlying writes may race).
+3. Trigger commit.
+4. Proceed with normal unmount.
+```
+
+Logs a warning; clients may need to reconnect cleanly via their own retry logic.
+
+---
+
+### 12.10 Hot ↔ Cold tier migration
+
+**Trigger**: tiering policy engine decides data should migrate [§6.9]. Runs as background task.
+
+#### 12.10.1 Hot → Cold (archival)
+
+```
+Given candidate extent E on dataset D:
+
+1. Verify E is not actively being read/written (check via reader
+   count + recent write timestamp).
+
+2. FastCDC-chunk the extent's plaintext content [§6.9.2]:
+     chunks = fastcdc(plaintext, avg=8MiB, min=1MiB, max=64MiB)
+
+3. For each chunk:
+     hash = blake3_256(chunk_plaintext)
+     Look up in CAS index:
+       hit: bump refcount on existing CAS entry. No new write.
+       miss: allocate cold-tier blocks, aead_seal chunk with
+             AD=stm_ad_cas(hash), write chunk, insert CAS entry
+             with refcount=1.
+
+4. Build new cold extent record containing chunk hashes (not paddrs):
+     struct stm_cold_extent { hash[], lens[], ... }
+
+5. Replace E's record in the fs tree:
+     old_record (references paddrs) ← new cold_record (references hashes)
+     COW via Bw-tree delta append.
+
+6. Commit at next txg.
+
+7. After commit durability, free E's original hot blocks via
+   allocator. (Standard PENDING→FREE cycle.)
+```
+
+Result: the file appears unchanged to clients; data is now content-addressed in the cold tier with automatic dedup.
+
+#### 12.10.2 Cold → Hot (re-hydration on write)
+
+```
+Write to a cold extent requires copy-up:
+
+1. Read the cold chunks (AEAD-decrypt, reassemble).
+2. Allocate new hot-tier paddr(s).
+3. Write the modified content as a new hot extent.
+4. Replace the cold-extent record with hot-extent record.
+5. Dereference the cold chunks:
+     for each chunk_hash:
+       cas_refcount_decrement(hash).
+       if refcount == 0: schedule GC [§6.9.3].
+6. Commit.
+```
+
+#### 12.10.3 Policy engine
+
+Simple heuristic at v2.0 (full learned model post-v2.0, NOVEL #6):
+
+```
+Candidate for hot→cold if:
+  - extent not accessed in > 30 days, AND
+  - dataset has tiering enabled, AND
+  - cold-tier class (HDD) has free space.
+
+Candidate for cold→hot if:
+  - write to cold extent triggers (always re-hydrate).
+  - or admin-triggered prefetch (future).
+```
+
+---
+
+### 12.11 Error recovery
+
+Cross-path error classification and handling.
+
+#### 12.11.1 Transient errors
+
+Retry with backoff [§9.11.2]:
+- I/O failures on a single read (EIO, EBUSY).
+- Kernel returning `EAGAIN` on uring submission.
+
+Max retries: 5 with exponential backoff (10 ms → 160 ms). After max, escalate to permanent.
+
+#### 12.11.2 Permanent errors
+
+Escalate to redundancy layer:
+- Unrecoverable read error on one device → read from mirror/RS/LRC [§7.15].
+- Corrupted metadata block → attempt repair; if unrepairable, mark device DEGRADED [§7.16].
+
+If redundancy is unavailable, return `-EIO` to caller; mark block as "known bad" in `/ctl/.../unrecoverable`.
+
+#### 12.11.3 Device gone
+
+Hot-unplug or driver reset:
+- Block layer detects via completion errors + udev notification [§9.11.4].
+- Pool transitions to DEGRADED.
+- If redundancy tolerance exceeded → FAULTED (read-only).
+- Device return → reconcile [§5.8].
+
+#### 12.11.4 Integrity corruption (detected)
+
+From Merkle mismatch, AEAD failure, or csum mismatch:
+1. Log to `/ctl/.../events/corruption`.
+2. Attempt repair via redundancy [§7.15].
+3. If repaired → verify + log success.
+4. If unrepairable → EIO to caller, mark for admin attention.
+
+---
+
+### 12.12 Crash recovery
+
+The pool's state machine across crash boundaries.
+
+#### 12.12.1 Possible post-crash states
+
+Given any crash scenario, the on-disk pool is in one of these states:
+
+| State | Description | Recovery action |
+|---|---|---|
+| **Clean txg** | Last commit's Phase 3 durable across quorum. | Mount normally. |
+| **Reservation only** | Phase 1 reservation durable; Phase 2 writes may exist (orphan); Phase 3 not durable. | Mount selects Phase 1 uberblock (gen+1). Session state = pre-crash state. Orphan Phase 2 blocks are implicitly free. |
+| **Partial Phase 3** | Some devices confirmed Phase 3, others didn't. | Quorum rule: if majority confirmed, Phase 3 is durable. Else Phase 1 reservation is authoritative. |
+| **Device gone** | One or more devices inaccessible at boot. | Mount if quorum achievable; else refuse. Emergency mode for forensics. |
+| **Torn uberblock** | A label's uberblock has invalid csum. | Skip that label; use next valid one. Other labels / devices still quorum-confirm. |
+| **Corrupted metadata** | A non-uberblock metadata block has Merkle mismatch. | Mount with `--verify` detects at mount; without, detects on first read of affected subtree. Repair via redundancy. |
+
+#### 12.12.2 Crash recovery protocol
+
+On mount (§12.8), this is automatic:
+
+```
+1. Read all labels on all devices.
+2. Find highest-gen uberblock with quorum.
+3. That's the authoritative state.
+4. Any device with gen < highest → mark BEHIND; reconcile.
+5. Any device with gen > highest but NOT in quorum → it had a partial
+   commit; its extra state is discarded. Mark BEHIND; reconcile to
+   the authoritative gen.
+6. Proceed with mount from the authoritative uberblock.
+```
+
+No data loss in any of these cases — worst case is losing the last uncommitted txg (which by definition wasn't durable before the crash).
+
+#### 12.12.3 Nonce uniqueness across crashes
+
+Key invariant: every nonce ever used to encrypt a disk block is unique (§7.4.2).
+
+Preserved across crashes by:
+- Mount-time gen bump ensures `fs->gen < disk ss_gen` [§5.6, §3.7.4].
+- New writes after mount use `txg > last-crashed-txg`.
+- Orphan blocks from failed commits are never referenced — the allocator frees them (implicitly, not in any tree).
+
+No crash sequence can cause nonce reuse.
+
+---
+
+### 12.13 The global state machine
+
+The pool's top-level state machine:
+
+```
+                  ┌─────────────┐
+                  │   OFFLINE   │  (not mounted)
+                  └──────┬──────┘
+                         │ mount()
+                         ▼
+                  ┌─────────────┐
+                  │  MOUNTING   │
+                  └──────┬──────┘
+                         │ quorum + key unwrap OK
+                         ▼
+     ┌───────────── ─┐    ┌──────────────┐
+     │    ONLINE    │───→│  DEGRADED   │  (device(s) offline,
+     │ (RW operable)│    │ (RO or RW)   │   quorum retained)
+     └───────┬──────┘    └──────┬───────┘
+             │                  │ tolerance exceeded
+             │                  ▼
+             │           ┌──────────────┐
+             │           │   FAULTED    │  (RO only; admin intervention)
+             │           └──────┬───────┘
+             │                  │ admin repair / replace
+             │                  ▼
+             │           (return to DEGRADED or ONLINE)
+             │
+             │ export / shutdown
+             ▼
+     ┌──────────────┐
+     │  UNMOUNTING  │
+     └──────┬───────┘
+            │
+            ▼
+     ┌──────────────┐
+     │   OFFLINE    │
+     └──────────────┘
+```
+
+State transitions logged to event log. State visible via `/ctl/.../state`.
+
+---
+
+### 12.14 Invariants across all paths
+
+A consolidated list of invariants that MUST hold at every path boundary. Violating any → corruption → wedge.
+
+| Invariant | Stated at | Enforcement |
+|---|---|---|
+| Nonce uniqueness | §7.4.2 | TLA+ spec `nonce.tla`; audit on every §7 change |
+| `disk ss_gen > fs->gen` | §3.7, §5.6 | Mount-time gen bump; audit on every §5 change |
+| Readers see consistent snapshot | §3.3 | MVCC root pointer; TLA+ spec `concurrency.tla` |
+| Non-blocking writers | §3.4 | Bw-tree CAS; TLA+ spec |
+| Merkle chain integrity | §7.13.2 | On-read verify; scrub |
+| AEAD tag presence | §7.5 | AEAD-SIV construction |
+| Allocator refcount ≥ 0 | §6.4 | Underflow = bug; wedge |
+| Quorum on commit | §5.5.2 | Phase 1 + Phase 3 both confirm |
+| PENDING block ≠ reallocable | §6.8 | Commit publishes before free-cycle |
+| Key material zeroed on release | §12.9 | `sodium_memzero` on every unwrapped key |
+| Dataset encryption immutable | §7.8 | Refused at attribute-set time |
+
+These invariants are tested via:
+- Unit tests (per-path happy + edge cases).
+- Property-based tests (random operations against invariants).
+- Fuzzers (random op sequences, crash injection).
+- TLA+ model checking (for spec'd invariants).
+- Audit loop reviewing every change that touches an invariant-related surface.
+
+---
+
+### 12.15 Summary
+
+This section is the integration narrative. No new architecture — everything references §§3–11. Key commitments:
+
+1. **Every I/O path is fully specified**: read, write, sync, rollback, scrub, mount, unmount, migration, error recovery, crash recovery.
+2. **Invariants hold at every step**: stated and enforced via tests, specs, audits.
+3. **Crash-safety is a property of the sync protocol, not per-op**: any crash at any point produces one of a small set of recoverable states.
+4. **The state machine is small**: OFFLINE, MOUNTING, ONLINE, DEGRADED, FAULTED, UNMOUNTING. Transitions are logged.
+5. **Nonce uniqueness is preserved across all paths and all crashes**: the single most load-bearing invariant.
+
+Status: DRAFT → awaiting review, push-back, then COMMITTED.
 
 ---
 
@@ -4257,8 +5029,8 @@ Each of §3–§5 and §7 is probably its own Phase 0 session. §6, §8, §9–�
 | §8 Namespace | DRAFT | 6 |
 | §9 Block device | DRAFT | 7 |
 | §10 Client interfaces | DRAFT | 8 |
-| §11 POSIX surface | **DRAFT** (this session) | 9 |
-| §12 I/O paths | STUB | 10 (integration) |
+| §11 POSIX surface | DRAFT | 9 |
+| §12 I/O paths | **DRAFT** (this session) | 10 (integration) |
 | §13 Format versioning | STUB | 11 |
 | §14 Observability | STUB | 12 |
 | §15 Cross-cutting | STUB | 12 |
