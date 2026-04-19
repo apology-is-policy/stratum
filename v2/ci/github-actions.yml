@@ -1,0 +1,129 @@
+# Stratum v2 CI workflow.
+#
+# Jobs:
+#   build-linux        — gcc + clang, default RelWithDebInfo; runs ctest.
+#   build-linux-asan   — AddressSanitizer + UBSan; runs ctest.
+#   build-linux-tsan   — ThreadSanitizer; runs ctest.
+#   build-macos        — clang on macOS; POSIX backend only.
+#   tlc-specs          — TLC on all v2/specs/*.tla with matching .cfg.
+#
+# This file is *not* active yet — Stratum v2's CI pipeline will install at
+# .github/workflows/ci.yml when the implementation team decides to turn CI on.
+# We keep it under v2/ci/ so it's reviewable alongside the code it gates.
+
+name: v2-ci
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'v2/**'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    paths:
+      - 'v2/**'
+
+defaults:
+  run:
+    working-directory: v2
+
+jobs:
+  build-linux:
+    name: Linux / ${{ matrix.compiler }} / ${{ matrix.sanitizer }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        sanitizer: [off, asan, tsan]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              build-essential pkg-config cmake ninja-build \
+              libsodium-dev liburing-dev
+
+      - name: install liboqs
+        run: |
+          sudo apt-get install -y --no-install-recommends liboqs-dev || true
+          if ! pkg-config --exists liboqs; then
+              echo "liboqs not available via apt; building from source"
+              git clone --depth 1 --branch 0.10.0 https://github.com/open-quantum-safe/liboqs.git /tmp/liboqs
+              cmake -S /tmp/liboqs -B /tmp/liboqs/build -GNinja \
+                    -DCMAKE_INSTALL_PREFIX=/usr/local \
+                    -DOQS_BUILD_ONLY_LIB=ON -DOQS_USE_OPENSSL=OFF
+              sudo cmake --build /tmp/liboqs/build --target install
+          fi
+
+      - name: configure
+        env:
+          CC: ${{ matrix.compiler }}
+        run: |
+          cmake -B build -S . -GNinja \
+              -DSTM_SANITIZE=${{ matrix.sanitizer }} \
+              -DSTM_ENABLE_IOURING=ON \
+              -DSTM_ENABLE_PQ=ON \
+              -DSTM_WERROR=ON
+
+      - name: build
+        run: cmake --build build
+
+      - name: test
+        run: ctest --test-dir build --output-on-failure
+
+  build-macos:
+    name: macOS / clang / ${{ matrix.sanitizer }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [off, asan, tsan]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install deps
+        run: |
+          brew update
+          brew install cmake ninja pkg-config libsodium
+          # liboqs is optional on macOS — fall back to classical-only wrap.
+
+      - name: configure
+        run: |
+          cmake -B build -S . -GNinja \
+              -DSTM_SANITIZE=${{ matrix.sanitizer }} \
+              -DSTM_ENABLE_IOURING=OFF \
+              -DSTM_ENABLE_PQ=OFF \
+              -DSTM_WERROR=ON
+
+      - name: build
+        run: cmake --build build
+
+      - name: test
+        run: ctest --test-dir build --output-on-failure
+
+  tlc-specs:
+    name: TLC / ${{ matrix.spec }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        spec: [sync]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install java + tla2tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends default-jre wget
+          wget -q -O /tmp/tla2tools.jar \
+              https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+
+      - name: check ${{ matrix.spec }}.tla
+        run: |
+          cd specs
+          java -cp /tmp/tla2tools.jar tlc2.TLC \
+              -workers auto -deadlock \
+              -config ${{ matrix.spec }}.cfg ${{ matrix.spec }}.tla
