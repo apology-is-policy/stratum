@@ -521,36 +521,318 @@ Status: DRAFT → awaiting review, push-back, and then COMMITTED.
 
 ## 4. Storage pool model
 
-**STATUS**: STUB
+**STATUS**: DRAFT
 
-### 4.1 Goals
+### 4.1 Goals and non-goals
 
-- Multi-device pool with declared redundancy profile.
-- Online add / remove / replace devices.
-- Redundancy domains expressed independently of physical topology.
-- Graceful degradation under device failure.
+**Goals**:
 
-### 4.2 Decisions committed (COMPARISON §3.7)
+- A pool is 1 to N block devices presenting a unified namespace.
+- Declared redundancy profile per pool (with per-dataset override).
+- Online device add / remove / replace / fail handling.
+- Redundancy domains decoupled from physical layout (the pool describes logical redundancy; physical geometry follows).
+- Graceful degradation: N devices can fail within the profile's tolerance without data loss.
+- Mixed-class pools: SSD and HDD in one pool with per-extent placement.
 
-- RS + LRC erasure coding.
+**Non-goals**:
+
+- Distributed multi-node pools. Stratum is single-host; a pool's devices all belong to one machine. Multi-node replication goes through send/recv (§8), not pool spanning.
+- Software-defined RAID in kernel (dm-raid territory). Stratum owns its redundancy layer end-to-end; it doesn't stack on dm-raid / md-raid.
+- LVM-style dynamic resizing with random block reorganization. Our model is "devices with stable paddrs, rebalance is an explicit operation."
+- ZFS-style unchangeable-after-creation geometry. We support add/remove/replace as first-class operations — btrfs got that right, ZFS got that wrong.
+
+### 4.2 Decisions already committed
+
+From earlier Phase 0 docs:
+
+- Reed-Solomon (RS) + Locally Repairable Codes (LRC) as the erasure coding families (COMPARISON §3.7).
 - Mirror profile for small pools or hot metadata.
+- Per-device uberblocks (§5 placeholder — SB model depends on this).
 
-### 4.3 Subsections to write
+Decisions taken in this section:
 
-- **4.3.1** Pool composition — device roster, pool version, feature flags.
-- **4.3.2** Physical address space — `paddr = (device_id: u16, offset: u64)`. Nonce construction accommodates multi-device.
-- **4.3.3** Redundancy profile — RS(k, n), LRC(k, l, r), mirror(n). Per-pool default + per-dataset override.
-- **4.3.4** Stripe geometry — block-to-device-stripe mapping.
-- **4.3.5** Device lifecycle — add (rebalance), remove (evacuate), replace (rebuild), fail (degrade).
-- **4.3.6** Rebalance — triggers, progress reporting, IO throttling.
-- **4.3.7** Mixed-class pools — SSD + HDD co-existence; per-extent placement.
-- **4.3.8** Hot-spare policy.
+- **paddr layout**: packed `(device_id: 16 bits, offset: 48 bits)` into a uint64. 65536 devices per pool × 256 TiB per device = 16 EiB pool ceiling. Extended formats available via feature flag.
+- **Lazy rebalance by default**: add is fast (just activates the new device); rebalance is an explicit operation. btrfs pattern, not ZFS's no-rebalance model.
+- **Heterogeneous-size devices supported**: devices of differing capacity can coexist; allocator weights usage by free space proportionally.
+- **Per-dataset redundancy override**: a dataset can carry a non-default redundancy profile (e.g., critical data mirrored 3-way, archive LRC'd with high k).
 
-### 4.4 Open questions
+### 4.3 Pool composition
 
-- Per-device uberblocks vs pool-wide SB. Probably both (per-device for quorum; pool-wide derived view).
-- Strictness of online-add: always requires rebalance (expensive) vs deferred rebalance mode.
-- Heterogeneous-size devices: supported (like btrfs) or not (more like ZFS before late-career relaxations).
+A pool is described by its **device roster** (the list of devices) and its **pool configuration** (version, feature flags, default redundancy profile, pool-wide metadata).
+
+#### 4.3.1 Device roster
+
+Every device in the pool has:
+
+- A persistent **UUID** (not tied to device path — `/dev/nvme0n1` can become `/dev/nvme1n1` after reboot; the pool tracks UUIDs, not paths).
+- A **role** (`DATA`, `LOG`, `CACHE`, `SPARE`) — see §4.9 and §4.10.
+- A **class** (`SSD`, `HDD`, `PMEM`, `ZNS`) for placement hints.
+- An **availability state** (`ONLINE`, `OFFLINE`, `DEGRADED`, `FAULTED`, `REMOVED`).
+- A **size** in bytes (at pool-join time; devices don't dynamically resize).
+- An **order in the roster** (stable; survives add/remove).
+
+The roster is persisted in the per-device uberblocks (§5) so any subset of devices can recover the full roster.
+
+#### 4.3.2 Pool configuration
+
+Stored in every device's uberblock ring:
+
+- Pool UUID.
+- Pool version + feature flags.
+- Default redundancy profile.
+- Pool-wide metadata (Merkle root, next txg, next dataset id, ...).
+- Roster hash — identifies this specific roster state; advances on add / remove.
+
+Per-device uberblocks carry a **copy** of the pool-wide configuration. A device that comes online with a stale roster hash performs a reconciliation against its peers.
+
+### 4.4 Physical address space
+
+**Decision**: packed 64-bit paddr = `(device_id: 16 bits, offset: 48 bits)`.
+
+```c
+typedef uint64_t stm_paddr_t;
+
+#define STM_PADDR_DEV_SHIFT  48
+#define STM_PADDR_DEV_MASK   0xFFFFULL
+#define STM_PADDR_OFF_MASK   ((1ULL << 48) - 1)
+
+static inline uint16_t paddr_device(stm_paddr_t p) {
+    return (p >> STM_PADDR_DEV_SHIFT) & STM_PADDR_DEV_MASK;
+}
+static inline uint64_t paddr_offset(stm_paddr_t p) {
+    return p & STM_PADDR_OFF_MASK;
+}
+static inline stm_paddr_t paddr_make(uint16_t dev, uint64_t off) {
+    return ((stm_paddr_t)dev << STM_PADDR_DEV_SHIFT) | (off & STM_PADDR_OFF_MASK);
+}
+```
+
+#### 4.4.1 Sizing rationale
+
+- **16 bits device_id** = 65536 devices per pool. ZFS allows more but nobody's ever hit the limit; 64K is plenty for physical hardware realities (PCIe lanes, SAS expanders).
+- **48 bits offset** = 256 TiB per device. Largest current drives are ~30 TB (HDD) / ~60 TB (SSD); trajectory suggests 256 TiB drives around 2040. Growth headroom is sufficient.
+- **Total pool ceiling** = 16 EiB. Matches the largest practical real-world pools.
+
+#### 4.4.2 Growth beyond the ceiling
+
+If devices larger than 256 TiB appear before 2040, or if someone wants a >16 EiB pool, the format grows via feature flag:
+
+- `FEATURE_EXT_PADDR`: paddr becomes a struct `{ uint32 dev; uint64 off; }` (12 bytes unpacked, 16 aligned). Extent records bump from 32 → 40 bytes; bptrs bump proportionally. Enabling the flag is one-way (can't downgrade).
+
+We don't commit to this; it's an escape hatch.
+
+#### 4.4.3 Nonce construction under multi-device
+
+AEAD nonce includes the paddr. With device_id packed into paddr, the nonce naturally differentiates across devices — block 0 of device 1 and block 0 of device 2 produce different nonces. Zero coordination needed.
+
+Full nonce layout (from §3.7.4 and §7.3.2):
+
+```
+nonce[0..7]  = paddr                (16-bit device + 48-bit offset)
+nonce[8..15] = txg | seq_in_txg     (32 bits each)
+nonce[16..23]= 0                    (reserved for future use)
+```
+
+Under End A, `seq_in_txg` is assigned monotonically by the commit coordinator. Nonce uniqueness is trivially provable (§3.7.4).
+
+### 4.5 Redundancy profiles
+
+A profile describes how blocks are redundantly stored across devices. Each pool has a default profile; each dataset can override.
+
+#### 4.5.1 Profile families
+
+- **`mirror(n)`**: each logical block stored as `n` identical physical blocks on `n` distinct devices. Tolerates `n-1` failures. Storage overhead `n×`.
+- **`rs(k, p)`**: Reed-Solomon with `k` data + `p` parity blocks per stripe, across `k+p` devices. Tolerates `p` failures. Storage overhead `(k+p)/k`.
+- **`lrc(k, l, g)`**: LRC with `k` data + `l` local-parity + `g` global-parity, across `k+l+g` devices. Tolerates `l+g` failures total (with locality constraints). Single failure repairs from `k/l` devices, not all `k+p-1`.
+
+#### 4.5.2 Profile selection
+
+Selection happens at pool creation and per dataset:
+
+- `pool create ... redundancy=mirror(2)` → every block mirrored once.
+- `pool create ... redundancy=rs(6,2)` → RAIDZ2-equivalent, 6 data + 2 parity.
+- `pool create ... redundancy=lrc(10,2,2)` → 10 data, 2 local parity, 2 global parity. Single-failure repair touches 5 devices (local group), not 11.
+
+Per-dataset override:
+- `dataset set redundancy=mirror(3) tank/critical` → this dataset's data is 3-way mirrored even though the pool default is `rs(6,2)`.
+
+#### 4.5.3 Profile constraints
+
+- Pool must have at least `k+p` (for RS) or `k+l+g` (for LRC) or `n` (for mirror) devices to support that profile.
+- All devices in a profile must be ONLINE at pool-creation time.
+- Changing the pool default profile after creation requires rebalance (expensive; sometimes desired after device additions).
+
+#### 4.5.4 Metadata redundancy
+
+Metadata (Bε-tree nodes, allocator tree nodes, SB) is always *at least* as redundant as the pool default, and can be configured separately. Options:
+
+- **`meta=default`**: metadata uses the pool default profile. OK for small pools.
+- **`meta=ditto(n)`**: additional `n` copies of every metadata block beyond the profile (ZFS ditto-block style). Recommended for large pools where metadata corruption is catastrophic.
+
+### 4.6 Stripe geometry and COW-driven RAID
+
+#### 4.6.1 Stripe-level redundancy
+
+RS and LRC operate at **stripe granularity**. A stripe is a row of `k+p` (or `k+l+g`) blocks spanning that many devices. When we write user data, we allocate a full stripe.
+
+Stripe size: `k × block_size` of user data. For `rs(6,2)` with 4 KiB blocks, stripe = 24 KiB data / 32 KiB total.
+
+For extents larger than one stripe, consecutive stripes are written across the device set. The allocator's job (§6) is to pick stripes such that device utilization stays balanced.
+
+#### 4.6.2 No write hole
+
+The famous "RAID5 write hole": partial-stripe writes require read-modify-write of parity; a crash between the data and parity write leaves the stripe inconsistent. btrfs fixed it in 2024; ZFS avoided it via full-stripe COW.
+
+Stratum is COW from the ground up. **Every stripe write is a full-stripe write**. No partial-stripe RMW ever happens. The write hole doesn't exist.
+
+Consequence: the minimum allocation unit for a redundant profile is one stripe. Small files pack into stripes via the per-extent compression (small file → small extent → still a full stripe, just mostly padding).
+
+#### 4.6.3 Mirror geometry
+
+Mirrors don't stripe; they duplicate. A `mirror(2)` write produces two block writes on two devices; `mirror(3)` produces three. The allocator picks the devices; the write layer issues the parallel writes.
+
+#### 4.6.4 Allocator / stripe interaction
+
+The allocator (§6) allocates **stripes**, not individual blocks, for redundant profiles. A stripe allocation returns the paddrs of all blocks in the stripe; the caller writes the data to them.
+
+For mirrors, the allocator allocates `n` blocks (one per mirror target device); for RS/LRC, it allocates one stripe's worth of blocks on `k+p` or `k+l+g` devices.
+
+### 4.7 Device lifecycle
+
+Devices join and leave pools. Stratum handles four operations:
+
+#### 4.7.1 Add
+
+```
+pool add <pool> <device> [role=DATA|LOG|CACHE|SPARE] [class=SSD|HDD|PMEM|ZNS]
+```
+
+- Device's UUID added to roster.
+- New uberblock ring created on the device.
+- Roster hash advances.
+- Pool-wide Merkle root updated (new device's uberblock is now part of the metadata set).
+- Existing data is **not** rebalanced; the new device starts empty.
+- The allocator (§6) begins using the new device for new allocations, preferring it until usage balances.
+
+Lazy add is fast — seconds. If the user wants everything re-striped, they run `pool rebalance` (§4.8).
+
+#### 4.7.2 Remove
+
+```
+pool remove <pool> <device>
+```
+
+- Requires: pool can still satisfy its redundancy profile without this device. (E.g., removing the 8th device from an `rs(6,2)` pool is allowed; removing the 3rd leaves `rs(6,2)` impossible — refused.)
+- Stratum evacuates the device: reads every allocated block on it, rewrites on remaining devices, updates the tree.
+- Evacuation is incremental; can be paused / resumed.
+- Once evacuation completes, the device's uberblock is zeroed and the device is removed from the roster.
+
+Remove is expensive (reads+writes the whole device's contents). Progress reported via `/ctl/.../pool/remove-progress`.
+
+#### 4.7.3 Replace
+
+```
+pool replace <pool> <old-device> <new-device>
+```
+
+Two cases:
+
+- **Old device is ONLINE (user-initiated replacement, e.g., moving to a larger drive)**: data is copied directly from old to new. Then old is removed. Fast — a straight copy.
+- **Old device is FAULTED (replacement of a failed drive)**: data is reconstructed from redundancy onto the new device. Speed depends on the redundancy profile: LRC rebuild is 2-3× faster than RS rebuild (the whole LRC lead position, COMPARISON §3.7).
+
+Replace is usually what people want, not add + remove; it preserves the device's position in the stripe geometry.
+
+#### 4.7.4 Fail
+
+A device becomes unavailable: OS removes it, drive dies, cable falls out.
+
+- The pool transitions to **DEGRADED** state. Reads continue via redundancy reconstruction; writes continue on remaining devices.
+- If redundancy tolerance is exceeded (e.g., 3 devices fail in an `rs(6,2)` pool), the pool transitions to **FAULTED** — read-only, requires administrator intervention.
+- Device return: if the same device comes back (same UUID), it re-syncs — only blocks modified during its absence are copied to it. Fast.
+- Permanent loss: administrator runs `pool replace <faulted> <new>`.
+
+### 4.8 Rebalance
+
+Reorganizes data to evenly use all devices. Triggered explicitly:
+
+```
+pool rebalance <pool> [--io-weight=N] [--pause-file=/path]
+```
+
+- Walks the allocator tree, identifying stripes with unbalanced device utilization.
+- Re-allocates via COW: reads the stripe, writes a new stripe with better placement, updates the tree, frees the old.
+- Incremental: progress is checkpointed in the allocator tree; can be stopped and resumed.
+- IO-throttled: `--io-weight=N` (1-100, default 50) caps rebalance IO as a fraction of the device's capability.
+
+Rebalance preserves redundancy invariants at every step — never is a block unreplicated. The COW write produces the new stripe before the old is freed.
+
+### 4.9 Mixed-class pools
+
+A pool can mix device classes. Common configurations:
+
+- **SSD + HDD**: hot tier on SSD, cold tier on HDD. Metadata, log, and small files on SSD; large files on HDD.
+- **PMEM + SSD**: pmem as write log + metadata; SSD as primary storage.
+- **ZNS + conventional**: zoned drives for bulk, conventional for metadata.
+
+#### 4.9.1 Role vs class
+
+- **Role** is a pool-level assignment: `DATA`, `LOG`, `CACHE`, `SPARE`. The pool consults role when deciding where to place data.
+- **Class** is a device-level attribute: `SSD`, `HDD`, `PMEM`, `ZNS`. The placement policy uses class as a hint.
+
+#### 4.9.2 Placement policy
+
+The allocator (§6) uses class + role + a learned model (NOVEL #6) to decide which device's free space to draw from:
+
+- Metadata → fastest available class (PMEM > SSD > HDD).
+- Hot user data → SSD class by default.
+- Cold user data (CAS tier) → HDD class by default.
+- User override via dataset property: `dataset set placement=ssd tank/home` forces SSD placement.
+
+#### 4.9.3 Interaction with CAS tier
+
+CAS (cold) tier uses whatever device class is configured for cold. Hot tier uses any device. A single file can have hot extents on SSD and cold chunks on HDD; the extent record tracks which tier each piece is on.
+
+### 4.10 Hot spares
+
+```
+pool add <pool> <device> role=SPARE
+```
+
+A SPARE device sits idle until a pool device fails. On failure, Stratum automatically invokes `pool replace <faulted> <spare>`, which begins reconstruction onto the spare. Spare use is logged at `/ctl/.../pool/events`.
+
+Multiple spares are supported. Spare selection is first-available or by class-match (a failed HDD is preferred to be replaced by an HDD spare; an SSD failure won't randomly consume an HDD spare).
+
+### 4.11 Interactions with other subsystems
+
+- **§3 Concurrency**: multi-device commits need all devices to confirm Phase 1 (reservation) and Phase 3 (final) writes. If a device fails mid-commit, the quorum rules (§5) determine whether the commit succeeds. The coordinator's commit protocol extends to multi-device fsync barriers.
+- **§5 SB/quorum**: per-device uberblock rings; majority-of-original-roster quorum. Device add advances the roster; quorum rules track the new roster.
+- **§6 Allocator**: stripe-granularity allocation for redundant profiles. Class-aware placement via learned policy.
+- **§7 Crypto + integrity**: nonce naturally unique across devices via paddr's device_id. AEAD AD struct extends to include `device_id` or relies on its presence in the nonce — TBD in §7.3.4.
+- **§8 Namespace**: per-dataset redundancy is a dataset property.
+- **§9 Block device**: block device abstraction is device-agnostic; pool layer picks which device receives a given read/write.
+
+### 4.12 Open questions (for discussion)
+
+- **Class discovery**: do we probe devices for their class (`/sys/block/.../rotational`, `/sys/block/.../queue/zoned`), or require admin declaration? Probably both — probe with admin override.
+- **Heterogeneous-size allocator**: the allocator needs to weight devices by free capacity, not just count. Straightforward in principle; some detail in §6 when we get there.
+- **Rebalance progress persistence**: how the "where I am in the rebalance walk" state survives crashes. Probably: an entry in the allocator tree itself that rebalance writes/reads.
+- **Metadata ditto-block policy**: is `meta=ditto(1)` the default for pools of >= N devices, or always opt-in? Lean toward opt-in; default `meta=default` keeps small-pool behavior simple.
+- **Spare selection priority**: class-match, size-match, or first-available? Pick class-match with size-tiebreak for now; admin can override with a specific `pool replace`.
+- **Log device semantics**: do we support ZFS-style ZIL on a dedicated LOG device? Pairs with fsync latency optimization. Defer the decision to §9 block device, where the write-ahead-log design lives.
+
+### 4.13 Summary
+
+The storage pool is the foundation layer. Key commitments:
+
+1. **Packed paddr**: `(16-bit device, 48-bit offset)`. Natural nonce differentiation across devices.
+2. **Declared redundancy profiles**: mirror, RS, LRC at pool level; override per dataset.
+3. **COW makes RAID safe**: every stripe write is full-stripe; no write hole.
+4. **Lazy add + explicit rebalance**: fast device onboarding; rebalance when the user wants it.
+5. **First-class remove, replace, fail**: all four lifecycle operations supported.
+6. **Mixed-class pools**: SSD + HDD + PMEM + ZNS in one pool, with class-aware placement.
+7. **LRC as differentiator**: single-failure rebuild 2-3× faster than RS (Azure-proven).
+
+Status: DRAFT → awaiting review, push-back, then COMMITTED.
 
 ---
 
@@ -995,8 +1277,8 @@ Each of §3–§5 and §7 is probably its own Phase 0 session. §6, §8, §9–�
 |---|---|---|
 | §1 Purpose | DRAFT | n/a |
 | §2 Layer cake | STUB | 11 (thin pass once rest is settled) |
-| §3 Concurrency | **DRAFT** (this session) | 1 |
-| §4 Storage pool | STUB | 2 |
+| §3 Concurrency | DRAFT | 1 |
+| §4 Storage pool | **DRAFT** (this session) | 2 |
 | §5 Superblock / quorum | STUB | 3 |
 | §6 Allocator | STUB | 4 |
 | §7 Cryptography + integrity | STUB | 5 |
