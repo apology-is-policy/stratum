@@ -1,0 +1,13 @@
+build/
+build-*/
+compile_commands.json
+.cache/
+*.o
+*.a
+*.so
+*.dylib
+
+# Vendored git checkouts (tracked separately as git submodules would be nicer
+# long-term; for now we .gitignore the .git directory inside each)
+third_party/BLAKE3_src/.git/
+third_party/xxHash_src/.git/

@@ -1,0 +1,171 @@
+cmake_minimum_required(VERSION 3.24)
+project(stratum-v2
+    VERSION 2.0.0
+    DESCRIPTION "Stratum v2 — copy-on-write filesystem, PQ-encrypted, lock-free"
+    LANGUAGES C)
+
+# ---------------------------------------------------------------------------
+# Language level, warnings.
+# ---------------------------------------------------------------------------
+set(CMAKE_C_STANDARD 17)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
+
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "" FORCE)
+endif()
+
+list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_LIST_DIR}/cmake)
+
+# ---------------------------------------------------------------------------
+# Options.
+# ---------------------------------------------------------------------------
+set(STM_SANITIZE "off" CACHE STRING
+    "Sanitizer build: off | asan | tsan | msan | ubsan")
+set_property(CACHE STM_SANITIZE PROPERTY STRINGS off asan tsan msan ubsan)
+
+option(STM_ENABLE_IOURING "Enable io_uring backend (Linux only)" ON)
+option(STM_ENABLE_LIBAIO  "Enable libaio backend (pre-5.1 Linux)" OFF)
+option(STM_ENABLE_PQ      "Enable liboqs ML-KEM-768 hybrid wrap"  ON)
+option(STM_BUILD_TESTS    "Build tests"                           ON)
+option(STM_BUILD_FUZZERS  "Build libFuzzer targets (clang only)"  OFF)
+option(STM_COVERAGE       "Enable gcov/lcov coverage"             OFF)
+option(STM_WERROR         "Treat warnings as errors"              ON)
+
+set(STM_AEAD_DEFAULT "auto" CACHE STRING
+    "Default AEAD: aegis256 | xchacha20-siv | auto")
+set_property(CACHE STM_AEAD_DEFAULT PROPERTY STRINGS aegis256 xchacha20-siv auto)
+
+# ---------------------------------------------------------------------------
+# Warnings + sanitizers.
+# ---------------------------------------------------------------------------
+add_library(stm_warnings INTERFACE)
+target_compile_options(stm_warnings INTERFACE
+    -Wall -Wextra -Wpedantic
+    -Wshadow -Wconversion -Wno-sign-conversion
+    -Wstrict-prototypes -Wmissing-prototypes
+    -Wformat=2 -Wnull-dereference
+    -fno-common
+    -fstack-protector-strong
+    -D_FORTIFY_SOURCE=2)
+if(STM_WERROR)
+    target_compile_options(stm_warnings INTERFACE -Werror)
+endif()
+
+add_library(stm_sanitize INTERFACE)
+if(STM_SANITIZE STREQUAL "asan")
+    target_compile_options(stm_sanitize INTERFACE -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options   (stm_sanitize INTERFACE -fsanitize=address,undefined)
+elseif(STM_SANITIZE STREQUAL "tsan")
+    target_compile_options(stm_sanitize INTERFACE -fsanitize=thread -fno-omit-frame-pointer)
+    target_link_options   (stm_sanitize INTERFACE -fsanitize=thread)
+elseif(STM_SANITIZE STREQUAL "msan")
+    target_compile_options(stm_sanitize INTERFACE -fsanitize=memory -fno-omit-frame-pointer -fno-optimize-sibling-calls)
+    target_link_options   (stm_sanitize INTERFACE -fsanitize=memory)
+elseif(STM_SANITIZE STREQUAL "ubsan")
+    target_compile_options(stm_sanitize INTERFACE -fsanitize=undefined -fno-omit-frame-pointer)
+    target_link_options   (stm_sanitize INTERFACE -fsanitize=undefined)
+endif()
+
+add_library(stm_coverage INTERFACE)
+if(STM_COVERAGE)
+    target_compile_options(stm_coverage INTERFACE --coverage -O0 -g)
+    target_link_options   (stm_coverage INTERFACE --coverage)
+endif()
+
+# ---------------------------------------------------------------------------
+# Platform detection.
+# ---------------------------------------------------------------------------
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(STM_PLATFORM_LINUX TRUE)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    set(STM_PLATFORM_DARWIN TRUE)
+endif()
+
+# io_uring only on Linux.
+if(STM_ENABLE_IOURING AND NOT STM_PLATFORM_LINUX)
+    message(STATUS "io_uring disabled (not Linux)")
+    set(STM_ENABLE_IOURING OFF)
+endif()
+
+# ---------------------------------------------------------------------------
+# Dependencies.
+# ---------------------------------------------------------------------------
+find_package(Threads REQUIRED)
+find_package(PkgConfig REQUIRED)
+
+pkg_check_modules(LIBSODIUM REQUIRED IMPORTED_TARGET libsodium>=1.0.19)
+
+if(STM_ENABLE_IOURING)
+    pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing>=2.3)
+endif()
+
+if(STM_ENABLE_LIBAIO)
+    pkg_check_modules(LIBAIO REQUIRED IMPORTED_TARGET libaio>=0.3)
+endif()
+
+if(STM_ENABLE_PQ)
+    # liboqs doesn't ship pkg-config universally; try both paths.
+    find_package(liboqs QUIET)
+    if(NOT liboqs_FOUND)
+        pkg_check_modules(LIBOQS IMPORTED_TARGET liboqs>=0.9.0)
+        if(NOT LIBOQS_FOUND)
+            message(WARNING "liboqs not found; PQ hybrid wrap disabled. "
+                            "Set STM_ENABLE_PQ=OFF to silence, or install liboqs.")
+            set(STM_ENABLE_PQ OFF)
+        endif()
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# Vendored third-party.
+# ---------------------------------------------------------------------------
+add_subdirectory(third_party)
+
+# ---------------------------------------------------------------------------
+# Core subsystems.
+# ---------------------------------------------------------------------------
+add_subdirectory(src/util)
+add_subdirectory(src/hash)
+add_subdirectory(src/crypto)
+add_subdirectory(src/block)
+
+# ---------------------------------------------------------------------------
+# Public aggregate library.
+# ---------------------------------------------------------------------------
+add_library(stratum INTERFACE)
+target_link_libraries(stratum INTERFACE
+    stm_util
+    stm_hash
+    stm_crypto
+    stm_block)
+target_include_directories(stratum INTERFACE
+    ${CMAKE_CURRENT_LIST_DIR}/include)
+
+# ---------------------------------------------------------------------------
+# Tests.
+# ---------------------------------------------------------------------------
+if(STM_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
+
+# ---------------------------------------------------------------------------
+# Configuration summary.
+# ---------------------------------------------------------------------------
+message(STATUS "")
+message(STATUS "Stratum v2 configuration")
+message(STATUS "  Platform       : ${CMAKE_SYSTEM_NAME}")
+message(STATUS "  Build type     : ${CMAKE_BUILD_TYPE}")
+message(STATUS "  Sanitizer      : ${STM_SANITIZE}")
+message(STATUS "  io_uring       : ${STM_ENABLE_IOURING}")
+message(STATUS "  libaio         : ${STM_ENABLE_LIBAIO}")
+message(STATUS "  PQ (liboqs)    : ${STM_ENABLE_PQ}")
+message(STATUS "  AEAD default   : ${STM_AEAD_DEFAULT}")
+message(STATUS "  Coverage       : ${STM_COVERAGE}")
+message(STATUS "  Werror         : ${STM_WERROR}")
+message(STATUS "  Tests          : ${STM_BUILD_TESTS}")
+message(STATUS "  Fuzzers        : ${STM_BUILD_FUZZERS}")
+message(STATUS "")
