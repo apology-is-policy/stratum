@@ -236,15 +236,18 @@ STM_TEST(ebr_concurrent_stress) {
     atomic_store(&stop, true);
     pthread_join(advancer, NULL);
 
-    /* Drain any remaining retires. Keep going until the pending-retires
-     * counter stabilizes (no more progress possible). */
-    uint64_t prev = ~0ull;
-    for (int i = 0; i < 100; i++) {
+    /*
+     * Drain any remaining retires. We keep advancing for a bounded number
+     * of iterations rather than stopping when pending_retires goes flat —
+     * the push-back path for records retired during an active advance
+     * window shows no progress on a single iteration, but progress is
+     * guaranteed over time as the epoch catches up. Bound to something
+     * well past 3 × max_epoch_seen so any surviving records eventually
+     * age into the reclaimable window.
+     */
+    for (int i = 0; i < 256; i++) {
         stm_ebr_try_advance();
-        uint64_t cur = stm_ebr_pending_retires();
-        if (cur == 0) break;
-        if (cur == prev) break;
-        prev = cur;
+        if (atomic_load(&g_freed) >= atomic_load(&retire_ct)) break;
     }
 
     int retires = atomic_load(&retire_ct);
