@@ -193,6 +193,13 @@ int ensure_msg_cap(struct stm_node *n, uint32_t need)
 /* Deep-copy a node. Used by split_root so an in-progress split can be
  * abandoned without having mutated the live tree->root. Returns NULL on
  * any allocation failure, leaving no partial state. */
+/* Deep-copy a node. Entries / messages / val buffers are all duplicated,
+ * so callers can mutate the clone independently. Intentionally does NOT
+ * copy src->paddr (clone starts with paddr = STM_BADDR_NONE) or
+ * src->dirty (starts dirty=1). Both fields are diagnostic — no code path
+ * reads them off a non-root node — so the clone's "freshly-allocated"
+ * defaults are harmless. Callers that want a byte-identical replica
+ * should set paddr/dirty themselves after cloning. */
 struct stm_node *stm_node_clone(const struct stm_node *src)
 {
     struct stm_node *n;

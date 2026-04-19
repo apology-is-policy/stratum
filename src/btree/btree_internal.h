@@ -82,7 +82,6 @@ struct stm_btree {
 
 struct stm_node_cache *stm_node_cache_new(uint32_t capacity);
 void                   stm_node_cache_free(struct stm_node_cache *c);
-void                   stm_node_cache_flush(struct stm_node_cache *c);
 void                   stm_node_cache_insert(struct stm_node_cache *c,
                                              uint64_t paddr,
                                              struct stm_node *node);

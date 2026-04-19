@@ -10,25 +10,29 @@
  *
  * Correctness contract (see docs/STRATUM.md §22 and CLAUDE.md):
  *
- *   INVARIANT: at any moment, a cache entry (paddr, node) reflects
- *              EXACTLY the node most recently written to `paddr` in
- *              this session. The cache never returns stale data.
+ *   INVARIANT: the cache never returns stale data. A cache hit for
+ *              paddr P returns a clone of content that is guaranteed
+ *              identical to what a disk read at P would return right now.
  *
  * The invariant is maintained by:
  *
  *   1. `stm_btree_read_node` inserts (paddr, clone-of-node) on every
- *      successful read (and serves from cache on hit, skipping disk).
- *   2. `stm_btree_write_node` inserts (paddr, clone-of-node) on every
- *      successful write — overwriting any stale entry at the same paddr.
- *      Since writes always go to fresh paddrs (COW via stm_alloc_extent),
- *      this is how a paddr reallocated across a sync gets a fresh entry.
+ *      successful read, and serves from cache on hit (skipping disk).
+ *   2. `stm_btree_write_node` INVALIDATES any entry at the written paddr
+ *      on success — it does NOT re-populate. Writes always go to fresh
+ *      COW paddrs, so the invariant is trivially preserved for those.
+ *      The invalidate handles the one edge case: a paddr freed in an
+ *      earlier sync cycle, committed PENDING → free, then re-allocated
+ *      for a new write. Any stale entry from its previous life gets
+ *      dropped here; next read will repopulate from disk. (Earlier
+ *      drafts had write_node clone-and-insert; benchmarking showed a
+ *      3.3× regression on write-heavy workloads, so it was changed to
+ *      invalidate-only.)
  *   3. `stm_btree_close` destroys the cache and every node it holds.
- *   4. `stm_btree_cache_flush` — called from snap_rollback reopen paths
- *      and any context where the tree's root is being replaced wholesale.
  *
  * Because every stm_btree_write_node allocates a fresh paddr, no in-session
  * "write-behind" problem exists. Cross-sync paddr reuse is handled by
- * rule (2): when the reused paddr is written to, the cache entry updates.
+ * rule (2).
  *
  * Clone-on-hit (via stm_node_clone) preserves the existing ownership
  * model — callers of stm_btree_read_node own the returned struct stm_node
@@ -62,10 +66,11 @@ struct stm_node_cache {
 
 static uint32_t hash_paddr(uint64_t paddr)
 {
-    /* paddrs are node-size aligned; divide out the alignment to widen the
-     * low bits before masking. Mixing via golden ratio smooths clustering
-     * if paddrs ever become non-uniformly distributed. */
-    uint64_t h = paddr / (uint64_t)STM_NODE_SIZE;
+    /* paddrs are STM_BLOCK_SIZE-aligned (returned by stm_alloc_extent as
+     * base_block * STM_BLOCK_SIZE). Divide out the low zero bits before
+     * mixing so unique blocks produce unique hash inputs; golden-ratio
+     * multiplication scrambles clustering regardless. */
+    uint64_t h = paddr / (uint64_t)STM_BLOCK_SIZE;
     h *= UINT64_C(0x9E3779B97F4A7C15);
     return (uint32_t)(h >> 32) & (CACHE_BUCKETS - 1);
 }
@@ -216,25 +221,6 @@ struct stm_node *stm_node_cache_get(struct stm_node_cache *c, uint64_t paddr)
     if (!e) return NULL;
     lru_touch(c, e);
     return stm_node_clone(e->node);
-}
-
-/* Invalidate every entry. Called from rollback's tree-replacement path —
- * after fs->tree is reopened at a different root, the prior cache's
- * contents might correspond to paddrs that the new tree doesn't reference
- * and that could be reallocated before the cache entries age out. */
-void stm_node_cache_flush(struct stm_node_cache *c)
-{
-    if (!c) return;
-    struct cache_entry *e = c->lru_head;
-    while (e) {
-        struct cache_entry *next = e->lru_next;
-        entry_free(e);
-        e = next;
-    }
-    memset(c->buckets, 0, sizeof(c->buckets));
-    c->lru_head = NULL;
-    c->lru_tail = NULL;
-    c->count = 0;
 }
 
 /* Number of entries currently cached — for tests / diagnostics. */

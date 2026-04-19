@@ -165,6 +165,17 @@ int stm_cmd_scrub(int argc, char **argv)
      * at SENSITIVE tier. Without a pre-open message the user sees a
      * dead terminal during that window. */
     fprintf(stderr, "Opening %s...\n", path);
+
+    /* Disable the btree node LRU cache for the scrub session. Scrub's
+     * promise is that every node reachable from any root — main tree,
+     * snap tree, every saved snapshot's subtree — is AEAD-verified
+     * against on-disk bytes during the run. Nodes shared between the
+     * main tree and snapshot subtrees (routine under COW) would
+     * otherwise hit the cache on the second walk and skip disk + AEAD
+     * verification. Setenv before stm_fs_open_ro so stm_btree_open
+     * sees capacity 0 and declines to allocate a cache. */
+    setenv("STM_CACHE_SIZE", "0", 1);
+
     struct stm_fs *fs = NULL;
     int rc = stm_fs_open_ro(path, pass, &fs);
     if (rc) {
