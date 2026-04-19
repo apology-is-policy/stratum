@@ -39,6 +39,22 @@ set(STM_AEAD_DEFAULT "auto" CACHE STRING
 set_property(CACHE STM_AEAD_DEFAULT PROPERTY STRINGS aegis256 xchacha20-siv auto)
 
 # ---------------------------------------------------------------------------
+# Platform detection — must run before warnings/sanitizer setup so feature-
+# test macros and fortify gating can consult STM_PLATFORM_*.
+# ---------------------------------------------------------------------------
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(STM_PLATFORM_LINUX TRUE)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    set(STM_PLATFORM_DARWIN TRUE)
+endif()
+
+# io_uring only on Linux.
+if(STM_ENABLE_IOURING AND NOT STM_PLATFORM_LINUX)
+    message(STATUS "io_uring disabled (not Linux)")
+    set(STM_ENABLE_IOURING OFF)
+endif()
+
+# ---------------------------------------------------------------------------
 # Warnings + sanitizers.
 # ---------------------------------------------------------------------------
 add_library(stm_warnings INTERFACE)
@@ -101,21 +117,6 @@ add_library(stm_coverage INTERFACE)
 if(STM_COVERAGE)
     target_compile_options(stm_coverage INTERFACE --coverage -O0 -g)
     target_link_options   (stm_coverage INTERFACE --coverage)
-endif()
-
-# ---------------------------------------------------------------------------
-# Platform detection.
-# ---------------------------------------------------------------------------
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    set(STM_PLATFORM_LINUX TRUE)
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-    set(STM_PLATFORM_DARWIN TRUE)
-endif()
-
-# io_uring only on Linux.
-if(STM_ENABLE_IOURING AND NOT STM_PLATFORM_LINUX)
-    message(STATUS "io_uring disabled (not Linux)")
-    set(STM_ENABLE_IOURING OFF)
 endif()
 
 # ---------------------------------------------------------------------------

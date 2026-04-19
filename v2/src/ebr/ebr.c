@@ -104,7 +104,8 @@ stm_status stm_ebr_init(void)
 stm_ebr_thread *stm_ebr_register(void)
 {
     if (!atomic_load(&g.initialized)) {
-        (void)stm_ebr_init();
+        stm_status s = stm_ebr_init();
+        if (s != STM_OK) return NULL;
     }
 
     /* C11 aligned_alloc requires size to be a multiple of alignment; macOS
