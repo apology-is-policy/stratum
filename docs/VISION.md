@@ -201,31 +201,102 @@ When two properties conflict, the one ranked higher in the overall priority (dec
 
 ---
 
-### 4.13 The meta-ranking
+### 4.13 The meta-ranking (final)
 
-We can't optimize for everything. When two properties conflict, which wins? A tentative ordering, **for discussion**:
+We can't optimize for everything. When two properties conflict, which wins? The committed ordering:
 
 1. **Crash safety** — nothing matters if a power failure can corrupt the volume.
 2. **Data integrity (detection + repair)** — corruption we can't find is corruption we ship to the user.
 3. **Security** — encryption and tamper-evidence are non-negotiable for the target workloads.
-4. **Concurrency** — a single-threaded filesystem can't be an OS root in 2026+.
-5. **Memory footprint** — OS-root means running on resource-constrained systems.
+4. **Concurrency** — a single-threaded filesystem can't be an OS root in 2026+. Bumped to max within its pairwise conflicts (lock-free readers + MVCC).
+5. **Memory footprint** — OS-root means running on resource-constrained systems. Target 1 MiB allocator RAM per TiB.
 6. **Feature richness** — must match ZFS/btrfs for target-user credibility.
-7. **Throughput** — important but can be traded for the above.
-8. **Latency** — ditto; optimizable after the structure is right.
-9. **Implementation simplicity** — a forcing function, not a deliverable.
-10. **On-disk format stability** — only starts mattering at v2.0 release.
-11. **Portability** — bonus, not a constraint.
+7. **Latency** — tail-latency budget enforces that integrity costs don't become pauses (see §4.14).
+8. **Throughput** — aggregate bandwidth is allowed to land at ~70% of raw device if integrity needs it. Target workloads don't saturate disk.
+9. **On-disk format stability** — only starts mattering at v2.0 release.
+10. **Portability** — bonus, not a constraint. FUSE + 9P costs us ~15-30% performance ceiling and some POSIX edge cases, none of which constrain the design.
+11. **Implementation simplicity** — traded for verification rigor. Complexity is allowed where we can machine-check it (formal specs, fuzzers, audit loops).
 
-**The question for you**: is this ordering right? Specifically:
-- Should *security* come before *integrity*? (I put integrity higher because an unencrypted-but-correct file is more useful than an encrypted-but-corrupt file.)
-- Should *concurrency* come before *memory footprint*? (I put concurrency higher because memory can be bought; serialization is architectural.)
-- Should *throughput* come before *feature richness*? (I put feature richness higher because the target users need the features; a fast filesystem without snapshots isn't a contender.)
-- Is anything missing from the list?
+### 4.14 Tail-latency budget
 
-Every downstream design decision flows from this ordering. E.g.: "should we Merkle-verify metadata on every mount or defer to background scrub?" — if integrity > throughput, mount-time verify. If throughput > integrity, background. The ordering decides.
+Throughput ranking says "70% of raw is fine." That isn't a license for tail-latency spikes. A 50ms pause during a commit is invisible as throughput loss but visible to any user expecting sub-millisecond operations.
 
-## 5. Non-goals
+The budget, committed at v2.0:
+
+- **Small read p99.9 ≤ 500µs** (NVMe, cache hit or miss).
+- **Small write p99.9 ≤ 2ms** (NVMe, buffered; the fsync path can be longer).
+- **fsync p99.9 ≤ 10ms** (commit point; batches integrity work).
+- **Scrub and background repair never visible on foreground p99.9.**
+
+Integrity work gets amortized across many small commits, not concentrated into a few large ones. Merkle-root computation per commit is sized to the commit's tree delta, not the whole tree. Mount-time metadata verification is opt-in (`stratum mount --verify`) rather than default, to keep `mount` p99.9 reasonable; full verification happens in scrub, continuously.
+
+## 5. Committed design choices
+
+The decisions made during Phase 0 discussion, 2026-04-19. Each one follows from the ranking above and constrains `ARCHITECTURE.md`.
+
+### 5.1 Complexity stance
+
+**Maximum complexity is permitted where it can be verified.** Implementation simplicity is ranked last. The trade:
+
+- Every load-bearing invariant gets a machine-checkable spec (TLA+ or equivalent).
+- Fuzzers and property-based tests are part of the development loop, not an afterthought.
+- The audit loop that proved itself on v1 (15 rounds, ~60 corruption-class fixes found) becomes a permanent part of the development cadence.
+- Running detailed technical documentation in `docs/` is load-bearing — undocumented complexity is the failure mode.
+
+This elevates formal verification (novel angle #1) from "nice to have" to load-bearing. We can only afford aggressive complexity if we can verify it.
+
+### 5.2 Nonce model — End A + AEAD-SIV
+
+**Transaction-group-serialized nonce allocation** (ZFS-style), combined with **nonce-misuse-resistant AEAD** (XChaCha20-SIV or AEGIS-256) as belt-and-suspenders.
+
+- Writers parallelize up to the commit point; commit is serialized. Nonce allocation is trivial under serialization.
+- Readers are fully lock-free via MVCC; concurrency story is mostly about reads anyway.
+- SIV construction means that even if a bug causes nonce reuse, worst case is "these two plaintexts are equal" leakage rather than full plaintext recovery.
+- No production filesystem uses AEAD-SIV. This is a concrete novel angle — replaces "PQ crypto by default" as the lead crypto story with "PQ + nonce-misuse resistant, belt and suspenders."
+
+### 5.3 Erasure coding — Reed-Solomon + Locally Repairable Codes
+
+**RS as the baseline** (peer with ZFS raidz), **LRC as the large-pool profile** (Azure-proven, 2-3× faster single-failure rebuild).
+
+- RS(k, n): classical, MDS-optimal, Intel ISA-L SIMD implementation.
+- LRC(k, l, r): local parity groups reduce single-failure I/O; global parity handles multi-failure.
+- First open-source filesystem to offer first-class LRC.
+
+### 5.4 Memory model — succinct structures + modest cache
+
+**Wavelet trees / rank-select / SDArrays / xor filters** for in-RAM state representation. Modest W-TinyLFU cache (64-128 MiB) for hot metadata.
+
+- Target: 1 MiB allocator RAM per TiB of data (1000× ZFS).
+- First filesystem to use succinct data structures at the metadata-state level.
+
+### 5.5 Plan 9 architectural inheritances
+
+Stratum picks up the thread Plan 9's Fossil + Venti started in 2002 and carries it forward with 25 years of hindsight.
+
+- **Venti-style CAS cold tier.** Unifies content-defined chunking + tiered storage + dedup into one coherent architecture. Hot tier is the Bε-tree; cold tier is content-addressed (BLAKE3 or SHA3-256 keyed), append-only, dedup by construction. Learned-migration model decides hot → cold.
+- **Per-connection 9P namespaces.** Subvolume composition is per-connection, not global. Native multi-client isolation; containers and OS services get private namespace views without extra layers.
+- **Synthetic `/ctl/` admin interface.** Administration is `cat`, `echo`, `ls`. No separate `zfs`/`btrfs` CLI with bespoke output formats. Remote admin is 9P forwarding.
+- **9P-first architectural stance.** 9P is the native protocol; FUSE, future Linux kernel module, and any other transport are clients. Encryption, authentication, and multi-client support happen at the 9P boundary.
+- **Factotum-style key agent.** Key management separated into a dedicated agent process. FS asks for unwraps; agent mediates access, logs, rotates, proxies to HSM/TPM/YubiKey/cloud KMS.
+
+### 5.6 The consolidated novel-angles list
+
+After merging the Plan 9 inheritances and the decisions above, the leading differentiators become:
+
+1. **Formally verified sync + crash protocol.** TLA+ spec, machine-checked correctness under arbitrary write reordering.
+2. **PQ-hybrid AEAD-SIV encryption.** ML-KEM-768 wrap + XChaCha20-SIV / AEGIS-256 data encryption. First FS with both PQ default and nonce-misuse-resistant AEAD.
+3. **Venti-style CAS cold tier with content-defined boundaries.** Dedup + tiering + CDC in one architecture.
+4. **Lock-free metadata path + MVCC readers.** Bw-tree-style lock-free Bε-tree; zero-contention reads.
+5. **Merkle-rooted metadata integrity.** Tamper-evident — every offline metadata edit cryptographically detectable.
+6. **Succinct in-RAM state.** Wavelet trees / rank-select / xor filters. ~1 MiB allocator RAM per TiB.
+7. **io_uring-native zero-copy I/O.** Modern block device abstraction, DAX-ready.
+8. **Per-connection 9P namespaces.** Plan 9's per-process-namespace model, exposed per 9P connection. Native container/service isolation.
+9. **Synthetic-file administration.** All admin via `/ctl/`. No separate tool.
+10. **Factotum-style key agent.** HSM/TPM/KMS-proxyable key management, separated from the FS.
+
+Nine genuine lead positions. The plan is not to match ZFS/btrfs — it's to leapfrog them architecturally by combining a modern security stack with Plan 9's filesystem-design thread.
+
+## 6. Non-goals
 
 Explicit non-goals, with rationale:
 
@@ -238,17 +309,10 @@ Explicit non-goals, with rationale:
 - **General-purpose defragmenter.** COW + content-defined chunking makes most defrag moot. We don't ship one.
 - **Online deduplication as a background job.** Content-defined chunking gives us dedup for free at the extent layer. No separate dedup tree.
 
-## 6. Summary claim
+## 7. Summary claim
 
-Stratum v2 is the COW filesystem you'd design in 2026 if you were starting from scratch with the benefit of 25 years of filesystem hindsight — ZFS's reliability bar, btrfs's feature richness, ext4's efficiency, plus formal verification, post-quantum crypto, content-defined chunking, Merkle-rooted integrity, lock-free metadata, tiered storage, and io_uring-native I/O as first-class design elements rather than add-ons.
+Stratum v2 is the COW filesystem you'd design in 2026 if you were starting from scratch with the benefit of 25 years of filesystem hindsight — ZFS's reliability bar, btrfs's feature richness, ext4's efficiency — plus **Plan 9's architectural lineage** (Fossil/Venti tiered storage, per-connection namespaces, synthetic-file administration) carried forward with **modern foundations**: formal verification, post-quantum nonce-misuse-resistant AEAD, succinct in-memory state, lock-free metadata, Merkle-rooted integrity, locally-repairable erasure coding, io_uring-native I/O.
 
-It is not a research filesystem — it's meant to be the thing you actually use. But it uses the research.
+It is not a research filesystem — it is meant to be the thing you actually use. But it uses the research.
 
----
-
-## Open questions for the reader
-
-1. Is the property ranking in §4.13 right? Which swaps would you make?
-2. Which workload tier (§2) is overweighted or underweighted in the ranking?
-3. Is anything in §5 (non-goals) actually a goal you'd want?
-4. Is anything not in §5 that you'd explicitly rule out?
+The consolidated value proposition: **Plan 9's thread, picked back up and carried forward.**
