@@ -140,6 +140,7 @@ add_subdirectory(src/util)
 add_subdirectory(src/hash)
 add_subdirectory(src/crypto)
 add_subdirectory(src/block)
+add_subdirectory(src/ebr)
 
 # ---------------------------------------------------------------------------
 # Public aggregate library.
@@ -149,7 +150,8 @@ target_link_libraries(stratum INTERFACE
     stm_util
     stm_hash
     stm_crypto
-    stm_block)
+    stm_block
+    stm_ebr)
 target_include_directories(stratum INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/include)
 
