@@ -1,6 +1,6 @@
 # Stratum — The Definitive Technical Reference
 
-**Version**: repository state at commit `405c4fb` (R14: counter wraparound defense), updated through the R0–R14 soundness audit loop. The three-phase sync and AEAD nonce invariant machinery in §7 and §22 is load-bearing — see `CLAUDE.md` for the audit-triggering change policy.
+**Version**: repository state at commit `0d674ee` (SOTA #1 FUSE backend), updated through the R0–R14 soundness audit loop and the Phase A–C feature work. The three-phase sync and AEAD nonce invariant machinery in §7 and §23 is load-bearing — see `CLAUDE.md` for the audit-triggering change policy.
 **Scope**: This document describes every user-visible behavior, every on-disk structure, every algorithm, and every known quirk of the Stratum filesystem. It is written to be exhaustive: a future engineer should be able to reimplement Stratum from scratch using only this document, or debug any concrete issue without reading the source.
 
 ---
@@ -22,13 +22,14 @@
 13. [9P protocol server](#13-9p-protocol-server)
 14. [CLI (stratum)](#14-cli-stratum)
 15. [TUI (stratum-tui)](#15-tui-stratum-tui)
-16. [Build system](#16-build-system)
-17. [Testing](#17-testing)
-18. [Performance characteristics](#18-performance-characteristics)
-19. [Edge cases and gotchas](#19-edge-cases-and-gotchas)
-20. [Known limitations / future work](#20-known-limitations--future-work)
-21. [Glossary](#21-glossary)
-22. [Soundness invariants](#22-soundness-invariants)
+16. [FUSE backend (stratum-fuse)](#16-fuse-backend-stratum-fuse)
+17. [Build system](#17-build-system)
+18. [Testing](#18-testing)
+19. [Performance characteristics](#19-performance-characteristics)
+20. [Edge cases and gotchas](#20-edge-cases-and-gotchas)
+21. [Known limitations / future work](#21-known-limitations--future-work)
+22. [Glossary](#22-glossary)
+23. [Soundness invariants](#23-soundness-invariants)
 
 ---
 
@@ -55,7 +56,7 @@ Stratum is a **user-space copy-on-write filesystem** that stores a single volume
 - **Block-device backend** — only file-backed volumes exist.
 - **Journaling / WAL** — crash safety is provided purely by COW + ping-pong superblocks.
 - **Defragmentation** — no user-visible defrag.
-- **Kernel FUSE mount** — there is no FUSE bridge. Applications must talk 9P.
+- ~~**Kernel FUSE mount** — there is no FUSE bridge.~~ **Landed (§16).** Applications can talk 9P or mount the volume via `stratum-fuse`.
 
 ### 1.3 Relation to other COW filesystems
 
@@ -373,7 +374,7 @@ An earlier version freed old blocks using the NEW node's compressed size — wro
 
 ### 7.1 Ping-pong superblocks
 
-Two SB slots at block 0 and block 1. On mount, both are read, csum-verified, version-checked (only v1 accepted; non-v1 deterministically loses the tiebreak even at higher gen), and the higher-`ss_gen` valid slot wins. See §22 for the full mount selection policy.
+Two SB slots at block 0 and block 1. On mount, both are read, csum-verified, version-checked (only v1 accepted; non-v1 deterministically loses the tiebreak even at higher gen), and the higher-`ss_gen` valid slot wins. See §23 for the full mount selection policy.
 
 ### 7.2 The generation invariant
 
@@ -507,7 +508,7 @@ It is persisted alongside the ciphertext:
 - Btree nodes store it in `bp_write_gen` of the parent's bptr.
 - Data extents store it in `se_write_gen` of the extent record.
 
-Why it matters: `paddr` alone is not unique across time. Under COW, a block may be freed and later re-allocated for a different piece of data; encrypting that new plaintext under `(DEK, nonce=paddr)` would reuse the same nonce with the same key, destroying confidentiality (XOR of the two ciphertexts = XOR of the two plaintexts — a classic stream-cipher catastrophe). Mixing `write_gen` into the nonce makes every re-use distinct, because `fs->gen` strictly increases across syncs — **but only if the disk generation counter stays strictly ahead of any gen ever used for ciphertext, across every mount boundary and every crash**. See §7.2 for the three-phase sync + mount-bump + rollback-bump machinery that maintains that strict inequality, and §22 for the full invariant statement.
+Why it matters: `paddr` alone is not unique across time. Under COW, a block may be freed and later re-allocated for a different piece of data; encrypting that new plaintext under `(DEK, nonce=paddr)` would reuse the same nonce with the same key, destroying confidentiality (XOR of the two ciphertexts = XOR of the two plaintexts — a classic stream-cipher catastrophe). Mixing `write_gen` into the nonce makes every re-use distinct, because `fs->gen` strictly increases across syncs — **but only if the disk generation counter stays strictly ahead of any gen ever used for ciphertext, across every mount boundary and every crash**. See §7.2 for the three-phase sync + mount-bump + rollback-bump machinery that maintains that strict inequality, and §23 for the full invariant statement.
 
 ### 9.4 AEAD integrity
 
@@ -734,9 +735,112 @@ Works only on stratum-mounted panels.
 
 ---
 
-## 16. Build system
+## 16. FUSE backend (stratum-fuse)
 
-### 16.1 CMake (C)
+SOTA #1. A userspace FUSE daemon that serves a Stratum volume at a POSIX mount point. Every Unix tool (`ls`, `cat`, `vim`, `grep`, `rsync`, `git`, `tar`, `find`, `rm`, `cp`) works against a Stratum volume as an ordinary filesystem. Complements the 9P server — same `stm_fs_*` backend, different frontend.
+
+### 16.1 Architecture
+
+```
+user process   (ls / cat / vim / rsync / ...)
+     │ POSIX syscall
+     ▼
+VFS  (kernel)
+     │
+FUSE kernel module (fuse.ko on Linux, macFUSE kext on macOS)
+     │ /dev/fuse
+     ▼
+stratum-fuse daemon (C, linked with libfuse3 + stratum-lib)
+     │ direct call
+     ▼
+stm_fs_* API  →  Bε-tree  →  block device  (same backend 9P uses)
+```
+
+**Direct link to stratum-lib**, not IPC. Every FUSE callback is a thin wrapper over the corresponding `stm_fs_*` function. Inode numbers are passed through unchanged — `fuse_ino_t` is `uint64_t`, `STM_ROOT_INO` and `FUSE_ROOT_ID` both equal 1.
+
+### 16.2 Operation mapping
+
+| FUSE op | stm_fs_* | Status |
+|---|---|---|
+| `lookup(parent, name)` | `stm_fs_lookup` + `stm_fs_stat` | wired |
+| `getattr(ino)` | `stm_fs_stat` | wired |
+| `setattr(ino, attr, to_set)` | — | **accept-and-ignore** until #5 |
+| `mkdir(parent, name, mode)` | `stm_fs_mkdir` | wired |
+| `rmdir(parent, name)` | `stm_fs_unlink` | wired (checks empty via -ENOTEMPTY) |
+| `create(parent, name, mode)` | `stm_fs_create_file` | wired |
+| `unlink(parent, name)` | `stm_fs_unlink` | wired |
+| `open(ino, flags)` | noop | wired (no per-handle state) |
+| `read(ino, size, off)` | `stm_fs_read` | wired |
+| `write(ino, buf, size, off)` | `stm_fs_write` | wired |
+| `flush(ino, fi)` | noop | wired (no per-close sync; avoid spam) |
+| `release(ino, fi)` | `stm_fs_sync` | wired (sync on last close, mirrors 9P h_clunk) |
+| `fsync(ino, datasync)` | `stm_fs_sync` | wired |
+| `readdir(ino, size, off)` | `stm_fs_readdir` | wired (via `fuse_add_direntry`) |
+| `statfs(ino)` | placeholder | wired (generic values until SOTA #2) |
+| `rename`, `link`, `symlink`, `readlink`, `mknod`, `setxattr`, `getxattr`, `listxattr`, `removexattr`, `access` | — | **ENOSYS** until SOTA #5 |
+
+**`setattr` accept-and-ignore rationale**: POSIX tools (`touch`, `cp -p`, editor saves) call setattr after create to adjust timestamps. Returning ENOSYS would break them loudly. Accepting (and returning the current unchanged attrs) lets them proceed. When SOTA #5 wires real mutation through, we swap the implementation without breaking callers.
+
+### 16.3 Concurrency
+
+**Single-threaded event loop** (`fuse_session_loop`, not `_mt`). `stm_fs_*` is not thread-safe — two concurrent inserts would race in the btree message buffer. Single-threaded is both correct and simpler. Multi-threaded FUSE would need either a global mutex around every `stm_fs_*` call or fine-grained locking inside the btree; the latter is SOTA #14 territory.
+
+### 16.4 Lifecycle
+
+```
+stratum-fuse <volume> <mountpoint>
+    [--pass <p>|--pass-stdin]  passphrase for encrypted volumes
+    [-f]                         foreground (useful for debugging)
+    [-d]                         debug (verbose libfuse trace; implies -f)
+```
+
+Flow:
+1. Parse args. Read passphrase if requested.
+2. `stm_fs_open` the volume.
+3. `fuse_session_new` with the callback table.
+4. `fuse_set_signal_handlers` — Ctrl-C / SIGTERM exit the loop cleanly.
+5. `fuse_session_mount` — kernel attaches `/dev/fuse` to the mountpoint.
+6. `fuse_daemonize(0)` unless `-f` / `-d` — fork, detach from terminal.
+7. `fuse_session_loop` — process requests until a signal breaks the loop.
+8. `fuse_session_unmount` + `fuse_session_destroy` + `stm_fs_close`.
+
+**Unmount**:
+- Linux: `fusermount -u <mountpoint>` (or kill the daemon and the kernel unmounts on FUSE disconnect).
+- macOS: `umount <mountpoint>` (macFUSE doesn't ship `fusermount`).
+
+Abnormal termination (SIGKILL, panic) leaves a stale mount; the user clears it with the same commands.
+
+### 16.5 Security
+
+- **Per-user mount**: no `-o allow_other`. Only the user who ran `stratum-fuse` can see the mount.
+- **uid/gid**: FUSE passes caller uid/gid via `fuse_req_ctx()`. Stratum's inode struct has `si_uid` / `si_gid` fields but they aren't enforced yet (SOTA #5 POSIX completion). Every op is effectively attributed to the mounting user.
+- **Inherit from the volume's security story**: on encrypted volumes, the FUSE daemon holds the DEK in memory for the lifetime of the process; close via signal wipes it (via `stm_fs_close` → `memset(fs->dek, 0, ...)`).
+
+### 16.6 Performance
+
+FUSE introduces ~20-50 μs overhead per op (two kernel↔userspace transitions) vs direct `stm_fs_*` calls. The recently-landed btree node LRU cache (SOTA #3) eliminates redundant tree walks across successive ops, so the FUSE path doesn't compound disk-read overhead.
+
+Expect roughly comparable throughput to the 9P path for streaming I/O, slightly faster for metadata-chatty workloads (`ls -laR`, `find`) because FUSE uses in-kernel attribute caching (1-second timeout by default — safe because the daemon is the only writer).
+
+### 16.7 Platform requirements
+
+| Platform | Requirement | Install |
+|---|---|---|
+| Linux | libfuse3 ≥ 3.x headers + runtime | `apt install libfuse3-dev` / `dnf install fuse3-devel` |
+| macOS | macFUSE (must be kext-approved in System Settings → Privacy & Security before first mount) | macFUSE installer from <https://macfuse.github.io/> |
+
+If libfuse3 isn't present at configure time, CMake prints `"libfuse3 not found: stratum-fuse will be skipped"` and the rest of the build proceeds. The 9P server + TUI remain fully functional without FUSE.
+
+### 16.8 Build-time notes
+
+- macFUSE's `fuse_lowlevel.h` uses `typeof` (a GNU extension) for its Darwin-extended op signatures. The `stratum-fuse` CMake target overrides `-std=c99` to `-std=gnu99` via `target_compile_options`.
+- We force `FUSE_DARWIN_ENABLE_EXTENSIONS=0` so the callback signatures match the vanilla Linux libfuse3 API on both platforms. Without this, macFUSE's setattr would take `struct fuse_darwin_attr *` instead of `struct stat *`.
+
+---
+
+## 17. Build system
+
+### 17.1 CMake (C)
 
 ```
 cmake -B build -DCMAKE_BUILD_TYPE=Release .
@@ -747,8 +851,9 @@ Optional dependencies (each enables a feature):
 - LZ4 / ZSTD → compression
 - libsodium → encryption
 - xxhash → checksums
+- libfuse3 → `stratum-fuse` binary (§16)
 
-### 16.2 Cargo (Rust TUI)
+### 17.2 Cargo (Rust TUI)
 
 ```
 cd tui && cargo build --release
@@ -756,7 +861,7 @@ cd tui && cargo build --release
 
 ---
 
-## 17. Testing
+## 18. Testing
 
 - **11 C test suites** in `tests/`, covering types, keys, blocks, nodes, btree, fs (including 10-cycle copy-delete stress tests both plain and encrypted), compression, crypto, snapshots, 9P, allocator.
 - **Rust integration tests** in `tui/tests/integration.rs`: 10 scenarios via CLI (small/large files, overwrite, sparse, binary integrity, autogrow, 200 small files, performance scaling).
@@ -764,7 +869,7 @@ cd tui && cargo build --release
 
 ---
 
-## 18. Performance characteristics
+## 19. Performance characteristics
 
 - CLI: 300-500 MB/s on modern SSD.
 - TUI: 150-200 MB/s (UI overhead).
@@ -782,7 +887,7 @@ Key optimizations applied (git history):
 
 ---
 
-## 19. Edge cases and gotchas
+## 20. Edge cases and gotchas
 
 - **128 KiB extent + AEAD tag**: encrypted extent uses 33 blocks (128 KiB + 16 B tag rounds up).
 - **Partial 9P walks**: server rejects when `newfid != fid`; client also guards.
@@ -792,19 +897,19 @@ Key optimizations applied (git history):
 
 ---
 
-## 20. Known limitations / future work
+## 21. Known limitations / future work
 
 1. **No intermediate commits during long writes**. A 50 GB copy loses everything on crash before sync. (Attempted; reverted due to encryption corruption.)
 2. **No node cache**. Every `stm_btree_read_node` does full malloc + I/O + decrypt + decompress + decode.
 3. **No defragmentation**.
 4. **Allocator state not persisted**. Rebuilt via tree walk on mount (O(total nodes + extents)).
 5. **No hard links, symlinks, xattrs, rename, chown, utime**.
-6. **No FUSE / kernel mount**. 9P only.
+6. ~~**No FUSE / kernel mount**. 9P only.~~ **Addressed (§16)** — `stratum-fuse` provides a POSIX mount point via libfuse3 / macFUSE.
 7. **No CRC on extent data independent of AEAD**. Unencrypted volumes have no integrity check on data.
 
 ---
 
-## 21. Glossary
+## 22. Glossary
 
 | Term | Meaning |
 | --- | --- |
@@ -835,7 +940,7 @@ Key optimizations applied (git history):
 
 ---
 
-## 22. Soundness invariants
+## 23. Soundness invariants
 
 This section is the **contract** that future changes must not break. Each invariant below has a history — every one was discovered by an adversarial audit (R0–R14, commits `bb39db8` → `405c4fb`, ~60 corruption-class fixes) — and each has at least one test in `tests/` that fails without its fix. Modifying any code path listed under "enforced at" triggers a fresh audit round before merge (see `CLAUDE.md`).
 

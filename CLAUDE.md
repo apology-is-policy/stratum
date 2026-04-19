@@ -15,6 +15,8 @@ Stratum went through 15 rounds of adversarial soundness audits (R0–R14, commit
 | Btree write paths | `src/btree/btree.c::stm_btree_write_node`, `split_root`, `split_child`, `stm_btree_flush`, `src/btree/msg.c` | Torn-write recovery, pivot pre-reserve, and the two-phase flush commit are easy to break |
 | Superblock layout / validation | `src/fs/fs.c` mount SB parsing, `include/stratum/super.h` | SB is plaintext + unkeyed xxHash3; every counter field needs adversarial-tamper defense |
 | 9P wire handling | `src/p9/p9.c` | Every `body` pointer read needs a `body_len` bound; silent Rread with count=0 hides errors |
+| FUSE callbacks | `src/cmd/fuse.c` | Same concerns as 9P: every callback is a trust boundary from kernel VFS. Single-threaded loop assumed — multi-threading would need locking. |
+| Btree node cache | `src/btree/cache.c`, `stm_btree_read_node`, `stm_btree_write_node` | Cache correctness depends on invalidate-on-write + COW-fresh-paddr invariant. Any future path that writes a node without going through `stm_btree_write_node` breaks the contract silently. |
 | Extent write ordering | `src/fs/fs.c::stm_fs_write`, `extent_write_data`, `extent_read_data` | Insert-before-free, ebuf tail-zero, partial-extent old-lookup are all audit-derived |
 | Public API contracts | `include/stratum/fs.h`, `stm_fs_open_ro` vs `stm_fs_open` | RO vs RW contract depends on runtime guards; new accessors can create bypass surfaces |
 
