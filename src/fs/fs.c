@@ -2106,8 +2106,9 @@ int stm_fs_link(struct stm_fs *fs, uint64_t target_ino,
     rc = find_dirent_slot(fs->tree, new_parent, new_name, nlen, &new_dkey);
     if (rc) return rc;  /* -EEXIST if name already in use */
 
-    uint8_t dtype = ((mode & STM_S_IFMT) == STM_S_IFDIR)
-                  ? STM_DT_DIR : STM_DT_REG;
+    /* Directory was rejected at the -EPERM above; all surviving inodes are
+     * non-directories for dirent-type purposes. */
+    uint8_t dtype = STM_DT_REG;
     uint8_t dbuf[STM_NAME_MAX + 16];
     uint32_t dlen;
     encode_dirent(target_ino, dtype, new_name, nlen, dbuf, &dlen);

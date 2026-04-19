@@ -1167,6 +1167,38 @@ STM_TEST(test_fs_posix_hardlinks)
     STM_ASSERT_EQ(stm_fs_mkdir(fs, 1, "mydir", 0755, &dir_ino), 0);
     STM_ASSERT_EQ(stm_fs_link(fs, dir_ino, 1, "mydir_alias"), -EPERM);
 
+    /* Cross-directory hardlink: create /cd/src.txt, link as /other/dest.txt.
+     * Verifies nlink and read-through-alias work across a parent boundary. */
+    uint64_t cd_ino, other_ino, src_ino;
+    STM_ASSERT_EQ(stm_fs_mkdir(fs, 1, "cd", 0755, &cd_ino), 0);
+    STM_ASSERT_EQ(stm_fs_mkdir(fs, 1, "other", 0755, &other_ino), 0);
+    STM_ASSERT_EQ(stm_fs_create_file(fs, cd_ino, "src.txt", 0644, &src_ino), 0);
+    STM_ASSERT_EQ(stm_fs_write(fs, src_ino, 0, "crossdir", 8), 0);
+    STM_ASSERT_EQ(stm_fs_link(fs, src_ino, other_ino, "dest.txt"), 0);
+
+    struct stm_inode cd_in;
+    STM_ASSERT_EQ(stm_fs_stat(fs, src_ino, &cd_in), 0);
+    STM_ASSERT_EQ(le32_to_cpu(cd_in.si_nlink), 2u);
+
+    uint64_t chk_src, chk_dest;
+    STM_ASSERT_EQ(stm_fs_lookup(fs, cd_ino, "src.txt", &chk_src), 0);
+    STM_ASSERT_EQ(stm_fs_lookup(fs, other_ino, "dest.txt", &chk_dest), 0);
+    STM_ASSERT_EQ(chk_src, src_ino);
+    STM_ASSERT_EQ(chk_dest, src_ino);
+
+    char cdbuf[16] = {0};
+    uint32_t cdnread = 0;
+    STM_ASSERT_EQ(stm_fs_read(fs, src_ino, 0, cdbuf, sizeof(cdbuf), &cdnread), 0);
+    STM_ASSERT_MEM_EQ(cdbuf, "crossdir", 8);
+
+    /* Unlink the alias in the other parent; data survives via the source. */
+    STM_ASSERT_EQ(stm_fs_unlink(fs, other_ino, "dest.txt"), 0);
+    STM_ASSERT_EQ(stm_fs_stat(fs, src_ino, &cd_in), 0);
+    STM_ASSERT_EQ(le32_to_cpu(cd_in.si_nlink), 1u);
+    memset(cdbuf, 0, sizeof(cdbuf));
+    STM_ASSERT_EQ(stm_fs_read(fs, src_ino, 0, cdbuf, sizeof(cdbuf), &cdnread), 0);
+    STM_ASSERT_MEM_EQ(cdbuf, "crossdir", 8);
+
     /* Sync + reopen — link count persists. */
     uint64_t x_ino;
     STM_ASSERT_EQ(stm_fs_create_file(fs, 1, "x", 0644, &x_ino), 0);
