@@ -5,8 +5,9 @@
 #   build-macos   — clang × off/asan/tsan; POSIX backend only.
 #   tlc-specs     — TLC on all v2/specs/*.tla with matching .cfg.
 #
-# Installed at .github/workflows/v2-ci.yml. This copy is the source of truth
-# — changes here need to be synced to the workflows/ path to become active.
+# The canonical copy of this file lives at v2/ci/github-actions.yml and is
+# synchronized to .github/workflows/v2-ci.yml via the `dist.sh` flow (or by
+# hand) when changes land.
 
 name: v2-ci
 
