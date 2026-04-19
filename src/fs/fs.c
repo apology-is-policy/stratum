@@ -1368,7 +1368,15 @@ int stm_fs_readdir(struct stm_fs *fs, uint64_t dir_ino,
     struct stm_key lo = mk_key(dir_ino, STM_KEY_DIRENT, 0);
     struct stm_key hi = mk_key(dir_ino, STM_KEY_DATA, 0);
     struct readdir_ctx rd = { .user_cb = cb, .user_ctx = ctx };
-    return stm_btree_scan(fs->tree, &lo, &hi, readdir_scan_cb, &rd);
+    int rc = stm_btree_scan(fs->tree, &lo, &hi, readdir_scan_cb, &rd);
+    /* Callback convention: positive return = caller stopped early
+     * (e.g. FUSE's fuse_add_direntry ran out of buffer and signalled
+     * overflow). That is NOT an error — only negative returns are.
+     * Callers observe "stopped early" via their own state (e.g. the
+     * dirfill buffer position / overflow flag). See the parallel
+     * treatment in stm_fs_xattr_list for the xattr scan. */
+    if (rc > 0) return 0;
+    return rc;
 }
 
 /* ── unlink ─────────────────────────────────────────────────────────── */
@@ -1825,7 +1833,10 @@ int stm_fs_xattr_get(struct stm_fs *fs, uint64_t ino,
                      const char *name, void *out, uint32_t *inout_len)
 {
     if (fs->wedged) return -EIO;
-    if (!name || !name[0]) return -EINVAL;
+    if (!name || !name[0] || !inout_len) return -EINVAL;
+    /* A non-zero buffer size without a buffer is malformed; memcpy(NULL, …)
+     * is UB even when the copy is truncated by ERANGE in other paths. */
+    if (*inout_len > 0 && !out) return -EINVAL;
     size_t nlen = strlen(name);
     if (nlen > STM_NAME_MAX) return -ENAMETOOLONG;
 
@@ -1881,6 +1892,12 @@ int stm_fs_xattr_list(struct stm_fs *fs, uint64_t ino,
     struct stm_key hi = mk_key(ino, STM_KEY_SNAP, 0);  /* next type after XATTR */
     struct xattr_list_ctx lc = { .user_cb = cb, .user_ctx = ctx, .stopped = 0 };
     int rc = stm_btree_scan(fs->tree, &lo, &hi, xattr_list_scan_cb, &lc);
+    /* stm_btree_scan returns the callback's non-zero return verbatim.
+     * A positive return from the callback (early stop from caller; e.g.
+     * FUSE's buffer-full signal) is NOT an error — only negative returns
+     * are. Callers distinguish "stopped early" via their own state
+     * (e.g. listbuf->overflow flag). */
+    if (rc > 0) return 0;
     return rc;
 }
 
