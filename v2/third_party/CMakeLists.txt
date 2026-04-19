@@ -42,6 +42,6 @@ target_compile_definitions(xxhash PUBLIC
     XXH_STATIC_LINKING_ONLY)
 
 target_compile_options(xxhash PRIVATE
-    -Wno-unused-function -Wno-unused-parameter)
+    -Wno-unused-function -Wno-unused-parameter -Wno-macro-redefined)
 
 set_target_properties(xxhash PROPERTIES POSITION_INDEPENDENT_CODE ON)

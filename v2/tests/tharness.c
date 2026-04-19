@@ -18,6 +18,7 @@ void stm_test_register(stm_test_entry *e)
     g_head = e;
 }
 
+__attribute__((format(printf, 3, 4)))
 void stm_test_fail(const char *file, int line, const char *fmt, ...)
 {
     stm_test_current_failed = 1;
@@ -28,6 +29,7 @@ void stm_test_fail(const char *file, int line, const char *fmt, ...)
     fputc('\n', stderr);
 }
 
+__attribute__((format(printf, 1, 2)))
 void stm_test_info(const char *fmt, ...)
 {
     fprintf(stderr, "  info: ");
@@ -57,8 +59,8 @@ int stm_test_run_all(const char *suite_name)
         clock_gettime(CLOCK_MONOTONIC, &t0);
         e->t_func();
         clock_gettime(CLOCK_MONOTONIC, &t1);
-        double ms = (t1.tv_sec - t0.tv_sec) * 1000.0
-                  + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        double ms = (double)(t1.tv_sec - t0.tv_sec) * 1000.0
+                  + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
         if (stm_test_current_failed) {
             fprintf(stderr, "FAIL  %s (%.1f ms)\n", e->t_label, ms);
             nfail++;
