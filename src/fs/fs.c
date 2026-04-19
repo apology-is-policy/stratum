@@ -1615,6 +1615,295 @@ int stm_fs_truncate(struct stm_fs *fs, uint64_t ino, uint64_t new_size)
     return write_inode(fs, ino, &in);
 }
 
+/* ── POSIX Group C: extended attributes ────────────────────────────── */
+
+/* Xattr key/value layout.
+ *
+ * Key: (ino, STM_KEY_XATTR, fnv1a(name) + probe_distance). Hash +
+ * linear probing mirrors the dirent scheme (§8.3 STRATUM.md), which is
+ * already validated by the R-audit-era dirent-tombstone fixes.
+ *
+ * Value (live entry):
+ *   [u16 name_len][name bytes][u32 val_len][val bytes]
+ * Value (tombstone): single zero byte (vlen == 1).
+ *
+ * Limits: name ≤ STM_NAME_MAX (255); value ≤ STM_XATTR_VALUE_MAX (64 KiB).
+ * Larger values would fit in the btree but could fragment leaves; bump
+ * later if real workloads demand it. */
+#define STM_XATTR_VALUE_MAX  65536u
+#define XATTR_TOMBSTONE_VLEN 1
+
+static void encode_xattr(const char *name, size_t nlen,
+                         const void *val, uint32_t vlen,
+                         uint8_t *buf, uint32_t *out_len)
+{
+    le16 nlen_le = cpu_to_le16((uint16_t)nlen);
+    le32 vlen_le = cpu_to_le32(vlen);
+    memcpy(buf, &nlen_le, 2);
+    memcpy(buf + 2, name, nlen);
+    memcpy(buf + 2 + nlen, &vlen_le, 4);
+    memcpy(buf + 6 + nlen, val, vlen);
+    *out_len = (uint32_t)(6 + nlen + vlen);
+}
+
+static int decode_xattr(const uint8_t *buf, uint32_t blen,
+                        const char **name_out, uint16_t *nlen_out,
+                        const uint8_t **val_out, uint32_t *vlen_out)
+{
+    if (blen < 6) return -EIO;
+    le16 nlen_le;
+    memcpy(&nlen_le, buf, 2);
+    uint16_t nlen = le16_to_cpu(nlen_le);
+    if (nlen == 0 || nlen > STM_NAME_MAX) return -EIO;
+    if (blen < 6u + (uint32_t)nlen) return -EIO;
+    le32 vlen_le;
+    memcpy(&vlen_le, buf + 2 + nlen, 4);
+    uint32_t vlen = le32_to_cpu(vlen_le);
+    if (vlen > STM_XATTR_VALUE_MAX) return -EIO;
+    if (blen != 6u + (uint32_t)nlen + vlen) return -EIO;
+    *name_out = (const char *)(buf + 2);
+    *nlen_out = nlen;
+    *val_out = buf + 6 + nlen;
+    *vlen_out = vlen;
+    return 0;
+}
+
+/* Two-phase xattr lookup:
+ *   Phase 1 uses a small stack buffer sized to (hdr + max name) so we
+ *   can check the name prefix without decoding the full value. If the
+ *   name matches and out_key is requested, we're done.
+ *   Phase 2 (only if want_value) re-reads with a full-size heap buffer,
+ *   decodes, and gives back the value.
+ *
+ * Returns 0 on hit, -ENOENT on probe-chain exhausted without match,
+ * -EIO on a corrupt encoding, other errors from stm_btree_lookup. On a
+ * want_value hit, `*val_out_buf` is set to a heap-allocated buffer the
+ * caller must free(); `*vlen_out` is the value length. */
+static int xattr_lookup(struct stm_btree *tree, uint64_t ino,
+                        const char *name, size_t nlen,
+                        struct stm_key *out_key,
+                        int want_value,
+                        uint8_t **val_out_buf, uint32_t *vlen_out)
+{
+    uint64_t h = fnv1a(name, nlen);
+    uint8_t pbuf[STM_NAME_MAX + 16];  /* 271 bytes — fits hdr + name */
+    for (int attempt = 0; attempt < 256; attempt++) {
+        struct stm_key k = mk_key(ino, STM_KEY_XATTR, h + (uint64_t)attempt);
+        uint32_t plen = sizeof(pbuf);
+        int rc = stm_btree_lookup(tree, &k, pbuf, &plen);
+        if (rc == -ENOENT) return -ENOENT;
+        if (rc < 0) return rc;
+        if (plen == XATTR_TOMBSTONE_VLEN) continue;
+        /* Guard against reading past the truncated prefix copy. The
+         * stm_btree_lookup copies min(capacity, actual) bytes but
+         * returns `actual` in *vlen. We can only safely inspect bytes
+         * up to min(actual, sizeof(pbuf)). */
+        uint32_t prefix_have = plen < sizeof(pbuf) ? plen : (uint32_t)sizeof(pbuf);
+        if (prefix_have < 6) continue;  /* malformed, skip */
+
+        le16 nlen_le;
+        memcpy(&nlen_le, pbuf, 2);
+        uint16_t got_nlen = le16_to_cpu(nlen_le);
+        if (got_nlen == 0 || got_nlen > STM_NAME_MAX) continue;
+        if (prefix_have < 2u + got_nlen) continue;  /* prefix truncated */
+
+        if (got_nlen != nlen || memcmp(pbuf + 2, name, nlen) != 0) {
+            /* hash collision — different name */
+            continue;
+        }
+
+        if (out_key) *out_key = k;
+        if (!want_value) return 0;
+
+        /* Phase 2: re-fetch with a full-size buffer to get the value. */
+        uint8_t *big = malloc(plen);
+        if (!big) return -ENOMEM;
+        uint32_t blen = plen;
+        rc = stm_btree_lookup(tree, &k, big, &blen);
+        if (rc) { free(big); return rc; }
+        if (blen != plen) { free(big); return -EIO; }  /* race? */
+
+        const char *dn; uint16_t dnl;
+        const uint8_t *dv; uint32_t dvl;
+        rc = decode_xattr(big, blen, &dn, &dnl, &dv, &dvl);
+        if (rc) { free(big); return rc; }
+        /* Hand the value back as a heap copy so the caller's buffer
+         * lifetime is independent of pbuf/big. */
+        uint8_t *vcopy = malloc(dvl ? dvl : 1);
+        if (!vcopy) { free(big); return -ENOMEM; }
+        if (dvl) memcpy(vcopy, dv, dvl);
+        free(big);
+        *val_out_buf = vcopy;
+        *vlen_out = dvl;
+        return 0;
+    }
+    return -ENOENT;
+}
+
+/* Find a slot for a new xattr: first tombstone seen (if any) or the
+ * first never-used slot at end-of-chain. Rejects -EEXIST if a live
+ * entry with the same name is already present. */
+static int xattr_find_slot(struct stm_btree *tree, uint64_t ino,
+                           const char *name, size_t nlen,
+                           struct stm_key *out_key, int *exists)
+{
+    uint64_t h = fnv1a(name, nlen);
+    int have_tomb = 0;
+    struct stm_key tomb_key;
+    *exists = 0;
+    for (int attempt = 0; attempt < 256; attempt++) {
+        struct stm_key k = mk_key(ino, STM_KEY_XATTR, h + (uint64_t)attempt);
+        uint8_t vbuf[STM_NAME_MAX + 16];
+        uint32_t vlen = sizeof(vbuf);
+        int rc = stm_btree_lookup(tree, &k, vbuf, &vlen);
+        if (rc == -ENOENT) {
+            *out_key = have_tomb ? tomb_key : k;
+            return 0;
+        }
+        if (rc < 0) return rc;
+        if (vlen == XATTR_TOMBSTONE_VLEN) {
+            if (!have_tomb) { tomb_key = k; have_tomb = 1; }
+            continue;
+        }
+        /* Live entry — is it a duplicate? We only need the name
+         * prefix, not the value. */
+        if (vlen >= 6) {
+            le16 nlen_le;
+            memcpy(&nlen_le, vbuf, 2);
+            uint16_t got_nlen = le16_to_cpu(nlen_le);
+            if (got_nlen == nlen && vlen >= 2u + got_nlen &&
+                memcmp(vbuf + 2, name, nlen) == 0) {
+                *out_key = k;
+                *exists = 1;
+                return 0;
+            }
+        }
+    }
+    return -ENOSPC;
+}
+
+/* POSIX Group C: setxattr. `flags`:
+ *   0              — create or replace (default)
+ *   XATTR_CREATE   — fail -EEXIST if already set (Linux #define = 1)
+ *   XATTR_REPLACE  — fail -ENODATA if not already set (#define = 2)
+ * The header here doesn't depend on sys/xattr.h to stay portable; the
+ * FUSE caller passes Linux-style flags through unchanged. */
+int stm_fs_xattr_set(struct stm_fs *fs, uint64_t ino,
+                     const char *name, const void *val, uint32_t val_len,
+                     int flags)
+{
+    STM_FS_GUARD_WRITE(fs);
+    if (!name || !name[0]) return -EINVAL;
+    size_t nlen = strlen(name);
+    if (nlen > STM_NAME_MAX) return -ENAMETOOLONG;
+    if (val_len > STM_XATTR_VALUE_MAX) return -E2BIG;
+
+    /* Existence check + slot resolution in one pass. */
+    struct stm_key slot;
+    int exists;
+    int rc = xattr_find_slot(fs->tree, ino, name, nlen, &slot, &exists);
+    if (rc) return rc;
+
+    if ((flags & 1) && exists)       return -EEXIST;      /* XATTR_CREATE */
+    if ((flags & 2) && !exists)      return -ENODATA;     /* XATTR_REPLACE */
+
+    uint8_t *buf = malloc(6 + nlen + val_len);
+    if (!buf) return -ENOMEM;
+    uint32_t dlen;
+    encode_xattr(name, nlen, val, val_len, buf, &dlen);
+    rc = stm_btree_insert(fs->tree, &slot, buf, dlen, fs->gen);
+    free(buf);
+    return rc;
+}
+
+/* getxattr: probe the chain, match by name. `*inout_len` on entry is
+ * the caller's buffer capacity; on exit it's the actual value length.
+ * If the caller passes 0, we return the size without copying (classic
+ * "query size" pattern). Returns -ERANGE if the caller's buffer is
+ * non-zero but too small. */
+int stm_fs_xattr_get(struct stm_fs *fs, uint64_t ino,
+                     const char *name, void *out, uint32_t *inout_len)
+{
+    if (fs->wedged) return -EIO;
+    if (!name || !name[0]) return -EINVAL;
+    size_t nlen = strlen(name);
+    if (nlen > STM_NAME_MAX) return -ENAMETOOLONG;
+
+    uint8_t *val_buf = NULL;
+    uint32_t vlen = 0;
+    int rc = xattr_lookup(fs->tree, ino, name, nlen, NULL,
+                          1, &val_buf, &vlen);
+    if (rc) return rc;
+
+    if (*inout_len == 0) {
+        /* Size-query: caller just wants to know how big the value is. */
+        *inout_len = vlen;
+        free(val_buf);
+        return 0;
+    }
+    if (*inout_len < vlen) { free(val_buf); return -ERANGE; }
+    memcpy(out, val_buf, vlen);
+    *inout_len = vlen;
+    free(val_buf);
+    return 0;
+}
+
+/* listxattr iterator. For each live xattr on this inode, invokes cb with
+ * the name (null-terminated). cb returns non-zero to stop. */
+struct xattr_list_ctx {
+    int (*user_cb)(const char *name, void *ctx);
+    void *user_ctx;
+    int stopped;
+};
+
+static int xattr_list_scan_cb(const struct stm_key *key, const void *val,
+                              uint32_t vlen, void *ctx)
+{
+    (void)key;
+    struct xattr_list_ctx *lc = ctx;
+    if (vlen == XATTR_TOMBSTONE_VLEN) return 0;  /* skip tombstones */
+    const char *name; uint16_t nlen;
+    const uint8_t *v; uint32_t vl;
+    if (decode_xattr(val, vlen, &name, &nlen, &v, &vl) != 0) return 0;
+    char nbuf[STM_NAME_MAX + 1];
+    if (nlen > STM_NAME_MAX) return 0;
+    memcpy(nbuf, name, nlen);
+    nbuf[nlen] = '\0';
+    if (lc->user_cb(nbuf, lc->user_ctx)) { lc->stopped = 1; return 1; }
+    return 0;
+}
+
+int stm_fs_xattr_list(struct stm_fs *fs, uint64_t ino,
+                      int (*cb)(const char *name, void *ctx), void *ctx)
+{
+    if (fs->wedged) return -EIO;
+    struct stm_key lo = mk_key(ino, STM_KEY_XATTR, 0);
+    struct stm_key hi = mk_key(ino, STM_KEY_SNAP, 0);  /* next type after XATTR */
+    struct xattr_list_ctx lc = { .user_cb = cb, .user_ctx = ctx, .stopped = 0 };
+    int rc = stm_btree_scan(fs->tree, &lo, &hi, xattr_list_scan_cb, &lc);
+    return rc;
+}
+
+/* removexattr: locate the entry, replace with a tombstone to preserve
+ * the probe chain (same pattern as dirents). */
+int stm_fs_xattr_remove(struct stm_fs *fs, uint64_t ino, const char *name)
+{
+    STM_FS_GUARD_WRITE(fs);
+    if (!name || !name[0]) return -EINVAL;
+    size_t nlen = strlen(name);
+    if (nlen > STM_NAME_MAX) return -ENAMETOOLONG;
+
+    /* want_value=0 — we just need the key to overwrite with a
+     * tombstone; the existing value is thrown away. */
+    struct stm_key slot;
+    int rc = xattr_lookup(fs->tree, ino, name, nlen, &slot,
+                          0, NULL, NULL);
+    if (rc) return rc;
+    uint8_t marker = 0;
+    return stm_btree_insert(fs->tree, &slot, &marker,
+                            XATTR_TOMBSTONE_VLEN, fs->gen);
+}
+
 /* POSIX Group B: rename.
  *
  * rename(old_parent/old_name, new_parent/new_name) atomically moves or
@@ -1658,6 +1947,11 @@ int stm_fs_rename(struct stm_fs *fs,
                   uint64_t new_parent, const char *new_name)
 {
     STM_FS_GUARD_WRITE(fs);
+
+    /* NOTE: no ancestor-loop check (renaming a directory into its own
+     * subtree creates a cycle). See caller-contract comment in fs.h.
+     * FUSE callers are covered by the Linux VFS pre-check; other callers
+     * MUST guard themselves. */
 
     size_t old_nlen = strlen(old_name);
     size_t new_nlen = strlen(new_name);

@@ -254,6 +254,94 @@ static void ll_unlink(fuse_req_t req, fuse_ino_t parent, const char *name)
     fuse_reply_err(req, rc ? -rc : 0);
 }
 
+/* ── xattr (POSIX Group C) ─────────────────────────────────────────── */
+
+/* We compile with FUSE_DARWIN_ENABLE_EXTENSIONS=0, so the op-table
+ * signatures match the vanilla Linux API on both platforms — no
+ * `position` parameter from the macOS resource-fork extension. */
+static void ll_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
+                        const char *value, size_t size, int flags)
+{
+    int rc = stm_fs_xattr_set(g_fs, ino, name, value, (uint32_t)size, flags);
+    fuse_reply_err(req, rc ? -rc : 0);
+}
+
+static void ll_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
+                        size_t size)
+{
+    if (size == 0) {
+        /* Size query: reply with the attribute's value length via
+         * fuse_reply_xattr. */
+        uint32_t vlen = 0;
+        int rc = stm_fs_xattr_get(g_fs, ino, name, NULL, &vlen);
+        if (rc == -ENOENT) { fuse_reply_err(req, ENODATA); return; }
+        if (rc) { fuse_reply_err(req, -rc); return; }
+        fuse_reply_xattr(req, vlen);
+        return;
+    }
+    uint8_t *buf = malloc(size);
+    if (!buf) { fuse_reply_err(req, ENOMEM); return; }
+    uint32_t vlen = (uint32_t)size;
+    int rc = stm_fs_xattr_get(g_fs, ino, name, buf, &vlen);
+    if (rc == -ENOENT) { free(buf); fuse_reply_err(req, ENODATA); return; }
+    if (rc)            { free(buf); fuse_reply_err(req, -rc);     return; }
+    fuse_reply_buf(req, (const char *)buf, vlen);
+    free(buf);
+}
+
+struct xattr_listbuf {
+    char  *buf;
+    size_t cap;
+    size_t pos;
+    int    overflow;
+};
+
+static int xattr_list_append(const char *name, void *ctx)
+{
+    struct xattr_listbuf *lb = ctx;
+    size_t nlen = strlen(name);
+    size_t need = nlen + 1;  /* name + NUL separator */
+    if (lb->pos + need > lb->cap) { lb->overflow = 1; return 1; /* stop */ }
+    memcpy(lb->buf + lb->pos, name, nlen);
+    lb->buf[lb->pos + nlen] = '\0';
+    lb->pos += need;
+    return 0;
+}
+
+/* Count-only callback for size queries. */
+static int xattr_list_count(const char *name, void *ctx)
+{
+    size_t *total = ctx;
+    *total += strlen(name) + 1;
+    return 0;
+}
+
+static void ll_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
+{
+    if (size == 0) {
+        size_t total = 0;
+        int rc = stm_fs_xattr_list(g_fs, ino, xattr_list_count, &total);
+        if (rc) { fuse_reply_err(req, -rc); return; }
+        fuse_reply_xattr(req, total);
+        return;
+    }
+    char *buf = malloc(size);
+    if (!buf) { fuse_reply_err(req, ENOMEM); return; }
+    struct xattr_listbuf lb = { .buf = buf, .cap = size, .pos = 0, .overflow = 0 };
+    int rc = stm_fs_xattr_list(g_fs, ino, xattr_list_append, &lb);
+    if (rc)           { free(buf); fuse_reply_err(req, -rc); return; }
+    if (lb.overflow)  { free(buf); fuse_reply_err(req, ERANGE); return; }
+    fuse_reply_buf(req, buf, lb.pos);
+    free(buf);
+}
+
+static void ll_removexattr(fuse_req_t req, fuse_ino_t ino, const char *name)
+{
+    int rc = stm_fs_xattr_remove(g_fs, ino, name);
+    if (rc == -ENOENT) { fuse_reply_err(req, ENODATA); return; }
+    fuse_reply_err(req, rc ? -rc : 0);
+}
+
 static void ll_rename(fuse_req_t req, fuse_ino_t parent, const char *name,
                       fuse_ino_t newparent, const char *newname,
                       unsigned int flags)
@@ -419,10 +507,13 @@ static const struct fuse_lowlevel_ops ops = {
     .release  = ll_release,
     .readdir  = ll_readdir,
     .statfs   = ll_statfs,
-    .rename   = ll_rename,
-    /* Unimplemented (SOTA #5 Groups C/D):
-     *   link, symlink, readlink, mknod, access,
-     *   setxattr, getxattr, listxattr, removexattr, bmap.
+    .rename      = ll_rename,
+    .setxattr    = ll_setxattr,
+    .getxattr    = ll_getxattr,
+    .listxattr   = ll_listxattr,
+    .removexattr = ll_removexattr,
+    /* Unimplemented (SOTA #5 Group D + symlinks/special-files):
+     *   link, symlink, readlink, mknod, access, bmap.
      * libfuse returns ENOSYS for any op left NULL. */
 };
 

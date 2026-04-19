@@ -84,9 +84,42 @@ int  stm_fs_truncate(struct stm_fs *fs, uint64_t ino, uint64_t new_size);
  * inode number — only the dirent's (parent, hash, name) record changes.
  * If a target with `new_name` exists it is atomically unlinked first
  * (propagates -ENOTEMPTY for non-empty directories, -EACCES / -EPERM
- * where applicable). Rename-to-self is a successful no-op. */
+ * where applicable). Rename-to-self is a successful no-op.
+ *
+ * CALLER CONTRACT — ancestor-loop check. POSIX requires that renaming
+ * a directory into its own subtree return -EINVAL (e.g. `mv a a/sub`);
+ * otherwise you end up with an unreachable cycle. stm_fs_rename does
+ * NOT perform this check — the reverse-parent walk is expensive without
+ * a parent-pointer field on directory inodes (would require scanning
+ * descendant subtree). The only current in-tree caller is stratum-fuse,
+ * which sits behind the Linux VFS's rename ancestor guard; that's why
+ * stratum is safe today. Any future non-FUSE caller (future 9P wstat,
+ * direct C-API bindings, CLI op) MUST perform the ancestor check
+ * themselves before calling stm_fs_rename on directories. Without it,
+ * cycled orphans slip past `stratum check`'s orphan detector (each
+ * inode still has an inbound dirent — just not root-reachable). */
 int  stm_fs_rename(struct stm_fs *fs,
                    uint64_t old_parent, const char *old_name,
                    uint64_t new_parent, const char *new_name);
+
+/* POSIX Group C (SOTA #5): extended attributes. Key space: STM_KEY_XATTR
+ * entries at (ino, hash(name)+probe). Values capped at 64 KiB. Tombstones
+ * preserve probe chains (same pattern as dirents).
+ *
+ * set: flags = 0 → create or replace; flags & 1 → XATTR_CREATE (fail -EEXIST
+ *      if present); flags & 2 → XATTR_REPLACE (fail -ENODATA if absent).
+ * get: if *inout_len == 0 on entry, returns the value size without copying
+ *      (classic "query size" pattern). -ERANGE if buffer non-zero but too
+ *      small. -ENODATA if xattr doesn't exist (callers map from -ENOENT).
+ * list: callback-per-name; cb returns non-zero to stop iteration early.
+ * remove: -ENODATA if xattr doesn't exist. */
+int  stm_fs_xattr_set(struct stm_fs *fs, uint64_t ino,
+                      const char *name, const void *val, uint32_t val_len,
+                      int flags);
+int  stm_fs_xattr_get(struct stm_fs *fs, uint64_t ino,
+                      const char *name, void *out, uint32_t *inout_len);
+int  stm_fs_xattr_list(struct stm_fs *fs, uint64_t ino,
+                       int (*cb)(const char *name, void *ctx), void *ctx);
+int  stm_fs_xattr_remove(struct stm_fs *fs, uint64_t ino, const char *name);
 
 #endif /* STM_FS_H */

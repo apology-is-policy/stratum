@@ -26,3 +26,4 @@ dist/
 # Test artifacts
 /tmp/stratum_test_*
 *.stm
+.claude/

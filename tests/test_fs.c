@@ -959,6 +959,140 @@ STM_TEST(test_fs_posix_rename)
     unlink(path);
 }
 
+/* POSIX Group C (SOTA #5): extended attributes. */
+struct xattr_collect {
+    char names[16][64];
+    int  count;
+};
+static int xattr_collect_cb(const char *name, void *ctx) {
+    struct xattr_collect *c = ctx;
+    if (c->count < 16) {
+        strncpy(c->names[c->count], name, 63);
+        c->names[c->count][63] = 0;
+        c->count++;
+    }
+    return 0;
+}
+static int has_name(const struct xattr_collect *c, const char *needle) {
+    for (int i = 0; i < c->count; i++)
+        if (strcmp(c->names[i], needle) == 0) return 1;
+    return 0;
+}
+
+STM_TEST(test_fs_posix_xattr)
+{
+    const char *path = "/tmp/stratum_test_posix_xattr.img";
+    unlink(path);
+    STM_ASSERT_EQ(stm_fs_create(path, 32ULL*1024*1024, NULL), 0);
+    struct stm_fs *fs;
+    STM_ASSERT_EQ(stm_fs_open(path, NULL, &fs), 0);
+
+    uint64_t ino;
+    STM_ASSERT_EQ(stm_fs_create_file(fs, 1, "x.txt", 0644, &ino), 0);
+
+    /* set → get round-trip (default flags = create-or-replace). */
+    const char *v1 = "value-one";
+    STM_ASSERT_EQ(stm_fs_xattr_set(fs, ino, "user.test",
+                                   v1, (uint32_t)strlen(v1), 0), 0);
+    char buf[64] = {0};
+    uint32_t len = sizeof(buf);
+    STM_ASSERT_EQ(stm_fs_xattr_get(fs, ino, "user.test", buf, &len), 0);
+    STM_ASSERT_EQ(len, (uint32_t)strlen(v1));
+    STM_ASSERT_MEM_EQ(buf, v1, strlen(v1));
+
+    /* Size query — caller passes *inout_len = 0. */
+    len = 0;
+    STM_ASSERT_EQ(stm_fs_xattr_get(fs, ino, "user.test", NULL, &len), 0);
+    STM_ASSERT_EQ(len, (uint32_t)strlen(v1));
+
+    /* ERANGE when the caller's buffer is too small. */
+    len = 4;
+    STM_ASSERT_EQ(stm_fs_xattr_get(fs, ino, "user.test", buf, &len), -ERANGE);
+
+    /* XATTR_CREATE on existing → EEXIST. */
+    STM_ASSERT_EQ(stm_fs_xattr_set(fs, ino, "user.test", v1, (uint32_t)strlen(v1), 1),
+                  -EEXIST);
+
+    /* XATTR_REPLACE on missing → ENODATA. */
+    STM_ASSERT_EQ(stm_fs_xattr_set(fs, ino, "user.missing", v1, (uint32_t)strlen(v1), 2),
+                  -ENODATA);
+
+    /* Replace the value — default flags. */
+    const char *v2 = "new and different contents";
+    STM_ASSERT_EQ(stm_fs_xattr_set(fs, ino, "user.test",
+                                   v2, (uint32_t)strlen(v2), 0), 0);
+    memset(buf, 0, sizeof(buf));
+    len = sizeof(buf);
+    STM_ASSERT_EQ(stm_fs_xattr_get(fs, ino, "user.test", buf, &len), 0);
+    STM_ASSERT_EQ(len, (uint32_t)strlen(v2));
+    STM_ASSERT_MEM_EQ(buf, v2, strlen(v2));
+
+    /* Multiple xattrs on the same inode — list must see all. */
+    STM_ASSERT_EQ(stm_fs_xattr_set(fs, ino, "user.alpha", "A", 1, 0), 0);
+    STM_ASSERT_EQ(stm_fs_xattr_set(fs, ino, "user.beta",  "BB", 2, 0), 0);
+    STM_ASSERT_EQ(stm_fs_xattr_set(fs, ino, "user.gamma", "CCC", 3, 0), 0);
+
+    struct xattr_collect c = { .count = 0 };
+    STM_ASSERT_EQ(stm_fs_xattr_list(fs, ino, xattr_collect_cb, &c), 0);
+    STM_ASSERT_EQ(c.count, 4);
+    STM_ASSERT(has_name(&c, "user.test"));
+    STM_ASSERT(has_name(&c, "user.alpha"));
+    STM_ASSERT(has_name(&c, "user.beta"));
+    STM_ASSERT(has_name(&c, "user.gamma"));
+
+    /* Remove one — list count drops, removed name gone, others remain. */
+    STM_ASSERT_EQ(stm_fs_xattr_remove(fs, ino, "user.beta"), 0);
+    memset(&c, 0, sizeof(c));
+    STM_ASSERT_EQ(stm_fs_xattr_list(fs, ino, xattr_collect_cb, &c), 0);
+    STM_ASSERT_EQ(c.count, 3);
+    STM_ASSERT(!has_name(&c, "user.beta"));
+    STM_ASSERT(has_name(&c, "user.alpha"));
+
+    /* Get on removed → ENOENT (FUSE maps to ENODATA). */
+    len = sizeof(buf);
+    STM_ASSERT_EQ(stm_fs_xattr_get(fs, ino, "user.beta", buf, &len), -ENOENT);
+    /* Remove on missing → ENOENT. */
+    STM_ASSERT_EQ(stm_fs_xattr_remove(fs, ino, "user.beta"), -ENOENT);
+
+    /* Large value (at the 64 KiB max): encode, round-trip, verify. */
+    uint8_t *big = malloc(65536);
+    STM_ASSERT(big);
+    for (size_t i = 0; i < 65536; i++) big[i] = (uint8_t)(i & 0xFF);
+    STM_ASSERT_EQ(stm_fs_xattr_set(fs, ino, "user.big", big, 65536, 0), 0);
+    uint8_t *readback = malloc(65536);
+    STM_ASSERT(readback);
+    memset(readback, 0, 65536);
+    len = 65536;
+    STM_ASSERT_EQ(stm_fs_xattr_get(fs, ino, "user.big", readback, &len), 0);
+    STM_ASSERT_EQ(len, 65536u);
+    STM_ASSERT_MEM_EQ(readback, big, 65536);
+
+    /* Oversized value rejected. */
+    STM_ASSERT_EQ(stm_fs_xattr_set(fs, ino, "user.toobig",
+                                    big, 65537, 0), -E2BIG);
+
+    free(big); free(readback);
+
+    /* Sync + reopen — xattrs persist. */
+    STM_ASSERT_EQ(stm_fs_sync(fs), 0);
+    stm_fs_close(fs);
+    STM_ASSERT_EQ(stm_fs_open(path, NULL, &fs), 0);
+    uint64_t ino2;
+    STM_ASSERT_EQ(stm_fs_lookup(fs, 1, "x.txt", &ino2), 0);
+    STM_ASSERT_EQ(ino2, ino);
+    memset(buf, 0, sizeof(buf));
+    len = sizeof(buf);
+    STM_ASSERT_EQ(stm_fs_xattr_get(fs, ino, "user.test", buf, &len), 0);
+    STM_ASSERT_EQ(len, (uint32_t)strlen(v2));
+    STM_ASSERT_MEM_EQ(buf, v2, strlen(v2));
+    memset(&c, 0, sizeof(c));
+    STM_ASSERT_EQ(stm_fs_xattr_list(fs, ino, xattr_collect_cb, &c), 0);
+    STM_ASSERT_EQ(c.count, 4);  /* test, alpha, gamma, big */
+
+    stm_fs_close(fs);
+    unlink(path);
+}
+
 int main(void)
 {
     STM_SUITE("fs");
@@ -981,6 +1115,7 @@ int main(void)
     STM_RUN(test_fs_open_ro_rejects_writes);
     STM_RUN(test_fs_posix_attr_mutations);
     STM_RUN(test_fs_posix_rename);
+    STM_RUN(test_fs_posix_xattr);
     printf("all passed\n");
     return 0;
 }
