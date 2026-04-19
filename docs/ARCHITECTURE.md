@@ -2744,36 +2744,433 @@ Status: DRAFT → awaiting review, push-back, then COMMITTED.
 
 ## 9. Block device abstraction
 
-**STATUS**: STUB
+**STATUS**: DRAFT
 
-### 9.1 Goals
+### 9.1 Goals and non-goals
 
-- io_uring-native on Linux.
-- Zero-copy via fixed buffers and registered files.
-- DAX-compatible for persistent memory.
-- Portable fallback (libaio on older Linux; FUSE path on non-Linux).
+**Goals**:
 
-### 9.2 Decisions committed (NOVEL #7)
+- Pluggable backend interface; every backend implements the same small contract.
+- **io_uring-native on Linux**: default submission path. Fixed buffers, registered files, SQPOLL, multi-ring for priority separation.
+- **DAX-compatible for persistent memory**: byte-addressable path that bypasses the block layer.
+- **Portable fallbacks**: POSIX pread/pwrite for non-Linux and loopback-file pools; synchronous with thread-pool async simulation.
+- Concurrent submission safe — multiple writer threads + the commit coordinator (§3) can issue ops without cross-thread locking on the backend.
+- Error handling distinguishes transient (retry) from permanent (escalate to redundancy layer) from device-gone (pool degradation).
 
-- io_uring as primary submission path.
-- Fixed buffers for zero-copy.
-- DAX path for pmem.
+**Non-goals**:
 
-### 9.3 Subsections to write
+- libaio as the primary backend. Require io_uring on Linux (kernel 5.1+, 2019 — mature enough to demand); libaio only as a compile-time backport option for unusual deployments.
+- SPDK (userspace NVMe driver). Bypasses the kernel for extreme-IOPS workloads; post-v2.0 if demand emerges.
+- NVMe-over-Fabrics. Network-attached block storage is a specialized use case outside Stratum's primary targets.
+- Block-layer encryption / compression. Those live above the block layer (§7, §11). Block layer is transport only.
+- ZFS-style dedicated LOG device at v2.0. Valuable for fsync-latency-critical workloads; defer to v2.1 pending demand.
 
-- **9.3.1** Abstract interface — what every backend implements.
-- **9.3.2** io_uring backend — SQ/CQ management, SQ polling, registered files + buffers.
-- **9.3.3** libaio backend (fallback).
-- **9.3.4** FUSE backend (for non-Linux hosts).
-- **9.3.5** DAX path — mmap-based, byte-addressable.
-- **9.3.6** Sync semantics — fsync, fdatasync, barriers.
-- **9.3.7** Error handling — transient, permanent, device removal.
+### 9.2 Decisions already committed
 
-### 9.4 Open questions
+From earlier docs:
 
-- Fixed-buffer aggressiveness (pinned-memory cost).
-- SQ polling mode (kernel thread vs user thread).
-- Atomicity assumptions for old hardware.
+- **io_uring as primary submission path** (NOVEL #7).
+- **Fixed buffers for zero-copy** (NOVEL #7).
+- **DAX path for pmem** (NOVEL #7).
+
+Decisions taken in this section:
+
+- **io_uring required on Linux** at v2.0. libaio fallback only behind a build-time flag.
+- **Per-CPU io_uring instances**: reduces SQ contention on many-core systems. Commit coordinator uses its own ring.
+- **Priority rings**: two rings per CPU — metadata (high priority) and data (standard). Prevents fsync on a metadata block from waiting behind a queued 1 MiB data write.
+- **Fixed-buffer pool size**: 128 MiB per pool by default (1024 × 128 KiB buffers), configurable. Pinned memory cost.
+- **Backend abstraction is narrow**: ~12 ops. Easy to add a new backend.
+- **Device failure detection** via a mix of completion errors + periodic `EVENT_MEDIA_CHANGE`/udev monitoring.
+
+### 9.3 Abstract interface
+
+Every backend implements this contract:
+
+```c
+struct stm_block_backend {
+    int     (*open)(const char *path, struct stm_block_handle **out);
+    void    (*close)(struct stm_block_handle *h);
+
+    // Sync (blocking) ops — for rare cases and simplicity. Backends may
+    // implement in terms of async + wait.
+    int     (*read)(struct stm_block_handle *h, uint64_t offset,
+                    void *buf, uint32_t len);
+    int     (*write)(struct stm_block_handle *h, uint64_t offset,
+                     const void *buf, uint32_t len);
+
+    // Async submission. Primary interface. Completion callback invoked
+    // when op finishes (on the backend's completion thread, or caller's
+    // poll context — backend-specific).
+    int     (*submit_read)(struct stm_block_handle *h, uint64_t offset,
+                           void *buf, uint32_t len,
+                           stm_block_completion_cb cb, void *ctx);
+    int     (*submit_write)(struct stm_block_handle *h, uint64_t offset,
+                            const void *buf, uint32_t len,
+                            stm_block_completion_cb cb, void *ctx);
+
+    // Sync semantics.
+    int     (*fsync)(struct stm_block_handle *h);         // data + metadata
+    int     (*fdatasync)(struct stm_block_handle *h);     // data only
+    int     (*submit_fsync)(struct stm_block_handle *h,
+                            stm_block_completion_cb cb, void *ctx);
+
+    // Device management.
+    int     (*size)(struct stm_block_handle *h, uint64_t *out_bytes);
+    int     (*discard)(struct stm_block_handle *h,
+                       uint64_t offset, uint64_t len);     // TRIM / UNMAP
+    int     (*resize)(struct stm_block_handle *h,
+                      uint64_t new_size);                   // grow only; optional
+
+    // Zero-copy support.
+    int     (*register_buffers)(struct stm_block_handle *h,
+                                void **bufs, uint32_t nbufs, uint32_t len);
+    int     (*submit_read_fixed)(struct stm_block_handle *h,
+                                 uint64_t offset, uint32_t buf_idx,
+                                 uint32_t len,
+                                 stm_block_completion_cb cb, void *ctx);
+    int     (*submit_write_fixed)(struct stm_block_handle *h,
+                                  uint64_t offset, uint32_t buf_idx,
+                                  uint32_t len,
+                                  stm_block_completion_cb cb, void *ctx);
+
+    // Event polling (driven by coordinator's event loop).
+    int     (*poll_completions)(struct stm_block_handle *h,
+                                int max_completions);
+};
+```
+
+Callers (fs layer) submit async ops + callbacks, then poll for completions. Sync ops wrap async-submit + spin-poll for simplicity in non-hot paths.
+
+### 9.4 io_uring backend
+
+Primary Linux backend. Target: Linux 5.11+ for stable io_uring features; gracefully degrade for 5.1–5.10.
+
+#### 9.4.1 Structure
+
+```c
+struct io_uring_backend {
+    struct io_uring ring_meta;      // metadata priority ring
+    struct io_uring ring_data;      // data ring
+    int             fd;              // the underlying device fd
+    int             fd_index;        // registered fd index
+
+    void           *fixed_bufs_region; // pinned memory for registered buffers
+    size_t          fixed_bufs_size;
+    struct iovec   *fixed_bufs;
+    uint32_t        num_fixed_bufs;
+
+    // Completion tracking.
+    struct pending_op_table pending_ops;
+
+    // Capabilities probed at init.
+    bool has_sqpoll;
+    bool has_register_iowq;
+    bool has_ext_arg;
+};
+```
+
+Two rings per backend (per device): one for metadata ops (high priority, low latency), one for data ops (higher-throughput, tolerant of latency). Commit-path writes (Phase 1 / Phase 3 uberblocks) use the metadata ring; data extent writes use the data ring.
+
+Rings can be per-CPU if scaling demands; start with per-device (one pair of rings per open device).
+
+#### 9.4.2 Setup at pool mount
+
+1. `io_uring_queue_init(QUEUE_DEPTH=512, ...)` for each ring.
+2. Register the device fd: `io_uring_register_files(ring, &fd, 1)`.
+3. Allocate the fixed-buffer region: `mmap(MAP_HUGETLB if available, else MAP_ANONYMOUS)`. Pin via `mlock()` if io_uring kernel version doesn't auto-pin.
+4. Register fixed buffers: `io_uring_register_buffers(ring, fixed_bufs, N)`.
+5. Enable SQPOLL if `has_sqpoll` (Linux 5.13+); kernel thread polls SQ, no syscall per submit.
+
+#### 9.4.3 Submit path
+
+```c
+// Pseudocode for submit_write_fixed:
+sqe = io_uring_get_sqe(ring);
+io_uring_prep_write_fixed(sqe, fd_index, buf_ptr, len, offset, buf_idx);
+io_uring_sqe_set_data(sqe, request_id);
+io_uring_submit(ring);   // no-op if SQPOLL
+```
+
+The `request_id` is tracked in `pending_ops` table; when the CQE arrives, we look it up and call the completion callback.
+
+For non-fixed ops: `io_uring_prep_write` with a regular iovec. Slightly more overhead (kernel does bounce-buffer or page pinning per op) but supports larger buffers than fit in the fixed-buffer region.
+
+#### 9.4.4 Completion path
+
+```c
+// Drains up to max_completions CQEs.
+int poll_completions(ring, max) {
+    struct io_uring_cqe *cqe;
+    for (int i = 0; i < max; i++) {
+        if (io_uring_peek_cqe(ring, &cqe) < 0) break;
+        uint64_t request_id = io_uring_cqe_get_data(cqe);
+        int res = cqe->res;
+        invoke_completion(request_id, res);
+        io_uring_cqe_seen(ring, cqe);
+    }
+    return completed_count;
+}
+```
+
+The coordinator's event loop polls both rings round-robin (or with priority weighting). Writer threads invoke the completion indirectly: the callback signals an epoll-wake or pushes a result into the writer's local queue.
+
+#### 9.4.5 Version feature detection
+
+At init, probe which io_uring features are available:
+- `IORING_FEAT_NODROP` (5.5): CQEs never drop.
+- `IORING_FEAT_SUBMIT_STABLE` (5.5): submitted iovec stable until completion.
+- `IORING_FEAT_EXT_ARG` (5.11): wait with extra arguments.
+- `IORING_FEAT_NATIVE_WORKERS` (5.13): io_uring manages worker threads internally.
+
+Missing features → degrade gracefully (e.g., no SQPOLL on older kernels; syscall per submit).
+
+### 9.5 DAX path
+
+Persistent memory (Intel Optane, CXL memory, NVDIMMs) offers byte-addressable access to persistent storage. DAX (Direct Access) maps it into the process address space; reads and writes go directly to PMEM without a block layer.
+
+#### 9.5.1 Detection
+
+At device open:
+- Check `/sys/bus/nd/devices/...` for namespace details.
+- `ioctl(fd, BLKGETSIZE64, ...)` works normally.
+- `mmap(fd, ..., PROT_READ | PROT_WRITE, MAP_SHARED)`: if the mapping returns DAX-backed memory (check via `/proc/<pid>/smaps` for `rd` flag on the region, or via `MAP_SYNC` support), DAX path is available.
+
+If DAX is available, the backend switches to DAX mode.
+
+#### 9.5.2 DAX read / write
+
+- Read: `memcpy(dst, mapped_region + offset, len)`. Direct memory access.
+- Write: `memcpy(mapped_region + offset, src, len)`, then cache-line flush:
+  - `clflushopt` on older CPUs (Haswell, Broadwell).
+  - `clwb` on newer CPUs (Skylake-X+) — non-evicting flush; better for hot data.
+- Durability barrier: `sfence` after all flushes for a logical op.
+
+Libpmem (`libpmem2`) provides these primitives; we wrap it.
+
+#### 9.5.3 DAX sync semantics
+
+On DAX, "fsync" means "cache-line writeback + memory barrier". No kernel round-trip. Latency: nanoseconds, not microseconds.
+
+Implication: commit latency on PMEM-backed pools drops dramatically. The txg commit's fsync phase is limited by `sfence` throughput rather than storage controller response.
+
+#### 9.5.4 DAX in multi-device pools
+
+A pool can mix DAX and non-DAX devices. Metadata might live on PMEM for low-latency commits; bulk data on HDD.
+
+Per-device DAX flag in the device roster (§4.3.1) indicates which devices use DAX mode. Allocator respects class=PMEM for placement (§4.9.2).
+
+### 9.6 POSIX backend (for non-Linux hosts and loopback files)
+
+When Stratum runs on macOS, BSD, Windows (via WSL or native), or on a loopback file where io_uring isn't useful:
+
+- Backend uses POSIX `pread`/`pwrite`/`fsync`.
+- Async ops are simulated via a thread pool: submit puts the op on a work queue; worker thread runs it synchronously; completion is dispatched back.
+- No fixed-buffer optimization (no benefit on POSIX pread).
+- DAX not available.
+
+Performance: much lower than io_uring (every op is a syscall, every async is a thread-pool hop). Acceptable for dev / cross-platform / low-IOPS workloads.
+
+Thread pool sizing: number of logical CPUs, cap at 64.
+
+### 9.7 libaio backend (compile-time optional)
+
+For Linux kernels pre-5.1 (pre-io_uring). Uses `libaio` (`io_submit`, `io_getevents`).
+
+- Similar submission-queue model to io_uring but older, more limited.
+- No SQPOLL equivalent: every submit is a syscall.
+- No fixed-buffer optimization.
+- Works; slower than io_uring.
+
+Enabled via `-DSTM_ENABLE_LIBAIO` at build time; most builds skip it. Kernel 5.1+ is 2019; anyone running older than that is not our target user.
+
+### 9.8 Sync semantics
+
+The block layer provides sync primitives; the fs layer composes them.
+
+#### 9.8.1 fsync vs fdatasync
+
+- `fsync`: flush all pending writes *and* any metadata updates (e.g., file size change). On raw block devices, the distinction is moot — there's no filesystem-layer metadata below us. Equivalent to `fdatasync` in practice.
+- `fdatasync`: flush data only. Same as above on raw devices.
+
+For Stratum, both map to the same kernel op at the block layer. The fs layer above uses fsync semantically but expects fdatasync-equivalent behavior at the block interface.
+
+#### 9.8.2 Commit barriers
+
+The commit coordinator (§3.7, §5.6) issues `fsync` at Phase 1 and Phase 3. Each fsync is:
+- Submitted as `IORING_OP_FSYNC` (or `IORING_OP_SYNC_FILE_RANGE` + fsync).
+- Async: coordinator continues Phase 2 work while Phase 1 fsyncs in flight; waits at end of phase for all fsyncs to complete.
+- On DAX: `sfence` only; no kernel round-trip.
+
+Phase 1 and Phase 3 both require fsync-confirmed quorum (§5.5.2) before advancing.
+
+#### 9.8.3 Write ordering
+
+io_uring does not guarantee order between ops — two writes submitted in order may land out of order on disk. Stratum's sync protocol (§3.7) never relies on I/O ordering; it uses explicit `IORING_OP_FSYNC` as a barrier.
+
+Between fsyncs, writes can reorder; that's fine because we don't advance commit gen until after the fsync.
+
+### 9.9 Zero-copy strategy
+
+The goal: data written by a 9P client traverses the system with minimal copying.
+
+#### 9.9.1 Current path (v2.0 target)
+
+```
+9P client → 9P server (receives into stratum buffer)
+        → stratum buffer (compress, encrypt)
+        → fixed buffer (registered for io_uring)
+        → io_uring WRITE_FIXED → device
+```
+
+Copies: 9P receive → stratum buffer (one copy), stratum → fixed buffer (one copy). Total: 2 copies.
+
+With fixed-buffer zero-copy, the final hop is genuinely zero-copy (no bounce buffer in the kernel). 2 copies is acceptable for v2.0.
+
+#### 9.9.2 True zero-copy (post-v2.0)
+
+```
+NIC → fixed buffer directly (via TCP_ZEROCOPY or AF_XDP)
+    → in-place AEAD (destructive; or a shadow buffer)
+    → io_uring WRITE_FIXED → device
+```
+
+0 or 1 copy. Requires: 9P server using `recv(MSG_ZEROCOPY)` or AF_XDP; AEAD encrypt in-place (possible with modes like AEGIS-256 with some scratch space).
+
+Post-v2.0 optimization. Target: ~40% throughput improvement for large-file writes.
+
+#### 9.9.3 Read path
+
+Reverse:
+
+```
+Device → fixed buffer (io_uring READ_FIXED)
+     → AEAD decrypt in-place (or shadow)
+     → decompress (scratch buffer)
+     → stratum output buffer
+     → 9P send buffer → client
+```
+
+Copies: fixed → scratch (for decompression) → 9P send buffer. 2 copies.
+
+Post-v2.0: `sendfile(fd_socket, fd_device, ...)` for raw (no decrypt/decompress) paths — rare, but possible for debug/scrub traffic.
+
+### 9.10 Concurrent submission
+
+Multiple threads (writers + commit coordinator) submit to io_uring concurrently.
+
+#### 9.10.1 Thread-safety of io_uring
+
+io_uring's SQ and CQ are lock-free ring buffers. Multiple producers (threads submitting) can push to SQ as long as each gets its own SQE slot atomically.
+
+Liburing's `io_uring_get_sqe()` is NOT thread-safe by default; it assumes single-producer. For multi-producer, wrap with a mutex or use per-thread rings.
+
+#### 9.10.2 Our approach
+
+- **One ring pair (metadata + data) per device** at v2.0. Writers use a `mutex` to serialize `get_sqe + prep + submit` within one ring.
+- Mutex contention is low because prep is cheap (microseconds); submission is a CAS on the ring tail.
+- If contention becomes a bottleneck (per `perf` / benchmarks), split to per-CPU rings in v2.1.
+
+#### 9.10.3 Completion processing
+
+The coordinator's main loop polls both rings. Completions dispatch to per-request callbacks.
+
+For writer threads waiting on their own writes: completion callback sets a per-thread eventfd or pthread condvar; writer wakes.
+
+### 9.11 Error handling
+
+#### 9.11.1 Error taxonomy
+
+- **Transient**: temporary failure; retry likely to succeed. Examples: `EBUSY`, `EINTR`, a transient I/O error on a single sector.
+- **Permanent**: retrying won't help. Examples: device returned data with bad csum (not our fault), ENOSPC, EROFS.
+- **Device gone**: the device is no longer accessible. Examples: hot-unplug, driver reset, ENODEV.
+
+Classification is op-specific; a "transient" EIO on one read might escalate to "device gone" if it repeats.
+
+#### 9.11.2 Retry policy
+
+Transient errors: retry with exponential backoff.
+- First retry: 10 ms delay.
+- Each subsequent: double delay.
+- Max retries: 5 (total ~300 ms timeout).
+- After max retries: escalate to "permanent".
+
+Retries are at the block layer; the fs layer sees only the final result.
+
+#### 9.11.3 Permanent error escalation
+
+Permanent failures on a device → mark the device as `DEGRADED` in the pool's device roster (§4.3.1). Subsequent ops on this device fail immediately; redundancy paths (§7.15) handle data recovery.
+
+Admin is notified via the event log (`/ctl/.../events/device-failures`).
+
+#### 9.11.4 Device-gone detection
+
+Several detection paths:
+- I/O returns `ENODEV`, `ENXIO`, or similar.
+- udev (Linux) or equivalent reports device removal.
+- Periodic probe: every 10 seconds, issue a small read to confirm device is alive.
+
+Device-gone → immediate `FAULTED` transition. Pool enters degraded mode if redundancy can cover; otherwise `POOL_FAULTED`.
+
+#### 9.11.5 Write-hole prevention
+
+A write that's submitted but not confirmed before a crash leaves undefined disk state. Stratum's commit protocol (§3.7, §5.6) handles this:
+
+- Writes not referenced by any committed root are orphan — they exist on disk but no metadata points at them.
+- On next mount, the allocator walks reachable state and reconstructs the free list; orphan blocks are implicitly free.
+- No integrity problem because no metadata claimed them.
+
+### 9.12 Log device (post-v2.0 candidate)
+
+ZFS's ZIL (and bcachefs's journal) accelerates fsync latency by writing commit intent to a fast device (NVMe or PMEM).
+
+For Stratum, the analog would be:
+
+- A pool device with `role=LOG` (typically PMEM or fast NVMe).
+- Phase 1 and Phase 3 uberblock writes land on the log device first (fast fsync).
+- Phase 2 data writes to DATA devices proceed in parallel.
+- After the DATA-device Phase 2 completes, the log entry is released.
+
+Benefit: fsync latency bounded by log device speed (~tens of microseconds on PMEM) instead of slowest DATA device (~milliseconds on HDD).
+
+Cost: additional code complexity in the commit protocol; log-device management.
+
+Deferred to post-v2.0. Many workloads don't care about fsync latency enough to justify.
+
+### 9.13 Interactions with other subsystems
+
+- **§3 Concurrency**: commit coordinator and writer threads all submit through the block layer. Thread-safety via per-ring mutexes.
+- **§4 Storage pool**: each device in the pool has its own block backend instance. Pool layer routes operations to the appropriate device based on paddr.
+- **§5 SB / quorum**: uberblock writes require fsync confirmation; all devices' fsyncs must confirm for quorum.
+- **§6 Allocator**: bootstrap-pool block writes go through the block layer like any other. Block layer doesn't know about bootstrap vs user data.
+- **§7 Crypto + integrity**: encrypted data is passed to the block layer as ciphertext; no crypto happens at the block level. AEAD tag travels with the ciphertext in the same extent.
+- **§11 POSIX**: all user writes flow through the block layer on the write path.
+
+### 9.14 Open questions
+
+- **Queue depth tuning**: 512 entries per ring. Larger = better batching, more pinned memory. Benchmark-driven tuning.
+- **Fixed-buffer pool sizing**: 128 MiB default. Too small → fall back to non-fixed ops (slower); too large → wastes memory. Adaptive sizing based on observed op rate?
+- **Per-CPU rings timing**: v2.0 (per-device) or v2.1 (per-CPU)?  Start with per-device; upgrade if contention shows up in profiling.
+- **DAX detection reliability**: what if a device misreports DAX capability? Probably benign — we'd use mmap+memcpy either way; just miss the performance benefit on true-DAX hardware.
+- **Zero-copy receive in v2.0**: commit to 2-copy path for simplicity; post-v2.0 optimization.
+- **Log device at v2.0**: fsync latency matters for some workloads (DBs with high commit rates). If early feedback shows this, promote from post-v2.0 to v2.0 scope.
+- **Windows backend**: FUSE on Windows via WinFsp is possible; no io_uring equivalent. Portability is bonus; Linux kernel module is the preferred post-v2.0 optimization.
+
+### 9.15 Summary
+
+The block device layer is a thin abstraction above the storage hardware, designed for io_uring from the start.
+
+Key commitments:
+
+1. **Narrow backend interface** (~12 ops): open, close, submit_read/write (async, with fixed-buffer variants), fsync, discard, resize, register_buffers, poll_completions.
+2. **io_uring primary on Linux** with per-device metadata + data rings, fixed buffers, SQPOLL where available.
+3. **DAX path** for PMEM: mmap + memcpy + cache flushes. Microsecond-scale fsync.
+4. **POSIX backend** for non-Linux and loopback — synchronous ops behind a thread pool.
+5. **libaio backend** only as a compile-time opt-in; not in default builds.
+6. **Concurrent submission safe**: per-ring mutex protects SQE production; CAS in SQ tail handles multi-producer.
+7. **Error handling with transient retry + permanent escalation + device-gone detection**. Redundancy layer (§7.15) consumes permanent errors.
+8. **Log device deferred to post-v2.0**; current design doesn't preclude adding it.
+
+Status: DRAFT → awaiting review, push-back, then COMMITTED.
 
 ---
 
@@ -3023,8 +3420,8 @@ Each of §3–§5 and §7 is probably its own Phase 0 session. §6, §8, §9–�
 | §5 Superblock / quorum | DRAFT | 3 |
 | §6 Allocator | DRAFT | 4 |
 | §7 Cryptography + integrity | DRAFT | 5 |
-| §8 Namespace | **DRAFT** (this session) | 6 |
-| §9 Block device | STUB | 7 |
+| §8 Namespace | DRAFT | 6 |
+| §9 Block device | **DRAFT** (this session) | 7 |
 | §10 Client interfaces | STUB | 8 |
 | §11 POSIX surface | STUB | 9 |
 | §12 I/O paths | STUB | 10 (integration) |
