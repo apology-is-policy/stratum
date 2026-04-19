@@ -16,6 +16,7 @@
 #define STM_KEY_XATTR      0x04
 #define STM_KEY_SNAP       0x05   /* snapshot descriptor by ID */
 #define STM_KEY_SNAP_NAME  0x06   /* snapshot name-to-ID index */
+#define STM_KEY_SPACE      0x07   /* persistent allocator range (Phase D #2) */
 
 struct __attribute__((packed)) stm_key {
     le64    sk_ino;

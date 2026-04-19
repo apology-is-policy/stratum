@@ -154,7 +154,8 @@ Offset Size   Field                     Notes
 16      8      le64    ss_gen            monotonic per-sync
 24      57     stm_bptr ss_root          root of main Bε-tree
 81      57     stm_bptr ss_snap_root     root of snapshot tree
-138     57     stm_bptr ss_space_root    reserved (always null)
+138     57     stm_bptr ss_space_root    Phase D #2 persistent allocator root
+                                         (still null through Stage 1 of #2)
 195     2      le16    ss_tree_height    height of main tree
 197     4      le32    ss_block_size     = 4096
 201     4      le32    ss_node_size      = 131072
@@ -349,6 +350,24 @@ The array costs 4 bytes per 4 KiB block — 1 MiB per 1 GiB of volume.
 ### 5.4 Mount-time reconstruction
 
 `stm_alloc` is rebuilt on every mount by walking all live trees (main + snap tree + each snapshot's saved root) and incrementing refcounts via `stm_alloc_mark`.
+
+### 5.5 Persistent allocator (Phase D #2 — in progress)
+
+The in-memory refcount array is O(`total_blocks`) — 1 GiB of RAM for a 1 TiB volume, and mount time is O(data size) because every btree node and extent record must be walked. Phase D #2 replaces this with a second Bε-tree, rooted at `SB->ss_space_root`, storing only ALLOCATED block ranges. Free space is implicit (the gaps).
+
+Key = `stm_key { ino=0, type=STM_KEY_SPACE, offset=start_block }`. Value = `struct stm_space_val { le64 sv_count; le32 sv_refcount; }` (12 bytes). API in `include/stratum/space.h`; implementation in `src/alloc/space_map.c`.
+
+RAM becomes O(distinct ranges). Mount becomes a space-tree open (log N) instead of a full data walk.
+
+**Staging plan** — the change touches the sync-ordering invariants in §7, so it lands incrementally with audits at each stage:
+
+1. **Stage 1** (landed) — space-tree operations in isolation: `stm_space_insert`, `stm_space_lookup`, `stm_space_ref`, `stm_space_unref`, `stm_space_find_gap`, `stm_space_walk`, `stm_space_commit`. Unit-tested in `tests/test_space.c`. Not wired into the running fs. Existing allocator array remains source of truth.
+2. **Stage 2** — delta log: each sync emits a compact log block of the session's alloc/free deltas, referenced from the SB. Mount replays logs since last tree-fold on top of the tree. Solves the chicken-and-egg where the space tree's own node allocations would otherwise need to be recorded in itself.
+3. **Stage 3** — dual-source validation mode: mount builds the in-memory array from the space tree + log AND from the full walk, asserts they match. Proves correctness over wide test coverage before flipping sources.
+4. **Stage 4** — drop the full walk; space tree + log becomes source of truth. The O(`total_blocks`) refcount array is still maintained in memory during a session for fast allocation, but it's initialized from the persistent structure, not rebuilt from a walk.
+5. **Stage 5** — on-demand space-tree queries replace the in-memory array entirely. RAM becomes O(distinct ranges) at runtime too. Focused audit covers every sync crash boundary.
+
+`stm_space_entry` in `stratum/space.h` is the LOG entry form (per-delta, with `op` and `gen`) for Stage 2. Stage 1 does not use it.
 
 ---
 
