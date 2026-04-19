@@ -15,7 +15,7 @@
 
 /* On-disk extent record — stored as btree value for DATA keys.
  *
- * Layout: 24 bytes total. se_write_gen holds the sync generation at
+ * Layout: 32 bytes total. se_write_gen holds the sync generation at
  * encrypt time; the crypto layer uses (paddr, write_gen) as the AEAD
  * nonce input, so a paddr reused across free+realloc cycles still gets
  * a unique (key, nonce) pair. Unused on unencrypted volumes but always
@@ -27,15 +27,26 @@
  * than needed for 128 KiB extents (max dlen = STM_EXTENT_SIZE).
  *
  * If the data wouldn't compress smaller, se_clen equals se_dlen and
- * the comp algo is STM_COMP_NONE — the data is stored raw. */
+ * the comp algo is STM_COMP_NONE — the data is stored raw.
+ *
+ * se_xxh is a 64-bit xxHash3 of the ON-DISK bytes (post-compression,
+ * pre-encryption) — i.e. exactly the `clen` bytes at `paddr`. Verified
+ * on read for UNENCRYPTED volumes before decompress. On ENCRYPTED
+ * volumes the AEAD tag already provides stronger integrity, so the
+ * field is populated for format uniformity but not re-verified
+ * (redundant with AEAD). Not a security mechanism; detects bit rot /
+ * torn writes / media errors only. An attacker with raw-disk write
+ * access can rewrite both content and hash — that threat model needs
+ * AEAD (encrypted volumes). */
 struct __attribute__((packed)) stm_extent {
     le64 se_paddr;          /* physical byte address of data on disk */
     le64 se_write_gen;       /* write-gen counter (nonce uniqueness) */
     le32 se_dlen;            /* logical (uncompressed) data length */
     le32 se_clen_and_comp;   /* low 24 bits: stored disk length (pre-AEAD-tag)
                               * high 8 bits: compression algo (STM_COMP_*) */
+    le64 se_xxh;             /* xxHash3-64 of on-disk bytes (Phase D #7) */
 };
-STM_STATIC_ASSERT(sizeof(struct stm_extent) == 24, stm_extent_size);
+STM_STATIC_ASSERT(sizeof(struct stm_extent) == 32, stm_extent_size);
 
 static inline uint32_t stm_extent_clen(const struct stm_extent *e)
 {
@@ -49,13 +60,15 @@ static inline uint8_t stm_extent_comp(const struct stm_extent *e)
 
 static inline void stm_extent_set(struct stm_extent *e, uint64_t paddr,
                                   uint64_t write_gen,
-                                  uint32_t dlen, uint32_t clen, uint8_t comp)
+                                  uint32_t dlen, uint32_t clen, uint8_t comp,
+                                  uint64_t xxh)
 {
     e->se_paddr     = cpu_to_le64(paddr);
     e->se_write_gen = cpu_to_le64(write_gen);
     e->se_dlen      = cpu_to_le32(dlen);
     e->se_clen_and_comp =
         cpu_to_le32((clen & 0x00FFFFFFu) | ((uint32_t)comp << 24));
+    e->se_xxh       = cpu_to_le64(xxh);
 }
 
 struct stm_fs {

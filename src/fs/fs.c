@@ -1054,6 +1054,12 @@ static int extent_write_data(struct stm_fs *fs, const void *data,
     rc = stm_alloc_extent(fs->alloc, nblocks, &paddr);
     if (rc) return rc;
 
+    /* Phase D #7: per-extent xxHash3-64 of the on-disk payload (post-
+     * compression, pre-encryption) — i.e. exactly the `clen` bytes at
+     * `paddr`. Verified on read for unencrypted volumes. Always
+     * populated so the format doesn't branch on encrypted-ness. */
+    uint64_t xxh = stm_xxh64(payload, clen);
+
     if (crypto) {
         struct stm_ad_extent ad;
         build_extent_ad(&ad, ino, ext_off);
@@ -1069,7 +1075,7 @@ static int extent_write_data(struct stm_fs *fs, const void *data,
     }
     if (rc) goto fail_free;
 
-    stm_extent_set(out_ext, paddr, fs->gen, dlen, clen, comp);
+    stm_extent_set(out_ext, paddr, fs->gen, dlen, clen, comp, xxh);
     return 0;
 
 fail_free:
@@ -1147,11 +1153,30 @@ int extent_read_data(struct stm_fs *fs, const struct stm_extent *ext,
                                 fs->cipher_buf, disk_len,
                                 payload, &plain_len);
         if (rc) return rc;
+        /* No se_xxh verify: AEAD tag already authenticated the on-disk
+         * ciphertext cryptographically. xxHash of the plaintext would be
+         * redundant, and verifying xxHash of ciphertext would still only
+         * catch accidents AEAD already caught. */
     } else {
         uint32_t to_read = clen;
         if (comp == STM_COMP_NONE && to_read > buf_len) to_read = buf_len;
         rc = stm_block_read(&fs->dev, paddr, payload, to_read);
         if (rc) return rc;
+        /* Phase D #7: verify per-extent xxHash3-64 of the on-disk bytes
+         * before decompress. Catches bit rot / torn writes / media
+         * errors on unencrypted volumes. A whole-extent read must hash
+         * all `clen` bytes — any buf_len-truncated read would hash less
+         * and give a false negative; the adjacency above (to_read may be
+         * clamped only when comp==NONE && to_read > buf_len) means
+         * clamping can only happen when buf_len < clen, which callers
+         * currently never do (every caller allocates STM_EXTENT_SIZE and
+         * dlen ≤ STM_EXTENT_SIZE → clen ≤ STM_EXTENT_SIZE ≤ buf_len).
+         * Assert that invariant here; if a future caller shrinks buf
+         * we'd need to verify the FULL ciphertext separately. */
+        if (to_read != clen) return -EIO;
+        uint64_t expected = le64_to_cpu(ext->se_xxh);
+        uint64_t actual   = stm_xxh64(payload, clen);
+        if (expected != actual) return -EIO;
     }
 
     if (comp != STM_COMP_NONE) {

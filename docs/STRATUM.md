@@ -209,7 +209,7 @@ Sort order is lexicographic `(ino, type, offset)`. All data for one inode is con
 
 Contains ino, gen, mode, uid, gid, nlink, size, atime/mtime/ctime (sec + nsec), and flags. Stored under `(ino, STM_KEY_INODE, 0)`.
 
-### 2.7 `struct stm_extent` (24 bytes)
+### 2.7 `struct stm_extent` (32 bytes)
 
 ```
 0       8      le64    se_paddr           on-disk address of extent data
@@ -217,6 +217,7 @@ Contains ino, gen, mode, uid, gid, nlink, size, atime/mtime/ctime (sec + nsec), 
 16      4      le32    se_dlen            logical (uncompressed) data length
 20      4      le32    se_clen_and_comp   low 24 bits: stored disk length (pre-AEAD-tag)
                                           high 8 bits: compression algo (STM_COMP_*)
+24      8      le64    se_xxh             xxHash3-64 of on-disk bytes (Phase D #7)
 ```
 
 Stored as the btree value for `STM_KEY_DATA` keys.
@@ -225,6 +226,8 @@ Stored as the btree value for `STM_KEY_DATA` keys.
 
 The compression algo is packed into the high byte of `se_clen_and_comp`; the low 24 bits hold the stored length on disk (covers up to 16 MiB, more than enough for the 128 KiB max extent). If compression did not shrink the data, the raw form is stored and `se_clen == se_dlen`, `comp == STM_COMP_NONE`.
 
+`se_xxh` is a 64-bit xxHash3 of the ON-DISK bytes (post-compression, pre-encryption) — exactly the `clen` bytes at `paddr`. Verified on read for UNENCRYPTED volumes before decompress (mismatch → `-EIO`). On ENCRYPTED volumes the AEAD tag already authenticates the ciphertext cryptographically; `se_xxh` is populated for format uniformity but not re-verified. Not a security mechanism — an attacker with raw-disk write access can rewrite content and hash together; that threat model needs AEAD (encrypted volumes). Detects bit rot, torn writes, media errors, and filesystem-cache bugs underneath stratum.
+
 Access via helpers:
 
 ```c
@@ -232,7 +235,8 @@ uint32_t stm_extent_clen(const struct stm_extent *e);
 uint8_t  stm_extent_comp(const struct stm_extent *e);
 void     stm_extent_set(struct stm_extent *e, uint64_t paddr,
                         uint64_t write_gen,
-                        uint32_t dlen, uint32_t clen, uint8_t comp);
+                        uint32_t dlen, uint32_t clen, uint8_t comp,
+                        uint64_t xxh);
 ```
 
 ### 2.8 `struct stm_node_hdr` (64 bytes)
@@ -282,7 +286,7 @@ Messages sort by `(key, gen ascending)`. Binary search in `stm_msg_insert` uses 
 
 ### 4.1 Model
 
-File data lives on disk OUTSIDE the btree. The btree stores only 16-byte `stm_extent` records pointing to where the data lives. Each extent covers up to 128 KiB of logical data, stored on disk in compressed and/or encrypted form.
+File data lives on disk OUTSIDE the btree. The btree stores only 32-byte `stm_extent` records pointing to where the data lives. Each extent covers up to 128 KiB of logical data, stored on disk in compressed and/or encrypted form.
 
 ### 4.2 Write path (`stm_fs_write` → `extent_write_data`)
 
@@ -290,10 +294,11 @@ For each 128 KiB-aligned extent chunk:
 1. Full-extent write past current file size: skip old-extent lookup (nothing to free).
 2. Partial write within file: fetch old extent, read + decrypt + decompress into scratch buffer, modify.
 3. **Compress** plaintext into `comp_buf` (LZ4 by default). Keep the compressed form only if `csize < dlen`; otherwise fall back to raw.
-4. **Encrypt** (if configured) the payload using `paddr` as the nonce prefix; output to `cipher_buf` with a 16-byte Poly1305 tag appended.
-5. Allocate `ceil((clen + tag) / 4096)` blocks, write to disk.
-6. Free old extent's blocks (if any).
-7. Insert new 16-byte extent record in btree. `stm_extent_set` packs `clen` and `comp` into one 32-bit field.
+4. **Hash** the post-compression payload with xxHash3-64 (Phase D #7 per-extent integrity). Stored in `se_xxh`; verified on read for unencrypted volumes.
+5. **Encrypt** (if configured) the payload using `paddr` as the nonce prefix and `(ino, offset)` bound into AEAD associated data; output to `cipher_buf` with a 16-byte Poly1305 tag appended.
+6. Allocate `ceil((clen + tag) / 4096)` blocks, write to disk.
+7. Free old extent's blocks (if any).
+8. Insert new 32-byte extent record in btree. `stm_extent_set` packs `clen` and `comp` into one 32-bit field and stores the xxHash.
 
 Transform pipeline: `plaintext ── compress? ──► payload ── encrypt? ──► disk`
 
@@ -974,6 +979,19 @@ Enforced at:
 Why: paddr+gen uniqueness alone doesn't stop an attacker with raw-disk write access from copying an extent's ciphertext to a different `(ino, offset)` btree key (the key is stored in a separately-encrypted btree node, but an attacker with key material could produce both swaps; more realistically, an attacker without the DEK can still tamper at the btree-value level if AD is absent — AEAD accepts the cipher as long as paddr+gen match, oblivious to location). Binding the location into AD fails AEAD the instant the read-side AD disagrees.
 
 Without this, extent-swap / cross-tree node-swap go undetected by the crypto layer; only downstream sanity checks would catch them, and most plausibly mis-associated data reads succeed with wrong content. Rejected at mount: any `ss_version != 2` SB is refused with `-ENOTSUP`; see regression `test_fs_rejects_ss_version_1`.
+
+### 22.1.2a Per-extent integrity (Phase D #7)
+
+**Invariant**: on unencrypted volumes, every extent's on-disk bytes are covered by `se_xxh` (xxHash3-64). Read path verifies before decompress; mismatch → `-EIO`.
+
+Enforced at:
+- `src/fs/fs.c::extent_write_data` computes `stm_xxh64(payload, clen)` on the post-compression / pre-encryption bytes and stores it in the new extent record via `stm_extent_set`.
+- `src/fs/fs.c::extent_read_data` (unencrypted branch) verifies `stm_xxh64(payload, clen) == le64_to_cpu(ext->se_xxh)` after the block read, before decompress. Encrypted branch skips — AEAD tag is stronger and the verify would either be redundant (on ciphertext) or require re-hashing post-decrypt (equivalent to a second tag check).
+- `src/cmd/scrub.c::visit_entry` inherits the verify automatically by calling `extent_read_data` — after #7, scrub on unencrypted volumes becomes a true bit-rot detector, not just a btree-node checksum walk.
+
+Regression: `test_fs_extent_bitrot_detected` (tests/test_fs.c) writes an incompressible extent, flips one byte on disk at the extent content's paddr, reopens, expects `-EIO` on read.
+
+Not a security mechanism. An attacker with raw-disk write access can rewrite content and the stored hash together — that threat model is the domain of AEAD (encrypted volumes). Bit rot, torn writes, media errors, and underlying-storage bugs are the target.
 
 ### 22.1.2 Tree identity binding
 

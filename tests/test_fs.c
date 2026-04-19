@@ -1217,6 +1217,79 @@ STM_TEST(test_fs_posix_hardlinks)
     unlink(path);
 }
 
+/* Phase D #7 regression: a single-byte corruption of an extent's on-disk
+ * content must be detected on read (unencrypted volume, where there's no
+ * AEAD tag to catch it). We write a full 128 KiB extent of pseudorandom
+ * bytes (incompressible so it's stored raw, with known content), scan
+ * the disk image for the payload, flip one byte in it, reopen and read
+ * → expect -EIO. Without the per-extent xxHash3 verify this returns the
+ * corrupted bytes silently. */
+STM_TEST(test_fs_extent_bitrot_detected)
+{
+    const char *path = "/tmp/stratum_test_extent_bitrot.img";
+    unlink(path);
+    STM_ASSERT_EQ(stm_fs_create(path, 32ULL*1024*1024, NULL), 0);
+
+    /* Generate 128 KiB of random-ish bytes so LZ4 can't compress below
+     * size and the extent stores plaintext. Deterministic seed for
+     * repeatability. */
+    enum { PAYLOAD_SZ = 128 * 1024 };
+    uint8_t *payload = malloc(PAYLOAD_SZ);
+    STM_ASSERT(payload != NULL);
+    uint32_t rng = 0xdeadbeefu;
+    for (int i = 0; i < PAYLOAD_SZ; i++) {
+        rng = rng * 1103515245u + 12345u;
+        payload[i] = (uint8_t)(rng >> 16);
+    }
+
+    struct stm_fs *fs;
+    STM_ASSERT_EQ(stm_fs_open(path, NULL, &fs), 0);
+    uint64_t ino;
+    STM_ASSERT_EQ(stm_fs_create_file(fs, 1, "payload.bin", 0644, &ino), 0);
+    STM_ASSERT_EQ(stm_fs_write(fs, ino, 0, payload, PAYLOAD_SZ), 0);
+    STM_ASSERT_EQ(stm_fs_sync(fs), 0);
+    stm_fs_close(fs);
+
+    /* Scan the raw image for the payload. LZ4 on random data expands
+     * rather than shrinks, so extent_write_data falls back to plaintext
+     * storage — the first 32 bytes on disk will match payload[0..32]. */
+    int fd = open(path, O_RDWR);
+    STM_ASSERT(fd >= 0);
+    struct stat st;
+    STM_ASSERT_EQ(fstat(fd, &st), 0);
+    off_t scan_limit = st.st_size - PAYLOAD_SZ;
+    off_t found = -1;
+    /* Pattern matches aren't trivial for 128 KiB; just probe the first
+     * 32 bytes at block alignment. Allocator hands out block-aligned
+     * extents so any extent-start is at a multiple of 4096. */
+    uint8_t probe[32];
+    for (off_t b = 8192 /* past SBs */; b <= scan_limit; b += 4096) {
+        STM_ASSERT_EQ((int)pread(fd, probe, 32, b), 32);
+        if (memcmp(probe, payload, 32) == 0) { found = b; break; }
+    }
+    STM_ASSERT(found > 0);
+    /* Flip one bit in the middle of the payload on disk. */
+    uint8_t byte;
+    off_t bitrot_off = found + PAYLOAD_SZ / 2;
+    STM_ASSERT_EQ((int)pread(fd, &byte, 1, bitrot_off), 1);
+    byte ^= 0x01;
+    STM_ASSERT_EQ((int)pwrite(fd, &byte, 1, bitrot_off), 1);
+    close(fd);
+
+    /* Reopen + read → must now fail with -EIO. */
+    STM_ASSERT_EQ(stm_fs_open(path, NULL, &fs), 0);
+    uint8_t *readback = malloc(PAYLOAD_SZ);
+    STM_ASSERT(readback != NULL);
+    uint32_t nread = 0;
+    int rc = stm_fs_read(fs, ino, 0, readback, PAYLOAD_SZ, &nread);
+    STM_ASSERT_EQ(rc, -EIO);
+
+    stm_fs_close(fs);
+    free(readback);
+    free(payload);
+    unlink(path);
+}
+
 /* Phase D #8 regression: mounting an ss_version=1 volume must fail cleanly
  * with -ENOTSUP (rather than silently mis-decrypting or crashing). We
  * construct a plausible v1 volume by downgrading a freshly-created v2
@@ -1276,6 +1349,7 @@ int main(void)
     STM_RUN(test_fs_posix_rename);
     STM_RUN(test_fs_posix_xattr);
     STM_RUN(test_fs_posix_hardlinks);
+    STM_RUN(test_fs_extent_bitrot_detected);
     STM_RUN(test_fs_rejects_ss_version_1);
     printf("all passed\n");
     return 0;
