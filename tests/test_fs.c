@@ -2,6 +2,9 @@
 #include "stratum/fs.h"
 #include "stratum/super.h"
 #include "stratum/csum.h"
+#include "stratum/btree.h"
+#include "stratum/key.h"
+#include "../src/fs/fs_internal.h"
 
 #include <unistd.h>
 #include <errno.h>
@@ -1290,6 +1293,74 @@ STM_TEST(test_fs_extent_bitrot_detected)
     unlink(path);
 }
 
+/* Phase D #7 regression (compressed path): the xxHash must cover the
+ * post-compression bytes, so a bit flip in the stored compressed payload
+ * must also surface as -EIO. If extent_read_data hashed the wrong buffer
+ * (e.g. the decompressed plaintext, which would be hashed as zeros on
+ * a repeating-byte extent), this test would silently succeed. We write
+ * 128 KiB of a single byte so LZ4 compresses it to <100 B, scan the
+ * post-SB region for the 4-byte LZ4 run-length prefix that marks the
+ * compressed block, flip a byte there, reopen, read → -EIO. */
+STM_TEST(test_fs_extent_bitrot_compressed)
+{
+    const char *path = "/tmp/stratum_test_extent_bitrot_compressed.img";
+    unlink(path);
+    STM_ASSERT_EQ(stm_fs_create(path, 32ULL*1024*1024, NULL), 0);
+
+    enum { PAYLOAD_SZ = 128 * 1024 };
+    uint8_t *payload = malloc(PAYLOAD_SZ);
+    STM_ASSERT(payload != NULL);
+    memset(payload, 0xAB, PAYLOAD_SZ);  /* compresses to a handful of bytes */
+
+    struct stm_fs *fs;
+    STM_ASSERT_EQ(stm_fs_open(path, NULL, &fs), 0);
+    uint64_t ino;
+    STM_ASSERT_EQ(stm_fs_create_file(fs, 1, "compr.bin", 0644, &ino), 0);
+    STM_ASSERT_EQ(stm_fs_write(fs, ino, 0, payload, PAYLOAD_SZ), 0);
+    STM_ASSERT_EQ(stm_fs_sync(fs), 0);
+
+    /* Look up the extent record directly to get the compressed-payload
+     * paddr. Without this we'd have to scan disk for an unknown LZ4
+     * byte pattern — unreliable. stm_btree_lookup goes through the
+     * in-memory btree so the record is exactly what was written. */
+    struct stm_key_cpu kc = { .ino = ino, .type = STM_KEY_DATA, .offset = 0 };
+    struct stm_key k = stm_key_from_cpu(&kc);
+    struct stm_extent ext;
+    uint32_t vlen = sizeof(ext);
+    STM_ASSERT_EQ(stm_btree_lookup(fs->tree, &k, &ext, &vlen), 0);
+    STM_ASSERT_EQ(vlen, sizeof(ext));
+    uint64_t paddr = le64_to_cpu(ext.se_paddr);
+    uint32_t clen  = stm_extent_clen(&ext);
+    STM_ASSERT(stm_extent_comp(&ext) != STM_COMP_NONE);  /* verify compressed */
+    STM_ASSERT(clen < PAYLOAD_SZ);                        /* shrank */
+
+    stm_fs_close(fs);
+
+    /* Flip a byte somewhere in the compressed payload. */
+    int fd = open(path, O_RDWR);
+    STM_ASSERT(fd >= 0);
+    off_t bitrot_off = (off_t)paddr + (off_t)(clen / 2);
+    uint8_t byte;
+    STM_ASSERT_EQ((int)pread(fd, &byte, 1, bitrot_off), 1);
+    byte ^= 0xFF;
+    STM_ASSERT_EQ((int)pwrite(fd, &byte, 1, bitrot_off), 1);
+    close(fd);
+
+    /* Reopen + read. xxh verify is over the compressed bytes, so a flip
+     * in the stored payload fails integrity before decompress. */
+    STM_ASSERT_EQ(stm_fs_open(path, NULL, &fs), 0);
+    uint8_t *readback = malloc(PAYLOAD_SZ);
+    STM_ASSERT(readback != NULL);
+    uint32_t nread = 0;
+    int rc = stm_fs_read(fs, ino, 0, readback, PAYLOAD_SZ, &nread);
+    STM_ASSERT_EQ(rc, -EIO);
+
+    stm_fs_close(fs);
+    free(readback);
+    free(payload);
+    unlink(path);
+}
+
 /* Phase D #8 regression: mounting an ss_version=1 volume must fail cleanly
  * with -ENOTSUP (rather than silently mis-decrypting or crashing). We
  * construct a plausible v1 volume by downgrading a freshly-created v2
@@ -1350,6 +1421,7 @@ int main(void)
     STM_RUN(test_fs_posix_xattr);
     STM_RUN(test_fs_posix_hardlinks);
     STM_RUN(test_fs_extent_bitrot_detected);
+    STM_RUN(test_fs_extent_bitrot_compressed);
     STM_RUN(test_fs_rejects_ss_version_1);
     printf("all passed\n");
     return 0;

@@ -1158,22 +1158,20 @@ int extent_read_data(struct stm_fs *fs, const struct stm_extent *ext,
          * redundant, and verifying xxHash of ciphertext would still only
          * catch accidents AEAD already caught. */
     } else {
-        uint32_t to_read = clen;
-        if (comp == STM_COMP_NONE && to_read > buf_len) to_read = buf_len;
-        rc = stm_block_read(&fs->dev, paddr, payload, to_read);
+        /* Read the ENTIRE on-disk payload (all clen bytes). buf_len is
+         * already proven >= dlen by the bounds check above; for
+         * comp==STM_COMP_NONE clen == dlen so clen <= buf_len; for
+         * comp != STM_COMP_NONE payload points into fs->comp_buf whose
+         * capacity bounds clen at STM_EXTENT_SIZE via the earlier clen
+         * check. So an unclamped read of clen bytes is always safe.
+         *
+         * Phase D #7: verify per-extent xxHash3-64 before decompress.
+         * Catches bit rot / torn writes / media errors on unencrypted
+         * volumes. The hash covers exactly the clen bytes written at
+         * extent_write_data time, so we must also hash exactly clen
+         * bytes at read time — no truncation. */
+        rc = stm_block_read(&fs->dev, paddr, payload, clen);
         if (rc) return rc;
-        /* Phase D #7: verify per-extent xxHash3-64 of the on-disk bytes
-         * before decompress. Catches bit rot / torn writes / media
-         * errors on unencrypted volumes. A whole-extent read must hash
-         * all `clen` bytes — any buf_len-truncated read would hash less
-         * and give a false negative; the adjacency above (to_read may be
-         * clamped only when comp==NONE && to_read > buf_len) means
-         * clamping can only happen when buf_len < clen, which callers
-         * currently never do (every caller allocates STM_EXTENT_SIZE and
-         * dlen ≤ STM_EXTENT_SIZE → clen ≤ STM_EXTENT_SIZE ≤ buf_len).
-         * Assert that invariant here; if a future caller shrinks buf
-         * we'd need to verify the FULL ciphertext separately. */
-        if (to_read != clen) return -EIO;
         uint64_t expected = le64_to_cpu(ext->se_xxh);
         uint64_t actual   = stm_xxh64(payload, clen);
         if (expected != actual) return -EIO;

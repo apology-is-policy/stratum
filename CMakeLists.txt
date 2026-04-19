@@ -42,13 +42,23 @@ if(ZSTD_INCLUDE_DIR AND ZSTD_LIBRARY)
     message(STATUS "Found ZSTD: ${ZSTD_LIBRARY}")
 endif()
 
-# Integrity checksums (optional — xxHash3-128)
+# Integrity checksums (xxHash3-128 for SB + btree nodes; xxHash3-64 for
+# per-extent integrity). CMake still allows building without — the stubs
+# in include/stratum/csum.h return 0/pass — but that disables *all*
+# integrity detection, so emit a loud WARNING rather than silently ship
+# an insecure build. Production packagers should treat this as an error.
 find_path(XXHASH_INCLUDE_DIR xxhash.h)
 find_library(XXHASH_LIBRARY NAMES xxhash)
 if(XXHASH_INCLUDE_DIR AND XXHASH_LIBRARY)
     set(STM_HAVE_XXHASH ON)
     add_compile_definitions(STM_HAVE_XXHASH=1)
     message(STATUS "Found xxHash: ${XXHASH_LIBRARY}")
+else()
+    message(WARNING
+        "xxHash not found — building WITHOUT integrity checksums. "
+        "SB/node/extent corruption will not be detected. "
+        "Install xxhash (apt install libxxhash-dev, brew install xxhash) "
+        "and reconfigure for a production build.")
 endif()
 
 # Encryption (optional)

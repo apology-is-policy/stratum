@@ -1,16 +1,16 @@
 /*
  * stratum scrub — online integrity sweep.
  *
- * Walks every btree node (forces xxHash3 csum and AEAD tag verification via
+ * Walks every btree node (forces xxHash3 csum + AEAD tag verification via
  * stm_btree_read_node) and every DATA extent (forces AEAD tag verification
- * via extent_read_data). Read-only: opens via stm_fs_open_ro so no disk
- * writes, suitable for cron-style periodic verification.
+ * on encrypted volumes, xxHash3-64 per-extent verification on unencrypted
+ * volumes — both via extent_read_data). Read-only: opens via stm_fs_open_ro
+ * so no disk writes, suitable for cron-style periodic verification.
  *
- * On encrypted volumes, scrub is airtight — every bit of data is
- * AEAD-authenticated, so bitrot surfaces as an Rerror on first read. On
- * unencrypted volumes today, extent payload bytes have no per-extent
- * integrity field (SOTA #7 adds xxHash3 to each extent record); scrub still
- * exercises btree-node csums but reports extent payload as "unverifiable."
+ * After Phase D #7, scrub is a true bit-rot detector on BOTH flavors:
+ * - Encrypted: AEAD tag catches any bit flip in ciphertext or nonce.
+ * - Unencrypted: per-extent xxHash3-64 (stored in stm_extent.se_xxh) is
+ *   verified on read; mismatch → -EIO.
  *
  * Exit code:  0 = clean, 1 = errors found, 2 = couldn't run (bad path,
  * wrong passphrase, etc.) — matches fsck convention.
@@ -198,8 +198,8 @@ int stm_cmd_scrub(int argc, char **argv)
     }
 
     printf("Scrubbing %s (%s)...\n", path,
-           c.encrypted ? "encrypted — full AEAD verification"
-                       : "unencrypted — metadata only, extent data unverifiable");
+           c.encrypted ? "encrypted — AEAD tag + btree csum verification"
+                       : "unencrypted — per-extent xxHash3 + btree csum verification");
 
     /* Main tree. */
     rc = stm_btree_walk_entries(fs->tree, stm_btree_root(fs->tree),
