@@ -3585,36 +3585,497 @@ Status: DRAFT → awaiting review, push-back, then COMMITTED.
 
 ## 11. POSIX surface
 
-**STATUS**: STUB
+**STATUS**: DRAFT
 
-### 11.1 Goals
+*(This section specifies WHAT POSIX semantics Stratum exposes. The HOW is distributed across §§3–9 — concurrency, tree, allocator, crypto, block device.)*
 
-- Modern POSIX — everything in the ext4/XFS surface still relevant.
-- Skip legacy quirks (noatime, no mandatory locking, etc.).
+### 11.1 Goals and non-goals
 
-### 11.2 Decisions committed (VISION §6 non-goals)
+**Goals**:
 
-- O_TMPFILE, F_SEAL_*, relatime, pipes-as-files: yes.
-- Mandatory locking, atime: no.
-- Obscure BSD extensions: no.
+- Fully functional POSIX on Linux and macOS. Applications that target ext4/XFS/APFS should work unchanged.
+- Modern POSIX extensions: `O_TMPFILE`, `F_SEAL_*`, `statx(2)` with btime, `copy_file_range` with reflink support, `fallocate`/`FALLOC_FL_*`.
+- Nanosecond timestamp resolution.
+- Inline small-file data to avoid extent overhead on tiny files.
+- Reflinks (O(1) copy) within a dataset; cross-dataset reflinks when encryption compatible.
+- POSIX ACLs via standard xattr encoding.
 
-### 11.3 Subsections to write
+**Non-goals**:
 
-- **11.3.1** Inode format — fields, timestamps, xattr, embedded-small-file (if any).
-- **11.3.2** Directory format — hash-table / B-tree hybrid.
-- **11.3.3** Extended attributes — tree location, size limits.
-- **11.3.4** File data — extent tree, inline data for tiny files.
-- **11.3.5** Locking — advisory (flock, fcntl); no mandatory.
-- **11.3.6** ACLs — POSIX ACLs as xattr.
-- **11.3.7** Timestamps — ns resolution; btime, mtime, atime (relatime), ctime.
-- **11.3.8** Special files — FIFO, socket, device, symlink.
-- **11.3.9** Reflinks (copy_file_range).
-- **11.3.10** Hard links (same-dataset only).
+- Mandatory locking. Deprecated, leaky, nobody wants it.
+- `atime` strict updates. `relatime` default; atime-off as an option; strict atime available but not recommended.
+- Obscure BSD/SunOS extensions (`ACL_TYPE_NFS4`, `AT_FDCWD_FOLLOW_EACCESS`, etc.).
+- NFSv4 ACLs at v2.0 (different model; revisit post-v2.0 if demand).
+- Extended file flags beyond the common Linux `chattr` set.
+- Case-insensitive-by-default filesystems. Available as a per-dataset property (`casesensitive=insensitive`, `mixed`); sensitive is default.
+- Windows-style alternate data streams. Use xattrs.
+- Reserved-for-Windows filenames (`con`, `nul`, etc.). Linux/POSIX convention: any byte sequence except `/` and `\0`.
 
-### 11.4 Open questions
+### 11.2 Decisions already committed
 
-- Inline small-file data in inode (ext4 `inline_data`): yes or no.
-- Max filename length, max path depth.
+From earlier docs:
+
+- **Modern POSIX features yes** (VISION §6): `O_TMPFILE`, `F_SEAL_*`, `relatime`, `statx`, reflink.
+- **Mandatory locking no** (VISION §6).
+- **Per-dataset casesensitivity** (§8.4.2).
+
+Decisions taken in this section:
+
+- **256-byte inode** (power of 2 for packing; generous for extension).
+- **Four timestamps**: btime (creation, immutable), atime (relatime default), mtime, ctime. 96 bits each (64-sec + 32-nsec).
+- **Inline data up to 100 bytes** in the inode. Small-file optimization.
+- **Hash-indexed B-tree directories**. Same approach as v1 — keyed by `(dir_ino, STM_KEY_DIRENT, fnv1a(name))`, probe-chain for hash collisions.
+- **Xattr storage**: same mechanism as v1 — separate keyspace in the tree (`STM_KEY_XATTR`), keyed by inode + fnv1a(name).
+- **Max xattr value**: 64 KiB per attribute.
+- **Max filename**: 255 bytes (POSIX `NAME_MAX`).
+- **Max path depth**: no hard limit in format; practical cap at 4096 nesting levels (guards runaway recursion).
+- **Hard links same-dataset only**. Cross-dataset returns `-EXDEV`.
+- **Symlink target**: up to 100 bytes inline in inode; larger via extent tree.
+- **Device nodes and FIFO / socket**: standard POSIX; `dev_t` stored inline in inode data union.
+- **ACLs**: POSIX ACLs (`system.posix_acl_access`, `system.posix_acl_default`) via xattr. Standard encoding (Linux's `richacl`-pre-NFSv4).
+
+### 11.3 Inode format
+
+256 bytes per inode. Layout:
+
+```c
+struct stm_inode {
+    // Identity and metadata — 40 bytes
+    le64    si_ino;             // inode number (unique within dataset)
+    le64    si_dataset_id;      // dataset containing this inode
+    le64    si_gen;              // generation (increments on inode number reuse)
+    le32    si_mode;             // file type + permissions
+    le32    si_uid;              // owner UID
+    le32    si_gid;              // owner GID
+    le32    si_nlink;            // hard link count
+
+    // Timestamps — 48 bytes (4 × 12)
+    le64    si_btime_sec;       // creation time (immutable)
+    le32    si_btime_nsec;
+    le64    si_atime_sec;       // access time
+    le32    si_atime_nsec;
+    le64    si_mtime_sec;       // content modification
+    le32    si_mtime_nsec;
+    le64    si_ctime_sec;       // metadata change
+    le32    si_ctime_nsec;
+
+    // Size, flags — 24 bytes
+    le64    si_size;             // logical size in bytes
+    le64    si_allocated;        // blocks actually allocated
+    uint8_t si_data_kind;        // STM_DATA_EXTENT / INLINE / SYMLINK / DEVICE
+    uint8_t si_data_len;         // bytes of inline data used (≤100)
+    le16    si_xattr_count;      // quick count (auth via tree walk)
+    le32    si_flags;            // IMMUTABLE / APPEND / NODUMP / per-file encryption / ...
+
+    // File data (tagged union) — 100 bytes
+    union {
+        struct stm_bptr si_extent_tree_root;  // 57 B; rest padded
+        uint8_t         si_inline_data[100];  // tiny-file inline storage
+        uint8_t         si_symlink_target[100]; // symlink target (up to 100 B)
+        struct {
+            le32 dev_major;
+            le32 dev_minor;
+            uint8_t pad[92];
+        }               si_device;            // device node dev_t
+    } si_data;
+
+    // Reserved — 44 bytes (padding to 256)
+    uint8_t si_reserved[44];
+};
+
+STM_STATIC_ASSERT(sizeof(struct stm_inode) == 256, stm_inode_size);
+```
+
+#### 11.3.1 Tagged data union
+
+`si_data_kind` tells us how to interpret `si_data`:
+
+- **STM_DATA_EXTENT** (regular files, directories, large symlinks): `si_extent_tree_root` is valid; points at the root of this inode's extent tree.
+- **STM_DATA_INLINE** (files ≤100 bytes): `si_inline_data[si_data_len]` contains the whole file content.
+- **STM_DATA_SYMLINK** (short symlinks): `si_symlink_target[si_data_len]` is the target path (no NUL terminator; length is `si_data_len`).
+- **STM_DATA_DEVICE** (device nodes): `si_device.{dev_major, dev_minor}` is the device ID.
+
+For FIFOs and sockets, `si_mode` encodes the file type; `si_data_kind` is `STM_DATA_EXTENT` but the extent tree is empty (no data).
+
+#### 11.3.2 Generation number
+
+`si_gen` tracks inode number reuse. When an inode is deleted and its number is later reused for a new file, `si_gen` increments. Used for:
+
+- Disambiguating `nfs_fh_t` (NFS file handles) across reboots.
+- Detecting stale fids in 9P when a client holds an inode pointer across a delete-and-reuse.
+- Ensuring per-file derived keys (§7.3.3) don't collide when an inode number is reused.
+
+#### 11.3.3 Small-file optimization (inline data)
+
+Files ≤100 bytes store their content directly in the inode. Benefits:
+
+- No extent allocation (saves ≥4 KiB of device space per tiny file).
+- No extent-tree lookup (faster reads).
+- Reduces fragmentation on workloads with many tiny files.
+
+Cutover: a write that grows the file past 100 bytes migrates to extent storage:
+
+1. Allocate an extent.
+2. Write the combined (existing inline + new) data to the extent.
+3. Update the inode: `si_data_kind = STM_DATA_EXTENT`, `si_extent_tree_root = <new extent tree root>`.
+4. The inline space becomes reserved (44 bytes padding + unused 100-byte union).
+
+Reverse direction (truncate from large to tiny): the inode could migrate back to inline, but we skip this — truncation to tiny is rare, and the code complexity isn't worth it. Once extent-backed, stays extent-backed.
+
+#### 11.3.4 Per-dataset inode numbering
+
+Each dataset has its own inode number space starting at a reserved root (`STM_ROOT_INO = 1`). Dataset's `di_next_ino` in the dataset index (§8.3.2) is the next to assign. Monotonic within a dataset; inode numbers are not globally unique across datasets (they're unique within the dataset's tree).
+
+AD binding (§7.6.1) includes `dataset_id` so inodes with the same number in different datasets don't collide cryptographically.
+
+### 11.4 Directory format
+
+Directories use the same Bε-tree as file data; directory entries are records in the main tree keyed by hashed filename.
+
+#### 11.4.1 Dirent record
+
+```c
+struct stm_dirent {
+    le64    dir_ino;            // parent directory (implicit in key)
+    le64    child_ino;          // inode this dirent points at
+    le64    child_gen;          // child's si_gen at time of link (optional validation)
+    uint8_t child_type;         // DT_REG / DT_DIR / DT_LNK / DT_FIFO / ...
+    uint8_t name_len;           // byte length of name
+    uint8_t name[];             // UTF-8 name bytes (no NUL terminator)
+};
+```
+
+Key format:
+```c
+struct stm_dirent_key {
+    le64    sk_ino;             // dir_ino
+    uint8_t sk_type;            // STM_KEY_DIRENT
+    le64    sk_hash_probe;      // fnv1a(name) + probe offset for collision
+};
+```
+
+The `hash_probe` field is `fnv1a(name)` for the first attempt. On hash collision (two different names with same fnv1a), the new entry uses `hash + 1`, `hash + 2`, etc. — open-addressing probe sequence. The stored dirent includes the actual name so readers can verify.
+
+#### 11.4.2 Lookup protocol
+
+`name → child_ino`:
+
+1. Compute `h = fnv1a(name)`.
+2. Probe `(dir_ino, STM_KEY_DIRENT, h + 0)`, `(dir_ino, STM_KEY_DIRENT, h + 1)`, ...
+3. At each hit, compare stored `name` to query `name` byte-for-byte.
+4. Match → return `child_ino`. No match after bounded probe count (e.g., 64) → return `ENOENT`.
+
+Most names have unique fnv1a hashes; probe chain almost always terminates at probe 0 or 1. Pathological collision cases still work correctly, just slower.
+
+#### 11.4.3 Directory scaling
+
+For directories with many entries:
+
+- B-tree nature of the underlying structure means insertion / lookup is O(log n) in the total tree.
+- `readdir(3)` does a range scan: from `(dir_ino, STM_KEY_DIRENT, 0)` to `(dir_ino, STM_KEY_DIRENT, UINT64_MAX)`. Returns entries in hash order (not lexicographic — applications that want sorted output sort client-side).
+- For directories with >100k entries, performance stays O(log n) per lookup; `readdir` is proportional to directory size.
+
+#### 11.4.4 `.` and `..`
+
+Not stored as real dirents. Computed:
+
+- `readdir` synthesizes `.` (this_ino) and `..` (parent_ino) as the first two entries.
+- `lookup(name=".")` returns the current directory inode.
+- `lookup(name="..")` returns the parent (stored in an inode-level field or derivable from path walk).
+
+Saves two dirent entries per directory — not a huge win, but saves tree traffic.
+
+#### 11.4.5 Case-insensitivity
+
+Per-dataset property (`casesensitive` in §8.4.2):
+
+- **`sensitive`** (default): names are byte-literal. `FILE` and `file` are different.
+- **`insensitive`**: name hash computed over the Unicode-normalized-lowercase form (NFKD + lowercase). Lookup normalizes query too. Stored name retains original case.
+- **`mixed`**: stores lowercase hash for lookup but allows original-case display. Matches macOS/APFS behavior.
+
+Normalization uses the Unicode 16.0 table (libunistring or embedded).
+
+### 11.5 Extended attributes (xattr)
+
+Stored in the main tree using `STM_KEY_XATTR`. Structure identical to dirents but different keyspace:
+
+```c
+struct stm_xattr_key {
+    le64    sk_ino;             // owning inode
+    uint8_t sk_type;            // STM_KEY_XATTR
+    le64    sk_hash_probe;      // fnv1a(name) + probe
+};
+
+struct stm_xattr {
+    le32    value_len;          // bytes of value
+    uint8_t name_len;           // bytes of name
+    uint8_t name[];             // xattr name (up to 255 bytes)
+    uint8_t value[];            // xattr value (up to 64 KiB)
+};
+```
+
+#### 11.5.1 Namespaces
+
+POSIX xattr namespaces:
+
+- `user.*`: user-controlled, permission-checked via file permissions.
+- `system.*`: system-managed (ACLs). Only root can modify.
+- `security.*`: SELinux / security labels.
+- `trusted.*`: root-only, for system-specific metadata.
+
+Stratum preserves namespace semantics. Namespace enforcement at the API layer.
+
+#### 11.5.2 Size limits
+
+- Name: ≤ 255 bytes (POSIX `XATTR_NAME_MAX`).
+- Value: ≤ 64 KiB per attribute.
+- Total xattrs per inode: bounded by tree size (no hard cap).
+
+Larger xattr values would work in the tree structure but hit btree-node boundaries inefficiently; 64 KiB fits in a node cleanly.
+
+### 11.6 File data
+
+Regular files store data in an **extent tree**, a per-file Bε-tree keyed by `(file_offset)` with extent-record values.
+
+#### 11.6.1 Extent record
+
+From v1's Phase D work, carried forward with multi-device updates:
+
+```c
+struct stm_extent_v2 {
+    stm_paddr_t se_paddr;       // 8 B — (device_id: 16, offset: 48)
+    le64        se_write_gen;    // 8 B — txg at encrypt (nonce uniqueness)
+    le32        se_dlen;         // 4 B — logical byte length (pre-compression)
+    le32        se_clen_and_comp; // 4 B — low 24: stored length; high 8: compression algo
+    le64        se_xxh;           // 8 B — xxHash3-64 (unencrypted) or 0 (encrypted, AEAD tag is integrity)
+};
+```
+
+32 bytes per extent record. Matches v1's Phase D #7 design with multi-device paddr.
+
+Extent size: up to `recordsize` (default 128 KiB, per-dataset property §8.4.2). Larger files have many extents; the extent tree is a Bε-tree.
+
+#### 11.6.2 Extent tree key
+
+```c
+struct stm_extent_key {
+    le64    sk_ino;             // (dataset-local) inode number
+    uint8_t sk_type;            // STM_KEY_DATA
+    le64    sk_offset;          // byte offset within file
+};
+```
+
+Lookup: "what extent(s) cover byte range [X, Y) of inode N?" → range scan.
+
+#### 11.6.3 Sparse files
+
+Gaps between extents are implicit — no record = hole. Reads from a hole return zeros. Writes to a hole allocate a new extent.
+
+`lseek(fd, off, SEEK_HOLE)` / `SEEK_DATA` enumerates holes by scanning the extent tree.
+
+#### 11.6.4 Extent coalescing
+
+Adjacent same-key-type extents are coalesced on write where possible:
+- New write extends an existing extent's range without gap → merge.
+- Two COW-written extents end up adjacent after commit → merge at scrub-like background pass.
+
+Aggressive coalescing at write time helps small-IO workloads. Background coalescing during scrub helps long-term fragmentation.
+
+### 11.7 Timestamps
+
+Four timestamps per inode, 96-bit each:
+
+| Timestamp | Updated when | Notes |
+|---|---|---|
+| `btime` (birth) | Inode creation | Immutable after create. Exposed via `statx(2)`. |
+| `atime` (access) | File read | `relatime` default (only update if atime < mtime or > 24h old). Can be disabled per-dataset. |
+| `mtime` (modify) | Content write | Always updated on writes. |
+| `ctime` (change) | Metadata change | Updated on any inode field change (perms, owner, nlink, xattr, extent change). |
+
+All four support nanosecond resolution. `statx` (Linux 4.11+) exposes them cleanly; older interfaces (`stat`) expose second resolution.
+
+#### 11.7.1 relatime semantics
+
+For atime:
+- Update only if `atime < mtime` (file accessed since last modification).
+- Update only if `atime` is older than 24 hours (catch-up update).
+- Skip update entirely if dataset has `atime=off`.
+
+relatime is the default because strict atime on every read is a write amplification disaster. Users who need real atime set `atime=on`.
+
+#### 11.7.2 Timestamp ordering invariant
+
+`btime ≤ ctime ≤ mtime` should hold at all times (mtime updates also update ctime; modification implies metadata change). Not strictly enforced at the filesystem level — applications can forge timestamps via `utimensat(2)` — but should be natural under normal use.
+
+### 11.8 Locking
+
+#### 11.8.1 Advisory only
+
+- **`flock(2)`**: advisory whole-file lock (LOCK_SH, LOCK_EX, LOCK_UN). Supported.
+- **`fcntl(F_SETLK)`**: advisory byte-range lock. Supported.
+- **`fcntl(F_SETLKW)`**: blocking version. Supported.
+- **`fcntl(F_OFD_SETLK)`**: open file description locks (Linux). Supported.
+
+No mandatory locking. Period.
+
+#### 11.8.2 Lock state storage
+
+Lock state is held in RAM by the stratum daemon, keyed by `(connection, inode, range)`. Survives the life of the connection. Not persisted across crashes (advisory locks are inherently ephemeral).
+
+On connection close (or crash), all locks held by that connection are released automatically.
+
+#### 11.8.3 Cross-client lock semantics
+
+Each 9P connection has its own view of locks. `flock` from one connection blocks another connection's `flock`. This is the standard multi-client locking behavior.
+
+### 11.9 ACLs
+
+POSIX ACLs via xattr. Standard encoding:
+
+- `system.posix_acl_access`: access ACL for the file/directory.
+- `system.posix_acl_default`: default ACL for new entries in a directory (inherited).
+
+Encoding: per POSIX.1e; same binary layout as Linux `getxattr`/`setxattr` produces. `getfacl`/`setfacl` tools work unmodified.
+
+#### 11.9.1 ACL evaluation
+
+On access check:
+1. If the acting UID/GID matches the owner's exact entry → use those perms.
+2. Else check named user entries.
+3. Else check owning group and named group entries.
+4. Else use "other" entry.
+5. Mask applied to named-user/named-group/owning-group.
+
+Implementation lives in the 9P server's authorization layer; ACL xattr is just storage.
+
+#### 11.9.2 No NFSv4 ACLs at v2.0
+
+NFSv4 ACLs (different from POSIX ACLs) have a richer permission model but aren't widely used on Linux. Post-v2.0 via feature flag if demand emerges.
+
+### 11.10 Flags (chattr-style)
+
+Per-inode flags (subset of Linux's `chattr` flags):
+
+- `STM_IFLAG_IMMUTABLE` (`chattr +i`): no content modification, no link, no unlink, no rename, no chmod/chown.
+- `STM_IFLAG_APPEND_ONLY` (`chattr +a`): can only append; no truncate, no overwrite.
+- `STM_IFLAG_NODUMP` (`chattr +d`): backup tools should skip.
+- `STM_IFLAG_NOCOW` — disables COW for this file. *Not* supported; conflicts with our integrity model. Setting returns `-EOPNOTSUPP`.
+- `STM_IFLAG_COMPRESS` / `STM_IFLAG_NOCOMPRESS` (`chattr +c` / `+C`): force per-file compression on/off regardless of dataset default.
+- `STM_IFLAG_ENCRYPT` — informational only; encryption is dataset-scoped, not per-file.
+
+Set/cleared via `ioctl(FS_IOC_SETFLAGS)` (Linux) or stratum-specific 9P extension.
+
+### 11.11 Special files
+
+All standard POSIX special-file types:
+
+- **Symlinks** (`S_IFLNK`): target stored in `si_symlink_target` (inline, up to 100 bytes) or via extent tree (for longer targets). `readlink` returns the stored target.
+- **FIFO / named pipe** (`S_IFIFO`): exists in the namespace; reads/writes handled by the OS-level FIFO mechanism (Linux kernel maintains the actual pipe buffer). Stratum just stores the inode.
+- **Socket** (`S_IFSOCK`): same as FIFO — namespace presence only. Actual socket communication is OS-level.
+- **Character device** (`S_IFCHR`): `dev_t` in `si_device.{dev_major, dev_minor}`. `mknod` creates; opens route to the device driver.
+- **Block device** (`S_IFBLK`): same as char device.
+
+FIFOs, sockets, and device nodes don't have associated data — their mode bits + minimal metadata (dev_t for devices) are all that's stored.
+
+### 11.12 Reflinks
+
+Reflinks are O(1) copies that share underlying storage until a write triggers COW.
+
+#### 11.12.1 API
+
+- `ioctl(fd_dst, FICLONE, fd_src)`: clone src to dst.
+- `copy_file_range(fd_in, off_in, fd_out, off_out, len, FICLONE_RANGE)`: partial clone.
+- `stratum reflink <src> <dst>`: CLI.
+- 9P extension `Treflink` (§10.2).
+
+#### 11.12.2 Mechanism
+
+1. Allocate a new inode for the destination (or use existing).
+2. Iterate the source's extent tree.
+3. For each extent, insert a copy into the destination's extent tree.
+4. Increment the allocator refcount on each extent's backing storage (§6.4.1).
+5. Time: O(source extents). For a 1 TiB file with default extent size, ~8M extents → seconds.
+
+#### 11.12.3 Cross-dataset reflinks
+
+Allowed if:
+- Both datasets are unencrypted, OR
+- Both datasets use the same encryption key (inherited or explicit-same).
+
+Otherwise, return `-EXDEV` (caller must do full copy instead).
+
+Checked via dataset key metadata (§7.3.2): compare the wrapped key IDs; if identical, share is safe.
+
+### 11.13 Hard links
+
+Same-dataset only.
+
+#### 11.13.1 API
+
+- `link(2)`: POSIX link.
+- `linkat(2)`: with fd relative.
+
+Cross-dataset attempts (`link` where src and dst are in different datasets) return `-EXDEV`.
+
+#### 11.13.2 Mechanism
+
+1. Verify source and destination parent are in the same dataset.
+2. Resolve source to an inode.
+3. Increment source inode's `si_nlink`.
+4. Insert a new dirent in the destination's parent directory pointing at the source's inode number.
+
+O(log n) — two tree ops (inode update + dirent insert).
+
+#### 11.13.3 Unlink with refcount
+
+`unlink(2)` on a hard-linked file:
+
+1. Remove the dirent.
+2. Decrement `si_nlink`.
+3. If `si_nlink == 0` AND no open file descriptors referencing this inode:
+    - Free the extent tree.
+    - Remove the inode record.
+    - Free all extents via allocator.
+4. If `si_nlink == 0` AND FDs are open: mark inode as "unlinked-but-alive"; free on last FD close.
+
+The "unlinked-but-alive" state is tracked via the file's open-fd count in the 9P server. This preserves POSIX semantics that an open FD continues to work after unlink.
+
+### 11.14 Interactions with other subsystems
+
+- **§3 Concurrency**: inode reads/writes go through the MVCC reader/writer protocol. Dirent tree operations (mkdir, unlink) serialize at the commit point.
+- **§6 Allocator**: extents allocated through the standard allocator; reflinks bump refcounts; unlinks decrement.
+- **§7 Crypto + integrity**: extents encrypted with AEAD; AD includes `(dataset_id, ino, offset)` ensuring cross-inode attacks fail.
+- **§8 Namespace**: per-dataset inode numbering; case-sensitivity property; encryption inheritance.
+- **§10 Client interfaces**: FUSE shim translates POSIX syscalls to 9P ops implementing this surface.
+
+### 11.15 Open questions
+
+- **Inline data size**: 100 bytes fits in the 256-byte inode. Could bump to 200 bytes by tightening the reserved region; tradeoff is less future headroom.
+- **Coalescing policy**: aggressive at write vs conservative (coalesce at scrub only). Current plan: both — cheap adjacency check at write, periodic pass at scrub.
+- **Timestamp precision in practice**: nanosecond resolution stored, but most apps only care about ms/s. Overhead is tiny; stick with ns.
+- **.  / .. handling**: computed vs stored. Current plan: computed (saves 2 dirents per directory). Adds minor readdir complexity.
+- **Directory hash function**: fnv1a (v1) vs xxHash3-64. fnv1a is simpler; xxHash3 is faster and better-distributed. Probably xxHash3 in v2.
+- **NOCOW** behavior: refuse vs silently accept. Refusing is clearer (apps know NOCOW won't work); silent-accept would hide conflicts.
+- **Per-file compression override via flags**: support `chattr +c/+C`? Yes — useful for overriding dataset default on specific files.
+- **Symlink target length**: 100 bytes inline, extent tree beyond. Is 100 bytes enough for the common case? Linux `PATH_MAX` is 4096 but most symlinks are much shorter.
+
+### 11.16 Summary
+
+The POSIX surface is deliberately conservative — we implement the common Linux/macOS baseline thoroughly, skip legacy quirks, and add modern extensions (statx with btime, reflink, relatime default).
+
+Key commitments:
+
+1. **256-byte inode**, power-of-2, 4 timestamps at ns resolution, tagged data union (extent/inline/symlink/device).
+2. **Inline small-file data** up to 100 bytes. Migrates to extent on growth; doesn't reverse.
+3. **Hash-indexed B-tree directories** with open-addressing probe chain for collisions. Scales to very large directories.
+4. **Xattr via separate keyspace** in the main tree. Max 64 KiB per value.
+5. **Advisory-only locking**: flock, fcntl, OFD locks. No mandatory.
+6. **POSIX ACLs** via `system.posix_acl_access` / `system.posix_acl_default` xattrs.
+7. **Reflinks** O(1) within/across-dataset-if-encryption-compatible. Hard links same-dataset only.
+8. **Special files** standard POSIX: symlinks, FIFOs, sockets, device nodes.
+9. **Common chattr flags**: IMMUTABLE, APPEND_ONLY, NODUMP, COMPRESS / NOCOMPRESS. NOCOW explicitly unsupported.
+
+Status: DRAFT → awaiting review, push-back, then COMMITTED.
 
 ---
 
@@ -3795,8 +4256,8 @@ Each of §3–§5 and §7 is probably its own Phase 0 session. §6, §8, §9–�
 | §7 Cryptography + integrity | DRAFT | 5 |
 | §8 Namespace | DRAFT | 6 |
 | §9 Block device | DRAFT | 7 |
-| §10 Client interfaces | **DRAFT** (this session) | 8 |
-| §11 POSIX surface | STUB | 9 |
+| §10 Client interfaces | DRAFT | 8 |
+| §11 POSIX surface | **DRAFT** (this session) | 9 |
 | §12 I/O paths | STUB | 10 (integration) |
 | §13 Format versioning | STUB | 11 |
 | §14 Observability | STUB | 12 |
