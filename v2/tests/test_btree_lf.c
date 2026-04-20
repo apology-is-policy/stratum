@@ -165,6 +165,51 @@ STM_TEST(btree_lf_split_on_overflow) {
     stm_btree_lf_free(t);
 }
 
+/* Insert enough keys to force multiple cascading splits: root splits,
+ * then the upper sibling overflows and splits, then maybe that one too.
+ * Verifies the MVP's right-chain growth stays consistent end-to-end. */
+STM_TEST(btree_lf_cascading_splits) {
+    stm_btree_lf *t = make_tree(8);     /* very small target → many splits */
+    stm_ebr_thread *ebr = stm_ebr_register();
+
+    enum { N = 120 };
+    for (int i = 0; i < N; i++) {
+        char kbuf[16];
+        int kl = snprintf(kbuf, sizeof kbuf, "kc-%04d", i);
+        int v = i;
+        STM_ASSERT_OK(stm_btree_lf_insert(t, ebr, kbuf, (size_t)kl,
+                                           &v, sizeof v));
+        /* Drive consolidation every few inserts so splits cascade
+         * through the upper chain as it grows. */
+        if ((i & 7) == 7) {
+            STM_ASSERT_OK(stm_btree_lf_force_consolidate(t, ebr));
+        }
+    }
+
+    for (int i = 0; i < 8; i++) {
+        STM_ASSERT_OK(stm_btree_lf_force_consolidate(t, ebr));
+    }
+
+    /* Every key readable through whatever chain of SPLIT redirects is
+     * needed to reach its final leaf. */
+    int found = 0;
+    for (int i = 0; i < N; i++) {
+        char kbuf[16];
+        int kl = snprintf(kbuf, sizeof kbuf, "kc-%04d", i);
+        int got = 0;
+        size_t vl = 0;
+        stm_status s = stm_btree_lf_lookup(t, ebr, kbuf, (size_t)kl,
+                                            &got, sizeof got, &vl);
+        STM_ASSERT_OK(s);
+        STM_ASSERT_EQ(got, i);
+        found++;
+    }
+    stm_test_info("cascading splits: verified %d keys across split chain", found);
+
+    stm_ebr_thread_free(ebr);
+    stm_btree_lf_free(t);
+}
+
 /* Delete a key on the upper (post-split) side, verify it disappears
  * and the rest of the keys remain accessible. */
 STM_TEST(btree_lf_split_then_delete_upper) {
