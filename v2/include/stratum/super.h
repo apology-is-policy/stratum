@@ -258,6 +258,50 @@ static inline uint32_t stm_ub_ring_slot(uint64_t gen) {
     return (uint32_t)(gen % STM_UB_SLOTS_PER_LABEL);
 }
 
+/* ========================================================================= */
+/* Device-backed label I/O.                                                   */
+/* ========================================================================= */
+
+typedef struct stm_bdev stm_bdev;   /* forward from block.h */
+
+/*
+ * Encode `ub` and write it to (label_idx, slot_idx) on `d`. Fsyncs
+ * before returning. Caller must ensure label_idx < STM_LABELS_PER_DEVICE
+ * and slot_idx <= STM_UB_MIRROR_SLOT.
+ */
+STM_MUST_USE
+stm_status stm_sb_label_write(stm_bdev *d, uint32_t label_idx,
+                               uint32_t slot_idx, const stm_uberblock *ub);
+
+/*
+ * Read the uberblock at (label_idx, slot_idx) from `d` and decode it
+ * into `*out_ub`. Returns STM_ECORRUPT on csum failure,
+ * STM_EBADVERSION on magic/version mismatch.
+ */
+STM_MUST_USE
+stm_status stm_sb_label_read(stm_bdev *d, uint32_t label_idx,
+                              uint32_t slot_idx, stm_uberblock *out_ub);
+
+/*
+ * Scan all STM_LABELS_PER_DEVICE labels × STM_UB_SLOTS_PER_LABEL
+ * commit-ring slots on `d`, pick the uberblock with the highest valid
+ * `ub_gen`, and hand it back via `*out_ub`. Also reports which label +
+ * slot position it came from (useful for diagnostics and for deciding
+ * where to write the NEXT commit's ring slot).
+ *
+ * Returns STM_ENOENT if no valid uberblock is found on the device
+ * (fresh / never-mounted / irrecoverably corrupt). Per-slot
+ * STM_ECORRUPT / STM_EBADVERSION failures are NOT errors — they're
+ * expected for unused slots and get silently filtered out.
+ *
+ * Single-device: this is the authoritative mount-time selection.
+ * Multi-device pools (Phase 5) will add a quorum layer on top.
+ */
+STM_MUST_USE
+stm_status stm_sb_mount_scan(stm_bdev *d, stm_uberblock *out_ub,
+                              uint32_t *out_label_idx,
+                              uint32_t *out_slot_idx);
+
 #ifdef __cplusplus
 }
 #endif

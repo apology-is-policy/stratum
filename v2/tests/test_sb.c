@@ -10,8 +10,11 @@
  */
 #include "tharness.h"
 #include <stratum/super.h>
+#include <stratum/block.h>
 
+#include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 static void fill_example(stm_uberblock *ub)
 {
@@ -212,6 +215,168 @@ STM_TEST(sb_paddr_pack_unpack) {
     uint64_t masked = stm_paddr_make(1, UINT64_MAX);
     STM_ASSERT_EQ(stm_paddr_device(masked), (uint16_t)1);
     STM_ASSERT_EQ(stm_paddr_offset(masked), (UINT64_C(1) << 48) - 1);
+}
+
+/* ========================================================================= */
+/* Device-backed label I/O.                                                   */
+/* ========================================================================= */
+
+static char g_tmp_path[256];
+
+static void make_tmp(const char *tag)
+{
+    snprintf(g_tmp_path, sizeof g_tmp_path, "/tmp/stm_v2_sb_%s_%d.bin",
+             tag, (int)getpid());
+    unlink(g_tmp_path);
+}
+
+/* Open a tmp-backed bdev sized for 4 labels + a scrap of pool data. */
+static stm_bdev *open_test_device(const char *tag, uint64_t size_bytes)
+{
+    make_tmp(tag);
+    stm_bdev_open_opts opts = stm_bdev_open_opts_default();
+    stm_bdev *d = NULL;
+    stm_status s = stm_bdev_open(g_tmp_path, &opts, &d);
+    if (s != STM_OK) return NULL;
+    if (stm_bdev_resize(d, size_bytes) != STM_OK) {
+        stm_bdev_close(d);
+        return NULL;
+    }
+    return d;
+}
+
+STM_TEST(sb_label_write_read_roundtrip) {
+    stm_bdev *d = open_test_device("rw", 16 * 1024 * 1024);   /* 16 MiB */
+    STM_ASSERT(d != NULL);
+
+    stm_uberblock src, dst;
+    fill_example(&src);
+    src.ub_gen = stm_store_le64(7);
+
+    /* Write to label 0 slot 5, read back from same position. */
+    STM_ASSERT_OK(stm_sb_label_write(d, 0, 5, &src));
+    STM_ASSERT_OK(stm_sb_label_read(d, 0, 5, &dst));
+    STM_ASSERT_MEM_EQ(&dst, &src, offsetof(stm_uberblock, ub_csum));
+
+    /* Also verify a tail label. Label 3 is the last 256 KiB of the
+     * device; slot 10 somewhere inside it. */
+    stm_uberblock tail;
+    fill_example(&tail);
+    tail.ub_gen = stm_store_le64(999);
+    STM_ASSERT_OK(stm_sb_label_write(d, 3, 10, &tail));
+    stm_uberblock tail_back;
+    STM_ASSERT_OK(stm_sb_label_read(d, 3, 10, &tail_back));
+    STM_ASSERT_EQ(stm_load_le64(tail_back.ub_gen), 999u);
+
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(sb_label_rejects_bad_idx) {
+    stm_bdev *d = open_test_device("bad", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+
+    stm_uberblock ub;
+    fill_example(&ub);
+    /* label_idx out of range. */
+    STM_ASSERT_ERR(stm_sb_label_write(d, STM_LABELS_PER_DEVICE, 0, &ub),
+                   STM_EINVAL);
+    /* slot_idx out of range. */
+    STM_ASSERT_ERR(stm_sb_label_write(d, 0, STM_UB_MIRROR_SLOT + 1, &ub),
+                   STM_EINVAL);
+
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(sb_mount_scan_picks_highest_gen) {
+    stm_bdev *d = open_test_device("mnt", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+
+    /* Fresh device: no valid uberblocks anywhere. */
+    stm_uberblock found;
+    STM_ASSERT_ERR(stm_sb_mount_scan(d, &found, NULL, NULL), STM_ENOENT);
+
+    /* Write three uberblocks at different (label, slot, gen) tuples.
+     * The scan must return the highest-gen one regardless of where
+     * it's stored. */
+    stm_uberblock ub1;  fill_example(&ub1);  ub1.ub_gen = stm_store_le64(5);
+    stm_uberblock ub2;  fill_example(&ub2);  ub2.ub_gen = stm_store_le64(42);
+    stm_uberblock ub3;  fill_example(&ub3);  ub3.ub_gen = stm_store_le64(17);
+
+    STM_ASSERT_OK(stm_sb_label_write(d, 0, 5, &ub1));
+    STM_ASSERT_OK(stm_sb_label_write(d, 2, 30, &ub2));   /* highest */
+    STM_ASSERT_OK(stm_sb_label_write(d, 3, 10, &ub3));
+
+    uint32_t label = 99, slot = 99;
+    STM_ASSERT_OK(stm_sb_mount_scan(d, &found, &label, &slot));
+    STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 42u);
+    STM_ASSERT_EQ(label, 2u);
+    STM_ASSERT_EQ(slot, 30u);
+
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(sb_mount_scan_skips_corrupt_slots) {
+    stm_bdev *d = open_test_device("cor", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+
+    /* Valid uberblock at label 0 slot 1. */
+    stm_uberblock good;  fill_example(&good);
+    good.ub_gen = stm_store_le64(100);
+    STM_ASSERT_OK(stm_sb_label_write(d, 0, 1, &good));
+
+    /* Now corrupt label 1 slot 0 directly via the bdev — doesn't
+     * match any valid magic / csum. mount_scan should silently skip. */
+    uint64_t label_offsets[STM_LABELS_PER_DEVICE];
+    const stm_bdev_caps *caps = stm_bdev_caps_of(d);
+    STM_ASSERT_OK(stm_label_offsets(caps->size_bytes, label_offsets));
+    uint8_t garbage[STM_UB_SIZE];
+    memset(garbage, 0xAB, sizeof garbage);
+    STM_ASSERT_OK(stm_bdev_write(d, label_offsets[1], garbage, sizeof garbage));
+    STM_ASSERT_OK(stm_bdev_fsync(d));
+
+    /* Scan should still find `good` — the corrupt slot is filtered. */
+    stm_uberblock found;
+    STM_ASSERT_OK(stm_sb_mount_scan(d, &found, NULL, NULL));
+    STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 100u);
+
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(sb_mount_scan_four_label_redundancy) {
+    /* Write the same uberblock at the same slot across all 4 labels.
+     * Then smash 3 of them; the 4th should carry the mount through. */
+    stm_bdev *d = open_test_device("red", 16 * 1024 * 1024);
+    STM_ASSERT(d != NULL);
+
+    stm_uberblock ub;  fill_example(&ub);
+    ub.ub_gen = stm_store_le64(55);
+    for (uint32_t li = 0; li < STM_LABELS_PER_DEVICE; li++) {
+        STM_ASSERT_OK(stm_sb_label_write(d, li, 3, &ub));
+    }
+
+    /* Corrupt labels 0, 1, 2 — label 3 alone must still suffice. */
+    uint64_t label_offsets[STM_LABELS_PER_DEVICE];
+    const stm_bdev_caps *caps = stm_bdev_caps_of(d);
+    STM_ASSERT_OK(stm_label_offsets(caps->size_bytes, label_offsets));
+    uint8_t zeros[STM_LABEL_SIZE];
+    memset(zeros, 0, sizeof zeros);
+    for (uint32_t li = 0; li < 3; li++) {
+        STM_ASSERT_OK(stm_bdev_write(d, label_offsets[li], zeros, sizeof zeros));
+    }
+    STM_ASSERT_OK(stm_bdev_fsync(d));
+
+    stm_uberblock found;
+    uint32_t found_label = 99;
+    STM_ASSERT_OK(stm_sb_mount_scan(d, &found, &found_label, NULL));
+    STM_ASSERT_EQ(stm_load_le64(found.ub_gen), 55u);
+    STM_ASSERT_EQ(found_label, 3u);
+
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
 }
 
 STM_TEST_MAIN("sb")
