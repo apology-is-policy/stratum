@@ -168,6 +168,7 @@ add_subdirectory(src/btree)
 add_subdirectory(src/sb)
 add_subdirectory(src/bootstrap)
 add_subdirectory(src/btnode)
+add_subdirectory(src/btree_store)
 add_subdirectory(src/alloc)
 
 # ---------------------------------------------------------------------------
@@ -184,6 +185,7 @@ target_link_libraries(stratum INTERFACE
     stm_sb
     stm_bootstrap
     stm_btnode
+    stm_btree_store
     stm_alloc)
 target_include_directories(stratum INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/include)
