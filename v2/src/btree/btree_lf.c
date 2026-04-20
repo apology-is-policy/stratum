@@ -1093,18 +1093,16 @@ static stm_status commit_split(stm_btree_lf *t, uint64_t nid,
                                   preserved->splits[i].sep_key_len,
                                   preserved->splits[i].sibling_id);
             if (!sd) {
-                /* Unwind partial chain: free everything we built. */
+                /* Unwind partial chain: free everything we built.
+                 * Transferred sep_keys (indices > i) were NULL'd in
+                 * their own iteration below and freed via the
+                 * delta_destroy; untransferred indices [0, i] remain
+                 * in preserved for caller cleanup. */
                 while (cur) {
                     stm_bt_lf_delta *nx = atomic_load_explicit(
                         &cur->next, memory_order_relaxed);
                     delta_destroy(cur);
                     cur = nx;
-                }
-                /* Transferred sep_keys (indices > i) are freed via
-                 * delta_destroy above; untransferred remain in
-                 * preserved for caller cleanup. */
-                for (uint32_t j = i + 1; j < preserved->n; j++) {
-                    preserved->splits[j].sep_key = NULL;
                 }
                 rc = STM_ENOMEM;
                 goto cleanup;
@@ -1183,7 +1181,6 @@ static stm_status commit_split(stm_btree_lf *t, uint64_t nid,
         new_parent_delta = alloc_internal_delta(new_parent_internal);
         if (!new_parent_delta) {
             internal_free(new_parent_internal);
-            new_parent_internal = NULL;
             retire_chain(old_head);
             return STM_OK;
         }
@@ -1196,7 +1193,6 @@ static stm_status commit_split(stm_btree_lf *t, uint64_t nid,
              * Accept the pivot loss — readers are still correct via
              * SPLIT redirect. */
             delta_destroy(new_parent_delta);
-            new_parent_delta = NULL;
             retire_chain(old_head);
             return STM_OK;
         }
@@ -1346,22 +1342,27 @@ static stm_status try_consolidate(stm_btree_lf *t, uint64_t nid)
     return rc;
 }
 
-/* Collect all leaf slot IDs reachable from root. Two-level MVP:
- * root's BASE_INTERNAL lists them directly. Returns count; leaves
- * *out is caller-allocated with cap entries. */
-static uint32_t enumerate_leaves(stm_btree_lf *t, uint64_t *out, uint32_t cap)
+/* Collect all leaf slot IDs reachable from root. Two-level MVP: root's
+ * BASE_INTERNAL lists them directly. Heap-allocates *out (caller must
+ * free); returns count. Returns 0 and leaves *out NULL if the root is
+ * empty / not BASE_INTERNAL / OOM. */
+static uint32_t enumerate_leaves(stm_btree_lf *t, uint64_t **out)
 {
+    *out = NULL;
     uint64_t root_id = atomic_load(&t->root_id);
     stm_bt_lf_delta *root_head = atomic_load(&t->pt->slots[root_id]);
     if (!root_head || root_head->kind != STM_BT_LF_DELTA_BASE_INTERNAL)
         return 0;
     stm_bt_lf_internal *internal = root_head->u.base_internal.internal;
-    uint32_t n = 0;
-    if (n < cap) out[n++] = internal->leftmost_child;
-    for (uint32_t i = 0; i < internal->npivots && n < cap; i++) {
-        out[n++] = internal->pivots[i].right_child;
+    uint32_t count = internal->npivots + 1u;
+    uint64_t *arr = malloc(count * sizeof *arr);
+    if (!arr) return 0;
+    arr[0] = internal->leftmost_child;
+    for (uint32_t i = 0; i < internal->npivots; i++) {
+        arr[i + 1] = internal->pivots[i].right_child;
     }
-    return n;
+    *out = arr;
+    return count;
 }
 
 stm_status stm_btree_lf_force_consolidate(stm_btree_lf *t, stm_ebr_thread *ebr)
@@ -1372,20 +1373,29 @@ stm_status stm_btree_lf_force_consolidate(stm_btree_lf *t, stm_ebr_thread *ebr)
 
     stm_status rc = STM_OK;
     for (uint32_t iter = 0; iter < 16; iter++) {
-        uint64_t leaves[65536];
-        uint32_t n = enumerate_leaves(t, leaves, 65536);
+        uint64_t *leaves = NULL;
+        uint32_t n = enumerate_leaves(t, &leaves);
         bool any_work = false;
 
         for (uint32_t i = 0; i < n; i++) {
             stm_bt_lf_delta *head = atomic_load(&t->pt->slots[leaves[i]]);
             if (!head) continue;
-            uint32_t d = atomic_load_explicit(&head->chain_depth,
-                                               memory_order_relaxed);
-            if (d == 0) continue;
+            uint32_t d_before = atomic_load_explicit(&head->chain_depth,
+                                                      memory_order_relaxed);
+            if (d_before == 0) continue;
             stm_status s = consolidate_or_split(t, leaves[i], true);
-            if (s != STM_OK) { rc = s; goto out; }
-            any_work = true;
+            if (s != STM_OK) { free(leaves); rc = s; goto out; }
+            /* P3-1: only mark any_work if we actually reduced depth.
+             * Otherwise the outer loop thrashes on leaves whose chain
+             * is all preserved SPLITs (no INSERTs/DELETEs to merge). */
+            stm_bt_lf_delta *after = atomic_load(&t->pt->slots[leaves[i]]);
+            uint32_t d_after = after
+                ? atomic_load_explicit(&after->chain_depth,
+                                        memory_order_relaxed)
+                : 0u;
+            if (d_after < d_before) any_work = true;
         }
+        free(leaves);
         if (!any_work) break;
     }
 
@@ -1550,18 +1560,21 @@ uint32_t stm_btree_lf_chain_depth(const stm_btree_lf *t, stm_ebr_thread *ebr)
     uint32_t max_depth = 0;
     if (root_head && root_head->kind == STM_BT_LF_DELTA_BASE_INTERNAL) {
         stm_bt_lf_internal *internal = root_head->u.base_internal.internal;
-        uint64_t nids[65536];
-        uint32_t n = 0;
-        if (n < 65536) nids[n++] = internal->leftmost_child;
-        for (uint32_t i = 0; i < internal->npivots && n < 65536; i++) {
-            nids[n++] = internal->pivots[i].right_child;
-        }
-        for (uint32_t i = 0; i < n; i++) {
-            stm_bt_lf_delta *h = atomic_load(&t->pt->slots[nids[i]]);
-            if (!h) continue;
-            uint32_t d = atomic_load_explicit(&h->chain_depth,
-                                                memory_order_relaxed);
-            if (d > max_depth) max_depth = d;
+        uint32_t count = internal->npivots + 1u;
+        uint64_t *nids = malloc(count * sizeof *nids);
+        if (nids) {
+            nids[0] = internal->leftmost_child;
+            for (uint32_t i = 0; i < internal->npivots; i++) {
+                nids[i + 1] = internal->pivots[i].right_child;
+            }
+            for (uint32_t i = 0; i < count; i++) {
+                stm_bt_lf_delta *h = atomic_load(&t->pt->slots[nids[i]]);
+                if (!h) continue;
+                uint32_t d = atomic_load_explicit(&h->chain_depth,
+                                                    memory_order_relaxed);
+                if (d > max_depth) max_depth = d;
+            }
+            free(nids);
         }
     } else if (root_head) {
         /* Legacy fallback: root directly holds a leaf chain. Only
