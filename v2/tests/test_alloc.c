@@ -1,0 +1,433 @@
+/* SPDX-License-Identifier: ISC */
+/*
+ * Main allocator tests (Phase 3 chunk 4b).
+ *
+ *   - create / close round-trip; data-area geometry is the expected
+ *     [(1 MiB + bootstrap_size), end − 2×LABEL_SIZE).
+ *   - reserve lays down ranges contiguously from data_first_block.
+ *   - reserve finds the first-fit gap between existing ranges.
+ *   - reserve past capacity returns STM_ENOSPC.
+ *   - reserve honors hint when the hinted gap is big enough.
+ *   - free decrements refcount; reaches 0 → PENDING.
+ *   - commit sweep matches allocator.tla: `free_gen < committed_gen`.
+ *     Before sweep, PENDING ranges are not reservable.
+ *   - ref bumps refcount; multi-owner ranges need multiple frees to
+ *     hit PENDING.
+ *   - lookup returns length + refcount for an allocated range.
+ *   - double-free (free of refcount=0 entry) rejected STM_EINVAL.
+ *
+ * Device: 16 MiB loopback with 8 MiB bootstrap; data area is ~7 MiB,
+ * enough for a few thousand blocks of reserve/free without stressing
+ * either bootstrap geometry or btree scan cost.
+ */
+#include "tharness.h"
+#include <stratum/alloc.h>
+#include <stratum/block.h>
+#include <stratum/bootstrap.h>
+#include <stratum/super.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+/* 16 MiB device, 8 MiB bootstrap pool. */
+#define TEST_DEVICE_BYTES         (UINT64_C(16) * 1024u * 1024u)
+#define TEST_BOOTSTRAP_BYTES      (UINT64_C(8)  * 1024u * 1024u)
+
+/* Data area size in blocks: TEST_DEVICE_BYTES / 4096 − first − tail_labels
+ * = 4096 − 256 − 2304 − 128 = 1408 blocks = 5.5 MiB. Actually compute:
+ *   first = (1 MiB + 8 MiB) / 4 KiB = 9 MiB / 4 KiB = 2304
+ *   last  = (16 MiB − 512 KiB) / 4 KiB − 1 = (15.5 MiB / 4 KiB) − 1
+ *         = 3968 − 1 = 3967
+ *   total = 3967 − 2304 + 1 = 1664 blocks = 6.5 MiB. */
+#define TEST_DATA_FIRST_BLOCK     2304u
+#define TEST_DATA_LAST_BLOCK      3967u
+#define TEST_DATA_TOTAL_BLOCKS    1664u
+
+static char g_tmp_path[256];
+
+static void make_tmp(const char *tag)
+{
+    snprintf(g_tmp_path, sizeof g_tmp_path, "/tmp/stm_v2_alloc_%s_%d.bin",
+             tag, (int)getpid());
+    unlink(g_tmp_path);
+}
+
+static stm_bdev *open_fresh_device(void)
+{
+    stm_bdev_open_opts opts = stm_bdev_open_opts_default();
+    stm_bdev *d = NULL;
+    STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &opts, &d));
+    STM_ASSERT(d != NULL);
+    if (d) {
+        STM_ASSERT_OK(stm_bdev_resize(d, TEST_DEVICE_BYTES));
+    }
+    return d;
+}
+
+static stm_alloc *make_fresh_alloc(stm_bdev *d)
+{
+    uint64_t pool_uuid[2]   = { 0xA1A1A1A1A1A1A1A1ULL, 0xB2B2B2B2B2B2B2B2ULL };
+    uint64_t device_uuid[2] = { 0xC3C3C3C3C3C3C3C3ULL, 0xD4D4D4D4D4D4D4D4ULL };
+    stm_alloc *a = NULL;
+    STM_ASSERT_OK(stm_alloc_create(d, pool_uuid, device_uuid,
+                                    TEST_BOOTSTRAP_BYTES, &a));
+    return a;
+}
+
+/* ========================================================================= */
+
+STM_TEST(alloc_create_data_geometry) {
+    make_tmp("geom");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    stm_alloc_stats st;
+    STM_ASSERT_OK(stm_alloc_stats_get(a, &st));
+    STM_ASSERT_EQ(st.data_first_block,     TEST_DATA_FIRST_BLOCK);
+    STM_ASSERT_EQ(st.data_last_block,      TEST_DATA_LAST_BLOCK);
+    STM_ASSERT_EQ(st.data_total_blocks,    TEST_DATA_TOTAL_BLOCKS);
+    STM_ASSERT_EQ(st.data_allocated_blocks, 0u);
+    STM_ASSERT_EQ(st.data_pending_blocks,   0u);
+    STM_ASSERT_EQ(st.data_free_blocks,     TEST_DATA_TOTAL_BLOCKS);
+    STM_ASSERT_EQ(st.n_allocated_ranges,   0u);
+    STM_ASSERT_EQ(st.n_pending_ranges,     0u);
+
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(alloc_reserve_contiguous_runs) {
+    make_tmp("contig");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    /* Three reservations: 8, 16, 4 blocks. They should land contiguously
+     * starting at data_first_block. */
+    uint64_t p1 = 0, p2 = 0, p3 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &p1));
+    STM_ASSERT_OK(stm_alloc_reserve(a, 16u, 0, &p2));
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p3));
+
+    STM_ASSERT_EQ(stm_paddr_offset(p1), TEST_DATA_FIRST_BLOCK);
+    STM_ASSERT_EQ(stm_paddr_offset(p2), TEST_DATA_FIRST_BLOCK + 8u);
+    STM_ASSERT_EQ(stm_paddr_offset(p3), TEST_DATA_FIRST_BLOCK + 8u + 16u);
+
+    stm_alloc_stats st;
+    STM_ASSERT_OK(stm_alloc_stats_get(a, &st));
+    STM_ASSERT_EQ(st.data_allocated_blocks, 28u);
+    STM_ASSERT_EQ(st.n_allocated_ranges,     3u);
+
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(alloc_reserve_fills_gap) {
+    make_tmp("gap");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    /* Layout a hole: reserve → reserve → free middle → reserve (smaller). */
+    uint64_t p1 = 0, p2 = 0, p3 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &p1));   /* blocks [first,     first+8)   */
+    STM_ASSERT_OK(stm_alloc_reserve(a, 16u, 0, &p2));  /* blocks [first+8,   first+24)  */
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p3));   /* blocks [first+24,  first+28)  */
+
+    /* Free p2 and sweep it (commit past free_gen). Gap of 16 blocks. */
+    STM_ASSERT_OK(stm_alloc_free(a, p2, /*free_gen=*/ 1));
+    STM_ASSERT_OK(stm_alloc_commit(a, /*committed_gen=*/ 2));
+
+    /* Request 16 blocks → should fill the gap exactly. */
+    uint64_t p4 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 16u, 0, &p4));
+    STM_ASSERT_EQ(stm_paddr_offset(p4), TEST_DATA_FIRST_BLOCK + 8u);
+
+    /* Request 4 more → appends after p3. */
+    uint64_t p5 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p5));
+    STM_ASSERT_EQ(stm_paddr_offset(p5), TEST_DATA_FIRST_BLOCK + 28u);
+
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(alloc_reserve_exhaust_returns_enospc) {
+    make_tmp("enospc");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    /* Reserve everything. */
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, TEST_DATA_TOTAL_BLOCKS, 0, &p));
+    STM_ASSERT_EQ(stm_paddr_offset(p), TEST_DATA_FIRST_BLOCK);
+
+    /* One more byte → ENOSPC. */
+    uint64_t q = 0;
+    STM_ASSERT_ERR(stm_alloc_reserve(a, 1u, 0, &q), STM_ENOSPC);
+
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(alloc_pending_not_reservable_until_sweep) {
+    /* allocator.tla: a PENDING range can't be reallocated until Commit
+     * sweeps it. The bitmap bit (here: tree entry) stays set. */
+    make_tmp("pendres");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    uint64_t p1 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &p1));
+    STM_ASSERT_OK(stm_alloc_free(a, p1, /*free_gen=*/ 5));
+    STM_ASSERT_OK(stm_alloc_commit(a, /*committed_gen=*/ 5));  /* 5 < 5 is false → no sweep */
+
+    /* The range is still PENDING (refcount=0). A new reserve for 8 blocks
+     * lands AFTER it. */
+    uint64_t p2 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &p2));
+    STM_ASSERT_EQ(stm_paddr_offset(p2), TEST_DATA_FIRST_BLOCK + 8u);
+
+    /* Now commit with a bigger gen. The sweep runs. */
+    STM_ASSERT_OK(stm_alloc_commit(a, /*committed_gen=*/ 6));
+
+    stm_alloc_stats st;
+    STM_ASSERT_OK(stm_alloc_stats_get(a, &st));
+    STM_ASSERT_EQ(st.n_pending_ranges, 0u);
+    STM_ASSERT_EQ(st.data_pending_blocks, 0u);
+
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(alloc_ref_and_multi_free) {
+    /* A range with refcount=3 takes 3 frees to reach PENDING. */
+    make_tmp("ref");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &p));
+
+    /* Bump refcount twice → total 3. */
+    STM_ASSERT_OK(stm_alloc_ref(a, p));
+    STM_ASSERT_OK(stm_alloc_ref(a, p));
+
+    uint64_t len = 0;
+    uint32_t rc  = 0;
+    STM_ASSERT_OK(stm_alloc_lookup(a, p, &len, &rc));
+    STM_ASSERT_EQ(len, 8u);
+    STM_ASSERT_EQ(rc,  3u);
+
+    /* First two frees: refcount drops to 2 then 1, NOT yet PENDING. */
+    STM_ASSERT_OK(stm_alloc_free(a, p, /*free_gen=*/ 1));
+    STM_ASSERT_OK(stm_alloc_lookup(a, p, &len, &rc));
+    STM_ASSERT_EQ(rc, 2u);
+    STM_ASSERT_OK(stm_alloc_free(a, p, /*free_gen=*/ 1));
+    STM_ASSERT_OK(stm_alloc_lookup(a, p, &len, &rc));
+    STM_ASSERT_EQ(rc, 1u);
+
+    /* Third free: PENDING. */
+    STM_ASSERT_OK(stm_alloc_free(a, p, /*free_gen=*/ 1));
+    STM_ASSERT_OK(stm_alloc_lookup(a, p, &len, &rc));
+    STM_ASSERT_EQ(rc, 0u);
+
+    /* Commit sweeps the PENDING. */
+    STM_ASSERT_OK(stm_alloc_commit(a, /*committed_gen=*/ 2));
+    STM_ASSERT_ERR(stm_alloc_lookup(a, p, &len, &rc), STM_ENOENT);
+
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(alloc_double_free_rejected) {
+    make_tmp("dblfree");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p));
+    STM_ASSERT_OK(stm_alloc_free(a, p, 1));          /* refcount → 0, PENDING */
+    /* Next free on the same paddr: refcount is already 0. */
+    STM_ASSERT_ERR(stm_alloc_free(a, p, 1), STM_EINVAL);
+
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(alloc_free_unknown_paddr_enoent) {
+    make_tmp("nope");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    /* No reservations yet. Any paddr returns STM_ENOENT. */
+    uint64_t fake = stm_paddr_make(0, TEST_DATA_FIRST_BLOCK + 100u);
+    STM_ASSERT_ERR(stm_alloc_free(a, fake, 1), STM_ENOENT);
+
+    /* paddr that doesn't match a range-start also fails. */
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &p));
+    uint64_t mid = stm_paddr_make(0, stm_paddr_offset(p) + 2u);
+    STM_ASSERT_ERR(stm_alloc_free(a, mid, 1), STM_ENOENT);
+
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(alloc_ref_rejects_pending) {
+    make_tmp("refpend");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p));
+    STM_ASSERT_OK(stm_alloc_free(a, p, 1));
+    /* Range is PENDING. Ref on it should be rejected. */
+    STM_ASSERT_ERR(stm_alloc_ref(a, p), STM_EINVAL);
+
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(alloc_reserve_hint_honored_in_gap) {
+    make_tmp("hint");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    /* Create two ranges with a 64-block gap. */
+    uint64_t p1 = 0, p2 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &p1));
+    /* Skip 64 blocks (intentionally leave a gap by first_block + 8 + 64). */
+    uint64_t forced_start = stm_paddr_make(0,
+        TEST_DATA_FIRST_BLOCK + 8u + 64u);
+    (void)forced_start;
+    /* Easier: reserve-free-reserve the gap as a tombstone. */
+    STM_ASSERT_OK(stm_alloc_reserve(a, 64u, 0, &p2));    /* [first+8, first+72) */
+    uint64_t p3 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &p3));     /* [first+72, first+80) */
+
+    STM_ASSERT_OK(stm_alloc_free(a, p2, 1));
+    STM_ASSERT_OK(stm_alloc_commit(a, 2));                /* sweep → gap of 64 blocks */
+
+    /* Hint inside the gap with alignment. */
+    uint64_t hint = stm_paddr_make(0, TEST_DATA_FIRST_BLOCK + 8u + 32u);
+    uint64_t p4 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 16u, hint, &p4));
+    STM_ASSERT_EQ(stm_paddr_offset(p4),
+                  TEST_DATA_FIRST_BLOCK + 8u + 32u);
+
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(alloc_lookup_reports_length_and_refcount) {
+    make_tmp("lookup");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 37u, 0, &p));
+
+    uint64_t len = 0;
+    uint32_t rc  = 0;
+    STM_ASSERT_OK(stm_alloc_lookup(a, p, &len, &rc));
+    STM_ASSERT_EQ(len, 37u);
+    STM_ASSERT_EQ(rc, 1u);
+
+    /* NULL out params permitted. */
+    STM_ASSERT_OK(stm_alloc_lookup(a, p, NULL, NULL));
+
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(alloc_commit_strict_inequality) {
+    /* Matches allocator.tla's Commit rule: sweep free_gen < committed_gen.
+     * free_gen = 5:
+     *   commit(5) does NOT sweep.
+     *   commit(6) DOES sweep. */
+    make_tmp("strict");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p));
+    STM_ASSERT_OK(stm_alloc_free(a, p, /*free_gen=*/ 5));
+
+    STM_ASSERT_OK(stm_alloc_commit(a, /*committed_gen=*/ 5));
+    stm_alloc_stats st;
+    STM_ASSERT_OK(stm_alloc_stats_get(a, &st));
+    STM_ASSERT_EQ(st.n_pending_ranges, 1u);
+
+    STM_ASSERT_OK(stm_alloc_commit(a, /*committed_gen=*/ 6));
+    STM_ASSERT_OK(stm_alloc_stats_get(a, &st));
+    STM_ASSERT_EQ(st.n_pending_ranges, 0u);
+
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(alloc_reserve_misuse) {
+    make_tmp("resmis");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    uint64_t p = 0;
+    STM_ASSERT_ERR(stm_alloc_reserve(a, 0, 0, &p), STM_EINVAL);
+    STM_ASSERT_ERR(stm_alloc_reserve(a, 1u, 0, NULL), STM_EINVAL);
+    STM_ASSERT_ERR(stm_alloc_reserve(NULL, 1u, 0, &p), STM_EINVAL);
+
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(alloc_bootstrap_persists_through_open) {
+    /* Data-area tree is in-RAM (chunk 4b), but the bootstrap pool
+     * persists across close/open (chunk 4a state). Verify
+     * bootstrap_bitmap_gen advances across commits and is visible
+     * after reopen. */
+    make_tmp("rm");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p));
+    STM_ASSERT_OK(stm_alloc_commit(a, 1));     /* bootstrap gen 0→1 */
+    STM_ASSERT_OK(stm_alloc_commit(a, 2));     /* bootstrap gen 1→2 */
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+
+    stm_bdev_open_opts opts = stm_bdev_open_opts_default();
+    stm_bdev *d2 = NULL;
+    STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &opts, &d2));
+
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open(d2, &a2));
+
+    stm_alloc_stats st;
+    STM_ASSERT_OK(stm_alloc_stats_get(a2, &st));
+    STM_ASSERT_EQ(st.bootstrap_bitmap_gen, 2u);
+
+    /* Data-area tree is fresh (in-RAM only in chunk 4b). */
+    STM_ASSERT_EQ(st.n_allocated_ranges, 0u);
+    STM_ASSERT_EQ(st.data_allocated_blocks, 0u);
+
+    stm_alloc_close(a2);
+    stm_bdev_close(d2);
+    unlink(g_tmp_path);
+}
+
+STM_TEST_MAIN("alloc")
