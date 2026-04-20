@@ -161,6 +161,7 @@ static stm_bt_lf_delta *alloc_base_delta(stm_bt_node *node)
     if (!d) return NULL;
     d->kind = STM_BT_LF_DELTA_BASE;
     atomic_init(&d->next, NULL);
+    atomic_init(&d->chain_depth, 0u);
     d->u.base.node = node;
     return d;
 }
@@ -172,6 +173,7 @@ static stm_bt_lf_delta *alloc_insert_delta(const void *key, size_t key_len,
     if (!d) return NULL;
     d->kind = STM_BT_LF_DELTA_INSERT;
     atomic_init(&d->next, NULL);
+    atomic_init(&d->chain_depth, 0u);
 
     uint8_t *k = stm_bt_dup_bytes(key, key_len);
     uint8_t *v = stm_bt_dup_bytes(val, val_len);
@@ -192,6 +194,7 @@ static stm_bt_lf_delta *alloc_delete_delta(const void *key, size_t key_len)
     if (!d) return NULL;
     d->kind = STM_BT_LF_DELTA_DELETE;
     atomic_init(&d->next, NULL);
+    atomic_init(&d->chain_depth, 0u);
 
     uint8_t *k = stm_bt_dup_bytes(key, key_len);
     if (!k && key_len > 0) { free(d); return NULL; }
@@ -210,6 +213,7 @@ static stm_bt_lf_delta *alloc_split_delta(uint8_t *sep_key, uint32_t sep_key_len
     if (!d) return NULL;
     d->kind = STM_BT_LF_DELTA_SPLIT;
     atomic_init(&d->next, NULL);
+    atomic_init(&d->chain_depth, 0u);
     d->u.split.sep_key     = sep_key;
     d->u.split.sep_key_len = sep_key_len;
     d->u.split.sibling_id  = sibling_id;
@@ -274,10 +278,12 @@ stm_status stm_btree_lf_new(const stm_btree_opts *opts, stm_btree_lf **out)
     if (t->opts.target_entries  < 4) t->opts.target_entries  = 4;
     if (t->opts.target_messages < 1) t->opts.target_messages = 1;
 
-    /* Fixed-capacity page table. 256 slots is enough for the tree to
-     * grow through O(log) leaf splits before running out — a runtime
-     * grow-with-CoW is future work. */
-    t->pt = page_table_new(256);
+    /* Fixed-capacity page table. 65536 slots gives enough headroom for
+     * a deep right-chain of splits plus defensive margin for IDs burned
+     * when a commit_split CAS loses its race to a concurrent prepender
+     * (see audit R2-1). A runtime grow-with-CoW and/or freed-id pool
+     * are follow-up work. */
+    t->pt = page_table_new(65536);
     if (!t->pt) { free(t); return STM_ENOMEM; }
 
     stm_bt_node *leaf = stm_bt_node_new_leaf(t->opts.target_entries,
@@ -717,31 +723,30 @@ cleanup:
     return rc;
 }
 
-/* Attempt consolidation of node `nid`. Called inside the caller's EBR
- * epoch, so any chain we walk is alive for our whole visit. Serialized
- * through t->consolidating — the first writer past the threshold takes
- * the flag, later writers bail immediately and leave the work to the
- * winner. If consolidation's result overflows target_entries AND this
- * node doesn't already carry a SPLIT delta, the consolidator transitions
- * into a split (commit_split). */
-static stm_status try_consolidate(stm_btree_lf *t, uint64_t nid)
+/* One-shot consolidation attempt for slot `nid`. Either consolidates
+ * the chain in-place (preserving any SPLIT delta above a fresh base)
+ * or, when the consolidated leaf overflows AND no SPLIT is already
+ * present, transitions into a split via commit_split. The caller must
+ * hold t->consolidating and be inside EBR. When called by
+ * try_consolidate, `bypass_threshold` is FALSE so the function no-ops
+ * on sub-threshold chains; force_consolidate passes TRUE to attempt
+ * the collapse regardless. */
+static stm_status consolidate_or_split(stm_btree_lf *t, uint64_t nid,
+                                         bool bypass_threshold)
 {
-    bool expected = false;
-    if (!atomic_compare_exchange_strong(&t->consolidating, &expected, true)) {
-        return STM_OK;   /* another thread is consolidating */
-    }
-
-    stm_status rc = STM_OK;
     for (uint32_t attempt = 0; attempt < STM_BT_LF_CONSOLIDATE_RETRIES; attempt++) {
         stm_bt_lf_delta *old_head = atomic_load(&t->pt->slots[nid]);
-        if (!old_head) break;
-        if (atomic_load_explicit(&old_head->chain_depth, memory_order_relaxed)
-            < STM_BT_LF_CONSOLIDATE_THRESHOLD) break;   /* nothing to do */
+        if (!old_head) return STM_OK;
+        uint32_t depth = atomic_load_explicit(&old_head->chain_depth,
+                                               memory_order_relaxed);
+        if (!bypass_threshold && depth < STM_BT_LF_CONSOLIDATE_THRESHOLD)
+            return STM_OK;
+        if (bypass_threshold && depth == 0) return STM_OK;
 
         stm_bt_lf_preserved_split preserved;
         stm_bt_node *new_base_node = build_consolidated_base(old_head, t->opts,
                                                                &preserved);
-        if (!new_base_node) { rc = STM_ENOMEM; break; }
+        if (!new_base_node) return STM_ENOMEM;
 
         /* Split decision: the consolidated leaf overflows AND this node
          * doesn't already carry a SPLIT. MVP rule: at most one split
@@ -749,19 +754,15 @@ static stm_status try_consolidate(stm_btree_lf *t, uint64_t nid)
          * in place and preserve the SPLIT above the new base. */
         if (new_base_node->nentries > t->opts.target_entries
             && !preserved.present) {
-            rc = commit_split(t, nid, old_head, new_base_node);
-            break;                          /* one shot, success or race */
+            return commit_split(t, nid, old_head, new_base_node);
         }
 
         stm_bt_lf_delta *new_base_delta = alloc_base_delta(new_base_node);
         if (!new_base_delta) {
             stm_bt_node_free(new_base_node);
             free(preserved.sep_key);
-            rc = STM_ENOMEM;
-            break;
+            return STM_ENOMEM;
         }
-        atomic_store_explicit(&new_base_delta->chain_depth, 0u,
-                              memory_order_relaxed);
 
         stm_bt_lf_delta *new_head = new_base_delta;
         if (preserved.present) {
@@ -771,8 +772,7 @@ static stm_status try_consolidate(stm_btree_lf *t, uint64_t nid)
             if (!split_clone) {
                 delta_destroy(new_base_delta);
                 free(preserved.sep_key);
-                rc = STM_ENOMEM;
-                break;
+                return STM_ENOMEM;
             }
             preserved.sep_key = NULL;       /* owned by split_clone */
             atomic_store_explicit(&split_clone->next, new_base_delta,
@@ -785,14 +785,49 @@ static stm_status try_consolidate(stm_btree_lf *t, uint64_t nid)
         if (atomic_compare_exchange_strong(&t->pt->slots[nid],
                                             &old_head, new_head)) {
             retire_old_chain(old_head);
-            break;                          /* success */
+            return STM_OK;
         }
-        /* A prepender beat us. Discard the whole new chain and retry. */
+        /* A prepender beat us. Discard and retry with fresh head. */
         if (new_head != new_base_delta) delta_destroy(new_head);
         delta_destroy(new_base_delta);
     }
+    return STM_OK;   /* retries exhausted; give way to the next caller */
+}
 
+/* Acquire the consolidating flag. try_consolidate bails if contended
+ * (lets the winner handle the work); force_consolidate spin-waits
+ * (it's test-only, so blocking is acceptable). */
+static bool try_acquire_consolidate(stm_btree_lf *t)
+{
+    bool expected = false;
+    return atomic_compare_exchange_strong(&t->consolidating, &expected, true);
+}
+
+static void acquire_consolidate_blocking(stm_btree_lf *t)
+{
+    bool expected = false;
+    while (!atomic_compare_exchange_weak(&t->consolidating, &expected, true)) {
+        expected = false;
+    }
+}
+
+static void release_consolidate(stm_btree_lf *t)
+{
     atomic_store(&t->consolidating, false);
+}
+
+/* Attempt consolidation of node `nid`. Called inside the caller's EBR
+ * epoch, so any chain we walk is alive for our whole visit. Serialized
+ * through t->consolidating — the first writer past the threshold takes
+ * the flag, later writers bail immediately and leave the work to the
+ * winner. If consolidation's result overflows target_entries AND this
+ * node doesn't already carry a SPLIT delta, the consolidator transitions
+ * into a split (commit_split). */
+static stm_status try_consolidate(stm_btree_lf *t, uint64_t nid)
+{
+    if (!try_acquire_consolidate(t)) return STM_OK;
+    stm_status rc = consolidate_or_split(t, nid, false);
+    release_consolidate(t);
     return rc;
 }
 
@@ -800,64 +835,16 @@ stm_status stm_btree_lf_force_consolidate(stm_btree_lf *t, stm_ebr_thread *ebr)
 {
     if (!t || !ebr) return STM_EINVAL;
     stm_ebr_enter(ebr);
+    /* Block until exclusive — force_consolidate is a test-only oracle
+     * and concurrent try_consolidate would race on commit_split's CAS,
+     * burning page-table IDs (see audit R2-3). Serializing through the
+     * same flag is the safe fix. */
+    acquire_consolidate_blocking(t);
     uint64_t nid = atomic_load(&t->root_id);
-    stm_bt_lf_delta *old_head = atomic_load(&t->pt->slots[nid]);
-    stm_status s = STM_OK;
-
-    if (old_head &&
-        atomic_load_explicit(&old_head->chain_depth, memory_order_relaxed) > 0) {
-        stm_bt_lf_preserved_split preserved;
-        stm_bt_node *new_base_node = build_consolidated_base(old_head, t->opts,
-                                                               &preserved);
-        if (!new_base_node) { s = STM_ENOMEM; goto out; }
-
-        if (new_base_node->nentries > t->opts.target_entries
-            && !preserved.present) {
-            s = commit_split(t, nid, old_head, new_base_node);
-            goto out;
-        }
-
-        stm_bt_lf_delta *new_base_delta = alloc_base_delta(new_base_node);
-        if (!new_base_delta) {
-            stm_bt_node_free(new_base_node);
-            free(preserved.sep_key);
-            s = STM_ENOMEM;
-            goto out;
-        }
-        atomic_store_explicit(&new_base_delta->chain_depth, 0u,
-                              memory_order_relaxed);
-
-        stm_bt_lf_delta *new_head = new_base_delta;
-        if (preserved.present) {
-            stm_bt_lf_delta *split_clone = alloc_split_delta(preserved.sep_key,
-                                                               preserved.sep_key_len,
-                                                               preserved.sibling_id);
-            if (!split_clone) {
-                delta_destroy(new_base_delta);
-                free(preserved.sep_key);
-                s = STM_ENOMEM;
-                goto out;
-            }
-            preserved.sep_key = NULL;
-            atomic_store_explicit(&split_clone->next, new_base_delta,
-                                  memory_order_relaxed);
-            atomic_store_explicit(&split_clone->chain_depth, 1u,
-                                  memory_order_relaxed);
-            new_head = split_clone;
-        }
-
-        if (atomic_compare_exchange_strong(&t->pt->slots[nid],
-                                            &old_head, new_head)) {
-            retire_old_chain(old_head);
-        } else {
-            if (new_head != new_base_delta) delta_destroy(new_head);
-            delta_destroy(new_base_delta);
-        }
-    }
-
-out:
+    stm_status rc = consolidate_or_split(t, nid, true);
+    release_consolidate(t);
     stm_ebr_exit(ebr);
-    return s;
+    return rc;
 }
 
 /* ------------------------------------------------------------------------- */
