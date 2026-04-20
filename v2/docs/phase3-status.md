@@ -1,39 +1,48 @@
 # Phase 3 — status and next-session guide
 
 Authoritative pickup guide for Phase 3 (persistence + allocator). Last
-update 2026-04-20 (after chunk 4a / bootstrap pool landed). Companion
+update 2026-04-20 (after chunk 4b-2 / stm_alloc landed). Companion
 to `phase2-status.md`, which remains the reference for the Bw-tree
 layer Phase 3 builds on.
 
 ## TL;DR
 
-Phase 3 is in progress. Four chunks landed:
+Phase 3 is in progress. Six chunks landed:
 
 | Commit | What | Tests |
 |---|---|---|
 | `4d87fb7` | Uberblock format (4 KiB struct, BLAKE3 csum) + label layout + `stm_bptr` + encode/decode | 12 sb tests |
 | `2290d49` | Device-backed label I/O + mount_scan (single-device authoritative selection) | +5 bdev-backed tests |
 | `cf52a1f` | `allocator.tla` spec: refcount + deferred-free safety. TLC clean (3729 states, depth 16) | — |
-| `37a3be7` | **Chunk 4a**: bootstrap-pool allocator (bitmap-managed, ping-pong hdr+bm slots, PENDING deferred-free matching `allocator.tla`'s Commit rule) | 16 alloc tests |
+| `37a3be7` → `dd86a63` | **Chunk 4a + R7a**: bootstrap-pool allocator (bitmap-managed, ping-pong hdr+bm slots, PENDING deferred-free matching `allocator.tla`'s Commit rule). R7a closed (0 P0 / 2 P1 / 3 P2 / 3-of-6 P3). | 18 bootstrap tests |
+| `3d9bcd0` | **Chunk 4b-1**: rename bootstrap module (stm_alloc → stm_bootstrap) to free the `stm_alloc` name for the main allocator. Pure mechanical refactor. | 18 bootstrap tests |
+| `6651830` | **Chunk 4b-2**: `stm_alloc` top-level allocator. Wraps `stm_bootstrap` + `stm_btree_mt`; data-area tree keyed by BE-packed u64 start_block, value {le32 length_blocks; le32 refcount}. Reserve/free/ref/commit match `allocator.tla` semantics. **Data-area tree is in-RAM** — node persistence + bootstrap-backed node placement deferred to chunk 5. | 14 alloc tests |
 
 Phase 2 is complete (SPLIT + MERGE + per-node consolidator + SCAN + R0-R6
 audits). Phase 3 chunks remaining:
 
-1. **Allocator implementation** — 4a (bootstrap pool) landed. Remaining:
-   4b allocator Bε-tree, 4c SDArray in-RAM, 4d xor filter, 4e R7 full audit.
-   ARCH §6.
-2. **Bε-tree node serialization** — moved from Phase 2. Encode/decode
-   with Merkle-hash field + csum. ARCH §5.4 bptr + §3 node format.
-3. **Four-phase commit implementation** — wire the protocol sync.tla
+1. **Allocator implementation** — 4a (bootstrap pool) + 4b (data-area
+   tree, in-RAM) landed. Remaining sub-chunks:
+   - **Chunk 5** (formerly "node serialization"): on-disk Bε-tree node
+     encode/decode with Merkle-hash field + BLAKE3 csum. Once this
+     lands, chunk 5 also wires the `reserve_for_node` callback so
+     allocator-tree NODES live in the bootstrap pool per ARCH §6.5.
+     Unblocks persistent data-area allocator state across mount.
+   - **Chunk 4c**: SDArray in-RAM bitmap for O(1) allocation queries.
+   - **Chunk 4d**: xor filter for negative lookups.
+   - **Chunk 4e**: R7 full-stack audit (after 4c+4d).
+2. **Four-phase commit implementation** — wire the protocol sync.tla
    abstracts. Uberblock ring rotation + fsync discipline.
-4. **Mount / unmount integration** — put labels + commit + allocator
-   together; single-device round-trip.
-5. **Crash-injection fuzzer** — Phase 3 exit criterion. Inject partial
+3. **Mount / unmount integration** — put labels + commit + allocator
+   together; single-device round-trip. Data-area tree persistence
+   goes live here (depends on chunk 5).
+4. **Crash-injection fuzzer** — Phase 3 exit criterion. Inject partial
    writes at every commit phase; verify mount recovers to a
    consistent state.
-6. **R7 audit** — adversarial soundness pass per CLAUDE.md before
-   Phase 3 exit. R7a (bootstrap only, see §"Next chunk") runs with
-   chunk 4a; full R7 at the end of allocator work.
+5. **R7 audit** — adversarial soundness pass per CLAUDE.md before
+   Phase 3 exit. R7a (bootstrap-only scope) closed with chunk 4a;
+   R7b (stm_alloc scope) runs with chunk 4b; full R7 at the end of
+   allocator work.
 
 ## You have autonomy
 
@@ -113,62 +122,80 @@ Expected TLC results:
 - `merge.tla` — empty-leaf reabsorb. 65536 states, depth 18.
 - `allocator.tla` — refcount + deferred-free. 3729 states, depth 16.
 
-## Next chunk — allocator tree (chunk 4b)
+## Next chunk — Bε-tree node serialization (chunk 5)
 
-Chunk 4a landed at `37a3be7` with 16 tests green on default / ASan /
-TSan. API, layout, and semantics are in `include/stratum/alloc.h`.
-The bootstrap pool is bitmap-managed at 128 KiB (32-block) granularity,
-with ping-pong header + bitmap slots for torn-write safety and BLAKE3-256
-self-csums on each header slot plus a bitmap csum recorded in the
-header. The deferred-free machinery stamps PENDING entries with
-caller-supplied `free_gen`; `stm_alloc_commit(committed_gen)` sweeps
-`free_gen < committed_gen` exactly as `allocator.tla` specifies. Commit
-COWs the bitmap then the header, fsync'd between writes; a crash at any
-point recovers cleanly via the older-slot fallback.
+Chunk 4a + 4b landed across `37a3be7` / `dd86a63` (bootstrap pool +
+R7a audit) and `3d9bcd0` / `6651830` (rename + stm_alloc data-area
+tree). Everything is in-RAM from a tree perspective. The bootstrap
+pool IS durable (it has its own format; survives mount/unmount);
+the data-area tree is NOT.
 
-MVP restrictions (carry into 4b):
-- Single-block bitmap → bootstrap pool capped at 4 GiB. Extend with
-  multi-block bitmaps when a device needs more.
-- Single-device: paddrs return device = 0. The allocator-roots object
-  (per §6.3.2) will add device indirection.
+**Chunk 4a + 4b: LANDED (2026-04-20).** Bootstrap pool + stm_alloc
+with reserve/free/ref/commit. R7a closed; R7b runs with chunk 4b.
 
-**Chunk 4a was audited as R7a.** See audit-closed-list for findings.
-**Chunk 4a: Bootstrap pool — LANDED (2026-04-20).**
+### Chunk 5 (next): Bε-tree node serialization.
 
-**Chunk 4b: Allocator tree (Bε-tree rooted).**
-- Reuse existing `stm_btree` (single-threaded) or `stm_btree_lf`
-  (concurrent). Concurrent makes sense since the allocator is
-  accessed from any commit participant. Key: u64 start_block,
-  value: `struct stm_alloc_entry { le32 length_blocks; le32
-  refcount; }`.
-- Glue: allocator-tree reads go through the btree API; writes go
-  through the tree's message-buffer (or direct writes at commit
-  reservation time).
-- Integration with bootstrap pool: allocator-tree NODES live in
-  the bootstrap pool. Tree-INSERT doesn't recurse into the allocator.
-- Node placement contract: the btree layer must be parameterized
-  with an allocator callback (`reserve_for_node` / `free_node`) so
-  that Bε-tree page writes consume bootstrap-pool units rather than
-  allocator-tree ranges. Prototype: a thin wrapper around
-  `stm_alloc_reserve(a, STM_BOOTSTRAP_UNIT_BLOCKS, hint, &paddr)`.
+This is the work that makes the data-area allocator tree durable and
+wires the `reserve_for_node` callback so allocator-tree NODES live in
+the bootstrap pool (ARCH §6.5) rather than malloc.
 
-**Chunk 4c: In-RAM succinct bitmap (SDArray).**
+Scope:
+- **On-disk node format** (ARCH §3, §5.4 bptr):
+  - Leaf node: header + packed entries + BLAKE3-256 csum + (future)
+    Merkle hash field. Size: one or more multiples of 128 KiB
+    (STM_BOOTSTRAP_UNIT_BLOCKS × 4 KiB).
+  - Internal node: header + pivot bptrs + csum.
+  - Encode/decode honoring le* endianness convention.
+- **Node-placement callback** wired through stm_btree or a thin
+  "persistent btree" wrapper. Interface sketch:
+
+    typedef struct {
+        stm_status (*reserve)(void *ctx, uint64_t nblocks,
+                              uint64_t hint, uint64_t *out_paddr);
+        stm_status (*free)   (void *ctx, uint64_t paddr,
+                              uint64_t free_gen);
+        stm_status (*read)   (void *ctx, uint64_t paddr,
+                              void *buf, size_t len);
+        stm_status (*write)  (void *ctx, uint64_t paddr,
+                              const void *buf, size_t len);
+    } stm_btree_store_vtable;
+
+  stm_alloc provides an impl that routes reserve/free to
+  stm_bootstrap_reserve/free and read/write to the bdev.
+- **stm_alloc_open reads allocator-tree root from the uberblock.**
+  Currently a no-op; becomes a real walk after chunk 5 + the
+  four-phase commit protocol wires the allocator root into the
+  uberblock's `ub_alloc_root` bptr.
+
+Don't confuse the scope: chunk 5 is STRICTLY the btree
+serialization layer + allocator wiring. Four-phase commit (which
+touches uberblock ring rotation) is a separate chunk. Mount/unmount
+integration (which reads `ub_alloc_root` and reconstructs the tree)
+comes after both.
+
+### Chunk 4c: In-RAM succinct bitmap (SDArray).
 - Performance structure. `src/alloc/sdarray.c`. Approximate
   "is block X allocated" in O(1). Reduces tree walks.
 - Target: ~20 MiB RAM per TiB of data. Revisit if initial
   straight-bitmap impl already lands within the Phase 3 exit
   budget (25 MiB/TiB per roadmap §6.2).
 
-**Chunk 4d: xor filter for negative lookups.**
+### Chunk 4d: xor filter for negative lookups.
 - 9 bits per allocated range, <1% false-positive rate. Fast
   "is this paddr in any live range?"
 
-**Chunk 4e: R7 audit.**
+### Chunk 4e: R7 full-stack audit.
 - Per CLAUDE.md policy: changes to sync / allocator / crypto /
   tree-write paths trigger a focused soundness audit before merge.
 - Prompt template is in the R5/R6 audit spawns in git history
-  (commits `83f4710` → `a1299fb` → `8941a2a`). Include R0-R6
+  (commits `83f4710` → `a1299fb` → `8941a2a`). Include R0-R7b
   closed list as the do-not-report preamble.
+
+### MVP restrictions carrying forward:
+- Single-block bootstrap bitmap → bootstrap pool capped at 4 GiB.
+- Single-device: paddrs return device = 0. The allocator-roots
+  object (per §6.3.2) will add device indirection once we move to
+  multi-device.
 
 ## Trip hazards carried in from phases 1 and 2
 
