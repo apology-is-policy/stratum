@@ -43,8 +43,10 @@ stm_status stm_argon2id(const stm_argon2id_params *p,
     if (!p || !passphrase || !out) return STM_EINVAL;
     if (out_len < crypto_pwhash_BYTES_MIN || out_len > crypto_pwhash_BYTES_MAX)
         return STM_ERANGE;
-    if (pass_len < crypto_pwhash_PASSWD_MIN || pass_len > crypto_pwhash_PASSWD_MAX)
-        return STM_ERANGE;
+    /* crypto_pwhash_PASSWD_MIN is 0 on current libsodium, so `pass_len <
+     * MIN` is vacuous for our size_t argument and -Wtype-limits rightly
+     * flags it. We still guard the upper bound. */
+    if (pass_len > crypto_pwhash_PASSWD_MAX) return STM_ERANGE;
 
     /* libsodium memlimit is bytes. */
     size_t memlimit = p->m_cost_kib * 1024ull;
