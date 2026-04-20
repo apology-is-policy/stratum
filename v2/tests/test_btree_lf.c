@@ -210,6 +210,72 @@ STM_TEST(btree_lf_cascading_splits) {
     stm_btree_lf_free(t);
 }
 
+/* Force a re-split of a node that already carries a SPLIT delta, to
+ * exercise the chain-inheritance path. After the first split the root
+ * has [SPLIT(sep, R), BASE_LEAF(lower)]. Repeatedly inserting keys
+ * that live below sep grows the lower base. When it overflows again,
+ * commit_split must build a new sibling X whose chain inherits the
+ * existing SPLIT(sep, R) — otherwise readers at X for keys >= sep would
+ * fail to redirect onward to R.
+ *
+ * Structurally this drives root-as-left-splitter through 3+ splits,
+ * each carrying the accumulated inherited redirect forward to the new
+ * siblings. */
+STM_TEST(btree_lf_left_side_re_split) {
+    stm_btree_lf *t = make_tree(4);
+    stm_ebr_thread *ebr = stm_ebr_register();
+
+    /* Phase 1: insert 8 keys spanning "a" to "h". Triggers the first
+     * split at around sep="e". */
+    const char *keys_phase1[] = {"a","b","c","d","e","f","g","h"};
+    for (size_t i = 0; i < sizeof keys_phase1 / sizeof *keys_phase1; i++) {
+        int v = (int)i;
+        STM_ASSERT_OK(stm_btree_lf_insert(t, ebr, keys_phase1[i],
+                                            strlen(keys_phase1[i]),
+                                            &v, sizeof v));
+    }
+    STM_ASSERT_OK(stm_btree_lf_force_consolidate(t, ebr));
+
+    /* Phase 2: pack the lower range (< "e") with more keys to force the
+     * root's lower side to overflow AGAIN. Use 3-char keys starting
+     * with letters a-d so they sort below "e". */
+    char low_keys[12][4];
+    for (int i = 0; i < 12; i++) {
+        snprintf(low_keys[i], sizeof low_keys[i], "a%02d", i);
+        int v = 1000 + i;
+        STM_ASSERT_OK(stm_btree_lf_insert(t, ebr, low_keys[i],
+                                            strlen(low_keys[i]),
+                                            &v, sizeof v));
+    }
+    STM_ASSERT_OK(stm_btree_lf_force_consolidate(t, ebr));
+
+    /* Phase 3: verify every key (phase-1 and phase-2) is readable. The
+     * low-key inserts may have triggered one or more re-splits; the
+     * inherited SPLIT must have propagated correctly onto each new
+     * sibling so keys >= "e" still resolve. */
+    for (size_t i = 0; i < sizeof keys_phase1 / sizeof *keys_phase1; i++) {
+        int got = 0;
+        size_t vl = 0;
+        stm_status s = stm_btree_lf_lookup(t, ebr, keys_phase1[i],
+                                             strlen(keys_phase1[i]),
+                                             &got, sizeof got, &vl);
+        STM_ASSERT_OK(s);
+        STM_ASSERT_EQ(got, (int)i);
+    }
+    for (int i = 0; i < 12; i++) {
+        int got = 0;
+        size_t vl = 0;
+        stm_status s = stm_btree_lf_lookup(t, ebr, low_keys[i],
+                                             strlen(low_keys[i]),
+                                             &got, sizeof got, &vl);
+        STM_ASSERT_OK(s);
+        STM_ASSERT_EQ(got, 1000 + i);
+    }
+
+    stm_ebr_thread_free(ebr);
+    stm_btree_lf_free(t);
+}
+
 /* Delete a key on the upper (post-split) side, verify it disappears
  * and the rest of the keys remain accessible. */
 STM_TEST(btree_lf_split_then_delete_upper) {

@@ -617,7 +617,7 @@ static void retire_old_chain(stm_bt_lf_delta *old_head)
 }
 
 /* Split `full_base` in place into a lower and upper half. Allocates a
- * fresh sibling node_id, installs upper's BASE at that slot, and CAS-
+ * fresh sibling node_id, installs upper's chain at that slot, and CAS-
  * swaps the splitting slot's chain from `old_head` to a new chain of
  * [SPLIT delta, BASE(lower)]. On success, retires the old chain.
  *
@@ -626,26 +626,43 @@ static void retire_old_chain(stm_bt_lf_delta *old_head)
  * chain head; if another thread CASed the slot between the caller's
  * sampling and this call, the CAS here will fail and we roll back.
  *
+ * `inherited` (optional): when the old chain already carried a SPLIT
+ * delta (meaning the node had previously split and its chain redirects
+ * keys >= inherited.sep_key to inherited.sibling_id), the NEW sibling
+ * we're creating must also redirect those keys — otherwise a reader
+ * who lands on the new sibling would lookup keys outside its range in
+ * its local base. To preserve linearizability the new sibling's chain
+ * becomes [SPLIT(inherited), BASE(upper)] instead of just [BASE(upper)],
+ * and we take ownership of inherited->sep_key iff we succeed in
+ * building the split_delta. If `inherited` is NULL or has
+ * present == FALSE, the new sibling gets a plain [BASE(upper)] chain
+ * (the first-split case covered by structural.tla).
+ *
  * On CAS failure (race), we uninstall the upper slot and release all
  * new allocations. The old chain stays untouched.
  *
  * Matches structural.tla's two-step protocol: InstallSibling (step 1)
  * is the atomic_store on the fresh upper slot; PostSplit (step 2) is
- * the CAS that publishes the new (SPLIT | BASE(lower)) chain. */
+ * the CAS that publishes the new (SPLIT | BASE(lower)) chain. Chain
+ * inheritance generalizes the spec inductively — each level is itself
+ * a well-formed two-step split, with the inherited SPLIT flowing into
+ * the new sibling rather than staying on the splitting node. */
 static stm_status commit_split(stm_btree_lf *t, uint64_t nid,
                                  stm_bt_lf_delta *old_head,
-                                 stm_bt_node *full_base)
+                                 stm_bt_node *full_base,
+                                 stm_bt_lf_preserved_split *inherited)
 {
-    stm_bt_node     *upper           = NULL;
-    uint8_t         *sep_key         = NULL;
-    uint32_t         sep_len         = 0;
-    uint64_t         upper_id        = 0;
-    bool             upper_id_valid  = false;
-    bool             upper_installed = false;
-    stm_bt_lf_delta *upper_base      = NULL;
-    stm_bt_lf_delta *lower_base      = NULL;
-    stm_bt_lf_delta *split_delta     = NULL;
-    stm_status       rc              = STM_OK;
+    stm_bt_node     *upper            = NULL;
+    uint8_t         *sep_key          = NULL;
+    uint32_t         sep_len          = 0;
+    uint64_t         upper_id         = 0;
+    bool             upper_installed  = false;
+    stm_bt_lf_delta *upper_base       = NULL;
+    stm_bt_lf_delta *inherited_delta  = NULL;
+    stm_bt_lf_delta *upper_head       = NULL;
+    stm_bt_lf_delta *lower_base       = NULL;
+    stm_bt_lf_delta *split_delta      = NULL;
+    stm_status       rc               = STM_OK;
 
     if (full_base->nentries < 2) { rc = STM_EINVAL; goto cleanup; }
 
@@ -673,23 +690,37 @@ static stm_status commit_split(stm_btree_lf *t, uint64_t nid,
     if (!sep_key && sep_len > 0) { rc = STM_ENOMEM; goto cleanup; }
 
     upper_id = page_table_allocate_id(t->pt);
-    upper_id_valid = true;
     if (upper_id >= t->pt->capacity) { rc = STM_EOVERFLOW; goto cleanup; }
 
     upper_base = alloc_base_delta(upper);
     if (!upper_base) { rc = STM_ENOMEM; goto cleanup; }
     upper = NULL;                               /* owned by upper_base */
 
+    upper_head = upper_base;
+    if (inherited && inherited->present) {
+        /* Chain inheritance: upper's chain must keep the redirect to
+         * the existing sibling so keys >= inherited.sep_key still
+         * resolve correctly from the new sibling. */
+        inherited_delta = alloc_split_delta(inherited->sep_key,
+                                              inherited->sep_key_len,
+                                              inherited->sibling_id);
+        if (!inherited_delta) { rc = STM_ENOMEM; goto cleanup; }
+        inherited->sep_key = NULL;               /* owned by inherited_delta */
+        atomic_store_explicit(&inherited_delta->next, upper_base,
+                              memory_order_relaxed);
+        atomic_store_explicit(&inherited_delta->chain_depth, 1u,
+                              memory_order_relaxed);
+        upper_head = inherited_delta;
+    }
+
     /* Step 1 — InstallSibling. The slot was zero-initialized and has
      * never been published; a relaxed store is sufficient. */
-    atomic_store(&t->pt->slots[upper_id], upper_base);
+    atomic_store(&t->pt->slots[upper_id], upper_head);
     upper_installed = true;
 
     lower_base = alloc_base_delta(full_base);
     if (!lower_base) { rc = STM_ENOMEM; goto cleanup; }
     full_base = NULL;                           /* owned by lower_base */
-    atomic_store_explicit(&lower_base->chain_depth, 0u,
-                          memory_order_relaxed);
 
     split_delta = alloc_split_delta(sep_key, sep_len, upper_id);
     if (!split_delta) { rc = STM_ENOMEM; goto cleanup; }
@@ -713,13 +744,18 @@ cleanup:
     if (upper_installed) {
         atomic_store(&t->pt->slots[upper_id], NULL);
     }
-    (void)upper_id_valid;
-    if (split_delta) delta_destroy(split_delta);
-    else if (sep_key) free(sep_key);
-    if (lower_base) delta_destroy(lower_base);
-    else if (full_base) stm_bt_node_free(full_base);
-    if (upper_base) delta_destroy(upper_base);
-    else if (upper) stm_bt_node_free(upper);
+    if (split_delta)     delta_destroy(split_delta);
+    else if (sep_key)    free(sep_key);
+    if (lower_base)      delta_destroy(lower_base);
+    else if (full_base)  stm_bt_node_free(full_base);
+    if (inherited_delta) delta_destroy(inherited_delta);
+    if (upper_base)      delta_destroy(upper_base);
+    else if (upper)      stm_bt_node_free(upper);
+    if (inherited && inherited->sep_key) {
+        /* inherited ownership wasn't transferred to inherited_delta. */
+        free(inherited->sep_key);
+        inherited->sep_key = NULL;
+    }
     return rc;
 }
 
@@ -748,13 +784,22 @@ static stm_status consolidate_or_split(stm_btree_lf *t, uint64_t nid,
                                                                &preserved);
         if (!new_base_node) return STM_ENOMEM;
 
-        /* Split decision: the consolidated leaf overflows AND this node
-         * doesn't already carry a SPLIT. MVP rule: at most one split
-         * per node — if a SPLIT is already present, we just consolidate
-         * in place and preserve the SPLIT above the new base. */
-        if (new_base_node->nentries > t->opts.target_entries
-            && !preserved.present) {
-            return commit_split(t, nid, old_head, new_base_node);
+        /* Split decision: the consolidated leaf overflows. Chain
+         * inheritance — if the old chain already carried a SPLIT, the
+         * new sibling we're creating must also carry that SPLIT (via
+         * commit_split's `inherited` argument) so its upper-range keys
+         * still route correctly. commit_split takes ownership of the
+         * inherited sep_key buffer on success; on cleanup it returns
+         * ownership through preserved.sep_key. */
+        if (new_base_node->nentries > t->opts.target_entries) {
+            stm_bt_lf_preserved_split *inherit_arg =
+                preserved.present ? &preserved : NULL;
+            stm_status split_rc = commit_split(t, nid, old_head,
+                                                 new_base_node, inherit_arg);
+            /* If commit_split's cleanup returned the sep_key to us,
+             * free it — we won't reuse it. */
+            if (preserved.sep_key) { free(preserved.sep_key); preserved.sep_key = NULL; }
+            return split_rc;
         }
 
         stm_bt_lf_delta *new_base_delta = alloc_base_delta(new_base_node);
