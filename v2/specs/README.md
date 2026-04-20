@@ -16,6 +16,7 @@ is exercised by TLC in CI.
 | `structural.tla` | split atomicity + cascade | landed | P2 | §3.5         |
 | `balanced.tla`   | parent-pivot update   | landed  | P2    | §3.5            |
 | `merge.tla`      | empty-leaf reabsorb   | landed  | P2    | §3.5            |
+| `allocator.tla`  | refcount + deferred-free | landed | P3 | §6.4, §6.7      |
 | `namespace.tla`  | per-conn isolation    | stub    | P8    | §8.8            |
 
 ## Running TLC locally
