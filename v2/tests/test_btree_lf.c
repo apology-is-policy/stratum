@@ -728,4 +728,128 @@ STM_TEST(btree_lf_per_thread_oracle_stress) {
     stm_btree_lf_free(t);
 }
 
+/* ------------------------------------------------------------------------- */
+/* Concurrent-splits oracle. Threads with disjoint key ranges bulk-insert     */
+/* into a tree with a very small target_entries so splits are forced during   */
+/* the run, not just in a post-process. This exercises the SPLIT protocol    */
+/* under concurrent writers + readers + consolidators — precisely the race   */
+/* window structural.tla covers, now stressed at scale.                       */
+/* ------------------------------------------------------------------------- */
+
+#define STM_BT_LF_SPLIT_ORACLE_THREADS  4
+#define STM_BT_LF_SPLIT_ORACLE_KEYS     20
+#define STM_BT_LF_SPLIT_ORACLE_TARGET   4     /* forces many splits */
+
+typedef struct {
+    stm_btree_lf *tree;
+    int           thread_id;
+    int           present[STM_BT_LF_SPLIT_ORACLE_KEYS];
+    int           value[STM_BT_LF_SPLIT_ORACLE_KEYS];
+} split_oracle_arg;
+
+static int format_split_oracle_key(char *buf, size_t cap, int tid, int k)
+{
+    /* Format such that keys sort lexicographically AND span the sep
+     * boundaries: t0-k000..t0-k019, t1-k000.., etc. */
+    return snprintf(buf, cap, "t%d-k%03d", tid, k);
+}
+
+static void *split_oracle_worker(void *arg_)
+{
+    split_oracle_arg *arg = arg_;
+    stm_ebr_thread *ebr = stm_ebr_register();
+    if (!ebr) return NULL;
+
+    /* Two phases: bulk-insert (forcing splits), then mixed lookup+delete
+     * (exercising SPLIT redirect traversal on a split tree). */
+    for (int k = 0; k < STM_BT_LF_SPLIT_ORACLE_KEYS; k++) {
+        char kbuf[24];
+        int kl = format_split_oracle_key(kbuf, sizeof kbuf, arg->thread_id, k);
+        int v = arg->thread_id * 10000 + k;
+        stm_status st = stm_btree_lf_insert(arg->tree, ebr, kbuf, (size_t)kl,
+                                             &v, sizeof v);
+        if (st == STM_OK) {
+            arg->present[k] = 1;
+            arg->value[k]   = v;
+        }
+    }
+
+    /* Lookup each of our keys — must find it with the right value. */
+    for (int k = 0; k < STM_BT_LF_SPLIT_ORACLE_KEYS; k++) {
+        char kbuf[24];
+        int kl = format_split_oracle_key(kbuf, sizeof kbuf, arg->thread_id, k);
+        int got = 0;
+        size_t vl = 0;
+        stm_status st = stm_btree_lf_lookup(arg->tree, ebr, kbuf, (size_t)kl,
+                                             &got, sizeof got, &vl);
+        if (arg->present[k]) {
+            STM_ASSERT_OK(st);
+            STM_ASSERT_EQ(got, arg->value[k]);
+        }
+    }
+
+    /* Delete half of our keys. */
+    for (int k = 0; k < STM_BT_LF_SPLIT_ORACLE_KEYS; k += 2) {
+        char kbuf[24];
+        int kl = format_split_oracle_key(kbuf, sizeof kbuf, arg->thread_id, k);
+        stm_status st = stm_btree_lf_delete(arg->tree, ebr, kbuf, (size_t)kl);
+        if (st == STM_OK) {
+            arg->present[k] = 0;
+        }
+    }
+
+    stm_ebr_thread_free(ebr);
+    return NULL;
+}
+
+STM_TEST(btree_lf_concurrent_splits_oracle) {
+    stm_btree_lf *t = make_tree(STM_BT_LF_SPLIT_ORACLE_TARGET);
+
+    pthread_t         tids[STM_BT_LF_SPLIT_ORACLE_THREADS];
+    split_oracle_arg  args[STM_BT_LF_SPLIT_ORACLE_THREADS];
+    memset(args, 0, sizeof args);
+    for (int i = 0; i < STM_BT_LF_SPLIT_ORACLE_THREADS; i++) {
+        args[i].tree      = t;
+        args[i].thread_id = i;
+        pthread_create(&tids[i], NULL, split_oracle_worker, &args[i]);
+    }
+    for (int i = 0; i < STM_BT_LF_SPLIT_ORACLE_THREADS; i++) {
+        pthread_join(tids[i], NULL);
+    }
+
+    /* Drain EBR and force any remaining consolidations. */
+    for (int i = 0; i < 128; i++) (void)stm_ebr_try_advance();
+
+    stm_ebr_thread *ebr = stm_ebr_register();
+    for (int i = 0; i < 4; i++) {
+        STM_ASSERT_OK(stm_btree_lf_force_consolidate(t, ebr));
+    }
+
+    /* Per-thread verification: every thread's shadow must match the tree. */
+    int total_present = 0, total_absent = 0;
+    for (int tid = 0; tid < STM_BT_LF_SPLIT_ORACLE_THREADS; tid++) {
+        for (int k = 0; k < STM_BT_LF_SPLIT_ORACLE_KEYS; k++) {
+            char kbuf[24];
+            int kl = format_split_oracle_key(kbuf, sizeof kbuf, tid, k);
+            int got = 0;
+            size_t vl = 0;
+            stm_status s = stm_btree_lf_lookup(t, ebr, kbuf, (size_t)kl,
+                                                &got, sizeof got, &vl);
+            if (args[tid].present[k]) {
+                STM_ASSERT_OK(s);
+                STM_ASSERT_EQ(got, args[tid].value[k]);
+                total_present++;
+            } else {
+                STM_ASSERT_ERR(s, STM_ENOENT);
+                total_absent++;
+            }
+        }
+    }
+    stm_test_info("concurrent splits oracle: %d present, %d absent; final chain_depth %u",
+                  total_present, total_absent, stm_btree_lf_chain_depth(t, ebr));
+
+    stm_ebr_thread_free(ebr);
+    stm_btree_lf_free(t);
+}
+
 STM_TEST_MAIN("btree-lf")
