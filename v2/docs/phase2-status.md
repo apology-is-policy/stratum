@@ -37,17 +37,19 @@ throughput stress).
 
 Also: several CI-fix commits for Linux `-Werror` / liboqs issues.
 All CI matrix jobs (Linux gcc/clang × off/asan/tsan + macOS clang ×
-off/asan/tsan + TLC per spec) green on tip. 14/14 tests pass on
+off/asan/tsan + TLC per spec) green on tip. 17/17 tests pass on
 default/ASan/TSan.
 
 Audit rounds closed: R0 (pre-#171 substrate), R1 (MVP), R2 (SPLIT
-protocol), R3 (chain inheritance). Cumulative do-not-report ledger is
+protocol), R3 (chain inheritance), R4 (internal routing in #176).
+Cumulative do-not-report ledger is
 `memory/audit_v2_r0_closed_list.md`.
 
 ## What's left in Phase 2
 
-Option B (internal routing) landed in `9b60510`. Remaining options
-are MERGE (spec-first, sizable) and the R4 audit.
+Option B (internal routing) + R4 audit both landed. Remaining scope
+is MERGE (spec-first, sizable) and per-node consolidator (modest,
+unblocks throughput).
 
 ### Option A: MERGE
 
@@ -55,30 +57,62 @@ Symmetric to SPLIT — allows a leaf that has shrunk (due to deletes)
 to be reabsorbed into a sibling, releasing the sibling's
 page-table ID.
 
-**Design hazard**: the naive "post MERGE delta on the disappearing
-node, redirect to its predecessor" protocol **livelocks** —
-reader at R sees MERGE → goes to L → L still has SPLIT → goes to
-R → MERGE → ... Requires careful ordering or a "sealed" marker
-with well-defined fallback semantics.
+**Post-internal-routing design (recommended starting point for
+merge.tla):**
 
-Candidate protocols (tried during the session):
+With internal routing in place, the "livelock via bounced
+redirects" no longer threatens the protocol because the parent's
+pivot array is the authoritative range-routing source. The
+remaining hazard is **lost writes during the merge window**:
+between the moment parent stops routing to R and the moment R is
+retired, writers with stale parent pivots may still arrive at R
+and prepend INSERTs, which then go unrouted.
 
-1. **Post MERGE on R first, then rebuild L.** Writers livelock
-   between MERGE on R and SPLIT still on L.
-2. **Rebuild L first, then post MERGE on R.** Writers at R between
-   the two steps prepend to an orphaned chain. Writes lost.
-3. **MERGE redirect points writers at L but marks them "retraverse
-   once"** — prevents the livelock at the cost of
-   retraversal-tracking per thread. Complex.
-4. **Defer: only prune R when R is fully empty, and do it during L's
-   consolidation with a SEAL-then-CAS two-step.** Cleanest. Still
-   needs precise SEAL semantics (what does a reader/writer who
-   arrives at a SEALED slot do?). Probably: retraverse from root,
-   accepting whatever routing L has by then.
+The cleanest protocol is a **SEALED-with-forward** delta:
 
-Option 4 is the recommended starting point. Write `merge.tla`
-first. Verify that SEAL + CAS preserves LookupCorrectness under all
-reader interleavings. Then code.
+  1. `SEAL(R, forward=L)` — CAS R's slot head from `BASE_LEAF`
+     to a new `STM_BT_LF_DELTA_SEALED` marker whose semantics
+     are: "R is sealed; any reader/writer here should act on L
+     instead." Readers walking into R find the SEAL, follow
+     forward to L. Writers who try to prepend see SEAL, discard
+     their attempt, retraverse from root. No chain prepending on
+     R possible after SEAL lands.
+
+  2. `UpdateParent` — CAS parent's `BASE_INTERNAL` to remove the
+     pivot `(sep_r, R)`. Keys >= sep_r now route directly to L
+     via whatever pivot covers the range. Parent's clone-and-
+     replace is the same primitive used by split's UpdateParent,
+     serialized by `t->consolidating`.
+
+  3. `Retire(R)` — EBR-retire R's SEALED head. Any reader who
+     loaded R's slot pre-retire has the SEAL pointer pinned and
+     can still forward to L. After EBR advance, R's slot becomes
+     reusable (or, with the freed-id pool follow-up, recyclable).
+
+**Eligibility**: R must be empty AND have no pending retires at
+merge time. Enforced by the consolidator: it detects R has a
+consolidated BASE_LEAF with `nentries == 0` and schedules the
+merge as a follow-up to its own consolidation.
+
+**Spec requirements for merge.tla:**
+- SEAL delta kind with forward pointer.
+- `LookupCorrectness` invariant — every reader, at every phase,
+  returns the logical truth (R's keys are absent; other keys
+  routable via their current pivot).
+- `NoLostWrites` invariant — no writer can prepend an INSERT on R
+  after SEAL is installed (SEAL's CAS enforces).
+- Model the three SEAL → UpdateParent → Retire events.
+
+**Prior-session alternative protocols (livelock + write-loss):**
+
+1. Post MERGE on R first, then rebuild L. Livelock between MERGE
+   on R and SPLIT on L (pre-internal-routing issue; resolved by
+   internal routing making this non-applicable).
+2. Rebuild L first, then post MERGE on R. Write-loss window.
+3. MERGE redirect with per-thread "retraverse once" tracking.
+   Complex and unnecessary with SEAL-with-forward.
+4. Defer prune until empty + SEAL-then-CAS two-step. This IS the
+   protocol above, now fleshed out.
 
 ### Option B: internal-node routing (balanced B+tree) — LANDED
 
@@ -274,7 +308,7 @@ v2/
 ## Where to pick up
 
 1. Read this file top to bottom.
-2. Read `memory/audit_v2_r0_closed_list.md` for R0–R3 do-not-report.
+2. Read `memory/audit_v2_r0_closed_list.md` for R0–R4 do-not-report.
 3. The recommended next chunk is either:
    - **MERGE** — write `merge.tla` first. Use `balanced.tla` /
      `structural.tla` as templates for style.
