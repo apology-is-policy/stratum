@@ -30,7 +30,7 @@
  * slot's csum mismatches, so mount falls back to the other slot.
  */
 
-#include <stratum/alloc.h>
+#include <stratum/bootstrap.h>
 #include <stratum/block.h>
 #include <stratum/hash.h>
 #include <stratum/super.h>       /* STM_UB_SIZE = 4096 */
@@ -43,7 +43,7 @@
 /* ========================================================================= */
 
 /* Magic "STMALOC1" read as a little-endian uint64. */
-#define STM_ALLOC_HDR_MAGIC    UINT64_C(0x31434F4C414D5453)
+#define STM_BOOTSTRAP_HDR_MAGIC    UINT64_C(0x31434F4C414D5453)
 
 typedef struct {
     le64    h_magic;                 /*    0 :  8 */
@@ -60,10 +60,10 @@ typedef struct {
     uint8_t h_bitmap_csum[32];       /*   96 : 32 */
     uint8_t h_reserved[3936];        /*  128 : 3936 */
     uint8_t h_csum[32];              /* 4064 : 32 */
-} stm_alloc_hdr;
+} stm_bootstrap_hdr;
 
-_Static_assert(sizeof(stm_alloc_hdr) == 4096,
-               "stm_alloc_hdr must be exactly one 4 KiB block");
+_Static_assert(sizeof(stm_bootstrap_hdr) == 4096,
+               "stm_bootstrap_hdr must be exactly one 4 KiB block");
 
 /* ========================================================================= */
 /* In-RAM state.                                                              */
@@ -77,7 +77,7 @@ struct pending_entry {
     pending_entry *next;
 };
 
-struct stm_alloc {
+struct stm_bootstrap {
     stm_bdev  *d;
     uint64_t   bootstrap_size_blocks;
     uint64_t   total_units;
@@ -86,7 +86,7 @@ struct stm_alloc {
     uint64_t   device_uuid[2];
 
     /* Which slots are live. A commit flips to the other slot. */
-    uint32_t   hdr_slot_live;       /* 0 or 1 (STM_ALLOC_HDR_SLOT_A/B)   */
+    uint32_t   hdr_slot_live;       /* 0 or 1 (STM_BOOTSTRAP_HDR_SLOT_A/B)   */
     uint32_t   bitmap_slot_live;    /* 0 or 1                            */
     uint64_t   bitmap_gen;
 
@@ -122,25 +122,25 @@ static inline uint64_t device_byte_offset(uint64_t pool_block_idx)
 /* Byte offset of header slot A/B (pool block 0 or 1). */
 static inline uint64_t hdr_slot_offset(uint32_t slot)
 {
-    return device_byte_offset((slot == 0) ? STM_ALLOC_HDR_SLOT_A
-                                           : STM_ALLOC_HDR_SLOT_B);
+    return device_byte_offset((slot == 0) ? STM_BOOTSTRAP_HDR_SLOT_A
+                                           : STM_BOOTSTRAP_HDR_SLOT_B);
 }
 
 /* Byte offset of bitmap slot A/B (pool block 2 or 3). */
 static inline uint64_t bitmap_slot_offset(uint32_t slot)
 {
-    return device_byte_offset((slot == 0) ? STM_ALLOC_BITMAP_SLOT_A
-                                           : STM_ALLOC_BITMAP_SLOT_B);
+    return device_byte_offset((slot == 0) ? STM_BOOTSTRAP_BITMAP_SLOT_A
+                                           : STM_BOOTSTRAP_BITMAP_SLOT_B);
 }
 
 /* In-pool block index of bitmap slot A/B. */
 static inline uint64_t bitmap_slot_block(uint32_t slot)
 {
-    return (slot == 0) ? STM_ALLOC_BITMAP_SLOT_A : STM_ALLOC_BITMAP_SLOT_B;
+    return (slot == 0) ? STM_BOOTSTRAP_BITMAP_SLOT_A : STM_BOOTSTRAP_BITMAP_SLOT_B;
 }
 
 /* Unit index → absolute device paddr of the first block. */
-static inline uint64_t unit_to_paddr(const stm_alloc *a, uint64_t unit_idx)
+static inline uint64_t unit_to_paddr(const stm_bootstrap *a, uint64_t unit_idx)
 {
     uint64_t pool_block = a->data_start_block +
                           unit_idx * (uint64_t)STM_BOOTSTRAP_UNIT_BLOCKS;
@@ -148,7 +148,7 @@ static inline uint64_t unit_to_paddr(const stm_alloc *a, uint64_t unit_idx)
 }
 
 /* paddr → unit index. Returns true on valid, unit-aligned, in-range paddr. */
-static bool paddr_to_unit(const stm_alloc *a, uint64_t paddr,
+static bool paddr_to_unit(const stm_bootstrap *a, uint64_t paddr,
                           uint64_t *out_unit_idx)
 {
     if (stm_paddr_device(paddr) != 0) return false;
@@ -199,16 +199,16 @@ static void compute_bitmap_csum(const uint8_t *bitmap_block,
  * Serialize `hdr_in` into a 4 KiB buffer suitable for direct bdev write.
  * Populates h_csum as BLAKE3-256 over bytes [0, 4064).
  */
-static void encode_hdr(const stm_alloc_hdr *hdr_in, uint8_t buf[STM_UB_SIZE])
+static void encode_hdr(const stm_bootstrap_hdr *hdr_in, uint8_t buf[STM_UB_SIZE])
 {
     memcpy(buf, hdr_in, sizeof *hdr_in);
 
     /* Zero the csum field before hashing. */
-    memset(buf + offsetof(stm_alloc_hdr, h_csum), 0, 32);
+    memset(buf + offsetof(stm_bootstrap_hdr, h_csum), 0, 32);
 
     stm_blake3_hash h;
     stm_blake3(buf, STM_UB_SIZE - 32, &h);
-    memcpy(buf + offsetof(stm_alloc_hdr, h_csum), h.bytes, 32);
+    memcpy(buf + offsetof(stm_bootstrap_hdr, h_csum), h.bytes, 32);
 }
 
 /*
@@ -216,19 +216,19 @@ static void encode_hdr(const stm_alloc_hdr *hdr_in, uint8_t buf[STM_UB_SIZE])
  * Returns STM_EBADVERSION on magic/version mismatch, STM_ECORRUPT on csum.
  */
 static stm_status decode_hdr(const uint8_t buf[STM_UB_SIZE],
-                              stm_alloc_hdr *out_hdr)
+                              stm_bootstrap_hdr *out_hdr)
 {
-    const stm_alloc_hdr *on_disk = (const stm_alloc_hdr *)buf;
+    const stm_bootstrap_hdr *on_disk = (const stm_bootstrap_hdr *)buf;
 
     uint64_t magic = stm_load_le64(on_disk->h_magic);
-    if (magic != STM_ALLOC_HDR_MAGIC) return STM_EBADVERSION;
+    if (magic != STM_BOOTSTRAP_HDR_MAGIC) return STM_EBADVERSION;
     uint32_t version = stm_load_le32(on_disk->h_version);
-    if (version != STM_ALLOC_HDR_VERSION) return STM_EBADVERSION;
+    if (version != STM_BOOTSTRAP_HDR_VERSION) return STM_EBADVERSION;
 
     /* Recompute csum with the field zeroed. */
     uint8_t staged[STM_UB_SIZE];
     memcpy(staged, buf, STM_UB_SIZE);
-    memset(staged + offsetof(stm_alloc_hdr, h_csum), 0, 32);
+    memset(staged + offsetof(stm_bootstrap_hdr, h_csum), 0, 32);
 
     uint8_t expected[32];
     stm_blake3_hash h;
@@ -286,8 +286,8 @@ static stm_status compute_bootstrap_size(stm_bdev *d,
 
     /* Unit count check (chunk 4a MVP: single-block bitmap). */
     uint64_t size_blocks = size / STM_UB_SIZE;
-    if (size_blocks <= STM_ALLOC_DATA_START_BLOCK) return STM_ENOSPC;
-    uint64_t data_blocks = size_blocks - STM_ALLOC_DATA_START_BLOCK;
+    if (size_blocks <= STM_BOOTSTRAP_DATA_START_BLOCK) return STM_ENOSPC;
+    uint64_t data_blocks = size_blocks - STM_BOOTSTRAP_DATA_START_BLOCK;
     uint64_t num_units = data_blocks / (uint64_t)STM_BOOTSTRAP_UNIT_BLOCKS;
     if (num_units == 0) return STM_ENOSPC;
     if (num_units > STM_BOOTSTRAP_MAX_UNITS) return STM_ENOTSUPPORTED;
@@ -300,16 +300,16 @@ static stm_status compute_bootstrap_size(stm_bdev *d,
 /* Lifecycle: create, open, close.                                            */
 /* ========================================================================= */
 
-static stm_alloc *alloc_new(stm_bdev *d, uint64_t size_bytes,
+static stm_bootstrap *alloc_new(stm_bdev *d, uint64_t size_bytes,
                              const uint64_t pool_uuid[2],
                              const uint64_t device_uuid[2])
 {
-    stm_alloc *a = calloc(1, sizeof *a);
+    stm_bootstrap *a = calloc(1, sizeof *a);
     if (!a) return NULL;
 
     a->d = d;
     a->bootstrap_size_blocks = size_bytes / STM_UB_SIZE;
-    a->data_start_block = STM_ALLOC_DATA_START_BLOCK;
+    a->data_start_block = STM_BOOTSTRAP_DATA_START_BLOCK;
     a->total_units =
         (a->bootstrap_size_blocks - a->data_start_block) /
         (uint64_t)STM_BOOTSTRAP_UNIT_BLOCKS;
@@ -329,11 +329,11 @@ static stm_alloc *alloc_new(stm_bdev *d, uint64_t size_bytes,
     return a;
 }
 
-stm_status stm_alloc_create(stm_bdev *d,
+stm_status stm_bootstrap_create(stm_bdev *d,
                              const uint64_t pool_uuid[2],
                              const uint64_t device_uuid[2],
                              uint64_t bootstrap_size_bytes,
-                             stm_alloc **out_alloc)
+                             stm_bootstrap **out_alloc)
 {
     if (!d || !pool_uuid || !device_uuid || !out_alloc) return STM_EINVAL;
 
@@ -341,7 +341,7 @@ stm_status stm_alloc_create(stm_bdev *d,
     stm_status s = compute_bootstrap_size(d, bootstrap_size_bytes, &size_bytes);
     if (s != STM_OK) return s;
 
-    stm_alloc *a = alloc_new(d, size_bytes, pool_uuid, device_uuid);
+    stm_bootstrap *a = alloc_new(d, size_bytes, pool_uuid, device_uuid);
     if (!a) return STM_ENOMEM;
 
     /* Fresh pool: bitmap is all zeros (all units free), gen starts at 0.
@@ -374,9 +374,9 @@ stm_status stm_alloc_create(stm_bdev *d,
     if (s != STM_OK) goto fail;
 
     /* Now the header (step 2). */
-    stm_alloc_hdr hdr = { 0 };
-    hdr.h_magic                 = stm_store_le64(STM_ALLOC_HDR_MAGIC);
-    hdr.h_version               = stm_store_le32(STM_ALLOC_HDR_VERSION);
+    stm_bootstrap_hdr hdr = { 0 };
+    hdr.h_magic                 = stm_store_le64(STM_BOOTSTRAP_HDR_MAGIC);
+    hdr.h_version               = stm_store_le32(STM_BOOTSTRAP_HDR_VERSION);
     hdr.h_flags                 = stm_store_le32(0);
     hdr.h_pool_uuid[0]          = stm_store_le64(pool_uuid[0]);
     hdr.h_pool_uuid[1]          = stm_store_le64(pool_uuid[1]);
@@ -416,11 +416,11 @@ fail:
 /* Try to read + csum-verify the bitmap designated by `hdr`. On success
  * fills `out_bitmap` and returns STM_OK. On failure returns an error
  * suitable for the caller to fall back to a different header. */
-static stm_status load_bitmap_for_hdr(stm_bdev *d, const stm_alloc_hdr *hdr,
+static stm_status load_bitmap_for_hdr(stm_bdev *d, const stm_bootstrap_hdr *hdr,
                                        uint8_t out_bitmap[STM_UB_SIZE])
 {
     uint64_t idx = stm_load_le64(hdr->h_bitmap_block);
-    if (idx != STM_ALLOC_BITMAP_SLOT_A && idx != STM_ALLOC_BITMAP_SLOT_B)
+    if (idx != STM_BOOTSTRAP_BITMAP_SLOT_A && idx != STM_BOOTSTRAP_BITMAP_SLOT_B)
         return STM_ECORRUPT;
 
     stm_status s = stm_bdev_read(d, device_byte_offset(idx),
@@ -436,7 +436,7 @@ static stm_status load_bitmap_for_hdr(stm_bdev *d, const stm_alloc_hdr *hdr,
     return diff == 0 ? STM_OK : STM_ECORRUPT;
 }
 
-stm_status stm_alloc_open(stm_bdev *d, stm_alloc **out_alloc)
+stm_status stm_bootstrap_open(stm_bdev *d, stm_bootstrap **out_alloc)
 {
     if (!d || !out_alloc) return STM_EINVAL;
 
@@ -450,7 +450,7 @@ stm_status stm_alloc_open(stm_bdev *d, stm_alloc **out_alloc)
     s = stm_bdev_read(d, hdr_slot_offset(1), hdr_buf_b, sizeof hdr_buf_b);
     if (s != STM_OK) return s;
 
-    stm_alloc_hdr hdr_a, hdr_b;
+    stm_bootstrap_hdr hdr_a, hdr_b;
     stm_status s_a = decode_hdr(hdr_buf_a, &hdr_a);
     stm_status s_b = decode_hdr(hdr_buf_b, &hdr_b);
 
@@ -471,7 +471,7 @@ stm_status stm_alloc_open(stm_bdev *d, stm_alloc **out_alloc)
      * the live bitmap slot) we fall back to the other valid header's
      * bitmap so the pool can mount at the prior gen rather than being
      * wedged. */
-    stm_alloc_hdr *cand_hdr[2]  = { NULL, NULL };
+    stm_bootstrap_hdr *cand_hdr[2]  = { NULL, NULL };
     uint32_t       cand_slot[2] = { 0, 0 };
     int            ncand        = 0;
 
@@ -493,7 +493,7 @@ stm_status stm_alloc_open(stm_bdev *d, stm_alloc **out_alloc)
     }
 
     uint8_t         bitmap_block[STM_UB_SIZE];
-    stm_alloc_hdr  *chosen_hdr  = NULL;
+    stm_bootstrap_hdr  *chosen_hdr  = NULL;
     uint32_t        chosen_slot = 0;
     for (int i = 0; i < ncand; i++) {
         stm_status cs = load_bitmap_for_hdr(d, cand_hdr[i], bitmap_block);
@@ -514,7 +514,7 @@ stm_status stm_alloc_open(stm_bdev *d, stm_alloc **out_alloc)
     uint64_t bit_count   = stm_load_le64(chosen_hdr->h_bitmap_bit_count);
 
     if (unit_blocks != STM_BOOTSTRAP_UNIT_BLOCKS) return STM_EBADVERSION;
-    if (data_start  != STM_ALLOC_DATA_START_BLOCK) return STM_EBADVERSION;
+    if (data_start  != STM_BOOTSTRAP_DATA_START_BLOCK) return STM_EBADVERSION;
     if (bit_count  == 0 || bit_count > STM_BOOTSTRAP_MAX_UNITS) return STM_ECORRUPT;
 
     /* Overflow: size_blocks * STM_UB_SIZE must fit in uint64_t. */
@@ -539,13 +539,13 @@ stm_status stm_alloc_open(stm_bdev *d, stm_alloc **out_alloc)
         stm_load_le64(chosen_hdr->h_device_uuid[1]),
     };
 
-    stm_alloc *a = alloc_new(d, size_bytes, pool_uuid, device_uuid);
+    stm_bootstrap *a = alloc_new(d, size_bytes, pool_uuid, device_uuid);
     if (!a) return STM_ENOMEM;
 
     a->bitmap_gen       = stm_load_le64(chosen_hdr->h_bitmap_gen);
     a->hdr_slot_live    = chosen_slot;
     a->bitmap_slot_live = (uint32_t)(stm_load_le64(chosen_hdr->h_bitmap_block) -
-                                     STM_ALLOC_BITMAP_SLOT_A);
+                                     STM_BOOTSTRAP_BITMAP_SLOT_A);
 
     /* Header's bit_count and our computed total_units must agree. */
     if (bit_count != a->total_units) {
@@ -559,7 +559,7 @@ stm_status stm_alloc_open(stm_bdev *d, stm_alloc **out_alloc)
     return STM_OK;
 }
 
-void stm_alloc_close(stm_alloc *a)
+void stm_bootstrap_close(stm_bootstrap *a)
 {
     if (!a) return;
     pending_entry *e = a->pending_head;
@@ -578,7 +578,7 @@ void stm_alloc_close(stm_alloc *a)
 
 /* Scan for a run of `nunits` consecutive free units starting at `start`.
  * Returns true + *out_first_unit on success; false on no-fit. */
-static bool find_free_run(const stm_alloc *a, uint64_t start, uint64_t nunits,
+static bool find_free_run(const stm_bootstrap *a, uint64_t start, uint64_t nunits,
                            uint64_t *out_first_unit)
 {
     if (nunits == 0 || nunits > a->total_units) return false;
@@ -623,7 +623,7 @@ static bool find_free_run(const stm_alloc *a, uint64_t start, uint64_t nunits,
     return false;
 }
 
-stm_status stm_alloc_reserve(stm_alloc *a, uint32_t nblocks,
+stm_status stm_bootstrap_reserve(stm_bootstrap *a, uint32_t nblocks,
                               uint64_t hint_paddr,
                               uint64_t *out_paddr)
 {
@@ -658,7 +658,7 @@ stm_status stm_alloc_reserve(stm_alloc *a, uint32_t nblocks,
     return STM_OK;
 }
 
-stm_status stm_alloc_free(stm_alloc *a, uint64_t paddr, uint32_t nblocks,
+stm_status stm_bootstrap_free(stm_bootstrap *a, uint64_t paddr, uint32_t nblocks,
                            uint64_t free_gen)
 {
     if (!a) return STM_EINVAL;
@@ -706,7 +706,7 @@ stm_status stm_alloc_free(stm_alloc *a, uint64_t paddr, uint32_t nblocks,
     return STM_OK;
 }
 
-stm_status stm_alloc_commit(stm_alloc *a, uint64_t committed_gen)
+stm_status stm_bootstrap_commit(stm_bootstrap *a, uint64_t committed_gen)
 {
     if (!a) return STM_EINVAL;
 
@@ -761,9 +761,9 @@ stm_status stm_alloc_commit(stm_alloc *a, uint64_t committed_gen)
     s = stm_bdev_fsync(a->d);
     if (s != STM_OK) return s;
 
-    stm_alloc_hdr hdr = { 0 };
-    hdr.h_magic                 = stm_store_le64(STM_ALLOC_HDR_MAGIC);
-    hdr.h_version               = stm_store_le32(STM_ALLOC_HDR_VERSION);
+    stm_bootstrap_hdr hdr = { 0 };
+    hdr.h_magic                 = stm_store_le64(STM_BOOTSTRAP_HDR_MAGIC);
+    hdr.h_version               = stm_store_le32(STM_BOOTSTRAP_HDR_VERSION);
     hdr.h_flags                 = stm_store_le32(0);
     hdr.h_pool_uuid[0]          = stm_store_le64(a->pool_uuid[0]);
     hdr.h_pool_uuid[1]          = stm_store_le64(a->pool_uuid[1]);
@@ -814,7 +814,7 @@ stm_status stm_alloc_commit(stm_alloc *a, uint64_t committed_gen)
 /* Inspection.                                                                */
 /* ========================================================================= */
 
-stm_status stm_alloc_stats_get(const stm_alloc *a, stm_alloc_stats *out)
+stm_status stm_bootstrap_stats_get(const stm_bootstrap *a, stm_bootstrap_stats *out)
 {
     if (!a || !out) return STM_EINVAL;
 
@@ -835,7 +835,7 @@ stm_status stm_alloc_stats_get(const stm_alloc *a, stm_alloc_stats *out)
     return STM_OK;
 }
 
-stm_status stm_alloc_is_allocated(const stm_alloc *a, uint64_t paddr,
+stm_status stm_bootstrap_is_allocated(const stm_bootstrap *a, uint64_t paddr,
                                    bool *out_allocated)
 {
     if (!a || !out_allocated) return STM_EINVAL;

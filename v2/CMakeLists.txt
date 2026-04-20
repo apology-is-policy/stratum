@@ -166,7 +166,7 @@ add_subdirectory(src/block)
 add_subdirectory(src/ebr)
 add_subdirectory(src/btree)
 add_subdirectory(src/sb)
-add_subdirectory(src/alloc)
+add_subdirectory(src/bootstrap)
 
 # ---------------------------------------------------------------------------
 # Public aggregate library.
@@ -180,7 +180,7 @@ target_link_libraries(stratum INTERFACE
     stm_ebr
     stm_btree
     stm_sb
-    stm_alloc)
+    stm_bootstrap)
 target_include_directories(stratum INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/include)
 

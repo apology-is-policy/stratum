@@ -9,7 +9,7 @@
  * the bootstrap-pool-only path: a per-device bitmap-managed region that
  * hosts (in 4b) the allocator Bε-tree's own nodes. The Bε-tree allocator
  * itself (tracking user-data ranges via tree entries) arrives in chunk 4b
- * and reuses this same `stm_alloc` abstraction.
+ * and reuses this same `stm_bootstrap` abstraction.
  *
  * Layout on disk:
  *
@@ -34,10 +34,10 @@
  *
  * Deferred-free semantics mirror `v2/specs/allocator.tla` exactly:
  *
- *    - stm_alloc_free(paddr, nblocks, free_gen) stamps a PENDING entry.
+ *    - stm_bootstrap_free(paddr, nblocks, free_gen) stamps a PENDING entry.
  *      Bitmap bit stays set (the range is reserved against any concurrent
  *      reserve) but an in-RAM list remembers free_gen.
- *    - stm_alloc_commit(committed_gen) sweeps all PENDING with
+ *    - stm_bootstrap_commit(committed_gen) sweeps all PENDING with
  *      free_gen < committed_gen → clears the bitmap bit, drops the entry.
  *      It then COWs the bitmap to the other slot and writes a new header
  *      to the other header slot, fsyncing before returning.
@@ -48,8 +48,8 @@
  * chunks 4+ the commit protocol drives these; for chunk 4a they are
  * driven directly by tests.
  */
-#ifndef STRATUM_V2_ALLOC_H
-#define STRATUM_V2_ALLOC_H
+#ifndef STRATUM_V2_BOOTSTRAP_H
+#define STRATUM_V2_BOOTSTRAP_H
 
 #include <stratum/types.h>
 
@@ -83,23 +83,23 @@ typedef struct stm_bdev stm_bdev;   /* forward from block.h */
 #define STM_BOOTSTRAP_MAX_UNITS       32768u
 
 /* Header / bitmap slot layout inside the bootstrap pool, in block indices. */
-#define STM_ALLOC_HDR_SLOT_A          0u
-#define STM_ALLOC_HDR_SLOT_B          1u
-#define STM_ALLOC_BITMAP_SLOT_A       2u
-#define STM_ALLOC_BITMAP_SLOT_B       3u
+#define STM_BOOTSTRAP_HDR_SLOT_A          0u
+#define STM_BOOTSTRAP_HDR_SLOT_B          1u
+#define STM_BOOTSTRAP_BITMAP_SLOT_A       2u
+#define STM_BOOTSTRAP_BITMAP_SLOT_B       3u
 
 /* First block (within the bootstrap pool) of the data area. Equal to
  * STM_BOOTSTRAP_UNIT_BLOCKS so unit 0 starts at a natural alignment. */
-#define STM_ALLOC_DATA_START_BLOCK    STM_BOOTSTRAP_UNIT_BLOCKS
+#define STM_BOOTSTRAP_DATA_START_BLOCK    STM_BOOTSTRAP_UNIT_BLOCKS
 
 /* On-disk format version of the bootstrap-pool header. */
-#define STM_ALLOC_HDR_VERSION         1u
+#define STM_BOOTSTRAP_HDR_VERSION         1u
 
 /* ========================================================================= */
 /* Opaque handle + stats.                                                     */
 /* ========================================================================= */
 
-typedef struct stm_alloc stm_alloc;
+typedef struct stm_bootstrap stm_bootstrap;
 
 typedef struct {
     /* Bootstrap pool geometry. */
@@ -116,7 +116,7 @@ typedef struct {
     uint64_t header_slot_live;        /* 0 or 1                                 */
     uint64_t bitmap_slot_live;        /* 0 or 1                                 */
     uint64_t bitmap_gen;              /* monotonic on each commit               */
-} stm_alloc_stats;
+} stm_bootstrap_stats;
 
 /* ========================================================================= */
 /* Lifecycle.                                                                 */
@@ -139,11 +139,11 @@ typedef struct {
  * unit count exceeds STM_BOOTSTRAP_MAX_UNITS.
  */
 STM_MUST_USE
-stm_status stm_alloc_create(stm_bdev *d,
+stm_status stm_bootstrap_create(stm_bdev *d,
                              const uint64_t pool_uuid[2],
                              const uint64_t device_uuid[2],
                              uint64_t bootstrap_size_bytes,
-                             stm_alloc **out_alloc);
+                             stm_bootstrap **out_alloc);
 
 /*
  * Open an existing bootstrap pool. Reads both header slots; picks the
@@ -155,14 +155,14 @@ stm_status stm_alloc_create(stm_bdev *d,
  * or the designated bitmap doesn't csum-match the header's record.
  */
 STM_MUST_USE
-stm_status stm_alloc_open(stm_bdev *d, stm_alloc **out_alloc);
+stm_status stm_bootstrap_open(stm_bdev *d, stm_bootstrap **out_alloc);
 
 /*
  * Flush in-RAM state (if dirty) and release the handle. Does NOT fsync
- * on its own — callers who need durability must `stm_alloc_commit`
+ * on its own — callers who need durability must `stm_bootstrap_commit`
  * first. The release itself is inert on the device side.
  */
-void stm_alloc_close(stm_alloc *a);
+void stm_bootstrap_close(stm_bootstrap *a);
 
 /* ========================================================================= */
 /* Reserve / free / commit.                                                   */
@@ -181,12 +181,12 @@ void stm_alloc_close(stm_alloc *a);
  *
  * On success, `*out_paddr` gets the absolute paddr of the first block
  * of the reserved run (device 0 for single-device MVP; the device
- * field will be filled in once stm_alloc is parameterized per-device).
+ * field will be filled in once stm_bootstrap is parameterized per-device).
  *
  * Returns STM_ENOSPC if no run of the requested size is free.
  */
 STM_MUST_USE
-stm_status stm_alloc_reserve(stm_alloc *a, uint32_t nblocks,
+stm_status stm_bootstrap_reserve(stm_bootstrap *a, uint32_t nblocks,
                               uint64_t hint_paddr,
                               uint64_t *out_paddr);
 
@@ -197,13 +197,13 @@ stm_status stm_alloc_reserve(stm_alloc *a, uint32_t nblocks,
  * the range was returned by a prior reserve and not yet freed).
  *
  * `free_gen` is stamped onto the PENDING entry. A subsequent
- * stm_alloc_commit(committed_gen) with `free_gen < committed_gen` will
+ * stm_bootstrap_commit(committed_gen) with `free_gen < committed_gen` will
  * transition the entry to FREE (clearing the bitmap bits).
  *
  * Returns STM_EINVAL for alignment/range errors.
  */
 STM_MUST_USE
-stm_status stm_alloc_free(stm_alloc *a, uint64_t paddr, uint32_t nblocks,
+stm_status stm_bootstrap_free(stm_bootstrap *a, uint64_t paddr, uint32_t nblocks,
                            uint64_t free_gen);
 
 /*
@@ -228,22 +228,22 @@ stm_status stm_alloc_free(stm_alloc *a, uint64_t paddr, uint32_t nblocks,
  * Returns STM_OK on success. Device-level I/O errors propagate.
  */
 STM_MUST_USE
-stm_status stm_alloc_commit(stm_alloc *a, uint64_t committed_gen);
+stm_status stm_bootstrap_commit(stm_bootstrap *a, uint64_t committed_gen);
 
 /* ========================================================================= */
 /* Inspection.                                                                */
 /* ========================================================================= */
 
 STM_MUST_USE
-stm_status stm_alloc_stats_get(const stm_alloc *a, stm_alloc_stats *out);
+stm_status stm_bootstrap_stats_get(const stm_bootstrap *a, stm_bootstrap_stats *out);
 
 /* Report whether a given paddr's data unit is currently allocated (bitmap
  * bit set, includes PENDING). For tests and diagnostics. */
 STM_MUST_USE
-stm_status stm_alloc_is_allocated(const stm_alloc *a, uint64_t paddr,
+stm_status stm_bootstrap_is_allocated(const stm_bootstrap *a, uint64_t paddr,
                                    bool *out_allocated);
 
 #ifdef __cplusplus
 }
 #endif
-#endif /* STRATUM_V2_ALLOC_H */
+#endif /* STRATUM_V2_BOOTSTRAP_H */
