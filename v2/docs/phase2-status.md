@@ -10,10 +10,10 @@ of the reasoning that led to the current code.
 
 The lock-free Bw-tree is a **balanced B+tree** now: root is a
 BASE_INTERNAL delta with a pivot array, leaves are atomic-published
-BASE_LEAF chains with SPLIT redirects. All four audit rounds R0-R3
+BASE_LEAF chains with SPLIT redirects. All FIVE audit rounds R0-R4
 passed and CI green on full matrix. Remaining Phase 2 scope is
-MERGE (spec-first) and a fresh R4 audit round over the
-internal-routing changes.
+MERGE (spec-first) and per-node consolidator (unblocks higher-
+throughput stress).
 
 ## What's landed (commits, tests, audits)
 
@@ -32,6 +32,8 @@ internal-routing changes.
 | `09c3636` | `structural.tla` extended to cover 2-level cascade (5120 states, depth 15) |
 | `91a6a84` | `balanced.tla` — parent-pivot-update three-CAS spec (65536 states, depth 18) |
 | `9b60510` | **#176: internal-node routing landed**. Root is BASE_INTERNAL with pivots; leaves are BASE_LEAF with multi-SPLIT chains. Chain inheritance dropped — parent routing supersedes. New tests (balanced_growth, large_scale_internal_routing). |
+| `67da4f0` | R4 audit fixes: 512 KiB stack buffers → heap-alloc, force_consolidate thrash-guard, dead writes / redundant NULL loop cleanups. Closed R4 with 0 P0 / 0 P1 / 1 P2 / 5 P3. |
+| `048520f` | **#174: multi-leaf concurrent stress**. 8 threads × 3000 ops on 1024-key × target=16 → ~64 leaves under contention. ~3s under TSan; total suite ~8s. Throughput ceiling reached at tree-global consolidator flag. |
 
 Also: several CI-fix commits for Linux `-Werror` / liboqs issues.
 All CI matrix jobs (Linux gcc/clang × off/asan/tsan + macOS clang ×
@@ -111,26 +113,26 @@ target=4 → max leaf depth 9. See `btree_lf_balanced_growth` and
 
 ### Next steps
 
-1. **R4 audit (task #175)** — scope is the internal-routing changes
-   in `9b60510`. Preamble = cumulative R0-R3 closed list at
-   `memory/audit_v2_r0_closed_list.md`. Focus surfaces: commit_split's
-   three-step protocol, multi-SPLIT chain walk (resolve_leaf_chain,
-   traverse_and_prepend), internal_clone_with_pivot ownership,
-   build_leaf_chain ownership on failure (a leak bug caught during
-   implementation), force_consolidate's tree walk, EBR interaction
-   with the new BASE_INTERNAL retire path.
+1. **R4 audit (task #175 component)** — DONE in `67da4f0`. 0 P0 /
+   0 P1 / 1 P2 / 5 P3. P2 and three P3s fixed. Two P3s noted for
+   future (retry parent update on OOM, extend balanced.tla to
+   model failure paths). See `memory/audit_v2_r0_closed_list.md`
+   for full R4 report.
 
 2. **MERGE (option A above)** — still requires `merge.tla` before
    code. Now that internal routing is in, MERGE semantics are
    clearer: a shrunk leaf can be absorbed into a sibling by
    (a) posting a MERGE marker on the victim leaf, (b) CAS-replacing
-   the parent's BASE_INTERNAL with one that drops the pivot. Still
-   have to nail down the redirect semantics during the window.
+   the parent's BASE_INTERNAL with one that drops the pivot.
 
-3. **10s+ TSAN stress (task #174 exit)** — may or may not need
-   additional work; with contention now spread across many leaves,
-   bumping STRESS_OPS from 3000 is plausible. Needs empirical
-   validation under TSAN.
+3. **Per-node consolidator flag** — the current `t->consolidating`
+   is tree-global. Under the multi-leaf stress (`048520f`),
+   chain depth on one leaf spiked past MAX_CHAIN=4096 because other
+   leaves held the flag. Per-node flag would let chain-drain
+   happen in parallel across leaves, unblocking higher-throughput
+   stress (and the historical 10s+ target). Modest change — add
+   `_Atomic bool consolidating` to the page-table slot or as a
+   parallel array indexed by nid.
 
 ### Minor leftover
 
@@ -263,7 +265,7 @@ v2/
 │   ├── concurrency.tla  # MVCC + delta chain + EBR
 │   └── structural.tla   # SPLIT protocol + cascade (extended)
 ├── tests/
-│   └── test_btree_lf.c  # 16 tests (incl. balanced_growth + large-scale)
+│   └── test_btree_lf.c  # 17 tests (incl. multi_leaf_stress for #174)
 └── docs/
     ├── phase2-bw-tree-design.md  # pre-implementation design note
     └── phase2-status.md           # THIS FILE
@@ -274,10 +276,11 @@ v2/
 1. Read this file top to bottom.
 2. Read `memory/audit_v2_r0_closed_list.md` for R0–R3 do-not-report.
 3. The recommended next chunk is either:
-   - **R4 audit** over the internal-routing changes in `9b60510`
-     (scoped — cheapest unit of value).
    - **MERGE** — write `merge.tla` first. Use `balanced.tla` /
      `structural.tla` as templates for style.
+   - **Per-node consolidator** — modest refactor that unblocks
+     higher-throughput stress. No new spec needed (just adjust
+     concurrency.tla's coverage if invariants shift).
 4. Run the verification commands to confirm tip is green.
 5. Start spec-first. Don't touch `btree_lf.c` until the spec is
    TLC-clean.
