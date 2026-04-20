@@ -338,4 +338,262 @@ STM_TEST(btnode_encoded_bytes_helper) {
     STM_ASSERT_EQ(stm_btnode_leaf_encoded_bytes(NULL, 0), (size_t)0);
 }
 
+/* ========================================================================= */
+/* Internal-node tests (chunk 5b).                                            */
+/* ========================================================================= */
+
+typedef struct {
+    const stm_btnode_pivot *expected_pivots;
+    uint32_t                n_expected_pivots;
+    const uint8_t          *expected_children; /* (N+1)*64 */
+    uint32_t                n_pivots_seen;
+    uint32_t                n_children_seen;
+    bool                    ok;
+} internal_ctx;
+
+static int pivot_collect_cb(const void *key, size_t key_len,
+                              uint32_t idx, void *ctx_)
+{
+    internal_ctx *c = ctx_;
+    if (idx != c->n_pivots_seen) { c->ok = false; return 1; }
+    if (idx >= c->n_expected_pivots) { c->ok = false; return 1; }
+    const stm_btnode_pivot *e = &c->expected_pivots[idx];
+    if (key_len != e->key_len) { c->ok = false; return 1; }
+    if (key_len && memcmp(key, e->key, key_len) != 0) {
+        c->ok = false; return 1;
+    }
+    c->n_pivots_seen++;
+    return 0;
+}
+
+static int child_collect_cb(const uint8_t bptr[STM_BTNODE_CHILD_BPTR_SIZE],
+                              uint32_t idx, void *ctx_)
+{
+    internal_ctx *c = ctx_;
+    if (idx != c->n_children_seen) { c->ok = false; return 1; }
+    if (memcmp(bptr, c->expected_children + idx * STM_BTNODE_CHILD_BPTR_SIZE,
+               STM_BTNODE_CHILD_BPTR_SIZE) != 0) {
+        c->ok = false; return 1;
+    }
+    c->n_children_seen++;
+    return 0;
+}
+
+STM_TEST(btnode_internal_roundtrip_small) {
+    uint8_t *buf = malloc(STM_BTNODE_SIZE);
+    STM_ASSERT(buf != NULL);
+    if (!buf) return;
+
+    /* 3 pivots ("a", "bb", "ccc") → 4 children. */
+    stm_btnode_pivot pivots[3] = {
+        { "a",   1 },
+        { "bb",  2 },
+        { "ccc", 3 },
+    };
+    uint8_t children[4 * STM_BTNODE_CHILD_BPTR_SIZE];
+    for (uint32_t i = 0; i < 4; i++) {
+        for (uint32_t j = 0; j < STM_BTNODE_CHILD_BPTR_SIZE; j++) {
+            children[i * STM_BTNODE_CHILD_BPTR_SIZE + j] =
+                (uint8_t)(i * 64 + j);
+        }
+    }
+
+    STM_ASSERT_OK(stm_btnode_internal_encode(pivots, 3,
+                                               children, sizeof children,
+                                               /*gen=*/77, /*tree_id=*/0,
+                                               buf, STM_BTNODE_SIZE));
+
+    stm_btnode_info info;
+    STM_ASSERT_OK(stm_btnode_peek(buf, STM_BTNODE_SIZE, &info));
+    STM_ASSERT_EQ(info.kind,       STM_BTNODE_KIND_INTERNAL);
+    STM_ASSERT_EQ(info.n_entries,  3u);
+    STM_ASSERT_EQ(info.gen,        77u);
+
+    STM_ASSERT_OK(stm_btnode_verify(buf, STM_BTNODE_SIZE));
+
+    internal_ctx ctx = {
+        .expected_pivots    = pivots,
+        .n_expected_pivots  = 3,
+        .expected_children  = children,
+        .n_pivots_seen      = 0,
+        .n_children_seen    = 0,
+        .ok                 = true,
+    };
+    STM_ASSERT_OK(stm_btnode_internal_decode(buf, STM_BTNODE_SIZE, NULL,
+                                               pivot_collect_cb,
+                                               child_collect_cb,
+                                               &ctx));
+    STM_ASSERT_EQ(ctx.n_pivots_seen,   3u);
+    STM_ASSERT_EQ(ctx.n_children_seen, 4u);
+    STM_ASSERT_TRUE(ctx.ok);
+
+    free(buf);
+}
+
+STM_TEST(btnode_internal_zero_pivots_single_child) {
+    /* N=0: no pivots, one child. Degenerate but valid. */
+    uint8_t *buf = malloc(STM_BTNODE_SIZE);
+    STM_ASSERT(buf != NULL);
+    if (!buf) return;
+
+    uint8_t child[STM_BTNODE_CHILD_BPTR_SIZE];
+    for (uint32_t j = 0; j < STM_BTNODE_CHILD_BPTR_SIZE; j++)
+        child[j] = (uint8_t)(0xA0 + j);
+
+    STM_ASSERT_OK(stm_btnode_internal_encode(NULL, 0,
+                                               child, sizeof child,
+                                               0, 0,
+                                               buf, STM_BTNODE_SIZE));
+
+    stm_btnode_info info;
+    STM_ASSERT_OK(stm_btnode_peek(buf, STM_BTNODE_SIZE, &info));
+    STM_ASSERT_EQ(info.n_entries, 0u);
+
+    internal_ctx ctx = {
+        .expected_pivots    = NULL,
+        .n_expected_pivots  = 0,
+        .expected_children  = child,
+        .n_pivots_seen      = 0,
+        .n_children_seen    = 0,
+        .ok                 = true,
+    };
+    STM_ASSERT_OK(stm_btnode_internal_decode(buf, STM_BTNODE_SIZE, NULL,
+                                               pivot_collect_cb,
+                                               child_collect_cb,
+                                               &ctx));
+    STM_ASSERT_EQ(ctx.n_pivots_seen,   0u);
+    STM_ASSERT_EQ(ctx.n_children_seen, 1u);
+    STM_ASSERT_TRUE(ctx.ok);
+
+    free(buf);
+}
+
+STM_TEST(btnode_internal_bad_children_len) {
+    uint8_t *buf = malloc(STM_BTNODE_SIZE);
+    STM_ASSERT(buf != NULL);
+    if (!buf) return;
+
+    stm_btnode_pivot pv = { "k", 1 };
+    /* Expected 2*64 = 128 bytes. Supply 100. */
+    uint8_t children[100] = { 0 };
+    STM_ASSERT_ERR(stm_btnode_internal_encode(&pv, 1,
+                                                children, sizeof children,
+                                                0, 0,
+                                                buf, STM_BTNODE_SIZE),
+                   STM_EINVAL);
+
+    free(buf);
+}
+
+STM_TEST(btnode_internal_tamper_payload_detected) {
+    uint8_t *buf = malloc(STM_BTNODE_SIZE);
+    STM_ASSERT(buf != NULL);
+    if (!buf) return;
+
+    stm_btnode_pivot pv = { "k", 1 };
+    uint8_t children[2 * STM_BTNODE_CHILD_BPTR_SIZE] = { 0 };
+    STM_ASSERT_OK(stm_btnode_internal_encode(&pv, 1,
+                                               children, sizeof children,
+                                               0, 0,
+                                               buf, STM_BTNODE_SIZE));
+
+    /* Flip a byte in one of the children. */
+    buf[STM_BTNODE_HDR_SIZE + 4 + 1 + 10] ^= 0x02;
+    STM_ASSERT_ERR(stm_btnode_verify(buf, STM_BTNODE_SIZE), STM_ECORRUPT);
+
+    free(buf);
+}
+
+STM_TEST(btnode_internal_large_fanout_roundtrip) {
+    /* 100 pivots of 8-byte keys + 101 children of 64 B each.
+     * payload = 100 * (4 + 8) + 101 * 64 = 1200 + 6464 = 7664 bytes. */
+    uint8_t *buf = malloc(STM_BTNODE_SIZE);
+    STM_ASSERT(buf != NULL);
+    if (!buf) return;
+
+    #define NP 100u
+    stm_btnode_pivot *pivots = calloc(NP, sizeof *pivots);
+    uint8_t (*pivot_keys)[8] = calloc(NP, sizeof *pivot_keys);
+    uint8_t *children = calloc((size_t)NP + 1, STM_BTNODE_CHILD_BPTR_SIZE);
+    STM_ASSERT(pivots && pivot_keys && children);
+    if (!pivots || !pivot_keys || !children) {
+        free(buf); free(pivots); free(pivot_keys); free(children);
+        return;
+    }
+
+    for (uint32_t i = 0; i < NP; i++) {
+        for (int b = 0; b < 8; b++)
+            pivot_keys[i][b] = (uint8_t)((i * 31 + b) & 0xff);
+        pivots[i].key     = pivot_keys[i];
+        pivots[i].key_len = 8;
+    }
+    for (uint32_t i = 0; i <= NP; i++) {
+        for (uint32_t j = 0; j < STM_BTNODE_CHILD_BPTR_SIZE; j++) {
+            children[i * STM_BTNODE_CHILD_BPTR_SIZE + j] = (uint8_t)(i + j);
+        }
+    }
+
+    STM_ASSERT_OK(stm_btnode_internal_encode(
+        pivots, NP,
+        children, (size_t)(NP + 1) * STM_BTNODE_CHILD_BPTR_SIZE,
+        0, 0, buf, STM_BTNODE_SIZE));
+    STM_ASSERT_OK(stm_btnode_verify(buf, STM_BTNODE_SIZE));
+
+    internal_ctx ctx = {
+        .expected_pivots    = pivots,
+        .n_expected_pivots  = NP,
+        .expected_children  = children,
+        .n_pivots_seen      = 0,
+        .n_children_seen    = 0,
+        .ok                 = true,
+    };
+    STM_ASSERT_OK(stm_btnode_internal_decode(buf, STM_BTNODE_SIZE, NULL,
+                                               pivot_collect_cb,
+                                               child_collect_cb,
+                                               &ctx));
+    STM_ASSERT_EQ(ctx.n_pivots_seen,   NP);
+    STM_ASSERT_EQ(ctx.n_children_seen, NP + 1u);
+    STM_ASSERT_TRUE(ctx.ok);
+
+    free(buf); free(pivots); free(pivot_keys); free(children);
+    #undef NP
+}
+
+STM_TEST(btnode_internal_wrong_kind_rejected) {
+    uint8_t *buf = malloc(STM_BTNODE_SIZE);
+    STM_ASSERT(buf != NULL);
+    if (!buf) return;
+
+    /* Encode as leaf, then try to decode as internal. */
+    STM_ASSERT_OK(stm_btnode_leaf_encode(NULL, 0, 0, 0, buf, STM_BTNODE_SIZE));
+    STM_ASSERT_ERR(stm_btnode_internal_decode(buf, STM_BTNODE_SIZE, NULL,
+                                                NULL, NULL, NULL),
+                   STM_EINVAL);
+
+    /* Reverse: encode as internal, decode as leaf. */
+    uint8_t child[STM_BTNODE_CHILD_BPTR_SIZE] = { 0 };
+    STM_ASSERT_OK(stm_btnode_internal_encode(NULL, 0, child, sizeof child,
+                                               0, 0, buf, STM_BTNODE_SIZE));
+    STM_ASSERT_ERR(stm_btnode_leaf_decode(buf, STM_BTNODE_SIZE, NULL,
+                                            collect_cb, NULL),
+                   STM_EINVAL);
+
+    free(buf);
+}
+
+STM_TEST(btnode_internal_encoded_bytes_helper) {
+    /* 3 pivots of lengths 1, 2, 3 + 4 children. */
+    stm_btnode_pivot pivots[3] = {
+        { "a",   1 },
+        { "bb",  2 },
+        { "ccc", 3 },
+    };
+    /* payload = (4+1) + (4+2) + (4+3) + 4*64 = 5+6+7+256 = 274. */
+    size_t n = stm_btnode_internal_encoded_bytes(pivots, 3);
+    STM_ASSERT_EQ(n, (size_t)274);
+
+    /* Zero pivots: 1 child * 64 = 64. */
+    STM_ASSERT_EQ(stm_btnode_internal_encoded_bytes(NULL, 0), (size_t)64);
+}
+
 STM_TEST_MAIN("btnode")

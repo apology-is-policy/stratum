@@ -1,5 +1,6 @@
 add_library(stm_btnode STATIC
-    leaf.c)
+    leaf.c
+    internal.c)
 
 target_include_directories(stm_btnode PUBLIC
     ${CMAKE_SOURCE_DIR}/include)

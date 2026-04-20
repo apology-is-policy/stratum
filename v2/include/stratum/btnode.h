@@ -215,6 +215,92 @@ stm_status stm_btnode_leaf_decode(
 size_t stm_btnode_leaf_encoded_bytes(
     const stm_btnode_entry *entries, uint32_t n_entries);
 
+/* ========================================================================= */
+/* Internal (branch) node encode / decode (chunk 5b).                         */
+/* ========================================================================= */
+
+/*
+ * Internal nodes route lookups to children. An internal with N pivots
+ * has N+1 children; pivot[i] is the smallest key reachable through
+ * children[i+1]. Pivots are sorted ascending lex, same comparison as
+ * leaves.
+ *
+ * Payload layout (packed, no inter-slot padding):
+ *
+ *   [pivot 0: le32 key_len | key bytes]
+ *   [pivot 1: le32 key_len | key bytes]
+ *   ...
+ *   [pivot N-1]
+ *   [child 0: 64 byte bptr opaque blob]
+ *   [child 1: 64 byte bptr opaque blob]
+ *   ...
+ *   [child N: 64 byte bptr opaque blob]
+ *
+ * Message-buffer serialization is deferred: callers must drain pending
+ * messages to leaves before serializing (quiescent state). Chunk 5c's
+ * serializer will call the tree layer's flush-all before encoding.
+ *
+ * The 64-byte child blobs are opaque to this module — stm_btree layer
+ * fills them in with encoded stm_bptr bytes. Decoding gives the bytes
+ * back to the caller who knows how to reinterpret.
+ */
+
+/* One child bptr's worth of opaque bytes. Matches stm_bptr size in
+ * super.h but kept here as a value to avoid pulling super.h into
+ * btnode.h. */
+#define STM_BTNODE_CHILD_BPTR_SIZE    64u
+
+typedef struct {
+    const void *key;
+    size_t      key_len;
+} stm_btnode_pivot;
+
+/*
+ * Encode an internal node. Caller supplies N pivots (must be sorted
+ * ascending) and a flat array of (N+1) × 64 child bptr bytes. A tree
+ * with an internal node and no children is not representable (N=0 is
+ * allowed and produces a node with exactly one child and zero pivots —
+ * degenerate but valid; useful during single-child-promotion).
+ *
+ * Returns STM_ERANGE if the encoding exceeds STM_BTNODE_PAYLOAD_MAX.
+ */
+STM_MUST_USE
+stm_status stm_btnode_internal_encode(
+    const stm_btnode_pivot *pivots, uint32_t n_pivots,
+    const uint8_t *children, size_t children_len,
+    uint64_t gen, uint64_t tree_id,
+    void *buf, size_t buf_size);
+
+typedef int (*stm_btnode_pivot_cb)(const void *key, size_t key_len,
+                                     uint32_t pivot_index, void *ctx);
+typedef int (*stm_btnode_child_cb)(const uint8_t bptr[STM_BTNODE_CHILD_BPTR_SIZE],
+                                     uint32_t child_index, void *ctx);
+
+/*
+ * Decode an internal node. Validates csum + kind. Invokes `pivot_cb`
+ * for each of the N pivots in order, then `child_cb` for each of the
+ * N+1 children in order. Either callback may be NULL to skip that
+ * phase. Return nonzero from either callback to stop; the decode then
+ * returns STM_OK immediately.
+ *
+ * Returns STM_EINVAL if the node's kind is not INTERNAL, STM_ECORRUPT
+ * on csum / boundary violations.
+ */
+STM_MUST_USE
+stm_status stm_btnode_internal_decode(
+    const void *buf, size_t buf_size,
+    stm_btnode_info *out_info,
+    stm_btnode_pivot_cb pivot_cb,
+    stm_btnode_child_cb child_cb,
+    void *ctx);
+
+/*
+ * Predict the encoded size of an internal node with the given pivots
+ * + N+1 children.
+ */
+size_t stm_btnode_internal_encoded_bytes(
+    const stm_btnode_pivot *pivots, uint32_t n_pivots);
+
 #ifdef __cplusplus
 }
 #endif
