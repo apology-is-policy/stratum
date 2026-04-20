@@ -249,6 +249,11 @@ stm_status stm_btree_lf_force_consolidate(stm_btree_lf *t, stm_ebr_thread *ebr);
  * pointer — caller provides a registered handle. */
 uint32_t stm_btree_lf_chain_depth(const stm_btree_lf *t, stm_ebr_thread *ebr);
 
+/* Observability (tests): number of leaves currently reachable from the
+ * root's BASE_INTERNAL. After a MERGE succeeds, this count decreases by
+ * one. Returns 0 if root is not an internal node. Pins EBR. */
+uint32_t stm_btree_lf_leaf_count(const stm_btree_lf *t, stm_ebr_thread *ebr);
+
 #ifdef __cplusplus
 }
 #endif

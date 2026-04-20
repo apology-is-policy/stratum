@@ -374,6 +374,180 @@ STM_TEST(btree_lf_split_then_delete_upper) {
     stm_btree_lf_free(t);
 }
 
+/* MERGE: after a split, delete all keys on the upper (freshly created)
+ * sibling. force_consolidate should absorb the upper sibling back into
+ * its left neighbor — leaf_count drops from 2 to 1 and the upper
+ * pivot is gone. Spec: v2/specs/merge.tla. */
+STM_TEST(btree_lf_merge_rightmost_after_split) {
+    stm_btree_lf *t = make_tree(4);
+    stm_ebr_thread *ebr = stm_ebr_register();
+
+    /* Insert 5 keys at target=4 → forces exactly one split. mid=5/2=2,
+     * so lower holds {0,1}, upper holds {2,3,4}. */
+    enum { N = 5 };
+    for (int i = 0; i < N; i++) {
+        char kbuf[8];
+        int kl = snprintf(kbuf, sizeof kbuf, "k%04d", i);
+        int v = i;
+        STM_ASSERT_OK(stm_btree_lf_insert(t, ebr, kbuf, (size_t)kl,
+                                           &v, sizeof v));
+    }
+    STM_ASSERT_OK(stm_btree_lf_force_consolidate(t, ebr));
+
+    uint32_t pre_leaves = stm_btree_lf_leaf_count(t, ebr);
+    STM_ASSERT_EQ(pre_leaves, 2);
+
+    /* Delete every key in the upper half (the fresh sibling — no
+     * preserved SPLITs, merge-eligible). */
+    for (int i = 2; i < N; i++) {
+        char kbuf[8];
+        int kl = snprintf(kbuf, sizeof kbuf, "k%04d", i);
+        STM_ASSERT_OK(stm_btree_lf_delete(t, ebr, kbuf, (size_t)kl));
+    }
+    STM_ASSERT_OK(stm_btree_lf_force_consolidate(t, ebr));
+
+    uint32_t post_leaves = stm_btree_lf_leaf_count(t, ebr);
+    stm_test_info("merge: %u → %u leaves after deleting upper half",
+                  pre_leaves, post_leaves);
+    STM_ASSERT_EQ(post_leaves, 1);
+
+    /* Lower-half keys still resolve correctly. */
+    for (int i = 0; i < 2; i++) {
+        char kbuf[8];
+        int kl = snprintf(kbuf, sizeof kbuf, "k%04d", i);
+        int got = 0;
+        size_t vl = 0;
+        STM_ASSERT_OK(stm_btree_lf_lookup(t, ebr, kbuf, (size_t)kl,
+                                           &got, sizeof got, &vl));
+        STM_ASSERT_EQ(got, i);
+    }
+    /* Upper-half keys are gone — fresh walks route to the leftmost
+     * leaf via the updated pivots and find nothing. */
+    for (int i = 2; i < N; i++) {
+        char kbuf[8];
+        int kl = snprintf(kbuf, sizeof kbuf, "k%04d", i);
+        size_t vl = 0;
+        STM_ASSERT_ERR(stm_btree_lf_lookup(t, ebr, kbuf, (size_t)kl,
+                                            NULL, 0, &vl), STM_ENOENT);
+    }
+
+    stm_ebr_thread_free(ebr);
+    stm_btree_lf_free(t);
+}
+
+/* MERGE bulk: insert many keys (producing many splits), delete all,
+ * force_consolidate repeatedly. Leaves whose BASE is empty AND who
+ * carry no preserved SPLITs (MVP eligibility) should be reabsorbed —
+ * leaf_count should STRICTLY decrease. Leaves with preserved SPLITs
+ * (lower halves of earlier splits) aren't mergeable in this MVP and
+ * persist with empty BASEs. */
+STM_TEST(btree_lf_merge_bulk_delete) {
+    stm_btree_lf *t = make_tree(4);
+    stm_ebr_thread *ebr = stm_ebr_register();
+
+    enum { N = 64 };
+    for (int i = 0; i < N; i++) {
+        char kbuf[8];
+        int kl = snprintf(kbuf, sizeof kbuf, "k%04d", i);
+        int v = i;
+        STM_ASSERT_OK(stm_btree_lf_insert(t, ebr, kbuf, (size_t)kl,
+                                           &v, sizeof v));
+    }
+    STM_ASSERT_OK(stm_btree_lf_force_consolidate(t, ebr));
+
+    uint32_t pre_leaves = stm_btree_lf_leaf_count(t, ebr);
+    stm_test_info("bulk merge: pre-delete leaves = %u", pre_leaves);
+    STM_ASSERT(pre_leaves > 1);
+
+    for (int i = 0; i < N; i++) {
+        char kbuf[8];
+        int kl = snprintf(kbuf, sizeof kbuf, "k%04d", i);
+        STM_ASSERT_OK(stm_btree_lf_delete(t, ebr, kbuf, (size_t)kl));
+    }
+    for (int iter = 0; iter < 8; iter++) {
+        STM_ASSERT_OK(stm_btree_lf_force_consolidate(t, ebr));
+    }
+
+    uint32_t post_leaves = stm_btree_lf_leaf_count(t, ebr);
+    stm_test_info("bulk merge: post-delete leaves = %u (from %u)",
+                  post_leaves, pre_leaves);
+    STM_ASSERT(post_leaves < pre_leaves);
+
+    /* Every key absent. */
+    for (int i = 0; i < N; i++) {
+        char kbuf[8];
+        int kl = snprintf(kbuf, sizeof kbuf, "k%04d", i);
+        size_t vl = 0;
+        STM_ASSERT_ERR(stm_btree_lf_lookup(t, ebr, kbuf, (size_t)kl,
+                                            NULL, 0, &vl), STM_ENOENT);
+    }
+
+    stm_ebr_thread_free(ebr);
+    stm_btree_lf_free(t);
+}
+
+/* MERGE then re-insert: after a leaf is merged away, inserting keys
+ * that would have lived there should route correctly to the absorbing
+ * sibling. Verifies the post-merge routing is coherent (parent's
+ * pivot array correctly reflects the merged range). */
+STM_TEST(btree_lf_merge_then_reinsert) {
+    stm_btree_lf *t = make_tree(4);
+    stm_ebr_thread *ebr = stm_ebr_register();
+
+    /* Grow and split, then delete the upper half. */
+    enum { N = 5 };
+    for (int i = 0; i < N; i++) {
+        char kbuf[8];
+        int kl = snprintf(kbuf, sizeof kbuf, "k%04d", i);
+        int v = i;
+        STM_ASSERT_OK(stm_btree_lf_insert(t, ebr, kbuf, (size_t)kl,
+                                           &v, sizeof v));
+    }
+    STM_ASSERT_OK(stm_btree_lf_force_consolidate(t, ebr));
+    for (int i = 2; i < N; i++) {
+        char kbuf[8];
+        int kl = snprintf(kbuf, sizeof kbuf, "k%04d", i);
+        STM_ASSERT_OK(stm_btree_lf_delete(t, ebr, kbuf, (size_t)kl));
+    }
+    STM_ASSERT_OK(stm_btree_lf_force_consolidate(t, ebr));
+    STM_ASSERT_EQ(stm_btree_lf_leaf_count(t, ebr), 1);
+
+    /* Re-insert into the formerly-upper range. Writes should route to
+     * the leftmost leaf (the absorbing sibling). */
+    for (int i = 2; i < N; i++) {
+        char kbuf[8];
+        int kl = snprintf(kbuf, sizeof kbuf, "k%04d", i);
+        int v = 1000 + i;
+        STM_ASSERT_OK(stm_btree_lf_insert(t, ebr, kbuf, (size_t)kl,
+                                           &v, sizeof v));
+    }
+    STM_ASSERT_OK(stm_btree_lf_force_consolidate(t, ebr));
+
+    /* Lower half still there with original values. */
+    for (int i = 0; i < 2; i++) {
+        char kbuf[8];
+        int kl = snprintf(kbuf, sizeof kbuf, "k%04d", i);
+        int got = 0;
+        size_t vl = 0;
+        STM_ASSERT_OK(stm_btree_lf_lookup(t, ebr, kbuf, (size_t)kl,
+                                           &got, sizeof got, &vl));
+        STM_ASSERT_EQ(got, i);
+    }
+    /* Reinserted upper range has new values. */
+    for (int i = 2; i < N; i++) {
+        char kbuf[8];
+        int kl = snprintf(kbuf, sizeof kbuf, "k%04d", i);
+        int got = 0;
+        size_t vl = 0;
+        STM_ASSERT_OK(stm_btree_lf_lookup(t, ebr, kbuf, (size_t)kl,
+                                           &got, sizeof got, &vl));
+        STM_ASSERT_EQ(got, 1000 + i);
+    }
+
+    stm_ebr_thread_free(ebr);
+    stm_btree_lf_free(t);
+}
+
 /* Interleave deletes and re-inserts. Consolidation must apply them in
  * order to produce the right final state. */
 STM_TEST(btree_lf_delete_reinsert_sequence) {

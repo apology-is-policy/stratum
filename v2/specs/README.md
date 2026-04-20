@@ -15,6 +15,7 @@ is exercised by TLC in CI.
 | `quorum.tla`     | multi-device commit   | stub    | P5    | §5.6            |
 | `structural.tla` | split atomicity + cascade | landed | P2 | §3.5         |
 | `balanced.tla`   | parent-pivot update   | landed  | P2    | §3.5            |
+| `merge.tla`      | empty-leaf reabsorb   | landed  | P2    | §3.5            |
 | `namespace.tla`  | per-conn isolation    | stub    | P8    | §8.8            |
 
 ## Running TLC locally

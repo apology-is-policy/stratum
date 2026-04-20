@@ -167,6 +167,12 @@ typedef enum {
     STM_BT_LF_DELTA_BASE          = 3,  /* BASE_LEAF */
     STM_BT_LF_DELTA_SPLIT         = 4,
     STM_BT_LF_DELTA_BASE_INTERNAL = 5,
+    /* Terminal marker on a leaf's slot after MERGE: the leaf has been
+     * reabsorbed into forward_id. Readers arriving here follow the
+     * forward; writers retraverse from root. Once installed, the SEAL
+     * head is never replaced — the slot becomes permanently forwarded.
+     * Spec: v2/specs/merge.tla. */
+    STM_BT_LF_DELTA_SEALED        = 6,
 } stm_bt_lf_delta_kind;
 
 /* (sep_key, right_child) pivot in a BASE_INTERNAL. Sorted ascending
@@ -204,6 +210,7 @@ struct stm_bt_lf_delta {
         struct { uint8_t *sep_key; uint32_t sep_key_len;
                  uint64_t sibling_id; } split;
         struct { stm_bt_lf_internal *internal; } base_internal;
+        struct { uint64_t forward_id; } sealed;
     } u;
 };
 
@@ -308,6 +315,45 @@ oom:
     return NULL;
 }
 
+/* Build a new internal with the pivot at `drop_idx` removed. leftmost_child
+ * is preserved; the pivot at drop_idx's right_child is effectively merged
+ * INTO the child at drop_idx-1 (or leftmost_child if drop_idx==0), since
+ * the routing range formerly covered by the dropped pivot now extends the
+ * neighboring child's range rightward.
+ *
+ * Caller must ensure drop_idx < old->npivots. Deep-copies all retained
+ * sep_keys; on OOM returns NULL and leaves old untouched. */
+static stm_bt_lf_internal *
+internal_clone_without_pivot(const stm_bt_lf_internal *old, uint32_t drop_idx)
+{
+    if (drop_idx >= old->npivots) return NULL;
+
+    stm_bt_lf_internal *neu = calloc(1, sizeof *neu);
+    if (!neu) return NULL;
+    neu->leftmost_child = old->leftmost_child;
+    neu->npivots = old->npivots - 1;
+    neu->pivots  = neu->npivots
+        ? calloc(neu->npivots, sizeof *neu->pivots)
+        : NULL;
+    if (neu->npivots > 0 && !neu->pivots) { free(neu); return NULL; }
+
+    uint32_t j = 0;
+    for (uint32_t i = 0; i < old->npivots; i++) {
+        if (i == drop_idx) continue;
+        uint8_t *nk = stm_bt_dup_bytes(old->pivots[i].sep_key,
+                                         old->pivots[i].sep_key_len);
+        if (!nk && old->pivots[i].sep_key_len > 0) {
+            internal_free(neu);
+            return NULL;
+        }
+        neu->pivots[j].sep_key     = nk;
+        neu->pivots[j].sep_key_len = old->pivots[i].sep_key_len;
+        neu->pivots[j].right_child = old->pivots[i].right_child;
+        j++;
+    }
+    return neu;
+}
+
 /* Route a key through an internal node: return the child_id to recurse
  * into. Linear scan — pivot arrays stay small in this MVP. */
 static uint64_t internal_route(const stm_bt_lf_internal *i,
@@ -350,6 +396,9 @@ static void delta_destroy(void *p)
         break;
     case STM_BT_LF_DELTA_BASE_INTERNAL:
         internal_free(d->u.base_internal.internal);
+        break;
+    case STM_BT_LF_DELTA_SEALED:
+        /* No heap-owned state — forward_id is scalar. */
         break;
     }
     free(d);
@@ -411,6 +460,18 @@ static stm_bt_lf_delta *alloc_delete_delta(const void *key, size_t key_len)
     if (!k && key_len > 0) { free(d); return NULL; }
     d->u.del.key     = k;
     d->u.del.key_len = (uint32_t)key_len;
+    return d;
+}
+
+/* Build a SEAL delta for MERGE. No owned heap data. */
+static stm_bt_lf_delta *alloc_sealed_delta(uint64_t forward_id)
+{
+    stm_bt_lf_delta *d = calloc(1, sizeof *d);
+    if (!d) return NULL;
+    d->kind = STM_BT_LF_DELTA_SEALED;
+    atomic_init(&d->next, NULL);
+    atomic_init(&d->chain_depth, 0u);
+    d->u.sealed.forward_id = forward_id;
     return d;
 }
 
@@ -578,6 +639,14 @@ static stm_status resolve_leaf_chain(stm_bt_lf_delta *head,
     *out_redirect = STM_BT_LF_NO_REDIRECT;
     *out_base     = NULL;
 
+    /* SEAL head: defensive forward. Callers (lookup, traverse) should
+     * intercept SEAL before calling this, but treat it correctly if it
+     * slips through. */
+    if (head && head->kind == STM_BT_LF_DELTA_SEALED) {
+        *out_redirect = head->u.sealed.forward_id;
+        return STM_OK;
+    }
+
     uint64_t candidate_sibling = 0;
     bool     has_candidate     = false;
 
@@ -627,6 +696,10 @@ static stm_status resolve_leaf_chain(stm_bt_lf_delta *head,
         case STM_BT_LF_DELTA_BASE_INTERNAL:
             /* A leaf chain should never contain BASE_INTERNAL. */
             return STM_ECORRUPT;
+        case STM_BT_LF_DELTA_SEALED:
+            /* SEAL only valid at head; intercepted above. Mid-chain
+             * SEAL is a corruption signal. */
+            return STM_ECORRUPT;
         }
     }
 
@@ -671,6 +744,16 @@ stm_status stm_btree_lf_lookup(const stm_btree_lf *t, stm_ebr_thread *ebr,
         if (head->kind == STM_BT_LF_DELTA_BASE_INTERNAL) {
             nid = internal_route(head->u.base_internal.internal,
                                   key, key_len);
+            continue;
+        }
+
+        /* SEAL'd leaf: the leaf has been merged away. Follow the
+         * forward to the sibling that absorbed its range. Only reachable
+         * by stale-pivot readers whose parent snapshot predates the
+         * UpdateParent of the MERGE protocol; fresh readers don't route
+         * here because parent no longer has this leaf's pivot. */
+        if (head->kind == STM_BT_LF_DELTA_SEALED) {
+            nid = head->u.sealed.forward_id;
             continue;
         }
 
@@ -911,6 +994,10 @@ static stm_bt_node *build_consolidated_leaf(stm_bt_lf_delta *head,
         }
         case STM_BT_LF_DELTA_BASE:
         case STM_BT_LF_DELTA_BASE_INTERNAL:
+        case STM_BT_LF_DELTA_SEALED:
+            /* SEAL should be intercepted before consolidation (the
+             * slot's head is checked in consolidate_or_split). Seeing
+             * one here is a corruption signal. */
             preserved_splits_free(out);
             stm_bt_node_free(new_leaf);
             return NULL;
@@ -1244,6 +1331,243 @@ static uint64_t find_parent(stm_btree_lf *t, uint64_t leaf_nid)
     return root_id;
 }
 
+/* Find the index k such that internal->pivots[k].right_child == child_nid.
+ * Returns k on success, -1 if child_nid is the leftmost_child (leftmost
+ * merges are unsupported in this MVP) or not found. */
+static int32_t find_pivot_index(const stm_bt_lf_internal *internal,
+                                  uint64_t child_nid)
+{
+    if (internal->leftmost_child == child_nid) return -1;
+    for (uint32_t k = 0; k < internal->npivots; k++) {
+        if (internal->pivots[k].right_child == child_nid) return (int32_t)k;
+    }
+    return -1;
+}
+
+/* Rebuild L's slot head without its SPLIT(*, r_nid) entry. When R was
+ * carved out of L by an earlier split, L's chain acquired a SPLIT that
+ * redirects k >= sep to R. Merging R back into L without dropping that
+ * SPLIT would create a bounce: reader arrives at L, sees SPLIT, goes to
+ * R, finds SEAL, forwards back to L, re-sees SPLIT, loops.
+ *
+ * This is step 0 of the MERGE protocol (a precondition that merge.tla's
+ * three-step spec implicitly assumes — its scenario models L1 as
+ * [BASE_LEAF(L1_initial)] with no SPLIT).
+ *
+ * Consolidates L's chain (extracting BASE + preserved SPLITs), drops the
+ * preserved SPLIT pointing at r_nid, rebuilds the chain, and CASes L's
+ * slot. On CAS failure from a racing writer, retries; on exhaustion
+ * returns OK (the merge attempt will skip this round). Caller holds
+ * t->consolidating so no other structural op races.
+ */
+static stm_status purge_split_on_l(stm_btree_lf *t, uint64_t l_nid,
+                                     uint64_t r_nid)
+{
+    for (uint32_t attempt = 0; attempt < STM_BT_LF_CONSOLIDATE_RETRIES; attempt++) {
+        stm_bt_lf_delta *old_head = atomic_load(&t->pt->slots[l_nid]);
+        if (!old_head) return STM_ECORRUPT;
+        if (old_head->kind == STM_BT_LF_DELTA_BASE_INTERNAL ||
+            old_head->kind == STM_BT_LF_DELTA_SEALED) return STM_OK;
+
+        stm_bt_lf_preserved_splits preserved = { .n = 0 };
+        stm_bt_node *new_base =
+            build_consolidated_leaf(old_head, t->opts, &preserved);
+        if (!new_base) return STM_ENOMEM;
+
+        /* L overflowing during a merge of R is unusual — defer merge. */
+        if (new_base->nentries > t->opts.target_entries) {
+            stm_bt_node_free(new_base);
+            preserved_splits_free(&preserved);
+            return STM_OK;
+        }
+
+        /* Drop any SPLIT whose sibling is r_nid. In practice there is
+         * exactly one (from when R was split off L), but be permissive. */
+        bool removed = false;
+        for (uint32_t i = 0; i < preserved.n; ) {
+            if (preserved.splits[i].sibling_id == r_nid) {
+                free(preserved.splits[i].sep_key);
+                memmove(&preserved.splits[i], &preserved.splits[i + 1],
+                        (preserved.n - i - 1) * sizeof preserved.splits[0]);
+                preserved.n--;
+                removed = true;
+            } else {
+                i++;
+            }
+        }
+
+        if (!removed) {
+            /* L already carries no SPLIT(*, R). Maybe a previous purge
+             * succeeded but SealR aborted; retry paths land here. No-op
+             * and let the caller proceed. */
+            stm_bt_node_free(new_base);
+            preserved_splits_free(&preserved);
+            return STM_OK;
+        }
+
+        stm_bt_lf_delta *new_head = build_leaf_chain(new_base, &preserved);
+        if (!new_head) {
+            stm_bt_node_free(new_base);
+            preserved_splits_free(&preserved);
+            return STM_ENOMEM;
+        }
+
+        if (atomic_compare_exchange_strong(&t->pt->slots[l_nid],
+                                            &old_head, new_head)) {
+            retire_chain(old_head);
+            return STM_OK;
+        }
+        /* Concurrent writer prepended; free new_head (walk + destroy)
+         * and retry with fresh old_head. */
+        stm_bt_lf_delta *cur = new_head;
+        while (cur) {
+            stm_bt_lf_delta *nx = atomic_load_explicit(&cur->next,
+                                                         memory_order_relaxed);
+            delta_destroy(cur);
+            cur = nx;
+        }
+    }
+    return STM_OK;
+}
+
+/* Implements the four-step MERGE protocol. merge.tla models steps 1-3
+ * (SealR, UpdateParent, RetireR); step 0 (PurgeSplitOnL) is a
+ * precondition establishing the spec's scenario (L without SPLIT to R).
+ *
+ *   0. PurgeSplitOnL — CAS L's slot to a chain without SPLIT(*, R).
+ *                      Prevents reader/writer bounce between L and
+ *                      SEAL(forward=L).
+ *   1. SealR        — CAS R's slot from expected_head to SEAL(forward).
+ *   2. UpdateParent — CAS parent's BASE_INTERNAL to drop pivot at
+ *                     `pivot_index`. Serialized by t->consolidating.
+ *   3. RetireR      — EBR-retire expected_head (R's pre-SEAL chain).
+ *                     SEAL itself persists in R's slot (no slot
+ *                     reclamation in this MVP; matches burned-ID
+ *                     policy in phase2-status.md).
+ *
+ * Caller must hold t->consolidating. expected_head must be a
+ * BASE_LEAF with zero entries and no SPLIT deltas above it
+ * (eligibility checked by try_merge).
+ *
+ * Failure modes:
+ *   - PurgeSplitOnL returns ENOMEM: propagate; merge deferred.
+ *   - SealR CAS fails (writer raced an INSERT into the "empty" leaf):
+ *     abort, leaf reverts to its correct non-empty state. L's purge
+ *     has already landed but is harmless (just one fewer redundant
+ *     redirect).
+ *   - UpdateParent CAS fails: shouldn't happen under t->consolidating;
+ *     defensive accept — SEAL on R still forwards correctly so
+ *     readers remain correct. Pivot leak (minor, bounded by merge
+ *     count in this MVP).
+ */
+static stm_status commit_merge(stm_btree_lf *t, uint64_t r_nid,
+                                 uint64_t parent_nid,
+                                 stm_bt_lf_delta *expected_head,
+                                 uint32_t pivot_index)
+{
+    stm_bt_lf_delta *parent_head = atomic_load(&t->pt->slots[parent_nid]);
+    if (!parent_head || parent_head->kind != STM_BT_LF_DELTA_BASE_INTERNAL)
+        return STM_ECORRUPT;
+    const stm_bt_lf_internal *cur = parent_head->u.base_internal.internal;
+    if (pivot_index >= cur->npivots) return STM_ECORRUPT;
+    if (cur->pivots[pivot_index].right_child != r_nid) return STM_ECORRUPT;
+
+    /* Forward target: left neighbor in the pivot array. */
+    uint64_t forward_id = (pivot_index == 0)
+        ? cur->leftmost_child
+        : cur->pivots[pivot_index - 1].right_child;
+
+    /* Build the post-merge parent internal (drops pivot_index). */
+    stm_bt_lf_internal *new_internal =
+        internal_clone_without_pivot(cur, pivot_index);
+    if (!new_internal) return STM_ENOMEM;
+
+    stm_bt_lf_delta *new_parent_delta = alloc_internal_delta(new_internal);
+    if (!new_parent_delta) {
+        internal_free(new_internal);
+        return STM_ENOMEM;
+    }
+
+    /* Build SEAL delta. */
+    stm_bt_lf_delta *sealed = alloc_sealed_delta(forward_id);
+    if (!sealed) {
+        delta_destroy(new_parent_delta);
+        return STM_ENOMEM;
+    }
+
+    /* Step 0 — PurgeSplitOnL. Remove the stale SPLIT on L's chain
+     * that points back to R. Without this, readers arriving at L via
+     * SEAL(forward=L) would re-redirect to R and bounce. See the
+     * purge_split_on_l header for the reasoning. */
+    stm_status purge_rc = purge_split_on_l(t, forward_id, r_nid);
+    if (purge_rc != STM_OK) {
+        delta_destroy(sealed);
+        delta_destroy(new_parent_delta);
+        return purge_rc;
+    }
+
+    /* Step 1 — SealR. CAS expects exactly expected_head; if a writer
+     * prepended an INSERT/DELETE since consolidation, CAS fails and we
+     * abort the merge. Under t->consolidating the consolidator is the
+     * only structural-op thread, but writer INSERTs/DELETEs on a
+     * pre-merge empty leaf can still race the SEAL CAS. */
+    if (!atomic_compare_exchange_strong(&t->pt->slots[r_nid],
+                                         &expected_head, sealed)) {
+        delta_destroy(sealed);
+        delta_destroy(new_parent_delta);
+        return STM_OK;   /* merge abandoned; leaf is fine as-is.
+                          * L's purge has landed and is harmless. */
+    }
+
+    /* Step 2 — UpdateParent. */
+    if (!atomic_compare_exchange_strong(&t->pt->slots[parent_nid],
+                                         &parent_head, new_parent_delta)) {
+        /* Shouldn't happen: parent is only mutated under
+         * t->consolidating (which we hold) and the rwlock variant
+         * lives on a separate tree. Accept the pivot leak: SEAL on R
+         * still forwards correctly, readers remain correct. */
+        delta_destroy(new_parent_delta);
+        retire_chain(expected_head);
+        return STM_OK;
+    }
+
+    /* Step 3 — EBR-retire R's old chain and the old parent head. SEAL
+     * stays at R's slot indefinitely so stale-pivot readers can still
+     * forward. */
+    retire_chain(expected_head);
+    retire_chain(parent_head);
+    return STM_OK;
+}
+
+/* Merge eligibility + dispatch helper.
+ *
+ * Eligibility (MVP):
+ *   - R's current slot head is `expected_head` of kind BASE_LEAF with
+ *     zero entries.
+ *   - No SPLIT or INSERT/DELETE deltas above the BASE (caller ensures
+ *     by passing a freshly-consolidated head).
+ *   - R has a parent (not root itself).
+ *   - R is not the leftmost child of its parent (leftmost-merge would
+ *     require a different forward direction and isn't modeled by
+ *     merge.tla).
+ */
+static stm_status try_merge(stm_btree_lf *t, uint64_t r_nid,
+                              stm_bt_lf_delta *expected_head)
+{
+    uint64_t parent_nid = find_parent(t, r_nid);
+    if (parent_nid == STM_BT_LF_NO_REDIRECT) return STM_OK;
+
+    stm_bt_lf_delta *parent_head = atomic_load(&t->pt->slots[parent_nid]);
+    if (!parent_head || parent_head->kind != STM_BT_LF_DELTA_BASE_INTERNAL)
+        return STM_OK;
+
+    int32_t idx = find_pivot_index(parent_head->u.base_internal.internal,
+                                     r_nid);
+    if (idx < 0) return STM_OK;    /* leftmost or unreachable — skip */
+
+    return commit_merge(t, r_nid, parent_nid, expected_head, (uint32_t)idx);
+}
+
 /* One-shot consolidation attempt for a leaf at `nid`. Either flattens
  * the chain via CAS of a fresh [preserved SPLITs..., BASE] head, or
  * transitions into a split if the consolidated base overflows.
@@ -1256,12 +1580,25 @@ static stm_status consolidate_or_split(stm_btree_lf *t, uint64_t nid,
         if (!old_head) return STM_OK;
         /* Root (internal) has no deltas; skip. */
         if (old_head->kind == STM_BT_LF_DELTA_BASE_INTERNAL) return STM_OK;
+        /* Already merged — nothing to do. */
+        if (old_head->kind == STM_BT_LF_DELTA_SEALED) return STM_OK;
 
         uint32_t depth = atomic_load_explicit(&old_head->chain_depth,
                                                memory_order_relaxed);
         if (!bypass_threshold && depth < STM_BT_LF_CONSOLIDATE_THRESHOLD)
             return STM_OK;
-        if (bypass_threshold && depth == 0) return STM_OK;
+
+        /* Merge fast-path: if bypass and the chain is already a lone
+         * empty BASE_LEAF (depth 0, nentries 0, no SPLITs), try to
+         * reabsorb this leaf into its left neighbor. consolidate_or_split
+         * would otherwise bail here without doing anything. */
+        if (bypass_threshold && depth == 0) {
+            if (old_head->kind == STM_BT_LF_DELTA_BASE &&
+                old_head->u.base.node->nentries == 0) {
+                return try_merge(t, nid, old_head);
+            }
+            return STM_OK;
+        }
 
         stm_bt_lf_preserved_splits preserved = { .n = 0 };
         stm_bt_node *new_base_node = build_consolidated_leaf(old_head, t->opts,
@@ -1297,6 +1634,16 @@ static stm_status consolidate_or_split(stm_btree_lf *t, uint64_t nid,
         if (atomic_compare_exchange_strong(&t->pt->slots[nid],
                                             &old_head, new_head)) {
             retire_chain(old_head);
+            /* Post-consolidation merge check: if the new base is empty
+             * AND there are no preserved SPLITs above it (i.e., the
+             * chain is a lone BASE_LEAF(empty)), reabsorb this leaf
+             * into its left neighbor. new_head is still the current
+             * slot head (writers may prepend concurrently; commit_merge
+             * CAS will re-check). */
+            if (new_base_node->nentries == 0 &&
+                new_head->kind == STM_BT_LF_DELTA_BASE) {
+                return try_merge(t, nid, new_head);
+            }
             return STM_OK;
         }
         /* Prepender beat us. Free the new head (walk and destroy) and
@@ -1435,6 +1782,16 @@ static stm_status traverse_and_prepend(stm_btree_lf *t,
             if (head->kind == STM_BT_LF_DELTA_BASE_INTERNAL) {
                 nid = internal_route(head->u.base_internal.internal,
                                       key, key_len);
+                continue;
+            }
+
+            /* SEAL'd leaf: forward to the absorbing sibling and keep
+             * walking. Writers with stale parent pivots may arrive here;
+             * they continue to the forward target rather than retraverse
+             * from root (retraversal is also correct but risks a retry
+             * loop if parent's UpdateParent is still pending). */
+            if (head->kind == STM_BT_LF_DELTA_SEALED) {
+                nid = head->u.sealed.forward_id;
                 continue;
             }
 
@@ -1585,4 +1942,18 @@ uint32_t stm_btree_lf_chain_depth(const stm_btree_lf *t, stm_ebr_thread *ebr)
     }
     stm_ebr_exit(ebr);
     return max_depth;
+}
+
+uint32_t stm_btree_lf_leaf_count(const stm_btree_lf *t, stm_ebr_thread *ebr)
+{
+    if (!t || !ebr) return 0;
+    stm_ebr_enter(ebr);
+    uint64_t root_id = atomic_load(&t->root_id);
+    stm_bt_lf_delta *root_head = atomic_load(&t->pt->slots[root_id]);
+    uint32_t count = 0;
+    if (root_head && root_head->kind == STM_BT_LF_DELTA_BASE_INTERNAL) {
+        count = root_head->u.base_internal.internal->npivots + 1u;
+    }
+    stm_ebr_exit(ebr);
+    return count;
 }
