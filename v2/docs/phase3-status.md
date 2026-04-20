@@ -1,13 +1,13 @@
 # Phase 3 — status and next-session guide
 
 Authoritative pickup guide for Phase 3 (persistence + allocator). Last
-update 2026-04-20 (after chunk 4b-2 / stm_alloc landed). Companion
-to `phase2-status.md`, which remains the reference for the Bw-tree
-layer Phase 3 builds on.
+update 2026-04-20 (after chunk 5 / node serialization + allocator
+persistence landed). Companion to `phase2-status.md`, which remains
+the reference for the Bw-tree layer Phase 3 builds on.
 
 ## TL;DR
 
-Phase 3 is in progress. Six chunks landed:
+Phase 3 is in progress. Ten chunks landed:
 
 | Commit | What | Tests |
 |---|---|---|
@@ -16,33 +16,35 @@ Phase 3 is in progress. Six chunks landed:
 | `cf52a1f` | `allocator.tla` spec: refcount + deferred-free safety. TLC clean (3729 states, depth 16) | — |
 | `37a3be7` → `dd86a63` | **Chunk 4a + R7a**: bootstrap-pool allocator (bitmap-managed, ping-pong hdr+bm slots, PENDING deferred-free matching `allocator.tla`'s Commit rule). R7a closed (0 P0 / 2 P1 / 3 P2 / 3-of-6 P3). | 18 bootstrap tests |
 | `3d9bcd0` | **Chunk 4b-1**: rename bootstrap module (stm_alloc → stm_bootstrap) to free the `stm_alloc` name for the main allocator. Pure mechanical refactor. | 18 bootstrap tests |
-| `6651830` | **Chunk 4b-2**: `stm_alloc` top-level allocator. Wraps `stm_bootstrap` + `stm_btree_mt`; data-area tree keyed by BE-packed u64 start_block, value {le32 length_blocks; le32 refcount}. Reserve/free/ref/commit match `allocator.tla` semantics. **Data-area tree is in-RAM** — node persistence + bootstrap-backed node placement deferred to chunk 5. | 14 alloc tests |
+| `6651830` → `14afe3c` | **Chunk 4b-2 + R7b**: `stm_alloc` top-level allocator. Wraps `stm_bootstrap` + `stm_btree_mt`; data-area tree keyed by BE-packed u64 start_block, value {le32 length_blocks; le32 refcount}. R7b closed (0 P0 / 3 P1 / 3 P2 / 6-of-7 P3). | 15 alloc tests |
+| `bd52837` | **Chunk 5a**: `stm_btnode` leaf node codec. Fixed 128 KiB layout: header (128 B) + packed entries + BLAKE3-256 csum. | 13 btnode-leaf tests |
+| `1aae3f2` | **Chunk 5b**: `stm_btnode` internal node codec. Pivots + N+1 child bptrs (64 B each). Message buffer deferred. | +7 btnode-internal tests |
+| `0d99eb5` | **Chunk 5c**: `stm_btree_store` serialize/deserialize + free_tree via an I/O vtable. Two-level depth cap; snapshot-style rewrite-on-commit. | 5 btree_store tests |
+| `033bb3f` | **Chunk 5d**: `stm_alloc` integration — tree now persists across mount. Bootstrap header gains 256-byte `h_user_data` slot holding the tree root paddr. | +3 alloc persistence tests |
 
 Phase 2 is complete (SPLIT + MERGE + per-node consolidator + SCAN + R0-R6
 audits). Phase 3 chunks remaining:
 
 1. **Allocator implementation** — 4a (bootstrap pool) + 4b (data-area
-   tree, in-RAM) landed. Remaining sub-chunks:
-   - **Chunk 5** (formerly "node serialization"): on-disk Bε-tree node
-     encode/decode with Merkle-hash field + BLAKE3 csum. Once this
-     lands, chunk 5 also wires the `reserve_for_node` callback so
-     allocator-tree NODES live in the bootstrap pool per ARCH §6.5.
-     Unblocks persistent data-area allocator state across mount.
+   tree) + 5 (node serialization + persistence) all landed. Remaining
+   sub-chunks:
    - **Chunk 4c**: SDArray in-RAM bitmap for O(1) allocation queries.
    - **Chunk 4d**: xor filter for negative lookups.
    - **Chunk 4e**: R7 full-stack audit (after 4c+4d).
 2. **Four-phase commit implementation** — wire the protocol sync.tla
-   abstracts. Uberblock ring rotation + fsync discipline.
+   abstracts. Uberblock ring rotation + fsync discipline. Moves the
+   allocator-tree root from the bootstrap user_data slot into the
+   uberblock's `ub_alloc_root` bptr.
 3. **Mount / unmount integration** — put labels + commit + allocator
-   together; single-device round-trip. Data-area tree persistence
-   goes live here (depends on chunk 5).
+   together; single-device round-trip. Data-area tree already
+   persists (chunk 5); what's missing is uberblock-rooted access.
 4. **Crash-injection fuzzer** — Phase 3 exit criterion. Inject partial
    writes at every commit phase; verify mount recovers to a
    consistent state.
 5. **R7 audit** — adversarial soundness pass per CLAUDE.md before
-   Phase 3 exit. R7a (bootstrap-only scope) closed with chunk 4a;
-   R7b (stm_alloc scope) runs with chunk 4b; full R7 at the end of
-   allocator work.
+   Phase 3 exit. R7a (bootstrap) + R7b (alloc 4b) + R7c (chunk 5
+   serialization) all closed as they landed; full R7 at end of 4c/4d
+   for the in-RAM acceleration structures.
 
 ## You have autonomy
 
@@ -122,80 +124,67 @@ Expected TLC results:
 - `merge.tla` — empty-leaf reabsorb. 65536 states, depth 18.
 - `allocator.tla` — refcount + deferred-free. 3729 states, depth 16.
 
-## Next chunk — Bε-tree node serialization (chunk 5)
+## Next chunk — four-phase commit protocol (chunk 6)
 
-Chunk 4a + 4b landed across `37a3be7` / `dd86a63` (bootstrap pool +
-R7a audit) and `3d9bcd0` / `6651830` (rename + stm_alloc data-area
-tree). Everything is in-RAM from a tree perspective. The bootstrap
-pool IS durable (it has its own format; survives mount/unmount);
-the data-area tree is NOT.
+All allocator chunks (4a + 4b + 5) have landed. The data-area tree
+now persists across mount. What's still required before Phase 3 can
+exit:
 
-**Chunk 4a + 4b: LANDED (2026-04-20).** Bootstrap pool + stm_alloc
-with reserve/free/ref/commit. R7a closed; R7b runs with chunk 4b.
+### Chunk 6 (next): four-phase commit implementation.
 
-### Chunk 5 (next): Bε-tree node serialization.
+Wire the `sync.tla` protocol: uberblock ring rotation, fsync
+discipline, and (critically) moving the allocator-tree root from the
+bootstrap header's user_data slot into the uberblock's
+`ub_alloc_root` bptr (ARCH §5.4). Scope sketch:
 
-This is the work that makes the data-area allocator tree durable and
-wires the `reserve_for_node` callback so allocator-tree NODES live in
-the bootstrap pool (ARCH §6.5) rather than malloc.
+- **Implement the four phases** from `sync.tla`:
+  1. Quiesce in-flight writers (commit-window close).
+  2. Drain + flush modified tree nodes (already handled by chunk 5's
+     serialize).
+  3. Write new uberblock (containing `ub_alloc_root` = new allocator
+     tree root) to the next ring slot + fsync.
+  4. Advance the pool's durable-gen + publish (the mount-time
+     authoritative pick).
+- **`MountGenBump`**: mount reads the highest-gen uberblock and
+  bumps `fs->gen` past it (§7.4 nonce uniqueness). Today
+  `stm_sb_mount_scan` selects the authoritative uberblock but
+  doesn't implement the bump — chunk 6 wires it.
+- **Interim → durable**: `h_user_data` in the bootstrap header
+  continues to exist but `ub_alloc_root` becomes authoritative once
+  chunk 6 lands. A one-commit migration writes ub_alloc_root
+  matching user_data during the first post-chunk-6 commit.
 
-Scope:
-- **On-disk node format** (ARCH §3, §5.4 bptr):
-  - Leaf node: header + packed entries + BLAKE3-256 csum + (future)
-    Merkle hash field. Size: one or more multiples of 128 KiB
-    (STM_BOOTSTRAP_UNIT_BLOCKS × 4 KiB).
-  - Internal node: header + pivot bptrs + csum.
-  - Encode/decode honoring le* endianness convention.
-- **Node-placement callback** wired through stm_btree or a thin
-  "persistent btree" wrapper. Interface sketch:
-
-    typedef struct {
-        stm_status (*reserve)(void *ctx, uint64_t nblocks,
-                              uint64_t hint, uint64_t *out_paddr);
-        stm_status (*free)   (void *ctx, uint64_t paddr,
-                              uint64_t free_gen);
-        stm_status (*read)   (void *ctx, uint64_t paddr,
-                              void *buf, size_t len);
-        stm_status (*write)  (void *ctx, uint64_t paddr,
-                              const void *buf, size_t len);
-    } stm_btree_store_vtable;
-
-  stm_alloc provides an impl that routes reserve/free to
-  stm_bootstrap_reserve/free and read/write to the bdev.
-- **stm_alloc_open reads allocator-tree root from the uberblock.**
-  Currently a no-op; becomes a real walk after chunk 5 + the
-  four-phase commit protocol wires the allocator root into the
-  uberblock's `ub_alloc_root` bptr.
-
-Don't confuse the scope: chunk 5 is STRICTLY the btree
-serialization layer + allocator wiring. Four-phase commit (which
-touches uberblock ring rotation) is a separate chunk. Mount/unmount
-integration (which reads `ub_alloc_root` and reconstructs the tree)
-comes after both.
+### Chunk 7 (after 6): mount / unmount integration.
+- `stm_fs_open` / `stm_fs_mount` / `stm_fs_unmount` end-to-end: read
+  labels → pick uberblock → load allocator from ub_alloc_root →
+  serve user ops → on close, a final commit.
+- Single-device round-trip as the first milestone.
 
 ### Chunk 4c: In-RAM succinct bitmap (SDArray).
 - Performance structure. `src/alloc/sdarray.c`. Approximate
   "is block X allocated" in O(1). Reduces tree walks.
-- Target: ~20 MiB RAM per TiB of data. Revisit if initial
-  straight-bitmap impl already lands within the Phase 3 exit
-  budget (25 MiB/TiB per roadmap §6.2).
+- Target: ~20 MiB RAM per TiB of data.
 
 ### Chunk 4d: xor filter for negative lookups.
 - 9 bits per allocated range, <1% false-positive rate. Fast
   "is this paddr in any live range?"
 
 ### Chunk 4e: R7 full-stack audit.
-- Per CLAUDE.md policy: changes to sync / allocator / crypto /
-  tree-write paths trigger a focused soundness audit before merge.
-- Prompt template is in the R5/R6 audit spawns in git history
-  (commits `83f4710` → `a1299fb` → `8941a2a`). Include R0-R7b
-  closed list as the do-not-report preamble.
+- Closes the allocator subsystem's audit rounds after the in-RAM
+  acceleration structures are in place.
+
+### Chunk 8: Crash-injection fuzzer (Phase 3 exit criterion).
+- Inject partial writes at every commit phase; verify mount
+  recovers to a consistent state.
 
 ### MVP restrictions carrying forward:
 - Single-block bootstrap bitmap → bootstrap pool capped at 4 GiB.
 - Single-device: paddrs return device = 0. The allocator-roots
   object (per §6.3.2) will add device indirection once we move to
   multi-device.
+- Two-level allocator-tree depth cap from chunk 5c.
+- Snapshot-style tree serialization (every commit rewrites every
+  node) — incremental is a post-Phase-3 optimization.
 
 ## Trip hazards carried in from phases 1 and 2
 
