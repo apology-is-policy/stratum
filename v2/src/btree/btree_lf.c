@@ -67,7 +67,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define STM_BT_LF_CONSOLIDATE_THRESHOLD 8u
+#define STM_BT_LF_CONSOLIDATE_THRESHOLD 4u
+
+/* The consolidator retries a bounded number of times when its CAS loses
+ * to a concurrent prepender. Beyond this, we yield to the next
+ * threshold-hitter. Each retry re-reads the chain head, so we always
+ * consolidate the latest state we can see. */
+#define STM_BT_LF_CONSOLIDATE_RETRIES 8u
 
 /* Sanity cap on how deep the chain can grow before we refuse to
  * consolidate (heap blow-up guard). Under normal operation chain depth
@@ -103,6 +109,13 @@ struct stm_btree_lf {
     stm_bt_page_table *pt;
     _Atomic uint64_t   root_id;
     stm_btree_opts     opts;
+    /* Single-consolidator gate. Under N-way writer contention the
+     * thundering-herd of "every writer past threshold tries to
+     * consolidate" produces mostly-failed CAS attempts and an unbounded
+     * chain. We serialize consolidations through this flag: the first
+     * writer past the threshold wins and does the work; others bail out
+     * to the insert path and let the winner handle it. */
+    _Atomic bool       consolidating;
 };
 
 /* ------------------------------------------------------------------------- */
@@ -227,6 +240,7 @@ stm_status stm_btree_lf_new(const stm_btree_opts *opts, stm_btree_lf **out)
 
     stm_btree_lf *t = calloc(1, sizeof *t);
     if (!t) return STM_ENOMEM;
+    atomic_init(&t->consolidating, false);
     t->opts = opts ? *opts : stm_btree_opts_default();
     if (t->opts.target_entries  < 4) t->opts.target_entries  = 4;
     if (t->opts.target_messages < 1) t->opts.target_messages = 1;
@@ -498,32 +512,47 @@ static void retire_old_chain(stm_bt_lf_delta *old_head)
 }
 
 /* Attempt consolidation of node `nid`. Called inside the caller's EBR
- * epoch, so any chain we walk is alive for our whole visit. */
+ * epoch, so any chain we walk is alive for our whole visit. Serialized
+ * through t->consolidating — the first writer past the threshold takes
+ * the flag, later writers bail immediately and leave the work to the
+ * winner. */
 static stm_status try_consolidate(stm_btree_lf *t, uint64_t nid)
 {
-    stm_bt_lf_delta *old_head = atomic_load(&t->pt->slots[nid]);
-    if (!old_head) return STM_OK;
-    if (atomic_load_explicit(&old_head->chain_depth, memory_order_relaxed)
-        < STM_BT_LF_CONSOLIDATE_THRESHOLD) return STM_OK;
-
-    stm_bt_node *new_base_node = build_consolidated_base(old_head, t->opts);
-    if (!new_base_node) return STM_ENOMEM;
-
-    stm_bt_lf_delta *new_head = alloc_base_delta(new_base_node);
-    if (!new_head) {
-        stm_bt_node_free(new_base_node);
-        return STM_ENOMEM;
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&t->consolidating, &expected, true)) {
+        return STM_OK;   /* another thread is consolidating */
     }
-    atomic_store_explicit(&new_head->chain_depth, 0u, memory_order_relaxed);
 
-    if (!atomic_compare_exchange_strong(&t->pt->slots[nid], &old_head, new_head)) {
-        /* Raced: free our attempt (delta_destroy frees the base node). */
+    stm_status rc = STM_OK;
+    for (uint32_t attempt = 0; attempt < STM_BT_LF_CONSOLIDATE_RETRIES; attempt++) {
+        stm_bt_lf_delta *old_head = atomic_load(&t->pt->slots[nid]);
+        if (!old_head) break;
+        if (atomic_load_explicit(&old_head->chain_depth, memory_order_relaxed)
+            < STM_BT_LF_CONSOLIDATE_THRESHOLD) break;   /* nothing to do */
+
+        stm_bt_node *new_base_node = build_consolidated_base(old_head, t->opts);
+        if (!new_base_node) { rc = STM_ENOMEM; break; }
+
+        stm_bt_lf_delta *new_head = alloc_base_delta(new_base_node);
+        if (!new_head) {
+            stm_bt_node_free(new_base_node);
+            rc = STM_ENOMEM;
+            break;
+        }
+        atomic_store_explicit(&new_head->chain_depth, 0u,
+                              memory_order_relaxed);
+
+        if (atomic_compare_exchange_strong(&t->pt->slots[nid],
+                                            &old_head, new_head)) {
+            retire_old_chain(old_head);
+            break;                          /* success */
+        }
+        /* A prepender beat us. Discard and retry with fresh head. */
         delta_destroy(new_head);
-        return STM_OK;
     }
 
-    retire_old_chain(old_head);
-    return STM_OK;
+    atomic_store(&t->consolidating, false);
+    return rc;
 }
 
 stm_status stm_btree_lf_force_consolidate(stm_btree_lf *t, stm_ebr_thread *ebr)

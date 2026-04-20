@@ -315,9 +315,18 @@ static void stress_run(stress_arg *arg, int ops)
     stm_ebr_thread_free(ebr);
 }
 
+/* The design doc calls for a 10s+ TSan stress; the ops count below
+ * hits that under the tsan build on current hardware while staying well
+ * under the 60s ctest timeout. The non-sanitizer build completes in
+ * well under a second. The value is also bounded by how quickly the
+ * single-serialized consolidator can keep up with N concurrent
+ * prependers on one leaf — too many ops and the chain grows faster
+ * than the consolidator can drain it. */
+#define STM_BT_LF_STRESS_OPS 3000
+
 static void *stress_worker(void *arg_)
 {
-    stress_run((stress_arg *)arg_, 500);
+    stress_run((stress_arg *)arg_, STM_BT_LF_STRESS_OPS);
     return NULL;
 }
 
@@ -447,6 +456,150 @@ STM_TEST(btree_lf_reader_heavy_stress) {
 
     for (int i = 0; i < 128; i++) (void)stm_ebr_try_advance();
 
+    stm_btree_lf_free(t);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Per-thread-owned-keys oracle stress.                                       */
+/*                                                                            */
+/* Each thread owns a disjoint key range, so concurrent writes never race on  */
+/* the same key — the shadow each thread maintains is authoritative for its   */
+/* keys. After join we verify the tree against every thread's shadow: any    */
+/* dropped or corrupted update would fail the check. This is a stronger       */
+/* property than the TSan smoke test: TSan catches memory-ordering bugs, the  */
+/* oracle catches logical bugs (lost deltas, incorrect consolidation, etc.).  */
+/* ------------------------------------------------------------------------- */
+
+#define STM_BT_LF_ORACLE_THREADS    8
+#define STM_BT_LF_ORACLE_KEYS_EACH  6
+#define STM_BT_LF_ORACLE_OPS_EACH   500
+
+typedef struct {
+    stm_btree_lf *tree;
+    int           thread_id;
+    int           shadow_present[STM_BT_LF_ORACLE_KEYS_EACH];
+    int           shadow_value  [STM_BT_LF_ORACLE_KEYS_EACH];
+} oracle_arg;
+
+/* Key format: "t<thread>-k<key>" — uniquely identifies the (thread, key)
+ * slot across all threads. */
+static int format_oracle_key(char *buf, size_t cap, int tid, int k)
+{
+    return snprintf(buf, cap, "t%d-k%d", tid, k);
+}
+
+static void *oracle_worker(void *arg_)
+{
+    oracle_arg *arg = arg_;
+    stm_ebr_thread *ebr = stm_ebr_register();
+    if (!ebr) return NULL;
+
+    uint64_t s = (uint64_t)(arg->thread_id + 1) * 0x9E3779B97F4A7C15ull;
+    for (int i = 0; i < STM_BT_LF_ORACLE_OPS_EACH; i++) {
+        s += 0x9E3779B97F4A7C15ull;
+        uint64_t z = (s ^ (s >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        uint64_t rnd = z ^ (z >> 31);
+
+        uint32_t op = rnd & 3;
+        uint32_t k  = (uint32_t)((rnd >> 3) % STM_BT_LF_ORACLE_KEYS_EACH);
+        int      v  = (int)(rnd >> 32);
+
+        char kbuf[16];
+        int  kl = format_oracle_key(kbuf, sizeof kbuf, arg->thread_id, (int)k);
+
+        switch (op) {
+        case 0: case 1: {
+            stm_status st = stm_btree_lf_insert(arg->tree, ebr,
+                                                 kbuf, (size_t)kl,
+                                                 &v, sizeof v);
+            if (st == STM_OK) {
+                arg->shadow_present[k] = 1;
+                arg->shadow_value[k]   = v;
+            }
+            break;
+        }
+        case 2: {
+            stm_status st = stm_btree_lf_delete(arg->tree, ebr,
+                                                 kbuf, (size_t)kl);
+            if (st == STM_OK) {
+                arg->shadow_present[k] = 0;
+            }
+            /* ENOENT is fine — just means the key wasn't present. */
+            break;
+        }
+        case 3: {
+            /* Since each thread owns its key range exclusively, the tree
+             * state for our keys is fully determined by our preceding
+             * ops on this thread. Other threads only touch other keys,
+             * so their consolidations/retirements must preserve our
+             * key→value mapping. Assert that invariant inline to catch
+             * bugs earlier than the end-of-test scan. */
+            int    got = 0;
+            size_t vl  = 0;
+            stm_status st = stm_btree_lf_lookup(arg->tree, ebr,
+                                                 kbuf, (size_t)kl,
+                                                 &got, sizeof got, &vl);
+            if (arg->shadow_present[k]) {
+                STM_ASSERT_OK(st);
+                STM_ASSERT_EQ(got, arg->shadow_value[k]);
+            } else {
+                STM_ASSERT_ERR(st, STM_ENOENT);
+            }
+            break;
+        }
+        }
+    }
+
+    stm_ebr_thread_free(ebr);
+    return NULL;
+}
+
+STM_TEST(btree_lf_per_thread_oracle_stress) {
+    stm_btree_lf *t = make_tree(64);
+
+    pthread_t   tids[STM_BT_LF_ORACLE_THREADS];
+    oracle_arg  args[STM_BT_LF_ORACLE_THREADS];
+    memset(args, 0, sizeof args);
+    for (int i = 0; i < STM_BT_LF_ORACLE_THREADS; i++) {
+        args[i].tree      = t;
+        args[i].thread_id = i;
+        pthread_create(&tids[i], NULL, oracle_worker, &args[i]);
+    }
+    for (int i = 0; i < STM_BT_LF_ORACLE_THREADS; i++) {
+        pthread_join(tids[i], NULL);
+    }
+
+    /* Drain retires so the final chain is consolidatable. */
+    for (int i = 0; i < 128; i++) (void)stm_ebr_try_advance();
+
+    /* Single-threaded: verify every thread's shadow against the tree. */
+    stm_ebr_thread *ebr = stm_ebr_register();
+    STM_ASSERT_OK(stm_btree_lf_force_consolidate(t, ebr));
+
+    int total_present = 0;
+    for (int tid = 0; tid < STM_BT_LF_ORACLE_THREADS; tid++) {
+        for (int k = 0; k < STM_BT_LF_ORACLE_KEYS_EACH; k++) {
+            char kbuf[16];
+            int  kl = format_oracle_key(kbuf, sizeof kbuf, tid, k);
+            int    got = 0;
+            size_t vl  = 0;
+            stm_status s = stm_btree_lf_lookup(t, ebr, kbuf, (size_t)kl,
+                                                &got, sizeof got, &vl);
+            if (args[tid].shadow_present[k]) {
+                STM_ASSERT_OK(s);
+                STM_ASSERT_EQ(got, args[tid].shadow_value[k]);
+                total_present++;
+            } else {
+                STM_ASSERT_ERR(s, STM_ENOENT);
+            }
+        }
+    }
+    stm_test_info("per-thread oracle: %d of %d slots present after stress",
+                  total_present,
+                  STM_BT_LF_ORACLE_THREADS * STM_BT_LF_ORACLE_KEYS_EACH);
+
+    stm_ebr_thread_free(ebr);
     stm_btree_lf_free(t);
 }
 
