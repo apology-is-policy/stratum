@@ -170,10 +170,10 @@ static stm_alloc *alloc_new(stm_bdev *d,
         return NULL;
     }
 
-    /* Tree options: generous target_entries because allocator entries
-     * are tiny (8 bytes of value + 8-byte key = 16 bytes; a 128 KiB
-     * node can hold ~5000 entries per ARCH §6.3.1). For chunk 4b MVP
-     * we use stm_btree_mt's default opts which give reasonable defaults. */
+    /* Chunk 4b MVP uses stm_btree_mt's default opts. Production sizing
+     * (ARCH §6.3.1 targets ~5000 entries per 128 KiB node) will be set
+     * by chunk 5 once the on-disk node format exists and node sizes
+     * are meaningful. */
     stm_btree_opts opts = stm_btree_opts_default();
     stm_btree_mt *tree = NULL;
     if (stm_btree_mt_new(&opts, &tree) != STM_OK) {
@@ -287,17 +287,23 @@ typedef struct {
     uint64_t cursor;
     uint64_t data_last;     /* inclusive */
     uint64_t hint_start;    /* 0 if none */
-    bool     hint_taken;
     bool     found;
     uint64_t found_start;
+    bool     saw_bad_entry; /* R7b P1-3: malformed tree entry observed */
 } reserve_ctx;
 
 static int reserve_scan_cb(const void *key, size_t key_len,
                             const void *value, size_t value_len,
                             void *ctx_)
 {
-    if (key_len != 8 || value_len != 8) return 1;
     reserve_ctx *ctx = ctx_;
+    if (key_len != 8 || value_len != 8) {
+        /* R7b P1-3: record the corruption AND abort so the outer
+         * stm_alloc_reserve refuses to allocate (not relying on a
+         * stale cursor from pre-malformed entries). */
+        ctx->saw_bad_entry = true;
+        return 1;
+    }
 
     uint64_t start = decode_key(key);
     uint32_t length = 0, refcount = 0;
@@ -305,10 +311,14 @@ static int reserve_scan_cb(const void *key, size_t key_len,
     (void)refcount;   /* PENDING (refcount=0) entries still occupy space */
 
     /* If there's a hint and it lies in the gap [cursor, start), and
-     * the gap is big enough, honor it. */
-    if (!ctx->hint_taken && ctx->hint_start != 0 &&
+     * the gap is big enough, honor it. Overflow-safe form:
+     *   hint_start ∈ [cursor, start)
+     *   start - hint_start >= nblocks  (distinct subtraction — safe
+     *                                    because hint_start < start) */
+    if (ctx->hint_start != 0 &&
         ctx->hint_start >= ctx->cursor &&
-        ctx->hint_start + ctx->nblocks <= start) {
+        ctx->hint_start < start &&
+        start - ctx->hint_start >= ctx->nblocks) {
         ctx->found = true;
         ctx->found_start = ctx->hint_start;
         return 1;
@@ -331,6 +341,11 @@ stm_status stm_alloc_reserve(stm_alloc *a, uint64_t nblocks,
 {
     if (!a || !out_paddr) return STM_EINVAL;
     if (nblocks == 0) return STM_EINVAL;
+    /* R7b P1-1: tree entry's length_blocks is le32. Reject u64 inputs
+     * that would silently truncate to u32 and produce length=0 entries
+     * (which don't advance the scan cursor → subsequent reserves
+     * overlap). */
+    if (nblocks > UINT32_MAX) return STM_ERANGE;
 
     pthread_mutex_lock(&a->lock);
 
@@ -343,13 +358,13 @@ stm_status stm_alloc_reserve(stm_alloc *a, uint64_t nblocks,
     }
 
     reserve_ctx ctx = {
-        .nblocks     = nblocks,
-        .cursor      = a->data_first_block,
-        .data_last   = a->data_last_block,
-        .hint_start  = hint_start,
-        .hint_taken  = false,
-        .found       = false,
-        .found_start = 0,
+        .nblocks       = nblocks,
+        .cursor        = a->data_first_block,
+        .data_last     = a->data_last_block,
+        .hint_start    = hint_start,
+        .found         = false,
+        .found_start   = 0,
+        .saw_bad_entry = false,
     };
 
     stm_status s = stm_btree_mt_scan(a->tree, NULL, 0, NULL, 0,
@@ -358,16 +373,23 @@ stm_status stm_alloc_reserve(stm_alloc *a, uint64_t nblocks,
         pthread_mutex_unlock(&a->lock);
         return s;
     }
+    if (ctx.saw_bad_entry) {
+        pthread_mutex_unlock(&a->lock);
+        return STM_ECORRUPT;
+    }
 
     /* If the scan didn't find a gap, check the tail region
-     * [cursor, data_last + 1). */
+     * [cursor, data_last + 1). Arithmetic is overflow-safe because
+     * cursor ≤ data_last is checked first. */
     if (!ctx.found) {
         if (ctx.cursor <= ctx.data_last &&
             ctx.data_last - ctx.cursor + 1 >= nblocks) {
-            /* Honor hint if it falls in the tail. */
+            /* Honor hint if it falls in the tail with room for the run.
+             * hint_start ∈ [cursor, data_last - nblocks + 1]. */
             if (hint_start != 0 &&
                 hint_start >= ctx.cursor &&
-                hint_start + nblocks - 1 <= ctx.data_last) {
+                hint_start <= ctx.data_last &&
+                ctx.data_last - hint_start + 1 >= nblocks) {
                 ctx.found = true;
                 ctx.found_start = hint_start;
             } else {
@@ -382,10 +404,31 @@ stm_status stm_alloc_reserve(stm_alloc *a, uint64_t nblocks,
         return STM_ENOSPC;
     }
 
-    /* Insert new entry. */
+    /* Encode key first. R7b P2-1: the gap-finder promised a free slot
+     * at ctx.found_start. Defense-in-depth: verify no entry exists at
+     * that key before the upsert-style insert overwrites it. */
     uint8_t key_buf[8];
-    uint8_t val_buf[8];
+    uint8_t probe_buf[8];
+    size_t  probe_len = 0;
     encode_key(ctx.found_start, key_buf);
+
+    s = stm_btree_mt_lookup(a->tree, key_buf, 8,
+                             probe_buf, sizeof probe_buf, &probe_len);
+    if (s == STM_OK) {
+        /* Gap-finder produced a slot that already has an entry.
+         * Not a recoverable state — surface as corruption. */
+        pthread_mutex_unlock(&a->lock);
+        return STM_ECORRUPT;
+    }
+    if (s != STM_ENOENT) {
+        /* Any error other than "key absent" is a real I/O / format
+         * error; surface it. */
+        pthread_mutex_unlock(&a->lock);
+        return s;
+    }
+
+    /* Safe to insert. */
+    uint8_t val_buf[8];
     encode_val((uint32_t)nblocks, 1u, val_buf);
 
     s = stm_btree_mt_insert(a->tree, key_buf, 8, val_buf, 8);
@@ -420,7 +463,10 @@ stm_status stm_alloc_free(stm_alloc *a, uint64_t paddr, uint64_t free_gen)
                                         val_buf, sizeof val_buf, &val_len);
     if (s != STM_OK) {
         pthread_mutex_unlock(&a->lock);
-        return s;
+        /* R7b P3-3: btree returned STM_ERANGE only if the stored value
+         * exceeded our 8-byte buffer — impossible for well-formed
+         * allocator entries. Surface as corruption. */
+        return s == STM_ERANGE ? STM_ECORRUPT : s;
     }
     if (val_len != 8) {
         pthread_mutex_unlock(&a->lock);
@@ -436,28 +482,34 @@ stm_status stm_alloc_free(stm_alloc *a, uint64_t paddr, uint64_t free_gen)
     }
 
     uint32_t new_refcount = refcount - 1;
+
+    /* R7b P1-2: pre-allocate the PENDING entry BEFORE mutating the
+     * tree so an OOM doesn't wedge the range at refcount=0 with no
+     * sweeper to reclaim it. On tree-insert failure we free the
+     * pre-allocated entry; on OOM we abort before any mutation. */
+    pending_entry *new_entry = NULL;
+    if (new_refcount == 0) {
+        new_entry = calloc(1, sizeof *new_entry);
+        if (!new_entry) {
+            pthread_mutex_unlock(&a->lock);
+            return STM_ENOMEM;
+        }
+    }
+
     encode_val(length, new_refcount, val_buf);
     s = stm_btree_mt_insert(a->tree, key_buf, 8, val_buf, 8);
     if (s != STM_OK) {
+        free(new_entry);
         pthread_mutex_unlock(&a->lock);
         return s;
     }
 
     if (new_refcount == 0) {
-        pending_entry *e = calloc(1, sizeof *e);
-        if (!e) {
-            /* OOM after a successful tree update leaves the entry at
-             * refcount=0 with no PENDING marker. The range is wedged
-             * (won't reallocate; won't ever sweep). Surface the error
-             * so the caller knows. */
-            pthread_mutex_unlock(&a->lock);
-            return STM_ENOMEM;
-        }
-        e->start_block   = start_block;
-        e->length_blocks = length;
-        e->free_gen      = free_gen;
-        e->next          = a->pending_head;
-        a->pending_head  = e;
+        new_entry->start_block   = start_block;
+        new_entry->length_blocks = length;
+        new_entry->free_gen      = free_gen;
+        new_entry->next          = a->pending_head;
+        a->pending_head          = new_entry;
         a->pending_count++;
         a->pending_blocks += length;
     }
@@ -483,7 +535,7 @@ stm_status stm_alloc_ref(stm_alloc *a, uint64_t paddr)
                                         val_buf, sizeof val_buf, &val_len);
     if (s != STM_OK) {
         pthread_mutex_unlock(&a->lock);
-        return s;
+        return s == STM_ERANGE ? STM_ECORRUPT : s;   /* R7b P3-3 */
     }
     if (val_len != 8) {
         pthread_mutex_unlock(&a->lock);
@@ -497,9 +549,10 @@ stm_status stm_alloc_ref(stm_alloc *a, uint64_t paddr)
         pthread_mutex_unlock(&a->lock);
         return STM_EINVAL;
     }
-    if (refcount == UINT32_MAX) {
-        /* Saturate rather than overflow (ARCH §6.4.2 reserves the
-         * sentinel for practical pools). */
+    /* R7b P2-3: saturate at UINT32_MAX - 1 so UINT32_MAX stays free
+     * for the ARCH §6.4.2 sentinel. Inputs at or above the penultimate
+     * value refuse the Ref rather than encoding the sentinel. */
+    if (refcount >= UINT32_MAX - 1u) {
         pthread_mutex_unlock(&a->lock);
         return STM_ERANGE;
     }
@@ -561,14 +614,20 @@ typedef struct {
     uint64_t pending_blocks;
     uint64_t n_allocated;
     uint64_t n_pending;
+    bool     saw_bad_entry;   /* R7b P2-2 */
 } stats_ctx;
 
 static int stats_scan_cb(const void *key, size_t key_len,
                           const void *value, size_t value_len, void *ctx_)
 {
-    (void)key; (void)key_len;
-    if (value_len != 8) return 0;
     stats_ctx *ctx = ctx_;
+    if (key_len != 8 || value_len != 8) {
+        /* R7b P2-2: don't silently skip. A malformed entry could hide
+         * blocks from `data_free_blocks` and let a reserve overlap it. */
+        ctx->saw_bad_entry = true;
+        return 1;
+    }
+    (void)key;
     uint32_t length = 0, refcount = 0;
     decode_val(value, &length, &refcount);
     if (refcount > 0) {
@@ -596,6 +655,10 @@ stm_status stm_alloc_stats_get(const stm_alloc *a, stm_alloc_stats *out)
     if (s != STM_OK) {
         pthread_mutex_unlock(&ma->lock);
         return s;
+    }
+    if (sc.saw_bad_entry) {
+        pthread_mutex_unlock(&ma->lock);
+        return STM_ECORRUPT;
     }
 
     stm_bootstrap_stats bstats;
@@ -645,7 +708,7 @@ stm_status stm_alloc_lookup(const stm_alloc *a, uint64_t paddr,
                                         val_buf, sizeof val_buf, &val_len);
     if (s != STM_OK) {
         pthread_mutex_unlock(&ma->lock);
-        return s;
+        return s == STM_ERANGE ? STM_ECORRUPT : s;   /* R7b P3-3 */
     }
     if (val_len != 8) {
         pthread_mutex_unlock(&ma->lock);

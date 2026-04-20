@@ -97,15 +97,25 @@ stm_status stm_alloc_create(stm_bdev *d,
                              stm_alloc **out_alloc);
 
 /*
- * Open an existing allocator. Reads the bootstrap pool and, in a future
- * chunk, the persisted allocator-tree root. In chunk 4b the tree is
- * in-RAM so open always produces an empty tree — pre-existing data-area
- * allocations are not observed until chunk 5's node-serialization layer
- * lands.
+ * Open an existing allocator.
+ *
+ * NOTE (chunk 4b): the data-area allocator-tree is in-RAM only in this
+ * chunk. `stm_alloc_open` reads the bootstrap pool (which IS durable —
+ * see stm_bootstrap_open) and initializes an empty tree. Pre-existing
+ * data-area allocations from a prior mount are NOT observed; chunk 5's
+ * node-serialization layer wires the persistent tree root. Callers
+ * relying on "reserve-close-open-still-reserved" semantics in chunk 4b
+ * will silently lose data-area state.
  */
 STM_MUST_USE
 stm_status stm_alloc_open(stm_bdev *d, stm_alloc **out_alloc);
 
+/*
+ * Release the handle and its sub-handles (bootstrap + tree). Callers
+ * must ensure no other thread is using `a` at close time; close does
+ * not self-quiesce and destroys the internal mutex (per POSIX,
+ * destroying a locked mutex is undefined behavior).
+ */
 void stm_alloc_close(stm_alloc *a);
 
 /* ========================================================================= */
@@ -179,10 +189,11 @@ STM_MUST_USE
 stm_status stm_alloc_stats_get(const stm_alloc *a, stm_alloc_stats *out);
 
 /*
- * Query: is a range starting at `paddr` currently allocated (refcount ≥
- * 1)? Returns STM_ENOENT if no entry starts at paddr. On success,
- * `*out_length_blocks` (if non-NULL) gets the range's length and
- * `*out_refcount` (if non-NULL) gets the current refcount.
+ * Query the entry at `paddr`. On success `*out_length_blocks` (if
+ * non-NULL) gets the range's length and `*out_refcount` (if non-NULL)
+ * gets the current refcount. A returned `*out_refcount == 0` means the
+ * entry is PENDING (awaiting commit-sweep); `STM_ENOENT` means no
+ * entry exists at that start_block.
  */
 STM_MUST_USE
 stm_status stm_alloc_lookup(const stm_alloc *a, uint64_t paddr,

@@ -394,6 +394,27 @@ STM_TEST(alloc_reserve_misuse) {
     unlink(g_tmp_path);
 }
 
+STM_TEST(alloc_reserve_rejects_over_u32_r7b_p1_1) {
+    /* R7b P1-1: the tree entry's length_blocks is le32. Reserve must
+     * refuse u64 inputs that would silently truncate and produce
+     * length=0 entries (causing the scan cursor not to advance past
+     * the new allocation). */
+    make_tmp("u32");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    uint64_t p = 0;
+    /* UINT32_MAX fits (nominally). UINT32_MAX + 1 must fail. */
+    STM_ASSERT_ERR(stm_alloc_reserve(a, (uint64_t)UINT32_MAX + 1u, 0, &p),
+                   STM_ERANGE);
+    /* Astronomic request rejected loudly rather than truncating. */
+    STM_ASSERT_ERR(stm_alloc_reserve(a, UINT64_MAX, 0, &p), STM_ERANGE);
+
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
 STM_TEST(alloc_bootstrap_persists_through_open) {
     /* Data-area tree is in-RAM (chunk 4b), but the bootstrap pool
      * persists across close/open (chunk 4a state). Verify
