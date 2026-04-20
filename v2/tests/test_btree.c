@@ -15,7 +15,8 @@ static stm_btree *make_tree(uint32_t target)
     opts.target_entries  = target;
     opts.target_messages = target / 4 > 0 ? target / 4 : 1;
     stm_btree *t = NULL;
-    (void)stm_btree_new(&opts, &t);
+    stm_status s = stm_btree_new(&opts, &t);
+    (void)s;
     return t;
 }
 

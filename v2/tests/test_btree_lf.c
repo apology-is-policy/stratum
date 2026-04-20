@@ -346,7 +346,9 @@ STM_TEST(btree_lf_concurrent_stress) {
     stm_test_info("total ops: %d across %d threads; final chain depth %u",
                   total, NTHREADS, stm_btree_lf_chain_depth(t, ebr));
     size_t vl = 0;
-    (void)stm_btree_lf_lookup(t, ebr, "zzzz_nonexistent", 16, NULL, 0, &vl);
+    stm_status st = stm_btree_lf_lookup(t, ebr, "zzzz_nonexistent", 16,
+                                         NULL, 0, &vl);
+    (void)st;
     stm_ebr_thread_free(ebr);
 
     stm_btree_lf_free(t);
@@ -373,8 +375,9 @@ static void *reader_hot(void *a_)
         char kbuf[8];
         int kl = snprintf(kbuf, sizeof kbuf, "%05u", key_i);
         int out; size_t vl = 0;
-        (void)stm_btree_lf_lookup(a->tree, ebr, kbuf, (size_t)kl,
-                                   &out, sizeof out, &vl);
+        stm_status st = stm_btree_lf_lookup(a->tree, ebr, kbuf, (size_t)kl,
+                                             &out, sizeof out, &vl);
+        (void)st;
     }
 
     stm_ebr_thread_free(ebr);
@@ -394,12 +397,14 @@ static void *writer_hot(void *a_)
         char kbuf[8];
         int kl = snprintf(kbuf, sizeof kbuf, "%05u", key_i);
         int val = (int)(s >> 32);
+        stm_status st;
         if ((s & 0xF) < 4) {
-            (void)stm_btree_lf_delete(a->tree, ebr, kbuf, (size_t)kl);
+            st = stm_btree_lf_delete(a->tree, ebr, kbuf, (size_t)kl);
         } else {
-            (void)stm_btree_lf_insert(a->tree, ebr, kbuf, (size_t)kl,
-                                       &val, sizeof val);
+            st = stm_btree_lf_insert(a->tree, ebr, kbuf, (size_t)kl,
+                                      &val, sizeof val);
         }
+        (void)st;
     }
 
     stm_ebr_thread_free(ebr);

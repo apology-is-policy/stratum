@@ -81,22 +81,24 @@ static void stress_run(stress_arg *arg, int ops)
         int kl = snprintf(kbuf, sizeof kbuf, "%05u", key_i);
         int val = (int)(rnd >> 32);
 
+        stm_status st = STM_OK;
         switch (op) {
         case 0: case 1:   /* insert */
-            (void)stm_btree_mt_insert(arg->tree, kbuf, (size_t)kl,
-                                       &val, sizeof val);
+            st = stm_btree_mt_insert(arg->tree, kbuf, (size_t)kl,
+                                      &val, sizeof val);
             break;
         case 2:           /* delete — may fail with ENOENT, tolerate */
-            (void)stm_btree_mt_delete(arg->tree, kbuf, (size_t)kl);
+            st = stm_btree_mt_delete(arg->tree, kbuf, (size_t)kl);
             break;
         case 3: {         /* lookup */
             int out = 0;
             size_t vl = 0;
-            (void)stm_btree_mt_lookup(arg->tree, kbuf, (size_t)kl,
-                                       &out, sizeof out, &vl);
+            st = stm_btree_mt_lookup(arg->tree, kbuf, (size_t)kl,
+                                      &out, sizeof out, &vl);
             break;
         }
         }
+        (void)st;
         arg->ops_done++;
     }
 }
@@ -127,7 +129,8 @@ STM_TEST(btree_mt_concurrent_stress) {
 
     /* Final sanity: tree is still walkable. */
     size_t vl = 0;
-    (void)stm_btree_mt_lookup(t, "nonexistent", 11, NULL, 0, &vl);
+    stm_status st = stm_btree_mt_lookup(t, "nonexistent", 11, NULL, 0, &vl);
+    (void)st;
 
     stm_btree_mt_free(t);
 }

@@ -116,13 +116,17 @@ STM_TEST(async_many_writes_in_flight) {
                                               bufs[i], 512, many_cb, &s);
         if (ok == STM_EAGAIN) {
             /* Drain some to free slots. */
-            (void)stm_bdev_wait_completion(d, 8);
+            int drained = stm_bdev_wait_completion(d, 8);
+            (void)drained;
             i--; /* retry */
             continue;
         }
         STM_ASSERT_EQ(ok, STM_OK);
     }
-    while (s.hits < N) (void)stm_bdev_wait_completion(d, 16);
+    while (s.hits < N) {
+        int drained = stm_bdev_wait_completion(d, 16);
+        (void)drained;
+    }
     STM_ASSERT_EQ(s.hits, N);
 
     stm_bdev_close(d);
@@ -141,7 +145,10 @@ STM_TEST(async_read_error_propagates) {
     cb_state s = { 0 };
     STM_ASSERT_OK(stm_bdev_submit_read(d, /*offset*/ 1 << 20, buf, sizeof buf,
                                        on_complete, &s));
-    while (s.hits == 0) (void)stm_bdev_wait_completion(d, 4);
+    while (s.hits == 0) {
+        int drained = stm_bdev_wait_completion(d, 4);
+        (void)drained;
+    }
 
     /* Either short read (bytes = 0 on POSIX hole) or explicit error is ok.
      * POSIX backend treats short-read as STM_EIO; io_uring may return 0 bytes
