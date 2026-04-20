@@ -8,14 +8,15 @@ record of the reasoning that led to the current code.
 
 ## TL;DR
 
-The lock-free Bw-tree is a **balanced B+tree with SPLIT and MERGE**:
-root is a BASE_INTERNAL delta with a pivot array; leaves are atomic-
-published BASE_LEAF chains with SPLIT redirects; empty leaves without
-preserved SPLITs are reabsorbed into their left neighbor via the
-SEAL-with-forward MERGE protocol. All five audit rounds R0-R5 are
-closed. 21/21 tests green on default/ASan/TSan. The remaining Phase 2
-open item is the per-node consolidator flag (modest refactor; unblocks
-higher-throughput stress).
+The lock-free Bw-tree is a **balanced B+tree with SPLIT, MERGE, and
+per-node consolidation**: root is a BASE_INTERNAL delta with a pivot
+array; leaves are atomic-published BASE_LEAF chains with SPLIT
+redirects; empty leaves without preserved SPLITs are reabsorbed into
+siblings via the SEAL-with-forward MERGE protocol; chain consolidation
+parallelizes across leaves via per-slot locks, with a tree-wide
+structural lock serializing only commit_split / commit_merge. All six
+audit rounds R0-R6 are closed. 21/21 tests green on default/ASan/TSan.
+Phase 2 deliverables are complete at this tip.
 
 ## What's landed (commits, tests, audits)
 
@@ -45,8 +46,8 @@ off/asan/tsan + TLC per spec, including `merge`) green on tip.
 
 Audit rounds closed: R0 (pre-#171 substrate), R1 (MVP), R2 (SPLIT
 protocol), R3 (chain inheritance), R4 (internal routing in #176),
-**R5 (MERGE)**. Cumulative do-not-report ledger is
-`memory/audit_v2_r0_closed_list.md`.
+R5 (MERGE), **R6 (per-node consolidator + cycle fix)**. Cumulative
+do-not-report ledger is `memory/audit_v2_r0_closed_list.md`.
 
 ## What's left in Phase 2
 

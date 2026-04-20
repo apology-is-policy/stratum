@@ -229,11 +229,22 @@ struct stm_btree_lf {
     _Atomic uint64_t   root_id;
     stm_btree_opts     opts;
     /* Structural-op gate. Held by commit_split and commit_merge for
-     * the duration of their parent-affecting CAS events (and by
-     * commit_merge's step-0 purge on the forward target). Serializes
-     * structural ops tree-wide so parent pivot updates are
-     * linearized. Acquired AFTER slot_consolidating; lock order is
-     * slot → structural. */
+     * the duration of their parent-affecting CAS events (including
+     * commit_merge's step-0 `purge_all_stale_splits` scan).
+     * Serializes structural ops tree-wide so parent pivot updates
+     * are linearized and the parent pivot array is stable during a
+     * purge scan. Acquired AFTER slot_consolidating; lock order is
+     * slot → structural.
+     *
+     * R6 note: purge_split_on_l CASes a sibling leaf's slot WITHOUT
+     * acquiring that sibling's slot_consolidating. This is by
+     * design — acquiring a slot_consolidating while holding
+     * structural_lock would reverse the documented lock order and
+     * deadlock against any consolidator holding its slot lock and
+     * waiting to commit_split/commit_merge (structural). The purge
+     * vs. consolidator race is benign: both paths build
+     * consolidation-equivalent chains and the CAS-loser retries
+     * until one succeeds. */
     _Atomic bool       structural_lock;
 };
 
