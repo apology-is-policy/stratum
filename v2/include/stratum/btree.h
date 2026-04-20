@@ -50,6 +50,9 @@ extern "C" {
 typedef struct stm_btree stm_btree;
 typedef struct stm_bt_node stm_bt_node;
 
+/* Forward — see <stratum/ebr.h>. */
+typedef struct stm_ebr_thread stm_ebr_thread;
+
 /* ========================================================================= */
 /* Construction                                                               */
 /* ========================================================================= */
@@ -177,6 +180,72 @@ stm_status stm_btree_mt_scan(stm_btree_mt *t,
                              const void *lo_key, size_t lo_key_len,
                              const void *hi_key, size_t hi_key_len,
                              stm_btree_scan_cb cb, void *ctx);
+
+/* ========================================================================= */
+/* Lock-free Bw-tree — Phase 2 (task #171).                                   */
+/* ========================================================================= */
+
+/*
+ * Lock-free variant of the Bε-tree per ARCHITECTURE §3.4 and the design
+ * notes in v2/docs/phase2-bw-tree-design.md. Reads and writes proceed
+ * without mutual exclusion: readers walk a CAS-built delta chain pinned
+ * by an EBR epoch; writers CAS-prepend a delta record; any writer whose
+ * prepend pushes the chain past a consolidation threshold attempts to
+ * collapse it into a fresh base (helping pattern).
+ *
+ * Current coverage (task #171):
+ *   - Single logical node. Delta kinds INSERT, DELETE, and BASE.
+ *   - Capacity bounded by the leaf's target_entries.
+ *   - Consolidation via build-new-base + single CAS.
+ *
+ * Deferred to task #172:
+ *   - SPLIT / MERGE deltas, internal routing via child IDs, multi-node
+ *     trees larger than target_entries. Callers needing unbounded size
+ *     today should use stm_btree_mt.
+ *
+ * Caller responsibilities:
+ *   - Each thread must register with EBR via stm_ebr_register and pass
+ *     its handle to every op. stm_ebr_thread_free at thread end.
+ *   - Callers may periodically invoke stm_ebr_try_advance to drive
+ *     reclamation; the tree layer also calls it internally.
+ */
+typedef struct stm_btree_lf stm_btree_lf;
+
+STM_MUST_USE
+stm_status stm_btree_lf_new(const stm_btree_opts *opts, stm_btree_lf **out);
+
+void stm_btree_lf_free(stm_btree_lf *t);
+
+STM_MUST_USE
+stm_status stm_btree_lf_insert(stm_btree_lf *t, stm_ebr_thread *ebr,
+                               const void *key, size_t key_len,
+                               const void *value, size_t value_len);
+
+STM_MUST_USE
+stm_status stm_btree_lf_lookup(const stm_btree_lf *t, stm_ebr_thread *ebr,
+                               const void *key, size_t key_len,
+                               void *buf, size_t buf_cap,
+                               size_t *out_value_len);
+
+STM_MUST_USE
+stm_status stm_btree_lf_delete(stm_btree_lf *t, stm_ebr_thread *ebr,
+                               const void *key, size_t key_len);
+
+/*
+ * Force a consolidation attempt on the root node. Primarily for tests
+ * that want deterministic behavior; production callers should let
+ * writers trigger consolidation via the chain-depth threshold.
+ *
+ * The attempt may be abandoned if another writer already consolidated;
+ * in that case the function returns STM_OK without error (no way to
+ * distinguish "already clean" from "raced and lost"). Returns STM_ENOMEM
+ * on allocation failure during build.
+ */
+STM_MUST_USE
+stm_status stm_btree_lf_force_consolidate(stm_btree_lf *t, stm_ebr_thread *ebr);
+
+/* Observability: approximate depth of the root's delta chain. For tests. */
+uint32_t stm_btree_lf_chain_depth(const stm_btree_lf *t);
 
 #ifdef __cplusplus
 }
