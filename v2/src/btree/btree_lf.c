@@ -2081,6 +2081,112 @@ stm_status stm_btree_lf_delete(stm_btree_lf *t, stm_ebr_thread *ebr,
 }
 
 /* ------------------------------------------------------------------------- */
+/* Scan.                                                                      */
+/* ------------------------------------------------------------------------- */
+
+stm_status stm_btree_lf_scan(const stm_btree_lf *t, stm_ebr_thread *ebr,
+                              const void *lo_key, size_t lo_key_len,
+                              const void *hi_key, size_t hi_key_len,
+                              stm_btree_scan_cb cb, void *ctx)
+{
+    if (!t || !ebr || !cb) return STM_EINVAL;
+
+    stm_ebr_enter(ebr);
+
+    uint64_t root_id = atomic_load(&t->root_id);
+    stm_bt_lf_delta *root_head = atomic_load(&t->pt->slots[root_id]);
+    if (!root_head || root_head->kind != STM_BT_LF_DELTA_BASE_INTERNAL) {
+        stm_ebr_exit(ebr);
+        return STM_ECORRUPT;
+    }
+
+    const stm_bt_lf_internal *internal = root_head->u.base_internal.internal;
+    uint32_t n_leaves = internal->npivots + 1u;
+    uint64_t *leaves = malloc(n_leaves * sizeof *leaves);
+    if (!leaves) { stm_ebr_exit(ebr); return STM_ENOMEM; }
+    leaves[0] = internal->leftmost_child;
+    for (uint32_t i = 0; i < internal->npivots; i++) {
+        leaves[i + 1] = internal->pivots[i].right_child;
+    }
+    /* Snapshot the parent pivot seps so we can skip leaves whose entire
+     * range sits outside [lo_key, hi_key). leaf[i]'s effective range is
+     * [left_sep, right_sep) where:
+     *   left_sep  = pivots[i-1].sep_key (or -inf for i==0)
+     *   right_sep = pivots[i].sep_key   (or +inf for i==n_leaves-1)
+     * We don't need to copy the sep_key bytes — the EBR pin keeps the
+     * internal struct alive. */
+
+    stm_status rc = STM_OK;
+
+    for (uint32_t i = 0; i < n_leaves; i++) {
+        /* Range-prune: if the caller provided hi_key and this leaf's
+         * left_sep >= hi_key, no keys in this leaf can be in scope.
+         * Similarly if lo_key > this leaf's right_sep (strict) — but
+         * since we iterate left-to-right, once we see a leaf beyond
+         * hi_key we can terminate. */
+        if (hi_key && i > 0) {
+            const stm_bt_lf_pivot *left_p = &internal->pivots[i - 1];
+            int cmp = stm_bt_key_cmp(left_p->sep_key, left_p->sep_key_len,
+                                       hi_key, hi_key_len);
+            if (cmp >= 0) break;
+        }
+        if (lo_key && i + 1 < n_leaves) {
+            const stm_bt_lf_pivot *right_p = &internal->pivots[i];
+            int cmp = stm_bt_key_cmp(right_p->sep_key, right_p->sep_key_len,
+                                       lo_key, lo_key_len);
+            if (cmp <= 0) continue;   /* this leaf's keys are all < lo_key */
+        }
+
+        stm_bt_lf_delta *head = atomic_load(&t->pt->slots[leaves[i]]);
+        if (!head) continue;
+        /* SEAL'd leaves were empty at merge time (eligibility); no keys
+         * to enumerate. The leaf's range now belongs to its forward
+         * target, which is elsewhere in the parent's pivots and we'll
+         * enumerate it on its own turn. Skip. */
+        if (head->kind == STM_BT_LF_DELTA_SEALED) continue;
+        if (head->kind == STM_BT_LF_DELTA_BASE_INTERNAL) continue;
+
+        /* Build a consolidated snapshot of this leaf's live entries.
+         * build_consolidated_leaf replays INSERT/DELETE against the
+         * BASE and preserves SPLIT deltas separately (we discard them
+         * — the sibling is enumerated via its own parent pivot). */
+        stm_bt_lf_preserved_splits preserved = { .n = 0 };
+        stm_bt_node *snapshot = build_consolidated_leaf(head, t->opts,
+                                                         &preserved);
+        preserved_splits_free(&preserved);
+        if (!snapshot) { rc = STM_ENOMEM; goto out; }
+
+        uint32_t start = 0;
+        if (lo_key) {
+            bool found;
+            start = stm_bt_entry_lower_bound(snapshot->entries,
+                                              snapshot->nentries,
+                                              lo_key, lo_key_len, &found);
+        }
+
+        bool stop = false;
+        for (uint32_t e = start; e < snapshot->nentries; e++) {
+            const stm_bt_entry *ent = &snapshot->entries[e];
+            if (hi_key) {
+                int cmp = stm_bt_key_cmp(ent->key, ent->key_len,
+                                          hi_key, hi_key_len);
+                if (cmp >= 0) break;
+            }
+            if (cb(ent->key, ent->key_len, ent->value, ent->value_len,
+                   ctx) != 0) { stop = true; break; }
+        }
+
+        stm_bt_node_free(snapshot);
+        if (stop) break;
+    }
+
+out:
+    free(leaves);
+    stm_ebr_exit(ebr);
+    return rc;
+}
+
+/* ------------------------------------------------------------------------- */
 /* Observability.                                                             */
 /* ------------------------------------------------------------------------- */
 

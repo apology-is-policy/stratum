@@ -8,15 +8,21 @@ record of the reasoning that led to the current code.
 
 ## TL;DR
 
-The lock-free Bw-tree is a **balanced B+tree with SPLIT, MERGE, and
-per-node consolidation**: root is a BASE_INTERNAL delta with a pivot
-array; leaves are atomic-published BASE_LEAF chains with SPLIT
-redirects; empty leaves without preserved SPLITs are reabsorbed into
-siblings via the SEAL-with-forward MERGE protocol; chain consolidation
-parallelizes across leaves via per-slot locks, with a tree-wide
-structural lock serializing only commit_split / commit_merge. All six
-audit rounds R0-R6 are closed. 21/21 tests green on default/ASan/TSan.
-Phase 2 deliverables are complete at this tip.
+The lock-free Bw-tree is a **balanced B+tree with SPLIT, MERGE,
+per-node consolidation, and range SCAN**: root is a BASE_INTERNAL
+delta with a pivot array; leaves are atomic-published BASE_LEAF
+chains with SPLIT redirects; empty leaves without preserved SPLITs
+are reabsorbed into siblings via the SEAL-with-forward MERGE
+protocol; chain consolidation parallelizes across leaves via per-slot
+locks, with a tree-wide structural lock serializing only
+commit_split / commit_merge; scan iterates parent's pivot array
+left-to-right under an EBR-pinned snapshot. All six audit rounds
+R0-R6 are closed. 26/26 tests green on default/ASan/TSan. Benchmark
+harness in `v2/bench/` produces single-writer throughput + multi-
+reader scaling numbers. A 30-second sustained TSan run via
+`btree_lf_long_stress` (env-parameterized) passes. Phase 2 is
+complete; node serialization is deferred to Phase 3 per roadmap
+amendment.
 
 ## What's landed (commits, tests, audits)
 

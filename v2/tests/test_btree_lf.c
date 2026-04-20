@@ -374,6 +374,175 @@ STM_TEST(btree_lf_split_then_delete_upper) {
     stm_btree_lf_free(t);
 }
 
+/* Scan sanity: insert a known set, scan with bounds, verify order + contents. */
+typedef struct {
+    int  max;
+    int  count;
+    int *keys;
+    int *vals;
+} scan_collect;
+
+static int scan_collect_cb(const void *key, size_t key_len,
+                            const void *value, size_t value_len, void *ctx)
+{
+    scan_collect *c = ctx;
+    if (c->count >= c->max) return 1;
+    char kbuf[32];
+    memcpy(kbuf, key, key_len);
+    kbuf[key_len] = 0;
+    int k = atoi(kbuf + 1);  /* keys are "kNNNN" */
+    int v = 0;
+    memcpy(&v, value, value_len);
+    c->keys[c->count] = k;
+    c->vals[c->count] = v;
+    c->count++;
+    return 0;
+}
+
+STM_TEST(btree_lf_scan_basic) {
+    stm_btree_lf *t = make_tree(64);
+    stm_ebr_thread *ebr = stm_ebr_register();
+
+    enum { N = 32 };
+    for (int i = 0; i < N; i++) {
+        char kbuf[8];
+        int kl = snprintf(kbuf, sizeof kbuf, "k%04d", i);
+        int v = i * 10;
+        STM_ASSERT_OK(stm_btree_lf_insert(t, ebr, kbuf, (size_t)kl,
+                                           &v, sizeof v));
+    }
+
+    /* Full scan — all 32 keys in ascending order. */
+    int keys[64], vals[64];
+    scan_collect c = { .max = 64, .count = 0, .keys = keys, .vals = vals };
+    STM_ASSERT_OK(stm_btree_lf_scan(t, ebr, NULL, 0, NULL, 0,
+                                      scan_collect_cb, &c));
+    STM_ASSERT_EQ(c.count, N);
+    for (int i = 0; i < N; i++) {
+        STM_ASSERT_EQ(c.keys[i], i);
+        STM_ASSERT_EQ(c.vals[i], i * 10);
+    }
+
+    /* Range [k0010, k0020) — 10 keys. */
+    c.count = 0;
+    STM_ASSERT_OK(stm_btree_lf_scan(t, ebr, "k0010", 5, "k0020", 5,
+                                      scan_collect_cb, &c));
+    STM_ASSERT_EQ(c.count, 10);
+    for (int i = 0; i < 10; i++) {
+        STM_ASSERT_EQ(c.keys[i], 10 + i);
+    }
+
+    /* No lower bound, hi = "k0005" — first 5 keys. */
+    c.count = 0;
+    STM_ASSERT_OK(stm_btree_lf_scan(t, ebr, NULL, 0, "k0005", 5,
+                                      scan_collect_cb, &c));
+    STM_ASSERT_EQ(c.count, 5);
+    for (int i = 0; i < 5; i++) {
+        STM_ASSERT_EQ(c.keys[i], i);
+    }
+
+    /* Lower bound "k0028", no upper — last 4 keys. */
+    c.count = 0;
+    STM_ASSERT_OK(stm_btree_lf_scan(t, ebr, "k0028", 5, NULL, 0,
+                                      scan_collect_cb, &c));
+    STM_ASSERT_EQ(c.count, 4);
+    for (int i = 0; i < 4; i++) {
+        STM_ASSERT_EQ(c.keys[i], 28 + i);
+    }
+
+    stm_ebr_thread_free(ebr);
+    stm_btree_lf_free(t);
+}
+
+/* Scan across splits: inserting enough to force multiple leaves must
+ * still produce a globally sorted sequence. */
+STM_TEST(btree_lf_scan_across_splits) {
+    stm_btree_lf *t = make_tree(4);     /* tiny target → many leaves */
+    stm_ebr_thread *ebr = stm_ebr_register();
+
+    enum { N = 128 };
+    for (int i = 0; i < N; i++) {
+        char kbuf[8];
+        int kl = snprintf(kbuf, sizeof kbuf, "k%04d", i);
+        int v = i * 100;
+        STM_ASSERT_OK(stm_btree_lf_insert(t, ebr, kbuf, (size_t)kl,
+                                           &v, sizeof v));
+    }
+    STM_ASSERT_OK(stm_btree_lf_force_consolidate(t, ebr));
+    STM_ASSERT(stm_btree_lf_leaf_count(t, ebr) > 1);   /* genuinely multi-leaf */
+
+    int keys[256], vals[256];
+    scan_collect c = { .max = 256, .count = 0, .keys = keys, .vals = vals };
+    STM_ASSERT_OK(stm_btree_lf_scan(t, ebr, NULL, 0, NULL, 0,
+                                      scan_collect_cb, &c));
+    STM_ASSERT_EQ(c.count, N);
+    for (int i = 0; i < N; i++) {
+        STM_ASSERT_EQ(c.keys[i], i);
+        STM_ASSERT_EQ(c.vals[i], i * 100);
+    }
+
+    stm_ebr_thread_free(ebr);
+    stm_btree_lf_free(t);
+}
+
+/* Scan stops early when cb returns nonzero. */
+static int scan_stop_after_n(const void *key, size_t key_len,
+                              const void *value, size_t value_len, void *ctx)
+{
+    (void)key; (void)key_len; (void)value; (void)value_len;
+    int *counter = ctx;
+    (*counter)++;
+    return *counter >= 5 ? 1 : 0;
+}
+
+STM_TEST(btree_lf_scan_stops_on_cb_nonzero) {
+    stm_btree_lf *t = make_tree(64);
+    stm_ebr_thread *ebr = stm_ebr_register();
+    for (int i = 0; i < 20; i++) {
+        char kbuf[8];
+        int kl = snprintf(kbuf, sizeof kbuf, "k%04d", i);
+        int v = i;
+        STM_ASSERT_OK(stm_btree_lf_insert(t, ebr, kbuf, (size_t)kl,
+                                           &v, sizeof v));
+    }
+    int counter = 0;
+    STM_ASSERT_OK(stm_btree_lf_scan(t, ebr, NULL, 0, NULL, 0,
+                                      scan_stop_after_n, &counter));
+    STM_ASSERT_EQ(counter, 5);
+    stm_ebr_thread_free(ebr);
+    stm_btree_lf_free(t);
+}
+
+/* Scan reflects deletions. */
+STM_TEST(btree_lf_scan_after_delete) {
+    stm_btree_lf *t = make_tree(8);
+    stm_ebr_thread *ebr = stm_ebr_register();
+    enum { N = 16 };
+    for (int i = 0; i < N; i++) {
+        char kbuf[8];
+        int kl = snprintf(kbuf, sizeof kbuf, "k%04d", i);
+        int v = i;
+        STM_ASSERT_OK(stm_btree_lf_insert(t, ebr, kbuf, (size_t)kl,
+                                           &v, sizeof v));
+    }
+    /* Delete evens. */
+    for (int i = 0; i < N; i += 2) {
+        char kbuf[8];
+        int kl = snprintf(kbuf, sizeof kbuf, "k%04d", i);
+        STM_ASSERT_OK(stm_btree_lf_delete(t, ebr, kbuf, (size_t)kl));
+    }
+    int keys[64], vals[64];
+    scan_collect c = { .max = 64, .count = 0, .keys = keys, .vals = vals };
+    STM_ASSERT_OK(stm_btree_lf_scan(t, ebr, NULL, 0, NULL, 0,
+                                      scan_collect_cb, &c));
+    STM_ASSERT_EQ(c.count, N / 2);
+    for (int j = 0; j < N / 2; j++) {
+        STM_ASSERT_EQ(c.keys[j], 1 + 2 * j);
+    }
+    stm_ebr_thread_free(ebr);
+    stm_btree_lf_free(t);
+}
+
 /* MERGE: after a split, delete all keys on the upper (freshly created)
  * sibling. force_consolidate should absorb the upper sibling back into
  * its left neighbor — leaf_count drops from 2 to 1 and the upper
@@ -954,6 +1123,109 @@ STM_TEST(btree_lf_merge_concurrent_stress) {
         }
     }
 
+    stm_ebr_thread_free(ebr);
+    stm_btree_lf_free(t);
+}
+
+/* Long-form stress: runs for STM_BT_LF_LONG_SEC seconds (default 2). Meant
+ * to be bumped via env var for sustained TSan/ASan runs — Phase 2 exit
+ * validation uses a 1-hour run under TSan nightly; continuous cumulative
+ * runs are the Phase 9 hardening target.
+ *
+ *   STM_BT_LF_LONG_SEC=3600 ctest -R btree_lf_long_stress
+ */
+typedef struct {
+    stm_btree_lf *tree;
+    atomic_bool  *stop;
+    int           thread_id;
+    unsigned long ops_done;
+} long_stress_arg;
+
+static void *long_stress_worker(void *arg_)
+{
+    long_stress_arg *arg = arg_;
+    stm_ebr_thread *ebr = stm_ebr_register();
+    if (!ebr) return NULL;
+
+    uint64_t s = 0x9E3779B97F4A7C15ull * (uint64_t)(arg->thread_id * 11 + 1);
+    while (!atomic_load(arg->stop)) {
+        s = s * 6364136223846793005ull + 1442695040888963407ull;
+        uint64_t rnd = s ^ (s >> 31);
+        uint32_t op    = rnd & 3;
+        uint32_t key_i = (rnd >> 3) & 0x3F;   /* 64 keys */
+        char kbuf[16];
+        int kl = snprintf(kbuf, sizeof kbuf, "ls-t%d-k%04u",
+                          arg->thread_id, key_i);
+        int val = (int)(rnd >> 32);
+
+        switch (op) {
+        case 0: case 1:
+            (void)stm_btree_lf_insert(arg->tree, ebr, kbuf, (size_t)kl,
+                                        &val, sizeof val);
+            break;
+        case 2:
+            (void)stm_btree_lf_delete(arg->tree, ebr, kbuf, (size_t)kl);
+            break;
+        case 3: {
+            int out; size_t vl = 0;
+            (void)stm_btree_lf_lookup(arg->tree, ebr, kbuf, (size_t)kl,
+                                        &out, sizeof out, &vl);
+            break;
+        }
+        }
+        arg->ops_done++;
+        /* Periodic force-consolidate to exercise merges + purge paths. */
+        if ((arg->ops_done & 0xFFF) == 0) {
+            (void)stm_btree_lf_force_consolidate(arg->tree, ebr);
+        }
+    }
+
+    stm_ebr_thread_free(ebr);
+    return NULL;
+}
+
+STM_TEST(btree_lf_long_stress) {
+    int duration_sec = 2;
+    const char *env = getenv("STM_BT_LF_LONG_SEC");
+    if (env) {
+        int parsed = atoi(env);
+        if (parsed > 0) duration_sec = parsed;
+    }
+
+    stm_btree_lf *t = make_tree(8);
+    atomic_bool stop = false;
+
+    enum { NTHREADS = 4 };
+    pthread_t         tids[NTHREADS];
+    long_stress_arg   args[NTHREADS];
+    for (int i = 0; i < NTHREADS; i++) {
+        args[i] = (long_stress_arg){
+            .tree = t, .stop = &stop, .thread_id = i, .ops_done = 0,
+        };
+        pthread_create(&tids[i], NULL, long_stress_worker, &args[i]);
+    }
+
+    struct timespec ts = { .tv_sec = duration_sec, .tv_nsec = 0 };
+    nanosleep(&ts, NULL);
+
+    atomic_store(&stop, true);
+    for (int i = 0; i < NTHREADS; i++) pthread_join(tids[i], NULL);
+
+    unsigned long total = 0;
+    for (int i = 0; i < NTHREADS; i++) total += args[i].ops_done;
+
+    for (int i = 0; i < 64; i++) (void)stm_ebr_try_advance();
+
+    /* Final force_consolidate is best-effort: under heavy churn a chain
+     * may have outpaced the consolidator (MAX_CHAIN=4096 for this MVP)
+     * and return ENOMEM. The primary property of this test is "no
+     * crash / no UB during the run"; ASan / TSan / UBSAN catch those. */
+    stm_ebr_thread *ebr = stm_ebr_register();
+    (void)stm_btree_lf_force_consolidate(t, ebr);
+    stm_test_info("long stress: %lu ops across %d threads in %ds "
+                  "(%.0f ops/s/thread)",
+                  total, NTHREADS, duration_sec,
+                  (double)total / (double)NTHREADS / (double)duration_sec);
     stm_ebr_thread_free(ebr);
     stm_btree_lf_free(t);
 }

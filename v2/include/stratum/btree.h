@@ -232,6 +232,26 @@ stm_status stm_btree_lf_delete(stm_btree_lf *t, stm_ebr_thread *ebr,
                                const void *key, size_t key_len);
 
 /*
+ * Scan: iterate keys in [lo_key, hi_key) in ascending order. `lo_key` NULL
+ * means no lower bound; `hi_key` NULL means no upper bound. `cb` is invoked
+ * once per matching entry with (key, value) pointers valid only for the
+ * duration of the call — copy if you need to retain. Returning nonzero
+ * from `cb` stops the scan.
+ *
+ * Consistency: each leaf is visited once, against an atomically-loaded
+ * head pointer pinned by EBR for the duration of that leaf's enumeration.
+ * Across leaves the snapshot is "loose": writes that land concurrently
+ * with the scan may or may not be reflected depending on the leaf they
+ * hit. Strictly-atomic snapshots require global versioning (deferred to
+ * the Phase 3 commit protocol).
+ */
+STM_MUST_USE
+stm_status stm_btree_lf_scan(const stm_btree_lf *t, stm_ebr_thread *ebr,
+                             const void *lo_key, size_t lo_key_len,
+                             const void *hi_key, size_t hi_key_len,
+                             stm_btree_scan_cb cb, void *ctx);
+
+/*
  * Force a consolidation attempt on the root node. Primarily for tests
  * that want deterministic behavior; production callers should let
  * writers trigger consolidation via the chain-depth threshold.

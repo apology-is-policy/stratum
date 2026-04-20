@@ -188,6 +188,10 @@ if(STM_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
 
+if(STM_BUILD_BENCHES)
+    add_subdirectory(bench)
+endif()
+
 # ---------------------------------------------------------------------------
 # Configuration summary.
 # ---------------------------------------------------------------------------

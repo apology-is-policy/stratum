@@ -25,6 +25,12 @@ function(stm_add_test name)
     set_tests_properties(${name} PROPERTIES TIMEOUT 60)
 endfunction()
 
+# Special timeout for test_btree_lf — the long-stress test can run for
+# a user-configurable duration via STM_BT_LF_LONG_SEC (default 2s).
+# Operators running 1h+ sustained passes should override ctest timeout
+# with --timeout=0 or set a large value; the CMakeLists default here
+# only needs to accommodate the short default run path.
+
 # ---------------------------------------------------------------------------
 # Individual test binaries.
 # ---------------------------------------------------------------------------
