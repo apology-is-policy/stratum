@@ -246,7 +246,7 @@ static stm_status internal_split(stm_bt_node *node,
 
 /* Apply one message to a leaf. On insert, overwrites if present. */
 static stm_status apply_msg_to_leaf(stm_bt_node *leaf, const stm_bt_msg *m,
-                                    bool *out_delta /* +1, 0, or -1 */)
+                                    int *out_delta /* +1, 0, or -1 */)
 {
     switch (m->kind) {
     case STM_BT_MSG_INSERT: {

@@ -370,8 +370,12 @@ static int op_poll(stm_bdev *base, int max_events)
         cur = cur->next;
         n++;
     }
-    if (cur) {
-        /* More than max_events — cut after cut_prev. */
+    if (cur && cut_prev) {
+        /* More than max_events — cut after cut_prev. cut_prev is non-NULL
+         * in this branch because reaching cur != NULL while `n < max_events`
+         * was false requires the loop to have advanced at least once, except
+         * in the degenerate max_events==0 case — which the `&& cut_prev`
+         * guard covers explicitly for -Wnull-dereference. */
         d->c_head = cur;
         cut_prev->next = NULL;
     } else {

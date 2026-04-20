@@ -244,8 +244,10 @@ stm_status stm_btree_lf_delete(stm_btree_lf *t, stm_ebr_thread *ebr,
 STM_MUST_USE
 stm_status stm_btree_lf_force_consolidate(stm_btree_lf *t, stm_ebr_thread *ebr);
 
-/* Observability: approximate depth of the root's delta chain. For tests. */
-uint32_t stm_btree_lf_chain_depth(const stm_btree_lf *t);
+/* Observability: approximate depth of the root's delta chain. Must pin
+ * an EBR epoch because concurrent consolidation can retire the head
+ * pointer — caller provides a registered handle. */
+uint32_t stm_btree_lf_chain_depth(const stm_btree_lf *t, stm_ebr_thread *ebr);
 
 #ifdef __cplusplus
 }

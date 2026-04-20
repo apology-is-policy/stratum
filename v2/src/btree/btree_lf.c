@@ -83,7 +83,7 @@ typedef enum {
 typedef struct stm_bt_lf_delta stm_bt_lf_delta;
 struct stm_bt_lf_delta {
     stm_bt_lf_delta_kind kind;
-    uint32_t chain_depth;                  /* 0 for BASE, N for the Nth delta above */
+    _Atomic uint32_t chain_depth;          /* 0 for BASE, N for the Nth delta above */
     _Atomic(stm_bt_lf_delta *) next;
     union {
         struct { uint8_t *key; uint32_t key_len;
@@ -503,7 +503,8 @@ static stm_status try_consolidate(stm_btree_lf *t, uint64_t nid)
 {
     stm_bt_lf_delta *old_head = atomic_load(&t->pt->slots[nid]);
     if (!old_head) return STM_OK;
-    if (old_head->chain_depth < STM_BT_LF_CONSOLIDATE_THRESHOLD) return STM_OK;
+    if (atomic_load_explicit(&old_head->chain_depth, memory_order_relaxed)
+        < STM_BT_LF_CONSOLIDATE_THRESHOLD) return STM_OK;
 
     stm_bt_node *new_base_node = build_consolidated_base(old_head, t->opts);
     if (!new_base_node) return STM_ENOMEM;
@@ -513,7 +514,7 @@ static stm_status try_consolidate(stm_btree_lf *t, uint64_t nid)
         stm_bt_node_free(new_base_node);
         return STM_ENOMEM;
     }
-    new_head->chain_depth = 0;
+    atomic_store_explicit(&new_head->chain_depth, 0u, memory_order_relaxed);
 
     if (!atomic_compare_exchange_strong(&t->pt->slots[nid], &old_head, new_head)) {
         /* Raced: free our attempt (delta_destroy frees the base node). */
@@ -534,7 +535,8 @@ stm_status stm_btree_lf_force_consolidate(stm_btree_lf *t, stm_ebr_thread *ebr)
     stm_bt_lf_delta *old_head = atomic_load(&t->pt->slots[nid]);
     stm_status s = STM_OK;
 
-    if (old_head && old_head->chain_depth > 0) {
+    if (old_head &&
+        atomic_load_explicit(&old_head->chain_depth, memory_order_relaxed) > 0) {
         stm_bt_node *new_base_node = build_consolidated_base(old_head, t->opts);
         if (!new_base_node) { s = STM_ENOMEM; goto out; }
 
@@ -544,7 +546,7 @@ stm_status stm_btree_lf_force_consolidate(stm_btree_lf *t, stm_ebr_thread *ebr)
             s = STM_ENOMEM;
             goto out;
         }
-        new_head->chain_depth = 0;
+        atomic_store_explicit(&new_head->chain_depth, 0u, memory_order_relaxed);
 
         if (atomic_compare_exchange_strong(&t->pt->slots[nid], &old_head, new_head)) {
             retire_old_chain(old_head);
@@ -570,7 +572,11 @@ static void cas_prepend(stm_btree_lf *t, uint64_t nid, stm_bt_lf_delta *d)
     do {
         head = atomic_load(&t->pt->slots[nid]);
         atomic_store_explicit(&d->next, head, memory_order_relaxed);
-        d->chain_depth = (head ? head->chain_depth : 0) + 1;
+        uint32_t base_depth = head
+            ? atomic_load_explicit(&head->chain_depth, memory_order_relaxed)
+            : 0u;
+        atomic_store_explicit(&d->chain_depth, base_depth + 1u,
+                              memory_order_relaxed);
     } while (!atomic_compare_exchange_weak(&t->pt->slots[nid], &head, d));
 }
 
@@ -587,7 +593,8 @@ stm_status stm_btree_lf_insert(stm_btree_lf *t, stm_ebr_thread *ebr,
 
     uint64_t nid = atomic_load(&t->root_id);
     cas_prepend(t, nid, d);
-    uint32_t depth_after = d->chain_depth;
+    uint32_t depth_after = atomic_load_explicit(&d->chain_depth,
+                                                 memory_order_relaxed);
 
     if (depth_after >= STM_BT_LF_CONSOLIDATE_THRESHOLD) {
         (void)try_consolidate(t, nid);
@@ -622,7 +629,8 @@ stm_status stm_btree_lf_delete(stm_btree_lf *t, stm_ebr_thread *ebr,
 
     uint64_t nid = atomic_load(&t->root_id);
     cas_prepend(t, nid, d);
-    uint32_t depth_after = d->chain_depth;
+    uint32_t depth_after = atomic_load_explicit(&d->chain_depth,
+                                                 memory_order_relaxed);
 
     if (depth_after >= STM_BT_LF_CONSOLIDATE_THRESHOLD) {
         (void)try_consolidate(t, nid);
@@ -639,10 +647,18 @@ stm_status stm_btree_lf_delete(stm_btree_lf *t, stm_ebr_thread *ebr,
 /* Observability.                                                             */
 /* ------------------------------------------------------------------------- */
 
-uint32_t stm_btree_lf_chain_depth(const stm_btree_lf *t)
+/* Must pin an EBR epoch to safely dereference the head — a concurrent
+ * consolidator may have retired the head pointer. Caller provides the
+ * per-thread handle. */
+uint32_t stm_btree_lf_chain_depth(const stm_btree_lf *t, stm_ebr_thread *ebr)
 {
-    if (!t) return 0;
+    if (!t || !ebr) return 0;
+    stm_ebr_enter(ebr);
     uint64_t nid = atomic_load(&t->root_id);
     stm_bt_lf_delta *head = atomic_load(&t->pt->slots[nid]);
-    return head ? head->chain_depth : 0;
+    uint32_t depth = head
+        ? atomic_load_explicit(&head->chain_depth, memory_order_relaxed)
+        : 0u;
+    stm_ebr_exit(ebr);
+    return depth;
 }

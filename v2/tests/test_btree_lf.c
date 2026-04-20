@@ -104,7 +104,7 @@ STM_TEST(btree_lf_consolidate_reduces_chain) {
     /* Force a final consolidate so the chain is guaranteed flat. */
     STM_ASSERT_OK(stm_btree_lf_force_consolidate(t, ebr));
 
-    uint32_t depth = stm_btree_lf_chain_depth(t);
+    uint32_t depth = stm_btree_lf_chain_depth(t, ebr);
     stm_test_info("chain depth after force_consolidate: %u", depth);
     STM_ASSERT_EQ(depth, 0);
 
@@ -337,14 +337,14 @@ STM_TEST(btree_lf_concurrent_stress) {
 
     int total = 0;
     for (int i = 0; i < NTHREADS; i++) total += args[i].ops_done;
-    stm_test_info("total ops: %d across %d threads; final chain depth %u",
-                  total, NTHREADS, stm_btree_lf_chain_depth(t));
 
     /* Drain EBR retires so the final tree state is stable. */
     for (int i = 0; i < 64; i++) (void)stm_ebr_try_advance();
 
     /* Final sanity: tree is still walkable. */
     stm_ebr_thread *ebr = stm_ebr_register();
+    stm_test_info("total ops: %d across %d threads; final chain depth %u",
+                  total, NTHREADS, stm_btree_lf_chain_depth(t, ebr));
     size_t vl = 0;
     (void)stm_btree_lf_lookup(t, ebr, "zzzz_nonexistent", 16, NULL, 0, &vl);
     stm_ebr_thread_free(ebr);
