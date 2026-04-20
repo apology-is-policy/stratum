@@ -126,6 +126,86 @@ STM_TEST(btree_lf_consolidate_reduces_chain) {
     stm_btree_lf_free(t);
 }
 
+/* Insert enough keys to force the leaf to split. After consolidation,
+ * the tree should have grown to root + sibling, reachable via the
+ * root's SPLIT delta. Every inserted key must remain readable. */
+STM_TEST(btree_lf_split_on_overflow) {
+    stm_btree_lf *t = make_tree(16);    /* small target — overflow at 17 */
+    stm_ebr_thread *ebr = stm_ebr_register();
+
+    enum { N = 64 };
+    for (int i = 0; i < N; i++) {
+        char kbuf[16];
+        int kl = snprintf(kbuf, sizeof kbuf, "key-%05d", i);
+        int v = i;
+        STM_ASSERT_OK(stm_btree_lf_insert(t, ebr, kbuf, (size_t)kl,
+                                           &v, sizeof v));
+    }
+
+    /* Drive the consolidator enough times to observe at least one split. */
+    for (int i = 0; i < 4; i++) {
+        STM_ASSERT_OK(stm_btree_lf_force_consolidate(t, ebr));
+    }
+
+    /* Every key must resolve correctly — via the root (for keys < sep)
+     * or via a SPLIT redirect into the sibling (for keys >= sep). */
+    for (int i = 0; i < N; i++) {
+        char kbuf[16];
+        int kl = snprintf(kbuf, sizeof kbuf, "key-%05d", i);
+        int got = 0;
+        size_t vl = 0;
+        stm_status s = stm_btree_lf_lookup(t, ebr, kbuf, (size_t)kl,
+                                            &got, sizeof got, &vl);
+        STM_ASSERT_OK(s);
+        STM_ASSERT_EQ(vl, sizeof got);
+        STM_ASSERT_EQ(got, i);
+    }
+
+    stm_ebr_thread_free(ebr);
+    stm_btree_lf_free(t);
+}
+
+/* Delete a key on the upper (post-split) side, verify it disappears
+ * and the rest of the keys remain accessible. */
+STM_TEST(btree_lf_split_then_delete_upper) {
+    stm_btree_lf *t = make_tree(16);
+    stm_ebr_thread *ebr = stm_ebr_register();
+
+    enum { N = 40 };
+    for (int i = 0; i < N; i++) {
+        char kbuf[16];
+        int kl = snprintf(kbuf, sizeof kbuf, "key-%05d", i);
+        int v = i * 100;
+        STM_ASSERT_OK(stm_btree_lf_insert(t, ebr, kbuf, (size_t)kl,
+                                           &v, sizeof v));
+    }
+
+    STM_ASSERT_OK(stm_btree_lf_force_consolidate(t, ebr));
+
+    /* Delete the largest key (which must have landed on the upper sibling). */
+    char del_kbuf[16];
+    int  del_kl = snprintf(del_kbuf, sizeof del_kbuf, "key-%05d", N - 1);
+    STM_ASSERT_OK(stm_btree_lf_delete(t, ebr, del_kbuf, (size_t)del_kl));
+
+    size_t vl = 0;
+    STM_ASSERT_ERR(stm_btree_lf_lookup(t, ebr, del_kbuf, (size_t)del_kl,
+                                        NULL, 0, &vl), STM_ENOENT);
+
+    /* Remaining keys still readable. */
+    for (int i = 0; i < N - 1; i++) {
+        char kbuf[16];
+        int kl = snprintf(kbuf, sizeof kbuf, "key-%05d", i);
+        int got = 0;
+        size_t vl2 = 0;
+        STM_ASSERT_OK(stm_btree_lf_lookup(t, ebr, kbuf, (size_t)kl,
+                                           &got, sizeof got, &vl2));
+        STM_ASSERT_EQ(got, i * 100);
+    }
+
+    stm_ebr_thread_free(ebr);
+    stm_btree_lf_free(t);
+}
+
 /* Interleave deletes and re-inserts. Consolidation must apply them in
  * order to produce the right final state. */
 STM_TEST(btree_lf_delete_reinsert_sequence) {

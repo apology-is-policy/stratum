@@ -84,6 +84,7 @@ typedef enum {
     STM_BT_LF_DELTA_INSERT = 1,
     STM_BT_LF_DELTA_DELETE = 2,
     STM_BT_LF_DELTA_BASE   = 3,
+    STM_BT_LF_DELTA_SPLIT  = 4,
 } stm_bt_lf_delta_kind;
 
 typedef struct stm_bt_lf_delta stm_bt_lf_delta;
@@ -96,8 +97,17 @@ struct stm_bt_lf_delta {
                  uint8_t *val; uint32_t val_len; } upsert;
         struct { uint8_t *key; uint32_t key_len; } del;
         struct { stm_bt_node *node; }      base;
+        /* SPLIT delta: keys >= sep_key should redirect to sibling_id.
+         * sep_key is owned by this record; freed in delta_destroy. */
+        struct { uint8_t *sep_key; uint32_t sep_key_len;
+                 uint64_t sibling_id; } split;
     } u;
 };
+
+/* Page table entries are zero-initialized, so slot IDs start from 0.
+ * We reserve 0 as the root ID (allocated first in stm_btree_lf_new)
+ * and use UINT64_MAX as an "no-redirect" sentinel internally. */
+#define STM_BT_LF_NO_REDIRECT ((uint64_t)UINT64_MAX)
 
 typedef struct stm_bt_page_table {
     _Atomic(stm_bt_lf_delta *) *slots;
@@ -137,6 +147,9 @@ static void delta_destroy(void *p)
         break;
     case STM_BT_LF_DELTA_BASE:
         stm_bt_node_free(d->u.base.node);
+        break;
+    case STM_BT_LF_DELTA_SPLIT:
+        free(d->u.split.sep_key);
         break;
     }
     free(d);
@@ -184,6 +197,22 @@ static stm_bt_lf_delta *alloc_delete_delta(const void *key, size_t key_len)
     if (!k && key_len > 0) { free(d); return NULL; }
     d->u.del.key     = k;
     d->u.del.key_len = (uint32_t)key_len;
+    return d;
+}
+
+/* Build a SPLIT delta. Takes ownership of the passed-in sep_key buffer
+ * (caller transfers; sep_key must be heap-allocated from stm_bt_dup_bytes
+ * or similar). On failure, the caller still owns sep_key. */
+static stm_bt_lf_delta *alloc_split_delta(uint8_t *sep_key, uint32_t sep_key_len,
+                                            uint64_t sibling_id)
+{
+    stm_bt_lf_delta *d = calloc(1, sizeof *d);
+    if (!d) return NULL;
+    d->kind = STM_BT_LF_DELTA_SPLIT;
+    atomic_init(&d->next, NULL);
+    d->u.split.sep_key     = sep_key;
+    d->u.split.sep_key_len = sep_key_len;
+    d->u.split.sibling_id  = sibling_id;
     return d;
 }
 
@@ -245,8 +274,10 @@ stm_status stm_btree_lf_new(const stm_btree_opts *opts, stm_btree_lf **out)
     if (t->opts.target_entries  < 4) t->opts.target_entries  = 4;
     if (t->opts.target_messages < 1) t->opts.target_messages = 1;
 
-    /* MVP: single-slot page table. */
-    t->pt = page_table_new(1);
+    /* Fixed-capacity page table. 256 slots is enough for the tree to
+     * grow through O(log) leaf splits before running out — a runtime
+     * grow-with-CoW is future work. */
+    t->pt = page_table_new(256);
     if (!t->pt) { free(t); return STM_ENOMEM; }
 
     stm_bt_node *leaf = stm_bt_node_new_leaf(t->opts.target_entries,
@@ -285,10 +316,20 @@ void stm_btree_lf_free(stm_btree_lf *t)
 /* Lookup.                                                                    */
 /* ------------------------------------------------------------------------- */
 
-/* Walk the chain newest-first, stopping at the first decisive event. */
+/* Chain walk for lookup:
+ *
+ *   - INSERT/DELETE delta matching the key: returns that delta (hit).
+ *   - SPLIT delta with key >= sep: sets *redirect_nid, returns NULL.
+ *   - BASE delta: returns that delta (hit, caller searches its leaf).
+ *   - no base reached: returns NULL and leaves *redirect_nid at
+ *     STM_BT_LF_NO_REDIRECT (malformed chain; caller should return
+ *     STM_ECORRUPT).
+ */
 static stm_bt_lf_delta *resolve_chain(stm_bt_lf_delta *head,
-                                       const void *key, size_t key_len)
+                                       const void *key, size_t key_len,
+                                       uint64_t *redirect_nid)
 {
+    *redirect_nid = STM_BT_LF_NO_REDIRECT;
     for (stm_bt_lf_delta *d = head; d; d = atomic_load(&d->next)) {
         switch (d->kind) {
         case STM_BT_LF_DELTA_INSERT:
@@ -299,11 +340,19 @@ static stm_bt_lf_delta *resolve_chain(stm_bt_lf_delta *head,
             if (stm_bt_key_cmp(d->u.del.key, d->u.del.key_len,
                                key, key_len) == 0) return d;
             break;
+        case STM_BT_LF_DELTA_SPLIT:
+            if (stm_bt_key_cmp(key, key_len,
+                               d->u.split.sep_key,
+                               d->u.split.sep_key_len) >= 0) {
+                *redirect_nid = d->u.split.sibling_id;
+                return NULL;
+            }
+            break;
         case STM_BT_LF_DELTA_BASE:
             return d;
         }
     }
-    return NULL;   /* malformed chain — no base reached */
+    return NULL;
 }
 
 stm_status stm_btree_lf_lookup(const stm_btree_lf *t, stm_ebr_thread *ebr,
@@ -316,45 +365,51 @@ stm_status stm_btree_lf_lookup(const stm_btree_lf *t, stm_ebr_thread *ebr,
     stm_ebr_enter(ebr);
 
     uint64_t nid = atomic_load(&t->root_id);
-    stm_bt_lf_delta *head = atomic_load(&t->pt->slots[nid]);
-    stm_bt_lf_delta *hit  = resolve_chain(head, key, key_len);
-
     stm_status result;
-    if (!hit) {
-        result = STM_ECORRUPT;
-        goto out;
-    }
+    for (;;) {
+        if (nid >= t->pt->capacity) { result = STM_ECORRUPT; goto out; }
+        stm_bt_lf_delta *head = atomic_load(&t->pt->slots[nid]);
+        uint64_t redirect = STM_BT_LF_NO_REDIRECT;
+        stm_bt_lf_delta *hit = resolve_chain(head, key, key_len, &redirect);
+        if (redirect != STM_BT_LF_NO_REDIRECT) {
+            nid = redirect;
+            continue;               /* follow SPLIT */
+        }
+        if (!hit) { result = STM_ECORRUPT; goto out; }
 
-    switch (hit->kind) {
-    case STM_BT_LF_DELTA_INSERT: {
-        uint32_t vl = hit->u.upsert.val_len;
-        if (out_value_len) *out_value_len = vl;
-        if (buf == NULL || buf_cap == 0) { result = STM_OK; break; }
-        if (vl > buf_cap) { result = STM_ERANGE; break; }
-        memcpy(buf, hit->u.upsert.val, vl);
-        result = STM_OK;
-        break;
-    }
-    case STM_BT_LF_DELTA_DELETE:
-        result = STM_ENOENT;
-        break;
-    case STM_BT_LF_DELTA_BASE: {
-        stm_bt_node *node = hit->u.base.node;
-        bool found;
-        uint32_t idx = stm_bt_entry_lower_bound(node->entries, node->nentries,
-                                                 key, key_len, &found);
-        if (!found) { result = STM_ENOENT; break; }
-        const stm_bt_entry *e = &node->entries[idx];
-        if (out_value_len) *out_value_len = e->value_len;
-        if (buf == NULL || buf_cap == 0) { result = STM_OK; break; }
-        if (e->value_len > buf_cap) { result = STM_ERANGE; break; }
-        memcpy(buf, e->value, e->value_len);
-        result = STM_OK;
-        break;
-    }
-    default:
-        result = STM_ECORRUPT;
-        break;
+        switch (hit->kind) {
+        case STM_BT_LF_DELTA_INSERT: {
+            uint32_t vl = hit->u.upsert.val_len;
+            if (out_value_len) *out_value_len = vl;
+            if (buf == NULL || buf_cap == 0) { result = STM_OK; break; }
+            if (vl > buf_cap) { result = STM_ERANGE; break; }
+            memcpy(buf, hit->u.upsert.val, vl);
+            result = STM_OK;
+            break;
+        }
+        case STM_BT_LF_DELTA_DELETE:
+            result = STM_ENOENT;
+            break;
+        case STM_BT_LF_DELTA_BASE: {
+            stm_bt_node *node = hit->u.base.node;
+            bool found;
+            uint32_t idx = stm_bt_entry_lower_bound(node->entries,
+                                                     node->nentries,
+                                                     key, key_len, &found);
+            if (!found) { result = STM_ENOENT; break; }
+            const stm_bt_entry *e = &node->entries[idx];
+            if (out_value_len) *out_value_len = e->value_len;
+            if (buf == NULL || buf_cap == 0) { result = STM_OK; break; }
+            if (e->value_len > buf_cap) { result = STM_ERANGE; break; }
+            memcpy(buf, e->value, e->value_len);
+            result = STM_OK;
+            break;
+        }
+        default:
+            result = STM_ECORRUPT;
+            break;
+        }
+        break;                       /* decision made */
     }
 
 out:
@@ -424,15 +479,36 @@ static void apply_delete_to_leaf(stm_bt_node *leaf, const stm_bt_lf_delta *d)
     leaf->nentries--;
 }
 
+/* Extracted SPLIT info, preserved across consolidation so the post-
+ * consolidated chain still redirects upper-range keys to the sibling.
+ * `present` is TRUE iff `out_split` below was populated by the walk.
+ * `sep_key` is a heap copy the caller OWNS (freed by caller if unused,
+ * transferred into a freshly allocated SPLIT delta otherwise). */
+typedef struct {
+    bool     present;
+    uint8_t *sep_key;
+    uint32_t sep_key_len;
+    uint64_t sibling_id;
+} stm_bt_lf_preserved_split;
+
 /* Build a fresh base by cloning the BASE node in `head`'s chain and
- * applying the chain's deltas in OLDEST-FIRST order. Returns NULL on OOM
- * or on malformed / over-deep chain. */
+ * applying the chain's INSERT/DELETE deltas in OLDEST-FIRST order.
+ * SPLIT deltas encountered on the chain are extracted into
+ * `*out_split` (most-recent-wins, matching replay semantics); callers
+ * must preserve them in the new chain or free the sep_key copy.
+ * Returns NULL on OOM or malformed chain. */
 static stm_bt_node *build_consolidated_base(stm_bt_lf_delta *head,
-                                              stm_btree_opts opts)
+                                              stm_btree_opts opts,
+                                              stm_bt_lf_preserved_split *out_split)
 {
     stm_bt_lf_delta *stack[STM_BT_LF_MAX_CHAIN];
     size_t sp = 0;
     stm_bt_lf_delta *base_delta = NULL;
+
+    out_split->present     = false;
+    out_split->sep_key     = NULL;
+    out_split->sep_key_len = 0;
+    out_split->sibling_id  = 0;
 
     for (stm_bt_lf_delta *d = head; d; d = atomic_load(&d->next)) {
         if (d->kind == STM_BT_LF_DELTA_BASE) { base_delta = d; break; }
@@ -475,14 +551,37 @@ static stm_bt_node *build_consolidated_base(stm_bt_lf_delta *head,
         switch (d->kind) {
         case STM_BT_LF_DELTA_INSERT: {
             stm_status s = apply_insert_to_leaf(new_leaf, d);
-            if (s != STM_OK) { stm_bt_node_free(new_leaf); return NULL; }
+            if (s != STM_OK) {
+                free(out_split->sep_key);
+                out_split->present = false;
+                stm_bt_node_free(new_leaf);
+                return NULL;
+            }
             break;
         }
         case STM_BT_LF_DELTA_DELETE:
             apply_delete_to_leaf(new_leaf, d);
             break;
+        case STM_BT_LF_DELTA_SPLIT: {
+            /* Preserve the most recent SPLIT (replay is oldest-first
+             * so each successive SPLIT overwrites the previous). */
+            uint8_t *nk = stm_bt_dup_bytes(d->u.split.sep_key,
+                                             d->u.split.sep_key_len);
+            if (!nk && d->u.split.sep_key_len > 0) {
+                stm_bt_node_free(new_leaf);
+                return NULL;
+            }
+            free(out_split->sep_key);
+            out_split->present     = true;
+            out_split->sep_key     = nk;
+            out_split->sep_key_len = d->u.split.sep_key_len;
+            out_split->sibling_id  = d->u.split.sibling_id;
+            break;
+        }
         case STM_BT_LF_DELTA_BASE:
             /* Should never occur mid-chain. */
+            free(out_split->sep_key);
+            out_split->present = false;
             stm_bt_node_free(new_leaf);
             return NULL;
         }
@@ -511,11 +610,120 @@ static void retire_old_chain(stm_bt_lf_delta *old_head)
     }
 }
 
+/* Split `full_base` in place into a lower and upper half. Allocates a
+ * fresh sibling node_id, installs upper's BASE at that slot, and CAS-
+ * swaps the splitting slot's chain from `old_head` to a new chain of
+ * [SPLIT delta, BASE(lower)]. On success, retires the old chain.
+ *
+ * Ownership on entry: `full_base` is owned by this function; it will
+ * be consumed regardless of outcome. `old_head` is the expected current
+ * chain head; if another thread CASed the slot between the caller's
+ * sampling and this call, the CAS here will fail and we roll back.
+ *
+ * On CAS failure (race), we uninstall the upper slot and release all
+ * new allocations. The old chain stays untouched.
+ *
+ * Matches structural.tla's two-step protocol: InstallSibling (step 1)
+ * is the atomic_store on the fresh upper slot; PostSplit (step 2) is
+ * the CAS that publishes the new (SPLIT | BASE(lower)) chain. */
+static stm_status commit_split(stm_btree_lf *t, uint64_t nid,
+                                 stm_bt_lf_delta *old_head,
+                                 stm_bt_node *full_base)
+{
+    stm_bt_node     *upper           = NULL;
+    uint8_t         *sep_key         = NULL;
+    uint32_t         sep_len         = 0;
+    uint64_t         upper_id        = 0;
+    bool             upper_id_valid  = false;
+    bool             upper_installed = false;
+    stm_bt_lf_delta *upper_base      = NULL;
+    stm_bt_lf_delta *lower_base      = NULL;
+    stm_bt_lf_delta *split_delta     = NULL;
+    stm_status       rc              = STM_OK;
+
+    if (full_base->nentries < 2) { rc = STM_EINVAL; goto cleanup; }
+
+    uint32_t mid = full_base->nentries / 2;
+
+    upper = stm_bt_node_new_leaf(t->opts.target_entries,
+                                  t->opts.target_messages);
+    if (!upper) { rc = STM_ENOMEM; goto cleanup; }
+
+    uint32_t upper_count = full_base->nentries - mid;
+    rc = stm_bt_node_grow_entries(upper, upper_count);
+    if (rc != STM_OK) goto cleanup;
+
+    /* Transfer ownership of entries[mid..] from full_base into upper —
+     * the byte copies already exist, we just re-home the pointers. */
+    memcpy(upper->entries, &full_base->entries[mid],
+           upper_count * sizeof(stm_bt_entry));
+    upper->nentries = upper_count;
+    memset(&full_base->entries[mid], 0, upper_count * sizeof(stm_bt_entry));
+    full_base->nentries = mid;
+
+    sep_key = stm_bt_dup_bytes(upper->entries[0].key,
+                                upper->entries[0].key_len);
+    sep_len = upper->entries[0].key_len;
+    if (!sep_key && sep_len > 0) { rc = STM_ENOMEM; goto cleanup; }
+
+    upper_id = page_table_allocate_id(t->pt);
+    upper_id_valid = true;
+    if (upper_id >= t->pt->capacity) { rc = STM_EOVERFLOW; goto cleanup; }
+
+    upper_base = alloc_base_delta(upper);
+    if (!upper_base) { rc = STM_ENOMEM; goto cleanup; }
+    upper = NULL;                               /* owned by upper_base */
+
+    /* Step 1 — InstallSibling. The slot was zero-initialized and has
+     * never been published; a relaxed store is sufficient. */
+    atomic_store(&t->pt->slots[upper_id], upper_base);
+    upper_installed = true;
+
+    lower_base = alloc_base_delta(full_base);
+    if (!lower_base) { rc = STM_ENOMEM; goto cleanup; }
+    full_base = NULL;                           /* owned by lower_base */
+    atomic_store_explicit(&lower_base->chain_depth, 0u,
+                          memory_order_relaxed);
+
+    split_delta = alloc_split_delta(sep_key, sep_len, upper_id);
+    if (!split_delta) { rc = STM_ENOMEM; goto cleanup; }
+    sep_key = NULL;                             /* owned by split_delta */
+    atomic_store_explicit(&split_delta->next, lower_base,
+                          memory_order_relaxed);
+    atomic_store_explicit(&split_delta->chain_depth, 1u,
+                          memory_order_relaxed);
+
+    /* Step 2 — PostSplit. Publish the new chain atomically. */
+    if (!atomic_compare_exchange_strong(&t->pt->slots[nid],
+                                         &old_head, split_delta)) {
+        /* Lost the race. Cleanup below. */
+        goto cleanup;
+    }
+
+    retire_old_chain(old_head);
+    return STM_OK;
+
+cleanup:
+    if (upper_installed) {
+        atomic_store(&t->pt->slots[upper_id], NULL);
+    }
+    (void)upper_id_valid;
+    if (split_delta) delta_destroy(split_delta);
+    else if (sep_key) free(sep_key);
+    if (lower_base) delta_destroy(lower_base);
+    else if (full_base) stm_bt_node_free(full_base);
+    if (upper_base) delta_destroy(upper_base);
+    else if (upper) stm_bt_node_free(upper);
+    return rc;
+}
+
 /* Attempt consolidation of node `nid`. Called inside the caller's EBR
  * epoch, so any chain we walk is alive for our whole visit. Serialized
  * through t->consolidating — the first writer past the threshold takes
  * the flag, later writers bail immediately and leave the work to the
- * winner. */
+ * winner. If consolidation's result overflows target_entries AND this
+ * node doesn't already carry a SPLIT delta, the consolidator transitions
+ * into a split (commit_split). */
 static stm_status try_consolidate(stm_btree_lf *t, uint64_t nid)
 {
     bool expected = false;
@@ -530,25 +738,58 @@ static stm_status try_consolidate(stm_btree_lf *t, uint64_t nid)
         if (atomic_load_explicit(&old_head->chain_depth, memory_order_relaxed)
             < STM_BT_LF_CONSOLIDATE_THRESHOLD) break;   /* nothing to do */
 
-        stm_bt_node *new_base_node = build_consolidated_base(old_head, t->opts);
+        stm_bt_lf_preserved_split preserved;
+        stm_bt_node *new_base_node = build_consolidated_base(old_head, t->opts,
+                                                               &preserved);
         if (!new_base_node) { rc = STM_ENOMEM; break; }
 
-        stm_bt_lf_delta *new_head = alloc_base_delta(new_base_node);
-        if (!new_head) {
+        /* Split decision: the consolidated leaf overflows AND this node
+         * doesn't already carry a SPLIT. MVP rule: at most one split
+         * per node — if a SPLIT is already present, we just consolidate
+         * in place and preserve the SPLIT above the new base. */
+        if (new_base_node->nentries > t->opts.target_entries
+            && !preserved.present) {
+            rc = commit_split(t, nid, old_head, new_base_node);
+            break;                          /* one shot, success or race */
+        }
+
+        stm_bt_lf_delta *new_base_delta = alloc_base_delta(new_base_node);
+        if (!new_base_delta) {
             stm_bt_node_free(new_base_node);
+            free(preserved.sep_key);
             rc = STM_ENOMEM;
             break;
         }
-        atomic_store_explicit(&new_head->chain_depth, 0u,
+        atomic_store_explicit(&new_base_delta->chain_depth, 0u,
                               memory_order_relaxed);
+
+        stm_bt_lf_delta *new_head = new_base_delta;
+        if (preserved.present) {
+            stm_bt_lf_delta *split_clone = alloc_split_delta(preserved.sep_key,
+                                                               preserved.sep_key_len,
+                                                               preserved.sibling_id);
+            if (!split_clone) {
+                delta_destroy(new_base_delta);
+                free(preserved.sep_key);
+                rc = STM_ENOMEM;
+                break;
+            }
+            preserved.sep_key = NULL;       /* owned by split_clone */
+            atomic_store_explicit(&split_clone->next, new_base_delta,
+                                  memory_order_relaxed);
+            atomic_store_explicit(&split_clone->chain_depth, 1u,
+                                  memory_order_relaxed);
+            new_head = split_clone;
+        }
 
         if (atomic_compare_exchange_strong(&t->pt->slots[nid],
                                             &old_head, new_head)) {
             retire_old_chain(old_head);
             break;                          /* success */
         }
-        /* A prepender beat us. Discard and retry with fresh head. */
-        delta_destroy(new_head);
+        /* A prepender beat us. Discard the whole new chain and retry. */
+        if (new_head != new_base_delta) delta_destroy(new_head);
+        delta_destroy(new_base_delta);
     }
 
     atomic_store(&t->consolidating, false);
@@ -559,28 +800,58 @@ stm_status stm_btree_lf_force_consolidate(stm_btree_lf *t, stm_ebr_thread *ebr)
 {
     if (!t || !ebr) return STM_EINVAL;
     stm_ebr_enter(ebr);
-    /* Bypass the chain-depth check: always try. */
     uint64_t nid = atomic_load(&t->root_id);
     stm_bt_lf_delta *old_head = atomic_load(&t->pt->slots[nid]);
     stm_status s = STM_OK;
 
     if (old_head &&
         atomic_load_explicit(&old_head->chain_depth, memory_order_relaxed) > 0) {
-        stm_bt_node *new_base_node = build_consolidated_base(old_head, t->opts);
+        stm_bt_lf_preserved_split preserved;
+        stm_bt_node *new_base_node = build_consolidated_base(old_head, t->opts,
+                                                               &preserved);
         if (!new_base_node) { s = STM_ENOMEM; goto out; }
 
-        stm_bt_lf_delta *new_head = alloc_base_delta(new_base_node);
-        if (!new_head) {
+        if (new_base_node->nentries > t->opts.target_entries
+            && !preserved.present) {
+            s = commit_split(t, nid, old_head, new_base_node);
+            goto out;
+        }
+
+        stm_bt_lf_delta *new_base_delta = alloc_base_delta(new_base_node);
+        if (!new_base_delta) {
             stm_bt_node_free(new_base_node);
+            free(preserved.sep_key);
             s = STM_ENOMEM;
             goto out;
         }
-        atomic_store_explicit(&new_head->chain_depth, 0u, memory_order_relaxed);
+        atomic_store_explicit(&new_base_delta->chain_depth, 0u,
+                              memory_order_relaxed);
 
-        if (atomic_compare_exchange_strong(&t->pt->slots[nid], &old_head, new_head)) {
+        stm_bt_lf_delta *new_head = new_base_delta;
+        if (preserved.present) {
+            stm_bt_lf_delta *split_clone = alloc_split_delta(preserved.sep_key,
+                                                               preserved.sep_key_len,
+                                                               preserved.sibling_id);
+            if (!split_clone) {
+                delta_destroy(new_base_delta);
+                free(preserved.sep_key);
+                s = STM_ENOMEM;
+                goto out;
+            }
+            preserved.sep_key = NULL;
+            atomic_store_explicit(&split_clone->next, new_base_delta,
+                                  memory_order_relaxed);
+            atomic_store_explicit(&split_clone->chain_depth, 1u,
+                                  memory_order_relaxed);
+            new_head = split_clone;
+        }
+
+        if (atomic_compare_exchange_strong(&t->pt->slots[nid],
+                                            &old_head, new_head)) {
             retire_old_chain(old_head);
         } else {
-            delta_destroy(new_head);
+            if (new_head != new_base_delta) delta_destroy(new_head);
+            delta_destroy(new_base_delta);
         }
     }
 
@@ -593,20 +864,57 @@ out:
 /* Insert / delete.                                                           */
 /* ------------------------------------------------------------------------- */
 
-/* CAS-prepend `d` onto the chain at slot `nid`, setting d->next and
- * d->chain_depth in the process. Assumes the caller is inside EBR. */
-static void cas_prepend(stm_btree_lf *t, uint64_t nid, stm_bt_lf_delta *d)
+/* Traverse the tree from root, following any SPLIT redirects that
+ * apply to `key`, and CAS-prepend `d` at the target leaf. Assumes the
+ * caller is inside EBR. On CAS failure we reload and re-walk — this
+ * handles both the common insert-vs-insert race AND the rarer race
+ * where a SPLIT landed on our target slot between our walk and CAS.
+ * *out_final_nid gets the nid where the prepend landed; *out_depth
+ * gets the chain_depth of the newly published delta. */
+static void traverse_and_prepend(stm_btree_lf *t,
+                                   stm_bt_lf_delta *d,
+                                   const void *key, size_t key_len,
+                                   uint64_t *out_final_nid,
+                                   uint32_t *out_depth)
 {
-    stm_bt_lf_delta *head;
-    do {
-        head = atomic_load(&t->pt->slots[nid]);
+    uint64_t nid = atomic_load(&t->root_id);
+    for (;;) {
+        stm_bt_lf_delta *head = atomic_load(&t->pt->slots[nid]);
+        /* Walk the chain and decide: follow a SPLIT, or prepend here. */
+        uint64_t redirect = STM_BT_LF_NO_REDIRECT;
+        for (stm_bt_lf_delta *w = head; w; w = atomic_load(&w->next)) {
+            if (w->kind == STM_BT_LF_DELTA_SPLIT) {
+                if (stm_bt_key_cmp(key, key_len,
+                                   w->u.split.sep_key,
+                                   w->u.split.sep_key_len) >= 0) {
+                    redirect = w->u.split.sibling_id;
+                    break;
+                }
+            } else if (w->kind == STM_BT_LF_DELTA_BASE) {
+                break;
+            }
+            /* INSERT/DELETE deltas don't change the routing decision. */
+        }
+        if (redirect != STM_BT_LF_NO_REDIRECT) {
+            nid = redirect;
+            continue;
+        }
+
+        /* Prepend at `nid`. */
         atomic_store_explicit(&d->next, head, memory_order_relaxed);
         uint32_t base_depth = head
             ? atomic_load_explicit(&head->chain_depth, memory_order_relaxed)
             : 0u;
         atomic_store_explicit(&d->chain_depth, base_depth + 1u,
                               memory_order_relaxed);
-    } while (!atomic_compare_exchange_weak(&t->pt->slots[nid], &head, d));
+        if (atomic_compare_exchange_weak(&t->pt->slots[nid], &head, d)) {
+            *out_final_nid = nid;
+            *out_depth     = base_depth + 1u;
+            return;
+        }
+        /* CAS failed. Re-walk at this nid — if a SPLIT now applies to
+         * our key the next iteration follows it. */
+    }
 }
 
 stm_status stm_btree_lf_insert(stm_btree_lf *t, stm_ebr_thread *ebr,
@@ -620,13 +928,12 @@ stm_status stm_btree_lf_insert(stm_btree_lf *t, stm_ebr_thread *ebr,
 
     stm_ebr_enter(ebr);
 
-    uint64_t nid = atomic_load(&t->root_id);
-    cas_prepend(t, nid, d);
-    uint32_t depth_after = atomic_load_explicit(&d->chain_depth,
-                                                 memory_order_relaxed);
+    uint64_t final_nid = 0;
+    uint32_t depth_after = 0;
+    traverse_and_prepend(t, d, key, key_len, &final_nid, &depth_after);
 
     if (depth_after >= STM_BT_LF_CONSOLIDATE_THRESHOLD) {
-        (void)try_consolidate(t, nid);
+        (void)try_consolidate(t, final_nid);
     }
 
     stm_ebr_exit(ebr);
@@ -656,13 +963,12 @@ stm_status stm_btree_lf_delete(stm_btree_lf *t, stm_ebr_thread *ebr,
 
     stm_ebr_enter(ebr);
 
-    uint64_t nid = atomic_load(&t->root_id);
-    cas_prepend(t, nid, d);
-    uint32_t depth_after = atomic_load_explicit(&d->chain_depth,
-                                                 memory_order_relaxed);
+    uint64_t final_nid = 0;
+    uint32_t depth_after = 0;
+    traverse_and_prepend(t, d, key, key_len, &final_nid, &depth_after);
 
     if (depth_after >= STM_BT_LF_CONSOLIDATE_THRESHOLD) {
-        (void)try_consolidate(t, nid);
+        (void)try_consolidate(t, final_nid);
     }
 
     stm_ebr_exit(ebr);
