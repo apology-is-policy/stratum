@@ -67,7 +67,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends liboqs-dev || true
           if ! pkg-config --exists liboqs; then
               echo "liboqs not available via apt; building from source"
-              git clone --depth 1 --branch 0.10.0 https://github.com/open-quantum-safe/liboqs.git /tmp/liboqs
+              # 0.11.0 uses the final FIPS 203 symbol names
+              # (OQS_KEM_ml_kem_768_*); 0.10.0 had them as _ipd_ only.
+              git clone --depth 1 --branch 0.11.0 https://github.com/open-quantum-safe/liboqs.git /tmp/liboqs
               cmake -S /tmp/liboqs -B /tmp/liboqs/build -GNinja \
                     -DCMAKE_INSTALL_PREFIX=/usr/local \
                     -DOQS_BUILD_ONLY_LIB=ON -DOQS_USE_OPENSSL=OFF
