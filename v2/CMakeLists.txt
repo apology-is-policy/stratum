@@ -136,11 +136,14 @@ if(STM_ENABLE_LIBAIO)
 endif()
 
 if(STM_ENABLE_PQ)
-    # liboqs doesn't ship pkg-config universally; try both paths.
-    find_package(liboqs QUIET)
-    if(NOT liboqs_FOUND)
-        pkg_check_modules(LIBOQS IMPORTED_TARGET liboqs>=0.9.0)
-        if(NOT LIBOQS_FOUND)
+    # liboqs ships a CMake config package (0.11+) AND a pkg-config file.
+    # Prefer pkg-config because the CMake-exported target name has
+    # changed across versions (OQS::oqs in 0.12, liboqs::oqs in earlier
+    # variants) and pkg-config gives us a stable PkgConfig::LIBOQS.
+    pkg_check_modules(LIBOQS IMPORTED_TARGET liboqs>=0.9.0)
+    if(NOT LIBOQS_FOUND)
+        find_package(liboqs QUIET)
+        if(NOT liboqs_FOUND)
             message(WARNING "liboqs not found; PQ hybrid wrap disabled. "
                             "Set STM_ENABLE_PQ=OFF to silence, or install liboqs.")
             set(STM_ENABLE_PQ OFF)

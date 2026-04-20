@@ -23,10 +23,17 @@ target_link_libraries(stm_crypto
 
 if(STM_ENABLE_PQ)
     target_compile_definitions(stm_crypto PRIVATE STM_HAVE_LIBOQS=1)
-    if(TARGET liboqs::oqs)
-        target_link_libraries(stm_crypto PRIVATE liboqs::oqs)
-    elseif(TARGET PkgConfig::LIBOQS)
-        target_link_libraries(stm_crypto PRIVATE PkgConfig::LIBOQS)
+    # Prefer pkg-config target; fall back to find_package names. liboqs
+    # has renamed its CMake export target across versions (OQS::oqs,
+    # liboqs::oqs) so we try each.
+    if(TARGET PkgConfig::LIBOQS)
+        target_link_libraries(stm_crypto PUBLIC PkgConfig::LIBOQS)
+    elseif(TARGET OQS::oqs)
+        target_link_libraries(stm_crypto PUBLIC OQS::oqs)
+    elseif(TARGET liboqs::oqs)
+        target_link_libraries(stm_crypto PUBLIC liboqs::oqs)
+    else()
+        message(FATAL_ERROR "STM_ENABLE_PQ=ON but no liboqs target available.")
     endif()
 else()
     target_compile_definitions(stm_crypto PRIVATE STM_HAVE_LIBOQS=0)
