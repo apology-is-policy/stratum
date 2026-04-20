@@ -169,6 +169,94 @@ STM_TEST(btree_lf_delete_reinsert_sequence) {
     stm_btree_lf_free(t);
 }
 
+/* Randomized single-threaded op sequence with a shadow oracle. Every
+ * operation on the tree is mirrored onto a plain-array shadow; after
+ * every few ops we force a consolidate and then cross-check every
+ * possible key. Covers the delta-chain + consolidate path end-to-end
+ * against an independent reference. */
+STM_TEST(btree_lf_randomized_shadow_oracle) {
+    stm_btree_lf *t = make_tree(32);    /* small target → many consolidates */
+    stm_ebr_thread *ebr = stm_ebr_register();
+
+    enum { KEYS = 16, OPS = 512 };
+    int  shadow_present[KEYS];
+    int  shadow_value[KEYS];
+    memset(shadow_present, 0, sizeof shadow_present);
+    memset(shadow_value,   0, sizeof shadow_value);
+
+    /* Seeded deterministic LCG — reproducible failures. */
+    uint64_t rs = 0x1234567890ABCDEFull;
+    for (int i = 0; i < OPS; i++) {
+        rs = rs * 6364136223846793005ull + 1442695040888963407ull;
+        uint32_t pick = (uint32_t)((rs >> 32) & 0x3);
+        uint32_t k    = (uint32_t)((rs >> 48) % KEYS);
+        int      v    = (int)(rs & 0xFFFF);
+
+        char kbuf[8];
+        int  kl = snprintf(kbuf, sizeof kbuf, "k%04u", k);
+
+        switch (pick) {
+        case 0: case 1: {   /* insert / overwrite */
+            STM_ASSERT_OK(stm_btree_lf_insert(t, ebr, kbuf, (size_t)kl,
+                                               &v, sizeof v));
+            shadow_present[k] = 1;
+            shadow_value[k]   = v;
+            break;
+        }
+        case 2: {           /* delete */
+            stm_status s = stm_btree_lf_delete(t, ebr, kbuf, (size_t)kl);
+            if (shadow_present[k]) {
+                STM_ASSERT_OK(s);
+            } else {
+                STM_ASSERT_ERR(s, STM_ENOENT);
+            }
+            shadow_present[k] = 0;
+            break;
+        }
+        case 3: {           /* lookup + oracle check */
+            int got = 0;
+            size_t vl = 0;
+            stm_status s = stm_btree_lf_lookup(t, ebr, kbuf, (size_t)kl,
+                                                &got, sizeof got, &vl);
+            if (shadow_present[k]) {
+                STM_ASSERT_OK(s);
+                STM_ASSERT_EQ(vl, sizeof got);
+                STM_ASSERT_EQ(got, shadow_value[k]);
+            } else {
+                STM_ASSERT_ERR(s, STM_ENOENT);
+            }
+            break;
+        }
+        }
+
+        /* Periodic consolidate so we exercise both the pre- and post-
+         * consolidate chain states. */
+        if ((i & 0x1F) == 0x1F) {
+            STM_ASSERT_OK(stm_btree_lf_force_consolidate(t, ebr));
+        }
+    }
+
+    /* Final consolidate then scan every key via lookup; compare to shadow. */
+    STM_ASSERT_OK(stm_btree_lf_force_consolidate(t, ebr));
+    for (uint32_t k = 0; k < KEYS; k++) {
+        char kbuf[8];
+        int  kl = snprintf(kbuf, sizeof kbuf, "k%04u", k);
+        int    got = 0;
+        size_t vl  = 0;
+        stm_status s = stm_btree_lf_lookup(t, ebr, kbuf, (size_t)kl,
+                                            &got, sizeof got, &vl);
+        if (shadow_present[k]) {
+            STM_ASSERT_OK(s);
+            STM_ASSERT_EQ(got, shadow_value[k]);
+        } else {
+            STM_ASSERT_ERR(s, STM_ENOENT);
+        }
+    }
+
+    stm_ebr_thread_free(ebr);
+    stm_btree_lf_free(t);
+}
+
 /* ------------------------------------------------------------------------- */
 /* Concurrent stress — correctness under TSan/ASan.                           */
 /* ------------------------------------------------------------------------- */
