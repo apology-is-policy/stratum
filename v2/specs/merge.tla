@@ -28,20 +28,26 @@
 \* k >= Sep1 routes directly to L1.
 \*
 \* Precondition (step 0 of the implementation, not re-verified here):
-\* the implementation purges any SPLIT(*, R) delta that may sit on L1's
-\* chain before entering the three-step protocol modeled below.
+\* the implementation purges any SPLIT(*, R) delta that may sit on any
+\* sibling's chain in the parent's pivot array before entering the
+\* three-step protocol modeled below.
 \*
-\* In the real Bw-tree, R was originally carved out of L1 by an earlier
-\* split, so L1's chain carries SPLIT(Sep2, R). Merging R without first
-\* removing that SPLIT would leave L1 routing k >= Sep2 back to R, which
-\* now SEAL-forwards to L1 — a bounce. Step 0 (`purge_split_on_l` in
-\* src/btree/btree_lf.c) CASes L1's slot to a chain without the stale
-\* SPLIT, establishing the clean scenario this spec models. Step 0's
+\* In the real Bw-tree, R was originally carved out of some leaf O by
+\* an earlier split, so O's chain carries SPLIT(Sep2, R). Subsequent
+\* splits may have inserted new pivots between O and R, so at R's
+\* merge time O is not necessarily R's immediate left neighbor. If
+\* ANY leaf retains its stale SPLIT(*, R), readers arriving at that
+\* leaf could redirect to R which SEAL-forwards onward, potentially
+\* looping through a chain of merged siblings back to the originator.
+\* Step 0 (`purge_all_stale_splits` in src/btree/btree_lf.c) iterates
+\* every sibling in the parent's pivot array and CASes each slot to a
+\* chain without the stale SPLIT, establishing the clean scenario
+\* this spec models for the leaves it touches. Step 0's per-leaf
 \* correctness is straightforward: the CAS replaces a chain that
 \* redirects `k >= Sep2` to R (empty) with one that falls through to
-\* L1's BASE for the same key range. Both states return the same ABSENT
-\* result for any k in R's range (since R is empty and L1_initial does
-\* not include keys >= Sep2).
+\* that leaf's BASE for the same key range. Both states return the
+\* same ABSENT result for any k in R's range (since R is empty and
+\* that leaf's initial set does not include keys >= Sep2).
 \*
 \* Protocol. Three CAS events in strict order (all serialized under
 \* t->consolidating; see commit_merge):

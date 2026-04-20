@@ -219,6 +219,7 @@ struct stm_bt_lf_delta {
 
 typedef struct stm_bt_page_table {
     _Atomic(stm_bt_lf_delta *) *slots;
+    _Atomic bool               *slot_consolidating;  /* per-slot gate */
     _Atomic uint64_t            next_id;
     size_t                      capacity;
 } stm_bt_page_table;
@@ -227,12 +228,13 @@ struct stm_btree_lf {
     stm_bt_page_table *pt;
     _Atomic uint64_t   root_id;
     stm_btree_opts     opts;
-    /* Single-consolidator / single-splitter gate. Every split and
-     * every parent-update goes through this. Writers past the chain
-     * threshold attempt try_acquire; the winner does the work and the
-     * rest bail to their insert/delete fast path. force_consolidate
-     * (test-only) takes this blocking. */
-    _Atomic bool       consolidating;
+    /* Structural-op gate. Held by commit_split and commit_merge for
+     * the duration of their parent-affecting CAS events (and by
+     * commit_merge's step-0 purge on the forward target). Serializes
+     * structural ops tree-wide so parent pivot updates are
+     * linearized. Acquired AFTER slot_consolidating; lock order is
+     * slot → structural. */
+    _Atomic bool       structural_lock;
 };
 
 /* ------------------------------------------------------------------------- */
@@ -501,6 +503,16 @@ static stm_bt_page_table *page_table_new(size_t capacity)
     if (!pt) return NULL;
     pt->slots = calloc(capacity, sizeof *pt->slots);
     if (!pt->slots) { free(pt); return NULL; }
+    pt->slot_consolidating = calloc(capacity, sizeof *pt->slot_consolidating);
+    if (!pt->slot_consolidating) {
+        free(pt->slots); free(pt); return NULL;
+    }
+    /* R2-2 carries over: _Atomic fields require atomic_init, even when
+     * calloc zero-initialized them. Lock-based-atomic platforms have
+     * indeterminate state otherwise. */
+    for (size_t i = 0; i < capacity; i++) {
+        atomic_init(&pt->slot_consolidating[i], false);
+    }
     atomic_init(&pt->next_id, 0);
     pt->capacity = capacity;
     return pt;
@@ -519,6 +531,7 @@ static void page_table_free(stm_bt_page_table *pt)
             d = next;
         }
     }
+    free(pt->slot_consolidating);
     free(pt->slots);
     free(pt);
 }
@@ -541,7 +554,7 @@ stm_status stm_btree_lf_new(const stm_btree_opts *opts, stm_btree_lf **out)
 
     stm_btree_lf *t = calloc(1, sizeof *t);
     if (!t) return STM_ENOMEM;
-    atomic_init(&t->consolidating, false);
+    atomic_init(&t->structural_lock, false);
     t->opts = opts ? *opts : stm_btree_opts_default();
     if (t->opts.target_entries  < 4) t->opts.target_entries  = 4;
     if (t->opts.target_messages < 1) t->opts.target_messages = 1;
@@ -1111,11 +1124,11 @@ static stm_bt_lf_delta *build_leaf_chain(stm_bt_node *leaf,
  *
  * Spec: balanced.tla Phase_Installed_X → Phase_PostSplit →
  * Phase_ParentUpd. */
-static stm_status commit_split(stm_btree_lf *t, uint64_t nid,
-                                 uint64_t parent_nid,
-                                 stm_bt_lf_delta *old_head,
-                                 stm_bt_node *full_base,
-                                 stm_bt_lf_preserved_splits *preserved)
+static stm_status commit_split_impl(stm_btree_lf *t, uint64_t nid,
+                                      uint64_t parent_nid,
+                                      stm_bt_lf_delta *old_head,
+                                      stm_bt_node *full_base,
+                                      stm_bt_lf_preserved_splits *preserved)
 {
     stm_bt_node             *upper                 = NULL;
     uint8_t                 *sep_key               = NULL;
@@ -1359,11 +1372,21 @@ static int32_t find_pivot_index(const stm_bt_lf_internal *internal,
  * three-step spec implicitly assumes — its scenario models L1 as
  * [BASE_LEAF(L1_initial)] with no SPLIT).
  *
- * Consolidates L's chain (extracting BASE + preserved SPLITs), drops the
- * preserved SPLIT pointing at r_nid, rebuilds the chain, and CASes L's
- * slot. On CAS failure from a racing writer, retries; on exhaustion
- * returns OK (the merge attempt will skip this round). Caller holds
- * t->consolidating so no other structural op races.
+ * Returns:
+ *   STM_OK      — L's chain no longer has SPLIT(*, r_nid). Either it
+ *                 never did (`!removed`) or the purge CAS succeeded.
+ *                 Caller may safely proceed to SealR.
+ *   STM_EBUSY   — retry budget exhausted with SPLIT(*, r_nid) still
+ *                 present. Caller must NOT proceed to SealR; doing so
+ *                 would create a reader/writer bounce. Abort the merge
+ *                 and let the next consolidation cycle retry.
+ *   STM_ENOMEM  — allocator failure during chain rebuild.
+ *   STM_ECORRUPT — L's slot is empty (shouldn't happen for a valid
+ *                  forward target).
+ *
+ * Caller holds structural_lock; concurrent structural ops on L can't
+ * race. Concurrent consolidators on L (under slot_lock[L]) can CAS
+ * on L's head and require the retry loop.
  */
 static stm_status purge_split_on_l(stm_btree_lf *t, uint64_t l_nid,
                                      uint64_t r_nid)
@@ -1383,7 +1406,7 @@ static stm_status purge_split_on_l(stm_btree_lf *t, uint64_t l_nid,
         if (new_base->nentries > t->opts.target_entries) {
             stm_bt_node_free(new_base);
             preserved_splits_free(&preserved);
-            return STM_OK;
+            return STM_EBUSY;
         }
 
         /* Drop any SPLIT whose sibling is r_nid. In practice there is
@@ -1432,7 +1455,51 @@ static stm_status purge_split_on_l(stm_btree_lf *t, uint64_t l_nid,
             cur = nx;
         }
     }
-    return STM_OK;
+    /* Retry budget exhausted with SPLIT(*, r_nid) still present on L.
+     * Caller must abort — SealR without purge would create a bounce. */
+    return STM_EBUSY;
+}
+
+/* Purge SPLIT(*, r_nid) from every leaf in the parent's pivot array
+ * except r_nid itself. When R was split off its originating leaf O,
+ * SPLIT(sep_R, R) was prepended on O. Subsequent splits may have
+ * inserted other pivots into the parent between O and R, so at R's
+ * merge time R's forward_target (left neighbor in parent) need not be
+ * O — it could be a newer sibling that never had SPLIT(*, R). If O's
+ * stale SPLIT(*, R) is left in place, readers arriving at O via
+ * parent or another SPLIT will re-redirect to R which SEAL-forwards
+ * elsewhere, potentially looping through a chain of merged siblings
+ * back to O (documented cycle: R → SEAL → X → SEAL → ... → O →
+ * SPLIT(R) → R).
+ *
+ * Under structural_lock, parent's pivot array is stable; we snapshot
+ * it once and scan each leaf. Returns STM_EBUSY if any leaf's purge
+ * exhausts its retry budget with the stale SPLIT still present.
+ */
+static stm_status purge_all_stale_splits(stm_btree_lf *t, uint64_t parent_nid,
+                                           uint64_t r_nid)
+{
+    stm_bt_lf_delta *parent_head = atomic_load(&t->pt->slots[parent_nid]);
+    if (!parent_head || parent_head->kind != STM_BT_LF_DELTA_BASE_INTERNAL)
+        return STM_ECORRUPT;
+
+    const stm_bt_lf_internal *internal = parent_head->u.base_internal.internal;
+    uint32_t n = internal->npivots + 1u;
+    uint64_t *leaves = malloc(n * sizeof *leaves);
+    if (!leaves) return STM_ENOMEM;
+    leaves[0] = internal->leftmost_child;
+    for (uint32_t i = 0; i < internal->npivots; i++) {
+        leaves[i + 1] = internal->pivots[i].right_child;
+    }
+
+    stm_status rc = STM_OK;
+    for (uint32_t i = 0; i < n; i++) {
+        if (leaves[i] == r_nid) continue;
+        stm_status s = purge_split_on_l(t, leaves[i], r_nid);
+        if (s != STM_OK) { rc = s; break; }
+    }
+    free(leaves);
+    return rc;
 }
 
 /* Implements the four-step MERGE protocol. merge.tla models steps 1-3
@@ -1465,10 +1532,10 @@ static stm_status purge_split_on_l(stm_btree_lf *t, uint64_t l_nid,
  *     readers remain correct. Pivot leak (minor, bounded by merge
  *     count in this MVP).
  */
-static stm_status commit_merge(stm_btree_lf *t, uint64_t r_nid,
-                                 uint64_t parent_nid,
-                                 stm_bt_lf_delta *expected_head,
-                                 uint32_t pivot_index)
+static stm_status commit_merge_impl(stm_btree_lf *t, uint64_t r_nid,
+                                     uint64_t parent_nid,
+                                     stm_bt_lf_delta *expected_head,
+                                     uint32_t pivot_index)
 {
     stm_bt_lf_delta *parent_head = atomic_load(&t->pt->slots[parent_nid]);
     if (!parent_head || parent_head->kind != STM_BT_LF_DELTA_BASE_INTERNAL)
@@ -1500,11 +1567,25 @@ static stm_status commit_merge(stm_btree_lf *t, uint64_t r_nid,
         return STM_ENOMEM;
     }
 
-    /* Step 0 — PurgeSplitOnL. Remove the stale SPLIT on L's chain
-     * that points back to R. Without this, readers arriving at L via
-     * SEAL(forward=L) would re-redirect to R and bounce. See the
-     * purge_split_on_l header for the reasoning. */
-    stm_status purge_rc = purge_split_on_l(t, forward_id, r_nid);
+    /* Step 0 — PurgeStaleSplits. Remove SPLIT(*, r_nid) from every
+     * sibling in the parent's pivot array. The originating leaf (the
+     * one that split to create R) still carries that SPLIT; merging
+     * R without removing it would let readers re-redirect back to R
+     * via the originating leaf's chain, forming a cycle through
+     * SEAL forwards. See purge_all_stale_splits header for the
+     * detailed cycle scenario.
+     *
+     * On STM_EBUSY (any leaf's purge retries exhausted with SPLIT
+     * still present), abort the merge rather than proceeding to
+     * SealR — SealR without complete purge would create exactly the
+     * cycle we're trying to prevent. The next consolidation cycle
+     * will retry. */
+    stm_status purge_rc = purge_all_stale_splits(t, parent_nid, r_nid);
+    if (purge_rc == STM_EBUSY) {
+        delta_destroy(sealed);
+        delta_destroy(new_parent_delta);
+        return STM_OK;   /* merge deferred; caller sees clean abort */
+    }
     if (purge_rc != STM_OK) {
         delta_destroy(sealed);
         delta_destroy(new_parent_delta);
@@ -1542,6 +1623,41 @@ static stm_status commit_merge(stm_btree_lf *t, uint64_t r_nid,
     retire_chain(expected_head);
     retire_chain(parent_head);
     return STM_OK;
+}
+
+/* Forward-declare the structural-lock helpers so the thin wrappers
+ * below compile. Their definitions live in the Lock-helpers section. */
+static void acquire_structural_blocking(stm_btree_lf *t);
+static void release_structural(stm_btree_lf *t);
+
+/* Thin wrappers that acquire the tree-wide structural lock for the
+ * duration of a structural op. Callers (consolidate_or_split) hold
+ * only the per-slot consolidation lock; the structural lock is what
+ * serializes commit_split and commit_merge with each other. Lock
+ * order is slot → structural. */
+static stm_status commit_split(stm_btree_lf *t, uint64_t nid,
+                                 uint64_t parent_nid,
+                                 stm_bt_lf_delta *old_head,
+                                 stm_bt_node *full_base,
+                                 stm_bt_lf_preserved_splits *preserved)
+{
+    acquire_structural_blocking(t);
+    stm_status rc = commit_split_impl(t, nid, parent_nid, old_head,
+                                        full_base, preserved);
+    release_structural(t);
+    return rc;
+}
+
+static stm_status commit_merge(stm_btree_lf *t, uint64_t r_nid,
+                                 uint64_t parent_nid,
+                                 stm_bt_lf_delta *expected_head,
+                                 uint32_t pivot_index)
+{
+    acquire_structural_blocking(t);
+    stm_status rc = commit_merge_impl(t, r_nid, parent_nid, expected_head,
+                                        pivot_index);
+    release_structural(t);
+    return rc;
 }
 
 /* Merge eligibility + dispatch helper.
@@ -1664,33 +1780,67 @@ static stm_status consolidate_or_split(stm_btree_lf *t, uint64_t nid,
     return STM_OK;
 }
 
-/* Consolidating-flag helpers. */
-static bool try_acquire_consolidate(stm_btree_lf *t)
+/* Lock helpers.
+ *
+ * Two levels (acquired in this order — slot → structural):
+ *
+ *   slot_consolidate(nid) — serializes consolidation attempts on a
+ *       single leaf slot. Different leaves can consolidate in parallel.
+ *       Writers' try_consolidate uses try_acquire (non-blocking).
+ *       force_consolidate uses the blocking variant.
+ *
+ *   structural — serializes commit_split / commit_merge tree-wide so
+ *       parent BASE_INTERNAL updates are linearized. Acquired inside
+ *       commit_split / commit_merge (callers hold slot_consolidate).
+ */
+static bool try_acquire_slot_consolidate(stm_btree_lf *t, uint64_t nid)
 {
     bool expected = false;
-    return atomic_compare_exchange_strong(&t->consolidating, &expected, true);
+    return atomic_compare_exchange_strong_explicit(
+        &t->pt->slot_consolidating[nid], &expected, true,
+        memory_order_acquire, memory_order_relaxed);
 }
 
-static void acquire_consolidate_blocking(stm_btree_lf *t)
+static void acquire_slot_consolidate_blocking(stm_btree_lf *t, uint64_t nid)
 {
     bool expected = false;
-    while (!atomic_compare_exchange_weak(&t->consolidating, &expected, true)) {
+    while (!atomic_compare_exchange_weak_explicit(
+        &t->pt->slot_consolidating[nid], &expected, true,
+        memory_order_acquire, memory_order_relaxed)) {
         expected = false;
     }
 }
 
-static void release_consolidate(stm_btree_lf *t)
+static void release_slot_consolidate(stm_btree_lf *t, uint64_t nid)
 {
-    atomic_store(&t->consolidating, false);
+    atomic_store_explicit(&t->pt->slot_consolidating[nid], false,
+                           memory_order_release);
+}
+
+static void acquire_structural_blocking(stm_btree_lf *t)
+{
+    bool expected = false;
+    while (!atomic_compare_exchange_weak_explicit(
+        &t->structural_lock, &expected, true,
+        memory_order_acquire, memory_order_relaxed)) {
+        expected = false;
+    }
+}
+
+static void release_structural(stm_btree_lf *t)
+{
+    atomic_store_explicit(&t->structural_lock, false, memory_order_release);
 }
 
 /* Contended-but-non-blocking consolidate; called by writers past the
- * threshold. */
+ * threshold. Acquires only the slot-level lock; commit_split and
+ * commit_merge will separately acquire the tree-wide structural lock
+ * if they fire. */
 static stm_status try_consolidate(stm_btree_lf *t, uint64_t nid)
 {
-    if (!try_acquire_consolidate(t)) return STM_OK;
+    if (!try_acquire_slot_consolidate(t, nid)) return STM_OK;
     stm_status rc = consolidate_or_split(t, nid, false);
-    release_consolidate(t);
+    release_slot_consolidate(t, nid);
     return rc;
 }
 
@@ -1721,7 +1871,6 @@ stm_status stm_btree_lf_force_consolidate(stm_btree_lf *t, stm_ebr_thread *ebr)
 {
     if (!t || !ebr) return STM_EINVAL;
     stm_ebr_enter(ebr);
-    acquire_consolidate_blocking(t);
 
     stm_status rc = STM_OK;
     for (uint32_t iter = 0; iter < 16; iter++) {
@@ -1740,7 +1889,9 @@ stm_status stm_btree_lf_force_consolidate(stm_btree_lf *t, stm_ebr_thread *ebr)
              * consolidate_or_split regardless; its depth==0 fast-path
              * triggers try_merge when the BASE is empty and returns
              * quickly otherwise. */
+            acquire_slot_consolidate_blocking(t, leaves[i]);
             stm_status s = consolidate_or_split(t, leaves[i], true);
+            release_slot_consolidate(t, leaves[i]);
             if (s != STM_OK) { free(leaves); rc = s; goto out; }
             /* R4-P3-1: only mark any_work if we actually reduced depth.
              * Otherwise the outer loop thrashes on leaves whose chain
@@ -1763,7 +1914,6 @@ stm_status stm_btree_lf_force_consolidate(stm_btree_lf *t, stm_ebr_thread *ebr)
     }
 
 out:
-    release_consolidate(t);
     stm_ebr_exit(ebr);
     return rc;
 }

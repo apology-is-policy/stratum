@@ -147,14 +147,24 @@ target=4 → max leaf depth 9. See `btree_lf_balanced_growth` and
    (spec extension, not correctness), leftmost-merge unsupported
    (MVP scope). Full list in `memory/audit_v2_r0_closed_list.md`.
 
-2. **Per-node consolidator flag** — the current `t->consolidating`
-   is tree-global. Under the multi-leaf stress (`048520f`),
-   chain depth on one leaf spiked past MAX_CHAIN=4096 because other
-   leaves held the flag. Per-node flag would let chain-drain
-   happen in parallel across leaves, unblocking higher-throughput
-   stress (and the historical 10s+ target). Modest change — add
-   `_Atomic bool consolidating` to the page-table slot or as a
-   parallel array indexed by nid.
+2. **Per-node consolidator flag** — LANDED. Each slot now has its
+   own `_Atomic bool slot_consolidating`; tree-wide `structural_lock`
+   is held only for commit_split / commit_merge (parent-affecting
+   ops). Chain consolidation parallelizes across leaves. Multi-merge
+   concurrent stress (`btree_lf_merge_concurrent_stress`, 4×24 ops
+   × 6 rounds) exercises this path under default/ASan/TSan. Lock
+   order: slot → structural.
+
+   The refactor exposed a latent MERGE bug: the original
+   `purge_split_on_l` only purged the forward target's chain, but
+   R's originating leaf (the one that split to create R) retains
+   SPLIT(*, R) and isn't necessarily the forward target after later
+   pivot insertions. Under sequential merges, the leftover SPLIT
+   forms a cycle: `R → SEAL → X → ... → O → SPLIT(R) → R`. Fixed
+   by `purge_all_stale_splits` which iterates every sibling in
+   parent's pivot array. This was a pre-existing bug latent under
+   the tree-wide lock's coarse serialization; per-node exposed it
+   under higher-parallelism workloads.
 
 3. **Follow-ups unlocked by landed MERGE:**
    - EBR-aware SPLIT purge. When a parent pivot has been present
@@ -287,12 +297,17 @@ already-settled decisions:
    SEAL'd slots are naturally excluded) and carefully audit EBR
    retire timing.
 
-12. **MERGE requires PurgeSplitOnL FIRST** (step 0 of the 4-step
-   protocol, implicit in the 3-step merge.tla scenario). Without
-   it, readers bounce between L's stale SPLIT(*, R) and R's
-   SEAL(forward=L). commit_merge calls `purge_split_on_l` before
-   SealR. If you ever reorder these, re-verify with a TSan run
-   of `btree_lf_merge_rightmost_after_split`.
+12. **MERGE requires purge_all_stale_splits FIRST** (step 0 of
+   the 4-step protocol, implicit in the 3-step merge.tla scenario).
+   Purge scans EVERY leaf in parent's pivot array — not just R's
+   forward target. R's originating leaf (the one that split to
+   create R) still carries SPLIT(*, R) and may no longer be R's
+   immediate left neighbor after later pivot insertions. Purging
+   only the forward target leaves that stale SPLIT, creating the
+   SEAL-chain cycle `R → SEAL → X → SEAL → ... → O → SPLIT(R)
+   → R` observed under multi-merge concurrent stress. If you
+   narrow the purge, re-verify with
+   `btree_lf_merge_concurrent_stress` under ASan.
 
 13. **Merge eligibility is strict**: consolidated BASE with 0
    entries AND 0 preserved SPLITs AND non-leftmost pivot. Leaves
@@ -300,6 +315,21 @@ already-settled decisions:
    SPLITs redirect ranges to still-live siblings; MERGE doesn't
    transfer those redirects. An EBR-aware SPLIT purge would
    relax this (future work).
+
+14. **Lock order is slot → structural.** Per-slot consolidation
+   (slot_consolidating[nid]) is acquired first; structural ops
+   (commit_split, commit_merge) acquire the tree-wide
+   structural_lock internally after the caller holds the slot.
+   Reversing this order or independently holding both with
+   different nids risks deadlock.
+
+15. **Consolidation on L races with purge on L.** purge_split_on_l
+   does NOT take slot_lock[L] (L is not the consolidation target —
+   R is). A consolidator on L holding slot_lock[L] can CAS L's
+   slot concurrently with purge's CAS. The retry loop handles it,
+   and retry exhaustion returns STM_EBUSY so commit_merge aborts
+   cleanly rather than proceeding to SealR with a stale SPLIT
+   still in place.
 
 ## Key files
 
