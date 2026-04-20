@@ -1,26 +1,27 @@
 # Phase 3 — status and next-session guide
 
 Authoritative pickup guide for Phase 3 (persistence + allocator). Last
-update 2026-04-20 (after `allocator.tla` landed). Companion to
-`phase2-status.md`, which remains the reference for the Bw-tree layer
-Phase 3 builds on.
+update 2026-04-20 (after chunk 4a / bootstrap pool landed). Companion
+to `phase2-status.md`, which remains the reference for the Bw-tree
+layer Phase 3 builds on.
 
 ## TL;DR
 
-Phase 3 is in progress. Three chunks landed:
+Phase 3 is in progress. Four chunks landed:
 
 | Commit | What | Tests |
 |---|---|---|
 | `4d87fb7` | Uberblock format (4 KiB struct, BLAKE3 csum) + label layout + `stm_bptr` + encode/decode | 12 sb tests |
 | `2290d49` | Device-backed label I/O + mount_scan (single-device authoritative selection) | +5 bdev-backed tests |
 | `cf52a1f` | `allocator.tla` spec: refcount + deferred-free safety. TLC clean (3729 states, depth 16) | — |
+| `37a3be7` | **Chunk 4a**: bootstrap-pool allocator (bitmap-managed, ping-pong hdr+bm slots, PENDING deferred-free matching `allocator.tla`'s Commit rule) | 16 alloc tests |
 
 Phase 2 is complete (SPLIT + MERGE + per-node consolidator + SCAN + R0-R6
 audits). Phase 3 chunks remaining:
 
-1. **Allocator implementation** (biggest) — src/alloc/: per-device
-   Bε-tree-rooted allocator, bootstrap pool, SDArray in-RAM, xor
-   filter, W-TinyLFU cache, PENDING-state machine, stripe API. ARCH §6.
+1. **Allocator implementation** — 4a (bootstrap pool) landed. Remaining:
+   4b allocator Bε-tree, 4c SDArray in-RAM, 4d xor filter, 4e R7 full audit.
+   ARCH §6.
 2. **Bε-tree node serialization** — moved from Phase 2. Encode/decode
    with Merkle-hash field + csum. ARCH §5.4 bptr + §3 node format.
 3. **Four-phase commit implementation** — wire the protocol sync.tla
@@ -31,7 +32,8 @@ audits). Phase 3 chunks remaining:
    writes at every commit phase; verify mount recovers to a
    consistent state.
 6. **R7 audit** — adversarial soundness pass per CLAUDE.md before
-   Phase 3 exit.
+   Phase 3 exit. R7a (bootstrap only, see §"Next chunk") runs with
+   chunk 4a; full R7 at the end of allocator work.
 
 ## You have autonomy
 
@@ -111,26 +113,27 @@ Expected TLC results:
 - `merge.tla` — empty-leaf reabsorb. 65536 states, depth 18.
 - `allocator.tla` — refcount + deferred-free. 3729 states, depth 16.
 
-## Next chunk — allocator implementation
+## Next chunk — allocator tree (chunk 4b)
 
-This is the biggest chunk in Phase 3. Consider splitting:
+Chunk 4a landed at `37a3be7` with 16 tests green on default / ASan /
+TSan. API, layout, and semantics are in `include/stratum/alloc.h`.
+The bootstrap pool is bitmap-managed at 128 KiB (32-block) granularity,
+with ping-pong header + bitmap slots for torn-write safety and BLAKE3-256
+self-csums on each header slot plus a bitmap csum recorded in the
+header. The deferred-free machinery stamps PENDING entries with
+caller-supplied `free_gen`; `stm_alloc_commit(committed_gen)` sweeps
+`free_gen < committed_gen` exactly as `allocator.tla` specifies. Commit
+COWs the bitmap then the header, fsync'd between writes; a crash at any
+point recovers cleanly via the older-slot fallback.
 
-**Chunk 4a: Bootstrap pool + core primitives.**
-- Header: `include/stratum/alloc.h`. Public API:
-  - `stm_alloc_open(bdev, pool_config, out_alloc)` — reads bootstrap
-    pool header, loads bitmap, ready to serve.
-  - `stm_alloc_reserve(alloc, nblocks, hint, out_paddr)` — reserve
-    blocks at commit-reservation time.
-  - `stm_alloc_free(alloc, paddr, nblocks)` — mark PENDING.
-  - `stm_alloc_commit(alloc, committed_gen)` — sweep PENDING →
-    FREE for free_gen < committed_gen.
-  - `stm_alloc_close(alloc)`.
-- Implementation: `src/alloc/bootstrap.c` with the bitmap-managed
-  bootstrap-pool-only allocator first (no Bε-tree yet). Bitmap blocks
-  are CAS-style COW per §6.5.2. Two-slot bootstrap-pool header for
-  torn-write safety.
-- Tests: bootstrap alloc/free cycles, survive unmount/remount,
-  PENDING drain semantics.
+MVP restrictions (carry into 4b):
+- Single-block bitmap → bootstrap pool capped at 4 GiB. Extend with
+  multi-block bitmaps when a device needs more.
+- Single-device: paddrs return device = 0. The allocator-roots object
+  (per §6.3.2) will add device indirection.
+
+**Chunk 4a was audited as R7a.** See audit-closed-list for findings.
+**Chunk 4a: Bootstrap pool — LANDED (2026-04-20).**
 
 **Chunk 4b: Allocator tree (Bε-tree rooted).**
 - Reuse existing `stm_btree` (single-threaded) or `stm_btree_lf`
@@ -143,6 +146,11 @@ This is the biggest chunk in Phase 3. Consider splitting:
   reservation time).
 - Integration with bootstrap pool: allocator-tree NODES live in
   the bootstrap pool. Tree-INSERT doesn't recurse into the allocator.
+- Node placement contract: the btree layer must be parameterized
+  with an allocator callback (`reserve_for_node` / `free_node`) so
+  that Bε-tree page writes consume bootstrap-pool units rather than
+  allocator-tree ranges. Prototype: a thin wrapper around
+  `stm_alloc_reserve(a, STM_BOOTSTRAP_UNIT_BLOCKS, hint, &paddr)`.
 
 **Chunk 4c: In-RAM succinct bitmap (SDArray).**
 - Performance structure. `src/alloc/sdarray.c`. Approximate
