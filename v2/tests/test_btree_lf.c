@@ -276,6 +276,63 @@ STM_TEST(btree_lf_left_side_re_split) {
     stm_btree_lf_free(t);
 }
 
+/* Balanced-tree stress: insert many keys forcing many leaf splits, then
+ * verify the tree has grown with parent pivots, not just a right-chain.
+ * After all inserts + a final consolidate:
+ *
+ *   - every key must lookup correctly.
+ *   - the MAX per-leaf chain depth must stay bounded (no unbounded
+ *     growth O(N/target); internal-routing gives O(1) per leaf after
+ *     consolidation).
+ *
+ * This is the property #176 exists to deliver: O(log N) lookups via
+ * balanced internal routing, not O(N/target) via a right-biased chain. */
+STM_TEST(btree_lf_balanced_growth) {
+    stm_btree_lf *t = make_tree(4);     /* tiny target → many splits */
+    stm_ebr_thread *ebr = stm_ebr_register();
+
+    enum { N = 1024 };                  /* → ~256+ leaves under parent pivots */
+    for (int i = 0; i < N; i++) {
+        char kbuf[16];
+        int kl = snprintf(kbuf, sizeof kbuf, "bkg-%06d", i);
+        int v = i;
+        STM_ASSERT_OK(stm_btree_lf_insert(t, ebr, kbuf, (size_t)kl,
+                                           &v, sizeof v));
+    }
+
+    STM_ASSERT_OK(stm_btree_lf_force_consolidate(t, ebr));
+
+    for (int i = 0; i < N; i++) {
+        char kbuf[16];
+        int kl = snprintf(kbuf, sizeof kbuf, "bkg-%06d", i);
+        int got = 0;
+        size_t vl = 0;
+        stm_status s = stm_btree_lf_lookup(t, ebr, kbuf, (size_t)kl,
+                                            &got, sizeof got, &vl);
+        STM_ASSERT_OK(s);
+        STM_ASSERT_EQ(got, i);
+    }
+
+    /* After a final consolidate, the MAX per-leaf chain depth must be
+     * BOUNDED — independent of N. Each leaf may retain one preserved
+     * SPLIT from its birth-split (that SPLIT is redundant after the
+     * parent's pivot was added, but kept for safety in case a reader
+     * with a stale parent pivot snapshot arrives here). With the
+     * current multi-SPLIT preservation, depth can grow to the number
+     * of times this leaf has re-split (bounded by log N). For sorted
+     * inserts the depth is typically 1 per leaf — the birth SPLIT —
+     * because the "active" leaf migrates rightward and each leaf
+     * splits at most once. We assert a generous bound of 16 to catch
+     * any unbounded growth. */
+    uint32_t depth = stm_btree_lf_chain_depth(t, ebr);
+    stm_test_info("balanced growth (N=%d, target=4): max leaf chain depth %u",
+                  N, depth);
+    STM_ASSERT(depth <= 16);
+
+    stm_ebr_thread_free(ebr);
+    stm_btree_lf_free(t);
+}
+
 /* Delete a key on the upper (post-split) side, verify it disappears
  * and the rest of the keys remain accessible. */
 STM_TEST(btree_lf_split_then_delete_upper) {
@@ -913,6 +970,117 @@ STM_TEST(btree_lf_concurrent_splits_oracle) {
     }
     stm_test_info("concurrent splits oracle: %d present, %d absent; final chain_depth %u",
                   total_present, total_absent, stm_btree_lf_chain_depth(t, ebr));
+
+    stm_ebr_thread_free(ebr);
+    stm_btree_lf_free(t);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Large-scale internal-routing stress.                                       */
+/*                                                                            */
+/* Many threads, each with a disjoint key range large enough that inserts     */
+/* force splits throughout the run — not just at the tail. Exercises the      */
+/* three-step split protocol (balanced.tla) under real concurrent pressure    */
+/* spread across hundreds of leaves. */
+/* ------------------------------------------------------------------------- */
+
+#define STM_BT_LF_LARGE_THREADS 6
+#define STM_BT_LF_LARGE_KEYS    400
+#define STM_BT_LF_LARGE_TARGET  4
+
+typedef struct {
+    stm_btree_lf *tree;
+    int           thread_id;
+    int           present[STM_BT_LF_LARGE_KEYS];
+    int           value[STM_BT_LF_LARGE_KEYS];
+} large_oracle_arg;
+
+static int format_large_key(char *buf, size_t cap, int tid, int k)
+{
+    return snprintf(buf, cap, "l%d-k%06d", tid, k);
+}
+
+static void *large_oracle_worker(void *arg_)
+{
+    large_oracle_arg *arg = arg_;
+    stm_ebr_thread *ebr = stm_ebr_register();
+    if (!ebr) return NULL;
+
+    /* Bulk insert — this produces many splits across the tree. */
+    for (int k = 0; k < STM_BT_LF_LARGE_KEYS; k++) {
+        char kbuf[24];
+        int kl = format_large_key(kbuf, sizeof kbuf, arg->thread_id, k);
+        int v = arg->thread_id * 1000000 + k;
+        stm_status st = stm_btree_lf_insert(arg->tree, ebr,
+                                             kbuf, (size_t)kl,
+                                             &v, sizeof v);
+        if (st == STM_OK) {
+            arg->present[k] = 1;
+            arg->value[k]   = v;
+        }
+    }
+
+    /* Lookup all our keys — every one must resolve correctly through
+     * the internal-routing pivot array and any SPLIT redirects. */
+    for (int k = 0; k < STM_BT_LF_LARGE_KEYS; k++) {
+        char kbuf[24];
+        int kl = format_large_key(kbuf, sizeof kbuf, arg->thread_id, k);
+        int got = 0;
+        size_t vl = 0;
+        stm_status st = stm_btree_lf_lookup(arg->tree, ebr,
+                                             kbuf, (size_t)kl,
+                                             &got, sizeof got, &vl);
+        if (arg->present[k]) {
+            STM_ASSERT_OK(st);
+            STM_ASSERT_EQ(got, arg->value[k]);
+        }
+    }
+
+    stm_ebr_thread_free(ebr);
+    return NULL;
+}
+
+STM_TEST(btree_lf_large_scale_internal_routing) {
+    stm_btree_lf *t = make_tree(STM_BT_LF_LARGE_TARGET);
+
+    pthread_t          tids[STM_BT_LF_LARGE_THREADS];
+    large_oracle_arg   args[STM_BT_LF_LARGE_THREADS];
+    memset(args, 0, sizeof args);
+    for (int i = 0; i < STM_BT_LF_LARGE_THREADS; i++) {
+        args[i].tree      = t;
+        args[i].thread_id = i;
+        pthread_create(&tids[i], NULL, large_oracle_worker, &args[i]);
+    }
+    for (int i = 0; i < STM_BT_LF_LARGE_THREADS; i++) {
+        pthread_join(tids[i], NULL);
+    }
+
+    for (int i = 0; i < 128; i++) (void)stm_ebr_try_advance();
+
+    stm_ebr_thread *ebr = stm_ebr_register();
+    STM_ASSERT_OK(stm_btree_lf_force_consolidate(t, ebr));
+
+    /* Every thread's inserted keys must be present + correct. */
+    int total_keys = 0;
+    for (int tid = 0; tid < STM_BT_LF_LARGE_THREADS; tid++) {
+        for (int k = 0; k < STM_BT_LF_LARGE_KEYS; k++) {
+            if (!args[tid].present[k]) continue;
+            char kbuf[24];
+            int kl = format_large_key(kbuf, sizeof kbuf, tid, k);
+            int got = 0;
+            size_t vl = 0;
+            stm_status s = stm_btree_lf_lookup(t, ebr, kbuf, (size_t)kl,
+                                                &got, sizeof got, &vl);
+            STM_ASSERT_OK(s);
+            STM_ASSERT_EQ(got, args[tid].value[k]);
+            total_keys++;
+        }
+    }
+
+    uint32_t depth = stm_btree_lf_chain_depth(t, ebr);
+    stm_test_info("large internal-routing: %d keys verified across %d threads; "
+                  "final max leaf chain depth %u",
+                  total_keys, STM_BT_LF_LARGE_THREADS, depth);
 
     stm_ebr_thread_free(ebr);
     stm_btree_lf_free(t);
