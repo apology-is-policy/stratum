@@ -345,9 +345,10 @@ stm_status stm_alloc_create(stm_bdev *d,
     if (!a) return STM_ENOMEM;
 
     /* Fresh pool: bitmap is all zeros (all units free), gen starts at 0.
-     * The initial live slots are slot-0 (hdr A, bitmap A). Slot-1 is left
-     * zero; its decode will fail with STM_EBADVERSION on magic mismatch,
-     * ensuring open() unambiguously selects slot-0. */
+     * The initial live slots are slot-0 (hdr A, bitmap A). Slot-1 is
+     * explicitly overwritten with zeros below so any stale state from a
+     * prior pool formatted on this device (which could otherwise
+     * out-gen slot 0 and get mis-selected by mount) is invalidated. */
     a->bitmap_gen       = 0;
     a->hdr_slot_live    = 0;
     a->bitmap_slot_live = 0;
@@ -362,6 +363,13 @@ stm_status stm_alloc_create(stm_bdev *d,
     s = stm_bdev_write(d, bitmap_slot_offset(a->bitmap_slot_live),
                        bitmap_block, sizeof bitmap_block);
     if (s != STM_OK) goto fail;
+
+    /* Invalidate slot 1's bitmap with zeros (R7a P1-1). Any magic-matching
+     * bytes there from a prior pool must not outlive this reformat. */
+    uint8_t zero_block[STM_UB_SIZE] = { 0 };
+    s = stm_bdev_write(d, bitmap_slot_offset(1u), zero_block, sizeof zero_block);
+    if (s != STM_OK) goto fail;
+
     s = stm_bdev_fsync(d);
     if (s != STM_OK) goto fail;
 
@@ -388,6 +396,11 @@ stm_status stm_alloc_create(stm_bdev *d,
     s = stm_bdev_write(d, hdr_slot_offset(a->hdr_slot_live),
                        hdr_buf, sizeof hdr_buf);
     if (s != STM_OK) goto fail;
+
+    /* Invalidate header slot 1 (R7a P1-1). */
+    s = stm_bdev_write(d, hdr_slot_offset(1u), zero_block, sizeof zero_block);
+    if (s != STM_OK) goto fail;
+
     s = stm_bdev_fsync(d);
     if (s != STM_OK) goto fail;
 
@@ -398,6 +411,29 @@ fail:
     free(a->bitmap);
     free(a);
     return s;
+}
+
+/* Try to read + csum-verify the bitmap designated by `hdr`. On success
+ * fills `out_bitmap` and returns STM_OK. On failure returns an error
+ * suitable for the caller to fall back to a different header. */
+static stm_status load_bitmap_for_hdr(stm_bdev *d, const stm_alloc_hdr *hdr,
+                                       uint8_t out_bitmap[STM_UB_SIZE])
+{
+    uint64_t idx = stm_load_le64(hdr->h_bitmap_block);
+    if (idx != STM_ALLOC_BITMAP_SLOT_A && idx != STM_ALLOC_BITMAP_SLOT_B)
+        return STM_ECORRUPT;
+
+    stm_status s = stm_bdev_read(d, device_byte_offset(idx),
+                                  out_bitmap, STM_UB_SIZE);
+    if (s != STM_OK) return s;
+
+    uint8_t expected[32];
+    compute_bitmap_csum(out_bitmap, expected);
+    uint8_t diff = 0;
+    for (size_t i = 0; i < 32; i++) {
+        diff |= (uint8_t)(expected[i] ^ hdr->h_bitmap_csum[i]);
+    }
+    return diff == 0 ? STM_OK : STM_ECORRUPT;
 }
 
 stm_status stm_alloc_open(stm_bdev *d, stm_alloc **out_alloc)
@@ -421,86 +457,98 @@ stm_status stm_alloc_open(stm_bdev *d, stm_alloc **out_alloc)
     bool have_a = (s_a == STM_OK);
     bool have_b = (s_b == STM_OK);
     if (!have_a && !have_b) {
-        /* No valid header on either slot. Either version mismatch (via
-         * whichever slot decoded non-OK for version-y reasons) or csum
-         * corruption. Return the more specific error when possible. */
+        /* If either slot is STM_EBADVERSION (magic/version mismatch), the
+         * operator needs to know the format isn't what we expected;
+         * otherwise report generic corruption. */
         if (s_a == STM_EBADVERSION || s_b == STM_EBADVERSION) {
-            /* One might be STM_EBADVERSION while the other's STM_ECORRUPT.
-             * If either is STM_EBADVERSION, report it — the operator
-             * needs to know the format isn't what we expected. */
             return STM_EBADVERSION;
         }
         return STM_ECORRUPT;
     }
 
-    /* Pick higher bitmap_gen among valid slots. */
-    stm_alloc_hdr *live_hdr;
-    uint32_t       live_slot;
+    /* Build candidate list in highest-gen-first order. R7a P2-1: if the
+     * top candidate's bitmap fails csum (e.g. a single bad sector in
+     * the live bitmap slot) we fall back to the other valid header's
+     * bitmap so the pool can mount at the prior gen rather than being
+     * wedged. */
+    stm_alloc_hdr *cand_hdr[2]  = { NULL, NULL };
+    uint32_t       cand_slot[2] = { 0, 0 };
+    int            ncand        = 0;
+
     if (have_a && have_b) {
         uint64_t ga = stm_load_le64(hdr_a.h_bitmap_gen);
         uint64_t gb = stm_load_le64(hdr_b.h_bitmap_gen);
         if (gb > ga) {
-            live_hdr = &hdr_b; live_slot = 1;
+            cand_hdr[0] = &hdr_b; cand_slot[0] = 1;
+            cand_hdr[1] = &hdr_a; cand_slot[1] = 0;
         } else {
-            live_hdr = &hdr_a; live_slot = 0;
+            cand_hdr[0] = &hdr_a; cand_slot[0] = 0;
+            cand_hdr[1] = &hdr_b; cand_slot[1] = 1;
         }
+        ncand = 2;
     } else if (have_a) {
-        live_hdr = &hdr_a; live_slot = 0;
+        cand_hdr[0] = &hdr_a; cand_slot[0] = 0; ncand = 1;
     } else {
-        live_hdr = &hdr_b; live_slot = 1;
+        cand_hdr[0] = &hdr_b; cand_slot[0] = 1; ncand = 1;
     }
 
-    /* Read the designated bitmap block. */
-    uint64_t bitmap_block_idx = stm_load_le64(live_hdr->h_bitmap_block);
-    if (bitmap_block_idx != STM_ALLOC_BITMAP_SLOT_A &&
-        bitmap_block_idx != STM_ALLOC_BITMAP_SLOT_B) return STM_ECORRUPT;
-
-    uint8_t bitmap_block[STM_UB_SIZE];
-    s = stm_bdev_read(d, device_byte_offset(bitmap_block_idx),
-                      bitmap_block, sizeof bitmap_block);
-    if (s != STM_OK) return s;
-
-    /* Verify bitmap csum. */
-    uint8_t expected_csum[32];
-    compute_bitmap_csum(bitmap_block, expected_csum);
-    uint8_t diff = 0;
-    for (size_t i = 0; i < 32; i++) {
-        diff |= (uint8_t)(expected_csum[i] ^ live_hdr->h_bitmap_csum[i]);
+    uint8_t         bitmap_block[STM_UB_SIZE];
+    stm_alloc_hdr  *chosen_hdr  = NULL;
+    uint32_t        chosen_slot = 0;
+    for (int i = 0; i < ncand; i++) {
+        stm_status cs = load_bitmap_for_hdr(d, cand_hdr[i], bitmap_block);
+        if (cs == STM_OK) {
+            chosen_hdr  = cand_hdr[i];
+            chosen_slot = cand_slot[i];
+            break;
+        }
     }
-    if (diff != 0) return STM_ECORRUPT;
+    if (!chosen_hdr) return STM_ECORRUPT;
 
-    /* Build the stm_alloc. */
-    uint64_t size_blocks = stm_load_le64(live_hdr->h_bootstrap_size_blocks);
-    uint64_t unit_blocks = stm_load_le64(live_hdr->h_data_unit_blocks);
-    uint64_t data_start  = stm_load_le64(live_hdr->h_data_start_block);
-    uint64_t bit_count   = stm_load_le64(live_hdr->h_bitmap_bit_count);
+    /* Validate bounds on decoded sizes before using them (R7a P2-2):
+     * an attacker-controlled header with a valid csum must not drive
+     * arithmetic overflow or geometry drift. */
+    uint64_t size_blocks = stm_load_le64(chosen_hdr->h_bootstrap_size_blocks);
+    uint64_t unit_blocks = stm_load_le64(chosen_hdr->h_data_unit_blocks);
+    uint64_t data_start  = stm_load_le64(chosen_hdr->h_data_start_block);
+    uint64_t bit_count   = stm_load_le64(chosen_hdr->h_bitmap_bit_count);
 
     if (unit_blocks != STM_BOOTSTRAP_UNIT_BLOCKS) return STM_EBADVERSION;
     if (data_start  != STM_ALLOC_DATA_START_BLOCK) return STM_EBADVERSION;
     if (bit_count  == 0 || bit_count > STM_BOOTSTRAP_MAX_UNITS) return STM_ECORRUPT;
+
+    /* Overflow: size_blocks * STM_UB_SIZE must fit in uint64_t. */
+    if (size_blocks > UINT64_MAX / (uint64_t)STM_UB_SIZE) return STM_ECORRUPT;
+    /* Overflow: data_start + bit_count * unit_blocks. */
+    if (bit_count > (UINT64_MAX - data_start) / unit_blocks) return STM_ECORRUPT;
     if (data_start + bit_count * unit_blocks > size_blocks) return STM_ECORRUPT;
 
+    /* The pool must physically fit on the device. */
+    const stm_bdev_caps *caps = stm_bdev_caps_of(d);
+    if (!caps) return STM_EINVAL;
+    uint64_t size_bytes = size_blocks * (uint64_t)STM_UB_SIZE;
+    if (STM_BOOTSTRAP_OFFSET > caps->size_bytes) return STM_ECORRUPT;
+    if (size_bytes > caps->size_bytes - STM_BOOTSTRAP_OFFSET) return STM_ECORRUPT;
+
     uint64_t pool_uuid[2]   = {
-        stm_load_le64(live_hdr->h_pool_uuid[0]),
-        stm_load_le64(live_hdr->h_pool_uuid[1]),
+        stm_load_le64(chosen_hdr->h_pool_uuid[0]),
+        stm_load_le64(chosen_hdr->h_pool_uuid[1]),
     };
     uint64_t device_uuid[2] = {
-        stm_load_le64(live_hdr->h_device_uuid[0]),
-        stm_load_le64(live_hdr->h_device_uuid[1]),
+        stm_load_le64(chosen_hdr->h_device_uuid[0]),
+        stm_load_le64(chosen_hdr->h_device_uuid[1]),
     };
 
-    uint64_t size_bytes = size_blocks * (uint64_t)STM_UB_SIZE;
     stm_alloc *a = alloc_new(d, size_bytes, pool_uuid, device_uuid);
     if (!a) return STM_ENOMEM;
 
-    a->bitmap_gen       = stm_load_le64(live_hdr->h_bitmap_gen);
-    a->hdr_slot_live    = live_slot;
-    a->bitmap_slot_live = (uint32_t)(bitmap_block_idx - STM_ALLOC_BITMAP_SLOT_A);
+    a->bitmap_gen       = stm_load_le64(chosen_hdr->h_bitmap_gen);
+    a->hdr_slot_live    = chosen_slot;
+    a->bitmap_slot_live = (uint32_t)(stm_load_le64(chosen_hdr->h_bitmap_block) -
+                                     STM_ALLOC_BITMAP_SLOT_A);
 
-    /* Load bitmap. `bit_count` and our internal total_units must agree
-     * (alloc_new computed it from size). */
+    /* Header's bit_count and our computed total_units must agree. */
     if (bit_count != a->total_units) {
-        /* Header records differ from geometry — format drift. */
         free(a->bitmap);
         free(a);
         return STM_ECORRUPT;
@@ -624,15 +672,23 @@ stm_status stm_alloc_free(stm_alloc *a, uint64_t paddr, uint32_t nblocks,
 
     /* Verify every unit is currently allocated (bit set) and not already
      * in a PENDING entry — overlapping PENDING entries would corrupt the
-     * commit-sweep accounting. */
+     * commit-sweep accounting.
+     *
+     * The PENDING scan is O(N) per free and thus O(N^2) for a burst of N
+     * frees between commits (R7a P2-3). The chunk 4a single-block bitmap
+     * cap of 32768 units keeps this bounded; a future upgrade to a
+     * sorted-interval structure could make it O(log N) if the pattern
+     * becomes hot. */
     for (uint64_t i = 0; i < nunits; i++) {
         if (!bit_is_set(a->bitmap, first_unit + i)) return STM_EINVAL;
     }
     for (pending_entry *e = a->pending_head; e; e = e->next) {
         uint64_t e_first = 0;
-        (void)paddr_to_unit(a, e->paddr, &e_first);
+        bool ok = paddr_to_unit(a, e->paddr, &e_first);
+        /* Invariant: every pending entry was validated when added — if
+         * this fails the pending list is corrupted. */
+        if (!ok) return STM_ECORRUPT;
         uint64_t e_nunits = e->nblocks / (uint64_t)STM_BOOTSTRAP_UNIT_BLOCKS;
-        /* overlap check */
         if (first_unit < e_first + e_nunits && e_first < first_unit + nunits) {
             return STM_EINVAL;
         }
@@ -654,42 +710,50 @@ stm_status stm_alloc_commit(stm_alloc *a, uint64_t committed_gen)
 {
     if (!a) return STM_EINVAL;
 
-    /* Build the post-sweep bitmap in a scratch block. Sweep criterion
-     * (allocator.tla): PENDING with free_gen < committed_gen → clear. */
+    /*
+     * Three-phase commit (R7a P1-2 fix):
+     *   Phase 1 — scan: compute the new bitmap in a scratch buffer and
+     *     count which PENDING entries *would* sweep. Do NOT touch the
+     *     pending list or the in-RAM bitmap yet.
+     *   Phase 2 — I/O: write new bitmap → fsync → write new header →
+     *     fsync. On failure, return without mutating in-RAM state.
+     *   Phase 3 — finalize: I/O succeeded, so commit the sweep to
+     *     in-RAM state (unlink + free entries, update counters, swap
+     *     live slots, promote bitmap + gen).
+     *
+     * A failed commit leaves the caller's view of the allocator exactly
+     * as it was. The on-disk new-slot write may partially succeed, but
+     * the old slot is still live and mount recovers the pre-commit state.
+     */
+
+    /* Phase 1 — scan + compute new bitmap. */
     uint8_t new_bitmap_block[STM_UB_SIZE];
     memset(new_bitmap_block, 0, sizeof new_bitmap_block);
     memcpy(new_bitmap_block, a->bitmap, a->bitmap_bytes);
 
-    pending_entry **link = &a->pending_head;
-    pending_entry  *e    = a->pending_head;
-    uint64_t        swept_count = 0;
-    uint64_t        swept_units = 0;
-    while (e) {
-        pending_entry *next = e->next;
-        if (e->free_gen < committed_gen) {
-            /* Sweep: clear bits in the staged bitmap. */
-            uint64_t first_unit = 0;
-            if (paddr_to_unit(a, e->paddr, &first_unit)) {
-                uint64_t nunits = e->nblocks /
-                                  (uint64_t)STM_BOOTSTRAP_UNIT_BLOCKS;
-                for (uint64_t i = 0; i < nunits; i++) {
-                    bit_clear(new_bitmap_block, first_unit + i);
-                }
-                swept_units += nunits;
-            }
-            *link = next;
-            free(e);
-            swept_count++;
-        } else {
-            link = &e->next;
+    uint64_t swept_count = 0;
+    uint64_t swept_units = 0;
+    for (const pending_entry *e = a->pending_head; e; e = e->next) {
+        if (e->free_gen >= committed_gen) continue;
+
+        uint64_t first_unit = 0;
+        bool ok = paddr_to_unit(a, e->paddr, &first_unit);
+        /* Invariant: every PENDING entry's paddr was validated on free().
+         * A failure here means a pending_head link was corrupted — fatal. */
+        if (!ok) return STM_ECORRUPT;
+
+        uint64_t nunits = e->nblocks / (uint64_t)STM_BOOTSTRAP_UNIT_BLOCKS;
+        for (uint64_t i = 0; i < nunits; i++) {
+            bit_clear(new_bitmap_block, first_unit + i);
         }
-        e = next;
+        swept_units += nunits;
+        swept_count++;
     }
 
     uint8_t bitmap_csum[32];
     compute_bitmap_csum(new_bitmap_block, bitmap_csum);
 
-    /* Step 1: write new bitmap to the non-live slot, fsync. */
+    /* Phase 2 — I/O. */
     uint32_t new_bitmap_slot = 1u - a->bitmap_slot_live;
     stm_status s = stm_bdev_write(a->d, bitmap_slot_offset(new_bitmap_slot),
                                    new_bitmap_block, sizeof new_bitmap_block);
@@ -697,7 +761,6 @@ stm_status stm_alloc_commit(stm_alloc *a, uint64_t committed_gen)
     s = stm_bdev_fsync(a->d);
     if (s != STM_OK) return s;
 
-    /* Step 2: write new header to the non-live slot, fsync. */
     stm_alloc_hdr hdr = { 0 };
     hdr.h_magic                 = stm_store_le64(STM_ALLOC_HDR_MAGIC);
     hdr.h_version               = stm_store_le32(STM_ALLOC_HDR_VERSION);
@@ -724,12 +787,24 @@ stm_status stm_alloc_commit(stm_alloc *a, uint64_t committed_gen)
     s = stm_bdev_fsync(a->d);
     if (s != STM_OK) return s;
 
-    /* Promote in-RAM state. */
+    /* Phase 3 — finalize. I/O succeeded; promote in-RAM state. */
+    pending_entry **link = &a->pending_head;
+    pending_entry  *e    = a->pending_head;
+    while (e) {
+        pending_entry *next = e->next;
+        if (e->free_gen < committed_gen) {
+            *link = next;
+            free(e);
+        } else {
+            link = &e->next;
+        }
+        e = next;
+    }
+
     memcpy(a->bitmap, new_bitmap_block, a->bitmap_bytes);
     a->bitmap_slot_live = new_bitmap_slot;
     a->hdr_slot_live    = new_hdr_slot;
     a->bitmap_gen      += 1;
-
     a->pending_count   -= swept_count;
     a->pending_units   -= swept_units;
     return STM_OK;

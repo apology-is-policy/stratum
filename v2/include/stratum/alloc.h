@@ -72,11 +72,6 @@ typedef struct stm_bdev stm_bdev;   /* forward from block.h */
  * 32 × 4 KiB = 128 KiB — the allocator-tree-node size from ARCH §6.3. */
 #define STM_BOOTSTRAP_UNIT_BLOCKS     32u
 
-/* Minimum device size accepted by stm_alloc_create. A 128 MiB floor gives
- * a 64 MiB bootstrap pool plus enough room for labels + some data area,
- * which is the smallest "toy pool" that still exercises every path. */
-#define STM_ALLOC_MIN_DEVICE_BYTES    (UINT64_C(128) * 1024u * 1024u)
-
 /* Default bootstrap pool size: max(64 MiB, device_size / 1024). ARCH §6.5.1. */
 #define STM_BOOTSTRAP_MIN_SIZE_BYTES  (UINT64_C(64) * 1024u * 1024u)
 #define STM_BOOTSTRAP_SIZE_DIVISOR    1024u

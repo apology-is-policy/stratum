@@ -417,9 +417,10 @@ STM_TEST(alloc_open_rejects_no_valid_header) {
     unlink(g_tmp_path);
 }
 
-STM_TEST(alloc_bitmap_corruption_detected) {
-    /* Modify the live bitmap payload — the header's stored bitmap_csum
-     * won't match, so open() returns STM_ECORRUPT. */
+STM_TEST(alloc_bitmap_corruption_both_slots_rejects) {
+    /* After the P2-1 fallback, open() tolerates one corrupt bitmap by
+     * falling back to the other header's bitmap. When BOTH are bad,
+     * open() must hard-fail with STM_ECORRUPT. */
     make_tmp("bm");
     stm_bdev *d = open_fresh_device();
     stm_alloc *a = make_fresh_alloc(d);
@@ -428,15 +429,16 @@ STM_TEST(alloc_bitmap_corruption_detected) {
     STM_ASSERT_OK(stm_alloc_commit(a, 1));   /* bitmap slot → 1 */
     stm_alloc_close(a);
 
-    /* After commit 1, live bitmap is slot 1 (block 3 in bootstrap pool =
-     * byte offset bootstrap + 3 × 4 KiB). Flip one bit. */
-    uint8_t byte = 0;
-    uint64_t bitmap_offset = STM_BOOTSTRAP_OFFSET + 3u * STM_UB_SIZE;
-    STM_ASSERT_OK(stm_bdev_read(d, bitmap_offset, &byte, 1));
-    byte ^= 0x80;
-    STM_ASSERT_OK(stm_bdev_write(d, bitmap_offset, &byte, 1));
+    /* Flip a bit in both bitmap slots. */
+    for (uint32_t slot = 0; slot < 2; slot++) {
+        uint8_t byte = 0;
+        uint64_t off = STM_BOOTSTRAP_OFFSET +
+                       (uint64_t)(2u + slot) * STM_UB_SIZE;
+        STM_ASSERT_OK(stm_bdev_read(d, off, &byte, 1));
+        byte ^= 0x80;
+        STM_ASSERT_OK(stm_bdev_write(d, off, &byte, 1));
+    }
     STM_ASSERT_OK(stm_bdev_fsync(d));
-
     stm_bdev_close(d);
 
     d = reopen_device();
@@ -492,6 +494,91 @@ STM_TEST(alloc_commit_idempotent_for_empty_pending) {
     STM_ASSERT_EQ(after.allocated_units,  before.allocated_units);
 
     stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(alloc_reformat_invalidates_slot1_r7a_p1_1) {
+    /* R7a P1-1: a previous pool's slot-1 header must not outlive a
+     * reformat. Scenario: create + commit twice (hdr slot 1 becomes live
+     * at gen=2) → close → create again → open must see the fresh (gen=0)
+     * state, not the stale gen=2 state. */
+    make_tmp("reformat");
+    stm_bdev *d = open_fresh_device();
+
+    stm_alloc *a = make_fresh_alloc(d);
+    /* Commit twice so slot 1 holds a valid gen=2 header. */
+    STM_ASSERT_OK(stm_alloc_commit(a, 1));   /* hdr slot → 1 */
+    STM_ASSERT_OK(stm_alloc_commit(a, 2));   /* hdr slot → 0, gen=2 lives in slot 1 still */
+    /* Reserve something so the slot-0-at-gen-2 state is distinct from
+     * the fresh state. */
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, TEST_UNIT_BLOCKS, 0, &p));
+    STM_ASSERT_OK(stm_alloc_commit(a, 3));   /* hdr slot → 1 live, gen=3 */
+    stm_alloc_close(a);
+
+    /* Reformat. Slot 1 currently holds a valid gen=3 header + bitmap. */
+    stm_alloc *a2 = make_fresh_alloc(d);
+    stm_alloc_stats st;
+    STM_ASSERT_OK(stm_alloc_stats_get(a2, &st));
+    /* The fresh pool has gen=0 and no allocations. */
+    STM_ASSERT_EQ(st.bitmap_gen,      0u);
+    STM_ASSERT_EQ(st.allocated_units, 0u);
+    stm_alloc_close(a2);
+
+    /* Now close + reopen. Open must pick the new slot-0 state, not any
+     * leftover slot-1 state. Without the fix, slot 1's gen=3 would win. */
+    stm_bdev_close(d);
+    d = reopen_device();
+    stm_alloc *a3 = NULL;
+    STM_ASSERT_OK(stm_alloc_open(d, &a3));
+    STM_ASSERT_OK(stm_alloc_stats_get(a3, &st));
+    STM_ASSERT_EQ(st.bitmap_gen,      0u);
+    STM_ASSERT_EQ(st.allocated_units, 0u);
+    stm_alloc_close(a3);
+
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(alloc_bitmap_fallback_on_csum_fail_r7a_p2_1) {
+    /* R7a P2-1: stomping just the live bitmap payload should let open()
+     * fall back to the other valid header's bitmap. Previously this
+     * returned STM_ECORRUPT. */
+    make_tmp("bm_fb");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    uint64_t p1 = 0, p2 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, TEST_UNIT_BLOCKS, 0, &p1));
+    STM_ASSERT_OK(stm_alloc_commit(a, 1));   /* bitmap slot → 1, gen=1 */
+    STM_ASSERT_OK(stm_alloc_reserve(a, TEST_UNIT_BLOCKS, 0, &p2));
+    STM_ASSERT_OK(stm_alloc_commit(a, 2));   /* bitmap slot → 0, gen=2.
+                                              * Slot 1 still holds gen=1
+                                              * bitmap (1 unit allocated). */
+    stm_alloc_close(a);
+
+    /* Stomp slot-0 bitmap (the live one at gen=2). Slot-1 bitmap (gen=1)
+     * is intact and references 1 allocated unit. Open should fall back. */
+    uint8_t byte = 0;
+    uint64_t bm0_off = STM_BOOTSTRAP_OFFSET + 2u * STM_UB_SIZE;
+    STM_ASSERT_OK(stm_bdev_read(d, bm0_off, &byte, 1));
+    byte ^= 0x80;
+    STM_ASSERT_OK(stm_bdev_write(d, bm0_off, &byte, 1));
+    STM_ASSERT_OK(stm_bdev_fsync(d));
+    stm_bdev_close(d);
+
+    d = reopen_device();
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open(d, &a2));
+
+    /* Fallback landed on slot-1 bitmap → gen=1 state, 1 unit allocated. */
+    stm_alloc_stats st;
+    STM_ASSERT_OK(stm_alloc_stats_get(a2, &st));
+    STM_ASSERT_EQ(st.bitmap_gen,      1u);
+    STM_ASSERT_EQ(st.allocated_units, 1u);
+
+    stm_alloc_close(a2);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }
