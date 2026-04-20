@@ -680,25 +680,37 @@ stm_status stm_bootstrap_free(stm_bootstrap *a, uint64_t paddr, uint32_t nblocks
     if (!paddr_to_unit(a, paddr, &first_unit)) return STM_EINVAL;
     if (first_unit + nunits > a->total_units) return STM_EINVAL;
 
-    /* Verify every unit is currently allocated (bit set) and not already
-     * in a PENDING entry — overlapping PENDING entries would corrupt the
-     * commit-sweep accounting.
+    /* Verify every unit is currently allocated (bit set).
      *
-     * The PENDING scan is O(N) per free and thus O(N^2) for a burst of N
-     * frees between commits (R7a P2-3). The chunk 4a single-block bitmap
-     * cap of 32768 units keeps this bounded; a future upgrade to a
-     * sorted-interval structure could make it O(log N) if the pattern
-     * becomes hot. */
+     * The PENDING scan below is O(N) per free and thus O(N^2) for a
+     * burst of N frees between commits (R7a P2-3). The chunk 4a
+     * single-block bitmap cap of 32768 units keeps this bounded; a
+     * future upgrade to a sorted-interval structure could make it
+     * O(log N) if the pattern becomes hot. */
     for (uint64_t i = 0; i < nunits; i++) {
         if (!bit_is_set(a->bitmap, first_unit + i)) return STM_EINVAL;
     }
+
+    /* R7c P1-1/P2-2: idempotent retry — if the exact same (paddr,
+     * nblocks) is already in PENDING, this is a commit-retry after a
+     * transient failure. Update the free_gen stamp to the max (so the
+     * later retry's gen wins) and return STM_OK. Callers that emitted
+     * partial frees in a failed free_tree walk can safely retry the
+     * entire walk.
+     *
+     * Non-identical overlap (different paddr/nblocks but intersecting
+     * range) remains a caller bug → STM_EINVAL. */
     for (pending_entry *e = a->pending_head; e; e = e->next) {
         uint64_t e_first = 0;
         bool ok = paddr_to_unit(a, e->paddr, &e_first);
-        /* Invariant: every pending entry was validated when added — if
-         * this fails the pending list is corrupted. */
         if (!ok) return STM_ECORRUPT;
         uint64_t e_nunits = e->nblocks / (uint64_t)STM_BOOTSTRAP_UNIT_BLOCKS;
+
+        if (e->paddr == paddr && e->nblocks == nblocks) {
+            /* Exact match: retry semantics. */
+            if (free_gen > e->free_gen) e->free_gen = free_gen;
+            return STM_OK;
+        }
         if (first_unit < e_first + e_nunits && e_first < first_unit + nunits) {
             return STM_EINVAL;
         }

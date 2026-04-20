@@ -564,11 +564,12 @@ STM_TEST(btnode_internal_wrong_kind_rejected) {
     STM_ASSERT(buf != NULL);
     if (!buf) return;
 
-    /* Encode as leaf, then try to decode as internal. */
+    /* Encode as leaf, then try to decode as internal. Wrong on-disk
+     * kind is a data-integrity failure (R7c P2-3) → STM_ECORRUPT. */
     STM_ASSERT_OK(stm_btnode_leaf_encode(NULL, 0, 0, 0, buf, STM_BTNODE_SIZE));
     STM_ASSERT_ERR(stm_btnode_internal_decode(buf, STM_BTNODE_SIZE, NULL,
                                                 NULL, NULL, NULL),
-                   STM_EINVAL);
+                   STM_ECORRUPT);
 
     /* Reverse: encode as internal, decode as leaf. */
     uint8_t child[STM_BTNODE_CHILD_BPTR_SIZE] = { 0 };
@@ -576,7 +577,7 @@ STM_TEST(btnode_internal_wrong_kind_rejected) {
                                                0, 0, buf, STM_BTNODE_SIZE));
     STM_ASSERT_ERR(stm_btnode_leaf_decode(buf, STM_BTNODE_SIZE, NULL,
                                             collect_cb, NULL),
-                   STM_EINVAL);
+                   STM_ECORRUPT);
 
     free(buf);
 }

@@ -1,4 +1,5 @@
 add_library(stm_btnode STATIC
+    common.c
     leaf.c
     internal.c)
 

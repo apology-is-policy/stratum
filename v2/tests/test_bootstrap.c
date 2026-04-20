@@ -196,9 +196,14 @@ STM_TEST(bootstrap_free_misuse) {
                    STM_EINVAL);
     /* Valid free. */
     STM_ASSERT_OK(stm_bootstrap_free(a, paddr, TEST_UNIT_BLOCKS, 1));
-    /* Double-free rejected — paddr now in PENDING; overlap check fires. */
-    STM_ASSERT_ERR(stm_bootstrap_free(a, paddr, TEST_UNIT_BLOCKS, 1),
-                   STM_EINVAL);
+    /* R7c P1-1: re-freeing the exact same (paddr, nblocks) is now
+     * idempotent — this is the commit-retry case after a transient
+     * failure. The free_gen updates to the max (here 2 > 1), but no
+     * new PENDING entry is added. */
+    STM_ASSERT_OK(stm_bootstrap_free(a, paddr, TEST_UNIT_BLOCKS, 2));
+    stm_bootstrap_stats st;
+    STM_ASSERT_OK(stm_bootstrap_stats_get(a, &st));
+    STM_ASSERT_EQ(st.pending_units, 1u);
 
     stm_bootstrap_close(a);
     stm_bdev_close(d);

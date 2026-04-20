@@ -89,6 +89,12 @@ struct stm_alloc {
      * has been committed yet. Used to free the previous snapshot's
      * nodes on the next commit. */
     uint64_t        current_tree_root;
+
+    /* R7c P2-5: set by reserve/free/ref; cleared on commit. When
+     * commit runs with !tree_dirty and a root already on disk, the
+     * free_tree + serialize round-trip is skipped — bootstrap_commit
+     * still runs to persist bootstrap-internal state. */
+    bool            tree_dirty;
 };
 
 /* ========================================================================= */
@@ -154,9 +160,20 @@ _Static_assert(sizeof(stm_alloc_user_data) == 64,
 #define STM_ALLOC_UD_MAGIC   UINT64_C(0x4154414455415453)
 #define STM_ALLOC_UD_VERSION 1u
 
-static void user_data_encode(uint64_t tree_root, uint64_t tree_gen,
-                               uint8_t out[STM_BOOTSTRAP_USER_DATA_SIZE])
+/* R7c P1-2: tree_root == 0 is reserved to mean "no tree persisted"
+ * (matches the all-zero "never initialized" slot). The serialize path
+ * only produces nonzero paddrs from the bootstrap pool, so encode
+ * rejects 0 as a defensive invariant check.
+ *
+ * On decode, a valid-magic slot with tree_root == 0 is treated as
+ * ENOENT too (defense in depth: even if a tampered slot presents
+ * magic+version but tree_root=0, we don't hand a 0 paddr to the
+ * deserializer). */
+static stm_status user_data_encode(uint64_t tree_root, uint64_t tree_gen,
+                                     uint8_t out[STM_BOOTSTRAP_USER_DATA_SIZE])
 {
+    if (tree_root == 0) return STM_EINVAL;
+
     memset(out, 0, STM_BOOTSTRAP_USER_DATA_SIZE);
 
     stm_alloc_user_data ud = { 0 };
@@ -165,15 +182,21 @@ static void user_data_encode(uint64_t tree_root, uint64_t tree_gen,
     ud.ud_tree_root = stm_store_le64(tree_root);
     ud.ud_tree_gen  = stm_store_le64(tree_gen);
     memcpy(out, &ud, sizeof ud);
+    return STM_OK;
 }
 
 /* Decode user_data; returns STM_ENOENT when the slot is zero (never
- * written), STM_EBADVERSION on magic/version mismatch. */
+ * written) or has tree_root == 0 (reserved-as-absent), STM_EBADVERSION
+ * on magic/version mismatch. */
 static stm_status user_data_decode(const uint8_t in[STM_BOOTSTRAP_USER_DATA_SIZE],
                                      uint64_t *out_tree_root,
                                      uint64_t *out_tree_gen)
 {
-    /* All-zero = "never initialized" → no tree yet. */
+    /* All-zero = "never initialized" → no tree yet. Checks first 32
+     * bytes, which covers magic(8) + version(4) + flags(4) +
+     * tree_root(8) + tree_gen(8) — all load-bearing fields. If any
+     * future field in ud_reserved[32] becomes load-bearing, extend
+     * the window. */
     bool all_zero = true;
     for (size_t i = 0; i < 32; i++) {
         if (in[i] != 0) { all_zero = false; break; }
@@ -185,7 +208,10 @@ static stm_status user_data_decode(const uint8_t in[STM_BOOTSTRAP_USER_DATA_SIZE
     if (stm_load_le64(ud.ud_magic)   != STM_ALLOC_UD_MAGIC)   return STM_EBADVERSION;
     if (stm_load_le32(ud.ud_version) != STM_ALLOC_UD_VERSION) return STM_EBADVERSION;
 
-    *out_tree_root = stm_load_le64(ud.ud_tree_root);
+    uint64_t tree_root = stm_load_le64(ud.ud_tree_root);
+    if (tree_root == 0) return STM_ENOENT;   /* R7c P1-2 */
+
+    *out_tree_root = tree_root;
     *out_tree_gen  = stm_load_le64(ud.ud_tree_gen);
     return STM_OK;
 }
@@ -579,6 +605,7 @@ stm_status stm_alloc_reserve(stm_alloc *a, uint64_t nblocks,
     }
 
     *out_paddr = stm_paddr_make(0, ctx.found_start);
+    a->tree_dirty = true;
     pthread_mutex_unlock(&a->lock);
     return STM_OK;
 }
@@ -655,6 +682,7 @@ stm_status stm_alloc_free(stm_alloc *a, uint64_t paddr, uint64_t free_gen)
         a->pending_blocks += length;
     }
 
+    a->tree_dirty = true;
     pthread_mutex_unlock(&a->lock);
     return STM_OK;
 }
@@ -700,6 +728,7 @@ stm_status stm_alloc_ref(stm_alloc *a, uint64_t paddr)
 
     encode_val(length, refcount + 1, val_buf);
     s = stm_btree_mt_insert(a->tree, key_buf, 8, val_buf, 8);
+    if (s == STM_OK) a->tree_dirty = true;
 
     pthread_mutex_unlock(&a->lock);
     return s;
@@ -713,6 +742,7 @@ stm_status stm_alloc_commit(stm_alloc *a, uint64_t committed_gen)
 
     /* Sweep PENDING: delete tree entries whose free_gen < committed_gen
      * (allocator.tla's Commit rule). */
+    bool swept_anything = false;
     pending_entry **link = &a->pending_head;
     pending_entry  *e    = a->pending_head;
     while (e) {
@@ -732,51 +762,64 @@ stm_status stm_alloc_commit(stm_alloc *a, uint64_t committed_gen)
             a->pending_count--;
             a->pending_blocks -= e->length_blocks;
             free(e);
+            swept_anything = true;
         } else {
             link = &e->next;
         }
         e = next;
     }
+    if (swept_anything) a->tree_dirty = true;
 
-    /* Chunk 5d: serialize the data-area tree to the bootstrap pool,
-     * freeing the previous snapshot's nodes first (PENDING-free at
-     * committed_gen so they're reclaimed at committed_gen+1 per
-     * allocator.tla's strict less-than rule). */
-    store_ctx scx = { .boot = a->boot, .bdev = a->bdev };
+    /* R7c P2-5: skip the tree rewrite when nothing logical has
+     * changed since the last commit. The bootstrap pool still
+     * commits (to advance its bitmap_gen and drain its own PENDING
+     * list), but we don't churn through free_tree + serialize +
+     * user_data update for a quiescent tree. */
+    uint64_t new_root = a->current_tree_root;
+    bool     persist_tree = a->tree_dirty || a->current_tree_root == 0;
 
-    if (a->current_tree_root != 0) {
-        stm_status fs = stm_btree_store_free_tree(a->current_tree_root,
-                                                    committed_gen,
-                                                    &ALLOC_STORE_VT, &scx);
-        if (fs != STM_OK) {
+    if (persist_tree) {
+        store_ctx scx = { .boot = a->boot, .bdev = a->bdev };
+
+        if (a->current_tree_root != 0) {
+            stm_status fs = stm_btree_store_free_tree(a->current_tree_root,
+                                                        committed_gen,
+                                                        &ALLOC_STORE_VT, &scx);
+            if (fs != STM_OK) {
+                pthread_mutex_unlock(&a->lock);
+                return fs;
+            }
+        }
+
+        stm_status ss = stm_btree_store_serialize(a->tree, committed_gen,
+                                                    /*tree_id=*/0,
+                                                    &ALLOC_STORE_VT, &scx,
+                                                    &new_root);
+        if (ss != STM_OK) {
             pthread_mutex_unlock(&a->lock);
-            return fs;
+            return ss;
+        }
+
+        uint8_t ud_buf[STM_BOOTSTRAP_USER_DATA_SIZE];
+        stm_status ue = user_data_encode(new_root, committed_gen, ud_buf);
+        if (ue != STM_OK) {
+            /* R7c P1-2 defensive: serialize must never hand back 0. */
+            pthread_mutex_unlock(&a->lock);
+            return ue;
+        }
+        stm_status us = stm_bootstrap_set_user_data(a->boot, ud_buf, sizeof ud_buf);
+        if (us != STM_OK) {
+            pthread_mutex_unlock(&a->lock);
+            return us;
         }
     }
 
-    uint64_t new_root = 0;
-    stm_status ss = stm_btree_store_serialize(a->tree, committed_gen, /*tree_id=*/0,
-                                                &ALLOC_STORE_VT, &scx,
-                                                &new_root);
-    if (ss != STM_OK) {
-        pthread_mutex_unlock(&a->lock);
-        return ss;
-    }
-
-    /* Persist the new tree root in the bootstrap's user-data slot so
-     * the next stm_alloc_open can recover it. */
-    uint8_t ud_buf[STM_BOOTSTRAP_USER_DATA_SIZE];
-    user_data_encode(new_root, committed_gen, ud_buf);
-    stm_status us = stm_bootstrap_set_user_data(a->boot, ud_buf, sizeof ud_buf);
-    if (us != STM_OK) {
-        pthread_mutex_unlock(&a->lock);
-        return us;
-    }
-
-    /* Commit the bootstrap pool — persists bitmap + new user_data. */
+    /* Commit the bootstrap pool — persists bitmap + (if we wrote it)
+     * new user_data. */
     stm_status s = stm_bootstrap_commit(a->boot, committed_gen);
     if (s == STM_OK) {
         a->current_tree_root = new_root;
+        a->tree_dirty        = false;
     }
 
     pthread_mutex_unlock(&a->lock);

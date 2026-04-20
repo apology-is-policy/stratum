@@ -18,87 +18,12 @@
  */
 
 #include <stratum/btnode.h>
-#include <stratum/hash.h>
+
+#include "btnode_common.h"
 
 #include <string.h>
 
-/* Shared constants with leaf.c. Duplicated locally to keep the two
- * translation units decoupled — consolidation comes after chunk 5c
- * when the common write/verify helpers want to live in one place. */
-#define CSUM_OFFSET   (STM_BTNODE_SIZE - STM_BTNODE_CSUM_SIZE)
-
-/* ========================================================================= */
-/* Internal helpers mirroring leaf.c (header + csum).                         */
-/* ========================================================================= */
-
-static void hdr_write_internal(uint8_t *buf,
-                                 uint32_t n_pivots,
-                                 uint32_t payload_used,
-                                 uint64_t gen, uint64_t tree_id)
-{
-    memset(buf, 0, STM_BTNODE_HDR_SIZE);
-
-    stm_btnode_hdr hdr = { 0 };
-    hdr.n_magic        = stm_store_le64(STM_BTNODE_MAGIC);
-    hdr.n_version      = stm_store_le32(STM_BTNODE_VERSION);
-    hdr.n_flags        = stm_store_le32(0);
-    hdr.n_kind         = (uint8_t)STM_BTNODE_KIND_INTERNAL;
-    hdr.n_n_entries    = stm_store_le32(n_pivots);
-    hdr.n_buffer_used  = stm_store_le32(0);        /* messages deferred */
-    hdr.n_payload_used = stm_store_le32(payload_used);
-    hdr.n_gen          = stm_store_le64(gen);
-    hdr.n_tree_id      = stm_store_le64(tree_id);
-
-    memcpy(buf, &hdr, sizeof hdr);
-}
-
-static stm_status hdr_read_internal(const uint8_t *buf, size_t buf_size,
-                                      stm_btnode_info *out)
-{
-    if (buf_size < STM_BTNODE_SIZE) return STM_ERANGE;
-
-    const stm_btnode_hdr *hdr = (const stm_btnode_hdr *)buf;
-    if (stm_load_le64(hdr->n_magic) != STM_BTNODE_MAGIC)
-        return STM_EBADVERSION;
-    if (stm_load_le32(hdr->n_version) != STM_BTNODE_VERSION)
-        return STM_EBADVERSION;
-
-    uint8_t kind = hdr->n_kind;
-    if (kind != STM_BTNODE_KIND_LEAF && kind != STM_BTNODE_KIND_INTERNAL)
-        return STM_ECORRUPT;
-
-    out->kind         = (stm_btnode_kind)kind;
-    out->n_entries    = stm_load_le32(hdr->n_n_entries);
-    out->buffer_used  = stm_load_le32(hdr->n_buffer_used);
-    out->payload_used = stm_load_le32(hdr->n_payload_used);
-    out->gen          = stm_load_le64(hdr->n_gen);
-    out->tree_id      = stm_load_le64(hdr->n_tree_id);
-    return STM_OK;
-}
-
-static void compute_csum_internal(uint8_t *buf, uint8_t out[STM_BTNODE_CSUM_SIZE])
-{
-    memset(buf + CSUM_OFFSET, 0, STM_BTNODE_CSUM_SIZE);
-    stm_blake3_hash h;
-    stm_blake3(buf, CSUM_OFFSET, &h);
-    memcpy(out, h.bytes, STM_BTNODE_CSUM_SIZE);
-}
-
-static stm_status verify_csum_internal(const uint8_t *buf)
-{
-    uint8_t staged[STM_BTNODE_SIZE];
-    memcpy(staged, buf, STM_BTNODE_SIZE);
-    memset(staged + CSUM_OFFSET, 0, STM_BTNODE_CSUM_SIZE);
-
-    stm_blake3_hash h;
-    stm_blake3(staged, CSUM_OFFSET, &h);
-    const uint8_t *stored = buf + CSUM_OFFSET;
-    uint8_t diff = 0;
-    for (size_t i = 0; i < STM_BTNODE_CSUM_SIZE; i++) {
-        diff |= (uint8_t)(stored[i] ^ h.bytes[i]);
-    }
-    return diff == 0 ? STM_OK : STM_ECORRUPT;
-}
+/* Header + csum helpers consolidated into common.c (R7c P2-4). */
 
 /* ========================================================================= */
 /* Public: internal encode / decode.                                          */
@@ -142,7 +67,9 @@ stm_status stm_btnode_internal_encode(const stm_btnode_pivot *pivots,
     uint8_t *out = (uint8_t *)buf;
     memset(out, 0, STM_BTNODE_SIZE);
 
-    hdr_write_internal(out, n_pivots, (uint32_t)payload_bytes, gen, tree_id);
+    btnode_hdr_write(out, STM_BTNODE_KIND_INTERNAL,
+                     n_pivots, /*buffer_used=*/0,
+                     (uint32_t)payload_bytes, gen, tree_id);
 
     uint8_t *p = out + STM_BTNODE_HDR_SIZE;
 
@@ -165,8 +92,8 @@ stm_status stm_btnode_internal_encode(const stm_btnode_pivot *pivots,
 
     /* Trailing csum. */
     uint8_t csum[STM_BTNODE_CSUM_SIZE];
-    compute_csum_internal(out, csum);
-    memcpy(out + CSUM_OFFSET, csum, STM_BTNODE_CSUM_SIZE);
+    btnode_compute_csum(out, csum);
+    memcpy(out + BTNODE_CSUM_OFFSET, csum, STM_BTNODE_CSUM_SIZE);
 
     return STM_OK;
 }
@@ -183,12 +110,13 @@ stm_status stm_btnode_internal_decode(const void *buf, size_t buf_size,
     const uint8_t *in = (const uint8_t *)buf;
 
     stm_btnode_info info;
-    stm_status s = hdr_read_internal(in, buf_size, &info);
+    stm_status s = btnode_hdr_read(in, buf_size, &info);
     if (s != STM_OK) return s;
 
-    if (info.kind != STM_BTNODE_KIND_INTERNAL) return STM_EINVAL;
+    /* R7c P2-3: wrong on-disk kind → STM_ECORRUPT, not STM_EINVAL. */
+    if (info.kind != STM_BTNODE_KIND_INTERNAL) return STM_ECORRUPT;
 
-    s = verify_csum_internal(in);
+    s = btnode_verify_csum(in);
     if (s != STM_OK) return s;
 
     if (out_info) *out_info = info;

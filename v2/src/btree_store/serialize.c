@@ -368,26 +368,67 @@ cleanup:
 
 typedef struct {
     stm_btree_mt *tree;
+    /* R7c P2-6: track the last key seen to reject out-of-order or
+     * duplicate-key entries. A tampered leaf that inserted duplicates
+     * would silently overwrite via upsert, masking corruption. */
+    uint8_t      *prev_key;
+    size_t        prev_key_len;
+    size_t        prev_key_cap;
     stm_status    err;
 } insert_ctx;
+
+/* Byte-string lex compare, matching stm_btree's ordering. Returns
+ * < 0, 0, > 0. */
+static int keys_cmp(const void *a, size_t alen,
+                    const void *b, size_t blen)
+{
+    size_t m = alen < blen ? alen : blen;
+    int r = memcmp(a, b, m);
+    if (r != 0) return r;
+    if (alen < blen) return -1;
+    if (alen > blen) return 1;
+    return 0;
+}
 
 static int insert_cb(const void *key, size_t key_len,
                       const void *value, size_t value_len, void *ctx_)
 {
     insert_ctx *c = ctx_;
+
+    /* Sort-order check: new key must be strictly greater than the
+     * last one we saw. Same-leaf duplicates and cross-leaf overlap
+     * (a following leaf's first key ≤ a previous leaf's last key)
+     * both surface here. */
+    if (c->prev_key_len > 0) {
+        int cmp = keys_cmp(c->prev_key, c->prev_key_len, key, key_len);
+        if (cmp >= 0) { c->err = STM_ECORRUPT; return 1; }
+    }
+
+    /* Remember this key for the next comparison. Grow buffer as
+     * needed. */
+    if (key_len > c->prev_key_cap) {
+        size_t new_cap = key_len * 2u;
+        uint8_t *grew = realloc(c->prev_key, new_cap);
+        if (!grew) { c->err = STM_ENOMEM; return 1; }
+        c->prev_key     = grew;
+        c->prev_key_cap = new_cap;
+    }
+    if (key_len) memcpy(c->prev_key, key, key_len);
+    c->prev_key_len = key_len;
+
     stm_status s = stm_btree_mt_insert(c->tree, key, key_len, value, value_len);
     if (s != STM_OK) { c->err = s; return 1; }
     return 0;
 }
 
-static stm_status deserialize_leaf(stm_btree_mt *t,
-                                     const uint8_t *buf)
+static stm_status deserialize_leaf(stm_btree_mt *t, const uint8_t *buf,
+                                     insert_ctx *ic)
 {
-    insert_ctx ic = { .tree = t, .err = STM_OK };
     stm_status s = stm_btnode_leaf_decode(buf, STM_BTNODE_SIZE,
-                                            NULL, insert_cb, &ic);
+                                            NULL, insert_cb, ic);
+    (void)t;
     if (s != STM_OK) return s;
-    return ic.err;
+    return ic->err;
 }
 
 typedef struct {
@@ -437,8 +478,10 @@ stm_status stm_btree_store_deserialize(stm_btree_mt *t, uint64_t root_paddr,
     if (s != STM_OK) { free(buf); return s; }
 
     if (info.kind == STM_BTNODE_KIND_LEAF) {
-        s = deserialize_leaf(t, buf);
+        insert_ctx ic = { .tree = t };
+        s = deserialize_leaf(t, buf, &ic);
         free(buf);
+        free(ic.prev_key);
         return s;
     }
 
@@ -463,26 +506,29 @@ stm_status stm_btree_store_deserialize(stm_btree_mt *t, uint64_t root_paddr,
         return s;
     }
 
-    /* Read each child and deserialize as a leaf. */
+    /* Read each child and deserialize as a leaf. A single insert_ctx
+     * threads across all leaves so the sort-order check (R7c P2-6)
+     * catches out-of-order keys straddling two leaves as well as
+     * in-leaf duplicates. */
     uint8_t *leafbuf = malloc(STM_BTNODE_SIZE);
     if (!leafbuf) {
         free(cc.child_paddrs); free(cc.child_kinds);
         return STM_ENOMEM;
     }
+    insert_ctx ic = { .tree = t };
     for (uint32_t i = 0; i < cc.n_children; i++) {
         if (cc.child_kinds[i] != STM_BPTR_KIND_LEAF) {
-            /* MVP cap: internal → only leaves. Nested internals not
-             * yet supported. */
             s = STM_ENOTSUPPORTED;
             break;
         }
         s = vt->read(vt_ctx, cc.child_paddrs[i], leafbuf, STM_BTNODE_SIZE);
         if (s != STM_OK) break;
-        s = deserialize_leaf(t, leafbuf);
+        s = deserialize_leaf(t, leafbuf, &ic);
         if (s != STM_OK) break;
     }
 
     free(leafbuf);
+    free(ic.prev_key);
     free(cc.child_paddrs);
     free(cc.child_kinds);
     return s;
