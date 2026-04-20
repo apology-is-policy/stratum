@@ -95,6 +95,14 @@ typedef struct stm_bdev stm_bdev;   /* forward from block.h */
 /* On-disk format version of the bootstrap-pool header. */
 #define STM_BOOTSTRAP_HDR_VERSION         1u
 
+/* Size (bytes) of the opaque user-data region stashed in each bootstrap
+ * header slot. Layers above the bootstrap pool (e.g. the allocator)
+ * use this to persist a small amount of state atomically with the
+ * bootstrap commit — matching format life-cycle without adding their
+ * own header slot. 256 bytes is enough for a bptr (64 B) plus room
+ * for small counters. */
+#define STM_BOOTSTRAP_USER_DATA_SIZE      256u
+
 /* ========================================================================= */
 /* Opaque handle + stats.                                                     */
 /* ========================================================================= */
@@ -242,6 +250,34 @@ stm_status stm_bootstrap_stats_get(const stm_bootstrap *a, stm_bootstrap_stats *
 STM_MUST_USE
 stm_status stm_bootstrap_is_allocated(const stm_bootstrap *a, uint64_t paddr,
                                    bool *out_allocated);
+
+/* ========================================================================= */
+/* Opaque user-data region (chunk 5d).                                        */
+/* ========================================================================= */
+
+/*
+ * Overwrite the bootstrap's in-RAM user-data region with `data` (up to
+ * STM_BOOTSTRAP_USER_DATA_SIZE bytes). The new bytes become durable on
+ * the next stm_bootstrap_commit. `len` must be ≤ STM_BOOTSTRAP_USER_DATA_SIZE;
+ * the stored region is zero-padded on the right.
+ *
+ * This slot is intended for a SMALL amount of state whose lifecycle is
+ * bound to the bootstrap header (e.g. the allocator-tree root paddr).
+ * Users that need more storage should serialize to the data area and
+ * keep only a pointer here.
+ */
+STM_MUST_USE
+stm_status stm_bootstrap_set_user_data(stm_bootstrap *a,
+                                        const void *data, size_t len);
+
+/*
+ * Copy the bootstrap's user-data region into `out_data` (at most
+ * STM_BOOTSTRAP_USER_DATA_SIZE bytes). If `len < STM_BOOTSTRAP_USER_DATA_SIZE`
+ * only the first `len` bytes are returned.
+ */
+STM_MUST_USE
+stm_status stm_bootstrap_get_user_data(const stm_bootstrap *a,
+                                        void *out_data, size_t len);
 
 #ifdef __cplusplus
 }

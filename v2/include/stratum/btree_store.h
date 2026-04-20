@@ -110,6 +110,24 @@ stm_status stm_btree_store_deserialize(
     stm_btree_mt *t, uint64_t root_paddr,
     const stm_btree_store_vtable *vt, void *vt_ctx);
 
+/*
+ * Walk the tree rooted at `root_paddr` and call vt->free on every
+ * node's paddr with the given `free_gen`. Matches the on-disk tree
+ * shape produced by stm_btree_store_serialize (two levels max).
+ *
+ * Used by allocator commit to reclaim the previous snapshot's nodes
+ * after emitting the new one. On-disk state is a fresh tree now —
+ * the old paddrs are dead once the new bootstrap commit records
+ * the new root.
+ *
+ * Returns STM_ECORRUPT if the tree nodes fail csum or violate the
+ * two-level invariant.
+ */
+STM_MUST_USE
+stm_status stm_btree_store_free_tree(uint64_t root_paddr, uint64_t free_gen,
+                                      const stm_btree_store_vtable *vt,
+                                      void *vt_ctx);
+
 #ifdef __cplusplus
 }
 #endif

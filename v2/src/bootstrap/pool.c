@@ -58,7 +58,8 @@ typedef struct {
     le64    h_data_unit_blocks;      /*   80 :  8 */
     le64    h_data_start_block;      /*   88 :  8 */
     uint8_t h_bitmap_csum[32];       /*   96 : 32 */
-    uint8_t h_reserved[3936];        /*  128 : 3936 */
+    uint8_t h_user_data[STM_BOOTSTRAP_USER_DATA_SIZE]; /*  128 : 256 */
+    uint8_t h_reserved[3680];        /*  384 : 3680 */
     uint8_t h_csum[32];              /* 4064 : 32 */
 } stm_bootstrap_hdr;
 
@@ -101,6 +102,10 @@ struct stm_bootstrap {
 
     /* Roving allocation cursor (in units). */
     uint64_t   rove_next_unit;
+
+    /* Chunk 5d: opaque user-data region stored in the header. Persisted
+     * atomically with the bootstrap commit. */
+    uint8_t    user_data[STM_BOOTSTRAP_USER_DATA_SIZE];
 };
 
 /* ========================================================================= */
@@ -389,6 +394,9 @@ stm_status stm_bootstrap_create(stm_bdev *d,
     hdr.h_data_unit_blocks      = stm_store_le64(STM_BOOTSTRAP_UNIT_BLOCKS);
     hdr.h_data_start_block      = stm_store_le64(a->data_start_block);
     memcpy(hdr.h_bitmap_csum, bitmap_csum, 32);
+    /* User data starts zero in a fresh pool; caller can set via
+     * stm_bootstrap_set_user_data and it'll persist on next commit. */
+    memcpy(hdr.h_user_data, a->user_data, STM_BOOTSTRAP_USER_DATA_SIZE);
 
     uint8_t hdr_buf[STM_UB_SIZE];
     encode_hdr(&hdr, hdr_buf);
@@ -554,6 +562,8 @@ stm_status stm_bootstrap_open(stm_bdev *d, stm_bootstrap **out_alloc)
         return STM_ECORRUPT;
     }
     memcpy(a->bitmap, bitmap_block, a->bitmap_bytes);
+    memcpy(a->user_data, chosen_hdr->h_user_data,
+           STM_BOOTSTRAP_USER_DATA_SIZE);
 
     *out_alloc = a;
     return STM_OK;
@@ -776,6 +786,7 @@ stm_status stm_bootstrap_commit(stm_bootstrap *a, uint64_t committed_gen)
     hdr.h_data_unit_blocks      = stm_store_le64(STM_BOOTSTRAP_UNIT_BLOCKS);
     hdr.h_data_start_block      = stm_store_le64(a->data_start_block);
     memcpy(hdr.h_bitmap_csum, bitmap_csum, 32);
+    memcpy(hdr.h_user_data, a->user_data, STM_BOOTSTRAP_USER_DATA_SIZE);
 
     uint8_t hdr_buf[STM_UB_SIZE];
     encode_hdr(&hdr, hdr_buf);
@@ -842,5 +853,31 @@ stm_status stm_bootstrap_is_allocated(const stm_bootstrap *a, uint64_t paddr,
     uint64_t unit = 0;
     if (!paddr_to_unit(a, paddr, &unit)) return STM_EINVAL;
     *out_allocated = bit_is_set(a->bitmap, unit);
+    return STM_OK;
+}
+
+/* ========================================================================= */
+/* User-data slot (chunk 5d).                                                 */
+/* ========================================================================= */
+
+stm_status stm_bootstrap_set_user_data(stm_bootstrap *a,
+                                        const void *data, size_t len)
+{
+    if (!a) return STM_EINVAL;
+    if (len > STM_BOOTSTRAP_USER_DATA_SIZE) return STM_ERANGE;
+    if (len > 0 && !data) return STM_EINVAL;
+
+    memset(a->user_data, 0, STM_BOOTSTRAP_USER_DATA_SIZE);
+    if (len) memcpy(a->user_data, data, len);
+    return STM_OK;
+}
+
+stm_status stm_bootstrap_get_user_data(const stm_bootstrap *a,
+                                        void *out_data, size_t len)
+{
+    if (!a || (len > 0 && !out_data)) return STM_EINVAL;
+    if (len > STM_BOOTSTRAP_USER_DATA_SIZE) return STM_ERANGE;
+
+    if (len) memcpy(out_data, a->user_data, len);
     return STM_OK;
 }

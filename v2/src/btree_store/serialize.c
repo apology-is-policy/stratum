@@ -487,3 +487,65 @@ stm_status stm_btree_store_deserialize(stm_btree_mt *t, uint64_t root_paddr,
     free(cc.child_kinds);
     return s;
 }
+
+/* ========================================================================= */
+/* Public: free_tree (reclaim previous snapshot's nodes).                     */
+/* ========================================================================= */
+
+stm_status stm_btree_store_free_tree(uint64_t root_paddr, uint64_t free_gen,
+                                       const stm_btree_store_vtable *vt,
+                                       void *vt_ctx)
+{
+    if (!vt) return STM_EINVAL;
+    if (!vt->read || !vt->free) return STM_EINVAL;
+
+    uint8_t *buf = malloc(STM_BTNODE_SIZE);
+    if (!buf) return STM_ENOMEM;
+
+    stm_status s = vt->read(vt_ctx, root_paddr, buf, STM_BTNODE_SIZE);
+    if (s != STM_OK) { free(buf); return s; }
+
+    stm_btnode_info info;
+    s = stm_btnode_peek(buf, STM_BTNODE_SIZE, &info);
+    if (s != STM_OK) { free(buf); return s; }
+
+    if (info.kind == STM_BTNODE_KIND_LEAF) {
+        free(buf);
+        return vt->free(vt_ctx, root_paddr, free_gen);
+    }
+
+    /* INTERNAL root. Enumerate children; free each (must be LEAF per
+     * the two-level invariant); then free the internal itself. */
+    uint32_t cap = info.n_entries + 1u;
+    child_collect cc = { 0 };
+    cc.child_paddrs = calloc(cap, sizeof *cc.child_paddrs);
+    cc.child_kinds  = calloc(cap, sizeof *cc.child_kinds);
+    cc.cap          = cap;
+    if (!cc.child_paddrs || !cc.child_kinds) {
+        free(cc.child_paddrs); free(cc.child_kinds); free(buf);
+        return STM_ENOMEM;
+    }
+
+    s = stm_btnode_internal_decode(buf, STM_BTNODE_SIZE, NULL,
+                                     NULL, child_record_cb, &cc);
+    if (s == STM_OK && cc.err != STM_OK) s = cc.err;
+    free(buf);
+    if (s != STM_OK) {
+        free(cc.child_paddrs); free(cc.child_kinds);
+        return s;
+    }
+
+    for (uint32_t i = 0; i < cc.n_children; i++) {
+        if (cc.child_kinds[i] != STM_BPTR_KIND_LEAF) {
+            s = STM_ENOTSUPPORTED;
+            break;
+        }
+        s = vt->free(vt_ctx, cc.child_paddrs[i], free_gen);
+        if (s != STM_OK) break;
+    }
+    free(cc.child_paddrs);
+    free(cc.child_kinds);
+    if (s != STM_OK) return s;
+
+    return vt->free(vt_ctx, root_paddr, free_gen);
+}

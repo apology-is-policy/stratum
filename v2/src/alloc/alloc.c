@@ -49,7 +49,9 @@
 #include <stratum/alloc.h>
 #include <stratum/block.h>
 #include <stratum/bootstrap.h>
+#include <stratum/btnode.h>
 #include <stratum/btree.h>
+#include <stratum/btree_store.h>
 #include <stratum/super.h>
 
 #include <pthread.h>
@@ -71,7 +73,8 @@ struct pending_entry {
 struct stm_alloc {
     pthread_mutex_t lock;
 
-    stm_bootstrap  *boot;           /* internal node storage (future)    */
+    stm_bdev       *bdev;           /* device underlying boot + tree I/O */
+    stm_bootstrap  *boot;           /* internal node storage             */
     stm_btree_mt   *tree;           /* data-area allocation tracker      */
 
     uint64_t        data_first_block;  /* inclusive                      */
@@ -81,6 +84,11 @@ struct stm_alloc {
     pending_entry  *pending_head;
     uint64_t        pending_count;
     uint64_t        pending_blocks;
+
+    /* Chunk 5d: most-recently-persisted tree root paddr. 0 if no tree
+     * has been committed yet. Used to free the previous snapshot's
+     * nodes on the next commit. */
+    uint64_t        current_tree_root;
 };
 
 /* ========================================================================= */
@@ -124,6 +132,113 @@ static inline void decode_val(const uint8_t in[8],
 }
 
 /* ========================================================================= */
+/* User-data slot encoding.                                                   */
+/* ========================================================================= */
+
+/* Layout of the bootstrap's user-data slot that the allocator owns.
+ * 64 bytes out of STM_BOOTSTRAP_USER_DATA_SIZE (256). The remaining
+ * bytes are reserved for future allocator metadata. */
+typedef struct {
+    le64    ud_magic;          /*  0 :  8 — "STAUDATA" */
+    le32    ud_version;        /*  8 :  4 */
+    le32    ud_flags;          /* 12 :  4 */
+    le64    ud_tree_root;      /* 16 :  8 — 0 if no tree persisted */
+    le64    ud_tree_gen;       /* 24 :  8 — gen when tree was last written */
+    uint8_t ud_reserved[32];   /* 32 : 32 */
+} stm_alloc_user_data;
+
+_Static_assert(sizeof(stm_alloc_user_data) == 64,
+               "stm_alloc_user_data must fit in 64 bytes");
+
+/* ASCII "STAUDATA" read as little-endian uint64. */
+#define STM_ALLOC_UD_MAGIC   UINT64_C(0x4154414455415453)
+#define STM_ALLOC_UD_VERSION 1u
+
+static void user_data_encode(uint64_t tree_root, uint64_t tree_gen,
+                               uint8_t out[STM_BOOTSTRAP_USER_DATA_SIZE])
+{
+    memset(out, 0, STM_BOOTSTRAP_USER_DATA_SIZE);
+
+    stm_alloc_user_data ud = { 0 };
+    ud.ud_magic     = stm_store_le64(STM_ALLOC_UD_MAGIC);
+    ud.ud_version   = stm_store_le32(STM_ALLOC_UD_VERSION);
+    ud.ud_tree_root = stm_store_le64(tree_root);
+    ud.ud_tree_gen  = stm_store_le64(tree_gen);
+    memcpy(out, &ud, sizeof ud);
+}
+
+/* Decode user_data; returns STM_ENOENT when the slot is zero (never
+ * written), STM_EBADVERSION on magic/version mismatch. */
+static stm_status user_data_decode(const uint8_t in[STM_BOOTSTRAP_USER_DATA_SIZE],
+                                     uint64_t *out_tree_root,
+                                     uint64_t *out_tree_gen)
+{
+    /* All-zero = "never initialized" → no tree yet. */
+    bool all_zero = true;
+    for (size_t i = 0; i < 32; i++) {
+        if (in[i] != 0) { all_zero = false; break; }
+    }
+    if (all_zero) return STM_ENOENT;
+
+    stm_alloc_user_data ud;
+    memcpy(&ud, in, sizeof ud);
+    if (stm_load_le64(ud.ud_magic)   != STM_ALLOC_UD_MAGIC)   return STM_EBADVERSION;
+    if (stm_load_le32(ud.ud_version) != STM_ALLOC_UD_VERSION) return STM_EBADVERSION;
+
+    *out_tree_root = stm_load_le64(ud.ud_tree_root);
+    *out_tree_gen  = stm_load_le64(ud.ud_tree_gen);
+    return STM_OK;
+}
+
+/* ========================================================================= */
+/* Store vtable: bridge stm_btree_store to stm_bootstrap + stm_bdev.          */
+/* ========================================================================= */
+
+typedef struct {
+    stm_bootstrap *boot;
+    stm_bdev      *bdev;
+} store_ctx;
+
+static stm_status store_reserve(void *ctx_, uint64_t *out_paddr)
+{
+    store_ctx *ctx = ctx_;
+    return stm_bootstrap_reserve(ctx->boot, STM_BOOTSTRAP_UNIT_BLOCKS,
+                                   /*hint_paddr=*/0, out_paddr);
+}
+
+static stm_status store_free(void *ctx_, uint64_t paddr, uint64_t free_gen)
+{
+    store_ctx *ctx = ctx_;
+    return stm_bootstrap_free(ctx->boot, paddr, STM_BOOTSTRAP_UNIT_BLOCKS,
+                                free_gen);
+}
+
+static stm_status store_write(void *ctx_, uint64_t paddr,
+                                const void *buf, size_t len)
+{
+    store_ctx *ctx = ctx_;
+    if (stm_paddr_device(paddr) != 0) return STM_EINVAL;
+    uint64_t byte_offset = stm_paddr_offset(paddr) * (uint64_t)STM_UB_SIZE;
+    return stm_bdev_write(ctx->bdev, byte_offset, buf, len);
+}
+
+static stm_status store_read(void *ctx_, uint64_t paddr,
+                               void *buf, size_t len)
+{
+    store_ctx *ctx = ctx_;
+    if (stm_paddr_device(paddr) != 0) return STM_EINVAL;
+    uint64_t byte_offset = stm_paddr_offset(paddr) * (uint64_t)STM_UB_SIZE;
+    return stm_bdev_read(ctx->bdev, byte_offset, buf, len);
+}
+
+static const stm_btree_store_vtable ALLOC_STORE_VT = {
+    .reserve = store_reserve,
+    .free    = store_free,
+    .write   = store_write,
+    .read    = store_read,
+};
+
+/* ========================================================================= */
 /* Data-area geometry.                                                        */
 /* ========================================================================= */
 
@@ -160,10 +275,9 @@ static stm_alloc *alloc_new(stm_bdev *d,
                              uint64_t data_first, uint64_t data_last,
                              stm_bootstrap *boot)
 {
-    (void)d;
-
     stm_alloc *a = calloc(1, sizeof *a);
     if (!a) return NULL;
+    a->bdev = d;
 
     if (pthread_mutex_init(&a->lock, NULL) != 0) {
         free(a);
@@ -258,6 +372,33 @@ stm_status stm_alloc_open(stm_bdev *d, stm_alloc **out_alloc)
         stm_bootstrap_close(boot);
         return STM_ENOMEM;
     }
+
+    /* Chunk 5d: if the bootstrap's user-data slot records a previously
+     * persisted tree root, deserialize it into our in-RAM tree. Zero /
+     * never-written slot → fresh open, empty tree (same as create). */
+    uint8_t ud_buf[STM_BOOTSTRAP_USER_DATA_SIZE];
+    s = stm_bootstrap_get_user_data(boot, ud_buf, sizeof ud_buf);
+    if (s != STM_OK) {
+        stm_alloc_close(a);
+        return s;
+    }
+
+    uint64_t root_paddr = 0, root_gen = 0;
+    stm_status ds = user_data_decode(ud_buf, &root_paddr, &root_gen);
+    if (ds == STM_OK && root_paddr != 0) {
+        store_ctx scx = { .boot = a->boot, .bdev = a->bdev };
+        ds = stm_btree_store_deserialize(a->tree, root_paddr,
+                                           &ALLOC_STORE_VT, &scx);
+        if (ds != STM_OK) {
+            stm_alloc_close(a);
+            return ds;
+        }
+        a->current_tree_root = root_paddr;
+    } else if (ds != STM_OK && ds != STM_ENOENT) {
+        stm_alloc_close(a);
+        return ds;
+    }
+    /* ds == STM_ENOENT: no tree persisted → leave tree empty. */
 
     *out_alloc = a;
     return STM_OK;
@@ -597,9 +738,46 @@ stm_status stm_alloc_commit(stm_alloc *a, uint64_t committed_gen)
         e = next;
     }
 
-    /* Commit the bootstrap pool (which persists the bootstrap's own
-     * state; the data-area tree is in-RAM in chunk 4b, no I/O here). */
+    /* Chunk 5d: serialize the data-area tree to the bootstrap pool,
+     * freeing the previous snapshot's nodes first (PENDING-free at
+     * committed_gen so they're reclaimed at committed_gen+1 per
+     * allocator.tla's strict less-than rule). */
+    store_ctx scx = { .boot = a->boot, .bdev = a->bdev };
+
+    if (a->current_tree_root != 0) {
+        stm_status fs = stm_btree_store_free_tree(a->current_tree_root,
+                                                    committed_gen,
+                                                    &ALLOC_STORE_VT, &scx);
+        if (fs != STM_OK) {
+            pthread_mutex_unlock(&a->lock);
+            return fs;
+        }
+    }
+
+    uint64_t new_root = 0;
+    stm_status ss = stm_btree_store_serialize(a->tree, committed_gen, /*tree_id=*/0,
+                                                &ALLOC_STORE_VT, &scx,
+                                                &new_root);
+    if (ss != STM_OK) {
+        pthread_mutex_unlock(&a->lock);
+        return ss;
+    }
+
+    /* Persist the new tree root in the bootstrap's user-data slot so
+     * the next stm_alloc_open can recover it. */
+    uint8_t ud_buf[STM_BOOTSTRAP_USER_DATA_SIZE];
+    user_data_encode(new_root, committed_gen, ud_buf);
+    stm_status us = stm_bootstrap_set_user_data(a->boot, ud_buf, sizeof ud_buf);
+    if (us != STM_OK) {
+        pthread_mutex_unlock(&a->lock);
+        return us;
+    }
+
+    /* Commit the bootstrap pool — persists bitmap + new user_data. */
     stm_status s = stm_bootstrap_commit(a->boot, committed_gen);
+    if (s == STM_OK) {
+        a->current_tree_root = new_root;
+    }
 
     pthread_mutex_unlock(&a->lock);
     return s;

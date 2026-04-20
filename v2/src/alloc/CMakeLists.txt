@@ -6,4 +6,4 @@ target_include_directories(stm_alloc PUBLIC
 
 target_link_libraries(stm_alloc
     PRIVATE stm_warnings stm_sanitize stm_coverage Threads::Threads
-    PUBLIC  stm_bootstrap stm_btree stm_block)
+    PUBLIC  stm_bootstrap stm_btree stm_btnode stm_btree_store stm_block)
