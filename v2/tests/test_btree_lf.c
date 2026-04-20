@@ -578,6 +578,111 @@ static void *stress_worker(void *arg_)
     return NULL;
 }
 
+/* Multi-leaf stress (#174 exit target): spreads N threads across a
+ * keyspace large enough to force many splits. Unlike the single-leaf
+ * concurrent_stress (32 keys → one leaf), this exercises the actual
+ * internal-routing + split-under-contention path.
+ *
+ * Op count calibrated so that any single leaf's accumulated chain
+ * stays under STM_BT_LF_MAX_CHAIN=4096 under pathological uneven
+ * random distribution across ~64 leaves, given the tree-global
+ * consolidator flag. Per-node consolidation is a follow-up that
+ * would let us push this much higher. */
+#define STM_BT_LF_MULTI_LEAF_KEYS   1024
+#define STM_BT_LF_MULTI_LEAF_TARGET 16
+#define STM_BT_LF_MULTI_LEAF_OPS    3000
+
+static void multi_leaf_run(stress_arg *arg, int ops)
+{
+    stm_ebr_thread *ebr = stm_ebr_register();
+    if (!ebr) return;
+
+    uint64_t s = (uint64_t)arg->seed * 0x9E3779B97F4A7C15ull + 1;
+    for (int i = 0; i < ops && !atomic_load(arg->stop); i++) {
+        s += 0x9E3779B97F4A7C15ull;
+        uint64_t z = (s ^ (s >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        uint64_t rnd = z ^ (z >> 31);
+
+        uint32_t op    = rnd & 3;
+        uint32_t key_i = (uint32_t)((rnd >> 3) % STM_BT_LF_MULTI_LEAF_KEYS);
+        char kbuf[16];
+        int kl = snprintf(kbuf, sizeof kbuf, "ml-%05u", key_i);
+        int val = (int)(rnd >> 32);
+
+        switch (op) {
+        case 0: case 1: {
+            stm_status st = stm_btree_lf_insert(arg->tree, ebr,
+                                                 kbuf, (size_t)kl,
+                                                 &val, sizeof val);
+            (void)st;
+            break;
+        }
+        case 2: {
+            stm_status st = stm_btree_lf_delete(arg->tree, ebr,
+                                                 kbuf, (size_t)kl);
+            (void)st;
+            break;
+        }
+        case 3: {
+            int out; size_t vl = 0;
+            stm_status st = stm_btree_lf_lookup(arg->tree, ebr,
+                                                 kbuf, (size_t)kl,
+                                                 &out, sizeof out, &vl);
+            (void)st;
+            break;
+        }
+        }
+        arg->ops_done++;
+    }
+
+    stm_ebr_thread_free(ebr);
+}
+
+static void *multi_leaf_worker(void *arg_)
+{
+    multi_leaf_run((stress_arg *)arg_, STM_BT_LF_MULTI_LEAF_OPS);
+    return NULL;
+}
+
+STM_TEST(btree_lf_multi_leaf_stress) {
+    stm_btree_lf *t = make_tree(STM_BT_LF_MULTI_LEAF_TARGET);
+    atomic_bool stop = false;
+
+    enum { NTHREADS = 8 };
+    pthread_t tids[NTHREADS];
+    stress_arg args[NTHREADS];
+    for (int i = 0; i < NTHREADS; i++) {
+        args[i] = (stress_arg){ .tree = t, .stop = &stop,
+                                .seed = i * 41 + 3, .ops_done = 0 };
+        pthread_create(&tids[i], NULL, multi_leaf_worker, &args[i]);
+    }
+    for (int i = 0; i < NTHREADS; i++) pthread_join(tids[i], NULL);
+
+    int total = 0;
+    for (int i = 0; i < NTHREADS; i++) total += args[i].ops_done;
+
+    for (int i = 0; i < 64; i++) (void)stm_ebr_try_advance();
+
+    /* Final sanity: tree still walkable and responsive. A
+     * force_consolidate would likely succeed at these op counts,
+     * but the assertion here is just "no crash, tree remains
+     * queryable." */
+    stm_ebr_thread *ebr = stm_ebr_register();
+    size_t vl = 0;
+    stm_status lookup_rc = stm_btree_lf_lookup(t, ebr, "ml-nope", 7,
+                                                 NULL, 0, &vl);
+    (void)lookup_rc;
+    stm_test_info("multi-leaf stress: %d ops across %d threads (target=%d, "
+                  "keys=%d); final max leaf chain depth %u",
+                  total, NTHREADS, STM_BT_LF_MULTI_LEAF_TARGET,
+                  STM_BT_LF_MULTI_LEAF_KEYS,
+                  stm_btree_lf_chain_depth(t, ebr));
+    stm_ebr_thread_free(ebr);
+
+    stm_btree_lf_free(t);
+}
+
 STM_TEST(btree_lf_concurrent_stress) {
     stm_btree_lf *t = make_tree(64);
     atomic_bool stop = false;
