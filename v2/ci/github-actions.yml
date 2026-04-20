@@ -127,7 +127,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        spec: [sync, concurrency, structural]
+        spec: [sync, concurrency, structural, balanced]
     steps:
       - uses: actions/checkout@v4
 
