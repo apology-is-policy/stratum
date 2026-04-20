@@ -12,10 +12,10 @@ The lock-free Bw-tree is a **balanced B+tree with SPLIT and MERGE**:
 root is a BASE_INTERNAL delta with a pivot array; leaves are atomic-
 published BASE_LEAF chains with SPLIT redirects; empty leaves without
 preserved SPLITs are reabsorbed into their left neighbor via the
-SEAL-with-forward MERGE protocol. Audit rounds R0-R4 are closed;
-R5 for MERGE is in progress at tip. 20/20 tests green on
-default/ASan/TSan. The remaining Phase 2 open item is the per-node
-consolidator flag (modest refactor; unblocks higher-throughput stress).
+SEAL-with-forward MERGE protocol. All five audit rounds R0-R5 are
+closed. 21/21 tests green on default/ASan/TSan. The remaining Phase 2
+open item is the per-node consolidator flag (modest refactor; unblocks
+higher-throughput stress).
 
 ## What's landed (commits, tests, audits)
 
@@ -41,12 +41,12 @@ consolidator flag (modest refactor; unblocks higher-throughput stress).
 Also: several CI-fix commits for Linux `-Werror` / liboqs issues.
 All CI matrix jobs (Linux gcc/clang × off/asan/tsan + macOS clang ×
 off/asan/tsan + TLC per spec, including `merge`) green on tip.
-20/20 tests pass on default/ASan/TSan.
+21/21 tests pass on default/ASan/TSan.
 
 Audit rounds closed: R0 (pre-#171 substrate), R1 (MVP), R2 (SPLIT
-protocol), R3 (chain inheritance), R4 (internal routing in #176).
-R5 (MERGE in `83f4710`) in progress. Cumulative do-not-report ledger
-is `memory/audit_v2_r0_closed_list.md`.
+protocol), R3 (chain inheritance), R4 (internal routing in #176),
+**R5 (MERGE)**. Cumulative do-not-report ledger is
+`memory/audit_v2_r0_closed_list.md`.
 
 ## What's left in Phase 2
 
@@ -139,10 +139,13 @@ target=4 → max leaf depth 9. See `btree_lf_balanced_growth` and
 
 ### Next steps
 
-1. **R5 audit** — in progress at tip `83f4710`. Scope: MERGE
-   implementation, SEAL delta, purge-split-on-L, try_merge
-   dispatch, lookup/write SEAL handling, merge.tla. Apply any
-   P0/P1/P2 findings before considering Phase 2 closed.
+1. **R5 audit** — CLOSED 2026-04-20. 0 P0 / 0 P1 / 2 P2 / 3 P3.
+   Both P2s fixed (R5-P2-1 dead fast-path in force_consolidate
+   removed; R5-P2-2 lookup + traverse hop budgets bumped to page-
+   table capacity). One P3 addressed (new concurrent merge TSan
+   test). Two P3s flagged: merge.tla doesn't model step 0 purge
+   (spec extension, not correctness), leftmost-merge unsupported
+   (MVP scope). Full list in `memory/audit_v2_r0_closed_list.md`.
 
 2. **Per-node consolidator flag** — the current `t->consolidating`
    is tree-global. Under the multi-leaf stress (`048520f`),
@@ -324,7 +327,7 @@ v2/
 │   ├── concurrency.tla  # MVCC + delta chain + EBR
 │   └── structural.tla   # SPLIT protocol + cascade (extended)
 ├── tests/
-│   └── test_btree_lf.c  # 20 tests (incl. multi_leaf_stress #174 + 3 merge)
+│   └── test_btree_lf.c  # 21 tests (incl. multi_leaf_stress #174 + 4 merge)
 └── docs/
     ├── phase2-bw-tree-design.md  # pre-implementation design note
     └── phase2-status.md           # THIS FILE
@@ -333,12 +336,9 @@ v2/
 ## Where to pick up
 
 1. Read this file top to bottom.
-2. Read `memory/audit_v2_r0_closed_list.md` for R0–R4 do-not-report
-   (R5 findings will be added once the audit closes).
-3. If R5 audit is still in progress or has open findings, start
-   there — fix P0/P1/P2s before moving on.
-4. Otherwise, the recommended next chunk is **per-node consolidator
-   flag** (modest refactor, no spec needed, unblocks higher-
-   throughput stress). Follow-up opportunities listed under the
-   "Next steps" section above.
-5. Run the verification commands to confirm tip is green.
+2. Read `memory/audit_v2_r0_closed_list.md` for R0–R5 do-not-report.
+3. The recommended next chunk is **per-node consolidator flag**
+   (modest refactor, no spec needed, unblocks higher-throughput
+   stress). Follow-up opportunities listed under the "Next steps"
+   section above.
+4. Run the verification commands to confirm tip is green.

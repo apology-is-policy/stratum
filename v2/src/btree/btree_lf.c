@@ -735,7 +735,12 @@ stm_status stm_btree_lf_lookup(const stm_btree_lf *t, stm_ebr_thread *ebr,
     uint64_t nid = atomic_load(&t->root_id);
     stm_status result = STM_ECORRUPT;
 
-    for (uint32_t hops = 0; hops < 64; hops++) {
+    /* Hop budget: capacity bounds the theoretical worst case (chained
+     * SEAL forwards from N sequential merges + SPLIT redirects). In
+     * practice each lookup does ~2 hops; this cap only triggers under
+     * adversarial chain lengths that imply either corruption or an
+     * extremely stale reader. R5-P2-2: was a fixed 64. */
+    for (uint32_t hops = 0; hops < t->pt->capacity; hops++) {
         if (nid >= t->pt->capacity) { result = STM_ECORRUPT; goto out; }
         stm_bt_lf_delta *head = atomic_load(&t->pt->slots[nid]);
         if (!head) { result = STM_ECORRUPT; goto out; }
@@ -1729,12 +1734,23 @@ stm_status stm_btree_lf_force_consolidate(stm_btree_lf *t, stm_ebr_thread *ebr)
             if (!head) continue;
             uint32_t d_before = atomic_load_explicit(&head->chain_depth,
                                                       memory_order_relaxed);
-            if (d_before == 0) continue;
+            /* R5-P2-1: don't skip depth-0 leaves. An already-consolidated
+             * empty BASE_LEAF might be merge-eligible (its consolidator
+             * deferred merge, or a prior attempt aborted). Call into
+             * consolidate_or_split regardless; its depth==0 fast-path
+             * triggers try_merge when the BASE is empty and returns
+             * quickly otherwise. */
             stm_status s = consolidate_or_split(t, leaves[i], true);
             if (s != STM_OK) { free(leaves); rc = s; goto out; }
-            /* P3-1: only mark any_work if we actually reduced depth.
+            /* R4-P3-1: only mark any_work if we actually reduced depth.
              * Otherwise the outer loop thrashes on leaves whose chain
-             * is all preserved SPLITs (no INSERTs/DELETEs to merge). */
+             * is all preserved SPLITs (no INSERTs/DELETEs to merge). A
+             * successful merge leaves d_after == d_before == 0, so it
+             * doesn't set any_work — the loop exits after this pass,
+             * and subsequent merges of now-unblocked leaves happen on
+             * the caller's next force_consolidate invocation (matches
+             * existing test behavior: callers iterate the call several
+             * times when large cascades are expected). */
             stm_bt_lf_delta *after = atomic_load(&t->pt->slots[leaves[i]]);
             uint32_t d_after = after
                 ? atomic_load_explicit(&after->chain_depth,
@@ -1770,10 +1786,12 @@ static stm_status traverse_and_prepend(stm_btree_lf *t,
 {
     for (uint32_t attempts = 0; attempts < 256; attempts++) {
         uint64_t nid = atomic_load(&t->root_id);
-        /* Traverse to the target leaf. */
+        /* Traverse to the target leaf. R5-P2-2: hop budget bounded by
+         * page-table capacity (worst-case chain of SEAL forwards under
+         * many sequential merges). Normal walks are ~2 hops. */
         uint32_t hops = 0;
         for (;;) {
-            if (hops++ > 128) return STM_ECORRUPT;
+            if (hops++ >= t->pt->capacity) return STM_ECORRUPT;
             if (nid >= t->pt->capacity) return STM_ECORRUPT;
 
             stm_bt_lf_delta *head = atomic_load(&t->pt->slots[nid]);

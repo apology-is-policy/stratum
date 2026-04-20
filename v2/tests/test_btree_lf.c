@@ -857,6 +857,107 @@ STM_TEST(btree_lf_multi_leaf_stress) {
     stm_btree_lf_free(t);
 }
 
+/* Concurrent MERGE stress (R5-P3-3 coverage). Each thread operates on
+ * a disjoint key prefix, alternating insert-all then delete-all across
+ * rounds so leaves empty and become merge-eligible. force_consolidate
+ * fires periodically from the main loop. Assertion: no crash; after
+ * final join + drain, all keys are absent. Complements
+ * btree_lf_multi_leaf_stress (which is insert-heavy and never exercises
+ * the empty-leaf path). */
+typedef struct {
+    stm_btree_lf *tree;
+    int           thread_id;
+    int           ops_done;
+} merge_stress_arg;
+
+enum {
+    STM_BT_LF_MERGE_THREADS = 4,
+    STM_BT_LF_MERGE_KEYS    = 24,
+    STM_BT_LF_MERGE_ROUNDS  = 6,
+};
+
+static void *merge_stress_worker(void *arg_)
+{
+    merge_stress_arg *arg = arg_;
+    stm_ebr_thread *ebr = stm_ebr_register();
+    if (!ebr) return NULL;
+
+    for (int round = 0; round < STM_BT_LF_MERGE_ROUNDS; round++) {
+        for (int k = 0; k < STM_BT_LF_MERGE_KEYS; k++) {
+            char kbuf[24];
+            int kl = snprintf(kbuf, sizeof kbuf, "ms-t%d-k%04d",
+                              arg->thread_id, k);
+            int v = arg->thread_id * 10000 + round * 100 + k;
+            stm_status s = stm_btree_lf_insert(arg->tree, ebr,
+                                                kbuf, (size_t)kl,
+                                                &v, sizeof v);
+            (void)s;
+            arg->ops_done++;
+        }
+        for (int k = 0; k < STM_BT_LF_MERGE_KEYS; k++) {
+            char kbuf[24];
+            int kl = snprintf(kbuf, sizeof kbuf, "ms-t%d-k%04d",
+                              arg->thread_id, k);
+            stm_status s = stm_btree_lf_delete(arg->tree, ebr,
+                                                kbuf, (size_t)kl);
+            (void)s;
+            arg->ops_done++;
+        }
+        if ((round & 1) == 1) {
+            stm_status s = stm_btree_lf_force_consolidate(arg->tree, ebr);
+            (void)s;
+        }
+    }
+
+    stm_ebr_thread_free(ebr);
+    return NULL;
+}
+
+STM_TEST(btree_lf_merge_concurrent_stress) {
+    stm_btree_lf *t = make_tree(4);
+
+    pthread_t         tids[STM_BT_LF_MERGE_THREADS];
+    merge_stress_arg  args[STM_BT_LF_MERGE_THREADS];
+    memset(args, 0, sizeof args);
+    for (int i = 0; i < STM_BT_LF_MERGE_THREADS; i++) {
+        args[i].tree      = t;
+        args[i].thread_id = i;
+        pthread_create(&tids[i], NULL, merge_stress_worker, &args[i]);
+    }
+    for (int i = 0; i < STM_BT_LF_MERGE_THREADS; i++) {
+        pthread_join(tids[i], NULL);
+    }
+
+    for (int i = 0; i < 128; i++) (void)stm_ebr_try_advance();
+
+    stm_ebr_thread *ebr = stm_ebr_register();
+    /* Run force_consolidate a few times to drain pending merges. */
+    for (int i = 0; i < 8; i++) {
+        STM_ASSERT_OK(stm_btree_lf_force_consolidate(t, ebr));
+    }
+
+    int total = 0;
+    for (int i = 0; i < STM_BT_LF_MERGE_THREADS; i++) total += args[i].ops_done;
+    stm_test_info("merge concurrent stress: %d ops across %d threads; "
+                  "final leaf_count=%u", total, STM_BT_LF_MERGE_THREADS,
+                  stm_btree_lf_leaf_count(t, ebr));
+
+    /* Every inserted key was followed by a delete in the same round, so
+     * all keys must be absent at the end. */
+    for (int tid = 0; tid < STM_BT_LF_MERGE_THREADS; tid++) {
+        for (int k = 0; k < STM_BT_LF_MERGE_KEYS; k++) {
+            char kbuf[24];
+            int kl = snprintf(kbuf, sizeof kbuf, "ms-t%d-k%04d", tid, k);
+            size_t vl = 0;
+            STM_ASSERT_ERR(stm_btree_lf_lookup(t, ebr, kbuf, (size_t)kl,
+                                                NULL, 0, &vl), STM_ENOENT);
+        }
+    }
+
+    stm_ebr_thread_free(ebr);
+    stm_btree_lf_free(t);
+}
+
 STM_TEST(btree_lf_concurrent_stress) {
     stm_btree_lf *t = make_tree(64);
     atomic_bool stop = false;
