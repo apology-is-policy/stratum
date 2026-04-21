@@ -15,7 +15,8 @@ integrity), then encryption (AEAD data extents + AEAD metadata nodes
 
 | Commit | What | Tests |
 |---|---|---|
-| `54b3c8b` | **P4-1: Merkle integrity scaffold**. Wires existing per-node BLAKE3 self-csums into a chain: internal-node bp_csum fields carry child csums; allocator-tree root csum propagates into `ub_alloc_root.bp_csum`; `ub_merkle_root = BLAKE3(main_csum(0) ‖ alloc_csum ‖ snap_csum(0) ‖ cas_csum(0) ‖ salt)` per ARCH §7.11.3. Per-pool salt generated at format time from `/dev/urandom`, stored in new `ub_merkle_root_salt[32]` field (STM_UB_VERSION bumped 1→2). Mount verifies recomputed Merkle root against stored value AND verifies tree-root node self-csum against `bp_csum`. Tamper detection confirmed by `sync_tamper_tree_node_surfaces_on_mount`. | 3 new sync tests; 20 suites green |
+| `54b3c8b` → `ee3600c` | **P4-1 + R8: Merkle integrity scaffold**. Wires existing per-node BLAKE3 self-csums into a chain: internal-node bp_csum fields carry child csums; allocator-tree root csum propagates into `ub_alloc_root.bp_csum`; `ub_merkle_root = BLAKE3(main_csum(0) ‖ alloc_csum ‖ snap_csum(0) ‖ cas_csum(0) ‖ salt)` per ARCH §7.11.3. Per-pool salt from libsodium CSPRNG at format, stored in new `ub_merkle_root_salt[32]` (STM_UB_VERSION 1→2). Mount verifies recomputed Merkle root against stored value AND tree-root node self-csum against `bp_csum`. R8 audit closed: 1 P0 (free_tree segfault on multi-leaf) + 2 P1 (BLAKE3 OOM bypass; NULL-csum trap) + 3 P2 (substitution test, libsodium switch, rename). | 4 new sync tests; 20 suites green |
+| `<next>` | **P4-6: `merkle.tla` formal spec**. Models the Merkle chain under COW: honest WriteLeaf / WriteInternal / Commit actions plus adversarial Tamper. Proves `CommittedTreeWellFormed` (stored csums = recomputed at commit time) and `TamperDetectableAtCommittedRoot` (any byte edit reachable from root makes recompute ≠ stored merkle_root). TLC clean: 83169 distinct states, depth 10. | Spec-only |
 
 ## Remaining Phase 4 work
 
@@ -64,10 +65,19 @@ a later phase if extent layer depends on Phase 6 dataset model.
 
 ### P4-6: merkle.tla
 
-Formal spec of hash propagation under COW. Proves that
-`ub_merkle_root` in any committed UB transitively covers every
-reachable metadata block. Sequenced with the actual Merkle work
-landing in P4-1..P4-3.
+LANDED. Formal spec of hash propagation under COW. Models honest
+protocol (WriteLeaf / WriteInternal / Commit) plus adversarial
+Tamper. Proves:
+
+- `CommittedTreeWellFormed` — after any Commit, stored root_csum
+  = recomputed, stored merkle_root = PoolMerkleRoot(root_csum).
+- `TamperDetectableAtCommittedRoot` — byte edits to any paddr
+  reachable from the committed root make recompute ≠ stored.
+
+TLC clean: 83169 distinct states, depth 10. Multi-level recursion
+beyond depth 2 (chunk 5c cap, R8-P3-4) is deliberately not
+modeled; when multi-level support lands the spec extends
+mechanically.
 
 ### P4-7: R8 full-stack audit
 
