@@ -1,13 +1,14 @@
 # Phase 3 — status and next-session guide
 
 Authoritative pickup guide for Phase 3 (persistence + allocator). Last
-update 2026-04-20 (after chunk 5 / node serialization + allocator
-persistence landed). Companion to `phase2-status.md`, which remains
-the reference for the Bw-tree layer Phase 3 builds on.
+update 2026-04-21 (after chunk 6 / four-phase commit protocol
+landed). Companion to `phase2-status.md`, which remains the reference
+for the Bw-tree layer Phase 3 builds on.
 
 ## TL;DR
 
-Phase 3 is in progress. Ten chunks landed:
+Phase 3 is in progress. Eleven chunks landed (R7d audit in-flight on
+chunk 6):
 
 | Commit | What | Tests |
 |---|---|---|
@@ -20,31 +21,30 @@ Phase 3 is in progress. Ten chunks landed:
 | `bd52837` | **Chunk 5a**: `stm_btnode` leaf node codec. Fixed 128 KiB layout: header (128 B) + packed entries + BLAKE3-256 csum. | 13 btnode-leaf tests |
 | `1aae3f2` | **Chunk 5b**: `stm_btnode` internal node codec. Pivots + N+1 child bptrs (64 B each). Message buffer deferred. | +7 btnode-internal tests |
 | `0d99eb5` | **Chunk 5c**: `stm_btree_store` serialize/deserialize + free_tree via an I/O vtable. Two-level depth cap; snapshot-style rewrite-on-commit. | 5 btree_store tests |
-| `033bb3f` | **Chunk 5d**: `stm_alloc` integration — tree now persists across mount. Bootstrap header gains 256-byte `h_user_data` slot holding the tree root paddr. | +3 alloc persistence tests |
+| `033bb3f` → `17e08be` | **Chunk 5d + R7c**: `stm_alloc` integration — tree now persists across mount. R7c closed (0 P0 / 2 P1 / 6 P2; btnode common-helper consolidation). | +3 alloc persistence tests |
+| `00d796e` | **Chunk 6**: `stm_sync` — four-phase commit protocol (sync.tla-aligned). Ring rotation `(gen % 4, gen % 63)`, MountGenBump on open, ub_alloc_root now authoritative. | 8 sync tests |
 
 Phase 2 is complete (SPLIT + MERGE + per-node consolidator + SCAN + R0-R6
 audits). Phase 3 chunks remaining:
 
-1. **Allocator implementation** — 4a (bootstrap pool) + 4b (data-area
-   tree) + 5 (node serialization + persistence) all landed. Remaining
-   sub-chunks:
+1. **Allocator acceleration** — 4a (bootstrap) + 4b (tree) +
+   5 (serialization) + 6 (commit protocol) all landed.
+   Remaining allocator sub-chunks:
    - **Chunk 4c**: SDArray in-RAM bitmap for O(1) allocation queries.
    - **Chunk 4d**: xor filter for negative lookups.
    - **Chunk 4e**: R7 full-stack audit (after 4c+4d).
-2. **Four-phase commit implementation** — wire the protocol sync.tla
-   abstracts. Uberblock ring rotation + fsync discipline. Moves the
-   allocator-tree root from the bootstrap user_data slot into the
-   uberblock's `ub_alloc_root` bptr.
-3. **Mount / unmount integration** — put labels + commit + allocator
-   together; single-device round-trip. Data-area tree already
-   persists (chunk 5); what's missing is uberblock-rooted access.
-4. **Crash-injection fuzzer** — Phase 3 exit criterion. Inject partial
-   writes at every commit phase; verify mount recovers to a
-   consistent state.
-5. **R7 audit** — adversarial soundness pass per CLAUDE.md before
-   Phase 3 exit. R7a (bootstrap) + R7b (alloc 4b) + R7c (chunk 5
-   serialization) all closed as they landed; full R7 at end of 4c/4d
-   for the in-RAM acceleration structures.
+2. **Mount / unmount integration (chunk 7)** — the end-to-end
+   user-facing lifecycle: `stm_fs_open` / `stm_fs_mount` /
+   `stm_fs_unmount` wiring labels + sync + allocator. Single-device
+   round-trip. Main tree (ub_main_root) is still zero until a
+   higher-level FS ABI lands post-Phase-3.
+3. **Crash-injection fuzzer (chunk 8)** — Phase 3 exit criterion.
+   Inject partial writes at every commit phase; verify mount
+   recovers to a consistent state.
+4. **R7 audit series** — R7a (bootstrap), R7b (alloc 4b), R7c
+   (chunk 5 serialization), R7d (chunk 6 sync) all closed or
+   in-flight as they land; full R7 at end of 4c/4d for in-RAM
+   acceleration.
 
 ## You have autonomy
 
@@ -124,41 +124,31 @@ Expected TLC results:
 - `merge.tla` — empty-leaf reabsorb. 65536 states, depth 18.
 - `allocator.tla` — refcount + deferred-free. 3729 states, depth 16.
 
-## Next chunk — four-phase commit protocol (chunk 6)
+## Next chunk — mount/unmount integration (chunk 7)
 
-All allocator chunks (4a + 4b + 5) have landed. The data-area tree
-now persists across mount. What's still required before Phase 3 can
-exit:
+Chunk 6 landed: stm_sync implements the four-phase commit protocol
+per sync.tla; ub_alloc_root now authoritative; MountGenBump wired.
 
-### Chunk 6 (next): four-phase commit implementation.
+### Chunk 7 (next): mount / unmount integration.
 
-Wire the `sync.tla` protocol: uberblock ring rotation, fsync
-discipline, and (critically) moving the allocator-tree root from the
-bootstrap header's user_data slot into the uberblock's
-`ub_alloc_root` bptr (ARCH §5.4). Scope sketch:
+Chunk 6 delivered the low-level machinery (create/open/commit/close)
+but doesn't yet wire a user-facing FS lifecycle. Chunk 7 scope:
 
-- **Implement the four phases** from `sync.tla`:
-  1. Quiesce in-flight writers (commit-window close).
-  2. Drain + flush modified tree nodes (already handled by chunk 5's
-     serialize).
-  3. Write new uberblock (containing `ub_alloc_root` = new allocator
-     tree root) to the next ring slot + fsync.
-  4. Advance the pool's durable-gen + publish (the mount-time
-     authoritative pick).
-- **`MountGenBump`**: mount reads the highest-gen uberblock and
-  bumps `fs->gen` past it (§7.4 nonce uniqueness). Today
-  `stm_sb_mount_scan` selects the authoritative uberblock but
-  doesn't implement the bump — chunk 6 wires it.
-- **Interim → durable**: `h_user_data` in the bootstrap header
-  continues to exist but `ub_alloc_root` becomes authoritative once
-  chunk 6 lands. A one-commit migration writes ub_alloc_root
-  matching user_data during the first post-chunk-6 commit.
+- **`stm_fs`** top-level handle aggregating stm_alloc + stm_sync +
+  (future) main-tree + (future) crypto state.
+- **`stm_fs_mount(path, opts, out_fs)`** — opens bdev, creates or
+  opens the allocator, opens the sync layer, returns a ready
+  handle.
+- **`stm_fs_unmount(fs)`** — final commit, close sync, close
+  allocator, close bdev.
+- **Wedged / read-only runtime guards** (from v1 heritage per
+  CLAUDE.md's invariants list) — `STM_FS_GUARD_READ` /
+  `STM_FS_GUARD_WRITE` macros at every public entry.
+- **Single-device round-trip** is the first acceptance test:
+  mount → reserve → commit → unmount → mount → observe state.
 
-### Chunk 7 (after 6): mount / unmount integration.
-- `stm_fs_open` / `stm_fs_mount` / `stm_fs_unmount` end-to-end: read
-  labels → pick uberblock → load allocator from ub_alloc_root →
-  serve user ops → on close, a final commit.
-- Single-device round-trip as the first milestone.
+Post-chunk-7, the stm_alloc user_data slot becomes dead weight and
+can be removed in a cleanup pass.
 
 ### Chunk 4c: In-RAM succinct bitmap (SDArray).
 - Performance structure. `src/alloc/sdarray.c`. Approximate
