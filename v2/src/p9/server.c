@@ -431,6 +431,13 @@ static stm_status h_read(struct stm_p9_server *s,
     if (!f) return reply_error(resp, resp_cap, resp_len, tag, "unknown fid");
     if (!f->is_open) return reply_error(resp, resp_cap, resp_len, tag,
                                           "read on unopened fid");
+    /* R11 P3-3: gate read against open mode at the server level so
+     * backends that forget the check don't silently pass reads on
+     * write-only fids. STM_P9_OWRITE (1) explicitly excludes read;
+     * OREAD and ORDWR allow it. */
+    if (f->open_mode == STM_P9_OWRITE)
+        return reply_error(resp, resp_cap, resp_len, tag,
+                           "read on write-only fid");
 
     uint32_t max_payload = s->msize - STM_P9_HDR_SIZE - 4u;
     if (count > max_payload) count = max_payload;
@@ -496,6 +503,11 @@ static stm_status h_write(struct stm_p9_server *s,
     if (f->qid_type & STM_P9_QTDIR)
         return reply_error(resp, resp_cap, resp_len, tag,
                            "write on directory");
+    /* R11 P3-3: gate write against open mode. OREAD (0) excludes
+     * write; OWRITE (1) and ORDWR (2) allow it. */
+    if (f->open_mode == STM_P9_OREAD)
+        return reply_error(resp, resp_cap, resp_len, tag,
+                           "write on read-only fid");
 
     uint32_t written = 0;
     stm_status rc = s->vops.write(s->ctx, f->fid, f->qid_path, offset,

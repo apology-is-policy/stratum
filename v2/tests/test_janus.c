@@ -37,8 +37,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -461,6 +463,54 @@ STM_TEST(janus_audit_log_records_unwrap)
     stop_daemon(&d, sock);
     tmp_rm(dir);
     free(dir);
+}
+
+/* ── R11 regression tests ───────────────────────────────────────────── */
+
+/* R11 P1-1: verify the socket file ends up at mode 0600 after
+ * janus_listen_unix. Previously the chmod was best-effort (silent
+ * failure); now it's fatal, so either the socket exists at the
+ * requested mode or listen_unix returned an error. */
+STM_TEST(janus_listen_unix_enforces_0600)
+{
+    char *dir = tmp_dir();
+    STM_ASSERT(dir);
+    char sock[1024];
+    snprintf(sock, sizeof sock, "%s/sock", dir);
+
+    int lfd = janus_listen_unix(sock, 0600);
+    STM_ASSERT(lfd >= 0);
+
+    struct stat st;
+    STM_ASSERT_EQ(stat(sock, &st), 0);
+    /* S_IRUSR | S_IWUSR only — exclude S_IFMT bits from the compare. */
+    mode_t mode = st.st_mode & 07777;
+    STM_ASSERT_EQ((long long)mode, 0600);
+
+    close(lfd);
+    unlink(sock);
+    tmp_rm(dir);
+    free(dir);
+}
+
+/* R11 P1-2 smoke: peer-cred check accepts same-UID peer. A rejection
+ * test would require cross-UID privileges that unit tests can't
+ * assume; the happy path is exercised here transitively by every
+ * other janus_* test that connects from the test process. This
+ * assertion just makes the contract explicit. */
+STM_TEST(janus_peer_uid_reports_self_on_socketpair)
+{
+    int sv[2];
+    STM_ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    uid_t got = (uid_t)-1;
+    stm_status rc = janus_peer_uid(sv[0], &got);
+    if (rc == STM_OK) {
+        STM_ASSERT_EQ((long long)got, (long long)geteuid());
+    } else {
+        /* STM_ENOTSUPPORTED is acceptable on exotic platforms. */
+        STM_ASSERT_EQ((long long)rc, (long long)STM_ENOTSUPPORTED);
+    }
+    close(sv[0]); close(sv[1]);
 }
 
 STM_TEST_MAIN("janus")

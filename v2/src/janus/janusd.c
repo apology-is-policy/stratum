@@ -287,7 +287,15 @@ static int cmd_serve(int argc, char **argv)
     sigaction(SIGTERM, &sa, NULL);
 
     stm_status rc = janus_serve_loop(lfd, synfs, &g_shutdown);
-    if (g_listen_fd >= 0) { close(g_listen_fd); g_listen_fd = -1; }
+    /* R11 P2-2: close/null in the same order the signal handler uses
+     * (read → null → close) so a SIGTERM interleaved with the main
+     * thread's cleanup can't race us into a double-close that steals
+     * whichever fd the OS hands out next. */
+    {
+        int fd_to_close = g_listen_fd;
+        g_listen_fd = -1;
+        if (fd_to_close >= 0) close(fd_to_close);
+    }
     unlink(socket_path);
     janus_synfs_destroy(synfs);
     for (size_t i = 0; i < n_pools; i++) free(pools_storage[i]);

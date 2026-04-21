@@ -254,10 +254,21 @@ static stm_status do_read(stm_janus_client *c, uint32_t fid, uint64_t offset,
     if (rc != STM_OK) return rc;
     rc = read_one(c, STM_P9_RREAD, tag, &msg_len);
     if (rc != STM_OK) return rc;
+    /* R11 P2-1: underflow-safe bounds check. Rread's body is
+     * count(4) + data[count]; the full message is thus at least
+     * STM_P9_HDR_SIZE(7) + 4 = 11 bytes. A malicious daemon returning
+     * msg_len in [7,10] would otherwise make `msg_len - 11` wrap to a
+     * huge u32 and the subsequent `count > that` check pass for any
+     * count. */
+    if (msg_len < 11u) return STM_EPROTOCOL;
     uint32_t count = load_u32(c->iobuf + 7);
-    if ((size_t)count > (size_t)(msg_len - 11)) return STM_EPROTOCOL;
+    if (count > msg_len - 11u) return STM_EPROTOCOL;
     if (count > want) return STM_EPROTOCOL;
     memcpy(out, c->iobuf + 11, count);
+    /* R11 P3-5: wipe the copy left in iobuf. DEK bytes in the
+     * client's scratch buffer otherwise live until disconnect; a
+     * long-lived connection (P4-4c) would widen that exposure. */
+    stm_ct_memzero(c->iobuf + 11, count);
     *got = count;
     return STM_OK;
 }

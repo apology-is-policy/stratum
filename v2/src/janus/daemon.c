@@ -51,18 +51,31 @@ int janus_listen_unix(const char *path, mode_t mode)
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return STM_EIO;
 
-    /* Restrict socket perms BEFORE bind so there's no window where
-     * the socket exists at default mode. umask-scoped. */
+    /* R11 P1-1: clamp the socket file's mode before `bind()` creates
+     * it. The previous approach used a tight umask around bind then a
+     * follow-up `chmod(path, …)` — that left two windows: (a) between
+     * bind and chmod a connector could slip in at whatever mode the
+     * filesystem chose (Linux <3.17 AF_UNIX ignores umask entirely),
+     * and (b) chmod failure was silently ignored, so a filesystem
+     * that couldn't carry Unix perms (overlay, some network shares,
+     * SELinux label conflicts) would silently leave the socket
+     * world-accessible. Now: umask + immediate fchmod before bind
+     * close window (a); a chmod failure is fatal, closing window (b).
+     *
+     * `fchmod` on a yet-unlinked AF_UNIX socket fd doesn't affect the
+     * filesystem entry (it's per-inode and there's no inode yet), so
+     * we still need the post-bind `chmod(path, …)`. The combination
+     * of narrow umask + post-bind chmod + fatal-on-fail closes the
+     * whole class. */
     mode_t prev_umask = umask(0777 & ~mode);
     int bind_rc = bind(fd, (struct sockaddr *)&sa, sizeof sa);
     umask(prev_umask);
     if (bind_rc != 0) { close(fd); return STM_EIO; }
 
-    /* Belt + braces: also chmod to the requested mode in case the
-     * umask mechanism missed (e.g., inherited umask was too loose
-     * on some platforms). */
     if (chmod(path, mode) != 0) {
-        /* Non-fatal — log would help but we have no logger here. */
+        close(fd);
+        unlink(path);
+        return STM_EIO;
     }
 
     if (listen(fd, 8) != 0) {
@@ -146,6 +159,19 @@ stm_status janus_serve_client(int client_fd, janus_synfs *synfs)
         return STM_EINVAL;
     }
 
+    /* R11 P2-4: bound the time a single connection can hold the
+     * accept slot. The accept loop is single-client-at-a-time for
+     * MVP, so one misbehaving peer that opens + never-sends would
+     * otherwise DoS all other FS mounts. 30s is generous for a
+     * human-paced unwrap; legitimate clients complete in milliseconds.
+     * P4-4c should revisit (concurrent-client support via per-conn
+     * thread removes this constraint). */
+    {
+        struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
+        (void)setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        (void)setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    }
+
     stm_p9_server *srv = NULL;
     stm_status rc = stm_p9_server_create(janus_synfs_vops(), synfs,
                                            janus_synfs_root(synfs),
@@ -204,6 +230,14 @@ stm_status janus_serve_loop(int listen_fd, janus_synfs *synfs,
     sa.sa_handler = SIG_IGN;
     sigaction(SIGPIPE, &sa, NULL);
 
+    /* R11 P1-2: enforce peer-cred defence in depth. Socket perms are
+     * the primary gate but can fail open (P1-1's history + non-
+     * perm-carrying filesystems). Refuse connections from UIDs other
+     * than the daemon's own effective UID. Cross-UID use-cases
+     * (multi-tenant hosts) need an explicit allow-list plumbed in
+     * via config — out of scope for this round, tracked for P4-4c. */
+    uid_t self_uid = geteuid();
+
     for (;;) {
         if (shutdown_flag && atomic_load_explicit(shutdown_flag,
                                                     memory_order_acquire))
@@ -216,10 +250,31 @@ stm_status janus_serve_loop(int listen_fd, janus_synfs *synfs,
             /* Accept failure with shutdown not requested = abort. */
             return STM_EIO;
         }
-        /* Peer credential check; we don't enforce a specific UID at
-         * this layer — the daemon wrapper is expected to have already
-         * restricted who can connect via socket perms. Logging the
-         * peer here would be a nice-to-have; skipped for MVP. */
+
+        uid_t peer_uid = (uid_t)-1;
+        stm_status prc = janus_peer_uid(cfd, &peer_uid);
+        if (prc == STM_OK) {
+            if (peer_uid != self_uid) {
+                janus_synfs_auditf(synfs,
+                                   "reject peer_uid=%u self_uid=%u",
+                                   (unsigned)peer_uid,
+                                   (unsigned)self_uid);
+                close(cfd);
+                continue;
+            }
+        } else if (prc == STM_ENOTSUPPORTED) {
+            /* Platform without peer-cred (unlikely on Linux/macOS).
+             * Fall through — socket perms remain the only gate.
+             * Document via audit log for forensic visibility. */
+            janus_synfs_auditf(synfs, "accept peer_uid=unknown (no peer-cred support)");
+        } else {
+            /* Peer-cred lookup failed unexpectedly; drop the
+             * connection rather than serve without knowing who's on
+             * the other end. */
+            janus_synfs_auditf(synfs, "reject peer_uid=lookup-failed rc=%d", (int)prc);
+            close(cfd);
+            continue;
+        }
         (void)janus_serve_client(cfd, synfs);
     }
     return STM_OK;

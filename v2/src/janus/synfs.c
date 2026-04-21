@@ -77,6 +77,19 @@ typedef struct pool_rec {
 #define JANUS_SESSION_MAX_REQ  (STM_HYBRID_WRAP_OVERHEAD + 4096u + STM_JANUS_UNWRAP_REQ_HDR)
 #define JANUS_SESSION_MAX_RESP 4096u
 
+/* R11 P2-3: pin the size invariant statically. `stm_hybrid_unwrap`
+ * writes `wrapped_len - STM_HYBRID_WRAP_OVERHEAD` bytes into the DEK
+ * buffer; that MUST fit in resp_buf for every wrapped blob the
+ * session accepts via Twrite. `JANUS_SESSION_MAX_REQ = OVERHEAD +
+ * 4096 + HDR` sets the upper bound on wrapped_len as 4096 + OVERHEAD,
+ * so the DEK output is at most 4096. If any of these three constants
+ * ever drifts, builds break here rather than at a runtime OOB write. */
+_Static_assert(JANUS_SESSION_MAX_REQ
+                  >= STM_HYBRID_WRAP_OVERHEAD
+                   + JANUS_SESSION_MAX_RESP
+                   + STM_JANUS_UNWRAP_REQ_HDR,
+               "unwrap DEK output can exceed resp_buf");
+
 typedef struct unwrap_session {
     int       active;
     uint32_t  fid;
@@ -257,8 +270,18 @@ void janus_synfs_auditf(janus_synfs *s, const char *fmt, ...)
     if (n < 0) return;
     size_t total = (size_t)pfx + (size_t)n;
     if (total >= sizeof line) total = sizeof line - 1;
-    if (total == 0 || line[total - 1] != '\n') {
-        if (total < sizeof line - 1) line[total++] = '\n';
+    /* R11 P3-4: ensure every log entry ends in a newline, even on the
+     * truncation path. Previously, a truncated line (total ==
+     * sizeof-1) skipped the append because `total < sizeof line - 1`
+     * was false, so the audit log silently merged the truncated line
+     * with the next entry on readout. Overwrite the last byte with
+     * '\n' on the truncation path — we lose one byte of content, but
+     * log structure stays intact. */
+    if (total == sizeof line - 1) {
+        line[sizeof line - 2] = '\n';
+        total = sizeof line - 1;
+    } else if (total == 0 || line[total - 1] != '\n') {
+        line[total++] = '\n';
     }
     pthread_mutex_lock(&s->audit_mu);
     audit_append_locked(s, line, total);

@@ -52,7 +52,11 @@
 #include <unistd.h>
 
 #define PASS_STATE_FILE        "hybrid.janus"
-#define PASS_MAGIC             UINT32_C(0x53415046) /* 'FPAS' — on-disk LE */
+/* R11 P3-1: the on-disk bytes now read "JPAS" matching the doc-
+ * comment at the top. The previous encoding 0x53415046 packed as
+ * "FPAS" in LE order, disagreeing with the header. J=0x4A, P=0x50,
+ * A=0x41, S=0x53 → LE u32 = 0x5341504A. */
+#define PASS_MAGIC             UINT32_C(0x5341504A) /* 'JPAS' on-disk LE */
 #define PASS_VERSION           1u
 #define PASS_AD_STR            "stratum-janus-pass-v1"
 #define PASS_KEK_LEN           32u
