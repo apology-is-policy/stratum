@@ -143,7 +143,11 @@ STM_TEST(sync_mount_gen_bump) {
     stm_sync_info info;
     STM_ASSERT_OK(stm_sync_info_get(s2, &info));
     STM_ASSERT_EQ(info.mount_max_durable_gen, 5u);
-    STM_ASSERT_EQ(info.current_gen,           6u); /* max + 1 */
+    /* R9 P0-1: mount writes a claim UB at max+1, then advances
+     * current_gen to max+2 so no commit ever reuses a gen that may
+     * correspond to orphan metadata writes from a crashed prior
+     * mount. First commit on this remount lands at gen 7. */
+    STM_ASSERT_EQ(info.current_gen,           7u);
 
     teardown(a2, s2);
     stm_bdev_close(d);
@@ -609,6 +613,86 @@ STM_TEST(sync_metadata_key_round_trips) {
      * every prior metadata block's encryption. */
     STM_ASSERT_EQ(memcmp(ub2.ub_key_schema, ub1.ub_key_schema, 32), 0);
 
+    unlink(g_tmp_path);
+}
+
+/* R9 P0-1 regression: consecutive mount-unmount cycles advance
+ * durable_gen even without intervening commits, via the mount-claim
+ * UB. Without this property, a crashed prior mount could leave
+ * orphan encrypted metadata writes at gen=durable_gen+1 that the
+ * next mount reuses for different plaintext — AEGIS-256 nonce
+ * reuse → plaintext recovery. */
+STM_TEST(sync_mount_claim_advances_durable_gen) {
+    make_tmp("mclaim");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL;
+    make_fresh_pool(d, &a, &s);
+
+    /* One commit at gen=1. */
+    STM_ASSERT_OK(stm_sync_commit(s));
+    teardown(a, s);
+    stm_bdev_close(d);
+
+    /* Mount #1: expect claim UB at gen=2; current_gen=3. */
+    d = open_fresh_device();
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
+    stm_sync *s2 = NULL;
+    STM_ASSERT_OK(stm_sync_open(d, a2, &s2));
+    stm_sync_info info;
+    STM_ASSERT_OK(stm_sync_info_get(s2, &info));
+    STM_ASSERT_EQ(info.mount_max_durable_gen, 1u);
+    STM_ASSERT_EQ(info.current_gen,           3u);
+    teardown(a2, s2);
+    stm_bdev_close(d);
+
+    /* Mount #2 (no intervening commit): mount-claim observed gen=2
+     * durable, writes claim UB at gen=3, current_gen=4. */
+    d = open_fresh_device();
+    stm_alloc *a3 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d, &a3));
+    stm_sync *s3 = NULL;
+    STM_ASSERT_OK(stm_sync_open(d, a3, &s3));
+    STM_ASSERT_OK(stm_sync_info_get(s3, &info));
+    STM_ASSERT_EQ(info.mount_max_durable_gen, 2u);
+    STM_ASSERT_EQ(info.current_gen,           4u);
+    teardown(a3, s3);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* R9 P3-5 regression: stm_alloc_load_tree_at refuses without a
+ * crypt ctx installed. Prior to P4-3b the function accepted any
+ * caller; post-P4-3b it would decrypt metadata, which needs the
+ * key. */
+STM_TEST(sync_load_tree_at_without_crypt_ctx_rejected) {
+    make_tmp("nocx");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL;
+    make_fresh_pool(d, &a, &s);
+
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p));
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    uint64_t root = 0;
+    uint8_t root_csum[32] = { 0 };
+    STM_ASSERT_OK(stm_alloc_get_tree_root(a, &root, root_csum));
+    STM_ASSERT(root != 0);
+
+    teardown(a, s);
+    stm_bdev_close(d);
+
+    /* Re-open device + alloc without set_crypt_ctx; load must fail. */
+    d = open_fresh_device();
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
+    /* Deliberately skip stm_alloc_set_crypt_ctx. */
+    STM_ASSERT_ERR(stm_alloc_load_tree_at(a2, root, /*gen=*/ 1, root_csum),
+                   STM_EINVAL);
+
+    stm_alloc_close(a2);
+    stm_bdev_close(d);
     unlink(g_tmp_path);
 }
 

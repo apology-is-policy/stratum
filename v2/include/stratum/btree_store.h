@@ -224,12 +224,22 @@ stm_status stm_btree_store_deserialize(
  * reconstruct the AEAD nonce for each node we must decrypt to
  * enumerate child paddrs. `cx` is the matching crypt ctx (REQUIRED).
  *
+ * R9 P1-2: `expected_root_csum` is REQUIRED (non-NULL, 32 bytes).
+ * The root node's ciphertext BLAKE3 is verified against it BEFORE
+ * AEAD decrypt — symmetric to `stm_btree_store_deserialize`. Closes
+ * the hazard where an in-process corruption of
+ * `stm_alloc.current_tree_root` pointing at a different valid
+ * encrypted node would cause free_tree to free THAT node's
+ * children.
+ *
  * Returns STM_ECORRUPT if the tree nodes fail csum or violate the
- * two-level invariant, STM_EBADTAG if AEAD decryption fails.
+ * two-level invariant, STM_EBADTAG if AEAD decryption fails,
+ * STM_EINVAL if `cx` or `expected_root_csum` is NULL.
  */
 STM_MUST_USE
 stm_status stm_btree_store_free_tree(uint64_t root_paddr, uint64_t root_gen,
                                       uint64_t free_gen,
+                                      const uint8_t expected_root_csum[32],
                                       const stm_btree_store_vtable *vt,
                                       void *vt_ctx,
                                       const stm_btree_crypt_ctx *cx);

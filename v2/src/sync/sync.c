@@ -63,6 +63,12 @@ struct stm_sync {
      * uberblock. 0 if no commits yet. */
     uint64_t   alloc_root_paddr;
 
+    /* Gen at which the referenced alloc tree was AEAD-encrypted
+     * (P4-3b R9 P0-1). May be less than current_gen when a
+     * mount-claim UB advanced the durable gen past orphan data
+     * without rewriting the tree. */
+    uint64_t   alloc_root_gen;
+
     /* P4-1: Merkle state.
      *
      *   merkle_salt      — 32-byte per-pool random value set at
@@ -156,13 +162,21 @@ static inline uint32_t ring_slot_for_gen(uint64_t gen)
 /* Build an uberblock in `out` from sync state + caller's inputs.
  * Fills pool_uuid / device_uuid / gen / txg / ub_alloc_root
  * (paddr + kind + bp_csum) + ub_merkle_root + ub_merkle_root_salt
- * for P4-1, and ub_key_schema[0..32] with the raw metadata key
- * for P4-3a. Allocator stats populate total_blocks / free_blocks. */
+ * for P4-1, ub_alloc_root_gen for P4-3b R9 P0-1, and
+ * ub_key_schema[0..32] with the raw metadata key for P4-3a.
+ * Allocator stats populate total_blocks / free_blocks.
+ *
+ * `alloc_root_gen` is the gen at which the referenced tree was
+ * AEAD-encrypted. Usually equals `new_gen` (a fresh tree commit),
+ * but a mount-claim UB advances new_gen past durable gen without
+ * rewriting the tree — in that case alloc_root_gen carries the
+ * OLDER gen so AEAD decrypt still works. */
 static void build_uberblock(stm_uberblock *out,
                               const stm_sync *s,
                               uint64_t new_gen,
                               uint64_t alloc_root_paddr,
                               const uint8_t alloc_root_csum[32],
+                              uint64_t alloc_root_gen,
                               const uint8_t merkle_root[32],
                               const stm_alloc_stats *astats)
 {
@@ -188,6 +202,7 @@ static void build_uberblock(stm_uberblock *out,
         out->ub_alloc_root.bp_kind  = STM_BPTR_KIND_ALLOC;
         memcpy(out->ub_alloc_root.bp_csum, alloc_root_csum, 32);
     }
+    out->ub_alloc_root_gen = stm_store_le64(alloc_root_gen);
 
     /* P4-1: Merkle root + per-pool salt. Both are stored; mount-time
      * verifier recomputes the root against on-disk tree-root csums +
@@ -241,6 +256,12 @@ stm_status stm_sync_create(stm_bdev *d, stm_alloc *a,
 {
     if (!d || !a || !pool_uuid || !device_uuid || !out_sync) return STM_EINVAL;
 
+    /* R9 P1-1: the rest of this function calls stm_random_bytes /
+     * stm_aead_* transitively via stm_alloc_set_crypt_ctx; libsodium
+     * must be initialized. Idempotent. */
+    stm_status ci = stm_crypto_init();
+    if (ci != STM_OK) return ci;
+
     stm_sync *s = sync_new(d, a, pool_uuid, device_uuid);
     if (!s) return STM_ENOMEM;
 
@@ -282,16 +303,25 @@ stm_status stm_sync_open(stm_bdev *d, stm_alloc *a, stm_sync **out_sync)
 {
     if (!d || !a || !out_sync) return STM_EINVAL;
 
+    /* R9 P1-1: make sure libsodium is up before any crypto op. */
+    stm_status ci = stm_crypto_init();
+    if (ci != STM_OK) return ci;
+
     /* Scan for the authoritative uberblock. */
     stm_uberblock ub;
     uint32_t      live_label = 0, live_slot = 0;
     stm_status s = stm_sb_mount_scan(d, &ub, &live_label, &live_slot);
     if (s != STM_OK) return s;
 
-    uint64_t durable_gen = stm_load_le64(ub.ub_gen);
+    uint64_t durable_gen    = stm_load_le64(ub.ub_gen);
+    uint64_t alloc_root_gen = stm_load_le64(ub.ub_alloc_root_gen);
 
-    /* R7d P2-5: bound durable_gen so the +1 below doesn't wrap. */
-    if (durable_gen >= UINT64_MAX - 1) return STM_ERANGE;
+    /* R9 P0-1: bound durable_gen so the +2 mount-claim dance below
+     * doesn't wrap. Commit at gen UINT64_MAX - 2 already refuses
+     * via R7d P2-5; a mount that would need to write a claim UB
+     * at UINT64_MAX - 1 leaves no headroom for the first commit at
+     * UINT64_MAX. Refuse early. */
+    if (durable_gen >= UINT64_MAX - 2) return STM_ERANGE;
 
     uint64_t pool_uuid[2] = {
         stm_load_le64(ub.ub_pool_uuid[0]),
@@ -305,13 +335,36 @@ stm_status stm_sync_open(stm_bdev *d, stm_alloc *a, stm_sync **out_sync)
     stm_sync *s2 = sync_new(d, a, pool_uuid, device_uuid);
     if (!s2) return STM_ENOMEM;
 
-    /* MountGenBump (sync.tla): next commit's gen must be strictly
-     * greater than any durable gen. Convention: `current_gen` is
-     * the next-commit's-gen, so set it to durable_gen + 1. */
-    s2->current_gen       = durable_gen + 1;
+    /* R9 P0-1 — mount-claim UB protocol.
+     *
+     * sync.tla's MountGenBump models MaxDurableTxg as the max over
+     * BOTH the UB ring AND the durable data area. The pre-fix
+     * implementation only inspected the UB ring, so orphan
+     * encrypted metadata writes at gen=durable_gen+1 that happened
+     * to flush to disk before the UB (e.g. page-cache eviction
+     * preceding fsync) went unnoticed — and the next commit reused
+     * gen=durable_gen+1 for a DIFFERENT plaintext at the same
+     * paddr → AEAD nonce reuse under AEGIS-256, a cryptographic
+     * catastrophe.
+     *
+     * Fix: at mount, durably claim gen=durable_gen+1 by writing a
+     * "mount-claim" uberblock at that gen with the SAME tree roots
+     * as the durable UB (no commit happening yet — just advancing
+     * the gen counter). `ub_alloc_root_gen` carries the ORIGINAL
+     * encryption gen so AEAD decrypt on subsequent reads still
+     * matches. current_gen then starts at durable_gen+2, one past
+     * the claim.
+     *
+     * If this mount itself crashes between the claim UB write and
+     * the first commit: the next mount observes durable_gen'=
+     * durable_gen+1 and claims durable_gen+2, so the same-gen
+     * problem cannot recur. Consecutive crashed mounts burn one
+     * gen each — UINT64_MAX / 2^? astronomic. */
+    s2->current_gen       = durable_gen + 2;
     s2->mount_max_durable = durable_gen;
     s2->live_label_idx    = live_label;
     s2->live_slot_idx     = live_slot;
+    s2->alloc_root_gen    = alloc_root_gen;
 
     /* P4-1: carry Merkle state forward from the durable uberblock.
      * Salt is per-pool and stable; alloc_root_csum + merkle_root
@@ -374,17 +427,62 @@ stm_status stm_sync_open(stm_bdev *d, stm_alloc *a, stm_sync **out_sync)
             stm_sync_close(s2);
             return STM_ECORRUPT;
         }
-        /* P4-1 / P4-3b: pass the expected csum + durable_gen through
-         * so the tree loader verifies ciphertext BLAKE3 against
-         * ub_alloc_root.bp_csum and AEAD-decrypts every node under
-         * gen = ub_gen. */
-        stm_status ls = stm_alloc_load_tree_at(a, alloc_root, durable_gen,
+        /* P4-1 / P4-3b: pass the expected csum + alloc_root_gen
+         * through so the tree loader verifies ciphertext BLAKE3
+         * against ub_alloc_root.bp_csum and AEAD-decrypts every
+         * node under the ORIGINAL encryption gen (which is NOT
+         * necessarily ub_gen if a prior mount wrote a claim UB). */
+        stm_status ls = stm_alloc_load_tree_at(a, alloc_root, alloc_root_gen,
                                                   ub.ub_alloc_root.bp_csum);
         if (ls != STM_OK) {
             stm_sync_close(s2);
             return ls;
         }
         s2->alloc_root_paddr = alloc_root;
+    }
+
+    /* Write the mount-claim UB at durable_gen+1. Same roots +
+     * merkle state + alloc_root_gen as the durable UB; only ub_gen
+     * advances. Fsynced via stm_sb_label_write. After this write
+     * returns, mount has durably claimed gen=durable_gen+1 — the
+     * next commit at current_gen (= durable_gen+2) cannot collide
+     * with any orphan metadata writes from a prior crashed mount.
+     *
+     * Read-only mount skips the claim UB (the bdev refuses writes
+     * with STM_EROFS). Safe because an RO mount never issues any
+     * new AEAD write — `current_gen` is unused. We stash it anyway
+     * for stm_sync_info_get callers that want to know "what the
+     * next RW mount would start at." */
+    {
+        stm_alloc_stats astats_claim;
+        stm_status gs = stm_alloc_stats_get(a, &astats_claim);
+        if (gs != STM_OK) {
+            stm_sync_close(s2);
+            return gs;
+        }
+        stm_uberblock claim_ub;
+        build_uberblock(&claim_ub, s2,
+                         /*new_gen=*/       durable_gen + 1,
+                         /*alloc_root=*/    alloc_root,
+                         /*alloc_csum=*/    ub.ub_alloc_root.bp_csum,
+                         /*alloc_root_gen=*/alloc_root_gen,
+                         /*merkle_root=*/   ub.ub_merkle_root,
+                         &astats_claim);
+        uint32_t lbl  = ring_label_for_gen(durable_gen + 1);
+        uint32_t slot = ring_slot_for_gen(durable_gen + 1);
+        stm_status cw = stm_sb_label_write(d, lbl, slot, &claim_ub);
+        if (cw == STM_OK) {
+            s2->live_label_idx = lbl;
+            s2->live_slot_idx  = slot;
+        } else if (cw != STM_EROFS) {
+            stm_sync_close(s2);
+            return cw;
+        }
+        /* For STM_EROFS we leave live_label/slot pointing at the
+         * DURABLE UB (set earlier from mount_scan). */
+        s2->alloc_root_paddr = alloc_root;
+        memcpy(s2->alloc_root_csum, ub.ub_alloc_root.bp_csum, 32);
+        memcpy(s2->merkle_root,     ub.ub_merkle_root,        32);
     }
 
     *out_sync = s2;
@@ -481,10 +579,13 @@ stm_status stm_sync_commit(stm_sync *s)
 
     /* Phase: Final — write the new uberblock to the next ring slot,
      * fsynced. This is the commit point per sync.tla. Ring rotation:
-     * label = gen % 4, slot = gen % 63. */
+     * label = gen % 4, slot = gen % 63.
+     *
+     * R9 P0-1: alloc_root_gen = commit_gen because this commit DID
+     * rewrite the tree under commit_gen's AEAD nonce. */
     stm_uberblock ub;
     build_uberblock(&ub, s, commit_gen, alloc_root, alloc_root_csum,
-                     new_merkle_root, &astats);
+                     commit_gen, new_merkle_root, &astats);
 
     uint32_t next_label = ring_label_for_gen(commit_gen);
     uint32_t next_slot  = ring_slot_for_gen(commit_gen);
@@ -502,6 +603,7 @@ stm_status stm_sync_commit(stm_sync *s)
     s->live_label_idx    = next_label;
     s->live_slot_idx     = next_slot;
     s->alloc_root_paddr  = alloc_root;
+    s->alloc_root_gen    = commit_gen;
     memcpy(s->alloc_root_csum, alloc_root_csum, 32);
     memcpy(s->merkle_root,     new_merkle_root, 32);
 

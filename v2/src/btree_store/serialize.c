@@ -94,7 +94,11 @@ static int scan_collect_cb(const void *key, size_t key_len,
     if (value_len) {
         e->value = malloc(value_len);
         if (!e->value) {
+            /* R9 P2-2: null out the key pointer after free so any
+             * future refactor that accidentally iterates past
+             * n_entries can't double-free the now-dangling slot. */
             free(e->key);
+            e->key = NULL;
             c->err = STM_ENOMEM;
             return 1;
         }
@@ -353,11 +357,13 @@ stm_status stm_btree_store_serialize(stm_btree_mt *t,
         return STM_ENOMEM;
     }
 
+    size_t leaves_emitted = 0;
     for (size_t i = 0; i < n_leaves; i++) {
         s = emit_leaf(coll.entries, starts[i], starts[i + 1],
                       gen, tree_id, vt, vt_ctx, cx,
                       scratch, &leaf_paddrs[i], &leaf_csums[i * 32]);
-        if (s != STM_OK) goto cleanup;
+        if (s != STM_OK) goto cleanup_rollback;
+        leaves_emitted = i + 1;
     }
 
     /* Single leaf → its paddr IS the root, and its csum IS the root csum. */
@@ -406,10 +412,29 @@ stm_status stm_btree_store_serialize(stm_btree_mt *t,
                       scratch, &root_paddr, out_root_csum);
     free(pivots);
     free(children);
-    if (s != STM_OK) goto cleanup;
+    if (s != STM_OK) goto cleanup_rollback;
 
     *out_root_paddr = root_paddr;
     s = STM_OK;
+    goto cleanup;
+
+cleanup_rollback:
+    /* R9 P2-1: emit_leaf or emit_internal failed after we had
+     * already reserved paddrs. Mark those paddrs PENDING-free via
+     * the vtable so the NEXT commit's sweep reclaims them — without
+     * this, they remain allocated in the bootstrap bitmap forever
+     * (a block leak that compounds the orphan-ciphertext attack
+     * surface of R9 P0-1 even though the P0-1 fix already closes
+     * the nonce-reuse hazard).
+     *
+     * Best-effort: vt->free failures are swallowed — we're already
+     * on an error path. */
+    if (vt->free) {
+        for (size_t i = 0; i < leaves_emitted; i++) {
+            (void)vt->free(vt_ctx, leaf_paddrs[i], gen);
+        }
+    }
+    /* fallthrough */
 
 cleanup:
     free(leaf_csums);
@@ -694,6 +719,7 @@ stm_status stm_btree_store_deserialize(stm_btree_mt *t, uint64_t root_paddr,
 
 stm_status stm_btree_store_free_tree(uint64_t root_paddr, uint64_t root_gen,
                                        uint64_t free_gen,
+                                       const uint8_t expected_root_csum[32],
                                        const stm_btree_store_vtable *vt,
                                        void *vt_ctx,
                                        const stm_btree_crypt_ctx *cx)
@@ -702,11 +728,21 @@ stm_status stm_btree_store_free_tree(uint64_t root_paddr, uint64_t root_gen,
     if (!vt->read || !vt->free) return STM_EINVAL;
     /* P4-3b: must decrypt internal nodes to enumerate their children. */
     if (!cx || !cx->metadata_key) return STM_EINVAL;
+    /* R9 P1-2: reject NULL expected csum so we can't silently
+     * free the wrong tree on in-process root-paddr corruption. */
+    if (!expected_root_csum) return STM_EINVAL;
 
     uint8_t *buf = malloc(STM_BTNODE_SIZE);
     if (!buf) return STM_ENOMEM;
 
     stm_status s = vt->read(vt_ctx, root_paddr, buf, STM_BTNODE_SIZE);
+    if (s != STM_OK) { free(buf); return s; }
+
+    /* R9 P1-2: Merkle-verify root BEFORE decrypt. If current_tree_root
+     * was corrupted to point at a DIFFERENT valid encrypted node, the
+     * BLAKE3 of that node's ciphertext won't match the recorded csum
+     * — abort before enumerating children. */
+    s = check_merkle_link(buf, expected_root_csum);
     if (s != STM_OK) { free(buf); return s; }
 
     /* P4-3b: decrypt before stm_btnode_peek. On a tampered or

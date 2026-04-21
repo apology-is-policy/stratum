@@ -1060,10 +1060,13 @@ stm_status stm_alloc_commit(stm_alloc *a, uint64_t committed_gen)
 
         if (a->current_tree_root != 0) {
             /* P4-3b: free_tree needs the gen at which the OLD tree
-             * was encrypted (current_tree_gen), NOT committed_gen. */
+             * was encrypted (current_tree_gen), NOT committed_gen.
+             * R9 P1-2: pass the OLD tree's bp_csum so free_tree
+             * Merkle-verifies before decrypt. */
             stm_status fs = stm_btree_store_free_tree(a->current_tree_root,
                                                         a->current_tree_gen,
                                                         committed_gen,
+                                                        a->current_tree_csum,
                                                         &ALLOC_STORE_VT, &scx,
                                                         &cx);
             if (fs != STM_OK) {

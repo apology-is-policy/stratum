@@ -44,8 +44,17 @@ extern "C" {
  * v1 → v2 (Phase 4 chunk P4-1): carved ub_merkle_root_salt[32]
  * from ub_reserved (unchanged offset; field size shrunk). v1 pools
  * had this region zero, so v2 readers cannot treat a v1 uberblock
- * as having a populated salt — hence the version bump. */
-#define STM_UB_VERSION        2u
+ * as having a populated salt — hence the version bump.
+ *
+ * v2 → v3 (Phase 4 chunk P4-3b R9 P0-1): carved
+ * ub_alloc_root_gen[8 bytes le64] from ub_reserved. Records the
+ * gen at which ub_alloc_root's tree was AEAD-encrypted — may
+ * differ from ub_gen when a mount-claim UB advances the gen
+ * counter past orphan metadata writes without rewriting the tree.
+ * v2 pools had this region zero, which AEAD-decrypts as nonce
+ * gen=0 — would fail-loud at mount, but the version bump makes
+ * the intent explicit and refuses v2 mounts up-front. */
+#define STM_UB_VERSION        3u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */
@@ -193,8 +202,17 @@ typedef struct {
      * across the pool's lifetime; never rotated. */
     uint8_t ub_merkle_root_salt[32];            /* 3008 : 32 */
 
+    /* Gen at which `ub_alloc_root`'s tree was AEAD-encrypted
+     * (P4-3b). Usually equals `ub_gen`, but may be strictly less
+     * when `stm_sync_open` writes a "mount-claim" UB that advances
+     * the durable gen past any orphan-data writes without
+     * rewriting the tree. The AEAD nonce on every tree-node read
+     * uses THIS field, not ub_gen, so a mount-claim UB keeps the
+     * existing tree decryptable. */
+    le64    ub_alloc_root_gen;                  /* 3040 :  8 */
+
     /* Reserved for future fields + alignment to csum. */
-    uint8_t ub_reserved[1024];                  /* 3040 : 1024 */
+    uint8_t ub_reserved[1016];                  /* 3048 : 1016 */
 
     /* Checksum: BLAKE3-256 over the rest of the uberblock with this
      * field zeroed. Self-verifying; a blob whose first 4064 bytes
