@@ -24,6 +24,7 @@ Phase 3 is in progress. Thirteen commits landed. Chunks 4c / 4d / 4e /
 | `033bb3f` → `17e08be` | **Chunk 5d + R7c**: `stm_alloc` integration — tree now persists across mount. R7c closed (0 P0 / 2 P1 / 6 P2; btnode common-helper consolidation). | +3 alloc persistence tests |
 | `00d796e` → `b70537d` | **Chunk 6 + R7d**: `stm_sync` — four-phase commit protocol (sync.tla-aligned). R7d closed (2 P0 / 1 P1 / 3 P2 — ub_alloc_root now sole authoritative source; user_data tree-root dead-coded out). | 8 sync tests |
 | `e45818b` → `dfe04b7` | **Chunk 7 + R7e**: `stm_fs` — top-level mount/unmount lifecycle. Format → mount → reserve → commit → unmount → remount. R7e closed (1 P0 / 1 P1 / 3 P2 / 6 P3). P0-1 was the "POSIX-bdev close-without-commit hang" — actually a `FS_GUARD_WRITE` unlock-on-refusal bug, not a bdev issue. P1-1 wiped stale uberblock ring on reformat. RO + wedged end-to-end tests restored. | 9 fs tests |
+| `deec70d` | **Chunk 4c**: `stm_sdarray` — Elias-Fano succinct encoding of a sorted 64-bit set. High bits as unary bitmap, low bits packed, exact-bit-position select samples every 64 ones → O(1) select, O(log m) rank/contains. Standalone module; integration into allocator query path deferred to chunk 4e. | 14 sdarray tests |
 
 Phase 2 is complete (SPLIT + MERGE + per-node consolidator + SCAN + R0-R6
 audits). Phase 3 chunks remaining:
@@ -125,14 +126,12 @@ Expected TLC results:
 - `merge.tla` — empty-leaf reabsorb. 65536 states, depth 18.
 - `allocator.tla` — refcount + deferred-free. 3729 states, depth 16.
 
-## Next chunk — 4c / 4d / 4e / 8
+## Next chunk — 4d / 4e / 8
 
-Chunk 7 (`e45818b`) landed the stm_fs lifecycle; R7e audit closed at
-`dfe04b7` with the P0 deadlock fixed (guard-macro unlock-on-refusal
-bug — correctly diagnosed as fs.c, not POSIX-bdev), the P1 stale-UB
-reformat fix, and two cheap P2s. The two RO + wedged end-to-end tests
-that were previously deferred are restored and green on default /
-ASan / TSan. Chunk 7 is now fully audited and closed.
+Chunk 4c landed at `deec70d` with a standalone SDArray module. The
+integration into the allocator's query path is chunk 4e's
+responsibility — the audit surface lives at integration, not at the
+pure data-structure module.
 
 ### Remaining Phase 3 work, in order:
 
@@ -147,9 +146,10 @@ Post-Phase-3 exit, Phase 4 begins encryption (AEAD per-extent +
 Merkle integrity populating ub_merkle_root + bp_csum).
 
 ### Chunk 4c: In-RAM succinct bitmap (SDArray).
-- Performance structure. `src/alloc/sdarray.c`. Approximate
-  "is block X allocated" in O(1). Reduces tree walks.
-- Target: ~20 MiB RAM per TiB of data.
+- LANDED at `deec70d`. `src/alloc/sdarray.c` + public header.
+  Elias-Fano encoding; O(1) select, O(log m) rank/contains.
+- MVP scope: sparse-optimal core only. Hybrid "SDArray-on-gaps" for
+  density > 50% is deferred post-Phase-3 optimization.
 
 ### Chunk 4d: xor filter for negative lookups.
 - 9 bits per allocated range, <1% false-positive rate. Fast
