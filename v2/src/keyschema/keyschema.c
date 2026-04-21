@@ -22,6 +22,7 @@
 #include <stratum/block.h>
 #include <stratum/bootstrap.h>
 #include <stratum/btnode.h>
+#include <stratum/crypto.h>
 #include <stratum/super.h>
 
 #include <stdlib.h>
@@ -396,6 +397,11 @@ stm_status stm_keyschema_commit(stm_keyschema *ks, uint64_t committed_gen,
     uint8_t new_csum[32];
     memcpy(new_csum,
              scratch + (STM_BTNODE_SIZE - STM_BTNODE_CSUM_SIZE), 32);
+    /* R10 P3-1: wipe the scratch before free. Contents are
+     * wrapped-key ciphertext (already confidential), but wiping
+     * before returning to the heap pool keeps key-adjacent bytes
+     * out of any future heap reuse. */
+    stm_ct_memzero(scratch, STM_BTNODE_SIZE);
     free(scratch);
 
     /* Defer-free the prior node (if any). */
@@ -404,9 +410,17 @@ stm_status stm_keyschema_commit(stm_keyschema *ks, uint64_t committed_gen,
                                               STM_BOOTSTRAP_UNIT_BLOCKS,
                                               committed_gen);
         if (fs != STM_OK) {
-            /* Best-effort: the new node is already written; the old
-             * one leaks until pool reformat but the schema is still
-             * consistent. Surface the error. */
+            /* R10 P2-1: rollback the new paddr we just reserved+wrote.
+             * Without this, a failure here leaves two paddrs claimed
+             * (new_paddr + ks->root_paddr) and zero recoverable
+             * progress, and a retry would reserve a THIRD paddr and
+             * attempt the same old-paddr free — unbounded bitmap
+             * leak on repeated transient failures. Do NOT update
+             * ks->root_paddr / root_csum so the retry re-reserves
+             * cleanly. */
+            (void)stm_bootstrap_free(ks->boot, new_paddr,
+                                        STM_BOOTSTRAP_UNIT_BLOCKS,
+                                        committed_gen);
             return fs;
         }
     }

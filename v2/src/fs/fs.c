@@ -169,6 +169,7 @@ stm_status stm_fs_format(const char *path, const stm_fs_format_opts *opts)
         stm_sync_close(sync);
         stm_alloc_close(a);
         stm_bdev_close(d);
+        stm_hybrid_keys_wipe(&wk);      /* R10 P1-1 */
         return s;
     }
 

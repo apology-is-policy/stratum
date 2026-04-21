@@ -232,15 +232,24 @@ stm_status stm_hybrid_keygen(uint8_t pk[STM_HYBRID_PK_LEN],
  */
 STM_MUST_USE
 stm_status stm_hybrid_wrap(const uint8_t pk[STM_HYBRID_PK_LEN],
+                           const void *ad, size_t ad_len,
                            const void *dek, size_t dek_len,
                            void *wrapped, size_t *out_len);
 
 /*
  * Unwraps a wrapped blob. `dek` buffer size = `wrapped_len - STM_HYBRID_WRAP_OVERHEAD`.
- * Returns STM_EBADTAG on tamper / wrong key.
+ *
+ * `ad` / `ad_len` MUST match the values passed to `stm_hybrid_wrap`
+ * (R10 P2-2). This binds the wrapped blob to its context — e.g.
+ * pool_uuid || dataset_id || key_id — so an attacker who swaps a
+ * retired wrapped blob into a CURRENT slot (or relocates a wrap
+ * across pools) fails the Poly1305 tag verification.
+ *
+ * Returns STM_EBADTAG on tamper / wrong key / wrong AD.
  */
 STM_MUST_USE
 stm_status stm_hybrid_unwrap(const uint8_t sk[STM_HYBRID_SK_LEN],
+                             const void *ad, size_t ad_len,
                              const void *wrapped, size_t wrapped_len,
                              void *dek, size_t *out_dek_len);
 

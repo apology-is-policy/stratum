@@ -96,6 +96,22 @@ stm_status stm_keyfile_load(const char *path, stm_hybrid_keys *out)
     int fd = open(path, O_RDONLY);
     if (fd < 0) return STM_ENOENT;
 
+    /* R10 P2-4: reject keyfiles with trailing bytes. An exact
+     * length check closes a "stash arbitrary data after the keys"
+     * vector: attackers with write access could otherwise plant
+     * provenance / audit-evasion markers in the trailing region,
+     * and future backend versions might read those bytes by
+     * accident. */
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        return STM_EBACKEND;
+    }
+    if ((uint64_t)st.st_size != (uint64_t)STM_KEYFILE_SIZE) {
+        close(fd);
+        return STM_ERANGE;
+    }
+
     uint8_t buf[STM_KEYFILE_SIZE];
     size_t got = 0;
     while (got < sizeof buf) {
@@ -112,10 +128,6 @@ stm_status stm_keyfile_load(const char *path, stm_hybrid_keys *out)
         }
         got += (size_t)n;
     }
-    /* Trailing-bytes sanity: a valid keyfile is exactly
-     * STM_KEYFILE_SIZE. Accept slightly-larger files (admin appended
-     * a newline, etc.) — we only read the first N bytes. A smaller
-     * file already failed above with STM_ERANGE. */
     close(fd);
 
     uint32_t magic   = load_u32_le(buf + 0);

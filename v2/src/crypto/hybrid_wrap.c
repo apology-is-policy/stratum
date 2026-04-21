@@ -81,10 +81,12 @@ stm_status stm_hybrid_keygen(uint8_t pk[STM_HYBRID_PK_LEN],
 }
 
 stm_status stm_hybrid_wrap(const uint8_t pk[STM_HYBRID_PK_LEN],
+                           const void *ad, size_t ad_len,
                            const void *dek, size_t dek_len,
                            void *wrapped, size_t *out_len)
 {
     if (!pk || !dek || !wrapped || dek_len == 0) return STM_EINVAL;
+    if (ad_len > 0 && !ad) return STM_EINVAL;
 
     size_t total = dek_len + STM_HYBRID_WRAP_OVERHEAD;
     uint8_t *out = (uint8_t *)wrapped;
@@ -151,12 +153,16 @@ stm_status stm_hybrid_wrap(const uint8_t pk[STM_HYBRID_PK_LEN],
     memcpy(out + 32, mlkem_ct, STM_MLKEM768_CT_LEN);
     memcpy(out + 32 + STM_MLKEM768_CT_LEN, wrap_nonce, WRAP_NONCE_LEN);
 
-    /* (7) XChaCha20-Poly1305 encrypt dek under wrap_key, wrap_nonce. */
+    /* (7) XChaCha20-Poly1305 encrypt dek under wrap_key, wrap_nonce.
+     * AD binds the wrap to its caller-supplied context (R10 P2-2) —
+     * typically pool_uuid ‖ dataset_id ‖ key_id, so a retired
+     * wrapped blob swapped into a current slot (or relocated across
+     * pools) fails tag verification at unwrap. */
     unsigned long long clen = 0;
     int r = crypto_aead_xchacha20poly1305_ietf_encrypt(
         out + 32 + STM_MLKEM768_CT_LEN + WRAP_NONCE_LEN, &clen,
         (const unsigned char *)dek, (unsigned long long)dek_len,
-        NULL, 0,        /* no AD */
+        (const unsigned char *)ad, (unsigned long long)ad_len,
         NULL,           /* nsec */
         wrap_nonce,
         wrap_key);
@@ -169,11 +175,13 @@ stm_status stm_hybrid_wrap(const uint8_t pk[STM_HYBRID_PK_LEN],
 }
 
 stm_status stm_hybrid_unwrap(const uint8_t sk[STM_HYBRID_SK_LEN],
+                             const void *ad, size_t ad_len,
                              const void *wrapped, size_t wrapped_len,
                              void *dek, size_t *out_dek_len)
 {
     if (!sk || !wrapped || !dek) return STM_EINVAL;
     if (wrapped_len < STM_HYBRID_WRAP_OVERHEAD) return STM_EINVAL;
+    if (ad_len > 0 && !ad) return STM_EINVAL;
 
     const uint8_t *in = (const uint8_t *)wrapped;
 
@@ -210,13 +218,13 @@ stm_status stm_hybrid_unwrap(const uint8_t sk[STM_HYBRID_SK_LEN],
     stm_ct_memzero(ss2, sizeof ss2);
     if (s != STM_OK) { stm_ct_memzero(wrap_key, sizeof wrap_key); return s; }
 
-    /* Decrypt. */
+    /* Decrypt. AD must match the wrap-time value (R10 P2-2). */
     unsigned long long plen = 0;
     int r = crypto_aead_xchacha20poly1305_ietf_decrypt(
         (unsigned char *)dek, &plen,
         NULL,
         ct_tag, (unsigned long long)ct_tag_len,
-        NULL, 0,
+        (const unsigned char *)ad, (unsigned long long)ad_len,
         wrap_nonce,
         wrap_key);
     stm_ct_memzero(wrap_key, sizeof wrap_key);

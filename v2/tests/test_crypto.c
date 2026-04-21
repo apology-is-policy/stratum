@@ -427,11 +427,11 @@ STM_TEST(hybrid_wrap_zero_mlkem_pk_roundtrips) {
 
     uint8_t wrapped[sizeof dek + STM_HYBRID_WRAP_OVERHEAD];
     size_t wlen = 0;
-    STM_ASSERT_OK(stm_hybrid_wrap(pk, dek, sizeof dek, wrapped, &wlen));
+    STM_ASSERT_OK(stm_hybrid_wrap(pk, NULL, 0, dek, sizeof dek, wrapped, &wlen));
 
     uint8_t out[sizeof dek];
     size_t olen = 0;
-    STM_ASSERT_OK(stm_hybrid_unwrap(sk, wrapped, wlen, out, &olen));
+    STM_ASSERT_OK(stm_hybrid_unwrap(sk, NULL, 0, wrapped, wlen, out, &olen));
     STM_ASSERT_EQ(olen, sizeof dek);
     STM_ASSERT_MEM_EQ(out, dek, sizeof dek);
 }

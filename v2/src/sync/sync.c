@@ -48,6 +48,31 @@
 #define STM_SYNC_POOL_DATASET_ID   UINT64_C(0)
 #define STM_SYNC_POOL_KEY_ID       UINT64_C(0)
 
+/* R10 P2-2: wrap-AD layout = pool_uuid(16) || dataset_id(8) ||
+ * key_id(8). Binds the wrapped blob to its schema-tree coordinates
+ * so a retired-blob-swapped-into-current attack (actionable once
+ * P4-4c rotation lands) fails the Poly1305 tag inside stm_hybrid.
+ * pool_uuid pins cross-pool replay; dataset_id + key_id pin
+ * within-pool substitution. device_uuid is deliberately OMITTED —
+ * the schema is pool-scoped in Phase 5's multi-device plan (ARCH
+ * §7.7.3 "Multi-device durability") and mirroring the same bytes
+ * across devices must succeed. */
+#define STM_SYNC_WRAP_AD_LEN       32u
+
+static void build_wrap_ad(const uint64_t pool_uuid[2],
+                            uint64_t dataset_id, uint64_t key_id,
+                            uint8_t out[STM_SYNC_WRAP_AD_LEN])
+{
+    le64 p0 = stm_store_le64(pool_uuid[0]);
+    le64 p1 = stm_store_le64(pool_uuid[1]);
+    le64 ds = stm_store_le64(dataset_id);
+    le64 kid = stm_store_le64(key_id);
+    memcpy(out +  0, p0.v,  8);
+    memcpy(out +  8, p1.v,  8);
+    memcpy(out + 16, ds.v,  8);
+    memcpy(out + 24, kid.v, 8);
+}
+
 /* Size of a hybrid-wrapped 32-byte dek. Pinned at build time so
  * caller buffers are deterministic. */
 #define STM_SYNC_WRAPPED_KEY_LEN   (32u + STM_HYBRID_WRAP_OVERHEAD)
@@ -333,7 +358,12 @@ stm_status stm_sync_create(stm_bdev *d, stm_alloc *a,
 
         uint8_t wrapped[STM_SYNC_WRAPPED_KEY_LEN];
         size_t  wrapped_len = 0;
+        uint8_t wrap_ad[STM_SYNC_WRAP_AD_LEN];
+        build_wrap_ad(s->pool_uuid,
+                       STM_SYNC_POOL_DATASET_ID, STM_SYNC_POOL_KEY_ID,
+                       wrap_ad);
         stm_status ws = stm_hybrid_wrap(wk->pk,
+                                           wrap_ad, sizeof wrap_ad,
                                            s->metadata_key, 32,
                                            wrapped, &wrapped_len);
         if (ws != STM_OK) { stm_sync_close(s); return ws; }
@@ -491,8 +521,14 @@ stm_status stm_sync_open(stm_bdev *d, stm_alloc *a,
         return kos;
     }
 
+    uint8_t unwrap_ad[STM_SYNC_WRAP_AD_LEN];
+    build_wrap_ad(s2->pool_uuid,
+                    STM_SYNC_POOL_DATASET_ID, found_key_id,
+                    unwrap_ad);
     size_t dek_out_len = 0;
-    stm_status us = stm_hybrid_unwrap(wk->sk, wrapped, wrapped_len,
+    stm_status us = stm_hybrid_unwrap(wk->sk,
+                                        unwrap_ad, sizeof unwrap_ad,
+                                        wrapped, wrapped_len,
                                         s2->metadata_key, &dek_out_len);
     stm_ct_memzero(wrapped, sizeof wrapped);
     if (us != STM_OK) {
@@ -500,6 +536,10 @@ stm_status stm_sync_open(stm_bdev *d, stm_alloc *a,
         return us;
     }
     if (dek_out_len != 32) {
+        /* R10 P3-2: symmetric cleanup with the STM_OK path. The
+         * wrap/unwrap should always yield exactly 32 bytes; any
+         * other length indicates backend corruption. */
+        stm_ct_memzero(s2->metadata_key, sizeof s2->metadata_key);
         stm_sync_close(s2);
         return STM_EBACKEND;
     }
