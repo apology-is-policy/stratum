@@ -17,7 +17,8 @@ integrity), then encryption (AEAD data extents + AEAD metadata nodes
 |---|---|---|
 | `54b3c8b` → `ee3600c` | **P4-1 + R8: Merkle integrity scaffold**. Wires existing per-node BLAKE3 self-csums into a chain: internal-node bp_csum fields carry child csums; allocator-tree root csum propagates into `ub_alloc_root.bp_csum`; `ub_merkle_root = BLAKE3(main_csum(0) ‖ alloc_csum ‖ snap_csum(0) ‖ cas_csum(0) ‖ salt)` per ARCH §7.11.3. Per-pool salt from libsodium CSPRNG at format, stored in new `ub_merkle_root_salt[32]` (STM_UB_VERSION 1→2). Mount verifies recomputed Merkle root against stored value AND tree-root node self-csum against `bp_csum`. R8 audit closed: 1 P0 (free_tree segfault on multi-leaf) + 2 P1 (BLAKE3 OOM bypass; NULL-csum trap) + 3 P2 (substitution test, libsodium switch, rename). | 4 new sync tests; 20 suites green |
 | `65c4c76` | **P4-6: `merkle.tla` formal spec**. Models the Merkle chain under COW: honest WriteLeaf / WriteInternal / Commit actions plus adversarial Tamper. Proves `CommittedTreeWellFormed` (stored csums = recomputed at commit time) and `TamperDetectableAtCommittedRoot` (any byte edit reachable from root makes recompute ≠ stored merkle_root). TLC clean: 83169 distinct states, depth 10. | Spec-only |
-| `<next>` | **P4-3a: metadata-key lifecycle**. Per-pool 32-byte metadata-encryption key. Generated at sync_create from libsodium CSPRNG, persisted at `ub_key_schema[0..32]` on every commit, recovered at sync_open. Key is unused by the write path — infrastructure for P4-3b's AEAD wrapper. Reserved tail `ub_key_schema[32..512]` stays zero for P4-4's key-hierarchy layout. | 1 new sync test |
+| `cb9671f` | **P4-3a: metadata-key lifecycle**. Per-pool 32-byte metadata-encryption key. Generated at sync_create from libsodium CSPRNG, persisted at `ub_key_schema[0..32]` on every commit, recovered at sync_open. Reserved tail `ub_key_schema[32..512]` stays zero for P4-4's key-hierarchy layout. | 1 new sync test |
+| `<next>` | **P4-3b: AEAD on metadata nodes**. AEGIS-256 wraps every emitted btnode image at the `btree_store` boundary. On-disk layout: ciphertext occupies `[0..STM_BTNODE_SIZE - 32)`, AEAD tag fills the trailing 32 bytes (repurposes the slot the P4-1 plaintext self-csum used to live in; `STM_AEAD_TAG_LEN_AEGIS256 == STM_BTNODE_CSUM_SIZE` ensures exact fit). `bp_csum` semantics unchanged: `BLAKE3(on-disk[0..STM_BTNODE_SIZE - 32))` — now covers ciphertext. Nonce = paddr(8 LE) ‖ gen(8 LE) ‖ pool_uuid(16 LE). AD = pool_uuid(16 LE) ‖ device_uuid(16 LE). Mandatory for v2 pools — no unencrypted path. `stm_alloc` gains a crypt-ctx setter; `stm_sync_{create,open}` installs it from the pool key before the first commit / tree load. Old-tree free path threads the prior tree's gen so AEAD decrypt can enumerate internal-node children. | 7 new btree_store tests (encrypted round-trip, tag tamper, wrong key / gen / pool_uuid / device_uuid, NULL cx); 20 suites green |
 
 ## Remaining Phase 4 work
 
@@ -82,23 +83,52 @@ deserialize boundary. Design decisions:
 - **Migration**: v1→v2 uberblock version bump (already done in
   P4-1) rejects v1 pools, so there's no backward-compat concern.
 
-Integration surfaces:
+Integration surfaces (as landed):
 - `src/btree_store/serialize.c`:
   - `emit_leaf` / `emit_internal`: after `stm_btnode_*_encode`,
-    AEAD-encrypt bytes [0..131040) in place, write AEAD tag into
-    [131040..131072). THEN compute bp_csum over [0..131040) (the
-    ciphertext) and populate out_csum.
-  - `stm_btree_store_deserialize`: after `vt->read`, verify bp_csum
-    match, AEAD-decrypt bytes [0..131040) using tag at [131040..)
-    and the nonce/AD derived from paddr+gen+pool_uuid. Skip
-    `btnode_verify_csum`.
-- `src/alloc/alloc.c`: `stm_alloc_commit` already has
-  `committed_gen`; pass through. `stm_alloc_load_tree_at` needs a
-  gen arg (currently absent) so the reader can reconstruct the
-  nonce. **This is the wrinkle**: the gen is in the UB
-  (`ub_gen`), not the bptr. `stm_sync_open` can pass it through.
-- No changes to btnode.c or btnode_common.c — the plaintext btnode
-  layout is preserved.
+    reserve the paddr, AEAD-encrypt bytes `[0..STM_BTNODE_SIZE - 32)`
+    in place (via heap scratch — see below), which also stamps the
+    AEAD tag at `[STM_BTNODE_SIZE - 32..STM_BTNODE_SIZE)`. THEN
+    compute `bp_csum = BLAKE3(ciphertext)` and populate `out_csum`.
+  - `stm_btree_store_deserialize`: after `vt->read`, verify
+    `BLAKE3(ciphertext)` matches `expected_root_csum`, AEAD-decrypt,
+    then restore the plaintext self-csum (see below) so
+    `btnode_verify_csum` (called transitively from `_leaf_decode`
+    and `_internal_decode`) passes.
+- `src/alloc/alloc.c`: `stm_alloc_load_tree_at` now takes `root_gen`.
+  `stm_alloc` stashes `metadata_key + pool_uuid + device_uuid` via a
+  new `stm_alloc_set_crypt_ctx` and a new `current_tree_gen` field so
+  the NEXT commit's `free_tree` can decrypt the OLD tree under its
+  original gen. `stm_alloc_commit` wipes the key on close with
+  `stm_ct_memzero`.
+- `src/sync/sync.c`: `stm_sync_create` and `stm_sync_open` install
+  the crypt ctx on the alloc handle before the first commit / load.
+  `stm_sync_open` threads `durable_gen` as the root_gen.
+- No changes to `btnode.c` / `btnode_common.c` — the plaintext
+  btnode layout is preserved. The decrypt path reconstructs the
+  plaintext self-csum from ciphertext so btnode's existing
+  `btnode_verify_csum` keeps working without special-casing.
+
+Two implementation notes worth preserving:
+
+1. **AEGIS-256 aliasing**: libsodium's `crypto_aead_aegis256_encrypt`
+   does NOT guarantee correctness under aliased `pt` / `ct` buffers.
+   Empirical result with aliased buffers: decrypted plaintext comes
+   back as zeros (the state-update step reads plaintext AFTER the
+   ciphertext write, which clobbers subsequent input reads). The
+   wrapper in `crypt.c` allocates a heap scratch, memcpy's the input
+   into it, runs the AEAD against disjoint buffers, and
+   `stm_ct_memzero`'s the scratch before `free`. One malloc per node
+   emit is in the noise relative to the 128 KiB copy.
+
+2. **Plaintext self-csum restoration**: after AEAD decrypt, the
+   trailing 32 bytes of the node image still hold the AEAD tag
+   (decrypt only writes the first CT_LEN bytes). `btnode_verify_csum`
+   — called from every leaf/internal decode path — expects those
+   bytes to be the plaintext self-csum. `restore_plaintext_self_csum`
+   zeros them and writes BLAKE3 of the plaintext region.
+   Double-verification (AEAD+Merkle already guarantee plaintext
+   integrity) but keeps self-csum semantics single-sourced in btnode.
 
 R9 audit triggers after P4-3b lands.
 

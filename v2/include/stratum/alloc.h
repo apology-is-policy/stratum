@@ -126,21 +126,46 @@ stm_status stm_alloc_open_blank(stm_bdev *d, stm_alloc **out_alloc);
  * stm_alloc_open_blank'd handle. root_paddr = 0 is a valid no-op
  * (leaves the tree empty).
  *
+ * `root_gen` is the gen at which the on-disk tree was serialized
+ * (= ub_gen from the mounting uberblock). Threaded into the AEAD
+ * nonce for every node (P4-3b).
+ *
  * `expected_root_csum` is REQUIRED (non-NULL, 32 bytes). The
- * on-disk root node's BLAKE3 self-csum is verified against it —
- * this is the Merkle-chain link from the uberblock's
- * `ub_alloc_root.bp_csum` into the tree (P4-1). Passing NULL
- * returns STM_EINVAL: without the expected csum, a later commit
- * would propagate a zero csum to the uberblock and wedge the pool
- * at the subsequent mount's tree-load Merkle check (R8-P1-2).
+ * on-disk root node's BLAKE3 self-csum over ciphertext is verified
+ * against it — the Merkle-chain link from the uberblock's
+ * `ub_alloc_root.bp_csum` into the tree (P4-1 / P4-3b). Passing
+ * NULL returns STM_EINVAL (R8-P1-2).
+ *
+ * P4-3b: the caller MUST have previously called
+ * `stm_alloc_set_crypt_ctx` with the pool's metadata_key +
+ * pool_uuid + device_uuid; otherwise STM_EINVAL. The load drives
+ * AEAD decryption of every node under that ctx.
  *
  * Returns STM_ECORRUPT on node read / csum / Merkle / ordering
- * failures, STM_ENOTSUPPORTED if the on-disk tree exceeds two
- * levels.
+ * failures, STM_EBADTAG on AEAD tag verification failure,
+ * STM_ENOTSUPPORTED if the on-disk tree exceeds two levels.
  */
 STM_MUST_USE
 stm_status stm_alloc_load_tree_at(stm_alloc *a, uint64_t root_paddr,
+                                    uint64_t root_gen,
                                     const uint8_t expected_root_csum[32]);
+
+/*
+ * Install the per-pool metadata-encryption key + UUIDs used for AEAD
+ * on every metadata-node write/read (P4-3b). `metadata_key` is
+ * borrowed (pointer retained — must stay valid for `a`'s lifetime).
+ * Safe to call before any commit / load; required before calling
+ * `stm_alloc_load_tree_at` or `stm_alloc_commit`.
+ *
+ * Production callers: `stm_sync_create` / `stm_sync_open` install
+ * this from the uberblock's ub_key_schema before the first commit /
+ * tree load.
+ */
+STM_MUST_USE
+stm_status stm_alloc_set_crypt_ctx(stm_alloc *a,
+                                     const uint8_t *metadata_key,
+                                     const uint64_t pool_uuid[2],
+                                     const uint64_t device_uuid[2]);
 
 /*
  * Return the paddr + BLAKE3-256 self-csum of the current allocator-

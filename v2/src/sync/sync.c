@@ -262,6 +262,18 @@ stm_status stm_sync_create(stm_bdev *d, stm_alloc *a,
      * Key rotation is P4-4's job. */
     stm_random_bytes(s->metadata_key, 32);
 
+    /* P4-3b: install the crypt ctx on the allocator so its next
+     * stm_alloc_commit encrypts every metadata node. Order matters:
+     * this must happen BEFORE the first commit. sync_create returns
+     * s without having committed yet — callers always commit through
+     * stm_sync_commit which drives stm_alloc_commit. */
+    stm_status cs = stm_alloc_set_crypt_ctx(a, s->metadata_key,
+                                              s->pool_uuid, s->device_uuid);
+    if (cs != STM_OK) {
+        stm_sync_close(s);
+        return cs;
+    }
+
     *out_sync = s;
     return STM_OK;
 }
@@ -313,6 +325,16 @@ stm_status stm_sync_open(stm_bdev *d, stm_alloc *a, stm_sync **out_sync)
      * it (ML-KEM-768 + X25519 hybrid) and the unwrap path moves here. */
     memcpy(s2->metadata_key,     ub.ub_key_schema,       32);
 
+    /* P4-3b: install the crypt ctx on the allocator so
+     * stm_alloc_load_tree_at below can decrypt nodes. MUST happen
+     * before load_tree_at. */
+    stm_status cs = stm_alloc_set_crypt_ctx(a, s2->metadata_key,
+                                              s2->pool_uuid, s2->device_uuid);
+    if (cs != STM_OK) {
+        stm_sync_close(s2);
+        return cs;
+    }
+
     /* P4-1: verify the on-disk ub_merkle_root is self-consistent
      * with the per-tree-root csums + salt recorded in the SAME
      * uberblock. An offline edit that swapped either the salt,
@@ -352,10 +374,11 @@ stm_status stm_sync_open(stm_bdev *d, stm_alloc *a, stm_sync **out_sync)
             stm_sync_close(s2);
             return STM_ECORRUPT;
         }
-        /* P4-1: pass the expected csum through so the tree loader
-         * verifies the root node's bytes against the value the
-         * uberblock commits to. */
-        stm_status ls = stm_alloc_load_tree_at(a, alloc_root,
+        /* P4-1 / P4-3b: pass the expected csum + durable_gen through
+         * so the tree loader verifies ciphertext BLAKE3 against
+         * ub_alloc_root.bp_csum and AEAD-decrypts every node under
+         * gen = ub_gen. */
+        stm_status ls = stm_alloc_load_tree_at(a, alloc_root, durable_gen,
                                                   ub.ub_alloc_root.bp_csum);
         if (ls != STM_OK) {
             stm_sync_close(s2);
@@ -371,6 +394,9 @@ stm_status stm_sync_open(stm_bdev *d, stm_alloc *a, stm_sync **out_sync)
 void stm_sync_close(stm_sync *s)
 {
     if (!s) return;
+    /* P4-3b: wipe key material before free. The alloc's copy is
+     * wiped independently in stm_alloc_close. */
+    stm_ct_memzero(s->metadata_key, sizeof s->metadata_key);
     pthread_mutex_destroy(&s->lock);
     free(s);
 }

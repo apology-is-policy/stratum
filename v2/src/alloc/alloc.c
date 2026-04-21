@@ -52,6 +52,7 @@
 #include <stratum/btnode.h>
 #include <stratum/btree.h>
 #include <stratum/btree_store.h>
+#include <stratum/crypto.h>
 #include <stratum/sdarray.h>
 #include <stratum/super.h>
 #include <stratum/xor_filter.h>
@@ -92,11 +93,30 @@ struct stm_alloc {
      * nodes on the next commit. */
     uint64_t        current_tree_root;
 
+    /* P4-3b: gen at which current_tree_root's nodes were serialized.
+     * Needed to reconstruct the AEAD nonce when free_tree-ing that
+     * subtree on the NEXT commit. Set by stm_alloc_load_tree_at to
+     * root_gen (= ub_gen at mount). Updated by stm_alloc_commit to
+     * the committed_gen after a successful serialize. Meaningless
+     * when current_tree_root == 0. */
+    uint64_t        current_tree_gen;
+
     /* P4-1: BLAKE3-256 self-csum of the root node at current_tree_root.
      * All-zero when current_tree_root == 0. Exposed via
      * stm_alloc_get_tree_root so sync_commit can put it into
      * ub_alloc_root.bp_csum and propagate into ub_merkle_root. */
     uint8_t         current_tree_csum[32];
+
+    /* P4-3b: per-pool metadata AEAD context. Installed by sync
+     * (stm_alloc_set_crypt_ctx) before the first commit / tree
+     * load. `crypt_key_present` guards stm_alloc_commit and
+     * stm_alloc_load_tree_at — both refuse to proceed without a
+     * configured key, so we fail fast rather than writing
+     * unencrypted metadata. */
+    uint8_t         crypt_key[32];
+    uint64_t        crypt_pool_uuid[2];
+    uint64_t        crypt_device_uuid[2];
+    bool            crypt_key_present;
 
     /* R7c P2-5: set by reserve/free/ref; cleared on commit. When
      * commit runs with !tree_dirty and a root already on disk, the
@@ -439,6 +459,10 @@ static stm_alloc *alloc_new(stm_bdev *d,
                              uint64_t data_first, uint64_t data_last,
                              stm_bootstrap *boot)
 {
+    /* P4-3b: ensure libsodium is initialized before any commit tries
+     * to encrypt. Idempotent — real cost is paid once per process. */
+    if (stm_crypto_init() != STM_OK) return NULL;
+
     stm_alloc *a = calloc(1, sizeof *a);
     if (!a) return NULL;
     a->bdev = d;
@@ -550,7 +574,36 @@ stm_status stm_alloc_open_blank(stm_bdev *d, stm_alloc **out_alloc)
     return open_handle_bare(d, out_alloc);
 }
 
+stm_status stm_alloc_set_crypt_ctx(stm_alloc *a,
+                                     const uint8_t *metadata_key,
+                                     const uint64_t pool_uuid[2],
+                                     const uint64_t device_uuid[2])
+{
+    if (!a || !metadata_key || !pool_uuid || !device_uuid) return STM_EINVAL;
+    pthread_mutex_lock(&a->lock);
+    memcpy(a->crypt_key,         metadata_key, 32);
+    memcpy(a->crypt_pool_uuid,   pool_uuid,    sizeof a->crypt_pool_uuid);
+    memcpy(a->crypt_device_uuid, device_uuid,  sizeof a->crypt_device_uuid);
+    a->crypt_key_present = true;
+    pthread_mutex_unlock(&a->lock);
+    return STM_OK;
+}
+
+/* Build a stm_btree_crypt_ctx pointing at this alloc's stashed
+ * key/uuids. Safe to call with the lock held; returned struct
+ * references memory internal to `a` — do not pass it across a
+ * stm_alloc_close boundary. Returns false if no key is installed. */
+static bool build_crypt_ctx_locked(const stm_alloc *a, stm_btree_crypt_ctx *out)
+{
+    if (!a->crypt_key_present) return false;
+    out->metadata_key = a->crypt_key;
+    memcpy(out->pool_uuid,   a->crypt_pool_uuid,   sizeof out->pool_uuid);
+    memcpy(out->device_uuid, a->crypt_device_uuid, sizeof out->device_uuid);
+    return true;
+}
+
 stm_status stm_alloc_load_tree_at(stm_alloc *a, uint64_t root_paddr,
+                                    uint64_t root_gen,
                                     const uint8_t expected_root_csum[32])
 {
     if (!a) return STM_EINVAL;
@@ -567,12 +620,18 @@ stm_status stm_alloc_load_tree_at(stm_alloc *a, uint64_t root_paddr,
     if (!expected_root_csum) return STM_EINVAL;
 
     pthread_mutex_lock(&a->lock);
+    stm_btree_crypt_ctx cx;
+    if (!build_crypt_ctx_locked(a, &cx)) {
+        pthread_mutex_unlock(&a->lock);
+        return STM_EINVAL;    /* no key installed — mandatory in v2 */
+    }
     store_ctx scx = { .boot = a->boot, .bdev = a->bdev };
-    stm_status s = stm_btree_store_deserialize(a->tree, root_paddr,
+    stm_status s = stm_btree_store_deserialize(a->tree, root_paddr, root_gen,
                                                  expected_root_csum,
-                                                 &ALLOC_STORE_VT, &scx);
+                                                 &ALLOC_STORE_VT, &scx, &cx);
     if (s == STM_OK) {
         a->current_tree_root = root_paddr;
+        a->current_tree_gen  = root_gen;
         memcpy(a->current_tree_csum, expected_root_csum, 32);
         /* A loaded tree is NOT dirty — on-disk matches RAM. */
         a->tree_dirty = false;
@@ -626,6 +685,10 @@ void stm_alloc_close(stm_alloc *a)
     accel_free(a);
     if (a->tree) stm_btree_mt_free(a->tree);
     if (a->boot) stm_bootstrap_close(a->boot);
+    /* P4-3b: wipe key material. stm_ct_memzero is the compiler-
+     * cannot-optimize-away variant; uuids are public so ordinary
+     * memset is fine. */
+    stm_ct_memzero(a->crypt_key, sizeof a->crypt_key);
     pthread_mutex_destroy(&a->lock);
     free(a);
 }
@@ -977,17 +1040,32 @@ stm_status stm_alloc_commit(stm_alloc *a, uint64_t committed_gen)
      * list), but we don't churn through free_tree + serialize +
      * user_data update for a quiescent tree. */
     uint64_t new_root = a->current_tree_root;
+    uint64_t new_gen  = a->current_tree_gen;
     uint8_t  new_csum[32];
     memcpy(new_csum, a->current_tree_csum, 32);
     bool     persist_tree = a->tree_dirty || a->current_tree_root == 0;
 
     if (persist_tree) {
+        /* P4-3b: encryption is mandatory. Refuse to proceed without a
+         * configured crypt ctx. stm_sync_create / stm_sync_open
+         * install it before the first commit; if we got here without
+         * it, sync was misused. */
+        stm_btree_crypt_ctx cx;
+        if (!build_crypt_ctx_locked(a, &cx)) {
+            pthread_mutex_unlock(&a->lock);
+            return STM_EINVAL;
+        }
+
         store_ctx scx = { .boot = a->boot, .bdev = a->bdev };
 
         if (a->current_tree_root != 0) {
+            /* P4-3b: free_tree needs the gen at which the OLD tree
+             * was encrypted (current_tree_gen), NOT committed_gen. */
             stm_status fs = stm_btree_store_free_tree(a->current_tree_root,
+                                                        a->current_tree_gen,
                                                         committed_gen,
-                                                        &ALLOC_STORE_VT, &scx);
+                                                        &ALLOC_STORE_VT, &scx,
+                                                        &cx);
             if (fs != STM_OK) {
                 pthread_mutex_unlock(&a->lock);
                 return fs;
@@ -997,11 +1075,13 @@ stm_status stm_alloc_commit(stm_alloc *a, uint64_t committed_gen)
         stm_status ss = stm_btree_store_serialize(a->tree, committed_gen,
                                                     /*tree_id=*/0,
                                                     &ALLOC_STORE_VT, &scx,
+                                                    &cx,
                                                     &new_root, new_csum);
         if (ss != STM_OK) {
             pthread_mutex_unlock(&a->lock);
             return ss;
         }
+        new_gen = committed_gen;
 
         /* R7d P0-1: we no longer write the tree root into the bootstrap
          * user_data slot. ub_alloc_root (set by stm_sync_commit) is the
@@ -1014,6 +1094,7 @@ stm_status stm_alloc_commit(stm_alloc *a, uint64_t committed_gen)
     stm_status s = stm_bootstrap_commit(a->boot, committed_gen);
     if (s == STM_OK) {
         a->current_tree_root = new_root;
+        a->current_tree_gen  = new_gen;
         memcpy(a->current_tree_csum, new_csum, 32);
         a->tree_dirty        = false;
     }

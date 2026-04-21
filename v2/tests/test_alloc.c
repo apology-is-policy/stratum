@@ -66,6 +66,16 @@ static stm_bdev *open_fresh_device(void)
     return d;
 }
 
+/* P4-3b: the alloc-level tests commit trees directly without going
+ * through stm_sync, so they must install a crypt ctx themselves (sync
+ * does this automatically for production callers). */
+static const uint8_t TEST_ALLOC_KEY[32] = {
+    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+    0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00,
+    0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
+    0x90, 0xa0, 0xb0, 0xc0, 0xd0, 0xe0, 0xf0, 0x01,
+};
+
 static stm_alloc *make_fresh_alloc(stm_bdev *d)
 {
     uint64_t pool_uuid[2]   = { 0xA1A1A1A1A1A1A1A1ULL, 0xB2B2B2B2B2B2B2B2ULL };
@@ -73,6 +83,8 @@ static stm_alloc *make_fresh_alloc(stm_bdev *d)
     stm_alloc *a = NULL;
     STM_ASSERT_OK(stm_alloc_create(d, pool_uuid, device_uuid,
                                     TEST_BOOTSTRAP_BYTES, &a));
+    STM_ASSERT_OK(stm_alloc_set_crypt_ctx(a, TEST_ALLOC_KEY,
+                                             pool_uuid, device_uuid));
     return a;
 }
 
@@ -455,9 +467,17 @@ STM_TEST(alloc_open_after_commit_is_blank) {
     STM_ASSERT_OK(stm_alloc_get_tree_root(a2, &got_root, NULL));
     STM_ASSERT_EQ(got_root, 0u);
 
-    /* Explicit load_tree_at WORKS with the known root + csum — shows
-     * that the data is actually there, just not auto-loaded. */
-    STM_ASSERT_OK(stm_alloc_load_tree_at(a2, root, root_csum));
+    /* P4-3b: re-install the crypt ctx on the fresh handle so
+     * load_tree_at can decrypt nodes the prior session wrote. */
+    uint64_t pool_uuid[2]   = { 0xA1A1A1A1A1A1A1A1ULL, 0xB2B2B2B2B2B2B2B2ULL };
+    uint64_t device_uuid[2] = { 0xC3C3C3C3C3C3C3C3ULL, 0xD4D4D4D4D4D4D4D4ULL };
+    STM_ASSERT_OK(stm_alloc_set_crypt_ctx(a2, TEST_ALLOC_KEY,
+                                             pool_uuid, device_uuid));
+
+    /* Explicit load_tree_at WORKS with the known root + csum + gen —
+     * shows that the data is actually there, just not auto-loaded.
+     * Gen = 1 (what the commit above stamped the tree with). */
+    STM_ASSERT_OK(stm_alloc_load_tree_at(a2, root, /*gen=*/ 1, root_csum));
     STM_ASSERT_OK(stm_alloc_stats_get(a2, &st));
     STM_ASSERT_EQ(st.n_allocated_ranges, 1u);
 

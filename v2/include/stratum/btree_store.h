@@ -40,6 +40,78 @@ extern "C" {
 struct stm_btree_mt; typedef struct stm_btree_mt stm_btree_mt;
 
 /* ========================================================================= */
+/* P4-3b: metadata-node AEAD wrapper.                                          */
+/* ========================================================================= */
+
+/*
+ * Crypt context threaded through serialize / deserialize so every
+ * metadata node is AEGIS-256 encrypted on write and authenticated on
+ * read. Mandatory in v2 — no unencrypted metadata path.
+ *
+ *   metadata_key  — 32-byte pool key generated at sync_create and
+ *                    persisted in ub_key_schema[0..32] (P4-3a). Borrowed.
+ *   pool_uuid     — bound into both the nonce (uniqueness across pools)
+ *                    and the AD (cross-pool replay rejection).
+ *   device_uuid   — bound into the AD so a node written to device X
+ *                    cannot be replayed at device Y (relevant once
+ *                    multi-device lands in Phase 5).
+ *
+ * On-disk layout of an encrypted metadata node (STM_BTNODE_SIZE bytes):
+ *
+ *   [0                                  .. STM_BTNODE_SIZE - 32)   ciphertext
+ *   [STM_BTNODE_SIZE - 32               .. STM_BTNODE_SIZE)        AEAD tag
+ *
+ * Parent bp_csum = BLAKE3(on-disk[0 .. STM_BTNODE_SIZE - 32)) —
+ * covers the ciphertext, not the tag. Byte tamper in ciphertext is
+ * caught by the Merkle chain; tag tamper is caught by AEAD decrypt.
+ */
+typedef struct {
+    const uint8_t *metadata_key;   /* 32 bytes, borrowed */
+    uint64_t       pool_uuid[2];
+    uint64_t       device_uuid[2];
+} stm_btree_crypt_ctx;
+
+/*
+ * Encrypt a freshly-encoded btnode image in place.
+ *
+ *   buf           — STM_BTNODE_SIZE bytes. Before call: plaintext
+ *                   btnode image produced by stm_btnode_*_encode
+ *                   (including the plaintext self-csum in the trailing
+ *                   32 bytes). After call on success: ciphertext in
+ *                   bytes [0 .. STM_BTNODE_SIZE - 32) and AEGIS-256 tag
+ *                   in the trailing 32 bytes. On failure: buf contents
+ *                   are undefined — the caller MUST NOT write it to disk.
+ *
+ * nonce construction (32 B): paddr (8 LE) ‖ gen (8 LE) ‖ pool_uuid (16 LE).
+ * AD    (32 B):               pool_uuid (16 LE) ‖ device_uuid (16 LE).
+ *
+ * Uniqueness of (paddr, gen) within a pool is guaranteed by sync.tla's
+ * MountGenBump (gen strictly increases on every commit) and
+ * stm_bootstrap's deferred-free (paddr not reused within a commit).
+ */
+STM_MUST_USE
+stm_status stm_btree_node_encrypt(const stm_btree_crypt_ctx *cx,
+                                    uint64_t paddr, uint64_t gen,
+                                    uint8_t *buf);
+
+/*
+ * Decrypt an on-disk btnode image in place.
+ *
+ *   buf           — STM_BTNODE_SIZE bytes. Before call: ciphertext in
+ *                   [0 .. STM_BTNODE_SIZE - 32) and AEAD tag in the
+ *                   trailing 32 bytes. After call on success: recovered
+ *                   plaintext (identical to what the encoder wrote,
+ *                   including the trailing 32-byte plaintext self-csum).
+ *
+ * Returns STM_EBADTAG on tag verification failure (tampered ciphertext,
+ * wrong key, wrong paddr/gen/pool/device uuid).
+ */
+STM_MUST_USE
+stm_status stm_btree_node_decrypt(const stm_btree_crypt_ctx *cx,
+                                    uint64_t paddr, uint64_t gen,
+                                    uint8_t *buf);
+
+/* ========================================================================= */
 /* I/O vtable.                                                                */
 /* ========================================================================= */
 
@@ -74,28 +146,35 @@ typedef struct {
  * Serialize `t` to a tree of nodes written via the vtable. Returns
  * `*out_root_paddr` on success — the root is either a leaf paddr (if
  * all entries fit in one leaf) or an internal paddr. Additionally
- * returns the root's BLAKE3-256 self-csum in `*out_root_csum` (32
- * bytes; P4-1 — Merkle chain root).
+ * returns the root's bp_csum in `*out_root_csum` — post-P4-3b this is
+ * BLAKE3(ciphertext[0..STM_BTNODE_SIZE - 32)) (32 bytes, the Merkle
+ * chain root).
  *
- * Internally, each internal node's child bptr entries now carry the
- * child's csum in the bp_csum field, so a Merkle chain runs from
- * `out_root_csum` down to every leaf.
+ * `cx` is REQUIRED (non-NULL). Every emitted node is AEGIS-256
+ * encrypted under `cx->metadata_key` with nonce = paddr‖gen‖pool_uuid
+ * and AD = pool_uuid‖device_uuid before being written via the vtable.
+ * Internal-node child bptr entries carry bp_csum = BLAKE3 of the
+ * child's ciphertext region, so a Merkle chain runs from
+ * `out_root_csum` down to every leaf over encrypted bytes.
  *
  * The emitted nodes carry `gen` in their headers for MVCC snapshot
  * routing and `tree_id` for multi-tree pools (use 0 when
- * meaningless).
+ * meaningless). `gen` is also fed into the AEAD nonce — callers must
+ * pass the SAME gen to `stm_btree_store_deserialize` at read time.
  *
  * Empty trees still emit exactly one empty leaf, so `*out_root_paddr`
  * + `*out_root_csum` are always valid on STM_OK.
  *
  * Returns STM_ENOSPC if the vtable's reserve runs out of space,
  * STM_ERANGE if a single entry is too large for a leaf,
- * STM_ENOTSUPPORTED if the tree would need more than two levels.
+ * STM_ENOTSUPPORTED if the tree would need more than two levels,
+ * STM_EINVAL if `cx` is NULL.
  */
 STM_MUST_USE
 stm_status stm_btree_store_serialize(
     stm_btree_mt *t, uint64_t gen, uint64_t tree_id,
     const stm_btree_store_vtable *vt, void *vt_ctx,
+    const stm_btree_crypt_ctx *cx,
     uint64_t *out_root_paddr, uint8_t out_root_csum[32]);
 
 /*
@@ -104,24 +183,31 @@ stm_status stm_btree_store_serialize(
  * empty. Existing entries in `t` are left intact; newly-read entries
  * upsert over matching keys (standard stm_btree insert semantics).
  *
- * If `expected_root_csum` is non-NULL, the root node's self-csum is
- * verified against those 32 bytes. For internal roots, the per-child
- * bp_csum from each child bptr is verified against the child node's
- * self-csum recursively — the full Merkle chain is checked (P4-1).
- * Pass NULL to skip verification (backward-compat for tests that
- * don't yet track csums; production callers should always supply).
+ * `cx` is REQUIRED (non-NULL) and must match the key/pool/device
+ * triple used at serialize time. `gen` must match the `gen` passed to
+ * the corresponding serialize call — it's bound into the AEAD nonce.
  *
- * Walks the root: if LEAF, inserts each entry. If INTERNAL, reads
- * each child recursively.
+ * `expected_root_csum` is REQUIRED (non-NULL) — Merkle-chain entry
+ * point. The root's BLAKE3-over-ciphertext is verified against it
+ * before AEAD decryption is attempted. For internal roots, each
+ * child bptr's bp_csum is verified against the child's ciphertext
+ * hash recursively. P4-1+P4-3b: the full Merkle chain runs over
+ * ciphertext.
  *
- * Returns STM_ECORRUPT if a node fails self-csum OR if the Merkle
- * chain doesn't match the expected csum at any level.
+ * Walks the root: verify bp_csum → AEAD-decrypt → if LEAF, insert
+ * each entry; if INTERNAL, recurse.
+ *
+ * Returns STM_ECORRUPT if the Merkle chain mismatches at any level,
+ * STM_EBADTAG if AEAD tag verification fails (tamper / wrong key /
+ * wrong gen / wrong pool_uuid / wrong device_uuid), STM_EINVAL if
+ * `cx` or `expected_root_csum` is NULL.
  */
 STM_MUST_USE
 stm_status stm_btree_store_deserialize(
-    stm_btree_mt *t, uint64_t root_paddr,
+    stm_btree_mt *t, uint64_t root_paddr, uint64_t gen,
     const uint8_t expected_root_csum[32],
-    const stm_btree_store_vtable *vt, void *vt_ctx);
+    const stm_btree_store_vtable *vt, void *vt_ctx,
+    const stm_btree_crypt_ctx *cx);
 
 /*
  * Walk the tree rooted at `root_paddr` and call vt->free on every
@@ -133,13 +219,20 @@ stm_status stm_btree_store_deserialize(
  * the old paddrs are dead once the new bootstrap commit records
  * the new root.
  *
+ * P4-3b: `root_gen` is the gen at which the tree being freed was
+ * serialized (NOT the current commit's free_gen). Needed to
+ * reconstruct the AEAD nonce for each node we must decrypt to
+ * enumerate child paddrs. `cx` is the matching crypt ctx (REQUIRED).
+ *
  * Returns STM_ECORRUPT if the tree nodes fail csum or violate the
- * two-level invariant.
+ * two-level invariant, STM_EBADTAG if AEAD decryption fails.
  */
 STM_MUST_USE
-stm_status stm_btree_store_free_tree(uint64_t root_paddr, uint64_t free_gen,
+stm_status stm_btree_store_free_tree(uint64_t root_paddr, uint64_t root_gen,
+                                      uint64_t free_gen,
                                       const stm_btree_store_vtable *vt,
-                                      void *vt_ctx);
+                                      void *vt_ctx,
+                                      const stm_btree_crypt_ctx *cx);
 
 #ifdef __cplusplus
 }

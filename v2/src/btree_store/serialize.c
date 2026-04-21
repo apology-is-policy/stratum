@@ -35,10 +35,17 @@
 #include <stratum/btree.h>
 #include <stratum/btnode.h>
 #include <stratum/btree_store.h>
+#include <stratum/hash.h>
 #include <stratum/super.h>
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* P4-3b: size of the ciphertext region in an encrypted node image.
+ * The trailing STM_BTNODE_CSUM_SIZE bytes hold the AEAD tag; bp_csum
+ * covers ONLY the ciphertext region, not the tag. */
+#define CT_LEN (STM_BTNODE_SIZE - STM_BTNODE_CSUM_SIZE)
 
 /* ========================================================================= */
 /* Collector: walk the in-RAM tree via scan, store entries in an              */
@@ -203,24 +210,38 @@ static void decode_child_bptr(const uint8_t in[STM_BTNODE_CHILD_BPTR_SIZE],
     if (out_csum) memcpy(out_csum, bp.bp_csum, 32);
 }
 
-/* Extract a node's self-csum from a freshly-encoded buffer. The csum
- * lives in the trailing 32 bytes of the node image. */
-static inline void node_csum_from_buf(const uint8_t *buf, uint8_t out[32])
+/* P4-3b: Compute bp_csum for an on-disk encrypted node image —
+ * BLAKE3 over the ciphertext region (first CT_LEN bytes). The AEAD
+ * tag in the trailing STM_BTNODE_CSUM_SIZE bytes is NOT included;
+ * tag integrity is provided by the AEAD decrypt path, not the Merkle
+ * chain. */
+static inline void compute_bp_csum(const uint8_t *buf, uint8_t out[32])
 {
-    memcpy(out, buf + (STM_BTNODE_SIZE - STM_BTNODE_CSUM_SIZE), 32);
+    stm_blake3_hash h;
+    stm_blake3(buf, CT_LEN, &h);
+    memcpy(out, h.bytes, 32);
 }
 
 /* ========================================================================= */
 /* Leaf emission.                                                             */
 /* ========================================================================= */
 
-/* Emit one leaf: encode bytes → reserve paddr via vt → write → record
- * paddr and the first-key-in-this-leaf (needed for the internal's
- * pivots). On the first leaf, first_key is left NULL (it's the "below
- * every pivot" child). */
+/* Emit one leaf: encode plaintext → reserve paddr → AEAD-encrypt in
+ * place → compute bp_csum over ciphertext → write.
+ *
+ * P4-3b ordering: reserve MUST precede encrypt so the paddr is known
+ * and can be bound into the AEAD nonce. bp_csum MUST be computed
+ * AFTER encryption (it hashes the ciphertext).
+ *
+ * On encryption failure the scratch buffer is in undefined state; we
+ * don't call vt->write, so no tampered image reaches disk. The paddr
+ * was already reserved — it becomes a burned paddr for this commit,
+ * reclaimed on the NEXT commit's sweep if the caller reports the
+ * failure upward (stm_alloc_commit unwinds on any error). */
 static stm_status emit_leaf(const coll_entry *entries, size_t lo, size_t hi,
                               uint64_t gen, uint64_t tree_id,
                               const stm_btree_store_vtable *vt, void *ctx,
+                              const stm_btree_crypt_ctx *cx,
                               uint8_t *scratch,
                               uint64_t *out_paddr,
                               uint8_t out_csum[32])
@@ -244,12 +265,13 @@ static stm_status emit_leaf(const coll_entry *entries, size_t lo, size_t hi,
     free(nodes);
     if (s != STM_OK) return s;
 
-    /* Capture the csum BEFORE writing so caller doesn't need another
-     * read. Encoding deterministically fills bytes [131040, 131072). */
-    node_csum_from_buf(scratch, out_csum);
-
     s = vt->reserve(ctx, out_paddr);
     if (s != STM_OK) return s;
+
+    s = stm_btree_node_encrypt(cx, *out_paddr, gen, scratch);
+    if (s != STM_OK) return s;
+
+    compute_bp_csum(scratch, out_csum);
 
     return vt->write(ctx, *out_paddr, scratch, STM_BTNODE_SIZE);
 }
@@ -262,6 +284,7 @@ static stm_status emit_internal(const stm_btnode_pivot *pivots, uint32_t np,
                                   const uint8_t *children, size_t children_len,
                                   uint64_t gen, uint64_t tree_id,
                                   const stm_btree_store_vtable *vt, void *ctx,
+                                  const stm_btree_crypt_ctx *cx,
                                   uint8_t *scratch,
                                   uint64_t *out_paddr,
                                   uint8_t out_csum[32])
@@ -272,10 +295,13 @@ static stm_status emit_internal(const stm_btnode_pivot *pivots, uint32_t np,
                                                 scratch, STM_BTNODE_SIZE);
     if (s != STM_OK) return s;
 
-    node_csum_from_buf(scratch, out_csum);
-
     s = vt->reserve(ctx, out_paddr);
     if (s != STM_OK) return s;
+
+    s = stm_btree_node_encrypt(cx, *out_paddr, gen, scratch);
+    if (s != STM_OK) return s;
+
+    compute_bp_csum(scratch, out_csum);
 
     return vt->write(ctx, *out_paddr, scratch, STM_BTNODE_SIZE);
 }
@@ -288,11 +314,16 @@ stm_status stm_btree_store_serialize(stm_btree_mt *t,
                                        uint64_t gen, uint64_t tree_id,
                                        const stm_btree_store_vtable *vt,
                                        void *vt_ctx,
+                                       const stm_btree_crypt_ctx *cx,
                                        uint64_t *out_root_paddr,
                                        uint8_t  out_root_csum[32])
 {
     if (!t || !vt || !out_root_paddr || !out_root_csum) return STM_EINVAL;
     if (!vt->reserve || !vt->write)   return STM_EINVAL;
+    /* P4-3b: encryption is mandatory. A NULL cx would cause the
+     * encrypt helper to return STM_EINVAL anyway, but checking up
+     * front gives a single crisp error point. */
+    if (!cx || !cx->metadata_key) return STM_EINVAL;
 
     /* Scratch buffer used for both leaf and internal encode. */
     uint8_t *scratch = malloc(STM_BTNODE_SIZE);
@@ -324,7 +355,7 @@ stm_status stm_btree_store_serialize(stm_btree_mt *t,
 
     for (size_t i = 0; i < n_leaves; i++) {
         s = emit_leaf(coll.entries, starts[i], starts[i + 1],
-                      gen, tree_id, vt, vt_ctx,
+                      gen, tree_id, vt, vt_ctx, cx,
                       scratch, &leaf_paddrs[i], &leaf_csums[i * 32]);
         if (s != STM_OK) goto cleanup;
     }
@@ -371,7 +402,7 @@ stm_status stm_btree_store_serialize(stm_btree_mt *t,
     uint64_t root_paddr = 0;
     s = emit_internal(pivots, n_pivots,
                       children, (size_t)n_leaves * STM_BTNODE_CHILD_BPTR_SIZE,
-                      gen, tree_id, vt, vt_ctx,
+                      gen, tree_id, vt, vt_ctx, cx,
                       scratch, &root_paddr, out_root_csum);
     free(pivots);
     free(children);
@@ -489,30 +520,72 @@ static int child_record_cb(const uint8_t bptr[STM_BTNODE_CHILD_BPTR_SIZE],
     return 0;
 }
 
-/* R8-P2-3: verifies the Merkle LINK — the node's trailing 32 bytes
- * equal the expected value recorded in a parent bptr / uberblock.
- * It does NOT re-hash the node bytes; that job belongs to
- * btnode_verify_csum inside stm_btnode_{leaf,internal}_decode, which
- * stm_btnode_peek chains into. Both checks are needed: node-self-csum
- * catches bit rot, and check_merkle_link catches an attacker
- * substituting a well-formed alternative node at the victim paddr. */
+/* P4-3b: verifies the Merkle LINK by computing BLAKE3 over the
+ * ciphertext region and comparing against the parent bptr /
+ * uberblock's recorded bp_csum.
+ *
+ * Pre-P4-3b this function compared the trailing 32 bytes of the node
+ * against `expected`; that worked because the trailing bytes held the
+ * plaintext BLAKE3 self-csum. Post-P4-3b those bytes hold the AEAD
+ * tag — a separate integrity primitive — so we hash the ciphertext
+ * region explicitly.
+ *
+ * Running BEFORE AEAD decryption means a byte flip in the ciphertext
+ * is caught here at the Merkle layer before consuming AEAD decrypt's
+ * (constant-cost but still wasted) work. Tampered tag alone is
+ * caught by AEAD decrypt downstream.
+ *
+ * R8-P2-3 rationale still holds: self-csum (now = Merkle csum =
+ * BLAKE3 of ciphertext) catches bit rot; Merkle match catches
+ * substitution of a well-formed alternative node at the victim
+ * paddr. AEAD adds a third layer — even a substituted well-formed
+ * node matching `expected` under the same key won't match the AEAD
+ * tag unless the attacker also has the key. */
 static inline stm_status check_merkle_link(const uint8_t *buf,
                                              const uint8_t expected[32])
 {
     if (!expected) return STM_OK;
     uint8_t actual[32];
-    node_csum_from_buf(buf, actual);
+    compute_bp_csum(buf, actual);
     if (memcmp(actual, expected, 32) != 0) return STM_ECORRUPT;
     return STM_OK;
 }
 
+/* After stm_btree_node_decrypt, buf[0..CT_LEN) is plaintext but
+ * buf[CT_LEN..SIZE) still holds the AEAD tag (decrypt only writes
+ * the first CT_LEN bytes). btnode_verify_csum — called from every
+ * leaf/internal decode path — expects the trailing 32 bytes to be
+ * the plaintext self-csum (BLAKE3 over the first CT_LEN bytes with
+ * those last 32 zeroed). We recompute and write it so the
+ * downstream decoders pass their self-csum check.
+ *
+ * Redundant with AEAD+Merkle (both already verify integrity of the
+ * plaintext-we-are-about-to-trust), but avoids touching btnode.c —
+ * keeps self-csum semantics single-sourced in btnode. */
+static void restore_plaintext_self_csum(uint8_t *buf)
+{
+    uint8_t saved[32];
+    memcpy(saved, buf + CT_LEN, 32);
+    memset(buf + CT_LEN, 0, 32);
+
+    stm_blake3_hash h;
+    stm_blake3(buf, CT_LEN, &h);
+    memcpy(buf + CT_LEN, h.bytes, 32);
+    (void)saved;   /* AEAD tag no longer needed; we won't re-encrypt */
+}
+
 stm_status stm_btree_store_deserialize(stm_btree_mt *t, uint64_t root_paddr,
+                                         uint64_t gen,
                                          const uint8_t expected_root_csum[32],
                                          const stm_btree_store_vtable *vt,
-                                         void *vt_ctx)
+                                         void *vt_ctx,
+                                         const stm_btree_crypt_ctx *cx)
 {
-    if (!t || !vt)                   return STM_EINVAL;
-    if (!vt->read)                   return STM_EINVAL;
+    if (!t || !vt)                          return STM_EINVAL;
+    if (!vt->read)                          return STM_EINVAL;
+    if (!expected_root_csum)                return STM_EINVAL;
+    /* P4-3b: decryption is mandatory. Symmetric to serialize's check. */
+    if (!cx || !cx->metadata_key)           return STM_EINVAL;
 
     uint8_t *buf = malloc(STM_BTNODE_SIZE);
     if (!buf) return STM_ENOMEM;
@@ -521,15 +594,23 @@ stm_status stm_btree_store_deserialize(stm_btree_mt *t, uint64_t root_paddr,
     stm_status s = vt->read(vt_ctx, root_paddr, buf, STM_BTNODE_SIZE);
     if (s != STM_OK) { free(buf); return s; }
 
-    /* P4-1 Merkle gate: root self-csum must match what the caller
-     * expected (i.e., what ub_alloc_root.bp_csum held). The
-     * stm_btnode_peek below validates the trailing csum against the
-     * node's OWN bytes, but not against the expected outer value.
-     * Both checks are needed: self-csum catches tampering of the
-     * on-disk node bytes, Merkle-match catches substitution of a
-     * well-formed stale or attacker-controlled node. */
+    /* P4-1 + P4-3b Merkle gate: recompute BLAKE3 over the ciphertext
+     * region and compare against the caller's expected value (from
+     * ub_alloc_root.bp_csum or a parent internal's bptr).
+     * Both checks are needed: Merkle-match catches substitution of a
+     * well-formed stale or attacker-controlled node (and detects byte
+     * tamper before we bother calling AEAD). AEAD decrypt below
+     * catches the rarer case where attacker somehow produced a
+     * matching BLAKE3 with a tampered AEAD tag — not possible without
+     * the metadata key, but defense-in-depth. */
     s = check_merkle_link(buf, expected_root_csum);
     if (s != STM_OK) { free(buf); return s; }
+
+    /* P4-3b: decrypt in place. A tag-verify failure aborts with
+     * STM_EBADTAG — surfaced to the caller as a read failure. */
+    s = stm_btree_node_decrypt(cx, root_paddr, gen, buf);
+    if (s != STM_OK) { free(buf); return s; }
+    restore_plaintext_self_csum(buf);
 
     stm_btnode_info info;
     s = stm_btnode_peek(buf, STM_BTNODE_SIZE, &info);
@@ -569,7 +650,11 @@ stm_status stm_btree_store_deserialize(stm_btree_mt *t, uint64_t root_paddr,
     /* Read each child and deserialize as a leaf. A single insert_ctx
      * threads across all leaves so the sort-order check (R7c P2-6)
      * catches out-of-order keys straddling two leaves as well as
-     * in-leaf duplicates. */
+     * in-leaf duplicates.
+     *
+     * Each child is verified (Merkle) + decrypted (AEAD) under the
+     * SAME `gen` that was threaded into this call — the serialize
+     * path stamps every node in the tree with the commit's gen. */
     uint8_t *leafbuf = malloc(STM_BTNODE_SIZE);
     if (!leafbuf) {
         free(cc.child_paddrs); free(cc.child_kinds); free(cc.child_csums);
@@ -583,10 +668,14 @@ stm_status stm_btree_store_deserialize(stm_btree_mt *t, uint64_t root_paddr,
         }
         s = vt->read(vt_ctx, cc.child_paddrs[i], leafbuf, STM_BTNODE_SIZE);
         if (s != STM_OK) break;
-        /* Merkle check: each child's self-csum must match the parent
-         * internal node's bp_csum record. */
+        /* Merkle check: each child's bp_csum (over ciphertext) must
+         * match the parent internal node's recorded bp_csum. */
         s = check_merkle_link(leafbuf, &cc.child_csums[i * 32]);
         if (s != STM_OK) break;
+        /* AEAD decrypt each leaf under the child's paddr + shared gen. */
+        s = stm_btree_node_decrypt(cx, cc.child_paddrs[i], gen, leafbuf);
+        if (s != STM_OK) break;
+        restore_plaintext_self_csum(leafbuf);
         s = deserialize_leaf(t, leafbuf, &ic);
         if (s != STM_OK) break;
     }
@@ -603,18 +692,31 @@ stm_status stm_btree_store_deserialize(stm_btree_mt *t, uint64_t root_paddr,
 /* Public: free_tree (reclaim previous snapshot's nodes).                     */
 /* ========================================================================= */
 
-stm_status stm_btree_store_free_tree(uint64_t root_paddr, uint64_t free_gen,
+stm_status stm_btree_store_free_tree(uint64_t root_paddr, uint64_t root_gen,
+                                       uint64_t free_gen,
                                        const stm_btree_store_vtable *vt,
-                                       void *vt_ctx)
+                                       void *vt_ctx,
+                                       const stm_btree_crypt_ctx *cx)
 {
     if (!vt) return STM_EINVAL;
     if (!vt->read || !vt->free) return STM_EINVAL;
+    /* P4-3b: must decrypt internal nodes to enumerate their children. */
+    if (!cx || !cx->metadata_key) return STM_EINVAL;
 
     uint8_t *buf = malloc(STM_BTNODE_SIZE);
     if (!buf) return STM_ENOMEM;
 
     stm_status s = vt->read(vt_ctx, root_paddr, buf, STM_BTNODE_SIZE);
     if (s != STM_OK) { free(buf); return s; }
+
+    /* P4-3b: decrypt before stm_btnode_peek. On a tampered or
+     * wrong-gen node, AEAD decrypt returns STM_EBADTAG and we abort
+     * without enumerating children; those bytes on disk remain
+     * allocated and will leak (bounded by the tampered subtree)
+     * rather than being freed silently under corrupt data. */
+    s = stm_btree_node_decrypt(cx, root_paddr, root_gen, buf);
+    if (s != STM_OK) { free(buf); return s; }
+    restore_plaintext_self_csum(buf);
 
     stm_btnode_info info;
     s = stm_btnode_peek(buf, STM_BTNODE_SIZE, &info);
