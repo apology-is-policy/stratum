@@ -36,6 +36,7 @@
 #include <stratum/alloc.h>
 #include <stratum/block.h>
 #include <stratum/bootstrap.h>
+#include <stratum/janus.h>
 #include <stratum/keyfile.h>
 #include <stratum/super.h>
 #include <stratum/sync.h>
@@ -207,28 +208,52 @@ stm_status stm_fs_mount(const char *path,
                          stm_fs **out_fs)
 {
     if (!path || !opts || !out_fs) return STM_EINVAL;
-    if (!opts->keyfile_path) return STM_EINVAL;
 
-    stm_hybrid_keys wk;
-    stm_status ks = stm_keyfile_load(opts->keyfile_path, &wk);
-    if (ks != STM_OK) return ks;
+    /* P4-4b: exactly one key source. */
+    int have_kf = opts->keyfile_path != NULL;
+    int have_jn = opts->janus_socket != NULL;
+    if (have_kf == have_jn) return STM_EINVAL;
+
+    stm_hybrid_keys   wk = {0};
+    stm_janus_client *janus = NULL;
+
+    if (have_kf) {
+        stm_status ks = stm_keyfile_load(opts->keyfile_path, &wk);
+        if (ks != STM_OK) return ks;
+    } else {
+        stm_status js = stm_janus_client_connect(opts->janus_socket, &janus);
+        if (js != STM_OK) return js;
+    }
 
     stm_bdev_open_opts bopts = stm_bdev_open_opts_default();
     bopts.read_only = opts->read_only;
     stm_bdev *d = NULL;
     stm_status s = stm_bdev_open(path, &bopts, &d);
-    if (s != STM_OK) { stm_hybrid_keys_wipe(&wk); return s; }
+    if (s != STM_OK) {
+        stm_hybrid_keys_wipe(&wk);
+        if (janus) stm_janus_client_disconnect(janus);
+        return s;
+    }
 
     stm_alloc *a = NULL;
     s = stm_alloc_open_blank(d, &a);
-    if (s != STM_OK) { stm_bdev_close(d); stm_hybrid_keys_wipe(&wk); return s; }
+    if (s != STM_OK) {
+        stm_bdev_close(d);
+        stm_hybrid_keys_wipe(&wk);
+        if (janus) stm_janus_client_disconnect(janus);
+        return s;
+    }
 
     stm_sync *sync = NULL;
-    s = stm_sync_open(d, a, &wk, &sync);
+    s = stm_sync_open(d, a,
+                        have_kf ? &wk : NULL,
+                        have_jn ? janus : NULL,
+                        &sync);
     if (s != STM_OK) {
         stm_alloc_close(a);
         stm_bdev_close(d);
         stm_hybrid_keys_wipe(&wk);
+        if (janus) stm_janus_client_disconnect(janus);
         return s;
     }
 
@@ -238,11 +263,16 @@ stm_status stm_fs_mount(const char *path,
         stm_alloc_close(a);
         stm_bdev_close(d);
         stm_hybrid_keys_wipe(&wk);
+        if (janus) stm_janus_client_disconnect(janus);
         return STM_ENOMEM;
     }
 
     *out_fs = fs;
+    /* The raw DEK is already installed in the allocator's crypt ctx —
+     * the client is no longer needed. Disconnect after sync_open; the
+     * keyfile's hybrid_sk is also wiped now that unwrap is done. */
     stm_hybrid_keys_wipe(&wk);
+    if (janus) stm_janus_client_disconnect(janus);
     return STM_OK;
 }
 

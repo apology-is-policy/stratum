@@ -103,7 +103,7 @@ STM_TEST(sync_fresh_create_has_no_uberblock) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_ERR(stm_sync_open(d, a2, make_wk(), &s2), STM_ENOENT);
+    STM_ASSERT_ERR(stm_sync_open(d, a2, make_wk(), NULL, &s2), STM_ENOENT);
     stm_alloc_close(a2);
 
     stm_bdev_close(d);
@@ -157,7 +157,7 @@ STM_TEST(sync_mount_gen_bump) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_OK(stm_sync_open(d, a2, make_wk(), &s2));
+    STM_ASSERT_OK(stm_sync_open(d, a2, make_wk(), NULL, &s2));
 
     stm_sync_info info;
     STM_ASSERT_OK(stm_sync_info_get(s2, &info));
@@ -195,7 +195,7 @@ STM_TEST(sync_alloc_state_survives_mount) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_OK(stm_sync_open(d, a2, make_wk(), &s2));
+    STM_ASSERT_OK(stm_sync_open(d, a2, make_wk(), NULL, &s2));
 
     stm_alloc_stats ast;
     STM_ASSERT_OK(stm_alloc_stats_get(a2, &ast));
@@ -300,7 +300,7 @@ STM_TEST(sync_commit_empty_pool_produces_ub_alloc_root) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(d2, &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_OK(stm_sync_open(d2, a2, make_wk(), &s2));
+    STM_ASSERT_OK(stm_sync_open(d2, a2, make_wk(), NULL, &s2));
 
     stm_alloc_stats ast;
     STM_ASSERT_OK(stm_alloc_stats_get(a2, &ast));
@@ -331,7 +331,7 @@ STM_TEST(sync_reserve_across_mount_avoids_overlap) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_OK(stm_sync_open(d, a2, make_wk(), &s2));
+    STM_ASSERT_OK(stm_sync_open(d, a2, make_wk(), NULL, &s2));
 
     uint64_t p2 = 0;
     STM_ASSERT_OK(stm_alloc_reserve(a2, 32u, 0, &p2));
@@ -431,7 +431,7 @@ STM_TEST(sync_remount_verifies_merkle_root) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(d2, &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_OK(stm_sync_open(d2, a2, make_wk(), &s2));
+    STM_ASSERT_OK(stm_sync_open(d2, a2, make_wk(), NULL, &s2));
 
     teardown(a2, s2);
     stm_bdev_close(d2);
@@ -511,7 +511,7 @@ STM_TEST(sync_tamper_substitutes_well_formed_node) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(d2, &a2));
     stm_sync *s2 = NULL;
-    stm_status ms = stm_sync_open(d2, a2, make_wk(), &s2);
+    stm_status ms = stm_sync_open(d2, a2, make_wk(), NULL, &s2);
     STM_ASSERT_ERR(ms, STM_ECORRUPT);
     STM_ASSERT(s2 == NULL);
 
@@ -563,7 +563,7 @@ STM_TEST(sync_tamper_tree_node_surfaces_on_mount) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(d2, &a2));
     stm_sync *s2 = NULL;
-    stm_status ms = stm_sync_open(d2, a2, make_wk(), &s2);
+    stm_status ms = stm_sync_open(d2, a2, make_wk(), NULL, &s2);
     STM_ASSERT_ERR(ms, STM_ECORRUPT);
     STM_ASSERT(s2 == NULL);
 
@@ -638,7 +638,7 @@ STM_TEST(sync_no_plaintext_key_on_disk) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(d2, &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_OK(stm_sync_open(d2, a2, make_wk(), &s2));
+    STM_ASSERT_OK(stm_sync_open(d2, a2, make_wk(), NULL, &s2));
 
     STM_ASSERT_OK(stm_sync_commit(s2));
     teardown(a2, s2);
@@ -678,7 +678,7 @@ STM_TEST(sync_wrong_keyfile_rejected) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(d2, &a2));
     stm_sync *s2 = NULL;
-    stm_status ms = stm_sync_open(d2, a2, &other, &s2);
+    stm_status ms = stm_sync_open(d2, a2, &other, NULL, &s2);
     STM_ASSERT(ms != STM_OK);
     STM_ASSERT(s2 == NULL);
 
@@ -709,7 +709,7 @@ STM_TEST(sync_mount_claim_advances_durable_gen) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_OK(stm_sync_open(d, a2, make_wk(), &s2));
+    STM_ASSERT_OK(stm_sync_open(d, a2, make_wk(), NULL, &s2));
     stm_sync_info info;
     STM_ASSERT_OK(stm_sync_info_get(s2, &info));
     STM_ASSERT_EQ(info.mount_max_durable_gen, 1u);
@@ -723,7 +723,7 @@ STM_TEST(sync_mount_claim_advances_durable_gen) {
     stm_alloc *a3 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a3));
     stm_sync *s3 = NULL;
-    STM_ASSERT_OK(stm_sync_open(d, a3, make_wk(), &s3));
+    STM_ASSERT_OK(stm_sync_open(d, a3, make_wk(), NULL, &s3));
     STM_ASSERT_OK(stm_sync_info_get(s3, &info));
     STM_ASSERT_EQ(info.mount_max_durable_gen, 2u);
     STM_ASSERT_EQ(info.current_gen,           4u);

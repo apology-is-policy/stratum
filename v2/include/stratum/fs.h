@@ -114,9 +114,15 @@ typedef struct {
      * tools. */
     bool read_only;
 
-    /* P4-4a: same keyfile as format time; used to unwrap the pool's
-     * metadata key during mount. MUST be set. */
+    /* P4-4a legacy: keyfile with the hybrid wrap keypair. Used for
+     * in-process unwrap. Mutually exclusive with `janus_socket`. */
     const char *keyfile_path;
+
+    /* P4-4b: route the unwrap to a running janus daemon. The FS-side
+     * client connects to this Unix socket and requests the unwrap;
+     * the raw DEK arrives over 9P. Mutually exclusive with
+     * `keyfile_path` — exactly one must be set. */
+    const char *janus_socket;
 } stm_fs_mount_opts;
 
 /*

@@ -172,6 +172,8 @@ add_subdirectory(src/btree_store)
 add_subdirectory(src/alloc)
 add_subdirectory(src/keyfile)
 add_subdirectory(src/keyschema)
+add_subdirectory(src/p9)
+add_subdirectory(src/janus)
 add_subdirectory(src/sync)
 add_subdirectory(src/fs)
 add_subdirectory(src/extent)
@@ -196,6 +198,8 @@ target_link_libraries(stratum INTERFACE
     stm_xor_filter
     stm_keyfile
     stm_keyschema
+    stm_p9
+    stm_janus
     stm_sync
     stm_fs
     stm_extent)

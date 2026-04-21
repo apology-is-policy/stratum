@@ -56,6 +56,8 @@ stm_add_test(test_sdarray    test_sdarray.c)
 stm_add_test(test_xor_filter test_xor_filter.c)
 stm_add_test(test_crash_inject test_crash_inject.c)
 stm_add_test(test_extent     test_extent.c)
+stm_add_test(test_p9         test_p9.c)
+stm_add_test(test_janus      test_janus.c)
 
 # The crash-injection fuzzer runs ~168 independent format+mount+unmount
 # cycles and takes ~25 s on default, ~42 s under ASan/TSan. Bump the

@@ -45,9 +45,10 @@
 extern "C" {
 #endif
 
-struct stm_bdev;        typedef struct stm_bdev  stm_bdev;
-struct stm_alloc;       typedef struct stm_alloc stm_alloc;
-struct stm_hybrid_keys; typedef struct stm_hybrid_keys stm_hybrid_keys;
+struct stm_bdev;         typedef struct stm_bdev  stm_bdev;
+struct stm_alloc;        typedef struct stm_alloc stm_alloc;
+struct stm_hybrid_keys;  typedef struct stm_hybrid_keys stm_hybrid_keys;
+struct stm_janus_client;
 
 /* ========================================================================= */
 /* Opaque handle + info.                                                      */
@@ -119,9 +120,15 @@ stm_status stm_sync_create(stm_bdev *d, stm_alloc *a,
  * failure was in stm_alloc_load_tree_at); callers should discard
  * the handle via stm_alloc_close and not reuse it.
  */
+/*
+ * P4-4b: `wk` and `janus` are mutually exclusive — exactly one must
+ * be non-NULL. `wk` uses the in-process unwrap path (keyfile / legacy);
+ * `janus` routes the unwrap over the 9P socket to a remote daemon.
+ */
 STM_MUST_USE
 stm_status stm_sync_open(stm_bdev *d, stm_alloc *a,
                           const stm_hybrid_keys *wk,
+                          struct stm_janus_client *janus,
                           stm_sync **out_sync);
 
 /*

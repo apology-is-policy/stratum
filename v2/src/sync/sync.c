@@ -35,6 +35,7 @@
 #include <stratum/block.h>
 #include <stratum/crypto.h>
 #include <stratum/hash.h>
+#include <stratum/janus.h>
 #include <stratum/keyfile.h>
 #include <stratum/keyschema.h>
 #include <stratum/super.h>
@@ -399,11 +400,12 @@ stm_status stm_sync_create(stm_bdev *d, stm_alloc *a,
 
 stm_status stm_sync_open(stm_bdev *d, stm_alloc *a,
                           const stm_hybrid_keys *wk,
+                          struct stm_janus_client *janus,
                           stm_sync **out_sync)
 {
     if (!d || !a || !out_sync) return STM_EINVAL;
-    /* P4-4a: unwrap the pool key via wk->sk. Mandatory. */
-    if (!wk) return STM_EINVAL;
+    /* P4-4a/P4-4b: key source is mandatory, exactly one. */
+    if ((!wk && !janus) || (wk && janus)) return STM_EINVAL;
 
     /* R9 P1-1: make sure libsodium is up before any crypto op. */
     stm_status ci = stm_crypto_init();
@@ -526,10 +528,29 @@ stm_status stm_sync_open(stm_bdev *d, stm_alloc *a,
                     STM_SYNC_POOL_DATASET_ID, found_key_id,
                     unwrap_ad);
     size_t dek_out_len = 0;
-    stm_status us = stm_hybrid_unwrap(wk->sk,
-                                        unwrap_ad, sizeof unwrap_ad,
+    stm_status us;
+    if (wk) {
+        us = stm_hybrid_unwrap(wk->sk,
+                                 unwrap_ad, sizeof unwrap_ad,
+                                 wrapped, wrapped_len,
+                                 s2->metadata_key, &dek_out_len);
+    } else {
+        /* The janus client rebuilds the same AD as build_wrap_ad from
+         * (pool_uuid, dataset_id, key_id); the first 16 bytes of that
+         * AD are exactly the concatenation of two LE-packed u64s we
+         * keep in s2->pool_uuid. */
+        uint8_t pool_uuid_bytes[16];
+        memcpy(pool_uuid_bytes,     unwrap_ad,     16);
+        size_t dek_len_io = sizeof s2->metadata_key;
+        us = stm_janus_client_unwrap(janus,
+                                        pool_uuid_bytes,
+                                        STM_SYNC_POOL_DATASET_ID,
+                                        found_key_id,
                                         wrapped, wrapped_len,
-                                        s2->metadata_key, &dek_out_len);
+                                        s2->metadata_key, &dek_len_io);
+        stm_ct_memzero(pool_uuid_bytes, sizeof pool_uuid_bytes);
+        if (us == STM_OK) dek_out_len = dek_len_io;
+    }
     stm_ct_memzero(wrapped, sizeof wrapped);
     if (us != STM_OK) {
         stm_sync_close(s2);
