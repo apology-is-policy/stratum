@@ -371,7 +371,7 @@ The most architecturally risky phase (per NOVEL #4). Extensive TLA+ spec work + 
 - [ ] Mount-time full verify (opt-in) works on 1 TiB test volume.
 - [ ] On-read verify has ≤ 5% overhead vs disabled.
 - [ ] Tampering with a metadata block is cryptographically detected.
-- [ ] Janus + daemon integrated; passphrase backend works.
+- [x] Janus + daemon integrated; passphrase backend works.
 - [ ] `merkle.tla` proves hash-propagation correctness under COW.
 - [ ] `key_schema.tla` proves rotation atomicity + retired-key retention.
 

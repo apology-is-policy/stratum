@@ -22,6 +22,7 @@ integrity), then encryption (AEAD data extents + AEAD metadata nodes
 | `ca8d47b` | **R9 audit fixes**. P0-1: mount-claim UB closes the nonce-reuse-across-crash-recovery hazard. New `ub_alloc_root_gen` field preserves the AEAD nonce on the tree when a mount advances ub_gen without rewriting the tree. Format bump STM_UB_VERSION 2→3. P1-1: `stm_crypto_init` at top of sync_create/open. P1-2: `stm_btree_store_free_tree` now takes `expected_root_csum` and Merkle-verifies before AEAD decrypt. P2-1: `stm_btree_store_serialize` rolls back reserved paddrs on emit failure. P2-2: dangling key-pointer nulled after OOM. | 2 new sync tests (mount-claim advance, load_tree_at-without-cx); 20 suites green on default/ASan/TSan; 7 TLA+ specs clean |
 | `dc357ad` | **P4-2: scrubber**. New `stm_btree_store_verify` + `stm_alloc_verify` + `stm_fs_verify`: walks the on-disk allocator tree, re-reads every node, checks Merkle chain + AEAD tags without mutating state. Safe to call on live pools (including RO / wedged). Intended for admin-invoked scrubs and as a separate detection surface from mount-time Merkle (in-flight bit rot or external tamper surfaces on next scrub without waiting for unmount). | 3 new sync tests (clean, empty pool, post-commit tamper detection); 20 suites green |
 | `<r10>` | **R10 audit fixes** (post-P4-4a). P1-1 `stm_fs_format` wk-wipe on commit-failure path. P2-1 `stm_keyschema_commit` rollback of new_paddr when old-paddr free fails. **P2-2 stm_hybrid_wrap/_unwrap now take AD** — sync.c binds `pool_uuid ‖ dataset_id ‖ key_id` so a retired-blob-swap (exploitable once P4-4c rotation lands) fails tag verification. P2-3 `key_schema.cfg` narrowed to `Datasets={0}` for P4-4a MVP. P2-4 `stm_keyfile_load` now `fstat`-verifies exact file size (rejects trailing bytes). P3-1/2 wipes added. | 1 new hybrid test `hybrid_ad_mismatch_fails`; 21 suites green on default/ASan/TSan; 8 TLA+ specs clean |
+| `1ae4374` | **P4-4b: janus key-agent daemon**. Splits wrap-key custody into a dedicated process per ARCH §7.9 / NOVEL #10. New `src/p9/` — generic 9P2000 server library with a backend-agnostic vops interface (carries forward v1's R11–R14 bounds-check discipline). New `src/janus/` — synthetic FS (`/pools/<uuid>/datasets/<id>/unwrap`, `/audit-log`), file + passphrase backends, FS-side client, and the `janus` daemon binary. Passphrase backend: Argon2id(passphrase, salt) → 32-byte KEK → AEGIS-256-wraps the hybrid keypair into `<state_dir>/hybrid.janus`. File backend wraps `stm_keyfile` for automation / container contexts. `stm_fs_mount_opts` gains `janus_socket` mutually exclusive with `keyfile_path`; `stm_sync_open` grows a `stm_janus_client *` param routing the unwrap over 9P. Audit log records every unwrap (OK / FAIL rc). Peer auth: `SO_PEERCRED` on Linux, `LOCAL_PEERCRED` on macOS. Single-client-at-a-time accept loop for MVP. | 8 new p9 tests + 7 new janus integration tests (unwrap round-trip via file backend, wrong-key_id tag failure, `fs_mount` via socket, ambiguous-opts rejection, wrong-socket failure, passphrase setup+open round-trip incl. wrong-passphrase rejection, audit-log smoke). 23/23 green on default / ASan / TSan. 8/8 TLA+ specs clean — `janus_protocol.tla` was evaluated and deemed unnecessary at this scope (single-threaded accept, well-trodden 9P state machine). |
 | `eeea92d` | **P4-5 stub: data-extent AEAD round-trip**. New `src/extent/` module exposing `stm_ad_extent` (ARCH §7.6.1 — 56-byte AD: magic ‖ version ‖ pool_uuid ‖ dataset_id ‖ ino ‖ offset ‖ content_kind) + `stm_extent_encrypt` / `stm_extent_decrypt`. Nonce construction matches P4-3b's metadata wrapper (paddr ‖ gen ‖ pool_uuid) — see phase4-status.md "Known deltas from ARCH" for the nonce-layout subset rationale. No extent manager, no on-disk index — the caller owns paddrs. Scope is the crypto surface alone; full extent layer is Phase 6 (dataset model + tree + content-defined chunking). Satisfies ROADMAP §7.2's "encrypted writes round-trip correctly with AEGIS-256 and XChaCha20-SIV" exit bullet. | 11 new tests: round-trip per mode; AD field-by-field tamper rejects (pool_uuid / dataset_id / ino / offset / content_kind); nonce tamper (paddr / gen); tag tamper; AD packed-size pinned to 56. 21 suites green |
 
 ## Remaining Phase 4 work
@@ -102,8 +103,17 @@ Implementation split (per the decision thread):
    using the Phase 1 stm_hybrid primitive; wrap-key source is a file
    (the "file" backend from ARCH §7.9.3's list). Ends with: no
    plaintext key on disk.
-2. **P4-4b — janus daemon**. Separate binary, 9P synthetic FS,
-   SO_PEERCRED auth, passphrase backend.
+2. **P4-4b — janus daemon (LANDED at `1ae4374`)**. Separate binary,
+   9P synthetic FS, `SO_PEERCRED` / `LOCAL_PEERCRED` auth,
+   passphrase (Argon2id + AEGIS-256) + file backends. `stm_fs_mount`
+   now accepts `janus_socket` mutually exclusive with `keyfile_path`;
+   `stm_sync_open` grows a `stm_janus_client *` param. Daemon CLI
+   has `setup` (prints hybrid_pk for `stratum format`) and `serve`.
+   Known MVP gaps handed off to P4-4c: format still requires a
+   keyfile to obtain hybrid_pk (no `--pool-pubkey` option yet); the
+   daemon unlocks all passphrase-backed pools with a single
+   passphrase at startup. TPM / PKCS#11 / YubiKey backends deferred
+   to post-Phase-4.
 3. **P4-4c — per-dataset keys**. Generalize from one pool key to the
    dataset-keyed sub-tree; rotation plumbing per ARCH §7.7.
 
