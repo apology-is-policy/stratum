@@ -26,8 +26,9 @@
  * Child encoding:
  *   Children in internal nodes are 64-byte blobs laid out as the
  *   packed form of an stm_bptr — first 8 bytes are the paddr (LE u64),
- *   then kind (1 byte) + flags (1 byte) + 6 bytes pad + 32 bytes csum
- *   (zeroed in chunk 5 — chunk 7 wires Merkle) + 16 bytes reserved.
+ *   then kind (1 byte) + flags (1 byte) + 6 bytes pad + 32 bytes
+ *   csum (populated in P4-1 with the child node's BLAKE3 self-csum
+ *   so internal nodes carry the Merkle chain) + 16 bytes reserved.
  *   Parallels the stm_bptr layout in super.h exactly.
  */
 
@@ -177,24 +178,36 @@ static stm_status partition_leaves(const coll_entry *entries, size_t n,
 /* ========================================================================= */
 
 /* Pack the 64 bytes of an stm_bptr pointing at `paddr` with `kind`.
- * Csum + reserved regions zeroed (chunk 7 will populate csum). */
+ * Csum carries the child node's BLAKE3-256 self-csum (P4-1 —
+ * Merkle chain). Reserved regions zeroed. */
 static void encode_child_bptr(uint64_t paddr, stm_bptr_kind kind,
+                                const uint8_t child_csum[32],
                                 uint8_t out[STM_BTNODE_CHILD_BPTR_SIZE])
 {
     memset(out, 0, STM_BTNODE_CHILD_BPTR_SIZE);
     stm_bptr bp = { 0 };
     bp.bp_paddr = stm_store_le64(paddr);
     bp.bp_kind  = (uint8_t)kind;
+    if (child_csum) memcpy(bp.bp_csum, child_csum, 32);
     memcpy(out, &bp, sizeof bp);
 }
 
 static void decode_child_bptr(const uint8_t in[STM_BTNODE_CHILD_BPTR_SIZE],
-                                uint64_t *out_paddr, uint8_t *out_kind)
+                                uint64_t *out_paddr, uint8_t *out_kind,
+                                uint8_t out_csum[32])
 {
     stm_bptr bp;
     memcpy(&bp, in, sizeof bp);
     *out_paddr = stm_load_le64(bp.bp_paddr);
     *out_kind  = bp.bp_kind;
+    if (out_csum) memcpy(out_csum, bp.bp_csum, 32);
+}
+
+/* Extract a node's self-csum from a freshly-encoded buffer. The csum
+ * lives in the trailing 32 bytes of the node image. */
+static inline void node_csum_from_buf(const uint8_t *buf, uint8_t out[32])
+{
+    memcpy(out, buf + (STM_BTNODE_SIZE - STM_BTNODE_CSUM_SIZE), 32);
 }
 
 /* ========================================================================= */
@@ -209,7 +222,8 @@ static stm_status emit_leaf(const coll_entry *entries, size_t lo, size_t hi,
                               uint64_t gen, uint64_t tree_id,
                               const stm_btree_store_vtable *vt, void *ctx,
                               uint8_t *scratch,
-                              uint64_t *out_paddr)
+                              uint64_t *out_paddr,
+                              uint8_t out_csum[32])
 {
     /* Build stm_btnode_entry array pointing at collector's storage. */
     size_t n = hi - lo;
@@ -230,6 +244,10 @@ static stm_status emit_leaf(const coll_entry *entries, size_t lo, size_t hi,
     free(nodes);
     if (s != STM_OK) return s;
 
+    /* Capture the csum BEFORE writing so caller doesn't need another
+     * read. Encoding deterministically fills bytes [131040, 131072). */
+    node_csum_from_buf(scratch, out_csum);
+
     s = vt->reserve(ctx, out_paddr);
     if (s != STM_OK) return s;
 
@@ -245,13 +263,16 @@ static stm_status emit_internal(const stm_btnode_pivot *pivots, uint32_t np,
                                   uint64_t gen, uint64_t tree_id,
                                   const stm_btree_store_vtable *vt, void *ctx,
                                   uint8_t *scratch,
-                                  uint64_t *out_paddr)
+                                  uint64_t *out_paddr,
+                                  uint8_t out_csum[32])
 {
     stm_status s = stm_btnode_internal_encode(pivots, np,
                                                 children, children_len,
                                                 gen, tree_id,
                                                 scratch, STM_BTNODE_SIZE);
     if (s != STM_OK) return s;
+
+    node_csum_from_buf(scratch, out_csum);
 
     s = vt->reserve(ctx, out_paddr);
     if (s != STM_OK) return s;
@@ -267,9 +288,10 @@ stm_status stm_btree_store_serialize(stm_btree_mt *t,
                                        uint64_t gen, uint64_t tree_id,
                                        const stm_btree_store_vtable *vt,
                                        void *vt_ctx,
-                                       uint64_t *out_root_paddr)
+                                       uint64_t *out_root_paddr,
+                                       uint8_t  out_root_csum[32])
 {
-    if (!t || !vt || !out_root_paddr) return STM_EINVAL;
+    if (!t || !vt || !out_root_paddr || !out_root_csum) return STM_EINVAL;
     if (!vt->reserve || !vt->write)   return STM_EINVAL;
 
     /* Scratch buffer used for both leaf and internal encode. */
@@ -291,9 +313,11 @@ stm_status stm_btree_store_serialize(stm_btree_mt *t,
         collector_free(&coll); free(scratch); return s;
     }
 
-    /* Emit leaves. Record paddrs and per-leaf first keys. */
+    /* Emit leaves. Record paddrs, csums, and per-leaf first keys. */
     uint64_t *leaf_paddrs = calloc(n_leaves, sizeof *leaf_paddrs);
-    if (!leaf_paddrs) {
+    uint8_t  *leaf_csums  = calloc(n_leaves, 32);   /* 32 bytes each */
+    if (!leaf_paddrs || !leaf_csums) {
+        free(leaf_paddrs); free(leaf_csums);
         free(starts); collector_free(&coll); free(scratch);
         return STM_ENOMEM;
     }
@@ -301,13 +325,14 @@ stm_status stm_btree_store_serialize(stm_btree_mt *t,
     for (size_t i = 0; i < n_leaves; i++) {
         s = emit_leaf(coll.entries, starts[i], starts[i + 1],
                       gen, tree_id, vt, vt_ctx,
-                      scratch, &leaf_paddrs[i]);
+                      scratch, &leaf_paddrs[i], &leaf_csums[i * 32]);
         if (s != STM_OK) goto cleanup;
     }
 
-    /* Single leaf → its paddr IS the root. */
+    /* Single leaf → its paddr IS the root, and its csum IS the root csum. */
     if (n_leaves == 1) {
         *out_root_paddr = leaf_paddrs[0];
+        memcpy(out_root_csum, &leaf_csums[0], 32);
         s = STM_OK;
         goto cleanup;
     }
@@ -331,6 +356,7 @@ stm_status stm_btree_store_serialize(stm_btree_mt *t,
     }
     for (size_t i = 0; i < n_leaves; i++) {
         encode_child_bptr(leaf_paddrs[i], STM_BPTR_KIND_LEAF,
+                          &leaf_csums[i * 32],
                           children + i * STM_BTNODE_CHILD_BPTR_SIZE);
     }
 
@@ -346,7 +372,7 @@ stm_status stm_btree_store_serialize(stm_btree_mt *t,
     s = emit_internal(pivots, n_pivots,
                       children, (size_t)n_leaves * STM_BTNODE_CHILD_BPTR_SIZE,
                       gen, tree_id, vt, vt_ctx,
-                      scratch, &root_paddr);
+                      scratch, &root_paddr, out_root_csum);
     free(pivots);
     free(children);
     if (s != STM_OK) goto cleanup;
@@ -355,6 +381,7 @@ stm_status stm_btree_store_serialize(stm_btree_mt *t,
     s = STM_OK;
 
 cleanup:
+    free(leaf_csums);
     free(leaf_paddrs);
     free(starts);
     collector_free(&coll);
@@ -437,6 +464,7 @@ typedef struct {
      * reentrant vtable calls don't nest. */
     uint64_t *child_paddrs;
     uint8_t  *child_kinds;
+    uint8_t  *child_csums;        /* 32 bytes per child (P4-1)   */
     uint32_t  n_children;
     uint32_t  cap;
     stm_status err;
@@ -452,14 +480,28 @@ static int child_record_cb(const uint8_t bptr[STM_BTNODE_CHILD_BPTR_SIZE],
 
     uint64_t paddr = 0;
     uint8_t  kind  = 0;
-    decode_child_bptr(bptr, &paddr, &kind);
+    uint8_t  csum[32];
+    decode_child_bptr(bptr, &paddr, &kind, csum);
     c->child_paddrs[c->n_children] = paddr;
     c->child_kinds [c->n_children] = kind;
+    memcpy(&c->child_csums[c->n_children * 32], csum, 32);
     c->n_children++;
     return 0;
 }
 
+/* Verify that the buffer's trailing self-csum matches `expected`. */
+static inline stm_status check_node_csum(const uint8_t *buf,
+                                           const uint8_t expected[32])
+{
+    if (!expected) return STM_OK;
+    uint8_t actual[32];
+    node_csum_from_buf(buf, actual);
+    if (memcmp(actual, expected, 32) != 0) return STM_ECORRUPT;
+    return STM_OK;
+}
+
 stm_status stm_btree_store_deserialize(stm_btree_mt *t, uint64_t root_paddr,
+                                         const uint8_t expected_root_csum[32],
                                          const stm_btree_store_vtable *vt,
                                          void *vt_ctx)
 {
@@ -471,6 +513,16 @@ stm_status stm_btree_store_deserialize(stm_btree_mt *t, uint64_t root_paddr,
 
     /* Read root. */
     stm_status s = vt->read(vt_ctx, root_paddr, buf, STM_BTNODE_SIZE);
+    if (s != STM_OK) { free(buf); return s; }
+
+    /* P4-1 Merkle gate: root self-csum must match what the caller
+     * expected (i.e., what ub_alloc_root.bp_csum held). The
+     * stm_btnode_peek below validates the trailing csum against the
+     * node's OWN bytes, but not against the expected outer value.
+     * Both checks are needed: self-csum catches tampering of the
+     * on-disk node bytes, Merkle-match catches substitution of a
+     * well-formed stale or attacker-controlled node. */
+    s = check_node_csum(buf, expected_root_csum);
     if (s != STM_OK) { free(buf); return s; }
 
     stm_btnode_info info;
@@ -485,15 +537,17 @@ stm_status stm_btree_store_deserialize(stm_btree_mt *t, uint64_t root_paddr,
         return s;
     }
 
-    /* INTERNAL root. Collect child paddrs, then iterate. MVP caps at
-     * one internal level → children must all be LEAF. */
+    /* INTERNAL root. Collect child paddrs + csums, then iterate. MVP
+     * caps at one internal level → children must all be LEAF. */
     uint32_t cap = info.n_entries + 1u;   /* = n_pivots + 1 */
     child_collect cc = { 0 };
     cc.child_paddrs = calloc(cap, sizeof *cc.child_paddrs);
     cc.child_kinds  = calloc(cap, sizeof *cc.child_kinds);
+    cc.child_csums  = calloc((size_t)cap * 32u, sizeof *cc.child_csums);
     cc.cap          = cap;
-    if (!cc.child_paddrs || !cc.child_kinds) {
-        free(cc.child_paddrs); free(cc.child_kinds); free(buf);
+    if (!cc.child_paddrs || !cc.child_kinds || !cc.child_csums) {
+        free(cc.child_paddrs); free(cc.child_kinds); free(cc.child_csums);
+        free(buf);
         return STM_ENOMEM;
     }
 
@@ -502,7 +556,7 @@ stm_status stm_btree_store_deserialize(stm_btree_mt *t, uint64_t root_paddr,
     if (s == STM_OK && cc.err != STM_OK) s = cc.err;
     free(buf);
     if (s != STM_OK) {
-        free(cc.child_paddrs); free(cc.child_kinds);
+        free(cc.child_paddrs); free(cc.child_kinds); free(cc.child_csums);
         return s;
     }
 
@@ -512,7 +566,7 @@ stm_status stm_btree_store_deserialize(stm_btree_mt *t, uint64_t root_paddr,
      * in-leaf duplicates. */
     uint8_t *leafbuf = malloc(STM_BTNODE_SIZE);
     if (!leafbuf) {
-        free(cc.child_paddrs); free(cc.child_kinds);
+        free(cc.child_paddrs); free(cc.child_kinds); free(cc.child_csums);
         return STM_ENOMEM;
     }
     insert_ctx ic = { .tree = t };
@@ -523,12 +577,17 @@ stm_status stm_btree_store_deserialize(stm_btree_mt *t, uint64_t root_paddr,
         }
         s = vt->read(vt_ctx, cc.child_paddrs[i], leafbuf, STM_BTNODE_SIZE);
         if (s != STM_OK) break;
+        /* Merkle check: each child's self-csum must match the parent
+         * internal node's bp_csum record. */
+        s = check_node_csum(leafbuf, &cc.child_csums[i * 32]);
+        if (s != STM_OK) break;
         s = deserialize_leaf(t, leafbuf, &ic);
         if (s != STM_OK) break;
     }
 
     free(leafbuf);
     free(ic.prev_key);
+    free(cc.child_csums);
     free(cc.child_paddrs);
     free(cc.child_kinds);
     return s;

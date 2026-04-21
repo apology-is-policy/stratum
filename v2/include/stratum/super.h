@@ -39,8 +39,13 @@ extern "C" {
  * when viewed with `xxd` on the raw block. */
 #define STM_UB_MAGIC          UINT64_C(0x324d555441525453) /* "STRATUM2" */
 
-/* Format version. Bumped on incompatible layout changes. */
-#define STM_UB_VERSION        1u
+/* Format version. Bumped on incompatible layout changes.
+ *
+ * v1 → v2 (Phase 4 chunk P4-1): carved ub_merkle_root_salt[32]
+ * from ub_reserved (unchanged offset; field size shrunk). v1 pools
+ * had this region zero, so v2 readers cannot treat a v1 uberblock
+ * as having a populated salt — hence the version bump. */
+#define STM_UB_VERSION        2u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */
@@ -182,8 +187,14 @@ typedef struct {
     /* Compact roster (up to 64 devices × 32 B each) */
     uint8_t ub_roster[2048];                    /* 960 : 2048 */
 
+    /* Merkle root salt — 32 bytes random per pool, seeded at format
+     * time from a CSPRNG. Mixes into the ub_merkle_root computation
+     * (§7.11.3) to prevent certain precomputation attacks. Stable
+     * across the pool's lifetime; never rotated. */
+    uint8_t ub_merkle_root_salt[32];            /* 3008 : 32 */
+
     /* Reserved for future fields + alignment to csum. */
-    uint8_t ub_reserved[1056];                  /* 3008 : 1056 */
+    uint8_t ub_reserved[1024];                  /* 3040 : 1024 */
 
     /* Checksum: BLAKE3-256 over the rest of the uberblock with this
      * field zeroed. Self-verifying; a blob whose first 4064 bytes

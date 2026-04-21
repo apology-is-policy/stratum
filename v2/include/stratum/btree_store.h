@@ -73,14 +73,20 @@ typedef struct {
 /*
  * Serialize `t` to a tree of nodes written via the vtable. Returns
  * `*out_root_paddr` on success — the root is either a leaf paddr (if
- * all entries fit in one leaf) or an internal paddr.
+ * all entries fit in one leaf) or an internal paddr. Additionally
+ * returns the root's BLAKE3-256 self-csum in `*out_root_csum` (32
+ * bytes; P4-1 — Merkle chain root).
+ *
+ * Internally, each internal node's child bptr entries now carry the
+ * child's csum in the bp_csum field, so a Merkle chain runs from
+ * `out_root_csum` down to every leaf.
  *
  * The emitted nodes carry `gen` in their headers for MVCC snapshot
  * routing and `tree_id` for multi-tree pools (use 0 when
  * meaningless).
  *
  * Empty trees still emit exactly one empty leaf, so `*out_root_paddr`
- * is always valid on STM_OK.
+ * + `*out_root_csum` are always valid on STM_OK.
  *
  * Returns STM_ENOSPC if the vtable's reserve runs out of space,
  * STM_ERANGE if a single entry is too large for a leaf,
@@ -90,7 +96,7 @@ STM_MUST_USE
 stm_status stm_btree_store_serialize(
     stm_btree_mt *t, uint64_t gen, uint64_t tree_id,
     const stm_btree_store_vtable *vt, void *vt_ctx,
-    uint64_t *out_root_paddr);
+    uint64_t *out_root_paddr, uint8_t out_root_csum[32]);
 
 /*
  * Deserialize the tree rooted at `root_paddr` into `t`, which must
@@ -98,16 +104,23 @@ stm_status stm_btree_store_serialize(
  * empty. Existing entries in `t` are left intact; newly-read entries
  * upsert over matching keys (standard stm_btree insert semantics).
  *
+ * If `expected_root_csum` is non-NULL, the root node's self-csum is
+ * verified against those 32 bytes. For internal roots, the per-child
+ * bp_csum from each child bptr is verified against the child node's
+ * self-csum recursively — the full Merkle chain is checked (P4-1).
+ * Pass NULL to skip verification (backward-compat for tests that
+ * don't yet track csums; production callers should always supply).
+ *
  * Walks the root: if LEAF, inserts each entry. If INTERNAL, reads
  * each child recursively.
  *
- * Returns STM_ECORRUPT if a node fails csum or has an unexpected kind
- * in the context (e.g. internal pointing at another internal — MVP
- * caps at two levels).
+ * Returns STM_ECORRUPT if a node fails self-csum OR if the Merkle
+ * chain doesn't match the expected csum at any level.
  */
 STM_MUST_USE
 stm_status stm_btree_store_deserialize(
     stm_btree_mt *t, uint64_t root_paddr,
+    const uint8_t expected_root_csum[32],
     const stm_btree_store_vtable *vt, void *vt_ctx);
 
 /*

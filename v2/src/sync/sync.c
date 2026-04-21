@@ -33,9 +33,11 @@
 #include <stratum/sync.h>
 #include <stratum/alloc.h>
 #include <stratum/block.h>
+#include <stratum/hash.h>
 #include <stratum/super.h>
 
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -60,7 +62,66 @@ struct stm_sync {
     /* Allocator-tree root paddr recorded in the last committed
      * uberblock. 0 if no commits yet. */
     uint64_t   alloc_root_paddr;
+
+    /* P4-1: Merkle state.
+     *
+     *   merkle_salt      — 32-byte per-pool random value set at
+     *                      sync_create (first commit) and persisted
+     *                      in ub_merkle_root_salt. Stable for the
+     *                      pool's lifetime. Mixes into every
+     *                      ub_merkle_root computation.
+     *   alloc_root_csum  — BLAKE3 self-csum of the live allocator-
+     *                      tree root node, mirrored from
+     *                      ub_alloc_root.bp_csum.
+     *   merkle_root      — most recently computed pool Merkle root
+     *                      (mirror of ub_merkle_root).
+     */
+    uint8_t    merkle_salt[32];
+    uint8_t    alloc_root_csum[32];
+    uint8_t    merkle_root[32];
 };
+
+/* ========================================================================= */
+/* Merkle root construction (P4-1).                                           */
+/* ========================================================================= */
+
+/* Compute pool_merkle_root = BLAKE3-256(
+ *     main_root_csum || alloc_root_csum || snap_root_csum ||
+ *     cas_root_csum || salt
+ * ). Unpopulated tree roots contribute 32 zero bytes.
+ *
+ * Phase 3 has only the allocator tree; the other three are zero.
+ * The field placement mirrors ARCH §7.11.3's formula, so when we
+ * wire main/snap/cas in Phase 5/6 the math doesn't change. */
+static void compute_merkle_root(const uint8_t main_csum[32],
+                                  const uint8_t alloc_csum[32],
+                                  const uint8_t snap_csum[32],
+                                  const uint8_t cas_csum[32],
+                                  const uint8_t salt[32],
+                                  uint8_t out[32])
+{
+    stm_blake3_ctx *h = stm_blake3_new();
+    if (!h) { memset(out, 0, 32); return; }
+    stm_blake3_update(h, main_csum,  32);
+    stm_blake3_update(h, alloc_csum, 32);
+    stm_blake3_update(h, snap_csum,  32);
+    stm_blake3_update(h, cas_csum,   32);
+    stm_blake3_update(h, salt,       32);
+    stm_blake3_final(h, out, 32);
+    stm_blake3_free(h);
+}
+
+/* Fill `out` with 32 cryptographically-random bytes from the host
+ * OS. Uses /dev/urandom directly so stm_sync doesn't need to link
+ * stm_crypto (libsodium) just for one call. */
+static stm_status fill_random(uint8_t out[32])
+{
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (!f) return STM_EIO;
+    size_t n = fread(out, 1u, 32u, f);
+    fclose(f);
+    return (n == 32u) ? STM_OK : STM_EIO;
+}
 
 /* ========================================================================= */
 /* Ring rotation.                                                             */
@@ -81,13 +142,15 @@ static inline uint32_t ring_slot_for_gen(uint64_t gen)
 /* ========================================================================= */
 
 /* Build an uberblock in `out` from sync state + caller's inputs.
- * Fills pool_uuid / device_uuid / gen / txg / ub_alloc_root +
- * zero'd main/snap/cas roots for MVP. Allocator stats populate
- * total_blocks / free_blocks. */
+ * Fills pool_uuid / device_uuid / gen / txg / ub_alloc_root
+ * (paddr + kind + bp_csum) + ub_merkle_root + ub_merkle_root_salt
+ * for P4-1. Allocator stats populate total_blocks / free_blocks. */
 static void build_uberblock(stm_uberblock *out,
                               const stm_sync *s,
                               uint64_t new_gen,
                               uint64_t alloc_root_paddr,
+                              const uint8_t alloc_root_csum[32],
+                              const uint8_t merkle_root[32],
                               const stm_alloc_stats *astats)
 {
     memset(out, 0, sizeof *out);
@@ -106,11 +169,18 @@ static void build_uberblock(stm_uberblock *out,
     out->ub_device_count = stm_store_le16(1);
     out->ub_device_id    = stm_store_le16(0);
 
-    /* Allocator tree root. */
+    /* Allocator tree root (paddr + kind + Merkle csum). */
     if (alloc_root_paddr != 0) {
         out->ub_alloc_root.bp_paddr = stm_store_le64(alloc_root_paddr);
         out->ub_alloc_root.bp_kind  = STM_BPTR_KIND_ALLOC;
+        memcpy(out->ub_alloc_root.bp_csum, alloc_root_csum, 32);
     }
+
+    /* P4-1: Merkle root + per-pool salt. Both are stored; mount-time
+     * verifier recomputes the root against on-disk tree-root csums +
+     * stored salt, and fails STM_ECORRUPT on mismatch. */
+    memcpy(out->ub_merkle_root,        merkle_root,     32);
+    memcpy(out->ub_merkle_root_salt,   s->merkle_salt,  32);
 
     /* Data-area totals (in blocks). */
     out->ub_total_blocks = stm_store_le64(astats->data_total_blocks);
@@ -161,6 +231,15 @@ stm_status stm_sync_create(stm_bdev *d, stm_alloc *a,
      * MaxDurableTxg+1 = 0+1 = 1). */
     s->current_gen = 0;
 
+    /* P4-1: generate the pool's Merkle salt once, at format time.
+     * The salt is persisted in ub_merkle_root_salt and stays stable
+     * across the pool's lifetime. */
+    stm_status rs = fill_random(s->merkle_salt);
+    if (rs != STM_OK) {
+        stm_sync_close(s);
+        return rs;
+    }
+
     *out_sync = s;
     return STM_OK;
 }
@@ -200,6 +279,32 @@ stm_status stm_sync_open(stm_bdev *d, stm_alloc *a, stm_sync **out_sync)
     s2->live_label_idx    = live_label;
     s2->live_slot_idx     = live_slot;
 
+    /* P4-1: carry Merkle state forward from the durable uberblock.
+     * Salt is per-pool and stable; alloc_root_csum + merkle_root
+     * are the last-committed values. */
+    memcpy(s2->merkle_salt,      ub.ub_merkle_root_salt, 32);
+    memcpy(s2->alloc_root_csum,  ub.ub_alloc_root.bp_csum, 32);
+    memcpy(s2->merkle_root,      ub.ub_merkle_root,      32);
+
+    /* P4-1: verify the on-disk ub_merkle_root is self-consistent
+     * with the per-tree-root csums + salt recorded in the SAME
+     * uberblock. An offline edit that swapped either the salt,
+     * a tree-root csum, or the merkle_root field would break this.
+     * (A coordinated edit to all three would pass this check but
+     * fails the tree-node self-csum check on the first read.) */
+    uint8_t  zeros32[32] = { 0 };
+    uint8_t  recomputed[32];
+    compute_merkle_root(zeros32,                       /* main */
+                         ub.ub_alloc_root.bp_csum,
+                         zeros32,                       /* snap */
+                         zeros32,                       /* cas  */
+                         ub.ub_merkle_root_salt,
+                         recomputed);
+    if (memcmp(recomputed, ub.ub_merkle_root, 32) != 0) {
+        stm_sync_close(s2);
+        return STM_ECORRUPT;
+    }
+
     /* Rehydrate the allocator tree from ub_alloc_root. R7d P1-1:
      * a valid-csum uberblock with a nonzero ub_alloc_root.bp_paddr
      * but wrong kind indicates tampering — surface as STM_ECORRUPT
@@ -212,7 +317,11 @@ stm_status stm_sync_open(stm_bdev *d, stm_alloc *a, stm_sync **out_sync)
             stm_sync_close(s2);
             return STM_ECORRUPT;
         }
-        stm_status ls = stm_alloc_load_tree_at(a, alloc_root);
+        /* P4-1: pass the expected csum through so the tree loader
+         * verifies the root node's bytes against the value the
+         * uberblock commits to. */
+        stm_status ls = stm_alloc_load_tree_at(a, alloc_root,
+                                                  ub.ub_alloc_root.bp_csum);
         if (ls != STM_OK) {
             stm_sync_close(s2);
             return ls;
@@ -269,9 +378,12 @@ stm_status stm_sync_commit(stm_sync *s)
         return s_alloc;
     }
 
-    /* Pull the now-durable allocator tree root for ub_alloc_root. */
+    /* Pull the now-durable allocator tree root + its BLAKE3 self-csum
+     * for ub_alloc_root.bp_paddr and .bp_csum (P4-1). */
     uint64_t alloc_root = 0;
-    stm_status sr = stm_alloc_get_tree_root(s->alloc, &alloc_root);
+    uint8_t  alloc_root_csum[32] = { 0 };
+    stm_status sr = stm_alloc_get_tree_root(s->alloc,
+                                              &alloc_root, alloc_root_csum);
     if (sr != STM_OK) {
         pthread_mutex_unlock(&s->lock);
         return sr;
@@ -285,11 +397,25 @@ stm_status stm_sync_commit(stm_sync *s)
         return sr;
     }
 
+    /* P4-1: compute the pool Merkle root over the set of tree-root
+     * csums + the per-pool salt. Phase 3 populates only the
+     * allocator tree; main/snap/cas contribute zeros and will
+     * populate in Phase 5+. */
+    uint8_t zeros32[32] = { 0 };
+    uint8_t new_merkle_root[32];
+    compute_merkle_root(zeros32,                 /* main */
+                         alloc_root_csum,
+                         zeros32,                 /* snap */
+                         zeros32,                 /* cas  */
+                         s->merkle_salt,
+                         new_merkle_root);
+
     /* Phase: Final — write the new uberblock to the next ring slot,
      * fsynced. This is the commit point per sync.tla. Ring rotation:
      * label = gen % 4, slot = gen % 63. */
     stm_uberblock ub;
-    build_uberblock(&ub, s, commit_gen, alloc_root, &astats);
+    build_uberblock(&ub, s, commit_gen, alloc_root, alloc_root_csum,
+                     new_merkle_root, &astats);
 
     uint32_t next_label = ring_label_for_gen(commit_gen);
     uint32_t next_slot  = ring_slot_for_gen(commit_gen);
@@ -307,6 +433,8 @@ stm_status stm_sync_commit(stm_sync *s)
     s->live_label_idx    = next_label;
     s->live_slot_idx     = next_slot;
     s->alloc_root_paddr  = alloc_root;
+    memcpy(s->alloc_root_csum, alloc_root_csum, 32);
+    memcpy(s->merkle_root,     new_merkle_root, 32);
 
     pthread_mutex_unlock(&s->lock);
     return STM_OK;

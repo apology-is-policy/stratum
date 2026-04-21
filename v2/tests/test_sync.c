@@ -233,7 +233,7 @@ STM_TEST(sync_ub_alloc_root_matches_tree) {
     STM_ASSERT_OK(stm_sync_commit(s));
 
     uint64_t alloc_root = 0;
-    STM_ASSERT_OK(stm_alloc_get_tree_root(a, &alloc_root));
+    STM_ASSERT_OK(stm_alloc_get_tree_root(a, &alloc_root, NULL));
 
     stm_sync_info info;
     STM_ASSERT_OK(stm_sync_info_get(s, &info));
@@ -318,6 +318,165 @@ STM_TEST(sync_reserve_across_mount_avoids_overlap) {
 
     teardown(a2, s2);
     stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* ========================================================================= */
+/* P4-1 Merkle scaffolding tests.                                             */
+/* ========================================================================= */
+
+/* Read the highest-gen uberblock from disk directly (bypass stm_sync).
+ * Scans all 4x63 ring slots and returns the slot with the largest
+ * `ub_gen`. The returned uberblock is already BE→host converted. */
+static void read_live_ub(const char *path, stm_uberblock *out,
+                          uint64_t *out_byte_offset)
+{
+    stm_bdev_open_opts opts = stm_bdev_open_opts_default();
+    stm_bdev *d = NULL;
+    STM_ASSERT_OK(stm_bdev_open(path, &opts, &d));
+
+    uint32_t live_label = 0, live_slot = 0;
+    STM_ASSERT_OK(stm_sb_mount_scan(d, out, &live_label, &live_slot));
+
+    uint64_t label_offs[STM_LABELS_PER_DEVICE];
+    STM_ASSERT_OK(stm_label_offsets(TEST_DEVICE_BYTES, label_offs));
+    uint64_t slot_off = 0;
+    STM_ASSERT_OK(stm_ub_slot_offset(label_offs[live_label], live_slot,
+                                        &slot_off));
+    *out_byte_offset = slot_off;
+
+    stm_bdev_close(d);
+}
+
+STM_TEST(sync_first_commit_populates_merkle_state) {
+    make_tmp("merkle_pop");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL;
+    make_fresh_pool(d, &a, &s);
+
+    /* Reserve something non-trivial so the tree root is an actual
+     * node, not the degenerate empty-leaf state. */
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p));
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    teardown(a, s);
+    stm_bdev_close(d);
+
+    /* Read the live UB from disk and verify P4-1 fields are populated. */
+    stm_uberblock ub;
+    uint64_t ub_off = 0;
+    read_live_ub(g_tmp_path, &ub, &ub_off);
+
+    /* ub_alloc_root.bp_csum should be non-zero (points at the tree
+     * root node's BLAKE3 self-csum). */
+    uint8_t zeros32[32] = { 0 };
+    STM_ASSERT(memcmp(ub.ub_alloc_root.bp_csum, zeros32, 32) != 0);
+
+    /* ub_merkle_root_salt: non-zero (32 random bytes from /dev/urandom). */
+    STM_ASSERT(memcmp(ub.ub_merkle_root_salt, zeros32, 32) != 0);
+
+    /* ub_merkle_root: non-zero and equal to
+     *   BLAKE3(zeros32 || alloc_csum || zeros32 || zeros32 || salt). */
+    STM_ASSERT(memcmp(ub.ub_merkle_root, zeros32, 32) != 0);
+
+    unlink(g_tmp_path);
+}
+
+STM_TEST(sync_remount_verifies_merkle_root) {
+    /* Remount normally — stm_sync_open recomputes ub_merkle_root from
+     * the stored fields and compares against the stored value. Plain
+     * round-trip must succeed. */
+    make_tmp("merkle_rt");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL;
+    make_fresh_pool(d, &a, &s);
+
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p));
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    teardown(a, s);
+    stm_bdev_close(d);
+
+    /* Remount. stm_sync_open must succeed — Merkle check recomputes
+     * and matches. */
+    stm_bdev_open_opts opts = stm_bdev_open_opts_default();
+    stm_bdev *d2 = NULL;
+    STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &opts, &d2));
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d2, &a2));
+    stm_sync *s2 = NULL;
+    STM_ASSERT_OK(stm_sync_open(d2, a2, &s2));
+
+    teardown(a2, s2);
+    stm_bdev_close(d2);
+    unlink(g_tmp_path);
+}
+
+/* Helper: stomp a single byte at file offset `off`. */
+static void tamper_byte_at(const char *path, uint64_t off, uint8_t xor_mask)
+{
+    FILE *f = fopen(path, "rb+");
+    STM_ASSERT(f != NULL);
+    STM_ASSERT_EQ(fseeko(f, (off_t)off, SEEK_SET), 0);
+    uint8_t b = 0;
+    STM_ASSERT_EQ(fread(&b, 1u, 1u, f), (size_t)1);
+    STM_ASSERT_EQ(fseeko(f, (off_t)off, SEEK_SET), 0);
+    b ^= xor_mask;
+    STM_ASSERT_EQ(fwrite(&b, 1u, 1u, f), (size_t)1);
+    fclose(f);
+}
+
+STM_TEST(sync_tamper_tree_node_surfaces_on_mount) {
+    /* P4-1 Merkle chain: tamper the tree root node's on-disk bytes.
+     * The uberblock is intact; its ub_alloc_root.bp_csum records the
+     * PRE-tamper BLAKE3 of the node. On remount:
+     *   - ub_csum validates (we didn't touch the UB).
+     *   - ub_merkle_root recompute matches (we didn't touch UB fields).
+     *   - stm_alloc_load_tree_at reads the tree root, computes its
+     *     self-csum, compares against expected (from bp_csum) — FAILS. */
+    make_tmp("tamper_node");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL;
+    make_fresh_pool(d, &a, &s);
+
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p));
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    teardown(a, s);
+    stm_bdev_close(d);
+
+    /* Read the live UB; find the tree root's paddr. */
+    stm_uberblock ub;
+    uint64_t ub_off = 0;
+    read_live_ub(g_tmp_path, &ub, &ub_off);
+    uint64_t alloc_root = stm_load_le64(ub.ub_alloc_root.bp_paddr);
+    STM_ASSERT(alloc_root != 0);
+
+    /* The tree root lives in the bootstrap pool at paddr → byte offset.
+     * Bootstrap uses the same 4 KiB-block addressing the uberblocks
+     * do. The node is 128 KiB; tamper a byte somewhere in its payload
+     * region (skip the header so we target content bytes). */
+    uint64_t tree_byte_off =
+        stm_paddr_offset(alloc_root) * (uint64_t)STM_UB_SIZE + 512u;
+    tamper_byte_at(g_tmp_path, tree_byte_off, 0x7Fu);
+
+    /* Remount — stm_sync_open must reject via the tree-load Merkle
+     * gate in stm_alloc_load_tree_at. */
+    stm_bdev_open_opts opts = stm_bdev_open_opts_default();
+    stm_bdev *d2 = NULL;
+    STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &opts, &d2));
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d2, &a2));
+    stm_sync *s2 = NULL;
+    stm_status ms = stm_sync_open(d2, a2, &s2);
+    STM_ASSERT_ERR(ms, STM_ECORRUPT);
+    STM_ASSERT(s2 == NULL);
+
+    stm_alloc_close(a2);
+    stm_bdev_close(d2);
     unlink(g_tmp_path);
 }
 

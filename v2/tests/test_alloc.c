@@ -433,7 +433,8 @@ STM_TEST(alloc_open_after_commit_is_blank) {
     STM_ASSERT_OK(stm_alloc_commit(a, 1));
 
     uint64_t root = 0;
-    STM_ASSERT_OK(stm_alloc_get_tree_root(a, &root));
+    uint8_t  root_csum[32] = { 0 };
+    STM_ASSERT_OK(stm_alloc_get_tree_root(a, &root, root_csum));
     STM_ASSERT(root != 0);
 
     stm_alloc_close(a);
@@ -451,12 +452,12 @@ STM_TEST(alloc_open_after_commit_is_blank) {
     STM_ASSERT_EQ(st.data_allocated_blocks, 0u);
 
     uint64_t got_root = 0;
-    STM_ASSERT_OK(stm_alloc_get_tree_root(a2, &got_root));
+    STM_ASSERT_OK(stm_alloc_get_tree_root(a2, &got_root, NULL));
     STM_ASSERT_EQ(got_root, 0u);
 
-    /* Explicit load_tree_at WORKS with the known root — shows that
-     * the data is actually there, just not auto-loaded. */
-    STM_ASSERT_OK(stm_alloc_load_tree_at(a2, root));
+    /* Explicit load_tree_at WORKS with the known root + csum — shows
+     * that the data is actually there, just not auto-loaded. */
+    STM_ASSERT_OK(stm_alloc_load_tree_at(a2, root, root_csum));
     STM_ASSERT_OK(stm_alloc_stats_get(a2, &st));
     STM_ASSERT_EQ(st.n_allocated_ranges, 1u);
 

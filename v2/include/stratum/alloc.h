@@ -126,19 +126,31 @@ stm_status stm_alloc_open_blank(stm_bdev *d, stm_alloc **out_alloc);
  * stm_alloc_open_blank'd handle. root_paddr = 0 is a valid no-op
  * (leaves the tree empty).
  *
- * Returns STM_ECORRUPT on node read / csum / ordering failures,
- * STM_ENOTSUPPORTED if the on-disk tree exceeds two levels.
+ * If `expected_root_csum` is non-NULL, the 32-byte BLAKE3 self-csum
+ * of the on-disk root node is verified against it (P4-1 Merkle
+ * chain). A mismatch returns STM_ECORRUPT. Pass NULL to skip the
+ * Merkle check — production callers should always supply from
+ * `ub_alloc_root.bp_csum`.
+ *
+ * Returns STM_ECORRUPT on node read / csum / Merkle / ordering
+ * failures, STM_ENOTSUPPORTED if the on-disk tree exceeds two
+ * levels.
  */
 STM_MUST_USE
-stm_status stm_alloc_load_tree_at(stm_alloc *a, uint64_t root_paddr);
+stm_status stm_alloc_load_tree_at(stm_alloc *a, uint64_t root_paddr,
+                                    const uint8_t expected_root_csum[32]);
 
 /*
- * Return the paddr of the current allocator-tree root as last
- * persisted by stm_alloc_commit. 0 before any commit. Used by
- * stm_sync to write ub_alloc_root after a commit.
+ * Return the paddr + BLAKE3-256 self-csum of the current allocator-
+ * tree root as last persisted by stm_alloc_commit. 0-paddr / zero-
+ * csum before any commit. Used by stm_sync to write ub_alloc_root
+ * (both paddr and bp_csum) after a commit. `out_root_csum` may be
+ * NULL if the caller only wants the paddr.
  */
 STM_MUST_USE
-stm_status stm_alloc_get_tree_root(const stm_alloc *a, uint64_t *out_root_paddr);
+stm_status stm_alloc_get_tree_root(const stm_alloc *a,
+                                     uint64_t *out_root_paddr,
+                                     uint8_t out_root_csum[32]);
 
 /*
  * Release the handle and its sub-handles (bootstrap + tree). Callers

@@ -128,10 +128,11 @@ STM_TEST(bstore_empty_roundtrip) {
     mem_store store = { .max = 128 };
 
     uint64_t root = UINT64_MAX;
-    STM_ASSERT_OK(stm_btree_store_serialize(src, 0, 0, &MEM_VT, &store, &root));
+    uint8_t  root_csum[32] = { 0 };
+    STM_ASSERT_OK(stm_btree_store_serialize(src, 0, 0, &MEM_VT, &store, &root, root_csum));
     STM_ASSERT_EQ(store.next, (size_t)1);   /* exactly one empty leaf */
 
-    STM_ASSERT_OK(stm_btree_store_deserialize(dst, root, &MEM_VT, &store));
+    STM_ASSERT_OK(stm_btree_store_deserialize(dst, root, root_csum, &MEM_VT, &store));
     STM_ASSERT_EQ(tree_count(dst), (size_t)0);
 
     stm_btree_mt_free(src);
@@ -153,13 +154,14 @@ STM_TEST(bstore_single_leaf_roundtrip) {
     }
 
     uint64_t root = UINT64_MAX;
-    STM_ASSERT_OK(stm_btree_store_serialize(src, 42, 7, &MEM_VT, &store, &root));
+    uint8_t  root_csum[32] = { 0 };
+    STM_ASSERT_OK(stm_btree_store_serialize(src, 42, 7, &MEM_VT, &store, &root, root_csum));
     /* 32 × (8 + 4 + 8) = 640 bytes — fits one leaf easily. */
     STM_ASSERT_EQ(store.next, (size_t)1);
 
     /* Deserialize into a fresh tree; verify entries survive by lookup. */
     stm_btree_mt *dst = fresh_tree();
-    STM_ASSERT_OK(stm_btree_store_deserialize(dst, root, &MEM_VT, &store));
+    STM_ASSERT_OK(stm_btree_store_deserialize(dst, root, root_csum, &MEM_VT, &store));
     STM_ASSERT_EQ(tree_count(dst), (size_t)N);
 
     for (uint32_t i = 0; i < N; i++) {
@@ -194,13 +196,14 @@ STM_TEST(bstore_multi_leaf_roundtrip) {
     }
 
     uint64_t root = UINT64_MAX;
-    STM_ASSERT_OK(stm_btree_store_serialize(src, 0, 0, &MEM_VT, &store, &root));
+    uint8_t  root_csum[32] = { 0 };
+    STM_ASSERT_OK(stm_btree_store_serialize(src, 0, 0, &MEM_VT, &store, &root, root_csum));
     /* Expect > 1 total nodes (multi-leaf + 1 internal). */
     STM_ASSERT(store.next >= 3);
 
     /* Deserialize. */
     stm_btree_mt *dst = fresh_tree();
-    STM_ASSERT_OK(stm_btree_store_deserialize(dst, root, &MEM_VT, &store));
+    STM_ASSERT_OK(stm_btree_store_deserialize(dst, root, root_csum, &MEM_VT, &store));
     STM_ASSERT_EQ(tree_count(dst), (size_t)N);
 
     /* Spot-check a few keys. */
@@ -224,7 +227,8 @@ STM_TEST(bstore_reserve_enospc_propagates) {
     mem_store store = { .max = 0 };   /* no reservations allowed */
 
     uint64_t root = UINT64_MAX;
-    stm_status s = stm_btree_store_serialize(src, 0, 0, &MEM_VT, &store, &root);
+    uint8_t  root_csum[32] = { 0 };
+    stm_status s = stm_btree_store_serialize(src, 0, 0, &MEM_VT, &store, &root, root_csum);
     STM_ASSERT_ERR(s, STM_ENOSPC);
 
     stm_btree_mt_free(src);
@@ -242,13 +246,14 @@ STM_TEST(bstore_corrupt_node_detected_on_read) {
     }
 
     uint64_t root = UINT64_MAX;
-    STM_ASSERT_OK(stm_btree_store_serialize(src, 0, 0, &MEM_VT, &store, &root));
+    uint8_t  root_csum[32] = { 0 };
+    STM_ASSERT_OK(stm_btree_store_serialize(src, 0, 0, &MEM_VT, &store, &root, root_csum));
 
     /* Stomp a byte in the leaf's payload. */
     store.slots[root * STM_BTNODE_SIZE + STM_BTNODE_HDR_SIZE + 5] ^= 0x10;
 
     stm_btree_mt *dst = fresh_tree();
-    stm_status s = stm_btree_store_deserialize(dst, root, &MEM_VT, &store);
+    stm_status s = stm_btree_store_deserialize(dst, root, root_csum, &MEM_VT, &store);
     STM_ASSERT_ERR(s, STM_ECORRUPT);
 
     stm_btree_mt_free(src);

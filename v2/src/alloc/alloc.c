@@ -92,6 +92,12 @@ struct stm_alloc {
      * nodes on the next commit. */
     uint64_t        current_tree_root;
 
+    /* P4-1: BLAKE3-256 self-csum of the root node at current_tree_root.
+     * All-zero when current_tree_root == 0. Exposed via
+     * stm_alloc_get_tree_root so sync_commit can put it into
+     * ub_alloc_root.bp_csum and propagate into ub_merkle_root. */
+    uint8_t         current_tree_csum[32];
+
     /* R7c P2-5: set by reserve/free/ref; cleared on commit. When
      * commit runs with !tree_dirty and a root already on disk, the
      * free_tree + serialize round-trip is skipped — bootstrap_commit
@@ -544,7 +550,8 @@ stm_status stm_alloc_open_blank(stm_bdev *d, stm_alloc **out_alloc)
     return open_handle_bare(d, out_alloc);
 }
 
-stm_status stm_alloc_load_tree_at(stm_alloc *a, uint64_t root_paddr)
+stm_status stm_alloc_load_tree_at(stm_alloc *a, uint64_t root_paddr,
+                                    const uint8_t expected_root_csum[32])
 {
     if (!a) return STM_EINVAL;
     if (root_paddr == 0) return STM_OK;   /* no tree to load */
@@ -552,9 +559,15 @@ stm_status stm_alloc_load_tree_at(stm_alloc *a, uint64_t root_paddr)
     pthread_mutex_lock(&a->lock);
     store_ctx scx = { .boot = a->boot, .bdev = a->bdev };
     stm_status s = stm_btree_store_deserialize(a->tree, root_paddr,
+                                                 expected_root_csum,
                                                  &ALLOC_STORE_VT, &scx);
     if (s == STM_OK) {
         a->current_tree_root = root_paddr;
+        if (expected_root_csum) {
+            memcpy(a->current_tree_csum, expected_root_csum, 32);
+        } else {
+            memset(a->current_tree_csum, 0, 32);
+        }
         /* A loaded tree is NOT dirty — on-disk matches RAM. */
         a->tree_dirty = false;
         /* Accel was empty (new handle); rebuild on first query. */
@@ -564,12 +577,15 @@ stm_status stm_alloc_load_tree_at(stm_alloc *a, uint64_t root_paddr)
     return s;
 }
 
-stm_status stm_alloc_get_tree_root(const stm_alloc *a, uint64_t *out_root_paddr)
+stm_status stm_alloc_get_tree_root(const stm_alloc *a,
+                                     uint64_t *out_root_paddr,
+                                     uint8_t out_root_csum[32])
 {
     if (!a || !out_root_paddr) return STM_EINVAL;
     stm_alloc *ma = (stm_alloc *)a;
     pthread_mutex_lock(&ma->lock);
     *out_root_paddr = a->current_tree_root;
+    if (out_root_csum) memcpy(out_root_csum, a->current_tree_csum, 32);
     pthread_mutex_unlock(&ma->lock);
     return STM_OK;
 }
@@ -955,6 +971,8 @@ stm_status stm_alloc_commit(stm_alloc *a, uint64_t committed_gen)
      * list), but we don't churn through free_tree + serialize +
      * user_data update for a quiescent tree. */
     uint64_t new_root = a->current_tree_root;
+    uint8_t  new_csum[32];
+    memcpy(new_csum, a->current_tree_csum, 32);
     bool     persist_tree = a->tree_dirty || a->current_tree_root == 0;
 
     if (persist_tree) {
@@ -973,7 +991,7 @@ stm_status stm_alloc_commit(stm_alloc *a, uint64_t committed_gen)
         stm_status ss = stm_btree_store_serialize(a->tree, committed_gen,
                                                     /*tree_id=*/0,
                                                     &ALLOC_STORE_VT, &scx,
-                                                    &new_root);
+                                                    &new_root, new_csum);
         if (ss != STM_OK) {
             pthread_mutex_unlock(&a->lock);
             return ss;
@@ -990,6 +1008,7 @@ stm_status stm_alloc_commit(stm_alloc *a, uint64_t committed_gen)
     stm_status s = stm_bootstrap_commit(a->boot, committed_gen);
     if (s == STM_OK) {
         a->current_tree_root = new_root;
+        memcpy(a->current_tree_csum, new_csum, 32);
         a->tree_dirty        = false;
     }
 
