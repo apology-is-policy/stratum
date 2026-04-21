@@ -370,7 +370,11 @@ stm_status stm_alloc_create(stm_bdev *d,
     return STM_OK;
 }
 
-stm_status stm_alloc_open(stm_bdev *d, stm_alloc **out_alloc)
+/* Shared helper for both stm_alloc_open and stm_alloc_open_blank —
+ * opens the bootstrap pool + computes data-area geometry + allocates
+ * the stm_alloc handle with an empty tree. Does NOT touch user_data
+ * or deserialize anything. */
+static stm_status open_handle_bare(stm_bdev *d, stm_alloc **out_alloc)
 {
     if (!d || !out_alloc) return STM_EINVAL;
 
@@ -399,11 +403,54 @@ stm_status stm_alloc_open(stm_bdev *d, stm_alloc **out_alloc)
         return STM_ENOMEM;
     }
 
+    *out_alloc = a;
+    return STM_OK;
+}
+
+stm_status stm_alloc_open_blank(stm_bdev *d, stm_alloc **out_alloc)
+{
+    return open_handle_bare(d, out_alloc);
+}
+
+stm_status stm_alloc_load_tree_at(stm_alloc *a, uint64_t root_paddr)
+{
+    if (!a) return STM_EINVAL;
+    if (root_paddr == 0) return STM_OK;   /* no tree to load */
+
+    pthread_mutex_lock(&a->lock);
+    store_ctx scx = { .boot = a->boot, .bdev = a->bdev };
+    stm_status s = stm_btree_store_deserialize(a->tree, root_paddr,
+                                                 &ALLOC_STORE_VT, &scx);
+    if (s == STM_OK) {
+        a->current_tree_root = root_paddr;
+        /* A loaded tree is NOT dirty — on-disk matches RAM. */
+        a->tree_dirty = false;
+    }
+    pthread_mutex_unlock(&a->lock);
+    return s;
+}
+
+stm_status stm_alloc_get_tree_root(const stm_alloc *a, uint64_t *out_root_paddr)
+{
+    if (!a || !out_root_paddr) return STM_EINVAL;
+    stm_alloc *ma = (stm_alloc *)a;
+    pthread_mutex_lock(&ma->lock);
+    *out_root_paddr = a->current_tree_root;
+    pthread_mutex_unlock(&ma->lock);
+    return STM_OK;
+}
+
+stm_status stm_alloc_open(stm_bdev *d, stm_alloc **out_alloc)
+{
+    stm_alloc *a = NULL;
+    stm_status s = open_handle_bare(d, &a);
+    if (s != STM_OK) return s;
+
     /* Chunk 5d: if the bootstrap's user-data slot records a previously
      * persisted tree root, deserialize it into our in-RAM tree. Zero /
      * never-written slot → fresh open, empty tree (same as create). */
     uint8_t ud_buf[STM_BOOTSTRAP_USER_DATA_SIZE];
-    s = stm_bootstrap_get_user_data(boot, ud_buf, sizeof ud_buf);
+    s = stm_bootstrap_get_user_data(a->boot, ud_buf, sizeof ud_buf);
     if (s != STM_OK) {
         stm_alloc_close(a);
         return s;
@@ -412,14 +459,11 @@ stm_status stm_alloc_open(stm_bdev *d, stm_alloc **out_alloc)
     uint64_t root_paddr = 0, root_gen = 0;
     stm_status ds = user_data_decode(ud_buf, &root_paddr, &root_gen);
     if (ds == STM_OK && root_paddr != 0) {
-        store_ctx scx = { .boot = a->boot, .bdev = a->bdev };
-        ds = stm_btree_store_deserialize(a->tree, root_paddr,
-                                           &ALLOC_STORE_VT, &scx);
-        if (ds != STM_OK) {
+        stm_status ls = stm_alloc_load_tree_at(a, root_paddr);
+        if (ls != STM_OK) {
             stm_alloc_close(a);
-            return ds;
+            return ls;
         }
-        a->current_tree_root = root_paddr;
     } else if (ds != STM_OK && ds != STM_ENOENT) {
         stm_alloc_close(a);
         return ds;

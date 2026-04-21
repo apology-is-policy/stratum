@@ -97,18 +97,45 @@ stm_status stm_alloc_create(stm_bdev *d,
                              stm_alloc **out_alloc);
 
 /*
- * Open an existing allocator.
- *
- * NOTE (chunk 4b): the data-area allocator-tree is in-RAM only in this
- * chunk. `stm_alloc_open` reads the bootstrap pool (which IS durable —
- * see stm_bootstrap_open) and initializes an empty tree. Pre-existing
- * data-area allocations from a prior mount are NOT observed; chunk 5's
- * node-serialization layer wires the persistent tree root. Callers
- * relying on "reserve-close-open-still-reserved" semantics in chunk 4b
- * will silently lose data-area state.
+ * Open an existing allocator. Reads the bootstrap pool and, if a
+ * tree root is recorded in the bootstrap's user_data slot, deserializes
+ * the data-area tree. Fresh pools open with an empty tree.
  */
 STM_MUST_USE
 stm_status stm_alloc_open(stm_bdev *d, stm_alloc **out_alloc);
+
+/*
+ * Open the bootstrap pool but do NOT auto-load the allocator tree.
+ * Caller is responsible for calling stm_alloc_load_tree_at afterwards
+ * with a root paddr supplied from an external authoritative source
+ * (e.g. the uberblock's ub_alloc_root under chunk 6's sync layer).
+ *
+ * Intended for callers that want the uberblock to be the source of
+ * truth rather than the bootstrap user_data slot. Falls through to the
+ * same stm_alloc handle shape as stm_alloc_open.
+ */
+STM_MUST_USE
+stm_status stm_alloc_open_blank(stm_bdev *d, stm_alloc **out_alloc);
+
+/*
+ * Deserialize the allocator tree rooted at `root_paddr` into the
+ * handle's in-RAM tree. Intended to be called once on a freshly
+ * stm_alloc_open_blank'd handle. root_paddr = 0 is a valid no-op
+ * (leaves the tree empty).
+ *
+ * Returns STM_ECORRUPT on node read / csum / ordering failures,
+ * STM_ENOTSUPPORTED if the on-disk tree exceeds two levels.
+ */
+STM_MUST_USE
+stm_status stm_alloc_load_tree_at(stm_alloc *a, uint64_t root_paddr);
+
+/*
+ * Return the paddr of the current allocator-tree root as last
+ * persisted by stm_alloc_commit. 0 before any commit. Used by
+ * stm_sync to write ub_alloc_root after a commit.
+ */
+STM_MUST_USE
+stm_status stm_alloc_get_tree_root(const stm_alloc *a, uint64_t *out_root_paddr);
 
 /*
  * Release the handle and its sub-handles (bootstrap + tree). Callers

@@ -1,0 +1,326 @@
+/* SPDX-License-Identifier: ISC */
+/*
+ * Four-phase commit (Phase 3 chunk 6).
+ *
+ *   see include/stratum/sync.h for the surface + phase diagram.
+ *   see v2/specs/sync.tla          for the formal spec.
+ *
+ * What this module does:
+ *   - owns uberblock ring rotation (label + slot selection per commit).
+ *   - calls stm_alloc_commit during Reserve+Flush to persist the
+ *     data-area tree, then reads back the tree root paddr.
+ *   - builds the new uberblock, writes it to the next ring slot with
+ *     an fsync barrier (DoFinal — the commit point per sync.tla).
+ *   - advances current_gen on success (DoPublish).
+ *
+ * Mount logic:
+ *   - stm_sb_mount_scan picks the highest-valid-gen uberblock.
+ *   - MountGenBump: current_gen = authoritative_gen + 1 (strictly
+ *     greater than any durable gen; preserves nonce uniqueness).
+ *   - If the authoritative uberblock has a valid ub_alloc_root, the
+ *     allocator-tree is loaded from that paddr via
+ *     stm_alloc_load_tree_at. This is the ub_alloc_root → durable
+ *     handoff from chunk 5d's user_data slot.
+ *
+ * Ring rotation (MVP):
+ *   label = gen % STM_LABELS_PER_DEVICE   (0..3)
+ *   slot  = gen % STM_UB_SLOTS_PER_LABEL  (0..62)
+ * Consecutive commits land on different labels. After
+ * 4 × 63 = 252 commits the (label, slot) pair wraps, but by then the
+ * history is dense and mount-time selection always picks the newest.
+ */
+
+#include <stratum/sync.h>
+#include <stratum/alloc.h>
+#include <stratum/block.h>
+#include <stratum/super.h>
+
+#include <pthread.h>
+#include <stdlib.h>
+#include <string.h>
+
+struct stm_sync {
+    pthread_mutex_t lock;
+
+    stm_bdev  *bdev;        /* borrowed */
+    stm_alloc *alloc;       /* borrowed — not owned */
+
+    uint64_t   pool_uuid[2];
+    uint64_t   device_uuid[2];
+
+    /* Commit state. */
+    uint64_t   current_gen;         /* last-committed gen; next commit is +1.
+                                     * 0 before any commit lands.          */
+    uint64_t   mount_max_durable;   /* maximum gen observed at mount time  */
+
+    /* Most recent uberblock location (valid once current_gen > 0). */
+    uint32_t   live_label_idx;
+    uint32_t   live_slot_idx;
+
+    /* Allocator-tree root paddr recorded in the last committed
+     * uberblock. 0 if no commits yet. */
+    uint64_t   alloc_root_paddr;
+};
+
+/* ========================================================================= */
+/* Ring rotation.                                                             */
+/* ========================================================================= */
+
+static inline uint32_t ring_label_for_gen(uint64_t gen)
+{
+    return (uint32_t)(gen % (uint64_t)STM_LABELS_PER_DEVICE);
+}
+
+static inline uint32_t ring_slot_for_gen(uint64_t gen)
+{
+    return (uint32_t)(gen % (uint64_t)STM_UB_SLOTS_PER_LABEL);
+}
+
+/* ========================================================================= */
+/* Uberblock construction.                                                    */
+/* ========================================================================= */
+
+/* Build an uberblock in `out` from sync state + caller's inputs.
+ * Fills pool_uuid / device_uuid / gen / txg / ub_alloc_root +
+ * zero'd main/snap/cas roots for MVP. Allocator stats populate
+ * total_blocks / free_blocks. */
+static void build_uberblock(stm_uberblock *out,
+                              const stm_sync *s,
+                              uint64_t new_gen,
+                              uint64_t alloc_root_paddr,
+                              const stm_alloc_stats *astats)
+{
+    memset(out, 0, sizeof *out);
+
+    out->ub_magic   = stm_store_le64(STM_UB_MAGIC);
+    out->ub_version = stm_store_le32(STM_UB_VERSION);
+
+    out->ub_pool_uuid[0]   = stm_store_le64(s->pool_uuid[0]);
+    out->ub_pool_uuid[1]   = stm_store_le64(s->pool_uuid[1]);
+    out->ub_device_uuid[0] = stm_store_le64(s->device_uuid[0]);
+    out->ub_device_uuid[1] = stm_store_le64(s->device_uuid[1]);
+
+    out->ub_gen         = stm_store_le64(new_gen);
+    out->ub_txg         = stm_store_le64(new_gen);     /* chunk 6 keeps
+                                                         * gen == txg */
+    out->ub_device_count = stm_store_le16(1);
+    out->ub_device_id    = stm_store_le16(0);
+
+    /* Allocator tree root. */
+    if (alloc_root_paddr != 0) {
+        out->ub_alloc_root.bp_paddr = stm_store_le64(alloc_root_paddr);
+        out->ub_alloc_root.bp_kind  = STM_BPTR_KIND_ALLOC;
+    }
+
+    /* Data-area totals (in blocks). */
+    out->ub_total_blocks = stm_store_le64(astats->data_total_blocks);
+    out->ub_free_blocks  = stm_store_le64(astats->data_free_blocks);
+
+    /* Chunk 6 MVP: single-device, no redundancy, no encryption
+     * schema. Those fields stay zero. */
+    out->ub_redundancy_kind = STM_RED_NONE;
+    out->ub_device_class    = STM_DEV_CLASS_UNSET;
+    out->ub_device_role     = STM_DEV_ROLE_UNSET;
+}
+
+/* ========================================================================= */
+/* Lifecycle.                                                                 */
+/* ========================================================================= */
+
+static stm_sync *sync_new(stm_bdev *d, stm_alloc *a,
+                           const uint64_t pool_uuid[2],
+                           const uint64_t device_uuid[2])
+{
+    stm_sync *s = calloc(1, sizeof *s);
+    if (!s) return NULL;
+
+    if (pthread_mutex_init(&s->lock, NULL) != 0) {
+        free(s);
+        return NULL;
+    }
+
+    s->bdev  = d;
+    s->alloc = a;
+    memcpy(s->pool_uuid,   pool_uuid,   sizeof s->pool_uuid);
+    memcpy(s->device_uuid, device_uuid, sizeof s->device_uuid);
+    return s;
+}
+
+stm_status stm_sync_create(stm_bdev *d, stm_alloc *a,
+                            const uint64_t pool_uuid[2],
+                            const uint64_t device_uuid[2],
+                            stm_sync **out_sync)
+{
+    if (!d || !a || !pool_uuid || !device_uuid || !out_sync) return STM_EINVAL;
+
+    stm_sync *s = sync_new(d, a, pool_uuid, device_uuid);
+    if (!s) return STM_ENOMEM;
+
+    /* Fresh pool: no uberblocks written yet. First stm_sync_commit
+     * will write gen=1 (matches sync.tla: Mount bumps to
+     * MaxDurableTxg+1 = 0+1 = 1). */
+    s->current_gen = 0;
+
+    *out_sync = s;
+    return STM_OK;
+}
+
+stm_status stm_sync_open(stm_bdev *d, stm_alloc *a, stm_sync **out_sync)
+{
+    if (!d || !a || !out_sync) return STM_EINVAL;
+
+    /* Scan for the authoritative uberblock. */
+    stm_uberblock ub;
+    uint32_t      live_label = 0, live_slot = 0;
+    stm_status s = stm_sb_mount_scan(d, &ub, &live_label, &live_slot);
+    if (s != STM_OK) return s;
+
+    uint64_t durable_gen = stm_load_le64(ub.ub_gen);
+    uint64_t pool_uuid[2] = {
+        stm_load_le64(ub.ub_pool_uuid[0]),
+        stm_load_le64(ub.ub_pool_uuid[1]),
+    };
+    uint64_t device_uuid[2] = {
+        stm_load_le64(ub.ub_device_uuid[0]),
+        stm_load_le64(ub.ub_device_uuid[1]),
+    };
+
+    stm_sync *s2 = sync_new(d, a, pool_uuid, device_uuid);
+    if (!s2) return STM_ENOMEM;
+
+    /* MountGenBump: current_gen = max_durable + 1. Our next commit
+     * will write gen = (current_gen + 1) = max_durable + 2. Wait —
+     * need to be careful. sync.tla's txg after Mount is
+     * MaxDurableTxg + 1, and the NEXT commit happens AT that txg
+     * (not txg+1). Let's match that: stm_sync_commit writes at
+     * current_gen, then bumps current_gen by 1.
+     *
+     * Representation choice in this code: `current_gen` is the
+     * next-commit's-gen, not the last-committed-gen. So on mount we
+     * set it to durable_gen + 1 to match sync.tla. */
+    s2->current_gen       = durable_gen + 1;
+    s2->mount_max_durable = durable_gen;
+    s2->live_label_idx    = live_label;
+    s2->live_slot_idx     = live_slot;
+
+    /* Rehydrate the allocator tree from ub_alloc_root. */
+    uint64_t alloc_root = stm_load_le64(ub.ub_alloc_root.bp_paddr);
+    uint8_t  kind       = ub.ub_alloc_root.bp_kind;
+    if (alloc_root != 0 && kind == STM_BPTR_KIND_ALLOC) {
+        stm_status ls = stm_alloc_load_tree_at(a, alloc_root);
+        if (ls != STM_OK) {
+            stm_sync_close(s2);
+            return ls;
+        }
+        s2->alloc_root_paddr = alloc_root;
+    }
+
+    *out_sync = s2;
+    return STM_OK;
+}
+
+void stm_sync_close(stm_sync *s)
+{
+    if (!s) return;
+    pthread_mutex_destroy(&s->lock);
+    free(s);
+}
+
+/* ========================================================================= */
+/* Commit.                                                                    */
+/* ========================================================================= */
+
+stm_status stm_sync_commit(stm_sync *s)
+{
+    if (!s) return STM_EINVAL;
+
+    pthread_mutex_lock(&s->lock);
+
+    /* We represent `current_gen` as the NEXT-commit's-gen. Fresh pool
+     * starts at 0 so first commit writes gen=0 (matches sync.tla's
+     * txg starting at 1 after Mount — we stay one-off because our
+     * convention is "0 = uninitialized"; the first commit's durable
+     * gen is what matters for ordering, not the specific starting
+     * number).
+     *
+     * Actually, align exactly with sync.tla's Mount-bumps-to-1
+     * semantic: on Create we'll commit at gen=1 first (simpler to
+     * reason about vs. allowing gen=0 on disk). */
+    uint64_t commit_gen = s->current_gen;
+    if (commit_gen == 0) commit_gen = 1;   /* first commit is gen=1 */
+
+    /* Phase: Reserve + Flush.
+     *
+     * stm_alloc_commit(committed_gen = commit_gen) persists the
+     * allocator-tree to the bootstrap pool. It reserves node paddrs
+     * (Reserve), writes nodes to the bdev (Flush), records PENDING
+     * entries for the old tree's nodes (to be swept at the next
+     * commit), and fsyncs via stm_bootstrap_commit. */
+    stm_status s_alloc = stm_alloc_commit(s->alloc, commit_gen);
+    if (s_alloc != STM_OK) {
+        pthread_mutex_unlock(&s->lock);
+        return s_alloc;
+    }
+
+    /* Pull the now-durable allocator tree root for ub_alloc_root. */
+    uint64_t alloc_root = 0;
+    stm_status sr = stm_alloc_get_tree_root(s->alloc, &alloc_root);
+    if (sr != STM_OK) {
+        pthread_mutex_unlock(&s->lock);
+        return sr;
+    }
+
+    /* Pull allocator stats for uberblock's total/free block counters. */
+    stm_alloc_stats astats;
+    sr = stm_alloc_stats_get(s->alloc, &astats);
+    if (sr != STM_OK) {
+        pthread_mutex_unlock(&s->lock);
+        return sr;
+    }
+
+    /* Phase: Final — write the new uberblock to the next ring slot,
+     * fsynced. This is the commit point per sync.tla. Ring rotation:
+     * label = gen % 4, slot = gen % 63. */
+    stm_uberblock ub;
+    build_uberblock(&ub, s, commit_gen, alloc_root, &astats);
+
+    uint32_t next_label = ring_label_for_gen(commit_gen);
+    uint32_t next_slot  = ring_slot_for_gen(commit_gen);
+
+    stm_status sw = stm_sb_label_write(s->bdev, next_label, next_slot, &ub);
+    if (sw != STM_OK) {
+        pthread_mutex_unlock(&s->lock);
+        return sw;
+    }
+
+    /* Phase: Publish — advance in-RAM state. Done under our mutex so
+     * any concurrent reader of stm_sync_info_get observes a
+     * consistent snapshot. */
+    s->current_gen       = commit_gen + 1;
+    s->live_label_idx    = next_label;
+    s->live_slot_idx     = next_slot;
+    s->alloc_root_paddr  = alloc_root;
+
+    pthread_mutex_unlock(&s->lock);
+    return STM_OK;
+}
+
+/* ========================================================================= */
+/* Inspection.                                                                */
+/* ========================================================================= */
+
+stm_status stm_sync_info_get(const stm_sync *s, stm_sync_info *out)
+{
+    if (!s || !out) return STM_EINVAL;
+    stm_sync *ms = (stm_sync *)s;
+    pthread_mutex_lock(&ms->lock);
+
+    out->current_gen           = s->current_gen;
+    out->mount_max_durable_gen = s->mount_max_durable;
+    out->live_label_idx        = s->live_label_idx;
+    out->live_slot_idx         = s->live_slot_idx;
+    out->alloc_root_paddr      = s->alloc_root_paddr;
+
+    pthread_mutex_unlock(&ms->lock);
+    return STM_OK;
+}
