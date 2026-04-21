@@ -45,12 +45,12 @@ Phase 4 so far, in order:
 - `bed67c8`        **P4-4a** — key-schema sub-tree + in-process unwrap.
 - `<R10 fixes>`    R10 findings closed (check closed-list for the commit hash).
 
-Tip as of writing: `<R10 fix commit>` (above `bed67c8`); check
-`git log --oneline -5` for the current tip. R10 closed with 1 P1 +
-4 P2 + 2 P3 fixed — notable: `stm_hybrid_wrap` / `_unwrap` now
-take an AD parameter (R10 P2-2), and sync.c binds `pool_uuid ‖
-dataset_id ‖ key_id` into it. Any new caller of `stm_hybrid_*`
-MUST pass a matching wrap-AD / unwrap-AD pair.
+Tip as of writing: `8bc97d7` (R10 fixes) above `bed67c8` (P4-4a).
+R10 closed with 1 P1 + 4 P2 + 2 P3 fixed — notable: `stm_hybrid_wrap`
+/ `_unwrap` now take an `ad` / `ad_len` parameter (R10 P2-2), and
+sync.c binds `pool_uuid ‖ dataset_id ‖ key_id` into it. Any new
+caller of `stm_hybrid_*` MUST pass a matching wrap-AD / unwrap-AD
+pair; test_hybrid's `hybrid_ad_mismatch_fails` is the reference.
 
 STM_UB_VERSION is **4**. STM_BPTR_KIND_KEYSCHEMA = 7. Metadata key
 stored PQ-hybrid-wrapped inside a Merkle-chained sub-tree rooted from
