@@ -165,24 +165,131 @@ STM_TEST(fs_state_survives_unmount_remount) {
     unlink(g_tmp_path);
 }
 
-/* NOTE: a read-only mount path is exposed by the stm_fs API but is
- * not exercised end-to-end here. A direct end-to-end test using
- * stm_bdev_open(read_only=true) interacts with the POSIX backend's
- * thread-pool shutdown in a way that hangs during close under the
- * current test harness. Tracking as a chunk-7 known issue; the guard
- * behavior itself is covered by fs_wedged_blocks_everything below
- * (the wedged flag and the read_only flag share the same guard
- * macros in src/fs/fs.c). */
+/* R7e-P0-1 regression: mount RO, verify every mutating API returns
+ * STM_EROFS without leaving fs->lock held, then verify unmount
+ * completes. A prior revision of FS_GUARD_WRITE returned without
+ * unlocking → unmount's pthread_mutex_lock hung forever. */
+STM_TEST(fs_read_only_blocks_writes) {
+    make_tmp("ro");
 
-/* NOTE: a wedged-flag test on a live (bdev-backed) stm_fs was
- * omitted here. The wedged path forces stm_fs_unmount to skip its
- * final commit; under the current POSIX-bdev thread-pool, closing
- * without that commit hangs during cleanup. The wedged guard
- * mechanism is verified by inspection (src/fs/fs.c: the
- * FS_GUARD_WRITE macro gates every mutating API on !wedged
- * before dispatching to stm_alloc / stm_sync). A proper end-to-end
- * wedged test needs a mock/injected bdev and is tracked for
- * chunk 8's crash-injection fuzzer work. */
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    stm_fs_mount_opts mopts = { .read_only = true };
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Stats still readable on RO. */
+    stm_fs_stats st;
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_EQ(st.read_only, true);
+    STM_ASSERT_EQ(st.wedged, false);
+
+    /* Every mutating API refuses. Each call must not leave fs->lock
+     * held — the next call would hang otherwise. */
+    uint64_t dummy = 0;
+    STM_ASSERT_ERR(stm_fs_reserve(fs, 4u, 0, &dummy), STM_EROFS);
+    STM_ASSERT_ERR(stm_fs_free(fs, 0, 0),             STM_EROFS);
+    STM_ASSERT_ERR(stm_fs_commit(fs),                 STM_EROFS);
+
+    /* Stats must still succeed after a refusal. */
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+
+    /* Unmount. RO skips the final commit (returns STM_OK). If the
+     * guard macro had leaked the lock, this hangs forever. */
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* R7e-P0-1 regression: same as above but for the wedged flag. */
+STM_TEST(fs_wedged_blocks_everything) {
+    make_tmp("wedge");
+
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Reserve something first so the final-commit-skip path actually
+     * drops state — exposes any bug in the wedged unmount path. */
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_fs_reserve(fs, 4u, 0, &p));
+
+    stm_fs_mark_wedged(fs);
+
+    /* Stats on a wedged fs are allowed (diagnostic). */
+    stm_fs_stats st;
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_EQ(st.wedged, true);
+
+    /* Every mutating API refuses with STM_EWEDGED. */
+    uint64_t dummy = 0;
+    STM_ASSERT_ERR(stm_fs_reserve(fs, 4u, 0, &dummy), STM_EWEDGED);
+    STM_ASSERT_ERR(stm_fs_free(fs, p, 0),             STM_EWEDGED);
+    STM_ASSERT_ERR(stm_fs_commit(fs),                 STM_EWEDGED);
+
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+
+    /* Unmount skips final commit (wedged); must still return cleanly. */
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* R7e-P1-1 regression: formatting over an existing pool must not leave
+ * the old uberblock ring lying around. A prior revision wrote only the
+ * fresh gen=1 uberblock and relied on the device being pre-zeroed; a
+ * reformat over a pool that had reached, say, gen=6 left gen=6 stale on
+ * disk. stm_sb_mount_scan picks highest-gen, so the mount would rehydrate
+ * the OLD tree root, then STM_EINVAL on the first commit's sweep when
+ * the new bootstrap bitmap didn't recognize the old-tree node paddrs. */
+STM_TEST(fs_reformat_over_old_pool_is_clean) {
+    make_tmp("reformat");
+
+    stm_fs_format_opts fopts = default_format_opts();
+    stm_fs_mount_opts  mopts = rw_mount_opts();
+
+    /* Pool A: reach gen ~6 via a handful of commits. */
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    for (int i = 0; i < 4; i++) {
+        uint64_t p = 0;
+        STM_ASSERT_OK(stm_fs_reserve(fs, 4u, 0, &p));
+        STM_ASSERT_OK(stm_fs_commit(fs));
+    }
+    stm_fs_stats st;
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    uint64_t old_gen = st.current_gen;
+    STM_ASSERT(old_gen >= 6u);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    /* Reformat the same path. Pool B must be indistinguishable from a
+     * freshly-created pool. */
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    /* New format's first commit is gen=1; mount bumps to 2. No leakage
+     * from the old pool. */
+    STM_ASSERT_EQ(st.current_gen, 2u);
+    STM_ASSERT_EQ(st.n_allocated_ranges, 0u);
+    STM_ASSERT_EQ(st.data_allocated_blocks, 0u);
+
+    /* Mutation + commit must work — the old-pool failure mode was a
+     * permanent STM_EINVAL on commit's sweep. */
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_fs_reserve(fs, 8u, 0, &p));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_EQ(st.current_gen, 3u);
+    STM_ASSERT_EQ(st.data_allocated_blocks, 8u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
 
 STM_TEST(fs_stats_reports_gen_progression) {
     make_tmp("gen");

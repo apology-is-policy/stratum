@@ -10,7 +10,7 @@
  *   1. Lifecycle: stm_fs_format writes a fresh pool; stm_fs_mount opens
  *      an existing one; stm_fs_unmount tears down (committing first
  *      unless RO or wedged).
- *   2. Runtime guards: STM_FS_GUARD_READ / _WRITE enforce wedged +
+ *   2. Runtime guards: FS_GUARD_READ / _WRITE enforce wedged +
  *      read_only state at every public entry.
  *   3. Single-mutex serialization for mutating ops. Matches the
  *      stm_alloc / stm_sync shape below.
@@ -19,12 +19,23 @@
  * detecting consistency violations must call stm_fs_mark_wedged
  * themselves. Auto-wedging policy arrives alongside the crash fuzzer
  * (chunk 8).
+ *
+ * Lock hierarchy (held in this order, never reversed):
+ *
+ *   fs->lock   →  sync->lock  →  alloc->lock  →  alloc's btree rwlock
+ *
+ * Public stm_fs entries acquire fs->lock then dispatch; stm_sync_commit
+ * nests stm_alloc_commit under sync->lock. Every reader-path inside
+ * stm_fs (stats_get) acquires the same order. Do not add a path that
+ * takes alloc->lock and then sync->lock — the commit path already owns
+ * the reverse, and crossing lock orders deadlocks.
  */
 
 #include <stratum/fs.h>
 #include <stratum/alloc.h>
 #include <stratum/block.h>
 #include <stratum/bootstrap.h>
+#include <stratum/super.h>
 #include <stratum/sync.h>
 
 #include <pthread.h>
@@ -46,22 +57,68 @@ struct stm_fs {
     bool wedged;
 };
 
-/* Guard macros. The lock is NOT acquired here — callers acquire it
- * themselves and check the flags while holding it. Acquiring the lock
- * inside the macro would double-lock whenever a public entry nests a
- * call into another. */
-#define FS_GUARD_READ(fs) do {                  \
-    if ((fs)->wedged)    return STM_EWEDGED;    \
+/* Guard macros. MUST be called while holding fs->lock. On the refusal
+ * path they UNLOCK fs->lock and return from the enclosing function.
+ * The caller's happy path is responsible for its own unlock; the guard
+ * only takes ownership of the unlock when it bails.
+ *
+ * R7e-P0-1: a prior revision returned without unlocking, which turned
+ * the very next mutex acquisition (from any API, including unmount)
+ * into a deadlock — the bug that the removed RO/wedged end-to-end
+ * tests had been tripping over and that was misdiagnosed as a POSIX-
+ * bdev thread-pool hang.                                                */
+#define FS_GUARD_READ(fs) do {                                             \
+    if ((fs)->wedged) {                                                    \
+        pthread_mutex_unlock(&(fs)->lock);                                 \
+        return STM_EWEDGED;                                                \
+    }                                                                      \
 } while (0)
 
-#define FS_GUARD_WRITE(fs) do {                 \
-    if ((fs)->wedged)    return STM_EWEDGED;    \
-    if ((fs)->read_only) return STM_EROFS;      \
+#define FS_GUARD_WRITE(fs) do {                                            \
+    if ((fs)->wedged) {                                                    \
+        pthread_mutex_unlock(&(fs)->lock);                                 \
+        return STM_EWEDGED;                                                \
+    }                                                                      \
+    if ((fs)->read_only) {                                                 \
+        pthread_mutex_unlock(&(fs)->lock);                                 \
+        return STM_EROFS;                                                  \
+    }                                                                      \
 } while (0)
 
 /* ========================================================================= */
 /* Format.                                                                    */
 /* ========================================================================= */
+
+/*
+ * R7e-P1-1: zero every byte of every label region before the first
+ * uberblock lands. Prevents a reformat-over-existing-pool from leaving
+ * stale high-gen uberblocks that would beat the new gen=1 at
+ * stm_sb_mount_scan, wedging the pool on the first commit.
+ *
+ * Writes 4 × STM_LABEL_SIZE (= 4 × 256 KiB = 1 MiB) of zeros and fsyncs
+ * once before returning. The cost is negligible vs. the rest of format
+ * and small vs. typical device sizes.
+ */
+static stm_status format_wipe_labels(stm_bdev *d, uint64_t device_bytes)
+{
+    uint64_t label_offsets[STM_LABELS_PER_DEVICE];
+    stm_status s = stm_label_offsets(device_bytes, label_offsets);
+    if (s != STM_OK) return s;
+
+    void *zeros = calloc(1, STM_LABEL_SIZE);
+    if (!zeros) return STM_ENOMEM;
+
+    for (uint32_t li = 0; li < STM_LABELS_PER_DEVICE; li++) {
+        s = stm_bdev_write(d, label_offsets[li], zeros, STM_LABEL_SIZE);
+        if (s != STM_OK) { free(zeros); return s; }
+    }
+    free(zeros);
+
+    /* Make the wipe durable before any real uberblock lands; otherwise
+     * a crash between wipe and first sync_commit could leave both stale
+     * and new UBs on media, the stale one winning. */
+    return stm_bdev_fsync(d);
+}
 
 stm_status stm_fs_format(const char *path, const stm_fs_format_opts *opts)
 {
@@ -78,6 +135,13 @@ stm_status stm_fs_format(const char *path, const stm_fs_format_opts *opts)
         s = stm_bdev_resize(d, opts->device_size_bytes);
         if (s != STM_OK) { stm_bdev_close(d); return s; }
     }
+
+    /* Wipe label regions before anything else writes to them. See
+     * format_wipe_labels doc. Uses the bdev's actual size (post-resize). */
+    const stm_bdev_caps *caps = stm_bdev_caps_of(d);
+    if (!caps) { stm_bdev_close(d); return STM_EIO; }
+    s = format_wipe_labels(d, caps->size_bytes);
+    if (s != STM_OK) { stm_bdev_close(d); return s; }
 
     stm_alloc *a = NULL;
     s = stm_alloc_create(d, opts->pool_uuid, opts->device_uuid,
@@ -233,19 +297,27 @@ stm_status stm_fs_commit(stm_fs *fs)
 stm_status stm_fs_stats_get(const stm_fs *fs, stm_fs_stats *out)
 {
     if (!fs || !out) return STM_EINVAL;
+
+    /* R7e-P2-3: zero *out so an early error leaves the caller's
+     * buffer deterministic, not partially-populated. */
+    memset(out, 0, sizeof *out);
+
     stm_fs *mfs = (stm_fs *)fs;
     pthread_mutex_lock(&mfs->lock);
     /* Allow reading stats on a wedged fs — useful for diagnostics. */
 
-    stm_alloc_stats astats;
-    stm_status s = stm_alloc_stats_get(fs->alloc, &astats);
+    /* R7e-P2-1: sync first, then alloc — matches the nesting used by
+     * stm_fs_commit (sync_commit -> alloc_commit). Keeps a single
+     * canonical lock order across all stm_fs entries. */
+    stm_sync_info sinfo;
+    stm_status s = stm_sync_info_get(fs->sync, &sinfo);
     if (s != STM_OK) {
         pthread_mutex_unlock(&mfs->lock);
         return s;
     }
 
-    stm_sync_info sinfo;
-    s = stm_sync_info_get(fs->sync, &sinfo);
+    stm_alloc_stats astats;
+    s = stm_alloc_stats_get(fs->alloc, &astats);
     if (s != STM_OK) {
         pthread_mutex_unlock(&mfs->lock);
         return s;
