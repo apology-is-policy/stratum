@@ -252,7 +252,7 @@ STM_TEST(sync_ub_alloc_root_matches_tree) {
     unlink(g_tmp_path);
 }
 
-STM_TEST(sync_commit_idempotent_empty_pool) {
+STM_TEST(sync_commit_empty_pool_produces_ub_alloc_root) {
     /* Commit with no allocations in the tree: tree is empty, ub_alloc_root
      * still points at an empty-leaf paddr. */
     make_tmp("empty");

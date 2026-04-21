@@ -137,84 +137,11 @@ static inline void decode_val(const uint8_t in[8],
     *out_refcount = stm_load_le32(r);
 }
 
-/* ========================================================================= */
-/* User-data slot encoding.                                                   */
-/* ========================================================================= */
-
-/* Layout of the bootstrap's user-data slot that the allocator owns.
- * 64 bytes out of STM_BOOTSTRAP_USER_DATA_SIZE (256). The remaining
- * bytes are reserved for future allocator metadata. */
-typedef struct {
-    le64    ud_magic;          /*  0 :  8 — "STAUDATA" */
-    le32    ud_version;        /*  8 :  4 */
-    le32    ud_flags;          /* 12 :  4 */
-    le64    ud_tree_root;      /* 16 :  8 — 0 if no tree persisted */
-    le64    ud_tree_gen;       /* 24 :  8 — gen when tree was last written */
-    uint8_t ud_reserved[32];   /* 32 : 32 */
-} stm_alloc_user_data;
-
-_Static_assert(sizeof(stm_alloc_user_data) == 64,
-               "stm_alloc_user_data must fit in 64 bytes");
-
-/* ASCII "STAUDATA" read as little-endian uint64. */
-#define STM_ALLOC_UD_MAGIC   UINT64_C(0x4154414455415453)
-#define STM_ALLOC_UD_VERSION 1u
-
-/* R7c P1-2: tree_root == 0 is reserved to mean "no tree persisted"
- * (matches the all-zero "never initialized" slot). The serialize path
- * only produces nonzero paddrs from the bootstrap pool, so encode
- * rejects 0 as a defensive invariant check.
- *
- * On decode, a valid-magic slot with tree_root == 0 is treated as
- * ENOENT too (defense in depth: even if a tampered slot presents
- * magic+version but tree_root=0, we don't hand a 0 paddr to the
- * deserializer). */
-static stm_status user_data_encode(uint64_t tree_root, uint64_t tree_gen,
-                                     uint8_t out[STM_BOOTSTRAP_USER_DATA_SIZE])
-{
-    if (tree_root == 0) return STM_EINVAL;
-
-    memset(out, 0, STM_BOOTSTRAP_USER_DATA_SIZE);
-
-    stm_alloc_user_data ud = { 0 };
-    ud.ud_magic     = stm_store_le64(STM_ALLOC_UD_MAGIC);
-    ud.ud_version   = stm_store_le32(STM_ALLOC_UD_VERSION);
-    ud.ud_tree_root = stm_store_le64(tree_root);
-    ud.ud_tree_gen  = stm_store_le64(tree_gen);
-    memcpy(out, &ud, sizeof ud);
-    return STM_OK;
-}
-
-/* Decode user_data; returns STM_ENOENT when the slot is zero (never
- * written) or has tree_root == 0 (reserved-as-absent), STM_EBADVERSION
- * on magic/version mismatch. */
-static stm_status user_data_decode(const uint8_t in[STM_BOOTSTRAP_USER_DATA_SIZE],
-                                     uint64_t *out_tree_root,
-                                     uint64_t *out_tree_gen)
-{
-    /* All-zero = "never initialized" → no tree yet. Checks first 32
-     * bytes, which covers magic(8) + version(4) + flags(4) +
-     * tree_root(8) + tree_gen(8) — all load-bearing fields. If any
-     * future field in ud_reserved[32] becomes load-bearing, extend
-     * the window. */
-    bool all_zero = true;
-    for (size_t i = 0; i < 32; i++) {
-        if (in[i] != 0) { all_zero = false; break; }
-    }
-    if (all_zero) return STM_ENOENT;
-
-    stm_alloc_user_data ud;
-    memcpy(&ud, in, sizeof ud);
-    if (stm_load_le64(ud.ud_magic)   != STM_ALLOC_UD_MAGIC)   return STM_EBADVERSION;
-    if (stm_load_le32(ud.ud_version) != STM_ALLOC_UD_VERSION) return STM_EBADVERSION;
-
-    uint64_t tree_root = stm_load_le64(ud.ud_tree_root);
-    if (tree_root == 0) return STM_ENOENT;   /* R7c P1-2 */
-
-    *out_tree_root = tree_root;
-    *out_tree_gen  = stm_load_le64(ud.ud_tree_gen);
-    return STM_OK;
-}
+/* The bootstrap's 256-byte user_data slot is currently unused. Chunk 5d
+ * stored an allocator-tree root there; R7d's P0-1 fix retired that
+ * because ub_alloc_root (set by stm_sync_commit) is the sole
+ * authoritative source. The slot remains in the bootstrap format for
+ * future allocator metadata that doesn't belong in the uberblock. */
 
 /* ========================================================================= */
 /* Store vtable: bridge stm_btree_store to stm_bootstrap + stm_bdev.          */
@@ -442,36 +369,20 @@ stm_status stm_alloc_get_tree_root(const stm_alloc *a, uint64_t *out_root_paddr)
 
 stm_status stm_alloc_open(stm_bdev *d, stm_alloc **out_alloc)
 {
-    stm_alloc *a = NULL;
-    stm_status s = open_handle_bare(d, &a);
-    if (s != STM_OK) return s;
-
-    /* Chunk 5d: if the bootstrap's user-data slot records a previously
-     * persisted tree root, deserialize it into our in-RAM tree. Zero /
-     * never-written slot → fresh open, empty tree (same as create). */
-    uint8_t ud_buf[STM_BOOTSTRAP_USER_DATA_SIZE];
-    s = stm_bootstrap_get_user_data(a->boot, ud_buf, sizeof ud_buf);
-    if (s != STM_OK) {
-        stm_alloc_close(a);
-        return s;
-    }
-
-    uint64_t root_paddr = 0, root_gen = 0;
-    stm_status ds = user_data_decode(ud_buf, &root_paddr, &root_gen);
-    if (ds == STM_OK && root_paddr != 0) {
-        stm_status ls = stm_alloc_load_tree_at(a, root_paddr);
-        if (ls != STM_OK) {
-            stm_alloc_close(a);
-            return ls;
-        }
-    } else if (ds != STM_OK && ds != STM_ENOENT) {
-        stm_alloc_close(a);
-        return ds;
-    }
-    /* ds == STM_ENOENT: no tree persisted → leave tree empty. */
-
-    *out_alloc = a;
-    return STM_OK;
+    /* R7d P0-1: `stm_alloc_open` is now an alias for
+     * `stm_alloc_open_blank`. The previous auto-load-from-user_data
+     * path created a divergence window — a crash between
+     * stm_alloc_commit (which wrote user_data) and stm_sync_commit
+     * (which writes ub_alloc_root) would leave the two sources
+     * disagreeing on "which tree is live." stm_alloc_open reading
+     * user_data would then return an un-published tree.
+     *
+     * All production callers use stm_sync_open (which reads
+     * ub_alloc_root from the uberblock and calls
+     * stm_alloc_load_tree_at). Tests that want a rehydrated
+     * allocator without going through stm_sync must call
+     * stm_alloc_load_tree_at explicitly. */
+    return open_handle_bare(d, out_alloc);
 }
 
 void stm_alloc_close(stm_alloc *a)
@@ -844,18 +755,10 @@ stm_status stm_alloc_commit(stm_alloc *a, uint64_t committed_gen)
             return ss;
         }
 
-        uint8_t ud_buf[STM_BOOTSTRAP_USER_DATA_SIZE];
-        stm_status ue = user_data_encode(new_root, committed_gen, ud_buf);
-        if (ue != STM_OK) {
-            /* R7c P1-2 defensive: serialize must never hand back 0. */
-            pthread_mutex_unlock(&a->lock);
-            return ue;
-        }
-        stm_status us = stm_bootstrap_set_user_data(a->boot, ud_buf, sizeof ud_buf);
-        if (us != STM_OK) {
-            pthread_mutex_unlock(&a->lock);
-            return us;
-        }
+        /* R7d P0-1: we no longer write the tree root into the bootstrap
+         * user_data slot. ub_alloc_root (set by stm_sync_commit) is the
+         * sole authoritative source. Two sources diverging on a
+         * mid-commit crash was a real correctness hazard. */
     }
 
     /* Commit the bootstrap pool — persists bitmap + (if we wrote it)

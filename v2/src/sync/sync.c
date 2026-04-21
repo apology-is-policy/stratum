@@ -176,6 +176,10 @@ stm_status stm_sync_open(stm_bdev *d, stm_alloc *a, stm_sync **out_sync)
     if (s != STM_OK) return s;
 
     uint64_t durable_gen = stm_load_le64(ub.ub_gen);
+
+    /* R7d P2-5: bound durable_gen so the +1 below doesn't wrap. */
+    if (durable_gen >= UINT64_MAX - 1) return STM_ERANGE;
+
     uint64_t pool_uuid[2] = {
         stm_load_le64(ub.ub_pool_uuid[0]),
         stm_load_le64(ub.ub_pool_uuid[1]),
@@ -188,25 +192,26 @@ stm_status stm_sync_open(stm_bdev *d, stm_alloc *a, stm_sync **out_sync)
     stm_sync *s2 = sync_new(d, a, pool_uuid, device_uuid);
     if (!s2) return STM_ENOMEM;
 
-    /* MountGenBump: current_gen = max_durable + 1. Our next commit
-     * will write gen = (current_gen + 1) = max_durable + 2. Wait —
-     * need to be careful. sync.tla's txg after Mount is
-     * MaxDurableTxg + 1, and the NEXT commit happens AT that txg
-     * (not txg+1). Let's match that: stm_sync_commit writes at
-     * current_gen, then bumps current_gen by 1.
-     *
-     * Representation choice in this code: `current_gen` is the
-     * next-commit's-gen, not the last-committed-gen. So on mount we
-     * set it to durable_gen + 1 to match sync.tla. */
+    /* MountGenBump (sync.tla): next commit's gen must be strictly
+     * greater than any durable gen. Convention: `current_gen` is
+     * the next-commit's-gen, so set it to durable_gen + 1. */
     s2->current_gen       = durable_gen + 1;
     s2->mount_max_durable = durable_gen;
     s2->live_label_idx    = live_label;
     s2->live_slot_idx     = live_slot;
 
-    /* Rehydrate the allocator tree from ub_alloc_root. */
+    /* Rehydrate the allocator tree from ub_alloc_root. R7d P1-1:
+     * a valid-csum uberblock with a nonzero ub_alloc_root.bp_paddr
+     * but wrong kind indicates tampering — surface as STM_ECORRUPT
+     * rather than silently returning a handle with an empty tree
+     * that would alias the real (on-disk but unreferenced) data. */
     uint64_t alloc_root = stm_load_le64(ub.ub_alloc_root.bp_paddr);
     uint8_t  kind       = ub.ub_alloc_root.bp_kind;
-    if (alloc_root != 0 && kind == STM_BPTR_KIND_ALLOC) {
+    if (alloc_root != 0) {
+        if (kind != STM_BPTR_KIND_ALLOC) {
+            stm_sync_close(s2);
+            return STM_ECORRUPT;
+        }
         stm_status ls = stm_alloc_load_tree_at(a, alloc_root);
         if (ls != STM_OK) {
             stm_sync_close(s2);
@@ -236,18 +241,20 @@ stm_status stm_sync_commit(stm_sync *s)
 
     pthread_mutex_lock(&s->lock);
 
-    /* We represent `current_gen` as the NEXT-commit's-gen. Fresh pool
-     * starts at 0 so first commit writes gen=0 (matches sync.tla's
-     * txg starting at 1 after Mount — we stay one-off because our
-     * convention is "0 = uninitialized"; the first commit's durable
-     * gen is what matters for ordering, not the specific starting
-     * number).
-     *
-     * Actually, align exactly with sync.tla's Mount-bumps-to-1
-     * semantic: on Create we'll commit at gen=1 first (simpler to
-     * reason about vs. allowing gen=0 on disk). */
+    /* Convention: s->current_gen = 0 means "fresh pool, no commits yet";
+     * post-mount it's (max_durable + 1), i.e. next-commit's-gen. Force
+     * the first commit to gen=1 so on-disk gens are strictly positive
+     * (matches sync.tla's Mount bumping txg from 0 to 1). */
     uint64_t commit_gen = s->current_gen;
-    if (commit_gen == 0) commit_gen = 1;   /* first commit is gen=1 */
+    if (commit_gen == 0) commit_gen = 1;
+
+    /* R7d P2-5: refuse to commit if advancing current_gen would wrap
+     * past UINT64_MAX. 2^64 commits is astronomically unreachable, but
+     * bounded gen arithmetic is the project norm. */
+    if (commit_gen >= UINT64_MAX) {
+        pthread_mutex_unlock(&s->lock);
+        return STM_ERANGE;
+    }
 
     /* Phase: Reserve + Flush.
      *

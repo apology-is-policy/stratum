@@ -97,23 +97,26 @@ stm_status stm_alloc_create(stm_bdev *d,
                              stm_alloc **out_alloc);
 
 /*
- * Open an existing allocator. Reads the bootstrap pool and, if a
- * tree root is recorded in the bootstrap's user_data slot, deserializes
- * the data-area tree. Fresh pools open with an empty tree.
+ * Open the bootstrap pool and return an allocator handle with an
+ * EMPTY data-area tree. Production callers should use
+ * `stm_sync_open`, which (via ub_alloc_root in the uberblock) calls
+ * `stm_alloc_load_tree_at` to populate the tree. Callers bypassing
+ * stm_sync must call stm_alloc_load_tree_at directly.
+ *
+ * R7d P0-1: this function formerly auto-loaded the tree from a
+ * bootstrap user_data slot. That path was deleted because a crash
+ * between `stm_alloc_commit` and `stm_sync_commit` could leave
+ * user_data and ub_alloc_root disagreeing about the live root —
+ * the two-sources-of-truth hazard. The uberblock is now the sole
+ * authority.
+ *
+ * `stm_alloc_open` is preserved as an alias for `stm_alloc_open_blank`
+ * so existing call sites compile unchanged.
  */
 STM_MUST_USE
 stm_status stm_alloc_open(stm_bdev *d, stm_alloc **out_alloc);
 
-/*
- * Open the bootstrap pool but do NOT auto-load the allocator tree.
- * Caller is responsible for calling stm_alloc_load_tree_at afterwards
- * with a root paddr supplied from an external authoritative source
- * (e.g. the uberblock's ub_alloc_root under chunk 6's sync layer).
- *
- * Intended for callers that want the uberblock to be the source of
- * truth rather than the bootstrap user_data slot. Falls through to the
- * same stm_alloc handle shape as stm_alloc_open.
- */
+/* Same as stm_alloc_open — retained for clarity of intent. */
 STM_MUST_USE
 stm_status stm_alloc_open_blank(stm_bdev *d, stm_alloc **out_alloc);
 

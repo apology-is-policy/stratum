@@ -102,7 +102,14 @@ stm_status stm_sync_create(stm_bdev *d, stm_alloc *a,
  * uberblock's ub_alloc_root).
  *
  * Returns STM_ENOENT when no valid uberblock exists on the device
- * (operator needs stm_sync_create, not _open).
+ * (operator needs stm_sync_create, not _open). Returns STM_ECORRUPT
+ * if the selected uberblock's ub_alloc_root has a nonzero paddr but
+ * the wrong kind (tampering indicator). Returns STM_ERANGE if the
+ * durable gen is UINT64_MAX or UINT64_MAX-1 (cannot MountGenBump).
+ *
+ * On ANY failure, `*a` may be in a partially-loaded state (if the
+ * failure was in stm_alloc_load_tree_at); callers should discard
+ * the handle via stm_alloc_close and not reuse it.
  */
 STM_MUST_USE
 stm_status stm_sync_open(stm_bdev *d, stm_alloc *a, stm_sync **out_sync);
@@ -112,6 +119,18 @@ stm_status stm_sync_open(stm_bdev *d, stm_alloc *a, stm_sync **out_sync);
  * Publish). On STM_OK, current_gen has advanced by 1 and a new
  * uberblock is durable on disk referencing the latest allocator
  * state.
+ *
+ * Known MVP caveat (R7d P0-2): a crash between the internal
+ * stm_alloc_commit (which flushes bootstrap state) and
+ * stm_sb_label_write (the uberblock write) leaks bootstrap-pool
+ * bitmap bits for the tree nodes written for the in-flight commit.
+ * The next mount via stm_sync_open picks the prior uberblock
+ * (CommitAtomic holds — the orphan tree nodes are unreachable),
+ * but the bits they occupy remain marked allocated until the
+ * next pool reformat or until a future fsck pass reconciles. This
+ * is leak-on-failure, not corruption — nonce-uniqueness and data
+ * integrity are preserved. The two-phase-bootstrap-commit fix is
+ * tracked for chunk 7+.
  */
 STM_MUST_USE
 stm_status stm_sync_commit(stm_sync *s);
@@ -120,6 +139,10 @@ stm_status stm_sync_commit(stm_sync *s);
  * Release the handle. Does NOT commit; callers who need durability
  * must call stm_sync_commit first. Does NOT close the underlying
  * stm_alloc — the caller owns that lifecycle.
+ *
+ * Callers must ensure no other thread is using `s` at close time.
+ * close does not self-quiesce and destroys the internal mutex
+ * (destroying a locked mutex is undefined behavior per POSIX).
  */
 void stm_sync_close(stm_sync *s);
 

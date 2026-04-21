@@ -415,69 +415,26 @@ STM_TEST(alloc_reserve_rejects_over_u32_r7b_p1_1) {
     unlink(g_tmp_path);
 }
 
-STM_TEST(alloc_data_tree_persists_across_open) {
-    /* Chunk 5d: data-area tree is now persisted to the bootstrap pool
-     * and rehydrated on open. Verify allocated ranges survive
-     * close/open. */
-    make_tmp("rm");
+/* Persistence-via-stm_alloc_open tests moved to test_sync.c (R7d P0-1).
+ * stm_alloc_open no longer auto-loads the tree from user_data; the
+ * canonical way to rehydrate is stm_sync_open which reads
+ * ub_alloc_root from the uberblock and calls stm_alloc_load_tree_at. */
+
+STM_TEST(alloc_open_after_commit_is_blank) {
+    /* R7d P0-1: confirm stm_alloc_open returns an empty tree even
+     * after a commit wrote one. Callers must use stm_sync_open
+     * (or call stm_alloc_load_tree_at directly) to rehydrate. */
+    make_tmp("open_blank");
     stm_bdev *d = open_fresh_device();
     stm_alloc *a = make_fresh_alloc(d);
 
-    uint64_t p1 = 0, p2 = 0, p3 = 0;
-    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p1));
-    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &p2));
-    STM_ASSERT_OK(stm_alloc_reserve(a, 16u, 0, &p3));
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p));
     STM_ASSERT_OK(stm_alloc_commit(a, 1));
 
-    stm_alloc_stats st;
-    STM_ASSERT_OK(stm_alloc_stats_get(a, &st));
-    STM_ASSERT_EQ(st.n_allocated_ranges, 3u);
-    STM_ASSERT_EQ(st.data_allocated_blocks, 4u + 8u + 16u);
-
-    stm_alloc_close(a);
-    stm_bdev_close(d);
-
-    /* Reopen and verify state persisted. */
-    stm_bdev_open_opts opts = stm_bdev_open_opts_default();
-    stm_bdev *d2 = NULL;
-    STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &opts, &d2));
-
-    stm_alloc *a2 = NULL;
-    STM_ASSERT_OK(stm_alloc_open(d2, &a2));
-
-    STM_ASSERT_OK(stm_alloc_stats_get(a2, &st));
-    STM_ASSERT_EQ(st.bootstrap_bitmap_gen, 1u);
-    STM_ASSERT_EQ(st.n_allocated_ranges,   3u);
-    STM_ASSERT_EQ(st.data_allocated_blocks, 4u + 8u + 16u);
-
-    /* Each specific paddr should lookup as allocated with correct length. */
-    uint64_t len = 0; uint32_t rc = 0;
-    STM_ASSERT_OK(stm_alloc_lookup(a2, p1, &len, &rc));
-    STM_ASSERT_EQ(len, 4u); STM_ASSERT_EQ(rc, 1u);
-    STM_ASSERT_OK(stm_alloc_lookup(a2, p2, &len, &rc));
-    STM_ASSERT_EQ(len, 8u); STM_ASSERT_EQ(rc, 1u);
-    STM_ASSERT_OK(stm_alloc_lookup(a2, p3, &len, &rc));
-    STM_ASSERT_EQ(len, 16u); STM_ASSERT_EQ(rc, 1u);
-
-    stm_alloc_close(a2);
-    stm_bdev_close(d2);
-    unlink(g_tmp_path);
-}
-
-STM_TEST(alloc_persistence_across_multiple_commits) {
-    /* Several commits with intervening reserve/free; verify the
-     * final state is what survives. */
-    make_tmp("persist_multi");
-    stm_bdev *d = open_fresh_device();
-    stm_alloc *a = make_fresh_alloc(d);
-
-    uint64_t p1 = 0, p2 = 0;
-    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p1));
-    STM_ASSERT_OK(stm_alloc_commit(a, 1));
-
-    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &p2));
-    STM_ASSERT_OK(stm_alloc_free(a, p1, /*free_gen=*/ 2));
-    STM_ASSERT_OK(stm_alloc_commit(a, 3));   /* p1 swept; p2 stays */
+    uint64_t root = 0;
+    STM_ASSERT_OK(stm_alloc_get_tree_root(a, &root));
+    STM_ASSERT(root != 0);
 
     stm_alloc_close(a);
     stm_bdev_close(d);
@@ -490,41 +447,18 @@ STM_TEST(alloc_persistence_across_multiple_commits) {
 
     stm_alloc_stats st;
     STM_ASSERT_OK(stm_alloc_stats_get(a2, &st));
-    STM_ASSERT_EQ(st.n_allocated_ranges,    1u);
-    STM_ASSERT_EQ(st.data_allocated_blocks, 8u);
-
-    uint64_t len = 0; uint32_t rc = 0;
-    STM_ASSERT_OK(stm_alloc_lookup(a2, p2, &len, &rc));
-    STM_ASSERT_EQ(len, 8u);
-    /* p1 is gone — lookup returns ENOENT. */
-    STM_ASSERT_ERR(stm_alloc_lookup(a2, p1, &len, &rc), STM_ENOENT);
-
-    stm_alloc_close(a2);
-    stm_bdev_close(d2);
-    unlink(g_tmp_path);
-}
-
-STM_TEST(alloc_empty_tree_persists) {
-    /* Commit with no reservations → empty tree persists; reopen shows
-     * zero allocated ranges. */
-    make_tmp("empty_persist");
-    stm_bdev *d = open_fresh_device();
-    stm_alloc *a = make_fresh_alloc(d);
-
-    STM_ASSERT_OK(stm_alloc_commit(a, 1));
-    stm_alloc_close(a);
-    stm_bdev_close(d);
-
-    stm_bdev_open_opts opts = stm_bdev_open_opts_default();
-    stm_bdev *d2 = NULL;
-    STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &opts, &d2));
-    stm_alloc *a2 = NULL;
-    STM_ASSERT_OK(stm_alloc_open(d2, &a2));
-
-    stm_alloc_stats st;
-    STM_ASSERT_OK(stm_alloc_stats_get(a2, &st));
-    STM_ASSERT_EQ(st.n_allocated_ranges,    0u);
+    STM_ASSERT_EQ(st.n_allocated_ranges, 0u);
     STM_ASSERT_EQ(st.data_allocated_blocks, 0u);
+
+    uint64_t got_root = 0;
+    STM_ASSERT_OK(stm_alloc_get_tree_root(a2, &got_root));
+    STM_ASSERT_EQ(got_root, 0u);
+
+    /* Explicit load_tree_at WORKS with the known root — shows that
+     * the data is actually there, just not auto-loaded. */
+    STM_ASSERT_OK(stm_alloc_load_tree_at(a2, root));
+    STM_ASSERT_OK(stm_alloc_stats_get(a2, &st));
+    STM_ASSERT_EQ(st.n_allocated_ranges, 1u);
 
     stm_alloc_close(a2);
     stm_bdev_close(d2);
