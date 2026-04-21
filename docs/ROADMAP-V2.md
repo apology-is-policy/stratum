@@ -351,13 +351,14 @@ The most architecturally risky phase (per NOVEL #4). Extensive TLA+ spec work + 
 - **AEAD on metadata nodes**:
   - Tree node encryption with `stm_ad_node`.
   - Decryption on read with AD verification.
-- **Key hierarchy** (`src/keyagent/`):
-  - Key agent process (`stratum-keyagent`).
-  - 9P protocol between daemon and agent (§7.9).
+- **Key hierarchy**:
+  - **Key-schema sub-tree** (`src/keyschema/`) — wrapped keys stored in a Merkle-chained B-tree rooted from `ub_key_schema` (ARCH §7.7.3). Fifth input to `ub_merkle_root`.
+  - **Janus** (`src/janus/`) — key-agent daemon per ARCH §7.9.
+  - 9P protocol between daemon and FS (§7.9).
   - Backends: passphrase, file (for automation).
   - Key unwrap/rewrap/rotate primitives.
-- **Per-dataset encryption state** in uberblock.
-- **TLA+ spec**: `merkle.tla`.
+- **Per-dataset encryption state** in the key-schema sub-tree.
+- **TLA+ specs**: `merkle.tla` (hash propagation), `key_schema.tla` (rotation atomicity + retired-key retention).
 - **Tests**:
   - End-to-end encrypted write + read + verify.
   - Tamper-evidence: offline metadata edit detection.
@@ -370,8 +371,9 @@ The most architecturally risky phase (per NOVEL #4). Extensive TLA+ spec work + 
 - [ ] Mount-time full verify (opt-in) works on 1 TiB test volume.
 - [ ] On-read verify has ≤ 5% overhead vs disabled.
 - [ ] Tampering with a metadata block is cryptographically detected.
-- [ ] Key agent + daemon integrated; passphrase backend works.
+- [ ] Janus + daemon integrated; passphrase backend works.
 - [ ] `merkle.tla` proves hash-propagation correctness under COW.
+- [ ] `key_schema.tla` proves rotation atomicity + retired-key retention.
 
 ### 7.3 Risks
 

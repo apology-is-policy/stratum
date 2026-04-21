@@ -1745,11 +1745,14 @@ From earlier docs:
 Decisions taken in this section:
 
 - **Support both AEAD modes** — AEGIS-256 by default on hardware with AES acceleration (x86-64 + AES-NI, ARMv8 + crypto extensions); XChaCha20-SIV as fallback and as explicit-override option. Detected at pool creation, settable per-dataset.
-- **Three-level logical key hierarchy**: (1) wrap key at agent, (2) dataset key stored wrapped in uberblock, (3) per-object logical key derived from dataset key + AD context. Only (1) and (2) are physical keys; (3) is derivation at encrypt/decrypt time.
+- **Three-level logical key hierarchy**: (1) wrap key at agent, (2) dataset key stored wrapped in the key-schema sub-tree, (3) per-object logical key derived from dataset key + AD context. Only (1) and (2) are physical keys; (3) is derivation at encrypt/decrypt time.
+- **Key agent named `janus`** (§7.9) — separate process, 9P synthetic FS, one binary, pluggable backends.
+- **Key-schema is its own Merkle-chained sub-tree** (§7.7.3) — not inlined in the uberblock. 1192-byte PQ-hybrid wrapped keys don't fit the 512-byte `ub_key_schema` field; a dedicated tree scales to arbitrary dataset + rotation counts and reuses the existing btree_store / AEAD / Merkle machinery.
 - **AD struct layout** extends v1's to multi-device + dataset: see §7.6.
-- **Retired-key list** in uberblock: old dataset keys kept for reading historical data without forcing re-encryption on rotation.
-- **Merkle over ALL metadata**: every metadata block is in the Merkle tree, rooted at the uberblock.
+- **Retired-key list** in the sub-tree: old dataset keys kept for reading historical data without forcing re-encryption on rotation.
+- **Merkle over ALL metadata**: every metadata block is in the Merkle tree, rooted at the uberblock. Key-schema is the fifth root after main / alloc / snap / cas.
 - **Per-extent integrity** (xxHash3 vs AEAD tag) is mode-dependent, carried forward from v1's Phase D #7.
+- **Formal models**: `merkle.tla` for hash propagation (landed Phase 4); `key_schema.tla` for rotation atomicity + retired-key retention (lands with P4-4a).
 
 ### 7.3 Key hierarchy
 
@@ -1798,8 +1801,8 @@ Three-level logical structure:
   ```
   wrapped_D_i = HPKE-seal(wrap_key_pk, D_i)
   ```
-  Where HPKE (RFC 9180) is instantiated with the hybrid KEM: X25519 || ML-KEM-768, plus XChaCha20-Poly1305 AEAD for the wrapping.
-- Stored in the uberblock's `ub_key_schema` (§5.4), 512 bytes reserved.
+  Where HPKE (RFC 9180) is instantiated with the hybrid KEM: X25519 || ML-KEM-768, plus XChaCha20-Poly1305 AEAD for the wrapping. Wrapped form is ~1192 bytes per key (32-byte dek + 1160-byte overhead).
+- Stored in the **key-schema sub-tree** (§7.7.3), rooted from `ub_key_schema`. The tree scales to arbitrary dataset counts and rotation histories; the 512-byte uberblock field itself only holds a header + bptr to the tree root.
 - Key rotation generates a new D_i, marks the old as "retired" (§7.7).
 
 #### 7.3.3 Per-object logical key
@@ -1992,21 +1995,39 @@ Procedure:
 
 Retired keys stay in `ub_key_schema` indefinitely unless explicitly pruned. They're cheap to store (few KB each).
 
-#### 7.7.3 Retired key storage
+#### 7.7.3 Key-schema sub-tree
 
-`ub_key_schema` (512 bytes) layout:
+Wrapped PQ-hybrid keys are ~1192 bytes each, which is too large to store directly in the 512-byte `ub_key_schema` field. The schema lives in its own B-tree, rooted from the uberblock.
+
+`ub_key_schema` (512 bytes) is a header + bptr:
 
 ```
-[num_keys: 1 byte][reserved: 7 bytes]
-[key[0]: 128 bytes: id + state + wrapped_bytes]
-[key[1]: 128 bytes]
-[key[2]: 128 bytes]
-[key[3]: 128 bytes]
+[schema_magic:   4 bytes = 'KSCH']
+[schema_version: 4 bytes]
+[schema_flags:   8 bytes]         // feature flags: PQ-hybrid, wrap-suite, etc.
+[schema_root:   64 bytes stm_bptr] // paddr + kind + bp_csum of the sub-tree root
+[schema_gen:     8 bytes]          // AEAD nonce gen for the sub-tree root node
+[reserved:     424 bytes]
 ```
 
-Max 4 keys per dataset entry; one current, up to 3 retired. Rotations beyond 3 force pruning of the oldest retired key (which requires verifying no data still uses it — background scan task).
+**Key-schema tree**:
 
-For datasets with complex rotation histories, a pointer to an "extended key schema" object stored in the main tree is used (feature flag `COMPAT_EXTENDED_KEY_SCHEMA`).
+- Same on-disk node format as the allocator tree (§6.3) — reuses `stm_btnode` + `stm_btree_store` + AEGIS-256 wrapping (§7.5).
+- Key: 16-byte composite `(le64 dataset_id, le64 key_id)`. `key_id` monotonically increases per dataset; rotation inserts a new `(dataset_id, key_id+1)` entry and marks the previous one retired via a state byte in the value.
+- Value: `state(1) || flags(1) || reserved(6) || wrapped_key(~1192 bytes)`. `state ∈ {CURRENT, RETIRED, PRUNING}`; `CURRENT` entries are the active encryption key for new writes; `RETIRED` entries remain unwrappable for reading historical data; `PRUNING` marks a retired key undergoing re-encryption-sweep before deletion.
+- Scale: at `STM_BTNODE_PAYLOAD_MAX = 130912` bytes per leaf ÷ (~16 + ~1200) ≈ 107 wrapped keys per leaf. Two-level trees reach ~107² ≈ 11 000 keys before needing a third level. Real pools (dozens of datasets × a few rotations each) stay well inside one leaf.
+
+**Merkle integration**: the key-schema root's `bp_csum` is the fifth input to `ub_merkle_root` (§7.11.3). Tamper on any wrapped key → mount-time Merkle check fails. The sub-tree nodes themselves are AEAD-encrypted under the pool's metadata key (§7.5) just like alloc-tree nodes; tag tamper detects bit-flip at the per-node level.
+
+**Rotation semantics** (formalised in `key_schema.tla`):
+
+1. FS requests new wrapped `D_i'` from the agent.
+2. Insert `(dataset_id, key_id+1, CURRENT)` into the sub-tree; update the existing `(dataset_id, key_id, CURRENT)` entry to `RETIRED`. Single commit — atomic via the regular commit protocol.
+3. Background re-encrypt sweep (optional) walks extents referencing `key_id`, rewrites them under `key_id+1`, then transitions `key_id` to `PRUNING` and eventually deletes the entry.
+
+**Multi-device durability** (Phase 5): the sub-tree's root paddr is on a single device, but the key schema is pool-scoped — each device's uberblock points to the same tree. Redundancy comes from whole-device mirroring; if the device holding the key-schema tree fails, the pool recovers from a mirror. Treating key material as pool-level (not device-level) metadata simplifies the consistency story.
+
+**Format versioning**: the `schema_version` field in the header governs the wrapped-key format. Introducing a new wrap suite (post-PQ-hybrid) is a version bump on `schema_version`, not on `STM_UB_VERSION` — key rotation to the new suite is the upgrade path.
 
 ### 7.8 Per-dataset encryption inheritance
 
@@ -2021,16 +2042,18 @@ The `encryption` property is set at dataset creation and cannot be changed after
 
 `inherit` vs `independent` is the subtle distinction. In the inherit case, the child's entry in `ub_key_schema` is an *alias* pointing at the parent's key rather than its own wrapped key. This matters for key rotation: rotating the parent rotates the inherit-aliased children atomically.
 
-### 7.9 Key agent protocol
+### 7.9 Janus — the key-agent daemon
 
-The filesystem and the key agent are separate processes. They communicate via a 9P connection on a Unix socket at `/var/run/stratum-agent.sock` (path configurable; default uses the system's run directory).
+The filesystem and the key agent are separate processes. The agent binary is named **`janus`** — two-faced, presenting 9P to the filesystem on one side and a pluggable backend interface (passphrase / TPM / PKCS#11 / YubiKey) on the other. They communicate via a 9P connection on a Unix socket at `/var/run/janus.sock` (path configurable; default uses the system's run directory).
 
-Why 9P? We already implement 9P for client access; reusing it for the agent avoids a bespoke RPC. The agent exposes a small synthetic filesystem with keyed operations.
+Why 9P? We already implement 9P for client access; reusing it for the agent avoids a bespoke RPC. Janus exposes a small synthetic filesystem with keyed operations.
 
-#### 7.9.1 Agent synthetic FS
+Why a separate binary? Crashes in the FS should not leak key material; crashes in janus should not corrupt the FS. The process boundary is a security boundary — `SO_PEERCRED` + capability tokens mediate access (§7.9.2).
+
+#### 7.9.1 Janus synthetic FS
 
 ```
-/agent/
+/janus/
 ├── pools/
 │   └── <pool_uuid>/
 │       ├── wrap-key-info        (read: describes current wrap key backend)
@@ -2039,7 +2062,7 @@ Why 9P? We already implement 9P for client access; reusing it for the agent avoi
 │       │       ├── wrapped-key   (read: current wrapped key; write: update
 │       │       │                   with a new wrapped key as part of rotation)
 │       │       └── unwrap        (write: a challenge; read: the unwrap result
-│       │                          after agent performs its backend op)
+│       │                          after janus performs its backend op)
 │       └── rotate-wrap           (write: trigger wrap-key rotation)
 └── backends/
     ├── passphrase/               (admin-configurable)
@@ -2049,18 +2072,18 @@ Why 9P? We already implement 9P for client access; reusing it for the agent avoi
 ```
 
 FS-side ops:
-- Unwrap a dataset key: `cat /agent/pools/P/datasets/D/unwrap` (with context in a file write operation).
-- Rotate wrap key: `echo command > /agent/pools/P/rotate-wrap`.
+- Unwrap a dataset key: `cat /janus/pools/P/datasets/D/unwrap` (with context in a file write operation).
+- Rotate wrap key: `echo command > /janus/pools/P/rotate-wrap`.
 
-The agent logs every op to `/agent/audit-log`, which is append-only and human-readable.
+Janus logs every op to `/janus/audit-log`, which is append-only and human-readable.
 
-#### 7.9.2 Authentication between FS and agent
+#### 7.9.2 Authentication between FS and janus
 
-Unix socket permissions + optional capability token. FS must be running as a UID authorized to talk to the agent; the agent checks socket peer credentials via `SO_PEERCRED` on Linux.
+Unix socket permissions + optional capability token. FS must be running as a UID authorized to talk to janus; janus checks socket peer credentials via `SO_PEERCRED` on Linux.
 
-Token mode (alternative): at pool-open time, FS obtains a short-lived capability token from the agent (via backend auth); subsequent ops present this token. Token expires on agent restart or after a timeout.
+Token mode (alternative): at pool-open time, FS obtains a short-lived capability token from janus (via backend auth); subsequent ops present this token. Token expires on janus restart or after a timeout.
 
-#### 7.9.3 Agent backends
+#### 7.9.3 Janus backends
 
 - **`passphrase`**: interactive passphrase input via a pipe or tty. For laptops and personal use.
 - **`tpm`**: TPM 2.0 sealed object. Uses `tpm2-tss` library. Binds key to platform state (PCR registers).
@@ -2068,7 +2091,7 @@ Token mode (alternative): at pool-open time, FS obtains a short-lived capability
 - **`yubikey`**: FIDO2/hmac-secret challenge-response. Touch-to-decrypt UX.
 - **`file`**: raw key file (for automation; discouraged; for containers).
 
-Each backend is a module; the agent selects based on configuration.
+Each backend is a module; janus selects based on configuration.
 
 ### 7.10 Encrypted send and recv
 
@@ -2120,11 +2143,14 @@ pool_merkle_root = BLAKE3-256(
     allocator_roots_object_hash ||
     snap_tree_root_hash ||
     cas_index_root_hash ||
+    key_schema_root_hash ||    // §7.7.3 — wrapped keys sub-tree root
     ub_merkle_root_salt        // 32 bytes random; stored in uberblock
 )
 ```
 
 The root salt is a per-pool random value set at pool creation. Prevents certain precomputation attacks. Stored in the uberblock (`ub_merkle_root_salt`, carved from `ub_reserved`).
+
+The key-schema root joins the other first-class subsystems as a fifth Merkle input. Any tamper on a wrapped key in the sub-tree propagates into `pool_merkle_root` exactly as tamper on a main-tree node does — no special-casing. Unpopulated roots contribute 32 zero bytes (e.g., CAS-index in Phase 4 before the CAS tier lands).
 
 ### 7.12 Hash update protocol
 
@@ -3397,7 +3423,7 @@ stratum send tank/home@daily-2026-04-19 | \
     ssh remote "stratum recv tank/backup/"
 
 stratum key rotate tank
-stratum key agent status
+stratum key janus status
 ```
 
 Each subcommand is thin — 50–100 LOC. The work happens in the `/ctl/` interface.
@@ -4592,8 +4618,8 @@ Pause/resume survives mounts — a scrub interrupted by shutdown can resume on n
        instantiate per-dataset context (key slot, redundancy profile,
        inheritance-resolved properties).
 
-8. Initialize key agent connection (§7.9):
-     connect to agent's Unix socket.
+8. Initialize janus connection (§7.9):
+     connect to janus's Unix socket.
      request unwrap of current wrap key (interactive, if backed by
      passphrase).
      cache unwrapped dataset keys for each referenced dataset.
@@ -5164,7 +5190,7 @@ Decisions here:
 │       └── metrics/
 │           ├── prometheus               (Prometheus exposition)
 │           └── opentelemetry            (OTLP exposition)
-├── agent/                               (§7.9 key agent synthetic FS)
+├── janus/                               (§7.9 janus synthetic FS)
 ├── logs/
 │   ├── scrub                             (scrub history)
 │   ├── repair                            (repair history)

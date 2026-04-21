@@ -436,19 +436,19 @@ The goal is to make `ARCHITECTURE.md` easier to write: each angle becomes a know
 
 ---
 
-### 3.10 Angle #10 — Factotum-style key agent
+### 3.10 Angle #10 — Factotum-style key agent (`janus`)
 
-**Why it's novel**: ZFS and bcachefs bundle key management into the filesystem code. Plan 9's factotum split authentication into a dedicated process. We do the same for storage encryption — and pair it with HSM/TPM/KMS backends.
+**Why it's novel**: ZFS and bcachefs bundle key management into the filesystem code. Plan 9's factotum split authentication into a dedicated process. We do the same for storage encryption — and pair it with HSM/TPM/KMS backends. The binary is named `janus` for its two-faced role: 9P to the filesystem on one side, pluggable backends (passphrase / TPM / PKCS#11 / YubiKey) on the other.
 
 **Scope — in**:
-- Dedicated agent process (`stratum-keyagent` or similar).
-- Communication via Unix socket (or 9P locally).
+- Dedicated agent process named `janus`, single binary.
+- 9P synthetic filesystem over a Unix socket at `/var/run/janus.sock` (ARCH §7.9).
 - Backends:
     - Passphrase (Argon2id KDF, for laptops).
     - TPM 2.0 (for attested-boot systems).
     - YubiKey / FIDO2 (hardware token).
     - PKCS#11 (enterprise HSMs, cloud KMS proxies).
-- Key rotation: agent can rotate wrap keys without remounting the FS.
+- Key rotation: janus can rotate wrap keys without remounting the FS.
 - Audit log: every unwrap op recorded with timestamp, caller (connection), dataset.
 
 **Scope — deferred**:

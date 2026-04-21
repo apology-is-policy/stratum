@@ -42,6 +42,37 @@ safe on live / RO / wedged pools. Intended for:
 A future "scrub mode" daemon (background periodic scrub) is a
 Phase-8 concern but plugs into this primitive.
 
+### P4-4: Janus + key-schema sub-tree (design committed; implementation pending)
+
+Agreed-on-the-run 2026-04-21 (see ARCH §7.7.3 + §7.9, NOVEL §3.10,
+ROADMAP §7.1 for the committed design):
+
+- **Agent name: `janus`**, two-faced daemon (9P on one side, backends on
+  the other). Single binary, not prefixed.
+- **Key-schema sub-tree**, rooted from `ub_key_schema`. Reuses
+  `stm_btnode` + `stm_btree_store` + AEGIS-256 machinery. Fifth input
+  to `ub_merkle_root` after main / alloc / snap / cas. Scales to
+  arbitrary dataset + rotation counts (1192-byte PQ-hybrid wrapped
+  keys don't fit the 512-byte uberblock field; a tree scales
+  naturally). See ARCH §7.7.3 for the on-disk layout.
+- **Merkle formula change**: `BLAKE3(main || alloc || snap || cas ||
+  keyschema || salt)`. Empty roots contribute zeros (today cas is
+  zero; keyschema will also be zero until P4-4a lands, then populates).
+- **Formal model required**: `key_schema.tla` proving rotation
+  atomicity + retired-key retention. ~150-200 lines. Lands with P4-4a.
+
+Implementation split (per the decision thread):
+
+1. **P4-4a — on-disk key-schema sub-tree**. Layout, tree operations
+   (insert / lookup / rotate), Merkle integration. In-process unwrap
+   using the Phase 1 stm_hybrid primitive; wrap-key source is a file
+   (the "file" backend from ARCH §7.9.3's list). Ends with: no
+   plaintext key on disk.
+2. **P4-4b — janus daemon**. Separate binary, 9P synthetic FS,
+   SO_PEERCRED auth, passphrase backend.
+3. **P4-4c — per-dataset keys**. Generalize from one pool key to the
+   dataset-keyed sub-tree; rotation plumbing per ARCH §7.7.
+
 ### P4-3: AEAD on metadata nodes (stm_btnode)
 
 Split into two landings:
