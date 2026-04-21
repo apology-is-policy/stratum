@@ -52,7 +52,9 @@
 #include <stratum/btnode.h>
 #include <stratum/btree.h>
 #include <stratum/btree_store.h>
+#include <stratum/sdarray.h>
 #include <stratum/super.h>
+#include <stratum/xor_filter.h>
 
 #include <pthread.h>
 #include <stdlib.h>
@@ -95,6 +97,30 @@ struct stm_alloc {
      * free_tree + serialize round-trip is skipped — bootstrap_commit
      * still runs to persist bootstrap-internal state. */
     bool            tree_dirty;
+
+    /* Chunk 4e: in-RAM acceleration over the data-area tree's set of
+     * entry start_blocks (both ALLOCATED + PENDING). Lazy rebuild —
+     * reserve/commit invalidate; the next query rebuilds under
+     * `lock`. Free() and ref() don't invalidate: they change
+     * refcount, not the set of start_blocks.
+     *
+     *   accel_sda       — Elias-Fano sorted set over start_blocks.
+     *   accel_xor       — xor8 filter over start_blocks (fast
+     *                     negative lookup: "is paddr X a start of
+     *                     any tree entry?").
+     *   accel_lengths   — parallel array of length_blocks, indexed
+     *                     by sorted position (same ordering as
+     *                     accel_sda). Enables range-containment via
+     *                     sdarray rank + length comparison.
+     *   accel_count     — size of both structures (m).
+     *   accel_dirty     — structures may be stale; rebuild before
+     *                     any query.
+     */
+    stm_sdarray    *accel_sda;
+    stm_xor_filter *accel_xor;
+    uint32_t       *accel_lengths;
+    size_t          accel_count;
+    bool            accel_dirty;
 };
 
 /* ========================================================================= */
@@ -142,6 +168,176 @@ static inline void decode_val(const uint8_t in[8],
  * because ub_alloc_root (set by stm_sync_commit) is the sole
  * authoritative source. The slot remains in the bootstrap format for
  * future allocator metadata that doesn't belong in the uberblock. */
+
+/* ========================================================================= */
+/* Chunk 4e: in-RAM acceleration over the tree.                               */
+/* ========================================================================= */
+
+/* Release accel structures. Callers MUST hold a->lock. Safe to call
+ * when accel_* are already NULL (e.g. before the first rebuild). */
+static void accel_free_locked(stm_alloc *a)
+{
+    stm_sdarray_free(a->accel_sda);
+    stm_xor_filter_free(a->accel_xor);
+    free(a->accel_lengths);
+    a->accel_sda     = NULL;
+    a->accel_xor     = NULL;
+    a->accel_lengths = NULL;
+    a->accel_count   = 0u;
+}
+
+/* Mark accel structures as needing rebuild. Does NOT free them
+ * eagerly — the old structures stay valid and queryable on a
+ * last-commit-accurate basis until the next query rebuilds. Callers
+ * who want the current state MUST go through accel_ensure_fresh_locked.
+ *
+ * Why not free eagerly? Callers may issue a burst of reserves / frees
+ * before querying; keeping the previous structures alive means we
+ * don't pay repeated alloc/free churn inside the mutation path. */
+static inline void accel_invalidate_locked(stm_alloc *a)
+{
+    a->accel_dirty = true;
+}
+
+/* Scan callback: populate a packed array of (start, length) pairs
+ * in the order the tree yields them — which is sorted ascending by
+ * start_block thanks to our big-endian key encoding. Caller pre-
+ * allocates the buffers sized by n_allocated_ranges + n_pending_ranges. */
+typedef struct {
+    uint64_t *starts;
+    uint32_t *lengths;
+    size_t    cap;
+    size_t    count;
+    bool      saw_bad_entry;   /* R7b-style corruption flag     */
+} accel_scan_ctx;
+
+static int accel_scan_cb(const void *key, size_t key_len,
+                          const void *value, size_t value_len,
+                          void *ctx_)
+{
+    accel_scan_ctx *ctx = ctx_;
+    if (key_len != 8 || value_len != 8) {
+        ctx->saw_bad_entry = true;
+        return 1;
+    }
+    if (ctx->count >= ctx->cap) {
+        /* Tree grew between the count scan and this rebuild. Abort
+         * and let the next query retry. Shouldn't happen under the
+         * mutex, but defensive. */
+        return 1;
+    }
+    uint64_t start = decode_key(key);
+    uint32_t length = 0, refcount = 0;
+    decode_val(value, &length, &refcount);
+
+    /* Include BOTH ALLOCATED (refcount >= 1) AND PENDING (refcount == 0).
+     * Both occupy blocks. */
+    ctx->starts [ctx->count] = start;
+    ctx->lengths[ctx->count] = length;
+    ctx->count++;
+    return 0;
+}
+
+/* Counter callback: just counts entries. Used to pre-size the buffers
+ * before a real scan. */
+static int accel_count_cb(const void *key,   size_t key_len,
+                           const void *value, size_t value_len,
+                           void *ctx_)
+{
+    (void)key; (void)value;
+    if (key_len != 8 || value_len != 8) return 1;  /* corruption */
+    (*(size_t *)ctx_)++;
+    return 0;
+}
+
+/* Rebuild the in-RAM accel structures from the current tree contents.
+ * Atomic-on-success: either both SDArray and xor filter are fresh, or
+ * the previous (stale) structures are preserved. The `dirty` flag is
+ * cleared only on full success.
+ *
+ * Called from query paths under a->lock. */
+static stm_status accel_ensure_fresh_locked(stm_alloc *a)
+{
+    if (!a->accel_dirty) return STM_OK;
+
+    /* Size first. */
+    size_t n = 0u;
+    stm_status s = stm_btree_mt_scan(a->tree, NULL, 0, NULL, 0,
+                                      accel_count_cb, &n);
+    if (s != STM_OK) return s;
+
+    /* Allocate scratch with +1 headroom so a tree that grew by one
+     * entry between count and scan doesn't trip the cap guard. */
+    uint64_t *starts  = NULL;
+    uint32_t *lengths = NULL;
+    if (n > 0u) {
+        starts  = malloc((n + 1u) * sizeof *starts);
+        lengths = malloc((n + 1u) * sizeof *lengths);
+        if (!starts || !lengths) {
+            free(starts); free(lengths);
+            return STM_ENOMEM;
+        }
+    }
+
+    accel_scan_ctx ctx = {
+        .starts        = starts,
+        .lengths       = lengths,
+        .cap           = n,
+        .count         = 0u,
+        .saw_bad_entry = false,
+    };
+    s = stm_btree_mt_scan(a->tree, NULL, 0, NULL, 0,
+                          accel_scan_cb, &ctx);
+    if (s != STM_OK || ctx.saw_bad_entry) {
+        free(starts); free(lengths);
+        return (ctx.saw_bad_entry) ? STM_ECORRUPT : s;
+    }
+
+    /* Build new structures. Both sdarray_build and xor_filter_build
+     * copy the input, so it's safe to free starts/lengths after. The
+     * SDArray domain is [0, data_last + 1) — enough to encode every
+     * start_block in the data area. */
+    stm_sdarray    *new_sda = NULL;
+    stm_xor_filter *new_xor = NULL;
+    uint32_t       *new_len = NULL;
+
+    uint64_t universe = a->data_last_block + 1u;
+    if (universe < a->data_first_block) universe = a->data_first_block + 1u;
+
+    s = stm_sdarray_build(starts, ctx.count, universe, &new_sda);
+    if (s != STM_OK) {
+        free(starts); free(lengths);
+        return s;
+    }
+    s = stm_xor_filter_build(starts, ctx.count, &new_xor);
+    if (s != STM_OK) {
+        stm_sdarray_free(new_sda);
+        free(starts); free(lengths);
+        return s;
+    }
+    if (ctx.count > 0u) {
+        new_len = malloc(ctx.count * sizeof *new_len);
+        if (!new_len) {
+            stm_sdarray_free(new_sda);
+            stm_xor_filter_free(new_xor);
+            free(starts); free(lengths);
+            return STM_ENOMEM;
+        }
+        memcpy(new_len, lengths, ctx.count * sizeof *new_len);
+    }
+
+    /* Commit: swap in new structures, free old. */
+    accel_free_locked(a);
+    a->accel_sda     = new_sda;
+    a->accel_xor     = new_xor;
+    a->accel_lengths = new_len;
+    a->accel_count   = ctx.count;
+    a->accel_dirty   = false;
+
+    free(starts);
+    free(lengths);
+    return STM_OK;
+}
 
 /* ========================================================================= */
 /* Store vtable: bridge stm_btree_store to stm_bootstrap + stm_bdev.          */
@@ -352,6 +548,8 @@ stm_status stm_alloc_load_tree_at(stm_alloc *a, uint64_t root_paddr)
         a->current_tree_root = root_paddr;
         /* A loaded tree is NOT dirty — on-disk matches RAM. */
         a->tree_dirty = false;
+        /* Accel was empty (new handle); rebuild on first query. */
+        accel_invalidate_locked(a);
     }
     pthread_mutex_unlock(&a->lock);
     return s;
@@ -394,6 +592,7 @@ void stm_alloc_close(stm_alloc *a)
         free(e);
         e = next;
     }
+    accel_free_locked(a);
     if (a->tree) stm_btree_mt_free(a->tree);
     if (a->boot) stm_bootstrap_close(a->boot);
     pthread_mutex_destroy(&a->lock);
@@ -561,6 +760,7 @@ stm_status stm_alloc_reserve(stm_alloc *a, uint64_t nblocks,
 
     *out_paddr = stm_paddr_make(0, ctx.found_start);
     a->tree_dirty = true;
+    accel_invalidate_locked(a);    /* new start_block added to the set */
     pthread_mutex_unlock(&a->lock);
     return STM_OK;
 }
@@ -723,7 +923,10 @@ stm_status stm_alloc_commit(stm_alloc *a, uint64_t committed_gen)
         }
         e = next;
     }
-    if (swept_anything) a->tree_dirty = true;
+    if (swept_anything) {
+        a->tree_dirty = true;
+        accel_invalidate_locked(a);  /* deleted start_blocks from the set */
+    }
 
     /* R7c P2-5: skip the tree rewrite when nothing logical has
      * changed since the last commit. The bootstrap pool still
@@ -867,6 +1070,30 @@ stm_status stm_alloc_lookup(const stm_alloc *a, uint64_t paddr,
     stm_alloc *ma = (stm_alloc *)a;
     pthread_mutex_lock(&ma->lock);
 
+    /* Chunk 4e fast-path: the xor filter answers "is start_block in
+     * the tree's set of entries?" with no false negatives. If the
+     * filter says NO, we skip the tree lookup and return STM_ENOENT
+     * directly — the common case for a random paddr that happens to
+     * not be any entry's start. Filter may false-positive (~0.4%);
+     * the tree lookup below handles those correctly.               */
+    stm_status rs = accel_ensure_fresh_locked(ma);
+    if (rs != STM_OK) {
+        /* Rebuild failed — fall through to the authoritative tree
+         * lookup. Stale accel is acceptable as long as we don't
+         * TRUST it on a miss. Clear dirty so we don't churn rebuild
+         * attempts on every lookup; tree path will still succeed. */
+        ma->accel_dirty = false;
+    }
+    if (ma->accel_count == 0u) {
+        pthread_mutex_unlock(&ma->lock);
+        return STM_ENOENT;   /* empty tree: no entry exists anywhere */
+    }
+    if (rs == STM_OK && ma->accel_xor &&
+        !stm_xor_filter_contains(ma->accel_xor, start_block)) {
+        pthread_mutex_unlock(&ma->lock);
+        return STM_ENOENT;
+    }
+
     uint8_t key_buf[8];
     uint8_t val_buf[8] = { 0 };
     size_t  val_len    = 0;
@@ -887,6 +1114,57 @@ stm_status stm_alloc_lookup(const stm_alloc *a, uint64_t paddr,
     decode_val(val_buf, &length, &refcount);
     if (out_length_blocks) *out_length_blocks = length;
     if (out_refcount)      *out_refcount      = refcount;
+
+    pthread_mutex_unlock(&ma->lock);
+    return STM_OK;
+}
+
+/* ========================================================================= */
+/* Chunk 4e: range-containment query.                                         */
+/* ========================================================================= */
+
+stm_status stm_alloc_is_allocated(const stm_alloc *a, uint64_t paddr,
+                                    bool *out_allocated)
+{
+    if (!a || !out_allocated) return STM_EINVAL;
+    *out_allocated = false;
+    if (stm_paddr_device(paddr) != 0) return STM_EINVAL;
+
+    uint64_t block = stm_paddr_offset(paddr);
+    stm_alloc *ma = (stm_alloc *)a;
+    pthread_mutex_lock(&ma->lock);
+
+    stm_status s = accel_ensure_fresh_locked(ma);
+    if (s != STM_OK) {
+        pthread_mutex_unlock(&ma->lock);
+        return s;
+    }
+    if (ma->accel_count == 0u) {
+        pthread_mutex_unlock(&ma->lock);
+        return STM_OK;  /* *out_allocated stays false */
+    }
+
+    /* Find predecessor range: largest i with start_block[i] <= block.
+     * rank(block) = count of entries strictly less than block. If
+     * rank == 0, no predecessor. Else predecessor is at rank-1 — OR
+     * at rank itself if select(rank) == block (exact start match). */
+    size_t   r     = stm_sdarray_rank(ma->accel_sda, block);
+    size_t   idx;
+    if (r < ma->accel_count &&
+        stm_sdarray_select(ma->accel_sda, r) == block) {
+        idx = r;    /* block IS a start of range idx */
+    } else if (r > 0u) {
+        idx = r - 1u;
+    } else {
+        pthread_mutex_unlock(&ma->lock);
+        return STM_OK;  /* no predecessor; not allocated */
+    }
+
+    uint64_t start  = stm_sdarray_select(ma->accel_sda, idx);
+    uint32_t length = ma->accel_lengths[idx];
+    if (block < start + (uint64_t)length) {
+        *out_allocated = true;
+    }
 
     pthread_mutex_unlock(&ma->lock);
     return STM_OK;

@@ -230,6 +230,24 @@ stm_status stm_alloc_lookup(const stm_alloc *a, uint64_t paddr,
                              uint64_t *out_length_blocks,
                              uint32_t *out_refcount);
 
+/*
+ * Range-containment query (chunk 4e). Answers "does `paddr` fall
+ * within any tree entry (allocated or pending)?" in O(log m) via the
+ * in-RAM SDArray + parallel length array.
+ *
+ * This is distinct from stm_alloc_lookup, which asks "is `paddr` the
+ * START of an entry?" (exact start match). stm_alloc_is_allocated
+ * handles the more common "is this block reserved" question without
+ * requiring the caller to know the range's start.
+ *
+ * Returns STM_OK with *out_allocated = true/false on a successful
+ * query. STM_ECORRUPT / STM_ENOMEM if the accel structures couldn't
+ * be rebuilt from a dirty state.
+ */
+STM_MUST_USE
+stm_status stm_alloc_is_allocated(const stm_alloc *a, uint64_t paddr,
+                                    bool *out_allocated);
+
 #ifdef __cplusplus
 }
 #endif

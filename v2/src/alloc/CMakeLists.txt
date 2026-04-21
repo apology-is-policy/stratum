@@ -6,7 +6,8 @@ target_include_directories(stm_alloc PUBLIC
 
 target_link_libraries(stm_alloc
     PRIVATE stm_warnings stm_sanitize stm_coverage Threads::Threads
-    PUBLIC  stm_bootstrap stm_btree stm_btnode stm_btree_store stm_block)
+    PUBLIC  stm_bootstrap stm_btree stm_btnode stm_btree_store stm_block
+            stm_sdarray stm_xor_filter)
 
 # Succinct in-RAM acceleration (Phase 3 chunk 4c). Standalone
 # data-structure library with no deps beyond libc + types.h. Integration

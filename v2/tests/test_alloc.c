@@ -465,4 +465,161 @@ STM_TEST(alloc_open_after_commit_is_blank) {
     unlink(g_tmp_path);
 }
 
+/* ========================================================================= */
+/* Chunk 4e: accel integration — stm_alloc_is_allocated + lookup fast-path.   */
+/* ========================================================================= */
+
+STM_TEST(alloc_is_allocated_empty_pool_is_false) {
+    stm_bdev  *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    bool in = true;
+    STM_ASSERT_OK(stm_alloc_is_allocated(a, stm_paddr_make(0, 256u), &in));
+    STM_ASSERT_EQ(in, false);
+
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(alloc_is_allocated_basic_range_containment) {
+    stm_bdev  *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    uint64_t paddr = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 16u, 0, &paddr));
+    uint64_t start = stm_paddr_offset(paddr);
+
+    bool in = false;
+    /* Start block: allocated. */
+    STM_ASSERT_OK(stm_alloc_is_allocated(a, paddr, &in));
+    STM_ASSERT_EQ(in, true);
+    /* Middle block. */
+    STM_ASSERT_OK(stm_alloc_is_allocated(a, stm_paddr_make(0, start + 5u), &in));
+    STM_ASSERT_EQ(in, true);
+    /* Last block of range. */
+    STM_ASSERT_OK(stm_alloc_is_allocated(a, stm_paddr_make(0, start + 15u), &in));
+    STM_ASSERT_EQ(in, true);
+    /* One past end: free. */
+    STM_ASSERT_OK(stm_alloc_is_allocated(a, stm_paddr_make(0, start + 16u), &in));
+    STM_ASSERT_EQ(in, false);
+    /* Way before start: free. */
+    if (start > 10u) {
+        STM_ASSERT_OK(stm_alloc_is_allocated(a, stm_paddr_make(0, start - 10u), &in));
+        STM_ASSERT_EQ(in, false);
+    }
+
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(alloc_is_allocated_pending_still_occupies_blocks) {
+    /* A PENDING range (refcount=0 awaiting commit-sweep) still
+     * reserves its blocks — stm_alloc_is_allocated must report true
+     * so the allocator's "no reuse across MVCC snapshots" invariant
+     * holds. After commit-sweep, it becomes free. */
+    stm_bdev  *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    uint64_t paddr = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &paddr));
+    STM_ASSERT_OK(stm_alloc_free(a, paddr, /*free_gen=*/5u));
+
+    bool in = false;
+    STM_ASSERT_OK(stm_alloc_is_allocated(a, paddr, &in));
+    STM_ASSERT_EQ(in, true);
+    STM_ASSERT_OK(stm_alloc_is_allocated(a,
+                    stm_paddr_make(0, stm_paddr_offset(paddr) + 3u), &in));
+    STM_ASSERT_EQ(in, true);
+
+    /* Commit at gen=6 > free_gen=5 → sweeps. Accel invalidated. */
+    STM_ASSERT_OK(stm_alloc_commit(a, /*committed_gen=*/6u));
+
+    in = true;
+    STM_ASSERT_OK(stm_alloc_is_allocated(a, paddr, &in));
+    STM_ASSERT_EQ(in, false);
+
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(alloc_is_allocated_spans_many_ranges) {
+    stm_bdev  *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    enum { N = 64 };
+    uint64_t paddrs[N];
+    uint64_t last_start = 0u;
+    for (int i = 0; i < N; i++) {
+        uint64_t len = (uint64_t)(i % 8) + 1u;
+        STM_ASSERT_OK(stm_alloc_reserve(a, len, 0, &paddrs[i]));
+        uint64_t s = stm_paddr_offset(paddrs[i]);
+        if (s > last_start) last_start = s;
+    }
+    for (int i = 0; i < N; i++) {
+        uint64_t len = (uint64_t)(i % 8) + 1u;
+        uint64_t start = stm_paddr_offset(paddrs[i]);
+        for (uint64_t k = 0; k < len; k++) {
+            bool in = false;
+            STM_ASSERT_OK(stm_alloc_is_allocated(a,
+                            stm_paddr_make(0, start + k), &in));
+            STM_ASSERT_EQ(in, true);
+        }
+    }
+    bool in = true;
+    STM_ASSERT_OK(stm_alloc_is_allocated(a,
+                    stm_paddr_make(0, last_start + 1000u), &in));
+    STM_ASSERT_EQ(in, false);
+
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(alloc_lookup_fast_path_stays_correct) {
+    /* Positive lookups (real starts) must return length + refcount.
+     * Negative lookups (non-starts) must return STM_ENOENT — the
+     * filter fast-path shortcuts the tree walk. Covers both branches. */
+    stm_bdev  *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    uint64_t p1 = 0, p2 = 0, p3 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p1));
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &p2));
+    STM_ASSERT_OK(stm_alloc_reserve(a, 2u, 0, &p3));
+
+    uint64_t len = 0; uint32_t rc = 0;
+    STM_ASSERT_OK(stm_alloc_lookup(a, p1, &len, &rc));
+    STM_ASSERT_EQ(len, 4u); STM_ASSERT_EQ(rc, 1u);
+    STM_ASSERT_OK(stm_alloc_lookup(a, p2, &len, &rc));
+    STM_ASSERT_EQ(len, 8u); STM_ASSERT_EQ(rc, 1u);
+    STM_ASSERT_OK(stm_alloc_lookup(a, p3, &len, &rc));
+    STM_ASSERT_EQ(len, 2u); STM_ASSERT_EQ(rc, 1u);
+
+    STM_ASSERT_ERR(stm_alloc_lookup(a, stm_paddr_make(0, 0xDEADu), NULL, NULL),
+                   STM_ENOENT);
+    STM_ASSERT_ERR(stm_alloc_lookup(a,
+                    stm_paddr_make(0, stm_paddr_offset(p1) + 1u), NULL, NULL),
+                   STM_ENOENT);
+
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(alloc_is_allocated_null_args) {
+    stm_bdev  *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+    bool in = false;
+    STM_ASSERT_ERR(stm_alloc_is_allocated(NULL, 0, &in),  STM_EINVAL);
+    STM_ASSERT_ERR(stm_alloc_is_allocated(a,    0, NULL), STM_EINVAL);
+    STM_ASSERT_ERR(stm_alloc_is_allocated(a,
+                    stm_paddr_make(7, 100u), &in), STM_EINVAL);
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
 STM_TEST_MAIN("alloc")
