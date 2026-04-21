@@ -86,6 +86,14 @@ typedef struct {
     /* Pool identity. Every uberblock + bootstrap header records these. */
     uint64_t pool_uuid[2];
     uint64_t device_uuid[2];
+
+    /* P4-4a: path to a keyfile (ARCH §7.9.3 "file" backend) holding
+     * the hybrid wrap key-pair. The pool's metadata key is
+     * PQ-hybrid-wrapped under keyfile.pk and persisted in the
+     * key-schema sub-tree. MUST be set; there is no unencrypted
+     * pool path in v2. Janus (P4-4b) supersedes this with
+     * process-boundary-protected backends. */
+    const char *keyfile_path;
 } stm_fs_format_opts;
 
 /*
@@ -105,6 +113,10 @@ typedef struct {
     /* If true, no mutating API is permitted. Useful for inspection
      * tools. */
     bool read_only;
+
+    /* P4-4a: same keyfile as format time; used to unwrap the pool's
+     * metadata key during mount. MUST be set. */
+    const char *keyfile_path;
 } stm_fs_mount_opts;
 
 /*

@@ -12,6 +12,7 @@
  */
 #include "tharness.h"
 #include <stratum/fs.h>
+#include <stratum/keyfile.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,12 +26,20 @@ static const uint64_t POOL_UUID[2]   = { 0xAA11, 0xBB22 };
 static const uint64_t DEVICE_UUID[2] = { 0xCC33, 0xDD44 };
 
 static char g_tmp_path[256];
+static char g_key_path[256];
 
+/* P4-4a: every test formats + mounts with a keyfile. We generate
+ * a shared keyfile once per test (make_tmp refreshes the path and
+ * regenerates) so format and mount use the same wrap keys. */
 static void make_tmp(const char *tag)
 {
     snprintf(g_tmp_path, sizeof g_tmp_path, "/tmp/stm_v2_fs_%s_%d.bin",
              tag, (int)getpid());
     unlink(g_tmp_path);
+    snprintf(g_key_path, sizeof g_key_path, "/tmp/stm_v2_fs_%s_%d.key",
+             tag, (int)getpid());
+    unlink(g_key_path);
+    STM_ASSERT_OK(stm_keyfile_generate(g_key_path));
 }
 
 static stm_fs_format_opts default_format_opts(void)
@@ -40,12 +49,16 @@ static stm_fs_format_opts default_format_opts(void)
         .bootstrap_size_bytes = TEST_BOOTSTRAP_BYTES,
         .pool_uuid            = { POOL_UUID[0], POOL_UUID[1] },
         .device_uuid          = { DEVICE_UUID[0], DEVICE_UUID[1] },
+        .keyfile_path         = g_key_path,
     };
 }
 
 static stm_fs_mount_opts rw_mount_opts(void)
 {
-    return (stm_fs_mount_opts){ .read_only = false };
+    return (stm_fs_mount_opts){
+        .read_only    = false,
+        .keyfile_path = g_key_path,
+    };
 }
 
 /* ========================================================================= */
@@ -178,7 +191,7 @@ STM_TEST(fs_read_only_blocks_writes) {
     stm_fs_format_opts fopts = default_format_opts();
     STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
 
-    stm_fs_mount_opts mopts = { .read_only = true };
+    stm_fs_mount_opts mopts = { .read_only = true, .keyfile_path = g_key_path };
     stm_fs *fs = NULL;
     STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
 

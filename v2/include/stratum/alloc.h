@@ -187,6 +187,17 @@ stm_status stm_alloc_get_tree_root(const stm_alloc *a,
  */
 void stm_alloc_close(stm_alloc *a);
 
+/*
+ * Borrow the allocator's bootstrap handle. Used by higher layers
+ * (stm_sync / stm_keyschema) that need to reserve node-sized paddrs
+ * for their own persistent state from the same pool. The returned
+ * pointer is valid for the lifetime of `a`.
+ *
+ * P4-4a: stm_sync holds a stm_keyschema that stores its sub-tree
+ * nodes in the bootstrap pool alongside allocator-tree nodes.
+ */
+stm_bootstrap *stm_alloc_bootstrap(stm_alloc *a);
+
 /* ========================================================================= */
 /* Reserve / free / commit.                                                   */
 /* ========================================================================= */

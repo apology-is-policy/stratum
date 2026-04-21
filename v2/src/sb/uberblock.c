@@ -83,3 +83,43 @@ stm_status stm_ub_decode(const void *buf, size_t buf_len, stm_uberblock *out_ub)
     memcpy(out_ub, buf, STM_UB_SIZE);
     return STM_OK;
 }
+
+/* ========================================================================= */
+/* Key-schema header packing (P4-4a, ARCH §7.7.3).                            */
+/* ========================================================================= */
+
+void stm_ub_key_schema_pack(const stm_ub_key_schema_hdr *hdr,
+                              uint8_t out[512])
+{
+    memset(out, 0, 512);
+    le32 magic   = stm_store_le32(hdr->ks_magic);
+    le32 version = stm_store_le32(hdr->ks_version);
+    le64 flags   = stm_store_le64(hdr->ks_flags);
+    memcpy(out + 0, magic.v,   4);
+    memcpy(out + 4, version.v, 4);
+    memcpy(out + 8, flags.v,   8);
+    /* stm_bptr is a packed struct — copy directly. */
+    memcpy(out + 16, &hdr->ks_root, sizeof hdr->ks_root);
+    /* [80..512) stays zero from the memset above. */
+}
+
+stm_status stm_ub_key_schema_unpack(const uint8_t in[512],
+                                      stm_ub_key_schema_hdr *out)
+{
+    le32 magic_le, version_le;
+    le64 flags_le;
+    memcpy(magic_le.v,   in + 0, 4);
+    memcpy(version_le.v, in + 4, 4);
+    memcpy(flags_le.v,   in + 8, 8);
+
+    uint32_t magic   = stm_load_le32(magic_le);
+    uint32_t version = stm_load_le32(version_le);
+    if (magic   != STM_UB_KEY_SCHEMA_MAGIC)   return STM_EBADVERSION;
+    if (version != STM_UB_KEY_SCHEMA_VERSION) return STM_EBADVERSION;
+
+    out->ks_magic   = magic;
+    out->ks_version = version;
+    out->ks_flags   = stm_load_le64(flags_le);
+    memcpy(&out->ks_root, in + 16, sizeof out->ks_root);
+    return STM_OK;
+}

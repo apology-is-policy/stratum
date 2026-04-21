@@ -36,6 +36,7 @@
 #include <stratum/alloc.h>
 #include <stratum/block.h>
 #include <stratum/bootstrap.h>
+#include <stratum/keyfile.h>
 #include <stratum/super.h>
 #include <stratum/sync.h>
 
@@ -124,34 +125,42 @@ static stm_status format_wipe_labels(stm_bdev *d, uint64_t device_bytes)
 stm_status stm_fs_format(const char *path, const stm_fs_format_opts *opts)
 {
     if (!path || !opts) return STM_EINVAL;
+    /* P4-4a: keyfile is mandatory. */
+    if (!opts->keyfile_path) return STM_EINVAL;
+
+    /* Load wrap keys up-front so an unreadable keyfile fails BEFORE
+     * we touch the pool device. */
+    stm_hybrid_keys wk;
+    stm_status ks = stm_keyfile_load(opts->keyfile_path, &wk);
+    if (ks != STM_OK) return ks;
 
     stm_bdev_open_opts bopts = stm_bdev_open_opts_default();
     stm_bdev *d = NULL;
     stm_status s = stm_bdev_open(path, &bopts, &d);
-    if (s != STM_OK) return s;
+    if (s != STM_OK) { stm_hybrid_keys_wipe(&wk); return s; }
 
     /* Resize if the caller asked for it (typical for loopback files
      * that start empty). */
     if (opts->device_size_bytes > 0) {
         s = stm_bdev_resize(d, opts->device_size_bytes);
-        if (s != STM_OK) { stm_bdev_close(d); return s; }
+        if (s != STM_OK) { stm_bdev_close(d); stm_hybrid_keys_wipe(&wk); return s; }
     }
 
     /* Wipe label regions before anything else writes to them. See
      * format_wipe_labels doc. Uses the bdev's actual size (post-resize). */
     const stm_bdev_caps *caps = stm_bdev_caps_of(d);
-    if (!caps) { stm_bdev_close(d); return STM_EIO; }
+    if (!caps) { stm_bdev_close(d); stm_hybrid_keys_wipe(&wk); return STM_EIO; }
     s = format_wipe_labels(d, caps->size_bytes);
-    if (s != STM_OK) { stm_bdev_close(d); return s; }
+    if (s != STM_OK) { stm_bdev_close(d); stm_hybrid_keys_wipe(&wk); return s; }
 
     stm_alloc *a = NULL;
     s = stm_alloc_create(d, opts->pool_uuid, opts->device_uuid,
                           opts->bootstrap_size_bytes, &a);
-    if (s != STM_OK) { stm_bdev_close(d); return s; }
+    if (s != STM_OK) { stm_bdev_close(d); stm_hybrid_keys_wipe(&wk); return s; }
 
     stm_sync *sync = NULL;
-    s = stm_sync_create(d, a, opts->pool_uuid, opts->device_uuid, &sync);
-    if (s != STM_OK) { stm_alloc_close(a); stm_bdev_close(d); return s; }
+    s = stm_sync_create(d, a, opts->pool_uuid, opts->device_uuid, &wk, &sync);
+    if (s != STM_OK) { stm_alloc_close(a); stm_bdev_close(d); stm_hybrid_keys_wipe(&wk); return s; }
 
     /* First commit: lays down the initial uberblock at gen=1 so a
      * subsequent stm_fs_mount finds something to read. */
@@ -168,6 +177,7 @@ stm_status stm_fs_format(const char *path, const stm_fs_format_opts *opts)
     stm_sync_close(sync);
     stm_alloc_close(a);
     stm_bdev_close(d);
+    stm_hybrid_keys_wipe(&wk);
     return STM_OK;
 }
 
@@ -196,22 +206,28 @@ stm_status stm_fs_mount(const char *path,
                          stm_fs **out_fs)
 {
     if (!path || !opts || !out_fs) return STM_EINVAL;
+    if (!opts->keyfile_path) return STM_EINVAL;
+
+    stm_hybrid_keys wk;
+    stm_status ks = stm_keyfile_load(opts->keyfile_path, &wk);
+    if (ks != STM_OK) return ks;
 
     stm_bdev_open_opts bopts = stm_bdev_open_opts_default();
     bopts.read_only = opts->read_only;
     stm_bdev *d = NULL;
     stm_status s = stm_bdev_open(path, &bopts, &d);
-    if (s != STM_OK) return s;
+    if (s != STM_OK) { stm_hybrid_keys_wipe(&wk); return s; }
 
     stm_alloc *a = NULL;
     s = stm_alloc_open_blank(d, &a);
-    if (s != STM_OK) { stm_bdev_close(d); return s; }
+    if (s != STM_OK) { stm_bdev_close(d); stm_hybrid_keys_wipe(&wk); return s; }
 
     stm_sync *sync = NULL;
-    s = stm_sync_open(d, a, &sync);
+    s = stm_sync_open(d, a, &wk, &sync);
     if (s != STM_OK) {
         stm_alloc_close(a);
         stm_bdev_close(d);
+        stm_hybrid_keys_wipe(&wk);
         return s;
     }
 
@@ -220,10 +236,12 @@ stm_status stm_fs_mount(const char *path,
         stm_sync_close(sync);
         stm_alloc_close(a);
         stm_bdev_close(d);
+        stm_hybrid_keys_wipe(&wk);
         return STM_ENOMEM;
     }
 
     *out_fs = fs;
+    stm_hybrid_keys_wipe(&wk);
     return STM_OK;
 }
 

@@ -53,8 +53,15 @@ extern "C" {
  * counter past orphan metadata writes without rewriting the tree.
  * v2 pools had this region zero, which AEAD-decrypts as nonce
  * gen=0 — would fail-loud at mount, but the version bump makes
- * the intent explicit and refuses v2 mounts up-front. */
-#define STM_UB_VERSION        3u
+ * the intent explicit and refuses v2 mounts up-front.
+ *
+ * v3 → v4 (Phase 4 chunk P4-4a): ub_key_schema[512] repurposed
+ * from a raw bytes slot holding a plaintext pool key into a
+ * structured header + bptr pointing at a Merkle-chained key-schema
+ * sub-tree (ARCH §7.7.3). Wrapped dataset keys now live in the
+ * sub-tree, never on disk in plaintext. Pool mounts now require a
+ * keyfile (the "file" backend; janus replaces this in P4-4b). */
+#define STM_UB_VERSION        4u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */
@@ -112,13 +119,14 @@ typedef enum {
  * space for format growth without bumping STM_UB_VERSION.
  */
 typedef enum {
-    STM_BPTR_KIND_NONE     = 0,   /* null pointer */
-    STM_BPTR_KIND_INTERNAL = 1,   /* Bε-tree internal node */
-    STM_BPTR_KIND_LEAF     = 2,   /* Bε-tree leaf node */
-    STM_BPTR_KIND_EXTENT   = 3,   /* user-data extent */
-    STM_BPTR_KIND_ALLOC    = 4,   /* allocator tree node */
-    STM_BPTR_KIND_SNAP     = 5,   /* snapshot-index tree node */
-    STM_BPTR_KIND_CAS      = 6,   /* CAS-tier index node */
+    STM_BPTR_KIND_NONE      = 0,   /* null pointer */
+    STM_BPTR_KIND_INTERNAL  = 1,   /* Bε-tree internal node */
+    STM_BPTR_KIND_LEAF      = 2,   /* Bε-tree leaf node */
+    STM_BPTR_KIND_EXTENT    = 3,   /* user-data extent */
+    STM_BPTR_KIND_ALLOC     = 4,   /* allocator tree node */
+    STM_BPTR_KIND_SNAP      = 5,   /* snapshot-index tree node */
+    STM_BPTR_KIND_CAS       = 6,   /* CAS-tier index node */
+    STM_BPTR_KIND_KEYSCHEMA = 7,   /* key-schema sub-tree node (ARCH §7.7.3) */
 } stm_bptr_kind;
 
 typedef struct {
@@ -185,7 +193,9 @@ typedef struct {
     uint8_t ub_redundancy_kind;                 /* 424 :  1 */
     uint8_t ub_redundancy_params[15];           /* 425 : 15 */
 
-    /* Key schema (§7) — wrapped keys + IV + KDF salt + version */
+    /* Key schema (§7.7.3) — header + bptr into the key-schema
+     * sub-tree. Layout inside these 512 bytes is managed via
+     * stm_ub_key_schema_pack / _unpack (see below). */
     uint8_t ub_key_schema[512];                 /* 440 : 512 */
 
     /* Device class / role */
@@ -221,6 +231,49 @@ typedef struct {
 } stm_uberblock;
 
 _Static_assert(sizeof(stm_uberblock) == 4096, "stm_uberblock must be 4096 bytes");
+
+/* ========================================================================= */
+/* Key-schema header (packed into ub_key_schema[512], P4-4a).                 */
+/* ========================================================================= */
+
+/* "TSCH" — key-schema Tree header magic. Four ASCII bytes appearing
+ * at the head of ub_key_schema distinguish a v4+ populated schema
+ * header from (a) a v3 uberblock's raw 32-byte plaintext key
+ * prefix, or (b) an all-zero "never-formatted" region. */
+#define STM_UB_KEY_SCHEMA_MAGIC    UINT32_C(0x48435354)
+#define STM_UB_KEY_SCHEMA_VERSION  1u
+
+/* Logical layout inside ub_key_schema[512]:
+ *
+ *   [0..4)      magic 'TSCH'              (le32)
+ *   [4..8)      version                   (le32)
+ *   [8..16)     feature-flag bits         (le64)
+ *   [16..80)    stm_bptr → schema root    (64 bytes)
+ *   [80..512)   reserved (zero-filled)    (432 bytes)
+ *
+ * Schema nodes themselves are plaintext Merkle-covered (ARCH §7.7.3);
+ * the sensitive bytes — wrapped dataset keys inside the leaf — are
+ * already encrypted under the pool's wrap key via stm_hybrid. */
+typedef struct {
+    uint32_t  ks_magic;
+    uint32_t  ks_version;
+    uint64_t  ks_flags;
+    stm_bptr  ks_root;             /* zero-initialized = "no schema tree yet" */
+} stm_ub_key_schema_hdr;
+
+/* Pack a header into the 512-byte slot. Fills reserved tail with
+ * zeros so consecutive commits produce byte-identical uberblocks
+ * when the schema state is unchanged. */
+void stm_ub_key_schema_pack(const stm_ub_key_schema_hdr *hdr,
+                              uint8_t out[512]);
+
+/* Unpack. Returns STM_OK on valid magic + version, STM_EBADVERSION
+ * otherwise. A freshly-zeroed slot (magic == 0) is NOT valid —
+ * callers should only attempt unpack on a pool that was formatted
+ * as v4+. */
+STM_MUST_USE
+stm_status stm_ub_key_schema_unpack(const uint8_t in[512],
+                                      stm_ub_key_schema_hdr *out);
 
 /* ========================================================================= */
 /* Encode / decode.                                                           */

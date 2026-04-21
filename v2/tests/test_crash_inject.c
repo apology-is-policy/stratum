@@ -35,6 +35,7 @@
 #include <stratum/block_inject.h>
 #include <stratum/fs.h>
 #include <stratum/fs_testing.h>
+#include <stratum/keyfile.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,6 +50,7 @@ static const uint64_t POOL_UUID[2]   = { 0xF1F2F3F4u, 0xA1A2A3A4u };
 static const uint64_t DEVICE_UUID[2] = { 0xB1B2B3B4u, 0xC1C2C3C4u };
 
 static char g_tmp_path[256];
+static char g_key_path[256];
 
 static void make_tmp(uint64_t iter)
 {
@@ -56,6 +58,11 @@ static void make_tmp(uint64_t iter)
              "/tmp/stm_v2_crash_%d_%llu.bin",
              (int)getpid(), (unsigned long long)iter);
     unlink(g_tmp_path);
+    snprintf(g_key_path, sizeof g_key_path,
+             "/tmp/stm_v2_crash_%d_%llu.key",
+             (int)getpid(), (unsigned long long)iter);
+    unlink(g_key_path);
+    STM_ASSERT_OK(stm_keyfile_generate(g_key_path));
 }
 
 static stm_fs_format_opts default_format_opts(void)
@@ -65,12 +72,16 @@ static stm_fs_format_opts default_format_opts(void)
         .bootstrap_size_bytes = TEST_BOOTSTRAP_BYTES,
         .pool_uuid            = { POOL_UUID[0], POOL_UUID[1] },
         .device_uuid          = { DEVICE_UUID[0], DEVICE_UUID[1] },
+        .keyfile_path         = g_key_path,
     };
 }
 
 static stm_fs_mount_opts rw_mount_opts(void)
 {
-    return (stm_fs_mount_opts){ .read_only = false };
+    return (stm_fs_mount_opts){
+        .read_only    = false,
+        .keyfile_path = g_key_path,
+    };
 }
 
 /* Shared warm-up path: format + mount + N of (reserve+commit). Returns

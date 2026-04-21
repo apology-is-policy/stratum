@@ -2017,7 +2017,9 @@ Wrapped PQ-hybrid keys are ~1192 bytes each, which is too large to store directl
 - Value: `state(1) || flags(1) || reserved(6) || wrapped_key(~1192 bytes)`. `state ∈ {CURRENT, RETIRED, PRUNING}`; `CURRENT` entries are the active encryption key for new writes; `RETIRED` entries remain unwrappable for reading historical data; `PRUNING` marks a retired key undergoing re-encryption-sweep before deletion.
 - Scale: at `STM_BTNODE_PAYLOAD_MAX = 130912` bytes per leaf ÷ (~16 + ~1200) ≈ 107 wrapped keys per leaf. Two-level trees reach ~107² ≈ 11 000 keys before needing a third level. Real pools (dozens of datasets × a few rotations each) stay well inside one leaf.
 
-**Merkle integration**: the key-schema root's `bp_csum` is the fifth input to `ub_merkle_root` (§7.11.3). Tamper on any wrapped key → mount-time Merkle check fails. The sub-tree nodes themselves are AEAD-encrypted under the pool's metadata key (§7.5) just like alloc-tree nodes; tag tamper detects bit-flip at the per-node level.
+**Merkle integration**: the key-schema root's `bp_csum` is the fifth input to `ub_merkle_root` (§7.11.3). Tamper on any wrapped key → mount-time Merkle check fails.
+
+**Node-level confidentiality**: the sub-tree nodes themselves are **plaintext** (not AEAD-encrypted). Applying node-level AEAD here would be either impossible (circular — the metadata key the schema stores would need to encrypt the schema that stores it) or confidentiality-null (any publicly-derivable key gives no meaningful secrecy while incurring the cost of an extra AEAD primitive). The sensitive bytes — the wrapped dataset keys themselves — are *already* encrypted under the wrap key inside each entry, so the schema tree leaks only structural information (dataset IDs, key IDs, rotation states) to an attacker with raw disk access. Integrity is provided by the plaintext `btnode` self-csum (BLAKE3 over the node's encoding), which IS the node's `bp_csum` recorded in the parent / uberblock — making the Merkle chain continuous from `ub_merkle_root` through the schema tree to every wrapped-key byte.
 
 **Rotation semantics** (formalised in `key_schema.tla`):
 

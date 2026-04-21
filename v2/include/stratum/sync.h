@@ -45,8 +45,9 @@
 extern "C" {
 #endif
 
-struct stm_bdev;  typedef struct stm_bdev  stm_bdev;
-struct stm_alloc; typedef struct stm_alloc stm_alloc;
+struct stm_bdev;        typedef struct stm_bdev  stm_bdev;
+struct stm_alloc;       typedef struct stm_alloc stm_alloc;
+struct stm_hybrid_keys; typedef struct stm_hybrid_keys stm_hybrid_keys;
 
 /* ========================================================================= */
 /* Opaque handle + info.                                                      */
@@ -82,11 +83,18 @@ typedef struct {
  *
  * pool_uuid / device_uuid go into every uberblock's header; they
  * should match the allocator's bootstrap pool for consistency.
+ *
+ * `wk` (P4-4a): the hybrid wrap key-pair. `wk->pk` is used at
+ * format time to PQ-hybrid-wrap the pool's dataset key. `wk->sk`
+ * must also be populated so the handle can operate without needing
+ * a separate unwrap call (a fresh pool uses the dataset key
+ * immediately for metadata encryption).
  */
 STM_MUST_USE
 stm_status stm_sync_create(stm_bdev *d, stm_alloc *a,
                             const uint64_t pool_uuid[2],
                             const uint64_t device_uuid[2],
+                            const stm_hybrid_keys *wk,
                             stm_sync **out_sync);
 
 /*
@@ -112,7 +120,9 @@ stm_status stm_sync_create(stm_bdev *d, stm_alloc *a,
  * the handle via stm_alloc_close and not reuse it.
  */
 STM_MUST_USE
-stm_status stm_sync_open(stm_bdev *d, stm_alloc *a, stm_sync **out_sync);
+stm_status stm_sync_open(stm_bdev *d, stm_alloc *a,
+                          const stm_hybrid_keys *wk,
+                          stm_sync **out_sync);
 
 /*
  * Commit. Runs through the five phases (Freeze/Reserve/Flush/Final/

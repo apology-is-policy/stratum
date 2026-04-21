@@ -35,11 +35,24 @@
 #include <stratum/block.h>
 #include <stratum/crypto.h>
 #include <stratum/hash.h>
+#include <stratum/keyfile.h>
+#include <stratum/keyschema.h>
 #include <stratum/super.h>
 
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Dataset id used by the P4-4a single-pool-key MVP. Multi-dataset
+ * arrives with P4-4c; for now every pool has dataset 0 implicitly. */
+#define STM_SYNC_POOL_DATASET_ID   UINT64_C(0)
+#define STM_SYNC_POOL_KEY_ID       UINT64_C(0)
+
+/* Size of a hybrid-wrapped 32-byte dek. Pinned at build time so
+ * caller buffers are deterministic. */
+#define STM_SYNC_WRAPPED_KEY_LEN   (32u + STM_HYBRID_WRAP_OVERHEAD)
+_Static_assert(STM_SYNC_WRAPPED_KEY_LEN <= STM_KEYSCHEMA_WRAPPED_MAX,
+               "wrapped pool key must fit a keyschema entry");
 
 struct stm_sync {
     pthread_mutex_t lock;
@@ -86,23 +99,25 @@ struct stm_sync {
     uint8_t    alloc_root_csum[32];
     uint8_t    merkle_root[32];
 
-    /* P4-3a: per-pool metadata-encryption key.
+    /* Per-pool metadata-encryption key.
      *
-     * Generated at sync_create from the OS CSPRNG (libsodium). Stored
-     * raw in ub_key_schema[0..32] for the MVP — no PQ-hybrid wrap
-     * yet; that's P4-4's job. When P4-3b lands, this key encrypts
-     * every metadata node (btnode) at write time and decrypts them
-     * at read time via an AEAD wrapper around the btree_store
-     * serialize / deserialize path.
-     *
-     * Format note (to revisit in P4-4): the first 32 bytes of
-     * ub_key_schema currently hold a plaintext raw key. ub_key_schema
-     * is 512 bytes total, so there is room for a proper header
-     * (magic + version + wrap metadata + wrapped payload) once the
-     * key hierarchy + key agent land. The P4-3a layout is
-     * "raw[0..32]" with the rest zero-filled; future readers detecting
-     * all-zero after offset 32 can infer raw-MVP format. */
-    uint8_t    metadata_key[32];
+     * P4-3a generated this at sync_create and stored it in plaintext
+     * in ub_key_schema[0..32]. P4-4a moved the on-disk storage into
+     * the key-schema sub-tree in PQ-hybrid-wrapped form; the raw key
+     * stays in RAM (needed by every btree_store encrypt/decrypt) but
+     * never hits disk in plaintext. */
+    uint8_t           metadata_key[32];
+
+    /* P4-4a: key-schema sub-tree holding the wrapped pool key (and,
+     * in P4-4c, per-dataset keys + retired keys). Owned by
+     * stm_sync; closed on stm_sync_close. */
+    stm_keyschema    *keyschema;
+
+    /* Durable root of the key-schema sub-tree — mirror of the bptr
+     * stored in ub_key_schema.ks_root. Zero/zeros before the first
+     * commit. */
+    uint64_t          keyschema_root_paddr;
+    uint8_t           keyschema_root_csum[32];
 };
 
 /* ========================================================================= */
@@ -126,16 +141,18 @@ static stm_status compute_merkle_root(const uint8_t main_csum[32],
                                         const uint8_t alloc_csum[32],
                                         const uint8_t snap_csum[32],
                                         const uint8_t cas_csum[32],
+                                        const uint8_t keyschema_csum[32],
                                         const uint8_t salt[32],
                                         uint8_t out[32])
 {
     stm_blake3_ctx *h = stm_blake3_new();
     if (!h) return STM_ENOMEM;
-    stm_blake3_update(h, main_csum,  32);
-    stm_blake3_update(h, alloc_csum, 32);
-    stm_blake3_update(h, snap_csum,  32);
-    stm_blake3_update(h, cas_csum,   32);
-    stm_blake3_update(h, salt,       32);
+    stm_blake3_update(h, main_csum,      32);
+    stm_blake3_update(h, alloc_csum,     32);
+    stm_blake3_update(h, snap_csum,      32);
+    stm_blake3_update(h, cas_csum,       32);
+    stm_blake3_update(h, keyschema_csum, 32);
+    stm_blake3_update(h, salt,           32);
     stm_blake3_final(h, out, 32);
     stm_blake3_free(h);
     return STM_OK;
@@ -177,6 +194,8 @@ static void build_uberblock(stm_uberblock *out,
                               uint64_t alloc_root_paddr,
                               const uint8_t alloc_root_csum[32],
                               uint64_t alloc_root_gen,
+                              uint64_t keyschema_root_paddr,
+                              const uint8_t keyschema_root_csum[32],
                               const uint8_t merkle_root[32],
                               const stm_alloc_stats *astats)
 {
@@ -210,10 +229,22 @@ static void build_uberblock(stm_uberblock *out,
     memcpy(out->ub_merkle_root,        merkle_root,     32);
     memcpy(out->ub_merkle_root_salt,   s->merkle_salt,  32);
 
-    /* P4-3a: metadata-encryption key at ub_key_schema[0..32].
-     * Remaining 480 bytes of ub_key_schema are reserved for the
-     * P4-4 PQ-hybrid wrapped key hierarchy. Stays zero in the MVP. */
-    memcpy(out->ub_key_schema,         s->metadata_key, 32);
+    /* P4-4a: key-schema sub-tree pointer in ub_key_schema. Packed
+     * via the v4 header format (magic 'TSCH' + version + flags +
+     * bptr). Tree nodes themselves are plaintext Merkle-covered;
+     * wrapped keys inside leaves are what's cryptographically
+     * protected. */
+    stm_ub_key_schema_hdr ks_hdr;
+    memset(&ks_hdr, 0, sizeof ks_hdr);
+    ks_hdr.ks_magic   = STM_UB_KEY_SCHEMA_MAGIC;
+    ks_hdr.ks_version = STM_UB_KEY_SCHEMA_VERSION;
+    ks_hdr.ks_flags   = 0;
+    if (keyschema_root_paddr != 0) {
+        ks_hdr.ks_root.bp_paddr = stm_store_le64(keyschema_root_paddr);
+        ks_hdr.ks_root.bp_kind  = STM_BPTR_KIND_KEYSCHEMA;
+        memcpy(ks_hdr.ks_root.bp_csum, keyschema_root_csum, 32);
+    }
+    stm_ub_key_schema_pack(&ks_hdr, out->ub_key_schema);
 
     /* Data-area totals (in blocks). */
     out->ub_total_blocks = stm_store_le64(astats->data_total_blocks);
@@ -252,9 +283,14 @@ static stm_sync *sync_new(stm_bdev *d, stm_alloc *a,
 stm_status stm_sync_create(stm_bdev *d, stm_alloc *a,
                             const uint64_t pool_uuid[2],
                             const uint64_t device_uuid[2],
+                            const stm_hybrid_keys *wk,
                             stm_sync **out_sync)
 {
     if (!d || !a || !pool_uuid || !device_uuid || !out_sync) return STM_EINVAL;
+    /* P4-4a: wk is mandatory — the pool's metadata key must be
+     * PQ-hybrid-wrapped before persistence, so the wrap-public-key
+     * half has to be available at create time. */
+    if (!wk) return STM_EINVAL;
 
     /* R9 P1-1: the rest of this function calls stm_random_bytes /
      * stm_aead_* transitively via stm_alloc_set_crypt_ctx; libsodium
@@ -280,8 +316,40 @@ stm_status stm_sync_create(stm_bdev *d, stm_alloc *a,
 
     /* P4-3a: generate the pool's metadata-encryption key. Like the
      * merkle salt, this is stable across the pool's lifetime for MVP.
-     * Key rotation is P4-4's job. */
+     * Key rotation is P4-4c's job. */
     stm_random_bytes(s->metadata_key, 32);
+
+    /* P4-4a: PQ-hybrid-wrap the freshly-minted metadata key and park
+     * it in a new in-RAM key-schema handle. The wrapped bytes
+     * persist to disk on the first commit (via stm_keyschema_commit);
+     * the raw `metadata_key` never leaves RAM. */
+    {
+        stm_bootstrap *boot = stm_alloc_bootstrap(a);
+        if (!boot) { stm_sync_close(s); return STM_EINVAL; }
+        stm_keyschema *ks = NULL;
+        stm_status ks_s = stm_keyschema_create(d, boot, &ks);
+        if (ks_s != STM_OK) { stm_sync_close(s); return ks_s; }
+        s->keyschema = ks;
+
+        uint8_t wrapped[STM_SYNC_WRAPPED_KEY_LEN];
+        size_t  wrapped_len = 0;
+        stm_status ws = stm_hybrid_wrap(wk->pk,
+                                           s->metadata_key, 32,
+                                           wrapped, &wrapped_len);
+        if (ws != STM_OK) { stm_sync_close(s); return ws; }
+        if (wrapped_len != STM_SYNC_WRAPPED_KEY_LEN) {
+            stm_ct_memzero(wrapped, sizeof wrapped);
+            stm_sync_close(s);
+            return STM_EBACKEND;
+        }
+        ws = stm_keyschema_insert_wrapped(ks,
+                                            STM_SYNC_POOL_DATASET_ID,
+                                            STM_SYNC_POOL_KEY_ID,
+                                            STM_KS_STATE_CURRENT,
+                                            wrapped, wrapped_len);
+        stm_ct_memzero(wrapped, sizeof wrapped);
+        if (ws != STM_OK) { stm_sync_close(s); return ws; }
+    }
 
     /* P4-3b: install the crypt ctx on the allocator so its next
      * stm_alloc_commit encrypts every metadata node. Order matters:
@@ -299,9 +367,13 @@ stm_status stm_sync_create(stm_bdev *d, stm_alloc *a,
     return STM_OK;
 }
 
-stm_status stm_sync_open(stm_bdev *d, stm_alloc *a, stm_sync **out_sync)
+stm_status stm_sync_open(stm_bdev *d, stm_alloc *a,
+                          const stm_hybrid_keys *wk,
+                          stm_sync **out_sync)
 {
     if (!d || !a || !out_sync) return STM_EINVAL;
+    /* P4-4a: unwrap the pool key via wk->sk. Mandatory. */
+    if (!wk) return STM_EINVAL;
 
     /* R9 P1-1: make sure libsodium is up before any crypto op. */
     stm_status ci = stm_crypto_init();
@@ -373,10 +445,64 @@ stm_status stm_sync_open(stm_bdev *d, stm_alloc *a, stm_sync **out_sync)
     memcpy(s2->alloc_root_csum,  ub.ub_alloc_root.bp_csum, 32);
     memcpy(s2->merkle_root,      ub.ub_merkle_root,      32);
 
-    /* P4-3a: recover the metadata key from ub_key_schema[0..32]. The
-     * key is plaintext in the MVP — P4-4's key hierarchy will wrap
-     * it (ML-KEM-768 + X25519 hybrid) and the unwrap path moves here. */
-    memcpy(s2->metadata_key,     ub.ub_key_schema,       32);
+    /* P4-4a: unpack the key-schema header, load the sub-tree into
+     * a keyschema handle, find the CURRENT wrapped key for dataset
+     * 0, and unwrap it with wk->sk. The raw metadata_key stays in
+     * RAM and gets installed on the allocator below. */
+    stm_ub_key_schema_hdr ks_hdr;
+    stm_status hs = stm_ub_key_schema_unpack(ub.ub_key_schema, &ks_hdr);
+    if (hs != STM_OK) {
+        stm_sync_close(s2);
+        return hs;
+    }
+    uint64_t ks_root_paddr = stm_load_le64(ks_hdr.ks_root.bp_paddr);
+    uint8_t  ks_root_kind  = ks_hdr.ks_root.bp_kind;
+    /* A pool that was sync_create'd but never sync_commit'd would
+     * have no keyschema on disk yet — but also no durable uberblock,
+     * so mount_scan above would have returned STM_ENOENT. A valid
+     * durable UB at v4 MUST have a non-zero keyschema bptr (or,
+     * conservatively, we treat zero as corruption). */
+    if (ks_root_paddr == 0 ||
+        ks_root_kind  != STM_BPTR_KIND_KEYSCHEMA) {
+        stm_sync_close(s2);
+        return STM_ECORRUPT;
+    }
+
+    stm_bootstrap *boot = stm_alloc_bootstrap(a);
+    if (!boot) { stm_sync_close(s2); return STM_EINVAL; }
+    stm_status kos = stm_keyschema_open(d, boot, &s2->keyschema);
+    if (kos != STM_OK) { stm_sync_close(s2); return kos; }
+    kos = stm_keyschema_load_at(s2->keyschema, ks_root_paddr,
+                                  ks_hdr.ks_root.bp_csum);
+    if (kos != STM_OK) { stm_sync_close(s2); return kos; }
+    s2->keyschema_root_paddr = ks_root_paddr;
+    memcpy(s2->keyschema_root_csum, ks_hdr.ks_root.bp_csum, 32);
+
+    uint8_t wrapped[STM_SYNC_WRAPPED_KEY_LEN];
+    size_t  wrapped_len = 0;
+    uint64_t found_key_id = 0;
+    kos = stm_keyschema_lookup_current(s2->keyschema,
+                                         STM_SYNC_POOL_DATASET_ID,
+                                         &found_key_id,
+                                         wrapped, sizeof wrapped, &wrapped_len);
+    if (kos != STM_OK) {
+        stm_ct_memzero(wrapped, sizeof wrapped);
+        stm_sync_close(s2);
+        return kos;
+    }
+
+    size_t dek_out_len = 0;
+    stm_status us = stm_hybrid_unwrap(wk->sk, wrapped, wrapped_len,
+                                        s2->metadata_key, &dek_out_len);
+    stm_ct_memzero(wrapped, sizeof wrapped);
+    if (us != STM_OK) {
+        stm_sync_close(s2);
+        return us;
+    }
+    if (dek_out_len != 32) {
+        stm_sync_close(s2);
+        return STM_EBACKEND;
+    }
 
     /* P4-3b: install the crypt ctx on the allocator so
      * stm_alloc_load_tree_at below can decrypt nodes. MUST happen
@@ -388,22 +514,19 @@ stm_status stm_sync_open(stm_bdev *d, stm_alloc *a, stm_sync **out_sync)
         return cs;
     }
 
-    /* P4-1: verify the on-disk ub_merkle_root is self-consistent
-     * with the per-tree-root csums + salt recorded in the SAME
-     * uberblock. An offline edit that swapped either the salt,
-     * a tree-root csum, or the merkle_root field would break this.
-     * (A coordinated edit to all three would pass this check but
-     * fails the tree-node self-csum check on the first read.)
+    /* P4-1 / P4-4a: verify the on-disk ub_merkle_root is
+     * self-consistent with the per-tree-root csums (now including
+     * the key-schema root) + salt recorded in the SAME uberblock.
+     * An offline edit that swapped any of those inputs breaks this.
      *
-     * R8-P1-1: on BLAKE3 OOM, refuse the mount entirely (rather
-     * than computing an all-zero root which might coincidentally
-     * match a tampered UB). */
+     * R8-P1-1: on BLAKE3 OOM, refuse the mount entirely. */
     uint8_t  zeros32[32] = { 0 };
     uint8_t  recomputed[32];
     stm_status ms = compute_merkle_root(zeros32,     /* main */
                                           ub.ub_alloc_root.bp_csum,
                                           zeros32,     /* snap */
                                           zeros32,     /* cas  */
+                                          ks_hdr.ks_root.bp_csum,
                                           ub.ub_merkle_root_salt,
                                           recomputed);
     if (ms != STM_OK) {
@@ -462,11 +585,13 @@ stm_status stm_sync_open(stm_bdev *d, stm_alloc *a, stm_sync **out_sync)
         }
         stm_uberblock claim_ub;
         build_uberblock(&claim_ub, s2,
-                         /*new_gen=*/       durable_gen + 1,
-                         /*alloc_root=*/    alloc_root,
-                         /*alloc_csum=*/    ub.ub_alloc_root.bp_csum,
-                         /*alloc_root_gen=*/alloc_root_gen,
-                         /*merkle_root=*/   ub.ub_merkle_root,
+                         /*new_gen=*/           durable_gen + 1,
+                         /*alloc_root=*/        alloc_root,
+                         /*alloc_csum=*/        ub.ub_alloc_root.bp_csum,
+                         /*alloc_root_gen=*/    alloc_root_gen,
+                         /*keyschema_root=*/    ks_root_paddr,
+                         /*keyschema_csum=*/    ks_hdr.ks_root.bp_csum,
+                         /*merkle_root=*/       ub.ub_merkle_root,
                          &astats_claim);
         uint32_t lbl  = ring_label_for_gen(durable_gen + 1);
         uint32_t slot = ring_slot_for_gen(durable_gen + 1);
@@ -492,6 +617,8 @@ stm_status stm_sync_open(stm_bdev *d, stm_alloc *a, stm_sync **out_sync)
 void stm_sync_close(stm_sync *s)
 {
     if (!s) return;
+    /* P4-4a: close the keyschema (frees its in-RAM entries too). */
+    if (s->keyschema) stm_keyschema_close(s->keyschema);
     /* P4-3b: wipe key material before free. The alloc's copy is
      * wiped independently in stm_alloc_close. */
     stm_ct_memzero(s->metadata_key, sizeof s->metadata_key);
@@ -526,11 +653,33 @@ stm_status stm_sync_commit(stm_sync *s)
 
     /* Phase: Reserve + Flush.
      *
-     * stm_alloc_commit(committed_gen = commit_gen) persists the
-     * allocator-tree to the bootstrap pool. It reserves node paddrs
-     * (Reserve), writes nodes to the bdev (Flush), records PENDING
-     * entries for the old tree's nodes (to be swept at the next
-     * commit), and fsyncs via stm_bootstrap_commit. */
+     * Order matters — key-schema first, allocator second. Both
+     * share the bootstrap pool for node storage; bootstrap_commit
+     * runs at the END of stm_alloc_commit (fsyncs the bitmap).
+     * If we ran alloc_commit first, keyschema's subsequent reserves
+     * would stamp the bitmap in RAM but never reach durable state,
+     * and the next mount would see keyschema's paddr as free — a
+     * recipe for paddr collisions on the next commit.
+     *
+     * P4-4a: commit the key-schema sub-tree. For P4-4a the schema
+     * state is usually unchanged across commits (no rotation yet),
+     * but we re-serialize unconditionally — the node is tiny by
+     * metadata standards (1 × 128 KiB) and the always-fresh-paddr
+     * shape matches the alloc-tree's commit pattern (simpler
+     * reasoning, no special "clean" skip path). */
+    uint64_t ks_root_paddr = 0;
+    uint8_t  ks_root_csum[32] = { 0 };
+    stm_status kcs = stm_keyschema_commit(s->keyschema, commit_gen,
+                                            &ks_root_paddr, ks_root_csum);
+    if (kcs != STM_OK) {
+        pthread_mutex_unlock(&s->lock);
+        return kcs;
+    }
+
+    /* stm_alloc_commit(committed_gen = commit_gen) persists the
+     * allocator-tree to the bootstrap pool AND fsyncs via
+     * stm_bootstrap_commit at the end — finalizing both alloc's
+     * and keyschema's reserves/frees in one durable transaction. */
     stm_status s_alloc = stm_alloc_commit(s->alloc, commit_gen);
     if (s_alloc != STM_OK) {
         pthread_mutex_unlock(&s->lock);
@@ -556,9 +705,9 @@ stm_status stm_sync_commit(stm_sync *s)
         return sr;
     }
 
-    /* P4-1: compute the pool Merkle root over the set of tree-root
-     * csums + the per-pool salt. Phase 3 populates only the
-     * allocator tree; main/snap/cas contribute zeros and will
+    /* P4-1 / P4-4a: compute the pool Merkle root over all five
+     * sub-tree csums + the per-pool salt. Phase 4 populates
+     * allocator + key-schema; main/snap/cas contribute zeros and
      * populate in Phase 5+.
      *
      * R8-P1-1: refuse to commit if BLAKE3 context allocation fails.
@@ -570,6 +719,7 @@ stm_status stm_sync_commit(stm_sync *s)
                                           alloc_root_csum,
                                           zeros32,   /* snap */
                                           zeros32,   /* cas  */
+                                          ks_root_csum,
                                           s->merkle_salt,
                                           new_merkle_root);
     if (ms != STM_OK) {
@@ -584,8 +734,10 @@ stm_status stm_sync_commit(stm_sync *s)
      * R9 P0-1: alloc_root_gen = commit_gen because this commit DID
      * rewrite the tree under commit_gen's AEAD nonce. */
     stm_uberblock ub;
-    build_uberblock(&ub, s, commit_gen, alloc_root, alloc_root_csum,
-                     commit_gen, new_merkle_root, &astats);
+    build_uberblock(&ub, s, commit_gen,
+                     alloc_root, alloc_root_csum, commit_gen,
+                     ks_root_paddr, ks_root_csum,
+                     new_merkle_root, &astats);
 
     uint32_t next_label = ring_label_for_gen(commit_gen);
     uint32_t next_slot  = ring_slot_for_gen(commit_gen);
@@ -599,13 +751,15 @@ stm_status stm_sync_commit(stm_sync *s)
     /* Phase: Publish — advance in-RAM state. Done under our mutex so
      * any concurrent reader of stm_sync_info_get observes a
      * consistent snapshot. */
-    s->current_gen       = commit_gen + 1;
-    s->live_label_idx    = next_label;
-    s->live_slot_idx     = next_slot;
-    s->alloc_root_paddr  = alloc_root;
-    s->alloc_root_gen    = commit_gen;
-    memcpy(s->alloc_root_csum, alloc_root_csum, 32);
-    memcpy(s->merkle_root,     new_merkle_root, 32);
+    s->current_gen           = commit_gen + 1;
+    s->live_label_idx        = next_label;
+    s->live_slot_idx         = next_slot;
+    s->alloc_root_paddr      = alloc_root;
+    s->alloc_root_gen        = commit_gen;
+    s->keyschema_root_paddr  = ks_root_paddr;
+    memcpy(s->alloc_root_csum,     alloc_root_csum, 32);
+    memcpy(s->keyschema_root_csum, ks_root_csum,   32);
+    memcpy(s->merkle_root,         new_merkle_root, 32);
 
     pthread_mutex_unlock(&s->lock);
     return STM_OK;

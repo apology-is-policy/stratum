@@ -21,7 +21,7 @@ integrity), then encryption (AEAD data extents + AEAD metadata nodes
 | `fc52dbe` | **P4-3b: AEAD on metadata nodes**. AEGIS-256 wraps every emitted btnode image at the `btree_store` boundary. On-disk layout: ciphertext occupies `[0..STM_BTNODE_SIZE - 32)`, AEAD tag fills the trailing 32 bytes (repurposes the slot the P4-1 plaintext self-csum used to live in; `STM_AEAD_TAG_LEN_AEGIS256 == STM_BTNODE_CSUM_SIZE` ensures exact fit). `bp_csum` semantics unchanged: `BLAKE3(on-disk[0..STM_BTNODE_SIZE - 32))` — now covers ciphertext. Nonce = paddr(8 LE) ‖ gen(8 LE) ‖ pool_uuid(16 LE). AD = pool_uuid(16 LE) ‖ device_uuid(16 LE). Mandatory for v2 pools — no unencrypted path. `stm_alloc` gains a crypt-ctx setter; `stm_sync_{create,open}` installs it from the pool key before the first commit / tree load. Old-tree free path threads the prior tree's gen so AEAD decrypt can enumerate internal-node children. | 7 new btree_store tests (encrypted round-trip, tag tamper, wrong key / gen / pool_uuid / device_uuid, NULL cx); 20 suites green |
 | `ca8d47b` | **R9 audit fixes**. P0-1: mount-claim UB closes the nonce-reuse-across-crash-recovery hazard. New `ub_alloc_root_gen` field preserves the AEAD nonce on the tree when a mount advances ub_gen without rewriting the tree. Format bump STM_UB_VERSION 2→3. P1-1: `stm_crypto_init` at top of sync_create/open. P1-2: `stm_btree_store_free_tree` now takes `expected_root_csum` and Merkle-verifies before AEAD decrypt. P2-1: `stm_btree_store_serialize` rolls back reserved paddrs on emit failure. P2-2: dangling key-pointer nulled after OOM. | 2 new sync tests (mount-claim advance, load_tree_at-without-cx); 20 suites green on default/ASan/TSan; 7 TLA+ specs clean |
 | `dc357ad` | **P4-2: scrubber**. New `stm_btree_store_verify` + `stm_alloc_verify` + `stm_fs_verify`: walks the on-disk allocator tree, re-reads every node, checks Merkle chain + AEAD tags without mutating state. Safe to call on live pools (including RO / wedged). Intended for admin-invoked scrubs and as a separate detection surface from mount-time Merkle (in-flight bit rot or external tamper surfaces on next scrub without waiting for unmount). | 3 new sync tests (clean, empty pool, post-commit tamper detection); 20 suites green |
-| `<next>` | **P4-5 stub: data-extent AEAD round-trip**. New `src/extent/` module exposing `stm_ad_extent` (ARCH §7.6.1 — 56-byte AD: magic ‖ version ‖ pool_uuid ‖ dataset_id ‖ ino ‖ offset ‖ content_kind) + `stm_extent_encrypt` / `stm_extent_decrypt`. Nonce construction matches P4-3b's metadata wrapper (paddr ‖ gen ‖ pool_uuid) — see phase4-status.md "Known deltas from ARCH" for the nonce-layout subset rationale. No extent manager, no on-disk index — the caller owns paddrs. Scope is the crypto surface alone; full extent layer is Phase 6 (dataset model + tree + content-defined chunking). Satisfies ROADMAP §7.2's "encrypted writes round-trip correctly with AEGIS-256 and XChaCha20-SIV" exit bullet. | 11 new tests: round-trip per mode; AD field-by-field tamper rejects (pool_uuid / dataset_id / ino / offset / content_kind); nonce tamper (paddr / gen); tag tamper; AD packed-size pinned to 56. 21 suites green |
+| `eeea92d` | **P4-5 stub: data-extent AEAD round-trip**. New `src/extent/` module exposing `stm_ad_extent` (ARCH §7.6.1 — 56-byte AD: magic ‖ version ‖ pool_uuid ‖ dataset_id ‖ ino ‖ offset ‖ content_kind) + `stm_extent_encrypt` / `stm_extent_decrypt`. Nonce construction matches P4-3b's metadata wrapper (paddr ‖ gen ‖ pool_uuid) — see phase4-status.md "Known deltas from ARCH" for the nonce-layout subset rationale. No extent manager, no on-disk index — the caller owns paddrs. Scope is the crypto surface alone; full extent layer is Phase 6 (dataset model + tree + content-defined chunking). Satisfies ROADMAP §7.2's "encrypted writes round-trip correctly with AEGIS-256 and XChaCha20-SIV" exit bullet. | 11 new tests: round-trip per mode; AD field-by-field tamper rejects (pool_uuid / dataset_id / ino / offset / content_kind); nonce tamper (paddr / gen); tag tamper; AD packed-size pinned to 56. 21 suites green |
 
 ## Remaining Phase 4 work
 
@@ -42,7 +42,40 @@ safe on live / RO / wedged pools. Intended for:
 A future "scrub mode" daemon (background periodic scrub) is a
 Phase-8 concern but plugs into this primitive.
 
-### P4-4: Janus + key-schema sub-tree (design committed; implementation pending)
+### P4-4a: on-disk key-schema sub-tree + in-process unwrap (LANDED)
+
+Lands the on-disk half of P4-4 without the out-of-process janus
+daemon (P4-4b) or dataset generalization (P4-4c):
+
+- **STM_UB_VERSION 3 → 4**. New `ub_key_schema` layout: magic 'TSCH'
+  + version + flags + `stm_bptr ks_root` + reserved. Packed/unpacked
+  via `stm_ub_key_schema_pack` / `_unpack`.
+- **New bptr kind**: `STM_BPTR_KIND_KEYSCHEMA = 7`.
+- **`src/keyschema/`**: `stm_keyschema` handle over a single on-disk
+  leaf (Phase 4 scale). Plaintext + Merkle-covered via the btnode
+  self-csum (no AEAD at the node level — would be circular; wrapped
+  bytes inside entries are the confidentiality layer).
+- **`src/keyfile/`**: MVP wrap-key backend. Keyfile = magic 'KFIL' +
+  version + hybrid_pk + hybrid_sk. `stm_keyfile_generate` creates
+  one; `stm_keyfile_load` reads. Janus (P4-4b) supersedes.
+- **sync integration**: `stm_sync_create` / `_open` gain a
+  `const stm_hybrid_keys *wk` parameter. Create PQ-hybrid-wraps the
+  freshly-generated metadata key and inserts into the schema. Open
+  loads the schema, looks up the CURRENT key for dataset 0, and
+  unwraps via `stm_hybrid_unwrap`. No plaintext pool key ever hits
+  disk.
+- **Merkle root formula updated**: `BLAKE3(main ‖ alloc ‖ snap ‖
+  cas ‖ keyschema ‖ salt)` — fifth input.
+- **Commit order**: keyschema_commit runs BEFORE alloc_commit inside
+  `stm_sync_commit`. Alloc's bootstrap_commit finalizes both
+  subsystems' bitmap reserves durably.
+- **Tests**: `sync_no_plaintext_key_on_disk` proves the old P4-3a
+  marker (raw 32-byte pool key at `ub_key_schema[0..32]`) is gone;
+  `sync_wrong_keyfile_rejected` proves a mismatched sk fails mount.
+  Plus full-suite pass (21/21 green on default/ASan/TSan, 8 TLA+
+  specs clean including the new `key_schema.tla`).
+
+### P4-4: Janus + key-schema sub-tree (design committed; P4-4a LANDED)
 
 Agreed-on-the-run 2026-04-21 (see ARCH §7.7.3 + §7.9, NOVEL §3.10,
 ROADMAP §7.1 for the committed design):
@@ -261,7 +294,7 @@ ctest --test-dir build-asan --output-on-failure
 # All TLA+ specs (includes merkle after P4-6)
 export PATH="/opt/homebrew/opt/openjdk/bin:$PATH"
 cd specs
-for s in sync concurrency structural balanced merge allocator merkle; do
+for s in sync concurrency structural balanced merge allocator merkle key_schema; do
     echo "== $s =="
     java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
         -config $s.cfg $s.tla 2>&1 | tail -3

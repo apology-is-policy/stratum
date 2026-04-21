@@ -673,6 +673,11 @@ stm_status stm_alloc_open(stm_bdev *d, stm_alloc **out_alloc)
     return open_handle_bare(d, out_alloc);
 }
 
+stm_bootstrap *stm_alloc_bootstrap(stm_alloc *a)
+{
+    return a ? a->boot : NULL;
+}
+
 void stm_alloc_close(stm_alloc *a)
 {
     if (!a) return;
