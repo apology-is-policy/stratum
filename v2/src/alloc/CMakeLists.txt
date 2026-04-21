@@ -19,3 +19,14 @@ target_include_directories(stm_sdarray PUBLIC
 
 target_link_libraries(stm_sdarray
     PRIVATE stm_warnings stm_sanitize stm_coverage)
+
+# xor8 filter (Phase 3 chunk 4d). Standalone membership-accelerator
+# library; same packaging as stm_sdarray.
+add_library(stm_xor_filter STATIC
+    xor_filter.c)
+
+target_include_directories(stm_xor_filter PUBLIC
+    ${CMAKE_SOURCE_DIR}/include)
+
+target_link_libraries(stm_xor_filter
+    PRIVATE stm_warnings stm_sanitize stm_coverage)

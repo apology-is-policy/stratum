@@ -190,6 +190,7 @@ target_link_libraries(stratum INTERFACE
     stm_btree_store
     stm_alloc
     stm_sdarray
+    stm_xor_filter
     stm_sync
     stm_fs)
 target_include_directories(stratum INTERFACE
