@@ -7,8 +7,8 @@ for the Bw-tree layer Phase 3 builds on.
 
 ## TL;DR
 
-Phase 3 is in progress. Eleven chunks landed (R7d audit in-flight on
-chunk 6):
+Phase 3 is in progress. Twelve chunks landed. R7e audit on chunk 7
+is the next round.
 
 | Commit | What | Tests |
 |---|---|---|
@@ -22,7 +22,8 @@ chunk 6):
 | `1aae3f2` | **Chunk 5b**: `stm_btnode` internal node codec. Pivots + N+1 child bptrs (64 B each). Message buffer deferred. | +7 btnode-internal tests |
 | `0d99eb5` | **Chunk 5c**: `stm_btree_store` serialize/deserialize + free_tree via an I/O vtable. Two-level depth cap; snapshot-style rewrite-on-commit. | 5 btree_store tests |
 | `033bb3f` → `17e08be` | **Chunk 5d + R7c**: `stm_alloc` integration — tree now persists across mount. R7c closed (0 P0 / 2 P1 / 6 P2; btnode common-helper consolidation). | +3 alloc persistence tests |
-| `00d796e` | **Chunk 6**: `stm_sync` — four-phase commit protocol (sync.tla-aligned). Ring rotation `(gen % 4, gen % 63)`, MountGenBump on open, ub_alloc_root now authoritative. | 8 sync tests |
+| `00d796e` → `b70537d` | **Chunk 6 + R7d**: `stm_sync` — four-phase commit protocol (sync.tla-aligned). R7d closed (2 P0 / 1 P1 / 3 P2 — ub_alloc_root now sole authoritative source; user_data tree-root dead-coded out). | 8 sync tests |
+| `e45818b` | **Chunk 7**: `stm_fs` — top-level mount/unmount lifecycle. Format → mount → reserve → commit → unmount → remount. Runtime guards (wedged / read_only) wired but live end-to-end tests for RO + wedged paths deferred to chunk 8 (POSIX-bdev close-without-commit hang). | 6 fs tests |
 
 Phase 2 is complete (SPLIT + MERGE + per-node consolidator + SCAN + R0-R6
 audits). Phase 3 chunks remaining:
@@ -124,31 +125,43 @@ Expected TLC results:
 - `merge.tla` — empty-leaf reabsorb. 65536 states, depth 18.
 - `allocator.tla` — refcount + deferred-free. 3729 states, depth 16.
 
-## Next chunk — mount/unmount integration (chunk 7)
+## Next chunk — R7e audit on chunk 7, then 4c/4d/4e and chunk 8
 
-Chunk 6 landed: stm_sync implements the four-phase commit protocol
-per sync.tla; ub_alloc_root now authoritative; MountGenBump wired.
+Chunk 7 landed at `e45818b` with the stm_fs lifecycle. Six-test
+coverage of the round-trip path (format → mount → reserve → commit
+→ unmount → remount). The user-facing guard flags (read_only /
+wedged) are wired at the API level and verified-by-inspection, but
+two end-to-end tests hang in POSIX-bdev cleanup when unmount skips
+the final commit — flagged as chunk-7 known issues for R7e and
+chunk 8 to tackle.
 
-### Chunk 7 (next): mount / unmount integration.
+### R7e (next): audit chunk 7.
 
-Chunk 6 delivered the low-level machinery (create/open/commit/close)
-but doesn't yet wire a user-facing FS lifecycle. Chunk 7 scope:
+Focused soundness audit on src/fs/fs.c + include/stratum/fs.h +
+tests/test_fs.c. Expected surfaces:
 
-- **`stm_fs`** top-level handle aggregating stm_alloc + stm_sync +
-  (future) main-tree + (future) crypto state.
-- **`stm_fs_mount(path, opts, out_fs)`** — opens bdev, creates or
-  opens the allocator, opens the sync layer, returns a ready
-  handle.
-- **`stm_fs_unmount(fs)`** — final commit, close sync, close
-  allocator, close bdev.
-- **Wedged / read-only runtime guards** (from v1 heritage per
-  CLAUDE.md's invariants list) — `STM_FS_GUARD_READ` /
-  `STM_FS_GUARD_WRITE` macros at every public entry.
-- **Single-device round-trip** is the first acceptance test:
-  mount → reserve → commit → unmount → mount → observe state.
+- Guard-macro coverage across every public entry.
+- stm_fs_format idempotency vs partial-failure.
+- Unmount's final-commit error propagation.
+- Bootstrap POSIX-bdev thread-pool hang on close-without-commit
+  (the deferred tests above). Root-cause this; the fix probably
+  belongs in src/block/posix.c, not fs.c.
+- Concurrency: the stm_fs mutex vs the nested stm_alloc + stm_sync
+  mutexes (lock-order invariants).
 
-Post-chunk-7, the stm_alloc user_data slot becomes dead weight and
-can be removed in a cleanup pass.
+Preamble: include R0-R7d closed list as do-not-report.
+
+### Then: chunks 4c, 4d, 4e, 8.
+
+- **4c** SDArray in-RAM bitmap for O(1) allocation queries.
+- **4d** xor filter for negative lookups.
+- **4e** R7 full-stack audit closing the allocator subsystem.
+- **8** Crash-injection fuzzer — Phase 3 exit criterion. Likely
+  forces us to implement the R7d-P0-2 two-phase bootstrap commit
+  fix (crash-mid-first-commit leak).
+
+Post-Phase-3 exit, Phase 4 begins encryption (AEAD per-extent +
+Merkle integrity populating ub_merkle_root + bp_csum).
 
 ### Chunk 4c: In-RAM succinct bitmap (SDArray).
 - Performance structure. `src/alloc/sdarray.c`. Approximate
