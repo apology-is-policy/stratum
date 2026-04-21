@@ -135,7 +135,9 @@ static void entry_free(ks_entry *e)
          * some future primitive. Today the bytes are already
          * ciphertext (PQ-hybrid-wrapped), so wiping is pure
          * belt-and-suspenders. */
-        memset(e->wrapped, 0, e->wrapped_len);
+        /* R12 P3-1: use stm_ct_memzero — memset of a soon-to-be-freed
+         * buffer is dead-store-eligible and may be elided under LTO. */
+        stm_ct_memzero(e->wrapped, e->wrapped_len);
         free(e->wrapped);
     }
     free(e);
@@ -455,9 +457,14 @@ stm_status stm_keyschema_insert_wrapped(stm_keyschema *ks,
     if (!ks) return STM_EINVAL;
     if (wrapped_len > 0 && !wrapped) return STM_EINVAL;
     if (wrapped_len > STM_KEYSCHEMA_WRAPPED_MAX) return STM_ERANGE;
-    if (state != STM_KS_STATE_CURRENT &&
-        state != STM_KS_STATE_RETIRED &&
-        state != STM_KS_STATE_PRUNING) return STM_EINVAL;
+    /* R12 P2-4: the public insert path is narrowed to CURRENT only.
+     * RETIRED / PRUNING transitions go through stm_keyschema_rotate /
+     * _mark_pruning (both of which enforce the legal state machine
+     * per key_schema.tla). The on-disk load path creates entries
+     * directly in keyschema.c (`load_cb`) without going through this
+     * primitive, so mount-time rehydration of RETIRED / PRUNING
+     * entries still works. */
+    if (state != STM_KS_STATE_CURRENT) return STM_EINVAL;
 
     ks_entry **slot = find_slot(ks, dataset_id, key_id);
     ks_entry *existing = *slot;
@@ -639,7 +646,7 @@ stm_status stm_keyschema_rotate(stm_keyschema *ks,
     if (*slot &&
          (*slot)->dataset_id == dataset_id &&
          (*slot)->key_id     == new_key_id) {
-        memset(new_entry->wrapped, 0, wrapped_len);
+        stm_ct_memzero(new_entry->wrapped, wrapped_len);
         free(new_entry->wrapped);
         free(new_entry);
         return STM_ECORRUPT;

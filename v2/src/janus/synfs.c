@@ -423,11 +423,14 @@ static int str_eq(const char *s, size_t slen, const char *lit)
 
 /* Parse `name[0..name_len)` as an unsigned decimal up to 2^28-1 (the
  * dataset-id width in qid_path). Returns 0 on success, -1 on any
- * non-digit, empty input, overflow, or over-ceiling value. */
+ * non-digit, empty input, overflow, or over-ceiling value.
+ * R12 P3-4: cap name_len at 9 digits — the max value 268435455 fits
+ * in 9 characters and longer inputs waste parse cycles on request-
+ * rate attacks before the numeric overflow check rejects them. */
 static int parse_dataset_id(const char *name, size_t name_len,
                              uint64_t *out_id)
 {
-    if (name_len == 0 || name_len > 12) return -1;      /* 2^28 < 10^9 */
+    if (name_len == 0 || name_len > 9) return -1;
     /* Reject leading zero on multi-char names (strict canonical form). */
     if (name_len > 1 && name[0] == '0') return -1;
     uint64_t v = 0;
@@ -876,6 +879,16 @@ uint64_t janus_synfs_root(const janus_synfs *s)
 const stm_p9_vops *janus_synfs_vops(void)
 {
     return &g_vops;
+}
+
+void janus_synfs_drop_all_sessions(janus_synfs *s)
+{
+    if (!s) return;
+    pthread_mutex_lock(&s->mu);
+    for (uint32_t i = 0; i < JANUS_MAX_SESSIONS; i++) {
+        if (s->sessions[i].active) session_free(&s->sessions[i]);
+    }
+    pthread_mutex_unlock(&s->mu);
 }
 
 void janus_synfs_destroy(janus_synfs *s)

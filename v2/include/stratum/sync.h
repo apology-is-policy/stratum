@@ -175,6 +175,14 @@ stm_status stm_sync_info_get(const stm_sync *s, stm_sync_info *out);
 /* ========================================================================= */
 
 /*
+ * Maximum valid `dataset_id` for every sync-layer key API. Mirrors
+ * the janus qid-path dataset field's 28-bit range so a pool created
+ * via keyfile-only mode stays mountable via janus on a different
+ * host. Values above this are refused STM_ERANGE at the FS boundary.
+ */
+#define STM_SYNC_DATASET_ID_MAX   UINT64_C(0x0FFFFFFF)
+
+/*
  * Add a new dataset with a freshly-generated DEK. Inserts
  * (dataset_id, key_id=0, CURRENT) into the key-schema sub-tree and
  * stashes the plaintext DEK in the in-RAM map.

@@ -214,6 +214,12 @@ stm_status janus_serve_client(int client_fd, janus_synfs *synfs)
     free(req_buf);
     free(rsp_buf);
     stm_p9_server_destroy(srv);
+    /* R12 P3-5: drop any rotate / unwrap sessions the client opened
+     * but didn't `Tclunk` before disconnect. Plaintext DEK bytes
+     * materialised into resp_bufs would otherwise linger in daemon
+     * RAM until the session slot was re-used or the daemon exited,
+     * widening the cold-boot / ptrace / core-dump attack surface. */
+    janus_synfs_drop_all_sessions(synfs);
     close(client_fd);
     return rc;
 }

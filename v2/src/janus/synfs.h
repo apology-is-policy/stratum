@@ -58,6 +58,19 @@ uint64_t janus_synfs_root(const janus_synfs *s);
 
 void janus_synfs_destroy(janus_synfs *s);
 
+/*
+ * Wipe + free every active per-fid session. The accept loop is
+ * single-client-at-a-time (R11 P2-4), so at the end of each served
+ * connection the daemon calls this to release any rotate / unwrap
+ * sessions that the client opened but forgot to `Tclunk`. Without
+ * this, plaintext DEK bytes stashed in session resp_bufs would
+ * persist in daemon RAM until the next collision on JANUS_MAX_
+ * SESSIONS or until daemon shutdown.
+ *
+ * Safe to call when there are no active sessions (no-op).
+ */
+void janus_synfs_drop_all_sessions(janus_synfs *s);
+
 /* Append a line to the audit log (snprintf-style). Timestamps are
  * added automatically. Thread-safe. */
 void janus_synfs_auditf(janus_synfs *s, const char *fmt, ...)

@@ -180,11 +180,22 @@ static stm_status sync_dek_grow(stm_sync *s, size_t need)
         if (grown < new_cap) return STM_ENOMEM;
         new_cap = grown;
     }
-    sync_dek_slot *grown = realloc(s->deks, new_cap * sizeof *grown);
+    /* R12 P1-1: do NOT realloc. realloc that relocates leaves the old
+     * allocation (which holds plaintext DEK bytes) on the heap with
+     * no hygiene pass — a subsequent allocation of the same size
+     * can land on top of it and observe key material. Hand-roll a
+     * malloc → memcpy → ct_memzero(old) → free(old) sequence so the
+     * DEK bytes are scrubbed the moment they leave our ownership. */
+    sync_dek_slot *grown = malloc(new_cap * sizeof *grown);
     if (!grown) return STM_ENOMEM;
-    /* Zero the newly-allocated tail. */
-    memset(grown + s->dek_cap, 0,
-             (new_cap - s->dek_cap) * sizeof *grown);
+    if (s->deks && s->dek_count > 0)
+        memcpy(grown, s->deks, s->dek_count * sizeof *grown);
+    memset(grown + s->dek_count, 0,
+             (new_cap - s->dek_count) * sizeof *grown);
+    if (s->deks) {
+        stm_ct_memzero(s->deks, s->dek_cap * sizeof *s->deks);
+        free(s->deks);
+    }
     s->deks = grown;
     s->dek_cap = new_cap;
     return STM_OK;
@@ -295,11 +306,32 @@ static int sync_unwrap_cb(uint64_t dataset_id, uint64_t key_id,
 
     if (rc != STM_OK) {
         stm_ct_memzero(dek, sizeof dek);
-        return (int)rc;
+        /* R12 P1-3: a tampered RETIRED entry — or any unwrap failure
+         * at a non-pool dataset — would historically abort mount with
+         * the callback's error code. That made a one-shot attacker
+         * with raw-device access + Merkle-recompute able to deny
+         * every future mount by flipping a byte in any retired
+         * wrapped blob (and recomputing the schema node's bp_csum +
+         * ub_merkle_root). The pool metadata key — (0, 0) CURRENT —
+         * is the only key required for mount to proceed; retired
+         * per-dataset keys are only needed for reads of OLD data
+         * encrypted under them, and those failures should surface at
+         * read time (Phase 6 extent layer), not at mount time. */
+        if (dataset_id == STM_SYNC_POOL_DATASET_ID &&
+             key_id     == STM_SYNC_POOL_KEY_ID    &&
+             state      == STM_KS_STATE_CURRENT) {
+            return (int)rc;
+        }
+        return 0;    /* soft-skip */
     }
     if (dek_len != 32) {
         stm_ct_memzero(dek, sizeof dek);
-        return (int)STM_EBACKEND;
+        if (dataset_id == STM_SYNC_POOL_DATASET_ID &&
+             key_id     == STM_SYNC_POOL_KEY_ID    &&
+             state      == STM_KS_STATE_CURRENT) {
+            return (int)STM_EBACKEND;
+        }
+        return 0;
     }
 
     rc = sync_dek_insert(u->s, dataset_id, key_id, dek);
@@ -1087,6 +1119,11 @@ stm_status stm_sync_add_dataset_key(stm_sync *s,
     /* ds=0 is reserved for the pool metadata key; installed by
      * stm_sync_create, not here. */
     if (dataset_id == STM_SYNC_POOL_DATASET_ID) return STM_EINVAL;
+    /* R12 P2-3: cap dataset_id at janus's qid-path dataset field
+     * (28 bits). Keyfile-only adds above this range would be
+     * invisible to any later janus-mounted session, so refuse
+     * bidirectionally at the FS boundary. */
+    if (dataset_id > STM_SYNC_DATASET_ID_MAX) return STM_ERANGE;
 
     pthread_mutex_lock(&s->lock);
 
@@ -1099,6 +1136,16 @@ stm_status stm_sync_add_dataset_key(stm_sync *s,
         pthread_mutex_unlock(&s->lock);
         return STM_EEXIST;
     }
+
+    /* R12 P1-2: pre-reserve the DEK map slot BEFORE any schema
+     * mutation. The prior code mutated the schema, then tried to
+     * grow the DEK map, and on ENOMEM "rolled back" by calling
+     * mark_pruning(CURRENT) — which always fails STM_EINVAL, leaving
+     * an orphan CURRENT in the schema that no caller could remove.
+     * By growing first we turn the subsequent sync_dek_insert into
+     * an infallible in-place write. */
+    rc = sync_dek_grow(s, s->dek_count + 1);
+    if (rc != STM_OK) { pthread_mutex_unlock(&s->lock); return rc; }
 
     uint8_t dek[32];
     uint8_t wrapped[STM_SYNC_WRAPPED_KEY_LEN];
@@ -1117,19 +1164,15 @@ stm_status stm_sync_add_dataset_key(stm_sync *s,
         return rc;
     }
 
+    /* Post-grow invariant: sync_dek_insert cannot fail from OOM now. */
     rc = sync_dek_insert(s, dataset_id, /*key_id=*/0, dek);
     stm_ct_memzero(dek, sizeof dek);
     if (rc != STM_OK) {
-        /* Roll back the schema insert so a retry doesn't hit EEXIST.
-         * Use the "replace with PRUNING then prune" approach — we can't
-         * cleanly un-insert a CURRENT, but we can delete it atomically
-         * since no one has committed yet. Instead: overwrite the entry
-         * with a PRUNING-state same-id so a caller sees structural
-         * consistency and can attempt `sweep`. This is a narrow OOM
-         * path; most callers will just abort the mount. */
-        (void)stm_keyschema_mark_pruning(s->keyschema, dataset_id, 0);
+        /* Only path left is STM_EEXIST, which means we raced with
+         * ourselves under the same lock — indicates a logic bug.
+         * Surface as STM_ECORRUPT. */
         pthread_mutex_unlock(&s->lock);
-        return rc;
+        return STM_ECORRUPT;
     }
 
     *out_new_key_id = 0;
@@ -1150,6 +1193,9 @@ stm_status stm_sync_rotate_dataset_key(stm_sync *s,
      * re-encrypting every metadata node. Block this until the
      * re-encrypt sweep lands (future chunk). */
     if (dataset_id == STM_SYNC_POOL_DATASET_ID) return STM_EBUSY;
+    /* R12 P2-3: same ceiling as add — a pool rotated past the janus
+     * qid cap would be janus-unmountable. */
+    if (dataset_id > STM_SYNC_DATASET_ID_MAX) return STM_ERANGE;
 
     pthread_mutex_lock(&s->lock);
 
@@ -1161,6 +1207,15 @@ stm_status stm_sync_rotate_dataset_key(stm_sync *s,
         pthread_mutex_unlock(&s->lock);
         return STM_ENOENT;
     }
+
+    /* R12 P2-1: pre-reserve the DEK map slot before any schema
+     * mutation. Prior code mutated the schema then tried to grow the
+     * map, and on ENOMEM left the schema rotated but the in-RAM
+     * mirror missing — future DEK lookups would spuriously ENOENT
+     * until the next full sync_open rebuilt the map. Grow first so
+     * the post-rotate sync_dek_insert is infallible. */
+    rc = sync_dek_grow(s, s->dek_count + 1);
+    if (rc != STM_OK) { pthread_mutex_unlock(&s->lock); return rc; }
 
     uint8_t dek[32];
     uint8_t wrapped[STM_SYNC_WRAPPED_KEY_LEN];
@@ -1179,14 +1234,12 @@ stm_status stm_sync_rotate_dataset_key(stm_sync *s,
         return rc;
     }
 
+    /* Post-grow invariant: cannot fail from OOM. */
     rc = sync_dek_insert(s, dataset_id, next_id, dek);
     stm_ct_memzero(dek, sizeof dek);
     if (rc != STM_OK) {
-        /* Keyschema is mutated but DEK map isn't. Best-effort: leave
-         * the schema alone (the new CURRENT is valid; only the in-RAM
-         * mirror is missing). Next sync_open will rebuild the map. */
         pthread_mutex_unlock(&s->lock);
-        return rc;
+        return STM_ECORRUPT;
     }
 
     *out_new_key_id = next_id;
@@ -1238,10 +1291,17 @@ stm_status stm_sync_keyschema_sweep(stm_sync *s,
 
     sweep_collect col = { .dataset_id_filter = dataset_id };
     stm_status rc = stm_keyschema_iter(s->keyschema, sweep_collect_cb, &col);
+    /* R12 P2-5: prefer the collector's own error. The callback's
+     * return funnels through stm_keyschema_iter as an opaque cast;
+     * `col.err` is the authoritative cause. Falling back to `rc`
+     * only when the collector didn't set one keeps the error
+     * surface faithful even if future iter internals start
+     * returning their own error codes. */
+    if (col.err != STM_OK) rc = col.err;
     if (rc != STM_OK) {
         free(col.keys);
         pthread_mutex_unlock(&s->lock);
-        return col.err != STM_OK ? col.err : rc;
+        return rc;
     }
 
     size_t pruned = 0;

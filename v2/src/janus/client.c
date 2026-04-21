@@ -458,8 +458,9 @@ stm_status stm_janus_client_rotate(stm_janus_client *c,
     if (written != sizeof hdr) { rc = STM_EIO; goto done; }
 
     /* Read back dek(32) || wrapped(dek_len + OVERHEAD) in chunks. The
-     * daemon lays them out contiguously in resp_buf. */
-    uint8_t   *cursor       = NULL;
+     * daemon lays them out contiguously in resp_buf. R12 P3-3:
+     * hoist allocation + cleanup so every exit path (including the
+     * early gotos above) runs through a single free+wipe. */
     size_t     want_total   = dek_len + wrapped_len;
     uint8_t   *composite    = calloc(1, want_total);
     if (!composite) { rc = STM_ENOMEM; goto done; }
@@ -471,32 +472,25 @@ stm_status stm_janus_client_rotate(stm_janus_client *c,
                           ? avail_max : (uint32_t)(want_total - read_off);
         uint32_t got = 0;
         rc = do_read(c, fid, read_off, want, composite + read_off, &got);
-        if (rc != STM_OK) {
-            stm_ct_memzero(composite, want_total);
-            free(composite);
-            goto done;
-        }
+        if (rc != STM_OK) goto read_done;
         if (got == 0) {
             /* Short response — daemon produced fewer bytes than
-             * expected; tag the result as truncated to make this
-             * observable at the call site. R11 P2-1 guards against
-             * malformed frames; this guards against a well-framed
-             * but under-sized response. */
-            stm_ct_memzero(composite, want_total);
-            free(composite);
+             * expected; tag as truncated so callers can distinguish
+             * from framing errors caught by R11 P2-1. */
             rc = STM_EBADTAG;
-            goto done;
+            goto read_done;
         }
         read_off += got;
     }
-    cursor = composite;
-    memcpy(out_dek,     cursor,           dek_len);
-    memcpy(out_wrapped, cursor + dek_len, wrapped_len);
+    memcpy(out_dek,     composite,           dek_len);
+    memcpy(out_wrapped, composite + dek_len, wrapped_len);
     *inout_dek_len     = dek_len;
     *inout_wrapped_len = wrapped_len;
+    rc = STM_OK;
+
+read_done:
     stm_ct_memzero(composite, want_total);
     free(composite);
-    rc = STM_OK;
 
 done: {
     stm_status rc2 = do_clunk(c, fid);
