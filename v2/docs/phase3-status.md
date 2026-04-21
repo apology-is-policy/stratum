@@ -1,14 +1,14 @@
 # Phase 3 — status and next-session guide
 
 Authoritative pickup guide for Phase 3 (persistence + allocator). Last
-update 2026-04-21 (after chunk 6 / four-phase commit protocol
-landed). Companion to `phase2-status.md`, which remains the reference
-for the Bw-tree layer Phase 3 builds on.
+update 2026-04-21 (after R7e audit on chunk 7 closed).
+Companion to `phase2-status.md`, which remains the reference for the
+Bw-tree layer Phase 3 builds on.
 
 ## TL;DR
 
-Phase 3 is in progress. Twelve chunks landed. R7e audit on chunk 7
-is the next round.
+Phase 3 is in progress. Thirteen commits landed. Chunks 4c / 4d / 4e /
+8 remain before Phase 3 exit.
 
 | Commit | What | Tests |
 |---|---|---|
@@ -23,7 +23,7 @@ is the next round.
 | `0d99eb5` | **Chunk 5c**: `stm_btree_store` serialize/deserialize + free_tree via an I/O vtable. Two-level depth cap; snapshot-style rewrite-on-commit. | 5 btree_store tests |
 | `033bb3f` → `17e08be` | **Chunk 5d + R7c**: `stm_alloc` integration — tree now persists across mount. R7c closed (0 P0 / 2 P1 / 6 P2; btnode common-helper consolidation). | +3 alloc persistence tests |
 | `00d796e` → `b70537d` | **Chunk 6 + R7d**: `stm_sync` — four-phase commit protocol (sync.tla-aligned). R7d closed (2 P0 / 1 P1 / 3 P2 — ub_alloc_root now sole authoritative source; user_data tree-root dead-coded out). | 8 sync tests |
-| `e45818b` | **Chunk 7**: `stm_fs` — top-level mount/unmount lifecycle. Format → mount → reserve → commit → unmount → remount. Runtime guards (wedged / read_only) wired but live end-to-end tests for RO + wedged paths deferred to chunk 8 (POSIX-bdev close-without-commit hang). | 6 fs tests |
+| `e45818b` → `dfe04b7` | **Chunk 7 + R7e**: `stm_fs` — top-level mount/unmount lifecycle. Format → mount → reserve → commit → unmount → remount. R7e closed (1 P0 / 1 P1 / 3 P2 / 6 P3). P0-1 was the "POSIX-bdev close-without-commit hang" — actually a `FS_GUARD_WRITE` unlock-on-refusal bug, not a bdev issue. P1-1 wiped stale uberblock ring on reformat. RO + wedged end-to-end tests restored. | 9 fs tests |
 
 Phase 2 is complete (SPLIT + MERGE + per-node consolidator + SCAN + R0-R6
 audits). Phase 3 chunks remaining:
@@ -125,33 +125,16 @@ Expected TLC results:
 - `merge.tla` — empty-leaf reabsorb. 65536 states, depth 18.
 - `allocator.tla` — refcount + deferred-free. 3729 states, depth 16.
 
-## Next chunk — R7e audit on chunk 7, then 4c/4d/4e and chunk 8
+## Next chunk — 4c / 4d / 4e / 8
 
-Chunk 7 landed at `e45818b` with the stm_fs lifecycle. Six-test
-coverage of the round-trip path (format → mount → reserve → commit
-→ unmount → remount). The user-facing guard flags (read_only /
-wedged) are wired at the API level and verified-by-inspection, but
-two end-to-end tests hang in POSIX-bdev cleanup when unmount skips
-the final commit — flagged as chunk-7 known issues for R7e and
-chunk 8 to tackle.
+Chunk 7 (`e45818b`) landed the stm_fs lifecycle; R7e audit closed at
+`dfe04b7` with the P0 deadlock fixed (guard-macro unlock-on-refusal
+bug — correctly diagnosed as fs.c, not POSIX-bdev), the P1 stale-UB
+reformat fix, and two cheap P2s. The two RO + wedged end-to-end tests
+that were previously deferred are restored and green on default /
+ASan / TSan. Chunk 7 is now fully audited and closed.
 
-### R7e (next): audit chunk 7.
-
-Focused soundness audit on src/fs/fs.c + include/stratum/fs.h +
-tests/test_fs.c. Expected surfaces:
-
-- Guard-macro coverage across every public entry.
-- stm_fs_format idempotency vs partial-failure.
-- Unmount's final-commit error propagation.
-- Bootstrap POSIX-bdev thread-pool hang on close-without-commit
-  (the deferred tests above). Root-cause this; the fix probably
-  belongs in src/block/posix.c, not fs.c.
-- Concurrency: the stm_fs mutex vs the nested stm_alloc + stm_sync
-  mutexes (lock-order invariants).
-
-Preamble: include R0-R7d closed list as do-not-report.
-
-### Then: chunks 4c, 4d, 4e, 8.
+### Remaining Phase 3 work, in order:
 
 - **4c** SDArray in-RAM bitmap for O(1) allocation queries.
 - **4d** xor filter for negative lookups.
