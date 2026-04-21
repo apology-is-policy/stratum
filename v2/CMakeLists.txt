@@ -189,6 +189,7 @@ target_link_libraries(stratum INTERFACE
     stm_btnode
     stm_btree_store
     stm_alloc
+    stm_sdarray
     stm_sync
     stm_fs)
 target_include_directories(stratum INTERFACE
