@@ -127,6 +127,14 @@ stm_status stm_pool_roster_decode(const uint8_t in[STM_POOL_ROSTER_BYTES],
         out_devs[i].class_     = (stm_device_class) slot[OFF_CLASS];
         out_devs[i].state      = (stm_device_state) slot[OFF_STATE];
         out_devs[i].bdev       = NULL;
+        /* R13 P2-3: reserved bytes [27..31] of a populated slot must
+         * be zero. The encoder zeros them (via the outer memset);
+         * non-zero bytes here indicate either a buggy writer or a
+         * tamper attempt. Symmetric with the unused-slots-must-be-zero
+         * check below. */
+        for (size_t b = 27; b < STM_POOL_ROSTER_SLOT_SIZE; b++) {
+            if (slot[b] != 0) return STM_ECORRUPT;
+        }
     }
     /* Unused slots must be zero. A leftover non-zero slot would mean
      * either a prior device was never cleanly zeroed on remove (buggy

@@ -321,9 +321,14 @@ stm_status stm_ub_encode(const stm_uberblock *ub, void *buf, size_t buf_len);
  *   - ub_version is supported (== STM_UB_VERSION; future: feature-flag check).
  *   - ub_csum matches BLAKE3-256 over bytes [0, STM_UB_SIZE - 32).
  *
- * On csum mismatch returns STM_ECORRUPT. On magic or version mismatch
- * returns STM_EBADVERSION. Feature-flag checks are a Phase-3-later
- * addition (need the pool-config context to decide).
+ * R13 P2-1: status taxonomy for failures:
+ *   - STM_ENOENT:      magic mismatch (slot is empty / uninitialized).
+ *   - STM_EBADVERSION: version mismatch (slot holds a pool at an
+ *                     incompatible format version).
+ *   - STM_ECORRUPT:    csum mismatch (tampering or bit-rot).
+ *   - STM_ERANGE:      buf_len != STM_UB_SIZE.
+ * Feature-flag checks are a Phase-3-later addition (need the pool-
+ * config context to decide).
  */
 STM_MUST_USE
 stm_status stm_ub_decode(const void *buf, size_t buf_len, stm_uberblock *out_ub);

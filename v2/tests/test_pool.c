@@ -108,6 +108,78 @@ STM_TEST(pool_open_zero_device_count_rejected) {
     STM_ASSERT(p == NULL);
 }
 
+/* R13 P3-5 #9: guard the earliest parameter checks — both NULL opts
+ * and NULL out_pool must be refused cleanly. */
+STM_TEST(pool_open_rejects_null_params) {
+    stm_pool *p = NULL;
+    STM_ASSERT_ERR(stm_pool_open(NULL, &p), STM_EINVAL);
+    STM_ASSERT(p == NULL);
+
+    stm_pool_open_opts opts;
+    memset(&opts, 0, sizeof opts);
+    opts.pool_uuid[0] = POOL_UUID[0];
+    opts.pool_uuid[1] = POOL_UUID[1];
+    opts.device_count = 1;
+    STM_ASSERT_ERR(stm_pool_open(&opts, NULL), STM_EINVAL);
+}
+
+/* R13 P3-5 #1: device_count above the hard cap is refused. */
+STM_TEST(pool_open_over_device_cap_rejected) {
+    stm_pool_open_opts opts;
+    memset(&opts, 0, sizeof opts);
+    opts.pool_uuid[0] = POOL_UUID[0];
+    opts.pool_uuid[1] = POOL_UUID[1];
+    opts.device_count = (size_t)STM_POOL_DEVICES_MAX + 1;
+    stm_pool *p = NULL;
+    STM_ASSERT_ERR(stm_pool_open(&opts, &p), STM_EINVAL);
+    STM_ASSERT(p == NULL);
+}
+
+/* R13 P3-5 #8: out-of-range role / class / state bytes are refused.
+ * Uses a single test with three sub-phases so the helper boilerplate
+ * stays concentrated. */
+STM_TEST(pool_open_out_of_range_enum_bytes_rejected) {
+    make_tmp("oor_enums");
+    stm_bdev *d = open_fresh_device();
+
+    const stm_bdev_caps *caps = stm_bdev_caps_of(d);
+    STM_ASSERT(caps != NULL);
+
+    stm_pool_open_opts opts;
+    memset(&opts, 0, sizeof opts);
+    opts.pool_uuid[0] = POOL_UUID[0];
+    opts.pool_uuid[1] = POOL_UUID[1];
+    opts.device_count = 1;
+    opts.devices[0].uuid[0]    = DEVICE_UUID[0];
+    opts.devices[0].uuid[1]    = DEVICE_UUID[1];
+    opts.devices[0].size_bytes = caps->size_bytes;
+    opts.devices[0].role       = STM_DEV_ROLE_DATA;
+    opts.devices[0].class_     = STM_DEV_CLASS_SSD;
+    opts.devices[0].state      = STM_DEV_STATE_ONLINE;
+    opts.devices[0].bdev       = d;
+
+    /* role out of range */
+    opts.devices[0].role = (stm_device_role)99;
+    stm_pool *p = NULL;
+    STM_ASSERT_ERR(stm_pool_open(&opts, &p), STM_EINVAL);
+    STM_ASSERT(p == NULL);
+    opts.devices[0].role = STM_DEV_ROLE_DATA;
+
+    /* class out of range */
+    opts.devices[0].class_ = (stm_device_class)99;
+    STM_ASSERT_ERR(stm_pool_open(&opts, &p), STM_EINVAL);
+    STM_ASSERT(p == NULL);
+    opts.devices[0].class_ = STM_DEV_CLASS_SSD;
+
+    /* state out of range */
+    opts.devices[0].state = (stm_device_state)99;
+    STM_ASSERT_ERR(stm_pool_open(&opts, &p), STM_EINVAL);
+    STM_ASSERT(p == NULL);
+
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
 STM_TEST(pool_open_duplicate_uuid_rejected) {
     /* Two devices with the same UUID in the roster — structurally
      * invalid; stm_paddr_t's device_id must be a 1:1 mapping. */
@@ -302,6 +374,50 @@ STM_TEST(pool_roster_decode_rejects_zero_uuid_in_populated_slot) {
     STM_ASSERT_ERR(stm_pool_roster_decode(buf, 1, out), STM_ECORRUPT);
 }
 
+/* R13 P3-5 #7: expected_count outside [1, STM_POOL_DEVICES_MAX] is
+ * refused. */
+STM_TEST(pool_roster_decode_rejects_invalid_expected_count) {
+    uint8_t buf[STM_POOL_ROSTER_BYTES] = {0};
+    stm_pool_device out[STM_POOL_DEVICES_MAX];
+    STM_ASSERT_ERR(stm_pool_roster_decode(buf, 0, out), STM_EINVAL);
+    STM_ASSERT_ERR(stm_pool_roster_decode(buf,
+                                            (uint16_t)(STM_POOL_DEVICES_MAX + 1u),
+                                            out),
+                     STM_EINVAL);
+}
+
+/* R13 P2-3 regression: reserved bytes [27..31] of a populated slot
+ * must be zero. A tamper that flips any of them is rejected even
+ * though all semantic fields are well-formed. */
+STM_TEST(pool_roster_decode_rejects_reserved_byte_tamper) {
+    uint8_t buf[STM_POOL_ROSTER_BYTES];
+    memset(buf, 0, sizeof buf);
+    /* Slot 0: valid semantic fields. */
+    buf[0]  = 0x11;                    /* uuid low */
+    buf[8]  = 0x22;
+    buf[16] = 0x00;                    /* size = 0 allowed here */
+    buf[24] = STM_DEV_ROLE_DATA;
+    buf[25] = STM_DEV_CLASS_SSD;
+    buf[26] = STM_DEV_STATE_ONLINE;
+
+    stm_pool_device out[STM_POOL_DEVICES_MAX];
+    /* Baseline: well-formed. */
+    STM_ASSERT_OK(stm_pool_roster_decode(buf, 1, out));
+
+    /* Flip byte 27. Semantically untouched; reserved-byte check must
+     * still reject. */
+    buf[27] = 0xff;
+    STM_ASSERT_ERR(stm_pool_roster_decode(buf, 1, out), STM_ECORRUPT);
+    buf[27] = 0;
+
+    /* Likewise for bytes 28, 29, 30, 31. */
+    for (size_t b = 28; b < STM_POOL_ROSTER_SLOT_SIZE; b++) {
+        buf[b] = 0x01;
+        STM_ASSERT_ERR(stm_pool_roster_decode(buf, 1, out), STM_ECORRUPT);
+        buf[b] = 0;
+    }
+}
+
 /* ========================================================================= */
 /* End-to-end through stm_fs (roster makes it into the UB).                   */
 /* ========================================================================= */
@@ -435,6 +551,151 @@ STM_TEST(pool_sync_open_refuses_wrong_pool_uuid) {
     stm_alloc_close(a);
     stm_bdev_close(d);
     stm_hybrid_keys_wipe(&wk);
+    unlink(g_tmp_path);
+    unlink(kf);
+}
+
+/* ========================================================================= */
+/* On-disk UB tamper tests (R13 P3-5 items 2, 3, 4, 5 + P2-1 proof).          */
+/* ========================================================================= */
+
+typedef void (*ub_mutate_fn)(stm_uberblock *ub);
+
+/* Format a fresh pool at `g_tmp_path`, then read the live UB, apply
+ * `mutate` to it, and re-write it to the same (label, slot) with a
+ * fresh csum. A fresh format has exactly ONE populated ring slot
+ * (gen=1 → label=1, slot=1); every other slot is zeroed via
+ * format_wipe_labels. Tampering the single live slot is therefore
+ * sufficient to cover every slot that matters for mount-scan. */
+static void format_and_tamper_live_ub(const char *keyfile, ub_mutate_fn mutate)
+{
+    stm_fs_format_opts fopts;
+    memset(&fopts, 0, sizeof fopts);
+    fopts.device_size_bytes = TEST_DEVICE_BYTES;
+    fopts.bootstrap_size_bytes = TEST_BOOTSTRAP_BYTES;
+    fopts.pool_uuid[0]   = POOL_UUID[0];
+    fopts.pool_uuid[1]   = POOL_UUID[1];
+    fopts.device_uuid[0] = DEVICE_UUID[0];
+    fopts.device_uuid[1] = DEVICE_UUID[1];
+    fopts.keyfile_path   = keyfile;
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    stm_bdev_open_opts bopts = stm_bdev_open_opts_default();
+    stm_bdev *d = NULL;
+    STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &bopts, &d));
+
+    stm_uberblock ub;
+    uint32_t lbl = 0, slot = 0;
+    STM_ASSERT_OK(stm_sb_mount_scan(d, &ub, &lbl, &slot));
+
+    mutate(&ub);
+
+    /* stm_sb_label_write re-encodes (which recomputes ub_csum) and
+     * fsyncs. The tampered UB is bit-perfect and csum-valid. */
+    STM_ASSERT_OK(stm_sb_label_write(d, lbl, slot, &ub));
+    stm_bdev_close(d);
+}
+
+static void mutate_version_to_4(stm_uberblock *ub) {
+    ub->ub_version = stm_store_le32(4u);
+}
+
+static void mutate_device_count_to_0(stm_uberblock *ub) {
+    ub->ub_device_count = stm_store_le16(0);
+}
+
+static void mutate_device_count_to_over_cap(stm_uberblock *ub) {
+    ub->ub_device_count = stm_store_le16((uint16_t)(STM_POOL_DEVICES_MAX + 1u));
+}
+
+static void mutate_device_id_out_of_range(stm_uberblock *ub) {
+    /* count stays 1 (set at format); bump id to 5 — out of range. */
+    ub->ub_device_id = stm_store_le16(5);
+}
+
+/* R13 P2-1 / P3-5 #2: every ring slot at an incompatible version
+ * (e.g., v4 under v5 code) must surface as STM_EBADVERSION, NOT the
+ * misleading STM_ENOENT that would imply a reformat. */
+STM_TEST(pool_mount_refuses_v4_ub_with_bad_version) {
+    make_tmp("v4_ub");
+    char kf[256];
+    snprintf(kf, sizeof kf, "/tmp/stm_v2_pool_v4_kf_%d.bin", (int)getpid());
+    unlink(kf);
+    make_keyfile(kf);
+
+    format_and_tamper_live_ub(kf, mutate_version_to_4);
+
+    stm_fs_mount_opts mopts;
+    memset(&mopts, 0, sizeof mopts);
+    mopts.keyfile_path = kf;
+    stm_fs *fs = NULL;
+    /* mount_scan's EBADVERSION propagates through fs.c's peek call. */
+    STM_ASSERT_ERR(stm_fs_mount(g_tmp_path, &mopts, &fs), STM_EBADVERSION);
+    STM_ASSERT(fs == NULL);
+
+    unlink(g_tmp_path);
+    unlink(kf);
+}
+
+/* R13 P3-5 #3: ub_device_count=0 on disk is refused at fs.c's peek. */
+STM_TEST(pool_mount_refuses_zero_device_count_on_disk) {
+    make_tmp("dc_zero");
+    char kf[256];
+    snprintf(kf, sizeof kf, "/tmp/stm_v2_pool_dc0_kf_%d.bin", (int)getpid());
+    unlink(kf);
+    make_keyfile(kf);
+
+    format_and_tamper_live_ub(kf, mutate_device_count_to_0);
+
+    stm_fs_mount_opts mopts;
+    memset(&mopts, 0, sizeof mopts);
+    mopts.keyfile_path = kf;
+    stm_fs *fs = NULL;
+    STM_ASSERT_ERR(stm_fs_mount(g_tmp_path, &mopts, &fs), STM_ECORRUPT);
+    STM_ASSERT(fs == NULL);
+
+    unlink(g_tmp_path);
+    unlink(kf);
+}
+
+/* R13 P3-5 #4: ub_device_count > STM_POOL_DEVICES_MAX is refused. */
+STM_TEST(pool_mount_refuses_device_count_over_cap_on_disk) {
+    make_tmp("dc_over");
+    char kf[256];
+    snprintf(kf, sizeof kf, "/tmp/stm_v2_pool_dcX_kf_%d.bin", (int)getpid());
+    unlink(kf);
+    make_keyfile(kf);
+
+    format_and_tamper_live_ub(kf, mutate_device_count_to_over_cap);
+
+    stm_fs_mount_opts mopts;
+    memset(&mopts, 0, sizeof mopts);
+    mopts.keyfile_path = kf;
+    stm_fs *fs = NULL;
+    STM_ASSERT_ERR(stm_fs_mount(g_tmp_path, &mopts, &fs), STM_ECORRUPT);
+    STM_ASSERT(fs == NULL);
+
+    unlink(g_tmp_path);
+    unlink(kf);
+}
+
+/* R13 P3-5 #5: ub_device_id >= ub_device_count is refused. */
+STM_TEST(pool_mount_refuses_device_id_out_of_range_on_disk) {
+    make_tmp("did_oor");
+    char kf[256];
+    snprintf(kf, sizeof kf, "/tmp/stm_v2_pool_did_kf_%d.bin", (int)getpid());
+    unlink(kf);
+    make_keyfile(kf);
+
+    format_and_tamper_live_ub(kf, mutate_device_id_out_of_range);
+
+    stm_fs_mount_opts mopts;
+    memset(&mopts, 0, sizeof mopts);
+    mopts.keyfile_path = kf;
+    stm_fs *fs = NULL;
+    STM_ASSERT_ERR(stm_fs_mount(g_tmp_path, &mopts, &fs), STM_ECORRUPT);
+    STM_ASSERT(fs == NULL);
+
     unlink(g_tmp_path);
     unlink(kf);
 }

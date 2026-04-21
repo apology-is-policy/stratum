@@ -163,6 +163,12 @@ stm_status stm_sync_commit(stm_sync *s);
  * Callers must ensure no other thread is using `s` at close time.
  * close does not self-quiesce and destroys the internal mutex
  * (destroying a locked mutex is undefined behavior per POSIX).
+ *
+ * Lifetime contract (R13 P2-1): the stm_pool * passed to
+ * stm_sync_create / stm_sync_open is borrowed and dereferenced on
+ * every commit. It MUST remain valid until stm_sync_close returns;
+ * do not call stm_pool_close on the pool until the sync handle has
+ * been closed.
  */
 void stm_sync_close(stm_sync *s);
 

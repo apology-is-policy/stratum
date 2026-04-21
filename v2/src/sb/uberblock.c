@@ -55,9 +55,14 @@ stm_status stm_ub_decode(const void *buf, size_t buf_len, stm_uberblock *out_ub)
     const stm_uberblock *on_disk = (const stm_uberblock *)buf;
 
     /* Magic + version checks first — they fail fast on obviously
-     * wrong buffers (uninitialized disk, wrong offset, etc.). */
+     * wrong buffers (uninitialized disk, wrong offset, etc.).
+     *
+     * R13 P2-1: magic mismatch and version mismatch return DIFFERENT
+     * status codes so mount_scan can tell "blank slot" from "slot
+     * holds a pool at an incompatible version". STM_ENOENT = "nothing
+     * here"; STM_EBADVERSION = "something here, wrong version". */
     uint64_t magic = stm_load_le64(on_disk->ub_magic);
-    if (magic != STM_UB_MAGIC) return STM_EBADVERSION;
+    if (magic != STM_UB_MAGIC) return STM_ENOENT;
     uint32_t version = stm_load_le32(on_disk->ub_version);
     if (version != STM_UB_VERSION) return STM_EBADVERSION;
 

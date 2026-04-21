@@ -91,6 +91,9 @@ STM_TEST(sb_decode_rejects_bad_csum) {
     STM_ASSERT_ERR(stm_ub_decode(buf, sizeof buf, &dst), STM_ECORRUPT);
 }
 
+/* R13 P2-1: magic mismatch is now STM_ENOENT — "slot is empty /
+ * uninitialized", distinct from STM_EBADVERSION ("slot holds a pool
+ * at an incompatible format version"). */
 STM_TEST(sb_decode_rejects_bad_magic) {
     stm_uberblock src;
     fill_example(&src);
@@ -100,7 +103,7 @@ STM_TEST(sb_decode_rejects_bad_magic) {
 
     buf[0] ^= 0xFF;                      /* trash the magic */
     stm_uberblock dst;
-    STM_ASSERT_ERR(stm_ub_decode(buf, sizeof buf, &dst), STM_EBADVERSION);
+    STM_ASSERT_ERR(stm_ub_decode(buf, sizeof buf, &dst), STM_ENOENT);
 }
 
 STM_TEST(sb_decode_rejects_bad_version) {
@@ -142,7 +145,9 @@ STM_TEST(sb_csum_tamper_detection) {
         buf[positions[i]] ^= 0x40;
         stm_uberblock dst;
         stm_status s = stm_ub_decode(buf, sizeof buf, &dst);
-        if (s == STM_ECORRUPT || s == STM_EBADVERSION) caught++;
+        /* R13 P2-1: magic perturbation now returns STM_ENOENT. Any
+         * structural rejection counts as "caught". */
+        if (s == STM_ECORRUPT || s == STM_EBADVERSION || s == STM_ENOENT) caught++;
         memcpy(buf, backup, sizeof buf);   /* restore */
     }
     /* Every perturbation in the covered region should be caught. */

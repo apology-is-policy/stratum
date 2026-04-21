@@ -84,6 +84,9 @@ stm_status stm_sb_mount_scan(stm_bdev *d, stm_uberblock *out_ub,
     if (!d || !out_ub) return STM_EINVAL;
 
     bool    have_any       = false;
+    bool    saw_bad_version = false;   /* R13 P2-1: distinguishes a
+                                         * pre-bump-version pool from
+                                         * an empty device. */
     uint64_t best_gen      = 0;
     uint32_t best_label    = 0;
     uint32_t best_slot     = 0;
@@ -98,7 +101,10 @@ stm_status stm_sb_mount_scan(stm_bdev *d, stm_uberblock *out_ub,
             stm_uberblock candidate;
             stm_status s = stm_sb_label_read(d, li, si, &candidate);
             if (s != STM_OK) {
-                /* Expected: unused slots, corrupted slots. Skip. */
+                /* Expected: unused slots, corrupted slots. Skip —
+                 * but remember a version mismatch so we can surface
+                 * it as a distinct error if no slot decoded OK. */
+                if (s == STM_EBADVERSION) saw_bad_version = true;
                 continue;
             }
             uint64_t gen = stm_load_le64(candidate.ub_gen);
@@ -112,7 +118,14 @@ stm_status stm_sb_mount_scan(stm_bdev *d, stm_uberblock *out_ub,
         }
     }
 
-    if (!have_any) return STM_ENOENT;
+    /* R13 P2-1: if we found NO valid UB but at least one slot was a
+     * well-formed pool at an incompatible version, report that rather
+     * than STM_ENOENT. STM_ENOENT is the "nothing here; reformat
+     * freshly" path — misleading an admin into reformatting a pool
+     * that just needs an upgrade would be destructive. */
+    if (!have_any) {
+        return saw_bad_version ? STM_EBADVERSION : STM_ENOENT;
+    }
 
     *out_ub = best_ub;
     if (out_label_idx) *out_label_idx = best_label;

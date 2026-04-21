@@ -113,6 +113,18 @@ typedef struct {
 STM_MUST_USE
 stm_status stm_pool_open(const stm_pool_open_opts *opts, stm_pool **out);
 
+/*
+ * Release the pool handle. Does NOT close the underlying stm_bdevs —
+ * they are borrowed, caller owns their lifecycle.
+ *
+ * Lifetime contract (R13 P2-1): every stm_sync / stm_alloc handle
+ * that borrowed this pool (via stm_sync_create / stm_sync_open)
+ * MUST be closed BEFORE stm_pool_close. Those handles cache a
+ * borrowed stm_pool * and dereference it on every commit; closing
+ * the pool first produces a use-after-free on the next commit.
+ * stm_fs_unmount respects this order (sync → alloc → pool → bdev);
+ * direct callers should mirror it.
+ */
 void stm_pool_close(stm_pool *p);
 
 /* ========================================================================= */
