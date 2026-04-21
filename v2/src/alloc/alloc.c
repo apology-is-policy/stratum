@@ -173,9 +173,12 @@ static inline void decode_val(const uint8_t in[8],
 /* Chunk 4e: in-RAM acceleration over the tree.                               */
 /* ========================================================================= */
 
-/* Release accel structures. Callers MUST hold a->lock. Safe to call
- * when accel_* are already NULL (e.g. before the first rebuild). */
-static void accel_free_locked(stm_alloc *a)
+/* Release accel structures. Safe to call when accel_* are already
+ * NULL (e.g. before the first rebuild). Caller discipline: either
+ * holds a->lock, or is the close path (which holds the
+ * single-threaded-close contract from R7b-P3-6). No _locked suffix
+ * since both call sites are legitimate. */
+static void accel_free(stm_alloc *a)
 {
     stm_sdarray_free(a->accel_sda);
     stm_xor_filter_free(a->accel_xor);
@@ -301,7 +304,13 @@ static stm_status accel_ensure_fresh_locked(stm_alloc *a)
     stm_xor_filter *new_xor = NULL;
     uint32_t       *new_len = NULL;
 
-    uint64_t universe = a->data_last_block + 1u;
+    /* R7-P3-2: guard the +1 on data_last_block (unreachable in
+     * practice since data_last <= device_size / block_size, but
+     * defense-in-depth). If adding 1 would wrap to 0, clamp to
+     * UINT64_MAX — the allocator-tree universe is bounded above
+     * by this anyway. */
+    uint64_t universe = a->data_last_block;
+    if (universe < UINT64_MAX) universe += 1u;
     if (universe < a->data_first_block) universe = a->data_first_block + 1u;
 
     s = stm_sdarray_build(starts, ctx.count, universe, &new_sda);
@@ -327,7 +336,7 @@ static stm_status accel_ensure_fresh_locked(stm_alloc *a)
     }
 
     /* Commit: swap in new structures, free old. */
-    accel_free_locked(a);
+    accel_free(a);
     a->accel_sda     = new_sda;
     a->accel_xor     = new_xor;
     a->accel_lengths = new_len;
@@ -592,7 +601,7 @@ void stm_alloc_close(stm_alloc *a)
         free(e);
         e = next;
     }
-    accel_free_locked(a);
+    accel_free(a);
     if (a->tree) stm_btree_mt_free(a->tree);
     if (a->boot) stm_bootstrap_close(a->boot);
     pthread_mutex_destroy(&a->lock);
@@ -909,7 +918,19 @@ stm_status stm_alloc_commit(stm_alloc *a, uint64_t committed_gen)
             if (ds != STM_OK && ds != STM_ENOENT) {
                 /* Catastrophic: can't delete from an in-RAM tree.
                  * Stop sweep so caller can observe the error; PENDING
-                 * list still references the entry. */
+                 * list still references the entry.
+                 *
+                 * R7-P1-1: if earlier iterations of the sweep did
+                 * modify the tree, the accel must be invalidated
+                 * before returning — otherwise it's stale-but-
+                 * "fresh" (accel_dirty=false, accel_count stale),
+                 * and subsequent is_allocated / lookup queries
+                 * disagree with the tree. Mark invalid so the next
+                 * query rebuilds. */
+                if (swept_anything) {
+                    a->tree_dirty = true;
+                    accel_invalidate_locked(a);
+                }
                 pthread_mutex_unlock(&a->lock);
                 return ds;
             }
@@ -1075,24 +1096,31 @@ stm_status stm_alloc_lookup(const stm_alloc *a, uint64_t paddr,
      * filter says NO, we skip the tree lookup and return STM_ENOENT
      * directly — the common case for a random paddr that happens to
      * not be any entry's start. Filter may false-positive (~0.4%);
-     * the tree lookup below handles those correctly.               */
+     * the tree lookup below handles those correctly.
+     *
+     * R7-P0-1: trust accel short-circuits ONLY when the rebuild just
+     * succeeded. On rebuild failure, accel may be stale OR never-
+     * built (count still 0 from calloc with dirty=true). In that
+     * case, fall through to the authoritative tree walk
+     * unconditionally. DO NOT clear accel_dirty on failure — the
+     * next query should retry the rebuild, not inherit a stale
+     * accel_count=0 as "empty tree" and silently return ENOENT.    */
     stm_status rs = accel_ensure_fresh_locked(ma);
-    if (rs != STM_OK) {
-        /* Rebuild failed — fall through to the authoritative tree
-         * lookup. Stale accel is acceptable as long as we don't
-         * TRUST it on a miss. Clear dirty so we don't churn rebuild
-         * attempts on every lookup; tree path will still succeed. */
-        ma->accel_dirty = false;
+    if (rs == STM_OK) {
+        if (ma->accel_count == 0u) {
+            pthread_mutex_unlock(&ma->lock);
+            return STM_ENOENT;   /* empty tree: no entry can exist */
+        }
+        if (ma->accel_xor &&
+            !stm_xor_filter_contains(ma->accel_xor, start_block)) {
+            pthread_mutex_unlock(&ma->lock);
+            return STM_ENOENT;
+        }
     }
-    if (ma->accel_count == 0u) {
-        pthread_mutex_unlock(&ma->lock);
-        return STM_ENOENT;   /* empty tree: no entry exists anywhere */
-    }
-    if (rs == STM_OK && ma->accel_xor &&
-        !stm_xor_filter_contains(ma->accel_xor, start_block)) {
-        pthread_mutex_unlock(&ma->lock);
-        return STM_ENOENT;
-    }
+    /* If rs != STM_OK, fall through — the tree lookup below is
+     * authoritative and will return the correct answer (slower, but
+     * always right). accel_dirty remains true so a later query
+     * retries the rebuild. */
 
     uint8_t key_buf[8];
     uint8_t val_buf[8] = { 0 };
