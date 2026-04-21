@@ -549,4 +549,67 @@ STM_TEST(sync_tamper_tree_node_surfaces_on_mount) {
     unlink(g_tmp_path);
 }
 
+/* ========================================================================= */
+/* P4-3a: metadata-encryption key lifecycle.                                  */
+/* ========================================================================= */
+
+STM_TEST(sync_metadata_key_round_trips) {
+    /* Generate a key at format, commit, unmount, remount, read the
+     * live uberblock, and verify ub_key_schema[0..32] survives as a
+     * stable 32-byte value. Bytes beyond offset 32 should remain zero
+     * in the MVP (reserved for P4-4's key hierarchy). */
+    make_tmp("mkey");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL;
+    make_fresh_pool(d, &a, &s);
+
+    /* One commit to land the key in the uberblock. */
+    STM_ASSERT_OK(stm_sync_commit(s));
+    teardown(a, s);
+    stm_bdev_close(d);
+
+    stm_uberblock ub1;
+    uint64_t ub1_off = 0;
+    read_live_ub(g_tmp_path, &ub1, &ub1_off);
+
+    /* Key must be random — not all-zero. (The libsodium CSPRNG would
+     * have to return 32 zero bytes for this to fail; vanishingly
+     * unlikely.) */
+    uint8_t zeros32[32] = { 0 };
+    STM_ASSERT(memcmp(ub1.ub_key_schema, zeros32, 32) != 0);
+
+    /* Reserved tail of ub_key_schema [32..512) must stay zero so
+     * P4-4 can land its wrapped-key layout without colliding. */
+    STM_ASSERT_EQ(memcmp(&ub1.ub_key_schema[32], zeros32, 32), 0);
+    for (size_t off = 32; off < sizeof ub1.ub_key_schema; off += 32) {
+        size_t chunk = sizeof ub1.ub_key_schema - off;
+        if (chunk > 32) chunk = 32;
+        STM_ASSERT_EQ(memcmp(&ub1.ub_key_schema[off], zeros32, chunk), 0);
+    }
+
+    /* Remount, commit again, re-read: key byte-for-byte stable. */
+    stm_bdev_open_opts opts = stm_bdev_open_opts_default();
+    stm_bdev *d2 = NULL;
+    STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &opts, &d2));
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d2, &a2));
+    stm_sync *s2 = NULL;
+    STM_ASSERT_OK(stm_sync_open(d2, a2, &s2));
+
+    STM_ASSERT_OK(stm_sync_commit(s2));
+    teardown(a2, s2);
+    stm_bdev_close(d2);
+
+    stm_uberblock ub2;
+    uint64_t ub2_off = 0;
+    read_live_ub(g_tmp_path, &ub2, &ub2_off);
+
+    /* The second commit MUST carry the same key — not a freshly-
+     * re-rolled one. If this failed, every commit would invalidate
+     * every prior metadata block's encryption. */
+    STM_ASSERT_EQ(memcmp(ub2.ub_key_schema, ub1.ub_key_schema, 32), 0);
+
+    unlink(g_tmp_path);
+}
+
 STM_TEST_MAIN("sync")

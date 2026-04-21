@@ -16,7 +16,8 @@ integrity), then encryption (AEAD data extents + AEAD metadata nodes
 | Commit | What | Tests |
 |---|---|---|
 | `54b3c8b` → `ee3600c` | **P4-1 + R8: Merkle integrity scaffold**. Wires existing per-node BLAKE3 self-csums into a chain: internal-node bp_csum fields carry child csums; allocator-tree root csum propagates into `ub_alloc_root.bp_csum`; `ub_merkle_root = BLAKE3(main_csum(0) ‖ alloc_csum ‖ snap_csum(0) ‖ cas_csum(0) ‖ salt)` per ARCH §7.11.3. Per-pool salt from libsodium CSPRNG at format, stored in new `ub_merkle_root_salt[32]` (STM_UB_VERSION 1→2). Mount verifies recomputed Merkle root against stored value AND tree-root node self-csum against `bp_csum`. R8 audit closed: 1 P0 (free_tree segfault on multi-leaf) + 2 P1 (BLAKE3 OOM bypass; NULL-csum trap) + 3 P2 (substitution test, libsodium switch, rename). | 4 new sync tests; 20 suites green |
-| `<next>` | **P4-6: `merkle.tla` formal spec**. Models the Merkle chain under COW: honest WriteLeaf / WriteInternal / Commit actions plus adversarial Tamper. Proves `CommittedTreeWellFormed` (stored csums = recomputed at commit time) and `TamperDetectableAtCommittedRoot` (any byte edit reachable from root makes recompute ≠ stored merkle_root). TLC clean: 83169 distinct states, depth 10. | Spec-only |
+| `65c4c76` | **P4-6: `merkle.tla` formal spec**. Models the Merkle chain under COW: honest WriteLeaf / WriteInternal / Commit actions plus adversarial Tamper. Proves `CommittedTreeWellFormed` (stored csums = recomputed at commit time) and `TamperDetectableAtCommittedRoot` (any byte edit reachable from root makes recompute ≠ stored merkle_root). TLC clean: 83169 distinct states, depth 10. | Spec-only |
+| `<next>` | **P4-3a: metadata-key lifecycle**. Per-pool 32-byte metadata-encryption key. Generated at sync_create from libsodium CSPRNG, persisted at `ub_key_schema[0..32]` on every commit, recovered at sync_open. Key is unused by the write path — infrastructure for P4-3b's AEAD wrapper. Reserved tail `ub_key_schema[32..512]` stays zero for P4-4's key-hierarchy layout. | 1 new sync test |
 
 ## Remaining Phase 4 work
 
@@ -33,15 +34,73 @@ low. Revisit after crypto lands.
 
 ### P4-3: AEAD on metadata nodes (stm_btnode)
 
-Node encode flow becomes: serialize → AEAD-encrypt → write. Decode:
-read → AEAD-decrypt (tag = BLAKE3 of pre-encrypt bytes) → validate.
+Split into two landings:
 
-Blocker: key hierarchy is not yet in place. Either:
-- Land a placeholder per-pool metadata key first (all metadata
-  encrypted under one key), then refine in P4-4 with per-dataset keys;
-  or
-- Land key hierarchy (P4-4) first and then add encryption at the
-  write path once keys exist.
+**P4-3a (LANDED)** — per-pool metadata key lifecycle. Generates a
+32-byte key at sync_create from libsodium CSPRNG, persists in
+`ub_key_schema[0..32]` at every commit, recovers at sync_open. Key
+is unused by the write path so far; infrastructure only. Reserved
+tail `ub_key_schema[32..512]` stays zero for P4-4's wrapped-key
+hierarchy.
+
+**P4-3b (next)** — AEAD wrapper at the btree_store serialize /
+deserialize boundary. Design decisions:
+
+- **Wrapper location**: btree_store, NOT btnode. Keeps btnode
+  plaintext-only; encryption is a transport concern.
+- **On-disk layout for encrypted metadata node**:
+  ```
+  [0 .. STM_BTNODE_SIZE - STM_BTNODE_CSUM_SIZE)   = ciphertext
+  [STM_BTNODE_SIZE - STM_BTNODE_CSUM_SIZE .. END) = AEAD tag (32 B)
+  ```
+  Trailing 32 bytes repurpose the P4-1 "self-csum" slot to store
+  the AEAD tag. `btnode_verify_csum` is bypassed for encrypted
+  nodes — the AEAD tag verification replaces it.
+- **bp_csum semantics (unchanged from P4-1)**:
+  `BLAKE3(on-disk-bytes[0..STM_BTNODE_SIZE-STM_BTNODE_CSUM_SIZE))`
+  — covers the ciphertext. The AEAD tag is NOT part of bp_csum;
+  tag tamper is caught by AEAD decrypt, byte tamper in the
+  ciphertext is caught by Merkle chain.
+- **AEAD choice**: AEGIS-256. 32-byte tag (fits the repurposed
+  slot exactly), high-throughput, nonce-misuse-resistant enough
+  for our unique-per-write-paddr-gen nonce.
+- **Nonce (32 bytes)**: `paddr (8) || gen (8) || pool_uuid (16)`.
+  Guarantees uniqueness under the gen-monotonicity invariant
+  (sync.tla's MountGenBump: gen strictly increases on every
+  commit AND bumps past durable-max on mount). Two writes at the
+  same paddr under the same gen are impossible — stm_bootstrap's
+  deferred-free prevents paddr reuse within a commit.
+- **AD (32 bytes)**: `pool_uuid (16) || device_uuid (16)`. Paddr
+  and gen go in nonce (not AD) because AEGIS binds all of them
+  to the tag equivalently. Including device_uuid in AD ensures a
+  node written to device X cannot be replayed at device Y
+  (relevant for multi-device Phase 5).
+- **Feature flag vs. mandatory**: mandatory for v2.0 — every
+  metadata node is encrypted. No unencrypted-pool path in code
+  means no branching on read/write. Saves complexity and matches
+  the ARCH §7 mission commitment to PQ-default.
+- **Migration**: v1→v2 uberblock version bump (already done in
+  P4-1) rejects v1 pools, so there's no backward-compat concern.
+
+Integration surfaces:
+- `src/btree_store/serialize.c`:
+  - `emit_leaf` / `emit_internal`: after `stm_btnode_*_encode`,
+    AEAD-encrypt bytes [0..131040) in place, write AEAD tag into
+    [131040..131072). THEN compute bp_csum over [0..131040) (the
+    ciphertext) and populate out_csum.
+  - `stm_btree_store_deserialize`: after `vt->read`, verify bp_csum
+    match, AEAD-decrypt bytes [0..131040) using tag at [131040..)
+    and the nonce/AD derived from paddr+gen+pool_uuid. Skip
+    `btnode_verify_csum`.
+- `src/alloc/alloc.c`: `stm_alloc_commit` already has
+  `committed_gen`; pass through. `stm_alloc_load_tree_at` needs a
+  gen arg (currently absent) so the reader can reconstruct the
+  nonce. **This is the wrinkle**: the gen is in the UB
+  (`ub_gen`), not the bptr. `stm_sync_open` can pass it through.
+- No changes to btnode.c or btnode_common.c — the plaintext btnode
+  layout is preserved.
+
+R9 audit triggers after P4-3b lands.
 
 ### P4-4: Per-dataset key hierarchy + PQ-hybrid wrap
 

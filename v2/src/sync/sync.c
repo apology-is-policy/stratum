@@ -79,6 +79,24 @@ struct stm_sync {
     uint8_t    merkle_salt[32];
     uint8_t    alloc_root_csum[32];
     uint8_t    merkle_root[32];
+
+    /* P4-3a: per-pool metadata-encryption key.
+     *
+     * Generated at sync_create from the OS CSPRNG (libsodium). Stored
+     * raw in ub_key_schema[0..32] for the MVP — no PQ-hybrid wrap
+     * yet; that's P4-4's job. When P4-3b lands, this key encrypts
+     * every metadata node (btnode) at write time and decrypts them
+     * at read time via an AEAD wrapper around the btree_store
+     * serialize / deserialize path.
+     *
+     * Format note (to revisit in P4-4): the first 32 bytes of
+     * ub_key_schema currently hold a plaintext raw key. ub_key_schema
+     * is 512 bytes total, so there is room for a proper header
+     * (magic + version + wrap metadata + wrapped payload) once the
+     * key hierarchy + key agent land. The P4-3a layout is
+     * "raw[0..32]" with the rest zero-filled; future readers detecting
+     * all-zero after offset 32 can infer raw-MVP format. */
+    uint8_t    metadata_key[32];
 };
 
 /* ========================================================================= */
@@ -138,7 +156,8 @@ static inline uint32_t ring_slot_for_gen(uint64_t gen)
 /* Build an uberblock in `out` from sync state + caller's inputs.
  * Fills pool_uuid / device_uuid / gen / txg / ub_alloc_root
  * (paddr + kind + bp_csum) + ub_merkle_root + ub_merkle_root_salt
- * for P4-1. Allocator stats populate total_blocks / free_blocks. */
+ * for P4-1, and ub_key_schema[0..32] with the raw metadata key
+ * for P4-3a. Allocator stats populate total_blocks / free_blocks. */
 static void build_uberblock(stm_uberblock *out,
                               const stm_sync *s,
                               uint64_t new_gen,
@@ -175,6 +194,11 @@ static void build_uberblock(stm_uberblock *out,
      * stored salt, and fails STM_ECORRUPT on mismatch. */
     memcpy(out->ub_merkle_root,        merkle_root,     32);
     memcpy(out->ub_merkle_root_salt,   s->merkle_salt,  32);
+
+    /* P4-3a: metadata-encryption key at ub_key_schema[0..32].
+     * Remaining 480 bytes of ub_key_schema are reserved for the
+     * P4-4 PQ-hybrid wrapped key hierarchy. Stays zero in the MVP. */
+    memcpy(out->ub_key_schema,         s->metadata_key, 32);
 
     /* Data-area totals (in blocks). */
     out->ub_total_blocks = stm_store_le64(astats->data_total_blocks);
@@ -233,6 +257,11 @@ stm_status stm_sync_create(stm_bdev *d, stm_alloc *a,
      * consistent cross-platform behavior. */
     stm_random_bytes(s->merkle_salt, 32);
 
+    /* P4-3a: generate the pool's metadata-encryption key. Like the
+     * merkle salt, this is stable across the pool's lifetime for MVP.
+     * Key rotation is P4-4's job. */
+    stm_random_bytes(s->metadata_key, 32);
+
     *out_sync = s;
     return STM_OK;
 }
@@ -278,6 +307,11 @@ stm_status stm_sync_open(stm_bdev *d, stm_alloc *a, stm_sync **out_sync)
     memcpy(s2->merkle_salt,      ub.ub_merkle_root_salt, 32);
     memcpy(s2->alloc_root_csum,  ub.ub_alloc_root.bp_csum, 32);
     memcpy(s2->merkle_root,      ub.ub_merkle_root,      32);
+
+    /* P4-3a: recover the metadata key from ub_key_schema[0..32]. The
+     * key is plaintext in the MVP — P4-4's key hierarchy will wrap
+     * it (ML-KEM-768 + X25519 hybrid) and the unwrap path moves here. */
+    memcpy(s2->metadata_key,     ub.ub_key_schema,       32);
 
     /* P4-1: verify the on-disk ub_merkle_root is self-consistent
      * with the per-tree-root csums + salt recorded in the SAME
