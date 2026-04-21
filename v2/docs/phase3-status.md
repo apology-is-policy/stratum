@@ -26,6 +26,7 @@ Phase 3 is in progress. Thirteen commits landed. Chunks 4c / 4d / 4e /
 | `e45818b` → `dfe04b7` | **Chunk 7 + R7e**: `stm_fs` — top-level mount/unmount lifecycle. Format → mount → reserve → commit → unmount → remount. R7e closed (1 P0 / 1 P1 / 3 P2 / 6 P3). P0-1 was the "POSIX-bdev close-without-commit hang" — actually a `FS_GUARD_WRITE` unlock-on-refusal bug, not a bdev issue. P1-1 wiped stale uberblock ring on reformat. RO + wedged end-to-end tests restored. | 9 fs tests |
 | `deec70d` | **Chunk 4c**: `stm_sdarray` — Elias-Fano succinct encoding of a sorted 64-bit set. High bits as unary bitmap, low bits packed, exact-bit-position select samples every 64 ones → O(1) select, O(log m) rank/contains. Standalone module; integration into allocator query path deferred to chunk 4e. | 14 sdarray tests |
 | `1cd9f3f` | **Chunk 4d**: `stm_xor_filter` — xor8 approximate-membership filter (Graf & Lemire 2020). ~9.84 bits/item, <0.4% FPR, O(1) query. Peeling builder with splitmix64 hashing + up-to-64 seed retries. Standalone module; integration with chunk 4e. | 10 xor_filter tests |
+| `a809db1` → `04a3c52` | **Chunk 4e + R7 full-stack**: wire stm_sdarray + stm_xor_filter into stm_alloc. Lazy rebuild on mutation; stm_alloc_lookup gets xor-filter fast-path on negative; new stm_alloc_is_allocated for range-containment. R7 full-stack audit closed allocator subsystem: 1 P0 (sticky accel_dirty after rebuild failure poisoned lookup + is_allocated) + 1 P1 (commit sweep early-return skipped accel invalidation) + 2 P3s addressed. | 6 new alloc tests (25 total) |
 
 Phase 2 is complete (SPLIT + MERGE + per-node consolidator + SCAN + R0-R6
 audits). Phase 3 chunks remaining:
@@ -127,13 +128,23 @@ Expected TLC results:
 - `merge.tla` — empty-leaf reabsorb. 65536 states, depth 18.
 - `allocator.tla` — refcount + deferred-free. 3729 states, depth 16.
 
-## Next chunk — 4e / 8
+## Next chunk — 8 (crash-injection fuzzer)
 
-Chunks 4c and 4d landed as standalone data-structure modules
-(`stm_sdarray` at `deec70d`, `stm_xor_filter` at `1cd9f3f`). Chunk
-4e wires them into stm_alloc's lookup / contains path — the
-audit-triggering surface — and kicks off the R7 full-stack audit
-closing the allocator subsystem.
+Chunk 4e integrated stm_sdarray + stm_xor_filter into stm_alloc
+(`a809db1`) and R7 full-stack audit closed at `04a3c52`. The
+allocator subsystem (chunks 4a through 4e) is now feature-complete
+and audited.
+
+Chunk 8 (the Phase 3 exit criterion) is a crash-injection fuzzer
+that partially-writes at every commit phase and verifies mount
+recovers to a consistent state. Expected to force:
+
+- **R7d-P0-2**: two-phase bootstrap commit fix (crash-mid-first-
+  commit leak).
+- **R7e-P2-2**: format idempotency / partial-failure self-describing
+  recovery.
+- **R7-P2-1**: fault-injection seam for accel rebuild failures (and
+  related sdarray / xor_filter build-time failures).
 
 ### Remaining Phase 3 work, in order:
 
@@ -157,6 +168,14 @@ Merkle integrity populating ub_merkle_root + bp_csum).
 - LANDED at `1cd9f3f`. `src/alloc/xor_filter.c` + public header.
   xor8 construction: ~9.84 bits/item, <0.4% FPR, O(1) query.
   Peeling builder, splitmix64 hashing, seed-retry loop.
+
+### Chunk 4e: allocator integration + R7 full-stack audit.
+- LANDED at `a809db1` (integration) + `04a3c52` (R7 fixes).
+  stm_alloc gains in-RAM SDArray + xor filter with lazy rebuild on
+  mutation. Fast-path stm_alloc_lookup; new stm_alloc_is_allocated
+  for range-containment. R7 full-stack audit closed allocator
+  subsystem with 1 P0 + 1 P1 + 2 P3s fixed; P2 regression test
+  (fault-injection seam) deferred to chunk 8's fuzzer.
 
 ### Chunk 4e: R7 full-stack audit.
 - Closes the allocator subsystem's audit rounds after the in-RAM
