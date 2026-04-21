@@ -20,7 +20,8 @@ integrity), then encryption (AEAD data extents + AEAD metadata nodes
 | `cb9671f` | **P4-3a: metadata-key lifecycle**. Per-pool 32-byte metadata-encryption key. Generated at sync_create from libsodium CSPRNG, persisted at `ub_key_schema[0..32]` on every commit, recovered at sync_open. Reserved tail `ub_key_schema[32..512]` stays zero for P4-4's key-hierarchy layout. | 1 new sync test |
 | `fc52dbe` | **P4-3b: AEAD on metadata nodes**. AEGIS-256 wraps every emitted btnode image at the `btree_store` boundary. On-disk layout: ciphertext occupies `[0..STM_BTNODE_SIZE - 32)`, AEAD tag fills the trailing 32 bytes (repurposes the slot the P4-1 plaintext self-csum used to live in; `STM_AEAD_TAG_LEN_AEGIS256 == STM_BTNODE_CSUM_SIZE` ensures exact fit). `bp_csum` semantics unchanged: `BLAKE3(on-disk[0..STM_BTNODE_SIZE - 32))` — now covers ciphertext. Nonce = paddr(8 LE) ‖ gen(8 LE) ‖ pool_uuid(16 LE). AD = pool_uuid(16 LE) ‖ device_uuid(16 LE). Mandatory for v2 pools — no unencrypted path. `stm_alloc` gains a crypt-ctx setter; `stm_sync_{create,open}` installs it from the pool key before the first commit / tree load. Old-tree free path threads the prior tree's gen so AEAD decrypt can enumerate internal-node children. | 7 new btree_store tests (encrypted round-trip, tag tamper, wrong key / gen / pool_uuid / device_uuid, NULL cx); 20 suites green |
 | `ca8d47b` | **R9 audit fixes**. P0-1: mount-claim UB closes the nonce-reuse-across-crash-recovery hazard. New `ub_alloc_root_gen` field preserves the AEAD nonce on the tree when a mount advances ub_gen without rewriting the tree. Format bump STM_UB_VERSION 2→3. P1-1: `stm_crypto_init` at top of sync_create/open. P1-2: `stm_btree_store_free_tree` now takes `expected_root_csum` and Merkle-verifies before AEAD decrypt. P2-1: `stm_btree_store_serialize` rolls back reserved paddrs on emit failure. P2-2: dangling key-pointer nulled after OOM. | 2 new sync tests (mount-claim advance, load_tree_at-without-cx); 20 suites green on default/ASan/TSan; 7 TLA+ specs clean |
-| `<next>` | **P4-2: scrubber**. New `stm_btree_store_verify` + `stm_alloc_verify` + `stm_fs_verify`: walks the on-disk allocator tree, re-reads every node, checks Merkle chain + AEAD tags without mutating state. Safe to call on live pools (including RO / wedged). Intended for admin-invoked scrubs and as a separate detection surface from mount-time Merkle (in-flight bit rot or external tamper surfaces on next scrub without waiting for unmount). | 3 new sync tests (clean, empty pool, post-commit tamper detection); 20 suites green |
+| `dc357ad` | **P4-2: scrubber**. New `stm_btree_store_verify` + `stm_alloc_verify` + `stm_fs_verify`: walks the on-disk allocator tree, re-reads every node, checks Merkle chain + AEAD tags without mutating state. Safe to call on live pools (including RO / wedged). Intended for admin-invoked scrubs and as a separate detection surface from mount-time Merkle (in-flight bit rot or external tamper surfaces on next scrub without waiting for unmount). | 3 new sync tests (clean, empty pool, post-commit tamper detection); 20 suites green |
+| `<next>` | **P4-5 stub: data-extent AEAD round-trip**. New `src/extent/` module exposing `stm_ad_extent` (ARCH §7.6.1 — 56-byte AD: magic ‖ version ‖ pool_uuid ‖ dataset_id ‖ ino ‖ offset ‖ content_kind) + `stm_extent_encrypt` / `stm_extent_decrypt`. Nonce construction matches P4-3b's metadata wrapper (paddr ‖ gen ‖ pool_uuid) — see phase4-status.md "Known deltas from ARCH" for the nonce-layout subset rationale. No extent manager, no on-disk index — the caller owns paddrs. Scope is the crypto surface alone; full extent layer is Phase 6 (dataset model + tree + content-defined chunking). Satisfies ROADMAP §7.2's "encrypted writes round-trip correctly with AEGIS-256 and XChaCha20-SIV" exit bullet. | 11 new tests: round-trip per mode; AD field-by-field tamper rejects (pool_uuid / dataset_id / ino / offset / content_kind); nonce tamper (paddr / gen); tag tamper; AD packed-size pinned to 56. 21 suites green |
 
 ## Remaining Phase 4 work
 
@@ -152,15 +153,31 @@ X25519 hybrid (stm_hybrid from Phase 1). Requires:
 - Key agent process (stratum-keyagent) for wrap/unwrap.
 - 9P protocol between daemon and agent (ARCH §7.9).
 
-### P4-5: AEAD on data extents
+### P4-5: AEAD on data extents (STUB LANDED; full impl deferred)
 
-Write path: compress → BLAKE3(plaintext) → AEAD-encrypt with
-(paddr, write_gen) as nonce + pool/dataset/ino/offset as AD.
-Read path: reverse. Tag binding ensures cross-context confusion
-fails.
+Phase 4 stub landed as `src/extent/` + `tests/test_extent.c`. Covers
+the exit-criterion "encrypted writes round-trip correctly with
+AEGIS-256 and XChaCha20-SIV" at the crypto-surface level:
 
-Requires extent manager (doesn't exist yet — Phase 6?). May slip to
-a later phase if extent layer depends on Phase 6 dataset model.
+- `stm_ad_extent` struct + packing matches ARCH §7.6.1 exactly.
+- `stm_extent_encrypt` / `_decrypt` with nonce = (paddr, gen,
+  pool_uuid) and AD = packed stm_ad_extent.
+- Both AEGIS-256 and XChaCha20-SIV round-trip.
+- Five AD fields + two nonce fields + the tag are each independently
+  proven to bind via tamper tests.
+
+What the stub DOESN'T do — deferred to Phase 6 extent manager:
+
+- Extent index (tree mapping (dataset, ino, offset) → paddr).
+- Variable-sized extents / content-defined chunking.
+- Compression (§11) preceding encryption.
+- Integration with stm_fs's reserve/free path.
+- Cross-device extent placement.
+
+When the extent manager lands (Phase 6), callers switch from using
+the crypto surface directly to a higher-level write/read API;
+these primitives stay exactly as they are — they're the crypto
+layer, not the storage layer.
 
 ### P4-6: merkle.tla
 
@@ -219,6 +236,26 @@ for s in sync concurrency structural balanced merge allocator merkle; do
         -config $s.cfg $s.tla 2>&1 | tail -3
 done
 ```
+
+## Known deltas from ARCH §7 (owed follow-ups)
+
+- **AD layout narrower than ARCH §7.6.2** (flagged R9 P3). P4-3b
+  shipped with `AD = pool_uuid || device_uuid`. ARCH specifies
+  `magic || version || pool_uuid || tree_id || node_level ||
+  dataset_id || reserved`. Safe today (single tree, single dataset,
+  single device) but MUST widen before (a) multiple trees land
+  (snap / CAS / main), (b) datasets become selectable, or (c)
+  multi-device commits (Phase 5). Widening is additive: the new
+  fields bind the AD more narrowly, rejecting cross-context reads
+  that today's AD would incorrectly accept.
+- **Nonce layout narrower than ARCH §7.4.1**. ARCH:
+  `paddr(8) || txg(8) || seq_in_txg(4) || reserved(4) ||
+  pool_uuid-high(8)`. P4-3b: `paddr(8) || gen(8) || pool_uuid(16)`.
+  The missing `seq_in_txg` field is harmless today because
+  `stm_bootstrap`'s deferred-free prevents paddr reuse within a
+  gen. Would need adding only if a future path writes multiple
+  distinct blocks to the same paddr within one gen (no such path
+  exists).
 
 ## Trip hazards carrying into Phase 4
 
