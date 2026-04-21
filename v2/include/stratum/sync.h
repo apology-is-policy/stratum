@@ -170,6 +170,100 @@ void stm_sync_close(stm_sync *s);
 STM_MUST_USE
 stm_status stm_sync_info_get(const stm_sync *s, stm_sync_info *out);
 
+/* ========================================================================= */
+/* Per-dataset key management (P4-4c).                                        */
+/* ========================================================================= */
+
+/*
+ * Add a new dataset with a freshly-generated DEK. Inserts
+ * (dataset_id, key_id=0, CURRENT) into the key-schema sub-tree and
+ * stashes the plaintext DEK in the in-RAM map.
+ *
+ * Exactly one of {wk, janus} must be non-NULL (mirrors stm_sync_open).
+ * For the keyfile path, `stm_sync` uses libsodium CSPRNG to generate
+ * the DEK and `stm_hybrid_wrap` to produce the wrapped blob. For the
+ * janus path, the daemon's CSPRNG is the DEK source and the backend's
+ * wrap fn produces the wrapped blob; see `stm_janus_client_rotate`.
+ *
+ * `dataset_id == 0` is reserved for the pool's metadata key and is
+ * refused here (STM_EINVAL). The metadata key is installed by
+ * `stm_sync_create` during formatting.
+ *
+ * Returns STM_EEXIST if a CURRENT entry already exists for
+ * `dataset_id` (use `stm_sync_rotate_dataset_key` to advance key_id).
+ */
+STM_MUST_USE
+stm_status stm_sync_add_dataset_key(stm_sync *s,
+                                      uint64_t dataset_id,
+                                      const stm_hybrid_keys *wk,
+                                      struct stm_janus_client *janus,
+                                      uint64_t *out_new_key_id);
+
+/*
+ * Rotate a dataset's key (ARCH §7.7.2). Generates a new DEK, wraps
+ * it, and atomically inserts (dataset_id, new_key_id, CURRENT) +
+ * retires the existing CURRENT entry in one schema mutation. The
+ * change becomes durable on the next `stm_sync_commit`.
+ *
+ * Exactly one of {wk, janus} must be non-NULL.
+ *
+ * `dataset_id == 0` (pool metadata key) is refused — rotating it
+ * would leave existing metadata nodes un-decryptable. Metadata-key
+ * rotation (with an accompanying re-encrypt sweep) is future work.
+ *
+ * The old DEK stays resident in the sync handle's RAM so readers of
+ * data encrypted under it can still decrypt. It is removed only by
+ * `stm_sync_keyschema_sweep` (RETIRED → PRUNING → deleted).
+ *
+ * On success, `*out_new_key_id` and `*out_old_key_id` are populated.
+ */
+STM_MUST_USE
+stm_status stm_sync_rotate_dataset_key(stm_sync *s,
+                                         uint64_t dataset_id,
+                                         const stm_hybrid_keys *wk,
+                                         struct stm_janus_client *janus,
+                                         uint64_t *out_new_key_id,
+                                         uint64_t *out_old_key_id);
+
+/*
+ * Sweep every RETIRED key for `dataset_id`, transitioning each
+ * through PRUNING and deleting it. In-RAM DEKs for the pruned entries
+ * are wiped. Phase 4 has no extent layer referencing these keys, so
+ * the sweep is always safe; Phase 6's extent manager will own the
+ * refcount check before calling this API.
+ *
+ * On success, `*out_pruned_count` is set to the number of retired
+ * keys pruned. STM_OK on empty sweeps (no retired entries — result
+ * is idempotent).
+ *
+ * Like rotate/add, the on-disk change lands on the next commit.
+ */
+STM_MUST_USE
+stm_status stm_sync_keyschema_sweep(stm_sync *s,
+                                      uint64_t dataset_id,
+                                      size_t *out_pruned_count);
+
+/*
+ * Look up a DEK by (dataset_id, key_id). Copies 32 bytes into
+ * `out_dek`. Returns STM_ENOENT if the key is not present in the
+ * in-RAM map (never generated, never unwrapped, or swept away).
+ *
+ * Primarily used by tests and by the extent layer (Phase 6) to pick
+ * the right DEK for reads of extents that carry the key_id in their
+ * AD struct.
+ */
+STM_MUST_USE
+stm_status stm_sync_get_dek(const stm_sync *s,
+                              uint64_t dataset_id, uint64_t key_id,
+                              uint8_t out_dek[32]);
+
+/*
+ * Number of DEKs currently held in the in-RAM map (across all
+ * datasets + key_ids). Tests use this to confirm rotations add and
+ * sweeps remove the expected counts.
+ */
+size_t stm_sync_dek_count(const stm_sync *s);
+
 #ifdef __cplusplus
 }
 #endif

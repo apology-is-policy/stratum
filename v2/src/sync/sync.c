@@ -41,13 +41,26 @@
 #include <stratum/super.h>
 
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* Dataset id used by the P4-4a single-pool-key MVP. Multi-dataset
- * arrives with P4-4c; for now every pool has dataset 0 implicitly. */
+/* Dataset id for the pool's metadata-encryption key. Every pool has
+ * a fixed (0, 0) entry for the metadata-node AEAD. Rotating dataset 0
+ * would require re-encrypting every metadata node under the new key;
+ * that sweep is future work, so `stm_sync_rotate_dataset_key` refuses
+ * dataset_id == 0 today. Additional datasets (ds >= 1) are added via
+ * `stm_sync_add_dataset_key` and rotate freely. */
 #define STM_SYNC_POOL_DATASET_ID   UINT64_C(0)
 #define STM_SYNC_POOL_KEY_ID       UINT64_C(0)
+
+/* Per-(dataset_id, key_id) DEK slot. 32-byte DEK lives in RAM only;
+ * the on-disk byte is its wrapped form inside the keyschema entry. */
+typedef struct sync_dek_slot {
+    uint64_t dataset_id;
+    uint64_t key_id;
+    uint8_t  dek[32];
+} sync_dek_slot;
 
 /* R10 P2-2: wrap-AD layout = pool_uuid(16) || dataset_id(8) ||
  * key_id(8). Binds the wrapped blob to its schema-tree coordinates
@@ -144,7 +157,156 @@ struct stm_sync {
      * commit. */
     uint64_t          keyschema_root_paddr;
     uint8_t           keyschema_root_csum[32];
+
+    /* P4-4c: per-(dataset_id, key_id) DEK map. `deks[0]` (if present)
+     * is always (0, 0) so `metadata_key` above is an alias for its
+     * `dek[32]` — updating one implies updating the other. Additional
+     * datasets + rotated key_ids populate subsequent slots. */
+    sync_dek_slot    *deks;
+    size_t            dek_count;
+    size_t            dek_cap;
 };
+
+/* ========================================================================= */
+/* DEK map helpers (P4-4c).                                                   */
+/* ========================================================================= */
+
+static stm_status sync_dek_grow(stm_sync *s, size_t need)
+{
+    if (need <= s->dek_cap) return STM_OK;
+    size_t new_cap = s->dek_cap ? s->dek_cap : 4;
+    while (new_cap < need) {
+        size_t grown = new_cap * 2;
+        if (grown < new_cap) return STM_ENOMEM;
+        new_cap = grown;
+    }
+    sync_dek_slot *grown = realloc(s->deks, new_cap * sizeof *grown);
+    if (!grown) return STM_ENOMEM;
+    /* Zero the newly-allocated tail. */
+    memset(grown + s->dek_cap, 0,
+             (new_cap - s->dek_cap) * sizeof *grown);
+    s->deks = grown;
+    s->dek_cap = new_cap;
+    return STM_OK;
+}
+
+static sync_dek_slot *sync_dek_find(stm_sync *s,
+                                      uint64_t dataset_id, uint64_t key_id)
+{
+    for (size_t i = 0; i < s->dek_count; i++) {
+        if (s->deks[i].dataset_id == dataset_id &&
+             s->deks[i].key_id     == key_id) return &s->deks[i];
+    }
+    return NULL;
+}
+
+static stm_status sync_dek_insert(stm_sync *s,
+                                    uint64_t dataset_id, uint64_t key_id,
+                                    const uint8_t dek[32])
+{
+    if (sync_dek_find(s, dataset_id, key_id) != NULL) return STM_EEXIST;
+    stm_status rc = sync_dek_grow(s, s->dek_count + 1);
+    if (rc != STM_OK) return rc;
+    sync_dek_slot *slot = &s->deks[s->dek_count++];
+    slot->dataset_id = dataset_id;
+    slot->key_id     = key_id;
+    memcpy(slot->dek, dek, 32);
+    return STM_OK;
+}
+
+/* Remove the slot at index `i` by swap-with-last. O(1). */
+static void sync_dek_remove_at(stm_sync *s, size_t i)
+{
+    if (i >= s->dek_count) return;
+    stm_ct_memzero(s->deks[i].dek, 32);
+    size_t last = s->dek_count - 1;
+    if (i != last) s->deks[i] = s->deks[last];
+    memset(&s->deks[last], 0, sizeof s->deks[last]);
+    s->dek_count--;
+}
+
+static stm_status sync_dek_remove(stm_sync *s,
+                                    uint64_t dataset_id, uint64_t key_id)
+{
+    for (size_t i = 0; i < s->dek_count; i++) {
+        if (s->deks[i].dataset_id == dataset_id &&
+             s->deks[i].key_id     == key_id) {
+            sync_dek_remove_at(s, i);
+            return STM_OK;
+        }
+    }
+    return STM_ENOENT;
+}
+
+static void sync_dek_wipe_all(stm_sync *s)
+{
+    if (!s->deks) return;
+    for (size_t i = 0; i < s->dek_count; i++)
+        stm_ct_memzero(s->deks[i].dek, 32);
+    stm_ct_memzero(s->deks, s->dek_cap * sizeof *s->deks);
+    free(s->deks);
+    s->deks = NULL;
+    s->dek_count = 0;
+    s->dek_cap = 0;
+}
+
+/* Shared iterate-and-unwrap context used by stm_sync_open to
+ * rehydrate every schema entry's DEK on mount. */
+typedef struct {
+    stm_sync                  *s;
+    const stm_hybrid_keys     *wk;
+    struct stm_janus_client   *janus;
+} sync_unwrap_ctx;
+
+static int sync_unwrap_cb(uint64_t dataset_id, uint64_t key_id,
+                           stm_keyschema_state state,
+                           const void *wrapped, size_t wrapped_len,
+                           void *ctx_)
+{
+    sync_unwrap_ctx *u = ctx_;
+    /* PRUNING entries are awaiting delete; nothing should be reading
+     * data under them at this point (extent-manager contract). Skip
+     * unwrap to save cycles + keep the key out of RAM. */
+    if (state == STM_KS_STATE_PRUNING) return 0;
+
+    uint8_t ad[STM_SYNC_WRAP_AD_LEN];
+    build_wrap_ad(u->s->pool_uuid, dataset_id, key_id, ad);
+
+    uint8_t dek[32];
+    size_t  dek_len = sizeof dek;
+    stm_status rc;
+    if (u->wk) {
+        rc = stm_hybrid_unwrap(u->wk->sk, ad, sizeof ad,
+                                 wrapped, wrapped_len,
+                                 dek, &dek_len);
+    } else {
+        /* Reconstruct pool_uuid bytes from the AD (matches janus
+         * backend's build_ad). */
+        uint8_t pool_uuid_bytes[16];
+        memcpy(pool_uuid_bytes, ad, 16);
+        rc = stm_janus_client_unwrap(u->janus,
+                                       pool_uuid_bytes,
+                                       dataset_id, key_id,
+                                       wrapped, wrapped_len,
+                                       dek, &dek_len);
+        stm_ct_memzero(pool_uuid_bytes, sizeof pool_uuid_bytes);
+    }
+    stm_ct_memzero(ad, sizeof ad);
+
+    if (rc != STM_OK) {
+        stm_ct_memzero(dek, sizeof dek);
+        return (int)rc;
+    }
+    if (dek_len != 32) {
+        stm_ct_memzero(dek, sizeof dek);
+        return (int)STM_EBACKEND;
+    }
+
+    rc = sync_dek_insert(u->s, dataset_id, key_id, dek);
+    stm_ct_memzero(dek, sizeof dek);
+    if (rc != STM_OK) return (int)rc;
+    return 0;
+}
 
 /* ========================================================================= */
 /* Merkle root construction (P4-1).                                           */
@@ -340,9 +502,10 @@ stm_status stm_sync_create(stm_bdev *d, stm_alloc *a,
      * consistent cross-platform behavior. */
     stm_random_bytes(s->merkle_salt, 32);
 
-    /* P4-3a: generate the pool's metadata-encryption key. Like the
-     * merkle salt, this is stable across the pool's lifetime for MVP.
-     * Key rotation is P4-4c's job. */
+    /* P4-3a: generate the pool's metadata-encryption key. P4-4c MVP
+     * keeps this key stable over the pool's lifetime — rotating it
+     * would require re-encrypting every metadata node. Per-dataset
+     * keys (ds >= 1) rotate freely via stm_sync_rotate_dataset_key. */
     stm_random_bytes(s->metadata_key, 32);
 
     /* P4-4a: PQ-hybrid-wrap the freshly-minted metadata key and park
@@ -380,6 +543,15 @@ stm_status stm_sync_create(stm_bdev *d, stm_alloc *a,
                                             wrapped, wrapped_len);
         stm_ct_memzero(wrapped, sizeof wrapped);
         if (ws != STM_OK) { stm_sync_close(s); return ws; }
+
+        /* Park (0, 0) in the DEK map so per-dataset APIs see the
+         * pool metadata key as a regular entry. `metadata_key` stays
+         * populated as a cached copy for stm_alloc_set_crypt_ctx. */
+        stm_status dis = sync_dek_insert(s,
+                                           STM_SYNC_POOL_DATASET_ID,
+                                           STM_SYNC_POOL_KEY_ID,
+                                           s->metadata_key);
+        if (dis != STM_OK) { stm_sync_close(s); return dis; }
     }
 
     /* P4-3b: install the crypt ctx on the allocator so its next
@@ -510,60 +682,40 @@ stm_status stm_sync_open(stm_bdev *d, stm_alloc *a,
     s2->keyschema_root_paddr = ks_root_paddr;
     memcpy(s2->keyschema_root_csum, ks_hdr.ks_root.bp_csum, 32);
 
-    uint8_t wrapped[STM_SYNC_WRAPPED_KEY_LEN];
-    size_t  wrapped_len = 0;
-    uint64_t found_key_id = 0;
-    kos = stm_keyschema_lookup_current(s2->keyschema,
-                                         STM_SYNC_POOL_DATASET_ID,
-                                         &found_key_id,
-                                         wrapped, sizeof wrapped, &wrapped_len);
-    if (kos != STM_OK) {
-        stm_ct_memzero(wrapped, sizeof wrapped);
+    /* P4-4c: unwrap every CURRENT + RETIRED entry in the schema into
+     * the in-RAM DEK map. Retired keys are needed for reads of old
+     * data still encrypted under them; PRUNING entries are skipped
+     * (they're awaiting deletion, not reads). The pool metadata key
+     * for dataset 0 is then copied into `metadata_key` for alloc's
+     * crypt ctx. */
+    sync_unwrap_ctx ux = { .s = s2, .wk = wk, .janus = janus };
+    stm_status all_rc = stm_keyschema_iter(s2->keyschema, sync_unwrap_cb, &ux);
+    if (all_rc != STM_OK) {
         stm_sync_close(s2);
-        return kos;
+        return all_rc;
     }
 
-    uint8_t unwrap_ad[STM_SYNC_WRAP_AD_LEN];
-    build_wrap_ad(s2->pool_uuid,
-                    STM_SYNC_POOL_DATASET_ID, found_key_id,
-                    unwrap_ad);
-    size_t dek_out_len = 0;
-    stm_status us;
-    if (wk) {
-        us = stm_hybrid_unwrap(wk->sk,
-                                 unwrap_ad, sizeof unwrap_ad,
-                                 wrapped, wrapped_len,
-                                 s2->metadata_key, &dek_out_len);
-    } else {
-        /* The janus client rebuilds the same AD as build_wrap_ad from
-         * (pool_uuid, dataset_id, key_id); the first 16 bytes of that
-         * AD are exactly the concatenation of two LE-packed u64s we
-         * keep in s2->pool_uuid. */
-        uint8_t pool_uuid_bytes[16];
-        memcpy(pool_uuid_bytes,     unwrap_ad,     16);
-        size_t dek_len_io = sizeof s2->metadata_key;
-        us = stm_janus_client_unwrap(janus,
-                                        pool_uuid_bytes,
-                                        STM_SYNC_POOL_DATASET_ID,
-                                        found_key_id,
-                                        wrapped, wrapped_len,
-                                        s2->metadata_key, &dek_len_io);
-        stm_ct_memzero(pool_uuid_bytes, sizeof pool_uuid_bytes);
-        if (us == STM_OK) dek_out_len = dek_len_io;
-    }
-    stm_ct_memzero(wrapped, sizeof wrapped);
-    if (us != STM_OK) {
+    /* Defense: the schema MUST carry exactly one CURRENT at (0, 0).
+     * Any other arrangement is structural corruption. */
+    uint64_t pool_cur_kid = UINT64_MAX;
+    kos = stm_keyschema_lookup_current(s2->keyschema,
+                                         STM_SYNC_POOL_DATASET_ID,
+                                         &pool_cur_kid, NULL, 0, NULL);
+    if (kos != STM_OK) { stm_sync_close(s2); return kos; }
+    if (pool_cur_kid != STM_SYNC_POOL_KEY_ID) {
         stm_sync_close(s2);
-        return us;
+        return STM_ECORRUPT;
     }
-    if (dek_out_len != 32) {
-        /* R10 P3-2: symmetric cleanup with the STM_OK path. The
-         * wrap/unwrap should always yield exactly 32 bytes; any
-         * other length indicates backend corruption. */
-        stm_ct_memzero(s2->metadata_key, sizeof s2->metadata_key);
+    sync_dek_slot *pool_slot = sync_dek_find(s2,
+                                                STM_SYNC_POOL_DATASET_ID,
+                                                STM_SYNC_POOL_KEY_ID);
+    if (!pool_slot) {
+        /* Unwrap succeeded for every entry but (0, 0) wasn't one of
+         * them — schema must be missing the pool metadata entry. */
         stm_sync_close(s2);
-        return STM_EBACKEND;
+        return STM_ECORRUPT;
     }
+    memcpy(s2->metadata_key, pool_slot->dek, 32);
 
     /* P4-3b: install the crypt ctx on the allocator so
      * stm_alloc_load_tree_at below can decrypt nodes. MUST happen
@@ -683,6 +835,8 @@ void stm_sync_close(stm_sync *s)
     /* P4-3b: wipe key material before free. The alloc's copy is
      * wiped independently in stm_alloc_close. */
     stm_ct_memzero(s->metadata_key, sizeof s->metadata_key);
+    /* P4-4c: wipe + free the per-dataset DEK map. */
+    sync_dek_wipe_all(s);
     pthread_mutex_destroy(&s->lock);
     free(s);
 }
@@ -792,11 +946,22 @@ stm_status stm_sync_commit(stm_sync *s)
      * fsynced. This is the commit point per sync.tla. Ring rotation:
      * label = gen % 4, slot = gen % 63.
      *
-     * R9 P0-1: alloc_root_gen = commit_gen because this commit DID
-     * rewrite the tree under commit_gen's AEAD nonce. */
+     * R9 P0-1 / P4-4c: alloc_root_gen comes from the allocator — NOT
+     * from commit_gen — because stm_alloc_commit's R7c P2-5 optimization
+     * skips the tree rewrite when nothing is dirty, so the tree may
+     * still be encrypted at an older gen. Recording commit_gen here
+     * would cause sync_open's alloc_load_tree_at to try decrypting under
+     * the wrong gen → STM_EBADTAG at mount. */
+    uint64_t tree_gen = 0;
+    sr = stm_alloc_get_tree_gen(s->alloc, &tree_gen);
+    if (sr != STM_OK) {
+        pthread_mutex_unlock(&s->lock);
+        return sr;
+    }
+
     stm_uberblock ub;
     build_uberblock(&ub, s, commit_gen,
-                     alloc_root, alloc_root_csum, commit_gen,
+                     alloc_root, alloc_root_csum, tree_gen,
                      ks_root_paddr, ks_root_csum,
                      new_merkle_root, &astats);
 
@@ -816,7 +981,7 @@ stm_status stm_sync_commit(stm_sync *s)
     s->live_label_idx        = next_label;
     s->live_slot_idx         = next_slot;
     s->alloc_root_paddr      = alloc_root;
-    s->alloc_root_gen        = commit_gen;
+    s->alloc_root_gen        = tree_gen;
     s->keyschema_root_paddr  = ks_root_paddr;
     memcpy(s->alloc_root_csum,     alloc_root_csum, 32);
     memcpy(s->keyschema_root_csum, ks_root_csum,   32);
@@ -844,4 +1009,285 @@ stm_status stm_sync_info_get(const stm_sync *s, stm_sync_info *out)
 
     pthread_mutex_unlock(&ms->lock);
     return STM_OK;
+}
+
+/* ========================================================================= */
+/* Per-dataset key management (P4-4c).                                        */
+/* ========================================================================= */
+
+/* Generate a fresh DEK and wrap it via either the local keyfile or
+ * the janus daemon. On STM_OK, `out_dek` holds 32 plaintext bytes
+ * and `out_wrapped[0..*out_wrapped_len)` holds the wrapped form that
+ * gets stored in the keyschema. */
+static stm_status sync_generate_and_wrap(const stm_sync *s,
+                                           uint64_t dataset_id, uint64_t key_id,
+                                           const stm_hybrid_keys *wk,
+                                           struct stm_janus_client *janus,
+                                           uint8_t out_dek[32],
+                                           uint8_t out_wrapped[STM_SYNC_WRAPPED_KEY_LEN],
+                                           size_t *out_wrapped_len)
+{
+    uint8_t ad[STM_SYNC_WRAP_AD_LEN];
+    build_wrap_ad(s->pool_uuid, dataset_id, key_id, ad);
+
+    if (wk) {
+        stm_random_bytes(out_dek, 32);
+        size_t wlen = STM_SYNC_WRAPPED_KEY_LEN;
+        stm_status rc = stm_hybrid_wrap(wk->pk, ad, sizeof ad,
+                                          out_dek, 32,
+                                          out_wrapped, &wlen);
+        stm_ct_memzero(ad, sizeof ad);
+        if (rc != STM_OK) {
+            stm_ct_memzero(out_dek, 32);
+            return rc;
+        }
+        if (wlen != STM_SYNC_WRAPPED_KEY_LEN) {
+            stm_ct_memzero(out_dek, 32);
+            stm_ct_memzero(out_wrapped, STM_SYNC_WRAPPED_KEY_LEN);
+            return STM_EBACKEND;
+        }
+        *out_wrapped_len = wlen;
+        return STM_OK;
+    }
+
+    /* janus path: the daemon generates the DEK via its CSPRNG and
+     * returns both halves over 9P. */
+    uint8_t pool_uuid_bytes[16];
+    memcpy(pool_uuid_bytes, ad, 16);
+    size_t dek_len_io     = 32;
+    size_t wrapped_len_io = STM_SYNC_WRAPPED_KEY_LEN;
+    stm_status rc = stm_janus_client_rotate(janus,
+                                               pool_uuid_bytes,
+                                               dataset_id, key_id,
+                                               out_dek,     &dek_len_io,
+                                               out_wrapped, &wrapped_len_io);
+    stm_ct_memzero(pool_uuid_bytes, sizeof pool_uuid_bytes);
+    stm_ct_memzero(ad, sizeof ad);
+    if (rc != STM_OK) {
+        stm_ct_memzero(out_dek, 32);
+        return rc;
+    }
+    if (dek_len_io != 32 || wrapped_len_io != STM_SYNC_WRAPPED_KEY_LEN) {
+        stm_ct_memzero(out_dek, 32);
+        stm_ct_memzero(out_wrapped, STM_SYNC_WRAPPED_KEY_LEN);
+        return STM_EBACKEND;
+    }
+    *out_wrapped_len = wrapped_len_io;
+    return STM_OK;
+}
+
+stm_status stm_sync_add_dataset_key(stm_sync *s,
+                                      uint64_t dataset_id,
+                                      const stm_hybrid_keys *wk,
+                                      struct stm_janus_client *janus,
+                                      uint64_t *out_new_key_id)
+{
+    if (!s || !out_new_key_id) return STM_EINVAL;
+    if ((!wk && !janus) || (wk && janus)) return STM_EINVAL;
+    /* ds=0 is reserved for the pool metadata key; installed by
+     * stm_sync_create, not here. */
+    if (dataset_id == STM_SYNC_POOL_DATASET_ID) return STM_EINVAL;
+
+    pthread_mutex_lock(&s->lock);
+
+    /* Refuse if the dataset already has any entry (CURRENT or retired):
+     * add is strictly "new dataset". Use rotate for an existing one. */
+    uint64_t next_id = 0;
+    stm_status rc = stm_keyschema_next_key_id(s->keyschema, dataset_id, &next_id);
+    if (rc != STM_OK) { pthread_mutex_unlock(&s->lock); return rc; }
+    if (next_id != 0) {
+        pthread_mutex_unlock(&s->lock);
+        return STM_EEXIST;
+    }
+
+    uint8_t dek[32];
+    uint8_t wrapped[STM_SYNC_WRAPPED_KEY_LEN];
+    size_t  wrapped_len = 0;
+    rc = sync_generate_and_wrap(s, dataset_id, /*key_id=*/0,
+                                   wk, janus, dek, wrapped, &wrapped_len);
+    if (rc != STM_OK) { pthread_mutex_unlock(&s->lock); return rc; }
+
+    rc = stm_keyschema_insert_wrapped(s->keyschema, dataset_id, /*key_id=*/0,
+                                        STM_KS_STATE_CURRENT,
+                                        wrapped, wrapped_len);
+    stm_ct_memzero(wrapped, sizeof wrapped);
+    if (rc != STM_OK) {
+        stm_ct_memzero(dek, sizeof dek);
+        pthread_mutex_unlock(&s->lock);
+        return rc;
+    }
+
+    rc = sync_dek_insert(s, dataset_id, /*key_id=*/0, dek);
+    stm_ct_memzero(dek, sizeof dek);
+    if (rc != STM_OK) {
+        /* Roll back the schema insert so a retry doesn't hit EEXIST.
+         * Use the "replace with PRUNING then prune" approach — we can't
+         * cleanly un-insert a CURRENT, but we can delete it atomically
+         * since no one has committed yet. Instead: overwrite the entry
+         * with a PRUNING-state same-id so a caller sees structural
+         * consistency and can attempt `sweep`. This is a narrow OOM
+         * path; most callers will just abort the mount. */
+        (void)stm_keyschema_mark_pruning(s->keyschema, dataset_id, 0);
+        pthread_mutex_unlock(&s->lock);
+        return rc;
+    }
+
+    *out_new_key_id = 0;
+    pthread_mutex_unlock(&s->lock);
+    return STM_OK;
+}
+
+stm_status stm_sync_rotate_dataset_key(stm_sync *s,
+                                         uint64_t dataset_id,
+                                         const stm_hybrid_keys *wk,
+                                         struct stm_janus_client *janus,
+                                         uint64_t *out_new_key_id,
+                                         uint64_t *out_old_key_id)
+{
+    if (!s || !out_new_key_id || !out_old_key_id) return STM_EINVAL;
+    if ((!wk && !janus) || (wk && janus)) return STM_EINVAL;
+    /* P4-4c MVP: rotating the pool metadata key (ds=0) would require
+     * re-encrypting every metadata node. Block this until the
+     * re-encrypt sweep lands (future chunk). */
+    if (dataset_id == STM_SYNC_POOL_DATASET_ID) return STM_EBUSY;
+
+    pthread_mutex_lock(&s->lock);
+
+    uint64_t next_id = 0;
+    stm_status rc = stm_keyschema_next_key_id(s->keyschema, dataset_id, &next_id);
+    if (rc != STM_OK) { pthread_mutex_unlock(&s->lock); return rc; }
+    if (next_id == 0) {
+        /* No entry yet — caller should have used add, not rotate. */
+        pthread_mutex_unlock(&s->lock);
+        return STM_ENOENT;
+    }
+
+    uint8_t dek[32];
+    uint8_t wrapped[STM_SYNC_WRAPPED_KEY_LEN];
+    size_t  wrapped_len = 0;
+    rc = sync_generate_and_wrap(s, dataset_id, next_id,
+                                   wk, janus, dek, wrapped, &wrapped_len);
+    if (rc != STM_OK) { pthread_mutex_unlock(&s->lock); return rc; }
+
+    uint64_t old_id = 0;
+    rc = stm_keyschema_rotate(s->keyschema, dataset_id, next_id,
+                                 wrapped, wrapped_len, &old_id);
+    stm_ct_memzero(wrapped, sizeof wrapped);
+    if (rc != STM_OK) {
+        stm_ct_memzero(dek, sizeof dek);
+        pthread_mutex_unlock(&s->lock);
+        return rc;
+    }
+
+    rc = sync_dek_insert(s, dataset_id, next_id, dek);
+    stm_ct_memzero(dek, sizeof dek);
+    if (rc != STM_OK) {
+        /* Keyschema is mutated but DEK map isn't. Best-effort: leave
+         * the schema alone (the new CURRENT is valid; only the in-RAM
+         * mirror is missing). Next sync_open will rebuild the map. */
+        pthread_mutex_unlock(&s->lock);
+        return rc;
+    }
+
+    *out_new_key_id = next_id;
+    *out_old_key_id = old_id;
+    pthread_mutex_unlock(&s->lock);
+    return STM_OK;
+}
+
+/* Collector used by sweep: gather (ds, key_id) pairs where state ==
+ * RETIRED so we don't mutate the list while iterating it. */
+typedef struct {
+    uint64_t dataset_id_filter;
+    uint64_t *keys;
+    size_t    count;
+    size_t    cap;
+    stm_status err;
+} sweep_collect;
+
+static int sweep_collect_cb(uint64_t dataset_id, uint64_t key_id,
+                             stm_keyschema_state state,
+                             const void *wrapped, size_t wrapped_len,
+                             void *ctx_)
+{
+    (void)wrapped; (void)wrapped_len;
+    sweep_collect *c = ctx_;
+    if (dataset_id != c->dataset_id_filter) return 0;
+    if (state != STM_KS_STATE_RETIRED) return 0;
+    if (c->count == c->cap) {
+        size_t new_cap = c->cap ? c->cap * 2 : 8;
+        uint64_t *grown = realloc(c->keys, new_cap * sizeof *grown);
+        if (!grown) { c->err = STM_ENOMEM; return (int)STM_ENOMEM; }
+        c->keys = grown;
+        c->cap = new_cap;
+    }
+    c->keys[c->count++] = key_id;
+    return 0;
+}
+
+stm_status stm_sync_keyschema_sweep(stm_sync *s,
+                                      uint64_t dataset_id,
+                                      size_t *out_pruned_count)
+{
+    if (!s) return STM_EINVAL;
+    size_t local_count = 0;
+    if (!out_pruned_count) out_pruned_count = &local_count;
+    *out_pruned_count = 0;
+
+    pthread_mutex_lock(&s->lock);
+
+    sweep_collect col = { .dataset_id_filter = dataset_id };
+    stm_status rc = stm_keyschema_iter(s->keyschema, sweep_collect_cb, &col);
+    if (rc != STM_OK) {
+        free(col.keys);
+        pthread_mutex_unlock(&s->lock);
+        return col.err != STM_OK ? col.err : rc;
+    }
+
+    size_t pruned = 0;
+    for (size_t i = 0; i < col.count; i++) {
+        uint64_t kid = col.keys[i];
+        /* RETIRED → PRUNING. Phase 4 has no extent layer referencing
+         * these keys, so the precondition (refs == 0) is trivially
+         * satisfied. */
+        stm_status ms = stm_keyschema_mark_pruning(s->keyschema,
+                                                     dataset_id, kid);
+        if (ms != STM_OK) continue;    /* state raced — skip */
+        stm_status ps = stm_keyschema_prune(s->keyschema, dataset_id, kid);
+        if (ps != STM_OK) continue;
+        (void)sync_dek_remove(s, dataset_id, kid);
+        pruned++;
+    }
+    free(col.keys);
+
+    *out_pruned_count = pruned;
+    pthread_mutex_unlock(&s->lock);
+    return STM_OK;
+}
+
+stm_status stm_sync_get_dek(const stm_sync *s,
+                              uint64_t dataset_id, uint64_t key_id,
+                              uint8_t out_dek[32])
+{
+    if (!s || !out_dek) return STM_EINVAL;
+    stm_sync *ms = (stm_sync *)s;
+    pthread_mutex_lock(&ms->lock);
+    sync_dek_slot *slot = sync_dek_find(ms, dataset_id, key_id);
+    if (!slot) {
+        pthread_mutex_unlock(&ms->lock);
+        return STM_ENOENT;
+    }
+    memcpy(out_dek, slot->dek, 32);
+    pthread_mutex_unlock(&ms->lock);
+    return STM_OK;
+}
+
+size_t stm_sync_dek_count(const stm_sync *s)
+{
+    if (!s) return 0;
+    stm_sync *ms = (stm_sync *)s;
+    pthread_mutex_lock(&ms->lock);
+    size_t n = ms->dek_count;
+    pthread_mutex_unlock(&ms->lock);
+    return n;
 }

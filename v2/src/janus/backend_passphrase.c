@@ -317,6 +317,22 @@ static stm_status pass_unwrap(void *ctx,
     return rc;
 }
 
+static stm_status pass_wrap(void *ctx,
+                              const uint8_t pool_uuid[16],
+                              uint64_t dataset_id, uint64_t key_id,
+                              const void *dek, size_t dek_len,
+                              void *out_wrapped, size_t *inout_wrapped_len)
+{
+    pass_ctx *p = ctx;
+    uint8_t ad[STM_JANUS_WRAP_AD_LEN];
+    build_ad(pool_uuid, dataset_id, key_id, ad);
+    stm_status rc = stm_hybrid_wrap(p->hybrid_pk, ad, sizeof ad,
+                                      dek, dek_len,
+                                      out_wrapped, inout_wrapped_len);
+    stm_ct_memzero(ad, sizeof ad);
+    return rc;
+}
+
 static void pass_destroy(void *ctx)
 {
     if (!ctx) return;
@@ -394,6 +410,7 @@ stm_status janus_backend_passphrase_open(const char *state_dir,
     snprintf(out->name, sizeof out->name, "passphrase");
     out->ctx     = c;
     out->unwrap  = pass_unwrap;
+    out->wrap    = pass_wrap;
     out->destroy = pass_destroy;
     return STM_OK;
 }

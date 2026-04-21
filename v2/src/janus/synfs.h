@@ -3,21 +3,23 @@
  * synfs — janus's synthetic filesystem, exposed to clients over 9P
  * (ARCH §7.9.1).
  *
- * Layout (P4-4b scope):
+ * Layout (P4-4c scope):
  *
  *   /                            root directory
  *   /pools/                      per-pool configured entries
  *   /pools/<uuid>/
  *     wrap-key-info              read: "<backend_name>\n"
  *     datasets/
- *       <id>/
- *         unwrap                 write Twrite request, read Tread response
- *   /audit-log                   read: append-only log of unwrap ops
+ *       <id>/                    any numeric dataset_id is walkable
+ *         unwrap                 write wrapped blob, read DEK
+ *         rotate                 write new_key_id, read DEK || wrapped
+ *   /audit-log                   read: append-only log of unwrap + rotate
  *
  * Each pool is registered before the daemon starts listening; the
- * tree is static from then on (no /create / /remove). Rotation
- * (P4-4c) will extend this with /pools/<uuid>/datasets/<id>/wrapped-key
- * and /pools/<uuid>/rotate-wrap.
+ * tree is static from then on. The daemon holds no list of known
+ * datasets — any dataset_id the FS walks through is serviceable, and
+ * `readdir` on `/pools/<uuid>/datasets/` returns empty (the
+ * authoritative list lives in the FS's keyschema sub-tree, not here).
  */
 #ifndef STRATUM_V2_JANUS_SYNFS_H
 #define STRATUM_V2_JANUS_SYNFS_H
@@ -36,16 +38,16 @@ stm_status janus_synfs_create(janus_synfs **out);
 
 /*
  * Register a pool. Takes ownership of `backend` (moves via
- * janus_backend_move). `pool_uuid` is copied in. `dataset_id` is
- * part of the synthetic path; P4-4b MVP uses 0 everywhere.
+ * janus_backend_move). `pool_uuid` is copied in.
  *
  * Must be called BEFORE the first 9P server is attached to this
- * synfs. Returns STM_EEXIST if this (pool_uuid, dataset_id) is
- * already registered.
+ * synfs. Returns STM_EEXIST if `pool_uuid` is already registered.
+ *
+ * The backend serves any dataset_id within the pool; there is no
+ * per-dataset registration.
  */
 stm_status janus_synfs_register_pool(janus_synfs *s,
                                        const uint8_t pool_uuid[16],
-                                       uint64_t dataset_id,
                                        janus_backend *backend);
 
 /* The p9 vops that dispatches onto a janus_synfs. */

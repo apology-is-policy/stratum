@@ -373,7 +373,7 @@ The most architecturally risky phase (per NOVEL #4). Extensive TLA+ spec work + 
 - [ ] Tampering with a metadata block is cryptographically detected.
 - [x] Janus + daemon integrated; passphrase backend works.
 - [ ] `merkle.tla` proves hash-propagation correctness under COW.
-- [ ] `key_schema.tla` proves rotation atomicity + retired-key retention.
+- [x] `key_schema.tla` proves rotation atomicity + retired-key retention.
 
 ### 7.3 Risks
 

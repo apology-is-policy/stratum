@@ -184,6 +184,96 @@ stm_status stm_keyschema_lookup_current(const stm_keyschema *ks,
  */
 size_t stm_keyschema_count(const stm_keyschema *ks);
 
+/* ========================================================================= */
+/* Rotation + retired-key sweeper (P4-4c, ARCH §7.7.2).                       */
+/* ========================================================================= */
+
+/*
+ * Next monotonic key_id for `dataset_id`. 0 if no entries exist for
+ * the dataset; max(key_id)+1 otherwise — including entries currently
+ * RETIRED or PRUNING. Key-ids never recycle; a pruned slot becomes
+ * NONE but the id remains burned so retired-blob lookups stay
+ * unambiguous (key_schema.tla's MonotonicKeyIds).
+ */
+STM_MUST_USE
+stm_status stm_keyschema_next_key_id(const stm_keyschema *ks,
+                                       uint64_t dataset_id,
+                                       uint64_t *out_next_key_id);
+
+/*
+ * Atomic dataset-key rotation (ARCH §7.7.2). Inserts
+ * (dataset_id, new_key_id, CURRENT, wrapped) AND flips the existing
+ * CURRENT entry for the dataset to RETIRED, in a single call. The
+ * on-disk visibility is atomic via the commit protocol's CommitAtomic
+ * (the schema tree's new root is only reachable once the uberblock
+ * lands).
+ *
+ * Preconditions enforced:
+ *   - `new_key_id` must equal `stm_keyschema_next_key_id(dataset_id)`
+ *     (strict monotonicity; callers that pass a stale value get
+ *     STM_EINVAL).
+ *   - The dataset currently has exactly one CURRENT entry (the one
+ *     being retired). Zero or more-than-one → STM_ECORRUPT.
+ *
+ * On success, `*out_old_key_id` is set to the retired key's id.
+ *
+ * On failure the in-RAM schema is untouched (operation is
+ * all-or-nothing with respect to the list mutations).
+ */
+STM_MUST_USE
+stm_status stm_keyschema_rotate(stm_keyschema *ks,
+                                  uint64_t dataset_id,
+                                  uint64_t new_key_id,
+                                  const void *wrapped, size_t wrapped_len,
+                                  uint64_t *out_old_key_id);
+
+/*
+ * Transition RETIRED → PRUNING. Per key_schema.tla's MarkPruning,
+ * the caller must have verified refs == 0; Phase 4 has no extent
+ * layer, so refs == 0 is trivially true, and this primitive accepts
+ * the transition unconditionally. Phase 6's extent manager will own
+ * the refcount check before invoking this.
+ *
+ * STM_EINVAL if the entry is not in RETIRED state; STM_ENOENT if no
+ * entry exists at (dataset_id, key_id).
+ */
+STM_MUST_USE
+stm_status stm_keyschema_mark_pruning(stm_keyschema *ks,
+                                        uint64_t dataset_id,
+                                        uint64_t key_id);
+
+/*
+ * Remove a PRUNING entry. Frees the wrapped-blob allocation and
+ * removes the list slot. STM_EINVAL if the entry is not in PRUNING
+ * state; STM_ENOENT if no entry exists.
+ *
+ * The burned key_id is NOT recycled — a subsequent rotate still
+ * picks `max(live_key_id) + 1` (see `stm_keyschema_next_key_id`'s
+ * contract). This matches the spec's MonotonicKeyIds invariant.
+ */
+STM_MUST_USE
+stm_status stm_keyschema_prune(stm_keyschema *ks,
+                                 uint64_t dataset_id,
+                                 uint64_t key_id);
+
+/*
+ * Callback signature for `stm_keyschema_iter`. Returns 0 to continue,
+ * non-zero to stop; iter propagates the non-zero value to its caller.
+ */
+typedef int (*stm_keyschema_iter_cb)(uint64_t dataset_id, uint64_t key_id,
+                                       stm_keyschema_state state,
+                                       const void *wrapped, size_t wrapped_len,
+                                       void *ctx);
+
+/*
+ * Walk every entry in sorted (dataset_id, key_id) order, invoking
+ * `cb` per entry. If `cb` returns non-zero the iteration short-
+ * circuits with that return value; STM_OK otherwise.
+ */
+STM_MUST_USE
+stm_status stm_keyschema_iter(const stm_keyschema *ks,
+                                stm_keyschema_iter_cb cb, void *ctx);
+
 #ifdef __cplusplus
 }
 #endif

@@ -655,6 +655,16 @@ stm_status stm_alloc_get_tree_root(const stm_alloc *a,
     return STM_OK;
 }
 
+stm_status stm_alloc_get_tree_gen(const stm_alloc *a, uint64_t *out_root_gen)
+{
+    if (!a || !out_root_gen) return STM_EINVAL;
+    stm_alloc *ma = (stm_alloc *)a;
+    pthread_mutex_lock(&ma->lock);
+    *out_root_gen = a->current_tree_gen;
+    pthread_mutex_unlock(&ma->lock);
+    return STM_OK;
+}
+
 stm_status stm_alloc_open(stm_bdev *d, stm_alloc **out_alloc)
 {
     /* R7d P0-1: `stm_alloc_open` is now an alias for

@@ -418,6 +418,93 @@ done: {
 }
 }
 
+stm_status stm_janus_client_rotate(stm_janus_client *c,
+                                     const uint8_t pool_uuid[16],
+                                     uint64_t dataset_id,
+                                     uint64_t new_key_id,
+                                     void *out_dek, size_t *inout_dek_len,
+                                     void *out_wrapped, size_t *inout_wrapped_len)
+{
+    if (!c || !pool_uuid || !out_dek || !inout_dek_len
+            || !out_wrapped || !inout_wrapped_len) return STM_EINVAL;
+    const size_t dek_len     = 32u;
+    const size_t wrapped_len = dek_len + STM_HYBRID_WRAP_OVERHEAD;
+    if (*inout_dek_len     < dek_len)     return STM_ERANGE;
+    if (*inout_wrapped_len < wrapped_len) return STM_ERANGE;
+
+    /* Walk /pools/<uuid>/datasets/<N>/rotate. */
+    char uuid_s[37];
+    uuid_to_hex(pool_uuid, uuid_s);
+    char ds_s[21];
+    int ds_len = snprintf(ds_s, sizeof ds_s, "%llu",
+                          (unsigned long long)dataset_id);
+    if (ds_len < 0) return STM_EINVAL;
+    const char *names[5] = { "pools", uuid_s, "datasets", ds_s, "rotate" };
+    uint16_t lens[5] = { 5, 36, 8, (uint16_t)ds_len, 6 };
+
+    uint32_t fid = c->next_fid++;
+    stm_status rc = do_walk(c, fid, 5, names, lens);
+    if (rc != STM_OK) return rc;
+    rc = do_open(c, fid, STM_P9_ORDWR);
+    if (rc != STM_OK) { (void)do_clunk(c, fid); return rc; }
+
+    /* Write new_key_id as 8 LE bytes. */
+    uint8_t hdr[STM_JANUS_ROTATE_REQ_HDR];
+    for (size_t i = 0; i < 8; i++)
+        hdr[i] = (uint8_t)(new_key_id >> (i * 8));
+    uint32_t written = 0;
+    rc = do_write(c, fid, 0, hdr, sizeof hdr, &written);
+    if (rc != STM_OK) goto done;
+    if (written != sizeof hdr) { rc = STM_EIO; goto done; }
+
+    /* Read back dek(32) || wrapped(dek_len + OVERHEAD) in chunks. The
+     * daemon lays them out contiguously in resp_buf. */
+    uint8_t   *cursor       = NULL;
+    size_t     want_total   = dek_len + wrapped_len;
+    uint8_t   *composite    = calloc(1, want_total);
+    if (!composite) { rc = STM_ENOMEM; goto done; }
+
+    size_t read_off = 0;
+    uint32_t avail_max = c->msize - STM_P9_HDR_SIZE - 4u;
+    while (read_off < want_total) {
+        uint32_t want = (want_total - read_off > avail_max)
+                          ? avail_max : (uint32_t)(want_total - read_off);
+        uint32_t got = 0;
+        rc = do_read(c, fid, read_off, want, composite + read_off, &got);
+        if (rc != STM_OK) {
+            stm_ct_memzero(composite, want_total);
+            free(composite);
+            goto done;
+        }
+        if (got == 0) {
+            /* Short response — daemon produced fewer bytes than
+             * expected; tag the result as truncated to make this
+             * observable at the call site. R11 P2-1 guards against
+             * malformed frames; this guards against a well-framed
+             * but under-sized response. */
+            stm_ct_memzero(composite, want_total);
+            free(composite);
+            rc = STM_EBADTAG;
+            goto done;
+        }
+        read_off += got;
+    }
+    cursor = composite;
+    memcpy(out_dek,     cursor,           dek_len);
+    memcpy(out_wrapped, cursor + dek_len, wrapped_len);
+    *inout_dek_len     = dek_len;
+    *inout_wrapped_len = wrapped_len;
+    stm_ct_memzero(composite, want_total);
+    free(composite);
+    rc = STM_OK;
+
+done: {
+    stm_status rc2 = do_clunk(c, fid);
+    if (rc == STM_OK && rc2 != STM_OK) rc = rc2;
+    return rc;
+}
+}
+
 void stm_janus_client_disconnect(stm_janus_client *c)
 {
     if (!c) return;

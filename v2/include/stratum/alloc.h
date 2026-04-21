@@ -180,6 +180,19 @@ stm_status stm_alloc_get_tree_root(const stm_alloc *a,
                                      uint8_t out_root_csum[32]);
 
 /*
+ * Gen at which the current tree root was last AEAD-encrypted. This is
+ * the value that ub_alloc_root_gen should carry in the next uberblock
+ * — NOT necessarily the commit gen, because stm_alloc_commit skips
+ * the tree rewrite when nothing dirty happened since the last commit
+ * (R7c P2-5). Using commit_gen there makes later mounts decrypt under
+ * the wrong gen → STM_EBADTAG.
+ *
+ * 0 before any commit has persisted a tree.
+ */
+STM_MUST_USE
+stm_status stm_alloc_get_tree_gen(const stm_alloc *a, uint64_t *out_root_gen);
+
+/*
  * Release the handle and its sub-handles (bootstrap + tree). Callers
  * must ensure no other thread is using `a` at close time; close does
  * not self-quiesce and destroys the internal mutex (per POSIX,

@@ -37,6 +37,22 @@ typedef struct janus_backend {
                          const void *wrapped, size_t wrapped_len,
                          void *out_dek, size_t *inout_dek_len);
 
+    /* P4-4c: Wrap `dek` under AD = pool_uuid || dataset_id || key_id
+     * using the backend's hybrid_pk. Both backends hold pk alongside
+     * sk, so the wrap is symmetric with unwrap. Used by the /rotate
+     * synfs endpoint: the daemon generates a fresh DEK via CSPRNG,
+     * has the backend wrap it, and returns (dek || wrapped) so the FS
+     * can atomically install both.
+     *
+     * `*inout_wrapped_len` in: capacity; out: bytes written, which
+     * equals `dek_len + STM_HYBRID_WRAP_OVERHEAD`. */
+    stm_status (*wrap)(void *ctx,
+                       const uint8_t pool_uuid[16],
+                       uint64_t dataset_id,
+                       uint64_t key_id,
+                       const void *dek, size_t dek_len,
+                       void *out_wrapped, size_t *inout_wrapped_len);
+
     /* Release all backend state including key material. Must wipe
      * any hybrid_sk bytes before freeing. */
     void (*destroy)(void *ctx);
@@ -52,6 +68,7 @@ static inline void janus_backend_move(janus_backend *dst,
     *dst = *src;
     src->ctx = NULL;
     src->unwrap = NULL;
+    src->wrap = NULL;
     src->destroy = NULL;
 }
 

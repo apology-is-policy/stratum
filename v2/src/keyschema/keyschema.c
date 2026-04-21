@@ -552,3 +552,157 @@ size_t stm_keyschema_count(const stm_keyschema *ks)
 {
     return ks ? ks->count : 0u;
 }
+
+/* ========================================================================= */
+/* Rotation + retired-key sweeper (P4-4c).                                    */
+/* ========================================================================= */
+
+/* Max live key_id for `dataset_id` across CURRENT, RETIRED, PRUNING.
+ * -1 if none (signals caller to return 0 as next_key_id). */
+static int64_t max_key_id_for(const stm_keyschema *ks, uint64_t dataset_id)
+{
+    int64_t best = -1;
+    for (const ks_entry *e = ks->head; e; e = e->next) {
+        if (e->dataset_id < dataset_id) continue;
+        if (e->dataset_id > dataset_id) break;
+        if ((int64_t)e->key_id > best) best = (int64_t)e->key_id;
+    }
+    return best;
+}
+
+stm_status stm_keyschema_next_key_id(const stm_keyschema *ks,
+                                       uint64_t dataset_id,
+                                       uint64_t *out_next_key_id)
+{
+    if (!ks || !out_next_key_id) return STM_EINVAL;
+    int64_t max_id = max_key_id_for(ks, dataset_id);
+    if (max_id < 0) {
+        *out_next_key_id = 0;
+        return STM_OK;
+    }
+    /* Wraparound defense. A realistic pool will hit dozens of
+     * rotations over a lifetime; UINT64_MAX reservations is
+     * unreachable but the clamp keeps types honest. */
+    if ((uint64_t)max_id == UINT64_MAX) return STM_ERANGE;
+    *out_next_key_id = (uint64_t)max_id + 1u;
+    return STM_OK;
+}
+
+stm_status stm_keyschema_rotate(stm_keyschema *ks,
+                                  uint64_t dataset_id,
+                                  uint64_t new_key_id,
+                                  const void *wrapped, size_t wrapped_len,
+                                  uint64_t *out_old_key_id)
+{
+    if (!ks || !out_old_key_id) return STM_EINVAL;
+    if (wrapped_len == 0 || !wrapped) return STM_EINVAL;
+    if (wrapped_len > STM_KEYSCHEMA_WRAPPED_MAX) return STM_ERANGE;
+
+    /* Strict monotonicity: caller must pass the expected next id. A
+     * mismatch indicates a lost-update race or buggy caller; either
+     * way the safe response is to reject before we mutate anything. */
+    uint64_t expect_next = 0;
+    stm_status ns = stm_keyschema_next_key_id(ks, dataset_id, &expect_next);
+    if (ns != STM_OK) return ns;
+    if (new_key_id != expect_next) return STM_EINVAL;
+
+    /* Find the (exactly-one) existing CURRENT for this dataset. */
+    ks_entry *old_current = NULL;
+    for (ks_entry *e = ks->head; e; e = e->next) {
+        if (e->dataset_id < dataset_id) continue;
+        if (e->dataset_id > dataset_id) break;
+        if (e->state != STM_KS_STATE_CURRENT) continue;
+        if (old_current) return STM_ECORRUPT;   /* >1 CURRENT */
+        old_current = e;
+    }
+    if (!old_current) return STM_ENOENT;        /* no CURRENT to rotate from */
+
+    /* Pre-allocate the new entry before any state mutation so we
+     * don't leave the list with 0 CURRENTs on allocation failure. */
+    ks_entry *new_entry = calloc(1, sizeof *new_entry);
+    if (!new_entry) return STM_ENOMEM;
+    new_entry->dataset_id  = dataset_id;
+    new_entry->key_id      = new_key_id;
+    new_entry->state       = STM_KS_STATE_CURRENT;
+    new_entry->wrapped_len = wrapped_len;
+    new_entry->wrapped     = malloc(wrapped_len);
+    if (!new_entry->wrapped) {
+        free(new_entry);
+        return STM_ENOMEM;
+    }
+    memcpy(new_entry->wrapped, wrapped, wrapped_len);
+
+    /* Splice-in at the sorted position for (dataset_id, new_key_id). */
+    ks_entry **slot = find_slot(ks, dataset_id, new_key_id);
+    /* Defensive: the slot must not already hold (dataset_id, new_key_id)
+     * because next_key_id == max+1 and the caller's input matched. */
+    if (*slot &&
+         (*slot)->dataset_id == dataset_id &&
+         (*slot)->key_id     == new_key_id) {
+        memset(new_entry->wrapped, 0, wrapped_len);
+        free(new_entry->wrapped);
+        free(new_entry);
+        return STM_ECORRUPT;
+    }
+    new_entry->next = *slot;
+    *slot = new_entry;
+    ks->count++;
+
+    /* Flip the old CURRENT to RETIRED last — everything above is
+     * roll-back-able on failure, this step is the atomic point. */
+    old_current->state = STM_KS_STATE_RETIRED;
+    *out_old_key_id = old_current->key_id;
+    return STM_OK;
+}
+
+/* Helper: find-and-return the ks_entry at (ds, kid); NULL if absent. */
+static ks_entry *find_entry(stm_keyschema *ks,
+                              uint64_t dataset_id, uint64_t key_id)
+{
+    ks_entry **slot = find_slot(ks, dataset_id, key_id);
+    if (*slot &&
+         (*slot)->dataset_id == dataset_id &&
+         (*slot)->key_id     == key_id) return *slot;
+    return NULL;
+}
+
+stm_status stm_keyschema_mark_pruning(stm_keyschema *ks,
+                                        uint64_t dataset_id,
+                                        uint64_t key_id)
+{
+    if (!ks) return STM_EINVAL;
+    ks_entry *e = find_entry(ks, dataset_id, key_id);
+    if (!e) return STM_ENOENT;
+    if (e->state != STM_KS_STATE_RETIRED) return STM_EINVAL;
+    e->state = STM_KS_STATE_PRUNING;
+    return STM_OK;
+}
+
+stm_status stm_keyschema_prune(stm_keyschema *ks,
+                                 uint64_t dataset_id,
+                                 uint64_t key_id)
+{
+    if (!ks) return STM_EINVAL;
+    ks_entry **slot = find_slot(ks, dataset_id, key_id);
+    if (!*slot ||
+         (*slot)->dataset_id != dataset_id ||
+         (*slot)->key_id     != key_id) return STM_ENOENT;
+    ks_entry *e = *slot;
+    if (e->state != STM_KS_STATE_PRUNING) return STM_EINVAL;
+    *slot = e->next;
+    entry_free(e);
+    ks->count--;
+    return STM_OK;
+}
+
+stm_status stm_keyschema_iter(const stm_keyschema *ks,
+                                stm_keyschema_iter_cb cb, void *ctx)
+{
+    if (!ks || !cb) return STM_EINVAL;
+    for (const ks_entry *e = ks->head; e; e = e->next) {
+        int r = cb(e->dataset_id, e->key_id, e->state,
+                    e->wrapped, e->wrapped_len, ctx);
+        if (r != 0) return (stm_status)r;
+    }
+    return STM_OK;
+}

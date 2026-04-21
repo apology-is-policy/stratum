@@ -50,6 +50,10 @@ extern "C" {
 /* Unwrap request preamble: just a key_id. */
 #define STM_JANUS_UNWRAP_REQ_HDR    8u
 
+/* Rotate request preamble: just a new_key_id. Matches the unwrap
+ * shape so client and server code can share the wire-framing. */
+#define STM_JANUS_ROTATE_REQ_HDR    8u
+
 typedef struct stm_janus_client stm_janus_client;
 
 /*
@@ -83,6 +87,28 @@ stm_status stm_janus_client_unwrap(stm_janus_client *c,
                                      size_t wrapped_len,
                                      void *out_dek,
                                      size_t *inout_dek_len);
+
+/*
+ * Rotate: ask the daemon to generate a fresh DEK and wrap it under
+ * `pool_uuid`/`dataset_id`/`new_key_id`. Returns both the plaintext
+ * DEK (`out_dek`, exactly 32 bytes) and the wrapped blob
+ * (`out_wrapped`, capacity `*inout_wrapped_len`, actual size
+ * `32 + STM_HYBRID_WRAP_OVERHEAD` on success).
+ *
+ * P4-4c: the caller (stm_sync_rotate_dataset_key) writes the wrapped
+ * blob into the keyschema as CURRENT for (dataset_id, new_key_id) and
+ * keeps the plaintext DEK in RAM for encrypt/decrypt. Both values
+ * enter FS memory briefly; the daemon's CSPRNG is the sole source of
+ * the DEK material (ARCH §7.7.2 step 1).
+ */
+STM_MUST_USE
+stm_status stm_janus_client_rotate(stm_janus_client *c,
+                                     const uint8_t pool_uuid[16],
+                                     uint64_t dataset_id,
+                                     uint64_t new_key_id,
+                                     void *out_dek, size_t *inout_dek_len,
+                                     void *out_wrapped,
+                                     size_t *inout_wrapped_len);
 
 void stm_janus_client_disconnect(stm_janus_client *c);
 

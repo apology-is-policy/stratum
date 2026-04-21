@@ -93,7 +93,7 @@ static stm_status spawn_daemon(const uint8_t pool_uuid[16],
     rc = janus_synfs_create(&out->synfs);
     if (rc != STM_OK) { if (b.destroy) b.destroy(b.ctx); return rc; }
 
-    rc = janus_synfs_register_pool(out->synfs, pool_uuid, 0, &b);
+    rc = janus_synfs_register_pool(out->synfs, pool_uuid, &b);
     if (rc != STM_OK) {
         janus_synfs_destroy(out->synfs);
         out->synfs = NULL;

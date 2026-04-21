@@ -260,7 +260,7 @@ static int cmd_serve(int argc, char **argv)
                     i, (int)rc, stm_strerror(rc));
             goto fail_after_synfs;
         }
-        rc = janus_synfs_register_pool(synfs, pools_buf[i].uuid, 0, &b);
+        rc = janus_synfs_register_pool(synfs, pools_buf[i].uuid, &b);
         if (rc != STM_OK) {
             if (b.destroy) b.destroy(b.ctx);
             fprintf(stderr, "serve: register pool failed rc=%d\n", (int)rc);

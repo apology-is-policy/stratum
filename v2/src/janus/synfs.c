@@ -45,36 +45,42 @@ enum {
     KIND_DATASET_DIR   = 5,
     KIND_UNWRAP        = 6,
     KIND_AUDIT_LOG     = 7,
+    KIND_ROTATE        = 8,
 };
 
+/* qid_path layout: kind(8) || pool_idx(28) || dataset_id(28). P4-4c
+ * widens the dataset field from a pool-local INDEX (always 0) to the
+ * actual dataset_id, capped at 2^28-1. Pools with more datasets than
+ * that would need a qid scheme bump; realistic counts stay in the
+ * thousands. */
 #define POOL_IDX_MASK    0x0FFFFFFFu
-#define DATASET_IDX_MASK 0x0FFFFFFFu
+#define DATASET_ID_MASK  0x0FFFFFFFu
 
-static uint64_t qid_of(uint8_t kind, uint32_t pool_idx, uint32_t dataset_idx)
+static uint64_t qid_of(uint8_t kind, uint32_t pool_idx, uint64_t dataset_id)
 {
     return ((uint64_t)kind << 56)
-         | ((uint64_t)(pool_idx    & POOL_IDX_MASK) << 28)
-         | ((uint64_t)(dataset_idx & DATASET_IDX_MASK));
+         | ((uint64_t)(pool_idx & POOL_IDX_MASK) << 28)
+         | (dataset_id & DATASET_ID_MASK);
 }
 
 static uint8_t  qid_kind    (uint64_t q) { return (uint8_t)(q >> 56); }
 static uint32_t qid_pool    (uint64_t q) { return (uint32_t)((q >> 28) & POOL_IDX_MASK); }
-static uint32_t qid_dataset (uint64_t q) { return (uint32_t)(q & DATASET_IDX_MASK); }
+static uint64_t qid_dataset (uint64_t q) { return q & DATASET_ID_MASK; }
 
 /* ── pool + session records ─────────────────────────────────────────── */
 
 #define JANUS_MAX_POOLS        16u
-#define JANUS_MAX_DATASETS      1u  /* P4-4b MVP: one dataset (id=0) per pool */
 
 typedef struct pool_rec {
     int      active;
     uint8_t  pool_uuid[16];
-    uint64_t dataset_id;
     janus_backend backend;
 } pool_rec;
 
 #define JANUS_MAX_SESSIONS     32u
 #define JANUS_SESSION_MAX_REQ  (STM_HYBRID_WRAP_OVERHEAD + 4096u + STM_JANUS_UNWRAP_REQ_HDR)
+/* Rotate's response = dek(32) || wrapped(dek_len + OVERHEAD). Unwrap's
+ * response = dek(= wrapped_len - OVERHEAD). Both must fit JANUS_SESSION_MAX_RESP. */
 #define JANUS_SESSION_MAX_RESP 4096u
 
 /* R11 P2-3: pin the size invariant statically. `stm_hybrid_unwrap`
@@ -89,19 +95,33 @@ _Static_assert(JANUS_SESSION_MAX_REQ
                    + JANUS_SESSION_MAX_RESP
                    + STM_JANUS_UNWRAP_REQ_HDR,
                "unwrap DEK output can exceed resp_buf");
+/* Rotate's response = 32B DEK + (32 + OVERHEAD) wrapped bytes = 64 +
+ * OVERHEAD, and OVERHEAD is ~1160 under PQ-hybrid. Plenty of headroom
+ * in JANUS_SESSION_MAX_RESP, but pin the invariant so a future enlarged
+ * DEK or OVERHEAD can't silently overflow. */
+#define JANUS_ROTATE_DEK_LEN       32u
+#define JANUS_ROTATE_WRAPPED_LEN   (JANUS_ROTATE_DEK_LEN + STM_HYBRID_WRAP_OVERHEAD)
+_Static_assert(JANUS_ROTATE_DEK_LEN + JANUS_ROTATE_WRAPPED_LEN <= JANUS_SESSION_MAX_RESP,
+               "rotate response (dek || wrapped) must fit resp_buf");
 
-typedef struct unwrap_session {
-    int       active;
-    uint32_t  fid;
-    uint32_t  pool_idx;
-    uint32_t  dataset_idx;
-    uint8_t  *req_buf;
-    size_t    req_len;
-    size_t    req_cap;
-    uint8_t  *resp_buf;
-    size_t    resp_len;
-    int       unwrapped;   /* response materialised */
-} unwrap_session;
+typedef enum {
+    SESSION_UNWRAP = 1,
+    SESSION_ROTATE = 2,
+} session_kind;
+
+typedef struct rw_session {
+    int            active;
+    session_kind   kind;
+    uint32_t       fid;
+    uint32_t       pool_idx;
+    uint64_t       dataset_id;
+    uint8_t       *req_buf;
+    size_t         req_len;
+    size_t         req_cap;
+    uint8_t       *resp_buf;
+    size_t         resp_len;
+    int            materialized;   /* response built, ready for Tread */
+} rw_session;
 
 struct janus_synfs {
     pthread_mutex_t mu;           /* guards pools + sessions */
@@ -111,7 +131,7 @@ struct janus_synfs {
     pool_rec         pools[JANUS_MAX_POOLS];
     uint32_t         n_pools;
 
-    unwrap_session   sessions[JANUS_MAX_SESSIONS];
+    rw_session       sessions[JANUS_MAX_SESSIONS];
 
     /* Audit log — contiguous byte buffer, grown by the factor of 2. */
     uint8_t  *audit_buf;
@@ -184,7 +204,7 @@ static pool_rec *pool_at(janus_synfs *s, uint32_t idx)
 
 /* ── session lookup ─────────────────────────────────────────────────── */
 
-static unwrap_session *session_get(janus_synfs *s, uint32_t fid)
+static rw_session *session_get(janus_synfs *s, uint32_t fid)
 {
     for (uint32_t i = 0; i < JANUS_MAX_SESSIONS; i++)
         if (s->sessions[i].active && s->sessions[i].fid == fid)
@@ -192,17 +212,19 @@ static unwrap_session *session_get(janus_synfs *s, uint32_t fid)
     return NULL;
 }
 
-static unwrap_session *session_alloc(janus_synfs *s, uint32_t fid,
-                                       uint32_t pool_idx, uint32_t dataset_idx)
+static rw_session *session_alloc(janus_synfs *s, session_kind kind,
+                                    uint32_t fid,
+                                    uint32_t pool_idx, uint64_t dataset_id)
 {
     for (uint32_t i = 0; i < JANUS_MAX_SESSIONS; i++) {
         if (!s->sessions[i].active) {
-            unwrap_session *u = &s->sessions[i];
+            rw_session *u = &s->sessions[i];
             memset(u, 0, sizeof *u);
             u->active = 1;
+            u->kind = kind;
             u->fid = fid;
             u->pool_idx = pool_idx;
-            u->dataset_idx = dataset_idx;
+            u->dataset_id = dataset_id;
             u->req_cap = JANUS_SESSION_MAX_REQ;
             u->req_buf = calloc(1, u->req_cap);
             if (!u->req_buf) { u->active = 0; return NULL; }
@@ -219,7 +241,7 @@ static unwrap_session *session_alloc(janus_synfs *s, uint32_t fid,
     return NULL;
 }
 
-static void session_free(unwrap_session *u)
+static void session_free(rw_session *u)
 {
     if (!u || !u->active) return;
     if (u->req_buf) {
@@ -325,7 +347,7 @@ static stm_status stat_at(janus_synfs *s, uint64_t qid_path,
 {
     uint8_t k = qid_kind(qid_path);
     uint32_t pi = qid_pool(qid_path);
-    uint32_t di = qid_dataset(qid_path);
+    uint64_t ds = qid_dataset(qid_path);
 
     switch (k) {
     case KIND_ROOT:
@@ -365,17 +387,21 @@ static stm_status stat_at(janus_synfs *s, uint64_t qid_path,
     case KIND_DATASET_DIR: {
         pool_rec *p = pool_at(s, pi);
         if (!p) return STM_ENOENT;
-        if (di != 0) return STM_ENOENT;
         char name[21];
-        snprintf(name, sizeof name, "%llu", (unsigned long long)p->dataset_id);
+        snprintf(name, sizeof name, "%llu", (unsigned long long)ds);
         stat_dir(out, qid_path, name, 0555 | STM_P9_DMDIR);
         return STM_OK;
     }
     case KIND_UNWRAP: {
         pool_rec *p = pool_at(s, pi);
         if (!p) return STM_ENOENT;
-        if (di != 0) return STM_ENOENT;
         stat_file(out, qid_path, "unwrap", 0622, 0);
+        return STM_OK;
+    }
+    case KIND_ROTATE: {
+        pool_rec *p = pool_at(s, pi);
+        if (!p) return STM_ENOENT;
+        stat_file(out, qid_path, "rotate", 0622, 0);
         return STM_OK;
     }
     }
@@ -393,6 +419,26 @@ static int str_eq(const char *s, size_t slen, const char *lit)
 {
     size_t lit_len = strlen(lit);
     return slen == lit_len && memcmp(s, lit, slen) == 0;
+}
+
+/* Parse `name[0..name_len)` as an unsigned decimal up to 2^28-1 (the
+ * dataset-id width in qid_path). Returns 0 on success, -1 on any
+ * non-digit, empty input, overflow, or over-ceiling value. */
+static int parse_dataset_id(const char *name, size_t name_len,
+                             uint64_t *out_id)
+{
+    if (name_len == 0 || name_len > 12) return -1;      /* 2^28 < 10^9 */
+    /* Reject leading zero on multi-char names (strict canonical form). */
+    if (name_len > 1 && name[0] == '0') return -1;
+    uint64_t v = 0;
+    for (size_t i = 0; i < name_len; i++) {
+        char c = name[i];
+        if (c < '0' || c > '9') return -1;
+        v = v * 10u + (uint64_t)(c - '0');
+        if (v > (uint64_t)DATASET_ID_MASK) return -1;
+    }
+    *out_id = v;
+    return 0;
 }
 
 static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
@@ -430,17 +476,18 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
         uint32_t pi = qid_pool(dir_qid_path);
         pool_rec *p = pool_at(s, pi);
         if (!p) return STM_ENOENT;
-        char ds_name[21];
-        snprintf(ds_name, sizeof ds_name, "%llu",
-                 (unsigned long long)p->dataset_id);
-        if (!str_eq(name, name_len, ds_name)) return STM_ENOENT;
-        return stat_at(s, qid_of(KIND_DATASET_DIR, pi, 0), out);
+        uint64_t ds = 0;
+        if (parse_dataset_id(name, name_len, &ds) != 0) return STM_ENOENT;
+        return stat_at(s, qid_of(KIND_DATASET_DIR, pi, ds), out);
     }
     case KIND_DATASET_DIR: {
         uint32_t pi = qid_pool(dir_qid_path);
+        uint64_t ds = qid_dataset(dir_qid_path);
         if (!pool_at(s, pi)) return STM_ENOENT;
         if (str_eq(name, name_len, "unwrap"))
-            return stat_at(s, qid_of(KIND_UNWRAP, pi, 0), out);
+            return stat_at(s, qid_of(KIND_UNWRAP, pi, ds), out);
+        if (str_eq(name, name_len, "rotate"))
+            return stat_at(s, qid_of(KIND_ROTATE, pi, ds), out);
         return STM_ENOENT;
     }
     }
@@ -485,14 +532,20 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
         return emit(cb, cb_ctx, s, qid_of(KIND_DATASETS_DIR, pi, 0));
     }
     case KIND_DATASETS_DIR: {
+        /* P4-4c: the daemon does not enumerate datasets — the
+         * authoritative list lives in the FS keyschema. readdir
+         * returns empty. Clients walk directly by numeric dataset_id. */
         uint32_t pi = qid_pool(dir_qid_path);
         if (!pool_at(s, pi)) return STM_ENOENT;
-        return emit(cb, cb_ctx, s, qid_of(KIND_DATASET_DIR, pi, 0));
+        return STM_OK;
     }
     case KIND_DATASET_DIR: {
         uint32_t pi = qid_pool(dir_qid_path);
+        uint64_t ds = qid_dataset(dir_qid_path);
         if (!pool_at(s, pi)) return STM_ENOENT;
-        return emit(cb, cb_ctx, s, qid_of(KIND_UNWRAP, pi, 0));
+        stm_status rc = emit(cb, cb_ctx, s, qid_of(KIND_UNWRAP, pi, ds));
+        if (rc != STM_OK) return rc;
+        return emit(cb, cb_ctx, s, qid_of(KIND_ROTATE, pi, ds));
     }
     }
     return STM_ENOENT;
@@ -517,17 +570,19 @@ static stm_status vops_open(void *ctx, uint32_t fid, uint64_t qid_path,
     case KIND_AUDIT_LOG:
         if (mode != STM_P9_OREAD) return STM_EACCES;
         return STM_OK;
-    case KIND_UNWRAP: {
+    case KIND_UNWRAP:
+    case KIND_ROTATE: {
         uint32_t pi = qid_pool(qid_path);
-        uint32_t di = qid_dataset(qid_path);
+        uint64_t ds = qid_dataset(qid_path);
         pool_rec *p = pool_at(s, pi);
         if (!p) return STM_ENOENT;
         if (mode != STM_P9_ORDWR) return STM_EACCES;
+        session_kind kind = (k == KIND_UNWRAP) ? SESSION_UNWRAP : SESSION_ROTATE;
         pthread_mutex_lock(&s->mu);
         /* Clear any session with the same fid (new open supersedes). */
-        unwrap_session *u = session_get(s, fid);
+        rw_session *u = session_get(s, fid);
         if (u) session_free(u);
-        u = session_alloc(s, fid, pi, di);
+        u = session_alloc(s, kind, fid, pi, ds);
         pthread_mutex_unlock(&s->mu);
         if (!u) return STM_ENOMEM;
         return STM_OK;
@@ -536,28 +591,32 @@ static stm_status vops_open(void *ctx, uint32_t fid, uint64_t qid_path,
     return STM_ENOENT;
 }
 
-/* Run the backend unwrap and populate session->resp_buf. Called
- * lazily on the first Tread after a Twrite. */
-static stm_status materialize_unwrap_locked(janus_synfs *s,
-                                              unwrap_session *u)
+/* Decode an LE u64 from the start of req_buf. */
+static uint64_t req_u64_le(const rw_session *u)
+{
+    uint64_t v = 0;
+    for (size_t i = 0; i < 8; i++)
+        v |= (uint64_t)u->req_buf[i] << (i * 8);
+    return v;
+}
+
+/* Materialize a SESSION_UNWRAP request. Request = key_id(8) ‖ wrapped;
+ * response = DEK. */
+static stm_status materialize_unwrap_locked(janus_synfs *s, rw_session *u)
 {
     if (u->req_len < STM_JANUS_UNWRAP_REQ_HDR) return STM_EPROTOCOL;
-    uint64_t key_id = 0;
-    for (size_t i = 0; i < 8; i++)
-        key_id |= (uint64_t)u->req_buf[i] << (i * 8);
+    uint64_t key_id = req_u64_le(u);
     const uint8_t *wrapped = u->req_buf + STM_JANUS_UNWRAP_REQ_HDR;
     size_t wrapped_len = u->req_len - STM_JANUS_UNWRAP_REQ_HDR;
 
     pool_rec *p = pool_at(s, u->pool_idx);
     if (!p) return STM_ENOENT;
-    if (u->dataset_idx != 0) return STM_ENOENT;  /* MVP */
     if (!p->backend.unwrap) return STM_EBACKEND;
 
-    size_t dek_cap = JANUS_SESSION_MAX_RESP;
-    size_t dek_len = dek_cap;
+    size_t dek_len = JANUS_SESSION_MAX_RESP;
     stm_status rc = p->backend.unwrap(p->backend.ctx,
                                         p->pool_uuid,
-                                        p->dataset_id,
+                                        u->dataset_id,
                                         key_id,
                                         wrapped, wrapped_len,
                                         u->resp_buf, &dek_len);
@@ -566,17 +625,88 @@ static stm_status materialize_unwrap_locked(janus_synfs *s,
     if (rc != STM_OK) {
         janus_synfs_auditf(s, "unwrap pool=%s ds=%llu key=%llu FAIL rc=%d",
                            uuid_s,
-                           (unsigned long long)p->dataset_id,
+                           (unsigned long long)u->dataset_id,
                            (unsigned long long)key_id, (int)rc);
         return rc;
     }
     u->resp_len = dek_len;
-    u->unwrapped = 1;
+    u->materialized = 1;
     janus_synfs_auditf(s, "unwrap pool=%s ds=%llu key=%llu OK len=%zu",
                        uuid_s,
-                       (unsigned long long)p->dataset_id,
+                       (unsigned long long)u->dataset_id,
                        (unsigned long long)key_id, dek_len);
     return STM_OK;
+}
+
+/* Materialize a SESSION_ROTATE request. Request = new_key_id(8);
+ * response = DEK(32) ‖ wrapped. The daemon generates the DEK via
+ * CSPRNG and wraps it under (pool_uuid, dataset_id, new_key_id).
+ *
+ * Callers already hold s->mu; req/resp buffers belong to the session. */
+static stm_status materialize_rotate_locked(janus_synfs *s, rw_session *u)
+{
+    if (u->req_len != STM_JANUS_ROTATE_REQ_HDR) return STM_EPROTOCOL;
+    uint64_t new_key_id = req_u64_le(u);
+
+    pool_rec *p = pool_at(s, u->pool_idx);
+    if (!p) return STM_ENOENT;
+    if (!p->backend.wrap) return STM_EBACKEND;
+
+    /* Generate fresh DEK. Stage in a local buffer (not directly in
+     * resp_buf) so a wrap failure doesn't leak a half-valid response. */
+    uint8_t dek[JANUS_ROTATE_DEK_LEN];
+    stm_random_bytes(dek, sizeof dek);
+
+    uint8_t wrapped[JANUS_ROTATE_WRAPPED_LEN];
+    size_t  wrapped_len = sizeof wrapped;
+    stm_status rc = p->backend.wrap(p->backend.ctx,
+                                      p->pool_uuid,
+                                      u->dataset_id,
+                                      new_key_id,
+                                      dek, sizeof dek,
+                                      wrapped, &wrapped_len);
+    char uuid_s[37];
+    uuid_hex(p->pool_uuid, uuid_s);
+    if (rc != STM_OK) {
+        stm_ct_memzero(dek, sizeof dek);
+        stm_ct_memzero(wrapped, sizeof wrapped);
+        janus_synfs_auditf(s, "rotate pool=%s ds=%llu key=%llu FAIL rc=%d",
+                           uuid_s,
+                           (unsigned long long)u->dataset_id,
+                           (unsigned long long)new_key_id, (int)rc);
+        return rc;
+    }
+    if (wrapped_len != JANUS_ROTATE_WRAPPED_LEN) {
+        stm_ct_memzero(dek, sizeof dek);
+        stm_ct_memzero(wrapped, sizeof wrapped);
+        janus_synfs_auditf(s, "rotate pool=%s ds=%llu key=%llu FAIL wrapped_len=%zu",
+                           uuid_s,
+                           (unsigned long long)u->dataset_id,
+                           (unsigned long long)new_key_id, wrapped_len);
+        return STM_EBACKEND;
+    }
+
+    /* Lay out resp as dek || wrapped. */
+    memcpy(u->resp_buf, dek, sizeof dek);
+    memcpy(u->resp_buf + sizeof dek, wrapped, wrapped_len);
+    stm_ct_memzero(dek, sizeof dek);
+    stm_ct_memzero(wrapped, sizeof wrapped);
+    u->resp_len = sizeof dek + wrapped_len;
+    u->materialized = 1;
+    janus_synfs_auditf(s, "rotate pool=%s ds=%llu key=%llu OK",
+                       uuid_s,
+                       (unsigned long long)u->dataset_id,
+                       (unsigned long long)new_key_id);
+    return STM_OK;
+}
+
+static stm_status materialize_locked(janus_synfs *s, rw_session *u)
+{
+    switch (u->kind) {
+    case SESSION_UNWRAP: return materialize_unwrap_locked(s, u);
+    case SESSION_ROTATE: return materialize_rotate_locked(s, u);
+    }
+    return STM_EBACKEND;
 }
 
 static stm_status vops_read(void *ctx, uint32_t fid, uint64_t qid_path,
@@ -612,15 +742,16 @@ static stm_status vops_read(void *ctx, uint32_t fid, uint64_t qid_path,
         pthread_mutex_unlock(&s->audit_mu);
         return STM_OK;
     }
-    case KIND_UNWRAP: {
+    case KIND_UNWRAP:
+    case KIND_ROTATE: {
         pthread_mutex_lock(&s->mu);
-        unwrap_session *u = session_get(s, fid);
+        rw_session *u = session_get(s, fid);
         if (!u) {
             pthread_mutex_unlock(&s->mu);
             return STM_EBACKEND;  /* should not happen — open gated this */
         }
-        if (!u->unwrapped) {
-            stm_status rc = materialize_unwrap_locked(s, u);
+        if (!u->materialized) {
+            stm_status rc = materialize_locked(s, u);
             if (rc != STM_OK) {
                 pthread_mutex_unlock(&s->mu);
                 return rc;
@@ -648,19 +779,19 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
 {
     janus_synfs *s = ctx;
     uint8_t k = qid_kind(qid_path);
-    if (k != KIND_UNWRAP) return STM_EACCES;
+    if (k != KIND_UNWRAP && k != KIND_ROTATE) return STM_EACCES;
 
     pthread_mutex_lock(&s->mu);
-    unwrap_session *u = session_get(s, fid);
+    rw_session *u = session_get(s, fid);
     if (!u) {
         pthread_mutex_unlock(&s->mu);
         return STM_EBACKEND;
     }
     /* Fresh Twrite after a read: start over. */
-    if (u->unwrapped) {
+    if (u->materialized) {
         u->req_len = 0;
         u->resp_len = 0;
-        u->unwrapped = 0;
+        u->materialized = 0;
         stm_ct_memzero(u->resp_buf, JANUS_SESSION_MAX_RESP);
     }
     /* Only append-at-end is supported. */
@@ -684,7 +815,7 @@ static void vops_clunk(void *ctx, uint32_t fid, uint64_t qid_path)
     janus_synfs *s = ctx;
     (void)qid_path;
     pthread_mutex_lock(&s->mu);
-    unwrap_session *u = session_get(s, fid);
+    rw_session *u = session_get(s, fid);
     if (u) session_free(u);
     pthread_mutex_unlock(&s->mu);
 }
@@ -721,7 +852,6 @@ stm_status janus_synfs_create(janus_synfs **out)
 
 stm_status janus_synfs_register_pool(janus_synfs *s,
                                       const uint8_t pool_uuid[16],
-                                      uint64_t dataset_id,
                                       janus_backend *backend)
 {
     if (!s || !pool_uuid || !backend) return STM_EINVAL;
@@ -732,7 +862,6 @@ stm_status janus_synfs_register_pool(janus_synfs *s,
     memset(p, 0, sizeof *p);
     p->active = 1;
     memcpy(p->pool_uuid, pool_uuid, 16);
-    p->dataset_id = dataset_id;
     janus_backend_move(&p->backend, backend);
     s->n_pools++;
     return STM_OK;
