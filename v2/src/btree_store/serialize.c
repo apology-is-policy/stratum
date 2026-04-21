@@ -489,9 +489,15 @@ static int child_record_cb(const uint8_t bptr[STM_BTNODE_CHILD_BPTR_SIZE],
     return 0;
 }
 
-/* Verify that the buffer's trailing self-csum matches `expected`. */
-static inline stm_status check_node_csum(const uint8_t *buf,
-                                           const uint8_t expected[32])
+/* R8-P2-3: verifies the Merkle LINK — the node's trailing 32 bytes
+ * equal the expected value recorded in a parent bptr / uberblock.
+ * It does NOT re-hash the node bytes; that job belongs to
+ * btnode_verify_csum inside stm_btnode_{leaf,internal}_decode, which
+ * stm_btnode_peek chains into. Both checks are needed: node-self-csum
+ * catches bit rot, and check_merkle_link catches an attacker
+ * substituting a well-formed alternative node at the victim paddr. */
+static inline stm_status check_merkle_link(const uint8_t *buf,
+                                             const uint8_t expected[32])
 {
     if (!expected) return STM_OK;
     uint8_t actual[32];
@@ -522,7 +528,7 @@ stm_status stm_btree_store_deserialize(stm_btree_mt *t, uint64_t root_paddr,
      * Both checks are needed: self-csum catches tampering of the
      * on-disk node bytes, Merkle-match catches substitution of a
      * well-formed stale or attacker-controlled node. */
-    s = check_node_csum(buf, expected_root_csum);
+    s = check_merkle_link(buf, expected_root_csum);
     if (s != STM_OK) { free(buf); return s; }
 
     stm_btnode_info info;
@@ -579,7 +585,7 @@ stm_status stm_btree_store_deserialize(stm_btree_mt *t, uint64_t root_paddr,
         if (s != STM_OK) break;
         /* Merkle check: each child's self-csum must match the parent
          * internal node's bp_csum record. */
-        s = check_node_csum(leafbuf, &cc.child_csums[i * 32]);
+        s = check_merkle_link(leafbuf, &cc.child_csums[i * 32]);
         if (s != STM_OK) break;
         s = deserialize_leaf(t, leafbuf, &ic);
         if (s != STM_OK) break;
@@ -620,14 +626,25 @@ stm_status stm_btree_store_free_tree(uint64_t root_paddr, uint64_t free_gen,
     }
 
     /* INTERNAL root. Enumerate children; free each (must be LEAF per
-     * the two-level invariant); then free the internal itself. */
+     * the two-level invariant); then free the internal itself.
+     *
+     * R8-P0-1: `child_record_cb` unconditionally writes 32 bytes into
+     * `cc.child_csums` per enumeration. The previous revision didn't
+     * allocate this buffer on the free_tree path (only on the
+     * deserialize path), causing a deterministic segfault on the
+     * first multi-leaf commit cycle after P4-1 landed. We don't
+     * actually USE the csums here — free_tree only needs paddrs —
+     * but allocating the buffer symmetrically is the cheap fix and
+     * keeps the callback usable everywhere. */
     uint32_t cap = info.n_entries + 1u;
     child_collect cc = { 0 };
     cc.child_paddrs = calloc(cap, sizeof *cc.child_paddrs);
     cc.child_kinds  = calloc(cap, sizeof *cc.child_kinds);
+    cc.child_csums  = calloc((size_t)cap * 32u, sizeof *cc.child_csums);
     cc.cap          = cap;
-    if (!cc.child_paddrs || !cc.child_kinds) {
-        free(cc.child_paddrs); free(cc.child_kinds); free(buf);
+    if (!cc.child_paddrs || !cc.child_kinds || !cc.child_csums) {
+        free(cc.child_paddrs); free(cc.child_kinds); free(cc.child_csums);
+        free(buf);
         return STM_ENOMEM;
     }
 
@@ -636,7 +653,7 @@ stm_status stm_btree_store_free_tree(uint64_t root_paddr, uint64_t free_gen,
     if (s == STM_OK && cc.err != STM_OK) s = cc.err;
     free(buf);
     if (s != STM_OK) {
-        free(cc.child_paddrs); free(cc.child_kinds);
+        free(cc.child_paddrs); free(cc.child_kinds); free(cc.child_csums);
         return s;
     }
 
@@ -650,6 +667,7 @@ stm_status stm_btree_store_free_tree(uint64_t root_paddr, uint64_t free_gen,
     }
     free(cc.child_paddrs);
     free(cc.child_kinds);
+    free(cc.child_csums);
     if (s != STM_OK) return s;
 
     return vt->free(vt_ctx, root_paddr, free_gen);

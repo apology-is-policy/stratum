@@ -33,11 +33,11 @@
 #include <stratum/sync.h>
 #include <stratum/alloc.h>
 #include <stratum/block.h>
+#include <stratum/crypto.h>
 #include <stratum/hash.h>
 #include <stratum/super.h>
 
 #include <pthread.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -92,16 +92,21 @@ struct stm_sync {
  *
  * Phase 3 has only the allocator tree; the other three are zero.
  * The field placement mirrors ARCH §7.11.3's formula, so when we
- * wire main/snap/cas in Phase 5/6 the math doesn't change. */
-static void compute_merkle_root(const uint8_t main_csum[32],
-                                  const uint8_t alloc_csum[32],
-                                  const uint8_t snap_csum[32],
-                                  const uint8_t cas_csum[32],
-                                  const uint8_t salt[32],
-                                  uint8_t out[32])
+ * wire main/snap/cas in Phase 5/6 the math doesn't change.
+ *
+ * R8-P1-1: returns STM_ENOMEM on BLAKE3 context allocation failure
+ * so callers can refuse the commit/mount rather than silently write
+ * (and recompute-match) an all-zero root — which would be a narrow
+ * but real Merkle-bypass window under persistent OOM. */
+static stm_status compute_merkle_root(const uint8_t main_csum[32],
+                                        const uint8_t alloc_csum[32],
+                                        const uint8_t snap_csum[32],
+                                        const uint8_t cas_csum[32],
+                                        const uint8_t salt[32],
+                                        uint8_t out[32])
 {
     stm_blake3_ctx *h = stm_blake3_new();
-    if (!h) { memset(out, 0, 32); return; }
+    if (!h) return STM_ENOMEM;
     stm_blake3_update(h, main_csum,  32);
     stm_blake3_update(h, alloc_csum, 32);
     stm_blake3_update(h, snap_csum,  32);
@@ -109,18 +114,7 @@ static void compute_merkle_root(const uint8_t main_csum[32],
     stm_blake3_update(h, salt,       32);
     stm_blake3_final(h, out, 32);
     stm_blake3_free(h);
-}
-
-/* Fill `out` with 32 cryptographically-random bytes from the host
- * OS. Uses /dev/urandom directly so stm_sync doesn't need to link
- * stm_crypto (libsodium) just for one call. */
-static stm_status fill_random(uint8_t out[32])
-{
-    FILE *f = fopen("/dev/urandom", "rb");
-    if (!f) return STM_EIO;
-    size_t n = fread(out, 1u, 32u, f);
-    fclose(f);
-    return (n == 32u) ? STM_OK : STM_EIO;
+    return STM_OK;
 }
 
 /* ========================================================================= */
@@ -233,12 +227,11 @@ stm_status stm_sync_create(stm_bdev *d, stm_alloc *a,
 
     /* P4-1: generate the pool's Merkle salt once, at format time.
      * The salt is persisted in ub_merkle_root_salt and stays stable
-     * across the pool's lifetime. */
-    stm_status rs = fill_random(s->merkle_salt);
-    if (rs != STM_OK) {
-        stm_sync_close(s);
-        return rs;
-    }
+     * across the pool's lifetime. R8-P2-2: use libsodium via
+     * stm_random_bytes instead of reading /dev/urandom directly —
+     * gives us getrandom(2) on Linux, arc4random on BSD, and
+     * consistent cross-platform behavior. */
+    stm_random_bytes(s->merkle_salt, 32);
 
     *out_sync = s;
     return STM_OK;
@@ -291,15 +284,23 @@ stm_status stm_sync_open(stm_bdev *d, stm_alloc *a, stm_sync **out_sync)
      * uberblock. An offline edit that swapped either the salt,
      * a tree-root csum, or the merkle_root field would break this.
      * (A coordinated edit to all three would pass this check but
-     * fails the tree-node self-csum check on the first read.) */
+     * fails the tree-node self-csum check on the first read.)
+     *
+     * R8-P1-1: on BLAKE3 OOM, refuse the mount entirely (rather
+     * than computing an all-zero root which might coincidentally
+     * match a tampered UB). */
     uint8_t  zeros32[32] = { 0 };
     uint8_t  recomputed[32];
-    compute_merkle_root(zeros32,                       /* main */
-                         ub.ub_alloc_root.bp_csum,
-                         zeros32,                       /* snap */
-                         zeros32,                       /* cas  */
-                         ub.ub_merkle_root_salt,
-                         recomputed);
+    stm_status ms = compute_merkle_root(zeros32,     /* main */
+                                          ub.ub_alloc_root.bp_csum,
+                                          zeros32,     /* snap */
+                                          zeros32,     /* cas  */
+                                          ub.ub_merkle_root_salt,
+                                          recomputed);
+    if (ms != STM_OK) {
+        stm_sync_close(s2);
+        return ms;
+    }
     if (memcmp(recomputed, ub.ub_merkle_root, 32) != 0) {
         stm_sync_close(s2);
         return STM_ECORRUPT;
@@ -400,15 +401,23 @@ stm_status stm_sync_commit(stm_sync *s)
     /* P4-1: compute the pool Merkle root over the set of tree-root
      * csums + the per-pool salt. Phase 3 populates only the
      * allocator tree; main/snap/cas contribute zeros and will
-     * populate in Phase 5+. */
+     * populate in Phase 5+.
+     *
+     * R8-P1-1: refuse to commit if BLAKE3 context allocation fails.
+     * Writing a zero merkle_root on OOM would match a future mount
+     * that also OOMs → silent integrity bypass. */
     uint8_t zeros32[32] = { 0 };
     uint8_t new_merkle_root[32];
-    compute_merkle_root(zeros32,                 /* main */
-                         alloc_root_csum,
-                         zeros32,                 /* snap */
-                         zeros32,                 /* cas  */
-                         s->merkle_salt,
-                         new_merkle_root);
+    stm_status ms = compute_merkle_root(zeros32,   /* main */
+                                          alloc_root_csum,
+                                          zeros32,   /* snap */
+                                          zeros32,   /* cas  */
+                                          s->merkle_salt,
+                                          new_merkle_root);
+    if (ms != STM_OK) {
+        pthread_mutex_unlock(&s->lock);
+        return ms;
+    }
 
     /* Phase: Final — write the new uberblock to the next ring slot,
      * fsynced. This is the commit point per sync.tla. Ring rotation:

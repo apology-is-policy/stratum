@@ -126,11 +126,13 @@ stm_status stm_alloc_open_blank(stm_bdev *d, stm_alloc **out_alloc);
  * stm_alloc_open_blank'd handle. root_paddr = 0 is a valid no-op
  * (leaves the tree empty).
  *
- * If `expected_root_csum` is non-NULL, the 32-byte BLAKE3 self-csum
- * of the on-disk root node is verified against it (P4-1 Merkle
- * chain). A mismatch returns STM_ECORRUPT. Pass NULL to skip the
- * Merkle check — production callers should always supply from
- * `ub_alloc_root.bp_csum`.
+ * `expected_root_csum` is REQUIRED (non-NULL, 32 bytes). The
+ * on-disk root node's BLAKE3 self-csum is verified against it —
+ * this is the Merkle-chain link from the uberblock's
+ * `ub_alloc_root.bp_csum` into the tree (P4-1). Passing NULL
+ * returns STM_EINVAL: without the expected csum, a later commit
+ * would propagate a zero csum to the uberblock and wedge the pool
+ * at the subsequent mount's tree-load Merkle check (R8-P1-2).
  *
  * Returns STM_ECORRUPT on node read / csum / Merkle / ordering
  * failures, STM_ENOTSUPPORTED if the on-disk tree exceeds two

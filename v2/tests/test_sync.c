@@ -16,6 +16,7 @@
 #include <stratum/alloc.h>
 #include <stratum/block.h>
 #include <stratum/bootstrap.h>
+#include <stratum/btnode.h>
 #include <stratum/super.h>
 #include <stratum/sync.h>
 
@@ -426,6 +427,74 @@ static void tamper_byte_at(const char *path, uint64_t off, uint8_t xor_mask)
     b ^= xor_mask;
     STM_ASSERT_EQ(fwrite(&b, 1u, 1u, f), (size_t)1);
     fclose(f);
+}
+
+/* R8-P2-1: write a well-formed alternative node at the tree-root
+ * paddr. Its own self-csum (btnode_verify_csum) passes because we
+ * re-encoded it, but its trailing bytes differ from the expected
+ * value recorded in ub_alloc_root.bp_csum. This exercises the
+ * Merkle-link check (check_merkle_link) specifically, not the
+ * per-node self-csum.
+ *
+ * Constructs a fresh leaf node by calling stm_btnode_leaf_encode
+ * with a different entry set, overwrites the on-disk tree root,
+ * then remounts. The expected outcome is STM_ECORRUPT from the
+ * Merkle-chain deserialize path. */
+STM_TEST(sync_tamper_substitutes_well_formed_node) {
+    make_tmp("tamper_sub");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL;
+    make_fresh_pool(d, &a, &s);
+
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    teardown(a, s);
+    stm_bdev_close(d);
+
+    stm_uberblock ub;
+    uint64_t ub_off = 0;
+    read_live_ub(g_tmp_path, &ub, &ub_off);
+    uint64_t alloc_root_paddr = stm_load_le64(ub.ub_alloc_root.bp_paddr);
+    STM_ASSERT(alloc_root_paddr != 0);
+
+    /* Build a valid-but-different leaf node (zero entries → empty
+     * leaf, distinct from the one we just committed with one
+     * entry). */
+    uint8_t *sub = calloc(1, STM_BTNODE_SIZE);
+    STM_ASSERT(sub != NULL);
+    STM_ASSERT_OK(stm_btnode_leaf_encode(NULL, 0u, /*gen=*/0u,
+                                            /*tree_id=*/0u,
+                                            sub, STM_BTNODE_SIZE));
+
+    /* Overwrite the on-disk root. */
+    FILE *f = fopen(g_tmp_path, "rb+");
+    STM_ASSERT(f != NULL);
+    uint64_t tree_byte_off = stm_paddr_offset(alloc_root_paddr)
+                              * (uint64_t)STM_UB_SIZE;
+    STM_ASSERT_EQ(fseeko(f, (off_t)tree_byte_off, SEEK_SET), 0);
+    STM_ASSERT_EQ(fwrite(sub, 1u, STM_BTNODE_SIZE, f),
+                  (size_t)STM_BTNODE_SIZE);
+    fclose(f);
+    free(sub);
+
+    /* Remount. The substitute node's btnode self-csum PASSES (we
+     * re-encoded it). But its trailing 32 bytes are the csum of
+     * the EMPTY leaf, not the one-entry leaf originally committed —
+     * so check_merkle_link against ub_alloc_root.bp_csum fails. */
+    stm_bdev_open_opts opts = stm_bdev_open_opts_default();
+    stm_bdev *d2 = NULL;
+    STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &opts, &d2));
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d2, &a2));
+    stm_sync *s2 = NULL;
+    stm_status ms = stm_sync_open(d2, a2, &s2);
+    STM_ASSERT_ERR(ms, STM_ECORRUPT);
+    STM_ASSERT(s2 == NULL);
+
+    stm_alloc_close(a2);
+    stm_bdev_close(d2);
+    unlink(g_tmp_path);
 }
 
 STM_TEST(sync_tamper_tree_node_surfaces_on_mount) {

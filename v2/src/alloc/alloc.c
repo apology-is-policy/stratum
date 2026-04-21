@@ -555,6 +555,16 @@ stm_status stm_alloc_load_tree_at(stm_alloc *a, uint64_t root_paddr,
 {
     if (!a) return STM_EINVAL;
     if (root_paddr == 0) return STM_OK;   /* no tree to load */
+    /* R8-P1-2: require non-NULL csum. Accepting NULL would leave
+     * `current_tree_csum = zeros` and `tree_dirty = false`; the
+     * next commit would skip the tree rewrite path and hand a
+     * zeros bp_csum to sync_commit. The subsequent mount would
+     * compute a merkle_root over those zeros (matching the stored
+     * one from the same commit), but then fail the tree-load Merkle
+     * check against the REAL root-node's hash — wedging the pool
+     * permanently. Production callers (stm_sync_open) always supply
+     * ub_alloc_root.bp_csum; enforce. */
+    if (!expected_root_csum) return STM_EINVAL;
 
     pthread_mutex_lock(&a->lock);
     store_ctx scx = { .boot = a->boot, .bdev = a->bdev };
@@ -563,11 +573,7 @@ stm_status stm_alloc_load_tree_at(stm_alloc *a, uint64_t root_paddr,
                                                  &ALLOC_STORE_VT, &scx);
     if (s == STM_OK) {
         a->current_tree_root = root_paddr;
-        if (expected_root_csum) {
-            memcpy(a->current_tree_csum, expected_root_csum, 32);
-        } else {
-            memset(a->current_tree_csum, 0, 32);
-        }
+        memcpy(a->current_tree_csum, expected_root_csum, 32);
         /* A loaded tree is NOT dirty — on-disk matches RAM. */
         a->tree_dirty = false;
         /* Accel was empty (new handle); rebuild on first query. */
