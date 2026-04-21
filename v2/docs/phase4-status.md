@@ -110,6 +110,15 @@ cmake -B build-asan -S . -DSTM_SANITIZE=asan \
     -DSTM_ENABLE_IOURING=OFF -DSTM_ENABLE_PQ=OFF
 cmake --build build-asan -j
 ctest --test-dir build-asan --output-on-failure
+
+# All TLA+ specs (includes merkle after P4-6)
+export PATH="/opt/homebrew/opt/openjdk/bin:$PATH"
+cd specs
+for s in sync concurrency structural balanced merge allocator merkle; do
+    echo "== $s =="
+    java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
+        -config $s.cfg $s.tla 2>&1 | tail -3
+done
 ```
 
 ## Trip hazards carrying into Phase 4

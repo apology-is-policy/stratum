@@ -113,7 +113,7 @@ STM_BT_LF_LONG_SEC=3600 ctest --test-dir build-tsan -R btree_lf --timeout 4000
 # All TLA+ specs
 export PATH="/opt/homebrew/opt/openjdk/bin:$PATH"
 cd specs
-for s in sync concurrency structural balanced merge allocator; do
+for s in sync concurrency structural balanced merge allocator merkle; do
     echo "== $s =="
     java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
         -config $s.cfg $s.tla 2>&1 | tail -3
