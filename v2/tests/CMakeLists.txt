@@ -54,3 +54,9 @@ stm_add_test(test_sync       test_sync.c)
 stm_add_test(test_fs         test_fs.c)
 stm_add_test(test_sdarray    test_sdarray.c)
 stm_add_test(test_xor_filter test_xor_filter.c)
+stm_add_test(test_crash_inject test_crash_inject.c)
+
+# The crash-injection fuzzer runs ~168 independent format+mount+unmount
+# cycles and takes ~25 s on default, ~42 s under ASan/TSan. Bump the
+# timeout so it has headroom on slower CI hardware.
+set_tests_properties(test_crash_inject PROPERTIES TIMEOUT 180)

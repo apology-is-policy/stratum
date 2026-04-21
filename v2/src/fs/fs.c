@@ -32,6 +32,7 @@
  */
 
 #include <stratum/fs.h>
+#include <stratum/fs_testing.h>
 #include <stratum/alloc.h>
 #include <stratum/block.h>
 #include <stratum/bootstrap.h>
@@ -345,4 +346,15 @@ void stm_fs_mark_wedged(stm_fs *fs)
     pthread_mutex_lock(&fs->lock);
     fs->wedged = true;
     pthread_mutex_unlock(&fs->lock);
+}
+
+/* ========================================================================= */
+/* Test-only accessors.                                                       */
+/* ========================================================================= */
+
+/* Chunk 8: exposed to the crash-injection fuzzer. The caller must
+ * not retain the pointer across stm_fs_unmount. */
+stm_bdev *stm_fs_bdev_for_test(stm_fs *fs)
+{
+    return fs ? fs->bdev : NULL;
 }
