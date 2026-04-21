@@ -25,6 +25,7 @@ Phase 3 is in progress. Thirteen commits landed. Chunks 4c / 4d / 4e /
 | `00d796e` → `b70537d` | **Chunk 6 + R7d**: `stm_sync` — four-phase commit protocol (sync.tla-aligned). R7d closed (2 P0 / 1 P1 / 3 P2 — ub_alloc_root now sole authoritative source; user_data tree-root dead-coded out). | 8 sync tests |
 | `e45818b` → `dfe04b7` | **Chunk 7 + R7e**: `stm_fs` — top-level mount/unmount lifecycle. Format → mount → reserve → commit → unmount → remount. R7e closed (1 P0 / 1 P1 / 3 P2 / 6 P3). P0-1 was the "POSIX-bdev close-without-commit hang" — actually a `FS_GUARD_WRITE` unlock-on-refusal bug, not a bdev issue. P1-1 wiped stale uberblock ring on reformat. RO + wedged end-to-end tests restored. | 9 fs tests |
 | `deec70d` | **Chunk 4c**: `stm_sdarray` — Elias-Fano succinct encoding of a sorted 64-bit set. High bits as unary bitmap, low bits packed, exact-bit-position select samples every 64 ones → O(1) select, O(log m) rank/contains. Standalone module; integration into allocator query path deferred to chunk 4e. | 14 sdarray tests |
+| `1cd9f3f` | **Chunk 4d**: `stm_xor_filter` — xor8 approximate-membership filter (Graf & Lemire 2020). ~9.84 bits/item, <0.4% FPR, O(1) query. Peeling builder with splitmix64 hashing + up-to-64 seed retries. Standalone module; integration with chunk 4e. | 10 xor_filter tests |
 
 Phase 2 is complete (SPLIT + MERGE + per-node consolidator + SCAN + R0-R6
 audits). Phase 3 chunks remaining:
@@ -126,12 +127,13 @@ Expected TLC results:
 - `merge.tla` — empty-leaf reabsorb. 65536 states, depth 18.
 - `allocator.tla` — refcount + deferred-free. 3729 states, depth 16.
 
-## Next chunk — 4d / 4e / 8
+## Next chunk — 4e / 8
 
-Chunk 4c landed at `deec70d` with a standalone SDArray module. The
-integration into the allocator's query path is chunk 4e's
-responsibility — the audit surface lives at integration, not at the
-pure data-structure module.
+Chunks 4c and 4d landed as standalone data-structure modules
+(`stm_sdarray` at `deec70d`, `stm_xor_filter` at `1cd9f3f`). Chunk
+4e wires them into stm_alloc's lookup / contains path — the
+audit-triggering surface — and kicks off the R7 full-stack audit
+closing the allocator subsystem.
 
 ### Remaining Phase 3 work, in order:
 
@@ -152,8 +154,9 @@ Merkle integrity populating ub_merkle_root + bp_csum).
   density > 50% is deferred post-Phase-3 optimization.
 
 ### Chunk 4d: xor filter for negative lookups.
-- 9 bits per allocated range, <1% false-positive rate. Fast
-  "is this paddr in any live range?"
+- LANDED at `1cd9f3f`. `src/alloc/xor_filter.c` + public header.
+  xor8 construction: ~9.84 bits/item, <0.4% FPR, O(1) query.
+  Peeling builder, splitmix64 hashing, seed-retry loop.
 
 ### Chunk 4e: R7 full-stack audit.
 - Closes the allocator subsystem's audit rounds after the in-RAM
