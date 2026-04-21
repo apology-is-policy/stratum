@@ -60,8 +60,20 @@ extern "C" {
  * structured header + bptr pointing at a Merkle-chained key-schema
  * sub-tree (ARCH §7.7.3). Wrapped dataset keys now live in the
  * sub-tree, never on disk in plaintext. Pool mounts now require a
- * keyfile (the "file" backend; janus replaces this in P4-4b). */
-#define STM_UB_VERSION        4u
+ * keyfile (the "file" backend; janus replaces this in P4-4b).
+ *
+ * v4 → v5 (Phase 5 chunk P5-1): ub_roster[2048], ub_roster_hash,
+ * ub_device_count, ub_device_id, ub_device_class, ub_device_role
+ * become mandatory and populated for every pool (ARCH §4.3, §5.13).
+ * A v5 pool's uberblock carries the full device roster on every
+ * device — any single device is sufficient to reconstruct pool
+ * membership (and to mount under emergency recovery per ARCH §5.11).
+ * Degenerate single-device pools (N=1) carry a 1-entry roster.
+ * Multi-device commit semantics land in P5-2; P5-1 is spec + roster
+ * persistence only. v4 pools had these fields zero — unambiguous
+ * rejection at v5 mount. No feature-flag allocation; the version
+ * bump alone gates the format change per ARCH §5.9. */
+#define STM_UB_VERSION        5u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */
@@ -99,6 +111,20 @@ typedef enum {
     STM_DEV_ROLE_CACHE = 3,
     STM_DEV_ROLE_SPARE = 4,
 } stm_device_role;
+
+/* Device availability state (ARCH §4.3.1). ONLINE is the normal
+ * mount-time state; the others describe transitions driven by
+ * failures or admin actions. Persisted in the roster byte of the
+ * uberblock — P5-1 writes ONLINE unconditionally since multi-device
+ * fault handling lands in P5-4. */
+typedef enum {
+    STM_DEV_STATE_UNSET    = 0,
+    STM_DEV_STATE_ONLINE   = 1,
+    STM_DEV_STATE_OFFLINE  = 2,
+    STM_DEV_STATE_DEGRADED = 3,
+    STM_DEV_STATE_FAULTED  = 4,
+    STM_DEV_STATE_REMOVED  = 5,
+} stm_device_state;
 
 /* ========================================================================= */
 /* Block pointer (stm_bptr) — 64 bytes.                                       */

@@ -19,6 +19,7 @@
 #include <stratum/btnode.h>
 #include <stratum/crypto.h>
 #include <stratum/keyfile.h>
+#include <stratum/pool.h>
 #include <stratum/super.h>
 #include <stratum/sync.h>
 
@@ -67,20 +68,46 @@ static const stm_hybrid_keys *make_wk(void)
     return &g_wk;
 }
 
-/* Create a fresh pool: stm_alloc_create + stm_sync_create. */
-static void make_fresh_pool(stm_bdev *d, stm_alloc **out_a, stm_sync **out_s)
+/* P5-1: wrap a single bdev in a stm_pool with fixed test UUIDs +
+ * DATA/SSD/ONLINE. Every test uses this same 1-device pool shape,
+ * mirroring the N=1 degenerate path. */
+static stm_pool *make_test_pool(stm_bdev *d)
 {
-    STM_ASSERT_OK(stm_alloc_create(d, POOL_UUID, DEVICE_UUID,
-                                     TEST_BOOTSTRAP_BYTES, out_a));
-    STM_ASSERT_OK(stm_sync_create(d, *out_a, POOL_UUID, DEVICE_UUID,
-                                     make_wk(), out_s));
+    const stm_bdev_caps *caps = stm_bdev_caps_of(d);
+    STM_ASSERT(caps != NULL);
+    stm_pool_open_opts opts;
+    memset(&opts, 0, sizeof opts);
+    opts.pool_uuid[0] = POOL_UUID[0];
+    opts.pool_uuid[1] = POOL_UUID[1];
+    opts.device_count = 1;
+    opts.devices[0].uuid[0]    = DEVICE_UUID[0];
+    opts.devices[0].uuid[1]    = DEVICE_UUID[1];
+    opts.devices[0].size_bytes = caps->size_bytes;
+    opts.devices[0].role       = STM_DEV_ROLE_DATA;
+    opts.devices[0].class_     = STM_DEV_CLASS_SSD;
+    opts.devices[0].state      = STM_DEV_STATE_ONLINE;
+    opts.devices[0].bdev       = d;
+    stm_pool *p = NULL;
+    STM_ASSERT_OK(stm_pool_open(&opts, &p));
+    return p;
 }
 
-/* Tear down a pool handle pair. */
-static void teardown(stm_alloc *a, stm_sync *s)
+/* Create a fresh pool: stm_alloc_create + stm_pool_open + stm_sync_create. */
+static void make_fresh_pool(stm_bdev *d, stm_alloc **out_a, stm_sync **out_s,
+                              stm_pool **out_p)
+{
+    *out_p = make_test_pool(d);
+    STM_ASSERT_OK(stm_alloc_create(d, POOL_UUID, DEVICE_UUID,
+                                     TEST_BOOTSTRAP_BYTES, out_a));
+    STM_ASSERT_OK(stm_sync_create(*out_p, *out_a, make_wk(), out_s));
+}
+
+/* Tear down a pool handle triple. */
+static void teardown(stm_alloc *a, stm_sync *s, stm_pool *p)
 {
     stm_sync_close(s);
     stm_alloc_close(a);
+    stm_pool_close(p);
 }
 
 /* ========================================================================= */
@@ -88,8 +115,8 @@ static void teardown(stm_alloc *a, stm_sync *s)
 STM_TEST(sync_fresh_create_has_no_uberblock) {
     make_tmp("fresh");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     stm_sync_info info;
     STM_ASSERT_OK(stm_sync_info_get(s, &info));
@@ -98,12 +125,17 @@ STM_TEST(sync_fresh_create_has_no_uberblock) {
 
     /* Tear down without committing. Next open should fail — no
      * uberblock on disk. */
-    teardown(a, s);
+    teardown(a, s, pool);
 
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_ERR(stm_sync_open(d, a2, make_wk(), NULL, &s2), STM_ENOENT);
+    stm_pool *pool2 = make_test_pool(d);
+    /* Fresh pool has no durable UB → sync_open returns STM_ENOENT
+     * BEFORE any roster validation; the pool constructed here is
+     * harmless — it's closed below. */
+    STM_ASSERT_ERR(stm_sync_open(pool2, a2, make_wk(), NULL, &s2), STM_ENOENT);
+    stm_pool_close(pool2);
     stm_alloc_close(a2);
 
     stm_bdev_close(d);
@@ -113,8 +145,8 @@ STM_TEST(sync_fresh_create_has_no_uberblock) {
 STM_TEST(sync_first_commit_writes_uberblock) {
     make_tmp("first");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     /* Reserve something so the tree is non-empty. */
     uint64_t p = 0;
@@ -130,7 +162,7 @@ STM_TEST(sync_first_commit_writes_uberblock) {
     STM_ASSERT_EQ(info.live_slot_idx,  1u);
     STM_ASSERT(info.alloc_root_paddr != 0);
 
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }
@@ -140,8 +172,8 @@ STM_TEST(sync_mount_gen_bump) {
      * uberblock's txg. */
     make_tmp("mgb");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     /* Commit 5 times → durable gens 1..5. */
     for (int i = 0; i < 5; i++) {
@@ -149,7 +181,7 @@ STM_TEST(sync_mount_gen_bump) {
         STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p));
         STM_ASSERT_OK(stm_sync_commit(s));
     }
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
 
     /* Remount. */
@@ -157,7 +189,8 @@ STM_TEST(sync_mount_gen_bump) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_OK(stm_sync_open(d, a2, make_wk(), NULL, &s2));
+    stm_pool *pool2 = make_test_pool(d);
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
 
     stm_sync_info info;
     STM_ASSERT_OK(stm_sync_info_get(s2, &info));
@@ -168,7 +201,7 @@ STM_TEST(sync_mount_gen_bump) {
      * mount. First commit on this remount lands at gen 7. */
     STM_ASSERT_EQ(info.current_gen,           7u);
 
-    teardown(a2, s2);
+    teardown(a2, s2, pool2);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }
@@ -178,8 +211,8 @@ STM_TEST(sync_alloc_state_survives_mount) {
      * via the uberblock's ub_alloc_root → stm_alloc_load_tree_at. */
     make_tmp("persist");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     uint64_t p1 = 0, p2 = 0, p3 = 0;
     STM_ASSERT_OK(stm_alloc_reserve(a,  4u, 0, &p1));
@@ -187,7 +220,7 @@ STM_TEST(sync_alloc_state_survives_mount) {
     STM_ASSERT_OK(stm_alloc_reserve(a, 16u, 0, &p3));
     STM_ASSERT_OK(stm_sync_commit(s));
 
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
 
     /* Remount. */
@@ -195,7 +228,8 @@ STM_TEST(sync_alloc_state_survives_mount) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_OK(stm_sync_open(d, a2, make_wk(), NULL, &s2));
+    stm_pool *pool2 = make_test_pool(d);
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
 
     stm_alloc_stats ast;
     STM_ASSERT_OK(stm_alloc_stats_get(a2, &ast));
@@ -210,7 +244,7 @@ STM_TEST(sync_alloc_state_survives_mount) {
     STM_ASSERT_OK(stm_alloc_lookup(a2, p3, &len, &rc));
     STM_ASSERT_EQ(len, 16u);
 
-    teardown(a2, s2);
+    teardown(a2, s2, pool2);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }
@@ -224,8 +258,8 @@ STM_TEST(sync_commit_advances_ring_label_slot) {
      * I.e. label = gen % 4 rotates every commit. */
     make_tmp("ring");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     for (uint64_t g = 1; g <= 4; g++) {
         uint64_t p = 0;
@@ -239,7 +273,7 @@ STM_TEST(sync_commit_advances_ring_label_slot) {
         STM_ASSERT_EQ(info.current_gen,    g + 1u);
     }
 
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }
@@ -249,8 +283,8 @@ STM_TEST(sync_ub_alloc_root_matches_tree) {
      * equals stm_alloc_get_tree_root(a). */
     make_tmp("uar");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     uint64_t p = 0;
     STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p));
@@ -271,7 +305,7 @@ STM_TEST(sync_ub_alloc_root_matches_tree) {
     STM_ASSERT_EQ(stm_load_le64(ub.ub_alloc_root.bp_paddr), alloc_root);
     STM_ASSERT_EQ(ub.ub_alloc_root.bp_kind, STM_BPTR_KIND_ALLOC);
 
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }
@@ -281,8 +315,8 @@ STM_TEST(sync_commit_empty_pool_produces_ub_alloc_root) {
      * still points at an empty-leaf paddr. */
     make_tmp("empty");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     STM_ASSERT_OK(stm_sync_commit(s));
 
@@ -290,7 +324,7 @@ STM_TEST(sync_commit_empty_pool_produces_ub_alloc_root) {
     STM_ASSERT_OK(stm_sync_info_get(s, &info));
     STM_ASSERT(info.alloc_root_paddr != 0);
 
-    teardown(a, s);
+    teardown(a, s, pool);
 
     /* Remount + verify empty. */
     stm_bdev *d2 = NULL;
@@ -300,13 +334,14 @@ STM_TEST(sync_commit_empty_pool_produces_ub_alloc_root) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(d2, &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_OK(stm_sync_open(d2, a2, make_wk(), NULL, &s2));
+    stm_pool *pool2 = make_test_pool(d2);
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
 
     stm_alloc_stats ast;
     STM_ASSERT_OK(stm_alloc_stats_get(a2, &ast));
     STM_ASSERT_EQ(ast.n_allocated_ranges, 0u);
 
-    teardown(a2, s2);
+    teardown(a2, s2, pool2);
     stm_bdev_close(d2);
     unlink(g_tmp_path);
 }
@@ -317,30 +352,31 @@ STM_TEST(sync_reserve_across_mount_avoids_overlap) {
      * nonce-uniqueness invariant at the allocator level. */
     make_tmp("noovl");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     uint64_t p1 = 0;
     STM_ASSERT_OK(stm_alloc_reserve(a, 32u, 0, &p1));   /* 128 KiB */
     STM_ASSERT_OK(stm_sync_commit(s));
 
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
 
     d = open_fresh_device();
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_OK(stm_sync_open(d, a2, make_wk(), NULL, &s2));
+    stm_pool *pool2 = make_test_pool(d);
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
 
-    uint64_t p2 = 0;
-    STM_ASSERT_OK(stm_alloc_reserve(a2, 32u, 0, &p2));
-    /* p2 must not overlap p1. Either strictly after or strictly
+    uint64_t paddr2 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a2, 32u, 0, &paddr2));
+    /* paddr2 must not overlap p1. Either strictly after or strictly
      * before. For our first-fit allocator with p1 at the front,
-     * p2 lands after. */
-    STM_ASSERT(stm_paddr_offset(p2) >= stm_paddr_offset(p1) + 32u);
+     * paddr2 lands after. */
+    STM_ASSERT(stm_paddr_offset(paddr2) >= stm_paddr_offset(p1) + 32u);
 
-    teardown(a2, s2);
+    teardown(a2, s2, pool2);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }
@@ -375,8 +411,8 @@ static void read_live_ub(const char *path, stm_uberblock *out,
 STM_TEST(sync_first_commit_populates_merkle_state) {
     make_tmp("merkle_pop");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     /* Reserve something non-trivial so the tree root is an actual
      * node, not the degenerate empty-leaf state. */
@@ -384,7 +420,7 @@ STM_TEST(sync_first_commit_populates_merkle_state) {
     STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p));
     STM_ASSERT_OK(stm_sync_commit(s));
 
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
 
     /* Read the live UB from disk and verify P4-1 fields are populated. */
@@ -413,14 +449,14 @@ STM_TEST(sync_remount_verifies_merkle_root) {
      * round-trip must succeed. */
     make_tmp("merkle_rt");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     uint64_t p = 0;
     STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p));
     STM_ASSERT_OK(stm_sync_commit(s));
 
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
 
     /* Remount. stm_sync_open must succeed — Merkle check recomputes
@@ -431,9 +467,10 @@ STM_TEST(sync_remount_verifies_merkle_root) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(d2, &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_OK(stm_sync_open(d2, a2, make_wk(), NULL, &s2));
+    stm_pool *pool2 = make_test_pool(d2);
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
 
-    teardown(a2, s2);
+    teardown(a2, s2, pool2);
     stm_bdev_close(d2);
     unlink(g_tmp_path);
 }
@@ -466,13 +503,13 @@ static void tamper_byte_at(const char *path, uint64_t off, uint8_t xor_mask)
 STM_TEST(sync_tamper_substitutes_well_formed_node) {
     make_tmp("tamper_sub");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     uint64_t p = 0;
     STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p));
     STM_ASSERT_OK(stm_sync_commit(s));
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
 
     stm_uberblock ub;
@@ -511,10 +548,12 @@ STM_TEST(sync_tamper_substitutes_well_formed_node) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(d2, &a2));
     stm_sync *s2 = NULL;
-    stm_status ms = stm_sync_open(d2, a2, make_wk(), NULL, &s2);
+    stm_pool *pool2 = make_test_pool(d2);
+    stm_status ms = stm_sync_open(pool2, a2, make_wk(), NULL, &s2);
     STM_ASSERT_ERR(ms, STM_ECORRUPT);
     STM_ASSERT(s2 == NULL);
 
+    stm_pool_close(pool2);
     stm_alloc_close(a2);
     stm_bdev_close(d2);
     unlink(g_tmp_path);
@@ -530,14 +569,14 @@ STM_TEST(sync_tamper_tree_node_surfaces_on_mount) {
      *     self-csum, compares against expected (from bp_csum) — FAILS. */
     make_tmp("tamper_node");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     uint64_t p = 0;
     STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p));
     STM_ASSERT_OK(stm_sync_commit(s));
 
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
 
     /* Read the live UB; find the tree root's paddr. */
@@ -563,10 +602,12 @@ STM_TEST(sync_tamper_tree_node_surfaces_on_mount) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(d2, &a2));
     stm_sync *s2 = NULL;
-    stm_status ms = stm_sync_open(d2, a2, make_wk(), NULL, &s2);
+    stm_pool *pool2 = make_test_pool(d2);
+    stm_status ms = stm_sync_open(pool2, a2, make_wk(), NULL, &s2);
     STM_ASSERT_ERR(ms, STM_ECORRUPT);
     STM_ASSERT(s2 == NULL);
 
+    stm_pool_close(pool2);
     stm_alloc_close(a2);
     stm_bdev_close(d2);
     unlink(g_tmp_path);
@@ -590,12 +631,12 @@ STM_TEST(sync_tamper_tree_node_surfaces_on_mount) {
 STM_TEST(sync_no_plaintext_key_on_disk) {
     make_tmp("nokey_on_disk");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     /* One commit to land the schema. */
     STM_ASSERT_OK(stm_sync_commit(s));
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
 
     /* Re-open, commit again, verify the header is stable. */
@@ -638,10 +679,11 @@ STM_TEST(sync_no_plaintext_key_on_disk) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(d2, &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_OK(stm_sync_open(d2, a2, make_wk(), NULL, &s2));
+    stm_pool *pool2 = make_test_pool(d2);
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
 
     STM_ASSERT_OK(stm_sync_commit(s2));
-    teardown(a2, s2);
+    teardown(a2, s2, pool2);
     stm_bdev_close(d2);
 
     stm_uberblock ub2;
@@ -661,10 +703,10 @@ STM_TEST(sync_no_plaintext_key_on_disk) {
 STM_TEST(sync_wrong_keyfile_rejected) {
     make_tmp("wrong_key");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
     STM_ASSERT_OK(stm_sync_commit(s));
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
 
     /* Generate a DIFFERENT wrap key pair. */
@@ -678,10 +720,12 @@ STM_TEST(sync_wrong_keyfile_rejected) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(d2, &a2));
     stm_sync *s2 = NULL;
-    stm_status ms = stm_sync_open(d2, a2, &other, NULL, &s2);
+    stm_pool *pool2 = make_test_pool(d2);
+    stm_status ms = stm_sync_open(pool2, a2, &other, NULL, &s2);
     STM_ASSERT(ms != STM_OK);
     STM_ASSERT(s2 == NULL);
 
+    stm_pool_close(pool2);
     stm_alloc_close(a2);
     stm_bdev_close(d2);
     unlink(g_tmp_path);
@@ -696,12 +740,12 @@ STM_TEST(sync_wrong_keyfile_rejected) {
 STM_TEST(sync_mount_claim_advances_durable_gen) {
     make_tmp("mclaim");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     /* One commit at gen=1. */
     STM_ASSERT_OK(stm_sync_commit(s));
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
 
     /* Mount #1: expect claim UB at gen=2; current_gen=3. */
@@ -709,12 +753,13 @@ STM_TEST(sync_mount_claim_advances_durable_gen) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_OK(stm_sync_open(d, a2, make_wk(), NULL, &s2));
+    stm_pool *pool2 = make_test_pool(d);
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
     stm_sync_info info;
     STM_ASSERT_OK(stm_sync_info_get(s2, &info));
     STM_ASSERT_EQ(info.mount_max_durable_gen, 1u);
     STM_ASSERT_EQ(info.current_gen,           3u);
-    teardown(a2, s2);
+    teardown(a2, s2, pool2);
     stm_bdev_close(d);
 
     /* Mount #2 (no intervening commit): mount-claim observed gen=2
@@ -723,11 +768,12 @@ STM_TEST(sync_mount_claim_advances_durable_gen) {
     stm_alloc *a3 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a3));
     stm_sync *s3 = NULL;
-    STM_ASSERT_OK(stm_sync_open(d, a3, make_wk(), NULL, &s3));
+    stm_pool *pool3 = make_test_pool(d);
+    STM_ASSERT_OK(stm_sync_open(pool3, a3, make_wk(), NULL, &s3));
     STM_ASSERT_OK(stm_sync_info_get(s3, &info));
     STM_ASSERT_EQ(info.mount_max_durable_gen, 2u);
     STM_ASSERT_EQ(info.current_gen,           4u);
-    teardown(a3, s3);
+    teardown(a3, s3, pool3);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }
@@ -739,8 +785,8 @@ STM_TEST(sync_mount_claim_advances_durable_gen) {
 STM_TEST(sync_load_tree_at_without_crypt_ctx_rejected) {
     make_tmp("nocx");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     uint64_t p = 0;
     STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p));
@@ -751,7 +797,7 @@ STM_TEST(sync_load_tree_at_without_crypt_ctx_rejected) {
     STM_ASSERT_OK(stm_alloc_get_tree_root(a, &root, root_csum));
     STM_ASSERT(root != 0);
 
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
 
     /* Re-open device + alloc without set_crypt_ctx; load must fail. */
@@ -775,8 +821,8 @@ STM_TEST(sync_load_tree_at_without_crypt_ctx_rejected) {
 STM_TEST(sync_verify_detects_tree_tamper) {
     make_tmp("verify_tamper");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     uint64_t p = 0;
     STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p));
@@ -800,7 +846,7 @@ STM_TEST(sync_verify_detects_tree_tamper) {
     /* Scrubber detects the tamper without remount. */
     STM_ASSERT_ERR(stm_alloc_verify(a), STM_ECORRUPT);
 
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }
@@ -809,8 +855,8 @@ STM_TEST(sync_verify_detects_tree_tamper) {
 STM_TEST(sync_verify_clean_tree_ok) {
     make_tmp("verify_clean");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     /* Reserve a few, commit. */
     for (int i = 0; i < 5; i++) {
@@ -822,7 +868,7 @@ STM_TEST(sync_verify_clean_tree_ok) {
     /* Verify walks the durable tree and returns STM_OK. */
     STM_ASSERT_OK(stm_alloc_verify(a));
 
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }
@@ -832,12 +878,12 @@ STM_TEST(sync_verify_clean_tree_ok) {
 STM_TEST(sync_verify_empty_pool_ok) {
     make_tmp("verify_empty");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     STM_ASSERT_OK(stm_alloc_verify(a));
 
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }

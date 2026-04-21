@@ -21,6 +21,7 @@
 #include <stratum/janus.h>
 #include <stratum/keyfile.h>
 #include <stratum/keyschema.h>
+#include <stratum/pool.h>
 #include <stratum/sync.h>
 
 #include "../src/janus/backend.h"
@@ -76,18 +77,43 @@ static const stm_hybrid_keys *make_wk(void)
     return &g_wk;
 }
 
-static void make_fresh_pool(stm_bdev *d, stm_alloc **out_a, stm_sync **out_s)
+/* P5-1: wrap a single bdev in a stm_pool with fixed test UUIDs +
+ * DATA/SSD/ONLINE. */
+static stm_pool *make_test_pool(stm_bdev *d)
 {
-    STM_ASSERT_OK(stm_alloc_create(d, POOL_UUID, DEVICE_UUID,
-                                     TEST_BOOTSTRAP_BYTES, out_a));
-    STM_ASSERT_OK(stm_sync_create(d, *out_a, POOL_UUID, DEVICE_UUID,
-                                     make_wk(), out_s));
+    const stm_bdev_caps *caps = stm_bdev_caps_of(d);
+    STM_ASSERT(caps != NULL);
+    stm_pool_open_opts opts;
+    memset(&opts, 0, sizeof opts);
+    opts.pool_uuid[0] = POOL_UUID[0];
+    opts.pool_uuid[1] = POOL_UUID[1];
+    opts.device_count = 1;
+    opts.devices[0].uuid[0]    = DEVICE_UUID[0];
+    opts.devices[0].uuid[1]    = DEVICE_UUID[1];
+    opts.devices[0].size_bytes = caps->size_bytes;
+    opts.devices[0].role       = STM_DEV_ROLE_DATA;
+    opts.devices[0].class_     = STM_DEV_CLASS_SSD;
+    opts.devices[0].state      = STM_DEV_STATE_ONLINE;
+    opts.devices[0].bdev       = d;
+    stm_pool *p = NULL;
+    STM_ASSERT_OK(stm_pool_open(&opts, &p));
+    return p;
 }
 
-static void teardown(stm_alloc *a, stm_sync *s)
+static void make_fresh_pool(stm_bdev *d, stm_alloc **out_a, stm_sync **out_s,
+                              stm_pool **out_p)
+{
+    *out_p = make_test_pool(d);
+    STM_ASSERT_OK(stm_alloc_create(d, POOL_UUID, DEVICE_UUID,
+                                     TEST_BOOTSTRAP_BYTES, out_a));
+    STM_ASSERT_OK(stm_sync_create(*out_p, *out_a, make_wk(), out_s));
+}
+
+static void teardown(stm_alloc *a, stm_sync *s, stm_pool *p)
 {
     stm_sync_close(s);
     stm_alloc_close(a);
+    stm_pool_close(p);
 }
 
 /* ========================================================================= */
@@ -97,8 +123,8 @@ static void teardown(stm_alloc *a, stm_sync *s)
 STM_TEST(keyschema_next_key_id_empty_dataset) {
     make_tmp("next_empty");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     /* Dataset 0 has (0, 0) CURRENT by construction → next = 1. */
     uint64_t next = UINT64_MAX;
@@ -115,7 +141,7 @@ STM_TEST(keyschema_next_key_id_empty_dataset) {
     STM_ASSERT_EQ(rc2, STM_EEXIST);
     (void)next;
 
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }
@@ -127,8 +153,8 @@ STM_TEST(keyschema_next_key_id_empty_dataset) {
 STM_TEST(rotate_dataset_key_keyfile) {
     make_tmp("rot_keyfile");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     /* Add dataset 1 with key_id 0. */
     uint64_t kid0 = UINT64_MAX;
@@ -170,7 +196,7 @@ STM_TEST(rotate_dataset_key_keyfile) {
     STM_ASSERT_EQ(new_id2, 2u);
     STM_ASSERT_EQ(old_id2, 1u);
 
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }
@@ -178,15 +204,15 @@ STM_TEST(rotate_dataset_key_keyfile) {
 STM_TEST(rotate_ds0_refused) {
     make_tmp("rot_ds0");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     uint64_t new_id = 0, old_id = 0;
     stm_status rc = stm_sync_rotate_dataset_key(s, 0, make_wk(), NULL,
                                                   &new_id, &old_id);
     STM_ASSERT_EQ(rc, STM_EBUSY);
 
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }
@@ -194,14 +220,14 @@ STM_TEST(rotate_ds0_refused) {
 STM_TEST(add_ds0_refused) {
     make_tmp("add_ds0");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     uint64_t new_id = 0;
     stm_status rc = stm_sync_add_dataset_key(s, 0, make_wk(), NULL, &new_id);
     STM_ASSERT_EQ(rc, STM_EINVAL);
 
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }
@@ -209,8 +235,8 @@ STM_TEST(add_ds0_refused) {
 STM_TEST(cross_dataset_isolation) {
     make_tmp("iso");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     uint64_t kid = 0;
     STM_ASSERT_OK(stm_sync_add_dataset_key(s, 1, make_wk(), NULL, &kid));
@@ -239,7 +265,7 @@ STM_TEST(cross_dataset_isolation) {
     stm_status rc = stm_sync_get_dek(s, 2, 1, trash);
     STM_ASSERT_EQ(rc, STM_ENOENT);
 
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }
@@ -251,8 +277,8 @@ STM_TEST(cross_dataset_isolation) {
 STM_TEST(sweep_removes_retired) {
     make_tmp("sweep_basic");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     uint64_t kid = 0;
     STM_ASSERT_OK(stm_sync_add_dataset_key(s, 1, make_wk(), NULL, &kid));
@@ -283,7 +309,7 @@ STM_TEST(sweep_removes_retired) {
     STM_ASSERT_OK(stm_sync_keyschema_sweep(s, 1, &pruned));
     STM_ASSERT_EQ(pruned, 0u);
 
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }
@@ -291,8 +317,8 @@ STM_TEST(sweep_removes_retired) {
 STM_TEST(sweep_preserves_current_never_retired) {
     make_tmp("sweep_cur");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     uint64_t kid = 0;
     STM_ASSERT_OK(stm_sync_add_dataset_key(s, 1, make_wk(), NULL, &kid));
@@ -309,7 +335,7 @@ STM_TEST(sweep_preserves_current_never_retired) {
     STM_ASSERT_OK(stm_sync_get_dek(s, 1, 0, dek_after));
     STM_ASSERT_MEM_EQ(dek_after, dek_cur, 32);
 
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }
@@ -321,8 +347,8 @@ STM_TEST(sweep_preserves_current_never_retired) {
 STM_TEST(rotation_persists_across_mount) {
     make_tmp("persist");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     uint64_t kid = 0;
     STM_ASSERT_OK(stm_sync_add_dataset_key(s, 7, make_wk(), NULL, &kid));
@@ -335,7 +361,7 @@ STM_TEST(rotation_persists_across_mount) {
     STM_ASSERT_OK(stm_sync_get_dek(s, 7, 1, dek_new));
 
     STM_ASSERT_OK(stm_sync_commit(s));
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
 
     /* Reopen: the schema still has (7, 0) RETIRED and (7, 1) CURRENT;
@@ -344,7 +370,8 @@ STM_TEST(rotation_persists_across_mount) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_OK(stm_sync_open(d, a2, make_wk(), NULL, &s2));
+    stm_pool *pool2 = make_test_pool(d);
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
 
     uint8_t dek_old2[32], dek_new2[32];
     STM_ASSERT_OK(stm_sync_get_dek(s2, 7, 0, dek_old2));
@@ -352,7 +379,7 @@ STM_TEST(rotation_persists_across_mount) {
     STM_ASSERT_MEM_EQ(dek_old2, dek_old, 32);
     STM_ASSERT_MEM_EQ(dek_new2, dek_new, 32);
 
-    teardown(a2, s2);
+    teardown(a2, s2, pool2);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }
@@ -360,8 +387,8 @@ STM_TEST(rotation_persists_across_mount) {
 STM_TEST(swept_keys_dont_reappear_on_reopen) {
     make_tmp("persist_swept");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     uint64_t kid = 0;
     STM_ASSERT_OK(stm_sync_add_dataset_key(s, 3, make_wk(), NULL, &kid));
@@ -373,20 +400,21 @@ STM_TEST(swept_keys_dont_reappear_on_reopen) {
     STM_ASSERT_EQ(pruned, 1u);
 
     STM_ASSERT_OK(stm_sync_commit(s));
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
 
     d = open_fresh_device();
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_OK(stm_sync_open(d, a2, make_wk(), NULL, &s2));
+    stm_pool *pool2 = make_test_pool(d);
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
 
     uint8_t dek[32];
     STM_ASSERT_EQ(stm_sync_get_dek(s2, 3, 0, dek), STM_ENOENT);
     STM_ASSERT_OK(stm_sync_get_dek(s2, 3, 1, dek));
 
-    teardown(a2, s2);
+    teardown(a2, s2, pool2);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }
@@ -394,8 +422,8 @@ STM_TEST(swept_keys_dont_reappear_on_reopen) {
 STM_TEST(monotonic_key_ids_across_many_rotations) {
     make_tmp("mono");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     uint64_t kid = 0;
     STM_ASSERT_OK(stm_sync_add_dataset_key(s, 9, make_wk(), NULL, &kid));
@@ -423,7 +451,7 @@ STM_TEST(monotonic_key_ids_across_many_rotations) {
     STM_ASSERT_EQ(nid6, 6u);
     STM_ASSERT_EQ(oid6, 5u);
 
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }
@@ -511,8 +539,8 @@ static void stop_daemon(daemon_thread *d, const char *sock)
 STM_TEST(add_dataset_id_over_max_rejected) {
     make_tmp("ds_over_max");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     /* STM_SYNC_DATASET_ID_MAX = 2^28 - 1 = 268435455. One past. */
     uint64_t new_id = 0;
@@ -531,7 +559,7 @@ STM_TEST(add_dataset_id_over_max_rejected) {
     STM_ASSERT_OK(rc);
     STM_ASSERT_EQ(new_id, 0u);
 
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }
@@ -539,8 +567,8 @@ STM_TEST(add_dataset_id_over_max_rejected) {
 STM_TEST(rotate_dataset_id_over_max_rejected) {
     make_tmp("rot_over_max");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     uint64_t new_id = 0, old_id = 0;
     stm_status rc = stm_sync_rotate_dataset_key(s,
@@ -549,7 +577,7 @@ STM_TEST(rotate_dataset_id_over_max_rejected) {
                                                   &new_id, &old_id);
     STM_ASSERT_EQ(rc, STM_ERANGE);
 
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }
@@ -557,8 +585,8 @@ STM_TEST(rotate_dataset_id_over_max_rejected) {
 STM_TEST(keyschema_insert_wrapped_narrowed_to_current) {
     make_tmp("insert_state");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     /* The public insert primitive now rejects any non-CURRENT state
      * to keep transitions funnelled through rotate / mark_pruning /
@@ -578,7 +606,7 @@ STM_TEST(keyschema_insert_wrapped_narrowed_to_current) {
     STM_ASSERT_OK(stm_sync_get_dek(s, 1, 0, dek));
     STM_ASSERT_OK(stm_sync_get_dek(s, 1, 1, dek));
 
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }
@@ -591,8 +619,8 @@ STM_TEST(many_rotations_exercise_dek_map_realloc) {
      * completes"; the sanitizer does the heavy lifting. */
     make_tmp("dek_grow");
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
-    make_fresh_pool(d, &a, &s);
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
 
     uint64_t kid = 0;
     STM_ASSERT_OK(stm_sync_add_dataset_key(s, 1, make_wk(), NULL, &kid));
@@ -606,7 +634,7 @@ STM_TEST(many_rotations_exercise_dek_map_realloc) {
     /* Pool + 21 ds=1 entries. */
     STM_ASSERT_EQ((long long)stm_sync_dek_count(s), 22);
 
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }
@@ -627,10 +655,11 @@ STM_TEST(rotate_dataset_key_janus) {
     STM_ASSERT_OK(stm_keyfile_load(keyfile, &wk));
 
     stm_bdev *d = open_fresh_device();
-    stm_alloc *a = NULL; stm_sync *s = NULL;
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
     STM_ASSERT_OK(stm_alloc_create(d, POOL_UUID, DEVICE_UUID,
                                      TEST_BOOTSTRAP_BYTES, &a));
-    STM_ASSERT_OK(stm_sync_create(d, a, POOL_UUID, DEVICE_UUID, &wk, &s));
+    pool = make_test_pool(d);
+    STM_ASSERT_OK(stm_sync_create(pool, a, &wk, &s));
     STM_ASSERT_OK(stm_sync_commit(s));
 
     /* Add a test dataset (via keyfile path to avoid needing janus for
@@ -641,7 +670,7 @@ STM_TEST(rotate_dataset_key_janus) {
     /* Close and reopen via janus: unwrap-all path needs to round-trip
      * via the daemon's SO_PEERCRED socket. */
     STM_ASSERT_OK(stm_sync_commit(s));
-    teardown(a, s);
+    teardown(a, s, pool);
     stm_bdev_close(d);
 
     daemon_thread dae;
@@ -655,7 +684,8 @@ STM_TEST(rotate_dataset_key_janus) {
     STM_ASSERT_OK(stm_janus_client_connect(sock, &jc));
 
     stm_sync *s2 = NULL;
-    STM_ASSERT_OK(stm_sync_open(d, a2, NULL, jc, &s2));
+    stm_pool *pool2 = make_test_pool(d);
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, NULL, jc, &s2));
 
     /* Ensure the initial add DEK is recoverable post-mount. */
     uint8_t dek_init[32];
@@ -674,7 +704,7 @@ STM_TEST(rotate_dataset_key_janus) {
     STM_ASSERT(memcmp(dek_old, dek_new, 32) != 0);
 
     stm_janus_client_disconnect(jc);
-    teardown(a2, s2);
+    teardown(a2, s2, pool2);
     stm_bdev_close(d);
 
     stop_daemon(&dae, sock);

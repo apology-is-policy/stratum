@@ -1,7 +1,7 @@
 # Phase 5 — status and pickup guide
 
 Authoritative pickup guide for Phase 5 (multi-device + redundancy).
-Last update 2026-04-21 after P5-0 landed. Companion to
+Last update 2026-04-21 after P5-1 landed. Companion to
 `phase4-status.md`, which documents the crypto/integrity layer
 Phase 5 builds on.
 
@@ -17,24 +17,23 @@ to a later sub-chunk.
 | Commit | What | Tests |
 |---|---|---|
 | `57a37e7` | **P5-0: `quorum.tla` formal spec**. Models multi-device commit (ARCH §5.6) with per-device UB rings, parallel reservation + final writes, quorum threshold = ⌊N/2⌋+1, device FAULTED / ONLINE state, rejoin + reconcile, coordinator crash. Proves `TypeOK`, `QuorumSafety` (phase=Published implies ≥quorum devices at target_gen), `AuthoritativeMono` (committed gens never regress), `CommitAtomic` (auth ≥ 2×commits_done), `OrphansNotAuthoritative` (partial-Phase-3 gens held by <quorum devices are never authoritative), `LiveCoordTargetValid` (coord's in-flight target_gen ≥ current auth), `QuorumDurability`, `MountGenBumpMulti`. Mount requires quorum of ONLINE devices (emergency mount is an explicit opt-in not modeled). TLC-clean under `Devices={1,2,3}, MaxCommits=3, MaxFaults=2`: 36839 distinct states, depth 35. Two iterations: initial pass rejected orphan gens from degraded-mount, then caught an over-strict `LiveCoordMonotonic` (`target > auth`) that Fails in the transient state where Phase 3 WriteFinals hit quorum on disk before CheckFinalQuorum fires. Fixed by weakening to `target_gen >= auth`. | Spec-only; 9 TLA+ specs clean including the new one. |
+| _TBD_ | **P5-1: Pool layer foundation**. Introduces `stm_pool` (`include/stratum/pool.h` + `src/pool/pool.c`) wrapping up to 64 `stm_bdev`s — today's configuration is always N=1 (degenerate). Adds `stm_device_state` enum. Populates the uberblock's previously-zero roster fields (`ub_device_count`, `ub_device_id`, `ub_device_class`, `ub_device_role`, `ub_roster[2048]`, `ub_roster_hash`) on every commit. `ub_roster` layout is 32 bytes per slot: `uuid[16] + size[8] + role[1] + class[1] + state[1] + reserved[5]`; up to 64 slots exactly match `ub_roster[2048]`. `ub_roster_hash` is the le64 truncation of BLAKE3-256 over the encoded 2048-byte roster. Refactors `stm_sync_create` / `stm_sync_open` to take a `stm_pool *` in place of `(stm_bdev*, pool_uuid, device_uuid)` — cleaner lifecycle, ready for P5-2 to iterate the pool's device set during commit. `stm_fs_format` builds a 1-device pool from `stm_fs_format_opts` (role=DATA, class=SSD, state=ONLINE default); `stm_fs_mount` peeks the durable UB via `stm_sb_mount_scan`, decodes the roster, constructs a matching `stm_pool`, and hands it to sync. Sync cross-validates `ub_roster_hash` + `ub_pool_uuid` + `ub_device_uuid` against the pool handle before proceeding — catches programmer error and roster tampering that preserved ub_csum. STM_UB_VERSION 4 → 5. v4 pools refused at mount by version check; no feature-flag allocation needed (version bump alone gates per ARCH §5.9). | New `test_pool.c` (12 tests): open validation, roster encode/decode roundtrip, roster hash determinism + identity-change sensitivity, fs format/mount roundtrip populates every roster field, decode rejects leftover bytes + zero UUID in populated slot, sync_open refuses wrong pool_uuid + wrong device_uuid. All 25 suites (24 prior + 1 new) green on default + ASan + TSan. |
 
 ## Remaining Phase 5 work
 
 Rough ordering; dependencies force roughly this sequence:
 
-### P5-1: Pool layer foundation (`src/pool/`)
+### P5-1: Pool layer foundation (`src/pool/`) — **LANDED**
 
-Introduces `stm_pool` — the new top-level handle that wraps N `stm_bdev`s. Covers ARCH §4.3 (pool composition) and §4.7 (device lifecycle, minus add/remove/replace which land in P5-4).
-
-Decisions carried from ARCH §4:
-
-- `stm_paddr_t` layout is unchanged: `(device_id: 16 bits, offset: 48 bits)`. Current code already uses this layout with device=0; P5-1 opens it up.
-- Device roster persisted in every device's uberblock (per-device copy, reconstructible from any single device).
-- Per-device UUID separate from device path (`/dev/nvme0n1` can rename to `/dev/nvme1n1` between reboots).
-- Device role ∈ `{DATA, LOG, CACHE, SPARE}` and class ∈ `{SSD, HDD, PMEM, ZNS}`. P5-1 only implements DATA + SSD/HDD; the rest are stubs.
-- Roster size ≤ 16 for MVP (fits in UB's reserved tail with room; ARCH §5.13 notes 64-device roster limit pre-spill-to-separate-object).
-
-Format impact: STM_UB_VERSION 4 → 5. New fields in `ub_roster`: device_count, per-device (uuid, role, class, state, size), roster_hash (BLAKE3 over the roster sorted by device_id). All goes in `ub_reserved[1008]` — we have ~256 bytes left after Merkle + keyschema + alloc_root_gen.
+Landed above P5-0; specifics in the Landed-chunks table. Summary:
+`stm_pool` wraps up to `STM_POOL_DEVICES_MAX = 64` `stm_bdev`s (MVP
+exercises N=1 only); roster persisted in every device's uberblock
+at `ub_roster[2048]` (32-byte slots: `uuid[16] + size[8] + role +
+class + state + reserved[5]`); `ub_roster_hash` is the le64
+truncation of BLAKE3-256(`ub_roster[2048]`); STM_UB_VERSION bumped
+4→5. Sync + FS lifecycle refactored to thread a `stm_pool *` where
+previously `(stm_bdev*, pool_uuid, device_uuid)` lived — P5-2 is
+now pure body-change (iterate the pool's device set during commit).
 
 ### P5-2: Multi-device commit
 

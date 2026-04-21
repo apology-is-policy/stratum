@@ -38,6 +38,7 @@
 #include <stratum/janus.h>
 #include <stratum/keyfile.h>
 #include <stratum/keyschema.h>
+#include <stratum/pool.h>
 #include <stratum/super.h>
 
 #include <pthread.h>
@@ -96,11 +97,21 @@ _Static_assert(STM_SYNC_WRAPPED_KEY_LEN <= STM_KEYSCHEMA_WRAPPED_MAX,
 struct stm_sync {
     pthread_mutex_t lock;
 
-    stm_bdev  *bdev;        /* borrowed */
+    /* P5-1: the pool-layer handle is now the source of truth for
+     * identity (pool_uuid, per-device uuid, role, class, state, size)
+     * and the device set. P5-1 writes to device 0 only (degenerate
+     * N=1); P5-2 iterates all devices during commit. */
+    stm_pool  *pool;        /* borrowed — lifecycle owned by caller */
+    stm_bdev  *bdev;        /* cached: stm_pool_device_bdev(pool, 0) */
     stm_alloc *alloc;       /* borrowed — not owned */
 
+    /* Cached from pool at open/create time. Sync uses these on every
+     * crypto + UB-build path; pulling from pool each time is fine but
+     * caching saves a dereference without changing semantics — pool
+     * identity is immutable after stm_pool_open for P5-1. */
     uint64_t   pool_uuid[2];
     uint64_t   device_uuid[2];
+    uint16_t   self_device_id;     /* N=1 MVP: always 0 */
 
     /* Commit state. */
     uint64_t   current_gen;         /* last-committed gen; next commit is +1.
@@ -432,8 +443,22 @@ static void build_uberblock(stm_uberblock *out,
     out->ub_gen         = stm_store_le64(new_gen);
     out->ub_txg         = stm_store_le64(new_gen);     /* chunk 6 keeps
                                                          * gen == txg */
-    out->ub_device_count = stm_store_le16(1);
-    out->ub_device_id    = stm_store_le16(0);
+
+    /* P5-1: roster fields populated from the pool-layer handle. For
+     * N=1 (today's only configuration) device_count=1, device_id=0,
+     * and ub_roster's slot 0 describes THIS device. ub_roster_hash is
+     * the le64 truncation of BLAKE3-256(ub_roster[2048]). */
+    out->ub_device_count = stm_store_le16((uint16_t)stm_pool_device_count(s->pool));
+    out->ub_device_id    = stm_store_le16(s->self_device_id);
+    {
+        const stm_pool_device *self = stm_pool_device_info(s->pool,
+                                                             s->self_device_id);
+        /* sync_new validates self exists; defensive fallback. */
+        out->ub_device_class = self ? (uint8_t)self->class_ : (uint8_t)STM_DEV_CLASS_UNSET;
+        out->ub_device_role  = self ? (uint8_t)self->role   : (uint8_t)STM_DEV_ROLE_UNSET;
+    }
+    stm_pool_roster_encode(s->pool, out->ub_roster);
+    out->ub_roster_hash = stm_store_le64(stm_pool_roster_hash(s->pool));
 
     /* Allocator tree root (paddr + kind + Merkle csum). */
     if (alloc_root_paddr != 0) {
@@ -470,21 +495,23 @@ static void build_uberblock(stm_uberblock *out,
     out->ub_total_blocks = stm_store_le64(astats->data_total_blocks);
     out->ub_free_blocks  = stm_store_le64(astats->data_free_blocks);
 
-    /* Chunk 6 MVP: single-device, no redundancy, no encryption
-     * schema. Those fields stay zero. */
+    /* Chunk 6 MVP: no redundancy profile yet (mirror lands in P5-3).
+     * Device class/role were populated from pool context above. */
     out->ub_redundancy_kind = STM_RED_NONE;
-    out->ub_device_class    = STM_DEV_CLASS_UNSET;
-    out->ub_device_role     = STM_DEV_ROLE_UNSET;
 }
 
 /* ========================================================================= */
 /* Lifecycle.                                                                 */
 /* ========================================================================= */
 
-static stm_sync *sync_new(stm_bdev *d, stm_alloc *a,
-                           const uint64_t pool_uuid[2],
-                           const uint64_t device_uuid[2])
+static stm_sync *sync_new(stm_pool *p, stm_alloc *a)
 {
+    /* Pool must carry at least one device; caller validated. */
+    stm_bdev *d = stm_pool_device_bdev(p, 0);
+    const stm_pool_device *d0 = stm_pool_device_info(p, 0);
+    const uint64_t *puuid = stm_pool_uuid(p);
+    if (!d || !d0 || !puuid) return NULL;
+
     stm_sync *s = calloc(1, sizeof *s);
     if (!s) return NULL;
 
@@ -493,20 +520,23 @@ static stm_sync *sync_new(stm_bdev *d, stm_alloc *a,
         return NULL;
     }
 
+    s->pool  = p;
     s->bdev  = d;
     s->alloc = a;
-    memcpy(s->pool_uuid,   pool_uuid,   sizeof s->pool_uuid);
-    memcpy(s->device_uuid, device_uuid, sizeof s->device_uuid);
+    s->self_device_id = 0;    /* P5-1 N=1 degenerate */
+    s->pool_uuid[0]   = puuid[0];
+    s->pool_uuid[1]   = puuid[1];
+    s->device_uuid[0] = d0->uuid[0];
+    s->device_uuid[1] = d0->uuid[1];
     return s;
 }
 
-stm_status stm_sync_create(stm_bdev *d, stm_alloc *a,
-                            const uint64_t pool_uuid[2],
-                            const uint64_t device_uuid[2],
+stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
                             const stm_hybrid_keys *wk,
                             stm_sync **out_sync)
 {
-    if (!d || !a || !pool_uuid || !device_uuid || !out_sync) return STM_EINVAL;
+    if (!p || !a || !out_sync) return STM_EINVAL;
+    if (stm_pool_device_count(p) == 0) return STM_EINVAL;
     /* P4-4a: wk is mandatory — the pool's metadata key must be
      * PQ-hybrid-wrapped before persistence, so the wrap-public-key
      * half has to be available at create time. */
@@ -518,8 +548,9 @@ stm_status stm_sync_create(stm_bdev *d, stm_alloc *a,
     stm_status ci = stm_crypto_init();
     if (ci != STM_OK) return ci;
 
-    stm_sync *s = sync_new(d, a, pool_uuid, device_uuid);
+    stm_sync *s = sync_new(p, a);
     if (!s) return STM_ENOMEM;
+    stm_bdev *d = s->bdev;
 
     /* Fresh pool: no uberblocks written yet. First stm_sync_commit
      * will write gen=1 (matches sync.tla: Mount bumps to
@@ -602,18 +633,24 @@ stm_status stm_sync_create(stm_bdev *d, stm_alloc *a,
     return STM_OK;
 }
 
-stm_status stm_sync_open(stm_bdev *d, stm_alloc *a,
+stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
                           const stm_hybrid_keys *wk,
                           struct stm_janus_client *janus,
                           stm_sync **out_sync)
 {
-    if (!d || !a || !out_sync) return STM_EINVAL;
+    if (!p || !a || !out_sync) return STM_EINVAL;
+    if (stm_pool_device_count(p) == 0) return STM_EINVAL;
     /* P4-4a/P4-4b: key source is mandatory, exactly one. */
     if ((!wk && !janus) || (wk && janus)) return STM_EINVAL;
 
     /* R9 P1-1: make sure libsodium is up before any crypto op. */
     stm_status ci = stm_crypto_init();
     if (ci != STM_OK) return ci;
+
+    /* P5-1 MVP scans device 0's ring. Multi-device quorum scan is
+     * P5-2. */
+    stm_bdev *d = stm_pool_device_bdev(p, 0);
+    if (!d) return STM_EINVAL;
 
     /* Scan for the authoritative uberblock. */
     stm_uberblock ub;
@@ -631,16 +668,41 @@ stm_status stm_sync_open(stm_bdev *d, stm_alloc *a,
      * UINT64_MAX. Refuse early. */
     if (durable_gen >= UINT64_MAX - 2) return STM_ERANGE;
 
-    uint64_t pool_uuid[2] = {
-        stm_load_le64(ub.ub_pool_uuid[0]),
-        stm_load_le64(ub.ub_pool_uuid[1]),
-    };
-    uint64_t device_uuid[2] = {
-        stm_load_le64(ub.ub_device_uuid[0]),
-        stm_load_le64(ub.ub_device_uuid[1]),
-    };
+    /* P5-1: verify the on-disk UB matches the caller's pool handle.
+     * Caller (fs.c) peeks the UB to learn the roster, constructs a
+     * pool that matches, and hands it to us. A mismatch here means
+     * the caller either constructed the pool wrong or the UB's
+     * roster fields have been tampered with (ub_csum would catch
+     * outright flips; this catches structured tampering that
+     * preserved ub_csum — unreachable given ub_csum is BLAKE3-256,
+     * but defense-in-depth is cheap). */
+    uint16_t ub_device_count = stm_load_le16(ub.ub_device_count);
+    uint16_t ub_device_id    = stm_load_le16(ub.ub_device_id);
+    uint64_t ub_roster_hash  = stm_load_le64(ub.ub_roster_hash);
+    if (ub_device_count != (uint16_t)stm_pool_device_count(p)) return STM_ECORRUPT;
+    if (ub_device_id    >= ub_device_count)                     return STM_ECORRUPT;
+    if (ub_roster_hash  != stm_pool_roster_hash(p))            return STM_ECORRUPT;
+    /* Cross-check this device's UUID against the roster slot. */
+    {
+        const stm_pool_device *self = stm_pool_device_info(p, ub_device_id);
+        uint64_t ub_dev_uuid[2] = {
+            stm_load_le64(ub.ub_device_uuid[0]),
+            stm_load_le64(ub.ub_device_uuid[1]),
+        };
+        if (!self) return STM_ECORRUPT;
+        if (self->uuid[0] != ub_dev_uuid[0] ||
+            self->uuid[1] != ub_dev_uuid[1]) return STM_ECORRUPT;
+        /* pool_uuid too. */
+        uint64_t ub_pool_uuid[2] = {
+            stm_load_le64(ub.ub_pool_uuid[0]),
+            stm_load_le64(ub.ub_pool_uuid[1]),
+        };
+        const uint64_t *puuid = stm_pool_uuid(p);
+        if (puuid[0] != ub_pool_uuid[0] ||
+            puuid[1] != ub_pool_uuid[1]) return STM_ECORRUPT;
+    }
 
-    stm_sync *s2 = sync_new(d, a, pool_uuid, device_uuid);
+    stm_sync *s2 = sync_new(p, a);
     if (!s2) return STM_ENOMEM;
 
     /* R9 P0-1 — mount-claim UB protocol.

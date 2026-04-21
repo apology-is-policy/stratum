@@ -38,6 +38,7 @@
 #include <stratum/bootstrap.h>
 #include <stratum/janus.h>
 #include <stratum/keyfile.h>
+#include <stratum/pool.h>
 #include <stratum/super.h>
 #include <stratum/sync.h>
 
@@ -53,6 +54,7 @@ struct stm_fs {
     pthread_mutex_t lock;
 
     stm_bdev  *bdev;         /* owned — closed at unmount */
+    stm_pool  *pool;         /* owned — P5-1 N=1 wrapper over bdev */
     stm_alloc *alloc;        /* owned */
     stm_sync  *sync;         /* owned */
 
@@ -159,15 +161,34 @@ stm_status stm_fs_format(const char *path, const stm_fs_format_opts *opts)
                           opts->bootstrap_size_bytes, &a);
     if (s != STM_OK) { stm_bdev_close(d); stm_hybrid_keys_wipe(&wk); return s; }
 
-    stm_sync *sync = NULL;
-    s = stm_sync_create(d, a, opts->pool_uuid, opts->device_uuid, &wk, &sync);
+    /* P5-1: degenerate 1-device pool. Role/class default to
+     * DATA/SSD for MVP — P5-4 will surface these as admin knobs. */
+    stm_pool_open_opts popts;
+    memset(&popts, 0, sizeof popts);
+    popts.pool_uuid[0] = opts->pool_uuid[0];
+    popts.pool_uuid[1] = opts->pool_uuid[1];
+    popts.device_count = 1;
+    popts.devices[0].uuid[0]    = opts->device_uuid[0];
+    popts.devices[0].uuid[1]    = opts->device_uuid[1];
+    popts.devices[0].size_bytes = caps->size_bytes;
+    popts.devices[0].role       = STM_DEV_ROLE_DATA;
+    popts.devices[0].class_     = STM_DEV_CLASS_SSD;
+    popts.devices[0].state      = STM_DEV_STATE_ONLINE;
+    popts.devices[0].bdev       = d;
+    stm_pool *pool = NULL;
+    s = stm_pool_open(&popts, &pool);
     if (s != STM_OK) { stm_alloc_close(a); stm_bdev_close(d); stm_hybrid_keys_wipe(&wk); return s; }
+
+    stm_sync *sync = NULL;
+    s = stm_sync_create(pool, a, &wk, &sync);
+    if (s != STM_OK) { stm_pool_close(pool); stm_alloc_close(a); stm_bdev_close(d); stm_hybrid_keys_wipe(&wk); return s; }
 
     /* First commit: lays down the initial uberblock at gen=1 so a
      * subsequent stm_fs_mount finds something to read. */
     s = stm_sync_commit(sync);
     if (s != STM_OK) {
         stm_sync_close(sync);
+        stm_pool_close(pool);
         stm_alloc_close(a);
         stm_bdev_close(d);
         stm_hybrid_keys_wipe(&wk);      /* R10 P1-1 */
@@ -177,6 +198,7 @@ stm_status stm_fs_format(const char *path, const stm_fs_format_opts *opts)
     /* Tidy close. The format does NOT leave an open handle — caller
      * must stm_fs_mount afterward. */
     stm_sync_close(sync);
+    stm_pool_close(pool);
     stm_alloc_close(a);
     stm_bdev_close(d);
     stm_hybrid_keys_wipe(&wk);
@@ -187,7 +209,8 @@ stm_status stm_fs_format(const char *path, const stm_fs_format_opts *opts)
 /* Mount.                                                                     */
 /* ========================================================================= */
 
-static stm_fs *fs_new(stm_bdev *d, stm_alloc *a, stm_sync *sync, bool ro)
+static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
+                       stm_alloc *a, stm_sync *sync, bool ro)
 {
     stm_fs *fs = calloc(1, sizeof *fs);
     if (!fs) return NULL;
@@ -196,6 +219,7 @@ static stm_fs *fs_new(stm_bdev *d, stm_alloc *a, stm_sync *sync, bool ro)
         return NULL;
     }
     fs->bdev      = d;
+    fs->pool      = pool;
     fs->alloc     = a;
     fs->sync      = sync;
     fs->read_only = ro;
@@ -235,9 +259,70 @@ stm_status stm_fs_mount(const char *path,
         return s;
     }
 
+    /* P5-1: peek the durable uberblock to discover the pool's
+     * roster (pool_uuid, per-device uuid / role / class / state),
+     * then construct an stm_pool handle that MATCHES the UB. Sync
+     * will validate the match; a mismatch means either programmer
+     * error here or tampered roster bytes in the UB. */
+    stm_uberblock peek_ub;
+    {
+        uint32_t peek_lbl = 0, peek_slot = 0;
+        s = stm_sb_mount_scan(d, &peek_ub, &peek_lbl, &peek_slot);
+        if (s != STM_OK) {
+            stm_bdev_close(d);
+            stm_hybrid_keys_wipe(&wk);
+            if (janus) stm_janus_client_disconnect(janus);
+            return s;
+        }
+    }
+    uint16_t peek_device_count = stm_load_le16(peek_ub.ub_device_count);
+    uint16_t peek_device_id    = stm_load_le16(peek_ub.ub_device_id);
+    if (peek_device_count == 0 ||
+        peek_device_count > STM_POOL_DEVICES_MAX ||
+        peek_device_id >= peek_device_count) {
+        stm_bdev_close(d);
+        stm_hybrid_keys_wipe(&wk);
+        if (janus) stm_janus_client_disconnect(janus);
+        return STM_ECORRUPT;
+    }
+    stm_pool_device peek_devs[STM_POOL_DEVICES_MAX];
+    memset(peek_devs, 0, sizeof peek_devs);
+    s = stm_pool_roster_decode(peek_ub.ub_roster, peek_device_count, peek_devs);
+    if (s != STM_OK) {
+        stm_bdev_close(d);
+        stm_hybrid_keys_wipe(&wk);
+        if (janus) stm_janus_client_disconnect(janus);
+        return s;
+    }
+    /* Bind THIS bdev into the slot that matches its uuid (the UB's
+     * ub_device_id). P5-2 generalizes this to multi-device path
+     * resolution; P5-1 has only the one slot. */
+    peek_devs[peek_device_id].bdev = d;
+
+    stm_pool_open_opts popts;
+    memset(&popts, 0, sizeof popts);
+    popts.pool_uuid[0] = stm_load_le64(peek_ub.ub_pool_uuid[0]);
+    popts.pool_uuid[1] = stm_load_le64(peek_ub.ub_pool_uuid[1]);
+    popts.device_count = peek_device_count;
+    for (size_t i = 0; i < peek_device_count; i++) {
+        popts.devices[i] = peek_devs[i];
+    }
+    /* P5-1 N=1: slots other than peek_device_id won't have bdevs
+     * assigned, but there ARE none. For P5-2 multi-device, caller
+     * supplies a path list and we bind each bdev in the loop above. */
+    stm_pool *pool = NULL;
+    s = stm_pool_open(&popts, &pool);
+    if (s != STM_OK) {
+        stm_bdev_close(d);
+        stm_hybrid_keys_wipe(&wk);
+        if (janus) stm_janus_client_disconnect(janus);
+        return s;
+    }
+
     stm_alloc *a = NULL;
     s = stm_alloc_open_blank(d, &a);
     if (s != STM_OK) {
+        stm_pool_close(pool);
         stm_bdev_close(d);
         stm_hybrid_keys_wipe(&wk);
         if (janus) stm_janus_client_disconnect(janus);
@@ -245,22 +330,24 @@ stm_status stm_fs_mount(const char *path,
     }
 
     stm_sync *sync = NULL;
-    s = stm_sync_open(d, a,
+    s = stm_sync_open(pool, a,
                         have_kf ? &wk : NULL,
                         have_jn ? janus : NULL,
                         &sync);
     if (s != STM_OK) {
         stm_alloc_close(a);
+        stm_pool_close(pool);
         stm_bdev_close(d);
         stm_hybrid_keys_wipe(&wk);
         if (janus) stm_janus_client_disconnect(janus);
         return s;
     }
 
-    stm_fs *fs = fs_new(d, a, sync, opts->read_only);
+    stm_fs *fs = fs_new(d, pool, a, sync, opts->read_only);
     if (!fs) {
         stm_sync_close(sync);
         stm_alloc_close(a);
+        stm_pool_close(pool);
         stm_bdev_close(d);
         stm_hybrid_keys_wipe(&wk);
         if (janus) stm_janus_client_disconnect(janus);
@@ -293,9 +380,11 @@ stm_status stm_fs_unmount(stm_fs *fs)
         commit_status = stm_sync_commit(fs->sync);
     }
 
-    /* Close the stack regardless of commit result. */
+    /* Close the stack regardless of commit result. Order matters:
+     * sync borrows pool; pool borrows bdev. Close inside-out. */
     stm_sync_close(fs->sync);
     stm_alloc_close(fs->alloc);
+    stm_pool_close(fs->pool);
     stm_bdev_close(fs->bdev);
 
     pthread_mutex_unlock(&fs->lock);

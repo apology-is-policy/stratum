@@ -47,6 +47,7 @@ extern "C" {
 
 struct stm_bdev;         typedef struct stm_bdev  stm_bdev;
 struct stm_alloc;        typedef struct stm_alloc stm_alloc;
+struct stm_pool;         typedef struct stm_pool  stm_pool;
 struct stm_hybrid_keys;  typedef struct stm_hybrid_keys stm_hybrid_keys;
 struct stm_janus_client;
 
@@ -77,13 +78,17 @@ typedef struct {
 /* ========================================================================= */
 
 /*
- * Create a fresh pool's sync state. Borrows `a` (not owned); `a` must
- * already be open via stm_alloc_create. Writes NO initial uberblock —
- * callers should call stm_sync_commit to land the first durable
- * checkpoint.
+ * Create a fresh pool's sync state. Borrows `a` and `p` (not owned);
+ * `a` must already be open via stm_alloc_create. Writes NO initial
+ * uberblock — callers should call stm_sync_commit to land the first
+ * durable checkpoint.
  *
- * pool_uuid / device_uuid go into every uberblock's header; they
- * should match the allocator's bootstrap pool for consistency.
+ * `p` (P5-1): supplies pool identity (pool_uuid, per-device uuid,
+ * role, class, state, size) and the block devices written during
+ * commit. The uberblock's ub_pool_uuid / ub_device_uuid / roster /
+ * class / role fields are populated from `p`. `p` must have at least
+ * one device; P5-1 writes to device 0 (degenerate N=1). Multi-device
+ * quorum commit lands in P5-2.
  *
  * `wk` (P4-4a): the hybrid wrap key-pair. `wk->pk` is used at
  * format time to PQ-hybrid-wrap the pool's dataset key. `wk->sk`
@@ -92,9 +97,7 @@ typedef struct {
  * immediately for metadata encryption).
  */
 STM_MUST_USE
-stm_status stm_sync_create(stm_bdev *d, stm_alloc *a,
-                            const uint64_t pool_uuid[2],
-                            const uint64_t device_uuid[2],
+stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
                             const stm_hybrid_keys *wk,
                             stm_sync **out_sync);
 
@@ -126,7 +129,7 @@ stm_status stm_sync_create(stm_bdev *d, stm_alloc *a,
  * `janus` routes the unwrap over the 9P socket to a remote daemon.
  */
 STM_MUST_USE
-stm_status stm_sync_open(stm_bdev *d, stm_alloc *a,
+stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
                           const stm_hybrid_keys *wk,
                           struct stm_janus_client *janus,
                           stm_sync **out_sync);
