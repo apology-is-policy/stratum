@@ -171,6 +171,7 @@ add_subdirectory(src/btnode)
 add_subdirectory(src/btree_store)
 add_subdirectory(src/alloc)
 add_subdirectory(src/sync)
+add_subdirectory(src/fs)
 
 # ---------------------------------------------------------------------------
 # Public aggregate library.
@@ -188,7 +189,8 @@ target_link_libraries(stratum INTERFACE
     stm_btnode
     stm_btree_store
     stm_alloc
-    stm_sync)
+    stm_sync
+    stm_fs)
 target_include_directories(stratum INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/include)
 
