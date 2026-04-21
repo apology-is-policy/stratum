@@ -696,4 +696,79 @@ STM_TEST(sync_load_tree_at_without_crypt_ctx_rejected) {
     unlink(g_tmp_path);
 }
 
+/* P4-2 scrubber: tree tamper is caught by stm_alloc_verify on a
+ * LIVE pool (no remount needed). Proves the scrubber is a separate
+ * detection surface from mount-time Merkle — an in-flight tamper
+ * (e.g. bit rot, external attacker) surfaces the next scrub cycle
+ * without waiting for unmount. */
+STM_TEST(sync_verify_detects_tree_tamper) {
+    make_tmp("verify_tamper");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL;
+    make_fresh_pool(d, &a, &s);
+
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p));
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    /* Baseline: scrubber is clean. */
+    STM_ASSERT_OK(stm_alloc_verify(a));
+
+    uint64_t root = 0;
+    STM_ASSERT_OK(stm_alloc_get_tree_root(a, &root, NULL));
+    STM_ASSERT(root != 0);
+
+    /* Tamper the on-disk tree root while the pool is open. The
+     * tamper goes through a separate fd; OS page cache (shared per
+     * inode on Linux/macOS buffered I/O) makes the change visible
+     * to subsequent bdev_read through the mounted fd. */
+    uint64_t tree_byte_off =
+        stm_paddr_offset(root) * (uint64_t)STM_UB_SIZE + 512u;
+    tamper_byte_at(g_tmp_path, tree_byte_off, 0x42u);
+
+    /* Scrubber detects the tamper without remount. */
+    STM_ASSERT_ERR(stm_alloc_verify(a), STM_ECORRUPT);
+
+    teardown(a, s);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* P4-2 scrubber: clean tree verifies without error. */
+STM_TEST(sync_verify_clean_tree_ok) {
+    make_tmp("verify_clean");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL;
+    make_fresh_pool(d, &a, &s);
+
+    /* Reserve a few, commit. */
+    for (int i = 0; i < 5; i++) {
+        uint64_t p = 0;
+        STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p));
+    }
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    /* Verify walks the durable tree and returns STM_OK. */
+    STM_ASSERT_OK(stm_alloc_verify(a));
+
+    teardown(a, s);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* P4-2 scrubber: verify is trivially OK on a pool that has never
+ * committed. current_tree_root == 0 → nothing to walk. */
+STM_TEST(sync_verify_empty_pool_ok) {
+    make_tmp("verify_empty");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL;
+    make_fresh_pool(d, &a, &s);
+
+    STM_ASSERT_OK(stm_alloc_verify(a));
+
+    teardown(a, s);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
 STM_TEST_MAIN("sync")

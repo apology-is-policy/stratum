@@ -1260,6 +1260,33 @@ stm_status stm_alloc_lookup(const stm_alloc *a, uint64_t paddr,
 /* Chunk 4e: range-containment query.                                         */
 /* ========================================================================= */
 
+stm_status stm_alloc_verify(const stm_alloc *a)
+{
+    if (!a) return STM_EINVAL;
+    stm_alloc *ma = (stm_alloc *)a;
+    pthread_mutex_lock(&ma->lock);
+
+    /* No tree committed yet: trivially clean. */
+    if (a->current_tree_root == 0) {
+        pthread_mutex_unlock(&ma->lock);
+        return STM_OK;
+    }
+
+    stm_btree_crypt_ctx cx;
+    if (!build_crypt_ctx_locked(a, &cx)) {
+        pthread_mutex_unlock(&ma->lock);
+        return STM_EINVAL;
+    }
+
+    store_ctx scx = { .boot = a->boot, .bdev = a->bdev };
+    stm_status s = stm_btree_store_verify(a->current_tree_root,
+                                            a->current_tree_gen,
+                                            a->current_tree_csum,
+                                            &ALLOC_STORE_VT, &scx, &cx);
+    pthread_mutex_unlock(&ma->lock);
+    return s;
+}
+
 stm_status stm_alloc_is_allocated(const stm_alloc *a, uint64_t paddr,
                                     bool *out_allocated)
 {

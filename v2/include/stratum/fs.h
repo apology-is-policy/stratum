@@ -158,6 +158,17 @@ stm_status stm_fs_commit(stm_fs *fs);
 STM_MUST_USE
 stm_status stm_fs_stats_get(const stm_fs *fs, stm_fs_stats *out);
 
+/*
+ * Scrubber (P4-2): re-read every on-disk allocator-tree node and
+ * verify the full Merkle chain + AEAD tags. Side-effect-free —
+ * safe to call from RO or wedged handles. Returns STM_ECORRUPT on
+ * Merkle mismatch, STM_EBADTAG on AEAD failure, STM_OK on a fully
+ * consistent tree (or trivially on an empty-pool handle that has
+ * never committed).
+ */
+STM_MUST_USE
+stm_status stm_fs_verify(const stm_fs *fs);
+
 /* Mark the filesystem wedged. After this, every API entry returns
  * STM_EWEDGED (including unmount, which short-circuits the final
  * commit). Used by callers who detect a consistency violation and

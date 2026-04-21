@@ -714,6 +714,98 @@ stm_status stm_btree_store_deserialize(stm_btree_mt *t, uint64_t root_paddr,
 }
 
 /* ========================================================================= */
+/* Public: verify (P4-2 scrubber).                                            */
+/* ========================================================================= */
+
+/* Read one node, Merkle-verify against `expected`, AEAD-decrypt, then
+ * sanity-check via stm_btnode_peek. `buf` is a caller-owned scratch
+ * sized STM_BTNODE_SIZE. On success returns STM_OK and leaves `buf`
+ * holding plaintext (useful for the caller to enumerate children). */
+static stm_status verify_one(uint64_t paddr, uint64_t gen,
+                               const uint8_t expected[32],
+                               const stm_btree_store_vtable *vt, void *vt_ctx,
+                               const stm_btree_crypt_ctx *cx,
+                               uint8_t *buf, stm_btnode_info *out_info)
+{
+    stm_status s = vt->read(vt_ctx, paddr, buf, STM_BTNODE_SIZE);
+    if (s != STM_OK) return s;
+    s = check_merkle_link(buf, expected);
+    if (s != STM_OK) return s;
+    s = stm_btree_node_decrypt(cx, paddr, gen, buf);
+    if (s != STM_OK) return s;
+    restore_plaintext_self_csum(buf);
+    return stm_btnode_peek(buf, STM_BTNODE_SIZE, out_info);
+}
+
+stm_status stm_btree_store_verify(uint64_t root_paddr, uint64_t gen,
+                                    const uint8_t expected_root_csum[32],
+                                    const stm_btree_store_vtable *vt,
+                                    void *vt_ctx,
+                                    const stm_btree_crypt_ctx *cx)
+{
+    if (!vt || !vt->read)                   return STM_EINVAL;
+    if (!expected_root_csum)                return STM_EINVAL;
+    if (!cx || !cx->metadata_key)           return STM_EINVAL;
+
+    uint8_t *buf = malloc(STM_BTNODE_SIZE);
+    if (!buf) return STM_ENOMEM;
+
+    stm_btnode_info info;
+    stm_status s = verify_one(root_paddr, gen, expected_root_csum,
+                                vt, vt_ctx, cx, buf, &info);
+    if (s != STM_OK) { free(buf); return s; }
+
+    if (info.kind == STM_BTNODE_KIND_LEAF) {
+        free(buf);
+        return STM_OK;
+    }
+
+    /* INTERNAL root. Enumerate children + verify each. */
+    uint32_t cap = info.n_entries + 1u;
+    child_collect cc = { 0 };
+    cc.child_paddrs = calloc(cap, sizeof *cc.child_paddrs);
+    cc.child_kinds  = calloc(cap, sizeof *cc.child_kinds);
+    cc.child_csums  = calloc((size_t)cap * 32u, sizeof *cc.child_csums);
+    cc.cap          = cap;
+    if (!cc.child_paddrs || !cc.child_kinds || !cc.child_csums) {
+        free(cc.child_paddrs); free(cc.child_kinds); free(cc.child_csums);
+        free(buf);
+        return STM_ENOMEM;
+    }
+
+    s = stm_btnode_internal_decode(buf, STM_BTNODE_SIZE, NULL,
+                                     NULL, child_record_cb, &cc);
+    if (s == STM_OK && cc.err != STM_OK) s = cc.err;
+    if (s != STM_OK) {
+        free(cc.child_paddrs); free(cc.child_kinds); free(cc.child_csums);
+        free(buf);
+        return s;
+    }
+
+    for (uint32_t i = 0; i < cc.n_children; i++) {
+        if (cc.child_kinds[i] != STM_BPTR_KIND_LEAF) {
+            s = STM_ENOTSUPPORTED;
+            break;
+        }
+        stm_btnode_info child_info;
+        s = verify_one(cc.child_paddrs[i], gen,
+                         &cc.child_csums[i * 32],
+                         vt, vt_ctx, cx, buf, &child_info);
+        if (s != STM_OK) break;
+        if (child_info.kind != STM_BTNODE_KIND_LEAF) {
+            s = STM_ECORRUPT;
+            break;
+        }
+    }
+
+    free(cc.child_paddrs);
+    free(cc.child_kinds);
+    free(cc.child_csums);
+    free(buf);
+    return s;
+}
+
+/* ========================================================================= */
 /* Public: free_tree (reclaim previous snapshot's nodes).                     */
 /* ========================================================================= */
 

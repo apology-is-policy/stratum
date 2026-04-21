@@ -210,6 +210,27 @@ stm_status stm_btree_store_deserialize(
     const stm_btree_crypt_ctx *cx);
 
 /*
+ * Scrubber (P4-2): walk the on-disk tree and verify the full
+ * Merkle + AEAD chain without populating anything. Symmetric to
+ * `stm_btree_store_deserialize` in its verification work; differs
+ * only in that no entries are inserted into any tree. Intended for
+ * admin-invoked scrubs and for regression-testing the full
+ * read path.
+ *
+ * Returns STM_OK if every node from the root down verifies cleanly.
+ * STM_ECORRUPT on any Merkle mismatch, STM_EBADTAG on any AEAD
+ * tag-verify failure, STM_ENOTSUPPORTED on > 2-level trees
+ * (chunk 5 MVP cap). `cx`, `gen`, and `expected_root_csum` are
+ * REQUIRED (symmetric to deserialize).
+ */
+STM_MUST_USE
+stm_status stm_btree_store_verify(uint64_t root_paddr, uint64_t gen,
+                                    const uint8_t expected_root_csum[32],
+                                    const stm_btree_store_vtable *vt,
+                                    void *vt_ctx,
+                                    const stm_btree_crypt_ctx *cx);
+
+/*
  * Walk the tree rooted at `root_paddr` and call vt->free on every
  * node's paddr with the given `free_gen`. Matches the on-disk tree
  * shape produced by stm_btree_store_serialize (two levels max).

@@ -348,6 +348,19 @@ void stm_fs_mark_wedged(stm_fs *fs)
     pthread_mutex_unlock(&fs->lock);
 }
 
+stm_status stm_fs_verify(const stm_fs *fs)
+{
+    if (!fs) return STM_EINVAL;
+    /* Verify is side-effect-free: takes fs->lock so state can't
+     * shift under us, but ignores read_only + wedged (both make
+     * sense for scrubbing). */
+    stm_fs *mfs = (stm_fs *)fs;
+    pthread_mutex_lock(&mfs->lock);
+    stm_status s = stm_alloc_verify(fs->alloc);
+    pthread_mutex_unlock(&mfs->lock);
+    return s;
+}
+
 /* ========================================================================= */
 /* Test-only accessors.                                                       */
 /* ========================================================================= */

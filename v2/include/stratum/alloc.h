@@ -270,6 +270,23 @@ stm_status stm_alloc_lookup(const stm_alloc *a, uint64_t paddr,
                              uint32_t *out_refcount);
 
 /*
+ * Scrubber (P4-2): re-read every node of the on-disk allocator
+ * tree and verify the full Merkle chain + AEAD tags. Does NOT
+ * mutate the in-RAM tree. Returns STM_OK if the on-disk tree is
+ * fully consistent with the recorded `current_tree_root` /
+ * `current_tree_csum` / `current_tree_gen`. STM_ECORRUPT on Merkle
+ * mismatch, STM_EBADTAG on AEAD failure.
+ *
+ * With no tree ever committed (current_tree_root == 0) returns
+ * STM_OK trivially.
+ *
+ * Intended for admin-invoked scrubs and for regression-testing the
+ * read path end-to-end.
+ */
+STM_MUST_USE
+stm_status stm_alloc_verify(const stm_alloc *a);
+
+/*
  * Range-containment query (chunk 4e). Answers "does `paddr` fall
  * within any tree entry (allocated or pending)?" in O(log m) via the
  * in-RAM SDArray + parallel length array.

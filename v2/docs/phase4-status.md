@@ -19,20 +19,27 @@ integrity), then encryption (AEAD data extents + AEAD metadata nodes
 | `65c4c76` | **P4-6: `merkle.tla` formal spec**. Models the Merkle chain under COW: honest WriteLeaf / WriteInternal / Commit actions plus adversarial Tamper. Proves `CommittedTreeWellFormed` (stored csums = recomputed at commit time) and `TamperDetectableAtCommittedRoot` (any byte edit reachable from root makes recompute ≠ stored merkle_root). TLC clean: 83169 distinct states, depth 10. | Spec-only |
 | `cb9671f` | **P4-3a: metadata-key lifecycle**. Per-pool 32-byte metadata-encryption key. Generated at sync_create from libsodium CSPRNG, persisted at `ub_key_schema[0..32]` on every commit, recovered at sync_open. Reserved tail `ub_key_schema[32..512]` stays zero for P4-4's key-hierarchy layout. | 1 new sync test |
 | `fc52dbe` | **P4-3b: AEAD on metadata nodes**. AEGIS-256 wraps every emitted btnode image at the `btree_store` boundary. On-disk layout: ciphertext occupies `[0..STM_BTNODE_SIZE - 32)`, AEAD tag fills the trailing 32 bytes (repurposes the slot the P4-1 plaintext self-csum used to live in; `STM_AEAD_TAG_LEN_AEGIS256 == STM_BTNODE_CSUM_SIZE` ensures exact fit). `bp_csum` semantics unchanged: `BLAKE3(on-disk[0..STM_BTNODE_SIZE - 32))` — now covers ciphertext. Nonce = paddr(8 LE) ‖ gen(8 LE) ‖ pool_uuid(16 LE). AD = pool_uuid(16 LE) ‖ device_uuid(16 LE). Mandatory for v2 pools — no unencrypted path. `stm_alloc` gains a crypt-ctx setter; `stm_sync_{create,open}` installs it from the pool key before the first commit / tree load. Old-tree free path threads the prior tree's gen so AEAD decrypt can enumerate internal-node children. | 7 new btree_store tests (encrypted round-trip, tag tamper, wrong key / gen / pool_uuid / device_uuid, NULL cx); 20 suites green |
-| `<r9-fix>` | **R9 audit fixes**. P0-1: mount-claim UB closes the nonce-reuse-across-crash-recovery hazard. New `ub_alloc_root_gen` field preserves the AEAD nonce on the tree when a mount advances ub_gen without rewriting the tree. Format bump STM_UB_VERSION 2→3. P1-1: `stm_crypto_init` at top of sync_create/open. P1-2: `stm_btree_store_free_tree` now takes `expected_root_csum` and Merkle-verifies before AEAD decrypt. P2-1: `stm_btree_store_serialize` rolls back reserved paddrs on emit failure. P2-2: dangling key-pointer nulled after OOM. | 2 new sync tests (mount-claim advance, load_tree_at-without-cx); 20 suites green on default/ASan/TSan; 7 TLA+ specs clean |
+| `ca8d47b` | **R9 audit fixes**. P0-1: mount-claim UB closes the nonce-reuse-across-crash-recovery hazard. New `ub_alloc_root_gen` field preserves the AEAD nonce on the tree when a mount advances ub_gen without rewriting the tree. Format bump STM_UB_VERSION 2→3. P1-1: `stm_crypto_init` at top of sync_create/open. P1-2: `stm_btree_store_free_tree` now takes `expected_root_csum` and Merkle-verifies before AEAD decrypt. P2-1: `stm_btree_store_serialize` rolls back reserved paddrs on emit failure. P2-2: dangling key-pointer nulled after OOM. | 2 new sync tests (mount-claim advance, load_tree_at-without-cx); 20 suites green on default/ASan/TSan; 7 TLA+ specs clean |
+| `<next>` | **P4-2: scrubber**. New `stm_btree_store_verify` + `stm_alloc_verify` + `stm_fs_verify`: walks the on-disk allocator tree, re-reads every node, checks Merkle chain + AEAD tags without mutating state. Safe to call on live pools (including RO / wedged). Intended for admin-invoked scrubs and as a separate detection surface from mount-time Merkle (in-flight bit rot or external tamper surfaces on next scrub without waiting for unmount). | 3 new sync tests (clean, empty pool, post-commit tamper detection); 20 suites green |
 
 ## Remaining Phase 4 work
 
 Rough ordering, subject to revision as dependencies clarify:
 
-### P4-2: Read-path Merkle on ALL paddr-keyed lookups
+### P4-2: Scrubber (LANDED as of `<next>`)
 
-Not strictly needed for Phase 4 exit (P4-1 verifies on mount; per-read
-verification is what ARCH §7.13.2 calls the "default" mode). Currently
-only the root + immediate children are checked. A future chunk can
-wire per-read verification as blocks are fetched — but since Phase 3's
-stm_alloc_lookup doesn't load fresh blocks per call, the urgency is
-low. Revisit after crypto lands.
+Per-read verification wasn't directly applicable because Phase 3's
+`stm_alloc_lookup` serves from the in-RAM tree — no fresh reads to
+hook. Re-scoped to a scrubber primitive: `stm_alloc_verify` (+
+`stm_fs_verify`) re-reads every allocator-tree node from disk and
+runs the full Merkle + AEAD verification chain. Side-effect-free;
+safe on live / RO / wedged pools. Intended for:
+- admin-invoked scrubs
+- a separate detection surface for in-flight bit rot or tamper
+  (surfaces on next scrub rather than waiting for unmount)
+
+A future "scrub mode" daemon (background periodic scrub) is a
+Phase-8 concern but plugs into this primitive.
 
 ### P4-3: AEAD on metadata nodes (stm_btnode)
 
