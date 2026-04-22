@@ -1,7 +1,7 @@
 # Phase 5 — status and pickup guide
 
 Authoritative pickup guide for Phase 5 (multi-device + redundancy).
-Last update 2026-04-21 after P5-1 landed. Companion to
+Last update 2026-04-22 after P5-2 landed. Companion to
 `phase4-status.md`, which documents the crypto/integrity layer
 Phase 5 builds on.
 
@@ -17,6 +17,7 @@ to a later sub-chunk.
 | Commit | What | Tests |
 |---|---|---|
 | `57a37e7` | **P5-0: `quorum.tla` formal spec**. Models multi-device commit (ARCH §5.6) with per-device UB rings, parallel reservation + final writes, quorum threshold = ⌊N/2⌋+1, device FAULTED / ONLINE state, rejoin + reconcile, coordinator crash. Proves `TypeOK`, `QuorumSafety` (phase=Published implies ≥quorum devices at target_gen), `AuthoritativeMono` (committed gens never regress), `CommitAtomic` (auth ≥ 2×commits_done), `OrphansNotAuthoritative` (partial-Phase-3 gens held by <quorum devices are never authoritative), `LiveCoordTargetValid` (coord's in-flight target_gen ≥ current auth), `QuorumDurability`, `MountGenBumpMulti`. Mount requires quorum of ONLINE devices (emergency mount is an explicit opt-in not modeled). TLC-clean under `Devices={1,2,3}, MaxCommits=3, MaxFaults=2`: 36839 distinct states, depth 35. Two iterations: initial pass rejected orphan gens from degraded-mount, then caught an over-strict `LiveCoordMonotonic` (`target > auth`) that Fails in the transient state where Phase 3 WriteFinals hit quorum on disk before CheckFinalQuorum fires. Fixed by weakening to `target_gen >= auth`. | Spec-only; 9 TLA+ specs clean including the new one. |
+| `1414cc4` | **P5-2: Multi-device 2-phase quorum commit**. Implements the commit + mount protocols for N-device pools per quorum.tla. Each commit writes reservation at gen=auth+1 (pre-flush roots; rollback target) and final at gen=auth+2 (post-flush roots + new merkle) to every pool device in parallel, with quorum (⌊N/2⌋+1) fsync confirmations required per phase. Mount scans every device, computes auth_gen = highest gen G such that ≥quorum devices have ub_gen ≥ G (derived by sorting valid gens descending and taking the kth element), validates content agreement among quorum members at gen=auth_gen, then writes a claim UB at auth+1 to every device (quorum required). Fresh-pool first commit is 1-phase (no pre-flush state); subsequent commits uniformly 2-phase. Struct cleanup: `stm_sync` drops cached `bdev`/`self_device_id` (no "self" in multi-device), adds `auth_gen` field. `build_uberblock` takes a `target_device_id` param; shared bytes + per-device fields split via a new `write_ub_to_all_devices` helper. New `STM_EQUORUM` status code for quorum-write failures. `stm_sync_info` exposes `auth_gen` alongside `current_gen`. Alloc tree still lives on device 0 (metadata primary) — P5-3+ mirror/RS will fan it out. | New `test_sync_multi.c` (7 tests): 3-device roundtrip, quorum fault tolerance (wipe 1 of 3 devices' UBs; mount succeeds), sub-quorum refusal (wipe 2 of 3; STM_EQUORUM), every-device UB write verification, orphan-ahead-of-quorum (OrphansNotAuthoritative), inconsistent-quorum-content rejection. Existing tests updated for +2 gen arithmetic (fresh commit at gen=1; subsequent commits advance auth by 2). All 26 suites green on default + ASan + TSan. 9/9 TLA+ specs clean. |
 | `567b143` | **P5-1: Pool layer foundation**. Introduces `stm_pool` (`include/stratum/pool.h` + `src/pool/pool.c`) wrapping up to 64 `stm_bdev`s — today's configuration is always N=1 (degenerate). Adds `stm_device_state` enum. Populates the uberblock's previously-zero roster fields (`ub_device_count`, `ub_device_id`, `ub_device_class`, `ub_device_role`, `ub_roster[2048]`, `ub_roster_hash`) on every commit. `ub_roster` layout is 32 bytes per slot: `uuid[16] + size[8] + role[1] + class[1] + state[1] + reserved[5]`; up to 64 slots exactly match `ub_roster[2048]`. `ub_roster_hash` is the le64 truncation of BLAKE3-256 over the encoded 2048-byte roster. Refactors `stm_sync_create` / `stm_sync_open` to take a `stm_pool *` in place of `(stm_bdev*, pool_uuid, device_uuid)` — cleaner lifecycle, ready for P5-2 to iterate the pool's device set during commit. `stm_fs_format` builds a 1-device pool from `stm_fs_format_opts` (role=DATA, class=SSD, state=ONLINE default); `stm_fs_mount` peeks the durable UB via `stm_sb_mount_scan`, decodes the roster, constructs a matching `stm_pool`, and hands it to sync. Sync cross-validates `ub_roster_hash` + `ub_pool_uuid` + `ub_device_uuid` against the pool handle before proceeding — catches programmer error and roster tampering that preserved ub_csum. STM_UB_VERSION 4 → 5. v4 pools refused at mount by version check; no feature-flag allocation needed (version bump alone gates per ARCH §5.9). | New `test_pool.c` (12 tests): open validation, roster encode/decode roundtrip, roster hash determinism + identity-change sensitivity, fs format/mount roundtrip populates every roster field, decode rejects leftover bytes + zero UUID in populated slot, sync_open refuses wrong pool_uuid + wrong device_uuid. All 25 suites (24 prior + 1 new) green on default + ASan + TSan. |
 
 ## Remaining Phase 5 work
@@ -35,16 +36,21 @@ truncation of BLAKE3-256(`ub_roster[2048]`); STM_UB_VERSION bumped
 previously `(stm_bdev*, pool_uuid, device_uuid)` lived — P5-2 is
 now pure body-change (iterate the pool's device set during commit).
 
-### P5-2: Multi-device commit
+### P5-2: Multi-device commit — **LANDED**
 
-Rewrites `stm_sync_commit` / `_open` per ARCH §5.6 + `quorum.tla`:
+Landed above P5-1; specifics in the Landed-chunks table. Summary:
+`stm_sync_commit` / `_open` iterate the pool's device set per
+phase; each phase requires quorum of fsync confirmations. Commit
+protocol is 2-phase (reservation at auth+1 with pre-flush roots,
+final at auth+2 with post-flush roots); each commit advances auth
+by 2. Mount scans all devices, computes auth via highest gen with
+quorum, writes a claim UB at auth+1 (quorum required) and sets
+auth_gen = auth+1 post-claim.
 
-- Coordinator-level commit replaces per-device commit. `stm_sync` gains a `stm_pool *` (not `stm_bdev *`) and iterates the pool's device set on every UB write.
-- Phase 1 reservation: write UB at `gen+1` to every ONLINE device, fsync in parallel, wait for quorum.
-- Phase 3 final: write UB at `gen+2`, wait for quorum.
-- Mount: scan all devices' rings, authoritative_gen = highest quorum-confirmed gen. BEHIND devices flagged for reconcile. Ahead-of-quorum devices (partial Phase 3) get overwritten on next commit.
-- Preserves R9 mount-claim UB protocol end-to-end: claim UB at `durable_gen+1` with `ub_alloc_root_gen = durable_gen's alloc_root_gen`.
-- Device FAULTED during commit: coordinator observes missing fsync confirmation; if quorum fails, aborts.
+Fresh-pool first commit is 1-phase (no pre-flush state). `STM_EQUORUM`
+is the new status for quorum-write failures. Alloc tree is still
+single-device (device 0, the metadata primary) — multi-device data
+redundancy lands in P5-3.
 
 ### P5-3: Mirror redundancy (`src/redundancy/` or extension of `src/alloc/`)
 
