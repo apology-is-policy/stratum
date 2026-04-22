@@ -52,9 +52,31 @@ struct stm_keyschema {
     uint64_t        root_paddr;
     uint8_t         root_csum[32];
 
-    /* Mark that in-RAM state has diverged from durable root. Commit
-     * re-serializes unconditionally — the schema is small and rarely
-     * written, so skipping the "clean" optimization doesn't cost. */
+    /* R14b P2-1: dirty flag. True when the in-RAM entry list has
+     * diverged from the durably-persisted root (i.e., a mutation
+     * happened that isn't yet on disk). When clean (no mutations
+     * since last commit), `stm_keyschema_commit` short-circuits and
+     * returns the cached (root_paddr, root_csum) without reserving
+     * a fresh paddr — this makes commit-retry idempotent.
+     *
+     * Why this matters: if sync_commit returns STM_EQUORUM and the
+     * caller retries, a non-idempotent commit would allocate a
+     * NEW paddr and produce DIFFERENT ub_key_schema bytes across
+     * the two attempts. Different bytes on different devices at
+     * the same target_gen violate quorum.tla's ContentQuorumAtGen
+     * invariant and in the worst case (3 retries, rotating
+     * single-device successes) brick the pool with STM_EQUORUM at
+     * mount. Symmetric with stm_alloc_commit's R7c P2-5
+     * optimization.
+     *
+     * Lifecycle:
+     *   - stm_keyschema_create: dirty=true (fresh in-RAM state
+     *     needs first-ever persistence).
+     *   - stm_keyschema_load_at: dirty=false (loaded == durable).
+     *   - Every mutation (insert_wrapped / rotate / mark_pruning /
+     *     prune): dirty=true.
+     *   - stm_keyschema_commit: dirty=false on success. */
+    bool            dirty;
 };
 
 /* ========================================================================= */
@@ -170,6 +192,8 @@ static stm_keyschema *new_handle(stm_bdev *d, stm_bootstrap *boot)
     if (!ks) return NULL;
     ks->bdev = d;
     ks->boot = boot;
+    /* R14b P2-1: fresh handle needs a durable root on first commit. */
+    ks->dirty = true;
     return ks;
 }
 
@@ -319,6 +343,8 @@ stm_status stm_keyschema_load_at(stm_keyschema *ks, uint64_t root_paddr,
 
     ks->root_paddr = root_paddr;
     memcpy(ks->root_csum, expected_csum, 32);
+    /* R14b P2-1: loaded-from-disk state matches durable root. Clean. */
+    ks->dirty = false;
     return STM_OK;
 }
 
@@ -327,6 +353,18 @@ stm_status stm_keyschema_commit(stm_keyschema *ks, uint64_t committed_gen,
                                   uint8_t out_root_csum[32])
 {
     if (!ks || !out_root_paddr || !out_root_csum) return STM_EINVAL;
+
+    /* R14b P2-1: if in-RAM state hasn't changed since last commit,
+     * return the cached (paddr, csum) without re-persisting.
+     * Makes commit-retry idempotent: consecutive sync_commit calls
+     * between mutations produce byte-identical ub_key_schema bytes
+     * across every device, preventing the content-divergence bug
+     * caught by quorum.tla under IdempotentRetry=FALSE. */
+    if (!ks->dirty && ks->root_paddr != 0) {
+        *out_root_paddr = ks->root_paddr;
+        memcpy(out_root_csum, ks->root_csum, 32);
+        return STM_OK;
+    }
 
     /* Always-emit-one-leaf even when empty so callers always have
      * a valid bptr in the uberblock. Mirrors btree_store's
@@ -429,6 +467,8 @@ stm_status stm_keyschema_commit(stm_keyschema *ks, uint64_t committed_gen,
 
     ks->root_paddr = new_paddr;
     memcpy(ks->root_csum, new_csum, 32);
+    /* R14b P2-1: persisted; clean until next mutation. */
+    ks->dirty = false;
     *out_root_paddr = new_paddr;
     memcpy(out_root_csum, new_csum, 32);
     return STM_OK;
@@ -486,6 +526,7 @@ stm_status stm_keyschema_insert_wrapped(stm_keyschema *ks,
         existing->wrapped     = new_wrapped;
         existing->wrapped_len = wrapped_len;
         existing->state       = state;
+        ks->dirty = true;
         return STM_OK;
     }
 
@@ -504,6 +545,7 @@ stm_status stm_keyschema_insert_wrapped(stm_keyschema *ks,
     e->next = *slot;
     *slot = e;
     ks->count++;
+    ks->dirty = true;
     return STM_OK;
 }
 
@@ -659,6 +701,7 @@ stm_status stm_keyschema_rotate(stm_keyschema *ks,
      * roll-back-able on failure, this step is the atomic point. */
     old_current->state = STM_KS_STATE_RETIRED;
     *out_old_key_id = old_current->key_id;
+    ks->dirty = true;
     return STM_OK;
 }
 
@@ -682,6 +725,7 @@ stm_status stm_keyschema_mark_pruning(stm_keyschema *ks,
     if (!e) return STM_ENOENT;
     if (e->state != STM_KS_STATE_RETIRED) return STM_EINVAL;
     e->state = STM_KS_STATE_PRUNING;
+    ks->dirty = true;
     return STM_OK;
 }
 
@@ -699,6 +743,7 @@ stm_status stm_keyschema_prune(stm_keyschema *ks,
     *slot = e->next;
     entry_free(e);
     ks->count--;
+    ks->dirty = true;
     return STM_OK;
 }
 

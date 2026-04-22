@@ -630,4 +630,60 @@ STM_TEST(sync_multi_mount_refuses_no_content_quorum) {
     unlink_paths();
 }
 
+STM_TEST(sync_multi_keyschema_commit_idempotent_on_clean) {
+    /* R14b P2-1 regression: consecutive stm_sync_commit calls with
+     * NO schema mutation between them must produce BYTE-IDENTICAL
+     * ub_key_schema bytes. If the keyschema_commit weren't idempotent
+     * (i.e., allocated a fresh paddr on every call regardless of
+     * dirty state), commit N and commit N+1 would have different
+     * ks_root paddrs, causing content divergence across devices
+     * under retry patterns.
+     *
+     * This test is the direct in-impl witness of the spec's
+     * IdempotentRetry=TRUE invariant: commit → commit (no retry
+     * triggering in between) must preserve ub_key_schema bytes. */
+    make_paths("ks_idem");
+    stm_bdev *bds[NDEV] = {0};
+    open_bdevs(bds);
+    stm_pool *pool = make_multi_pool(bds);
+
+    stm_alloc *a = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bds[0], POOL_UUID,
+                                     (uint64_t[]){ DEV_UUID_LO[0], DEV_UUID_HI },
+                                     TEST_BOOTSTRAP_BYTES, &a));
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), &s));
+
+    /* Commit #1 (fresh 1-phase). Schema was dirty (fresh handle);
+     * commit persists, clears dirty. */
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_uberblock ub1;
+    uint32_t lbl1 = 0, slot1 = 0;
+    STM_ASSERT_OK(stm_sb_mount_scan(bds[0], &ub1, &lbl1, &slot1));
+
+    /* Commit #2 with no intervening schema mutation. ks should still
+     * be clean; commit should short-circuit and return the SAME
+     * (ks_root_paddr, ks_root_csum). ub_key_schema bytes identical. */
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_uberblock ub2;
+    uint32_t lbl2 = 0, slot2 = 0;
+    STM_ASSERT_OK(stm_sb_mount_scan(bds[0], &ub2, &lbl2, &slot2));
+
+    /* Commit #2 is at higher gen (different slot). Verify the KEY
+     * SCHEMA BYTES (ub_key_schema[512]) are IDENTICAL across the
+     * two commits — proves idempotent persistence. */
+    STM_ASSERT_EQ(memcmp(ub1.ub_key_schema, ub2.ub_key_schema,
+                          sizeof ub1.ub_key_schema), 0);
+
+    /* Sanity: the UBs ARE otherwise different (ub_gen bumped). */
+    STM_ASSERT(stm_load_le64(ub1.ub_gen) !=
+                stm_load_le64(ub2.ub_gen));
+
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+    unlink_paths();
+}
+
 STM_TEST_MAIN("sync_multi")
