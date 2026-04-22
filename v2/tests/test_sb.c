@@ -119,6 +119,23 @@ STM_TEST(sb_decode_rejects_bad_version) {
     STM_ASSERT_ERR(stm_ub_decode(buf, sizeof buf, &dst), STM_EBADVERSION);
 }
 
+/* R14 P3-3: ub_gen=0 is not a valid committed UB — every durable UB
+ * is written at gen >= 1 (fresh first commit, mount-claim, reservation,
+ * or final). A decoded UB with gen=0 is either corruption or attacker-
+ * forged. Reject at decode so compute_auth_gen doesn't need to special-
+ * case a 0 sentinel. */
+STM_TEST(sb_decode_rejects_zero_gen) {
+    stm_uberblock src;
+    fill_example(&src);
+    src.ub_gen = stm_store_le64(0);
+
+    uint8_t buf[STM_UB_SIZE];
+    STM_ASSERT_OK(stm_ub_encode(&src, buf, sizeof buf));
+
+    stm_uberblock dst;
+    STM_ASSERT_ERR(stm_ub_decode(buf, sizeof buf, &dst), STM_ECORRUPT);
+}
+
 STM_TEST(sb_decode_rejects_wrong_size) {
     uint8_t small[1024];
     stm_uberblock dst;

@@ -450,11 +450,12 @@ STM_TEST(sync_multi_orphan_ahead_of_quorum_ignored_on_mount) {
     unlink_paths();
 }
 
-STM_TEST(sync_multi_mount_refuses_inconsistent_quorum_content) {
-    /* Two devices at the SAME gen with DIFFERENT content — protocol
-     * invariant violated (coordinator writes identical shared bytes
-     * to every device). Mount must refuse with STM_ECORRUPT. */
-    make_paths("split");
+STM_TEST(sync_multi_mount_tolerates_minority_content_divergence) {
+    /* R14 P1 / ContentQuorumAtGen: one device diverges at auth_gen
+     * while two agree. The majority is canonical; the minority is
+     * treated as an orphan that the next commit will reconcile.
+     * Mount must SUCCEED with the majority's content. */
+    make_paths("minor");
     stm_bdev *bds[NDEV] = {0};
     open_bdevs(bds);
     stm_pool *pool = make_multi_pool(bds);
@@ -471,20 +472,85 @@ STM_TEST(sync_multi_mount_refuses_inconsistent_quorum_content) {
     stm_pool_close(pool);
     close_bdevs(bds);
 
-    /* Hex-edit: corrupt device 1's alloc_root csum at the gen=1 slot
-     * so its shared content diverges from devices 0+2. Recompute
-     * its ub_csum so decode still passes. */
+    /* Tamper device 1's alloc_root csum at the gen=1 slot so its
+     * shared content diverges from devices 0+2. Recompute ub_csum so
+     * the UB still decodes (stm_sb_label_write handles that). */
     {
         stm_bdev_open_opts bo = stm_bdev_open_opts_default();
         stm_bdev *d = NULL;
         STM_ASSERT_OK(stm_bdev_open(g_paths[1], &bo, &d));
-
         stm_uberblock ub;
         uint32_t lbl, slot;
         STM_ASSERT_OK(stm_sb_mount_scan(d, &ub, &lbl, &slot));
-        /* Flip a byte in ub_alloc_root.bp_csum. */
         ub.ub_alloc_root.bp_csum[0] ^= 0xffu;
-        /* Re-encode + write (recomputes csum). */
+        STM_ASSERT_OK(stm_sb_label_write(d, lbl, slot, &ub));
+        stm_bdev_close(d);
+    }
+
+    /* Mount succeeds: 2-of-3 devices agree on original content, that's
+     * content-quorum. Device 1's diverged UB is a minority orphan that
+     * will be overwritten by the next commit. */
+    open_bdevs(bds);
+    pool = make_multi_pool(bds);
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(bds[0], &a2));
+    stm_sync *s2 = NULL;
+    STM_ASSERT_OK(stm_sync_open(pool, a2, make_wk(), NULL, &s2));
+    STM_ASSERT(s2 != NULL);
+
+    stm_sync_close(s2);
+    stm_alloc_close(a2);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+    unlink_paths();
+}
+
+STM_TEST(sync_multi_mount_detects_alloc_root_gen_tamper) {
+    /* R14 P2 regression: ub_alloc_root_gen is a SHARED field (same
+     * across all devices' UBs for a given commit). The byte-level
+     * shared-bytes comparison catches a tamper of ub_alloc_root_gen
+     * on a minority of devices — the majority's content wins, and
+     * mount succeeds with the canonical. Tampering 2 of 3 makes it
+     * the majority, shifting which content is canonical. Verifies
+     * the agreement check actually considers ub_alloc_root_gen
+     * (pre-R14 P2 the strict cross-check omitted it, a DoS vector). */
+    make_paths("arg_tamper");
+    stm_bdev *bds[NDEV] = {0};
+    open_bdevs(bds);
+    stm_pool *pool = make_multi_pool(bds);
+
+    stm_alloc *a = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bds[0], POOL_UUID,
+                                     (uint64_t[]){ DEV_UUID_LO[0], DEV_UUID_HI },
+                                     TEST_BOOTSTRAP_BYTES, &a));
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), &s));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+
+    /* Tamper ub_alloc_root_gen on devices 1 AND 2 with the same
+     * non-original value. That makes the TAMPERED content the
+     * majority (2/3). Mount picks the tampered content as canonical;
+     * since alloc_root_gen doesn't match the actual tree's encryption
+     * gen, alloc_load_tree_at fails with STM_EBADTAG. That's the
+     * "DoS via alloc_root_gen tamper" path P2 flagged. Under the
+     * current content-quorum check the tamper is DETECTED (majority
+     * diverges from device 0's original), and STM_EBADTAG surfaces
+     * as the specific "can't decrypt" error. */
+    for (size_t i = 1; i < NDEV; i++) {
+        stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+        stm_bdev *d = NULL;
+        STM_ASSERT_OK(stm_bdev_open(g_paths[i], &bo, &d));
+        stm_uberblock ub;
+        uint32_t lbl, slot;
+        STM_ASSERT_OK(stm_sb_mount_scan(d, &ub, &lbl, &slot));
+        /* Set to a value that definitely doesn't match the real
+         * encryption gen (fresh pool's commit ran at gen=1, so
+         * 999 is guaranteed wrong). */
+        ub.ub_alloc_root_gen = stm_store_le64(999);
         STM_ASSERT_OK(stm_sb_label_write(d, lbl, slot, &ub));
         stm_bdev_close(d);
     }
@@ -494,7 +560,68 @@ STM_TEST(sync_multi_mount_refuses_inconsistent_quorum_content) {
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(bds[0], &a2));
     stm_sync *s2 = NULL;
-    STM_ASSERT_ERR(stm_sync_open(pool, a2, make_wk(), NULL, &s2), STM_ECORRUPT);
+    /* Majority (devs 1,2) has tampered alloc_root_gen=999. Mount
+     * picks majority's content as canonical. Loads tree with gen=999;
+     * AEAD fails (real tree encrypted at gen=1). STM_EBADTAG. */
+    stm_status ms = stm_sync_open(pool, a2, make_wk(), NULL, &s2);
+    STM_ASSERT(ms != STM_OK);
+    STM_ASSERT(s2 == NULL);
+
+    stm_alloc_close(a2);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+    unlink_paths();
+}
+
+STM_TEST(sync_multi_mount_refuses_no_content_quorum) {
+    /* R14 P1: if all three devices at auth_gen have distinct
+     * content (no content has quorum of devs at auth_gen), mount
+     * must refuse with STM_EQUORUM — the pool is genuinely
+     * ambiguous and can't pick a canonical state. This is the
+     * spec-level invariant failure that the quorum.tla model
+     * surfaces under IdempotentRetry=FALSE with MaxRetries >= 1
+     * (content bump on retry diverges writes across devices).
+     *
+     * We synthesize the state directly by tampering two of the
+     * three devices' alloc_root csums with DIFFERENT byte flips. */
+    make_paths("noq");
+    stm_bdev *bds[NDEV] = {0};
+    open_bdevs(bds);
+    stm_pool *pool = make_multi_pool(bds);
+
+    stm_alloc *a = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bds[0], POOL_UUID,
+                                     (uint64_t[]){ DEV_UUID_LO[0], DEV_UUID_HI },
+                                     TEST_BOOTSTRAP_BYTES, &a));
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), &s));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+
+    /* Tamper dev 1 with xor 0x01, dev 2 with xor 0x02.
+     * Three distinct contents: dev 0 (original), dev 1 (flip1),
+     * dev 2 (flip2). No content has quorum (=2). */
+    for (size_t i = 1; i < NDEV; i++) {
+        stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+        stm_bdev *d = NULL;
+        STM_ASSERT_OK(stm_bdev_open(g_paths[i], &bo, &d));
+        stm_uberblock ub;
+        uint32_t lbl, slot;
+        STM_ASSERT_OK(stm_sb_mount_scan(d, &ub, &lbl, &slot));
+        ub.ub_alloc_root.bp_csum[0] ^= (uint8_t)i;   /* 0x01 for i=1, 0x02 for i=2 */
+        STM_ASSERT_OK(stm_sb_label_write(d, lbl, slot, &ub));
+        stm_bdev_close(d);
+    }
+
+    open_bdevs(bds);
+    pool = make_multi_pool(bds);
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(bds[0], &a2));
+    stm_sync *s2 = NULL;
+    STM_ASSERT_ERR(stm_sync_open(pool, a2, make_wk(), NULL, &s2), STM_EQUORUM);
     STM_ASSERT(s2 == NULL);
 
     stm_alloc_close(a2);

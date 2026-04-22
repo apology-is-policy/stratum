@@ -66,6 +66,15 @@ stm_status stm_ub_decode(const void *buf, size_t buf_len, stm_uberblock *out_ub)
     uint32_t version = stm_load_le32(on_disk->ub_version);
     if (version != STM_UB_VERSION) return STM_EBADVERSION;
 
+    /* R14 P3-3: ub_gen == 0 is not a valid committed UB. The first
+     * durable UB a pool ever writes is at gen=1 (fresh first commit
+     * or mount-claim). A slot carrying magic+version but gen=0 is
+     * either corrupt or an attacker-forged UB trying to pose as
+     * committed state. Reject explicitly so `compute_auth_gen`
+     * doesn't need to special-case a 0 sentinel. */
+    uint64_t gen_field = stm_load_le64(on_disk->ub_gen);
+    if (gen_field == 0) return STM_ECORRUPT;
+
     /* Recompute csum over a copy with the csum field zeroed. We must
      * not mutate the caller's buffer, and can't safely zero an in-
      * place stack copy smaller than 4096 — so stage the hash region. */

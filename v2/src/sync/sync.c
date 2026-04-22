@@ -531,6 +531,7 @@ static stm_status write_ub_to_all_devices(stm_sync *s,
     size_t n = stm_pool_device_count(s->pool);
     size_t confirmed = 0;
     size_t ro_skipped = 0;
+    stm_status last_hard_err = STM_OK;   /* R14 P3-5: for diag propagation */
     for (size_t i = 0; i < n; i++) {
         stm_bdev *d = stm_pool_device_bdev(s->pool, (uint16_t)i);
         if (!d) continue;
@@ -550,23 +551,32 @@ static stm_status write_ub_to_all_devices(stm_sync *s,
         if (sw == STM_OK) {
             confirmed++;
         } else if (sw == STM_EROFS) {
-            /* RO mount: bdev refused the write. For quorum purposes
-             * we treat RO devices as "never confirming"; an all-RO
-             * pool will fail quorum and the caller skips the claim
-             * UB write (same semantic as pre-P5-2 single-device RO
-             * mount). */
+            /* RO mount: bdev refused the write. */
             ro_skipped++;
+        } else {
+            last_hard_err = sw;
         }
-        /* Other failures (STM_EIO, etc.) drop the device from the
-         * quorum count; commit aborts if insufficient devices confirm. */
     }
 
     size_t quorum = sync_quorum_n(s);
     if (confirmed >= quorum) return STM_OK;
-    /* RO-quorum sentinel: if every device was RO and none had a
-     * hard failure, propagate STM_EROFS so the caller can distinguish
-     * "can't write" from "wrote but didn't achieve quorum". */
+
+    /* R14 P3-5: if every device was RO and none had a hard failure,
+     * propagate STM_EROFS so the caller can distinguish "can't write"
+     * from "wrote but didn't achieve quorum". */
     if (confirmed + ro_skipped == n && ro_skipped > 0) return STM_EROFS;
+
+    /* R14 P3-5: if NO device confirmed and at least one returned a
+     * specific I/O error (STM_EIO, STM_ENOSPC, etc.), propagate that
+     * error — better diagnostic than the generic STM_EQUORUM. In
+     * particular, N=1 pools where the single device fails with EIO
+     * now surface the underlying error, matching pre-P5-2 behavior. */
+    if (confirmed == 0 && ro_skipped == 0 && last_hard_err != STM_OK) {
+        return last_hard_err;
+    }
+
+    /* Mixed-outcome case (some succeeded, some failed, total <
+     * quorum): STM_EQUORUM is the accurate summary. */
     return STM_EQUORUM;
 }
 
@@ -717,6 +727,31 @@ typedef struct {
     stm_uberblock ub;       /* the canonical UB for this device */
 } sync_scan;
 
+/* R14 P2: compare two UBs for shared-field agreement. Every byte
+ * EXCEPT the per-device region (ub_device_uuid, ub_device_id,
+ * ub_device_class, ub_device_role) and ub_csum (which varies because
+ * it covers the per-device region) must match. Works by zeroing
+ * those regions in local copies and memcmping — future-proof against
+ * new shared fields landing in Phase 6+ without needing to maintain
+ * a hand-written memcmp chain. */
+static bool sync_ub_shared_bytes_match(const stm_uberblock *a,
+                                         const stm_uberblock *b)
+{
+    stm_uberblock ca = *a;
+    stm_uberblock cb = *b;
+    memset(&ca.ub_device_uuid, 0, sizeof ca.ub_device_uuid);
+    memset(&cb.ub_device_uuid, 0, sizeof cb.ub_device_uuid);
+    ca.ub_device_id = stm_store_le16(0);
+    cb.ub_device_id = stm_store_le16(0);
+    ca.ub_device_class = 0;
+    cb.ub_device_class = 0;
+    ca.ub_device_role = 0;
+    cb.ub_device_role = 0;
+    memset(ca.ub_csum, 0, sizeof ca.ub_csum);
+    memset(cb.ub_csum, 0, sizeof cb.ub_csum);
+    return memcmp(&ca, &cb, sizeof ca) == 0;
+}
+
 /* Compute the authoritative gen: highest G such that
  * |{device i : scans[i].valid && scans[i].ub.gen >= G}| >= quorum.
  * Equivalent to: sort valid gens descending, take the (quorum-1)th.
@@ -798,37 +833,83 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
         return STM_ERANGE;
     }
 
-    /* Phase 3: pick canonical UB — any device with ub_gen == auth_gen.
-     * Cross-check all other quorum members' content (at gen==auth_gen)
-     * for agreement: a coordinator that writes UB Phase-3-per-device
-     * uses IDENTICAL shared content (only per-device fields differ).
-     * Any disagreement means split or tampering. */
-    size_t canonical_idx = SIZE_MAX;
+    /* Phase 3 (R14 P1 + P2): content-quorum agreement check.
+     *
+     * Group visible devices at exactly auth_gen by their shared-field
+     * bytes. Shared fields are every byte of the UB EXCEPT the per-
+     * device region (ub_device_uuid, ub_device_id, ub_device_class,
+     * ub_device_role) and ub_csum (which varies because it covers
+     * the per-device region). Byte-level comparison via
+     * sync_ub_shared_bytes_match automatically covers every current
+     * and future shared field without hand-enumeration.
+     *
+     * Selection:
+     *   - If ≥ quorum visible devs are at exactly auth_gen: require
+     *     content-quorum among them (≥ quorum with identical shared
+     *     bytes). Otherwise STM_EQUORUM (genuine content ambiguity;
+     *     no single UB can be authoritative).
+     *   - If fewer than quorum devs are at exactly auth_gen (the
+     *     rest are ahead-of-auth orphans, which is how we recover
+     *     from partial-Phase-3 commits): canonical = any dev at
+     *     auth_gen. No content-quorum check (there are < quorum devs
+     *     to disagree). Ahead-of-auth devices are orphans that the
+     *     next commit's writes will overwrite.
+     *
+     * Dissenting devices at auth_gen that aren't in the quorum group
+     * are legitimate orphans per ARCH §5.8 — they'll be overwritten
+     * on the next commit's per-device writes. Tolerating minority
+     * disagreement here (instead of failing STM_ECORRUPT like the
+     * strict pre-R14 check) lets the impl recover from R14 P1's
+     * non-idempotent-retry divergence without operator intervention,
+     * and is the spec-compliant behavior per quorum.tla's
+     * ContentQuorumAtGen invariant. */
+    typedef struct { size_t rep; size_t count; } content_group;
+    content_group groups[STM_POOL_DEVICES_MAX];
+    size_t ngroups = 0;
+    size_t devs_at_auth = 0;
+    size_t any_at_auth = SIZE_MAX;
     for (size_t i = 0; i < n; i++) {
-        if (scans[i].valid && stm_load_le64(scans[i].ub.ub_gen) == auth_gen) {
-            if (canonical_idx == SIZE_MAX) {
-                canonical_idx = i;
-                continue;
-            }
-            /* Cross-check shared fields. */
-            const stm_uberblock *c = &scans[canonical_idx].ub;
-            const stm_uberblock *x = &scans[i].ub;
-            if (memcmp(c->ub_pool_uuid, x->ub_pool_uuid, sizeof c->ub_pool_uuid) != 0 ||
-                memcmp(&c->ub_alloc_root, &x->ub_alloc_root, sizeof c->ub_alloc_root) != 0 ||
-                memcmp(c->ub_merkle_root, x->ub_merkle_root, 32) != 0 ||
-                memcmp(c->ub_merkle_root_salt, x->ub_merkle_root_salt, 32) != 0 ||
-                memcmp(&c->ub_roster_hash, &x->ub_roster_hash, sizeof c->ub_roster_hash) != 0 ||
-                memcmp(&c->ub_device_count, &x->ub_device_count, sizeof c->ub_device_count) != 0 ||
-                memcmp(c->ub_key_schema, x->ub_key_schema, sizeof c->ub_key_schema) != 0 ||
-                memcmp(c->ub_roster, x->ub_roster, sizeof c->ub_roster) != 0) {
-                free(scans);
-                return STM_ECORRUPT;
+        if (!scans[i].valid) continue;
+        if (stm_load_le64(scans[i].ub.ub_gen) != auth_gen) continue;
+        devs_at_auth++;
+        if (any_at_auth == SIZE_MAX) any_at_auth = i;
+        bool matched = false;
+        for (size_t g = 0; g < ngroups; g++) {
+            if (sync_ub_shared_bytes_match(&scans[i].ub,
+                                              &scans[groups[g].rep].ub)) {
+                groups[g].count++;
+                matched = true;
+                break;
             }
         }
+        if (!matched) {
+            groups[ngroups].rep   = i;
+            groups[ngroups].count = 1;
+            ngroups++;
+        }
+    }
+    size_t canonical_idx = SIZE_MAX;
+    if (devs_at_auth >= quorum) {
+        /* Need content-quorum within the auth_gen devs. */
+        for (size_t g = 0; g < ngroups; g++) {
+            if (groups[g].count >= quorum) {
+                canonical_idx = groups[g].rep;
+                break;
+            }
+        }
+        if (canonical_idx == SIZE_MAX) {
+            free(scans);
+            return STM_EQUORUM;
+        }
+    } else {
+        /* < quorum devs at exactly auth_gen — rest are ahead-of-auth
+         * orphans. Canonical = any dev at auth_gen. Orphans get
+         * overwritten by next commit's per-device writes. */
+        canonical_idx = any_at_auth;
     }
     if (canonical_idx == SIZE_MAX) {
-        /* Invariant violation: compute_auth_gen returned auth_gen but
-         * no device is at exactly that gen. Should be unreachable. */
+        /* Invariant violation: compute_auth_gen returned auth_gen > 0
+         * but no device has gen == auth_gen. Should be unreachable. */
         free(scans);
         return STM_ECORRUPT;
     }

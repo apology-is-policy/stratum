@@ -1,316 +1,369 @@
 ------------------------------ MODULE quorum ------------------------------
 (***************************************************************************)
-(* Stratum v2 multi-device commit — quorum model.                           *)
+(* Stratum v2 multi-device commit — quorum + content-agreement model.       *)
 (*                                                                           *)
 (* Covers ARCH §4 (storage pool roster) and §5.5-5.8 (quorum semantics,     *)
 (* multi-device commit protocol, device rejoin/reconcile). Sister to       *)
-(* sync.tla, which models the four-phase commit from the perspective of    *)
-(* a single device; quorum.tla adds the per-device dimension and the       *)
-(* quorum-of-N constraint at Phase 1 / Phase 3.                             *)
+(* sync.tla (single-device four-phase).                                    *)
 (*                                                                           *)
-(* Scope deliberately omits:                                                *)
-(*   * Data-area writes and nonce uniqueness — already proven in sync.tla  *)
-(*     (under multi-device paddr = (device_id, offset, gen) the argument   *)
-(*      extends mechanically because gen is globally monotonic per-pool    *)
-(*      and device_id distinguishes across devices).                       *)
-(*   * Erasure-coded stripe layout — orthogonal to commit semantics.        *)
-(*   * Key-schema transitions — covered in key_schema.tla.                  *)
+(* R14 extension (2026-04-22): each device's UB carries BOTH a gen AND a   *)
+(* content tag. The content tag represents the shared bytes the coordinator*)
+(* wrote during that commit attempt (key-schema root paddr, alloc-tree root*)
+(* paddr, merkle root, etc. — everything that should be byte-identical    *)
+(* across every device at a given gen). The spec invariant                 *)
+(* ContentAgreementAtGen says every device at the same gen must have the  *)
+(* same content; this captures the correctness condition that a crash +   *)
+(* remount can load a consistent view without having to reconcile        *)
+(* disagreements between quorum members.                                    *)
+(*                                                                           *)
+(* R14 P1 is the bug caught by this extension: under non-idempotent retry *)
+(* (e.g., stm_keyschema_commit reserves a fresh paddr on every call), two *)
+(* retry attempts at the same target_gen write DIFFERENT content bytes on *)
+(* different devices; on remount the cross-check detects a divergence at  *)
+(* the quorum gen and refuses to mount.                                    *)
+(*                                                                           *)
+(* CONSTANT IdempotentRetry toggles the behavior of RetryPhase3:           *)
+(*   - TRUE  (fixed impl):     retry reuses coord_commit_content;         *)
+(*                               re-writes produce byte-identical UBs.     *)
+(*   - FALSE (buggy impl):     retry bumps coord_commit_content;          *)
+(*                               re-writes produce divergent UBs.          *)
 (*                                                                           *)
 (* Invariants proved:                                                       *)
-(*   * TypeOK              — variable domains are stable.                  *)
-(*   * CommitAtomic        — if a commit at gen G achieved Phase 3 quorum, *)
-(*                            post-recovery the authoritative gen is >= G. *)
-(*                            Partial-Phase-3 writes without quorum are    *)
-(*                            never observable as authoritative.           *)
-(*   * AuthoritativeMono   — across any sequence of mounts + commits,     *)
-(*                            the authoritative gen never regresses.       *)
-(*   * NoOrphanedCommit    — no device persists a gen that no other device*)
-(*                            knows about and that is authoritative.       *)
-(*   * QuorumSafety        — a gen is authoritative iff at least quorum_N *)
-(*                            devices have a valid ub_ring entry at that  *)
-(*                            gen.                                         *)
-(*   * LiveCoordMonotonic  — the live coordinator's "next gen to commit"  *)
-(*                            is always strictly greater than the current *)
-(*                            authoritative gen (MountGenBump, lifted to  *)
-(*                            multi-device).                                *)
+(*   * TypeOK                — variable domains stable.                    *)
+(*   * QuorumSafety           — phase=Published ⇒ quorum at target_gen.   *)
+(*   * AuthoritativeMono      — auth gen never regresses.                  *)
+(*   * CommitAtomic           — auth ≥ 2·commits_done.                     *)
+(*   * OrphansNotAuthoritative — partial-Phase-3 gens held by <quorum     *)
+(*                                devices never become authoritative.      *)
+(*   * LiveCoordTargetValid   — in-flight target_gen ≥ auth.               *)
+(*   * QuorumDurability       — committed commits stay authoritative.      *)
+(*   * MountGenBumpMulti      — post-mount target > any dev_ub[d].gen.    *)
+(*   * ContentAgreementAtGen  — at the same gen, all devices agree on     *)
+(*                               content (R14 P1).                          *)
 (***************************************************************************)
 
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS
     Devices,          \* finite set of device ids, e.g. {1, 2, 3}
-    MaxCommits,       \* bound on the number of commit attempts (state-space cap)
-    MaxFaults         \* bound on concurrent device faults (state-space cap)
+    MaxCommits,       \* bound on the number of commit attempts
+    MaxFaults,        \* bound on concurrent device faults
+    MaxRetries,       \* bound on retries per commit (state-space cap)
+    IdempotentRetry   \* BOOLEAN: TRUE = fixed impl, FALSE = buggy impl
 
 ASSUME /\ Devices # {}
        /\ Cardinality(Devices) >= 1
        /\ MaxCommits \in Nat \ {0}
        /\ MaxFaults  \in Nat
+       /\ MaxRetries \in Nat
+       /\ IdempotentRetry \in BOOLEAN
 
 (***************************************************************************)
-(* Quorum threshold: majority of the original roster. For N devices, any   *)
-(* gen with ⌊N/2⌋+1 devices holding a valid UB at that gen is              *)
-(* authoritative. The roster in this model is fixed (device add/remove is *)
-(* a separate commit-level concern — this spec assumes the roster is set  *)
-(* at pool creation and never changes). Device add/remove is modeled as   *)
-(* an orthogonal refinement elsewhere.                                     *)
+(* Quorum threshold: ⌊N/2⌋+1.                                              *)
 (***************************************************************************)
 
 QuorumN == (Cardinality(Devices) \div 2) + 1
 
 (***************************************************************************)
-(* Device state set. ONLINE devices accept writes and respond to fsync.    *)
-(* FAULTED devices refuse all I/O (modeled: coordinator can't durable-    *)
-(* write to them). A device's UB-ring state persists across FAULTED→ONLINE*)
-(* transitions (rejoin) — the on-disk bits don't evaporate.                *)
+(* Device state. ONLINE accepts writes; FAULTED refuses I/O. UB ring       *)
+(* state persists across FAULTED→ONLINE transitions.                       *)
 (***************************************************************************)
 
 DevState == {"ONLINE", "FAULTED"}
 
-(***************************************************************************)
-(* Coordinator phases (mirrors ARCH §5.6 plus Idle for quiescent).         *)
-(***************************************************************************)
-
 Phase == {"Idle", "Reserving", "Flushing", "Finalizing", "Published"}
 
-VARIABLES
-    dev_ub,            \* [Devices -> {0} \cup 1..MaxGen] — each device's
-                       \* highest durably-written ub gen (0 = never written)
-    dev_state,         \* [Devices -> DevState]
-    coord_phase,       \* current phase (Idle when quiescent)
-    coord_target_gen,  \* the gen this in-progress commit targets (0 if Idle)
-    commits_done,      \* count of committed (Phase 3 quorum achieved) gens
-    fault_count,       \* running total of device faults (bounded by MaxFaults)
-    mounted            \* TRUE after Mount has run at least once
+(***************************************************************************)
+(* Content space. Each commit attempt gets a distinct content tag; the     *)
+(* claim UB (post-mount) and reservation UBs share "ClaimContent" (= 1)   *)
+(* because their bytes are derived deterministically from the previous    *)
+(* auth UB's bytes with only ub_gen bumped. Final UBs use a commit-       *)
+(* specific content that varies per commit (and per retry, in the buggy   *)
+(* model).                                                                  *)
+(***************************************************************************)
 
-vars == <<dev_ub, dev_state, coord_phase, coord_target_gen,
-           commits_done, fault_count, mounted>>
+ClaimContent == 1   \* all claim + reservation UBs use content = 1 (stable).
+MaxContent == 1 + MaxCommits * (MaxRetries + 1)   \* upper bound for state space.
 
-\* Tighter upper bound for gen values. Each commit advances gen by 2 (claim
-\* UB at +1, final UB at +2 — matches R9 mount-claim protocol). Initial
-\* mount advances from 0 to 2, then each of MaxCommits commits adds 2. This
-\* keeps MaxGen deterministic for TLC's state-space enumeration.
+(***************************************************************************)
+(* Each commit may retry up to MaxRetries times (bounded). Each commit    *)
+(* advances gen by 2 (reservation + final). Claim uses 1 gen.              *)
+(***************************************************************************)
+
 MaxGen == 2 * (MaxCommits + 1)
 
-\* --------------------------------------------------------------------------
-\* Helpers.
-\* --------------------------------------------------------------------------
+VARIABLES
+    dev_ub,            \* [Devices -> [gen |-> 0..MaxGen,
+                       \*              content |-> 0..MaxContent]]
+    dev_state,         \* [Devices -> DevState]
+    coord_phase,       \* Phase
+    coord_target_gen,  \* 0..MaxGen
+    coord_commit_content, \* 0..MaxContent (content tag for current commit's final UB)
+    commits_done,      \* 0..MaxCommits
+    retry_count,       \* 0..MaxRetries (retries within the CURRENT commit)
+    next_content,      \* 0..MaxContent — monotonic content-id allocator
+    fault_count,       \* 0..MaxFaults
+    mounted            \* BOOLEAN
+
+vars == <<dev_ub, dev_state, coord_phase, coord_target_gen,
+           coord_commit_content, commits_done, retry_count,
+           next_content, fault_count, mounted>>
+
+(***************************************************************************)
+(* Helpers.                                                                  *)
+(***************************************************************************)
 
 OnlineDevices == { d \in Devices : dev_state[d] = "ONLINE" }
 
-\* Devices that hold a valid UB at exactly gen g.
-DevicesAtGen(g) == { d \in Devices : dev_ub[d] = g }
+DevicesAtGen(g) == { d \in Devices : dev_ub[d].gen = g }
+DevicesAtLeastGen(g) == { d \in Devices : dev_ub[d].gen >= g }
 
-\* Devices whose highest UB is >= g (i.e. they have SEEN this commit,
-\* possibly later ones too).
-DevicesAtLeastGen(g) == { d \in Devices : dev_ub[d] >= g }
-
-\* A gen g is committed iff quorum devices have a ub at g or higher. The
-\* "or higher" captures the device that's been through a subsequent commit
-\* — its UB-ring-max is some g' > g, but the g'th commit was only durable
-\* because g was already durable, so by induction g is still committed.
 GenCommitted(g) ==
     g > 0 /\ Cardinality(DevicesAtLeastGen(g)) >= QuorumN
 
-\* The authoritative gen is the largest committed gen. 0 if none.
 AuthoritativeGen ==
     LET committed == { g \in 0..MaxGen : GenCommitted(g) }
     IN  IF committed = {} THEN 0
         ELSE CHOOSE g \in committed :
                   \A g2 \in committed : g2 <= g
 
-\* --------------------------------------------------------------------------
-\* Initial state: empty pool, no commits, all devices online.
-\* --------------------------------------------------------------------------
+(***************************************************************************)
+(* Init.                                                                     *)
+(***************************************************************************)
 
 Init ==
-    /\ dev_ub           = [d \in Devices |-> 0]
-    /\ dev_state        = [d \in Devices |-> "ONLINE"]
-    /\ coord_phase      = "Idle"
-    /\ coord_target_gen = 0
-    /\ commits_done     = 0
-    /\ fault_count      = 0
-    /\ mounted          = FALSE
+    /\ dev_ub               = [d \in Devices |-> [gen |-> 0, content |-> 0]]
+    /\ dev_state            = [d \in Devices |-> "ONLINE"]
+    /\ coord_phase          = "Idle"
+    /\ coord_target_gen     = 0
+    /\ coord_commit_content = 0
+    /\ commits_done         = 0
+    /\ retry_count          = 0
+    /\ next_content         = ClaimContent  \* content=1 reserved for claim/reservation.
+    /\ fault_count          = 0
+    /\ mounted              = FALSE
 
-\* --------------------------------------------------------------------------
-\* Mount.
-\* --------------------------------------------------------------------------
+(***************************************************************************)
+(* Mount — claim UB at auth+1 to every ONLINE device, content=ClaimContent.*)
+(***************************************************************************)
 
-\* Mount scans every device's ring and picks the highest gen with quorum.
-\* It then writes a "claim" UB at auth_gen + 1 (R9 mount-claim protocol)
-\* to prevent nonce reuse across crash recovery. Here we model the mount
-\* step as setting coord_target_gen to auth_gen + 1 for the claim phase.
-\* The claim write is modeled as Phase 3's Quorum achieving (auth_gen + 1)
-\* — for simplicity we fold the claim into the post-mount state via a
-\* best-effort write to every online device. A real mount writes the
-\* claim synchronously and refuses to mount if < quorum accept it; we
-\* model both outcomes.
 Mount ==
     /\ ~mounted
     /\ coord_phase = "Idle"
-    \* Mount requires quorum of ONLINE devices. A pool with fewer online
-    \* devices refuses to mount (ARCH §5.11 emergency-mount path is an
-    \* explicit opt-in not modeled here). This closes the "one device
-    \* ahead of quorum" hole the first TLC pass surfaced.
     /\ Cardinality(OnlineDevices) >= QuorumN
     /\ LET auth == AuthoritativeGen
-       IN
-         /\ auth + 1 <= MaxGen
-         /\ coord_target_gen' = auth + 1
-         /\ coord_phase' = "Idle"
-         \* Claim UB: every ONLINE device writes the claim gen. Since
-         \* we gated on |OnlineDevices| >= QuorumN, auth+1 immediately
-         \* achieves quorum — no orphan "ahead of quorum" device can
-         \* arise from mount. (FAULTED devices keep their stale dev_ub;
-         \* they reconcile on rejoin.)
-         /\ dev_ub' = [d \in Devices |->
-                         IF dev_state[d] = "ONLINE"
-                            /\ dev_ub[d] < auth + 1
-                         THEN auth + 1
-                         ELSE dev_ub[d]]
-         /\ mounted' = TRUE
-    /\ UNCHANGED <<dev_state, commits_done, fault_count>>
+       IN  /\ auth + 1 <= MaxGen
+           /\ coord_target_gen' = auth + 1
+           /\ coord_phase' = "Idle"
+           \* Claim UB is written to EVERY ONLINE device, overwriting
+           \* any prior content at the claim gen. The impl's
+           \* write_ub_to_all_devices writes to each device
+           \* unconditionally; an orphan final UB at gen=auth+1 from a
+           \* partially-completed pre-crash commit gets overwritten
+           \* by the claim on devices that are online. This cleans up
+           \* orphans at the claim gen slot (same (label, slot)).
+           /\ dev_ub' = [d \in Devices |->
+                          IF dev_state[d] = "ONLINE"
+                          THEN [gen |-> auth + 1, content |-> ClaimContent]
+                          ELSE dev_ub[d]]
+           /\ mounted' = TRUE
+    /\ UNCHANGED <<dev_state, coord_commit_content, commits_done,
+                    retry_count, next_content, fault_count>>
 
-\* --------------------------------------------------------------------------
-\* Commit protocol (ARCH §5.6).
-\* --------------------------------------------------------------------------
+(***************************************************************************)
+(* BeginCommit — coordinator picks target = auth+2, fresh content.         *)
+(***************************************************************************)
 
-\* BeginCommit: coordinator transitions Idle → Reserving, picks a target
-\* gen two past the current authoritative (one for the reservation UB,
-\* one for the final UB). The gen gap matches the impl's
-\* current_gen = durable_gen + 2 convention post-mount.
 BeginCommit ==
     /\ mounted
     /\ coord_phase = "Idle"
     /\ commits_done < MaxCommits
-    /\ LET next == AuthoritativeGen + 2
-       IN
-         /\ next <= MaxGen
-         /\ coord_target_gen' = next
-         /\ coord_phase' = "Reserving"
+    \* Require visible quorum: the impl's write_ub_to_all_devices needs
+    \* quorum of ONLINE devices to confirm. A pool with fewer online
+    \* devices cannot start a commit — caller would get STM_EQUORUM on
+    \* Phase 1 immediately. Gating here matches impl liveness.
+    /\ Cardinality(OnlineDevices) >= QuorumN
+    /\ LET next_gen == AuthoritativeGen + 2
+       IN  /\ next_gen <= MaxGen
+           /\ coord_target_gen' = next_gen
+           /\ coord_phase' = "Reserving"
+           /\ next_content' = next_content + 1
+           /\ coord_commit_content' = next_content + 1
+           /\ retry_count' = 0
     /\ UNCHANGED <<dev_ub, dev_state, commits_done, fault_count, mounted>>
 
-\* Phase 1: reservation UB written to every online device in parallel.
-\* The model: each step atomically stamps coord_target_gen - 1 into some
-\* ONLINE device's ub. We allow arbitrary subsets to succeed, modeling
-\* per-device fsync latency + potential drop. After writes, quorum check
-\* decides whether to advance to Flushing or abort.
+(***************************************************************************)
+(* WriteReservation — stamps ClaimContent (content stable: reservation UB *)
+(* carries PREVIOUS auth's roots = claim content).                          *)
+(*                                                                           *)
+(* Guard removed from original spec: the impl's write_ub_to_all_devices   *)
+(* writes to every device unconditionally, overwriting any prior gen-or-  *)
+(* content. Model reflects this by permitting writes on devices already at*)
+(* reservation_gen (idempotent with same content).                          *)
+(***************************************************************************)
+
 WriteReservation(d) ==
     /\ coord_phase = "Reserving"
     /\ dev_state[d] = "ONLINE"
-    /\ dev_ub[d] < coord_target_gen - 1
-    /\ dev_ub' = [dev_ub EXCEPT ![d] = coord_target_gen - 1]
+    /\ dev_ub[d].gen <= coord_target_gen - 1
+    /\ \/ dev_ub[d].gen < coord_target_gen - 1
+       \/ /\ dev_ub[d].gen = coord_target_gen - 1
+          /\ dev_ub[d].content # ClaimContent    \* only re-write if would change content
+    /\ dev_ub' = [dev_ub EXCEPT ![d] = [gen |-> coord_target_gen - 1,
+                                          content |-> ClaimContent]]
     /\ UNCHANGED <<dev_state, coord_phase, coord_target_gen,
-                    commits_done, fault_count, mounted>>
+                    coord_commit_content, commits_done, retry_count,
+                    next_content, fault_count, mounted>>
 
-\* Phase 1 commit: if quorum of devices have the reservation gen, advance.
 CheckReservationQuorum ==
     /\ coord_phase = "Reserving"
     /\ Cardinality(DevicesAtLeastGen(coord_target_gen - 1)) >= QuorumN
     /\ coord_phase' = "Flushing"
-    /\ UNCHANGED <<dev_ub, dev_state, coord_target_gen,
-                    commits_done, fault_count, mounted>>
+    /\ UNCHANGED <<dev_ub, dev_state, coord_target_gen, coord_commit_content,
+                    commits_done, retry_count, next_content, fault_count, mounted>>
 
-\* Phase 1 abort: too many devices fell offline to reach quorum. Revert.
 AbortReservation ==
     /\ coord_phase = "Reserving"
     /\ Cardinality(OnlineDevices) < QuorumN
     /\ coord_phase' = "Idle"
     /\ coord_target_gen' = 0
-    /\ UNCHANGED <<dev_ub, dev_state, commits_done, fault_count, mounted>>
+    /\ coord_commit_content' = 0
+    /\ retry_count' = 0
+    /\ UNCHANGED <<dev_ub, dev_state, commits_done, next_content,
+                    fault_count, mounted>>
 
-\* Phase 2 flush: we don't model data writes here (they're sync.tla's
-\* domain). This step just advances the phase machinery.
 DoFlush ==
     /\ coord_phase = "Flushing"
     /\ coord_phase' = "Finalizing"
-    /\ UNCHANGED <<dev_ub, dev_state, coord_target_gen,
-                    commits_done, fault_count, mounted>>
+    /\ UNCHANGED <<dev_ub, dev_state, coord_target_gen, coord_commit_content,
+                    commits_done, retry_count, next_content, fault_count, mounted>>
 
-\* Phase 3: final UB written to every online device in parallel. Same
-\* per-device atomic step shape as reservation.
+(***************************************************************************)
+(* WriteFinal — stamps coord_commit_content. This is the content-diverg-  *)
+(* ence surface: under buggy impl, retry bumps coord_commit_content so    *)
+(* consecutive WriteFinal firings on the same target_gen can stamp        *)
+(* different content bytes on different devices.                           *)
+(*                                                                           *)
+(* Unlike reservation/claim, final UB content is commit-specific (new     *)
+(* paddrs, new merkle, new counters). Retries in the buggy impl generate *)
+(* fresh content; retries in the fixed impl reuse the prior content.     *)
+(***************************************************************************)
+
 WriteFinal(d) ==
     /\ coord_phase = "Finalizing"
     /\ dev_state[d] = "ONLINE"
-    /\ dev_ub[d] < coord_target_gen
-    /\ dev_ub' = [dev_ub EXCEPT ![d] = coord_target_gen]
+    /\ \/ dev_ub[d].gen < coord_target_gen
+       \/ /\ dev_ub[d].gen = coord_target_gen
+          /\ dev_ub[d].content # coord_commit_content   \* overwrite if content differs
+    /\ dev_ub' = [dev_ub EXCEPT ![d] = [gen |-> coord_target_gen,
+                                          content |-> coord_commit_content]]
     /\ UNCHANGED <<dev_state, coord_phase, coord_target_gen,
-                    commits_done, fault_count, mounted>>
+                    coord_commit_content, commits_done, retry_count,
+                    next_content, fault_count, mounted>>
 
-\* Phase 3 commit: quorum at final gen → published. This is the commit
-\* point for the TLA spec.
 CheckFinalQuorum ==
     /\ coord_phase = "Finalizing"
     /\ Cardinality(DevicesAtLeastGen(coord_target_gen)) >= QuorumN
-    /\ coord_phase'      = "Published"
+    \* All quorum-member devices at target_gen must agree on content.
+    \* The actual impl's cross-check at mount enforces this; failure to
+    \* agree in TLA space manifests as the ContentAgreement invariant
+    \* violation, which is what we want to catch under the buggy model.
+    /\ coord_phase' = "Published"
     /\ commits_done' = commits_done + 1
-    /\ UNCHANGED <<dev_ub, dev_state, coord_target_gen,
-                    fault_count, mounted>>
+    /\ UNCHANGED <<dev_ub, dev_state, coord_target_gen, coord_commit_content,
+                    retry_count, next_content, fault_count, mounted>>
 
-\* Phase 3 abort: pool lost quorum before final landed. Revert to Idle
-\* — the Phase 1 reservation stays durable, and next mount will pick
-\* it as authoritative (if IT achieved quorum) or the prior gen (if not).
 AbortFinal ==
     /\ coord_phase = "Finalizing"
     /\ Cardinality(OnlineDevices) < QuorumN
     /\ coord_phase' = "Idle"
     /\ coord_target_gen' = 0
-    /\ UNCHANGED <<dev_ub, dev_state, commits_done, fault_count, mounted>>
+    /\ coord_commit_content' = 0
+    /\ retry_count' = 0
+    /\ UNCHANGED <<dev_ub, dev_state, commits_done, next_content,
+                    fault_count, mounted>>
 
-\* Publish: drops back to Idle so the next BeginCommit can fire.
+(***************************************************************************)
+(* RetryPhase3 — the P5-2 impl's caller-level retry after STM_EQUORUM.    *)
+(* Transitions Finalizing → Reserving WITHOUT resetting target_gen. The   *)
+(* IdempotentRetry constant controls whether content is preserved (fixed *)
+(* impl) or bumped (buggy impl — keyschema_commit allocates fresh paddr). *)
+(***************************************************************************)
+
+RetryPhase3 ==
+    /\ coord_phase = "Finalizing"
+    /\ Cardinality(OnlineDevices) >= QuorumN   \* if below, AbortFinal takes over
+    /\ ~(Cardinality(DevicesAtLeastGen(coord_target_gen)) >= QuorumN)
+    /\ retry_count < MaxRetries
+    /\ retry_count' = retry_count + 1
+    /\ coord_phase' = "Reserving"
+    /\ IF IdempotentRetry
+       THEN /\ coord_commit_content' = coord_commit_content
+            /\ next_content' = next_content
+       ELSE /\ coord_commit_content' = next_content + 1
+            /\ next_content' = next_content + 1
+    /\ UNCHANGED <<dev_ub, dev_state, coord_target_gen, commits_done,
+                    fault_count, mounted>>
+
 Publish ==
     /\ coord_phase = "Published"
     /\ coord_phase' = "Idle"
     /\ coord_target_gen' = 0
-    /\ UNCHANGED <<dev_ub, dev_state, commits_done, fault_count, mounted>>
+    /\ coord_commit_content' = 0
+    /\ retry_count' = 0
+    /\ UNCHANGED <<dev_ub, dev_state, commits_done, next_content,
+                    fault_count, mounted>>
 
-\* --------------------------------------------------------------------------
-\* Device failure + rejoin.
-\* --------------------------------------------------------------------------
+(***************************************************************************)
+(* Device failure + rejoin + reconcile + crash.                             *)
+(***************************************************************************)
 
 DeviceFail(d) ==
     /\ dev_state[d] = "ONLINE"
     /\ fault_count < MaxFaults
     /\ dev_state' = [dev_state EXCEPT ![d] = "FAULTED"]
     /\ fault_count' = fault_count + 1
-    /\ UNCHANGED <<dev_ub, coord_phase, coord_target_gen,
-                    commits_done, mounted>>
+    /\ UNCHANGED <<dev_ub, coord_phase, coord_target_gen, coord_commit_content,
+                    commits_done, retry_count, next_content, mounted>>
 
-\* Rejoin: FAULTED → ONLINE. The device keeps whatever dev_ub it had
-\* at fault time. A BEHIND device (dev_ub < AuthoritativeGen) will catch
-\* up via the Reconcile action below.
 DeviceRejoin(d) ==
     /\ dev_state[d] = "FAULTED"
     /\ dev_state' = [dev_state EXCEPT ![d] = "ONLINE"]
-    /\ UNCHANGED <<dev_ub, coord_phase, coord_target_gen,
-                    commits_done, fault_count, mounted>>
+    /\ UNCHANGED <<dev_ub, coord_phase, coord_target_gen, coord_commit_content,
+                    commits_done, retry_count, next_content, fault_count, mounted>>
 
-\* Reconcile: a BEHIND device catches up to the current authoritative
-\* gen. Models ARCH §5.8's replay-missed-commits step. Atomic for the
-\* model's purposes; real impl is incremental.
+\* Reconcile a BEHIND ONLINE device by catching its gen up to auth.
+\* Content is copied from a quorum member at exactly auth_gen (under
+\* ContentAgreementAtGen, any such member's content is canonical).
+\* This models ARCH §5.8's replay-missed-commits step: the reconciler
+\* reads the authoritative UB from a quorum peer and writes it into
+\* the behind device's ring slot.
 Reconcile(d) ==
     /\ dev_state[d] = "ONLINE"
     /\ coord_phase = "Idle"
-    /\ dev_ub[d] < AuthoritativeGen
-    /\ dev_ub' = [dev_ub EXCEPT ![d] = AuthoritativeGen]
-    /\ UNCHANGED <<dev_state, coord_phase, coord_target_gen,
-                    commits_done, fault_count, mounted>>
-
-\* --------------------------------------------------------------------------
-\* Coordinator crash: volatile state resets, devices unchanged. Mount
-\* must run again.
-\* --------------------------------------------------------------------------
+    /\ LET auth == AuthoritativeGen
+           peers == DevicesAtGen(auth)
+       IN  /\ dev_ub[d].gen < auth
+           /\ peers # {}
+           /\ LET peer == CHOOSE e \in peers : TRUE
+              IN  dev_ub' = [dev_ub EXCEPT ![d] =
+                              [gen |-> auth,
+                               content |-> dev_ub[peer].content]]
+    /\ UNCHANGED <<dev_state, coord_phase, coord_target_gen, coord_commit_content,
+                    commits_done, retry_count, next_content, fault_count, mounted>>
 
 Crash ==
     /\ mounted
-    /\ coord_phase'      = "Idle"
-    /\ coord_target_gen' = 0
-    /\ mounted'          = FALSE
-    /\ UNCHANGED <<dev_ub, dev_state, commits_done, fault_count>>
+    /\ coord_phase'          = "Idle"
+    /\ coord_target_gen'     = 0
+    /\ coord_commit_content' = 0
+    /\ retry_count'          = 0
+    /\ mounted'              = FALSE
+    /\ UNCHANGED <<dev_ub, dev_state, commits_done, next_content, fault_count>>
 
-\* --------------------------------------------------------------------------
-\* Next-state.
-\* --------------------------------------------------------------------------
+(***************************************************************************)
+(* Next-state.                                                              *)
+(***************************************************************************)
 
 Next ==
     \/ Mount
@@ -322,6 +375,7 @@ Next ==
     \/ \E d \in Devices : WriteFinal(d)
     \/ CheckFinalQuorum
     \/ AbortFinal
+    \/ RetryPhase3
     \/ Publish
     \/ \E d \in Devices : DeviceFail(d)
     \/ \E d \in Devices : DeviceRejoin(d)
@@ -330,89 +384,99 @@ Next ==
 
 Spec == Init /\ [][Next]_vars
 
-\* --------------------------------------------------------------------------
-\* Invariants.
-\* --------------------------------------------------------------------------
+(***************************************************************************)
+(* Invariants.                                                              *)
+(***************************************************************************)
 
 TypeOK ==
-    /\ dev_ub           \in [Devices -> 0..MaxGen]
-    /\ dev_state        \in [Devices -> DevState]
-    /\ coord_phase      \in Phase
+    /\ dev_ub \in [Devices -> [gen: 0..MaxGen, content: 0..MaxContent]]
+    /\ dev_state \in [Devices -> DevState]
+    /\ coord_phase \in Phase
     /\ coord_target_gen \in 0..MaxGen
-    /\ commits_done     \in 0..MaxCommits
-    /\ fault_count      \in 0..MaxFaults
-    /\ mounted          \in BOOLEAN
+    /\ coord_commit_content \in 0..MaxContent
+    /\ commits_done \in 0..MaxCommits
+    /\ retry_count \in 0..MaxRetries
+    /\ next_content \in 0..MaxContent
+    /\ fault_count \in 0..MaxFaults
+    /\ mounted \in BOOLEAN
 
-\* If the coordinator's phase counter says "Published" for a target, it
-\* must be because quorum at target_gen actually holds. This is a
-\* sanity check on the CheckFinalQuorum action itself.
 QuorumSafety ==
     (coord_phase = "Published") =>
         Cardinality(DevicesAtLeastGen(coord_target_gen)) >= QuorumN
 
-\* The authoritative gen is non-decreasing under any sequence of actions
-\* that involves crash + rejoin + reconcile. Regression would mean a
-\* committed gen became un-committed, which this invariant outlaws.
-\*
-\* We prove it as "for every state, AuthoritativeGen is a historical
-\* maximum" — enforced via a history variable max_auth that tracks the
-\* running max and checking max_auth <= AuthoritativeGen.
-\*
-\* (In TLA+ we can't inline a history var easily; we instead observe
-\* that the monotonicity follows from: dev_ub values are monotonic per
-\* device (no action decreases dev_ub[d]) and AuthoritativeGen is a
-\* function of the dev_ub array that is monotonic in each argument.)
-\*
-\* We still state the invariant as a weaker safety property: at any
-\* state where a commit succeeded (commits_done > 0), AuthoritativeGen
-\* is at least 2 (the first committed gen). This pins the baseline.
 AuthoritativeMono ==
     /\ commits_done = 0 \/ AuthoritativeGen >= 2
     /\ \A d \in Devices :
-          dev_ub[d] > 0 => AuthoritativeGen >= 2 \/ commits_done = 0
-                           \/ dev_ub[d] < 2
+          dev_ub[d].gen > 0 =>
+             AuthoritativeGen >= 2 \/ commits_done = 0
+                              \/ dev_ub[d].gen < 2
 
-\* CommitAtomic: if commits_done records N successful commits, the
-\* authoritative gen is at least 2*N (each commit advances by 2). A
-\* committed commit is never forgotten.
 CommitAtomic ==
     AuthoritativeGen >= 2 * commits_done
 
-\* Orphan gens ("ahead of quorum" devices whose UB records a gen no
-\* other device confirms) are a legitimate post-crash state per ARCH
-\* §5.6.6 "After Phase 3 partial (< quorum)". They exist on disk but
-\* are never authoritative — AuthoritativeGen's quorum requirement
-\* filters them out. We prove this explicitly: any gen strictly
-\* greater than AuthoritativeGen must be held by fewer than quorum
-\* devices. (If it were held by quorum, it would BE authoritative.)
 OrphansNotAuthoritative ==
     \A d \in Devices :
-        dev_ub[d] > AuthoritativeGen =>
-            Cardinality(DevicesAtLeastGen(dev_ub[d])) < QuorumN
+        dev_ub[d].gen > AuthoritativeGen =>
+            Cardinality(DevicesAtLeastGen(dev_ub[d].gen)) < QuorumN
 
-\* LiveCoordTargetValid: once mounted, the target_gen of any in-progress
-\* commit is at least AuthoritativeGen — i.e. the coord doesn't try to
-\* commit at a gen that has ALREADY passed. Equality is possible during
-\* Finalizing if Phase 3 WriteFinals have hit quorum on disk before
-\* CheckFinalQuorum formally closes the transaction.
 LiveCoordTargetValid ==
     (mounted /\ coord_phase # "Idle") =>
         coord_target_gen >= AuthoritativeGen
 
-\* QuorumDurability: once a commit achieved Phase 3 quorum (commits_done
-\* incremented), it stays authoritative even after:
-\*   (a) some of the quorum members fault,
-\*   (b) the coordinator crashes and remounts,
-\*   (c) a subsequent commit aborts.
-\* Expressed as: AuthoritativeGen doesn't drop below 2*commits_done.
-\* (Same as CommitAtomic; reiterated for clarity.)
 QuorumDurability == AuthoritativeGen >= 2 * commits_done
 
-\* MountGenBumpMulti: once mounted, the post-mount target_gen is > any
-\* dev_ub value. Mirrors sync.tla's MountGenBump, lifted to multi-device.
 MountGenBumpMulti ==
     mounted => \A d \in Devices :
-                    dev_ub[d] <= coord_target_gen \/ coord_phase = "Idle"
+                   dev_ub[d].gen <= coord_target_gen \/ coord_phase = "Idle"
+
+(***************************************************************************)
+(* R14 P1: ContentQuorumAtGen.                                             *)
+(*                                                                           *)
+(* At any gen G where a quorum of devices report UBs (at G or higher),    *)
+(* at LEAST a quorum of the devices-at-exactly-G must agree on content.   *)
+(* Devices at G with a different content are "orphans" whose state will   *)
+(* be overwritten by a future commit or reconciliation (ARCH §5.8).       *)
+(*                                                                           *)
+(* This is the property the impl's mount-time agreement check must        *)
+(* enforce: find the content shared by ≥quorum devices at auth_gen,      *)
+(* pick that as canonical, and ignore dissenters as orphans. A stricter  *)
+(* "all devices at G must agree" (ContentAgreementAtGen below) is NOT a  *)
+(* safety invariant — it can be violated legitimately by device-fault    *)
+(* scenarios where a FAULTED device retains an orphan UB from an earlier *)
+(* partial commit while subsequent mount-claims overwrite the online    *)
+(* quorum members.                                                         *)
+(*                                                                           *)
+(* Under IdempotentRetry=FALSE (buggy impl), even ContentQuorumAtGen can *)
+(* be violated if MaxRetries >= 2 — three retries can produce three      *)
+(* distinct contents at the same gen, leaving no quorum group at that    *)
+(* gen. Under IdempotentRetry=TRUE (fixed impl), retries preserve content *)
+(* so WriteFinal only ever stamps one content value per gen; content-    *)
+(* quorum always holds.                                                   *)
+(***************************************************************************)
+
+\* Set of distinct contents observed on devices at exactly gen g.
+ContentsAtGen(g) == { dev_ub[d].content : d \in DevicesAtGen(g) }
+
+\* Does gen g have content-quorum — some content c held by >= quorum
+\* of the devices at exactly g?
+ContentQuorumAt(g) ==
+    \E c \in ContentsAtGen(g) :
+        Cardinality({ d \in DevicesAtGen(g) : dev_ub[d].content = c }) >= QuorumN
+
+ContentQuorumAtGen ==
+    \A g \in 1..MaxGen :
+        Cardinality(DevicesAtGen(g)) >= QuorumN => ContentQuorumAt(g)
+
+\* Aspirational (not enforced): stricter agreement. All devices at the
+\* same gen have the same content. Held under idempotent retry WITHOUT
+\* device-fault scenarios; violated under legitimate fault-orphan cases
+\* where a FAULTED device keeps an older UB while online devices accept
+\* a new claim at the same gen.
+ContentAgreementAtGen ==
+    \A d, e \in Devices :
+        /\ dev_ub[d].gen > 0
+        /\ dev_ub[d].gen = dev_ub[e].gen
+        => dev_ub[d].content = dev_ub[e].content
 
 Invariants ==
     /\ TypeOK
@@ -423,5 +487,6 @@ Invariants ==
     /\ LiveCoordTargetValid
     /\ QuorumDurability
     /\ MountGenBumpMulti
+    /\ ContentQuorumAtGen
 
 =============================================================================
