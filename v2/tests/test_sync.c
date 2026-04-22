@@ -120,7 +120,11 @@ STM_TEST(sync_fresh_create_has_no_uberblock) {
 
     stm_sync_info info;
     STM_ASSERT_OK(stm_sync_info_get(s, &info));
-    STM_ASSERT_EQ(info.current_gen, 0u);
+    /* P5-2: fresh pool starts with auth_gen=0, current_gen=1 — the
+     * first commit is 1-phase (no pre-flush state), writing a single
+     * final UB at gen=1. Subsequent commits are full 2-phase. */
+    STM_ASSERT_EQ(info.auth_gen, 0u);
+    STM_ASSERT_EQ(info.current_gen, 1u);
     STM_ASSERT_EQ(info.alloc_root_paddr, 0u);
 
     /* Tear down without committing. Next open should fail — no
@@ -156,8 +160,11 @@ STM_TEST(sync_first_commit_writes_uberblock) {
 
     stm_sync_info info;
     STM_ASSERT_OK(stm_sync_info_get(s, &info));
-    STM_ASSERT_EQ(info.current_gen,  2u);  /* first commit is gen=1; next will be 2 */
-    /* Ring rotation: gen=1 → label=1, slot=1. */
+    /* P5-2: first commit on a fresh pool is 1-phase. Final UB lands
+     * at gen=1; auth_gen=1; next commit target is auth+2=3. */
+    STM_ASSERT_EQ(info.auth_gen,     1u);
+    STM_ASSERT_EQ(info.current_gen,  3u);
+    /* Ring rotation for gen=1: label=1, slot=1. */
     STM_ASSERT_EQ(info.live_label_idx, 1u);
     STM_ASSERT_EQ(info.live_slot_idx,  1u);
     STM_ASSERT(info.alloc_root_paddr != 0);
@@ -168,14 +175,23 @@ STM_TEST(sync_first_commit_writes_uberblock) {
 }
 
 STM_TEST(sync_mount_gen_bump) {
-    /* sync.tla MountGenBump: after mount, live txg > any durable
-     * uberblock's txg. */
+    /* quorum.tla MountGenBumpMulti: after mount, coord_target_gen >
+     * any on-disk dev_ub. Under P5-2's 2-phase protocol each commit
+     * advances auth by 2 (reservation + final), and mount-claim
+     * advances by 1. */
     make_tmp("mgb");
     stm_bdev *d = open_fresh_device();
     stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
     make_fresh_pool(d, &a, &s, &pool);
 
-    /* Commit 5 times → durable gens 1..5. */
+    /* Commit 5 times.
+     *   #1 (fresh, 1-phase):   final gen=1. auth=1.
+     *   #2 (2-phase):          res=2, final=3. auth=3.
+     *   #3:                    res=4, final=5. auth=5.
+     *   #4:                    res=6, final=7. auth=7.
+     *   #5:                    res=8, final=9. auth=9.
+     * Highest durable gen = 9.
+     */
     for (int i = 0; i < 5; i++) {
         uint64_t p = 0;
         STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p));
@@ -194,12 +210,11 @@ STM_TEST(sync_mount_gen_bump) {
 
     stm_sync_info info;
     STM_ASSERT_OK(stm_sync_info_get(s2, &info));
-    STM_ASSERT_EQ(info.mount_max_durable_gen, 5u);
-    /* R9 P0-1: mount writes a claim UB at max+1, then advances
-     * current_gen to max+2 so no commit ever reuses a gen that may
-     * correspond to orphan metadata writes from a crashed prior
-     * mount. First commit on this remount lands at gen 7. */
-    STM_ASSERT_EQ(info.current_gen,           7u);
+    STM_ASSERT_EQ(info.mount_max_durable_gen, 9u);
+    /* Mount writes claim UB at auth+1=10. auth becomes 10. Next
+     * commit target = auth+2 = 12 (reservation at 11, final at 12). */
+    STM_ASSERT_EQ(info.auth_gen,     10u);
+    STM_ASSERT_EQ(info.current_gen,  12u);
 
     teardown(a2, s2, pool2);
     stm_bdev_close(d);
@@ -250,27 +265,33 @@ STM_TEST(sync_alloc_state_survives_mount) {
 }
 
 STM_TEST(sync_commit_advances_ring_label_slot) {
-    /* Successive commits land on distinct (label, slot) pairs:
-     *   gen=1 → (label 1, slot 1)
-     *   gen=2 → (label 2, slot 2)
-     *   gen=3 → (label 3, slot 3)
-     *   gen=4 → (label 0, slot 4)
-     * I.e. label = gen % 4 rotates every commit. */
+    /* P5-2: successive commits under the 2-phase protocol land at:
+     *   commit #1 (fresh, 1-phase): final gen=1 → (label 1, slot 1)
+     *   commit #2:                   res=2, final=3 → (label 3, slot 3)
+     *   commit #3:                   res=4, final=5 → (label 1, slot 5)
+     *   commit #4:                   res=6, final=7 → (label 3, slot 7)
+     *   commit #5:                   res=8, final=9 → (label 1, slot 9)
+     * Ring slots for gen = gen%63; labels for gen = gen%4. */
     make_tmp("ring");
     stm_bdev *d = open_fresh_device();
     stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
     make_fresh_pool(d, &a, &s, &pool);
 
-    for (uint64_t g = 1; g <= 4; g++) {
+    /* Expected (final_gen) per commit (1, 3, 5, 7, 9) — i.e. fresh
+     * commit uses gen=1, each subsequent adds 2. */
+    const uint64_t expected_final[5] = { 1, 3, 5, 7, 9 };
+    for (size_t i = 0; i < 5; i++) {
         uint64_t p = 0;
         STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p));
         STM_ASSERT_OK(stm_sync_commit(s));
 
         stm_sync_info info;
         STM_ASSERT_OK(stm_sync_info_get(s, &info));
-        STM_ASSERT_EQ(info.live_label_idx, g % 4u);
-        STM_ASSERT_EQ(info.live_slot_idx,  g % 63u);
-        STM_ASSERT_EQ(info.current_gen,    g + 1u);
+        uint64_t fg = expected_final[i];
+        STM_ASSERT_EQ(info.auth_gen,        fg);
+        STM_ASSERT_EQ(info.live_label_idx,  fg % 4u);
+        STM_ASSERT_EQ(info.live_slot_idx,   fg % 63u);
+        STM_ASSERT_EQ(info.current_gen,     fg + 2u);
     }
 
     teardown(a, s, pool);
@@ -743,12 +764,12 @@ STM_TEST(sync_mount_claim_advances_durable_gen) {
     stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
     make_fresh_pool(d, &a, &s, &pool);
 
-    /* One commit at gen=1. */
+    /* Commit #1 (fresh, 1-phase): final at gen=1. */
     STM_ASSERT_OK(stm_sync_commit(s));
     teardown(a, s, pool);
     stm_bdev_close(d);
 
-    /* Mount #1: expect claim UB at gen=2; current_gen=3. */
+    /* Mount #1: durable=1. Claim at auth+1=2 → auth=2. current_gen=4. */
     d = open_fresh_device();
     stm_alloc *a2 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
@@ -758,12 +779,15 @@ STM_TEST(sync_mount_claim_advances_durable_gen) {
     stm_sync_info info;
     STM_ASSERT_OK(stm_sync_info_get(s2, &info));
     STM_ASSERT_EQ(info.mount_max_durable_gen, 1u);
-    STM_ASSERT_EQ(info.current_gen,           3u);
+    STM_ASSERT_EQ(info.auth_gen,              2u);
+    STM_ASSERT_EQ(info.current_gen,           4u);
     teardown(a2, s2, pool2);
     stm_bdev_close(d);
 
-    /* Mount #2 (no intervening commit): mount-claim observed gen=2
-     * durable, writes claim UB at gen=3, current_gen=4. */
+    /* Mount #2 (no intervening commit): durable=2 (from prior mount's
+     * claim). Claim at auth+1=3 → auth=3. current_gen=5. Consecutive
+     * crashed mounts each burn one gen, preserving nonce uniqueness
+     * (R9 P0-1 / quorum.tla MountGenBumpMulti). */
     d = open_fresh_device();
     stm_alloc *a3 = NULL;
     STM_ASSERT_OK(stm_alloc_open_blank(d, &a3));
@@ -772,7 +796,8 @@ STM_TEST(sync_mount_claim_advances_durable_gen) {
     STM_ASSERT_OK(stm_sync_open(pool3, a3, make_wk(), NULL, &s3));
     STM_ASSERT_OK(stm_sync_info_get(s3, &info));
     STM_ASSERT_EQ(info.mount_max_durable_gen, 2u);
-    STM_ASSERT_EQ(info.current_gen,           4u);
+    STM_ASSERT_EQ(info.auth_gen,              3u);
+    STM_ASSERT_EQ(info.current_gen,           5u);
     teardown(a3, s3, pool3);
     stm_bdev_close(d);
     unlink(g_tmp_path);

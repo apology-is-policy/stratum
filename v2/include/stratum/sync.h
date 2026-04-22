@@ -1,40 +1,56 @@
 /* SPDX-License-Identifier: ISC */
 /*
- * Four-phase commit protocol (Phase 3 chunk 6).
+ * Commit protocol — single-device (sync.tla) + multi-device quorum
+ * (quorum.tla).
  *
- *   see v2/specs/sync.tla         — formal spec (TLC-clean).
+ *   see v2/specs/sync.tla         — single-device four-phase spec.
+ *   see v2/specs/quorum.tla       — multi-device quorum spec (P5-0).
  *   see ARCHITECTURE §3.7, §5.6   — commit + uberblock ring.
  *   see ARCHITECTURE §7.4         — nonce uniqueness + MountGenBump.
  *
- * `stm_sync` owns the uberblock ring on a device and orchestrates
- * the commit protocol. It sits above `stm_alloc` (allocator state +
- * data-area tree persistence) and below future per-FS machinery.
+ * `stm_sync` owns the uberblock ring across a pool's devices and
+ * orchestrates the commit protocol. It sits above `stm_alloc`
+ * (allocator state + data-area tree persistence) and below future
+ * per-FS machinery.
  *
- * Phases, aligned to sync.tla:
+ * Commit protocol (P5-2 multi-device, two-phase):
  *
- *   BeginFreeze — stop writers. Chunk 6 MVP is single-writer so this
- *                 is a no-op.
- *   Reserve      — allocator hands out paddrs + seqs. In chunk 6 the
- *                  reservation of any new tree-node paddrs happens
- *                  inside stm_alloc_commit, which is called as part
- *                  of this phase.
- *   DoFlush      — persist all dirty data + new tree nodes. Driven
- *                  by stm_alloc_commit + stm_bootstrap_commit.
- *   DoFinal      — write the new uberblock to the next ring slot with
- *                  an fsync barrier. THIS is the commit point per
- *                  sync.tla.
- *   DoPublish    — advance in-RAM current_gen; the next commit's
- *                  txg is now (new_gen).
+ *   Reservation — write UB at gen=auth+1 to every pool device,
+ *                  fsync each, wait for quorum (⌊N/2⌋+1) of
+ *                  confirmations. Reservation UB content = copy of
+ *                  the previous authoritative UB with ub_gen bumped
+ *                  (pre-flush roots; rollback target if Phase 3
+ *                  fails). If quorum is not reached, commit aborts;
+ *                  no flush occurs.
+ *   Flush        — persist dirty data + new tree nodes. Driven by
+ *                  stm_keyschema_commit + stm_alloc_commit (each at
+ *                  gen=target_gen=auth+2). Per-block writes do not
+ *                  require quorum — their durability is anchored by
+ *                  the final UB referencing them.
+ *   Final        — write UB at gen=target to every pool device,
+ *                  fsync each, wait for quorum. Final UB content =
+ *                  post-flush roots + post-flush Merkle root. This
+ *                  is the commit point.
+ *   Publish      — in-RAM auth_gen := target. current_gen := auth+2.
  *
- * Mount logic: scan all four labels × 63 ring slots, pick the uberblock
- * with the highest valid gen, bump current_gen to (max + 1) to preserve
- * the nonce-uniqueness invariant (MountGenBump in the spec).
+ *   Each commit therefore advances the authoritative gen by 2.
+ *   Mount-claim advances it by 1.
  *
- * Ring rotation (chunk 6 MVP):
+ *   The first commit on a fresh pool (auth==0) is 1-phase: only the
+ *   final UB is written at gen=1. There's no "pre-flush" state to
+ *   preserve. Subsequent commits are full 2-phase.
+ *
+ * Mount logic (P5-2): for each pool device, scan every label × 63
+ * commit-ring slot; collect valid uberblocks. The authoritative gen
+ * is the highest gen G with |{device : ub_device.gen >= G}| >=
+ * ⌊N/2⌋+1. If no quorum exists, mount fails. Otherwise the mount
+ * writes a claim UB at auth+1 on every online device and requires
+ * quorum. This protects nonce uniqueness across crash recovery (R9
+ * P0-1) and the MountGenBumpMulti invariant in quorum.tla.
+ *
+ * Ring rotation (per device, deterministic):
  *   label = gen % STM_LABELS_PER_DEVICE
  *   slot  = gen % STM_UB_SLOTS_PER_LABEL
- * Consecutive commits land on different labels, so any torn-write on a
- * single label leaves the other three intact.
  */
 #ifndef STRATUM_V2_SYNC_H
 #define STRATUM_V2_SYNC_H
@@ -58,13 +74,26 @@ struct stm_janus_client;
 typedef struct stm_sync stm_sync;
 
 typedef struct {
-    /* Current in-RAM gen. The next stm_sync_commit will write gen+1. */
+    /* Authoritative gen — the gen of the most recent committed final
+     * UB with quorum. Includes mount-claim UBs (which advance auth
+     * by 1 without flushing data). 0 on a fresh handle before the
+     * first commit. */
+    uint64_t auth_gen;
+
+    /* Next commit's final gen:
+     *   - fresh (auth=0):  1 (first commit is 1-phase at gen=1).
+     *   - otherwise:       auth + 2 (2-phase; reservation at auth+1,
+     *                                final at auth+2).
+     * Kept as `current_gen` for API continuity; reflects "gen the
+     * NEXT commit will end up at" (matches pre-P5-2 semantic). */
     uint64_t current_gen;
 
-    /* Highest gen observed on-disk during the last open/mount. */
+    /* Highest gen with quorum on-disk at the last open/mount. */
     uint64_t mount_max_durable_gen;
 
-    /* Most-recent committed uberblock's location. */
+    /* Most-recent final UB's ring location. Same (label, slot) across
+     * every pool device (rotation is gen-indexed, and per-device rings
+     * are synchronized at every commit). */
     uint32_t live_label_idx;
     uint32_t live_slot_idx;
 
@@ -135,22 +164,27 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
                           stm_sync **out_sync);
 
 /*
- * Commit. Runs through the five phases (Freeze/Reserve/Flush/Final/
- * Publish). On STM_OK, current_gen has advanced by 1 and a new
- * uberblock is durable on disk referencing the latest allocator
- * state.
+ * Commit. Writes Phase 1 reservation UB at auth+1, flushes, writes
+ * Phase 3 final UB at auth+2, to every pool device in parallel.
+ * Each phase requires quorum (⌊N/2⌋+1) of fsync confirmations; if
+ * either phase lacks quorum, the commit aborts with STM_EQUORUM
+ * and the in-RAM state is unchanged.
+ *
+ * On STM_OK, auth_gen has advanced by 2 (one commit) and the pool's
+ * devices hold quorum-confirmed UBs at the reservation and final
+ * gens.
+ *
+ * The first commit on a fresh pool (auth_gen==0) is 1-phase: only
+ * the final UB is written at gen=1. There is no pre-flush state to
+ * preserve on rollback.
  *
  * Known MVP caveat (R7d P0-2): a crash between the internal
- * stm_alloc_commit (which flushes bootstrap state) and
- * stm_sb_label_write (the uberblock write) leaks bootstrap-pool
- * bitmap bits for the tree nodes written for the in-flight commit.
- * The next mount via stm_sync_open picks the prior uberblock
- * (CommitAtomic holds — the orphan tree nodes are unreachable),
- * but the bits they occupy remain marked allocated until the
- * next pool reformat or until a future fsck pass reconciles. This
- * is leak-on-failure, not corruption — nonce-uniqueness and data
- * integrity are preserved. The two-phase-bootstrap-commit fix is
- * tracked for chunk 7+.
+ * stm_alloc_commit (which flushes bootstrap state) and the Phase 3
+ * UB writes leaks bootstrap-pool bitmap bits for the tree nodes
+ * written for the in-flight commit. The next mount picks the Phase
+ * 1 reservation (CommitAtomic holds — orphan tree nodes are
+ * unreachable), but the bitmap bits remain allocated until a future
+ * fsck pass reconciles. Leak-on-failure, not corruption.
  */
 STM_MUST_USE
 stm_status stm_sync_commit(stm_sync *s);

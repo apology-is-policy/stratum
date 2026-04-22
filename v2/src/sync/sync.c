@@ -97,28 +97,35 @@ _Static_assert(STM_SYNC_WRAPPED_KEY_LEN <= STM_KEYSCHEMA_WRAPPED_MAX,
 struct stm_sync {
     pthread_mutex_t lock;
 
-    /* P5-1: the pool-layer handle is now the source of truth for
-     * identity (pool_uuid, per-device uuid, role, class, state, size)
-     * and the device set. P5-1 writes to device 0 only (degenerate
-     * N=1); P5-2 iterates all devices during commit. */
+    /* P5-2: sync coordinates commits across every device in the pool.
+     * There is no "self" in multi-device; the coordinator writes the
+     * reservation / final UBs to all devices in parallel and requires
+     * quorum. P5-1's cached `bdev` pointer is replaced by per-commit
+     * iteration over pool->devices[]. */
     stm_pool  *pool;        /* borrowed — lifecycle owned by caller */
-    stm_bdev  *bdev;        /* cached: stm_pool_device_bdev(pool, 0) */
-    stm_alloc *alloc;       /* borrowed — not owned */
+    stm_alloc *alloc;       /* borrowed — not owned (still per-device
+                             * MVP: the alloc tree lives on device 0) */
 
-    /* Cached from pool at open/create time. Sync uses these on every
-     * crypto + UB-build path; pulling from pool each time is fine but
-     * caching saves a dereference without changing semantics — pool
-     * identity is immutable after stm_pool_open for P5-1. */
+    /* Cached from pool at open/create time. pool_uuid is pool-wide;
+     * device_uuid is device 0's uuid (used by stm_alloc_set_crypt_ctx
+     * since alloc remains single-device in P5-2). */
     uint64_t   pool_uuid[2];
     uint64_t   device_uuid[2];
-    uint16_t   self_device_id;     /* N=1 MVP: always 0 */
 
-    /* Commit state. */
-    uint64_t   current_gen;         /* last-committed gen; next commit is +1.
-                                     * 0 before any commit lands.          */
-    uint64_t   mount_max_durable;   /* maximum gen observed at mount time  */
+    /* Commit gen state (P5-2, aligned with quorum.tla):
+     *   auth_gen    — most recent committed final gen with quorum.
+     *                 0 if no commits yet. Advances by 1 on mount-
+     *                 claim and by 2 on each commit.
+     *   current_gen — "next commit's final gen". For fresh pools
+     *                 (auth==0) this is 1 (1-phase first commit).
+     *                 Otherwise it is auth+2 (2-phase: reservation
+     *                 at auth+1, final at auth+2). Retained under
+     *                 the pre-P5-2 name for API continuity. */
+    uint64_t   auth_gen;
+    uint64_t   current_gen;
+    uint64_t   mount_max_durable;   /* auth observed at mount time */
 
-    /* Most recent uberblock location (valid once current_gen > 0). */
+    /* Most recent final UB's ring location (all devices synchronized). */
     uint32_t   live_label_idx;
     uint32_t   live_slot_idx;
 
@@ -407,20 +414,21 @@ static inline uint32_t ring_slot_for_gen(uint64_t gen)
 /* Uberblock construction.                                                    */
 /* ========================================================================= */
 
-/* Build an uberblock in `out` from sync state + caller's inputs.
- * Fills pool_uuid / device_uuid / gen / txg / ub_alloc_root
- * (paddr + kind + bp_csum) + ub_merkle_root + ub_merkle_root_salt
- * for P4-1, ub_alloc_root_gen for P4-3b R9 P0-1, and
- * ub_key_schema[0..32] with the raw metadata key for P4-3a.
- * Allocator stats populate total_blocks / free_blocks.
+/* Build an uberblock in `out` targeting `target_device_id`'s slot in
+ * the pool's roster. Every pool device's UB for a given commit shares
+ * the same bytes EXCEPT the per-device fields (ub_device_id,
+ * ub_device_uuid, ub_device_class, ub_device_role), which are pulled
+ * from the pool's roster entry for `target_device_id`. All shared
+ * fields come from sync state + caller's inputs.
  *
  * `alloc_root_gen` is the gen at which the referenced tree was
  * AEAD-encrypted. Usually equals `new_gen` (a fresh tree commit),
- * but a mount-claim UB advances new_gen past durable gen without
- * rewriting the tree — in that case alloc_root_gen carries the
- * OLDER gen so AEAD decrypt still works. */
+ * but reservation and mount-claim UBs advance `new_gen` past the
+ * tree's encryption gen without rewriting the tree — in those cases
+ * `alloc_root_gen` carries the OLDER gen so AEAD decrypt still works. */
 static void build_uberblock(stm_uberblock *out,
                               const stm_sync *s,
+                              uint16_t target_device_id,
                               uint64_t new_gen,
                               uint64_t alloc_root_paddr,
                               const uint8_t alloc_root_csum[32],
@@ -437,26 +445,22 @@ static void build_uberblock(stm_uberblock *out,
 
     out->ub_pool_uuid[0]   = stm_store_le64(s->pool_uuid[0]);
     out->ub_pool_uuid[1]   = stm_store_le64(s->pool_uuid[1]);
-    out->ub_device_uuid[0] = stm_store_le64(s->device_uuid[0]);
-    out->ub_device_uuid[1] = stm_store_le64(s->device_uuid[1]);
+
+    /* P5-2: per-device fields from the target slot of the pool roster. */
+    const stm_pool_device *target = stm_pool_device_info(s->pool,
+                                                            target_device_id);
+    if (target) {
+        out->ub_device_uuid[0] = stm_store_le64(target->uuid[0]);
+        out->ub_device_uuid[1] = stm_store_le64(target->uuid[1]);
+        out->ub_device_class   = (uint8_t)target->class_;
+        out->ub_device_role    = (uint8_t)target->role;
+    }
 
     out->ub_gen         = stm_store_le64(new_gen);
-    out->ub_txg         = stm_store_le64(new_gen);     /* chunk 6 keeps
-                                                         * gen == txg */
+    out->ub_txg         = stm_store_le64(new_gen);     /* gen == txg MVP */
 
-    /* P5-1: roster fields populated from the pool-layer handle. For
-     * N=1 (today's only configuration) device_count=1, device_id=0,
-     * and ub_roster's slot 0 describes THIS device. ub_roster_hash is
-     * the le64 truncation of BLAKE3-256(ub_roster[2048]). */
     out->ub_device_count = stm_store_le16((uint16_t)stm_pool_device_count(s->pool));
-    out->ub_device_id    = stm_store_le16(s->self_device_id);
-    {
-        const stm_pool_device *self = stm_pool_device_info(s->pool,
-                                                             s->self_device_id);
-        /* sync_new validates self exists; defensive fallback. */
-        out->ub_device_class = self ? (uint8_t)self->class_ : (uint8_t)STM_DEV_CLASS_UNSET;
-        out->ub_device_role  = self ? (uint8_t)self->role   : (uint8_t)STM_DEV_ROLE_UNSET;
-    }
+    out->ub_device_id    = stm_store_le16(target_device_id);
     stm_pool_roster_encode(s->pool, out->ub_roster);
     out->ub_roster_hash = stm_store_le64(stm_pool_roster_hash(s->pool));
 
@@ -468,17 +472,13 @@ static void build_uberblock(stm_uberblock *out,
     }
     out->ub_alloc_root_gen = stm_store_le64(alloc_root_gen);
 
-    /* P4-1: Merkle root + per-pool salt. Both are stored; mount-time
-     * verifier recomputes the root against on-disk tree-root csums +
-     * stored salt, and fails STM_ECORRUPT on mismatch. */
+    /* P4-1: Merkle root + per-pool salt. Mount-time verifier
+     * recomputes the root against per-tree-root csums + salt, and
+     * fails STM_ECORRUPT on mismatch. */
     memcpy(out->ub_merkle_root,        merkle_root,     32);
     memcpy(out->ub_merkle_root_salt,   s->merkle_salt,  32);
 
-    /* P4-4a: key-schema sub-tree pointer in ub_key_schema. Packed
-     * via the v4 header format (magic 'TSCH' + version + flags +
-     * bptr). Tree nodes themselves are plaintext Merkle-covered;
-     * wrapped keys inside leaves are what's cryptographically
-     * protected. */
+    /* P4-4a: key-schema sub-tree pointer in ub_key_schema. */
     stm_ub_key_schema_hdr ks_hdr;
     memset(&ks_hdr, 0, sizeof ks_hdr);
     ks_hdr.ks_magic   = STM_UB_KEY_SCHEMA_MAGIC;
@@ -495,9 +495,79 @@ static void build_uberblock(stm_uberblock *out,
     out->ub_total_blocks = stm_store_le64(astats->data_total_blocks);
     out->ub_free_blocks  = stm_store_le64(astats->data_free_blocks);
 
-    /* Chunk 6 MVP: no redundancy profile yet (mirror lands in P5-3).
-     * Device class/role were populated from pool context above. */
+    /* MVP: no redundancy profile yet (mirror lands in P5-3). */
     out->ub_redundancy_kind = STM_RED_NONE;
+}
+
+/* ========================================================================= */
+/* P5-2: Multi-device UB write + quorum check.                                */
+/* ========================================================================= */
+
+/* Quorum threshold for the pool: ⌊N/2⌋ + 1. */
+static inline size_t sync_quorum_n(const stm_sync *s)
+{
+    return stm_pool_device_count(s->pool) / 2u + 1u;
+}
+
+/* Write an uberblock carrying `shared` content to every device in the
+ * pool at (label, slot). The per-device ub_device_id / ub_device_uuid
+ * / class / role fields are filled from the pool's roster entry for
+ * each target. Returns STM_OK if ≥ quorum devices confirmed the write
+ * (successful fsync); STM_EQUORUM if not.
+ *
+ * On partial success (> 0 but < quorum), the pool has an orphan UB
+ * at the write gen on some devices. Per quorum.tla's
+ * OrphansNotAuthoritative, this is legitimate on-disk state; the
+ * caller's rollback path must handle it (typically by returning
+ * STM_EQUORUM so the caller leaves the in-RAM gen unchanged).
+ *
+ * `prototype_ub` supplies every SHARED field (pool_uuid, gen, roots,
+ * roster, etc.); this function overwrites only the per-device fields
+ * before writing each device's UB. */
+static stm_status write_ub_to_all_devices(stm_sync *s,
+                                            const stm_uberblock *prototype_ub,
+                                            uint32_t label, uint32_t slot)
+{
+    size_t n = stm_pool_device_count(s->pool);
+    size_t confirmed = 0;
+    size_t ro_skipped = 0;
+    for (size_t i = 0; i < n; i++) {
+        stm_bdev *d = stm_pool_device_bdev(s->pool, (uint16_t)i);
+        if (!d) continue;
+
+        /* Copy shared bytes, then overwrite per-device fields. */
+        stm_uberblock ub = *prototype_ub;
+        const stm_pool_device *di = stm_pool_device_info(s->pool, (uint16_t)i);
+        if (di) {
+            ub.ub_device_uuid[0] = stm_store_le64(di->uuid[0]);
+            ub.ub_device_uuid[1] = stm_store_le64(di->uuid[1]);
+            ub.ub_device_class   = (uint8_t)di->class_;
+            ub.ub_device_role    = (uint8_t)di->role;
+        }
+        ub.ub_device_id = stm_store_le16((uint16_t)i);
+
+        stm_status sw = stm_sb_label_write(d, label, slot, &ub);
+        if (sw == STM_OK) {
+            confirmed++;
+        } else if (sw == STM_EROFS) {
+            /* RO mount: bdev refused the write. For quorum purposes
+             * we treat RO devices as "never confirming"; an all-RO
+             * pool will fail quorum and the caller skips the claim
+             * UB write (same semantic as pre-P5-2 single-device RO
+             * mount). */
+            ro_skipped++;
+        }
+        /* Other failures (STM_EIO, etc.) drop the device from the
+         * quorum count; commit aborts if insufficient devices confirm. */
+    }
+
+    size_t quorum = sync_quorum_n(s);
+    if (confirmed >= quorum) return STM_OK;
+    /* RO-quorum sentinel: if every device was RO and none had a
+     * hard failure, propagate STM_EROFS so the caller can distinguish
+     * "can't write" from "wrote but didn't achieve quorum". */
+    if (confirmed + ro_skipped == n && ro_skipped > 0) return STM_EROFS;
+    return STM_EQUORUM;
 }
 
 /* ========================================================================= */
@@ -507,10 +577,9 @@ static void build_uberblock(stm_uberblock *out,
 static stm_sync *sync_new(stm_pool *p, stm_alloc *a)
 {
     /* Pool must carry at least one device; caller validated. */
-    stm_bdev *d = stm_pool_device_bdev(p, 0);
     const stm_pool_device *d0 = stm_pool_device_info(p, 0);
     const uint64_t *puuid = stm_pool_uuid(p);
-    if (!d || !d0 || !puuid) return NULL;
+    if (!d0 || !d0->bdev || !puuid) return NULL;
 
     stm_sync *s = calloc(1, sizeof *s);
     if (!s) return NULL;
@@ -521,11 +590,11 @@ static stm_sync *sync_new(stm_pool *p, stm_alloc *a)
     }
 
     s->pool  = p;
-    s->bdev  = d;
     s->alloc = a;
-    s->self_device_id = 0;    /* P5-1 N=1 degenerate */
     s->pool_uuid[0]   = puuid[0];
     s->pool_uuid[1]   = puuid[1];
+    /* device_uuid cache = device 0's uuid (alloc-tree device under P5-2
+     * MVP). Multi-device P5-3+ will generalize when alloc fans out. */
     s->device_uuid[0] = d0->uuid[0];
     s->device_uuid[1] = d0->uuid[1];
     return s;
@@ -550,12 +619,21 @@ stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
 
     stm_sync *s = sync_new(p, a);
     if (!s) return STM_ENOMEM;
-    stm_bdev *d = s->bdev;
+    /* P5-2: keyschema lives on device 0 (alloc tree device). Multi-
+     * device data redundancy is P5-3+; metadata still lands on a
+     * single primary device for P5-2. */
+    stm_bdev *d = stm_pool_device_bdev(p, 0);
+    if (!d) { stm_sync_close(s); return STM_EINVAL; }
 
-    /* Fresh pool: no uberblocks written yet. First stm_sync_commit
-     * will write gen=1 (matches sync.tla: Mount bumps to
-     * MaxDurableTxg+1 = 0+1 = 1). */
-    s->current_gen = 0;
+    /* Fresh pool: no uberblocks written yet.
+     *   auth_gen=0: no prior authoritative state.
+     *   current_gen=1: the first commit is 1-phase, writing a single
+     *                  final UB at gen=1 (no pre-flush state to
+     *                  preserve on rollback). After that first
+     *                  commit, auth_gen=1 and subsequent commits
+     *                  are full 2-phase with current_gen = auth+2. */
+    s->auth_gen    = 0;
+    s->current_gen = 1;
 
     /* P4-1: generate the pool's Merkle salt once, at format time.
      * The salt is persisted in ub_merkle_root_salt and stays stable
@@ -633,6 +711,38 @@ stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
     return STM_OK;
 }
 
+/* Per-device UB scan result. */
+typedef struct {
+    bool          valid;    /* stm_sb_mount_scan returned STM_OK */
+    stm_uberblock ub;       /* the canonical UB for this device */
+} sync_scan;
+
+/* Compute the authoritative gen: highest G such that
+ * |{device i : scans[i].valid && scans[i].ub.gen >= G}| >= quorum.
+ * Equivalent to: sort valid gens descending, take the (quorum-1)th.
+ * Returns 0 if fewer than quorum devices have a valid UB. */
+static uint64_t compute_auth_gen(const sync_scan *scans, size_t n, size_t quorum)
+{
+    /* Collect valid gens, pack into a local array. N <= 64 so stack-ok. */
+    uint64_t gens[STM_POOL_DEVICES_MAX];
+    size_t ngens = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (scans[i].valid) gens[ngens++] = stm_load_le64(scans[i].ub.ub_gen);
+    }
+    if (ngens < quorum) return 0;
+    /* Partial selection sort for the top `quorum` elements. O(N*quorum). */
+    for (size_t i = 0; i < quorum; i++) {
+        size_t max_at = i;
+        for (size_t j = i + 1; j < ngens; j++) {
+            if (gens[j] > gens[max_at]) max_at = j;
+        }
+        if (max_at != i) {
+            uint64_t t = gens[i]; gens[i] = gens[max_at]; gens[max_at] = t;
+        }
+    }
+    return gens[quorum - 1];
+}
+
 stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
                           const stm_hybrid_keys *wk,
                           struct stm_janus_client *janus,
@@ -647,52 +757,99 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
     stm_status ci = stm_crypto_init();
     if (ci != STM_OK) return ci;
 
-    /* P5-1 MVP scans device 0's ring. Multi-device quorum scan is
-     * P5-2. */
-    stm_bdev *d = stm_pool_device_bdev(p, 0);
-    if (!d) return STM_EINVAL;
+    size_t n = stm_pool_device_count(p);
+    size_t quorum = n / 2u + 1u;
 
-    /* Scan for the authoritative uberblock. */
-    stm_uberblock ub;
-    uint32_t      live_label = 0, live_slot = 0;
-    stm_status s = stm_sb_mount_scan(d, &ub, &live_label, &live_slot);
-    if (s != STM_OK) return s;
+    /* Phase 1: scan every device's ring. Track valid UBs per device.
+     * STM_ENOENT on a device means "blank / never used"; that device
+     * drops out of quorum arithmetic. STM_EBADVERSION means "pool at
+     * an incompatible format version" — fail fast. */
+    sync_scan *scans = calloc(n, sizeof *scans);
+    if (!scans) return STM_ENOMEM;
+    for (size_t i = 0; i < n; i++) {
+        stm_bdev *di = stm_pool_device_bdev(p, (uint16_t)i);
+        if (!di) continue;
+        uint32_t lbl = 0, slot = 0;
+        stm_status sc = stm_sb_mount_scan(di, &scans[i].ub, &lbl, &slot);
+        if (sc == STM_OK) {
+            scans[i].valid = true;
+        } else if (sc == STM_EBADVERSION) {
+            free(scans);
+            return STM_EBADVERSION;
+        }
+        /* STM_ENOENT / STM_ECORRUPT / STM_EIO: device contributes nothing. */
+    }
 
-    uint64_t durable_gen    = stm_load_le64(ub.ub_gen);
-    uint64_t alloc_root_gen = stm_load_le64(ub.ub_alloc_root_gen);
+    /* Phase 2: determine authoritative gen. */
+    uint64_t auth_gen = compute_auth_gen(scans, n, quorum);
+    if (auth_gen == 0) {
+        /* Not enough devices to form quorum. Distinguish:
+         *   - No device had a valid UB → STM_ENOENT (fresh pool). */
+        size_t valid_count = 0;
+        for (size_t i = 0; i < n; i++) if (scans[i].valid) valid_count++;
+        free(scans);
+        return (valid_count == 0) ? STM_ENOENT : STM_EQUORUM;
+    }
 
-    /* R9 P0-1: bound durable_gen so the +2 mount-claim dance below
-     * doesn't wrap. Commit at gen UINT64_MAX - 2 already refuses
-     * via R7d P2-5; a mount that would need to write a claim UB
-     * at UINT64_MAX - 1 leaves no headroom for the first commit at
-     * UINT64_MAX. Refuse early. */
-    if (durable_gen >= UINT64_MAX - 2) return STM_ERANGE;
+    /* R9 P0-1: bound durable_gen so the +1 (claim) and +2 (first
+     * commit target post-claim) don't wrap. */
+    if (auth_gen >= UINT64_MAX - 3) {
+        free(scans);
+        return STM_ERANGE;
+    }
 
-    /* P5-1: verify the on-disk UB matches the caller's pool handle.
-     * Caller (fs.c) peeks the UB to learn the roster, constructs a
-     * pool that matches, and hands it to us. A mismatch here means
-     * the caller either constructed the pool wrong or the UB's
-     * roster fields have been tampered with (ub_csum would catch
-     * outright flips; this catches structured tampering that
-     * preserved ub_csum — unreachable given ub_csum is BLAKE3-256,
-     * but defense-in-depth is cheap). */
+    /* Phase 3: pick canonical UB — any device with ub_gen == auth_gen.
+     * Cross-check all other quorum members' content (at gen==auth_gen)
+     * for agreement: a coordinator that writes UB Phase-3-per-device
+     * uses IDENTICAL shared content (only per-device fields differ).
+     * Any disagreement means split or tampering. */
+    size_t canonical_idx = SIZE_MAX;
+    for (size_t i = 0; i < n; i++) {
+        if (scans[i].valid && stm_load_le64(scans[i].ub.ub_gen) == auth_gen) {
+            if (canonical_idx == SIZE_MAX) {
+                canonical_idx = i;
+                continue;
+            }
+            /* Cross-check shared fields. */
+            const stm_uberblock *c = &scans[canonical_idx].ub;
+            const stm_uberblock *x = &scans[i].ub;
+            if (memcmp(c->ub_pool_uuid, x->ub_pool_uuid, sizeof c->ub_pool_uuid) != 0 ||
+                memcmp(&c->ub_alloc_root, &x->ub_alloc_root, sizeof c->ub_alloc_root) != 0 ||
+                memcmp(c->ub_merkle_root, x->ub_merkle_root, 32) != 0 ||
+                memcmp(c->ub_merkle_root_salt, x->ub_merkle_root_salt, 32) != 0 ||
+                memcmp(&c->ub_roster_hash, &x->ub_roster_hash, sizeof c->ub_roster_hash) != 0 ||
+                memcmp(&c->ub_device_count, &x->ub_device_count, sizeof c->ub_device_count) != 0 ||
+                memcmp(c->ub_key_schema, x->ub_key_schema, sizeof c->ub_key_schema) != 0 ||
+                memcmp(c->ub_roster, x->ub_roster, sizeof c->ub_roster) != 0) {
+                free(scans);
+                return STM_ECORRUPT;
+            }
+        }
+    }
+    if (canonical_idx == SIZE_MAX) {
+        /* Invariant violation: compute_auth_gen returned auth_gen but
+         * no device is at exactly that gen. Should be unreachable. */
+        free(scans);
+        return STM_ECORRUPT;
+    }
+
+    /* Canonical UB reference. (Keep a copy on the stack for safety —
+     * scans[] is about to be freed.) */
+    stm_uberblock ub = scans[canonical_idx].ub;
+    free(scans);
+    scans = NULL;
+
+    /* P5-1 UB validation (generalized): verify the canonical UB's
+     * pool_uuid + roster_hash + device_count match the caller's
+     * pool handle. Per-device uuid checks happen per-device below
+     * when we iterate for the claim write. */
     uint16_t ub_device_count = stm_load_le16(ub.ub_device_count);
     uint16_t ub_device_id    = stm_load_le16(ub.ub_device_id);
     uint64_t ub_roster_hash  = stm_load_le64(ub.ub_roster_hash);
-    if (ub_device_count != (uint16_t)stm_pool_device_count(p)) return STM_ECORRUPT;
-    if (ub_device_id    >= ub_device_count)                     return STM_ECORRUPT;
-    if (ub_roster_hash  != stm_pool_roster_hash(p))            return STM_ECORRUPT;
-    /* Cross-check this device's UUID against the roster slot. */
+    if (ub_device_count != (uint16_t)n) return STM_ECORRUPT;
+    if (ub_device_id    >= ub_device_count) return STM_ECORRUPT;
+    if (ub_roster_hash  != stm_pool_roster_hash(p)) return STM_ECORRUPT;
     {
-        const stm_pool_device *self = stm_pool_device_info(p, ub_device_id);
-        uint64_t ub_dev_uuid[2] = {
-            stm_load_le64(ub.ub_device_uuid[0]),
-            stm_load_le64(ub.ub_device_uuid[1]),
-        };
-        if (!self) return STM_ECORRUPT;
-        if (self->uuid[0] != ub_dev_uuid[0] ||
-            self->uuid[1] != ub_dev_uuid[1]) return STM_ECORRUPT;
-        /* pool_uuid too. */
         uint64_t ub_pool_uuid[2] = {
             stm_load_le64(ub.ub_pool_uuid[0]),
             stm_load_le64(ub.ub_pool_uuid[1]),
@@ -701,52 +858,40 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
         if (puuid[0] != ub_pool_uuid[0] ||
             puuid[1] != ub_pool_uuid[1]) return STM_ECORRUPT;
     }
+    /* Cross-check canonical's device_uuid against its roster slot. */
+    {
+        const stm_pool_device *canon_dev = stm_pool_device_info(p, ub_device_id);
+        uint64_t canon_uuid[2] = {
+            stm_load_le64(ub.ub_device_uuid[0]),
+            stm_load_le64(ub.ub_device_uuid[1]),
+        };
+        if (!canon_dev) return STM_ECORRUPT;
+        if (canon_dev->uuid[0] != canon_uuid[0] ||
+            canon_dev->uuid[1] != canon_uuid[1]) return STM_ECORRUPT;
+    }
+
+    uint64_t alloc_root_gen = stm_load_le64(ub.ub_alloc_root_gen);
 
     stm_sync *s2 = sync_new(p, a);
     if (!s2) return STM_ENOMEM;
 
-    /* R9 P0-1 — mount-claim UB protocol.
-     *
-     * sync.tla's MountGenBump models MaxDurableTxg as the max over
-     * BOTH the UB ring AND the durable data area. The pre-fix
-     * implementation only inspected the UB ring, so orphan
-     * encrypted metadata writes at gen=durable_gen+1 that happened
-     * to flush to disk before the UB (e.g. page-cache eviction
-     * preceding fsync) went unnoticed — and the next commit reused
-     * gen=durable_gen+1 for a DIFFERENT plaintext at the same
-     * paddr → AEAD nonce reuse under AEGIS-256, a cryptographic
-     * catastrophe.
-     *
-     * Fix: at mount, durably claim gen=durable_gen+1 by writing a
-     * "mount-claim" uberblock at that gen with the SAME tree roots
-     * as the durable UB (no commit happening yet — just advancing
-     * the gen counter). `ub_alloc_root_gen` carries the ORIGINAL
-     * encryption gen so AEAD decrypt on subsequent reads still
-     * matches. current_gen then starts at durable_gen+2, one past
-     * the claim.
-     *
-     * If this mount itself crashes between the claim UB write and
-     * the first commit: the next mount observes durable_gen'=
-     * durable_gen+1 and claims durable_gen+2, so the same-gen
-     * problem cannot recur. Consecutive crashed mounts burn one
-     * gen each — UINT64_MAX / 2^? astronomic. */
-    s2->current_gen       = durable_gen + 2;
-    s2->mount_max_durable = durable_gen;
-    s2->live_label_idx    = live_label;
-    s2->live_slot_idx     = live_slot;
+    /* Populate in-RAM state from the canonical UB. auth_gen = durable
+     * auth (pre-claim); claim advances it to auth+1 below. */
+    s2->auth_gen          = auth_gen;       /* pre-claim; updated after claim write */
+    s2->current_gen       = auth_gen + 2;   /* will be +3 after claim */
+    s2->mount_max_durable = auth_gen;
     s2->alloc_root_gen    = alloc_root_gen;
 
-    /* P4-1: carry Merkle state forward from the durable uberblock.
-     * Salt is per-pool and stable; alloc_root_csum + merkle_root
-     * are the last-committed values. */
+    /* P4-1: carry Merkle state forward from the canonical UB. */
     memcpy(s2->merkle_salt,      ub.ub_merkle_root_salt, 32);
     memcpy(s2->alloc_root_csum,  ub.ub_alloc_root.bp_csum, 32);
     memcpy(s2->merkle_root,      ub.ub_merkle_root,      32);
 
-    /* P4-4a: unpack the key-schema header, load the sub-tree into
-     * a keyschema handle, find the CURRENT wrapped key for dataset
-     * 0, and unwrap it with wk->sk. The raw metadata_key stays in
-     * RAM and gets installed on the allocator below. */
+    /* P4-4a: unpack the key-schema header, load the sub-tree.
+     * Keyschema lives on device 0 (metadata primary in P5-2 MVP). */
+    stm_bdev *meta_bdev = stm_pool_device_bdev(p, 0);
+    if (!meta_bdev) { stm_sync_close(s2); return STM_EINVAL; }
+
     stm_ub_key_schema_hdr ks_hdr;
     stm_status hs = stm_ub_key_schema_unpack(ub.ub_key_schema, &ks_hdr);
     if (hs != STM_OK) {
@@ -755,11 +900,6 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
     }
     uint64_t ks_root_paddr = stm_load_le64(ks_hdr.ks_root.bp_paddr);
     uint8_t  ks_root_kind  = ks_hdr.ks_root.bp_kind;
-    /* A pool that was sync_create'd but never sync_commit'd would
-     * have no keyschema on disk yet — but also no durable uberblock,
-     * so mount_scan above would have returned STM_ENOENT. A valid
-     * durable UB at v4 MUST have a non-zero keyschema bptr (or,
-     * conservatively, we treat zero as corruption). */
     if (ks_root_paddr == 0 ||
         ks_root_kind  != STM_BPTR_KIND_KEYSCHEMA) {
         stm_sync_close(s2);
@@ -768,7 +908,7 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
 
     stm_bootstrap *boot = stm_alloc_bootstrap(a);
     if (!boot) { stm_sync_close(s2); return STM_EINVAL; }
-    stm_status kos = stm_keyschema_open(d, boot, &s2->keyschema);
+    stm_status kos = stm_keyschema_open(meta_bdev, boot, &s2->keyschema);
     if (kos != STM_OK) { stm_sync_close(s2); return kos; }
     kos = stm_keyschema_load_at(s2->keyschema, ks_root_paddr,
                                   ks_hdr.ks_root.bp_csum);
@@ -776,12 +916,7 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
     s2->keyschema_root_paddr = ks_root_paddr;
     memcpy(s2->keyschema_root_csum, ks_hdr.ks_root.bp_csum, 32);
 
-    /* P4-4c: unwrap every CURRENT + RETIRED entry in the schema into
-     * the in-RAM DEK map. Retired keys are needed for reads of old
-     * data still encrypted under them; PRUNING entries are skipped
-     * (they're awaiting deletion, not reads). The pool metadata key
-     * for dataset 0 is then copied into `metadata_key` for alloc's
-     * crypt ctx. */
+    /* P4-4c: unwrap every CURRENT + RETIRED entry into the DEK map. */
     sync_unwrap_ctx ux = { .s = s2, .wk = wk, .janus = janus };
     stm_status all_rc = stm_keyschema_iter(s2->keyschema, sync_unwrap_cb, &ux);
     if (all_rc != STM_OK) {
@@ -789,8 +924,7 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
         return all_rc;
     }
 
-    /* Defense: the schema MUST carry exactly one CURRENT at (0, 0).
-     * Any other arrangement is structural corruption. */
+    /* Defense: schema MUST carry exactly one CURRENT at (0, 0). */
     uint64_t pool_cur_kid = UINT64_MAX;
     kos = stm_keyschema_lookup_current(s2->keyschema,
                                          STM_SYNC_POOL_DATASET_ID,
@@ -804,16 +938,12 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
                                                 STM_SYNC_POOL_DATASET_ID,
                                                 STM_SYNC_POOL_KEY_ID);
     if (!pool_slot) {
-        /* Unwrap succeeded for every entry but (0, 0) wasn't one of
-         * them — schema must be missing the pool metadata entry. */
         stm_sync_close(s2);
         return STM_ECORRUPT;
     }
     memcpy(s2->metadata_key, pool_slot->dek, 32);
 
-    /* P4-3b: install the crypt ctx on the allocator so
-     * stm_alloc_load_tree_at below can decrypt nodes. MUST happen
-     * before load_tree_at. */
+    /* P4-3b: install the crypt ctx on the allocator. */
     stm_status cs = stm_alloc_set_crypt_ctx(a, s2->metadata_key,
                                               s2->pool_uuid, s2->device_uuid);
     if (cs != STM_OK) {
@@ -821,18 +951,13 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
         return cs;
     }
 
-    /* P4-1 / P4-4a: verify the on-disk ub_merkle_root is
-     * self-consistent with the per-tree-root csums (now including
-     * the key-schema root) + salt recorded in the SAME uberblock.
-     * An offline edit that swapped any of those inputs breaks this.
-     *
-     * R8-P1-1: on BLAKE3 OOM, refuse the mount entirely. */
+    /* P4-1 / P4-4a: verify ub_merkle_root self-consistency. */
     uint8_t  zeros32[32] = { 0 };
     uint8_t  recomputed[32];
-    stm_status ms = compute_merkle_root(zeros32,     /* main */
+    stm_status ms = compute_merkle_root(zeros32,
                                           ub.ub_alloc_root.bp_csum,
-                                          zeros32,     /* snap */
-                                          zeros32,     /* cas  */
+                                          zeros32,
+                                          zeros32,
                                           ks_hdr.ks_root.bp_csum,
                                           ub.ub_merkle_root_salt,
                                           recomputed);
@@ -845,11 +970,7 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
         return STM_ECORRUPT;
     }
 
-    /* Rehydrate the allocator tree from ub_alloc_root. R7d P1-1:
-     * a valid-csum uberblock with a nonzero ub_alloc_root.bp_paddr
-     * but wrong kind indicates tampering — surface as STM_ECORRUPT
-     * rather than silently returning a handle with an empty tree
-     * that would alias the real (on-disk but unreferenced) data. */
+    /* Rehydrate the allocator tree. R7d P1-1 defense on kind. */
     uint64_t alloc_root = stm_load_le64(ub.ub_alloc_root.bp_paddr);
     uint8_t  kind       = ub.ub_alloc_root.bp_kind;
     if (alloc_root != 0) {
@@ -857,11 +978,6 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
             stm_sync_close(s2);
             return STM_ECORRUPT;
         }
-        /* P4-1 / P4-3b: pass the expected csum + alloc_root_gen
-         * through so the tree loader verifies ciphertext BLAKE3
-         * against ub_alloc_root.bp_csum and AEAD-decrypts every
-         * node under the ORIGINAL encryption gen (which is NOT
-         * necessarily ub_gen if a prior mount wrote a claim UB). */
         stm_status ls = stm_alloc_load_tree_at(a, alloc_root, alloc_root_gen,
                                                   ub.ub_alloc_root.bp_csum);
         if (ls != STM_OK) {
@@ -871,18 +987,21 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
         s2->alloc_root_paddr = alloc_root;
     }
 
-    /* Write the mount-claim UB at durable_gen+1. Same roots +
-     * merkle state + alloc_root_gen as the durable UB; only ub_gen
-     * advances. Fsynced via stm_sb_label_write. After this write
-     * returns, mount has durably claimed gen=durable_gen+1 — the
-     * next commit at current_gen (= durable_gen+2) cannot collide
-     * with any orphan metadata writes from a prior crashed mount.
+    /* R9 P0-1 — multi-device mount-claim.
      *
-     * Read-only mount skips the claim UB (the bdev refuses writes
-     * with STM_EROFS). Safe because an RO mount never issues any
-     * new AEAD write — `current_gen` is unused. We stash it anyway
-     * for stm_sync_info_get callers that want to know "what the
-     * next RW mount would start at." */
+     * Write a claim UB at auth_gen+1 to every pool device, require
+     * quorum. Same shared content as the canonical UB (roots
+     * unchanged; only ub_gen advances). After the quorum write,
+     * auth=auth+1 and current_gen=auth+3 (next commit target; 2-phase
+     * commit will reserve at auth+2 and finalize at auth+3).
+     *
+     * RO pools: write fails with STM_EROFS on every device; treat as
+     * a no-op claim. current_gen stays at auth+2 (reported for info
+     * but unused — RO never commits).
+     *
+     * Quorum failure (too few devices online to accept the claim):
+     * refuse mount. Operator's recourse is emergency recovery or
+     * replacing faulted devices. */
     {
         stm_alloc_stats astats_claim;
         stm_status gs = stm_alloc_stats_get(a, &astats_claim);
@@ -890,9 +1009,10 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
             stm_sync_close(s2);
             return gs;
         }
-        stm_uberblock claim_ub;
-        build_uberblock(&claim_ub, s2,
-                         /*new_gen=*/           durable_gen + 1,
+        stm_uberblock claim_prototype;
+        build_uberblock(&claim_prototype, s2,
+                         /*target_device_id=*/ 0,   /* overwritten per-device */
+                         /*new_gen=*/           auth_gen + 1,
                          /*alloc_root=*/        alloc_root,
                          /*alloc_csum=*/        ub.ub_alloc_root.bp_csum,
                          /*alloc_root_gen=*/    alloc_root_gen,
@@ -900,18 +1020,24 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
                          /*keyschema_csum=*/    ks_hdr.ks_root.bp_csum,
                          /*merkle_root=*/       ub.ub_merkle_root,
                          &astats_claim);
-        uint32_t lbl  = ring_label_for_gen(durable_gen + 1);
-        uint32_t slot = ring_slot_for_gen(durable_gen + 1);
-        stm_status cw = stm_sb_label_write(d, lbl, slot, &claim_ub);
+        uint32_t lbl  = ring_label_for_gen(auth_gen + 1);
+        uint32_t slot = ring_slot_for_gen(auth_gen + 1);
+        stm_status cw = write_ub_to_all_devices(s2, &claim_prototype, lbl, slot);
         if (cw == STM_OK) {
+            s2->auth_gen       = auth_gen + 1;
+            s2->current_gen    = auth_gen + 3;
             s2->live_label_idx = lbl;
             s2->live_slot_idx  = slot;
-        } else if (cw != STM_EROFS) {
+        } else if (cw == STM_EROFS) {
+            /* RO pool: leave auth_gen at the durable value (pre-claim).
+             * Remember the canonical UB's (label, slot) for info. */
+            uint64_t canon_gen = stm_load_le64(ub.ub_gen);
+            s2->live_label_idx = ring_label_for_gen(canon_gen);
+            s2->live_slot_idx  = ring_slot_for_gen(canon_gen);
+        } else {
             stm_sync_close(s2);
             return cw;
         }
-        /* For STM_EROFS we leave live_label/slot pointing at the
-         * DURABLE UB (set earlier from mount_scan). */
         s2->alloc_root_paddr = alloc_root;
         memcpy(s2->alloc_root_csum, ub.ub_alloc_root.bp_csum, 32);
         memcpy(s2->merkle_root,     ub.ub_merkle_root,        32);
@@ -945,58 +1071,83 @@ stm_status stm_sync_commit(stm_sync *s)
 
     pthread_mutex_lock(&s->lock);
 
-    /* Convention: s->current_gen = 0 means "fresh pool, no commits yet";
-     * post-mount it's (max_durable + 1), i.e. next-commit's-gen. Force
-     * the first commit to gen=1 so on-disk gens are strictly positive
-     * (matches sync.tla's Mount bumping txg from 0 to 1). */
-    uint64_t commit_gen = s->current_gen;
-    if (commit_gen == 0) commit_gen = 1;
-
-    /* R7d P2-5: refuse to commit if advancing current_gen would wrap
-     * past UINT64_MAX. 2^64 commits is astronomically unreachable, but
-     * bounded gen arithmetic is the project norm. */
-    if (commit_gen >= UINT64_MAX) {
+    /* P5-2 commit protocol (quorum.tla):
+     *
+     *   Fresh pool (auth_gen == 0):
+     *       1-phase: flush, write final UB at gen=1 to every device,
+     *       require quorum. auth=1, current_gen=3.
+     *   Existing pool (auth_gen > 0):
+     *       2-phase.
+     *       Reservation: write UB at reservation_gen=auth+1
+     *       (content = previous auth UB with gen bumped; pre-flush
+     *        roots) to every device, require quorum. This is the
+     *        rollback target if Phase 3 fails.
+     *       Flush: keyschema_commit + alloc_commit at target_gen.
+     *       Final: write UB at target_gen=auth+2 (content = post-flush
+     *        roots + new merkle root) to every device, require quorum.
+     *        auth = target_gen, current_gen = auth+2.
+     *
+     * R7d P2-5: refuse to commit if advancing target_gen would wrap
+     * past UINT64_MAX. 2^64 commits is astronomically unreachable. */
+    uint64_t target_gen = s->current_gen;
+    if (target_gen >= UINT64_MAX - 2) {
         pthread_mutex_unlock(&s->lock);
         return STM_ERANGE;
     }
 
-    /* Phase: Reserve + Flush.
-     *
-     * Order matters — key-schema first, allocator second. Both
-     * share the bootstrap pool for node storage; bootstrap_commit
-     * runs at the END of stm_alloc_commit (fsyncs the bitmap).
-     * If we ran alloc_commit first, keyschema's subsequent reserves
-     * would stamp the bitmap in RAM but never reach durable state,
-     * and the next mount would see keyschema's paddr as free — a
-     * recipe for paddr collisions on the next commit.
-     *
-     * P4-4a: commit the key-schema sub-tree. For P4-4a the schema
-     * state is usually unchanged across commits (no rotation yet),
-     * but we re-serialize unconditionally — the node is tiny by
-     * metadata standards (1 × 128 KiB) and the always-fresh-paddr
-     * shape matches the alloc-tree's commit pattern (simpler
-     * reasoning, no special "clean" skip path). */
+    const bool is_fresh = (s->auth_gen == 0);
+    const uint64_t reservation_gen = is_fresh ? 0 : (target_gen - 1);
+
+    /* Phase 1 (non-fresh only): reservation UB = copy of previous
+     * authoritative state with gen bumped. Pre-flush roots; rollback
+     * target on Phase 3 failure. */
+    if (!is_fresh) {
+        stm_alloc_stats astats_res;
+        stm_status gs = stm_alloc_stats_get(s->alloc, &astats_res);
+        if (gs != STM_OK) {
+            pthread_mutex_unlock(&s->lock);
+            return gs;
+        }
+        stm_uberblock res_prototype;
+        build_uberblock(&res_prototype, s,
+                         /*target_device_id=*/ 0,   /* overwritten per-device */
+                         /*new_gen=*/           reservation_gen,
+                         /*alloc_root=*/        s->alloc_root_paddr,
+                         /*alloc_csum=*/        s->alloc_root_csum,
+                         /*alloc_root_gen=*/    s->alloc_root_gen,
+                         /*keyschema_root=*/    s->keyschema_root_paddr,
+                         /*keyschema_csum=*/    s->keyschema_root_csum,
+                         /*merkle_root=*/       s->merkle_root,
+                         &astats_res);
+        uint32_t res_label = ring_label_for_gen(reservation_gen);
+        uint32_t res_slot  = ring_slot_for_gen(reservation_gen);
+        stm_status rw = write_ub_to_all_devices(s, &res_prototype,
+                                                    res_label, res_slot);
+        if (rw != STM_OK) {
+            pthread_mutex_unlock(&s->lock);
+            return rw;
+        }
+    }
+
+    /* Phase 2: Flush. Keyschema first (its tree nodes get allocated
+     * before the alloc-tree's commit which fsyncs the bitmap — running
+     * alloc_commit first would stamp keyschema's reserves in RAM but
+     * never reach durable state, colliding on the next commit). */
     uint64_t ks_root_paddr = 0;
     uint8_t  ks_root_csum[32] = { 0 };
-    stm_status kcs = stm_keyschema_commit(s->keyschema, commit_gen,
+    stm_status kcs = stm_keyschema_commit(s->keyschema, target_gen,
                                             &ks_root_paddr, ks_root_csum);
     if (kcs != STM_OK) {
         pthread_mutex_unlock(&s->lock);
         return kcs;
     }
 
-    /* stm_alloc_commit(committed_gen = commit_gen) persists the
-     * allocator-tree to the bootstrap pool AND fsyncs via
-     * stm_bootstrap_commit at the end — finalizing both alloc's
-     * and keyschema's reserves/frees in one durable transaction. */
-    stm_status s_alloc = stm_alloc_commit(s->alloc, commit_gen);
+    stm_status s_alloc = stm_alloc_commit(s->alloc, target_gen);
     if (s_alloc != STM_OK) {
         pthread_mutex_unlock(&s->lock);
         return s_alloc;
     }
 
-    /* Pull the now-durable allocator tree root + its BLAKE3 self-csum
-     * for ub_alloc_root.bp_paddr and .bp_csum (P4-1). */
     uint64_t alloc_root = 0;
     uint8_t  alloc_root_csum[32] = { 0 };
     stm_status sr = stm_alloc_get_tree_root(s->alloc,
@@ -1006,7 +1157,6 @@ stm_status stm_sync_commit(stm_sync *s)
         return sr;
     }
 
-    /* Pull allocator stats for uberblock's total/free block counters. */
     stm_alloc_stats astats;
     sr = stm_alloc_stats_get(s->alloc, &astats);
     if (sr != STM_OK) {
@@ -1014,14 +1164,9 @@ stm_status stm_sync_commit(stm_sync *s)
         return sr;
     }
 
-    /* P4-1 / P4-4a: compute the pool Merkle root over all five
-     * sub-tree csums + the per-pool salt. Phase 4 populates
-     * allocator + key-schema; main/snap/cas contribute zeros and
-     * populate in Phase 5+.
-     *
-     * R8-P1-1: refuse to commit if BLAKE3 context allocation fails.
-     * Writing a zero merkle_root on OOM would match a future mount
-     * that also OOMs → silent integrity bypass. */
+    /* P4-1: compute the pool Merkle root. R8-P1-1: refuse to commit
+     * on BLAKE3 OOM (writing zero merkle_root would silently bypass
+     * integrity check). */
     uint8_t zeros32[32] = { 0 };
     uint8_t new_merkle_root[32];
     stm_status ms = compute_merkle_root(zeros32,   /* main */
@@ -1036,16 +1181,12 @@ stm_status stm_sync_commit(stm_sync *s)
         return ms;
     }
 
-    /* Phase: Final — write the new uberblock to the next ring slot,
-     * fsynced. This is the commit point per sync.tla. Ring rotation:
-     * label = gen % 4, slot = gen % 63.
-     *
-     * R9 P0-1 / P4-4c: alloc_root_gen comes from the allocator — NOT
-     * from commit_gen — because stm_alloc_commit's R7c P2-5 optimization
-     * skips the tree rewrite when nothing is dirty, so the tree may
-     * still be encrypted at an older gen. Recording commit_gen here
-     * would cause sync_open's alloc_load_tree_at to try decrypting under
-     * the wrong gen → STM_EBADTAG at mount. */
+    /* Phase 3: Final UB write. R9 P0-1 / P4-4c: alloc_root_gen comes
+     * from the allocator — NOT target_gen — because stm_alloc_commit's
+     * R7c P2-5 optimization skips the tree rewrite when nothing is
+     * dirty, so the tree may still be encrypted at an older gen.
+     * Recording target_gen here would break AEAD decrypt on the next
+     * mount. */
     uint64_t tree_gen = 0;
     sr = stm_alloc_get_tree_gen(s->alloc, &tree_gen);
     if (sr != STM_OK) {
@@ -1053,27 +1194,30 @@ stm_status stm_sync_commit(stm_sync *s)
         return sr;
     }
 
-    stm_uberblock ub;
-    build_uberblock(&ub, s, commit_gen,
+    stm_uberblock fin_prototype;
+    build_uberblock(&fin_prototype, s,
+                     /*target_device_id=*/ 0,   /* overwritten per-device */
+                     /*new_gen=*/           target_gen,
                      alloc_root, alloc_root_csum, tree_gen,
                      ks_root_paddr, ks_root_csum,
                      new_merkle_root, &astats);
 
-    uint32_t next_label = ring_label_for_gen(commit_gen);
-    uint32_t next_slot  = ring_slot_for_gen(commit_gen);
-
-    stm_status sw = stm_sb_label_write(s->bdev, next_label, next_slot, &ub);
-    if (sw != STM_OK) {
+    uint32_t fin_label = ring_label_for_gen(target_gen);
+    uint32_t fin_slot  = ring_slot_for_gen(target_gen);
+    stm_status fw = write_ub_to_all_devices(s, &fin_prototype,
+                                                fin_label, fin_slot);
+    if (fw != STM_OK) {
         pthread_mutex_unlock(&s->lock);
-        return sw;
+        return fw;
     }
 
-    /* Phase: Publish — advance in-RAM state. Done under our mutex so
-     * any concurrent reader of stm_sync_info_get observes a
-     * consistent snapshot. */
-    s->current_gen           = commit_gen + 1;
-    s->live_label_idx        = next_label;
-    s->live_slot_idx         = next_slot;
+    /* Publish: advance in-RAM state. auth_gen = target, current_gen =
+     * auth + 2 (next target). Done under our mutex so concurrent
+     * stm_sync_info_get observes a consistent snapshot. */
+    s->auth_gen              = target_gen;
+    s->current_gen           = target_gen + 2;
+    s->live_label_idx        = fin_label;
+    s->live_slot_idx         = fin_slot;
     s->alloc_root_paddr      = alloc_root;
     s->alloc_root_gen        = tree_gen;
     s->keyschema_root_paddr  = ks_root_paddr;
@@ -1095,6 +1239,7 @@ stm_status stm_sync_info_get(const stm_sync *s, stm_sync_info *out)
     stm_sync *ms = (stm_sync *)s;
     pthread_mutex_lock(&ms->lock);
 
+    out->auth_gen              = s->auth_gen;
     out->current_gen           = s->current_gen;
     out->mount_max_durable_gen = s->mount_max_durable;
     out->live_label_idx        = s->live_label_idx;

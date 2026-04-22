@@ -87,6 +87,7 @@ typedef enum {
     STM_ENOTSUPPORTED   = -205,
     STM_EPROTOCOL       = -206,   /* protocol / wire-format violation      */
     STM_EBACKEND        = -207,   /* backend reported an opaque failure    */
+    STM_EQUORUM         = -208,   /* multi-device commit/mount lacked quorum confirmations */
 } stm_status;
 
 const char *stm_strerror(stm_status s);

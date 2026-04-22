@@ -80,11 +80,10 @@ STM_TEST(fs_format_mount_unmount_roundtrip) {
     STM_ASSERT(st.data_total_blocks > 0);
     STM_ASSERT_EQ(st.read_only, false);
     STM_ASSERT_EQ(st.wedged, false);
-    /* Format did one commit at gen=1. Mount writes a mount-claim UB
-     * at gen=2 (R9 P0-1) and bumps current_gen to 3 so the first
-     * live commit cannot collide with orphan metadata from a
-     * hypothetical prior crashed mount. */
-    STM_ASSERT_EQ(st.current_gen, 3u);
+    /* P5-2: Format does one commit at gen=1 (fresh 1-phase). Mount
+     * writes a claim UB at auth+1=2 (auth becomes 2). Next commit
+     * target = auth+2 = 4. */
+    STM_ASSERT_EQ(st.current_gen, 4u);
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
@@ -137,7 +136,9 @@ STM_TEST(fs_reserve_free_commit_via_fs) {
     uint64_t pre_commit_gen = st.current_gen;
     STM_ASSERT_OK(stm_fs_commit(fs));
     STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
-    STM_ASSERT_EQ(st.current_gen, pre_commit_gen + 1u);
+    /* P5-2: 2-phase commits advance current_gen by 2 (auth advances
+     * from auth to auth+2; current_gen = auth+2 = prev_current+2). */
+    STM_ASSERT_EQ(st.current_gen, pre_commit_gen + 2u);
 
     /* Free p1, commit, verify removed. */
     STM_ASSERT_OK(stm_fs_free(fs, p1, pre_commit_gen));
@@ -288,10 +289,10 @@ STM_TEST(fs_reformat_over_old_pool_is_clean) {
     STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
 
     STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
-    /* New format's first commit is gen=1. Mount writes a mount-claim
-     * UB at gen=2 (R9 P0-1) and bumps current_gen to 3. No leakage
-     * from the old pool. */
-    STM_ASSERT_EQ(st.current_gen, 3u);
+    /* P5-2: Fresh format's first commit (1-phase) at gen=1. Mount
+     * writes claim UB at auth+1=2. Next commit target = auth+2 = 4.
+     * No leakage from the old pool. */
+    STM_ASSERT_EQ(st.current_gen, 4u);
     STM_ASSERT_EQ(st.n_allocated_ranges, 0u);
     STM_ASSERT_EQ(st.data_allocated_blocks, 0u);
 
@@ -301,7 +302,8 @@ STM_TEST(fs_reformat_over_old_pool_is_clean) {
     STM_ASSERT_OK(stm_fs_reserve(fs, 8u, 0, &p));
     STM_ASSERT_OK(stm_fs_commit(fs));
     STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
-    STM_ASSERT_EQ(st.current_gen, 4u);
+    /* 2-phase commit: reservation at 3, final at 4. current_gen=6. */
+    STM_ASSERT_EQ(st.current_gen, 6u);
     STM_ASSERT_EQ(st.data_allocated_blocks, 8u);
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
@@ -324,11 +326,12 @@ STM_TEST(fs_stats_reports_gen_progression) {
 
     STM_ASSERT_OK(stm_fs_commit(fs));
     STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
-    STM_ASSERT_EQ(st.current_gen, gen0 + 1u);
+    /* P5-2: 2-phase commits advance current_gen by 2. */
+    STM_ASSERT_EQ(st.current_gen, gen0 + 2u);
 
     STM_ASSERT_OK(stm_fs_commit(fs));
     STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
-    STM_ASSERT_EQ(st.current_gen, gen0 + 2u);
+    STM_ASSERT_EQ(st.current_gen, gen0 + 4u);
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
