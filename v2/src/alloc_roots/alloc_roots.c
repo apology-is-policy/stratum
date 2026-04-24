@@ -83,7 +83,7 @@ struct stm_alloc_roots {
  * of v2's on-disk encoding. */
 #define AR_KEY_LEN   2u
 #define AR_VAL_LEN   STM_ALLOC_ROOTS_VALUE_BYTES
-_Static_assert(AR_VAL_LEN == 40u, "value layout changed; update callers");
+_Static_assert(AR_VAL_LEN == 48u, "value layout changed; update callers");
 
 static void encode_key(uint16_t device_id, uint8_t out[AR_KEY_LEN])
 {
@@ -97,22 +97,29 @@ static uint16_t decode_key(const uint8_t in[AR_KEY_LEN])
 }
 
 static void encode_val(uint64_t paddr, const uint8_t csum[32],
-                         uint8_t out[AR_VAL_LEN])
+                         uint64_t root_gen, uint8_t out[AR_VAL_LEN])
 {
     /* le64 paddr. */
     for (int i = 0; i < 8; i++)
         out[i] = (uint8_t)((paddr >> (i * 8)) & 0xff);
     memcpy(out + 8, csum, 32);
+    /* le64 root_gen. */
+    for (int i = 0; i < 8; i++)
+        out[40 + i] = (uint8_t)((root_gen >> (i * 8)) & 0xff);
 }
 
 static stm_status decode_val(const uint8_t *in, size_t in_len,
-                                uint64_t *out_paddr, uint8_t out_csum[32])
+                                uint64_t *out_paddr, uint8_t out_csum[32],
+                                uint64_t *out_root_gen)
 {
     if (in_len != AR_VAL_LEN) return STM_ECORRUPT;
     uint64_t p = 0;
     for (int i = 0; i < 8; i++) p |= ((uint64_t)in[i]) << (i * 8);
     *out_paddr = p;
     memcpy(out_csum, in + 8, 32);
+    uint64_t g = 0;
+    for (int i = 0; i < 8; i++) g |= ((uint64_t)in[40 + i]) << (i * 8);
+    *out_root_gen = g;
     return STM_OK;
 }
 
@@ -249,7 +256,8 @@ stm_status stm_alloc_roots_set_crypt_ctx(stm_alloc_roots *r,
 
 stm_status stm_alloc_roots_set(stm_alloc_roots *r, uint16_t device_id,
                                  uint64_t root_paddr,
-                                 const uint8_t root_csum[32])
+                                 const uint8_t root_csum[32],
+                                 uint64_t root_gen)
 {
     if (!r || !root_csum) return STM_EINVAL;
     if (device_id >= STM_POOL_DEVICES_MAX) return STM_EINVAL;
@@ -258,7 +266,7 @@ stm_status stm_alloc_roots_set(stm_alloc_roots *r, uint16_t device_id,
     uint8_t key[AR_KEY_LEN];
     uint8_t new_val[AR_VAL_LEN];
     encode_key(device_id, key);
-    encode_val(root_paddr, root_csum, new_val);
+    encode_val(root_paddr, root_csum, root_gen, new_val);
 
     /* Idempotency guard: on a retry (commit-called-twice-without-
      * mutation), every per-device alloc_commit returns identical
@@ -289,7 +297,8 @@ stm_status stm_alloc_roots_set(stm_alloc_roots *r, uint16_t device_id,
 
 stm_status stm_alloc_roots_get(const stm_alloc_roots *r, uint16_t device_id,
                                  uint64_t *out_root_paddr,
-                                 uint8_t out_root_csum[32])
+                                 uint8_t out_root_csum[32],
+                                 uint64_t *out_root_gen)
 {
     if (!r || !out_root_paddr) return STM_EINVAL;
     if (device_id >= STM_POOL_DEVICES_MAX) return STM_EINVAL;
@@ -308,12 +317,14 @@ stm_status stm_alloc_roots_get(const stm_alloc_roots *r, uint16_t device_id,
     if (got != AR_VAL_LEN) return STM_ECORRUPT;
 
     uint64_t p = 0;
+    uint64_t g = 0;
     uint8_t  cs[32];
-    stm_status ds = decode_val(val, AR_VAL_LEN, &p, cs);
+    stm_status ds = decode_val(val, AR_VAL_LEN, &p, cs, &g);
     if (ds != STM_OK) return ds;
 
     *out_root_paddr = p;
     if (out_root_csum) memcpy(out_root_csum, cs, 32);
+    if (out_root_gen)  *out_root_gen = g;
     return STM_OK;
 }
 
@@ -358,10 +369,11 @@ static int iter_bridge(const void *k, size_t klen,
     }
     uint16_t device_id = decode_key(k);
     uint64_t paddr = 0;
+    uint64_t gen   = 0;
     uint8_t  csum[32];
-    stm_status ds = decode_val(v, vlen, &paddr, csum);
+    stm_status ds = decode_val(v, vlen, &paddr, csum, &gen);
     if (ds != STM_OK) { ic->err = ds; return 1; }
-    int rc = ic->cb(device_id, paddr, csum, ic->user_ctx);
+    int rc = ic->cb(device_id, paddr, csum, gen, ic->user_ctx);
     if (rc != 0) { ic->stop = rc; return 1; }
     return 0;
 }

@@ -43,6 +43,7 @@
 #define STRATUM_V2_ALLOC_H
 
 #include <stratum/types.h>
+#include <stratum/pool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -199,6 +200,32 @@ stm_status stm_alloc_get_tree_gen(const stm_alloc *a, uint64_t *out_root_gen);
  * destroying a locked mutex is undefined behavior).
  */
 void stm_alloc_close(stm_alloc *a);
+
+/*
+ * P5-3c: set the pool-level device_id this alloc belongs to. Stamped
+ * into the top 16 bits of every paddr returned by stm_alloc_reserve,
+ * and validated in the top 16 bits of every paddr passed to free /
+ * ref / lookup / is_allocated.
+ *
+ * Default at create is 0 (legacy single-device semantics). Multi-
+ * device pools call this for each additional device's alloc (device
+ * 0's alloc stays at the default).
+ *
+ * MUST be called before any reserve on this alloc; pre-reserve
+ * invariant keeps the returned-paddr stream internally consistent
+ * (every paddr returned by reserve has the same top 16 bits, matching
+ * what free / lookup expect).
+ *
+ * Returns STM_EINVAL on a NULL handle. Accepts any device_id in
+ * [0, STM_POOL_DEVICES_MAX) — the upper bound comes from pool.h.
+ */
+STM_MUST_USE
+stm_status stm_alloc_set_device_id(stm_alloc *a, uint16_t device_id);
+
+/* P5-3c: read back the device_id set via stm_alloc_set_device_id.
+ * 0 by default (legacy single-device). */
+STM_MUST_USE
+stm_status stm_alloc_get_device_id(const stm_alloc *a, uint16_t *out_device_id);
 
 /*
  * Borrow the allocator's bootstrap handle. Used by higher layers

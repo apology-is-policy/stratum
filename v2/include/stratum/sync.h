@@ -263,6 +263,100 @@ stm_status stm_sync_redundancy_get(const stm_sync *s,
                                      stm_redundancy_profile *out);
 
 /* ========================================================================= */
+/* P5-3c: multi-device alloc attach + mirror APIs.                             */
+/* ========================================================================= */
+
+/*
+ * Attach `alloc` to sync as the allocator for `device_id`. The
+ * primary alloc (device 0) is set at stm_sync_create / _open time;
+ * use this to register additional per-device allocators for mirror
+ * (n>1) reservations.
+ *
+ * Prerequisites:
+ *   - device_id in (0, stm_pool_device_count(pool)); device_id == 0
+ *     is already attached and cannot be replaced.
+ *   - `alloc` MUST have its device_id set via stm_alloc_set_device_id
+ *     to match the argument here.
+ *   - The attached alloc is BORROWED; caller owns its lifecycle and
+ *     must keep it alive until stm_sync_close returns.
+ *   - The attached alloc MUST NOT already be registered for another
+ *     device_id.
+ *   - MUST be called before the first stm_sync_commit that writes
+ *     durable state referencing device_id's alloc tree.
+ *
+ * Returns STM_EEXIST if a slot is already filled for device_id.
+ * Returns STM_EINVAL on range / shape violations.
+ */
+STM_MUST_USE
+stm_status stm_sync_attach_alloc(stm_sync *s, uint16_t device_id,
+                                   stm_alloc *alloc);
+
+/*
+ * Mirror reservation. Reserves `nblocks` blocks on each of the first
+ * `n_replicas` devices in the pool, returning their paddrs in
+ * `out_paddrs[0..n_replicas-1]`. Each paddr's top 16 bits encode its
+ * device_id.
+ *
+ * `n_replicas` MUST equal the pool's declared `mirror_n` (set at
+ * create via profile). STM_EINVAL on mismatch.
+ *
+ * Each target device MUST have an attached alloc (via
+ * stm_sync_attach_alloc or as the primary). STM_EINVAL on any missing
+ * alloc.
+ *
+ * Atomicity: partial-failure cleanup. If any per-device reserve
+ * fails, every already-reserved paddr is freed before returning the
+ * error. On success, all n_replicas reservations are live and
+ * consistent.
+ */
+STM_MUST_USE
+stm_status stm_sync_reserve_mirror(stm_sync *s, uint64_t nblocks,
+                                      size_t n_replicas,
+                                      uint64_t out_paddrs[]);
+
+/*
+ * Write `buf[0..len)` to every paddr in `paddrs[0..n)`, fsyncing
+ * each device after its write. Returns STM_OK if at least
+ * ⌊n/2⌋+1 devices confirmed (write + fsync both STM_OK). `out_n_
+ * confirmed` (may be NULL) receives the actual confirmation count.
+ *
+ * `len` MUST be a multiple of STM_UB_SIZE (4096). Each paddr's top
+ * 16 bits select the target device; the low 48 bits are the starting
+ * block offset. No length / range validation of the paddrs happens
+ * here — caller typically got them from stm_sync_reserve_mirror.
+ *
+ * Returns STM_EQUORUM on sub-quorum confirmation (pool left with
+ * some replicas durable, others not; scrub / retry reconciles).
+ */
+STM_MUST_USE
+stm_status stm_sync_mirror_write(stm_sync *s, const uint64_t paddrs[],
+                                    size_t n, const void *buf, size_t len,
+                                    size_t *out_n_confirmed);
+
+/*
+ * Read from any of the `n` replicas into `buf`. Tries paddrs in
+ * order; on each read, verifies BLAKE3-256(buf) against
+ * `expected_csum`. First match wins. Returns STM_OK on success (buf
+ * holds the verified replica). STM_ECORRUPT if NO replica produces
+ * a csum match.
+ *
+ * `expected_csum` is typically the parent bptr's bp_csum, i.e., the
+ * plaintext csum of what was written via stm_sync_mirror_write.
+ * AEAD-layered callers (future extent manager) use AEAD decryption
+ * as the integrity gate; for this layer we expose the plaintext
+ * csum primitive.
+ *
+ * On read I/O failure for an individual replica (not ECORRUPT),
+ * the loop proceeds to the next replica. Only surfaces the I/O
+ * error if every replica fails AND no replica produced a csum
+ * match.
+ */
+STM_MUST_USE
+stm_status stm_sync_mirror_read(stm_sync *s, const uint64_t paddrs[],
+                                   size_t n, void *buf, size_t len,
+                                   const uint8_t expected_csum[32]);
+
+/* ========================================================================= */
 /* Per-dataset key management (P4-4c).                                        */
 /* ========================================================================= */
 

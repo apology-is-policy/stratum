@@ -80,6 +80,15 @@ struct stm_alloc {
     stm_bootstrap  *boot;           /* internal node storage             */
     stm_btree_mt   *tree;           /* data-area allocation tracker      */
 
+    /* P5-3c: pool-level device_id this alloc belongs to. Stamped into
+     * the top 16 bits of every paddr returned by stm_alloc_reserve,
+     * and validated in the top 16 bits of every paddr passed to free /
+     * ref / lookup. Defaults to 0 on create (legacy single-device
+     * semantics). Set via stm_alloc_set_device_id BEFORE any reserve.
+     * Multi-device pools (P5-3c+) call the setter on each additional
+     * device's alloc; device 0 stays at the default. */
+    uint16_t        device_id;
+
     uint64_t        data_first_block;  /* inclusive                      */
     uint64_t        data_last_block;   /* inclusive                      */
     uint64_t        data_total_blocks;
@@ -688,6 +697,26 @@ stm_bootstrap *stm_alloc_bootstrap(stm_alloc *a)
     return a ? a->boot : NULL;
 }
 
+stm_status stm_alloc_set_device_id(stm_alloc *a, uint16_t device_id)
+{
+    if (!a) return STM_EINVAL;
+    if (device_id >= STM_POOL_DEVICES_MAX) return STM_EINVAL;
+    pthread_mutex_lock(&a->lock);
+    a->device_id = device_id;
+    pthread_mutex_unlock(&a->lock);
+    return STM_OK;
+}
+
+stm_status stm_alloc_get_device_id(const stm_alloc *a, uint16_t *out_device_id)
+{
+    if (!a || !out_device_id) return STM_EINVAL;
+    stm_alloc *ma = (stm_alloc *)a;
+    pthread_mutex_lock(&ma->lock);
+    *out_device_id = a->device_id;
+    pthread_mutex_unlock(&ma->lock);
+    return STM_OK;
+}
+
 void stm_alloc_close(stm_alloc *a)
 {
     if (!a) return;
@@ -780,7 +809,7 @@ stm_status stm_alloc_reserve(stm_alloc *a, uint64_t nblocks,
     pthread_mutex_lock(&a->lock);
 
     uint64_t hint_start = 0;
-    if (hint_paddr != 0 && stm_paddr_device(hint_paddr) == 0) {
+    if (hint_paddr != 0 && stm_paddr_device(hint_paddr) == a->device_id) {
         uint64_t hs = stm_paddr_offset(hint_paddr);
         if (hs >= a->data_first_block && hs <= a->data_last_block) {
             hint_start = hs;
@@ -867,7 +896,13 @@ stm_status stm_alloc_reserve(stm_alloc *a, uint64_t nblocks,
         return s;
     }
 
-    *out_paddr = stm_paddr_make(0, ctx.found_start);
+    /* P5-3c: stamp this alloc's device_id into the top 16 bits of
+     * the returned paddr. Callers that dereference this paddr (bdev
+     * I/O, AEAD nonce construction, mirror-replica coordination) can
+     * read the device_id straight out. In-tree key encoding stays the
+     * low 48 bits (start_block offset) so the existing lookup/free
+     * paths are device-id-symmetric. */
+    *out_paddr = stm_paddr_make(a->device_id, ctx.found_start);
     a->tree_dirty = true;
     accel_invalidate_locked(a);    /* new start_block added to the set */
     pthread_mutex_unlock(&a->lock);
@@ -881,7 +916,9 @@ stm_status stm_alloc_reserve(stm_alloc *a, uint64_t nblocks,
 stm_status stm_alloc_free(stm_alloc *a, uint64_t paddr, uint64_t free_gen)
 {
     if (!a) return STM_EINVAL;
-    if (stm_paddr_device(paddr) != 0) return STM_EINVAL;
+    /* P5-3c: paddrs are device-tagged; reject paddrs from other
+     * devices' allocators. */
+    if (stm_paddr_device(paddr) != a->device_id) return STM_EINVAL;
     uint64_t start_block = stm_paddr_offset(paddr);
 
     pthread_mutex_lock(&a->lock);
@@ -954,7 +991,7 @@ stm_status stm_alloc_free(stm_alloc *a, uint64_t paddr, uint64_t free_gen)
 stm_status stm_alloc_ref(stm_alloc *a, uint64_t paddr)
 {
     if (!a) return STM_EINVAL;
-    if (stm_paddr_device(paddr) != 0) return STM_EINVAL;
+    if (stm_paddr_device(paddr) != a->device_id) return STM_EINVAL;
     uint64_t start_block = stm_paddr_offset(paddr);
 
     pthread_mutex_lock(&a->lock);
@@ -1209,7 +1246,7 @@ stm_status stm_alloc_lookup(const stm_alloc *a, uint64_t paddr,
                              uint32_t *out_refcount)
 {
     if (!a) return STM_EINVAL;
-    if (stm_paddr_device(paddr) != 0) return STM_EINVAL;
+    if (stm_paddr_device(paddr) != a->device_id) return STM_EINVAL;
     uint64_t start_block = stm_paddr_offset(paddr);
 
     stm_alloc *ma = (stm_alloc *)a;
@@ -1307,7 +1344,7 @@ stm_status stm_alloc_is_allocated(const stm_alloc *a, uint64_t paddr,
 {
     if (!a || !out_allocated) return STM_EINVAL;
     *out_allocated = false;
-    if (stm_paddr_device(paddr) != 0) return STM_EINVAL;
+    if (stm_paddr_device(paddr) != a->device_id) return STM_EINVAL;
 
     uint64_t block = stm_paddr_offset(paddr);
     stm_alloc *ma = (stm_alloc *)a;

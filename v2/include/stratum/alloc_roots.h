@@ -80,8 +80,12 @@ struct stm_bootstrap;  typedef struct stm_bootstrap  stm_bootstrap;
 
 typedef struct stm_alloc_roots stm_alloc_roots;
 
-/* On-disk per-entry value size. paddr(8 LE) + blake3(32). */
-#define STM_ALLOC_ROOTS_VALUE_BYTES   40u
+/* On-disk per-entry value size. paddr(8 LE) + blake3(32) +
+ * root_gen(8 LE). Each device's tree carries its own AEAD gen —
+ * clean trees stay at their prior encryption gen when later commits
+ * short-circuit (alloc_commit's R7c P2-5), so a single pool-level
+ * gen doesn't suffice. */
+#define STM_ALLOC_ROOTS_VALUE_BYTES   48u
 
 /* ========================================================================= */
 /* Lifecycle.                                                                 */
@@ -197,23 +201,34 @@ stm_status stm_alloc_roots_get_gen(const stm_alloc_roots *r,
 
 /*
  * Register device's alloc-tree root. If an entry for `device_id`
- * exists, the (paddr, csum) are replaced (upsert). Marks dirty.
+ * exists, the (paddr, csum, root_gen) are replaced (upsert). Marks
+ * dirty only when the new value differs from the existing entry —
+ * idempotent set preserves `dirty = false` through retries.
+ *
+ * `root_gen` is the gen at which the device's alloc tree was AEAD-
+ * encrypted (= stm_alloc_get_tree_gen). Trees can have different
+ * gens across devices when alloc_commit's R7c P2-5 short-circuits
+ * on clean trees. Recorded per-entry so attach-time load_tree_at
+ * gets the right AEAD nonce.
  *
  * `device_id < STM_POOL_DEVICES_MAX` enforced.
  */
 STM_MUST_USE
 stm_status stm_alloc_roots_set(stm_alloc_roots *r, uint16_t device_id,
                                  uint64_t root_paddr,
-                                 const uint8_t root_csum[32]);
+                                 const uint8_t root_csum[32],
+                                 uint64_t root_gen);
 
 /*
- * Read a device's entry. `out_csum` may be NULL if only the paddr is
- * wanted. STM_ENOENT if no entry exists for `device_id`.
+ * Read a device's entry. `out_csum` / `out_root_gen` may be NULL if
+ * only the paddr is wanted. STM_ENOENT if no entry exists for
+ * `device_id`.
  */
 STM_MUST_USE
 stm_status stm_alloc_roots_get(const stm_alloc_roots *r, uint16_t device_id,
                                  uint64_t *out_root_paddr,
-                                 uint8_t out_root_csum[32]);
+                                 uint8_t out_root_csum[32],
+                                 uint64_t *out_root_gen);
 
 /* Count of registered entries. Primarily for tests. */
 size_t stm_alloc_roots_count(const stm_alloc_roots *r);
@@ -222,7 +237,7 @@ size_t stm_alloc_roots_count(const stm_alloc_roots *r);
  * that return value is propagated to the caller). */
 typedef int (*stm_alloc_roots_iter_cb)(
     uint16_t device_id, uint64_t root_paddr,
-    const uint8_t root_csum[32], void *ctx);
+    const uint8_t root_csum[32], uint64_t root_gen, void *ctx);
 
 /*
  * Walk every entry in ascending device_id order.

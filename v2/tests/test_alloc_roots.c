@@ -103,12 +103,12 @@ STM_TEST(alloc_roots_set_validates_args) {
     csum_pattern(cs, 0x10);
 
     /* device_id >= STM_POOL_DEVICES_MAX rejected. */
-    STM_ASSERT_ERR(stm_alloc_roots_set(r, STM_POOL_DEVICES_MAX, 100, cs),
+    STM_ASSERT_ERR(stm_alloc_roots_set(r, STM_POOL_DEVICES_MAX, 100, cs, 1u),
                     STM_EINVAL);
     /* paddr == 0 rejected (every real paddr is non-zero). */
-    STM_ASSERT_ERR(stm_alloc_roots_set(r, 0, 0, cs), STM_EINVAL);
+    STM_ASSERT_ERR(stm_alloc_roots_set(r, 0, 0, cs, 1u), STM_EINVAL);
     /* csum NULL rejected. */
-    STM_ASSERT_ERR(stm_alloc_roots_set(r, 0, 100, NULL), STM_EINVAL);
+    STM_ASSERT_ERR(stm_alloc_roots_set(r, 0, 100, NULL, 1u), STM_EINVAL);
 
     stm_alloc_roots_close(r);
     stm_bootstrap_close(b);
@@ -160,28 +160,28 @@ STM_TEST(alloc_roots_set_get_count) {
     csum_pattern(cs1, 0x20);
     csum_pattern(cs2, 0x30);
 
-    STM_ASSERT_OK(stm_alloc_roots_set(r, 0, 0x100, cs0));
-    STM_ASSERT_OK(stm_alloc_roots_set(r, 1, 0x200, cs1));
-    STM_ASSERT_OK(stm_alloc_roots_set(r, 2, 0x300, cs2));
+    STM_ASSERT_OK(stm_alloc_roots_set(r, 0, 0x100, cs0, 1u));
+    STM_ASSERT_OK(stm_alloc_roots_set(r, 1, 0x200, cs1, 1u));
+    STM_ASSERT_OK(stm_alloc_roots_set(r, 2, 0x300, cs2, 1u));
     STM_ASSERT_EQ(stm_alloc_roots_count(r), 3u);
 
     /* get roundtrip. */
     uint64_t p = 0; uint8_t got_cs[32];
-    STM_ASSERT_OK(stm_alloc_roots_get(r, 1, &p, got_cs));
+    STM_ASSERT_OK(stm_alloc_roots_get(r, 1, &p, got_cs, NULL));
     STM_ASSERT_EQ(p, 0x200u);
     STM_ASSERT_EQ(memcmp(got_cs, cs1, 32), 0);
 
     /* replace existing entry: count stays. */
     uint8_t cs1b[32];
     csum_pattern(cs1b, 0x22);
-    STM_ASSERT_OK(stm_alloc_roots_set(r, 1, 0x250, cs1b));
+    STM_ASSERT_OK(stm_alloc_roots_set(r, 1, 0x250, cs1b, 1u));
     STM_ASSERT_EQ(stm_alloc_roots_count(r), 3u);
-    STM_ASSERT_OK(stm_alloc_roots_get(r, 1, &p, got_cs));
+    STM_ASSERT_OK(stm_alloc_roots_get(r, 1, &p, got_cs, NULL));
     STM_ASSERT_EQ(p, 0x250u);
     STM_ASSERT_EQ(memcmp(got_cs, cs1b, 32), 0);
 
     /* missing entry: STM_ENOENT. */
-    STM_ASSERT_ERR(stm_alloc_roots_get(r, 42, &p, got_cs), STM_ENOENT);
+    STM_ASSERT_ERR(stm_alloc_roots_get(r, 42, &p, got_cs, NULL), STM_ENOENT);
 
     stm_alloc_roots_close(r);
     stm_bootstrap_close(b);
@@ -196,9 +196,9 @@ typedef struct {
 } iter_ctx;
 
 static int iter_collect(uint16_t device_id, uint64_t paddr,
-                          const uint8_t csum[32], void *ctx_)
+                          const uint8_t csum[32], uint64_t gen, void *ctx_)
 {
-    (void)csum;
+    (void)csum; (void)gen;
     iter_ctx *ic = ctx_;
     if (ic->n >= 4) return 1;
     ic->seen_ids[ic->n]    = device_id;
@@ -219,9 +219,9 @@ STM_TEST(alloc_roots_iter_ordered) {
 
     uint8_t cs[32]; csum_pattern(cs, 0x50);
     /* Insert out of order — iter should yield ascending by device_id. */
-    STM_ASSERT_OK(stm_alloc_roots_set(r, 3, 0x300, cs));
-    STM_ASSERT_OK(stm_alloc_roots_set(r, 0, 0x100, cs));
-    STM_ASSERT_OK(stm_alloc_roots_set(r, 1, 0x200, cs));
+    STM_ASSERT_OK(stm_alloc_roots_set(r, 3, 0x300, cs, 1u));
+    STM_ASSERT_OK(stm_alloc_roots_set(r, 0, 0x100, cs, 1u));
+    STM_ASSERT_OK(stm_alloc_roots_set(r, 1, 0x200, cs, 1u));
 
     iter_ctx ic = { 0 };
     STM_ASSERT_OK(stm_alloc_roots_iter(r, iter_collect, &ic));
@@ -259,8 +259,8 @@ STM_TEST(alloc_roots_commit_load_roundtrip) {
     /* Use real-looking tree-root paddrs (non-bootstrap-owned, so
      * free_tree at second commit wouldn't try to Merkle-decrypt
      * them; for this test we only exercise one commit cycle). */
-    STM_ASSERT_OK(stm_alloc_roots_set(r, 0, 0xf000, cs0));
-    STM_ASSERT_OK(stm_alloc_roots_set(r, 1, 0xf100, cs1));
+    STM_ASSERT_OK(stm_alloc_roots_set(r, 0, 0xf000, cs0, 1u));
+    STM_ASSERT_OK(stm_alloc_roots_set(r, 1, 0xf100, cs1, 1u));
 
     uint64_t root_paddr = 0;
     uint8_t  root_csum[32];
@@ -296,10 +296,10 @@ STM_TEST(alloc_roots_commit_load_roundtrip) {
     STM_ASSERT_EQ(stm_alloc_roots_count(r2), 2u);
 
     uint64_t p = 0; uint8_t cs[32];
-    STM_ASSERT_OK(stm_alloc_roots_get(r2, 0, &p, cs));
+    STM_ASSERT_OK(stm_alloc_roots_get(r2, 0, &p, cs, NULL));
     STM_ASSERT_EQ(p, 0xf000u);
     STM_ASSERT_EQ(memcmp(cs, cs0, 32), 0);
-    STM_ASSERT_OK(stm_alloc_roots_get(r2, 1, &p, cs));
+    STM_ASSERT_OK(stm_alloc_roots_get(r2, 1, &p, cs, NULL));
     STM_ASSERT_EQ(p, 0xf100u);
     STM_ASSERT_EQ(memcmp(cs, cs1, 32), 0);
 
@@ -323,7 +323,7 @@ STM_TEST(alloc_roots_commit_is_idempotent_on_clean) {
     STM_ASSERT_OK(stm_alloc_roots_set_crypt_ctx(r, METADATA_KEY,
                                                    POOL_UUID, DEVICE_UUID));
     uint8_t cs[32]; csum_pattern(cs, 0x10);
-    STM_ASSERT_OK(stm_alloc_roots_set(r, 0, 0xf000, cs));
+    STM_ASSERT_OK(stm_alloc_roots_set(r, 0, 0xf000, cs, 1u));
 
     /* First commit persists. */
     uint64_t paddr1 = 0; uint8_t csum1[32];
@@ -342,7 +342,7 @@ STM_TEST(alloc_roots_commit_is_idempotent_on_clean) {
     /* Setting the same entry again (unchanged values) must also NOT
      * dirty the handle — this is the path sync_commit hits on retry
      * when every per-device alloc_commit returns its cached values. */
-    STM_ASSERT_OK(stm_alloc_roots_set(r, 0, 0xf000, cs));
+    STM_ASSERT_OK(stm_alloc_roots_set(r, 0, 0xf000, cs, 1u));
     uint64_t paddr3 = 0; uint8_t csum3[32];
     STM_ASSERT_OK(stm_alloc_roots_commit(r, 3u, &paddr3, csum3));
     STM_ASSERT_EQ(paddr3, paddr1);
@@ -350,7 +350,7 @@ STM_TEST(alloc_roots_commit_is_idempotent_on_clean) {
 
     /* Changing an entry dirties — next commit emits a NEW paddr. */
     uint8_t cs_new[32]; csum_pattern(cs_new, 0x99);
-    STM_ASSERT_OK(stm_alloc_roots_set(r, 0, 0xf000, cs_new));
+    STM_ASSERT_OK(stm_alloc_roots_set(r, 0, 0xf000, cs_new, 1u));
     uint64_t paddr4 = 0; uint8_t csum4[32];
     STM_ASSERT_OK(stm_alloc_roots_commit(r, 4u, &paddr4, csum4));
     STM_ASSERT(paddr4 != paddr1);
@@ -375,7 +375,7 @@ STM_TEST(alloc_roots_load_at_wrong_csum_rejected) {
     STM_ASSERT_OK(stm_alloc_roots_set_crypt_ctx(r, METADATA_KEY,
                                                    POOL_UUID, DEVICE_UUID));
     uint8_t cs[32]; csum_pattern(cs, 0x10);
-    STM_ASSERT_OK(stm_alloc_roots_set(r, 0, 0xf000, cs));
+    STM_ASSERT_OK(stm_alloc_roots_set(r, 0, 0xf000, cs, 1u));
 
     uint64_t paddr = 0; uint8_t csum[32];
     STM_ASSERT_OK(stm_alloc_roots_commit(r, 1u, &paddr, csum));
@@ -413,7 +413,7 @@ STM_TEST(alloc_roots_load_at_wrong_key_rejected) {
     STM_ASSERT_OK(stm_alloc_roots_set_crypt_ctx(r, METADATA_KEY,
                                                    POOL_UUID, DEVICE_UUID));
     uint8_t cs[32]; csum_pattern(cs, 0x10);
-    STM_ASSERT_OK(stm_alloc_roots_set(r, 0, 0xf000, cs));
+    STM_ASSERT_OK(stm_alloc_roots_set(r, 0, 0xf000, cs, 1u));
 
     uint64_t paddr = 0; uint8_t csum[32];
     STM_ASSERT_OK(stm_alloc_roots_commit(r, 1u, &paddr, csum));
@@ -451,7 +451,7 @@ STM_TEST(alloc_roots_load_at_wrong_gen_rejected) {
     STM_ASSERT_OK(stm_alloc_roots_set_crypt_ctx(r, METADATA_KEY,
                                                    POOL_UUID, DEVICE_UUID));
     uint8_t cs[32]; csum_pattern(cs, 0x10);
-    STM_ASSERT_OK(stm_alloc_roots_set(r, 0, 0xf000, cs));
+    STM_ASSERT_OK(stm_alloc_roots_set(r, 0, 0xf000, cs, 1u));
 
     uint64_t paddr = 0; uint8_t csum[32];
     STM_ASSERT_OK(stm_alloc_roots_commit(r, 1u, &paddr, csum));

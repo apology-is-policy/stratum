@@ -104,8 +104,17 @@ struct stm_sync {
      * quorum. P5-1's cached `bdev` pointer is replaced by per-commit
      * iteration over pool->devices[]. */
     stm_pool  *pool;        /* borrowed — lifecycle owned by caller */
-    stm_alloc *alloc;       /* borrowed — not owned (still per-device
-                             * MVP: the alloc tree lives on device 0) */
+    stm_alloc *alloc;       /* borrowed — alias for allocs[0]; primary
+                             * (device 0) metadata alloc */
+
+    /* P5-3c: array of per-device allocs. Index == device_id. `alloc`
+     * above aliases allocs[0]. Slots > 0 are populated by
+     * stm_sync_attach_alloc before mirror reservations / multi-device
+     * tree load fire. NULL entries mean "no attached alloc for that
+     * device" — fine for a legacy single-device-metadata pool but
+     * blocks mirror(n) with n > attached_count. */
+    stm_alloc *allocs[STM_POOL_DEVICES_MAX];
+    size_t     n_attached;   /* count of non-NULL entries in allocs[] */
 
     /* Cached from pool at open/create time. pool_uuid is pool-wide;
      * device_uuid is device 0's uuid (used by stm_alloc_set_crypt_ctx
@@ -715,6 +724,10 @@ static stm_sync *sync_new(stm_pool *p, stm_alloc *a)
 
     s->pool  = p;
     s->alloc = a;
+    /* P5-3c: primary alloc lives at allocs[0]. allocs[] starts all
+     * NULL from calloc; attach_alloc fills in slots > 0. */
+    s->allocs[0]   = a;
+    s->n_attached  = 1;
     s->pool_uuid[0]   = puuid[0];
     s->pool_uuid[1]   = puuid[1];
     /* device_uuid cache = device 0's uuid (alloc-tree device under P5-2
@@ -1235,20 +1248,26 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
                                         ub.ub_alloc_root.bp_csum);
         if (rs != STM_OK) { stm_sync_close(s2); return rs; }
 
-        /* Load device 0's alloc tree from the roots entry. Multi-
-         * device per-device trees land in P5-3c; today the only
-         * entry is device 0. Absence of a device-0 entry is a
-         * format error (every committed pool has at least one
-         * alloc tree). */
+        /* Load device 0's alloc tree from the roots entry. Additional
+         * per-device trees are loaded lazily via stm_sync_attach_alloc
+         * post-open (P5-3c). Absence of a device-0 entry is a format
+         * error (every committed pool has at least one alloc tree).
+         *
+         * Per-tree gen: each entry carries its own root_gen; device
+         * 0's tree may be at a gen different from the roots object
+         * itself when alloc_commit's R7c P2-5 short-circuited on a
+         * clean tree. We use the per-tree gen for the AEAD nonce. */
         uint64_t tree_paddr = 0;
         uint8_t  tree_csum[32];
+        uint64_t tree_gen   = 0;
         stm_status gs = stm_alloc_roots_get(s2->roots, /*device_id=*/0,
-                                               &tree_paddr, tree_csum);
+                                               &tree_paddr, tree_csum,
+                                               &tree_gen);
         if (gs != STM_OK) {
             stm_sync_close(s2);
             return (gs == STM_ENOENT) ? STM_ECORRUPT : gs;
         }
-        stm_status ls = stm_alloc_load_tree_at(a, tree_paddr, alloc_root_gen,
+        stm_status ls = stm_alloc_load_tree_at(a, tree_paddr, tree_gen,
                                                   tree_csum);
         if (ls != STM_OK) {
             stm_sync_close(s2);
@@ -1415,32 +1434,47 @@ stm_status stm_sync_commit(stm_sync *s)
         return kcs;
     }
 
-    stm_status s_alloc = stm_alloc_commit(s->alloc, target_gen);
-    if (s_alloc != STM_OK) {
-        pthread_mutex_unlock(&s->lock);
-        return s_alloc;
-    }
-
-    uint64_t tree_paddr = 0;
-    uint8_t  tree_csum[32] = { 0 };
-    stm_status sr = stm_alloc_get_tree_root(s->alloc,
-                                              &tree_paddr, tree_csum);
-    if (sr != STM_OK) {
-        pthread_mutex_unlock(&s->lock);
-        return sr;
-    }
-
-    /* P5-3b: register device 0's alloc-tree root in the roots object.
-     * `set` is idempotent when the (paddr, csum) match the existing
-     * entry — so an idempotent alloc_commit that returned cached
-     * values propagates into an idempotent roots commit below.
-     * Once multi-device alloc lands (P5-3c), this loop extends to
-     * every device's alloc. */
-    sr = stm_alloc_roots_set(s->roots, /*device_id=*/0,
-                                tree_paddr, tree_csum);
-    if (sr != STM_OK) {
-        pthread_mutex_unlock(&s->lock);
-        return sr;
+    /* P5-3c: iterate every attached alloc (= every device with a
+     * local tree). Commit each → grab (paddr, csum, gen) → register
+     * in roots. Per-device errors propagate immediately; partial-
+     * success cleanup is handled at the bootstrap/UB level (the new
+     * UB doesn't land unless all steps complete).
+     *
+     * Per-tree gen: each alloc tree has its OWN AEAD gen, which may
+     * differ from the commit gen when alloc_commit's R7c P2-5 short-
+     * circuits on a clean tree. We record that per-tree gen in the
+     * roots entry so attach-time load_tree_at gets the right nonce. */
+    for (uint16_t dev = 0; dev < STM_POOL_DEVICES_MAX; dev++) {
+        stm_alloc *ai = s->allocs[dev];
+        if (!ai) continue;
+        stm_status s_alloc = stm_alloc_commit(ai, target_gen);
+        if (s_alloc != STM_OK) {
+            pthread_mutex_unlock(&s->lock);
+            return s_alloc;
+        }
+        uint64_t ti_paddr = 0;
+        uint8_t  ti_csum[32];
+        stm_status gs = stm_alloc_get_tree_root(ai, &ti_paddr, ti_csum);
+        if (gs != STM_OK) {
+            pthread_mutex_unlock(&s->lock);
+            return gs;
+        }
+        uint64_t ti_gen = 0;
+        gs = stm_alloc_get_tree_gen(ai, &ti_gen);
+        if (gs != STM_OK) {
+            pthread_mutex_unlock(&s->lock);
+            return gs;
+        }
+        /* roots.set is a no-op when the entire (paddr, csum, gen)
+         * triple matches the existing entry → propagates per-device
+         * idempotency (alloc_commit's R7c P2-5 short-circuit) into
+         * roots staying clean on retry. */
+        stm_status rs = stm_alloc_roots_set(s->roots, dev,
+                                               ti_paddr, ti_csum, ti_gen);
+        if (rs != STM_OK) {
+            pthread_mutex_unlock(&s->lock);
+            return rs;
+        }
     }
 
     /* Commit the roots object itself. Idempotent on clean (R7c/R14b
@@ -1464,7 +1498,7 @@ stm_status stm_sync_commit(stm_sync *s)
     }
 
     stm_alloc_stats astats;
-    sr = stm_alloc_stats_get(s->alloc, &astats);
+    stm_status sr = stm_alloc_stats_get(s->alloc, &astats);
     if (sr != STM_OK) {
         pthread_mutex_unlock(&s->lock);
         return sr;
@@ -1559,6 +1593,244 @@ stm_status stm_sync_redundancy_get(const stm_sync *s,
     *out = s->redundancy;
     pthread_mutex_unlock(&ms->lock);
     return STM_OK;
+}
+
+/* ========================================================================= */
+/* P5-3c: multi-device alloc attach + mirror APIs.                             */
+/* ========================================================================= */
+
+stm_status stm_sync_attach_alloc(stm_sync *s, uint16_t device_id,
+                                   stm_alloc *alloc)
+{
+    if (!s || !alloc) return STM_EINVAL;
+    if (device_id == 0) return STM_EINVAL;                   /* primary is fixed */
+    if (device_id >= STM_POOL_DEVICES_MAX) return STM_EINVAL;
+    if (device_id >= stm_pool_device_count(s->pool)) return STM_EINVAL;
+
+    /* Cross-check: the attached alloc's device_id must match. */
+    uint16_t alloc_dev = 0;
+    stm_status gs = stm_alloc_get_device_id(alloc, &alloc_dev);
+    if (gs != STM_OK) return gs;
+    if (alloc_dev != device_id) return STM_EINVAL;
+
+    pthread_mutex_lock(&s->lock);
+    if (s->allocs[device_id] != NULL) {
+        pthread_mutex_unlock(&s->lock);
+        return STM_EEXIST;
+    }
+    /* Defense against double-attach: check no other slot already holds
+     * this handle. Would silently duplicate ownership otherwise. */
+    for (size_t i = 0; i < STM_POOL_DEVICES_MAX; i++) {
+        if (s->allocs[i] == alloc) {
+            pthread_mutex_unlock(&s->lock);
+            return STM_EEXIST;
+        }
+    }
+
+    s->allocs[device_id] = alloc;
+    s->n_attached++;
+
+    /* Install metadata crypt ctx on the attached alloc. Each device's
+     * alloc tree is AEAD-encrypted under its own device_uuid so cross-
+     * device replay of encrypted nodes fails tag verification. */
+    const stm_pool_device *di = stm_pool_device_info(s->pool, device_id);
+    if (!di) {
+        s->allocs[device_id] = NULL;
+        s->n_attached--;
+        pthread_mutex_unlock(&s->lock);
+        return STM_EINVAL;
+    }
+    stm_status cs = stm_alloc_set_crypt_ctx(alloc, s->metadata_key,
+                                               s->pool_uuid, di->uuid);
+    if (cs != STM_OK) {
+        s->allocs[device_id] = NULL;
+        s->n_attached--;
+        pthread_mutex_unlock(&s->lock);
+        return cs;
+    }
+
+    /* P5-3c: on a MOUNTED sync (roots has a durable root) with an
+     * entry for `device_id`, load that device's alloc tree from
+     * disk. attach_alloc is the natural late-binding hook for this
+     * since sync_open only knows about device 0 at that point. For
+     * a freshly-created sync (no commits yet), roots is empty and
+     * this path short-circuits ENOENT. */
+    if (s->roots) {
+        uint64_t tree_paddr = 0;
+        uint8_t  tree_csum[32];
+        uint64_t tree_gen   = 0;
+        stm_status roots_gs = stm_alloc_roots_get(s->roots, device_id,
+                                                    &tree_paddr, tree_csum,
+                                                    &tree_gen);
+        if (roots_gs == STM_OK) {
+            /* Use the PER-TREE gen carried in the roots entry, NOT the
+             * roots object's own gen. Trees can be at different gens
+             * when alloc_commit's R7c P2-5 short-circuits on a clean
+             * tree — that tree stays at its previous encryption gen
+             * while the roots object advances. Decrypting with the
+             * wrong gen fails AEAD tag. */
+            stm_status ls = stm_alloc_load_tree_at(alloc, tree_paddr,
+                                                     tree_gen,
+                                                     tree_csum);
+            if (ls != STM_OK) {
+                s->allocs[device_id] = NULL;
+                s->n_attached--;
+                pthread_mutex_unlock(&s->lock);
+                return ls;
+            }
+        } else if (roots_gs != STM_ENOENT) {
+            s->allocs[device_id] = NULL;
+            s->n_attached--;
+            pthread_mutex_unlock(&s->lock);
+            return roots_gs;
+        }
+    }
+
+    pthread_mutex_unlock(&s->lock);
+    return STM_OK;
+}
+
+stm_status stm_sync_reserve_mirror(stm_sync *s, uint64_t nblocks,
+                                      size_t n_replicas,
+                                      uint64_t out_paddrs[])
+{
+    if (!s || !out_paddrs) return STM_EINVAL;
+    if (nblocks == 0) return STM_EINVAL;
+    if (n_replicas == 0 || n_replicas > STM_POOL_DEVICES_MAX) return STM_EINVAL;
+
+    pthread_mutex_lock(&s->lock);
+
+    /* Profile must match requested replica count. */
+    if (s->redundancy.kind != STM_RED_MIRROR) {
+        pthread_mutex_unlock(&s->lock);
+        return STM_EINVAL;
+    }
+    if ((size_t)s->redundancy.mirror_n != n_replicas) {
+        pthread_mutex_unlock(&s->lock);
+        return STM_EINVAL;
+    }
+
+    /* Pool must have >= n_replicas devices, all with attached allocs. */
+    if (stm_pool_device_count(s->pool) < n_replicas) {
+        pthread_mutex_unlock(&s->lock);
+        return STM_EINVAL;
+    }
+    for (size_t i = 0; i < n_replicas; i++) {
+        if (s->allocs[i] == NULL) {
+            pthread_mutex_unlock(&s->lock);
+            return STM_EINVAL;
+        }
+    }
+
+    /* Reserve on each device's alloc. On per-device failure, unwind
+     * the already-reserved paddrs so the pool's on-disk state reflects
+     * all-or-nothing. (In-RAM alloc state hasn't committed yet either
+     * way; the unwind keeps the RAM picture clean for the next
+     * attempt.) */
+    size_t reserved = 0;
+    stm_status last_err = STM_OK;
+    for (size_t i = 0; i < n_replicas; i++) {
+        uint64_t pi = 0;
+        stm_status rs = stm_alloc_reserve(s->allocs[i], nblocks, 0, &pi);
+        if (rs != STM_OK) { last_err = rs; break; }
+        out_paddrs[i] = pi;
+        reserved++;
+    }
+    if (last_err != STM_OK) {
+        /* Best-effort rollback: free each already-reserved range. Uses
+         * free_gen = s->current_gen so the sweep happens at the next
+         * commit. Ignore per-free errors — we're already in the error
+         * path. */
+        for (size_t i = 0; i < reserved; i++) {
+            (void)stm_alloc_free(s->allocs[i], out_paddrs[i], s->current_gen);
+            out_paddrs[i] = 0;
+        }
+        pthread_mutex_unlock(&s->lock);
+        return last_err;
+    }
+
+    pthread_mutex_unlock(&s->lock);
+    return STM_OK;
+}
+
+/* Compute the quorum threshold for `n` parallel writes — ⌊n/2⌋+1,
+ * matching the commit-UB quorum. */
+static inline size_t mirror_quorum(size_t n)
+{
+    return n / 2u + 1u;
+}
+
+stm_status stm_sync_mirror_write(stm_sync *s, const uint64_t paddrs[],
+                                    size_t n, const void *buf, size_t len,
+                                    size_t *out_n_confirmed)
+{
+    if (!s || !paddrs || !buf) return STM_EINVAL;
+    if (n == 0 || n > STM_POOL_DEVICES_MAX) return STM_EINVAL;
+    /* Only 4 KiB-aligned lengths today — matches the UB/page grain and
+     * the stm_paddr_offset -> byte-offset conversion. */
+    if (len == 0 || (len % STM_UB_SIZE) != 0) return STM_EINVAL;
+
+    pthread_mutex_lock(&s->lock);
+
+    size_t confirmed = 0;
+    stm_status last_err = STM_OK;
+    for (size_t i = 0; i < n; i++) {
+        uint16_t dev = stm_paddr_device(paddrs[i]);
+        uint64_t off = stm_paddr_offset(paddrs[i]) * (uint64_t)STM_UB_SIZE;
+        stm_bdev *bd = stm_pool_device_bdev(s->pool, dev);
+        if (!bd) { last_err = STM_EINVAL; continue; }
+
+        stm_status ws = stm_bdev_write(bd, off, buf, len);
+        if (ws != STM_OK) { last_err = ws; continue; }
+        stm_status fs = stm_bdev_fsync(bd);
+        if (fs != STM_OK) { last_err = fs; continue; }
+        confirmed++;
+    }
+    if (out_n_confirmed) *out_n_confirmed = confirmed;
+
+    pthread_mutex_unlock(&s->lock);
+
+    if (confirmed >= mirror_quorum(n)) return STM_OK;
+    /* Sub-quorum: surface STM_EQUORUM (new P5-2 status code for
+     * quorum-write failures) unless we observed a more specific error.
+     * Either way the pool has some replicas durable; scrub / retry
+     * reconciles per ARCH §7.15. */
+    return (last_err != STM_OK) ? last_err : STM_EQUORUM;
+}
+
+stm_status stm_sync_mirror_read(stm_sync *s, const uint64_t paddrs[],
+                                   size_t n, void *buf, size_t len,
+                                   const uint8_t expected_csum[32])
+{
+    if (!s || !paddrs || !buf || !expected_csum) return STM_EINVAL;
+    if (n == 0 || n > STM_POOL_DEVICES_MAX) return STM_EINVAL;
+    if (len == 0 || (len % STM_UB_SIZE) != 0) return STM_EINVAL;
+
+    pthread_mutex_lock(&s->lock);
+
+    stm_status last_err = STM_OK;
+    for (size_t i = 0; i < n; i++) {
+        uint16_t dev = stm_paddr_device(paddrs[i]);
+        uint64_t off = stm_paddr_offset(paddrs[i]) * (uint64_t)STM_UB_SIZE;
+        stm_bdev *bd = stm_pool_device_bdev(s->pool, dev);
+        if (!bd) { last_err = STM_EINVAL; continue; }
+
+        stm_status rs = stm_bdev_read(bd, off, buf, len);
+        if (rs != STM_OK) { last_err = rs; continue; }
+
+        stm_blake3_hash h;
+        stm_blake3(buf, len, &h);
+        if (memcmp(h.bytes, expected_csum, 32) == 0) {
+            pthread_mutex_unlock(&s->lock);
+            return STM_OK;
+        }
+        /* csum mismatch: this replica is corrupt / stale; try next. */
+        last_err = STM_ECORRUPT;
+    }
+
+    pthread_mutex_unlock(&s->lock);
+    /* No replica passed the csum check. */
+    return (last_err != STM_OK) ? last_err : STM_ECORRUPT;
 }
 
 /* ========================================================================= */

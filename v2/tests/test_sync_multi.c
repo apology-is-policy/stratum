@@ -893,6 +893,323 @@ STM_TEST(sync_multi_redundancy_mount_rejects_nonzero_tail_on_none) {
 }
 
 /* ========================================================================= */
+/* P5-3c: mirror reservation + write fan-out + read fallback.                 */
+/* ========================================================================= */
+
+/*
+ * Full multi-device fixture: bdev + bootstrap + alloc per device, +
+ * a pool aggregating the bdevs. Output arrays are caller-owned; each
+ * alloc has device_id set to its index.
+ */
+static void open_multi_allocs(stm_bdev *bds_out[NDEV], stm_alloc *allocs_out[NDEV])
+{
+    for (size_t i = 0; i < NDEV; i++) {
+        stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+        STM_ASSERT_OK(stm_bdev_open(g_paths[i], &bo, &bds_out[i]));
+        STM_ASSERT_OK(stm_bdev_resize(bds_out[i], TEST_DEVICE_BYTES));
+
+        uint64_t dev_uuid[2] = { DEV_UUID_LO[i], DEV_UUID_HI };
+        STM_ASSERT_OK(stm_alloc_create(bds_out[i], POOL_UUID, dev_uuid,
+                                         TEST_BOOTSTRAP_BYTES, &allocs_out[i]));
+        STM_ASSERT_OK(stm_alloc_set_device_id(allocs_out[i], (uint16_t)i));
+    }
+}
+
+static void close_multi_allocs(stm_alloc *allocs[NDEV])
+{
+    for (size_t i = 0; i < NDEV; i++) stm_alloc_close(allocs[i]);
+}
+
+/*
+ * Build a 3-device pool + 3 per-device allocs + sync with mirror(mn)
+ * profile. Attaches allocs 1..NDEV-1 to sync. Commits an initial
+ * UB. Returns handles via out params.
+ */
+static void setup_mirror_pool(uint8_t mn, const char *tag,
+                               stm_bdev *bds_out[NDEV],
+                               stm_alloc *allocs_out[NDEV],
+                               stm_pool **pool_out,
+                               stm_sync **sync_out)
+{
+    make_paths(tag);
+    open_multi_allocs(bds_out, allocs_out);
+
+    *pool_out = make_multi_pool(bds_out);
+
+    stm_redundancy_profile prof = { .kind = STM_RED_MIRROR, .mirror_n = mn };
+    STM_ASSERT_OK(stm_sync_create(*pool_out, allocs_out[0], make_wk(),
+                                     &prof, sync_out));
+
+    /* Attach additional allocs. Primary (device 0) is already set
+     * by stm_sync_create. */
+    for (size_t i = 1; i < NDEV; i++) {
+        STM_ASSERT_OK(stm_sync_attach_alloc(*sync_out, (uint16_t)i,
+                                              allocs_out[i]));
+    }
+
+    /* First commit on a fresh pool — lays down device-0, device-1,
+     * device-2 alloc trees, roots object with all N entries, and
+     * the first UB. */
+    STM_ASSERT_OK(stm_sync_commit(*sync_out));
+}
+
+static void teardown_mirror_pool(stm_bdev *bds[NDEV],
+                                   stm_alloc *allocs[NDEV],
+                                   stm_pool *pool, stm_sync *s)
+{
+    stm_sync_close(s);
+    close_multi_allocs(allocs);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+    unlink_paths();
+}
+
+/* Happy path: mirror(2) on a 3-device pool. Reserve 1 block mirror →
+ * 2 paddrs on 2 distinct devices. Write same content to both. Read
+ * from either paddr verifies. */
+STM_TEST(sync_multi_mirror_write_read_roundtrip) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "mirror_rt", bds, as, &pool, &s);
+
+    uint64_t paddrs[2] = { 0 };
+    STM_ASSERT_OK(stm_sync_reserve_mirror(s, 1u, 2u, paddrs));
+    /* Each paddr lands on a distinct device (devs 0 and 1). */
+    STM_ASSERT_EQ(stm_paddr_device(paddrs[0]), 0u);
+    STM_ASSERT_EQ(stm_paddr_device(paddrs[1]), 1u);
+
+    uint8_t payload[STM_UB_SIZE];
+    for (size_t i = 0; i < sizeof payload; i++) payload[i] = (uint8_t)(i & 0xff);
+
+    size_t n_confirmed = 0;
+    STM_ASSERT_OK(stm_sync_mirror_write(s, paddrs, 2u,
+                                            payload, sizeof payload,
+                                            &n_confirmed));
+    STM_ASSERT_EQ(n_confirmed, 2u);
+
+    /* Read back via mirror_read with the plaintext's BLAKE3 csum. */
+    stm_blake3_hash expected;
+    stm_blake3(payload, sizeof payload, &expected);
+
+    uint8_t readback[STM_UB_SIZE] = { 0 };
+    STM_ASSERT_OK(stm_sync_mirror_read(s, paddrs, 2u,
+                                          readback, sizeof readback,
+                                          expected.bytes));
+    STM_ASSERT_EQ(memcmp(readback, payload, sizeof payload), 0);
+
+    teardown_mirror_pool(bds, as, pool, s);
+}
+
+/* Mirror(3): exercise all three devices. */
+STM_TEST(sync_multi_mirror_write_read_n3) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(3, "mirror_n3", bds, as, &pool, &s);
+
+    uint64_t paddrs[3] = { 0 };
+    STM_ASSERT_OK(stm_sync_reserve_mirror(s, 2u, 3u, paddrs));
+    STM_ASSERT_EQ(stm_paddr_device(paddrs[0]), 0u);
+    STM_ASSERT_EQ(stm_paddr_device(paddrs[1]), 1u);
+    STM_ASSERT_EQ(stm_paddr_device(paddrs[2]), 2u);
+
+    const size_t len = 2u * STM_UB_SIZE;
+    uint8_t *payload = malloc(len);
+    STM_ASSERT(payload != NULL);
+    for (size_t i = 0; i < len; i++) payload[i] = (uint8_t)((i * 31) & 0xff);
+
+    size_t n_confirmed = 0;
+    STM_ASSERT_OK(stm_sync_mirror_write(s, paddrs, 3u,
+                                            payload, len, &n_confirmed));
+    STM_ASSERT_EQ(n_confirmed, 3u);
+
+    stm_blake3_hash expected;
+    stm_blake3(payload, len, &expected);
+
+    uint8_t *readback = malloc(len);
+    STM_ASSERT(readback != NULL);
+    memset(readback, 0, len);
+    STM_ASSERT_OK(stm_sync_mirror_read(s, paddrs, 3u, readback, len,
+                                          expected.bytes));
+    STM_ASSERT_EQ(memcmp(readback, payload, len), 0);
+
+    free(payload);
+    free(readback);
+    teardown_mirror_pool(bds, as, pool, s);
+}
+
+/* Corrupt primary replica; mirror_read falls back to the surviving
+ * replica. Mirror(3) so we have two survivors — test both ordering
+ * scenarios. */
+STM_TEST(sync_multi_mirror_read_falls_back_on_tamper) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(3, "mirror_fb", bds, as, &pool, &s);
+
+    uint64_t paddrs[3] = { 0 };
+    STM_ASSERT_OK(stm_sync_reserve_mirror(s, 1u, 3u, paddrs));
+
+    uint8_t payload[STM_UB_SIZE];
+    for (size_t i = 0; i < sizeof payload; i++) payload[i] = (uint8_t)(0xa5 ^ (i & 0xff));
+    size_t nc = 0;
+    STM_ASSERT_OK(stm_sync_mirror_write(s, paddrs, 3u,
+                                            payload, sizeof payload, &nc));
+
+    stm_blake3_hash expected;
+    stm_blake3(payload, sizeof payload, &expected);
+
+    /* Tamper replica 0 on-disk: overwrite with garbage at the paddr's
+     * device-0 offset. bdev_write corrupts it. */
+    uint8_t garbage[STM_UB_SIZE];
+    memset(garbage, 0x5a, sizeof garbage);
+    uint64_t off0 = stm_paddr_offset(paddrs[0]) * (uint64_t)STM_UB_SIZE;
+    STM_ASSERT_OK(stm_bdev_write(bds[0], off0, garbage, sizeof garbage));
+    STM_ASSERT_OK(stm_bdev_fsync(bds[0]));
+
+    /* mirror_read tries paddrs in order: 0 (tampered, csum mismatch,
+     * skip) → 1 (good, returns). */
+    uint8_t readback[STM_UB_SIZE] = { 0 };
+    STM_ASSERT_OK(stm_sync_mirror_read(s, paddrs, 3u,
+                                          readback, sizeof readback,
+                                          expected.bytes));
+    STM_ASSERT_EQ(memcmp(readback, payload, sizeof payload), 0);
+
+    /* Tamper replica 1 too; still fallback to replica 2. */
+    uint64_t off1 = stm_paddr_offset(paddrs[1]) * (uint64_t)STM_UB_SIZE;
+    STM_ASSERT_OK(stm_bdev_write(bds[1], off1, garbage, sizeof garbage));
+    STM_ASSERT_OK(stm_bdev_fsync(bds[1]));
+
+    memset(readback, 0, sizeof readback);
+    STM_ASSERT_OK(stm_sync_mirror_read(s, paddrs, 3u,
+                                          readback, sizeof readback,
+                                          expected.bytes));
+    STM_ASSERT_EQ(memcmp(readback, payload, sizeof payload), 0);
+
+    /* Tamper replica 2 too → no valid replica → STM_ECORRUPT. */
+    uint64_t off2 = stm_paddr_offset(paddrs[2]) * (uint64_t)STM_UB_SIZE;
+    STM_ASSERT_OK(stm_bdev_write(bds[2], off2, garbage, sizeof garbage));
+    STM_ASSERT_OK(stm_bdev_fsync(bds[2]));
+
+    STM_ASSERT_ERR(stm_sync_mirror_read(s, paddrs, 3u,
+                                          readback, sizeof readback,
+                                          expected.bytes),
+                    STM_ECORRUPT);
+
+    teardown_mirror_pool(bds, as, pool, s);
+}
+
+/* reserve_mirror on a pool with no MIRROR profile returns STM_EINVAL. */
+STM_TEST(sync_multi_reserve_mirror_refuses_none_profile) {
+    make_paths("mirror_noprof");
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    open_multi_allocs(bds, as);
+    stm_pool *pool = make_multi_pool(bds);
+
+    stm_sync *s = NULL;
+    /* NULL profile → NONE. */
+    STM_ASSERT_OK(stm_sync_create(pool, as[0], make_wk(), NULL, &s));
+    for (size_t i = 1; i < NDEV; i++)
+        STM_ASSERT_OK(stm_sync_attach_alloc(s, (uint16_t)i, as[i]));
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    uint64_t paddrs[2] = { 0 };
+    /* NONE profile → reserve_mirror refuses. */
+    STM_ASSERT_ERR(stm_sync_reserve_mirror(s, 1u, 2u, paddrs), STM_EINVAL);
+
+    teardown_mirror_pool(bds, as, pool, s);
+}
+
+/* attach_alloc refuses device_id == 0 (primary already attached) and
+ * a second attach for the same device_id. */
+STM_TEST(sync_multi_attach_alloc_arg_validation) {
+    make_paths("attach_val");
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    open_multi_allocs(bds, as);
+    stm_pool *pool = make_multi_pool(bds);
+
+    stm_redundancy_profile prof = { .kind = STM_RED_MIRROR, .mirror_n = 2 };
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(pool, as[0], make_wk(), &prof, &s));
+
+    /* device_id 0 already attached. */
+    STM_ASSERT_ERR(stm_sync_attach_alloc(s, 0, as[1]), STM_EINVAL);
+
+    /* mismatched device_id on alloc (as[2] has id=2; try to attach at 1). */
+    STM_ASSERT_ERR(stm_sync_attach_alloc(s, 1, as[2]), STM_EINVAL);
+
+    /* Normal: attach as[1] at device_id=1. */
+    STM_ASSERT_OK(stm_sync_attach_alloc(s, 1, as[1]));
+    /* Second attach at same device_id → EEXIST. */
+    STM_ASSERT_ERR(stm_sync_attach_alloc(s, 1, as[1]), STM_EEXIST);
+
+    stm_sync_close(s);
+    close_multi_allocs(as);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+    unlink_paths();
+}
+
+/* Full roundtrip: mirror(2), reserve + write + unmount + remount +
+ * attach_alloc loads per-device alloc trees from disk + mirror_read
+ * still succeeds. Validates the attach-loads-from-roots path. */
+STM_TEST(sync_multi_mirror_survives_unmount_remount) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "mirror_mnt", bds, as, &pool, &s);
+
+    uint64_t paddrs[2] = { 0 };
+    STM_ASSERT_OK(stm_sync_reserve_mirror(s, 1u, 2u, paddrs));
+
+    uint8_t payload[STM_UB_SIZE];
+    for (size_t i = 0; i < sizeof payload; i++) payload[i] = (uint8_t)(0x33 + (i & 0xff));
+    size_t nc = 0;
+    STM_ASSERT_OK(stm_sync_mirror_write(s, paddrs, 2u,
+                                            payload, sizeof payload, &nc));
+
+    /* Commit so the on-disk alloc trees record the reservations. */
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    /* Unmount chain: sync → allocs → pool → bdevs. */
+    stm_sync_close(s);
+    close_multi_allocs(as);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+
+    /* Remount. stm_alloc_open_blank on each device — same API as
+     * single-device, just invoked once per device. */
+    open_bdevs(bds);
+    pool = make_multi_pool(bds);
+    stm_alloc *a2s[NDEV] = {0};
+    for (size_t i = 0; i < NDEV; i++) {
+        STM_ASSERT_OK(stm_alloc_open_blank(bds[i], &a2s[i]));
+        STM_ASSERT_OK(stm_alloc_set_device_id(a2s[i], (uint16_t)i));
+    }
+
+    stm_sync *s2 = NULL;
+    STM_ASSERT_OK(stm_sync_open(pool, a2s[0], make_wk(), NULL, &s2));
+    /* attach_alloc with a mounted sync auto-loads each device's alloc
+     * tree from the roots object. */
+    for (size_t i = 1; i < NDEV; i++)
+        STM_ASSERT_OK(stm_sync_attach_alloc(s2, (uint16_t)i, a2s[i]));
+
+    /* Re-read via the remounted pool. */
+    stm_blake3_hash expected;
+    stm_blake3(payload, sizeof payload, &expected);
+    uint8_t readback[STM_UB_SIZE] = { 0 };
+    STM_ASSERT_OK(stm_sync_mirror_read(s2, paddrs, 2u,
+                                          readback, sizeof readback,
+                                          expected.bytes));
+    STM_ASSERT_EQ(memcmp(readback, payload, sizeof payload), 0);
+
+    teardown_mirror_pool(bds, a2s, pool, s2);
+}
+
+/* ========================================================================= */
 /* P5-3b: allocator-roots object integration.                                 */
 /* ========================================================================= */
 
