@@ -433,6 +433,52 @@ stm_status stm_pool_begin_evacuation(stm_pool *p, uint16_t device_id,
 STM_MUST_USE
 stm_status stm_pool_finish_evacuation(stm_pool *p, uint16_t device_id);
 
+/*
+ * P5-4d-α: ONLINE → FAULTED transition (ARCH §4.7.4). The device's
+ * bdev pointer is PRESERVED — the slot is marked as unavailable but
+ * the caller's ownership of the bdev is unchanged. Subsequent
+ * reserve_mirror / mirror_write / mirror_read skip FAULTED slots.
+ * On-disk data on the device is untouched; a later rejoin restores
+ * it to ONLINE without destroying content.
+ *
+ * device_lifecycle.tla's FailDevice action models this: the content
+ * gen freezes at the last ONLINE value; the pool continues writing
+ * to the remaining ONLINE replicas; mirror quorum is recomputed
+ * against live (non-REMOVED) devices only.
+ *
+ * Preconditions:
+ *   - device_id != 0 (metadata primary guard — R17 P1-1).
+ *   - Slot state is ONLINE. Any other state → EINVAL.
+ *
+ * Returns:
+ *   STM_OK            — slot flipped to FAULTED; roster_hash advanced.
+ *   STM_EROFS         — pool is read_only.
+ *   STM_ENOTSUPPORTED — device_id == 0.
+ *   STM_EINVAL        — slot not ONLINE, or out-of-range.
+ */
+STM_MUST_USE
+stm_status stm_pool_fail_device(stm_pool *p, uint16_t device_id);
+
+/*
+ * P5-4d-α: FAULTED → ONLINE transition. The device rejoins the pool
+ * as a live replica-carrier. Its on-disk content may LAG — writes
+ * that landed on other devices during the fault window never
+ * reached this one. Pre-β mirror_read fails csum on the stale
+ * content and falls through to the up-to-date replicas; P5-4d-β
+ * adds an explicit reconcile step that catches the rejoined device
+ * up by copying current-auth content.
+ *
+ * Preconditions:
+ *   - Slot state is FAULTED.
+ *
+ * Returns:
+ *   STM_OK     — slot flipped to ONLINE; roster_hash advanced.
+ *   STM_EROFS  — pool is read_only.
+ *   STM_EINVAL — slot not FAULTED, or out-of-range.
+ */
+STM_MUST_USE
+stm_status stm_pool_rejoin_device(stm_pool *p, uint16_t device_id);
+
 /* ========================================================================= */
 /* _locked variants for sync-layer safe wrappers.                            */
 /*                                                                             */
@@ -461,6 +507,12 @@ stm_status stm_pool_begin_evacuation_locked(stm_pool *p, uint16_t device_id,
 
 STM_MUST_USE
 stm_status stm_pool_finish_evacuation_locked(stm_pool *p, uint16_t device_id);
+
+STM_MUST_USE
+stm_status stm_pool_fail_device_locked(stm_pool *p, uint16_t device_id);
+
+STM_MUST_USE
+stm_status stm_pool_rejoin_device_locked(stm_pool *p, uint16_t device_id);
 
 #ifdef __cplusplus
 }

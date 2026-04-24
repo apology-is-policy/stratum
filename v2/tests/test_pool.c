@@ -1578,6 +1578,138 @@ STM_TEST(pool_finish_evacuation_and_remove_guard_states) {
     unlink(g_tmp_path);
 }
 
+/* ========================================================================= */
+/* P5-4d-α: stm_pool_fail_device + stm_pool_rejoin_device.                   */
+/* ========================================================================= */
+
+/* Happy path: ONLINE → FAULTED → ONLINE transition. bdev pointer
+ * is preserved across both transitions (unlike remove, which clears
+ * it). roster_hash advances on each. */
+STM_TEST(pool_fail_and_rejoin_device_cycle) {
+    make_tmp("fail_rejoin");
+    stm_bdev *d = open_fresh_device();
+    stm_pool *p = make_single_device_pool(d, POOL_UUID, DEVICE_UUID,
+                                             STM_DEV_ROLE_DATA,
+                                             STM_DEV_CLASS_SSD,
+                                             STM_DEV_STATE_ONLINE);
+    stm_bdev *d2 = open_companion_device("fail_rejoin");
+    stm_pool_device add = {
+        .uuid = { DEVICE_UUID_B[0], DEVICE_UUID_B[1] },
+        .role = STM_DEV_ROLE_DATA, .class_ = STM_DEV_CLASS_SSD,
+        .state = STM_DEV_STATE_ONLINE, .bdev = d2,
+    };
+    STM_ASSERT_OK(stm_pool_add_device(p, &add));
+
+    uint64_t hash0 = stm_pool_roster_hash(p);
+
+    /* ONLINE → FAULTED. bdev pointer preserved. */
+    STM_ASSERT_OK(stm_pool_fail_device(p, 1));
+    const stm_pool_device *info = stm_pool_device_info(p, 1);
+    STM_ASSERT(info != NULL);
+    STM_ASSERT_EQ(info->state, STM_DEV_STATE_FAULTED);
+    STM_ASSERT(info->bdev == d2);   /* bdev survives fail */
+    /* Live count UNCHANGED — FAULTED counts toward live (per
+     * device_lifecycle.tla's live set = non-REMOVED). */
+    STM_ASSERT_EQ(stm_pool_live_device_count(p), 2u);
+
+    uint64_t hash1 = stm_pool_roster_hash(p);
+    STM_ASSERT(hash1 != hash0);
+
+    /* FAULTED → ONLINE. bdev still preserved. */
+    STM_ASSERT_OK(stm_pool_rejoin_device(p, 1));
+    info = stm_pool_device_info(p, 1);
+    STM_ASSERT(info != NULL);
+    STM_ASSERT_EQ(info->state, STM_DEV_STATE_ONLINE);
+    STM_ASSERT(info->bdev == d2);
+
+    uint64_t hash2 = stm_pool_roster_hash(p);
+    STM_ASSERT(hash2 != hash1);
+
+    stm_pool_close(p);
+    stm_bdev_close(d);
+    stm_bdev_close(d2);
+    unlink(g_tmp_path);
+}
+
+/* Guardrails: fail refuses non-ONLINE states; rejoin refuses
+ * non-FAULTED; dev 0 guarded (R17 P1-1). */
+STM_TEST(pool_fail_rejoin_guard_states_and_device_zero) {
+    make_tmp("fail_guards");
+    stm_bdev *d = open_fresh_device();
+    stm_pool *p = make_single_device_pool(d, POOL_UUID, DEVICE_UUID,
+                                             STM_DEV_ROLE_DATA,
+                                             STM_DEV_CLASS_SSD,
+                                             STM_DEV_STATE_ONLINE);
+    stm_bdev *d2 = open_companion_device("fail_guards");
+    stm_pool_device add = {
+        .uuid = { DEVICE_UUID_B[0], DEVICE_UUID_B[1] },
+        .role = STM_DEV_ROLE_DATA, .class_ = STM_DEV_CLASS_SSD,
+        .state = STM_DEV_STATE_ONLINE, .bdev = d2,
+    };
+    STM_ASSERT_OK(stm_pool_add_device(p, &add));
+
+    /* Dev 0 refused (metadata primary). */
+    STM_ASSERT_ERR(stm_pool_fail_device(p, 0), STM_ENOTSUPPORTED);
+    STM_ASSERT_ERR(stm_pool_rejoin_device(p, 0), STM_EINVAL);  /* dev 0 is ONLINE */
+
+    /* Out-of-range. */
+    STM_ASSERT_ERR(stm_pool_fail_device(p, 99), STM_EINVAL);
+    STM_ASSERT_ERR(stm_pool_rejoin_device(p, 99), STM_EINVAL);
+
+    /* Rejoin on ONLINE: EINVAL. */
+    STM_ASSERT_ERR(stm_pool_rejoin_device(p, 1), STM_EINVAL);
+
+    /* Fail once → FAULTED. */
+    STM_ASSERT_OK(stm_pool_fail_device(p, 1));
+
+    /* Fail on FAULTED: EINVAL. */
+    STM_ASSERT_ERR(stm_pool_fail_device(p, 1), STM_EINVAL);
+
+    /* Rejoin brings back to ONLINE. */
+    STM_ASSERT_OK(stm_pool_rejoin_device(p, 1));
+
+    /* Remove dev 1 → REMOVED. */
+    STM_ASSERT_OK(stm_pool_remove_device(p, 1, 1));
+
+    /* Fail / rejoin on REMOVED: EINVAL (state not ONLINE/FAULTED). */
+    STM_ASSERT_ERR(stm_pool_fail_device(p, 1), STM_EINVAL);
+    STM_ASSERT_ERR(stm_pool_rejoin_device(p, 1), STM_EINVAL);
+
+    stm_pool_close(p);
+    stm_bdev_close(d);
+    stm_bdev_close(d2);
+    unlink(g_tmp_path);
+}
+
+/* RO pools refuse fail and rejoin. */
+STM_TEST(pool_fail_rejoin_refuses_read_only) {
+    make_tmp("fail_ro");
+    stm_bdev *d = open_fresh_device();
+    stm_pool_open_opts ro_opts;
+    memset(&ro_opts, 0, sizeof ro_opts);
+    ro_opts.pool_uuid[0] = POOL_UUID[0];
+    ro_opts.pool_uuid[1] = POOL_UUID[1];
+    ro_opts.device_count = 1;
+    ro_opts.read_only    = true;
+    ro_opts.devices[0].uuid[0]    = DEVICE_UUID[0];
+    ro_opts.devices[0].uuid[1]    = DEVICE_UUID[1];
+    ro_opts.devices[0].role       = STM_DEV_ROLE_DATA;
+    ro_opts.devices[0].class_     = STM_DEV_CLASS_SSD;
+    ro_opts.devices[0].state      = STM_DEV_STATE_ONLINE;
+    ro_opts.devices[0].bdev       = d;
+    const stm_bdev_caps *caps = stm_bdev_caps_of(d);
+    ro_opts.devices[0].size_bytes = caps->size_bytes;
+    stm_pool *ro_p = NULL;
+    STM_ASSERT_OK(stm_pool_open(&ro_opts, &ro_p));
+
+    STM_ASSERT_ERR(stm_pool_fail_device(ro_p, 0), STM_EROFS);
+    STM_ASSERT_ERR(stm_pool_rejoin_device(ro_p, 0), STM_EROFS);
+
+    stm_pool_close(ro_p);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
 /* RO pool: begin/finish both refuse with STM_EROFS (same as
  * add/remove — structural mutation gated by the pool's read_only). */
 STM_TEST(pool_begin_finish_evacuation_refuses_read_only) {

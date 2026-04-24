@@ -1946,6 +1946,25 @@ stm_status stm_sync_mirror_read(stm_sync *s, const uint64_t paddrs[],
     for (size_t i = 0; i < n; i++) {
         uint16_t dev = stm_paddr_device(paddrs[i]);
         uint64_t off = stm_paddr_offset(paddrs[i]) * (uint64_t)STM_UB_SIZE;
+
+        /* P5-4d-α: skip non-ONLINE devices. FAULTED → physically
+         * unreachable, and its on-disk content may be stale post-
+         * rejoin (P5-4d-β reconciles); reading from it would return
+         * stale bytes that fail csum and delay the OK replica. REMOVED
+         * → bdev is NULL, we'd skip via the null check anyway, but
+         * the state check is explicit and documents intent.
+         * EVACUATING → bdev still valid; the spec (evac.tla) keeps
+         * EVACUATING replicas in LiveDevices, so mirror_read may read
+         * from them during drain. Allow EVACUATING but skip FAULTED /
+         * REMOVED / others. */
+        const stm_pool_device *di = stm_pool_device_info(s->pool, dev);
+        if (!di ||
+            (di->state != STM_DEV_STATE_ONLINE &&
+             di->state != STM_DEV_STATE_EVACUATING)) {
+            if (first_err == STM_OK) first_err = STM_EINVAL;
+            continue;
+        }
+
         stm_bdev *bd = stm_pool_device_bdev(s->pool, dev);
         if (!bd) {
             if (first_err == STM_OK) first_err = STM_EINVAL;

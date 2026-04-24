@@ -2006,6 +2006,76 @@ STM_TEST(sync_multi_replace_device_online_happy_path) {
     teardown_mirror_pool(bds, as, pool, s);
 }
 
+/* ========================================================================= */
+/* P5-4d-α: mirror_read skips FAULTED replicas.                              */
+/* ========================================================================= */
+
+/* Setup mirror(2) × 3-dev. Write one block to (dev 0, dev 1). Fail
+ * dev 1. mirror_read over (paddr_on_0, paddr_on_1) must succeed via
+ * dev 0 only — FAULTED dev 1 is skipped, its on-disk bytes NOT
+ * read. Rejoin dev 1 and verify read succeeds via either replica. */
+STM_TEST(sync_multi_mirror_read_skips_faulted_replica) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "mirror_read_faulted", bds, as, &pool, &s);
+
+    uint64_t paddrs[2] = {0};
+    STM_ASSERT_OK(stm_sync_reserve_mirror(s, 1u, 2u, paddrs));
+    STM_ASSERT_EQ(stm_paddr_device(paddrs[0]), 0u);
+    STM_ASSERT_EQ(stm_paddr_device(paddrs[1]), 1u);
+
+    uint8_t payload[STM_UB_SIZE];
+    for (size_t i = 0; i < sizeof payload; i++)
+        payload[i] = (uint8_t)((i ^ 0x77) & 0xff);
+    size_t n_conf = 0;
+    STM_ASSERT_OK(stm_sync_mirror_write(s, paddrs, 2u,
+                                            payload, sizeof payload, &n_conf));
+
+    stm_blake3_hash expected;
+    stm_blake3(payload, sizeof payload, &expected);
+    uint8_t readback[STM_UB_SIZE] = {0};
+
+    /* Pre-fail: both replicas serve the read. */
+    STM_ASSERT_OK(stm_sync_mirror_read(s, paddrs, 2u,
+                                          readback, sizeof readback,
+                                          expected.bytes));
+    STM_ASSERT_EQ(memcmp(readback, payload, sizeof payload), 0);
+
+    /* Fail dev 1. */
+    STM_ASSERT_OK(stm_pool_fail_device(pool, 1));
+
+    /* mirror_read still succeeds via dev 0. The iteration tries dev 0
+     * first (paddrs[0]); it's ONLINE, bytes match csum, return OK
+     * before even touching dev 1. If we flip the order so FAULTED is
+     * tried first, the skip path kicks in and we fall through to
+     * dev 0. */
+    memset(readback, 0, sizeof readback);
+    STM_ASSERT_OK(stm_sync_mirror_read(s, paddrs, 2u,
+                                          readback, sizeof readback,
+                                          expected.bytes));
+    STM_ASSERT_EQ(memcmp(readback, payload, sizeof payload), 0);
+
+    /* Explicit FAULTED-first ordering. Reverse paddrs so dev 1 is
+     * tried before dev 0. */
+    uint64_t rev_paddrs[2] = { paddrs[1], paddrs[0] };
+    memset(readback, 0, sizeof readback);
+    STM_ASSERT_OK(stm_sync_mirror_read(s, rev_paddrs, 2u,
+                                          readback, sizeof readback,
+                                          expected.bytes));
+    STM_ASSERT_EQ(memcmp(readback, payload, sizeof payload), 0);
+
+    /* Rejoin dev 1. Reads work from either replica. */
+    STM_ASSERT_OK(stm_pool_rejoin_device(pool, 1));
+    memset(readback, 0, sizeof readback);
+    STM_ASSERT_OK(stm_sync_mirror_read(s, rev_paddrs, 2u,
+                                          readback, sizeof readback,
+                                          expected.bytes));
+    STM_ASSERT_EQ(memcmp(readback, payload, sizeof payload), 0);
+
+    teardown_mirror_pool(bds, as, pool, s);
+}
+
 /* FAULTED source → STM_ENOTSUPPORTED (P5-4c-β reconstruct path not yet
  * implemented). device_id=0 also STM_ENOTSUPPORTED (metadata primary). */
 STM_TEST(sync_multi_replace_device_refuses_unsupported_paths) {

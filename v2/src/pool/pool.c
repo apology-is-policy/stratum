@@ -646,3 +646,66 @@ stm_status stm_pool_finish_evacuation(stm_pool *p, uint16_t device_id)
     pthread_rwlock_unlock(&p->lock);
     return s;
 }
+
+/* ========================================================================= */
+/* P5-4d-α: FailDevice / RejoinDevice state transitions.                     */
+/* ========================================================================= */
+
+stm_status stm_pool_fail_device_locked(stm_pool *p, uint16_t device_id)
+{
+    /* Caller MUST hold pool's exclusive lock. */
+    if (!p) return STM_EINVAL;
+    if (p->read_only) return STM_EROFS;
+    if ((size_t)device_id >= p->device_count) return STM_EINVAL;
+
+    /* R17 P1-1: dev 0 is the metadata primary. Failing it would
+     * strand the pool — sync_open hard-codes dev 0. Refuse until a
+     * dynamic-primary mechanism lands. */
+    if (device_id == 0) return STM_ENOTSUPPORTED;
+
+    stm_pool_device *slot = &p->devices[device_id];
+    /* Only ONLINE → FAULTED. EVACUATING / REMOVED / already FAULTED
+     * have no business transitioning via this path. */
+    if (slot->state != STM_DEV_STATE_ONLINE) return STM_EINVAL;
+
+    slot->state = STM_DEV_STATE_FAULTED;
+    p->roster_hash = hash_of_devs(p->devices, p->device_count);
+    return STM_OK;
+}
+
+stm_status stm_pool_fail_device(stm_pool *p, uint16_t device_id)
+{
+    if (!p) return STM_EINVAL;
+    pthread_rwlock_wrlock(&p->lock);
+    stm_status s = stm_pool_fail_device_locked(p, device_id);
+    pthread_rwlock_unlock(&p->lock);
+    return s;
+}
+
+stm_status stm_pool_rejoin_device_locked(stm_pool *p, uint16_t device_id)
+{
+    /* Caller MUST hold pool's exclusive lock. */
+    if (!p) return STM_EINVAL;
+    if (p->read_only) return STM_EROFS;
+    if ((size_t)device_id >= p->device_count) return STM_EINVAL;
+
+    stm_pool_device *slot = &p->devices[device_id];
+    /* Only FAULTED → ONLINE. Note the rejoined device's content may
+     * be stale (content-gen lags pool_gen); reconcile lands in
+     * P5-4d-β. Pre-β, mirror_read falls back to other replicas when
+     * the stale content's csum fails. */
+    if (slot->state != STM_DEV_STATE_FAULTED) return STM_EINVAL;
+
+    slot->state = STM_DEV_STATE_ONLINE;
+    p->roster_hash = hash_of_devs(p->devices, p->device_count);
+    return STM_OK;
+}
+
+stm_status stm_pool_rejoin_device(stm_pool *p, uint16_t device_id)
+{
+    if (!p) return STM_EINVAL;
+    pthread_rwlock_wrlock(&p->lock);
+    stm_status s = stm_pool_rejoin_device_locked(p, device_id);
+    pthread_rwlock_unlock(&p->lock);
+    return s;
+}
