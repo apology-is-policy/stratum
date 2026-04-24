@@ -44,6 +44,28 @@ Only after `ARCHITECTURE.md` is signed off does implementation resume — likely
 - Design sessions produce documents, not code. No implementation pressure during Phase 0.
 - Load-bearing invariants identified during design become candidates for formal specification (TLA+ / Alloy / similar). The spec is the source of truth; code is an implementation of the spec.
 
+## Spec-first policy (applies to every new feature, not just Phase 0)
+
+**If a feature touches a load-bearing invariant — concurrency, commit ordering, nonce uniqueness, quorum, redundancy, crypto key derivation, cache coherence, torn-write recovery — the TLA+ (or similar) model comes BEFORE the implementation.** Write the spec, let TLC chew on it, and let the invariant violations (if any) surface at the spec level where they cost minutes, not at runtime where they cost commits.
+
+Concrete pattern that's repeatedly paid off on this project:
+1. Propose the feature in prose (problem + shape).
+2. **Model the mechanism in TLA+** — state, actions, invariants. TLC with small bounds (typically Devices≤3, Commits≤3, Retries≤1).
+3. Iterate until TLC is green under the invariants you'd want the impl to uphold. If a bug shows up, fix the design BEFORE writing code.
+4. Implement against the model. Cross-reference each impl step to the corresponding spec action in comments. Keep the SPEC-TO-CODE mapping current.
+5. When the impl surfaces a new mechanism the spec didn't cover, extend the spec FIRST, then update the impl.
+
+Historical receipts:
+- `quorum.tla` (P5-0) caught two bugs before a line of P5-2 code was written: orphan-gen mount acceptance (fixed via `OrphansNotAuthoritative`) and over-strict `LiveCoordMonotonic` that would fail in the transient between-writes state.
+- `quorum.tla` with `IdempotentRetry=FALSE` + `MaxRetries≥2` demonstrated the R14 P1 content-divergence bug at the spec level — the invariant fired before anyone had coded the offending path.
+- Skipping this step for P5-3b/c left the per-tree-gen divergence bug (fold of alloc_commit's R7c P2-5 short-circuit + the roots-object value layout) for a test to catch at runtime, not the model. An extension of `quorum.tla` that captures per-device tree gens + idempotent-commit would have caught it before the first compile.
+
+**If you cannot articulate the invariant formally, you don't understand it well enough to implement it.**
+
+Features that clearly benefit (not exhaustive): multi-device commit, quorum protocols, key rotation, scrub orchestration, refcount/snapshot graph mutations, MVCC readers vs writers, anything that persists a reservation-then-commit or multi-phase write, anything that uses crypto nonces over a shared key, anything with more than one device state machine in play.
+
+Features that usually don't (pure computation, test helpers, config parsing, CLI glue): skip the spec; just write + test. Use judgment.
+
 ## Audit-triggering changes
 
 **Applies to**: any change to the current codebase during Phase 0 (e.g. bug fixes to the foundation) AND to Stratum v2 code once implementation resumes. The policy survives the redesign — the invariants are filesystem invariants, not stratum-v1 invariants.
