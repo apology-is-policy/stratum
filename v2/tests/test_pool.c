@@ -813,6 +813,24 @@ STM_TEST(pool_sync_open_refuses_wrong_device_uuid) {
 /* P5-4a: stm_pool_add_device.                                                */
 /* ========================================================================= */
 
+/* R16 F6 P3: second-device fixture — use a distinct tmp path so
+ * the two bdev files don't accidentally share state. open_fresh_device
+ * is parameterized by the shared g_tmp_path; this helper opens a
+ * suffixed companion file. */
+static stm_bdev *open_companion_device(const char *suffix)
+{
+    char companion_path[256];
+    snprintf(companion_path, sizeof companion_path,
+             "/tmp/stm_v2_pool_%s_%d_companion.bin",
+             suffix, (int)getpid());
+    unlink(companion_path);
+    stm_bdev_open_opts opts = stm_bdev_open_opts_default();
+    stm_bdev *d = NULL;
+    STM_ASSERT_OK(stm_bdev_open(companion_path, &opts, &d));
+    STM_ASSERT_OK(stm_bdev_resize(d, TEST_DEVICE_BYTES));
+    return d;
+}
+
 STM_TEST(pool_add_device_appends_and_advances_roster_hash) {
     make_tmp("add_device_rt");
     stm_bdev *d = open_fresh_device();
@@ -824,10 +842,8 @@ STM_TEST(pool_add_device_appends_and_advances_roster_hash) {
     STM_ASSERT_EQ(stm_pool_device_count(p), 1u);
     uint64_t h_before = stm_pool_roster_hash(p);
 
-    /* Second device backed by the same test file (fine for this unit
-     * test — we only exercise the pool-layer membership API, no I/O
-     * to the new device). */
-    stm_bdev *d2 = open_fresh_device();
+    /* Companion device on a distinct tmp path (R16 F6). */
+    stm_bdev *d2 = open_companion_device("add_device_rt");
     STM_ASSERT(d2 != NULL);
     stm_pool_device add = {
         .uuid       = { DEVICE_UUID_B[0], DEVICE_UUID_B[1] },
@@ -867,7 +883,7 @@ STM_TEST(pool_add_device_rejects_duplicate_uuid) {
                                              STM_DEV_CLASS_SSD,
                                              STM_DEV_STATE_ONLINE);
 
-    stm_bdev *d2 = open_fresh_device();
+    stm_bdev *d2 = open_companion_device("add_device_dup");
     /* Same UUID as device 0 — must be rejected. */
     stm_pool_device add = {
         .uuid       = { DEVICE_UUID[0], DEVICE_UUID[1] },
@@ -896,7 +912,7 @@ STM_TEST(pool_add_device_refuses_bad_args) {
                                              STM_DEV_CLASS_SSD,
                                              STM_DEV_STATE_ONLINE);
 
-    stm_bdev *d2 = open_fresh_device();
+    stm_bdev *d2 = open_companion_device("add_device_badargs");
 
     /* NULL pool or device. */
     stm_pool_device base = {
@@ -974,6 +990,123 @@ STM_TEST(pool_add_device_roster_cap_enforced) {
 
     stm_pool_close(p);
     stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* ========================================================================= */
+/* R16 regression tests.                                                       */
+/* ========================================================================= */
+
+/* R16 F1 P1: add_device forces state=ONLINE regardless of caller input.
+ * A caller passing REMOVED/FAULTED/anything is coerced to ONLINE. */
+STM_TEST(pool_add_device_coerces_state_to_online) {
+    make_tmp("add_coerce_state");
+    stm_bdev *d = open_fresh_device();
+    stm_pool *p = make_single_device_pool(d, POOL_UUID, DEVICE_UUID,
+                                             STM_DEV_ROLE_DATA,
+                                             STM_DEV_CLASS_SSD,
+                                             STM_DEV_STATE_ONLINE);
+    stm_bdev *d2 = open_companion_device("add_coerce_state");
+
+    /* Caller passes REMOVED — the spec's AddDevice(d) → ONLINE must
+     * hold regardless. */
+    stm_pool_device add = {
+        .uuid       = { DEVICE_UUID_B[0], DEVICE_UUID_B[1] },
+        .size_bytes = TEST_DEVICE_BYTES,
+        .role       = STM_DEV_ROLE_DATA,
+        .class_     = STM_DEV_CLASS_SSD,
+        .state      = STM_DEV_STATE_REMOVED,
+        .bdev       = d2,
+    };
+    STM_ASSERT_OK(stm_pool_add_device(p, &add));
+
+    /* Slot's stored state is ONLINE, not REMOVED. */
+    const stm_pool_device *info = stm_pool_device_info(p, 1);
+    STM_ASSERT(info != NULL);
+    STM_ASSERT_EQ(info->state, STM_DEV_STATE_ONLINE);
+
+    stm_pool_close(p);
+    stm_bdev_close(d);
+    stm_bdev_close(d2);
+    unlink(g_tmp_path);
+}
+
+/* R16 F2 P1: size_bytes is derived from bdev caps, not from caller
+ * input. A caller-supplied mismatched size_bytes is silently
+ * overridden by the pool-layer's cap-based value. */
+STM_TEST(pool_add_device_size_derived_from_bdev) {
+    make_tmp("add_size_derived");
+    stm_bdev *d = open_fresh_device();
+    stm_pool *p = make_single_device_pool(d, POOL_UUID, DEVICE_UUID,
+                                             STM_DEV_ROLE_DATA,
+                                             STM_DEV_CLASS_SSD,
+                                             STM_DEV_STATE_ONLINE);
+    stm_bdev *d2 = open_companion_device("add_size_derived");
+
+    /* Caller lies about size_bytes (says 1 byte; real bdev is
+     * TEST_DEVICE_BYTES). */
+    stm_pool_device add = {
+        .uuid       = { DEVICE_UUID_B[0], DEVICE_UUID_B[1] },
+        .size_bytes = 1u,                   /* bogus */
+        .role       = STM_DEV_ROLE_DATA,
+        .class_     = STM_DEV_CLASS_SSD,
+        .state      = STM_DEV_STATE_ONLINE,
+        .bdev       = d2,
+    };
+    STM_ASSERT_OK(stm_pool_add_device(p, &add));
+
+    /* Stored size_bytes matches the bdev's actual size. */
+    const stm_pool_device *info = stm_pool_device_info(p, 1);
+    STM_ASSERT(info != NULL);
+    STM_ASSERT_EQ(info->size_bytes, TEST_DEVICE_BYTES);
+
+    stm_pool_close(p);
+    stm_bdev_close(d);
+    stm_bdev_close(d2);
+    unlink(g_tmp_path);
+}
+
+/* R16 F5 P2: RO pools refuse add_device with STM_EROFS. */
+STM_TEST(pool_add_device_refuses_read_only) {
+    make_tmp("add_ro_refuse");
+    stm_bdev *d = open_fresh_device();
+
+    /* Build opts with read_only=true. */
+    const stm_bdev_caps *caps = stm_bdev_caps_of(d);
+    STM_ASSERT(caps != NULL);
+    stm_pool_open_opts opts;
+    memset(&opts, 0, sizeof opts);
+    opts.pool_uuid[0] = POOL_UUID[0];
+    opts.pool_uuid[1] = POOL_UUID[1];
+    opts.device_count = 1;
+    opts.read_only    = true;
+    opts.devices[0].uuid[0]    = DEVICE_UUID[0];
+    opts.devices[0].uuid[1]    = DEVICE_UUID[1];
+    opts.devices[0].size_bytes = caps->size_bytes;
+    opts.devices[0].role       = STM_DEV_ROLE_DATA;
+    opts.devices[0].class_     = STM_DEV_CLASS_SSD;
+    opts.devices[0].state      = STM_DEV_STATE_ONLINE;
+    opts.devices[0].bdev       = d;
+    stm_pool *p = NULL;
+    STM_ASSERT_OK(stm_pool_open(&opts, &p));
+
+    stm_bdev *d2 = open_companion_device("add_ro_refuse");
+    stm_pool_device add = {
+        .uuid       = { DEVICE_UUID_B[0], DEVICE_UUID_B[1] },
+        .size_bytes = TEST_DEVICE_BYTES,
+        .role       = STM_DEV_ROLE_DATA,
+        .class_     = STM_DEV_CLASS_SSD,
+        .state      = STM_DEV_STATE_ONLINE,
+        .bdev       = d2,
+    };
+    STM_ASSERT_ERR(stm_pool_add_device(p, &add), STM_EROFS);
+
+    /* device_count unchanged. */
+    STM_ASSERT_EQ(stm_pool_device_count(p), 1u);
+
+    stm_pool_close(p);
+    stm_bdev_close(d);
+    stm_bdev_close(d2);
     unlink(g_tmp_path);
 }
 

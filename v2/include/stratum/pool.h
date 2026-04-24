@@ -97,6 +97,13 @@ typedef struct {
      * device_id that will land in the uberblock's paddr top-16-bits. */
     size_t          device_count;
     stm_pool_device devices[STM_POOL_DEVICES_MAX];
+
+    /* R16 F5 P2: when true, the pool handle refuses structural
+     * mutation APIs (add_device, future remove/replace) with
+     * STM_EROFS. Mirrors `stm_sync.read_only` — fs_mount plumbs
+     * its RO opt through to both. Pools mounted read/write leave
+     * this false. */
+    bool            read_only;
 } stm_pool_open_opts;
 
 /*
@@ -196,30 +203,64 @@ uint64_t stm_pool_roster_hash_of_bytes(
 /* ========================================================================= */
 
 /*
- * Append `new_device` to the pool's roster (ARCH §4.7.1). The new device
- * joins at index = current device_count, advances roster_hash, and is
- * picked up by the NEXT sync_commit (the commit writes an UB whose
- * ub_roster / ub_device_count / ub_roster_hash reflect the expanded
- * membership).
+ * Append `new_device` to the pool's roster (ARCH §4.7.1). The new
+ * device joins at index = current device_count, advances
+ * roster_hash, and is picked up by the NEXT sync_commit (the commit
+ * writes an UB whose ub_roster / ub_device_count / ub_roster_hash
+ * reflect the expanded membership).
  *
  * Preconditions:
  *   - `new_device->bdev` non-NULL.
- *   - `new_device->uuid` non-zero AND not already present in the roster
- *     (each device's UUID is unique per ARCH §4.3.1).
- *   - `new_device->role` / `class_` / `state` in range.
+ *   - `new_device->uuid` non-zero AND not already present in the
+ *     roster (each device's UUID is unique per ARCH §4.3.1).
+ *   - `new_device->role` / `class_` in range.
  *   - Current device_count < STM_POOL_DEVICES_MAX.
  *
- * The caller retains ownership of new_device->bdev; the pool borrows
- * it for the pool's lifetime (symmetric with stm_pool_open).
+ * State coercion (R16 F1): the spec's AddDevice(d) action transitions
+ * the device to ONLINE unconditionally. This API IGNORES
+ * `new_device->state` and installs STM_DEV_STATE_ONLINE. A caller
+ * that wants to FAIL/DEGRADE a device after adding goes through the
+ * FailDevice / DegradeDevice APIs (P5-4d).
  *
- * Does NOT exercise any other device on the pool (no reads, no writes)
- * — fast. The new device is ONLINE but empty: a subsequent
- * mirror_write or rebalance populates its storage. Sync-layer: attach
- * a fresh stm_alloc for this device via stm_sync_attach_alloc before
- * the next commit that targets it for mirror reservations.
+ * Size verification (R16 F2): `new_device->size_bytes` is IGNORED.
+ * The pool reads the size from `stm_bdev_caps_of(new_device->bdev)`
+ * directly. This avoids on-disk roster entries with size_bytes
+ * disagreeing with the bdev's actual size.
+ *
+ * The caller retains ownership of new_device->bdev; the pool
+ * borrows it for the pool's lifetime (symmetric with stm_pool_open).
+ *
+ * Does NOT exercise any other device on the pool (no reads, no
+ * writes) — fast. The new device is ONLINE but empty: a subsequent
+ * mirror_write or rebalance populates its storage. Sync-layer:
+ * attach a fresh stm_alloc for this device via stm_sync_attach_alloc
+ * before the next commit that targets it for mirror reservations.
+ *
+ * **Caller-serialization contract (R16 F4 — strengthened):** the
+ * caller MUST guarantee no concurrent `stm_sync_commit` on this
+ * pool runs during `stm_pool_add_device`'s duration. Sync's commit
+ * reads `device_count`, encodes the roster, and reads `roster_hash`
+ * across multiple calls; an interleaving `add_device` leaves the
+ * UB with `ub_device_count` disagreeing with `ub_roster` or
+ * `ub_roster_hash`, which remount rejects as STM_ECORRUPT and
+ * wedges the pool. There is currently NO internal lock enforcing
+ * this — a per-pool lock that sync also holds is P5-4b work.
+ * Enforce externally: call add_device on the same thread that owns
+ * sync, BEFORE sync_create, or BETWEEN sync_commit calls under an
+ * application-level lock.
+ *
+ * **Burned-UUID tracking (R16 F3 — P5-4b precondition):** this
+ * function's UUID uniqueness walk covers only the LIVE roster.
+ * Once `stm_pool_remove_device` (P5-4b) lands, the same UUID must
+ * stay rejected here even after remove — re-using a UUID that
+ * previously identified a device in the pool would collide with
+ * the AEAD nonce invariant (R15 F1) for any metadata written
+ * under the historical device. P5-4b must persist REMOVED slots
+ * in the roster AND this walk must iterate through them.
  *
  * Returns:
  *   STM_OK           — device added; roster_hash advanced.
+ *   STM_EROFS        — pool was opened read_only.
  *   STM_EINVAL       — shape violation on new_device.
  *   STM_ENOSPC       — roster is full (device_count == STM_POOL_DEVICES_MAX).
  *   STM_EEXIST       — new_device->uuid matches an existing roster entry.

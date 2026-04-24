@@ -42,6 +42,7 @@ struct stm_pool {
     size_t          device_count;
     stm_pool_device devices[STM_POOL_DEVICES_MAX];
     uint64_t        roster_hash;  /* cached: recomputed on any mutation */
+    bool            read_only;    /* R16 F5 P2: RO pools refuse mutation */
 };
 
 /* ========================================================================= */
@@ -226,6 +227,7 @@ stm_status stm_pool_open(const stm_pool_open_opts *opts, stm_pool **out)
     p->pool_uuid[0] = opts->pool_uuid[0];
     p->pool_uuid[1] = opts->pool_uuid[1];
     p->device_count = opts->device_count;
+    p->read_only    = opts->read_only;
     for (size_t i = 0; i < opts->device_count; i++) {
         p->devices[i] = opts->devices[i];
     }
@@ -277,11 +279,26 @@ uint64_t stm_pool_roster_hash(const stm_pool *p) {
 stm_status stm_pool_add_device(stm_pool *p, const stm_pool_device *new_device)
 {
     if (!p || !new_device) return STM_EINVAL;
+
+    /* R16 F5 P2: RO pools refuse structural mutation. Same policy as
+     * stm_sync's mirror-write / commit refusing under read_only. */
+    if (p->read_only) return STM_EROFS;
+
     if (!new_device->bdev) return STM_EINVAL;
     if (uuid_is_zero(new_device->uuid)) return STM_EINVAL;
     if (!role_in_range(new_device->role))   return STM_EINVAL;
     if (!class_in_range(new_device->class_)) return STM_EINVAL;
-    if (!state_in_range(new_device->state))  return STM_EINVAL;
+    /* R16 F1 P1: state is coerced to ONLINE below; we intentionally do
+     * NOT validate new_device->state here (the caller's value is
+     * discarded). The spec's AddDevice(d) transitions to ONLINE
+     * unconditionally — FAULTED / REMOVED states must be reached via
+     * the dedicated transitions (fail/remove), never via add. */
+
+    /* R16 F2 P1: derive size_bytes from the bdev, not the caller's
+     * input. Avoids on-disk roster entries whose size_bytes disagrees
+     * with the bdev's actual size. */
+    const stm_bdev_caps *caps = stm_bdev_caps_of(new_device->bdev);
+    if (!caps) return STM_EINVAL;
 
     /* Roster capacity check. STM_POOL_DEVICES_MAX matches the 64-slot
      * ub_roster[2048] layout; beyond that, the on-disk format doesn't
@@ -292,7 +309,7 @@ stm_status stm_pool_add_device(stm_pool *p, const stm_pool_device *new_device)
      * is unique across the pool's lifetime (ARCH §4.3.1). P5-4a MVP
      * checks the live roster only; burned-UUID tracking for REMOVED
      * devices lands with P5-4b remove + replace (needs the REMOVED
-     * slot persistence).
+     * slot persistence). Documented as a P5-4b precondition in pool.h.
      *
      * AddDeviceIdempotent from device_lifecycle.tla: AddDevice(d) is
      * rejected when d is already ONLINE or FAULTED — enforced here by
@@ -305,13 +322,14 @@ stm_status stm_pool_add_device(stm_pool *p, const stm_pool_device *new_device)
         }
     }
 
-    /* Append + rehash. The new slot lands at the current count; the
-     * recount bumps it afterward. Matches the TLA model's AddDevice
-     * action: roster_gen advances; per-device content_gen for the
-     * new device initializes to the current pool_gen-equivalent
-     * (here, post-commit the new device's ub will land at the next
-     * commit's gen). */
-    p->devices[p->device_count] = *new_device;
+    /* Build the canonical slot: caller-supplied uuid / role / class
+     * plus derived bdev + size_bytes + coerced state=ONLINE. */
+    stm_pool_device slot = *new_device;
+    slot.size_bytes = caps->size_bytes;
+    slot.state      = STM_DEV_STATE_ONLINE;
+
+    /* Append + rehash. Matches the TLA model's AddDevice action. */
+    p->devices[p->device_count] = slot;
     p->device_count++;
     p->roster_hash = hash_of_devs(p->devices, p->device_count);
 
