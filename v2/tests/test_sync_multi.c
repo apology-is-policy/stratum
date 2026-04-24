@@ -32,6 +32,8 @@
 #include <stratum/super.h>
 #include <stratum/sync.h>
 
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1890,6 +1892,148 @@ STM_TEST(sync_multi_evacuate_empty_device_skips_steps) {
     STM_ASSERT_OK(stm_pool_finish_evacuation(pool, 2));
     STM_ASSERT_OK(stm_sync_commit(s));
     STM_ASSERT_EQ(stm_pool_live_device_count(pool), 2u);
+
+    teardown_mirror_pool(bds, as, pool, s);
+}
+
+/* ========================================================================= */
+/* P5-4b-ii-β: per-pool lock stress (R16 F4 discharge).                      */
+/* ========================================================================= */
+
+/* Shared state for the stress test. */
+typedef struct {
+    stm_sync           *s;
+    atomic_int          stop;
+    atomic_uint_fast64_t commits;   /* commits completed by reader thread */
+    atomic_uint_fast64_t reserves;  /* reserves completed by writer thread */
+} stress_ctx;
+
+static void *stress_commit_thread(void *arg) {
+    stress_ctx *c = arg;
+    while (!atomic_load(&c->stop)) {
+        stm_status s = stm_sync_commit(c->s);
+        if (s == STM_OK) {
+            atomic_fetch_add(&c->commits, 1);
+        } else if (s != STM_EQUORUM && s != STM_EROFS && s != STM_EWEDGED) {
+            /* Other errors are unexpected under stress — fail loudly. */
+            STM_ASSERT_OK(s);
+        }
+    }
+    return NULL;
+}
+
+static void *stress_reserve_thread(void *arg) {
+    stress_ctx *c = arg;
+    while (!atomic_load(&c->stop)) {
+        uint64_t paddrs[2] = { 0 };
+        stm_status rs = stm_sync_reserve_mirror(c->s, 1u, 2u, paddrs);
+        if (rs == STM_OK) {
+            /* Don't write — just exercise reserve + free. free_gen=0
+             * so the next commit sweeps the entries. */
+            (void)paddrs;
+            atomic_fetch_add(&c->reserves, 1);
+        }
+        /* Some errors (ENOSPC if we exhaust the device, EROFS, etc.)
+         * are acceptable under stress; only data races are what this
+         * test catches under TSan. */
+    }
+    return NULL;
+}
+
+/* Concurrent sync_commit + sync_reserve_mirror for ~200ms. Under
+ * TSan, any data race between the pool-read phase of commit and the
+ * pool-read phase of reserve would fire. With pool.rdlock held by
+ * both (shared), they proceed concurrently without racing. */
+STM_TEST(sync_multi_pool_lock_rwlock_concurrent_readers) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "beta_stress_rd", bds, as, &pool, &s);
+
+    stress_ctx c = { .s = s, .stop = 0, .commits = 0, .reserves = 0 };
+
+    pthread_t t_commit, t_reserve;
+    STM_ASSERT_EQ(pthread_create(&t_commit, NULL,
+                                    stress_commit_thread, &c), 0);
+    STM_ASSERT_EQ(pthread_create(&t_reserve, NULL,
+                                    stress_reserve_thread, &c), 0);
+
+    /* Burn ~200ms — enough cycles to surface race hazards under TSan. */
+    usleep(200 * 1000);
+
+    atomic_store(&c.stop, 1);
+    pthread_join(t_commit, NULL);
+    pthread_join(t_reserve, NULL);
+
+    /* Both threads made progress — proves the lock doesn't deadlock
+     * and shared readers compose correctly. */
+    STM_ASSERT(atomic_load(&c.commits) > 0);
+    STM_ASSERT(atomic_load(&c.reserves) > 0);
+
+    teardown_mirror_pool(bds, as, pool, s);
+}
+
+/* Concurrent sync_commit + begin_evacuation/finish_evacuation. The
+ * mutators take the exclusive lock; sync_commit takes shared. They
+ * serialize cleanly with no data races (TSan clean) and no deadlock. */
+STM_TEST(sync_multi_pool_lock_writer_serializes_with_readers) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "beta_stress_wr", bds, as, &pool, &s);
+
+    stress_ctx c = { .s = s, .stop = 0, .commits = 0, .reserves = 0 };
+
+    pthread_t t_commit;
+    STM_ASSERT_EQ(pthread_create(&t_commit, NULL,
+                                    stress_commit_thread, &c), 0);
+
+    /* Brief warm-up so the commit thread is in flight. */
+    usleep(50 * 1000);
+
+    /* Mutator path — exclusive lock. Each begin/finish cycle races
+     * with whatever commits are in flight; the pool's wrlock
+     * serializes them. TSan watches for any pool-state read that
+     * escaped the shared lock. Dev 2 is ONLINE, has no data, and is
+     * not the metadata primary (R17 P1-1 allows it). Subsequent
+     * iterations evacuate the freshly-appended slot. */
+    uint16_t evac_target = 2;
+    for (int i = 0; i < 5; i++) {
+        STM_ASSERT_OK(stm_pool_begin_evacuation(pool, evac_target,
+                                                   /*floor=*/2));
+        STM_ASSERT_OK(stm_sync_finish_evacuation(s, evac_target));
+        /* Re-add so the loop can repeat. UUID must be fresh per add
+         * (REMOVED-slot UUIDs are burned). */
+        stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+        char path[256];
+        snprintf(path, sizeof path,
+                 "/tmp/stm_v2_sync_multi_beta_wr_readd_%d_%d.bin",
+                 (int)getpid(), i);
+        unlink(path);
+        stm_bdev *new_bd = NULL;
+        STM_ASSERT_OK(stm_bdev_open(path, &bo, &new_bd));
+        STM_ASSERT_OK(stm_bdev_resize(new_bd, TEST_DEVICE_BYTES));
+        stm_pool_device add = {
+            .uuid   = { 0xb00bULL + i, 0xdeadULL + i },
+            .role   = STM_DEV_ROLE_DATA,
+            .class_ = STM_DEV_CLASS_SSD,
+            .state  = STM_DEV_STATE_ONLINE,
+            .bdev   = new_bd,
+        };
+        STM_ASSERT_OK(stm_pool_add_device(pool, &add));
+        /* The new device lands at the tail — that's our next evac
+         * target. device_count grows by 1 each iteration since
+         * REMOVED slots persist (P5-4b-i). Intentionally leak the
+         * bdev for test-stress purposes. */
+        evac_target = (uint16_t)(stm_pool_device_count(pool) - 1);
+        usleep(10 * 1000);
+    }
+
+    atomic_store(&c.stop, 1);
+    pthread_join(t_commit, NULL);
+
+    /* Reader made progress despite the writer churn. */
+    STM_ASSERT(atomic_load(&c.commits) > 0);
 
     teardown_mirror_pool(bds, as, pool, s);
 }

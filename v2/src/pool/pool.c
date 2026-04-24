@@ -25,6 +25,7 @@
 #include <stratum/hash.h>
 #include <stratum/block.h>
 
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -43,6 +44,14 @@ struct stm_pool {
     stm_pool_device devices[STM_POOL_DEVICES_MAX];
     uint64_t        roster_hash;  /* cached: recomputed on any mutation */
     bool            read_only;    /* R16 F5 P2: RO pools refuse mutation */
+    /* R16 F4 / P5-4b-ii-β: per-pool rwlock. Writers (add / remove /
+     * begin_evac / finish_evac) take the exclusive side; readers
+     * (sync_commit's pool-read phase, reserve_mirror's device
+     * selection, evac_step's survivor pick) take the shared side via
+     * the public stm_pool_lock_* APIs. Lock order (global): POOL
+     * OUTER, SYNC INNER — every composite critical section takes
+     * pool first. Deadlock-by-reversal is a contract violation. */
+    pthread_rwlock_t lock;
 };
 
 /* ========================================================================= */
@@ -239,6 +248,10 @@ stm_status stm_pool_open(const stm_pool_open_opts *opts, stm_pool **out)
     stm_pool *p = calloc(1, sizeof *p);
     if (!p) return STM_ENOMEM;
 
+    /* rwlock init — must land BEFORE any publish of `p`. */
+    int rc = pthread_rwlock_init(&p->lock, NULL);
+    if (rc != 0) { free(p); return STM_ENOMEM; }
+
     p->pool_uuid[0] = opts->pool_uuid[0];
     p->pool_uuid[1] = opts->pool_uuid[1];
     p->device_count = opts->device_count;
@@ -255,10 +268,36 @@ stm_status stm_pool_open(const stm_pool_open_opts *opts, stm_pool **out)
 void stm_pool_close(stm_pool *p)
 {
     if (!p) return;
+    /* Caller must not call close while any other thread holds the
+     * lock — POSIX says destroying a locked rwlock is UB. The
+     * lifetime contract (pool.h) requires every sync handle to be
+     * closed before the pool; sync handles are the lock's primary
+     * users on the read side. */
+    (void)pthread_rwlock_destroy(&p->lock);
     /* Borrowers of stm_bdev — we don't close them; wiping the roster
      * is belt-and-braces against lingering pointers. */
     memset(p->devices, 0, sizeof p->devices);
     free(p);
+}
+
+/* ========================================================================= */
+/* P5-4b-ii-β: per-pool lock API.                                             */
+/* ========================================================================= */
+
+void stm_pool_lock_shared(stm_pool *p) {
+    if (p) (void)pthread_rwlock_rdlock(&p->lock);
+}
+
+void stm_pool_unlock_shared(stm_pool *p) {
+    if (p) (void)pthread_rwlock_unlock(&p->lock);
+}
+
+void stm_pool_lock_exclusive(stm_pool *p) {
+    if (p) (void)pthread_rwlock_wrlock(&p->lock);
+}
+
+void stm_pool_unlock_exclusive(stm_pool *p) {
+    if (p) (void)pthread_rwlock_unlock(&p->lock);
 }
 
 /* ========================================================================= */
@@ -300,8 +339,11 @@ uint64_t stm_pool_roster_hash(const stm_pool *p) {
 /* Device lifecycle — P5-4.                                                   */
 /* ========================================================================= */
 
-stm_status stm_pool_add_device(stm_pool *p, const stm_pool_device *new_device)
+stm_status stm_pool_add_device_locked(stm_pool *p,
+                                          const stm_pool_device *new_device)
 {
+    /* Caller MUST hold pool's exclusive lock. The public
+     * stm_pool_add_device wrapper below does the locking. */
     if (!p || !new_device) return STM_EINVAL;
 
     /* R16 F5 P2: RO pools refuse structural mutation. Same policy as
@@ -360,9 +402,19 @@ stm_status stm_pool_add_device(stm_pool *p, const stm_pool_device *new_device)
     return STM_OK;
 }
 
-stm_status stm_pool_remove_device(stm_pool *p, uint16_t device_id,
-                                     size_t redundancy_floor)
+stm_status stm_pool_add_device(stm_pool *p, const stm_pool_device *new_device)
 {
+    if (!p) return STM_EINVAL;
+    pthread_rwlock_wrlock(&p->lock);
+    stm_status s = stm_pool_add_device_locked(p, new_device);
+    pthread_rwlock_unlock(&p->lock);
+    return s;
+}
+
+stm_status stm_pool_remove_device_locked(stm_pool *p, uint16_t device_id,
+                                              size_t redundancy_floor)
+{
+    /* Caller MUST hold pool's exclusive lock. */
     if (!p) return STM_EINVAL;
 
     /* R16 F5 symmetric: RO pools refuse structural mutation. */
@@ -435,13 +487,24 @@ stm_status stm_pool_remove_device(stm_pool *p, uint16_t device_id,
     return STM_OK;
 }
 
+stm_status stm_pool_remove_device(stm_pool *p, uint16_t device_id,
+                                      size_t redundancy_floor)
+{
+    if (!p) return STM_EINVAL;
+    pthread_rwlock_wrlock(&p->lock);
+    stm_status s = stm_pool_remove_device_locked(p, device_id, redundancy_floor);
+    pthread_rwlock_unlock(&p->lock);
+    return s;
+}
+
 /* ========================================================================= */
 /* P5-4b-ii: evacuation state-machine half.                                  */
 /* ========================================================================= */
 
-stm_status stm_pool_begin_evacuation(stm_pool *p, uint16_t device_id,
-                                        size_t redundancy_floor)
+stm_status stm_pool_begin_evacuation_locked(stm_pool *p, uint16_t device_id,
+                                                size_t redundancy_floor)
 {
+    /* Caller MUST hold pool's exclusive lock. */
     if (!p) return STM_EINVAL;
     if (p->read_only) return STM_EROFS;
     if ((size_t)device_id >= p->device_count) return STM_EINVAL;
@@ -492,8 +555,20 @@ stm_status stm_pool_begin_evacuation(stm_pool *p, uint16_t device_id,
     return STM_OK;
 }
 
-stm_status stm_pool_finish_evacuation(stm_pool *p, uint16_t device_id)
+stm_status stm_pool_begin_evacuation(stm_pool *p, uint16_t device_id,
+                                         size_t redundancy_floor)
 {
+    if (!p) return STM_EINVAL;
+    pthread_rwlock_wrlock(&p->lock);
+    stm_status s = stm_pool_begin_evacuation_locked(p, device_id,
+                                                       redundancy_floor);
+    pthread_rwlock_unlock(&p->lock);
+    return s;
+}
+
+stm_status stm_pool_finish_evacuation_locked(stm_pool *p, uint16_t device_id)
+{
+    /* Caller MUST hold pool's exclusive lock. */
     if (!p) return STM_EINVAL;
     if (p->read_only) return STM_EROFS;
     if ((size_t)device_id >= p->device_count) return STM_EINVAL;
@@ -528,4 +603,13 @@ stm_status stm_pool_finish_evacuation(stm_pool *p, uint16_t device_id)
     slot->bdev  = NULL;
     p->roster_hash = hash_of_devs(p->devices, p->device_count);
     return STM_OK;
+}
+
+stm_status stm_pool_finish_evacuation(stm_pool *p, uint16_t device_id)
+{
+    if (!p) return STM_EINVAL;
+    pthread_rwlock_wrlock(&p->lock);
+    stm_status s = stm_pool_finish_evacuation_locked(p, device_id);
+    pthread_rwlock_unlock(&p->lock);
+    return s;
 }

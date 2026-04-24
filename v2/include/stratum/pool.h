@@ -201,19 +201,54 @@ uint64_t stm_pool_roster_hash_of_bytes(
     const uint8_t in[STM_POOL_ROSTER_BYTES]);
 
 /* ========================================================================= */
+/* Per-pool lock (P5-4b-ii-β — R16 F4 discharge).                            */
+/*                                                                             */
+/* Internally, `stm_pool` carries a pthread_rwlock_t protecting the roster  */
+/* (`devices[]`, `device_count`, `roster_hash`, per-slot `state`/`bdev`).   */
+/* Mutating operations (add_device / remove_device / begin_evacuation /    */
+/* finish_evacuation) acquire the exclusive side internally.                */
+/*                                                                             */
+/* Multi-field readers that need snapshot consistency across several pool  */
+/* accesses (sync_commit's roster iteration, sync_reserve_mirror's device  */
+/* selection loop, sync_evacuation_step's target + survivor lookups) take  */
+/* the shared side via these APIs. Single-field readers (device_count,    */
+/* roster_hash, live_device_count, uuid) are safe without external locking */
+/* — their reads are atomic at the field level.                            */
+/*                                                                             */
+/* Lock order (global): POOL OUTER, SYNC INNER. Callers holding sync's     */
+/* internal mutex MUST NOT acquire pool's lock; pool's lock is always      */
+/* acquired first. Ordering reversal → deadlock.                           */
+/*                                                                             */
+/* Readers nest (multiple concurrent shared holders OK). Writers are       */
+/* exclusive. A writer blocks until every shared holder releases; a        */
+/* shared-lock request blocks if a writer is waiting — POSIX's writer-     */
+/* preference variant avoids writer starvation.                             */
+/*                                                                             */
+/* The pool mutators do NOT require the caller to pre-lock; they manage    */
+/* the exclusive side internally. Callers composing a shared-read with a   */
+/* mutation (e.g., "check device count, then remove") must release the     */
+/* shared lock BEFORE the mutator call, since recursive write-after-read   */
+/* is UB under POSIX rwlocks.                                               */
+/* ========================================================================= */
+
+void stm_pool_lock_shared(stm_pool *p);
+void stm_pool_unlock_shared(stm_pool *p);
+void stm_pool_lock_exclusive(stm_pool *p);
+void stm_pool_unlock_exclusive(stm_pool *p);
+
+/* ========================================================================= */
 /* Device lifecycle (Phase 5 chunk P5-4).                                     */
 /*                                                                             */
 /* See docs/ARCHITECTURE.md §4.7.1 (add), §4.7.2 (remove), §4.7.3 (replace). */
-/* Formal model: v2/specs/device_lifecycle.tla.                               */
+/* Formal model: v2/specs/device_lifecycle.tla + evac.tla.                    */
 /*                                                                             */
-/* Serialization contract (P5-4a MVP): the caller MUST serialize device-     */
-/* lifecycle calls with respect to any concurrent sync_commit on the same   */
-/* pool. Sync-side calls iterate the pool's device array on every commit;   */
-/* a concurrent mutation interleaves unsafely. Use an external lock, or     */
-/* add-before-sync-create.                                                   */
-/*                                                                             */
-/* A per-pool internal lock that sync also holds is deferred to P5-4b —     */
-/* requires a wider sync refactor to acquire the pool lock around commits. */
+/* Serialization (P5-4b-ii-β, R16 F4 discharge): the per-pool rwlock above   */
+/* serializes mutators against concurrent sync_commit / reserve_mirror /    */
+/* mirror_write / mirror_read / evacuation_step. Callers no longer need     */
+/* external synchronization — the lock enforces it internally. sync holds  */
+/* the SHARED side across its pool-iterating critical sections; each       */
+/* mutator takes the EXCLUSIVE side for the duration of the state           */
+/* transition. Lock order: POOL OUTER, SYNC INNER.                         */
 /* ========================================================================= */
 
 /*
@@ -250,18 +285,14 @@ uint64_t stm_pool_roster_hash_of_bytes(
  * attach a fresh stm_alloc for this device via stm_sync_attach_alloc
  * before the next commit that targets it for mirror reservations.
  *
- * **Caller-serialization contract (R16 F4 — strengthened):** the
- * caller MUST guarantee no concurrent `stm_sync_commit` on this
- * pool runs during `stm_pool_add_device`'s duration. Sync's commit
- * reads `device_count`, encodes the roster, and reads `roster_hash`
- * across multiple calls; an interleaving `add_device` leaves the
- * UB with `ub_device_count` disagreeing with `ub_roster` or
- * `ub_roster_hash`, which remount rejects as STM_ECORRUPT and
- * wedges the pool. There is currently NO internal lock enforcing
- * this — a per-pool lock that sync also holds is P5-4b work.
- * Enforce externally: call add_device on the same thread that owns
- * sync, BEFORE sync_create, or BETWEEN sync_commit calls under an
- * application-level lock.
+ * **Serialization (P5-4b-ii-β)**: the pool's internal rwlock
+ * enforces mutual exclusion against concurrent `stm_sync_commit` /
+ * `stm_sync_reserve_mirror` / `stm_sync_mirror_write` /
+ * `stm_sync_mirror_read` / `stm_sync_evacuation_step`. The caller
+ * no longer needs to externally coordinate. The exclusive lock is
+ * taken for the duration of this call — a concurrent sync-commit
+ * will either complete fully before this mutator runs, or start
+ * fully after it returns.
  *
  * **Burned-UUID tracking (R16 F3 — P5-4b precondition):** this
  * function's UUID uniqueness walk covers only the LIVE roster.
@@ -310,9 +341,9 @@ stm_status stm_pool_add_device(stm_pool *p, const stm_pool_device *new_device);
  * slots persist in the roster). `live_device_count` decremented.
  * `roster_hash` advances.
  *
- * Caller-serialization contract (same as `stm_pool_add_device`):
- * serialize against concurrent sync_commit externally. Internal
- * per-pool lock lands in P5-4b-ii.
+ * Serialization (P5-4b-ii-β): same as `stm_pool_add_device` — the
+ * pool's internal rwlock serializes against concurrent sync-side
+ * readers. No external synchronization needed.
  *
  * RO pools: returns STM_EROFS.
  *
@@ -371,6 +402,35 @@ stm_status stm_pool_begin_evacuation(stm_pool *p, uint16_t device_id,
  */
 STM_MUST_USE
 stm_status stm_pool_finish_evacuation(stm_pool *p, uint16_t device_id);
+
+/* ========================================================================= */
+/* _locked variants for sync-layer safe wrappers.                            */
+/*                                                                             */
+/* These perform the same state transition as the public functions above     */
+/* but ASSUME the caller already holds pool's exclusive lock. Sync's safe   */
+/* wrappers (stm_sync_remove_device, stm_sync_finish_evacuation) use these */
+/* so they can compose pool.wrlock + sync.lock into one atomic critical   */
+/* section — letting the drain check and the state transition happen      */
+/* without a racy unlock-reacquire in between.                              */
+/*                                                                             */
+/* Calling a _locked variant without holding the exclusive lock is UB      */
+/* (data races against concurrent readers).                                 */
+/* ========================================================================= */
+
+STM_MUST_USE
+stm_status stm_pool_add_device_locked(stm_pool *p,
+                                         const stm_pool_device *new_device);
+
+STM_MUST_USE
+stm_status stm_pool_remove_device_locked(stm_pool *p, uint16_t device_id,
+                                             size_t redundancy_floor);
+
+STM_MUST_USE
+stm_status stm_pool_begin_evacuation_locked(stm_pool *p, uint16_t device_id,
+                                                size_t redundancy_floor);
+
+STM_MUST_USE
+stm_status stm_pool_finish_evacuation_locked(stm_pool *p, uint16_t device_id);
 
 #ifdef __cplusplus
 }

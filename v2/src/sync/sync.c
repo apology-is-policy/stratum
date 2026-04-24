@@ -1395,12 +1395,18 @@ stm_status stm_sync_commit(stm_sync *s)
 {
     if (!s) return STM_EINVAL;
 
+    /* P5-4b-ii-β: pool lock OUTER, sync lock INNER. Held across the
+     * whole commit because sync_commit iterates the pool's device
+     * array multiple times (roster encode, per-device UB write,
+     * per-device alloc commit). Concurrent add/remove would observe
+     * a torn iteration. */
+    stm_pool_lock_shared(s->pool);
     pthread_mutex_lock(&s->lock);
 
     /* R15 F5 P2: runtime guards. Same rule as reserve_mirror /
      * mirror_write — refuse mutating commit on RO or wedged. */
-    if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
-    if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS; }
+    if (s->wedged)    { pthread_mutex_unlock(&s->lock); stm_pool_unlock_shared(s->pool); return STM_EWEDGED; }
+    if (s->read_only) { pthread_mutex_unlock(&s->lock); stm_pool_unlock_shared(s->pool); return STM_EROFS; }
 
     /* P5-2 commit protocol (quorum.tla):
      *
@@ -1422,7 +1428,7 @@ stm_status stm_sync_commit(stm_sync *s)
      * past UINT64_MAX. 2^64 commits is astronomically unreachable. */
     uint64_t target_gen = s->current_gen;
     if (target_gen >= UINT64_MAX - 2) {
-        pthread_mutex_unlock(&s->lock);
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return STM_ERANGE;
     }
 
@@ -1436,7 +1442,7 @@ stm_status stm_sync_commit(stm_sync *s)
         stm_alloc_stats astats_res;
         stm_status gs = stm_alloc_stats_get(s->alloc, &astats_res);
         if (gs != STM_OK) {
-            pthread_mutex_unlock(&s->lock);
+            pthread_mutex_unlock(&s->lock);            stm_pool_unlock_shared(s->pool);
             return gs;
         }
         stm_uberblock res_prototype;
@@ -1455,7 +1461,7 @@ stm_status stm_sync_commit(stm_sync *s)
         stm_status rw = write_ub_to_all_devices(s, &res_prototype,
                                                     res_label, res_slot);
         if (rw != STM_OK) {
-            pthread_mutex_unlock(&s->lock);
+            pthread_mutex_unlock(&s->lock);            stm_pool_unlock_shared(s->pool);
             return rw;
         }
     }
@@ -1469,7 +1475,7 @@ stm_status stm_sync_commit(stm_sync *s)
     stm_status kcs = stm_keyschema_commit(s->keyschema, target_gen,
                                             &ks_root_paddr, ks_root_csum);
     if (kcs != STM_OK) {
-        pthread_mutex_unlock(&s->lock);
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return kcs;
     }
 
@@ -1498,20 +1504,20 @@ stm_status stm_sync_commit(stm_sync *s)
         if (di && di->state == STM_DEV_STATE_REMOVED) continue;
         stm_status s_alloc = stm_alloc_commit(ai, target_gen);
         if (s_alloc != STM_OK) {
-            pthread_mutex_unlock(&s->lock);
+            pthread_mutex_unlock(&s->lock);            stm_pool_unlock_shared(s->pool);
             return s_alloc;
         }
         uint64_t ti_paddr = 0;
         uint8_t  ti_csum[32];
         stm_status gs = stm_alloc_get_tree_root(ai, &ti_paddr, ti_csum);
         if (gs != STM_OK) {
-            pthread_mutex_unlock(&s->lock);
+            pthread_mutex_unlock(&s->lock);            stm_pool_unlock_shared(s->pool);
             return gs;
         }
         uint64_t ti_gen = 0;
         gs = stm_alloc_get_tree_gen(ai, &ti_gen);
         if (gs != STM_OK) {
-            pthread_mutex_unlock(&s->lock);
+            pthread_mutex_unlock(&s->lock);            stm_pool_unlock_shared(s->pool);
             return gs;
         }
         /* roots.set is a no-op when the entire (paddr, csum, gen)
@@ -1521,7 +1527,7 @@ stm_status stm_sync_commit(stm_sync *s)
         stm_status rs = stm_alloc_roots_set(s->roots, dev,
                                                ti_paddr, ti_csum, ti_gen);
         if (rs != STM_OK) {
-            pthread_mutex_unlock(&s->lock);
+            pthread_mutex_unlock(&s->lock);            stm_pool_unlock_shared(s->pool);
             return rs;
         }
     }
@@ -1533,7 +1539,7 @@ stm_status stm_sync_commit(stm_sync *s)
     stm_status rc = stm_alloc_roots_commit(s->roots, target_gen,
                                               &roots_paddr, roots_csum);
     if (rc != STM_OK) {
-        pthread_mutex_unlock(&s->lock);
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return rc;
     }
     /* Gen at which the roots object was encrypted. May differ from
@@ -1542,14 +1548,14 @@ stm_status stm_sync_commit(stm_sync *s)
     uint64_t roots_gen = 0;
     rc = stm_alloc_roots_get_gen(s->roots, &roots_gen);
     if (rc != STM_OK) {
-        pthread_mutex_unlock(&s->lock);
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return rc;
     }
 
     stm_alloc_stats astats;
     stm_status sr = stm_alloc_stats_get(s->alloc, &astats);
     if (sr != STM_OK) {
-        pthread_mutex_unlock(&s->lock);
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return sr;
     }
 
@@ -1568,7 +1574,7 @@ stm_status stm_sync_commit(stm_sync *s)
                                           s->merkle_salt,
                                           new_merkle_root);
     if (ms != STM_OK) {
-        pthread_mutex_unlock(&s->lock);
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return ms;
     }
 
@@ -1585,7 +1591,7 @@ stm_status stm_sync_commit(stm_sync *s)
     stm_status fw = write_ub_to_all_devices(s, &fin_prototype,
                                                 fin_label, fin_slot);
     if (fw != STM_OK) {
-        pthread_mutex_unlock(&s->lock);
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return fw;
     }
 
@@ -1605,7 +1611,7 @@ stm_status stm_sync_commit(stm_sync *s)
     memcpy(s->keyschema_root_csum, ks_root_csum,   32);
     memcpy(s->merkle_root,         new_merkle_root, 32);
 
-    pthread_mutex_unlock(&s->lock);
+    pthread_mutex_unlock(&s->lock);    stm_pool_unlock_shared(s->pool);
     return STM_OK;
 }
 
@@ -1656,30 +1662,37 @@ stm_status stm_sync_attach_alloc(stm_sync *s, uint16_t device_id,
     if (device_id >= STM_POOL_DEVICES_MAX) return STM_EINVAL;
     if (device_id >= stm_pool_device_count(s->pool)) return STM_EINVAL;
 
-    /* P5-4b-i: REMOVED slots cannot accept an alloc — they have no
-     * bdev and will be evacuated in P5-4b-ii. Refuse at the pool's
-     * boundary so no code path builds up stale crypt ctx / roots
-     * entries for a removed device. */
-    const stm_pool_device *di_check = stm_pool_device_info(s->pool, device_id);
-    if (!di_check || di_check->state == STM_DEV_STATE_REMOVED)
-        return STM_EINVAL;
-
-    /* Cross-check: the attached alloc's device_id must match. */
+    /* Cross-check: the attached alloc's device_id must match.
+     * Alloc-side read; does not need the pool lock. */
     uint16_t alloc_dev = 0;
     stm_status gs = stm_alloc_get_device_id(alloc, &alloc_dev);
     if (gs != STM_OK) return gs;
     if (alloc_dev != device_id) return STM_EINVAL;
 
+    /* P5-4b-ii-β: pool OUTER, sync INNER. Pool read (state check) and
+     * sync write (allocs[] install) are one atomic region. */
+    stm_pool_lock_shared(s->pool);
     pthread_mutex_lock(&s->lock);
-    if (s->allocs[device_id] != NULL) {
+
+    /* P5-4b-i: REMOVED slots cannot accept an alloc — they have no
+     * bdev and will be evacuated in P5-4b-ii. Refuse at the pool's
+     * boundary so no code path builds up stale crypt ctx / roots
+     * entries for a removed device. */
+    const stm_pool_device *di_check = stm_pool_device_info(s->pool, device_id);
+    if (!di_check || di_check->state == STM_DEV_STATE_REMOVED) {
         pthread_mutex_unlock(&s->lock);
+        stm_pool_unlock_shared(s->pool);
+        return STM_EINVAL;
+    }
+    if (s->allocs[device_id] != NULL) {
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return STM_EEXIST;
     }
     /* Defense against double-attach: check no other slot already holds
      * this handle. Would silently duplicate ownership otherwise. */
     for (size_t i = 0; i < STM_POOL_DEVICES_MAX; i++) {
         if (s->allocs[i] == alloc) {
-            pthread_mutex_unlock(&s->lock);
+            pthread_mutex_unlock(&s->lock);            stm_pool_unlock_shared(s->pool);
             return STM_EEXIST;
         }
     }
@@ -1694,7 +1707,7 @@ stm_status stm_sync_attach_alloc(stm_sync *s, uint16_t device_id,
     if (!di) {
         s->allocs[device_id] = NULL;
         s->n_attached--;
-        pthread_mutex_unlock(&s->lock);
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return STM_EINVAL;
     }
     stm_status cs = stm_alloc_set_crypt_ctx(alloc, s->metadata_key,
@@ -1702,7 +1715,7 @@ stm_status stm_sync_attach_alloc(stm_sync *s, uint16_t device_id,
     if (cs != STM_OK) {
         s->allocs[device_id] = NULL;
         s->n_attached--;
-        pthread_mutex_unlock(&s->lock);
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return cs;
     }
 
@@ -1732,18 +1745,18 @@ stm_status stm_sync_attach_alloc(stm_sync *s, uint16_t device_id,
             if (ls != STM_OK) {
                 s->allocs[device_id] = NULL;
                 s->n_attached--;
-                pthread_mutex_unlock(&s->lock);
+                pthread_mutex_unlock(&s->lock);                stm_pool_unlock_shared(s->pool);
                 return ls;
             }
         } else if (roots_gs != STM_ENOENT) {
             s->allocs[device_id] = NULL;
             s->n_attached--;
-            pthread_mutex_unlock(&s->lock);
+            pthread_mutex_unlock(&s->lock);            stm_pool_unlock_shared(s->pool);
             return roots_gs;
         }
     }
 
-    pthread_mutex_unlock(&s->lock);
+    pthread_mutex_unlock(&s->lock);    stm_pool_unlock_shared(s->pool);
     return STM_OK;
 }
 
@@ -1755,21 +1768,23 @@ stm_status stm_sync_reserve_mirror(stm_sync *s, uint64_t nblocks,
     if (nblocks == 0) return STM_EINVAL;
     if (n_replicas == 0 || n_replicas > STM_POOL_DEVICES_MAX) return STM_EINVAL;
 
+    /* P5-4b-ii-β: pool OUTER (we iterate devices). */
+    stm_pool_lock_shared(s->pool);
     pthread_mutex_lock(&s->lock);
 
     /* R15 F5 P2: runtime guards. RO pools refuse mutating ops up-
      * front. Wedged pools refuse everything to preserve post-mortem
      * state. */
-    if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
-    if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS; }
+    if (s->wedged)    { pthread_mutex_unlock(&s->lock); stm_pool_unlock_shared(s->pool); return STM_EWEDGED; }
+    if (s->read_only) { pthread_mutex_unlock(&s->lock); stm_pool_unlock_shared(s->pool); return STM_EROFS; }
 
     /* Profile must match requested replica count. */
     if (s->redundancy.kind != STM_RED_MIRROR) {
-        pthread_mutex_unlock(&s->lock);
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return STM_EINVAL;
     }
     if ((size_t)s->redundancy.mirror_n != n_replicas) {
-        pthread_mutex_unlock(&s->lock);
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return STM_EINVAL;
     }
 
@@ -1796,7 +1811,7 @@ stm_status stm_sync_reserve_mirror(stm_sync *s, uint64_t nblocks,
         targets[targets_n++] = (uint16_t)i;
     }
     if (targets_n < n_replicas) {
-        pthread_mutex_unlock(&s->lock);
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return STM_EINVAL;
     }
 
@@ -1833,11 +1848,11 @@ stm_status stm_sync_reserve_mirror(stm_sync *s, uint64_t nblocks,
             (void)stm_alloc_free(s->allocs[targets[i]], out_paddrs[i], s->auth_gen);
             out_paddrs[i] = 0;
         }
-        pthread_mutex_unlock(&s->lock);
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return last_err;
     }
 
-    pthread_mutex_unlock(&s->lock);
+    pthread_mutex_unlock(&s->lock);    stm_pool_unlock_shared(s->pool);
     return STM_OK;
 }
 
@@ -1858,11 +1873,15 @@ stm_status stm_sync_mirror_write(stm_sync *s, const uint64_t paddrs[],
      * the stm_paddr_offset -> byte-offset conversion. */
     if (len == 0 || (len % STM_UB_SIZE) != 0) return STM_EINVAL;
 
+    /* P5-4b-ii-β: pool OUTER (per-paddr device_bdev reads). Held across
+     * the I/O so the target bdev pointer doesn't get invalidated by a
+     * concurrent finish_evacuation mid-write. */
+    stm_pool_lock_shared(s->pool);
     pthread_mutex_lock(&s->lock);
 
     /* R15 F5 P2: runtime guards — same pattern as reserve_mirror. */
-    if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
-    if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS; }
+    if (s->wedged)    { pthread_mutex_unlock(&s->lock); stm_pool_unlock_shared(s->pool); return STM_EWEDGED; }
+    if (s->read_only) { pthread_mutex_unlock(&s->lock); stm_pool_unlock_shared(s->pool); return STM_EROFS; }
 
     size_t confirmed = 0;
     stm_status last_err = STM_OK;
@@ -1880,7 +1899,7 @@ stm_status stm_sync_mirror_write(stm_sync *s, const uint64_t paddrs[],
     }
     if (out_n_confirmed) *out_n_confirmed = confirmed;
 
-    pthread_mutex_unlock(&s->lock);
+    pthread_mutex_unlock(&s->lock);    stm_pool_unlock_shared(s->pool);
 
     if (confirmed >= mirror_quorum(n)) return STM_OK;
     /* Sub-quorum: surface STM_EQUORUM (new P5-2 status code for
@@ -1898,13 +1917,15 @@ stm_status stm_sync_mirror_read(stm_sync *s, const uint64_t paddrs[],
     if (n == 0 || n > STM_POOL_DEVICES_MAX) return STM_EINVAL;
     if (len == 0 || (len % STM_UB_SIZE) != 0) return STM_EINVAL;
 
+    /* P5-4b-ii-β: pool OUTER for per-paddr device_bdev lookups. */
+    stm_pool_lock_shared(s->pool);
     pthread_mutex_lock(&s->lock);
 
     /* R15 F5 P2: mirror_read is a read-only path — works on RO
      * pools (it's how the RO caller accesses data). Wedged still
      * refuses though: a wedged handle's in-RAM state is no longer
      * trustworthy and the pool device may be mid-inconsistency. */
-    if (s->wedged) { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
+    if (s->wedged) { pthread_mutex_unlock(&s->lock); stm_pool_unlock_shared(s->pool); return STM_EWEDGED; }
 
     /* R15 F7 P3: preserve the FIRST non-OK status across replicas
      * for operator diagnostics. E.g. replica 0 fails with STM_EIO
@@ -1931,14 +1952,14 @@ stm_status stm_sync_mirror_read(stm_sync *s, const uint64_t paddrs[],
         stm_blake3_hash h;
         stm_blake3(buf, len, &h);
         if (memcmp(h.bytes, expected_csum, 32) == 0) {
-            pthread_mutex_unlock(&s->lock);
+            pthread_mutex_unlock(&s->lock);            stm_pool_unlock_shared(s->pool);
             return STM_OK;
         }
         /* csum mismatch: this replica is corrupt / stale; try next. */
         if (first_err == STM_OK) first_err = STM_ECORRUPT;
     }
 
-    pthread_mutex_unlock(&s->lock);
+    pthread_mutex_unlock(&s->lock);    stm_pool_unlock_shared(s->pool);
     /* No replica passed the csum check. */
     return (first_err != STM_OK) ? first_err : STM_ECORRUPT;
 }
@@ -1959,20 +1980,24 @@ stm_status stm_sync_evacuation_step(stm_sync *s, uint16_t target_device_id,
     *out_old_paddr = 0;
     *out_new_paddr = 0;
 
+    /* P5-4b-ii-β: pool OUTER. Target + survivor state reads, per-paddr
+     * bdev lookups, and the alloc-tree migration must all be atomic
+     * w.r.t. concurrent add_device / finish_evacuation. */
+    stm_pool_lock_shared(s->pool);
     pthread_mutex_lock(&s->lock);
 
     /* R15 F5 P2 symmetric: RO/wedged refuses mutation. */
-    if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
-    if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS; }
+    if (s->wedged)    { pthread_mutex_unlock(&s->lock); stm_pool_unlock_shared(s->pool); return STM_EWEDGED; }
+    if (s->read_only) { pthread_mutex_unlock(&s->lock); stm_pool_unlock_shared(s->pool); return STM_EROFS; }
 
     const stm_pool_device *td = stm_pool_device_info(s->pool, target_device_id);
-    if (!td) { pthread_mutex_unlock(&s->lock); return STM_EINVAL; }
+    if (!td) { pthread_mutex_unlock(&s->lock); stm_pool_unlock_shared(s->pool); return STM_EINVAL; }
     /* The target MUST be EVACUATING — set by stm_pool_begin_evacuation.
      * This is the state byte's load-bearing role: it signals reserve_mirror
      * / sync_commit / this step which device is the drain target. Calling
      * evacuation_step on a device that isn't draining is a caller bug. */
     if (td->state != STM_DEV_STATE_EVACUATING) {
-        pthread_mutex_unlock(&s->lock);
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return STM_EINVAL;
     }
 
@@ -1983,7 +2008,7 @@ stm_status stm_sync_evacuation_step(stm_sync *s, uint16_t target_device_id,
      * delegated to the caller, who sees the replica list). */
     const stm_pool_device *sd = stm_pool_device_info(s->pool, survivor_device_id);
     if (!sd || sd->state != STM_DEV_STATE_ONLINE) {
-        pthread_mutex_unlock(&s->lock);
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return STM_EINVAL;
     }
 
@@ -1991,7 +2016,7 @@ stm_status stm_sync_evacuation_step(stm_sync *s, uint16_t target_device_id,
     if (!target_alloc) {
         /* Nothing to drain — target has no attached alloc. Bubble up as
          * "no data" so caller proceeds to finish_evacuation. */
-        pthread_mutex_unlock(&s->lock);
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return STM_ENOENT;
     }
 
@@ -2002,14 +2027,14 @@ stm_status stm_sync_evacuation_step(stm_sync *s, uint16_t target_device_id,
     stm_status fs = stm_alloc_first_allocated(target_alloc,
                                                 &old_paddr, &length_blocks);
     if (fs != STM_OK) {
-        pthread_mutex_unlock(&s->lock);
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return fs;   /* STM_ENOENT = done, STM_ECORRUPT = surface up */
     }
     if (length_blocks == 0) {
         /* Defensive: an entry with length_blocks=0 would imply a
          * corrupt tree value. first_allocated surfaces length from
          * the val blob; a 0 here means the tree has a junk entry. */
-        pthread_mutex_unlock(&s->lock);
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return STM_ECORRUPT;
     }
 
@@ -2024,11 +2049,11 @@ stm_status stm_sync_evacuation_step(stm_sync *s, uint16_t target_device_id,
      * sufficiently large length_blocks × STM_UB_SIZE wraps. */
     static const uint64_t STM_EVAC_STEP_MAX_BYTES = 4u * 1024u * 1024u;
     if (length_blocks > (uint64_t)SIZE_MAX / (uint64_t)STM_UB_SIZE) {
-        pthread_mutex_unlock(&s->lock);
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return STM_ERANGE;
     }
     if (length_blocks > STM_EVAC_STEP_MAX_BYTES / (uint64_t)STM_UB_SIZE) {
-        pthread_mutex_unlock(&s->lock);
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return STM_ENOTSUPPORTED;
     }
 
@@ -2040,20 +2065,20 @@ stm_status stm_sync_evacuation_step(stm_sync *s, uint16_t target_device_id,
      * asserts this atomicity at the block-granularity level. */
     size_t nbytes = (size_t)length_blocks * (size_t)STM_UB_SIZE;
     uint8_t *buf = malloc(nbytes);
-    if (!buf) { pthread_mutex_unlock(&s->lock); return STM_ENOMEM; }
+    if (!buf) { pthread_mutex_unlock(&s->lock); stm_pool_unlock_shared(s->pool); return STM_ENOMEM; }
 
     /* 1) Read from target. */
     stm_bdev *target_bd = stm_pool_device_bdev(s->pool, target_device_id);
-    if (!target_bd) { free(buf); pthread_mutex_unlock(&s->lock); return STM_EINVAL; }
+    if (!target_bd) { free(buf); pthread_mutex_unlock(&s->lock); stm_pool_unlock_shared(s->pool); return STM_EINVAL; }
     uint64_t target_off = stm_paddr_offset(old_paddr) * (uint64_t)STM_UB_SIZE;
     stm_status rs = stm_bdev_read(target_bd, target_off, buf, nbytes);
-    if (rs != STM_OK) { free(buf); pthread_mutex_unlock(&s->lock); return rs; }
+    if (rs != STM_OK) { free(buf); pthread_mutex_unlock(&s->lock); stm_pool_unlock_shared(s->pool); return rs; }
 
     /* 2) Reserve length_blocks on survivor. */
     stm_alloc *surv_alloc = s->allocs[survivor];
     uint64_t new_paddr = 0;
     stm_status res = stm_alloc_reserve(surv_alloc, length_blocks, 0, &new_paddr);
-    if (res != STM_OK) { free(buf); pthread_mutex_unlock(&s->lock); return res; }
+    if (res != STM_OK) { free(buf); pthread_mutex_unlock(&s->lock); stm_pool_unlock_shared(s->pool); return res; }
 
     /* 3) Write to survivor + fsync. We do NOT fan out to all survivors
      * here — evacuation rehomes ONE copy (target's copy → survivor's
@@ -2064,7 +2089,7 @@ stm_status stm_sync_evacuation_step(stm_sync *s, uint16_t target_device_id,
     if (!surv_bd) {
         (void)stm_alloc_free(surv_alloc, new_paddr, s->auth_gen);
         free(buf);
-        pthread_mutex_unlock(&s->lock);
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return STM_EINVAL;
     }
     uint64_t surv_off = stm_paddr_offset(new_paddr) * (uint64_t)STM_UB_SIZE;
@@ -2077,7 +2102,7 @@ stm_status stm_sync_evacuation_step(stm_sync *s, uint16_t target_device_id,
          * than sweep criterion). */
         (void)stm_alloc_free(surv_alloc, new_paddr, s->auth_gen);
         free(buf);
-        pthread_mutex_unlock(&s->lock);
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return ws;
     }
     free(buf);
@@ -2092,14 +2117,14 @@ stm_status stm_sync_evacuation_step(stm_sync *s, uint16_t target_device_id,
          * got this paddr from first_allocated, but defensively roll
          * back the survivor reservation. */
         (void)stm_alloc_free(surv_alloc, new_paddr, s->auth_gen);
-        pthread_mutex_unlock(&s->lock);
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
         return frs;
     }
 
     *out_old_paddr = old_paddr;
     *out_new_paddr = new_paddr;
 
-    pthread_mutex_unlock(&s->lock);
+    pthread_mutex_unlock(&s->lock);    stm_pool_unlock_shared(s->pool);
     return STM_OK;
 }
 
@@ -2107,30 +2132,27 @@ stm_status stm_sync_evacuation_step(stm_sync *s, uint16_t target_device_id,
 /* R17 P1-2 / P2-5: sync-level safe wrappers for device removal.             */
 /* ========================================================================= */
 
-/* Shared drain check: does s->allocs[device_id] still hold ALLOCATED
- * (refcount >= 1) entries? Returns:
+/* Shared drain check: does s->allocs[device_id] hold ALLOCATED
+ * (refcount >= 1) entries? ASSUMES caller holds sync's lock.
+ *
+ * Returns:
  *   STM_OK      — tree drained; safe to remove.
  *   STM_EBUSY   — ≥1 allocated range remains; caller must evacuate.
- *   (other)     — passthrough of alloc_first_allocated's error.
- *
- * Takes the sync lock internally; callers must not already hold it. */
-static stm_status sync_require_drained(stm_sync *s, uint16_t device_id)
+ *   (other)     — passthrough of alloc_first_allocated's error. */
+static stm_status sync_require_drained_locked(stm_sync *s, uint16_t device_id)
 {
     if (device_id >= stm_pool_device_count(s->pool)) return STM_EINVAL;
 
-    pthread_mutex_lock(&s->lock);
     stm_alloc *a = s->allocs[device_id];
     if (!a) {
         /* No alloc attached means no tree at all — trivially drained.
          * Pre-P5-3c this held for N=1 pools; post-P5-3c all devices
          * should have allocs attached pre-commit, so this arm mostly
          * handles the just-begin-evacuated-on-empty-device case. */
-        pthread_mutex_unlock(&s->lock);
         return STM_OK;
     }
     uint64_t probe_paddr = 0, probe_length = 0;
     stm_status fs = stm_alloc_first_allocated(a, &probe_paddr, &probe_length);
-    pthread_mutex_unlock(&s->lock);
 
     if (fs == STM_ENOENT) return STM_OK;       /* drained */
     if (fs == STM_OK)     return STM_EBUSY;    /* still has data */
@@ -2145,40 +2167,53 @@ stm_status stm_sync_remove_device(stm_sync *s, uint16_t device_id,
      * letting the pool primitive mark it REMOVED. Without this, a
      * caller who hasn't evacuated first would silently strip replicas
      * (R17 P1-2). device_id == 0 is rejected by pool_remove_device
-     * itself (R17 P1-1); don't re-check here. */
-    stm_status ds = sync_require_drained(s, device_id);
-    if (ds != STM_OK) return ds;
-    return stm_pool_remove_device(s->pool, device_id, redundancy_floor);
+     * itself (R17 P1-1).
+     *
+     * P5-4b-ii-β: acquire pool.wrlock BEFORE sync.lock (global lock
+     * order). With both held, the drain check and the pool state
+     * transition are atomic w.r.t. any other sync or pool caller —
+     * closes the race where a concurrent sync_reserve_mirror could
+     * install data on the about-to-be-REMOVED slot between check and
+     * transition (R17 lingering concern). */
+    stm_pool_lock_exclusive(s->pool);
+    pthread_mutex_lock(&s->lock);
+
+    stm_status ds = sync_require_drained_locked(s, device_id);
+    stm_status ret = ds;
+    if (ds == STM_OK) {
+        ret = stm_pool_remove_device_locked(s->pool, device_id,
+                                                redundancy_floor);
+    }
+
+    pthread_mutex_unlock(&s->lock);
+    stm_pool_unlock_exclusive(s->pool);
+    return ret;
 }
 
 stm_status stm_sync_finish_evacuation(stm_sync *s, uint16_t device_id)
 {
     if (!s) return STM_EINVAL;
-    /* Same drain check as stm_sync_remove_device, but the pool slot is
-     * EVACUATING rather than ONLINE/FAULTED. The pool primitive would
-     * happily flip the slot to REMOVED without checking drain; we
-     * enforce NoTargetReplicasAfterComplete (evac.tla invariant) at
-     * the sync boundary. On success, detach s->allocs[device_id] so
-     * the next sync_commit's per-device loop (and any concurrent
-     * caller) treats the device as fully gone. */
-    stm_status ds = sync_require_drained(s, device_id);
-    if (ds != STM_OK) return ds;
-
-    stm_status ps = stm_pool_finish_evacuation(s->pool, device_id);
-    if (ps != STM_OK) return ps;
-
-    /* Detach the alloc handle from sync's table. The handle remains
-     * owned by the caller; they're responsible for closing it. We do
-     * NOT null out its bdev or tear down its internal state — that's
-     * the caller's concern when they stm_alloc_close it. */
+    /* Same atomic (pool.wrlock + sync.lock) composition as
+     * stm_sync_remove_device. On success, also detach s->allocs[X]
+     * under the same locks so the next sync_commit's per-device loop
+     * (which holds pool.rdlock) sees a consistent REMOVED slot with
+     * no attached alloc. */
+    stm_pool_lock_exclusive(s->pool);
     pthread_mutex_lock(&s->lock);
-    if (s->allocs[device_id]) {
-        s->allocs[device_id] = NULL;
-        if (s->n_attached > 0) s->n_attached--;
-    }
-    pthread_mutex_unlock(&s->lock);
 
-    return STM_OK;
+    stm_status ds = sync_require_drained_locked(s, device_id);
+    stm_status ret = ds;
+    if (ds == STM_OK) {
+        ret = stm_pool_finish_evacuation_locked(s->pool, device_id);
+        if (ret == STM_OK && s->allocs[device_id]) {
+            s->allocs[device_id] = NULL;
+            if (s->n_attached > 0) s->n_attached--;
+        }
+    }
+
+    pthread_mutex_unlock(&s->lock);
+    stm_pool_unlock_exclusive(s->pool);
+    return ret;
 }
 
 /* ========================================================================= */

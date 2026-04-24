@@ -47,16 +47,22 @@
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS
-    AllDevices,        \* finite universe of device ids
-    Blocks,            \* finite universe of logical block ids
-    MirrorN,           \* replication factor: mirror_n
-    AtomicEvacuation   \* BOOLEAN: TRUE = fixed impl; FALSE = bug demo
+    AllDevices,             \* finite universe of device ids
+    Blocks,                 \* finite universe of logical block ids
+    MirrorN,                \* replication factor: mirror_n
+    AtomicEvacuation,       \* BOOLEAN: TRUE = fixed impl; FALSE = bug demo
+                            \*   (release-before-write models R17 P2-3).
+    DrainCheckOnRemove      \* BOOLEAN: TRUE = R17 P1-2 fix (safe-remove
+                            \*   wrapper enforces drained); FALSE = buggy
+                            \*   (caller removes data-bearing device and
+                            \*   loses replicas silently).
 
 ASSUME /\ AllDevices # {}
        /\ Blocks # {}
        /\ MirrorN \in Nat \ {0}
        /\ Cardinality(AllDevices) >= MirrorN + 1
        /\ AtomicEvacuation \in BOOLEAN
+       /\ DrainCheckOnRemove \in BOOLEAN
 
 (***************************************************************************)
 (* Per-device state (subset of device_lifecycle's DevState for this spec). *)
@@ -165,12 +171,41 @@ CompleteEvacuation(d) ==
     /\ device_state' = [device_state EXCEPT ![d] = "REMOVED"]
     /\ UNCHANGED replicas
 
+\* RemoveDirectly(d): models stm_sync_remove_device / stm_pool_remove_device
+\* on a non-evacuating slot.
+\*
+\* The `DrainCheckOnRemove` CONSTANT toggles the load-bearing
+\* precondition `\A b : d \notin replicas[b]`:
+\*   - TRUE  (fixed impl, R17 P1-2): sync-layer safe wrapper probes
+\*      `stm_alloc_first_allocated` and returns STM_EBUSY if any
+\*      live entries remain. Only devices with empty alloc trees reach
+\*      the pool-layer transition. `EvacuationAtomic` holds.
+\*   - FALSE (buggy impl, pre-R17):  caller invokes `stm_pool_remove_device`
+\*      on a data-bearing slot without evacuating first. Replicas[b]
+\*      for every block on d are silently stripped. TLC finds
+\*      `EvacuationAtomic` VIOLATED at depth 1: Init →
+\*      RemoveDirectly(d1 ∈ replicas[b]) → replicas[b] ∩ Live has
+\*      cardinality MirrorN-1.
+\*
+\* There is no additional "refuse during evac" gate: under the
+\* DrainCheckOnRemove precondition, concurrent remove + evacuation is
+\* SAFE at the spec level (the pool.c P2-2 guard is defense-in-depth
+\* against operator confusion, not a spec obligation).
+RemoveDirectly(d) ==
+    /\ device_state[d] = "ONLINE"
+    /\ IF DrainCheckOnRemove
+       THEN \A b \in Blocks : d \notin replicas[b]
+       ELSE TRUE
+    /\ device_state' = [device_state EXCEPT ![d] = "REMOVED"]
+    /\ UNCHANGED replicas
+
 Next ==
     \/ \E d \in AllDevices : BeginEvacuation(d)
     \/ \E d, s \in AllDevices, b \in Blocks : EvacuateAtomic(d, b, s)
     \/ \E d \in AllDevices, b \in Blocks : ReleaseOnly(d, b)
     \/ \E s \in AllDevices, b \in Blocks : WriteSurvivor(s, b)
     \/ \E d \in AllDevices : CompleteEvacuation(d)
+    \/ \E d \in AllDevices : RemoveDirectly(d)
 
 Spec == Init /\ [][Next]_vars
 
