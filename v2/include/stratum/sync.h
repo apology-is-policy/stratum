@@ -517,19 +517,68 @@ stm_status stm_sync_finish_evacuation(stm_sync *s, uint16_t device_id);
  *   8. stm_sync_finish_evacuation(old)         — EVACUATING → REMOVED.
  *   9. stm_sync_commit                          — persists REMOVED.
  *
- * **Recovery semantics (R19)**:
- * - Failure BEFORE step 3 commit: nothing durable. Retry with the
- *   same or a different `new_device` / `new_alloc`.
- * - Failure AFTER step 3 commit (new device durable) but BEFORE step
- *   5 (EVACUATING durable): retry with the same `new_alloc` is not
- *   directly supported — the wrapper would re-add. Use primitive APIs
- *   (`stm_pool_begin_evacuation` + evacuation_step-loop +
- *   `stm_sync_finish_evacuation`) to finish manually. Alternatively,
- *   call `stm_sync_remove_device(new_slot)` to roll back the add.
- * - Failure AFTER step 5 (old is EVACUATING on disk): **retry is
- *   supported**. Re-invoke with the SAME `old_device_id` and SAME
- *   `new_alloc` (still attached). The wrapper detects the EVACUATING
- *   state + already-attached alloc and resumes from step 6.
+ * **Recovery semantics (R19 + R22)**:
+ * - Failure BEFORE step 1's pool mutation (wedged/RO guards, old not
+ *   ONLINE, etc): nothing durable or in-RAM-mutated. Retry freely.
+ * - Failure AT step 1 (`stm_pool_add_device_locked`): the mutation
+ *   didn't take effect. Retry with the same or different args.
+ * - Failure AT step 2a/2b (set_device_id / attach_alloc): step 1's
+ *   add is rolled back via `replace_rollback_or_wedge`. Retry.
+ * - Failure AT step 3 (first sync_commit): in-RAM roster has new
+ *   slot at ONLINE with new_alloc attached; old_device_id still
+ *   ONLINE; no durable progress.  **R22 resume path**: retry
+ *   with the same `new_device` and `new_alloc` succeeds. The wrapper
+ *   detects the UUID+alloc-identity match and skips steps 1+2a+2b.
+ *   See the "Resume criterion" paragraph below for its semantics.
+ * - Failure AFTER step 3 commit + BEFORE step 5 (EVACUATING durable):
+ *   symmetric to step-3 failure — the wrapper still detects the
+ *   added slot and retries from step 3.
+ * - Failure AFTER step 5 (old is EVACUATING on disk): retry
+ *   supported via the R19 EVACUATING-resume path. Re-invoke with
+ *   same `old_device_id` + same `new_alloc`; the wrapper detects
+ *   EVACUATING + already-attached alloc and resumes from step 6.
+ *
+ * **Resume criterion** (R22 P3-2 / P3-5 — clarifies the "retry with
+ * same args" contract):
+ *
+ * The resume detection checks ONLY (a) UUID match and (b) alloc-
+ * identity match against the attached slot. Other fields in
+ * `new_device` (role, class_, state) and the `old_device_id` /
+ * `redundancy_floor` arguments are NOT compared against the prior
+ * failed call. Concretely:
+ *
+ * - Changing `new_device->role` / `class_` on retry: silently
+ *   ignored (the step-1 add stamped role/class once; they persist
+ *   in the roster and are not re-stamped on resume).
+ * - Changing `old_device_id` on retry: the retry runs steps 4-9
+ *   against the NEW old, not the one the prior failed call named.
+ *   If the user mistypes `old_device_id`, the retry replaces a
+ *   different device than originally intended.
+ * - Changing `redundancy_floor`: used by step 4 (begin_evacuation);
+ *   the retry uses the new value.
+ *
+ * Callers that need strict "retry replays exactly the prior call"
+ * semantics must track their own retry cookie at the admin layer.
+ * The wrapper's contract is: "given a new_alloc already attached
+ * at an ONLINE slot, finish the replace as specified by the
+ * current call's old_device_id + redundancy_floor."
+ *
+ * **Slot-0 refusal (R22 P3-1)**: the resume path refuses to target
+ * slot 0 (the metadata primary). A caller whose `new_device->uuid`
+ * happens to equal device 0's UUID and whose `new_alloc` equals
+ * `s->allocs[0]` cannot use this function to drain data onto the
+ * primary. Returns STM_EEXIST. Symmetric with
+ * `stm_sync_attach_alloc`'s "primary is fixed" rule.
+ *
+ * **Concurrent-caller constraint (R22 P3-3 / P3-4)**: between a
+ * failed step-3 attempt and a retry, concurrent
+ * `stm_pool_begin_evacuation(new_slot)` or
+ * `stm_sync_remove_device(new_slot)` on the newly-added slot can
+ * wedge the retry (EVACUATING-then-REMOVED leaves no valid drain
+ * target). The current impl does NOT defend against this; callers
+ * MUST serialize their replace attempts against pool-structural
+ * mutations on the new slot until this function returns. A future
+ * sync-layer "replace in flight" flag would enforce this internally.
  *
  * **Alloc ownership after OK**: the OLD device's alloc (attached via
  * `stm_sync_attach_alloc` before this call) is detached on success

@@ -2454,6 +2454,16 @@ stm_status stm_sync_replace_device_online(
 
     uint16_t new_slot;
     if (resume_slot != UINT16_MAX) {
+        /* R22 P3-1: slot 0 is the metadata-primary and `stm_sync_attach_alloc`
+         * explicitly refuses `device_id == 0` ("primary is fixed"). The
+         * resume path bypasses attach_alloc, so without this check a caller
+         * passing `new_device.uuid == device-0's uuid` + `new_alloc ==
+         * s->allocs[0]` would drain their old_device onto the metadata
+         * primary — a semantic violation of the primary's fixed identity.
+         * Refuse cleanly here; UUID-already-in-roster on the primary is a
+         * genuine conflict with the primary's tombstoned claim. */
+        if (resume_slot == 0) return STM_EEXIST;
+
         /* UUID found at ONLINE slot. Validate alloc-identity match. */
         pthread_mutex_lock(&s->lock);
         bool alloc_matches = (s->allocs[resume_slot] == new_alloc);

@@ -2196,6 +2196,133 @@ STM_TEST(sync_multi_replace_resumes_after_step3_commit_failure) {
     teardown_mirror_pool(bds, as, pool, s);
 }
 
+/* R22 (P5-7) regression: two consecutive step-3 failures followed by
+ * a successful third attempt. Covers the "multi-retry works" claim
+ * that the idempotent-commit short-circuits (R7c P2-5 alloc +
+ * R14b P2-1 keyschema + alloc_roots idempotency) hold across
+ * repeated resume attempts. */
+STM_TEST(sync_multi_replace_multi_retry_converges) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "replace_multi_retry", bds, as, &pool, &s);
+
+    uint64_t paddrs[2] = {0};
+    STM_ASSERT_OK(stm_sync_reserve_mirror(s, 1u, 2u, paddrs));
+    uint8_t payload[STM_UB_SIZE];
+    for (size_t i = 0; i < sizeof payload; i++)
+        payload[i] = (uint8_t)((i ^ 0xd7) & 0xff);
+    size_t n_conf = 0;
+    STM_ASSERT_OK(stm_sync_mirror_write(s, paddrs, 2u, payload,
+                                           sizeof payload, &n_conf));
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    char path4[256];
+    snprintf(path4, sizeof path4,
+             "/tmp/stm_v2_sync_multi_replace_multi_retry_%d_3.bin",
+             (int)getpid());
+    unlink(path4);
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    stm_bdev *bd4 = NULL;
+    STM_ASSERT_OK(stm_bdev_open(path4, &bo, &bd4));
+    STM_ASSERT_OK(stm_bdev_resize(bd4, TEST_DEVICE_BYTES));
+    uint64_t uuid4[2] = { 0x7e57edULL, DEV_UUID_HI };
+    stm_alloc *a4 = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bd4, POOL_UUID, uuid4,
+                                      TEST_BOOTSTRAP_BYTES, &a4));
+
+    stm_pool_device new_dev = {
+        .uuid   = { uuid4[0], uuid4[1] },
+        .role   = STM_DEV_ROLE_DATA,
+        .class_ = STM_DEV_CLASS_SSD,
+        .state  = STM_DEV_STATE_ONLINE,
+        .bdev   = bd4,
+    };
+
+    /* First attempt: fail step 3 quorum via 2-device inject. */
+    stm_bdev_inject_fail_after(bd4, 1);
+    stm_bdev_inject_fail_after(bds[2], 1);
+    uint16_t slot = UINT16_MAX;
+    STM_ASSERT_NE((int)stm_sync_replace_device_online(
+        s, /*old=*/1, &new_dev, a4, /*floor=*/2, &slot), (int)STM_OK);
+
+    /* Partial state confirmed. */
+    const stm_pool_device *probe = stm_pool_device_info(pool, 3);
+    STM_ASSERT(probe != NULL);
+    STM_ASSERT_EQ((int)probe->state, (int)STM_DEV_STATE_ONLINE);
+
+    /* Second attempt: also fail via another 2-device inject. This
+     * exercises the resume path running + failing AGAIN without
+     * corrupting in-RAM state. */
+    stm_bdev_inject_fail_after(bd4, 1);
+    stm_bdev_inject_fail_after(bds[2], 1);
+    STM_ASSERT_NE((int)stm_sync_replace_device_online(
+        s, /*old=*/1, &new_dev, a4, /*floor=*/2, &slot), (int)STM_OK);
+
+    probe = stm_pool_device_info(pool, 3);
+    STM_ASSERT(probe != NULL);
+    STM_ASSERT_EQ((int)probe->state, (int)STM_DEV_STATE_ONLINE);
+    probe = stm_pool_device_info(pool, 1);
+    STM_ASSERT(probe != NULL);
+    STM_ASSERT_EQ((int)probe->state, (int)STM_DEV_STATE_ONLINE);
+
+    /* Third attempt: no inject → resume path drives the replace to
+     * completion. Idempotent commits write byte-identical UBs. */
+    STM_ASSERT_OK(stm_sync_replace_device_online(
+        s, /*old=*/1, &new_dev, a4, /*floor=*/2, &slot));
+    STM_ASSERT_EQ(slot, 3u);
+
+    STM_ASSERT_EQ(stm_pool_live_device_count(pool), 3u);
+    probe = stm_pool_device_info(pool, 1);
+    STM_ASSERT(probe != NULL);
+    STM_ASSERT_EQ((int)probe->state, (int)STM_DEV_STATE_REMOVED);
+
+    stm_alloc_close(a4);
+    stm_bdev_close(bd4);
+    unlink(path4);
+    teardown_mirror_pool(bds, as, pool, s);
+}
+
+/* R22 (P5-7) P3-1 regression: resume refuses to target slot 0 (the
+ * metadata primary), matching stm_sync_attach_alloc's "primary is
+ * fixed" rule. Without this guard a caller whose new_device.uuid
+ * happens to equal device 0's UUID could drain data onto the
+ * primary, violating the fixed-primary invariant. */
+STM_TEST(sync_multi_replace_refuses_resume_into_slot_zero) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "replace_resume_slot0", bds, as, &pool, &s);
+
+    /* Construct a fake new_device struct whose UUID coincides with
+     * device 0's. Pair with as[0] (the primary alloc) to satisfy
+     * alloc-identity + belt checks — every condition except the new
+     * slot-0 refusal passes. */
+    stm_pool_device fake_new = {
+        .uuid   = { DEV_UUID_LO[0], DEV_UUID_HI },   /* = dev 0's uuid */
+        .role   = STM_DEV_ROLE_DATA,
+        .class_ = STM_DEV_CLASS_SSD,
+        .state  = STM_DEV_STATE_ONLINE,
+        .bdev   = bds[0],                             /* any non-NULL bdev */
+    };
+
+    uint16_t slot = UINT16_MAX;
+    /* The direct call would hit old_device_id=1's path, find
+     * new_device.uuid at slot 0 (ONLINE, primary), alloc-identity
+     * matches (as[0]), and would slip through to goto added_ready
+     * without the guard. With the P3-1 guard, the slot-0 refusal
+     * fires and returns STM_EEXIST. */
+    STM_ASSERT_ERR(stm_sync_replace_device_online(
+        s, /*old=*/1, &fake_new, as[0], /*floor=*/2, &slot),
+        STM_EEXIST);
+
+    /* Pool state unchanged. */
+    STM_ASSERT_EQ(stm_pool_live_device_count(pool), 3u);
+    STM_ASSERT_EQ(stm_pool_device_count(pool), 3u);
+
+    teardown_mirror_pool(bds, as, pool, s);
+}
+
 /* R22 (P5-6 P2-1) negative regression: same-UUID-but-different-alloc
  * is a genuine conflict, not a resume. The resume path MUST NOT
  * accept a caller that passes the same new_device.uuid but a fresh
