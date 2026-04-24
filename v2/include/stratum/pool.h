@@ -211,9 +211,20 @@ uint64_t stm_pool_roster_hash_of_bytes(
 /* Multi-field readers that need snapshot consistency across several pool  */
 /* accesses (sync_commit's roster iteration, sync_reserve_mirror's device  */
 /* selection loop, sync_evacuation_step's target + survivor lookups) take  */
-/* the shared side via these APIs. Single-field readers (device_count,    */
-/* roster_hash, live_device_count, uuid) are safe without external locking */
-/* — their reads are atomic at the field level.                            */
+/* the shared side via these APIs.                                         */
+/*                                                                             */
+/* Pointer-returning readers (`stm_pool_device_bdev`, `stm_pool_device_info`) */
+/* require the caller to hold pool.rdlock while dereferencing the returned */
+/* pointer — concurrent `stm_pool_finish_evacuation` (exclusive) writes      */
+/* `slot->bdev = NULL` and `slot->state = REMOVED`. A lock-less read that   */
+/* races with that write sees tearing.                                      */
+/*                                                                             */
+/* Scalar-returning readers (`stm_pool_device_count`, `stm_pool_roster_hash`,*/
+/* `stm_pool_live_device_count`) are practically safe without external      */
+/* locking on aligned 64-bit loads/stores (x86-64, aarch64). Under C11       */
+/* they are still formally a data race; call them inside the shared lock   */
+/* when composing with other pool reads, OR use them only from a thread    */
+/* that is the sole pool-mutation caller. TSan may flag them — R18 P2-3.   */
 /*                                                                             */
 /* Lock order (global): POOL OUTER, SYNC INNER. Callers holding sync's     */
 /* internal mutex MUST NOT acquire pool's lock; pool's lock is always      */
@@ -314,44 +325,59 @@ STM_MUST_USE
 stm_status stm_pool_add_device(stm_pool *p, const stm_pool_device *new_device);
 
 /*
- * Mark device `device_id` as REMOVED (ARCH §4.7.2). P5-4b-i is the
- * "metadata half" of remove — it transitions the roster slot to
- * REMOVED, clears its `bdev` pointer, and preserves the UUID so
- * subsequent `stm_pool_add_device` walks refuse to re-add it
- * (burned-UUID; R16 F3).
+ * Mark device `device_id` as REMOVED (ARCH §4.7.2). Transitions the
+ * roster slot to REMOVED, clears its `bdev` pointer, and preserves
+ * the UUID so subsequent `stm_pool_add_device` walks refuse to
+ * re-add it (burned-UUID; R16 F3).
  *
- * Evacuation of allocated blocks (the "data half" — reading the
- * target device's content and mirror-writing to remaining devices)
- * is P5-4b-ii scope. Today this function enforces that ONLY a
- * device with NO allocated data may be removed. The caller's
- * alloc-layer contract: verify the device's alloc tree is empty
- * before calling this, or get STM_EINVAL / STM_EBUSY (future).
+ * **WARNING — pool-level primitive; bypasses drain check (R18 P1-1).**
+ * This function does NOT inspect the device's alloc tree. If the
+ * device still holds allocated data when this call lands, every
+ * block replicated on it is silently stripped from the pool's
+ * replica set — violating evac.tla's NoTargetReplicasAfterComplete
+ * and reproducing the bug demonstrated by
+ * `v2/specs/evac_remove_no_drain_buggy.cfg`.
+ *
+ * Callers with an attached `stm_sync` MUST use
+ * `stm_sync_remove_device` instead. That wrapper probes
+ * `stm_alloc_first_allocated` on the target and returns STM_EBUSY
+ * if any live entries remain. The direct entry point below exists
+ * for tests and for pool-only tooling that has no alloc state.
  *
  * Preconditions:
+ *   - device_id != 0 (metadata primary; R17 P1-1 — returns
+ *     STM_ENOTSUPPORTED).
  *   - device_id < stm_pool_device_count(p).
  *   - Slot state is ONLINE or FAULTED (already REMOVED → EINVAL).
+ *     EVACUATING → EINVAL (must go through finish_evacuation).
+ *   - No OTHER slot is EVACUATING (R17 P2-2 guard — returns
+ *     STM_EBUSY; prevents live-count accounting hazard).
  *   - `stm_pool_live_device_count(p) - 1 >= redundancy_floor`
- *     (spec's RedundancyPreservedOnRemove invariant). Caller
- *     supplies the floor from the sync handle's redundancy
- *     profile — typically `profile.mirror_n` for MIRROR, 1 for
- *     NONE. Mismatch → STM_EINVAL.
+ *     (evac.tla RedundancyPreservedOnRemove). Caller supplies
+ *     the floor from the sync handle's redundancy profile —
+ *     typically `profile.mirror_n` for MIRROR, 1 for NONE.
  *
  * Post-condition: slot at `device_id` has state=REMOVED,
  * bdev=NULL, UUID preserved. `device_count` UNCHANGED (REMOVED
  * slots persist in the roster). `live_device_count` decremented.
  * `roster_hash` advances.
  *
- * Serialization (P5-4b-ii-β): same as `stm_pool_add_device` — the
- * pool's internal rwlock serializes against concurrent sync-side
- * readers. No external synchronization needed.
+ * Serialization (P5-4b-ii-β): the pool's internal rwlock serializes
+ * against concurrent sync-side pool-iterating readers (sync_commit
+ * etc.) and other pool mutators. Lock order is POOL OUTER. NOTE the
+ * caveat above: the lock closes data-race / ordering hazards, NOT
+ * the drain-check hazard — which is a sync-layer-only invariant.
  *
  * RO pools: returns STM_EROFS.
  *
  * Returns:
- *   STM_OK           — slot marked REMOVED; roster_hash advanced.
- *   STM_EROFS        — pool is read_only.
- *   STM_EINVAL       — device_id out of range, slot already REMOVED,
- *                       or redundancy_floor would be violated.
+ *   STM_OK            — slot marked REMOVED; roster_hash advanced.
+ *   STM_EROFS         — pool is read_only.
+ *   STM_ENOTSUPPORTED — device_id == 0 (metadata primary).
+ *   STM_EBUSY         — another slot is in EVACUATING state.
+ *   STM_EINVAL        — device_id out of range, slot already REMOVED
+ *                        or EVACUATING, or redundancy_floor would be
+ *                        violated.
  */
 STM_MUST_USE
 stm_status stm_pool_remove_device(stm_pool *p, uint16_t device_id,
@@ -390,13 +416,17 @@ stm_status stm_pool_begin_evacuation(stm_pool *p, uint16_t device_id,
  * Finalize an evacuation (P5-4b-ii-α). Transitions EVACUATING to
  * REMOVED. No redundancy re-check — that happened at begin.
  *
- * Precondition (checked by caller, not enforced here): sync's
- * evacuation_step returned STM_ENOENT for this device, i.e., the
- * alloc tree is drained. Callers that skip this check and call
- * finish with live data still on the device leave the post-remove
- * block pointers dangling (sync's mirror_read will fail to find the
- * target's replicas and must rely on surviving copies). The spec's
- * NoTargetReplicasAfterComplete invariant encodes this precondition.
+ * **WARNING — pool-level primitive; bypasses drain check.**
+ * Same caveat as `stm_pool_remove_device`: this function does not
+ * probe the target's alloc tree. Callers with an attached
+ * `stm_sync` MUST use `stm_sync_finish_evacuation` instead. That
+ * wrapper enforces drain (via `stm_alloc_first_allocated`) AND
+ * detaches `s->allocs[X]` atomically under the composite
+ * pool.wrlock + sync.lock region.
+ *
+ * The spec's NoTargetReplicasAfterComplete encodes the drain
+ * precondition; skipping it reproduces the same bug as the
+ * non-drained remove path.
  *
  * Post: slot state = REMOVED, bdev = NULL, UUID preserved (burned).
  */

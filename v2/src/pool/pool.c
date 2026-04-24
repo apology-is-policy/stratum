@@ -26,6 +26,7 @@
 #include <stratum/block.h>
 
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -248,8 +249,23 @@ stm_status stm_pool_open(const stm_pool_open_opts *opts, stm_pool **out)
     stm_pool *p = calloc(1, sizeof *p);
     if (!p) return STM_ENOMEM;
 
-    /* rwlock init — must land BEFORE any publish of `p`. */
+    /* rwlock init — must land BEFORE any publish of `p`.
+     *
+     * R18 P2-1: on Linux, the default rwlock attrs favor readers,
+     * allowing writer starvation under sustained sync-side traffic.
+     * Set writer preference explicitly where the attr is available.
+     * macOS / other POSIX: default attrs already give reasonable
+     * scheduler fairness; pass NULL. */
+#if defined(__linux__) && defined(PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP)
+    pthread_rwlockattr_t attr;
+    pthread_rwlockattr_init(&attr);
+    pthread_rwlockattr_setkind_np(&attr,
+        PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+    int rc = pthread_rwlock_init(&p->lock, &attr);
+    pthread_rwlockattr_destroy(&attr);
+#else
     int rc = pthread_rwlock_init(&p->lock, NULL);
+#endif
     if (rc != 0) { free(p); return STM_ENOMEM; }
 
     p->pool_uuid[0] = opts->pool_uuid[0];
@@ -272,7 +288,24 @@ void stm_pool_close(stm_pool *p)
      * lock — POSIX says destroying a locked rwlock is UB. The
      * lifetime contract (pool.h) requires every sync handle to be
      * closed before the pool; sync handles are the lock's primary
-     * users on the read side. */
+     * users on the read side.
+     *
+     * R18 P2-5: loud-fail on contract violation. Try acquiring the
+     * exclusive side; if we can't, abort with a diagnostic. This
+     * converts a silent heap corruption (destroy-while-locked UB)
+     * into a visible crash. trywrlock returns 0 if acquired, EBUSY
+     * if held, or other errno for malformed rwlock. The subsequent
+     * destroy is then safe. */
+    int trc = pthread_rwlock_trywrlock(&p->lock);
+    if (trc != 0) {
+        fprintf(stderr,
+                "stm_pool_close: rwlock held at destroy time "
+                "(trywrlock=%d); contract violation — a sync or "
+                "other borrower was not closed before the pool.\n",
+                trc);
+        abort();
+    }
+    pthread_rwlock_unlock(&p->lock);
     (void)pthread_rwlock_destroy(&p->lock);
     /* Borrowers of stm_bdev — we don't close them; wiping the roster
      * is belt-and-braces against lingering pointers. */

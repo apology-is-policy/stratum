@@ -183,9 +183,10 @@ CompleteEvacuation(d) ==
 \*   - FALSE (buggy impl, pre-R17):  caller invokes `stm_pool_remove_device`
 \*      on a data-bearing slot without evacuating first. Replicas[b]
 \*      for every block on d are silently stripped. TLC finds
-\*      `EvacuationAtomic` VIOLATED at depth 1: Init →
-\*      RemoveDirectly(d1 ∈ replicas[b]) → replicas[b] ∩ Live has
-\*      cardinality MirrorN-1.
+\*      `EvacuationAtomic` VIOLATED at State 2 (one Next step from
+\*      Init): RemoveDirectly(d1 ∈ replicas[b]) strands replicas on
+\*      a REMOVED device; replicas[b] ∩ LiveDevices has cardinality
+\*      MirrorN-1.
 \*
 \* There is no additional "refuse during evac" gate: under the
 \* DrainCheckOnRemove precondition, concurrent remove + evacuation is

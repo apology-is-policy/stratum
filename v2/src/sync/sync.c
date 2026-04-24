@@ -1660,7 +1660,6 @@ stm_status stm_sync_attach_alloc(stm_sync *s, uint16_t device_id,
     if (!s || !alloc) return STM_EINVAL;
     if (device_id == 0) return STM_EINVAL;                   /* primary is fixed */
     if (device_id >= STM_POOL_DEVICES_MAX) return STM_EINVAL;
-    if (device_id >= stm_pool_device_count(s->pool)) return STM_EINVAL;
 
     /* Cross-check: the attached alloc's device_id must match.
      * Alloc-side read; does not need the pool lock. */
@@ -1670,9 +1669,19 @@ stm_status stm_sync_attach_alloc(stm_sync *s, uint16_t device_id,
     if (alloc_dev != device_id) return STM_EINVAL;
 
     /* P5-4b-ii-β: pool OUTER, sync INNER. Pool read (state check) and
-     * sync write (allocs[] install) are one atomic region. */
+     * sync write (allocs[] install) are one atomic region.
+     *
+     * R18 P2-3: the device_id upper-bound check reads pool.device_count
+     * under the lock, not before. Avoids a TSan data race with a
+     * concurrent add_device that extends device_count. */
     stm_pool_lock_shared(s->pool);
     pthread_mutex_lock(&s->lock);
+
+    if (device_id >= stm_pool_device_count(s->pool)) {
+        pthread_mutex_unlock(&s->lock);
+        stm_pool_unlock_shared(s->pool);
+        return STM_EINVAL;
+    }
 
     /* P5-4b-i: REMOVED slots cannot accept an alloc — they have no
      * bdev and will be evacuated in P5-4b-ii. Refuse at the pool's
@@ -1974,17 +1983,25 @@ stm_status stm_sync_evacuation_step(stm_sync *s, uint16_t target_device_id,
                                        uint64_t *out_new_paddr)
 {
     if (!s || !out_old_paddr || !out_new_paddr) return STM_EINVAL;
-    if (target_device_id >= stm_pool_device_count(s->pool)) return STM_EINVAL;
-    if (survivor_device_id >= stm_pool_device_count(s->pool)) return STM_EINVAL;
     if (survivor_device_id == target_device_id) return STM_EINVAL;
     *out_old_paddr = 0;
     *out_new_paddr = 0;
 
     /* P5-4b-ii-β: pool OUTER. Target + survivor state reads, per-paddr
      * bdev lookups, and the alloc-tree migration must all be atomic
-     * w.r.t. concurrent add_device / finish_evacuation. */
+     * w.r.t. concurrent add_device / finish_evacuation.
+     *
+     * R18 P2-3: device_count upper-bound checks moved inside the pool
+     * lock to avoid a TSan race with concurrent add_device. */
     stm_pool_lock_shared(s->pool);
     pthread_mutex_lock(&s->lock);
+
+    if (target_device_id >= stm_pool_device_count(s->pool) ||
+        survivor_device_id >= stm_pool_device_count(s->pool)) {
+        pthread_mutex_unlock(&s->lock);
+        stm_pool_unlock_shared(s->pool);
+        return STM_EINVAL;
+    }
 
     /* R15 F5 P2 symmetric: RO/wedged refuses mutation. */
     if (s->wedged)    { pthread_mutex_unlock(&s->lock); stm_pool_unlock_shared(s->pool); return STM_EWEDGED; }

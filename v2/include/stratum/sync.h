@@ -436,11 +436,27 @@ stm_status stm_sync_remove_device(stm_sync *s, uint16_t device_id,
  * the target's alloc tree is drained, then finalizes the EVACUATING
  * → REMOVED transition via the pool primitive, then detaches the
  * target's alloc handle from sync's internal table (s->allocs[X] =
- * NULL) so subsequent sync_commit loops skip it. The caller retains
- * ownership of the stm_alloc and is responsible for stm_alloc_close.
+ * NULL) so subsequent sync_commit loops skip it.
+ *
+ * **Ownership semantics (R18 P2-4)**: on STM_OK, the `stm_alloc *`
+ * previously attached via `stm_sync_attach_alloc` is DETACHED from
+ * sync but NOT closed. Ownership reverts to the caller. The caller
+ * MUST close the alloc (stm_alloc_close) BEFORE closing the device's
+ * underlying `stm_bdev`, and MUST NOT perform any further alloc
+ * operation (commit / reserve / free / lookup) on it — the alloc's
+ * cached bdev pointer targets the now-removed device, so any bdev
+ * I/O against it is UB from the pool's perspective.
+ *
+ * In practice most callers pair finish_evacuation with alloc_close
+ * immediately:
+ *
+ *     if (stm_sync_finish_evacuation(s, id) == STM_OK) {
+ *         stm_alloc_close(attached_alloc_for_id);
+ *     }
  *
  * Returns:
  *   STM_OK             — slot flipped to REMOVED; alloc detached.
+ *                         Caller owns the detached alloc; close it.
  *   STM_EBUSY          — target tree still has allocated ranges
  *                         (more evacuation_step calls needed).
  *   STM_EINVAL         — slot not EVACUATING or out-of-range.
