@@ -2256,6 +2256,26 @@ stm_status stm_sync_finish_evacuation(stm_sync *s, uint16_t device_id)
 /* P5-4c-α: ONLINE → ONLINE device replacement.                               */
 /* ========================================================================= */
 
+/* R19 P2-2: rollback helper for attach/set-device-id failure. If the
+ * pool-level remove itself fails (redundancy_floor too tight, or a
+ * concurrent EVACUATING elsewhere blocks via STM_EBUSY), the pool
+ * has an in-RAM-only ONLINE slot without an attached alloc —
+ * sync_commit won't persist it (commit consults the pool slot's
+ * state but also checks allocs[X]; an unattached slot is uncommitable
+ * data-wise). We wedge the sync handle so the next call surfaces
+ * the inconsistency loudly rather than compounding the bug. */
+static void replace_rollback_or_wedge(stm_sync *s, uint16_t new_slot,
+                                         size_t redundancy_floor)
+{
+    stm_status rs = stm_pool_remove_device(s->pool, new_slot,
+                                              redundancy_floor);
+    if (rs != STM_OK) {
+        pthread_mutex_lock(&s->lock);
+        s->wedged = true;
+        pthread_mutex_unlock(&s->lock);
+    }
+}
+
 stm_status stm_sync_replace_device_online(
     stm_sync *s, uint16_t old_device_id,
     const stm_pool_device *new_device,
@@ -2265,6 +2285,17 @@ stm_status stm_sync_replace_device_online(
 {
     if (!s || !new_device || !new_alloc) return STM_EINVAL;
 
+    /* R19 P2-4: upfront wedged/read-only guards. Without these,
+     * step 1's add_device mutates pool in-RAM but step 3's commit
+     * then refuses under the same wedged/RO state, leaving a
+     * phantom slot. Mirror reserve_mirror's prologue. */
+    pthread_mutex_lock(&s->lock);
+    bool wedged = s->wedged;
+    bool ro     = s->read_only;
+    pthread_mutex_unlock(&s->lock);
+    if (wedged) return STM_EWEDGED;
+    if (ro)     return STM_EROFS;
+
     /* Pre-checks. device_id=0 guard mirrors pool layer (R17 P1-1);
      * we catch it here too so the caller gets a clean error before
      * we start adding + committing. */
@@ -2272,14 +2303,51 @@ stm_status stm_sync_replace_device_online(
 
     /* Snapshot old slot state under pool.rdlock. Release before any
      * mutator (which takes wrlock internally — recursive acquire is
-     * UB under POSIX rwlocks). */
+     * UB under POSIX rwlocks).
+     *
+     * R19 P3-1: capture the state into a local bool / enum, not a
+     * pointer held past the unlock. The pointer itself is stable
+     * (fixed-array slot), but future edits might inadvertently
+     * dereference it outside the lock. */
     stm_pool_lock_shared(s->pool);
     const stm_pool_device *old = stm_pool_device_info(s->pool,
                                                           old_device_id);
-    stm_device_state old_state = old ? old->state : STM_DEV_STATE_UNSET;
+    bool old_exists = (old != NULL);
+    stm_device_state old_state = old_exists ? old->state
+                                             : STM_DEV_STATE_UNSET;
     stm_pool_unlock_shared(s->pool);
 
-    if (!old) return STM_EINVAL;
+    if (!old_exists) return STM_EINVAL;
+
+    /* R19 P2-1: idempotent resume. If a previous invocation durably
+     * landed the new device (step 3) + transitioned old to EVACUATING
+     * (step 5) and then failed mid-drain, the pool's on-disk state
+     * is EVACUATING with the new device already ONLINE. A retry that
+     * refused due to old's non-ONLINE state would strand progress.
+     * Instead, if old is EVACUATING AND the caller's new_alloc is
+     * already attached at some slot, we resume from step 6.
+     *
+     * Detection: caller re-passes the same new_alloc with its
+     * device_id already set to an attached slot. We validate and
+     * drive the drain to completion. This supports retry without
+     * duplicating the add. */
+    if (old_state == STM_DEV_STATE_EVACUATING) {
+        uint16_t alloc_dev = 0;
+        stm_status gs = stm_alloc_get_device_id(new_alloc, &alloc_dev);
+        if (gs != STM_OK) return gs;
+        /* The new_alloc must already be attached at alloc_dev — caller
+         * must pass the SAME new_alloc from the prior failed call. */
+        pthread_mutex_lock(&s->lock);
+        bool already_attached = (alloc_dev > 0 &&
+                                  alloc_dev < STM_POOL_DEVICES_MAX &&
+                                  s->allocs[alloc_dev] == new_alloc);
+        pthread_mutex_unlock(&s->lock);
+        if (!already_attached) return STM_EINVAL;
+        if (out_new_device_id) *out_new_device_id = alloc_dev;
+        /* Resume: drain + finish + commit. Skip steps 1-5. */
+        goto drain_loop;
+    }
+
     if (old_state == STM_DEV_STATE_FAULTED) {
         /* Reconstruct path — reads from surviving replicas instead
          * of from old. Needs bptr-layer iteration of block replicas;
@@ -2308,7 +2376,7 @@ stm_status stm_sync_replace_device_online(
      * post-add under concurrent callers). */
     stm_status sds = stm_alloc_set_device_id(new_alloc, new_slot);
     if (sds != STM_OK) {
-        (void)stm_pool_remove_device(s->pool, new_slot, redundancy_floor);
+        replace_rollback_or_wedge(s, new_slot, redundancy_floor);
         return sds;
     }
 
@@ -2316,36 +2384,61 @@ stm_status stm_sync_replace_device_online(
     stm_status ats = stm_sync_attach_alloc(s, new_slot, new_alloc);
     if (ats != STM_OK) {
         /* Roll back the add: remove the new slot. No data on it yet,
-         * so remove_device accepts. */
-        (void)stm_pool_remove_device(s->pool, new_slot, redundancy_floor);
+         * so remove_device accepts. R19 P2-2: if the remove itself
+         * fails (floor too tight / concurrent EVACUATING), wedge
+         * rather than silently leave an inconsistent slot. */
+        replace_rollback_or_wedge(s, new_slot, redundancy_floor);
         return ats;
     }
 
     if (out_new_device_id) *out_new_device_id = new_slot;
 
-    /* Step 3: persist the add. */
-    stm_status cs = stm_sync_commit(s);
-    if (cs != STM_OK) return cs;
+    {
+        /* Step 3: persist the add. */
+        stm_status cs = stm_sync_commit(s);
+        if (cs != STM_OK) return cs;
 
-    /* Step 4: begin evacuation on the old slot. */
-    stm_status bs = stm_pool_begin_evacuation(s->pool, old_device_id,
-                                                  redundancy_floor);
-    if (bs != STM_OK) return bs;
+        /* Step 4: begin evacuation on the old slot. */
+        stm_status bs = stm_pool_begin_evacuation(s->pool, old_device_id,
+                                                      redundancy_floor);
+        if (bs != STM_OK) return bs;
 
-    /* Step 5: persist EVACUATING. */
-    cs = stm_sync_commit(s);
-    if (cs != STM_OK) return cs;
+        /* Step 5: persist EVACUATING. */
+        cs = stm_sync_commit(s);
+        if (cs != STM_OK) return cs;
+    }
 
+drain_loop: {
     /* Step 6: drain the old slot range-by-range onto the new slot.
      * Each evacuation_step is one commit-unit of migration (atomic
      * per evac.tla's EvacuateAtomic); we accumulate until the target
-     * tree is empty, then commit the batch for durability. */
-    for (;;) {
+     * tree is empty, then commit the batch for durability.
+     *
+     * R19 P2-5: bound the loop. An unbounded drain risks spinning if
+     * the alloc tree contains entries that first_allocated keeps
+     * surfacing but evacuation_step can't fully remove (refcount > 1
+     * in a future snapshot-aware caller, or a bug in free). Cap at
+     * STM_REPLACE_DRAIN_MAX_STEPS: enough for any realistic workload
+     * (100M blocks × STM_UB_SIZE = 400 GiB per device), small enough
+     * to catch a pathological loop. */
+    const size_t STM_REPLACE_DRAIN_MAX_STEPS = 100u * 1000u * 1000u;
+
+    /* Resume path: read the attached alloc's device_id to discover
+     * which slot to drain onto. Fresh path: identical — we set it
+     * in step 2a. */
+    uint16_t drain_survivor = 0;
+    {
+        stm_status gs = stm_alloc_get_device_id(new_alloc, &drain_survivor);
+        if (gs != STM_OK) return gs;
+    }
+
+    bool drained = false;
+    for (size_t step = 0; step < STM_REPLACE_DRAIN_MAX_STEPS; step++) {
         uint64_t old_paddr = 0, new_paddr = 0;
         stm_status es = stm_sync_evacuation_step(s, old_device_id,
-                                                    new_slot,
+                                                    drain_survivor,
                                                     &old_paddr, &new_paddr);
-        if (es == STM_ENOENT) break;    /* drained */
+        if (es == STM_ENOENT) { drained = true; break; }
         if (es != STM_OK) return es;
         /* Any higher-level replica-list owner would rewrite
          * old_paddr → new_paddr here. At this layer there are no
@@ -2353,9 +2446,13 @@ stm_status stm_sync_replace_device_online(
          * bookkeeping. */
         (void)old_paddr; (void)new_paddr;
     }
+    if (!drained) {
+        /* Exceeded step budget — alloc tree isn't converging. */
+        return STM_ECORRUPT;
+    }
 
     /* Step 7: persist migrations. */
-    cs = stm_sync_commit(s);
+    stm_status cs = stm_sync_commit(s);
     if (cs != STM_OK) return cs;
 
     /* Step 8: finalize — old → REMOVED, detach allocs[old]. */
@@ -2367,6 +2464,7 @@ stm_status stm_sync_replace_device_online(
     if (cs != STM_OK) return cs;
 
     return STM_OK;
+}
 }
 
 /* ========================================================================= */

@@ -2077,7 +2077,9 @@ STM_TEST(sync_multi_mirror_read_skips_faulted_replica) {
 }
 
 /* FAULTED source → STM_ENOTSUPPORTED (P5-4c-β reconstruct path not yet
- * implemented). device_id=0 also STM_ENOTSUPPORTED (metadata primary). */
+ * implemented). device_id=0 also STM_ENOTSUPPORTED (metadata primary).
+ * R19 P3-3: actually exercise the FAULTED branch using
+ * stm_pool_fail_device (P5-4d-α). */
 STM_TEST(sync_multi_replace_device_refuses_unsupported_paths) {
     stm_bdev *bds[NDEV] = {0};
     stm_alloc *as[NDEV] = {0};
@@ -2104,6 +2106,15 @@ STM_TEST(sync_multi_replace_device_refuses_unsupported_paths) {
                      as[0], 1, NULL), STM_EINVAL);
     STM_ASSERT_ERR(stm_sync_replace_device_online(s, 1,
                      &placeholder_dev, NULL, 1, NULL), STM_EINVAL);
+
+    /* R19 P3-3: fail dev 1, then try to replace it — must refuse
+     * with STM_ENOTSUPPORTED (reconstruct path is P5-4c-β). */
+    STM_ASSERT_OK(stm_pool_fail_device(pool, 1));
+    stm_status rf = stm_sync_replace_device_online(
+        s, 1, &placeholder_dev, as[0], 1, NULL);
+    STM_ASSERT_ERR(rf, STM_ENOTSUPPORTED);
+    /* Rejoin to leave the pool in a clean state for teardown. */
+    STM_ASSERT_OK(stm_pool_rejoin_device(pool, 1));
 
     teardown_mirror_pool(bds, as, pool, s);
 }

@@ -496,9 +496,27 @@ stm_status stm_sync_finish_evacuation(stm_sync *s, uint16_t device_id);
  *   8. stm_sync_finish_evacuation(old)         — EVACUATING → REMOVED.
  *   9. stm_sync_commit                          — persists REMOVED.
  *
- * On any non-OK step, the sequence halts. Partial progress may have
- * landed durably; the pool is in a consistent but intermediate state
- * that a retry can advance. The caller decides recovery strategy.
+ * **Recovery semantics (R19)**:
+ * - Failure BEFORE step 3 commit: nothing durable. Retry with the
+ *   same or a different `new_device` / `new_alloc`.
+ * - Failure AFTER step 3 commit (new device durable) but BEFORE step
+ *   5 (EVACUATING durable): retry with the same `new_alloc` is not
+ *   directly supported — the wrapper would re-add. Use primitive APIs
+ *   (`stm_pool_begin_evacuation` + evacuation_step-loop +
+ *   `stm_sync_finish_evacuation`) to finish manually. Alternatively,
+ *   call `stm_sync_remove_device(new_slot)` to roll back the add.
+ * - Failure AFTER step 5 (old is EVACUATING on disk): **retry is
+ *   supported**. Re-invoke with the SAME `old_device_id` and SAME
+ *   `new_alloc` (still attached). The wrapper detects the EVACUATING
+ *   state + already-attached alloc and resumes from step 6.
+ *
+ * **Alloc ownership after OK**: the OLD device's alloc (attached via
+ * `stm_sync_attach_alloc` before this call) is detached on success
+ * (via the internal `stm_sync_finish_evacuation`); the caller owns
+ * it and MUST `stm_alloc_close` it before closing the old device's
+ * bdev. The NEW device's alloc stays attached at `*out_new_device_id`
+ * until the caller explicitly detaches (via another finish_evacuation)
+ * or closes the sync handle.
  *
  * Slot semantics (caveat): `new_slot` is a NEW roster index, not a
  * reuse of `old_device_id`. `old_device_id` becomes a REMOVED
@@ -518,6 +536,11 @@ stm_status stm_sync_finish_evacuation(stm_sync *s, uint16_t device_id);
  *   STM_ENOSPC         — roster at STM_POOL_DEVICES_MAX.
  *   STM_EEXIST         — new_device->uuid collides with roster.
  *   STM_EROFS          — RO pool.
+ *   STM_EWEDGED        — sync handle wedged (either before call, or
+ *                         wedged during this call because a rollback
+ *                         itself failed; R19 P2-2).
+ *   STM_ECORRUPT       — drain loop exceeded STM_REPLACE_DRAIN_MAX_STEPS
+ *                         without converging (100M steps cap; R19 P2-5).
  */
 STM_MUST_USE
 stm_status stm_sync_replace_device_online(
