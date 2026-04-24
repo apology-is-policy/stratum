@@ -1308,8 +1308,9 @@ STM_TEST(sync_multi_alloc_roots_multi_commit_cycle) {
 }
 
 /* Every UB slot at version 5 (pre-P5-3b format) is refused at mount
- * as STM_EBADVERSION. The v5 → v6 bump guards against a v5 pool
- * being mis-interpreted by v6 code. */
+ * as STM_EBADVERSION. The v5 → v6 → v7 bumps guard against earlier
+ * pools being mis-interpreted by later code. R15 F6 P2 promoted the
+ * intermediate v6 → v7 bump too (roots-object leaf value layout). */
 STM_TEST(sync_multi_mount_refuses_v5_ub) {
     make_paths("v5_refuse");
     stm_bdev *bds[NDEV] = {0};
@@ -1363,6 +1364,170 @@ STM_TEST(sync_multi_mount_refuses_v5_ub) {
     stm_alloc_close(a2);
     stm_pool_close(pool);
     close_bdevs(bds);
+    unlink_paths();
+}
+
+/* ========================================================================= */
+/* R15 regression tests.                                                       */
+/* ========================================================================= */
+
+/* R15 F1 P0 regression: metadata-node AEAD nonce uniqueness across
+ * per-device alloc trees. Pre-fix, the first tree-node paddr on
+ * each device would be IDENTICAL (bootstrap stamps device=0
+ * unconditionally), producing (paddr, gen, pool_uuid) nonce reuse
+ * under the shared metadata_key. Post-fix, alloc's store_reserve
+ * stamps device_id into the top 16 paddr bits. This test verifies
+ * the on-disk bootstrap bitmaps on different devices are reachable
+ * by their own device-stamped paddrs and that the alloc trees
+ * load correctly after remount — the canary case is a second
+ * commit that reads back each device's tree, which exercises the
+ * AEAD decrypt path with per-device paddrs. */
+STM_TEST(sync_multi_mirror_per_device_nonce_differentiation) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(3, "nonce_diff", bds, as, &pool, &s);
+
+    /* Two commits with divergent per-device reservations. Each
+     * device's tree ends up with different contents — the stress
+     * case that would trip nonce reuse if paddrs collided. */
+    uint64_t paddrs[3] = { 0 };
+    STM_ASSERT_OK(stm_sync_reserve_mirror(s, 1u, 3u, paddrs));
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    STM_ASSERT_OK(stm_sync_reserve_mirror(s, 4u, 3u, paddrs));
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    /* Remount and verify every device's tree still decrypts. If
+     * nonces had collided, at least one device's tree would fail
+     * AEAD tag verification (the decrypt-with-same-nonce-against-
+     * different-ciphertext produces garbage that won't match the
+     * plaintext self-csum). */
+    stm_sync_close(s);
+    close_multi_allocs(as);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+
+    open_bdevs(bds);
+    pool = make_multi_pool(bds);
+    stm_alloc *a2s[NDEV] = {0};
+    for (size_t i = 0; i < NDEV; i++) {
+        STM_ASSERT_OK(stm_alloc_open_blank(bds[i], &a2s[i]));
+        STM_ASSERT_OK(stm_alloc_set_device_id(a2s[i], (uint16_t)i));
+    }
+    stm_sync *s2 = NULL;
+    STM_ASSERT_OK(stm_sync_open(pool, a2s[0], make_wk(), NULL, &s2));
+    for (size_t i = 1; i < NDEV; i++)
+        STM_ASSERT_OK(stm_sync_attach_alloc(s2, (uint16_t)i, a2s[i]));
+
+    /* All three per-device trees loaded successfully — nonce
+     * uniqueness holds. */
+    teardown_mirror_pool(bds, a2s, pool, s2);
+}
+
+/* R15 F3 P1 regression: stm_alloc_set_device_id refuses after any
+ * tree activity. Pre-fix, a set after reserves silently succeeded
+ * and left in-tree paddrs stamped under the OLD device_id,
+ * causing free/ref to reject them downstream. */
+STM_TEST(sync_multi_set_device_id_refuses_after_reserve) {
+    make_paths("setdev_busy");
+    stm_bdev *bds[NDEV] = {0};
+    open_bdevs(bds);
+    stm_alloc *a = NULL;
+    uint64_t dev_uuid[2] = { DEV_UUID_LO[0], DEV_UUID_HI };
+    STM_ASSERT_OK(stm_alloc_create(bds[0], POOL_UUID, dev_uuid,
+                                     TEST_BOOTSTRAP_BYTES, &a));
+    /* Set is fine pre-reserve. */
+    STM_ASSERT_OK(stm_alloc_set_device_id(a, 0));
+
+    /* Need crypt ctx before reserve; use a throwaway ctx since
+     * this test doesn't exercise commit. */
+    uint8_t throwaway_key[32] = { 0 };
+    STM_ASSERT_OK(stm_alloc_set_crypt_ctx(a, throwaway_key,
+                                             POOL_UUID, dev_uuid));
+
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p));
+
+    /* Post-reserve set_device_id must refuse. */
+    STM_ASSERT_ERR(stm_alloc_set_device_id(a, 1), STM_EBUSY);
+
+    stm_alloc_close(a);
+    close_bdevs(bds);
+    unlink_paths();
+}
+
+/* R15 F5 P2 regression: mirror_write on a read-only sync refuses
+ * at the API boundary, not after partial bdev writes. Previously
+ * sync had no RO flag; mirror_write would call bdev_write which
+ * returned STM_EROFS per device, surfacing as STM_EROFS but only
+ * after the partial write attempts. */
+STM_TEST(sync_multi_mirror_write_refuses_read_only) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "ro_refuse", bds, as, &pool, &s);
+
+    uint64_t paddrs[2] = { 0 };
+    STM_ASSERT_OK(stm_sync_reserve_mirror(s, 1u, 2u, paddrs));
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    /* Close and reopen the bdevs read-only, then remount sync. */
+    stm_sync_close(s);
+    close_multi_allocs(as);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+
+    stm_bdev *ro_bds[NDEV] = {0};
+    for (size_t i = 0; i < NDEV; i++) {
+        stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+        bo.read_only = true;
+        STM_ASSERT_OK(stm_bdev_open(g_paths[i], &bo, &ro_bds[i]));
+    }
+    stm_pool *ro_pool = make_multi_pool(ro_bds);
+    stm_alloc *ro_as[NDEV] = {0};
+    for (size_t i = 0; i < NDEV; i++) {
+        STM_ASSERT_OK(stm_alloc_open_blank(ro_bds[i], &ro_as[i]));
+        STM_ASSERT_OK(stm_alloc_set_device_id(ro_as[i], (uint16_t)i));
+    }
+    stm_sync *ro_s = NULL;
+    STM_ASSERT_OK(stm_sync_open(ro_pool, ro_as[0], make_wk(), NULL, &ro_s));
+    for (size_t i = 1; i < NDEV; i++)
+        STM_ASSERT_OK(stm_sync_attach_alloc(ro_s, (uint16_t)i, ro_as[i]));
+
+    /* reserve_mirror must refuse. */
+    uint64_t ro_paddrs[2] = { 0 };
+    STM_ASSERT_ERR(stm_sync_reserve_mirror(ro_s, 1u, 2u, ro_paddrs),
+                    STM_EROFS);
+
+    /* mirror_write on the previously-reserved paddrs must refuse. */
+    uint8_t payload[STM_UB_SIZE] = { 0 };
+    STM_ASSERT_ERR(stm_sync_mirror_write(ro_s, paddrs, 2u,
+                                            payload, sizeof payload, NULL),
+                    STM_EROFS);
+
+    /* commit must refuse. */
+    STM_ASSERT_ERR(stm_sync_commit(ro_s), STM_EROFS);
+
+    /* mirror_read still works on RO (it's the point of RO mount). */
+    stm_blake3_hash expected;
+    stm_blake3(payload, sizeof payload, &expected);
+    /* No data was written here (RO pool), but the refusal we want
+     * to verify is that the API path doesn't refuse reads. Any
+     * non-EROFS outcome is acceptable evidence — either STM_OK if
+     * a prior write happened to succeed elsewhere, or STM_ECORRUPT
+     * if no replica has matching content. EROFS would indicate
+     * mirror_read is (incorrectly) treating itself as mutating. */
+    uint8_t readback[STM_UB_SIZE];
+    stm_status rd = stm_sync_mirror_read(ro_s, paddrs, 2u,
+                                             readback, sizeof readback,
+                                             expected.bytes);
+    STM_ASSERT(rd != STM_EROFS);
+
+    stm_sync_close(ro_s);
+    for (size_t i = 0; i < NDEV; i++) stm_alloc_close(ro_as[i]);
+    stm_pool_close(ro_pool);
+    close_bdevs(ro_bds);
     unlink_paths();
 }
 

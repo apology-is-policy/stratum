@@ -211,6 +211,16 @@ struct stm_sync {
      * stored in ub_alloc_root), NOT any single alloc tree. Per-
      * device tree roots live INSIDE the roots object. */
     stm_alloc_roots  *roots;
+
+    /* R15 F5 P2: runtime guards for mirror / reserve APIs. Mirrors
+     * the v1 stm_fs guard pattern required by CLAUDE.md. Set by
+     * sync_open on RO-mount or by explicit mark-wedged API. Any
+     * mutating sync-layer API (reserve_mirror, mirror_write, commit)
+     * must short-circuit on these. mirror_read is exempt from
+     * read_only — it's the R/O recovery path — but still refuses
+     * on wedged (the handle is no longer trustworthy). */
+    bool              read_only;
+    bool              wedged;
 };
 
 /* ========================================================================= */
@@ -1319,7 +1329,12 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
             s2->live_slot_idx  = slot;
         } else if (cw == STM_EROFS) {
             /* RO pool: leave auth_gen at the durable value (pre-claim).
-             * Remember the canonical UB's (label, slot) for info. */
+             * Remember the canonical UB's (label, slot) for info.
+             * R15 F5 P2: persist the RO state so mutating APIs
+             * (reserve_mirror, mirror_write, commit) short-circuit
+             * instead of reaching the bdev and getting STM_EROFS
+             * after having done in-RAM mutation. */
+            s2->read_only      = true;
             uint64_t canon_gen = stm_load_le64(ub.ub_gen);
             s2->live_label_idx = ring_label_for_gen(canon_gen);
             s2->live_slot_idx  = ring_slot_for_gen(canon_gen);
@@ -1362,6 +1377,11 @@ stm_status stm_sync_commit(stm_sync *s)
     if (!s) return STM_EINVAL;
 
     pthread_mutex_lock(&s->lock);
+
+    /* R15 F5 P2: runtime guards. Same rule as reserve_mirror /
+     * mirror_write — refuse mutating commit on RO or wedged. */
+    if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
+    if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS; }
 
     /* P5-2 commit protocol (quorum.tla):
      *
@@ -1700,6 +1720,12 @@ stm_status stm_sync_reserve_mirror(stm_sync *s, uint64_t nblocks,
 
     pthread_mutex_lock(&s->lock);
 
+    /* R15 F5 P2: runtime guards. RO pools refuse mutating ops up-
+     * front. Wedged pools refuse everything to preserve post-mortem
+     * state. */
+    if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
+    if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS; }
+
     /* Profile must match requested replica count. */
     if (s->redundancy.kind != STM_RED_MIRROR) {
         pthread_mutex_unlock(&s->lock);
@@ -1737,12 +1763,21 @@ stm_status stm_sync_reserve_mirror(stm_sync *s, uint64_t nblocks,
         reserved++;
     }
     if (last_err != STM_OK) {
-        /* Best-effort rollback: free each already-reserved range. Uses
-         * free_gen = s->current_gen so the sweep happens at the next
-         * commit. Ignore per-free errors — we're already in the error
-         * path. */
+        /* R15 F4 P2: best-effort rollback — free each already-reserved
+         * range so the next commit sweeps them from the PENDING list.
+         *
+         * Sweep criterion (allocator.tla + alloc_commit): PENDING
+         * entries with free_gen < committed_gen are reclaimed. The
+         * next sync_commit sets committed_gen = s->current_gen, so
+         * free_gen must be < current_gen for same-commit sweep. Using
+         * auth_gen is clean: auth_gen <= current_gen - 2 (post-
+         * commit) or 0 (fresh) — always < current_gen. Pre-fix used
+         * current_gen directly, which left entries PENDING for one
+         * extra commit (not a correctness bug; a cleanup delay).
+         *
+         * Ignore per-free errors — we're already in the error path. */
         for (size_t i = 0; i < reserved; i++) {
-            (void)stm_alloc_free(s->allocs[i], out_paddrs[i], s->current_gen);
+            (void)stm_alloc_free(s->allocs[i], out_paddrs[i], s->auth_gen);
             out_paddrs[i] = 0;
         }
         pthread_mutex_unlock(&s->lock);
@@ -1771,6 +1806,10 @@ stm_status stm_sync_mirror_write(stm_sync *s, const uint64_t paddrs[],
     if (len == 0 || (len % STM_UB_SIZE) != 0) return STM_EINVAL;
 
     pthread_mutex_lock(&s->lock);
+
+    /* R15 F5 P2: runtime guards — same pattern as reserve_mirror. */
+    if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
+    if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS; }
 
     size_t confirmed = 0;
     stm_status last_err = STM_OK;
@@ -1808,15 +1847,33 @@ stm_status stm_sync_mirror_read(stm_sync *s, const uint64_t paddrs[],
 
     pthread_mutex_lock(&s->lock);
 
-    stm_status last_err = STM_OK;
+    /* R15 F5 P2: mirror_read is a read-only path — works on RO
+     * pools (it's how the RO caller accesses data). Wedged still
+     * refuses though: a wedged handle's in-RAM state is no longer
+     * trustworthy and the pool device may be mid-inconsistency. */
+    if (s->wedged) { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
+
+    /* R15 F7 P3: preserve the FIRST non-OK status across replicas
+     * for operator diagnostics. E.g. replica 0 fails with STM_EIO
+     * and replica 1 fails csum — the caller should see STM_EIO as
+     * the more specific failure, not STM_ECORRUPT (which hides the
+     * real I/O fault). Symmetric to R14 P3-5's last_hard_err pattern
+     * in write_ub_to_all_devices. */
+    stm_status first_err = STM_OK;
     for (size_t i = 0; i < n; i++) {
         uint16_t dev = stm_paddr_device(paddrs[i]);
         uint64_t off = stm_paddr_offset(paddrs[i]) * (uint64_t)STM_UB_SIZE;
         stm_bdev *bd = stm_pool_device_bdev(s->pool, dev);
-        if (!bd) { last_err = STM_EINVAL; continue; }
+        if (!bd) {
+            if (first_err == STM_OK) first_err = STM_EINVAL;
+            continue;
+        }
 
         stm_status rs = stm_bdev_read(bd, off, buf, len);
-        if (rs != STM_OK) { last_err = rs; continue; }
+        if (rs != STM_OK) {
+            if (first_err == STM_OK) first_err = rs;
+            continue;
+        }
 
         stm_blake3_hash h;
         stm_blake3(buf, len, &h);
@@ -1825,12 +1882,12 @@ stm_status stm_sync_mirror_read(stm_sync *s, const uint64_t paddrs[],
             return STM_OK;
         }
         /* csum mismatch: this replica is corrupt / stale; try next. */
-        last_err = STM_ECORRUPT;
+        if (first_err == STM_OK) first_err = STM_ECORRUPT;
     }
 
     pthread_mutex_unlock(&s->lock);
     /* No replica passed the csum check. */
-    return (last_err != STM_OK) ? last_err : STM_ECORRUPT;
+    return (first_err != STM_OK) ? first_err : STM_ECORRUPT;
 }
 
 /* ========================================================================= */

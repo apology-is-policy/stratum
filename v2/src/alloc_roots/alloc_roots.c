@@ -449,6 +449,19 @@ stm_status stm_alloc_roots_commit(stm_alloc_roots *r, uint64_t committed_gen,
                                                  &new_paddr, new_csum);
     if (ss != STM_OK) return ss;
 
+    /* R15 F2 P1: from here on, if any step fails we've left new_paddr
+     * reserved in the bootstrap bitmap without durably referencing it.
+     * A naive retry would reserve a DIFFERENT fresh paddr and
+     * permanently leak the first one. Free it before returning so
+     * retry-land sees it as pending → sweepable at the next
+     * committed_gen+1. rollback_reserve is a local helper to keep
+     * this DRY across the three failure points below. */
+    #define AR_ROLLBACK_RESERVE() \
+        do { (void)stm_btree_store_free_tree(new_paddr, committed_gen,  \
+                                                committed_gen, new_csum, \
+                                                &ROOTS_STORE_VT, &sc, &cx); \
+        } while (0)
+
     /* Defer-free the prior root's nodes. Mirrors alloc's pattern:
      * on a mount-claim gen bump with no mutation the old root is
      * preserved (short-circuit above), so a free here is safe only
@@ -461,11 +474,12 @@ stm_status stm_alloc_roots_commit(stm_alloc_roots *r, uint64_t committed_gen,
                                                      r->root_csum,
                                                      &ROOTS_STORE_VT, &sc, &cx);
         if (fs != STM_OK) {
-            /* New root is already on disk; failing to free the old is
-             * a bootstrap-bitmap leak (same class as R7d P0-2's
-             * commit-crash leak) — loud but not catastrophic. Propagate
-             * so the caller can wedge if desired; the in-RAM handle
-             * stays unchanged. */
+            /* Old root's free_tree failed. Release the new paddr we
+             * just reserved so retry doesn't leak it. New node's
+             * on-disk bytes remain but are unreferenced — a future
+             * commit_sweep reclaims them via the bootstrap's
+             * PENDING list once committed_gen+1 arrives. */
+            AR_ROLLBACK_RESERVE();
             return fs;
         }
     }
@@ -484,7 +498,11 @@ stm_status stm_alloc_roots_commit(stm_alloc_roots *r, uint64_t committed_gen,
      * (Merkle mismatch because the new content under that paddr
      * wouldn't match the UB's recorded csum). */
     stm_status bs = stm_bootstrap_commit(r->boot, committed_gen);
-    if (bs != STM_OK) return bs;
+    if (bs != STM_OK) {
+        AR_ROLLBACK_RESERVE();
+        return bs;
+    }
+    #undef AR_ROLLBACK_RESERVE
 
     r->root_paddr = new_paddr;
     r->root_gen   = committed_gen;

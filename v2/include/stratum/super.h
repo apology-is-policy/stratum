@@ -85,8 +85,19 @@ extern "C" {
  * alloc-tree leaf as a roots object → AEAD-decrypt-pass but value
  * format mismatch, catching at entry-decode time. The version bump
  * gates this unambiguously up-front. No feature-flag allocation
- * (version bump alone per ARCH §5.9). */
-#define STM_UB_VERSION        6u
+ * (version bump alone per ARCH §5.9).
+ *
+ * v6 → v7 (Phase 5 chunk P5-3c + R15 F6): roots-object leaf value
+ * layout extends 40 → 48 bytes (per-entry le64 `root_gen` appended
+ * after paddr + csum). Each device's alloc tree may be encrypted at
+ * a gen different from the roots object's own gen when alloc_commit's
+ * R7c P2-5 short-circuits on a clean tree; the per-entry gen lets
+ * mount-time attach_alloc pass the correct AEAD nonce. A v6 pool's
+ * 40-byte leaf values would length-check-fail at the v7 reader's
+ * decode_val (AR_VAL_LEN = 48 assertion). Version bump gates this
+ * up-front with STM_EBADVERSION at mount, same policy as v5 → v6.
+ * Feature-flag bump unnecessary (full version bump per ARCH §5.9). */
+#define STM_UB_VERSION        7u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */

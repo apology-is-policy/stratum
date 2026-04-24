@@ -457,12 +457,13 @@ STM_TEST(pool_fs_roundtrip_populates_roster) {
     STM_ASSERT_OK(stm_sb_mount_scan(d, &ub, &lbl, &slot));
     stm_bdev_close(d);
 
-    /* P5-3b bumped STM_UB_VERSION 5 → 6 for the allocator-roots
-     * object (ARCH §6.1). The constant symbol is what we assert on;
-     * the literal 6 is restated here so a future version bump that
-     * forgets to update this test fails loudly. */
+    /* P5-3c + R15 F6 bumped STM_UB_VERSION 6 → 7 for the roots-
+     * object leaf's value layout change (per-entry root_gen). The
+     * constant symbol is what we assert on; the literal 7 is
+     * restated here so a future version bump that forgets to update
+     * this test fails loudly. */
     STM_ASSERT_EQ(stm_load_le32(ub.ub_version), STM_UB_VERSION);
-    STM_ASSERT_EQ(STM_UB_VERSION, 6u);
+    STM_ASSERT_EQ(STM_UB_VERSION, 7u);
 
     /* Roster fields are populated. */
     STM_ASSERT_EQ(stm_load_le16(ub.ub_device_count), 1u);
@@ -607,6 +608,10 @@ static void mutate_version_to_5(stm_uberblock *ub) {
     ub->ub_version = stm_store_le32(5u);
 }
 
+static void mutate_version_to_6(stm_uberblock *ub) {
+    ub->ub_version = stm_store_le32(6u);
+}
+
 static void mutate_device_count_to_0(stm_uberblock *ub) {
     ub->ub_device_count = stm_store_le16(0);
 }
@@ -645,8 +650,8 @@ STM_TEST(pool_mount_refuses_v4_ub_with_bad_version) {
 }
 
 /* P5-3b: v5 pools (the last format before the allocator-roots
- * object landed) must fail cleanly under v6 code. Same contract as
- * the v4 test: STM_EBADVERSION, never silently STM_ENOENT. */
+ * object landed) must fail cleanly under v6+ code. Same contract
+ * as the v4 test: STM_EBADVERSION, never silently STM_ENOENT. */
 STM_TEST(pool_mount_refuses_v5_ub_with_bad_version) {
     make_tmp("v5_ub");
     char kf[256];
@@ -655,6 +660,30 @@ STM_TEST(pool_mount_refuses_v5_ub_with_bad_version) {
     make_keyfile(kf);
 
     format_and_tamper_live_ub(kf, mutate_version_to_5);
+
+    stm_fs_mount_opts mopts;
+    memset(&mopts, 0, sizeof mopts);
+    mopts.keyfile_path = kf;
+    stm_fs *fs = NULL;
+    STM_ASSERT_ERR(stm_fs_mount(g_tmp_path, &mopts, &fs), STM_EBADVERSION);
+    STM_ASSERT(fs == NULL);
+
+    unlink(g_tmp_path);
+    unlink(kf);
+}
+
+/* R15 F6 P2: v6 pools (the intermediate format between P5-3b and
+ * P5-3c) have a 40-byte roots-object leaf value; v7 pools have 48.
+ * A v6 pool must fail cleanly under v7+ code at the version check,
+ * not at the value-length check deep in alloc_roots_load_at. */
+STM_TEST(pool_mount_refuses_v6_ub_with_bad_version) {
+    make_tmp("v6_ub");
+    char kf[256];
+    snprintf(kf, sizeof kf, "/tmp/stm_v2_pool_v6_kf_%d.bin", (int)getpid());
+    unlink(kf);
+    make_keyfile(kf);
+
+    format_and_tamper_live_ub(kf, mutate_version_to_6);
 
     stm_fs_mount_opts mopts;
     memset(&mopts, 0, sizeof mopts);

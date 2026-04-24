@@ -390,19 +390,48 @@ static stm_status accel_ensure_fresh_locked(stm_alloc *a)
 typedef struct {
     stm_bootstrap *boot;
     stm_bdev      *bdev;
+    uint16_t       device_id;  /* R15 F1 P0: stamped into paddrs so per-
+                                  * device tree nodes get unique AEAD
+                                  * nonces. See comment on store_reserve. */
 } store_ctx;
 
+/*
+ * R15 F1 (P0) fix: metadata-node AEAD nonce construction in
+ * btree_store/crypt.c:build_nonce is (paddr || gen || pool_uuid).
+ * Without this stamp, two per-device alloc trees reserving from
+ * their respective bootstraps would get paddrs with device bits 0
+ * (stm_bootstrap stamps device=0 unconditionally in unit_to_paddr).
+ * Identical paddrs across devices + same gen + same pool_uuid +
+ * same metadata_key → NONCE REUSE under AEGIS-256, catastrophic.
+ *
+ * Fix: post-process the bootstrap's raw paddr to stamp the owning
+ * device_id into the top 16 bits. Every tree-node AEAD nonce is
+ * then unique per device even when per-device bootstrap offsets
+ * coincide. The symmetric strip-and-validate happens at store_write/
+ * read/free (strip device_id before handing the offset back to
+ * bootstrap, which is device-ignorant).
+ */
 static stm_status store_reserve(void *ctx_, uint64_t *out_paddr)
 {
     store_ctx *ctx = ctx_;
-    return stm_bootstrap_reserve(ctx->boot, STM_BOOTSTRAP_UNIT_BLOCKS,
-                                   /*hint_paddr=*/0, out_paddr);
+    uint64_t raw = 0;
+    stm_status s = stm_bootstrap_reserve(ctx->boot, STM_BOOTSTRAP_UNIT_BLOCKS,
+                                            /*hint_paddr=*/0, &raw);
+    if (s != STM_OK) return s;
+    /* Bootstrap returns (device=0, offset=N). Re-stamp the owning
+     * device_id so tree-node paddrs differ across devices. */
+    *out_paddr = stm_paddr_make(ctx->device_id, stm_paddr_offset(raw));
+    return STM_OK;
 }
 
 static stm_status store_free(void *ctx_, uint64_t paddr, uint64_t free_gen)
 {
     store_ctx *ctx = ctx_;
-    return stm_bootstrap_free(ctx->boot, paddr, STM_BOOTSTRAP_UNIT_BLOCKS,
+    if (stm_paddr_device(paddr) != ctx->device_id) return STM_EINVAL;
+    /* Bootstrap is device-ignorant; hand it the (device=0, offset)
+     * form it understands. */
+    uint64_t boot_paddr = stm_paddr_make(0, stm_paddr_offset(paddr));
+    return stm_bootstrap_free(ctx->boot, boot_paddr, STM_BOOTSTRAP_UNIT_BLOCKS,
                                 free_gen);
 }
 
@@ -410,7 +439,7 @@ static stm_status store_write(void *ctx_, uint64_t paddr,
                                 const void *buf, size_t len)
 {
     store_ctx *ctx = ctx_;
-    if (stm_paddr_device(paddr) != 0) return STM_EINVAL;
+    if (stm_paddr_device(paddr) != ctx->device_id) return STM_EINVAL;
     uint64_t byte_offset = stm_paddr_offset(paddr) * (uint64_t)STM_UB_SIZE;
     return stm_bdev_write(ctx->bdev, byte_offset, buf, len);
 }
@@ -419,7 +448,7 @@ static stm_status store_read(void *ctx_, uint64_t paddr,
                                void *buf, size_t len)
 {
     store_ctx *ctx = ctx_;
-    if (stm_paddr_device(paddr) != 0) return STM_EINVAL;
+    if (stm_paddr_device(paddr) != ctx->device_id) return STM_EINVAL;
     uint64_t byte_offset = stm_paddr_offset(paddr) * (uint64_t)STM_UB_SIZE;
     return stm_bdev_read(ctx->bdev, byte_offset, buf, len);
 }
@@ -634,7 +663,7 @@ stm_status stm_alloc_load_tree_at(stm_alloc *a, uint64_t root_paddr,
         pthread_mutex_unlock(&a->lock);
         return STM_EINVAL;    /* no key installed — mandatory in v2 */
     }
-    store_ctx scx = { .boot = a->boot, .bdev = a->bdev };
+    store_ctx scx = { .boot = a->boot, .bdev = a->bdev, .device_id = a->device_id };
     stm_status s = stm_btree_store_deserialize(a->tree, root_paddr, root_gen,
                                                  expected_root_csum,
                                                  &ALLOC_STORE_VT, &scx, &cx);
@@ -702,6 +731,23 @@ stm_status stm_alloc_set_device_id(stm_alloc *a, uint16_t device_id)
     if (!a) return STM_EINVAL;
     if (device_id >= STM_POOL_DEVICES_MAX) return STM_EINVAL;
     pthread_mutex_lock(&a->lock);
+    /* R15 F3 P1: reject if any tree mutation (reserve/free/ref/commit)
+     * has already fired, or if a tree's been loaded from disk. The
+     * returned-paddr stream must be internally consistent — every
+     * paddr has the same top-16 device bits, matching what free /
+     * lookup expect. Changing device_id AFTER reserves would leave
+     * existing in-tree paddrs stamped under the OLD device_id, then
+     * free/lookup/ref calls with the NEW device_id would reject them
+     * via the device-mismatch check, leaking the entries in the tree.
+     * Better to refuse the transition loudly.
+     *
+     * tree_dirty covers reserve / free / ref; current_tree_root != 0
+     * covers load_tree_at (mount-time rehydrate). Together they
+     * cover every code path that produces or observes a paddr. */
+    if (a->tree_dirty || a->current_tree_root != 0) {
+        pthread_mutex_unlock(&a->lock);
+        return STM_EBUSY;
+    }
     a->device_id = device_id;
     pthread_mutex_unlock(&a->lock);
     return STM_OK;
@@ -1108,7 +1154,7 @@ stm_status stm_alloc_commit(stm_alloc *a, uint64_t committed_gen)
             return STM_EINVAL;
         }
 
-        store_ctx scx = { .boot = a->boot, .bdev = a->bdev };
+        store_ctx scx = { .boot = a->boot, .bdev = a->bdev, .device_id = a->device_id };
 
         if (a->current_tree_root != 0) {
             /* P4-3b: free_tree needs the gen at which the OLD tree
@@ -1330,7 +1376,7 @@ stm_status stm_alloc_verify(const stm_alloc *a)
         return STM_EINVAL;
     }
 
-    store_ctx scx = { .boot = a->boot, .bdev = a->bdev };
+    store_ctx scx = { .boot = a->boot, .bdev = a->bdev, .device_id = a->device_id };
     stm_status s = stm_btree_store_verify(a->current_tree_root,
                                             a->current_tree_gen,
                                             a->current_tree_csum,

@@ -216,8 +216,16 @@ void stm_alloc_close(stm_alloc *a);
  * (every paddr returned by reserve has the same top 16 bits, matching
  * what free / lookup expect).
  *
- * Returns STM_EINVAL on a NULL handle. Accepts any device_id in
- * [0, STM_POOL_DEVICES_MAX) — the upper bound comes from pool.h.
+ * R15 F3 P1: refuses (STM_EBUSY) if the tree has been mutated
+ * (tree_dirty) or hydrated from disk (current_tree_root != 0),
+ * since paddrs stamped under the OLD device_id would be rejected
+ * at free/lookup under the NEW device_id. The correct call order
+ * is: stm_alloc_create → stm_alloc_set_device_id → (crypt ctx) →
+ * first reserve / load_tree_at.
+ *
+ * Returns STM_EINVAL on a NULL handle, STM_EBUSY if the tree is
+ * already in use. Accepts any device_id in [0, STM_POOL_DEVICES_MAX)
+ * — the upper bound comes from pool.h.
  */
 STM_MUST_USE
 stm_status stm_alloc_set_device_id(stm_alloc *a, uint16_t device_id);
