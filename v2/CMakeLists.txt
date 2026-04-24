@@ -177,6 +177,7 @@ add_subdirectory(src/p9)
 add_subdirectory(src/janus)
 add_subdirectory(src/pool)
 add_subdirectory(src/sync)
+add_subdirectory(src/scrub)
 add_subdirectory(src/fs)
 add_subdirectory(src/extent)
 
@@ -205,6 +206,7 @@ target_link_libraries(stratum INTERFACE
     stm_janus
     stm_pool
     stm_sync
+    stm_scrub
     stm_fs
     stm_extent)
 target_include_directories(stratum INTERFACE

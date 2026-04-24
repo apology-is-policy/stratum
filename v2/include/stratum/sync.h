@@ -262,6 +262,27 @@ STM_MUST_USE
 stm_status stm_sync_redundancy_get(const stm_sync *s,
                                      stm_redundancy_profile *out);
 
+/*
+ * P5-5-α: scrub support. Return borrowed pointers to sync-owned state
+ * that the scrub subsystem reads. Both are const-correct snapshot reads:
+ * the pool and allocs are borrowed, not owned.
+ *
+ * `stm_sync_pool`  — the pool handle (always non-NULL post-create/open).
+ * `stm_sync_alloc` — the alloc attached at `device_id`, or NULL if none
+ *                     is attached (REMOVED slot, or never attached).
+ *                     Safe against concurrent sync_commit (allocs[] is
+ *                     stable between attach/detach events; the caller
+ *                     is responsible for handling transient NULLs in a
+ *                     concurrent remove scenario).
+ *
+ * Lifetime: the returned pointers are valid until the NEXT operation
+ * that could change sync's attach table (attach_alloc, finish_evacuation,
+ * replace_device_online) completes. For scrub — which drives steps
+ * serially and holds no long-lived pointer — this is sufficient.
+ */
+stm_pool  *stm_sync_pool(const stm_sync *s);
+stm_alloc *stm_sync_alloc(const stm_sync *s, uint16_t device_id);
+
 /* ========================================================================= */
 /* P5-3c: multi-device alloc attach + mirror APIs.                             */
 /* ========================================================================= */

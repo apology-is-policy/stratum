@@ -1442,6 +1442,39 @@ stm_status stm_alloc_first_allocated(const stm_alloc *a,
     return STM_OK;
 }
 
+/* P5-5-α: scrub cursor scan. lo_key is inclusive (stm_btree_scan uses
+ * `lower_bound` internally), so passing min_start_block as the key
+ * returns the first entry whose start_block >= min_start_block. */
+stm_status stm_alloc_first_allocated_from(const stm_alloc *a,
+                                              uint64_t min_start_block,
+                                              uint64_t *out_paddr,
+                                              uint64_t *out_length_blocks)
+{
+    if (!a || !out_paddr || !out_length_blocks) return STM_EINVAL;
+    if (min_start_block >= (UINT64_C(1) << 48)) return STM_EINVAL;
+    *out_paddr = 0;
+    *out_length_blocks = 0;
+
+    stm_alloc *ma = (stm_alloc *)a;
+    pthread_mutex_lock(&ma->lock);
+
+    uint8_t lo[8];
+    encode_key(min_start_block, lo);
+
+    first_allocated_ctx ctx = { 0 };
+    stm_status s = stm_btree_mt_scan(ma->tree, lo, 8, NULL, 0,
+                                      first_allocated_cb, &ctx);
+    pthread_mutex_unlock(&ma->lock);
+
+    if (s != STM_OK) return s;
+    if (ctx.saw_corruption) return STM_ECORRUPT;
+    if (!ctx.found) return STM_ENOENT;
+
+    *out_paddr         = stm_paddr_make(ma->device_id, ctx.start_block);
+    *out_length_blocks = (uint64_t)ctx.length;
+    return STM_OK;
+}
+
 stm_status stm_alloc_is_allocated(const stm_alloc *a, uint64_t paddr,
                                     bool *out_allocated)
 {

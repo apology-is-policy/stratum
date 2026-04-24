@@ -390,6 +390,30 @@ stm_status stm_alloc_first_allocated(const stm_alloc *a,
                                         uint64_t *out_paddr,
                                         uint64_t *out_length_blocks);
 
+/*
+ * P5-5-α: scrub cursor support. Same as `stm_alloc_first_allocated` but
+ * resumes scanning at `min_start_block` (inclusive). Returns the first
+ * entry whose `start_block >= min_start_block` AND `refcount >= 1`,
+ * skipping any PENDING entries in between.
+ *
+ * Used by scrub to advance through a device's alloc tree one range at a
+ * time: after processing a range at `(paddr, length)`, caller passes
+ * `min_start_block = stm_paddr_offset(paddr) + length` to get the next
+ * one. When the tree has no further live entries at or after
+ * `min_start_block`, returns STM_ENOENT — signals the device is drained
+ * from the cursor's POV.
+ *
+ *   STM_OK        — *out_paddr / *out_length_blocks populated.
+ *   STM_ENOENT    — no live entries at or after `min_start_block`.
+ *   STM_ECORRUPT  — malformed tree entry (key_len != 8 or val_len != 8).
+ *   STM_EINVAL    — NULL args or `min_start_block > UINT48_MAX`.
+ */
+STM_MUST_USE
+stm_status stm_alloc_first_allocated_from(const stm_alloc *a,
+                                             uint64_t min_start_block,
+                                             uint64_t *out_paddr,
+                                             uint64_t *out_length_blocks);
+
 #ifdef __cplusplus
 }
 #endif

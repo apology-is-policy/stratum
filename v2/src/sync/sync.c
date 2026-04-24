@@ -1650,6 +1650,30 @@ stm_status stm_sync_redundancy_get(const stm_sync *s,
     return STM_OK;
 }
 
+/* P5-5-α: scrub getters. Read-only borrowed access to sync's pool and
+ * per-device allocs. Guarded by sync->lock to order against
+ * attach_alloc / finish_evacuation. */
+stm_pool *stm_sync_pool(const stm_sync *s)
+{
+    if (!s) return NULL;
+    stm_sync *ms = (stm_sync *)s;
+    pthread_mutex_lock(&ms->lock);
+    stm_pool *p = s->pool;
+    pthread_mutex_unlock(&ms->lock);
+    return p;
+}
+
+stm_alloc *stm_sync_alloc(const stm_sync *s, uint16_t device_id)
+{
+    if (!s) return NULL;
+    if (device_id >= STM_POOL_DEVICES_MAX) return NULL;
+    stm_sync *ms = (stm_sync *)s;
+    pthread_mutex_lock(&ms->lock);
+    stm_alloc *a = s->allocs[device_id];
+    pthread_mutex_unlock(&ms->lock);
+    return a;
+}
+
 /* ========================================================================= */
 /* P5-3c: multi-device alloc attach + mirror APIs.                             */
 /* ========================================================================= */
