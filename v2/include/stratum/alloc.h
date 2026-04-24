@@ -376,7 +376,7 @@ stm_status stm_alloc_is_allocated(const stm_alloc *a, uint64_t paddr,
  * top 16 bits, start_block in low 48) and `*out_length_blocks` gets
  * its length.
  *
- * Evacuation drives this by repeatedly calling until STM_ENODATA —
+ * Evacuation drives this by repeatedly calling until STM_ENOENT —
  * each call yields the current-lowest allocated range, which is then
  * read + mirrored + freed, shrinking the tree until empty.
  *

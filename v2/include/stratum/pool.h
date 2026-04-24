@@ -338,7 +338,7 @@ stm_status stm_pool_remove_device(stm_pool *p, uint16_t device_id,
  *     identical to stm_pool_remove_device.
  *
  * The caller drives the drain with `stm_sync_evacuation_step` until
- * STM_ENODATA, then finalizes with `stm_pool_finish_evacuation`. The
+ * STM_ENOENT, then finalizes with `stm_pool_finish_evacuation`. The
  * sequence must complete within one mount session: on crash recovery
  * during EVACUATING, the next mount sees the state byte in the
  * uberblock's roster and must decide whether to resume the drain or
@@ -360,7 +360,7 @@ stm_status stm_pool_begin_evacuation(stm_pool *p, uint16_t device_id,
  * REMOVED. No redundancy re-check — that happened at begin.
  *
  * Precondition (checked by caller, not enforced here): sync's
- * evacuation_step returned STM_ENODATA for this device, i.e., the
+ * evacuation_step returned STM_ENOENT for this device, i.e., the
  * alloc tree is drained. Callers that skip this check and call
  * finish with live data still on the device leave the post-remove
  * block pointers dangling (sync's mirror_read will fail to find the

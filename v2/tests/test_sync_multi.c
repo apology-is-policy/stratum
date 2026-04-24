@@ -1685,17 +1685,18 @@ STM_TEST(sync_multi_add_device_mid_session_survives_remount) {
 
 /*
  * Mirror(2) × 3-device pool. Write two blocks via mirror(2), landing
- * replicas on devs 0 + 1. Commit. Evacuate dev 0: each evacuation_step
- * migrates one replica from dev 0 to a survivor (dev 2), freeing the
- * original entry from dev 0's alloc tree. After the drain completes,
- * finish_evacuation flips dev 0 to REMOVED and the pool continues as
- * a 2-live-device mirror(2) with the data readable via (dev_2, dev_1)
- * replicas.
+ * replicas on devs 0 + 1. Commit. Evacuate dev 1: each evacuation_step
+ * migrates the dev-1 replica to survivor dev 2, freeing the entry
+ * from dev 1's alloc tree. After the drain completes, the safe wrapper
+ * stm_sync_finish_evacuation verifies drain + flips dev 1 to REMOVED +
+ * detaches the alloc handle. The pool continues as a 2-live-device
+ * mirror(2) with data readable via (dev_0, dev_2).
  *
  * Exercises EvacuateAtomic from v2/specs/evac.tla: each step is an
- * atomic remove-d + add-s transition on replicas[b]. mirror_read with
- * the updated paddrs succeeds; mirror_read with the stale (dev 0)
- * paddrs falls back via the surviving replica.
+ * atomic remove-d + add-s transition on replicas[b]. Dev 0 is the
+ * metadata primary and can't be evacuated per R17 P1-1 (device-0
+ * guard in pool.c) — this test picks dev 1 as target, dev 2 as
+ * survivor.
  */
 STM_TEST(sync_multi_evacuate_migrates_to_survivor) {
     stm_bdev *bds[NDEV] = {0};
@@ -1703,7 +1704,7 @@ STM_TEST(sync_multi_evacuate_migrates_to_survivor) {
     stm_pool *pool = NULL; stm_sync *s = NULL;
     setup_mirror_pool(2, "evac_happy", bds, as, &pool, &s);
 
-    /* Two mirrored writes — exercise multiple alloc entries on dev 0. */
+    /* Two mirrored writes — exercise multiple alloc entries on dev 1. */
     uint64_t paddrs_a[2] = { 0 }, paddrs_b[2] = { 0 };
     STM_ASSERT_OK(stm_sync_reserve_mirror(s, 1u, 2u, paddrs_a));
     STM_ASSERT_OK(stm_sync_reserve_mirror(s, 1u, 2u, paddrs_b));
@@ -1727,62 +1728,62 @@ STM_TEST(sync_multi_evacuate_migrates_to_survivor) {
     /* Persist the mirrored writes + allocator state. */
     STM_ASSERT_OK(stm_sync_commit(s));
 
-    /* Begin evacuation on dev 0. Floor=2: we had 3 live devices, so
+    /* Begin evacuation on dev 1. Floor=2: we had 3 live devices, so
      * (live-1)=2 >= floor=2. */
-    STM_ASSERT_OK(stm_pool_begin_evacuation(pool, 0, /*floor=*/2));
-    const stm_pool_device *d0 = stm_pool_device_info(pool, 0);
-    STM_ASSERT(d0 != NULL);
-    STM_ASSERT_EQ(d0->state, STM_DEV_STATE_EVACUATING);
+    STM_ASSERT_OK(stm_pool_begin_evacuation(pool, 1, /*floor=*/2));
+    const stm_pool_device *d1 = stm_pool_device_info(pool, 1);
+    STM_ASSERT(d1 != NULL);
+    STM_ASSERT_EQ(d1->state, STM_DEV_STATE_EVACUATING);
 
     /* Persist EVACUATING state. Quorum still 2 (live=3 incl.
      * EVACUATING). */
     STM_ASSERT_OK(stm_sync_commit(s));
 
-    /* Drain step-by-step. Caller picks survivor=2 (the only dev that
-     * isn't dev 0 or dev 1 — dev 1 already holds the OTHER replicas of
-     * these blocks, so picking it would collapse replicas onto one
-     * device). Each step migrates one range and returns old/new paddrs
-     * for caller's bptr update. */
+    /* Drain step-by-step. Caller picks survivor=2: dev 0 already holds
+     * the other replicas, so picking it would collapse replicas onto
+     * one device. Each step migrates one range and returns old/new
+     * paddrs for the caller's bptr update. */
     uint64_t old_p = 0, new_p = 0;
 
-    /* Step 1: migrates one of the two dev-0 entries. */
-    STM_ASSERT_OK(stm_sync_evacuation_step(s, 0, 2, &old_p, &new_p));
-    STM_ASSERT_EQ(stm_paddr_device(old_p), 0u);
+    /* Step 1: migrates one of the two dev-1 entries. */
+    STM_ASSERT_OK(stm_sync_evacuation_step(s, 1, 2, &old_p, &new_p));
+    STM_ASSERT_EQ(stm_paddr_device(old_p), 1u);
     STM_ASSERT_EQ(stm_paddr_device(new_p), 2u);
-    /* Update whichever replica-list entry used old_p. */
-    if (paddrs_a[0] == old_p) paddrs_a[0] = new_p;
-    else if (paddrs_b[0] == old_p) paddrs_b[0] = new_p;
+    if (paddrs_a[1] == old_p) paddrs_a[1] = new_p;
+    else if (paddrs_b[1] == old_p) paddrs_b[1] = new_p;
     else STM_ASSERT(false);  /* step returned a paddr we didn't write */
 
     /* Step 2: migrates the remaining entry. */
-    STM_ASSERT_OK(stm_sync_evacuation_step(s, 0, 2, &old_p, &new_p));
-    STM_ASSERT_EQ(stm_paddr_device(old_p), 0u);
+    STM_ASSERT_OK(stm_sync_evacuation_step(s, 1, 2, &old_p, &new_p));
+    STM_ASSERT_EQ(stm_paddr_device(old_p), 1u);
     STM_ASSERT_EQ(stm_paddr_device(new_p), 2u);
-    if (paddrs_a[0] == old_p) paddrs_a[0] = new_p;
-    else if (paddrs_b[0] == old_p) paddrs_b[0] = new_p;
+    if (paddrs_a[1] == old_p) paddrs_a[1] = new_p;
+    else if (paddrs_b[1] == old_p) paddrs_b[1] = new_p;
     else STM_ASSERT(false);
 
     /* Step 3: tree drained → STM_ENOENT. Caller proceeds to finish. */
-    STM_ASSERT_ERR(stm_sync_evacuation_step(s, 0, 2, &old_p, &new_p),
+    STM_ASSERT_ERR(stm_sync_evacuation_step(s, 1, 2, &old_p, &new_p),
                     STM_ENOENT);
 
     /* Persist the migrations (survivor reserves + target frees). */
     STM_ASSERT_OK(stm_sync_commit(s));
 
-    /* Finalize — dev 0 becomes REMOVED. */
-    STM_ASSERT_OK(stm_pool_finish_evacuation(pool, 0));
+    /* Finalize via the safe wrapper — verifies drain, flips dev 1 to
+     * REMOVED, detaches s->allocs[1] so future commits skip. */
+    STM_ASSERT_OK(stm_sync_finish_evacuation(s, 1));
     STM_ASSERT_EQ(stm_pool_live_device_count(pool), 2u);
-    STM_ASSERT(stm_pool_device_bdev(pool, 0) == NULL);
+    STM_ASSERT(stm_pool_device_bdev(pool, 1) == NULL);
 
-    /* Persist REMOVED state. */
+    /* Persist REMOVED state. Commit loop now skips dev 1 (state = REMOVED
+     * AND allocs[1] is NULL post-detach). */
     STM_ASSERT_OK(stm_sync_commit(s));
 
-    /* Read back via the updated paddrs — one replica on dev 2, the
-     * other on dev 1 (unchanged). */
-    STM_ASSERT_EQ(stm_paddr_device(paddrs_a[0]), 2u);
-    STM_ASSERT_EQ(stm_paddr_device(paddrs_a[1]), 1u);
-    STM_ASSERT_EQ(stm_paddr_device(paddrs_b[0]), 2u);
-    STM_ASSERT_EQ(stm_paddr_device(paddrs_b[1]), 1u);
+    /* Read back via the updated paddrs — one replica on dev 0, the
+     * other on dev 2. */
+    STM_ASSERT_EQ(stm_paddr_device(paddrs_a[0]), 0u);
+    STM_ASSERT_EQ(stm_paddr_device(paddrs_a[1]), 2u);
+    STM_ASSERT_EQ(stm_paddr_device(paddrs_b[0]), 0u);
+    STM_ASSERT_EQ(stm_paddr_device(paddrs_b[1]), 2u);
 
     stm_blake3_hash exp_a, exp_b;
     stm_blake3(payload_a, sizeof payload_a, &exp_a);
@@ -1799,6 +1800,47 @@ STM_TEST(sync_multi_evacuate_migrates_to_survivor) {
                                           readback, sizeof readback,
                                           exp_b.bytes));
     STM_ASSERT_EQ(memcmp(readback, payload_b, sizeof payload_b), 0);
+
+    teardown_mirror_pool(bds, as, pool, s);
+}
+
+/* R17 P1-2 / P2-5: safe wrappers refuse non-drained devices.
+ *   stm_sync_remove_device on a dev with allocated data → STM_EBUSY.
+ *   stm_sync_finish_evacuation with data still on target → STM_EBUSY. */
+STM_TEST(sync_multi_safe_removal_refuses_non_drained) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "safe_remove", bds, as, &pool, &s);
+
+    /* Seed data on devs 0 + 1. */
+    uint64_t paddrs[2] = { 0 };
+    STM_ASSERT_OK(stm_sync_reserve_mirror(s, 1u, 2u, paddrs));
+    uint8_t payload[STM_UB_SIZE];
+    for (size_t i = 0; i < sizeof payload; i++)
+        payload[i] = (uint8_t)((i ^ 0x33) & 0xff);
+    size_t n_conf = 0;
+    STM_ASSERT_OK(stm_sync_mirror_write(s, paddrs, 2u,
+                                            payload, sizeof payload, &n_conf));
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    /* Dev 1 has allocated data. Safe remove refuses with EBUSY. */
+    STM_ASSERT_ERR(stm_sync_remove_device(s, 1, /*floor=*/1), STM_EBUSY);
+
+    /* Begin evacuation, don't drain yet. finish refuses with EBUSY. */
+    STM_ASSERT_OK(stm_pool_begin_evacuation(pool, 1, /*floor=*/2));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    STM_ASSERT_ERR(stm_sync_finish_evacuation(s, 1), STM_EBUSY);
+
+    /* Drain + finish via safe wrapper succeeds. */
+    uint64_t op = 0, np = 0;
+    STM_ASSERT_OK(stm_sync_evacuation_step(s, 1, 2, &op, &np));
+    STM_ASSERT_ERR(stm_sync_evacuation_step(s, 1, 2, &op, &np),
+                    STM_ENOENT);
+    STM_ASSERT_OK(stm_sync_commit(s));
+    STM_ASSERT_OK(stm_sync_finish_evacuation(s, 1));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    STM_ASSERT_EQ(stm_pool_live_device_count(pool), 2u);
 
     teardown_mirror_pool(bds, as, pool, s);
 }

@@ -370,6 +370,12 @@ stm_status stm_pool_remove_device(stm_pool *p, uint16_t device_id,
 
     if ((size_t)device_id >= p->device_count) return STM_EINVAL;
 
+    /* R17 P1-1: device 0 is the metadata primary (sync_open hard-codes
+     * it at pool.c:1163 for keyschema + alloc-roots). Removing it
+     * makes the pool unmountable. Until sync_open picks a dynamic
+     * primary (post-P5-4c), reject at the boundary. */
+    if (device_id == 0) return STM_ENOTSUPPORTED;
+
     stm_pool_device *slot = &p->devices[device_id];
     /* Slot must be LIVE to be removed. REMOVED → already burned.
      * EVACUATING → caller must finish the in-flight evacuation via
@@ -380,6 +386,17 @@ stm_status stm_pool_remove_device(stm_pool *p, uint16_t device_id,
      * the evacuation step and leak live data. */
     if (slot->state == STM_DEV_STATE_REMOVED)    return STM_EINVAL;
     if (slot->state == STM_DEV_STATE_EVACUATING) return STM_EINVAL;
+
+    /* R17 P2-2: refuse when any OTHER slot is EVACUATING. Concurrent
+     * remove + in-flight evacuation is a live-count accounting hazard
+     * (begin_evac checked live-1 against floor with a live count
+     * that now is stale by this remove). Mirror AtMostOneEvacuating's
+     * spirit to the remove path. */
+    for (size_t i = 0; i < p->device_count; i++) {
+        if (p->devices[i].state == STM_DEV_STATE_EVACUATING) {
+            return STM_EBUSY;
+        }
+    }
 
     /* Spec's RedundancyPreservedOnRemove (device_lifecycle.tla):
      * post-remove live count must remain >= redundancy_floor.
@@ -428,6 +445,11 @@ stm_status stm_pool_begin_evacuation(stm_pool *p, uint16_t device_id,
     if (!p) return STM_EINVAL;
     if (p->read_only) return STM_EROFS;
     if ((size_t)device_id >= p->device_count) return STM_EINVAL;
+
+    /* R17 P1-1: device 0 is the metadata primary (sync_open hard-codes
+     * it). Draining and removing it leaves the pool unmountable. Same
+     * guard as stm_pool_remove_device. */
+    if (device_id == 0) return STM_ENOTSUPPORTED;
 
     stm_pool_device *slot = &p->devices[device_id];
     /* Only ONLINE / FAULTED are eligible. REMOVED is a burned tombstone;

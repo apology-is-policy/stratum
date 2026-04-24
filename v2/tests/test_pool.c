@@ -1192,18 +1192,19 @@ STM_TEST(pool_remove_device_enforces_redundancy_floor) {
                     STM_EINVAL);
     STM_ASSERT_EQ(stm_pool_live_device_count(p), 2u);
 
-    /* floor=2 on device 0 also refused. */
+    /* R17 P1-1: device 0 is the metadata primary and always refused
+     * (STM_ENOTSUPPORTED), regardless of floor. */
     STM_ASSERT_ERR(stm_pool_remove_device(p, 0, /*redundancy_floor=*/2),
-                    STM_EINVAL);
+                    STM_ENOTSUPPORTED);
 
     /* floor=1 on device 1 succeeds. */
     STM_ASSERT_OK(stm_pool_remove_device(p, 1, /*redundancy_floor=*/1));
     STM_ASSERT_EQ(stm_pool_live_device_count(p), 1u);
 
-    /* Further remove with floor=1 on device 0 would drop live to 0,
-     * below floor → refused. */
+    /* Re-attempting on device 0 still refused with STM_ENOTSUPPORTED
+     * (device-0 guard fires before the floor check). */
     STM_ASSERT_ERR(stm_pool_remove_device(p, 0, /*redundancy_floor=*/1),
-                    STM_EINVAL);
+                    STM_ENOTSUPPORTED);
 
     stm_pool_close(p);
     stm_bdev_close(d);
@@ -1378,7 +1379,8 @@ STM_TEST(pool_begin_finish_evacuation_marks_states) {
 
 /* RedundancyPreservedDuringEvacuation: begin refuses when (live-1) <
  * floor. Symmetric with remove_device's guard (spec:
- * v2/specs/evac.tla RedundancyPreservedDuringEvacuation). */
+ * v2/specs/evac.tla RedundancyPreservedDuringEvacuation). Dev 0 can't
+ * be evacuated (R17 P1-1 device-0 guard), so this test uses dev 1. */
 STM_TEST(pool_begin_evacuation_enforces_redundancy_floor) {
     make_tmp("evac_floor");
     stm_bdev *d = open_fresh_device();
@@ -1396,7 +1398,6 @@ STM_TEST(pool_begin_evacuation_enforces_redundancy_floor) {
     STM_ASSERT_EQ(stm_pool_live_device_count(p), 2u);
 
     /* floor=2, live=2: (live-1)=1 < 2 — refused. */
-    STM_ASSERT_ERR(stm_pool_begin_evacuation(p, 0, 2), STM_EINVAL);
     STM_ASSERT_ERR(stm_pool_begin_evacuation(p, 1, 2), STM_EINVAL);
     STM_ASSERT_EQ(stm_pool_live_device_count(p), 2u);
 
@@ -1409,6 +1410,87 @@ STM_TEST(pool_begin_evacuation_enforces_redundancy_floor) {
     stm_pool_close(p);
     stm_bdev_close(d);
     stm_bdev_close(d2);
+    unlink(g_tmp_path);
+}
+
+/* R17 P1-1: device 0 is the metadata primary (sync_open hard-codes it).
+ * begin_evacuation and remove_device must refuse device_id == 0 with
+ * STM_ENOTSUPPORTED until sync_open can pick a dynamic primary. */
+STM_TEST(pool_device_zero_guarded_from_remove_and_evacuation) {
+    make_tmp("dev0_guard");
+    stm_bdev *d = open_fresh_device();
+    stm_pool *p = make_single_device_pool(d, POOL_UUID, DEVICE_UUID,
+                                             STM_DEV_ROLE_DATA,
+                                             STM_DEV_CLASS_SSD,
+                                             STM_DEV_STATE_ONLINE);
+    stm_bdev *d2 = open_companion_device("dev0_guard");
+    stm_pool_device add = {
+        .uuid = { DEVICE_UUID_B[0], DEVICE_UUID_B[1] },
+        .role = STM_DEV_ROLE_DATA, .class_ = STM_DEV_CLASS_SSD,
+        .state = STM_DEV_STATE_ONLINE, .bdev = d2,
+    };
+    STM_ASSERT_OK(stm_pool_add_device(p, &add));
+
+    /* Both paths refuse device 0, regardless of floor value. */
+    STM_ASSERT_ERR(stm_pool_begin_evacuation(p, 0, 0), STM_ENOTSUPPORTED);
+    STM_ASSERT_ERR(stm_pool_begin_evacuation(p, 0, 1), STM_ENOTSUPPORTED);
+    STM_ASSERT_ERR(stm_pool_remove_device(p, 0, 0), STM_ENOTSUPPORTED);
+    STM_ASSERT_ERR(stm_pool_remove_device(p, 0, 1), STM_ENOTSUPPORTED);
+
+    /* Dev 1 is fine. */
+    STM_ASSERT_OK(stm_pool_begin_evacuation(p, 1, 1));
+    STM_ASSERT_OK(stm_pool_finish_evacuation(p, 1));
+
+    /* Slot 0 is still ONLINE. */
+    const stm_pool_device *info0 = stm_pool_device_info(p, 0);
+    STM_ASSERT(info0 != NULL);
+    STM_ASSERT_EQ(info0->state, STM_DEV_STATE_ONLINE);
+
+    stm_pool_close(p);
+    stm_bdev_close(d);
+    stm_bdev_close(d2);
+    unlink(g_tmp_path);
+}
+
+/* R17 P2-2: remove_device refuses STM_EBUSY when any OTHER slot is
+ * EVACUATING. Prevents the live-count accounting hazard of three-way
+ * transitions dropping below the floor at finalize time. */
+STM_TEST(pool_remove_device_refuses_during_evacuation) {
+    make_tmp("remove_during_evac");
+    stm_bdev *d = open_fresh_device();
+    stm_pool *p = make_single_device_pool(d, POOL_UUID, DEVICE_UUID,
+                                             STM_DEV_ROLE_DATA,
+                                             STM_DEV_CLASS_SSD,
+                                             STM_DEV_STATE_ONLINE);
+    stm_bdev *d2 = open_companion_device("remove_during_evac_a");
+    stm_bdev *d3 = open_companion_device("remove_during_evac_b");
+    stm_pool_device addb = {
+        .uuid = { DEVICE_UUID_B[0], DEVICE_UUID_B[1] },
+        .role = STM_DEV_ROLE_DATA, .class_ = STM_DEV_CLASS_SSD,
+        .state = STM_DEV_STATE_ONLINE, .bdev = d2,
+    };
+    stm_pool_device addc = {
+        .uuid = { 0xd0d0ULL, 0xd1d1ULL },
+        .role = STM_DEV_ROLE_DATA, .class_ = STM_DEV_CLASS_SSD,
+        .state = STM_DEV_STATE_ONLINE, .bdev = d3,
+    };
+    STM_ASSERT_OK(stm_pool_add_device(p, &addb));
+    STM_ASSERT_OK(stm_pool_add_device(p, &addc));
+
+    STM_ASSERT_OK(stm_pool_begin_evacuation(p, 1, /*floor=*/1));
+
+    /* While slot 1 is EVACUATING, remove on slot 2 is refused
+     * with EBUSY (even though slot 2 itself is ONLINE). */
+    STM_ASSERT_ERR(stm_pool_remove_device(p, 2, 1), STM_EBUSY);
+
+    /* After finish, remove on slot 2 succeeds. */
+    STM_ASSERT_OK(stm_pool_finish_evacuation(p, 1));
+    STM_ASSERT_OK(stm_pool_remove_device(p, 2, 0));
+
+    stm_pool_close(p);
+    stm_bdev_close(d);
+    stm_bdev_close(d2);
+    stm_bdev_close(d3);
     unlink(g_tmp_path);
 }
 

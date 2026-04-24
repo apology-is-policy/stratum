@@ -411,6 +411,44 @@ stm_status stm_sync_evacuation_step(stm_sync *s, uint16_t target_device_id,
                                        uint64_t *out_old_paddr,
                                        uint64_t *out_new_paddr);
 
+/*
+ * R17 P1-2 safe wrapper over stm_pool_remove_device. Verifies the
+ * target's alloc tree is drained (no ALLOCATED entries) before
+ * flipping the slot to REMOVED. Callers that skip evacuation on a
+ * data-bearing device would silently violate evac.tla's
+ * NoTargetReplicasAfterComplete; this wrapper returns STM_EBUSY
+ * instead.
+ *
+ * Returns:
+ *   STM_OK             — slot flipped to REMOVED.
+ *   STM_EBUSY          — target has allocated data; call
+ *                         stm_pool_begin_evacuation → evacuation_step
+ *                         loop → stm_sync_finish_evacuation.
+ *   STM_ENOTSUPPORTED  — device_id == 0 (metadata primary; P5-4c).
+ *   STM_EINVAL / STM_EROFS — as for stm_pool_remove_device.
+ */
+STM_MUST_USE
+stm_status stm_sync_remove_device(stm_sync *s, uint16_t device_id,
+                                     size_t redundancy_floor);
+
+/*
+ * R17 P2-5 safe wrapper over stm_pool_finish_evacuation. Verifies
+ * the target's alloc tree is drained, then finalizes the EVACUATING
+ * → REMOVED transition via the pool primitive, then detaches the
+ * target's alloc handle from sync's internal table (s->allocs[X] =
+ * NULL) so subsequent sync_commit loops skip it. The caller retains
+ * ownership of the stm_alloc and is responsible for stm_alloc_close.
+ *
+ * Returns:
+ *   STM_OK             — slot flipped to REMOVED; alloc detached.
+ *   STM_EBUSY          — target tree still has allocated ranges
+ *                         (more evacuation_step calls needed).
+ *   STM_EINVAL         — slot not EVACUATING or out-of-range.
+ *   STM_EROFS          — RO pool.
+ */
+STM_MUST_USE
+stm_status stm_sync_finish_evacuation(stm_sync *s, uint16_t device_id);
+
 /* ========================================================================= */
 /* Per-dataset key management (P4-4c).                                        */
 /* ========================================================================= */

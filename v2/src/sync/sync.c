@@ -1137,9 +1137,15 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
      * ENOTSUPPORTED for future-incompatible kinds (RS/LRC) at mount,
      * matching the feature-flag policy from ARCH §5.9. */
     stm_redundancy_profile rp;
+    /* R17 P2-4: decode against LIVE device count, not total. After a
+     * P5-4b-i remove, total includes REMOVED slots (burned tombstones)
+     * but mirror_n must still be satisfiable by live devices. The
+     * symmetric sync_redundancy_validate at create uses live count
+     * (see pool.c call site above); mount drifted. */
     stm_status rps = sync_redundancy_decode(ub.ub_redundancy_kind,
                                                ub.ub_redundancy_params,
-                                               n, &rp);
+                                               stm_pool_live_device_count(p),
+                                               &rp);
     if (rps != STM_OK) return rps;
 
     stm_sync *s2 = sync_new(p, a);
@@ -1480,6 +1486,16 @@ stm_status stm_sync_commit(stm_sync *s)
     for (uint16_t dev = 0; dev < STM_POOL_DEVICES_MAX; dev++) {
         stm_alloc *ai = s->allocs[dev];
         if (!ai) continue;
+        /* R17 P2-1: skip REMOVED devices. finish_evacuation clears the
+         * slot's bdev and burns its UUID; the stale alloc handle still
+         * caches its original bdev, so letting commit run would write
+         * orphan state to a device no longer in the pool (and possibly
+         * trigger UAF if the caller has closed the bdev after the
+         * finish). The safe wrapper stm_sync_finish_evacuation
+         * additionally detaches s->allocs[dev] on success; this check
+         * is the belt to that braces. */
+        const stm_pool_device *di = stm_pool_device_info(s->pool, dev);
+        if (di && di->state == STM_DEV_STATE_REMOVED) continue;
         stm_status s_alloc = stm_alloc_commit(ai, target_gen);
         if (s_alloc != STM_OK) {
             pthread_mutex_unlock(&s->lock);
@@ -1997,6 +2013,25 @@ stm_status stm_sync_evacuation_step(stm_sync *s, uint16_t target_device_id,
         return STM_ECORRUPT;
     }
 
+    /* R17 P2-3: cap the per-step copy window. Without a cap, a large
+     * contiguous allocation (e.g. a multi-GiB extent from a P6 writer)
+     * would malloc proportional RAM in one step. The alloc tree doesn't
+     * yet support partial-free, so we can't stream sub-ranges; instead,
+     * refuse the over-large range with STM_ENOTSUPPORTED. Operators hit
+     * this only when they have ranges > STM_EVAC_STEP_MAX_BYTES; the
+     * P5-4c scope will add partial-free + streaming to close this gap.
+     * The size_t overflow guard is separate — on 32-bit platforms a
+     * sufficiently large length_blocks × STM_UB_SIZE wraps. */
+    static const uint64_t STM_EVAC_STEP_MAX_BYTES = 4u * 1024u * 1024u;
+    if (length_blocks > (uint64_t)SIZE_MAX / (uint64_t)STM_UB_SIZE) {
+        pthread_mutex_unlock(&s->lock);
+        return STM_ERANGE;
+    }
+    if (length_blocks > STM_EVAC_STEP_MAX_BYTES / (uint64_t)STM_UB_SIZE) {
+        pthread_mutex_unlock(&s->lock);
+        return STM_ENOTSUPPORTED;
+    }
+
     uint16_t survivor = survivor_device_id;
 
     /* Read + reserve + write + free — all in the critical section so the
@@ -2065,6 +2100,84 @@ stm_status stm_sync_evacuation_step(stm_sync *s, uint16_t target_device_id,
     *out_new_paddr = new_paddr;
 
     pthread_mutex_unlock(&s->lock);
+    return STM_OK;
+}
+
+/* ========================================================================= */
+/* R17 P1-2 / P2-5: sync-level safe wrappers for device removal.             */
+/* ========================================================================= */
+
+/* Shared drain check: does s->allocs[device_id] still hold ALLOCATED
+ * (refcount >= 1) entries? Returns:
+ *   STM_OK      — tree drained; safe to remove.
+ *   STM_EBUSY   — ≥1 allocated range remains; caller must evacuate.
+ *   (other)     — passthrough of alloc_first_allocated's error.
+ *
+ * Takes the sync lock internally; callers must not already hold it. */
+static stm_status sync_require_drained(stm_sync *s, uint16_t device_id)
+{
+    if (device_id >= stm_pool_device_count(s->pool)) return STM_EINVAL;
+
+    pthread_mutex_lock(&s->lock);
+    stm_alloc *a = s->allocs[device_id];
+    if (!a) {
+        /* No alloc attached means no tree at all — trivially drained.
+         * Pre-P5-3c this held for N=1 pools; post-P5-3c all devices
+         * should have allocs attached pre-commit, so this arm mostly
+         * handles the just-begin-evacuated-on-empty-device case. */
+        pthread_mutex_unlock(&s->lock);
+        return STM_OK;
+    }
+    uint64_t probe_paddr = 0, probe_length = 0;
+    stm_status fs = stm_alloc_first_allocated(a, &probe_paddr, &probe_length);
+    pthread_mutex_unlock(&s->lock);
+
+    if (fs == STM_ENOENT) return STM_OK;       /* drained */
+    if (fs == STM_OK)     return STM_EBUSY;    /* still has data */
+    return fs;                                  /* ECORRUPT etc. */
+}
+
+stm_status stm_sync_remove_device(stm_sync *s, uint16_t device_id,
+                                     size_t redundancy_floor)
+{
+    if (!s) return STM_EINVAL;
+    /* Safe wrapper: verify the device's alloc tree is drained before
+     * letting the pool primitive mark it REMOVED. Without this, a
+     * caller who hasn't evacuated first would silently strip replicas
+     * (R17 P1-2). device_id == 0 is rejected by pool_remove_device
+     * itself (R17 P1-1); don't re-check here. */
+    stm_status ds = sync_require_drained(s, device_id);
+    if (ds != STM_OK) return ds;
+    return stm_pool_remove_device(s->pool, device_id, redundancy_floor);
+}
+
+stm_status stm_sync_finish_evacuation(stm_sync *s, uint16_t device_id)
+{
+    if (!s) return STM_EINVAL;
+    /* Same drain check as stm_sync_remove_device, but the pool slot is
+     * EVACUATING rather than ONLINE/FAULTED. The pool primitive would
+     * happily flip the slot to REMOVED without checking drain; we
+     * enforce NoTargetReplicasAfterComplete (evac.tla invariant) at
+     * the sync boundary. On success, detach s->allocs[device_id] so
+     * the next sync_commit's per-device loop (and any concurrent
+     * caller) treats the device as fully gone. */
+    stm_status ds = sync_require_drained(s, device_id);
+    if (ds != STM_OK) return ds;
+
+    stm_status ps = stm_pool_finish_evacuation(s->pool, device_id);
+    if (ps != STM_OK) return ps;
+
+    /* Detach the alloc handle from sync's table. The handle remains
+     * owned by the caller; they're responsible for closing it. We do
+     * NOT null out its bdev or tear down its internal state — that's
+     * the caller's concern when they stm_alloc_close it. */
+    pthread_mutex_lock(&s->lock);
+    if (s->allocs[device_id]) {
+        s->allocs[device_id] = NULL;
+        if (s->n_attached > 0) s->n_attached--;
+    }
+    pthread_mutex_unlock(&s->lock);
+
     return STM_OK;
 }
 
