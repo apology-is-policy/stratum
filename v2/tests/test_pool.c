@@ -1322,4 +1322,208 @@ STM_TEST(pool_remove_device_refuses_double_remove) {
     unlink(g_tmp_path);
 }
 
+/* ========================================================================= */
+/* P5-4b-ii-α: evacuation state machine (no data-move here — that's           */
+/* test_sync_multi's job; these tests drive pool-layer transitions).          */
+/* ========================================================================= */
+
+/* Happy path: begin_evacuation flips ONLINE → EVACUATING, advances the
+ * roster_hash, preserves the slot; finish_evacuation flips EVACUATING →
+ * REMOVED, clears bdev, preserves UUID (burned). */
+STM_TEST(pool_begin_finish_evacuation_marks_states) {
+    make_tmp("evac_states");
+    stm_bdev *d = open_fresh_device();
+    stm_pool *p = make_single_device_pool(d, POOL_UUID, DEVICE_UUID,
+                                             STM_DEV_ROLE_DATA,
+                                             STM_DEV_CLASS_SSD,
+                                             STM_DEV_STATE_ONLINE);
+    stm_bdev *d2 = open_companion_device("evac_states");
+    stm_pool_device add = {
+        .uuid = { DEVICE_UUID_B[0], DEVICE_UUID_B[1] },
+        .role = STM_DEV_ROLE_DATA, .class_ = STM_DEV_CLASS_SSD,
+        .state = STM_DEV_STATE_ONLINE, .bdev = d2,
+    };
+    STM_ASSERT_OK(stm_pool_add_device(p, &add));
+
+    uint64_t hash_before = stm_pool_roster_hash(p);
+    STM_ASSERT_OK(stm_pool_begin_evacuation(p, 1, /*floor=*/1));
+    const stm_pool_device *info = stm_pool_device_info(p, 1);
+    STM_ASSERT(info != NULL);
+    STM_ASSERT_EQ(info->state, STM_DEV_STATE_EVACUATING);
+    /* bdev still live — evacuation reads from the target. */
+    STM_ASSERT(info->bdev == d2);
+    /* live count UNCHANGED — EVACUATING is still live. */
+    STM_ASSERT_EQ(stm_pool_live_device_count(p), 2u);
+    /* roster_hash advanced. */
+    STM_ASSERT(stm_pool_roster_hash(p) != hash_before);
+
+    uint64_t hash_mid = stm_pool_roster_hash(p);
+    STM_ASSERT_OK(stm_pool_finish_evacuation(p, 1));
+    info = stm_pool_device_info(p, 1);
+    STM_ASSERT(info != NULL);
+    STM_ASSERT_EQ(info->state, STM_DEV_STATE_REMOVED);
+    STM_ASSERT(info->bdev == NULL);
+    /* UUID preserved (burned) — same property as direct remove. */
+    STM_ASSERT_EQ(info->uuid[0], DEVICE_UUID_B[0]);
+    STM_ASSERT_EQ(info->uuid[1], DEVICE_UUID_B[1]);
+    /* live count drops now that the evacuation is finalized. */
+    STM_ASSERT_EQ(stm_pool_live_device_count(p), 1u);
+    STM_ASSERT(stm_pool_roster_hash(p) != hash_mid);
+
+    stm_pool_close(p);
+    stm_bdev_close(d);
+    stm_bdev_close(d2);
+    unlink(g_tmp_path);
+}
+
+/* RedundancyPreservedDuringEvacuation: begin refuses when (live-1) <
+ * floor. Symmetric with remove_device's guard (spec:
+ * v2/specs/evac.tla RedundancyPreservedDuringEvacuation). */
+STM_TEST(pool_begin_evacuation_enforces_redundancy_floor) {
+    make_tmp("evac_floor");
+    stm_bdev *d = open_fresh_device();
+    stm_pool *p = make_single_device_pool(d, POOL_UUID, DEVICE_UUID,
+                                             STM_DEV_ROLE_DATA,
+                                             STM_DEV_CLASS_SSD,
+                                             STM_DEV_STATE_ONLINE);
+    stm_bdev *d2 = open_companion_device("evac_floor");
+    stm_pool_device add = {
+        .uuid = { DEVICE_UUID_B[0], DEVICE_UUID_B[1] },
+        .role = STM_DEV_ROLE_DATA, .class_ = STM_DEV_CLASS_SSD,
+        .state = STM_DEV_STATE_ONLINE, .bdev = d2,
+    };
+    STM_ASSERT_OK(stm_pool_add_device(p, &add));
+    STM_ASSERT_EQ(stm_pool_live_device_count(p), 2u);
+
+    /* floor=2, live=2: (live-1)=1 < 2 — refused. */
+    STM_ASSERT_ERR(stm_pool_begin_evacuation(p, 0, 2), STM_EINVAL);
+    STM_ASSERT_ERR(stm_pool_begin_evacuation(p, 1, 2), STM_EINVAL);
+    STM_ASSERT_EQ(stm_pool_live_device_count(p), 2u);
+
+    /* floor=1: (live-1)=1 >= 1 — OK. */
+    STM_ASSERT_OK(stm_pool_begin_evacuation(p, 1, 1));
+    const stm_pool_device *info = stm_pool_device_info(p, 1);
+    STM_ASSERT(info != NULL);
+    STM_ASSERT_EQ(info->state, STM_DEV_STATE_EVACUATING);
+
+    stm_pool_close(p);
+    stm_bdev_close(d);
+    stm_bdev_close(d2);
+    unlink(g_tmp_path);
+}
+
+/* AtMostOneEvacuating (spec invariant): second begin while another
+ * slot is EVACUATING returns STM_EBUSY. */
+STM_TEST(pool_begin_evacuation_at_most_one) {
+    make_tmp("evac_atmost1");
+    stm_bdev *d = open_fresh_device();
+    stm_pool *p = make_single_device_pool(d, POOL_UUID, DEVICE_UUID,
+                                             STM_DEV_ROLE_DATA,
+                                             STM_DEV_CLASS_SSD,
+                                             STM_DEV_STATE_ONLINE);
+    stm_bdev *d2 = open_companion_device("evac_atmost1_a");
+    stm_bdev *d3 = open_companion_device("evac_atmost1_b");
+    stm_pool_device addb = {
+        .uuid = { DEVICE_UUID_B[0], DEVICE_UUID_B[1] },
+        .role = STM_DEV_ROLE_DATA, .class_ = STM_DEV_CLASS_SSD,
+        .state = STM_DEV_STATE_ONLINE, .bdev = d2,
+    };
+    stm_pool_device addc = {
+        .uuid = { 0xc0c0ULL, 0xc1c1ULL },
+        .role = STM_DEV_ROLE_DATA, .class_ = STM_DEV_CLASS_SSD,
+        .state = STM_DEV_STATE_ONLINE, .bdev = d3,
+    };
+    STM_ASSERT_OK(stm_pool_add_device(p, &addb));
+    STM_ASSERT_OK(stm_pool_add_device(p, &addc));
+    STM_ASSERT_EQ(stm_pool_live_device_count(p), 3u);
+
+    STM_ASSERT_OK(stm_pool_begin_evacuation(p, 1, /*floor=*/1));
+    /* Second begin on another slot refused. */
+    STM_ASSERT_ERR(stm_pool_begin_evacuation(p, 2, 1), STM_EBUSY);
+    /* Second begin on the SAME slot refused (state is EVACUATING, not
+     * ONLINE/FAULTED). */
+    STM_ASSERT_ERR(stm_pool_begin_evacuation(p, 1, 1), STM_EINVAL);
+
+    /* Finish one → another can begin. */
+    STM_ASSERT_OK(stm_pool_finish_evacuation(p, 1));
+    STM_ASSERT_OK(stm_pool_begin_evacuation(p, 2, /*floor=*/1));
+
+    stm_pool_close(p);
+    stm_bdev_close(d);
+    stm_bdev_close(d2);
+    stm_bdev_close(d3);
+    unlink(g_tmp_path);
+}
+
+/* Guardrails: finish requires EVACUATING state; remove_device refuses
+ * EVACUATING (the caller must finish through evacuation, not skip). */
+STM_TEST(pool_finish_evacuation_and_remove_guard_states) {
+    make_tmp("evac_guards");
+    stm_bdev *d = open_fresh_device();
+    stm_pool *p = make_single_device_pool(d, POOL_UUID, DEVICE_UUID,
+                                             STM_DEV_ROLE_DATA,
+                                             STM_DEV_CLASS_SSD,
+                                             STM_DEV_STATE_ONLINE);
+    stm_bdev *d2 = open_companion_device("evac_guards");
+    stm_pool_device add = {
+        .uuid = { DEVICE_UUID_B[0], DEVICE_UUID_B[1] },
+        .role = STM_DEV_ROLE_DATA, .class_ = STM_DEV_CLASS_SSD,
+        .state = STM_DEV_STATE_ONLINE, .bdev = d2,
+    };
+    STM_ASSERT_OK(stm_pool_add_device(p, &add));
+
+    /* finish on ONLINE slot: EINVAL. */
+    STM_ASSERT_ERR(stm_pool_finish_evacuation(p, 1), STM_EINVAL);
+
+    STM_ASSERT_OK(stm_pool_begin_evacuation(p, 1, /*floor=*/1));
+
+    /* remove on EVACUATING slot: EINVAL (must go through finish). */
+    STM_ASSERT_ERR(stm_pool_remove_device(p, 1, 1), STM_EINVAL);
+
+    /* finish on wrong slot (ONLINE): EINVAL. */
+    STM_ASSERT_ERR(stm_pool_finish_evacuation(p, 0), STM_EINVAL);
+
+    STM_ASSERT_OK(stm_pool_finish_evacuation(p, 1));
+
+    /* finish on REMOVED: EINVAL. */
+    STM_ASSERT_ERR(stm_pool_finish_evacuation(p, 1), STM_EINVAL);
+    /* remove on REMOVED: EINVAL (existing). */
+    STM_ASSERT_ERR(stm_pool_remove_device(p, 1, 1), STM_EINVAL);
+
+    stm_pool_close(p);
+    stm_bdev_close(d);
+    stm_bdev_close(d2);
+    unlink(g_tmp_path);
+}
+
+/* RO pool: begin/finish both refuse with STM_EROFS (same as
+ * add/remove — structural mutation gated by the pool's read_only). */
+STM_TEST(pool_begin_finish_evacuation_refuses_read_only) {
+    make_tmp("evac_ro");
+    stm_bdev *d = open_fresh_device();
+    stm_pool_open_opts ro_opts;
+    memset(&ro_opts, 0, sizeof ro_opts);
+    ro_opts.pool_uuid[0] = POOL_UUID[0];
+    ro_opts.pool_uuid[1] = POOL_UUID[1];
+    ro_opts.device_count = 1;
+    ro_opts.read_only    = true;
+    ro_opts.devices[0].uuid[0]    = DEVICE_UUID[0];
+    ro_opts.devices[0].uuid[1]    = DEVICE_UUID[1];
+    ro_opts.devices[0].role       = STM_DEV_ROLE_DATA;
+    ro_opts.devices[0].class_     = STM_DEV_CLASS_SSD;
+    ro_opts.devices[0].state      = STM_DEV_STATE_ONLINE;
+    ro_opts.devices[0].bdev       = d;
+    const stm_bdev_caps *caps = stm_bdev_caps_of(d);
+    ro_opts.devices[0].size_bytes = caps->size_bytes;
+    stm_pool *ro_p = NULL;
+    STM_ASSERT_OK(stm_pool_open(&ro_opts, &ro_p));
+
+    STM_ASSERT_ERR(stm_pool_begin_evacuation(ro_p, 0, 0), STM_EROFS);
+    STM_ASSERT_ERR(stm_pool_finish_evacuation(ro_p, 0), STM_EROFS);
+
+    stm_pool_close(ro_p);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
 STM_TEST_MAIN("pool")

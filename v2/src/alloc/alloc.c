@@ -1385,6 +1385,63 @@ stm_status stm_alloc_verify(const stm_alloc *a)
     return s;
 }
 
+/* P5-4b-ii-α: first-allocated scan context. stm_btree_mt_scan delivers
+ * entries in ascending start_block order (big-endian key encoding
+ * makes lex order = numeric order). We capture the first entry whose
+ * refcount >= 1 and return 1 from the cb to stop iteration. PENDING
+ * entries (refcount == 0) continue the scan. */
+typedef struct {
+    bool     found;
+    uint64_t start_block;
+    uint32_t length;
+    bool     saw_corruption;
+} first_allocated_ctx;
+
+static int first_allocated_cb(const void *key, size_t key_len,
+                               const void *value, size_t value_len,
+                               void *ctx_)
+{
+    first_allocated_ctx *ctx = ctx_;
+    if (key_len != 8 || value_len != 8) {
+        ctx->saw_corruption = true;
+        return 1;
+    }
+    uint32_t length = 0, refcount = 0;
+    decode_val(value, &length, &refcount);
+    if (refcount == 0u) {
+        return 0;   /* PENDING — keep scanning for a live entry */
+    }
+    ctx->found       = true;
+    ctx->start_block = decode_key(key);
+    ctx->length      = length;
+    return 1;       /* stop */
+}
+
+stm_status stm_alloc_first_allocated(const stm_alloc *a,
+                                        uint64_t *out_paddr,
+                                        uint64_t *out_length_blocks)
+{
+    if (!a || !out_paddr || !out_length_blocks) return STM_EINVAL;
+    *out_paddr = 0;
+    *out_length_blocks = 0;
+
+    stm_alloc *ma = (stm_alloc *)a;
+    pthread_mutex_lock(&ma->lock);
+
+    first_allocated_ctx ctx = { 0 };
+    stm_status s = stm_btree_mt_scan(ma->tree, NULL, 0, NULL, 0,
+                                      first_allocated_cb, &ctx);
+    pthread_mutex_unlock(&ma->lock);
+
+    if (s != STM_OK) return s;
+    if (ctx.saw_corruption) return STM_ECORRUPT;
+    if (!ctx.found) return STM_ENOENT;
+
+    *out_paddr         = stm_paddr_make(ma->device_id, ctx.start_block);
+    *out_length_blocks = (uint64_t)ctx.length;
+    return STM_OK;
+}
+
 stm_status stm_alloc_is_allocated(const stm_alloc *a, uint64_t paddr,
                                     bool *out_allocated)
 {

@@ -142,12 +142,18 @@ typedef enum {
  * uberblock — P5-1 writes ONLINE unconditionally since multi-device
  * fault handling lands in P5-4. */
 typedef enum {
-    STM_DEV_STATE_UNSET    = 0,
-    STM_DEV_STATE_ONLINE   = 1,
-    STM_DEV_STATE_OFFLINE  = 2,
-    STM_DEV_STATE_DEGRADED = 3,
-    STM_DEV_STATE_FAULTED  = 4,
-    STM_DEV_STATE_REMOVED  = 5,
+    STM_DEV_STATE_UNSET      = 0,
+    STM_DEV_STATE_ONLINE     = 1,
+    STM_DEV_STATE_OFFLINE    = 2,
+    STM_DEV_STATE_DEGRADED   = 3,
+    STM_DEV_STATE_FAULTED    = 4,
+    STM_DEV_STATE_REMOVED    = 5,
+    /* P5-4b-ii: draining in preparation for removal. Still holds data
+     * (its alloc tree is non-empty until evacuation completes) but is
+     * excluded from new mirror reservations and from sync_commit's
+     * fan-out. Transitions: ONLINE -> EVACUATING -> REMOVED.
+     * See v2/specs/evac.tla (EvacuationAtomic, AtMostOneEvacuating). */
+    STM_DEV_STATE_EVACUATING = 6,
 } stm_device_state;
 
 /* ========================================================================= */

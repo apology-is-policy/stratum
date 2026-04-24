@@ -643,4 +643,82 @@ STM_TEST(alloc_is_allocated_null_args) {
     unlink(g_tmp_path);
 }
 
+/* ========================================================================= */
+/* P5-4b-ii-α: stm_alloc_first_allocated.                                     */
+/* ========================================================================= */
+
+/* Empty tree / tree with only PENDING entries → STM_ENOENT. */
+STM_TEST(alloc_first_allocated_empty_returns_enoent) {
+    make_tmp("first_empty");
+    stm_bdev  *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    uint64_t paddr = 0, length = 0;
+    STM_ASSERT_ERR(stm_alloc_first_allocated(a, &paddr, &length),
+                    STM_ENOENT);
+    STM_ASSERT_EQ(paddr, 0u);
+    STM_ASSERT_EQ(length, 0u);
+
+    /* Tree with ONE PENDING entry is still "no live allocations". */
+    uint64_t p1 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p1));
+    STM_ASSERT_OK(stm_alloc_free(a, p1, /*free_gen=*/ 1));
+    /* Before sweep: tree still has the entry with refcount=0 (PENDING). */
+    STM_ASSERT_ERR(stm_alloc_first_allocated(a, &paddr, &length),
+                    STM_ENOENT);
+
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* Returns the lowest-start entry with refcount >= 1 (scan walks in
+ * ascending start_block order). PENDING entries are skipped. */
+STM_TEST(alloc_first_allocated_picks_lowest_live) {
+    make_tmp("first_pick");
+    stm_bdev  *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    /* Reserve three ranges. Free the FIRST (makes it PENDING).
+     * first_allocated must then pick the second (lowest live). */
+    uint64_t p1 = 0, p2 = 0, p3 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p1));
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p2));
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p3));
+    STM_ASSERT_OK(stm_alloc_free(a, p1, /*free_gen=*/ 1));
+
+    uint64_t first_paddr = 0, first_length = 0;
+    STM_ASSERT_OK(stm_alloc_first_allocated(a, &first_paddr, &first_length));
+    /* Picks p2 — skips p1 (PENDING). */
+    STM_ASSERT_EQ(first_paddr, p2);
+    STM_ASSERT_EQ(first_length, 4u);
+
+    /* Free p2 too — still PENDING, next pick is p3. */
+    STM_ASSERT_OK(stm_alloc_free(a, p2, /*free_gen=*/ 1));
+    STM_ASSERT_OK(stm_alloc_first_allocated(a, &first_paddr, &first_length));
+    STM_ASSERT_EQ(first_paddr, p3);
+    STM_ASSERT_EQ(first_length, 4u);
+
+    /* Free p3 — tree has only PENDING entries. ENOENT. */
+    STM_ASSERT_OK(stm_alloc_free(a, p3, /*free_gen=*/ 1));
+    STM_ASSERT_ERR(stm_alloc_first_allocated(a, &first_paddr, &first_length),
+                    STM_ENOENT);
+
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(alloc_first_allocated_null_args) {
+    stm_bdev  *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+    uint64_t p = 0, l = 0;
+    STM_ASSERT_ERR(stm_alloc_first_allocated(NULL, &p, &l), STM_EINVAL);
+    STM_ASSERT_ERR(stm_alloc_first_allocated(a, NULL, &l),  STM_EINVAL);
+    STM_ASSERT_ERR(stm_alloc_first_allocated(a, &p, NULL),  STM_EINVAL);
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
 STM_TEST_MAIN("alloc")

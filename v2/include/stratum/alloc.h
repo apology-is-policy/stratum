@@ -363,6 +363,33 @@ STM_MUST_USE
 stm_status stm_alloc_is_allocated(const stm_alloc *a, uint64_t paddr,
                                     bool *out_allocated);
 
+/*
+ * P5-4b-ii-α: lowest-paddr ALLOCATED entry in the tree.
+ *
+ * Returns the entry with the smallest `start_block` whose refcount is
+ * >= 1 — i.e., the "first" allocated range in iteration order. PENDING
+ * entries (refcount = 0) are skipped; they occupy space in the tree
+ * until the next sync_commit sweeps them, but are not live from the
+ * evacuation POV.
+ *
+ * On STM_OK, `*out_paddr` gets the entry's full paddr (device_id in
+ * top 16 bits, start_block in low 48) and `*out_length_blocks` gets
+ * its length.
+ *
+ * Evacuation drives this by repeatedly calling until STM_ENODATA —
+ * each call yields the current-lowest allocated range, which is then
+ * read + mirrored + freed, shrinking the tree until empty.
+ *
+ *   STM_OK        — *out_paddr / *out_length_blocks populated.
+ *   STM_ENOENT    — no allocated entries remain (tree empty or all
+ *                    PENDING). Caller transitions to finish_evacuation.
+ *   STM_ECORRUPT  — malformed tree entry (key_len != 8 or val_len != 8).
+ */
+STM_MUST_USE
+stm_status stm_alloc_first_allocated(const stm_alloc *a,
+                                        uint64_t *out_paddr,
+                                        uint64_t *out_length_blocks);
+
 #ifdef __cplusplus
 }
 #endif

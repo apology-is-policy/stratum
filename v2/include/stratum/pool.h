@@ -326,6 +326,52 @@ STM_MUST_USE
 stm_status stm_pool_remove_device(stm_pool *p, uint16_t device_id,
                                      size_t redundancy_floor);
 
+/*
+ * Begin evacuation of `device_id` (P5-4b-ii-α). Transitions the slot
+ * from ONLINE/FAULTED to EVACUATING, clamped by two invariants from
+ * v2/specs/evac.tla:
+ *
+ *   * AtMostOneEvacuating — at most one slot is EVACUATING at a time.
+ *     A second call while another slot is draining returns STM_EBUSY.
+ *   * RedundancyPreservedDuringEvacuation — post-remove live count
+ *     (live - 1) must still clear `redundancy_floor`. Arithmetic
+ *     identical to stm_pool_remove_device.
+ *
+ * The caller drives the drain with `stm_sync_evacuation_step` until
+ * STM_ENODATA, then finalizes with `stm_pool_finish_evacuation`. The
+ * sequence must complete within one mount session: on crash recovery
+ * during EVACUATING, the next mount sees the state byte in the
+ * uberblock's roster and must decide whether to resume the drain or
+ * abort-and-rollback. P5-4b-ii-α leaves that choice to the operator;
+ * the recovery loop lands with P5-4d (reconcile / fail / rejoin).
+ *
+ * RO pools refuse (STM_EROFS). An already-EVACUATING slot refuses
+ * (STM_EINVAL — use evacuation_step or finish_evacuation, not double
+ * begin). Same caller-serialization contract as add_device /
+ * remove_device — serialize against concurrent sync_commit until
+ * P5-4b-ii-β lands the per-pool lock.
+ */
+STM_MUST_USE
+stm_status stm_pool_begin_evacuation(stm_pool *p, uint16_t device_id,
+                                        size_t redundancy_floor);
+
+/*
+ * Finalize an evacuation (P5-4b-ii-α). Transitions EVACUATING to
+ * REMOVED. No redundancy re-check — that happened at begin.
+ *
+ * Precondition (checked by caller, not enforced here): sync's
+ * evacuation_step returned STM_ENODATA for this device, i.e., the
+ * alloc tree is drained. Callers that skip this check and call
+ * finish with live data still on the device leave the post-remove
+ * block pointers dangling (sync's mirror_read will fail to find the
+ * target's replicas and must rely on surviving copies). The spec's
+ * NoTargetReplicasAfterComplete invariant encodes this precondition.
+ *
+ * Post: slot state = REMOVED, bdev = NULL, UUID preserved (burned).
+ */
+STM_MUST_USE
+stm_status stm_pool_finish_evacuation(stm_pool *p, uint16_t device_id);
+
 #ifdef __cplusplus
 }
 #endif

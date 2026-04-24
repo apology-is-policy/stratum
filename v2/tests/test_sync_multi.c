@@ -1679,4 +1679,177 @@ STM_TEST(sync_multi_add_device_mid_session_survives_remount) {
     unlink_paths();
 }
 
+/* ========================================================================= */
+/* P5-4b-ii-α: evacuation happy path.                                         */
+/* ========================================================================= */
+
+/*
+ * Mirror(2) × 3-device pool. Write two blocks via mirror(2), landing
+ * replicas on devs 0 + 1. Commit. Evacuate dev 0: each evacuation_step
+ * migrates one replica from dev 0 to a survivor (dev 2), freeing the
+ * original entry from dev 0's alloc tree. After the drain completes,
+ * finish_evacuation flips dev 0 to REMOVED and the pool continues as
+ * a 2-live-device mirror(2) with the data readable via (dev_2, dev_1)
+ * replicas.
+ *
+ * Exercises EvacuateAtomic from v2/specs/evac.tla: each step is an
+ * atomic remove-d + add-s transition on replicas[b]. mirror_read with
+ * the updated paddrs succeeds; mirror_read with the stale (dev 0)
+ * paddrs falls back via the surviving replica.
+ */
+STM_TEST(sync_multi_evacuate_migrates_to_survivor) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "evac_happy", bds, as, &pool, &s);
+
+    /* Two mirrored writes — exercise multiple alloc entries on dev 0. */
+    uint64_t paddrs_a[2] = { 0 }, paddrs_b[2] = { 0 };
+    STM_ASSERT_OK(stm_sync_reserve_mirror(s, 1u, 2u, paddrs_a));
+    STM_ASSERT_OK(stm_sync_reserve_mirror(s, 1u, 2u, paddrs_b));
+    STM_ASSERT_EQ(stm_paddr_device(paddrs_a[0]), 0u);
+    STM_ASSERT_EQ(stm_paddr_device(paddrs_a[1]), 1u);
+    STM_ASSERT_EQ(stm_paddr_device(paddrs_b[0]), 0u);
+    STM_ASSERT_EQ(stm_paddr_device(paddrs_b[1]), 1u);
+
+    uint8_t payload_a[STM_UB_SIZE], payload_b[STM_UB_SIZE];
+    for (size_t i = 0; i < sizeof payload_a; i++)
+        payload_a[i] = (uint8_t)((i ^ 0xaa) & 0xff);
+    for (size_t i = 0; i < sizeof payload_b; i++)
+        payload_b[i] = (uint8_t)((i ^ 0x55) & 0xff);
+    size_t n_conf = 0;
+    STM_ASSERT_OK(stm_sync_mirror_write(s, paddrs_a, 2u,
+                                            payload_a, sizeof payload_a, &n_conf));
+    STM_ASSERT_EQ(n_conf, 2u);
+    STM_ASSERT_OK(stm_sync_mirror_write(s, paddrs_b, 2u,
+                                            payload_b, sizeof payload_b, &n_conf));
+    STM_ASSERT_EQ(n_conf, 2u);
+    /* Persist the mirrored writes + allocator state. */
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    /* Begin evacuation on dev 0. Floor=2: we had 3 live devices, so
+     * (live-1)=2 >= floor=2. */
+    STM_ASSERT_OK(stm_pool_begin_evacuation(pool, 0, /*floor=*/2));
+    const stm_pool_device *d0 = stm_pool_device_info(pool, 0);
+    STM_ASSERT(d0 != NULL);
+    STM_ASSERT_EQ(d0->state, STM_DEV_STATE_EVACUATING);
+
+    /* Persist EVACUATING state. Quorum still 2 (live=3 incl.
+     * EVACUATING). */
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    /* Drain step-by-step. Caller picks survivor=2 (the only dev that
+     * isn't dev 0 or dev 1 — dev 1 already holds the OTHER replicas of
+     * these blocks, so picking it would collapse replicas onto one
+     * device). Each step migrates one range and returns old/new paddrs
+     * for caller's bptr update. */
+    uint64_t old_p = 0, new_p = 0;
+
+    /* Step 1: migrates one of the two dev-0 entries. */
+    STM_ASSERT_OK(stm_sync_evacuation_step(s, 0, 2, &old_p, &new_p));
+    STM_ASSERT_EQ(stm_paddr_device(old_p), 0u);
+    STM_ASSERT_EQ(stm_paddr_device(new_p), 2u);
+    /* Update whichever replica-list entry used old_p. */
+    if (paddrs_a[0] == old_p) paddrs_a[0] = new_p;
+    else if (paddrs_b[0] == old_p) paddrs_b[0] = new_p;
+    else STM_ASSERT(false);  /* step returned a paddr we didn't write */
+
+    /* Step 2: migrates the remaining entry. */
+    STM_ASSERT_OK(stm_sync_evacuation_step(s, 0, 2, &old_p, &new_p));
+    STM_ASSERT_EQ(stm_paddr_device(old_p), 0u);
+    STM_ASSERT_EQ(stm_paddr_device(new_p), 2u);
+    if (paddrs_a[0] == old_p) paddrs_a[0] = new_p;
+    else if (paddrs_b[0] == old_p) paddrs_b[0] = new_p;
+    else STM_ASSERT(false);
+
+    /* Step 3: tree drained → STM_ENOENT. Caller proceeds to finish. */
+    STM_ASSERT_ERR(stm_sync_evacuation_step(s, 0, 2, &old_p, &new_p),
+                    STM_ENOENT);
+
+    /* Persist the migrations (survivor reserves + target frees). */
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    /* Finalize — dev 0 becomes REMOVED. */
+    STM_ASSERT_OK(stm_pool_finish_evacuation(pool, 0));
+    STM_ASSERT_EQ(stm_pool_live_device_count(pool), 2u);
+    STM_ASSERT(stm_pool_device_bdev(pool, 0) == NULL);
+
+    /* Persist REMOVED state. */
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    /* Read back via the updated paddrs — one replica on dev 2, the
+     * other on dev 1 (unchanged). */
+    STM_ASSERT_EQ(stm_paddr_device(paddrs_a[0]), 2u);
+    STM_ASSERT_EQ(stm_paddr_device(paddrs_a[1]), 1u);
+    STM_ASSERT_EQ(stm_paddr_device(paddrs_b[0]), 2u);
+    STM_ASSERT_EQ(stm_paddr_device(paddrs_b[1]), 1u);
+
+    stm_blake3_hash exp_a, exp_b;
+    stm_blake3(payload_a, sizeof payload_a, &exp_a);
+    stm_blake3(payload_b, sizeof payload_b, &exp_b);
+
+    uint8_t readback[STM_UB_SIZE] = {0};
+    STM_ASSERT_OK(stm_sync_mirror_read(s, paddrs_a, 2u,
+                                          readback, sizeof readback,
+                                          exp_a.bytes));
+    STM_ASSERT_EQ(memcmp(readback, payload_a, sizeof payload_a), 0);
+
+    memset(readback, 0, sizeof readback);
+    STM_ASSERT_OK(stm_sync_mirror_read(s, paddrs_b, 2u,
+                                          readback, sizeof readback,
+                                          exp_b.bytes));
+    STM_ASSERT_EQ(memcmp(readback, payload_b, sizeof payload_b), 0);
+
+    teardown_mirror_pool(bds, as, pool, s);
+}
+
+/* Guard: evacuation_step on a non-EVACUATING slot refused. Ensures the
+ * state byte is the load-bearing signal (not accidentally allowed via
+ * other paths). */
+STM_TEST(sync_multi_evacuation_step_refuses_non_evacuating) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "evac_guard", bds, as, &pool, &s);
+
+    /* Dev 0 is ONLINE; evac_step refuses. */
+    uint64_t op = 0, np = 0;
+    STM_ASSERT_ERR(stm_sync_evacuation_step(s, 0, 1, &op, &np), STM_EINVAL);
+    /* Out-of-range target. */
+    STM_ASSERT_ERR(stm_sync_evacuation_step(s, 99, 1, &op, &np), STM_EINVAL);
+    /* Out-of-range survivor. */
+    STM_ASSERT_ERR(stm_sync_evacuation_step(s, 0, 99, &op, &np), STM_EINVAL);
+    /* Survivor == target. */
+    STM_ASSERT_ERR(stm_sync_evacuation_step(s, 0, 0, &op, &np), STM_EINVAL);
+    /* NULL outputs rejected. */
+    STM_ASSERT_ERR(stm_sync_evacuation_step(s, 0, 1, NULL, &np), STM_EINVAL);
+    STM_ASSERT_ERR(stm_sync_evacuation_step(s, 0, 1, &op, NULL), STM_EINVAL);
+
+    teardown_mirror_pool(bds, as, pool, s);
+}
+
+/* Empty-target evacuation: begin → step → STM_ENOENT → finish — a
+ * device with no allocated data drains in zero steps. */
+STM_TEST(sync_multi_evacuate_empty_device_skips_steps) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "evac_empty", bds, as, &pool, &s);
+
+    /* Evacuate dev 2 — nothing reserved there (reserve_mirror(2) used
+     * devs 0 + 1 for the setup commit's seed writes). */
+    STM_ASSERT_OK(stm_pool_begin_evacuation(pool, 2, /*floor=*/2));
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    uint64_t op = 0, np = 0;
+    /* Survivor choice is irrelevant for ENOENT — use dev 0 arbitrarily. */
+    STM_ASSERT_ERR(stm_sync_evacuation_step(s, 2, 0, &op, &np), STM_ENOENT);
+
+    STM_ASSERT_OK(stm_pool_finish_evacuation(pool, 2));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    STM_ASSERT_EQ(stm_pool_live_device_count(pool), 2u);
+
+    teardown_mirror_pool(bds, as, pool, s);
+}
+
 STM_TEST_MAIN("sync_multi")

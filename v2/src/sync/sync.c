@@ -1757,20 +1757,34 @@ stm_status stm_sync_reserve_mirror(stm_sync *s, uint64_t nblocks,
         return STM_EINVAL;
     }
 
-    /* Pool must have >= n_replicas LIVE devices, all with attached
-     * allocs. REMOVED slots don't count — P5-4b-i. */
-    if (stm_pool_live_device_count(s->pool) < n_replicas) {
+    /* P5-4b-ii-α: pick the first n_replicas ONLINE devices (skip
+     * EVACUATING, REMOVED, FAULTED, etc). Pre-P5-4b-ii reserve_mirror
+     * used a positional [0, n) scan which would allocate to an
+     * EVACUATING device if one sat at index < n_replicas, defeating
+     * the drain. Roster order is preserved — the first n ONLINE
+     * slots by device_id are the chosen replica carriers.
+     *
+     * Rejection cases:
+     *   - fewer than n_replicas ONLINE devices with attached allocs
+     *     → STM_EINVAL (caller's redundancy guard should have caught).
+     *   - survivor count drops below n_replicas mid-loop (e.g. FAULTED
+     *     race) → rollback reserved paddrs, surface error. */
+    uint16_t targets[STM_POOL_DEVICES_MAX];
+    size_t targets_n = 0;
+    size_t roster_n  = stm_pool_device_count(s->pool);
+    for (size_t i = 0; i < roster_n && targets_n < n_replicas; i++) {
+        const stm_pool_device *di = stm_pool_device_info(s->pool, (uint16_t)i);
+        if (!di) continue;
+        if (di->state != STM_DEV_STATE_ONLINE) continue;
+        if (s->allocs[i] == NULL) continue;
+        targets[targets_n++] = (uint16_t)i;
+    }
+    if (targets_n < n_replicas) {
         pthread_mutex_unlock(&s->lock);
         return STM_EINVAL;
     }
-    for (size_t i = 0; i < n_replicas; i++) {
-        if (s->allocs[i] == NULL) {
-            pthread_mutex_unlock(&s->lock);
-            return STM_EINVAL;
-        }
-    }
 
-    /* Reserve on each device's alloc. On per-device failure, unwind
+    /* Reserve on each chosen device. On per-device failure, unwind
      * the already-reserved paddrs so the pool's on-disk state reflects
      * all-or-nothing. (In-RAM alloc state hasn't committed yet either
      * way; the unwind keeps the RAM picture clean for the next
@@ -1779,7 +1793,8 @@ stm_status stm_sync_reserve_mirror(stm_sync *s, uint64_t nblocks,
     stm_status last_err = STM_OK;
     for (size_t i = 0; i < n_replicas; i++) {
         uint64_t pi = 0;
-        stm_status rs = stm_alloc_reserve(s->allocs[i], nblocks, 0, &pi);
+        stm_status rs = stm_alloc_reserve(s->allocs[targets[i]],
+                                            nblocks, 0, &pi);
         if (rs != STM_OK) { last_err = rs; break; }
         out_paddrs[i] = pi;
         reserved++;
@@ -1799,7 +1814,7 @@ stm_status stm_sync_reserve_mirror(stm_sync *s, uint64_t nblocks,
          *
          * Ignore per-free errors — we're already in the error path. */
         for (size_t i = 0; i < reserved; i++) {
-            (void)stm_alloc_free(s->allocs[i], out_paddrs[i], s->auth_gen);
+            (void)stm_alloc_free(s->allocs[targets[i]], out_paddrs[i], s->auth_gen);
             out_paddrs[i] = 0;
         }
         pthread_mutex_unlock(&s->lock);
@@ -1910,6 +1925,147 @@ stm_status stm_sync_mirror_read(stm_sync *s, const uint64_t paddrs[],
     pthread_mutex_unlock(&s->lock);
     /* No replica passed the csum check. */
     return (first_err != STM_OK) ? first_err : STM_ECORRUPT;
+}
+
+/* ========================================================================= */
+/* P5-4b-ii-α: evacuation step.                                               */
+/* ========================================================================= */
+
+stm_status stm_sync_evacuation_step(stm_sync *s, uint16_t target_device_id,
+                                       uint16_t survivor_device_id,
+                                       uint64_t *out_old_paddr,
+                                       uint64_t *out_new_paddr)
+{
+    if (!s || !out_old_paddr || !out_new_paddr) return STM_EINVAL;
+    if (target_device_id >= stm_pool_device_count(s->pool)) return STM_EINVAL;
+    if (survivor_device_id >= stm_pool_device_count(s->pool)) return STM_EINVAL;
+    if (survivor_device_id == target_device_id) return STM_EINVAL;
+    *out_old_paddr = 0;
+    *out_new_paddr = 0;
+
+    pthread_mutex_lock(&s->lock);
+
+    /* R15 F5 P2 symmetric: RO/wedged refuses mutation. */
+    if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
+    if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS; }
+
+    const stm_pool_device *td = stm_pool_device_info(s->pool, target_device_id);
+    if (!td) { pthread_mutex_unlock(&s->lock); return STM_EINVAL; }
+    /* The target MUST be EVACUATING — set by stm_pool_begin_evacuation.
+     * This is the state byte's load-bearing role: it signals reserve_mirror
+     * / sync_commit / this step which device is the drain target. Calling
+     * evacuation_step on a device that isn't draining is a caller bug. */
+    if (td->state != STM_DEV_STATE_EVACUATING) {
+        pthread_mutex_unlock(&s->lock);
+        return STM_EINVAL;
+    }
+
+    /* Survivor must be ONLINE, non-target, with an attached alloc. The
+     * caller supplies the id (it knows which device holds the OTHER
+     * replicas of the block being moved, so it can pick one that does
+     * not already hold b — the spec's `s \notin replicas[b]` check is
+     * delegated to the caller, who sees the replica list). */
+    const stm_pool_device *sd = stm_pool_device_info(s->pool, survivor_device_id);
+    if (!sd || sd->state != STM_DEV_STATE_ONLINE) {
+        pthread_mutex_unlock(&s->lock);
+        return STM_EINVAL;
+    }
+
+    stm_alloc *target_alloc = s->allocs[target_device_id];
+    if (!target_alloc) {
+        /* Nothing to drain — target has no attached alloc. Bubble up as
+         * "no data" so caller proceeds to finish_evacuation. */
+        pthread_mutex_unlock(&s->lock);
+        return STM_ENOENT;
+    }
+
+    /* Spec's EvacuatePaddr precondition: pick one allocated range on d.
+     * first_allocated returns the lowest-start entry with refcount >= 1.
+     * STM_ENOENT here = tree drained = caller finalizes. */
+    uint64_t old_paddr = 0, length_blocks = 0;
+    stm_status fs = stm_alloc_first_allocated(target_alloc,
+                                                &old_paddr, &length_blocks);
+    if (fs != STM_OK) {
+        pthread_mutex_unlock(&s->lock);
+        return fs;   /* STM_ENOENT = done, STM_ECORRUPT = surface up */
+    }
+    if (length_blocks == 0) {
+        /* Defensive: an entry with length_blocks=0 would imply a
+         * corrupt tree value. first_allocated surfaces length from
+         * the val blob; a 0 here means the tree has a junk entry. */
+        pthread_mutex_unlock(&s->lock);
+        return STM_ECORRUPT;
+    }
+
+    uint16_t survivor = survivor_device_id;
+
+    /* Read + reserve + write + free — all in the critical section so the
+     * caller's next sync_commit persists the complete migration (or
+     * rolls back wholesale on failure). EvacuationAtomic in evac.tla
+     * asserts this atomicity at the block-granularity level. */
+    size_t nbytes = (size_t)length_blocks * (size_t)STM_UB_SIZE;
+    uint8_t *buf = malloc(nbytes);
+    if (!buf) { pthread_mutex_unlock(&s->lock); return STM_ENOMEM; }
+
+    /* 1) Read from target. */
+    stm_bdev *target_bd = stm_pool_device_bdev(s->pool, target_device_id);
+    if (!target_bd) { free(buf); pthread_mutex_unlock(&s->lock); return STM_EINVAL; }
+    uint64_t target_off = stm_paddr_offset(old_paddr) * (uint64_t)STM_UB_SIZE;
+    stm_status rs = stm_bdev_read(target_bd, target_off, buf, nbytes);
+    if (rs != STM_OK) { free(buf); pthread_mutex_unlock(&s->lock); return rs; }
+
+    /* 2) Reserve length_blocks on survivor. */
+    stm_alloc *surv_alloc = s->allocs[survivor];
+    uint64_t new_paddr = 0;
+    stm_status res = stm_alloc_reserve(surv_alloc, length_blocks, 0, &new_paddr);
+    if (res != STM_OK) { free(buf); pthread_mutex_unlock(&s->lock); return res; }
+
+    /* 3) Write to survivor + fsync. We do NOT fan out to all survivors
+     * here — evacuation rehomes ONE copy (target's copy → survivor's
+     * copy). Other existing replicas on OTHER survivors keep their
+     * data; the caller's bptr list becomes (old_target_paddr, ...) →
+     * (new_survivor_paddr, ...) via the return values. */
+    stm_bdev *surv_bd = stm_pool_device_bdev(s->pool, survivor);
+    if (!surv_bd) {
+        (void)stm_alloc_free(surv_alloc, new_paddr, s->auth_gen);
+        free(buf);
+        pthread_mutex_unlock(&s->lock);
+        return STM_EINVAL;
+    }
+    uint64_t surv_off = stm_paddr_offset(new_paddr) * (uint64_t)STM_UB_SIZE;
+    stm_status ws = stm_bdev_write(surv_bd, surv_off, buf, nbytes);
+    if (ws == STM_OK) ws = stm_bdev_fsync(surv_bd);
+    if (ws != STM_OK) {
+        /* Roll back the survivor reservation — the write didn't land so
+         * the reservation is unreferenced. free_gen = auth_gen so the
+         * next commit's sweep reclaims it (allocator.tla's strict-less-
+         * than sweep criterion). */
+        (void)stm_alloc_free(surv_alloc, new_paddr, s->auth_gen);
+        free(buf);
+        pthread_mutex_unlock(&s->lock);
+        return ws;
+    }
+    free(buf);
+
+    /* 4) Free the target's entry. The target bdev's data is now stale
+     * but WILL NOT be read after finish_evacuation (target transitions
+     * to REMOVED, mirror_read skips REMOVED). free_gen = auth_gen so
+     * the next commit sweeps the PENDING entry (allocator.tla). */
+    stm_status frs = stm_alloc_free(target_alloc, old_paddr, s->auth_gen);
+    if (frs != STM_OK) {
+        /* Target tree refused the free — shouldn't happen since we just
+         * got this paddr from first_allocated, but defensively roll
+         * back the survivor reservation. */
+        (void)stm_alloc_free(surv_alloc, new_paddr, s->auth_gen);
+        pthread_mutex_unlock(&s->lock);
+        return frs;
+    }
+
+    *out_old_paddr = old_paddr;
+    *out_new_paddr = new_paddr;
+
+    pthread_mutex_unlock(&s->lock);
+    return STM_OK;
 }
 
 /* ========================================================================= */

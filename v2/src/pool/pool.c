@@ -191,6 +191,7 @@ static bool state_in_range(stm_device_state s) {
         case STM_DEV_STATE_DEGRADED:
         case STM_DEV_STATE_FAULTED:
         case STM_DEV_STATE_REMOVED:
+        case STM_DEV_STATE_EVACUATING:
             return true;
     }
     return false;
@@ -216,8 +217,10 @@ stm_status stm_pool_open(const stm_pool_open_opts *opts, stm_pool **out)
             /* REMOVED: bdev must be NULL, UUID preserved. */
             if (d->bdev != NULL) return STM_EINVAL;
         } else {
-            /* Live (ONLINE / FAULTED / DEGRADED / OFFLINE): bdev
-             * non-NULL. */
+            /* Live (ONLINE / FAULTED / DEGRADED / OFFLINE / EVACUATING):
+             * bdev non-NULL. EVACUATING is still readable and its
+             * alloc tree is still live — data-half of remove_device
+             * (P5-4b-ii) drains it range-by-range. */
             if (!d->bdev) return STM_EINVAL;
         }
         if (uuid_is_zero(d->uuid)) return STM_EINVAL;
@@ -368,8 +371,15 @@ stm_status stm_pool_remove_device(stm_pool *p, uint16_t device_id,
     if ((size_t)device_id >= p->device_count) return STM_EINVAL;
 
     stm_pool_device *slot = &p->devices[device_id];
-    /* Slot must be LIVE to be removed. REMOVED → already burned. */
-    if (slot->state == STM_DEV_STATE_REMOVED) return STM_EINVAL;
+    /* Slot must be LIVE to be removed. REMOVED → already burned.
+     * EVACUATING → caller must finish the in-flight evacuation via
+     * stm_pool_finish_evacuation (the data-half of remove). Pre
+     * P5-4b-ii this state was unreachable so the check was absent;
+     * now that evacuation is explicit, route accidental direct
+     * remove calls on draining devices to EINVAL so they don't skip
+     * the evacuation step and leak live data. */
+    if (slot->state == STM_DEV_STATE_REMOVED)    return STM_EINVAL;
+    if (slot->state == STM_DEV_STATE_EVACUATING) return STM_EINVAL;
 
     /* Spec's RedundancyPreservedOnRemove (device_lifecycle.tla):
      * post-remove live count must remain >= redundancy_floor.
@@ -405,5 +415,95 @@ stm_status stm_pool_remove_device(stm_pool *p, uint16_t device_id,
      * the encoded bytes change → new hash. */
     p->roster_hash = hash_of_devs(p->devices, p->device_count);
 
+    return STM_OK;
+}
+
+/* ========================================================================= */
+/* P5-4b-ii: evacuation state-machine half.                                  */
+/* ========================================================================= */
+
+stm_status stm_pool_begin_evacuation(stm_pool *p, uint16_t device_id,
+                                        size_t redundancy_floor)
+{
+    if (!p) return STM_EINVAL;
+    if (p->read_only) return STM_EROFS;
+    if ((size_t)device_id >= p->device_count) return STM_EINVAL;
+
+    stm_pool_device *slot = &p->devices[device_id];
+    /* Only ONLINE / FAULTED are eligible. REMOVED is a burned tombstone;
+     * EVACUATING is the one we're about to become — double-begin is a
+     * caller bug (should call evacuation_step instead). */
+    if (slot->state != STM_DEV_STATE_ONLINE &&
+        slot->state != STM_DEV_STATE_FAULTED) {
+        return STM_EINVAL;
+    }
+
+    /* AtMostOneEvacuating (evac.tla): at most one EVACUATING slot at a
+     * time. The spec's AtMostOneEvacuating invariant encodes this as
+     * "|{d : device_state[d] = EVACUATING}| <= 1"; we enforce by
+     * walking the roster and refusing a second begin. Sync's
+     * evacuation_step discovers the target via this state byte; two
+     * concurrent evacuations would race on which survivor receives
+     * which block. */
+    for (size_t i = 0; i < p->device_count; i++) {
+        if (p->devices[i].state == STM_DEV_STATE_EVACUATING) {
+            return STM_EBUSY;
+        }
+    }
+
+    /* RedundancyPreservedDuringEvacuation (evac.tla): the post-remove
+     * live count must still clear redundancy_floor. The check must
+     * fire HERE (at begin) rather than at finish, because once we
+     * flip the state byte to EVACUATING, sync's reserve_mirror routes
+     * around us and new writes depend on the floor holding. The
+     * arithmetic is identical to remove_device: (live - 1) >= floor,
+     * where `live` includes the slot we're about to drain. */
+    size_t live = 0;
+    for (size_t i = 0; i < p->device_count; i++) {
+        if (p->devices[i].state != STM_DEV_STATE_REMOVED) live++;
+    }
+    if (live == 0) return STM_EINVAL;   /* impossible: slot is live */
+    if ((live - 1) < redundancy_floor) return STM_EINVAL;
+
+    slot->state = STM_DEV_STATE_EVACUATING;
+    p->roster_hash = hash_of_devs(p->devices, p->device_count);
+    return STM_OK;
+}
+
+stm_status stm_pool_finish_evacuation(stm_pool *p, uint16_t device_id)
+{
+    if (!p) return STM_EINVAL;
+    if (p->read_only) return STM_EROFS;
+    if ((size_t)device_id >= p->device_count) return STM_EINVAL;
+
+    stm_pool_device *slot = &p->devices[device_id];
+    /* Must be in the EVACUATING state — this API is ONLY the finalize
+     * step of a begin/step/finish sequence. Callers who want to abort
+     * an in-progress evacuation would use a separate cancel API (not
+     * provided in P5-4b-ii-α; survivor copies would need cleanup
+     * before rolling EVACUATING back to ONLINE). */
+    if (slot->state != STM_DEV_STATE_EVACUATING) return STM_EINVAL;
+
+    /* No redundancy re-check: begin_evacuation already established
+     * (live - 1) >= floor. The caller's contract is that they must
+     * not drop the floor between begin and finish (no concurrent
+     * add/remove below the floor). If FailDevice lands on a survivor
+     * during evacuation, device_lifecycle.tla's FailDevice action
+     * keeps it in the live count (FAULTED still counts toward the
+     * roster), so the check at begin is robust.
+     *
+     * Note: this is NOT the place to check "alloc tree empty" — that's
+     * the sync layer's concern. sync's evacuation_step returns
+     * STM_ENODATA when the tree is drained; the caller then invokes
+     * this function. If a caller calls us with data still on the
+     * target, sync's reserve_mirror already refuses to allocate to
+     * an EVACUATING/REMOVED device, so the remaining data becomes
+     * unreachable (readable via mirror_read from survivors, but no
+     * fresh writes land there). Future: enforce emptiness by giving
+     * pool a borrowed view into sync's allocs[]. */
+
+    slot->state = STM_DEV_STATE_REMOVED;
+    slot->bdev  = NULL;
+    p->roster_hash = hash_of_devs(p->devices, p->device_count);
     return STM_OK;
 }

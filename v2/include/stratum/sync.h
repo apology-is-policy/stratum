@@ -356,6 +356,61 @@ stm_status stm_sync_mirror_read(stm_sync *s, const uint64_t paddrs[],
                                    size_t n, void *buf, size_t len,
                                    const uint8_t expected_csum[32]);
 
+/*
+ * P5-4b-ii-α: evacuate one allocated range from `target_device_id`
+ * onto `survivor_device_id`.
+ *
+ * The target must be in STM_DEV_STATE_EVACUATING (set by
+ * stm_pool_begin_evacuation). The survivor must be ONLINE with an
+ * attached alloc and must not be the target. Each call:
+ *   1) picks the lowest-start allocated range on the target's alloc
+ *      tree (stm_alloc_first_allocated);
+ *   2) reads length_blocks × STM_UB_SIZE bytes from the target bdev;
+ *   3) reserves `length_blocks` on the survivor's alloc;
+ *   4) writes the bytes + fsyncs the survivor;
+ *   5) frees the range from the target's tree (marks PENDING so the
+ *      next sync_commit sweeps it per allocator.tla).
+ *
+ * The entire step runs under sync's lock so the read / reserve /
+ * write / free sequence is atomic w.r.t. other sync callers. At the
+ * spec level (v2/specs/evac.tla), this corresponds to EvacuateAtomic:
+ * replicas[b] = (replicas[b] \ {target}) ∪ {survivor} in one step.
+ *
+ * The caller owns survivor selection because at this layer we cannot
+ * see which devices already hold OTHER replicas of the block: picking
+ * a survivor that happens to already hold b would collapse two
+ * replicas onto one device (violating evac.tla's `s \notin
+ * replicas[b]` precondition). Caller derives the survivor from its
+ * bptr / replica-list: any device except target and except the
+ * current holders of b.
+ *
+ * The caller MUST call stm_sync_commit to persist the migration (the
+ * survivor reservation + target free both live in in-RAM alloc state
+ * until then). Crash between evacuation_step and commit loses the
+ * survivor write (block is still on target) — safe but wasted work.
+ *
+ * On STM_OK, `*out_old_paddr` and `*out_new_paddr` are populated.
+ * Any higher-layer reference to *out_old_paddr must be rewritten to
+ * *out_new_paddr before the next sync_commit.
+ *
+ * Returns:
+ *   STM_OK        — one range evacuated; paddrs populated.
+ *   STM_ENOENT    — target alloc tree has no live allocated entries
+ *                    (tree empty or all PENDING). Caller finalizes via
+ *                    stm_pool_finish_evacuation + sync_commit.
+ *   STM_EINVAL    — target not EVACUATING, survivor not ONLINE or is
+ *                    the target, out-of-range ids, shape errors.
+ *   STM_EROFS     — pool opened read_only.
+ *   STM_EWEDGED   — sync handle wedged (post-quorum-loss state).
+ *   STM_EQUORUM / STM_EIO / STM_ENOMEM — backend failures; no state
+ *                    change on target's tree (rolled back).
+ */
+STM_MUST_USE
+stm_status stm_sync_evacuation_step(stm_sync *s, uint16_t target_device_id,
+                                       uint16_t survivor_device_id,
+                                       uint64_t *out_old_paddr,
+                                       uint64_t *out_new_paddr);
+
 /* ========================================================================= */
 /* Per-dataset key management (P4-4c).                                        */
 /* ========================================================================= */
