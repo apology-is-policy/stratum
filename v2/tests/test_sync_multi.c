@@ -25,6 +25,7 @@
 
 #include <stratum/alloc.h>
 #include <stratum/block.h>
+#include <stratum/block_inject.h>
 #include <stratum/crypto.h>
 #include <stratum/hash.h>
 #include <stratum/keyfile.h>
@@ -2073,6 +2074,198 @@ STM_TEST(sync_multi_mirror_read_skips_faulted_replica) {
                                           expected.bytes));
     STM_ASSERT_EQ(memcmp(readback, payload, sizeof payload), 0);
 
+    teardown_mirror_pool(bds, as, pool, s);
+}
+
+/* R22 (P5-6 P2-1) regression: replace_device_online resumes cleanly
+ * after step-3 (first sync_commit) failure.
+ *
+ * The previous EVACUATING-resume covered step-5+ failures but NOT the
+ * step-3 gap: if the FIRST commit (which persists the ADD) fails, the
+ * in-RAM pool has the new slot at ONLINE with new_alloc attached but
+ * the durable state is pre-add and old_device stays ONLINE. Retry
+ * would hit STM_EEXIST at add_device's UUID uniqueness walk.
+ *
+ * This test exercises the ADDED-ONLINE resume path via a deterministic
+ * injected I/O failure during step 3's bootstrap-pool write on the
+ * new device's bdev. */
+STM_TEST(sync_multi_replace_resumes_after_step3_commit_failure) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "replace_resume_s3", bds, as, &pool, &s);
+
+    /* Seed one mirrored block so there's something for the drain loop
+     * to actually evacuate once the replace completes. */
+    uint64_t paddrs[2] = {0};
+    STM_ASSERT_OK(stm_sync_reserve_mirror(s, 1u, 2u, paddrs));
+    uint8_t payload[STM_UB_SIZE];
+    for (size_t i = 0; i < sizeof payload; i++)
+        payload[i] = (uint8_t)((i ^ 0x9a) & 0xff);
+    size_t n_conf = 0;
+    STM_ASSERT_OK(stm_sync_mirror_write(s, paddrs, 2u, payload,
+                                           sizeof payload, &n_conf));
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    /* Prepare a 4th device, fresh UUID. */
+    char path4[256];
+    snprintf(path4, sizeof path4,
+             "/tmp/stm_v2_sync_multi_replace_resume_s3_%d_3.bin",
+             (int)getpid());
+    unlink(path4);
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    stm_bdev *bd4 = NULL;
+    STM_ASSERT_OK(stm_bdev_open(path4, &bo, &bd4));
+    STM_ASSERT_OK(stm_bdev_resize(bd4, TEST_DEVICE_BYTES));
+
+    uint64_t uuid4[2] = { 0xc0ffeeULL, DEV_UUID_HI };
+    stm_alloc *a4 = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bd4, POOL_UUID, uuid4,
+                                      TEST_BOOTSTRAP_BYTES, &a4));
+
+    stm_pool_device new_dev = {
+        .uuid   = { uuid4[0], uuid4[1] },
+        .role   = STM_DEV_ROLE_DATA,
+        .class_ = STM_DEV_CLASS_SSD,
+        .state  = STM_DEV_STATE_ONLINE,
+        .bdev   = bd4,
+    };
+
+    /* Arm injection on TWO of the 4 post-add devices (bd4 + bds[2]).
+     * With n=4 devices, quorum = 3. Failing 2 writes per phase drops
+     * confirmations to 2 → STM_EQUORUM. Each inject is a one-shot,
+     * fires on the first state-changing op on that bdev (the
+     * reservation UB write in sync_commit's Phase 1). */
+    stm_bdev_inject_fail_after(bd4, 1);
+    stm_bdev_inject_fail_after(bds[2], 1);
+
+    uint16_t new_slot1 = UINT16_MAX;
+    stm_status r1 = stm_sync_replace_device_online(
+        s, /*old=*/1, &new_dev, a4, /*floor=*/2, &new_slot1);
+    /* Step 3's sync_commit fails at Phase 1 quorum → STM_EQUORUM
+     * bubbles through the replace wrapper.  The in-RAM state at
+     * this point has the new roster entry + attached alloc but no
+     * durable progress — the scenario R22 targets. */
+    STM_ASSERT_NE((int)r1, (int)STM_OK);
+    /* Confirm both injections fired. */
+    STM_ASSERT(stm_bdev_inject_fired_count(bd4)    >= 1);
+    STM_ASSERT(stm_bdev_inject_fired_count(bds[2]) >= 1);
+
+    /* Partial-state check: pool has the new slot in RAM at ONLINE with
+     * new_alloc attached; dev 1 is still ONLINE (begin_evacuation
+     * never ran). This is the exact state the audit flagged — pre-fix
+     * the retry below would return STM_EEXIST. */
+    STM_ASSERT_EQ(stm_pool_device_count(pool), 4u);
+    const stm_pool_device *probe = stm_pool_device_info(pool, 3);
+    STM_ASSERT(probe != NULL);
+    STM_ASSERT_EQ((int)probe->state, (int)STM_DEV_STATE_ONLINE);
+    STM_ASSERT_EQ(probe->uuid[0], uuid4[0]);
+    probe = stm_pool_device_info(pool, 1);
+    STM_ASSERT(probe != NULL);
+    STM_ASSERT_EQ((int)probe->state, (int)STM_DEV_STATE_ONLINE);
+
+    /* Retry: inject is now disarmed (fired its one shot). Call replace
+     * with the SAME args. The resume-from-ONLINE path detects
+     * new_device.uuid at an ONLINE slot with new_alloc attached,
+     * skips step 1+2+2b, proceeds to step 3. */
+    uint16_t new_slot2 = UINT16_MAX;
+    STM_ASSERT_OK(stm_sync_replace_device_online(
+        s, /*old=*/1, &new_dev, a4, /*floor=*/2, &new_slot2));
+    STM_ASSERT_EQ(new_slot2, 3u);
+    STM_ASSERT_EQ(new_slot2, (uint16_t)(new_slot1 == UINT16_MAX ? 3 : new_slot1));
+
+    /* Verify final state: live=3 (dev 1 REMOVED, dev 3 ONLINE), data
+     * moved to dev 3's alloc tree. Same end-state as the happy-path
+     * test, just via the resume route. */
+    STM_ASSERT_EQ(stm_pool_live_device_count(pool), 3u);
+    probe = stm_pool_device_info(pool, 1);
+    STM_ASSERT(probe != NULL);
+    STM_ASSERT_EQ((int)probe->state, (int)STM_DEV_STATE_REMOVED);
+    STM_ASSERT(probe->bdev == NULL);
+    probe = stm_pool_device_info(pool, 3);
+    STM_ASSERT(probe != NULL);
+    STM_ASSERT_EQ((int)probe->state, (int)STM_DEV_STATE_ONLINE);
+
+    uint64_t dev3_paddr = 0, dev3_len = 0;
+    STM_ASSERT_OK(stm_alloc_first_allocated(a4, &dev3_paddr, &dev3_len));
+    STM_ASSERT_EQ(stm_paddr_device(dev3_paddr), 3u);
+
+    stm_alloc_close(a4);
+    stm_bdev_close(bd4);
+    unlink(path4);
+    teardown_mirror_pool(bds, as, pool, s);
+}
+
+/* R22 (P5-6 P2-1) negative regression: same-UUID-but-different-alloc
+ * is a genuine conflict, not a resume. The resume path MUST NOT
+ * accept a caller that passes the same new_device.uuid but a fresh
+ * alloc object — that would silently forget the first alloc. */
+STM_TEST(sync_multi_replace_refuses_same_uuid_different_alloc) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "replace_resume_uuid_conflict", bds, as, &pool, &s);
+
+    /* Prepare a 4th device. Force the first replace to fail at step 3
+     * via inject, so we reach the "UUID already in roster" path. */
+    char path4[256];
+    snprintf(path4, sizeof path4,
+             "/tmp/stm_v2_sync_multi_replace_resume_conflict_%d_3.bin",
+             (int)getpid());
+    unlink(path4);
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    stm_bdev *bd4 = NULL;
+    STM_ASSERT_OK(stm_bdev_open(path4, &bo, &bd4));
+    STM_ASSERT_OK(stm_bdev_resize(bd4, TEST_DEVICE_BYTES));
+    uint64_t uuid4[2] = { 0xd00d1eULL, DEV_UUID_HI };
+    stm_alloc *a4a = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bd4, POOL_UUID, uuid4,
+                                      TEST_BOOTSTRAP_BYTES, &a4a));
+
+    stm_pool_device new_dev = {
+        .uuid   = { uuid4[0], uuid4[1] },
+        .role   = STM_DEV_ROLE_DATA,
+        .class_ = STM_DEV_CLASS_SSD,
+        .state  = STM_DEV_STATE_ONLINE,
+        .bdev   = bd4,
+    };
+
+    stm_bdev_inject_fail_after(bd4, 1);
+    stm_bdev_inject_fail_after(bds[2], 1);
+    uint16_t slot = UINT16_MAX;
+    stm_status r1 = stm_sync_replace_device_online(
+        s, /*old=*/1, &new_dev, a4a, /*floor=*/2, &slot);
+    STM_ASSERT_NE((int)r1, (int)STM_OK);
+
+    /* Now create a DIFFERENT alloc with the same UUID claim.
+     * This simulates a bug / misuse where the caller forgets they
+     * already have a4a attached and passes a fresh alloc.
+     * Re-using the same bdev is OK for the test — stm_alloc_create
+     * on the same bdev would overwrite its bootstrap, but we don't
+     * call it; we exercise the replace entry path's rejection. */
+    stm_alloc *a4b_placeholder = NULL;
+    /* For the regression we just need a non-NULL alloc pointer
+     * different from a4a. A second stm_alloc_create would clobber
+     * the bootstrap so we use a different in-RAM alloc handle by
+     * creating one on a throwaway bdev — even cleaner, just pass
+     * as[0] (the primary alloc) which is definitely NOT attached
+     * at slot 3. The function should reject STM_EEXIST because
+     * s->allocs[3] == a4a != as[0]. */
+    a4b_placeholder = as[0];
+
+    STM_ASSERT_ERR(stm_sync_replace_device_online(
+        s, /*old=*/1, &new_dev, a4b_placeholder, /*floor=*/2, &slot),
+        STM_EEXIST);
+
+    /* Sanity: retrying with the ORIGINAL a4a still works (the resume
+     * path accepts). */
+    STM_ASSERT_OK(stm_sync_replace_device_online(
+        s, /*old=*/1, &new_dev, a4a, /*floor=*/2, &slot));
+    STM_ASSERT_EQ(slot, 3u);
+
+    stm_alloc_close(a4a);
+    stm_bdev_close(bd4);
+    unlink(path4);
     teardown_mirror_pool(bds, as, pool, s);
 }
 

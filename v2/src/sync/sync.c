@@ -2408,6 +2408,74 @@ stm_status stm_sync_replace_device_online(
     }
     if (old_state != STM_DEV_STATE_ONLINE) return STM_EINVAL;
 
+    /* R22 (P5-6 P2-1): ADDED-NOT-YET-EVACUATING resume.
+     *
+     * A previous invocation may have completed step 1 (add) + 2a
+     * (set_device_id) + 2b (attach_alloc) successfully but failed at
+     * step 3 (first sync_commit) with STM_EQUORUM or similar. In
+     * that state the in-RAM pool roster has new_device at an ONLINE
+     * slot with new_alloc attached, but the durable state is pre-add.
+     * old_device_id is still ONLINE (step 4 never ran).
+     *
+     * The existing EVACUATING resume (above) covers step-5+ failures.
+     * Without this ADDED-ONLINE path, retry with the same args would
+     * hit stm_pool_add_device_locked's UUID uniqueness walk and
+     * return STM_EEXIST — no clean recovery, operator has to unmount.
+     *
+     * Detection: scan the roster for new_device->uuid at an ONLINE
+     * slot whose attached alloc == new_alloc. Match on BOTH uuid AND
+     * alloc-identity — same UUID with a different alloc is a genuine
+     * caller conflict (different device, same UUID — impossible
+     * post-R16 F3 burned-UUID tracking but defend in depth).
+     *
+     * On resume: skip steps 1 + 2a + 2b (already done + in RAM),
+     * proceed to step 3 (sync_commit, idempotent on clean state).
+     * Steps 4-6 then run as normal. */
+    uint16_t resume_slot = UINT16_MAX;
+    stm_pool_lock_shared(s->pool);
+    {
+        size_t rcount = stm_pool_device_count(s->pool);
+        for (uint16_t i = 0; i < rcount; i++) {
+            const stm_pool_device *di = stm_pool_device_info(s->pool, i);
+            if (!di) continue;
+            if (di->uuid[0] == new_device->uuid[0] &&
+                di->uuid[1] == new_device->uuid[1]) {
+                if (di->state == STM_DEV_STATE_ONLINE) {
+                    resume_slot = i;
+                }
+                /* Non-ONLINE match (REMOVED burned-UUID, or EVACUATING
+                 * via a racing operation) → fall through; add_device
+                 * will surface STM_EEXIST and caller re-evaluates. */
+                break;
+            }
+        }
+    }
+    stm_pool_unlock_shared(s->pool);
+
+    uint16_t new_slot;
+    if (resume_slot != UINT16_MAX) {
+        /* UUID found at ONLINE slot. Validate alloc-identity match. */
+        pthread_mutex_lock(&s->lock);
+        bool alloc_matches = (s->allocs[resume_slot] == new_alloc);
+        pthread_mutex_unlock(&s->lock);
+        if (!alloc_matches) {
+            /* Same UUID in roster but caller is passing a different
+             * alloc — genuine conflict. Reject cleanly. */
+            return STM_EEXIST;
+        }
+        /* Belt-and-suspenders: alloc's device_id must match the slot
+         * (attach_alloc enforced this on the original call). */
+        uint16_t alloc_dev = 0;
+        stm_status gs = stm_alloc_get_device_id(new_alloc, &alloc_dev);
+        if (gs != STM_OK) return gs;
+        if (alloc_dev != resume_slot) return STM_EINVAL;
+
+        new_slot = resume_slot;
+        if (out_new_device_id) *out_new_device_id = new_slot;
+        /* Jump past steps 1 + 2a + 2b; proceed to step 3. */
+        goto added_ready;
+    }
+
     /* Step 1: add the new device AND determine its slot under one
      * pool.wrlock critical section. Without this composition, a
      * concurrent add_device from another thread could intervene
@@ -2419,7 +2487,7 @@ stm_status stm_sync_replace_device_online(
     stm_status as = stm_pool_add_device_locked(s->pool, new_device);
     stm_pool_unlock_exclusive(s->pool);
     if (as != STM_OK) return as;
-    uint16_t new_slot = (uint16_t)count_before;
+    new_slot = (uint16_t)count_before;
 
     /* Step 2a: set the alloc's device_id to match the new slot.
      * Caller passes a fresh alloc (tree clean; root=0); we stamp the
@@ -2445,8 +2513,12 @@ stm_status stm_sync_replace_device_online(
 
     if (out_new_device_id) *out_new_device_id = new_slot;
 
+added_ready:
     {
-        /* Step 3: persist the add. */
+        /* Step 3: persist the add. Idempotent on the resume path
+         * (no dirty alloc/keyschema state beyond what a fresh-add
+         * already staged; commit writes a new UB at auth+1/+2 with
+         * the same roots + same roster). R22. */
         stm_status cs = stm_sync_commit(s);
         if (cs != STM_OK) return cs;
 
