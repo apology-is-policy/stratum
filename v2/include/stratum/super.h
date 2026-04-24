@@ -72,8 +72,21 @@ extern "C" {
  * Multi-device commit semantics land in P5-2; P5-1 is spec + roster
  * persistence only. v4 pools had these fields zero — unambiguous
  * rejection at v5 mount. No feature-flag allocation; the version
- * bump alone gates the format change per ARCH §5.9. */
-#define STM_UB_VERSION        5u
+ * bump alone gates the format change per ARCH §5.9.
+ *
+ * v5 → v6 (Phase 5 chunk P5-3b): `ub_alloc_root` now points at the
+ * pool-level allocator-roots object (ARCH §6.1), NOT at a single
+ * device's allocator tree. The roots object is itself a small
+ * Bε-tree stored on device 0's bootstrap pool, keyed by device_id
+ * and valued with each device's alloc-tree root (paddr + csum). The
+ * bp_kind at ub_alloc_root changes from STM_BPTR_KIND_ALLOC (a leaf
+ * of the allocator tree) to STM_BPTR_KIND_ALLOC_ROOTS (the roots
+ * object). v5 pools loaded under v6 code would try to interpret the
+ * alloc-tree leaf as a roots object → AEAD-decrypt-pass but value
+ * format mismatch, catching at entry-decode time. The version bump
+ * gates this unambiguously up-front. No feature-flag allocation
+ * (version bump alone per ARCH §5.9). */
+#define STM_UB_VERSION        6u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */
@@ -145,14 +158,15 @@ typedef enum {
  * space for format growth without bumping STM_UB_VERSION.
  */
 typedef enum {
-    STM_BPTR_KIND_NONE      = 0,   /* null pointer */
-    STM_BPTR_KIND_INTERNAL  = 1,   /* Bε-tree internal node */
-    STM_BPTR_KIND_LEAF      = 2,   /* Bε-tree leaf node */
-    STM_BPTR_KIND_EXTENT    = 3,   /* user-data extent */
-    STM_BPTR_KIND_ALLOC     = 4,   /* allocator tree node */
-    STM_BPTR_KIND_SNAP      = 5,   /* snapshot-index tree node */
-    STM_BPTR_KIND_CAS       = 6,   /* CAS-tier index node */
-    STM_BPTR_KIND_KEYSCHEMA = 7,   /* key-schema sub-tree node (ARCH §7.7.3) */
+    STM_BPTR_KIND_NONE        = 0,   /* null pointer */
+    STM_BPTR_KIND_INTERNAL    = 1,   /* Bε-tree internal node */
+    STM_BPTR_KIND_LEAF        = 2,   /* Bε-tree leaf node */
+    STM_BPTR_KIND_EXTENT      = 3,   /* user-data extent */
+    STM_BPTR_KIND_ALLOC       = 4,   /* allocator tree node */
+    STM_BPTR_KIND_SNAP        = 5,   /* snapshot-index tree node */
+    STM_BPTR_KIND_CAS         = 6,   /* CAS-tier index node */
+    STM_BPTR_KIND_KEYSCHEMA   = 7,   /* key-schema sub-tree node (ARCH §7.7.3) */
+    STM_BPTR_KIND_ALLOC_ROOTS = 8,   /* allocator-roots object (ARCH §6.1, P5-3b) */
 } stm_bptr_kind;
 
 typedef struct {

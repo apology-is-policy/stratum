@@ -32,6 +32,7 @@
 
 #include <stratum/sync.h>
 #include <stratum/alloc.h>
+#include <stratum/alloc_roots.h>
 #include <stratum/block.h>
 #include <stratum/crypto.h>
 #include <stratum/hash.h>
@@ -189,6 +190,18 @@ struct stm_sync {
      * ub_redundancy_kind / ub_redundancy_params); future P5-3c work
      * will expose it to the allocator + write path. */
     stm_redundancy_profile redundancy;
+
+    /* P5-3b: allocator-roots object (ARCH §6.1). Aggregates per-
+     * device alloc-tree roots. Replaces the pre-P5-3b direct
+     * ub_alloc_root → single-alloc-tree pointer. Owned by sync;
+     * closed on stm_sync_close. Every commit writes a fresh roots
+     * object (or short-circuits idempotently when clean).
+     *
+     * Semantic shift for alloc_root_paddr/_csum/_gen above: post
+     * P5-3b these now mirror the ROOTS OBJECT's root (the bptr
+     * stored in ub_alloc_root), NOT any single alloc tree. Per-
+     * device tree roots live INSIDE the roots object. */
+    stm_alloc_roots  *roots;
 };
 
 /* ========================================================================= */
@@ -562,7 +575,10 @@ static void build_uberblock(stm_uberblock *out,
     /* Allocator tree root (paddr + kind + Merkle csum). */
     if (alloc_root_paddr != 0) {
         out->ub_alloc_root.bp_paddr = stm_store_le64(alloc_root_paddr);
-        out->ub_alloc_root.bp_kind  = STM_BPTR_KIND_ALLOC;
+        /* P5-3b: ub_alloc_root points at the pool-level allocator-roots
+         * object (ARCH §6.1), NOT at a single device's alloc tree.
+         * The roots object's leaf values carry per-device tree roots. */
+        out->ub_alloc_root.bp_kind  = STM_BPTR_KIND_ALLOC_ROOTS;
         memcpy(out->ub_alloc_root.bp_csum, alloc_root_csum, 32);
     }
     out->ub_alloc_root_gen = stm_store_le64(alloc_root_gen);
@@ -828,6 +844,20 @@ stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
     if (cs != STM_OK) {
         stm_sync_close(s);
         return cs;
+    }
+
+    /* P5-3b: create the allocator-roots object handle rooted on
+     * device 0's bootstrap. First commit populates it with device
+     * 0's alloc-tree root; subsequent per-device alloc trees
+     * (P5-3c) add more entries. */
+    {
+        stm_bootstrap *boot = stm_alloc_bootstrap(a);
+        if (!boot) { stm_sync_close(s); return STM_EINVAL; }
+        stm_status rc = stm_alloc_roots_create(d, boot, &s->roots);
+        if (rc != STM_OK) { stm_sync_close(s); return rc; }
+        rc = stm_alloc_roots_set_crypt_ctx(s->roots, s->metadata_key,
+                                              s->pool_uuid, s->device_uuid);
+        if (rc != STM_OK) { stm_sync_close(s); return rc; }
     }
 
     *out_sync = s;
@@ -1175,21 +1205,56 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
         return STM_ECORRUPT;
     }
 
-    /* Rehydrate the allocator tree. R7d P1-1 defense on kind. */
-    uint64_t alloc_root = stm_load_le64(ub.ub_alloc_root.bp_paddr);
-    uint8_t  kind       = ub.ub_alloc_root.bp_kind;
-    if (alloc_root != 0) {
-        if (kind != STM_BPTR_KIND_ALLOC) {
+    /* P5-3b: rehydrate via the allocator-roots object. ub_alloc_root
+     * now points at a small Bε-tree (ALLOC_ROOTS kind) whose leaves
+     * carry each device's alloc-tree root. Steps:
+     *   1. Create roots handle on device 0's bootstrap; install
+     *      crypt ctx.
+     *   2. Load roots contents from (ub_alloc_root, ub_alloc_root_gen).
+     *   3. Iterate entries, load each device's alloc tree.
+     *
+     * R7d P1-1 defense on kind: the kind field is part of the
+     * unauthenticated bptr header (not covered by the tree's AEAD);
+     * ub_csum covers it transitively. A mismatched kind is a tamper
+     * indicator even if ub_csum passed (e.g., malformed-on-write). */
+    uint64_t roots_paddr = stm_load_le64(ub.ub_alloc_root.bp_paddr);
+    uint8_t  roots_kind  = ub.ub_alloc_root.bp_kind;
+    if (roots_paddr != 0) {
+        if (roots_kind != STM_BPTR_KIND_ALLOC_ROOTS) {
             stm_sync_close(s2);
             return STM_ECORRUPT;
         }
-        stm_status ls = stm_alloc_load_tree_at(a, alloc_root, alloc_root_gen,
-                                                  ub.ub_alloc_root.bp_csum);
+        /* Share the same stm_bootstrap handle already resolved above
+         * for keyschema. */
+        stm_status rs = stm_alloc_roots_open(meta_bdev, boot, &s2->roots);
+        if (rs != STM_OK) { stm_sync_close(s2); return rs; }
+        rs = stm_alloc_roots_set_crypt_ctx(s2->roots, s2->metadata_key,
+                                              s2->pool_uuid, s2->device_uuid);
+        if (rs != STM_OK) { stm_sync_close(s2); return rs; }
+        rs = stm_alloc_roots_load_at(s2->roots, roots_paddr, alloc_root_gen,
+                                        ub.ub_alloc_root.bp_csum);
+        if (rs != STM_OK) { stm_sync_close(s2); return rs; }
+
+        /* Load device 0's alloc tree from the roots entry. Multi-
+         * device per-device trees land in P5-3c; today the only
+         * entry is device 0. Absence of a device-0 entry is a
+         * format error (every committed pool has at least one
+         * alloc tree). */
+        uint64_t tree_paddr = 0;
+        uint8_t  tree_csum[32];
+        stm_status gs = stm_alloc_roots_get(s2->roots, /*device_id=*/0,
+                                               &tree_paddr, tree_csum);
+        if (gs != STM_OK) {
+            stm_sync_close(s2);
+            return (gs == STM_ENOENT) ? STM_ECORRUPT : gs;
+        }
+        stm_status ls = stm_alloc_load_tree_at(a, tree_paddr, alloc_root_gen,
+                                                  tree_csum);
         if (ls != STM_OK) {
             stm_sync_close(s2);
             return ls;
         }
-        s2->alloc_root_paddr = alloc_root;
+        s2->alloc_root_paddr = roots_paddr;
     }
 
     /* R9 P0-1 — multi-device mount-claim.
@@ -1218,7 +1283,7 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
         build_uberblock(&claim_prototype, s2,
                          /*target_device_id=*/ 0,   /* overwritten per-device */
                          /*new_gen=*/           auth_gen + 1,
-                         /*alloc_root=*/        alloc_root,
+                         /*alloc_root=*/        roots_paddr,
                          /*alloc_csum=*/        ub.ub_alloc_root.bp_csum,
                          /*alloc_root_gen=*/    alloc_root_gen,
                          /*keyschema_root=*/    ks_root_paddr,
@@ -1243,7 +1308,7 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
             stm_sync_close(s2);
             return cw;
         }
-        s2->alloc_root_paddr = alloc_root;
+        s2->alloc_root_paddr = roots_paddr;
         memcpy(s2->alloc_root_csum, ub.ub_alloc_root.bp_csum, 32);
         memcpy(s2->merkle_root,     ub.ub_merkle_root,        32);
     }
@@ -1255,6 +1320,9 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
 void stm_sync_close(stm_sync *s)
 {
     if (!s) return;
+    /* P5-3b: close the allocator-roots handle. Owns its own
+     * in-RAM btree; borrows bdev + bootstrap + metadata_key. */
+    if (s->roots) stm_alloc_roots_close(s->roots);
     /* P4-4a: close the keyschema (frees its in-RAM entries too). */
     if (s->keyschema) stm_keyschema_close(s->keyschema);
     /* P4-3b: wipe key material before free. The alloc's copy is
@@ -1353,13 +1421,46 @@ stm_status stm_sync_commit(stm_sync *s)
         return s_alloc;
     }
 
-    uint64_t alloc_root = 0;
-    uint8_t  alloc_root_csum[32] = { 0 };
+    uint64_t tree_paddr = 0;
+    uint8_t  tree_csum[32] = { 0 };
     stm_status sr = stm_alloc_get_tree_root(s->alloc,
-                                              &alloc_root, alloc_root_csum);
+                                              &tree_paddr, tree_csum);
     if (sr != STM_OK) {
         pthread_mutex_unlock(&s->lock);
         return sr;
+    }
+
+    /* P5-3b: register device 0's alloc-tree root in the roots object.
+     * `set` is idempotent when the (paddr, csum) match the existing
+     * entry — so an idempotent alloc_commit that returned cached
+     * values propagates into an idempotent roots commit below.
+     * Once multi-device alloc lands (P5-3c), this loop extends to
+     * every device's alloc. */
+    sr = stm_alloc_roots_set(s->roots, /*device_id=*/0,
+                                tree_paddr, tree_csum);
+    if (sr != STM_OK) {
+        pthread_mutex_unlock(&s->lock);
+        return sr;
+    }
+
+    /* Commit the roots object itself. Idempotent on clean (R7c/R14b
+     * pattern) — returns cached paddr+csum without re-persisting. */
+    uint64_t roots_paddr = 0;
+    uint8_t  roots_csum[32] = { 0 };
+    stm_status rc = stm_alloc_roots_commit(s->roots, target_gen,
+                                              &roots_paddr, roots_csum);
+    if (rc != STM_OK) {
+        pthread_mutex_unlock(&s->lock);
+        return rc;
+    }
+    /* Gen at which the roots object was encrypted. May differ from
+     * target_gen when _commit short-circuits (clean). Same semantics
+     * as alloc's tree_gen. */
+    uint64_t roots_gen = 0;
+    rc = stm_alloc_roots_get_gen(s->roots, &roots_gen);
+    if (rc != STM_OK) {
+        pthread_mutex_unlock(&s->lock);
+        return rc;
     }
 
     stm_alloc_stats astats;
@@ -1369,13 +1470,15 @@ stm_status stm_sync_commit(stm_sync *s)
         return sr;
     }
 
-    /* P4-1: compute the pool Merkle root. R8-P1-1: refuse to commit
-     * on BLAKE3 OOM (writing zero merkle_root would silently bypass
-     * integrity check). */
+    /* P4-1 / P5-3b: compute the pool Merkle root. The `alloc_root`
+     * input is now the ROOTS OBJECT's root csum, which transitively
+     * covers every per-device tree root via the roots object's leaf
+     * values. R8-P1-1: refuse to commit on BLAKE3 OOM (writing zero
+     * merkle_root would silently bypass integrity check). */
     uint8_t zeros32[32] = { 0 };
     uint8_t new_merkle_root[32];
     stm_status ms = compute_merkle_root(zeros32,   /* main */
-                                          alloc_root_csum,
+                                          roots_csum,
                                           zeros32,   /* snap */
                                           zeros32,   /* cas  */
                                           ks_root_csum,
@@ -1386,24 +1489,11 @@ stm_status stm_sync_commit(stm_sync *s)
         return ms;
     }
 
-    /* Phase 3: Final UB write. R9 P0-1 / P4-4c: alloc_root_gen comes
-     * from the allocator — NOT target_gen — because stm_alloc_commit's
-     * R7c P2-5 optimization skips the tree rewrite when nothing is
-     * dirty, so the tree may still be encrypted at an older gen.
-     * Recording target_gen here would break AEAD decrypt on the next
-     * mount. */
-    uint64_t tree_gen = 0;
-    sr = stm_alloc_get_tree_gen(s->alloc, &tree_gen);
-    if (sr != STM_OK) {
-        pthread_mutex_unlock(&s->lock);
-        return sr;
-    }
-
     stm_uberblock fin_prototype;
     build_uberblock(&fin_prototype, s,
                      /*target_device_id=*/ 0,   /* overwritten per-device */
                      /*new_gen=*/           target_gen,
-                     alloc_root, alloc_root_csum, tree_gen,
+                     roots_paddr, roots_csum, roots_gen,
                      ks_root_paddr, ks_root_csum,
                      new_merkle_root, &astats);
 
@@ -1418,15 +1508,17 @@ stm_status stm_sync_commit(stm_sync *s)
 
     /* Publish: advance in-RAM state. auth_gen = target, current_gen =
      * auth + 2 (next target). Done under our mutex so concurrent
-     * stm_sync_info_get observes a consistent snapshot. */
+     * stm_sync_info_get observes a consistent snapshot. P5-3b:
+     * alloc_root_* mirror the ROOTS OBJECT (not any single alloc
+     * tree). */
     s->auth_gen              = target_gen;
     s->current_gen           = target_gen + 2;
     s->live_label_idx        = fin_label;
     s->live_slot_idx         = fin_slot;
-    s->alloc_root_paddr      = alloc_root;
-    s->alloc_root_gen        = tree_gen;
+    s->alloc_root_paddr      = roots_paddr;
+    s->alloc_root_gen        = roots_gen;
     s->keyschema_root_paddr  = ks_root_paddr;
-    memcpy(s->alloc_root_csum,     alloc_root_csum, 32);
+    memcpy(s->alloc_root_csum,     roots_csum,      32);
     memcpy(s->keyschema_root_csum, ks_root_csum,   32);
     memcpy(s->merkle_root,         new_merkle_root, 32);
 

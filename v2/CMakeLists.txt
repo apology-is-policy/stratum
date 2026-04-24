@@ -170,6 +170,7 @@ add_subdirectory(src/bootstrap)
 add_subdirectory(src/btnode)
 add_subdirectory(src/btree_store)
 add_subdirectory(src/alloc)
+add_subdirectory(src/alloc_roots)
 add_subdirectory(src/keyfile)
 add_subdirectory(src/keyschema)
 add_subdirectory(src/p9)
@@ -195,6 +196,7 @@ target_link_libraries(stratum INTERFACE
     stm_btnode
     stm_btree_store
     stm_alloc
+    stm_alloc_roots
     stm_sdarray
     stm_xor_filter
     stm_keyfile

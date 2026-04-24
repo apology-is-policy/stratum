@@ -892,4 +892,161 @@ STM_TEST(sync_multi_redundancy_mount_rejects_nonzero_tail_on_none) {
     unlink_paths();
 }
 
+/* ========================================================================= */
+/* P5-3b: allocator-roots object integration.                                 */
+/* ========================================================================= */
+
+/* First commit on a fresh pool writes a UB whose ub_alloc_root points
+ * at the allocator-roots object (kind == STM_BPTR_KIND_ALLOC_ROOTS),
+ * not at the per-device alloc tree (kind == STM_BPTR_KIND_ALLOC). */
+STM_TEST(sync_multi_ub_points_at_alloc_roots) {
+    make_paths("roots_kind");
+    stm_bdev *bds[NDEV] = {0};
+    open_bdevs(bds);
+    stm_pool *pool = make_multi_pool(bds);
+
+    stm_alloc *a = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bds[0], POOL_UUID,
+                                     (uint64_t[]){ DEV_UUID_LO[0], DEV_UUID_HI },
+                                     TEST_BOOTSTRAP_BYTES, &a));
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), NULL, &s));
+
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p));
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    /* Fresh-pool first commit lands the final UB at gen=1 (1-phase);
+     * its ring location is (label=1, slot=1). Every device should
+     * carry an identical shared-bytes UB pointing at the roots
+     * object. */
+    for (size_t i = 0; i < NDEV; i++) {
+        stm_uberblock ub;
+        STM_ASSERT_OK(stm_sb_label_read(bds[i], 1u, 1u, &ub));
+        STM_ASSERT_EQ(ub.ub_alloc_root.bp_kind, STM_BPTR_KIND_ALLOC_ROOTS);
+        STM_ASSERT(stm_load_le64(ub.ub_alloc_root.bp_paddr) != 0);
+        /* Tree's actual paddr is embedded inside the roots object;
+         * the pool-level alloc_root_paddr is the roots object itself. */
+    }
+
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+    unlink_paths();
+}
+
+/* Multi-cycle commit + remount: verifies that across several
+ * reserve→commit→remount cycles, the roots object tracks each
+ * commit's alloc tree root correctly and the pool remains mountable.
+ * Specifically checks the free_tree-on-old-roots path exercised at
+ * every non-first commit. */
+STM_TEST(sync_multi_alloc_roots_multi_commit_cycle) {
+    make_paths("roots_multi");
+    stm_bdev *bds[NDEV] = {0};
+    open_bdevs(bds);
+    stm_pool *pool = make_multi_pool(bds);
+
+    stm_alloc *a = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bds[0], POOL_UUID,
+                                     (uint64_t[]){ DEV_UUID_LO[0], DEV_UUID_HI },
+                                     TEST_BOOTSTRAP_BYTES, &a));
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), NULL, &s));
+
+    /* 5 reserve+commit cycles. Each commit frees the prior roots
+     * object's node + writes a new one. Errors in free_tree's Merkle
+     * decrypt under a wrong gen/key would surface as STM_ECORRUPT
+     * / STM_EBADTAG and fail the test. */
+    for (int i = 0; i < 5; i++) {
+        uint64_t p = 0;
+        STM_ASSERT_OK(stm_alloc_reserve(a, 4u + (uint64_t)i, 0, &p));
+        STM_ASSERT_OK(stm_sync_commit(s));
+    }
+
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+
+    /* Remount, reserve once more, commit — the roots-object's load_at
+     * chain must succeed; the subsequent commit frees the just-loaded
+     * roots root (exercising free_tree at the post-mount-claim gen). */
+    open_bdevs(bds);
+    pool = make_multi_pool(bds);
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(bds[0], &a2));
+    stm_sync *s2 = NULL;
+    STM_ASSERT_OK(stm_sync_open(pool, a2, make_wk(), NULL, &s2));
+
+    uint64_t p2 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a2, 9u, 0, &p2));
+    STM_ASSERT_OK(stm_sync_commit(s2));
+
+    stm_sync_close(s2);
+    stm_alloc_close(a2);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+    unlink_paths();
+}
+
+/* Every UB slot at version 5 (pre-P5-3b format) is refused at mount
+ * as STM_EBADVERSION. The v5 → v6 bump guards against a v5 pool
+ * being mis-interpreted by v6 code. */
+STM_TEST(sync_multi_mount_refuses_v5_ub) {
+    make_paths("v5_refuse");
+    stm_bdev *bds[NDEV] = {0};
+    open_bdevs(bds);
+    stm_pool *pool = make_multi_pool(bds);
+
+    stm_alloc *a = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bds[0], POOL_UUID,
+                                     (uint64_t[]){ DEV_UUID_LO[0], DEV_UUID_HI },
+                                     TEST_BOOTSTRAP_BYTES, &a));
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), NULL, &s));
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+
+    /* Rewrite every device's live UB with ub_version=5 (preserving
+     * ub_csum via recompute so only the version check fires, not the
+     * global csum check). */
+    for (size_t i = 0; i < NDEV; i++) {
+        FILE *f = fopen(g_paths[i], "rb+");
+        STM_ASSERT(f != NULL);
+        uint64_t offsets[STM_LABELS_PER_DEVICE];
+        STM_ASSERT_OK(stm_label_offsets(TEST_DEVICE_BYTES, offsets));
+        uint64_t slot_off = 0;
+        STM_ASSERT_OK(stm_ub_slot_offset(offsets[1], 1u, &slot_off));
+        uint8_t buf[STM_UB_SIZE];
+        STM_ASSERT_EQ(fseeko(f, (off_t)slot_off, SEEK_SET), 0);
+        STM_ASSERT_EQ(fread(buf, 1, STM_UB_SIZE, f), (size_t)STM_UB_SIZE);
+        /* ub_version is le32 at offset 8. */
+        buf[8] = 5;
+        buf[9] = 0; buf[10] = 0; buf[11] = 0;
+        stm_ub_csum(buf, STM_UB_SIZE, buf + (STM_UB_SIZE - 32));
+        STM_ASSERT_EQ(fseeko(f, (off_t)slot_off, SEEK_SET), 0);
+        STM_ASSERT_EQ(fwrite(buf, 1, STM_UB_SIZE, f), (size_t)STM_UB_SIZE);
+        fclose(f);
+    }
+
+    open_bdevs(bds);
+    pool = make_multi_pool(bds);
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(bds[0], &a2));
+    stm_sync *s2 = NULL;
+    STM_ASSERT_ERR(stm_sync_open(pool, a2, make_wk(), NULL, &s2),
+                    STM_EBADVERSION);
+    STM_ASSERT(s2 == NULL);
+
+    stm_alloc_close(a2);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+    unlink_paths();
+}
+
 STM_TEST_MAIN("sync_multi")

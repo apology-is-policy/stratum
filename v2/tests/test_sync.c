@@ -300,8 +300,16 @@ STM_TEST(sync_commit_advances_ring_label_slot) {
 }
 
 STM_TEST(sync_ub_alloc_root_matches_tree) {
-    /* The ub_alloc_root paddr recorded in the committed uberblock
-     * equals stm_alloc_get_tree_root(a). */
+    /* P5-3b: ub_alloc_root points at the allocator-roots object
+     * (ARCH §6.1), NOT at the per-device alloc tree. The roots
+     * object's entry for device 0 carries the alloc tree's paddr.
+     *
+     * This test verifies:
+     *   - info.alloc_root_paddr is populated to a non-zero paddr.
+     *   - info.alloc_root_paddr differs from the alloc tree's paddr
+     *     (the indirection layer is real, not a cosmetic pass-through).
+     *   - The on-disk UB's ub_alloc_root carries kind=ALLOC_ROOTS and
+     *     paddr matching info.alloc_root_paddr. */
     make_tmp("uar");
     stm_bdev *d = open_fresh_device();
     stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
@@ -311,20 +319,21 @@ STM_TEST(sync_ub_alloc_root_matches_tree) {
     STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p));
     STM_ASSERT_OK(stm_sync_commit(s));
 
-    uint64_t alloc_root = 0;
-    STM_ASSERT_OK(stm_alloc_get_tree_root(a, &alloc_root, NULL));
+    uint64_t tree_root = 0;
+    STM_ASSERT_OK(stm_alloc_get_tree_root(a, &tree_root, NULL));
 
     stm_sync_info info;
     STM_ASSERT_OK(stm_sync_info_get(s, &info));
-    STM_ASSERT_EQ(info.alloc_root_paddr, alloc_root);
+    STM_ASSERT(info.alloc_root_paddr != 0);
+    /* Indirection is real: alloc_root (now = roots-obj) != tree_root. */
+    STM_ASSERT(info.alloc_root_paddr != tree_root);
 
-    /* Bonus: read the live uberblock directly and check its
-     * ub_alloc_root field. */
     stm_uberblock ub;
     STM_ASSERT_OK(stm_sb_label_read(d, info.live_label_idx,
                                       info.live_slot_idx, &ub));
-    STM_ASSERT_EQ(stm_load_le64(ub.ub_alloc_root.bp_paddr), alloc_root);
-    STM_ASSERT_EQ(ub.ub_alloc_root.bp_kind, STM_BPTR_KIND_ALLOC);
+    STM_ASSERT_EQ(stm_load_le64(ub.ub_alloc_root.bp_paddr),
+                  info.alloc_root_paddr);
+    STM_ASSERT_EQ(ub.ub_alloc_root.bp_kind, STM_BPTR_KIND_ALLOC_ROOTS);
 
     teardown(a, s, pool);
     stm_bdev_close(d);
