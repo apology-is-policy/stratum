@@ -2234,6 +2234,105 @@ stm_status stm_sync_finish_evacuation(stm_sync *s, uint16_t device_id)
 }
 
 /* ========================================================================= */
+/* P5-4c-α: ONLINE → ONLINE device replacement.                               */
+/* ========================================================================= */
+
+stm_status stm_sync_replace_device_online(
+    stm_sync *s, uint16_t old_device_id,
+    const stm_pool_device *new_device,
+    stm_alloc *new_alloc,
+    size_t redundancy_floor,
+    uint16_t *out_new_device_id)
+{
+    if (!s || !new_device || !new_alloc) return STM_EINVAL;
+
+    /* Pre-checks. device_id=0 guard mirrors pool layer (R17 P1-1);
+     * we catch it here too so the caller gets a clean error before
+     * we start adding + committing. */
+    if (old_device_id == 0) return STM_ENOTSUPPORTED;
+
+    /* Snapshot old slot state under pool.rdlock. Release before any
+     * mutator (which takes wrlock internally — recursive acquire is
+     * UB under POSIX rwlocks). */
+    stm_pool_lock_shared(s->pool);
+    const stm_pool_device *old = stm_pool_device_info(s->pool,
+                                                          old_device_id);
+    stm_device_state old_state = old ? old->state : STM_DEV_STATE_UNSET;
+    size_t count_before = stm_pool_device_count(s->pool);
+    stm_pool_unlock_shared(s->pool);
+
+    if (!old || count_before == 0) return STM_EINVAL;
+    if (old_state == STM_DEV_STATE_FAULTED) {
+        /* Reconstruct path — reads from surviving replicas instead
+         * of from old. Needs bptr-layer iteration of block replicas;
+         * not available at this layer. Deferred to P5-4c-β. */
+        return STM_ENOTSUPPORTED;
+    }
+    if (old_state != STM_DEV_STATE_ONLINE) return STM_EINVAL;
+
+    /* Step 1: add the new device. Appends at count_before. */
+    stm_status as = stm_pool_add_device(s->pool, new_device);
+    if (as != STM_OK) return as;
+    uint16_t new_slot = (uint16_t)count_before;
+
+    /* Step 2: attach the caller's alloc to the new slot. */
+    stm_status ats = stm_sync_attach_alloc(s, new_slot, new_alloc);
+    if (ats != STM_OK) {
+        /* Roll back the add: remove the new slot. No data on it yet,
+         * so remove_device accepts. */
+        (void)stm_pool_remove_device(s->pool, new_slot, redundancy_floor);
+        return ats;
+    }
+
+    if (out_new_device_id) *out_new_device_id = new_slot;
+
+    /* Step 3: persist the add. */
+    stm_status cs = stm_sync_commit(s);
+    if (cs != STM_OK) return cs;
+
+    /* Step 4: begin evacuation on the old slot. */
+    stm_status bs = stm_pool_begin_evacuation(s->pool, old_device_id,
+                                                  redundancy_floor);
+    if (bs != STM_OK) return bs;
+
+    /* Step 5: persist EVACUATING. */
+    cs = stm_sync_commit(s);
+    if (cs != STM_OK) return cs;
+
+    /* Step 6: drain the old slot range-by-range onto the new slot.
+     * Each evacuation_step is one commit-unit of migration (atomic
+     * per evac.tla's EvacuateAtomic); we accumulate until the target
+     * tree is empty, then commit the batch for durability. */
+    for (;;) {
+        uint64_t old_paddr = 0, new_paddr = 0;
+        stm_status es = stm_sync_evacuation_step(s, old_device_id,
+                                                    new_slot,
+                                                    &old_paddr, &new_paddr);
+        if (es == STM_ENOENT) break;    /* drained */
+        if (es != STM_OK) return es;
+        /* Any higher-level replica-list owner would rewrite
+         * old_paddr → new_paddr here. At this layer there are no
+         * block pointers to update — tests / bptr-layer do their own
+         * bookkeeping. */
+        (void)old_paddr; (void)new_paddr;
+    }
+
+    /* Step 7: persist migrations. */
+    cs = stm_sync_commit(s);
+    if (cs != STM_OK) return cs;
+
+    /* Step 8: finalize — old → REMOVED, detach allocs[old]. */
+    stm_status fs = stm_sync_finish_evacuation(s, old_device_id);
+    if (fs != STM_OK) return fs;
+
+    /* Step 9: persist REMOVED. */
+    cs = stm_sync_commit(s);
+    if (cs != STM_OK) return cs;
+
+    return STM_OK;
+}
+
+/* ========================================================================= */
 /* Per-dataset key management (P4-4c).                                        */
 /* ========================================================================= */
 

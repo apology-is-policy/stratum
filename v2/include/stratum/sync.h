@@ -56,6 +56,7 @@
 #define STRATUM_V2_SYNC_H
 
 #include <stratum/types.h>
+#include <stratum/pool.h>      /* stm_pool_device — used in replace_device_online */
 
 #ifdef __cplusplus
 extern "C" {
@@ -63,7 +64,6 @@ extern "C" {
 
 struct stm_bdev;         typedef struct stm_bdev  stm_bdev;
 struct stm_alloc;        typedef struct stm_alloc stm_alloc;
-struct stm_pool;         typedef struct stm_pool  stm_pool;
 struct stm_hybrid_keys;  typedef struct stm_hybrid_keys stm_hybrid_keys;
 struct stm_janus_client;
 
@@ -464,6 +464,67 @@ stm_status stm_sync_remove_device(stm_sync *s, uint16_t device_id,
  */
 STM_MUST_USE
 stm_status stm_sync_finish_evacuation(stm_sync *s, uint16_t device_id);
+
+/*
+ * P5-4c-α: ONLINE → ONLINE device replacement. Composes add_device +
+ * begin_evacuation + evacuation_step* + finish_evacuation + intervening
+ * commits, returning STM_OK only after the full sequence durably
+ * lands. Drives the exact pattern any application would write by
+ * hand — bundled for correctness + audit focus.
+ *
+ * Pre:
+ *   - `old_device_id != 0` (R17 P1-1: metadata primary guarded).
+ *   - Slot at `old_device_id` is ONLINE. (FAULTED → new reconstruct
+ *     is a distinct primitive — P5-4c-β, needs bptr-layer iteration.
+ *     Returns STM_ENOTSUPPORTED here.)
+ *   - `new_device` / `new_alloc` are a fresh pair the caller owns.
+ *     `new_device->bdev` valid; `new_alloc` device_id pre-set via
+ *     `stm_alloc_set_device_id` to the slot index this call will
+ *     return (the next appendable slot).
+ *   - Pool has headroom: device_count < STM_POOL_DEVICES_MAX.
+ *
+ * Sequence:
+ *   1. stm_pool_add_device(new_device)        — new device appended.
+ *   2. stm_sync_attach_alloc(new_slot, new_alloc).
+ *   3. stm_sync_commit                          — persists ADD.
+ *   4. stm_pool_begin_evacuation(old, floor).
+ *   5. stm_sync_commit                          — persists EVACUATING.
+ *   6. Loop: stm_sync_evacuation_step(old, new_slot, ...) until
+ *      STM_ENOENT.
+ *   7. stm_sync_commit                          — persists migrations.
+ *   8. stm_sync_finish_evacuation(old)         — EVACUATING → REMOVED.
+ *   9. stm_sync_commit                          — persists REMOVED.
+ *
+ * On any non-OK step, the sequence halts. Partial progress may have
+ * landed durably; the pool is in a consistent but intermediate state
+ * that a retry can advance. The caller decides recovery strategy.
+ *
+ * Slot semantics (caveat): `new_slot` is a NEW roster index, not a
+ * reuse of `old_device_id`. `old_device_id` becomes a REMOVED
+ * tombstone; `new_device`'s UUID occupies a fresh slot. For a true
+ * "swap into old's slot" variant (ARCH §4.7.3 full intent), slot
+ * reuse requires either burning the old UUID entirely or a dedicated
+ * refactor — deferred.
+ *
+ * `*out_new_device_id` receives the new slot index (if non-NULL).
+ *
+ * Returns:
+ *   STM_OK             — replacement complete + durable.
+ *   STM_ENOTSUPPORTED  — old slot FAULTED (reconstruct path unimplemented)
+ *                         or old_device_id == 0.
+ *   STM_EINVAL         — shape / state errors.
+ *   STM_EBUSY          — another slot is EVACUATING.
+ *   STM_ENOSPC         — roster at STM_POOL_DEVICES_MAX.
+ *   STM_EEXIST         — new_device->uuid collides with roster.
+ *   STM_EROFS          — RO pool.
+ */
+STM_MUST_USE
+stm_status stm_sync_replace_device_online(
+    stm_sync *s, uint16_t old_device_id,
+    const stm_pool_device *new_device,
+    stm_alloc *new_alloc,
+    size_t redundancy_floor,
+    uint16_t *out_new_device_id);
 
 /* ========================================================================= */
 /* Per-dataset key management (P4-4c).                                        */
