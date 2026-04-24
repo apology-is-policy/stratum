@@ -183,6 +183,12 @@ struct stm_sync {
     sync_dek_slot    *deks;
     size_t            dek_count;
     size_t            dek_cap;
+
+    /* P5-3a: pool-wide redundancy profile. Set from caller at create,
+     * from on-disk UB at open. Consumed by build_uberblock (stamps
+     * ub_redundancy_kind / ub_redundancy_params); future P5-3c work
+     * will expose it to the allocator + write path. */
+    stm_redundancy_profile redundancy;
 };
 
 /* ========================================================================= */
@@ -426,6 +432,95 @@ static inline uint32_t ring_slot_for_gen(uint64_t gen)
  * but reservation and mount-claim UBs advance `new_gen` past the
  * tree's encryption gen without rewriting the tree — in those cases
  * `alloc_root_gen` carries the OLDER gen so AEAD decrypt still works. */
+/* ========================================================================= */
+/* P5-3a: redundancy-profile validate + encode + decode helpers.              */
+/* ========================================================================= */
+
+/*
+ * Validate a caller-supplied profile against the pool's current
+ * membership. Returns:
+ *   STM_EINVAL         — kind out of range, or MIRROR with n==0, or
+ *                        MIRROR with n > device_count.
+ *   STM_ENOTSUPPORTED  — RS / LRC kind (reserved for future).
+ *   STM_OK             — accepted.
+ */
+static stm_status sync_redundancy_validate(const stm_redundancy_profile *p,
+                                              size_t device_count)
+{
+    if (!p) return STM_EINVAL;
+    switch (p->kind) {
+        case STM_RED_NONE:
+            /* mirror_n is a don't-care but MUST be zero for format
+             * determinism. A nonzero n on a NONE profile looks
+             * harmless today but could be mistaken for "mirror(n)"
+             * once the on-disk profile union grows. Reject. */
+            if (p->mirror_n != 0) return STM_EINVAL;
+            return STM_OK;
+        case STM_RED_MIRROR:
+            if (p->mirror_n == 0) return STM_EINVAL;
+            if (p->mirror_n > device_count) return STM_EINVAL;
+            if (p->mirror_n > STM_POOL_DEVICES_MAX) return STM_EINVAL;
+            return STM_OK;
+        case STM_RED_RS:
+        case STM_RED_LRC:
+            return STM_ENOTSUPPORTED;
+        default:
+            return STM_EINVAL;
+    }
+}
+
+/* Pack a validated profile into the on-disk 1+15 bytes. Caller owns
+ * the buffer; writes deterministically so two commits with the same
+ * profile produce byte-identical UBs. */
+static void sync_redundancy_encode(const stm_redundancy_profile *p,
+                                      uint8_t *out_kind,
+                                      uint8_t out_params[15])
+{
+    *out_kind = p->kind;
+    memset(out_params, 0, 15);
+    if (p->kind == STM_RED_MIRROR) {
+        out_params[0] = p->mirror_n;
+    }
+}
+
+/* Decode the on-disk bytes into a profile. Used at mount. Enforces
+ * the same rules as sync_redundancy_validate — well-formed kind,
+ * well-formed MIRROR params, and zero tail bytes (rejects drift /
+ * tamper even though ub_csum already covers the full UB). Also
+ * cross-checks against the pool handle's device_count; a UB that
+ * declares mirror(n) on a pool that has since shrunk below n
+ * rejects STM_ECORRUPT at mount rather than quietly downgrading. */
+static stm_status sync_redundancy_decode(uint8_t on_disk_kind,
+                                            const uint8_t on_disk_params[15],
+                                            size_t device_count,
+                                            stm_redundancy_profile *out)
+{
+    out->kind     = on_disk_kind;
+    out->mirror_n = 0;
+    switch (on_disk_kind) {
+        case STM_RED_NONE:
+            for (size_t i = 0; i < 15; i++)
+                if (on_disk_params[i] != 0) return STM_ECORRUPT;
+            return STM_OK;
+        case STM_RED_MIRROR: {
+            uint8_t n = on_disk_params[0];
+            if (n == 0) return STM_ECORRUPT;
+            if (n > STM_POOL_DEVICES_MAX) return STM_ECORRUPT;
+            if (n > device_count) return STM_ECORRUPT;
+            for (size_t i = 1; i < 15; i++)
+                if (on_disk_params[i] != 0) return STM_ECORRUPT;
+            out->mirror_n = n;
+            return STM_OK;
+        }
+        case STM_RED_RS:
+        case STM_RED_LRC:
+            /* Future-incompatible kinds: fail-loud at mount. */
+            return STM_ENOTSUPPORTED;
+        default:
+            return STM_ECORRUPT;
+    }
+}
+
 static void build_uberblock(stm_uberblock *out,
                               const stm_sync *s,
                               uint16_t target_device_id,
@@ -495,8 +590,11 @@ static void build_uberblock(stm_uberblock *out,
     out->ub_total_blocks = stm_store_le64(astats->data_total_blocks);
     out->ub_free_blocks  = stm_store_le64(astats->data_free_blocks);
 
-    /* MVP: no redundancy profile yet (mirror lands in P5-3). */
-    out->ub_redundancy_kind = STM_RED_NONE;
+    /* P5-3a: stamp the pool's declared redundancy profile. Validated
+     * at create / decoded at open, so a well-formed `s->redundancy` is
+     * an invariant here. */
+    sync_redundancy_encode(&s->redundancy, &out->ub_redundancy_kind,
+                              out->ub_redundancy_params);
 }
 
 /* ========================================================================= */
@@ -612,6 +710,7 @@ static stm_sync *sync_new(stm_pool *p, stm_alloc *a)
 
 stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
                             const stm_hybrid_keys *wk,
+                            const stm_redundancy_profile *profile,
                             stm_sync **out_sync)
 {
     if (!p || !a || !out_sync) return STM_EINVAL;
@@ -620,6 +719,16 @@ stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
      * PQ-hybrid-wrapped before persistence, so the wrap-public-key
      * half has to be available at create time. */
     if (!wk) return STM_EINVAL;
+
+    /* P5-3a: validate + resolve the redundancy profile up-front,
+     * before any on-disk state is created. NULL => {NONE}. */
+    stm_redundancy_profile rp = { .kind = STM_RED_NONE, .mirror_n = 0 };
+    if (profile) {
+        stm_status ps = sync_redundancy_validate(profile,
+                                                   stm_pool_device_count(p));
+        if (ps != STM_OK) return ps;
+        rp = *profile;
+    }
 
     /* R9 P1-1: the rest of this function calls stm_random_bytes /
      * stm_aead_* transitively via stm_alloc_set_crypt_ctx; libsodium
@@ -644,6 +753,10 @@ stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
      *                  are full 2-phase with current_gen = auth+2. */
     s->auth_gen    = 0;
     s->current_gen = 1;
+
+    /* P5-3a: persist the resolved profile on the handle; build_uberblock
+     * reads it from here on every commit. */
+    s->redundancy = rp;
 
     /* P4-1: generate the pool's Merkle salt once, at format time.
      * The salt is persisted in ub_merkle_root_salt and stays stable
@@ -953,8 +1066,19 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
 
     uint64_t alloc_root_gen = stm_load_le64(ub.ub_alloc_root_gen);
 
+    /* P5-3a: decode the canonical UB's redundancy profile. sync_new
+     * zeroes redundancy (kind=NONE); decode can reject
+     * ENOTSUPPORTED for future-incompatible kinds (RS/LRC) at mount,
+     * matching the feature-flag policy from ARCH §5.9. */
+    stm_redundancy_profile rp;
+    stm_status rps = sync_redundancy_decode(ub.ub_redundancy_kind,
+                                               ub.ub_redundancy_params,
+                                               n, &rp);
+    if (rps != STM_OK) return rps;
+
     stm_sync *s2 = sync_new(p, a);
     if (!s2) return STM_ENOMEM;
+    s2->redundancy = rp;
 
     /* Populate in-RAM state from the canonical UB. auth_gen = durable
      * auth (pre-claim); claim advances it to auth+1 below. */
@@ -1327,6 +1451,20 @@ stm_status stm_sync_info_get(const stm_sync *s, stm_sync_info *out)
     out->live_slot_idx         = s->live_slot_idx;
     out->alloc_root_paddr      = s->alloc_root_paddr;
 
+    pthread_mutex_unlock(&ms->lock);
+    return STM_OK;
+}
+
+/* P5-3a: expose the resolved redundancy profile. Read-only; no
+ * per-call mutation here, so a shared snapshot is fine under the
+ * sync-wide lock like info_get. */
+stm_status stm_sync_redundancy_get(const stm_sync *s,
+                                      stm_redundancy_profile *out)
+{
+    if (!s || !out) return STM_EINVAL;
+    stm_sync *ms = (stm_sync *)s;
+    pthread_mutex_lock(&ms->lock);
+    *out = s->redundancy;
     pthread_mutex_unlock(&ms->lock);
     return STM_OK;
 }

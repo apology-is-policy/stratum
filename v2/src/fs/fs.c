@@ -180,7 +180,7 @@ stm_status stm_fs_format(const char *path, const stm_fs_format_opts *opts)
     if (s != STM_OK) { stm_alloc_close(a); stm_bdev_close(d); stm_hybrid_keys_wipe(&wk); return s; }
 
     stm_sync *sync = NULL;
-    s = stm_sync_create(pool, a, &wk, &sync);
+    s = stm_sync_create(pool, a, &wk, NULL, &sync);
     if (s != STM_OK) { stm_pool_close(pool); stm_alloc_close(a); stm_bdev_close(d); stm_hybrid_keys_wipe(&wk); return s; }
 
     /* First commit: lays down the initial uberblock at gen=1 so a

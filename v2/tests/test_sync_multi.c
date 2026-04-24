@@ -132,7 +132,7 @@ STM_TEST(sync_multi_3dev_roundtrip) {
                                      (uint64_t[]){ DEV_UUID_LO[0], DEV_UUID_HI },
                                      TEST_BOOTSTRAP_BYTES, &a));
     stm_sync *s = NULL;
-    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), &s));
+    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), NULL, &s));
 
     /* Reserve + commit. Post-commit: auth=1, current_gen=3. */
     uint64_t paddr = 0;
@@ -215,7 +215,7 @@ STM_TEST(sync_multi_mount_survives_single_device_loss) {
                                      (uint64_t[]){ DEV_UUID_LO[0], DEV_UUID_HI },
                                      TEST_BOOTSTRAP_BYTES, &a));
     stm_sync *s = NULL;
-    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), &s));
+    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), NULL, &s));
     STM_ASSERT_OK(stm_sync_commit(s));
     STM_ASSERT_OK(stm_sync_commit(s));   /* 2-phase. auth=3 post-commit. */
 
@@ -260,7 +260,7 @@ STM_TEST(sync_multi_mount_refuses_sub_quorum) {
                                      (uint64_t[]){ DEV_UUID_LO[0], DEV_UUID_HI },
                                      TEST_BOOTSTRAP_BYTES, &a));
     stm_sync *s = NULL;
-    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), &s));
+    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), NULL, &s));
     STM_ASSERT_OK(stm_sync_commit(s));
 
     stm_sync_close(s);
@@ -327,7 +327,7 @@ STM_TEST(sync_multi_commit_writes_every_device_ub) {
                                      (uint64_t[]){ DEV_UUID_LO[0], DEV_UUID_HI },
                                      TEST_BOOTSTRAP_BYTES, &a));
     stm_sync *s = NULL;
-    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), &s));
+    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), NULL, &s));
     STM_ASSERT_OK(stm_sync_commit(s));
 
     /* Scan each device: each should have UB at gen=1 (fresh first
@@ -388,7 +388,7 @@ STM_TEST(sync_multi_orphan_ahead_of_quorum_ignored_on_mount) {
                                      (uint64_t[]){ DEV_UUID_LO[0], DEV_UUID_HI },
                                      TEST_BOOTSTRAP_BYTES, &a));
     stm_sync *s = NULL;
-    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), &s));
+    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), NULL, &s));
     STM_ASSERT_OK(stm_sync_commit(s));    /* auth=1 on all 3 devices. */
 
     /* Read the gen=1 UB from device 0 — this will be our prototype
@@ -465,7 +465,7 @@ STM_TEST(sync_multi_mount_tolerates_minority_content_divergence) {
                                      (uint64_t[]){ DEV_UUID_LO[0], DEV_UUID_HI },
                                      TEST_BOOTSTRAP_BYTES, &a));
     stm_sync *s = NULL;
-    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), &s));
+    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), NULL, &s));
     STM_ASSERT_OK(stm_sync_commit(s));
     stm_sync_close(s);
     stm_alloc_close(a);
@@ -524,7 +524,7 @@ STM_TEST(sync_multi_mount_detects_alloc_root_gen_tamper) {
                                      (uint64_t[]){ DEV_UUID_LO[0], DEV_UUID_HI },
                                      TEST_BOOTSTRAP_BYTES, &a));
     stm_sync *s = NULL;
-    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), &s));
+    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), NULL, &s));
     STM_ASSERT_OK(stm_sync_commit(s));
     stm_sync_close(s);
     stm_alloc_close(a);
@@ -594,7 +594,7 @@ STM_TEST(sync_multi_mount_refuses_no_content_quorum) {
                                      (uint64_t[]){ DEV_UUID_LO[0], DEV_UUID_HI },
                                      TEST_BOOTSTRAP_BYTES, &a));
     stm_sync *s = NULL;
-    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), &s));
+    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), NULL, &s));
     STM_ASSERT_OK(stm_sync_commit(s));
     stm_sync_close(s);
     stm_alloc_close(a);
@@ -652,7 +652,7 @@ STM_TEST(sync_multi_keyschema_commit_idempotent_on_clean) {
                                      (uint64_t[]){ DEV_UUID_LO[0], DEV_UUID_HI },
                                      TEST_BOOTSTRAP_BYTES, &a));
     stm_sync *s = NULL;
-    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), &s));
+    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), NULL, &s));
 
     /* Commit #1 (fresh 1-phase). Schema was dirty (fresh handle);
      * commit persists, clears dirty. */
@@ -681,6 +681,212 @@ STM_TEST(sync_multi_keyschema_commit_idempotent_on_clean) {
 
     stm_sync_close(s);
     stm_alloc_close(a);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+    unlink_paths();
+}
+
+/* ========================================================================= */
+/* P5-3a: redundancy profile plumbing.                                        */
+/* ========================================================================= */
+
+/*
+ * Format a fresh pool under mirror(n), commit, close, and re-mount —
+ * the decoded profile should match byte-for-byte. Also verifies the
+ * profile is stamped on every device's UB (read back via
+ * stm_sb_label_read).
+ */
+STM_TEST(sync_multi_redundancy_mirror_roundtrip) {
+    make_paths("red_roundtrip");
+    stm_bdev *bds[NDEV] = {0};
+    open_bdevs(bds);
+    stm_pool *pool = make_multi_pool(bds);
+
+    stm_alloc *a = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bds[0], POOL_UUID,
+                                     (uint64_t[]){ DEV_UUID_LO[0], DEV_UUID_HI },
+                                     TEST_BOOTSTRAP_BYTES, &a));
+
+    stm_redundancy_profile prof = { .kind = STM_RED_MIRROR, .mirror_n = 2 };
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), &prof, &s));
+
+    stm_redundancy_profile got;
+    STM_ASSERT_OK(stm_sync_redundancy_get(s, &got));
+    STM_ASSERT_EQ(got.kind, STM_RED_MIRROR);
+    STM_ASSERT_EQ(got.mirror_n, 2u);
+
+    /* First commit lands UBs on all 3 devs; each should carry the
+     * profile bytes. */
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    for (size_t i = 0; i < NDEV; i++) {
+        stm_uberblock ub_i;
+        STM_ASSERT_OK(stm_sb_label_read(bds[i], 1u, 1u, &ub_i));
+        STM_ASSERT_EQ(ub_i.ub_redundancy_kind, STM_RED_MIRROR);
+        STM_ASSERT_EQ(ub_i.ub_redundancy_params[0], 2u);
+        for (size_t j = 1; j < 15; j++)
+            STM_ASSERT_EQ(ub_i.ub_redundancy_params[j], 0u);
+    }
+
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+
+    /* Remount: profile should survive a round-trip through disk. */
+    open_bdevs(bds);
+    pool = make_multi_pool(bds);
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(bds[0], &a2));
+    stm_sync *s2 = NULL;
+    STM_ASSERT_OK(stm_sync_open(pool, a2, make_wk(), NULL, &s2));
+
+    stm_redundancy_profile got2;
+    STM_ASSERT_OK(stm_sync_redundancy_get(s2, &got2));
+    STM_ASSERT_EQ(got2.kind, STM_RED_MIRROR);
+    STM_ASSERT_EQ(got2.mirror_n, 2u);
+
+    stm_sync_close(s2);
+    stm_alloc_close(a2);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+    unlink_paths();
+}
+
+/* Create with NONE profile (via NULL) — on-disk bytes must be all zero
+ * and decode must round-trip clean. */
+STM_TEST(sync_multi_redundancy_none_when_null) {
+    make_paths("red_none");
+    stm_bdev *bds[NDEV] = {0};
+    open_bdevs(bds);
+    stm_pool *pool = make_multi_pool(bds);
+
+    stm_alloc *a = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bds[0], POOL_UUID,
+                                     (uint64_t[]){ DEV_UUID_LO[0], DEV_UUID_HI },
+                                     TEST_BOOTSTRAP_BYTES, &a));
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), NULL, &s));
+
+    stm_redundancy_profile got;
+    STM_ASSERT_OK(stm_sync_redundancy_get(s, &got));
+    STM_ASSERT_EQ(got.kind, STM_RED_NONE);
+    STM_ASSERT_EQ(got.mirror_n, 0u);
+
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_uberblock ub0;
+    STM_ASSERT_OK(stm_sb_label_read(bds[0], 1u, 1u, &ub0));
+    STM_ASSERT_EQ(ub0.ub_redundancy_kind, STM_RED_NONE);
+    for (size_t j = 0; j < 15; j++)
+        STM_ASSERT_EQ(ub0.ub_redundancy_params[j], 0u);
+
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+    unlink_paths();
+}
+
+/* Reject malformed profile inputs at create time, BEFORE any on-disk
+ * state materializes. */
+STM_TEST(sync_multi_redundancy_create_rejects_malformed) {
+    make_paths("red_reject");
+    stm_bdev *bds[NDEV] = {0};
+    open_bdevs(bds);
+    stm_pool *pool = make_multi_pool(bds);
+    stm_alloc *a = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bds[0], POOL_UUID,
+                                     (uint64_t[]){ DEV_UUID_LO[0], DEV_UUID_HI },
+                                     TEST_BOOTSTRAP_BYTES, &a));
+
+    stm_sync *s = NULL;
+
+    /* mirror(0) — invalid. */
+    stm_redundancy_profile p_zero = { .kind = STM_RED_MIRROR, .mirror_n = 0 };
+    STM_ASSERT_EQ(stm_sync_create(pool, a, make_wk(), &p_zero, &s), STM_EINVAL);
+    STM_ASSERT(s == NULL);
+
+    /* mirror(n > device_count) — invalid. NDEV=3 here. */
+    stm_redundancy_profile p_big = { .kind = STM_RED_MIRROR, .mirror_n = 4 };
+    STM_ASSERT_EQ(stm_sync_create(pool, a, make_wk(), &p_big, &s), STM_EINVAL);
+    STM_ASSERT(s == NULL);
+
+    /* NONE with nonzero mirror_n — invalid (determinism guard). */
+    stm_redundancy_profile p_none_n = { .kind = STM_RED_NONE, .mirror_n = 2 };
+    STM_ASSERT_EQ(stm_sync_create(pool, a, make_wk(), &p_none_n, &s), STM_EINVAL);
+    STM_ASSERT(s == NULL);
+
+    /* Unknown kind — invalid. */
+    stm_redundancy_profile p_bogus = { .kind = 99, .mirror_n = 0 };
+    STM_ASSERT_EQ(stm_sync_create(pool, a, make_wk(), &p_bogus, &s), STM_EINVAL);
+
+    /* RS/LRC — STM_ENOTSUPPORTED, not STM_EINVAL. */
+    stm_redundancy_profile p_rs = { .kind = STM_RED_RS, .mirror_n = 0 };
+    STM_ASSERT_EQ(stm_sync_create(pool, a, make_wk(), &p_rs, &s),
+                  STM_ENOTSUPPORTED);
+    stm_redundancy_profile p_lrc = { .kind = STM_RED_LRC, .mirror_n = 0 };
+    STM_ASSERT_EQ(stm_sync_create(pool, a, make_wk(), &p_lrc, &s),
+                  STM_ENOTSUPPORTED);
+
+    stm_alloc_close(a);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+    unlink_paths();
+}
+
+/* Tamper the redundancy bytes on every device's canonical UB and verify
+ * mount fails STM_ECORRUPT (with a fix-up to ub_csum so only the
+ * redundancy-field check fires, not the global csum check). */
+STM_TEST(sync_multi_redundancy_mount_rejects_nonzero_tail_on_none) {
+    make_paths("red_tamper_none_tail");
+    stm_bdev *bds[NDEV] = {0};
+    open_bdevs(bds);
+    stm_pool *pool = make_multi_pool(bds);
+
+    stm_alloc *a = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bds[0], POOL_UUID,
+                                     (uint64_t[]){ DEV_UUID_LO[0], DEV_UUID_HI },
+                                     TEST_BOOTSTRAP_BYTES, &a));
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), NULL, &s));
+    STM_ASSERT_OK(stm_sync_commit(s));
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+
+    /* Directly munge on-disk bytes: for every device's final UB (which
+     * is at label=1 slot=1 per gen=1's ring math), set params[1]=1
+     * (invalid on NONE: tail must be zero) and rebuild ub_csum. */
+    for (size_t i = 0; i < NDEV; i++) {
+        FILE *f = fopen(g_paths[i], "rb+");
+        STM_ASSERT(f != NULL);
+        uint64_t offsets[STM_LABELS_PER_DEVICE];
+        STM_ASSERT_OK(stm_label_offsets(TEST_DEVICE_BYTES, offsets));
+        uint64_t slot_off = 0;
+        STM_ASSERT_OK(stm_ub_slot_offset(offsets[1], 1u, &slot_off));
+        uint8_t buf[STM_UB_SIZE];
+        STM_ASSERT_EQ(fseeko(f, (off_t)slot_off, SEEK_SET), 0);
+        STM_ASSERT_EQ(fread(buf, 1, STM_UB_SIZE, f), (size_t)STM_UB_SIZE);
+        /* params field is at offset 425, size 15. Flip params[1]. */
+        buf[425 + 1] ^= 0x01;
+        /* Recompute ub_csum over bytes [0, STM_UB_SIZE-32). */
+        stm_ub_csum(buf, STM_UB_SIZE, buf + (STM_UB_SIZE - 32));
+        STM_ASSERT_EQ(fseeko(f, (off_t)slot_off, SEEK_SET), 0);
+        STM_ASSERT_EQ(fwrite(buf, 1, STM_UB_SIZE, f), (size_t)STM_UB_SIZE);
+        fclose(f);
+    }
+
+    open_bdevs(bds);
+    pool = make_multi_pool(bds);
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(bds[0], &a2));
+    stm_sync *s2 = NULL;
+    STM_ASSERT_EQ(stm_sync_open(pool, a2, make_wk(), NULL, &s2), STM_ECORRUPT);
+    STM_ASSERT(s2 == NULL);
+
+    stm_alloc_close(a2);
     stm_pool_close(pool);
     close_bdevs(bds);
     unlink_paths();

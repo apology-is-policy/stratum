@@ -99,7 +99,7 @@ static void make_fresh_pool(stm_bdev *d, stm_alloc **out_a, stm_sync **out_s,
     *out_p = make_test_pool(d);
     STM_ASSERT_OK(stm_alloc_create(d, POOL_UUID, DEVICE_UUID,
                                      TEST_BOOTSTRAP_BYTES, out_a));
-    STM_ASSERT_OK(stm_sync_create(*out_p, *out_a, make_wk(), out_s));
+    STM_ASSERT_OK(stm_sync_create(*out_p, *out_a, make_wk(), NULL, out_s));
 }
 
 /* Tear down a pool handle triple. */

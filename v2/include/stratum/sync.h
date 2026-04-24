@@ -68,6 +68,38 @@ struct stm_hybrid_keys;  typedef struct stm_hybrid_keys stm_hybrid_keys;
 struct stm_janus_client;
 
 /* ========================================================================= */
+/* Redundancy profile (P5-3a).                                                */
+/* ========================================================================= */
+
+/*
+ * Pool-wide redundancy profile (ARCH §4.5). Declared at pool format,
+ * persisted in every uberblock's ub_redundancy_kind + ub_redundancy_params,
+ * and consumed by the allocator + write path.
+ *
+ * P5-3a: plumbing only — the profile is carried through sync and stamped
+ * into every UB. Actual use (mirror reservation + fan-out) lands in P5-3c.
+ *
+ * Param encoding, per kind:
+ *   STM_RED_NONE:   all 15 params bytes zero.
+ *   STM_RED_MIRROR: params[0] = n (replica count, 1..64).
+ *                   params[1..15] zero.
+ *   STM_RED_RS / STM_RED_LRC: reserved (refused with STM_ENOTSUPPORTED
+ *                              at create; mount decodes but treats as
+ *                              forward-incompatible).
+ *
+ * Validation (sync_create + sync_open):
+ *   - kind in {NONE, MIRROR}; RS / LRC → STM_ENOTSUPPORTED.
+ *   - if MIRROR: n in [1 .. stm_pool_device_count(pool)]. n=1 is allowed
+ *     (degenerate "mirror of one" — equivalent to NONE but intentional,
+ *     useful for testing the mirror write path on single-device pools).
+ *   - tail params bytes must be zero (rejects encoding drift + tamper).
+ */
+typedef struct {
+    uint8_t kind;              /* stm_redundancy_kind */
+    uint8_t mirror_n;          /* valid when kind == STM_RED_MIRROR */
+} stm_redundancy_profile;
+
+/* ========================================================================= */
 /* Opaque handle + info.                                                      */
 /* ========================================================================= */
 
@@ -124,10 +156,16 @@ typedef struct {
  * must also be populated so the handle can operate without needing
  * a separate unwrap call (a fresh pool uses the dataset key
  * immediately for metadata encryption).
+ *
+ * `profile` (P5-3a): pool-wide redundancy profile. NULL == treat as
+ * {kind = STM_RED_NONE}. Validated per `stm_redundancy_profile`
+ * contract above; invalid inputs return STM_EINVAL /
+ * STM_ENOTSUPPORTED before any on-disk state is created.
  */
 STM_MUST_USE
 stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
                             const stm_hybrid_keys *wk,
+                            const stm_redundancy_profile *profile,
                             stm_sync **out_sync);
 
 /*
@@ -212,6 +250,17 @@ void stm_sync_close(stm_sync *s);
 
 STM_MUST_USE
 stm_status stm_sync_info_get(const stm_sync *s, stm_sync_info *out);
+
+/*
+ * Return the pool's redundancy profile (set at create from the
+ * caller-supplied profile, at open from the mounted UB). Always
+ * returns STM_OK — the profile is always well-formed past
+ * sync_create / sync_open success (their validation rejects
+ * malformed profiles up-front).
+ */
+STM_MUST_USE
+stm_status stm_sync_redundancy_get(const stm_sync *s,
+                                     stm_redundancy_profile *out);
 
 /* ========================================================================= */
 /* Per-dataset key management (P4-4c).                                        */

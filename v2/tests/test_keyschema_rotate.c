@@ -106,7 +106,7 @@ static void make_fresh_pool(stm_bdev *d, stm_alloc **out_a, stm_sync **out_s,
     *out_p = make_test_pool(d);
     STM_ASSERT_OK(stm_alloc_create(d, POOL_UUID, DEVICE_UUID,
                                      TEST_BOOTSTRAP_BYTES, out_a));
-    STM_ASSERT_OK(stm_sync_create(*out_p, *out_a, make_wk(), out_s));
+    STM_ASSERT_OK(stm_sync_create(*out_p, *out_a, make_wk(), NULL, out_s));
 }
 
 static void teardown(stm_alloc *a, stm_sync *s, stm_pool *p)
@@ -659,7 +659,7 @@ STM_TEST(rotate_dataset_key_janus) {
     STM_ASSERT_OK(stm_alloc_create(d, POOL_UUID, DEVICE_UUID,
                                      TEST_BOOTSTRAP_BYTES, &a));
     pool = make_test_pool(d);
-    STM_ASSERT_OK(stm_sync_create(pool, a, &wk, &s));
+    STM_ASSERT_OK(stm_sync_create(pool, a, &wk, NULL, &s));
     STM_ASSERT_OK(stm_sync_commit(s));
 
     /* Add a test dataset (via keyfile path to avoid needing janus for
