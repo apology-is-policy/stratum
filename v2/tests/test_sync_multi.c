@@ -1950,9 +1950,9 @@ STM_TEST(sync_multi_replace_device_online_happy_path) {
     stm_alloc *a4 = NULL;
     STM_ASSERT_OK(stm_alloc_create(bd4, POOL_UUID, uuid4,
                                       TEST_BOOTSTRAP_BYTES, &a4));
-    /* The new slot will be at index 3 (count=3 at the time of
-     * replace_device_online; new_slot = count_before). */
-    STM_ASSERT_OK(stm_alloc_set_device_id(a4, 3));
+    /* Note: caller does NOT pre-set device_id. The wrapper stamps it
+     * to the actual slot post-add (which is only knowable inside the
+     * pool's wrlock critical section — R19 self-find). */
 
     stm_pool_device new_dev = {
         .uuid   = { uuid4[0], uuid4[1] },

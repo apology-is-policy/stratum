@@ -478,9 +478,10 @@ stm_status stm_sync_finish_evacuation(stm_sync *s, uint16_t device_id);
  *     is a distinct primitive — P5-4c-β, needs bptr-layer iteration.
  *     Returns STM_ENOTSUPPORTED here.)
  *   - `new_device` / `new_alloc` are a fresh pair the caller owns.
- *     `new_device->bdev` valid; `new_alloc` device_id pre-set via
- *     `stm_alloc_set_device_id` to the slot index this call will
- *     return (the next appendable slot).
+ *     `new_device->bdev` valid. `new_alloc` must be freshly created
+ *     (empty tree, root_paddr=0) — the wrapper stamps its device_id
+ *     internally to match the actual slot it lands at (caller cannot
+ *     predict the slot under concurrent callers).
  *   - Pool has headroom: device_count < STM_POOL_DEVICES_MAX.
  *
  * Sequence:

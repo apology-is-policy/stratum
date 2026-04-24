@@ -2258,10 +2258,9 @@ stm_status stm_sync_replace_device_online(
     const stm_pool_device *old = stm_pool_device_info(s->pool,
                                                           old_device_id);
     stm_device_state old_state = old ? old->state : STM_DEV_STATE_UNSET;
-    size_t count_before = stm_pool_device_count(s->pool);
     stm_pool_unlock_shared(s->pool);
 
-    if (!old || count_before == 0) return STM_EINVAL;
+    if (!old) return STM_EINVAL;
     if (old_state == STM_DEV_STATE_FAULTED) {
         /* Reconstruct path — reads from surviving replicas instead
          * of from old. Needs bptr-layer iteration of block replicas;
@@ -2270,12 +2269,31 @@ stm_status stm_sync_replace_device_online(
     }
     if (old_state != STM_DEV_STATE_ONLINE) return STM_EINVAL;
 
-    /* Step 1: add the new device. Appends at count_before. */
-    stm_status as = stm_pool_add_device(s->pool, new_device);
+    /* Step 1: add the new device AND determine its slot under one
+     * pool.wrlock critical section. Without this composition, a
+     * concurrent add_device from another thread could intervene
+     * between our count-read and our add, leaving us pointing at the
+     * wrong slot. The _locked variant lets us hold wrlock across the
+     * count-read + add + count-read-again. */
+    stm_pool_lock_exclusive(s->pool);
+    size_t count_before = stm_pool_device_count(s->pool);
+    stm_status as = stm_pool_add_device_locked(s->pool, new_device);
+    stm_pool_unlock_exclusive(s->pool);
     if (as != STM_OK) return as;
     uint16_t new_slot = (uint16_t)count_before;
 
-    /* Step 2: attach the caller's alloc to the new slot. */
+    /* Step 2a: set the alloc's device_id to match the new slot.
+     * Caller passes a fresh alloc (tree clean; root=0); we stamp the
+     * slot ourselves rather than requiring the caller to predict an
+     * unpredictable value (R19 P1 self-find: slot is only known
+     * post-add under concurrent callers). */
+    stm_status sds = stm_alloc_set_device_id(new_alloc, new_slot);
+    if (sds != STM_OK) {
+        (void)stm_pool_remove_device(s->pool, new_slot, redundancy_floor);
+        return sds;
+    }
+
+    /* Step 2b: attach the alloc to the new slot. */
     stm_status ats = stm_sync_attach_alloc(s, new_slot, new_alloc);
     if (ats != STM_OK) {
         /* Roll back the add: remove the new slot. No data on it yet,
