@@ -38,11 +38,13 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `3152c49` (R20 close + scrub P2 fixes + reference doc + hash fixup).
+- **Tip**: `925817b` (R21 / P5-6 full-phase audit close + FAULTED-skip fix).
 - **Phases**: 1–4 complete; Phase 5 in progress — P5-4 fully landed through
-  α scopes, P5-5-α (scrub verify-only) landed + R20 audit closed.
-- **Tests**: 28 suites × (default + ASan + TSan) green. test_scrub holds 17 tests.
-- **Specs**: 13 TLA+ modules (13 fixed configs + 6 buggy-demo configs).
+  α scopes, P5-5-α (scrub verify-only) landed + R20 audit closed, P5-6
+  full-phase audit closed (R21) with 0 P0 + 1 P1 fixed.
+- **Tests**: 28 suites × (default + ASan + TSan) green. test_sync_multi
+  holds 37 tests; test_pool 45; test_scrub 17.
+- **Specs**: 13 TLA+ modules clean + 6 buggy-demo configs fire as expected.
 - **LOC**: ~26 KLOC across 21 src/ modules + 25 public headers.
 
 For phase-level status see `v2/docs/phase{2,3,4,5}-status.md`. The
