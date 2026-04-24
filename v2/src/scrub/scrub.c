@@ -42,6 +42,8 @@ struct stm_scrub {
     pthread_mutex_t lock;
 
     stm_sync       *sync;        /* borrowed; caller-owned lifecycle */
+    stm_pool       *pool;        /* cached at create — sync->pool is
+                                    immutable after sync_create/open */
 
     stm_scrub_state state;
 
@@ -73,6 +75,8 @@ static void scrub_reset_counters_locked(stm_scrub *sc)
 stm_status stm_scrub_create(stm_sync *sync, stm_scrub **out_scrub)
 {
     if (!sync || !out_scrub) return STM_EINVAL;
+    stm_pool *pool = stm_sync_pool(sync);
+    if (!pool) return STM_EINVAL;      /* sync not fully created */
     stm_scrub *sc = calloc(1, sizeof(*sc));
     if (!sc) return STM_ENOMEM;
     if (pthread_mutex_init(&sc->lock, NULL) != 0) {
@@ -80,6 +84,7 @@ stm_status stm_scrub_create(stm_sync *sync, stm_scrub **out_scrub)
         return STM_ENOMEM;
     }
     sc->sync  = sync;
+    sc->pool  = pool;
     sc->state = STM_SCRUB_STATE_IDLE;
     *out_scrub = sc;
     return STM_OK;
@@ -204,38 +209,51 @@ stm_status stm_scrub_step(stm_scrub *sc)
         return STM_OK;
     }
 
-    stm_pool *pool = stm_sync_pool(sc->sync);
-    if (!pool) {
-        pthread_mutex_unlock(&sc->lock);
-        return STM_EINVAL;
-    }
-
-    /* Walk forward across devices until we either find a range to
-     * process OR exhaust the roster. Device state + alloc attach are
-     * both required for the device to be scannable. */
+    /* Lock discipline (POOL OUTER, SYNC INNER):
+     *   sc->lock   — held for the full step body.
+     *   pool.rdlock — acquired for each device-lookup + verify pass.
+     *                 Required for stm_pool_device_info / _device_bdev
+     *                 (pointer-returning readers per pool.h P5-4b-ii-β
+     *                 contract). Excludes concurrent add/remove/
+     *                 finish_evacuation so our device pointer + bdev
+     *                 can't be freed underneath the bdev_read calls.
+     *   sync->lock — briefly, inside stm_sync_alloc, while pool.rdlock
+     *                 is held. Ordering matches POOL OUTER SYNC INNER.
+     *   alloc.lock — internally, LEAF.
+     *
+     * Holding pool.rdlock across multi-block bdev reads is the same
+     * throughput tradeoff flagged by R18 P2-2 for mirror_write /
+     * mirror_read — acceptable for α's low-priority scrub. If the
+     * lock-held duration proves painful, γ's per-block throttling can
+     * drop + re-acquire pool.rdlock between blocks. */
     for (;;) {
-        size_t dcount = stm_pool_device_count(pool);
+        stm_pool_lock_shared(sc->pool);
+
+        size_t dcount = stm_pool_device_count(sc->pool);
         if ((size_t)sc->cursor_device_id >= dcount) {
             /* Cursor drained — Complete. (scrub.tla: Complete action.) */
+            stm_pool_unlock_shared(sc->pool);
             sc->state = STM_SCRUB_STATE_COMPLETED;
             pthread_mutex_unlock(&sc->lock);
             return STM_OK;
         }
 
         uint16_t dev = sc->cursor_device_id;
-        const stm_pool_device *di = stm_pool_device_info(pool, dev);
+        const stm_pool_device *di = stm_pool_device_info(sc->pool, dev);
         if (!di ||
             (di->state != STM_DEV_STATE_ONLINE &&
              di->state != STM_DEV_STATE_EVACUATING)) {
             /* FAULTED / REMOVED / unknown — skip the device entirely. */
+            stm_pool_unlock_shared(sc->pool);
             sc->cursor_device_id++;
             sc->cursor_start_block = 0;
             continue;
         }
 
-        stm_bdev *bd = stm_pool_device_bdev(pool, dev);
+        stm_bdev *bd = stm_pool_device_bdev(sc->pool, dev);
         stm_alloc *a = stm_sync_alloc(sc->sync, dev);
         if (!bd || !a) {
+            stm_pool_unlock_shared(sc->pool);
             sc->cursor_device_id++;
             sc->cursor_start_block = 0;
             continue;
@@ -246,11 +264,13 @@ stm_status stm_scrub_step(stm_scrub *sc)
                                                         &paddr, &length);
         if (s == STM_ENOENT) {
             /* Device drained from the cursor's POV. */
+            stm_pool_unlock_shared(sc->pool);
             sc->cursor_device_id++;
             sc->cursor_start_block = 0;
             continue;
         }
         if (s != STM_OK) {
+            stm_pool_unlock_shared(sc->pool);
             pthread_mutex_unlock(&sc->lock);
             return s;
         }
@@ -263,6 +283,7 @@ stm_status stm_scrub_step(stm_scrub *sc)
          * device offset; any real tree entry satisfies
          * `start + length <= UINT48_MAX`. */
         sc->cursor_start_block = start_block + length;
+        stm_pool_unlock_shared(sc->pool);
         pthread_mutex_unlock(&sc->lock);
         return STM_OK;
     }
