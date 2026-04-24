@@ -269,3 +269,51 @@ const uint64_t *stm_pool_uuid(const stm_pool *p) {
 uint64_t stm_pool_roster_hash(const stm_pool *p) {
     return p ? p->roster_hash : 0;
 }
+
+/* ========================================================================= */
+/* Device lifecycle — P5-4.                                                   */
+/* ========================================================================= */
+
+stm_status stm_pool_add_device(stm_pool *p, const stm_pool_device *new_device)
+{
+    if (!p || !new_device) return STM_EINVAL;
+    if (!new_device->bdev) return STM_EINVAL;
+    if (uuid_is_zero(new_device->uuid)) return STM_EINVAL;
+    if (!role_in_range(new_device->role))   return STM_EINVAL;
+    if (!class_in_range(new_device->class_)) return STM_EINVAL;
+    if (!state_in_range(new_device->state))  return STM_EINVAL;
+
+    /* Roster capacity check. STM_POOL_DEVICES_MAX matches the 64-slot
+     * ub_roster[2048] layout; beyond that, the on-disk format doesn't
+     * fit. */
+    if (p->device_count >= STM_POOL_DEVICES_MAX) return STM_ENOSPC;
+
+    /* UUID uniqueness against the current roster. Every device's UUID
+     * is unique across the pool's lifetime (ARCH §4.3.1). P5-4a MVP
+     * checks the live roster only; burned-UUID tracking for REMOVED
+     * devices lands with P5-4b remove + replace (needs the REMOVED
+     * slot persistence).
+     *
+     * AddDeviceIdempotent from device_lifecycle.tla: AddDevice(d) is
+     * rejected when d is already ONLINE or FAULTED — enforced here by
+     * the UUID uniqueness check (ABSENT devices aren't in the array at
+     * all, so they're trivially not duplicates). */
+    for (size_t i = 0; i < p->device_count; i++) {
+        if (p->devices[i].uuid[0] == new_device->uuid[0] &&
+             p->devices[i].uuid[1] == new_device->uuid[1]) {
+            return STM_EEXIST;
+        }
+    }
+
+    /* Append + rehash. The new slot lands at the current count; the
+     * recount bumps it afterward. Matches the TLA model's AddDevice
+     * action: roster_gen advances; per-device content_gen for the
+     * new device initializes to the current pool_gen-equivalent
+     * (here, post-commit the new device's ub will land at the next
+     * commit's gen). */
+    p->devices[p->device_count] = *new_device;
+    p->device_count++;
+    p->roster_hash = hash_of_devs(p->devices, p->device_count);
+
+    return STM_OK;
+}

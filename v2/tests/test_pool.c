@@ -809,4 +809,172 @@ STM_TEST(pool_sync_open_refuses_wrong_device_uuid) {
     unlink(kf);
 }
 
+/* ========================================================================= */
+/* P5-4a: stm_pool_add_device.                                                */
+/* ========================================================================= */
+
+STM_TEST(pool_add_device_appends_and_advances_roster_hash) {
+    make_tmp("add_device_rt");
+    stm_bdev *d = open_fresh_device();
+    stm_pool *p = make_single_device_pool(d, POOL_UUID, DEVICE_UUID,
+                                             STM_DEV_ROLE_DATA,
+                                             STM_DEV_CLASS_SSD,
+                                             STM_DEV_STATE_ONLINE);
+
+    STM_ASSERT_EQ(stm_pool_device_count(p), 1u);
+    uint64_t h_before = stm_pool_roster_hash(p);
+
+    /* Second device backed by the same test file (fine for this unit
+     * test — we only exercise the pool-layer membership API, no I/O
+     * to the new device). */
+    stm_bdev *d2 = open_fresh_device();
+    STM_ASSERT(d2 != NULL);
+    stm_pool_device add = {
+        .uuid       = { DEVICE_UUID_B[0], DEVICE_UUID_B[1] },
+        .size_bytes = TEST_DEVICE_BYTES,
+        .role       = STM_DEV_ROLE_DATA,
+        .class_     = STM_DEV_CLASS_SSD,
+        .state      = STM_DEV_STATE_ONLINE,
+        .bdev       = d2,
+    };
+    STM_ASSERT_OK(stm_pool_add_device(p, &add));
+
+    STM_ASSERT_EQ(stm_pool_device_count(p), 2u);
+    uint64_t h_after = stm_pool_roster_hash(p);
+    STM_ASSERT(h_before != h_after);
+
+    /* Read back the new slot's info. */
+    const stm_pool_device *info = stm_pool_device_info(p, 1);
+    STM_ASSERT(info != NULL);
+    STM_ASSERT_EQ(info->uuid[0], DEVICE_UUID_B[0]);
+    STM_ASSERT_EQ(info->uuid[1], DEVICE_UUID_B[1]);
+    STM_ASSERT_EQ(info->role, STM_DEV_ROLE_DATA);
+    STM_ASSERT_EQ(info->class_, STM_DEV_CLASS_SSD);
+    STM_ASSERT_EQ(info->state, STM_DEV_STATE_ONLINE);
+    STM_ASSERT(info->bdev == d2);
+
+    stm_pool_close(p);
+    stm_bdev_close(d);
+    stm_bdev_close(d2);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(pool_add_device_rejects_duplicate_uuid) {
+    make_tmp("add_device_dup");
+    stm_bdev *d = open_fresh_device();
+    stm_pool *p = make_single_device_pool(d, POOL_UUID, DEVICE_UUID,
+                                             STM_DEV_ROLE_DATA,
+                                             STM_DEV_CLASS_SSD,
+                                             STM_DEV_STATE_ONLINE);
+
+    stm_bdev *d2 = open_fresh_device();
+    /* Same UUID as device 0 — must be rejected. */
+    stm_pool_device add = {
+        .uuid       = { DEVICE_UUID[0], DEVICE_UUID[1] },
+        .size_bytes = TEST_DEVICE_BYTES,
+        .role       = STM_DEV_ROLE_DATA,
+        .class_     = STM_DEV_CLASS_SSD,
+        .state      = STM_DEV_STATE_ONLINE,
+        .bdev       = d2,
+    };
+    STM_ASSERT_ERR(stm_pool_add_device(p, &add), STM_EEXIST);
+
+    /* device_count unchanged. */
+    STM_ASSERT_EQ(stm_pool_device_count(p), 1u);
+
+    stm_pool_close(p);
+    stm_bdev_close(d);
+    stm_bdev_close(d2);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(pool_add_device_refuses_bad_args) {
+    make_tmp("add_device_badargs");
+    stm_bdev *d = open_fresh_device();
+    stm_pool *p = make_single_device_pool(d, POOL_UUID, DEVICE_UUID,
+                                             STM_DEV_ROLE_DATA,
+                                             STM_DEV_CLASS_SSD,
+                                             STM_DEV_STATE_ONLINE);
+
+    stm_bdev *d2 = open_fresh_device();
+
+    /* NULL pool or device. */
+    stm_pool_device base = {
+        .uuid       = { DEVICE_UUID_B[0], DEVICE_UUID_B[1] },
+        .size_bytes = TEST_DEVICE_BYTES,
+        .role       = STM_DEV_ROLE_DATA,
+        .class_     = STM_DEV_CLASS_SSD,
+        .state      = STM_DEV_STATE_ONLINE,
+        .bdev       = d2,
+    };
+    STM_ASSERT_ERR(stm_pool_add_device(NULL, &base), STM_EINVAL);
+    STM_ASSERT_ERR(stm_pool_add_device(p, NULL), STM_EINVAL);
+
+    /* Zero UUID. */
+    stm_pool_device zero_uuid = base;
+    zero_uuid.uuid[0] = 0;
+    zero_uuid.uuid[1] = 0;
+    STM_ASSERT_ERR(stm_pool_add_device(p, &zero_uuid), STM_EINVAL);
+
+    /* NULL bdev. */
+    stm_pool_device null_bdev = base;
+    null_bdev.bdev = NULL;
+    STM_ASSERT_ERR(stm_pool_add_device(p, &null_bdev), STM_EINVAL);
+
+    /* Out-of-range role. */
+    stm_pool_device bad_role = base;
+    bad_role.role = (stm_device_role)99;
+    STM_ASSERT_ERR(stm_pool_add_device(p, &bad_role), STM_EINVAL);
+
+    stm_pool_close(p);
+    stm_bdev_close(d);
+    stm_bdev_close(d2);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(pool_add_device_roster_cap_enforced) {
+    make_tmp("add_device_cap");
+    stm_bdev *d = open_fresh_device();
+
+    /* Build a pool filled to STM_POOL_DEVICES_MAX via a large opts
+     * struct, then try to add one more. Each slot reuses `d` as its
+     * bdev — we're only exercising the pool-layer capacity guard,
+     * no I/O happens. */
+    stm_pool_open_opts opts;
+    memset(&opts, 0, sizeof opts);
+    opts.pool_uuid[0] = POOL_UUID[0];
+    opts.pool_uuid[1] = POOL_UUID[1];
+    opts.device_count = STM_POOL_DEVICES_MAX;
+    for (size_t i = 0; i < STM_POOL_DEVICES_MAX; i++) {
+        /* Distinct UUIDs via index. Low word = 1 + i so no zero
+         * UUID; high word = 0xfeedbeef. */
+        opts.devices[i].uuid[0]    = 1u + i;
+        opts.devices[i].uuid[1]    = 0xfeedbeefULL;
+        opts.devices[i].size_bytes = TEST_DEVICE_BYTES;
+        opts.devices[i].role       = STM_DEV_ROLE_DATA;
+        opts.devices[i].class_     = STM_DEV_CLASS_SSD;
+        opts.devices[i].state      = STM_DEV_STATE_ONLINE;
+        opts.devices[i].bdev       = d;
+    }
+    stm_pool *p = NULL;
+    STM_ASSERT_OK(stm_pool_open(&opts, &p));
+    STM_ASSERT_EQ(stm_pool_device_count(p), (size_t)STM_POOL_DEVICES_MAX);
+
+    /* Try to add one more. Must return STM_ENOSPC. */
+    stm_pool_device overflow = {
+        .uuid       = { 0xdeadULL, 0xbeefULL },
+        .size_bytes = TEST_DEVICE_BYTES,
+        .role       = STM_DEV_ROLE_DATA,
+        .class_     = STM_DEV_CLASS_SSD,
+        .state      = STM_DEV_STATE_ONLINE,
+        .bdev       = d,
+    };
+    STM_ASSERT_ERR(stm_pool_add_device(p, &overflow), STM_ENOSPC);
+    STM_ASSERT_EQ(stm_pool_device_count(p), (size_t)STM_POOL_DEVICES_MAX);
+
+    stm_pool_close(p);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
 STM_TEST_MAIN("pool")

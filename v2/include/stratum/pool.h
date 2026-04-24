@@ -179,6 +179,54 @@ stm_status stm_pool_roster_decode(const uint8_t in[STM_POOL_ROSTER_BYTES],
 uint64_t stm_pool_roster_hash_of_bytes(
     const uint8_t in[STM_POOL_ROSTER_BYTES]);
 
+/* ========================================================================= */
+/* Device lifecycle (Phase 5 chunk P5-4).                                     */
+/*                                                                             */
+/* See docs/ARCHITECTURE.md §4.7.1 (add), §4.7.2 (remove), §4.7.3 (replace). */
+/* Formal model: v2/specs/device_lifecycle.tla.                               */
+/*                                                                             */
+/* Serialization contract (P5-4a MVP): the caller MUST serialize device-     */
+/* lifecycle calls with respect to any concurrent sync_commit on the same   */
+/* pool. Sync-side calls iterate the pool's device array on every commit;   */
+/* a concurrent mutation interleaves unsafely. Use an external lock, or     */
+/* add-before-sync-create.                                                   */
+/*                                                                             */
+/* A per-pool internal lock that sync also holds is deferred to P5-4b —     */
+/* requires a wider sync refactor to acquire the pool lock around commits. */
+/* ========================================================================= */
+
+/*
+ * Append `new_device` to the pool's roster (ARCH §4.7.1). The new device
+ * joins at index = current device_count, advances roster_hash, and is
+ * picked up by the NEXT sync_commit (the commit writes an UB whose
+ * ub_roster / ub_device_count / ub_roster_hash reflect the expanded
+ * membership).
+ *
+ * Preconditions:
+ *   - `new_device->bdev` non-NULL.
+ *   - `new_device->uuid` non-zero AND not already present in the roster
+ *     (each device's UUID is unique per ARCH §4.3.1).
+ *   - `new_device->role` / `class_` / `state` in range.
+ *   - Current device_count < STM_POOL_DEVICES_MAX.
+ *
+ * The caller retains ownership of new_device->bdev; the pool borrows
+ * it for the pool's lifetime (symmetric with stm_pool_open).
+ *
+ * Does NOT exercise any other device on the pool (no reads, no writes)
+ * — fast. The new device is ONLINE but empty: a subsequent
+ * mirror_write or rebalance populates its storage. Sync-layer: attach
+ * a fresh stm_alloc for this device via stm_sync_attach_alloc before
+ * the next commit that targets it for mirror reservations.
+ *
+ * Returns:
+ *   STM_OK           — device added; roster_hash advanced.
+ *   STM_EINVAL       — shape violation on new_device.
+ *   STM_ENOSPC       — roster is full (device_count == STM_POOL_DEVICES_MAX).
+ *   STM_EEXIST       — new_device->uuid matches an existing roster entry.
+ */
+STM_MUST_USE
+stm_status stm_pool_add_device(stm_pool *p, const stm_pool_device *new_device);
+
 #ifdef __cplusplus
 }
 #endif

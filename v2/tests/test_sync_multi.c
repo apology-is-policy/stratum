@@ -1531,4 +1531,152 @@ STM_TEST(sync_multi_mirror_write_refuses_read_only) {
     unlink_paths();
 }
 
+/* ========================================================================= */
+/* P5-4a: device lifecycle — add_device integration with sync.                */
+/* ========================================================================= */
+
+/* Build a 2-device pool + run 1 commit. Then add a 3rd device mid-
+ * session, commit again. Verify every device's UB carries the
+ * expanded roster (device_count=3, new roster_hash, new device's
+ * uuid/class/role stamped into its slot). Remount and confirm the
+ * decoded roster matches.
+ *
+ * This is the P5-4a integration story: membership expansion is
+ * picked up by the next sync_commit automatically; mount reconstructs
+ * the expanded pool from the UB's roster blob. */
+STM_TEST(sync_multi_add_device_mid_session_survives_remount) {
+    make_paths("add_dev_mid");
+    /* Start with 2 devices, add a 3rd later. NDEV=3 fixture opens 3
+     * bdev files up-front; we only insert the 3rd into the pool via
+     * stm_pool_add_device. */
+    stm_bdev *bds[NDEV] = {0};
+    open_bdevs(bds);
+
+    /* Two-device pool. */
+    stm_pool_open_opts popts;
+    memset(&popts, 0, sizeof popts);
+    popts.pool_uuid[0] = POOL_UUID[0];
+    popts.pool_uuid[1] = POOL_UUID[1];
+    popts.device_count = 2;
+    for (size_t i = 0; i < 2; i++) {
+        popts.devices[i].uuid[0]    = DEV_UUID_LO[i];
+        popts.devices[i].uuid[1]    = DEV_UUID_HI;
+        popts.devices[i].size_bytes = TEST_DEVICE_BYTES;
+        popts.devices[i].role       = STM_DEV_ROLE_DATA;
+        popts.devices[i].class_     = STM_DEV_CLASS_SSD;
+        popts.devices[i].state      = STM_DEV_STATE_ONLINE;
+        popts.devices[i].bdev       = bds[i];
+    }
+    stm_pool *pool = NULL;
+    STM_ASSERT_OK(stm_pool_open(&popts, &pool));
+
+    stm_alloc *a0 = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bds[0], POOL_UUID,
+                                     (uint64_t[]){ DEV_UUID_LO[0], DEV_UUID_HI },
+                                     TEST_BOOTSTRAP_BYTES, &a0));
+    /* device 0 keeps device_id=0 by default. */
+    stm_alloc *a1 = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bds[1], POOL_UUID,
+                                     (uint64_t[]){ DEV_UUID_LO[1], DEV_UUID_HI },
+                                     TEST_BOOTSTRAP_BYTES, &a1));
+    STM_ASSERT_OK(stm_alloc_set_device_id(a1, 1));
+
+    stm_redundancy_profile prof = { .kind = STM_RED_MIRROR, .mirror_n = 2 };
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(pool, a0, make_wk(), &prof, &s));
+    STM_ASSERT_OK(stm_sync_attach_alloc(s, 1, a1));
+
+    /* First commit — 2-device pool. */
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    /* Record the pre-add roster_hash on device 0's latest UB. */
+    stm_uberblock ub_pre;
+    STM_ASSERT_OK(stm_sb_label_read(bds[0], 1u, 1u, &ub_pre));
+    STM_ASSERT_EQ(stm_load_le16(ub_pre.ub_device_count), 2u);
+    uint64_t hash_pre = stm_load_le64(ub_pre.ub_roster_hash);
+
+    /* Add device 2 to the pool. */
+    stm_pool_device add_dev = {
+        .uuid       = { DEV_UUID_LO[2], DEV_UUID_HI },
+        .size_bytes = TEST_DEVICE_BYTES,
+        .role       = STM_DEV_ROLE_DATA,
+        .class_     = STM_DEV_CLASS_SSD,
+        .state      = STM_DEV_STATE_ONLINE,
+        .bdev       = bds[2],
+    };
+    STM_ASSERT_OK(stm_pool_add_device(pool, &add_dev));
+    STM_ASSERT_EQ(stm_pool_device_count(pool), 3u);
+
+    /* Create an alloc for device 2 and attach it so its tree gets
+     * committed alongside. */
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bds[2], POOL_UUID,
+                                     (uint64_t[]){ DEV_UUID_LO[2], DEV_UUID_HI },
+                                     TEST_BOOTSTRAP_BYTES, &a2));
+    STM_ASSERT_OK(stm_alloc_set_device_id(a2, 2));
+    STM_ASSERT_OK(stm_sync_attach_alloc(s, 2, a2));
+
+    /* Second commit — 3-device pool. target_gen lands at auth+2=3. */
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    /* Every device's new UB carries device_count=3 + advanced roster
+     * hash. Final gen is 3; (label, slot) = (3 % 4, 3 % 63) = (3, 3). */
+    for (size_t i = 0; i < NDEV; i++) {
+        stm_uberblock ub_post;
+        STM_ASSERT_OK(stm_sb_label_read(bds[i], 3u, 3u, &ub_post));
+        STM_ASSERT_EQ(stm_load_le16(ub_post.ub_device_count), 3u);
+        uint64_t hash_post = stm_load_le64(ub_post.ub_roster_hash);
+        STM_ASSERT(hash_post != hash_pre);
+    }
+
+    /* Teardown. */
+    stm_sync_close(s);
+    stm_alloc_close(a0);
+    stm_alloc_close(a1);
+    stm_alloc_close(a2);
+    stm_pool_close(pool);
+    close_bdevs(bds);
+
+    /* Remount. Mount chain reads the UB's roster (device_count=3),
+     * reconstructs a 3-device pool, hands to sync. */
+    open_bdevs(bds);
+    stm_uberblock mount_ub;
+    uint32_t lbl = 0, slot = 0;
+    STM_ASSERT_OK(stm_sb_mount_scan(bds[0], &mount_ub, &lbl, &slot));
+    STM_ASSERT_EQ(stm_load_le16(mount_ub.ub_device_count), 3u);
+
+    /* Decode the roster and build the pool from it. */
+    stm_pool_device decoded[STM_POOL_DEVICES_MAX];
+    memset(decoded, 0, sizeof decoded);
+    STM_ASSERT_OK(stm_pool_roster_decode(mount_ub.ub_roster, 3u, decoded));
+    /* Bind decoded bdevs. */
+    for (size_t i = 0; i < 3; i++) decoded[i].bdev = bds[i];
+
+    stm_pool_open_opts mopts;
+    memset(&mopts, 0, sizeof mopts);
+    mopts.pool_uuid[0] = POOL_UUID[0];
+    mopts.pool_uuid[1] = POOL_UUID[1];
+    mopts.device_count = 3;
+    for (size_t i = 0; i < 3; i++) mopts.devices[i] = decoded[i];
+    stm_pool *pool2 = NULL;
+    STM_ASSERT_OK(stm_pool_open(&mopts, &pool2));
+
+    stm_alloc *a2s[3] = {0};
+    for (size_t i = 0; i < 3; i++) {
+        STM_ASSERT_OK(stm_alloc_open_blank(bds[i], &a2s[i]));
+        STM_ASSERT_OK(stm_alloc_set_device_id(a2s[i], (uint16_t)i));
+    }
+    stm_sync *s2 = NULL;
+    STM_ASSERT_OK(stm_sync_open(pool2, a2s[0], make_wk(), NULL, &s2));
+    STM_ASSERT_OK(stm_sync_attach_alloc(s2, 1, a2s[1]));
+    STM_ASSERT_OK(stm_sync_attach_alloc(s2, 2, a2s[2]));
+
+    /* All three alloc trees loaded successfully on remount. */
+    stm_sync_close(s2);
+    for (size_t i = 0; i < 3; i++) stm_alloc_close(a2s[i]);
+    stm_pool_close(pool2);
+    close_bdevs(bds);
+    unlink_paths();
+}
+
 STM_TEST_MAIN("sync_multi")
