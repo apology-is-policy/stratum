@@ -274,37 +274,34 @@ All green on default + ASan + TSan.
 - [x] Pool.rdlock around device lookups (addendum `86a71ec`).
 - [x] Spec-first with buggy-config regression.
 
-### Known gaps — flagged by R20 (2026-04-24)
+### R20 audit posture (closed 2026-04-24 @ `25d7c4a`)
 
-- [ ] **P2-1**: `cursor_start_block == (1<<48)` trips
-      `stm_alloc_first_allocated_from`'s EINVAL guard, wedging
-      scrub. Unreachable in practice (requires a 2^60-byte device)
-      but formally a boundary bug. Fix: treat as
-      "device drained" in step.
-- [ ] **P2-2**: `STM_ECORRUPT` from the alloc cursor returns
-      directly to caller without advancing, leaving scrub
-      permanently wedged at a corrupt entry. Fix: treat as
-      "skip this device"; log; increment a counter.
-- [ ] **P2-3**: Spec's `CompletedIffDrained` implies cursor ==
-      NumBlocks, but impl's COMPLETED can coexist with unscanned
-      FAULTED-device blocks. Documentation drift — scrub.h needs
-      an explicit "COMPLETED = all ONLINE/EVACUATING devices swept,
-      NOT necessarily every allocated block".
-- [ ] **P3-1**: No FAULTED-device-skip test in test_scrub.
-- [ ] **P3-2**: No direct unit tests for
-      `stm_alloc_first_allocated_from` (exercised indirectly only).
-- [ ] **P3-3**: No concurrent-scrub + pool-mutation TSan stress
-      test.
+- [x] **P2-1**: `cursor_start_block >= (1<<48)` + any non-OK non-ENOENT
+      return from the alloc cursor now advances past the device
+      instead of wedging scrub.
+- [x] **P2-2**: `STM_ECORRUPT` from the alloc cursor advances past
+      the device + bumps `ranges_processed` as a symbolic "tree
+      unparseable" signal.
+- [x] **P2-3**: `scrub.h` docstring clarifies that COMPLETED ⇒
+      all ONLINE/EVACUATING devices swept, NOT "every allocated
+      block verified". FAULTED + REMOVED silently skipped.
+- [x] **P3-1**: `scrub_skips_faulted_devices` test added.
+- [x] **P3-5**: `scrub.h` lifetime paragraph extended for per-device
+      allocs (must outlive OR be detached before close).
+- [x] **P3-7**: `scrub_pause_refuses_non_running` extended with
+      COMPLETED case.
+
+Deferred (γ-scope / future):
+
+- [ ] **P3-2**: direct unit tests for `stm_alloc_first_allocated_from`
+      (exercised indirectly via scrub today).
+- [ ] **P3-3**: concurrent-scrub + pool-mutation TSan stress test.
 - [ ] **P3-4** (γ): `stm_scrub_step` holds `sc.lock` for the
       duration of a multi-MiB range. Pause + status_get block
       arbitrarily long. Periodic lock drop or atomic-state flag
       can fix in γ.
-- [ ] **P3-5**: Lifetime docstring omits that per-device allocs
-      must also outlive scrub (or be detached before close).
 - [ ] **P3-6** (γ): Spec models single-stream cursor; γ's
       durable-cursor work will need device-aware spec extension.
-- [ ] **P3-7**: `scrub_pause_refuses_non_running` test missing
-      the COMPLETED case.
 
 ### β / γ pipeline
 
