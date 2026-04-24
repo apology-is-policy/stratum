@@ -204,15 +204,27 @@ stm_status stm_pool_open(const stm_pool_open_opts *opts, stm_pool **out)
         return STM_EINVAL;
     }
 
-    /* Validate every device slot. */
+    /* Validate every device slot. P5-4b-i: REMOVED slots are
+     * persisted in the roster with NULL bdev; live slots must have
+     * bdev non-NULL. Every slot keeps its UUID (REMOVED slots' UUIDs
+     * are "burned" — cannot be re-added, per spec's AddDevice ABSENT
+     * guard + R16 F3 tightening). */
     for (size_t i = 0; i < opts->device_count; i++) {
         const stm_pool_device *d = &opts->devices[i];
-        if (!d->bdev) return STM_EINVAL;
+        if (!state_in_range(d->state))  return STM_EINVAL;
+        if (d->state == STM_DEV_STATE_REMOVED) {
+            /* REMOVED: bdev must be NULL, UUID preserved. */
+            if (d->bdev != NULL) return STM_EINVAL;
+        } else {
+            /* Live (ONLINE / FAULTED / DEGRADED / OFFLINE): bdev
+             * non-NULL. */
+            if (!d->bdev) return STM_EINVAL;
+        }
         if (uuid_is_zero(d->uuid)) return STM_EINVAL;
         if (!role_in_range(d->role))   return STM_EINVAL;
         if (!class_in_range(d->class_)) return STM_EINVAL;
-        if (!state_in_range(d->state))  return STM_EINVAL;
-        /* Uniqueness of UUID. */
+        /* Uniqueness of UUID — covers REMOVED slots too (their UUIDs
+         * remain burned so a new device cannot re-use them). */
         for (size_t j = 0; j < i; j++) {
             const stm_pool_device *e = &opts->devices[j];
             if (e->uuid[0] == d->uuid[0] && e->uuid[1] == d->uuid[1]) {
@@ -252,6 +264,15 @@ void stm_pool_close(stm_pool *p)
 
 size_t stm_pool_device_count(const stm_pool *p) {
     return p ? p->device_count : 0;
+}
+
+size_t stm_pool_live_device_count(const stm_pool *p) {
+    if (!p) return 0;
+    size_t live = 0;
+    for (size_t i = 0; i < p->device_count; i++) {
+        if (p->devices[i].state != STM_DEV_STATE_REMOVED) live++;
+    }
+    return live;
 }
 
 stm_bdev *stm_pool_device_bdev(stm_pool *p, uint16_t device_id) {
@@ -331,6 +352,57 @@ stm_status stm_pool_add_device(stm_pool *p, const stm_pool_device *new_device)
     /* Append + rehash. Matches the TLA model's AddDevice action. */
     p->devices[p->device_count] = slot;
     p->device_count++;
+    p->roster_hash = hash_of_devs(p->devices, p->device_count);
+
+    return STM_OK;
+}
+
+stm_status stm_pool_remove_device(stm_pool *p, uint16_t device_id,
+                                     size_t redundancy_floor)
+{
+    if (!p) return STM_EINVAL;
+
+    /* R16 F5 symmetric: RO pools refuse structural mutation. */
+    if (p->read_only) return STM_EROFS;
+
+    if ((size_t)device_id >= p->device_count) return STM_EINVAL;
+
+    stm_pool_device *slot = &p->devices[device_id];
+    /* Slot must be LIVE to be removed. REMOVED → already burned. */
+    if (slot->state == STM_DEV_STATE_REMOVED) return STM_EINVAL;
+
+    /* Spec's RedundancyPreservedOnRemove (device_lifecycle.tla):
+     * post-remove live count must remain >= redundancy_floor.
+     * Caller supplies the floor from the sync handle's profile
+     * (typically profile.mirror_n for MIRROR, 1 for NONE). The
+     * pool layer is oblivious to profile semantics — the arithmetic
+     * contract lives with the caller.
+     *
+     * The buggy variant of this guard was demonstrated by
+     * device_lifecycle_buggy.cfg: removing without the check drops
+     * the roster below the redundancy floor → counterexample at
+     * depth 2. We enforce in-code by explicitly computing live
+     * count and refusing if (live - 1) < floor. */
+    size_t live = 0;
+    for (size_t i = 0; i < p->device_count; i++) {
+        if (p->devices[i].state != STM_DEV_STATE_REMOVED) live++;
+    }
+    /* `live` includes the slot we're about to remove. After the
+     * transition the count decrements by 1. */
+    if (live == 0) return STM_EINVAL;   /* impossible: slot is live */
+    if ((live - 1) < redundancy_floor) return STM_EINVAL;
+
+    /* Transition: state=REMOVED, bdev=NULL, UUID preserved. The
+     * slot becomes a burned-UUID tombstone: future add_device sees
+     * the UUID in its uniqueness walk and refuses re-add. size_bytes,
+     * role, class remain historical (harmless — slot's role in the
+     * pool is done). */
+    slot->state = STM_DEV_STATE_REMOVED;
+    slot->bdev  = NULL;
+
+    /* Recompute roster_hash. The changed state byte + cleared bdev
+     * ptr (which doesn't affect encoding — bdev isn't on-disk) mean
+     * the encoded bytes change → new hash. */
     p->roster_hash = hash_of_devs(p->devices, p->device_count);
 
     return STM_OK;

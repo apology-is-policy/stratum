@@ -1110,4 +1110,216 @@ STM_TEST(pool_add_device_refuses_read_only) {
     unlink(g_tmp_path);
 }
 
+/* ========================================================================= */
+/* P5-4b-i: stm_pool_remove_device.                                           */
+/* ========================================================================= */
+
+/* Happy path: remove a device. Post-remove the slot stays at its
+ * device_id with state=REMOVED, bdev=NULL, UUID preserved. */
+STM_TEST(pool_remove_device_marks_removed) {
+    make_tmp("remove_marks");
+    stm_bdev *d = open_fresh_device();
+    stm_pool *p = make_single_device_pool(d, POOL_UUID, DEVICE_UUID,
+                                             STM_DEV_ROLE_DATA,
+                                             STM_DEV_CLASS_SSD,
+                                             STM_DEV_STATE_ONLINE);
+
+    /* Add a second device so the pool can satisfy
+     * RedundancyPreservedOnRemove with floor=1 post-remove. */
+    stm_bdev *d2 = open_companion_device("remove_marks");
+    stm_pool_device add = {
+        .uuid       = { DEVICE_UUID_B[0], DEVICE_UUID_B[1] },
+        .role       = STM_DEV_ROLE_DATA,
+        .class_     = STM_DEV_CLASS_SSD,
+        .state      = STM_DEV_STATE_ONLINE,
+        .bdev       = d2,
+    };
+    STM_ASSERT_OK(stm_pool_add_device(p, &add));
+    STM_ASSERT_EQ(stm_pool_device_count(p), 2u);
+    STM_ASSERT_EQ(stm_pool_live_device_count(p), 2u);
+
+    uint64_t hash_before = stm_pool_roster_hash(p);
+
+    /* Remove device 1 with floor=1 (the remaining device 0 satisfies). */
+    STM_ASSERT_OK(stm_pool_remove_device(p, 1, /*redundancy_floor=*/1));
+
+    /* Slot persists at index 1. device_count unchanged; live count drops. */
+    STM_ASSERT_EQ(stm_pool_device_count(p), 2u);
+    STM_ASSERT_EQ(stm_pool_live_device_count(p), 1u);
+
+    const stm_pool_device *info = stm_pool_device_info(p, 1);
+    STM_ASSERT(info != NULL);
+    STM_ASSERT_EQ(info->state, STM_DEV_STATE_REMOVED);
+    STM_ASSERT(info->bdev == NULL);
+    /* UUID preserved for burned-check. */
+    STM_ASSERT_EQ(info->uuid[0], DEVICE_UUID_B[0]);
+    STM_ASSERT_EQ(info->uuid[1], DEVICE_UUID_B[1]);
+
+    /* stm_pool_device_bdev returns NULL for the REMOVED slot. */
+    STM_ASSERT(stm_pool_device_bdev(p, 1) == NULL);
+
+    /* roster_hash advances on remove. */
+    STM_ASSERT(stm_pool_roster_hash(p) != hash_before);
+
+    stm_pool_close(p);
+    stm_bdev_close(d);
+    stm_bdev_close(d2);
+    unlink(g_tmp_path);
+}
+
+/* RedundancyPreservedOnRemove: removing below floor is refused. */
+STM_TEST(pool_remove_device_enforces_redundancy_floor) {
+    make_tmp("remove_floor");
+    stm_bdev *d = open_fresh_device();
+    stm_pool *p = make_single_device_pool(d, POOL_UUID, DEVICE_UUID,
+                                             STM_DEV_ROLE_DATA,
+                                             STM_DEV_CLASS_SSD,
+                                             STM_DEV_STATE_ONLINE);
+
+    stm_bdev *d2 = open_companion_device("remove_floor");
+    stm_pool_device add = {
+        .uuid       = { DEVICE_UUID_B[0], DEVICE_UUID_B[1] },
+        .role       = STM_DEV_ROLE_DATA,
+        .class_     = STM_DEV_CLASS_SSD,
+        .state      = STM_DEV_STATE_ONLINE,
+        .bdev       = d2,
+    };
+    STM_ASSERT_OK(stm_pool_add_device(p, &add));
+
+    /* Pool has 2 live devices. A remove with floor=2 would require
+     * (live-1)=1 >= 2, impossible. Refused. */
+    STM_ASSERT_ERR(stm_pool_remove_device(p, 1, /*redundancy_floor=*/2),
+                    STM_EINVAL);
+    STM_ASSERT_EQ(stm_pool_live_device_count(p), 2u);
+
+    /* floor=2 on device 0 also refused. */
+    STM_ASSERT_ERR(stm_pool_remove_device(p, 0, /*redundancy_floor=*/2),
+                    STM_EINVAL);
+
+    /* floor=1 on device 1 succeeds. */
+    STM_ASSERT_OK(stm_pool_remove_device(p, 1, /*redundancy_floor=*/1));
+    STM_ASSERT_EQ(stm_pool_live_device_count(p), 1u);
+
+    /* Further remove with floor=1 on device 0 would drop live to 0,
+     * below floor → refused. */
+    STM_ASSERT_ERR(stm_pool_remove_device(p, 0, /*redundancy_floor=*/1),
+                    STM_EINVAL);
+
+    stm_pool_close(p);
+    stm_bdev_close(d);
+    stm_bdev_close(d2);
+    unlink(g_tmp_path);
+}
+
+/* Burned-UUID: after remove, re-adding with the same UUID returns
+ * STM_EEXIST (the uniqueness walk picks up the REMOVED slot's
+ * preserved UUID). Prevents the R16 F3 AEAD-nonce scenario. */
+STM_TEST(pool_remove_device_burns_uuid) {
+    make_tmp("remove_burns");
+    stm_bdev *d = open_fresh_device();
+    stm_pool *p = make_single_device_pool(d, POOL_UUID, DEVICE_UUID,
+                                             STM_DEV_ROLE_DATA,
+                                             STM_DEV_CLASS_SSD,
+                                             STM_DEV_STATE_ONLINE);
+
+    stm_bdev *d2 = open_companion_device("remove_burns");
+    stm_pool_device add = {
+        .uuid       = { DEVICE_UUID_B[0], DEVICE_UUID_B[1] },
+        .role       = STM_DEV_ROLE_DATA,
+        .class_     = STM_DEV_CLASS_SSD,
+        .state      = STM_DEV_STATE_ONLINE,
+        .bdev       = d2,
+    };
+    STM_ASSERT_OK(stm_pool_add_device(p, &add));
+
+    /* Remove device 1. Its UUID (DEVICE_UUID_B) is now burned. */
+    STM_ASSERT_OK(stm_pool_remove_device(p, 1, 1));
+
+    /* Try to add a new device with the SAME UUID. Must be rejected. */
+    stm_bdev *d3 = open_companion_device("remove_burns_redux");
+    stm_pool_device re_add = {
+        .uuid       = { DEVICE_UUID_B[0], DEVICE_UUID_B[1] },
+        .role       = STM_DEV_ROLE_DATA,
+        .class_     = STM_DEV_CLASS_SSD,
+        .state      = STM_DEV_STATE_ONLINE,
+        .bdev       = d3,
+    };
+    STM_ASSERT_ERR(stm_pool_add_device(p, &re_add), STM_EEXIST);
+
+    /* A new UUID still works. */
+    uint64_t new_uuid[2] = { 0xcafeULL, 0xbabeULL };
+    stm_pool_device fresh = {
+        .uuid       = { new_uuid[0], new_uuid[1] },
+        .role       = STM_DEV_ROLE_DATA,
+        .class_     = STM_DEV_CLASS_SSD,
+        .state      = STM_DEV_STATE_ONLINE,
+        .bdev       = d3,
+    };
+    STM_ASSERT_OK(stm_pool_add_device(p, &fresh));
+
+    /* Roster: [device_0=ONLINE, device_1=REMOVED, device_2=ONLINE]. */
+    STM_ASSERT_EQ(stm_pool_device_count(p), 3u);
+    STM_ASSERT_EQ(stm_pool_live_device_count(p), 2u);
+
+    stm_pool_close(p);
+    stm_bdev_close(d);
+    stm_bdev_close(d2);
+    stm_bdev_close(d3);
+    unlink(g_tmp_path);
+}
+
+/* Double-remove on the same slot returns EINVAL (already REMOVED). */
+STM_TEST(pool_remove_device_refuses_double_remove) {
+    make_tmp("remove_double");
+    stm_bdev *d = open_fresh_device();
+    stm_pool *p = make_single_device_pool(d, POOL_UUID, DEVICE_UUID,
+                                             STM_DEV_ROLE_DATA,
+                                             STM_DEV_CLASS_SSD,
+                                             STM_DEV_STATE_ONLINE);
+
+    stm_bdev *d2 = open_companion_device("remove_double");
+    stm_pool_device add = {
+        .uuid       = { DEVICE_UUID_B[0], DEVICE_UUID_B[1] },
+        .role       = STM_DEV_ROLE_DATA,
+        .class_     = STM_DEV_CLASS_SSD,
+        .state      = STM_DEV_STATE_ONLINE,
+        .bdev       = d2,
+    };
+    STM_ASSERT_OK(stm_pool_add_device(p, &add));
+
+    STM_ASSERT_OK(stm_pool_remove_device(p, 1, 1));
+    /* Double-remove: EINVAL. */
+    STM_ASSERT_ERR(stm_pool_remove_device(p, 1, 1), STM_EINVAL);
+
+    /* Out-of-range device_id. */
+    STM_ASSERT_ERR(stm_pool_remove_device(p, 99, 1), STM_EINVAL);
+
+    /* RO pools refuse. */
+    stm_pool_close(p);
+    stm_bdev *d3 = open_fresh_device();  /* opens the same tmp file fresh. */
+    stm_pool_open_opts ro_opts;
+    memset(&ro_opts, 0, sizeof ro_opts);
+    ro_opts.pool_uuid[0] = POOL_UUID[0];
+    ro_opts.pool_uuid[1] = POOL_UUID[1];
+    ro_opts.device_count = 1;
+    ro_opts.read_only    = true;
+    ro_opts.devices[0].uuid[0]    = DEVICE_UUID[0];
+    ro_opts.devices[0].uuid[1]    = DEVICE_UUID[1];
+    ro_opts.devices[0].role       = STM_DEV_ROLE_DATA;
+    ro_opts.devices[0].class_     = STM_DEV_CLASS_SSD;
+    ro_opts.devices[0].state      = STM_DEV_STATE_ONLINE;
+    ro_opts.devices[0].bdev       = d3;
+    const stm_bdev_caps *caps = stm_bdev_caps_of(d3);
+    ro_opts.devices[0].size_bytes = caps->size_bytes;
+    stm_pool *ro_p = NULL;
+    STM_ASSERT_OK(stm_pool_open(&ro_opts, &ro_p));
+    STM_ASSERT_ERR(stm_pool_remove_device(ro_p, 0, 0), STM_EROFS);
+
+    stm_pool_close(ro_p);
+    stm_bdev_close(d);
+    stm_bdev_close(d2);
+    stm_bdev_close(d3);
+    unlink(g_tmp_path);
+}
+
 STM_TEST_MAIN("pool")

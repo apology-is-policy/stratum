@@ -636,10 +636,15 @@ static void build_uberblock(stm_uberblock *out,
 /* P5-2: Multi-device UB write + quorum check.                                */
 /* ========================================================================= */
 
-/* Quorum threshold for the pool: ⌊N/2⌋ + 1. */
+/* Quorum threshold for the pool: ⌊N/2⌋ + 1 over LIVE devices.
+ * P5-4b-i: REMOVED slots persist in the roster for burned-UUID
+ * tracking (R16 F3) but do not contribute to quorum — they cannot
+ * accept writes. Pre-P5-4b-i this used total device_count; that
+ * only differed from live count in pools that had NEVER removed,
+ * so the behavior change is isolated to post-remove pools. */
 static inline size_t sync_quorum_n(const stm_sync *s)
 {
-    return stm_pool_device_count(s->pool) / 2u + 1u;
+    return stm_pool_live_device_count(s->pool) / 2u + 1u;
 }
 
 /* Write an uberblock carrying `shared` content to every device in the
@@ -760,11 +765,16 @@ stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
     if (!wk) return STM_EINVAL;
 
     /* P5-3a: validate + resolve the redundancy profile up-front,
-     * before any on-disk state is created. NULL => {NONE}. */
+     * before any on-disk state is created. NULL => {NONE}.
+     *
+     * P5-4b-i: validate against LIVE device count. A profile
+     * declaring mirror_n=3 on a pool where 2 devices are REMOVED
+     * and only 2 are live must fail — only live devices can host
+     * a mirror replica. */
     stm_redundancy_profile rp = { .kind = STM_RED_NONE, .mirror_n = 0 };
     if (profile) {
         stm_status ps = sync_redundancy_validate(profile,
-                                                   stm_pool_device_count(p));
+                                                   stm_pool_live_device_count(p));
         if (ps != STM_OK) return ps;
         rp = *profile;
     }
@@ -958,8 +968,11 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
     stm_status ci = stm_crypto_init();
     if (ci != STM_OK) return ci;
 
+    /* P5-4b-i: iteration bound stays TOTAL device_count (REMOVED
+     * slots still occupy their indices; skipped via NULL bdev).
+     * Quorum denominator is LIVE count (REMOVED can't vote). */
     size_t n = stm_pool_device_count(p);
-    size_t quorum = n / 2u + 1u;
+    size_t quorum = stm_pool_live_device_count(p) / 2u + 1u;
 
     /* Phase 1: scan every device's ring. Track valid UBs per device.
      * STM_ENOENT on a device means "blank / never used"; that device
@@ -1627,6 +1640,14 @@ stm_status stm_sync_attach_alloc(stm_sync *s, uint16_t device_id,
     if (device_id >= STM_POOL_DEVICES_MAX) return STM_EINVAL;
     if (device_id >= stm_pool_device_count(s->pool)) return STM_EINVAL;
 
+    /* P5-4b-i: REMOVED slots cannot accept an alloc — they have no
+     * bdev and will be evacuated in P5-4b-ii. Refuse at the pool's
+     * boundary so no code path builds up stale crypt ctx / roots
+     * entries for a removed device. */
+    const stm_pool_device *di_check = stm_pool_device_info(s->pool, device_id);
+    if (!di_check || di_check->state == STM_DEV_STATE_REMOVED)
+        return STM_EINVAL;
+
     /* Cross-check: the attached alloc's device_id must match. */
     uint16_t alloc_dev = 0;
     stm_status gs = stm_alloc_get_device_id(alloc, &alloc_dev);
@@ -1736,8 +1757,9 @@ stm_status stm_sync_reserve_mirror(stm_sync *s, uint64_t nblocks,
         return STM_EINVAL;
     }
 
-    /* Pool must have >= n_replicas devices, all with attached allocs. */
-    if (stm_pool_device_count(s->pool) < n_replicas) {
+    /* Pool must have >= n_replicas LIVE devices, all with attached
+     * allocs. REMOVED slots don't count — P5-4b-i. */
+    if (stm_pool_live_device_count(s->pool) < n_replicas) {
         pthread_mutex_unlock(&s->lock);
         return STM_EINVAL;
     }

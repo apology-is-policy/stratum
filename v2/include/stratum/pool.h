@@ -109,9 +109,12 @@ typedef struct {
 /*
  * Construct a pool handle from `opts`. Validates:
  *   - device_count in [1, STM_POOL_DEVICES_MAX];
- *   - every device slot has non-NULL bdev;
+ *   - every LIVE device slot (state != REMOVED) has non-NULL bdev;
+ *   - REMOVED slots (P5-4b-i) have NULL bdev and keep their UUID
+ *     for burned-UUID tracking;
  *   - every device's uuid is non-zero (all-zero is the reserved
- *     "unset" marker) and unique within the roster;
+ *     "unset" marker) and unique within the roster (live OR removed
+ *     — burned UUIDs are still duplicates);
  *   - role / class / state are in range.
  *
  * On success, stm_pool_roster_hash(p) is finalized. The caller keeps
@@ -138,7 +141,18 @@ void stm_pool_close(stm_pool *p);
 /* Accessors.                                                                 */
 /* ========================================================================= */
 
+/* Total roster size — INCLUDES REMOVED slots per P5-4b-i. Use this
+ * when iterating by device_id [0, count) so REMOVED slots are
+ * encountered (caller filters on state). For "how many devices can
+ * accept I/O" use stm_pool_live_device_count. */
 size_t                   stm_pool_device_count(const stm_pool *p);
+
+/* Count of non-REMOVED devices in the roster (P5-4b-i). This is
+ * the right denominator for quorum arithmetic: ⌊live/2⌋+1 quorum.
+ * Equals stm_pool_device_count pre-any-remove; strictly less after
+ * the first remove. */
+size_t                   stm_pool_live_device_count(const stm_pool *p);
+
 stm_bdev *               stm_pool_device_bdev(stm_pool *p, uint16_t device_id);
 const stm_pool_device *  stm_pool_device_info(const stm_pool *p, uint16_t device_id);
 
@@ -267,6 +281,50 @@ uint64_t stm_pool_roster_hash_of_bytes(
  */
 STM_MUST_USE
 stm_status stm_pool_add_device(stm_pool *p, const stm_pool_device *new_device);
+
+/*
+ * Mark device `device_id` as REMOVED (ARCH §4.7.2). P5-4b-i is the
+ * "metadata half" of remove — it transitions the roster slot to
+ * REMOVED, clears its `bdev` pointer, and preserves the UUID so
+ * subsequent `stm_pool_add_device` walks refuse to re-add it
+ * (burned-UUID; R16 F3).
+ *
+ * Evacuation of allocated blocks (the "data half" — reading the
+ * target device's content and mirror-writing to remaining devices)
+ * is P5-4b-ii scope. Today this function enforces that ONLY a
+ * device with NO allocated data may be removed. The caller's
+ * alloc-layer contract: verify the device's alloc tree is empty
+ * before calling this, or get STM_EINVAL / STM_EBUSY (future).
+ *
+ * Preconditions:
+ *   - device_id < stm_pool_device_count(p).
+ *   - Slot state is ONLINE or FAULTED (already REMOVED → EINVAL).
+ *   - `stm_pool_live_device_count(p) - 1 >= redundancy_floor`
+ *     (spec's RedundancyPreservedOnRemove invariant). Caller
+ *     supplies the floor from the sync handle's redundancy
+ *     profile — typically `profile.mirror_n` for MIRROR, 1 for
+ *     NONE. Mismatch → STM_EINVAL.
+ *
+ * Post-condition: slot at `device_id` has state=REMOVED,
+ * bdev=NULL, UUID preserved. `device_count` UNCHANGED (REMOVED
+ * slots persist in the roster). `live_device_count` decremented.
+ * `roster_hash` advances.
+ *
+ * Caller-serialization contract (same as `stm_pool_add_device`):
+ * serialize against concurrent sync_commit externally. Internal
+ * per-pool lock lands in P5-4b-ii.
+ *
+ * RO pools: returns STM_EROFS.
+ *
+ * Returns:
+ *   STM_OK           — slot marked REMOVED; roster_hash advanced.
+ *   STM_EROFS        — pool is read_only.
+ *   STM_EINVAL       — device_id out of range, slot already REMOVED,
+ *                       or redundancy_floor would be violated.
+ */
+STM_MUST_USE
+stm_status stm_pool_remove_device(stm_pool *p, uint16_t device_id,
+                                     size_t redundancy_floor);
 
 #ifdef __cplusplus
 }
