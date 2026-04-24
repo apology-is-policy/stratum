@@ -223,6 +223,16 @@ stm_status stm_pool_open(const stm_pool_open_opts *opts, stm_pool **out)
     for (size_t i = 0; i < opts->device_count; i++) {
         const stm_pool_device *d = &opts->devices[i];
         if (!state_in_range(d->state))  return STM_EINVAL;
+        /* R21 (P5-6 P2-4): device 0 is the metadata primary (sync
+         * hard-codes it for keyschema / alloc-roots I/O). Every
+         * runtime mutator refuses dev 0 transitions (fail / remove /
+         * begin_evacuation all return STM_ENOTSUPPORTED) — guard the
+         * open boundary symmetrically so an operator constructing a
+         * pool handle with dev 0 pre-marked FAULTED / OFFLINE /
+         * EVACUATING / DEGRADED cannot bypass the invariant. Only
+         * ONLINE is accepted at slot 0. The dynamic-metadata-primary
+         * refactor (post-P5) relaxes this. */
+        if (i == 0 && d->state != STM_DEV_STATE_ONLINE) return STM_EINVAL;
         if (d->state == STM_DEV_STATE_REMOVED) {
             /* REMOVED: bdev must be NULL, UUID preserved. */
             if (d->bdev != NULL) return STM_EINVAL;

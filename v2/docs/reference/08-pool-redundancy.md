@@ -140,9 +140,25 @@ stm_status stm_pool_rejoin_device_locked    (...);
 - `rejoin`: FAULTED → ONLINE.
 - Dev 0 guard (R17 P1-1): refuses `device_id == 0`.
 - RO refuses.
-- `mirror_read` (in sync) now explicitly skips FAULTED state:
-  ONLINE + EVACUATING are read-accepted; FAULTED + REMOVED + others
-  are skipped.
+- **FAULTED-skip is symmetric across all sync I/O paths** (R21 /
+  P5-6 P1 + P2-5):
+  - `mirror_read` — ONLINE + EVACUATING read-accepted; FAULTED +
+    REMOVED + others skipped.
+  - `mirror_write` — ONLINE + EVACUATING written-to; FAULTED
+    skipped (pre-fix would hang on the FAULTED bdev's fsync and
+    starve mirror_quorum).
+  - `sync_commit`'s per-alloc persistence loop — FAULTED devs'
+    trees are NOT rewritten (stale-on-disk; reconcile at rejoin
+    per P5-4d-β, deferred).
+  - `write_ub_to_all_devices` (both reservation + final phases) —
+    FAULTED skipped, same rationale.
+  - `reserve_mirror` — already picks first-N ONLINE since
+    P5-4b-ii-α.
+  Overall contract: a single FAULTED device does NOT block commits
+  on a pool whose remaining ONLINE count still meets quorum.
+  Rejoin + reconcile catches the device up (β); until then,
+  `mirror_read`'s csum-fallback masks any stale FAULTED content
+  at read time.
 
 **Burned-UUID** (R16 F3 / P5-4b-i): REMOVED slots persist in the
 roster so add_device's uniqueness walk refuses re-add of a UUID
@@ -361,6 +377,11 @@ EVACUATING / REMOVED transitions are implemented.
 - [x] mirror(n) reserve / write (quorum) / read (first-match-wins).
 - [x] Reserve picks first-N ONLINE (not positional).
 - [x] mirror_read skips FAULTED + REMOVED.
+- [x] mirror_write + sync_commit + write_ub_to_all_devices all skip
+      FAULTED (R21 / P5-6 P1) — symmetric with mirror_read.
+- [x] `stm_pool_open` refuses non-ONLINE state at slot 0 (R21 / P5-6
+      P2-4) — metadata-primary invariant enforced at the construction
+      boundary.
 - [x] Device-0 guard on every mutator (metadata primary).
 - [ ] **FAULTED → new reconstruct** (P5-4c-β): needs bptr-layer
       block iteration. Deferred to P6 extent manager.

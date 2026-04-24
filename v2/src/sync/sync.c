@@ -674,9 +674,19 @@ static stm_status write_ub_to_all_devices(stm_sync *s,
         stm_bdev *d = stm_pool_device_bdev(s->pool, (uint16_t)i);
         if (!d) continue;
 
+        /* R21 (P5-6 P1): skip FAULTED slots. A FAULTED bdev stays
+         * non-NULL (P5-4d-α preserves the pointer for rejoin), so the
+         * !d guard above misses it. Without this check, a single
+         * FAULTED device's stalled fsync or STM_EIO propagates and
+         * starves quorum. Skipping here composes with the alloc-commit
+         * loop skip above to give a clean "FAULTED is as-if REMOVED
+         * for write paths" semantic, aligned with mirror_read's
+         * P5-4d-α skip. */
+        const stm_pool_device *di = stm_pool_device_info(s->pool, (uint16_t)i);
+        if (di && di->state == STM_DEV_STATE_FAULTED) continue;
+
         /* Copy shared bytes, then overwrite per-device fields. */
         stm_uberblock ub = *prototype_ub;
-        const stm_pool_device *di = stm_pool_device_info(s->pool, (uint16_t)i);
         if (di) {
             ub.ub_device_uuid[0] = stm_store_le64(di->uuid[0]);
             ub.ub_device_uuid[1] = stm_store_le64(di->uuid[1]);
@@ -1499,9 +1509,21 @@ stm_status stm_sync_commit(stm_sync *s)
          * trigger UAF if the caller has closed the bdev after the
          * finish). The safe wrapper stm_sync_finish_evacuation
          * additionally detaches s->allocs[dev] on success; this check
-         * is the belt to that braces. */
+         * is the belt to that braces.
+         *
+         * R21 (P5-6 P1): skip FAULTED devices. Writing through to a
+         * FAULTED bdev risks long I/O hangs or STM_EIO that would
+         * propagate to caller and wedge the pool; per mirror(n)'s
+         * fault-tolerance contract, a single FAULTED device must not
+         * block commits as long as quorum remains. The skip is
+         * symmetric with mirror_read's P5-4d-α behavior. Rejoin
+         * reconcile (P5-4d-β, deferred) will catch the FAULTED device
+         * up when it returns ONLINE; pre-reconcile, the FAULTED
+         * device's on-disk alloc tree will lag but mirror_read's
+         * csum fallback covers divergence. */
         const stm_pool_device *di = stm_pool_device_info(s->pool, dev);
-        if (di && di->state == STM_DEV_STATE_REMOVED) continue;
+        if (di && (di->state == STM_DEV_STATE_REMOVED ||
+                   di->state == STM_DEV_STATE_FAULTED)) continue;
         stm_status s_alloc = stm_alloc_commit(ai, target_gen);
         if (s_alloc != STM_OK) {
             pthread_mutex_unlock(&s->lock);            stm_pool_unlock_shared(s->pool);
@@ -1923,6 +1945,12 @@ stm_status stm_sync_mirror_write(stm_sync *s, const uint64_t paddrs[],
         uint64_t off = stm_paddr_offset(paddrs[i]) * (uint64_t)STM_UB_SIZE;
         stm_bdev *bd = stm_pool_device_bdev(s->pool, dev);
         if (!bd) { last_err = STM_EINVAL; continue; }
+
+        /* R21 (P5-6 P1): skip FAULTED replicas. Symmetric with
+         * mirror_read's P5-4d-α behavior. Write-through to a FAULTED
+         * device can hang or propagate EIO, starving mirror_quorum. */
+        const stm_pool_device *di = stm_pool_device_info(s->pool, dev);
+        if (di && di->state == STM_DEV_STATE_FAULTED) continue;
 
         stm_status ws = stm_bdev_write(bd, off, buf, len);
         if (ws != STM_OK) { last_err = ws; continue; }

@@ -2076,6 +2076,58 @@ STM_TEST(sync_multi_mirror_read_skips_faulted_replica) {
     teardown_mirror_pool(bds, as, pool, s);
 }
 
+/* R21 (P5-6 P1) regression: sync_commit must succeed with one FAULTED
+ * device on a 3-device mirror(2). Before the fix, the commit's per-alloc
+ * loop and write_ub_to_all_devices would try to write through the
+ * FAULTED bdev and either hang or propagate STM_EIO, starving quorum
+ * even though 2/3 = quorum threshold. Post-fix they skip FAULTED
+ * entirely — symmetric with mirror_read's P5-4d-α behavior. */
+STM_TEST(sync_multi_commit_succeeds_with_one_faulted) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "commit_faulted", bds, as, &pool, &s);
+
+    /* Reserve-mirror + write so there's real per-device data to commit. */
+    uint64_t paddrs[2] = {0};
+    STM_ASSERT_OK(stm_sync_reserve_mirror(s, 2u, 2u, paddrs));
+    uint8_t payload[2u * STM_UB_SIZE];
+    for (size_t i = 0; i < sizeof payload; i++)
+        payload[i] = (uint8_t)((i ^ 0x33) & 0xff);
+    size_t n_conf = 0;
+    STM_ASSERT_OK(stm_sync_mirror_write(s, paddrs, 2u,
+                                           payload, sizeof payload, &n_conf));
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    /* Record auth gen before the fail. */
+    stm_sync_info before;
+    STM_ASSERT_OK(stm_sync_info_get(s, &before));
+
+    /* Fail dev 1. bdev pointer preserved (P5-4d-α) so the write paths
+     * would still try to use it without the skip. */
+    STM_ASSERT_OK(stm_pool_fail_device(pool, 1));
+
+    /* Commit MUST still succeed using dev 0 + dev 2 for quorum on the
+     * reservation + final UBs; the FAULTED dev 1 is skipped in both
+     * the per-alloc loop and write_ub_to_all_devices. auth advances by 2. */
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    stm_sync_info after;
+    STM_ASSERT_OK(stm_sync_info_get(s, &after));
+    STM_ASSERT_EQ(after.auth_gen, before.auth_gen + 2u);
+
+    /* Rejoin dev 1. Subsequent commits include it again. mirror_read's
+     * csum-fallback (pre-P5-4d-β reconcile) masks any stale content. */
+    STM_ASSERT_OK(stm_pool_rejoin_device(pool, 1));
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    stm_sync_info after_rejoin;
+    STM_ASSERT_OK(stm_sync_info_get(s, &after_rejoin));
+    STM_ASSERT_EQ(after_rejoin.auth_gen, after.auth_gen + 2u);
+
+    teardown_mirror_pool(bds, as, pool, s);
+}
+
 /* FAULTED source → STM_ENOTSUPPORTED (P5-4c-β reconstruct path not yet
  * implemented). device_id=0 also STM_ENOTSUPPORTED (metadata primary).
  * R19 P3-3: actually exercise the FAULTED branch using

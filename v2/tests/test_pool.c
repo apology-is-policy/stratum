@@ -1740,4 +1740,55 @@ STM_TEST(pool_begin_finish_evacuation_refuses_read_only) {
     unlink(g_tmp_path);
 }
 
+/* R21 (P5-6 P2-4): stm_pool_open refuses any non-ONLINE state for
+ * slot 0. Dev 0 is the metadata primary (sync hard-codes it for
+ * keyschema / alloc-roots); every runtime mutator refuses dev 0
+ * transitions with STM_ENOTSUPPORTED. The open boundary now enforces
+ * the same invariant so an operator cannot construct a pool handle
+ * with dev 0 pre-marked FAULTED / OFFLINE / EVACUATING / DEGRADED. */
+STM_TEST(pool_open_refuses_non_online_dev_zero) {
+    make_tmp("dev0_state");
+    stm_bdev *d = open_fresh_device();
+
+    /* For every non-ONLINE state at slot 0, open must refuse. */
+    const stm_device_state bad_states[] = {
+        STM_DEV_STATE_OFFLINE,
+        STM_DEV_STATE_DEGRADED,
+        STM_DEV_STATE_FAULTED,
+        STM_DEV_STATE_EVACUATING,
+    };
+    for (size_t i = 0; i < sizeof bad_states / sizeof bad_states[0]; i++) {
+        stm_pool_open_opts opts;
+        memset(&opts, 0, sizeof opts);
+        opts.pool_uuid[0] = POOL_UUID[0];
+        opts.pool_uuid[1] = POOL_UUID[1];
+        opts.device_count = 1;
+        opts.devices[0].uuid[0]    = DEVICE_UUID[0];
+        opts.devices[0].uuid[1]    = DEVICE_UUID[1];
+        opts.devices[0].size_bytes = TEST_DEVICE_BYTES;
+        opts.devices[0].role       = STM_DEV_ROLE_DATA;
+        opts.devices[0].class_     = STM_DEV_CLASS_SSD;
+        opts.devices[0].state      = bad_states[i];
+        opts.devices[0].bdev       = d;
+        stm_pool *p = NULL;
+        STM_ASSERT_ERR(stm_pool_open(&opts, &p), STM_EINVAL);
+        STM_ASSERT(p == NULL);
+    }
+
+    /* Confirm the positive case still works: ONLINE at slot 0 → OK. */
+    stm_pool *p = make_single_device_pool(d, POOL_UUID, DEVICE_UUID,
+                                            STM_DEV_ROLE_DATA,
+                                            STM_DEV_CLASS_SSD,
+                                            STM_DEV_STATE_ONLINE);
+    stm_pool_close(p);
+
+    /* REMOVED at slot 0 is already covered by the existing bdev-nullness
+     * guard (REMOVED requires NULL bdev; populated slots with NULL bdev
+     * rejected elsewhere). The new check catches the FAULTED+bdev-non-NULL
+     * gap that the pre-existing validation missed. */
+
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
 STM_TEST_MAIN("pool")
