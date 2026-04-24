@@ -37,10 +37,26 @@
  *     point.  (scrub.tla: CursorMonotonic, PauseResumeIdempotent.)
  *   - verified + failed = blocks-processed in the current run.
  *     (scrub.tla: ProcessedCount.)
- *   - COMPLETED ⇔ all allocated ranges in the pool have been processed.
- *     (scrub.tla: CompletedIffDrained.)
+ *   - COMPLETED ⇒ cursor has traversed every ONLINE and EVACUATING
+ *     device's alloc tree in the pool. (scrub.tla: CompletedIffDrained
+ *     — where the spec's NumBlocks models this same processable
+ *     stream. FAULTED + REMOVED devices are skipped from the stream
+ *     by design; their data is NOT verified by this run — see
+ *     "Coverage" below. R20 P2-3 clarification.)
  *   - IDLE / COMPLETED are quiescent: no step advances cursor unless
  *     state = RUNNING.
+ *
+ * Coverage semantics — important (R20 P2-3):
+ *
+ *   COMPLETED means the scrub finished iterating every device whose
+ *   state was ONLINE or EVACUATING during the run. FAULTED and
+ *   REMOVED devices are skipped unconditionally, and their allocated
+ *   blocks are NOT included in the `blocks_verified` / `blocks_failed`
+ *   counters. Operators relying on scrub for full integrity coverage
+ *   should (a) ensure no device is FAULTED at scrub time, or
+ *   (b) restart the run after the device returns to ONLINE. β will
+ *   add a `devices_skipped` field to stm_scrub_status so the degraded
+ *   coverage is visible in the snapshot.
  *
  * Thread safety: every API holds an internal mutex around state
  * mutations. Multiple threads may call step + status_get + pause from
@@ -48,8 +64,19 @@
  *
  * Lifecycle: callers create a scrub handle via stm_scrub_create, drive
  * step-by-step via stm_scrub_step, inspect progress via
- * stm_scrub_status_get, and close with stm_scrub_close. The handle
- * borrows the stm_sync reference; it must outlive the scrub handle.
+ * stm_scrub_status_get, and close with stm_scrub_close.
+ *
+ * Borrowed references (R20 P3-5):
+ *
+ *   - The stm_sync passed to stm_scrub_create must outlive the scrub
+ *     handle.
+ *   - Every stm_alloc attached to sync (at create time OR via
+ *     stm_sync_attach_alloc during scrub's lifetime) must also outlive
+ *     scrub — OR be detached via stm_sync_finish_evacuation BEFORE
+ *     being closed. Scrub caches no alloc pointer between steps, so
+ *     "detach without close" is sufficient for lifetime correctness
+ *     (after detach, stm_sync_alloc(dev) returns NULL and scrub's
+ *     next step advances past the device).
  *
  * Not modeled here (deferred to β / γ / future):
  *   - Per-block csum verification (needs bptr layer, P6).

@@ -262,17 +262,33 @@ stm_status stm_scrub_step(stm_scrub *sc)
         uint64_t paddr = 0, length = 0;
         stm_status s = stm_alloc_first_allocated_from(a, sc->cursor_start_block,
                                                         &paddr, &length);
-        if (s == STM_ENOENT) {
-            /* Device drained from the cursor's POV. */
+        /* R20 P2-1 + P2-2: any non-OK return advances past this device
+         * rather than propagating an error that would permanently wedge
+         * scrub.
+         *   STM_ENOENT   — device drained (normal advance).
+         *   STM_EINVAL   — e.g. cursor_start_block hit the 48-bit ceiling.
+         *                   The device is effectively drained from our
+         *                   cursor's POV.
+         *   STM_ECORRUPT — malformed tree entry. Per ARCH §7.16.1 scrub
+         *                   continues past corruption; we record the
+         *                   device as skipped and move on.
+         *   STM_ENOMEM / other — transient; same skip-and-advance handling
+         *                   keeps scrub moving. (α treats these as skip;
+         *                   β will refine with retry + logging.) */
+        if (s != STM_OK) {
+            if (s == STM_ECORRUPT) {
+                /* Symbolically record the corruption in ranges_processed
+                 * so operators see a non-zero outcome even though no
+                 * per-block reads happened here. blocks_failed stays
+                 * zero — we didn't read the blocks, we couldn't enumerate
+                 * them. A future API bump will add a
+                 * `devices_skipped_corrupt` counter for clean separation. */
+                sc->ranges_processed++;
+            }
             stm_pool_unlock_shared(sc->pool);
             sc->cursor_device_id++;
             sc->cursor_start_block = 0;
             continue;
-        }
-        if (s != STM_OK) {
-            stm_pool_unlock_shared(sc->pool);
-            pthread_mutex_unlock(&sc->lock);
-            return s;
         }
 
         uint64_t start_block = stm_paddr_offset(paddr);

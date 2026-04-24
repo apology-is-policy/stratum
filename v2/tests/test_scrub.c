@@ -243,6 +243,14 @@ STM_TEST(scrub_pause_refuses_non_running) {
     STM_ASSERT_OK(stm_scrub_pause(fx.sc));
     STM_ASSERT_ERR(stm_scrub_pause(fx.sc), STM_EINVAL);
 
+    /* R20 P3-7: pause-from-COMPLETED also refused. Resume then drain. */
+    STM_ASSERT_OK(stm_scrub_resume(fx.sc));       /* PAUSED → RUNNING  */
+    STM_ASSERT_OK(stm_scrub_step(fx.sc));         /* empty pool → COMPLETED */
+    stm_scrub_status st;
+    STM_ASSERT_OK(stm_scrub_status_get(fx.sc, &st));
+    STM_ASSERT_EQ((int)st.state, (int)STM_SCRUB_STATE_COMPLETED);
+    STM_ASSERT_ERR(stm_scrub_pause(fx.sc), STM_EINVAL);
+
     scrub_fx_close(&fx);
 }
 
@@ -660,6 +668,109 @@ STM_TEST(scrub_multi_device_covers_every_attached_alloc) {
     STM_ASSERT_EQ((int)done.state,       (int)STM_SCRUB_STATE_COMPLETED);
     STM_ASSERT_EQ(done.ranges_processed,  2u);
     STM_ASSERT_EQ(done.blocks_verified,   6u);
+    STM_ASSERT_EQ(done.blocks_failed,     0u);
+
+    stm_scrub_close(sc);
+    stm_sync_close(s);
+    stm_alloc_close(a1);
+    stm_alloc_close(a0);
+    stm_pool_close(pool);
+    for (size_t i = 0; i < MDEV; i++) {
+        stm_bdev_close(bds[i]);
+        unlink(paths[i]);
+    }
+}
+
+STM_TEST(scrub_skips_faulted_devices) {
+    /* R20 P3-1: scrub must skip FAULTED devices entirely. Build a
+     * 2-device mirror(2) pool, reserve ranges on both, fail device 1,
+     * run scrub. Expect: only device 0's range processed; device 1's
+     * blocks NOT counted in blocks_verified or blocks_failed. */
+    char paths[MDEV][256];
+    for (size_t i = 0; i < MDEV; i++) {
+        snprintf(paths[i], sizeof paths[i],
+                 "/tmp/stm_v2_scrub_faulted_%d_%zu.bin", (int)getpid(), i);
+        unlink(paths[i]);
+    }
+
+    stm_bdev *bds[MDEV] = {0};
+    for (size_t i = 0; i < MDEV; i++) {
+        stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+        STM_ASSERT_OK(stm_bdev_open(paths[i], &bo, &bds[i]));
+        STM_ASSERT_OK(stm_bdev_resize(bds[i], TEST_DEVICE_BYTES));
+    }
+
+    const uint64_t duuid0[2] = { 0x3333, 0x9999 };
+    const uint64_t duuid1[2] = { 0x4444, 0x9999 };
+    stm_pool_open_opts opts;
+    memset(&opts, 0, sizeof opts);
+    opts.pool_uuid[0] = POOL_UUID[0];
+    opts.pool_uuid[1] = POOL_UUID[1];
+    opts.device_count = MDEV;
+    opts.devices[0].uuid[0]    = duuid0[0];
+    opts.devices[0].uuid[1]    = duuid0[1];
+    opts.devices[0].size_bytes = TEST_DEVICE_BYTES;
+    opts.devices[0].role       = STM_DEV_ROLE_DATA;
+    opts.devices[0].class_     = STM_DEV_CLASS_SSD;
+    opts.devices[0].state      = STM_DEV_STATE_ONLINE;
+    opts.devices[0].bdev       = bds[0];
+    opts.devices[1].uuid[0]    = duuid1[0];
+    opts.devices[1].uuid[1]    = duuid1[1];
+    opts.devices[1].size_bytes = TEST_DEVICE_BYTES;
+    opts.devices[1].role       = STM_DEV_ROLE_DATA;
+    opts.devices[1].class_     = STM_DEV_CLASS_SSD;
+    opts.devices[1].state      = STM_DEV_STATE_ONLINE;
+    opts.devices[1].bdev       = bds[1];
+    stm_pool *pool = NULL;
+    STM_ASSERT_OK(stm_pool_open(&opts, &pool));
+
+    stm_alloc *a0 = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bds[0], POOL_UUID, duuid0,
+                                     TEST_BOOTSTRAP_BYTES, &a0));
+    stm_redundancy_profile prof = { STM_RED_MIRROR, (uint8_t)MDEV };
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(pool, a0, make_wk(), &prof, &s));
+
+    stm_alloc *a1 = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bds[1], POOL_UUID, duuid1,
+                                     TEST_BOOTSTRAP_BYTES, &a1));
+    STM_ASSERT_OK(stm_alloc_set_device_id(a1, 1));
+    STM_ASSERT_OK(stm_sync_attach_alloc(s, 1, a1));
+
+    /* Mirror-reserve a 4-block run. Allocates one range on each of
+     * device 0 and device 1. */
+    uint64_t paddrs[MDEV] = {0};
+    STM_ASSERT_OK(stm_sync_reserve_mirror(s, 4u, MDEV, paddrs));
+    uint8_t blk[4 * STM_UB_SIZE];
+    memset(blk, 0x11, sizeof blk);
+    size_t confirmed = 0;
+    STM_ASSERT_OK(stm_sync_mirror_write(s, paddrs, MDEV, blk, sizeof blk,
+                                          &confirmed));
+    STM_ASSERT(confirmed >= MDEV);
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    /* Fail device 1 — dev 0 is the metadata primary, can't fail.
+     * Post-fail: dev 1 state=FAULTED, bdev pointer preserved. */
+    STM_ASSERT_OK(stm_pool_fail_device(pool, 1));
+
+    /* Scrub. Expect: only device 0's 4-block range processed.
+     * ranges_processed == 1 (not 2); blocks_verified == 4 (not 8). */
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(s, &sc));
+    STM_ASSERT_OK(stm_scrub_start(sc));
+
+    for (int i = 0; i < 20; i++) {
+        stm_scrub_status st;
+        STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
+        if (st.state == STM_SCRUB_STATE_COMPLETED) break;
+        STM_ASSERT_OK(stm_scrub_step(sc));
+    }
+
+    stm_scrub_status done;
+    STM_ASSERT_OK(stm_scrub_status_get(sc, &done));
+    STM_ASSERT_EQ((int)done.state,       (int)STM_SCRUB_STATE_COMPLETED);
+    STM_ASSERT_EQ(done.ranges_processed,  1u);
+    STM_ASSERT_EQ(done.blocks_verified,   4u);
     STM_ASSERT_EQ(done.blocks_failed,     0u);
 
     stm_scrub_close(sc);
