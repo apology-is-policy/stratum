@@ -428,12 +428,14 @@ The most architecturally risky phase (per NOVEL #4). Extensive TLA+ spec work + 
 
 ### 8.2 Exit criteria
 
-Status as of 2026-04-25 (post-R25 close, tip `c45a76a`):
+Status as of 2026-04-25 (post-R26 close, tip `a6249eb`).
+**Phase 5 substantively complete**: criteria 1, 3, 4, 5 met;
+#2 explicitly post-v2.0 by design (§8.6 + §14.2).
 
 - [x] **Single-device-failure survival**: 4-device RAID-Z-equivalent pool survives single-device failure without data loss. **Met via mirror(n)** at P5-3c (`sync_multi_mirror_read_falls_back_on_tamper`) + R21 P1 (`sync_multi_commit_succeeds_with_one_faulted`). RS-based RAID-Z deferred to post-v2.0 (§8.6 + §14.1).
 - [ ] **LRC vs RS performance**: LRC repair is 2-3× faster than RS for single-failure scenarios (per the LRC lead position). **Deferred** to post-v2.0 per §8.3 risk mitigation + §8.6 + §14.2 (LRC requires RS stable first).
-- [~] **Scrub detect + repair**: Scrub detects + repairs injected corruption. **Surface integrated** at P5-5-α (verify-only sweep) + P5-5-β (4-counter classification via caller-supplied verify-callback; CallbackSetExclusivity invariant). Test stubs demonstrate detect + repair end-to-end. **Production-default cb** (bptr-aware, walks the replica list, rewrites the bad device, emits repair log) deferred to P6 (§8.6 + §9.1.bis).
-- [ ] **Rebalance progress persistence**: Rebalance progress persists across restart. **Deferred** to a combined P5-durable-cursors chunk that bundles scrub-γ + evacuation cursor persistence under one `STM_UB_VERSION` bump (§8.6).
+- [x] **Scrub detect + repair**: Scrub detects + repairs injected corruption. **Met** at P5-5-α (verify-only sweep) + P5-5-β (4-counter classification via caller-supplied verify-callback; CallbackSetExclusivity invariant) + P5-durable-cursors (state persists across mount via γ). Test stubs demonstrate detect + repair end-to-end. **Production-default cb** (bptr-aware, walks the replica list, rewrites the bad device, emits repair log) is the only remaining sub-aspect, deferred to P6 (§8.6 + §9.6) as documented carry-over.
+- [x] **Rebalance progress persistence**: Rebalance progress persists across restart. **Met** by P5-durable-cursors (γ for scrub) + the existing roster + alloc-tree format that already implicitly persists evacuation state (per `evac.tla` annotation: `device_state[d]` ↔ `ub_roster[d].state`; `replicas[b]` ↔ per-device alloc trees; both persisted on every commit).
 - [x] **quorum.tla**: `quorum.tla` proves commit-under-partial-failure semantics. **Met** at P5-0 (`v2/specs/quorum.tla`, 36839 distinct states at depth 35; `quorum_buggy.cfg` with `IdempotentRetry=FALSE, MaxRetries≥2` reproduces the R14 P1 content-divergence at the spec level).
 
 ### 8.3 Risks

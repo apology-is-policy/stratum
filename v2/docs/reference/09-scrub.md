@@ -457,7 +457,7 @@ All green on default + ASan + TSan.
 - [x] **β: scrub_beta.cfg** — fixed-impl spec config exercising
       all three cb outcomes. 19 states / depth 8, clean.
 
-### R26 audit posture (closed 2026-04-25 @ *(pending)*)
+### R26 audit posture (closed 2026-04-25 @ `a6249eb`)
 
 R26 scoped audit on the P5-durable-cursors close `caf99e6`. 0 P0 /
 1 P1 / 3 P2 / 5 P3. P1 was a real spec-impl gap (β + γ-reopen

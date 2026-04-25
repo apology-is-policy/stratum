@@ -38,11 +38,12 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `caf99e6` (P5-durable-cursors — STM_UB_VERSION 7→8;
-  scrub state persists across mount via `ub_scrub_state[64]`;
-  evacuation already implicitly durable via roster + alloc tree
-  per evac.tla annotation; closes Phase 5 exit criteria #3
-  (scrub-durable aspect) and #4. R26 audit pending).
+- **Tip**: `a6249eb` (R26 / P5-durable-cursors scope close —
+  γ scrub durable cursor + STM_UB_VERSION 7→8 fully audited.
+  R26 closed clean at 0 P0 / 1 P1 (β + γ-reopen
+  CallbackSetExclusivity) / 3 P2 / 5 P3, all addressed.
+  **Phase 5 substantively complete**: exit criteria 1, 3, 4, 5 met;
+  #2 (LRC vs RS) explicitly post-v2.0 per ROADMAP §8.6.).
 - **Phases**: 1–4 complete; Phase 5 substantively complete after
   P5-durable-cursors lands (γ closes the in-Phase-5 work; remaining
   P6 carry-overs documented in ROADMAP §9.6, post-v2.0 carry-overs

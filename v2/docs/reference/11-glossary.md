@@ -131,7 +131,7 @@ closed items.
 | R23 | P5-8 scope (replace-in-flight claim + atomic resume). | `5468dac` |
 | R24 | P5-5-β scope (scrub repair via cb). | `52503fe` |
 | R25 | Backlog hygiene (R23 P3-2 + R20 P3-2/P3-3). | `cd6cb04` |
-| R26 | P5-durable-cursors scope (γ scrub + STM_UB_VERSION 7→8). | *(pending)* |
+| R26 | P5-durable-cursors scope (γ scrub + STM_UB_VERSION 7→8). | `a6249eb` |
 
 ## Policy terms
 
