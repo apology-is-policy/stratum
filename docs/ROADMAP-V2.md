@@ -428,11 +428,13 @@ The most architecturally risky phase (per NOVEL #4). Extensive TLA+ spec work + 
 
 ### 8.2 Exit criteria
 
-- [ ] 4-device RAID-Z-equivalent pool survives single-device failure without data loss.
-- [ ] LRC repair is 2-3× faster than RS for single-failure scenarios (per the LRC lead position).
-- [ ] Scrub detects + repairs injected corruption.
-- [ ] Rebalance progress persists across restart.
-- [ ] `quorum.tla` proves commit-under-partial-failure semantics.
+Status as of 2026-04-25 (post-R25 close, tip `c45a76a`):
+
+- [x] **Single-device-failure survival**: 4-device RAID-Z-equivalent pool survives single-device failure without data loss. **Met via mirror(n)** at P5-3c (`sync_multi_mirror_read_falls_back_on_tamper`) + R21 P1 (`sync_multi_commit_succeeds_with_one_faulted`). RS-based RAID-Z deferred to post-v2.0 (§8.6 + §14.1).
+- [ ] **LRC vs RS performance**: LRC repair is 2-3× faster than RS for single-failure scenarios (per the LRC lead position). **Deferred** to post-v2.0 per §8.3 risk mitigation + §8.6 + §14.2 (LRC requires RS stable first).
+- [~] **Scrub detect + repair**: Scrub detects + repairs injected corruption. **Surface integrated** at P5-5-α (verify-only sweep) + P5-5-β (4-counter classification via caller-supplied verify-callback; CallbackSetExclusivity invariant). Test stubs demonstrate detect + repair end-to-end. **Production-default cb** (bptr-aware, walks the replica list, rewrites the bad device, emits repair log) deferred to P6 (§8.6 + §9.1.bis).
+- [ ] **Rebalance progress persistence**: Rebalance progress persists across restart. **Deferred** to a combined P5-durable-cursors chunk that bundles scrub-γ + evacuation cursor persistence under one `STM_UB_VERSION` bump (§8.6).
+- [x] **quorum.tla**: `quorum.tla` proves commit-under-partial-failure semantics. **Met** at P5-0 (`v2/specs/quorum.tla`, 36839 distinct states at depth 35; `quorum_buggy.cfg` with `IdempotentRetry=FALSE, MaxRetries≥2` reproduces the R14 P1 content-divergence at the spec level).
 
 ### 8.3 Risks
 
@@ -447,6 +449,72 @@ The most architecturally risky phase (per NOVEL #4). Extensive TLA+ spec work + 
 ### 8.5 Parallel opportunities
 
 - Scrub + repair infrastructure can be built in parallel with multi-device commit.
+
+### 8.6 Phase 5 deferrals (carry-over to later phases)
+
+Items that were in Phase 5's original §8.1 scope or §8.2 exit
+criteria but are deferred to later phases — captured here so the
+work doesn't get lost. Each entry identifies the origin (§8.1
+deliverable or §8.2 exit-criterion number), the reason for the
+deferral, and the target phase.
+
+**RS erasure coding** (§8.1 "Erasure coding", §8.2 criterion 1
+strict reading) — deferred to **post-v2.0** (§14.1). MVP shipped
+with mirror(n) only; mirror(n) demonstrably satisfies
+single-device-failure survival (P5-3c + R21 P1), so the spirit of
+criterion 1 is met. Adding RS now would risk the v2.0 release
+window; better to layer it as v2.1.
+
+**LRC erasure coding** (§8.1 "Erasure coding", §8.2 criterion 2)
+— deferred to **post-RS** (v2.2+, §14.2). Per §8.3 risk
+mitigation: "start with RS-only; add LRC after RS is stable".
+LRC's decode-locality value materializes only after RS exercises
+the single-failure recovery path under load.
+
+**Multi-device stripe allocation API** (§8.1 "Erasure coding"
+sub-bullet) — deferred to **post-v2.0** (§14.1) alongside RS.
+Stripe-aware allocation only matters for RS / LRC; pre-RS the
+allocator is per-device with mirror replication.
+
+**Scrub IO throttling per priority** (§8.1 "Scrub") — deferred
+to **post-v2.0** (§14.1). ARCH §7.14.3 defines low/medium/high.
+Current scrub α/β is admin-driven step-by-step; production
+deployment will want token-bucket throttle on `stm_bdev_read`
+submit rate.
+
+**Scrub durable cursor (P5-5-γ)** (§8.2 criterion 3 sub-aspect)
+— deferred to a **format-break chunk** within Phase 5, gated on
+user signoff (bumps `STM_UB_VERSION`). Persists scrub
+`(state, cursor_device_id, cursor_start_block, blocks_*)` across
+mount so a long scrub interrupted by shutdown resumes on next
+mount (ARCH §7.14.1). Likely bundled with rebalance persistence
+(below) under one format break to amortize the version bump.
+
+**Rebalance progress persistence** (§8.2 criterion 4) — deferred
+to the same **format-break chunk** as scrub-γ. Persists
+`stm_sync_evacuation_step`'s cursor + counters across mount,
+analogous to scrub-γ but for evacuation. Format break.
+
+**Production-default scrub verify-callback** (§8.2 criterion 3
+"detects + repairs corruption" production aspect) — deferred to
+**Phase 6** (§9). β-mode integrated at P5-5-β with the
+caller-supplied cb shape (`stm_scrub_set_verify_cb`). P6's bptr
+layer plugs in the production cb that walks the replica list,
+verifies AEAD/csum, picks a verified replica, rewrites the bad
+device, emits the repair-log entry per ARCH §7.15.4.
+
+**P5-4c-β reconstruct path** (FAULTED → new replace via
+bptr-iteration) — deferred to **Phase 6** (§9). Today
+`stm_sync_replace_device_online` returns `STM_ENOTSUPPORTED` for
+FAULTED-source replace; full replace requires bptr-aware
+replica-list iteration to copy live blocks onto the new device.
+
+**P5-4d-β reconcile path** (catch-up of stale FAULTED-rejoined
+content) — deferred to **Phase 6** (§9). Same bptr-layer
+dependency. Today, mirror_read covers reads from a freshly
+rejoined device by falling back to other replicas on csum-fail
+(R15 F1 via metadata_nonce.tla), but the rejoined device isn't
+proactively brought current.
 
 ---
 
@@ -499,6 +567,36 @@ The most architecturally risky phase (per NOVEL #4). Extensive TLA+ spec work + 
 ### 9.5 Parallel opportunities
 
 - Dataset + snapshot + clone lifecycles can be built in parallel with dead-list implementation.
+
+### 9.6 Phase 5 carry-over (closed during P6)
+
+The following items were deferred from Phase 5 (§8.6) and depend
+on the bptr layer P6 introduces. They MUST be picked up during
+Phase 6 — no later phase has the ingredients to do so:
+
+- **Production scrub verify-callback**: plug a bptr-aware cb
+  into `stm_scrub_set_verify_cb` (P5-5-β surface). The cb walks
+  the bptr's replica list, reads each replica, verifies
+  AEAD/csum, picks a verified replica, rewrites the bad device,
+  verifies the writeback (ARCH §7.15.3), emits the repair-log
+  entry (ARCH §7.15.4). Replaces today's test-stub-only cb
+  usage; closes the production aspect of Phase 5 exit
+  criterion 3.
+
+- **P5-4c-β reconstruct**: replace a FAULTED device by
+  iterating its allocated bptrs and copying live blocks onto
+  the new device's slot. `stm_sync_replace_device_online` today
+  returns `STM_ENOTSUPPORTED` for the FAULTED→new path.
+
+- **P5-4d-β reconcile**: bring a FAULTED-rejoined device
+  current by iterating bptrs whose content-gen lags
+  `pool_gen` and pulling fresh bytes from a verified replica.
+  Pre-bptr the rejoined device sits with stale bytes; mirror_read
+  covers reads via majority-quorum but the device isn't
+  proactively brought current.
+
+These are tracked in `v2/docs/phase5-status.md`'s deferral
+section and in `memory/project_v2_active.md`'s carry-over notes.
 
 ---
 
@@ -676,6 +774,15 @@ The most architecturally risky phase (per NOVEL #4). Extensive TLA+ spec work + 
 
 ### 14.1 v2.1 candidates (6–12 months post-v2.0)
 
+- **Reed-Solomon erasure coding** (Phase 5 §8.6 deferral):
+  ships as a new `stm_redundancy_profile` variant alongside
+  mirror(n). ISA-L SIMD encode/decode (Intel) + pure-C fallback.
+  Companion: **multi-device stripe allocation API** (§8.6) for
+  k+m block placement across distinct devices.
+- **Scrub IO throttling per priority** (Phase 5 §8.6 deferral):
+  ARCH §7.14.3 low (10% of bandwidth) / medium (30%) / high (80%).
+  Token-bucket rate-limiter on `stm_bdev_read` submit rate.
+  Settable via `/ctl/.../scrub/priority`.
 - **In-kernel Linux driver**: bypass FUSE for high-IOPS workloads. ~10-20 KLOC kernel code.
 - **Log device** (ZFS ZIL equivalent): dedicated fast-device for commit latency.
 - **Learned tiering policy** (NOVEL #6): ML-based hot/cold migration replacing heuristic.
@@ -684,6 +791,10 @@ The most architecturally risky phase (per NOVEL #4). Extensive TLA+ spec work + 
 
 ### 14.2 v2.2+ candidates (12–24+ months)
 
+- **LRC (Local Reconstruction Codes)** (Phase 5 §8.6 deferral):
+  layered on top of v2.1 RS. Decode-locality optimization for
+  single-failure recovery — ARCH §4.5 LRC(k, l, g) layout. Per
+  §8.3 risk mitigation: requires RS to be stable first.
 - **Windows driver** (via WinFsp or native kernel).
 - **Zoned Namespace (ZNS NVMe)** native support.
 - **NVMe-oF** for network-attached block storage.

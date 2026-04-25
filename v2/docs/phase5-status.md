@@ -138,11 +138,55 @@ Spawned after P5-1 through P5-5 land. Scope: roster persistence, multi-device co
 
 ## ROADMAP §8.2 exit criteria status
 
-- [x] 4-device RAID-Z-equivalent pool survives single-device failure without data loss. **Mirror(n)** satisfies this at P5-3c — sync_multi_mirror_read_falls_back_on_tamper demonstrates 2-of-3 replica survival. Full 4-device RAID-Z (Reed-Solomon) lands post-Phase-5.
-- [ ] LRC repair 2-3× faster than RS for single-failure scenarios. (Deferred.)
-- [ ] Scrub detects + repairs injected corruption. (P5-5.)
-- [ ] Rebalance progress persists across restart. (Deferred to P5-4b.)
-- [x] `quorum.tla` proves commit-under-partial-failure semantics. (P5-0.)
+Refreshed 2026-04-25 after R25 close. Each deferral has a target
+phase + ROADMAP cross-reference per §8.6 "Phase 5 deferrals
+(carry-over to later phases)".
+
+- [x] **Single-device-failure survival**: 4-device RAID-Z-equivalent
+      pool survives single-device failure without data loss.
+      **Met via mirror(n)** at P5-3c
+      (`sync_multi_mirror_read_falls_back_on_tamper`) + R21 P1
+      (`sync_multi_commit_succeeds_with_one_faulted` — commit
+      with one FAULTED device advances auth_gen). Full 4-device
+      RAID-Z (Reed-Solomon) deferred to **post-v2.0** (ROADMAP
+      §8.6 + §14.1).
+- [ ] **LRC vs RS performance**: LRC repair 2-3× faster than RS
+      for single-failure scenarios. **Deferred to v2.2+** per
+      ROADMAP §8.3 risk mitigation + §8.6 + §14.2 (requires RS
+      stable first).
+- [~] **Scrub detect + repair**: Scrub detects + repairs injected
+      corruption. **Surface integrated** at P5-5-α
+      (verify-only sweep) + P5-5-β (4-counter classification via
+      caller-supplied verify-callback; CallbackSetExclusivity
+      invariant); test stubs demonstrate detect+repair end-to-end.
+      **Production-default cb** (bptr-aware, walks replica list,
+      rewrites bad device, emits repair log per ARCH §7.15.4)
+      deferred to **P6** (ROADMAP §8.6 + §9.6 carry-over).
+- [ ] **Rebalance progress persistence**: Rebalance progress
+      persists across restart. **Deferred** to a combined
+      P5-durable-cursors chunk that bundles scrub-γ +
+      evacuation cursor persistence under one `STM_UB_VERSION`
+      bump (ROADMAP §8.6). Format break — requires user signoff.
+- [x] **quorum.tla**: `quorum.tla` proves commit-under-partial-
+      failure semantics. **Met** at P5-0 (`v2/specs/quorum.tla`,
+      36839 distinct states at depth 35; `quorum_buggy.cfg`
+      reproduces R14 P1 content-divergence at the spec level).
+
+## Phase 5 deferrals — full list
+
+See ROADMAP §8.6 for the canonical list with rationale + target
+phases. Quick index:
+
+| Item | Target | Driver |
+|---|---|---|
+| RS erasure coding + multi-device stripe alloc | post-v2.0 (§14.1) | Risk-budget for v2.0 freeze |
+| LRC erasure coding | v2.2+ (§14.2) | Requires RS stable first |
+| Scrub IO throttling per priority | post-v2.0 (§14.1) | Production-deployment concern |
+| Scrub durable cursor (γ) | Phase-5 chunk, format break | User signoff for `STM_UB_VERSION` bump |
+| Rebalance progress persistence | Phase-5 chunk, format break | Bundle with γ |
+| Production-default scrub verify-callback | Phase 6 (§9.6) | Needs bptr layer |
+| P5-4c-β reconstruct (FAULTED→new replace) | Phase 6 (§9.6) | Needs bptr-iteration |
+| P5-4d-β reconcile (stale FAULTED-rejoined) | Phase 6 (§9.6) | Needs bptr-iteration |
 
 ## Build + verify commands
 
