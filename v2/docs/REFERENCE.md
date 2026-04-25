@@ -38,10 +38,10 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: *(pending)* (post-R24 backlog hygiene chunk — R23 P3-2
+- **Tip**: `64e5aaa` (post-R24 backlog hygiene chunk — R23 P3-2
   add_device refusal tightened to collision-only; R20 P3-2 + P3-3
   closed via direct alloc-cursor unit tests + concurrent scrub
-  TSan stress test).
+  TSan stress test; R25 audit pending).
 - **Phases**: 1–4 complete; Phase 5 in progress — through R24 +
   backlog hygiene (P5-5-β audited clean; deferred items cleared
   for the path to γ).
