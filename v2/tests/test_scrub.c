@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: ISC */
 /*
- * Scrub tests (Phase 5 chunk P5-5-α).
+ * Scrub tests (Phase 5 chunks P5-5-α + P5-5-β).
  *
  *   see v2/include/stratum/scrub.h — surface tested here.
  *   see v2/specs/scrub.tla         — state-machine invariants.
@@ -20,6 +20,11 @@
  *   - State-guard refusals for invalid transitions.
  *   - NULL-arg validation.
  *   - Multi-device pool: scrub covers every attached device's tree.
+ *   - β: stm_scrub_set_verify_cb arg validation.
+ *   - β: cb returning OK / REPAIRED / UNREPAIRABLE charges the matching
+ *     counter; CallbackSetExclusivity (failed = 0 in β-mode).
+ *   - β: mixed-outcome cb keyed on paddr — counters sum to processed.
+ *   - β: no-cb regression — α-fallback unchanged when cb not installed.
  */
 
 #include "tharness.h"
@@ -574,6 +579,305 @@ STM_TEST(scrub_step_counts_io_error_as_failed) {
     STM_ASSERT_EQ(done.ranges_processed,  1u);
     STM_ASSERT_EQ(done.blocks_verified,   0u);
     STM_ASSERT_EQ(done.blocks_failed,     2u);
+
+    scrub_fx_close(&fx);
+}
+
+/* ========================================================================= */
+/* β cb-driven verify (P5-5-β).                                                */
+/* ========================================================================= */
+
+/* Stub cb context. Per scrub.h's "Borrowed references", the ctx must
+ * outlive the scrub handle — these tests keep ctx on the stack frame
+ * that owns scrub, so lifetime is correct by construction. */
+typedef struct {
+    stm_scrub_verify_outcome fixed_outcome;  /* returned for every block */
+    uint64_t                  call_count;
+} stub_cb_fixed_ctx;
+
+static stm_scrub_verify_outcome stub_cb_fixed(uint64_t paddr, void *vctx)
+{
+    (void)paddr;
+    stub_cb_fixed_ctx *c = (stub_cb_fixed_ctx *)vctx;
+    c->call_count++;
+    return c->fixed_outcome;
+}
+
+/* Mixed-outcome cb: returns OK / REPAIRED / UNREPAIRABLE based on the
+ * paddr's offset modulo 3. Block 0 → OK, block 1 → REPAIRED,
+ * block 2 → UNREPAIRABLE, block 3 → OK, ... */
+typedef struct {
+    uint64_t ok_count;
+    uint64_t repaired_count;
+    uint64_t unrepairable_count;
+} stub_cb_mixed_ctx;
+
+static stm_scrub_verify_outcome stub_cb_mixed(uint64_t paddr, void *vctx)
+{
+    stub_cb_mixed_ctx *c = (stub_cb_mixed_ctx *)vctx;
+    uint64_t off = stm_paddr_offset(paddr);
+    switch (off % 3) {
+    case 0:
+        c->ok_count++;
+        return STM_SCRUB_VERIFY_OK;
+    case 1:
+        c->repaired_count++;
+        return STM_SCRUB_VERIFY_REPAIRED;
+    default:
+        c->unrepairable_count++;
+        return STM_SCRUB_VERIFY_UNREPAIRABLE;
+    }
+}
+
+STM_TEST(scrub_set_verify_cb_arg_validation) {
+    scrub_fx fx;
+    scrub_fx_open(&fx, "cb_args");
+
+    stub_cb_fixed_ctx ctx = { STM_SCRUB_VERIFY_OK, 0 };
+
+    /* NULL sc rejected. */
+    STM_ASSERT_ERR(stm_scrub_set_verify_cb(NULL, stub_cb_fixed, &ctx),
+                     STM_EINVAL);
+
+    /* cb=NULL,ctx!=NULL is the suspicious shape — explicitly rejected. */
+    STM_ASSERT_ERR(stm_scrub_set_verify_cb(fx.sc, NULL, &ctx), STM_EINVAL);
+
+    /* cb=non-NULL,ctx=NULL allowed (stateless cb). State is IDLE — OK. */
+    STM_ASSERT_OK(stm_scrub_set_verify_cb(fx.sc, stub_cb_fixed, NULL));
+
+    /* cb=NULL,ctx=NULL allowed (clear). */
+    STM_ASSERT_OK(stm_scrub_set_verify_cb(fx.sc, NULL, NULL));
+
+    /* cb=non-NULL,ctx=non-NULL allowed. */
+    STM_ASSERT_OK(stm_scrub_set_verify_cb(fx.sc, stub_cb_fixed, &ctx));
+
+    scrub_fx_close(&fx);
+}
+
+STM_TEST(scrub_set_verify_cb_refuses_running_or_paused) {
+    /* Self-audit P1: cb mode (α vs β) must be frozen across a run so
+     * CallbackSetExclusivity holds end-to-end. Mid-run cb installation
+     * or clear is therefore refused with STM_EINVAL from RUNNING /
+     * PAUSED. Allowed from IDLE and COMPLETED. */
+    scrub_fx fx;
+    scrub_fx_open(&fx, "cb_state_guard");
+
+    stub_cb_fixed_ctx ctx = { STM_SCRUB_VERIFY_OK, 0 };
+
+    /* IDLE → install OK. */
+    STM_ASSERT_OK(stm_scrub_set_verify_cb(fx.sc, stub_cb_fixed, &ctx));
+
+    /* RUNNING → refused. */
+    STM_ASSERT_OK(stm_scrub_start(fx.sc));
+    STM_ASSERT_ERR(stm_scrub_set_verify_cb(fx.sc, stub_cb_fixed, &ctx),
+                     STM_EINVAL);
+    STM_ASSERT_ERR(stm_scrub_set_verify_cb(fx.sc, NULL, NULL),
+                     STM_EINVAL);
+
+    /* PAUSED → refused. */
+    STM_ASSERT_OK(stm_scrub_pause(fx.sc));
+    STM_ASSERT_ERR(stm_scrub_set_verify_cb(fx.sc, stub_cb_fixed, &ctx),
+                     STM_EINVAL);
+    STM_ASSERT_ERR(stm_scrub_set_verify_cb(fx.sc, NULL, NULL),
+                     STM_EINVAL);
+
+    /* Resume + drain to COMPLETED — install/clear allowed there. */
+    STM_ASSERT_OK(stm_scrub_resume(fx.sc));
+    STM_ASSERT_OK(stm_scrub_step(fx.sc));     /* empty pool → COMPLETED */
+    stm_scrub_status st;
+    STM_ASSERT_OK(stm_scrub_status_get(fx.sc, &st));
+    STM_ASSERT_EQ((int)st.state, (int)STM_SCRUB_STATE_COMPLETED);
+    STM_ASSERT_OK(stm_scrub_set_verify_cb(fx.sc, NULL, NULL));
+    STM_ASSERT_OK(stm_scrub_set_verify_cb(fx.sc, stub_cb_fixed, &ctx));
+
+    scrub_fx_close(&fx);
+}
+
+STM_TEST(scrub_cb_returns_ok_increments_verified) {
+    /* β cb returning OK always: every block accounted as `verified`,
+     * blocks_failed/repaired/unrepairable stay 0. (scrub.tla StepClean
+     * via the cb-path branch.) */
+    scrub_fx fx;
+    scrub_fx_open(&fx, "cb_ok");
+
+    /* Reserve 7 blocks across 2 ranges (3 + 4). No bdev_write needed —
+     * the cb returns OK without touching the disk. */
+    uint64_t p1 = 0, p2 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(fx.a, 3u, 0, &p1));
+    STM_ASSERT_OK(stm_alloc_reserve(fx.a, 4u, 0, &p2));
+
+    stub_cb_fixed_ctx ctx = { STM_SCRUB_VERIFY_OK, 0 };
+    STM_ASSERT_OK(stm_scrub_set_verify_cb(fx.sc, stub_cb_fixed, &ctx));
+
+    STM_ASSERT_OK(stm_scrub_start(fx.sc));
+    for (int i = 0; i < 10; i++) {
+        stm_scrub_status st;
+        STM_ASSERT_OK(stm_scrub_status_get(fx.sc, &st));
+        if (st.state == STM_SCRUB_STATE_COMPLETED) break;
+        STM_ASSERT_OK(stm_scrub_step(fx.sc));
+    }
+
+    stm_scrub_status done;
+    STM_ASSERT_OK(stm_scrub_status_get(fx.sc, &done));
+    STM_ASSERT_EQ((int)done.state,            (int)STM_SCRUB_STATE_COMPLETED);
+    STM_ASSERT_EQ(done.ranges_processed,       2u);
+    STM_ASSERT_EQ(done.blocks_verified,        7u);
+    STM_ASSERT_EQ(done.blocks_failed,          0u);    /* CallbackSetExclusivity */
+    STM_ASSERT_EQ(done.blocks_repaired,        0u);
+    STM_ASSERT_EQ(done.blocks_unrepairable,    0u);
+    STM_ASSERT_EQ(ctx.call_count,              7u);   /* once per block */
+
+    scrub_fx_close(&fx);
+}
+
+STM_TEST(scrub_cb_returns_repaired_increments_repaired) {
+    /* β cb returning REPAIRED always: every block accounted as
+     * `repaired`. (scrub.tla StepRepaired.) */
+    scrub_fx fx;
+    scrub_fx_open(&fx, "cb_repaired");
+
+    uint64_t p1 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(fx.a, 5u, 0, &p1));
+
+    stub_cb_fixed_ctx ctx = { STM_SCRUB_VERIFY_REPAIRED, 0 };
+    STM_ASSERT_OK(stm_scrub_set_verify_cb(fx.sc, stub_cb_fixed, &ctx));
+
+    STM_ASSERT_OK(stm_scrub_start(fx.sc));
+    for (int i = 0; i < 10; i++) {
+        stm_scrub_status st;
+        STM_ASSERT_OK(stm_scrub_status_get(fx.sc, &st));
+        if (st.state == STM_SCRUB_STATE_COMPLETED) break;
+        STM_ASSERT_OK(stm_scrub_step(fx.sc));
+    }
+
+    stm_scrub_status done;
+    STM_ASSERT_OK(stm_scrub_status_get(fx.sc, &done));
+    STM_ASSERT_EQ((int)done.state,            (int)STM_SCRUB_STATE_COMPLETED);
+    STM_ASSERT_EQ(done.blocks_verified,        0u);
+    STM_ASSERT_EQ(done.blocks_failed,          0u);
+    STM_ASSERT_EQ(done.blocks_repaired,        5u);
+    STM_ASSERT_EQ(done.blocks_unrepairable,    0u);
+    STM_ASSERT_EQ(ctx.call_count,              5u);
+
+    scrub_fx_close(&fx);
+}
+
+STM_TEST(scrub_cb_returns_unrepairable_increments_unrepairable) {
+    /* β cb returning UNREPAIRABLE always: every block accounted as
+     * `unrepairable`. (scrub.tla StepUnrepairable.) */
+    scrub_fx fx;
+    scrub_fx_open(&fx, "cb_unrepairable");
+
+    uint64_t p1 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(fx.a, 6u, 0, &p1));
+
+    stub_cb_fixed_ctx ctx = { STM_SCRUB_VERIFY_UNREPAIRABLE, 0 };
+    STM_ASSERT_OK(stm_scrub_set_verify_cb(fx.sc, stub_cb_fixed, &ctx));
+
+    STM_ASSERT_OK(stm_scrub_start(fx.sc));
+    for (int i = 0; i < 10; i++) {
+        stm_scrub_status st;
+        STM_ASSERT_OK(stm_scrub_status_get(fx.sc, &st));
+        if (st.state == STM_SCRUB_STATE_COMPLETED) break;
+        STM_ASSERT_OK(stm_scrub_step(fx.sc));
+    }
+
+    stm_scrub_status done;
+    STM_ASSERT_OK(stm_scrub_status_get(fx.sc, &done));
+    STM_ASSERT_EQ((int)done.state,            (int)STM_SCRUB_STATE_COMPLETED);
+    STM_ASSERT_EQ(done.blocks_verified,        0u);
+    STM_ASSERT_EQ(done.blocks_failed,          0u);
+    STM_ASSERT_EQ(done.blocks_repaired,        0u);
+    STM_ASSERT_EQ(done.blocks_unrepairable,    6u);
+    STM_ASSERT_EQ(ctx.call_count,              6u);
+
+    scrub_fx_close(&fx);
+}
+
+STM_TEST(scrub_cb_mixed_outcomes_per_paddr) {
+    /* β cb keyed on paddr offset mod 3: tests that the cb is invoked
+     * with distinct paddrs for distinct blocks AND that scrub charges
+     * each outcome to its matching counter. */
+    scrub_fx fx;
+    scrub_fx_open(&fx, "cb_mixed");
+
+    /* One contiguous range of 9 blocks. The 9 paddrs cycle through
+     * offsets {N, N+1, N+2, ..., N+8}, where N = stm_paddr_offset(p).
+     * Modulo 3 this hits each outcome 3 times — independent of N.   */
+    uint64_t p = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(fx.a, 9u, 0, &p));
+
+    stub_cb_mixed_ctx ctx = { 0, 0, 0 };
+    STM_ASSERT_OK(stm_scrub_set_verify_cb(fx.sc, stub_cb_mixed, &ctx));
+
+    STM_ASSERT_OK(stm_scrub_start(fx.sc));
+    for (int i = 0; i < 10; i++) {
+        stm_scrub_status st;
+        STM_ASSERT_OK(stm_scrub_status_get(fx.sc, &st));
+        if (st.state == STM_SCRUB_STATE_COMPLETED) break;
+        STM_ASSERT_OK(stm_scrub_step(fx.sc));
+    }
+
+    stm_scrub_status done;
+    STM_ASSERT_OK(stm_scrub_status_get(fx.sc, &done));
+    STM_ASSERT_EQ((int)done.state,            (int)STM_SCRUB_STATE_COMPLETED);
+    STM_ASSERT_EQ(done.blocks_verified,        ctx.ok_count);
+    STM_ASSERT_EQ(done.blocks_repaired,        ctx.repaired_count);
+    STM_ASSERT_EQ(done.blocks_unrepairable,    ctx.unrepairable_count);
+    STM_ASSERT_EQ(done.blocks_failed,          0u);
+    /* Sum invariant: ProcessedCount in scrub.tla. */
+    STM_ASSERT_EQ(done.blocks_verified + done.blocks_repaired +
+                    done.blocks_unrepairable, 9u);
+    /* And the per-modulo counts: 9 blocks → 3 each. */
+    STM_ASSERT_EQ(ctx.ok_count,              3u);
+    STM_ASSERT_EQ(ctx.repaired_count,        3u);
+    STM_ASSERT_EQ(ctx.unrepairable_count,    3u);
+
+    scrub_fx_close(&fx);
+}
+
+STM_TEST(scrub_no_cb_falls_back_to_alpha_behavior) {
+    /* Regression: with no cb installed, β scrub behaves exactly as α.
+     * The α-only `scrub_step_sweeps_allocated_ranges` test covers
+     * blocks_verified; here we re-verify it together with the new
+     * counters all staying 0. */
+    scrub_fx fx;
+    scrub_fx_open(&fx, "no_cb_alpha");
+
+    uint64_t p1 = 0, p2 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(fx.a, 3u, 0, &p1));
+    STM_ASSERT_OK(stm_alloc_reserve(fx.a, 2u, 0, &p2));
+    uint8_t blk[STM_UB_SIZE];
+    memset(blk, 0xEE, sizeof blk);
+    for (uint64_t b = 0; b < 3; b++) {
+        STM_ASSERT_OK(stm_bdev_write(fx.bd,
+                                       (stm_paddr_offset(p1) + b) * STM_UB_SIZE,
+                                       blk, sizeof blk));
+    }
+    for (uint64_t b = 0; b < 2; b++) {
+        STM_ASSERT_OK(stm_bdev_write(fx.bd,
+                                       (stm_paddr_offset(p2) + b) * STM_UB_SIZE,
+                                       blk, sizeof blk));
+    }
+
+    /* No stm_scrub_set_verify_cb call. α-fallback path. */
+    STM_ASSERT_OK(stm_scrub_start(fx.sc));
+    for (int i = 0; i < 10; i++) {
+        stm_scrub_status st;
+        STM_ASSERT_OK(stm_scrub_status_get(fx.sc, &st));
+        if (st.state == STM_SCRUB_STATE_COMPLETED) break;
+        STM_ASSERT_OK(stm_scrub_step(fx.sc));
+    }
+
+    stm_scrub_status done;
+    STM_ASSERT_OK(stm_scrub_status_get(fx.sc, &done));
+    STM_ASSERT_EQ((int)done.state,            (int)STM_SCRUB_STATE_COMPLETED);
+    STM_ASSERT_EQ(done.ranges_processed,       2u);
+    STM_ASSERT_EQ(done.blocks_verified,        5u);
+    STM_ASSERT_EQ(done.blocks_failed,          0u);
+    /* CallbackSetExclusivity: α-mode keeps β counters at 0. */
+    STM_ASSERT_EQ(done.blocks_repaired,        0u);
+    STM_ASSERT_EQ(done.blocks_unrepairable,    0u);
 
     scrub_fx_close(&fx);
 }

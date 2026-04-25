@@ -59,6 +59,8 @@ documents them in depth.
 | **Quorum** | `⌊N/2⌋ + 1` of pool devices. Required for Phase 1 reservation + Phase 3 final + mount-claim. | [07-sb-sync](07-sb-sync.md) |
 | **reservation UB** | Phase 1 UB at `gen = auth+1` carrying the PREVIOUS authoritative UB's roots. Rollback target if Phase 3 fails. | [07-sb-sync](07-sb-sync.md) |
 | **safe removal** | Sync-layer wrappers that probe alloc drain before pool state transition. `stm_sync_remove_device`, `stm_sync_finish_evacuation`. | [08-pool-redundancy](08-pool-redundancy.md) |
+| **verify-callback** | Caller-supplied per-block classification function (P5-5-β). Returns OK / REPAIRED / UNREPAIRABLE; encapsulates the bptr-aware redundancy iteration. Future P6 extent manager plugs the production cb. | [09-scrub](09-scrub.md) |
+| **CallbackSetExclusivity** | Spec invariant (scrub.tla): the four scrub counters split cleanly by mode. α (no cb) keeps `repaired`/`unrepairable` at 0; β (cb installed) keeps `failed` at 0. | [10-specs](10-specs.md) |
 | **wedge** | Runtime state where sync refuses all mutations because an in-flight rollback itself failed. `STM_EWEDGED`. | [07-sb-sync](07-sb-sync.md) |
 
 ## Device states
@@ -102,7 +104,7 @@ documents them in depth.
 | 2 | Bε-tree + Bw-tree + EBR + R0-R5 audits. |
 | 3 | Single-device sync + uberblock + allocator + R6-R12 audits. |
 | 4 | AEAD-AD + per-extent integrity + keyschema + PQ-hybrid wrap + janus + R13-R14b audits. |
-| 5 | Multi-device pool + quorum commit + mirror(n) + device lifecycle + scrub (α) + R15-R20 audits. |
+| 5 | Multi-device pool + quorum commit + mirror(n) + device lifecycle + scrub (α + β) + R15-R23+ audits. |
 | 6 | Extent manager + namespace (datasets / snapshots / clones). |
 | 7 | CAS dedup tier. |
 | 8 | 9P / FUSE surface. |
@@ -123,7 +125,11 @@ closed items.
 | R17 | P5-4b scope (remove + evacuation). | `350e144` |
 | R18 | P5-4b-ii-β scope (per-pool rwlock). | `3c370c5` |
 | R19 | P5-4c-α scope (replace_device_online). | `9207ae7` |
-| R20 | P5-5-α scope (scrub verify-only). | in flight |
+| R20 | P5-5-α scope (scrub verify-only). | `25d7c4a` |
+| R21 | P5-6 full-phase audit. | `3edeb69` |
+| R22 | P5-7 scope (replace resume from ADDED-ONLINE). | `e5fe085` |
+| R23 | P5-8 scope (replace-in-flight claim + atomic resume). | `5468dac` |
+| R24 | P5-5-β scope (scrub repair via cb). | queued |
 
 ## Policy terms
 

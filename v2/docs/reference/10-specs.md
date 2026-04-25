@@ -32,10 +32,11 @@ chapter as specs get wider cross-reference tables).
 | `metadata_nonce.tla` | 5 | Per-device paddr-stamping for nonces. | 51939 states | `metadata_nonce_buggy.cfg` |
 | `device_lifecycle.tla` | 5 | Roster state machine (add/remove/fail/rejoin). | large cfg: 10.6M states at depth 21 | `device_lifecycle_buggy.cfg` |
 | `evac.tla` | 5 | Per-block evacuation atomicity. | 13 states, depth 5 | `evac_buggy.cfg`, `evac_remove_no_drain_buggy.cfg` |
-| `scrub.tla` | 5 | Scrub state machine. | 19 states, depth 8 | `scrub_buggy.cfg` |
+| `scrub.tla` | 5 | Scrub state machine + β cb-classification. | 19 states, depth 8 (each of α + β configs) | `scrub_buggy.cfg` |
 
-All fixed configs green. All 6 buggy configs reproduce their
-designed invariant violations.
+All fixed configs green (one per module + a second β-mode config for
+`scrub.tla`). All 6 buggy configs reproduce their designed invariant
+violations.
 
 ## Per-module invariants
 
@@ -239,10 +240,13 @@ Buggy configs:
 Spec-to-code: `src/sync/sync.c::stm_sync_evacuation_step` +
 safe-removal wrappers.
 
-### `scrub.tla` — scrub state machine (P5-5-α)
+### `scrub.tla` — scrub state machine + β cb (P5-5-α + β)
 
 - `TypeOK`, `StateMachineValid`, `CursorBounded`.
-- `ProcessedCount` — verified + failed = cursor.
+- `ProcessedCount` — verified + failed + repaired + unrepairable = cursor.
+- `CallbackSetExclusivity` — `~CallbackSet ⇒ repaired = unrepairable
+  = 0`; `CallbackSet ⇒ failed = 0`. The four counters split cleanly
+  by mode; documents the impl branch on `verify_cb`.
 - `CompletedIffDrained` — state = COMPLETED ⇒ cursor = NumBlocks.
 - `IdleMeansZero` — IDLE ⇒ zero counters + cursor.
 - `PauseResumeIdempotent` — snapshot_cursor > 0 ∧ state ∈
@@ -252,14 +256,43 @@ safe-removal wrappers.
 - `NoWorkWhenIdleOrCompleted` — step doesn't advance cursor
   outside RUNNING.
 
-Fixed config (`scrub.cfg`): 19 states at depth 8.
+CONSTANTS:
+- `NumBlocks` — total logical blocks to verify.
+- `CorruptBlocks ⊆ 1..NumBlocks` — blocks that fail verify.
+- `RepairableBlocks ⊆ CorruptBlocks` — β: blocks the cb classifies
+  as REPAIRED. Vacuous when `CallbackSet = FALSE`.
+- `CallbackSet ∈ BOOLEAN` — selects α-fallback (FALSE) vs β cb-mode
+  (TRUE). Disables `StepCorrupt` when TRUE; disables `StepRepaired` /
+  `StepUnrepairable` when FALSE.
+- `BuggyResume ∈ BOOLEAN` — buggy-Resume toggle.
 
-Buggy config (`scrub_buggy.cfg`, `BuggyResume = TRUE`):
-`PauseResumeIdempotent` violated at State 5 with 5-step trace
-`Init → Start → StepClean(1) → Pause → Resume`.
+Actions:
+- `Start` / `Restart` / `Reset` / `Pause` / `Resume` / `Complete` —
+  state-machine transitions; counters reset on Start/Restart/Reset.
+- `StepClean(b)` — clean block; bumps `verified`. Same in α and β.
+- `StepCorrupt(b)` — α-fallback only (guarded by `~CallbackSet`):
+  raw read failed; bumps `failed`.
+- `StepRepaired(b)` — β-only (guarded by `CallbackSet`); cb returned
+  REPAIRED for `b ∈ RepairableBlocks`. Bumps `repaired`.
+- `StepUnrepairable(b)` — β-only; cb returned UNREPAIRABLE for
+  `b ∈ CorruptBlocks \ RepairableBlocks`. Bumps `unrepairable`.
+
+Fixed-α config (`scrub.cfg`, `CallbackSet=FALSE`,
+`RepairableBlocks={}`): 19 states at depth 8.
+
+Fixed-β config (`scrub_beta.cfg`, `CallbackSet=TRUE`,
+`CorruptBlocks={2,3}`, `RepairableBlocks={2}`): exercises StepClean
+on block 1, StepRepaired on block 2, StepUnrepairable on block 3.
+19 states at depth 8. All invariants hold including
+`CallbackSetExclusivity` (failed = 0 throughout).
+
+Buggy-α config (`scrub_buggy.cfg`, `BuggyResume = TRUE`,
+`CallbackSet=FALSE`): `PauseResumeIdempotent` violated at State 5
+with 5-step trace `Init → Start → StepClean(1) → Pause → Resume`.
 
 Spec-to-code: `src/scrub/scrub.c::stm_scrub_{start, pause, resume,
-reset, step}` + SPEC-TO-CODE table inline at top of scrub.c.
+reset, step, set_verify_cb}` + SPEC-TO-CODE table inline at top of
+scrub.c. Per-block β cb dispatch in `scrub_verify_range_locked`.
 
 ## Running TLC
 
@@ -271,13 +304,16 @@ cd v2/specs
 java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
     -config scrub.cfg scrub.tla
 
-# Full sweep (see v2/docs/reference/00-overview.md for the command).
+# Full sweep — fixed configs (one per module; scrub has a second β config).
 for s in sync concurrency structural balanced merge allocator merkle \
          key_schema quorum metadata_nonce device_lifecycle evac scrub; do
   echo "== $s ==" && \
   java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
       -config $s.cfg $s.tla 2>&1 | tail -3
 done
+echo "== scrub (β) ==" && \
+  java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
+      -config scrub_beta.cfg scrub.tla 2>&1 | tail -3
 
 # Buggy-config sanity (each must VIOLATE as expected):
 for cfg in quorum_buggy metadata_nonce_buggy device_lifecycle_buggy \

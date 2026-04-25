@@ -1,17 +1,35 @@
 /* SPDX-License-Identifier: ISC */
 /*
- * Scrub — P5-5-α MVP verify-only sweep.
+ * Scrub — P5-5-α + β. Verify-only sweep with optional repair-callback.
  *
  *   see docs/ARCHITECTURE.md §7.14 (state machine + scope + priority)
+ *                            §7.15 (repair from redundancy)
  *                            §12.7 (I/O path obligations)
  *   see docs/ROADMAP-V2.md §8    (Phase 5 scope)
  *   see v2/specs/scrub.tla        (formal state-machine spec)
  *
  * The scrub module performs a background walk over a pool's allocated
- * data, reading every allocated block and counting read failures. In
- * α scope, "verify" means: the device returns the bytes without an I/O
- * error. No csum comparison (bptr layer not yet available), no repair
- * (β), no durable pause/resume (γ).
+ * data, reading every allocated block and counting read failures. Two
+ * verify modes:
+ *
+ *   α-fallback (default; no cb installed): "verify" means the device
+ *     returns the bytes without an I/O error. Read failures bump
+ *     blocks_failed; no repair attempted. Per ARCH §7.16.1 scrub
+ *     continues past corruption.
+ *
+ *   β cb-mode (stm_scrub_set_verify_cb installed): per-block outcome
+ *     is delegated to the caller's callback, which encapsulates the
+ *     bptr-aware redundancy iteration. The cb returns
+ *     STM_SCRUB_VERIFY_OK / REPAIRED / UNREPAIRABLE; counters bump
+ *     accordingly. blocks_failed stays 0 in this mode — a cb
+ *     converts every per-block outcome into a definite classification.
+ *
+ * The cb-shape is the integration point for the future P6 extent
+ * manager: the callback walks the bptr's replica list, reads each,
+ * verifies AEAD/csum, picks the first good replica, rewrites the
+ * corrupted device, and reports the outcome. β has no bptr layer yet,
+ * so tests pass stub callbacks and production callers wait for P6.
+ * No durable pause/resume (γ).
  *
  * State machine (scrub.tla):
  *
@@ -35,8 +53,12 @@
  *   - Cursor is monotonic within a single run (Start→...→COMPLETED).
  *     Pause does not regress cursor; Resume continues from the same
  *     point.  (scrub.tla: CursorMonotonic, PauseResumeIdempotent.)
- *   - verified + failed = blocks-processed in the current run.
- *     (scrub.tla: ProcessedCount.)
+ *   - verified + failed + repaired + unrepairable = blocks-processed in
+ *     the current run. (scrub.tla: ProcessedCount.)
+ *   - α-mode (no cb): repaired = unrepairable = 0; corrupt blocks
+ *     fall into `failed`. β-mode (cb set): failed = 0; corrupt blocks
+ *     classified as repaired or unrepairable. (scrub.tla:
+ *     CallbackSetExclusivity.)
  *   - COMPLETED ⇒ cursor has traversed every ONLINE and EVACUATING
  *     device's alloc tree in the pool. (scrub.tla: CompletedIffDrained
  *     — where the spec's NumBlocks models this same processable
@@ -77,14 +99,36 @@
  *     "detach without close" is sufficient for lifetime correctness
  *     (after detach, stm_sync_alloc(dev) returns NULL and scrub's
  *     next step advances past the device).
+ *   - β cb-context (the `ctx` passed to stm_scrub_set_verify_cb) must
+ *     outlive the scrub handle, OR be cleared (via a follow-up
+ *     stm_scrub_set_verify_cb(sc, NULL, NULL)) before the underlying
+ *     ctx storage is freed. Scrub does not copy the ctx — it borrows
+ *     the pointer and passes it through to the cb on every call.
  *
- * Not modeled here (deferred to β / γ / future):
- *   - Per-block csum verification (needs bptr layer, P6).
- *   - Repair on read failure (ARCH §7.15; P5-5-β).
+ * Callback contract (β):
+ *
+ *   - The cb is invoked with (paddr, ctx) under sc->lock + the pool's
+ *     rdlock — both held for the duration of one stm_scrub_step call.
+ *     The cb MUST NOT call back into stm_scrub_* on the same handle
+ *     (re-entry would deadlock on sc->lock) and MUST NOT call APIs
+ *     that would acquire pool's wrlock (the rdlock is held).
+ *   - The cb is invoked once per allocated block in cursor order; it
+ *     returns one of STM_SCRUB_VERIFY_{OK,REPAIRED,UNREPAIRABLE}.
+ *   - REPAIRED implies the cb has rewritten the corrupted block's
+ *     paddr from a verified replica AND verified the writeback (per
+ *     ARCH §7.15.3). UNREPAIRABLE implies no surviving replica was
+ *     usable; the block is left as-is on disk and the operator should
+ *     consult ARCH §7.16.2 unrecoverable-data policy.
+ *   - The cb is otherwise stateless from scrub's POV; counters are
+ *     authoritative through stm_scrub_status_get.
+ *
+ * Not modeled here (deferred to γ / future):
  *   - Durable cursor (resume across mount; P5-5-γ).
  *   - IO throttling (ARCH §7.14.3 priority levels; future).
  *   - Per-device parallelism (ARCH §12.7.1 "one thread per device");
- *     α serializes.
+ *     α/β serialize.
+ *   - Repair logging (ARCH §7.15.4); cb implementor's responsibility
+ *     to log the (paddr, source-replica, verification-result) tuple.
  */
 #ifndef STRATUM_V2_SCRUB_H
 #define STRATUM_V2_SCRUB_H
@@ -115,17 +159,62 @@ typedef enum {
 } stm_scrub_state;
 
 /*
+ * Per-block verify outcome — β cb return value (scrub.tla actions).
+ *
+ * STM_SCRUB_VERIFY_OK           — block read + verified clean. Bumps
+ *                                  blocks_verified. (scrub.tla: StepClean)
+ * STM_SCRUB_VERIFY_REPAIRED     — block was bad; cb reconstructed it
+ *                                  from a verified replica and rewrote
+ *                                  the corrupted device. Bumps
+ *                                  blocks_repaired. (scrub.tla:
+ *                                  StepRepaired)
+ * STM_SCRUB_VERIFY_UNREPAIRABLE — block was bad; no surviving replica
+ *                                  usable. Block left as-is. Bumps
+ *                                  blocks_unrepairable. (scrub.tla:
+ *                                  StepUnrepairable)
+ */
+typedef enum {
+    STM_SCRUB_VERIFY_OK            = 0,
+    STM_SCRUB_VERIFY_REPAIRED      = 1,
+    STM_SCRUB_VERIFY_UNREPAIRABLE  = 2,
+} stm_scrub_verify_outcome;
+
+/*
+ * β verify-callback. Invoked once per allocated block under sc->lock
+ * + pool->rdlock; must classify the block into one of the outcomes
+ * above. See "Callback contract" in the file header for the rules
+ * the implementor must respect.
+ *
+ * paddr — the encoded (device_id, block_offset) of the block being
+ *          verified (per stm_paddr_make in stratum/types.h). The cb
+ *          should pass this through to the bptr layer (P6) when
+ *          locating replicas.
+ * ctx   — opaque pointer the cb provided to stm_scrub_set_verify_cb.
+ */
+typedef stm_scrub_verify_outcome (*stm_scrub_verify_cb)(uint64_t paddr,
+                                                          void    *ctx);
+
+/*
  * Progress snapshot. Counters accumulate during a RUNNING run and
  * reset on Start / Restart / Reset transitions. Cursor is the next
  * (device, start_block) the scrub will scan from; interpret as an
  * exclusive lower bound for the current device.
+ *
+ * Counter semantics by mode (scrub.tla CallbackSetExclusivity):
+ *   α-mode (no cb): blocks_verified + blocks_failed = blocks scanned.
+ *                    blocks_repaired = blocks_unrepairable = 0.
+ *   β-mode (cb set): blocks_verified + blocks_repaired +
+ *                    blocks_unrepairable = blocks scanned.
+ *                    blocks_failed = 0.
  */
 typedef struct {
     stm_scrub_state state;
     uint16_t        cursor_device_id;    /* next device to scan */
     uint64_t        cursor_start_block;  /* inclusive lower bound within device */
     uint64_t        blocks_verified;     /* blocks with OK reads this run */
-    uint64_t        blocks_failed;       /* blocks with I/O errors this run */
+    uint64_t        blocks_failed;       /* α: I/O errors this run; β: 0 */
+    uint64_t        blocks_repaired;     /* β: REPAIRED outcomes this run; α: 0 */
+    uint64_t        blocks_unrepairable; /* β: UNREPAIRABLE outcomes this run; α: 0 */
     uint64_t        ranges_processed;    /* alloc-tree entries processed this run */
 } stm_scrub_status;
 
@@ -214,6 +303,32 @@ stm_status stm_scrub_step(stm_scrub *sc);
  */
 STM_MUST_USE
 stm_status stm_scrub_status_get(const stm_scrub *sc, stm_scrub_status *out);
+
+/*
+ * Install (or clear) the β verify-callback. Pass cb=NULL, ctx=NULL to
+ * clear and revert to α-fallback behavior. ctx is borrowed; caller
+ * must keep it valid for the cb's lifetime — see the file header
+ * "Borrowed references" + "Callback contract" sections.
+ *
+ * Valid states: IDLE | COMPLETED. The cb mode (set vs unset) is
+ * frozen for the duration of a run (Start → ... → Complete) so the
+ * spec's `CallbackSetExclusivity` invariant — α-mode keeps
+ * `repaired`/`unrepairable` at 0; β-mode keeps `failed` at 0 — holds
+ * across the whole run rather than getting torn between α and β
+ * counters. Callers should install the cb BEFORE the first
+ * `stm_scrub_start`, or between `_reset` and the next `_start` (or
+ * between two `_start` calls separated by a `Restart`).
+ *
+ * Refuses RUNNING / PAUSED with STM_EINVAL.
+ *
+ * Returns STM_EINVAL on NULL sc, or on the suspicious shape
+ * `cb=NULL,ctx!=NULL` (cb=non-NULL,ctx=NULL is allowed — stateless
+ * cb is legitimate).
+ */
+STM_MUST_USE
+stm_status stm_scrub_set_verify_cb(stm_scrub          *sc,
+                                     stm_scrub_verify_cb cb,
+                                     void               *ctx);
 
 #ifdef __cplusplus
 }
