@@ -45,7 +45,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   (scrub repair surface integrated; bptr-aware default cb deferred to
   P6 extent manager).
 - **Tests**: 28 suites × (default + ASan + TSan, serial) green.
-  test_sync_multi 42; test_pool 47; test_scrub 24.
+  test_sync_multi 42; test_pool 47; test_scrub 26.
 - **Specs**: 13 TLA+ modules clean (14 fixed configs incl. `scrub_beta`)
   + 6 buggy-demo configs fire as expected.
 - **LOC**: ~26 KLOC across 21 src/ modules + 25 public headers.

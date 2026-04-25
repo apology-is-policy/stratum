@@ -836,6 +836,55 @@ STM_TEST(scrub_cb_mixed_outcomes_per_paddr) {
     scrub_fx_close(&fx);
 }
 
+/* R24 P3-3: defensive default arm of cb-outcome switch. A misbehaving
+ * cb that returns a value not in {OK, REPAIRED, UNREPAIRABLE} must
+ * be accounted defensively as UNREPAIRABLE — preserves
+ * CallbackSetExclusivity (failed = 0 in β-mode) without abandoning
+ * the cursor. */
+static stm_scrub_verify_outcome stub_cb_unknown_value(uint64_t paddr,
+                                                       void    *vctx)
+{
+    (void)paddr;
+    uint64_t *count = (uint64_t *)vctx;
+    if (count) (*count)++;
+    /* Cast through unsigned int to avoid -Wenum-int-mismatch from
+     * the literal; this is intentionally an out-of-range value to
+     * exercise the impl's `default:` branch. */
+    return (stm_scrub_verify_outcome)0xFFu;
+}
+
+STM_TEST(scrub_cb_returns_unknown_charges_unrepairable_defensively) {
+    scrub_fx fx;
+    scrub_fx_open(&fx, "cb_unknown");
+
+    uint64_t p1 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(fx.a, 4u, 0, &p1));
+
+    uint64_t calls = 0;
+    STM_ASSERT_OK(stm_scrub_set_verify_cb(fx.sc, stub_cb_unknown_value,
+                                            &calls));
+    STM_ASSERT_OK(stm_scrub_start(fx.sc));
+    for (int i = 0; i < 10; i++) {
+        stm_scrub_status st;
+        STM_ASSERT_OK(stm_scrub_status_get(fx.sc, &st));
+        if (st.state == STM_SCRUB_STATE_COMPLETED) break;
+        STM_ASSERT_OK(stm_scrub_step(fx.sc));
+    }
+
+    stm_scrub_status done;
+    STM_ASSERT_OK(stm_scrub_status_get(fx.sc, &done));
+    STM_ASSERT_EQ((int)done.state,         (int)STM_SCRUB_STATE_COMPLETED);
+    STM_ASSERT_EQ(done.blocks_verified,     0u);
+    /* CallbackSetExclusivity: even with misbehaving cb, β-mode keeps
+     * failed at 0. */
+    STM_ASSERT_EQ(done.blocks_failed,       0u);
+    STM_ASSERT_EQ(done.blocks_repaired,     0u);
+    STM_ASSERT_EQ(done.blocks_unrepairable, 4u);
+    STM_ASSERT_EQ(calls,                    4u);
+
+    scrub_fx_close(&fx);
+}
+
 STM_TEST(scrub_no_cb_falls_back_to_alpha_behavior) {
     /* Regression: with no cb installed, β scrub behaves exactly as α.
      * The α-only `scrub_step_sweeps_allocated_ranges` test covers
@@ -1076,6 +1125,134 @@ STM_TEST(scrub_skips_faulted_devices) {
     STM_ASSERT_EQ(done.ranges_processed,  1u);
     STM_ASSERT_EQ(done.blocks_verified,   4u);
     STM_ASSERT_EQ(done.blocks_failed,     0u);
+
+    stm_scrub_close(sc);
+    stm_sync_close(s);
+    stm_alloc_close(a1);
+    stm_alloc_close(a0);
+    stm_pool_close(pool);
+    for (size_t i = 0; i < MDEV; i++) {
+        stm_bdev_close(bds[i]);
+        unlink(paths[i]);
+    }
+}
+
+/* R24 P3-4: cb invocation across a multi-device pool. Asserts the
+ * cb sees paddrs from BOTH devices in a mirror(2) pool, with
+ * counters summing across devices. The integration point for P6's
+ * bptr-aware cb is multi-device replica-list iteration; today's
+ * stub establishes the regression that the cb's per-block paddr
+ * carries the correct device_id stamp. */
+typedef struct {
+    uint64_t calls_dev0;
+    uint64_t calls_dev1;
+    uint64_t calls_other;
+} stub_cb_per_device_ctx;
+
+static stm_scrub_verify_outcome stub_cb_per_device(uint64_t paddr, void *vctx)
+{
+    stub_cb_per_device_ctx *c = (stub_cb_per_device_ctx *)vctx;
+    uint16_t dev = stm_paddr_device(paddr);
+    if      (dev == 0) c->calls_dev0++;
+    else if (dev == 1) c->calls_dev1++;
+    else                c->calls_other++;
+    /* Treat dev 0 as OK, dev 1 as REPAIRED — exercises both counters
+     * being driven by the cb under the same multi-device run. */
+    return (dev == 0) ? STM_SCRUB_VERIFY_OK : STM_SCRUB_VERIFY_REPAIRED;
+}
+
+STM_TEST(scrub_cb_invoked_across_multiple_devices) {
+    char paths[MDEV][256];
+    for (size_t i = 0; i < MDEV; i++) {
+        snprintf(paths[i], sizeof paths[i],
+                 "/tmp/stm_v2_scrub_cb_mdev_%d_%zu.bin", (int)getpid(), i);
+        unlink(paths[i]);
+    }
+
+    stm_bdev *bds[MDEV] = {0};
+    for (size_t i = 0; i < MDEV; i++) {
+        stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+        STM_ASSERT_OK(stm_bdev_open(paths[i], &bo, &bds[i]));
+        STM_ASSERT_OK(stm_bdev_resize(bds[i], TEST_DEVICE_BYTES));
+    }
+
+    const uint64_t duuid0[2] = { 0x5555, 0x9999 };
+    const uint64_t duuid1[2] = { 0x6666, 0x9999 };
+    stm_pool_open_opts opts;
+    memset(&opts, 0, sizeof opts);
+    opts.pool_uuid[0] = POOL_UUID[0];
+    opts.pool_uuid[1] = POOL_UUID[1];
+    opts.device_count = MDEV;
+    opts.devices[0].uuid[0]    = duuid0[0];
+    opts.devices[0].uuid[1]    = duuid0[1];
+    opts.devices[0].size_bytes = TEST_DEVICE_BYTES;
+    opts.devices[0].role       = STM_DEV_ROLE_DATA;
+    opts.devices[0].class_     = STM_DEV_CLASS_SSD;
+    opts.devices[0].state      = STM_DEV_STATE_ONLINE;
+    opts.devices[0].bdev       = bds[0];
+    opts.devices[1].uuid[0]    = duuid1[0];
+    opts.devices[1].uuid[1]    = duuid1[1];
+    opts.devices[1].size_bytes = TEST_DEVICE_BYTES;
+    opts.devices[1].role       = STM_DEV_ROLE_DATA;
+    opts.devices[1].class_     = STM_DEV_CLASS_SSD;
+    opts.devices[1].state      = STM_DEV_STATE_ONLINE;
+    opts.devices[1].bdev       = bds[1];
+    stm_pool *pool = NULL;
+    STM_ASSERT_OK(stm_pool_open(&opts, &pool));
+
+    stm_alloc *a0 = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bds[0], POOL_UUID, duuid0,
+                                     TEST_BOOTSTRAP_BYTES, &a0));
+    stm_redundancy_profile prof = { STM_RED_MIRROR, (uint8_t)MDEV };
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(pool, a0, make_wk(), &prof, &s));
+
+    stm_alloc *a1 = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bds[1], POOL_UUID, duuid1,
+                                     TEST_BOOTSTRAP_BYTES, &a1));
+    STM_ASSERT_OK(stm_alloc_set_device_id(a1, 1));
+    STM_ASSERT_OK(stm_sync_attach_alloc(s, 1, a1));
+
+    /* Mirror-reserve a 5-block run: writes one 5-block range to each
+     * device's alloc tree. */
+    uint64_t paddrs[MDEV] = {0};
+    STM_ASSERT_OK(stm_sync_reserve_mirror(s, 5u, MDEV, paddrs));
+    uint8_t blk[5 * STM_UB_SIZE];
+    memset(blk, 0x88, sizeof blk);
+    size_t confirmed = 0;
+    STM_ASSERT_OK(stm_sync_mirror_write(s, paddrs, MDEV, blk, sizeof blk,
+                                          &confirmed));
+    STM_ASSERT(confirmed >= MDEV);
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(s, &sc));
+
+    stub_cb_per_device_ctx cbctx = { 0, 0, 0 };
+    STM_ASSERT_OK(stm_scrub_set_verify_cb(sc, stub_cb_per_device, &cbctx));
+
+    STM_ASSERT_OK(stm_scrub_start(sc));
+    for (int i = 0; i < 20; i++) {
+        stm_scrub_status st;
+        STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
+        if (st.state == STM_SCRUB_STATE_COMPLETED) break;
+        STM_ASSERT_OK(stm_scrub_step(sc));
+    }
+
+    stm_scrub_status done;
+    STM_ASSERT_OK(stm_scrub_status_get(sc, &done));
+    STM_ASSERT_EQ((int)done.state,            (int)STM_SCRUB_STATE_COMPLETED);
+    STM_ASSERT_EQ(done.ranges_processed,       2u);  /* one per device */
+    /* dev 0's 5 blocks → OK → blocks_verified.
+     * dev 1's 5 blocks → REPAIRED → blocks_repaired. */
+    STM_ASSERT_EQ(done.blocks_verified,        5u);
+    STM_ASSERT_EQ(done.blocks_failed,          0u);
+    STM_ASSERT_EQ(done.blocks_repaired,        5u);
+    STM_ASSERT_EQ(done.blocks_unrepairable,    0u);
+    /* The cb saw blocks from both devices, none from elsewhere. */
+    STM_ASSERT_EQ(cbctx.calls_dev0,            5u);
+    STM_ASSERT_EQ(cbctx.calls_dev1,            5u);
+    STM_ASSERT_EQ(cbctx.calls_other,           0u);
 
     stm_scrub_close(sc);
     stm_sync_close(s);

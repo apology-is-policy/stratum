@@ -137,8 +137,13 @@ State-guard refusals:
 - `step` on non-RUNNING is a no-op returning `STM_OK`.
 - `status_get` is always safe.
 - `set_verify_cb` rejects `cb=NULL,ctx!=NULL` (suspicious shape) →
-  `STM_EINVAL`. All other combinations valid; callable in any state.
-  New cb takes effect on next `stm_scrub_step` call.
+  `STM_EINVAL`. Refuses RUNNING / PAUSED → `STM_EINVAL` (cb mode is
+  frozen for the duration of a Start...Complete run so spec's
+  `CallbackSetExclusivity` holds end-to-end). Valid in IDLE /
+  COMPLETED. Install BEFORE `_start`, or between `_reset` and
+  next `_start`, or in COMPLETED before `_start` (Restart) /
+  `_reset`. To free ctx mid-run without first reaching COMPLETED,
+  call `stm_scrub_close` (scrub never references ctx after close).
 
 Thread safety: internal `pthread_mutex_t` serializes every API.
 
@@ -286,20 +291,44 @@ latency — flagged by R20 P3-4 as a γ-scope throttling concern.
 ### β cb invocation context
 
 The cb is invoked from inside `verify_range_locked`, with both
-`sc->lock` and `pool->rdlock` held. The cb is therefore forbidden
-from:
+`sc->lock` and `pool->rdlock` held. **The pool's rwlock is
+non-reentrant** — initialized with
+`PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP` on Linux
+(`pool.c:274-280`); a thread already holding rdlock that calls a
+pool API which re-acquires the rdlock will deadlock if any writer
+is queued. The cb must therefore avoid every pool API that takes
+the rwlock internally (read OR write side).
 
-- Calling any `stm_scrub_*` on this handle (would deadlock on
-  `sc->lock`).
-- Calling APIs that acquire `pool` write-lock (e.g.
-  `stm_pool_add_device`, `_remove_device`, `_fail_device`,
-  `_finish_evacuation`) — would block forever, since we hold the
-  rdlock.
+Forbidden from the cb:
 
-Read-side pool APIs (`stm_pool_device_info`, `_device_bdev`,
-`stm_sync_alloc` etc.) ARE callable from within the cb because they
-take `pool.rdlock` reentrantly (the underlying `pthread_rwlock_t`
-permits multiple readers).
+- Any `stm_scrub_*` on this handle (would deadlock on `sc->lock`).
+- Pool write-side mutators (`stm_pool_add_device`, `_remove_device`,
+  `_fail_device`, `_rejoin_device`, `_begin_evacuation`,
+  `_finish_evacuation`, `_set_replace_claim`, `_clear_replace_claim`)
+  — block forever waiting for our rdlock.
+- Pool read APIs that internally call `pthread_rwlock_rdlock`:
+  `stm_pool_replace_claim` (`pool.c:454`). Use the `_locked` variant
+  if needed (it doesn't re-lock).
+
+Allowed from the cb (no internal locking — pure pointer dereference
+of the already-locked pool struct):
+
+- `stm_pool_device_info(pool, dev)` (`pool.c:498-501`).
+- `stm_pool_device_bdev(pool, dev)` (`pool.c:493-496`).
+- `stm_pool_device_count(pool)`, `stm_pool_uuid(pool)`,
+  `stm_pool_live_device_count(pool)` (all pure dereferences).
+- `stm_pool_replace_claim_locked(pool)` (`pool.c:460-465`) — the
+  caller-locked variant.
+- `stm_sync_alloc(sync, dev)`: takes sync.lock briefly (pool order
+  is OUTER → SYNC, so this is correct under our held rdlock).
+- `stm_alloc_*` accessors on the alloc returned by
+  `stm_sync_alloc` (alloc.lock is LEAF; no path back up).
+- `stm_bdev_read` on the bdev returned by `stm_pool_device_bdev`
+  (no pool/sync locks).
+
+When in doubt, prefer `_locked` variants of pool APIs and treat the
+held rdlock as a snapshot of pool state — the cb is a leaf in the
+lock-acquire DAG.
 
 ## Spec cross-reference
 
@@ -350,7 +379,7 @@ SPEC-TO-CODE:
 
 ## Tests
 
-`tests/test_scrub.c` (24 tests):
+`tests/test_scrub.c` (26 tests):
 
 - Lifecycle: `scrub_create_initial_state_is_idle`,
   `scrub_create_rejects_null_args`, `scrub_status_get_rejects_null_args`.
@@ -383,7 +412,15 @@ SPEC-TO-CODE:
   `scrub_cb_returns_unrepairable_increments_unrepairable`,
   `scrub_cb_mixed_outcomes_per_paddr` (cb keyed on paddr offset
   mod 3; asserts each counter sums correctly + ProcessedCount
-  invariant), `scrub_no_cb_falls_back_to_alpha_behavior`
+  invariant),
+  `scrub_cb_returns_unknown_charges_unrepairable_defensively`
+  (R24 P3-3: misbehaving cb returning out-of-enum value charges
+  to `blocks_unrepairable`, preserving CallbackSetExclusivity
+  even under cb misbehavior),
+  `scrub_cb_invoked_across_multiple_devices` (R24 P3-4: 2-device
+  mirror, cb sees paddrs from both devices with correct device-id
+  stamping; dev 0 → OK, dev 1 → REPAIRED; counters sum across
+  devices), `scrub_no_cb_falls_back_to_alpha_behavior`
   (regression: with no cb installed, β scrub identical to α).
 
 All green on default + ASan + TSan.
@@ -401,6 +438,37 @@ All green on default + ASan + TSan.
       UNREPAIRABLE / OK outcomes. CallbackSetExclusivity holds.
 - [x] **β: scrub_beta.cfg** — fixed-impl spec config exercising
       all three cb outcomes. 19 states / depth 8, clean.
+
+### R24 audit posture (closed 2026-04-25 @ *(pending)*)
+
+R24 scoped audit on the P5-5-β commit `00869ee`. 0 P0 / 0 P1 / 2 P2 /
+4 P3. β impl + spec sound; both P2s were doc-vs-code drift in
+this file (state-guard table contradicting impl + misleading
+"rdlock reentrantly" claim that would hazard P6's bptr-aware cb).
+
+- [x] **P2-1**: state-guard refusal of `set_verify_cb` in
+      RUNNING/PAUSED is now reflected in this doc's "State-guard
+      refusals" bullet (was missing — claimed "callable in any
+      state" while impl already refused).
+- [x] **P2-2**: cb-context section rewritten to be precise about
+      pool's `_NONRECURSIVE_NP` rwlock + which read APIs internally
+      re-lock (`stm_pool_replace_claim`) vs. pure-deref accessors
+      (`_device_info`, `_device_bdev`). Future P6 cb implementor
+      now has accurate guidance + an explicit safe-list.
+- [x] **P3-1**: `stm_scrub_status` field doc clarifies α/β refers
+      to the run that produced the counters; cross-run windows
+      (cb-cleared in COMPLETED with prior β counters still in
+      view) documented as intentional + behavioral.
+- [x] **P3-2**: `scrub.h` "Borrowed references" calls out
+      `stm_scrub_close` as the abort pattern when ctx must be
+      freed before the run reaches COMPLETED.
+- [x] **P3-3**: new test
+      `scrub_cb_returns_unknown_charges_unrepairable_defensively`
+      exercises the impl's `default:` arm on the cb-outcome
+      switch (misbehaving cb returning out-of-enum value).
+- [x] **P3-4**: new test `scrub_cb_invoked_across_multiple_devices`
+      asserts cb sees paddrs from both devices in a 2-device
+      mirror pool with correct device-id stamping.
 
 ### R20 audit posture (closed 2026-04-24 @ `25d7c4a`)
 

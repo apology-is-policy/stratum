@@ -104,6 +104,10 @@
  *     stm_scrub_set_verify_cb(sc, NULL, NULL)) before the underlying
  *     ctx storage is freed. Scrub does not copy the ctx — it borrows
  *     the pointer and passes it through to the cb on every call.
+ *     NOTE: set_verify_cb refuses RUNNING / PAUSED, so cb-clear
+ *     mid-run is not possible; if ctx must be freed before the run
+ *     reaches COMPLETED, call stm_scrub_close — scrub never
+ *     references cb / ctx after close.
  *
  * Callback contract (β):
  *
@@ -200,12 +204,29 @@ typedef stm_scrub_verify_outcome (*stm_scrub_verify_cb)(uint64_t paddr,
  * (device, start_block) the scrub will scan from; interpret as an
  * exclusive lower bound for the current device.
  *
- * Counter semantics by mode (scrub.tla CallbackSetExclusivity):
- *   α-mode (no cb): blocks_verified + blocks_failed = blocks scanned.
- *                    blocks_repaired = blocks_unrepairable = 0.
- *   β-mode (cb set): blocks_verified + blocks_repaired +
- *                    blocks_unrepairable = blocks scanned.
- *                    blocks_failed = 0.
+ * Counter semantics: each block scanned during a Start...Complete
+ * run charges exactly one counter, determined by the cb-installation
+ * mode AT THE TIME the block was scanned. Because cb-mode is frozen
+ * for the duration of a run (set_verify_cb refuses RUNNING /
+ * PAUSED), all blocks in one run charge the same counter pair —
+ * satisfying scrub.tla's CallbackSetExclusivity end-to-end:
+ *
+ *   α-mode (cb=NULL during the run):
+ *       blocks_verified + blocks_failed = blocks scanned.
+ *       blocks_repaired = blocks_unrepairable = 0.
+ *   β-mode (cb non-NULL during the run):
+ *       blocks_verified + blocks_repaired + blocks_unrepairable
+ *           = blocks scanned.
+ *       blocks_failed = 0.
+ *
+ * Cross-run: counters reflect the run that produced them. Caller
+ * may clear / install cb in COMPLETED state — counters from the
+ * just-finished β-mode run remain visible until the next Start
+ * zeros them, even after the cb is cleared. status_get does not
+ * gate fields on current cb-installation; the (failed=0,
+ * repaired/unrepairable>0) shape after a β run that's then
+ * cb-cleared in COMPLETED is intentional and reflects the prior
+ * run's outcomes.
  */
 typedef struct {
     stm_scrub_state state;
