@@ -1791,4 +1791,138 @@ STM_TEST(pool_open_refuses_non_online_dev_zero) {
     unlink(g_tmp_path);
 }
 
+/* ========================================================================= */
+/* P5-8: replace-in-flight claim.                                             */
+/* ========================================================================= */
+
+/* The claim refuses non-locked mutators on the claimed slot with STM_EBUSY,
+ * and refuses second set_claim while one is held.  Locked variants are
+ * unaffected (used internally by replace itself). */
+STM_TEST(pool_replace_claim_blocks_mutators_on_claimed_slot) {
+    make_tmp("claim_blocks");
+    stm_bdev *d = open_fresh_device();
+    stm_pool *p = make_single_device_pool(d, POOL_UUID, DEVICE_UUID,
+                                            STM_DEV_ROLE_DATA,
+                                            STM_DEV_CLASS_SSD,
+                                            STM_DEV_STATE_ONLINE);
+
+    /* Add a second device so we can claim it (slot 0 cannot be the
+     * target of mutators that refuse dev-0; using a non-zero slot
+     * exercises the claim check directly). */
+    char path2[256];
+    snprintf(path2, sizeof path2, "/tmp/stm_v2_pool_claim_%d_2.bin",
+             (int)getpid());
+    unlink(path2);
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    stm_bdev *d2 = NULL;
+    STM_ASSERT_OK(stm_bdev_open(path2, &bo, &d2));
+    STM_ASSERT_OK(stm_bdev_resize(d2, TEST_DEVICE_BYTES));
+    stm_pool_device dev2 = {
+        .uuid = { DEVICE_UUID_B[0], DEVICE_UUID_B[1] },
+        .role = STM_DEV_ROLE_DATA, .class_ = STM_DEV_CLASS_SSD,
+        .state = STM_DEV_STATE_ONLINE, .bdev = d2,
+    };
+    STM_ASSERT_OK(stm_pool_add_device(p, &dev2));
+    STM_ASSERT_EQ(stm_pool_device_count(p), 2u);
+
+    /* Initial state: no claim. */
+    STM_ASSERT_EQ((int)stm_pool_replace_claim(p),
+                   (int)STM_POOL_REPLACE_CLAIM_NONE);
+
+    /* Claim slot 1. */
+    STM_ASSERT_OK(stm_pool_set_replace_claim(p, 1));
+    STM_ASSERT_EQ((int)stm_pool_replace_claim(p), 1);
+
+    /* set_claim is idempotent on the same slot (lets retry reclaim its
+     * own prior claim cleanly).  A different-slot claim refuses STM_EBUSY. */
+    STM_ASSERT_OK(stm_pool_set_replace_claim(p, 1));   /* idempotent same-slot */
+    STM_ASSERT_ERR(stm_pool_set_replace_claim(p, 0), STM_EBUSY);
+
+    /* Mutators on slot 1 refused with STM_EBUSY:
+     * - remove_device, begin_evacuation, finish_evacuation,
+     *   fail_device, rejoin_device. */
+    STM_ASSERT_ERR(stm_pool_remove_device(p, 1, /*floor=*/0), STM_EBUSY);
+    STM_ASSERT_ERR(stm_pool_begin_evacuation(p, 1, /*floor=*/0), STM_EBUSY);
+    STM_ASSERT_ERR(stm_pool_finish_evacuation(p, 1), STM_EBUSY);
+    STM_ASSERT_ERR(stm_pool_fail_device(p, 1), STM_EBUSY);
+    STM_ASSERT_ERR(stm_pool_rejoin_device(p, 1), STM_EBUSY);
+
+    /* add_device refused while ANY claim is held (the new slot might
+     * collide with the claim if added at the tail). */
+    stm_pool_device dev3 = dev2;
+    dev3.uuid[0] = 0xfeed;
+    STM_ASSERT_ERR(stm_pool_add_device(p, &dev3), STM_EBUSY);
+
+    /* Mutators on a NON-claimed slot (slot 0) are unaffected by the
+     * claim — but slot 0 has its own dev-0 guards (STM_ENOTSUPPORTED),
+     * so we just verify the claim doesn't masquerade as STM_EBUSY. */
+    STM_ASSERT_ERR(stm_pool_remove_device(p, 0, /*floor=*/0),
+                     STM_ENOTSUPPORTED);
+
+    /* Clear the claim. Mutators work again. */
+    stm_pool_clear_replace_claim(p);
+    STM_ASSERT_EQ((int)stm_pool_replace_claim(p),
+                   (int)STM_POOL_REPLACE_CLAIM_NONE);
+    /* fail_device on slot 1 now works. */
+    STM_ASSERT_OK(stm_pool_fail_device(p, 1));
+
+    /* Clear is idempotent — calling twice is a no-op. */
+    stm_pool_clear_replace_claim(p);
+    stm_pool_clear_replace_claim(p);
+
+    /* set_claim out-of-range refused. */
+    STM_ASSERT_ERR(stm_pool_set_replace_claim(p, 99), STM_EINVAL);
+
+    stm_pool_close(p);
+    stm_bdev_close(d);
+    stm_bdev_close(d2);
+    unlink(g_tmp_path);
+    unlink(path2);
+}
+
+/* The _locked variants bypass the claim check — replace's own internal
+ * pool ops use _locked. */
+STM_TEST(pool_replace_claim_locked_bypasses_check) {
+    make_tmp("claim_locked");
+    stm_bdev *d = open_fresh_device();
+    stm_pool *p = make_single_device_pool(d, POOL_UUID, DEVICE_UUID,
+                                            STM_DEV_ROLE_DATA,
+                                            STM_DEV_CLASS_SSD,
+                                            STM_DEV_STATE_ONLINE);
+
+    /* Add slot 1 so we have something to test against. */
+    char path2[256];
+    snprintf(path2, sizeof path2, "/tmp/stm_v2_pool_claim_locked_%d_2.bin",
+             (int)getpid());
+    unlink(path2);
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    stm_bdev *d2 = NULL;
+    STM_ASSERT_OK(stm_bdev_open(path2, &bo, &d2));
+    STM_ASSERT_OK(stm_bdev_resize(d2, TEST_DEVICE_BYTES));
+    stm_pool_device dev2 = {
+        .uuid = { DEVICE_UUID_B[0], DEVICE_UUID_B[1] },
+        .role = STM_DEV_ROLE_DATA, .class_ = STM_DEV_CLASS_SSD,
+        .state = STM_DEV_STATE_ONLINE, .bdev = d2,
+    };
+    STM_ASSERT_OK(stm_pool_add_device(p, &dev2));
+
+    /* Claim slot 1. */
+    STM_ASSERT_OK(stm_pool_set_replace_claim(p, 1));
+
+    /* _locked mutators bypass the claim. Test fail_device_locked
+     * directly. */
+    stm_pool_lock_exclusive(p);
+    STM_ASSERT_OK(stm_pool_fail_device_locked(p, 1));
+    /* Slot is now FAULTED. clear-then-rejoin to restore. */
+    stm_pool_clear_replace_claim_locked(p);
+    STM_ASSERT_OK(stm_pool_rejoin_device_locked(p, 1));
+    stm_pool_unlock_exclusive(p);
+
+    stm_pool_close(p);
+    stm_bdev_close(d);
+    stm_bdev_close(d2);
+    unlink(g_tmp_path);
+    unlink(path2);
+}
+
 STM_TEST_MAIN("pool")

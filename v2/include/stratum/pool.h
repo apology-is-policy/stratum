@@ -514,6 +514,60 @@ stm_status stm_pool_fail_device_locked(stm_pool *p, uint16_t device_id);
 STM_MUST_USE
 stm_status stm_pool_rejoin_device_locked(stm_pool *p, uint16_t device_id);
 
+/* ========================================================================= */
+/* P5-8: replace-in-flight claim (R22 P3-3 / P3-4 closeout).                  */
+/*                                                                             */
+/* A claim marks a slot as "owned by an in-flight stm_sync_replace_device_   */
+/* online call" so concurrent pool mutators on that slot fail cleanly with   */
+/* STM_EBUSY instead of wedging the replace.  Pre-P5-8 the claim was         */
+/* implicit (slot existed only inside one call's execution); P5-7's          */
+/* resume-from-ADDED-ONLINE path exposed a window where the slot is          */
+/* durably added but the replace isn't yet complete — external begin_       */
+/* evacuation / remove_device / fail_device on that slot could wedge the     */
+/* retry.                                                                     */
+/*                                                                             */
+/* Contract:                                                                  */
+/*   * At most ONE claim is active at a time.  A second set_claim while a    */
+/*     claim is held fails STM_EBUSY (even if the slot being claimed is      */
+/*     the same — idempotent claim is refused to keep the ownership         */
+/*     boundary clear).                                                       */
+/*   * While a claim is held on slot S, non-locked mutators targeting S     */
+/*     refuse STM_EBUSY.  The _locked variants skip the check — replace     */
+/*     uses _locked for its own internal pool ops and so can proceed.       */
+/*   * Claims are advisory: scalar readers (device_count, roster_hash) are   */
+/*     unaffected; read paths (mirror_read / scrub) are unaffected.          */
+/*   * Clearing an unheld claim is a no-op.  This simplifies replace's       */
+/*     cleanup — every return path can call clear unconditionally.           */
+/*                                                                             */
+/* Lock discipline: set/clear_locked require pool.wrlock held by caller.     */
+/* The public set/clear wrappers acquire wrlock internally.                  */
+/* ========================================================================= */
+
+#define STM_POOL_REPLACE_CLAIM_NONE   UINT16_MAX
+
+/* Set the replace-in-flight claim to `slot`.  IDEMPOTENT on same-slot:
+ * returns STM_OK if a claim is already held on `slot` (lets replace
+ * retries reclaim their own prior partial-state claim cleanly).
+ * Returns STM_EBUSY if a claim is held on a DIFFERENT slot (someone
+ * else's replace is in flight).  Returns STM_EINVAL if slot is out of
+ * roster range.  _locked variant requires caller to hold pool.wrlock;
+ * public wrapper acquires it internally.                                  */
+STM_MUST_USE
+stm_status stm_pool_set_replace_claim       (stm_pool *p, uint16_t slot);
+STM_MUST_USE
+stm_status stm_pool_set_replace_claim_locked(stm_pool *p, uint16_t slot);
+
+/* Clear the replace-in-flight claim.  No-op if no claim is held; does NOT
+ * validate that the caller is the holder (callers are expected to pair
+ * set/clear correctly).  _locked variant requires pool.wrlock; public
+ * wrapper acquires it internally.                                          */
+void stm_pool_clear_replace_claim       (stm_pool *p);
+void stm_pool_clear_replace_claim_locked(stm_pool *p);
+
+/* Inspect the current claim (returns STM_POOL_REPLACE_CLAIM_NONE if
+ * unclaimed).  Primarily for tests.  Reads under pool.rdlock internally. */
+uint16_t stm_pool_replace_claim(const stm_pool *p);
+
 #ifdef __cplusplus
 }
 #endif

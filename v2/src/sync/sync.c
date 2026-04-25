@@ -2308,25 +2308,42 @@ stm_status stm_sync_finish_evacuation(stm_sync *s, uint16_t device_id)
 /* P5-4c-α: ONLINE → ONLINE device replacement.                               */
 /* ========================================================================= */
 
-/* R19 P2-2: rollback helper for attach/set-device-id failure. If the
- * pool-level remove itself fails (redundancy_floor too tight, or a
- * concurrent EVACUATING elsewhere blocks via STM_EBUSY), the pool
- * has an in-RAM-only ONLINE slot without an attached alloc —
- * sync_commit won't persist it (commit consults the pool slot's
- * state but also checks allocs[X]; an unattached slot is uncommitable
- * data-wise). We wedge the sync handle so the next call surfaces
- * the inconsistency loudly rather than compounding the bug. */
+/* R19 P2-2 + P5-8: rollback helper for attach/set-device-id failure
+ * or any post-claim error path. If the pool-level remove itself fails
+ * (redundancy_floor too tight, or a concurrent EVACUATING elsewhere
+ * blocks via STM_EBUSY), the pool has an in-RAM-only ONLINE slot
+ * without an attached alloc — sync_commit won't persist it (commit
+ * consults the pool slot's state but also checks allocs[X]; an
+ * unattached slot is uncommitable data-wise). We wedge the sync handle
+ * so the next call surfaces the inconsistency loudly rather than
+ * compounding the bug.
+ *
+ * P5-8: rollback runs atomically with claim-clear under one
+ * pool.wrlock — `_locked` variants bypass the claim check (which
+ * would otherwise refuse remove of the slot we're trying to roll back).
+ * On `claim_held = false` (resume-path failures where we never
+ * acquired a claim), the function clears the claim anyway (no-op if
+ * unheld) but does NOT call remove (the slot was never freshly added
+ * by THIS call). */
 static void replace_rollback_or_wedge(stm_sync *s, uint16_t new_slot,
-                                         size_t redundancy_floor)
+                                         size_t redundancy_floor,
+                                         bool claim_held)
 {
-    stm_status rs = stm_pool_remove_device(s->pool, new_slot,
+    stm_pool_lock_exclusive(s->pool);
+    stm_status rs = STM_OK;
+    if (claim_held) {
+        rs = stm_pool_remove_device_locked(s->pool, new_slot,
                                               redundancy_floor);
+    }
+    stm_pool_clear_replace_claim_locked(s->pool);
+    stm_pool_unlock_exclusive(s->pool);
     if (rs != STM_OK) {
         pthread_mutex_lock(&s->lock);
         s->wedged = true;
         pthread_mutex_unlock(&s->lock);
     }
 }
+
 
 stm_status stm_sync_replace_device_online(
     stm_sync *s, uint16_t old_device_id,
@@ -2480,6 +2497,13 @@ stm_status stm_sync_replace_device_online(
         if (gs != STM_OK) return gs;
         if (alloc_dev != resume_slot) return STM_EINVAL;
 
+        /* P5-8: take the replace-in-flight claim before touching the slot
+         * for steps 3-9.  Refuses STM_EBUSY if another replace is already
+         * in flight (could be a concurrent retry of this same slot, or a
+         * different replace altogether — both are legitimate refusals). */
+        stm_status cls = stm_pool_set_replace_claim(s->pool, resume_slot);
+        if (cls != STM_OK) return cls;
+
         new_slot = resume_slot;
         if (out_new_device_id) *out_new_device_id = new_slot;
         /* Jump past steps 1 + 2a + 2b; proceed to step 3. */
@@ -2491,12 +2515,28 @@ stm_status stm_sync_replace_device_online(
      * concurrent add_device from another thread could intervene
      * between our count-read and our add, leaving us pointing at the
      * wrong slot. The _locked variant lets us hold wrlock across the
-     * count-read + add + count-read-again. */
+     * count-read + add + count-read-again.
+     *
+     * P5-8: also set the replace-in-flight claim atomically with the
+     * add. Holding wrlock across both means an external mutator
+     * cannot fire on the new slot between add and claim-set. If the
+     * claim is already held by another in-flight replace, refuse
+     * STM_EBUSY and roll back the add. */
     stm_pool_lock_exclusive(s->pool);
     size_t count_before = stm_pool_device_count(s->pool);
     stm_status as = stm_pool_add_device_locked(s->pool, new_device);
+    stm_status cls = STM_OK;
+    if (as == STM_OK) {
+        cls = stm_pool_set_replace_claim_locked(s->pool, (uint16_t)count_before);
+        if (cls != STM_OK) {
+            (void)stm_pool_remove_device_locked(s->pool,
+                                                   (uint16_t)count_before,
+                                                   redundancy_floor);
+        }
+    }
     stm_pool_unlock_exclusive(s->pool);
-    if (as != STM_OK) return as;
+    if (as != STM_OK)  return as;
+    if (cls != STM_OK) return cls;
     new_slot = (uint16_t)count_before;
 
     /* Step 2a: set the alloc's device_id to match the new slot.
@@ -2506,7 +2546,8 @@ stm_status stm_sync_replace_device_online(
      * post-add under concurrent callers). */
     stm_status sds = stm_alloc_set_device_id(new_alloc, new_slot);
     if (sds != STM_OK) {
-        replace_rollback_or_wedge(s, new_slot, redundancy_floor);
+        replace_rollback_or_wedge(s, new_slot, redundancy_floor,
+                                     /*claim_held=*/true);
         return sds;
     }
 
@@ -2516,8 +2557,10 @@ stm_status stm_sync_replace_device_online(
         /* Roll back the add: remove the new slot. No data on it yet,
          * so remove_device accepts. R19 P2-2: if the remove itself
          * fails (floor too tight / concurrent EVACUATING), wedge
-         * rather than silently leave an inconsistent slot. */
-        replace_rollback_or_wedge(s, new_slot, redundancy_floor);
+         * rather than silently leave an inconsistent slot. P5-8: same
+         * helper now also clears the claim atomically. */
+        replace_rollback_or_wedge(s, new_slot, redundancy_floor,
+                                     /*claim_held=*/true);
         return ats;
     }
 
@@ -2528,7 +2571,12 @@ added_ready:
         /* Step 3: persist the add. Idempotent on the resume path
          * (no dirty alloc/keyschema state beyond what a fresh-add
          * already staged; commit writes a new UB at auth+1/+2 with
-         * the same roots + same roster). R22. */
+         * the same roots + same roster). R22. P5-8: error paths past
+         * this point KEEP the claim held so the partial state stays
+         * protected against concurrent pool mutators on the new slot
+         * — retry from R22's resume path will reacquire the claim
+         * idempotently. The claim only releases on full success or
+         * via an explicit caller abort (future API). */
         stm_status cs = stm_sync_commit(s);
         if (cs != STM_OK) return cs;
 
@@ -2597,6 +2645,11 @@ drain_loop: {
     cs = stm_sync_commit(s);
     if (cs != STM_OK) return cs;
 
+    /* Success. P5-8: clear the claim only on full completion — failed
+     * paths above leave the claim held so retry can reacquire it
+     * idempotently and the partial state stays protected from
+     * concurrent pool mutators. */
+    stm_pool_clear_replace_claim(s->pool);
     return STM_OK;
 }
 }

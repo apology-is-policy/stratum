@@ -53,6 +53,11 @@ struct stm_pool {
      * OUTER, SYNC INNER — every composite critical section takes
      * pool first. Deadlock-by-reversal is a contract violation. */
     pthread_rwlock_t lock;
+    /* P5-8: replace-in-flight claim. UINT16_MAX = unclaimed; else the
+     * slot id claimed by an in-flight stm_sync_replace_device_online.
+     * Protected by the rwlock above. Non-_locked mutators refuse
+     * STM_EBUSY when their target slot matches the claim. */
+    uint16_t         replace_claim;
 };
 
 /* ========================================================================= */
@@ -285,7 +290,8 @@ stm_status stm_pool_open(const stm_pool_open_opts *opts, stm_pool **out)
     for (size_t i = 0; i < opts->device_count; i++) {
         p->devices[i] = opts->devices[i];
     }
-    p->roster_hash = hash_of_devs(p->devices, p->device_count);
+    p->roster_hash    = hash_of_devs(p->devices, p->device_count);
+    p->replace_claim  = STM_POOL_REPLACE_CLAIM_NONE;
 
     *out = p;
     return STM_OK;
@@ -341,6 +347,67 @@ void stm_pool_lock_exclusive(stm_pool *p) {
 
 void stm_pool_unlock_exclusive(stm_pool *p) {
     if (p) (void)pthread_rwlock_unlock(&p->lock);
+}
+
+/* ========================================================================= */
+/* P5-8: replace-in-flight claim.                                             */
+/* ========================================================================= */
+
+stm_status stm_pool_set_replace_claim_locked(stm_pool *p, uint16_t slot)
+{
+    if (!p) return STM_EINVAL;
+    if ((size_t)slot >= p->device_count) return STM_EINVAL;
+    /* Idempotent on same-slot: if the claim is already held on `slot`,
+     * return OK without changing state. This lets a replace retry
+     * reclaim its own prior partial-state claim cleanly. A claim on
+     * a DIFFERENT slot refuses STM_EBUSY (someone else's replace is
+     * in flight; we cannot start ours). */
+    if (p->replace_claim == slot) return STM_OK;
+    if (p->replace_claim != STM_POOL_REPLACE_CLAIM_NONE) return STM_EBUSY;
+    p->replace_claim = slot;
+    return STM_OK;
+}
+
+stm_status stm_pool_set_replace_claim(stm_pool *p, uint16_t slot)
+{
+    if (!p) return STM_EINVAL;
+    pthread_rwlock_wrlock(&p->lock);
+    stm_status s = stm_pool_set_replace_claim_locked(p, slot);
+    pthread_rwlock_unlock(&p->lock);
+    return s;
+}
+
+void stm_pool_clear_replace_claim_locked(stm_pool *p)
+{
+    if (!p) return;
+    p->replace_claim = STM_POOL_REPLACE_CLAIM_NONE;
+}
+
+void stm_pool_clear_replace_claim(stm_pool *p)
+{
+    if (!p) return;
+    pthread_rwlock_wrlock(&p->lock);
+    p->replace_claim = STM_POOL_REPLACE_CLAIM_NONE;
+    pthread_rwlock_unlock(&p->lock);
+}
+
+uint16_t stm_pool_replace_claim(const stm_pool *p)
+{
+    if (!p) return STM_POOL_REPLACE_CLAIM_NONE;
+    stm_pool *mp = (stm_pool *)p;
+    pthread_rwlock_rdlock(&mp->lock);
+    uint16_t v = mp->replace_claim;
+    pthread_rwlock_unlock(&mp->lock);
+    return v;
+}
+
+/* Internal: returns true iff the public-API mutator on `target_slot`
+ * should refuse with STM_EBUSY due to an active replace claim. Caller
+ * must already hold pool.wrlock (mutators do this). */
+static inline bool claim_blocks(const stm_pool *p, uint16_t target_slot)
+{
+    return p->replace_claim != STM_POOL_REPLACE_CLAIM_NONE &&
+           p->replace_claim == target_slot;
 }
 
 /* ========================================================================= */
@@ -449,6 +516,14 @@ stm_status stm_pool_add_device(stm_pool *p, const stm_pool_device *new_device)
 {
     if (!p) return STM_EINVAL;
     pthread_rwlock_wrlock(&p->lock);
+    /* P5-8: an in-flight replace claims the slot it just added. Until
+     * the replace completes (clears the claim), reject external add too —
+     * the new slot index would collide if the claim's slot is at the
+     * tail. Strict refusal keeps the invariant simple. */
+    if (p->replace_claim != STM_POOL_REPLACE_CLAIM_NONE) {
+        pthread_rwlock_unlock(&p->lock);
+        return STM_EBUSY;
+    }
     stm_status s = stm_pool_add_device_locked(p, new_device);
     pthread_rwlock_unlock(&p->lock);
     return s;
@@ -535,6 +610,10 @@ stm_status stm_pool_remove_device(stm_pool *p, uint16_t device_id,
 {
     if (!p) return STM_EINVAL;
     pthread_rwlock_wrlock(&p->lock);
+    if (claim_blocks(p, device_id)) {
+        pthread_rwlock_unlock(&p->lock);
+        return STM_EBUSY;
+    }
     stm_status s = stm_pool_remove_device_locked(p, device_id, redundancy_floor);
     pthread_rwlock_unlock(&p->lock);
     return s;
@@ -603,6 +682,10 @@ stm_status stm_pool_begin_evacuation(stm_pool *p, uint16_t device_id,
 {
     if (!p) return STM_EINVAL;
     pthread_rwlock_wrlock(&p->lock);
+    if (claim_blocks(p, device_id)) {
+        pthread_rwlock_unlock(&p->lock);
+        return STM_EBUSY;
+    }
     stm_status s = stm_pool_begin_evacuation_locked(p, device_id,
                                                        redundancy_floor);
     pthread_rwlock_unlock(&p->lock);
@@ -652,6 +735,10 @@ stm_status stm_pool_finish_evacuation(stm_pool *p, uint16_t device_id)
 {
     if (!p) return STM_EINVAL;
     pthread_rwlock_wrlock(&p->lock);
+    if (claim_blocks(p, device_id)) {
+        pthread_rwlock_unlock(&p->lock);
+        return STM_EBUSY;
+    }
     stm_status s = stm_pool_finish_evacuation_locked(p, device_id);
     pthread_rwlock_unlock(&p->lock);
     return s;
@@ -687,6 +774,10 @@ stm_status stm_pool_fail_device(stm_pool *p, uint16_t device_id)
 {
     if (!p) return STM_EINVAL;
     pthread_rwlock_wrlock(&p->lock);
+    if (claim_blocks(p, device_id)) {
+        pthread_rwlock_unlock(&p->lock);
+        return STM_EBUSY;
+    }
     stm_status s = stm_pool_fail_device_locked(p, device_id);
     pthread_rwlock_unlock(&p->lock);
     return s;
@@ -715,6 +806,10 @@ stm_status stm_pool_rejoin_device(stm_pool *p, uint16_t device_id)
 {
     if (!p) return STM_EINVAL;
     pthread_rwlock_wrlock(&p->lock);
+    if (claim_blocks(p, device_id)) {
+        pthread_rwlock_unlock(&p->lock);
+        return STM_EBUSY;
+    }
     stm_status s = stm_pool_rejoin_device_locked(p, device_id);
     pthread_rwlock_unlock(&p->lock);
     return s;

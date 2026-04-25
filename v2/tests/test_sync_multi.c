@@ -2196,6 +2196,77 @@ STM_TEST(sync_multi_replace_resumes_after_step3_commit_failure) {
     teardown_mirror_pool(bds, as, pool, s);
 }
 
+/* P5-8 regression: while a replace is in flight (stuck after step-3
+ * failure, holding the new slot at ONLINE in RAM), an external caller
+ * cannot fire begin_evacuation / fail_device / remove_device on the
+ * new slot — it's claimed by the in-flight replace.  Pre-P5-8, R22
+ * P3-3/P3-4 documented these as adversarial wedge scenarios. */
+STM_TEST(sync_multi_replace_claim_blocks_concurrent_mutators) {
+    stm_bdev *bds[NDEV] = {0};
+    stm_alloc *as[NDEV] = {0};
+    stm_pool *pool = NULL; stm_sync *s = NULL;
+    setup_mirror_pool(2, "replace_claim_blocks", bds, as, &pool, &s);
+
+    char path4[256];
+    snprintf(path4, sizeof path4,
+             "/tmp/stm_v2_sync_multi_replace_claim_blocks_%d_3.bin",
+             (int)getpid());
+    unlink(path4);
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    stm_bdev *bd4 = NULL;
+    STM_ASSERT_OK(stm_bdev_open(path4, &bo, &bd4));
+    STM_ASSERT_OK(stm_bdev_resize(bd4, TEST_DEVICE_BYTES));
+    uint64_t uuid4[2] = { 0xa5a5a5ULL, DEV_UUID_HI };
+    stm_alloc *a4 = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bd4, POOL_UUID, uuid4,
+                                      TEST_BOOTSTRAP_BYTES, &a4));
+    stm_pool_device new_dev = {
+        .uuid   = { uuid4[0], uuid4[1] },
+        .role   = STM_DEV_ROLE_DATA, .class_ = STM_DEV_CLASS_SSD,
+        .state  = STM_DEV_STATE_ONLINE, .bdev = bd4,
+    };
+
+    /* Force step-3 commit failure → partial state with claim held on
+     * slot 3 (the newly added slot).  Inject on 2 of 4 post-add
+     * devices so quorum (3) is starved. */
+    stm_bdev_inject_fail_after(bd4, 1);
+    stm_bdev_inject_fail_after(bds[2], 1);
+    uint16_t slot = UINT16_MAX;
+    STM_ASSERT_NE((int)stm_sync_replace_device_online(
+        s, /*old=*/1, &new_dev, a4, /*floor=*/2, &slot), (int)STM_OK);
+
+    /* Confirm: claim is held on slot 3. */
+    STM_ASSERT_EQ((int)stm_pool_replace_claim(pool), 3);
+
+    /* External mutators on slot 3 refuse STM_EBUSY: */
+    STM_ASSERT_ERR(stm_pool_fail_device(pool, 3), STM_EBUSY);
+    STM_ASSERT_ERR(stm_pool_begin_evacuation(pool, 3, /*floor=*/2),
+                     STM_EBUSY);
+    STM_ASSERT_ERR(stm_pool_remove_device(pool, 3, /*floor=*/2),
+                     STM_EBUSY);
+    STM_ASSERT_ERR(stm_pool_finish_evacuation(pool, 3), STM_EBUSY);
+
+    /* Mutators on slot 1 (the OLD device, still ONLINE; not claimed)
+     * are unaffected — but they go through their own state-machine
+     * checks. fail_device(1) succeeds. */
+    STM_ASSERT_OK(stm_pool_fail_device(pool, 1));
+    STM_ASSERT_OK(stm_pool_rejoin_device(pool, 1));
+
+    /* Retry: replaces should clear + re-acquire claim cleanly. */
+    STM_ASSERT_OK(stm_sync_replace_device_online(
+        s, /*old=*/1, &new_dev, a4, /*floor=*/2, &slot));
+    STM_ASSERT_EQ(slot, 3u);
+
+    /* On success the claim is released. */
+    STM_ASSERT_EQ((int)stm_pool_replace_claim(pool),
+                   (int)STM_POOL_REPLACE_CLAIM_NONE);
+
+    stm_alloc_close(a4);
+    stm_bdev_close(bd4);
+    unlink(path4);
+    teardown_mirror_pool(bds, as, pool, s);
+}
+
 /* R22 (P5-7) regression: two consecutive step-3 failures followed by
  * a successful third attempt. Covers the "multi-retry works" claim
  * that the idempotent-commit short-circuits (R7c P2-5 alloc +

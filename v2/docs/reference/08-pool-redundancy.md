@@ -382,6 +382,49 @@ EVACUATING / REMOVED transitions are implemented.
 - [x] `stm_pool_open` refuses non-ONLINE state at slot 0 (R21 / P5-6
       P2-4) — metadata-primary invariant enforced at the construction
       boundary.
+- [x] **Replace-in-flight claim** (P5-8 / closes R22 P3-3 + P3-4):
+      `stm_sync_replace_device_online` claims the new slot atomically
+      with the add (or with resume detection on retry).  While the
+      claim is held, `stm_pool_{add,remove,fail,rejoin}_device` and
+      `stm_pool_{begin,finish}_evacuation` on the claimed slot refuse
+      with `STM_EBUSY`.  `_locked` variants bypass — replace's own
+      internal pool ops can proceed.  Claim is idempotent on same-slot
+      reclaim (lets retry reclaim its own prior partial-state claim);
+      released only on full success of the replace.  Failed replace
+      leaves the claim held so the partial in-RAM state is protected
+      from concurrent mutators across the failure→retry window.
+
+### Replace-in-flight claim API
+
+```c
+#define STM_POOL_REPLACE_CLAIM_NONE   UINT16_MAX
+
+stm_status stm_pool_set_replace_claim       (stm_pool *p, uint16_t slot);
+stm_status stm_pool_set_replace_claim_locked(stm_pool *p, uint16_t slot);
+void       stm_pool_clear_replace_claim       (stm_pool *p);
+void       stm_pool_clear_replace_claim_locked(stm_pool *p);
+uint16_t   stm_pool_replace_claim(const stm_pool *p);   // for tests
+```
+
+Contract:
+
+- **At most one claim** at a time.  `set_claim` on a different slot
+  while a claim is held → `STM_EBUSY`.
+- **Idempotent same-slot**: `set_claim(slot)` when claim is already
+  on `slot` → `STM_OK` (no state change).  This lets a replace retry
+  reclaim its own prior failed-call's claim without coordinating.
+- **Clear is unconditional**: safe to call without the claim held
+  (no-op).  Callers don't need to check before clearing.
+- **Mutator refusal scope**: only the non-`_locked` wrappers
+  consult the claim.  `_locked` variants are caller-controlled
+  internal ops (replace itself uses these to proceed past the
+  claim guard).
+- **`add_device` refusal**: refuses while ANY claim is held (the
+  new slot would land at the tail and could collide).
+
+Lock discipline: `set/clear_locked` require pool.wrlock held by the
+caller.  Public wrappers acquire it internally.  `replace_claim`
+reader takes pool.rdlock.
 - [x] Device-0 guard on every mutator (metadata primary).
 - [ ] **FAULTED → new reconstruct** (P5-4c-β): needs bptr-layer
       block iteration. Deferred to P6 extent manager.

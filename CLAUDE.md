@@ -103,6 +103,21 @@ See `docs/STRATUM.md` §22 "Soundness invariants" for the full list. The load-be
 - **Wedged / read-only containment**: `fs->wedged` and `fs->read_only` are runtime-enforced at every public API entry. New public APIs must call `STM_FS_GUARD_READ` / `STM_FS_GUARD_WRITE`.
 - **Counter clamps at mount**: `ss_gen`, `ss_next_ino`, `ss_next_snap_id` all rejected if near UINT64_MAX; walk-derived raises from on-disk tree contents.
 
+## Technical reference upkeep (v2 only)
+
+The v2 tree carries a comprehensive as-built reference at `v2/docs/REFERENCE.md` (top-level index + maintenance policy) and `v2/docs/reference/00..11.md` (per-subsystem deep dives). Every chunk that lands in v2/ MUST update the relevant reference section in the **same PR / commit** that lands the code.  Concretely:
+
+- **New module / new public API** → add or extend the corresponding `reference/NN-*.md` section.
+- **Change to a documented invariant or contract** → update the section, and (per the spec-first policy above) update the spec FIRST.
+- **New TLA+ spec or buggy config** → update `reference/10-specs.md`'s catalog.
+- **New term / acronym / state name** → add to `reference/11-glossary.md`.
+- **`STM_UB_VERSION` bump or feature-flag change** → update `reference/00-overview.md`'s UB-versioning table.
+- **Snapshot drift** (test count, spec count, tip hash in `REFERENCE.md`) — refresh in the close commit.
+
+The reference is intentionally distinct from `docs/ARCHITECTURE.md` (design intent, including unimplemented work) and `docs/ROADMAP-V2.md` (phased plan): it documents what EXISTS in the tree right now, with `file:line` citations.  When the three disagree, the spec wins, the reference is corrected, and ARCHITECTURE.md gets an issue noted for cross-check.
+
+If a chunk's diff doesn't include a reference-doc update, the reviewer should ask whether it was intentional (e.g., pure bug fix that doesn't change documented surface) or an oversight.
+
 ## Regression testing
 
 - Every audit finding that can be made to fail without the fix should land a regression test. See `tests/test_fs.c::test_fs_sync_two_phase_gen_invariant`, `test_fs_mount_bump_encrypted`, `test_fs_write_gap_is_zeroed*`, `tests/test_snap.c::test_snap_rollback_bumps_gen_encrypted`, `tests/test_p9.c::test_p9_wire_validation`, `test_p9_fid_cache_and_dup` for the pattern.
