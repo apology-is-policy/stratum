@@ -38,7 +38,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: *(pending)* (P5-5-β scope close — repair-from-redundancy
+- **Tip**: `00869ee` (P5-5-β scope close — repair-from-redundancy
   via caller-supplied verify-callback + four-counter classification +
   CallbackSetExclusivity invariant).
 - **Phases**: 1–4 complete; Phase 5 in progress — through P5-5-β
