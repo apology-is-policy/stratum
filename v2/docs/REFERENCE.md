@@ -38,12 +38,14 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `4d3c523` (P5-8 / replace-in-flight claim — closes R22 P3-3+P3-4).
-- **Phases**: 1–4 complete; Phase 5 in progress — through P5-8
-  (replace partial-state protected by per-pool claim; concurrent
-  pool mutators on the new slot refused with STM_EBUSY).
-- **Tests**: 28 suites × (default + ASan + TSan) green. test_sync_multi
-  holds 42 tests; test_pool 47; test_scrub 17.
+- **Tip**: `5468dac` (R23 / P5-8 scope close — atomic-CS resume claim
+  + authorized clear + sync-wrapper claim-check + wedge-on-rollback).
+- **Phases**: 1–4 complete; Phase 5 in progress — through R23
+  (resume-path TOCTOU + sync-wrapper bypass closed; replace
+  partial-state protection now extends across the failed-call →
+  retry window via idempotent-on-same-slot claim).
+- **Tests**: 28 suites × (default + ASan + TSan, serial) green.
+  test_sync_multi 42; test_pool 47; test_scrub 17.
 - **Specs**: 13 TLA+ modules clean + 6 buggy-demo configs fire as expected.
 - **LOC**: ~26 KLOC across 21 src/ modules + 25 public headers.
 
