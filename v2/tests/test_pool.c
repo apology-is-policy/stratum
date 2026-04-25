@@ -1853,9 +1853,24 @@ STM_TEST(pool_replace_claim_blocks_mutators_on_claimed_slot) {
      * claim is always on a slot strictly below the new tail, so an
      * external add at a non-claimed tail succeeds. Earlier strict
      * refusal blocked legitimate concurrent admin ops (e.g., adding
-     * a hot-spare while a replace evacuates a different slot). */
-    stm_pool_device dev3 = dev2;
-    dev3.uuid[0] = 0xfeed;
+     * a hot-spare while a replace evacuates a different slot).
+     *
+     * R25 P3 (test-fixture hygiene): open a fresh bdev for dev3
+     * rather than reusing dev2's. Two pool slots pointing at the
+     * same bdev would silently corrupt data if the test were ever
+     * extended to do I/O on slot 2. */
+    char path3[256];
+    snprintf(path3, sizeof path3, "/tmp/stm_v2_pool_claim_%d_3.bin",
+             (int)getpid());
+    unlink(path3);
+    stm_bdev *d3 = NULL;
+    STM_ASSERT_OK(stm_bdev_open(path3, &bo, &d3));
+    STM_ASSERT_OK(stm_bdev_resize(d3, TEST_DEVICE_BYTES));
+    stm_pool_device dev3 = {
+        .uuid = { 0xfeed, DEVICE_UUID_B[1] },
+        .role = STM_DEV_ROLE_DATA, .class_ = STM_DEV_CLASS_SSD,
+        .state = STM_DEV_STATE_ONLINE, .bdev = d3,
+    };
     STM_ASSERT_OK(stm_pool_add_device(p, &dev3));
     STM_ASSERT_EQ(stm_pool_device_count(p), 3u);
     /* Claim still held on slot 1; the new device landed at slot 2. */
@@ -1896,8 +1911,10 @@ STM_TEST(pool_replace_claim_blocks_mutators_on_claimed_slot) {
     stm_pool_close(p);
     stm_bdev_close(d);
     stm_bdev_close(d2);
+    stm_bdev_close(d3);
     unlink(g_tmp_path);
     unlink(path2);
+    unlink(path3);
 }
 
 /* The _locked variants bypass the claim check — replace's own internal

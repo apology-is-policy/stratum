@@ -130,6 +130,7 @@ closed items.
 | R22 | P5-7 scope (replace resume from ADDED-ONLINE). | `e5fe085` |
 | R23 | P5-8 scope (replace-in-flight claim + atomic resume). | `5468dac` |
 | R24 | P5-5-β scope (scrub repair via cb). | `52503fe` |
+| R25 | Backlog hygiene (R23 P3-2 + R20 P3-2/P3-3). | *(pending)* |
 
 ## Policy terms
 

@@ -1179,7 +1179,18 @@ static void *scrub_thread_fn(void *arg)
             (void)stm_scrub_step(c->sc);
             atomic_fetch_add(&c->step_count, 1);
         }
-        /* PAUSED would be unusual here (we don't pause); fall through. */
+        /* PAUSED would be unusual here (we don't pause); fall through.
+         *
+         * R25 P3 (portability hardening): yield briefly between scrub
+         * iterations so the mutator gets a wrlock window even on
+         * platforms where pool's rwlock isn't writer-preferring.
+         * Linux uses PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP
+         * (pool.c:274-280) so writers preempt new readers, but macOS
+         * falls back to the default rwlock attribute (`pool.c:281-283`)
+         * which is reader-favoring. A 1µs sleep is enough to release
+         * scrub's tight reacquire loop without bloating the test. */
+        struct timespec yield_ts = { 0, 1000L };  /* 1µs */
+        nanosleep(&yield_ts, NULL);
     }
     return NULL;
 }

@@ -336,7 +336,7 @@ atomically so add / attach / commit / detach composes in one step.
 |---|---|---|
 | `test_sb` | 18 | Encode / decode roundtrip; csum tamper rejected; magic tamper → STM_ENOENT; version tamper → STM_EBADVERSION; zero-gen rejected; label offsets; label_read / label_write; mount_scan picks highest valid. |
 | `test_sync` | 19 | Single-device commit + remount; MountGenBump; alloc-root tree encoded under correct key; version boundary refusals. |
-| `test_sync_multi` | 36 | 3-device quorum roundtrip; 1-of-3 device loss tolerated; sub-quorum refused (STM_EQUORUM); orphan-ahead-of-quorum ignored; content-quorum tested; alloc-roots indirection; v5/v6 version refusals; mirror(2) + mirror(3) roundtrips + tampered-replica fallback; reserve refuses NONE profile; attach_alloc arg validation; RO pool refuses write ops; wedge refusal; keyschema idempotent commit produces byte-identical UBs. |
+| `test_sync_multi` | 42 | 3-device quorum roundtrip; 1-of-3 device loss tolerated; sub-quorum refused (STM_EQUORUM); orphan-ahead-of-quorum ignored; content-quorum tested; alloc-roots indirection; v5/v6 version refusals; mirror(2) + mirror(3) roundtrips + tampered-replica fallback; reserve refuses NONE profile; attach_alloc arg validation; RO pool refuses write ops; wedge refusal; keyschema idempotent commit produces byte-identical UBs; replace_device_online resume from step-3 commit failure; same-uuid-different-alloc refused; slot-0 spoofing refused; multi-retry converges; **commit succeeds with one FAULTED device** (R21 P1); replace-claim blocks concurrent mutators on the claimed slot via sync-wrapper bypass-closed (R23 P3-4). |
 
 ## Status
 
