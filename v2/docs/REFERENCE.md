@@ -38,11 +38,10 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `cd6cb04` (R25 / backlog hygiene scope close — R23 P3-2
-  add_device refusal tightened to collision-only; R20 P3-2 + P3-3
-  closed via direct alloc-cursor unit tests + concurrent scrub
-  TSan stress test; R25 closed clean at 0 P0 / 0 P1 / 0 P2 / 3 P3,
-  all addressed).
+- **Tip**: `fd2ef4a` (R25 / backlog hygiene scope close + ROADMAP
+  §8.6 deferral persistence — backlog empty; deferrals indexed at
+  ROADMAP §8.6 with P6 (§9.6) + post-v2.0 (§14) carry-over
+  pointers).
 - **Phases**: 1–4 complete; Phase 5 in progress — through R24 +
   backlog hygiene (P5-5-β audited clean; deferred items cleared
   for the path to γ).
