@@ -129,7 +129,7 @@ closed items.
 | R21 | P5-6 full-phase audit. | `3edeb69` |
 | R22 | P5-7 scope (replace resume from ADDED-ONLINE). | `e5fe085` |
 | R23 | P5-8 scope (replace-in-flight claim + atomic resume). | `5468dac` |
-| R24 | P5-5-β scope (scrub repair via cb). | *(pending)* |
+| R24 | P5-5-β scope (scrub repair via cb). | `52503fe` |
 
 ## Policy terms
 

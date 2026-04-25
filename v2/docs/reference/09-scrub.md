@@ -439,7 +439,7 @@ All green on default + ASan + TSan.
 - [x] **β: scrub_beta.cfg** — fixed-impl spec config exercising
       all three cb outcomes. 19 states / depth 8, clean.
 
-### R24 audit posture (closed 2026-04-25 @ *(pending)*)
+### R24 audit posture (closed 2026-04-25 @ `52503fe`)
 
 R24 scoped audit on the P5-5-β commit `00869ee`. 0 P0 / 0 P1 / 2 P2 /
 4 P3. β impl + spec sound; both P2s were doc-vs-code drift in
