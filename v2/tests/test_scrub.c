@@ -1255,6 +1255,114 @@ STM_TEST(scrub_durable_resumes_after_reopen) {
     unlink(g_path);
 }
 
+/* R26 P1-1 regression: a β scrub spans a reboot. After reopen, the
+ * cb is lost (cb is in-RAM only; not persisted). The relaxed
+ * set_verify_cb guard allows reinstallation in RUNNING/PAUSED for
+ * this exact case. The step-without-cb safety net refuses if the
+ * caller forgets to reinstall. */
+static stm_scrub_verify_outcome stub_cb_repaired_only(uint64_t paddr, void *vctx)
+{
+    (void)paddr;
+    uint64_t *count = (uint64_t *)vctx;
+    if (count) (*count)++;
+    return STM_SCRUB_VERIFY_REPAIRED;
+}
+
+STM_TEST(scrub_durable_resumes_beta_run_after_reopen) {
+    make_path("durable_beta");
+    stm_bdev *bd1 = open_device();
+    stm_pool *pool1 = make_single_pool(bd1, DEVICE_UUID);
+
+    stm_alloc *a1 = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bd1, POOL_UUID, DEVICE_UUID,
+                                     TEST_BOOTSTRAP_BYTES, &a1));
+    stm_sync *s1 = NULL;
+    STM_ASSERT_OK(stm_sync_create(pool1, a1, make_wk(), NULL, &s1));
+
+    /* Reserve 6 blocks across 2 ranges. */
+    uint64_t p1 = 0, p2 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a1, 4u, 0, &p1));
+    STM_ASSERT_OK(stm_alloc_reserve(a1, 2u, 0, &p2));
+    STM_ASSERT_OK(stm_sync_commit(s1));
+
+    /* β-mode: install cb (returns REPAIRED), step once. */
+    uint64_t cb_calls_pre = 0;
+    stm_scrub *sc1 = NULL;
+    STM_ASSERT_OK(stm_scrub_create(s1, &sc1));
+    STM_ASSERT_OK(stm_scrub_set_verify_cb(sc1, stub_cb_repaired_only,
+                                            &cb_calls_pre));
+    STM_ASSERT_OK(stm_scrub_start(sc1));
+    STM_ASSERT_OK(stm_scrub_step(sc1));   /* processes range p1 = 4 blocks */
+
+    stm_scrub_status st_pre;
+    STM_ASSERT_OK(stm_scrub_status_get(sc1, &st_pre));
+    STM_ASSERT_EQ((int)st_pre.state,        (int)STM_SCRUB_STATE_RUNNING);
+    STM_ASSERT_EQ(st_pre.blocks_repaired,    4u);
+    STM_ASSERT_EQ(st_pre.blocks_failed,      0u);
+
+    /* Persist + tear everything down. */
+    STM_ASSERT_OK(stm_sync_commit(s1));
+    stm_scrub_close(sc1);
+    stm_sync_close(s1);
+    stm_alloc_close(a1);
+    stm_pool_close(pool1);
+    stm_bdev_close(bd1);
+
+    /* Reopen. */
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    stm_bdev *bd2 = NULL;
+    STM_ASSERT_OK(stm_bdev_open(g_path, &bo, &bd2));
+    stm_pool *pool2 = make_single_pool(bd2, DEVICE_UUID);
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(bd2, &a2));
+    stm_sync *s2 = NULL;
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
+
+    stm_scrub *sc2 = NULL;
+    STM_ASSERT_OK(stm_scrub_create(s2, &sc2));
+
+    /* β counters are restored; cb is NULL. */
+    stm_scrub_status st_post;
+    STM_ASSERT_OK(stm_scrub_status_get(sc2, &st_post));
+    STM_ASSERT_EQ((int)st_post.state,        (int)STM_SCRUB_STATE_RUNNING);
+    STM_ASSERT_EQ(st_post.blocks_repaired,    4u);
+    STM_ASSERT_EQ(st_post.blocks_failed,      0u);
+
+    /* Step WITHOUT a cb is refused — the safety net for the
+     * γ-restore-without-cb case. */
+    STM_ASSERT_ERR(stm_scrub_step(sc2), STM_EINVAL);
+
+    /* Reinstall cb in RUNNING — the relaxed set_verify_cb guard
+     * accepts this for the β-resume case. */
+    uint64_t cb_calls_post = 0;
+    STM_ASSERT_OK(stm_scrub_set_verify_cb(sc2, stub_cb_repaired_only,
+                                            &cb_calls_post));
+
+    /* Drive to completion. Process p2's 2 blocks via cb → repaired+=2. */
+    for (int i = 0; i < 10; i++) {
+        stm_scrub_status st;
+        STM_ASSERT_OK(stm_scrub_status_get(sc2, &st));
+        if (st.state == STM_SCRUB_STATE_COMPLETED) break;
+        STM_ASSERT_OK(stm_scrub_step(sc2));
+    }
+
+    stm_scrub_status st_done;
+    STM_ASSERT_OK(stm_scrub_status_get(sc2, &st_done));
+    STM_ASSERT_EQ((int)st_done.state,        (int)STM_SCRUB_STATE_COMPLETED);
+    STM_ASSERT_EQ(st_done.blocks_repaired,    6u);   /* 4 + 2 across mounts */
+    /* CallbackSetExclusivity: failed stayed 0 throughout the β run. */
+    STM_ASSERT_EQ(st_done.blocks_failed,      0u);
+    STM_ASSERT_EQ(st_done.blocks_unrepairable, 0u);
+    STM_ASSERT_EQ(cb_calls_post,              2u);   /* only the post-reopen cb */
+
+    stm_scrub_close(sc2);
+    stm_sync_close(s2);
+    stm_alloc_close(a2);
+    stm_pool_close(pool2);
+    stm_bdev_close(bd2);
+    unlink(g_path);
+}
+
 /* Regression: a fresh pool's first sync_create + scrub_create gives
  * an IDLE state with all counters zero. Without this, a stale UB
  * region of nonzero bytes could erroneously trigger restore-from-

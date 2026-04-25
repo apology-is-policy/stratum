@@ -254,6 +254,12 @@ stm_status stm_scrub_create(stm_sync *sync, stm_scrub **out_scrub);
  * from another thread; caller must ensure no other thread is using
  * `sc` at close time (the handle has an internal mutex but destroying
  * a locked mutex is UB per POSIX — same contract as stm_sync_close).
+ *
+ * Lifetime ordering (R26 P3-4): the underlying `stm_sync` passed at
+ * `stm_scrub_create` is borrowed and outlives this handle. Caller
+ * MUST close scrub BEFORE closing the underlying sync handle.
+ * Calling any `stm_scrub_*` op after the underlying sync has been
+ * closed is undefined behavior (sc->sync would be dangling).
  */
 void stm_scrub_close(stm_scrub *sc);
 
@@ -309,7 +315,11 @@ stm_status stm_scrub_reset(stm_scrub *sc);
  *   STM_OK        — step completed (or state was not RUNNING).
  *   STM_ECORRUPT  — alloc tree had malformed entries (underlying
  *                    stm_alloc_first_allocated_from failed).
- *   STM_EINVAL    — NULL arg.
+ *   STM_EINVAL    — NULL arg, OR (R26 P1-1) state ∈ {RUNNING, PAUSED}
+ *                    with β counters > 0 but no cb installed (the
+ *                    γ-restore-without-cb case; caller must
+ *                    reinstall the cb via `stm_scrub_set_verify_cb`
+ *                    before stepping).
  *
  * Read errors on individual blocks do NOT short-circuit the step:
  * scrub continues past corrupt blocks per ARCH §7.16.1 ("Scrub
@@ -331,16 +341,31 @@ stm_status stm_scrub_status_get(const stm_scrub *sc, stm_scrub_status *out);
  * must keep it valid for the cb's lifetime — see the file header
  * "Borrowed references" + "Callback contract" sections.
  *
- * Valid states: IDLE | COMPLETED. The cb mode (set vs unset) is
- * frozen for the duration of a run (Start → ... → Complete) so the
- * spec's `CallbackSetExclusivity` invariant — α-mode keeps
+ * Mode-tear protection: the cb mode (set vs unset) is frozen for
+ * the duration of a run (Start → ... → Complete) so the spec's
+ * `CallbackSetExclusivity` invariant — α-mode keeps
  * `repaired`/`unrepairable` at 0; β-mode keeps `failed` at 0 — holds
  * across the whole run rather than getting torn between α and β
- * counters. Callers should install the cb BEFORE the first
- * `stm_scrub_start`, or between `_reset` and the next `_start` (or
- * between two `_start` calls separated by a `Restart`).
+ * counters.
  *
- * Refuses RUNNING / PAUSED with STM_EINVAL.
+ * Valid in IDLE | COMPLETED unconditionally (any cb value).
+ *
+ * In RUNNING | PAUSED, the install is permitted ONLY when:
+ *   - the new cb is non-NULL (clearing in mid-run is refused), AND
+ *   - no cb is currently installed (`verify_cb == NULL`), AND
+ *   - α has not committed to its mode yet (`blocks_failed == 0`).
+ * That window covers two cases:
+ *   - Pre-step in a fresh RUNNING run (all counters zero; the
+ *     install determines mode going forward).
+ *   - β-resume after γ-reopen: scrub_create restores β counters
+ *     from durable, but the cb is in-RAM only and is lost across
+ *     mount; reinstalling the cb in RUNNING/PAUSED is the right
+ *     thing (R26 P1-1 fix).
+ *
+ * All other shapes in RUNNING/PAUSED return STM_EINVAL: cb=NULL
+ * (would tear an active β run into α via the next step),
+ * cb-replace (mode change mid-β), and install over an α-committed
+ * run (would mix α `failed` with β counters).
  *
  * Returns STM_EINVAL on NULL sc, or on the suspicious shape
  * `cb=NULL,ctx!=NULL` (cb=non-NULL,ctx=NULL is allowed — stateless

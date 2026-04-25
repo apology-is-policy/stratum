@@ -387,7 +387,7 @@ SPEC-TO-CODE:
 
 ## Tests
 
-`tests/test_scrub.c` (29 tests):
+`tests/test_scrub.c` (30 tests):
 
 - Lifecycle: `scrub_create_initial_state_is_idle`,
   `scrub_create_rejects_null_args`, `scrub_status_get_rejects_null_args`.
@@ -456,6 +456,49 @@ All green on default + ASan + TSan.
       UNREPAIRABLE / OK outcomes. CallbackSetExclusivity holds.
 - [x] **β: scrub_beta.cfg** — fixed-impl spec config exercising
       all three cb outcomes. 19 states / depth 8, clean.
+
+### R26 audit posture (closed 2026-04-25 @ *(pending)*)
+
+R26 scoped audit on the P5-durable-cursors close `caf99e6`. 0 P0 /
+1 P1 / 3 P2 / 5 P3. P1 was a real spec-impl gap (β + γ-reopen
+breaks `CallbackSetExclusivity`); fixed in the close commit.
+
+- [x] **P1-1 fixed**: relaxed `stm_scrub_set_verify_cb` guard
+      to allow non-NULL cb installation in RUNNING/PAUSED when the
+      handle has no current cb AND no α-committed `blocks_failed`.
+      Covers β-resume-after-γ-reopen (cb is in-RAM only and is
+      lost across mount; reinstalling is the right thing).
+      Safety net: `stm_scrub_step` returns STM_EINVAL when state
+      ∈ {RUNNING, PAUSED} ∧ β counters > 0 ∧ no cb (caller forgot
+      to reinstall). New regression test
+      `scrub_durable_resumes_beta_run_after_reopen` exercises the
+      full flow.
+- [x] **P2-1 fixed**: `stm_scrub_create`'s out-of-range state
+      clamp now zeros all counters + cursor along with the IDLE
+      fallback (preserves IdleMeansZero invariant under hostile
+      post-csum corruption).
+- [x] **P2-2 fixed**: new `pool_mount_refuses_v7_ub_with_bad_version`
+      test pattern-matches the existing v4/v5/v6 refusal tests.
+- [~] **P2-3** (replace × concurrent scrub byte-identity)
+      documented as known caveat in commit message + scrub.h /
+      sync.h + phase5-status row. Admin-side serialization is the
+      MVP mitigation; option 3 (pre-staged scrub-durable snapshot
+      across retries) is post-v2.0 work.
+- [x] **P3-1 fixed**: prominent comment in scrub.h about
+      `snapshot_cursor` being a future-proofed field; impl
+      doesn't track it (PauseResumeIdempotent is structurally
+      enforced by Resume not zeroing the cursor).
+- [x] **P3-2 fixed**: new `scrub_beta_durable.cfg` exercises β +
+      γ combination at the spec level (CallbackSet=TRUE,
+      WithCrash=TRUE). Confirms no exclusivity tear at the spec
+      level.
+- [ ] **P3-3** (push-on-step performance overhead): deferred to
+      post-v2.0; performance hygiene only, no correctness concern.
+- [x] **P3-4 fixed**: `stm_scrub_close` docstring now states
+      caller MUST close scrub before sync.
+- [x] **P3-5 fixed**: `scrub_durable.cfg` comment updated to use
+      actual invariant name `CrashedMeansInRamFresh` (was
+      referencing a never-landed `DurableMonotonicAcrossCrash`).
 
 ### R24 audit posture (closed 2026-04-25 @ `52503fe`)
 

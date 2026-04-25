@@ -148,23 +148,34 @@ stm_status stm_scrub_create(stm_sync *sync, stm_scrub **out_scrub)
     /* Clamp the on-disk state byte against the enum range — defensive
      * against a corrupt or future-extended UB that carries a state
      * value we don't recognize. Out-of-range states fall back to
-     * IDLE (the safe default; caller can stm_scrub_start to begin
-     * a fresh run). */
+     * IDLE WITH ZEROED COUNTERS to honor IdleMeansZero (R26 P2-1
+     * fix: previously the clamp left counters/cursor at the
+     * unpacked values, leaving in-RAM at IDLE+nonzero-counters
+     * which violates the spec invariant). The safe default keeps
+     * the handle in a coherent IDLE state; caller can stm_scrub_
+     * start to begin a fresh run. */
     if (st.scrub_state == STM_SCRUB_STATE_IDLE      ||
         st.scrub_state == STM_SCRUB_STATE_RUNNING   ||
         st.scrub_state == STM_SCRUB_STATE_PAUSED    ||
         st.scrub_state == STM_SCRUB_STATE_COMPLETED) {
         sc->state = (stm_scrub_state)st.scrub_state;
+        sc->cursor_device_id    = st.cursor_device_id;
+        sc->cursor_start_block  = st.cursor_start_block;
+        sc->blocks_verified     = st.blocks_verified;
+        sc->blocks_failed       = st.blocks_failed;
+        sc->blocks_repaired     = st.blocks_repaired;
+        sc->blocks_unrepairable = st.blocks_unrepairable;
+        sc->ranges_processed    = st.ranges_processed;
     } else {
-        sc->state = STM_SCRUB_STATE_IDLE;
+        sc->state               = STM_SCRUB_STATE_IDLE;
+        sc->cursor_device_id    = 0;
+        sc->cursor_start_block  = 0;
+        sc->blocks_verified     = 0;
+        sc->blocks_failed       = 0;
+        sc->blocks_repaired     = 0;
+        sc->blocks_unrepairable = 0;
+        sc->ranges_processed    = 0;
     }
-    sc->cursor_device_id    = st.cursor_device_id;
-    sc->cursor_start_block  = st.cursor_start_block;
-    sc->blocks_verified     = st.blocks_verified;
-    sc->blocks_failed       = st.blocks_failed;
-    sc->blocks_repaired     = st.blocks_repaired;
-    sc->blocks_unrepairable = st.blocks_unrepairable;
-    sc->ranges_processed    = st.ranges_processed;
 
     *out_scrub = sc;
     return STM_OK;
@@ -277,16 +288,43 @@ stm_status stm_scrub_set_verify_cb(stm_scrub          *sc,
 
     pthread_mutex_lock(&sc->lock);
 
-    /* Self-audit P1: cb mode (set vs unset) must be frozen across a
-     * run so spec's CallbackSetExclusivity holds end-to-end. Otherwise
-     * a mid-run cb-clear would bump `failed` (α) on top of `repaired`/
-     * `unrepairable` (β) already accumulated, violating the per-mode
-     * counter exclusivity. Confine cb installation to IDLE |
-     * COMPLETED. */
-    if (sc->state != STM_SCRUB_STATE_IDLE &&
-        sc->state != STM_SCRUB_STATE_COMPLETED) {
-        pthread_mutex_unlock(&sc->lock);
-        return STM_EINVAL;
+    /* Self-audit P1 (β + γ-reopen → R26 P1-1 refinement): cb mode
+     * (set vs unset) is frozen for the duration of a run so spec's
+     * CallbackSetExclusivity holds end-to-end. The original guard
+     * confined cb installation to IDLE | COMPLETED only — but that
+     * over-rejected the legitimate β-resume-after-reopen case
+     * (γ restores β counters but cb is in-RAM only and is lost
+     * across mount; reinstalling the cb in RUNNING/PAUSED is
+     * actually the right thing).
+     *
+     * Refined guard: in RUNNING/PAUSED, allow the install of a
+     * non-NULL cb only when the current handle has no cb installed
+     * AND has not yet committed to α-mode (no `blocks_failed`).
+     * That covers:
+     *   - β-resume-after-reopen: counters restored from γ may have
+     *     repaired/unrepairable > 0; cb was lost and is being
+     *     reinstalled — same mode, no exclusivity tear.
+     *   - Pre-step in a fresh RUNNING run: all counters zero; cb
+     *     install determines the mode going forward.
+     * Refuses still:
+     *   - cb-clear in RUNNING/PAUSED (would tear an active β run
+     *     into α via the next step).
+     *   - cb-install over an existing cb in RUNNING/PAUSED (mode
+     *     change mid-β).
+     *   - cb-install when α has accumulated `blocks_failed > 0`
+     *     (would mix α `failed` with β `repaired`/`unrepairable`
+     *     in the same run).
+     * IDLE / COMPLETED still allow any combination (clear or install). */
+    if (sc->state == STM_SCRUB_STATE_RUNNING ||
+        sc->state == STM_SCRUB_STATE_PAUSED) {
+        bool installing_cb = (cb != NULL);
+        bool already_have_cb = (sc->verify_cb != NULL);
+        bool alpha_committed = (sc->blocks_failed > 0);
+        bool ok = installing_cb && !already_have_cb && !alpha_committed;
+        if (!ok) {
+            pthread_mutex_unlock(&sc->lock);
+            return STM_EINVAL;
+        }
     }
 
     sc->verify_cb  = cb;
@@ -376,6 +414,20 @@ stm_status stm_scrub_step(stm_scrub *sc)
     if (sc->state != STM_SCRUB_STATE_RUNNING) {
         pthread_mutex_unlock(&sc->lock);
         return STM_OK;
+    }
+
+    /* R26 P1-1 safety net: a γ-restored β run has β counters > 0
+     * but cb is NULL (cb is in-RAM only and not persisted). Step
+     * without a cb would fall back to the α path and bump
+     * `blocks_failed`, mixing α and β counters and violating
+     * spec's CallbackSetExclusivity. Refuse the step; caller must
+     * reinstall the cb (the relaxed set_verify_cb guard above
+     * permits this in RUNNING/PAUSED for the β-restore case)
+     * before stepping. */
+    if (sc->verify_cb == NULL &&
+        (sc->blocks_repaired > 0 || sc->blocks_unrepairable > 0)) {
+        pthread_mutex_unlock(&sc->lock);
+        return STM_EINVAL;
     }
 
     /* Lock discipline (POOL OUTER, SYNC INNER):

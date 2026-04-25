@@ -317,6 +317,14 @@ actions on top of α. Verifies `CrashedMeansInRamFresh`,
 `DurableProcessedCount`, `DurableCallbackSetExclusivity` end-to-
 end across crash boundaries.
 
+**Fixed-β+γ config (`scrub_beta_durable.cfg`, `CallbackSet=TRUE`,
+`WithCrash=TRUE`)** — added in R26 P3-2 close: cross-product of β
+cb-mode and γ crash-recovery. Universe: `CorruptBlocks={2,3}`,
+`RepairableBlocks={2}`, `WithCrash=TRUE`. Confirms no exclusivity
+tear AT THE SPEC LEVEL across β + crash + mount. The C-level
+β-resume-without-cb gap (cb is in-RAM only, lost across mount) is
+closed by the relaxed `stm_scrub_set_verify_cb` guard (R26 P1-1).
+
 Buggy-α config (`scrub_buggy.cfg`, `BuggyResume = TRUE`,
 `CallbackSet=FALSE`, `WithCrash=FALSE`): `PauseResumeIdempotent`
 violated at State 5 with 5-step trace
@@ -354,6 +362,9 @@ echo "== scrub (β) ==" && \
 echo "== scrub (γ durable) ==" && \
   java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
       -config scrub_durable.cfg scrub.tla 2>&1 | tail -3
+echo "== scrub (β+γ) ==" && \
+  java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
+      -config scrub_beta_durable.cfg scrub.tla 2>&1 | tail -3
 
 # Buggy-config sanity (each must VIOLATE as expected):
 for cfg in quorum_buggy metadata_nonce_buggy device_lifecycle_buggy \

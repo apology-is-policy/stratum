@@ -613,6 +613,10 @@ static void mutate_version_to_6(stm_uberblock *ub) {
     ub->ub_version = stm_store_le32(6u);
 }
 
+static void mutate_version_to_7(stm_uberblock *ub) {
+    ub->ub_version = stm_store_le32(7u);
+}
+
 static void mutate_device_count_to_0(stm_uberblock *ub) {
     ub->ub_device_count = stm_store_le16(0);
 }
@@ -685,6 +689,31 @@ STM_TEST(pool_mount_refuses_v6_ub_with_bad_version) {
     make_keyfile(kf);
 
     format_and_tamper_live_ub(kf, mutate_version_to_6);
+
+    stm_fs_mount_opts mopts;
+    memset(&mopts, 0, sizeof mopts);
+    mopts.keyfile_path = kf;
+    stm_fs *fs = NULL;
+    STM_ASSERT_ERR(stm_fs_mount(g_tmp_path, &mopts, &fs), STM_EBADVERSION);
+    STM_ASSERT(fs == NULL);
+
+    unlink(g_tmp_path);
+    unlink(kf);
+}
+
+/* R26 P2-2: P5-durable-cursors bumped STM_UB_VERSION 7 → 8. v7 pools
+ * must be refused at mount under v8 binary. Pattern matches v4/v5/v6
+ * refusal tests; impl rejects all non-STM_UB_VERSION uniformly via
+ * `if (version != STM_UB_VERSION) return STM_EBADVERSION` at
+ * uberblock.c:67. */
+STM_TEST(pool_mount_refuses_v7_ub_with_bad_version) {
+    make_tmp("v7_ub");
+    char kf[256];
+    snprintf(kf, sizeof kf, "/tmp/stm_v2_pool_v7_kf_%d.bin", (int)getpid());
+    unlink(kf);
+    make_keyfile(kf);
+
+    format_and_tamper_live_ub(kf, mutate_version_to_7);
 
     stm_fs_mount_opts mopts;
     memset(&mopts, 0, sizeof mopts);
