@@ -545,28 +545,85 @@ stm_status stm_pool_rejoin_device_locked(stm_pool *p, uint16_t device_id);
 
 #define STM_POOL_REPLACE_CLAIM_NONE   UINT16_MAX
 
-/* Set the replace-in-flight claim to `slot`.  IDEMPOTENT on same-slot:
- * returns STM_OK if a claim is already held on `slot` (lets replace
- * retries reclaim their own prior partial-state claim cleanly).
- * Returns STM_EBUSY if a claim is held on a DIFFERENT slot (someone
- * else's replace is in flight).  Returns STM_EINVAL if slot is out of
- * roster range.  _locked variant requires caller to hold pool.wrlock;
- * public wrapper acquires it internally.                                  */
+/* Set the replace-in-flight claim to `slot`.
+ *
+ * Returns STM_OK if no claim was held (newly set) or if the claim was
+ * already held on `slot` (idempotent same-slot reclaim — lets a
+ * replace retry reacquire its own prior partial-state claim cleanly).
+ *
+ * Returns STM_EBUSY if a claim is held on a DIFFERENT slot (another
+ * replace is in flight).  Returns STM_EINVAL if slot is out of roster
+ * range.  _locked variant requires caller to hold pool.wrlock; public
+ * wrapper acquires it internally.
+ *
+ * IMPORTANT (R23 doc-fix): mechanical idempotency only.  Two distinct
+ * replace attempts that happen to converge on the same slot will both
+ * see STM_OK from set_claim — caller-side serialization (one replace-
+ * in-flight per old_device at the admin layer) is still required to
+ * prevent overlapping replace operations.                              */
 STM_MUST_USE
 stm_status stm_pool_set_replace_claim       (stm_pool *p, uint16_t slot);
 STM_MUST_USE
 stm_status stm_pool_set_replace_claim_locked(stm_pool *p, uint16_t slot);
 
-/* Clear the replace-in-flight claim.  No-op if no claim is held; does NOT
- * validate that the caller is the holder (callers are expected to pair
- * set/clear correctly).  _locked variant requires pool.wrlock; public
- * wrapper acquires it internally.                                          */
-void stm_pool_clear_replace_claim       (stm_pool *p);
-void stm_pool_clear_replace_claim_locked(stm_pool *p);
+/* Clear the replace-in-flight claim, but ONLY if the current claim
+ * matches `expected_slot` (R23 P2-2: authorization).
+ *
+ * If the claim is on `expected_slot`: cleared, returns STM_OK.
+ * If the claim is on a DIFFERENT slot: no-op, returns STM_EBUSY (some
+ * other in-flight replace owns the claim; we must not clear it).
+ * If no claim is held: no-op, returns STM_OK (idempotent; safe to
+ * call from cleanup paths that don't track whether the claim was set).
+ * Returns STM_EINVAL if `expected_slot` is `STM_POOL_REPLACE_CLAIM_NONE`
+ * or out of roster range.
+ *
+ * Pass the slot the caller's own replace originally claimed.  Random
+ * callers that don't know the right slot get STM_EBUSY (harmless).
+ * _locked variant requires pool.wrlock; public wrapper acquires it
+ * internally.                                                           */
+STM_MUST_USE
+stm_status stm_pool_clear_replace_claim       (stm_pool *p, uint16_t expected_slot);
+STM_MUST_USE
+stm_status stm_pool_clear_replace_claim_locked(stm_pool *p, uint16_t expected_slot);
 
 /* Inspect the current claim (returns STM_POOL_REPLACE_CLAIM_NONE if
  * unclaimed).  Primarily for tests.  Reads under pool.rdlock internally. */
 uint16_t stm_pool_replace_claim(const stm_pool *p);
+
+/* _locked variant: caller already holds pool.rdlock or pool.wrlock.
+ * Used by sync's safe-removal wrappers to consult the claim under
+ * their own composite (pool.wrlock + sync.lock) without recursive
+ * rdlock-after-wrlock UB. */
+uint16_t stm_pool_replace_claim_locked(const stm_pool *p);
+
+/* R23 P1-1: claim a resume slot atomically with the UUID lookup.  Used
+ * by stm_sync_replace_device_online's ADDED-ONLINE-resume path to
+ * close the TOCTOU window where concurrent stm_sync_remove_device(S)
+ * could land between the resume's UUID scan and its set_claim,
+ * wedging the retry.
+ *
+ * Walks the roster for an ONLINE slot whose uuid equals `target_uuid`,
+ * sets the claim on that slot, and returns the slot in `*out_slot` —
+ * all under one pool.wrlock critical section.  The slot's other
+ * properties (alloc attachment, alloc.device_id consistency) are NOT
+ * checked here — caller validates after taking the claim.
+ *
+ * Returns:
+ *   STM_OK           — slot found at ONLINE, claim acquired,
+ *                       *out_slot populated.
+ *   STM_ENOENT       — no roster slot matches target_uuid at any state.
+ *   STM_EINVAL       — UUID matches a NON-ONLINE slot (REMOVED tombstone
+ *                       / EVACUATING / FAULTED), OR matches slot 0
+ *                       (metadata primary refusal).
+ *   STM_EBUSY        — claim already held on a different slot.
+ *
+ * Caller must hold pool.wrlock; this is a `_locked` API.  No public
+ * (auto-locking) wrapper exists — the only sensible caller is sync's
+ * resume path, which takes its own composite lock.                    */
+STM_MUST_USE
+stm_status stm_pool_claim_resume_slot_locked(stm_pool *p,
+                                                 const uint64_t target_uuid[2],
+                                                 uint16_t *out_slot);
 
 #ifdef __cplusplus
 }

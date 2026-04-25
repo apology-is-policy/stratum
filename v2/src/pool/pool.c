@@ -377,18 +377,74 @@ stm_status stm_pool_set_replace_claim(stm_pool *p, uint16_t slot)
     return s;
 }
 
-void stm_pool_clear_replace_claim_locked(stm_pool *p)
+stm_status stm_pool_clear_replace_claim_locked(stm_pool *p, uint16_t expected_slot)
 {
-    if (!p) return;
+    if (!p) return STM_EINVAL;
+    if (expected_slot == STM_POOL_REPLACE_CLAIM_NONE) return STM_EINVAL;
+    if ((size_t)expected_slot >= p->device_count) return STM_EINVAL;
+    /* No claim held → idempotent OK so cleanup paths can call
+     * unconditionally without tracking whether they set the claim. */
+    if (p->replace_claim == STM_POOL_REPLACE_CLAIM_NONE) return STM_OK;
+    /* Claim held on a different slot → caller does not own this claim;
+     * refuse to clear (R23 P2-2 authorization). */
+    if (p->replace_claim != expected_slot) return STM_EBUSY;
     p->replace_claim = STM_POOL_REPLACE_CLAIM_NONE;
+    return STM_OK;
 }
 
-void stm_pool_clear_replace_claim(stm_pool *p)
+stm_status stm_pool_clear_replace_claim(stm_pool *p, uint16_t expected_slot)
 {
-    if (!p) return;
+    if (!p) return STM_EINVAL;
     pthread_rwlock_wrlock(&p->lock);
-    p->replace_claim = STM_POOL_REPLACE_CLAIM_NONE;
+    stm_status s = stm_pool_clear_replace_claim_locked(p, expected_slot);
     pthread_rwlock_unlock(&p->lock);
+    return s;
+}
+
+stm_status stm_pool_claim_resume_slot_locked(stm_pool *p,
+                                                  const uint64_t target_uuid[2],
+                                                  uint16_t *out_slot)
+{
+    if (!p || !target_uuid || !out_slot) return STM_EINVAL;
+    *out_slot = STM_POOL_REPLACE_CLAIM_NONE;
+    /* Caller MUST hold pool.wrlock. */
+
+    /* Scan roster for the UUID. R23 P1-1: this scan + set_claim must
+     * be in the SAME pool.wrlock critical section as the caller's
+     * subsequent state validation, or a concurrent stm_sync_remove_
+     * device(S) can land between detection and claim acquisition,
+     * wedging the retry. */
+    uint16_t found_slot = STM_POOL_REPLACE_CLAIM_NONE;
+    bool     found_match = false;
+    bool     found_at_online = false;
+    for (uint16_t i = 0; i < p->device_count; i++) {
+        const stm_pool_device *di = &p->devices[i];
+        if (di->uuid[0] == target_uuid[0] &&
+            di->uuid[1] == target_uuid[1]) {
+            found_match = true;
+            found_slot = i;
+            found_at_online = (di->state == STM_DEV_STATE_ONLINE);
+            break;
+        }
+    }
+
+    if (!found_match) return STM_ENOENT;
+    /* Slot 0 is the metadata primary; refuse symmetric to attach_alloc
+     * "primary is fixed" (R22 P3-1). */
+    if (found_slot == 0) return STM_EINVAL;
+    /* Match at non-ONLINE state → not a resume (REMOVED tombstone, or
+     * raced into EVACUATING/FAULTED). Caller must surface this so the
+     * fall-through to add_device generates STM_EEXIST naturally
+     * (preserving burned-UUID semantics). */
+    if (!found_at_online) return STM_EINVAL;
+
+    /* Set the claim on the resolved slot under the same wrlock.
+     * Idempotent on same-slot reclaim. */
+    stm_status cls = stm_pool_set_replace_claim_locked(p, found_slot);
+    if (cls != STM_OK) return cls;
+
+    *out_slot = found_slot;
+    return STM_OK;
 }
 
 uint16_t stm_pool_replace_claim(const stm_pool *p)
@@ -399,6 +455,13 @@ uint16_t stm_pool_replace_claim(const stm_pool *p)
     uint16_t v = mp->replace_claim;
     pthread_rwlock_unlock(&mp->lock);
     return v;
+}
+
+uint16_t stm_pool_replace_claim_locked(const stm_pool *p)
+{
+    if (!p) return STM_POOL_REPLACE_CLAIM_NONE;
+    /* Caller holds pool.rdlock or wrlock; just read. */
+    return p->replace_claim;
 }
 
 /* Internal: returns true iff the public-API mutator on `target_slot`

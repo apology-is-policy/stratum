@@ -2262,15 +2262,29 @@ stm_status stm_sync_remove_device(stm_sync *s, uint16_t device_id,
      * transition are atomic w.r.t. any other sync or pool caller —
      * closes the race where a concurrent sync_reserve_mirror could
      * install data on the about-to-be-REMOVED slot between check and
-     * transition (R17 lingering concern). */
+     * transition (R17 lingering concern).
+     *
+     * R23 P3-4: this wrapper uses _locked pool primitives that
+     * BYPASS the pool-layer replace-in-flight claim check.  An
+     * external caller's `stm_sync_remove_device(new_slot)` while a
+     * replace was in flight could thus tear down the partial state.
+     * Defend by consulting the claim explicitly — refuse STM_EBUSY
+     * if the caller's target slot matches the in-flight replace's
+     * claim. */
     stm_pool_lock_exclusive(s->pool);
     pthread_mutex_lock(&s->lock);
 
-    stm_status ds = sync_require_drained_locked(s, device_id);
-    stm_status ret = ds;
-    if (ds == STM_OK) {
-        ret = stm_pool_remove_device_locked(s->pool, device_id,
-                                                redundancy_floor);
+    stm_status ret;
+    uint16_t claim = stm_pool_replace_claim_locked(s->pool);
+    if (claim != STM_POOL_REPLACE_CLAIM_NONE && claim == device_id) {
+        ret = STM_EBUSY;
+    } else {
+        stm_status ds = sync_require_drained_locked(s, device_id);
+        ret = ds;
+        if (ds == STM_OK) {
+            ret = stm_pool_remove_device_locked(s->pool, device_id,
+                                                    redundancy_floor);
+        }
     }
 
     pthread_mutex_unlock(&s->lock);
@@ -2285,17 +2299,25 @@ stm_status stm_sync_finish_evacuation(stm_sync *s, uint16_t device_id)
      * stm_sync_remove_device. On success, also detach s->allocs[X]
      * under the same locks so the next sync_commit's per-device loop
      * (which holds pool.rdlock) sees a consistent REMOVED slot with
-     * no attached alloc. */
+     * no attached alloc.
+     *
+     * R23 P3-4: same claim-check as stm_sync_remove_device. */
     stm_pool_lock_exclusive(s->pool);
     pthread_mutex_lock(&s->lock);
 
-    stm_status ds = sync_require_drained_locked(s, device_id);
-    stm_status ret = ds;
-    if (ds == STM_OK) {
-        ret = stm_pool_finish_evacuation_locked(s->pool, device_id);
-        if (ret == STM_OK && s->allocs[device_id]) {
-            s->allocs[device_id] = NULL;
-            if (s->n_attached > 0) s->n_attached--;
+    stm_status ret;
+    uint16_t claim = stm_pool_replace_claim_locked(s->pool);
+    if (claim != STM_POOL_REPLACE_CLAIM_NONE && claim == device_id) {
+        ret = STM_EBUSY;
+    } else {
+        stm_status ds = sync_require_drained_locked(s, device_id);
+        ret = ds;
+        if (ds == STM_OK) {
+            ret = stm_pool_finish_evacuation_locked(s->pool, device_id);
+            if (ret == STM_OK && s->allocs[device_id]) {
+                s->allocs[device_id] = NULL;
+                if (s->n_attached > 0) s->n_attached--;
+            }
         }
     }
 
@@ -2334,8 +2356,12 @@ static void replace_rollback_or_wedge(stm_sync *s, uint16_t new_slot,
     if (claim_held) {
         rs = stm_pool_remove_device_locked(s->pool, new_slot,
                                               redundancy_floor);
+        /* Authorized clear: only releases OUR claim on new_slot.
+         * If the claim was on a different slot (impossible in the
+         * current path but defense-in-depth), we'd get STM_EBUSY
+         * and leave it alone. */
+        (void)stm_pool_clear_replace_claim_locked(s->pool, new_slot);
     }
-    stm_pool_clear_replace_claim_locked(s->pool);
     stm_pool_unlock_exclusive(s->pool);
     if (rs != STM_OK) {
         pthread_mutex_lock(&s->lock);
@@ -2404,14 +2430,32 @@ stm_status stm_sync_replace_device_online(
         uint16_t alloc_dev = 0;
         stm_status gs = stm_alloc_get_device_id(new_alloc, &alloc_dev);
         if (gs != STM_OK) return gs;
-        /* The new_alloc must already be attached at alloc_dev — caller
-         * must pass the SAME new_alloc from the prior failed call. */
+        if (alloc_dev == 0 || alloc_dev >= STM_POOL_DEVICES_MAX) {
+            return STM_EINVAL;
+        }
+
+        /* R23 P2-3 + P1-1: alloc-identity check + claim acquisition
+         * MUST be atomic against concurrent stm_sync_remove_device(S)
+         * / stm_pool_fail_device(S) / stm_pool_begin_evacuation(S) on
+         * the new slot.  Hold pool.wrlock + sync.lock together across
+         * the validation + claim-set so no window opens between them.
+         *
+         * Lock order is POOL OUTER, SYNC INNER (matching the
+         * codebase's global rule).  set_replace_claim_locked is
+         * idempotent on same-slot reclaim, so a prior failed call's
+         * still-held claim is accepted without flapping. */
+        stm_pool_lock_exclusive(s->pool);
         pthread_mutex_lock(&s->lock);
-        bool already_attached = (alloc_dev > 0 &&
-                                  alloc_dev < STM_POOL_DEVICES_MAX &&
-                                  s->allocs[alloc_dev] == new_alloc);
+        bool already_attached = (s->allocs[alloc_dev] == new_alloc);
         pthread_mutex_unlock(&s->lock);
-        if (!already_attached) return STM_EINVAL;
+        if (!already_attached) {
+            stm_pool_unlock_exclusive(s->pool);
+            return STM_EINVAL;
+        }
+        stm_status cls = stm_pool_set_replace_claim_locked(s->pool, alloc_dev);
+        stm_pool_unlock_exclusive(s->pool);
+        if (cls != STM_OK) return cls;
+
         if (out_new_device_id) *out_new_device_id = alloc_dev;
         /* Resume: drain + finish + commit. Skip steps 1-5. */
         goto drain_loop;
@@ -2425,7 +2469,7 @@ stm_status stm_sync_replace_device_online(
     }
     if (old_state != STM_DEV_STATE_ONLINE) return STM_EINVAL;
 
-    /* R22 (P5-6 P2-1): ADDED-NOT-YET-EVACUATING resume.
+    /* R22 (P5-6 P2-1) + R23 P1-1: ADDED-NOT-YET-EVACUATING resume.
      *
      * A previous invocation may have completed step 1 (add) + 2a
      * (set_device_id) + 2b (attach_alloc) successfully but failed at
@@ -2439,71 +2483,70 @@ stm_status stm_sync_replace_device_online(
      * hit stm_pool_add_device_locked's UUID uniqueness walk and
      * return STM_EEXIST — no clean recovery, operator has to unmount.
      *
-     * Detection: scan the roster for new_device->uuid at an ONLINE
-     * slot whose attached alloc == new_alloc. Match on BOTH uuid AND
-     * alloc-identity — same UUID with a different alloc is a genuine
-     * caller conflict (different device, same UUID — impossible
-     * post-R16 F3 burned-UUID tracking but defend in depth).
+     * R23 P1-1: UUID lookup + slot-0 + state validation + alloc-identity
+     * check + set_claim MUST be atomic under one pool.wrlock + sync.lock
+     * critical section.  Pre-fix the lookup ran under pool.rdlock,
+     * released, then alloc-check under sync.lock, released, then
+     * set_claim under wrlock — a window opened in which a concurrent
+     * stm_sync_remove_device(S) (which uses _locked pool primitives
+     * that bypass the claim check, since it isn't held yet) could flip
+     * S to REMOVED.  Retry's evac_step would then refuse the REMOVED
+     * survivor → wedge.  Atomic acquisition closes that window.
      *
-     * On resume: skip steps 1 + 2a + 2b (already done + in RAM),
-     * proceed to step 3 (sync_commit, idempotent on clean state).
-     * Steps 4-6 then run as normal. */
-    uint16_t resume_slot = UINT16_MAX;
-    stm_pool_lock_shared(s->pool);
+     * Detection: walk roster for new_device->uuid at ONLINE.  Slot 0
+     * + non-ONLINE matches refuse via stm_pool_claim_resume_slot_locked.
+     * Then check alloc-identity (s->allocs[slot] == new_alloc) +
+     * belt check (alloc.device_id == slot) under sync.lock.  All
+     * inside one pool.wrlock CS. */
+    uint16_t resume_slot = STM_POOL_REPLACE_CLAIM_NONE;
+    bool resume_path = false;
+    stm_status resume_err = STM_OK;
+    stm_pool_lock_exclusive(s->pool);
     {
-        size_t rcount = stm_pool_device_count(s->pool);
-        for (uint16_t i = 0; i < rcount; i++) {
-            const stm_pool_device *di = stm_pool_device_info(s->pool, i);
-            if (!di) continue;
-            if (di->uuid[0] == new_device->uuid[0] &&
-                di->uuid[1] == new_device->uuid[1]) {
-                if (di->state == STM_DEV_STATE_ONLINE) {
-                    resume_slot = i;
+        stm_status crs = stm_pool_claim_resume_slot_locked(
+            s->pool, new_device->uuid, &resume_slot);
+        if (crs == STM_OK) {
+            /* Slot found at ONLINE, claim is now held.  Validate
+             * alloc-identity under sync.lock (still inside pool.wrlock
+             * — POOL OUTER SYNC INNER). */
+            pthread_mutex_lock(&s->lock);
+            bool alloc_matches = (s->allocs[resume_slot] == new_alloc);
+            pthread_mutex_unlock(&s->lock);
+            if (!alloc_matches) {
+                /* Caller's UUID matches a slot we just claimed, but
+                 * the alloc identity differs.  Release our claim
+                 * (we set it; we own it) and surface as caller
+                 * conflict. */
+                (void)stm_pool_clear_replace_claim_locked(s->pool, resume_slot);
+                resume_err = STM_EEXIST;
+            } else {
+                /* Belt: alloc.device_id matches the slot (attach_alloc
+                 * enforced this on the original call). */
+                uint16_t alloc_dev = 0;
+                stm_status gs = stm_alloc_get_device_id(new_alloc, &alloc_dev);
+                if (gs != STM_OK || alloc_dev != resume_slot) {
+                    (void)stm_pool_clear_replace_claim_locked(s->pool, resume_slot);
+                    resume_err = (gs != STM_OK) ? gs : STM_EINVAL;
+                } else {
+                    resume_path = true;
                 }
-                /* Non-ONLINE match (REMOVED burned-UUID, or EVACUATING
-                 * via a racing operation) → fall through; add_device
-                 * will surface STM_EEXIST and caller re-evaluates. */
-                break;
             }
+        } else if (crs == STM_ENOENT) {
+            /* No UUID match → fall through to fresh-add. */
+        } else {
+            /* STM_EINVAL = match at slot 0 / non-ONLINE state.
+             * STM_EBUSY = different-slot claim already held.
+             * Both surface to caller; do not attempt fresh-add (the
+             * UUID is present, just not as a viable resume target). */
+            resume_err = (crs == STM_EINVAL) ? STM_EEXIST : crs;
         }
     }
-    stm_pool_unlock_shared(s->pool);
+    stm_pool_unlock_exclusive(s->pool);
+
+    if (resume_err != STM_OK) return resume_err;
 
     uint16_t new_slot;
-    if (resume_slot != UINT16_MAX) {
-        /* R22 P3-1: slot 0 is the metadata-primary and `stm_sync_attach_alloc`
-         * explicitly refuses `device_id == 0` ("primary is fixed"). The
-         * resume path bypasses attach_alloc, so without this check a caller
-         * passing `new_device.uuid == device-0's uuid` + `new_alloc ==
-         * s->allocs[0]` would drain their old_device onto the metadata
-         * primary — a semantic violation of the primary's fixed identity.
-         * Refuse cleanly here; UUID-already-in-roster on the primary is a
-         * genuine conflict with the primary's tombstoned claim. */
-        if (resume_slot == 0) return STM_EEXIST;
-
-        /* UUID found at ONLINE slot. Validate alloc-identity match. */
-        pthread_mutex_lock(&s->lock);
-        bool alloc_matches = (s->allocs[resume_slot] == new_alloc);
-        pthread_mutex_unlock(&s->lock);
-        if (!alloc_matches) {
-            /* Same UUID in roster but caller is passing a different
-             * alloc — genuine conflict. Reject cleanly. */
-            return STM_EEXIST;
-        }
-        /* Belt-and-suspenders: alloc's device_id must match the slot
-         * (attach_alloc enforced this on the original call). */
-        uint16_t alloc_dev = 0;
-        stm_status gs = stm_alloc_get_device_id(new_alloc, &alloc_dev);
-        if (gs != STM_OK) return gs;
-        if (alloc_dev != resume_slot) return STM_EINVAL;
-
-        /* P5-8: take the replace-in-flight claim before touching the slot
-         * for steps 3-9.  Refuses STM_EBUSY if another replace is already
-         * in flight (could be a concurrent retry of this same slot, or a
-         * different replace altogether — both are legitimate refusals). */
-        stm_status cls = stm_pool_set_replace_claim(s->pool, resume_slot);
-        if (cls != STM_OK) return cls;
-
+    if (resume_path) {
         new_slot = resume_slot;
         if (out_new_device_id) *out_new_device_id = new_slot;
         /* Jump past steps 1 + 2a + 2b; proceed to step 3. */
@@ -2526,17 +2569,36 @@ stm_status stm_sync_replace_device_online(
     size_t count_before = stm_pool_device_count(s->pool);
     stm_status as = stm_pool_add_device_locked(s->pool, new_device);
     stm_status cls = STM_OK;
+    stm_status rs  = STM_OK;
     if (as == STM_OK) {
         cls = stm_pool_set_replace_claim_locked(s->pool, (uint16_t)count_before);
         if (cls != STM_OK) {
-            (void)stm_pool_remove_device_locked(s->pool,
-                                                   (uint16_t)count_before,
-                                                   redundancy_floor);
+            /* R23 P2-1: capture rollback status. If remove_device_locked
+             * itself fails (e.g., a concurrent EVACUATING elsewhere
+             * raised STM_EBUSY at the OTHER-evac guard, or RO transition
+             * mid-call), we must wedge the sync handle — leaving the
+             * just-added slot ONLINE with no alloc would let the next
+             * sync_commit persist a phantom device.  Restores R19 P2-2
+             * invariant ("if the remove itself fails, wedge rather
+             * than silently leave an inconsistent slot"). */
+            rs = stm_pool_remove_device_locked(s->pool,
+                                                  (uint16_t)count_before,
+                                                  redundancy_floor);
         }
     }
     stm_pool_unlock_exclusive(s->pool);
     if (as != STM_OK)  return as;
-    if (cls != STM_OK) return cls;
+    if (cls != STM_OK) {
+        if (rs != STM_OK) {
+            /* Rollback failed.  Wedge so the next public-API call
+             * surfaces the inconsistency instead of compounding. */
+            pthread_mutex_lock(&s->lock);
+            s->wedged = true;
+            pthread_mutex_unlock(&s->lock);
+            return STM_EWEDGED;
+        }
+        return cls;
+    }
     new_slot = (uint16_t)count_before;
 
     /* Step 2a: set the alloc's device_id to match the new slot.
@@ -2648,8 +2710,9 @@ drain_loop: {
     /* Success. P5-8: clear the claim only on full completion — failed
      * paths above leave the claim held so retry can reacquire it
      * idempotently and the partial state stays protected from
-     * concurrent pool mutators. */
-    stm_pool_clear_replace_claim(s->pool);
+     * concurrent pool mutators. R23 P2-2: authorized clear, only
+     * releases our own claim on new_slot. */
+    (void)stm_pool_clear_replace_claim(s->pool, new_slot);
     return STM_OK;
 }
 }

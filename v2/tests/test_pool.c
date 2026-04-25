@@ -1859,16 +1859,28 @@ STM_TEST(pool_replace_claim_blocks_mutators_on_claimed_slot) {
     STM_ASSERT_ERR(stm_pool_remove_device(p, 0, /*floor=*/0),
                      STM_ENOTSUPPORTED);
 
-    /* Clear the claim. Mutators work again. */
-    stm_pool_clear_replace_claim(p);
+    /* R23 P2-2: clear with WRONG expected_slot refuses STM_EBUSY,
+     * does NOT clear the claim. Slot 0 != claim of 1. */
+    STM_ASSERT_ERR(stm_pool_clear_replace_claim(p, 0), STM_EBUSY);
+    STM_ASSERT_EQ((int)stm_pool_replace_claim(p), 1);   /* still held */
+
+    /* Clear with correct expected_slot succeeds. */
+    STM_ASSERT_OK(stm_pool_clear_replace_claim(p, 1));
     STM_ASSERT_EQ((int)stm_pool_replace_claim(p),
                    (int)STM_POOL_REPLACE_CLAIM_NONE);
     /* fail_device on slot 1 now works. */
     STM_ASSERT_OK(stm_pool_fail_device(p, 1));
 
-    /* Clear is idempotent — calling twice is a no-op. */
-    stm_pool_clear_replace_claim(p);
-    stm_pool_clear_replace_claim(p);
+    /* Clear with no claim held → idempotent OK so cleanup paths can
+     * call unconditionally. */
+    STM_ASSERT_OK(stm_pool_clear_replace_claim(p, 1));
+    STM_ASSERT_OK(stm_pool_clear_replace_claim(p, 1));
+
+    /* Clear with STM_POOL_REPLACE_CLAIM_NONE / out-of-range → EINVAL. */
+    STM_ASSERT_ERR(stm_pool_clear_replace_claim(p,
+                                                  STM_POOL_REPLACE_CLAIM_NONE),
+                     STM_EINVAL);
+    STM_ASSERT_ERR(stm_pool_clear_replace_claim(p, 99), STM_EINVAL);
 
     /* set_claim out-of-range refused. */
     STM_ASSERT_ERR(stm_pool_set_replace_claim(p, 99), STM_EINVAL);
@@ -1914,7 +1926,7 @@ STM_TEST(pool_replace_claim_locked_bypasses_check) {
     stm_pool_lock_exclusive(p);
     STM_ASSERT_OK(stm_pool_fail_device_locked(p, 1));
     /* Slot is now FAULTED. clear-then-rejoin to restore. */
-    stm_pool_clear_replace_claim_locked(p);
+    STM_ASSERT_OK(stm_pool_clear_replace_claim_locked(p, 1));
     STM_ASSERT_OK(stm_pool_rejoin_device_locked(p, 1));
     stm_pool_unlock_exclusive(p);
 

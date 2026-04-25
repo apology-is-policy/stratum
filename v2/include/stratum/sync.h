@@ -570,15 +570,30 @@ stm_status stm_sync_finish_evacuation(stm_sync *s, uint16_t device_id);
  * primary. Returns STM_EEXIST. Symmetric with
  * `stm_sync_attach_alloc`'s "primary is fixed" rule.
  *
- * **Concurrent-caller constraint (R22 P3-3 / P3-4)**: between a
- * failed step-3 attempt and a retry, concurrent
- * `stm_pool_begin_evacuation(new_slot)` or
- * `stm_sync_remove_device(new_slot)` on the newly-added slot can
- * wedge the retry (EVACUATING-then-REMOVED leaves no valid drain
- * target). The current impl does NOT defend against this; callers
- * MUST serialize their replace attempts against pool-structural
- * mutations on the new slot until this function returns. A future
- * sync-layer "replace in flight" flag would enforce this internally.
+ * **Concurrent-caller protection (P5-8 + R23 P1-1 / P2-3)**: the
+ * partial in-RAM state across a failed step-3 (or step-5) and the
+ * subsequent retry is protected by a per-pool replace-in-flight
+ * claim.  While the claim is held on `new_slot`:
+ *
+ *   - Public pool mutators on `new_slot` refuse STM_EBUSY:
+ *     `stm_pool_remove_device`, `stm_pool_begin_evacuation`,
+ *     `stm_pool_finish_evacuation`, `stm_pool_fail_device`,
+ *     `stm_pool_rejoin_device`.  `stm_pool_add_device` refuses
+ *     while ANY claim is held.
+ *   - The `_locked` pool variants bypass — replace's own internal
+ *     ops use them, so the wrapper can proceed past its own
+ *     guard.  The sync-layer safe wrappers
+ *     (`stm_sync_remove_device`, `stm_sync_finish_evacuation`)
+ *     also use `_locked` variants; callers MUST NOT invoke those
+ *     on `new_slot` while a replace is in flight, or the partial
+ *     state will be torn down behind the replace.
+ *
+ * Resume detection + claim acquisition are atomic under one
+ * pool.wrlock + sync.lock CS (R23 P1-1), so a concurrent
+ * `stm_sync_remove_device(new_slot)` cannot land between detection
+ * and claim-set.  The claim persists across failed-call → retry
+ * windows (idempotent same-slot reclaim on retry); released only
+ * on full success of step 9.
  *
  * **Alloc ownership after OK**: the OLD device's alloc (attached via
  * `stm_sync_attach_alloc` before this call) is detached on success

@@ -2238,13 +2238,19 @@ STM_TEST(sync_multi_replace_claim_blocks_concurrent_mutators) {
     /* Confirm: claim is held on slot 3. */
     STM_ASSERT_EQ((int)stm_pool_replace_claim(pool), 3);
 
-    /* External mutators on slot 3 refuse STM_EBUSY: */
+    /* External pool-layer mutators on slot 3 refuse STM_EBUSY: */
     STM_ASSERT_ERR(stm_pool_fail_device(pool, 3), STM_EBUSY);
     STM_ASSERT_ERR(stm_pool_begin_evacuation(pool, 3, /*floor=*/2),
                      STM_EBUSY);
     STM_ASSERT_ERR(stm_pool_remove_device(pool, 3, /*floor=*/2),
                      STM_EBUSY);
     STM_ASSERT_ERR(stm_pool_finish_evacuation(pool, 3), STM_EBUSY);
+
+    /* R23 P3-4: external sync-layer wrappers (which use _locked pool
+     * primitives that bypass the pool-level claim check) ALSO refuse
+     * STM_EBUSY via the explicit claim check at the sync boundary. */
+    STM_ASSERT_ERR(stm_sync_remove_device(s, 3, /*floor=*/2), STM_EBUSY);
+    STM_ASSERT_ERR(stm_sync_finish_evacuation(s, 3), STM_EBUSY);
 
     /* Mutators on slot 1 (the OLD device, still ONLINE; not claimed)
      * are unaffected — but they go through their own state-machine
@@ -2321,6 +2327,8 @@ STM_TEST(sync_multi_replace_multi_retry_converges) {
     const stm_pool_device *probe = stm_pool_device_info(pool, 3);
     STM_ASSERT(probe != NULL);
     STM_ASSERT_EQ((int)probe->state, (int)STM_DEV_STATE_ONLINE);
+    /* R23 P3-3: claim must be held throughout failure window. */
+    STM_ASSERT_EQ((int)stm_pool_replace_claim(pool), 3);
 
     /* Second attempt: also fail via another 2-device inject. This
      * exercises the resume path running + failing AGAIN without
@@ -2336,12 +2344,17 @@ STM_TEST(sync_multi_replace_multi_retry_converges) {
     probe = stm_pool_device_info(pool, 1);
     STM_ASSERT(probe != NULL);
     STM_ASSERT_EQ((int)probe->state, (int)STM_DEV_STATE_ONLINE);
+    /* R23 P3-3: still held after second failure (idempotent reclaim). */
+    STM_ASSERT_EQ((int)stm_pool_replace_claim(pool), 3);
 
     /* Third attempt: no inject → resume path drives the replace to
      * completion. Idempotent commits write byte-identical UBs. */
     STM_ASSERT_OK(stm_sync_replace_device_online(
         s, /*old=*/1, &new_dev, a4, /*floor=*/2, &slot));
     STM_ASSERT_EQ(slot, 3u);
+    /* R23 P3-3: claim released on full success. */
+    STM_ASSERT_EQ((int)stm_pool_replace_claim(pool),
+                   (int)STM_POOL_REPLACE_CLAIM_NONE);
 
     STM_ASSERT_EQ(stm_pool_live_device_count(pool), 3u);
     probe = stm_pool_device_info(pool, 1);

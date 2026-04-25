@@ -394,16 +394,27 @@ EVACUATING / REMOVED transitions are implemented.
       leaves the claim held so the partial in-RAM state is protected
       from concurrent mutators across the failure→retry window.
 
-### Replace-in-flight claim API
+### Replace-in-flight claim API (post-R23)
 
 ```c
 #define STM_POOL_REPLACE_CLAIM_NONE   UINT16_MAX
 
+// Set: idempotent on same-slot, refuses different-slot reclaim.
 stm_status stm_pool_set_replace_claim       (stm_pool *p, uint16_t slot);
 stm_status stm_pool_set_replace_claim_locked(stm_pool *p, uint16_t slot);
-void       stm_pool_clear_replace_claim       (stm_pool *p);
-void       stm_pool_clear_replace_claim_locked(stm_pool *p);
-uint16_t   stm_pool_replace_claim(const stm_pool *p);   // for tests
+
+// Clear: AUTHORIZED — only releases caller's own claim (matches expected_slot).
+stm_status stm_pool_clear_replace_claim       (stm_pool *p, uint16_t expected_slot);
+stm_status stm_pool_clear_replace_claim_locked(stm_pool *p, uint16_t expected_slot);
+
+// Read: rdlock-acquired vs caller-locks-already.
+uint16_t stm_pool_replace_claim       (const stm_pool *p);   // for tests
+uint16_t stm_pool_replace_claim_locked(const stm_pool *p);   // sync-wrapper use
+
+// R23 P1-1: atomic UUID-lookup-and-claim helper for sync's resume paths.
+stm_status stm_pool_claim_resume_slot_locked(stm_pool *p,
+                                                 const uint64_t target_uuid[2],
+                                                 uint16_t *out_slot);
 ```
 
 Contract:
@@ -413,18 +424,41 @@ Contract:
 - **Idempotent same-slot**: `set_claim(slot)` when claim is already
   on `slot` → `STM_OK` (no state change).  This lets a replace retry
   reclaim its own prior failed-call's claim without coordinating.
-- **Clear is unconditional**: safe to call without the claim held
-  (no-op).  Callers don't need to check before clearing.
-- **Mutator refusal scope**: only the non-`_locked` wrappers
-  consult the claim.  `_locked` variants are caller-controlled
-  internal ops (replace itself uses these to proceed past the
-  claim guard).
+  **Mechanical idempotency only** (R23 doc-fix): two distinct replace
+  attempts that converge on the same slot both see `STM_OK` —
+  caller-side serialization (one replace-in-flight per old_device at
+  the admin layer) is still required to prevent overlapping replaces.
+- **Authorized clear** (R23 P2-2): clear takes an `expected_slot`.
+  Releases only if claim matches; mismatched callers get `STM_EBUSY`
+  (no state change).  Idempotent OK if no claim is held (cleanup
+  paths can call unconditionally).  `STM_POOL_REPLACE_CLAIM_NONE`
+  or out-of-range `expected_slot` → `STM_EINVAL`.
+- **Pool-mutator refusal scope**: non-`_locked` mutators
+  (`add_device` / `remove_device` / `begin_evacuation` /
+  `finish_evacuation` / `fail_device` / `rejoin_device`) consult the
+  claim.  `_locked` variants bypass — replace's own internal ops use
+  them.
+- **Sync-wrapper refusal** (R23 P3-4): `stm_sync_remove_device` and
+  `stm_sync_finish_evacuation` use `_locked` pool ops (which bypass
+  the pool-layer claim check), so they each carry an EXPLICIT
+  claim check at the sync boundary.  External calls targeting the
+  claim's slot get `STM_EBUSY`; internal replace ops target
+  `old_device_id` (different from the claimed `new_slot`), so they
+  proceed.
 - **`add_device` refusal**: refuses while ANY claim is held (the
   new slot would land at the tail and could collide).
+- **Atomic resume acquisition** (R23 P1-1): ADDED-ONLINE-resume + the
+  older R19 EVACUATING-resume paths both acquire the claim under
+  one pool.wrlock + sync.lock CS together with their UUID/state/alloc
+  validation — closes the TOCTOU window where a concurrent
+  `stm_sync_remove_device(S)` could land between resume detection
+  and `set_claim`, leaving the slot REMOVED while replace's drain
+  expected ONLINE.
 
-Lock discipline: `set/clear_locked` require pool.wrlock held by the
-caller.  Public wrappers acquire it internally.  `replace_claim`
-reader takes pool.rdlock.
+Lock discipline: `set/clear_locked` + `claim_resume_slot_locked`
+require pool.wrlock held by caller.  Public wrappers acquire
+internally.  `replace_claim` reader takes pool.rdlock; `_locked`
+variant requires caller-held lock (read-only access).
 - [x] Device-0 guard on every mutator (metadata primary).
 - [ ] **FAULTED → new reconstruct** (P5-4c-β): needs bptr-layer
       block iteration. Deferred to P6 extent manager.
