@@ -1847,11 +1847,19 @@ STM_TEST(pool_replace_claim_blocks_mutators_on_claimed_slot) {
     STM_ASSERT_ERR(stm_pool_fail_device(p, 1), STM_EBUSY);
     STM_ASSERT_ERR(stm_pool_rejoin_device(p, 1), STM_EBUSY);
 
-    /* add_device refused while ANY claim is held (the new slot might
-     * collide with the claim if added at the tail). */
+    /* R23 P3-2: add_device is now collision-only — refuses only when
+     * `p->replace_claim == p->device_count` (the new tail). Since
+     * set_replace_claim_locked requires `slot < device_count`, a held
+     * claim is always on a slot strictly below the new tail, so an
+     * external add at a non-claimed tail succeeds. Earlier strict
+     * refusal blocked legitimate concurrent admin ops (e.g., adding
+     * a hot-spare while a replace evacuates a different slot). */
     stm_pool_device dev3 = dev2;
     dev3.uuid[0] = 0xfeed;
-    STM_ASSERT_ERR(stm_pool_add_device(p, &dev3), STM_EBUSY);
+    STM_ASSERT_OK(stm_pool_add_device(p, &dev3));
+    STM_ASSERT_EQ(stm_pool_device_count(p), 3u);
+    /* Claim still held on slot 1; the new device landed at slot 2. */
+    STM_ASSERT_EQ((int)stm_pool_replace_claim(p), 1);
 
     /* Mutators on a NON-claimed slot (slot 0) are unaffected by the
      * claim — but slot 0 has its own dev-0 guards (STM_ENOTSUPPORTED),

@@ -251,7 +251,7 @@ carries a dirty flag; a clean-state commit returns the cached
 | Suite | Count | Coverage |
 |---|---|---|
 | `test_bootstrap` | 18 | Bootstrap-pool format, open-roundtrip, reserve/free/commit, bitmap ping-pong, torn-write recovery (crash between COW and header update), capacity boundaries, user_data slot roundtrip. |
-| `test_alloc` | 24 | Tree insertion order, gap-scan reserve, free-then-pending, commit-sweeps-pending, refcount transitions, double-free rejected, full-tree scan, stats, accel is_allocated consistency, device_id stamping, set_device_id-refused-after-reserve, first_allocated + first_allocated_from basic cases, corrupt-tree-entry → STM_ECORRUPT. |
+| `test_alloc` | 32 | Tree insertion order, gap-scan reserve, free-then-pending, commit-sweeps-pending, refcount transitions, double-free rejected, full-tree scan, stats, accel is_allocated consistency, device_id stamping, set_device_id-refused-after-reserve, first_allocated + first_allocated_from basic cases, corrupt-tree-entry → STM_ECORRUPT, **first_allocated_from boundary cases** (R20 P3-2 close: NULL args; `min_start_block ≥ 2^48` → STM_EINVAL; empty tree; inclusive lower bound at exact start_block; cursor past end-of-range → next entry; cursor mid-range → next entry by start_block; PENDING-skip; cursor below first entry returns leftmost). |
 | `test_alloc_roots` | 10 | Roots-object set/get/count/iter/commit/load roundtrip; idempotent commit; tamper detection (wrong csum / wrong key / wrong gen). |
 | `test_sync_multi` (indirectly) | — | Exercises `stm_alloc_set_device_id`, multi-alloc attach, roots-object load, mirror reservation across devices. |
 

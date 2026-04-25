@@ -38,15 +38,15 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `52503fe` (R24 / P5-5-β scope close — scrub repair via
-  verify-callback + four-counter classification +
-  CallbackSetExclusivity invariant; R24 closed clean at 0 P0 / 0 P1
-  / 2 P2 / 4 P3, all addressed).
-- **Phases**: 1–4 complete; Phase 5 in progress — through P5-5-β
-  (scrub repair surface integrated + audited; bptr-aware default cb
-  deferred to P6 extent manager).
+- **Tip**: *(pending)* (post-R24 backlog hygiene chunk — R23 P3-2
+  add_device refusal tightened to collision-only; R20 P3-2 + P3-3
+  closed via direct alloc-cursor unit tests + concurrent scrub
+  TSan stress test).
+- **Phases**: 1–4 complete; Phase 5 in progress — through R24 +
+  backlog hygiene (P5-5-β audited clean; deferred items cleared
+  for the path to γ).
 - **Tests**: 28 suites × (default + ASan + TSan, serial) green.
-  test_sync_multi 42; test_pool 47; test_scrub 26.
+  test_sync_multi 42; test_pool 47; test_scrub 27; test_alloc 32.
 - **Specs**: 13 TLA+ modules clean (14 fixed configs incl. `scrub_beta`)
   + 6 buggy-demo configs fire as expected.
 - **LOC**: ~26 KLOC across 21 src/ modules + 25 public headers.

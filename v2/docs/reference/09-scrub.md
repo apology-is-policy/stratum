@@ -379,7 +379,7 @@ SPEC-TO-CODE:
 
 ## Tests
 
-`tests/test_scrub.c` (26 tests):
+`tests/test_scrub.c` (27 tests):
 
 - Lifecycle: `scrub_create_initial_state_is_idle`,
   `scrub_create_rejects_null_args`, `scrub_status_get_rejects_null_args`.
@@ -403,7 +403,11 @@ SPEC-TO-CODE:
 - Multi-device: `scrub_multi_device_covers_every_attached_alloc`
   (mirror(2) 2-device pool, one 3-block range per device, asserts
   `ranges_processed=2, blocks_verified=6`),
-  `scrub_skips_faulted_devices` (R20 P3-1).
+  `scrub_skips_faulted_devices` (R20 P3-1),
+  `scrub_concurrent_with_fail_rejoin_stress` (R20 P3-3: TSan
+  stress, concurrent scrub_step + fail/rejoin toggle on a
+  non-primary slot for ~250ms; asserts no race + forward progress
+  on both threads).
 - β cb-mode: `scrub_set_verify_cb_arg_validation` (NULL/EINVAL
   shape coverage), `scrub_set_verify_cb_refuses_running_or_paused`
   (state-guard self-audit P1 regression: cb mode frozen for the
@@ -487,11 +491,21 @@ this file (state-guard table contradicting impl + misleading
 - [x] **P3-7**: `scrub_pause_refuses_non_running` extended with
       COMPLETED case.
 
+Closed in subsequent backlog hygiene chunks:
+
+- [x] **P3-2** (closed in backlog hygiene chunk after R24): direct
+      unit tests for `stm_alloc_first_allocated_from` added in
+      `tests/test_alloc.c` — null args, `min_start_block ≥ 2^48`
+      EINVAL, empty tree, inclusive lower bound, skip-to-next,
+      mid-range cursor, PENDING-skip, below-first-entry.
+- [x] **P3-3** (closed in backlog hygiene chunk after R24):
+      `scrub_concurrent_with_fail_rejoin_stress` test exercises
+      concurrent scrub + pool-mutation under TSan. Two threads —
+      scrub_step loop + fail/rejoin toggle on a non-primary slot.
+      Validates no data race + forward progress on both threads.
+
 Deferred (γ-scope / future):
 
-- [ ] **P3-2**: direct unit tests for `stm_alloc_first_allocated_from`
-      (exercised indirectly via scrub today).
-- [ ] **P3-3**: concurrent-scrub + pool-mutation TSan stress test.
 - [ ] **P3-4** (γ): `stm_scrub_step` holds `sc.lock` for the
       duration of a multi-MiB range. Pause + status_get block
       arbitrarily long. Periodic lock drop or atomic-state flag

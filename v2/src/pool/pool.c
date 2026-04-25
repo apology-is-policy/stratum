@@ -579,11 +579,20 @@ stm_status stm_pool_add_device(stm_pool *p, const stm_pool_device *new_device)
 {
     if (!p) return STM_EINVAL;
     pthread_rwlock_wrlock(&p->lock);
-    /* P5-8: an in-flight replace claims the slot it just added. Until
-     * the replace completes (clears the claim), reject external add too —
-     * the new slot index would collide if the claim's slot is at the
-     * tail. Strict refusal keeps the invariant simple. */
-    if (p->replace_claim != STM_POOL_REPLACE_CLAIM_NONE) {
+    /* R23 P3-2: an in-flight replace claims one specific slot. The new
+     * slot index from add_device_locked is `p->device_count` (the next
+     * tail position). Refuse only when the claim collides with that
+     * tail position; concurrent claims on lower slots are fine — the
+     * new add lands at a different slot index that the claim doesn't
+     * touch. Symmetric with the other 5 mutators that consult
+     * claim_blocks(target_slot): they refuse only on slot match.
+     *
+     * Earlier P5-8 strict refusal ("any claim held") was conservative-
+     * safe but rejected legitimate concurrent admin operations (e.g.
+     * adding a hot-spare while a replace evacuates a different
+     * device). Per R23 P3-2 close: only collision matters. */
+    if (p->replace_claim != STM_POOL_REPLACE_CLAIM_NONE &&
+        (size_t)p->replace_claim == p->device_count) {
         pthread_rwlock_unlock(&p->lock);
         return STM_EBUSY;
     }

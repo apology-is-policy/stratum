@@ -721,4 +721,222 @@ STM_TEST(alloc_first_allocated_null_args) {
     unlink(g_tmp_path);
 }
 
+/* ========================================================================= */
+/* R20 P3-2: direct unit tests for stm_alloc_first_allocated_from. The
+ * scrub α path uses this cursor extensively but only as a transitive
+ * dependency. The tests here exercise it directly to pin boundary
+ * cases without going through scrub.c.                                       */
+/* ========================================================================= */
+
+STM_TEST(alloc_first_allocated_from_null_args) {
+    make_tmp("first_from_null");
+    stm_bdev  *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    uint64_t p = 0, l = 0;
+    STM_ASSERT_ERR(stm_alloc_first_allocated_from(NULL, 0, &p, &l),
+                     STM_EINVAL);
+    STM_ASSERT_ERR(stm_alloc_first_allocated_from(a, 0, NULL, &l),
+                     STM_EINVAL);
+    STM_ASSERT_ERR(stm_alloc_first_allocated_from(a, 0, &p, NULL),
+                     STM_EINVAL);
+
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(alloc_first_allocated_from_min_at_uint48_returns_einval) {
+    /* Boundary check: min_start_block must be < 2^48. The scrub
+     * impl relies on this guard (when the cursor walks off the end,
+     * it advances to (dev+1, 0) instead of passing UINT48_MAX in). */
+    make_tmp("first_from_uint48");
+    stm_bdev  *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    uint64_t p = 0, l = 0;
+    STM_ASSERT_ERR(stm_alloc_first_allocated_from(a,
+                                                     UINT64_C(1) << 48,
+                                                     &p, &l),
+                     STM_EINVAL);
+    /* Just below the bound is allowed (returns ENOENT on empty tree). */
+    STM_ASSERT_ERR(stm_alloc_first_allocated_from(a,
+                                                     (UINT64_C(1) << 48) - 1,
+                                                     &p, &l),
+                     STM_ENOENT);
+
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(alloc_first_allocated_from_empty_tree_returns_enoent) {
+    make_tmp("first_from_empty");
+    stm_bdev  *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    uint64_t p = 0, l = 0;
+    STM_ASSERT_ERR(stm_alloc_first_allocated_from(a, 0, &p, &l),
+                     STM_ENOENT);
+    STM_ASSERT_ERR(stm_alloc_first_allocated_from(a, 1024, &p, &l),
+                     STM_ENOENT);
+
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(alloc_first_allocated_from_inclusive_lower_bound) {
+    /* Cursor exactly equal to a live entry's start_block must return
+     * THAT entry — the lower bound is inclusive. */
+    make_tmp("first_from_inclusive");
+    stm_bdev  *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    uint64_t p1 = 0, p2 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p1));
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &p2));
+
+    uint64_t got_paddr = 0, got_length = 0;
+    /* cursor = p1's start: returns p1 (4 blocks). */
+    STM_ASSERT_OK(stm_alloc_first_allocated_from(a, stm_paddr_offset(p1),
+                                                    &got_paddr,
+                                                    &got_length));
+    STM_ASSERT_EQ(stm_paddr_offset(got_paddr), stm_paddr_offset(p1));
+    STM_ASSERT_EQ(got_length, 4u);
+
+    /* cursor = p2's start: returns p2 (8 blocks). */
+    STM_ASSERT_OK(stm_alloc_first_allocated_from(a, stm_paddr_offset(p2),
+                                                    &got_paddr,
+                                                    &got_length));
+    STM_ASSERT_EQ(stm_paddr_offset(got_paddr), stm_paddr_offset(p2));
+    STM_ASSERT_EQ(got_length, 8u);
+
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(alloc_first_allocated_from_skips_to_next_after_range) {
+    /* Cursor positioned past p1's end (mimicking scrub's natural
+     * advance: cursor = stm_paddr_offset(p1) + length) returns p2. */
+    make_tmp("first_from_after");
+    stm_bdev  *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    uint64_t p1 = 0, p2 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p1));
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &p2));
+
+    uint64_t got_paddr = 0, got_length = 0;
+    uint64_t cursor = stm_paddr_offset(p1) + 4u;  /* past p1's end */
+    STM_ASSERT_OK(stm_alloc_first_allocated_from(a, cursor,
+                                                    &got_paddr,
+                                                    &got_length));
+    STM_ASSERT_EQ(stm_paddr_offset(got_paddr), stm_paddr_offset(p2));
+    STM_ASSERT_EQ(got_length, 8u);
+
+    /* Cursor past p2's end → ENOENT (no further entries). */
+    cursor = stm_paddr_offset(p2) + 8u;
+    STM_ASSERT_ERR(stm_alloc_first_allocated_from(a, cursor,
+                                                     &got_paddr,
+                                                     &got_length),
+                     STM_ENOENT);
+
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(alloc_first_allocated_from_in_middle_returns_next_entry) {
+    /* Cursor in the middle of an entry's range: contract is
+     * `start_block >= min_start_block`. The middle of an entry has
+     * start_block < cursor, so that entry is skipped; the next entry
+     * (whose start_block >= cursor) is returned.
+     *
+     * scrub never lands here in practice (it advances cursor to
+     * end-of-range each step), but the contract is well-defined and
+     * worth pinning. */
+    make_tmp("first_from_middle");
+    stm_bdev  *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    uint64_t p1 = 0, p2 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 8u, 0, &p1));
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p2));
+
+    uint64_t got_paddr = 0, got_length = 0;
+    /* Mid-range cursor inside p1: skip p1 (start < cursor), return p2. */
+    uint64_t cursor = stm_paddr_offset(p1) + 4u;
+    STM_ASSERT_OK(stm_alloc_first_allocated_from(a, cursor,
+                                                    &got_paddr,
+                                                    &got_length));
+    STM_ASSERT_EQ(stm_paddr_offset(got_paddr), stm_paddr_offset(p2));
+    STM_ASSERT_EQ(got_length, 4u);
+
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(alloc_first_allocated_from_skips_pending) {
+    /* PENDING entries (refcount=0, awaiting commit-sweep) must be
+     * skipped — same semantics as `_first_allocated`. */
+    make_tmp("first_from_pending");
+    stm_bdev  *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    uint64_t p1 = 0, p2 = 0, p3 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p1));
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p2));
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p3));
+    /* Free p2 — it transitions to PENDING (refcount=0, not yet
+     * swept). p1 and p3 remain refcount>=1. */
+    STM_ASSERT_OK(stm_alloc_free(a, p2, /*free_gen=*/ 1));
+
+    uint64_t got_paddr = 0, got_length = 0;
+    /* Cursor at p2's start_block: skip the PENDING p2, return p3. */
+    STM_ASSERT_OK(stm_alloc_first_allocated_from(a, stm_paddr_offset(p2),
+                                                    &got_paddr,
+                                                    &got_length));
+    STM_ASSERT_EQ(stm_paddr_offset(got_paddr), stm_paddr_offset(p3));
+    STM_ASSERT_EQ(got_length, 4u);
+
+    /* Free p3 too — only PENDING entries remain. ENOENT. */
+    STM_ASSERT_OK(stm_alloc_free(a, p3, /*free_gen=*/ 1));
+    STM_ASSERT_ERR(stm_alloc_first_allocated_from(a,
+                                                     stm_paddr_offset(p2),
+                                                     &got_paddr,
+                                                     &got_length),
+                     STM_ENOENT);
+
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(alloc_first_allocated_from_below_first_entry) {
+    /* Cursor below the first entry's start_block returns the first
+     * entry. Validates that scrub starting from cursor=0 picks up
+     * the leftmost live entry. */
+    make_tmp("first_from_below");
+    stm_bdev  *d = open_fresh_device();
+    stm_alloc *a = make_fresh_alloc(d);
+
+    uint64_t p1 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a, 4u, 0, &p1));
+
+    uint64_t got_paddr = 0, got_length = 0;
+    /* Cursor=0 is well below TEST_DATA_FIRST_BLOCK (2304). */
+    STM_ASSERT_OK(stm_alloc_first_allocated_from(a, 0,
+                                                    &got_paddr,
+                                                    &got_length));
+    STM_ASSERT_EQ(stm_paddr_offset(got_paddr), stm_paddr_offset(p1));
+    STM_ASSERT_EQ(got_length, 4u);
+
+    stm_alloc_close(a);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
 STM_TEST_MAIN("alloc")

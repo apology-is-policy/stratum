@@ -382,17 +382,29 @@ EVACUATING / REMOVED transitions are implemented.
 - [x] `stm_pool_open` refuses non-ONLINE state at slot 0 (R21 / P5-6
       P2-4) — metadata-primary invariant enforced at the construction
       boundary.
-- [x] **Replace-in-flight claim** (P5-8 / closes R22 P3-3 + P3-4):
+- [x] **Replace-in-flight claim** (P5-8 / closes R22 P3-3 + P3-4;
+      tightened R23 P3-2 in this chunk):
       `stm_sync_replace_device_online` claims the new slot atomically
       with the add (or with resume detection on retry).  While the
-      claim is held, `stm_pool_{add,remove,fail,rejoin}_device` and
-      `stm_pool_{begin,finish}_evacuation` on the claimed slot refuse
-      with `STM_EBUSY`.  `_locked` variants bypass — replace's own
-      internal pool ops can proceed.  Claim is idempotent on same-slot
-      reclaim (lets retry reclaim its own prior partial-state claim);
-      released only on full success of the replace.  Failed replace
-      leaves the claim held so the partial in-RAM state is protected
-      from concurrent mutators across the failure→retry window.
+      claim is held, `stm_pool_{remove,fail,rejoin}_device` and
+      `stm_pool_{begin,finish}_evacuation` on the **claimed slot**
+      refuse with `STM_EBUSY` (collision-only via `claim_blocks`;
+      mutators on non-claimed slots proceed normally).
+      `stm_pool_add_device` was strict ("any claim held → refuse")
+      through R23; R23 P3-2 close tightened it to **collision-only**
+      on the new tail position (`replace_claim == device_count`).
+      Since `set_replace_claim_locked` requires `slot < device_count`,
+      collision is impossible-by-construction in normal operation —
+      the check remains as defense-in-depth. The relaxation lets
+      legitimate concurrent admin ops (e.g., adding a hot-spare while
+      a replace evacuates a different device) succeed instead of
+      being rejected.
+      `_locked` variants bypass — replace's own internal pool ops
+      can proceed.  Claim is idempotent on same-slot reclaim (lets
+      retry reclaim its own prior partial-state claim); released
+      only on full success of the replace.  Failed replace leaves
+      the claim held so the partial in-RAM state is protected from
+      concurrent mutators across the failure→retry window.
 
 ### Replace-in-flight claim API (post-R23)
 
