@@ -137,3 +137,71 @@ stm_status stm_ub_key_schema_unpack(const uint8_t in[512],
     memcpy(&out->ks_root, in + 16, sizeof out->ks_root);
     return STM_OK;
 }
+
+/* ========================================================================= */
+/* Durable scrub state packing (P5-durable-cursors, v8).                      */
+/* ========================================================================= */
+
+/* On-disk layout (64 bytes) inside ub_scrub_state[]:
+ *   off  size   field
+ *   0    1      scrub_state (u8 enum)
+ *   1    1      reserved (zero)
+ *   2    2      cursor_device_id (le16)
+ *   4    4      reserved (zero)
+ *   8    8      cursor_start_block  (le64)
+ *  16    8      blocks_verified     (le64)
+ *  24    8      blocks_failed       (le64)
+ *  32    8      blocks_repaired     (le64)
+ *  40    8      blocks_unrepairable (le64)
+ *  48    8      ranges_processed    (le64)
+ *  56    8      snapshot_cursor     (le64)
+ *  64    -      total
+ */
+void stm_ub_scrub_state_pack(const stm_ub_scrub_state *state,
+                              uint8_t out[64])
+{
+    memset(out, 0, 64);
+    out[0] = state->scrub_state;
+    /* out[1] reserved */
+    le16 cd  = stm_store_le16(state->cursor_device_id);
+    memcpy(out + 2, cd.v, 2);
+    /* out[4..8) reserved */
+    le64 csb = stm_store_le64(state->cursor_start_block);
+    le64 bv  = stm_store_le64(state->blocks_verified);
+    le64 bf  = stm_store_le64(state->blocks_failed);
+    le64 br  = stm_store_le64(state->blocks_repaired);
+    le64 bu  = stm_store_le64(state->blocks_unrepairable);
+    le64 rp  = stm_store_le64(state->ranges_processed);
+    le64 sc  = stm_store_le64(state->snapshot_cursor);
+    memcpy(out + 8,  csb.v, 8);
+    memcpy(out + 16, bv.v,  8);
+    memcpy(out + 24, bf.v,  8);
+    memcpy(out + 32, br.v,  8);
+    memcpy(out + 40, bu.v,  8);
+    memcpy(out + 48, rp.v,  8);
+    memcpy(out + 56, sc.v,  8);
+}
+
+void stm_ub_scrub_state_unpack(const uint8_t in[64],
+                                 stm_ub_scrub_state *out)
+{
+    out->scrub_state = in[0];
+    le16 cd;
+    memcpy(cd.v, in + 2, 2);
+    out->cursor_device_id = stm_load_le16(cd);
+    le64 csb, bv, bf, br, bu, rp, sc;
+    memcpy(csb.v, in + 8,  8);
+    memcpy(bv.v,  in + 16, 8);
+    memcpy(bf.v,  in + 24, 8);
+    memcpy(br.v,  in + 32, 8);
+    memcpy(bu.v,  in + 40, 8);
+    memcpy(rp.v,  in + 48, 8);
+    memcpy(sc.v,  in + 56, 8);
+    out->cursor_start_block  = stm_load_le64(csb);
+    out->blocks_verified     = stm_load_le64(bv);
+    out->blocks_failed       = stm_load_le64(bf);
+    out->blocks_repaired     = stm_load_le64(br);
+    out->blocks_unrepairable = stm_load_le64(bu);
+    out->ranges_processed    = stm_load_le64(rp);
+    out->snapshot_cursor     = stm_load_le64(sc);
+}

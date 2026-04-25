@@ -1140,6 +1140,143 @@ STM_TEST(scrub_skips_faulted_devices) {
     }
 }
 
+/* ========================================================================= */
+/* P5-durable-cursors (γ): scrub state persists across mount.                  */
+/* ========================================================================= */
+
+/* Demonstrates the γ contract end-to-end: a scrub that's mid-run at
+ * shutdown resumes from the same cursor + counters on next mount.
+ * Walks: create pool → alloc → sync → reserve + commit → scrub create
+ * + start → step (advances cursor) → commit (captures durable) →
+ * close everything → reopen pool + alloc + sync_open → scrub_create
+ * → verify cursor + counters restored. */
+STM_TEST(scrub_durable_resumes_after_reopen) {
+    make_path("durable_resume");
+    stm_bdev *bd1 = open_device();
+    stm_pool *pool1 = make_single_pool(bd1, DEVICE_UUID);
+
+    stm_alloc *a1 = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bd1, POOL_UUID, DEVICE_UUID,
+                                     TEST_BOOTSTRAP_BYTES, &a1));
+
+    stm_sync *s1 = NULL;
+    STM_ASSERT_OK(stm_sync_create(pool1, a1, make_wk(), NULL, &s1));
+
+    /* Reserve 6 blocks across 2 ranges so scrub has work to do. */
+    uint64_t p1 = 0, p2 = 0;
+    STM_ASSERT_OK(stm_alloc_reserve(a1, 4u, 0, &p1));
+    STM_ASSERT_OK(stm_alloc_reserve(a1, 2u, 0, &p2));
+    /* Write content so scrub's per-block reads succeed. */
+    uint8_t blk[STM_UB_SIZE];
+    memset(blk, 0xD7, sizeof blk);
+    for (uint64_t b = 0; b < 4; b++) {
+        STM_ASSERT_OK(stm_bdev_write(bd1,
+                                       (stm_paddr_offset(p1) + b) * STM_UB_SIZE,
+                                       blk, sizeof blk));
+    }
+    for (uint64_t b = 0; b < 2; b++) {
+        STM_ASSERT_OK(stm_bdev_write(bd1,
+                                       (stm_paddr_offset(p2) + b) * STM_UB_SIZE,
+                                       blk, sizeof blk));
+    }
+    STM_ASSERT_OK(stm_sync_commit(s1));   /* persists alloc tree */
+
+    /* Create scrub, start, step once (processes one range = 4 blocks),
+     * then commit (captures durable scrub state). */
+    stm_scrub *sc1 = NULL;
+    STM_ASSERT_OK(stm_scrub_create(s1, &sc1));
+    STM_ASSERT_OK(stm_scrub_start(sc1));
+    STM_ASSERT_OK(stm_scrub_step(sc1));
+
+    stm_scrub_status st_pre;
+    STM_ASSERT_OK(stm_scrub_status_get(sc1, &st_pre));
+    STM_ASSERT_EQ((int)st_pre.state,        (int)STM_SCRUB_STATE_RUNNING);
+    STM_ASSERT_EQ(st_pre.blocks_verified,    4u);
+    STM_ASSERT_EQ(st_pre.ranges_processed,   1u);
+    /* Cursor advanced past p1; still pointing at device 0 (single-dev). */
+    STM_ASSERT_EQ(st_pre.cursor_device_id,   0u);
+    STM_ASSERT(st_pre.cursor_start_block >    0u);
+
+    /* Commit captures the live scrub state into ub_scrub_state[]. */
+    STM_ASSERT_OK(stm_sync_commit(s1));
+
+    /* Tear everything down to simulate a clean shutdown. */
+    stm_scrub_close(sc1);
+    stm_sync_close(s1);
+    stm_alloc_close(a1);
+    stm_pool_close(pool1);
+    stm_bdev_close(bd1);
+
+    /* Reopen the same backing file. Same UB ring, same scrub state on
+     * disk. */
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    stm_bdev *bd2 = NULL;
+    STM_ASSERT_OK(stm_bdev_open(g_path, &bo, &bd2));
+    stm_pool *pool2 = make_single_pool(bd2, DEVICE_UUID);
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(bd2, &a2));
+    stm_sync *s2 = NULL;
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
+
+    /* Create scrub on the reopened sync. Should restore mid-run state. */
+    stm_scrub *sc2 = NULL;
+    STM_ASSERT_OK(stm_scrub_create(s2, &sc2));
+
+    stm_scrub_status st_post;
+    STM_ASSERT_OK(stm_scrub_status_get(sc2, &st_post));
+    /* All in-RAM fields restored from the durable region. */
+    STM_ASSERT_EQ((int)st_post.state,         (int)st_pre.state);
+    STM_ASSERT_EQ(st_post.cursor_device_id,    st_pre.cursor_device_id);
+    STM_ASSERT_EQ(st_post.cursor_start_block,  st_pre.cursor_start_block);
+    STM_ASSERT_EQ(st_post.blocks_verified,     st_pre.blocks_verified);
+    STM_ASSERT_EQ(st_post.blocks_failed,       st_pre.blocks_failed);
+    STM_ASSERT_EQ(st_post.blocks_repaired,     st_pre.blocks_repaired);
+    STM_ASSERT_EQ(st_post.blocks_unrepairable, st_pre.blocks_unrepairable);
+    STM_ASSERT_EQ(st_post.ranges_processed,    st_pre.ranges_processed);
+
+    /* Drive scrub to completion to confirm continued forward progress. */
+    for (int i = 0; i < 10; i++) {
+        stm_scrub_status st;
+        STM_ASSERT_OK(stm_scrub_status_get(sc2, &st));
+        if (st.state == STM_SCRUB_STATE_COMPLETED) break;
+        STM_ASSERT_OK(stm_scrub_step(sc2));
+    }
+    stm_scrub_status st_done;
+    STM_ASSERT_OK(stm_scrub_status_get(sc2, &st_done));
+    STM_ASSERT_EQ((int)st_done.state,        (int)STM_SCRUB_STATE_COMPLETED);
+    STM_ASSERT_EQ(st_done.blocks_verified,    6u);   /* 4 + 2 across runs */
+    STM_ASSERT_EQ(st_done.ranges_processed,   2u);
+
+    stm_scrub_close(sc2);
+    stm_sync_close(s2);
+    stm_alloc_close(a2);
+    stm_pool_close(pool2);
+    stm_bdev_close(bd2);
+    unlink(g_path);
+}
+
+/* Regression: a fresh pool's first sync_create + scrub_create gives
+ * an IDLE state with all counters zero. Without this, a stale UB
+ * region of nonzero bytes could erroneously trigger restore-from-
+ * durable on a fresh pool. */
+STM_TEST(scrub_durable_fresh_pool_starts_idle) {
+    scrub_fx fx;
+    scrub_fx_open(&fx, "durable_fresh");
+
+    stm_scrub_status st;
+    STM_ASSERT_OK(stm_scrub_status_get(fx.sc, &st));
+    STM_ASSERT_EQ((int)st.state,            (int)STM_SCRUB_STATE_IDLE);
+    STM_ASSERT_EQ(st.cursor_device_id,       0u);
+    STM_ASSERT_EQ(st.cursor_start_block,     0u);
+    STM_ASSERT_EQ(st.blocks_verified,        0u);
+    STM_ASSERT_EQ(st.blocks_failed,          0u);
+    STM_ASSERT_EQ(st.blocks_repaired,        0u);
+    STM_ASSERT_EQ(st.blocks_unrepairable,    0u);
+    STM_ASSERT_EQ(st.ranges_processed,       0u);
+
+    scrub_fx_close(&fx);
+}
+
 /* R20 P3-3: concurrent scrub_step + pool fail_device / rejoin_device
  * stress test. Two threads — one drives scrub_step in a loop
  * (restarting on COMPLETED), the other toggles a non-primary slot

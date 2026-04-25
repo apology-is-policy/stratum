@@ -32,7 +32,7 @@ chapter as specs get wider cross-reference tables).
 | `metadata_nonce.tla` | 5 | Per-device paddr-stamping for nonces. | 51939 states | `metadata_nonce_buggy.cfg` |
 | `device_lifecycle.tla` | 5 | Roster state machine (add/remove/fail/rejoin). | large cfg: 10.6M states at depth 21 | `device_lifecycle_buggy.cfg` |
 | `evac.tla` | 5 | Per-block evacuation atomicity. | 13 states, depth 5 | `evac_buggy.cfg`, `evac_remove_no_drain_buggy.cfg` |
-| `scrub.tla` | 5 | Scrub state machine + β cb-classification. | 19 states, depth 8 (each of α + β configs) | `scrub_buggy.cfg` |
+| `scrub.tla` | 5 | Scrub state machine + β cb-classification + γ durable cursor. | small (each of α + β + γ configs; γ adds durable shadow + Persist/Crash/Mount) | `scrub_buggy.cfg` |
 
 All fixed configs green (one per module + a second β-mode config for
 `scrub.tla`). All 6 buggy configs reproduce their designed invariant
@@ -240,7 +240,7 @@ Buggy configs:
 Spec-to-code: `src/sync/sync.c::stm_sync_evacuation_step` +
 safe-removal wrappers.
 
-### `scrub.tla` — scrub state machine + β cb (P5-5-α + β)
+### `scrub.tla` — scrub state machine + β cb + γ durable (P5-5-α + β + γ)
 
 - `TypeOK`, `StateMachineValid`, `CursorBounded`.
 - `ProcessedCount` — verified + failed + repaired + unrepairable = cursor.
@@ -255,6 +255,19 @@ safe-removal wrappers.
   snapshot_cursor = cursor.
 - `NoWorkWhenIdleOrCompleted` — step doesn't advance cursor
   outside RUNNING.
+- **γ invariants**:
+  - `DurableProcessedCount` — durable counters obey `ProcessedCount`
+    (the durable side is a snapshot of in-RAM, which always
+    satisfies ProcessedCount, so this lifts).
+  - `CrashedMeansInRamFresh` — while `crashed = TRUE`, in-RAM is
+    reset to Init values (state=IDLE, all counters=0). Only
+    durable holds truth during the crashed window. Combined with
+    Mount's assignment (`cursor' = d_cursor`, etc.), this
+    structurally enforces "post-Mount cursor = last persisted
+    cursor" — γ's load-bearing safety property.
+  - `DurableCallbackSetExclusivity` — durable counters split by
+    mode same as in-RAM. Persist copies in-RAM (which obeys
+    CallbackSetExclusivity); Crash/Mount don't touch durable.
 
 CONSTANTS:
 - `NumBlocks` — total logical blocks to verify.
@@ -265,6 +278,11 @@ CONSTANTS:
   (TRUE). Disables `StepCorrupt` when TRUE; disables `StepRepaired` /
   `StepUnrepairable` when FALSE.
 - `BuggyResume ∈ BOOLEAN` — buggy-Resume toggle.
+- **`WithCrash ∈ BOOLEAN`** (γ extension) — when TRUE, the
+  `Crash` action is enabled (in-RAM zeroed, durable preserved,
+  `crashed` flag set). Mount restores in-RAM from durable and
+  clears `crashed`. While `WithCrash = FALSE`, crash never fires
+  and the spec collapses to α/β legacy behavior.
 
 Actions:
 - `Start` / `Restart` / `Reset` / `Pause` / `Resume` / `Complete` —
@@ -276,23 +294,42 @@ Actions:
   REPAIRED for `b ∈ RepairableBlocks`. Bumps `repaired`.
 - `StepUnrepairable(b)` — β-only; cb returned UNREPAIRABLE for
   `b ∈ CorruptBlocks \ RepairableBlocks`. Bumps `unrepairable`.
+- **γ — `Persist`**: copies in-RAM state to durable shadow.
+  Models `stm_sync_commit` capturing the live scrub state.
+- **γ — `Crash`** (gated on `WithCrash`): zeros in-RAM, sets
+  `crashed = TRUE`, durable preserved.
+- **γ — `Mount`**: restores in-RAM from durable, clears
+  `crashed`. Other actions are blocked while `crashed`.
 
 Fixed-α config (`scrub.cfg`, `CallbackSet=FALSE`,
-`RepairableBlocks={}`): 19 states at depth 8.
+`RepairableBlocks={}`, `WithCrash=FALSE`): all invariants hold;
+collapses to α legacy.
 
 Fixed-β config (`scrub_beta.cfg`, `CallbackSet=TRUE`,
-`CorruptBlocks={2,3}`, `RepairableBlocks={2}`): exercises StepClean
-on block 1, StepRepaired on block 2, StepUnrepairable on block 3.
-19 states at depth 8. All invariants hold including
+`CorruptBlocks={2,3}`, `RepairableBlocks={2}`, `WithCrash=FALSE`):
+exercises StepClean on block 1, StepRepaired on block 2,
+StepUnrepairable on block 3. All invariants hold including
 `CallbackSetExclusivity` (failed = 0 throughout).
 
+**Fixed-γ config (`scrub_durable.cfg`, `CallbackSet=FALSE`,
+`WithCrash=TRUE`)**: enables `Persist` / `Crash` / `Mount`
+actions on top of α. Verifies `CrashedMeansInRamFresh`,
+`DurableProcessedCount`, `DurableCallbackSetExclusivity` end-to-
+end across crash boundaries.
+
 Buggy-α config (`scrub_buggy.cfg`, `BuggyResume = TRUE`,
-`CallbackSet=FALSE`): `PauseResumeIdempotent` violated at State 5
-with 5-step trace `Init → Start → StepClean(1) → Pause → Resume`.
+`CallbackSet=FALSE`, `WithCrash=FALSE`): `PauseResumeIdempotent`
+violated at State 5 with 5-step trace
+`Init → Start → StepClean(1) → Pause → Resume`.
 
 Spec-to-code: `src/scrub/scrub.c::stm_scrub_{start, pause, resume,
 reset, step, set_verify_cb}` + SPEC-TO-CODE table inline at top of
 scrub.c. Per-block β cb dispatch in `scrub_verify_range_locked`.
+γ durable wiring: `scrub_persist_cb` (impl helper bound at
+`stm_scrub_create` via `stm_sync_set_scrub_persist_cb`); restore
+on `stm_scrub_create` via `stm_sync_get_scrub_durable_bytes` +
+`stm_ub_scrub_state_unpack`. On-disk format: `ub_scrub_state[64]`
+in `stm_uberblock` (v8 layout, see reference/07-sb-sync.md).
 
 ## Running TLC
 
@@ -314,6 +351,9 @@ done
 echo "== scrub (β) ==" && \
   java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
       -config scrub_beta.cfg scrub.tla 2>&1 | tail -3
+echo "== scrub (γ durable) ==" && \
+  java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
+      -config scrub_durable.cfg scrub.tla 2>&1 | tail -3
 
 # Buggy-config sanity (each must VIOLATE as expected):
 for cfg in quorum_buggy metadata_nonce_buggy device_lifecycle_buggy \

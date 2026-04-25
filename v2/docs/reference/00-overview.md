@@ -143,8 +143,9 @@ any version other than the current one.
 | 4 → 5 | P5-1: populate roster fields (`ub_device_count`, `ub_roster[2048]`, `ub_roster_hash`). |
 | 5 → 6 | P5-3b: `ub_alloc_root` now points at the pool-level alloc-roots object (`STM_BPTR_KIND_ALLOC_ROOTS`) instead of a single alloc tree. |
 | 6 → 7 | P5-3c: per-alloc-roots entry gains per-tree `root_gen` (value layout 40 → 48 bytes); needed for per-device independent-commit-gen handling. |
+| 7 → 8 | P5-durable-cursors: `ub_scrub_state[64]` carved from `ub_reserved` to persist scrub state across mount (ARCH §7.14.1; closes Phase 5 exit criterion 4 / scrub-durable aspect of #3). |
 
-Current: `STM_UB_VERSION == 7` (see `include/stratum/super.h:100`).
+Current: `STM_UB_VERSION == 8` (see `include/stratum/super.h:100`).
 
 ### Merkle-rooted integrity
 

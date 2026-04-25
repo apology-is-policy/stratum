@@ -221,6 +221,16 @@ struct stm_sync {
      * on wedged (the handle is no longer trustworthy). */
     bool              read_only;
     bool              wedged;
+
+    /* P5-durable-cursors: 64-byte opaque scrub state region.
+     * sync_open reads ub_scrub_state[] from disk into this buffer;
+     * build_uberblock writes it back. scrub.c pushes updated bytes
+     * via stm_sync_set_scrub_durable_bytes after every state-
+     * changing op; sync_commit reads with no further coordination.
+     *
+     * Initially zero (= scrub IDLE / all counters zero); fresh
+     * pools see this naturally. */
+    uint8_t           scrub_durable[64];
 };
 
 /* ========================================================================= */
@@ -601,6 +611,14 @@ static void build_uberblock(stm_uberblock *out,
         memcpy(out->ub_alloc_root.bp_csum, alloc_root_csum, 32);
     }
     out->ub_alloc_root_gen = stm_store_le64(alloc_root_gen);
+
+    /* P5-durable-cursors: persist whatever durable scrub bytes sync
+     * currently holds. scrub.c pushes updates via
+     * stm_sync_set_scrub_durable_bytes after every state-changing
+     * op, so this region reflects the latest scrub state without
+     * cross-locking. Without a bound scrub, the region round-trips
+     * unchanged (zeros for fresh pools). */
+    memcpy(out->ub_scrub_state, s->scrub_durable, 64);
 
     /* P4-1: Merkle root + per-pool salt. Mount-time verifier
      * recomputes the root against per-tree-root csums + salt, and
@@ -1174,6 +1192,12 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
     memcpy(s2->alloc_root_csum,  ub.ub_alloc_root.bp_csum, 32);
     memcpy(s2->merkle_root,      ub.ub_merkle_root,      32);
 
+    /* P5-durable-cursors: read durable scrub state from the canonical
+     * UB. Re-emitted by every subsequent commit (until a scrub handle
+     * binds and overwrites it). On a fresh / pre-v8 pool this region
+     * was zero, which unpacks to scrub IDLE / all counters zero. */
+    memcpy(s2->scrub_durable, ub.ub_scrub_state, 64);
+
     /* P4-4a: unpack the key-schema header, load the sub-tree.
      * Keyschema lives on device 0 (metadata primary in P5-2 MVP). */
     stm_bdev *meta_bdev = stm_pool_device_bdev(p, 0);
@@ -1694,6 +1718,32 @@ stm_alloc *stm_sync_alloc(const stm_sync *s, uint16_t device_id)
     stm_alloc *a = s->allocs[device_id];
     pthread_mutex_unlock(&ms->lock);
     return a;
+}
+
+/* ========================================================================= */
+/* P5-durable-cursors: scrub-state durable bytes (push from scrub).           */
+/* ========================================================================= */
+
+stm_status stm_sync_set_scrub_durable_bytes(stm_sync     *s,
+                                              const uint8_t bytes[64])
+{
+    if (!s || !bytes) return STM_EINVAL;
+    pthread_mutex_lock(&s->lock);
+    memcpy(s->scrub_durable, bytes, 64);
+    pthread_mutex_unlock(&s->lock);
+    return STM_OK;
+}
+
+void stm_sync_get_scrub_durable_bytes(const stm_sync *s, uint8_t out[64])
+{
+    if (!s || !out) {
+        if (out) memset(out, 0, 64);
+        return;
+    }
+    stm_sync *ms = (stm_sync *)s;
+    pthread_mutex_lock(&ms->lock);
+    memcpy(out, s->scrub_durable, 64);
+    pthread_mutex_unlock(&ms->lock);
 }
 
 /* ========================================================================= */

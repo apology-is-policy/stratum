@@ -62,7 +62,7 @@ uberblock.
 | Offset | Size | Field | Meaning |
 |---|---|---|---|
 | 0 | 8 | `ub_magic` | `0x324d555441525453` (ASCII "STRATUM2"). |
-| 8 | 4 | `ub_version` | Currently `STM_UB_VERSION = 7`. |
+| 8 | 4 | `ub_version` | Currently `STM_UB_VERSION = 8`. |
 | 12–20 | 12 | feature flags | `compat` / `ro_compat` / `incompat` (ARCH §5.2). |
 | 24 | 16 | `ub_pool_uuid` | Pool identity. |
 | 40 | 16 | `ub_device_uuid` | This device's identity. |
@@ -72,7 +72,7 @@ uberblock.
 | 80 | 2 | `ub_device_count` | Roster size. |
 | 82 | 2 | `ub_device_id` | This device's slot in the roster. |
 | 96 | 64 | `ub_main_root` | Main FS tree root bptr (future). |
-| 160 | 64 | `ub_alloc_root` | v7: points at alloc-roots object (`STM_BPTR_KIND_ALLOC_ROOTS`). |
+| 160 | 64 | `ub_alloc_root` | v7+: points at alloc-roots object (`STM_BPTR_KIND_ALLOC_ROOTS`). |
 | 224 | 64 | `ub_snap_root` | Snapshot tree root (future). |
 | 288 | 64 | `ub_cas_index_root` | CAS index root (future). |
 | 352 | 32 | `ub_merkle_root` | Root of the Merkle chain over all metadata. |
@@ -86,7 +86,8 @@ uberblock.
 | 960 | 2048 | `ub_roster[2048]` | 64 × 32 B roster entries. |
 | 3008 | 32 | `ub_merkle_root_salt` | Per-pool random salt. |
 | 3040 | 8 | `ub_alloc_root_gen` | Gen at which alloc-root tree was encrypted. |
-| 3048 | 1016 | `ub_reserved` | Future fields. |
+| 3048 | 64 | `ub_scrub_state` | v8: durable scrub state (P5-durable-cursors). Layout: u8 state + u8 reserved + le16 cursor_device_id + 4 reserved + le64 cursor_start_block + le64 ×6 counters (verified, failed, repaired, unrepairable, ranges_processed, snapshot_cursor). Pack/unpack via `stm_ub_scrub_state_pack/_unpack`. Refreshed at every `sync_commit` if a scrub handle is bound (cb registered via `stm_sync_set_scrub_persist_cb`); otherwise round-trips. |
+| 3112 | 952 | `ub_reserved` | Future fields. |
 | 4064 | 32 | `ub_csum` | BLAKE3 over bytes [0, 4064). |
 
 `_Static_assert(sizeof(stm_uberblock) == 4096)` catches accidental
@@ -336,7 +337,7 @@ atomically so add / attach / commit / detach composes in one step.
 |---|---|---|
 | `test_sb` | 18 | Encode / decode roundtrip; csum tamper rejected; magic tamper → STM_ENOENT; version tamper → STM_EBADVERSION; zero-gen rejected; label offsets; label_read / label_write; mount_scan picks highest valid. |
 | `test_sync` | 19 | Single-device commit + remount; MountGenBump; alloc-root tree encoded under correct key; version boundary refusals. |
-| `test_sync_multi` | 42 | 3-device quorum roundtrip; 1-of-3 device loss tolerated; sub-quorum refused (STM_EQUORUM); orphan-ahead-of-quorum ignored; content-quorum tested; alloc-roots indirection; v5/v6 version refusals; mirror(2) + mirror(3) roundtrips + tampered-replica fallback; reserve refuses NONE profile; attach_alloc arg validation; RO pool refuses write ops; wedge refusal; keyschema idempotent commit produces byte-identical UBs; replace_device_online resume from step-3 commit failure; same-uuid-different-alloc refused; slot-0 spoofing refused; multi-retry converges; **commit succeeds with one FAULTED device** (R21 P1); replace-claim blocks concurrent mutators on the claimed slot via sync-wrapper bypass-closed (R23 P3-4). |
+| `test_sync_multi` | 42 | 3-device quorum roundtrip; 1-of-3 device loss tolerated; sub-quorum refused (STM_EQUORUM); orphan-ahead-of-quorum ignored; content-quorum tested; alloc-roots indirection; v5/v6/v7 version refusals (the v5 test exercises one prior version; impl rejects all non-`STM_UB_VERSION` uniformly); mirror(2) + mirror(3) roundtrips + tampered-replica fallback; reserve refuses NONE profile; attach_alloc arg validation; RO pool refuses write ops; wedge refusal; keyschema idempotent commit produces byte-identical UBs; replace_device_online resume from step-3 commit failure; same-uuid-different-alloc refused; slot-0 spoofing refused; multi-retry converges; **commit succeeds with one FAULTED device** (R21 P1); replace-claim blocks concurrent mutators on the claimed slot via sync-wrapper bypass-closed (R23 P3-4). |
 
 ## Status
 

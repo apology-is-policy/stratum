@@ -94,6 +94,34 @@ static void scrub_reset_counters_locked(stm_scrub *sc)
     sc->ranges_processed    = 0;
 }
 
+/* P5-durable-cursors: pack the live scrub state into the on-disk
+ * 64-byte form and push it into sync's durable buffer. Caller must
+ * hold sc->lock; the push takes sync.lock briefly (lock order:
+ * sc.lock OUTER → sync.lock INNER, symmetric with stm_scrub_step's
+ * use of stm_sync_alloc). */
+static void scrub_push_durable_locked(stm_scrub *sc)
+{
+    stm_ub_scrub_state st = {
+        .scrub_state         = (uint8_t)sc->state,
+        .cursor_device_id    = sc->cursor_device_id,
+        .cursor_start_block  = sc->cursor_start_block,
+        .blocks_verified     = sc->blocks_verified,
+        .blocks_failed       = sc->blocks_failed,
+        .blocks_repaired     = sc->blocks_repaired,
+        .blocks_unrepairable = sc->blocks_unrepairable,
+        .ranges_processed    = sc->ranges_processed,
+        /* scrub.tla's snapshot_cursor is auxiliary; the impl
+         * doesn't track it (PauseResumeIdempotent is structurally
+         * enforced by Resume not zeroing the cursor). Pack 0 for
+         * forward-compat with future spec extensions that might
+         * persist it explicitly. */
+        .snapshot_cursor     = 0,
+    };
+    uint8_t buf[64];
+    stm_ub_scrub_state_pack(&st, buf);
+    (void)stm_sync_set_scrub_durable_bytes(sc->sync, buf);
+}
+
 stm_status stm_scrub_create(stm_sync *sync, stm_scrub **out_scrub)
 {
     if (!sync || !out_scrub) return STM_EINVAL;
@@ -107,7 +135,37 @@ stm_status stm_scrub_create(stm_sync *sync, stm_scrub **out_scrub)
     }
     sc->sync  = sync;
     sc->pool  = pool;
-    sc->state = STM_SCRUB_STATE_IDLE;
+
+    /* P5-durable-cursors: restore from the durable scrub-state region
+     * that sync_open populated at mount time. Fresh pools have all
+     * zeros there, which unpacks to IDLE / zero counters — matches
+     * the IDLE-init this struct already had. Pre-existing pools that
+     * were mid-scrub at shutdown resume their state automatically. */
+    uint8_t durable[64];
+    stm_sync_get_scrub_durable_bytes(sync, durable);
+    stm_ub_scrub_state st;
+    stm_ub_scrub_state_unpack(durable, &st);
+    /* Clamp the on-disk state byte against the enum range — defensive
+     * against a corrupt or future-extended UB that carries a state
+     * value we don't recognize. Out-of-range states fall back to
+     * IDLE (the safe default; caller can stm_scrub_start to begin
+     * a fresh run). */
+    if (st.scrub_state == STM_SCRUB_STATE_IDLE      ||
+        st.scrub_state == STM_SCRUB_STATE_RUNNING   ||
+        st.scrub_state == STM_SCRUB_STATE_PAUSED    ||
+        st.scrub_state == STM_SCRUB_STATE_COMPLETED) {
+        sc->state = (stm_scrub_state)st.scrub_state;
+    } else {
+        sc->state = STM_SCRUB_STATE_IDLE;
+    }
+    sc->cursor_device_id    = st.cursor_device_id;
+    sc->cursor_start_block  = st.cursor_start_block;
+    sc->blocks_verified     = st.blocks_verified;
+    sc->blocks_failed       = st.blocks_failed;
+    sc->blocks_repaired     = st.blocks_repaired;
+    sc->blocks_unrepairable = st.blocks_unrepairable;
+    sc->ranges_processed    = st.ranges_processed;
+
     *out_scrub = sc;
     return STM_OK;
 }
@@ -132,6 +190,7 @@ stm_status stm_scrub_start(stm_scrub *sc)
 
     scrub_reset_counters_locked(sc);
     sc->state = STM_SCRUB_STATE_RUNNING;
+    scrub_push_durable_locked(sc);
 
     pthread_mutex_unlock(&sc->lock);
     return STM_OK;
@@ -147,6 +206,7 @@ stm_status stm_scrub_pause(stm_scrub *sc)
         return STM_EINVAL;
     }
     sc->state = STM_SCRUB_STATE_PAUSED;
+    scrub_push_durable_locked(sc);
 
     pthread_mutex_unlock(&sc->lock);
     return STM_OK;
@@ -164,6 +224,7 @@ stm_status stm_scrub_resume(stm_scrub *sc)
     /* Spec's PauseResumeIdempotent: cursor + counters must survive a
      * Pause/Resume. We just flip the state byte; nothing else moves. */
     sc->state = STM_SCRUB_STATE_RUNNING;
+    scrub_push_durable_locked(sc);
 
     pthread_mutex_unlock(&sc->lock);
     return STM_OK;
@@ -180,6 +241,7 @@ stm_status stm_scrub_reset(stm_scrub *sc)
     }
     scrub_reset_counters_locked(sc);
     sc->state = STM_SCRUB_STATE_IDLE;
+    scrub_push_durable_locked(sc);
 
     pthread_mutex_unlock(&sc->lock);
     return STM_OK;
@@ -341,6 +403,7 @@ stm_status stm_scrub_step(stm_scrub *sc)
             /* Cursor drained — Complete. (scrub.tla: Complete action.) */
             stm_pool_unlock_shared(sc->pool);
             sc->state = STM_SCRUB_STATE_COMPLETED;
+            scrub_push_durable_locked(sc);
             pthread_mutex_unlock(&sc->lock);
             return STM_OK;
         }
@@ -407,6 +470,7 @@ stm_status stm_scrub_step(stm_scrub *sc)
          * `start + length <= UINT48_MAX`. */
         sc->cursor_start_block = start_block + length;
         stm_pool_unlock_shared(sc->pool);
+        scrub_push_durable_locked(sc);
         pthread_mutex_unlock(&sc->lock);
         return STM_OK;
     }

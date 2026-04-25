@@ -96,8 +96,21 @@ extern "C" {
  * 40-byte leaf values would length-check-fail at the v7 reader's
  * decode_val (AR_VAL_LEN = 48 assertion). Version bump gates this
  * up-front with STM_EBADVERSION at mount, same policy as v5 → v6.
- * Feature-flag bump unnecessary (full version bump per ARCH §5.9). */
-#define STM_UB_VERSION        7u
+ * Feature-flag bump unnecessary (full version bump per ARCH §5.9).
+ *
+ * v7 → v8 (Phase 5 P5-durable-cursors): `ub_scrub_state[64]` carved
+ * from the head of `ub_reserved`, persisting the in-RAM scrub state
+ * across mount (ARCH §7.14.1, ROADMAP §8.2 criterion 4). On every
+ * sync_commit the current scrub (state, cursor_device_id,
+ * cursor_start_block, blocks_verified, blocks_failed, blocks_repaired,
+ * blocks_unrepairable, ranges_processed, snapshot_cursor) is written
+ * to this region; on mount the state is restored. Evacuation does
+ * NOT need its own durable region — it's already implicitly durable
+ * via roster (`ub_roster[]` carries device_state) + per-device
+ * alloc tree (carries the un-evacuated blocks). v7 pools had this
+ * region zero (interpretable as IDLE/zero — but the version bump
+ * makes intent explicit and refuses v7 mounts up-front per ARCH §5.9). */
+#define STM_UB_VERSION        8u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */
@@ -278,8 +291,16 @@ typedef struct {
      * existing tree decryptable. */
     le64    ub_alloc_root_gen;                  /* 3040 :  8 */
 
+    /* Durable scrub state (P5-durable-cursors, v8). 64 bytes packed
+     * with explicit field ordering: state (u8), cursor_device_id
+     * (u16, after 1-byte alignment), cursor_start_block (le64),
+     * blocks_{verified,failed,repaired,unrepairable} (le64 each),
+     * ranges_processed (le64), snapshot_cursor (le64).
+     * Format: see stm_ub_scrub_state below for the unpacked C view. */
+    uint8_t ub_scrub_state[64];                 /* 3048 :  64 */
+
     /* Reserved for future fields + alignment to csum. */
-    uint8_t ub_reserved[1016];                  /* 3048 : 1016 */
+    uint8_t ub_reserved[952];                   /* 3112 : 952 */
 
     /* Checksum: BLAKE3-256 over the rest of the uberblock with this
      * field zeroed. Self-verifying; a blob whose first 4064 bytes
@@ -288,6 +309,46 @@ typedef struct {
 } stm_uberblock;
 
 _Static_assert(sizeof(stm_uberblock) == 4096, "stm_uberblock must be 4096 bytes");
+_Static_assert(offsetof(stm_uberblock, ub_alloc_root_gen) == 3040,
+               "ub_alloc_root_gen must be at offset 3040 (v8 layout)");
+_Static_assert(offsetof(stm_uberblock, ub_scrub_state) == 3048,
+               "ub_scrub_state must be at offset 3048 (v8 layout)");
+_Static_assert(offsetof(stm_uberblock, ub_reserved) == 3112,
+               "ub_reserved must be at offset 3112 (v8 layout)");
+_Static_assert(offsetof(stm_uberblock, ub_csum) == 4064,
+               "ub_csum must be at offset 4064");
+
+/* ========================================================================= */
+/* Durable scrub state (P5-durable-cursors, packs into ub_scrub_state[64]).   */
+/* ========================================================================= */
+
+/* The unpacked view of `stm_uberblock.ub_scrub_state[64]`. Use
+ * stm_ub_scrub_state_pack / _unpack to convert between this and the
+ * on-disk byte form. Layout is little-endian; matches the spec
+ * variables in v2/specs/scrub.tla under the γ extension. */
+typedef struct {
+    uint8_t  scrub_state;            /* stm_scrub_state enum value */
+    uint16_t cursor_device_id;
+    uint64_t cursor_start_block;
+    uint64_t blocks_verified;
+    uint64_t blocks_failed;
+    uint64_t blocks_repaired;
+    uint64_t blocks_unrepairable;
+    uint64_t ranges_processed;
+    uint64_t snapshot_cursor;
+} stm_ub_scrub_state;
+
+/* Pack `state` into the 64-byte on-disk region. Always writes 64
+ * bytes; trailing region zeroed for alignment + future growth. */
+void stm_ub_scrub_state_pack(const stm_ub_scrub_state *state,
+                              uint8_t out[64]);
+
+/* Unpack the 64-byte on-disk region into `*out`. No validation —
+ * the UB-level csum already covers integrity. The fresh-pool case
+ * (all-zero region) unpacks to {scrub_state=0 (IDLE), all counters
+ * zero}, which matches scrub.tla's Init. */
+void stm_ub_scrub_state_unpack(const uint8_t in[64],
+                                 stm_ub_scrub_state *out);
 
 /* ========================================================================= */
 /* Key-schema header (packed into ub_key_schema[512], P4-4a).                 */

@@ -457,13 +457,14 @@ STM_TEST(pool_fs_roundtrip_populates_roster) {
     STM_ASSERT_OK(stm_sb_mount_scan(d, &ub, &lbl, &slot));
     stm_bdev_close(d);
 
-    /* P5-3c + R15 F6 bumped STM_UB_VERSION 6 → 7 for the roots-
-     * object leaf's value layout change (per-entry root_gen). The
-     * constant symbol is what we assert on; the literal 7 is
-     * restated here so a future version bump that forgets to update
-     * this test fails loudly. */
+    /* P5-durable-cursors bumped STM_UB_VERSION 7 → 8 for the
+     * `ub_scrub_state[64]` field carved from `ub_reserved`. Prior
+     * bumps: P5-3c + R15 F6 (6 → 7 for roots-object leaf value
+     * layout). The constant symbol is what we assert on; the
+     * literal 8 is restated here so a future version bump that
+     * forgets to update this test fails loudly. */
     STM_ASSERT_EQ(stm_load_le32(ub.ub_version), STM_UB_VERSION);
-    STM_ASSERT_EQ(STM_UB_VERSION, 7u);
+    STM_ASSERT_EQ(STM_UB_VERSION, 8u);
 
     /* Roster fields are populated. */
     STM_ASSERT_EQ(stm_load_le16(ub.ub_device_count), 1u);

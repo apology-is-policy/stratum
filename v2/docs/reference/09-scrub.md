@@ -1,4 +1,4 @@
-# 09 — Scrub (P5-5-α + β)
+# 09 — Scrub (P5-5-α + β + γ)
 
 ## Purpose
 
@@ -20,7 +20,15 @@ manager: P6's bptr layer will plug a real cb that walks the
 replica list, picks a verified replica, and rewrites the bad
 device per ARCH §7.15. Tests today pass stub callbacks.
 
-No durable cursor (γ), no IO throttling (future).
+**γ — durable cursor**: scrub state (state, cursor, all counters) is
+persisted in `stm_uberblock.ub_scrub_state[64]` on every
+`stm_sync_commit`. On `stm_sync_open`, the bytes are read into
+`s->scrub_durable[64]`; `stm_scrub_create` then unpacks and restores
+the in-RAM state. A scrub running at shutdown therefore resumes its
+cursor + counters on the next mount automatically (ARCH §7.14.1).
+Format break: `STM_UB_VERSION` 7 → 8.
+
+No IO throttling per priority (post-v2.0).
 
 State machine lives entirely in RAM. Operators drive steps
 manually; a step processes one allocated range at a time.
@@ -379,7 +387,7 @@ SPEC-TO-CODE:
 
 ## Tests
 
-`tests/test_scrub.c` (27 tests):
+`tests/test_scrub.c` (29 tests):
 
 - Lifecycle: `scrub_create_initial_state_is_idle`,
   `scrub_create_rejects_null_args`, `scrub_status_get_rejects_null_args`.
@@ -426,6 +434,12 @@ SPEC-TO-CODE:
   stamping; dev 0 → OK, dev 1 → REPAIRED; counters sum across
   devices), `scrub_no_cb_falls_back_to_alpha_behavior`
   (regression: with no cb installed, β scrub identical to α).
+- γ durable cursor: `scrub_durable_resumes_after_reopen`
+  (creates pool, scrubs partial, commits, closes everything,
+  reopens, asserts state restored byte-for-byte; finishes scrub
+  to completion across the mount boundary),
+  `scrub_durable_fresh_pool_starts_idle` (regression: fresh
+  pool's scrub_create gives IDLE state with zero counters).
 
 All green on default + ASan + TSan.
 
@@ -513,15 +527,29 @@ Deferred (γ-scope / future):
 - [ ] **P3-6** (γ): Spec models single-stream cursor; γ's
       durable-cursor work will need device-aware spec extension.
 
-### γ pipeline
+### γ posture (closed in P5-durable-cursors chunk)
 
-- **P5-5-γ**: durable pause/resume cursor. Persist cursor in a new
-  UB field or dedicated scrub-metadata object. May bump
-  `STM_UB_VERSION`. Enables resume across unmount/remount.
-- **Future**: IO throttling (ARCH §7.14.3 low/medium/high priority),
-  per-device parallelism (ARCH §12.7.1 "one thread per device"),
-  P6 extent manager wiring (the bptr-aware verify-cb that replaces
-  test stubs with a real replica-list iterator).
+- [x] **Durable cursor**: scrub state persists across mount via
+      `stm_uberblock.ub_scrub_state[64]`. `STM_UB_VERSION` bumped
+      7 → 8. `stm_sync_set_scrub_persist_cb` registers the live-
+      state capture; `stm_scrub_create` restores from
+      `stm_sync_get_scrub_durable_bytes`.
+- [x] **Spec extension**: `scrub.tla` gains `WithCrash` CONSTANT
+      + durable-shadow variables + `Persist` / `Crash` / `Mount`
+      actions + `CrashedMeansInRamFresh` /
+      `DurableProcessedCount` / `DurableCallbackSetExclusivity`
+      invariants. New `scrub_durable.cfg` clean.
+
+### Future / out-of-Phase-5 pipeline
+
+- **IO throttling per priority** (ARCH §7.14.3 low/medium/high):
+  token-bucket on bdev_read submit rate. Deferred to **post-v2.0**
+  per ROADMAP §8.6 + §14.1.
+- **Per-device parallelism** (ARCH §12.7.1 "one thread per device"):
+  α/β/γ all serialize today. Future enhancement.
+- **P6 extent manager wiring**: the bptr-aware verify-cb that
+  replaces test stubs with a real replica-list iterator. See
+  ROADMAP §9.6 carry-over.
 
 ## Known caveats
 
@@ -540,8 +568,9 @@ Deferred (γ-scope / future):
   gives no indication that coverage was degraded. Operators
   monitoring "scrub finished without errors" may misread the
   signal. R20 P2-3.
-- **In-RAM cursor only**. An unmount mid-scrub loses the cursor;
-  the next mount starts from (0, 0). γ addresses.
+- ~~**In-RAM cursor only**~~. **CLOSED by γ (P5-durable-cursors)**:
+  scrub state now persists in `stm_uberblock.ub_scrub_state[64]`
+  on every commit; mount restores cursor + counters automatically.
 - **Single-threaded step**. Per-device parallelism is future
   work. Large pools with many devices scrub serially.
 - **β cb under sc->lock + pool->rdlock**: long-running cbs (e.g. a

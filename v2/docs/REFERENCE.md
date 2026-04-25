@@ -38,16 +38,18 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `fd2ef4a` (R25 / backlog hygiene scope close + ROADMAP
-  §8.6 deferral persistence — backlog empty; deferrals indexed at
-  ROADMAP §8.6 with P6 (§9.6) + post-v2.0 (§14) carry-over
-  pointers).
-- **Phases**: 1–4 complete; Phase 5 in progress — through R24 +
-  backlog hygiene (P5-5-β audited clean; deferred items cleared
-  for the path to γ).
+- **Tip**: *(pending)* (P5-durable-cursors — STM_UB_VERSION 7→8;
+  scrub state persists across mount via `ub_scrub_state[64]`;
+  evacuation already implicitly durable via roster + alloc tree
+  per evac.tla annotation; closes Phase 5 exit criteria #3
+  (scrub-durable aspect) and #4).
+- **Phases**: 1–4 complete; Phase 5 substantively complete after
+  P5-durable-cursors lands (γ closes the in-Phase-5 work; remaining
+  P6 carry-overs documented in ROADMAP §9.6, post-v2.0 carry-overs
+  in §14).
 - **Tests**: 28 suites × (default + ASan + TSan, serial) green.
-  test_sync_multi 42; test_pool 47; test_scrub 27; test_alloc 32.
-- **Specs**: 13 TLA+ modules clean (14 fixed configs incl. `scrub_beta`)
+  test_sync_multi 42; test_pool 47; test_scrub 29; test_alloc 32.
+- **Specs**: 13 TLA+ modules clean (15 fixed configs: legacy + scrub_beta + scrub_durable)
   + 6 buggy-demo configs fire as expected.
 - **LOC**: ~26 KLOC across 21 src/ modules + 25 public headers.
 

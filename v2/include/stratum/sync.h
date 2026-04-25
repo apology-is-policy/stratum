@@ -245,6 +245,49 @@ stm_status stm_sync_commit(stm_sync *s);
 void stm_sync_close(stm_sync *s);
 
 /* ========================================================================= */
+/* P5-durable-cursors — scrub state durable bytes (push from scrub).          */
+/* ========================================================================= */
+
+/* Update the 64-byte durable scrub-state region that sync persists
+ * on the next stm_sync_commit. The bytes must match the layout
+ * documented for `stm_uberblock.ub_scrub_state[64]` (see
+ * stm_ub_scrub_state_pack in <stratum/super.h>).
+ *
+ * Push-from-scrub design (vs a sync→scrub callback): scrub.c calls
+ * this after every state-changing op (Start, Pause, Resume, Reset,
+ * Restart, Step, ...). The setter takes sync's internal lock
+ * briefly to memcpy the bytes; sync_commit reads from its buffer
+ * with no further coordination. Avoids the lock inversion that a
+ * sync→scrub callback would create (sync_commit holds sync.lock
+ * and would need scrub's lock; scrub_step holds sc.lock and uses
+ * stm_sync_alloc which briefly takes sync.lock).
+ *
+ * Caller must already hold its own scrub-side lock (if any) when
+ * computing the bytes; this function does not coordinate with the
+ * scrub side.
+ *
+ * Lock order: sc.lock (caller-held) OUTER → sync.lock INNER (taken
+ * briefly by this setter). Symmetric with stm_scrub_step's existing
+ * use of stm_sync_alloc.
+ *
+ * Returns STM_EINVAL on NULL args.
+ */
+STM_MUST_USE
+stm_status stm_sync_set_scrub_durable_bytes(stm_sync     *s,
+                                              const uint8_t bytes[64]);
+
+/* Read back the durable scrub-state bytes that sync currently holds.
+ * After sync_open, this returns the bytes that were on disk in the
+ * authoritative UB at mount time — useful for stm_scrub_create to
+ * restore the in-RAM state at handle init.
+ *
+ * Always succeeds for a valid handle; never blocks (reads under the
+ * sync lock briefly). Buffer is exactly 64 bytes.
+ */
+void stm_sync_get_scrub_durable_bytes(const stm_sync *s,
+                                        uint8_t out[64]);
+
+/* ========================================================================= */
 /* Inspection.                                                                */
 /* ========================================================================= */
 
