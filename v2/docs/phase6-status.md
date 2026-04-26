@@ -38,18 +38,20 @@ Phase 6 also picks up three P5 carry-overs per ROADMAP §9.6:
 | `34d89f5` + `000d394` | P6-3 C impl: snapshot module — in-RAM MVP per snapshot.tla. New `src/snapshot/snapshot.{h,c}` (~480 LOC) + 22 tests. Atomic Create/Delete/Hold/Release under pthread ERRORCHECK mutex; per-dataset chain via prev_snap_id (linked at Create from most_recent); O(n) linear-array storage; persistent storage (ub_snap_root wiring) is a follow-on chunk. R29 audit close 0 P0 / 0 P1 / 3 P2 / 4 P3 + self-audit P1 carry-back to dataset module (must_lock/must_unlock abort on EDEADLK). | 31/31 ctest pass on default + ASan + TSan; test_snapshot 22 cases including TSan-clean concurrent stress on both per-dataset and same-dataset chains. |
 | `3527fe2` + `8be3628` | P6-4 C impl: property API on dataset module — in-RAM MVP per property.tla. Extends `include/stratum/dataset.h` + `src/dataset/dataset.c` (no new module). Three property kinds (INHERITABLE/NONINHERITABLE/IMMUTABLE) covering ARCH §8.4.2 representative properties (compress/quota/encryption). Local override + parent-chain walk + pool default + immutable-set-once semantics. Test_dataset grows 28 → 40 cases. R30 audit close 0 P0 / 0 P1 / 2 P2 / 4 P3, all 6 addressed (clear-on-immutable contract tightened; root-effective tests + concurrent property stress added; spec-vs-impl divergence on IMMUTABLE-at-Create documented). | 31/31 ctest pass on default + ASan + TSan; test_dataset 40 cases; TSan-clean concurrent property stress on shared dataset. |
 | `3db8b5e` | P6-5 spec scaffold: `clone.tla` (clone lifecycle — clone-from-snap + SnapWithClonesUndeletable + Promote-breaks-dependency) + 1 fixed cfg + 1 buggy cfg. C impl deferred (extends dataset module with origin_snap_id field). Spec posture jumps to 18/21/16. | TLC: clone 161 states/depth 11 clean; buggy demo fires CloneOriginPresent. |
+| `348d165` | **P6-persist: dataset + snapshot persistent storage + STM_UB_VERSION 8 → 9.** Two new uberblock fields (`ub_main_root_gen`, `ub_snap_root_gen`) carved from `ub_reserved` (which shrinks 952 → 936; existing offsets unchanged). New bptr kind `STM_BPTR_KIND_DATASET = 9`; existing `STM_BPTR_KIND_SNAP = 5` reused for the snapshot tree root. Per-dataset on-disk value is 56 + name_len bytes (parent_id, created_txg, next_ino, flags, local_set bitmap, name_len, local_value[STM_PROP_COUNT], name); pool-property defaults occupy reserved key=0 (24 bytes for STM_PROP_COUNT=3). Per-snapshot value is 44 + name_len bytes (dataset_id, tree_root_paddr, created_txg, prev_snap_id, hold_count, flags, name_len, name); `hold_count` persists across mount. AEAD (paddr‖gen‖pool_uuid nonce; pool_uuid‖device_uuid_0 AD) + Merkle-chain identical to alloc_roots. Atomic shadow-swap in `load_at` (failure mid-iteration leaves index unchanged). `dirty`-flag idempotency on commit (R7c P2-5 / R14b parallel) preserves byte-identical UB content under sync_commit retries — required for `quorum.tla::ContentQuorumAtGen`. Sync.c integration: indices created at sync_create, hydrated at sync_open from `ub_main_root` / `ub_snap_root` (with bp_kind validation), persisted in sync_commit, released in sync_close; merkle root now includes dataset + snapshot tree csums (was zeros pre-P6-persist). New public accessors `stm_sync_dataset_index` / `stm_sync_snapshot_index`. Spec-first check: `quorum.tla` + `merkle.tla` + `metadata_nonce.tla` cover the new surface — no new TLA module required (verified). R31 audit pending close. | 31 suites × default + ASan + TSan green serial. test_dataset 40 → 48 (persist roundtrip + idempotent + tamper csum/key/gen + next_id seeding); test_snapshot 22 → 28 (persist roundtrip with held snapshots + idempotent + tamper csum/key + next_id); test_sync 19 → 21 (full mount/unmount round-trip including properties + pool defaults + held snapshots + idempotent commit byte-identicality). |
 
 ## ROADMAP §9.2 exit criteria status
 
-Status as of Phase 6 entry (2026-04-26):
+Status as of tip `348d165`:
 
 - [ ] Snapshot create < 10 ms regardless of dataset size.
 - [ ] Snapshot delete's work proportional to blocks freed, not
       total tree.
 - [ ] Clone + writes + COW produce correct divergence.
-- [ ] Property inheritance resolves correctly across multi-level
-      datasets.
-- [ ] Datasets survive mount/unmount round-trips.
+- [x] Property inheritance resolves correctly across multi-level
+      datasets. (P6-4 + P6-persist verifies across mount.)
+- [x] Datasets survive mount/unmount round-trips. (P6-persist;
+      `tests/test_sync.c::sync_dataset_state_survives_mount`.)
 
 ## Recommended P6 entry path
 
@@ -129,13 +131,13 @@ See `phase7-status.md` for the FastCDC pre-work plan.
 - Two-commit close pattern: substantive close + hash fixup.
 - Spec-first per CLAUDE.md.
 
-## Remaining Phase 6 work (as of tip `354ec11`)
+## Remaining Phase 6 work (as of tip `348d165`)
 
 | Item | Status | Notes |
 |---|---|---|
-| Persistent storage hookup (dataset + snapshot via btree_store, wired to ub_main_root + ub_snap_root through sync_commit) | **Next chunk — primed** | See `memory/project_v2_next_session.md` for primer. Generous 100-150k token budget. May bump STM_UB_VERSION 8 → 9 (format break needing user signoff per CLAUDE.md autonomy rules); see Decision 1 in primer. Closest existing pattern: `src/alloc_roots/`. |
-| Clone C impl (extends `stm_dataset_entry` with `origin_snap_id` + adds clone-aware Create + Promote APIs validating clone.tla) | Pending | Smaller chunk (~300-500 LOC) — could land before or after persistent storage. |
+| Persistent storage hookup (dataset + snapshot via btree_store, wired to ub_main_root + ub_snap_root through sync_commit) | **Done at `348d165`** | STM_UB_VERSION bumped 8 → 9 (carved `ub_main_root_gen` + `ub_snap_root_gen` from `ub_reserved`). New `STM_BPTR_KIND_DATASET` (=9); `STM_BPTR_KIND_SNAP` (=5) reused for snap. Indices borrow device 0's bdev + bootstrap; AEAD nonce paddr‖gen‖pool_uuid; AD pool_uuid‖device_uuid_0. Dirty-flag idempotency (R7c P2-5 / R14b parallel). Atomic shadow-swap in `load_at`. Round-trip + idempotent + tamper coverage in 16 new tests. Awaiting R31 audit close. |
+| Clone C impl (extends `stm_dataset_entry` with `origin_snap_id` + adds clone-aware Create + Promote APIs validating clone.tla) | Pending | Smaller chunk (~300-500 LOC) — natural follow-on now that the persistence path is in place. Adding `origin_snap_id` to the on-disk dataset value is a minor format extension (could be done compatibly via a flag bit + optional trailing field, or via another version bump). |
 | Dead-list spec (block-level model for snapshot delete correctness per ARCH §8.5.5) | Pending | Medium-complex spec. Block reachability + birth-txg + dead-list incremental maintenance. Load-bearing for `stm_snapshot_delete` going from MVP to production. |
-| Production scrub cb (per ROADMAP §9.6 carry-over) | Blocked | Needs paddr→bptr resolver, which depends on extent records (P6 deliverable not yet implemented). Resolves naturally after persistent storage + extent records land. |
-| Reference doc files for new modules: `12-dataset.md`, `13-snapshot.md`, `14-bptr.md` (or fold into existing) | Pending | Lands with the persistent-storage chunk (the modules become "as-built" documentable then). |
-| ROADMAP §9.2 exit criteria | Several pending | See top of this file for status table. |
+| Production scrub cb (per ROADMAP §9.6 carry-over) | Blocked | Needs paddr→bptr resolver, which depends on extent records (P6 deliverable not yet implemented). Resolves naturally after extent records land. |
+| Reference doc files for new modules: `12-dataset.md`, `13-snapshot.md`, `14-bptr.md` (or fold into existing) | Pending | Now justifiable — modules are "as-built" with persistence in place. |
+| ROADMAP §9.2 exit criteria | Several pending | See top of this file for status table. Snapshot create / delete perf criteria and clone-divergence still pending; persistence got us to "datasets survive mount" which is one criterion. |

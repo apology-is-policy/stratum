@@ -38,34 +38,32 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `02a9b32` (phase6-status.md remaining-work table —
-  ground-truth view of Phase 6 pending items alongside the
-  memory/project_v2_next_session.md primer; persistent storage
-  is the primed next chunk). Spec scaffold for clone landed at
-  `3db8b5e` + hash fixup `354ec11`. Phase 5 tagged
+- **Tip**: `348d165` (P6-persist: dataset + snapshot persistent
+  storage + STM_UB_VERSION 8 → 9). Phase 5 tagged
   `phase-5-complete` at `461e68e`. Spec posture: 18 modules /
-  21 fixed configs / 16 buggy demos.
-- **Phases**: 1–5 complete; **Phase 6 entered 2026-04-26**.
+  21 fixed configs / 16 buggy demos (unchanged this chunk —
+  persistence consumes existing invariants per quorum.tla,
+  merkle.tla, metadata_nonce.tla; no new spec module required).
+- **Phases**: 1–5 complete; **Phase 6 progressing**.
   Spec scaffolds: P6-1 (bptr.tla) `032db86`; P6-2 (dataset.tla)
   `75f6a3f`; P6-3 (snapshot.tla) `8813027`; P6-4 (property.tla)
-  `2b6f248`; P6-5 (clone.tla) landing this commit. C impls:
-  P6-2 dataset `6dbf8f0` + R28 `bdb888b`; P6-3 snapshot
-  `34d89f5` + R29 `000d394`; P6-4 property `3527fe2` + R30
-  `8be3628`. Phase 7 pre-work FastCDC `5cb8900` + R27 close
-  `a2ffd38`. **All 4 of the in-scope P6 specs (dataset,
-  snapshot, property, clone) now spec'd; the first three have
-  in-RAM MVP C impls; clone C impl deferred (extends dataset
-  with origin field).** Pending: persistent storage hookup;
-  block-level dead-list spec; production scrub cb (still
-  blocked on paddr→bptr resolver).
+  `2b6f248`; P6-5 (clone.tla) `3db8b5e`. C impls: P6-2 dataset
+  `6dbf8f0` + R28 `bdb888b`; P6-3 snapshot `34d89f5` + R29
+  `000d394`; P6-4 property `3527fe2` + R30 `8be3628`. **P6-persist
+  dataset + snapshot persistent-storage hookup landed at `348d165`.**
+  Phase 7 pre-work FastCDC `5cb8900` + R27 close `a2ffd38`.
+  Pending: clone C impl (extends dataset with `origin_snap_id`,
+  small follow-on); block-level dead-list spec; production scrub
+  cb (still blocked on paddr→bptr resolver, which arrives with
+  extents).
 - **Tests**: 31 suites × (default + ASan + TSan, serial) green.
   test_sync_multi 42; test_pool 48; test_scrub 30; test_alloc 32;
-  test_cdc 12; test_dataset 40; test_snapshot 22.
+  test_cdc 12; test_dataset 48; test_snapshot 28; test_sync 21.
 - **Specs**: 18 TLA+ modules clean (21 fixed configs: legacy +
   scrub_beta + scrub_durable + scrub_beta_durable + bptr +
   dataset + snapshot + property + clone) + 16 buggy-demo
   configs fire as expected.
-- **LOC**: ~28.5 KLOC across 24 src/ modules + 28 public headers.
+- **LOC**: ~31 KLOC across 26 src/ modules + 28 public headers.
 
 For phase-level status see `v2/docs/phase{2,3,4,5}-status.md`. The
 reference below covers the as-built layers in bottom-up order.
