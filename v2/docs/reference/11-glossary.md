@@ -139,7 +139,7 @@ closed items.
 | R31 | P6-persist (dataset + snapshot persistent storage + UB v8→v9). | `bffee62` |
 | R32 | P6-clone (clone C impl + UB v9→v10). | `4503405` |
 | R33 | P6-deadlist C impl (snapshot dead-list + UB v10→v11). | `d4efeeb` |
-| R34 | P7-2 extent index C impl (in-RAM MVP per extent.tla). | `<R34-close>` |
+| R34 | P7-2 extent index C impl (in-RAM MVP per extent.tla). | `433d2dd` |
 
 ## Phase 6 / clone terms
 

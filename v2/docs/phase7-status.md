@@ -75,7 +75,7 @@ into the CAS tier (which DOES need P6) is a separate concern.
       MaxFileBlocks=2, MaxPaddrs=3, MaxTxg=1). Spec posture
       19/22/19 → 20/23/22.
 - [x] **P7-2 extent C impl** — landed at `732b20e`; R34 close
-      `<R34-close>` (0 P0 / 0 P1 / 4 P2 / 4 P3 — P2-1 (out-arg
+      `433d2dd` (0 P0 / 0 P1 / 4 P2 / 4 P3 — P2-1 (out-arg
       zeroing on idx==NULL), P2-3 (iter cb pointer-retain doc),
       P3-1 (iter return-code doc) + P3-2 (advance_txg NULL test)
       fixed inline; P2-2 (concurrent-stress scope) + P2-4
@@ -89,7 +89,7 @@ into the CAS tier (which DOES need P6) is a separate concern.
       _close / _current_txg / _advance_txg`, `stm_extent_write /
       _overwrite / _truncate / _delete_file / _lookup_at / _iter
       / _count / _count_for_ino`. ERRORCHECK mutex with must_lock /
-      must_unlock contract. `test_extent_index` 26 tests covering
+      must_unlock contract. `test_extent_index` 32 tests covering
       lifecycle + every spec action + every documented error
       path + concurrent stress. Default + ASan + TSan all green.
 - [ ] **P7-3 extent persistence** — pending. Wire `ub_extent_root` +
@@ -132,4 +132,5 @@ Status: untouched. Phase 7 not yet entered.
 - P7-2 (extent C impl) WILL bump STM_UB_VERSION when persistence
   comes in — likely 11→12 when the extent btree's value layout
   is committed. Format-break user signoff required per CLAUDE.md.
-- Audit-per-change pattern: R34 will close P7-2 when it lands.
+- Audit-per-change pattern: R34 closed P7-2 at `433d2dd`. R35
+  reserved for the next P7 chunk.

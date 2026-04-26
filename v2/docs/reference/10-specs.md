@@ -929,7 +929,7 @@ Out of scope:
 - Coalescing (quality-of-implementation).
 
 C impl status: P7-2 in-RAM MVP landed at `732b20e` + R34 close
-`<R34-close>`. New `src/extent/extent_index.c` realizes
+`433d2dd`. New `src/extent/extent_index.c` realizes
 every spec action against an in-RAM linear-array store; full
 public API in `include/stratum/extent.h`. Persistence
 (per-inode Bε-tree under `ub_extent_root` + format break
