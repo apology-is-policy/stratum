@@ -663,4 +663,272 @@ STM_TEST(dataset_forest_is_intact_after_create_destroy_chain) {
     stm_dataset_index_close(idx);
 }
 
+/* ================================================================== */
+/* Property API — covers property.tla invariants.                      */
+/* ================================================================== */
+
+STM_TEST(prop_kind_classifier) {
+    /* Sanity: enum values map to the documented kinds. */
+    STM_ASSERT_EQ((int)stm_property_kind_of(STM_PROP_COMPRESS),
+                   (int)STM_PROP_KIND_INHERITABLE);
+    STM_ASSERT_EQ((int)stm_property_kind_of(STM_PROP_QUOTA),
+                   (int)STM_PROP_KIND_NONINHERITABLE);
+    STM_ASSERT_EQ((int)stm_property_kind_of(STM_PROP_ENCRYPTION),
+                   (int)STM_PROP_KIND_IMMUTABLE);
+}
+
+STM_TEST(prop_pool_default_set_get) {
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+
+    /* Defaults start at 0 — Effective on root with no local set
+     * returns 0. */
+    uint64_t v = 999;
+    STM_ASSERT_OK(stm_dataset_effective_property(idx, STM_DATASET_ROOT_ID,
+                                                     STM_PROP_COMPRESS, &v));
+    STM_ASSERT_EQ(v, (uint64_t)0);
+
+    /* Setting the pool default propagates to all datasets that don't
+     * have a local set. */
+    STM_ASSERT_OK(stm_dataset_set_pool_default(idx, STM_PROP_COMPRESS, 42));
+    STM_ASSERT_OK(stm_dataset_effective_property(idx, STM_DATASET_ROOT_ID,
+                                                     STM_PROP_COMPRESS, &v));
+    STM_ASSERT_EQ(v, (uint64_t)42);
+
+    stm_dataset_index_close(idx);
+}
+
+STM_TEST(prop_local_override_wins) {
+    /* property.tla::LocalOverrideWins. */
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_OK(stm_dataset_set_pool_default(idx, STM_PROP_COMPRESS, 100));
+
+    uint64_t home = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID,
+                                              "home", &home));
+    /* Without local: effective = pool default. */
+    uint64_t v = 0;
+    STM_ASSERT_OK(stm_dataset_effective_property(idx, home,
+                                                     STM_PROP_COMPRESS, &v));
+    STM_ASSERT_EQ(v, (uint64_t)100);
+
+    /* With local: effective = local value. */
+    STM_ASSERT_OK(stm_dataset_set_property(idx, home, STM_PROP_COMPRESS, 7));
+    STM_ASSERT_OK(stm_dataset_effective_property(idx, home,
+                                                     STM_PROP_COMPRESS, &v));
+    STM_ASSERT_EQ(v, (uint64_t)7);
+
+    /* Even if root sets compress = 99, home still uses 7. */
+    STM_ASSERT_OK(stm_dataset_set_property(idx, STM_DATASET_ROOT_ID,
+                                              STM_PROP_COMPRESS, 99));
+    STM_ASSERT_OK(stm_dataset_effective_property(idx, home,
+                                                     STM_PROP_COMPRESS, &v));
+    STM_ASSERT_EQ(v, (uint64_t)7);
+
+    stm_dataset_index_close(idx);
+}
+
+STM_TEST(prop_inheritable_walks_parent_chain) {
+    /* property.tla::InheritFromParent. */
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_OK(stm_dataset_set_pool_default(idx, STM_PROP_COMPRESS, 1));
+
+    /* Build chain: root → home → alice → photos */
+    uint64_t home = 0, alice = 0, photos = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID,
+                                              "home", &home));
+    STM_ASSERT_OK(stm_dataset_create_child(idx, home, "alice", &alice));
+    STM_ASSERT_OK(stm_dataset_create_child(idx, alice, "photos", &photos));
+
+    /* Set compress on home; alice + photos inherit through home. */
+    STM_ASSERT_OK(stm_dataset_set_property(idx, home, STM_PROP_COMPRESS, 5));
+
+    uint64_t v = 0;
+    STM_ASSERT_OK(stm_dataset_effective_property(idx, home,
+                                                     STM_PROP_COMPRESS, &v));
+    STM_ASSERT_EQ(v, (uint64_t)5);
+    STM_ASSERT_OK(stm_dataset_effective_property(idx, alice,
+                                                     STM_PROP_COMPRESS, &v));
+    STM_ASSERT_EQ(v, (uint64_t)5);
+    STM_ASSERT_OK(stm_dataset_effective_property(idx, photos,
+                                                     STM_PROP_COMPRESS, &v));
+    STM_ASSERT_EQ(v, (uint64_t)5);
+
+    /* Set on alice; photos inherits through alice (closer ancestor). */
+    STM_ASSERT_OK(stm_dataset_set_property(idx, alice, STM_PROP_COMPRESS, 9));
+    STM_ASSERT_OK(stm_dataset_effective_property(idx, photos,
+                                                     STM_PROP_COMPRESS, &v));
+    STM_ASSERT_EQ(v, (uint64_t)9);
+    /* home unaffected. */
+    STM_ASSERT_OK(stm_dataset_effective_property(idx, home,
+                                                     STM_PROP_COMPRESS, &v));
+    STM_ASSERT_EQ(v, (uint64_t)5);
+
+    stm_dataset_index_close(idx);
+}
+
+STM_TEST(prop_noninheritable_no_walk) {
+    /* property.tla::NonInheritableNoWalk. */
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_OK(stm_dataset_set_pool_default(idx, STM_PROP_QUOTA, 1024));
+
+    uint64_t home = 0, alice = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID,
+                                              "home", &home));
+    STM_ASSERT_OK(stm_dataset_create_child(idx, home, "alice", &alice));
+
+    /* Set quota on root and home; alice is non-inheritable, so its
+     * effective quota is the pool default — neither root's nor
+     * home's local value is inherited. */
+    STM_ASSERT_OK(stm_dataset_set_property(idx, STM_DATASET_ROOT_ID,
+                                              STM_PROP_QUOTA, 9999));
+    STM_ASSERT_OK(stm_dataset_set_property(idx, home, STM_PROP_QUOTA, 5555));
+
+    uint64_t v = 0;
+    STM_ASSERT_OK(stm_dataset_effective_property(idx, alice,
+                                                     STM_PROP_QUOTA, &v));
+    STM_ASSERT_EQ(v, (uint64_t)1024);  /* pool default — NOT walked */
+
+    /* alice's own local quota IS observed. */
+    STM_ASSERT_OK(stm_dataset_set_property(idx, alice, STM_PROP_QUOTA, 7));
+    STM_ASSERT_OK(stm_dataset_effective_property(idx, alice,
+                                                     STM_PROP_QUOTA, &v));
+    STM_ASSERT_EQ(v, (uint64_t)7);
+
+    stm_dataset_index_close(idx);
+}
+
+STM_TEST(prop_immutable_set_once) {
+    /* property.tla::ImmutableEncryption — set once, refuses subsequent
+     * Set / Clear. */
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+
+    uint64_t home = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID,
+                                              "home", &home));
+
+    /* First set: OK. */
+    STM_ASSERT_OK(stm_dataset_set_property(idx, home,
+                                              STM_PROP_ENCRYPTION, 1));
+    /* Second set: refused. */
+    STM_ASSERT_ERR(stm_dataset_set_property(idx, home,
+                                                STM_PROP_ENCRYPTION, 2),
+                    STM_EINVAL);
+    /* Clear: refused. */
+    STM_ASSERT_ERR(stm_dataset_clear_property(idx, home,
+                                                  STM_PROP_ENCRYPTION),
+                    STM_EINVAL);
+    /* Effective still returns the original value. */
+    uint64_t v = 0;
+    STM_ASSERT_OK(stm_dataset_effective_property(idx, home,
+                                                     STM_PROP_ENCRYPTION, &v));
+    STM_ASSERT_EQ(v, (uint64_t)1);
+
+    stm_dataset_index_close(idx);
+}
+
+STM_TEST(prop_immutable_inherits_when_unset) {
+    /* ARCH §8.4.2 encryption: "can be inherited from parent or
+     * declared at creation". The IMMUTABLE-kind property still
+     * walks the parent chain when not locally set. */
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_OK(stm_dataset_set_pool_default(idx,
+                                                  STM_PROP_ENCRYPTION, 0));
+
+    uint64_t home = 0, alice = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID,
+                                              "home", &home));
+    STM_ASSERT_OK(stm_dataset_create_child(idx, home, "alice", &alice));
+
+    STM_ASSERT_OK(stm_dataset_set_property(idx, home,
+                                              STM_PROP_ENCRYPTION, 0xAEAD));
+
+    /* alice has no local encryption → inherits home's. */
+    uint64_t v = 0;
+    STM_ASSERT_OK(stm_dataset_effective_property(idx, alice,
+                                                     STM_PROP_ENCRYPTION, &v));
+    STM_ASSERT_EQ(v, (uint64_t)0xAEAD);
+
+    /* Now alice declares its own encryption — fine (first set, on
+     * a different dataset). Subsequent sets on alice refused. */
+    STM_ASSERT_OK(stm_dataset_set_property(idx, alice,
+                                              STM_PROP_ENCRYPTION, 0xCAFE));
+    STM_ASSERT_OK(stm_dataset_effective_property(idx, alice,
+                                                     STM_PROP_ENCRYPTION, &v));
+    STM_ASSERT_EQ(v, (uint64_t)0xCAFE);
+    STM_ASSERT_ERR(stm_dataset_set_property(idx, alice,
+                                                STM_PROP_ENCRYPTION, 0xBABE),
+                    STM_EINVAL);
+
+    stm_dataset_index_close(idx);
+}
+
+STM_TEST(prop_clear_returns_to_inheritance) {
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_OK(stm_dataset_set_pool_default(idx, STM_PROP_COMPRESS, 1));
+
+    uint64_t home = 0, alice = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID,
+                                              "home", &home));
+    STM_ASSERT_OK(stm_dataset_create_child(idx, home, "alice", &alice));
+
+    STM_ASSERT_OK(stm_dataset_set_property(idx, home, STM_PROP_COMPRESS, 5));
+    STM_ASSERT_OK(stm_dataset_set_property(idx, alice, STM_PROP_COMPRESS, 9));
+    /* alice clears — falls back to home's value (5). */
+    STM_ASSERT_OK(stm_dataset_clear_property(idx, alice, STM_PROP_COMPRESS));
+    uint64_t v = 0;
+    STM_ASSERT_OK(stm_dataset_effective_property(idx, alice,
+                                                     STM_PROP_COMPRESS, &v));
+    STM_ASSERT_EQ(v, (uint64_t)5);
+    /* home clears — alice falls back further to pool default (1). */
+    STM_ASSERT_OK(stm_dataset_clear_property(idx, home, STM_PROP_COMPRESS));
+    STM_ASSERT_OK(stm_dataset_effective_property(idx, alice,
+                                                     STM_PROP_COMPRESS, &v));
+    STM_ASSERT_EQ(v, (uint64_t)1);
+
+    stm_dataset_index_close(idx);
+}
+
+STM_TEST(prop_arg_validation) {
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    uint64_t v = 0;
+
+    STM_ASSERT_ERR(stm_dataset_set_pool_default(NULL, STM_PROP_COMPRESS, 0),
+                    STM_EINVAL);
+    STM_ASSERT_ERR(stm_dataset_set_pool_default(idx, (stm_property)999, 0),
+                    STM_EINVAL);
+
+    STM_ASSERT_ERR(stm_dataset_set_property(NULL, 1, STM_PROP_COMPRESS, 0),
+                    STM_EINVAL);
+    STM_ASSERT_ERR(stm_dataset_set_property(idx, 1, (stm_property)999, 0),
+                    STM_EINVAL);
+    STM_ASSERT_ERR(stm_dataset_set_property(idx, 9999, STM_PROP_COMPRESS, 0),
+                    STM_ENOENT);
+
+    STM_ASSERT_ERR(stm_dataset_clear_property(idx, 9999, STM_PROP_COMPRESS),
+                    STM_ENOENT);
+
+    STM_ASSERT_ERR(stm_dataset_effective_property(NULL, 1,
+                                                       STM_PROP_COMPRESS, &v),
+                    STM_EINVAL);
+    STM_ASSERT_ERR(stm_dataset_effective_property(idx, 1,
+                                                       STM_PROP_COMPRESS, NULL),
+                    STM_EINVAL);
+    STM_ASSERT_ERR(stm_dataset_effective_property(idx, 1,
+                                                       (stm_property)999, &v),
+                    STM_EINVAL);
+    STM_ASSERT_ERR(stm_dataset_effective_property(idx, 9999,
+                                                       STM_PROP_COMPRESS, &v),
+                    STM_ENOENT);
+
+    stm_dataset_index_close(idx);
+}
+
 STM_TEST_MAIN("dataset")

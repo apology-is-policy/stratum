@@ -69,6 +69,40 @@ extern "C" {
 #define STM_DATASET_NAME_MAX     255u
 
 /*
+ * Property identifiers for per-dataset properties (ARCH §8.4).
+ *
+ * MVP coverage: one inheritable, one non-inheritable, one immutable —
+ * exercises every property.tla resolution path. The full canonical
+ * list (ARCH §8.4.2 Table) is added incrementally; the on-disk layout
+ * (di_local_props[128] bit-vector + values per ARCH §8.4.3) is wired
+ * in the persistent-storage chunk.
+ *
+ * Kinds:
+ *   - INHERITABLE   — effective(d, p) walks parent chain to find
+ *                       nearest local set; pool default if none.
+ *   - NONINHERITABLE — effective(d, p) is local-or-default; never
+ *                       walks parent chain (matches property.tla).
+ *   - IMMUTABLE     — set ONCE per dataset; subsequent Set / Clear
+ *                       refused with STM_EINVAL. Encryption is the
+ *                       canonical example (ARCH §8.4.2).
+ */
+typedef enum {
+    STM_PROP_COMPRESS    = 0,   /* INHERITABLE   */
+    STM_PROP_QUOTA       = 1,   /* NONINHERITABLE */
+    STM_PROP_ENCRYPTION  = 2,   /* IMMUTABLE     */
+    STM_PROP_COUNT       = 3
+} stm_property;
+
+typedef enum {
+    STM_PROP_KIND_INHERITABLE     = 0,
+    STM_PROP_KIND_NONINHERITABLE  = 1,
+    STM_PROP_KIND_IMMUTABLE       = 2
+} stm_property_kind;
+
+/* Classifier — pure function over the enum. */
+stm_property_kind stm_property_kind_of(stm_property p);
+
+/*
  * Per-dataset entry. Mirrors ARCH §8.3.2 stm_dataset_index_entry but
  * omits di_tree_root + di_key_slot + di_local_props which are added
  * in follow-on chunks (extents + key schema + property system).
@@ -219,7 +253,8 @@ stm_status stm_dataset_children_count(const stm_dataset_index *idx,
  * terminates iteration early.
  *
  * The iteration holds the index's mutex for the duration; the callback
- * MUST NOT call back into stm_dataset_* on the same index (deadlock).
+ * MUST NOT call back into stm_dataset_* on the same index (deadlock —
+ * ERRORCHECK mutex aborts on EDEADLK).
  */
 typedef bool (*stm_dataset_iter_cb)(const stm_dataset_entry *entry,
                                        void *ctx);
@@ -227,6 +262,63 @@ typedef bool (*stm_dataset_iter_cb)(const stm_dataset_entry *entry,
 STM_MUST_USE
 stm_status stm_dataset_iter(const stm_dataset_index *idx,
                               stm_dataset_iter_cb cb, void *ctx);
+
+/*
+ * Set the pool-wide default for property `p`. Used as the fallback
+ * when no ancestor has a local value. Defaults default to 0 at
+ * index_create time; callers can override for the canonical
+ * "lz4 / 8 MiB / aegis-256" defaults from ARCH §8.4.2.
+ *
+ * Returns STM_OK on valid args; STM_EINVAL on NULL idx or
+ * out-of-range property.
+ */
+STM_MUST_USE
+stm_status stm_dataset_set_pool_default(stm_dataset_index *idx,
+                                           stm_property p, uint64_t value);
+
+/*
+ * Set property `p` on dataset `id` to `value`.
+ *
+ * Refusals (per property.tla):
+ *   - id is STM_DATASET_ROOT_ID: allowed (root carries pool-wide
+ *     property defaults via local override).
+ *   - id is not PRESENT: STM_ENOENT.
+ *   - p is out-of-range: STM_EINVAL.
+ *   - p is IMMUTABLE and already-locally-set on this dataset:
+ *     STM_EINVAL (set-once enforcement; matches
+ *     property.tla::ImmutableEncryption).
+ *
+ * Models property.tla::SetProperty.
+ */
+STM_MUST_USE
+stm_status stm_dataset_set_property(stm_dataset_index *idx, uint64_t id,
+                                       stm_property p, uint64_t value);
+
+/*
+ * Clear property `p` on dataset `id`. Refusals same shape as Set,
+ * plus: clearing an IMMUTABLE property always refused.
+ *
+ * Models property.tla::ClearProperty.
+ */
+STM_MUST_USE
+stm_status stm_dataset_clear_property(stm_dataset_index *idx, uint64_t id,
+                                         stm_property p);
+
+/*
+ * Compute the effective value of property `p` on dataset `id` per
+ * the resolution algorithm (property.tla::Effective):
+ *
+ *   - If local_set[id][p]: return local value.
+ *   - If p is NONINHERITABLE: return pool default.
+ *   - If parent is RootId's parent (no parent): return pool default.
+ *   - Else: recurse to parent.
+ *
+ * STM_ENOENT if id is not PRESENT. STM_EINVAL on NULL out / OOR p.
+ */
+STM_MUST_USE
+stm_status stm_dataset_effective_property(const stm_dataset_index *idx,
+                                              uint64_t id, stm_property p,
+                                              uint64_t *out_value);
 
 #ifdef __cplusplus
 }

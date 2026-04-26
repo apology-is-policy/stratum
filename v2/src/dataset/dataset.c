@@ -41,12 +41,17 @@ static inline void must_unlock(pthread_mutex_t *m) {
 
 /*
  * Per-slot record. The public stm_dataset_entry plus a "present" flag
- * so we can distinguish PRESENT vs ABSENT (destroyed) slots without
- * recycling slots.
+ * (PRESENT vs ABSENT/destroyed) plus per-property local state.
+ *
+ * local_set[p] is TRUE iff the dataset has a locally-set value for
+ * property p; local_value[p] is that value (only meaningful when
+ * local_set[p] is TRUE — otherwise the slot is "inherit / default").
  */
 typedef struct {
     stm_dataset_entry e;
     bool              present;
+    bool              local_set[STM_PROP_COUNT];
+    uint64_t          local_value[STM_PROP_COUNT];
 } dataset_slot;
 
 struct stm_dataset_index {
@@ -56,6 +61,7 @@ struct stm_dataset_index {
     size_t          slots_cap;    /* capacity */
     uint64_t        next_id;      /* next id to assign — monotonic */
     uint64_t        current_txg;
+    uint64_t        pool_default[STM_PROP_COUNT];  /* per-property default */
 };
 
 /*
@@ -471,6 +477,135 @@ stm_status stm_dataset_iter(const stm_dataset_index *idx,
         if (!idx->slots[i].present) continue;
         if (!cb(&idx->slots[i].e, ctx)) break;
     }
+    must_unlock(lock);
+    return STM_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* Property API.                                                       */
+/* ------------------------------------------------------------------ */
+
+stm_property_kind stm_property_kind_of(stm_property p) {
+    switch (p) {
+    case STM_PROP_COMPRESS:    return STM_PROP_KIND_INHERITABLE;
+    case STM_PROP_QUOTA:       return STM_PROP_KIND_NONINHERITABLE;
+    case STM_PROP_ENCRYPTION:  return STM_PROP_KIND_IMMUTABLE;
+    case STM_PROP_COUNT:       break;
+    }
+    /* Default-treat unknown / future properties as inheritable. */
+    return STM_PROP_KIND_INHERITABLE;
+}
+
+static bool prop_in_range(stm_property p) {
+    return (unsigned)p < (unsigned)STM_PROP_COUNT;
+}
+
+/*
+ * Walk d's chain looking for the nearest dataset with `p` locally set.
+ * For NONINHERITABLE properties, only d's own slot counts (no walk).
+ * Returns the local value if found; otherwise returns the pool default.
+ *
+ * Caller must hold idx->lock.
+ */
+static uint64_t effective_property_locked(const stm_dataset_index *idx,
+                                              uint64_t id, stm_property p) {
+    stm_property_kind kind = stm_property_kind_of(p);
+
+    /* Bounded walk: at most slots_len + 1 steps to defend against any
+     * malformed parent chain. */
+    uint64_t cur = id;
+    for (size_t hops = 0; hops <= idx->slots_len; hops++) {
+        size_t s = find_slot_locked(idx, cur);
+        if (s == (size_t)-1 || !idx->slots[s].present) break;
+        if (idx->slots[s].local_set[p]) {
+            return idx->slots[s].local_value[p];
+        }
+        /* Non-inheritable: short-circuit to pool default once we've
+         * checked d's own slot (no parent walk).
+         * property.tla::NonInheritableNoWalk. */
+        if (kind == STM_PROP_KIND_NONINHERITABLE) break;
+        /* Inheritable / Immutable: walk to parent. (Immutable is
+         * inherited if not locally set — see ARCH §8.4.2 encryption
+         * "can be inherited from parent or declared at creation".) */
+        uint64_t parent = idx->slots[s].e.parent_id;
+        if (parent == STM_DATASET_NO_PARENT) break;
+        cur = parent;
+    }
+    return idx->pool_default[p];
+}
+
+stm_status stm_dataset_set_pool_default(stm_dataset_index *idx,
+                                           stm_property p, uint64_t value) {
+    if (!idx) return STM_EINVAL;
+    if (!prop_in_range(p)) return STM_EINVAL;
+    must_lock(&idx->lock);
+    idx->pool_default[p] = value;
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+stm_status stm_dataset_set_property(stm_dataset_index *idx, uint64_t id,
+                                       stm_property p, uint64_t value) {
+    if (!idx) return STM_EINVAL;
+    if (!prop_in_range(p)) return STM_EINVAL;
+    must_lock(&idx->lock);
+    size_t s = find_slot_locked(idx, id);
+    if (s == (size_t)-1 || !idx->slots[s].present) {
+        must_unlock(&idx->lock);
+        return STM_ENOENT;
+    }
+    /* property.tla::ImmutableEncryption: an IMMUTABLE property is
+     * write-once per dataset. Once locally set, refuse subsequent
+     * Set / Clear. The spec models this via the
+     * `immutable_was_mutated` ghost flag and BuggyMutateEncryption
+     * gate; the impl rejects at the action's enabling condition. */
+    if (stm_property_kind_of(p) == STM_PROP_KIND_IMMUTABLE
+        && idx->slots[s].local_set[p]) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
+    idx->slots[s].local_set[p]   = true;
+    idx->slots[s].local_value[p] = value;
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+stm_status stm_dataset_clear_property(stm_dataset_index *idx, uint64_t id,
+                                         stm_property p) {
+    if (!idx) return STM_EINVAL;
+    if (!prop_in_range(p)) return STM_EINVAL;
+    must_lock(&idx->lock);
+    size_t s = find_slot_locked(idx, id);
+    if (s == (size_t)-1 || !idx->slots[s].present) {
+        must_unlock(&idx->lock);
+        return STM_ENOENT;
+    }
+    /* IMMUTABLE properties cannot be cleared after Create. */
+    if (stm_property_kind_of(p) == STM_PROP_KIND_IMMUTABLE
+        && idx->slots[s].local_set[p]) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
+    idx->slots[s].local_set[p] = false;
+    /* Leave local_value[p] in place; it's not observed when
+     * local_set[p] is FALSE. */
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+stm_status stm_dataset_effective_property(const stm_dataset_index *idx,
+                                              uint64_t id, stm_property p,
+                                              uint64_t *out_value) {
+    if (!idx || !out_value) return STM_EINVAL;
+    if (!prop_in_range(p)) return STM_EINVAL;
+    pthread_mutex_t *lock = dataset_lock(idx);
+    must_lock(lock);
+    size_t s = find_slot_locked(idx, id);
+    if (s == (size_t)-1 || !idx->slots[s].present) {
+        must_unlock(lock);
+        return STM_ENOENT;
+    }
+    *out_value = effective_property_locked(idx, id, p);
     must_unlock(lock);
     return STM_OK;
 }
