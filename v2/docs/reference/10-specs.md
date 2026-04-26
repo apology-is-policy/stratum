@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Stratum v2 ships 16 TLA+ spec modules covering every load-bearing
+Stratum v2 ships 17 TLA+ spec modules covering every load-bearing
 invariant in the implementation. The specs are the **source of
 truth** for protocol-level behavior; code is an implementation of
 the spec (CLAUDE.md: "spec-first policy"). When the two disagree,
@@ -36,9 +36,10 @@ chapter as specs get wider cross-reference tables).
 | `bptr.tla` | 6 | Production scrub β cb protocol — replica-walk + csum-gate + rewrite-bad + verify-writeback + log. | 29 states, depth 8 (NReplicas=3) | `bptr_accept_corrupt_buggy.cfg`, `bptr_no_verify_writeback_buggy.cfg` |
 | `dataset.tla` | 6 | Pool-wide dataset hierarchy — forest structure + atomic create/destroy/rename/move + sibling-name uniqueness + id monotonicity + birth-txg. | 43 states, depth 7 (MaxDatasets=3, 2 names) | `dataset_cycles_buggy.cfg`, `dataset_dup_name_buggy.cfg`, `dataset_destroy_non_leaf_buggy.cfg` |
 | `snapshot.tla` | 6 | Snapshot lifecycle — O(1) atomic create + birth-txg ordering + chain integrity + holds prevent delete. Block-level dead-list deferred. | 636 states, depth 9 (MaxSnaps=3, MaxTxg=5) | `snapshot_delete_held_buggy.cfg`, `snapshot_chain_disorder_buggy.cfg` |
+| `property.tla` | 6 | Per-dataset property inheritance — local override / inheritable walk / non-inheritable + immutable-at-create. | 1040 states, depth 11 (MaxDatasets=2, 3 props, 2 values) | `property_inherit_non_inh_buggy.cfg`, `property_mutate_immutable_buggy.cfg` |
 
-All 19 fixed configs green (one per module + `scrub_beta` +
-`scrub_durable` + `scrub_beta_durable` extending `scrub.tla`). All 13
+All 20 fixed configs green (one per module + `scrub_beta` +
+`scrub_durable` + `scrub_beta_durable` extending `scrub.tla`). All 15
 buggy configs reproduce their designed invariant violations.
 
 ## Per-module invariants
@@ -624,6 +625,97 @@ Out of scope for `snapshot.tla`:
 - The btree mechanism layer that stores snapshot entries (covered
   by structural.tla / balanced.tla / merge.tla).
 
+### `property.tla` — per-dataset property inheritance (P6-4 spec scaffold)
+
+Models the property-resolution algorithm per ARCH §8.4: local
+override, inheritable walk to nearest ancestor, non-inheritable
+short-circuit to pool default, immutable-at-create properties.
+
+Resolution semantics (`Effective(d, p)`):
+
+```
+if local_set[d][p]:           return local_value[d][p]
+if p NOT inheritable:          return PoolDefault[p]
+if parent[d] == 0 (root chain): return PoolDefault[p]
+else:                          return Effective(parent[d], p)
+```
+
+Invariants:
+
+- `TypeOK`.
+- `RootInvariant` — root present, parent 0.
+- `LocalOverrideWins` — `local_set[d][p] ⇒ Effective(d, p) =
+  local_value[d][p]`. Local override never shadowed by an ancestor.
+- `NonInheritableNoWalk` — for `p ∉ InheritableProperties`, if d has no
+  local set, `Effective(d, p) = PoolDefault[p]`. Never walks parent
+  chain. ARCH §8.4.2 calls out quota / reservation as non-inheritable.
+- `InheritFromParent` — for `p ∈ InheritableProperties` without a local
+  set on d, `Effective(d, p) = Effective(parent[d], p)`. The recursion
+  IS the spec.
+- `ImmutableEncryption` — encoded via the ghost flag
+  `immutable_was_mutated`, set TRUE iff a SetProperty / ClearProperty
+  fires on `p ∈ ImmutableProperties` post-Create. Stays FALSE under
+  fixed policy because both actions refuse those fires.
+
+CONSTANTS:
+
+- `MaxDatasets ≥ 1` — bound on dataset population.
+- `Properties` — finite set of property names. Test uses
+  `{"compress", "quota", "encryption"}`.
+- `InheritableProperties ⊆ Properties` — non-inheritable = the rest.
+- `ImmutableProperties ⊆ Properties` — set at Create, unchangeable.
+  Disjoint from `InheritableProperties` per ASSUME.
+- `PropertyValues` — finite set of value tokens.
+- `PoolDefault: Properties → PropertyValues` — function via `<-`
+  override; the named function `PoolDefault_All_v1` in the spec
+  fills it.
+- Buggy variants:
+  - `BuggyInheritNonInheritable` — non-inheritable properties walk
+    the parent chain (just like inheritable). Violates
+    `NonInheritableNoWalk`.
+  - `BuggyMutateEncryption` — Set/Clear allow mutating an
+    ImmutableProperty post-Create. Violates `ImmutableEncryption`.
+
+Actions:
+
+- `CreateChild(p, immutable_vals)` — new dataset under p; every
+  ImmutableProperty pre-set with a chosen value; other properties
+  start un-locally-set.
+- `Destroy(d)` — d must be a leaf in the present forest.
+- `SetProperty(d, p, v) / ClearProperty(d, p)` — local set / unset.
+  Refuses `p ∈ ImmutableProperties` under fixed policy.
+
+Fixed config (`property.cfg`, `MaxDatasets=2`, `Properties={"compress",
+"quota", "encryption"}`, inheritable `{"compress"}`, immutable
+`{"encryption"}`, values `{"v1", "v2"}`): exercises every resolution
+path. 1040 distinct states at depth 11. All six invariants hold.
+
+Buggy configs:
+
+- `property_inherit_non_inh_buggy.cfg` (`BuggyInheritNonInheritable=
+  TRUE`): non-inheritable walks parent chain. Reachable: SetProperty(
+  root, "quota", "v2"); CreateChild; child has no local quota;
+  Effective(child, "quota") under buggy returns "v2" (root's local)
+  instead of PoolDefault["v1"]. `NonInheritableNoWalk` violated.
+- `property_mutate_immutable_buggy.cfg` (`BuggyMutateEncryption=
+  TRUE`): Set/Clear allow mutating ImmutableProperty. Reachable:
+  CreateChild + SetProperty(child, "encryption", "v2") fires;
+  `immutable_was_mutated` flips TRUE; `ImmutableEncryption` violated.
+
+Spec-to-code (forward reference): impl maps `Effective(d, p)` to
+the inheritance walk in `src/dataset/` (or wherever the property
+system lands). The C side will cache effective values per-dataset
+to avoid recomputing the walk per access.
+
+Out of scope for `property.tla`:
+- Dataset Create/Destroy/Rename/Move structural invariants —
+  covered by `dataset.tla`.
+- Property storage encoding (local_props bit-vector, ARCH §8.4.3)
+  — impl-side concern.
+- Property cache invalidation — runtime efficiency, not safety.
+- The 12+ canonical properties (§8.4.2 table); spec uses an
+  abstract trio.
+
 ## Running TLC
 
 ```bash
@@ -637,7 +729,7 @@ java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
 # Full sweep — fixed configs (one per module; scrub has 3 extra configs).
 for s in sync concurrency structural balanced merge allocator merkle \
          key_schema quorum metadata_nonce device_lifecycle evac scrub \
-         bptr dataset snapshot; do
+         bptr dataset snapshot property; do
   echo "== $s ==" && \
   java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
       -config $s.cfg $s.tla 2>&1 | tail -3
@@ -668,6 +760,11 @@ done
 for cfg in snapshot_delete_held_buggy snapshot_chain_disorder_buggy; do
   java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
       -config ${cfg}.cfg snapshot.tla 2>&1 | \
+      grep -E "Invariant|Error:" | head -2
+done
+for cfg in property_inherit_non_inh_buggy property_mutate_immutable_buggy; do
+  java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
+      -config ${cfg}.cfg property.tla 2>&1 | \
       grep -E "Invariant|Error:" | head -2
 done
 ```

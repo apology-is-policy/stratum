@@ -38,23 +38,25 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `8813027` (P6-3 spec scaffold: `snapshot.tla` + 3
-  configs; bumps spec posture to 16 modules / 19 fixed configs
-  / 13 buggy demos). Phase 5 tagged `phase-5-complete` at
-  `461e68e`.
+- **Tip**: TBD (P6-4 spec scaffold: `property.tla` + 3 configs;
+  bumps spec posture to 17 modules / 20 fixed configs / 15 buggy
+  demos). Phase 5 tagged `phase-5-complete` at `461e68e`.
 - **Phases**: 1–5 complete; **Phase 6 entered 2026-04-26**.
   P6-1 (bptr.tla) at `032db86`; P6-2 (dataset.tla) at
-  `75f6a3f`; P6-3 (snapshot.tla lifecycle) landing this commit.
-  C implementations pending — production scrub cb waits for
-  paddr→bptr resolver; dataset/snapshot index trees waiting
-  for their C impl chunks. Block-level dead-list spec deferred
-  (will follow snapshot.tla). Phase 7 pre-work (FastCDC,
-  P6-independent) parallel-available.
+  `75f6a3f`; P6-3 (snapshot.tla) at `8813027`; P6-4
+  (property.tla inheritance) landing this commit. Spec-first
+  scaffold series for ROADMAP §9.1's deliverables: bptr layer
+  protocol + dataset hierarchy + snapshot lifecycle + property
+  inheritance all modeled. Block-level dead-list (snapshot
+  delete correctness) and clones still pending specs. C
+  implementations pending across the board. Phase 7 pre-work
+  (FastCDC, P6-independent) parallel-available.
 - **Tests**: 28 suites × (default + ASan + TSan, serial) green.
   test_sync_multi 42; test_pool 48; test_scrub 30; test_alloc 32.
-- **Specs**: 16 TLA+ modules clean (19 fixed configs: legacy +
+- **Specs**: 17 TLA+ modules clean (20 fixed configs: legacy +
   scrub_beta + scrub_durable + scrub_beta_durable + bptr +
-  dataset + snapshot) + 13 buggy-demo configs fire as expected.
+  dataset + snapshot + property) + 15 buggy-demo configs fire
+  as expected.
 - **LOC**: ~26 KLOC across 21 src/ modules + 25 public headers.
 
 For phase-level status see `v2/docs/phase{2,3,4,5}-status.md`. The
