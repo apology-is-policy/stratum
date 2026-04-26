@@ -929,8 +929,9 @@ Out of scope:
 - Coalescing (quality-of-implementation).
 
 C impl status: P7-2 in-RAM MVP landed at `732b20e` + R34 close
-`433d2dd`. **P7-3 persistence landed at `<P7-3-c-impl>` + R35
-close `<R35-close>`** — STM_UB_VERSION 11→12 with `ub_extent_root`
+`433d2dd`. **P7-3 persistence landed at `b223975` (R35 audit
+clean: 0 P0/P1/P2 + 5 P3 deferred, bundled into substantive)** —
+STM_UB_VERSION 11→12 with `ub_extent_root`
 + `ub_extent_root_gen` carved from `ub_reserved`; single unified
 btree_store-encoded AEAD-encrypted Bε-tree keyed by (le64 ds || le64
 ino || le64 off) valued by 32-byte ARCH §11.6.1 record; same

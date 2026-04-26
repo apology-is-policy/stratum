@@ -92,8 +92,9 @@ into the CAS tier (which DOES need P6) is a separate concern.
       must_unlock contract. `test_extent_index` 32 tests covering
       lifecycle + every spec action + every documented error
       path + concurrent stress. Default + ASan + TSan all green.
-- [x] **P7-3 extent persistence** — landed at `<P7-3-c-impl>`;
-      R35 close `<R35-close>`. STM_UB_VERSION 11 → 12. New UB
+- [x] **P7-3 extent persistence** — landed at `b223975` (R35 audit
+      clean: 0 P0 / 0 P1 / 0 P2 / 5 P3 deferred — bundled into
+      substantive). STM_UB_VERSION 11 → 12. New UB
       fields `ub_extent_root` (64-byte stm_bptr at offset 3128) +
       `ub_extent_root_gen` (le64 at offset 3192) carved from the
       head of `ub_reserved`. New `STM_BPTR_KIND_EXTENT_TREE = 10`.

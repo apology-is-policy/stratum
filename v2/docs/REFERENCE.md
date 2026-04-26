@@ -38,7 +38,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `<P7-3-c-impl>` (**P7-3 extent persistence** — extent
+- **Tip**: `b223975` (**P7-3 extent persistence** — extent
   index now persists under `ub_extent_root` + `ub_extent_root_gen`;
   STM_UB_VERSION 11→12; v11 pools refused at v12 mount). Phase 5
   tagged `phase-5-complete` at `461e68e`. Spec posture: **20
@@ -55,9 +55,10 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   `18b9289` + R33 `d4efeeb`. P6-perf bench `d4c6708`.
   Phase 7 entry: P7-1 spec scaffold (extent.tla) `4eace52`.
   P7-2 extent C impl `732b20e` + R34 close `433d2dd`.
-  **P7-3 extent persistence `<P7-3-c-impl>` + R35 close
-  `<R35-close>` (this commit) — STM_UB_VERSION 11→12, ub_extent_root
-  carve, sync.c integration**. Phase 7 pre-work FastCDC `5cb8900`
+  **P7-3 extent persistence `b223975` (this commit) — R35 audit
+  clean (0 P0/P1/P2; 5 P3 deferred). STM_UB_VERSION 11→12,
+  ub_extent_root carve, sync.c integration**. Phase 7 pre-work
+  FastCDC `5cb8900`
   + R27 close `a2ffd38`. Pending: P7-4 sync.c COW path
   integration (extent → snapshot.overwrite_block routing);
   production scrub cb (unblocks once paddr→bptr resolver lands
