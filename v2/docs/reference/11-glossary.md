@@ -141,7 +141,7 @@ closed items.
 | R33 | P6-deadlist C impl (snapshot dead-list + UB v10→v11). | `d4efeeb` |
 | R34 | P7-2 extent index C impl (in-RAM MVP per extent.tla). | `433d2dd` |
 | R35 | P7-3 extent persistence (UB v11→v12 + sync wire-in). | `b223975` |
-| R36 | P7-4 fs.c/sync.c COW path integration (extent → dead-list / alloc-free routing). | `<R36-close>` |
+| R36 | P7-4 fs.c/sync.c COW path integration (extent → dead-list / alloc-free routing). | `64a6278` |
 
 ## Phase 6 / clone terms
 

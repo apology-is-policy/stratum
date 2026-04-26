@@ -117,7 +117,7 @@ into the CAS tier (which DOES need P6) is a separate concern.
       accessor `stm_sync_extent_index`. v11 pools refused at v12
       mount via uniform STM_EBADVERSION (existing handler).
 - [x] **P7-4 fs.c/sync.c COW path integration** — landed at `bb2d666`;
-      R36 close `<R36-close>` (1 P0 + 3 P1 + 3 P2 + 3 P3 — P0-1
+      R36 close `64a6278` (1 P0 + 3 P1 + 3 P2 + 3 P3 — P0-1
       (use-after-free via fs->lock release/reacquire) + P1-1
       (paddr leak in drop loop) + P1-2 (wedge-guard race; same
       root cause as P0-1) + P1-3 (AEAD mode autodetect drift) +

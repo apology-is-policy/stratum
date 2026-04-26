@@ -38,7 +38,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `<P7-4>` (**P7-4 fs.c/sync.c COW path integration** —
+- **Tip**: `bb2d666` (**P7-4 fs.c/sync.c COW path integration** —
   POSIX-shape `stm_fs_write` / `stm_fs_read` with full alloc.reserve
   + AEAD encrypt + bdev.write + extent_overwrite + drop-routing
   through snapshot dead-list / allocator-free; advance_txg per
@@ -58,16 +58,15 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   Phase 7 entry: P7-1 spec scaffold (extent.tla) `4eace52`.
   P7-2 extent C impl `732b20e` + R34 close `433d2dd`.
   P7-3 extent persistence `b223975` (R35 audit clean).
-  **P7-4 fs.c/sync.c COW integration `<P7-4>` + R36 close
-  `<R36-close>` (this commit) — POSIX-shape stm_fs_write /
+  **P7-4 fs.c/sync.c COW integration `bb2d666` + R36 close
+  `64a6278` (this commit) — POSIX-shape stm_fs_write /
   stm_fs_read; sync_drop_paddr_locked composes extent.tla::
   Overwrite + dead_list.tla::OverwriteBlock + allocator.tla::Free;
   advance_txg per sync_commit (R35 forward note acted on)**.
-  Phase 7 pre-work FastCDC `5cb8900`
-  + R27 close `a2ffd38`. Pending: P7-4 sync.c COW path
-  integration (extent → snapshot.overwrite_block routing);
-  production scrub cb (unblocks once paddr→bptr resolver lands
-  via extent walk).
+  Phase 7 pre-work FastCDC `5cb8900` + R27 close `a2ffd38`.
+  Pending: P7-5 production scrub cb (now unblocked — paddr→bptr
+  resolver implementable via extent walk over the persistent
+  extent index); CAS / send-recv / reflinks (Phase 7 §10.1+).
 - **Tests**: 32 suites × (default + ASan + TSan, serial) green.
   test_sync_multi 42; test_pool 48; test_scrub 30; test_alloc 32;
   test_cdc 12; test_dataset 57; test_snapshot 41; test_sync 24;
@@ -102,7 +101,7 @@ reference below covers the as-built layers in bottom-up order.
 | [11-glossary.md](reference/11-glossary.md) | Terms, acronyms, invariant names | small |
 | [12-dataset.md](reference/12-dataset.md) | Dataset hierarchy + properties + clones | large |
 | [13-snapshot.md](reference/13-snapshot.md) | Snapshot index + clone-check hook | medium |
-| [14-extent.md](reference/14-extent.md) | Extent index (P7-2 in-RAM MVP) | medium |
+| [14-extent.md](reference/14-extent.md) | Extent index (P7-2 MVP + P7-3 persistence + P7-4 fs/sync COW path) | medium |
 
 This is a live document — every phase-chunk commit that touches a
 subsystem updates the corresponding section in the same PR.
