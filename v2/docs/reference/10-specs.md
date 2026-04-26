@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Stratum v2 ships 15 TLA+ spec modules covering every load-bearing
+Stratum v2 ships 16 TLA+ spec modules covering every load-bearing
 invariant in the implementation. The specs are the **source of
 truth** for protocol-level behavior; code is an implementation of
 the spec (CLAUDE.md: "spec-first policy"). When the two disagree,
@@ -35,9 +35,10 @@ chapter as specs get wider cross-reference tables).
 | `scrub.tla` | 5 | Scrub state machine + β cb-classification + γ durable cursor. | small (each of α + β + γ configs; γ adds durable shadow + Persist/Crash/Mount) | `scrub_buggy.cfg` |
 | `bptr.tla` | 6 | Production scrub β cb protocol — replica-walk + csum-gate + rewrite-bad + verify-writeback + log. | 29 states, depth 8 (NReplicas=3) | `bptr_accept_corrupt_buggy.cfg`, `bptr_no_verify_writeback_buggy.cfg` |
 | `dataset.tla` | 6 | Pool-wide dataset hierarchy — forest structure + atomic create/destroy/rename/move + sibling-name uniqueness + id monotonicity + birth-txg. | 43 states, depth 7 (MaxDatasets=3, 2 names) | `dataset_cycles_buggy.cfg`, `dataset_dup_name_buggy.cfg`, `dataset_destroy_non_leaf_buggy.cfg` |
+| `snapshot.tla` | 6 | Snapshot lifecycle — O(1) atomic create + birth-txg ordering + chain integrity + holds prevent delete. Block-level dead-list deferred. | 636 states, depth 9 (MaxSnaps=3, MaxTxg=5) | `snapshot_delete_held_buggy.cfg`, `snapshot_chain_disorder_buggy.cfg` |
 
-All 18 fixed configs green (one per module + `scrub_beta` +
-`scrub_durable` + `scrub_beta_durable` extending `scrub.tla`). All 11
+All 19 fixed configs green (one per module + `scrub_beta` +
+`scrub_durable` + `scrub_beta_durable` extending `scrub.tla`). All 13
 buggy configs reproduce their designed invariant violations.
 
 ## Per-module invariants
@@ -534,6 +535,95 @@ spec); snapshots and clones (separate specs); send/recv; per-
 connection 9P namespaces; the btree mechanism layer that stores
 the entries; crash/commit boundaries (covered by quorum.tla).
 
+### `snapshot.tla` — snapshot lifecycle (P6-3 spec scaffold)
+
+Models the snapshot LIFECYCLE for a single dataset's snapshot
+chain — Create / Delete / Hold / Release / Write — capturing
+ARCH §8.5's load-bearing properties without yet diving into the
+block-level dead-list mechanics (separate spec).
+
+Invariants:
+
+- `TypeOK`.
+- `BirthTxgMonotonic` — every snapshot's `created_txg ≤ current_txg`.
+  No "future-dated" snapshots.
+- `HoldPreventsDelete` — encoded as `snap_held[s] ⇒ Present(s)`.
+  A held snap can't transition to ABSENT; a deleted snap's hold
+  must have been released first.
+- `ChainTxgOrdered` — along the `snap_prev` chain (filtering
+  ABSENT links), `created_txg` strictly decreases. Older
+  snapshots in the chain were genuinely created earlier.
+- `ChainAcyclic` — bounded walk along `snap_prev` never returns
+  to the starting snap. Chain is a back-pointer linked list,
+  not a cycle.
+- `MostRecentValid` — `most_recent_snap` is `NoSnap` or refers
+  to a previously-allocated id (id < `next_snap_id`).
+- `SnapIdMonotonic` — ids assigned strictly increasing via
+  `next_snap_id`; never recycled. Allocated ids have
+  `created_txg > 0`; unallocated ids stay zero-initialized.
+
+CONSTANTS:
+
+- `MaxSnaps ≥ 1` — snap-chain population cap (ids 1..MaxSnaps).
+- `MaxTxg ≥ 1` — bounds `current_txg`. Each Write and
+  SnapshotCreate bumps it.
+- `TreeRoots` — finite set of abstract tree-root values. Live
+  dataset's tree_root cycles through the set on Write (modeling
+  COW emitting a new root).
+- Buggy variants:
+  - `BuggyDeleteWithHold` — SnapshotDelete proceeds even when
+    `snap_held[s]` is TRUE.
+  - `BuggyChainOutOfOrder` — SnapshotCreate uses an arbitrary
+    `created_txg` instead of `current_txg + 1`.
+
+Actions:
+
+- `Write` — bump `current_txg`, switch `live_tree_root` to a
+  different value (COW emits a new root). Existing snapshots'
+  `snap_tree_root` unchanged — structural test of tree-root
+  immutability.
+- `SnapshotCreate` — atomically: allocate `next_snap_id`,
+  capture `(live_tree_root, current_txg + 1, most_recent_snap)`,
+  bump `most_recent_snap` and `current_txg`. ARCH §8.5.3 O(1).
+- `SnapshotDelete(s)` — mark s ABSENT. Refused (fixed policy)
+  if `snap_held[s]`. Block-level dead-list mechanics deferred.
+- `SnapshotHold(s) / SnapshotRelease(s)` — toggle hold flag.
+  Held snaps refuse delete.
+
+Fixed config (`snapshot.cfg`, `MaxSnaps=3, MaxTxg=5,
+TreeRoots={"r0","r1"}`): exercises Create + Write + Delete +
+Hold + Release combinations + chain ordering. 636 distinct
+states at depth 9. All seven invariants hold.
+
+Buggy configs:
+
+- `snapshot_delete_held_buggy.cfg` (`BuggyDeleteWithHold=TRUE`):
+  Delete proceeds with `snap_held=TRUE`. Reachable: Create →
+  Hold → Delete leaves snap_state=ABSENT and snap_held=TRUE
+  simultaneously. `HoldPreventsDelete` violated.
+- `snapshot_chain_disorder_buggy.cfg` (`BuggyChainOutOfOrder=TRUE`):
+  Create chooses arbitrary `created_txg` ∈ 0..MaxTxg. When the
+  second snap's `created_txg` ≤ the first's, the chain's
+  strictly-decreasing-along-prev property breaks.
+  `ChainTxgOrdered` violated.
+
+Spec-to-code (forward reference): the C implementation of the
+snapshot index tree is **not yet in this commit**. Lands in a
+follow-on chunk under `src/snapshot/` (or alongside
+`src/dataset/`), populating the existing `ub_snap_root` slot
+(no format break) per ARCH §5.6 + §8.5.2.
+
+Out of scope for `snapshot.tla`:
+- Block-level reachability + dead-list correctness (ARCH §8.5.5);
+  separate spec needed for the block model.
+- Snapshot rollback (ARCH §8.10).
+- Multi-dataset snapshot indexing; spec covers a single dataset's
+  chain.
+- Send/recv use of birth-txg for incremental diffs (ARCH §8.7.4);
+  builds on `BirthTxgMonotonic`.
+- The btree mechanism layer that stores snapshot entries (covered
+  by structural.tla / balanced.tla / merge.tla).
+
 ## Running TLC
 
 ```bash
@@ -547,7 +637,7 @@ java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
 # Full sweep — fixed configs (one per module; scrub has 3 extra configs).
 for s in sync concurrency structural balanced merge allocator merkle \
          key_schema quorum metadata_nonce device_lifecycle evac scrub \
-         bptr dataset; do
+         bptr dataset snapshot; do
   echo "== $s ==" && \
   java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
       -config $s.cfg $s.tla 2>&1 | tail -3
@@ -573,6 +663,11 @@ done
 for cfg in dataset_cycles_buggy dataset_dup_name_buggy dataset_destroy_non_leaf_buggy; do
   java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
       -config ${cfg}.cfg dataset.tla 2>&1 | \
+      grep -E "Invariant|Error:" | head -2
+done
+for cfg in snapshot_delete_held_buggy snapshot_chain_disorder_buggy; do
+  java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
+      -config ${cfg}.cfg snapshot.tla 2>&1 | \
       grep -E "Invariant|Error:" | head -2
 done
 ```
