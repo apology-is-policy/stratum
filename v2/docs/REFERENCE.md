@@ -38,12 +38,12 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `4eace52` (**Phase 7 entry — P7-1 spec scaffold:
-  `extent.tla`** — per-(dataset, ino) extent layout; the LOGICAL
-  data layer between datasets and stored bytes. Spec-only landing
-  per CLAUDE.md spec-first; C impl follow-on extends `src/`).
-  Phase 5 tagged `phase-5-complete` at `461e68e`. Spec posture:
-  **20 modules / 23 fixed configs / 22 buggy demos**.
+- **Tip**: `<P7-2-c-impl>` (**P7-2 extent C impl** — in-RAM extent
+  index per `extent.tla`; the LOGICAL data layer between datasets
+  and stored bytes lands as a working module. Persistence is
+  follow-on P7-3 with format break v11→v12). Phase 5 tagged
+  `phase-5-complete` at `461e68e`. Spec posture: **20 modules /
+  23 fixed configs / 22 buggy demos**.
 - **Phases**: 1–5 complete; Phase 6 namespace layer feature-
   complete; **Phase 7 progressing**.
   Spec scaffolds: P6-1 (bptr.tla) `032db86`; P6-2 (dataset.tla)
@@ -52,22 +52,26 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   `d568ff7`. C impls: P6-2 dataset `6dbf8f0` + R28 `bdb888b`;
   P6-3 snapshot `34d89f5` + R29 `000d394`; P6-4 property `3527fe2`
   + R30 `8be3628`; P6-persist `348d165` + R31 `bffee62`; P6-clone
-  `ee45a0d` + R32 `4503405`; **P6-deadlist C impl
-  `18b9289` + R33 `d4efeeb`**.
-  P6-perf bench `d4c6708`. **Phase 7 entry: P7-1 spec scaffold
-  (extent.tla) `4eace52` (this commit)**. Phase 7 pre-work
-  FastCDC `5cb8900` + R27 close `a2ffd38`. Pending: P7-2 extent
-  C impl + integration; production scrub cb (still blocked on
-  paddr→bptr resolver, which arrives with extents); sync.c
-  integration of OverwriteBlock cb (extents wire it).
-- **Tests**: 31 suites × (default + ASan + TSan, serial) green.
+  `ee45a0d` + R32 `4503405`; P6-deadlist C impl
+  `18b9289` + R33 `d4efeeb`. P6-perf bench `d4c6708`.
+  Phase 7 entry: P7-1 spec scaffold (extent.tla) `4eace52`.
+  **P7-2 extent C impl `<P7-2-c-impl>` (this commit)**. R34 audit
+  close pending. Phase 7 pre-work FastCDC `5cb8900` + R27 close
+  `a2ffd38`. Pending: P7-3 extent persistence (format break
+  v11→v12); production scrub cb (unblocks once P7-3 lands the
+  paddr→bptr resolver via extent walk); sync.c integration of
+  OverwriteBlock cb.
+- **Tests**: 32 suites × (default + ASan + TSan, serial) green.
   test_sync_multi 42; test_pool 48; test_scrub 30; test_alloc 32;
-  test_cdc 12; test_dataset 57; test_snapshot 41; test_sync 24.
+  test_cdc 12; test_dataset 57; test_snapshot 41; test_sync 24;
+  test_extent_index 31.
 - **Specs**: 20 TLA+ modules clean (23 fixed configs: legacy +
   scrub_beta + scrub_durable + scrub_beta_durable + bptr +
   dataset + snapshot + property + clone + dead_list + extent) +
   22 buggy-demo configs fire as expected.
-- **LOC**: ~31 KLOC across 26 src/ modules + 28 public headers.
+- **LOC**: ~32 KLOC across 24 src/ modules (extent module gains
+  `extent_index.c` alongside the Phase 4 `extent.c` AEAD wrapper)
+  + 28 public headers.
 
 For phase-level status see `v2/docs/phase{2,3,4,5}-status.md`. The
 reference below covers the as-built layers in bottom-up order.
@@ -90,6 +94,7 @@ reference below covers the as-built layers in bottom-up order.
 | [11-glossary.md](reference/11-glossary.md) | Terms, acronyms, invariant names | small |
 | [12-dataset.md](reference/12-dataset.md) | Dataset hierarchy + properties + clones | large |
 | [13-snapshot.md](reference/13-snapshot.md) | Snapshot index + clone-check hook | medium |
+| [14-extent.md](reference/14-extent.md) | Extent index (P7-2 in-RAM MVP) | medium |
 
 This is a live document — every phase-chunk commit that touches a
 subsystem updates the corresponding section in the same PR.

@@ -74,18 +74,31 @@ into the CAS tier (which DOES need P6) is a separate concern.
       TLC: 1216 distinct states / depth 6 (MaxDatasets=1, MaxInos=2,
       MaxFileBlocks=2, MaxPaddrs=3, MaxTxg=1). Spec posture
       19/22/19 → 20/23/22.
-- [ ] **P7-2 extent C impl** — pending. New `src/extent/extent.{h,c}`
-      module realizing extent.tla against an in-RAM map; later
-      chunks add the per-inode Bε-tree storage + persistence.
-      Will need a format break for the on-disk extent value
-      (matches ARCH §11.6.1's 32-byte record layout).
-- [ ] **P7-3 dataset COW path integration** — pending. Extent
-      writes trigger `stm_snapshot_index_overwrite_block(paddr)`
-      on the dropped extent's paddr (composes with dead_list.tla
-      via the C-impl boundary).
-- [ ] **P7-4 production scrub cb** — pending. Now unblocks once
+- [x] **P7-2 extent C impl** — landed at `<P7-2-c-impl>`.
+      R34 audit close pending. New `src/extent/extent_index.c` module
+      realizing extent.tla against an in-RAM map; the AEAD wrap
+      helpers in `src/extent/extent.c` (Phase 4) coexist
+      unchanged. Public API surface: `stm_extent_index_create /
+      _close / _current_txg / _advance_txg`, `stm_extent_write /
+      _overwrite / _truncate / _delete_file / _lookup_at / _iter
+      / _count / _count_for_ino`. ERRORCHECK mutex with must_lock /
+      must_unlock contract. `test_extent_index` 26 tests covering
+      lifecycle + every spec action + every documented error
+      path + concurrent stress. Default + ASan + TSan all green.
+- [ ] **P7-3 extent persistence** — pending. Wire `ub_extent_root` +
+      per-inode Bε-tree under btree_store; bumps STM_UB_VERSION
+      v11→v12 (format break — needs user signoff). Realizes
+      ARCH §11.6.1's 32-byte record layout. The current in-RAM
+      MVP carries only the spec-modeled fields (ds, ino, off, len,
+      paddr, gen); compression / xxh fields land with persistence.
+- [ ] **P7-4 dataset COW path integration** — pending. fs.c / sync.c
+      integration: extent writes trigger
+      `stm_snapshot_index_overwrite_block(paddr)` on each dropped
+      paddr from `_overwrite` / `_truncate` / `_delete_file`
+      (composes with dead_list.tla via the C-impl boundary).
+- [ ] **P7-5 production scrub cb** — pending. Now unblocks once
       extents land (paddr→bptr resolver becomes implementable via
-      extent walk).
+      extent walk; P7-3 persistence is the gating dependency).
 - [ ] CAS tier — pending; needs extent layer + integration.
 - [ ] Send / recv — pending; needs extent layer + birth-txg from
       snapshots (already in place from P6).

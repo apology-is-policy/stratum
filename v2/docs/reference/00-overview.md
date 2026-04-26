@@ -169,17 +169,18 @@ checked at the extent boundary on every read.
 | 2 | ✅ complete | Bε-tree + Bw-tree MVP + EBR + R0-R5 audits. | phase2-status.md, phase2-bw-tree-design.md |
 | 3 | ✅ complete | Single-device sync + uberblock + persistent allocator + R6-R12 audits. | phase3-status.md |
 | 4 | ✅ complete | AEAD-AD + per-extent integrity + keyschema + PQ-hybrid wrap + janus + R13-R14b audits. | phase4-status.md |
-| 5 | 🚧 in progress | P5-1..P5-5-α landed. R15-R19 audits closed. R20 in flight on P5-5-α. | phase5-status.md |
-| 6 | ⏳ planned | Extent manager + dataset / snapshot / clone namespace. | docs/ROADMAP-V2.md §9 |
+| 5 | ✅ complete | Multi-device pool + roster + quorum + scrub-α/β/γ. R15-R26 audits closed. Tagged `phase-5-complete` at `461e68e`. | phase5-status.md |
+| 6 | ✅ namespace feature-complete | Dataset / snapshot / clone / property / dead-list C impls + persistence. ROADMAP §9.2 5/5 exit criteria met. R27-R33 closed. | phase6-status.md |
+| 7 | 🚧 in progress | P7-prework FastCDC + P7-1 extent.tla spec + P7-2 extent C impl (in-RAM MVP); R34 audit close pending. Pending: P7-3 persistence (UB v11→v12), P7-4 sync.c COW integration, CAS, send/recv, reflinks. | phase7-status.md |
 
 ## Test posture
 
-- 28 test suites (single-device unit + multi-device integration).
+- 32 test suites (single-device unit + multi-device integration).
 - Three sanitizer configurations, all green: default, ASan, TSan.
 - TSan timeout bumped to 180s for `test_crash_inject` (has ~168
   format+mount cycles).
-- 13 TLA+ spec modules verify fixed configs.
-- 6 buggy-config demos confirm the invariants actually fire when
+- 20 TLA+ spec modules verify 23 fixed configs.
+- 22 buggy-config demos confirm the invariants actually fire when
   violated (regression protection for the invariants themselves).
 
 ## Build + CI
