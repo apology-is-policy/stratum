@@ -5,3 +5,7 @@
 add_executable(bench_btree_lf bench_btree_lf.c)
 target_link_libraries(bench_btree_lf
     PRIVATE stratum stm_warnings stm_sanitize)
+
+add_executable(bench_snapshot bench_snapshot.c)
+target_link_libraries(bench_snapshot
+    PRIVATE stratum stm_warnings stm_sanitize)

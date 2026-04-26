@@ -38,12 +38,11 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `d4efeeb` (P6-deadlist C impl: snapshot
-  module gains in-line dead-list under `stm_snapshot_index_*`,
-  `stm_snapshot_delete` now returns the freed-paddr list, format
-  bumped 10 → 11 for the snapshot value tail). Phase 5 tagged
-  `phase-5-complete` at `461e68e`. Spec posture: **19 modules /
-  22 fixed configs / 19 buggy demos**.
+- **Tip**: `__P6PERF__` (P6-perf bench: `bench_snapshot` opt-in
+  binary confirming ROADMAP §9.2 #1 — snap_create < 10 ms even
+  at N=100k snapshots. All 5 ROADMAP §9.2 exit criteria met).
+  Phase 5 tagged `phase-5-complete` at `461e68e`. Spec posture:
+  **19 modules / 22 fixed configs / 19 buggy demos**.
 - **Phases**: 1–5 complete; **Phase 6 progressing**.
   Spec scaffolds: P6-1 (bptr.tla) `032db86`; P6-2 (dataset.tla)
   `75f6a3f`; P6-3 (snapshot.tla) `8813027`; P6-4 (property.tla)
