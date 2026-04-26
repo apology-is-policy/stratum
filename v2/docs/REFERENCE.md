@@ -38,27 +38,27 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `2b6f248` (P6-4 spec scaffold: `property.tla` + 3
-  configs; bumps spec posture to 17 modules / 20 fixed configs
-  / 15 buggy demos). Phase 5 tagged `phase-5-complete` at
-  `461e68e`.
+- **Tip**: `a2ffd38` (P7 pre-work R27 audit close: 0 P0 / 1 P1 /
+  4 P2 / 4 P3, 6 fixed + 3 deferred per audit close commit). FastCDC
+  substantive landed at `5cb8900`. Phase 5 tagged
+  `phase-5-complete` at `461e68e`. Spec posture unchanged at
+  17/20/15.
 - **Phases**: 1–5 complete; **Phase 6 entered 2026-04-26**.
   P6-1 (bptr.tla) at `032db86`; P6-2 (dataset.tla) at
   `75f6a3f`; P6-3 (snapshot.tla) at `8813027`; P6-4
-  (property.tla inheritance) landing this commit. Spec-first
-  scaffold series for ROADMAP §9.1's deliverables: bptr layer
-  protocol + dataset hierarchy + snapshot lifecycle + property
-  inheritance all modeled. Block-level dead-list (snapshot
-  delete correctness) and clones still pending specs. C
-  implementations pending across the board. Phase 7 pre-work
-  (FastCDC, P6-independent) parallel-available.
-- **Tests**: 28 suites × (default + ASan + TSan, serial) green.
-  test_sync_multi 42; test_pool 48; test_scrub 30; test_alloc 32.
+  (property.tla) at `2b6f248`. Phase 7 pre-work FastCDC
+  (P6-independent) at `5cb8900` + R27 close at `a2ffd38`. CAS
+  tier and other P7 deliverables remain blocked on P6 metadata.
+  Block-level dead-list + clones still pending P6 specs. C
+  implementations pending across P6.
+- **Tests**: 29 suites × (default + ASan + TSan, serial) green.
+  test_sync_multi 42; test_pool 48; test_scrub 30; test_alloc 32;
+  test_cdc 12.
 - **Specs**: 17 TLA+ modules clean (20 fixed configs: legacy +
   scrub_beta + scrub_durable + scrub_beta_durable + bptr +
   dataset + snapshot + property) + 15 buggy-demo configs fire
   as expected.
-- **LOC**: ~26 KLOC across 21 src/ modules + 25 public headers.
+- **LOC**: ~26.8 KLOC across 22 src/ modules + 26 public headers.
 
 For phase-level status see `v2/docs/phase{2,3,4,5}-status.md`. The
 reference below covers the as-built layers in bottom-up order.
