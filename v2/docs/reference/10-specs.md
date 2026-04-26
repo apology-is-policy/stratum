@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Stratum v2 ships 17 TLA+ spec modules covering every load-bearing
+Stratum v2 ships 18 TLA+ spec modules covering every load-bearing
 invariant in the implementation. The specs are the **source of
 truth** for protocol-level behavior; code is an implementation of
 the spec (CLAUDE.md: "spec-first policy"). When the two disagree,
@@ -37,9 +37,10 @@ chapter as specs get wider cross-reference tables).
 | `dataset.tla` | 6 | Pool-wide dataset hierarchy — forest structure + atomic create/destroy/rename/move + sibling-name uniqueness + id monotonicity + birth-txg. | 43 states, depth 7 (MaxDatasets=3, 2 names) | `dataset_cycles_buggy.cfg`, `dataset_dup_name_buggy.cfg`, `dataset_destroy_non_leaf_buggy.cfg` |
 | `snapshot.tla` | 6 | Snapshot lifecycle — O(1) atomic create + birth-txg ordering + chain integrity + holds prevent delete. Block-level dead-list deferred. | 636 states, depth 9 (MaxSnaps=3, MaxTxg=5) | `snapshot_delete_held_buggy.cfg`, `snapshot_chain_disorder_buggy.cfg` |
 | `property.tla` | 6 | Per-dataset property inheritance — local override / inheritable walk / non-inheritable + immutable-at-create. | 1040 states, depth 11 (MaxDatasets=2, 3 props, 2 values) | `property_inherit_non_inh_buggy.cfg`, `property_mutate_immutable_buggy.cfg` |
+| `clone.tla` | 6 | Clone (writable snapshot) lifecycle — clone-from-snap + snap-with-clones-undeletable + promote-breaks-dependency. | 161 states, depth 11 (MaxDatasets=3, MaxSnaps=2) | `clone_delete_snap_with_clones_buggy.cfg` |
 
-All 20 fixed configs green (one per module + `scrub_beta` +
-`scrub_durable` + `scrub_beta_durable` extending `scrub.tla`). All 15
+All 21 fixed configs green (one per module + `scrub_beta` +
+`scrub_durable` + `scrub_beta_durable` extending `scrub.tla`). All 16
 buggy configs reproduce their designed invariant violations.
 
 ## Per-module invariants
@@ -716,6 +717,76 @@ Out of scope for `property.tla`:
 - The 12+ canonical properties (§8.4.2 table); spec uses an
   abstract trio.
 
+### `clone.tla` — clone (writable snapshot) lifecycle (P6-5 spec scaffold)
+
+Models the dataset / snapshot interaction that arises when datasets
+clone from snapshots per ARCH §8.6. A clone is a dataset with
+`origin_snap_id ≠ NoOrigin`; it depends on the snapshot it cloned
+from (the origin snap can't be deleted while clones reference it).
+Promote breaks the dependency.
+
+Invariants:
+
+- `TypeOK`.
+- `RootInvariant` — root present + origin = NoOrigin (root never a
+  clone).
+- `CloneOriginPresent` — every PRESENT clone's `origin_snap_id`
+  refers to a PRESENT snapshot. No dangling clone-origin
+  references.
+- `SnapWithClonesUndeletable` — a snapshot with at least one PRESENT
+  clone cannot be ABSENT. ARCH §8.6.2 "Clone holds its origin
+  snapshot."
+- `PromoteIsTerminalForOrigin` / `NoOriginMeansNotClone` — after
+  Promote, the dataset is no longer a clone (origin = NoOrigin).
+- `DatasetIdMonotonic` / `SnapIdMonotonic` — both id axes only grow.
+
+CONSTANTS:
+
+- `MaxDatasets ≥ 1` — bound on dataset population.
+- `MaxSnaps ≥ 1` — bound on snapshot population.
+- `BuggyDeleteSnapWithClones` — buggy variant. SnapDelete proceeds
+  even when the snap has PRESENT clones.
+
+Actions:
+
+- `SnapCreate` — allocate a new snap (abstracted from snapshot.tla;
+  clone.tla doesn't re-prove the chain ordering).
+- `SnapDelete(s)` — refused (fixed) when `HasClones(s)`.
+- `CloneCreate(s)` — new dataset with `dataset_origin = s`. Requires
+  `SnapPresent(s)`.
+- `CloneDestroy(c)` — mark a (clone or non-clone) dataset ABSENT.
+- `Promote(c)` — clone's `origin = NoOrigin`; c is now a non-clone
+  dataset. ARCH §8.6.2 "Clone becomes the original."
+
+Fixed config (`clone.cfg`, `MaxDatasets=3`, `MaxSnaps=2`): exercises
+SnapCreate + CloneCreate + SnapDelete refused + CloneDestroy +
+Promote interactions. 161 states at depth 11. All seven invariants
+hold.
+
+Buggy config:
+
+- `clone_delete_snap_with_clones_buggy.cfg`
+  (`BuggyDeleteSnapWithClones=TRUE`): SnapDelete proceeds while
+  HasClones. Reachable: SnapCreate → CloneCreate(snap=1) →
+  SnapDelete(1) under buggy policy makes the clone reference an
+  ABSENT snap. `CloneOriginPresent` violated.
+
+Spec-to-code (forward reference): the C impl of clones extends the
+existing dataset module with an `origin_snap_id` field +
+clone-aware Create / Promote APIs. Persistent storage chunk wires
+the field through ub_main_root's btree records. NOT in this
+chunk.
+
+Out of scope for `clone.tla`:
+- Full ARCH §8.6.2 promote semantics (snap becomes descendant of
+  the promoted clone). MVP models promote as "clear origin
+  dependency".
+- Forest invariant for clones — composes with dataset.tla.
+- Snapshot chain ordering — covered by snapshot.tla.
+- Block-level COW divergence after clone — dead-list spec
+  territory.
+- Cross-dataset reflinks (ARCH §8.6.3) — separate.
+
 ## Running TLC
 
 ```bash
@@ -729,7 +800,7 @@ java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
 # Full sweep — fixed configs (one per module; scrub has 3 extra configs).
 for s in sync concurrency structural balanced merge allocator merkle \
          key_schema quorum metadata_nonce device_lifecycle evac scrub \
-         bptr dataset snapshot property; do
+         bptr dataset snapshot property clone; do
   echo "== $s ==" && \
   java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
       -config $s.cfg $s.tla 2>&1 | tail -3
@@ -767,6 +838,9 @@ for cfg in property_inherit_non_inh_buggy property_mutate_immutable_buggy; do
       -config ${cfg}.cfg property.tla 2>&1 | \
       grep -E "Invariant|Error:" | head -2
 done
+java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
+    -config clone_delete_snap_with_clones_buggy.cfg clone.tla 2>&1 | \
+    grep -E "Invariant|Error:" | head -2
 ```
 
 CI runs TLC per spec on every PR touching `v2/specs/` or `v2/src/`.
