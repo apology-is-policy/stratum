@@ -58,6 +58,9 @@
 extern "C" {
 #endif
 
+struct stm_bdev;       typedef struct stm_bdev       stm_bdev;
+struct stm_bootstrap;  typedef struct stm_bootstrap  stm_bootstrap;
+
 #define STM_SNAP_NO_PREV         ((uint64_t)0)
 #define STM_SNAP_NAME_MAX        255u
 /* Sentinel for "no captured tree_root yet" — reserved for the
@@ -221,6 +224,72 @@ typedef bool (*stm_snapshot_iter_cb)(const stm_snapshot_entry *entry,
 STM_MUST_USE
 stm_status stm_snapshot_iter(const stm_snapshot_index *idx,
                                stm_snapshot_iter_cb cb, void *ctx);
+
+/* ========================================================================= */
+/* Persistence (P6-persist).                                                  */
+/* ========================================================================= */
+
+/*
+ * The snapshot index is persisted as a btree_store-encoded, AEAD-encrypted
+ * tree under `ub_snap_root`. Keys are le64 snapshot_id (always ≥ 1).
+ *
+ * Per-snapshot value layout (variable length):
+ *
+ *   off  size  field
+ *    0    8   dataset_id (le64)
+ *    8    8   tree_root_paddr (le64)
+ *   16    8   created_txg (le64)
+ *   24    8   prev_snap_id (le64) — STM_SNAP_NO_PREV (0) for chain head
+ *   32    4   hold_count (le32) — persists across mount, like ZFS holds
+ *   36    4   flags (le32)
+ *   40    2   name_len (le16) — 1..STM_SNAP_NAME_MAX
+ *   42    2   pad (zero)
+ *   44    L   name (UTF-8, no NUL)  L = name_len
+ *
+ * Total: 44 + name_len bytes. Crypt + I/O follow the alloc_roots pattern.
+ */
+
+STM_MUST_USE
+stm_status stm_snapshot_index_set_storage(stm_snapshot_index *idx,
+                                             stm_bdev *bdev_0,
+                                             stm_bootstrap *boot_0);
+
+STM_MUST_USE
+stm_status stm_snapshot_index_set_crypt_ctx(stm_snapshot_index *idx,
+                                               const uint8_t *metadata_key,
+                                               const uint64_t pool_uuid[2],
+                                               const uint64_t device_uuid_0[2]);
+
+STM_MUST_USE
+stm_status stm_snapshot_index_load_at(stm_snapshot_index *idx,
+                                         uint64_t root_paddr, uint64_t root_gen,
+                                         const uint8_t expected_csum[32]);
+
+STM_MUST_USE
+stm_status stm_snapshot_index_commit(stm_snapshot_index *idx,
+                                        uint64_t committed_gen,
+                                        uint64_t *out_root_paddr,
+                                        uint8_t out_root_csum[32]);
+
+STM_MUST_USE
+stm_status stm_snapshot_index_get_root(const stm_snapshot_index *idx,
+                                          uint64_t *out_root_paddr,
+                                          uint8_t out_root_csum[32]);
+
+STM_MUST_USE
+stm_status stm_snapshot_index_get_gen(const stm_snapshot_index *idx,
+                                         uint64_t *out_root_gen);
+
+STM_MUST_USE
+stm_status stm_snapshot_index_verify(const stm_snapshot_index *idx);
+
+STM_MUST_USE
+stm_status stm_snapshot_index_get_next_id(const stm_snapshot_index *idx,
+                                             uint64_t *out_next_id);
+
+STM_MUST_USE
+stm_status stm_snapshot_index_set_next_id(stm_snapshot_index *idx,
+                                             uint64_t next_id);
 
 #ifdef __cplusplus
 }

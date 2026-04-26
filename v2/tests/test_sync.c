@@ -18,8 +18,10 @@
 #include <stratum/bootstrap.h>
 #include <stratum/btnode.h>
 #include <stratum/crypto.h>
+#include <stratum/dataset.h>
 #include <stratum/keyfile.h>
 #include <stratum/pool.h>
+#include <stratum/snapshot.h>
 #include <stratum/super.h>
 #include <stratum/sync.h>
 
@@ -916,6 +918,136 @@ STM_TEST(sync_verify_empty_pool_ok) {
     make_fresh_pool(d, &a, &s, &pool);
 
     STM_ASSERT_OK(stm_alloc_verify(a));
+
+    teardown(a, s, pool);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* ====================================================================== */
+/* P6-persist: dataset + snapshot indices through sync_commit + mount.     */
+/* ====================================================================== */
+
+STM_TEST(sync_dataset_state_survives_mount) {
+    /* Create a pool with dataset hierarchy, snapshots, and pool defaults.
+     * Commit, close, remount — verify everything came back via the
+     * sync-owned indices. */
+    make_tmp("ds_persist");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
+
+    stm_dataset_index  *di = stm_sync_dataset_index(s);
+    stm_snapshot_index *si = stm_sync_snapshot_index(s);
+    STM_ASSERT(di != NULL);
+    STM_ASSERT(si != NULL);
+
+    /* Build a small hierarchy. */
+    uint64_t a_id = 0, b_id = 0, c_id = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(di, STM_DATASET_ROOT_ID,
+                                              "alpha", &a_id));
+    STM_ASSERT_OK(stm_dataset_create_child(di, STM_DATASET_ROOT_ID,
+                                              "beta",  &b_id));
+    STM_ASSERT_OK(stm_dataset_create_child(di, a_id, "gamma", &c_id));
+    STM_ASSERT_OK(stm_dataset_set_property(di, STM_DATASET_ROOT_ID,
+                                              STM_PROP_COMPRESS, 0xa1));
+    STM_ASSERT_OK(stm_dataset_set_pool_default(di, STM_PROP_QUOTA, 0xbeef));
+
+    /* Snapshots on alpha + gamma. */
+    uint64_t snap1 = 0, snap2 = 0;
+    STM_ASSERT_OK(stm_snapshot_create(si, a_id, "snap_a", 0xfed1, &snap1));
+    STM_ASSERT_OK(stm_snapshot_create(si, c_id, "snap_c", 0xfed2, &snap2));
+    STM_ASSERT_OK(stm_snapshot_hold(si, snap1));   /* persisted hold */
+
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    teardown(a, s, pool);
+    stm_bdev_close(d);
+
+    /* Remount. */
+    d = open_fresh_device();
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
+    stm_sync *s2 = NULL;
+    stm_pool *pool2 = make_test_pool(d);
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
+
+    di = stm_sync_dataset_index(s2);
+    si = stm_sync_snapshot_index(s2);
+    STM_ASSERT(di != NULL);
+    STM_ASSERT(si != NULL);
+
+    /* Datasets restored. */
+    size_t n = 0;
+    STM_ASSERT_OK(stm_dataset_count(di, &n));
+    STM_ASSERT_EQ(n, (size_t)4);   /* root + alpha + beta + gamma */
+
+    stm_dataset_entry e;
+    STM_ASSERT_OK(stm_dataset_lookup(di, a_id, &e));
+    STM_ASSERT_EQ(memcmp(e.name, "alpha", 5), 0);
+    STM_ASSERT_OK(stm_dataset_lookup(di, c_id, &e));
+    STM_ASSERT_EQ(e.parent_id, a_id);
+
+    /* Properties — inheritable resolves through chain; pool default hit. */
+    uint64_t v = 0;
+    STM_ASSERT_OK(stm_dataset_effective_property(di, c_id,
+                                                    STM_PROP_COMPRESS, &v));
+    STM_ASSERT_EQ(v, 0xa1u);
+    STM_ASSERT_OK(stm_dataset_effective_property(di, c_id,
+                                                    STM_PROP_QUOTA, &v));
+    STM_ASSERT_EQ(v, 0xbeefu);   /* pool default (NONINHERITABLE) */
+
+    /* Snapshots restored, including hold count. */
+    size_t sn = 0;
+    STM_ASSERT_OK(stm_snapshot_count(si, &sn));
+    STM_ASSERT_EQ(sn, (size_t)2);
+
+    stm_snapshot_entry se;
+    STM_ASSERT_OK(stm_snapshot_lookup(si, snap1, &se));
+    STM_ASSERT_EQ(se.dataset_id, a_id);
+    STM_ASSERT_EQ(se.tree_root_paddr, (uint64_t)0xfed1);
+    STM_ASSERT_EQ(se.hold_count, (uint32_t)1);
+    /* Held → Delete refused. */
+    STM_ASSERT_ERR(stm_snapshot_delete(si, snap1), STM_EBUSY);
+
+    teardown(a2, s2, pool2);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(sync_dataset_persist_idempotent_across_retried_commit) {
+    /* Two consecutive commits with no dataset/snapshot mutation produce
+     * byte-identical ub_main_root + ub_snap_root content
+     * (quorum.tla::ContentQuorumAtGen under retry). */
+    make_tmp("ds_idem");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
+
+    stm_dataset_index *di = stm_sync_dataset_index(s);
+    uint64_t child = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(di, STM_DATASET_ROOT_ID, "x", &child));
+
+    STM_ASSERT_OK(stm_sync_commit(s));
+    /* Read back UB1 bytes. */
+    uint32_t lbl1 = 0, slot1 = 0;
+    stm_uberblock ub1;
+    STM_ASSERT_OK(stm_sb_mount_scan(d, &ub1, &lbl1, &slot1));
+
+    /* Commit AGAIN with no dataset mutation (alloc may dirty the
+     * roots object, but dataset_idx + snap_idx must short-circuit). */
+    STM_ASSERT_OK(stm_sync_commit(s));
+    uint32_t lbl2 = 0, slot2 = 0;
+    stm_uberblock ub2;
+    STM_ASSERT_OK(stm_sb_mount_scan(d, &ub2, &lbl2, &slot2));
+
+    /* Dataset + snapshot bptrs preserved across the unchanged commit. */
+    STM_ASSERT_EQ(memcmp(&ub1.ub_main_root, &ub2.ub_main_root,
+                            sizeof ub1.ub_main_root), 0);
+    STM_ASSERT_EQ(memcmp(&ub1.ub_snap_root, &ub2.ub_snap_root,
+                            sizeof ub1.ub_snap_root), 0);
+    STM_ASSERT_EQ(memcmp(ub1.ub_main_root_gen.v, ub2.ub_main_root_gen.v, 8), 0);
+    STM_ASSERT_EQ(memcmp(ub1.ub_snap_root_gen.v, ub2.ub_snap_root_gen.v, 8), 0);
 
     teardown(a, s, pool);
     stm_bdev_close(d);

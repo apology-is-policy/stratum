@@ -20,11 +20,16 @@
  * preconditions documented in dataset.h.
  */
 #include "tharness.h"
+#include <stratum/block.h>
+#include <stratum/bootstrap.h>
+#include <stratum/crypto.h>
 #include <stratum/dataset.h>
 
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 /* ------------------------------------------------------------------ */
 /* Lifecycle + Init.                                                  */
@@ -1073,6 +1078,395 @@ STM_TEST(prop_concurrent_set_clear_effective) {
     STM_ASSERT_EQ(total_failures, 0);
 
     stm_dataset_index_close(idx);
+}
+
+/* ====================================================================== */
+/* Persistence (P6-persist).                                                */
+/* ====================================================================== */
+
+#define DSP_DEVICE_BYTES      (UINT64_C(16) * 1024u * 1024u)
+#define DSP_BOOTSTRAP_BYTES   (UINT64_C(8)  * 1024u * 1024u)
+
+static const uint64_t DSP_POOL_UUID[2]   = {
+    0x9988776655443322ULL, 0x11ffeeddccbbaa00ULL };
+static const uint64_t DSP_DEVICE_UUID[2] = {
+    0xfacefeedcafef00dULL, 0xfedcba9876543210ULL };
+static const uint8_t  DSP_KEY[32] = {
+    0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
+    0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30,
+    0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
+    0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40,
+};
+
+static char dsp_tmp_path[256];
+
+static void dsp_make_tmp(const char *tag) {
+    snprintf(dsp_tmp_path, sizeof dsp_tmp_path,
+             "/tmp/stm_v2_dataset_persist_%s_%d.bin", tag, (int)getpid());
+    unlink(dsp_tmp_path);
+}
+
+static void dsp_open_fresh(stm_bdev **out_d, stm_bootstrap **out_b) {
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    STM_ASSERT_OK(stm_bdev_open(dsp_tmp_path, &bo, out_d));
+    STM_ASSERT_OK(stm_bdev_resize(*out_d, DSP_DEVICE_BYTES));
+    STM_ASSERT_OK(stm_crypto_init());
+    STM_ASSERT_OK(stm_bootstrap_create(*out_d, DSP_POOL_UUID, DSP_DEVICE_UUID,
+                                         DSP_BOOTSTRAP_BYTES, out_b));
+}
+
+static void dsp_reopen(stm_bdev **out_d, stm_bootstrap **out_b) {
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    STM_ASSERT_OK(stm_bdev_open(dsp_tmp_path, &bo, out_d));
+    STM_ASSERT_OK(stm_bootstrap_open(*out_d, out_b));
+}
+
+STM_TEST(dataset_persist_set_storage_required_for_commit) {
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(idx, DSP_KEY,
+                                                     DSP_POOL_UUID,
+                                                     DSP_DEVICE_UUID));
+
+    /* Without storage bound, commit refuses. */
+    uint64_t paddr = 0; uint8_t cs[32];
+    STM_ASSERT_ERR(stm_dataset_index_commit(idx, 1u, &paddr, cs), STM_EINVAL);
+
+    stm_dataset_index_close(idx);
+}
+
+STM_TEST(dataset_persist_set_crypt_ctx_required_for_commit) {
+    dsp_make_tmp("ctxreq");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    dsp_open_fresh(&d, &b);
+
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(idx, d, b));
+
+    /* Without crypt_ctx, commit refuses. */
+    uint64_t paddr = 0; uint8_t cs[32];
+    STM_ASSERT_ERR(stm_dataset_index_commit(idx, 1u, &paddr, cs), STM_EINVAL);
+
+    stm_dataset_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(dsp_tmp_path);
+}
+
+STM_TEST(dataset_persist_commit_load_roundtrip) {
+    dsp_make_tmp("rt");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    dsp_open_fresh(&d, &b);
+
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(/*current_txg=*/10, &idx));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(idx, DSP_KEY,
+                                                     DSP_POOL_UUID,
+                                                     DSP_DEVICE_UUID));
+
+    /* Populate. */
+    uint64_t a_id = 0, b_id = 0, c_id = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID, "alpha", &a_id));
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID, "beta",  &b_id));
+    STM_ASSERT_OK(stm_dataset_create_child(idx, a_id,                "gamma", &c_id));
+    /* Property work: set inheritable on root, immutable on alpha. */
+    STM_ASSERT_OK(stm_dataset_set_property(idx, STM_DATASET_ROOT_ID,
+                                              STM_PROP_COMPRESS, 0xaa));
+    STM_ASSERT_OK(stm_dataset_set_property(idx, a_id,
+                                              STM_PROP_ENCRYPTION, 0xbb));
+    STM_ASSERT_OK(stm_dataset_set_pool_default(idx, STM_PROP_QUOTA, 0x1234));
+    /* Destroy beta to exercise ABSENT slots in the encode path. */
+    STM_ASSERT_OK(stm_dataset_destroy(idx, b_id));
+
+    /* Commit. */
+    uint64_t root_paddr = 0;
+    uint8_t  root_csum[32];
+    STM_ASSERT_OK(stm_dataset_index_commit(idx, 1u, &root_paddr, root_csum));
+    STM_ASSERT(root_paddr != 0);
+
+    uint64_t got_gen = UINT64_MAX;
+    STM_ASSERT_OK(stm_dataset_index_get_gen(idx, &got_gen));
+    STM_ASSERT_EQ(got_gen, 1u);
+
+    /* Verify durable Merkle + AEAD chain. */
+    STM_ASSERT_OK(stm_dataset_index_verify(idx));
+
+    stm_dataset_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+
+    /* Reopen + load. */
+    dsp_reopen(&d, &b);
+    stm_dataset_index *idx2 = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx2));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(idx2, d, b));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(idx2, DSP_KEY,
+                                                      DSP_POOL_UUID,
+                                                      DSP_DEVICE_UUID));
+    STM_ASSERT_OK(stm_dataset_index_load_at(idx2, root_paddr, 1u, root_csum));
+
+    /* Count: root + alpha + gamma = 3 (beta destroyed). */
+    size_t n = 0;
+    STM_ASSERT_OK(stm_dataset_count(idx2, &n));
+    STM_ASSERT_EQ(n, (size_t)3);
+
+    /* Lookup alpha — name + parent + created_txg preserved. */
+    stm_dataset_entry e;
+    STM_ASSERT_OK(stm_dataset_lookup(idx2, a_id, &e));
+    STM_ASSERT_EQ(e.parent_id, STM_DATASET_ROOT_ID);
+    STM_ASSERT_EQ(e.name_len, (uint32_t)5);
+    STM_ASSERT_EQ(memcmp(e.name, "alpha", 5), 0);
+
+    /* Lookup gamma. */
+    STM_ASSERT_OK(stm_dataset_lookup(idx2, c_id, &e));
+    STM_ASSERT_EQ(e.parent_id, a_id);
+    STM_ASSERT_EQ(memcmp(e.name, "gamma", 5), 0);
+
+    /* beta is gone. */
+    STM_ASSERT_ERR(stm_dataset_lookup(idx2, b_id, &e), STM_ENOENT);
+
+    /* Properties preserved. */
+    uint64_t v = 0;
+    STM_ASSERT_OK(stm_dataset_effective_property(idx2, c_id,
+                                                    STM_PROP_COMPRESS, &v));
+    STM_ASSERT_EQ(v, 0xaau);  /* inherited from root through alpha */
+    STM_ASSERT_OK(stm_dataset_effective_property(idx2, a_id,
+                                                    STM_PROP_ENCRYPTION, &v));
+    STM_ASSERT_EQ(v, 0xbbu);
+    STM_ASSERT_OK(stm_dataset_effective_property(idx2, STM_DATASET_ROOT_ID,
+                                                    STM_PROP_QUOTA, &v));
+    STM_ASSERT_EQ(v, 0x1234u);  /* pool default */
+
+    stm_dataset_index_close(idx2);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(dsp_tmp_path);
+}
+
+STM_TEST(dataset_persist_commit_idempotent_on_clean) {
+    dsp_make_tmp("idem");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    dsp_open_fresh(&d, &b);
+
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(idx, DSP_KEY,
+                                                     DSP_POOL_UUID,
+                                                     DSP_DEVICE_UUID));
+    uint64_t a_id = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID,
+                                              "child", &a_id));
+
+    uint64_t paddr1 = 0; uint8_t csum1[32];
+    STM_ASSERT_OK(stm_dataset_index_commit(idx, 1u, &paddr1, csum1));
+    STM_ASSERT(paddr1 != 0);
+
+    /* Second commit at higher gen WITHOUT mutation — must short-circuit
+     * to cached values. quorum.tla::ContentQuorumAtGen requires byte-
+     * identical UB content across retries. */
+    uint64_t paddr2 = 0; uint8_t csum2[32];
+    STM_ASSERT_OK(stm_dataset_index_commit(idx, 2u, &paddr2, csum2));
+    STM_ASSERT_EQ(paddr2, paddr1);
+    STM_ASSERT_EQ(memcmp(csum2, csum1, 32), 0);
+
+    /* No-op set_pool_default (same value) doesn't dirty. */
+    STM_ASSERT_OK(stm_dataset_set_pool_default(idx, STM_PROP_COMPRESS, 0));
+    uint64_t paddr3 = 0; uint8_t csum3[32];
+    STM_ASSERT_OK(stm_dataset_index_commit(idx, 3u, &paddr3, csum3));
+    STM_ASSERT_EQ(paddr3, paddr1);
+
+    /* Real mutation dirties — next commit emits NEW paddr. */
+    uint64_t b_id = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID,
+                                              "newchild", &b_id));
+    uint64_t paddr4 = 0; uint8_t csum4[32];
+    STM_ASSERT_OK(stm_dataset_index_commit(idx, 4u, &paddr4, csum4));
+    STM_ASSERT(paddr4 != paddr1);
+
+    stm_dataset_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(dsp_tmp_path);
+}
+
+STM_TEST(dataset_persist_load_at_wrong_csum_rejected) {
+    dsp_make_tmp("merkle");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    dsp_open_fresh(&d, &b);
+
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(idx, DSP_KEY,
+                                                     DSP_POOL_UUID,
+                                                     DSP_DEVICE_UUID));
+    uint64_t a_id = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID,
+                                              "alpha", &a_id));
+    uint64_t paddr = 0; uint8_t cs[32];
+    STM_ASSERT_OK(stm_dataset_index_commit(idx, 1u, &paddr, cs));
+
+    stm_dataset_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+
+    dsp_reopen(&d, &b);
+    stm_dataset_index *idx2 = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx2));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(idx2, d, b));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(idx2, DSP_KEY,
+                                                      DSP_POOL_UUID,
+                                                      DSP_DEVICE_UUID));
+    uint8_t wrong_cs[32];
+    memcpy(wrong_cs, cs, 32);
+    wrong_cs[0] ^= 0x01;
+    STM_ASSERT_ERR(stm_dataset_index_load_at(idx2, paddr, 1u, wrong_cs),
+                    STM_ECORRUPT);
+
+    stm_dataset_index_close(idx2);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(dsp_tmp_path);
+}
+
+STM_TEST(dataset_persist_load_at_wrong_key_rejected) {
+    dsp_make_tmp("aead_key");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    dsp_open_fresh(&d, &b);
+
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(idx, DSP_KEY,
+                                                     DSP_POOL_UUID,
+                                                     DSP_DEVICE_UUID));
+    uint64_t a_id = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID,
+                                              "alpha", &a_id));
+    uint64_t paddr = 0; uint8_t cs[32];
+    STM_ASSERT_OK(stm_dataset_index_commit(idx, 1u, &paddr, cs));
+
+    stm_dataset_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+
+    dsp_reopen(&d, &b);
+    stm_dataset_index *idx2 = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx2));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(idx2, d, b));
+    uint8_t wrong_key[32];
+    memcpy(wrong_key, DSP_KEY, 32);
+    wrong_key[0] ^= 0x01;
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(idx2, wrong_key,
+                                                      DSP_POOL_UUID,
+                                                      DSP_DEVICE_UUID));
+    STM_ASSERT_ERR(stm_dataset_index_load_at(idx2, paddr, 1u, cs),
+                    STM_EBADTAG);
+
+    stm_dataset_index_close(idx2);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(dsp_tmp_path);
+}
+
+STM_TEST(dataset_persist_load_at_wrong_gen_rejected) {
+    dsp_make_tmp("aead_gen");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    dsp_open_fresh(&d, &b);
+
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(idx, DSP_KEY,
+                                                     DSP_POOL_UUID,
+                                                     DSP_DEVICE_UUID));
+    uint64_t a_id = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID,
+                                              "alpha", &a_id));
+    uint64_t paddr = 0; uint8_t cs[32];
+    STM_ASSERT_OK(stm_dataset_index_commit(idx, 1u, &paddr, cs));
+
+    stm_dataset_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+
+    dsp_reopen(&d, &b);
+    stm_dataset_index *idx2 = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx2));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(idx2, d, b));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(idx2, DSP_KEY,
+                                                      DSP_POOL_UUID,
+                                                      DSP_DEVICE_UUID));
+    /* Wrong gen — AEAD nonce includes gen. */
+    STM_ASSERT_ERR(stm_dataset_index_load_at(idx2, paddr, /*wrong gen*/ 7u, cs),
+                    STM_EBADTAG);
+
+    stm_dataset_index_close(idx2);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(dsp_tmp_path);
+}
+
+STM_TEST(dataset_persist_next_id_seeded_after_load) {
+    dsp_make_tmp("nextid");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    dsp_open_fresh(&d, &b);
+
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(idx, DSP_KEY,
+                                                     DSP_POOL_UUID,
+                                                     DSP_DEVICE_UUID));
+    /* Create three datasets — ids will be 2, 3, 4. */
+    uint64_t a, c, e;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID, "a", &a));
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID, "c", &c));
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID, "e", &e));
+    STM_ASSERT_EQ(a, (uint64_t)2);
+    STM_ASSERT_EQ(e, (uint64_t)4);
+
+    uint64_t paddr = 0; uint8_t cs[32];
+    STM_ASSERT_OK(stm_dataset_index_commit(idx, 1u, &paddr, cs));
+    uint64_t pre_next = 0;
+    STM_ASSERT_OK(stm_dataset_index_get_next_id(idx, &pre_next));
+    STM_ASSERT_EQ(pre_next, (uint64_t)5);
+
+    stm_dataset_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+
+    /* Reopen + load — next_id seeded past max-loaded-id (4 → next=5). */
+    dsp_reopen(&d, &b);
+    stm_dataset_index *idx2 = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx2));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(idx2, d, b));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(idx2, DSP_KEY,
+                                                      DSP_POOL_UUID,
+                                                      DSP_DEVICE_UUID));
+    STM_ASSERT_OK(stm_dataset_index_load_at(idx2, paddr, 1u, cs));
+    uint64_t post_next = 0;
+    STM_ASSERT_OK(stm_dataset_index_get_next_id(idx2, &post_next));
+    STM_ASSERT_EQ(post_next, (uint64_t)5);
+
+    /* New Create gets id=5. */
+    uint64_t newer = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx2, STM_DATASET_ROOT_ID,
+                                              "newer", &newer));
+    STM_ASSERT_EQ(newer, (uint64_t)5);
+
+    /* set_next_id refuses regression. */
+    STM_ASSERT_ERR(stm_dataset_index_set_next_id(idx2, 3u), STM_EINVAL);
+    /* Forward bump OK. */
+    STM_ASSERT_OK(stm_dataset_index_set_next_id(idx2, 100u));
+
+    stm_dataset_index_close(idx2);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(dsp_tmp_path);
 }
 
 STM_TEST_MAIN("dataset")

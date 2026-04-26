@@ -780,6 +780,26 @@ stm_status stm_sync_get_dek(const stm_sync *s,
  */
 size_t stm_sync_dek_count(const stm_sync *s);
 
+/* Forward decls for index accessors below. */
+struct stm_dataset_index;  typedef struct stm_dataset_index  stm_dataset_index;
+struct stm_snapshot_index; typedef struct stm_snapshot_index stm_snapshot_index;
+
+/*
+ * P6-persist: borrowed handles on the sync-owned dataset + snapshot
+ * indices. Lifetime is the sync handle's — caller MUST NOT close them.
+ * Both are non-NULL post-sync_create / post-sync_open.
+ *
+ * The dataset index always has the root dataset (id=1) populated (fresh
+ * pool: from sync_create's seed; mounted pool: from on-disk via
+ * stm_dataset_index_load_at).  The snapshot index is empty on a fresh
+ * pool, populated from on-disk on a mounted pool.
+ *
+ * Mutations made on these indices between sync_open and sync_close
+ * persist on the next sync_commit (which calls _commit on each handle).
+ */
+stm_dataset_index  *stm_sync_dataset_index(stm_sync *s);
+stm_snapshot_index *stm_sync_snapshot_index(stm_sync *s);
+
 #ifdef __cplusplus
 }
 #endif

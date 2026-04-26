@@ -16,11 +16,16 @@
  * documented preconditions and error paths.
  */
 #include "tharness.h"
+#include <stratum/block.h>
+#include <stratum/bootstrap.h>
+#include <stratum/crypto.h>
 #include <stratum/snapshot.h>
 
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 /* ------------------------------------------------------------------ */
 /* Lifecycle.                                                         */
@@ -550,6 +555,291 @@ STM_TEST(snap_concurrent_create_same_dataset) {
     STM_ASSERT_EQ(with_no_prev, 1);
 
     stm_snapshot_index_close(idx);
+}
+
+/* ====================================================================== */
+/* Persistence (P6-persist).                                                */
+/* ====================================================================== */
+
+#define SPP_DEVICE_BYTES      (UINT64_C(16) * 1024u * 1024u)
+#define SPP_BOOTSTRAP_BYTES   (UINT64_C(8)  * 1024u * 1024u)
+
+static const uint64_t SPP_POOL_UUID[2]   = {
+    0x4422664488aa00ccULL, 0xeeff112233445566ULL };
+static const uint64_t SPP_DEVICE_UUID[2] = {
+    0xfeedfaceabad1deaULL, 0x55aa33cc77bb99ddULL };
+static const uint8_t  SPP_KEY[32] = {
+    0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
+    0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f, 0x50,
+    0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58,
+    0x59, 0x5a, 0x5b, 0x5c, 0x5d, 0x5e, 0x5f, 0x60,
+};
+
+static char spp_tmp_path[256];
+
+static void spp_make_tmp(const char *tag) {
+    snprintf(spp_tmp_path, sizeof spp_tmp_path,
+             "/tmp/stm_v2_snapshot_persist_%s_%d.bin", tag, (int)getpid());
+    unlink(spp_tmp_path);
+}
+
+static void spp_open_fresh(stm_bdev **out_d, stm_bootstrap **out_b) {
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    STM_ASSERT_OK(stm_bdev_open(spp_tmp_path, &bo, out_d));
+    STM_ASSERT_OK(stm_bdev_resize(*out_d, SPP_DEVICE_BYTES));
+    STM_ASSERT_OK(stm_crypto_init());
+    STM_ASSERT_OK(stm_bootstrap_create(*out_d, SPP_POOL_UUID, SPP_DEVICE_UUID,
+                                         SPP_BOOTSTRAP_BYTES, out_b));
+}
+
+static void spp_reopen(stm_bdev **out_d, stm_bootstrap **out_b) {
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    STM_ASSERT_OK(stm_bdev_open(spp_tmp_path, &bo, out_d));
+    STM_ASSERT_OK(stm_bootstrap_open(*out_d, out_b));
+}
+
+STM_TEST(snapshot_persist_set_storage_required_for_commit) {
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    STM_ASSERT_OK(stm_snapshot_index_set_crypt_ctx(idx, SPP_KEY,
+                                                      SPP_POOL_UUID,
+                                                      SPP_DEVICE_UUID));
+    uint64_t paddr = 0; uint8_t cs[32];
+    STM_ASSERT_ERR(stm_snapshot_index_commit(idx, 1u, &paddr, cs), STM_EINVAL);
+    stm_snapshot_index_close(idx);
+}
+
+STM_TEST(snapshot_persist_commit_load_roundtrip) {
+    spp_make_tmp("rt");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    spp_open_fresh(&d, &b);
+
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(/*current_txg=*/100, &idx));
+    STM_ASSERT_OK(stm_snapshot_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_snapshot_index_set_crypt_ctx(idx, SPP_KEY,
+                                                      SPP_POOL_UUID,
+                                                      SPP_DEVICE_UUID));
+
+    /* Snap two datasets. */
+    uint64_t a = 0, b1 = 0, c = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, /*ds*/ 1, "snap_alpha", 0xfeed01, &a));
+    STM_ASSERT_OK(stm_snapshot_create(idx, /*ds*/ 1, "snap_beta",  0xfeed02, &b1));
+    STM_ASSERT_OK(stm_snapshot_create(idx, /*ds*/ 2, "snap_gamma", 0xfeed03, &c));
+
+    /* Hold snap_alpha twice (should persist). */
+    STM_ASSERT_OK(stm_snapshot_hold(idx, a));
+    STM_ASSERT_OK(stm_snapshot_hold(idx, a));
+
+    /* Delete snap_beta (releases ABSENT slot through encode). */
+    STM_ASSERT_OK(stm_snapshot_delete(idx, b1));
+
+    uint64_t paddr = 0; uint8_t cs[32];
+    STM_ASSERT_OK(stm_snapshot_index_commit(idx, 1u, &paddr, cs));
+    STM_ASSERT(paddr != 0);
+    STM_ASSERT_OK(stm_snapshot_index_verify(idx));
+
+    stm_snapshot_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+
+    spp_reopen(&d, &b);
+    stm_snapshot_index *idx2 = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx2));
+    STM_ASSERT_OK(stm_snapshot_index_set_storage(idx2, d, b));
+    STM_ASSERT_OK(stm_snapshot_index_set_crypt_ctx(idx2, SPP_KEY,
+                                                       SPP_POOL_UUID,
+                                                       SPP_DEVICE_UUID));
+    STM_ASSERT_OK(stm_snapshot_index_load_at(idx2, paddr, 1u, cs));
+
+    /* alpha + gamma present (beta gone). */
+    size_t n = 0;
+    STM_ASSERT_OK(stm_snapshot_count(idx2, &n));
+    STM_ASSERT_EQ(n, (size_t)2);
+
+    stm_snapshot_entry e;
+    STM_ASSERT_OK(stm_snapshot_lookup(idx2, a, &e));
+    STM_ASSERT_EQ(e.dataset_id, (uint64_t)1);
+    STM_ASSERT_EQ(e.tree_root_paddr, (uint64_t)0xfeed01);
+    STM_ASSERT_EQ(e.hold_count, (uint32_t)2);   /* persisted holds */
+    STM_ASSERT_EQ(e.name_len, (uint32_t)10);
+    STM_ASSERT_EQ(memcmp(e.name, "snap_alpha", 10), 0);
+
+    STM_ASSERT_OK(stm_snapshot_lookup(idx2, c, &e));
+    STM_ASSERT_EQ(e.dataset_id, (uint64_t)2);
+    STM_ASSERT_EQ(e.tree_root_paddr, (uint64_t)0xfeed03);
+
+    STM_ASSERT_ERR(stm_snapshot_lookup(idx2, b1, &e), STM_ENOENT);
+
+    /* Held alpha refuses Delete. */
+    STM_ASSERT_ERR(stm_snapshot_delete(idx2, a), STM_EBUSY);
+
+    stm_snapshot_index_close(idx2);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(spp_tmp_path);
+}
+
+STM_TEST(snapshot_persist_commit_idempotent_on_clean) {
+    spp_make_tmp("idem");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    spp_open_fresh(&d, &b);
+
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    STM_ASSERT_OK(stm_snapshot_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_snapshot_index_set_crypt_ctx(idx, SPP_KEY,
+                                                      SPP_POOL_UUID,
+                                                      SPP_DEVICE_UUID));
+    uint64_t a = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "snap1", 0x1000, &a));
+
+    uint64_t paddr1 = 0; uint8_t cs1[32];
+    STM_ASSERT_OK(stm_snapshot_index_commit(idx, 1u, &paddr1, cs1));
+
+    uint64_t paddr2 = 0; uint8_t cs2[32];
+    STM_ASSERT_OK(stm_snapshot_index_commit(idx, 2u, &paddr2, cs2));
+    STM_ASSERT_EQ(paddr2, paddr1);
+    STM_ASSERT_EQ(memcmp(cs2, cs1, 32), 0);
+
+    /* Hold dirties → next commit emits new paddr. */
+    STM_ASSERT_OK(stm_snapshot_hold(idx, a));
+    uint64_t paddr3 = 0; uint8_t cs3[32];
+    STM_ASSERT_OK(stm_snapshot_index_commit(idx, 3u, &paddr3, cs3));
+    STM_ASSERT(paddr3 != paddr1);
+
+    stm_snapshot_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(spp_tmp_path);
+}
+
+STM_TEST(snapshot_persist_load_at_wrong_csum_rejected) {
+    spp_make_tmp("merkle");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    spp_open_fresh(&d, &b);
+
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    STM_ASSERT_OK(stm_snapshot_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_snapshot_index_set_crypt_ctx(idx, SPP_KEY,
+                                                      SPP_POOL_UUID,
+                                                      SPP_DEVICE_UUID));
+    uint64_t a = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "s", 0x100, &a));
+    uint64_t paddr = 0; uint8_t cs[32];
+    STM_ASSERT_OK(stm_snapshot_index_commit(idx, 1u, &paddr, cs));
+
+    stm_snapshot_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+
+    spp_reopen(&d, &b);
+    stm_snapshot_index *idx2 = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx2));
+    STM_ASSERT_OK(stm_snapshot_index_set_storage(idx2, d, b));
+    STM_ASSERT_OK(stm_snapshot_index_set_crypt_ctx(idx2, SPP_KEY,
+                                                       SPP_POOL_UUID,
+                                                       SPP_DEVICE_UUID));
+    uint8_t wrong[32]; memcpy(wrong, cs, 32); wrong[0] ^= 1;
+    STM_ASSERT_ERR(stm_snapshot_index_load_at(idx2, paddr, 1u, wrong),
+                    STM_ECORRUPT);
+
+    stm_snapshot_index_close(idx2);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(spp_tmp_path);
+}
+
+STM_TEST(snapshot_persist_load_at_wrong_key_rejected) {
+    spp_make_tmp("aead_key");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    spp_open_fresh(&d, &b);
+
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    STM_ASSERT_OK(stm_snapshot_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_snapshot_index_set_crypt_ctx(idx, SPP_KEY,
+                                                      SPP_POOL_UUID,
+                                                      SPP_DEVICE_UUID));
+    uint64_t a = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "s", 0x100, &a));
+    uint64_t paddr = 0; uint8_t cs[32];
+    STM_ASSERT_OK(stm_snapshot_index_commit(idx, 1u, &paddr, cs));
+
+    stm_snapshot_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+
+    spp_reopen(&d, &b);
+    stm_snapshot_index *idx2 = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx2));
+    STM_ASSERT_OK(stm_snapshot_index_set_storage(idx2, d, b));
+    uint8_t wrong_key[32];
+    memcpy(wrong_key, SPP_KEY, 32);
+    wrong_key[0] ^= 1;
+    STM_ASSERT_OK(stm_snapshot_index_set_crypt_ctx(idx2, wrong_key,
+                                                       SPP_POOL_UUID,
+                                                       SPP_DEVICE_UUID));
+    STM_ASSERT_ERR(stm_snapshot_index_load_at(idx2, paddr, 1u, cs),
+                    STM_EBADTAG);
+
+    stm_snapshot_index_close(idx2);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(spp_tmp_path);
+}
+
+STM_TEST(snapshot_persist_next_id_seeded_after_load) {
+    spp_make_tmp("nextid");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    spp_open_fresh(&d, &b);
+
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    STM_ASSERT_OK(stm_snapshot_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_snapshot_index_set_crypt_ctx(idx, SPP_KEY,
+                                                      SPP_POOL_UUID,
+                                                      SPP_DEVICE_UUID));
+    uint64_t a, c, e;
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "x", 1, &a));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "y", 2, &c));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "z", 3, &e));
+    STM_ASSERT_EQ(a, (uint64_t)1);
+    STM_ASSERT_EQ(e, (uint64_t)3);
+
+    uint64_t paddr = 0; uint8_t cs[32];
+    STM_ASSERT_OK(stm_snapshot_index_commit(idx, 1u, &paddr, cs));
+
+    stm_snapshot_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+
+    spp_reopen(&d, &b);
+    stm_snapshot_index *idx2 = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx2));
+    STM_ASSERT_OK(stm_snapshot_index_set_storage(idx2, d, b));
+    STM_ASSERT_OK(stm_snapshot_index_set_crypt_ctx(idx2, SPP_KEY,
+                                                       SPP_POOL_UUID,
+                                                       SPP_DEVICE_UUID));
+    STM_ASSERT_OK(stm_snapshot_index_load_at(idx2, paddr, 1u, cs));
+
+    uint64_t post_next = 0;
+    STM_ASSERT_OK(stm_snapshot_index_get_next_id(idx2, &post_next));
+    STM_ASSERT_EQ(post_next, (uint64_t)4);
+
+    /* New Create gets id=4. */
+    uint64_t newer = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx2, 1, "newer", 4, &newer));
+    STM_ASSERT_EQ(newer, (uint64_t)4);
+
+    STM_ASSERT_ERR(stm_snapshot_index_set_next_id(idx2, 2u), STM_EINVAL);
+    STM_ASSERT_OK(stm_snapshot_index_set_next_id(idx2, 100u));
+
+    stm_snapshot_index_close(idx2);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(spp_tmp_path);
 }
 
 STM_TEST_MAIN("snapshot")

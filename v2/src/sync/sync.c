@@ -35,11 +35,13 @@
 #include <stratum/alloc_roots.h>
 #include <stratum/block.h>
 #include <stratum/crypto.h>
+#include <stratum/dataset.h>
 #include <stratum/hash.h>
 #include <stratum/janus.h>
 #include <stratum/keyfile.h>
 #include <stratum/keyschema.h>
 #include <stratum/pool.h>
+#include <stratum/snapshot.h>
 #include <stratum/super.h>
 
 #include <pthread.h>
@@ -211,6 +213,33 @@ struct stm_sync {
      * stored in ub_alloc_root), NOT any single alloc tree. Per-
      * device tree roots live INSIDE the roots object. */
     stm_alloc_roots  *roots;
+
+    /* P6-persist: dataset + snapshot persistent indices. Owned by sync;
+     * closed on stm_sync_close. Created at sync_open / sync_create with
+     * the same (bdev_0, bootstrap_0, metadata_key, pool_uuid,
+     * device_uuid_0) wiring as alloc_roots. Each every commit (or
+     * idempotent-shortcircuit) produces one (paddr, csum, gen) tuple
+     * stamped into ub_main_root + ub_main_root_gen / ub_snap_root +
+     * ub_snap_root_gen. */
+    stm_dataset_index  *dataset_idx;
+    stm_snapshot_index *snap_idx;
+
+    /* Durable mirror of ub_main_root / ub_snap_root state, last-
+     * committed. Updated on successful sync_commit; consumed by
+     * claim/reservation-phase build_uberblock to keep the prior
+     * roots intact across the gen bump. Zero before first commit. */
+    uint64_t           main_root_paddr;
+    uint64_t           main_root_gen;
+    uint8_t            main_root_csum[32];
+    uint64_t           snap_root_paddr;
+    uint64_t           snap_root_gen;
+    uint8_t            snap_root_csum[32];
+
+    /* Mirror of ub_next_dataset_id / ub_next_snap_id. Sourced from the
+     * indices' get_next_id at commit; restored at mount via
+     * stm_dataset_index_set_next_id / stm_snapshot_index_set_next_id. */
+    uint64_t           next_dataset_id;
+    uint64_t           next_snap_id;
 
     /* R15 F5 P2: runtime guards for mirror / reserve APIs. Mirrors
      * the v1 stm_fs guard pattern required by CLAUDE.md. Set by
@@ -572,6 +601,14 @@ static void build_uberblock(stm_uberblock *out,
                               uint64_t alloc_root_gen,
                               uint64_t keyschema_root_paddr,
                               const uint8_t keyschema_root_csum[32],
+                              uint64_t main_root_paddr,
+                              const uint8_t main_root_csum[32],
+                              uint64_t main_root_gen,
+                              uint64_t next_dataset_id,
+                              uint64_t snap_root_paddr,
+                              const uint8_t snap_root_csum[32],
+                              uint64_t snap_root_gen,
+                              uint64_t next_snap_id,
                               const uint8_t merkle_root[32],
                               const stm_alloc_stats *astats)
 {
@@ -611,6 +648,27 @@ static void build_uberblock(stm_uberblock *out,
         memcpy(out->ub_alloc_root.bp_csum, alloc_root_csum, 32);
     }
     out->ub_alloc_root_gen = stm_store_le64(alloc_root_gen);
+
+    /* P6-persist: dataset + snapshot tree roots. Both zero before the
+     * first commit; populated after dataset_index_commit / snapshot_
+     * index_commit returns the new (paddr, csum, gen). */
+    if (main_root_paddr != 0) {
+        out->ub_main_root.bp_paddr = stm_store_le64(main_root_paddr);
+        out->ub_main_root.bp_kind  = STM_BPTR_KIND_DATASET;
+        memcpy(out->ub_main_root.bp_csum, main_root_csum, 32);
+    }
+    out->ub_main_root_gen = stm_store_le64(main_root_gen);
+    if (snap_root_paddr != 0) {
+        out->ub_snap_root.bp_paddr = stm_store_le64(snap_root_paddr);
+        out->ub_snap_root.bp_kind  = STM_BPTR_KIND_SNAP;
+        memcpy(out->ub_snap_root.bp_csum, snap_root_csum, 32);
+    }
+    out->ub_snap_root_gen = stm_store_le64(snap_root_gen);
+
+    /* Pool-wide id counters (ARCH §5.4). Stamped from the indices'
+     * get_next_id; restored at mount via the indices' set_next_id. */
+    out->ub_next_dataset_id = stm_store_le64(next_dataset_id);
+    out->ub_next_snap_id    = stm_store_le64(next_snap_id);
 
     /* P5-durable-cursors: persist whatever durable scrub bytes sync
      * currently holds. scrub.c pushes updates via
@@ -918,6 +976,33 @@ stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
         if (rc != STM_OK) { stm_sync_close(s); return rc; }
         rc = stm_alloc_roots_set_crypt_ctx(s->roots, s->metadata_key,
                                               s->pool_uuid, s->device_uuid);
+        if (rc != STM_OK) { stm_sync_close(s); return rc; }
+
+        /* P6-persist: create the dataset + snapshot indices on the
+         * same bootstrap pool (device 0). At sync_create the indices
+         * are fresh — the dataset has just its root entry (id=1) and
+         * the snapshot is empty. First sync_commit will persist them. */
+        rc = stm_dataset_index_create(/*current_txg=*/0, &s->dataset_idx);
+        if (rc != STM_OK) { stm_sync_close(s); return rc; }
+        rc = stm_dataset_index_set_storage(s->dataset_idx, d, boot);
+        if (rc != STM_OK) { stm_sync_close(s); return rc; }
+        rc = stm_dataset_index_set_crypt_ctx(s->dataset_idx, s->metadata_key,
+                                                s->pool_uuid, s->device_uuid);
+        if (rc != STM_OK) { stm_sync_close(s); return rc; }
+
+        rc = stm_snapshot_index_create(/*current_txg=*/0, &s->snap_idx);
+        if (rc != STM_OK) { stm_sync_close(s); return rc; }
+        rc = stm_snapshot_index_set_storage(s->snap_idx, d, boot);
+        if (rc != STM_OK) { stm_sync_close(s); return rc; }
+        rc = stm_snapshot_index_set_crypt_ctx(s->snap_idx, s->metadata_key,
+                                                 s->pool_uuid, s->device_uuid);
+        if (rc != STM_OK) { stm_sync_close(s); return rc; }
+
+        /* Seed mirrors. The freshly-created indices' next_id is 2 for
+         * dataset (root claimed id=1) and 1 for snapshot. */
+        rc = stm_dataset_index_get_next_id(s->dataset_idx, &s->next_dataset_id);
+        if (rc != STM_OK) { stm_sync_close(s); return rc; }
+        rc = stm_snapshot_index_get_next_id(s->snap_idx, &s->next_snap_id);
         if (rc != STM_OK) { stm_sync_close(s); return rc; }
     }
 
@@ -1262,12 +1347,16 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
         return cs;
     }
 
-    /* P4-1 / P4-4a: verify ub_merkle_root self-consistency. */
+    /* P4-1 / P4-4a / P6-persist: verify ub_merkle_root self-consistency.
+     * Inputs match what sync_commit stamps: alloc_roots csum, dataset
+     * tree csum (from ub_main_root), snapshot tree csum (from
+     * ub_snap_root). For pools created pre-P6-persist these csums
+     * are all-zero and the recompute matches. */
     uint8_t  zeros32[32] = { 0 };
     uint8_t  recomputed[32];
-    stm_status ms = compute_merkle_root(zeros32,
+    stm_status ms = compute_merkle_root(ub.ub_main_root.bp_csum,
                                           ub.ub_alloc_root.bp_csum,
-                                          zeros32,
+                                          ub.ub_snap_root.bp_csum,
                                           zeros32,
                                           ks_hdr.ks_root.bp_csum,
                                           ub.ub_merkle_root_salt,
@@ -1339,6 +1428,105 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
         s2->alloc_root_paddr = roots_paddr;
     }
 
+    /* P6-persist: rehydrate the dataset + snapshot indices.
+     *
+     * The indices are always created (so post-mount Create/Hold
+     * etc. APIs work even on a fresh-format pool). On a v9 pool that
+     * has committed dataset/snapshot state, ub_main_root /
+     * ub_snap_root + their _gen fields drive load_at; on a fresh
+     * pool (no commits yet), both bptr.bp_paddr are zero and we
+     * leave the indices fresh-from-create.
+     *
+     * R7d P1-1 defense on bp_kind: ub_csum covers the bptr header,
+     * but a malformed-on-write could still slip a bad kind through;
+     * refuse explicitly. */
+    {
+        stm_bootstrap *boot2 = stm_alloc_bootstrap(a);
+        if (!boot2) { stm_sync_close(s2); return STM_EINVAL; }
+
+        stm_status di = stm_dataset_index_create(/*current_txg=*/0,
+                                                    &s2->dataset_idx);
+        if (di != STM_OK) { stm_sync_close(s2); return di; }
+        di = stm_dataset_index_set_storage(s2->dataset_idx, meta_bdev, boot2);
+        if (di != STM_OK) { stm_sync_close(s2); return di; }
+        di = stm_dataset_index_set_crypt_ctx(s2->dataset_idx, s2->metadata_key,
+                                                s2->pool_uuid, s2->device_uuid);
+        if (di != STM_OK) { stm_sync_close(s2); return di; }
+
+        uint64_t main_paddr = stm_load_le64(ub.ub_main_root.bp_paddr);
+        uint64_t main_gen   = stm_load_le64(ub.ub_main_root_gen);
+        if (main_paddr != 0) {
+            if (ub.ub_main_root.bp_kind != STM_BPTR_KIND_DATASET) {
+                stm_sync_close(s2);
+                return STM_ECORRUPT;
+            }
+            stm_status ls = stm_dataset_index_load_at(s2->dataset_idx,
+                                                         main_paddr, main_gen,
+                                                         ub.ub_main_root.bp_csum);
+            if (ls != STM_OK) { stm_sync_close(s2); return ls; }
+        }
+        /* Mirror durable values into s2 even when zero so claim-phase
+         * UB carries the same bytes through the gen bump. */
+        s2->main_root_paddr = main_paddr;
+        s2->main_root_gen   = main_gen;
+        memcpy(s2->main_root_csum, ub.ub_main_root.bp_csum, 32);
+
+        uint64_t ub_next_ds = stm_load_le64(ub.ub_next_dataset_id);
+        if (ub_next_ds == 0) {
+            /* v8-formatted pool upgraded to v9 has the field zero; seed
+             * to fresh value (2 = past root id=1). For populated v9
+             * pools this is a no-op against the always-≥2 value
+             * stamped at commit. */
+            ub_next_ds = 2;
+        }
+        /* set_next_id refuses regression below max_present + 1; a v9
+         * pool stamps next_dataset_id past max so this is consistent. */
+        di = stm_dataset_index_set_next_id(s2->dataset_idx, ub_next_ds);
+        if (di != STM_OK && di != STM_EINVAL) {
+            stm_sync_close(s2);
+            return di;
+        }
+        di = stm_dataset_index_get_next_id(s2->dataset_idx,
+                                              &s2->next_dataset_id);
+        if (di != STM_OK) { stm_sync_close(s2); return di; }
+
+        /* Snapshot index. */
+        stm_status si = stm_snapshot_index_create(/*current_txg=*/0,
+                                                     &s2->snap_idx);
+        if (si != STM_OK) { stm_sync_close(s2); return si; }
+        si = stm_snapshot_index_set_storage(s2->snap_idx, meta_bdev, boot2);
+        if (si != STM_OK) { stm_sync_close(s2); return si; }
+        si = stm_snapshot_index_set_crypt_ctx(s2->snap_idx, s2->metadata_key,
+                                                 s2->pool_uuid, s2->device_uuid);
+        if (si != STM_OK) { stm_sync_close(s2); return si; }
+
+        uint64_t spaddr = stm_load_le64(ub.ub_snap_root.bp_paddr);
+        uint64_t sgen   = stm_load_le64(ub.ub_snap_root_gen);
+        if (spaddr != 0) {
+            if (ub.ub_snap_root.bp_kind != STM_BPTR_KIND_SNAP) {
+                stm_sync_close(s2);
+                return STM_ECORRUPT;
+            }
+            stm_status ls = stm_snapshot_index_load_at(s2->snap_idx,
+                                                          spaddr, sgen,
+                                                          ub.ub_snap_root.bp_csum);
+            if (ls != STM_OK) { stm_sync_close(s2); return ls; }
+        }
+        s2->snap_root_paddr = spaddr;
+        s2->snap_root_gen   = sgen;
+        memcpy(s2->snap_root_csum, ub.ub_snap_root.bp_csum, 32);
+
+        uint64_t ub_next_sn = stm_load_le64(ub.ub_next_snap_id);
+        if (ub_next_sn == 0) ub_next_sn = 1;
+        si = stm_snapshot_index_set_next_id(s2->snap_idx, ub_next_sn);
+        if (si != STM_OK && si != STM_EINVAL) {
+            stm_sync_close(s2);
+            return si;
+        }
+        si = stm_snapshot_index_get_next_id(s2->snap_idx, &s2->next_snap_id);
+        if (si != STM_OK) { stm_sync_close(s2); return si; }
+    }
+
     /* R9 P0-1 — multi-device mount-claim.
      *
      * Write a claim UB at auth_gen+1 to every pool device, require
@@ -1370,6 +1558,14 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
                          /*alloc_root_gen=*/    alloc_root_gen,
                          /*keyschema_root=*/    ks_root_paddr,
                          /*keyschema_csum=*/    ks_hdr.ks_root.bp_csum,
+                         /*main_root=*/         s2->main_root_paddr,
+                         /*main_csum=*/         s2->main_root_csum,
+                         /*main_gen=*/          s2->main_root_gen,
+                         /*next_ds_id=*/        s2->next_dataset_id,
+                         /*snap_root=*/         s2->snap_root_paddr,
+                         /*snap_csum=*/         s2->snap_root_csum,
+                         /*snap_gen=*/          s2->snap_root_gen,
+                         /*next_snap_id=*/      s2->next_snap_id,
                          /*merkle_root=*/       ub.ub_merkle_root,
                          &astats_claim);
         uint32_t lbl  = ring_label_for_gen(auth_gen + 1);
@@ -1407,6 +1603,12 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
 void stm_sync_close(stm_sync *s)
 {
     if (!s) return;
+    /* P6-persist: close the dataset + snapshot indices first. They
+     * hold no exclusive resources beyond their own in-RAM state and
+     * borrow the bdev + bootstrap + metadata_key from the alloc /
+     * pool layer below. */
+    if (s->dataset_idx) stm_dataset_index_close(s->dataset_idx);
+    if (s->snap_idx)    stm_snapshot_index_close(s->snap_idx);
     /* P5-3b: close the allocator-roots handle. Owns its own
      * in-RAM btree; borrows bdev + bootstrap + metadata_key. */
     if (s->roots) stm_alloc_roots_close(s->roots);
@@ -1488,6 +1690,14 @@ stm_status stm_sync_commit(stm_sync *s)
                          /*alloc_root_gen=*/    s->alloc_root_gen,
                          /*keyschema_root=*/    s->keyschema_root_paddr,
                          /*keyschema_csum=*/    s->keyschema_root_csum,
+                         /*main_root=*/         s->main_root_paddr,
+                         /*main_csum=*/         s->main_root_csum,
+                         /*main_gen=*/          s->main_root_gen,
+                         /*next_ds_id=*/        s->next_dataset_id,
+                         /*snap_root=*/         s->snap_root_paddr,
+                         /*snap_csum=*/         s->snap_root_csum,
+                         /*snap_gen=*/          s->snap_root_gen,
+                         /*next_snap_id=*/      s->next_snap_id,
                          /*merkle_root=*/       s->merkle_root,
                          &astats_res);
         uint32_t res_label = ring_label_for_gen(reservation_gen);
@@ -1598,6 +1808,55 @@ stm_status stm_sync_commit(stm_sync *s)
         return rc;
     }
 
+    /* P6-persist: commit the dataset + snapshot indices. Each is
+     * idempotent on clean (R7c/R14b parallel) — clean handles return
+     * cached (paddr, csum) bytes which keep the UB content
+     * byte-identical across retries (quorum.tla::ContentQuorumAtGen).
+     * Both indices borrow device 0's bdev + bootstrap, so their
+     * persistence interleaves with alloc_roots's on the same bootstrap
+     * pool — the bootstrap_commit each one does is cheap and
+     * idempotent at the same gen. */
+    uint64_t main_paddr = 0;
+    uint8_t  main_csum[32] = {0};
+    uint64_t main_gen = 0;
+    uint64_t main_next_id = 0;
+    stm_status mcs = stm_dataset_index_commit(s->dataset_idx, target_gen,
+                                                  &main_paddr, main_csum);
+    if (mcs != STM_OK) {
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
+        return mcs;
+    }
+    mcs = stm_dataset_index_get_gen(s->dataset_idx, &main_gen);
+    if (mcs != STM_OK) {
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
+        return mcs;
+    }
+    mcs = stm_dataset_index_get_next_id(s->dataset_idx, &main_next_id);
+    if (mcs != STM_OK) {
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
+        return mcs;
+    }
+    uint64_t snap_paddr = 0;
+    uint8_t  snap_csum[32] = {0};
+    uint64_t snap_gen = 0;
+    uint64_t snap_next_id = 0;
+    stm_status scs = stm_snapshot_index_commit(s->snap_idx, target_gen,
+                                                   &snap_paddr, snap_csum);
+    if (scs != STM_OK) {
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
+        return scs;
+    }
+    scs = stm_snapshot_index_get_gen(s->snap_idx, &snap_gen);
+    if (scs != STM_OK) {
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
+        return scs;
+    }
+    scs = stm_snapshot_index_get_next_id(s->snap_idx, &snap_next_id);
+    if (scs != STM_OK) {
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
+        return scs;
+    }
+
     stm_alloc_stats astats;
     stm_status sr = stm_alloc_stats_get(s->alloc, &astats);
     if (sr != STM_OK) {
@@ -1605,16 +1864,17 @@ stm_status stm_sync_commit(stm_sync *s)
         return sr;
     }
 
-    /* P4-1 / P5-3b: compute the pool Merkle root. The `alloc_root`
-     * input is now the ROOTS OBJECT's root csum, which transitively
-     * covers every per-device tree root via the roots object's leaf
-     * values. R8-P1-1: refuse to commit on BLAKE3 OOM (writing zero
-     * merkle_root would silently bypass integrity check). */
+    /* P4-1 / P5-3b / P6-persist: compute the pool Merkle root. The
+     * `alloc_root` slot is the ROOTS OBJECT's root csum (transitively
+     * covers every per-device tree root). The `main_root` slot is the
+     * dataset index tree's root csum; `snap_root` is the snapshot
+     * index tree's. Both feed in directly now that the trees exist.
+     * R8-P1-1: refuse to commit on BLAKE3 OOM. */
     uint8_t zeros32[32] = { 0 };
     uint8_t new_merkle_root[32];
-    stm_status ms = compute_merkle_root(zeros32,   /* main */
+    stm_status ms = compute_merkle_root(main_csum,   /* main */
                                           roots_csum,
-                                          zeros32,   /* snap */
+                                          snap_csum,
                                           zeros32,   /* cas  */
                                           ks_root_csum,
                                           s->merkle_salt,
@@ -1630,6 +1890,8 @@ stm_status stm_sync_commit(stm_sync *s)
                      /*new_gen=*/           target_gen,
                      roots_paddr, roots_csum, roots_gen,
                      ks_root_paddr, ks_root_csum,
+                     main_paddr, main_csum, main_gen, main_next_id,
+                     snap_paddr, snap_csum, snap_gen, snap_next_id,
                      new_merkle_root, &astats);
 
     uint32_t fin_label = ring_label_for_gen(target_gen);
@@ -1653,8 +1915,16 @@ stm_status stm_sync_commit(stm_sync *s)
     s->alloc_root_paddr      = roots_paddr;
     s->alloc_root_gen        = roots_gen;
     s->keyschema_root_paddr  = ks_root_paddr;
+    s->main_root_paddr       = main_paddr;
+    s->main_root_gen         = main_gen;
+    s->snap_root_paddr       = snap_paddr;
+    s->snap_root_gen         = snap_gen;
+    s->next_dataset_id       = main_next_id;
+    s->next_snap_id          = snap_next_id;
     memcpy(s->alloc_root_csum,     roots_csum,      32);
     memcpy(s->keyschema_root_csum, ks_root_csum,   32);
+    memcpy(s->main_root_csum,      main_csum,      32);
+    memcpy(s->snap_root_csum,      snap_csum,      32);
     memcpy(s->merkle_root,         new_merkle_root, 32);
 
     pthread_mutex_unlock(&s->lock);    stm_pool_unlock_shared(s->pool);
@@ -3064,6 +3334,16 @@ stm_status stm_sync_get_dek(const stm_sync *s,
     memcpy(out_dek, slot->dek, 32);
     pthread_mutex_unlock(&ms->lock);
     return STM_OK;
+}
+
+stm_dataset_index *stm_sync_dataset_index(stm_sync *s)
+{
+    return s ? s->dataset_idx : NULL;
+}
+
+stm_snapshot_index *stm_sync_snapshot_index(stm_sync *s)
+{
+    return s ? s->snap_idx : NULL;
 }
 
 size_t stm_sync_dek_count(const stm_sync *s)

@@ -109,8 +109,22 @@ extern "C" {
  * via roster (`ub_roster[]` carries device_state) + per-device
  * alloc tree (carries the un-evacuated blocks). v7 pools had this
  * region zero (interpretable as IDLE/zero — but the version bump
- * makes intent explicit and refuses v7 mounts up-front per ARCH §5.9). */
-#define STM_UB_VERSION        8u
+ * makes intent explicit and refuses v7 mounts up-front per ARCH §5.9).
+ *
+ * v8 → v9 (Phase 6 P6-persist): `ub_main_root_gen` (le64) and
+ * `ub_snap_root_gen` (le64) carved from `ub_reserved`, recording the
+ * AEAD gen at which `ub_main_root` and `ub_snap_root` were last
+ * serialized. Symmetric to `ub_alloc_root_gen` (P4-3b R9 P0-1):
+ * a sync_open mount-claim UB that advances `ub_gen` past orphan-
+ * data writes WITHOUT rewriting the dataset/snapshot trees keeps
+ * those trees decryptable by feeding the prior gen into the AEAD
+ * nonce (ARCH §3.9.1 nonce-uniqueness). v8 pools had `ub_main_root`
+ * and `ub_snap_root` guaranteed-zero (no v8 code populated them),
+ * so the v8 → v9 upgrade is content-clean: load path checks
+ * `paddr == 0 → no commit yet`. The version bump gates the new
+ * field meaning explicitly. No feature-flag bump (full version
+ * bump per ARCH §5.9). */
+#define STM_UB_VERSION        9u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */
@@ -197,6 +211,7 @@ typedef enum {
     STM_BPTR_KIND_CAS         = 6,   /* CAS-tier index node */
     STM_BPTR_KIND_KEYSCHEMA   = 7,   /* key-schema sub-tree node (ARCH §7.7.3) */
     STM_BPTR_KIND_ALLOC_ROOTS = 8,   /* allocator-roots object (ARCH §6.1, P5-3b) */
+    STM_BPTR_KIND_DATASET     = 9,   /* dataset-index tree root (ARCH §8.3.2, P6-persist) */
 } stm_bptr_kind;
 
 typedef struct {
@@ -299,8 +314,23 @@ typedef struct {
      * Format: see stm_ub_scrub_state below for the unpacked C view. */
     uint8_t ub_scrub_state[64];                 /* 3048 :  64 */
 
+    /* Gen at which `ub_main_root`'s tree (dataset index, ARCH §8.3.2)
+     * was AEAD-encrypted (P6-persist, v9). Symmetric to
+     * `ub_alloc_root_gen`: usually equals `ub_gen`, but may be strictly
+     * less when `stm_sync_open` writes a "mount-claim" UB that advances
+     * the durable gen past any orphan-data writes without rewriting
+     * the dataset tree. The AEAD nonce on every dataset tree-node read
+     * uses THIS field, not ub_gen. Zero before the first commit. */
+    le64    ub_main_root_gen;                   /* 3112 :  8 */
+
+    /* Gen at which `ub_snap_root`'s tree (snapshot index, ARCH §8.5.2)
+     * was AEAD-encrypted (P6-persist, v9). Same semantics as
+     * `ub_main_root_gen` for the snapshot tree. Zero before the first
+     * commit. */
+    le64    ub_snap_root_gen;                   /* 3120 :  8 */
+
     /* Reserved for future fields + alignment to csum. */
-    uint8_t ub_reserved[952];                   /* 3112 : 952 */
+    uint8_t ub_reserved[936];                   /* 3128 : 936 */
 
     /* Checksum: BLAKE3-256 over the rest of the uberblock with this
      * field zeroed. Self-verifying; a blob whose first 4064 bytes
@@ -313,8 +343,12 @@ _Static_assert(offsetof(stm_uberblock, ub_alloc_root_gen) == 3040,
                "ub_alloc_root_gen must be at offset 3040 (v8 layout)");
 _Static_assert(offsetof(stm_uberblock, ub_scrub_state) == 3048,
                "ub_scrub_state must be at offset 3048 (v8 layout)");
-_Static_assert(offsetof(stm_uberblock, ub_reserved) == 3112,
-               "ub_reserved must be at offset 3112 (v8 layout)");
+_Static_assert(offsetof(stm_uberblock, ub_main_root_gen) == 3112,
+               "ub_main_root_gen must be at offset 3112 (v9 layout)");
+_Static_assert(offsetof(stm_uberblock, ub_snap_root_gen) == 3120,
+               "ub_snap_root_gen must be at offset 3120 (v9 layout)");
+_Static_assert(offsetof(stm_uberblock, ub_reserved) == 3128,
+               "ub_reserved must be at offset 3128 (v9 layout)");
 _Static_assert(offsetof(stm_uberblock, ub_csum) == 4064,
                "ub_csum must be at offset 4064");
 

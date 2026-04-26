@@ -11,6 +11,13 @@
  */
 #include <stratum/snapshot.h>
 
+#include <stratum/block.h>
+#include <stratum/bootstrap.h>
+#include <stratum/btnode.h>
+#include <stratum/btree.h>
+#include <stratum/btree_store.h>
+#include <stratum/super.h>
+
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,6 +52,18 @@ struct stm_snapshot_index {
     size_t          slots_cap;
     uint64_t        next_id;       /* monotonic; starts at 1 */
     uint64_t        current_txg;
+
+    /* ----- Persistence (P6-persist), mirrors stm_dataset_index. ----- */
+    stm_bdev       *bdev;
+    stm_bootstrap  *boot;
+    const uint8_t  *metadata_key;
+    uint64_t        pool_uuid[2];
+    uint64_t        device_uuid[2];
+    bool            crypt_set;
+    uint64_t        root_paddr;
+    uint64_t        root_gen;
+    uint8_t         root_csum[32];
+    bool            dirty;
 };
 
 /*
@@ -160,6 +179,7 @@ stm_status stm_snapshot_index_create(uint64_t current_txg,
 
     idx->next_id     = 1;
     idx->current_txg = current_txg;
+    idx->dirty       = true;  /* fresh state — needs first persist */
 
     *out = idx;
     return STM_OK;
@@ -252,6 +272,7 @@ stm_status stm_snapshot_create(stm_snapshot_index *idx,
     s->present           = true;
 
     *out_id = id;
+    idx->dirty = true;
 
     must_unlock(&idx->lock);
     return STM_OK;
@@ -271,6 +292,7 @@ stm_status stm_snapshot_delete(stm_snapshot_index *idx,
         return STM_EBUSY;
     }
     idx->slots[s].present = false;
+    idx->dirty = true;
     must_unlock(&idx->lock);
     return STM_OK;
 }
@@ -292,6 +314,7 @@ stm_status stm_snapshot_hold(stm_snapshot_index *idx,
         return STM_EOVERFLOW;
     }
     idx->slots[s].e.hold_count++;
+    idx->dirty = true;
     must_unlock(&idx->lock);
     return STM_OK;
 }
@@ -310,6 +333,7 @@ stm_status stm_snapshot_release(stm_snapshot_index *idx,
         return STM_EINVAL;
     }
     idx->slots[s].e.hold_count--;
+    idx->dirty = true;
     must_unlock(&idx->lock);
     return STM_OK;
 }
@@ -384,4 +408,467 @@ stm_status stm_snapshot_iter(const stm_snapshot_index *idx,
     }
     must_unlock(lock);
     return STM_OK;
+}
+
+/* =========================================================================
+ * Persistence (P6-persist).
+ *
+ * Mirrors src/dataset/dataset.c's persistence. Snapshot index has no
+ * pool-level defaults so the keyspace is just le64 snapshot_id (≥ 1).
+ * ========================================================================= */
+
+#define SP_KEY_LEN              8u
+#define SP_VAL_FIXED            44u                          /* before name[] */
+#define SP_VAL_MAX              (SP_VAL_FIXED + STM_SNAP_NAME_MAX)
+
+static void sp_encode_key(uint64_t id, uint8_t out[SP_KEY_LEN]) {
+    le64 k = stm_store_le64(id);
+    memcpy(out, k.v, SP_KEY_LEN);
+}
+
+static uint64_t sp_decode_key(const uint8_t in[SP_KEY_LEN]) {
+    le64 k;
+    memcpy(k.v, in, SP_KEY_LEN);
+    return stm_load_le64(k);
+}
+
+static size_t sp_encode_value(const snapshot_slot *s,
+                                 uint8_t *out, size_t out_cap) {
+    size_t need = SP_VAL_FIXED + s->e.name_len;
+    if (out_cap < need) return 0;
+
+    le64 ds   = stm_store_le64(s->e.dataset_id);
+    le64 trp  = stm_store_le64(s->e.tree_root_paddr);
+    le64 ctxg = stm_store_le64(s->e.created_txg);
+    le64 prev = stm_store_le64(s->e.prev_snap_id);
+    le32 hc   = stm_store_le32(s->e.hold_count);
+    le32 fl   = stm_store_le32(s->e.flags);
+    le16 nl   = stm_store_le16((uint16_t)s->e.name_len);
+
+    memcpy(out + 0,  ds.v,   8);
+    memcpy(out + 8,  trp.v,  8);
+    memcpy(out + 16, ctxg.v, 8);
+    memcpy(out + 24, prev.v, 8);
+    memcpy(out + 32, hc.v,   4);
+    memcpy(out + 36, fl.v,   4);
+    memcpy(out + 40, nl.v,   2);
+    /* out[42..44) is pad; zero. */
+    out[42] = 0; out[43] = 0;
+    if (s->e.name_len > 0) {
+        memcpy(out + SP_VAL_FIXED, s->e.name, s->e.name_len);
+    }
+    return need;
+}
+
+static stm_status sp_decode_value(uint64_t id, const uint8_t *in,
+                                     size_t in_len, snapshot_slot *out_slot) {
+    if (in_len < SP_VAL_FIXED) return STM_ECORRUPT;
+
+    le64 ds, trp, ctxg, prev;
+    le32 hc, fl;
+    le16 nl;
+    memcpy(ds.v,   in + 0,  8);
+    memcpy(trp.v,  in + 8,  8);
+    memcpy(ctxg.v, in + 16, 8);
+    memcpy(prev.v, in + 24, 8);
+    memcpy(hc.v,   in + 32, 4);
+    memcpy(fl.v,   in + 36, 4);
+    memcpy(nl.v,   in + 40, 2);
+
+    uint16_t name_len = stm_load_le16(nl);
+    if (name_len > STM_SNAP_NAME_MAX) return STM_ECORRUPT;
+    if (in_len != (size_t)SP_VAL_FIXED + name_len) return STM_ECORRUPT;
+
+    memset(out_slot, 0, sizeof *out_slot);
+    out_slot->present              = true;
+    out_slot->e.snapshot_id        = id;
+    out_slot->e.dataset_id         = stm_load_le64(ds);
+    out_slot->e.tree_root_paddr    = stm_load_le64(trp);
+    out_slot->e.created_txg        = stm_load_le64(ctxg);
+    out_slot->e.prev_snap_id       = stm_load_le64(prev);
+    out_slot->e.hold_count         = stm_load_le32(hc);
+    out_slot->e.flags              = stm_load_le32(fl);
+    out_slot->e.name_len           = name_len;
+    if (name_len > 0) {
+        memcpy(out_slot->e.name, in + SP_VAL_FIXED, name_len);
+    }
+    out_slot->e.name[name_len] = '\0';
+    return STM_OK;
+}
+
+/* ---- btree_store vtable ---- */
+
+typedef struct {
+    stm_bootstrap *boot;
+    stm_bdev      *bdev;
+} sp_store_ctx;
+
+static stm_status sp_store_reserve(void *ctx_, uint64_t *out_paddr) {
+    sp_store_ctx *ctx = ctx_;
+    return stm_bootstrap_reserve(ctx->boot, STM_BOOTSTRAP_UNIT_BLOCKS,
+                                   /*hint_paddr=*/0, out_paddr);
+}
+
+static stm_status sp_store_free(void *ctx_, uint64_t paddr, uint64_t free_gen) {
+    sp_store_ctx *ctx = ctx_;
+    return stm_bootstrap_free(ctx->boot, paddr, STM_BOOTSTRAP_UNIT_BLOCKS,
+                                free_gen);
+}
+
+static stm_status sp_store_write(void *ctx_, uint64_t paddr,
+                                    const void *buf, size_t len) {
+    sp_store_ctx *ctx = ctx_;
+    if (stm_paddr_device(paddr) != 0) return STM_EINVAL;
+    uint64_t byte_offset = stm_paddr_offset(paddr) * (uint64_t)STM_UB_SIZE;
+    return stm_bdev_write(ctx->bdev, byte_offset, buf, len);
+}
+
+static stm_status sp_store_read(void *ctx_, uint64_t paddr,
+                                   void *buf, size_t len) {
+    sp_store_ctx *ctx = ctx_;
+    if (stm_paddr_device(paddr) != 0) return STM_EINVAL;
+    uint64_t byte_offset = stm_paddr_offset(paddr) * (uint64_t)STM_UB_SIZE;
+    return stm_bdev_read(ctx->bdev, byte_offset, buf, len);
+}
+
+static const stm_btree_store_vtable SP_STORE_VT = {
+    .reserve = sp_store_reserve,
+    .free    = sp_store_free,
+    .write   = sp_store_write,
+    .read    = sp_store_read,
+};
+
+static inline sp_store_ctx sp_make_store_ctx(stm_snapshot_index *idx) {
+    sp_store_ctx c = { .boot = idx->boot, .bdev = idx->bdev };
+    return c;
+}
+
+static inline stm_btree_crypt_ctx sp_make_crypt_ctx(const stm_snapshot_index *idx) {
+    stm_btree_crypt_ctx cx = { .metadata_key = idx->metadata_key };
+    cx.pool_uuid[0]   = idx->pool_uuid[0];
+    cx.pool_uuid[1]   = idx->pool_uuid[1];
+    cx.device_uuid[0] = idx->device_uuid[0];
+    cx.device_uuid[1] = idx->device_uuid[1];
+    return cx;
+}
+
+/* ---- Public persistence API. ---- */
+
+stm_status stm_snapshot_index_set_storage(stm_snapshot_index *idx,
+                                             stm_bdev *bdev_0,
+                                             stm_bootstrap *boot_0) {
+    if (!idx || !bdev_0 || !boot_0) return STM_EINVAL;
+    must_lock(&idx->lock);
+    idx->bdev = bdev_0;
+    idx->boot = boot_0;
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+stm_status stm_snapshot_index_set_crypt_ctx(stm_snapshot_index *idx,
+                                               const uint8_t *metadata_key,
+                                               const uint64_t pool_uuid[2],
+                                               const uint64_t device_uuid_0[2]) {
+    if (!idx || !metadata_key || !pool_uuid || !device_uuid_0) return STM_EINVAL;
+    must_lock(&idx->lock);
+    idx->metadata_key   = metadata_key;
+    idx->pool_uuid[0]   = pool_uuid[0];
+    idx->pool_uuid[1]   = pool_uuid[1];
+    idx->device_uuid[0] = device_uuid_0[0];
+    idx->device_uuid[1] = device_uuid_0[1];
+    idx->crypt_set      = true;
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+stm_status stm_snapshot_index_get_root(const stm_snapshot_index *idx,
+                                          uint64_t *out_root_paddr,
+                                          uint8_t out_root_csum[32]) {
+    if (!idx || !out_root_paddr) return STM_EINVAL;
+    pthread_mutex_t *lock = snap_lock(idx);
+    must_lock(lock);
+    *out_root_paddr = idx->root_paddr;
+    if (out_root_csum) memcpy(out_root_csum, idx->root_csum, 32);
+    must_unlock(lock);
+    return STM_OK;
+}
+
+stm_status stm_snapshot_index_get_gen(const stm_snapshot_index *idx,
+                                         uint64_t *out_root_gen) {
+    if (!idx || !out_root_gen) return STM_EINVAL;
+    pthread_mutex_t *lock = snap_lock(idx);
+    must_lock(lock);
+    *out_root_gen = idx->root_gen;
+    must_unlock(lock);
+    return STM_OK;
+}
+
+stm_status stm_snapshot_index_get_next_id(const stm_snapshot_index *idx,
+                                             uint64_t *out_next_id) {
+    if (!idx || !out_next_id) return STM_EINVAL;
+    pthread_mutex_t *lock = snap_lock(idx);
+    must_lock(lock);
+    *out_next_id = idx->next_id;
+    must_unlock(lock);
+    return STM_OK;
+}
+
+stm_status stm_snapshot_index_set_next_id(stm_snapshot_index *idx,
+                                             uint64_t next_id) {
+    if (!idx) return STM_EINVAL;
+    must_lock(&idx->lock);
+    uint64_t max_present = 0;
+    for (size_t i = 0; i < idx->slots_len; i++) {
+        if (!idx->slots[i].present) continue;
+        if (idx->slots[i].e.snapshot_id > max_present)
+            max_present = idx->slots[i].e.snapshot_id;
+    }
+    if (next_id <= max_present) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
+    if (next_id != idx->next_id) {
+        idx->next_id = next_id;
+        /* No dirty flip — sourced from UB. */
+    }
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+static stm_status sp_build_btree_locked(const stm_snapshot_index *idx,
+                                            stm_btree_mt **out_tree) {
+    stm_btree_opts opts = stm_btree_opts_default();
+    if (opts.target_entries < 512u) opts.target_entries = 512u;
+
+    stm_btree_mt *t = NULL;
+    stm_status ts = stm_btree_mt_new(&opts, &t);
+    if (ts != STM_OK) return ts;
+
+    uint8_t key[SP_KEY_LEN];
+    uint8_t val[SP_VAL_MAX];
+    for (size_t i = 0; i < idx->slots_len; i++) {
+        const snapshot_slot *s = &idx->slots[i];
+        if (!s->present) continue;
+        sp_encode_key(s->e.snapshot_id, key);
+        size_t vlen = sp_encode_value(s, val, sizeof val);
+        if (vlen == 0) { stm_btree_mt_free(t); return STM_ERANGE; }
+        stm_status is = stm_btree_mt_insert(t, key, SP_KEY_LEN, val, vlen);
+        if (is != STM_OK) { stm_btree_mt_free(t); return is; }
+    }
+
+    *out_tree = t;
+    return STM_OK;
+}
+
+stm_status stm_snapshot_index_commit(stm_snapshot_index *idx,
+                                        uint64_t committed_gen,
+                                        uint64_t *out_root_paddr,
+                                        uint8_t out_root_csum[32]) {
+    if (!idx || !out_root_paddr || !out_root_csum) return STM_EINVAL;
+    must_lock(&idx->lock);
+
+    if (!idx->crypt_set || !idx->bdev || !idx->boot) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
+
+    if (!idx->dirty && idx->root_paddr != 0) {
+        *out_root_paddr = idx->root_paddr;
+        memcpy(out_root_csum, idx->root_csum, 32);
+        must_unlock(&idx->lock);
+        return STM_OK;
+    }
+
+    stm_btree_mt *t = NULL;
+    stm_status bs = sp_build_btree_locked(idx, &t);
+    if (bs != STM_OK) {
+        must_unlock(&idx->lock);
+        return bs;
+    }
+
+    sp_store_ctx       sc = sp_make_store_ctx(idx);
+    stm_btree_crypt_ctx cx = sp_make_crypt_ctx(idx);
+
+    uint64_t new_paddr = 0;
+    uint8_t  new_csum[32];
+    stm_status ss = stm_btree_store_serialize(t, committed_gen,
+                                                 /*tree_id=*/0u,
+                                                 &SP_STORE_VT, &sc, &cx,
+                                                 &new_paddr, new_csum);
+    stm_btree_mt_free(t);
+    if (ss != STM_OK) {
+        must_unlock(&idx->lock);
+        return ss;
+    }
+
+    #define SP_ROLLBACK_RESERVE() \
+        do { (void)stm_btree_store_free_tree(new_paddr, committed_gen,  \
+                                                committed_gen, new_csum, \
+                                                &SP_STORE_VT, &sc, &cx); \
+        } while (0)
+
+    if (idx->root_paddr != 0) {
+        stm_status fs = stm_btree_store_free_tree(idx->root_paddr,
+                                                     idx->root_gen,
+                                                     committed_gen,
+                                                     idx->root_csum,
+                                                     &SP_STORE_VT, &sc, &cx);
+        if (fs != STM_OK) {
+            SP_ROLLBACK_RESERVE();
+            must_unlock(&idx->lock);
+            return fs;
+        }
+    }
+
+    stm_status bsc = stm_bootstrap_commit(idx->boot, committed_gen);
+    if (bsc != STM_OK) {
+        SP_ROLLBACK_RESERVE();
+        must_unlock(&idx->lock);
+        return bsc;
+    }
+    #undef SP_ROLLBACK_RESERVE
+
+    idx->root_paddr = new_paddr;
+    idx->root_gen   = committed_gen;
+    memcpy(idx->root_csum, new_csum, 32);
+    idx->dirty      = false;
+
+    *out_root_paddr = new_paddr;
+    memcpy(out_root_csum, new_csum, 32);
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+/* load_at — atomic shadow swap. */
+
+typedef struct {
+    snapshot_slot *shadow_slots;
+    size_t         shadow_len;
+    size_t         shadow_cap;
+    uint64_t       max_present_id;
+    stm_status     err;
+} sp_load_ctx;
+
+static stm_status sp_shadow_append(sp_load_ctx *lc, const snapshot_slot *src) {
+    if (lc->shadow_len == lc->shadow_cap) {
+        size_t new_cap = lc->shadow_cap == 0 ? 8 : lc->shadow_cap * 2;
+        snapshot_slot *new_buf = realloc(lc->shadow_slots,
+                                            new_cap * sizeof(snapshot_slot));
+        if (!new_buf) return STM_ENOMEM;
+        lc->shadow_slots = new_buf;
+        lc->shadow_cap = new_cap;
+    }
+    lc->shadow_slots[lc->shadow_len++] = *src;
+    return STM_OK;
+}
+
+static int sp_load_iter(const void *k, size_t klen,
+                          const void *v, size_t vlen, void *ctx_) {
+    sp_load_ctx *lc = ctx_;
+    if (klen != SP_KEY_LEN) {
+        lc->err = STM_ECORRUPT;
+        return 1;
+    }
+    uint64_t key = sp_decode_key(k);
+    if (key == 0) {
+        /* snapshot_id=0 is reserved (STM_SNAP_NO_PREV sentinel) — never
+         * emitted by encode. Refuse to load such a tree. */
+        lc->err = STM_ECORRUPT;
+        return 1;
+    }
+    snapshot_slot tmp;
+    stm_status dr = sp_decode_value(key, v, vlen, &tmp);
+    if (dr != STM_OK) { lc->err = dr; return 1; }
+    if (key > lc->max_present_id) lc->max_present_id = key;
+    stm_status as = sp_shadow_append(lc, &tmp);
+    if (as != STM_OK) { lc->err = as; return 1; }
+    return 0;
+}
+
+stm_status stm_snapshot_index_load_at(stm_snapshot_index *idx,
+                                         uint64_t root_paddr, uint64_t root_gen,
+                                         const uint8_t expected_csum[32]) {
+    if (!idx || !expected_csum) return STM_EINVAL;
+    if (root_paddr == 0) return STM_EINVAL;
+    must_lock(&idx->lock);
+    if (!idx->crypt_set || !idx->bdev || !idx->boot) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
+
+    stm_btree_opts opts = stm_btree_opts_default();
+    if (opts.target_entries < 512u) opts.target_entries = 512u;
+    stm_btree_mt *t = NULL;
+    stm_status ts = stm_btree_mt_new(&opts, &t);
+    if (ts != STM_OK) {
+        must_unlock(&idx->lock);
+        return ts;
+    }
+
+    sp_store_ctx       sc = sp_make_store_ctx(idx);
+    stm_btree_crypt_ctx cx = sp_make_crypt_ctx(idx);
+
+    stm_status ds = stm_btree_store_deserialize(t, root_paddr, root_gen,
+                                                   expected_csum,
+                                                   &SP_STORE_VT, &sc, &cx);
+    if (ds != STM_OK) {
+        stm_btree_mt_free(t);
+        must_unlock(&idx->lock);
+        return ds;
+    }
+
+    sp_load_ctx lc = {0};
+    stm_status sr = stm_btree_mt_scan(t, NULL, 0, NULL, 0,
+                                         sp_load_iter, &lc);
+    stm_btree_mt_free(t);
+
+    if (sr != STM_OK) {
+        free(lc.shadow_slots);
+        must_unlock(&idx->lock);
+        return sr;
+    }
+    if (lc.err != STM_OK) {
+        free(lc.shadow_slots);
+        must_unlock(&idx->lock);
+        return lc.err;
+    }
+
+    /* Atomic swap. */
+    free(idx->slots);
+    idx->slots     = lc.shadow_slots;
+    idx->slots_len = lc.shadow_len;
+    idx->slots_cap = lc.shadow_cap;
+
+    if (lc.max_present_id < UINT64_MAX) {
+        idx->next_id = lc.max_present_id + 1;
+    }
+
+    idx->root_paddr = root_paddr;
+    idx->root_gen   = root_gen;
+    memcpy(idx->root_csum, expected_csum, 32);
+    idx->dirty = false;
+
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+stm_status stm_snapshot_index_verify(const stm_snapshot_index *idx) {
+    if (!idx) return STM_EINVAL;
+    pthread_mutex_t *lock = snap_lock(idx);
+    must_lock(lock);
+    if (!idx->crypt_set || !idx->bdev || !idx->boot) {
+        must_unlock(lock);
+        return STM_EINVAL;
+    }
+    if (idx->root_paddr == 0) {
+        must_unlock(lock);
+        return STM_OK;
+    }
+    sp_store_ctx       sc = sp_make_store_ctx((stm_snapshot_index *)idx);
+    stm_btree_crypt_ctx cx = sp_make_crypt_ctx(idx);
+    stm_status vs = stm_btree_store_verify(idx->root_paddr, idx->root_gen,
+                                              idx->root_csum,
+                                              &SP_STORE_VT, &sc, &cx);
+    must_unlock(lock);
+    return vs;
 }

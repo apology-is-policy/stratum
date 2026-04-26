@@ -59,6 +59,9 @@
 extern "C" {
 #endif
 
+struct stm_bdev;       typedef struct stm_bdev       stm_bdev;
+struct stm_bootstrap;  typedef struct stm_bootstrap  stm_bootstrap;
+
 /* Dataset id 1 is the root dataset, created at index init time.
  * Parent id 0 is the sentinel "no parent" (only root has it). */
 #define STM_DATASET_ROOT_ID      ((uint64_t)1)
@@ -335,6 +338,143 @@ STM_MUST_USE
 stm_status stm_dataset_effective_property(const stm_dataset_index *idx,
                                               uint64_t id, stm_property p,
                                               uint64_t *out_value);
+
+/* ========================================================================= */
+/* Persistence (P6-persist).                                                  */
+/* ========================================================================= */
+
+/*
+ * The dataset index is persisted as a btree_store-encoded, AEAD-encrypted
+ * tree under `ub_main_root`. The tree's keyspace mixes:
+ *   - Dataset entries:       key = le64 dataset_id (≥ 1), value = packed entry.
+ *   - Pool-property defaults: key = le64 0, value = STM_PROP_COUNT × le64.
+ *
+ * On-disk per-dataset value (variable length, name_len bytes for the name):
+ *
+ *   off  size  field
+ *    0    8   parent_id (le64)
+ *    8    8   created_txg (le64)
+ *   16    8   next_ino (le64)
+ *   24    4   flags (le32)
+ *   28    2   local_set_bitmap (le16) — bits 0..STM_PROP_COUNT-1 = local_set[]
+ *   30    2   name_len (le16) — 0..STM_DATASET_NAME_MAX
+ *   32   24   local_value[STM_PROP_COUNT] (3 × le64, in property-id order)
+ *   56    L   name (UTF-8, no NUL)  L = name_len
+ *
+ * Total: 56 + name_len bytes.  Bumping STM_PROP_COUNT requires a UB-version
+ * bump (the value layout shifts).  Crypt + I/O follow the alloc_roots
+ * pattern: AEAD nonce paddr‖gen‖pool_uuid, AD pool_uuid‖device_uuid_0,
+ * idempotent commit via internal dirty flag.
+ */
+
+/*
+ * Bind storage (device 0's bdev + bootstrap).  Borrowed pointers — caller
+ * must keep them live for the index's lifetime.  Mandatory before
+ * _load_at / _commit.
+ *
+ * STM_EINVAL on NULL idx / bdev / boot.
+ */
+STM_MUST_USE
+stm_status stm_dataset_index_set_storage(stm_dataset_index *idx,
+                                            stm_bdev *bdev_0,
+                                            stm_bootstrap *boot_0);
+
+/*
+ * Install crypt context.  metadata_key (32 bytes) is borrowed — must
+ * outlive the index.  pool_uuid + device_uuid_0 are copied.  Mandatory
+ * before _load_at / _commit.
+ *
+ * STM_EINVAL on NULL.
+ */
+STM_MUST_USE
+stm_status stm_dataset_index_set_crypt_ctx(stm_dataset_index *idx,
+                                              const uint8_t *metadata_key,
+                                              const uint64_t pool_uuid[2],
+                                              const uint64_t device_uuid_0[2]);
+
+/*
+ * Hydrate the index from on-disk state.  Wipes every existing slot
+ * (including the fresh-from-create root) and replaces with the on-disk
+ * contents.  Sets dirty=false on success.
+ *
+ * `root_paddr` MUST be non-zero (the caller checks for "no commit yet"
+ * by inspecting the UB before invoking).  `root_gen` is the AEAD gen at
+ * which the tree was last serialized (= ub_main_root_gen).
+ * `expected_csum` is the Merkle link from ub_main_root.bp_csum.
+ *
+ * Returns STM_OK on full hydration; STM_ECORRUPT on Merkle mismatch
+ * or malformed entries; STM_EBADTAG on AEAD failure; STM_EINVAL on
+ * missing storage / crypt ctx; STM_ENOTSUPPORTED if the on-disk tree
+ * exceeds btree_store's 2-level cap.
+ */
+STM_MUST_USE
+stm_status stm_dataset_index_load_at(stm_dataset_index *idx,
+                                        uint64_t root_paddr, uint64_t root_gen,
+                                        const uint8_t expected_csum[32]);
+
+/*
+ * Serialize current state, AEAD-encrypt, write a fresh root, free the
+ * previous root's nodes (if any), return new (paddr, csum).
+ *
+ * Idempotent when clean (dirty=false + prior commit exists): returns
+ * cached values without on-disk activity.  Mandatory for
+ * quorum.tla::ContentQuorumAtGen under retry — sync_commit may invoke
+ * us multiple times at the same target_gen and every call must produce
+ * byte-identical UB bytes across devices.
+ *
+ * `committed_gen` is the AEAD gen for the new root AND the free_gen for
+ * reclaiming the previous root.  Mirrors stm_alloc_roots_commit.
+ */
+STM_MUST_USE
+stm_status stm_dataset_index_commit(stm_dataset_index *idx,
+                                       uint64_t committed_gen,
+                                       uint64_t *out_root_paddr,
+                                       uint8_t out_root_csum[32]);
+
+/*
+ * Durable root paddr + csum as last persisted by _commit / _load_at.
+ * Both zero before any commit.
+ */
+STM_MUST_USE
+stm_status stm_dataset_index_get_root(const stm_dataset_index *idx,
+                                         uint64_t *out_root_paddr,
+                                         uint8_t out_root_csum[32]);
+
+/*
+ * Gen at which the durable root was AEAD-encrypted.  May differ from
+ * the current commit's gen when _commit idempotent-shortcircuits.
+ * 0 before any commit.  Stamped into ub_main_root_gen.
+ */
+STM_MUST_USE
+stm_status stm_dataset_index_get_gen(const stm_dataset_index *idx,
+                                        uint64_t *out_root_gen);
+
+/*
+ * Walk the on-disk tree's Merkle + AEAD chain without mutating
+ * in-RAM state.  STM_OK trivially if no commit has persisted yet
+ * (root_paddr == 0).  Symmetric to stm_alloc_roots_verify.
+ */
+STM_MUST_USE
+stm_status stm_dataset_index_verify(const stm_dataset_index *idx);
+
+/*
+ * Override the next-id counter used for monotonic dataset id assignment.
+ * Used by sync_open after load_at to seed from ub_next_dataset_id (since
+ * the on-disk tree only carries assigned ids, not the next-id counter).
+ *
+ * Refuses regression (STM_EINVAL if `next_id` is less than any present
+ * dataset id + 1).  STM_OK on valid args.
+ */
+STM_MUST_USE
+stm_status stm_dataset_index_set_next_id(stm_dataset_index *idx,
+                                            uint64_t next_id);
+
+/*
+ * Read the next-id counter.  Stamped into ub_next_dataset_id at commit.
+ */
+STM_MUST_USE
+stm_status stm_dataset_index_get_next_id(const stm_dataset_index *idx,
+                                            uint64_t *out_next_id);
 
 #ifdef __cplusplus
 }

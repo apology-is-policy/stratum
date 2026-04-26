@@ -17,6 +17,13 @@
  */
 #include <stratum/dataset.h>
 
+#include <stratum/block.h>
+#include <stratum/bootstrap.h>
+#include <stratum/btnode.h>
+#include <stratum/btree.h>
+#include <stratum/btree_store.h>
+#include <stratum/super.h>
+
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -62,6 +69,31 @@ struct stm_dataset_index {
     uint64_t        next_id;      /* next id to assign — monotonic */
     uint64_t        current_txg;
     uint64_t        pool_default[STM_PROP_COUNT];  /* per-property default */
+
+    /* ----- Persistence (P6-persist) ----- */
+    stm_bdev       *bdev;         /* borrowed — device 0; NULL until set_storage */
+    stm_bootstrap  *boot;         /* borrowed — device 0's bootstrap */
+    const uint8_t  *metadata_key; /* borrowed (32 bytes); NULL until set_crypt_ctx */
+    uint64_t        pool_uuid[2];
+    uint64_t        device_uuid[2];
+    bool            crypt_set;
+
+    /* Durable root state (last persisted or last loaded). All zero
+     * before any commit/load. */
+    uint64_t        root_paddr;
+    uint64_t        root_gen;
+    uint8_t         root_csum[32];
+
+    /* R7c P2-5 / R14b parallel idempotency flag. True iff in-RAM state
+     * has diverged from the durably-persisted root. Fresh handles start
+     * dirty (no durable state yet); load_at clears; mutation sets;
+     * commit clears on success.
+     *
+     * Why load-bearing: sync_commit retries on STM_EQUORUM must produce
+     * byte-identical UB bytes across every device per
+     * quorum.tla::ContentQuorumAtGen. A non-idempotent commit would
+     * allocate a fresh paddr on each call and diverge. */
+    bool            dirty;
 };
 
 /*
@@ -236,6 +268,7 @@ stm_status stm_dataset_index_create(uint64_t current_txg,
 
     idx->next_id     = 2;  /* root = 1 used; next allocation starts at 2 */
     idx->current_txg = current_txg;
+    idx->dirty       = true;  /* fresh state — needs first persist */
 
     *out = idx;
     return STM_OK;
@@ -331,6 +364,7 @@ stm_status stm_dataset_create_child(stm_dataset_index *idx,
     s->present       = true;
 
     *out_id = id;
+    idx->dirty = true;
 
     must_unlock(&idx->lock);
     return STM_OK;
@@ -351,6 +385,7 @@ stm_status stm_dataset_destroy(stm_dataset_index *idx, uint64_t id) {
         return STM_EBUSY;
     }
     idx->slots[s].present = false;
+    idx->dirty = true;
     must_unlock(&idx->lock);
     return STM_OK;
 }
@@ -378,6 +413,7 @@ stm_status stm_dataset_rename(stm_dataset_index *idx, uint64_t id,
     idx->slots[s].e.name_len = (uint32_t)name_len;
     memcpy(idx->slots[s].e.name, new_name, name_len);
     idx->slots[s].e.name[name_len] = '\0';
+    idx->dirty = true;
     must_unlock(&idx->lock);
     return STM_OK;
 }
@@ -413,6 +449,7 @@ stm_status stm_dataset_move(stm_dataset_index *idx, uint64_t id,
         return STM_EEXIST;
     }
     idx->slots[s].e.parent_id = new_parent_id;
+    idx->dirty = true;
     must_unlock(&idx->lock);
     return STM_OK;
 }
@@ -551,7 +588,10 @@ stm_status stm_dataset_set_pool_default(stm_dataset_index *idx,
     if (!idx) return STM_EINVAL;
     if (!prop_in_range(p)) return STM_EINVAL;
     must_lock(&idx->lock);
-    idx->pool_default[p] = value;
+    if (idx->pool_default[p] != value) {
+        idx->pool_default[p] = value;
+        idx->dirty = true;
+    }
     must_unlock(&idx->lock);
     return STM_OK;
 }
@@ -578,6 +618,7 @@ stm_status stm_dataset_set_property(stm_dataset_index *idx, uint64_t id,
     }
     idx->slots[s].local_set[p]   = true;
     idx->slots[s].local_value[p] = value;
+    idx->dirty = true;
     must_unlock(&idx->lock);
     return STM_OK;
 }
@@ -602,9 +643,12 @@ stm_status stm_dataset_clear_property(stm_dataset_index *idx, uint64_t id,
         must_unlock(&idx->lock);
         return STM_EINVAL;
     }
-    idx->slots[s].local_set[p] = false;
-    /* Leave local_value[p] in place; it's not observed when
-     * local_set[p] is FALSE. */
+    if (idx->slots[s].local_set[p]) {
+        idx->slots[s].local_set[p] = false;
+        /* Leave local_value[p] in place; it's not observed when
+         * local_set[p] is FALSE. */
+        idx->dirty = true;
+    }
     must_unlock(&idx->lock);
     return STM_OK;
 }
@@ -624,4 +668,585 @@ stm_status stm_dataset_effective_property(const stm_dataset_index *idx,
     *out_value = effective_property_locked(idx, id, p);
     must_unlock(lock);
     return STM_OK;
+}
+
+/* =========================================================================
+ * Persistence (P6-persist).
+ *
+ * The dataset index is persisted as a single btree_store-encoded tree
+ * under ub_main_root. Keyspace:
+ *   - le64 0   → pool-property defaults  (value: 24 bytes for STM_PROP_COUNT=3).
+ *   - le64 ≥1  → packed dataset entry    (value: 56 + name_len bytes).
+ *
+ * Implementation mirrors src/alloc_roots/alloc_roots.c — same vtable shape,
+ * same dirty-flag idempotency, same Merkle + AEAD chain via btree_store.
+ * ========================================================================= */
+
+#define DS_KEY_LEN              8u
+#define DS_VAL_FIXED            56u                          /* before name[] */
+#define DS_VAL_MAX              (DS_VAL_FIXED + STM_DATASET_NAME_MAX)
+#define DS_POOL_DEFAULTS_KEY    UINT64_C(0)
+#define DS_POOL_DEFAULTS_VAL_LEN  (8u * STM_PROP_COUNT)
+
+/* DS_VAL_MAX = 311 bytes, well under any btnode-leaf cap; if a future
+ * STM_DATASET_NAME_MAX bump pushes past one leaf, the encode would
+ * fail at stm_btree_mt_insert with STM_ERANGE. Keeping the math here
+ * as a comment for reviewers. */
+
+/* ---- key + value codec (caller must hold idx->lock for slot reads) ---- */
+
+static void ds_encode_key(uint64_t key_val, uint8_t out[DS_KEY_LEN]) {
+    le64 k = stm_store_le64(key_val);
+    memcpy(out, k.v, DS_KEY_LEN);
+}
+
+static uint64_t ds_decode_key(const uint8_t in[DS_KEY_LEN]) {
+    le64 k;
+    memcpy(k.v, in, DS_KEY_LEN);
+    return stm_load_le64(k);
+}
+
+/* Encode a present dataset slot. Returns the byte count written.
+ * Caller ensures out_cap >= DS_VAL_FIXED + slot->e.name_len. */
+static size_t ds_encode_dataset_value(const dataset_slot *s,
+                                          uint8_t *out, size_t out_cap) {
+    size_t need = DS_VAL_FIXED + s->e.name_len;
+    if (out_cap < need) return 0;
+
+    le64 parent = stm_store_le64(s->e.parent_id);
+    le64 ctxg   = stm_store_le64(s->e.created_txg);
+    le64 nino   = stm_store_le64(s->e.next_ino);
+    le32 flags  = stm_store_le32(s->e.flags);
+
+    uint16_t bitmap = 0;
+    for (unsigned p = 0; p < STM_PROP_COUNT; p++) {
+        if (s->local_set[p]) bitmap |= (uint16_t)(1u << p);
+    }
+    le16 lsb  = stm_store_le16(bitmap);
+    le16 nlen = stm_store_le16((uint16_t)s->e.name_len);
+
+    memcpy(out + 0,  parent.v, 8);
+    memcpy(out + 8,  ctxg.v,   8);
+    memcpy(out + 16, nino.v,   8);
+    memcpy(out + 24, flags.v,  4);
+    memcpy(out + 28, lsb.v,    2);
+    memcpy(out + 30, nlen.v,   2);
+    for (unsigned p = 0; p < STM_PROP_COUNT; p++) {
+        le64 v = stm_store_le64(s->local_value[p]);
+        memcpy(out + 32u + p * 8u, v.v, 8);
+    }
+    if (s->e.name_len > 0) {
+        memcpy(out + DS_VAL_FIXED, s->e.name, s->e.name_len);
+    }
+    return need;
+}
+
+/* Decode a dataset entry value into out_slot (with id supplied separately
+ * from the key). out_slot is fully populated (present=true). */
+static stm_status ds_decode_dataset_value(uint64_t id, const uint8_t *in,
+                                             size_t in_len,
+                                             dataset_slot *out_slot) {
+    if (in_len < DS_VAL_FIXED) return STM_ECORRUPT;
+
+    le64 parent, ctxg, nino;
+    le32 flags;
+    le16 lsb, nlen;
+    memcpy(parent.v, in + 0,  8);
+    memcpy(ctxg.v,   in + 8,  8);
+    memcpy(nino.v,   in + 16, 8);
+    memcpy(flags.v,  in + 24, 4);
+    memcpy(lsb.v,    in + 28, 2);
+    memcpy(nlen.v,   in + 30, 2);
+
+    uint16_t name_len = stm_load_le16(nlen);
+    if (name_len > STM_DATASET_NAME_MAX) return STM_ECORRUPT;
+    if (in_len != (size_t)DS_VAL_FIXED + name_len) return STM_ECORRUPT;
+
+    uint16_t bitmap = stm_load_le16(lsb);
+    /* Bits beyond STM_PROP_COUNT signal an encode from a future
+     * STM_PROP_COUNT — refuse to mount partially-decoded state. A
+     * version bump should accompany any STM_PROP_COUNT growth. */
+    uint16_t bitmap_mask = (uint16_t)((1u << STM_PROP_COUNT) - 1u);
+    if (bitmap & ~bitmap_mask) return STM_ECORRUPT;
+
+    memset(out_slot, 0, sizeof *out_slot);
+    out_slot->present     = true;
+    out_slot->e.id        = id;
+    out_slot->e.parent_id = stm_load_le64(parent);
+    out_slot->e.created_txg = stm_load_le64(ctxg);
+    out_slot->e.next_ino  = stm_load_le64(nino);
+    out_slot->e.flags     = stm_load_le32(flags);
+    out_slot->e.name_len  = name_len;
+    for (unsigned p = 0; p < STM_PROP_COUNT; p++) {
+        le64 v;
+        memcpy(v.v, in + 32u + p * 8u, 8);
+        out_slot->local_value[p] = stm_load_le64(v);
+        out_slot->local_set[p]   = (bitmap & (uint16_t)(1u << p)) != 0;
+    }
+    if (name_len > 0) {
+        memcpy(out_slot->e.name, in + DS_VAL_FIXED, name_len);
+    }
+    out_slot->e.name[name_len] = '\0';
+    return STM_OK;
+}
+
+static void ds_encode_pool_defaults(const uint64_t pd[STM_PROP_COUNT],
+                                       uint8_t out[DS_POOL_DEFAULTS_VAL_LEN]) {
+    for (unsigned p = 0; p < STM_PROP_COUNT; p++) {
+        le64 v = stm_store_le64(pd[p]);
+        memcpy(out + p * 8u, v.v, 8);
+    }
+}
+
+static stm_status ds_decode_pool_defaults(const uint8_t *in, size_t in_len,
+                                              uint64_t out_pd[STM_PROP_COUNT]) {
+    if (in_len != DS_POOL_DEFAULTS_VAL_LEN) return STM_ECORRUPT;
+    for (unsigned p = 0; p < STM_PROP_COUNT; p++) {
+        le64 v;
+        memcpy(v.v, in + p * 8u, 8);
+        out_pd[p] = stm_load_le64(v);
+    }
+    return STM_OK;
+}
+
+/* ---- btree_store vtable: bridge to bootstrap + bdev on device 0. ---- */
+
+typedef struct {
+    stm_bootstrap *boot;
+    stm_bdev      *bdev;
+} ds_store_ctx;
+
+static stm_status ds_store_reserve(void *ctx_, uint64_t *out_paddr) {
+    ds_store_ctx *ctx = ctx_;
+    return stm_bootstrap_reserve(ctx->boot, STM_BOOTSTRAP_UNIT_BLOCKS,
+                                   /*hint_paddr=*/0, out_paddr);
+}
+
+static stm_status ds_store_free(void *ctx_, uint64_t paddr, uint64_t free_gen) {
+    ds_store_ctx *ctx = ctx_;
+    return stm_bootstrap_free(ctx->boot, paddr, STM_BOOTSTRAP_UNIT_BLOCKS,
+                                free_gen);
+}
+
+static stm_status ds_store_write(void *ctx_, uint64_t paddr,
+                                    const void *buf, size_t len) {
+    ds_store_ctx *ctx = ctx_;
+    if (stm_paddr_device(paddr) != 0) return STM_EINVAL;
+    uint64_t byte_offset = stm_paddr_offset(paddr) * (uint64_t)STM_UB_SIZE;
+    return stm_bdev_write(ctx->bdev, byte_offset, buf, len);
+}
+
+static stm_status ds_store_read(void *ctx_, uint64_t paddr,
+                                   void *buf, size_t len) {
+    ds_store_ctx *ctx = ctx_;
+    if (stm_paddr_device(paddr) != 0) return STM_EINVAL;
+    uint64_t byte_offset = stm_paddr_offset(paddr) * (uint64_t)STM_UB_SIZE;
+    return stm_bdev_read(ctx->bdev, byte_offset, buf, len);
+}
+
+static const stm_btree_store_vtable DS_STORE_VT = {
+    .reserve = ds_store_reserve,
+    .free    = ds_store_free,
+    .write   = ds_store_write,
+    .read    = ds_store_read,
+};
+
+static inline ds_store_ctx ds_make_store_ctx(stm_dataset_index *idx) {
+    ds_store_ctx c = { .boot = idx->boot, .bdev = idx->bdev };
+    return c;
+}
+
+static inline stm_btree_crypt_ctx ds_make_crypt_ctx(const stm_dataset_index *idx) {
+    stm_btree_crypt_ctx cx = { .metadata_key = idx->metadata_key };
+    cx.pool_uuid[0]   = idx->pool_uuid[0];
+    cx.pool_uuid[1]   = idx->pool_uuid[1];
+    cx.device_uuid[0] = idx->device_uuid[0];
+    cx.device_uuid[1] = idx->device_uuid[1];
+    return cx;
+}
+
+/* ---- Public persistence API. ---- */
+
+stm_status stm_dataset_index_set_storage(stm_dataset_index *idx,
+                                            stm_bdev *bdev_0,
+                                            stm_bootstrap *boot_0) {
+    if (!idx || !bdev_0 || !boot_0) return STM_EINVAL;
+    must_lock(&idx->lock);
+    idx->bdev = bdev_0;
+    idx->boot = boot_0;
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+stm_status stm_dataset_index_set_crypt_ctx(stm_dataset_index *idx,
+                                              const uint8_t *metadata_key,
+                                              const uint64_t pool_uuid[2],
+                                              const uint64_t device_uuid_0[2]) {
+    if (!idx || !metadata_key || !pool_uuid || !device_uuid_0) return STM_EINVAL;
+    must_lock(&idx->lock);
+    idx->metadata_key   = metadata_key;
+    idx->pool_uuid[0]   = pool_uuid[0];
+    idx->pool_uuid[1]   = pool_uuid[1];
+    idx->device_uuid[0] = device_uuid_0[0];
+    idx->device_uuid[1] = device_uuid_0[1];
+    idx->crypt_set      = true;
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+stm_status stm_dataset_index_get_root(const stm_dataset_index *idx,
+                                         uint64_t *out_root_paddr,
+                                         uint8_t out_root_csum[32]) {
+    if (!idx || !out_root_paddr) return STM_EINVAL;
+    pthread_mutex_t *lock = dataset_lock(idx);
+    must_lock(lock);
+    *out_root_paddr = idx->root_paddr;
+    if (out_root_csum) memcpy(out_root_csum, idx->root_csum, 32);
+    must_unlock(lock);
+    return STM_OK;
+}
+
+stm_status stm_dataset_index_get_gen(const stm_dataset_index *idx,
+                                        uint64_t *out_root_gen) {
+    if (!idx || !out_root_gen) return STM_EINVAL;
+    pthread_mutex_t *lock = dataset_lock(idx);
+    must_lock(lock);
+    *out_root_gen = idx->root_gen;
+    must_unlock(lock);
+    return STM_OK;
+}
+
+stm_status stm_dataset_index_get_next_id(const stm_dataset_index *idx,
+                                            uint64_t *out_next_id) {
+    if (!idx || !out_next_id) return STM_EINVAL;
+    pthread_mutex_t *lock = dataset_lock(idx);
+    must_lock(lock);
+    *out_next_id = idx->next_id;
+    must_unlock(lock);
+    return STM_OK;
+}
+
+stm_status stm_dataset_index_set_next_id(stm_dataset_index *idx,
+                                            uint64_t next_id) {
+    if (!idx) return STM_EINVAL;
+    must_lock(&idx->lock);
+    /* Refuse to push next_id below any present id + 1 — would break
+     * IdMonotonic on subsequent creates. Equal-or-greater advance is OK. */
+    uint64_t max_present = 0;
+    for (size_t i = 0; i < idx->slots_len; i++) {
+        if (!idx->slots[i].present) continue;
+        if (idx->slots[i].e.id > max_present) max_present = idx->slots[i].e.id;
+    }
+    if (next_id <= max_present) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
+    if (next_id != idx->next_id) {
+        idx->next_id = next_id;
+        /* No dirty flip: next_id is sourced from the UB, not persisted
+         * in our btree. The caller (sync.c) round-trips it via
+         * ub_next_dataset_id. */
+    }
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+/* Build a fresh stm_btree_mt from the in-RAM slots[] + pool_default[].
+ * Caller (commit) takes ownership; on error returns NULL with status set. */
+static stm_status ds_build_btree_locked(const stm_dataset_index *idx,
+                                            stm_btree_mt **out_tree) {
+    stm_btree_opts opts = stm_btree_opts_default();
+    /* Dataset entries are ~60..310 bytes each; with a 128 KiB leaf and
+     * ~280 byte average we can fit ~460 entries per leaf. Bump
+     * target_entries to ~512 to stay single-leaf for typical pool
+     * populations (< 500 datasets) — internal-node splits then only
+     * fire for genuinely large pools. */
+    if (opts.target_entries < 512u) opts.target_entries = 512u;
+
+    stm_btree_mt *t = NULL;
+    stm_status ts = stm_btree_mt_new(&opts, &t);
+    if (ts != STM_OK) return ts;
+
+    /* Pool defaults: key = le64 0, value = 24 bytes. */
+    uint8_t pdkey[DS_KEY_LEN];
+    uint8_t pdval[DS_POOL_DEFAULTS_VAL_LEN];
+    ds_encode_key(DS_POOL_DEFAULTS_KEY, pdkey);
+    ds_encode_pool_defaults(idx->pool_default, pdval);
+    stm_status ins = stm_btree_mt_insert(t, pdkey, DS_KEY_LEN,
+                                            pdval, sizeof pdval);
+    if (ins != STM_OK) { stm_btree_mt_free(t); return ins; }
+
+    /* Each PRESENT slot. */
+    uint8_t key[DS_KEY_LEN];
+    uint8_t val[DS_VAL_MAX];
+    for (size_t i = 0; i < idx->slots_len; i++) {
+        const dataset_slot *s = &idx->slots[i];
+        if (!s->present) continue;
+        ds_encode_key(s->e.id, key);
+        size_t vlen = ds_encode_dataset_value(s, val, sizeof val);
+        if (vlen == 0) { stm_btree_mt_free(t); return STM_ERANGE; }
+        stm_status is = stm_btree_mt_insert(t, key, DS_KEY_LEN, val, vlen);
+        if (is != STM_OK) { stm_btree_mt_free(t); return is; }
+    }
+
+    *out_tree = t;
+    return STM_OK;
+}
+
+stm_status stm_dataset_index_commit(stm_dataset_index *idx,
+                                       uint64_t committed_gen,
+                                       uint64_t *out_root_paddr,
+                                       uint8_t out_root_csum[32]) {
+    if (!idx || !out_root_paddr || !out_root_csum) return STM_EINVAL;
+    must_lock(&idx->lock);
+
+    if (!idx->crypt_set || !idx->bdev || !idx->boot) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
+
+    /* R7c P2-5 / R14b idempotency: clean handle with prior persist
+     * returns cached values. Critical for quorum.tla::ContentQuorumAtGen
+     * under retry. */
+    if (!idx->dirty && idx->root_paddr != 0) {
+        *out_root_paddr = idx->root_paddr;
+        memcpy(out_root_csum, idx->root_csum, 32);
+        must_unlock(&idx->lock);
+        return STM_OK;
+    }
+
+    /* Materialize a btree from current slots + pool_defaults. */
+    stm_btree_mt *t = NULL;
+    stm_status bs = ds_build_btree_locked(idx, &t);
+    if (bs != STM_OK) {
+        must_unlock(&idx->lock);
+        return bs;
+    }
+
+    ds_store_ctx       sc = ds_make_store_ctx(idx);
+    stm_btree_crypt_ctx cx = ds_make_crypt_ctx(idx);
+
+    uint64_t new_paddr = 0;
+    uint8_t  new_csum[32];
+    stm_status ss = stm_btree_store_serialize(t, committed_gen,
+                                                 /*tree_id=*/0u,
+                                                 &DS_STORE_VT, &sc, &cx,
+                                                 &new_paddr, new_csum);
+    /* The materialized btree is no longer needed once serialized;
+     * btree_store has copied bytes into the on-disk nodes. */
+    stm_btree_mt_free(t);
+    if (ss != STM_OK) {
+        must_unlock(&idx->lock);
+        return ss;
+    }
+
+    /* R15 F2 P1 parallel: rollback helper for failure paths after a
+     * successful reserve+write but before commit completes. Symmetric
+     * to alloc_roots's AR_ROLLBACK_RESERVE. */
+    #define DS_ROLLBACK_RESERVE() \
+        do { (void)stm_btree_store_free_tree(new_paddr, committed_gen,  \
+                                                committed_gen, new_csum, \
+                                                &DS_STORE_VT, &sc, &cx); \
+        } while (0)
+
+    /* Defer-free the prior root's nodes. */
+    if (idx->root_paddr != 0) {
+        stm_status fs = stm_btree_store_free_tree(idx->root_paddr,
+                                                     idx->root_gen,
+                                                     committed_gen,
+                                                     idx->root_csum,
+                                                     &DS_STORE_VT, &sc, &cx);
+        if (fs != STM_OK) {
+            DS_ROLLBACK_RESERVE();
+            must_unlock(&idx->lock);
+            return fs;
+        }
+    }
+
+    /* Bootstrap commit so our reserve + free are durable. Idempotent
+     * at the same gen — symmetric to alloc_roots_commit. */
+    stm_status bsc = stm_bootstrap_commit(idx->boot, committed_gen);
+    if (bsc != STM_OK) {
+        DS_ROLLBACK_RESERVE();
+        must_unlock(&idx->lock);
+        return bsc;
+    }
+    #undef DS_ROLLBACK_RESERVE
+
+    idx->root_paddr = new_paddr;
+    idx->root_gen   = committed_gen;
+    memcpy(idx->root_csum, new_csum, 32);
+    idx->dirty      = false;
+
+    *out_root_paddr = new_paddr;
+    memcpy(out_root_csum, new_csum, 32);
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+/* ---- load_at: hydrate from on-disk root.
+ *
+ * Atomic swap discipline: we build a shadow slots[] + shadow
+ * pool_default[] from the on-disk btree first, validate it (root
+ * present, no decode failures), and only then swap into idx. Any
+ * failure mid-iteration leaves idx unchanged so the caller (sync_open)
+ * can propagate STM_ECORRUPT / STM_ENOMEM up without leaving the
+ * index in a half-loaded state.
+ * ---- */
+
+typedef struct {
+    /* Shadow buffers (we own them until swap). */
+    dataset_slot *shadow_slots;
+    size_t        shadow_len;
+    size_t        shadow_cap;
+    uint64_t      shadow_pool_default[STM_PROP_COUNT];
+    bool          saw_pool_defaults;
+    bool          saw_root;
+    uint64_t      max_present_id;
+    stm_status    err;
+} ds_load_ctx;
+
+static stm_status ds_shadow_append(ds_load_ctx *lc, const dataset_slot *src) {
+    if (lc->shadow_len == lc->shadow_cap) {
+        size_t new_cap = lc->shadow_cap == 0 ? 8 : lc->shadow_cap * 2;
+        dataset_slot *new_buf = realloc(lc->shadow_slots,
+                                          new_cap * sizeof(dataset_slot));
+        if (!new_buf) return STM_ENOMEM;
+        lc->shadow_slots = new_buf;
+        lc->shadow_cap = new_cap;
+    }
+    lc->shadow_slots[lc->shadow_len++] = *src;
+    return STM_OK;
+}
+
+static int ds_load_iter(const void *k, size_t klen,
+                          const void *v, size_t vlen, void *ctx_) {
+    ds_load_ctx *lc = ctx_;
+    if (klen != DS_KEY_LEN) {
+        lc->err = STM_ECORRUPT;
+        return 1;
+    }
+    uint64_t key = ds_decode_key(k);
+    if (key == DS_POOL_DEFAULTS_KEY) {
+        if (lc->saw_pool_defaults) {
+            lc->err = STM_ECORRUPT;
+            return 1;
+        }
+        stm_status pds = ds_decode_pool_defaults(v, vlen,
+                                                    lc->shadow_pool_default);
+        if (pds != STM_OK) { lc->err = pds; return 1; }
+        lc->saw_pool_defaults = true;
+        return 0;
+    }
+    dataset_slot tmp;
+    stm_status dr = ds_decode_dataset_value(key, v, vlen, &tmp);
+    if (dr != STM_OK) { lc->err = dr; return 1; }
+    if (key == STM_DATASET_ROOT_ID) lc->saw_root = true;
+    if (key > lc->max_present_id) lc->max_present_id = key;
+    stm_status as = ds_shadow_append(lc, &tmp);
+    if (as != STM_OK) { lc->err = as; return 1; }
+    return 0;
+}
+
+stm_status stm_dataset_index_load_at(stm_dataset_index *idx,
+                                        uint64_t root_paddr, uint64_t root_gen,
+                                        const uint8_t expected_csum[32]) {
+    if (!idx || !expected_csum) return STM_EINVAL;
+    if (root_paddr == 0) return STM_EINVAL;
+    must_lock(&idx->lock);
+    if (!idx->crypt_set || !idx->bdev || !idx->boot) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
+
+    stm_btree_opts opts = stm_btree_opts_default();
+    if (opts.target_entries < 512u) opts.target_entries = 512u;
+    stm_btree_mt *t = NULL;
+    stm_status ts = stm_btree_mt_new(&opts, &t);
+    if (ts != STM_OK) {
+        must_unlock(&idx->lock);
+        return ts;
+    }
+
+    ds_store_ctx       sc = ds_make_store_ctx(idx);
+    stm_btree_crypt_ctx cx = ds_make_crypt_ctx(idx);
+
+    stm_status ds = stm_btree_store_deserialize(t, root_paddr, root_gen,
+                                                   expected_csum,
+                                                   &DS_STORE_VT, &sc, &cx);
+    if (ds != STM_OK) {
+        stm_btree_mt_free(t);
+        must_unlock(&idx->lock);
+        return ds;
+    }
+
+    ds_load_ctx lc = {0};
+    stm_status sr = stm_btree_mt_scan(t, NULL, 0, NULL, 0,
+                                         ds_load_iter, &lc);
+    stm_btree_mt_free(t);
+
+    if (sr != STM_OK) {
+        free(lc.shadow_slots);
+        must_unlock(&idx->lock);
+        return sr;
+    }
+    if (lc.err != STM_OK) {
+        free(lc.shadow_slots);
+        must_unlock(&idx->lock);
+        return lc.err;
+    }
+    /* Every legitimate persisted index includes id=1. Missing root =
+     * corruption / tamper; refusing here keeps post-load_at invariants
+     * identical to fresh-create. */
+    if (!lc.saw_root) {
+        free(lc.shadow_slots);
+        must_unlock(&idx->lock);
+        return STM_ECORRUPT;
+    }
+
+    /* Atomic swap: replace in-RAM slots[] with the validated shadow. */
+    free(idx->slots);
+    idx->slots     = lc.shadow_slots;
+    idx->slots_len = lc.shadow_len;
+    idx->slots_cap = lc.shadow_cap;
+    memcpy(idx->pool_default, lc.shadow_pool_default,
+           sizeof idx->pool_default);
+
+    /* Seed next_id past the highest decoded id; sync.c may further
+     * advance via stm_dataset_index_set_next_id from ub_next_dataset_id
+     * (which can be ahead if a Destroy happened post-Create-with-skip). */
+    if (lc.max_present_id < UINT64_MAX) {
+        idx->next_id = lc.max_present_id + 1;
+    }
+
+    idx->root_paddr = root_paddr;
+    idx->root_gen   = root_gen;
+    memcpy(idx->root_csum, expected_csum, 32);
+    idx->dirty = false;
+
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+stm_status stm_dataset_index_verify(const stm_dataset_index *idx) {
+    if (!idx) return STM_EINVAL;
+    pthread_mutex_t *lock = dataset_lock(idx);
+    must_lock(lock);
+    if (!idx->crypt_set || !idx->bdev || !idx->boot) {
+        must_unlock(lock);
+        return STM_EINVAL;
+    }
+    if (idx->root_paddr == 0) {
+        must_unlock(lock);
+        return STM_OK;   /* no commit yet */
+    }
+    /* The store-context structs aren't const-friendly; we hold the lock
+     * for the duration so the cast is benign. */
+    ds_store_ctx       sc = ds_make_store_ctx((stm_dataset_index *)idx);
+    stm_btree_crypt_ctx cx = ds_make_crypt_ctx(idx);
+    stm_status vs = stm_btree_store_verify(idx->root_paddr, idx->root_gen,
+                                              idx->root_csum,
+                                              &DS_STORE_VT, &sc, &cx);
+    must_unlock(lock);
+    return vs;
 }
