@@ -92,20 +92,37 @@ into the CAS tier (which DOES need P6) is a separate concern.
       must_unlock contract. `test_extent_index` 32 tests covering
       lifecycle + every spec action + every documented error
       path + concurrent stress. Default + ASan + TSan all green.
-- [ ] **P7-3 extent persistence** — pending. Wire `ub_extent_root` +
-      per-inode Bε-tree under btree_store; bumps STM_UB_VERSION
-      v11→v12 (format break — needs user signoff). Realizes
-      ARCH §11.6.1's 32-byte record layout. The current in-RAM
-      MVP carries only the spec-modeled fields (ds, ino, off, len,
-      paddr, gen); compression / xxh fields land with persistence.
+- [x] **P7-3 extent persistence** — landed at `<P7-3-c-impl>`;
+      R35 close `<R35-close>`. STM_UB_VERSION 11 → 12. New UB
+      fields `ub_extent_root` (64-byte stm_bptr at offset 3128) +
+      `ub_extent_root_gen` (le64 at offset 3192) carved from the
+      head of `ub_reserved`. New `STM_BPTR_KIND_EXTENT_TREE = 10`.
+      Single unified Bε-tree under `ub_extent_root` keyed by
+      `(le64 ds || le64 ino || le64 off)`, valued by 32-byte
+      ARCH §11.6.1 record. Same envelope as ub_main_root /
+      ub_snap_root: btree_store-encoded, AEAD-encrypted with
+      nonce `paddr || gen || pool_uuid` + AD `pool_uuid ||
+      device_uuid_0`. Idempotent commit via internal dirty flag;
+      atomic shadow-swap on load_at; structural validator
+      enforcing NoOverlapWithinIno + paddr-disjointness on the
+      loaded shadow. MVP cap: 24-bit length (≤ 16 MiB - 1, far
+      above any realistic recordsize). xxh = 0 (AEAD tag is
+      integrity); compression = 0 (no compression in MVP).
+      Sync.c wire-in: `stm_extent_index *extent_idx` field +
+      mirror fields, `compute_merkle_root` extended to fold
+      extent_csum, `build_uberblock` extended with extent_root
+      params, hydration on `sync_open` from ub_extent_root,
+      commit on `sync_commit`, close on `sync_close`. New
+      accessor `stm_sync_extent_index`. v11 pools refused at v12
+      mount via uniform STM_EBADVERSION (existing handler).
 - [ ] **P7-4 dataset COW path integration** — pending. fs.c / sync.c
       integration: extent writes trigger
       `stm_snapshot_index_overwrite_block(paddr)` on each dropped
       paddr from `_overwrite` / `_truncate` / `_delete_file`
       (composes with dead_list.tla via the C-impl boundary).
-- [ ] **P7-5 production scrub cb** — pending. Now unblocks once
-      extents land (paddr→bptr resolver becomes implementable via
-      extent walk; P7-3 persistence is the gating dependency).
+- [ ] **P7-5 production scrub cb** — pending. Now unblocks (paddr→
+      bptr resolver becomes implementable via extent walk over the
+      persistent extent index). Integration concern only.
 - [ ] CAS tier — pending; needs extent layer + integration.
 - [ ] Send / recv — pending; needs extent layer + birth-txg from
       snapshots (already in place from P6).

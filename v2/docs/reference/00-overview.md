@@ -147,8 +147,9 @@ any version other than the current one.
 | 8 → 9 | P6-persist: `ub_main_root_gen` (le64) + `ub_snap_root_gen` (le64) carved from `ub_reserved` to track AEAD gens for the dataset + snapshot index trees (ARCH §8.3.2 / §8.5.2). Symmetric to `ub_alloc_root_gen`. New bptr kind `STM_BPTR_KIND_DATASET = 9`; `STM_BPTR_KIND_SNAP = 5` reused for the snapshot tree root. v8 pools refused at v9 mount via uniform `STM_EBADVERSION`. |
 | 9 → 10 | P6-clone: dataset on-disk value layout grows by 8 bytes for `origin_snap_id` (le64 at offset 56). New fixed prefix is 64 bytes (was 56); total = 64 + name_len. Non-clone datasets carry `STM_DATASET_NO_ORIGIN` (0). v9 pools refused at v10 mount via uniform `STM_EBADVERSION` — the dataset value layout shift would mis-decode otherwise. Uberblock layout itself unchanged. |
 | 10 → 11 | P6-deadlist: snapshot on-disk value layout grows by a tail `le32 dead_count + le64 paddrs[N]` (per-snap incremental dead-list, dead_list.tla). Per entry: 48 + name_len + 8*N bytes (was 44 + name_len). `STM_SNAP_DEAD_LIST_MAX = 256` paddrs/snap caps in-line; chunked off-tree storage deferred. v10 pools refused at v11 mount via uniform `STM_EBADVERSION` — v10 decoders rejected trailing bytes after `name`. Uberblock layout itself unchanged. |
+| 11 → 12 | P7-3: `ub_extent_root` (64-byte stm_bptr at offset 3128) + `ub_extent_root_gen` (le64 at offset 3192) carved from the head of `ub_reserved`. Anchors the extent-index Bε-tree (ARCH §11.6, extent.tla); same envelope as ub_main_root / ub_snap_root (btree_store-encoded, AEAD-encrypted). New `STM_BPTR_KIND_EXTENT_TREE = 10`. The Merkle root chain folds in a 6th csum (extent_csum) — v11 pools' Merkle roots were 5-input, so any v11 UB at v12 would fail Merkle recompute even before the version check. v11 pools refused at v12 mount via uniform `STM_EBADVERSION`. |
 
-Current: `STM_UB_VERSION == 11` (see `include/stratum/super.h`).
+Current: `STM_UB_VERSION == 12` (see `include/stratum/super.h`).
 
 ### Merkle-rooted integrity
 
@@ -171,7 +172,7 @@ checked at the extent boundary on every read.
 | 4 | ✅ complete | AEAD-AD + per-extent integrity + keyschema + PQ-hybrid wrap + janus + R13-R14b audits. | phase4-status.md |
 | 5 | ✅ complete | Multi-device pool + roster + quorum + scrub-α/β/γ. R15-R26 audits closed. Tagged `phase-5-complete` at `461e68e`. | phase5-status.md |
 | 6 | ✅ namespace feature-complete | Dataset / snapshot / clone / property / dead-list C impls + persistence. ROADMAP §9.2 5/5 exit criteria met. R27-R33 closed. | phase6-status.md |
-| 7 | 🚧 in progress | P7-prework FastCDC + P7-1 extent.tla spec + P7-2 extent C impl (in-RAM MVP). R27, R34 closed. Pending: P7-3 persistence (UB v11→v12), P7-4 sync.c COW integration, CAS, send/recv, reflinks. | phase7-status.md |
+| 7 | 🚧 in progress | P7-prework FastCDC + P7-1 extent.tla spec + P7-2 extent C impl (in-RAM MVP) + P7-3 extent persistence (UB v11→v12). R27, R34, R35 closed. Pending: P7-4 sync.c COW integration, CAS, send/recv, reflinks. | phase7-status.md |
 
 ## Test posture
 

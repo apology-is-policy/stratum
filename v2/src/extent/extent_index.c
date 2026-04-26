@@ -29,6 +29,13 @@
  */
 #include <stratum/extent.h>
 
+#include <stratum/block.h>
+#include <stratum/bootstrap.h>
+#include <stratum/btnode.h>
+#include <stratum/btree.h>
+#include <stratum/btree_store.h>
+#include <stratum/super.h>
+
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,6 +58,18 @@ struct stm_extent_index {
     size_t                n_records;
     size_t                cap_records;
     uint64_t              current_txg;
+
+    /* ----- Persistence (P7-3), mirrors stm_dataset_index. ----- */
+    stm_bdev       *bdev;
+    stm_bootstrap  *boot;
+    const uint8_t  *metadata_key;
+    uint64_t        pool_uuid[2];
+    uint64_t        device_uuid[2];
+    bool            crypt_set;
+    uint64_t        root_paddr;
+    uint64_t        root_gen;
+    uint8_t         root_csum[32];
+    bool            dirty;
 };
 
 static inline pthread_mutex_t *ex_lock(const stm_extent_index *idx) {
@@ -161,6 +180,10 @@ stm_status stm_extent_index_create(uint64_t current_txg,
     }
 
     idx->current_txg = current_txg;
+    /* Mark dirty so the first commit persists even when no extents
+     * have been written — matches the dataset / snapshot pattern.
+     * The empty btree write makes ub_extent_root non-zero. */
+    idx->dirty       = true;
     *out = idx;
     return STM_OK;
 }
@@ -186,6 +209,10 @@ stm_status stm_extent_index_advance_txg(stm_extent_index *idx,
                                            uint64_t new_txg) {
     if (!idx) return STM_EINVAL;
     must_lock(&idx->lock);
+    /* Equal value is no-op; only strict regression refused.
+     * current_txg is NOT persisted as a standalone field — load_at
+     * recomputes it from max(write_gen) — so advance_txg doesn't
+     * flip dirty. Matches snapshot.c's pattern. */
     if (new_txg < idx->current_txg) {
         must_unlock(&idx->lock);
         return STM_EINVAL;
@@ -231,6 +258,7 @@ stm_status stm_extent_write(stm_extent_index *idx,
         .paddr = paddr, .gen = write_gen,
     };
     stm_status as = append_record_locked(idx, &rec);
+    if (as == STM_OK) idx->dirty = true;
     must_unlock(&idx->lock);
     return as;
 }
@@ -346,6 +374,7 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
 
     *out_dropped_paddrs = out_buf;
     *out_n_dropped      = n_drops;
+    idx->dirty = true;
     must_unlock(&idx->lock);
     return STM_OK;
 }
@@ -426,6 +455,7 @@ stm_status stm_extent_truncate(stm_extent_index *idx,
                                                 /*threshold=*/new_size,
                                                 out_dropped_paddrs,
                                                 out_n_dropped);
+    if (rs == STM_OK && *out_n_dropped > 0) idx->dirty = true;
     must_unlock(&idx->lock);
     return rs;
 }
@@ -447,6 +477,7 @@ stm_status stm_extent_delete_file(stm_extent_index *idx,
                                                 /*threshold=*/0,
                                                 out_dropped_paddrs,
                                                 out_n_dropped);
+    if (rs == STM_OK && *out_n_dropped > 0) idx->dirty = true;
     must_unlock(&idx->lock);
     return rs;
 }
@@ -558,4 +589,481 @@ stm_status stm_extent_count_for_ino(const stm_extent_index *idx,
     *out_count = n;
     must_unlock(lock);
     return STM_OK;
+}
+
+/* =========================================================================
+ * Persistence (P7-3, v12).
+ *
+ * Mirrors src/snapshot/snapshot.c's persistence section. Same envelope:
+ * btree_store-encoded, AEAD-encrypted Bε-tree on device 0, with nonce
+ * paddr‖gen‖pool_uuid + AD pool_uuid‖device_uuid_0. Idempotent commit
+ * via internal dirty flag; atomic shadow swap on load_at; structural
+ * validator on the loaded shadow before swap.
+ * ========================================================================= */
+
+#define EX_KEY_LEN              24u                          /* ds + ino + off */
+#define EX_VAL_LEN              32u                          /* ARCH §11.6.1   */
+/* MVP cap: 24-bit length so dlen + clen_and_comp.clen both fit without
+ * compression. Production extends with chunking / per-extent integrity. */
+#define EX_LEN_MAX_24BIT        UINT32_C(0x00FFFFFF)
+
+static void ex_encode_key(uint64_t ds, uint64_t ino, uint64_t off,
+                             uint8_t out[EX_KEY_LEN]) {
+    le64 d = stm_store_le64(ds);
+    le64 i = stm_store_le64(ino);
+    le64 o = stm_store_le64(off);
+    memcpy(out + 0,  d.v, 8);
+    memcpy(out + 8,  i.v, 8);
+    memcpy(out + 16, o.v, 8);
+}
+
+static stm_status ex_decode_key(const uint8_t *in, size_t in_len,
+                                   uint64_t *ds, uint64_t *ino, uint64_t *off) {
+    if (in_len != EX_KEY_LEN) return STM_ECORRUPT;
+    le64 d, i, o;
+    memcpy(d.v, in + 0,  8);
+    memcpy(i.v, in + 8,  8);
+    memcpy(o.v, in + 16, 8);
+    *ds  = stm_load_le64(d);
+    *ino = stm_load_le64(i);
+    *off = stm_load_le64(o);
+    return STM_OK;
+}
+
+static stm_status ex_encode_value(const stm_extent_record *r,
+                                     uint8_t out[EX_VAL_LEN]) {
+    /* MVP cap on length (see header). Refuse to encode oversize records
+     * to keep on-disk fields representable; in practice, recordsize is
+     * bounded well under 24 bits. */
+    if (r->len > EX_LEN_MAX_24BIT) return STM_ERANGE;
+
+    le64 paddr      = stm_store_le64(r->paddr);
+    le64 write_gen  = stm_store_le64(r->gen);
+    le32 dlen       = stm_store_le32((uint32_t)r->len);
+    /* clen_and_comp: low 24 = stored length (== dlen, no compression
+     * in MVP); high 8 = compression algo (0 = none). */
+    uint32_t clen_and_comp = (uint32_t)r->len & 0x00FFFFFFu;
+    le32 cac        = stm_store_le32(clen_and_comp);
+    le64 xxh        = stm_store_le64((uint64_t)0); /* AEAD-only mode */
+
+    memcpy(out + 0,  paddr.v,     8);
+    memcpy(out + 8,  write_gen.v, 8);
+    memcpy(out + 16, dlen.v,      4);
+    memcpy(out + 20, cac.v,       4);
+    memcpy(out + 24, xxh.v,       8);
+    return STM_OK;
+}
+
+static stm_status ex_decode_value(const uint8_t *in, size_t in_len,
+                                     uint64_t ds, uint64_t ino, uint64_t off,
+                                     stm_extent_record *out_rec) {
+    if (in_len != EX_VAL_LEN) return STM_ECORRUPT;
+    le64 paddr_le, write_gen_le, xxh_le;
+    le32 dlen_le, cac_le;
+    memcpy(paddr_le.v,     in + 0,  8);
+    memcpy(write_gen_le.v, in + 8,  8);
+    memcpy(dlen_le.v,      in + 16, 4);
+    memcpy(cac_le.v,       in + 20, 4);
+    memcpy(xxh_le.v,       in + 24, 8);
+
+    uint32_t dlen = stm_load_le32(dlen_le);
+    uint32_t cac  = stm_load_le32(cac_le);
+    uint32_t clen = cac & 0x00FFFFFFu;
+    uint32_t comp = (cac >> 24) & 0xFFu;
+    /* MVP: refuse non-zero comp (no compression supported). */
+    if (comp != 0) return STM_ECORRUPT;
+    /* MVP: clen must equal dlen (no compression). */
+    if (clen != dlen) return STM_ECORRUPT;
+    /* dlen must be positive (LengthPositive). */
+    if (dlen == 0) return STM_ECORRUPT;
+
+    out_rec->dataset_id = ds;
+    out_rec->ino        = ino;
+    out_rec->off        = off;
+    out_rec->len        = (uint64_t)dlen;
+    out_rec->paddr      = stm_load_le64(paddr_le);
+    out_rec->gen        = stm_load_le64(write_gen_le);
+    /* xxh ignored in MVP (AEAD tag is integrity). */
+    (void)xxh_le;
+
+    /* Sanity: paddr=0 is reserved sentinel. */
+    if (out_rec->paddr == 0) return STM_ECORRUPT;
+    return STM_OK;
+}
+
+/* ---- btree_store vtable ---- */
+
+typedef struct {
+    stm_bootstrap *boot;
+    stm_bdev      *bdev;
+} ex_store_ctx;
+
+static stm_status ex_store_reserve(void *ctx_, uint64_t *out_paddr) {
+    ex_store_ctx *ctx = ctx_;
+    return stm_bootstrap_reserve(ctx->boot, STM_BOOTSTRAP_UNIT_BLOCKS,
+                                   /*hint_paddr=*/0, out_paddr);
+}
+
+static stm_status ex_store_free(void *ctx_, uint64_t paddr, uint64_t free_gen) {
+    ex_store_ctx *ctx = ctx_;
+    return stm_bootstrap_free(ctx->boot, paddr, STM_BOOTSTRAP_UNIT_BLOCKS,
+                                free_gen);
+}
+
+static stm_status ex_store_write(void *ctx_, uint64_t paddr,
+                                    const void *buf, size_t len) {
+    ex_store_ctx *ctx = ctx_;
+    if (stm_paddr_device(paddr) != 0) return STM_EINVAL;
+    uint64_t byte_offset = stm_paddr_offset(paddr) * (uint64_t)STM_UB_SIZE;
+    return stm_bdev_write(ctx->bdev, byte_offset, buf, len);
+}
+
+static stm_status ex_store_read(void *ctx_, uint64_t paddr,
+                                   void *buf, size_t len) {
+    ex_store_ctx *ctx = ctx_;
+    if (stm_paddr_device(paddr) != 0) return STM_EINVAL;
+    uint64_t byte_offset = stm_paddr_offset(paddr) * (uint64_t)STM_UB_SIZE;
+    return stm_bdev_read(ctx->bdev, byte_offset, buf, len);
+}
+
+static const stm_btree_store_vtable EX_STORE_VT = {
+    .reserve = ex_store_reserve,
+    .free    = ex_store_free,
+    .write   = ex_store_write,
+    .read    = ex_store_read,
+};
+
+static inline ex_store_ctx ex_make_store_ctx(stm_extent_index *idx) {
+    ex_store_ctx c = { .boot = idx->boot, .bdev = idx->bdev };
+    return c;
+}
+
+static inline stm_btree_crypt_ctx ex_make_crypt_ctx(const stm_extent_index *idx) {
+    stm_btree_crypt_ctx cx = { .metadata_key = idx->metadata_key };
+    cx.pool_uuid[0]   = idx->pool_uuid[0];
+    cx.pool_uuid[1]   = idx->pool_uuid[1];
+    cx.device_uuid[0] = idx->device_uuid[0];
+    cx.device_uuid[1] = idx->device_uuid[1];
+    return cx;
+}
+
+/* ---- Public persistence API. ---- */
+
+stm_status stm_extent_index_set_storage(stm_extent_index *idx,
+                                           stm_bdev *bdev_0,
+                                           stm_bootstrap *boot_0) {
+    if (!idx || !bdev_0 || !boot_0) return STM_EINVAL;
+    must_lock(&idx->lock);
+    idx->bdev = bdev_0;
+    idx->boot = boot_0;
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+stm_status stm_extent_index_set_crypt_ctx(stm_extent_index *idx,
+                                             const uint8_t *metadata_key,
+                                             const uint64_t pool_uuid[2],
+                                             const uint64_t device_uuid_0[2]) {
+    if (!idx || !metadata_key || !pool_uuid || !device_uuid_0) return STM_EINVAL;
+    must_lock(&idx->lock);
+    idx->metadata_key   = metadata_key;
+    idx->pool_uuid[0]   = pool_uuid[0];
+    idx->pool_uuid[1]   = pool_uuid[1];
+    idx->device_uuid[0] = device_uuid_0[0];
+    idx->device_uuid[1] = device_uuid_0[1];
+    idx->crypt_set      = true;
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+stm_status stm_extent_index_get_root(const stm_extent_index *idx,
+                                        uint64_t *out_root_paddr,
+                                        uint8_t out_root_csum[32]) {
+    if (!idx || !out_root_paddr) return STM_EINVAL;
+    pthread_mutex_t *lock = ex_lock(idx);
+    must_lock(lock);
+    *out_root_paddr = idx->root_paddr;
+    if (out_root_csum) memcpy(out_root_csum, idx->root_csum, 32);
+    must_unlock(lock);
+    return STM_OK;
+}
+
+stm_status stm_extent_index_get_gen(const stm_extent_index *idx,
+                                       uint64_t *out_root_gen) {
+    if (!idx || !out_root_gen) return STM_EINVAL;
+    pthread_mutex_t *lock = ex_lock(idx);
+    must_lock(lock);
+    *out_root_gen = idx->root_gen;
+    must_unlock(lock);
+    return STM_OK;
+}
+
+static stm_status ex_build_btree_locked(const stm_extent_index *idx,
+                                           stm_btree_mt **out_tree) {
+    stm_btree_opts opts = stm_btree_opts_default();
+    if (opts.target_entries < 512u) opts.target_entries = 512u;
+
+    stm_btree_mt *t = NULL;
+    stm_status ts = stm_btree_mt_new(&opts, &t);
+    if (ts != STM_OK) return ts;
+
+    uint8_t key[EX_KEY_LEN];
+    uint8_t val[EX_VAL_LEN];
+    for (size_t i = 0; i < idx->n_records; i++) {
+        const stm_extent_record *r = &idx->records[i];
+        ex_encode_key(r->dataset_id, r->ino, r->off, key);
+        stm_status es = ex_encode_value(r, val);
+        if (es != STM_OK) { stm_btree_mt_free(t); return es; }
+        stm_status is = stm_btree_mt_insert(t, key, EX_KEY_LEN, val, EX_VAL_LEN);
+        if (is != STM_OK) { stm_btree_mt_free(t); return is; }
+    }
+
+    *out_tree = t;
+    return STM_OK;
+}
+
+stm_status stm_extent_index_commit(stm_extent_index *idx,
+                                      uint64_t committed_gen,
+                                      uint64_t *out_root_paddr,
+                                      uint8_t out_root_csum[32]) {
+    if (!idx || !out_root_paddr || !out_root_csum) return STM_EINVAL;
+    must_lock(&idx->lock);
+
+    if (!idx->crypt_set || !idx->bdev || !idx->boot) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
+
+    if (!idx->dirty && idx->root_paddr != 0) {
+        *out_root_paddr = idx->root_paddr;
+        memcpy(out_root_csum, idx->root_csum, 32);
+        must_unlock(&idx->lock);
+        return STM_OK;
+    }
+
+    stm_btree_mt *t = NULL;
+    stm_status bs = ex_build_btree_locked(idx, &t);
+    if (bs != STM_OK) {
+        must_unlock(&idx->lock);
+        return bs;
+    }
+
+    ex_store_ctx       sc = ex_make_store_ctx(idx);
+    stm_btree_crypt_ctx cx = ex_make_crypt_ctx(idx);
+
+    uint64_t new_paddr = 0;
+    uint8_t  new_csum[32];
+    stm_status ss = stm_btree_store_serialize(t, committed_gen,
+                                                 /*tree_id=*/0u,
+                                                 &EX_STORE_VT, &sc, &cx,
+                                                 &new_paddr, new_csum);
+    stm_btree_mt_free(t);
+    if (ss != STM_OK) {
+        must_unlock(&idx->lock);
+        return ss;
+    }
+
+    #define EX_ROLLBACK_RESERVE() \
+        do { (void)stm_btree_store_free_tree(new_paddr, committed_gen,  \
+                                                committed_gen, new_csum, \
+                                                &EX_STORE_VT, &sc, &cx); \
+        } while (0)
+
+    if (idx->root_paddr != 0) {
+        stm_status fs = stm_btree_store_free_tree(idx->root_paddr,
+                                                     idx->root_gen,
+                                                     committed_gen,
+                                                     idx->root_csum,
+                                                     &EX_STORE_VT, &sc, &cx);
+        if (fs != STM_OK) {
+            EX_ROLLBACK_RESERVE();
+            must_unlock(&idx->lock);
+            return fs;
+        }
+    }
+
+    stm_status bsc = stm_bootstrap_commit(idx->boot, committed_gen);
+    if (bsc != STM_OK) {
+        EX_ROLLBACK_RESERVE();
+        must_unlock(&idx->lock);
+        return bsc;
+    }
+    #undef EX_ROLLBACK_RESERVE
+
+    idx->root_paddr = new_paddr;
+    idx->root_gen   = committed_gen;
+    memcpy(idx->root_csum, new_csum, 32);
+    idx->dirty      = false;
+
+    *out_root_paddr = new_paddr;
+    memcpy(out_root_csum, new_csum, 32);
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+/* load_at — atomic shadow swap. */
+
+typedef struct {
+    stm_extent_record *shadow_records;
+    size_t             shadow_len;
+    size_t             shadow_cap;
+    uint64_t           max_write_gen;
+    stm_status         err;
+} ex_load_ctx;
+
+static stm_status ex_shadow_append(ex_load_ctx *lc,
+                                      const stm_extent_record *r) {
+    if (lc->shadow_len == lc->shadow_cap) {
+        size_t new_cap = lc->shadow_cap == 0 ? 8 : lc->shadow_cap * 2;
+        stm_extent_record *new_buf = realloc(lc->shadow_records,
+                                                new_cap * sizeof(stm_extent_record));
+        if (!new_buf) return STM_ENOMEM;
+        lc->shadow_records = new_buf;
+        lc->shadow_cap = new_cap;
+    }
+    lc->shadow_records[lc->shadow_len++] = *r;
+    return STM_OK;
+}
+
+static int ex_load_iter(const void *k, size_t klen,
+                          const void *v, size_t vlen, void *ctx_) {
+    ex_load_ctx *lc = ctx_;
+    uint64_t ds, ino, off;
+    stm_status ks = ex_decode_key(k, klen, &ds, &ino, &off);
+    if (ks != STM_OK) { lc->err = ks; return 1; }
+    /* Zero ds / ino are reserved sentinels — refuse on decode. */
+    if (ds == 0 || ino == 0) { lc->err = STM_ECORRUPT; return 1; }
+
+    stm_extent_record r;
+    stm_status vs = ex_decode_value(v, vlen, ds, ino, off, &r);
+    if (vs != STM_OK) { lc->err = vs; return 1; }
+
+    if (r.gen > lc->max_write_gen) lc->max_write_gen = r.gen;
+
+    /* off + len overflow guard (AllExtentsInBounds). */
+    if (r.off > UINT64_MAX - r.len) { lc->err = STM_ECORRUPT; return 1; }
+
+    stm_status as = ex_shadow_append(lc, &r);
+    if (as != STM_OK) { lc->err = as; return 1; }
+    return 0;
+}
+
+/* Structural validator on the loaded shadow. Catches extents that
+ * decode byte-clean but violate extent.tla invariants:
+ *   - NoOverlapWithinIno: pairwise overlap check within each (ds, ino).
+ *   - PaddrFreshness (live-paddr): no two records share a paddr.
+ * O(N²) for the MVP — fine for any plausible mount. Production-grade
+ * persistence (chunked / per-inode trees) revisits this with a sorted-
+ * merge strategy.
+ */
+static stm_status ex_validate_shadow(const ex_load_ctx *lc) {
+    /* NoOverlapWithinIno + LengthPositive (already enforced at decode). */
+    for (size_t i = 0; i < lc->shadow_len; i++) {
+        const stm_extent_record *a = &lc->shadow_records[i];
+        for (size_t j = i + 1; j < lc->shadow_len; j++) {
+            const stm_extent_record *b = &lc->shadow_records[j];
+            if (a->dataset_id == b->dataset_id && a->ino == b->ino) {
+                if (ranges_overlap(a->off, a->len, b->off, b->len)) {
+                    return STM_ECORRUPT;
+                }
+            }
+            if (a->paddr == b->paddr) return STM_ECORRUPT;
+        }
+    }
+    return STM_OK;
+}
+
+stm_status stm_extent_index_load_at(stm_extent_index *idx,
+                                       uint64_t root_paddr, uint64_t root_gen,
+                                       const uint8_t expected_csum[32]) {
+    if (!idx || !expected_csum) return STM_EINVAL;
+    if (root_paddr == 0) return STM_EINVAL;
+    must_lock(&idx->lock);
+    if (!idx->crypt_set || !idx->bdev || !idx->boot) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
+
+    stm_btree_opts opts = stm_btree_opts_default();
+    if (opts.target_entries < 512u) opts.target_entries = 512u;
+    stm_btree_mt *t = NULL;
+    stm_status ts = stm_btree_mt_new(&opts, &t);
+    if (ts != STM_OK) {
+        must_unlock(&idx->lock);
+        return ts;
+    }
+
+    ex_store_ctx       sc = ex_make_store_ctx(idx);
+    stm_btree_crypt_ctx cx = ex_make_crypt_ctx(idx);
+
+    stm_status ds = stm_btree_store_deserialize(t, root_paddr, root_gen,
+                                                   expected_csum,
+                                                   &EX_STORE_VT, &sc, &cx);
+    if (ds != STM_OK) {
+        stm_btree_mt_free(t);
+        must_unlock(&idx->lock);
+        return ds;
+    }
+
+    ex_load_ctx lc = {0};
+    stm_status sr = stm_btree_mt_scan(t, NULL, 0, NULL, 0,
+                                         ex_load_iter, &lc);
+    stm_btree_mt_free(t);
+
+    if (sr != STM_OK) {
+        free(lc.shadow_records);
+        must_unlock(&idx->lock);
+        return sr;
+    }
+    if (lc.err != STM_OK) {
+        free(lc.shadow_records);
+        must_unlock(&idx->lock);
+        return lc.err;
+    }
+    stm_status vs = ex_validate_shadow(&lc);
+    if (vs != STM_OK) {
+        free(lc.shadow_records);
+        must_unlock(&idx->lock);
+        return vs;
+    }
+
+    /* Atomic swap. */
+    free(idx->records);
+    idx->records      = lc.shadow_records;
+    idx->n_records    = lc.shadow_len;
+    idx->cap_records  = lc.shadow_cap;
+
+    /* Bump current_txg ≥ max(write_gen) per extent.tla::BirthTxgBound. */
+    if (lc.max_write_gen > idx->current_txg) {
+        idx->current_txg = lc.max_write_gen;
+    }
+
+    idx->root_paddr = root_paddr;
+    idx->root_gen   = root_gen;
+    memcpy(idx->root_csum, expected_csum, 32);
+    idx->dirty = false;
+
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+stm_status stm_extent_index_verify(const stm_extent_index *idx) {
+    if (!idx) return STM_EINVAL;
+    pthread_mutex_t *lock = ex_lock(idx);
+    must_lock(lock);
+    if (!idx->crypt_set || !idx->bdev || !idx->boot) {
+        must_unlock(lock);
+        return STM_EINVAL;
+    }
+    if (idx->root_paddr == 0) {
+        must_unlock(lock);
+        return STM_OK;
+    }
+    ex_store_ctx       sc = ex_make_store_ctx((stm_extent_index *)idx);
+    stm_btree_crypt_ctx cx = ex_make_crypt_ctx(idx);
+    stm_status vs = stm_btree_store_verify(idx->root_paddr, idx->root_gen,
+                                              idx->root_csum,
+                                              &EX_STORE_VT, &sc, &cx);
+    must_unlock(lock);
+    return vs;
 }

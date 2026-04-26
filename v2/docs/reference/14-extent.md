@@ -33,6 +33,41 @@ helpers (`stm_extent_encrypt` / `stm_extent_decrypt`) and the index
 API. Both relate to extents but are independent — encrypt/decrypt
 serve the data-plane payload; the index serves metadata.
 
+### Persistence (P7-3, v12)
+
+```c
+stm_status stm_extent_index_set_storage    (idx, bdev_0, boot_0);
+stm_status stm_extent_index_set_crypt_ctx  (idx, key, pool_uuid, dev_uuid_0);
+stm_status stm_extent_index_load_at        (idx, root_paddr, root_gen, csum);
+stm_status stm_extent_index_commit         (idx, target_gen, *out_paddr, *out_csum);
+stm_status stm_extent_index_get_root       (idx, *out_paddr, out_csum);
+stm_status stm_extent_index_get_gen        (idx, *out_root_gen);
+stm_status stm_extent_index_verify         (idx);
+```
+
+Same shape + semantics as the snapshot module's persistence API.
+`load_at` runs the structural validator (`ex_validate_shadow`):
+rejects extents with overlapping ranges within the same `(ds, ino)`,
+extents that share a paddr (live-paddr PaddrFreshness violation),
+extents with zero ds / ino / paddr / len, and any decode-format
+violation.
+
+Idempotent commit: when `dirty == false` AND a prior commit's root
+exists, `_commit` returns the cached `(paddr, csum)` without on-
+disk activity. Mandatory for `quorum.tla::ContentQuorumAtGen` —
+sync_commit may invoke this multiple times at the same target_gen
+under retry, and every call must produce byte-identical UB bytes.
+
+Atomic shadow swap: `_load_at` builds a shadow record array,
+validates it structurally, then atomically replaces the live
+records. Failure paths (corruption, AEAD mismatch, validator
+rejection) free the shadow and leave the live index untouched.
+
+`_load_at` post-condition: `current_txg` is bumped to
+`max(loaded write_gen)` per `extent.tla::BirthTxgBound`, so post-
+mount Write/Overwrite cannot stamp an extent with gen below any
+persisted gen.
+
 ### Lifecycle
 
 ```c
@@ -123,12 +158,82 @@ SPEC-TO-CODE mapping (in `src/extent/extent_index.c`):
 | `BirthTxgBound` | `write_gen ≤ current_txg` arg check |
 | `PaddrFreshness` (live-paddr) | `paddr_in_use_locked` scan |
 
+## On-disk encoding (v12+)
+
+### Key (24 bytes, lexicographically sorted)
+
+```
+off  size  field
+  0    8   dataset_id (le64; ≠ 0)
+  8    8   ino        (le64; ≠ 0)
+ 16    8   offset     (le64) — byte offset within the file
+```
+
+The unified key shape places all extents in a single Bε-tree under
+`ub_extent_root`. ARCH §11.6.2 specifies a per-file Bε-tree keyed
+by `(ino, type, offset)`; the unified MVP here is structurally
+compatible (no semantic divergence). Migration to per-file or per-
+dataset trees is incremental.
+
+### Value (32 bytes per ARCH §11.6.1 stm_extent_v2)
+
+```
+off  size  field
+  0    8   paddr            (le64)
+  8    8   write_gen        (le64)
+ 16    4   dlen             (le32) — logical byte length
+ 20    4   clen_and_comp    (le32) — low 24: stored length; high 8: comp algo
+ 24    8   xxh              (le64) — 0 in MVP (AEAD tag is integrity)
+```
+
+MVP caps:
+- `len` must fit in 24 bits (≤ 0xFFFFFF; ~16 MiB-1) so both `dlen`
+  and `clen` (low 24 bits of `clen_and_comp`) hold the same value
+  (no compression). Production recordsizes (default 128 KiB) are
+  far under this. `_commit` refuses with STM_ERANGE on overflow.
+- Compression algo byte = 0 always.
+- xxh = 0 always (AEAD tag covers integrity).
+
+### Crypt + Merkle
+
+Same envelope as the dataset / snapshot trees: AEGIS-256 under
+`metadata_key`, nonce `paddr || gen || pool_uuid`, AD `pool_uuid ||
+device_uuid_0`. Merkle chain via BLAKE3 over node ciphertext,
+rooted at `ub_extent_root.bp_csum` and folded into
+`ub_merkle_root` (P7-3 added the 6th input slot to
+`compute_merkle_root` after main / alloc / snap / cas /
+keyschema).
+
+The extent tree's root carries `bp_kind = STM_BPTR_KIND_EXTENT_TREE`
+(value 10; introduced for P7-3). Note the distinction from
+`STM_BPTR_KIND_EXTENT = 3` which references a user-data extent
+(the data-plane payload), not the metadata tree root.
+
+### UB carve
+
+```
+3128  64   ub_extent_root      (stm_bptr; bp_kind = EXTENT_TREE)
+3192   8   ub_extent_root_gen  (le64; AEAD gen at last serialize)
+3200 864   ub_reserved         (was 936, shrinks by 72 bytes)
+```
+
+v11 → v12 bump gates this carve. v11 pools had `ub_reserved` at
+[3128..4064) — interpretation as v12's `ub_extent_root` would
+yield bp_kind = 0 (none), bp_paddr = 0 (load skips), bp_csum =
+zeros (Merkle recompute mismatches). The version check refuses
+v11 mounts at v12 up-front via uniform STM_EBADVERSION (existing
+handler).
+
 ## Implementation notes
 
 - **Storage**: linear array of `stm_extent_record`; Overwrite /
   Truncate / DeleteFile compact in place via two-finger walk. O(n)
-  scan per mutation; persistent storage (per-inode Bε-tree) is the
-  P7-3 chunk.
+  scan per mutation. Persistent storage uses btree_store-encoded
+  AEAD-encrypted Bε-tree under `ub_extent_root`; commit re-builds
+  the tree from the linear array each pass. Production scale-out
+  to per-inode trees is a future enhancement; current MVP supports
+  any size pool that fits the metadata in a small number of
+  Bε-tree nodes.
 - **Live-paddr interpretation**: extent.tla's `used_paddrs` is
   monotonic in the spec (paddrs never leave the set); the C impl
   narrows this to "paddrs in CURRENT extents" so the allocator can
@@ -159,41 +264,50 @@ SPEC-TO-CODE mapping (in `src/extent/extent_index.c`):
 
 | Suite | Count | Coverage |
 |---|---|---|
-| `test_extent_index` | 32 | Lifecycle (create / close / advance_txg with all error paths including R34 P3-2 NULL-idx parity). Write — basic insert + lookup roundtrip; refuses zero-len, zero-args, off+len overflow, future write_gen, overlap with existing in-ino, paddr already-in-use. Overwrite — into hole returns no drops; drops one extent; drops multiple overlapping; doesn't touch other (ds, ino); refuses paddr-cycle (new_paddr equals a dropped extent); refuses paddr-collision with live extent in different (ds, ino); refuses bad args. Truncate — drops past-size extents; truncate-to-zero drops all; no drops when new_size > max extent end; doesn't touch other (ds, ino). DeleteFile — drops all in (ds, ino); idempotent on empty (ds, ino). Lookup — hole boundaries (off < extent.off, off ≥ extent.off+extent.len, off=last byte); unknown (ds, ino) returns ENOENT. Iter — returns off-ascending despite insertion order; early terminate on cb=false; filters by (ds, ino). ERRORCHECK reentry — cb-runs-under-lock smoke test. Concurrent stress — 4 workers × 256 ops each on disjoint (ds, ino) all serialize cleanly. **R34 P2-1 regression** — out-arg zeroing on `idx==NULL` early return for overwrite / truncate / delete_file. |
+| `test_extent_index` | 38 | Lifecycle (create / close / advance_txg with all error paths including R34 P3-2 NULL-idx parity). Write — basic insert + lookup roundtrip; refuses zero-len, zero-args, off+len overflow, future write_gen, overlap with existing in-ino, paddr already-in-use. Overwrite — into hole returns no drops; drops one extent; drops multiple overlapping; doesn't touch other (ds, ino); refuses paddr-cycle (new_paddr equals a dropped extent); refuses paddr-collision with live extent in different (ds, ino); refuses bad args. Truncate — drops past-size extents; truncate-to-zero drops all; no drops when new_size > max extent end; doesn't touch other (ds, ino). DeleteFile — drops all in (ds, ino); idempotent on empty (ds, ino). Lookup — hole boundaries (off < extent.off, off ≥ extent.off+extent.len, off=last byte); unknown (ds, ino) returns ENOENT. Iter — returns off-ascending despite insertion order; early terminate on cb=false; filters by (ds, ino). ERRORCHECK reentry — cb-runs-under-lock smoke test. Concurrent stress — 4 workers × 256 ops each on disjoint (ds, ino) all serialize cleanly. **R34 P2-1 regression** — out-arg zeroing on `idx==NULL` early return for overwrite / truncate / delete_file. **P7-3 persistence** (6 tests) — set_storage required for commit; commit + load_at roundtrip across multiple datasets / inos / paddrs / write_gens with current_txg bumped to max(write_gen); idempotent commit at same target_gen returns same paddr+csum bytes; tampered csum on load_at refused + atomic state preserve; 24-bit length cap refused at commit; empty-tree first-commit roundtrip. |
 
 `test_extent` (Phase 4) covers the AEAD-wrap helpers; that suite is
 unrelated to the index API and stays separate.
 
 ## Status
 
-- [x] In-RAM MVP per `extent.tla`.
+- [x] In-RAM MVP per `extent.tla` (P7-2).
 - [x] All lifecycle + mutation + read APIs.
 - [x] No-overlap, length-positive, birth-txg-bound, paddr-freshness
       enforced.
 - [x] ERRORCHECK mutex with must_lock contract.
-- [ ] Persistent storage (per-inode Bε-tree under `ub_extent_root`)
-      — P7-3, will bump `STM_UB_VERSION` v11→v12.
-- [ ] Production caller — sync.c integration of OverwriteBlock cb,
-      arrives with P7-3.
+- [x] Persistent storage (P7-3): `ub_extent_root` +
+      `ub_extent_root_gen` carved from `ub_reserved`. Single unified
+      Bε-tree keyed by (ds, ino, off); 32-byte ARCH §11.6.1 record.
+      Idempotent commit + atomic shadow swap + structural validator.
+      STM_UB_VERSION 11→12.
+- [x] Sync wire-in (P7-3): create / open / commit / close / accessor.
+- [ ] Sync.c COW path integration — extent → snapshot.overwrite_block
+      routing on each dropped paddr from Overwrite / Truncate /
+      DeleteFile (composes with dead_list.tla). Lands as P7-4.
+- [ ] Production scrub cb — paddr→bptr resolver via extent walk.
+      Now unblocked by P7-3.
 - [ ] Partial-extent shrink on Truncate (truncating mid-extent) —
       deferred; current MVP only drops fully-past-truncation extents.
 - [ ] Coalescing — quality-of-implementation; correctness preserved
       by `NoOverlapWithinIno`.
 - [ ] Reflinks / refcount-bump path — Phase 7 §10.4.
 - [ ] CAS / cold-tier extents — Phase 7 §10.1.
+- [ ] Per-file or per-dataset Bε-tree partitioning — current unified
+      MVP scales to small pools; production scale-out to many-inode
+      pools needs partitioning.
 
 ## Known caveats
 
-- **In-RAM only**: nothing persists. Mount/unmount cycles do not
-  preserve extent state — the data layer is unusable until P7-3
-  hooks the index to `ub_extent_root`.
-- **Linear scan**: O(n) for every mutation and lookup. Acceptable for
-  this MVP (test populations stay small); production deployments
-  will switch to per-inode Bε-tree once persistence lands.
-- **No production caller yet**: `stm_extent_*` is API-complete and
-  tested in isolation. The fs.c / sync.c integration (extent-write
-  → snapshot.overwrite_block → allocator-free) lands together with
-  P7-3.
+- **Linear in-RAM scan**: O(n) for every mutation and lookup. The
+  persistence path rebuilds the Bε-tree from the array on every
+  commit; for small pools this is fine, but many-inode pools
+  benefit from per-file or per-dataset partitioning (see Status).
+- **No production caller yet**: extent module is API-complete and
+  persists through mount/unmount cycles. The fs.c / sync.c
+  integration that drives extent mutations from POSIX writes —
+  including the dropped-paddr → snapshot.overwrite_block →
+  allocator-free routing — lands as P7-4.
 - **Live-paddr semantics**: a paddr re-used in a future gen by the
   allocator is allowed; a paddr that's CURRENTLY in any live extent
   is refused. Callers MUST drop the old extent (via Overwrite /
@@ -202,3 +316,13 @@ unrelated to the index API and stays separate.
 - **Truncate doesn't split**: the simplification is in line with
   `extent.tla::Truncate`; production work needs partial-extent
   shrinking. Unblocks no immediate roadmap exit criterion; deferred.
+- **24-bit length cap**: extents larger than ~16 MiB-1 bytes are
+  refused at commit time (STM_ERANGE). Recordsize defaults far
+  under this; the cap is essentially the on-disk `clen_and_comp`
+  field's clen width. Production extension would either bump the
+  on-disk format (post-v12) or add chunking.
+- **No xxh / no compression in MVP**: `xxh = 0` always (AEAD tag is
+  the integrity check); `clen_and_comp.comp = 0` always. Adding
+  unencrypted-extent support (xxh-based integrity) or compression
+  (clen ≠ dlen) would not bump the on-disk format — only fields
+  that are currently zero would change.

@@ -33,6 +33,9 @@
 extern "C" {
 #endif
 
+struct stm_bdev;       typedef struct stm_bdev       stm_bdev;
+struct stm_bootstrap;  typedef struct stm_bootstrap  stm_bootstrap;
+
 /* ARCH §7.6.1 AD magic / version. */
 #define STM_AD_MAGIC_EXTENT     UINT32_C(0x44545845)   /* 'EXTD' */
 #define STM_AD_VERSION_EXTENT   1u
@@ -343,6 +346,128 @@ STM_MUST_USE
 stm_status stm_extent_count_for_ino(const stm_extent_index *idx,
                                        uint64_t dataset_id, uint64_t ino,
                                        size_t *out_count);
+
+/* ========================================================================= */
+/* Persistence (P7-3, v12).                                                   */
+/* ========================================================================= */
+
+/*
+ * The extent index is persisted as a btree_store-encoded, AEAD-encrypted
+ * Bε-tree under `ub_extent_root`. Same envelope as the dataset / snapshot
+ * trees — AEAD nonce `paddr || gen || pool_uuid`, AD `pool_uuid ||
+ * device_uuid_0`, idempotent commit via internal dirty flag, atomic
+ * shadow-swap on load_at.
+ *
+ * Key (24 bytes, lexicographically sorted):
+ *
+ *   off  size  field
+ *    0    8    dataset_id (le64)
+ *    8    8    ino        (le64)
+ *   16    8    offset     (le64) — byte offset within the file
+ *
+ * Value (32 bytes, ARCH §11.6.1 stm_extent_v2 layout):
+ *
+ *   off  size  field
+ *    0    8    paddr            (le64)
+ *    8    8    write_gen        (le64)
+ *   16    4    dlen             (le32) — logical byte length
+ *   20    4    clen_and_comp    (le32) — low 24: stored length; high 8: comp algo
+ *   24    8    xxh              (le64) — 0 in this MVP (AEAD tag is integrity)
+ *
+ * Total: 32 bytes per ARCH §11.6.1.
+ *
+ * MVP caps:
+ *   - `len` must fit in 24 bits (≤ 0xFFFFFF; ~16 MiB-1) so both `dlen`
+ *     and `clen` (low 24 bits of clen_and_comp) can hold it without
+ *     compression. Production recordsizes (default 128 KiB) are far
+ *     under this. Refuse with STM_ERANGE on commit if any extent's
+ *     length exceeds the cap.
+ *   - Compression algorithm field is always 0 (no compression in this
+ *     MVP).
+ *   - `xxh` is always 0 (AEAD tag is the integrity check; the
+ *     unencrypted-extent path with non-zero xxh is a future extension).
+ *
+ * The unified key shape (ds || ino || off) places all extents in a
+ * single Bε-tree under `ub_extent_root`. ARCH §11.6.2 specifies a
+ * per-file Bε-tree keyed by `(ino, type, offset)`; the unified MVP
+ * here is structurally compatible (no semantic divergence) and the
+ * migration to per-file or per-dataset trees is incremental.
+ */
+
+STM_MUST_USE
+stm_status stm_extent_index_set_storage(stm_extent_index *idx,
+                                           stm_bdev *bdev_0,
+                                           stm_bootstrap *boot_0);
+
+STM_MUST_USE
+stm_status stm_extent_index_set_crypt_ctx(stm_extent_index *idx,
+                                             const uint8_t *metadata_key,
+                                             const uint64_t pool_uuid[2],
+                                             const uint64_t device_uuid_0[2]);
+
+/*
+ * Hydrate the index from on-disk state. Wipes existing in-RAM extent
+ * records and replaces with the on-disk contents. Sets dirty=false on
+ * success.
+ *
+ * `root_paddr` MUST be non-zero (the caller checks for "no commit yet"
+ * by inspecting the UB before invoking). `root_gen` is the AEAD gen
+ * at which the tree was last serialized (= ub_extent_root_gen).
+ * `expected_csum` is the Merkle link from ub_extent_root.bp_csum.
+ *
+ * On success, current_txg is bumped to max(loaded write_gen) per
+ * extent.tla::BirthTxgBound — post-mount Write/Overwrite must not stamp
+ * extents with gen less than the highest persisted gen.
+ *
+ * Returns STM_OK on full hydration; STM_ECORRUPT on Merkle mismatch
+ * or malformed entries (zero ds/ino, zero len, key/value length
+ * mismatch, NoOverlapWithinIno violation, paddr collision among
+ * loaded records); STM_EBADTAG on AEAD failure; STM_EINVAL on
+ * missing storage / crypt ctx.
+ */
+STM_MUST_USE
+stm_status stm_extent_index_load_at(stm_extent_index *idx,
+                                       uint64_t root_paddr, uint64_t root_gen,
+                                       const uint8_t expected_csum[32]);
+
+/*
+ * Serialize current state, AEAD-encrypt, write a fresh root, free the
+ * previous root's nodes (if any), return new (paddr, csum).
+ *
+ * Idempotent when clean (dirty=false + prior commit exists): returns
+ * cached values without on-disk activity. Mandatory for
+ * quorum.tla::ContentQuorumAtGen under retry — sync_commit may invoke
+ * us multiple times at the same target_gen and every call must produce
+ * byte-identical UB bytes across devices.
+ *
+ * `committed_gen` is the AEAD gen for the new root AND the free_gen for
+ * reclaiming the previous root.
+ *
+ * Returns STM_ERANGE if any live extent's length exceeds the MVP
+ * 24-bit cap (see preamble).
+ */
+STM_MUST_USE
+stm_status stm_extent_index_commit(stm_extent_index *idx,
+                                      uint64_t committed_gen,
+                                      uint64_t *out_root_paddr,
+                                      uint8_t out_root_csum[32]);
+
+/* Durable root paddr + csum as last persisted by _commit / _load_at.
+ * Both zero before any commit. */
+STM_MUST_USE
+stm_status stm_extent_index_get_root(const stm_extent_index *idx,
+                                        uint64_t *out_root_paddr,
+                                        uint8_t out_root_csum[32]);
+
+/* Gen at which the durable root was AEAD-encrypted. May differ from
+ * the current commit's gen when _commit idempotent-shortcircuits.
+ * 0 before any commit. Stamped into ub_extent_root_gen. */
+STM_MUST_USE
+stm_status stm_extent_index_get_gen(const stm_extent_index *idx,
+                                       uint64_t *out_root_gen);
+
+STM_MUST_USE
+stm_status stm_extent_index_verify(const stm_extent_index *idx);
 
 #ifdef __cplusplus
 }

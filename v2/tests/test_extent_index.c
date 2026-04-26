@@ -18,12 +18,17 @@
  */
 #include "tharness.h"
 
+#include <stratum/block.h>
+#include <stratum/bootstrap.h>
+#include <stratum/crypto.h>
 #include <stratum/extent.h>
 #include <stratum/types.h>
 
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 /* Convenience: free + zero a uint64_t* pair returned by overwrite /
  * truncate / delete_file. */
@@ -743,6 +748,267 @@ STM_TEST(ex_concurrent_writes_serialized) {
     STM_ASSERT_EQ(n, (size_t)(N_THREADS * N_OPS));
 
     stm_extent_index_close(idx);
+}
+
+/* ------------------------------------------------------------------ */
+/* Persistence (P7-3).                                                  */
+/* ------------------------------------------------------------------ */
+
+#define EXP_DEVICE_BYTES        (32u * 1024u * 1024u)
+#define EXP_BOOTSTRAP_BYTES     (4u * 1024u * 1024u)
+
+static const uint64_t EXP_POOL_UUID[2]   = {
+    0x1122334455667788ULL, 0x99aabbccddeeff00ULL };
+static const uint64_t EXP_DEVICE_UUID[2] = {
+    0xdeadbeefcafef00dULL, 0x0123456789abcdefULL };
+static const uint8_t  EXP_KEY[32] = {
+    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+    0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+    0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+    0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
+};
+
+static char exp_tmp_path[256];
+
+static void exp_make_tmp(const char *tag) {
+    snprintf(exp_tmp_path, sizeof exp_tmp_path,
+             "/tmp/stm_v2_extent_persist_%s_%d.bin", tag, (int)getpid());
+    unlink(exp_tmp_path);
+}
+
+static void exp_open_fresh(stm_bdev **out_d, stm_bootstrap **out_b) {
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    STM_ASSERT_OK(stm_bdev_open(exp_tmp_path, &bo, out_d));
+    STM_ASSERT_OK(stm_bdev_resize(*out_d, EXP_DEVICE_BYTES));
+    STM_ASSERT_OK(stm_crypto_init());
+    STM_ASSERT_OK(stm_bootstrap_create(*out_d, EXP_POOL_UUID, EXP_DEVICE_UUID,
+                                         EXP_BOOTSTRAP_BYTES, out_b));
+}
+
+static void exp_reopen(stm_bdev **out_d, stm_bootstrap **out_b) {
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    STM_ASSERT_OK(stm_bdev_open(exp_tmp_path, &bo, out_d));
+    STM_ASSERT_OK(stm_bootstrap_open(*out_d, out_b));
+}
+
+STM_TEST(extent_persist_set_storage_required_for_commit) {
+    stm_extent_index *idx = NULL;
+    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    STM_ASSERT_OK(stm_extent_index_set_crypt_ctx(idx, EXP_KEY,
+                                                    EXP_POOL_UUID,
+                                                    EXP_DEVICE_UUID));
+    uint64_t paddr = 0; uint8_t cs[32];
+    STM_ASSERT_ERR(stm_extent_index_commit(idx, 1u, &paddr, cs), STM_EINVAL);
+    stm_extent_index_close(idx);
+}
+
+STM_TEST(extent_persist_commit_load_roundtrip) {
+    exp_make_tmp("rt");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    exp_open_fresh(&d, &b);
+
+    stm_extent_index *idx = NULL;
+    STM_ASSERT_OK(stm_extent_index_create(/*current_txg=*/100, &idx));
+    STM_ASSERT_OK(stm_extent_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_extent_index_set_crypt_ctx(idx, EXP_KEY,
+                                                    EXP_POOL_UUID,
+                                                    EXP_DEVICE_UUID));
+
+    /* Three live extents across two datasets. */
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0,        4096, 0xAA, 100));
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 4096,     4096, 0xBB,  99));
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 2, 0,        8192, 0xCC,  50));
+    STM_ASSERT_OK(stm_extent_write(idx, 2, 1, 1u << 16, 4096, 0xDD, 100));
+
+    uint64_t paddr = 0; uint8_t cs[32];
+    STM_ASSERT_OK(stm_extent_index_commit(idx, 1u, &paddr, cs));
+    STM_ASSERT(paddr != 0);
+    STM_ASSERT_OK(stm_extent_index_verify(idx));
+
+    stm_extent_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+
+    /* Remount + load. */
+    exp_reopen(&d, &b);
+    stm_extent_index *idx2 = NULL;
+    STM_ASSERT_OK(stm_extent_index_create(0, &idx2));
+    STM_ASSERT_OK(stm_extent_index_set_storage(idx2, d, b));
+    STM_ASSERT_OK(stm_extent_index_set_crypt_ctx(idx2, EXP_KEY,
+                                                     EXP_POOL_UUID,
+                                                     EXP_DEVICE_UUID));
+    STM_ASSERT_OK(stm_extent_index_load_at(idx2, paddr, 1u, cs));
+
+    /* Counts + lookups round-trip. */
+    size_t n = 0;
+    STM_ASSERT_OK(stm_extent_count(idx2, &n));
+    STM_ASSERT_EQ(n, (size_t)4);
+
+    stm_extent_record e;
+    STM_ASSERT_OK(stm_extent_lookup_at(idx2, 1, 1, 0, &e));
+    STM_ASSERT_EQ(e.paddr, (uint64_t)0xAA);
+    STM_ASSERT_EQ(e.gen,   (uint64_t)100);
+    STM_ASSERT_EQ(e.len,   (uint64_t)4096);
+
+    STM_ASSERT_OK(stm_extent_lookup_at(idx2, 1, 1, 4096, &e));
+    STM_ASSERT_EQ(e.paddr, (uint64_t)0xBB);
+    STM_ASSERT_EQ(e.gen,   (uint64_t)99);
+
+    STM_ASSERT_OK(stm_extent_lookup_at(idx2, 1, 2, 0, &e));
+    STM_ASSERT_EQ(e.paddr, (uint64_t)0xCC);
+
+    STM_ASSERT_OK(stm_extent_lookup_at(idx2, 2, 1, 1u << 16, &e));
+    STM_ASSERT_EQ(e.paddr, (uint64_t)0xDD);
+
+    /* current_txg bumped to max(write_gen) per BirthTxgBound. */
+    uint64_t txg = 0;
+    STM_ASSERT_OK(stm_extent_index_current_txg(idx2, &txg));
+    STM_ASSERT_EQ(txg, (uint64_t)100);
+
+    stm_extent_index_close(idx2);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(exp_tmp_path);
+}
+
+STM_TEST(extent_persist_idempotent_commit) {
+    exp_make_tmp("idem");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    exp_open_fresh(&d, &b);
+
+    stm_extent_index *idx = NULL;
+    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    STM_ASSERT_OK(stm_extent_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_extent_index_set_crypt_ctx(idx, EXP_KEY,
+                                                    EXP_POOL_UUID,
+                                                    EXP_DEVICE_UUID));
+
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, 0xAA, 0));
+
+    uint64_t p1 = 0, p2 = 0;
+    uint8_t  c1[32], c2[32];
+    STM_ASSERT_OK(stm_extent_index_commit(idx, 1u, &p1, c1));
+    STM_ASSERT_OK(stm_extent_index_commit(idx, 1u, &p2, c2));
+    STM_ASSERT_EQ(p1, p2);
+    STM_ASSERT_MEM_EQ(c1, c2, 32);
+
+    stm_extent_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(exp_tmp_path);
+}
+
+STM_TEST(extent_persist_load_rejects_tampered_csum) {
+    exp_make_tmp("tamper");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    exp_open_fresh(&d, &b);
+
+    stm_extent_index *idx = NULL;
+    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    STM_ASSERT_OK(stm_extent_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_extent_index_set_crypt_ctx(idx, EXP_KEY,
+                                                    EXP_POOL_UUID,
+                                                    EXP_DEVICE_UUID));
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, 0xAA, 0));
+
+    uint64_t paddr = 0; uint8_t cs[32];
+    STM_ASSERT_OK(stm_extent_index_commit(idx, 1u, &paddr, cs));
+    stm_extent_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+
+    exp_reopen(&d, &b);
+    stm_extent_index *idx2 = NULL;
+    STM_ASSERT_OK(stm_extent_index_create(0, &idx2));
+    STM_ASSERT_OK(stm_extent_index_set_storage(idx2, d, b));
+    STM_ASSERT_OK(stm_extent_index_set_crypt_ctx(idx2, EXP_KEY,
+                                                     EXP_POOL_UUID,
+                                                     EXP_DEVICE_UUID));
+
+    /* Flip a bit in expected_csum — tampered. */
+    uint8_t cs_tamper[32];
+    memcpy(cs_tamper, cs, 32);
+    cs_tamper[0] ^= 0x01;
+    stm_status ls = stm_extent_index_load_at(idx2, paddr, 1u, cs_tamper);
+    STM_ASSERT(ls != STM_OK);
+
+    /* Load with correct csum still works (atomic swap left state untouched). */
+    STM_ASSERT_OK(stm_extent_index_load_at(idx2, paddr, 1u, cs));
+    size_t n = 0;
+    STM_ASSERT_OK(stm_extent_count(idx2, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+
+    stm_extent_index_close(idx2);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(exp_tmp_path);
+}
+
+STM_TEST(extent_persist_24bit_length_cap) {
+    /* MVP cap: lengths must fit in 24 bits (≤ 16 MiB - 1). */
+    exp_make_tmp("cap");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    exp_open_fresh(&d, &b);
+
+    stm_extent_index *idx = NULL;
+    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    STM_ASSERT_OK(stm_extent_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_extent_index_set_crypt_ctx(idx, EXP_KEY,
+                                                    EXP_POOL_UUID,
+                                                    EXP_DEVICE_UUID));
+
+    /* 16 MiB extent — exceeds 24-bit cap; commit refuses with ERANGE. */
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 1u << 24, 0xAA, 0));
+
+    uint64_t paddr = 0; uint8_t cs[32];
+    STM_ASSERT_ERR(stm_extent_index_commit(idx, 1u, &paddr, cs), STM_ERANGE);
+
+    stm_extent_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(exp_tmp_path);
+}
+
+STM_TEST(extent_persist_empty_tree_roundtrip) {
+    /* A fresh-create idx has no extents but is dirty — first commit
+     * persists an empty tree so ub_extent_root becomes non-zero, and
+     * load_at on it produces an empty index. */
+    exp_make_tmp("empty");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    exp_open_fresh(&d, &b);
+
+    stm_extent_index *idx = NULL;
+    STM_ASSERT_OK(stm_extent_index_create(/*current_txg=*/0, &idx));
+    STM_ASSERT_OK(stm_extent_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_extent_index_set_crypt_ctx(idx, EXP_KEY,
+                                                    EXP_POOL_UUID,
+                                                    EXP_DEVICE_UUID));
+
+    uint64_t paddr = 0; uint8_t cs[32];
+    STM_ASSERT_OK(stm_extent_index_commit(idx, 1u, &paddr, cs));
+    STM_ASSERT(paddr != 0);
+
+    stm_extent_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+
+    exp_reopen(&d, &b);
+    stm_extent_index *idx2 = NULL;
+    STM_ASSERT_OK(stm_extent_index_create(0, &idx2));
+    STM_ASSERT_OK(stm_extent_index_set_storage(idx2, d, b));
+    STM_ASSERT_OK(stm_extent_index_set_crypt_ctx(idx2, EXP_KEY,
+                                                     EXP_POOL_UUID,
+                                                     EXP_DEVICE_UUID));
+    STM_ASSERT_OK(stm_extent_index_load_at(idx2, paddr, 1u, cs));
+
+    size_t n = 0;
+    STM_ASSERT_OK(stm_extent_count(idx2, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    stm_extent_index_close(idx2);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(exp_tmp_path);
 }
 
 STM_TEST_MAIN("test_extent_index")

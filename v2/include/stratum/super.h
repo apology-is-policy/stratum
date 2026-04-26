@@ -148,8 +148,22 @@ extern "C" {
  * the in-line tail; chunked storage for very-large dead-lists is
  * deferred to a future extent-aware revision. The version bump
  * gates the new field meaning explicitly. No feature-flag bump
- * (full version bump per ARCH §5.9). */
-#define STM_UB_VERSION        11u
+ * (full version bump per ARCH §5.9).
+ *
+ * v11 → v12 (Phase 7 P7-3): `ub_extent_root` (64-byte stm_bptr) +
+ * `ub_extent_root_gen` (le64) carved from the head of `ub_reserved`
+ * to anchor the persistent extent index (ARCH §11.6, extent.tla).
+ * The extent index is a btree_store-encoded, AEAD-encrypted Bε-tree
+ * on device 0; keys are (le64 dataset_id || le64 ino || le64 off),
+ * values are 32-byte ARCH §11.6.1 records. v11 pools had this
+ * region zero (no v11 code populated extents), so the v11 → v12
+ * upgrade is content-clean: `ub_extent_root.bp_paddr == 0` is
+ * unambiguously "no commit yet" at load time. The version bump
+ * gates the new field meaning explicitly + refuses v11 mounts at
+ * v12 to prevent decoders without the extent index from booting
+ * a pool whose extents would otherwise be lost on next sync.
+ * No feature-flag bump (full version bump per ARCH §5.9). */
+#define STM_UB_VERSION        12u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */
@@ -237,6 +251,7 @@ typedef enum {
     STM_BPTR_KIND_KEYSCHEMA   = 7,   /* key-schema sub-tree node (ARCH §7.7.3) */
     STM_BPTR_KIND_ALLOC_ROOTS = 8,   /* allocator-roots object (ARCH §6.1, P5-3b) */
     STM_BPTR_KIND_DATASET     = 9,   /* dataset-index tree root (ARCH §8.3.2, P6-persist) */
+    STM_BPTR_KIND_EXTENT_TREE = 10,  /* extent-index tree root (ARCH §11.6, P7-3) */
 } stm_bptr_kind;
 
 typedef struct {
@@ -354,8 +369,21 @@ typedef struct {
      * commit. */
     le64    ub_snap_root_gen;                   /* 3120 :  8 */
 
+    /* Extent-index tree root (P7-3, v12). Bptr to the
+     * btree_store-encoded, AEAD-encrypted Bε-tree under
+     * `ub_extent_root` on device 0. Keys: (le64 dataset_id || le64
+     * ino || le64 offset). Values: 32-byte ARCH §11.6.1 record. The
+     * tree's bp_kind is `STM_BPTR_KIND_EXTENT_TREE`. Zero before the
+     * first commit. ARCH §11.6, spec extent.tla. */
+    stm_bptr ub_extent_root;                    /* 3128 : 64 */
+
+    /* Gen at which `ub_extent_root`'s tree was AEAD-encrypted (P7-3,
+     * v12). Same semantics as `ub_main_root_gen` / `ub_snap_root_gen`.
+     * Zero before the first commit. */
+    le64    ub_extent_root_gen;                 /* 3192 :  8 */
+
     /* Reserved for future fields + alignment to csum. */
-    uint8_t ub_reserved[936];                   /* 3128 : 936 */
+    uint8_t ub_reserved[864];                   /* 3200 : 864 */
 
     /* Checksum: BLAKE3-256 over the rest of the uberblock with this
      * field zeroed. Self-verifying; a blob whose first 4064 bytes
@@ -372,8 +400,12 @@ _Static_assert(offsetof(stm_uberblock, ub_main_root_gen) == 3112,
                "ub_main_root_gen must be at offset 3112 (v9 layout)");
 _Static_assert(offsetof(stm_uberblock, ub_snap_root_gen) == 3120,
                "ub_snap_root_gen must be at offset 3120 (v9 layout)");
-_Static_assert(offsetof(stm_uberblock, ub_reserved) == 3128,
-               "ub_reserved must be at offset 3128 (v9 layout)");
+_Static_assert(offsetof(stm_uberblock, ub_extent_root) == 3128,
+               "ub_extent_root must be at offset 3128 (v12 layout)");
+_Static_assert(offsetof(stm_uberblock, ub_extent_root_gen) == 3192,
+               "ub_extent_root_gen must be at offset 3192 (v12 layout)");
+_Static_assert(offsetof(stm_uberblock, ub_reserved) == 3200,
+               "ub_reserved must be at offset 3200 (v12 layout)");
 _Static_assert(offsetof(stm_uberblock, ub_csum) == 4064,
                "ub_csum must be at offset 4064");
 

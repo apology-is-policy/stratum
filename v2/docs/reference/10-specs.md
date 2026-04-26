@@ -866,7 +866,7 @@ C impl status: P6-deadlist landed at `18b9289` + R33 close
 with `le32 dead_count + le64 paddrs[N]`; cap STM_SNAP_DEAD_LIST_MAX
 = 256. STM_UB_VERSION 10 → 11.
 
-### `extent.tla` — per-(dataset, ino) extent layout (P7-1 entry; P7-2 C impl landed)
+### `extent.tla` — per-(dataset, ino) extent layout (P7-1 entry; P7-2 C impl + P7-3 persistence landed)
 
 Models the LOGICAL extent layer that connects datasets (the
 namespace P6 built) to actual stored bytes. Entry chunk for
@@ -929,16 +929,20 @@ Out of scope:
 - Coalescing (quality-of-implementation).
 
 C impl status: P7-2 in-RAM MVP landed at `732b20e` + R34 close
-`433d2dd`. New `src/extent/extent_index.c` realizes
-every spec action against an in-RAM linear-array store; full
-public API in `include/stratum/extent.h`. Persistence
-(per-inode Bε-tree under `ub_extent_root` + format break
-v11→v12) is the P7-3 follow-on chunk. Dropped paddrs from
-Overwrite / Truncate / DeleteFile flow back to the caller via
+`433d2dd`. **P7-3 persistence landed at `<P7-3-c-impl>` + R35
+close `<R35-close>`** — STM_UB_VERSION 11→12 with `ub_extent_root`
++ `ub_extent_root_gen` carved from `ub_reserved`; single unified
+btree_store-encoded AEAD-encrypted Bε-tree keyed by (le64 ds || le64
+ino || le64 off) valued by 32-byte ARCH §11.6.1 record; same
+envelope as ub_main_root / ub_snap_root (idempotent commit, atomic
+shadow swap, structural validator); sync.c wire-in via
+`stm_extent_index *extent_idx` + extended `compute_merkle_root` +
+extended `build_uberblock`. Dropped paddrs from Overwrite /
+Truncate / DeleteFile flow back to the caller via
 `out_dropped_paddrs[]`; the caller routes each through
-`stm_snapshot_index_overwrite_block` to compose with
-dead_list.tla — that production wiring lands with P7-4 (sync.c
-COW path integration). Reference doc: `reference/14-extent.md`.
+`stm_snapshot_index_overwrite_block` to compose with dead_list.tla
+— that production wiring lands with P7-4 (sync.c COW path
+integration). Reference doc: `reference/14-extent.md`.
 
 ## Running TLC
 

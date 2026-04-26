@@ -457,17 +457,18 @@ STM_TEST(pool_fs_roundtrip_populates_roster) {
     STM_ASSERT_OK(stm_sb_mount_scan(d, &ub, &lbl, &slot));
     stm_bdev_close(d);
 
-    /* P6-deadlist bumped STM_UB_VERSION 10 → 11 for the snapshot-tree
-     * on-disk value layout extension (dead_count + paddrs[] tail per
-     * entry). Prior bumps: P6-clone (9 → 10) for the dataset-tree
-     * origin_snap_id field; P6-persist (8 → 9) for ub_main_root_gen
-     * + ub_snap_root_gen; P5-durable-cursors (7 → 8) for
-     * ub_scrub_state[64]; P5-3c + R15 F6 (6 → 7) for the roots-object
-     * leaf value layout. The constant symbol is what we assert on;
-     * the literal 11 is restated here so a future version bump that
-     * forgets to update this test fails loudly. */
+    /* P7-3 bumped STM_UB_VERSION 11 → 12 for the extent-index UB
+     * carve (ub_extent_root + ub_extent_root_gen). Prior bumps:
+     * P6-deadlist (10 → 11) for the snapshot-tree dead_list tail;
+     * P6-clone (9 → 10) for the dataset-tree origin_snap_id field;
+     * P6-persist (8 → 9) for ub_main_root_gen + ub_snap_root_gen;
+     * P5-durable-cursors (7 → 8) for ub_scrub_state[64]; P5-3c +
+     * R15 F6 (6 → 7) for the roots-object leaf value layout. The
+     * constant symbol is what we assert on; the literal 12 is
+     * restated here so a future version bump that forgets to
+     * update this test fails loudly. */
     STM_ASSERT_EQ(stm_load_le32(ub.ub_version), STM_UB_VERSION);
-    STM_ASSERT_EQ(STM_UB_VERSION, 11u);
+    STM_ASSERT_EQ(STM_UB_VERSION, 12u);
 
     /* Roster fields are populated. */
     STM_ASSERT_EQ(stm_load_le16(ub.ub_device_count), 1u);

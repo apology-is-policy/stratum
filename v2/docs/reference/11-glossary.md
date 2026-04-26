@@ -140,6 +140,7 @@ closed items.
 | R32 | P6-clone (clone C impl + UB v9→v10). | `4503405` |
 | R33 | P6-deadlist C impl (snapshot dead-list + UB v10→v11). | `d4efeeb` |
 | R34 | P7-2 extent index C impl (in-RAM MVP per extent.tla). | `433d2dd` |
+| R35 | P7-3 extent persistence (UB v11→v12 + sync wire-in). | `<R35-close>` |
 
 ## Phase 6 / clone terms
 

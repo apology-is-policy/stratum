@@ -816,6 +816,14 @@ struct stm_snapshot_index; typedef struct stm_snapshot_index stm_snapshot_index;
 stm_dataset_index  *stm_sync_dataset_index(stm_sync *s);
 stm_snapshot_index *stm_sync_snapshot_index(stm_sync *s);
 
+/*
+ * P7-3: extent-index handle. Same lifetime + thread-safety contract
+ * as the dataset / snapshot accessors above.
+ */
+struct stm_extent_index;
+typedef struct stm_extent_index stm_extent_index;
+stm_extent_index *stm_sync_extent_index(stm_sync *s);
+
 #ifdef __cplusplus
 }
 #endif

@@ -36,6 +36,7 @@
 #include <stratum/block.h>
 #include <stratum/crypto.h>
 #include <stratum/dataset.h>
+#include <stratum/extent.h>
 #include <stratum/hash.h>
 #include <stratum/janus.h>
 #include <stratum/keyfile.h>
@@ -224,6 +225,14 @@ struct stm_sync {
     stm_dataset_index  *dataset_idx;
     stm_snapshot_index *snap_idx;
 
+    /* P7-3 (v12): extent-index. Same wiring as dataset_idx / snap_idx —
+     * created at sync_open / sync_create, hydrated from ub_extent_root
+     * + ub_extent_root_gen if non-zero, committed every sync_commit.
+     * The extent index is the data-plane analog of the namespace
+     * indices: it tracks the (ds, ino, off) → (paddr, gen, len)
+     * mapping for every regular file. */
+    stm_extent_index   *extent_idx;
+
     /* Durable mirror of ub_main_root / ub_snap_root state, last-
      * committed. Updated on successful sync_commit; consumed by
      * claim/reservation-phase build_uberblock to keep the prior
@@ -234,6 +243,9 @@ struct stm_sync {
     uint64_t           snap_root_paddr;
     uint64_t           snap_root_gen;
     uint8_t            snap_root_csum[32];
+    uint64_t           extent_root_paddr;
+    uint64_t           extent_root_gen;
+    uint8_t            extent_root_csum[32];
 
     /* Mirror of ub_next_dataset_id / ub_next_snap_id. Sourced from the
      * indices' get_next_id at commit; restored at mount via
@@ -457,6 +469,7 @@ static stm_status compute_merkle_root(const uint8_t main_csum[32],
                                         const uint8_t snap_csum[32],
                                         const uint8_t cas_csum[32],
                                         const uint8_t keyschema_csum[32],
+                                        const uint8_t extent_csum[32],
                                         const uint8_t salt[32],
                                         uint8_t out[32])
 {
@@ -467,6 +480,10 @@ static stm_status compute_merkle_root(const uint8_t main_csum[32],
     stm_blake3_update(h, snap_csum,      32);
     stm_blake3_update(h, cas_csum,       32);
     stm_blake3_update(h, keyschema_csum, 32);
+    /* P7-3 (v12): extent-index tree root csum folded into the Merkle
+     * chain. v11 pools (refused at v12 mount) had no extent root, so
+     * the new slot is a clean v12-only addition. */
+    stm_blake3_update(h, extent_csum,    32);
     stm_blake3_update(h, salt,           32);
     stm_blake3_final(h, out, 32);
     stm_blake3_free(h);
@@ -612,6 +629,9 @@ static void build_uberblock(stm_uberblock *out,
                               const uint8_t snap_root_csum[32],
                               uint64_t snap_root_gen,
                               uint64_t next_snap_id,
+                              uint64_t extent_root_paddr,
+                              const uint8_t extent_root_csum[32],
+                              uint64_t extent_root_gen,
                               const uint8_t merkle_root[32],
                               const stm_alloc_stats *astats)
 {
@@ -667,6 +687,15 @@ static void build_uberblock(stm_uberblock *out,
         memcpy(out->ub_snap_root.bp_csum, snap_root_csum, 32);
     }
     out->ub_snap_root_gen = stm_store_le64(snap_root_gen);
+
+    /* P7-3 (v12): extent-index tree root + AEAD gen. Same shape as
+     * main_root / snap_root. */
+    if (extent_root_paddr != 0) {
+        out->ub_extent_root.bp_paddr = stm_store_le64(extent_root_paddr);
+        out->ub_extent_root.bp_kind  = STM_BPTR_KIND_EXTENT_TREE;
+        memcpy(out->ub_extent_root.bp_csum, extent_root_csum, 32);
+    }
+    out->ub_extent_root_gen = stm_store_le64(extent_root_gen);
 
     /* Pool-wide id counters (ARCH §5.4). Stamped from the indices'
      * get_next_id; restored at mount via the indices' set_next_id. */
@@ -999,6 +1028,15 @@ stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
         if (rc != STM_OK) { stm_sync_close(s); return rc; }
         rc = stm_snapshot_index_set_crypt_ctx(s->snap_idx, s->metadata_key,
                                                  s->pool_uuid, s->device_uuid);
+        if (rc != STM_OK) { stm_sync_close(s); return rc; }
+
+        /* P7-3: extent index, same wiring shape. */
+        rc = stm_extent_index_create(/*current_txg=*/0, &s->extent_idx);
+        if (rc != STM_OK) { stm_sync_close(s); return rc; }
+        rc = stm_extent_index_set_storage(s->extent_idx, d, boot);
+        if (rc != STM_OK) { stm_sync_close(s); return rc; }
+        rc = stm_extent_index_set_crypt_ctx(s->extent_idx, s->metadata_key,
+                                                s->pool_uuid, s->device_uuid);
         if (rc != STM_OK) { stm_sync_close(s); return rc; }
 
         /* P6-clone: register the clone-dependency check on snap_idx.
@@ -1369,6 +1407,7 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
                                           ub.ub_snap_root.bp_csum,
                                           zeros32,
                                           ks_hdr.ks_root.bp_csum,
+                                          ub.ub_extent_root.bp_csum,
                                           ub.ub_merkle_root_salt,
                                           recomputed);
     if (ms != STM_OK) {
@@ -1537,6 +1576,32 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
         si = stm_snapshot_index_get_next_id(s2->snap_idx, &s2->next_snap_id);
         if (si != STM_OK) { stm_sync_close(s2); return si; }
 
+        /* P7-3: extent index. */
+        stm_status ei = stm_extent_index_create(/*current_txg=*/0,
+                                                    &s2->extent_idx);
+        if (ei != STM_OK) { stm_sync_close(s2); return ei; }
+        ei = stm_extent_index_set_storage(s2->extent_idx, meta_bdev, boot2);
+        if (ei != STM_OK) { stm_sync_close(s2); return ei; }
+        ei = stm_extent_index_set_crypt_ctx(s2->extent_idx, s2->metadata_key,
+                                                s2->pool_uuid, s2->device_uuid);
+        if (ei != STM_OK) { stm_sync_close(s2); return ei; }
+
+        uint64_t epaddr = stm_load_le64(ub.ub_extent_root.bp_paddr);
+        uint64_t egen   = stm_load_le64(ub.ub_extent_root_gen);
+        if (epaddr != 0) {
+            if (ub.ub_extent_root.bp_kind != STM_BPTR_KIND_EXTENT_TREE) {
+                stm_sync_close(s2);
+                return STM_ECORRUPT;
+            }
+            stm_status ls = stm_extent_index_load_at(s2->extent_idx,
+                                                         epaddr, egen,
+                                                         ub.ub_extent_root.bp_csum);
+            if (ls != STM_OK) { stm_sync_close(s2); return ls; }
+        }
+        s2->extent_root_paddr = epaddr;
+        s2->extent_root_gen   = egen;
+        memcpy(s2->extent_root_csum, ub.ub_extent_root.bp_csum, 32);
+
         /* P6-clone: register the clone-dependency check now that both
          * indices are populated. Snap delete refuses while any present
          * clone in dataset_idx references the target snap. */
@@ -1584,6 +1649,9 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
                          /*snap_csum=*/         s2->snap_root_csum,
                          /*snap_gen=*/          s2->snap_root_gen,
                          /*next_snap_id=*/      s2->next_snap_id,
+                         /*extent_root=*/       s2->extent_root_paddr,
+                         /*extent_csum=*/       s2->extent_root_csum,
+                         /*extent_gen=*/        s2->extent_root_gen,
                          /*merkle_root=*/       ub.ub_merkle_root,
                          &astats_claim);
         uint32_t lbl  = ring_label_for_gen(auth_gen + 1);
@@ -1637,6 +1705,8 @@ void stm_sync_close(stm_sync *s)
      * pool layer below. */
     if (s->dataset_idx) stm_dataset_index_close(s->dataset_idx);
     if (s->snap_idx)    stm_snapshot_index_close(s->snap_idx);
+    /* P7-3: close the extent index. Same shape as dataset/snap. */
+    if (s->extent_idx)  stm_extent_index_close(s->extent_idx);
     /* P5-3b: close the allocator-roots handle. Owns its own
      * in-RAM btree; borrows bdev + bootstrap + metadata_key. */
     if (s->roots) stm_alloc_roots_close(s->roots);
@@ -1726,6 +1796,9 @@ stm_status stm_sync_commit(stm_sync *s)
                          /*snap_csum=*/         s->snap_root_csum,
                          /*snap_gen=*/          s->snap_root_gen,
                          /*next_snap_id=*/      s->next_snap_id,
+                         /*extent_root=*/       s->extent_root_paddr,
+                         /*extent_csum=*/       s->extent_root_csum,
+                         /*extent_gen=*/        s->extent_root_gen,
                          /*merkle_root=*/       s->merkle_root,
                          &astats_res);
         uint32_t res_label = ring_label_for_gen(reservation_gen);
@@ -1886,6 +1959,24 @@ stm_status stm_sync_commit(stm_sync *s)
         return scs;
     }
 
+    /* P7-3 (v12): commit the extent index. Same shape as dataset /
+     * snapshot — idempotent when clean, returns (paddr, csum) for
+     * the new tree root. */
+    uint64_t extent_paddr = 0;
+    uint8_t  extent_csum[32] = {0};
+    uint64_t extent_gen = 0;
+    stm_status ecs = stm_extent_index_commit(s->extent_idx, target_gen,
+                                                  &extent_paddr, extent_csum);
+    if (ecs != STM_OK) {
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
+        return ecs;
+    }
+    ecs = stm_extent_index_get_gen(s->extent_idx, &extent_gen);
+    if (ecs != STM_OK) {
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
+        return ecs;
+    }
+
     stm_alloc_stats astats;
     stm_status sr = stm_alloc_stats_get(s->alloc, &astats);
     if (sr != STM_OK) {
@@ -1893,12 +1984,12 @@ stm_status stm_sync_commit(stm_sync *s)
         return sr;
     }
 
-    /* P4-1 / P5-3b / P6-persist: compute the pool Merkle root. The
-     * `alloc_root` slot is the ROOTS OBJECT's root csum (transitively
+    /* P4-1 / P5-3b / P6-persist / P7-3: compute the pool Merkle root.
+     * The `alloc_root` slot is the ROOTS OBJECT's root csum (transitively
      * covers every per-device tree root). The `main_root` slot is the
      * dataset index tree's root csum; `snap_root` is the snapshot
-     * index tree's. Both feed in directly now that the trees exist.
-     * R8-P1-1: refuse to commit on BLAKE3 OOM. */
+     * index tree's; `extent_root` is the extent index tree's. Each
+     * feeds in directly. R8-P1-1: refuse to commit on BLAKE3 OOM. */
     uint8_t zeros32[32] = { 0 };
     uint8_t new_merkle_root[32];
     stm_status ms = compute_merkle_root(main_csum,   /* main */
@@ -1906,6 +1997,7 @@ stm_status stm_sync_commit(stm_sync *s)
                                           snap_csum,
                                           zeros32,   /* cas  */
                                           ks_root_csum,
+                                          extent_csum,
                                           s->merkle_salt,
                                           new_merkle_root);
     if (ms != STM_OK) {
@@ -1921,6 +2013,7 @@ stm_status stm_sync_commit(stm_sync *s)
                      ks_root_paddr, ks_root_csum,
                      main_paddr, main_csum, main_gen, main_next_id,
                      snap_paddr, snap_csum, snap_gen, snap_next_id,
+                     extent_paddr, extent_csum, extent_gen,
                      new_merkle_root, &astats);
 
     uint32_t fin_label = ring_label_for_gen(target_gen);
@@ -1948,12 +2041,15 @@ stm_status stm_sync_commit(stm_sync *s)
     s->main_root_gen         = main_gen;
     s->snap_root_paddr       = snap_paddr;
     s->snap_root_gen         = snap_gen;
+    s->extent_root_paddr     = extent_paddr;
+    s->extent_root_gen       = extent_gen;
     s->next_dataset_id       = main_next_id;
     s->next_snap_id          = snap_next_id;
     memcpy(s->alloc_root_csum,     roots_csum,      32);
     memcpy(s->keyschema_root_csum, ks_root_csum,   32);
     memcpy(s->main_root_csum,      main_csum,      32);
     memcpy(s->snap_root_csum,      snap_csum,      32);
+    memcpy(s->extent_root_csum,    extent_csum,    32);
     memcpy(s->merkle_root,         new_merkle_root, 32);
 
     pthread_mutex_unlock(&s->lock);    stm_pool_unlock_shared(s->pool);
@@ -3397,6 +3493,11 @@ stm_dataset_index *stm_sync_dataset_index(stm_sync *s)
 stm_snapshot_index *stm_sync_snapshot_index(stm_sync *s)
 {
     return s ? s->snap_idx : NULL;
+}
+
+stm_extent_index *stm_sync_extent_index(stm_sync *s)
+{
+    return s ? s->extent_idx : NULL;
 }
 
 size_t stm_sync_dek_count(const stm_sync *s)
