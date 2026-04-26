@@ -312,6 +312,30 @@ stm_status stm_extent_lookup_at(const stm_extent_index *idx,
                                    stm_extent_record *out_extent);
 
 /*
+ * Look up the live extent backed by `paddr`. Used by the production
+ * scrub cb (P7-5) to resolve paddr → bptr at verify time: the cb is
+ * invoked with a paddr and needs the (ds, ino, off, len, gen) of the
+ * containing extent to reconstruct AD + nonce for AEAD verify.
+ *
+ * Match semantics: exact equality with `record.paddr`. Live-paddr
+ * `PaddrFreshness` (the C impl's narrowing of extent.tla's
+ * monotonic `used_paddrs`) guarantees at most one live extent has
+ * any given paddr — first match suffices. Mid-extent paddrs (a
+ * paddr in [base+1, base+nblocks)) DO NOT match — only the base
+ * paddr each extent record carries does.
+ *
+ * Returns STM_OK with `*out_extent` filled on match; STM_ENOENT if
+ * no live extent has paddr == queried (a metadata block, bootstrap
+ * region, or trailing block of a multi-block extent — the
+ * production cb treats ENOENT as "no extent verify path; charge
+ * to OK"); STM_EINVAL on NULL args or paddr == 0 (reserved).
+ */
+STM_MUST_USE
+stm_status stm_extent_lookup_by_paddr(const stm_extent_index *idx,
+                                         uint64_t paddr,
+                                         stm_extent_record *out_extent);
+
+/*
  * Iterate every live extent of (ds, ino) in off-ascending order.
  * Returns false from the callback to terminate early. Callback runs
  * under the index's mutex; MUST NOT call back into stm_extent_*

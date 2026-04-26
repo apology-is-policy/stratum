@@ -120,15 +120,28 @@ caller owns the malloc'd dropped-paddr array.
 ### Read paths
 
 ```c
-stm_status stm_extent_lookup_at      (idx, ds, ino, off, *out_extent);
-stm_status stm_extent_iter           (idx, ds, ino, cb, ctx);
-stm_status stm_extent_count          (idx, *out_count);
-stm_status stm_extent_count_for_ino  (idx, ds, ino, *out_count);
+stm_status stm_extent_lookup_at        (idx, ds, ino, off, *out_extent);
+stm_status stm_extent_lookup_by_paddr  (idx, paddr, *out_extent);
+stm_status stm_extent_iter             (idx, ds, ino, cb, ctx);
+stm_status stm_extent_count            (idx, *out_count);
+stm_status stm_extent_count_for_ino    (idx, ds, ino, *out_count);
 ```
 
 `lookup_at` returns the extent covering `off` (any byte in `[e.off,
 e.off+e.len)`) or `STM_ENOENT` for a hole. `NoOverlapWithinIno`
 guarantees at most one extent matches; first match suffices.
+
+`lookup_by_paddr` (P7-5) returns the live extent whose stored
+`record.paddr` exactly equals the queried paddr — used by the
+production scrub β verify-callback to resolve paddr → extent at
+verify time. Live-paddr `PaddrFreshness` (the C impl's narrowing of
+extent.tla's monotonic `used_paddrs`) guarantees at most one match.
+Mid-extent paddrs (a paddr in `[base+1, base+nblocks)`) DO NOT match
+— only the base paddr each extent record carries does. Returns
+`STM_ENOENT` if no live extent has paddr == queried (a metadata
+block, bootstrap region, or trailing block of a multi-block
+extent — the production cb treats ENOENT as "no extent verify
+path; charge to OK").
 
 `iter` invokes `cb` once per matching extent in **off-ascending**
 order. Returning false from cb terminates iteration. cb runs with the
@@ -157,6 +170,11 @@ SPEC-TO-CODE mapping (in `src/extent/extent_index.c`):
 | `LengthPositive` | `len ≥ 1` arg check |
 | `BirthTxgBound` | `write_gen ≤ current_txg` arg check |
 | `PaddrFreshness` (live-paddr) | `paddr_in_use_locked` scan |
+
+Note: `stm_extent_lookup_by_paddr` (P7-5) is a read path used by the
+production scrub cb; it doesn't realize a spec action — it leverages
+the live-paddr `PaddrFreshness` invariant (no two live extents share
+a paddr) to return at most one match.
 
 ## On-disk encoding (v12+)
 
@@ -295,8 +313,10 @@ unrelated to the index API and stays separate.
 - [x] `stm_extent_index_advance_txg(sync->current_gen)` per sync_create
       / sync_open / sync_commit (R35 forward-looking note acted on
       in P7-4).
-- [ ] Production scrub cb — paddr→bptr resolver via extent walk.
-      Now fully unblocked.
+- [x] `stm_extent_lookup_by_paddr` (P7-5): exact-paddr lookup helper
+      backing the production scrub cb's paddr→bptr resolver. O(n)
+      linear scan; first match suffices by live-paddr
+      `PaddrFreshness`.
 - [ ] Partial-extent shrink on Truncate (truncating mid-extent) —
       deferred; current MVP only drops fully-past-truncation extents.
 - [ ] Coalescing — quality-of-implementation; correctness preserved

@@ -148,9 +148,29 @@ into the CAS tier (which DOES need P6) is a separate concern.
       P7-4 tests covering roundtrip / hole / args / COW with-snap
       asserting dead_list_count 0→1 / COW without-snap / cross-
       mount durability / RO blocks / multi-extent).
-- [ ] **P7-5 production scrub cb** — pending. Now fully unblocked
-      by P7-4: paddr→bptr resolver implementable via extent walk
-      over the persistent extent index.
+- [x] **P7-5 production scrub cb** — landed at `<TBD-substantive>`;
+      R37 close `<TBD-close>`. New `stm_extent_lookup_by_paddr`
+      (extent.h + extent_index.c) — exact-paddr live-extent lookup,
+      O(n) scan, first match wins by live-paddr `PaddrFreshness`.
+      New `stm_sync_scrub_install_production_cb` (sync.h + sync.c)
+      wires a static `sync_scrub_verify_cb` onto a scrub handle:
+      lookup_by_paddr → if hit, `stm_pool_device_bdev` (rdlock-
+      snapshot) + `stm_bdev_read` of `rec.len + tag_len` bytes +
+      `stm_extent_decrypt` with the same nonce/AD as the write
+      path; OK → `STM_SCRUB_VERIFY_OK`; AEAD-tag failure or bdev
+      I/O error → `STM_SCRUB_VERIFY_UNREPAIRABLE`. Mid-extent
+      blocks + metadata/bootstrap blocks return OK trivially. Lock
+      hierarchy: cb runs under `sc.lock + pool.rdlock` (existing
+      scrub contract); takes `extent_idx.lock` briefly inside
+      lookup; does NOT take `sync.lock` (extent_idx, pool,
+      pool_uuid, metadata_key all immutable post-create or
+      independently locked). Plaintext hygiene via
+      `stm_ct_memzero` before free. test_fs grows 17 → 20 (3 new
+      P7-5 tests: verifies extents, detects on-disk corruption
+      via direct pwrite + remount + scrub, mid-extent blocks
+      charge to OK in multi-block extent). Single-replica corner
+      of bptr.tla — full replica-walk + rewrite awaits extent
+      record's replica-list extension.
 - [ ] CAS tier — pending; needs extent layer + integration.
 - [ ] Send / recv — pending; needs extent layer + birth-txg from
       snapshots (already in place from P6).

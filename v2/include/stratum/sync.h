@@ -824,6 +824,13 @@ struct stm_extent_index;
 typedef struct stm_extent_index stm_extent_index;
 stm_extent_index *stm_sync_extent_index(stm_sync *s);
 
+/* Forward decl for stm_sync_scrub_install_production_cb below. The
+ * full type lives in <stratum/scrub.h>; including it here would create
+ * a cycle (scrub.h includes types.h which already pulls sync's deps).
+ */
+struct stm_scrub;
+typedef struct stm_scrub stm_scrub;
+
 /*
  * P7-4: POSIX-shape extent write/read with full COW routing.
  *
@@ -856,6 +863,42 @@ STM_MUST_USE
 stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
                                    uint64_t off, void *buf, size_t len,
                                    size_t *out_read);
+
+/*
+ * P7-5: install the production scrub β verify-callback on `sc`.
+ *
+ * The cb resolves each `paddr` against `sync`'s extent index via
+ * `stm_extent_lookup_by_paddr`:
+ *
+ *   - paddr matches a live extent's base → AEAD-decrypt the entire
+ *     ciphertext+tag at that paddr (using the same nonce + AD shape as
+ *     `stm_sync_write_extent`) and return STM_SCRUB_VERIFY_OK on
+ *     success or STM_SCRUB_VERIFY_UNREPAIRABLE on AEAD-tag failure /
+ *     bdev I/O error. Replica reconstruction is not yet implemented —
+ *     bptr.tla's full replica-walk + rewrite protocol awaits the
+ *     replica-aware allocator and extent record extension. Until
+ *     then, AEAD-tag failure means "no surviving redundancy" and the
+ *     block is reported UNREPAIRABLE (matching bptr.tla's
+ *     `NoOriginalOKMeansUnrepairable` corner).
+ *
+ *   - paddr does NOT match a live extent (mid-extent block, metadata
+ *     tree node, bootstrap block, scrub durable region, etc.) →
+ *     STM_SCRUB_VERIFY_OK. Mid-extent blocks are covered by the AEAD
+ *     verify of the containing extent at its base. Non-extent
+ *     allocated blocks (metadata, bootstrap) have no extent-level
+ *     verify path in this MVP — operator-visible coverage is
+ *     "extent-data only" until per-block-kind verify lands.
+ *
+ * Lifetime contract: `sync` is borrowed (the cb's ctx) and MUST
+ * outlive `sc`. Callers MUST close scrub BEFORE closing sync (per
+ * scrub.h "Borrowed references"). Re-installing or clearing the cb
+ * on `sc` follows the standard `stm_scrub_set_verify_cb` rules.
+ *
+ * Returns STM_EINVAL on NULL args; otherwise the
+ * `stm_scrub_set_verify_cb` return code.
+ */
+STM_MUST_USE
+stm_status stm_sync_scrub_install_production_cb(stm_sync *sync, stm_scrub *sc);
 
 #ifdef __cplusplus
 }

@@ -15,10 +15,18 @@ Two verify modes:
   writeback). The cb returns `OK` / `REPAIRED` / `UNREPAIRABLE`;
   scrub charges the matching counter.
 
-The β cb-shape is the integration point for the future P6 extent
-manager: P6's bptr layer will plug a real cb that walks the
-replica list, picks a verified replica, and rewrites the bad
-device per ARCH §7.15. Tests today pass stub callbacks.
+The β cb-shape is the integration point that P7-5 fills with the
+**production scrub cb** — `stm_sync_scrub_install_production_cb`
+(declared in `<stratum/sync.h>`). The cb resolves each scanned
+paddr against the persistent extent index via
+`stm_extent_lookup_by_paddr`, AEAD-decrypts the matched extent, and
+returns `OK` on tag-pass / `UNREPAIRABLE` on tag-fail. Replica
+reconstruction (bptr.tla's full `ScanRead` × `RewriteReplica`
+machine) waits for the extent record's replica-list extension; the
+P7-5 cb maps to the single-replica corner of bptr.tla where AEAD
+failure → `UNREPAIRABLE`. Stub callbacks remain in tests for the
+state-machine matrix; production-pattern callers install the
+production cb instead.
 
 **γ — durable cursor**: scrub state (state, cursor, all counters) is
 persisted in `stm_uberblock.ub_scrub_state[64]` on every
@@ -463,6 +471,19 @@ All green on default + ASan + TSan.
       UNREPAIRABLE / OK outcomes. CallbackSetExclusivity holds.
 - [x] **β: scrub_beta.cfg** — fixed-impl spec config exercising
       all three cb outcomes. 19 states / depth 8, clean.
+- [x] **P7-5 production scrub cb**: `stm_sync_scrub_install_production_cb`
+      installs an AEAD-decrypt-based cb on a scrub handle. cb logic:
+      (a) `stm_extent_lookup_by_paddr` — match on extent base; (b) on
+      hit, `stm_pool_device_bdev` + `stm_bdev_read` of the
+      ciphertext+tag at the extent's paddr+rec.len+tag_len; (c)
+      `stm_extent_decrypt` with the same nonce/AD as the write path
+      (paddr ‖ gen ‖ pool_uuid; AD pool_uuid ‖ ds ‖ ino ‖ off ‖
+      content_kind=0); (d) return `OK` on success, `UNREPAIRABLE`
+      on AEAD-tag failure or bdev I/O error. Mid-extent paddrs +
+      non-extent allocated blocks (metadata, bootstrap) return
+      `OK` trivially — base-paddr verify covers the entire
+      extent's bytes; non-extent blocks have no extent-level
+      verify path in this MVP.
 
 ### R26 audit posture (closed 2026-04-25 @ `a6249eb`)
 
@@ -597,9 +618,12 @@ Deferred (γ-scope / future):
   per ROADMAP §8.6 + §14.1.
 - **Per-device parallelism** (ARCH §12.7.1 "one thread per device"):
   α/β/γ all serialize today. Future enhancement.
-- **P6 extent manager wiring**: the bptr-aware verify-cb that
-  replaces test stubs with a real replica-list iterator. See
-  ROADMAP §9.6 carry-over.
+- ~~**P6 extent manager wiring**~~: **CLOSED by P7-5**: the
+  production cb (`stm_sync_scrub_install_production_cb`) resolves
+  paddr → extent and AEAD-verifies. Full replica-walk + rewrite
+  (bptr.tla's `ScanRead` × `RewriteReplica` matrix) awaits the
+  extent record's replica-list extension; current MVP maps to the
+  bptr.tla corner where AEAD failure → `UNREPAIRABLE`.
 
 ## Known caveats
 
@@ -610,10 +634,17 @@ Deferred (γ-scope / future):
   but the β cb-shape is the integration point: P6's bptr-aware
   cb will perform the csum check and return REPAIRED /
   UNREPAIRABLE accordingly.
-- **β cb is caller-supplied**: scrub itself does NOT carry a
-  bptr-aware default. With no cb installed, scrub falls back to α
-  (raw read, no csum). Production deployments need a real cb (P6
-  unlock) for end-to-end integrity coverage.
+- **β cb default**: as of P7-5 the production cb is available via
+  `stm_sync_scrub_install_production_cb`. With no cb installed
+  scrub falls back to α (raw read, no csum). Production callers
+  should install the production cb after `stm_scrub_create`.
+- **P7-5 single-replica corner**: the production cb maps to the
+  bptr.tla corner where the extent has only one replica. AEAD-tag
+  failure → `UNREPAIRABLE` (no rewrite path until extent records
+  carry replica lists). Mirror-pool deployments will see the same
+  block reported `UNREPAIRABLE` per scrub even when a healthy
+  replica exists on another device — the full replica walk is the
+  next chunk.
 - **FAULTED-device blocks are skipped silently**. Status_get
   gives no indication that coverage was degraded. Operators
   monitoring "scrub finished without errors" may misread the

@@ -11,15 +11,20 @@
  *   - stats report accurate current_gen + allocated_blocks.
  */
 #include "tharness.h"
+#include <stratum/extent.h>
 #include <stratum/fs.h>
 #include <stratum/fs_testing.h>
 #include <stratum/keyfile.h>
+#include <stratum/scrub.h>
 #include <stratum/snapshot.h>
 #include <stratum/sync.h>
+#include <stratum/types.h>
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #define TEST_DEVICE_BYTES     (UINT64_C(16) * 1024u * 1024u)
@@ -606,6 +611,180 @@ STM_TEST(fs_io_multi_extent_per_ino) {
     STM_ASSERT_OK(stm_fs_read(fs, 7, 13, 8192, out, sizeof out, &got));
     STM_ASSERT_MEM_EQ(c, out, sizeof c);
 
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+/* ========================================================================= */
+/* P7-5: production scrub β verify-callback.                                  */
+/* ========================================================================= */
+
+static void run_scrub_to_completion(stm_scrub *sc) {
+    /* Step until COMPLETED. Bound the loop liberally — 4 KiB blocks
+     * across the bootstrap region + a small data set converges fast,
+     * but the per-step ranges can be small so allow many iterations. */
+    for (int i = 0; i < 4096; i++) {
+        STM_ASSERT_OK(stm_scrub_step(sc));
+        stm_scrub_status st;
+        STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
+        if (st.state == STM_SCRUB_STATE_COMPLETED) return;
+    }
+    STM_ASSERT(false);   /* didn't drain in 4096 steps. */
+}
+
+STM_TEST(fs_io_scrub_production_cb_verifies_extents) {
+    /* End-to-end: write a handful of extents, install the production
+     * scrub cb, run scrub to completion, expect every block charged
+     * to OK (verified) — none to UNREPAIRABLE. The cb resolves each
+     * paddr against the extent index; matches AEAD-decrypt; mid-extent
+     * blocks + metadata blocks return OK trivially (no extent verify
+     * path for them in MVP). */
+    make_tmp("scrub_prod_ok");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Three 4-KiB extents — one per (ds, ino, off). */
+    uint8_t buf[4096];
+    for (size_t i = 0; i < sizeof buf; i++) buf[i] = (uint8_t)(i & 0xFF);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0,    buf, sizeof buf));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 4096, buf, sizeof buf));
+    STM_ASSERT_OK(stm_fs_write(fs, 2, 7, 0,    buf, sizeof buf));
+
+    /* Install cb on a fresh scrub handle. */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    STM_ASSERT_TRUE(sync != NULL);
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(sync, &sc));
+    STM_ASSERT_OK(stm_sync_scrub_install_production_cb(sync, sc));
+    STM_ASSERT_OK(stm_scrub_start(sc));
+
+    run_scrub_to_completion(sc);
+
+    stm_scrub_status st;
+    STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
+    STM_ASSERT_EQ((int)st.state, (int)STM_SCRUB_STATE_COMPLETED);
+    /* β-mode: failed must be 0; we're in cb-mode. */
+    STM_ASSERT_EQ(st.blocks_failed, 0u);
+    /* No corruption injected — every block charges to verified. */
+    STM_ASSERT_EQ(st.blocks_unrepairable, 0u);
+    STM_ASSERT_EQ(st.blocks_repaired,     0u);
+    /* At least the extent base paddrs must verify (3 extents → ≥3
+     * blocks_verified). The total includes metadata + bootstrap blocks
+     * the cb returns OK for trivially. */
+    STM_ASSERT(st.blocks_verified >= 3u);
+
+    stm_scrub_close(sc);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+STM_TEST(fs_io_scrub_production_cb_detects_corruption) {
+    /* Write an extent, then directly corrupt its on-disk bytes (skip
+     * the AEAD layer) so the AEAD-tag check fails. Install the
+     * production cb, run scrub to completion, expect at least one
+     * UNREPAIRABLE charge. */
+    make_tmp("scrub_prod_corrupt");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t buf[4096];
+    memset(buf, 0xCD, sizeof buf);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, buf, sizeof buf));
+
+    /* Reach into the extent index to recover the paddr we just wrote
+     * to so we can target its on-disk bytes. */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    STM_ASSERT_TRUE(sync != NULL);
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    STM_ASSERT_TRUE(eidx != NULL);
+    stm_extent_record rec;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &rec));
+
+    /* Unmount + corrupt + remount. Direct pwrite at the extent's
+     * byte offset overwrites the ciphertext+tag with garbage; on
+     * remount the AEAD verify will fail. */
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    /* device 0 by construction (single-device pool). */
+    STM_ASSERT_EQ(stm_paddr_device(rec.paddr), (uint16_t)0);
+    uint64_t byte_off = (uint64_t)stm_paddr_offset(rec.paddr) * 4096u;
+    int cfd = open(g_tmp_path, O_WRONLY);
+    STM_ASSERT(cfd >= 0);
+    uint8_t garbage[4096];
+    memset(garbage, 0xFE, sizeof garbage);
+    ssize_t n = pwrite(cfd, garbage, sizeof garbage, (off_t)byte_off);
+    STM_ASSERT_EQ((size_t)n, sizeof garbage);
+    STM_ASSERT_EQ(close(cfd), 0);
+
+    /* Remount + scrub with production cb. */
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    sync = stm_fs_sync_for_test(fs);
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(sync, &sc));
+    STM_ASSERT_OK(stm_sync_scrub_install_production_cb(sync, sc));
+    STM_ASSERT_OK(stm_scrub_start(sc));
+    run_scrub_to_completion(sc);
+
+    stm_scrub_status st;
+    STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
+    STM_ASSERT_EQ((int)st.state, (int)STM_SCRUB_STATE_COMPLETED);
+    STM_ASSERT_EQ(st.blocks_failed, 0u);   /* β-mode: failed = 0. */
+    /* The corrupted extent's base paddr must charge UNREPAIRABLE. */
+    STM_ASSERT(st.blocks_unrepairable >= 1u);
+
+    stm_scrub_close(sc);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+STM_TEST(fs_io_scrub_production_cb_charges_mid_extent_blocks_to_ok) {
+    /* A multi-block extent allocates multiple paddrs, but only the
+     * BASE paddr is stored in the extent index. Mid-extent paddrs
+     * (base+1, base+2, ...) return ENOENT on lookup_by_paddr; the
+     * production cb charges them to OK trivially (the AEAD verify at
+     * the base covers the entire ciphertext+tag). Confirms the
+     * "verified count > 1" property when an extent spans more than
+     * one 4 KiB block.
+     *
+     * Use an 8 KiB write to span two paddrs; with AEAD tag overhead
+     * the allocator reserves 3 blocks (8 KiB plaintext + 32-byte tag
+     * rounds up). Scrub iterates all 3, the cb recognizes the base,
+     * decrypts; the other two return OK trivially. */
+    make_tmp("scrub_prod_mid_ext");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* 8 KiB single-extent write. */
+    uint8_t buf[8192];
+    for (size_t i = 0; i < sizeof buf; i++) buf[i] = (uint8_t)((i * 7) & 0xFF);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, buf, sizeof buf));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(sync, &sc));
+    STM_ASSERT_OK(stm_sync_scrub_install_production_cb(sync, sc));
+    STM_ASSERT_OK(stm_scrub_start(sc));
+    run_scrub_to_completion(sc);
+
+    stm_scrub_status st;
+    STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
+    STM_ASSERT_EQ((int)st.state,         (int)STM_SCRUB_STATE_COMPLETED);
+    STM_ASSERT_EQ(st.blocks_failed,      0u);
+    STM_ASSERT_EQ(st.blocks_unrepairable,0u);
+    STM_ASSERT_EQ(st.blocks_repaired,    0u);
+    /* The 8 KiB extent + tag spans ≥ 3 blocks; all charge to verified. */
+    STM_ASSERT(st.blocks_verified >= 3u);
+
+    stm_scrub_close(sc);
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
 }

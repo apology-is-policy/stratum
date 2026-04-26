@@ -581,6 +581,78 @@ STM_TEST(ex_lookup_at_unknown_ino) {
     stm_extent_index_close(idx);
 }
 
+STM_TEST(ex_lookup_by_paddr_finds_extent) {
+    stm_extent_index *idx = NULL;
+    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0,    4096, 0xAA, 0));
+    STM_ASSERT_OK(stm_extent_write(idx, 2, 5, 4096, 8192, 0xBB, 0));
+
+    stm_extent_record e;
+    STM_ASSERT_OK(stm_extent_lookup_by_paddr(idx, 0xAA, &e));
+    STM_ASSERT_EQ(e.dataset_id, 1u);
+    STM_ASSERT_EQ(e.ino,        1u);
+    STM_ASSERT_EQ(e.off,        0u);
+    STM_ASSERT_EQ(e.len,        4096u);
+
+    STM_ASSERT_OK(stm_extent_lookup_by_paddr(idx, 0xBB, &e));
+    STM_ASSERT_EQ(e.dataset_id, 2u);
+    STM_ASSERT_EQ(e.ino,        5u);
+    STM_ASSERT_EQ(e.off,        4096u);
+    STM_ASSERT_EQ(e.len,        8192u);
+
+    stm_extent_index_close(idx);
+}
+
+STM_TEST(ex_lookup_by_paddr_unknown_returns_enoent) {
+    stm_extent_index *idx = NULL;
+    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, 0xAA, 0));
+
+    stm_extent_record e;
+    /* paddr not in any extent. */
+    STM_ASSERT_ERR(stm_extent_lookup_by_paddr(idx, 0xCC, &e), STM_ENOENT);
+    /* "Mid-extent" paddr (would belong to a multi-block extent's tail
+     * if the underlying alloc range had multiple paddrs) is not stored
+     * in the index — only the base. */
+    STM_ASSERT_ERR(stm_extent_lookup_by_paddr(idx, 0xAA + 1, &e), STM_ENOENT);
+
+    stm_extent_index_close(idx);
+}
+
+STM_TEST(ex_lookup_by_paddr_rejects_bad_args) {
+    stm_extent_index *idx = NULL;
+    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    stm_extent_record e;
+    STM_ASSERT_ERR(stm_extent_lookup_by_paddr(NULL, 0xAA, &e), STM_EINVAL);
+    STM_ASSERT_ERR(stm_extent_lookup_by_paddr(idx,  0,    &e), STM_EINVAL);
+    STM_ASSERT_ERR(stm_extent_lookup_by_paddr(idx,  0xAA, NULL), STM_EINVAL);
+    stm_extent_index_close(idx);
+}
+
+STM_TEST(ex_lookup_by_paddr_after_overwrite) {
+    /* After Overwrite drops the old extent, lookup_by_paddr on the
+     * old paddr returns ENOENT (live-paddr semantics) and the new
+     * paddr returns the new extent. */
+    stm_extent_index *idx = NULL;
+    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, 0xAA, 0));
+
+    uint64_t *dropped = NULL;
+    size_t    n_dropped = 0;
+    STM_ASSERT_OK(stm_extent_overwrite(idx, 1, 1, 0, 4096, 0xBB, 0,
+                                          &dropped, &n_dropped));
+    STM_ASSERT_EQ(n_dropped, (size_t)1);
+    STM_ASSERT_EQ(dropped[0], (uint64_t)0xAA);
+    free(dropped);
+
+    stm_extent_record e;
+    STM_ASSERT_ERR(stm_extent_lookup_by_paddr(idx, 0xAA, &e), STM_ENOENT);
+    STM_ASSERT_OK (stm_extent_lookup_by_paddr(idx, 0xBB, &e));
+    STM_ASSERT_EQ(e.paddr, (uint64_t)0xBB);
+
+    stm_extent_index_close(idx);
+}
+
 typedef struct {
     size_t   n_seen;
     uint64_t offs[8];

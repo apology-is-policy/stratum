@@ -510,6 +510,28 @@ stm_status stm_extent_lookup_at(const stm_extent_index *idx,
     return STM_ENOENT;
 }
 
+stm_status stm_extent_lookup_by_paddr(const stm_extent_index *idx,
+                                          uint64_t paddr,
+                                          stm_extent_record *out_extent) {
+    if (!idx || !out_extent) return STM_EINVAL;
+    if (paddr == 0) return STM_EINVAL;
+
+    pthread_mutex_t *lock = ex_lock(idx);
+    must_lock(lock);
+    /* Live-paddr PaddrFreshness: no two live extents share a paddr;
+     * first match suffices. */
+    for (size_t i = 0; i < idx->n_records; i++) {
+        const stm_extent_record *e = &idx->records[i];
+        if (e->paddr == paddr) {
+            *out_extent = *e;
+            must_unlock(lock);
+            return STM_OK;
+        }
+    }
+    must_unlock(lock);
+    return STM_ENOENT;
+}
+
 stm_status stm_extent_iter(const stm_extent_index *idx,
                               uint64_t dataset_id, uint64_t ino,
                               stm_extent_iter_cb cb, void *ctx) {

@@ -42,6 +42,7 @@
 #include <stratum/keyfile.h>
 #include <stratum/keyschema.h>
 #include <stratum/pool.h>
+#include <stratum/scrub.h>
 #include <stratum/snapshot.h>
 #include <stratum/super.h>
 
@@ -3777,6 +3778,121 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     *out_read = len;
     pthread_mutex_unlock(&s->lock);
     return STM_OK;
+}
+
+/* P7-5 production scrub β verify-callback.
+ *
+ * Composition with the existing tree:
+ *   - bptr.tla::ScanRead(i)        → stm_extent_lookup_by_paddr +
+ *                                     stm_bdev_read + stm_extent_decrypt.
+ *                                     The csum gate is the AEAD tag check
+ *                                     under stm_extent_decrypt.
+ *   - bptr.tla::AcceptedAsSource    → ds == STM_OK from decrypt.
+ *   - bptr.tla::ScanComplete (no   → returns STM_SCRUB_VERIFY_UNREPAIRABLE
+ *      OK source)                    when the only "replica" we model
+ *                                     (the single-paddr extent) fails
+ *                                     AEAD. Fully expanded replica-walk
+ *                                     awaits the extent record's
+ *                                     replica-list extension (post-MVP).
+ *
+ * Lock context (per scrub.h "Callback contract"):
+ *   - Invoked under sc->lock + pool->rdlock. Pool wrlock-bearing APIs
+ *     are forbidden; we only call stm_pool_device_bdev (pure deref of
+ *     the rdlock-snapshot pool struct, per pool.c).
+ *   - Does NOT take sync->lock. extent_idx has its own mutex; pool_uuid
+ *     and metadata_key are immutable post-create; pool is immutable.
+ *   - extent_idx.lock is acquired briefly inside stm_extent_lookup_by_paddr.
+ *     Lock order: sc.lock → pool.rdlock → extent_idx.lock (LEAF).
+ *
+ * Per-block charge model: scrub iterates ALLOCATED ranges block-by-
+ * block. For a multi-block extent, only the BASE paddr matches an
+ * extent record; mid-extent paddrs (base+1, base+2, ...) return
+ * ENOENT and charge to OK. Operator-visible counters therefore
+ * report "blocks scrubbed" with at most one UNREPAIRABLE per
+ * corrupted extent; subsequent blocks of the same extent count as
+ * verified (the AEAD-tag check at the base covers the entire
+ * ciphertext+tag, so corruption is detected exactly once per
+ * extent).
+ *
+ * Plaintext hygiene: the cb must AEAD-decrypt to verify integrity but
+ * doesn't need the plaintext. We allocate a temp buffer, decrypt,
+ * stm_ct_memzero before free — same pattern as the keyschema /
+ * mirror_read paths.
+ */
+static stm_scrub_verify_outcome
+sync_scrub_verify_cb(uint64_t paddr, void *ctx)
+{
+    stm_sync *s = ctx;
+    if (!s) return STM_SCRUB_VERIFY_UNREPAIRABLE;
+
+    /* Resolve paddr → extent. ENOENT means "not an extent base":
+     * mid-extent block (covered by the base verify), metadata block,
+     * bootstrap region, or scrub durable region. None of these have
+     * an extent-level verify path in this MVP — return OK. */
+    stm_extent_record rec;
+    stm_status ls = stm_extent_lookup_by_paddr(s->extent_idx, paddr, &rec);
+    if (ls == STM_ENOENT) return STM_SCRUB_VERIFY_OK;
+    if (ls != STM_OK)     return STM_SCRUB_VERIFY_UNREPAIRABLE;
+
+    /* Look up the bdev for the extent's device. pool is rdlock-held
+     * by scrub; stm_pool_device_bdev is a pure deref of the snapshot. */
+    uint16_t dev = stm_paddr_device(rec.paddr);
+    stm_bdev *bd = stm_pool_device_bdev(s->pool, dev);
+    if (!bd) return STM_SCRUB_VERIFY_UNREPAIRABLE;
+
+    /* AEAD setup matching stm_sync_write_extent. Hardcoded AEGIS-256
+     * (R36 P1-3) so cross-host portability is preserved. */
+    stm_aead_mode mode = STM_AEAD_AEGIS256;
+    size_t tag_len = stm_aead_tag_len(mode);
+    if (tag_len == 0) return STM_SCRUB_VERIFY_UNREPAIRABLE;
+
+    size_t total_bytes = rec.len + tag_len;
+    void *cbuf = malloc(total_bytes);
+    if (!cbuf) return STM_SCRUB_VERIFY_UNREPAIRABLE;
+
+    uint64_t byte_off = stm_paddr_offset(rec.paddr) * (uint64_t)STM_UB_SIZE;
+    stm_status rs = stm_bdev_read(bd, byte_off, cbuf, total_bytes);
+    if (rs != STM_OK) {
+        free(cbuf);
+        return STM_SCRUB_VERIFY_UNREPAIRABLE;
+    }
+
+    void *pbuf = malloc(rec.len);
+    if (!pbuf) {
+        free(cbuf);
+        return STM_SCRUB_VERIFY_UNREPAIRABLE;
+    }
+
+    stm_ad_extent ad;
+    memset(&ad, 0, sizeof ad);
+    ad.magic        = STM_AD_MAGIC_EXTENT;
+    ad.version      = STM_AD_VERSION_EXTENT;
+    ad.pool_uuid[0] = s->pool_uuid[0];
+    ad.pool_uuid[1] = s->pool_uuid[1];
+    ad.dataset_id   = rec.dataset_id;
+    ad.ino          = rec.ino;
+    ad.offset       = rec.off;
+    ad.content_kind = 0;  /* file data — matches stm_sync_write_extent. */
+
+    size_t pt_out = 0;
+    stm_status ds = stm_extent_decrypt(mode, s->metadata_key,
+                                          rec.paddr, rec.gen,
+                                          &ad, cbuf, total_bytes,
+                                          pbuf, rec.len, &pt_out);
+    free(cbuf);
+    /* Plaintext hygiene: scrub doesn't need the bytes; wipe before
+     * free so the heap is clean. */
+    stm_ct_memzero(pbuf, rec.len);
+    free(pbuf);
+
+    return (ds == STM_OK) ? STM_SCRUB_VERIFY_OK
+                          : STM_SCRUB_VERIFY_UNREPAIRABLE;
+}
+
+stm_status stm_sync_scrub_install_production_cb(stm_sync *sync, stm_scrub *sc)
+{
+    if (!sync || !sc) return STM_EINVAL;
+    return stm_scrub_set_verify_cb(sc, sync_scrub_verify_cb, sync);
 }
 
 size_t stm_sync_dek_count(const stm_sync *s)
