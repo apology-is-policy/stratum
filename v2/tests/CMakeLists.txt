@@ -63,6 +63,7 @@ stm_add_test(test_keyschema_rotate test_keyschema_rotate.c)
 stm_add_test(test_pool       test_pool.c)
 stm_add_test(test_sync_multi test_sync_multi.c)
 stm_add_test(test_scrub      test_scrub.c)
+stm_add_test(test_cdc        test_cdc.c)
 
 # The crash-injection fuzzer runs ~168 independent format+mount+unmount
 # cycles and takes ~25 s on default, ~42 s under ASan/TSan. Bump the

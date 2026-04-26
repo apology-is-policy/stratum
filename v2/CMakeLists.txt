@@ -180,6 +180,7 @@ add_subdirectory(src/sync)
 add_subdirectory(src/scrub)
 add_subdirectory(src/fs)
 add_subdirectory(src/extent)
+add_subdirectory(src/cdc)
 
 # ---------------------------------------------------------------------------
 # Public aggregate library.
@@ -208,7 +209,8 @@ target_link_libraries(stratum INTERFACE
     stm_sync
     stm_scrub
     stm_fs
-    stm_extent)
+    stm_extent
+    stm_cdc)
 target_include_directories(stratum INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/include)
 
