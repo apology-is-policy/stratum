@@ -38,14 +38,12 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `4503405` (P6-clone R32 audit close: 0 P0 + 0 P1 +
-  2 P2 + 4 P3 — all addressed; cb un-register on close, refactored
-  self-id check, deterministic *out_id init, sentinel-share doc
-  comment, new reference docs `12-dataset.md` + `13-snapshot.md`).
-  Phase 5 tagged `phase-5-complete` at `461e68e`. Spec posture: 18
-  modules / 21 fixed configs / 16 buggy demos (unchanged this
-  chunk — clone.tla already landed at `3db8b5e`; this chunk adds
-  the C impl).
+- **Tip**: P6-clone R32 audit close at `4503405` + dead-list spec
+  scaffold landing this commit (block-level dead-list maintenance
+  + ZFS-style SnapDelete; spec-only landing — C impl deferred).
+  Phase 5 tagged `phase-5-complete` at `461e68e`. Spec posture:
+  **19 modules / 22 fixed configs / 19 buggy demos** (was 18/21/16
+  pre-dead-list).
 - **Phases**: 1–5 complete; **Phase 6 progressing**.
   Spec scaffolds: P6-1 (bptr.tla) `032db86`; P6-2 (dataset.tla)
   `75f6a3f`; P6-3 (snapshot.tla) `8813027`; P6-4 (property.tla)

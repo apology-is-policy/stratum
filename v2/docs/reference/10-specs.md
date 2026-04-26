@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Stratum v2 ships 18 TLA+ spec modules covering every load-bearing
+Stratum v2 ships 19 TLA+ spec modules covering every load-bearing
 invariant in the implementation. The specs are the **source of
 truth** for protocol-level behavior; code is an implementation of
 the spec (CLAUDE.md: "spec-first policy"). When the two disagree,
@@ -38,9 +38,10 @@ chapter as specs get wider cross-reference tables).
 | `snapshot.tla` | 6 | Snapshot lifecycle — O(1) atomic create + birth-txg ordering + chain integrity + holds prevent delete. Block-level dead-list deferred. | 636 states, depth 9 (MaxSnaps=3, MaxTxg=5) | `snapshot_delete_held_buggy.cfg`, `snapshot_chain_disorder_buggy.cfg` |
 | `property.tla` | 6 | Per-dataset property inheritance — local override / inheritable walk / non-inheritable + immutable-at-create. | 1040 states, depth 11 (MaxDatasets=2, 3 props, 2 values) | `property_inherit_non_inh_buggy.cfg`, `property_mutate_immutable_buggy.cfg` |
 | `clone.tla` | 6 | Clone (writable snapshot) lifecycle — clone-from-snap + snap-with-clones-undeletable + promote-breaks-dependency. | 161 states, depth 11 (MaxDatasets=3, MaxSnaps=2) | `clone_delete_snap_with_clones_buggy.cfg` |
+| `dead_list.tla` | 6 | Block-level reachability + per-snapshot dead-list incremental maintenance during COW + ZFS-style SnapDelete (free-unique + merge-surviving-into-pred). | 5656 states, depth 15 (MaxBlocks=4, MaxSnaps=3) | `dead_list_overwrite_forgets_buggy.cfg`, `dead_list_delete_forgets_free_buggy.cfg`, `dead_list_merge_includes_freed_buggy.cfg` |
 
-All 21 fixed configs green (one per module + `scrub_beta` +
-`scrub_durable` + `scrub_beta_durable` extending `scrub.tla`). All 16
+All 22 fixed configs green (one per module + `scrub_beta` +
+`scrub_durable` + `scrub_beta_durable` extending `scrub.tla`). All 19
 buggy configs reproduce their designed invariant violations.
 
 ## Per-module invariants
@@ -786,6 +787,75 @@ Out of scope for `clone.tla`:
 - Block-level COW divergence after clone — dead-list spec
   territory.
 - Cross-dataset reflinks (ARCH §8.6.3) — separate.
+
+### `dead_list.tla` — block-level dead-list maintenance (P6-deadlist spec scaffold)
+
+Models block-level reachability + per-snapshot dead-list incremental
+maintenance during COW + ZFS-style snapshot delete. Closes ROADMAP
+§9.2 exit criterion #2 (snap delete proportional to blocks freed,
+not total tree).
+
+The algorithm:
+
+- Each block is added to live_blocks at `WriteBlock`.
+- `OverwriteBlock(b)` (COW) removes b from live_blocks. If a
+  most-recent snapshot exists, b is APPENDED to that snap's
+  dead-list. If no snap exists, b is freed immediately.
+- `SnapDelete(s)` partitions S's dead-list:
+  - `unique = snap_dead[s] − successor.snap_dead` → freed.
+  - `surviving = snap_dead[s] ∩ successor.snap_dead` → migrated to
+    predecessor's dead-list (predecessor takes responsibility on
+    its eventual delete). If no predecessor, surviving is dropped
+    (successor still tracks them).
+
+Invariants:
+
+- `TypeOK`.
+- `BlocksTrackedSomewhere` — every block in `used` is in
+  `live_blocks`, `freed`, or some present snap's dead-list. The
+  load-bearing invariant: blocks aren't lost.
+- `NoDoubleFree` (= `NoDeadListContainsFreed`) — `freed` and
+  `snap_dead[s]` are disjoint for every present snap. Prevents a
+  freed block from being re-freed via subsequent SnapDelete.
+- `LiveDisjointFromDead` — live blocks aren't in any dead-list.
+- `LiveDisjointFromFreed` — live blocks aren't freed.
+- `FreedDisjointFromDead` — freed blocks aren't in any dead-list
+  (PRESENT or ABSENT).
+- `SnapIdMonotonic` — ids only grow.
+
+CONSTANTS:
+
+- `MaxBlocks ≥ 1` — bound on block ids.
+- `MaxSnaps ≥ 1` — bound on snapshot ids.
+- `BuggyOverwriteForgetsDead` — Overwrite removes from live without
+  tracking → BlocksTrackedSomewhere fires.
+- `BuggyDeleteForgetsFree` — SnapDelete clears snap_dead[s] without
+  freeing unique → BlocksTrackedSomewhere fires.
+- `BuggyMergeIncludesFreed` — merge step carries ALL of S's
+  dead-list (including just-freed) into predecessor → NoDoubleFree
+  fires (block in both freed and pred.snap_dead).
+
+Actions:
+
+- `WriteBlock(b)` — allocate b, add to live.
+- `OverwriteBlock(b)` — COW: live → most_recent_snap.dead (or freed
+  if no snap).
+- `SnapCreate` — bump next_snap_id, mark PRESENT, become
+  most_recent_snap.
+- `SnapDelete(s)` — incremental free + merge per the algorithm
+  above.
+
+Out of scope:
+
+- Snapshot lifecycle (chain integrity, holds) — covered by
+  `snapshot.tla`.
+- Multi-snap-holding (a block held by ≥2 snaps' dead-lists at
+  once). The spec models single-dead-list ownership: each COW puts
+  the block in exactly one snap's dead. A future spec extension
+  could model multi-holding for tighter `BuggyForgetMerge` /
+  `BuggyAlwaysFreeAll` proofs (those didn't fire in the bounded
+  single-ownership model).
+- Persistent dead-list bytes — engineering chunk for the C impl.
 
 ## Running TLC
 

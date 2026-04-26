@@ -151,6 +151,9 @@ closed items.
 | **NO_ORIGIN / NO_PARENT / NO_PREV** | Sentinel values (all `((uint64_t)0)`) for absent references in dataset / snapshot fields. Disambiguate by FIELD they occupy, not by value. |
 | **`ub_main_root` / `ub_snap_root`** | Uberblock bptrs for the dataset / snapshot index trees. Populated post-P6-persist (`348d165`); content kinds `STM_BPTR_KIND_DATASET` (=9) and `STM_BPTR_KIND_SNAP` (=5). |
 | **`ub_main_root_gen` / `ub_snap_root_gen`** | AEAD gen trackers (le64) for the corresponding trees, symmetric to `ub_alloc_root_gen`. Required for mount-claim UBs that advance `ub_gen` past orphan writes without rewriting the trees. |
+| **dead-list** | Per-snapshot list of blocks that have been COW'd-away from the live dataset since the snapshot was created. On snapshot delete, blocks UNIQUE to the snap (not in successor's dead-list) are freed; SURVIVING blocks (in both S's and successor's dead-list) migrate to predecessor's dead-list. Algorithm is O(blocks COW'd during S's lifetime), not O(tree). ARCH §8.5.5; spec `dead_list.tla`. |
+| **next_dead** | Synonym for the per-snapshot dead-list (ZFS terminology). The "next" reflects "next snapshot to be deleted will free or migrate these blocks". |
+| **most_recent_snap** | The newest PRESENT snapshot. New COW'd blocks are added to its dead-list. After SnapDelete of the most-recent, recomputed by walking PRESENT snaps. |
 
 ## Policy terms
 
