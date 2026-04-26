@@ -38,8 +38,8 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: TBD (P6-1 spec-scaffold landing — `bptr.tla` +
-  configs + 10-specs.md catalog entry; bumps spec count from 13
+- **Tip**: `032db86` (P6-1 spec scaffold: `bptr.tla` + 3 configs
+  + 10-specs.md catalog entry; bumps spec posture from 13
   modules / 16 fixed configs / 6 buggy demos to 14 / 17 / 8).
   Phase 5 tagged `phase-5-complete` at `461e68e`.
 - **Phases**: 1–5 complete; **Phase 6 entered 2026-04-26**.
