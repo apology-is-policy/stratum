@@ -874,11 +874,12 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
  *     ciphertext+tag at that paddr (using the same nonce + AD shape as
  *     `stm_sync_write_extent`) and return STM_SCRUB_VERIFY_OK on
  *     success or STM_SCRUB_VERIFY_UNREPAIRABLE on AEAD-tag failure /
- *     bdev I/O error. Replica reconstruction is not yet implemented —
- *     bptr.tla's full replica-walk + rewrite protocol awaits the
- *     replica-aware allocator and extent record extension. Until
- *     then, AEAD-tag failure means "no surviving redundancy" and the
- *     block is reported UNREPAIRABLE (matching bptr.tla's
+ *     bdev I/O error / transient resource shortfall. Replica
+ *     reconstruction is not yet implemented — bptr.tla's full
+ *     replica-walk + rewrite protocol awaits the replica-aware
+ *     allocator and extent record extension. Until then, AEAD-tag
+ *     failure means "no surviving redundancy" and the block is
+ *     reported UNREPAIRABLE (matching bptr.tla's
  *     `NoOriginalOKMeansUnrepairable` corner).
  *
  *   - paddr does NOT match a live extent (mid-extent block, metadata
@@ -888,6 +889,39 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
  *     allocated blocks (metadata, bootstrap) have no extent-level
  *     verify path in this MVP — operator-visible coverage is
  *     "extent-data only" until per-block-kind verify lands.
+ *
+ * Transient-error caveat (R37 P2-1): the cb does not distinguish
+ * between persistent corruption (AEAD-tag failure on quiescent
+ * data) and transient failures (`malloc` returning NULL,
+ * `stm_bdev_read` returning STM_EIO, the device's bdev disappearing
+ * mid-step). All five transient modes — `cbuf`/`pbuf` malloc fail,
+ * bdev_read non-OK, NULL bdev from `stm_pool_device_bdev`, zero
+ * `stm_aead_tag_len` — charge to STM_SCRUB_VERIFY_UNREPAIRABLE,
+ * which is semantically a permanent data-loss attestation per ARCH
+ * §7.16.2. Operators MUST NOT alert solely on `blocks_unrepairable`
+ * — a near-OOM scrub run will libel healthy blocks. A future API
+ * extension (transient outcome enum + separate counter) will give
+ * operators a clean signal; until then, treat
+ * `blocks_unrepairable` as a "investigate, don't auto-replace"
+ * threshold.
+ *
+ * Concurrency (R37 P2-2): the cb does NOT acquire `sync->lock`. It
+ * borrows `extent_idx`, `pool_uuid`, `metadata_key`, and `pool` as
+ * immutable post-create state, plus `extent_idx`'s internal mutex
+ * for the lookup. Concurrent `stm_sync_write_extent` /
+ * `stm_sync_commit` activity during a `stm_scrub_step` call is
+ * therefore permitted by the lock graph but is NOT race-free at
+ * the data plane: a `(rec.paddr, rec.gen)` pair returned by the
+ * lookup can become stale across a commit-promote-PENDING-then-
+ * reuse boundary, with the cb's subsequent `stm_bdev_read`
+ * observing the new ciphertext while attempting decrypt under
+ * the old gen → false-positive UNREPAIRABLE. Callers MUST EITHER:
+ * (a) quiesce all `stm_sync_write_extent` / `stm_sync_commit`
+ * activity for the duration of every `stm_scrub_step` call, OR
+ * (b) run scrub on a snapshot-mounted view that does not share
+ * paddrs with live writes. Multi-writer harnesses without one
+ * of these provisions can produce intermittent UNREPAIRABLE
+ * phantoms uncorrelated with on-disk corruption.
  *
  * Lifetime contract: `sync` is borrowed (the cb's ctx) and MUST
  * outlive `sc`. Callers MUST close scrub BEFORE closing sync (per

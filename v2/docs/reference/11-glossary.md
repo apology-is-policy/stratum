@@ -142,6 +142,7 @@ closed items.
 | R34 | P7-2 extent index C impl (in-RAM MVP per extent.tla). | `433d2dd` |
 | R35 | P7-3 extent persistence (UB v11→v12 + sync wire-in). | `b223975` |
 | R36 | P7-4 fs.c/sync.c COW path integration (extent → dead-list / alloc-free routing). | `64a6278` |
+| R37 | P7-5 production scrub β verify-callback (paddr→bptr resolver via extent walk). | `<TBD>` |
 
 ## Phase 6 / clone terms
 
@@ -172,6 +173,8 @@ closed items.
 | **dropped paddrs** | Output of `stm_extent_overwrite` / `_truncate` / `_delete_file` — a malloc'd array of paddrs whose extents were just removed. Caller owns the array (`free()`) and MUST route each paddr through `stm_snapshot_index_overwrite_block` to compose with dead_list.tla. P7-4's `sync_drop_paddr_locked` is the production routing helper. |
 | **sync_drop_paddr_locked** | sync.c helper (P7-4) realizing the C-impl boundary between extent.tla::Overwrite, dead_list.tla::OverwriteBlock, and allocator.tla::Free. For each dropped paddr: route via `stm_snapshot_index_overwrite_block` → if `should_free=true`, call `stm_alloc_free` on the device's allocator (selected via `stm_paddr_device`); else, the paddr stays in the most-recent snapshot's dead-list until that snapshot is deleted. |
 | **stm_fs_write / stm_fs_read** | POSIX-shape extent I/O API (P7-4). Thin fs.c wrappers over `stm_sync_write_extent` / `stm_sync_read_extent`. MVP constraints: 4-KiB-aligned + len ≤ 128 KiB + single-extent per call. Encryption uses pool-wide `metadata_key`. |
+| **stm_extent_lookup_by_paddr** | Read-path helper (P7-5) — exact-paddr lookup over the live extent records. O(n) linear scan; first match wins by live-paddr `PaddrFreshness`. Returns `STM_ENOENT` for non-base paddrs (mid-extent, metadata, bootstrap, scrub durable region). The production scrub cb is the primary consumer. |
+| **production scrub cb** | The bptr-aware β verify-callback shipped in P7-5 via `stm_sync_scrub_install_production_cb`. Resolves each scanned paddr via `stm_extent_lookup_by_paddr`, AEAD-decrypts the matched extent's ciphertext+tag, and returns `STM_SCRUB_VERIFY_OK` on tag-pass / `STM_SCRUB_VERIFY_UNREPAIRABLE` on tag-fail. Mid-extent paddrs + non-extent allocs return OK trivially. Maps to `bptr.tla`'s `NReplicas=1` corner — the full replica-walk + rewrite (`ScanRead` × `RewriteReplica`) awaits the extent record's replica-list extension. |
 
 ## Policy terms
 

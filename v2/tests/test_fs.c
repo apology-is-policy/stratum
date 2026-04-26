@@ -11,6 +11,7 @@
  *   - stats report accurate current_gen + allocated_blocks.
  */
 #include "tharness.h"
+#include <stratum/alloc.h>
 #include <stratum/extent.h>
 #include <stratum/fs.h>
 #include <stratum/fs_testing.h>
@@ -632,6 +633,28 @@ static void run_scrub_to_completion(stm_scrub *sc) {
     STM_ASSERT(false);   /* didn't drain in 4096 steps. */
 }
 
+/* Walk every device's alloc tree to compute the exact total of
+ * blocks currently marked allocated. R37 P2-3: scrub asserts use
+ * this for strict equality, not the prior `>=` lower bound. */
+static uint64_t alloc_tree_total_blocks(stm_sync *sync) {
+    uint64_t total = 0;
+    /* Single-device pool by construction in test_fs harness. */
+    stm_alloc *a0 = stm_sync_alloc(sync, 0);
+    STM_ASSERT_TRUE(a0 != NULL);
+    uint64_t cursor_block = 0;
+    for (;;) {
+        uint64_t paddr = 0, length = 0;
+        stm_status s = stm_alloc_first_allocated_from(a0, cursor_block,
+                                                          &paddr, &length);
+        if (s == STM_ENOENT) break;
+        STM_ASSERT_OK(s);
+        total += length;
+        cursor_block = stm_paddr_offset(paddr) + length;
+        if (cursor_block >= (UINT64_C(1) << 48)) break;
+    }
+    return total;
+}
+
 STM_TEST(fs_io_scrub_production_cb_verifies_extents) {
     /* End-to-end: write a handful of extents, install the production
      * scrub cb, run scrub to completion, expect every block charged
@@ -656,6 +679,14 @@ STM_TEST(fs_io_scrub_production_cb_verifies_extents) {
     /* Install cb on a fresh scrub handle. */
     stm_sync *sync = stm_fs_sync_for_test(fs);
     STM_ASSERT_TRUE(sync != NULL);
+
+    /* Compute the exact total alloc tree blocks BEFORE scrub starts
+     * so the post-scrub verified count can be compared with strict
+     * equality (R37 P2-3 — guards against an "always-OK" or
+     * "double-charge" buggy cb). */
+    uint64_t expected_blocks = alloc_tree_total_blocks(sync);
+    STM_ASSERT(expected_blocks >= 3u);
+
     stm_scrub *sc = NULL;
     STM_ASSERT_OK(stm_scrub_create(sync, &sc));
     STM_ASSERT_OK(stm_sync_scrub_install_production_cb(sync, sc));
@@ -671,10 +702,11 @@ STM_TEST(fs_io_scrub_production_cb_verifies_extents) {
     /* No corruption injected — every block charges to verified. */
     STM_ASSERT_EQ(st.blocks_unrepairable, 0u);
     STM_ASSERT_EQ(st.blocks_repaired,     0u);
-    /* At least the extent base paddrs must verify (3 extents → ≥3
-     * blocks_verified). The total includes metadata + bootstrap blocks
-     * the cb returns OK for trivially. */
-    STM_ASSERT(st.blocks_verified >= 3u);
+    /* Strict equality: every alloc-tree block charges exactly once
+     * to verified, none to repaired/unrepairable. Catches an
+     * "always-OK" buggy cb (would still pass `>=3`) AND a
+     * double-charge bug (would push verified above expected). */
+    STM_ASSERT_EQ(st.blocks_verified, expected_blocks);
 
     stm_scrub_close(sc);
     STM_ASSERT_OK(stm_fs_unmount(fs));
@@ -725,6 +757,13 @@ STM_TEST(fs_io_scrub_production_cb_detects_corruption) {
     /* Remount + scrub with production cb. */
     STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
     sync = stm_fs_sync_for_test(fs);
+
+    /* Compute exact alloc-tree total before scrub. The corrupted
+     * extent's base paddr will charge UNREPAIRABLE; every other
+     * block charges to verified. R37 P2-3 strict-equality assertion. */
+    uint64_t expected_blocks = alloc_tree_total_blocks(sync);
+    STM_ASSERT(expected_blocks >= 1u);
+
     stm_scrub *sc = NULL;
     STM_ASSERT_OK(stm_scrub_create(sync, &sc));
     STM_ASSERT_OK(stm_sync_scrub_install_production_cb(sync, sc));
@@ -735,8 +774,12 @@ STM_TEST(fs_io_scrub_production_cb_detects_corruption) {
     STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
     STM_ASSERT_EQ((int)st.state, (int)STM_SCRUB_STATE_COMPLETED);
     STM_ASSERT_EQ(st.blocks_failed, 0u);   /* β-mode: failed = 0. */
-    /* The corrupted extent's base paddr must charge UNREPAIRABLE. */
-    STM_ASSERT(st.blocks_unrepairable >= 1u);
+    /* Exactly one block charges UNREPAIRABLE (the corrupted extent's
+     * base); the rest charge to verified. ProcessedCount holds:
+     * verified + unrepairable = expected_blocks. */
+    STM_ASSERT_EQ(st.blocks_unrepairable, 1u);
+    STM_ASSERT_EQ(st.blocks_repaired,     0u);
+    STM_ASSERT_EQ(st.blocks_verified, expected_blocks - 1u);
 
     stm_scrub_close(sc);
     STM_ASSERT_OK(stm_fs_unmount(fs));
@@ -769,6 +812,12 @@ STM_TEST(fs_io_scrub_production_cb_charges_mid_extent_blocks_to_ok) {
     STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, buf, sizeof buf));
 
     stm_sync *sync = stm_fs_sync_for_test(fs);
+    /* R37 P2-3 strict equality: every alloc-tree block charges to
+     * verified — including the mid-extent paddrs that return OK
+     * trivially. */
+    uint64_t expected_blocks = alloc_tree_total_blocks(sync);
+    STM_ASSERT(expected_blocks >= 3u);   /* 8 KiB + tag ≥ 3 blocks. */
+
     stm_scrub *sc = NULL;
     STM_ASSERT_OK(stm_scrub_create(sync, &sc));
     STM_ASSERT_OK(stm_sync_scrub_install_production_cb(sync, sc));
@@ -781,8 +830,7 @@ STM_TEST(fs_io_scrub_production_cb_charges_mid_extent_blocks_to_ok) {
     STM_ASSERT_EQ(st.blocks_failed,      0u);
     STM_ASSERT_EQ(st.blocks_unrepairable,0u);
     STM_ASSERT_EQ(st.blocks_repaired,    0u);
-    /* The 8 KiB extent + tag spans ≥ 3 blocks; all charge to verified. */
-    STM_ASSERT(st.blocks_verified >= 3u);
+    STM_ASSERT_EQ(st.blocks_verified,    expected_blocks);
 
     stm_scrub_close(sc);
     STM_ASSERT_OK(stm_fs_unmount(fs));

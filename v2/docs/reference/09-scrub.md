@@ -645,6 +645,26 @@ Deferred (γ-scope / future):
   block reported `UNREPAIRABLE` per scrub even when a healthy
   replica exists on another device — the full replica walk is the
   next chunk.
+- **R37 P2-1 transient-error overload**: the P7-5 production cb
+  charges every non-OK outcome to `STM_SCRUB_VERIFY_UNREPAIRABLE` —
+  including transient `malloc` failures, `bdev_read` STM_EIO,
+  `stm_pool_device_bdev` returning NULL (mid-replace race), and
+  zero `stm_aead_tag_len`. Operators MUST NOT auto-replace devices
+  on a single `blocks_unrepairable` reading; a near-OOM scrub run
+  will libel healthy blocks. A future API extension (transient
+  outcome enum + separate `blocks_skipped_transient` counter) will
+  give operators a clean signal. Until then treat
+  `blocks_unrepairable` as an "investigate, don't auto-replace"
+  threshold.
+- **R37 P2-2 concurrency**: the P7-5 production cb does NOT take
+  `sync->lock`; it borrows extent_idx's mutex briefly during
+  lookup but does NOT serialize against concurrent
+  `stm_sync_write_extent` / `stm_sync_commit`. A
+  commit-promote-PENDING-then-reuse window between the lookup and
+  the cb's `bdev_read` can cause false-positive `UNREPAIRABLE`.
+  Callers MUST quiesce all `stm_sync_write_extent` / `stm_sync_commit`
+  for the duration of every `stm_scrub_step`, OR run scrub on a
+  snapshot-mounted view.
 - **FAULTED-device blocks are skipped silently**. Status_get
   gives no indication that coverage was degraded. Operators
   monitoring "scrub finished without errors" may misread the

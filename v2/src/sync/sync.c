@@ -3835,7 +3835,13 @@ sync_scrub_verify_cb(uint64_t paddr, void *ctx)
     if (ls != STM_OK)     return STM_SCRUB_VERIFY_UNREPAIRABLE;
 
     /* Look up the bdev for the extent's device. pool is rdlock-held
-     * by scrub; stm_pool_device_bdev is a pure deref of the snapshot. */
+     * by scrub; stm_pool_device_bdev is a pure deref of the
+     * already-rdlock-snapshot pool struct (pool.c ~493-496). R37 P3-2:
+     * this MUST remain lockless under pool.rdlock — if a future pool
+     * rework adds internal locking inside stm_pool_device_bdev (e.g.,
+     * a per-device rwlock), the scrub cb's lock-order claim
+     * (sc.lock → pool.rdlock → extent_idx.lock) silently changes and
+     * this comment should be revisited. */
     uint16_t dev = stm_paddr_device(rec.paddr);
     stm_bdev *bd = stm_pool_device_bdev(s->pool, dev);
     if (!bd) return STM_SCRUB_VERIFY_UNREPAIRABLE;
@@ -3845,6 +3851,20 @@ sync_scrub_verify_cb(uint64_t paddr, void *ctx)
     stm_aead_mode mode = STM_AEAD_AEGIS256;
     size_t tag_len = stm_aead_tag_len(mode);
     if (tag_len == 0) return STM_SCRUB_VERIFY_UNREPAIRABLE;
+
+    /* Defensive cap on rec.len. The write path enforces
+     * STM_FS_RECORDSIZE_MAX (128 KiB) before insert, but a hostile
+     * on-disk btree blob could in theory present an extent with
+     * len up to the EX_LEN_MAX_24BIT cap (~16 MiB) that decodes
+     * cleanly. Refuse any extent whose plaintext exceeds the live
+     * write-path cap — the bytes were never legitimately written
+     * via stm_sync_write_extent, so AEAD verify would fail anyway,
+     * and a multi-MiB malloc per scrub block is a memory-pressure
+     * concern. Charging UNREPAIRABLE is also semantically right:
+     * the extent's structure doesn't match what the encrypt path
+     * would have produced. */
+    if (rec.len == 0 || rec.len > STM_FS_RECORDSIZE_MAX)
+        return STM_SCRUB_VERIFY_UNREPAIRABLE;
 
     size_t total_bytes = rec.len + tag_len;
     void *cbuf = malloc(total_bytes);
