@@ -38,11 +38,13 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `3db8b5e` (P6-5 spec scaffold: `clone.tla` — clone
-  lifecycle + snap-with-clones-undeletable + promote-breaks-
-  dependency). Phase 5 tagged `phase-5-complete` at `461e68e`.
-  Spec posture **bumped to 18 modules / 21 fixed configs / 16
-  buggy demos**.
+- **Tip**: `02a9b32` (phase6-status.md remaining-work table —
+  ground-truth view of Phase 6 pending items alongside the
+  memory/project_v2_next_session.md primer; persistent storage
+  is the primed next chunk). Spec scaffold for clone landed at
+  `3db8b5e` + hash fixup `354ec11`. Phase 5 tagged
+  `phase-5-complete` at `461e68e`. Spec posture: 18 modules /
+  21 fixed configs / 16 buggy demos.
 - **Phases**: 1–5 complete; **Phase 6 entered 2026-04-26**.
   Spec scaffolds: P6-1 (bptr.tla) `032db86`; P6-2 (dataset.tla)
   `75f6a3f`; P6-3 (snapshot.tla) `8813027`; P6-4 (property.tla)
