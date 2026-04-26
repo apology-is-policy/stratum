@@ -38,10 +38,10 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: TBD (P6-2 spec scaffold: `dataset.tla` + 4 configs
-  + 10-specs.md catalog entry; bumps spec posture to 15 modules
-  / 18 fixed configs / 11 buggy demos). Phase 5 tagged
-  `phase-5-complete` at `461e68e`.
+- **Tip**: `75f6a3f` (P6-2 spec scaffold: `dataset.tla` + 4
+  configs + 10-specs.md catalog entry; bumps spec posture to
+  15 modules / 18 fixed configs / 11 buggy demos). Phase 5
+  tagged `phase-5-complete` at `461e68e`.
 - **Phases**: 1–5 complete; **Phase 6 entered 2026-04-26**.
   P6-1 (bptr.tla protocol spec) landed at `032db86`. P6-2
   (dataset.tla hierarchy spec) landing this commit. C
