@@ -38,7 +38,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: TBD (P6-5 spec scaffold: `clone.tla` — clone
+- **Tip**: `3db8b5e` (P6-5 spec scaffold: `clone.tla` — clone
   lifecycle + snap-with-clones-undeletable + promote-breaks-
   dependency). Phase 5 tagged `phase-5-complete` at `461e68e`.
   Spec posture **bumped to 18 modules / 21 fixed configs / 16
