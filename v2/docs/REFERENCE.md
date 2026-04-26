@@ -38,24 +38,23 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `000d394` (P6-3 C impl R29 audit close: 0 P0 / 0 P1 /
-  3 P2 / 4 P3 + a self-audit P1 carry-back to dataset module —
-  ERRORCHECK pthread mutex now wrapped in must_lock/must_unlock
-  helpers that abort on EDEADLK, in both modules). Substantive
-  landed at `34d89f5`. Phase 5 tagged `phase-5-complete` at
-  `461e68e`. Spec posture unchanged at 17/20/15.
+- **Tip**: `8be3628` (P6-4 C impl R30 audit close: 0 P0 / 0 P1 /
+  2 P2 / 4 P3, all 6 addressed). Substantive landed at `3527fe2`.
+  Phase 5 tagged `phase-5-complete` at `461e68e`. Spec posture
+  unchanged at 17/20/15.
 - **Phases**: 1–5 complete; **Phase 6 entered 2026-04-26**.
   Spec scaffolds: P6-1 (bptr.tla) `032db86`; P6-2 (dataset.tla)
   `75f6a3f`; P6-3 (snapshot.tla) `8813027`; P6-4 (property.tla)
-  `2b6f248`. C impls: P6-2 dataset (in-RAM MVP) `6dbf8f0` + R28
-  close `bdb888b`; P6-3 snapshot (in-RAM MVP) `34d89f5` + R29
-  close `000d394`. Phase 7 pre-work FastCDC `5cb8900` + R27
-  close `a2ffd38`. Pending: persistent storage hookup; property
-  C impl; block-level dead-list + clone specs; production scrub
-  cb (still blocked on paddr→bptr resolver).
+  `2b6f248`. C impls: P6-2 dataset `6dbf8f0` + R28 `bdb888b`;
+  P6-3 snapshot `34d89f5` + R29 `000d394`; P6-4 property
+  `3527fe2` + R30 `8be3628`. Phase 7 pre-work FastCDC
+  `5cb8900` + R27 close `a2ffd38`. **All 4 P6 specs now have
+  in-RAM MVP C impls.** Pending: persistent storage hookup;
+  block-level dead-list + clone specs; production scrub cb
+  (still blocked on paddr→bptr resolver).
 - **Tests**: 31 suites × (default + ASan + TSan, serial) green.
   test_sync_multi 42; test_pool 48; test_scrub 30; test_alloc 32;
-  test_cdc 12; test_dataset 28; test_snapshot 22.
+  test_cdc 12; test_dataset 40; test_snapshot 22.
 - **Specs**: 17 TLA+ modules clean (20 fixed configs: legacy +
   scrub_beta + scrub_durable + scrub_beta_durable + bptr +
   dataset + snapshot + property) + 15 buggy-demo configs fire
