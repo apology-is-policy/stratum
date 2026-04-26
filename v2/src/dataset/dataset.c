@@ -353,15 +353,16 @@ stm_status stm_dataset_create_child(stm_dataset_index *idx,
 
     uint64_t id = idx->next_id++;
     dataset_slot *s = &idx->slots[new_slot];
-    s->e.id          = id;
-    s->e.parent_id   = parent_id;
-    s->e.name_len    = (uint32_t)name_len;
+    s->e.id              = id;
+    s->e.parent_id       = parent_id;
+    s->e.name_len        = (uint32_t)name_len;
     memcpy(s->e.name, name, name_len);
     s->e.name[name_len] = '\0';
-    s->e.created_txg = idx->current_txg;
-    s->e.flags       = 0;
-    s->e.next_ino    = 0;
-    s->present       = true;
+    s->e.created_txg     = idx->current_txg;
+    s->e.flags           = 0;
+    s->e.next_ino        = 0;
+    s->e.origin_snap_id  = STM_DATASET_NO_ORIGIN;  /* not a clone */
+    s->present           = true;
 
     *out_id = id;
     idx->dirty = true;
@@ -677,6 +678,122 @@ stm_status stm_dataset_effective_property(const stm_dataset_index *idx,
     return STM_OK;
 }
 
+/* ------------------------------------------------------------------ */
+/* Clone API (P6-clone).                                              */
+/* ------------------------------------------------------------------ */
+
+stm_status stm_dataset_create_clone(stm_dataset_index *idx,
+                                       uint64_t parent_id,
+                                       const char *name,
+                                       uint64_t origin_snap_id,
+                                       uint64_t *out_id) {
+    if (!idx || !name || !out_id) return STM_EINVAL;
+    if (origin_snap_id == STM_DATASET_NO_ORIGIN) return STM_EINVAL;
+    *out_id = 0;
+    size_t name_len = strlen(name);
+    if (name_len == 0 || name_len > STM_DATASET_NAME_MAX) return STM_EINVAL;
+
+    must_lock(&idx->lock);
+
+    if (idx->next_id == UINT64_MAX || idx->current_txg == UINT64_MAX) {
+        must_unlock(&idx->lock);
+        return STM_EOVERFLOW;
+    }
+
+    if (!is_present_locked(idx, parent_id)) {
+        must_unlock(&idx->lock);
+        return STM_ENOENT;
+    }
+    if (sibling_name_taken_locked(idx, parent_id,
+                                    (const uint8_t *)name, (uint32_t)name_len,
+                                    0)) {
+        must_unlock(&idx->lock);
+        return STM_EEXIST;
+    }
+
+    size_t new_slot = append_slot_locked(idx);
+    if (new_slot == (size_t)-1) {
+        must_unlock(&idx->lock);
+        return STM_ENOMEM;
+    }
+
+    /* Same txg-bump-then-stamp as create_child. */
+    idx->current_txg += 1;
+
+    uint64_t id = idx->next_id++;
+    /* P6-clone: a clone cannot reference its own id. Defends against a
+     * caller that fabricates origin_snap_id from a UUID-like source. */
+    if (origin_snap_id == id) {
+        /* Roll back the slot allocation + counter advances so the
+         * caller-visible state is unchanged on this failure. */
+        idx->slots_len--;
+        idx->next_id--;
+        idx->current_txg--;
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
+    dataset_slot *s = &idx->slots[new_slot];
+    s->e.id              = id;
+    s->e.parent_id       = parent_id;
+    s->e.name_len        = (uint32_t)name_len;
+    memcpy(s->e.name, name, name_len);
+    s->e.name[name_len] = '\0';
+    s->e.created_txg     = idx->current_txg;
+    s->e.flags           = 0;
+    s->e.next_ino        = 0;
+    s->e.origin_snap_id  = origin_snap_id;
+    s->present           = true;
+
+    *out_id = id;
+    idx->dirty = true;
+
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+stm_status stm_dataset_promote(stm_dataset_index *idx, uint64_t id) {
+    if (!idx) return STM_EINVAL;
+    must_lock(&idx->lock);
+    size_t s = find_slot_locked(idx, id);
+    if (s == (size_t)-1 || !idx->slots[s].present) {
+        must_unlock(&idx->lock);
+        return STM_ENOENT;
+    }
+    /* clone.tla::Promote precondition: dataset must be a clone. */
+    if (idx->slots[s].e.origin_snap_id == STM_DATASET_NO_ORIGIN) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
+    idx->slots[s].e.origin_snap_id = STM_DATASET_NO_ORIGIN;
+    idx->dirty = true;
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+stm_status stm_dataset_clones_count_for_snap(const stm_dataset_index *idx,
+                                                uint64_t snapshot_id,
+                                                size_t *out_count) {
+    if (!idx || !out_count) return STM_EINVAL;
+    *out_count = 0;
+    if (snapshot_id == STM_DATASET_NO_ORIGIN) {
+        /* The sentinel never matches a real clone reference; fast-path
+         * short-circuit so a caller scanning for "any clones?" doesn't
+         * walk the array uselessly. */
+        return STM_OK;
+    }
+    pthread_mutex_t *lock = dataset_lock(idx);
+    must_lock(lock);
+    size_t n = 0;
+    for (size_t i = 0; i < idx->slots_len; i++) {
+        const dataset_slot *s = &idx->slots[i];
+        if (!s->present) continue;
+        if (s->e.origin_snap_id == snapshot_id) n++;
+    }
+    *out_count = n;
+    must_unlock(lock);
+    return STM_OK;
+}
+
 /* =========================================================================
  * Persistence (P6-persist).
  *
@@ -690,12 +807,16 @@ stm_status stm_dataset_effective_property(const stm_dataset_index *idx,
  * ========================================================================= */
 
 #define DS_KEY_LEN              8u
-#define DS_VAL_FIXED            56u                          /* before name[] */
+/* P6-clone (v10): value layout is 64 bytes fixed prefix + name_len
+ * bytes for the name. The 8 bytes at offset 56..64 hold
+ * origin_snap_id (le64); STM_DATASET_NO_ORIGIN (0) for non-clones,
+ * snapshot id otherwise. Pre-v10 was 56 + name_len. */
+#define DS_VAL_FIXED            64u
 #define DS_VAL_MAX              (DS_VAL_FIXED + STM_DATASET_NAME_MAX)
 #define DS_POOL_DEFAULTS_KEY    UINT64_C(0)
 #define DS_POOL_DEFAULTS_VAL_LEN  (8u * STM_PROP_COUNT)
 
-/* DS_VAL_MAX = 311 bytes, well under any btnode-leaf cap; if a future
+/* DS_VAL_MAX = 319 bytes, well under any btnode-leaf cap; if a future
  * STM_DATASET_NAME_MAX bump pushes past one leaf, the encode would
  * fail at stm_btree_mt_insert with STM_ERANGE. Keeping the math here
  * as a comment for reviewers. */
@@ -729,8 +850,9 @@ static size_t ds_encode_dataset_value(const dataset_slot *s,
     for (unsigned p = 0; p < STM_PROP_COUNT; p++) {
         if (s->local_set[p]) bitmap |= (uint16_t)(1u << p);
     }
-    le16 lsb  = stm_store_le16(bitmap);
-    le16 nlen = stm_store_le16((uint16_t)s->e.name_len);
+    le16 lsb    = stm_store_le16(bitmap);
+    le16 nlen   = stm_store_le16((uint16_t)s->e.name_len);
+    le64 origin = stm_store_le64(s->e.origin_snap_id);
 
     memcpy(out + 0,  parent.v, 8);
     memcpy(out + 8,  ctxg.v,   8);
@@ -742,6 +864,7 @@ static size_t ds_encode_dataset_value(const dataset_slot *s,
         le64 v = stm_store_le64(s->local_value[p]);
         memcpy(out + 32u + p * 8u, v.v, 8);
     }
+    memcpy(out + 56, origin.v, 8);    /* P6-clone: origin_snap_id */
     if (s->e.name_len > 0) {
         memcpy(out + DS_VAL_FIXED, s->e.name, s->e.name_len);
     }
@@ -790,6 +913,9 @@ static stm_status ds_decode_dataset_value(uint64_t id, const uint8_t *in,
         out_slot->local_value[p] = stm_load_le64(v);
         out_slot->local_set[p]   = (bitmap & (uint16_t)(1u << p)) != 0;
     }
+    le64 origin;
+    memcpy(origin.v, in + 56, 8);
+    out_slot->e.origin_snap_id = stm_load_le64(origin);
     if (name_len > 0) {
         memcpy(out_slot->e.name, in + DS_VAL_FIXED, name_len);
     }
@@ -1178,11 +1304,21 @@ static stm_status ds_validate_shadow(const ds_load_ctx *lc) {
         if (si->e.id == STM_DATASET_ROOT_ID) {
             /* Root must have NO_PARENT; corrupt otherwise. */
             if (si->e.parent_id != STM_DATASET_NO_PARENT) return STM_ECORRUPT;
+            /* P6-clone: root is never a clone (clone.tla::RootInvariant). */
+            if (si->e.origin_snap_id != STM_DATASET_NO_ORIGIN)
+                return STM_ECORRUPT;
             continue;
         }
         /* Non-root: parent_id must be set and must NOT equal own id. */
         if (si->e.parent_id == STM_DATASET_NO_PARENT) return STM_ECORRUPT;
         if (si->e.parent_id == si->e.id) return STM_ECORRUPT;
+        /* P6-clone: a clone's origin_snap_id cannot equal its own id
+         * (datasets and snapshots use disjoint id-spaces in the spec
+         * but the impl shares the type — so origin == own_id is a
+         * malformed reference). The cross-module "snap exists"
+         * invariant (CloneOriginPresent) is enforced at delete time
+         * via the snapshot module's clone-check cb, not here. */
+        if (si->e.origin_snap_id == si->e.id) return STM_ECORRUPT;
         /* Parent must reference an existing shadow slot. */
         bool parent_found = false;
         for (size_t j = 0; j < lc->shadow_len; j++) {

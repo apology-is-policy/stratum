@@ -1081,6 +1081,138 @@ STM_TEST(prop_concurrent_set_clear_effective) {
 }
 
 /* ====================================================================== */
+/* Clone API (P6-clone).                                                    */
+/* ====================================================================== */
+
+STM_TEST(clone_create_basic) {
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+
+    uint64_t clone_id = 0;
+    STM_ASSERT_OK(stm_dataset_create_clone(idx, STM_DATASET_ROOT_ID,
+                                              "myclone",
+                                              /*origin=*/42, &clone_id));
+    stm_dataset_entry e;
+    STM_ASSERT_OK(stm_dataset_lookup(idx, clone_id, &e));
+    STM_ASSERT_EQ(e.origin_snap_id, (uint64_t)42);
+    STM_ASSERT_EQ(e.parent_id, STM_DATASET_ROOT_ID);
+    STM_ASSERT_EQ(memcmp(e.name, "myclone", 7), 0);
+
+    stm_dataset_index_close(idx);
+}
+
+STM_TEST(clone_create_no_origin_rejected) {
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+
+    uint64_t out = 0;
+    STM_ASSERT_ERR(stm_dataset_create_clone(idx, STM_DATASET_ROOT_ID,
+                                               "c", STM_DATASET_NO_ORIGIN, &out),
+                    STM_EINVAL);
+    stm_dataset_index_close(idx);
+}
+
+STM_TEST(clone_create_under_missing_parent_rejected) {
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+
+    uint64_t out = 0;
+    STM_ASSERT_ERR(stm_dataset_create_clone(idx, /*missing parent*/ 999,
+                                               "c", 7, &out),
+                    STM_ENOENT);
+    stm_dataset_index_close(idx);
+}
+
+STM_TEST(clone_create_sibling_collision) {
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+
+    uint64_t a = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID, "x", &a));
+    uint64_t out = 0;
+    STM_ASSERT_ERR(stm_dataset_create_clone(idx, STM_DATASET_ROOT_ID,
+                                               "x", 7, &out),
+                    STM_EEXIST);
+    stm_dataset_index_close(idx);
+}
+
+STM_TEST(promote_clears_origin) {
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+
+    uint64_t c = 0;
+    STM_ASSERT_OK(stm_dataset_create_clone(idx, STM_DATASET_ROOT_ID,
+                                              "c", 99, &c));
+    stm_dataset_entry e;
+    STM_ASSERT_OK(stm_dataset_lookup(idx, c, &e));
+    STM_ASSERT_EQ(e.origin_snap_id, (uint64_t)99);
+
+    STM_ASSERT_OK(stm_dataset_promote(idx, c));
+    STM_ASSERT_OK(stm_dataset_lookup(idx, c, &e));
+    STM_ASSERT_EQ(e.origin_snap_id, STM_DATASET_NO_ORIGIN);
+
+    /* Promote again — non-clone now, refused. */
+    STM_ASSERT_ERR(stm_dataset_promote(idx, c), STM_EINVAL);
+
+    stm_dataset_index_close(idx);
+}
+
+STM_TEST(promote_non_clone_rejected) {
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+
+    uint64_t a = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID, "a", &a));
+    STM_ASSERT_ERR(stm_dataset_promote(idx, a), STM_EINVAL);
+
+    /* Root never a clone either. */
+    STM_ASSERT_ERR(stm_dataset_promote(idx, STM_DATASET_ROOT_ID), STM_EINVAL);
+
+    /* Missing dataset. */
+    STM_ASSERT_ERR(stm_dataset_promote(idx, 999), STM_ENOENT);
+
+    stm_dataset_index_close(idx);
+}
+
+STM_TEST(clones_count_for_snap) {
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+
+    uint64_t c1 = 0, c2 = 0, c3 = 0;
+    STM_ASSERT_OK(stm_dataset_create_clone(idx, STM_DATASET_ROOT_ID,
+                                              "c1", 50, &c1));
+    STM_ASSERT_OK(stm_dataset_create_clone(idx, STM_DATASET_ROOT_ID,
+                                              "c2", 50, &c2));
+    STM_ASSERT_OK(stm_dataset_create_clone(idx, STM_DATASET_ROOT_ID,
+                                              "c3", 60, &c3));
+    size_t n50 = 999, n60 = 999, n70 = 999;
+    STM_ASSERT_OK(stm_dataset_clones_count_for_snap(idx, 50, &n50));
+    STM_ASSERT_OK(stm_dataset_clones_count_for_snap(idx, 60, &n60));
+    STM_ASSERT_OK(stm_dataset_clones_count_for_snap(idx, 70, &n70));
+    STM_ASSERT_EQ(n50, (size_t)2);
+    STM_ASSERT_EQ(n60, (size_t)1);
+    STM_ASSERT_EQ(n70, (size_t)0);
+
+    /* Destroy c1 — count drops to 1 for snap 50. */
+    STM_ASSERT_OK(stm_dataset_destroy(idx, c1));
+    STM_ASSERT_OK(stm_dataset_clones_count_for_snap(idx, 50, &n50));
+    STM_ASSERT_EQ(n50, (size_t)1);
+
+    /* Promote c2 — count drops to 0 for snap 50. */
+    STM_ASSERT_OK(stm_dataset_promote(idx, c2));
+    STM_ASSERT_OK(stm_dataset_clones_count_for_snap(idx, 50, &n50));
+    STM_ASSERT_EQ(n50, (size_t)0);
+
+    /* NO_ORIGIN sentinel always returns 0. */
+    size_t n0 = 999;
+    STM_ASSERT_OK(stm_dataset_clones_count_for_snap(idx, STM_DATASET_NO_ORIGIN,
+                                                       &n0));
+    STM_ASSERT_EQ(n0, (size_t)0);
+
+    stm_dataset_index_close(idx);
+}
+
+/* ====================================================================== */
 /* Persistence (P6-persist).                                                */
 /* ====================================================================== */
 
@@ -1520,6 +1652,70 @@ STM_TEST(dataset_persist_next_id_seeded_after_load) {
     STM_ASSERT_ERR(stm_dataset_index_set_next_id(idx2, 3u), STM_EINVAL);
     /* Forward bump OK. */
     STM_ASSERT_OK(stm_dataset_index_set_next_id(idx2, 100u));
+
+    stm_dataset_index_close(idx2);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(dsp_tmp_path);
+}
+
+STM_TEST(clone_persist_roundtrip) {
+    /* P6-clone v10: clone fields must roundtrip across mount. */
+    dsp_make_tmp("clone_rt");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    dsp_open_fresh(&d, &b);
+
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(idx, DSP_KEY,
+                                                     DSP_POOL_UUID,
+                                                     DSP_DEVICE_UUID));
+    /* Two clones of snap 100, one promoted clone, one regular dataset. */
+    uint64_t reg = 0, c1 = 0, c2 = 0, c3 = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID,
+                                              "regular", &reg));
+    STM_ASSERT_OK(stm_dataset_create_clone(idx, STM_DATASET_ROOT_ID,
+                                              "clone1", 100, &c1));
+    STM_ASSERT_OK(stm_dataset_create_clone(idx, STM_DATASET_ROOT_ID,
+                                              "clone2", 100, &c2));
+    STM_ASSERT_OK(stm_dataset_create_clone(idx, STM_DATASET_ROOT_ID,
+                                              "clone3", 200, &c3));
+    STM_ASSERT_OK(stm_dataset_promote(idx, c3));   /* now non-clone */
+
+    uint64_t paddr = 0; uint8_t cs[32];
+    STM_ASSERT_OK(stm_dataset_index_commit(idx, 1u, &paddr, cs));
+
+    stm_dataset_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+
+    /* Reopen + load + verify clone state preserved. */
+    dsp_reopen(&d, &b);
+    stm_dataset_index *idx2 = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx2));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(idx2, d, b));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(idx2, DSP_KEY,
+                                                      DSP_POOL_UUID,
+                                                      DSP_DEVICE_UUID));
+    STM_ASSERT_OK(stm_dataset_index_load_at(idx2, paddr, 1u, cs));
+
+    stm_dataset_entry e;
+    STM_ASSERT_OK(stm_dataset_lookup(idx2, reg, &e));
+    STM_ASSERT_EQ(e.origin_snap_id, STM_DATASET_NO_ORIGIN);
+    STM_ASSERT_OK(stm_dataset_lookup(idx2, c1, &e));
+    STM_ASSERT_EQ(e.origin_snap_id, (uint64_t)100);
+    STM_ASSERT_OK(stm_dataset_lookup(idx2, c2, &e));
+    STM_ASSERT_EQ(e.origin_snap_id, (uint64_t)100);
+    STM_ASSERT_OK(stm_dataset_lookup(idx2, c3, &e));
+    STM_ASSERT_EQ(e.origin_snap_id, STM_DATASET_NO_ORIGIN);   /* promoted */
+
+    /* clones_count_for_snap survives across mount. */
+    size_t n100 = 0, n200 = 0;
+    STM_ASSERT_OK(stm_dataset_clones_count_for_snap(idx2, 100, &n100));
+    STM_ASSERT_OK(stm_dataset_clones_count_for_snap(idx2, 200, &n200));
+    STM_ASSERT_EQ(n100, (size_t)2);
+    STM_ASSERT_EQ(n200, (size_t)0);   /* c3 was promoted before commit */
 
     stm_dataset_index_close(idx2);
     stm_bootstrap_close(b);

@@ -1054,4 +1054,118 @@ STM_TEST(sync_dataset_persist_idempotent_across_retried_commit) {
     unlink(g_tmp_path);
 }
 
+/* ====================================================================== */
+/* P6-clone: SnapWithClonesUndeletable wired through sync layer.            */
+/* ====================================================================== */
+
+STM_TEST(sync_snap_delete_refused_with_clone) {
+    /* clone.tla::SnapWithClonesUndeletable: a snapshot with a present
+     * clone cannot be deleted. Sync's clone-check cb on snap_idx
+     * enforces this by querying dataset_idx for clones referencing
+     * the target snap. */
+    make_tmp("snap_clone_busy");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
+
+    stm_dataset_index  *di = stm_sync_dataset_index(s);
+    stm_snapshot_index *si = stm_sync_snapshot_index(s);
+
+    /* Create a snap, then a clone of it. */
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_snapshot_create(si, /*ds*/ STM_DATASET_ROOT_ID,
+                                        "the_snap", 0xface01, &snap_id));
+    uint64_t clone_id = 0;
+    STM_ASSERT_OK(stm_dataset_create_clone(di, STM_DATASET_ROOT_ID,
+                                              "the_clone", snap_id, &clone_id));
+
+    /* Snap delete refused — clone holds the snap. */
+    STM_ASSERT_ERR(stm_snapshot_delete(si, snap_id), STM_EBUSY);
+
+    /* Promote the clone — clone no longer references the snap. */
+    STM_ASSERT_OK(stm_dataset_promote(di, clone_id));
+
+    /* Now snap delete succeeds. */
+    STM_ASSERT_OK(stm_snapshot_delete(si, snap_id));
+
+    teardown(a, s, pool);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(sync_snap_delete_after_clone_destroy) {
+    make_tmp("snap_clone_destroy");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
+
+    stm_dataset_index  *di = stm_sync_dataset_index(s);
+    stm_snapshot_index *si = stm_sync_snapshot_index(s);
+
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_snapshot_create(si, STM_DATASET_ROOT_ID,
+                                        "snap", 0xff, &snap_id));
+    uint64_t c1 = 0, c2 = 0;
+    STM_ASSERT_OK(stm_dataset_create_clone(di, STM_DATASET_ROOT_ID,
+                                              "c1", snap_id, &c1));
+    STM_ASSERT_OK(stm_dataset_create_clone(di, STM_DATASET_ROOT_ID,
+                                              "c2", snap_id, &c2));
+    /* Destroying ONE clone still leaves another → snap stays held. */
+    STM_ASSERT_OK(stm_dataset_destroy(di, c1));
+    STM_ASSERT_ERR(stm_snapshot_delete(si, snap_id), STM_EBUSY);
+    /* Destroying the last clone releases the hold. */
+    STM_ASSERT_OK(stm_dataset_destroy(di, c2));
+    STM_ASSERT_OK(stm_snapshot_delete(si, snap_id));
+
+    teardown(a, s, pool);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(sync_clone_state_survives_mount) {
+    /* End-to-end: clone created + committed + mount round-trip; the
+     * cb-driven clone-check still fires after rehydration. */
+    make_tmp("clone_mount");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
+
+    stm_dataset_index  *di = stm_sync_dataset_index(s);
+    stm_snapshot_index *si = stm_sync_snapshot_index(s);
+
+    uint64_t snap = 0, clone = 0;
+    STM_ASSERT_OK(stm_snapshot_create(si, STM_DATASET_ROOT_ID,
+                                        "snap_main", 0xa1, &snap));
+    STM_ASSERT_OK(stm_dataset_create_clone(di, STM_DATASET_ROOT_ID,
+                                              "clone_x", snap, &clone));
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    teardown(a, s, pool);
+    stm_bdev_close(d);
+
+    /* Reopen. */
+    d = open_fresh_device();
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
+    stm_sync *s2 = NULL;
+    stm_pool *pool2 = make_test_pool(d);
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
+
+    di = stm_sync_dataset_index(s2);
+    si = stm_sync_snapshot_index(s2);
+
+    stm_dataset_entry e;
+    STM_ASSERT_OK(stm_dataset_lookup(di, clone, &e));
+    STM_ASSERT_EQ(e.origin_snap_id, snap);
+
+    /* cb still bound — snap delete refused. */
+    STM_ASSERT_ERR(stm_snapshot_delete(si, snap), STM_EBUSY);
+    STM_ASSERT_OK(stm_dataset_promote(di, clone));
+    STM_ASSERT_OK(stm_snapshot_delete(si, snap));
+
+    teardown(a2, s2, pool2);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
 STM_TEST_MAIN("sync")

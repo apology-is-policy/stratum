@@ -123,8 +123,19 @@ extern "C" {
  * so the v8 → v9 upgrade is content-clean: load path checks
  * `paddr == 0 → no commit yet`. The version bump gates the new
  * field meaning explicitly. No feature-flag bump (full version
- * bump per ARCH §5.9). */
-#define STM_UB_VERSION        9u
+ * bump per ARCH §5.9).
+ *
+ * v9 → v10 (Phase 6 P6-clone): the dataset-tree on-disk value
+ * layout grows by 8 bytes for `origin_snap_id` (le64). New layout:
+ * `parent_id || created_txg || next_ino || flags || local_set_bitmap
+ *  || name_len || local_value[STM_PROP_COUNT] || origin_snap_id ||
+ *  name`. Total: 64 + name_len bytes (was 56 + name_len). Non-clone
+ * datasets carry `origin_snap_id == 0` (STM_DATASET_NO_ORIGIN
+ * sentinel). v9 pools' value layout doesn't accommodate the new
+ * field — old decoder length-checks would refuse v10 entries. The
+ * version bump gates the new field meaning explicitly. No
+ * feature-flag bump (full version bump per ARCH §5.9). */
+#define STM_UB_VERSION        10u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */

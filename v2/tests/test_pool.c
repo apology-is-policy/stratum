@@ -457,15 +457,16 @@ STM_TEST(pool_fs_roundtrip_populates_roster) {
     STM_ASSERT_OK(stm_sb_mount_scan(d, &ub, &lbl, &slot));
     stm_bdev_close(d);
 
-    /* P6-persist bumped STM_UB_VERSION 8 → 9 for `ub_main_root_gen`
-     * and `ub_snap_root_gen` carved from `ub_reserved` (dataset +
-     * snapshot persistence). Prior bumps: P5-durable-cursors (7 → 8)
-     * for `ub_scrub_state[64]`; P5-3c + R15 F6 (6 → 7) for the
+    /* P6-clone bumped STM_UB_VERSION 9 → 10 for the dataset-tree
+     * on-disk value layout extension (origin_snap_id field, 8 bytes,
+     * appended before name[]). Prior bumps: P6-persist (8 → 9) for
+     * ub_main_root_gen + ub_snap_root_gen; P5-durable-cursors (7 → 8)
+     * for ub_scrub_state[64]; P5-3c + R15 F6 (6 → 7) for the
      * roots-object leaf value layout. The constant symbol is what
-     * we assert on; the literal 9 is restated here so a future
+     * we assert on; the literal 10 is restated here so a future
      * version bump that forgets to update this test fails loudly. */
     STM_ASSERT_EQ(stm_load_le32(ub.ub_version), STM_UB_VERSION);
-    STM_ASSERT_EQ(STM_UB_VERSION, 9u);
+    STM_ASSERT_EQ(STM_UB_VERSION, 10u);
 
     /* Roster fields are populated. */
     STM_ASSERT_EQ(stm_load_le16(ub.ub_device_count), 1u);
@@ -702,12 +703,11 @@ STM_TEST(pool_mount_refuses_v6_ub_with_bad_version) {
     unlink(kf);
 }
 
-/* R26 P2-2: P5-durable-cursors bumped STM_UB_VERSION 7 → 8. P6-persist
- * bumped 8 → 9. v7 pools must be refused at mount under v9 binary.
- * Pattern matches v4/v5/v6/v8 refusal tests; impl rejects all
- * non-STM_UB_VERSION uniformly via
- * `if (version != STM_UB_VERSION) return STM_EBADVERSION` at
- * uberblock.c:67. */
+/* R26 P2-2: each STM_UB_VERSION bump (P5-durable-cursors 7→8;
+ * P6-persist 8→9; P6-clone 9→10) refuses every prior version
+ * uniformly via `if (version != STM_UB_VERSION) return STM_EBADVERSION`
+ * at uberblock.c:67. Test exercises one prior version (v7) but the
+ * impl rejects all non-current versions equivalently. */
 STM_TEST(pool_mount_refuses_v7_ub_with_bad_version) {
     make_tmp("v7_ub");
     char kf[256];

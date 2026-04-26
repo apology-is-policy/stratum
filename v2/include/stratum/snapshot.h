@@ -296,6 +296,32 @@ STM_MUST_USE
 stm_status stm_snapshot_index_set_next_id(stm_snapshot_index *idx,
                                              uint64_t next_id);
 
+/* ========================================================================= */
+/* Clone-dependency hook (P6-clone).                                          */
+/* ========================================================================= */
+
+/*
+ * Callback invoked by stm_snapshot_delete to enforce
+ * clone.tla::SnapWithClonesUndeletable: a snapshot with at least one
+ * present clone CANNOT be deleted. Returns true iff `snapshot_id` has
+ * one or more present clones in some external state (typically a
+ * stm_dataset_index in the same pool). When set, snapshot_delete
+ * refuses with STM_EBUSY if cb returns true.
+ *
+ * cb is invoked with idx->lock held; cb MUST NOT call back into
+ * stm_snapshot_*. It may safely query other modules (e.g.,
+ * stm_dataset_*) — those have their own locks. Lock order: snap_idx
+ * outer, dataset_idx inner is the established direction here.
+ *
+ * If no cb is registered (default), snap_delete uses today's hold-
+ * count-only semantics.
+ */
+typedef bool (*stm_snapshot_clone_check_cb)(uint64_t snapshot_id, void *ctx);
+
+void stm_snapshot_index_set_clone_check_cb(stm_snapshot_index *idx,
+                                              stm_snapshot_clone_check_cb cb,
+                                              void *ctx);
+
 #ifdef __cplusplus
 }
 #endif

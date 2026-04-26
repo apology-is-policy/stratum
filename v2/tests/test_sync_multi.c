@@ -1311,14 +1311,16 @@ STM_TEST(sync_multi_alloc_roots_multi_commit_cycle) {
 }
 
 /* Every UB slot at version 5 (pre-P5-3b format) is refused at mount
- * as STM_EBADVERSION. The v5 → v6 → v7 → v8 → v9 bumps guard against
- * earlier pools being mis-interpreted by later code. R15 F6 P2
- * promoted the intermediate v6 → v7 bump (roots-object leaf value
+ * as STM_EBADVERSION. The v5 → v6 → v7 → v8 → v9 → v10 bumps guard
+ * against earlier pools being mis-interpreted by later code. R15 F6
+ * P2 promoted the intermediate v6 → v7 bump (roots-object leaf value
  * layout); P5-durable-cursors promoted v7 → v8 (ub_scrub_state[64]
  * carved from ub_reserved); P6-persist promoted v8 → v9
- * (ub_main_root_gen + ub_snap_root_gen carved from ub_reserved).
- * The version mismatch test below exercises one prior version (v5)
- * but the impl rejects ALL non-STM_UB_VERSION values uniformly. */
+ * (ub_main_root_gen + ub_snap_root_gen carved from ub_reserved);
+ * P6-clone promoted v9 → v10 (dataset value layout grows by 8 bytes
+ * for origin_snap_id). The version mismatch test below exercises one
+ * prior version (v5) but the impl rejects ALL non-STM_UB_VERSION
+ * values uniformly. */
 STM_TEST(sync_multi_mount_refuses_v5_ub) {
     make_paths("v5_refuse");
     stm_bdev *bds[NDEV] = {0};

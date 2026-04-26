@@ -71,6 +71,12 @@ struct stm_bootstrap;  typedef struct stm_bootstrap  stm_bootstrap;
  * Matches ARCH §8.3 "Max name length per component: 255 bytes". */
 #define STM_DATASET_NAME_MAX     255u
 
+/* Origin-snapshot sentinel. A dataset with `origin_snap_id ==
+ * STM_DATASET_NO_ORIGIN` is a regular dataset; non-zero means it's a
+ * clone of the referenced snapshot (clone.tla::IsClone). Snapshot ids
+ * start at 1, so 0 is unambiguous. Matches `clone.tla::NoOrigin`. */
+#define STM_DATASET_NO_ORIGIN    ((uint64_t)0)
+
 /*
  * Property identifiers for per-dataset properties (ARCH §8.4).
  *
@@ -121,6 +127,13 @@ typedef struct {
     uint64_t created_txg;         /* txg at creation; ≤ current_txg */
     uint32_t flags;               /* future: encrypted / readonly / ... */
     uint64_t next_ino;            /* dataset's next-inode counter */
+    /* Clone origin (P6-clone, v10). STM_DATASET_NO_ORIGIN for non-clone
+     * datasets; non-zero references a snapshot in the pool's
+     * snapshot index. A clone is structurally a regular dataset that
+     * carries this back-reference; clone.tla::CloneOriginPresent
+     * holds because Snapshot.Delete refuses while any clone
+     * references the snap. */
+    uint64_t origin_snap_id;
 } stm_dataset_entry;
 
 struct stm_dataset_index;
@@ -338,6 +351,65 @@ STM_MUST_USE
 stm_status stm_dataset_effective_property(const stm_dataset_index *idx,
                                               uint64_t id, stm_property p,
                                               uint64_t *out_value);
+
+/* ========================================================================= */
+/* Clone API (P6-clone, v10).                                                 */
+/* ========================================================================= */
+
+/*
+ * Create a clone — a new dataset that originates from `origin_snap_id`.
+ *
+ * `parent_id` + `name` semantics are identical to stm_dataset_create_child
+ * (sibling-name unique under parent; created_txg auto-bumps).
+ *
+ * Preconditions in addition to create_child:
+ *   - origin_snap_id != STM_DATASET_NO_ORIGIN (else STM_EINVAL — use
+ *     create_child for non-clones).
+ *
+ * The dataset module does NOT verify that origin_snap_id refers to a
+ * PRESENT snapshot — that cross-module check belongs to the caller
+ * (typically sync layer). The dataset's persistent state simply
+ * records the origin reference; clone.tla::CloneOriginPresent is
+ * preserved by snapshot.tla::SnapshotDelete refusing while any clone
+ * references the snap (see stm_snapshot_index_set_clone_check_cb).
+ *
+ * Models clone.tla::CloneCreate.
+ */
+STM_MUST_USE
+stm_status stm_dataset_create_clone(stm_dataset_index *idx,
+                                       uint64_t parent_id,
+                                       const char *name,
+                                       uint64_t origin_snap_id,
+                                       uint64_t *out_id);
+
+/*
+ * Promote dataset `id`. Refused if:
+ *   - id is not PRESENT (STM_ENOENT).
+ *   - id is not a clone (origin_snap_id == STM_DATASET_NO_ORIGIN);
+ *     STM_EINVAL.
+ *
+ * Effect: clears `origin_snap_id` to STM_DATASET_NO_ORIGIN. The
+ * dataset becomes a regular (non-clone) dataset. The previously-
+ * referenced snapshot is no longer held by this clone — it can be
+ * deleted if no other clone still references it.
+ *
+ * Models clone.tla::Promote (MVP semantics: just clears the origin
+ * dependency; full snap-chain reshuffling per ARCH §8.6.2 is a
+ * future extension flagged in clone.tla "OUT OF SCOPE").
+ */
+STM_MUST_USE
+stm_status stm_dataset_promote(stm_dataset_index *idx, uint64_t id);
+
+/*
+ * Count PRESENT clones whose origin_snap_id == snapshot_id. Used by
+ * sync layer to enforce clone.tla::SnapWithClonesUndeletable: refuse
+ * snapshot delete if any clone references it. Always STM_OK on
+ * valid args; *out_count == 0 if no clones reference the snap.
+ */
+STM_MUST_USE
+stm_status stm_dataset_clones_count_for_snap(const stm_dataset_index *idx,
+                                                uint64_t snapshot_id,
+                                                size_t *out_count);
 
 /* ========================================================================= */
 /* Persistence (P6-persist).                                                  */

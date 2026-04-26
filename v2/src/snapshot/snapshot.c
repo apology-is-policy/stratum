@@ -64,6 +64,10 @@ struct stm_snapshot_index {
     uint64_t        root_gen;
     uint8_t         root_csum[32];
     bool            dirty;
+
+    /* ----- Clone-dependency hook (P6-clone). ----- */
+    stm_snapshot_clone_check_cb clone_check_cb;
+    void                       *clone_check_ctx;
 };
 
 /*
@@ -291,10 +295,30 @@ stm_status stm_snapshot_delete(stm_snapshot_index *idx,
         must_unlock(&idx->lock);
         return STM_EBUSY;
     }
+    /* P6-clone: clone.tla::SnapWithClonesUndeletable. If a clone-check
+     * cb is registered, refuse delete when any clone references this
+     * snap. Cb runs while we hold idx->lock; cb is contract-bound NOT
+     * to call back into stm_snapshot_* — it queries other modules
+     * (typically the dataset index) with their own locks. */
+    if (idx->clone_check_cb &&
+        idx->clone_check_cb(snapshot_id, idx->clone_check_ctx)) {
+        must_unlock(&idx->lock);
+        return STM_EBUSY;
+    }
     idx->slots[s].present = false;
     idx->dirty = true;
     must_unlock(&idx->lock);
     return STM_OK;
+}
+
+void stm_snapshot_index_set_clone_check_cb(stm_snapshot_index *idx,
+                                              stm_snapshot_clone_check_cb cb,
+                                              void *ctx) {
+    if (!idx) return;
+    must_lock(&idx->lock);
+    idx->clone_check_cb  = cb;
+    idx->clone_check_ctx = ctx;
+    must_unlock(&idx->lock);
 }
 
 stm_status stm_snapshot_hold(stm_snapshot_index *idx,

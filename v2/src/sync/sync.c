@@ -540,6 +540,9 @@ static stm_status sync_redundancy_validate(const stm_redundancy_profile *p,
     }
 }
 
+/* P6-clone: forward decl. Defined near stm_sync_dataset_index. */
+static bool sync_clone_check_cb(uint64_t snapshot_id, void *ctx);
+
 /* Pack a validated profile into the on-disk 1+15 bytes. Caller owns
  * the buffer; writes deterministically so two commits with the same
  * profile produce byte-identical UBs. */
@@ -997,6 +1000,13 @@ stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
         rc = stm_snapshot_index_set_crypt_ctx(s->snap_idx, s->metadata_key,
                                                  s->pool_uuid, s->device_uuid);
         if (rc != STM_OK) { stm_sync_close(s); return rc; }
+
+        /* P6-clone: register the clone-dependency check on snap_idx.
+         * Snap delete will now refuse if any present clone in
+         * dataset_idx references the target snap. */
+        stm_snapshot_index_set_clone_check_cb(s->snap_idx,
+                                                 sync_clone_check_cb,
+                                                 s->dataset_idx);
 
         /* Seed mirrors. The freshly-created indices' next_id is 2 for
          * dataset (root claimed id=1) and 1 for snapshot. */
@@ -1526,6 +1536,13 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
         if (si != STM_OK)     { stm_sync_close(s2); return si; }
         si = stm_snapshot_index_get_next_id(s2->snap_idx, &s2->next_snap_id);
         if (si != STM_OK) { stm_sync_close(s2); return si; }
+
+        /* P6-clone: register the clone-dependency check now that both
+         * indices are populated. Snap delete refuses while any present
+         * clone in dataset_idx references the target snap. */
+        stm_snapshot_index_set_clone_check_cb(s2->snap_idx,
+                                                 sync_clone_check_cb,
+                                                 s2->dataset_idx);
     }
 
     /* R9 P0-1 — multi-device mount-claim.
@@ -3336,6 +3353,30 @@ stm_status stm_sync_get_dek(const stm_sync *s,
     memcpy(out_dek, slot->dek, 32);
     pthread_mutex_unlock(&ms->lock);
     return STM_OK;
+}
+
+/* P6-clone: callback the snapshot module invokes during delete to
+ * enforce clone.tla::SnapWithClonesUndeletable. ctx is the dataset
+ * index handle (registered at sync_create / sync_open). Returns true
+ * iff any present clone references the snap — the snap module then
+ * refuses the delete with STM_EBUSY.
+ *
+ * Lock-order: caller holds snap_idx->lock; we acquire dataset_idx->lock
+ * via stm_dataset_clones_count_for_snap. snap → dataset is the
+ * established direction (sync_commit also takes them in this order
+ * via the index handles). */
+static bool sync_clone_check_cb(uint64_t snapshot_id, void *ctx)
+{
+    stm_dataset_index *di = (stm_dataset_index *)ctx;
+    size_t n = 0;
+    stm_status cs = stm_dataset_clones_count_for_snap(di, snapshot_id, &n);
+    if (cs != STM_OK) {
+        /* Defensive: on lookup failure, refuse the delete rather than
+         * proceed without the invariant check. Operationally this
+         * surfaces as STM_EBUSY at the caller. */
+        return true;
+    }
+    return n > 0;
 }
 
 stm_dataset_index *stm_sync_dataset_index(stm_sync *s)
