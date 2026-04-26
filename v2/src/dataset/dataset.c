@@ -40,6 +40,17 @@ struct stm_dataset_index {
     uint64_t        current_txg;
 };
 
+/*
+ * R28 P3-2: cast away the const on idx->lock for pthread_mutex_*.
+ * The mutex is logically a distinct state component from idx's
+ * data; const-qualified API callers (lookup, count, iter) treat the
+ * data as read-only but still need exclusive access to serialize
+ * with concurrent writers. POSIX permits this pattern.
+ */
+static inline pthread_mutex_t *dataset_lock(const stm_dataset_index *idx) {
+    return (pthread_mutex_t *)&idx->lock;
+}
+
 /* ------------------------------------------------------------------ */
 /* Internal helpers (caller must hold idx->lock).                     */
 /* ------------------------------------------------------------------ */
@@ -156,12 +167,34 @@ stm_status stm_dataset_index_create(uint64_t current_txg,
     stm_dataset_index *idx = calloc(1, sizeof(*idx));
     if (!idx) return STM_ENOMEM;
 
-    if (pthread_mutex_init(&idx->lock, NULL) != 0) {
+    /* R28 P3-4: ERRORCHECK mutex — callback re-entry from
+     * stm_dataset_iter (forbidden per public API contract) returns
+     * EDEADLK on the inner lock instead of hanging silently. Cost:
+     * trivial. Benefit: contract violations surface visibly. */
+    pthread_mutexattr_t attr;
+    if (pthread_mutexattr_init(&attr) != 0) {
+        free(idx);
+        return STM_ENOMEM;
+    }
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK);
+    int mr = pthread_mutex_init(&idx->lock, &attr);
+    pthread_mutexattr_destroy(&attr);
+    if (mr != 0) {
         free(idx);
         return STM_ENOMEM;
     }
 
-    /* Allocate root slot (id = STM_DATASET_ROOT_ID = 1). */
+    /* Allocate root slot (id = STM_DATASET_ROOT_ID = 1).
+     *
+     * R28 P3-1: dataset.tla's Init sets root.name = sentinel "_ROOT_"
+     * to keep the abstract name set disjoint from real children's
+     * names. The C impl stores name_len = 0 / empty string instead
+     * because (a) the path-prefix is the pool name (e.g., "tank"),
+     * not stored per-dataset; (b) root has no siblings (parent = 0),
+     * so SiblingNameUnique is vacuous; (c) name "" can never collide
+     * with a real child name (the empty string is rejected by Create's
+     * name_len > 0 check). Semantically equivalent to the spec
+     * sentinel. */
     size_t root_slot = append_slot_locked(idx);
     if (root_slot == (size_t)-1) {
         pthread_mutex_destroy(&idx->lock);
@@ -195,6 +228,10 @@ stm_status stm_dataset_index_advance_txg(stm_dataset_index *idx,
                                            uint64_t new_txg) {
     if (!idx) return STM_EINVAL;
     pthread_mutex_lock(&idx->lock);
+    /* R28 P3-3: equal value is a no-op (not a regression) — the spec's
+     * BirthTxgMonotonic invariant only forbids strictly-decreasing
+     * advance. Same-value advance is the legitimate "external txg
+     * source agrees with internal counter" path. */
     if (new_txg < idx->current_txg) {
         pthread_mutex_unlock(&idx->lock);
         return STM_EINVAL;
@@ -208,7 +245,7 @@ stm_status stm_dataset_index_current_txg(const stm_dataset_index *idx,
                                             uint64_t *out_txg) {
     if (!idx || !out_txg) return STM_EINVAL;
     /* Cast away const for pthread API; semantically read-only. */
-    pthread_mutex_t *lock = (pthread_mutex_t *)&idx->lock;
+    pthread_mutex_t *lock = dataset_lock(idx);
     pthread_mutex_lock(lock);
     *out_txg = idx->current_txg;
     pthread_mutex_unlock(lock);
@@ -350,7 +387,7 @@ stm_status stm_dataset_move(stm_dataset_index *idx, uint64_t id,
 stm_status stm_dataset_lookup(const stm_dataset_index *idx, uint64_t id,
                                 stm_dataset_entry *out) {
     if (!idx || !out) return STM_EINVAL;
-    pthread_mutex_t *lock = (pthread_mutex_t *)&idx->lock;
+    pthread_mutex_t *lock = dataset_lock(idx);
     pthread_mutex_lock(lock);
     size_t s = find_slot_locked(idx, id);
     if (s == (size_t)-1 || !idx->slots[s].present) {
@@ -365,7 +402,7 @@ stm_status stm_dataset_lookup(const stm_dataset_index *idx, uint64_t id,
 stm_status stm_dataset_count(const stm_dataset_index *idx,
                                 size_t *out_count) {
     if (!idx || !out_count) return STM_EINVAL;
-    pthread_mutex_t *lock = (pthread_mutex_t *)&idx->lock;
+    pthread_mutex_t *lock = dataset_lock(idx);
     pthread_mutex_lock(lock);
     size_t n = 0;
     for (size_t i = 0; i < idx->slots_len; i++) {
@@ -380,7 +417,7 @@ stm_status stm_dataset_children_count(const stm_dataset_index *idx,
                                          uint64_t parent_id,
                                          size_t *out_count) {
     if (!idx || !out_count) return STM_EINVAL;
-    pthread_mutex_t *lock = (pthread_mutex_t *)&idx->lock;
+    pthread_mutex_t *lock = dataset_lock(idx);
     pthread_mutex_lock(lock);
     if (!is_present_locked(idx, parent_id)) {
         pthread_mutex_unlock(lock);
@@ -398,7 +435,7 @@ stm_status stm_dataset_children_count(const stm_dataset_index *idx,
 stm_status stm_dataset_iter(const stm_dataset_index *idx,
                               stm_dataset_iter_cb cb, void *ctx) {
     if (!idx || !cb) return STM_EINVAL;
-    pthread_mutex_t *lock = (pthread_mutex_t *)&idx->lock;
+    pthread_mutex_t *lock = dataset_lock(idx);
     pthread_mutex_lock(lock);
     /* Iterate by id-ascending. Slots are appended in id-ascending order
      * (next_id is monotonic), so a linear walk over slots[] is already

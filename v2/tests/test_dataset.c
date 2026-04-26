@@ -22,6 +22,7 @@
 #include "tharness.h"
 #include <stratum/dataset.h>
 
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -474,6 +475,163 @@ STM_TEST(dataset_iter_visits_all_present) {
 /* ------------------------------------------------------------------ */
 /* Forest invariant — no orphan reachable post-destroy.               */
 /* ------------------------------------------------------------------ */
+
+/* ------------------------------------------------------------------ */
+/* R28 P2-3: sibling-uniqueness check skips ABSENT slots.             */
+/* ------------------------------------------------------------------ */
+
+STM_TEST(dataset_destroy_then_recreate_same_name) {
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    uint64_t home_v1 = 0, home_v2 = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID,
+                                              "home", &home_v1));
+    STM_ASSERT_OK(stm_dataset_destroy(idx, home_v1));
+    /* "home" should be available again — sibling-uniqueness must
+     * skip the ABSENT slot. */
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID,
+                                              "home", &home_v2));
+    /* Id monotonicity: the recycled name picks a NEW id. */
+    STM_ASSERT_TRUE(home_v2 > home_v1);
+    /* Old id stays ABSENT. */
+    stm_dataset_entry e;
+    STM_ASSERT_ERR(stm_dataset_lookup(idx, home_v1, &e), STM_ENOENT);
+    STM_ASSERT_OK(stm_dataset_lookup(idx, home_v2, &e));
+    STM_ASSERT_TRUE(memcmp(e.name, "home", 4) == 0);
+    stm_dataset_index_close(idx);
+}
+
+/* File-scope iter callback — counts visited entries. (Used by the
+ * realloc-grow test below; module-level so it works under strict
+ * Clang/C17 which forbids nested function definitions.) */
+static bool count_iter_cb(const stm_dataset_entry *e, void *ctx) {
+    (void)e;
+    (*(size_t *)ctx)++;
+    return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* R28 P2-2: realloc path — exercise capacity doubling beyond the    */
+/* initial 8 slots. Lookup of an early id must remain valid post-     */
+/* grow (the slot's content survives realloc, since we copy by value).*/
+/* ------------------------------------------------------------------ */
+
+STM_TEST(dataset_grows_past_initial_capacity) {
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+
+    /* Create 32 children of root. Initial cap is 8; this forces the
+     * doubling path 8 → 16 → 32 → 64. */
+    enum { N = 32 };
+    uint64_t ids[N];
+    for (int i = 0; i < N; i++) {
+        char name[16];
+        snprintf(name, sizeof name, "ds_%d", i);
+        STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID,
+                                                  name, &ids[i]));
+    }
+    /* Total count is root + 32. */
+    size_t n = 0;
+    STM_ASSERT_OK(stm_dataset_count(idx, &n));
+    STM_ASSERT_EQ(n, (size_t)(N + 1));
+
+    /* Lookup each — including ids[0] created when cap was 8 — must
+     * still produce the right entry post-grow. */
+    for (int i = 0; i < N; i++) {
+        stm_dataset_entry e;
+        STM_ASSERT_OK(stm_dataset_lookup(idx, ids[i], &e));
+        STM_ASSERT_EQ(e.id, ids[i]);
+        char expected[16];
+        snprintf(expected, sizeof expected, "ds_%d", i);
+        STM_ASSERT_TRUE(memcmp(e.name, expected, strlen(expected)) == 0);
+    }
+
+    /* Iterate: should see 33 entries (root + 32 children). */
+    size_t iter_count = 0;
+    STM_ASSERT_OK(stm_dataset_iter(idx, count_iter_cb, &iter_count));
+    STM_ASSERT_EQ(iter_count, (size_t)(N + 1));
+
+    stm_dataset_index_close(idx);
+}
+
+/* ------------------------------------------------------------------ */
+/* R28 P2-1: concurrent creators race the lock; every API atomic; no */
+/* duplicate ids; final count matches.                                */
+/* ------------------------------------------------------------------ */
+
+#define DATASET_CONCURRENT_THREADS 8
+#define DATASET_CONCURRENT_PER_THREAD 100
+
+typedef struct {
+    stm_dataset_index *idx;
+    int tid;
+    int fail_count;
+    uint64_t ids[DATASET_CONCURRENT_PER_THREAD];
+} concurrent_thread_ctx;
+
+static void *concurrent_creator(void *arg) {
+    concurrent_thread_ctx *c = arg;
+    for (int i = 0; i < DATASET_CONCURRENT_PER_THREAD; i++) {
+        char name[32];
+        snprintf(name, sizeof name, "thr%d_%d", c->tid, i);
+        stm_status s = stm_dataset_create_child(c->idx, STM_DATASET_ROOT_ID,
+                                                   name, &c->ids[i]);
+        if (s != STM_OK) c->fail_count++;
+    }
+    return NULL;
+}
+
+STM_TEST(dataset_concurrent_create_distinct_ids) {
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+
+    pthread_t threads[DATASET_CONCURRENT_THREADS];
+    concurrent_thread_ctx ctxs[DATASET_CONCURRENT_THREADS] = { 0 };
+    for (int t = 0; t < DATASET_CONCURRENT_THREADS; t++) {
+        ctxs[t].idx = idx;
+        ctxs[t].tid = t;
+        STM_ASSERT_EQ(pthread_create(&threads[t], NULL,
+                                        concurrent_creator, &ctxs[t]), 0);
+    }
+    for (int t = 0; t < DATASET_CONCURRENT_THREADS; t++) {
+        pthread_join(threads[t], NULL);
+    }
+
+    /* No errors. */
+    int total_failures = 0;
+    for (int t = 0; t < DATASET_CONCURRENT_THREADS; t++) {
+        total_failures += ctxs[t].fail_count;
+    }
+    STM_ASSERT_EQ(total_failures, 0);
+
+    /* All ids distinct: simple O(N²) check. Total N = 8*100 = 800. */
+    enum { N = DATASET_CONCURRENT_THREADS * DATASET_CONCURRENT_PER_THREAD };
+    uint64_t all_ids[N];
+    int k = 0;
+    for (int t = 0; t < DATASET_CONCURRENT_THREADS; t++) {
+        for (int i = 0; i < DATASET_CONCURRENT_PER_THREAD; i++) {
+            all_ids[k++] = ctxs[t].ids[i];
+        }
+    }
+    for (int i = 0; i < N; i++) {
+        for (int j = i + 1; j < N; j++) {
+            STM_ASSERT_NE(all_ids[i], all_ids[j]);
+        }
+    }
+
+    /* count = N + 1 (root + children). */
+    size_t n = 0;
+    STM_ASSERT_OK(stm_dataset_count(idx, &n));
+    STM_ASSERT_EQ(n, (size_t)(N + 1));
+
+    /* Ids fall in (1, 2 + N]: root used 1, next_id starts at 2,
+     * monotonic +1 per Create. */
+    for (int i = 0; i < N; i++) {
+        STM_ASSERT_TRUE(all_ids[i] >= 2 && all_ids[i] <= (uint64_t)(N + 1));
+    }
+
+    stm_dataset_index_close(idx);
+}
 
 STM_TEST(dataset_forest_is_intact_after_create_destroy_chain) {
     stm_dataset_index *idx = NULL;
