@@ -931,4 +931,148 @@ STM_TEST(prop_arg_validation) {
     stm_dataset_index_close(idx);
 }
 
+/* ------------------------------------------------------------------ */
+/* R30 P2-2: clear-on-immutable always refused (tightened contract).  */
+/* ------------------------------------------------------------------ */
+
+STM_TEST(prop_clear_immutable_unset_also_refused) {
+    /* Per the dataset.h docstring, clearing an IMMUTABLE property is
+     * unconditionally refused — even when the dataset never locally
+     * set the property. R30 P2-2 tightened the contract so clear
+     * returns STM_EINVAL regardless of local_set state on IMMUTABLE. */
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    uint64_t home = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID,
+                                              "home", &home));
+    /* home has no local encryption set. Clear should still refuse. */
+    STM_ASSERT_ERR(stm_dataset_clear_property(idx, home,
+                                                  STM_PROP_ENCRYPTION),
+                    STM_EINVAL);
+    /* Set then clear — also refused (R30 already covered by
+     * prop_immutable_set_once but worth re-asserting the tightened
+     * post-Set contract here). */
+    STM_ASSERT_OK(stm_dataset_set_property(idx, home,
+                                              STM_PROP_ENCRYPTION, 7));
+    STM_ASSERT_ERR(stm_dataset_clear_property(idx, home,
+                                                  STM_PROP_ENCRYPTION),
+                    STM_EINVAL);
+    stm_dataset_index_close(idx);
+}
+
+/* ------------------------------------------------------------------ */
+/* R30 P3-2: root with no local set returns pool default for every    */
+/* property kind (NONINHERITABLE / IMMUTABLE / INHERITABLE).          */
+/* ------------------------------------------------------------------ */
+
+STM_TEST(prop_root_no_local_returns_pool_default_for_every_kind) {
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_OK(stm_dataset_set_pool_default(idx,
+                                                  STM_PROP_COMPRESS, 11));
+    STM_ASSERT_OK(stm_dataset_set_pool_default(idx,
+                                                  STM_PROP_QUOTA, 22));
+    STM_ASSERT_OK(stm_dataset_set_pool_default(idx,
+                                                  STM_PROP_ENCRYPTION, 33));
+
+    uint64_t v = 0;
+    /* INHERITABLE on root: walk terminates at root's NO_PARENT;
+     * pool default returned. */
+    STM_ASSERT_OK(stm_dataset_effective_property(idx, STM_DATASET_ROOT_ID,
+                                                     STM_PROP_COMPRESS, &v));
+    STM_ASSERT_EQ(v, (uint64_t)11);
+    /* NONINHERITABLE on root: short-circuit on first hop; pool default. */
+    STM_ASSERT_OK(stm_dataset_effective_property(idx, STM_DATASET_ROOT_ID,
+                                                     STM_PROP_QUOTA, &v));
+    STM_ASSERT_EQ(v, (uint64_t)22);
+    /* IMMUTABLE on root with no local set: walk terminates at NO_PARENT;
+     * pool default. */
+    STM_ASSERT_OK(stm_dataset_effective_property(idx, STM_DATASET_ROOT_ID,
+                                                     STM_PROP_ENCRYPTION, &v));
+    STM_ASSERT_EQ(v, (uint64_t)33);
+
+    stm_dataset_index_close(idx);
+}
+
+/* ------------------------------------------------------------------ */
+/* R30 P3-3: concurrent property set / clear / effective.              */
+/* TSan-meaningful: confirms property storage is fully serialized      */
+/* under the mutex.                                                    */
+/* ------------------------------------------------------------------ */
+
+#define PROP_THREADS  4
+#define PROP_PER_THR  200
+
+typedef struct {
+    stm_dataset_index *idx;
+    uint64_t target_id;
+    int tid;
+    int fail_count;
+} prop_concurrent_ctx;
+
+static void *prop_concurrent_worker(void *arg) {
+    prop_concurrent_ctx *c = arg;
+    for (int i = 0; i < PROP_PER_THR; i++) {
+        switch (i % 3) {
+        case 0: {
+            stm_status s = stm_dataset_set_property(c->idx, c->target_id,
+                                                       STM_PROP_COMPRESS,
+                                                       (uint64_t)c->tid * 100 + i);
+            if (s != STM_OK) c->fail_count++;
+            break;
+        }
+        case 1: {
+            stm_status s = stm_dataset_clear_property(c->idx, c->target_id,
+                                                         STM_PROP_COMPRESS);
+            if (s != STM_OK) c->fail_count++;
+            break;
+        }
+        case 2: {
+            uint64_t v = 0;
+            stm_status s = stm_dataset_effective_property(c->idx,
+                                                              c->target_id,
+                                                              STM_PROP_COMPRESS,
+                                                              &v);
+            if (s != STM_OK) c->fail_count++;
+            break;
+        }
+        }
+    }
+    return NULL;
+}
+
+STM_TEST(prop_concurrent_set_clear_effective) {
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+    STM_ASSERT_OK(stm_dataset_set_pool_default(idx, STM_PROP_COMPRESS, 0));
+
+    /* Single shared dataset; threads contend on its compress slot. */
+    uint64_t shared = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID,
+                                              "shared", &shared));
+
+    pthread_t threads[PROP_THREADS];
+    prop_concurrent_ctx ctxs[PROP_THREADS] = { 0 };
+    for (int t = 0; t < PROP_THREADS; t++) {
+        ctxs[t].idx = idx;
+        ctxs[t].target_id = shared;
+        ctxs[t].tid = t;
+        STM_ASSERT_EQ(pthread_create(&threads[t], NULL,
+                                        prop_concurrent_worker, &ctxs[t]), 0);
+    }
+    for (int t = 0; t < PROP_THREADS; t++) {
+        pthread_join(threads[t], NULL);
+    }
+
+    /* Every op should have succeeded (set/clear/effective on
+     * INHERITABLE COMPRESS are all valid in any order). */
+    int total_failures = 0;
+    for (int t = 0; t < PROP_THREADS; t++) {
+        total_failures += ctxs[t].fail_count;
+    }
+    STM_ASSERT_EQ(total_failures, 0);
+
+    stm_dataset_index_close(idx);
+}
+
 STM_TEST_MAIN("dataset")

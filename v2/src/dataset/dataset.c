@@ -492,7 +492,10 @@ stm_property_kind stm_property_kind_of(stm_property p) {
     case STM_PROP_ENCRYPTION:  return STM_PROP_KIND_IMMUTABLE;
     case STM_PROP_COUNT:       break;
     }
-    /* Default-treat unknown / future properties as inheritable. */
+    /* R30 P3-4: STM_PROP_COUNT is the count sentinel — out-of-range
+     * values should never reach this function (every public API
+     * filters via prop_in_range first). Default-treat unknown values
+     * as inheritable so future enum extensions get a safe default. */
     return STM_PROP_KIND_INHERITABLE;
 }
 
@@ -512,7 +515,16 @@ static uint64_t effective_property_locked(const stm_dataset_index *idx,
     stm_property_kind kind = stm_property_kind_of(p);
 
     /* Bounded walk: at most slots_len + 1 steps to defend against any
-     * malformed parent chain. */
+     * malformed parent chain.
+     *
+     * R30 P3-1: an ABSENT intermediate parent on the chain of a
+     * PRESENT dataset would indicate corruption (Destroy refuses
+     * non-leaf, so this state should be unreachable from the public
+     * API). The break + fall-through to pool_default below is
+     * defensive — it returns a safe value rather than crashing under
+     * malformed state. A future debug-only assert could promote this
+     * to a hard fail; for now the silent fallback is preferred to
+     * keep effective_property crash-free even on hostile inputs. */
     uint64_t cur = id;
     for (size_t hops = 0; hops <= idx->slots_len; hops++) {
         size_t s = find_slot_locked(idx, cur);
@@ -580,9 +592,13 @@ stm_status stm_dataset_clear_property(stm_dataset_index *idx, uint64_t id,
         must_unlock(&idx->lock);
         return STM_ENOENT;
     }
-    /* IMMUTABLE properties cannot be cleared after Create. */
-    if (stm_property_kind_of(p) == STM_PROP_KIND_IMMUTABLE
-        && idx->slots[s].local_set[p]) {
+    /* R30 P2-2: clearing an IMMUTABLE property is unconditionally
+     * refused — even on a slot that was never locally set. This
+     * tightens the contract to match the dataset.h docstring
+     * ("clearing an IMMUTABLE property always refused"). The previous
+     * behavior was to no-op-succeed when local_set was already FALSE,
+     * which was a contract drift. */
+    if (stm_property_kind_of(p) == STM_PROP_KIND_IMMUTABLE) {
         must_unlock(&idx->lock);
         return STM_EINVAL;
     }

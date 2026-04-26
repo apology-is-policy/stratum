@@ -289,6 +289,22 @@ stm_status stm_dataset_set_pool_default(stm_dataset_index *idx,
  *     property.tla::ImmutableEncryption).
  *
  * Models property.tla::SetProperty.
+ *
+ * R30 P2-1: SPEC-TO-CODE divergence on the IMMUTABLE-at-Create
+ * pattern. The spec property.tla models CreateChild as taking an
+ * `immutable_vals` argument and atomically initializing each
+ * IMMUTABLE property's local_set + local_value at creation; its
+ * SetProperty then refuses every IMMUTABLE-property attempt. The C
+ * API splits this into stm_dataset_create_child + a follow-up
+ * stm_dataset_set_property; the FIRST set on an IMMUTABLE property
+ * is allowed (modeling "declared at creation" per ARCH §8.4.2),
+ * subsequent sets refuse. Long-run safety property (ImmutableEncryption
+ * — a set IMMUTABLE never mutates) holds in both shapes; the C
+ * impl exposes a transient state where a freshly-created dataset's
+ * IMMUTABLE property has no local set and effective() returns the
+ * inherited / pool-default value. Callers wanting "atomic at
+ * creation" semantics should set the IMMUTABLE before exposing the
+ * dataset id to other observers.
  */
 STM_MUST_USE
 stm_status stm_dataset_set_property(stm_dataset_index *idx, uint64_t id,
