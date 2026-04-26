@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Stratum v2 ships 14 TLA+ spec modules covering every load-bearing
+Stratum v2 ships 15 TLA+ spec modules covering every load-bearing
 invariant in the implementation. The specs are the **source of
 truth** for protocol-level behavior; code is an implementation of
 the spec (CLAUDE.md: "spec-first policy"). When the two disagree,
@@ -34,9 +34,10 @@ chapter as specs get wider cross-reference tables).
 | `evac.tla` | 5 | Per-block evacuation atomicity. | 13 states, depth 5 | `evac_buggy.cfg`, `evac_remove_no_drain_buggy.cfg` |
 | `scrub.tla` | 5 | Scrub state machine + β cb-classification + γ durable cursor. | small (each of α + β + γ configs; γ adds durable shadow + Persist/Crash/Mount) | `scrub_buggy.cfg` |
 | `bptr.tla` | 6 | Production scrub β cb protocol — replica-walk + csum-gate + rewrite-bad + verify-writeback + log. | 29 states, depth 8 (NReplicas=3) | `bptr_accept_corrupt_buggy.cfg`, `bptr_no_verify_writeback_buggy.cfg` |
+| `dataset.tla` | 6 | Pool-wide dataset hierarchy — forest structure + atomic create/destroy/rename/move + sibling-name uniqueness + id monotonicity + birth-txg. | 43 states, depth 7 (MaxDatasets=3, 2 names) | `dataset_cycles_buggy.cfg`, `dataset_dup_name_buggy.cfg`, `dataset_destroy_non_leaf_buggy.cfg` |
 
-All 17 fixed configs green (one per module + `scrub_beta` +
-`scrub_durable` + `scrub_beta_durable` extending `scrub.tla`). All 8
+All 18 fixed configs green (one per module + `scrub_beta` +
+`scrub_durable` + `scrub_beta_durable` extending `scrub.tla`). All 11
 buggy configs reproduce their designed invariant violations.
 
 ## Per-module invariants
@@ -437,6 +438,102 @@ infrastructure), concurrency (cb runs single-threaded under
 `sc->lock` + `pool->rdlock`), AEAD vs BLAKE3 csum specifics
 (modeled abstractly as a boolean gate).
 
+### `dataset.tla` — pool-wide dataset hierarchy + index tree (P6-2 spec scaffold)
+
+Models the dataset index tree's STRUCTURAL invariants under the
+four atomic operations Create / Destroy / Rename / Move. The
+dataset index lives at `ub_main_root` per ARCH §8.3.2 — an
+existing uberblock slot, no format break.
+
+Invariants:
+
+- `TypeOK`.
+- `RootInvariant` — RootId (1) is always PRESENT, has `parent = 0`,
+  carries the sentinel name. Root is undestroyable, unrenameable,
+  unmoveable.
+- `ForestStructure` — every PRESENT dataset's chain of PRESENT
+  parents reaches RootId by bounded depth. Cycles, orphan
+  subtrees (parent destroyed while children remain), and isolated
+  subgraphs all violate this. The walk is `PresentAncestor` —
+  intermediate parents must themselves be PRESENT.
+- `SiblingNameUnique` — among PRESENT siblings (same parent),
+  names are pairwise distinct. Path resolution under any parent
+  is deterministic.
+- `IdMonotonic` — ids are assigned strictly increasing via
+  `next_id`; never recycled after Destroy. Per ARCH §8.3.1 ids
+  are "stable across renames"; the strict-monotonic policy is
+  the natural ABA-avoidance for refcount-based references.
+- `BirthTxgMonotonic` — every dataset's `created_txg ≤ current_txg`.
+  No records "from the future". ARCH §8.5.1.
+- `CreatedTxgStable` — Destroy doesn't reset `created_txg`;
+  structurally enforced by `UNCHANGED` in Destroy.
+
+CONSTANTS:
+
+- `MaxDatasets ≥ 1` — bound on the dataset population. RootId (1)
+  always exists from Init; ids 2..MaxDatasets are created on demand.
+- `Names` — finite set of name tokens for child labels. The
+  fixed config uses `{"n1", "n2"}`; the root carries the sentinel
+  `"_ROOT_"` not in Names.
+- `MaxTxg ≥ 1` — bounds how far `current_txg` advances. Each
+  Create bumps `current_txg` by 1.
+- Buggy variants:
+  - `BuggyAllowCycles` — Move accepts a target parent that is a
+    descendant of the moved dataset.
+  - `BuggyAllowDuplicateName` — Create / Rename / Move skip the
+    sibling-name-availability check.
+  - `BuggyDestroyNonLeaf` — Destroy accepts a dataset with
+    PRESENT children.
+
+Actions:
+
+- `Create(p, n)` — allocate `next_id`, set `parent = p`, set
+  `name = n` (∈ Names), bump `current_txg` and `created_txg[next_id]`.
+- `Destroy(d)` — mark d ABSENT. Refused for RootId and (under
+  fixed policy) datasets with PRESENT children.
+- `Rename(d, n)` — change `name[d]` to `n` (∈ Names) under the
+  sibling-uniqueness gate.
+- `Move(d, p)` — change `parent[d]` to `p` under the
+  no-cycle gate (`d` is not an ancestor of `p` along raw
+  parent[]) and the sibling-uniqueness gate.
+
+Fixed config (`dataset.cfg`, `MaxDatasets=3`, `Names={"n1", "n2"}`,
+`MaxTxg=4`): exercises Create + Destroy + Rename + Move + cycle
+prevention + sibling-name uniqueness. 43 states at depth 7. All
+seven invariants hold.
+
+Buggy configs:
+
+- `dataset_cycles_buggy.cfg` (`BuggyAllowCycles=TRUE`): Move
+  accepts a descendant target. Reachable cycle: Create(1,"n1")
+  yields id=2; Create(2,"n2") yields id=3 child of 2; Move(2,3)
+  under buggy policy makes parent[2]=3 while parent[3]=2 — cycle.
+  `ForestStructure` violated.
+- `dataset_dup_name_buggy.cfg` (`BuggyAllowDuplicateName=TRUE`):
+  Create allows a name in use. Reachable: Create(1,"n1") +
+  Create(1,"n1") under buggy policy yields two siblings of root
+  both named "n1". `SiblingNameUnique` violated.
+- `dataset_destroy_non_leaf_buggy.cfg` (`BuggyDestroyNonLeaf=TRUE`):
+  Destroy accepts a non-leaf parent. Reachable: Create(1,"n1") +
+  Create(2,"n2") + Destroy(2) under buggy policy yields PRESENT
+  dataset 3 with `parent[3]=2` and `state[2]=ABSENT` — orphan.
+  `ForestStructure` violated (PresentAncestor walks 3 → 2(ABSENT)
+  → FALSE).
+
+Spec-to-code (forward reference): the C implementation of the
+dataset index tree is **not yet in this commit**. Lands in a
+follow-on chunk under `src/dataset/`, populating the existing
+`ub_main_root` slot with a btree of `stm_dataset_index_entry`
+records. The four operations map 1:1 to the spec actions; the
+btree mechanism layer (structural.tla / balanced.tla / merge.tla)
+underpins the storage. Property inheritance, snapshots, and
+clones are separate specs / chunks (ARCH §8.4 / §8.5 / §8.6).
+
+Out of scope for `dataset.tla`: property inheritance (separate
+spec); snapshots and clones (separate specs); send/recv; per-
+connection 9P namespaces; the btree mechanism layer that stores
+the entries; crash/commit boundaries (covered by quorum.tla).
+
 ## Running TLC
 
 ```bash
@@ -449,7 +546,8 @@ java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
 
 # Full sweep — fixed configs (one per module; scrub has 3 extra configs).
 for s in sync concurrency structural balanced merge allocator merkle \
-         key_schema quorum metadata_nonce device_lifecycle evac scrub bptr; do
+         key_schema quorum metadata_nonce device_lifecycle evac scrub \
+         bptr dataset; do
   echo "== $s ==" && \
   java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
       -config $s.cfg $s.tla 2>&1 | tail -3
@@ -470,6 +568,11 @@ done
 for cfg in bptr_accept_corrupt_buggy bptr_no_verify_writeback_buggy; do
   java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
       -config ${cfg}.cfg bptr.tla 2>&1 | \
+      grep -E "Invariant|Error:" | head -2
+done
+for cfg in dataset_cycles_buggy dataset_dup_name_buggy dataset_destroy_non_leaf_buggy; do
+  java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
+      -config ${cfg}.cfg dataset.tla 2>&1 | \
       grep -E "Invariant|Error:" | head -2
 done
 ```

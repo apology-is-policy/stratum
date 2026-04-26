@@ -30,7 +30,8 @@ Phase 6 also picks up three P5 carry-overs per ROADMAP §9.6:
 
 | Commit | What | Tests |
 |---|---|---|
-| `032db86` | P6-1 spec scaffold: `bptr.tla` (production scrub cb protocol) + 1 fixed cfg + 2 buggy cfgs. Spec-only landing per CLAUDE.md spec-first; production cb impl waits for paddr→bptr resolver. | TLC: bptr 29 states/depth 8 clean; 2 buggy demos fire NoSilentCorruption + WriteVerifyMandatory respectively. Total spec posture: 14 modules / 17 fixed cfgs / 8 buggy cfgs. |
+| `032db86` | P6-1 spec scaffold: `bptr.tla` (production scrub cb protocol) + 1 fixed cfg + 2 buggy cfgs. Spec-only landing per CLAUDE.md spec-first; production cb impl waits for paddr→bptr resolver. | TLC: bptr 29 states/depth 8 clean; 2 buggy demos fire NoSilentCorruption + WriteVerifyMandatory respectively. Total spec posture after P6-1: 14 modules / 17 fixed cfgs / 8 buggy cfgs. |
+| (this chunk) | P6-2 spec scaffold: `dataset.tla` (pool-wide dataset hierarchy — forest + atomic Create/Destroy/Rename/Move + sibling-name uniqueness + id monotonicity) + 1 fixed cfg + 3 buggy cfgs. Spec-only landing; C impl follow-on under `src/dataset/` populates `ub_main_root` (existing slot, no format break). Property inheritance / snapshots / clones are separate specs / chunks. | TLC: dataset 43 states/depth 7 clean; 3 buggy demos fire ForestStructure (cycles), SiblingNameUnique (dup name), ForestStructure (orphan from non-leaf destroy). Total spec posture after P6-2: 15 modules / 18 fixed cfgs / 11 buggy cfgs. |
 
 ## ROADMAP §9.2 exit criteria status
 

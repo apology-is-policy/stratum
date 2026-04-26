@@ -38,21 +38,22 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `032db86` (P6-1 spec scaffold: `bptr.tla` + 3 configs
-  + 10-specs.md catalog entry; bumps spec posture from 13
-  modules / 16 fixed configs / 6 buggy demos to 14 / 17 / 8).
-  Phase 5 tagged `phase-5-complete` at `461e68e`.
+- **Tip**: TBD (P6-2 spec scaffold: `dataset.tla` + 4 configs
+  + 10-specs.md catalog entry; bumps spec posture to 15 modules
+  / 18 fixed configs / 11 buggy demos). Phase 5 tagged
+  `phase-5-complete` at `461e68e`.
 - **Phases**: 1–5 complete; **Phase 6 entered 2026-04-26**.
-  P6-1 first chunk in progress: `bptr.tla` (production scrub
-  cb protocol spec) lands first; production cb impl waits for
-  paddr→bptr resolver infrastructure (downstream P6 chunk).
-  Phase 7 pre-work (FastCDC chunking, P6-independent) available
-  in parallel.
+  P6-1 (bptr.tla protocol spec) landed at `032db86`. P6-2
+  (dataset.tla hierarchy spec) landing this commit. C
+  implementations of both pending — production scrub cb waits
+  for paddr→bptr resolver; dataset index tree's C impl is a
+  follow-on chunk. Phase 7 pre-work (FastCDC chunking,
+  P6-independent) available in parallel.
 - **Tests**: 28 suites × (default + ASan + TSan, serial) green.
   test_sync_multi 42; test_pool 48; test_scrub 30; test_alloc 32.
-- **Specs**: 14 TLA+ modules clean (17 fixed configs: legacy +
-  scrub_beta + scrub_durable + scrub_beta_durable + bptr) + 8
-  buggy-demo configs fire as expected.
+- **Specs**: 15 TLA+ modules clean (18 fixed configs: legacy +
+  scrub_beta + scrub_durable + scrub_beta_durable + bptr +
+  dataset) + 11 buggy-demo configs fire as expected.
 - **LOC**: ~26 KLOC across 21 src/ modules + 25 public headers.
 
 For phase-level status see `v2/docs/phase{2,3,4,5}-status.md`. The
