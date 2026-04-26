@@ -60,7 +60,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   perf bench harness.
 - **Tests**: 31 suites × (default + ASan + TSan, serial) green.
   test_sync_multi 42; test_pool 48; test_scrub 30; test_alloc 32;
-  test_cdc 12; test_dataset 57; test_snapshot 40; test_sync 24.
+  test_cdc 12; test_dataset 57; test_snapshot 41; test_sync 24.
 - **Specs**: 19 TLA+ modules clean (22 fixed configs: legacy +
   scrub_beta + scrub_durable + scrub_beta_durable + bptr +
   dataset + snapshot + property + clone + dead_list) + 19
