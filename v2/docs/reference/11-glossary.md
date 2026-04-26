@@ -105,8 +105,8 @@ documents them in depth.
 | 3 | Single-device sync + uberblock + allocator + R6-R12 audits. |
 | 4 | AEAD-AD + per-extent integrity + keyschema + PQ-hybrid wrap + janus + R13-R14b audits. |
 | 5 | Multi-device pool + quorum commit + mirror(n) + device lifecycle + scrub (α + β) + R15-R23+ audits. |
-| 6 | Extent manager + namespace (datasets / snapshots / clones). |
-| 7 | CAS dedup tier. |
+| 6 | Namespace (datasets / snapshots / clones / dead-list). |
+| 7 | Extent layer + cold-tier (CAS) + send/recv + reflinks. |
 | 8 | 9P / FUSE surface. |
 | 9+ | Post-MVP (RS/LRC, tiering, send/recv, encryption-at-rest-with-rotation sweep). |
 
@@ -155,6 +155,16 @@ closed items.
 | **dead-list** | Per-snapshot list of blocks that have been COW'd-away from the live dataset since the snapshot was created. On snapshot delete, blocks UNIQUE to the snap (not in successor's dead-list) are freed; SURVIVING blocks (in both S's and successor's dead-list) migrate to predecessor's dead-list. Algorithm is O(blocks COW'd during S's lifetime), not O(tree). ARCH §8.5.5; spec `dead_list.tla`. |
 | **next_dead** | Synonym for the per-snapshot dead-list (ZFS terminology). The "next" reflects "next snapshot to be deleted will free or migrate these blocks". |
 | **most_recent_snap** | The newest PRESENT snapshot. New COW'd blocks are added to its dead-list. After SnapDelete of the most-recent, recomputed by walking PRESENT snaps. |
+
+## Phase 7 / extent terms
+
+| Term | Meaning |
+|---|---|
+| **extent record** | The 32-byte per-extent metadata `(paddr, write_gen, dlen, clen+comp, xxh)` that maps a logical file byte range to a physical paddr. Lives in a per-(dataset, ino) Bε-tree keyed by file offset. ARCH §11.6.1; spec `extent.tla`. |
+| **extent tree** | The per-inode Bε-tree of `(file_offset → extent_record)` mappings. One per inode per dataset. Keyed by `(ino, type=DATA, offset)`. ARCH §11.6.2. |
+| **NoOverlapWithinIno** | extent.tla load-bearing invariant: no two extents in the same `(ds, ino)` cover overlapping byte ranges. A read at any offset resolves to exactly one extent or a hole. |
+| **PaddrFreshness** | extent.tla invariant: every extent's paddr is in `used_paddrs`, which grows monotonically. With Write/Overwrite refusing previously-used paddrs, no two extents share a paddr at any time. Composes with allocator.tla::NoReuseInSameGen for end-to-end (paddr, gen)-pair nonce uniqueness. |
+| **OverwriteBlock cb (extent → snapshot)** | When extent.tla::Overwrite drops an extent, the C impl calls `stm_snapshot_index_overwrite_block(paddr)` to either route the paddr into the most-recent snap's dead-list or signal the caller to free directly. The composition between extent.tla and dead_list.tla is realized at the C-impl boundary. |
 
 ## Policy terms
 

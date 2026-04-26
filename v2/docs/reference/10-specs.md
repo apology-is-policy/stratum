@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Stratum v2 ships 19 TLA+ spec modules covering every load-bearing
+Stratum v2 ships 20 TLA+ spec modules covering every load-bearing
 invariant in the implementation. The specs are the **source of
 truth** for protocol-level behavior; code is an implementation of
 the spec (CLAUDE.md: "spec-first policy"). When the two disagree,
@@ -39,9 +39,10 @@ chapter as specs get wider cross-reference tables).
 | `property.tla` | 6 | Per-dataset property inheritance — local override / inheritable walk / non-inheritable + immutable-at-create. | 1040 states, depth 11 (MaxDatasets=2, 3 props, 2 values) | `property_inherit_non_inh_buggy.cfg`, `property_mutate_immutable_buggy.cfg` |
 | `clone.tla` | 6 | Clone (writable snapshot) lifecycle — clone-from-snap + snap-with-clones-undeletable + promote-breaks-dependency. | 161 states, depth 11 (MaxDatasets=3, MaxSnaps=2) | `clone_delete_snap_with_clones_buggy.cfg` |
 | `dead_list.tla` | 6 | Block-level reachability + per-snapshot dead-list incremental maintenance during COW + ZFS-style SnapDelete (free-unique + merge-surviving-into-pred). | 5656 states, depth 15 (MaxBlocks=4, MaxSnaps=3) | `dead_list_overwrite_forgets_buggy.cfg`, `dead_list_delete_forgets_free_buggy.cfg`, `dead_list_merge_includes_freed_buggy.cfg` |
+| `extent.tla` | 7 | Per-(dataset, ino) extent layout — Write / Overwrite / Truncate / DeleteFile / AdvanceTxg + no-overlap-within-ino + length-positive + birth-txg-bound + paddr-freshness. P7 entry chunk. | 1216 states, depth 6 (MaxDatasets=1, MaxInos=2, MaxFileBlocks=2, MaxPaddrs=3, MaxTxg=1) | `extent_overlap_buggy.cfg`, `extent_zero_length_buggy.cfg`, `extent_overwrite_forgets_drop_buggy.cfg` |
 
-All 22 fixed configs green (one per module + `scrub_beta` +
-`scrub_durable` + `scrub_beta_durable` extending `scrub.tla`). All 19
+All 23 fixed configs green (one per module + `scrub_beta` +
+`scrub_durable` + `scrub_beta_durable` extending `scrub.tla`). All 22
 buggy configs reproduce their designed invariant violations.
 
 ## Per-module invariants
@@ -865,6 +866,74 @@ C impl status: P6-deadlist landed at `18b9289` + R33 close
 with `le32 dead_count + le64 paddrs[N]`; cap STM_SNAP_DEAD_LIST_MAX
 = 256. STM_UB_VERSION 10 → 11.
 
+### `extent.tla` — per-(dataset, ino) extent layout (P7-1 entry)
+
+Models the LOGICAL extent layer that connects datasets (the
+namespace P6 built) to actual stored bytes. Entry chunk for
+Phase 7. Sibling specs:
+
+- `allocator.tla` — paddr nonce-uniqueness via `NoReuseInSameGen`
+  (extent.tla treats paddrs as fresh from the allocator).
+- `dead_list.tla` — extent.tla's Overwrite is the C-impl trigger
+  for dead_list.tla's `OverwriteBlock(paddr)` on each dropped
+  extent's paddr.
+- `metadata_nonce.tla` — multi-device paddr stamping.
+
+Actions:
+
+- `Write(ds, ino, off, len, paddr)` — insert fresh extent at
+  `(off, len)`. Preconditions: paddr fresh, `off + len ≤
+  MaxFileBlocks`, `len ≥ 1`, no overlap with existing in-(ds, ino)
+  extents.
+- `Overwrite(ds, ino, off, len, new_paddr)` — drop the
+  overlapping olds, insert the fresh extent. The C impl pairs each
+  drop with a `OverwriteBlock(old.paddr)` call into the snapshot
+  layer (composition deferred to the C impl, not modeled in TLC).
+- `Truncate(ds, ino, new_size)` — drop extents whose `off ≥
+  new_size`. Partial-extent shrinking (extent crossing the
+  boundary) is a C-impl detail not modeled here.
+- `DeleteFile(ds, ino)` — drop all extents for (ds, ino).
+- `AdvanceTxg` — bump current_txg.
+
+Invariants:
+
+- `TypeOK`.
+- `NoOverlapWithinIno` — load-bearing: two distinct extents in
+  the same (ds, ino) cannot cover overlapping byte ranges.
+  Reads must resolve to ≤ 1 extent.
+- `LengthPositive` — every extent has `len ≥ 1`.
+- `BirthTxgBound` — every extent's `gen ≤ current_txg`.
+- `AllExtentsInBounds` — `off + len ≤ MaxFileBlocks`.
+- `PaddrFreshness` — every extent's paddr is in `used_paddrs`.
+  The monotonic-grow property of `used_paddrs` + the `paddr ∉
+  used_paddrs` precondition on Write/Overwrite imply no two
+  extents share a paddr at any time.
+
+CONSTANTS (bounded TLC scope):
+
+- `MaxDatasets ≥ 1`, `MaxInos ≥ 1`, `MaxFileBlocks ≥ 1`,
+  `MaxPaddrs ≥ 1`, `MaxTxg ≥ 1`.
+- `BuggyWriteAllowsOverlap` — Write skips no-overlap
+  precondition. `NoOverlapWithinIno` fires.
+- `BuggyZeroLength` — Write allows `len = 0`. `LengthPositive`
+  fires.
+- `BuggyOverwriteForgetsDrop` — Overwrite inserts the new without
+  dropping overlapping olds. `NoOverlapWithinIno` fires.
+
+Out of scope:
+
+- Compression metadata (`se_clen_and_comp`).
+- Per-extent integrity (xxHash3 / AEAD tag).
+- Reflinks / refcount-share (Phase 7 §10.4).
+- CAS / cold tier (Phase 7 §10.1, separate spec).
+- Coalescing (quality-of-implementation).
+
+C impl status: pending. Spec scaffold landed; C impl chunk (P7-2)
+will extend `src/` with an extent module + extent btree wired
+through sync. The Overwrite-cb composition with
+`stm_snapshot_index_overwrite_block` realizes the dead_list.tla
+integration end-to-end.
+
 ## Running TLC
 
 ```bash
@@ -878,7 +947,7 @@ java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
 # Full sweep — fixed configs (one per module; scrub has 3 extra configs).
 for s in sync concurrency structural balanced merge allocator merkle \
          key_schema quorum metadata_nonce device_lifecycle evac scrub \
-         bptr dataset snapshot property clone; do
+         bptr dataset snapshot property clone dead_list extent; do
   echo "== $s ==" && \
   java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
       -config $s.cfg $s.tla 2>&1 | tail -3
