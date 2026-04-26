@@ -55,8 +55,8 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   `ee45a0d` + R32 `4503405`; P6-deadlist C impl
   `18b9289` + R33 `d4efeeb`. P6-perf bench `d4c6708`.
   Phase 7 entry: P7-1 spec scaffold (extent.tla) `4eace52`.
-  **P7-2 extent C impl `<P7-2-c-impl>` (this commit)**. R34 audit
-  close pending. Phase 7 pre-work FastCDC `5cb8900` + R27 close
+  **P7-2 extent C impl `732b20e` + R34 close `<R34-close>` (this
+  commit)**. Phase 7 pre-work FastCDC `5cb8900` + R27 close
   `a2ffd38`. Pending: P7-3 extent persistence (format break
   v11→v12); production scrub cb (unblocks once P7-3 lands the
   paddr→bptr resolver via extent walk); sync.c integration of
@@ -64,7 +64,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 - **Tests**: 32 suites × (default + ASan + TSan, serial) green.
   test_sync_multi 42; test_pool 48; test_scrub 30; test_alloc 32;
   test_cdc 12; test_dataset 57; test_snapshot 41; test_sync 24;
-  test_extent_index 31.
+  test_extent_index 32.
 - **Specs**: 20 TLA+ modules clean (23 fixed configs: legacy +
   scrub_beta + scrub_durable + scrub_beta_durable + bptr +
   dataset + snapshot + property + clone + dead_list + extent) +

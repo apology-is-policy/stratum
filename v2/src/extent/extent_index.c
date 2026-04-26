@@ -241,9 +241,14 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
                                   uint64_t new_paddr, uint64_t write_gen,
                                   uint64_t **out_dropped_paddrs,
                                   size_t *out_n_dropped) {
-    if (!idx || !out_dropped_paddrs || !out_n_dropped) return STM_EINVAL;
+    /* R34 P2-1: zero out-args before any early return so the header
+     * "On failure, *out_dropped_paddrs is NULL and *out_n_dropped is
+     * 0" contract holds even when idx==NULL but the out-arg pointers
+     * are valid. */
+    if (!out_dropped_paddrs || !out_n_dropped) return STM_EINVAL;
     *out_dropped_paddrs = NULL;
     *out_n_dropped      = 0;
+    if (!idx) return STM_EINVAL;
     if (dataset_id == 0 || ino == 0) return STM_EINVAL;
     if (len == 0) return STM_EINVAL;
     if (new_paddr == 0) return STM_EINVAL;
@@ -408,9 +413,11 @@ stm_status stm_extent_truncate(stm_extent_index *idx,
                                   uint64_t new_size,
                                   uint64_t **out_dropped_paddrs,
                                   size_t *out_n_dropped) {
-    if (!idx || !out_dropped_paddrs || !out_n_dropped) return STM_EINVAL;
+    /* R34 P2-1: zero out-args before any early return. */
+    if (!out_dropped_paddrs || !out_n_dropped) return STM_EINVAL;
     *out_dropped_paddrs = NULL;
     *out_n_dropped      = 0;
+    if (!idx) return STM_EINVAL;
     if (dataset_id == 0 || ino == 0) return STM_EINVAL;
 
     must_lock(&idx->lock);
@@ -427,9 +434,11 @@ stm_status stm_extent_delete_file(stm_extent_index *idx,
                                     uint64_t dataset_id, uint64_t ino,
                                     uint64_t **out_dropped_paddrs,
                                     size_t *out_n_dropped) {
-    if (!idx || !out_dropped_paddrs || !out_n_dropped) return STM_EINVAL;
+    /* R34 P2-1: zero out-args before any early return. */
+    if (!out_dropped_paddrs || !out_n_dropped) return STM_EINVAL;
     *out_dropped_paddrs = NULL;
     *out_n_dropped      = 0;
+    if (!idx) return STM_EINVAL;
     if (dataset_id == 0 || ino == 0) return STM_EINVAL;
 
     must_lock(&idx->lock);

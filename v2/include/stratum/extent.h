@@ -312,7 +312,15 @@ stm_status stm_extent_lookup_at(const stm_extent_index *idx,
  * Iterate every live extent of (ds, ino) in off-ascending order.
  * Returns false from the callback to terminate early. Callback runs
  * under the index's mutex; MUST NOT call back into stm_extent_*
- * (deadlock — ERRORCHECK mutex returns EDEADLK on reentry).
+ * (deadlock — ERRORCHECK mutex returns EDEADLK on reentry). The
+ * record pointer passed to the callback is valid only for the
+ * callback's lifetime — DO NOT retain it past the callback's return
+ * (a concurrent mutator may realloc the records array, leaving the
+ * saved pointer dangling). R34 P3-1.
+ *
+ * Returns: STM_OK on completion (whether cb terminated early or not),
+ * STM_EINVAL on bad args, STM_ENOMEM if the temporary order index
+ * fails to allocate.
  */
 typedef bool (*stm_extent_iter_cb)(const stm_extent_record *e, void *ctx);
 

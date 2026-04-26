@@ -74,7 +74,40 @@ STM_TEST(ex_index_advance_txg) {
     STM_ASSERT_ERR(stm_extent_index_advance_txg(idx, 14), STM_EINVAL);
     STM_ASSERT_OK(stm_extent_index_current_txg(idx, &t));
     STM_ASSERT_EQ(t, (uint64_t)15);
+    /* R34 P3-2: NULL-idx parity. */
+    STM_ASSERT_ERR(stm_extent_index_advance_txg(NULL, 0), STM_EINVAL);
+    STM_ASSERT_ERR(stm_extent_index_current_txg(NULL, &t), STM_EINVAL);
     stm_extent_index_close(idx);
+}
+
+/* R34 P2-1: out-arg zeroing must happen even on idx==NULL early return.
+ * A caller passing un-initialized stack out-args MUST observe NULL/0
+ * after a failure, per the header contract "On failure,
+ * *out_dropped_paddrs is NULL and *out_n_dropped is 0". */
+STM_TEST(ex_mutators_zero_out_args_on_null_idx) {
+    /* Initialize out-args to non-zero "garbage" — fix must overwrite. */
+    uint64_t *dropped = (uint64_t *)0xDEADBEEFul;
+    size_t    n       = 99;
+
+    STM_ASSERT_ERR(stm_extent_overwrite(NULL, 1, 1, 0, 4096, 0xAA, 0,
+                                           &dropped, &n),
+                       STM_EINVAL);
+    STM_ASSERT_TRUE(dropped == NULL);
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    dropped = (uint64_t *)0xDEADBEEFul;
+    n       = 99;
+    STM_ASSERT_ERR(stm_extent_truncate(NULL, 1, 1, 0, &dropped, &n),
+                       STM_EINVAL);
+    STM_ASSERT_TRUE(dropped == NULL);
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    dropped = (uint64_t *)0xDEADBEEFul;
+    n       = 99;
+    STM_ASSERT_ERR(stm_extent_delete_file(NULL, 1, 1, &dropped, &n),
+                       STM_EINVAL);
+    STM_ASSERT_TRUE(dropped == NULL);
+    STM_ASSERT_EQ(n, (size_t)0);
 }
 
 /* ------------------------------------------------------------------ */

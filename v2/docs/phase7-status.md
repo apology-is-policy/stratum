@@ -74,8 +74,15 @@ into the CAS tier (which DOES need P6) is a separate concern.
       TLC: 1216 distinct states / depth 6 (MaxDatasets=1, MaxInos=2,
       MaxFileBlocks=2, MaxPaddrs=3, MaxTxg=1). Spec posture
       19/22/19 → 20/23/22.
-- [x] **P7-2 extent C impl** — landed at `<P7-2-c-impl>`.
-      R34 audit close pending. New `src/extent/extent_index.c` module
+- [x] **P7-2 extent C impl** — landed at `732b20e`; R34 close
+      `<R34-close>` (0 P0 / 0 P1 / 4 P2 / 4 P3 — P2-1 (out-arg
+      zeroing on idx==NULL), P2-3 (iter cb pointer-retain doc),
+      P3-1 (iter return-code doc) + P3-2 (advance_txg NULL test)
+      fixed inline; P2-2 (concurrent-stress scope) + P2-4
+      (cb-NULL-check pre-lock; already correct) + P3-3 (size_t
+      overflow guard) + P3-4 (mutexattr return code) deferred per
+      audit close commit message). New `src/extent/extent_index.c`
+      module
       realizing extent.tla against an in-RAM map; the AEAD wrap
       helpers in `src/extent/extent.c` (Phase 4) coexist
       unchanged. Public API surface: `stm_extent_index_create /
