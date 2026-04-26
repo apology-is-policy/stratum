@@ -172,7 +172,7 @@ checked at the extent boundary on every read.
 | 4 | ✅ complete | AEAD-AD + per-extent integrity + keyschema + PQ-hybrid wrap + janus + R13-R14b audits. | phase4-status.md |
 | 5 | ✅ complete | Multi-device pool + roster + quorum + scrub-α/β/γ. R15-R26 audits closed. Tagged `phase-5-complete` at `461e68e`. | phase5-status.md |
 | 6 | ✅ namespace feature-complete | Dataset / snapshot / clone / property / dead-list C impls + persistence. ROADMAP §9.2 5/5 exit criteria met. R27-R33 closed. | phase6-status.md |
-| 7 | 🚧 in progress | P7-prework FastCDC + P7-1 extent.tla spec + P7-2 extent C impl (in-RAM MVP) + P7-3 extent persistence (UB v11→v12) + P7-4 fs.c/sync.c COW integration (POSIX-shape stm_fs_write / stm_fs_read with full drop-routing). R27, R34, R35 closed; R36 audit close pending. Pending: P7-5 production scrub cb (now unblocked), CAS, send/recv, reflinks. | phase7-status.md |
+| 7 | 🚧 in progress | P7-prework FastCDC + P7-1 extent.tla spec + P7-2 extent C impl (in-RAM MVP) + P7-3 extent persistence (UB v11→v12) + P7-4 fs.c/sync.c COW integration (POSIX-shape stm_fs_write / stm_fs_read with full drop-routing). R27, R34, R35, R36 closed. Pending: P7-5 production scrub cb (now unblocked), CAS, send/recv, reflinks. | phase7-status.md |
 
 ## Test posture
 

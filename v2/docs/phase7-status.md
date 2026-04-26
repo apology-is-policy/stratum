@@ -116,8 +116,17 @@ into the CAS tier (which DOES need P6) is a separate concern.
       commit on `sync_commit`, close on `sync_close`. New
       accessor `stm_sync_extent_index`. v11 pools refused at v12
       mount via uniform STM_EBADVERSION (existing handler).
-- [x] **P7-4 fs.c/sync.c COW path integration** — landed at `<P7-4>`.
-      R36 audit close pending. New
+- [x] **P7-4 fs.c/sync.c COW path integration** — landed at `bb2d666`;
+      R36 close `<R36-close>` (1 P0 + 3 P1 + 3 P2 + 3 P3 — P0-1
+      (use-after-free via fs->lock release/reacquire) + P1-1
+      (paddr leak in drop loop) + P1-2 (wedge-guard race; same
+      root cause as P0-1) + P1-3 (AEAD mode autodetect drift) +
+      P2-1 (drop-loop comment-vs-impl drift) + P3-1 (advance_txg
+      STM_EINVAL-impossibility doc gap) all fixed inline; P2-2
+      (read-path bounds asymmetry) + P2-3 (hole-spans-len vs
+      hole-up-to-next-extent) + P3-2 (write/read len==0 asymmetry)
+      + P3-3 (snap-deleted-then-cow + multi-snap test scenarios)
+      deferred per audit close commit message). New
       `stm_sync_write_extent` / `stm_sync_read_extent` in sync.c
       compose alloc.reserve + AEAD encrypt + bdev.write +
       extent_overwrite + drop-routing. New helper

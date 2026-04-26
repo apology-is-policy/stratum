@@ -1057,7 +1057,9 @@ stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
     /* P7-4 (R35 forward note): advance extent_idx->current_txg to
      * match the live current_gen so any pre-first-commit extent_write
      * passes BirthTxgBound. Without this, extent_idx->current_txg
-     * starts at 0 but sync->current_gen starts at 1. */
+     * starts at 0 but sync->current_gen starts at 1. R36 P3-1:
+     * STM_EINVAL is impossible because extent_idx->current_txg=0 and
+     * s->current_gen=1; advance is strictly increasing. */
     (void)stm_extent_index_advance_txg(s->extent_idx, s->current_gen);
 
     *out_sync = s;
@@ -1694,7 +1696,10 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
      * because extent_idx->current_txg is stuck at max(persisted gen).
      * sync_commit advances on every commit too, but sync_open is the
      * first opportunity and any pre-first-commit extent_write would
-     * otherwise fail. */
+     * otherwise fail. R36 P3-1: STM_EINVAL is impossible because
+     * extent_idx->current_txg post-load_at = max(persisted write_gen)
+     * ≤ persisted s->auth_gen ≤ s2->current_gen; advance is non-
+     * regressing (the equal case is a no-op). */
     (void)stm_extent_index_advance_txg(s2->extent_idx, s2->current_gen);
 
     *out_sync = s2;
@@ -3574,7 +3579,15 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
     if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
 
-    stm_aead_mode mode = stm_aead_autodetect();
+    /* R36 P1-3: hardcode AEGIS-256 to match the rest of the tree
+     * (btree_store, janus passphrase backend). Using stm_aead_autodetect
+     * here was non-portable: a pool created on a host with AES-NI would
+     * use AEGIS-256 (32-byte tag) but reading on a host without AES-NI
+     * (or after a libsodium upgrade flipping the probe) would get
+     * XChaCha20-SIV (16-byte tag), tag-len mismatch → STM_EBADTAG.
+     * Persisting the mode in the extent record would need a format
+     * break; pinning AEGIS-256 here is the simpler portable fix. */
+    stm_aead_mode mode = STM_AEAD_AEGIS256;
     size_t tag_len = stm_aead_tag_len(mode);
     if (tag_len == 0) {
         pthread_mutex_unlock(&s->lock);
@@ -3657,22 +3670,22 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
         return os;
     }
 
+    /* R36 P1-1 + P2-1: best-effort drain. The prior version returned
+     * on the first error, leaking subsequent paddrs in alloc (still
+     * marked ALLOCATED but no extent references them). Now: continue
+     * iterating, save the first error, propagate it. The most
+     * realistic failure is STM_ENOSPC (a snapshot at the
+     * STM_SNAP_DEAD_LIST_MAX = 256 cap); the cap was meant to bound
+     * memory, not silently kill subsequent COW. */
+    stm_status drop_err = STM_OK;
     for (size_t i = 0; i < n_dropped; i++) {
         stm_status drs = sync_drop_paddr_locked(s, dataset_id, dropped[i]);
-        if (drs != STM_OK) {
-            /* Best effort — continue to drain the rest. The first
-             * error is propagated. Partial drop on this path is
-             * recoverable (allocator's PENDING tracking sweeps next
-             * commit; snapshot dead-list is durable post-commit). */
-            free(dropped);
-            pthread_mutex_unlock(&s->lock);
-            return drs;
-        }
+        if (drs != STM_OK && drop_err == STM_OK) drop_err = drs;
     }
     free(dropped);
 
     pthread_mutex_unlock(&s->lock);
-    return STM_OK;
+    return drop_err;
 }
 
 stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
@@ -3706,7 +3719,8 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     if (rec.off != off) { pthread_mutex_unlock(&s->lock); return STM_EINVAL; }
     if (len > rec.len) { pthread_mutex_unlock(&s->lock); return STM_EINVAL; }
 
-    stm_aead_mode mode = stm_aead_autodetect();
+    /* R36 P1-3: hardcode AEGIS-256 — see write path for rationale. */
+    stm_aead_mode mode = STM_AEAD_AEGIS256;
     size_t tag_len = stm_aead_tag_len(mode);
     if (tag_len == 0) { pthread_mutex_unlock(&s->lock); return STM_EINVAL; }
 

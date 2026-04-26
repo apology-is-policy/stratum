@@ -430,17 +430,26 @@ stm_status stm_fs_commit(stm_fs *fs)
 }
 
 /* P7-4: POSIX-shape extent write/read. Thin wrappers over the sync
- * layer's stm_sync_write_extent / stm_sync_read_extent. The sync
- * layer takes its own mutex; here we just enforce the wedged +
- * read-only guards. */
+ * layer's stm_sync_write_extent / stm_sync_read_extent.
+ *
+ * R36 P0-1 + P1-2: hold fs->lock through the inner sync call.
+ * Releasing fs->lock between guard and sync invocation opened a
+ * use-after-free race against concurrent stm_fs_unmount (which
+ * destroys sync's mutex while the released-fs-lock window was
+ * about to dereference it) and a wedge-state-guard race (a
+ * stm_fs_mark_wedged in the released window let the write through).
+ * Lock hierarchy fs.lock OUTER → sync.lock INNER (fs.c:25) permits
+ * this; matches the existing reserve/free/commit pattern. */
 stm_status stm_fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                           uint64_t off, const void *buf, size_t len)
 {
     if (!fs) return STM_EINVAL;
     pthread_mutex_lock(&fs->lock);
     FS_GUARD_WRITE(fs);
+    stm_status s = stm_sync_write_extent(fs->sync, dataset_id, ino, off,
+                                            buf, len);
     pthread_mutex_unlock(&fs->lock);
-    return stm_sync_write_extent(fs->sync, dataset_id, ino, off, buf, len);
+    return s;
 }
 
 stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
@@ -450,9 +459,10 @@ stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (!fs) return STM_EINVAL;
     pthread_mutex_lock(&fs->lock);
     FS_GUARD_READ(fs);
+    stm_status s = stm_sync_read_extent(fs->sync, dataset_id, ino, off,
+                                           buf, len, out_read);
     pthread_mutex_unlock(&fs->lock);
-    return stm_sync_read_extent(fs->sync, dataset_id, ino, off,
-                                  buf, len, out_read);
+    return s;
 }
 
 /* ========================================================================= */
