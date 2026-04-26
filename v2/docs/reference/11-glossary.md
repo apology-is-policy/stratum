@@ -132,6 +132,25 @@ closed items.
 | R24 | P5-5-β scope (scrub repair via cb). | `52503fe` |
 | R25 | Backlog hygiene (R23 P3-2 + R20 P3-2/P3-3). | `cd6cb04` |
 | R26 | P5-durable-cursors scope (γ scrub + STM_UB_VERSION 7→8). | `a6249eb` |
+| R27 | P7-prework FastCDC content-defined chunking. | `a2ffd38` |
+| R28 | P6-2 dataset-module C impl scope. | `bdb888b` |
+| R29 | P6-3 snapshot-module C impl scope. | `000d394` |
+| R30 | P6-4 property API on dataset module. | `8be3628` |
+| R31 | P6-persist (dataset + snapshot persistent storage + UB v8→v9). | `bffee62` |
+| R32 | P6-clone (clone C impl + UB v9→v10). | (close pending) |
+
+## Phase 6 / clone terms
+
+| Term | Meaning |
+|---|---|
+| **dataset** | A node in the pool's namespace forest. Each has a unique id, parent_id, name, and metadata (created_txg, flags, next_ino, properties). Root is id=1. ARCH §8.3. |
+| **clone** | A dataset with a non-zero `origin_snap_id` referencing a snapshot. Structurally a regular dataset; the back-reference enables `clone.tla::SnapWithClonesUndeletable`. ARCH §8.6. |
+| **promote** | Operation that clears a clone's `origin_snap_id` to `STM_DATASET_NO_ORIGIN`. After promote, the dataset is no longer a clone; the previously-referenced snap can be deleted if no other clones reference it. ARCH §8.6.2. |
+| **CloneOriginPresent** | clone.tla invariant: every present clone's `origin_snap_id` references a present snapshot. Operationally enforced via the snap-delete cb. |
+| **SnapWithClonesUndeletable** | clone.tla invariant: a snapshot with one or more present clones cannot be deleted. Enforced through-stack via `stm_snapshot_index_set_clone_check_cb` registered by sync to query `stm_dataset_clones_count_for_snap`. |
+| **NO_ORIGIN / NO_PARENT / NO_PREV** | Sentinel values (all `((uint64_t)0)`) for absent references in dataset / snapshot fields. Disambiguate by FIELD they occupy, not by value. |
+| **`ub_main_root` / `ub_snap_root`** | Uberblock bptrs for the dataset / snapshot index trees. Populated post-P6-persist (`348d165`); content kinds `STM_BPTR_KIND_DATASET` (=9) and `STM_BPTR_KIND_SNAP` (=5). |
+| **`ub_main_root_gen` / `ub_snap_root_gen`** | AEAD gen trackers (le64) for the corresponding trees, symmetric to `ub_alloc_root_gen`. Required for mount-claim UBs that advance `ub_gen` past orphan writes without rewriting the trees. |
 
 ## Policy terms
 

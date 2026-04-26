@@ -87,6 +87,8 @@ reference below covers the as-built layers in bottom-up order.
 | [09-scrub.md](reference/09-scrub.md) | Verify-only sweep + state machine | medium |
 | [10-specs.md](reference/10-specs.md) | TLA+ spec catalog + SPEC-TO-CODE dictionary | medium |
 | [11-glossary.md](reference/11-glossary.md) | Terms, acronyms, invariant names | small |
+| [12-dataset.md](reference/12-dataset.md) | Dataset hierarchy + properties + clones | large |
+| [13-snapshot.md](reference/13-snapshot.md) | Snapshot index + clone-check hook | medium |
 
 This is a live document — every phase-chunk commit that touches a
 subsystem updates the corresponding section in the same PR.

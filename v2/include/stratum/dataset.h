@@ -74,7 +74,14 @@ struct stm_bootstrap;  typedef struct stm_bootstrap  stm_bootstrap;
 /* Origin-snapshot sentinel. A dataset with `origin_snap_id ==
  * STM_DATASET_NO_ORIGIN` is a regular dataset; non-zero means it's a
  * clone of the referenced snapshot (clone.tla::IsClone). Snapshot ids
- * start at 1, so 0 is unambiguous. Matches `clone.tla::NoOrigin`. */
+ * start at 1, so 0 is unambiguous. Matches `clone.tla::NoOrigin`.
+ *
+ * Note that NO_PARENT (parent_id sentinel) and NO_ORIGIN
+ * (origin_snap_id sentinel) deliberately share the value 0. Each
+ * sentinel disambiguates by FIELD it occupies, not by value: parent_id
+ * vs origin_snap_id are distinct columns of the dataset entry, and 0
+ * is the natural "absence" value for both. STM_SNAP_NO_PREV (snapshot
+ * prev-chain sentinel) follows the same convention. */
 #define STM_DATASET_NO_ORIGIN    ((uint64_t)0)
 
 /*

@@ -688,8 +688,8 @@ stm_status stm_dataset_create_clone(stm_dataset_index *idx,
                                        uint64_t origin_snap_id,
                                        uint64_t *out_id) {
     if (!idx || !name || !out_id) return STM_EINVAL;
-    if (origin_snap_id == STM_DATASET_NO_ORIGIN) return STM_EINVAL;
     *out_id = 0;
+    if (origin_snap_id == STM_DATASET_NO_ORIGIN) return STM_EINVAL;
     size_t name_len = strlen(name);
     if (name_len == 0 || name_len > STM_DATASET_NAME_MAX) return STM_EINVAL;
 
@@ -698,6 +698,15 @@ stm_status stm_dataset_create_clone(stm_dataset_index *idx,
     if (idx->next_id == UINT64_MAX || idx->current_txg == UINT64_MAX) {
         must_unlock(&idx->lock);
         return STM_EOVERFLOW;
+    }
+
+    /* R32 P2-2: check self-reference BEFORE counter advances. The
+     * about-to-be-allocated id is `idx->next_id`; rejecting here
+     * leaves all in-RAM counters untouched, so we don't need a
+     * rollback path on this branch. */
+    if (origin_snap_id == idx->next_id) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
     }
 
     if (!is_present_locked(idx, parent_id)) {
@@ -721,17 +730,6 @@ stm_status stm_dataset_create_clone(stm_dataset_index *idx,
     idx->current_txg += 1;
 
     uint64_t id = idx->next_id++;
-    /* P6-clone: a clone cannot reference its own id. Defends against a
-     * caller that fabricates origin_snap_id from a UUID-like source. */
-    if (origin_snap_id == id) {
-        /* Roll back the slot allocation + counter advances so the
-         * caller-visible state is unchanged on this failure. */
-        idx->slots_len--;
-        idx->next_id--;
-        idx->current_txg--;
-        must_unlock(&idx->lock);
-        return STM_EINVAL;
-    }
     dataset_slot *s = &idx->slots[new_slot];
     s->e.id              = id;
     s->e.parent_id       = parent_id;

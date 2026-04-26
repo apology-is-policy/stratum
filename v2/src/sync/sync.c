@@ -1621,7 +1621,17 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
 void stm_sync_close(stm_sync *s)
 {
     if (!s) return;
-    /* P6-persist: close the dataset + snapshot indices first. They
+    /* R32 P2-1: un-register the clone-check cb BEFORE freeing
+     * dataset_idx. The cb's `ctx` is `s->dataset_idx`; without the
+     * un-register, snap_idx would briefly hold a stale pointer
+     * between the dataset_idx free and the snap_idx free. Single-
+     * threaded close paths don't invoke cb in that window, but
+     * future teardown sequences that snap-delete during shutdown
+     * would dereference freed memory. Three-line defensive hygiene. */
+    if (s->snap_idx) {
+        stm_snapshot_index_set_clone_check_cb(s->snap_idx, NULL, NULL);
+    }
+    /* P6-persist: close the dataset + snapshot indices. They
      * hold no exclusive resources beyond their own in-RAM state and
      * borrow the bdev + bootstrap + metadata_key from the alloc /
      * pool layer below. */
