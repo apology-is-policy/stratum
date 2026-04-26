@@ -989,6 +989,29 @@ STM_TEST(snap_overwrite_arg_validation) {
     stm_snapshot_index_close(idx);
 }
 
+STM_TEST(snap_overwrite_refuses_duplicate_paddr) {
+    /* R33 P2: single-ownership defense-in-depth. A paddr already
+     * tracked by some snap's dead_list cannot be appended again. */
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    uint64_t s1 = 0, s2 = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "first",  0, &s1));
+
+    bool sf;
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_block(idx, 1, 0xABCD, &sf));
+    /* Same paddr again → EINVAL (would be in the same slot). */
+    STM_ASSERT_ERR(stm_snapshot_index_overwrite_block(idx, 1, 0xABCD, &sf),
+                   STM_EINVAL);
+
+    /* Create a second snap; same paddr in OTHER snap also refused
+     * (cross-snap defense). */
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "second", 0, &s2));
+    STM_ASSERT_ERR(stm_snapshot_index_overwrite_block(idx, 1, 0xABCD, &sf),
+                   STM_EINVAL);
+
+    stm_snapshot_index_close(idx);
+}
+
 STM_TEST(snap_overwrite_caps_at_max) {
     /* dead_list.tla doesn't model a cap, but the C impl bounds the
      * in-line tail at STM_SNAP_DEAD_LIST_MAX. Beyond that, OverwriteBlock

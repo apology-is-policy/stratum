@@ -175,7 +175,9 @@ stm_status stm_snapshot_create(stm_snapshot_index *idx,
  * owns the array and MUST `free(*out_freed_paddrs)` when done; each
  * paddr in the array MUST be reclaimed via `stm_alloc_free` against
  * the appropriate device's allocator before the next sync_commit
- * (otherwise the blocks leak from tracking).
+ * (otherwise the blocks leak from tracking). Use
+ * `stm_paddr_device(paddr)` to route each freed paddr to the
+ * correct device's allocator (R33 P3-3).
  *
  * In dead_list.tla's bounded single-ownership model `surviving =
  * S.dead ∩ successor.dead = ∅`, so all of S's dead-list is
@@ -212,10 +214,18 @@ stm_status stm_snapshot_delete(stm_snapshot_index *idx,
  * Refused if:
  *   - dataset_id == 0 (STM_EINVAL).
  *   - paddr == 0 (STM_EINVAL — reserved sentinel).
+ *   - paddr is already tracked by some PRESENT snap's dead_list
+ *     (STM_EINVAL — single-ownership defense-in-depth, R33 P2).
+ *   - realloc fails growing the dead_list (STM_ENOMEM — prior
+ *     dead_list contents preserved, R33 P3-1).
  *   - the dataset's most-recent snap is at STM_SNAP_DEAD_LIST_MAX
  *     entries (STM_ENOSPC). Production-grade chunked dead-list is
  *     a future enhancement; the cap is generous for any small/
- *     medium snapshot but real datasets need chunking.
+ *     medium snapshot but real datasets need chunking. Callers
+ *     SHOULD propagate STM_ENOSPC up to the higher-level write
+ *     and refuse the COW (the alternative — direct-free + drop the
+ *     snap's claim on the paddr — would silently violate the
+ *     per-snap reachability invariant). R33 P3-5.
  */
 STM_MUST_USE
 stm_status stm_snapshot_index_overwrite_block(stm_snapshot_index *idx,

@@ -371,6 +371,26 @@ stm_status stm_snapshot_index_overwrite_block(stm_snapshot_index *idx,
     }
 
     snapshot_slot *slot = &idx->slots[s];
+
+    /* R33 P2: single-ownership defense-in-depth. dead_list.tla
+     * requires that a paddr appears in at most one PRESENT snap's
+     * dead_list at any time. The alloc layer's live-tracking is the
+     * de-jure prevention (the same paddr is never re-issued while it
+     * remains on a dead-list); this scan catches caller bugs upstream
+     * before they corrupt the in-RAM index and surface only at the
+     * next mount via sp_validate_shadow. Bounded by total live dead
+     * entries (≤ STM_SNAP_DEAD_LIST_MAX × n_snaps). */
+    for (size_t k = 0; k < idx->slots_len; k++) {
+        const snapshot_slot *sk = &idx->slots[k];
+        if (!sk->present) continue;
+        for (size_t j = 0; j < sk->dead_count; j++) {
+            if (sk->dead_list[j] == paddr) {
+                must_unlock(&idx->lock);
+                return STM_EINVAL;
+            }
+        }
+    }
+
     if (slot->dead_count >= STM_SNAP_DEAD_LIST_MAX) {
         must_unlock(&idx->lock);
         return STM_ENOSPC;
@@ -646,7 +666,10 @@ static stm_status sp_decode_value(uint64_t id, const uint8_t *in,
     out_slot->e.name[name_len] = '\0';
 
     if (dead_count > 0) {
-        out_slot->dead_list = malloc((size_t)dead_count * sizeof(uint64_t));
+        /* R33 P3-2: zero-initialized so a partial-paddr-decode error
+         * leaves the buffer free of stale or partial entries that a
+         * future caller might inadvertently read. */
+        out_slot->dead_list = calloc((size_t)dead_count, sizeof(uint64_t));
         if (!out_slot->dead_list) return STM_ENOMEM;
         out_slot->dead_capacity = dead_count;
         out_slot->dead_count    = dead_count;
@@ -1037,7 +1060,10 @@ static stm_status sp_validate_shadow(const sp_load_ctx *lc) {
 
     /* P6-deadlist single-ownership: a paddr appears in at most one
      * snap's dead_list. Bounded by STM_SNAP_DEAD_LIST_MAX × n_snaps,
-     * the O(N²) walk is fine for any plausible mount. */
+     * the O(N²) walk is fine for any plausible mount. R33 P3-4:
+     * production-grade chunked dead-list (deferred) needs a sorted-
+     * merge or hash-set replacement here to avoid mount-time DoS on
+     * crafted-but-byte-clean trees with very-long dead-lists. */
     for (size_t i = 0; i < lc->shadow_len; i++) {
         const snapshot_slot *si = &lc->shadow_slots[i];
         if (!si->present) continue;
