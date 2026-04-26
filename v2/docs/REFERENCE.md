@@ -38,15 +38,14 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `ee45a0d` (P6-clone: clone C impl + STM_UB_VERSION 9 →
-  10 — `origin_snap_id` field on `stm_dataset_entry`; new APIs
-  `stm_dataset_create_clone` / `_promote` / `_clones_count_for_snap`;
-  cross-module clone-check cb from snapshot module that sync
-  registers; SnapWithClonesUndeletable wired through). R32 audit
-  pending. Phase 5 tagged `phase-5-complete` at `461e68e`. Spec
-  posture: 18 modules / 21 fixed configs / 16 buggy demos
-  (unchanged this chunk — clone.tla already landed at `3db8b5e`;
-  this chunk adds the C impl).
+- **Tip**: `4503405` (P6-clone R32 audit close: 0 P0 + 0 P1 +
+  2 P2 + 4 P3 — all addressed; cb un-register on close, refactored
+  self-id check, deterministic *out_id init, sentinel-share doc
+  comment, new reference docs `12-dataset.md` + `13-snapshot.md`).
+  Phase 5 tagged `phase-5-complete` at `461e68e`. Spec posture: 18
+  modules / 21 fixed configs / 16 buggy demos (unchanged this
+  chunk — clone.tla already landed at `3db8b5e`; this chunk adds
+  the C impl).
 - **Phases**: 1–5 complete; **Phase 6 progressing**.
   Spec scaffolds: P6-1 (bptr.tla) `032db86`; P6-2 (dataset.tla)
   `75f6a3f`; P6-3 (snapshot.tla) `8813027`; P6-4 (property.tla)
