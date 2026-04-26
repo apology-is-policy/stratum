@@ -22,7 +22,16 @@
  */
 #include <stratum/cdc.h>
 
+#include <limits.h>
 #include <string.h>
+
+/* R27 P1-1: hardcap must fit in uint32_t so max_size = avg_size * 4u
+ * doesn't silently wrap when avg_size approaches the cap. The hardcap
+ * is 1 GiB = 0x40000000, exactly UINT32_MAX/4 + 1 — one bit away from
+ * trouble. This static assert guarantees the relationship survives
+ * any future hardcap edit. */
+_Static_assert((uint64_t)STM_CDC_MAX_SIZE_HARDCAP <= UINT32_MAX,
+               "STM_CDC_MAX_SIZE_HARDCAP must fit in uint32_t");
 
 /*
  * SplitMix64 — fast, well-distributed 64-bit PRNG. We use it for two
@@ -32,8 +41,8 @@
  * handles built with the same params produce byte-identical state.
  */
 #define STM_CDC_GEAR_SEED         0x53544D4344437632ULL  /* "STMCDCv2" */
-#define STM_CDC_MASK_STRICT_SEED  0x53544D4350435F53ULL  /* "STMCPC_S" */
-#define STM_CDC_MASK_LOOSE_SEED   0x53544D4350435F4CULL  /* "STMCPC_L" */
+#define STM_CDC_MASK_STRICT_SEED  0x53544D4344435F53ULL  /* "STMCDC_S" — R27 P3-1 */
+#define STM_CDC_MASK_LOOSE_SEED   0x53544D4344435F4CULL  /* "STMCDC_L" */
 
 static inline uint64_t splitmix64_step(uint64_t *s) {
     *s += 0x9E3779B97F4A7C15ULL;
@@ -68,7 +77,10 @@ static uint64_t derive_mask(uint32_t pop, uint64_t seed) {
     return mask;
 }
 
-/* floor(log2(x)) for x > 0. Returns 0 for x = 0 (degenerate). */
+/* floor(log2(x)) for x > 0. Caller-precondition: x != 0. Returns 0
+ * for x = 0 as a defensive fallback; documented at the only callsite
+ * (stm_cdc_make_params) where avg_size >= 1024 has already been
+ * validated, so x = 0 is unreachable. R27 P3-3. */
 static uint32_t floor_log2_u32(uint32_t x) {
     if (x == 0) return 0;
     uint32_t r = 0;
@@ -89,13 +101,28 @@ static void cdc_init_gear(uint64_t gear[256]) {
     }
 }
 
-/* Validate parameters against constraints from cdc.h. */
+/* Validate parameters against constraints from cdc.h.
+ *
+ * R27 P2-1: a zero strict mask makes `(fp & mask) == 0` always true
+ * → boundary fires at min_size+1 every call → pathological min-size
+ * chunks with no shift-resistance. Reject. Symmetrically, a zero
+ * loose mask in a non-empty loose region (avg < max) creates the
+ * same trap inside the loose region; reject too. (Permitting
+ * mask_loose=0 when avg == max is fine because the loose region is
+ * empty by construction in that case.)
+ *
+ * Note on __builtin_popcountll: GCC/Clang extension. The whole v2
+ * tree relies on these compilers (sanitizer toggles, cmake settings),
+ * so the dependency is project-wide and accepted.
+ */
 static stm_status validate_params(const stm_cdc_params *p) {
     if (!p) return STM_EINVAL;
     if (p->min_size == 0) return STM_EINVAL;
     if (p->min_size > p->avg_size) return STM_EINVAL;
     if (p->avg_size > p->max_size) return STM_EINVAL;
     if ((uint64_t)p->max_size > STM_CDC_MAX_SIZE_HARDCAP) return STM_EINVAL;
+    if (p->mask_strict == 0) return STM_EINVAL;
+    if (p->avg_size < p->max_size && p->mask_loose == 0) return STM_EINVAL;
     /* mask popcounts: strict must be at least loose (cdc.h contract). */
     int popcnt_strict = __builtin_popcountll(p->mask_strict);
     int popcnt_loose  = __builtin_popcountll(p->mask_loose);
@@ -119,19 +146,31 @@ stm_status stm_cdc_make_params(uint32_t avg_size, stm_cdc_params *out) {
     if (avg_size < 1024u) return STM_EINVAL;
     if (avg_size > STM_CDC_MAX_SIZE_HARDCAP / 4u) return STM_EINVAL;
 
+    /* R27 P1-1: compute via uint64 + check before assigning so that any
+     * future hardcap relaxation can't wrap max_size silently. The
+     * static assert above pins STM_CDC_MAX_SIZE_HARDCAP <= UINT32_MAX
+     * for the current compile, so this check is belt-and-suspenders. */
+    uint64_t mx = (uint64_t)avg_size * 4u;
+    if (mx > UINT32_MAX) return STM_EINVAL;
+
     out->avg_size = avg_size;
     out->min_size = avg_size / 4u;
-    out->max_size = avg_size * 4u;
+    out->max_size = (uint32_t)mx;
 
     /* Normalized chunking, level 2 (±2 bits around log2(avg_size)).
      * Strict has more bits set → match probability lower in the
      * pre-avg region → fewer chunks below avg_size. Loose has fewer
      * bits set → higher probability post-avg → boundaries detected
-     * before max_size with high probability. */
+     * before max_size with high probability.
+     *
+     * R27 P2-2: clamp pop_loose >= 1 so mask_loose is always non-zero.
+     * Defense-in-depth against future floor-relaxation that could
+     * otherwise bypass validate_params' mask_loose=0 rejection. */
     uint32_t log2_avg = floor_log2_u32(avg_size);
     uint32_t pop_strict = log2_avg + 2u;
     uint32_t pop_loose  = log2_avg >= 2u ? log2_avg - 2u : 0u;
     if (pop_strict >= 64u) pop_strict = 63u;
+    if (pop_loose < 1u) pop_loose = 1u;
 
     out->mask_strict = derive_mask(pop_strict, STM_CDC_MASK_STRICT_SEED);
     out->mask_loose  = derive_mask(pop_loose,  STM_CDC_MASK_LOOSE_SEED);

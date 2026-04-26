@@ -49,7 +49,14 @@ into the CAS tier (which DOES need P6) is a separate concern.
 
 ## Phase 7 status (overall)
 
-- [ ] FastCDC pre-work — **available now, P6-independent**.
+- [x] **FastCDC pre-work** — landed at `5cb8900`; R27 close
+      `(this commit)` (0 P0 / 1 P1 / 4 P2 / 4 P3, all addressed
+      except P2-4 / P3-2 / P3-4 deferred per audit close commit
+      message). `src/cdc/cdc.{h,c}` + 12 tests on `tests/test_cdc.c`
+      covering arg validation, determinism, shift-resistance (90%
+      boundary match after 71-byte prepend), chunk-size
+      distribution, forced-cutoff path, edge cases. Default + ASan
+      + TSan all green.
 - [ ] CAS tier — blocked on P6.
 - [ ] Send / recv — blocked on P6 (birth-txg from snapshots).
 - [ ] Reflinks — blocked on P6 (dataset/file abstraction).

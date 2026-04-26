@@ -123,6 +123,29 @@ STM_TEST(cdc_init_rejects_malformed_params) {
         q.mask_loose  = 0xFFFFFFFFULL;/* popcount 32 */
         STM_ASSERT_ERR(stm_cdc_init(&cdc, &q), STM_EINVAL);
     }
+    /* R27 P2-1: mask_strict = 0 rejected (would fire boundary every
+     * byte after min_size — pathological min-size chunks). */
+    {
+        stm_cdc_params q = p;
+        q.mask_strict = 0;
+        q.mask_loose  = 0;
+        STM_ASSERT_ERR(stm_cdc_init(&cdc, &q), STM_EINVAL);
+    }
+    /* R27 P2-1: mask_loose = 0 rejected when loose region is non-empty
+     * (avg_size < max_size). */
+    {
+        stm_cdc_params q = p;
+        q.mask_loose = 0;
+        STM_ASSERT_ERR(stm_cdc_init(&cdc, &q), STM_EINVAL);
+    }
+    /* R27 P2-1: mask_loose = 0 ALLOWED when loose region is empty
+     * (avg_size == max_size). */
+    {
+        stm_cdc_params q = p;
+        q.avg_size = q.max_size;
+        q.mask_loose = 0;
+        STM_ASSERT_OK(stm_cdc_init(&cdc, &q));
+    }
 }
 
 STM_TEST(cdc_default_params_match_arch) {
@@ -293,26 +316,46 @@ STM_TEST(cdc_short_buffer_returns_buf_len) {
 }
 
 STM_TEST(cdc_max_size_forces_cutoff) {
-    stm_cdc_params p; make_test_params(&p);
+    /* R27 P2-3: explicitly verify the forced-cutoff path.
+     *
+     * Construction: mask_strict = mask_loose = UINT64_MAX so any
+     * non-zero fingerprint fails the bitwise mask test. Combined
+     * with a synthetic gear table of all-ones (gear[i] = 1), the
+     * fingerprint walk goes 0 → 1 → 3 → 7 → 15 → 2^k - 1, never
+     * hitting 0 after the first byte. No mask match is possible →
+     * algorithm must return exactly max_size on a buffer ≥ max_size.
+     *
+     * This test catches a buggy impl that returns prematurely (e.g.,
+     * at min_size or some incorrect early-cutoff position) which the
+     * old "boundary <= max_size" check would silently accept. */
+    stm_cdc_params p = {
+        .avg_size    = 512,
+        .min_size    = 128,
+        .max_size    = 1024,
+        .mask_strict = UINT64_MAX,
+        .mask_loose  = UINT64_MAX,
+    };
     stm_cdc cdc;
     STM_ASSERT_OK(stm_cdc_init(&cdc, &p));
 
-    /* All-zero buffer: hash never advances meaningfully, so no
-     * boundary fires until max_size. Verify: next_boundary on a
-     * buffer 4× max_size returns exactly max_size. */
-    size_t big_len = (size_t)p.max_size * 4;
-    uint8_t *zeros = calloc(1, big_len);
-    STM_ASSERT_TRUE(zeros != NULL);
-    /* Note: gear[0] != 0 in our table, so all-zero input will roll
-     * the hash to gear[0] * 2^k. Whether this matches the mask
-     * depends on the specific gear[0] value. To force max_size
-     * cutoff, we use a value whose gear entry has all the mask
-     * bits SET (so hash & mask never == 0 if gear[v] hits all mask
-     * bits). Easier: just check that the boundary is <= max_size,
-     * which the algorithm guarantees. */
-    size_t b = stm_cdc_next_boundary(&cdc, zeros, big_len);
-    STM_ASSERT_TRUE(b <= (size_t)p.max_size);
-    free(zeros);
+    /* Override the gear table with all-ones so the rolling-hash
+     * trajectory (fp = (fp<<1) + 1) never reaches 0 after the first
+     * byte. This makes the unmatchable-mask hypothesis ironclad,
+     * independent of the real STM_CDC_GEAR_SEED gear values. */
+    for (int i = 0; i < 256; i++) cdc.gear[i] = 1;
+
+    /* Buffer 2× max_size: algorithm scans through max_size bytes
+     * without finding a match, hits the forced cutoff, returns
+     * max_size exactly. */
+    size_t big_len = (size_t)p.max_size * 2;
+    uint8_t *buf = malloc(big_len);
+    STM_ASSERT_TRUE(buf != NULL);
+    fill_random(buf, big_len, 0xC0DECAFE);
+
+    size_t b = stm_cdc_next_boundary(&cdc, buf, big_len);
+    STM_ASSERT_EQ(b, (size_t)p.max_size);
+
+    free(buf);
 }
 
 STM_TEST(cdc_empty_buffer_returns_zero) {
