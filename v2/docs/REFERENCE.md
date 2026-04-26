@@ -38,16 +38,16 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `a6249eb` (R26 / P5-durable-cursors scope close —
-  γ scrub durable cursor + STM_UB_VERSION 7→8 fully audited.
-  R26 closed clean at 0 P0 / 1 P1 (β + γ-reopen
-  CallbackSetExclusivity) / 3 P2 / 5 P3, all addressed.
-  **Phase 5 substantively complete**: exit criteria 1, 3, 4, 5 met;
-  #2 (LRC vs RS) explicitly post-v2.0 per ROADMAP §8.6.).
-- **Phases**: 1–4 complete; Phase 5 substantively complete after
-  P5-durable-cursors lands (γ closes the in-Phase-5 work; remaining
-  P6 carry-overs documented in ROADMAP §9.6, post-v2.0 carry-overs
-  in §14).
+- **Tip**: *(pending)* (Phase 6 entered + Phase 7 pre-work
+  scaffolded; phase6-status.md + phase7-status.md created;
+  ROADMAP §9 + §10.5 annotated. Phase 5 tagged
+  `phase-5-complete` at `461e68e`).
+- **Phases**: 1–5 complete; **Phase 6 entered 2026-04-26**.
+  Recommended first chunk: production-default scrub verify-
+  callback (bptr-aware) — closes P5 exit criterion #3 production
+  aspect AND establishes the bptr layer that all subsequent P6
+  work depends on. Phase 7 pre-work (FastCDC chunking, P6-
+  independent) available in parallel.
 - **Tests**: 28 suites × (default + ASan + TSan, serial) green.
   test_sync_multi 42; test_pool 47; test_scrub 29; test_alloc 32.
 - **Specs**: 13 TLA+ modules clean (15 fixed configs: legacy + scrub_beta + scrub_durable)

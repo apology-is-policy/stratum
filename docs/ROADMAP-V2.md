@@ -522,6 +522,14 @@ proactively brought current.
 
 ## 9. Phase 6: Namespaces
 
+**Status as of 2026-04-26**: **Phase 6 entered**. Phase 5
+substantively complete at tag `phase-5-complete` (`461e68e`).
+First-chunk recommendation is the P5 §9.6 carry-over
+"production-default scrub verify-callback (bptr-aware)" —
+establishes the bptr layer that all P6 work rests on while
+closing the last piece of P5 exit criterion #3. See
+`v2/docs/phase6-status.md` for the entry-point pickup guide.
+
 **Scope**: dataset hierarchy, properties + inheritance, snapshots via birth-txg (O(1)), clones, dead-list maintenance.
 
 ### 9.1 Deliverables
@@ -650,6 +658,12 @@ section and in `memory/project_v2_active.md`'s carry-over notes.
 ### 10.5 Parallel opportunities
 
 - Send/recv and CAS tier are somewhat independent; can be built in parallel.
+- **FastCDC chunking** (`src/cdc/`, §10.1) is genuinely
+  P6-independent — pure algorithm + module, no on-disk format
+  impact at the chunking layer. Can be built in parallel with
+  Phase 6 namespace work as P7 pre-work. The CAS tier's
+  integration of the chunked output happens later, properly in
+  Phase 7. Tracked in `v2/docs/phase7-status.md`.
 
 ---
 
