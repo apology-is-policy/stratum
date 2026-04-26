@@ -38,7 +38,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `__P6PERF__` (P6-perf bench: `bench_snapshot` opt-in
+- **Tip**: `d4c6708` (P6-perf bench: `bench_snapshot` opt-in
   binary confirming ROADMAP §9.2 #1 — snap_create < 10 ms even
   at N=100k snapshots. All 5 ROADMAP §9.2 exit criteria met).
   Phase 5 tagged `phase-5-complete` at `461e68e`. Spec posture:
@@ -52,11 +52,11 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   + R30 `8be3628`; P6-persist `348d165` + R31 `bffee62`; P6-clone
   `ee45a0d` + R32 `4503405`; **P6-deadlist C impl
   `18b9289` + R33 `d4efeeb` (this commit)**.
-  Phase 7 pre-work FastCDC `5cb8900` + R27 close `a2ffd38`.
-  Pending: production scrub cb (still blocked on paddr→bptr
-  resolver, which arrives with extents); sync.c integration of
-  OverwriteBlock cb (production callers come with extents in P7);
-  perf bench harness.
+  P6-perf bench `d4c6708`. Phase 7 pre-work FastCDC `5cb8900` + R27
+  close `a2ffd38`. Pending: production scrub cb (still blocked on
+  paddr→bptr resolver, which arrives with extents); sync.c
+  integration of OverwriteBlock cb (production callers come with
+  extents in P7).
 - **Tests**: 31 suites × (default + ASan + TSan, serial) green.
   test_sync_multi 42; test_pool 48; test_scrub 30; test_alloc 32;
   test_cdc 12; test_dataset 57; test_snapshot 41; test_sync 24.
