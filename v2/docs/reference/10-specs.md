@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Stratum v2 ships 13 TLA+ spec modules covering every load-bearing
+Stratum v2 ships 14 TLA+ spec modules covering every load-bearing
 invariant in the implementation. The specs are the **source of
 truth** for protocol-level behavior; code is an implementation of
 the spec (CLAUDE.md: "spec-first policy"). When the two disagree,
@@ -33,10 +33,11 @@ chapter as specs get wider cross-reference tables).
 | `device_lifecycle.tla` | 5 | Roster state machine (add/remove/fail/rejoin). | large cfg: 10.6M states at depth 21 | `device_lifecycle_buggy.cfg` |
 | `evac.tla` | 5 | Per-block evacuation atomicity. | 13 states, depth 5 | `evac_buggy.cfg`, `evac_remove_no_drain_buggy.cfg` |
 | `scrub.tla` | 5 | Scrub state machine + β cb-classification + γ durable cursor. | small (each of α + β + γ configs; γ adds durable shadow + Persist/Crash/Mount) | `scrub_buggy.cfg` |
+| `bptr.tla` | 6 | Production scrub β cb protocol — replica-walk + csum-gate + rewrite-bad + verify-writeback + log. | 29 states, depth 8 (NReplicas=3) | `bptr_accept_corrupt_buggy.cfg`, `bptr_no_verify_writeback_buggy.cfg` |
 
-All fixed configs green (one per module + a second β-mode config for
-`scrub.tla`). All 6 buggy configs reproduce their designed invariant
-violations.
+All 17 fixed configs green (one per module + `scrub_beta` +
+`scrub_durable` + `scrub_beta_durable` extending `scrub.tla`). All 8
+buggy configs reproduce their designed invariant violations.
 
 ## Per-module invariants
 
@@ -339,6 +340,103 @@ on `stm_scrub_create` via `stm_sync_get_scrub_durable_bytes` +
 `stm_ub_scrub_state_unpack`. On-disk format: `ub_scrub_state[64]`
 in `stm_uberblock` (v8 layout, see reference/07-sb-sync.md).
 
+### `bptr.tla` — production scrub β cb protocol (P6-1 spec scaffold)
+
+Models the protocol the production-default β scrub verify-callback
+follows when invoked at one paddr: walk the bptr's replica list,
+csum-gate every read, pick the first OK source, rewrite each non-OK
+replica, verify each rewrite by reading it back + re-checking the
+csum, emit a repair-log entry per rewrite, return the
+`stm_scrub_verify_outcome`.
+
+Invariants (all four `result ∈ {OK, REPAIRED, UNREPAIRABLE}` paths):
+
+- `TypeOK`.
+- `NoSilentCorruption` — `picked > 0 ⇒ read_outcome[picked] = OK`.
+  Csum-gate honored on every read; bytes from a CORRUPT or FAILED
+  replica are never returned to the caller as "good". This is the
+  ARCH §7.16.3 anti-self-healing invariant at the protocol level.
+- `WriteVerifyMandatory` — `result = REPAIRED ⇒` every
+  `rewrite_outcome[j] ∈ {NONE, OK_VERIFIED}`. ARCH §7.15.3
+  "don't trust a writeback without confirmation".
+- `ResultSoundness` — terminal classification matches evidence:
+  - `OK` ⇒ no rewrite happened.
+  - `REPAIRED` ⇒ ≥1 rewrite happened ∧ none recorded `FAIL`.
+  - `UNREPAIRABLE` ⇒ no source picked OR some rewrite recorded
+    `FAIL`.
+- `LogIntegrity` — every emitted log entry corresponds to a
+  rewrite that actually landed AND carries the picked source's
+  index. ARCH §7.15.4 repair-log integrity at the protocol level.
+- `NoOriginalOKMeansUnrepairable` — at `phase = DONE`, if no
+  replica was originally OK, the cb returns `UNREPAIRABLE`. The
+  cb never invents good bytes.
+- `AllInitialOKMeansOK` — at `phase = DONE`, if every replica was
+  originally OK, no rewrite happens and `result = OK`. The cb does
+  not waste I/O on a healthy block.
+
+CONSTANTS:
+
+- `NReplicas` ≥ 1 — number of replicas in the bptr.
+- `InitialReplicaStates ∈ 1..NReplicas → {OK, CORRUPT, FAILED}` —
+  pre-cb on-disk state of each replica. Modeled abstractly:
+  - `OK` reads return bytes that match the bptr csum.
+  - `CORRUPT` reads return bytes that fail csum (silent bit-rot).
+  - `FAILED` reads return I/O error.
+  Bound to a sequence literal via the `<-` override in each cfg
+  (see `ReplicaStates_*` named functions in `bptr.tla`).
+- `RewriteCanFail ∈ BOOLEAN` — when TRUE, model nondeterministic
+  hardware-level write failure (writes can produce `FAIL`
+  outcomes even after a "successful" submit).
+- `BuggyAcceptCorrupt ∈ BOOLEAN` — buggy variant. Skips the csum
+  gate on read; accepts CORRUPT replicas as source.
+- `BuggyNoVerifyWriteback ∈ BOOLEAN` — buggy variant. Skips
+  read-back-after-rewrite; records `OK_UNVERIFIED` instead of
+  `OK_VERIFIED` / `FAIL`.
+
+Actions:
+
+- `ScanRead(i)` — read replica `i`, set `read_outcome[i]`, pick `i`
+  as source if it passes the csum gate (or, in buggy mode, if it
+  returns any bytes including CORRUPT).
+- `ScanComplete` — all replicas read; transitions to REWRITE if
+  source picked, else terminates with `result = UNREPAIRABLE`.
+- `RewriteReplica(j)` — only when `j ≠ picked` and `read_outcome[j]`
+  is non-OK. Records writeback outcome (verified or, in buggy
+  variant, unverified). Emits a log entry per rewrite.
+- `RewriteComplete` — all bad replicas rewritten; classifies
+  `result` per `ResultSoundness`.
+
+Fixed config (`bptr.cfg`, `NReplicas=3`,
+`InitialReplicaStates = <<OK, CORRUPT, FAILED>>`,
+`RewriteCanFail=TRUE`): exercises pick + rewrite + write-fail +
+write-success branches. 29 states at depth 8. All seven invariants
+hold.
+
+Buggy configs:
+
+- `bptr_accept_corrupt_buggy.cfg`
+  (`BuggyAcceptCorrupt=TRUE`, `<<CORRUPT, OK>>`):
+  cb stops on first read regardless of csum; picks the CORRUPT
+  replica as source. `NoSilentCorruption` violated at depth 1
+  (the very first ScanRead).
+- `bptr_no_verify_writeback_buggy.cfg`
+  (`BuggyNoVerifyWriteback=TRUE`, `<<OK, CORRUPT>>`):
+  cb skips read-back-after-rewrite; records OK_UNVERIFIED on the
+  rewrite. `WriteVerifyMandatory` violated at phase = DONE.
+
+Spec-to-code (forward reference): the production scrub cb that
+this spec governs is **not yet implemented**. Land in a follow-on
+P6-1 chunk once the paddr → bptr resolver infrastructure exists
+(extent records / dataset-tree → bptr mapping). The β cb shape is
+already in place in `include/stratum/scrub.h`
+(`stm_scrub_verify_cb` typedef + `stm_scrub_set_verify_cb` API);
+the spec captures what a real implementation must satisfy.
+
+Out of scope for `bptr.tla`: paddr→bptr resolution (P6 dataset
+infrastructure), concurrency (cb runs single-threaded under
+`sc->lock` + `pool->rdlock`), AEAD vs BLAKE3 csum specifics
+(modeled abstractly as a boolean gate).
+
 ## Running TLC
 
 ```bash
@@ -349,28 +447,29 @@ cd v2/specs
 java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
     -config scrub.cfg scrub.tla
 
-# Full sweep — fixed configs (one per module; scrub has a second β config).
+# Full sweep — fixed configs (one per module; scrub has 3 extra configs).
 for s in sync concurrency structural balanced merge allocator merkle \
-         key_schema quorum metadata_nonce device_lifecycle evac scrub; do
+         key_schema quorum metadata_nonce device_lifecycle evac scrub bptr; do
   echo "== $s ==" && \
   java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
       -config $s.cfg $s.tla 2>&1 | tail -3
 done
-echo "== scrub (β) ==" && \
+for cfg in scrub_beta scrub_durable scrub_beta_durable; do
+  echo "== scrub ($cfg) ==" && \
   java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
-      -config scrub_beta.cfg scrub.tla 2>&1 | tail -3
-echo "== scrub (γ durable) ==" && \
-  java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
-      -config scrub_durable.cfg scrub.tla 2>&1 | tail -3
-echo "== scrub (β+γ) ==" && \
-  java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
-      -config scrub_beta_durable.cfg scrub.tla 2>&1 | tail -3
+      -config ${cfg}.cfg scrub.tla 2>&1 | tail -3
+done
 
 # Buggy-config sanity (each must VIOLATE as expected):
 for cfg in quorum_buggy metadata_nonce_buggy device_lifecycle_buggy \
            evac_buggy evac_remove_no_drain_buggy scrub_buggy; do
   java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
       -config ${cfg}.cfg ${cfg%_buggy}.tla 2>&1 | \
+      grep -E "Invariant|Error:" | head -2
+done
+for cfg in bptr_accept_corrupt_buggy bptr_no_verify_writeback_buggy; do
+  java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
+      -config ${cfg}.cfg bptr.tla 2>&1 | \
       grep -E "Invariant|Error:" | head -2
 done
 ```

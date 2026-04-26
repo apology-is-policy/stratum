@@ -30,7 +30,7 @@ Phase 6 also picks up three P5 carry-overs per ROADMAP §9.6:
 
 | Commit | What | Tests |
 |---|---|---|
-| (none yet) | Phase 6 entered; first chunk pending. | — |
+| (this chunk) | P6-1 spec scaffold: `bptr.tla` (production scrub cb protocol) + 1 fixed cfg + 2 buggy cfgs. Spec-only landing per CLAUDE.md spec-first; production cb impl waits for paddr→bptr resolver. | TLC: bptr 29 states/depth 8 clean; 2 buggy demos fire NoSilentCorruption + WriteVerifyMandatory respectively. Total spec posture: 14 modules / 17 fixed cfgs / 8 buggy cfgs. |
 
 ## ROADMAP §9.2 exit criteria status
 

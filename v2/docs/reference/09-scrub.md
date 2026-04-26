@@ -340,7 +340,14 @@ lock-acquire DAG.
 
 ## Spec cross-reference
 
-Spec: `v2/specs/scrub.tla`. Invariants:
+Spec: `v2/specs/scrub.tla` for the state-machine + per-block cursor.
+Spec: `v2/specs/bptr.tla` for the production-default β cb protocol
+(replica-walk + csum-gate + rewrite + verify-writeback + log; see
+reference/10-specs.md). The β cb shape in `scrub.h` is the integration
+point — the actual production cb implementation waits for the
+paddr→bptr resolver infrastructure landing later in Phase 6.
+
+Invariants:
 
 | Name | Statement |
 |---|---|
