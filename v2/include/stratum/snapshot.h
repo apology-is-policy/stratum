@@ -60,6 +60,10 @@ extern "C" {
 
 #define STM_SNAP_NO_PREV         ((uint64_t)0)
 #define STM_SNAP_NAME_MAX        255u
+/* Sentinel for "no captured tree_root yet" — reserved for the
+ * persistent-storage chunk where on-disk encode/decode needs a
+ * distinguished value for unfilled-on-disk entries. R29 P3-4.
+ * Currently unused; tests pass tree_root_paddr literally. */
 #define STM_SNAP_NO_TREE_ROOT    ((uint64_t)0)
 
 /*

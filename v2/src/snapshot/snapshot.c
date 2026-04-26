@@ -15,6 +15,24 @@
 #include <stdlib.h>
 #include <string.h>
 
+/*
+ * R29 self-audit P1 (also affects dataset module): ERRORCHECK pthread
+ * mutex returns EDEADLK on reentry-from-same-thread, but if the
+ * caller doesn't check the return code the inner lock call proceeds
+ * unsafely AND the inner unlock releases the OUTER's lock claim,
+ * exposing state to concurrent writers. We use ERRORCHECK to surface
+ * contract violations (iter callback re-entering a public API) as
+ * a hard abort rather than a silent race or silent hang.
+ */
+static inline void must_lock(pthread_mutex_t *m) {
+    int rc = pthread_mutex_lock(m);
+    if (rc != 0) abort();
+}
+static inline void must_unlock(pthread_mutex_t *m) {
+    int rc = pthread_mutex_unlock(m);
+    if (rc != 0) abort();
+}
+
 typedef struct {
     stm_snapshot_entry e;
     bool               present;
@@ -78,6 +96,16 @@ static bool name_taken_in_dataset_locked(const stm_snapshot_index *idx,
  * slots array; since slots are append-only and id-ascending, the
  * most-recent is the last PRESENT slot with matching dataset_id.
  * Returns STM_SNAP_NO_PREV if none.
+ *
+ * R29 P2-1: divergence from snapshot.tla. The spec persists a single
+ * `most_recent_snap` variable past Delete (so a subsequent Create
+ * gets `prev_snap_id = <ABSENT snap id>` and the chain walk filters
+ * ABSENT links). The C impl computes most_recent dynamically and
+ * skips ABSENT — so a subsequent Create gets a TIGHTER chain
+ * (`prev_snap_id = previous PRESENT snap`). Both shapes satisfy
+ * snapshot.tla::ChainTxgOrdered; the impl's variant produces a
+ * cleaner chain with no dangling ABSENT links. The spec text could
+ * be relaxed to match; deferred since safety is preserved either way.
  */
 static uint64_t most_recent_locked(const stm_snapshot_index *idx,
                                        uint64_t dataset_id) {
@@ -147,14 +175,14 @@ void stm_snapshot_index_close(stm_snapshot_index *idx) {
 stm_status stm_snapshot_index_advance_txg(stm_snapshot_index *idx,
                                             uint64_t new_txg) {
     if (!idx) return STM_EINVAL;
-    pthread_mutex_lock(&idx->lock);
+    must_lock(&idx->lock);
     /* Equal value is no-op; only strict regression refused. */
     if (new_txg < idx->current_txg) {
-        pthread_mutex_unlock(&idx->lock);
+        must_unlock(&idx->lock);
         return STM_EINVAL;
     }
     idx->current_txg = new_txg;
-    pthread_mutex_unlock(&idx->lock);
+    must_unlock(&idx->lock);
     return STM_OK;
 }
 
@@ -162,9 +190,9 @@ stm_status stm_snapshot_index_current_txg(const stm_snapshot_index *idx,
                                              uint64_t *out_txg) {
     if (!idx || !out_txg) return STM_EINVAL;
     pthread_mutex_t *lock = snap_lock(idx);
-    pthread_mutex_lock(lock);
+    must_lock(lock);
     *out_txg = idx->current_txg;
-    pthread_mutex_unlock(lock);
+    must_unlock(lock);
     return STM_OK;
 }
 
@@ -179,12 +207,21 @@ stm_status stm_snapshot_create(stm_snapshot_index *idx,
     size_t name_len = strlen(name);
     if (name_len == 0 || name_len > STM_SNAP_NAME_MAX) return STM_EINVAL;
 
-    pthread_mutex_lock(&idx->lock);
+    must_lock(&idx->lock);
+
+    /* R29 P3-1: defensive saturation on the monotonic counters.
+     * UINT64_MAX is millennia away under realistic workloads, but
+     * a hostile / buggy caller could push us there. Refuse cleanly
+     * rather than wrap into an id collision or a backwards txg. */
+    if (idx->next_id == UINT64_MAX || idx->current_txg == UINT64_MAX) {
+        must_unlock(&idx->lock);
+        return STM_EOVERFLOW;
+    }
 
     if (name_taken_in_dataset_locked(idx, dataset_id,
                                        (const uint8_t *)name,
                                        (uint32_t)name_len, 0)) {
-        pthread_mutex_unlock(&idx->lock);
+        must_unlock(&idx->lock);
         return STM_EEXIST;
     }
 
@@ -192,7 +229,7 @@ stm_status stm_snapshot_create(stm_snapshot_index *idx,
 
     size_t new_slot = append_slot_locked(idx);
     if (new_slot == (size_t)-1) {
-        pthread_mutex_unlock(&idx->lock);
+        must_unlock(&idx->lock);
         return STM_ENOMEM;
     }
 
@@ -216,64 +253,64 @@ stm_status stm_snapshot_create(stm_snapshot_index *idx,
 
     *out_id = id;
 
-    pthread_mutex_unlock(&idx->lock);
+    must_unlock(&idx->lock);
     return STM_OK;
 }
 
 stm_status stm_snapshot_delete(stm_snapshot_index *idx,
                                  uint64_t snapshot_id) {
     if (!idx) return STM_EINVAL;
-    pthread_mutex_lock(&idx->lock);
+    must_lock(&idx->lock);
     size_t s = find_slot_locked(idx, snapshot_id);
     if (s == (size_t)-1 || !idx->slots[s].present) {
-        pthread_mutex_unlock(&idx->lock);
+        must_unlock(&idx->lock);
         return STM_ENOENT;
     }
     if (idx->slots[s].e.hold_count > 0) {
-        pthread_mutex_unlock(&idx->lock);
+        must_unlock(&idx->lock);
         return STM_EBUSY;
     }
     idx->slots[s].present = false;
-    pthread_mutex_unlock(&idx->lock);
+    must_unlock(&idx->lock);
     return STM_OK;
 }
 
 stm_status stm_snapshot_hold(stm_snapshot_index *idx,
                                uint64_t snapshot_id) {
     if (!idx) return STM_EINVAL;
-    pthread_mutex_lock(&idx->lock);
+    must_lock(&idx->lock);
     size_t s = find_slot_locked(idx, snapshot_id);
     if (s == (size_t)-1 || !idx->slots[s].present) {
-        pthread_mutex_unlock(&idx->lock);
+        must_unlock(&idx->lock);
         return STM_ENOENT;
     }
     /* hold_count is uint32_t; saturate at UINT32_MAX rather than wrap.
      * Realistic deployments will never approach 4B holds; guard
      * against a hostile caller anyway. */
     if (idx->slots[s].e.hold_count == UINT32_MAX) {
-        pthread_mutex_unlock(&idx->lock);
+        must_unlock(&idx->lock);
         return STM_EOVERFLOW;
     }
     idx->slots[s].e.hold_count++;
-    pthread_mutex_unlock(&idx->lock);
+    must_unlock(&idx->lock);
     return STM_OK;
 }
 
 stm_status stm_snapshot_release(stm_snapshot_index *idx,
                                   uint64_t snapshot_id) {
     if (!idx) return STM_EINVAL;
-    pthread_mutex_lock(&idx->lock);
+    must_lock(&idx->lock);
     size_t s = find_slot_locked(idx, snapshot_id);
     if (s == (size_t)-1 || !idx->slots[s].present) {
-        pthread_mutex_unlock(&idx->lock);
+        must_unlock(&idx->lock);
         return STM_ENOENT;
     }
     if (idx->slots[s].e.hold_count == 0) {
-        pthread_mutex_unlock(&idx->lock);
+        must_unlock(&idx->lock);
         return STM_EINVAL;
     }
     idx->slots[s].e.hold_count--;
-    pthread_mutex_unlock(&idx->lock);
+    must_unlock(&idx->lock);
     return STM_OK;
 }
 
@@ -282,14 +319,14 @@ stm_status stm_snapshot_lookup(const stm_snapshot_index *idx,
                                  stm_snapshot_entry *out) {
     if (!idx || !out) return STM_EINVAL;
     pthread_mutex_t *lock = snap_lock(idx);
-    pthread_mutex_lock(lock);
+    must_lock(lock);
     size_t s = find_slot_locked(idx, snapshot_id);
     if (s == (size_t)-1 || !idx->slots[s].present) {
-        pthread_mutex_unlock(lock);
+        must_unlock(lock);
         return STM_ENOENT;
     }
     *out = idx->slots[s].e;
-    pthread_mutex_unlock(lock);
+    must_unlock(lock);
     return STM_OK;
 }
 
@@ -297,13 +334,13 @@ stm_status stm_snapshot_count(const stm_snapshot_index *idx,
                                 size_t *out_count) {
     if (!idx || !out_count) return STM_EINVAL;
     pthread_mutex_t *lock = snap_lock(idx);
-    pthread_mutex_lock(lock);
+    must_lock(lock);
     size_t n = 0;
     for (size_t i = 0; i < idx->slots_len; i++) {
         if (idx->slots[i].present) n++;
     }
     *out_count = n;
-    pthread_mutex_unlock(lock);
+    must_unlock(lock);
     return STM_OK;
 }
 
@@ -312,14 +349,14 @@ stm_status stm_snapshot_dataset_count(const stm_snapshot_index *idx,
                                          size_t *out_count) {
     if (!idx || !out_count) return STM_EINVAL;
     pthread_mutex_t *lock = snap_lock(idx);
-    pthread_mutex_lock(lock);
+    must_lock(lock);
     size_t n = 0;
     for (size_t i = 0; i < idx->slots_len; i++) {
         if (idx->slots[i].present && idx->slots[i].e.dataset_id == dataset_id)
             n++;
     }
     *out_count = n;
-    pthread_mutex_unlock(lock);
+    must_unlock(lock);
     return STM_OK;
 }
 
@@ -328,9 +365,9 @@ stm_status stm_snapshot_most_recent(const stm_snapshot_index *idx,
                                        uint64_t *out_id) {
     if (!idx || !out_id) return STM_EINVAL;
     pthread_mutex_t *lock = snap_lock(idx);
-    pthread_mutex_lock(lock);
+    must_lock(lock);
     *out_id = most_recent_locked(idx, dataset_id);
-    pthread_mutex_unlock(lock);
+    must_unlock(lock);
     return STM_OK;
 }
 
@@ -338,13 +375,13 @@ stm_status stm_snapshot_iter(const stm_snapshot_index *idx,
                                stm_snapshot_iter_cb cb, void *ctx) {
     if (!idx || !cb) return STM_EINVAL;
     pthread_mutex_t *lock = snap_lock(idx);
-    pthread_mutex_lock(lock);
+    must_lock(lock);
     /* Slots are appended in id-ascending order; linear walk is
      * already id-ordered. */
     for (size_t i = 0; i < idx->slots_len; i++) {
         if (!idx->slots[i].present) continue;
         if (!cb(&idx->slots[i].e, ctx)) break;
     }
-    pthread_mutex_unlock(lock);
+    must_unlock(lock);
     return STM_OK;
 }

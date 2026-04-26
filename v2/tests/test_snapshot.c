@@ -468,4 +468,88 @@ STM_TEST(snap_concurrent_create_distinct_ids) {
     stm_snapshot_index_close(idx);
 }
 
+/* ------------------------------------------------------------------ */
+/* R29 P2-2: same-dataset concurrent creates exercise the chain-     */
+/* integrity path under contention (name uniqueness, most_recent,    */
+/* next_id, prev_snap_id linking all atomic).                        */
+/* ------------------------------------------------------------------ */
+
+static void *snap_same_dataset_creator(void *arg) {
+    snap_concurrent_ctx *c = arg;
+    for (int i = 0; i < SNAP_PER_THR; i++) {
+        char name[32];
+        snprintf(name, sizeof name, "thr%d_%d", c->tid, i);
+        /* Same dataset_id = 1 across all threads → contention on the
+         * per-dataset chain (most_recent + name uniqueness within the
+         * dataset). */
+        stm_status s = stm_snapshot_create(c->idx, 1, name,
+                                              (uint64_t)i, &c->ids[i]);
+        if (s != STM_OK) c->fail_count++;
+    }
+    return NULL;
+}
+
+STM_TEST(snap_concurrent_create_same_dataset) {
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+
+    pthread_t threads[SNAP_THREADS];
+    snap_concurrent_ctx ctxs[SNAP_THREADS] = { 0 };
+    for (int t = 0; t < SNAP_THREADS; t++) {
+        ctxs[t].idx = idx;
+        ctxs[t].tid = t;
+        STM_ASSERT_EQ(pthread_create(&threads[t], NULL,
+                                        snap_same_dataset_creator,
+                                        &ctxs[t]), 0);
+    }
+    for (int t = 0; t < SNAP_THREADS; t++) {
+        pthread_join(threads[t], NULL);
+    }
+    int total_failures = 0;
+    for (int t = 0; t < SNAP_THREADS; t++) total_failures += ctxs[t].fail_count;
+    STM_ASSERT_EQ(total_failures, 0);
+
+    enum { N = SNAP_THREADS * SNAP_PER_THR };
+    uint64_t all_ids[N];
+    int k = 0;
+    for (int t = 0; t < SNAP_THREADS; t++) {
+        for (int i = 0; i < SNAP_PER_THR; i++) {
+            all_ids[k++] = ctxs[t].ids[i];
+        }
+    }
+    /* Distinct ids. */
+    for (int i = 0; i < N; i++) {
+        for (int j = i + 1; j < N; j++) {
+            STM_ASSERT_NE(all_ids[i], all_ids[j]);
+        }
+    }
+    /* All N + 0 snaps belong to dataset 1. */
+    size_t ds_count = 0;
+    STM_ASSERT_OK(stm_snapshot_dataset_count(idx, 1, &ds_count));
+    STM_ASSERT_EQ(ds_count, (size_t)N);
+
+    /* Chain integrity: each snap (except the very first) has a
+     * prev_snap_id pointing at a strictly-lower id within the same
+     * dataset. Chain walking from any id eventually reaches NO_PREV. */
+    for (int i = 0; i < N; i++) {
+        stm_snapshot_entry e;
+        STM_ASSERT_OK(stm_snapshot_lookup(idx, all_ids[i], &e));
+        STM_ASSERT_EQ(e.dataset_id, (uint64_t)1);
+        if (e.prev_snap_id != STM_SNAP_NO_PREV) {
+            STM_ASSERT_TRUE(e.prev_snap_id < all_ids[i]);
+        }
+    }
+    /* Exactly one snap should have prev = NO_PREV (the first one
+     * created across all threads — id 1). */
+    int with_no_prev = 0;
+    for (int i = 0; i < N; i++) {
+        stm_snapshot_entry e;
+        STM_ASSERT_OK(stm_snapshot_lookup(idx, all_ids[i], &e));
+        if (e.prev_snap_id == STM_SNAP_NO_PREV) with_no_prev++;
+    }
+    STM_ASSERT_EQ(with_no_prev, 1);
+
+    stm_snapshot_index_close(idx);
+}
+
 STM_TEST_MAIN("snapshot")

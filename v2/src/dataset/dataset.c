@@ -22,6 +22,24 @@
 #include <string.h>
 
 /*
+ * R29 self-audit P1 (carries back to R28 / dataset module): ERRORCHECK
+ * pthread mutex returns EDEADLK on reentry-from-same-thread, but if
+ * the caller doesn't check the return code the inner lock call
+ * proceeds unsafely AND the inner unlock releases the OUTER's lock
+ * claim — exposing state to concurrent writers. We use ERRORCHECK to
+ * surface contract violations (e.g., iter callback re-entering a
+ * public API) as a hard abort rather than a silent race.
+ */
+static inline void must_lock(pthread_mutex_t *m) {
+    int rc = pthread_mutex_lock(m);
+    if (rc != 0) abort();
+}
+static inline void must_unlock(pthread_mutex_t *m) {
+    int rc = pthread_mutex_unlock(m);
+    if (rc != 0) abort();
+}
+
+/*
  * Per-slot record. The public stm_dataset_entry plus a "present" flag
  * so we can distinguish PRESENT vs ABSENT (destroyed) slots without
  * recycling slots.
@@ -227,17 +245,17 @@ void stm_dataset_index_close(stm_dataset_index *idx) {
 stm_status stm_dataset_index_advance_txg(stm_dataset_index *idx,
                                            uint64_t new_txg) {
     if (!idx) return STM_EINVAL;
-    pthread_mutex_lock(&idx->lock);
+    must_lock(&idx->lock);
     /* R28 P3-3: equal value is a no-op (not a regression) — the spec's
      * BirthTxgMonotonic invariant only forbids strictly-decreasing
      * advance. Same-value advance is the legitimate "external txg
      * source agrees with internal counter" path. */
     if (new_txg < idx->current_txg) {
-        pthread_mutex_unlock(&idx->lock);
+        must_unlock(&idx->lock);
         return STM_EINVAL;
     }
     idx->current_txg = new_txg;
-    pthread_mutex_unlock(&idx->lock);
+    must_unlock(&idx->lock);
     return STM_OK;
 }
 
@@ -246,9 +264,9 @@ stm_status stm_dataset_index_current_txg(const stm_dataset_index *idx,
     if (!idx || !out_txg) return STM_EINVAL;
     /* Cast away const for pthread API; semantically read-only. */
     pthread_mutex_t *lock = dataset_lock(idx);
-    pthread_mutex_lock(lock);
+    must_lock(lock);
     *out_txg = idx->current_txg;
-    pthread_mutex_unlock(lock);
+    must_unlock(lock);
     return STM_OK;
 }
 
@@ -261,23 +279,32 @@ stm_status stm_dataset_create_child(stm_dataset_index *idx,
     size_t name_len = strlen(name);
     if (name_len == 0 || name_len > STM_DATASET_NAME_MAX) return STM_EINVAL;
 
-    pthread_mutex_lock(&idx->lock);
+    must_lock(&idx->lock);
+
+    /* R29 P3-1 (carry-over): defensive saturation on the monotonic
+     * counters. Under realistic workloads UINT64_MAX is millennia
+     * away; refuse cleanly rather than wrap into an id collision
+     * or a backwards txg under a hostile / buggy caller. */
+    if (idx->next_id == UINT64_MAX || idx->current_txg == UINT64_MAX) {
+        must_unlock(&idx->lock);
+        return STM_EOVERFLOW;
+    }
 
     if (!is_present_locked(idx, parent_id)) {
-        pthread_mutex_unlock(&idx->lock);
+        must_unlock(&idx->lock);
         return STM_ENOENT;
     }
     if (sibling_name_taken_locked(idx, parent_id,
                                     (const uint8_t *)name, (uint32_t)name_len,
                                     0)) {
-        pthread_mutex_unlock(&idx->lock);
+        must_unlock(&idx->lock);
         return STM_EEXIST;
     }
 
     /* Allocate the new slot. */
     size_t new_slot = append_slot_locked(idx);
     if (new_slot == (size_t)-1) {
-        pthread_mutex_unlock(&idx->lock);
+        must_unlock(&idx->lock);
         return STM_ENOMEM;
     }
 
@@ -299,7 +326,7 @@ stm_status stm_dataset_create_child(stm_dataset_index *idx,
 
     *out_id = id;
 
-    pthread_mutex_unlock(&idx->lock);
+    must_unlock(&idx->lock);
     return STM_OK;
 }
 
@@ -307,18 +334,18 @@ stm_status stm_dataset_destroy(stm_dataset_index *idx, uint64_t id) {
     if (!idx) return STM_EINVAL;
     if (id == STM_DATASET_ROOT_ID) return STM_EINVAL;
 
-    pthread_mutex_lock(&idx->lock);
+    must_lock(&idx->lock);
     size_t s = find_slot_locked(idx, id);
     if (s == (size_t)-1 || !idx->slots[s].present) {
-        pthread_mutex_unlock(&idx->lock);
+        must_unlock(&idx->lock);
         return STM_ENOENT;
     }
     if (has_children_locked(idx, id)) {
-        pthread_mutex_unlock(&idx->lock);
+        must_unlock(&idx->lock);
         return STM_EBUSY;
     }
     idx->slots[s].present = false;
-    pthread_mutex_unlock(&idx->lock);
+    must_unlock(&idx->lock);
     return STM_OK;
 }
 
@@ -329,23 +356,23 @@ stm_status stm_dataset_rename(stm_dataset_index *idx, uint64_t id,
     size_t name_len = strlen(new_name);
     if (name_len == 0 || name_len > STM_DATASET_NAME_MAX) return STM_EINVAL;
 
-    pthread_mutex_lock(&idx->lock);
+    must_lock(&idx->lock);
     size_t s = find_slot_locked(idx, id);
     if (s == (size_t)-1 || !idx->slots[s].present) {
-        pthread_mutex_unlock(&idx->lock);
+        must_unlock(&idx->lock);
         return STM_ENOENT;
     }
     uint64_t parent_id = idx->slots[s].e.parent_id;
     if (sibling_name_taken_locked(idx, parent_id,
                                     (const uint8_t *)new_name,
                                     (uint32_t)name_len, id)) {
-        pthread_mutex_unlock(&idx->lock);
+        must_unlock(&idx->lock);
         return STM_EEXIST;
     }
     idx->slots[s].e.name_len = (uint32_t)name_len;
     memcpy(idx->slots[s].e.name, new_name, name_len);
     idx->slots[s].e.name[name_len] = '\0';
-    pthread_mutex_unlock(&idx->lock);
+    must_unlock(&idx->lock);
     return STM_OK;
 }
 
@@ -355,32 +382,32 @@ stm_status stm_dataset_move(stm_dataset_index *idx, uint64_t id,
     if (id == STM_DATASET_ROOT_ID) return STM_EINVAL;
     if (id == new_parent_id) return STM_EINVAL;
 
-    pthread_mutex_lock(&idx->lock);
+    must_lock(&idx->lock);
 
     size_t s = find_slot_locked(idx, id);
     if (s == (size_t)-1 || !idx->slots[s].present) {
-        pthread_mutex_unlock(&idx->lock);
+        must_unlock(&idx->lock);
         return STM_ENOENT;
     }
     if (!is_present_locked(idx, new_parent_id)) {
-        pthread_mutex_unlock(&idx->lock);
+        must_unlock(&idx->lock);
         return STM_ENOENT;
     }
     /* Cycle prevention: new_parent_id must NOT be a descendant of id
      * (or id itself — covered by id != new_parent_id above). */
     if (is_descendant_or_self_locked(idx, new_parent_id, id)) {
-        pthread_mutex_unlock(&idx->lock);
+        must_unlock(&idx->lock);
         return STM_EINVAL;
     }
     /* Sibling-name uniqueness in the new parent's children. */
     if (sibling_name_taken_locked(idx, new_parent_id,
                                     idx->slots[s].e.name,
                                     idx->slots[s].e.name_len, id)) {
-        pthread_mutex_unlock(&idx->lock);
+        must_unlock(&idx->lock);
         return STM_EEXIST;
     }
     idx->slots[s].e.parent_id = new_parent_id;
-    pthread_mutex_unlock(&idx->lock);
+    must_unlock(&idx->lock);
     return STM_OK;
 }
 
@@ -388,14 +415,14 @@ stm_status stm_dataset_lookup(const stm_dataset_index *idx, uint64_t id,
                                 stm_dataset_entry *out) {
     if (!idx || !out) return STM_EINVAL;
     pthread_mutex_t *lock = dataset_lock(idx);
-    pthread_mutex_lock(lock);
+    must_lock(lock);
     size_t s = find_slot_locked(idx, id);
     if (s == (size_t)-1 || !idx->slots[s].present) {
-        pthread_mutex_unlock(lock);
+        must_unlock(lock);
         return STM_ENOENT;
     }
     *out = idx->slots[s].e;
-    pthread_mutex_unlock(lock);
+    must_unlock(lock);
     return STM_OK;
 }
 
@@ -403,13 +430,13 @@ stm_status stm_dataset_count(const stm_dataset_index *idx,
                                 size_t *out_count) {
     if (!idx || !out_count) return STM_EINVAL;
     pthread_mutex_t *lock = dataset_lock(idx);
-    pthread_mutex_lock(lock);
+    must_lock(lock);
     size_t n = 0;
     for (size_t i = 0; i < idx->slots_len; i++) {
         if (idx->slots[i].present) n++;
     }
     *out_count = n;
-    pthread_mutex_unlock(lock);
+    must_unlock(lock);
     return STM_OK;
 }
 
@@ -418,9 +445,9 @@ stm_status stm_dataset_children_count(const stm_dataset_index *idx,
                                          size_t *out_count) {
     if (!idx || !out_count) return STM_EINVAL;
     pthread_mutex_t *lock = dataset_lock(idx);
-    pthread_mutex_lock(lock);
+    must_lock(lock);
     if (!is_present_locked(idx, parent_id)) {
-        pthread_mutex_unlock(lock);
+        must_unlock(lock);
         return STM_ENOENT;
     }
     size_t n = 0;
@@ -428,7 +455,7 @@ stm_status stm_dataset_children_count(const stm_dataset_index *idx,
         if (idx->slots[i].present && idx->slots[i].e.parent_id == parent_id) n++;
     }
     *out_count = n;
-    pthread_mutex_unlock(lock);
+    must_unlock(lock);
     return STM_OK;
 }
 
@@ -436,7 +463,7 @@ stm_status stm_dataset_iter(const stm_dataset_index *idx,
                               stm_dataset_iter_cb cb, void *ctx) {
     if (!idx || !cb) return STM_EINVAL;
     pthread_mutex_t *lock = dataset_lock(idx);
-    pthread_mutex_lock(lock);
+    must_lock(lock);
     /* Iterate by id-ascending. Slots are appended in id-ascending order
      * (next_id is monotonic), so a linear walk over slots[] is already
      * id-ordered. */
@@ -444,6 +471,6 @@ stm_status stm_dataset_iter(const stm_dataset_index *idx,
         if (!idx->slots[i].present) continue;
         if (!cb(&idx->slots[i].e, ctx)) break;
     }
-    pthread_mutex_unlock(lock);
+    must_unlock(lock);
     return STM_OK;
 }
