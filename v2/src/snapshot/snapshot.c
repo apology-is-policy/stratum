@@ -746,6 +746,10 @@ typedef struct {
     size_t         shadow_len;
     size_t         shadow_cap;
     uint64_t       max_present_id;
+    /* R31 P2-1: ceiling for post-load current_txg, mirroring dataset's
+     * fix. Without this, a post-mount Create stamps created_txg less
+     * than persisted snaps, violating snapshot.tla::BirthTxgMonotonic. */
+    uint64_t       max_created_txg;
     stm_status     err;
 } sp_load_ctx;
 
@@ -780,9 +784,62 @@ static int sp_load_iter(const void *k, size_t klen,
     stm_status dr = sp_decode_value(key, v, vlen, &tmp);
     if (dr != STM_OK) { lc->err = dr; return 1; }
     if (key > lc->max_present_id) lc->max_present_id = key;
+    if (tmp.e.created_txg > lc->max_created_txg) {
+        lc->max_created_txg = tmp.e.created_txg;
+    }
     stm_status as = sp_shadow_append(lc, &tmp);
     if (as != STM_OK) { lc->err = as; return 1; }
     return 0;
+}
+
+/* R31 P2-2: structural validation of the load-at shadow. Catches
+ * snapshot trees that decode byte-clean but violate snapshot.tla
+ * invariants — zero ids, prev_snap_id pointing forward or to wrong
+ * dataset, sibling-name collision within a dataset. Returns
+ * STM_ECORRUPT on any violation. */
+static stm_status sp_validate_shadow(const sp_load_ctx *lc) {
+    /* Per-slot checks. */
+    for (size_t i = 0; i < lc->shadow_len; i++) {
+        const snapshot_slot *si = &lc->shadow_slots[i];
+        if (!si->present) continue;
+        if (si->e.snapshot_id == 0) return STM_ECORRUPT;
+        if (si->e.dataset_id == 0)  return STM_ECORRUPT;
+        if (si->e.prev_snap_id != STM_SNAP_NO_PREV) {
+            /* prev must point backward (< own id) by SnapIdMonotonic
+             * + ChainTxgOrdered. Forward links indicate corruption. */
+            if (si->e.prev_snap_id >= si->e.snapshot_id) return STM_ECORRUPT;
+            /* prev must reference a PRESENT slot of the SAME dataset.
+             * (Spec allows prev to reach an ABSENT link, but we don't
+             * encode ABSENT slots so a present prev_snap_id MUST resolve
+             * within the shadow.) */
+            bool found = false;
+            for (size_t j = 0; j < lc->shadow_len; j++) {
+                const snapshot_slot *sj = &lc->shadow_slots[j];
+                if (sj->e.snapshot_id != si->e.prev_snap_id) continue;
+                if (!sj->present) return STM_ECORRUPT;  /* shouldn't happen */
+                if (sj->e.dataset_id != si->e.dataset_id) return STM_ECORRUPT;
+                found = true;
+                break;
+            }
+            if (!found) return STM_ECORRUPT;
+        }
+    }
+
+    /* Sibling-name uniqueness within each dataset. */
+    for (size_t i = 0; i < lc->shadow_len; i++) {
+        const snapshot_slot *si = &lc->shadow_slots[i];
+        if (!si->present) continue;
+        for (size_t j = i + 1; j < lc->shadow_len; j++) {
+            const snapshot_slot *sj = &lc->shadow_slots[j];
+            if (!sj->present) continue;
+            if (si->e.dataset_id != sj->e.dataset_id) continue;
+            if (si->e.name_len != sj->e.name_len) continue;
+            if (memcmp(si->e.name, sj->e.name, si->e.name_len) == 0)
+                return STM_ECORRUPT;
+        }
+    }
+
+    return STM_OK;
 }
 
 stm_status stm_snapshot_index_load_at(stm_snapshot_index *idx,
@@ -832,6 +889,13 @@ stm_status stm_snapshot_index_load_at(stm_snapshot_index *idx,
         must_unlock(&idx->lock);
         return lc.err;
     }
+    /* R31 P2-2: structural validation. */
+    stm_status vs = sp_validate_shadow(&lc);
+    if (vs != STM_OK) {
+        free(lc.shadow_slots);
+        must_unlock(&idx->lock);
+        return vs;
+    }
 
     /* Atomic swap. */
     free(idx->slots);
@@ -841,6 +905,12 @@ stm_status stm_snapshot_index_load_at(stm_snapshot_index *idx,
 
     if (lc.max_present_id < UINT64_MAX) {
         idx->next_id = lc.max_present_id + 1;
+    }
+
+    /* R31 P2-1: keep current_txg ≥ max(created_txg) per
+     * snapshot.tla::BirthTxgMonotonic. */
+    if (lc.max_created_txg > idx->current_txg) {
+        idx->current_txg = lc.max_created_txg;
     }
 
     idx->root_paddr = root_paddr;

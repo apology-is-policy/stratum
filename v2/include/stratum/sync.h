@@ -796,6 +796,22 @@ struct stm_snapshot_index; typedef struct stm_snapshot_index stm_snapshot_index;
  *
  * Mutations made on these indices between sync_open and sync_close
  * persist on the next sync_commit (which calls _commit on each handle).
+ *
+ * **Concurrency contract (R31 P1-1):** the dataset/snapshot indices
+ * have their own internal mutexes; their public mutators are
+ * thread-safe with respect to each other. They are NOT, however,
+ * coordinated with stm_sync's internal commit/retry state machine.
+ * A caller that mutates an index while stm_sync_commit is in flight,
+ * or between consecutive stm_sync_commit calls that retry on
+ * STM_EQUORUM, can introduce content divergence at the same target_gen
+ * across devices, violating quorum.tla::ContentQuorumAtGen. Pattern
+ * to follow: serialize index mutations against commit at the
+ * application layer (e.g., a single "fs writer" thread that owns the
+ * sync handle), or quiesce all mutators before invoking
+ * stm_sync_commit and until it returns success (or the operator
+ * abandons after STM_EQUORUM). Internal Stratum modules (alloc,
+ * keyschema) avoid this hazard by mutating only through stm_sync
+ * APIs that take s->lock; dataset/snapshot mutations bypass s->lock.
  */
 stm_dataset_index  *stm_sync_dataset_index(stm_sync *s);
 stm_snapshot_index *stm_sync_snapshot_index(stm_sync *s);

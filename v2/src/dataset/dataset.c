@@ -410,6 +410,13 @@ stm_status stm_dataset_rename(stm_dataset_index *idx, uint64_t id,
         must_unlock(&idx->lock);
         return STM_EEXIST;
     }
+    /* R31 P3-2: no-op rename (same name) shouldn't dirty the handle —
+     * matches set_pool_default's idempotency guard. */
+    if (idx->slots[s].e.name_len == name_len &&
+        memcmp(idx->slots[s].e.name, new_name, name_len) == 0) {
+        must_unlock(&idx->lock);
+        return STM_OK;
+    }
     idx->slots[s].e.name_len = (uint32_t)name_len;
     memcpy(idx->slots[s].e.name, new_name, name_len);
     idx->slots[s].e.name[name_len] = '\0';
@@ -1103,6 +1110,11 @@ typedef struct {
     bool          saw_pool_defaults;
     bool          saw_root;
     uint64_t      max_present_id;
+    /* R31 P2-1: ceiling for post-load current_txg. Walking the loaded
+     * slots gives max(created_txg). idx->current_txg must be bumped to
+     * at least that, else a post-mount Create stamps a created_txg LESS
+     * than persisted slots, violating dataset.tla::BirthTxgMonotonic. */
+    uint64_t      max_created_txg;
     stm_status    err;
 } ds_load_ctx;
 
@@ -1143,9 +1155,83 @@ static int ds_load_iter(const void *k, size_t klen,
     if (dr != STM_OK) { lc->err = dr; return 1; }
     if (key == STM_DATASET_ROOT_ID) lc->saw_root = true;
     if (key > lc->max_present_id) lc->max_present_id = key;
+    if (tmp.e.created_txg > lc->max_created_txg) {
+        lc->max_created_txg = tmp.e.created_txg;
+    }
     stm_status as = ds_shadow_append(lc, &tmp);
     if (as != STM_OK) { lc->err = as; return 1; }
     return 0;
+}
+
+/* R31 P2-2 + P2-3: structural validation of the load-at shadow.
+ * Catches trees that decode byte-clean but violate dataset.tla
+ * invariants — orphan parent, sibling-name collision, cycle in parent
+ * chain, root with non-zero parent_id. Returns STM_ECORRUPT on any
+ * violation; STM_OK if every present slot honors ForestStructure +
+ * SiblingNameUnique + RootInvariant. O(N²); fine for MVP scale. */
+static stm_status ds_validate_shadow(const ds_load_ctx *lc) {
+    /* Pass 1: per-slot local checks. */
+    for (size_t i = 0; i < lc->shadow_len; i++) {
+        const dataset_slot *si = &lc->shadow_slots[i];
+        if (!si->present) continue;
+
+        if (si->e.id == STM_DATASET_ROOT_ID) {
+            /* Root must have NO_PARENT; corrupt otherwise. */
+            if (si->e.parent_id != STM_DATASET_NO_PARENT) return STM_ECORRUPT;
+            continue;
+        }
+        /* Non-root: parent_id must be set and must NOT equal own id. */
+        if (si->e.parent_id == STM_DATASET_NO_PARENT) return STM_ECORRUPT;
+        if (si->e.parent_id == si->e.id) return STM_ECORRUPT;
+        /* Parent must reference an existing shadow slot. */
+        bool parent_found = false;
+        for (size_t j = 0; j < lc->shadow_len; j++) {
+            if (lc->shadow_slots[j].e.id == si->e.parent_id) {
+                parent_found = true;
+                break;
+            }
+        }
+        if (!parent_found) return STM_ECORRUPT;
+    }
+
+    /* Pass 2: cycle detection — every present slot's parent chain must
+     * reach root within ≤ shadow_len steps. */
+    for (size_t i = 0; i < lc->shadow_len; i++) {
+        const dataset_slot *si = &lc->shadow_slots[i];
+        if (!si->present) continue;
+        uint64_t cur = si->e.id;
+        bool reached_root = false;
+        for (size_t hops = 0; hops <= lc->shadow_len; hops++) {
+            if (cur == STM_DATASET_ROOT_ID) { reached_root = true; break; }
+            if (cur == STM_DATASET_NO_PARENT) return STM_ECORRUPT;
+            bool found = false;
+            for (size_t j = 0; j < lc->shadow_len; j++) {
+                if (lc->shadow_slots[j].e.id == cur) {
+                    cur = lc->shadow_slots[j].e.parent_id;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return STM_ECORRUPT;
+        }
+        if (!reached_root) return STM_ECORRUPT;  /* cycle */
+    }
+
+    /* Pass 3: sibling-name uniqueness (per parent_id). */
+    for (size_t i = 0; i < lc->shadow_len; i++) {
+        const dataset_slot *si = &lc->shadow_slots[i];
+        if (!si->present) continue;
+        for (size_t j = i + 1; j < lc->shadow_len; j++) {
+            const dataset_slot *sj = &lc->shadow_slots[j];
+            if (!sj->present) continue;
+            if (si->e.parent_id != sj->e.parent_id) continue;
+            if (si->e.name_len != sj->e.name_len) continue;
+            if (memcmp(si->e.name, sj->e.name, si->e.name_len) == 0)
+                return STM_ECORRUPT;
+        }
+    }
+
+    return STM_OK;
 }
 
 stm_status stm_dataset_index_load_at(stm_dataset_index *idx,
@@ -1204,6 +1290,15 @@ stm_status stm_dataset_index_load_at(stm_dataset_index *idx,
         return STM_ECORRUPT;
     }
 
+    /* R31 P2-2 + P2-3: full structural validation against dataset.tla
+     * invariants before committing to in-RAM state. */
+    stm_status vs = ds_validate_shadow(&lc);
+    if (vs != STM_OK) {
+        free(lc.shadow_slots);
+        must_unlock(&idx->lock);
+        return vs;
+    }
+
     /* Atomic swap: replace in-RAM slots[] with the validated shadow. */
     free(idx->slots);
     idx->slots     = lc.shadow_slots;
@@ -1217,6 +1312,14 @@ stm_status stm_dataset_index_load_at(stm_dataset_index *idx,
      * (which can be ahead if a Destroy happened post-Create-with-skip). */
     if (lc.max_present_id < UINT64_MAX) {
         idx->next_id = lc.max_present_id + 1;
+    }
+
+    /* R31 P2-1: keep current_txg ≥ max(created_txg) so post-mount
+     * Create's created_txg = current_txg + 1 stamps a value strictly
+     * greater than every loaded slot's created_txg
+     * (dataset.tla::BirthTxgMonotonic). */
+    if (lc.max_created_txg > idx->current_txg) {
+        idx->current_txg = lc.max_created_txg;
     }
 
     idx->root_paddr = root_paddr;

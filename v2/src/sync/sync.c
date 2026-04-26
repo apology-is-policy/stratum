@@ -1473,19 +1473,21 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
 
         uint64_t ub_next_ds = stm_load_le64(ub.ub_next_dataset_id);
         if (ub_next_ds == 0) {
-            /* v8-formatted pool upgraded to v9 has the field zero; seed
-             * to fresh value (2 = past root id=1). For populated v9
-             * pools this is a no-op against the always-≥2 value
-             * stamped at commit. */
+            /* v8 pools have the field zero (the slot pre-existed but was
+             * never populated). Seed to fresh value (2 = past root id=1).
+             * Populated v9 pools always stamp ≥ 2. */
             ub_next_ds = 2;
         }
-        /* set_next_id refuses regression below max_present + 1; a v9
-         * pool stamps next_dataset_id past max so this is consistent. */
+        /* R31 P2-4: set_next_id returns STM_EINVAL if `ub_next_ds` is
+         * below the on-disk tree's max present id + 1. That can only
+         * happen if the UB was stamped with a counter lower than the
+         * tree contents — corruption or tamper. Surface as STM_ECORRUPT
+         * rather than masking. The v9 commit path always stamps
+         * post-mutation `next_id`, which is strictly greater than every
+         * loaded id; a regression here is a load-bearing inconsistency. */
         di = stm_dataset_index_set_next_id(s2->dataset_idx, ub_next_ds);
-        if (di != STM_OK && di != STM_EINVAL) {
-            stm_sync_close(s2);
-            return di;
-        }
+        if (di == STM_EINVAL) { stm_sync_close(s2); return STM_ECORRUPT; }
+        if (di != STM_OK)     { stm_sync_close(s2); return di; }
         di = stm_dataset_index_get_next_id(s2->dataset_idx,
                                               &s2->next_dataset_id);
         if (di != STM_OK) { stm_sync_close(s2); return di; }
@@ -1518,11 +1520,10 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
 
         uint64_t ub_next_sn = stm_load_le64(ub.ub_next_snap_id);
         if (ub_next_sn == 0) ub_next_sn = 1;
+        /* R31 P2-4: same corrupt-UB surfacing as for ub_next_dataset_id. */
         si = stm_snapshot_index_set_next_id(s2->snap_idx, ub_next_sn);
-        if (si != STM_OK && si != STM_EINVAL) {
-            stm_sync_close(s2);
-            return si;
-        }
+        if (si == STM_EINVAL) { stm_sync_close(s2); return STM_ECORRUPT; }
+        if (si != STM_OK)     { stm_sync_close(s2); return si; }
         si = stm_snapshot_index_get_next_id(s2->snap_idx, &s2->next_snap_id);
         if (si != STM_OK) { stm_sync_close(s2); return si; }
     }
@@ -1812,10 +1813,11 @@ stm_status stm_sync_commit(stm_sync *s)
      * idempotent on clean (R7c/R14b parallel) — clean handles return
      * cached (paddr, csum) bytes which keep the UB content
      * byte-identical across retries (quorum.tla::ContentQuorumAtGen).
-     * Both indices borrow device 0's bdev + bootstrap, so their
-     * persistence interleaves with alloc_roots's on the same bootstrap
-     * pool — the bootstrap_commit each one does is cheap and
-     * idempotent at the same gen. */
+     * Both indices borrow device 0's bdev + bootstrap. The order is
+     * sequential (alloc_roots → dataset → snap) — each consumer's
+     * own stm_bootstrap_commit at the same target_gen is cheap (it
+     * advances bitmap_gen + fsyncs the bitmap, idempotent on subsequent
+     * calls at the same gen). */
     uint64_t main_paddr = 0;
     uint8_t  main_csum[32] = {0};
     uint64_t main_gen = 0;

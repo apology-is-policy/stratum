@@ -790,6 +790,57 @@ STM_TEST(snapshot_persist_load_at_wrong_key_rejected) {
     unlink(spp_tmp_path);
 }
 
+STM_TEST(snapshot_persist_current_txg_seeded_from_max_created) {
+    /* R31 P2-1: load_at must advance current_txg past
+     * max(created_txg) of loaded slots
+     * (snapshot.tla::BirthTxgMonotonic). */
+    spp_make_tmp("txg_seed");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    spp_open_fresh(&d, &b);
+
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(/*current_txg=*/50, &idx));
+    STM_ASSERT_OK(stm_snapshot_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_snapshot_index_set_crypt_ctx(idx, SPP_KEY,
+                                                      SPP_POOL_UUID,
+                                                      SPP_DEVICE_UUID));
+    uint64_t a = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "snap1", 0x100, &a));
+    stm_snapshot_entry e;
+    STM_ASSERT_OK(stm_snapshot_lookup(idx, a, &e));
+    STM_ASSERT_EQ(e.created_txg, (uint64_t)51);
+
+    uint64_t paddr = 0; uint8_t cs[32];
+    STM_ASSERT_OK(stm_snapshot_index_commit(idx, 1u, &paddr, cs));
+
+    stm_snapshot_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+
+    spp_reopen(&d, &b);
+    stm_snapshot_index *idx2 = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(/*current_txg=*/0, &idx2));
+    STM_ASSERT_OK(stm_snapshot_index_set_storage(idx2, d, b));
+    STM_ASSERT_OK(stm_snapshot_index_set_crypt_ctx(idx2, SPP_KEY,
+                                                       SPP_POOL_UUID,
+                                                       SPP_DEVICE_UUID));
+    STM_ASSERT_OK(stm_snapshot_index_load_at(idx2, paddr, 1u, cs));
+
+    uint64_t txg_after = 0;
+    STM_ASSERT_OK(stm_snapshot_index_current_txg(idx2, &txg_after));
+    STM_ASSERT(txg_after >= 51u);
+
+    uint64_t b1 = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx2, 1, "snap2", 0x200, &b1));
+    STM_ASSERT_OK(stm_snapshot_lookup(idx2, b1, &e));
+    STM_ASSERT(e.created_txg > 51u);
+
+    stm_snapshot_index_close(idx2);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(spp_tmp_path);
+}
+
 STM_TEST(snapshot_persist_next_id_seeded_after_load) {
     spp_make_tmp("nextid");
     stm_bdev *d = NULL; stm_bootstrap *b = NULL;

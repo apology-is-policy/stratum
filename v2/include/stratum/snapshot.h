@@ -271,11 +271,16 @@ stm_status stm_snapshot_index_commit(stm_snapshot_index *idx,
                                         uint64_t *out_root_paddr,
                                         uint8_t out_root_csum[32]);
 
+/* Durable root paddr + csum as last persisted by _commit / _load_at.
+ * Both zero before any commit. */
 STM_MUST_USE
 stm_status stm_snapshot_index_get_root(const stm_snapshot_index *idx,
                                           uint64_t *out_root_paddr,
                                           uint8_t out_root_csum[32]);
 
+/* Gen at which the durable root was AEAD-encrypted. May differ from
+ * the current commit's gen when _commit idempotent-shortcircuits.
+ * 0 before any commit. Stamped into ub_snap_root_gen. */
 STM_MUST_USE
 stm_status stm_snapshot_index_get_gen(const stm_snapshot_index *idx,
                                          uint64_t *out_root_gen);

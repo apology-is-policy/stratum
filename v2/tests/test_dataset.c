@@ -1410,6 +1410,64 @@ STM_TEST(dataset_persist_load_at_wrong_gen_rejected) {
     unlink(dsp_tmp_path);
 }
 
+STM_TEST(dataset_persist_current_txg_seeded_from_max_created) {
+    /* R31 P2-1: load_at must advance current_txg past
+     * max(created_txg) of loaded slots, else a post-mount Create
+     * stamps a created_txg less than persisted slots
+     * (dataset.tla::BirthTxgMonotonic). */
+    dsp_make_tmp("txg_seed");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    dsp_open_fresh(&d, &b);
+
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(/*current_txg=*/100, &idx));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(idx, DSP_KEY,
+                                                     DSP_POOL_UUID,
+                                                     DSP_DEVICE_UUID));
+    /* Create at txg = 101 (auto-bump from current_txg=100). */
+    uint64_t a_id = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID,
+                                              "alpha", &a_id));
+    stm_dataset_entry e;
+    STM_ASSERT_OK(stm_dataset_lookup(idx, a_id, &e));
+    STM_ASSERT_EQ(e.created_txg, (uint64_t)101);
+
+    uint64_t paddr = 0; uint8_t cs[32];
+    STM_ASSERT_OK(stm_dataset_index_commit(idx, 1u, &paddr, cs));
+
+    stm_dataset_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+
+    /* Reopen with fresh current_txg=0 (the pre-fix bug). */
+    dsp_reopen(&d, &b);
+    stm_dataset_index *idx2 = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(/*current_txg=*/0, &idx2));
+    STM_ASSERT_OK(stm_dataset_index_set_storage(idx2, d, b));
+    STM_ASSERT_OK(stm_dataset_index_set_crypt_ctx(idx2, DSP_KEY,
+                                                      DSP_POOL_UUID,
+                                                      DSP_DEVICE_UUID));
+    STM_ASSERT_OK(stm_dataset_index_load_at(idx2, paddr, 1u, cs));
+
+    /* Post-load current_txg must be ≥ 101 (max created_txg loaded). */
+    uint64_t txg_after = 0;
+    STM_ASSERT_OK(stm_dataset_index_current_txg(idx2, &txg_after));
+    STM_ASSERT(txg_after >= 101u);
+
+    /* New Create stamps created_txg > 101. */
+    uint64_t b_id = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx2, STM_DATASET_ROOT_ID,
+                                              "beta", &b_id));
+    STM_ASSERT_OK(stm_dataset_lookup(idx2, b_id, &e));
+    STM_ASSERT(e.created_txg > 101u);
+
+    stm_dataset_index_close(idx2);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(dsp_tmp_path);
+}
+
 STM_TEST(dataset_persist_next_id_seeded_after_load) {
     dsp_make_tmp("nextid");
     stm_bdev *d = NULL; stm_bootstrap *b = NULL;
