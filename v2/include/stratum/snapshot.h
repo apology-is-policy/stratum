@@ -70,6 +70,20 @@ struct stm_bootstrap;  typedef struct stm_bootstrap  stm_bootstrap;
 #define STM_SNAP_NO_TREE_ROOT    ((uint64_t)0)
 
 /*
+ * P6-deadlist: cap on the per-snapshot in-line dead-list. The on-disk
+ * tail per snapshot value is `4 + 8 * dead_count` bytes; with the
+ * cap at 256 the worst-case tail fits in ~2 KiB and a snapshot value
+ * stays comfortably within a btree leaf node.
+ *
+ * Production-grade dead-list maintenance for snapshots that span
+ * very-large datasets (TBs of dead bytes) needs chunked off-tree
+ * storage — that's a follow-on engineering chunk; the in-line MVP
+ * here matches dead_list.tla's bounded-set model and exercises the
+ * lifecycle correctly for any small snapshot.
+ */
+#define STM_SNAP_DEAD_LIST_MAX   256u
+
+/*
  * Per-snapshot entry. Mirrors ARCH §8.5.2 stm_snapshot_entry but
  * stores tree_root as a paddr (uint64_t) rather than a stm_bptr —
  * the bptr layer integration is a follow-on chunk. Other fields
@@ -148,16 +162,76 @@ stm_status stm_snapshot_create(stm_snapshot_index *idx,
  * Delete snapshot `snapshot_id`. Refused if:
  *   - snapshot_id is unknown / already-deleted (STM_ENOENT).
  *   - hold_count > 0 (STM_EBUSY).
+ *   - clone-check cb (if registered) reports a present clone (STM_EBUSY).
  *
- * Models snapshot.tla::SnapshotDelete. The snap's slot is marked
- * ABSENT; the id is NOT recycled (next_snap_id only grows). Other
- * snaps in the chain may still reference this snap's id via
- * prev_snap_id — the chain walk in invariant checks filters out
- * ABSENT links per snapshot.tla.
+ * Models snapshot.tla::SnapshotDelete + dead_list.tla::SnapDelete.
+ * The snap's slot is marked ABSENT; the id is NOT recycled
+ * (next_snap_id only grows). Other snaps in the chain may still
+ * reference this snap's id via prev_snap_id — the chain walk in
+ * invariant checks filters out ABSENT links per snapshot.tla.
+ *
+ * P6-deadlist: on success, the snap's dead-list is transferred to
+ * the caller via *out_freed_paddrs and *out_freed_count. The caller
+ * owns the array and MUST `free(*out_freed_paddrs)` when done; each
+ * paddr in the array MUST be reclaimed via `stm_alloc_free` against
+ * the appropriate device's allocator before the next sync_commit
+ * (otherwise the blocks leak from tracking).
+ *
+ * In dead_list.tla's bounded single-ownership model `surviving =
+ * S.dead ∩ successor.dead = ∅`, so all of S's dead-list is
+ * `unique` and gets freed; the predecessor-merge step is a no-op.
+ * The C impl realizes that simplification: emit the entire
+ * dead-list as freed and clear it in place.
+ *
+ * On failure the dead-list stays attached to the snap. *out_freed_*
+ * are zero/NULL.
+ *
+ * `*out_freed_paddrs` may be returned as NULL with `*out_freed_count
+ * == 0` when the snap had no dead-list (clean delete) — both forms
+ * are valid; callers MUST handle the NULL case by skipping the
+ * free + free()-of-array steps.
  */
 STM_MUST_USE
 stm_status stm_snapshot_delete(stm_snapshot_index *idx,
-                                 uint64_t snapshot_id);
+                                 uint64_t snapshot_id,
+                                 uint64_t **out_freed_paddrs,
+                                 size_t *out_freed_count);
+
+/*
+ * P6-deadlist: append `paddr` to the dead-list of the dataset's
+ * most-recent PRESENT snapshot.
+ *
+ * Semantics (dead_list.tla::OverwriteBlock):
+ *   - If the dataset has no PRESENT snapshot, no snap holds the
+ *     overwritten block, so it's safe for the caller to free it
+ *     immediately. *out_should_free is set to true.
+ *   - Otherwise the paddr is appended to the most-recent's
+ *     dead-list and *out_should_free is set to false. The block
+ *     is now "owned" by that snap until SnapDelete reaches it.
+ *
+ * Refused if:
+ *   - dataset_id == 0 (STM_EINVAL).
+ *   - paddr == 0 (STM_EINVAL — reserved sentinel).
+ *   - the dataset's most-recent snap is at STM_SNAP_DEAD_LIST_MAX
+ *     entries (STM_ENOSPC). Production-grade chunked dead-list is
+ *     a future enhancement; the cap is generous for any small/
+ *     medium snapshot but real datasets need chunking.
+ */
+STM_MUST_USE
+stm_status stm_snapshot_index_overwrite_block(stm_snapshot_index *idx,
+                                                 uint64_t dataset_id,
+                                                 uint64_t paddr,
+                                                 bool *out_should_free);
+
+/*
+ * P6-deadlist observability: count of paddrs in `snapshot_id`'s
+ * in-RAM dead-list. STM_ENOENT if not PRESENT. *out_count is 0 for
+ * a present snap with no overwrites.
+ */
+STM_MUST_USE
+stm_status stm_snapshot_dead_list_count(const stm_snapshot_index *idx,
+                                           uint64_t snapshot_id,
+                                           size_t *out_count);
 
 /*
  * Increment snapshot's hold count. STM_ENOENT if not PRESENT.
@@ -235,18 +309,24 @@ stm_status stm_snapshot_iter(const stm_snapshot_index *idx,
  *
  * Per-snapshot value layout (variable length):
  *
- *   off  size  field
- *    0    8   dataset_id (le64)
- *    8    8   tree_root_paddr (le64)
- *   16    8   created_txg (le64)
- *   24    8   prev_snap_id (le64) — STM_SNAP_NO_PREV (0) for chain head
- *   32    4   hold_count (le32) — persists across mount, like ZFS holds
- *   36    4   flags (le32)
- *   40    2   name_len (le16) — 1..STM_SNAP_NAME_MAX
- *   42    2   pad (zero)
- *   44    L   name (UTF-8, no NUL)  L = name_len
+ *   off       size   field
+ *    0         8    dataset_id (le64)
+ *    8         8    tree_root_paddr (le64)
+ *   16         8    created_txg (le64)
+ *   24         8    prev_snap_id (le64) — STM_SNAP_NO_PREV (0) for chain head
+ *   32         4    hold_count (le32) — persists across mount, like ZFS holds
+ *   36         4    flags (le32)
+ *   40         2    name_len (le16) — 1..STM_SNAP_NAME_MAX
+ *   42         2    pad (zero)
+ *   44         L    name (UTF-8, no NUL)  L = name_len
+ *   44+L       4    dead_count (le32) — 0..STM_SNAP_DEAD_LIST_MAX
+ *   48+L     8*N    dead_paddrs (le64[N]) where N = dead_count
  *
- * Total: 44 + name_len bytes. Crypt + I/O follow the alloc_roots pattern.
+ * Total: 48 + name_len + 8*dead_count bytes (was 44 + name_len pre-v11).
+ * Crypt + I/O follow the alloc_roots pattern. STM_UB_VERSION = 11
+ * gates the new tail; v10 decoders rejected trailing bytes after
+ * `name`, so v11 entries with `dead_count == 0` are content-clean for
+ * forward-only upgrade.
  */
 
 STM_MUST_USE

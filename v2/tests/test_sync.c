@@ -33,6 +33,17 @@
 #define TEST_DEVICE_BYTES      (UINT64_C(16) * 1024u * 1024u)
 #define TEST_BOOTSTRAP_BYTES   (UINT64_C(8)  * 1024u * 1024u)
 
+/* P6-deadlist: stm_snapshot_delete now returns the freed-paddr list
+ * via out-args. Tests that don't exercise the dead-list use this
+ * thin wrapper to retain the single-arg ergonomics. */
+static stm_status snap_delete_simple(stm_snapshot_index *idx, uint64_t id) {
+    uint64_t *freed = NULL;
+    size_t    n     = 0;
+    stm_status rs = stm_snapshot_delete(idx, id, &freed, &n);
+    free(freed);
+    return rs;
+}
+
 static char g_tmp_path[256];
 
 static void make_tmp(const char *tag)
@@ -1008,7 +1019,7 @@ STM_TEST(sync_dataset_state_survives_mount) {
     STM_ASSERT_EQ(se.tree_root_paddr, (uint64_t)0xfed1);
     STM_ASSERT_EQ(se.hold_count, (uint32_t)1);
     /* Held → Delete refused. */
-    STM_ASSERT_ERR(stm_snapshot_delete(si, snap1), STM_EBUSY);
+    STM_ASSERT_ERR(snap_delete_simple(si, snap1), STM_EBUSY);
 
     teardown(a2, s2, pool2);
     stm_bdev_close(d);
@@ -1080,13 +1091,13 @@ STM_TEST(sync_snap_delete_refused_with_clone) {
                                               "the_clone", snap_id, &clone_id));
 
     /* Snap delete refused — clone holds the snap. */
-    STM_ASSERT_ERR(stm_snapshot_delete(si, snap_id), STM_EBUSY);
+    STM_ASSERT_ERR(snap_delete_simple(si, snap_id), STM_EBUSY);
 
     /* Promote the clone — clone no longer references the snap. */
     STM_ASSERT_OK(stm_dataset_promote(di, clone_id));
 
     /* Now snap delete succeeds. */
-    STM_ASSERT_OK(stm_snapshot_delete(si, snap_id));
+    STM_ASSERT_OK(snap_delete_simple(si, snap_id));
 
     teardown(a, s, pool);
     stm_bdev_close(d);
@@ -1112,10 +1123,10 @@ STM_TEST(sync_snap_delete_after_clone_destroy) {
                                               "c2", snap_id, &c2));
     /* Destroying ONE clone still leaves another → snap stays held. */
     STM_ASSERT_OK(stm_dataset_destroy(di, c1));
-    STM_ASSERT_ERR(stm_snapshot_delete(si, snap_id), STM_EBUSY);
+    STM_ASSERT_ERR(snap_delete_simple(si, snap_id), STM_EBUSY);
     /* Destroying the last clone releases the hold. */
     STM_ASSERT_OK(stm_dataset_destroy(di, c2));
-    STM_ASSERT_OK(stm_snapshot_delete(si, snap_id));
+    STM_ASSERT_OK(snap_delete_simple(si, snap_id));
 
     teardown(a, s, pool);
     stm_bdev_close(d);
@@ -1159,9 +1170,9 @@ STM_TEST(sync_clone_state_survives_mount) {
     STM_ASSERT_EQ(e.origin_snap_id, snap);
 
     /* cb still bound — snap delete refused. */
-    STM_ASSERT_ERR(stm_snapshot_delete(si, snap), STM_EBUSY);
+    STM_ASSERT_ERR(snap_delete_simple(si, snap), STM_EBUSY);
     STM_ASSERT_OK(stm_dataset_promote(di, clone));
-    STM_ASSERT_OK(stm_snapshot_delete(si, snap));
+    STM_ASSERT_OK(snap_delete_simple(si, snap));
 
     teardown(a2, s2, pool2);
     stm_bdev_close(d);

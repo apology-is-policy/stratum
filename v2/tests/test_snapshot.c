@@ -27,6 +27,17 @@
 #include <string.h>
 #include <unistd.h>
 
+/* P6-deadlist: stm_snapshot_delete now returns the freed-paddr list
+ * via out-args. Tests that don't exercise the dead-list use this
+ * thin wrapper to retain the single-arg ergonomics. */
+static stm_status snap_delete_simple(stm_snapshot_index *idx, uint64_t id) {
+    uint64_t *freed = NULL;
+    size_t    n     = 0;
+    stm_status rs = stm_snapshot_delete(idx, id, &freed, &n);
+    free(freed);
+    return rs;
+}
+
 /* ------------------------------------------------------------------ */
 /* Lifecycle.                                                         */
 /* ------------------------------------------------------------------ */
@@ -163,14 +174,14 @@ STM_TEST(snap_delete_basic) {
     STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
     uint64_t s = 0;
     STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, &s));
-    STM_ASSERT_OK(stm_snapshot_delete(idx, s));
+    STM_ASSERT_OK(snap_delete_simple(idx, s));
 
     stm_snapshot_entry e;
     STM_ASSERT_ERR(stm_snapshot_lookup(idx, s, &e), STM_ENOENT);
     /* Re-delete returns ENOENT (already absent). */
-    STM_ASSERT_ERR(stm_snapshot_delete(idx, s), STM_ENOENT);
+    STM_ASSERT_ERR(snap_delete_simple(idx, s), STM_ENOENT);
     /* Unknown id returns ENOENT. */
-    STM_ASSERT_ERR(stm_snapshot_delete(idx, 9999u), STM_ENOENT);
+    STM_ASSERT_ERR(snap_delete_simple(idx, 9999u), STM_ENOENT);
     stm_snapshot_index_close(idx);
 }
 
@@ -180,11 +191,11 @@ STM_TEST(snap_delete_refused_while_held) {
     uint64_t s = 0;
     STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, &s));
     STM_ASSERT_OK(stm_snapshot_hold(idx, s));
-    STM_ASSERT_ERR(stm_snapshot_delete(idx, s), STM_EBUSY);
+    STM_ASSERT_ERR(snap_delete_simple(idx, s), STM_EBUSY);
 
     /* Release allows delete. */
     STM_ASSERT_OK(stm_snapshot_release(idx, s));
-    STM_ASSERT_OK(stm_snapshot_delete(idx, s));
+    STM_ASSERT_OK(snap_delete_simple(idx, s));
     stm_snapshot_index_close(idx);
 }
 
@@ -196,16 +207,16 @@ STM_TEST(snap_multiple_holds_each_must_release) {
     STM_ASSERT_OK(stm_snapshot_hold(idx, s));
     STM_ASSERT_OK(stm_snapshot_hold(idx, s));
     STM_ASSERT_OK(stm_snapshot_hold(idx, s));
-    STM_ASSERT_ERR(stm_snapshot_delete(idx, s), STM_EBUSY);
+    STM_ASSERT_ERR(snap_delete_simple(idx, s), STM_EBUSY);
 
     STM_ASSERT_OK(stm_snapshot_release(idx, s));
-    STM_ASSERT_ERR(stm_snapshot_delete(idx, s), STM_EBUSY);
+    STM_ASSERT_ERR(snap_delete_simple(idx, s), STM_EBUSY);
     STM_ASSERT_OK(stm_snapshot_release(idx, s));
-    STM_ASSERT_ERR(stm_snapshot_delete(idx, s), STM_EBUSY);
+    STM_ASSERT_ERR(snap_delete_simple(idx, s), STM_EBUSY);
     STM_ASSERT_OK(stm_snapshot_release(idx, s));
 
     /* Now no holds → delete OK. */
-    STM_ASSERT_OK(stm_snapshot_delete(idx, s));
+    STM_ASSERT_OK(snap_delete_simple(idx, s));
     stm_snapshot_index_close(idx);
 }
 
@@ -227,7 +238,7 @@ STM_TEST(snap_hold_on_unknown_id_rejected) {
     /* And on already-deleted id. */
     uint64_t s = 0;
     STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, &s));
-    STM_ASSERT_OK(stm_snapshot_delete(idx, s));
+    STM_ASSERT_OK(snap_delete_simple(idx, s));
     STM_ASSERT_ERR(stm_snapshot_hold(idx, s), STM_ENOENT);
     stm_snapshot_index_close(idx);
 }
@@ -274,10 +285,10 @@ STM_TEST(snap_id_never_recycled) {
     STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
     uint64_t a = 0, b = 0, c = 0;
     STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, &a));
-    STM_ASSERT_OK(stm_snapshot_delete(idx, a));
+    STM_ASSERT_OK(snap_delete_simple(idx, a));
     STM_ASSERT_OK(stm_snapshot_create(idx, 1, "b", 0, &b));
     STM_ASSERT_TRUE(b > a);
-    STM_ASSERT_OK(stm_snapshot_delete(idx, b));
+    STM_ASSERT_OK(snap_delete_simple(idx, b));
     STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, &c));
     /* Re-using name "a" in same dataset is fine after the original was
      * deleted; new id is still monotonic. */
@@ -327,7 +338,7 @@ STM_TEST(snap_most_recent_basic) {
     STM_ASSERT_OK(stm_snapshot_most_recent(idx, 1, &latest));
     STM_ASSERT_EQ(latest, b);
     /* After deleting most-recent, latest falls back to previous. */
-    STM_ASSERT_OK(stm_snapshot_delete(idx, b));
+    STM_ASSERT_OK(snap_delete_simple(idx, b));
     STM_ASSERT_OK(stm_snapshot_most_recent(idx, 1, &latest));
     STM_ASSERT_EQ(latest, a);
 
@@ -347,7 +358,7 @@ STM_TEST(snap_iter_visits_all_present) {
     STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, &a));
     STM_ASSERT_OK(stm_snapshot_create(idx, 1, "b", 0, &b));
     STM_ASSERT_OK(stm_snapshot_create(idx, 7, "c", 0, &c));
-    STM_ASSERT_OK(stm_snapshot_delete(idx, b));   /* ABSENT → not visited */
+    STM_ASSERT_OK(snap_delete_simple(idx, b));   /* ABSENT → not visited */
 
     size_t count = 0;
     STM_ASSERT_OK(stm_snapshot_iter(idx, snap_count_iter_cb, &count));
@@ -632,7 +643,7 @@ STM_TEST(snapshot_persist_commit_load_roundtrip) {
     STM_ASSERT_OK(stm_snapshot_hold(idx, a));
 
     /* Delete snap_beta (releases ABSENT slot through encode). */
-    STM_ASSERT_OK(stm_snapshot_delete(idx, b1));
+    STM_ASSERT_OK(snap_delete_simple(idx, b1));
 
     uint64_t paddr = 0; uint8_t cs[32];
     STM_ASSERT_OK(stm_snapshot_index_commit(idx, 1u, &paddr, cs));
@@ -672,7 +683,7 @@ STM_TEST(snapshot_persist_commit_load_roundtrip) {
     STM_ASSERT_ERR(stm_snapshot_lookup(idx2, b1, &e), STM_ENOENT);
 
     /* Held alpha refuses Delete. */
-    STM_ASSERT_ERR(stm_snapshot_delete(idx2, a), STM_EBUSY);
+    STM_ASSERT_ERR(snap_delete_simple(idx2, a), STM_EBUSY);
 
     stm_snapshot_index_close(idx2);
     stm_bootstrap_close(b);
@@ -888,6 +899,296 @@ STM_TEST(snapshot_persist_next_id_seeded_after_load) {
     STM_ASSERT_OK(stm_snapshot_index_set_next_id(idx2, 100u));
 
     stm_snapshot_index_close(idx2);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(spp_tmp_path);
+}
+
+/* ------------------------------------------------------------------ */
+/* P6-deadlist: dead_list.tla::OverwriteBlock + SnapDelete C impl.    */
+/* ------------------------------------------------------------------ */
+
+STM_TEST(snap_overwrite_no_snap_signals_caller_to_free) {
+    /* dead_list.tla: most_recent_snap = 0 ⇒ OverwriteBlock frees the
+     * paddr immediately (no snap holds it). */
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+
+    bool should_free = false;
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_block(idx, /*ds*/1, 0xCAFE,
+                                                        &should_free));
+    STM_ASSERT_TRUE(should_free);
+
+    stm_snapshot_index_close(idx);
+}
+
+STM_TEST(snap_overwrite_appends_to_most_recent) {
+    /* dead_list.tla: most_recent_snap > 0 ⇒ b is appended to that
+     * snap's dead-list. */
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+
+    uint64_t s1 = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, /*ds*/1, "snap1", 0, &s1));
+
+    bool should_free = true;
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_block(idx, 1, 0x1000,
+                                                        &should_free));
+    STM_ASSERT_FALSE(should_free);
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_block(idx, 1, 0x2000,
+                                                        &should_free));
+    STM_ASSERT_FALSE(should_free);
+
+    size_t dc = 0;
+    STM_ASSERT_OK(stm_snapshot_dead_list_count(idx, s1, &dc));
+    STM_ASSERT_EQ(dc, (size_t)2);
+
+    /* Different dataset's overwrite is independent. */
+    bool sf2 = false;
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_block(idx, /*ds*/2, 0x3000,
+                                                        &sf2));
+    STM_ASSERT_TRUE(sf2);  /* ds=2 has no snap yet */
+
+    stm_snapshot_index_close(idx);
+}
+
+STM_TEST(snap_overwrite_appends_to_latest_snap) {
+    /* Two snaps in same dataset: overwrite goes to the highest-id
+     * (most_recent) one. */
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    uint64_t s1 = 0, s2 = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "first",  0, &s1));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "second", 0, &s2));
+
+    bool sf;
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_block(idx, 1, 0xAAAA, &sf));
+    STM_ASSERT_FALSE(sf);
+
+    size_t dc1 = 99, dc2 = 99;
+    STM_ASSERT_OK(stm_snapshot_dead_list_count(idx, s1, &dc1));
+    STM_ASSERT_OK(stm_snapshot_dead_list_count(idx, s2, &dc2));
+    STM_ASSERT_EQ(dc1, (size_t)0);   /* old snap unaffected */
+    STM_ASSERT_EQ(dc2, (size_t)1);   /* most-recent receives it */
+
+    stm_snapshot_index_close(idx);
+}
+
+STM_TEST(snap_overwrite_arg_validation) {
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    bool sf = false;
+    STM_ASSERT_ERR(stm_snapshot_index_overwrite_block(NULL, 1, 0x1, &sf),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_index_overwrite_block(idx, 1, 0x1, NULL),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_index_overwrite_block(idx, 0, 0x1, &sf),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_index_overwrite_block(idx, 1, 0,   &sf),
+                   STM_EINVAL);
+    stm_snapshot_index_close(idx);
+}
+
+STM_TEST(snap_overwrite_caps_at_max) {
+    /* dead_list.tla doesn't model a cap, but the C impl bounds the
+     * in-line tail at STM_SNAP_DEAD_LIST_MAX. Beyond that, OverwriteBlock
+     * returns STM_ENOSPC. */
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    uint64_t s = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "fill", 0, &s));
+
+    bool sf;
+    for (uint32_t i = 0; i < STM_SNAP_DEAD_LIST_MAX; i++) {
+        uint64_t paddr = (uint64_t)0x1000 + i;
+        STM_ASSERT_OK(stm_snapshot_index_overwrite_block(idx, 1, paddr, &sf));
+        STM_ASSERT_FALSE(sf);
+    }
+    /* Cap reached. */
+    STM_ASSERT_ERR(stm_snapshot_index_overwrite_block(idx, 1, 0xDEAD, &sf),
+                   STM_ENOSPC);
+
+    stm_snapshot_index_close(idx);
+}
+
+STM_TEST(snap_delete_returns_dead_list) {
+    /* dead_list.tla::SnapDelete: all paddrs in s.dead are returned to
+     * the caller; s.dead is cleared; slot is ABSENT. */
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    uint64_t s = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "doomed", 0, &s));
+
+    bool sf;
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_block(idx, 1, 0xA001, &sf));
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_block(idx, 1, 0xA002, &sf));
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_block(idx, 1, 0xA003, &sf));
+
+    uint64_t *freed = NULL;
+    size_t    n     = 0;
+    STM_ASSERT_OK(stm_snapshot_delete(idx, s, &freed, &n));
+    STM_ASSERT_EQ(n, (size_t)3);
+    STM_ASSERT_TRUE(freed != NULL);
+    STM_ASSERT_EQ(freed[0], (uint64_t)0xA001);
+    STM_ASSERT_EQ(freed[1], (uint64_t)0xA002);
+    STM_ASSERT_EQ(freed[2], (uint64_t)0xA003);
+    free(freed);
+
+    /* Slot is ABSENT now. */
+    stm_snapshot_entry e;
+    STM_ASSERT_ERR(stm_snapshot_lookup(idx, s, &e), STM_ENOENT);
+
+    stm_snapshot_index_close(idx);
+}
+
+STM_TEST(snap_delete_clean_returns_null_zero) {
+    /* No overwrites ⇒ NULL/0 returned, caller MUST tolerate. */
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    uint64_t s = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "clean", 0, &s));
+
+    uint64_t *freed = (uint64_t *)0xDEADBEEF;  /* will be cleared */
+    size_t    n     = 99;
+    STM_ASSERT_OK(stm_snapshot_delete(idx, s, &freed, &n));
+    STM_ASSERT_TRUE(freed == NULL);
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    stm_snapshot_index_close(idx);
+}
+
+STM_TEST(snap_delete_refused_held_keeps_dead_list) {
+    /* Refused delete leaves dead_list intact; out-args set to NULL/0. */
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    uint64_t s = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "held", 0, &s));
+    bool sf;
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_block(idx, 1, 0xB001, &sf));
+
+    STM_ASSERT_OK(stm_snapshot_hold(idx, s));
+
+    uint64_t *freed = NULL;
+    size_t    n     = 99;
+    STM_ASSERT_ERR(stm_snapshot_delete(idx, s, &freed, &n), STM_EBUSY);
+    STM_ASSERT_TRUE(freed == NULL);
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    /* Dead-list still attached. */
+    size_t dc = 0;
+    STM_ASSERT_OK(stm_snapshot_dead_list_count(idx, s, &dc));
+    STM_ASSERT_EQ(dc, (size_t)1);
+
+    /* After release, delete succeeds and yields the paddr. */
+    STM_ASSERT_OK(stm_snapshot_release(idx, s));
+    STM_ASSERT_OK(stm_snapshot_delete(idx, s, &freed, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+    STM_ASSERT_EQ(freed[0], (uint64_t)0xB001);
+    free(freed);
+
+    stm_snapshot_index_close(idx);
+}
+
+STM_TEST(snap_dead_list_count_arg_validation) {
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    size_t out = 0;
+    STM_ASSERT_ERR(stm_snapshot_dead_list_count(NULL, 1u, &out), STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_dead_list_count(idx, 1u, NULL), STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_dead_list_count(idx, 9999u, &out), STM_ENOENT);
+    stm_snapshot_index_close(idx);
+}
+
+/* ------------------------------------------------------------------ */
+/* P6-deadlist persistence: dead-list survives commit/load roundtrip. */
+/* ------------------------------------------------------------------ */
+
+STM_TEST(snapshot_persist_dead_list_roundtrip) {
+    spp_make_tmp("dead_rt");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    spp_open_fresh(&d, &b);
+
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(100, &idx));
+    STM_ASSERT_OK(stm_snapshot_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_snapshot_index_set_crypt_ctx(idx, SPP_KEY,
+                                                      SPP_POOL_UUID,
+                                                      SPP_DEVICE_UUID));
+    uint64_t s1 = 0, s2 = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "with-dead", 0xA, &s1));
+    STM_ASSERT_OK(stm_snapshot_create(idx, 2, "no-dead",   0xB, &s2));
+
+    bool sf;
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_block(idx, 1, 0x1000, &sf));
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_block(idx, 1, 0x2000, &sf));
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_block(idx, 1, 0x3000, &sf));
+    /* ds=2's snap stays clean. */
+
+    uint64_t paddr = 0; uint8_t cs[32];
+    STM_ASSERT_OK(stm_snapshot_index_commit(idx, 1u, &paddr, cs));
+    stm_snapshot_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+
+    /* Reopen + load. */
+    spp_reopen(&d, &b);
+    stm_snapshot_index *idx2 = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx2));
+    STM_ASSERT_OK(stm_snapshot_index_set_storage(idx2, d, b));
+    STM_ASSERT_OK(stm_snapshot_index_set_crypt_ctx(idx2, SPP_KEY,
+                                                       SPP_POOL_UUID,
+                                                       SPP_DEVICE_UUID));
+    STM_ASSERT_OK(stm_snapshot_index_load_at(idx2, paddr, 1u, cs));
+
+    size_t dc1 = 0, dc2 = 99;
+    STM_ASSERT_OK(stm_snapshot_dead_list_count(idx2, s1, &dc1));
+    STM_ASSERT_OK(stm_snapshot_dead_list_count(idx2, s2, &dc2));
+    STM_ASSERT_EQ(dc1, (size_t)3);
+    STM_ASSERT_EQ(dc2, (size_t)0);
+
+    /* Delete s1 and verify the persisted paddrs come back. */
+    uint64_t *freed = NULL; size_t n = 0;
+    STM_ASSERT_OK(stm_snapshot_delete(idx2, s1, &freed, &n));
+    STM_ASSERT_EQ(n, (size_t)3);
+    STM_ASSERT_EQ(freed[0], (uint64_t)0x1000);
+    STM_ASSERT_EQ(freed[1], (uint64_t)0x2000);
+    STM_ASSERT_EQ(freed[2], (uint64_t)0x3000);
+    free(freed);
+
+    stm_snapshot_index_close(idx2);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(spp_tmp_path);
+}
+
+STM_TEST(snapshot_persist_dead_list_idempotent_commit) {
+    /* Two back-to-back commits with no mutation between produce
+     * byte-identical durable state (R31-style idempotency under a
+     * non-empty dead-list). */
+    spp_make_tmp("dead_idem");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    spp_open_fresh(&d, &b);
+
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    STM_ASSERT_OK(stm_snapshot_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_snapshot_index_set_crypt_ctx(idx, SPP_KEY,
+                                                      SPP_POOL_UUID,
+                                                      SPP_DEVICE_UUID));
+    uint64_t s = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "x", 1, &s));
+    bool sf;
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_block(idx, 1, 0xC1, &sf));
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_block(idx, 1, 0xC2, &sf));
+
+    uint64_t p1 = 0, p2 = 0;
+    uint8_t  c1[32], c2[32];
+    STM_ASSERT_OK(stm_snapshot_index_commit(idx, 5u, &p1, c1));
+    STM_ASSERT_OK(stm_snapshot_index_commit(idx, 7u, &p2, c2));
+    STM_ASSERT_EQ(p1, p2);
+    STM_ASSERT_EQ(memcmp(c1, c2, 32), 0);
+
+    stm_snapshot_index_close(idx);
     stm_bootstrap_close(b);
     stm_bdev_close(d);
     unlink(spp_tmp_path);

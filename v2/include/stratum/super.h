@@ -134,8 +134,22 @@ extern "C" {
  * sentinel). v9 pools' value layout doesn't accommodate the new
  * field — old decoder length-checks would refuse v10 entries. The
  * version bump gates the new field meaning explicitly. No
- * feature-flag bump (full version bump per ARCH §5.9). */
-#define STM_UB_VERSION        10u
+ * feature-flag bump (full version bump per ARCH §5.9).
+ *
+ * v10 → v11 (Phase 6 P6-deadlist): the snapshot-tree on-disk value
+ * layout grows by a tail of `le32 dead_count || le64 paddrs[N]`
+ * recording the snapshot's incremental dead-list (ARCH §8.5.5,
+ * dead_list.tla). New tail per entry: 4 + 8 * dead_count bytes
+ * (was 0). Pre-deadlist snapshots carry `dead_count == 0`. v10
+ * pools' decoder rejected trailing bytes after `name`, so the v10
+ * → v11 upgrade is content-clean (v10 entries with empty dead-list
+ * decode identically except for the trailing dead_count = 0 word).
+ * The `STM_SNAP_DEAD_LIST_MAX` cap (256 paddrs / snapshot) bounds
+ * the in-line tail; chunked storage for very-large dead-lists is
+ * deferred to a future extent-aware revision. The version bump
+ * gates the new field meaning explicitly. No feature-flag bump
+ * (full version bump per ARCH §5.9). */
+#define STM_UB_VERSION        11u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */

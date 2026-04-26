@@ -43,6 +43,14 @@ static inline void must_unlock(pthread_mutex_t *m) {
 typedef struct {
     stm_snapshot_entry e;
     bool               present;
+
+    /* P6-deadlist: per-snapshot incremental dead-list (dead_list.tla).
+     * Owned by the slot; freed in close + load_at + delete (transferred
+     * to caller). dead_count <= dead_capacity <= STM_SNAP_DEAD_LIST_MAX.
+     * NULL/0 for slots with no overwrites. */
+    uint64_t          *dead_list;
+    size_t             dead_count;
+    size_t             dead_capacity;
 } snapshot_slot;
 
 struct stm_snapshot_index {
@@ -192,6 +200,10 @@ stm_status stm_snapshot_index_create(uint64_t current_txg,
 void stm_snapshot_index_close(stm_snapshot_index *idx) {
     if (!idx) return;
     pthread_mutex_destroy(&idx->lock);
+    /* P6-deadlist: free per-slot dead_list arrays. */
+    for (size_t i = 0; i < idx->slots_len; i++) {
+        free(idx->slots[i].dead_list);
+    }
     free(idx->slots);
     free(idx);
 }
@@ -283,8 +295,12 @@ stm_status stm_snapshot_create(stm_snapshot_index *idx,
 }
 
 stm_status stm_snapshot_delete(stm_snapshot_index *idx,
-                                 uint64_t snapshot_id) {
-    if (!idx) return STM_EINVAL;
+                                 uint64_t snapshot_id,
+                                 uint64_t **out_freed_paddrs,
+                                 size_t *out_freed_count) {
+    if (!idx || !out_freed_paddrs || !out_freed_count) return STM_EINVAL;
+    *out_freed_paddrs = NULL;
+    *out_freed_count  = 0;
     must_lock(&idx->lock);
     size_t s = find_slot_locked(idx, snapshot_id);
     if (s == (size_t)-1 || !idx->slots[s].present) {
@@ -305,9 +321,93 @@ stm_status stm_snapshot_delete(stm_snapshot_index *idx,
         must_unlock(&idx->lock);
         return STM_EBUSY;
     }
-    idx->slots[s].present = false;
+    /* P6-deadlist: transfer the dead_list to the caller. In dead_list.tla's
+     * single-ownership model, all entries are unique-and-freed; the
+     * predecessor-merge step is empty so we just hand off the full list
+     * for caller-side reclaim. After the transfer, the slot's dead_list
+     * is NULL/0 — safe to mark ABSENT and leave to the next persist /
+     * close.
+     *
+     * Note: we do this AFTER all the refusal checks above (hold, clone-
+     * cb), so a refused delete leaves the dead_list intact. */
+    snapshot_slot *slot = &idx->slots[s];
+    *out_freed_paddrs   = slot->dead_list;
+    *out_freed_count    = slot->dead_count;
+    slot->dead_list     = NULL;
+    slot->dead_count    = 0;
+    slot->dead_capacity = 0;
+
+    slot->present = false;
+    idx->dirty    = true;
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+stm_status stm_snapshot_index_overwrite_block(stm_snapshot_index *idx,
+                                                 uint64_t dataset_id,
+                                                 uint64_t paddr,
+                                                 bool *out_should_free) {
+    if (!idx || !out_should_free) return STM_EINVAL;
+    if (dataset_id == 0) return STM_EINVAL;
+    if (paddr == 0) return STM_EINVAL;  /* paddr=0 reserved sentinel */
+    *out_should_free = false;
+
+    must_lock(&idx->lock);
+
+    uint64_t mr = most_recent_locked(idx, dataset_id);
+    if (mr == STM_SNAP_NO_PREV) {
+        /* No PRESENT snap holds this paddr — caller frees directly per
+         * dead_list.tla::OverwriteBlock with most_recent_snap = 0. */
+        *out_should_free = true;
+        must_unlock(&idx->lock);
+        return STM_OK;
+    }
+
+    size_t s = find_slot_locked(idx, mr);
+    /* most_recent_locked returns only PRESENT slots; missing ⇒ corruption. */
+    if (s == (size_t)-1 || !idx->slots[s].present) {
+        must_unlock(&idx->lock);
+        return STM_ECORRUPT;
+    }
+
+    snapshot_slot *slot = &idx->slots[s];
+    if (slot->dead_count >= STM_SNAP_DEAD_LIST_MAX) {
+        must_unlock(&idx->lock);
+        return STM_ENOSPC;
+    }
+
+    if (slot->dead_count == slot->dead_capacity) {
+        size_t new_cap = slot->dead_capacity == 0 ? 8u : slot->dead_capacity * 2u;
+        if (new_cap > STM_SNAP_DEAD_LIST_MAX) new_cap = STM_SNAP_DEAD_LIST_MAX;
+        uint64_t *new_buf = realloc(slot->dead_list,
+                                       new_cap * sizeof(uint64_t));
+        if (!new_buf) {
+            must_unlock(&idx->lock);
+            return STM_ENOMEM;
+        }
+        slot->dead_list     = new_buf;
+        slot->dead_capacity = new_cap;
+    }
+
+    slot->dead_list[slot->dead_count++] = paddr;
     idx->dirty = true;
     must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+stm_status stm_snapshot_dead_list_count(const stm_snapshot_index *idx,
+                                           uint64_t snapshot_id,
+                                           size_t *out_count) {
+    if (!idx || !out_count) return STM_EINVAL;
+    pthread_mutex_t *lock = snap_lock(idx);
+    must_lock(lock);
+    size_t s = find_slot_locked(idx, snapshot_id);
+    if (s == (size_t)-1 || !idx->slots[s].present) {
+        must_unlock(lock);
+        return STM_ENOENT;
+    }
+    *out_count = idx->slots[s].dead_count;
+    must_unlock(lock);
     return STM_OK;
 }
 
@@ -443,7 +543,11 @@ stm_status stm_snapshot_iter(const stm_snapshot_index *idx,
 
 #define SP_KEY_LEN              8u
 #define SP_VAL_FIXED            44u                          /* before name[] */
-#define SP_VAL_MAX              (SP_VAL_FIXED + STM_SNAP_NAME_MAX)
+#define SP_DEAD_TAIL_FIXED      4u                            /* le32 dead_count */
+#define SP_DEAD_PADDR_BYTES     8u                            /* le64 paddr */
+#define SP_VAL_MAX              (SP_VAL_FIXED + STM_SNAP_NAME_MAX \
+                                  + SP_DEAD_TAIL_FIXED \
+                                  + STM_SNAP_DEAD_LIST_MAX * SP_DEAD_PADDR_BYTES)
 
 static void sp_encode_key(uint64_t id, uint8_t out[SP_KEY_LEN]) {
     le64 k = stm_store_le64(id);
@@ -458,7 +562,9 @@ static uint64_t sp_decode_key(const uint8_t in[SP_KEY_LEN]) {
 
 static size_t sp_encode_value(const snapshot_slot *s,
                                  uint8_t *out, size_t out_cap) {
-    size_t need = SP_VAL_FIXED + s->e.name_len;
+    size_t need = (size_t)SP_VAL_FIXED + s->e.name_len
+                + SP_DEAD_TAIL_FIXED
+                + (size_t)s->dead_count * SP_DEAD_PADDR_BYTES;
     if (out_cap < need) return 0;
 
     le64 ds   = stm_store_le64(s->e.dataset_id);
@@ -481,6 +587,17 @@ static size_t sp_encode_value(const snapshot_slot *s,
     if (s->e.name_len > 0) {
         memcpy(out + SP_VAL_FIXED, s->e.name, s->e.name_len);
     }
+
+    /* P6-deadlist tail: dead_count then dead_paddrs[]. */
+    size_t tail_off = (size_t)SP_VAL_FIXED + s->e.name_len;
+    le32 dc = stm_store_le32((uint32_t)s->dead_count);
+    memcpy(out + tail_off, dc.v, 4);
+    tail_off += SP_DEAD_TAIL_FIXED;
+    for (size_t i = 0; i < s->dead_count; i++) {
+        le64 p = stm_store_le64(s->dead_list[i]);
+        memcpy(out + tail_off, p.v, 8);
+        tail_off += SP_DEAD_PADDR_BYTES;
+    }
     return need;
 }
 
@@ -501,7 +618,17 @@ static stm_status sp_decode_value(uint64_t id, const uint8_t *in,
 
     uint16_t name_len = stm_load_le16(nl);
     if (name_len > STM_SNAP_NAME_MAX) return STM_ECORRUPT;
-    if (in_len != (size_t)SP_VAL_FIXED + name_len) return STM_ECORRUPT;
+
+    /* P6-deadlist: read dead_count + paddrs[] from the tail. */
+    size_t tail_off = (size_t)SP_VAL_FIXED + name_len;
+    if (in_len < tail_off + SP_DEAD_TAIL_FIXED) return STM_ECORRUPT;
+    le32 dc;
+    memcpy(dc.v, in + tail_off, 4);
+    uint32_t dead_count = stm_load_le32(dc);
+    if (dead_count > STM_SNAP_DEAD_LIST_MAX) return STM_ECORRUPT;
+    size_t expected = tail_off + SP_DEAD_TAIL_FIXED
+                    + (size_t)dead_count * SP_DEAD_PADDR_BYTES;
+    if (in_len != expected) return STM_ECORRUPT;
 
     memset(out_slot, 0, sizeof *out_slot);
     out_slot->present              = true;
@@ -517,6 +644,27 @@ static stm_status sp_decode_value(uint64_t id, const uint8_t *in,
         memcpy(out_slot->e.name, in + SP_VAL_FIXED, name_len);
     }
     out_slot->e.name[name_len] = '\0';
+
+    if (dead_count > 0) {
+        out_slot->dead_list = malloc((size_t)dead_count * sizeof(uint64_t));
+        if (!out_slot->dead_list) return STM_ENOMEM;
+        out_slot->dead_capacity = dead_count;
+        out_slot->dead_count    = dead_count;
+        size_t off = tail_off + SP_DEAD_TAIL_FIXED;
+        for (size_t i = 0; i < dead_count; i++) {
+            le64 p;
+            memcpy(p.v, in + off + i * SP_DEAD_PADDR_BYTES, 8);
+            out_slot->dead_list[i] = stm_load_le64(p);
+            if (out_slot->dead_list[i] == 0) {
+                /* paddr=0 reserved sentinel — refuse on decode. */
+                free(out_slot->dead_list);
+                out_slot->dead_list     = NULL;
+                out_slot->dead_count    = 0;
+                out_slot->dead_capacity = 0;
+                return STM_ECORRUPT;
+            }
+        }
+    }
     return STM_OK;
 }
 
@@ -786,8 +934,25 @@ static stm_status sp_shadow_append(sp_load_ctx *lc, const snapshot_slot *src) {
         lc->shadow_slots = new_buf;
         lc->shadow_cap = new_cap;
     }
+    /* Shallow-copy the slot — dead_list ownership transfers from src
+     * (the local in sp_load_iter) to shadow_slots[i]. Caller MUST NOT
+     * free src->dead_list after this call. */
     lc->shadow_slots[lc->shadow_len++] = *src;
     return STM_OK;
+}
+
+/* P6-deadlist: free shadow_slots' per-slot dead_list arrays + the
+ * shadow_slots itself. Used on every load_at error path (each shadow
+ * slot owns its dead_list malloc'd by sp_decode_value). */
+static void sp_shadow_free(sp_load_ctx *lc) {
+    if (!lc->shadow_slots) return;
+    for (size_t i = 0; i < lc->shadow_len; i++) {
+        free(lc->shadow_slots[i].dead_list);
+    }
+    free(lc->shadow_slots);
+    lc->shadow_slots = NULL;
+    lc->shadow_len   = 0;
+    lc->shadow_cap   = 0;
 }
 
 static int sp_load_iter(const void *k, size_t klen,
@@ -812,15 +977,22 @@ static int sp_load_iter(const void *k, size_t klen,
         lc->max_created_txg = tmp.e.created_txg;
     }
     stm_status as = sp_shadow_append(lc, &tmp);
-    if (as != STM_OK) { lc->err = as; return 1; }
+    if (as != STM_OK) {
+        /* Append failed; ownership of tmp.dead_list never transferred,
+         * so we own it and must free here. */
+        free(tmp.dead_list);
+        lc->err = as;
+        return 1;
+    }
     return 0;
 }
 
 /* R31 P2-2: structural validation of the load-at shadow. Catches
- * snapshot trees that decode byte-clean but violate snapshot.tla
- * invariants — zero ids, prev_snap_id pointing forward or to wrong
- * dataset, sibling-name collision within a dataset. Returns
- * STM_ECORRUPT on any violation. */
+ * snapshot trees that decode byte-clean but violate snapshot.tla /
+ * dead_list.tla invariants — zero ids, prev_snap_id pointing forward
+ * or to wrong dataset, sibling-name collision within a dataset, or a
+ * paddr appearing in two snaps' dead_lists (single-ownership
+ * violation). Returns STM_ECORRUPT on any violation. */
 static stm_status sp_validate_shadow(const sp_load_ctx *lc) {
     /* Per-slot checks. */
     for (size_t i = 0; i < lc->shadow_len; i++) {
@@ -860,6 +1032,25 @@ static stm_status sp_validate_shadow(const sp_load_ctx *lc) {
             if (si->e.name_len != sj->e.name_len) continue;
             if (memcmp(si->e.name, sj->e.name, si->e.name_len) == 0)
                 return STM_ECORRUPT;
+        }
+    }
+
+    /* P6-deadlist single-ownership: a paddr appears in at most one
+     * snap's dead_list. Bounded by STM_SNAP_DEAD_LIST_MAX × n_snaps,
+     * the O(N²) walk is fine for any plausible mount. */
+    for (size_t i = 0; i < lc->shadow_len; i++) {
+        const snapshot_slot *si = &lc->shadow_slots[i];
+        if (!si->present) continue;
+        for (size_t ip = 0; ip < si->dead_count; ip++) {
+            uint64_t p = si->dead_list[ip];
+            for (size_t j = i; j < lc->shadow_len; j++) {
+                const snapshot_slot *sj = &lc->shadow_slots[j];
+                if (!sj->present) continue;
+                size_t jp_start = (j == i) ? (ip + 1) : 0;
+                for (size_t jp = jp_start; jp < sj->dead_count; jp++) {
+                    if (sj->dead_list[jp] == p) return STM_ECORRUPT;
+                }
+            }
         }
     }
 
@@ -904,24 +1095,28 @@ stm_status stm_snapshot_index_load_at(stm_snapshot_index *idx,
     stm_btree_mt_free(t);
 
     if (sr != STM_OK) {
-        free(lc.shadow_slots);
+        sp_shadow_free(&lc);
         must_unlock(&idx->lock);
         return sr;
     }
     if (lc.err != STM_OK) {
-        free(lc.shadow_slots);
+        sp_shadow_free(&lc);
         must_unlock(&idx->lock);
         return lc.err;
     }
     /* R31 P2-2: structural validation. */
     stm_status vs = sp_validate_shadow(&lc);
     if (vs != STM_OK) {
-        free(lc.shadow_slots);
+        sp_shadow_free(&lc);
         must_unlock(&idx->lock);
         return vs;
     }
 
-    /* Atomic swap. */
+    /* Atomic swap. P6-deadlist: free OLD slots' dead_list arrays before
+     * dropping the OLD slots[] backing store. */
+    for (size_t i = 0; i < idx->slots_len; i++) {
+        free(idx->slots[i].dead_list);
+    }
     free(idx->slots);
     idx->slots     = lc.shadow_slots;
     idx->slots_len = lc.shadow_len;

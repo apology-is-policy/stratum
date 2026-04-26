@@ -38,31 +38,33 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `d568ff7` (P6-deadlist spec scaffold: `dead_list.tla` —
-  block-level dead-list maintenance + ZFS-style SnapDelete;
-  spec-only landing, C impl deferred to a separate engineering
-  chunk). Phase 5 tagged `phase-5-complete` at `461e68e`. Spec
-  posture: **19 modules / 22 fixed configs / 19 buggy demos** (was
-  18/21/16 pre-dead-list).
+- **Tip**: `__P6DEADLIST_R33__` (P6-deadlist C impl: snapshot
+  module gains in-line dead-list under `stm_snapshot_index_*`,
+  `stm_snapshot_delete` now returns the freed-paddr list, format
+  bumped 10 → 11 for the snapshot value tail). Phase 5 tagged
+  `phase-5-complete` at `461e68e`. Spec posture: **19 modules /
+  22 fixed configs / 19 buggy demos**.
 - **Phases**: 1–5 complete; **Phase 6 progressing**.
   Spec scaffolds: P6-1 (bptr.tla) `032db86`; P6-2 (dataset.tla)
   `75f6a3f`; P6-3 (snapshot.tla) `8813027`; P6-4 (property.tla)
-  `2b6f248`; P6-5 (clone.tla) `3db8b5e`. C impls: P6-2 dataset
-  `6dbf8f0` + R28 `bdb888b`; P6-3 snapshot `34d89f5` + R29
-  `000d394`; P6-4 property `3527fe2` + R30 `8be3628`. **P6-persist
-  dataset + snapshot persistent-storage hookup landed at `348d165`.**
+  `2b6f248`; P6-5 (clone.tla) `3db8b5e`; P6-6 (dead_list.tla)
+  `d568ff7`. C impls: P6-2 dataset `6dbf8f0` + R28 `bdb888b`;
+  P6-3 snapshot `34d89f5` + R29 `000d394`; P6-4 property `3527fe2`
+  + R30 `8be3628`; P6-persist `348d165` + R31 `bffee62`; P6-clone
+  `ee45a0d` + R32 `4503405`; **P6-deadlist C impl
+  `__P6DEADLIST_C__` + R33 `__P6DEADLIST_R33__` (this commit)**.
   Phase 7 pre-work FastCDC `5cb8900` + R27 close `a2ffd38`.
-  Pending: clone C impl (extends dataset with `origin_snap_id`,
-  small follow-on); block-level dead-list spec; production scrub
-  cb (still blocked on paddr→bptr resolver, which arrives with
-  extents).
+  Pending: production scrub cb (still blocked on paddr→bptr
+  resolver, which arrives with extents); sync.c integration of
+  OverwriteBlock cb (production callers come with extents in P7);
+  perf bench harness.
 - **Tests**: 31 suites × (default + ASan + TSan, serial) green.
   test_sync_multi 42; test_pool 48; test_scrub 30; test_alloc 32;
-  test_cdc 12; test_dataset 57; test_snapshot 29; test_sync 24.
-- **Specs**: 18 TLA+ modules clean (21 fixed configs: legacy +
+  test_cdc 12; test_dataset 57; test_snapshot 40; test_sync 24.
+- **Specs**: 19 TLA+ modules clean (22 fixed configs: legacy +
   scrub_beta + scrub_durable + scrub_beta_durable + bptr +
-  dataset + snapshot + property + clone) + 16 buggy-demo
-  configs fire as expected.
+  dataset + snapshot + property + clone + dead_list) + 19
+  buggy-demo configs fire as expected.
 - **LOC**: ~31 KLOC across 26 src/ modules + 28 public headers.
 
 For phase-level status see `v2/docs/phase{2,3,4,5}-status.md`. The

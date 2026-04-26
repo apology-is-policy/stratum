@@ -788,7 +788,7 @@ Out of scope for `clone.tla`:
   territory.
 - Cross-dataset reflinks (ARCH §8.6.3) — separate.
 
-### `dead_list.tla` — block-level dead-list maintenance (P6-deadlist spec scaffold)
+### `dead_list.tla` — block-level dead-list maintenance (P6-deadlist)
 
 Models block-level reachability + per-snapshot dead-list incremental
 maintenance during COW + ZFS-style snapshot delete. Closes ROADMAP
@@ -856,6 +856,14 @@ Out of scope:
   `BuggyAlwaysFreeAll` proofs (those didn't fire in the bounded
   single-ownership model).
 - Persistent dead-list bytes — engineering chunk for the C impl.
+
+C impl status: P6-deadlist landed at `__P6DEADLIST_C__` + R33 close
+`__P6DEADLIST_R33__`. `stm_snapshot_index_overwrite_block` realizes
+`OverwriteBlock`; the modified `stm_snapshot_delete` realizes
+`SnapDelete` under the single-ownership simplification (surviving
+= ∅ ⇒ all of S.dead frees). Persistence extends the snapshot value
+with `le32 dead_count + le64 paddrs[N]`; cap STM_SNAP_DEAD_LIST_MAX
+= 256. STM_UB_VERSION 10 → 11.
 
 ## Running TLC
 
