@@ -145,8 +145,9 @@ any version other than the current one.
 | 6 → 7 | P5-3c: per-alloc-roots entry gains per-tree `root_gen` (value layout 40 → 48 bytes); needed for per-device independent-commit-gen handling. |
 | 7 → 8 | P5-durable-cursors: `ub_scrub_state[64]` carved from `ub_reserved` to persist scrub state across mount (ARCH §7.14.1; closes Phase 5 exit criterion 4 / scrub-durable aspect of #3). |
 | 8 → 9 | P6-persist: `ub_main_root_gen` (le64) + `ub_snap_root_gen` (le64) carved from `ub_reserved` to track AEAD gens for the dataset + snapshot index trees (ARCH §8.3.2 / §8.5.2). Symmetric to `ub_alloc_root_gen`. New bptr kind `STM_BPTR_KIND_DATASET = 9`; `STM_BPTR_KIND_SNAP = 5` reused for the snapshot tree root. v8 pools refused at v9 mount via uniform `STM_EBADVERSION`. |
+| 9 → 10 | P6-clone: dataset on-disk value layout grows by 8 bytes for `origin_snap_id` (le64 at offset 56). New fixed prefix is 64 bytes (was 56); total = 64 + name_len. Non-clone datasets carry `STM_DATASET_NO_ORIGIN` (0). v9 pools refused at v10 mount via uniform `STM_EBADVERSION` — the dataset value layout shift would mis-decode otherwise. Uberblock layout itself unchanged. |
 
-Current: `STM_UB_VERSION == 9` (see `include/stratum/super.h`).
+Current: `STM_UB_VERSION == 10` (see `include/stratum/super.h`).
 
 ### Merkle-rooted integrity
 

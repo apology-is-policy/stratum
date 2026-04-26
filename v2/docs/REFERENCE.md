@@ -38,14 +38,15 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `bffee62` (P6-persist R31 audit close: 0 P0 + 1 P1 +
-  4 P2 + 5 P3, all P1/P2 addressed; P3-1 / P3-4 deferred as
-  out-of-scope — bookkeeping cost + tamper class same as existing
-  ub_gen / ub_next_ino). Phase 5 tagged `phase-5-complete` at
-  `461e68e`. Spec posture: 18 modules / 21 fixed configs / 16
-  buggy demos (unchanged this chunk — persistence consumes
-  existing invariants per quorum.tla, merkle.tla,
-  metadata_nonce.tla; no new spec module required).
+- **Tip**: `ee45a0d` (P6-clone: clone C impl + STM_UB_VERSION 9 →
+  10 — `origin_snap_id` field on `stm_dataset_entry`; new APIs
+  `stm_dataset_create_clone` / `_promote` / `_clones_count_for_snap`;
+  cross-module clone-check cb from snapshot module that sync
+  registers; SnapWithClonesUndeletable wired through). R32 audit
+  pending. Phase 5 tagged `phase-5-complete` at `461e68e`. Spec
+  posture: 18 modules / 21 fixed configs / 16 buggy demos
+  (unchanged this chunk — clone.tla already landed at `3db8b5e`;
+  this chunk adds the C impl).
 - **Phases**: 1–5 complete; **Phase 6 progressing**.
   Spec scaffolds: P6-1 (bptr.tla) `032db86`; P6-2 (dataset.tla)
   `75f6a3f`; P6-3 (snapshot.tla) `8813027`; P6-4 (property.tla)
@@ -60,7 +61,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   extents).
 - **Tests**: 31 suites × (default + ASan + TSan, serial) green.
   test_sync_multi 42; test_pool 48; test_scrub 30; test_alloc 32;
-  test_cdc 12; test_dataset 49; test_snapshot 29; test_sync 21.
+  test_cdc 12; test_dataset 57; test_snapshot 29; test_sync 24.
 - **Specs**: 18 TLA+ modules clean (21 fixed configs: legacy +
   scrub_beta + scrub_durable + scrub_beta_durable + bptr +
   dataset + snapshot + property + clone) + 16 buggy-demo
