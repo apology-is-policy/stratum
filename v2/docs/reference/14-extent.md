@@ -265,6 +265,7 @@ handler).
 | Suite | Count | Coverage |
 |---|---|---|
 | `test_extent_index` | 38 | Lifecycle (create / close / advance_txg with all error paths including R34 P3-2 NULL-idx parity). Write — basic insert + lookup roundtrip; refuses zero-len, zero-args, off+len overflow, future write_gen, overlap with existing in-ino, paddr already-in-use. Overwrite — into hole returns no drops; drops one extent; drops multiple overlapping; doesn't touch other (ds, ino); refuses paddr-cycle (new_paddr equals a dropped extent); refuses paddr-collision with live extent in different (ds, ino); refuses bad args. Truncate — drops past-size extents; truncate-to-zero drops all; no drops when new_size > max extent end; doesn't touch other (ds, ino). DeleteFile — drops all in (ds, ino); idempotent on empty (ds, ino). Lookup — hole boundaries (off < extent.off, off ≥ extent.off+extent.len, off=last byte); unknown (ds, ino) returns ENOENT. Iter — returns off-ascending despite insertion order; early terminate on cb=false; filters by (ds, ino). ERRORCHECK reentry — cb-runs-under-lock smoke test. Concurrent stress — 4 workers × 256 ops each on disjoint (ds, ino) all serialize cleanly. **R34 P2-1 regression** — out-arg zeroing on `idx==NULL` early return for overwrite / truncate / delete_file. **P7-3 persistence** (6 tests) — set_storage required for commit; commit + load_at roundtrip across multiple datasets / inos / paddrs / write_gens with current_txg bumped to max(write_gen); idempotent commit at same target_gen returns same paddr+csum bytes; tampered csum on load_at refused + atomic state preserve; 24-bit length cap refused at commit; empty-tree first-commit roundtrip. |
+| `test_fs` | 17 | Lifecycle / format / mount / unmount / RO / wedged / reserve+free / stats / null-args (9 pre-existing). **P7-4 (8 new)**: write/read 4 KiB roundtrip; read-hole returns zeros; write args validation (zero ds/ino/len, unaligned off/len, len > 128 KiB); COW without snapshot routes drop to alloc.free; COW with snapshot routes drop to snap dead-list (asserts `stm_snapshot_dead_list_count` 0 → 1); cross-mount durability (write + commit + unmount + remount + read); RO mount blocks writes; multi-extent per ino. |
 
 `test_extent` (Phase 4) covers the AEAD-wrap helpers; that suite is
 unrelated to the index API and stays separate.
@@ -282,11 +283,20 @@ unrelated to the index API and stays separate.
       Idempotent commit + atomic shadow swap + structural validator.
       STM_UB_VERSION 11→12.
 - [x] Sync wire-in (P7-3): create / open / commit / close / accessor.
-- [ ] Sync.c COW path integration — extent → snapshot.overwrite_block
-      routing on each dropped paddr from Overwrite / Truncate /
-      DeleteFile (composes with dead_list.tla). Lands as P7-4.
+- [x] Sync.c COW path integration (P7-4): `stm_sync_write_extent` /
+      `stm_sync_read_extent` with full alloc.reserve + AEAD encrypt
+      + bdev.write + extent_overwrite + drop-routing through
+      `sync_drop_paddr_locked` (snapshot.overwrite_block → if
+      free, alloc.free with device routing via stm_paddr_device).
+      Composes extent.tla::Overwrite + dead_list.tla::OverwriteBlock
+      + allocator.tla::Free at the C-impl boundary.
+- [x] POSIX-shape `stm_fs_write` / `stm_fs_read` (P7-4): thin fs.c
+      wrappers with FS_GUARD_WRITE / FS_GUARD_READ.
+- [x] `stm_extent_index_advance_txg(sync->current_gen)` per sync_create
+      / sync_open / sync_commit (R35 forward-looking note acted on
+      in P7-4).
 - [ ] Production scrub cb — paddr→bptr resolver via extent walk.
-      Now unblocked by P7-3.
+      Now fully unblocked.
 - [ ] Partial-extent shrink on Truncate (truncating mid-extent) —
       deferred; current MVP only drops fully-past-truncation extents.
 - [ ] Coalescing — quality-of-implementation; correctness preserved
@@ -303,11 +313,12 @@ unrelated to the index API and stays separate.
   persistence path rebuilds the Bε-tree from the array on every
   commit; for small pools this is fine, but many-inode pools
   benefit from per-file or per-dataset partitioning (see Status).
-- **No production caller yet**: extent module is API-complete and
-  persists through mount/unmount cycles. The fs.c / sync.c
-  integration that drives extent mutations from POSIX writes —
-  including the dropped-paddr → snapshot.overwrite_block →
-  allocator-free routing — lands as P7-4.
+- **MVP write/read constraints (P7-4)**: `stm_fs_write` / `_read`
+  require `len > 0`, `len` multiple of 4 KiB, `len ≤ 128 KiB`
+  (recordsize default), `off` multiple of 4 KiB. Single-extent per
+  call. Encryption uses pool-wide `metadata_key` (per-dataset DEKs
+  deferred). Reads cap at the matching extent's length; partial
+  reads spanning multiple extents are caller-iterated.
 - **Live-paddr semantics**: a paddr re-used in a future gen by the
   allocator is allowed; a paddr that's CURRENTLY in any live extent
   is refused. Callers MUST drop the old extent (via Overwrite /

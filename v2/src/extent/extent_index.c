@@ -632,16 +632,18 @@ static stm_status ex_decode_key(const uint8_t *in, size_t in_len,
 
 static stm_status ex_encode_value(const stm_extent_record *r,
                                      uint8_t out[EX_VAL_LEN]) {
-    /* MVP cap on length (see header). Refuse to encode oversize records
-     * to keep on-disk fields representable; in practice, recordsize is
-     * bounded well under 24 bits. */
+    /* MVP cap on length (see header). dlen and clen both equal
+     * r->len — extent records track LOGICAL plaintext length;
+     * AEAD tag overhead lives with the allocator's per-range size
+     * tracking (stm_alloc_free uses paddr alone, allocator knows
+     * the run length internally). Compressed-extent path would
+     * later distinguish dlen vs clen; encryption alone does not
+     * require it for the MVP. */
     if (r->len > EX_LEN_MAX_24BIT) return STM_ERANGE;
 
     le64 paddr      = stm_store_le64(r->paddr);
     le64 write_gen  = stm_store_le64(r->gen);
     le32 dlen       = stm_store_le32((uint32_t)r->len);
-    /* clen_and_comp: low 24 = stored length (== dlen, no compression
-     * in MVP); high 8 = compression algo (0 = none). */
     uint32_t clen_and_comp = (uint32_t)r->len & 0x00FFFFFFu;
     le32 cac        = stm_store_le32(clen_and_comp);
     le64 xxh        = stm_store_le64((uint64_t)0); /* AEAD-only mode */

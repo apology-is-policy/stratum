@@ -824,6 +824,39 @@ struct stm_extent_index;
 typedef struct stm_extent_index stm_extent_index;
 stm_extent_index *stm_sync_extent_index(stm_sync *s);
 
+/*
+ * P7-4: POSIX-shape extent write/read with full COW routing.
+ *
+ * `stm_sync_write_extent` reserves blocks for a fresh extent,
+ * AEAD-encrypts the plaintext, writes ciphertext+tag to disk,
+ * inserts the extent record, and routes any dropped paddrs through
+ * the snapshot dead-list (extent.tla::Overwrite + dead_list.tla::
+ * OverwriteBlock + allocator.tla::Free composition).
+ *
+ * `stm_sync_read_extent` looks up the extent covering `off`, reads
+ * ciphertext+tag, AEAD-decrypts, and copies `len` bytes to the
+ * caller. Holes (no extent) return zeros.
+ *
+ * MVP constraints (P7-4):
+ *   - len > 0, multiple of 4 KiB, ≤ 128 KiB (recordsize default).
+ *   - off must be 4 KiB aligned.
+ *   - Single-extent per call: caller iterates for spans > recordsize.
+ *   - Encryption key sourced from sync->metadata_key (per-pool key).
+ *     Per-dataset DEKs deferred to a future chunk.
+ *
+ * Thread safety: serialized by sync's internal mutex. Composes with
+ * sync_commit's idempotent persistence — every commit captures all
+ * writes since the prior commit.
+ */
+STM_MUST_USE
+stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
+                                    uint64_t off, const void *buf, size_t len);
+
+STM_MUST_USE
+stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
+                                   uint64_t off, void *buf, size_t len,
+                                   size_t *out_read);
+
 #ifdef __cplusplus
 }
 #endif

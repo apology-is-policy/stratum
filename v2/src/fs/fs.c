@@ -429,6 +429,32 @@ stm_status stm_fs_commit(stm_fs *fs)
     return s;
 }
 
+/* P7-4: POSIX-shape extent write/read. Thin wrappers over the sync
+ * layer's stm_sync_write_extent / stm_sync_read_extent. The sync
+ * layer takes its own mutex; here we just enforce the wedged +
+ * read-only guards. */
+stm_status stm_fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                          uint64_t off, const void *buf, size_t len)
+{
+    if (!fs) return STM_EINVAL;
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+    pthread_mutex_unlock(&fs->lock);
+    return stm_sync_write_extent(fs->sync, dataset_id, ino, off, buf, len);
+}
+
+stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                         uint64_t off, void *buf, size_t len,
+                         size_t *out_read)
+{
+    if (!fs) return STM_EINVAL;
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_READ(fs);
+    pthread_mutex_unlock(&fs->lock);
+    return stm_sync_read_extent(fs->sync, dataset_id, ino, off,
+                                  buf, len, out_read);
+}
+
 /* ========================================================================= */
 /* Inspection + control.                                                      */
 /* ========================================================================= */
@@ -508,4 +534,11 @@ stm_status stm_fs_verify(const stm_fs *fs)
 stm_bdev *stm_fs_bdev_for_test(stm_fs *fs)
 {
     return fs ? fs->bdev : NULL;
+}
+
+/* P7-4: tests that drive the snapshot/dataset/extent indices need
+ * the sync handle. Same lifetime contract as the bdev accessor. */
+stm_sync *stm_fs_sync_for_test(stm_fs *fs)
+{
+    return fs ? fs->sync : NULL;
 }

@@ -23,6 +23,7 @@ extern "C" {
 
 struct stm_fs;
 struct stm_bdev;
+struct stm_sync;
 
 /*
  * Borrow a pointer to the underlying bdev of a mounted stm_fs. The
@@ -31,6 +32,16 @@ struct stm_bdev;
  * <stratum/block_inject.h>.
  */
 struct stm_bdev *stm_fs_bdev_for_test(struct stm_fs *fs);
+
+/*
+ * Borrow a pointer to the sync handle of a mounted stm_fs. Tests that
+ * need to drive the snapshot / dataset / extent indices directly can
+ * use this with stm_sync_snapshot_index / _dataset_index /
+ * _extent_index. P7-4 dead-list routing tests depend on this seam to
+ * verify drop_paddr_locked's decisions. Same lifetime contract as
+ * stm_fs_bdev_for_test.
+ */
+struct stm_sync *stm_fs_sync_for_test(struct stm_fs *fs);
 
 #ifdef __cplusplus
 }

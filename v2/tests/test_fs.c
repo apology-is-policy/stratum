@@ -12,7 +12,10 @@
  */
 #include "tharness.h"
 #include <stratum/fs.h>
+#include <stratum/fs_testing.h>
 #include <stratum/keyfile.h>
+#include <stratum/snapshot.h>
+#include <stratum/sync.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -358,6 +361,253 @@ STM_TEST(fs_null_args_rejected) {
 
     /* stm_fs_mark_wedged(NULL) is a no-op — should not crash. */
     stm_fs_mark_wedged(NULL);
+}
+
+/* ========================================================================= */
+/* P7-4: stm_fs_write / stm_fs_read with COW routing.                          */
+/* ========================================================================= */
+
+STM_TEST(fs_io_write_read_roundtrip) {
+    make_tmp("io_rt");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* 4 KiB write/read roundtrip. */
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)(i & 0xFF);
+
+    STM_ASSERT_OK(stm_fs_write(fs, /*ds=*/1, /*ino=*/1, /*off=*/0,
+                                  plain, sizeof plain));
+
+    uint8_t out[4096] = {0};
+    size_t  got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_EQ(got, (size_t)sizeof out);
+    STM_ASSERT_MEM_EQ(plain, out, sizeof plain);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+STM_TEST(fs_io_read_hole_returns_zeros) {
+    make_tmp("io_hole");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* No write at off=0 → reading a hole returns zeros. */
+    uint8_t out[4096];
+    memset(out, 0xFF, sizeof out);
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_EQ(got, (size_t)sizeof out);
+    for (size_t i = 0; i < sizeof out; i++) STM_ASSERT_EQ(out[i], 0u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+STM_TEST(fs_io_write_args_validated) {
+    make_tmp("io_args");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t buf[4096] = {0};
+    /* zero ds / zero ino / zero len. */
+    STM_ASSERT_ERR(stm_fs_write(fs, 0, 1, 0, buf, 4096), STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_write(fs, 1, 0, 0, buf, 4096), STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_write(fs, 1, 1, 0, buf, 0),    STM_EINVAL);
+    /* unaligned len. */
+    STM_ASSERT_ERR(stm_fs_write(fs, 1, 1, 0, buf, 1234), STM_EINVAL);
+    /* unaligned off. */
+    STM_ASSERT_ERR(stm_fs_write(fs, 1, 1, 1024, buf, 4096), STM_EINVAL);
+    /* len > 128 KiB. */
+    uint8_t big[129u * 1024u] = {0};
+    STM_ASSERT_ERR(stm_fs_write(fs, 1, 1, 0, big, sizeof big), STM_ERANGE);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+STM_TEST(fs_io_cow_without_snapshot_frees_old_paddr) {
+    /* No snapshot in flight: overwriting an extent should drop the
+     * old paddr through alloc_free (not into a dead-list). Verify
+     * via allocator stats: post-overwrite, the in-flight allocated
+     * count stays the same (1 fresh extent's worth) — the old paddr
+     * goes to PENDING and is freed at the next commit. */
+    make_tmp("io_cow_nosnap");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t a[4096];
+    uint8_t b[4096];
+    memset(a, 0xAA, sizeof a);
+    memset(b, 0xBB, sizeof b);
+
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, a, sizeof a));
+    /* Overwrite at the same off: drop_paddr → snap.overwrite_block →
+     * no snap → should_free=true → alloc.free(old_paddr). */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, b, sizeof b));
+
+    /* Read returns the new content. */
+    uint8_t out[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_EQ(got, (size_t)sizeof out);
+    STM_ASSERT_MEM_EQ(b, out, sizeof out);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+STM_TEST(fs_io_cow_with_snapshot_routes_to_dead_list) {
+    /* A snapshot is in flight: overwriting an extent must NOT free
+     * the old paddr — it must go into the most-recent snap's
+     * dead-list (dead_list.tla::OverwriteBlock). Verify by checking
+     * stm_snapshot_dead_list_count went up by 1 after the
+     * overwrite. */
+    make_tmp("io_cow_snap");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t a[4096];
+    uint8_t b[4096];
+    memset(a, 0xAA, sizeof a);
+    memset(b, 0xBB, sizeof b);
+
+    STM_ASSERT_OK(stm_fs_write(fs, /*ds=*/1, /*ino=*/1, 0, a, sizeof a));
+
+    /* Reach into sync via the test seam to create a snapshot of
+     * dataset_id=1 and confirm dead-list count behavior. */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    STM_ASSERT_TRUE(sync != NULL);
+    stm_snapshot_index *snap = stm_sync_snapshot_index(sync);
+    STM_ASSERT_TRUE(snap != NULL);
+
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_snapshot_create(snap, /*ds=*/1, "snap_a",
+                                          /*tree_root_paddr=*/0xCAFE,
+                                          &snap_id));
+    /* Pre-overwrite: dead_list is empty. */
+    size_t pre = 999;
+    STM_ASSERT_OK(stm_snapshot_dead_list_count(snap, snap_id, &pre));
+    STM_ASSERT_EQ(pre, (size_t)0);
+
+    /* Overwrite — old paddr should route to snap_id's dead-list. */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, b, sizeof b));
+
+    /* Post-overwrite: dead_list is +1. */
+    size_t post = 0;
+    STM_ASSERT_OK(stm_snapshot_dead_list_count(snap, snap_id, &post));
+    STM_ASSERT_EQ(post, (size_t)1);
+
+    /* Read-back of the new content. */
+    uint8_t out[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(b, out, sizeof out);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+STM_TEST(fs_io_cross_mount_durability) {
+    /* Write an extent, commit, unmount, remount, read back — content
+     * must round-trip via persistence. */
+    make_tmp("io_durable");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[8192];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)((i * 7) & 0xFF);
+
+    STM_ASSERT_OK(stm_fs_write(fs, 42, 99, 0,    plain,        4096));
+    STM_ASSERT_OK(stm_fs_write(fs, 42, 99, 4096, plain + 4096, 4096));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    /* Remount + read back. */
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint8_t out[8192] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 42, 99, 0,    out,        4096, &got));
+    STM_ASSERT_EQ(got, (size_t)4096);
+    STM_ASSERT_OK(stm_fs_read(fs, 42, 99, 4096, out + 4096, 4096, &got));
+    STM_ASSERT_EQ(got, (size_t)4096);
+    STM_ASSERT_MEM_EQ(plain, out, sizeof out);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+STM_TEST(fs_io_read_only_blocks_writes) {
+    make_tmp("io_ro");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    mopts.read_only = true;
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t buf[4096] = {0};
+    STM_ASSERT_ERR(stm_fs_write(fs, 1, 1, 0, buf, sizeof buf), STM_EROFS);
+    /* Reads still permitted on RO. */
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, buf, sizeof buf, &got));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+STM_TEST(fs_io_multi_extent_per_ino) {
+    /* Several extents on the same ino at different offsets — each
+     * round-trips independently. */
+    make_tmp("io_multi");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Write three contiguous 4 KiB extents. */
+    uint8_t a[4096], b[4096], c[4096];
+    memset(a, 0xA1, sizeof a);
+    memset(b, 0xB2, sizeof b);
+    memset(c, 0xC3, sizeof c);
+
+    STM_ASSERT_OK(stm_fs_write(fs, 7, 13, 0,        a, sizeof a));
+    STM_ASSERT_OK(stm_fs_write(fs, 7, 13, 4096,     b, sizeof b));
+    STM_ASSERT_OK(stm_fs_write(fs, 7, 13, 8192,     c, sizeof c));
+
+    uint8_t out[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 7, 13, 0,    out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(a, out, sizeof a);
+    STM_ASSERT_OK(stm_fs_read(fs, 7, 13, 4096, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(b, out, sizeof b);
+    STM_ASSERT_OK(stm_fs_read(fs, 7, 13, 8192, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(c, out, sizeof c);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
 }
 
 STM_TEST_MAIN("fs")

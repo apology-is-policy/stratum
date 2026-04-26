@@ -169,6 +169,40 @@ stm_status stm_fs_free(stm_fs *fs, uint64_t paddr, uint64_t free_gen);
 STM_MUST_USE
 stm_status stm_fs_commit(stm_fs *fs);
 
+/* P7-4: POSIX-shape extent write/read.
+ *
+ * `stm_fs_write` (encrypts + reserves + writes + extent-overwrite +
+ * COW-routing dropped paddrs through the snapshot dead-list /
+ * allocator-free path).
+ *
+ * `stm_fs_read` (extent-lookup + bdev-read + decrypt; holes return
+ * zeros).
+ *
+ * MVP constraints (P7-4):
+ *   - len > 0, multiple of 4 KiB, ≤ 128 KiB (recordsize default).
+ *   - off must be 4 KiB aligned.
+ *   - Single-extent per call: caller iterates for spans > recordsize.
+ *   - Encryption key sourced from the pool's metadata_key. Per-
+ *     dataset DEKs are deferred to a future chunk.
+ *
+ * Returns:
+ *   - STM_OK on success.
+ *   - STM_EWEDGED / STM_EROFS if the FS is wedged or read-only
+ *     (write only).
+ *   - STM_EINVAL on bad alignment / args.
+ *   - STM_ERANGE if len > 128 KiB.
+ *   - STM_ENOMEM on allocation failure.
+ *   - STM_EBADTAG on AEAD decrypt failure (read).
+ */
+STM_MUST_USE
+stm_status stm_fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                          uint64_t off, const void *buf, size_t len);
+
+STM_MUST_USE
+stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                         uint64_t off, void *buf, size_t len,
+                         size_t *out_read);
+
 /* ========================================================================= */
 /* Inspection + control.                                                      */
 /* ========================================================================= */

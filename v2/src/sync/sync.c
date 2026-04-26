@@ -1054,6 +1054,12 @@ stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
         if (rc != STM_OK) { stm_sync_close(s); return rc; }
     }
 
+    /* P7-4 (R35 forward note): advance extent_idx->current_txg to
+     * match the live current_gen so any pre-first-commit extent_write
+     * passes BirthTxgBound. Without this, extent_idx->current_txg
+     * starts at 0 but sync->current_gen starts at 1. */
+    (void)stm_extent_index_advance_txg(s->extent_idx, s->current_gen);
+
     *out_sync = s;
     return STM_OK;
 }
@@ -1682,6 +1688,15 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
         memcpy(s2->merkle_root,     ub.ub_merkle_root,        32);
     }
 
+    /* P7-4 (R35 forward note): advance extent_idx->current_txg to
+     * match the live current_gen post-mount. Without this, post-mount
+     * stm_extent_write at a higher write_gen would fail BirthTxgBound
+     * because extent_idx->current_txg is stuck at max(persisted gen).
+     * sync_commit advances on every commit too, but sync_open is the
+     * first opportunity and any pre-first-commit extent_write would
+     * otherwise fail. */
+    (void)stm_extent_index_advance_txg(s2->extent_idx, s2->current_gen);
+
     *out_sync = s2;
     return STM_OK;
 }
@@ -2051,6 +2066,16 @@ stm_status stm_sync_commit(stm_sync *s)
     memcpy(s->snap_root_csum,      snap_csum,      32);
     memcpy(s->extent_root_csum,    extent_csum,    32);
     memcpy(s->merkle_root,         new_merkle_root, 32);
+
+    /* P7-4 (R35 forward note): advance the extent index's
+     * current_txg in lockstep with sync->current_gen so any
+     * extent_write/_overwrite stamped at the NEW current_gen
+     * passes BirthTxgBound. extent_idx->current_txg is monotonic
+     * and not persisted standalone (load_at recomputes it from
+     * max(write_gen)); advancing here on every commit keeps it in
+     * sync with the live sync gen. STM_EINVAL on regression is
+     * impossible here (target_gen + 2 > prior current_gen always). */
+    (void)stm_extent_index_advance_txg(s->extent_idx, s->current_gen);
 
     pthread_mutex_unlock(&s->lock);    stm_pool_unlock_shared(s->pool);
     return STM_OK;
@@ -3498,6 +3523,246 @@ stm_snapshot_index *stm_sync_snapshot_index(stm_sync *s)
 stm_extent_index *stm_sync_extent_index(stm_sync *s)
 {
     return s ? s->extent_idx : NULL;
+}
+
+/* ========================================================================= */
+/* P7-4 — POSIX-shape extent write/read with full COW routing.                */
+/* ========================================================================= */
+
+/*
+ * MVP constraints:
+ *   - len must be a positive multiple of STM_UB_SIZE (4 KiB blocks).
+ *   - len bounded ≤ STM_FS_RECORDSIZE_MAX (128 KiB) per ARCH §8.4.2
+ *     default recordsize.
+ *   - off must be a multiple of STM_UB_SIZE.
+ *   - Single-extent per call: caller iterates for spans > recordsize.
+ *   - Encryption key sourced from sync->metadata_key (per-pool key).
+ *     Per-dataset DEKs are deferred to a future chunk.
+ */
+#define STM_FS_RECORDSIZE_MAX   (128u * 1024u)
+
+static stm_status sync_drop_paddr_locked(stm_sync *s, uint64_t ds, uint64_t paddr) {
+    /* Composes extent.tla::Overwrite-drop with dead_list.tla::OverwriteBlock:
+     * - If the dataset has a most-recent PRESENT snapshot, the dropped
+     *   paddr is appended to that snap's dead-list.
+     * - Otherwise, no snap holds the paddr — free it directly via the
+     *   correct device's allocator. */
+    bool should_free = false;
+    stm_status os = stm_snapshot_index_overwrite_block(s->snap_idx, ds, paddr,
+                                                          &should_free);
+    if (os != STM_OK) return os;
+    if (should_free) {
+        uint16_t dev_id = stm_paddr_device(paddr);
+        if (dev_id >= STM_POOL_DEVICES_MAX || s->allocs[dev_id] == NULL)
+            return STM_EINVAL;
+        return stm_alloc_free(s->allocs[dev_id], paddr, s->current_gen);
+    }
+    return STM_OK;
+}
+
+stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
+                                    uint64_t off, const void *buf, size_t len) {
+    if (!s || !buf) return STM_EINVAL;
+    if (dataset_id == 0 || ino == 0) return STM_EINVAL;
+    if (len == 0) return STM_EINVAL;
+    if (len > STM_FS_RECORDSIZE_MAX) return STM_ERANGE;
+    if ((len % STM_UB_SIZE) != 0) return STM_EINVAL;
+    if ((off % STM_UB_SIZE) != 0) return STM_EINVAL;
+    if (off > UINT64_MAX - len) return STM_EOVERFLOW;
+
+    pthread_mutex_lock(&s->lock);
+    if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
+    if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
+
+    stm_aead_mode mode = stm_aead_autodetect();
+    size_t tag_len = stm_aead_tag_len(mode);
+    if (tag_len == 0) {
+        pthread_mutex_unlock(&s->lock);
+        return STM_EINVAL;
+    }
+    /* Reserve enough blocks to hold ciphertext+tag. nblocks rounded up. */
+    size_t total_bytes = len + tag_len;
+    uint64_t nblocks   = (total_bytes + STM_UB_SIZE - 1u) / STM_UB_SIZE;
+
+    uint64_t paddr = 0;
+    stm_status rs = stm_alloc_reserve(s->alloc, nblocks, 0, &paddr);
+    if (rs != STM_OK) {
+        pthread_mutex_unlock(&s->lock);
+        return rs;
+    }
+
+    /* Encrypt into a temp buffer. AEAD output: ciphertext (len bytes)
+     * followed by tag (tag_len bytes). */
+    void *cbuf = malloc(total_bytes);
+    if (!cbuf) {
+        (void)stm_alloc_free(s->alloc, paddr, s->current_gen);
+        pthread_mutex_unlock(&s->lock);
+        return STM_ENOMEM;
+    }
+
+    stm_ad_extent ad;
+    memset(&ad, 0, sizeof ad);
+    ad.magic        = STM_AD_MAGIC_EXTENT;
+    ad.version      = STM_AD_VERSION_EXTENT;
+    ad.pool_uuid[0] = s->pool_uuid[0];
+    ad.pool_uuid[1] = s->pool_uuid[1];
+    ad.dataset_id   = dataset_id;
+    ad.ino          = ino;
+    ad.offset       = off;
+    ad.content_kind = 0;  /* file data */
+
+    size_t out_len = 0;
+    stm_status es = stm_extent_encrypt(mode, s->metadata_key,
+                                          paddr, s->current_gen,
+                                          &ad, buf, len,
+                                          cbuf, total_bytes, &out_len);
+    if (es != STM_OK) {
+        free(cbuf);
+        (void)stm_alloc_free(s->alloc, paddr, s->current_gen);
+        pthread_mutex_unlock(&s->lock);
+        return es;
+    }
+
+    /* Write ciphertext+tag to disk. The remainder of the reserved
+     * `nblocks * STM_UB_SIZE` bytes is unwritten — that's OK; the
+     * read path knows to read exactly `len + tag_len` bytes. */
+    uint64_t byte_off = stm_paddr_offset(paddr) * (uint64_t)STM_UB_SIZE;
+    stm_bdev *target_bdev = stm_pool_device_bdev(s->pool,
+                                                    stm_paddr_device(paddr));
+    if (!target_bdev) {
+        free(cbuf);
+        (void)stm_alloc_free(s->alloc, paddr, s->current_gen);
+        pthread_mutex_unlock(&s->lock);
+        return STM_EINVAL;
+    }
+    stm_status ws = stm_bdev_write(target_bdev, byte_off, cbuf, total_bytes);
+    free(cbuf);
+    if (ws != STM_OK) {
+        (void)stm_alloc_free(s->alloc, paddr, s->current_gen);
+        pthread_mutex_unlock(&s->lock);
+        return ws;
+    }
+
+    /* Update the extent index with the new extent; collect any dropped
+     * paddrs from overlapping extents. Each drop routes through the
+     * snapshot dead-list or free-direct path. */
+    uint64_t *dropped = NULL;
+    size_t    n_dropped = 0;
+    stm_status os = stm_extent_overwrite(s->extent_idx, dataset_id, ino, off,
+                                            len, paddr, s->current_gen,
+                                            &dropped, &n_dropped);
+    if (os != STM_OK) {
+        (void)stm_alloc_free(s->alloc, paddr, s->current_gen);
+        pthread_mutex_unlock(&s->lock);
+        return os;
+    }
+
+    for (size_t i = 0; i < n_dropped; i++) {
+        stm_status drs = sync_drop_paddr_locked(s, dataset_id, dropped[i]);
+        if (drs != STM_OK) {
+            /* Best effort — continue to drain the rest. The first
+             * error is propagated. Partial drop on this path is
+             * recoverable (allocator's PENDING tracking sweeps next
+             * commit; snapshot dead-list is durable post-commit). */
+            free(dropped);
+            pthread_mutex_unlock(&s->lock);
+            return drs;
+        }
+    }
+    free(dropped);
+
+    pthread_mutex_unlock(&s->lock);
+    return STM_OK;
+}
+
+stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
+                                   uint64_t off, void *buf, size_t len,
+                                   size_t *out_read) {
+    if (!s || !buf || !out_read) return STM_EINVAL;
+    if (dataset_id == 0 || ino == 0) return STM_EINVAL;
+    if (len == 0) { *out_read = 0; return STM_OK; }
+    if ((off % STM_UB_SIZE) != 0) return STM_EINVAL;
+
+    *out_read = 0;
+
+    pthread_mutex_lock(&s->lock);
+    if (s->wedged) { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
+
+    stm_extent_record rec;
+    stm_status ls = stm_extent_lookup_at(s->extent_idx, dataset_id, ino, off, &rec);
+    if (ls == STM_ENOENT) {
+        /* Hole — return zeros. Caller asked for `len` bytes; we fill
+         * the buffer with zeros and report the count. Spans the entire
+         * `len` since the MVP only handles single-extent reads. */
+        memset(buf, 0, len);
+        *out_read = len;
+        pthread_mutex_unlock(&s->lock);
+        return STM_OK;
+    }
+    if (ls != STM_OK) { pthread_mutex_unlock(&s->lock); return ls; }
+
+    /* Extent must start at our requested off (single-extent MVP) and
+     * cover at least `len` bytes from off. */
+    if (rec.off != off) { pthread_mutex_unlock(&s->lock); return STM_EINVAL; }
+    if (len > rec.len) { pthread_mutex_unlock(&s->lock); return STM_EINVAL; }
+
+    stm_aead_mode mode = stm_aead_autodetect();
+    size_t tag_len = stm_aead_tag_len(mode);
+    if (tag_len == 0) { pthread_mutex_unlock(&s->lock); return STM_EINVAL; }
+
+    /* Read ciphertext + tag (rec.len bytes plaintext + tag_len bytes
+     * tag), then decrypt. */
+    size_t total_bytes = rec.len + tag_len;
+    void *cbuf = malloc(total_bytes);
+    if (!cbuf) { pthread_mutex_unlock(&s->lock); return STM_ENOMEM; }
+
+    uint64_t byte_off = stm_paddr_offset(rec.paddr) * (uint64_t)STM_UB_SIZE;
+    stm_bdev *target_bdev = stm_pool_device_bdev(s->pool,
+                                                    stm_paddr_device(rec.paddr));
+    if (!target_bdev) {
+        free(cbuf);
+        pthread_mutex_unlock(&s->lock);
+        return STM_EINVAL;
+    }
+    stm_status rs = stm_bdev_read(target_bdev, byte_off, cbuf, total_bytes);
+    if (rs != STM_OK) {
+        free(cbuf);
+        pthread_mutex_unlock(&s->lock);
+        return rs;
+    }
+
+    stm_ad_extent ad;
+    memset(&ad, 0, sizeof ad);
+    ad.magic        = STM_AD_MAGIC_EXTENT;
+    ad.version      = STM_AD_VERSION_EXTENT;
+    ad.pool_uuid[0] = s->pool_uuid[0];
+    ad.pool_uuid[1] = s->pool_uuid[1];
+    ad.dataset_id   = dataset_id;
+    ad.ino          = ino;
+    ad.offset       = rec.off;
+    ad.content_kind = 0;
+
+    /* Decrypt into a temp buffer of plaintext size, then copy out the
+     * caller-requested `len` bytes. */
+    void *pbuf = malloc(rec.len);
+    if (!pbuf) { free(cbuf); pthread_mutex_unlock(&s->lock); return STM_ENOMEM; }
+    size_t pt_out = 0;
+    stm_status ds = stm_extent_decrypt(mode, s->metadata_key,
+                                          rec.paddr, rec.gen,
+                                          &ad, cbuf, total_bytes,
+                                          pbuf, rec.len, &pt_out);
+    free(cbuf);
+    if (ds != STM_OK) {
+        free(pbuf);
+        pthread_mutex_unlock(&s->lock);
+        return ds;
+    }
+
+    memcpy(buf, pbuf, len);
+    free(pbuf);
+    *out_read = len;
+    pthread_mutex_unlock(&s->lock);
+    return STM_OK;
 }
 
 size_t stm_sync_dek_count(const stm_sync *s)

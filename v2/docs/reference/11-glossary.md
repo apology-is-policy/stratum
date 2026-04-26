@@ -141,6 +141,7 @@ closed items.
 | R33 | P6-deadlist C impl (snapshot dead-list + UB v10→v11). | `d4efeeb` |
 | R34 | P7-2 extent index C impl (in-RAM MVP per extent.tla). | `433d2dd` |
 | R35 | P7-3 extent persistence (UB v11→v12 + sync wire-in). | `b223975` |
+| R36 | P7-4 fs.c/sync.c COW path integration (extent → dead-list / alloc-free routing). | `<R36-close>` |
 
 ## Phase 6 / clone terms
 
@@ -168,7 +169,9 @@ closed items.
 | **PaddrFreshness** | extent.tla invariant: every extent's paddr is in `used_paddrs`, which grows monotonically in the spec. The C impl (P7-2) narrows this to the LIVE-paddr interpretation: no two CURRENT extents share a paddr; once dropped via Overwrite / Truncate / DeleteFile, a paddr returns to the allocator's reuse pool. Both shapes pin the safety property and compose with allocator.tla::NoReuseInSameGen for end-to-end (paddr, gen)-pair nonce uniqueness. |
 | **OverwriteBlock cb (extent → snapshot)** | When extent.tla::Overwrite drops an extent, the C impl calls `stm_snapshot_index_overwrite_block(paddr)` to either route the paddr into the most-recent snap's dead-list or signal the caller to free directly. The composition between extent.tla and dead_list.tla is realized at the C-impl boundary; the production wiring lands with P7-4 (sync.c COW path integration). |
 | **stm_extent_index** | The C-side handle for the extent index (P7-2). API in `include/stratum/extent.h`; impl in `src/extent/extent_index.c`. ERRORCHECK mutex with must_lock contract; in-RAM linear-array store. Persistent storage is the P7-3 follow-on. |
-| **dropped paddrs** | Output of `stm_extent_overwrite` / `_truncate` / `_delete_file` — a malloc'd array of paddrs whose extents were just removed. Caller owns the array (`free()`) and MUST route each paddr through `stm_snapshot_index_overwrite_block` to compose with dead_list.tla. |
+| **dropped paddrs** | Output of `stm_extent_overwrite` / `_truncate` / `_delete_file` — a malloc'd array of paddrs whose extents were just removed. Caller owns the array (`free()`) and MUST route each paddr through `stm_snapshot_index_overwrite_block` to compose with dead_list.tla. P7-4's `sync_drop_paddr_locked` is the production routing helper. |
+| **sync_drop_paddr_locked** | sync.c helper (P7-4) realizing the C-impl boundary between extent.tla::Overwrite, dead_list.tla::OverwriteBlock, and allocator.tla::Free. For each dropped paddr: route via `stm_snapshot_index_overwrite_block` → if `should_free=true`, call `stm_alloc_free` on the device's allocator (selected via `stm_paddr_device`); else, the paddr stays in the most-recent snapshot's dead-list until that snapshot is deleted. |
+| **stm_fs_write / stm_fs_read** | POSIX-shape extent I/O API (P7-4). Thin fs.c wrappers over `stm_sync_write_extent` / `stm_sync_read_extent`. MVP constraints: 4-KiB-aligned + len ≤ 128 KiB + single-extent per call. Encryption uses pool-wide `metadata_key`. |
 
 ## Policy terms
 

@@ -116,14 +116,32 @@ into the CAS tier (which DOES need P6) is a separate concern.
       commit on `sync_commit`, close on `sync_close`. New
       accessor `stm_sync_extent_index`. v11 pools refused at v12
       mount via uniform STM_EBADVERSION (existing handler).
-- [ ] **P7-4 dataset COW path integration** — pending. fs.c / sync.c
-      integration: extent writes trigger
-      `stm_snapshot_index_overwrite_block(paddr)` on each dropped
-      paddr from `_overwrite` / `_truncate` / `_delete_file`
-      (composes with dead_list.tla via the C-impl boundary).
-- [ ] **P7-5 production scrub cb** — pending. Now unblocks (paddr→
-      bptr resolver becomes implementable via extent walk over the
-      persistent extent index). Integration concern only.
+- [x] **P7-4 fs.c/sync.c COW path integration** — landed at `<P7-4>`.
+      R36 audit close pending. New
+      `stm_sync_write_extent` / `stm_sync_read_extent` in sync.c
+      compose alloc.reserve + AEAD encrypt + bdev.write +
+      extent_overwrite + drop-routing. New helper
+      `sync_drop_paddr_locked` realizes the C-impl boundary between
+      extent.tla::Overwrite, dead_list.tla::OverwriteBlock, and
+      allocator.tla::Free: each dropped paddr feeds through
+      `stm_snapshot_index_overwrite_block` (routes to most-recent-
+      snap's dead-list if any) or `stm_alloc_free` direct (no
+      snapshot). New `stm_fs_write` / `stm_fs_read` in fs.c are
+      thin wrappers with FS_GUARD_WRITE / FS_GUARD_READ. New
+      `stm_fs_sync_for_test` accessor in fs_testing.h lets tests
+      drive the snapshot/dataset/extent indices directly.
+      `stm_extent_index_advance_txg(s->current_gen)` called per
+      sync_create / sync_open / sync_commit (R35 forward-looking
+      note acted on). MVP constraints: len > 0, multiple of
+      STM_UB_SIZE, ≤ 128 KiB; off multiple of STM_UB_SIZE; single-
+      extent per call; encryption with pool-wide metadata_key
+      (per-dataset DEKs deferred). test_fs grows 9 → 17 (8 new
+      P7-4 tests covering roundtrip / hole / args / COW with-snap
+      asserting dead_list_count 0→1 / COW without-snap / cross-
+      mount durability / RO blocks / multi-extent).
+- [ ] **P7-5 production scrub cb** — pending. Now fully unblocked
+      by P7-4: paddr→bptr resolver implementable via extent walk
+      over the persistent extent index.
 - [ ] CAS tier — pending; needs extent layer + integration.
 - [ ] Send / recv — pending; needs extent layer + birth-txg from
       snapshots (already in place from P6).

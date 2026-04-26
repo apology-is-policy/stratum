@@ -38,11 +38,13 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `b223975` (**P7-3 extent persistence** — extent
-  index now persists under `ub_extent_root` + `ub_extent_root_gen`;
-  STM_UB_VERSION 11→12; v11 pools refused at v12 mount). Phase 5
-  tagged `phase-5-complete` at `461e68e`. Spec posture: **20
-  modules / 23 fixed configs / 22 buggy demos**.
+- **Tip**: `<P7-4>` (**P7-4 fs.c/sync.c COW path integration** —
+  POSIX-shape `stm_fs_write` / `stm_fs_read` with full alloc.reserve
+  + AEAD encrypt + bdev.write + extent_overwrite + drop-routing
+  through snapshot dead-list / allocator-free; advance_txg per
+  sync_create / sync_open / sync_commit). Phase 5 tagged
+  `phase-5-complete` at `461e68e`. Spec posture: **20 modules /
+  23 fixed configs / 22 buggy demos**.
 - **Phases**: 1–5 complete; Phase 6 namespace layer feature-
   complete; **Phase 7 progressing**.
   Spec scaffolds: P6-1 (bptr.tla) `032db86`; P6-2 (dataset.tla)
@@ -55,10 +57,13 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   `18b9289` + R33 `d4efeeb`. P6-perf bench `d4c6708`.
   Phase 7 entry: P7-1 spec scaffold (extent.tla) `4eace52`.
   P7-2 extent C impl `732b20e` + R34 close `433d2dd`.
-  **P7-3 extent persistence `b223975` (this commit) — R35 audit
-  clean (0 P0/P1/P2; 5 P3 deferred). STM_UB_VERSION 11→12,
-  ub_extent_root carve, sync.c integration**. Phase 7 pre-work
-  FastCDC `5cb8900`
+  P7-3 extent persistence `b223975` (R35 audit clean).
+  **P7-4 fs.c/sync.c COW integration `<P7-4>` + R36 close
+  `<R36-close>` (this commit) — POSIX-shape stm_fs_write /
+  stm_fs_read; sync_drop_paddr_locked composes extent.tla::
+  Overwrite + dead_list.tla::OverwriteBlock + allocator.tla::Free;
+  advance_txg per sync_commit (R35 forward note acted on)**.
+  Phase 7 pre-work FastCDC `5cb8900`
   + R27 close `a2ffd38`. Pending: P7-4 sync.c COW path
   integration (extent → snapshot.overwrite_block routing);
   production scrub cb (unblocks once paddr→bptr resolver lands
@@ -66,7 +71,8 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 - **Tests**: 32 suites × (default + ASan + TSan, serial) green.
   test_sync_multi 42; test_pool 48; test_scrub 30; test_alloc 32;
   test_cdc 12; test_dataset 57; test_snapshot 41; test_sync 24;
-  test_extent_index 38 (32 in-RAM + 6 persist).
+  test_extent_index 38 (32 in-RAM + 6 persist); test_fs 17 (9
+  lifecycle + 8 P7-4 fs_io).
 - **Specs**: 20 TLA+ modules clean (23 fixed configs: legacy +
   scrub_beta + scrub_durable + scrub_beta_durable + bptr +
   dataset + snapshot + property + clone + dead_list + extent) +
