@@ -69,7 +69,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   returns OK on tag-pass / UNREPAIRABLE on tag-fail. Mid-extent
   paddrs + non-extent allocs (metadata, bootstrap) → OK trivially.
   Maps to bptr.tla's NReplicas=1 corner; full replica-walk awaits
-  extent record's replica-list extension. R37 close `<TBD>`**.
+  extent record's replica-list extension. R37 close `fc5f619`**.
   Phase 7 pre-work FastCDC `5cb8900` + R27 close `a2ffd38`.
   Pending: CAS / send-recv / reflinks (Phase 7 §10.1+); full
   replica-walk in scrub cb (post-MVP).

@@ -148,8 +148,15 @@ into the CAS tier (which DOES need P6) is a separate concern.
       P7-4 tests covering roundtrip / hole / args / COW with-snap
       asserting dead_list_count 0→1 / COW without-snap / cross-
       mount durability / RO blocks / multi-extent).
-- [x] **P7-5 production scrub cb** — landed at `<TBD-substantive>`;
-      R37 close `<TBD-close>`. New `stm_extent_lookup_by_paddr`
+- [x] **P7-5 production scrub cb** — landed at `38e6799`;
+      R37 close `fc5f619` (0 P0 / 0 P1 / 3 P2 / 3 P3 — P2-1 (cb
+      transient-error overload) + P2-2 (cb concurrency caveat
+      missing from public docstring) addressed via doc + caveat;
+      P2-3 (verify test `>=` assertions) tightened to strict
+      equality via alloc-tree walk; P3-1 (rec.len overflow guard)
+      preempted in substantive; P3-2 (pool_device_bdev forward-
+      compat note) added inline; P3-3 (docstring brittleness on
+      stacked extents) acknowledged). New `stm_extent_lookup_by_paddr`
       (extent.h + extent_index.c) — exact-paddr live-extent lookup,
       O(n) scan, first match wins by live-paddr `PaddrFreshness`.
       New `stm_sync_scrub_install_production_cb` (sync.h + sync.c)

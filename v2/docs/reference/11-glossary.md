@@ -142,7 +142,7 @@ closed items.
 | R34 | P7-2 extent index C impl (in-RAM MVP per extent.tla). | `433d2dd` |
 | R35 | P7-3 extent persistence (UB v11→v12 + sync wire-in). | `b223975` |
 | R36 | P7-4 fs.c/sync.c COW path integration (extent → dead-list / alloc-free routing). | `64a6278` |
-| R37 | P7-5 production scrub β verify-callback (paddr→bptr resolver via extent walk). | `<TBD>` |
+| R37 | P7-5 production scrub β verify-callback (paddr→bptr resolver via extent walk). | `fc5f619` |
 
 ## Phase 6 / clone terms
 
