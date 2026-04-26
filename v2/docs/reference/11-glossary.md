@@ -138,7 +138,7 @@ closed items.
 | R30 | P6-4 property API on dataset module. | `8be3628` |
 | R31 | P6-persist (dataset + snapshot persistent storage + UB v8→v9). | `bffee62` |
 | R32 | P6-clone (clone C impl + UB v9→v10). | `4503405` |
-| R33 | P6-deadlist C impl (snapshot dead-list + UB v10→v11). | `__P6DEADLIST_R33__` |
+| R33 | P6-deadlist C impl (snapshot dead-list + UB v10→v11). | `d4efeeb` |
 
 ## Phase 6 / clone terms
 

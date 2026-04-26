@@ -38,7 +38,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `__P6DEADLIST_R33__` (P6-deadlist C impl: snapshot
+- **Tip**: `d4efeeb` (P6-deadlist C impl: snapshot
   module gains in-line dead-list under `stm_snapshot_index_*`,
   `stm_snapshot_delete` now returns the freed-paddr list, format
   bumped 10 → 11 for the snapshot value tail). Phase 5 tagged
@@ -52,7 +52,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   P6-3 snapshot `34d89f5` + R29 `000d394`; P6-4 property `3527fe2`
   + R30 `8be3628`; P6-persist `348d165` + R31 `bffee62`; P6-clone
   `ee45a0d` + R32 `4503405`; **P6-deadlist C impl
-  `__P6DEADLIST_C__` + R33 `__P6DEADLIST_R33__` (this commit)**.
+  `18b9289` + R33 `d4efeeb` (this commit)**.
   Phase 7 pre-work FastCDC `5cb8900` + R27 close `a2ffd38`.
   Pending: production scrub cb (still blocked on paddr→bptr
   resolver, which arrives with extents); sync.c integration of

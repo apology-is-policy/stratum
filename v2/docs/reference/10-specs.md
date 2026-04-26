@@ -857,8 +857,8 @@ Out of scope:
   single-ownership model).
 - Persistent dead-list bytes — engineering chunk for the C impl.
 
-C impl status: P6-deadlist landed at `__P6DEADLIST_C__` + R33 close
-`__P6DEADLIST_R33__`. `stm_snapshot_index_overwrite_block` realizes
+C impl status: P6-deadlist landed at `18b9289` + R33 close
+`d4efeeb`. `stm_snapshot_index_overwrite_block` realizes
 `OverwriteBlock`; the modified `stm_snapshot_delete` realizes
 `SnapDelete` under the single-ownership simplification (surviving
 = ∅ ⇒ all of S.dead frees). Persistence extends the snapshot value
