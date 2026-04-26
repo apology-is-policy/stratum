@@ -38,7 +38,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: *(pending)* (Phase 6 entered + Phase 7 pre-work
+- **Tip**: `4ba29c6` (Phase 6 entered + Phase 7 pre-work
   scaffolded; phase6-status.md + phase7-status.md created;
   ROADMAP §9 + §10.5 annotated. Phase 5 tagged
   `phase-5-complete` at `461e68e`).
