@@ -128,3 +128,14 @@ See `phase7-status.md` for the FastCDC pre-work plan.
   (probably 12-dataset.md, 13-snapshot.md, 14-bptr.md).
 - Two-commit close pattern: substantive close + hash fixup.
 - Spec-first per CLAUDE.md.
+
+## Remaining Phase 6 work (as of tip `354ec11`)
+
+| Item | Status | Notes |
+|---|---|---|
+| Persistent storage hookup (dataset + snapshot via btree_store, wired to ub_main_root + ub_snap_root through sync_commit) | **Next chunk — primed** | See `memory/project_v2_next_session.md` for primer. Generous 100-150k token budget. May bump STM_UB_VERSION 8 → 9 (format break needing user signoff per CLAUDE.md autonomy rules); see Decision 1 in primer. Closest existing pattern: `src/alloc_roots/`. |
+| Clone C impl (extends `stm_dataset_entry` with `origin_snap_id` + adds clone-aware Create + Promote APIs validating clone.tla) | Pending | Smaller chunk (~300-500 LOC) — could land before or after persistent storage. |
+| Dead-list spec (block-level model for snapshot delete correctness per ARCH §8.5.5) | Pending | Medium-complex spec. Block reachability + birth-txg + dead-list incremental maintenance. Load-bearing for `stm_snapshot_delete` going from MVP to production. |
+| Production scrub cb (per ROADMAP §9.6 carry-over) | Blocked | Needs paddr→bptr resolver, which depends on extent records (P6 deliverable not yet implemented). Resolves naturally after persistent storage + extent records land. |
+| Reference doc files for new modules: `12-dataset.md`, `13-snapshot.md`, `14-bptr.md` (or fold into existing) | Pending | Lands with the persistent-storage chunk (the modules become "as-built" documentable then). |
+| ROADMAP §9.2 exit criteria | Several pending | See top of this file for status table. |
