@@ -38,7 +38,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `__P7-1__` (**Phase 7 entry — P7-1 spec scaffold:
+- **Tip**: `4eace52` (**Phase 7 entry — P7-1 spec scaffold:
   `extent.tla`** — per-(dataset, ino) extent layout; the LOGICAL
   data layer between datasets and stored bytes. Spec-only landing
   per CLAUDE.md spec-first; C impl follow-on extends `src/`).
@@ -53,9 +53,9 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   P6-3 snapshot `34d89f5` + R29 `000d394`; P6-4 property `3527fe2`
   + R30 `8be3628`; P6-persist `348d165` + R31 `bffee62`; P6-clone
   `ee45a0d` + R32 `4503405`; **P6-deadlist C impl
-  `18b9289` + R33 `d4efeeb` (this commit)**.
+  `18b9289` + R33 `d4efeeb`**.
   P6-perf bench `d4c6708`. **Phase 7 entry: P7-1 spec scaffold
-  (extent.tla) `__P7-1__` (this commit)**. Phase 7 pre-work
+  (extent.tla) `4eace52` (this commit)**. Phase 7 pre-work
   FastCDC `5cb8900` + R27 close `a2ffd38`. Pending: P7-2 extent
   C impl + integration; production scrub cb (still blocked on
   paddr→bptr resolver, which arrives with extents); sync.c

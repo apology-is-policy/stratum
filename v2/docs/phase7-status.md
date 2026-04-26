@@ -1,7 +1,7 @@
 # Phase 7 — status and pickup guide
 
 Authoritative pickup guide for Phase 7 (extent layer + cold tier
-+ features). **Phase 7 ENTERED 2026-04-26** at `__P7-1__` after
++ features). **Phase 7 ENTERED 2026-04-26** at `4eace52` after
 Phase 6 namespace layer landed feature-complete (`a4add6d`).
 
 ROADMAP §10 lists FastCDC + CAS + send/recv + reflinks as the §10.1
@@ -64,7 +64,7 @@ into the CAS tier (which DOES need P6) is a separate concern.
       boundary match after 71-byte prepend), chunk-size
       distribution, forced-cutoff path, edge cases. Default + ASan
       + TSan all green.
-- [x] **P7-1 spec scaffold: `extent.tla`** — landed at `__P7-1__`.
+- [x] **P7-1 spec scaffold: `extent.tla`** — landed at `4eace52`.
       Per-(ds, ino) extent layout: Write / Overwrite / Truncate /
       DeleteFile / AdvanceTxg actions; load-bearing invariant
       `NoOverlapWithinIno` plus LengthPositive / BirthTxgBound /
