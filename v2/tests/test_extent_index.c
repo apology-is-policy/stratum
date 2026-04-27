@@ -1509,4 +1509,178 @@ STM_TEST(ex_truncate_into_zero_drops_accepts_null_buffers) {
     stm_extent_index_close(idx);
 }
 
+/* ------------------------------------------------------------------ */
+/* P7-16 Reflink — extent_index unit tests.                           */
+/* ------------------------------------------------------------------ */
+
+STM_TEST(ex_reflink_basic_share) {
+    /* Whole-extent share: src and dst extent records reference the
+     * same paddr, same gen, same key_id, AND the same origin (inherited
+     * from src). extent.tla::Reflink + SharedReplicasAreCohabit. */
+    stm_extent_index *idx = NULL;
+    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+
+    uint64_t r[1] = { 0xAA };
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, r, 1, 0, 0));
+    /* Reflink to (1, 2) — same dataset, different ino. */
+    STM_ASSERT_OK(stm_extent_reflink(idx, 1, 2, 0, 4096,
+                                       r, 1, 0, 0,
+                                       /*origin_ds=*/1, /*origin_ino=*/1,
+                                       /*origin_off=*/0));
+    /* Both extents now exist. */
+    size_t n = 0;
+    STM_ASSERT_OK(stm_extent_count(idx, &n));
+    STM_ASSERT_EQ(n, (size_t)2);
+    /* dst record carries inherited origin = src's (1, 1, 0). */
+    stm_extent_record dst;
+    STM_ASSERT_OK(stm_extent_lookup_at(idx, 1, 2, 0, &dst));
+    STM_ASSERT_EQ(dst.origin_dataset_id, (uint64_t)1);
+    STM_ASSERT_EQ(dst.origin_ino,        (uint64_t)1);
+    STM_ASSERT_EQ(dst.origin_off,        (uint64_t)0);
+    STM_ASSERT_EQ(dst.paddrs[0],         (uint64_t)0xAA);
+    /* src record's origin is also (1, 1, 0) — fresh writes stamp
+     * origin = current. */
+    stm_extent_record src;
+    STM_ASSERT_OK(stm_extent_lookup_at(idx, 1, 1, 0, &src));
+    STM_ASSERT_EQ(src.origin_dataset_id, (uint64_t)1);
+    STM_ASSERT_EQ(src.origin_ino,        (uint64_t)1);
+    STM_ASSERT_EQ(src.origin_off,        (uint64_t)0);
+
+    stm_extent_index_close(idx);
+}
+
+STM_TEST(ex_reflink_rejects_dst_overlap) {
+    /* dst already has an extent at the target offset — STM_EEXIST. */
+    stm_extent_index *idx = NULL;
+    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+
+    uint64_t rA[1] = { 0xAA };
+    uint64_t rB[1] = { 0xBB };
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, rA, 1, 0, 0));
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 2, 0, 4096, rB, 1, 0, 0));
+    STM_ASSERT_ERR(stm_extent_reflink(idx, 1, 2, 0, 4096,
+                                         rA, 1, 0, 0,
+                                         1, 1, 0),
+                      STM_EEXIST);
+    stm_extent_index_close(idx);
+}
+
+STM_TEST(ex_reflink_rejects_partial_overlap_with_other) {
+    /* Buggy "partial overlap" pattern — the candidate's replica set
+     * shares ONE paddr with an existing extent but isn't a whole-set
+     * match. SharedReplicasAreCohabit fires. */
+    stm_extent_index *idx = NULL;
+    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+
+    uint64_t r2[2] = { 0xAA, 0xBB };
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, r2, 2, 0, 0));
+    /* Try to insert an extent that shares only paddr 0xAA. */
+    uint64_t r1[1] = { 0xAA };
+    STM_ASSERT_ERR(stm_extent_reflink(idx, 1, 2, 0, 4096,
+                                         r1, 1, 0, 0,
+                                         1, 1, 0),
+                      STM_EEXIST);
+    stm_extent_index_close(idx);
+}
+
+STM_TEST(ex_reflink_rejects_whole_share_different_origin) {
+    /* Whole-set match but different origin — SharedReplicasAreCohabit
+     * fires. This catches the "buggy reflink rotates origin" pattern
+     * (extent.tla::BuggyReflinkRotatesOrigin). */
+    stm_extent_index *idx = NULL;
+    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+
+    uint64_t r[1] = { 0xAA };
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, r, 1, 0, 0));
+    /* Try to share with a DIFFERENT origin. The src has origin =
+     * (1, 1, 0). Pretending the new record's origin is (1, 2, 0)
+     * (i.e., dst's live identity) violates cohabit. */
+    STM_ASSERT_ERR(stm_extent_reflink(idx, 1, 2, 0, 4096,
+                                         r, 1, 0, 0,
+                                         /*origin_ds=*/1,
+                                         /*origin_ino=*/2,
+                                         /*origin_off=*/0),
+                      STM_EEXIST);
+    stm_extent_index_close(idx);
+}
+
+STM_TEST(ex_reflink_rejects_invalid_args) {
+    stm_extent_index *idx = NULL;
+    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+    uint64_t r[1] = { 0xAA };
+    STM_ASSERT_ERR(stm_extent_reflink(NULL, 1, 1, 0, 4096, r, 1, 0, 0,
+                                         1, 1, 0), STM_EINVAL);
+    /* dst_ds == 0 / dst_ino == 0 / origin_ds == 0 / origin_ino == 0 */
+    STM_ASSERT_ERR(stm_extent_reflink(idx, 0, 1, 0, 4096, r, 1, 0, 0,
+                                         1, 1, 0), STM_EINVAL);
+    STM_ASSERT_ERR(stm_extent_reflink(idx, 1, 0, 0, 4096, r, 1, 0, 0,
+                                         1, 1, 0), STM_EINVAL);
+    STM_ASSERT_ERR(stm_extent_reflink(idx, 1, 1, 0, 4096, r, 1, 0, 0,
+                                         0, 1, 0), STM_EINVAL);
+    STM_ASSERT_ERR(stm_extent_reflink(idx, 1, 1, 0, 4096, r, 1, 0, 0,
+                                         1, 0, 0), STM_EINVAL);
+    /* len == 0 */
+    STM_ASSERT_ERR(stm_extent_reflink(idx, 1, 1, 0, 0, r, 1, 0, 0,
+                                         1, 1, 0), STM_EINVAL);
+    /* NULL paddrs */
+    STM_ASSERT_ERR(stm_extent_reflink(idx, 1, 1, 0, 4096, NULL, 1, 0, 0,
+                                         1, 1, 0), STM_EINVAL);
+    stm_extent_index_close(idx);
+}
+
+STM_TEST(ex_reflink_multiple_siblings_ok) {
+    /* Two reflink-siblings at different (ds, ino), both sharing src's
+     * paddrs and origin. */
+    stm_extent_index *idx = NULL;
+    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+
+    uint64_t r[1] = { 0xAA };
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, r, 1, 0, 0));
+    STM_ASSERT_OK(stm_extent_reflink(idx, 1, 2, 0, 4096,
+                                        r, 1, 0, 0, 1, 1, 0));
+    STM_ASSERT_OK(stm_extent_reflink(idx, 1, 3, 0, 4096,
+                                        r, 1, 0, 0, 1, 1, 0));
+    size_t n = 0;
+    STM_ASSERT_OK(stm_extent_count(idx, &n));
+    STM_ASSERT_EQ(n, (size_t)3);
+    stm_extent_index_close(idx);
+}
+
+STM_TEST(ex_overwrite_resets_origin_to_self) {
+    /* Overwrite (COW) on a fresh write resets origin = current. The
+     * subsequent reflink-like share would re-derive origin from the
+     * NEW extent's (live = origin) tuple. */
+    stm_extent_index *idx = NULL;
+    STM_ASSERT_OK(stm_extent_index_create(5, &idx));
+
+    uint64_t r1[1] = { 0xAA };
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, r1, 1, 0, 0));
+    /* Reflink first to pin origin sharing. */
+    STM_ASSERT_OK(stm_extent_reflink(idx, 1, 2, 0, 4096,
+                                        r1, 1, 0, 0, 1, 1, 0));
+    /* Now COW (1,1) — its old extent drops; new extent at (1, 1, 0)
+     * gets fresh paddr + origin = (1, 1, 0) (current). */
+    uint64_t r2[1] = { 0xBB };
+    uint64_t *dropped = NULL;
+    size_t   n_drop = 0;
+    STM_ASSERT_OK(stm_extent_overwrite(idx, 1, 1, 0, 4096, r2, 1, 5, 0,
+                                          &dropped, &n_drop));
+    free_dropped(&dropped, &n_drop);
+    /* (1, 1) now references 0xBB; (1, 2) still references 0xAA. */
+    stm_extent_record live1, live2;
+    STM_ASSERT_OK(stm_extent_lookup_at(idx, 1, 1, 0, &live1));
+    STM_ASSERT_OK(stm_extent_lookup_at(idx, 1, 2, 0, &live2));
+    STM_ASSERT_EQ(live1.paddrs[0], (uint64_t)0xBB);
+    STM_ASSERT_EQ(live2.paddrs[0], (uint64_t)0xAA);
+    /* Live1's origin was reset to (1, 1, 0). Live2's origin still (1,
+     * 1, 0) — inherited at reflink time, unchanged by src's COW. */
+    STM_ASSERT_EQ(live1.origin_dataset_id, (uint64_t)1);
+    STM_ASSERT_EQ(live1.origin_ino,        (uint64_t)1);
+    STM_ASSERT_EQ(live1.origin_off,        (uint64_t)0);
+    STM_ASSERT_EQ(live2.origin_dataset_id, (uint64_t)1);
+    STM_ASSERT_EQ(live2.origin_ino,        (uint64_t)1);
+    STM_ASSERT_EQ(live2.origin_off,        (uint64_t)0);
+    stm_extent_index_close(idx);
+}
+
 STM_TEST_MAIN("test_extent_index")

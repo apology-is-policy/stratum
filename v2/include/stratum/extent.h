@@ -194,6 +194,18 @@ typedef struct {
      * Stored on disk at value offset 56 (le64), repurposing the always-
      * zero `xxh` slot from v14. extent.tla::ExtentRec.key_id (typed). */
     uint64_t key_id;
+    /* P7-16: origin (dataset_id, ino, offset) at which this extent's
+     * AEAD ciphertext was first written. For freshly-written extents
+     * origin = (dataset_id, ino, off); for reflinked extents origin is
+     * INHERITED from the source — so two reflink-siblings sharing the
+     * same `paddrs` reconstruct the SAME AEAD AD at read/scrub time
+     * and AEGIS-256 verify succeeds across the share. Tampering with
+     * origin requires defeating the metadata-tree (btnode) AEAD; the
+     * field is no weaker than the live (dataset_id, ino, off) was for
+     * non-reflinked extents. extent.tla::ExtentRec.origin_*. */
+    uint64_t origin_dataset_id;
+    uint64_t origin_ino;
+    uint64_t origin_off;
 } stm_extent_record;
 
 struct stm_extent_index;
@@ -390,6 +402,46 @@ stm_status stm_extent_delete_file(stm_extent_index *idx,
                                     uint64_t dataset_id, uint64_t ino,
                                     uint64_t **out_dropped_paddrs,
                                     size_t *out_n_dropped);
+
+/*
+ * P7-16: Reflink — insert a new extent record at (`dst_dataset_id`,
+ * `dst_ino`, `dst_off`) inheriting `paddrs[0..n_paddrs)`, `gen`,
+ * `key_id`, AND the (`origin_dataset_id`, `origin_ino`, `origin_off`)
+ * triple from a SOURCE extent. The resulting record shares its replica
+ * set with the source — both extents AEAD-decrypt under the same AD
+ * because `origin_*` is invariant across reflink siblings (extent.tla
+ * ::SharedReplicasAreCohabit).
+ *
+ * Caller MUST have already bumped allocator refcounts on each paddr —
+ * this API just inserts the record. Atomicity at the sync layer.
+ *
+ * Refusals:
+ *   - dst_dataset_id == 0 OR dst_ino == 0 (STM_EINVAL).
+ *   - origin_dataset_id == 0 OR origin_ino == 0 (STM_EINVAL — origin
+ *     fields must be valid).
+ *   - len == 0 (STM_EINVAL — extent.tla::LengthPositive).
+ *   - n_paddrs out of bounds OR any paddr == 0 OR within-set duplicate
+ *     (STM_EINVAL).
+ *   - dst overlap: an existing live extent at (dst_dataset_id, dst_ino)
+ *     overlaps [dst_off, dst_off + len) (STM_EEXIST).
+ *   - SharedReplicasAreCohabit violation: any paddr in the new replica
+ *     set already lives in another extent record whose (replicas, gen,
+ *     key_id, origin_*) tuple differs (STM_EEXIST). Catches the
+ *     "partial-overlap" and "different-origin" buggy patterns.
+ *
+ * Models extent.tla::Reflink. Caller-provided origin lets the sync
+ * layer pass the SRC's origin (inherited) rather than the dst's
+ * live identity (a buggy "rotates origin" implementation).
+ */
+STM_MUST_USE
+stm_status stm_extent_reflink(stm_extent_index *idx,
+                                uint64_t dst_dataset_id, uint64_t dst_ino,
+                                uint64_t dst_off, uint64_t len,
+                                const uint64_t *paddrs, size_t n_paddrs,
+                                uint64_t gen, uint64_t key_id,
+                                uint64_t origin_dataset_id,
+                                uint64_t origin_ino,
+                                uint64_t origin_off);
 
 /*
  * Look up the live extent of (ds, ino) covering byte offset `off`.

@@ -500,6 +500,24 @@ stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     return s;
 }
 
+/* P7-16: stm_fs_reflink. POSIX-shape FICLONE — replaces dst's empty
+ * extent tree with a reflink-share of src's. Holds fs->lock across the
+ * inner sync_reflink so a concurrent observer can't see a partial
+ * dst. Errors propagate from stm_sync_reflink. */
+stm_status stm_fs_reflink(stm_fs *fs,
+                            uint64_t src_dataset_id, uint64_t src_ino,
+                            uint64_t dst_dataset_id, uint64_t dst_ino)
+{
+    if (!fs) return STM_EINVAL;
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+    stm_status s = stm_sync_reflink(fs->sync,
+                                       src_dataset_id, src_ino,
+                                       dst_dataset_id, dst_ino);
+    pthread_mutex_unlock(&fs->lock);
+    return s;
+}
+
 /* ========================================================================= */
 /* Dataset creation (P7-13).                                                  */
 /* ========================================================================= */

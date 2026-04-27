@@ -77,6 +77,7 @@ typedef enum {
     STM_EAGAIN          =  -11,
     STM_ENODEV          =  -19,
     STM_EROFS           =  -30,
+    STM_EXDEV           =  -18,   /* cross-device link/reflink refused      */
 
     /* Stratum-specific. */
     STM_ECORRUPT        = -200,   /* on-disk data failed integrity check   */

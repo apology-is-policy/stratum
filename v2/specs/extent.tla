@@ -37,6 +37,30 @@
 (*   N ≤ MaxReplicasPerExtent); device placement is a pool-redundancy       *)
 (*   concern modeled separately.                                             *)
 (*                                                                           *)
+(*   Reflinks (P7-16): an extent record carries an `origin` triple          *)
+(*   `<origin_ds, origin_ino, origin_off>` naming the (dataset, inode,      *)
+(*   byte-offset) at which the underlying ciphertext was originally          *)
+(*   AEAD-encrypted. For a freshly-written extent, origin = <ds, ino, off>; *)
+(*   for a reflinked extent the origin is INHERITED from the source         *)
+(*   extent. AD reconstruction at read/scrub time uses `origin`, not the    *)
+(*   live (ds, ino, off) — so a reflink-sibling reading the shared bytes    *)
+(*   produces the correct AEAD AD. This is the necessary condition for      *)
+(*   shared replica sets to verify under AEGIS-256: the AD's identity       *)
+(*   binding is to the ORIGIN, not the LIVE record. Tampering with         *)
+(*   `origin` requires defeating the metadata-tree AEAD (btnode), so the    *)
+(*   origin field is no weaker than the live (ds, ino, off) was for non-   *)
+(*   reflinked extents.                                                     *)
+(*                                                                           *)
+(*   The Reflink action models the extent-layer half of the FICLONE         *)
+(*   mechanism: it inserts a new extent record at (dst_ds, dst_ino,        *)
+(*   dst_off) whose `replicas`, `gen`, `key_id`, and `origin` are inherited *)
+(*   from a source extent. Allocator refcount bumps on the shared paddrs   *)
+(*   are an allocator.tla concern; the extent layer just records the      *)
+(*   sharing. COW on either side (Overwrite at the shared offset) is       *)
+(*   modeled by the existing Overwrite action — drops the side that's      *)
+(*   COW'd, leaves the other side intact, allocates fresh paddrs for the   *)
+(*   new write.                                                              *)
+(*                                                                           *)
 (*   Other captured invariants:                                              *)
 (*     LengthPositive   — every extent has length ≥ 1 (zero-length is       *)
 (*                         a hole, not an extent).                           *)
@@ -49,15 +73,24 @@
 (*                         issued. Composes with allocator.tla::            *)
 (*                         NoReuseInSameGen to guarantee (paddr, write_gen)-*)
 (*                         pair uniqueness end-to-end.                       *)
-(*     LiveReplicasDisjoint — no two LIVE extents share any replica paddr.  *)
-(*                         Stronger than PaddrFreshness because it directly *)
-(*                         pins the safety property the C impl needs:       *)
-(*                         allocator-fresh-paddr handout cannot collide     *)
-(*                         with any in-use replica.                          *)
+(*     SharedReplicasAreCohabit — replaces the prior LiveReplicasDisjoint  *)
+(*                         (P7-6); now relaxed for P7-16 reflinks. If two   *)
+(*                         distinct live extents share ANY replica paddr,   *)
+(*                         then they share the WHOLE replica set AND the    *)
+(*                         same `gen`, `key_id`, AND `origin`. Pins the    *)
+(*                         legitimate-sharing pattern: a paddr in any live  *)
+(*                         extent can be re-referenced ONLY via reflink     *)
+(*                         (whole-extent inheritance), not via partial      *)
+(*                         allocator-fresh handout (which would still       *)
+(*                         collide with an in-use replica).                  *)
 (*     ReplicasNonEmpty — every extent has at least one replica (one      *)
 (*                         active paddr).                                    *)
 (*     ReplicaCountBounded — every extent has at most MaxReplicasPerExtent *)
 (*                         replicas. Pins the on-disk slot count.            *)
+(*     OriginConsistentInBounds — every extent's origin is in-range       *)
+(*                         (origin_ds ∈ DatasetIds, origin_ino ∈ InoIds,    *)
+(*                         origin_off + len ≤ MaxFileBlocks). Pins the      *)
+(*                         on-disk origin field's typing.                   *)
 (*                                                                           *)
 (* Intentionally OUT OF SCOPE:                                               *)
 (*                                                                           *)
@@ -101,7 +134,12 @@
 (*                                                                           *)
 (*   - BuggyReplicaPaddrCollision (P7-6) — Write doesn't check that the    *)
 (*     new extent's replica set is disjoint from existing live extents'    *)
-(*     replicas. LiveReplicasDisjoint fires.                                 *)
+(*     replicas. SharedReplicasAreCohabit fires (because the colliding     *)
+(*     replicas are partial overlap rather than whole-set inheritance).    *)
+(*                                                                           *)
+(*   - BuggyReflinkRotatesOrigin (P7-16) — Reflink mutates the origin     *)
+(*     instead of inheriting from src. Two extents with the same replicas *)
+(*     end up with different origins. SharedReplicasAreCohabit fires.       *)
 (*                                                                           *)
 (* Per-dataset DEK key stamp (P7-10):                                       *)
 (*                                                                           *)
@@ -127,10 +165,12 @@ CONSTANTS
     MaxTxg,
     MaxReplicasPerExtent,
     MaxKeyIds,
+    DisableReflink,                  \* P7-16: skip Reflink in Next (cfg toggle)
     BuggyWriteAllowsOverlap,
     BuggyZeroLength,
     BuggyOverwriteForgetsDrop,
-    BuggyReplicaPaddrCollision
+    BuggyReplicaPaddrCollision,
+    BuggyReflinkRotatesOrigin
 
 ASSUME MaxDatasets         \in (Nat \ {0})
 ASSUME MaxInos             \in (Nat \ {0})
@@ -139,10 +179,12 @@ ASSUME MaxPaddrs           \in (Nat \ {0})
 ASSUME MaxTxg              \in (Nat \ {0})
 ASSUME MaxReplicasPerExtent \in (Nat \ {0})
 ASSUME MaxKeyIds           \in (Nat \ {0})
+ASSUME DisableReflink              \in BOOLEAN
 ASSUME BuggyWriteAllowsOverlap     \in BOOLEAN
 ASSUME BuggyZeroLength             \in BOOLEAN
 ASSUME BuggyOverwriteForgetsDrop   \in BOOLEAN
 ASSUME BuggyReplicaPaddrCollision  \in BOOLEAN
+ASSUME BuggyReflinkRotatesOrigin   \in BOOLEAN
 
 DatasetIds  == 1..MaxDatasets
 InoIds      == 1..MaxInos
@@ -159,9 +201,15 @@ ReplicaSets ==
         /\ S /= {}
         /\ Cardinality(S) <= MaxReplicasPerExtent }
 
+\* P7-16 reflinks: every extent carries an `origin` triple naming the
+\* (dataset, inode, byte-offset) at which the underlying ciphertext was
+\* originally AEAD-encrypted. Freshly-written extents have origin =
+\* current (ds, ino, off); reflinked extents inherit origin from src.
+\* The pinned identity at AEAD-AD-reconstruction time is `origin`.
 ExtentRec ==
     [ds: DatasetIds, ino: InoIds, off: FileOffsets, len: LengthsZ,
-     replicas: ReplicaSets, gen: Gens, key_id: KeyIds]
+     replicas: ReplicaSets, gen: Gens, key_id: KeyIds,
+     origin_ds: DatasetIds, origin_ino: InoIds, origin_off: FileOffsets]
 
 VARIABLES
     extents,        \* SUBSET ExtentRec — the in-memory extent map.
@@ -230,7 +278,8 @@ Write(ds, ino, off, len, replicas, key_id) ==
        \/ OverlappingIn(ds, ino, off, len) = {}
     /\ extents' = extents \union
         {[ds |-> ds, ino |-> ino, off |-> off, len |-> len,
-          replicas |-> replicas, gen |-> current_txg, key_id |-> key_id]}
+          replicas |-> replicas, gen |-> current_txg, key_id |-> key_id,
+          origin_ds |-> ds, origin_ino |-> ino, origin_off |-> off]}
     /\ used_paddrs' = used_paddrs \union replicas
     /\ UNCHANGED current_txg
 
@@ -257,7 +306,8 @@ Overwrite(ds, ino, off, len, new_replicas, key_id) ==
           ELSE extents \ OverlappingIn(ds, ino, off, len))
          \union
          {[ds |-> ds, ino |-> ino, off |-> off, len |-> len,
-           replicas |-> new_replicas, gen |-> current_txg, key_id |-> key_id]}
+           replicas |-> new_replicas, gen |-> current_txg, key_id |-> key_id,
+           origin_ds |-> ds, origin_ino |-> ino, origin_off |-> off]}
     /\ used_paddrs' = used_paddrs \union new_replicas
     /\ UNCHANGED current_txg
 
@@ -303,7 +353,9 @@ Truncate(ds, ino, new_size) ==
                   \cup {[ds |-> ds, ino |-> ino, off |-> e.off,
                          len |-> new_size - e.off,
                          replicas |-> new_replicas,
-                         gen |-> current_txg, key_id |-> new_key_id]}
+                         gen |-> current_txg, key_id |-> new_key_id,
+                         origin_ds |-> ds, origin_ino |-> ino,
+                         origin_off |-> e.off]}
               /\ used_paddrs' = used_paddrs \cup new_replicas
     /\ UNCHANGED current_txg
 
@@ -314,6 +366,44 @@ DeleteFile(ds, ino) ==
     /\ ds \in DatasetIds
     /\ ino \in InoIds
     /\ extents' = extents \ ExtentsOf(ds, ino)
+    /\ UNCHANGED <<used_paddrs, current_txg>>
+
+(***************************************************************************)
+(* Reflink — share a source extent's bytes with a destination (ds, ino).    *)
+(*                                                                           *)
+(* Inserts a new extent record at (dst_ds, dst_ino, dst_off) inheriting    *)
+(* the source extent's `replicas`, `gen`, `key_id`, AND `origin`. Used by  *)
+(* the C-impl `stm_fs_reflink` to build dst's extent tree as a shallow    *)
+(* copy of src's. Whole-file reflink iterates `Reflink` once per source   *)
+(* extent.                                                                  *)
+(*                                                                           *)
+(* Preconditions:                                                            *)
+(*   - src is a live extent (∈ extents).                                    *)
+(*   - <dst_ds, dst_ino> ≠ <src.ds, src.ino> (no self-reflink).             *)
+(*   - dst_off + src.len ≤ MaxFileBlocks (fits in dst).                      *)
+(*   - No live extent at (dst_ds, dst_ino) overlaps the dst range.          *)
+(*                                                                           *)
+(* `BuggyReflinkRotatesOrigin = TRUE` flips origin from src.origin to a     *)
+(* fresh (dst_ds, dst_ino, dst_off) — equivalent to a "deep" copy at the   *)
+(* extent layer but with shared replicas. SharedReplicasAreCohabit fires.   *)
+(*                                                                           *)
+(* used_paddrs UNCHANGED — Reflink reuses existing paddrs, doesn't issue   *)
+(* new ones.                                                                *)
+(***************************************************************************)
+Reflink(src, dst_ds, dst_ino, dst_off) ==
+    /\ src \in extents
+    /\ dst_ds \in DatasetIds
+    /\ dst_ino \in InoIds
+    /\ dst_off \in FileOffsets
+    /\ dst_off + src.len <= MaxFileBlocks
+    /\ <<dst_ds, dst_ino>> /= <<src.ds, src.ino>>
+    /\ OverlappingIn(dst_ds, dst_ino, dst_off, src.len) = {}
+    /\ extents' = extents \union
+        {[ds |-> dst_ds, ino |-> dst_ino, off |-> dst_off, len |-> src.len,
+          replicas |-> src.replicas, gen |-> src.gen, key_id |-> src.key_id,
+          origin_ds  |-> IF BuggyReflinkRotatesOrigin THEN dst_ds   ELSE src.origin_ds,
+          origin_ino |-> IF BuggyReflinkRotatesOrigin THEN dst_ino  ELSE src.origin_ino,
+          origin_off |-> IF BuggyReflinkRotatesOrigin THEN dst_off  ELSE src.origin_off]}
     /\ UNCHANGED <<used_paddrs, current_txg>>
 
 (***************************************************************************)
@@ -337,6 +427,10 @@ Next ==
     \/ \E ds \in DatasetIds, ino \in InoIds, n \in 0..MaxFileBlocks :
         Truncate(ds, ino, n)
     \/ \E ds \in DatasetIds, ino \in InoIds : DeleteFile(ds, ino)
+    \/ /\ ~DisableReflink
+       /\ \E src \in extents, dst_ds \in DatasetIds, dst_ino \in InoIds,
+              dst_off \in FileOffsets :
+                Reflink(src, dst_ds, dst_ino, dst_off)
     \/ AdvanceTxg
 
 Spec == Init /\ [][Next]_vars
@@ -391,14 +485,35 @@ ReplicaCountBounded ==
 PaddrFreshness ==
     \A e \in extents : e.replicas \subseteq used_paddrs
 
-(* LiveReplicasDisjoint — no two LIVE extents share any replica paddr.    *)
-(* Stronger than PaddrFreshness in that it directly pins the cross-extent *)
-(* invariant the C impl needs: a paddr in any live extent's replicas      *)
-(* cannot appear in any other live extent's replicas. Buggy demo          *)
-(* `extent_replica_collision_buggy.cfg` fires this.                       *)
-LiveReplicasDisjoint ==
+(* SharedReplicasAreCohabit — relaxes the prior LiveReplicasDisjoint     *)
+(* (P7-6) so reflinks can legitimately share paddrs. If two distinct      *)
+(* extents share ANY replica paddr, they MUST share the WHOLE replica    *)
+(* set AND the same `gen`, `key_id`, `origin_ds`, `origin_ino`, and      *)
+(* `origin_off`. This means partial overlap (one paddr shared, others    *)
+(* not) or share-with-different-origin is forbidden — only legitimate    *)
+(* whole-extent reflink-style sharing is permitted. Buggy demos          *)
+(* `extent_replica_collision_buggy.cfg` (partial overlap) and            *)
+(* `reflink_rotates_origin_buggy.cfg` (whole share but different origin)  *)
+(* fire this.                                                               *)
+SharedReplicasAreCohabit ==
     \A e1, e2 \in extents :
-        e1 = e2 \/ e1.replicas \cap e2.replicas = {}
+        \/ e1 = e2
+        \/ e1.replicas \cap e2.replicas = {}
+        \/ /\ e1.replicas = e2.replicas
+           /\ e1.gen        = e2.gen
+           /\ e1.key_id     = e2.key_id
+           /\ e1.origin_ds  = e2.origin_ds
+           /\ e1.origin_ino = e2.origin_ino
+           /\ e1.origin_off = e2.origin_off
+
+(* OriginConsistentInBounds — every extent's origin is in-range. The     *)
+(* extra typing pin (DatasetIds × InoIds × FileOffsets) is implied by    *)
+(* TypeOK, but we additionally require origin_off + len ≤ MaxFileBlocks  *)
+(* — origin must fit in the origin file just as the live extent fits.   *)
+(* Closed by every action since origin is either current (Write/        *)
+(* Overwrite/Truncate) or inherited from a live src (Reflink).          *)
+OriginConsistentInBounds ==
+    \A e \in extents : e.origin_off + e.len <= MaxFileBlocks
 
 (* P7-10 / R42 P3-1: nonce-uniqueness across DEKs is independent of      *)
 (* `key_id`. The C-impl's AEAD nonce is `(paddrs[0], gen, pool_uuid)` —  *)
@@ -422,6 +537,7 @@ Invariants ==
     /\ ReplicasNonEmpty
     /\ ReplicaCountBounded
     /\ PaddrFreshness
-    /\ LiveReplicasDisjoint
+    /\ SharedReplicasAreCohabit
+    /\ OriginConsistentInBounds
 
 ================================================================================

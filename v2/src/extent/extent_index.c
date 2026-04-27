@@ -22,14 +22,29 @@
  *                                   → stm_extent_truncate_into    (P7-12)
  *   extent.tla::DeleteFile         → stm_extent_delete_file
  *   extent.tla::AdvanceTxg         → stm_extent_index_advance_txg
+ *   extent.tla::Reflink            → stm_extent_reflink            (P7-16)
  *
  *   extent.tla::TypeOK             → field types in stm_extent_record
- *   extent.tla::NoOverlapWithinIno → overlap-scan in _write / _overwrite
- *   extent.tla::LengthPositive     → len ≥ 1 check in _write / _overwrite
+ *   extent.tla::NoOverlapWithinIno → overlap-scan in _write / _overwrite /
+ *                                       _reflink (overlap_in_ino_locked)
+ *   extent.tla::LengthPositive     → len ≥ 1 check in _write / _overwrite /
+ *                                       _reflink
  *   extent.tla::BirthTxgBound      → write_gen ≤ current_txg check
  *   extent.tla::AllExtentsInBounds → off + len overflow check
- *   extent.tla::PaddrFreshness     → paddr_in_use_locked scan (live-paddr
- *                                       interpretation; see header preamble)
+ *   extent.tla::PaddrFreshness     → paddr_in_use_locked scan in _write /
+ *                                       _overwrite (fresh-paddr gate)
+ *   extent.tla::SharedReplicasAreCohabit
+ *                                   → cohabit_check_locked in _reflink
+ *                                       (P7-16; replaces the prior
+ *                                       LiveReplicasDisjoint scan in
+ *                                       _reflink — relaxed for legitimate
+ *                                       whole-extent inheritance).
+ *   extent.tla::OriginConsistentInBounds
+ *                                   → origin = (dataset_id, ino, off) at
+ *                                       fresh write / overwrite / truncate;
+ *                                       origin = src.origin at reflink;
+ *                                       on-disk decode pins origin_ds > 0
+ *                                       AND origin_ino > 0 (P7-16).
  */
 #include <stratum/extent.h>
 
@@ -147,6 +162,57 @@ static bool overlap_in_ino_locked(const stm_extent_index *idx,
         if (ranges_overlap(e->off, e->len, off, len)) return true;
     }
     return false;
+}
+
+/* P7-16: validates extent.tla::SharedReplicasAreCohabit at insert time.
+ * Given a candidate (paddrs, gen, key_id, origin_*) tuple about to be
+ * inserted, checks every existing extent record. If any existing record
+ * shares a paddr but disagrees on (replicas, gen, key_id, origin_*),
+ * the cohabit invariant would be violated — return false (refuse).
+ * If sharing is consistent (whole-extent inheritance), or no sharing
+ * exists, return true.
+ *
+ * Three-state classification of an existing record `e` vs candidate:
+ *   - No overlap: e.replicas ∩ candidate.paddrs = ∅. OK.
+ *   - Whole-set match + matching tuple: cohabit-OK. Multiple reflink-
+ *     siblings can coexist; any number is fine.
+ *   - Partial overlap OR whole-match-but-tuple-mismatch: refuse.
+ *
+ * Whole-set check: same n_replicas AND each paddr in e.paddrs is in
+ * candidate.paddrs (their replica sets are equal as sets). Replica
+ * arrays in this MVP are stored in canonical sorted order from the
+ * sync layer's caller, but defensively compare as sets. */
+static bool cohabit_check_locked(const stm_extent_index *idx,
+                                    const uint64_t *paddrs, size_t n_paddrs,
+                                    uint64_t gen, uint64_t key_id,
+                                    uint64_t origin_ds, uint64_t origin_ino,
+                                    uint64_t origin_off) {
+    for (size_t i = 0; i < idx->n_records; i++) {
+        const stm_extent_record *e = &idx->records[i];
+        bool any_share = false;
+        for (uint8_t r = 0; r < e->n_replicas; r++) {
+            for (size_t k = 0; k < n_paddrs; k++) {
+                if (e->paddrs[r] == paddrs[k]) { any_share = true; break; }
+            }
+            if (any_share) break;
+        }
+        if (!any_share) continue;
+        /* Sharing detected — must be whole-set with matching tuple. */
+        if (e->n_replicas != (uint8_t)n_paddrs) return false;
+        for (uint8_t r = 0; r < e->n_replicas; r++) {
+            bool found = false;
+            for (size_t k = 0; k < n_paddrs; k++) {
+                if (e->paddrs[r] == paddrs[k]) { found = true; break; }
+            }
+            if (!found) return false;
+        }
+        if (e->gen        != gen)        return false;
+        if (e->key_id     != key_id)     return false;
+        if (e->origin_dataset_id != origin_ds)  return false;
+        if (e->origin_ino        != origin_ino) return false;
+        if (e->origin_off        != origin_off) return false;
+    }
+    return true;
 }
 
 /* Grow the records array if needed and append `rec`. Returns STM_OK
@@ -310,6 +376,10 @@ stm_status stm_extent_write(stm_extent_index *idx,
         .n_replicas = (uint8_t)n_paddrs,
         .gen = write_gen,
         .key_id = key_id,
+        /* P7-16: fresh write — origin = (dataset_id, ino, off). */
+        .origin_dataset_id = dataset_id,
+        .origin_ino        = ino,
+        .origin_off        = off,
     };
     for (size_t i = 0; i < n_paddrs; i++) rec.paddrs[i] = paddrs[i];
     stm_status as = append_record_locked(idx, &rec);
@@ -448,6 +518,11 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
         .n_replicas = (uint8_t)n_new_paddrs,
         .gen = write_gen,
         .key_id = key_id,
+        /* P7-16: COW Overwrite resets origin = current — the new
+         * ciphertext was AEAD-encrypted under (dataset_id, ino, off). */
+        .origin_dataset_id = dataset_id,
+        .origin_ino        = ino,
+        .origin_off        = off,
     };
     for (size_t i = 0; i < n_new_paddrs; i++) rec.paddrs[i] = new_paddrs[i];
     idx->records[idx->n_records++] = rec;
@@ -664,6 +739,60 @@ stm_status stm_extent_delete_file(stm_extent_index *idx,
     return rs;
 }
 
+stm_status stm_extent_reflink(stm_extent_index *idx,
+                                uint64_t dst_dataset_id, uint64_t dst_ino,
+                                uint64_t dst_off, uint64_t len,
+                                const uint64_t *paddrs, size_t n_paddrs,
+                                uint64_t gen, uint64_t key_id,
+                                uint64_t origin_dataset_id,
+                                uint64_t origin_ino,
+                                uint64_t origin_off) {
+    if (!idx) return STM_EINVAL;
+    if (dst_dataset_id == 0 || dst_ino == 0) return STM_EINVAL;
+    if (origin_dataset_id == 0 || origin_ino == 0) return STM_EINVAL;
+    if (len == 0) return STM_EINVAL;            /* LengthPositive */
+    if (!paddrs) return STM_EINVAL;
+    if (!replica_set_is_valid(paddrs, n_paddrs)) return STM_EINVAL;
+    if (dst_off > UINT64_MAX - len) return STM_EOVERFLOW;
+
+    must_lock(&idx->lock);
+
+    if (gen > idx->current_txg) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;                       /* BirthTxgBound */
+    }
+    /* P7-16: dst-overlap check (NoOverlapWithinIno). */
+    if (overlap_in_ino_locked(idx, dst_dataset_id, dst_ino, dst_off, len)) {
+        must_unlock(&idx->lock);
+        return STM_EEXIST;
+    }
+    /* P7-16: SharedReplicasAreCohabit. Reuse of any paddr is permitted
+     * ONLY when the existing extent's (replicas, gen, key_id, origin_*)
+     * tuple matches the candidate. Catches the partial-overlap and
+     * different-origin buggy patterns. */
+    if (!cohabit_check_locked(idx, paddrs, n_paddrs, gen, key_id,
+                                 origin_dataset_id, origin_ino, origin_off)) {
+        must_unlock(&idx->lock);
+        return STM_EEXIST;
+    }
+
+    stm_extent_record rec = {
+        .dataset_id = dst_dataset_id, .ino = dst_ino,
+        .off = dst_off, .len = len,
+        .n_replicas = (uint8_t)n_paddrs,
+        .gen = gen,
+        .key_id = key_id,
+        .origin_dataset_id = origin_dataset_id,
+        .origin_ino        = origin_ino,
+        .origin_off        = origin_off,
+    };
+    for (size_t i = 0; i < n_paddrs; i++) rec.paddrs[i] = paddrs[i];
+    stm_status as = append_record_locked(idx, &rec);
+    if (as == STM_OK) idx->dirty = true;
+    must_unlock(&idx->lock);
+    return as;
+}
+
 /* ------------------------------------------------------------------ */
 /* Read paths.                                                         */
 /* ------------------------------------------------------------------ */
@@ -863,7 +992,7 @@ stm_status stm_extent_count_for_ino(const stm_extent_index *idx,
  * via internal dirty flag; atomic shadow swap on load_at; structural
  * validator on the loaded shadow before swap.
  *
- * P7-10 / v15 value layout (64 bytes):
+ * P7-16 / v17 value layout (96 bytes):
  *
  *   off  size  field
  *     0    1   n_replicas       (u8; 1..STM_EXTENT_MAX_REPLICAS=4)
@@ -875,16 +1004,23 @@ stm_status stm_extent_count_for_ino(const stm_extent_index *idx,
  *    40    8   write_gen        (le64)
  *    48    4   dlen             (le32; logical byte length)
  *    52    4   clen_and_comp    (le32; low 24: stored len; high 8: comp)
- *    56    8   key_id           (le64; per-dataset DEK key_id; was xxh
- *                                  in v13/v14 — always 0 there since AEAD
- *                                  tag is integrity. The v15 decode
- *                                  treats the bytes as key_id; v14 pools
- *                                  fail at uberblock version check before
- *                                  this layer is reached.)
+ *    56    8   key_id           (le64; per-dataset DEK key_id)
+ *    64    8   origin_dataset_id (le64; AEAD-AD identity binding —
+ *                                  P7-16 reflinks; for non-reflinked
+ *                                  extents equals dataset_id at offset 0
+ *                                  of the encoded key.)
+ *    72    8   origin_ino       (le64; AEAD-AD identity binding)
+ *    80    8   origin_off       (le64; AEAD-AD identity binding)
+ *    88    8   reserved         (zero — future per-extent integrity
+ *                                  csum or chunking length slot)
+ *
+ * v15→v16 was the repair-log header carve in superblock; the extent
+ * value layout was unchanged in v16. v17 grows it 64 → 96 with the
+ * three origin fields + 8 reserved. Format break: STM_UB_VERSION 17.
  * ========================================================================= */
 
 #define EX_KEY_LEN              24u                          /* ds + ino + off */
-#define EX_VAL_LEN              64u                          /* P7-6 / v13     */
+#define EX_VAL_LEN              96u                          /* P7-16 / v17    */
 /* MVP cap: 24-bit length so dlen + clen_and_comp.clen both fit without
  * compression. Production extends with chunking / per-extent integrity. */
 #define EX_LEN_MAX_24BIT        UINT32_C(0x00FFFFFF)
@@ -945,6 +1081,15 @@ static stm_status ex_encode_value(const stm_extent_record *r,
     memcpy(out + 48, dlen.v,      4);
     memcpy(out + 52, cac.v,       4);
     memcpy(out + 56, key_id_le.v, 8);
+
+    /* P7-16: origin (dataset_id, ino, offset) at v17 offsets 64..87. */
+    le64 origin_ds  = stm_store_le64(r->origin_dataset_id);
+    le64 origin_ino = stm_store_le64(r->origin_ino);
+    le64 origin_off = stm_store_le64(r->origin_off);
+    memcpy(out + 64, origin_ds.v,  8);
+    memcpy(out + 72, origin_ino.v, 8);
+    memcpy(out + 80, origin_off.v, 8);
+    /* bytes [88..95] reserved (zero, already zeroed above). */
     return STM_OK;
 }
 
@@ -985,6 +1130,14 @@ static stm_status ex_decode_value(const uint8_t *in, size_t in_len,
     memcpy(cac_le.v,       in + 52, 4);
     memcpy(key_id_le.v,    in + 56, 8);
 
+    /* P7-16 / v17: origin (dataset_id, ino, offset) at offsets 64..87. */
+    le64 origin_ds_le, origin_ino_le, origin_off_le;
+    memcpy(origin_ds_le.v,  in + 64, 8);
+    memcpy(origin_ino_le.v, in + 72, 8);
+    memcpy(origin_off_le.v, in + 80, 8);
+    /* bytes [88..95] reserved — must be zero (anti-tamper). */
+    for (size_t i = 88; i < EX_VAL_LEN; i++) if (in[i] != 0) return STM_ECORRUPT;
+
     uint32_t dlen = stm_load_le32(dlen_le);
     uint32_t cac  = stm_load_le32(cac_le);
     uint32_t clen = cac & 0x00FFFFFFu;
@@ -996,6 +1149,15 @@ static stm_status ex_decode_value(const uint8_t *in, size_t in_len,
     /* dlen must be positive (LengthPositive). */
     if (dlen == 0) return STM_ECORRUPT;
 
+    /* P7-16: origin must satisfy basic typing. dataset_id and ino must
+     * be > 0 (sentinels reserved); origin_off has no upper bound here
+     * (extent.tla::OriginConsistentInBounds is enforced at the index-
+     * mutation site, not at the on-disk decode level). */
+    uint64_t origin_ds  = stm_load_le64(origin_ds_le);
+    uint64_t origin_ino = stm_load_le64(origin_ino_le);
+    uint64_t origin_off = stm_load_le64(origin_off_le);
+    if (origin_ds == 0 || origin_ino == 0) return STM_ECORRUPT;
+
     out_rec->dataset_id = ds;
     out_rec->ino        = ino;
     out_rec->off        = off;
@@ -1006,6 +1168,9 @@ static stm_status ex_decode_value(const uint8_t *in, size_t in_len,
     }
     out_rec->gen        = stm_load_le64(write_gen_le);
     out_rec->key_id     = stm_load_le64(key_id_le);
+    out_rec->origin_dataset_id = origin_ds;
+    out_rec->origin_ino        = origin_ino;
+    out_rec->origin_off        = origin_off;
 
     return STM_OK;
 }
@@ -1277,7 +1442,14 @@ static int ex_load_iter(const void *k, size_t klen,
  * revisits this with a sorted-merge strategy.
  */
 static stm_status ex_validate_shadow(const ex_load_ctx *lc) {
-    /* NoOverlapWithinIno + LengthPositive (already enforced at decode). */
+    /* NoOverlapWithinIno + LengthPositive (already enforced at decode).
+     *
+     * P7-16: replaced the prior cross-record replica-set DISJOINTNESS
+     * with extent.tla::SharedReplicasAreCohabit. Two distinct records
+     * that share ANY paddr MUST share the WHOLE replica set AND the
+     * same (gen, key_id, origin_*) tuple — i.e., be legitimate reflink-
+     * siblings. Partial overlap or whole-share-but-tuple-mismatch is
+     * still corruption. */
     for (size_t i = 0; i < lc->shadow_len; i++) {
         const stm_extent_record *a = &lc->shadow_records[i];
         for (size_t j = i + 1; j < lc->shadow_len; j++) {
@@ -1287,12 +1459,29 @@ static stm_status ex_validate_shadow(const ex_load_ctx *lc) {
                     return STM_ECORRUPT;
                 }
             }
-            /* Cross-record replica-set disjointness. */
-            for (uint8_t ai = 0; ai < a->n_replicas; ai++) {
+            /* Replica-set classification: detect any paddr share. */
+            bool any_share = false;
+            for (uint8_t ai = 0; ai < a->n_replicas && !any_share; ai++) {
                 for (uint8_t bi = 0; bi < b->n_replicas; bi++) {
-                    if (a->paddrs[ai] == b->paddrs[bi]) return STM_ECORRUPT;
+                    if (a->paddrs[ai] == b->paddrs[bi]) { any_share = true; break; }
                 }
             }
+            if (!any_share) continue;
+            /* Whole-set match required when sharing. */
+            if (a->n_replicas != b->n_replicas) return STM_ECORRUPT;
+            for (uint8_t ai = 0; ai < a->n_replicas; ai++) {
+                bool found = false;
+                for (uint8_t bi = 0; bi < b->n_replicas; bi++) {
+                    if (a->paddrs[ai] == b->paddrs[bi]) { found = true; break; }
+                }
+                if (!found) return STM_ECORRUPT;
+            }
+            /* Matching (gen, key_id, origin_*) required when sharing. */
+            if (a->gen        != b->gen)        return STM_ECORRUPT;
+            if (a->key_id     != b->key_id)     return STM_ECORRUPT;
+            if (a->origin_dataset_id != b->origin_dataset_id) return STM_ECORRUPT;
+            if (a->origin_ino        != b->origin_ino)        return STM_ECORRUPT;
+            if (a->origin_off        != b->origin_off)        return STM_ECORRUPT;
         }
     }
     return STM_OK;

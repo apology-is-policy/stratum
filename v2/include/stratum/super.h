@@ -217,7 +217,7 @@ extern "C" {
  * (see R42 P1-1 mount-time hard-fail).
  * Format break, no feature flag.
  *
- * v16 (P7-15, this commit): repair-log persistence (ARCH §7.15.4 /
+ * v16 (P7-15, prior commit): repair-log persistence (ARCH §7.15.4 /
  * bptr.tla::LogIntegrity). Adds three fields carved from the head
  * of `ub_reserved`: `ub_repair_log_root` (16-byte stm_bptr, 64
  * bytes total), `ub_repair_log_root_gen` (le64), and
@@ -234,8 +234,24 @@ extern "C" {
  * pool case and seeds the in-RAM index from `ub_repair_log_next_seq`
  * (also previously zero), so the tampered pool comes up with an
  * empty repair-log — no corruption hazard, just a forensic gap
- * for any pre-flip events. Format break, no feature flag. */
-#define STM_UB_VERSION        16u
+ * for any pre-flip events. Format break, no feature flag.
+ *
+ * v17 (P7-16, this commit): reflinks (ARCH §11.12 / §8.6.3,
+ * extent.tla::Reflink + SharedReplicasAreCohabit). Extent value
+ * grows 64 → 96 bytes by adding the (origin_dataset_id, origin_ino,
+ * origin_off) triple at offsets 64..87 plus 8 reserved bytes at
+ * 88..95. The origin fields name the (ds, ino, off) at which the
+ * AEAD ciphertext was first encrypted, so reflink-siblings sharing
+ * the same paddrs reconstruct the same AEAD AD at read/scrub time.
+ * For freshly-written extents origin equals the live (dataset_id,
+ * ino, off) — non-reflinked extents are unchanged in semantics.
+ * No uberblock field changes. v16 pools fail at the version check
+ * (STM_EBADVERSION) before reaching the new extent value layout.
+ * Tamper-then-mount: a v16 pool whose ub_version is flipped to 17
+ * has on-disk extent records still at v16's 64-byte value layout;
+ * the v17 decoder requires 96-byte values and refuses with
+ * STM_ECORRUPT. Format break, no feature flag. */
+#define STM_UB_VERSION        17u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */

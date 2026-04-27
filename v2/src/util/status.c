@@ -18,6 +18,7 @@ const char *stm_strerror(stm_status s)
     case STM_EAGAIN:         return "try again";
     case STM_ENODEV:         return "no device";
     case STM_EROFS:          return "read-only filesystem";
+    case STM_EXDEV:          return "cross-device link refused";
     case STM_ECORRUPT:       return "integrity check failed";
     case STM_EBADTAG:        return "aead tag mismatch";
     case STM_EBADVERSION:    return "unsupported format version";

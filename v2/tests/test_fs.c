@@ -1642,4 +1642,243 @@ STM_TEST(fs_repair_log_persists_emit_across_mount) {
     unlink(g_key_path);
 }
 
+/* ========================================================================= */
+/* P7-16 — Reflink integration tests.                                         */
+/* ========================================================================= */
+
+STM_TEST(fs_reflink_basic_share) {
+    /* write to (1, 1), reflink to (1, 2): both reads return identical
+     * plaintext. The bytes were AEAD-encrypted under origin = (1, 1, 0)
+     * at write time; reading from (1, 2) reconstructs AD from origin so
+     * AEGIS-256 verify succeeds across the share. */
+    make_tmp("rl_basic");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)((i * 5) & 0xFF);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+
+    STM_ASSERT_OK(stm_fs_reflink(fs, 1, 1, 1, 2));
+
+    uint8_t out_a[4096] = {0};
+    uint8_t out_b[4096] = {0};
+    size_t got_a = 0, got_b = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out_a, sizeof out_a, &got_a));
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 2, 0, out_b, sizeof out_b, &got_b));
+    STM_ASSERT_EQ(got_a, sizeof plain);
+    STM_ASSERT_EQ(got_b, sizeof plain);
+    STM_ASSERT_MEM_EQ(plain, out_a, sizeof plain);
+    STM_ASSERT_MEM_EQ(plain, out_b, sizeof plain);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_reflink_cow_diverges_dst) {
+    /* Reflink (1, 1) → (1, 2). Write to (1, 2): its extent COWs to a
+     * fresh paddr; (1, 1) still reads the original plaintext. */
+    make_tmp("rl_cow_dst");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t a[4096], b[4096];
+    memset(a, 0xAA, sizeof a);
+    memset(b, 0xBB, sizeof b);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, a, sizeof a));
+    STM_ASSERT_OK(stm_fs_reflink(fs, 1, 1, 1, 2));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 2, 0, b, sizeof b));
+
+    uint8_t out_a[4096], out_b[4096];
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out_a, sizeof out_a, &got));
+    STM_ASSERT_MEM_EQ(a, out_a, sizeof a);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 2, 0, out_b, sizeof out_b, &got));
+    STM_ASSERT_MEM_EQ(b, out_b, sizeof b);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_reflink_cow_diverges_src) {
+    /* Symmetric: write to (1, 1) AFTER reflink. (1, 1) COWs; (1, 2)
+     * keeps the original. */
+    make_tmp("rl_cow_src");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t a[4096], b[4096];
+    memset(a, 0xAA, sizeof a);
+    memset(b, 0xBB, sizeof b);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, a, sizeof a));
+    STM_ASSERT_OK(stm_fs_reflink(fs, 1, 1, 1, 2));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, b, sizeof b));
+
+    uint8_t out_a[4096], out_b[4096];
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out_a, sizeof out_a, &got));
+    STM_ASSERT_MEM_EQ(b, out_a, sizeof b);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 2, 0, out_b, sizeof out_b, &got));
+    STM_ASSERT_MEM_EQ(a, out_b, sizeof a);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_reflink_dst_must_be_empty) {
+    /* dst already has extents → STM_EEXIST. */
+    make_tmp("rl_dst_full");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t a[4096], b[4096];
+    memset(a, 0xAA, sizeof a);
+    memset(b, 0xBB, sizeof b);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, a, sizeof a));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 2, 0, b, sizeof b));
+    STM_ASSERT_ERR(stm_fs_reflink(fs, 1, 1, 1, 2), STM_EEXIST);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_reflink_self_refused) {
+    /* <src> == <dst> → STM_EINVAL (no self-reflink). */
+    make_tmp("rl_self");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t a[4096];
+    memset(a, 0xAA, sizeof a);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, a, sizeof a));
+    STM_ASSERT_ERR(stm_fs_reflink(fs, 1, 1, 1, 1), STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_reflink_cross_dataset_refused) {
+    /* MVP: cross-dataset reflinks deferred — STM_EXDEV. ARCH §11.12.3
+     * requires the two datasets to share an encryption key, which
+     * needs a same-key check this MVP doesn't implement. */
+    make_tmp("rl_xdev");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t ds_b = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "xdev_dst", &ds_b));
+
+    uint8_t a[4096];
+    memset(a, 0xAA, sizeof a);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, a, sizeof a));
+    STM_ASSERT_ERR(stm_fs_reflink(fs, 1, 1, ds_b, 1), STM_EXDEV);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_reflink_invalid_args) {
+    make_tmp("rl_args");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    STM_ASSERT_ERR(stm_fs_reflink(NULL, 1, 1, 1, 2), STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_reflink(fs,   0, 1, 1, 2), STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_reflink(fs,   1, 0, 1, 2), STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_reflink(fs,   1, 1, 0, 2), STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_reflink(fs,   1, 1, 1, 0), STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_reflink_persists_across_mount) {
+    /* Reflink + unmount + remount: the on-disk extent records carry
+     * `origin` so the remounted handle's read path reconstructs AD
+     * correctly. dst still reads the original plaintext.
+     *
+     * Catches a regression where origin is stamped only in-RAM but
+     * not on disk — remount would then default origin to (live ds,
+     * ino, off) and AEAD verify would fail. */
+    make_tmp("rl_remount");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)((i + 1) & 0xFF);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_reflink(fs, 1, 1, 1, 2));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint8_t out_a[4096] = {0}, out_b[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out_a, sizeof out_a, &got));
+    STM_ASSERT_MEM_EQ(plain, out_a, sizeof plain);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 2, 0, out_b, sizeof out_b, &got));
+    STM_ASSERT_MEM_EQ(plain, out_b, sizeof plain);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_reflink_rofs_refused) {
+    /* RO mount → STM_EROFS at the FS_GUARD_WRITE. */
+    make_tmp("rl_rofs");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    /* Pre-write at ds=1 / ino=1 in RW first so the source has an
+     * extent. */
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint8_t a[4096];
+    memset(a, 0xAA, sizeof a);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, a, sizeof a));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    /* Remount RO and try reflink. */
+    stm_fs_mount_opts ro = rw_mount_opts();
+    ro.read_only = true;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &ro, &fs));
+    STM_ASSERT_ERR(stm_fs_reflink(fs, 1, 1, 1, 2), STM_EROFS);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")

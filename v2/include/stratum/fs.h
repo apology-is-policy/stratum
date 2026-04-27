@@ -267,6 +267,36 @@ stm_status stm_fs_create_dataset(stm_fs *fs, uint64_t parent_id,
                                     const char *name,
                                     uint64_t *out_id);
 
+/*
+ * P7-16: stm_fs_reflink — POSIX-shape FICLONE. Replaces dst's empty
+ * extent tree with a reflink-share of src's extent tree. Same
+ * semantics as `ioctl(fd_dst, FICLONE, fd_src)` for a freshly-created
+ * dst inode.
+ *
+ * Cross-dataset reflinks require the two datasets to share an
+ * encryption key (ARCH §11.12.3); v1 MVP defers cross-dataset and
+ * refuses with STM_EXDEV.
+ *
+ * Refusals (errors propagate from {stm_sync_reflink} except as noted):
+ *   - NULL fs (STM_EINVAL).
+ *   - dataset_id == 0 OR ino == 0 (STM_EINVAL).
+ *   - <src_dataset_id, src_ino> == <dst_dataset_id, dst_ino>
+ *     (STM_EINVAL — no self-reflink).
+ *   - src_dataset_id != dst_dataset_id (STM_EXDEV — cross-dataset
+ *     deferred).
+ *   - dst_ino has any extent (STM_EEXIST — caller MUST clear dst
+ *     first).
+ *   - Wedged or read-only (STM_EWEDGED / STM_EROFS).
+ *
+ * Atomicity: holds fs->lock across the inner sync_reflink, so a
+ * concurrent observer never sees a partial dst. Models extent.tla
+ * ::Reflink iterated over every (src_dataset_id, src_ino) extent.
+ */
+STM_MUST_USE
+stm_status stm_fs_reflink(stm_fs *fs,
+                            uint64_t src_dataset_id, uint64_t src_ino,
+                            uint64_t dst_dataset_id, uint64_t dst_ino);
+
 /* ========================================================================= */
 /* Inspection + control.                                                      */
 /* ========================================================================= */

@@ -55,6 +55,15 @@ typedef struct {
     uint64_t key_id;
     uint8_t  n_replicas;       /* 1..STM_EXTENT_MAX_REPLICAS */
     uint64_t paddrs[STM_EXTENT_MAX_REPLICAS];
+    /* P7-16: origin (dataset_id, ino, off) for AEAD-AD reconstruction.
+     * For non-reflinked extents origin matches (h->dataset_id, ino,
+     * off); for reflinked extents origin is inherited from the source
+     * extent at write time. The send pipeline reads bytes via
+     * read_decrypt_extent_plaintext which needs origin to reconstruct
+     * the AEAD AD that was used at encrypt time. */
+    uint64_t origin_dataset_id;
+    uint64_t origin_ino;
+    uint64_t origin_off;
 } send_extent_meta;
 
 /* P7-10 / R42 P2-1: snapshot of (key_id, DEK) pairs the send needs.
@@ -156,6 +165,10 @@ static bool send_collect_cb(const stm_extent_record *e, void *ctx_) {
     m->key_id     = e->key_id;
     m->n_replicas = e->n_replicas;
     for (uint8_t i = 0; i < e->n_replicas; i++) m->paddrs[i] = e->paddrs[i];
+    /* P7-16: capture origin so the per-extent send can reconstruct AD. */
+    m->origin_dataset_id = e->origin_dataset_id;
+    m->origin_ino        = e->origin_ino;
+    m->origin_off        = e->origin_off;
     return true;
 }
 
@@ -354,7 +367,12 @@ static stm_status read_decrypt_extent_plaintext(stm_send_handle *h,
     void *cbuf = malloc(total);
     if (!cbuf) return STM_ENOMEM;
 
-    /* AEAD AD — same shape as stm_sync_write_extent. */
+    /* AEAD AD — same shape as stm_sync_write_extent. P7-16: AD binds
+     * to `origin`, not to the live (h->dataset_id, m->ino, m->off).
+     * For non-reflinked extents origin matches the live identity; for
+     * reflinked extents origin is inherited from the source — the
+     * AEAD ciphertext at m->paddrs[*] was bound to origin at write
+     * time so AD reconstructs the same identity. */
     stm_ad_extent ad;
     memset(&ad, 0, sizeof ad);
     ad.magic        = STM_AD_MAGIC_EXTENT;
@@ -362,9 +380,9 @@ static stm_status read_decrypt_extent_plaintext(stm_send_handle *h,
     const uint64_t *puuid = stm_pool_uuid(stm_sync_pool(h->sync));
     ad.pool_uuid[0] = puuid[0];
     ad.pool_uuid[1] = puuid[1];
-    ad.dataset_id   = h->dataset_id;
-    ad.ino          = m->ino;
-    ad.offset       = m->off;
+    ad.dataset_id   = m->origin_dataset_id;
+    ad.ino          = m->origin_ino;
+    ad.offset       = m->origin_off;
     ad.content_kind = 0;
 
     /* P7-10 / R42 P2-1: resolve the source DEK from the handle's

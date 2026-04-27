@@ -980,6 +980,51 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
                                 uint64_t new_size);
 
 /*
+ * P7-16: stm_sync_reflink — POSIX-shape FICLONE at the sync layer.
+ * Replaces dst's empty extent tree with a reflink-share of src's
+ * extent tree. For each (src_dataset_id, src_ino) extent E, this
+ * inserts a sibling extent at (dst_dataset_id, dst_ino, E.off,
+ * E.len, E.replicas, E.gen, E.key_id) with origin INHERITED from E
+ * (so AEGIS-256 verify succeeds for both siblings reading the shared
+ * ciphertext). Allocator refcounts on the shared paddrs are bumped
+ * once per replica per src extent — when one side is later COW'd
+ * the allocator's `stm_alloc_free` decrements; when the refcount
+ * reaches zero (last reference dropped), the paddr is reclaimed.
+ *
+ * Same-dataset reflinks only at v1 MVP. Cross-dataset reflinks
+ * require both datasets to share an encryption key; deferred per
+ * ARCH §11.12.3.
+ *
+ * Refusals:
+ *   - dataset_id == 0 OR ino == 0 (STM_EINVAL).
+ *   - src and dst are the same (ds, ino) (STM_EINVAL — no self-reflink).
+ *   - dataset_id is not the same for src and dst (STM_EXDEV — cross-
+ *     dataset reflinks deferred to a future chunk).
+ *   - dst_ino has any extent (STM_EEXIST — caller MUST clear dst first;
+ *     truncate to 0 plus re-create is the typical pattern but in MVP
+ *     we just refuse).
+ *   - Any allocator refcount-bump fails (STM_ECORRUPT — should never
+ *     happen for live extents; rolls back any prior bumps).
+ *   - Wedged or read-only (standard guards).
+ *
+ * Atomicity: holds sync->lock across all extent-tree mutations and
+ * refcount bumps. On partial failure, every successful refcount bump
+ * is rolled back via stm_alloc_free + every successful extent-tree
+ * insert is removed via stm_extent_delete_file (delete_file is the
+ * cheapest "drop everything for this dst_ino" given dst_ino was
+ * required to be empty at entry).
+ *
+ * Models extent.tla::Reflink iterated over every (src_dataset_id,
+ * src_ino) extent; lock-graph: sync.lock OUTER → extent_idx.lock +
+ * per-device alloc.lock INNER. fs->lock is the outermost layer when
+ * called via stm_fs_reflink (P7-16's public surface).
+ */
+STM_MUST_USE
+stm_status stm_sync_reflink(stm_sync *s,
+                              uint64_t src_dataset_id, uint64_t src_ino,
+                              uint64_t dst_dataset_id, uint64_t dst_ino);
+
+/*
  * P7-5: install the production scrub β verify-callback on `sc`.
  *
  * The cb resolves each `paddr` against `sync`'s extent index via

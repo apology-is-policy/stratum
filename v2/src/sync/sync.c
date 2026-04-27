@@ -4138,9 +4138,15 @@ static stm_status stm_sync_read_extent_locked(stm_sync *s,
     ad.version      = STM_AD_VERSION_EXTENT;
     ad.pool_uuid[0] = s->pool_uuid[0];
     ad.pool_uuid[1] = s->pool_uuid[1];
-    ad.dataset_id   = dataset_id;
-    ad.ino          = ino;
-    ad.offset       = rec.off;
+    /* P7-16: AD reconstructs from `origin`, not the live (ds, ino, off).
+     * For non-reflinked extents origin = (dataset_id, ino, rec.off)
+     * (stamped by stm_extent_write); for reflinked extents origin is
+     * inherited from the source extent. The AEAD ciphertext at
+     * `rec.paddrs[*]` was bound to `origin` at write time; reconstruct
+     * the same identity here so AEGIS-256 verify succeeds. */
+    ad.dataset_id   = rec.origin_dataset_id;
+    ad.ino          = rec.origin_ino;
+    ad.offset       = rec.origin_off;
     ad.content_kind = 0;
 
     /* P7-6: try each replica in order; first AEAD-verifying replica
@@ -4432,6 +4438,197 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     return drop_err;
 }
 
+/* ========================================================================= */
+/* P7-16 — reflink (FICLONE).                                                 */
+/* ========================================================================= */
+
+/*
+ * Iterator context for the per-extent collect pass. Captures every
+ * extent record at (src_dataset_id, src_ino) into a dynamically-grown
+ * snapshot, which the apply pass then uses to bump refcounts + insert
+ * dst-side records under sync->lock without iterating the live tree
+ * (which would race with our own mutations).
+ */
+typedef struct {
+    uint64_t                src_dataset_id;
+    uint64_t                src_ino;
+    stm_extent_record      *records;
+    size_t                  n;
+    size_t                  cap;
+    stm_status              err;          /* sticky non-OK */
+} reflink_collect_ctx;
+
+static bool reflink_collect_cb(const stm_extent_record *e, void *cx) {
+    reflink_collect_ctx *ctx = cx;
+    if (e->dataset_id != ctx->src_dataset_id || e->ino != ctx->src_ino)
+        return true;  /* skip; iter scans entire ds */
+    if (ctx->n == ctx->cap) {
+        size_t new_cap = ctx->cap == 0 ? 8u : ctx->cap * 2u;
+        stm_extent_record *grown = realloc(ctx->records,
+                                              new_cap * sizeof(stm_extent_record));
+        if (!grown) { ctx->err = STM_ENOMEM; return false; }
+        ctx->records = grown;
+        ctx->cap     = new_cap;
+    }
+    ctx->records[ctx->n++] = *e;
+    return true;
+}
+
+stm_status stm_sync_reflink(stm_sync *s,
+                              uint64_t src_dataset_id, uint64_t src_ino,
+                              uint64_t dst_dataset_id, uint64_t dst_ino) {
+    if (!s) return STM_EINVAL;
+    if (src_dataset_id == 0 || src_ino == 0) return STM_EINVAL;
+    if (dst_dataset_id == 0 || dst_ino == 0) return STM_EINVAL;
+    if (src_dataset_id == dst_dataset_id && src_ino == dst_ino)
+        return STM_EINVAL;
+    /* MVP: same-dataset only (ARCH §11.12.3 cross-dataset requires
+     * matching encryption keys; deferred to a future chunk). */
+    if (src_dataset_id != dst_dataset_id) return STM_EXDEV;
+
+    pthread_mutex_lock(&s->lock);
+    if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
+    if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
+
+    /* Pre-flight: dst_ino must be empty. */
+    size_t dst_n = 0;
+    stm_status cs = stm_extent_count_for_ino(s->extent_idx,
+                                                dst_dataset_id, dst_ino, &dst_n);
+    if (cs != STM_OK) {
+        pthread_mutex_unlock(&s->lock);
+        return cs;
+    }
+    if (dst_n != 0) {
+        pthread_mutex_unlock(&s->lock);
+        return STM_EEXIST;
+    }
+
+    /* Phase 1: collect src extents into an in-RAM snapshot. iter takes
+     * the extent_idx lock briefly; we hold sync->lock so no other
+     * sync-layer caller can mutate src between phases. */
+    reflink_collect_ctx cx = { .src_dataset_id = src_dataset_id,
+                               .src_ino        = src_ino,
+                               .err            = STM_OK };
+    stm_status its = stm_extent_iter_ds(s->extent_idx, src_dataset_id,
+                                           reflink_collect_cb, &cx);
+    if (its != STM_OK || cx.err != STM_OK) {
+        free(cx.records);
+        pthread_mutex_unlock(&s->lock);
+        return cx.err != STM_OK ? cx.err : its;
+    }
+    if (cx.n == 0) {
+        /* src_ino has no extents — nothing to reflink. Treat as OK
+         * (dst_ino was already empty; reflink of empty file is nop). */
+        free(cx.records);
+        pthread_mutex_unlock(&s->lock);
+        return STM_OK;
+    }
+
+    /* Phase 2: bump allocator refcount on every replica paddr in every
+     * src extent. On per-paddr failure, roll back any prior bumps and
+     * abort. */
+    size_t bumped = 0;  /* # successful refs taken across (i, r). */
+    stm_status apply_rc = STM_OK;
+    for (size_t i = 0; i < cx.n && apply_rc == STM_OK; i++) {
+        const stm_extent_record *e = &cx.records[i];
+        for (uint8_t r = 0; r < e->n_replicas; r++) {
+            uint16_t dev = stm_paddr_device(e->paddrs[r]);
+            if (dev >= STM_POOL_DEVICES_MAX || s->allocs[dev] == NULL) {
+                apply_rc = STM_ECORRUPT;
+                break;
+            }
+            stm_status rs = stm_alloc_ref(s->allocs[dev], e->paddrs[r]);
+            if (rs != STM_OK) {
+                apply_rc = rs;
+                break;
+            }
+            bumped++;
+        }
+    }
+
+    if (apply_rc == STM_OK) {
+        /* Phase 3: insert reflinked extent records at dst with origin
+         * INHERITED from src. dst_off equals src.off (whole-file
+         * reflink at v1 MVP). */
+        for (size_t i = 0; i < cx.n; i++) {
+            const stm_extent_record *e = &cx.records[i];
+            stm_status is = stm_extent_reflink(s->extent_idx,
+                                                  dst_dataset_id, dst_ino,
+                                                  e->off, e->len,
+                                                  e->paddrs, e->n_replicas,
+                                                  e->gen, e->key_id,
+                                                  e->origin_dataset_id,
+                                                  e->origin_ino,
+                                                  e->origin_off);
+            if (is != STM_OK) {
+                apply_rc = is;
+                /* Roll back already-inserted dst records.
+                 * stm_extent_delete_file on dst_ino drops every
+                 * dst-side insertion at this dst_ino — including
+                 * those we did this turn — and surfaces their
+                 * paddrs in `dropped`. We then DecRef every dropped
+                 * paddr to undo the corresponding Phase 2 bump. */
+                uint64_t *dropped = NULL;
+                size_t    n_drop  = 0;
+                stm_status del = stm_extent_delete_file(s->extent_idx,
+                                                          dst_dataset_id, dst_ino,
+                                                          &dropped, &n_drop);
+                if (del == STM_OK) {
+                    for (size_t k = 0; k < n_drop; k++) {
+                        uint16_t dev = stm_paddr_device(dropped[k]);
+                        if (dev < STM_POOL_DEVICES_MAX && s->allocs[dev]) {
+                            (void)stm_alloc_free(s->allocs[dev], dropped[k],
+                                                    s->current_gen);
+                        }
+                    }
+                }
+                free(dropped);
+                /* Decrement remaining un-dropped refs (paddrs from
+                 * extents whose insert never landed). bumped counts
+                 * total replicas bumped in Phase 2; n_drop counts
+                 * paddrs released by delete_file. The difference is
+                 * the count of refs from extents whose insert
+                 * failed before reaching the index. Walk the
+                 * collect snapshot from the failing index forward
+                 * to compute this exactly. */
+                size_t need_unref_extents = cx.n - i;  /* including i */
+                for (size_t j = i; j < cx.n; j++) {
+                    const stm_extent_record *ee = &cx.records[j];
+                    for (uint8_t r = 0; r < ee->n_replicas; r++) {
+                        uint16_t dev = stm_paddr_device(ee->paddrs[r]);
+                        if (dev < STM_POOL_DEVICES_MAX && s->allocs[dev]) {
+                            (void)stm_alloc_free(s->allocs[dev], ee->paddrs[r],
+                                                    s->current_gen);
+                        }
+                    }
+                }
+                (void)need_unref_extents;  /* documented above; not needed here */
+                break;
+            }
+        }
+    } else {
+        /* Phase 2 partial-fail: we bumped `bumped` paddrs successfully
+         * before the failure. Walk the collect snapshot in the SAME
+         * order we bumped, decrementing the first `bumped` refs. */
+        size_t undone = 0;
+        for (size_t i = 0; i < cx.n && undone < bumped; i++) {
+            const stm_extent_record *e = &cx.records[i];
+            for (uint8_t r = 0; r < e->n_replicas && undone < bumped; r++) {
+                uint16_t dev = stm_paddr_device(e->paddrs[r]);
+                if (dev < STM_POOL_DEVICES_MAX && s->allocs[dev]) {
+                    (void)stm_alloc_free(s->allocs[dev], e->paddrs[r],
+                                            s->current_gen);
+                }
+                undone++;
+            }
+        }
+    }
+
+    free(cx.records);
+    pthread_mutex_unlock(&s->lock);
+    return apply_rc;
+}
+
 /* P7-6 production scrub β verify-callback — full bptr.tla replica
  * walk + verify + rewrite-bad protocol.
  *
@@ -4618,9 +4815,16 @@ sync_scrub_verify_cb(uint64_t paddr, void *ctx)
     ad.version      = STM_AD_VERSION_EXTENT;
     ad.pool_uuid[0] = s->pool_uuid[0];
     ad.pool_uuid[1] = s->pool_uuid[1];
-    ad.dataset_id   = rec.dataset_id;
-    ad.ino          = rec.ino;
-    ad.offset       = rec.off;
+    /* P7-16: AD reconstructs from `origin`, not the lookup-by-paddr
+     * record's live (rec.dataset_id, rec.ino, rec.off). For reflinked
+     * extents lookup_by_paddr returns ANY of the extent records
+     * sharing this paddr (first match); origin is invariant across
+     * such siblings (extent.tla::SharedReplicasAreCohabit) so AD
+     * reconstructs identically. The AEAD ciphertext was bound to
+     * `origin` at write time. */
+    ad.dataset_id   = rec.origin_dataset_id;
+    ad.ino          = rec.origin_ino;
+    ad.offset       = rec.origin_off;
     ad.content_kind = 0;
 
     /* Phase 1 (bptr.tla::ScanRead × NReplicas): read each replica,
