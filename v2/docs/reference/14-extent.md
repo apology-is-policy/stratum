@@ -209,7 +209,9 @@ off  size  field
  40    8   write_gen        (le64)
  48    4   dlen             (le32) — logical byte length
  52    4   clen_and_comp    (le32) — low 24: stored length; high 8: comp algo
- 56    8   xxh              (le64) — 0 in MVP (AEAD tag is integrity)
+ 56    8   key_id           (le64) — P7-10: per-dataset DEK key_id
+                                     (was xxh in v13/v14, always 0 since
+                                     AEAD tag is integrity; v15 repurposes)
 ```
 
 Each extent stores up to `STM_EXTENT_MAX_REPLICAS=4` paddrs; unused
@@ -219,13 +221,29 @@ hold bytewise-identical ciphertext+tag. The decoder enforces:
 n_replicas ∈ [1, 4]; paddrs[0..n) all non-zero; paddrs[n..4) all
 zero; pairwise distinctness within the replica set.
 
+`key_id` (P7-10): names which DEK in the dataset's keyschema
+(`(dataset_id, key_id)`) decrypts the extent. The sync layer's
+`stm_sync_write_extent` resolves the dataset's CURRENT
+`(key_id, DEK)` at write time (via `keyschema_lookup_current` +
+`sync_dek_find`), encrypts under the DEK, and stamps the key_id
+here. `stm_sync_read_extent` reads the stamped key_id and resolves
+the matching DEK — RETIRED keys remain reachable so pre-rotation
+extents stay decryptable. The DEK is NOT in the AEAD nonce or AD;
+the nonce stays canonical `(paddrs[0], write_gen, pool_uuid)` so
+the per-replica AEAD-tag check is unchanged. The pre-P7-10 always-
+zero `xxh` slot at offset 56 is reused for `key_id` — a v14 pool
+mounted under v15 would have `key_id=0` everywhere (semantically
+"every extent decrypts under the dataset's first DEK") but v14
+keyschemas don't carry per-dataset DEKs at all, so the version
+check at the uberblock layer rejects the mount before the value
+layer is reached.
+
 MVP caps:
 - `len` must fit in 24 bits (≤ 0xFFFFFF; ~16 MiB-1) so both `dlen`
   and `clen` (low 24 bits of `clen_and_comp`) hold the same value
   (no compression). Production recordsizes (default 128 KiB) are
   far under this. `_commit` refuses with STM_ERANGE on overflow.
 - Compression algo byte = 0 always.
-- xxh = 0 always (AEAD tag covers integrity).
 
 ### Crypt + Merkle
 
@@ -377,9 +395,13 @@ unrelated to the index API and stays separate.
 - **MVP write/read constraints (P7-4)**: `stm_fs_write` / `_read`
   require `len > 0`, `len` multiple of 4 KiB, `len ≤ 128 KiB`
   (recordsize default), `off` multiple of 4 KiB. Single-extent per
-  call. Encryption uses pool-wide `metadata_key` (per-dataset DEKs
-  deferred). Reads cap at the matching extent's length; partial
-  reads spanning multiple extents are caller-iterated.
+  call. Encryption uses the dataset's CURRENT DEK (P7-10): the sync
+  layer resolves `(dataset_id, key_id) → DEK` via the keyschema
+  sub-tree at write time, stamps `key_id` on the extent record, and
+  resolves DEK by the stamped key_id at read time so RETIRED keys
+  still decrypt their original extents. Reads cap at the matching
+  extent's length; partial reads spanning multiple extents are
+  caller-iterated.
 - **Live-paddr semantics**: a paddr re-used in a future gen by the
   allocator is allowed; a paddr that's CURRENTLY in any live extent
   is refused. Callers MUST drop the old extent (via Overwrite /
@@ -393,8 +415,12 @@ unrelated to the index API and stays separate.
   under this; the cap is essentially the on-disk `clen_and_comp`
   field's clen width. Production extension would either bump the
   on-disk format (post-v12) or add chunking.
-- **No xxh / no compression in MVP**: `xxh = 0` always (AEAD tag is
-  the integrity check); `clen_and_comp.comp = 0` always. Adding
-  unencrypted-extent support (xxh-based integrity) or compression
-  (clen ≠ dlen) would not bump the on-disk format — only fields
-  that are currently zero would change.
+- **No compression in MVP**: `clen_and_comp.comp = 0` always.
+  Adding compression (clen ≠ dlen) would not bump the on-disk
+  format — only the `clen_and_comp` field's currently-zero high
+  byte would change.
+- **No xxh slot in v15**: P7-10 repurposed the offset-56 slot for
+  `key_id`. Adding unencrypted-extent integrity (xxhash-based)
+  would need a new field carve from `ub_reserved` or another
+  slot; deferred until ARCH §11.6's encryption-optional pathway
+  has a documented mode flag.

@@ -97,15 +97,22 @@ Rotation is orchestrated by sync (`stm_sync_rotate_dataset_key`):
 
 Sweep is orchestrated by `stm_sync_keyschema_sweep`:
 
-1. Transition every RETIRED entry for `dataset_id` → PRUNING.
-2. Future extent-manager GC marks PRUNING → deletable when no
-   extent references the key.
-3. `stm_keyschema_sweep_pruning` deletes the PRUNING entries
-   whose DEK count hit zero.
+1. Walk every RETIRED entry for `dataset_id`.
+2. **P7-10**: for each, count extent references via the in-RAM
+   extent index (`stm_extent_iter_ds` + filter by `key_id`). If
+   any live extent stamps that `(dataset_id, key_id)`, the entry
+   is left in RETIRED — closes the long-standing P4-4c TODO and
+   maps to `key_schema.tla::PruneSafety` ("a pruned key never had
+   outstanding refs"). The operator can sweep again after extents
+   migrate to a newer key (overwrite — drops the old key_id ref;
+   future bg re-encrypt sweep — same outcome).
+3. RETIRED entries with zero refs transition through PRUNING and
+   are then removed; the in-RAM DEK is wiped via `sync_dek_remove`.
 
-For P4-4c, extent refcounting doesn't exist yet — `stm_sync_keyschema_sweep`
-treats RETIRED → deletable immediately. Revisits when Phase 6's
-extent manager lands.
+The walk runs under sync's lock, so it sees a consistent snapshot:
+no concurrent extent-mutation can change the count between the
+walk and the prune. Cost is O(extents) per sweep call; future
+optimization could maintain refcount-by-key_id incrementally.
 
 ## Entry state machine
 

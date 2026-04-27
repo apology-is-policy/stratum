@@ -39,12 +39,12 @@ chapter as specs get wider cross-reference tables).
 | `property.tla` | 6 | Per-dataset property inheritance — local override / inheritable walk / non-inheritable + immutable-at-create. | 1040 states, depth 11 (MaxDatasets=2, 3 props, 2 values) | `property_inherit_non_inh_buggy.cfg`, `property_mutate_immutable_buggy.cfg` |
 | `clone.tla` | 6 | Clone (writable snapshot) lifecycle — clone-from-snap + snap-with-clones-undeletable + promote-breaks-dependency. | 161 states, depth 11 (MaxDatasets=3, MaxSnaps=2) | `clone_delete_snap_with_clones_buggy.cfg` |
 | `dead_list.tla` | 6 | Block-level reachability + per-snapshot dead-list incremental maintenance during COW + ZFS-style SnapDelete (free-unique + merge-surviving-into-pred). | 5656 states, depth 15 (MaxBlocks=4, MaxSnaps=3) | `dead_list_overwrite_forgets_buggy.cfg`, `dead_list_delete_forgets_free_buggy.cfg`, `dead_list_merge_includes_freed_buggy.cfg` |
-| `extent.tla` | 7 | Per-(dataset, ino) extent layout — Write / Overwrite / Truncate / DeleteFile / AdvanceTxg + no-overlap-within-ino + length-positive + birth-txg-bound + paddr-freshness + replica sets per extent (P7-6) + live-replicas-disjoint. | 11594 states, depth 6 (MaxDatasets=1, MaxInos=2, MaxFileBlocks=2, MaxPaddrs=4, MaxTxg=1, MaxReplicasPerExtent=2) | `extent_overlap_buggy.cfg`, `extent_zero_length_buggy.cfg`, `extent_overwrite_forgets_drop_buggy.cfg`, `extent_replica_collision_buggy.cfg` |
+| `extent.tla` | 7 | Per-(dataset, ino) extent layout — Write / Overwrite / Truncate / DeleteFile / AdvanceTxg + no-overlap-within-ino + length-positive + birth-txg-bound + paddr-freshness + replica sets per extent (P7-6) + live-replicas-disjoint + Truncate partial-shrink under fresh replicas (P7-9) + key_id stamp on every extent (P7-10). | extent.cfg: 838164 states, depth 7 (MaxDatasets=1, MaxInos=2, MaxFileBlocks=3, MaxPaddrs=5, MaxTxg=1, MaxReplicasPerExtent=2, MaxKeyIds=1; bound bumped P7-9 for branch-(b) coverage). extent_keyids.cfg: 67304 states, depth 7 (MaxFileBlocks=2, MaxPaddrs=4, MaxKeyIds=2; P7-10 spanning-rotation coverage). | `extent_overlap_buggy.cfg`, `extent_zero_length_buggy.cfg`, `extent_overwrite_forgets_drop_buggy.cfg`, `extent_replica_collision_buggy.cfg` |
 
-All 23 fixed configs green (one per module + `scrub_beta` +
-`scrub_durable` + `scrub_beta_durable` extending `scrub.tla`). All 24
-buggy configs reproduce their designed invariant violations
-(P7-8 added `snapshot_extent_txg_unbounded_buggy`).
+All 24 fixed configs green (one per module + `scrub_beta` +
+`scrub_durable` + `scrub_beta_durable` extending `scrub.tla` +
+`extent_keyids.cfg` extending `extent.tla`). All 24 buggy configs
+reproduce their designed invariant violations.
 
 ## Per-module invariants
 
@@ -945,13 +945,27 @@ Invariants:
 CONSTANTS (bounded TLC scope):
 
 - `MaxDatasets ≥ 1`, `MaxInos ≥ 1`, `MaxFileBlocks ≥ 1`,
-  `MaxPaddrs ≥ 1`, `MaxTxg ≥ 1`.
+  `MaxPaddrs ≥ 1`, `MaxTxg ≥ 1`, `MaxReplicasPerExtent ≥ 1`,
+  `MaxKeyIds ≥ 1` (P7-10).
 - `BuggyWriteAllowsOverlap` — Write skips no-overlap
   precondition. `NoOverlapWithinIno` fires.
 - `BuggyZeroLength` — Write allows `len = 0`. `LengthPositive`
   fires.
 - `BuggyOverwriteForgetsDrop` — Overwrite inserts the new without
   dropping overlapping olds. `NoOverlapWithinIno` fires.
+- `BuggyReplicaPaddrCollision` — Write skips replica freshness
+  check. `LiveReplicasDisjoint` fires (P7-6).
+
+P7-10: every extent stamps `key_id ∈ KeyIds` (default `MaxKeyIds=1`
+in extent.cfg keeps the P7-9 partial-shrink coverage at 838164
+states; the new `extent_keyids.cfg` runs `MaxKeyIds=2` at the
+pre-P7-9 bound for spanning-rotation coverage). The field has
+`TypeOK` closure only — load-bearing rotation invariants live in
+`key_schema.tla` (`PruneSafety`, `MonotonicKeyIds`); the
+composition between extent.tla's `extents` set and key_schema.tla's
+`refs` map is enforced at the C boundary by
+`stm_sync_keyschema_sweep` (refuses to prune a key with live
+extent refs).
 
 Out of scope:
 
@@ -960,6 +974,8 @@ Out of scope:
 - Reflinks / refcount-share (Phase 7 §10.4).
 - CAS / cold tier (Phase 7 §10.1, separate spec).
 - Coalescing (quality-of-implementation).
+- Cross-spec composition with key_schema.tla (modeled at C
+  boundary; would need a unified schema-and-extents spec).
 
 C impl status: P7-2 in-RAM MVP landed at `732b20e` + R34 close
 `433d2dd`. **P7-3 persistence landed at `b223975` (R35 audit

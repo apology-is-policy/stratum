@@ -150,8 +150,9 @@ any version other than the current one.
 | 11 → 12 | P7-3: `ub_extent_root` (64-byte stm_bptr at offset 3128) + `ub_extent_root_gen` (le64 at offset 3192) carved from the head of `ub_reserved`. Anchors the extent-index Bε-tree (ARCH §11.6, extent.tla); same envelope as ub_main_root / ub_snap_root (btree_store-encoded, AEAD-encrypted). New `STM_BPTR_KIND_EXTENT_TREE = 10`. The Merkle root chain folds in a 6th csum (extent_csum) — v11 pools' Merkle roots were 5-input, so any v11 UB at v12 would fail Merkle recompute even before the version check. v11 pools refused at v12 mount via uniform `STM_EBADVERSION`. |
 | 12 → 13 | P7-6: extent-record value layout grows 32 → 64 bytes with up to 4 replica paddrs per ARCH §11.6.1 (replica list per extent). New `extent.tla` invariant `LiveReplicasDisjoint` (replica paddrs across live extents are mutually disjoint at the device level). `stm_sync_write_extent` reserves N=mirror_n replicas across N distinct devices, encrypts ONCE under (replicas[0], gen), writes bytewise-identical ciphertext+tag to each replica. Scrub β cb realizes bptr.tla's full ScanRead × RewriteReplica matrix. v12 pools' 32-byte values length-rejected by v13 decoder. New buggy demo `extent_replica_collision_buggy.cfg`. |
 | 13 → 14 | P7-8: snapshot-record value layout grows 8 bytes (new `extent_txg` field at offset 24..32; captures `sync.current_gen` at SnapshotCreate). Send/recv's incremental gen filter aligns with `extent.gen` instead of using `created_txg` (different counter space). `snapshot.tla` extended with separate `sync_gen` counter + new invariants `ExtentTxgBoundedBySync` and `ChainExtentTxgOrdered`. New buggy demo `snapshot_extent_txg_unbounded_buggy.cfg`. SP_VAL_FIXED 44 → 52; v13 entries length-rejected by v14 decoder. Refused via uniform STM_EBADVERSION. |
+| 14 → 15 | P7-10: extent-record value layout reuses the always-zero `xxh` slot at offset 56 for `key_id` (le64) — names which DEK in the dataset's keyschema decrypts the extent. EX_VAL_LEN unchanged at 64 bytes. `stm_sync_create` auto-installs the root dataset's DEK at format time. Sync write/read/scrub-cb/send paths resolve DEK by `(dataset_id, key_id)` instead of using the per-pool `metadata_key`; receiver re-encrypts under its own pool's CURRENT DEK. `stm_sync_keyschema_sweep` refuses to prune a RETIRED key with live extent references (closes the long-standing P4-4c TODO; maps to key_schema.tla::PruneSafety). `extent.tla::ExtentRec` gains `key_id ∈ KeyIds`; new bound config `extent_keyids.cfg` (MaxKeyIds=2 at the pre-P7-9 bound) realizes spanning-rotation states. v14 pools refused at v15 mount via uniform STM_EBADVERSION (their offset-56 bytes are 0; semantically "key_id=0" but no per-dataset DEK exists in v14 keyschemas). |
 
-Current: `STM_UB_VERSION == 14` (see `include/stratum/super.h`).
+Current: `STM_UB_VERSION == 15` (see `include/stratum/super.h`).
 
 ### Merkle-rooted integrity
 
@@ -174,7 +175,7 @@ checked at the extent boundary on every read.
 | 4 | ✅ complete | AEAD-AD + per-extent integrity + keyschema + PQ-hybrid wrap + janus + R13-R14b audits. | phase4-status.md |
 | 5 | ✅ complete | Multi-device pool + roster + quorum + scrub-α/β/γ. R15-R26 audits closed. Tagged `phase-5-complete` at `461e68e`. | phase5-status.md |
 | 6 | ✅ namespace feature-complete | Dataset / snapshot / clone / property / dead-list C impls + persistence. ROADMAP §9.2 5/5 exit criteria met. R27-R33 closed. | phase6-status.md |
-| 7 | 🚧 in progress | P7-prework FastCDC + P7-1 extent.tla spec + P7-2 extent C impl + P7-3 extent persistence (UB v11→v12) + P7-4 fs.c/sync.c COW integration + P7-5 production scrub cb + P7-6 replica-list extension (UB v12→v13) + P7-7 send/recv MVP + P7-8 snap-gen alignment (extent_txg field + UB v13→v14) + P7-9 truncate partial-extent split (`stm_sync_truncate` re-encrypts crossing-extent prefix under fresh paddrs). R27, R34–R41 closed. Pending: CAS, reflinks, per-dataset DEKs, repair log persistence. | phase7-status.md |
+| 7 | 🚧 in progress | P7-prework FastCDC + P7-1 extent.tla spec + P7-2 extent C impl + P7-3 extent persistence (UB v11→v12) + P7-4 fs.c/sync.c COW integration + P7-5 production scrub cb + P7-6 replica-list extension (UB v12→v13) + P7-7 send/recv MVP + P7-8 snap-gen alignment (extent_txg field + UB v13→v14) + P7-9 truncate partial-extent split (`stm_sync_truncate` re-encrypts crossing-extent prefix under fresh paddrs) + P7-10 per-dataset DEKs (extent `key_id` field + UB v14→v15 + sweep refcount enforcement). R27, R34–R42 closed. Pending: CAS, reflinks, repair log persistence, truncate `_locked` atomicity refactor. | phase7-status.md |
 
 ## Test posture
 
@@ -182,7 +183,7 @@ checked at the extent boundary on every read.
 - Three sanitizer configurations, all green: default, ASan, TSan.
 - TSan timeout bumped to 180s for `test_crash_inject` (has ~168
   format+mount cycles).
-- 20 TLA+ spec modules verify 23 fixed configs.
+- 20 TLA+ spec modules verify 24 fixed configs.
 - 24 buggy-config demos confirm the invariants actually fire when
   violated (regression protection for the invariants themselves).
 

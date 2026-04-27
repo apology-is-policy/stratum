@@ -38,25 +38,33 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `5530a0e` (**P7-9 truncate partial-extent split** —
-  `stm_sync_truncate` shrinks the crossing extent (read+decrypt+
-  re-encrypt the kept prefix under fresh `(paddr_0, current_gen)`
-  AEAD nonce) + drops past extents through dead-list / free
-  routing; closes the long-standing MVP gap where
-  `stm_extent_truncate` only dropped fully-past extents. Spec
-  refinement in `extent.tla::Truncate` adds a second branch for
-  the crossing case under fresh `replicas \cap used_paddrs = {}`.
-  No format break. R41 audit clean: 0 P0 + 0 P1 + 0 P2 + 5 P3.
-  TLC bound bumped MaxFileBlocks 2 → 3 + MaxPaddrs 4 → 5 to
-  expose unique branch-(b) states; 11594 → 838164 distinct).
-  Prior: P7-8 snap-gen alignment `73019c4` (`extent_txg` field on
-  snapshot record + UB v13 → v14 closes incremental-send filter
-  gap). P7-7 send/recv MVP `1122d32`. P7-6 replica-list extension
-  `a958af6` (UB v12 → v13). Phase 5 tagged `phase-5-complete`
-  at `461e68e`.
-  Spec posture: **20 modules / 23 fixed configs / 24 buggy demos**
-  (no new buggy cfg in P7-9; the fixed-config bound bump explores
-  ~70× more states without adding modules).
+- **Tip**: `394150a` (**P7-10 per-dataset DEKs** — every extent
+  now carries a `key_id` field naming which DEK in the dataset's
+  keyschema decrypts it; sync resolves DEK by `(dataset_id, key_id)`
+  instead of using `metadata_key`. `stm_sync_create` auto-installs
+  the root dataset's DEK at format time alongside the pool metadata
+  key. Production scrub β cb + send/recv pick the DEK by the
+  extent's stamped `key_id` — RETIRED keys remain reachable so
+  pre-rotation extents stay decryptable. `stm_sync_keyschema_sweep`
+  refuses to prune any RETIRED key with live extent references
+  (closes the long-standing P4-4c TODO; maps to
+  key_schema.tla::PruneSafety). Format break STM_UB_VERSION
+  14 → 15: extent on-disk value's offset-56 slot — the always-zero
+  `xxh` field in v13/v14 — is repurposed for `key_id` (le64).
+  Spec extension: `extent.tla::ExtentRec` gains `key_id ∈ KeyIds`;
+  Write/Overwrite/Truncate stamp it. extent.cfg holds `MaxKeyIds=1`
+  to preserve the P7-9 partial-shrink coverage at 838164 states;
+  new `extent_keyids.cfg` runs MaxKeyIds=2 at the pre-P7-9 bound
+  (67304 distinct states; 5s wall) so spanning-rotation scenarios
+  exist in TLC.
+  Prior: P7-9 truncate partial-extent split `5530a0e`
+  (`stm_sync_truncate` shrinks crossing extent under fresh
+  `(paddr_0, current_gen)` nonce). P7-8 snap-gen alignment
+  `73019c4` (UB v13 → v14, `extent_txg` field). P7-7 send/recv
+  MVP `1122d32`. P7-6 replica-list extension `a958af6` (UB v12
+  → v13). Phase 5 tagged `phase-5-complete` at `461e68e`.
+  Spec posture: **20 modules / 24 fixed configs / 24 buggy demos**
+  (added `extent_keyids.cfg`; no new buggy cfg in P7-10).
 - **Phases**: 1–5 complete; Phase 6 namespace layer feature-
   complete; **Phase 7 progressing**.
   Spec scaffolds: P6-1 (bptr.tla) `032db86`; P6-2 (dataset.tla)
@@ -147,19 +155,55 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   P2-1 chain-ordering validation under idx->lock; structural
   validator extended; new accessor `stm_sync_current_gen`. R40
   audit: 0 P0 + 0 P1 + 1 P2 + 6 P3 (P2-1 + P3-1/2/4/5/7 fixed
-  inline; P3-3 + P3-6 deferred per audit close commit).**
+  inline; P3-3 + P3-6 deferred per audit close commit).
+  **P7-10 per-dataset DEKs `a3610f2` + R42 close `394150a`
+  (this commit) — every extent
+  now carries a `key_id` field naming which DEK in the dataset's
+  keyschema decrypts it; sync layer resolves DEK by
+  `(dataset_id, key_id)` instead of using the per-pool
+  `metadata_key`. `stm_sync_create` auto-installs the root
+  dataset's DEK as keyschema entry `(1, 0, CURRENT)` alongside
+  the pool metadata key `(0, 0)`; non-root datasets continue to
+  use `stm_sync_add_dataset_key`. The production scrub β cb and
+  send/recv resolve DEK by the extent's stamped `key_id` —
+  RETIRED keys remain reachable so pre-rotation extents stay
+  decryptable. `stm_sync_keyschema_sweep` walks the extent index
+  and refuses to prune any RETIRED key with live extent
+  references (closes the long-standing P4-4c TODO; maps to
+  key_schema.tla::PruneSafety; the operator can sweep again after
+  extents migrate via overwrite / re-encrypt sweep). Format break
+  STM_UB_VERSION 14 → 15: extent on-disk value's offset-56 slot
+  (the always-zero `xxh` field in v13/v14) is repurposed for
+  `key_id` (le64); EX_VAL_LEN stays 64. v14 pools fail at
+  uberblock version check before the value layer is reached.
+  Spec extension: `extent.tla::ExtentRec` gains `key_id ∈ KeyIds`;
+  `Write/Overwrite/Truncate` stamp it. `extent.cfg` holds
+  `MaxKeyIds=1` to preserve the P7-9 partial-shrink coverage at
+  838164 states; new `extent_keyids.cfg` runs MaxKeyIds=2 at the
+  pre-P7-9 bound (67304 distinct states; 5s wall) so
+  spanning-rotation scenarios — distinct extents under distinct
+  key_ids — are realized in TLC. R42 audit:
+  0 P0 + 1 P1 + 2 P2 + 5 P3 — P1-1 mount-fail on tampered CURRENT
+  + P2-1 send DEK snapshot at init + scrub race-tolerant OK +
+  P2-2 wedged/RO guards on sweep/add/rotate + P3-1 spec invariant
+  comment + P3-3 super.h docstring + P3-4 helper docstring fixed
+  inline; P3-2 docs-with-substantive-commit + P3-5 extent_full.cfg
+  deferred per project conventions.**
   Phase 7 pre-work FastCDC `5cb8900` + R27 close `a2ffd38`.
-  Pending: CAS / reflinks (Phase 7 §10.1, §10.4); per-dataset DEKs;
-  repair log persistence; truncate partial-extent split.
+  Pending: CAS / reflinks (Phase 7 §10.1, §10.4);
+  repair log persistence; truncate `_locked` atomicity refactor.
 - **Tests**: 33 suites × (default + ASan + TSan, serial) green
-  (P7-9 grows test_fs 20 → 26 with six new truncate tests).
+  (P7-10 grows test_fs 26 → 31 with four new per-dataset DEK
+  tests + R42 P2-2 wedged/RO refuse test; test_keyschema_rotate
+  15 → 17 with two new root-DEK tests).
   test_sync_multi 42; test_pool 48; test_scrub 34 (30 + 4 P7-6
   replica-walk); test_alloc 32; test_cdc 12; test_dataset 57;
   test_snapshot 41; test_sync 24;
   test_extent_index 51 (32 in-RAM + 6 persist + 4 lookup_by_paddr +
-  9 P7-6 multi-replica); test_fs 26 (P7-9: 6 truncate tests
-  covering crossing-shrink, boundary no-op, truncate-to-zero,
-  past-EOF no-op, snapshot dead-list routing, args validation);
+  9 P7-6 multi-replica); test_fs 31 (P7-10: 4 per-dataset DEK
+  tests covering rotation-roundtrip, sweep-refuses-with-refs,
+  sweep-after-overwrite-drops-ref, unprovisioned-ds-refused;
+  R42 P2-2: keyschema-mutators-refuse-on-RO);
   test_send_recv 13 (4 arg validation + 1 full-send roundtrip +
   1 incremental + 1 swap-rejection + 1 equal-extent_txg + 5
   wire/state-machine error paths).

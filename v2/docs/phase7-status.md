@@ -185,6 +185,81 @@ into the CAS tier (which DOES need P6) is a separate concern.
       gen filter is best-effort because `snapshot.created_txg` and
       `sync.current_gen` are independent counters — closed in P7-8.
       No format break in P7-7; STM_UB_VERSION stays at 13.
+- [x] **P7-10 per-dataset DEKs** — landed at `a3610f2`;
+      R42 close `394150a` (0 P0 + 1 P1 + 2 P2 + 5 P3 — P1-1
+      mount-fail on tampered CURRENT for any dataset_id (was only
+      pool (0,0) pre-fix, exposing a runtime DoS surface specific
+      to P7-10's load-bearing per-dataset CURRENTs); P2-1a send
+      now snapshots a (key_id → DEK) map at stm_send_init so
+      concurrent rotate+overwrite+sweep can't poison emit;
+      P2-1b scrub cb classifies missing-DEK as OK (race
+      tolerance, not corruption); P2-1c misleading send.c comment
+      rewritten; P2-2 wedged/RO guards on sweep + add_dataset_key
+      + rotate_dataset_key (sweep mutates the DEK map; symmetric
+      guards added to add/rotate); P3-1 extent.tla gains
+      NonceUniquenessIndependentOfKey doc-shaped invariant
+      recording the allocator-freshness composition; P3-3 super.h
+      v15 docstring rewritten to accurately describe the
+      uberblock-version check (NOT extent-value-layer) defense
+      + tamper-then-mount runtime DoS posture; P3-4
+      sync_resolve_current_dek_locked docstring documents the
+      write-side-only contract + caller wedged/RO obligation.
+      P3-2 (docs-with-substantive-commit) deferred per
+      project's three-commit pattern; P3-5 (extent_full.cfg
+      bumped MaxKeyIds × bumped MaxFileBlocks × bumped MaxPaddrs)
+      deferred as tractability trade-off / nightly CI candidate).
+      Wires the keyschema layer's per-dataset DEKs
+      (P4-4c) into the extent write/read paths. Every extent now
+      carries a `key_id` field naming which DEK in the dataset's
+      keyschema decrypts it; sync resolves DEK via
+      `(dataset_id, key_id)` instead of using `metadata_key`.
+      `stm_sync_create` auto-installs the root dataset's DEK at
+      format time as keyschema entry `(1, 0, CURRENT)` alongside
+      the pool metadata key `(0, 0)`. The production scrub β cb
+      (P7-5) and send/recv (P7-7) pick the DEK by the extent's
+      stamped `key_id` — RETIRED keys remain reachable so
+      pre-rotation extents stay decryptable; the receiver
+      re-encrypts under its own pool's CURRENT DEK for the target
+      dataset. `stm_sync_keyschema_sweep` walks the extent index
+      and refuses to prune any RETIRED key with live extent
+      references (closes the long-standing P4-4c TODO; maps to
+      key_schema.tla::PruneSafety). Format break STM_UB_VERSION
+      14 → 15: extent on-disk value's offset-56 slot — the
+      always-zero `xxh` field in v13/v14 — is repurposed for
+      `key_id` (le64); EX_VAL_LEN stays 64. v14 pools fail at the
+      uberblock version check. Spec extension:
+      `extent.tla::ExtentRec` gains `key_id ∈ KeyIds`;
+      Write/Overwrite/Truncate stamp it. `extent.cfg` holds
+      `MaxKeyIds=1` to preserve the P7-9 partial-shrink coverage
+      at 838164 distinct states; new `extent_keyids.cfg` runs
+      MaxKeyIds=2 at the pre-P7-9 bound (67304 distinct states;
+      5s wall) so spanning-rotation scenarios — distinct extents
+      coexisting under distinct key_ids — are realized in TLC.
+      All 4 buggy extent cfgs still violate as expected.
+      C surface: new private helper `sync_resolve_current_dek_locked`
+      (looks up `keyschema_lookup_current` + `sync_dek_find` under
+      s->lock); `stm_extent_write` / `_overwrite` signatures gain
+      `uint64_t key_id`; in-RAM `stm_extent_record` gains `key_id`;
+      `ex_encode_value` / `ex_decode_value` round-trip key_id
+      through the on-disk envelope. The scrub β cb takes s->lock
+      briefly to look up the DEK by `(rec.dataset_id, rec.key_id)`
+      — lock-order `sc.lock → pool.rdlock → s.lock` is symmetric
+      with `stm_sync_set_scrub_durable_bytes`. Plaintext hygiene:
+      every fresh DEK is copied to a stack-local 32-byte buffer
+      and `stm_ct_memzero`'d on every exit path of write/read/scrub/
+      send. Tests: test_keyschema_rotate 15 → 17 (root DEK auto-
+      installed at create, root DEK persists across mount); test_fs
+      26 → 30 (per-dataset DEK rotation roundtrip with kept-decryption
+      under RETIRED keys, sweep refuses prune with extent refs,
+      sweep succeeds after overwrite drops ref, unprovisioned ds
+      refused with STM_ENOENT); test_extent_index persist roundtrip
+      extended with distinct key_ids verifying field round-trip;
+      test_pool STM_UB_VERSION assertion bumped 14 → 15. Mechanical:
+      tests using non-root dataset ids now use ds=1 (root) since
+      the fs layer doesn't yet expose a `fs_create_dataset` that
+      bundles dataset_index + keyschema provisioning — that
+      integration is a future chunk. 33 ctest suites green default
+      + ASan + TSan in isolated runs.
 - [x] **P7-9 truncate partial-extent split** — landed at
       `ad95a5d`; R41 close `5530a0e` (0 P0 + 0 P1 + 0 P2 + 5 P3
       — P3-3 strict dead-list count assertion + P3-4 TLC bound
