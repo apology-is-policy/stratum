@@ -148,6 +148,30 @@ into the CAS tier (which DOES need P6) is a separate concern.
       P7-4 tests covering roundtrip / hole / args / COW with-snap
       asserting dead_list_count 0→1 / COW without-snap / cross-
       mount durability / RO blocks / multi-extent).
+- [x] **P7-6 replica-list extension** — landed at `<TBD-substantive>`;
+      R38 close `<TBD-close>`. Format break v12 → v13: extent
+      record value layout grows 32B → 64B with up to 4 replica
+      paddr slots per ARCH §11.6.1. extent.tla extended with
+      `replicas` field, `MaxReplicasPerExtent` constant, and
+      `LiveReplicasDisjoint` + `ReplicasNonEmpty` +
+      `ReplicaCountBounded` invariants; new buggy demo
+      `extent_replica_collision_buggy.cfg`. C impl: `stm_extent_record`
+      grows; `stm_extent_write` / `_overwrite` API takes
+      `(paddrs, n_paddrs)`; `stm_extent_lookup_by_paddr` scans full
+      replica set; encode/decode validates within-set distinctness
+      + sentinel-zero unused slots. Sync layer: `stm_sync_write_extent`
+      reserves N=mirror_n replicas across N distinct devices,
+      encrypts ONCE under (replicas[0], gen) and writes bytewise-
+      identical ciphertext+tag to each replica's paddr;
+      `stm_sync_read_extent` walks replicas (first AEAD-OK wins);
+      `sync_scrub_verify_cb` realizes bptr.tla's full ScanRead ×
+      RewriteReplica machine — picks first OK source, rewrites
+      non-OK replicas, verify-back-reads each, classifies
+      OK / REPAIRED / UNREPAIRABLE per
+      bptr.tla::ResultClassification. test_extent_index 42 → 51
+      (9 P7-6 multi-replica tests); test_scrub 30 → 34 (4 P7-6
+      replica-walk tests including end-to-end repair). Spec posture
+      20 / 23 / 23.
 - [x] **P7-5 production scrub cb** — landed at `38e6799`;
       R37 close `fc5f619` (0 P0 / 0 P1 / 3 P2 / 3 P3 — P2-1 (cb
       transient-error overload) + P2-2 (cb concurrency caveat

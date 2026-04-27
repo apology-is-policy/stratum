@@ -38,12 +38,15 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `38e6799` (**P7-5 production scrub cb** — paddr→bptr
-  resolver via extent walk; new `stm_extent_lookup_by_paddr` +
-  `stm_sync_scrub_install_production_cb`; AEAD-decrypt-based β cb
-  maps to bptr.tla's single-replica corner). Phase 5 tagged
-  `phase-5-complete` at `461e68e`. Spec posture: **20 modules /
-  23 fixed configs / 22 buggy demos** (no spec changes in P7-5).
+- **Tip**: `<TBD-P7-6-fixup>` (**P7-6 replica-list extension** —
+  extent records grow 32B → 64B with up to 4 replica paddrs;
+  `stm_sync_write_extent` allocates N replicas across N devices;
+  scrub β cb walks replicas + repairs corrupt ones per bptr.tla's
+  full `ScanRead` × `RewriteReplica` matrix; `STM_UB_VERSION`
+  12 → 13). Phase 5 tagged `phase-5-complete` at `461e68e`.
+  Spec posture: **20 modules / 23 fixed configs / 23 buggy demos**
+  (extent.tla extended with `replicas` field + `LiveReplicasDisjoint`
+  invariant; new `extent_replica_collision_buggy.cfg`).
 - **Phases**: 1–5 complete; Phase 6 namespace layer feature-
   complete; **Phase 7 progressing**.
   Spec scaffolds: P6-1 (bptr.tla) `032db86`; P6-2 (dataset.tla)
@@ -62,26 +65,38 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   sync_drop_paddr_locked composes extent.tla::Overwrite +
   dead_list.tla::OverwriteBlock + allocator.tla::Free;
   advance_txg per sync_commit (R35 forward note acted on).
-  **P7-5 production scrub cb `38e6799` (this commit) — new
-  `stm_extent_lookup_by_paddr` (extent.h + extent_index.c)
-  + `stm_sync_scrub_install_production_cb` (sync.h + sync.c).
-  cb resolves paddr → live extent, AEAD-decrypts ciphertext+tag,
-  returns OK on tag-pass / UNREPAIRABLE on tag-fail. Mid-extent
-  paddrs + non-extent allocs (metadata, bootstrap) → OK trivially.
-  Maps to bptr.tla's NReplicas=1 corner; full replica-walk awaits
-  extent record's replica-list extension. R37 close `fc5f619`**.
+  P7-5 production scrub cb `38e6799` + R37 close `fc5f619` —
+  paddr→bptr resolver; AEAD-verify; mapped to bptr.tla's
+  NReplicas=1 corner.
+  **P7-6 replica-list extension `<TBD-substantive>` + R38 close
+  `<TBD-close>` (this commit) — extent record value layout grows
+  32B → 64B with up to 4 replica paddr slots (P7-6 / v13).
+  `stm_sync_write_extent` reserves N=mirror_n replicas across
+  N distinct devices, encrypts ONCE under (replicas[0], gen) and
+  copies bytewise-identical ciphertext+tag to every replica.
+  `stm_sync_read_extent` walks replicas (first AEAD-OK wins).
+  `sync_scrub_verify_cb` realizes bptr.tla's full ScanRead ×
+  RewriteReplica matrix: per-replica csum-gate, pick first OK
+  source, rewrite non-OK replicas, verify writeback.
+  STM_UB_VERSION 12 → 13. Spec extension: extent.tla gains
+  `replicas` field, `MaxReplicasPerExtent` constant, and
+  `LiveReplicasDisjoint` + `ReplicasNonEmpty` +
+  `ReplicaCountBounded` invariants; new buggy demo
+  `extent_replica_collision_buggy.cfg`**.
   Phase 7 pre-work FastCDC `5cb8900` + R27 close `a2ffd38`.
-  Pending: CAS / send-recv / reflinks (Phase 7 §10.1+); full
-  replica-walk in scrub cb (post-MVP).
+  Pending: CAS / send-recv / reflinks (Phase 7 §10.1+); per-
+  dataset DEKs.
 - **Tests**: 32 suites × (default + ASan + TSan, serial) green.
   test_sync_multi 42; test_pool 48; test_scrub 30; test_alloc 32;
   test_cdc 12; test_dataset 57; test_snapshot 41; test_sync 24;
-  test_extent_index 42 (32 in-RAM + 6 persist + 4 lookup_by_paddr);
-  test_fs 20 (9 lifecycle + 8 P7-4 fs_io + 3 P7-5 scrub_cb).
+  test_extent_index 51 (32 in-RAM + 6 persist + 4 lookup_by_paddr +
+  9 P7-6 multi-replica); test_fs 20; test_scrub 34 (30 prior + 4
+  P7-6 replica-walk).
 - **Specs**: 20 TLA+ modules clean (23 fixed configs: legacy +
   scrub_beta + scrub_durable + scrub_beta_durable + bptr +
   dataset + snapshot + property + clone + dead_list + extent) +
-  22 buggy-demo configs fire as expected.
+  23 buggy-demo configs fire as expected (extent_replica_collision_buggy
+  added in P7-6).
 - **LOC**: ~32 KLOC across 24 src/ modules (extent module gains
   `extent_index.c` alongside the Phase 4 `extent.c` AEAD wrapper)
   + 28 public headers.

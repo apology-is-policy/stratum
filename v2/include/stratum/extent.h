@@ -157,20 +157,37 @@ stm_status stm_extent_decrypt(stm_aead_mode mode,
  * (cb-from-iter reentrancy) abort with EDEADLK.
  * ========================================================================= */
 
+/* Maximum number of replica paddrs per extent (P7-6 / v13). Sized at
+ * 4 to comfortably cover mirror-N pools up to N=4 without a record
+ * format change; production mirror configs are typically N ∈ {2, 3}.
+ * The on-disk format reserves all 4 slots regardless of n_replicas;
+ * unused slots store 0 (sentinel). */
+#define STM_EXTENT_MAX_REPLICAS  4u
+
 /*
  * Per-extent record. Mirrors ARCH §11.6.1 stm_extent_v2 in spirit —
- * stores the modeled fields (ds, ino, off, len, paddr, gen) plus the
- * paddr-encoded device id. Compression / xxh fields are deferred to
- * the persistence chunk (P7-3); the in-RAM MVP only carries the
- * logical-correctness fields modeled by extent.tla.
+ * stores the modeled fields (ds, ino, off, len, replicas, gen). The
+ * `paddrs[0..n_replicas-1]` array carries every replica paddr (each
+ * on a distinct device per the pool's redundancy profile); the
+ * higher slots `[n_replicas..STM_EXTENT_MAX_REPLICAS)` are zero
+ * (sentinel) and do not refer to any block. Compression / xxh
+ * fields are stored on disk (P7-3 layout) but the in-RAM MVP only
+ * carries the logical-correctness fields modeled by extent.tla.
+ *
+ * Replication semantics (P7-6): each replica holds a bytewise-
+ * identical copy of the AEAD ciphertext+tag of the same plaintext,
+ * encrypted ONCE with the canonical nonce (paddrs[0], gen). The
+ * scrub β cb walks the replica array; on AEAD-tag failure at any
+ * replica, rewrites from a verified replica per bptr.tla.
  */
 typedef struct {
-    uint64_t dataset_id;          /* > 0 */
-    uint64_t ino;                 /* > 0 */
-    uint64_t off;                 /* byte offset within file */
-    uint64_t len;                 /* extent length in bytes; ≥ 1 */
-    uint64_t paddr;               /* (device_id<<48) | offset */
-    uint64_t gen;                 /* write_gen at encrypt; nonce uniqueness */
+    uint64_t dataset_id;                          /* > 0 */
+    uint64_t ino;                                 /* > 0 */
+    uint64_t off;                                 /* byte offset within file */
+    uint64_t len;                                 /* extent length in bytes; ≥ 1 */
+    uint8_t  n_replicas;                          /* 1..STM_EXTENT_MAX_REPLICAS */
+    uint64_t paddrs[STM_EXTENT_MAX_REPLICAS];     /* valid 0..n_replicas-1 */
+    uint64_t gen;                                 /* write_gen; nonce uniqueness */
 } stm_extent_record;
 
 struct stm_extent_index;
@@ -212,16 +229,23 @@ stm_status stm_extent_index_advance_txg(stm_extent_index *idx,
 
 /*
  * Insert a fresh extent for (`dataset_id`, `ino`) covering [`off`,
- * `off`+`len`) backed by `paddr`, stamped with `write_gen`. No
- * existing extent for (ds, ino) may overlap [off, off+len).
+ * `off`+`len`) backed by the replica set `paddrs[0..n_paddrs)`,
+ * stamped with `write_gen`. No existing extent for (ds, ino) may
+ * overlap [off, off+len). All paddrs in the new replica set must be
+ * fresh from any live extent's replica set (extent.tla::
+ * LiveReplicasDisjoint).
  *
  * Refusals:
  *   - dataset_id == 0 OR ino == 0 (STM_EINVAL).
  *   - len == 0 (STM_EINVAL — extent.tla::LengthPositive).
- *   - paddr == 0 (STM_EINVAL — reserved sentinel).
+ *   - n_paddrs < 1 OR n_paddrs > STM_EXTENT_MAX_REPLICAS (STM_EINVAL —
+ *     extent.tla::ReplicasNonEmpty / ReplicaCountBounded).
+ *   - any paddrs[i] == 0 (STM_EINVAL — reserved sentinel).
+ *   - any pair paddrs[i] == paddrs[j] for i != j (STM_EINVAL —
+ *     within-replica-set distinctness).
  *   - write_gen > current_txg (STM_EINVAL — extent.tla::BirthTxgBound).
- *   - paddr already used by a live extent (STM_EEXIST —
- *     extent.tla::PaddrFreshness, live interpretation).
+ *   - any paddrs[i] already used by a live extent's replica set
+ *     (STM_EEXIST — extent.tla::LiveReplicasDisjoint).
  *   - any existing live extent of (ds, ino) overlaps [off, off+len)
  *     (STM_EEXIST — extent.tla::NoOverlapWithinIno).
  *   - off + len overflows uint64 (STM_EOVERFLOW).
@@ -233,23 +257,27 @@ STM_MUST_USE
 stm_status stm_extent_write(stm_extent_index *idx,
                               uint64_t dataset_id, uint64_t ino,
                               uint64_t off, uint64_t len,
-                              uint64_t paddr, uint64_t write_gen);
+                              const uint64_t *paddrs, size_t n_paddrs,
+                              uint64_t write_gen);
 
 /*
  * COW overwrite: drop every live extent of (ds, ino) overlapping
- * [`off`, `off`+`len`), then insert a fresh extent backed by
- * `new_paddr` stamped with `write_gen`.
+ * [`off`, `off`+`len`), then insert a fresh extent backed by the
+ * replica set `new_paddrs[0..n_new_paddrs)` stamped with `write_gen`.
  *
  * Refusals: same as stm_extent_write, plus:
- *   - new_paddr equals the paddr of one of the to-be-dropped extents
- *     (cycle — caller bug). Refused with STM_EINVAL.
+ *   - any new_paddrs[i] equals any paddr in any to-be-dropped
+ *     extent's replica set (cycle — caller bug). Refused with
+ *     STM_EINVAL.
  *
  * On success:
- *   - *out_dropped_paddrs receives a malloc'd array of every dropped
- *     extent's paddr (caller owns; MUST `free()`). Caller MUST route
- *     each via `stm_snapshot_index_overwrite_block` (composes with
+ *   - *out_dropped_paddrs receives a malloc'd array of every paddr
+ *     in every dropped extent's replica set, flattened (caller owns;
+ *     MUST `free()`). Caller MUST route each via
+ *     `stm_snapshot_index_overwrite_block` (composes with
  *     dead_list.tla::OverwriteBlock).
- *   - *out_n_dropped is the array length.
+ *   - *out_n_dropped is the array length (sum of replica counts of
+ *     dropped extents).
  *   - When zero extents were dropped (overwrite into a hole),
  *     *out_dropped_paddrs is NULL and *out_n_dropped is 0.
  *
@@ -262,7 +290,9 @@ STM_MUST_USE
 stm_status stm_extent_overwrite(stm_extent_index *idx,
                                   uint64_t dataset_id, uint64_t ino,
                                   uint64_t off, uint64_t len,
-                                  uint64_t new_paddr, uint64_t write_gen,
+                                  const uint64_t *new_paddrs,
+                                  size_t n_new_paddrs,
+                                  uint64_t write_gen,
                                   uint64_t **out_dropped_paddrs,
                                   size_t *out_n_dropped);
 

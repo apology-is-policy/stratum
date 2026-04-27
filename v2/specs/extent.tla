@@ -11,6 +11,10 @@
 (*     `NoReuseInSameGen` is an allocator.tla concern. extent.tla treats    *)
 (*     paddrs as fresh from the allocator's perspective and focuses on the  *)
 (*     LOGICAL extent-tree invariants.                                       *)
+(*   see v2/specs/bptr.tla — replica-walk + verify + rewrite-bad protocol.  *)
+(*     extent.tla now models replica SETS per extent (P7-6); bptr.tla        *)
+(*     consumes one such set as its `InitialReplicaStates` input — the     *)
+(*     two specs compose at the C-impl boundary (sync_scrub_verify_cb).    *)
 (*                                                                           *)
 (* Scope of this spec:                                                       *)
 (*                                                                           *)
@@ -22,17 +26,38 @@
 (*   (ds, ino, off) must resolve to either exactly one extent or to a       *)
 (*   hole, never to ambiguous content.                                       *)
 (*                                                                           *)
+(*   Replication (P7-6): each extent carries a non-empty set of paddrs       *)
+(*   (`replicas`) — distinct allocator-fresh paddrs holding bytewise-        *)
+(*   identical AEAD ciphertext+tag of the same plaintext. The C impl        *)
+(*   encrypts once under a canonical replica's nonce (paddr_0, gen) and     *)
+(*   copies the ciphertext to every paddr in the set; bptr.tla's protocol   *)
+(*   then validates each replica independently (the AEAD-tag check is per-  *)
+(*   replica because each replica's stored bytes are independently subject  *)
+(*   to bit-rot). The spec models replicas as distinct paddrs (1..N where   *)
+(*   N ≤ MaxReplicasPerExtent); device placement is a pool-redundancy       *)
+(*   concern modeled separately.                                             *)
+(*                                                                           *)
 (*   Other captured invariants:                                              *)
 (*     LengthPositive   — every extent has length ≥ 1 (zero-length is       *)
 (*                         a hole, not an extent).                           *)
 (*     BirthTxgBound    — every extent's write_gen ≤ current_txg.            *)
 (*     AllExtentsInBounds — extent end offset ≤ MaxFileBlocks (no overflow*)
 (*                          past the modeled file size cap).                 *)
-(*     PaddrFreshness   — no two extents share a paddr at any time. The     *)
-(*                         `used_paddrs` set grows monotonically; allocated*)
-(*                         paddrs are never re-issued. Composes with       *)
-(*                         allocator.tla::NoReuseInSameGen to guarantee   *)
-(*                         (paddr, write_gen)-pair uniqueness end-to-end. *)
+(*     PaddrFreshness   — every paddr in any extent's replicas set is in    *)
+(*                         `used_paddrs`. The `used_paddrs` set grows       *)
+(*                         monotonically; allocated paddrs are never re-    *)
+(*                         issued. Composes with allocator.tla::            *)
+(*                         NoReuseInSameGen to guarantee (paddr, write_gen)-*)
+(*                         pair uniqueness end-to-end.                       *)
+(*     LiveReplicasDisjoint — no two LIVE extents share any replica paddr.  *)
+(*                         Stronger than PaddrFreshness because it directly *)
+(*                         pins the safety property the C impl needs:       *)
+(*                         allocator-fresh-paddr handout cannot collide     *)
+(*                         with any in-use replica.                          *)
+(*     ReplicasNonEmpty — every extent has at least one replica (one      *)
+(*                         active paddr).                                    *)
+(*     ReplicaCountBounded — every extent has at most MaxReplicasPerExtent *)
+(*                         replicas. Pins the on-disk slot count.            *)
 (*                                                                           *)
 (* Intentionally OUT OF SCOPE:                                               *)
 (*                                                                           *)
@@ -43,11 +68,15 @@
 (*   - Multi-device paddr stamping — `metadata_nonce.tla`.                  *)
 (*   - Snapshot capture / dead-list — `dead_list.tla`. extent.tla's        *)
 (*     Overwrite action is the C-impl trigger for dead_list.tla::          *)
-(*     OverwriteBlock; the composition is left to the C impl.              *)
+(*     OverwriteBlock; the composition is left to the C impl. With         *)
+(*     replicas, every dropped extent's REPLICA SET is routed in full       *)
+(*     (each replica paddr flows through OverwriteBlock independently).    *)
 (*   - Reflinks / refcount-bumps / cross-extent share — Phase 7 §10.4.     *)
 (*   - CAS / cold-tier extents — Phase 7 §10.1 (CAS tier, separate spec).  *)
 (*   - Coalescing — quality-of-implementation; correctness is preserved   *)
 (*     by NoOverlap regardless of whether adjacent extents coalesce.       *)
+(*   - Device-placement constraint (replicas should land on distinct       *)
+(*     redundancy domains) — modeled at the pool layer.                    *)
 (*                                                                           *)
 (* CONSTANTS:                                                                *)
 (*                                                                           *)
@@ -56,6 +85,7 @@
 (*   - MaxFileBlocks ≥ 1 — bound on file size (in extent-block units).     *)
 (*   - MaxPaddrs ≥ 1 — bound on paddr namespace.                            *)
 (*   - MaxTxg ≥ 1 — bound on transaction-group counter.                     *)
+(*   - MaxReplicasPerExtent ≥ 1 — upper bound on |extent.replicas|.        *)
 (*                                                                           *)
 (*   Buggy variants (FALSE in fixed config; TRUE in buggy demos). Each is *)
 (*   designed to fire in the bounded model:                                  *)
@@ -67,6 +97,10 @@
 (*                                                                           *)
 (*   - BuggyOverwriteForgetsDrop — Overwrite inserts the new extent       *)
 (*     without dropping the overlapping olds. NoOverlap fires.             *)
+(*                                                                           *)
+(*   - BuggyReplicaPaddrCollision (P7-6) — Write doesn't check that the    *)
+(*     new extent's replica set is disjoint from existing live extents'    *)
+(*     replicas. LiveReplicasDisjoint fires.                                 *)
 (***************************************************************************)
 
 EXTENDS Naturals, FiniteSets
@@ -77,18 +111,22 @@ CONSTANTS
     MaxFileBlocks,
     MaxPaddrs,
     MaxTxg,
+    MaxReplicasPerExtent,
     BuggyWriteAllowsOverlap,
     BuggyZeroLength,
-    BuggyOverwriteForgetsDrop
+    BuggyOverwriteForgetsDrop,
+    BuggyReplicaPaddrCollision
 
-ASSUME MaxDatasets   \in (Nat \ {0})
-ASSUME MaxInos       \in (Nat \ {0})
-ASSUME MaxFileBlocks \in (Nat \ {0})
-ASSUME MaxPaddrs     \in (Nat \ {0})
-ASSUME MaxTxg        \in (Nat \ {0})
-ASSUME BuggyWriteAllowsOverlap   \in BOOLEAN
-ASSUME BuggyZeroLength           \in BOOLEAN
-ASSUME BuggyOverwriteForgetsDrop \in BOOLEAN
+ASSUME MaxDatasets         \in (Nat \ {0})
+ASSUME MaxInos             \in (Nat \ {0})
+ASSUME MaxFileBlocks       \in (Nat \ {0})
+ASSUME MaxPaddrs           \in (Nat \ {0})
+ASSUME MaxTxg              \in (Nat \ {0})
+ASSUME MaxReplicasPerExtent \in (Nat \ {0})
+ASSUME BuggyWriteAllowsOverlap     \in BOOLEAN
+ASSUME BuggyZeroLength             \in BOOLEAN
+ASSUME BuggyOverwriteForgetsDrop   \in BOOLEAN
+ASSUME BuggyReplicaPaddrCollision  \in BOOLEAN
 
 DatasetIds  == 1..MaxDatasets
 InoIds      == 1..MaxInos
@@ -98,9 +136,15 @@ LengthsZ    == 0..MaxFileBlocks         \* including zero, used by BuggyZeroLeng
 Paddrs      == 1..MaxPaddrs
 Gens        == 0..MaxTxg
 
+\* Replica sets — non-empty subsets of Paddrs bounded by MaxReplicasPerExtent.
+ReplicaSets ==
+    { S \in SUBSET Paddrs :
+        /\ S /= {}
+        /\ Cardinality(S) <= MaxReplicasPerExtent }
+
 ExtentRec ==
     [ds: DatasetIds, ino: InoIds, off: FileOffsets, len: LengthsZ,
-     paddr: Paddrs, gen: Gens]
+     replicas: ReplicaSets, gen: Gens]
 
 VARIABLES
     extents,        \* SUBSET ExtentRec — the in-memory extent map.
@@ -139,55 +183,63 @@ OverlappingIn(ds, ino, off, len) ==
 (*                                                                           *)
 (* Preconditions:                                                            *)
 (*   - off + len ≤ MaxFileBlocks (no out-of-bounds).                          *)
-(*   - paddr ∉ used_paddrs (allocator gives fresh paddr).                    *)
+(*   - replicas ∈ ReplicaSets (non-empty, |·| ≤ MaxReplicasPerExtent).       *)
+(*   - replicas ∩ used_paddrs = {} (every replica is allocator-fresh).       *)
+(*     Subsumes the live-extent disjointness because used_paddrs is         *)
+(*     monotonic — any paddr in any live extent's replicas was added to    *)
+(*     used_paddrs when that extent was written. BuggyReplicaPaddrCollision *)
+(*     drops this check, modeling an allocator that hands out an in-use    *)
+(*     paddr or an extent-write path that bypasses the freshness gate.     *)
 (*   - len ≥ 1 unless BuggyZeroLength.                                       *)
 (*   - No overlap with existing (ds, ino) extents unless BuggyWriteAllows-  *)
 (*     Overlap.                                                               *)
 (*                                                                           *)
-(* Effect: insert extent stamped with current_txg. used_paddrs grows.       *)
+(* Effect: insert extent stamped with current_txg. used_paddrs grows by      *)
+(* `replicas`.                                                                *)
 (***************************************************************************)
-Write(ds, ino, off, len, paddr) ==
+Write(ds, ino, off, len, replicas) ==
     /\ ds \in DatasetIds
     /\ ino \in InoIds
     /\ off \in FileOffsets
     /\ len \in LengthsZ
     /\ off + len <= MaxFileBlocks
-    /\ paddr \in Paddrs
-    /\ paddr \notin used_paddrs
+    /\ replicas \in ReplicaSets
+    /\ \/ BuggyReplicaPaddrCollision
+       \/ replicas \cap used_paddrs = {}     \* allocator freshness
     /\ \/ BuggyZeroLength
        \/ len >= 1
     /\ \/ BuggyWriteAllowsOverlap
        \/ OverlappingIn(ds, ino, off, len) = {}
     /\ extents' = extents \union
         {[ds |-> ds, ino |-> ino, off |-> off, len |-> len,
-          paddr |-> paddr, gen |-> current_txg]}
-    /\ used_paddrs' = used_paddrs \union {paddr}
+          replicas |-> replicas, gen |-> current_txg]}
+    /\ used_paddrs' = used_paddrs \union replicas
     /\ UNCHANGED current_txg
 
 (***************************************************************************)
 (* Overwrite — COW: drop the overlapping olds, insert a fresh extent.       *)
 (*                                                                           *)
 (* This is the action that the C-impl extent-write path will couple with    *)
-(* dead_list.tla::OverwriteBlock — for each dropped extent, the snapshot   *)
-(* layer's `stm_snapshot_index_overwrite_block(paddr)` is invoked. extent. *)
-(* tla doesn't model that composition; it focuses on the LOGICAL drop.    *)
+(* dead_list.tla::OverwriteBlock — for each dropped extent, EVERY paddr in *)
+(* its replica set is routed through `stm_snapshot_index_overwrite_block`. *)
 (***************************************************************************)
-Overwrite(ds, ino, off, len, new_paddr) ==
+Overwrite(ds, ino, off, len, new_replicas) ==
     /\ ds \in DatasetIds
     /\ ino \in InoIds
     /\ off \in FileOffsets
     /\ len \in LengthsPos                  \* Overwrite always len ≥ 1.
     /\ off + len <= MaxFileBlocks
-    /\ new_paddr \in Paddrs
-    /\ new_paddr \notin used_paddrs
+    /\ new_replicas \in ReplicaSets
+    /\ \/ BuggyReplicaPaddrCollision
+       \/ new_replicas \cap used_paddrs = {}
     /\ extents' =
          (IF BuggyOverwriteForgetsDrop
           THEN extents
           ELSE extents \ OverlappingIn(ds, ino, off, len))
          \union
          {[ds |-> ds, ino |-> ino, off |-> off, len |-> len,
-           paddr |-> new_paddr, gen |-> current_txg]}
-    /\ used_paddrs' = used_paddrs \union {new_paddr}
+           replicas |-> new_replicas, gen |-> current_txg]}
+    /\ used_paddrs' = used_paddrs \union new_replicas
     /\ UNCHANGED current_txg
 
 (***************************************************************************)
@@ -227,10 +279,11 @@ AdvanceTxg ==
 (***************************************************************************)
 Next ==
     \/ \E ds \in DatasetIds, ino \in InoIds, off \in FileOffsets,
-        len \in LengthsZ, paddr \in Paddrs : Write(ds, ino, off, len, paddr)
+        len \in LengthsZ, replicas \in ReplicaSets :
+            Write(ds, ino, off, len, replicas)
     \/ \E ds \in DatasetIds, ino \in InoIds, off \in FileOffsets,
-        len \in LengthsPos, paddr \in Paddrs :
-            Overwrite(ds, ino, off, len, paddr)
+        len \in LengthsPos, replicas \in ReplicaSets :
+            Overwrite(ds, ino, off, len, replicas)
     \/ \E ds \in DatasetIds, ino \in InoIds, n \in 0..MaxFileBlocks :
         Truncate(ds, ino, n)
     \/ \E ds \in DatasetIds, ino \in InoIds : DeleteFile(ds, ino)
@@ -270,13 +323,32 @@ BirthTxgBound ==
 AllExtentsInBounds ==
     \A e \in extents : e.off + e.len <= MaxFileBlocks
 
-(* PaddrFreshness — every extent's paddr is in `used_paddrs`. Composed   *)
-(* with the monotonic-grow property of `used_paddrs` and the `paddr ∉    *)
-(* used_paddrs` precondition on Write/Overwrite, this implies no two      *)
-(* extents share a paddr at any time. End-to-end nonce uniqueness        *)
-(* (paddr, gen) follows from this combined with allocator.tla.            *)
+(* ReplicasNonEmpty — every extent has at least one replica.              *)
+ReplicasNonEmpty ==
+    \A e \in extents : e.replicas /= {}
+
+(* ReplicaCountBounded — every extent has at most MaxReplicasPerExtent     *)
+(* replica paddrs. Pins the on-disk slot count for the C impl.             *)
+ReplicaCountBounded ==
+    \A e \in extents : Cardinality(e.replicas) <= MaxReplicasPerExtent
+
+(* PaddrFreshness — every paddr in any extent's replicas is in            *)
+(* `used_paddrs`. Composed with the monotonic-grow property of            *)
+(* `used_paddrs` and the `replicas ∩ used_paddrs = {}` precondition on    *)
+(* Write/Overwrite, this implies allocator-issued paddrs are never        *)
+(* re-issued. End-to-end nonce uniqueness (paddr, gen) follows from this  *)
+(* combined with allocator.tla.                                            *)
 PaddrFreshness ==
-    \A e \in extents : e.paddr \in used_paddrs
+    \A e \in extents : e.replicas \subseteq used_paddrs
+
+(* LiveReplicasDisjoint — no two LIVE extents share any replica paddr.    *)
+(* Stronger than PaddrFreshness in that it directly pins the cross-extent *)
+(* invariant the C impl needs: a paddr in any live extent's replicas      *)
+(* cannot appear in any other live extent's replicas. Buggy demo          *)
+(* `extent_replica_collision_buggy.cfg` fires this.                       *)
+LiveReplicasDisjoint ==
+    \A e1, e2 \in extents :
+        e1 = e2 \/ e1.replicas \cap e2.replicas = {}
 
 Invariants ==
     /\ TypeOK
@@ -284,6 +356,9 @@ Invariants ==
     /\ LengthPositive
     /\ BirthTxgBound
     /\ AllExtentsInBounds
+    /\ ReplicasNonEmpty
+    /\ ReplicaCountBounded
     /\ PaddrFreshness
+    /\ LiveReplicasDisjoint
 
 ================================================================================

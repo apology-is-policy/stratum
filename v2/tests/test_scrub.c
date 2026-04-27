@@ -1729,4 +1729,244 @@ STM_TEST(scrub_cb_invoked_across_multiple_devices) {
     }
 }
 
+/* ========================================================================= */
+/* P7-6 production scrub cb — multi-replica walk + repair tests.              */
+/* ========================================================================= */
+
+#include <fcntl.h>
+#include <stratum/extent.h>
+#include <sys/types.h>
+
+/* Build a mirror-2 pool, write a single extent (which gets replicated
+ * to both devices), return everything via out-args. Caller MUST clean
+ * up via mirror2_extent_teardown. */
+typedef struct {
+    char       paths[MDEV][256];
+    stm_bdev  *bds[MDEV];
+    stm_pool  *pool;
+    stm_alloc *a0;
+    stm_alloc *a1;
+    stm_sync  *s;
+    stm_extent_record extent_rec;   /* the single extent we wrote */
+} mirror2_extent_fx;
+
+static void mirror2_extent_setup(mirror2_extent_fx *fx, const char *tag) {
+    for (size_t i = 0; i < MDEV; i++) {
+        snprintf(fx->paths[i], sizeof fx->paths[i],
+                 "/tmp/stm_v2_scrub_p7_6_%s_%d_%zu.bin", tag, (int)getpid(), i);
+        unlink(fx->paths[i]);
+        stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+        STM_ASSERT_OK(stm_bdev_open(fx->paths[i], &bo, &fx->bds[i]));
+        STM_ASSERT_OK(stm_bdev_resize(fx->bds[i], TEST_DEVICE_BYTES));
+    }
+
+    const uint64_t duuid0[2] = { 0xAAA0, 0xBBB0 };
+    const uint64_t duuid1[2] = { 0xAAA1, 0xBBB1 };
+    stm_pool_open_opts opts;
+    memset(&opts, 0, sizeof opts);
+    opts.pool_uuid[0] = POOL_UUID[0];
+    opts.pool_uuid[1] = POOL_UUID[1];
+    opts.device_count = MDEV;
+    opts.devices[0].uuid[0]    = duuid0[0];
+    opts.devices[0].uuid[1]    = duuid0[1];
+    opts.devices[0].size_bytes = TEST_DEVICE_BYTES;
+    opts.devices[0].role       = STM_DEV_ROLE_DATA;
+    opts.devices[0].class_     = STM_DEV_CLASS_SSD;
+    opts.devices[0].state      = STM_DEV_STATE_ONLINE;
+    opts.devices[0].bdev       = fx->bds[0];
+    opts.devices[1].uuid[0]    = duuid1[0];
+    opts.devices[1].uuid[1]    = duuid1[1];
+    opts.devices[1].size_bytes = TEST_DEVICE_BYTES;
+    opts.devices[1].role       = STM_DEV_ROLE_DATA;
+    opts.devices[1].class_     = STM_DEV_CLASS_SSD;
+    opts.devices[1].state      = STM_DEV_STATE_ONLINE;
+    opts.devices[1].bdev       = fx->bds[1];
+    STM_ASSERT_OK(stm_pool_open(&opts, &fx->pool));
+
+    STM_ASSERT_OK(stm_alloc_create(fx->bds[0], POOL_UUID, duuid0,
+                                     TEST_BOOTSTRAP_BYTES, &fx->a0));
+    stm_redundancy_profile prof = { STM_RED_MIRROR, (uint8_t)MDEV };
+    STM_ASSERT_OK(stm_sync_create(fx->pool, fx->a0, make_wk(), &prof, &fx->s));
+
+    STM_ASSERT_OK(stm_alloc_create(fx->bds[1], POOL_UUID, duuid1,
+                                     TEST_BOOTSTRAP_BYTES, &fx->a1));
+    STM_ASSERT_OK(stm_alloc_set_device_id(fx->a1, 1));
+    STM_ASSERT_OK(stm_sync_attach_alloc(fx->s, 1, fx->a1));
+
+    /* Initial commit so allocators can settle. */
+    STM_ASSERT_OK(stm_sync_commit(fx->s));
+
+    /* Write a single 4 KiB extent. Goes through stm_sync_write_extent
+     * which now allocates 2 replicas. */
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)(i & 0xFF);
+    STM_ASSERT_OK(stm_sync_write_extent(fx->s, /*ds=*/1, /*ino=*/1,
+                                          /*off=*/0, plain, sizeof plain));
+
+    /* Snapshot the resulting record for later access. */
+    stm_extent_index *eidx = stm_sync_extent_index(fx->s);
+    STM_ASSERT_TRUE(eidx != NULL);
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &fx->extent_rec));
+    STM_ASSERT_EQ((int)fx->extent_rec.n_replicas, 2);
+}
+
+static void mirror2_extent_teardown(mirror2_extent_fx *fx) {
+    stm_sync_close(fx->s);
+    stm_alloc_close(fx->a1);
+    stm_alloc_close(fx->a0);
+    stm_pool_close(fx->pool);
+    for (size_t i = 0; i < MDEV; i++) {
+        stm_bdev_close(fx->bds[i]);
+        unlink(fx->paths[i]);
+    }
+}
+
+/* Direct-pwrite garbage at the extent's byte offset on the given
+ * backing file. Bypasses the bdev/pool layer; emulates on-disk
+ * bit-rot. */
+static void corrupt_replica_on_disk(const char *path, uint64_t paddr) {
+    int cfd = open(path, O_WRONLY);
+    STM_ASSERT(cfd >= 0);
+    uint8_t garbage[4096];
+    memset(garbage, 0xFE, sizeof garbage);
+    uint64_t byte_off = (uint64_t)stm_paddr_offset(paddr) * STM_UB_SIZE;
+    ssize_t n = pwrite(cfd, garbage, sizeof garbage, (off_t)byte_off);
+    STM_ASSERT_EQ((size_t)n, sizeof garbage);
+    STM_ASSERT_EQ(close(cfd), 0);
+}
+
+/* Run scrub to completion. */
+static void run_scrub_done(stm_scrub *sc) {
+    for (int i = 0; i < 4096; i++) {
+        STM_ASSERT_OK(stm_scrub_step(sc));
+        stm_scrub_status st;
+        STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
+        if (st.state == STM_SCRUB_STATE_COMPLETED) return;
+    }
+    STM_ASSERT(false);
+}
+
+STM_TEST(scrub_p7_6_replica_walk_returns_ok_when_all_clean) {
+    /* All replicas healthy → cb returns OK; no rewrite happens. */
+    mirror2_extent_fx fx;
+    mirror2_extent_setup(&fx, "ok");
+
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(fx.s, &sc));
+    STM_ASSERT_OK(stm_sync_scrub_install_production_cb(fx.s, sc));
+    STM_ASSERT_OK(stm_scrub_start(sc));
+    run_scrub_done(sc);
+
+    stm_scrub_status st;
+    STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
+    STM_ASSERT_EQ((int)st.state,         (int)STM_SCRUB_STATE_COMPLETED);
+    STM_ASSERT_EQ(st.blocks_failed,      0u);
+    STM_ASSERT_EQ(st.blocks_unrepairable,0u);
+    STM_ASSERT_EQ(st.blocks_repaired,    0u);
+    STM_ASSERT(st.blocks_verified > 0);
+
+    stm_scrub_close(sc);
+    mirror2_extent_teardown(&fx);
+}
+
+STM_TEST(scrub_p7_6_replica_walk_repairs_one_corrupt_replica) {
+    /* Mirror-2 pool. Corrupt replica 1 (device 1) on disk. Scrub's
+     * cb walks both replicas, finds replica 0 OK + replica 1 fails
+     * AEAD, rewrites replica 1 from replica 0, verifies-back, returns
+     * REPAIRED. Post-scrub, both replicas must AEAD-verify. */
+    mirror2_extent_fx fx;
+    mirror2_extent_setup(&fx, "repair");
+
+    /* The extent's two replica paddrs. paddrs[0] on device 0,
+     * paddrs[1] on device 1. */
+    STM_ASSERT_EQ(stm_paddr_device(fx.extent_rec.paddrs[0]), (uint16_t)0);
+    STM_ASSERT_EQ(stm_paddr_device(fx.extent_rec.paddrs[1]), (uint16_t)1);
+
+    /* Corrupt replica 1 directly on disk. */
+    corrupt_replica_on_disk(fx.paths[1], fx.extent_rec.paddrs[1]);
+
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(fx.s, &sc));
+    STM_ASSERT_OK(stm_sync_scrub_install_production_cb(fx.s, sc));
+    STM_ASSERT_OK(stm_scrub_start(sc));
+    run_scrub_done(sc);
+
+    stm_scrub_status st;
+    STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
+    STM_ASSERT_EQ((int)st.state,         (int)STM_SCRUB_STATE_COMPLETED);
+    STM_ASSERT_EQ(st.blocks_failed,      0u);
+    STM_ASSERT_EQ(st.blocks_unrepairable,0u);
+    /* Exactly one extent base reported REPAIRED. */
+    STM_ASSERT_EQ(st.blocks_repaired,    1u);
+
+    /* Post-scrub: read the extent back. Both replicas should now
+     * AEAD-verify; stm_sync_read_extent picks the first OK. */
+    uint8_t out[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_sync_read_extent(fx.s, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_EQ(got, (size_t)4096);
+    /* Plaintext we wrote: i & 0xFF. */
+    for (size_t i = 0; i < sizeof out; i++) {
+        STM_ASSERT_EQ((int)out[i], (int)(i & 0xFF));
+    }
+
+    stm_scrub_close(sc);
+    mirror2_extent_teardown(&fx);
+}
+
+STM_TEST(scrub_p7_6_replica_walk_unrepairable_when_all_corrupt) {
+    /* Corrupt BOTH replicas on disk. cb walks both, finds neither
+     * AEAD-verifies, picks no source → UNREPAIRABLE. No rewrite
+     * happens (would land bad-on-bad). */
+    mirror2_extent_fx fx;
+    mirror2_extent_setup(&fx, "all_corrupt");
+
+    corrupt_replica_on_disk(fx.paths[0], fx.extent_rec.paddrs[0]);
+    corrupt_replica_on_disk(fx.paths[1], fx.extent_rec.paddrs[1]);
+
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(fx.s, &sc));
+    STM_ASSERT_OK(stm_sync_scrub_install_production_cb(fx.s, sc));
+    STM_ASSERT_OK(stm_scrub_start(sc));
+    run_scrub_done(sc);
+
+    stm_scrub_status st;
+    STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
+    STM_ASSERT_EQ((int)st.state,         (int)STM_SCRUB_STATE_COMPLETED);
+    STM_ASSERT_EQ(st.blocks_failed,      0u);
+    STM_ASSERT_EQ(st.blocks_repaired,    0u);
+    /* The extent's base paddr charges UNREPAIRABLE. */
+    STM_ASSERT(st.blocks_unrepairable >= 1u);
+
+    /* Read returns STM_EBADTAG (last error from the read replica
+     * walk; bptr.tla::NoOriginalOKMeansUnrepairable). */
+    uint8_t out[4096] = {0};
+    size_t got = 0;
+    stm_status rs = stm_sync_read_extent(fx.s, 1, 1, 0, out, sizeof out, &got);
+    STM_ASSERT_ERR(rs, STM_EBADTAG);
+
+    stm_scrub_close(sc);
+    mirror2_extent_teardown(&fx);
+}
+
+STM_TEST(scrub_p7_6_read_path_falls_back_to_healthy_replica) {
+    /* The read path itself walks replicas (not just scrub). Corrupt
+     * replica 0; stm_sync_read_extent should still succeed by reading
+     * replica 1. */
+    mirror2_extent_fx fx;
+    mirror2_extent_setup(&fx, "read_fallback");
+
+    corrupt_replica_on_disk(fx.paths[0], fx.extent_rec.paddrs[0]);
+
+    uint8_t out[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_sync_read_extent(fx.s, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_EQ(got, (size_t)4096);
+    for (size_t i = 0; i < sizeof out; i++) {
+        STM_ASSERT_EQ((int)out[i], (int)(i & 0xFF));
+    }
+
+    mirror2_extent_teardown(&fx);
+}
+
 STM_TEST_MAIN("scrub")

@@ -193,16 +193,28 @@ by `(ino, type, offset)`; the unified MVP here is structurally
 compatible (no semantic divergence). Migration to per-file or per-
 dataset trees is incremental.
 
-### Value (32 bytes per ARCH §11.6.1 stm_extent_v2)
+### Value (64 bytes; P7-6 / v13 layout)
 
 ```
 off  size  field
-  0    8   paddr            (le64)
-  8    8   write_gen        (le64)
- 16    4   dlen             (le32) — logical byte length
- 20    4   clen_and_comp    (le32) — low 24: stored length; high 8: comp algo
- 24    8   xxh              (le64) — 0 in MVP (AEAD tag is integrity)
+  0    1   n_replicas       (u8)   — 1..STM_EXTENT_MAX_REPLICAS=4
+  1    7   reserved         (zero) — anti-tamper
+  8    8   paddr_0          (le64) — always non-zero
+ 16    8   paddr_1          (le64) — 0 if n_replicas < 2
+ 24    8   paddr_2          (le64) — 0 if n_replicas < 3
+ 32    8   paddr_3          (le64) — 0 if n_replicas < 4
+ 40    8   write_gen        (le64)
+ 48    4   dlen             (le32) — logical byte length
+ 52    4   clen_and_comp    (le32) — low 24: stored length; high 8: comp algo
+ 56    8   xxh              (le64) — 0 in MVP (AEAD tag is integrity)
 ```
+
+Each extent stores up to `STM_EXTENT_MAX_REPLICAS=4` paddrs; unused
+slots are zero (sentinel). `paddrs[0]` is the canonical "base" paddr
+used for AEAD nonce (`paddr_0 || gen || pool_uuid`); other replicas
+hold bytewise-identical ciphertext+tag. The decoder enforces:
+n_replicas ∈ [1, 4]; paddrs[0..n) all non-zero; paddrs[n..4) all
+zero; pairwise distinctness within the replica set.
 
 MVP caps:
 - `len` must fit in 24 bits (≤ 0xFFFFFF; ~16 MiB-1) so both `dlen`
@@ -241,6 +253,12 @@ yield bp_kind = 0 (none), bp_paddr = 0 (load skips), bp_csum =
 zeros (Merkle recompute mismatches). The version check refuses
 v11 mounts at v12 up-front via uniform STM_EBADVERSION (existing
 handler).
+
+v12 → v13 bump (P7-6) gates the extent record value layout grow
+(32B → 64B). v12 entries length-mismatch the v13 decoder; v12
+mounts at v13 are refused via the same STM_EBADVERSION handler.
+The UB carve is unchanged at v13 — only the extent btree's value
+layout changes.
 
 ## Implementation notes
 
@@ -316,7 +334,18 @@ unrelated to the index API and stays separate.
 - [x] `stm_extent_lookup_by_paddr` (P7-5): exact-paddr lookup helper
       backing the production scrub cb's paddr→bptr resolver. O(n)
       linear scan; first match suffices by live-paddr
-      `PaddrFreshness`.
+      `PaddrFreshness`. **P7-6: now scans each record's full
+      replica set** — every paddr in `paddrs[0..n_replicas)`
+      resolves to that record.
+- [x] **P7-6 replica-list extension (v13)**: extent record gains
+      `paddrs[STM_EXTENT_MAX_REPLICAS=4]` + `n_replicas`. On-disk
+      record grows 32B → 64B. Encode/decode + structural validator
+      enforce within-set distinctness (no replica appears twice in
+      a record) and cross-record disjointness (extent.tla::
+      LiveReplicasDisjoint). API signatures of `stm_extent_write` /
+      `stm_extent_overwrite` take `(paddrs, n_paddrs)` instead of a
+      single paddr. Dropped paddrs flatten across each dropped
+      extent's full replica set.
 - [ ] Partial-extent shrink on Truncate (truncating mid-extent) —
       deferred; current MVP only drops fully-past-truncation extents.
 - [ ] Coalescing — quality-of-implementation; correctness preserved

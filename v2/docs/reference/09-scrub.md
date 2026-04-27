@@ -15,18 +15,20 @@ Two verify modes:
   writeback). The cb returns `OK` / `REPAIRED` / `UNREPAIRABLE`;
   scrub charges the matching counter.
 
-The β cb-shape is the integration point that P7-5 fills with the
+The β cb-shape is the integration point that P7-5 filled with the
 **production scrub cb** — `stm_sync_scrub_install_production_cb`
-(declared in `<stratum/sync.h>`). The cb resolves each scanned
-paddr against the persistent extent index via
-`stm_extent_lookup_by_paddr`, AEAD-decrypts the matched extent, and
-returns `OK` on tag-pass / `UNREPAIRABLE` on tag-fail. Replica
-reconstruction (bptr.tla's full `ScanRead` × `RewriteReplica`
-machine) waits for the extent record's replica-list extension; the
-P7-5 cb maps to the single-replica corner of bptr.tla where AEAD
-failure → `UNREPAIRABLE`. Stub callbacks remain in tests for the
-state-machine matrix; production-pattern callers install the
-production cb instead.
+(declared in `<stratum/sync.h>`). **P7-6 promoted the cb from
+NReplicas=1 to bptr.tla's full `ScanRead` × `RewriteReplica`
+matrix**: now the cb walks every replica in the extent's replica
+set, csum-gates each (AEAD-tag check), picks the first OK as
+source, rewrites every non-OK replica from the source's bytes,
+verifies-back-reads each rewrite per ARCH §7.15.3
+WriteVerifyMandatory, and classifies the outcome:
+* every replica clean → `OK`;
+* at least one rewrite landed verified-OK → `REPAIRED`;
+* no source picked OR a verify-back failed → `UNREPAIRABLE`.
+Stub callbacks remain in tests for the α / β state-machine matrix;
+production-pattern callers install the production cb instead.
 
 **γ — durable cursor**: scrub state (state, cursor, all counters) is
 persisted in `stm_uberblock.ub_scrub_state[64]` on every
@@ -484,6 +486,17 @@ All green on default + ASan + TSan.
       `OK` trivially — base-paddr verify covers the entire
       extent's bytes; non-extent blocks have no extent-level
       verify path in this MVP.
+- [x] **P7-6 replica-walk extension** (v13): cb now realizes
+      bptr.tla's full `ScanRead` × `RewriteReplica` protocol over
+      the extent's replica set. Each invocation at `paddrs[0]`
+      reads + AEAD-verifies every replica, picks the first OK as
+      source, rewrites non-OK replicas, verify-back-reads each
+      rewrite. Outcomes: all clean → `OK`; ≥1 rewrite verified →
+      `REPAIRED`; no source → `UNREPAIRABLE`; any rewrite verify-
+      back fail → `UNREPAIRABLE`. The cb's reads of mid-extent
+      paddrs (those covered by the same allocator range as the
+      base) and other replicas in the extent's set return `OK`
+      trivially to avoid double-charging the extent's outcome.
 
 ### R26 audit posture (closed 2026-04-25 @ `a6249eb`)
 

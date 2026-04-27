@@ -162,8 +162,31 @@ extern "C" {
  * gates the new field meaning explicitly + refuses v11 mounts at
  * v12 to prevent decoders without the extent index from booting
  * a pool whose extents would otherwise be lost on next sync.
- * No feature-flag bump (full version bump per ARCH §5.9). */
-#define STM_UB_VERSION        12u
+ * No feature-flag bump (full version bump per ARCH §5.9).
+ *
+ * v12 → v13 (Phase 7 P7-6): the extent-tree on-disk value grows
+ * 32 → 64 bytes to carry up to STM_EXTENT_MAX_REPLICAS=4 replica
+ * paddrs per extent (extent.tla's `replicas` field). New layout:
+ *   off 0  : u8  n_replicas (1..4)
+ *   off 1  : u8  reserved[7] (zero)
+ *   off 8  : le64 paddr_0 (always non-zero)
+ *   off 16 : le64 paddr_1 (zero if n_replicas < 2)
+ *   off 24 : le64 paddr_2 (zero if n_replicas < 3)
+ *   off 32 : le64 paddr_3 (zero if n_replicas < 4)
+ *   off 40 : le64 write_gen
+ *   off 48 : le32 dlen
+ *   off 52 : le32 clen_and_comp
+ *   off 56 : le64 xxh
+ * The C impl AEAD-encrypts each extent's plaintext once with
+ * (paddr_0, gen) as nonce and writes bytewise-identical
+ * ciphertext+tag to every paddr_i. The scrub β cb's replica-walk
+ * (bptr.tla::ScanRead × RewriteReplica) reads each replica
+ * independently, csum-gates per-replica, and rewrites bad replicas
+ * from a verified source. v12 pools' 32-byte values would be
+ * length-rejected by the v13 decoder (size mismatch) — refuses
+ * v12 mounts at v13 via the existing STM_EBADVERSION handler. No
+ * feature-flag bump (full version bump per ARCH §5.9). */
+#define STM_UB_VERSION        13u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */

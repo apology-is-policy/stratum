@@ -743,9 +743,11 @@ STM_TEST(fs_io_scrub_production_cb_detects_corruption) {
      * remount the AEAD verify will fail. */
     STM_ASSERT_OK(stm_fs_unmount(fs));
 
-    /* device 0 by construction (single-device pool). */
-    STM_ASSERT_EQ(stm_paddr_device(rec.paddr), (uint16_t)0);
-    uint64_t byte_off = (uint64_t)stm_paddr_offset(rec.paddr) * 4096u;
+    /* device 0 by construction (single-device pool). Single-device
+     * pool → n_replicas = 1, so paddrs[0] is the only stored paddr. */
+    STM_ASSERT_EQ((int)rec.n_replicas, 1);
+    STM_ASSERT_EQ(stm_paddr_device(rec.paddrs[0]), (uint16_t)0);
+    uint64_t byte_off = (uint64_t)stm_paddr_offset(rec.paddrs[0]) * 4096u;
     int cfd = open(g_tmp_path, O_WRONLY);
     STM_ASSERT(cfd >= 0);
     uint8_t garbage[4096];

@@ -39,10 +39,10 @@ chapter as specs get wider cross-reference tables).
 | `property.tla` | 6 | Per-dataset property inheritance — local override / inheritable walk / non-inheritable + immutable-at-create. | 1040 states, depth 11 (MaxDatasets=2, 3 props, 2 values) | `property_inherit_non_inh_buggy.cfg`, `property_mutate_immutable_buggy.cfg` |
 | `clone.tla` | 6 | Clone (writable snapshot) lifecycle — clone-from-snap + snap-with-clones-undeletable + promote-breaks-dependency. | 161 states, depth 11 (MaxDatasets=3, MaxSnaps=2) | `clone_delete_snap_with_clones_buggy.cfg` |
 | `dead_list.tla` | 6 | Block-level reachability + per-snapshot dead-list incremental maintenance during COW + ZFS-style SnapDelete (free-unique + merge-surviving-into-pred). | 5656 states, depth 15 (MaxBlocks=4, MaxSnaps=3) | `dead_list_overwrite_forgets_buggy.cfg`, `dead_list_delete_forgets_free_buggy.cfg`, `dead_list_merge_includes_freed_buggy.cfg` |
-| `extent.tla` | 7 | Per-(dataset, ino) extent layout — Write / Overwrite / Truncate / DeleteFile / AdvanceTxg + no-overlap-within-ino + length-positive + birth-txg-bound + paddr-freshness. P7 entry chunk. | 1216 states, depth 6 (MaxDatasets=1, MaxInos=2, MaxFileBlocks=2, MaxPaddrs=3, MaxTxg=1) | `extent_overlap_buggy.cfg`, `extent_zero_length_buggy.cfg`, `extent_overwrite_forgets_drop_buggy.cfg` |
+| `extent.tla` | 7 | Per-(dataset, ino) extent layout — Write / Overwrite / Truncate / DeleteFile / AdvanceTxg + no-overlap-within-ino + length-positive + birth-txg-bound + paddr-freshness + replica sets per extent (P7-6) + live-replicas-disjoint. | 11594 states, depth 6 (MaxDatasets=1, MaxInos=2, MaxFileBlocks=2, MaxPaddrs=4, MaxTxg=1, MaxReplicasPerExtent=2) | `extent_overlap_buggy.cfg`, `extent_zero_length_buggy.cfg`, `extent_overwrite_forgets_drop_buggy.cfg`, `extent_replica_collision_buggy.cfg` |
 
 All 23 fixed configs green (one per module + `scrub_beta` +
-`scrub_durable` + `scrub_beta_durable` extending `scrub.tla`). All 22
+`scrub_durable` + `scrub_beta_durable` extending `scrub.tla`). All 23
 buggy configs reproduce their designed invariant violations.
 
 ## Per-module invariants

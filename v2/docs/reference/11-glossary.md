@@ -143,6 +143,7 @@ closed items.
 | R35 | P7-3 extent persistence (UB v11→v12 + sync wire-in). | `b223975` |
 | R36 | P7-4 fs.c/sync.c COW path integration (extent → dead-list / alloc-free routing). | `64a6278` |
 | R37 | P7-5 production scrub β verify-callback (paddr→bptr resolver via extent walk). | `fc5f619` |
+| R38 | P7-6 replica-list extension on extent records (UB v13 + bptr.tla full replica-walk in scrub cb). | `<TBD>` |
 
 ## Phase 6 / clone terms
 
@@ -174,7 +175,10 @@ closed items.
 | **sync_drop_paddr_locked** | sync.c helper (P7-4) realizing the C-impl boundary between extent.tla::Overwrite, dead_list.tla::OverwriteBlock, and allocator.tla::Free. For each dropped paddr: route via `stm_snapshot_index_overwrite_block` → if `should_free=true`, call `stm_alloc_free` on the device's allocator (selected via `stm_paddr_device`); else, the paddr stays in the most-recent snapshot's dead-list until that snapshot is deleted. |
 | **stm_fs_write / stm_fs_read** | POSIX-shape extent I/O API (P7-4). Thin fs.c wrappers over `stm_sync_write_extent` / `stm_sync_read_extent`. MVP constraints: 4-KiB-aligned + len ≤ 128 KiB + single-extent per call. Encryption uses pool-wide `metadata_key`. |
 | **stm_extent_lookup_by_paddr** | Read-path helper (P7-5) — exact-paddr lookup over the live extent records. O(n) linear scan; first match wins by live-paddr `PaddrFreshness`. Returns `STM_ENOENT` for non-base paddrs (mid-extent, metadata, bootstrap, scrub durable region). The production scrub cb is the primary consumer. |
-| **production scrub cb** | The bptr-aware β verify-callback shipped in P7-5 via `stm_sync_scrub_install_production_cb`. Resolves each scanned paddr via `stm_extent_lookup_by_paddr`, AEAD-decrypts the matched extent's ciphertext+tag, and returns `STM_SCRUB_VERIFY_OK` on tag-pass / `STM_SCRUB_VERIFY_UNREPAIRABLE` on tag-fail. Mid-extent paddrs + non-extent allocs return OK trivially. Maps to `bptr.tla`'s `NReplicas=1` corner — the full replica-walk + rewrite (`ScanRead` × `RewriteReplica`) awaits the extent record's replica-list extension. |
+| **production scrub cb** | The bptr-aware β verify-callback shipped in P7-5 via `stm_sync_scrub_install_production_cb`. Resolves each scanned paddr via `stm_extent_lookup_by_paddr`, AEAD-decrypts the matched extent's ciphertext+tag, and returns `STM_SCRUB_VERIFY_OK` on tag-pass / `STM_SCRUB_VERIFY_UNREPAIRABLE` on tag-fail. Mid-extent paddrs + non-extent allocs return OK trivially. **P7-6 promoted the cb from `bptr.tla`'s `NReplicas=1` corner to the full replica-walk + rewrite matrix** (per-replica csum-gate, pick first OK source, rewrite non-OK replicas, verify-back each rewrite, classify OK / REPAIRED / UNREPAIRABLE). |
+| **extent replica set** | P7-6 extension to `stm_extent_record`: an extent now carries an array of up to `STM_EXTENT_MAX_REPLICAS=4` paddrs in `paddrs[0..n_replicas)`. The same plaintext is encrypted ONCE under canonical nonce `(paddrs[0], gen)` and the bytewise-identical ciphertext+tag is replicated to every paddr's bdev. `LiveReplicasDisjoint` (extent.tla) requires no paddr appear in two live extents' replica sets; the C impl validates within-set distinctness too. |
+| **STM_EXTENT_MAX_REPLICAS** | C constant (=4) capping the on-disk replica-slot count. Mirror-N pools with N ≤ 4 are supported natively; larger N would need a record-format extension (post-v13). The on-disk record reserves all 4 slots regardless of `n_replicas`; trailing slots are sentinel-zero. |
+| **STM_RED_MIRROR / mirror_n** | Pool redundancy profile bits (sync.h's `stm_redundancy_profile`). `kind=STM_RED_MIRROR, mirror_n=N` directs the extent write path to allocate N replicas across N distinct devices. P7-6 wires this into `stm_sync_write_extent`'s replica fan-out. RAID-Z (`STM_RED_RS`) and LRC (`STM_RED_LRC`) remain unsupported MVP. |
 
 ## Policy terms
 

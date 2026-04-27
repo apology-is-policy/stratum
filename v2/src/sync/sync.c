@@ -3566,6 +3566,23 @@ static stm_status sync_drop_paddr_locked(stm_sync *s, uint64_t ds, uint64_t padd
     return STM_OK;
 }
 
+/* Determine the desired replica count from the pool's redundancy
+ * profile. NONE → 1 replica. MIRROR → mirror_n replicas. Capped at
+ * STM_EXTENT_MAX_REPLICAS for the on-disk slot count, and at the
+ * number of attached per-device allocators (degraded mode for pools
+ * with attached_count < mirror_n). RS / LRC unsupported in this MVP
+ * — the create-time validator in stm_sync_create rejects them. */
+static size_t sync_desired_replica_count_locked(const stm_sync *s) {
+    size_t n = 1;
+    if (s->redundancy.kind == STM_RED_MIRROR) {
+        n = s->redundancy.mirror_n;
+        if (n < 1) n = 1;
+    }
+    if (n > STM_EXTENT_MAX_REPLICAS) n = STM_EXTENT_MAX_REPLICAS;
+    if (n > s->n_attached) n = s->n_attached;
+    return n;
+}
+
 stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
                                     uint64_t off, const void *buf, size_t len) {
     if (!s || !buf) return STM_EINVAL;
@@ -3580,36 +3597,54 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
     if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
 
-    /* R36 P1-3: hardcode AEGIS-256 to match the rest of the tree
-     * (btree_store, janus passphrase backend). Using stm_aead_autodetect
-     * here was non-portable: a pool created on a host with AES-NI would
-     * use AEGIS-256 (32-byte tag) but reading on a host without AES-NI
-     * (or after a libsodium upgrade flipping the probe) would get
-     * XChaCha20-SIV (16-byte tag), tag-len mismatch → STM_EBADTAG.
-     * Persisting the mode in the extent record would need a format
-     * break; pinning AEGIS-256 here is the simpler portable fix. */
+    /* R36 P1-3: hardcode AEGIS-256 — see read path comment. */
     stm_aead_mode mode = STM_AEAD_AEGIS256;
     size_t tag_len = stm_aead_tag_len(mode);
     if (tag_len == 0) {
         pthread_mutex_unlock(&s->lock);
         return STM_EINVAL;
     }
-    /* Reserve enough blocks to hold ciphertext+tag. nblocks rounded up. */
     size_t total_bytes = len + tag_len;
     uint64_t nblocks   = (total_bytes + STM_UB_SIZE - 1u) / STM_UB_SIZE;
 
-    uint64_t paddr = 0;
-    stm_status rs = stm_alloc_reserve(s->alloc, nblocks, 0, &paddr);
-    if (rs != STM_OK) {
+    /* P7-6: reserve N replica paddrs across N distinct devices. */
+    size_t n_replicas = sync_desired_replica_count_locked(s);
+    if (n_replicas < 1) {
         pthread_mutex_unlock(&s->lock);
-        return rs;
+        return STM_EINVAL;
+    }
+    uint64_t replicas[STM_EXTENT_MAX_REPLICAS] = { 0 };
+    size_t   reserved_count = 0;
+
+    for (size_t i = 0; i < n_replicas; i++) {
+        if (i >= STM_POOL_DEVICES_MAX || s->allocs[i] == NULL) {
+            /* Not enough attached allocs — should not happen because
+             * sync_desired_replica_count_locked caps at n_attached.
+             * Defensive abort. */
+            for (size_t j = 0; j < reserved_count; j++)
+                (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
+            pthread_mutex_unlock(&s->lock);
+            return STM_EINVAL;
+        }
+        stm_status rs = stm_alloc_reserve(s->allocs[i], nblocks, 0, &replicas[i]);
+        if (rs != STM_OK) {
+            for (size_t j = 0; j < reserved_count; j++)
+                (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
+            pthread_mutex_unlock(&s->lock);
+            return rs;
+        }
+        reserved_count++;
     }
 
-    /* Encrypt into a temp buffer. AEAD output: ciphertext (len bytes)
-     * followed by tag (tag_len bytes). */
+    /* Encrypt ONCE under the canonical replica's nonce (replicas[0],
+     * gen). The same ciphertext+tag is written to every replica's
+     * paddr — bptr.tla's per-replica csum gate works because each
+     * replica's stored bytes are independently subject to bit-rot,
+     * but the AEAD MAC is computed against the canonical nonce. */
     void *cbuf = malloc(total_bytes);
     if (!cbuf) {
-        (void)stm_alloc_free(s->alloc, paddr, s->current_gen);
+        for (size_t j = 0; j < reserved_count; j++)
+            (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
         pthread_mutex_unlock(&s->lock);
         return STM_ENOMEM;
     }
@@ -3627,57 +3662,57 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
 
     size_t out_len = 0;
     stm_status es = stm_extent_encrypt(mode, s->metadata_key,
-                                          paddr, s->current_gen,
+                                          replicas[0], s->current_gen,
                                           &ad, buf, len,
                                           cbuf, total_bytes, &out_len);
     if (es != STM_OK) {
         free(cbuf);
-        (void)stm_alloc_free(s->alloc, paddr, s->current_gen);
+        for (size_t j = 0; j < reserved_count; j++)
+            (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
         pthread_mutex_unlock(&s->lock);
         return es;
     }
 
-    /* Write ciphertext+tag to disk. The remainder of the reserved
-     * `nblocks * STM_UB_SIZE` bytes is unwritten — that's OK; the
-     * read path knows to read exactly `len + tag_len` bytes. */
-    uint64_t byte_off = stm_paddr_offset(paddr) * (uint64_t)STM_UB_SIZE;
-    stm_bdev *target_bdev = stm_pool_device_bdev(s->pool,
-                                                    stm_paddr_device(paddr));
-    if (!target_bdev) {
-        free(cbuf);
-        (void)stm_alloc_free(s->alloc, paddr, s->current_gen);
-        pthread_mutex_unlock(&s->lock);
-        return STM_EINVAL;
+    /* Write the same ciphertext+tag to each replica's paddr. */
+    for (size_t i = 0; i < n_replicas; i++) {
+        uint16_t dev = stm_paddr_device(replicas[i]);
+        uint64_t byte_off = stm_paddr_offset(replicas[i]) * (uint64_t)STM_UB_SIZE;
+        stm_bdev *target_bdev = stm_pool_device_bdev(s->pool, dev);
+        if (!target_bdev) {
+            free(cbuf);
+            for (size_t j = 0; j < reserved_count; j++)
+                (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
+            pthread_mutex_unlock(&s->lock);
+            return STM_EINVAL;
+        }
+        stm_status ws = stm_bdev_write(target_bdev, byte_off, cbuf, total_bytes);
+        if (ws != STM_OK) {
+            free(cbuf);
+            for (size_t j = 0; j < reserved_count; j++)
+                (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
+            pthread_mutex_unlock(&s->lock);
+            return ws;
+        }
     }
-    stm_status ws = stm_bdev_write(target_bdev, byte_off, cbuf, total_bytes);
     free(cbuf);
-    if (ws != STM_OK) {
-        (void)stm_alloc_free(s->alloc, paddr, s->current_gen);
-        pthread_mutex_unlock(&s->lock);
-        return ws;
-    }
 
-    /* Update the extent index with the new extent; collect any dropped
-     * paddrs from overlapping extents. Each drop routes through the
-     * snapshot dead-list or free-direct path. */
+    /* Update the extent index with the new replica set; collect any
+     * dropped paddrs (flat across each dropped extent's replicas).
+     * Each dropped paddr routes through snapshot dead-list / free. */
     uint64_t *dropped = NULL;
     size_t    n_dropped = 0;
     stm_status os = stm_extent_overwrite(s->extent_idx, dataset_id, ino, off,
-                                            len, paddr, s->current_gen,
+                                            len, replicas, n_replicas,
+                                            s->current_gen,
                                             &dropped, &n_dropped);
     if (os != STM_OK) {
-        (void)stm_alloc_free(s->alloc, paddr, s->current_gen);
+        for (size_t j = 0; j < reserved_count; j++)
+            (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
         pthread_mutex_unlock(&s->lock);
         return os;
     }
 
-    /* R36 P1-1 + P2-1: best-effort drain. The prior version returned
-     * on the first error, leaking subsequent paddrs in alloc (still
-     * marked ALLOCATED but no extent references them). Now: continue
-     * iterating, save the first error, propagate it. The most
-     * realistic failure is STM_ENOSPC (a snapshot at the
-     * STM_SNAP_DEAD_LIST_MAX = 256 cap); the cap was meant to bound
-     * memory, not silently kill subsequent COW. */
+    /* R36 P1-1 + P2-1: best-effort drain. */
     stm_status drop_err = STM_OK;
     for (size_t i = 0; i < n_dropped; i++) {
         stm_status drs = sync_drop_paddr_locked(s, dataset_id, dropped[i]);
@@ -3719,32 +3754,21 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
      * cover at least `len` bytes from off. */
     if (rec.off != off) { pthread_mutex_unlock(&s->lock); return STM_EINVAL; }
     if (len > rec.len) { pthread_mutex_unlock(&s->lock); return STM_EINVAL; }
+    if (rec.n_replicas < 1 || rec.n_replicas > STM_EXTENT_MAX_REPLICAS) {
+        pthread_mutex_unlock(&s->lock);
+        return STM_ECORRUPT;
+    }
 
     /* R36 P1-3: hardcode AEGIS-256 — see write path for rationale. */
     stm_aead_mode mode = STM_AEAD_AEGIS256;
     size_t tag_len = stm_aead_tag_len(mode);
     if (tag_len == 0) { pthread_mutex_unlock(&s->lock); return STM_EINVAL; }
 
-    /* Read ciphertext + tag (rec.len bytes plaintext + tag_len bytes
-     * tag), then decrypt. */
     size_t total_bytes = rec.len + tag_len;
     void *cbuf = malloc(total_bytes);
     if (!cbuf) { pthread_mutex_unlock(&s->lock); return STM_ENOMEM; }
-
-    uint64_t byte_off = stm_paddr_offset(rec.paddr) * (uint64_t)STM_UB_SIZE;
-    stm_bdev *target_bdev = stm_pool_device_bdev(s->pool,
-                                                    stm_paddr_device(rec.paddr));
-    if (!target_bdev) {
-        free(cbuf);
-        pthread_mutex_unlock(&s->lock);
-        return STM_EINVAL;
-    }
-    stm_status rs = stm_bdev_read(target_bdev, byte_off, cbuf, total_bytes);
-    if (rs != STM_OK) {
-        free(cbuf);
-        pthread_mutex_unlock(&s->lock);
-        return rs;
-    }
+    void *pbuf = malloc(rec.len);
+    if (!pbuf) { free(cbuf); pthread_mutex_unlock(&s->lock); return STM_ENOMEM; }
 
     stm_ad_extent ad;
     memset(&ad, 0, sizeof ad);
@@ -3757,67 +3781,93 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     ad.offset       = rec.off;
     ad.content_kind = 0;
 
-    /* Decrypt into a temp buffer of plaintext size, then copy out the
-     * caller-requested `len` bytes. */
-    void *pbuf = malloc(rec.len);
-    if (!pbuf) { free(cbuf); pthread_mutex_unlock(&s->lock); return STM_ENOMEM; }
-    size_t pt_out = 0;
-    stm_status ds = stm_extent_decrypt(mode, s->metadata_key,
-                                          rec.paddr, rec.gen,
-                                          &ad, cbuf, total_bytes,
-                                          pbuf, rec.len, &pt_out);
+    /* P7-6: try each replica in order; first AEAD-verifying replica
+     * wins. This gives clients automatic resilience to single-replica
+     * corruption on the hot path (active repair is scrub's job;
+     * passive fallback through replica order is the read path's
+     * obligation per ARCH §7.16's recoverable-data policy).
+     *
+     * Nonce is canonical (replicas[0], gen) regardless of which
+     * replica we sourced bytes from — the cipher was computed once
+     * with that nonce at write time and replicated bytewise. */
+    stm_status last_err = STM_EBADTAG;
+    bool decrypted = false;
+    for (uint8_t i = 0; i < rec.n_replicas && !decrypted; i++) {
+        uint16_t dev = stm_paddr_device(rec.paddrs[i]);
+        stm_bdev *bd = stm_pool_device_bdev(s->pool, dev);
+        if (!bd) { last_err = STM_EINVAL; continue; }
+        uint64_t byte_off = stm_paddr_offset(rec.paddrs[i]) * (uint64_t)STM_UB_SIZE;
+        stm_status rs = stm_bdev_read(bd, byte_off, cbuf, total_bytes);
+        if (rs != STM_OK) { last_err = rs; continue; }
+
+        size_t pt_out = 0;
+        stm_status ds = stm_extent_decrypt(mode, s->metadata_key,
+                                              rec.paddrs[0], rec.gen,
+                                              &ad, cbuf, total_bytes,
+                                              pbuf, rec.len, &pt_out);
+        if (ds == STM_OK) {
+            decrypted = true;
+            break;
+        }
+        last_err = ds;
+    }
+
     free(cbuf);
-    if (ds != STM_OK) {
+    if (!decrypted) {
+        stm_ct_memzero(pbuf, rec.len);
         free(pbuf);
         pthread_mutex_unlock(&s->lock);
-        return ds;
+        return last_err;
     }
 
     memcpy(buf, pbuf, len);
+    stm_ct_memzero(pbuf, rec.len);
     free(pbuf);
     *out_read = len;
     pthread_mutex_unlock(&s->lock);
     return STM_OK;
 }
 
-/* P7-5 production scrub β verify-callback.
+/* P7-6 production scrub β verify-callback — full bptr.tla replica
+ * walk + verify + rewrite-bad protocol.
  *
- * Composition with the existing tree:
- *   - bptr.tla::ScanRead(i)        → stm_extent_lookup_by_paddr +
- *                                     stm_bdev_read + stm_extent_decrypt.
- *                                     The csum gate is the AEAD tag check
- *                                     under stm_extent_decrypt.
- *   - bptr.tla::AcceptedAsSource    → ds == STM_OK from decrypt.
- *   - bptr.tla::ScanComplete (no   → returns STM_SCRUB_VERIFY_UNREPAIRABLE
- *      OK source)                    when the only "replica" we model
- *                                     (the single-paddr extent) fails
- *                                     AEAD. Fully expanded replica-walk
- *                                     awaits the extent record's
- *                                     replica-list extension (post-MVP).
- *
- * Lock context (per scrub.h "Callback contract"):
- *   - Invoked under sc->lock + pool->rdlock. Pool wrlock-bearing APIs
- *     are forbidden; we only call stm_pool_device_bdev (pure deref of
- *     the rdlock-snapshot pool struct, per pool.c).
- *   - Does NOT take sync->lock. extent_idx has its own mutex; pool_uuid
- *     and metadata_key are immutable post-create; pool is immutable.
- *   - extent_idx.lock is acquired briefly inside stm_extent_lookup_by_paddr.
- *     Lock order: sc.lock → pool.rdlock → extent_idx.lock (LEAF).
+ * Composition with bptr.tla:
+ *   - bptr.tla::ScanRead(i)         → per-replica stm_bdev_read +
+ *                                      stm_extent_decrypt. csum gate
+ *                                      = AEAD-tag check.
+ *   - bptr.tla::AcceptedAsSource    → first replica whose decrypt
+ *                                      returns STM_OK.
+ *   - bptr.tla::ScanComplete        → after iterating all replicas:
+ *                                      if no source → UNREPAIRABLE;
+ *                                      else proceed to rewrite phase.
+ *   - bptr.tla::RewriteReplica(j)   → for each non-OK replica j,
+ *                                      write source ciphertext to j's
+ *                                      paddr, read it back, AEAD-
+ *                                      verify (per ARCH §7.15.3
+ *                                      WriteVerifyMandatory).
+ *   - bptr.tla::RewriteComplete     → REPAIRED if any rewrite landed
+ *                                      verified-OK; UNREPAIRABLE if
+ *                                      any rewrite's verify-back fails.
  *
  * Per-block charge model: scrub iterates ALLOCATED ranges block-by-
- * block. For a multi-block extent, only the BASE paddr matches an
- * extent record; mid-extent paddrs (base+1, base+2, ...) return
- * ENOENT and charge to OK. Operator-visible counters therefore
- * report "blocks scrubbed" with at most one UNREPAIRABLE per
- * corrupted extent; subsequent blocks of the same extent count as
- * verified (the AEAD-tag check at the base covers the entire
- * ciphertext+tag, so corruption is detected exactly once per
- * extent).
+ * block. lookup_by_paddr matches against the extent's full replica
+ * SET (P7-6) — every paddr in an extent's replicas[0..n-1] resolves
+ * to that extent. Mid-extent paddrs (the trailing blocks of a multi-
+ * block range allocated for the same extent) still return ENOENT
+ * (only base paddrs are in the index) and charge to OK trivially.
  *
- * Plaintext hygiene: the cb must AEAD-decrypt to verify integrity but
- * doesn't need the plaintext. We allocate a temp buffer, decrypt,
- * stm_ct_memzero before free — same pattern as the keyschema /
- * mirror_read paths.
+ * Lock context (per scrub.h "Callback contract"):
+ *   - Invoked under sc->lock + pool->rdlock.
+ *   - Does NOT take sync->lock — extent_idx has its own mutex;
+ *     pool_uuid, metadata_key, pool are immutable post-create.
+ *   - The cb internally writes via stm_bdev_write to non-OK
+ *     replicas; that's allowed because pool's rdlock guards device
+ *     pointers (no concurrent remove); bdev write is thread-safe per
+ *     pool.h's contract on pure-deref readers.
+ *   - Lock order: sc.lock → pool.rdlock → extent_idx.lock (LEAF).
+ *
+ * Plaintext hygiene: AEAD-decrypt outputs plaintext into a temp
+ * buffer; ct_memzero before free.
  */
 static stm_scrub_verify_outcome
 sync_scrub_verify_cb(uint64_t paddr, void *ctx)
@@ -3834,17 +3884,17 @@ sync_scrub_verify_cb(uint64_t paddr, void *ctx)
     if (ls == STM_ENOENT) return STM_SCRUB_VERIFY_OK;
     if (ls != STM_OK)     return STM_SCRUB_VERIFY_UNREPAIRABLE;
 
-    /* Look up the bdev for the extent's device. pool is rdlock-held
-     * by scrub; stm_pool_device_bdev is a pure deref of the
-     * already-rdlock-snapshot pool struct (pool.c ~493-496). R37 P3-2:
-     * this MUST remain lockless under pool.rdlock — if a future pool
-     * rework adds internal locking inside stm_pool_device_bdev (e.g.,
-     * a per-device rwlock), the scrub cb's lock-order claim
-     * (sc.lock → pool.rdlock → extent_idx.lock) silently changes and
-     * this comment should be revisited. */
-    uint16_t dev = stm_paddr_device(rec.paddr);
-    stm_bdev *bd = stm_pool_device_bdev(s->pool, dev);
-    if (!bd) return STM_SCRUB_VERIFY_UNREPAIRABLE;
+    if (rec.n_replicas < 1 || rec.n_replicas > STM_EXTENT_MAX_REPLICAS)
+        return STM_SCRUB_VERIFY_UNREPAIRABLE;
+
+    /* Each scrub block is processed once. To avoid duplicate-charging
+     * a single extent's outcome across each of its replica paddrs,
+     * we charge ONLY when paddr == rec.paddrs[0] (the canonical
+     * "scan from this replica's viewpoint"). For other replicas of
+     * the same extent, we return OK trivially — those blocks ARE
+     * scanned independently by scrub but the extent's verify+repair
+     * is canonicalized to the first replica's invocation. */
+    if (paddr != rec.paddrs[0]) return STM_SCRUB_VERIFY_OK;
 
     /* AEAD setup matching stm_sync_write_extent. Hardcoded AEGIS-256
      * (R36 P1-3) so cross-host portability is preserved. */
@@ -3852,34 +3902,18 @@ sync_scrub_verify_cb(uint64_t paddr, void *ctx)
     size_t tag_len = stm_aead_tag_len(mode);
     if (tag_len == 0) return STM_SCRUB_VERIFY_UNREPAIRABLE;
 
-    /* Defensive cap on rec.len. The write path enforces
-     * STM_FS_RECORDSIZE_MAX (128 KiB) before insert, but a hostile
-     * on-disk btree blob could in theory present an extent with
-     * len up to the EX_LEN_MAX_24BIT cap (~16 MiB) that decodes
-     * cleanly. Refuse any extent whose plaintext exceeds the live
-     * write-path cap — the bytes were never legitimately written
-     * via stm_sync_write_extent, so AEAD verify would fail anyway,
-     * and a multi-MiB malloc per scrub block is a memory-pressure
-     * concern. Charging UNREPAIRABLE is also semantically right:
-     * the extent's structure doesn't match what the encrypt path
-     * would have produced. */
+    /* Defensive cap on rec.len (R37 P3-1 carry-over). */
     if (rec.len == 0 || rec.len > STM_FS_RECORDSIZE_MAX)
         return STM_SCRUB_VERIFY_UNREPAIRABLE;
 
     size_t total_bytes = rec.len + tag_len;
+
     void *cbuf = malloc(total_bytes);
-    if (!cbuf) return STM_SCRUB_VERIFY_UNREPAIRABLE;
-
-    uint64_t byte_off = stm_paddr_offset(rec.paddr) * (uint64_t)STM_UB_SIZE;
-    stm_status rs = stm_bdev_read(bd, byte_off, cbuf, total_bytes);
-    if (rs != STM_OK) {
-        free(cbuf);
-        return STM_SCRUB_VERIFY_UNREPAIRABLE;
-    }
-
-    void *pbuf = malloc(rec.len);
-    if (!pbuf) {
-        free(cbuf);
+    void *src_bytes = malloc(total_bytes);  /* picked-source ciphertext */
+    void *back_buf  = malloc(total_bytes);  /* verify-back ciphertext */
+    void *pbuf      = malloc(rec.len);
+    if (!cbuf || !src_bytes || !back_buf || !pbuf) {
+        free(cbuf); free(src_bytes); free(back_buf); free(pbuf);
         return STM_SCRUB_VERIFY_UNREPAIRABLE;
     }
 
@@ -3892,21 +3926,98 @@ sync_scrub_verify_cb(uint64_t paddr, void *ctx)
     ad.dataset_id   = rec.dataset_id;
     ad.ino          = rec.ino;
     ad.offset       = rec.off;
-    ad.content_kind = 0;  /* file data — matches stm_sync_write_extent. */
+    ad.content_kind = 0;
 
-    size_t pt_out = 0;
-    stm_status ds = stm_extent_decrypt(mode, s->metadata_key,
-                                          rec.paddr, rec.gen,
-                                          &ad, cbuf, total_bytes,
-                                          pbuf, rec.len, &pt_out);
-    free(cbuf);
-    /* Plaintext hygiene: scrub doesn't need the bytes; wipe before
-     * free so the heap is clean. */
+    /* Phase 1 (bptr.tla::ScanRead × NReplicas): read each replica,
+     * AEAD-verify under canonical (rec.paddrs[0], rec.gen) nonce.
+     * Track per-replica status. */
+    bool        replica_ok[STM_EXTENT_MAX_REPLICAS] = { false };
+    int         picked = -1;
+    stm_scrub_verify_outcome final_outcome = STM_SCRUB_VERIFY_UNREPAIRABLE;
+
+    for (uint8_t i = 0; i < rec.n_replicas; i++) {
+        uint16_t dev = stm_paddr_device(rec.paddrs[i]);
+        stm_bdev *bd = stm_pool_device_bdev(s->pool, dev);
+        if (!bd) continue;
+        uint64_t boff = stm_paddr_offset(rec.paddrs[i]) * (uint64_t)STM_UB_SIZE;
+        stm_status rs = stm_bdev_read(bd, boff, cbuf, total_bytes);
+        if (rs != STM_OK) continue;
+
+        size_t pt_out = 0;
+        stm_status ds = stm_extent_decrypt(mode, s->metadata_key,
+                                              rec.paddrs[0], rec.gen,
+                                              &ad, cbuf, total_bytes,
+                                              pbuf, rec.len, &pt_out);
+        if (ds == STM_OK) {
+            replica_ok[i] = true;
+            if (picked < 0) {
+                picked = (int)i;
+                /* Save the picked source's ciphertext for repairs. */
+                memcpy(src_bytes, cbuf, total_bytes);
+            }
+        }
+    }
+
+    /* Phase 2 (bptr.tla::ScanComplete): if no replica verified, the
+     * extent is unrepairable. */
+    if (picked < 0) {
+        stm_ct_memzero(pbuf, rec.len);
+        free(cbuf); free(src_bytes); free(back_buf); free(pbuf);
+        return STM_SCRUB_VERIFY_UNREPAIRABLE;
+    }
+
+    /* Phase 3 (bptr.tla::RewriteReplica): rewrite each non-OK replica
+     * from the picked source's ciphertext, then verify-back-read +
+     * AEAD-check. Any verify-back failure → UNREPAIRABLE per
+     * bptr.tla::WriteVerifyMandatory. */
+    bool any_rewrite = false;
+    for (uint8_t j = 0; j < rec.n_replicas; j++) {
+        if (replica_ok[j]) continue;
+        uint16_t dev_j = stm_paddr_device(rec.paddrs[j]);
+        stm_bdev *bd_j = stm_pool_device_bdev(s->pool, dev_j);
+        if (!bd_j) {
+            /* Can't reach this replica's device — the extent is
+             * partially unrepairable. Per bptr.tla a single
+             * RewriteReplica failure → UNREPAIRABLE. */
+            final_outcome = STM_SCRUB_VERIFY_UNREPAIRABLE;
+            goto done;
+        }
+        uint64_t boff_j = stm_paddr_offset(rec.paddrs[j]) * (uint64_t)STM_UB_SIZE;
+        stm_status ws = stm_bdev_write(bd_j, boff_j, src_bytes, total_bytes);
+        if (ws != STM_OK) {
+            final_outcome = STM_SCRUB_VERIFY_UNREPAIRABLE;
+            goto done;
+        }
+        /* Verify-back: read the bytes we just wrote and AEAD-check. */
+        stm_status rs = stm_bdev_read(bd_j, boff_j, back_buf, total_bytes);
+        if (rs != STM_OK) {
+            final_outcome = STM_SCRUB_VERIFY_UNREPAIRABLE;
+            goto done;
+        }
+        size_t pt_out2 = 0;
+        stm_status ds = stm_extent_decrypt(mode, s->metadata_key,
+                                              rec.paddrs[0], rec.gen,
+                                              &ad, back_buf, total_bytes,
+                                              pbuf, rec.len, &pt_out2);
+        if (ds != STM_OK) {
+            final_outcome = STM_SCRUB_VERIFY_UNREPAIRABLE;
+            goto done;
+        }
+        any_rewrite = true;
+    }
+
+    /* Phase 4 (bptr.tla::RewriteComplete): no rewrite needed →
+     * REPAIRED only if at least one writeback verified; otherwise
+     * (all replicas were originally OK) → OK. */
+    final_outcome = any_rewrite ? STM_SCRUB_VERIFY_REPAIRED
+                                : STM_SCRUB_VERIFY_OK;
+
+done:
     stm_ct_memzero(pbuf, rec.len);
-    free(pbuf);
-
-    return (ds == STM_OK) ? STM_SCRUB_VERIFY_OK
-                          : STM_SCRUB_VERIFY_UNREPAIRABLE;
+    /* src_bytes + back_buf hold ciphertext, not plaintext — no
+     * sensitive material. Plain free is fine. */
+    free(cbuf); free(src_bytes); free(back_buf); free(pbuf);
+    return final_outcome;
 }
 
 stm_status stm_sync_scrub_install_production_cb(stm_sync *sync, stm_scrub *sc)

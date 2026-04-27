@@ -89,11 +89,49 @@ static inline bool ranges_overlap(uint64_t a_off, uint64_t a_len,
     return a_off < b_off + b_len && b_off < a_off + a_len;
 }
 
+/* True if `paddr` appears in any live extent's replica set. */
 static bool paddr_in_use_locked(const stm_extent_index *idx, uint64_t paddr) {
     for (size_t i = 0; i < idx->n_records; i++) {
-        if (idx->records[i].paddr == paddr) return true;
+        const stm_extent_record *e = &idx->records[i];
+        for (uint8_t r = 0; r < e->n_replicas; r++) {
+            if (e->paddrs[r] == paddr) return true;
+        }
     }
     return false;
+}
+
+/* True if any paddr in `paddrs[0..n)` is already in some live extent's
+ * replica set. P7-6 / extent.tla::LiveReplicasDisjoint. */
+static bool any_paddr_in_use_locked(const stm_extent_index *idx,
+                                       const uint64_t *paddrs, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (paddr_in_use_locked(idx, paddrs[i])) return true;
+    }
+    return false;
+}
+
+/* True iff `paddrs[0..n)` are pairwise distinct and none are zero.
+ * Used as the per-Write/Overwrite within-set sanity check. */
+static bool replica_set_is_valid(const uint64_t *paddrs, size_t n) {
+    if (n < 1 || n > STM_EXTENT_MAX_REPLICAS) return false;
+    for (size_t i = 0; i < n; i++) {
+        if (paddrs[i] == 0) return false;
+        for (size_t j = i + 1; j < n; j++) {
+            if (paddrs[i] == paddrs[j]) return false;
+        }
+    }
+    return true;
+}
+
+/* Sum of n_replicas over the given record indices. */
+static size_t total_replicas_in_drop_set(const stm_extent_index *idx,
+                                            const size_t *drop_indices,
+                                            size_t n_drops) {
+    size_t total = 0;
+    for (size_t i = 0; i < n_drops; i++) {
+        total += idx->records[drop_indices[i]].n_replicas;
+    }
+    return total;
 }
 
 static bool overlap_in_ino_locked(const stm_extent_index *idx,
@@ -124,17 +162,24 @@ static stm_status append_record_locked(stm_extent_index *idx,
 }
 
 /*
- * Compact records: collect each record's paddr into out_paddrs if its
- * index appears in `drop_indices` (sorted ascending), and remove those
- * records from the array. Caller owns out_paddrs (already malloc'd of
- * size n_drops).
+ * Compact records: flatten every dropped record's replica set into
+ * out_paddrs (size = sum of n_replicas across dropped records), then
+ * remove those records. drop_indices is sorted ascending. Caller owns
+ * out_paddrs (already malloc'd of total-replica size).
+ *
+ * Returns the count written to out_paddrs.
  */
-static void remove_indices_locked(stm_extent_index *idx,
-                                     const size_t *drop_indices, size_t n_drops,
-                                     uint64_t *out_paddrs) {
-    /* Collect dropped paddrs in input order. */
+static size_t remove_indices_locked(stm_extent_index *idx,
+                                       const size_t *drop_indices, size_t n_drops,
+                                       uint64_t *out_paddrs) {
+    /* Flatten dropped paddrs. Each dropped extent contributes
+     * n_replicas paddrs, in slot-index order. */
+    size_t out_idx = 0;
     for (size_t i = 0; i < n_drops; i++) {
-        out_paddrs[i] = idx->records[drop_indices[i]].paddr;
+        const stm_extent_record *e = &idx->records[drop_indices[i]];
+        for (uint8_t r = 0; r < e->n_replicas; r++) {
+            out_paddrs[out_idx++] = e->paddrs[r];
+        }
     }
 
     /* Two-finger compact: skip indices in drop_indices, copy survivors
@@ -152,6 +197,7 @@ static void remove_indices_locked(stm_extent_index *idx,
         write_idx++;
     }
     idx->n_records = write_idx;
+    return out_idx;
 }
 
 /* ------------------------------------------------------------------ */
@@ -229,11 +275,13 @@ stm_status stm_extent_index_advance_txg(stm_extent_index *idx,
 stm_status stm_extent_write(stm_extent_index *idx,
                               uint64_t dataset_id, uint64_t ino,
                               uint64_t off, uint64_t len,
-                              uint64_t paddr, uint64_t write_gen) {
+                              const uint64_t *paddrs, size_t n_paddrs,
+                              uint64_t write_gen) {
     if (!idx) return STM_EINVAL;
     if (dataset_id == 0 || ino == 0) return STM_EINVAL;
     if (len == 0) return STM_EINVAL;            /* LengthPositive */
-    if (paddr == 0) return STM_EINVAL;           /* sentinel */
+    if (!paddrs) return STM_EINVAL;
+    if (!replica_set_is_valid(paddrs, n_paddrs)) return STM_EINVAL;
     /* off + len overflow guard (AllExtentsInBounds — bounds the end). */
     if (off > UINT64_MAX - len) return STM_EOVERFLOW;
 
@@ -243,9 +291,9 @@ stm_status stm_extent_write(stm_extent_index *idx,
         must_unlock(&idx->lock);
         return STM_EINVAL;                       /* BirthTxgBound */
     }
-    if (paddr_in_use_locked(idx, paddr)) {
+    if (any_paddr_in_use_locked(idx, paddrs, n_paddrs)) {
         must_unlock(&idx->lock);
-        return STM_EEXIST;                       /* PaddrFreshness */
+        return STM_EEXIST;                       /* LiveReplicasDisjoint */
     }
     if (overlap_in_ino_locked(idx, dataset_id, ino, off, len)) {
         must_unlock(&idx->lock);
@@ -255,8 +303,10 @@ stm_status stm_extent_write(stm_extent_index *idx,
     stm_extent_record rec = {
         .dataset_id = dataset_id, .ino = ino,
         .off = off, .len = len,
-        .paddr = paddr, .gen = write_gen,
+        .n_replicas = (uint8_t)n_paddrs,
+        .gen = write_gen,
     };
+    for (size_t i = 0; i < n_paddrs; i++) rec.paddrs[i] = paddrs[i];
     stm_status as = append_record_locked(idx, &rec);
     if (as == STM_OK) idx->dirty = true;
     must_unlock(&idx->lock);
@@ -266,7 +316,9 @@ stm_status stm_extent_write(stm_extent_index *idx,
 stm_status stm_extent_overwrite(stm_extent_index *idx,
                                   uint64_t dataset_id, uint64_t ino,
                                   uint64_t off, uint64_t len,
-                                  uint64_t new_paddr, uint64_t write_gen,
+                                  const uint64_t *new_paddrs,
+                                  size_t n_new_paddrs,
+                                  uint64_t write_gen,
                                   uint64_t **out_dropped_paddrs,
                                   size_t *out_n_dropped) {
     /* R34 P2-1: zero out-args before any early return so the header
@@ -279,7 +331,8 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
     if (!idx) return STM_EINVAL;
     if (dataset_id == 0 || ino == 0) return STM_EINVAL;
     if (len == 0) return STM_EINVAL;
-    if (new_paddr == 0) return STM_EINVAL;
+    if (!new_paddrs) return STM_EINVAL;
+    if (!replica_set_is_valid(new_paddrs, n_new_paddrs)) return STM_EINVAL;
     if (off > UINT64_MAX - len) return STM_EOVERFLOW;
 
     must_lock(&idx->lock);
@@ -290,9 +343,10 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
     }
 
     /* First pass: collect indices of overlapping extents in (ds, ino).
-     * Cycle check: new_paddr must NOT match any extent we're about to
-     * drop (caller bug — overwrite can't reuse the same paddr it's
-     * dropping, since the allocator's NoReuseInSameGen forbids it). */
+     * Cycle check: no new replica paddr may match any paddr in any
+     * to-be-dropped extent's replica set (caller bug — overwrite
+     * can't reuse a paddr it's dropping; allocator.tla::
+     * NoReuseInSameGen forbids it for the alloc-issuance side). */
     size_t *drop_idx = NULL;
     size_t  n_drops  = 0;
     size_t  cap      = 0;
@@ -300,10 +354,14 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
         const stm_extent_record *e = &idx->records[i];
         if (e->dataset_id != dataset_id || e->ino != ino) continue;
         if (!ranges_overlap(e->off, e->len, off, len)) continue;
-        if (e->paddr == new_paddr) {
-            free(drop_idx);
-            must_unlock(&idx->lock);
-            return STM_EINVAL;                   /* cycle */
+        for (size_t k = 0; k < n_new_paddrs; k++) {
+            for (uint8_t r = 0; r < e->n_replicas; r++) {
+                if (e->paddrs[r] == new_paddrs[k]) {
+                    free(drop_idx);
+                    must_unlock(&idx->lock);
+                    return STM_EINVAL;           /* cycle */
+                }
+            }
         }
         if (n_drops == cap) {
             size_t new_cap = cap == 0 ? 4u : cap * 2u;
@@ -319,19 +377,32 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
         drop_idx[n_drops++] = i;
     }
 
-    /* PaddrFreshness on new_paddr: must not collide with any LIVE
-     * extent. (We've already checked it's not in the drop set, so a
-     * non-dropped match is a true conflict.) */
-    if (paddr_in_use_locked(idx, new_paddr)) {
-        free(drop_idx);
-        must_unlock(&idx->lock);
-        return STM_EEXIST;
+    /* LiveReplicasDisjoint on new_paddrs: none may collide with any
+     * surviving (non-dropped) live extent's replica set. The drop set
+     * is already cycle-checked above. */
+    for (size_t k = 0; k < n_new_paddrs; k++) {
+        bool in_drop = false;
+        for (size_t i = 0; i < n_drops && !in_drop; i++) {
+            const stm_extent_record *e = &idx->records[drop_idx[i]];
+            for (uint8_t r = 0; r < e->n_replicas; r++) {
+                if (e->paddrs[r] == new_paddrs[k]) { in_drop = true; break; }
+            }
+        }
+        if (!in_drop && paddr_in_use_locked(idx, new_paddrs[k])) {
+            free(drop_idx);
+            must_unlock(&idx->lock);
+            return STM_EEXIST;
+        }
     }
+
+    /* Total replicas across dropped extents — buffer size for the
+     * flattened drop set. */
+    size_t total_drops = total_replicas_in_drop_set(idx, drop_idx, n_drops);
 
     /* Allocate the dropped-paddr buffer (if any drops). */
     uint64_t *out_buf = NULL;
-    if (n_drops > 0) {
-        out_buf = calloc(n_drops, sizeof(uint64_t));
+    if (total_drops > 0) {
+        out_buf = calloc(total_drops, sizeof(uint64_t));
         if (!out_buf) {
             free(drop_idx);
             must_unlock(&idx->lock);
@@ -357,9 +428,10 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
         idx->cap_records = new_cap;
     }
 
-    /* Compact + emit dropped paddrs. */
+    /* Compact + emit dropped paddrs (flattened across replicas). */
+    size_t emitted = 0;
     if (n_drops > 0) {
-        remove_indices_locked(idx, drop_idx, n_drops, out_buf);
+        emitted = remove_indices_locked(idx, drop_idx, n_drops, out_buf);
     }
     free(drop_idx);
 
@@ -368,12 +440,14 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
     stm_extent_record rec = {
         .dataset_id = dataset_id, .ino = ino,
         .off = off, .len = len,
-        .paddr = new_paddr, .gen = write_gen,
+        .n_replicas = (uint8_t)n_new_paddrs,
+        .gen = write_gen,
     };
+    for (size_t i = 0; i < n_new_paddrs; i++) rec.paddrs[i] = new_paddrs[i];
     idx->records[idx->n_records++] = rec;
 
     *out_dropped_paddrs = out_buf;
-    *out_n_dropped      = n_drops;
+    *out_n_dropped      = emitted;
     idx->dirty = true;
     must_unlock(&idx->lock);
     return STM_OK;
@@ -388,6 +462,9 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
  * The predicate is encoded by the boolean `delete_all`; if not set,
  * threshold is the truncation off cutoff. Caller already validated
  * args.
+ *
+ * P7-6: dropped paddrs are flattened across each dropped extent's
+ * full replica set.
  */
 static stm_status drop_by_predicate_locked(stm_extent_index *idx,
                                               uint64_t ds, uint64_t ino,
@@ -423,17 +500,18 @@ static stm_status drop_by_predicate_locked(stm_extent_index *idx,
         return STM_OK;
     }
 
-    uint64_t *paddrs = calloc(n_drops, sizeof(uint64_t));
+    size_t total_drops = total_replicas_in_drop_set(idx, drop_idx, n_drops);
+    uint64_t *paddrs = calloc(total_drops, sizeof(uint64_t));
     if (!paddrs) {
         free(drop_idx);
         return STM_ENOMEM;
     }
 
-    remove_indices_locked(idx, drop_idx, n_drops, paddrs);
+    size_t emitted = remove_indices_locked(idx, drop_idx, n_drops, paddrs);
     free(drop_idx);
 
     *out_paddrs = paddrs;
-    *out_n      = n_drops;
+    *out_n      = emitted;
     return STM_OK;
 }
 
@@ -518,14 +596,17 @@ stm_status stm_extent_lookup_by_paddr(const stm_extent_index *idx,
 
     pthread_mutex_t *lock = ex_lock(idx);
     must_lock(lock);
-    /* Live-paddr PaddrFreshness: no two live extents share a paddr;
-     * first match suffices. */
+    /* P7-6: scan each extent's replica set. extent.tla::
+     * LiveReplicasDisjoint guarantees no paddr appears in two live
+     * extents' replicas, so first match suffices. */
     for (size_t i = 0; i < idx->n_records; i++) {
         const stm_extent_record *e = &idx->records[i];
-        if (e->paddr == paddr) {
-            *out_extent = *e;
-            must_unlock(lock);
-            return STM_OK;
+        for (uint8_t r = 0; r < e->n_replicas; r++) {
+            if (e->paddrs[r] == paddr) {
+                *out_extent = *e;
+                must_unlock(lock);
+                return STM_OK;
+            }
         }
     }
     must_unlock(lock);
@@ -614,17 +695,31 @@ stm_status stm_extent_count_for_ino(const stm_extent_index *idx,
 }
 
 /* =========================================================================
- * Persistence (P7-3, v12).
+ * Persistence (P7-3, v12; extended for replicas in P7-6, v13).
  *
  * Mirrors src/snapshot/snapshot.c's persistence section. Same envelope:
  * btree_store-encoded, AEAD-encrypted Bε-tree on device 0, with nonce
  * paddr‖gen‖pool_uuid + AD pool_uuid‖device_uuid_0. Idempotent commit
  * via internal dirty flag; atomic shadow swap on load_at; structural
  * validator on the loaded shadow before swap.
+ *
+ * P7-6 / v13 value layout (64 bytes):
+ *
+ *   off  size  field
+ *     0    1   n_replicas       (u8; 1..STM_EXTENT_MAX_REPLICAS=4)
+ *     1    7   reserved         (zero)
+ *     8    8   paddr_0          (le64; always non-zero)
+ *    16    8   paddr_1          (le64; 0 if n_replicas < 2)
+ *    24    8   paddr_2          (le64; 0 if n_replicas < 3)
+ *    32    8   paddr_3          (le64; 0 if n_replicas < 4)
+ *    40    8   write_gen        (le64)
+ *    48    4   dlen             (le32; logical byte length)
+ *    52    4   clen_and_comp    (le32; low 24: stored len; high 8: comp)
+ *    56    8   xxh              (le64; 0 in MVP — AEAD tag is integrity)
  * ========================================================================= */
 
 #define EX_KEY_LEN              24u                          /* ds + ino + off */
-#define EX_VAL_LEN              32u                          /* ARCH §11.6.1   */
+#define EX_VAL_LEN              64u                          /* P7-6 / v13     */
 /* MVP cap: 24-bit length so dlen + clen_and_comp.clen both fit without
  * compression. Production extends with chunking / per-extent integrity. */
 #define EX_LEN_MAX_24BIT        UINT32_C(0x00FFFFFF)
@@ -654,27 +749,37 @@ static stm_status ex_decode_key(const uint8_t *in, size_t in_len,
 
 static stm_status ex_encode_value(const stm_extent_record *r,
                                      uint8_t out[EX_VAL_LEN]) {
-    /* MVP cap on length (see header). dlen and clen both equal
-     * r->len — extent records track LOGICAL plaintext length;
-     * AEAD tag overhead lives with the allocator's per-range size
-     * tracking (stm_alloc_free uses paddr alone, allocator knows
-     * the run length internally). Compressed-extent path would
-     * later distinguish dlen vs clen; encryption alone does not
-     * require it for the MVP. */
+    /* MVP cap on length. dlen and clen both equal r->len — extent
+     * records track LOGICAL plaintext length; AEAD tag overhead lives
+     * with the allocator's per-range size tracking (stm_alloc_free
+     * uses paddr alone, allocator knows the run length internally). */
     if (r->len > EX_LEN_MAX_24BIT) return STM_ERANGE;
+    if (r->n_replicas < 1 || r->n_replicas > STM_EXTENT_MAX_REPLICAS)
+        return STM_ECORRUPT;
 
-    le64 paddr      = stm_store_le64(r->paddr);
-    le64 write_gen  = stm_store_le64(r->gen);
-    le32 dlen       = stm_store_le32((uint32_t)r->len);
+    /* Zero entire buffer first so unused replica slots + reserved
+     * bytes are deterministic-zero. */
+    memset(out, 0, EX_VAL_LEN);
+
+    out[0] = r->n_replicas;
+    /* bytes [1..7] reserved (zero, already zeroed above). */
+    for (uint8_t i = 0; i < r->n_replicas; i++) {
+        if (r->paddrs[i] == 0) return STM_ECORRUPT; /* sentinel guard */
+        le64 p = stm_store_le64(r->paddrs[i]);
+        memcpy(out + 8 + (size_t)i * 8, p.v, 8);
+    }
+    /* Trailing replica slots already zero from memset. */
+
+    le64 write_gen = stm_store_le64(r->gen);
+    le32 dlen      = stm_store_le32((uint32_t)r->len);
     uint32_t clen_and_comp = (uint32_t)r->len & 0x00FFFFFFu;
     le32 cac        = stm_store_le32(clen_and_comp);
     le64 xxh        = stm_store_le64((uint64_t)0); /* AEAD-only mode */
 
-    memcpy(out + 0,  paddr.v,     8);
-    memcpy(out + 8,  write_gen.v, 8);
-    memcpy(out + 16, dlen.v,      4);
-    memcpy(out + 20, cac.v,       4);
-    memcpy(out + 24, xxh.v,       8);
+    memcpy(out + 40, write_gen.v, 8);
+    memcpy(out + 48, dlen.v,      4);
+    memcpy(out + 52, cac.v,       4);
+    memcpy(out + 56, xxh.v,       8);
     return STM_OK;
 }
 
@@ -682,13 +787,38 @@ static stm_status ex_decode_value(const uint8_t *in, size_t in_len,
                                      uint64_t ds, uint64_t ino, uint64_t off,
                                      stm_extent_record *out_rec) {
     if (in_len != EX_VAL_LEN) return STM_ECORRUPT;
-    le64 paddr_le, write_gen_le, xxh_le;
+
+    uint8_t n_replicas = in[0];
+    if (n_replicas < 1 || n_replicas > STM_EXTENT_MAX_REPLICAS)
+        return STM_ECORRUPT;
+    /* bytes [1..7] reserved — must be zero (anti-tamper). */
+    for (size_t i = 1; i < 8; i++) if (in[i] != 0) return STM_ECORRUPT;
+
+    /* Decode all 4 replica slots; verify trailing slots are zero. */
+    uint64_t paddrs[STM_EXTENT_MAX_REPLICAS];
+    for (uint8_t i = 0; i < STM_EXTENT_MAX_REPLICAS; i++) {
+        le64 p_le;
+        memcpy(p_le.v, in + 8 + (size_t)i * 8, 8);
+        paddrs[i] = stm_load_le64(p_le);
+        if (i < n_replicas) {
+            if (paddrs[i] == 0) return STM_ECORRUPT;  /* must be set */
+        } else {
+            if (paddrs[i] != 0) return STM_ECORRUPT;  /* must be zero */
+        }
+    }
+    /* Within-set distinctness — no replica paddr appears twice. */
+    for (uint8_t i = 0; i < n_replicas; i++) {
+        for (uint8_t j = (uint8_t)(i + 1); j < n_replicas; j++) {
+            if (paddrs[i] == paddrs[j]) return STM_ECORRUPT;
+        }
+    }
+
+    le64 write_gen_le, xxh_le;
     le32 dlen_le, cac_le;
-    memcpy(paddr_le.v,     in + 0,  8);
-    memcpy(write_gen_le.v, in + 8,  8);
-    memcpy(dlen_le.v,      in + 16, 4);
-    memcpy(cac_le.v,       in + 20, 4);
-    memcpy(xxh_le.v,       in + 24, 8);
+    memcpy(write_gen_le.v, in + 40, 8);
+    memcpy(dlen_le.v,      in + 48, 4);
+    memcpy(cac_le.v,       in + 52, 4);
+    memcpy(xxh_le.v,       in + 56, 8);
 
     uint32_t dlen = stm_load_le32(dlen_le);
     uint32_t cac  = stm_load_le32(cac_le);
@@ -705,13 +835,14 @@ static stm_status ex_decode_value(const uint8_t *in, size_t in_len,
     out_rec->ino        = ino;
     out_rec->off        = off;
     out_rec->len        = (uint64_t)dlen;
-    out_rec->paddr      = stm_load_le64(paddr_le);
+    out_rec->n_replicas = n_replicas;
+    for (uint8_t i = 0; i < STM_EXTENT_MAX_REPLICAS; i++) {
+        out_rec->paddrs[i] = paddrs[i];
+    }
     out_rec->gen        = stm_load_le64(write_gen_le);
     /* xxh ignored in MVP (AEAD tag is integrity). */
     (void)xxh_le;
 
-    /* Sanity: paddr=0 is reserved sentinel. */
-    if (out_rec->paddr == 0) return STM_ECORRUPT;
     return STM_OK;
 }
 
@@ -975,10 +1106,11 @@ static int ex_load_iter(const void *k, size_t klen,
 /* Structural validator on the loaded shadow. Catches extents that
  * decode byte-clean but violate extent.tla invariants:
  *   - NoOverlapWithinIno: pairwise overlap check within each (ds, ino).
- *   - PaddrFreshness (live-paddr): no two records share a paddr.
- * O(N²) for the MVP — fine for any plausible mount. Production-grade
- * persistence (chunked / per-inode trees) revisits this with a sorted-
- * merge strategy.
+ *   - LiveReplicasDisjoint (P7-6): no paddr appears in two records'
+ *     replica sets.
+ * O(N² · K²) where K = STM_EXTENT_MAX_REPLICAS — fine for any plausible
+ * mount. Production-grade persistence (chunked / per-inode trees)
+ * revisits this with a sorted-merge strategy.
  */
 static stm_status ex_validate_shadow(const ex_load_ctx *lc) {
     /* NoOverlapWithinIno + LengthPositive (already enforced at decode). */
@@ -991,7 +1123,12 @@ static stm_status ex_validate_shadow(const ex_load_ctx *lc) {
                     return STM_ECORRUPT;
                 }
             }
-            if (a->paddr == b->paddr) return STM_ECORRUPT;
+            /* Cross-record replica-set disjointness. */
+            for (uint8_t ai = 0; ai < a->n_replicas; ai++) {
+                for (uint8_t bi = 0; bi < b->n_replicas; bi++) {
+                    if (a->paddrs[ai] == b->paddrs[bi]) return STM_ECORRUPT;
+                }
+            }
         }
     }
     return STM_OK;
