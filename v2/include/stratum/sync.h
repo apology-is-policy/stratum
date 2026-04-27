@@ -852,6 +852,19 @@ struct stm_extent_index;
 typedef struct stm_extent_index stm_extent_index;
 stm_extent_index *stm_sync_extent_index(stm_sync *s);
 
+/*
+ * P7-15: repair-log index handle. Same lifetime + thread-safety
+ * contract as the other index accessors above. Production callers
+ * never emit directly — entries are appended by the scrub β
+ * verify-callback (`sync_scrub_verify_cb`) on every successful
+ * Phase-3 rewrite. Tests can reach the handle to inspect the in-
+ * RAM list or drive `stm_repair_log_index_emit` synthetically;
+ * any emit persists on the next `stm_sync_commit`.
+ */
+struct stm_repair_log_index;
+typedef struct stm_repair_log_index stm_repair_log_index;
+stm_repair_log_index *stm_sync_repair_log_index(stm_sync *s);
+
 /* Forward decl for stm_sync_scrub_install_production_cb below. The
  * full type lives in <stratum/scrub.h>; including it here would create
  * a cycle (scrub.h includes types.h which already pulls sync's deps).

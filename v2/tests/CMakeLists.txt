@@ -68,6 +68,7 @@ stm_add_test(test_cdc        test_cdc.c)
 stm_add_test(test_dataset    test_dataset.c)
 stm_add_test(test_snapshot   test_snapshot.c)
 stm_add_test(test_send_recv  test_send_recv.c)
+stm_add_test(test_repair_log test_repair_log.c)
 
 # The crash-injection fuzzer runs ~168 independent format+mount+unmount
 # cycles and takes ~25 s on default, ~42 s under ASan/TSan. Bump the

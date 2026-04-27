@@ -17,6 +17,7 @@
 #include <stratum/fs.h>
 #include <stratum/fs_testing.h>
 #include <stratum/keyfile.h>
+#include <stratum/repair_log.h>
 #include <stratum/scrub.h>
 #include <stratum/snapshot.h>
 #include <stratum/snapshot_testing.h>
@@ -1566,6 +1567,77 @@ STM_TEST(fs_snap_chain_inversion_on_disk_refused_at_mount) {
     STM_ASSERT_ERR(stm_fs_mount(g_tmp_path, &mopts, &fs2), STM_ECORRUPT);
     STM_ASSERT(fs2 == NULL);
 
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* ========================================================================= */
+/* P7-15: repair-log persistence end-to-end through fs.                       */
+/* ========================================================================= */
+
+static int repair_log_count_cb(const stm_repair_log_entry *e, void *ctx)
+{
+    (void)e;
+    *(size_t *)ctx += 1;
+    return 0;
+}
+
+STM_TEST(fs_repair_log_persists_emit_across_mount) {
+    /* P7-15 end-to-end through fs: emit a synthetic repair-log entry
+     * via the sync accessor (the production scrub cb hooks the same
+     * emit path on every Phase-3 rewrite), commit + unmount, then
+     * remount and confirm the entry comes back via load_at. */
+    make_tmp("rlog_persist");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    STM_ASSERT(sync != NULL);
+    stm_repair_log_index *rl = stm_sync_repair_log_index(sync);
+    STM_ASSERT(rl != NULL);
+    STM_ASSERT_EQ(stm_repair_log_index_count(rl), 0u);
+
+    /* Emit a synthetic repair record matching what the scrub cb
+     * produces (target/source paddrs distinct; CSUM_FAIL → OK_VERIFIED). */
+    stm_repair_log_entry e = {
+        .timestamp_ns = 1234567890u,
+        .target_paddr = 0xAA00,
+        .source_paddr = 0xBB00,
+        .target_replica_idx = 1,
+        .source_replica_idx = 0,
+        .type = STM_REPAIR_TYPE_CSUM_FAIL,
+        .result = STM_REPAIR_RESULT_OK_VERIFIED,
+    };
+    uint64_t out_seq = 99;
+    STM_ASSERT_OK(stm_repair_log_index_emit(rl, &e, &out_seq));
+    STM_ASSERT_EQ(out_seq, 0u);
+
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    /* Remount; the entry should be loaded from disk. */
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    sync = stm_fs_sync_for_test(fs);
+    rl = stm_sync_repair_log_index(sync);
+    STM_ASSERT(rl != NULL);
+    STM_ASSERT_EQ(stm_repair_log_index_count(rl), 1u);
+
+    /* Iterate and confirm the field roundtripped. */
+    size_t n = 0;
+    STM_ASSERT_OK(stm_repair_log_index_iter(rl, repair_log_count_cb, &n));
+    STM_ASSERT_EQ(n, 1u);
+
+    /* Subsequent emit assigns seq_id 1 (continues from durable view). */
+    e.target_paddr = 0xCC00;
+    e.source_paddr = 0xDD00;
+    STM_ASSERT_OK(stm_repair_log_index_emit(rl, &e, &out_seq));
+    STM_ASSERT_EQ(out_seq, 1u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
     unlink(g_key_path);
 }

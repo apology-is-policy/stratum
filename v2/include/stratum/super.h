@@ -215,8 +215,27 @@ extern "C" {
  * sync_create), so writes/reads to ds≥1 fail STM_ECORRUPT/STM_ENOENT
  * at runtime — same DoS posture as a (1,0) wrapped-blob tamper
  * (see R42 P1-1 mount-time hard-fail).
- * Format break, no feature flag. */
-#define STM_UB_VERSION        15u
+ * Format break, no feature flag.
+ *
+ * v16 (P7-15, this commit): repair-log persistence (ARCH §7.15.4 /
+ * bptr.tla::LogIntegrity). Adds three fields carved from the head
+ * of `ub_reserved`: `ub_repair_log_root` (16-byte stm_bptr, 64
+ * bytes total), `ub_repair_log_root_gen` (le64), and
+ * `ub_repair_log_next_seq` (le64). Repair events emitted by the
+ * production scrub β cb (csum-fail / IO-err on a replica → rewrite
+ * from a verified source) persist as append-only entries in a
+ * single-leaf btnode rooted at `ub_repair_log_root`. Plaintext +
+ * Merkle-covered (matches keyschema sub-tree shape); tree's
+ * bp_kind is `STM_BPTR_KIND_REPAIR_LOG`. v15 pools fail at the
+ * version check (STM_EBADVERSION) before reaching the new fields.
+ * Tamper-then-mount: a v15 pool whose ub_version is flipped to 16
+ * + ub_csum recomputed has zeroed `ub_repair_log_root` (sat in
+ * `ub_reserved`); load_at treats `root_paddr == 0` as the empty-
+ * pool case and seeds the in-RAM index from `ub_repair_log_next_seq`
+ * (also previously zero), so the tampered pool comes up with an
+ * empty repair-log — no corruption hazard, just a forensic gap
+ * for any pre-flip events. Format break, no feature flag. */
+#define STM_UB_VERSION        16u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */
@@ -305,6 +324,7 @@ typedef enum {
     STM_BPTR_KIND_ALLOC_ROOTS = 8,   /* allocator-roots object (ARCH §6.1, P5-3b) */
     STM_BPTR_KIND_DATASET     = 9,   /* dataset-index tree root (ARCH §8.3.2, P6-persist) */
     STM_BPTR_KIND_EXTENT_TREE = 10,  /* extent-index tree root (ARCH §11.6, P7-3) */
+    STM_BPTR_KIND_REPAIR_LOG  = 11,  /* repair-log tree root (ARCH §7.15.4, P7-15) */
 } stm_bptr_kind;
 
 typedef struct {
@@ -435,8 +455,37 @@ typedef struct {
      * Zero before the first commit. */
     le64    ub_extent_root_gen;                 /* 3192 :  8 */
 
+    /* Repair-log tree root (P7-15, v16). Bptr to the single-leaf
+     * btnode-encoded, plaintext + Merkle-covered tree under
+     * `ub_repair_log_root` on device 0. Keys: 8-byte big-endian
+     * seq_id. Values: 32-byte ARCH §7.15.4 record (timestamp +
+     * paddrs + corruption type + verification result). The tree's
+     * bp_kind is `STM_BPTR_KIND_REPAIR_LOG`. Zero before the first
+     * commit. ARCH §7.15.4, spec bptr.tla::LogIntegrity. */
+    stm_bptr ub_repair_log_root;                /* 3200 : 64 */
+
+    /* Gen at which `ub_repair_log_root`'s tree was last serialized
+     * (P7-15, v16). Plaintext nodes don't take an AEAD nonce, but
+     * the gen is recorded for symmetry with the other tree-root
+     * gen trackers and for future-proofing if the repair log
+     * graduates to AEAD-encrypted multi-leaf encoding. Zero before
+     * the first commit. */
+    le64    ub_repair_log_root_gen;             /* 3264 :  8 */
+
+    /* Monotonic seq_id allocator for the repair log (P7-15, v16).
+     * Persisted on every commit so post-mount emits continue from
+     * the durable view (rather than restarting from 0, which would
+     * let new entries collide with persisted seq_ids).
+     *
+     * Invariant: `ub_repair_log_next_seq` > seq_id of every entry
+     * persisted in `ub_repair_log_root`'s tree. Cross-checked at
+     * `stm_repair_log_index_load_at` time (a tampered counter set
+     * lower than an existing entry's seq surfaces as STM_ECORRUPT
+     * during the load). Zero before the first commit. */
+    le64    ub_repair_log_next_seq;             /* 3272 :  8 */
+
     /* Reserved for future fields + alignment to csum. */
-    uint8_t ub_reserved[864];                   /* 3200 : 864 */
+    uint8_t ub_reserved[784];                   /* 3280 : 784 */
 
     /* Checksum: BLAKE3-256 over the rest of the uberblock with this
      * field zeroed. Self-verifying; a blob whose first 4064 bytes
@@ -457,8 +506,14 @@ _Static_assert(offsetof(stm_uberblock, ub_extent_root) == 3128,
                "ub_extent_root must be at offset 3128 (v12 layout)");
 _Static_assert(offsetof(stm_uberblock, ub_extent_root_gen) == 3192,
                "ub_extent_root_gen must be at offset 3192 (v12 layout)");
-_Static_assert(offsetof(stm_uberblock, ub_reserved) == 3200,
-               "ub_reserved must be at offset 3200 (v12 layout)");
+_Static_assert(offsetof(stm_uberblock, ub_repair_log_root) == 3200,
+               "ub_repair_log_root must be at offset 3200 (v16 layout)");
+_Static_assert(offsetof(stm_uberblock, ub_repair_log_root_gen) == 3264,
+               "ub_repair_log_root_gen must be at offset 3264 (v16 layout)");
+_Static_assert(offsetof(stm_uberblock, ub_repair_log_next_seq) == 3272,
+               "ub_repair_log_next_seq must be at offset 3272 (v16 layout)");
+_Static_assert(offsetof(stm_uberblock, ub_reserved) == 3280,
+               "ub_reserved must be at offset 3280 (v16 layout)");
 _Static_assert(offsetof(stm_uberblock, ub_csum) == 4064,
                "ub_csum must be at offset 4064");
 

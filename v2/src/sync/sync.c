@@ -41,6 +41,7 @@
 #include <stratum/janus.h>
 #include <stratum/keyfile.h>
 #include <stratum/keyschema.h>
+#include <stratum/repair_log.h>
 #include <stratum/pool.h>
 #include <stratum/scrub.h>
 #include <stratum/snapshot.h>
@@ -50,6 +51,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* Dataset id for the pool's metadata-encryption key. Every pool has
  * a fixed (0, 0) entry for the metadata-node AEAD. Rotating dataset 0
@@ -238,6 +240,13 @@ struct stm_sync {
      * mapping for every regular file. */
     stm_extent_index   *extent_idx;
 
+    /* P7-15 (v16): repair-log sub-tree (ARCH §7.15.4 /
+     * bptr.tla::LogIntegrity). Persists every scrub-driven replica
+     * rewrite as an append-only audit entry. Plaintext + Merkle-
+     * covered (matches keyschema's shape; no AEAD). Owned by sync;
+     * closed on stm_sync_close. */
+    stm_repair_log_index *repair_log;
+
     /* Durable mirror of ub_main_root / ub_snap_root state, last-
      * committed. Updated on successful sync_commit; consumed by
      * claim/reservation-phase build_uberblock to keep the prior
@@ -251,6 +260,10 @@ struct stm_sync {
     uint64_t           extent_root_paddr;
     uint64_t           extent_root_gen;
     uint8_t            extent_root_csum[32];
+    uint64_t           repair_log_root_paddr;
+    uint64_t           repair_log_root_gen;
+    uint8_t            repair_log_root_csum[32];
+    uint64_t           repair_log_next_seq;
 
     /* Mirror of ub_next_dataset_id / ub_next_snap_id. Sourced from the
      * indices' get_next_id at commit; restored at mount via
@@ -644,6 +657,10 @@ static void build_uberblock(stm_uberblock *out,
                               uint64_t extent_root_paddr,
                               const uint8_t extent_root_csum[32],
                               uint64_t extent_root_gen,
+                              uint64_t repair_log_root_paddr,
+                              const uint8_t repair_log_root_csum[32],
+                              uint64_t repair_log_root_gen,
+                              uint64_t repair_log_next_seq,
                               const uint8_t merkle_root[32],
                               const stm_alloc_stats *astats)
 {
@@ -708,6 +725,19 @@ static void build_uberblock(stm_uberblock *out,
         memcpy(out->ub_extent_root.bp_csum, extent_root_csum, 32);
     }
     out->ub_extent_root_gen = stm_store_le64(extent_root_gen);
+
+    /* P7-15 (v16): repair-log tree root + gen + next_seq counter.
+     * Plaintext + Merkle-covered (no AEAD); the gen field tracks
+     * which commit last serialized the tree, symmetric to the
+     * other tree-root gen trackers. next_seq is the monotonic
+     * seq_id allocator persisted across mounts. */
+    if (repair_log_root_paddr != 0) {
+        out->ub_repair_log_root.bp_paddr = stm_store_le64(repair_log_root_paddr);
+        out->ub_repair_log_root.bp_kind  = STM_BPTR_KIND_REPAIR_LOG;
+        memcpy(out->ub_repair_log_root.bp_csum, repair_log_root_csum, 32);
+    }
+    out->ub_repair_log_root_gen = stm_store_le64(repair_log_root_gen);
+    out->ub_repair_log_next_seq = stm_store_le64(repair_log_next_seq);
 
     /* Pool-wide id counters (ARCH §5.4). Stamped from the indices'
      * get_next_id; restored at mount via the indices' set_next_id. */
@@ -1049,6 +1079,13 @@ stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
         if (rc != STM_OK) { stm_sync_close(s); return rc; }
         rc = stm_extent_index_set_crypt_ctx(s->extent_idx, s->metadata_key,
                                                 s->pool_uuid, s->device_uuid);
+        if (rc != STM_OK) { stm_sync_close(s); return rc; }
+
+        /* P7-15: repair-log index. Plaintext + Merkle-covered (no
+         * crypt ctx); on-disk layout matches keyschema's. First
+         * sync_commit lays down the empty leaf so subsequent mounts
+         * find a valid bptr. */
+        rc = stm_repair_log_index_create(d, boot, &s->repair_log);
         if (rc != STM_OK) { stm_sync_close(s); return rc; }
 
         /* P6-clone: register the clone-dependency check on snap_idx.
@@ -1643,6 +1680,42 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
         s2->extent_root_gen   = egen;
         memcpy(s2->extent_root_csum, ub.ub_extent_root.bp_csum, 32);
 
+        /* P7-15: repair-log index. Plaintext + Merkle-covered, so
+         * load_at takes (root_paddr, expected_csum) plus the
+         * persisted next_seq counter. The next_seq is cross-checked
+         * against the loaded entries' max seq_id (a tampered
+         * counter set lower than an existing entry's seq surfaces
+         * as STM_ECORRUPT in load_at). */
+        stm_status ri = stm_repair_log_index_create(meta_bdev, boot2,
+                                                       &s2->repair_log);
+        if (ri != STM_OK) { stm_sync_close(s2); return ri; }
+
+        uint64_t rl_paddr    = stm_load_le64(ub.ub_repair_log_root.bp_paddr);
+        uint64_t rl_gen      = stm_load_le64(ub.ub_repair_log_root_gen);
+        uint64_t rl_next_seq = stm_load_le64(ub.ub_repair_log_next_seq);
+        if (rl_paddr != 0) {
+            if (ub.ub_repair_log_root.bp_kind != STM_BPTR_KIND_REPAIR_LOG) {
+                stm_sync_close(s2);
+                return STM_ECORRUPT;
+            }
+            stm_status ls = stm_repair_log_index_load_at(s2->repair_log,
+                                                            rl_paddr,
+                                                            ub.ub_repair_log_root.bp_csum,
+                                                            rl_next_seq);
+            if (ls != STM_OK) { stm_sync_close(s2); return ls; }
+        } else {
+            /* Empty (fresh-pool) path: still seed the in-RAM seq
+             * counter from the persisted UB field for symmetry. */
+            stm_status ls = stm_repair_log_index_load_at(s2->repair_log,
+                                                            /*root_paddr=*/0,
+                                                            NULL, rl_next_seq);
+            if (ls != STM_OK) { stm_sync_close(s2); return ls; }
+        }
+        s2->repair_log_root_paddr = rl_paddr;
+        s2->repair_log_root_gen   = rl_gen;
+        s2->repair_log_next_seq   = rl_next_seq;
+        memcpy(s2->repair_log_root_csum, ub.ub_repair_log_root.bp_csum, 32);
+
         /* P6-clone: register the clone-dependency check now that both
          * indices are populated. Snap delete refuses while any present
          * clone in dataset_idx references the target snap. */
@@ -1693,6 +1766,10 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
                          /*extent_root=*/       s2->extent_root_paddr,
                          /*extent_csum=*/       s2->extent_root_csum,
                          /*extent_gen=*/        s2->extent_root_gen,
+                         /*repair_log_root=*/   s2->repair_log_root_paddr,
+                         /*repair_log_csum=*/   s2->repair_log_root_csum,
+                         /*repair_log_gen=*/    s2->repair_log_root_gen,
+                         /*repair_log_seq=*/    s2->repair_log_next_seq,
                          /*merkle_root=*/       ub.ub_merkle_root,
                          &astats_claim);
         uint32_t lbl  = ring_label_for_gen(auth_gen + 1);
@@ -1760,6 +1837,8 @@ void stm_sync_close(stm_sync *s)
     if (s->snap_idx)    stm_snapshot_index_close(s->snap_idx);
     /* P7-3: close the extent index. Same shape as dataset/snap. */
     if (s->extent_idx)  stm_extent_index_close(s->extent_idx);
+    /* P7-15: close the repair-log index. */
+    if (s->repair_log)  stm_repair_log_index_close(s->repair_log);
     /* P5-3b: close the allocator-roots handle. Owns its own
      * in-RAM btree; borrows bdev + bootstrap + metadata_key. */
     if (s->roots) stm_alloc_roots_close(s->roots);
@@ -1852,6 +1931,10 @@ stm_status stm_sync_commit(stm_sync *s)
                          /*extent_root=*/       s->extent_root_paddr,
                          /*extent_csum=*/       s->extent_root_csum,
                          /*extent_gen=*/        s->extent_root_gen,
+                         /*repair_log_root=*/   s->repair_log_root_paddr,
+                         /*repair_log_csum=*/   s->repair_log_root_csum,
+                         /*repair_log_gen=*/    s->repair_log_root_gen,
+                         /*repair_log_seq=*/    s->repair_log_next_seq,
                          /*merkle_root=*/       s->merkle_root,
                          &astats_res);
         uint32_t res_label = ring_label_for_gen(reservation_gen);
@@ -2030,6 +2113,22 @@ stm_status stm_sync_commit(stm_sync *s)
         return ecs;
     }
 
+    /* P7-15 (v16): commit the repair-log index. Plaintext +
+     * Merkle-covered (no AEAD); idempotent when no emit since last
+     * commit (R14b P2-1 pattern). Returns (paddr, csum, next_seq)
+     * for stamping into the uberblock. */
+    uint64_t repair_log_paddr = 0;
+    uint8_t  repair_log_csum[32] = {0};
+    uint64_t repair_log_seq = 0;
+    stm_status rls = stm_repair_log_index_commit(s->repair_log, target_gen,
+                                                    &repair_log_paddr,
+                                                    repair_log_csum,
+                                                    &repair_log_seq);
+    if (rls != STM_OK) {
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
+        return rls;
+    }
+
     stm_alloc_stats astats;
     stm_status sr = stm_alloc_stats_get(s->alloc, &astats);
     if (sr != STM_OK) {
@@ -2067,6 +2166,8 @@ stm_status stm_sync_commit(stm_sync *s)
                      main_paddr, main_csum, main_gen, main_next_id,
                      snap_paddr, snap_csum, snap_gen, snap_next_id,
                      extent_paddr, extent_csum, extent_gen,
+                     repair_log_paddr, repair_log_csum,
+                     /*repair_log_gen=*/ target_gen, repair_log_seq,
                      new_merkle_root, &astats);
 
     uint32_t fin_label = ring_label_for_gen(target_gen);
@@ -2096,6 +2197,9 @@ stm_status stm_sync_commit(stm_sync *s)
     s->snap_root_gen         = snap_gen;
     s->extent_root_paddr     = extent_paddr;
     s->extent_root_gen       = extent_gen;
+    s->repair_log_root_paddr = repair_log_paddr;
+    s->repair_log_root_gen   = target_gen;
+    s->repair_log_next_seq   = repair_log_seq;
     s->next_dataset_id       = main_next_id;
     s->next_snap_id          = snap_next_id;
     memcpy(s->alloc_root_csum,     roots_csum,      32);
@@ -2103,6 +2207,7 @@ stm_status stm_sync_commit(stm_sync *s)
     memcpy(s->main_root_csum,      main_csum,      32);
     memcpy(s->snap_root_csum,      snap_csum,      32);
     memcpy(s->extent_root_csum,    extent_csum,    32);
+    memcpy(s->repair_log_root_csum, repair_log_csum, 32);
     memcpy(s->merkle_root,         new_merkle_root, 32);
 
     /* P7-4 (R35 forward note): advance the extent index's
@@ -3652,6 +3757,11 @@ stm_extent_index *stm_sync_extent_index(stm_sync *s)
     return s ? s->extent_idx : NULL;
 }
 
+stm_repair_log_index *stm_sync_repair_log_index(stm_sync *s)
+{
+    return s ? s->repair_log : NULL;
+}
+
 /* ========================================================================= */
 /* P7-4 — POSIX-shape extent write/read with full COW routing.                */
 /* ========================================================================= */
@@ -4336,14 +4446,53 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
  * buffer; ct_memzero before free.
  *
  * R38 P3-1 — repair logging (ARCH §7.15.4 / bptr.tla::LogIntegrity)
- * is deferred: the cb does NOT emit a `/ctl/.../repair-log` entry
- * per repair. scrub.h's "Not modeled here" list calls out the cb
- * implementor's responsibility; this MVP cb skips it pending the
- * observability surface (per-pool repair-log Bε-tree, schema TBD).
- * Operators MUST snapshot `blocks_repaired` / `blocks_unrepairable`
- * via `stm_scrub_status_get` to detect repair activity until the
- * log lands.
+ * P7-15 closes this: every Phase 3 rewrite emits one
+ * `stm_repair_log_entry` via `emit_repair_log_locked` with the
+ * (target_paddr, source_paddr, target_idx, source_idx, type,
+ * result) tuple. The on-disk persistence is the per-pool repair-
+ * log sub-tree rooted at `ub_repair_log_root` (P7-15 / v16); the
+ * /ctl/.../repair-log surface that ARCH §7.15.4 ultimately
+ * promises is downstream observability work. Failure paths
+ * (bdev-write failure, verify-back read failure, verify-back
+ * decrypt failure) emit a FAIL entry before goto-done so the
+ * audit trail captures the precise step that failed; success
+ * paths emit OK_VERIFIED. Pre-repair `read_outcome[j]` is
+ * recorded as the `type` field by tracking I/O vs csum failure
+ * separately during Phase 1.
  */
+static void emit_repair_log(stm_sync *s,
+                              uint64_t target_paddr, uint8_t target_idx,
+                              uint64_t source_paddr, uint8_t source_idx,
+                              stm_repair_type type, stm_repair_result result)
+{
+    if (!s || !s->repair_log) return;
+
+    struct timespec now;
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0) {
+        now.tv_sec = 0;
+        now.tv_nsec = 0;
+    }
+    uint64_t ts_ns = (uint64_t)now.tv_sec * UINT64_C(1000000000)
+                   + (uint64_t)now.tv_nsec;
+
+    stm_repair_log_entry e;
+    memset(&e, 0, sizeof e);
+    e.timestamp_ns       = ts_ns;
+    e.target_paddr       = target_paddr;
+    e.source_paddr       = source_paddr;
+    e.target_replica_idx = target_idx;
+    e.source_replica_idx = source_idx;
+    e.type               = type;
+    e.result             = result;
+
+    /* Best-effort: an emit failure (STM_EOVERFLOW after 2^64 seq_ids,
+     * STM_ENOMEM under sustained malloc pressure) doesn't make the
+     * repair worse. The numeric `blocks_repaired` counter on the
+     * scrub status remains the operator's primary signal. */
+    uint64_t out_seq = 0;
+    (void)stm_repair_log_index_emit(s->repair_log, &e, &out_seq);
+}
+
 static stm_scrub_verify_outcome
 sync_scrub_verify_cb(uint64_t paddr, void *ctx)
 {
@@ -4441,18 +4590,29 @@ sync_scrub_verify_cb(uint64_t paddr, void *ctx)
 
     /* Phase 1 (bptr.tla::ScanRead × NReplicas): read each replica,
      * AEAD-verify under canonical (rec.paddrs[0], rec.gen) nonce.
-     * Track per-replica status. */
-    bool        replica_ok[STM_EXTENT_MAX_REPLICAS] = { false };
+     * Track per-replica status. P7-15 splits non-OK into
+     * `replica_io_err[j]==true` (bdev_read failed or device
+     * unreachable) and `replica_io_err[j]==false` (read succeeded
+     * but AEAD-decrypt failed → csum-fail) so the repair-log
+     * `type` field can carry the bptr.tla `read_outcome` tag. */
+    bool        replica_ok[STM_EXTENT_MAX_REPLICAS]      = { false };
+    bool        replica_io_err[STM_EXTENT_MAX_REPLICAS]  = { false };
     int         picked = -1;
     stm_scrub_verify_outcome final_outcome = STM_SCRUB_VERIFY_UNREPAIRABLE;
 
     for (uint8_t i = 0; i < rec.n_replicas; i++) {
         uint16_t dev = stm_paddr_device(rec.paddrs[i]);
         stm_bdev *bd = stm_pool_device_bdev(s->pool, dev);
-        if (!bd) continue;
+        if (!bd) {
+            replica_io_err[i] = true;
+            continue;
+        }
         uint64_t boff = stm_paddr_offset(rec.paddrs[i]) * (uint64_t)STM_UB_SIZE;
         stm_status rs = stm_bdev_read(bd, boff, cbuf, total_bytes);
-        if (rs != STM_OK) continue;
+        if (rs != STM_OK) {
+            replica_io_err[i] = true;
+            continue;
+        }
 
         size_t pt_out = 0;
         stm_status ds = stm_extent_decrypt(mode, dek,
@@ -4467,6 +4627,7 @@ sync_scrub_verify_cb(uint64_t paddr, void *ctx)
                 memcpy(src_bytes, cbuf, total_bytes);
             }
         }
+        /* ds != STM_OK: csum-fail (replica_io_err stays false). */
     }
 
     /* Phase 2 (bptr.tla::ScanComplete): if no replica verified, the
@@ -4481,28 +4642,47 @@ sync_scrub_verify_cb(uint64_t paddr, void *ctx)
     /* Phase 3 (bptr.tla::RewriteReplica): rewrite each non-OK replica
      * from the picked source's ciphertext, then verify-back-read +
      * AEAD-check. Any verify-back failure → UNREPAIRABLE per
-     * bptr.tla::WriteVerifyMandatory. */
+     * bptr.tla::WriteVerifyMandatory.
+     *
+     * P7-15: every rewrite (success or failure) emits a
+     * `stm_repair_log_entry` via emit_repair_log so the on-disk
+     * audit trail (ARCH §7.15.4 / bptr.tla::LogIntegrity) records
+     * which replica's bytes were rewritten from which source, the
+     * bptr.tla read_outcome that prompted the repair (CSUM_FAIL vs
+     * IO_ERR, sourced from Phase 1's replica_io_err[]), and the
+     * verify-back result. Emits land on the next sync_commit. */
     bool any_rewrite = false;
     for (uint8_t j = 0; j < rec.n_replicas; j++) {
         if (replica_ok[j]) continue;
-        uint16_t dev_j = stm_paddr_device(rec.paddrs[j]);
+        stm_repair_type pre_type = replica_io_err[j] ? STM_REPAIR_TYPE_IO_ERR
+                                                      : STM_REPAIR_TYPE_CSUM_FAIL;
+        uint64_t target_paddr = rec.paddrs[j];
+        uint64_t source_paddr = rec.paddrs[picked];
+
+        uint16_t dev_j = stm_paddr_device(target_paddr);
         stm_bdev *bd_j = stm_pool_device_bdev(s->pool, dev_j);
         if (!bd_j) {
             /* Can't reach this replica's device — the extent is
              * partially unrepairable. Per bptr.tla a single
              * RewriteReplica failure → UNREPAIRABLE. */
+            emit_repair_log(s, target_paddr, j, source_paddr, (uint8_t)picked,
+                              pre_type, STM_REPAIR_RESULT_FAIL);
             final_outcome = STM_SCRUB_VERIFY_UNREPAIRABLE;
             goto done;
         }
-        uint64_t boff_j = stm_paddr_offset(rec.paddrs[j]) * (uint64_t)STM_UB_SIZE;
+        uint64_t boff_j = stm_paddr_offset(target_paddr) * (uint64_t)STM_UB_SIZE;
         stm_status ws = stm_bdev_write(bd_j, boff_j, src_bytes, total_bytes);
         if (ws != STM_OK) {
+            emit_repair_log(s, target_paddr, j, source_paddr, (uint8_t)picked,
+                              pre_type, STM_REPAIR_RESULT_FAIL);
             final_outcome = STM_SCRUB_VERIFY_UNREPAIRABLE;
             goto done;
         }
         /* Verify-back: read the bytes we just wrote and AEAD-check. */
         stm_status rs = stm_bdev_read(bd_j, boff_j, back_buf, total_bytes);
         if (rs != STM_OK) {
+            emit_repair_log(s, target_paddr, j, source_paddr, (uint8_t)picked,
+                              pre_type, STM_REPAIR_RESULT_FAIL);
             final_outcome = STM_SCRUB_VERIFY_UNREPAIRABLE;
             goto done;
         }
@@ -4512,9 +4692,13 @@ sync_scrub_verify_cb(uint64_t paddr, void *ctx)
                                               &ad, back_buf, total_bytes,
                                               pbuf, rec.len, &pt_out2);
         if (ds != STM_OK) {
+            emit_repair_log(s, target_paddr, j, source_paddr, (uint8_t)picked,
+                              pre_type, STM_REPAIR_RESULT_FAIL);
             final_outcome = STM_SCRUB_VERIFY_UNREPAIRABLE;
             goto done;
         }
+        emit_repair_log(s, target_paddr, j, source_paddr, (uint8_t)picked,
+                          pre_type, STM_REPAIR_RESULT_OK_VERIFIED);
         any_rewrite = true;
     }
 
