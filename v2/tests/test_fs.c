@@ -12,6 +12,7 @@
  */
 #include "tharness.h"
 #include <stratum/alloc.h>
+#include <stratum/dataset.h>
 #include <stratum/extent.h>
 #include <stratum/fs.h>
 #include <stratum/fs_testing.h>
@@ -1191,10 +1192,11 @@ STM_TEST(fs_keyschema_sweep_succeeds_after_overwrite_drops_ref) {
 
 STM_TEST(fs_io_unprovisioned_dataset_id_refused) {
     /* fs_write on a dataset_id that has no DEK installed must return
-     * STM_ENOENT, NOT silently encrypt under a fallback key. The fs
-     * layer doesn't yet expose a fs_create_dataset that bundles the
-     * keyschema install — until it does, only ds=1 (root) writes work
-     * out of the box. This test pins the explicit-failure contract. */
+     * STM_ENOENT, NOT silently encrypt under a fallback key. P7-13
+     * adds stm_fs_create_dataset which bundles dataset_index +
+     * keyschema provisioning; this test still pins the explicit-
+     * failure contract for ids that pre-date the create call (or
+     * were imported by other means). */
     make_tmp("dek_unprov");
     stm_fs_format_opts fopts = default_format_opts();
     STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
@@ -1253,6 +1255,233 @@ STM_TEST(fs_keyschema_mutators_refuse_on_read_only_mount) {
     STM_ASSERT_ERR(stm_sync_keyschema_sweep(sync, 1, &pruned), STM_EROFS);
 
     stm_hybrid_keys_wipe(&wk);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* ========================================================================= */
+/* P7-13: stm_fs_create_dataset.                                              */
+/* ========================================================================= */
+
+static stm_fs_create_dataset_opts default_create_dataset_opts(void)
+{
+    return (stm_fs_create_dataset_opts){
+        .keyfile_path = g_key_path,
+        .janus_socket = NULL,
+    };
+}
+
+STM_TEST(fs_create_dataset_basic_write_read_roundtrip) {
+    /* P7-13: fs_create_dataset bundles dataset_index + keyschema
+     * provisioning. The new id is immediately usable for fs_write /
+     * fs_read with no extra provisioning step. */
+    make_tmp("crd_basic");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_fs_create_dataset_opts copts = default_create_dataset_opts();
+    uint64_t new_id = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, /*parent=*/1, "home", &copts, &new_id));
+    STM_ASSERT(new_id >= 2);
+
+    /* Write + read on the new dataset works end-to-end. */
+    uint8_t buf[4096];
+    for (size_t i = 0; i < sizeof buf; i++) buf[i] = (uint8_t)(i & 0xff);
+    STM_ASSERT_OK(stm_fs_write(fs, new_id, /*ino=*/1, /*off=*/0, buf, sizeof buf));
+
+    uint8_t rbuf[4096] = {0};
+    size_t n_read = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, new_id, /*ino=*/1, /*off=*/0,
+                                  rbuf, sizeof rbuf, &n_read));
+    STM_ASSERT_EQ(n_read, sizeof rbuf);
+    STM_ASSERT_MEM_EQ(rbuf, buf, sizeof buf);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_create_dataset_parent_not_present) {
+    make_tmp("crd_noparent");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_fs_create_dataset_opts copts = default_create_dataset_opts();
+    uint64_t new_id = 0;
+    /* parent_id=999 is not PRESENT — dataset_create_child returns
+     * STM_ENOENT and we propagate. */
+    STM_ASSERT_ERR(stm_fs_create_dataset(fs, /*parent=*/999, "x", &copts, &new_id),
+                       STM_ENOENT);
+    STM_ASSERT_EQ(new_id, 0u);
+
+    /* Sibling under root should still be createable — failed call
+     * left no orphan. */
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, /*parent=*/1, "x", &copts, &new_id));
+    STM_ASSERT(new_id >= 2);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_create_dataset_name_collision) {
+    make_tmp("crd_collide");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_fs_create_dataset_opts copts = default_create_dataset_opts();
+    uint64_t a_id = 0, b_id = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "data", &copts, &a_id));
+    STM_ASSERT_ERR(stm_fs_create_dataset(fs, 1, "data", &copts, &b_id),
+                       STM_EEXIST);
+    STM_ASSERT_EQ(b_id, 0u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_create_dataset_bad_keyfile_no_index_mutation) {
+    /* A keyfile that doesn't exist fails at stm_keyfile_load BEFORE
+     * fs->lock is taken or any index is touched. The dataset_index
+     * stays at exactly its post-mount shape (just the root entry). */
+    make_tmp("crd_badkey");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_fs_create_dataset_opts copts = {
+        .keyfile_path = "/tmp/stm_v2_fs_crd_badkey_does_not_exist.key",
+        .janus_socket = NULL,
+    };
+    uint64_t new_id = 0;
+    stm_status s = stm_fs_create_dataset(fs, 1, "x", &copts, &new_id);
+    STM_ASSERT(s != STM_OK);
+    STM_ASSERT_EQ(new_id, 0u);
+
+    /* Confirm dataset_index is still at root-only by counting. */
+    stm_dataset_index *didx = stm_sync_dataset_index(stm_fs_sync_for_test(fs));
+    size_t n = 0;
+    STM_ASSERT_OK(stm_dataset_count(didx, &n));
+    STM_ASSERT_EQ(n, 1u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_create_dataset_invalid_args) {
+    make_tmp("crd_args");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_fs_create_dataset_opts copts = default_create_dataset_opts();
+    uint64_t out = 0;
+
+    STM_ASSERT_ERR(stm_fs_create_dataset(NULL, 1, "x", &copts, &out), STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_create_dataset(fs, 1, NULL, &copts, &out), STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_create_dataset(fs, 1, "x", NULL, &out),  STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_create_dataset(fs, 1, "x", &copts, NULL), STM_EINVAL);
+
+    /* Both key sources set. */
+    stm_fs_create_dataset_opts both = {
+        .keyfile_path = g_key_path,
+        .janus_socket = "/tmp/should_not_matter.sock",
+    };
+    STM_ASSERT_ERR(stm_fs_create_dataset(fs, 1, "x", &both, &out), STM_EINVAL);
+
+    /* Neither key source set. */
+    stm_fs_create_dataset_opts neither = {
+        .keyfile_path = NULL,
+        .janus_socket = NULL,
+    };
+    STM_ASSERT_ERR(stm_fs_create_dataset(fs, 1, "x", &neither, &out), STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_create_dataset_rofs_refused) {
+    make_tmp("crd_rofs");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    mopts.read_only = true;
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_fs_create_dataset_opts copts = default_create_dataset_opts();
+    uint64_t out = 0;
+    STM_ASSERT_ERR(stm_fs_create_dataset(fs, 1, "x", &copts, &out), STM_EROFS);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_create_dataset_wedged_refused) {
+    make_tmp("crd_wedged");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_fs_mark_wedged(fs);
+
+    stm_fs_create_dataset_opts copts = default_create_dataset_opts();
+    uint64_t out = 0;
+    STM_ASSERT_ERR(stm_fs_create_dataset(fs, 1, "x", &copts, &out), STM_EWEDGED);
+
+    /* Wedged unmount skips final commit. */
+    (void)stm_fs_unmount(fs);
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_create_dataset_persists_across_mount) {
+    /* Create + commit + unmount + remount: the new dataset's DEK
+     * unwraps and the data written under it reads back. */
+    make_tmp("crd_persist");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_fs_create_dataset_opts copts = default_create_dataset_opts();
+    uint64_t new_id = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "persist", &copts, &new_id));
+    STM_ASSERT(new_id >= 2);
+
+    uint8_t buf[4096];
+    for (size_t i = 0; i < sizeof buf; i++) buf[i] = (uint8_t)((i * 7) & 0xff);
+    STM_ASSERT_OK(stm_fs_write(fs, new_id, 1, 0, buf, sizeof buf));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint8_t rbuf[4096] = {0};
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, new_id, 1, 0, rbuf, sizeof rbuf, &n));
+    STM_ASSERT_EQ(n, sizeof rbuf);
+    STM_ASSERT_MEM_EQ(rbuf, buf, sizeof buf);
+
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
     unlink(g_key_path);

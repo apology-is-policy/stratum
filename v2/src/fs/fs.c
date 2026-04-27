@@ -36,6 +36,7 @@
 #include <stratum/alloc.h>
 #include <stratum/block.h>
 #include <stratum/bootstrap.h>
+#include <stratum/dataset.h>
 #include <stratum/janus.h>
 #include <stratum/keyfile.h>
 #include <stratum/pool.h>
@@ -463,6 +464,112 @@ stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                                            buf, len, out_read);
     pthread_mutex_unlock(&fs->lock);
     return s;
+}
+
+/* ========================================================================= */
+/* Dataset creation (P7-13).                                                  */
+/* ========================================================================= */
+
+/*
+ * Composes stm_dataset_create_child + stm_sync_add_dataset_key under
+ * fs->lock so the FS observer never sees a half-created dataset
+ * (entry minted with no DEK provisioned, or DEK provisioned with no
+ * entry). On add_dataset_key failure, the dataset_create_child is
+ * rolled back via stm_dataset_destroy: the freshly-created leaf has
+ * no children and a non-root id, so the only failure modes the
+ * destroy spec documents (STM_EINVAL on root, STM_ENOENT on
+ * not-PRESENT, STM_EBUSY on has-children) are all unreachable. If
+ * destroy somehow returns non-OK anyway, the dataset_index has now
+ * diverged from the keyschema so we wedge the fs to preserve
+ * forensic state — STM_ECORRUPT propagated to the caller.
+ *
+ * Wrap-key lifecycle: loaded BEFORE fs->lock so a bad keyfile or
+ * unreachable janus daemon doesn't hold up other writers; wiped
+ * (or janus client disconnected) on every exit path including the
+ * guard-refusal paths. Mirrors stm_fs_format / stm_fs_mount's
+ * shape — fs->* never retains wrap-key material.
+ */
+stm_status stm_fs_create_dataset(stm_fs *fs, uint64_t parent_id,
+                                    const char *name,
+                                    const stm_fs_create_dataset_opts *opts,
+                                    uint64_t *out_id)
+{
+    if (!fs || !name || !opts || !out_id) return STM_EINVAL;
+    int have_kf = opts->keyfile_path != NULL;
+    int have_jn = opts->janus_socket != NULL;
+    if (have_kf == have_jn) return STM_EINVAL;
+
+    stm_hybrid_keys   wk    = {0};
+    stm_janus_client *janus = NULL;
+    if (have_kf) {
+        stm_status ks = stm_keyfile_load(opts->keyfile_path, &wk);
+        if (ks != STM_OK) return ks;
+    } else {
+        stm_status js = stm_janus_client_connect(opts->janus_socket, &janus);
+        if (js != STM_OK) return js;
+    }
+
+    pthread_mutex_lock(&fs->lock);
+    if (fs->wedged) {
+        pthread_mutex_unlock(&fs->lock);
+        stm_hybrid_keys_wipe(&wk);
+        if (janus) stm_janus_client_disconnect(janus);
+        return STM_EWEDGED;
+    }
+    if (fs->read_only) {
+        pthread_mutex_unlock(&fs->lock);
+        stm_hybrid_keys_wipe(&wk);
+        if (janus) stm_janus_client_disconnect(janus);
+        return STM_EROFS;
+    }
+
+    stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
+    if (!didx) {
+        /* Should be impossible post-mount — sync_open always populates
+         * the dataset index. Surface as ECORRUPT defensively rather
+         * than dereferencing NULL. */
+        pthread_mutex_unlock(&fs->lock);
+        stm_hybrid_keys_wipe(&wk);
+        if (janus) stm_janus_client_disconnect(janus);
+        return STM_ECORRUPT;
+    }
+
+    uint64_t new_id = 0;
+    stm_status s = stm_dataset_create_child(didx, parent_id, name, &new_id);
+    if (s != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        stm_hybrid_keys_wipe(&wk);
+        if (janus) stm_janus_client_disconnect(janus);
+        return s;
+    }
+
+    uint64_t new_kid = 0;
+    s = stm_sync_add_dataset_key(fs->sync, new_id,
+                                    have_kf ? &wk : NULL,
+                                    have_jn ? janus : NULL,
+                                    &new_kid);
+    if (s != STM_OK) {
+        stm_status rb = stm_dataset_destroy(didx, new_id);
+        if (rb != STM_OK) {
+            /* Index now divergent from keyschema. Preserve forensic
+             * state for offline inspection — wedge the fs. */
+            fs->wedged = true;
+            pthread_mutex_unlock(&fs->lock);
+            stm_hybrid_keys_wipe(&wk);
+            if (janus) stm_janus_client_disconnect(janus);
+            return STM_ECORRUPT;
+        }
+        pthread_mutex_unlock(&fs->lock);
+        stm_hybrid_keys_wipe(&wk);
+        if (janus) stm_janus_client_disconnect(janus);
+        return s;
+    }
+
+    *out_id = new_id;
+    pthread_mutex_unlock(&fs->lock);
+    stm_hybrid_keys_wipe(&wk);
+    if (janus) stm_janus_client_disconnect(janus);
+    return STM_OK;
 }
 
 /* ========================================================================= */

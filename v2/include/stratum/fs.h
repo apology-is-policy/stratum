@@ -204,6 +204,80 @@ stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                          size_t *out_read);
 
 /* ========================================================================= */
+/* Dataset creation (P7-13).                                                  */
+/* ========================================================================= */
+
+/*
+ * Per-call wrap-key source for stm_fs_create_dataset. Mirrors
+ * stm_fs_mount_opts: exactly one of {keyfile_path, janus_socket}
+ * must be set. The fs handle does NOT retain wrap-key material
+ * across mount, so each create needs its own source — same shape as
+ * how mount loads the keyfile / connects janus on demand and wipes
+ * the wrap key after `stm_sync_open`.
+ */
+typedef struct {
+    /* P4-4a: path to a hybrid-wrap keyfile. Mutually exclusive with
+     * janus_socket. */
+    const char *keyfile_path;
+    /* P4-4b: janus daemon socket. Mutually exclusive with
+     * keyfile_path. */
+    const char *janus_socket;
+} stm_fs_create_dataset_opts;
+
+/*
+ * Create a new dataset under `parent_id` and provision its CURRENT
+ * DEK in one fs-handle-serialized step.
+ *
+ * Composes `stm_dataset_create_child` (mints a fresh dataset id,
+ * inserts a PRESENT entry under `parent_id`) with
+ * `stm_sync_add_dataset_key` (generates a DEK, hybrid-wraps it,
+ * inserts (new_id, key_id=0, CURRENT) into the keyschema sub-tree,
+ * stashes the plaintext DEK in the in-RAM map). Both mutations
+ * persist on the next `stm_sync_commit`.
+ *
+ * Atomicity: held under `fs->lock` across both steps. On
+ * `stm_sync_add_dataset_key` failure, the freshly-created dataset
+ * entry is rolled back via `stm_dataset_destroy` so the dataset
+ * index never sees an orphan-with-no-key entry.
+ *
+ * Pre-P7-13, callers had to call `stm_dataset_create_child` (via the
+ * `stm_sync_dataset_index` borrowed handle) and `stm_sync_add_dataset_key`
+ * (via the test-only `stm_fs_sync_for_test` accessor) themselves, with
+ * no wedged/RO coordination between the two. This API removes the test
+ * restriction "only ds=1 (root) writes work without explicit DEK
+ * install" and provides the production-shape one-step create.
+ *
+ * Returns:
+ *   - STM_OK on success; *out_id holds the new dataset id (≥ 2).
+ *   - STM_EWEDGED / STM_EROFS on wedged / read-only fs (no key load,
+ *     no index mutation).
+ *   - STM_EINVAL on NULL args, missing/duplicate key source, name
+ *     length out of range, parent_id == 0.
+ *   - STM_ENOENT if `parent_id` is not PRESENT or keyfile path is
+ *     unreadable.
+ *   - STM_EEXIST if a sibling under `parent_id` already has `name`.
+ *   - STM_ERANGE if the freshly-minted id exceeds
+ *     STM_SYNC_DATASET_ID_MAX (the sync layer's 28-bit cap;
+ *     dataset entry rolled back).
+ *   - STM_ENOMEM on alloc failure (rollback applied).
+ *   - STM_EIO from keyfile_load / janus_connect.
+ *
+ * The wrap-key source is loaded BEFORE `fs->lock` is taken so a
+ * bad keyfile doesn't block other writers; it is wiped /
+ * disconnected on every exit path (success and failure).
+ *
+ * Properties: this MVP creates the dataset with the inherited
+ * defaults from `parent_id`. Per-property overrides (compression,
+ * recordsize, etc.) are set with `stm_dataset_set_property` on the
+ * returned id afterwards.
+ */
+STM_MUST_USE
+stm_status stm_fs_create_dataset(stm_fs *fs, uint64_t parent_id,
+                                    const char *name,
+                                    const stm_fs_create_dataset_opts *opts,
+                                    uint64_t *out_id);
+
+/* ========================================================================= */
 /* Inspection + control.                                                      */
 /* ========================================================================= */
 
