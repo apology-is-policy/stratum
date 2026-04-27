@@ -3744,20 +3744,27 @@ static size_t sync_desired_replica_count_locked(const stm_sync *s) {
     return n;
 }
 
-stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
-                                    uint64_t off, const void *buf, size_t len) {
-    if (!s || !buf) return STM_EINVAL;
-    if (dataset_id == 0 || ino == 0) return STM_EINVAL;
-    if (len == 0) return STM_EINVAL;
-    if (len > STM_FS_RECORDSIZE_MAX) return STM_ERANGE;
-    if ((len % STM_UB_SIZE) != 0) return STM_EINVAL;
-    if ((off % STM_UB_SIZE) != 0) return STM_EINVAL;
-    if (off > UINT64_MAX - len) return STM_EOVERFLOW;
-
-    pthread_mutex_lock(&s->lock);
-    if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
-    if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
-
+/* P7-11: write_extent core, lock-held variant.
+ *
+ * Caller MUST hold s->lock AND have already passed the wedged / RO
+ * guards. Caller MUST also have validated args:
+ *   - dataset_id != 0, ino != 0
+ *   - len in (0, STM_FS_RECORDSIZE_MAX], multiple of STM_UB_SIZE
+ *   - off multiple of STM_UB_SIZE, off + len does not overflow
+ *
+ * The arg-validation duplication between this helper and the public
+ * wrapper would be untidy; instead the public wrapper validates and
+ * the helper trusts. stm_sync_truncate composes this with
+ * stm_sync_read_extent_locked under one lock acquisition to make
+ * truncate atomic w.r.t. concurrent commit / write (R41 P3-1/P3-2).
+ *
+ * Lock-graph note: this body acquires extent_idx.lock and per-device
+ * alloc.lock as inner leaves; sync.lock is OUTER. No back-edges.
+ */
+static stm_status stm_sync_write_extent_locked(stm_sync *s,
+                                                  uint64_t dataset_id, uint64_t ino,
+                                                  uint64_t off, const void *buf,
+                                                  size_t len) {
     /* P7-10: resolve the dataset's CURRENT DEK + key_id. STM_ENOENT
      * here means the caller skipped stm_sync_add_dataset_key for a
      * non-root dataset; surface as-is so the FS layer can either
@@ -3766,17 +3773,13 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     uint8_t  dek[32];
     stm_status rks = sync_resolve_current_dek_locked(s, dataset_id,
                                                         &enc_key_id, dek);
-    if (rks != STM_OK) {
-        pthread_mutex_unlock(&s->lock);
-        return rks;
-    }
+    if (rks != STM_OK) return rks;
 
     /* R36 P1-3: hardcode AEGIS-256 — see read path comment. */
     stm_aead_mode mode = STM_AEAD_AEGIS256;
     size_t tag_len = stm_aead_tag_len(mode);
     if (tag_len == 0) {
         stm_ct_memzero(dek, sizeof dek);
-        pthread_mutex_unlock(&s->lock);
         return STM_EINVAL;
     }
     size_t total_bytes = len + tag_len;
@@ -3786,7 +3789,6 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     size_t n_replicas = sync_desired_replica_count_locked(s);
     if (n_replicas < 1) {
         stm_ct_memzero(dek, sizeof dek);
-        pthread_mutex_unlock(&s->lock);
         return STM_EINVAL;
     }
     uint64_t replicas[STM_EXTENT_MAX_REPLICAS] = { 0 };
@@ -3800,7 +3802,6 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
             for (size_t j = 0; j < reserved_count; j++)
                 (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
             stm_ct_memzero(dek, sizeof dek);
-            pthread_mutex_unlock(&s->lock);
             return STM_EINVAL;
         }
         stm_status rs = stm_alloc_reserve(s->allocs[i], nblocks, 0, &replicas[i]);
@@ -3808,7 +3809,6 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
             for (size_t j = 0; j < reserved_count; j++)
                 (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
             stm_ct_memzero(dek, sizeof dek);
-            pthread_mutex_unlock(&s->lock);
             return rs;
         }
         reserved_count++;
@@ -3824,7 +3824,6 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
         for (size_t j = 0; j < reserved_count; j++)
             (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
         stm_ct_memzero(dek, sizeof dek);
-        pthread_mutex_unlock(&s->lock);
         return STM_ENOMEM;
     }
 
@@ -3855,7 +3854,6 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
         for (size_t j = 0; j < reserved_count; j++)
             (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
         stm_ct_memzero(dek, sizeof dek);
-        pthread_mutex_unlock(&s->lock);
         return es;
     }
 
@@ -3869,7 +3867,6 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
             for (size_t j = 0; j < reserved_count; j++)
                 (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
             stm_ct_memzero(dek, sizeof dek);
-            pthread_mutex_unlock(&s->lock);
             return STM_EINVAL;
         }
         stm_status ws = stm_bdev_write(target_bdev, byte_off, cbuf, total_bytes);
@@ -3878,7 +3875,6 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
             for (size_t j = 0; j < reserved_count; j++)
                 (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
             stm_ct_memzero(dek, sizeof dek);
-            pthread_mutex_unlock(&s->lock);
             return ws;
         }
     }
@@ -3897,7 +3893,6 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     if (os != STM_OK) {
         for (size_t j = 0; j < reserved_count; j++)
             (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
-        pthread_mutex_unlock(&s->lock);
         return os;
     }
 
@@ -3909,23 +3904,44 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     }
     free(dropped);
 
-    pthread_mutex_unlock(&s->lock);
     return drop_err;
 }
 
-stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
-                                   uint64_t off, void *buf, size_t len,
-                                   size_t *out_read) {
-    if (!s || !buf || !out_read) return STM_EINVAL;
+stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
+                                    uint64_t off, const void *buf, size_t len) {
+    if (!s || !buf) return STM_EINVAL;
     if (dataset_id == 0 || ino == 0) return STM_EINVAL;
-    if (len == 0) { *out_read = 0; return STM_OK; }
+    if (len == 0) return STM_EINVAL;
+    if (len > STM_FS_RECORDSIZE_MAX) return STM_ERANGE;
+    if ((len % STM_UB_SIZE) != 0) return STM_EINVAL;
     if ((off % STM_UB_SIZE) != 0) return STM_EINVAL;
-
-    *out_read = 0;
+    if (off > UINT64_MAX - len) return STM_EOVERFLOW;
 
     pthread_mutex_lock(&s->lock);
-    if (s->wedged) { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
+    if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
+    if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
 
+    stm_status rc = stm_sync_write_extent_locked(s, dataset_id, ino,
+                                                    off, buf, len);
+    pthread_mutex_unlock(&s->lock);
+    return rc;
+}
+
+/* P7-11: read_extent core, lock-held variant. Caller MUST hold
+ * s->lock AND have already passed the wedged guard (read is allowed
+ * under read_only — only writes need RO-refusal). Caller MUST also
+ * have validated args (ds/ino non-zero, off block-aligned, len > 0
+ * — the public wrapper handles len==0 by short-circuiting to OK
+ * before calling here). On entry *out_read is 0; on STM_OK success
+ * *out_read receives `len`.
+ *
+ * stm_sync_truncate composes this with stm_sync_write_extent_locked
+ * to read+re-encrypt the crossing extent's prefix without releasing
+ * sync.lock — closes R41 P3-1/P3-2 atomicity gaps. */
+static stm_status stm_sync_read_extent_locked(stm_sync *s,
+                                                 uint64_t dataset_id, uint64_t ino,
+                                                 uint64_t off, void *buf,
+                                                 size_t len, size_t *out_read) {
     stm_extent_record rec;
     stm_status ls = stm_extent_lookup_at(s->extent_idx, dataset_id, ino, off, &rec);
     if (ls == STM_ENOENT) {
@@ -3934,19 +3950,16 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
          * `len` since the MVP only handles single-extent reads. */
         memset(buf, 0, len);
         *out_read = len;
-        pthread_mutex_unlock(&s->lock);
         return STM_OK;
     }
-    if (ls != STM_OK) { pthread_mutex_unlock(&s->lock); return ls; }
+    if (ls != STM_OK) return ls;
 
     /* Extent must start at our requested off (single-extent MVP) and
      * cover at least `len` bytes from off. */
-    if (rec.off != off) { pthread_mutex_unlock(&s->lock); return STM_EINVAL; }
-    if (len > rec.len) { pthread_mutex_unlock(&s->lock); return STM_EINVAL; }
-    if (rec.n_replicas < 1 || rec.n_replicas > STM_EXTENT_MAX_REPLICAS) {
-        pthread_mutex_unlock(&s->lock);
+    if (rec.off != off) return STM_EINVAL;
+    if (len > rec.len) return STM_EINVAL;
+    if (rec.n_replicas < 1 || rec.n_replicas > STM_EXTENT_MAX_REPLICAS)
         return STM_ECORRUPT;
-    }
 
     /* P7-10: resolve the DEK by the extent's stamped key_id (NOT
      * the dataset's CURRENT — old extents written before a rotation
@@ -3956,7 +3969,7 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
      * stm_sync_keyschema_sweep refuses to prune keys with extent
      * refs. Surface as STM_ECORRUPT to the caller. */
     sync_dek_slot *rd_slot = sync_dek_find(s, dataset_id, rec.key_id);
-    if (!rd_slot) { pthread_mutex_unlock(&s->lock); return STM_ECORRUPT; }
+    if (!rd_slot) return STM_ECORRUPT;
     uint8_t dek[32];
     memcpy(dek, rd_slot->dek, 32);
 
@@ -3965,7 +3978,6 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     size_t tag_len = stm_aead_tag_len(mode);
     if (tag_len == 0) {
         stm_ct_memzero(dek, sizeof dek);
-        pthread_mutex_unlock(&s->lock);
         return STM_EINVAL;
     }
 
@@ -3973,14 +3985,12 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     void *cbuf = malloc(total_bytes);
     if (!cbuf) {
         stm_ct_memzero(dek, sizeof dek);
-        pthread_mutex_unlock(&s->lock);
         return STM_ENOMEM;
     }
     void *pbuf = malloc(rec.len);
     if (!pbuf) {
         free(cbuf);
         stm_ct_memzero(dek, sizeof dek);
-        pthread_mutex_unlock(&s->lock);
         return STM_ENOMEM;
     }
 
@@ -4031,7 +4041,6 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     if (!decrypted) {
         stm_ct_memzero(pbuf, rec.len);
         free(pbuf);
-        pthread_mutex_unlock(&s->lock);
         return last_err;
     }
 
@@ -4039,30 +4048,60 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     stm_ct_memzero(pbuf, rec.len);
     free(pbuf);
     *out_read = len;
-    pthread_mutex_unlock(&s->lock);
     return STM_OK;
+}
+
+stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
+                                   uint64_t off, void *buf, size_t len,
+                                   size_t *out_read) {
+    if (!s || !buf || !out_read) return STM_EINVAL;
+    if (dataset_id == 0 || ino == 0) return STM_EINVAL;
+    if (len == 0) { *out_read = 0; return STM_OK; }
+    if ((off % STM_UB_SIZE) != 0) return STM_EINVAL;
+
+    *out_read = 0;
+
+    pthread_mutex_lock(&s->lock);
+    if (s->wedged) { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
+
+    stm_status rc = stm_sync_read_extent_locked(s, dataset_id, ino,
+                                                   off, buf, len, out_read);
+    pthread_mutex_unlock(&s->lock);
+    return rc;
 }
 
 /* P7-9: POSIX-shape truncate. Shrinks (ds, ino) to new_size bytes;
  * extent.tla::Truncate.
  *
- * Composition strategy:
- *   1. Look up the crossing extent (single, by NoOverlapWithinIno) at
- *      offset `new_size - 1` via stm_extent_lookup_at — uses the
- *      extent index's own lock; cheap.
- *   2. If crossing exists: read + decrypt its full plaintext via
- *      stm_sync_read_extent, then re-encrypt the [0, prefix_len) bytes
- *      via stm_sync_write_extent. The latter's extent_overwrite +
- *      drop-route handles the original's replicas.
- *   3. Acquire sync lock; call stm_extent_truncate to drop every
- *      extent past new_size; route those paddrs through
- *      sync_drop_paddr_locked (dead-list or free).
+ * Composition strategy (P7-11 single-lock-span — closes R41 P3-1
+ * and R41 P3-2 atomicity gaps):
+ *   1. Acquire sync->lock + check wedged/RO.
+ *   2. Look up the crossing extent (single, by NoOverlapWithinIno) at
+ *      offset `new_size - 1` via stm_extent_lookup_at.
+ *   3. If crossing exists: read+decrypt the full plaintext via
+ *      stm_sync_read_extent_locked, then re-encrypt the [0, prefix_len)
+ *      bytes via stm_sync_write_extent_locked. The latter's
+ *      extent_overwrite + drop-route handles the original's replicas.
+ *   4. stm_extent_truncate drops every extent past new_size; route
+ *      those paddrs through sync_drop_paddr_locked.
+ *   5. Release sync->lock.
  *
- * Concurrency caveat: between (1) and (3) other threads can mutate
- * (ds, ino)'s extents. POSIX-style truncate atomicity is the
- * caller's responsibility (serialize at the FS layer above sync).
- * The internal lock acquired in (3) ensures the drop-routing of
- * past extents is atomic with respect to other sync ops.
+ * The single lock acquisition makes truncate atomic w.r.t. concurrent
+ * stm_sync_commit / stm_sync_write_extent / other truncate calls:
+ *   - R41 P3-1 closed: a Phase 4 (extent_truncate) failure no longer
+ *     leaves a partial state because Phases 3 and 4 share one
+ *     lock-hold; a failed extent_truncate retains the in-RAM state
+ *     from before Phase 3's overwrite (extent_overwrite has already
+ *     committed, but no commit can land because sync_commit blocks
+ *     on s->lock).
+ *   - R41 P3-2 closed: a concurrent stm_sync_commit cannot interleave
+ *     between the prefix re-encrypt and the past-extents drop because
+ *     sync_commit takes s->lock for the duration.
+ *
+ * The trade-off is lock-hold duration: the prefix's decrypt + encrypt
+ * + bdev I/O all happen under s->lock. For an MVP at 128 KiB
+ * recordsize this is acceptable; production extension would either
+ * fine-grain the lock or run truncate against a snapshot.
  */
 stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
                                 uint64_t new_size)
@@ -4070,6 +4109,10 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     if (!s) return STM_EINVAL;
     if (dataset_id == 0 || ino == 0) return STM_EINVAL;
     if ((new_size % STM_UB_SIZE) != 0) return STM_EINVAL;
+
+    pthread_mutex_lock(&s->lock);
+    if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
+    if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
 
     /* Phase 1: locate the crossing extent. */
     stm_extent_record rec;
@@ -4084,12 +4127,13 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
             /* Else: extent ends exactly at new_size (rec.off + rec.len ==
              * new_size). It's neither crossing nor past — leave it. */
         } else if (ls != STM_ENOENT) {
+            pthread_mutex_unlock(&s->lock);
             return ls;
         }
     }
 
     /* Phase 2: shrink the crossing extent by read+decrypt+re-encrypt
-     * of the kept prefix. stm_sync_write_extent's extent_overwrite
+     * of the kept prefix. stm_sync_write_extent_locked's extent_overwrite
      * drops the original (now superseded) and routes its paddrs
      * through dead-list / free. */
     if (has_crossing) {
@@ -4099,36 +4143,43 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
          * format-break drift) could feed an attacker-controlled
          * malloc size. Mirrors the scrub cb's defensive check. */
         if (rec.len == 0 || rec.len > STM_FS_RECORDSIZE_MAX) {
+            pthread_mutex_unlock(&s->lock);
             return STM_ECORRUPT;
         }
         void *plain = malloc(rec.len);
-        if (!plain) return STM_ENOMEM;
+        if (!plain) {
+            pthread_mutex_unlock(&s->lock);
+            return STM_ENOMEM;
+        }
         size_t got = 0;
-        stm_status rs = stm_sync_read_extent(s, dataset_id, ino, rec.off,
-                                                plain, rec.len, &got);
+        stm_status rs = stm_sync_read_extent_locked(s, dataset_id, ino,
+                                                       rec.off, plain,
+                                                       rec.len, &got);
         if (rs != STM_OK) {
             stm_ct_memzero(plain, rec.len);
             free(plain);
+            pthread_mutex_unlock(&s->lock);
             return rs;
         }
         if (got != rec.len) {
             stm_ct_memzero(plain, rec.len);
             free(plain);
+            pthread_mutex_unlock(&s->lock);
             return STM_EIO;
         }
         size_t prefix_len = (size_t)(new_size - rec.off);
-        stm_status ws = stm_sync_write_extent(s, dataset_id, ino, rec.off,
-                                                 plain, prefix_len);
+        stm_status ws = stm_sync_write_extent_locked(s, dataset_id, ino,
+                                                        rec.off, plain,
+                                                        prefix_len);
         stm_ct_memzero(plain, rec.len);
         free(plain);
-        if (ws != STM_OK) return ws;
+        if (ws != STM_OK) {
+            pthread_mutex_unlock(&s->lock);
+            return ws;
+        }
     }
 
     /* Phase 3: drop every extent past new_size + drop-route. */
-    pthread_mutex_lock(&s->lock);
-    if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
-    if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
-
     uint64_t *dropped = NULL;
     size_t    n_dropped = 0;
     stm_status ts = stm_extent_truncate(s->extent_idx, dataset_id, ino,

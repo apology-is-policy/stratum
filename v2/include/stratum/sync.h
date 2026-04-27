@@ -922,32 +922,26 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
  *   - `new_size` must be a multiple of `STM_UB_SIZE` (4 KiB blocks).
  *     Non-aligned truncate would require partial-block read+modify+
  *     write at the underlying bdev, deferred.
- *   - Composes the public `stm_sync_write_extent` + `stm_sync_read_extent`
- *     APIs with the sync handle's internal lock for the final
- *     `stm_extent_truncate` + drop-routing phase. Concurrent extent
- *     writes on (dataset_id, ino) during truncate are NOT serialized
- *     with the read + re-encrypt of the crossing extent — POSIX
- *     truncate-vs-concurrent-write semantics are the caller's
- *     responsibility (typical pattern: serialize at the FS layer
- *     above).
- *   - **NOT atomic across crash / partial failure** (R41 P3-1 / P3-2):
- *     the function is structured as Phase 1 (lookup, no lock), Phase 2
- *     (read + write under lock-acquire/release), Phase 3 (extent_truncate
- *     + drop-route under fresh lock-acquire/release). Three race windows:
- *     (a) a `stm_sync_commit` between Phase 2 and Phase 3 persists the
- *     shrunk prefix without the past-extent drops; on crash before
- *     Phase 3 lands, the file is in a partial state (prefix shrunk,
- *     past extents still present). (b) Phase 3's `stm_extent_truncate`
- *     can return STM_ENOMEM after Phase 2 succeeded, leaving the same
- *     partial state with no commit needed. (c) Phase 3's per-paddr
- *     drop loop continues on individual `sync_drop_paddr_locked`
- *     errors — a failed paddr is leaked (neither dead-listed nor
- *     freed). All three windows produce on-disk states that satisfy
- *     every load-bearing invariant (NoOverlap, PaddrFreshness,
- *     LiveReplicasDisjoint, nonce uniqueness); the partial state is
- *     a POSIX-atomicity gap, not a corruption hazard. Production
- *     callers requiring atomic truncate semantics serialize at the
- *     FS layer or batch via the planned `_locked` refactor.
+ *   - **P7-11**: holds the sync handle's internal lock across all
+ *     three phases (lookup → read+re-encrypt → past-extent drop +
+ *     drop-route). This makes truncate atomic w.r.t. concurrent
+ *     `stm_sync_commit` / `stm_sync_write_extent` / other truncate
+ *     callers — closes the R41 P3-1 (Phase 3 fail after Phase 2
+ *     success → partial state) and R41 P3-2 (concurrent commit
+ *     between Phase 2 and Phase 3 splits the on-disk view) gaps
+ *     present in the P7-9 MVP. The trade-off is a longer lock-hold
+ *     duration (decrypt + encrypt + bdev I/O all under s->lock);
+ *     for the 128 KiB recordsize default this is acceptable.
+ *     Concurrent-write atomicity (POSIX truncate-vs-write at the FS
+ *     boundary) remains the caller's responsibility — Stratum's sync
+ *     layer doesn't model the FS-layer file-handle locks that POSIX
+ *     specifies.
+ *   - Per-paddr drop-route on Phase 3 is best-effort (R36 P1-1 /
+ *     P2-1): a failed `sync_drop_paddr_locked` for a single paddr
+ *     surfaces as the function's return value but doesn't abort the
+ *     overall truncate — other paddrs continue to drop-route. A
+ *     leaked paddr is not a corruption hazard (it's still allocated
+ *     in the bitmap; future fsck reconciles).
  *
  * Returns:
  *   STM_OK             — truncate complete.
