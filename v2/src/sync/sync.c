@@ -3868,6 +3868,15 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
  *
  * Plaintext hygiene: AEAD-decrypt outputs plaintext into a temp
  * buffer; ct_memzero before free.
+ *
+ * R38 P3-1 — repair logging (ARCH §7.15.4 / bptr.tla::LogIntegrity)
+ * is deferred: the cb does NOT emit a `/ctl/.../repair-log` entry
+ * per repair. scrub.h's "Not modeled here" list calls out the cb
+ * implementor's responsibility; this MVP cb skips it pending the
+ * observability surface (per-pool repair-log Bε-tree, schema TBD).
+ * Operators MUST snapshot `blocks_repaired` / `blocks_unrepairable`
+ * via `stm_scrub_status_get` to detect repair activity until the
+ * log lands.
  */
 static stm_scrub_verify_outcome
 sync_scrub_verify_cb(uint64_t paddr, void *ctx)
