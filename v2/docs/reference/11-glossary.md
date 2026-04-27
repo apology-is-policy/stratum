@@ -145,6 +145,7 @@ closed items.
 | R37 | P7-5 production scrub β verify-callback (paddr→bptr resolver via extent walk). | `fc5f619` |
 | R38 | P7-6 replica-list extension on extent records (UB v13 + bptr.tla full replica-walk in scrub cb). | `8d0c172` |
 | R39 | P7-7 send/recv MVP (full-send byte-stream protocol, recv re-encrypts under target pool's key). | `73e9f20` |
+| R40 | P7-8 snap-gen alignment (extent_txg field on snapshot record + UB v13→v14; closes incremental-send filter gap from P7-7). | `c9c29ee` |
 
 ## Phase 6 / clone terms
 
@@ -182,7 +183,11 @@ closed items.
 | **STM_RED_MIRROR / mirror_n** | Pool redundancy profile bits (sync.h's `stm_redundancy_profile`). `kind=STM_RED_MIRROR, mirror_n=N` directs the extent write path to allocate N replicas across N distinct devices. P7-6 wires this into `stm_sync_write_extent`'s replica fan-out. RAID-Z (`STM_RED_RS`) and LRC (`STM_RED_LRC`) remain unsupported MVP. |
 | **send/recv** | Phase 7 §10.3 dataset replication protocol (P7-7 MVP). `stm_send_init/_next/_close` produces a wire-format byte stream for a source dataset's snapshot range; `stm_recv_init/_apply/_finish/_close` consumes records on the target pool. Wire = HEADER (52B body — magic STMS, version, pool_uuid, dataset_id, snap_ids) + EXTENT* (32B meta + plaintext) + END (32B BLAKE3 csum). Send decrypts source's extents under source pool's `metadata_key`; recv re-encrypts under target's via `stm_sync_write_extent` — fresh paddrs + fresh AEAD key + fresh nonces, no cross-pool nonce reuse hazard. |
 | **send wire format magic** | `STM_SEND_MAGIC = 0x534D5453` ("STMS" little-endian) at the start of every HEADER body. Receiver refuses any HEADER record whose first 4 bytes don't match. |
-| **send incremental gap** | The P7-7 MVP wires `from_snap_id` / `to_snap_id` parameters but the snap-bounded gen filter is best-effort: `snapshot.created_txg` and `sync.current_gen` are independent counters today, so the filter doesn't reliably partition pre-snap from post-snap extents. A future chunk adds an `extent_txg` field to the snapshot record (anticipated v13 → v14 format break) capturing `sync.current_gen` at snap-create time, which then makes the filter authoritative. |
+| **send incremental gap (closed in P7-8)** | The P7-7 MVP's snap-bounded gen filter was best-effort because `snapshot.created_txg` and `sync.current_gen` lived in independent counter spaces. P7-8 added an `extent_txg` field on the snapshot record (capturing `sync.current_gen` at SnapshotCreate; format break v13 → v14) and rewrote the send filter to use it. The filter is now authoritative when callers follow the documented operational pattern `commit → snap_create → commit` (analogous to ZFS's TXG bracketing). |
+| **extent_txg** | P7-8 field on `stm_snapshot_entry`. Captured from `sync.current_gen` at `stm_snapshot_create` time (under `idx->lock`; R40 P2-1 chain-ordering check rejects stale captures with STM_EINVAL). The send filter's bound is `from.extent_txg < extent.gen <= to.extent_txg` — same counter space as `extent.gen`, so the filter is mathematically authoritative. Distinct from `created_txg` (snap-index counter). |
+| **snap-gen alignment** | The P7-8 chunk's headline. Refers to aligning the snap-bounded send filter's gen-counter with `extent.gen` by capturing `sync.current_gen` at SnapshotCreate. The bracketed pattern `commit → snap_create → commit` establishes a strict gen boundary so writes after a snap have gen strictly greater than the snap's `extent_txg`. |
+| **ExtentTxgBoundedBySync** | snapshot.tla invariant (P7-8): every snap's captured `snap_extent_txg ≤ sync_gen`. Captured monotonically; sync_gen never decreases. Refutes a buggy impl that stamps a future-dated extent_txg. Buggy demo `snapshot_extent_txg_unbounded_buggy.cfg`. |
+| **ChainExtentTxgOrdered** | snapshot.tla invariant (P7-8): along the `snap_prev` chain (filtering ABSENT links), `snap_extent_txg` is non-decreasing — older has ≤ newer. The `≤` (not `<`) tolerates the equality case of two consecutive `SnapshotCreate`s with no intervening `Write`. Refutes a buggy impl that captures stale gen values (e.g., concurrent-create race, R40 P2-1). |
 
 ## Policy terms
 

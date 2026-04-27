@@ -38,21 +38,28 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `73e9f20` (**P7-7 send/recv MVP** — full-send
-  byte-stream protocol with HEADER + EXTENT records + END+csum;
-  `stm_send_init/_next/_close` produces wire bytes, `stm_recv_init/
-  _apply/_finish/_close` consumes them; recv re-encrypts each extent
-  under the target pool's metadata key — no cross-pool nonce reuse;
-  BLAKE3 end-of-stream csum gates authenticity; new module
-  `src/send_recv/`). Prior: P7-6 replica-list extension —
-  extent records grow 32B → 64B with up to 4 replica paddrs;
-  `stm_sync_write_extent` allocates N replicas across N devices;
-  scrub β cb walks replicas + repairs corrupt ones per bptr.tla's
-  full `ScanRead` × `RewriteReplica` matrix; `STM_UB_VERSION`
-  12 → 13). Phase 5 tagged `phase-5-complete` at `461e68e`.
-  Spec posture: **20 modules / 23 fixed configs / 23 buggy demos**
-  (extent.tla extended with `replicas` field + `LiveReplicasDisjoint`
-  invariant; new `extent_replica_collision_buggy.cfg`).
+- **Tip**: `c9c29ee` (**P7-8 snap-gen alignment** — `extent_txg`
+  field on each snapshot entry captures `sync.current_gen` at
+  SnapshotCreate; send/recv's incremental gen filter
+  (`from.extent_txg < extent.gen <= to.extent_txg`) now sits in
+  the same counter space as `extent.gen`, making the previously
+  best-effort filter authoritative; format break v13 → v14
+  (snapshot record value layout grows 8 bytes); spec extension
+  with separate `sync_gen` counter + `ExtentTxgBoundedBySync` +
+  `ChainExtentTxgOrdered` invariants + new buggy demo
+  `snapshot_extent_txg_unbounded_buggy.cfg`; new accessor
+  `stm_sync_current_gen`; structural validator extended with
+  chain-edge ordering check; `stm_snapshot_create` validates
+  extent_txg ≥ prev's at create time (R40 P2-1 race fix);
+  closes ROADMAP §10.2's incremental-send exit-criterion path).
+  Prior: P7-7 send/recv MVP `73e9f20` (full-send byte-stream
+  protocol with HEADER + EXTENT + END+csum). P7-6 replica-list
+  extension `8d0c172` (extent records grow 32B → 64B; UB v12 →
+  v13). Phase 5 tagged `phase-5-complete` at `461e68e`.
+  Spec posture: **20 modules / 23 fixed configs / 24 buggy demos**
+  (snapshot.tla extended with `sync_gen` + `snap_extent_txg` +
+  `ExtentTxgBoundedBySync` + `ChainExtentTxgOrdered`; new
+  `snapshot_extent_txg_unbounded_buggy.cfg`).
 - **Phases**: 1–5 complete; Phase 6 namespace layer feature-
   complete; **Phase 7 progressing**.
   Spec scaffolds: P6-1 (bptr.tla) `032db86`; P6-2 (dataset.tla)
@@ -89,33 +96,52 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   `LiveReplicasDisjoint` + `ReplicasNonEmpty` +
   `ReplicaCountBounded` invariants; new buggy demo
   `extent_replica_collision_buggy.cfg`**.
-  **P7-7 send/recv MVP `a42d84d` + R39 close `73e9f20`
-  (this commit) — new `src/send_recv/` module. Wire format: framed
-  records (16B framing + body); HEADER once, EXTENT* with plaintext
-  payload, END with BLAKE3 csum over prior bytes. Send decrypts
-  source's extents under source pool's metadata_key; recv re-
-  encrypts under target's. Single-dataset full-send only at MVP;
-  incremental send is API-wired but the snap-bounded gen filter is
-  best-effort until snap.created_txg ↔ sync.current_gen alignment
-  lands (anticipated v13 → v14 format break).** No format break in
-  P7-7; STM_UB_VERSION stays at 13.
+  P7-7 send/recv MVP `a42d84d` + R39 close `73e9f20`
+  — new `src/send_recv/` module. Wire format: framed records (16B
+  framing + body); HEADER once, EXTENT* with plaintext payload,
+  END with BLAKE3 csum over prior bytes. Send decrypts source's
+  extents under source pool's metadata_key; recv re-encrypts
+  under target's. Single-dataset full-send only at MVP; the
+  incremental send was API-wired but with a best-effort filter.
+  **P7-8 snap-gen alignment `4f40743` + R40 close `c9c29ee`
+  (this commit) — closes the P7-7 incremental gap. New 8-byte
+  `extent_txg` field on every snapshot entry, captured from
+  `sync.current_gen` at SnapshotCreate. Send filters by
+  `extent_txg` (same counter space as `extent.gen`) — filter is
+  now authoritative when callers follow the documented bracketed
+  pattern `commit → snap_create → commit`. Format break v13 → v14
+  (snapshot record value layout: SP_VAL_FIXED 44 → 52 with the
+  new field at offset 24..32). Spec change: new variable
+  `sync_gen` distinct from `current_txg`; `Write` bumps `sync_gen`
+  only; `SnapshotCreate` captures `sync_gen` as `snap_extent_txg`;
+  invariants `ExtentTxgBoundedBySync` + `ChainExtentTxgOrdered`;
+  buggy variant `BuggyExtentTxgUnbounded` + companion config.
+  C surface: `stm_snapshot_entry` gains `extent_txg` field;
+  `stm_snapshot_create` signature gains `extent_txg` arg + R40
+  P2-1 chain-ordering validation under idx->lock; structural
+  validator extended; new accessor `stm_sync_current_gen`. R40
+  audit: 0 P0 + 0 P1 + 1 P2 + 6 P3 (P2-1 + P3-1/2/4/5/7 fixed
+  inline; P3-3 + P3-6 deferred per audit close commit).**
   Phase 7 pre-work FastCDC `5cb8900` + R27 close `a2ffd38`.
   Pending: CAS / reflinks (Phase 7 §10.1, §10.4); per-dataset DEKs;
-  incremental send alignment.
+  repair log persistence; truncate partial-extent split.
 - **Tests**: 33 suites × (default + ASan + TSan, serial) green
-  (P7-7 adds test_send_recv = 10 tests).
+  (P7-8 grows test_send_recv 10 → 13 with two new R40 tests +
+  the incremental_send_filters_by_extent_txg roundtrip).
   test_sync_multi 42; test_pool 48; test_scrub 34 (30 + 4 P7-6
   replica-walk); test_alloc 32; test_cdc 12; test_dataset 57;
-  test_snapshot 41; test_sync 24;
+  test_snapshot 41 (P7-8 extent_txg roundtrip assertion added);
+  test_sync 24;
   test_extent_index 51 (32 in-RAM + 6 persist + 4 lookup_by_paddr +
-  9 P7-6 multi-replica); test_fs 20; test_send_recv 10 (4 arg
-  validation + 1 full-send roundtrip + 5 wire/state-machine error
+  9 P7-6 multi-replica); test_fs 20; test_send_recv 13 (4 arg
+  validation + 1 full-send roundtrip + 1 incremental + 1 swap-
+  rejection + 1 equal-extent_txg + 5 wire/state-machine error
   paths).
 - **Specs**: 20 TLA+ modules clean (23 fixed configs: legacy +
   scrub_beta + scrub_durable + scrub_beta_durable + bptr +
   dataset + snapshot + property + clone + dead_list + extent) +
-  23 buggy-demo configs fire as expected (extent_replica_collision_buggy
-  added in P7-6).
+  24 buggy-demo configs fire as expected
+  (snapshot_extent_txg_unbounded_buggy added in P7-8).
 - **LOC**: ~32 KLOC across 24 src/ modules (extent module gains
   `extent_index.c` alongside the Phase 4 `extent.c` AEAD wrapper)
   + 28 public headers.

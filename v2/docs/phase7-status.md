@@ -183,10 +183,55 @@ into the CAS tier (which DOES need P6) is a separate concern.
       buffer-too-small → STM_ERANGE retry path). MVP gap:
       incremental send (from_snap_id != 0) is API-wired but the
       gen filter is best-effort because `snapshot.created_txg` and
-      `sync.current_gen` are independent counters; full alignment
-      needs a future format-break (v13 → v14) introducing
-      `extent_txg` on the snapshot record. No format break in P7-7;
-      STM_UB_VERSION stays at 13.
+      `sync.current_gen` are independent counters — closed in P7-8.
+      No format break in P7-7; STM_UB_VERSION stays at 13.
+- [x] **P7-8 snap-gen alignment** — landed at `4f40743`;
+      R40 close `c9c29ee` (0 P0 / 0 P1 / 1 P2 / 6 P3 — P2-1
+      concurrent-create chain inversion + P3-1 send_recv.h docstring
+      drift + P3-2 extent_txg roundtrip assertion + P3-4 swapped
+      from/to test + P3-5 equal extent_txg test + P3-7 misleading
+      v13 decoder rejection comment all fixed inline; P3-3 byte-
+      level structural validator regression test + P3-6 absolute
+      bound check on extent_txg deferred per audit close commit
+      message). Closes the P7-7 incremental-send gap. New 8-byte
+      `extent_txg` field on every `stm_snapshot_entry`, captured
+      from `sync.current_gen` at SnapshotCreate. Send filters by
+      `extent_txg` (same counter space as `extent.gen`) instead
+      of `created_txg` (snap-index counter, distinct space) —
+      filter is now authoritative when callers follow the
+      documented bracketed pattern `commit → snap_create → commit`.
+      Format break v13 → v14: snapshot record value layout
+      `SP_VAL_FIXED` 44 → 52 with the new field at offset 24..32;
+      v13 entries length-rejected at v14 mount via uniform
+      STM_EBADVERSION (uberblock.c version gate). Spec change:
+      `snapshot.tla` extended with new variable `sync_gen`
+      (distinct from `current_txg`); `Write` bumps `sync_gen`
+      only; `SnapshotCreate` captures `sync_gen` as
+      `snap_extent_txg` (and bumps `current_txg` only); new
+      invariants `ExtentTxgBoundedBySync` + `ChainExtentTxgOrdered`;
+      new buggy variant `BuggyExtentTxgUnbounded` + companion
+      config `snapshot_extent_txg_unbounded_buggy.cfg` (TLC fires
+      `ExtentTxgBoundedBySync` at state 2). Spec posture
+      20/23/23 → 20/23/24. C surface: `stm_snapshot_create`
+      signature gains `uint64_t extent_txg` arg; impl validates
+      `extent_txg ≥ prev_snap.extent_txg` under idx->lock at
+      create time (R40 P2-1 race fix); structural validator
+      `sp_validate_shadow` extended with chain-edge ordering check;
+      new accessor `stm_sync_current_gen`. test_send_recv 10 → 13
+      (3 new tests: incremental_send_filters_by_extent_txg with
+      bracketed-commit pattern, incremental_send_rejects_swapped_
+      from_to, incremental_send_equal_extent_txg_chain_accepted_
+      send_rejected). test_snapshot extent_txg roundtrip
+      assertion added to existing persist-roundtrip test.
+      Mechanical: every `stm_snapshot_create` call site updated
+      (test_snapshot, test_sync, test_fs, bench) — 0 for unit/
+      bench, `stm_sync_current_gen(s)` for sync-aware paths.
+      ROADMAP §10.2 "send + receive roundtrip preserves data +
+      metadata + snapshots" exit criterion now achievable for
+      snap-bounded streams. Operational requirement (documented
+      in send_recv.h): callers must `stm_sync_commit` after every
+      `stm_snapshot_create` to establish the strict gen boundary
+      that makes the filter exact.
 - [x] **P7-6 replica-list extension** — landed at `2eb898d`;
       R38 close `8d0c172` (0 P0 / 0 P1 / 0 P2 / 2 P3 — P3-1 cb
       LogIntegrity-deferral docstring + P3-2 test_pool.c version-
