@@ -148,8 +148,11 @@ into the CAS tier (which DOES need P6) is a separate concern.
       P7-4 tests covering roundtrip / hole / args / COW with-snap
       asserting dead_list_count 0→1 / COW without-snap / cross-
       mount durability / RO blocks / multi-extent).
-- [x] **P7-6 replica-list extension** — landed at `<TBD-substantive>`;
-      R38 close `<TBD-close>`. Format break v12 → v13: extent
+- [x] **P7-6 replica-list extension** — landed at `2eb898d`;
+      R38 close `8d0c172` (0 P0 / 0 P1 / 0 P2 / 2 P3 — P3-1 cb
+      LogIntegrity-deferral docstring + P3-2 test_pool.c version-
+      history comment freshness, both fixed inline). Format break
+      v12 → v13: extent
       record value layout grows 32B → 64B with up to 4 replica
       paddr slots per ARCH §11.6.1. extent.tla extended with
       `replicas` field, `MaxReplicasPerExtent` constant, and

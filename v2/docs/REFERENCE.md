@@ -38,7 +38,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `<TBD-P7-6-fixup>` (**P7-6 replica-list extension** —
+- **Tip**: `8d0c172` (**P7-6 replica-list extension** —
   extent records grow 32B → 64B with up to 4 replica paddrs;
   `stm_sync_write_extent` allocates N replicas across N devices;
   scrub β cb walks replicas + repairs corrupt ones per bptr.tla's
@@ -68,8 +68,8 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   P7-5 production scrub cb `38e6799` + R37 close `fc5f619` —
   paddr→bptr resolver; AEAD-verify; mapped to bptr.tla's
   NReplicas=1 corner.
-  **P7-6 replica-list extension `<TBD-substantive>` + R38 close
-  `<TBD-close>` (this commit) — extent record value layout grows
+  **P7-6 replica-list extension `2eb898d` + R38 close
+  `8d0c172` (this commit) — extent record value layout grows
   32B → 64B with up to 4 replica paddr slots (P7-6 / v13).
   `stm_sync_write_extent` reserves N=mirror_n replicas across
   N distinct devices, encrypts ONCE under (replicas[0], gen) and
