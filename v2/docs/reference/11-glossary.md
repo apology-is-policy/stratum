@@ -146,6 +146,7 @@ closed items.
 | R38 | P7-6 replica-list extension on extent records (UB v13 + bptr.tla full replica-walk in scrub cb). | `8d0c172` |
 | R39 | P7-7 send/recv MVP (full-send byte-stream protocol, recv re-encrypts under target pool's key). | `73e9f20` |
 | R40 | P7-8 snap-gen alignment (extent_txg field on snapshot record + UB v13→v14; closes incremental-send filter gap from P7-7). | `c9c29ee` |
+| R41 | P7-9 truncate partial-extent split (`stm_sync_truncate` shrinks the crossing extent via read+decrypt+re-encrypt under fresh paddrs; extent.tla::Truncate refined with branch-(b)). | `5530a0e` |
 
 ## Phase 6 / clone terms
 
@@ -188,6 +189,7 @@ closed items.
 | **snap-gen alignment** | The P7-8 chunk's headline. Refers to aligning the snap-bounded send filter's gen-counter with `extent.gen` by capturing `sync.current_gen` at SnapshotCreate. The bracketed pattern `commit → snap_create → commit` establishes a strict gen boundary so writes after a snap have gen strictly greater than the snap's `extent_txg`. |
 | **ExtentTxgBoundedBySync** | snapshot.tla invariant (P7-8): every snap's captured `snap_extent_txg ≤ sync_gen`. Captured monotonically; sync_gen never decreases. Refutes a buggy impl that stamps a future-dated extent_txg. Buggy demo `snapshot_extent_txg_unbounded_buggy.cfg`. |
 | **ChainExtentTxgOrdered** | snapshot.tla invariant (P7-8): along the `snap_prev` chain (filtering ABSENT links), `snap_extent_txg` is non-decreasing — older has ≤ newer. The `≤` (not `<`) tolerates the equality case of two consecutive `SnapshotCreate`s with no intervening `Write`. Refutes a buggy impl that captures stale gen values (e.g., concurrent-create race, R40 P2-1). |
+| **truncate partial-extent split (P7-9)** | The production semantic for `stm_sync_truncate`: when `new_size` lands inside an extent (`off < new_size < off+len`), the extent is REPLACED by a shrunk version at `[off, new_size)` re-encrypted under fresh `(paddr_0, current_gen)` AEAD nonce. The original's replicas flow through dead-list / free per the COW path. Pre-P7-9 the extent was left at its original full length (MVP simplification), making bytes past `new_size` readable until a future overwrite. Spec refinement in `extent.tla::Truncate` adds the branch under fresh `replicas \cap used_paddrs = {}`. |
 
 ## Policy terms
 

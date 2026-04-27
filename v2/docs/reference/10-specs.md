@@ -916,8 +916,15 @@ Actions:
   drop with a `OverwriteBlock(old.paddr)` call into the snapshot
   layer (composition deferred to the C impl, not modeled in TLC).
 - `Truncate(ds, ino, new_size)` — drop extents whose `off ≥
-  new_size`. Partial-extent shrinking (extent crossing the
-  boundary) is a C-impl detail not modeled here.
+  new_size`. **P7-9 refinement**: if exactly one extent crosses
+  the boundary (`off < new_size < off + len`), it is REPLACED
+  by a shrunk extent at the same off, `len = new_size - off`,
+  encrypted under a FRESH replica set (`new_replicas \cap
+  used_paddrs = {}`), `gen = current_txg`. Re-encrypting under
+  fresh paddrs prevents `(paddr, gen)` reuse: the original full
+  ciphertext and the new shrunk-prefix's plaintext would
+  otherwise share a nonce. The C impl realizes this via
+  `stm_sync_truncate` (read+decrypt+re-encrypt+drop-route).
 - `DeleteFile(ds, ino)` — drop all extents for (ds, ino).
 - `AdvanceTxg` — bump current_txg.
 

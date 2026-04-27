@@ -107,10 +107,13 @@ array; `free()` after routing each through
 unchanged and the out-args are zeroed (`*paddrs = NULL`, `*n = 0`).
 
 `Truncate` drops every extent of `(ds, ino)` with `off ≥ new_size`.
-Partial-extent shrinking (an extent crossing the boundary) is NOT
-modeled in this MVP — same simplification as `extent.tla::Truncate`.
-Production extension is a sibling chunk that will preserve the
-load-bearing invariant either way.
+Partial-extent shrinking (an extent CROSSING the boundary) is
+handled at the sync layer by `stm_sync_truncate` (P7-9) — the
+extent_index API itself remains drop-only; `stm_sync_truncate`
+issues a fresh-replica re-encrypted prefix-write BEFORE calling
+`stm_extent_truncate`, so the crossing extent is dropped through
+the COW path naturally. See `stm_sync_truncate` in `sync.h` for
+the production POSIX-shape entry point.
 
 `DeleteFile` drops every extent of `(ds, ino)`. Used on inode unlink.
 
@@ -283,10 +286,14 @@ layout changes.
 - **Off-ascending iter**: collect matching record indices, insertion-
   sort by off, dispatch cb. `NoOverlapWithinIno` guarantees off is a
   total order on matching records.
-- **Truncate simplification**: only drops fully-past-truncation
-  extents. The crossing-extent case (an extent whose range straddles
-  `new_size`) needs partial-shrink semantics — deferred. The
-  load-bearing invariant `NoOverlapWithinIno` holds either way.
+- **Truncate split (P7-9)**: `stm_extent_truncate` itself is still
+  drop-only (drops fully-past-truncation extents). Production
+  partial-shrink semantics live one layer up at
+  `stm_sync_truncate`, which read+decrypt+re-encrypts the kept
+  prefix under fresh `(paddr_0, current_gen)` AEAD nonce before
+  delegating to `stm_extent_truncate` for the past-extent drop. The
+  spec model is in `extent.tla::Truncate` (P7-9 refinement);
+  `NoOverlapWithinIno` holds across both branches.
 - **ERRORCHECK mutex + must_lock helpers**: an iter callback that
   re-enters a public extent API hits `EDEADLK`; `must_lock` aborts
   on non-zero return rather than silently corrupting state. Same
@@ -346,8 +353,13 @@ unrelated to the index API and stays separate.
       `stm_extent_overwrite` take `(paddrs, n_paddrs)` instead of a
       single paddr. Dropped paddrs flatten across each dropped
       extent's full replica set.
-- [ ] Partial-extent shrink on Truncate (truncating mid-extent) —
-      deferred; current MVP only drops fully-past-truncation extents.
+- [x] **P7-9 partial-extent shrink** at `stm_sync_truncate`:
+      crossing extent is read+decrypted, kept prefix re-encrypted
+      under fresh `(paddr_0, current_gen)` AEAD nonce, original
+      drops via the COW overwrite path (replicas route through
+      dead-list / free per snapshot context). Spec refinement in
+      `extent.tla::Truncate` adds a second branch for the
+      crossing case under fresh `replicas \cap used_paddrs = {}`.
 - [ ] Coalescing — quality-of-implementation; correctness preserved
       by `NoOverlapWithinIno`.
 - [ ] Reflinks / refcount-bump path — Phase 7 §10.4.

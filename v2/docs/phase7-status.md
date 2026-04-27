@@ -185,6 +185,52 @@ into the CAS tier (which DOES need P6) is a separate concern.
       gen filter is best-effort because `snapshot.created_txg` and
       `sync.current_gen` are independent counters — closed in P7-8.
       No format break in P7-7; STM_UB_VERSION stays at 13.
+- [x] **P7-9 truncate partial-extent split** — landed at
+      `ad95a5d`; R41 close `5530a0e` (0 P0 + 0 P1 + 0 P2 + 5 P3
+      — P3-3 strict dead-list count assertion + P3-4 TLC bound
+      bump (MaxFileBlocks 2 → 3 + MaxPaddrs 4 → 5 to expose
+      branch-(b) unique states; 11594 → 838164 distinct) + P3-5
+      rec.len defense check fixed inline; P3-1/P3-2 atomicity
+      gaps documented as known limitations in stm_sync_truncate's
+      docstring, deferred to a future `_locked` refactor of
+      write_extent / read_extent). Closes the long-standing MVP
+      gap where `stm_extent_truncate` dropped only fully-past-
+      truncation extents — any crossing extent (off < new_size <
+      off+len) was left at its original full length, leaving
+      bytes past new_size readable until a future overwrite. New
+      public `stm_sync_truncate(s, ds, ino, new_size)` composes:
+      Phase 1 (`stm_extent_lookup_at` at off=new_size-1 to find
+      the crossing extent — NoOverlapWithinIno guarantees ≤ 1);
+      Phase 2 if crossing exists, malloc plaintext buffer,
+      `stm_sync_read_extent` to read+decrypt the full extent,
+      then `stm_sync_write_extent` to re-encrypt the kept
+      `[0, prefix_len)` bytes — the latter's `extent_overwrite`
+      drops the original via the COW path with replicas routed
+      through dead-list / free; Phase 3 acquires sync.lock for
+      atomicity of `stm_extent_truncate` (drops every extent past
+      new_size) + per-paddr `sync_drop_paddr_locked` routing.
+      Plaintext buffer is `stm_ct_memzero`'d on every exit path.
+      Spec refinement in `extent.tla::Truncate`: a second branch
+      replaces the single crossing extent under FRESH replicas
+      (`new_replicas \cap used_paddrs = {}`) at gen = current_txg
+      — re-encrypting under fresh paddrs prevents `(paddr, gen)`
+      reuse that would otherwise share a nonce between the
+      original full ciphertext and the new shrunk prefix's
+      plaintext. test_fs 20 → 26 (6 new tests):
+      fs_truncate_inside_extent_shrinks_prefix (8K → 4K with
+      byte-exact roundtrip + hole verify),
+      fs_truncate_at_extent_boundary_is_noop_for_extent (4K
+      truncate at 4K leaves extent intact),
+      fs_truncate_to_zero_drops_all_extents (3 extents → 0),
+      fs_truncate_past_eof_is_noop (4K → 16K),
+      fs_truncate_with_snapshot_routes_old_paddrs_to_dead_list
+      (snap + 8K → 4K asserts strict count == 1 per R41 P3-3),
+      fs_truncate_args_validated (NULL / 0 ds-ino / unaligned
+      new_size). MVP constraints: new_size must be 4 KiB-aligned;
+      atomicity across crash / partial failure is the caller's
+      responsibility (POSIX truncate-vs-concurrent-write and
+      truncate-vs-commit are not serialized at the sync layer).
+      No format break.
 - [x] **P7-8 snap-gen alignment** — landed at `4f40743`;
       R40 close `c9c29ee` (0 P0 / 0 P1 / 1 P2 / 6 P3 — P2-1
       concurrent-create chain inversion + P3-1 send_recv.h docstring

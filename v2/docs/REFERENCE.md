@@ -38,28 +38,25 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `c9c29ee` (**P7-8 snap-gen alignment** — `extent_txg`
-  field on each snapshot entry captures `sync.current_gen` at
-  SnapshotCreate; send/recv's incremental gen filter
-  (`from.extent_txg < extent.gen <= to.extent_txg`) now sits in
-  the same counter space as `extent.gen`, making the previously
-  best-effort filter authoritative; format break v13 → v14
-  (snapshot record value layout grows 8 bytes); spec extension
-  with separate `sync_gen` counter + `ExtentTxgBoundedBySync` +
-  `ChainExtentTxgOrdered` invariants + new buggy demo
-  `snapshot_extent_txg_unbounded_buggy.cfg`; new accessor
-  `stm_sync_current_gen`; structural validator extended with
-  chain-edge ordering check; `stm_snapshot_create` validates
-  extent_txg ≥ prev's at create time (R40 P2-1 race fix);
-  closes ROADMAP §10.2's incremental-send exit-criterion path).
-  Prior: P7-7 send/recv MVP `73e9f20` (full-send byte-stream
-  protocol with HEADER + EXTENT + END+csum). P7-6 replica-list
-  extension `8d0c172` (extent records grow 32B → 64B; UB v12 →
-  v13). Phase 5 tagged `phase-5-complete` at `461e68e`.
+- **Tip**: `5530a0e` (**P7-9 truncate partial-extent split** —
+  `stm_sync_truncate` shrinks the crossing extent (read+decrypt+
+  re-encrypt the kept prefix under fresh `(paddr_0, current_gen)`
+  AEAD nonce) + drops past extents through dead-list / free
+  routing; closes the long-standing MVP gap where
+  `stm_extent_truncate` only dropped fully-past extents. Spec
+  refinement in `extent.tla::Truncate` adds a second branch for
+  the crossing case under fresh `replicas \cap used_paddrs = {}`.
+  No format break. R41 audit clean: 0 P0 + 0 P1 + 0 P2 + 5 P3.
+  TLC bound bumped MaxFileBlocks 2 → 3 + MaxPaddrs 4 → 5 to
+  expose unique branch-(b) states; 11594 → 838164 distinct).
+  Prior: P7-8 snap-gen alignment `73019c4` (`extent_txg` field on
+  snapshot record + UB v13 → v14 closes incremental-send filter
+  gap). P7-7 send/recv MVP `1122d32`. P7-6 replica-list extension
+  `a958af6` (UB v12 → v13). Phase 5 tagged `phase-5-complete`
+  at `461e68e`.
   Spec posture: **20 modules / 23 fixed configs / 24 buggy demos**
-  (snapshot.tla extended with `sync_gen` + `snap_extent_txg` +
-  `ExtentTxgBoundedBySync` + `ChainExtentTxgOrdered`; new
-  `snapshot_extent_txg_unbounded_buggy.cfg`).
+  (no new buggy cfg in P7-9; the fixed-config bound bump explores
+  ~70× more states without adding modules).
 - **Phases**: 1–5 complete; Phase 6 namespace layer feature-
   complete; **Phase 7 progressing**.
   Spec scaffolds: P6-1 (bptr.tla) `032db86`; P6-2 (dataset.tla)
@@ -103,8 +100,37 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   extents under source pool's metadata_key; recv re-encrypts
   under target's. Single-dataset full-send only at MVP; the
   incremental send was API-wired but with a best-effort filter.
-  **P7-8 snap-gen alignment `4f40743` + R40 close `c9c29ee`
-  (this commit) — closes the P7-7 incremental gap. New 8-byte
+  **P7-9 truncate partial-extent split `ad95a5d` + R41 close
+  `5530a0e` (this commit) — closes the long-standing MVP gap
+  where `stm_extent_truncate` dropped only fully-past-truncation
+  extents, leaving any crossing extent at original full length
+  with a stale AEAD-tag-failing read on bytes past `new_size`.
+  New `stm_sync_truncate(s, ds, ino, new_size)` reads + decrypts
+  the crossing extent's full plaintext, re-encrypts the kept
+  `[0, new_size - off)` prefix under FRESH `(paddr_0,
+  current_gen)` AEAD nonce via `stm_sync_write_extent`'s overwrite
+  path (which drops + drop-routes the original's replicas
+  through dead-list / free per the COW pattern), then drops every
+  extent past `new_size` via `stm_extent_truncate` + per-paddr
+  `sync_drop_paddr_locked`. Spec refinement in
+  `extent.tla::Truncate`: branch (a) keeps the existing drop-
+  only behavior when no extent crosses; branch (b) replaces the
+  single crossing extent (NoOverlapWithinIno guarantees ≤ 1)
+  with a shrunk extent at the same off, len = `new_size - off`,
+  fresh replicas disjoint from `used_paddrs`, gen = `current_txg`.
+  Re-encrypting under fresh paddrs prevents `(paddr, gen)` reuse
+  that would otherwise share a nonce between the original full
+  ciphertext and the new shrunk-prefix's plaintext. No format
+  break. test_fs grows 20 → 26 (6 new tests: crossing-shrink,
+  boundary no-op, truncate-to-zero, past-EOF no-op, snapshot
+  dead-list routing, args validation). 33 ctest suites green
+  default + ASan + TSan in isolated runs. R41 audit:
+  0 P0 + 0 P1 + 0 P2 + 5 P3 — P3-3 strict dead-list count + P3-4
+  TLC bound bump + P3-5 rec.len defense check fixed inline;
+  P3-1/P3-2 documented as known atomicity gaps (deferred to a
+  future _locked refactor of write_extent / read_extent).**
+  P7-8 snap-gen alignment `4f40743` + R40 close `c9c29ee`
+  — closes the P7-7 incremental gap. New 8-byte
   `extent_txg` field on every snapshot entry, captured from
   `sync.current_gen` at SnapshotCreate. Send filters by
   `extent_txg` (same counter space as `extent.gen`) — filter is
@@ -126,17 +152,17 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   Pending: CAS / reflinks (Phase 7 §10.1, §10.4); per-dataset DEKs;
   repair log persistence; truncate partial-extent split.
 - **Tests**: 33 suites × (default + ASan + TSan, serial) green
-  (P7-8 grows test_send_recv 10 → 13 with two new R40 tests +
-  the incremental_send_filters_by_extent_txg roundtrip).
+  (P7-9 grows test_fs 20 → 26 with six new truncate tests).
   test_sync_multi 42; test_pool 48; test_scrub 34 (30 + 4 P7-6
   replica-walk); test_alloc 32; test_cdc 12; test_dataset 57;
-  test_snapshot 41 (P7-8 extent_txg roundtrip assertion added);
-  test_sync 24;
+  test_snapshot 41; test_sync 24;
   test_extent_index 51 (32 in-RAM + 6 persist + 4 lookup_by_paddr +
-  9 P7-6 multi-replica); test_fs 20; test_send_recv 13 (4 arg
-  validation + 1 full-send roundtrip + 1 incremental + 1 swap-
-  rejection + 1 equal-extent_txg + 5 wire/state-machine error
-  paths).
+  9 P7-6 multi-replica); test_fs 26 (P7-9: 6 truncate tests
+  covering crossing-shrink, boundary no-op, truncate-to-zero,
+  past-EOF no-op, snapshot dead-list routing, args validation);
+  test_send_recv 13 (4 arg validation + 1 full-send roundtrip +
+  1 incremental + 1 swap-rejection + 1 equal-extent_txg + 5
+  wire/state-machine error paths).
 - **Specs**: 20 TLA+ modules clean (23 fixed configs: legacy +
   scrub_beta + scrub_durable + scrub_beta_durable + bptr +
   dataset + snapshot + property + clone + dead_list + extent) +
