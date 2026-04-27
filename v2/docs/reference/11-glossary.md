@@ -144,7 +144,7 @@ closed items.
 | R36 | P7-4 fs.c/sync.c COW path integration (extent → dead-list / alloc-free routing). | `64a6278` |
 | R37 | P7-5 production scrub β verify-callback (paddr→bptr resolver via extent walk). | `fc5f619` |
 | R38 | P7-6 replica-list extension on extent records (UB v13 + bptr.tla full replica-walk in scrub cb). | `8d0c172` |
-| R39 | P7-7 send/recv MVP (full-send byte-stream protocol, recv re-encrypts under target pool's key). | `<TBD>` |
+| R39 | P7-7 send/recv MVP (full-send byte-stream protocol, recv re-encrypts under target pool's key). | `73e9f20` |
 
 ## Phase 6 / clone terms
 

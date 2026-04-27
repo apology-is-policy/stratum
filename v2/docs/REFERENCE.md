@@ -38,7 +38,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `<TBD-P7-7-fixup>` (**P7-7 send/recv MVP** — full-send
+- **Tip**: `73e9f20` (**P7-7 send/recv MVP** — full-send
   byte-stream protocol with HEADER + EXTENT records + END+csum;
   `stm_send_init/_next/_close` produces wire bytes, `stm_recv_init/
   _apply/_finish/_close` consumes them; recv re-encrypts each extent
@@ -89,7 +89,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   `LiveReplicasDisjoint` + `ReplicasNonEmpty` +
   `ReplicaCountBounded` invariants; new buggy demo
   `extent_replica_collision_buggy.cfg`**.
-  **P7-7 send/recv MVP `<TBD-substantive>` + R39 close `<TBD-close>`
+  **P7-7 send/recv MVP `a42d84d` + R39 close `73e9f20`
   (this commit) — new `src/send_recv/` module. Wire format: framed
   records (16B framing + body); HEADER once, EXTENT* with plaintext
   payload, END with BLAKE3 csum over prior bytes. Send decrypts

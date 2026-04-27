@@ -148,8 +148,12 @@ into the CAS tier (which DOES need P6) is a separate concern.
       P7-4 tests covering roundtrip / hole / args / COW with-snap
       asserting dead_list_count 0→1 / COW without-snap / cross-
       mount durability / RO blocks / multi-extent).
-- [x] **P7-7 send/recv MVP** — landed at `<TBD-substantive>`;
-      R39 close `<TBD-close>`. New `src/send_recv/` module with
+- [x] **P7-7 send/recv MVP** — landed at `a42d84d`;
+      R39 close `73e9f20` (0 P0 / 0 P1 / 3 P2 / 3 P3 — P2-1 send
+      replica fallback + P2-2 strict n_replicas + P2-3 recv
+      record-size cap + P3-3 dead-code cleanup all fixed inline;
+      P3-1 stale-paddr-on-busy-source + P3-2 recv-durability
+      documented as known caveats in send_recv.h). New `src/send_recv/` module with
       separate send + recv translation units sharing a unified
       `<stratum/send_recv.h>` surface. Wire format: 16-byte framing
       header (type/flags/body_len) per record; HEADER once
