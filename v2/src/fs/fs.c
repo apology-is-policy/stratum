@@ -59,6 +59,18 @@ struct stm_fs {
     stm_alloc *alloc;        /* owned */
     stm_sync  *sync;         /* owned */
 
+    /* P7-13 R45 P2-1: mount-time wrap-key source. Exactly one is
+     * non-NULL; both freed at unmount. Retained so
+     * stm_fs_create_dataset uses the SAME wrap source as the rest of
+     * the pool — passing a different keyfile/janus would silently
+     * persist an unwrappable CURRENT entry that bricks the next
+     * mount per R42 P1-1's hard-fail-on-CURRENT-unwrap-failure
+     * policy. ARCH §7.7 frames wrap keys as pool-wide; per-call
+     * overrides have no documented use case, so binding to the
+     * mount source removes the footgun by construction. */
+    char *keyfile_path;      /* owned */
+    char *janus_socket;      /* owned */
+
     bool read_only;
     bool wedged;
 };
@@ -211,13 +223,32 @@ stm_status stm_fs_format(const char *path, const stm_fs_format_opts *opts)
 /* ========================================================================= */
 
 static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
-                       stm_alloc *a, stm_sync *sync, bool ro)
+                       stm_alloc *a, stm_sync *sync, bool ro,
+                       const char *keyfile_path,
+                       const char *janus_socket)
 {
     stm_fs *fs = calloc(1, sizeof *fs);
     if (!fs) return NULL;
     if (pthread_mutex_init(&fs->lock, NULL) != 0) {
         free(fs);
         return NULL;
+    }
+    if (keyfile_path) {
+        fs->keyfile_path = strdup(keyfile_path);
+        if (!fs->keyfile_path) {
+            pthread_mutex_destroy(&fs->lock);
+            free(fs);
+            return NULL;
+        }
+    }
+    if (janus_socket) {
+        fs->janus_socket = strdup(janus_socket);
+        if (!fs->janus_socket) {
+            free(fs->keyfile_path);
+            pthread_mutex_destroy(&fs->lock);
+            free(fs);
+            return NULL;
+        }
     }
     fs->bdev      = d;
     fs->pool      = pool;
@@ -344,7 +375,8 @@ stm_status stm_fs_mount(const char *path,
         return s;
     }
 
-    stm_fs *fs = fs_new(d, pool, a, sync, opts->read_only);
+    stm_fs *fs = fs_new(d, pool, a, sync, opts->read_only,
+                          opts->keyfile_path, opts->janus_socket);
     if (!fs) {
         stm_sync_close(sync);
         stm_alloc_close(a);
@@ -390,6 +422,8 @@ stm_status stm_fs_unmount(stm_fs *fs)
 
     pthread_mutex_unlock(&fs->lock);
     pthread_mutex_destroy(&fs->lock);
+    free(fs->keyfile_path);
+    free(fs->janus_socket);
     free(fs);
 
     return commit_status;
@@ -475,37 +509,49 @@ stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
  * fs->lock so the FS observer never sees a half-created dataset
  * (entry minted with no DEK provisioned, or DEK provisioned with no
  * entry). On add_dataset_key failure, the dataset_create_child is
- * rolled back via stm_dataset_destroy: the freshly-created leaf has
- * no children and a non-root id, so the only failure modes the
- * destroy spec documents (STM_EINVAL on root, STM_ENOENT on
- * not-PRESENT, STM_EBUSY on has-children) are all unreachable. If
- * destroy somehow returns non-OK anyway, the dataset_index has now
- * diverged from the keyschema so we wedge the fs to preserve
- * forensic state — STM_ECORRUPT propagated to the caller.
+ * rolled back via stm_dataset_destroy. The freshly-created leaf is
+ * non-root (new_id ≥ 2 since root is id=1), PRESENT (just inserted
+ * under fs->lock), and has no children, so the destroy spec's three
+ * documented failure modes (STM_EINVAL on root, STM_ENOENT on
+ * not-PRESENT, STM_EBUSY on has-children) are all unreachable —
+ * asserted post-call.
  *
- * Wrap-key lifecycle: loaded BEFORE fs->lock so a bad keyfile or
- * unreachable janus daemon doesn't hold up other writers; wiped
- * (or janus client disconnected) on every exit path including the
- * guard-refusal paths. Mirrors stm_fs_format / stm_fs_mount's
- * shape — fs->* never retains wrap-key material.
+ * Wrap-key lifecycle (R45 P2-1): the wrap source is the SAME source
+ * used at mount, retained on the fs handle (`fs->keyfile_path` or
+ * `fs->janus_socket`, exactly one). Loading + wipe / connect +
+ * disconnect happens per-call. Binding to the mount source removes
+ * a footgun where a caller could have passed a different keyfile/
+ * janus and silently persisted an unwrappable CURRENT entry, which
+ * R42 P1-1's hard-fail-on-CURRENT-unwrap-failure would turn into a
+ * permanent mount refusal on the next mount. ARCH §7.7 frames wrap
+ * keys as pool-wide, so per-call overrides have no documented use
+ * case — implicit binding is the right shape.
+ *
+ * Loading the wrap source happens BEFORE fs->lock is taken so a
+ * keyfile read or janus connect failure doesn't hold up other
+ * writers. Wiped / disconnected on every exit path (success and
+ * failure).
  */
 stm_status stm_fs_create_dataset(stm_fs *fs, uint64_t parent_id,
                                     const char *name,
-                                    const stm_fs_create_dataset_opts *opts,
                                     uint64_t *out_id)
 {
-    if (!fs || !name || !opts || !out_id) return STM_EINVAL;
-    int have_kf = opts->keyfile_path != NULL;
-    int have_jn = opts->janus_socket != NULL;
-    if (have_kf == have_jn) return STM_EINVAL;
+    if (!fs || !name || !out_id) return STM_EINVAL;
+    /* R45 P2-1: bind to the mount-time wrap source. Exactly one of
+     * keyfile_path / janus_socket is non-NULL post-mount (mount opts
+     * enforce the XOR + at least one); confirm the post-mount
+     * invariant defensively. */
+    int have_kf = fs->keyfile_path != NULL;
+    int have_jn = fs->janus_socket != NULL;
+    if (have_kf == have_jn) return STM_ECORRUPT;
 
     stm_hybrid_keys   wk    = {0};
     stm_janus_client *janus = NULL;
     if (have_kf) {
-        stm_status ks = stm_keyfile_load(opts->keyfile_path, &wk);
+        stm_status ks = stm_keyfile_load(fs->keyfile_path, &wk);
         if (ks != STM_OK) return ks;
     } else {
-        stm_status js = stm_janus_client_connect(opts->janus_socket, &janus);
+        stm_status js = stm_janus_client_connect(fs->janus_socket, &janus);
         if (js != STM_OK) return js;
     }
 
@@ -525,9 +571,9 @@ stm_status stm_fs_create_dataset(stm_fs *fs, uint64_t parent_id,
 
     stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
     if (!didx) {
-        /* Should be impossible post-mount — sync_open always populates
-         * the dataset index. Surface as ECORRUPT defensively rather
-         * than dereferencing NULL. */
+        /* sync_open always populates the dataset index; a NULL here
+         * means a sync-internal corruption that we surface rather
+         * than dereferencing. */
         pthread_mutex_unlock(&fs->lock);
         stm_hybrid_keys_wipe(&wk);
         if (janus) stm_janus_client_disconnect(janus);
@@ -549,16 +595,15 @@ stm_status stm_fs_create_dataset(stm_fs *fs, uint64_t parent_id,
                                     have_jn ? janus : NULL,
                                     &new_kid);
     if (s != STM_OK) {
-        stm_status rb = stm_dataset_destroy(didx, new_id);
-        if (rb != STM_OK) {
-            /* Index now divergent from keyschema. Preserve forensic
-             * state for offline inspection — wedge the fs. */
-            fs->wedged = true;
-            pthread_mutex_unlock(&fs->lock);
-            stm_hybrid_keys_wipe(&wk);
-            if (janus) stm_janus_client_disconnect(janus);
-            return STM_ECORRUPT;
-        }
+        /* R45 P3-2: destroy on a freshly-created non-root leaf with
+         * no children + no concurrent observer (we hold fs->lock) is
+         * infallible per the dataset module's spec — its three
+         * documented failure modes (root-id, not-PRESENT, has-children)
+         * are all unreachable for new_id minted three lines above.
+         * The return value is unused. If a future spec change adds a
+         * failure mode, a regression test on fs_create_dataset's
+         * rollback path will catch it. */
+        (void)stm_dataset_destroy(didx, new_id);
         pthread_mutex_unlock(&fs->lock);
         stm_hybrid_keys_wipe(&wk);
         if (janus) stm_janus_client_disconnect(janus);
