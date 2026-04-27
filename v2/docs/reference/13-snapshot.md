@@ -39,7 +39,7 @@ written so `ub_snap_root` becomes non-zero).
 ### Mutation
 
 ```c
-stm_status stm_snapshot_create   (idx, dataset_id, name, tree_root_paddr, *out_id);
+stm_status stm_snapshot_create   (idx, dataset_id, name, tree_root_paddr, extent_txg, *out_id);
 stm_status stm_snapshot_delete   (idx, snapshot_id, **out_freed_paddrs, *out_freed_count);
 stm_status stm_snapshot_hold     (idx, snapshot_id);
 stm_status stm_snapshot_release  (idx, snapshot_id);
@@ -52,6 +52,16 @@ All run under an internal `PTHREAD_MUTEX_ERRORCHECK` mutex. Same
 `created_txg` equals (post-bump) `current_txg`. `prev_snap_id` is
 auto-stamped to the most-recent PRESENT snapshot of the same
 `dataset_id` (or `STM_SNAP_NO_PREV = 0` if first).
+
+`extent_txg` (P7-8) is a caller-supplied value that the impl
+captures verbatim into the entry. Production callers (sync-aware)
+pass `stm_sync_current_gen(s)`; this is the value the next extent
+write will stamp into `extent.gen`. Send/recv's incremental gen
+filter then sits in the same counter space as `extent.gen`. Test/
+bench callers without a sync handle may pass `0` — that disables
+snap-bounded send for those snaps but leaves all other lifecycle
+behavior unchanged. See `snapshot.tla::ExtentTxgBoundedBySync`
+and `ChainExtentTxgOrdered` for the spec-level invariants.
 
 `Delete` refuses with `STM_EBUSY` if `hold_count > 0` or if a
 registered clone-check cb returns true (`clone.tla::SnapWith-
@@ -155,7 +165,7 @@ queries `stm_dataset_clones_count_for_snap` to enforce
 explicitly un-registered in `stm_sync_close` BEFORE the dataset
 index is freed (R32 P2-1 defensive hygiene).
 
-## On-disk encoding (v11+)
+## On-disk encoding (v14+)
 
 ### Key
 
@@ -169,21 +179,25 @@ off       size  field
   0        8   dataset_id        (le64; ≠ 0)
   8        8   tree_root_paddr   (le64; STM_SNAP_NO_TREE_ROOT for stub)
  16        8   created_txg       (le64; ≤ idx->current_txg)
- 24        8   prev_snap_id      (le64; STM_SNAP_NO_PREV for chain head)
- 32        4   hold_count        (le32; persists across mount)
- 36        4   flags             (le32)
- 40        2   name_len          (le16; 1..STM_SNAP_NAME_MAX)
- 42        2   pad               (zero)
- 44        L   name              (UTF-8, no NUL)
- 44+L      4   dead_count        (le32; 0..STM_SNAP_DEAD_LIST_MAX)
- 48+L    8*N   dead_paddrs       (le64[N])  N = dead_count
+ 24        8   extent_txg        (le64; ≤ sync.current_gen at Create — P7-8)
+ 32        8   prev_snap_id      (le64; STM_SNAP_NO_PREV for chain head)
+ 40        4   hold_count        (le32; persists across mount)
+ 44        4   flags             (le32)
+ 48        2   name_len          (le16; 1..STM_SNAP_NAME_MAX)
+ 50        2   pad               (zero)
+ 52        L   name              (UTF-8, no NUL)
+ 52+L      4   dead_count        (le32; 0..STM_SNAP_DEAD_LIST_MAX)
+ 56+L    8*N   dead_paddrs       (le64[N])  N = dead_count
 ```
 
-Total: `48 + name_len + 8*dead_count` bytes (was `44 + name_len`
-pre-v11). `SP_VAL_FIXED == 44`; `SP_DEAD_TAIL_FIXED == 4`. The
-v10→v11 bump is content-clean (v10 entries had no trailing bytes;
-v11 entries with `dead_count == 0` parse identically modulo the
-extra 4-byte `0` word).
+Total: `56 + name_len + 8*dead_count` bytes (was `48 + name_len`
+pre-v14). `SP_VAL_FIXED == 52`; `SP_DEAD_TAIL_FIXED == 4`. The
+v13→v14 bump is a HARD format break — v13's 44-byte fixed prefix
+and v14's 52-byte fixed prefix produce different total lengths
+even at `name_len == 0` and `dead_count == 0`, so a v13 mount-load
+under v14 code length-rejects via the in_len-vs-expected check in
+`sp_decode_value`. Refused at mount via uniform STM_EBADVERSION
+(uberblock.c version gate).
 
 ### Crypt + Merkle
 
@@ -200,7 +214,7 @@ tree uses `STM_BPTR_KIND_DATASET = 9` (added in P6-clone).
 
 | Spec | Pins |
 |---|---|
-| `snapshot.tla` | `SnapIdMonotonic` — ids only grow; never recycled. `BirthTxgMonotonic` — `created_txg ≤ current_txg`. `HoldPreventsDelete` — `hold_count > 0` blocks delete. `TreeRootImmutable` — once captured, the snap's `tree_root_paddr` cannot change. `ChainTxgOrdered` — along prev_snap_id chain (filtering ABSENT links), `created_txg` strictly decreases. `ChainAcyclic` — bounded walk along prev_snap_id never returns to the start. |
+| `snapshot.tla` | `SnapIdMonotonic` — ids only grow; never recycled. `BirthTxgMonotonic` — `created_txg ≤ current_txg`. `HoldPreventsDelete` — `hold_count > 0` blocks delete. `TreeRootImmutable` — once captured, the snap's `tree_root_paddr` cannot change. `ChainTxgOrdered` — along prev_snap_id chain (filtering ABSENT links), `created_txg` strictly decreases. `ChainAcyclic` — bounded walk along prev_snap_id never returns to the start. **`ExtentTxgBoundedBySync` (P7-8)** — every snap's captured `extent_txg ≤ sync_gen`. **`ChainExtentTxgOrdered` (P7-8)** — along prev_snap_id chain, `extent_txg` is non-decreasing (older has ≤ newer). Buggy demos: `snapshot_chain_disorder_buggy.cfg` (BuggyChainOutOfOrder), `snapshot_delete_held_buggy.cfg` (BuggyDeleteWithHold), `snapshot_extent_txg_unbounded_buggy.cfg` (BuggyExtentTxgUnbounded — P7-8 new). |
 | `clone.tla` | `SnapWithClonesUndeletable` — operationally enforced via the cb hook. Snap deletion refused while any present clone references the snap. |
 | `dead_list.tla` | `BlocksTrackedSomewhere` — every block ever written is in the live set, freed, or in some PRESENT snap's dead-list (the load-bearing "blocks aren't lost"). `NoDoubleFree` — a freed block never re-appears in any dead-list. `LiveDisjointFromDead/Freed`, `FreedDisjointFromDead`, `SnapIdMonotonic`. `OverwriteBlock` — COW into most_recent_snap.dead, or free directly if no snap exists. `SnapDelete` with `unique = S.dead − succ.dead → freed`; `surviving = S.dead ∩ succ.dead → migrate to pred.dead` (empty in single-ownership). |
 

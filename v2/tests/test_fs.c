@@ -508,6 +508,7 @@ STM_TEST(fs_io_cow_with_snapshot_routes_to_dead_list) {
     uint64_t snap_id = 0;
     STM_ASSERT_OK(stm_snapshot_create(snap, /*ds=*/1, "snap_a",
                                           /*tree_root_paddr=*/0xCAFE,
+                                          stm_sync_current_gen(sync),
                                           &snap_id));
     /* Pre-overwrite: dead_list is empty. */
     size_t pre = 999;

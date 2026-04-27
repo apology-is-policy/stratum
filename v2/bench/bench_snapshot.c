@@ -55,7 +55,7 @@ static void bench_snap_create_at_population(uint64_t n_existing)
         snprintf(name, sizeof name, "pre_%010" PRIu64, i);
         uint64_t id = 0;
         if (stm_snapshot_create(idx, /*ds=*/1, name,
-                                  /*tree_root=*/0xCAFEBABEull, &id) != STM_OK) {
+                                  /*tree_root=*/0xCAFEBABEull, 0, &id) != STM_OK) {
             fprintf(stderr, "bench: pre-fill stm_snapshot_create failed at i=%" PRIu64 "\n", i);
             stm_snapshot_index_close(idx);
             return;
@@ -72,7 +72,7 @@ static void bench_snap_create_at_population(uint64_t n_existing)
     for (int i = 0; i < n_bench; i++) {
         snprintf(name, sizeof name, "bench_%010d", i);
         uint64_t id = 0;
-        (void)stm_snapshot_create(idx, /*ds=*/1, name, 0xBEEFull, &id);
+        (void)stm_snapshot_create(idx, /*ds=*/1, name, 0xBEEFull, 0, &id);
     }
     double t1 = now_sec();
 
@@ -110,7 +110,7 @@ static void bench_snap_create_across_datasets(int n_datasets)
         snprintf(name, sizeof name, "init_%d", d);
         uint64_t id = 0;
         (void)stm_snapshot_create(idx, /*ds=*/(uint64_t)(d + 1u), name,
-                                    0xCAFEBABEull, &id);
+                                    0xCAFEBABEull, 0, &id);
     }
 
     int n_bench = 1000;
@@ -122,7 +122,7 @@ static void bench_snap_create_across_datasets(int n_datasets)
          * shouldn't matter at this layer.) */
         snprintf(name, sizeof name, "ds1_bench_%d", i);
         uint64_t id = 0;
-        (void)stm_snapshot_create(idx, /*ds=*/1, name, 0xBEEFull, &id);
+        (void)stm_snapshot_create(idx, /*ds=*/1, name, 0xBEEFull, 0, &id);
     }
     double t1 = now_sec();
 
@@ -153,7 +153,7 @@ static void bench_snap_delete_vs_dead_list(size_t dead_size)
         char name[32];
         snprintf(name, sizeof name, "victim_%d", iter);
         uint64_t id = 0;
-        if (stm_snapshot_create(idx, /*ds=*/1, name, /*root=*/0xCAFE, &id) != STM_OK) {
+        if (stm_snapshot_create(idx, /*ds=*/1, name, /*root=*/0xCAFE, 0, &id) != STM_OK) {
             stm_snapshot_index_close(idx);
             continue;
         }
@@ -193,7 +193,7 @@ static void bench_overwrite_throughput(size_t per_snap)
     stm_snapshot_index *idx = NULL;
     if (stm_snapshot_index_create(0, &idx) != STM_OK) return;
     uint64_t id = 0;
-    if (stm_snapshot_create(idx, /*ds=*/1, "bench", 0, &id) != STM_OK) {
+    if (stm_snapshot_create(idx, /*ds=*/1, "bench", 0, 0, &id) != STM_OK) {
         stm_snapshot_index_close(idx);
         return;
     }

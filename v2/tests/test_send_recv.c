@@ -189,22 +189,93 @@ STM_TEST(full_send_roundtrip_three_extents) {
 }
 
 /* ========================================================================= */
-/* Incremental send.                                                          */
+/* Incremental send (P7-8 — extent_txg alignment).                            */
 /* ========================================================================= */
 
-/* Incremental send (snap-bounded) is documented as a future-work
- * gap in the MVP: snapshot.created_txg lives in the snapshot index's
- * own counter space, distinct from sync.current_gen which stamps
- * extent.gen. Without an alignment field the incremental gen filter
- * is meaningless. Future chunk: add `extent_txg` to the snapshot
- * record (format break v13 → v14) so incremental sends can map
- * snap → extent-gen-bound. The send_init API accepts the snap_id
- * params today but treats them as advisory metadata only when both
- * are zero (full send). Non-zero snap_id is honored at the API
- * level — it still validates the snap exists and matches the
- * dataset — but the gen-range is currently the snap_idx's
- * created_txg which does not reliably bound extent.gen. The
- * full_send_roundtrip_three_extents test pins the working case. */
+/* P7-8 wired snapshot.extent_txg = sync.current_gen at SnapshotCreate
+ * so send/recv's snap-bounded filter sits in the same counter space
+ * as `extent.gen`. The bracketed `commit → snap_create → commit`
+ * pattern below establishes a strict gen boundary so writes after
+ * snap_a are at gen strictly greater than snap_a.extent_txg, and
+ * writes before snap_b are at gen strictly less-than-or-equal-to
+ * snap_b.extent_txg. */
+STM_TEST(incremental_send_filters_by_extent_txg) {
+    testpool src; testpool_setup(&src, "inc_src", POOL_UUID_SRC);
+    testpool tgt; testpool_setup(&tgt, "inc_tgt", POOL_UUID_TGT);
+
+    stm_sync *s_src = stm_fs_sync_for_test(src.fs);
+    stm_sync *s_tgt = stm_fs_sync_for_test(tgt.fs);
+    stm_snapshot_index *snap_src = stm_sync_snapshot_index(s_src);
+    STM_ASSERT_TRUE(snap_src != NULL);
+
+    /* Pre-snap_a: write extent A at sync's initial gen. */
+    uint8_t dataA[4096]; memset(dataA, 0xAA, sizeof dataA);
+    STM_ASSERT_OK(stm_fs_write(src.fs, /*ds*/1, /*ino*/1, 0, dataA, sizeof dataA));
+
+    /* Commit → bumps current_gen so snap captures a fresh gen. */
+    STM_ASSERT_OK(stm_sync_commit(s_src));
+
+    /* Create snap_a — captures sync.current_gen as extent_txg. */
+    uint64_t snap_a = 0;
+    STM_ASSERT_OK(stm_snapshot_create(snap_src, /*ds*/1, "snap_a",
+                                          /*tree_root_paddr=*/0,
+                                          stm_sync_current_gen(s_src),
+                                          &snap_a));
+
+    /* Commit AGAIN so post-snap_a writes happen at strictly higher
+     * gen (the operational pattern documented in send_recv.h). */
+    STM_ASSERT_OK(stm_sync_commit(s_src));
+
+    /* Write extent B (post-snap_a). */
+    uint8_t dataB[4096]; memset(dataB, 0xBB, sizeof dataB);
+    STM_ASSERT_OK(stm_fs_write(src.fs, /*ds*/1, /*ino*/2, 0, dataB, sizeof dataB));
+
+    STM_ASSERT_OK(stm_sync_commit(s_src));
+
+    /* Create snap_b. */
+    uint64_t snap_b = 0;
+    STM_ASSERT_OK(stm_snapshot_create(snap_src, /*ds*/1, "snap_b",
+                                          /*tree_root_paddr=*/0,
+                                          stm_sync_current_gen(s_src),
+                                          &snap_b));
+
+    STM_ASSERT_OK(stm_sync_commit(s_src));
+
+    /* Verify the captured extent_txgs straddle B's gen. */
+    stm_snapshot_entry ea = {0}, eb = {0};
+    STM_ASSERT_OK(stm_snapshot_lookup(snap_src, snap_a, &ea));
+    STM_ASSERT_OK(stm_snapshot_lookup(snap_src, snap_b, &eb));
+    STM_ASSERT(ea.extent_txg < eb.extent_txg);
+
+    /* Incremental send (snap_a → snap_b). Should emit ONLY extent B. */
+    stm_send_handle *sh = NULL;
+    STM_ASSERT_OK(stm_send_init(s_src, /*ds=*/1, snap_a, snap_b, &sh));
+    stm_recv_handle *rh = NULL;
+    STM_ASSERT_OK(stm_recv_init(s_tgt, /*target_ds=*/1, &rh));
+
+    STM_ASSERT_OK(pipe_send_to_recv(sh, rh));
+
+    stm_send_close(sh);
+    stm_recv_close(rh);
+
+    /* Target should have B (post-snap_a) but NOT A (pre-snap_a). */
+    uint8_t out[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 2, 0, out, sizeof out, &got));
+    STM_ASSERT_EQ(got, (size_t)4096);
+    STM_ASSERT_MEM_EQ(dataB, out, sizeof dataB);
+
+    /* ino 1 (extent A) was excluded by the gen filter — read returns
+     * a hole (zeros) for the entire span. */
+    memset(out, 0xCC, sizeof out);  /* Pre-fill to detect "no read". */
+    STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_EQ(got, (size_t)4096);
+    uint8_t zeros[4096] = {0};
+    STM_ASSERT_MEM_EQ(zeros, out, sizeof zeros);
+
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
 
 /* ========================================================================= */
 /* Wire-format / state-machine error paths.                                   */

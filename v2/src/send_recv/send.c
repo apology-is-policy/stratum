@@ -156,19 +156,24 @@ stm_status stm_send_init(stm_sync *sync,
     stm_snapshot_index *snap_idx = stm_sync_snapshot_index(sync);
     if (!snap_idx) return STM_EINVAL;
 
+    /* P7-8: filter by `extent_txg`, the sync.current_gen captured at
+     * snap-create. This is the SAME counter space as `extent.gen`, so
+     * the filter `gen_min_excl < extent.gen <= gen_max_incl` is now
+     * authoritative (was best-effort pre-P7-8 when we used
+     * `created_txg`, the snap-index counter). */
     if (from_snap_id != 0) {
         stm_snapshot_entry from_entry;
         stm_status ls = stm_snapshot_lookup(snap_idx, from_snap_id, &from_entry);
         if (ls != STM_OK) return STM_ENOENT;
         if (from_entry.dataset_id != dataset_id) return STM_EINVAL;
-        gen_min_excl = from_entry.created_txg;
+        gen_min_excl = from_entry.extent_txg;
     }
     if (to_snap_id != 0) {
         stm_snapshot_entry to_entry;
         stm_status ls = stm_snapshot_lookup(snap_idx, to_snap_id, &to_entry);
         if (ls != STM_OK) return STM_ENOENT;
         if (to_entry.dataset_id != dataset_id) return STM_EINVAL;
-        gen_max_incl = to_entry.created_txg;
+        gen_max_incl = to_entry.extent_txg;
     } else {
         /* Full or open-ended: cap at the index's current_txg. */
         stm_extent_index *eidx = stm_sync_extent_index(sync);
@@ -176,7 +181,11 @@ stm_status stm_send_init(stm_sync *sync,
         stm_status ts = stm_extent_index_current_txg(eidx, &gen_max_incl);
         if (ts != STM_OK) return ts;
     }
-    /* From > To is nonsense. */
+    /* From > To is nonsense — incremental send across snaps must have
+     * the older snap (from) captured at a strictly LOWER extent_txg
+     * than the newer (to). Equal extent_txg means no Write happened
+     * between the two — empty diff, but still rejected here as a
+     * caller bug rather than silently producing zero EXTENT records. */
     if (from_snap_id != 0 && to_snap_id != 0 && gen_min_excl >= gen_max_incl)
         return STM_EINVAL;
 

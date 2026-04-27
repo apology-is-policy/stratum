@@ -2143,6 +2143,18 @@ const uint8_t *stm_sync_metadata_key(const stm_sync *s)
     return s->metadata_key;
 }
 
+uint64_t stm_sync_current_gen(const stm_sync *s)
+{
+    if (!s) return 0;
+    /* current_gen advances under sync->lock at every commit/publish;
+     * take the lock briefly for a consistent snapshot. */
+    stm_sync *ms = (stm_sync *)s;
+    pthread_mutex_lock(&ms->lock);
+    uint64_t g = s->current_gen;
+    pthread_mutex_unlock(&ms->lock);
+    return g;
+}
+
 stm_alloc *stm_sync_alloc(const stm_sync *s, uint16_t device_id)
 {
     if (!s) return NULL;

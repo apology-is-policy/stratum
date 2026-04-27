@@ -339,6 +339,21 @@ stm_alloc *stm_sync_alloc(const stm_sync *s, uint16_t device_id);
  */
 const uint8_t *stm_sync_metadata_key(const stm_sync *s);
 
+/*
+ * P7-8: read-only snapshot of sync's current_gen. Returned value
+ * is the gen at which the next extent-write will land — the same
+ * value `stm_sync_write_extent` stamps into `extent.gen`. Callers
+ * use this to capture an extent-txg-bound for a fresh snapshot via
+ * `stm_snapshot_create`'s `extent_txg` argument; the captured value
+ * then bounds `extent.gen` for snap-bounded send filtering.
+ *
+ * Returns 0 on NULL arg. Otherwise the caller's snapshot of
+ * s->current_gen taken under sync's lock — value is valid as of
+ * the call's instant; concurrent commits may advance it before the
+ * caller observes the return.
+ */
+uint64_t stm_sync_current_gen(const stm_sync *s);
+
 /* ========================================================================= */
 /* P5-3c: multi-device alloc attach + mirror APIs.                             */
 /* ========================================================================= */

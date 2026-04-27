@@ -89,6 +89,12 @@ struct stm_bootstrap;  typedef struct stm_bootstrap  stm_bootstrap;
  * the bptr layer integration is a follow-on chunk. Other fields
  * (name, dataset_id, prev_snap_id, created_txg, flags) match the
  * design 1:1.
+ *
+ * P7-8 added `extent_txg`: the sync.current_gen captured at Create
+ * time. Distinct from `created_txg` which is the snap-index's own
+ * monotonic counter. `extent_txg` IS the value send/recv's
+ * incremental gen filter uses to bound `extent.gen` (see
+ * snapshot.tla::ExtentTxgBoundedBySync). Format-break v13 → v14.
  */
 typedef struct {
     uint64_t snapshot_id;             /* unique pool-wide; monotonic */
@@ -96,7 +102,8 @@ typedef struct {
     uint32_t name_len;                /* bytes; ≤ STM_SNAP_NAME_MAX */
     uint8_t  name[STM_SNAP_NAME_MAX + 1u];  /* UTF-8 + NUL */
     uint64_t tree_root_paddr;         /* dataset tree_root captured at Create */
-    uint64_t created_txg;
+    uint64_t created_txg;             /* snap-index counter at Create */
+    uint64_t extent_txg;              /* sync.current_gen at Create (P7-8) */
     uint64_t prev_snap_id;            /* STM_SNAP_NO_PREV for first */
     uint32_t hold_count;              /* >0 ⇒ Delete refused */
     uint32_t flags;                   /* future: ro / locked / ... */
@@ -142,6 +149,15 @@ stm_status stm_snapshot_index_current_txg(const stm_snapshot_index *idx,
  * prev_snap_id to the dataset's most-recent existing snapshot
  * (NO_PREV if this is the first).
  *
+ * `extent_txg` (P7-8): the sync.current_gen value at the moment of
+ * Create. Captured into the entry as `extent_txg`. Used by send/
+ * recv's incremental filter to authoritatively bound `extent.gen`
+ * (which is also stamped from sync.current_gen at extent-write
+ * time). Callers integrated with `stm_sync` should pass the value
+ * from `stm_sync_current_gen`. Test/bench callers without sync may
+ * pass 0 — that disables snap-bounded send for those snaps but
+ * leaves all other lifecycle behavior unchanged.
+ *
  * Preconditions:
  *   - dataset_id != 0 (else STM_EINVAL).
  *   - name has length 1..STM_SNAP_NAME_MAX (else STM_EINVAL).
@@ -156,6 +172,7 @@ stm_status stm_snapshot_create(stm_snapshot_index *idx,
                                  uint64_t dataset_id,
                                  const char *name,
                                  uint64_t tree_root_paddr,
+                                 uint64_t extent_txg,
                                  uint64_t *out_id);
 
 /*
@@ -323,20 +340,21 @@ stm_status stm_snapshot_iter(const stm_snapshot_index *idx,
  *    0         8    dataset_id (le64)
  *    8         8    tree_root_paddr (le64)
  *   16         8    created_txg (le64)
- *   24         8    prev_snap_id (le64) — STM_SNAP_NO_PREV (0) for chain head
- *   32         4    hold_count (le32) — persists across mount, like ZFS holds
- *   36         4    flags (le32)
- *   40         2    name_len (le16) — 1..STM_SNAP_NAME_MAX
- *   42         2    pad (zero)
- *   44         L    name (UTF-8, no NUL)  L = name_len
- *   44+L       4    dead_count (le32) — 0..STM_SNAP_DEAD_LIST_MAX
- *   48+L     8*N    dead_paddrs (le64[N]) where N = dead_count
+ *   24         8    extent_txg (le64)  — sync.current_gen at Create (P7-8)
+ *   32         8    prev_snap_id (le64) — STM_SNAP_NO_PREV (0) for chain head
+ *   40         4    hold_count (le32) — persists across mount, like ZFS holds
+ *   44         4    flags (le32)
+ *   48         2    name_len (le16) — 1..STM_SNAP_NAME_MAX
+ *   50         2    pad (zero)
+ *   52         L    name (UTF-8, no NUL)  L = name_len
+ *   52+L       4    dead_count (le32) — 0..STM_SNAP_DEAD_LIST_MAX
+ *   56+L     8*N    dead_paddrs (le64[N]) where N = dead_count
  *
- * Total: 48 + name_len + 8*dead_count bytes (was 44 + name_len pre-v11).
- * Crypt + I/O follow the alloc_roots pattern. STM_UB_VERSION = 11
- * gates the new tail; v10 decoders rejected trailing bytes after
- * `name`, so v11 entries with `dead_count == 0` are content-clean for
- * forward-only upgrade.
+ * Total: 56 + name_len + 8*dead_count bytes (was 48 pre-v14).
+ * Crypt + I/O follow the alloc_roots pattern. STM_UB_VERSION = 14
+ * gates the new layout — v13 decoders length-rejected on the new
+ * extent_txg field's 8-byte insertion, so v13 → v14 is a hard format
+ * break. Refused with STM_EBADVERSION at mount.
  */
 
 STM_MUST_USE

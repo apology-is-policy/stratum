@@ -35,15 +35,16 @@ chapter as specs get wider cross-reference tables).
 | `scrub.tla` | 5 | Scrub state machine + β cb-classification + γ durable cursor. | small (each of α + β + γ configs; γ adds durable shadow + Persist/Crash/Mount) | `scrub_buggy.cfg` |
 | `bptr.tla` | 6 | Production scrub β cb protocol — replica-walk + csum-gate + rewrite-bad + verify-writeback + log. | 29 states, depth 8 (NReplicas=3) | `bptr_accept_corrupt_buggy.cfg`, `bptr_no_verify_writeback_buggy.cfg` |
 | `dataset.tla` | 6 | Pool-wide dataset hierarchy — forest structure + atomic create/destroy/rename/move + sibling-name uniqueness + id monotonicity + birth-txg. | 43 states, depth 7 (MaxDatasets=3, 2 names) | `dataset_cycles_buggy.cfg`, `dataset_dup_name_buggy.cfg`, `dataset_destroy_non_leaf_buggy.cfg` |
-| `snapshot.tla` | 6 | Snapshot lifecycle — O(1) atomic create + birth-txg ordering + chain integrity + holds prevent delete. Block-level dead-list deferred. | 636 states, depth 9 (MaxSnaps=3, MaxTxg=5) | `snapshot_delete_held_buggy.cfg`, `snapshot_chain_disorder_buggy.cfg` |
+| `snapshot.tla` | 6 | Snapshot lifecycle — O(1) atomic create + birth-txg ordering + chain integrity + holds prevent delete. P7-8 added separate `sync_gen` counter + `snap_extent_txg` capture so send/recv's incremental gen filter aligns with extent.gen. Block-level dead-list deferred. | 3975 states, depth 12 (MaxSnaps=3, MaxTxg=5) | `snapshot_delete_held_buggy.cfg`, `snapshot_chain_disorder_buggy.cfg`, `snapshot_extent_txg_unbounded_buggy.cfg` (P7-8) |
 | `property.tla` | 6 | Per-dataset property inheritance — local override / inheritable walk / non-inheritable + immutable-at-create. | 1040 states, depth 11 (MaxDatasets=2, 3 props, 2 values) | `property_inherit_non_inh_buggy.cfg`, `property_mutate_immutable_buggy.cfg` |
 | `clone.tla` | 6 | Clone (writable snapshot) lifecycle — clone-from-snap + snap-with-clones-undeletable + promote-breaks-dependency. | 161 states, depth 11 (MaxDatasets=3, MaxSnaps=2) | `clone_delete_snap_with_clones_buggy.cfg` |
 | `dead_list.tla` | 6 | Block-level reachability + per-snapshot dead-list incremental maintenance during COW + ZFS-style SnapDelete (free-unique + merge-surviving-into-pred). | 5656 states, depth 15 (MaxBlocks=4, MaxSnaps=3) | `dead_list_overwrite_forgets_buggy.cfg`, `dead_list_delete_forgets_free_buggy.cfg`, `dead_list_merge_includes_freed_buggy.cfg` |
 | `extent.tla` | 7 | Per-(dataset, ino) extent layout — Write / Overwrite / Truncate / DeleteFile / AdvanceTxg + no-overlap-within-ino + length-positive + birth-txg-bound + paddr-freshness + replica sets per extent (P7-6) + live-replicas-disjoint. | 11594 states, depth 6 (MaxDatasets=1, MaxInos=2, MaxFileBlocks=2, MaxPaddrs=4, MaxTxg=1, MaxReplicasPerExtent=2) | `extent_overlap_buggy.cfg`, `extent_zero_length_buggy.cfg`, `extent_overwrite_forgets_drop_buggy.cfg`, `extent_replica_collision_buggy.cfg` |
 
 All 23 fixed configs green (one per module + `scrub_beta` +
-`scrub_durable` + `scrub_beta_durable` extending `scrub.tla`). All 23
-buggy configs reproduce their designed invariant violations.
+`scrub_durable` + `scrub_beta_durable` extending `scrub.tla`). All 24
+buggy configs reproduce their designed invariant violations
+(P7-8 added `snapshot_extent_txg_unbounded_buggy`).
 
 ## Per-module invariants
 
@@ -539,18 +540,29 @@ spec); snapshots and clones (separate specs); send/recv; per-
 connection 9P namespaces; the btree mechanism layer that stores
 the entries; crash/commit boundaries (covered by quorum.tla).
 
-### `snapshot.tla` — snapshot lifecycle (P6-3 spec scaffold)
+### `snapshot.tla` — snapshot lifecycle (P6-3 spec scaffold; P7-8 extent_txg)
 
 Models the snapshot LIFECYCLE for a single dataset's snapshot
 chain — Create / Delete / Hold / Release / Write — capturing
 ARCH §8.5's load-bearing properties without yet diving into the
 block-level dead-list mechanics (separate spec).
 
+P7-8 extended the spec with a separate `sync_gen` counter
+(modeling `sync.current_gen` from the impl) distinct from the
+snap-index `current_txg`. Each `Write` action bumps `sync_gen` —
+not `current_txg` — capturing the impl reality that extent
+writes happen on the sync's commit-gen counter, not the snap-
+index's. `SnapshotCreate` captures `sync_gen` as a per-snap
+`snap_extent_txg` field; this is the value send/recv's incremental
+filter uses to bound `extent.gen`. The pre-P7-8 spec collapsed
+both counters into `current_txg`, which hid the impl's counter-
+space mismatch.
+
 Invariants:
 
 - `TypeOK`.
 - `BirthTxgMonotonic` — every snapshot's `created_txg ≤ current_txg`.
-  No "future-dated" snapshots.
+  No "future-dated" snapshots (snap-index counter).
 - `HoldPreventsDelete` — encoded as `snap_held[s] ⇒ Present(s)`.
   A held snap can't transition to ABSENT; a deleted snap's hold
   must have been released first.
@@ -565,12 +577,19 @@ Invariants:
 - `SnapIdMonotonic` — ids assigned strictly increasing via
   `next_snap_id`; never recycled. Allocated ids have
   `created_txg > 0`; unallocated ids stay zero-initialized.
+- `ExtentTxgBoundedBySync` (P7-8) — every snap's captured
+  `snap_extent_txg ≤ sync_gen`. Captured monotonically; sync_gen
+  never decreases. A buggy impl that stamps a future-dated
+  extent_txg violates this.
+- `ChainExtentTxgOrdered` (P7-8) — along the `snap_prev` chain
+  (skip ABSENT), `snap_extent_txg` is non-decreasing — older has
+  ≤ newer. Equality is reachable: two SnapshotCreates with no
+  intervening Write share the same captured `sync_gen`.
 
 CONSTANTS:
 
 - `MaxSnaps ≥ 1` — snap-chain population cap (ids 1..MaxSnaps).
-- `MaxTxg ≥ 1` — bounds `current_txg`. Each Write and
-  SnapshotCreate bumps it.
+- `MaxTxg ≥ 1` — bounds both `current_txg` and `sync_gen`.
 - `TreeRoots` — finite set of abstract tree-root values. Live
   dataset's tree_root cycles through the set on Write (modeling
   COW emitting a new root).
@@ -579,16 +598,18 @@ CONSTANTS:
     `snap_held[s]` is TRUE.
   - `BuggyChainOutOfOrder` — SnapshotCreate uses an arbitrary
     `created_txg` instead of `current_txg + 1`.
+  - `BuggyExtentTxgUnbounded` (P7-8) — SnapshotCreate stamps an
+    arbitrary `snap_extent_txg` instead of capturing `sync_gen`.
 
 Actions:
 
-- `Write` — bump `current_txg`, switch `live_tree_root` to a
-  different value (COW emits a new root). Existing snapshots'
-  `snap_tree_root` unchanged — structural test of tree-root
-  immutability.
-- `SnapshotCreate` — atomically: allocate `next_snap_id`,
-  capture `(live_tree_root, current_txg + 1, most_recent_snap)`,
+- `Write` — bump `sync_gen` (NOT `current_txg`), switch
+  `live_tree_root` to a different value (COW emits a new root).
+  Models a sync_commit landing extents at gen=sync_gen+1.
+- `SnapshotCreate` — atomically: allocate `next_snap_id`, capture
+  `(live_tree_root, current_txg + 1, sync_gen, most_recent_snap)`,
   bump `most_recent_snap` and `current_txg`. ARCH §8.5.3 O(1).
+  P7-8: `sync_gen` is captured but NOT bumped at create.
 - `SnapshotDelete(s)` — mark s ABSENT. Refused (fixed policy)
   if `snap_held[s]`. Block-level dead-list mechanics deferred.
 - `SnapshotHold(s) / SnapshotRelease(s)` — toggle hold flag.
@@ -596,8 +617,9 @@ Actions:
 
 Fixed config (`snapshot.cfg`, `MaxSnaps=3, MaxTxg=5,
 TreeRoots={"r0","r1"}`): exercises Create + Write + Delete +
-Hold + Release combinations + chain ordering. 636 distinct
-states at depth 9. All seven invariants hold.
+Hold + Release combinations + chain ordering + extent_txg
+capture. 3975 distinct states at depth 12 (post-P7-8 separate
+`sync_gen` widens the state space). All nine invariants hold.
 
 Buggy configs:
 
@@ -610,6 +632,10 @@ Buggy configs:
   second snap's `created_txg` ≤ the first's, the chain's
   strictly-decreasing-along-prev property breaks.
   `ChainTxgOrdered` violated.
+- `snapshot_extent_txg_unbounded_buggy.cfg` (`BuggyExtentTxgUnbounded=TRUE`,
+  P7-8): Create chooses arbitrary `snap_extent_txg` ∈ 0..MaxTxg.
+  Reachable at state 2: snap_extent_txg = 1, sync_gen = 0.
+  `ExtentTxgBoundedBySync` violated immediately.
 
 Spec-to-code (forward reference): the C implementation of the
 snapshot index tree is **not yet in this commit**. Lands in a

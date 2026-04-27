@@ -966,8 +966,10 @@ STM_TEST(sync_dataset_state_survives_mount) {
 
     /* Snapshots on alpha + gamma. */
     uint64_t snap1 = 0, snap2 = 0;
-    STM_ASSERT_OK(stm_snapshot_create(si, a_id, "snap_a", 0xfed1, &snap1));
-    STM_ASSERT_OK(stm_snapshot_create(si, c_id, "snap_c", 0xfed2, &snap2));
+    STM_ASSERT_OK(stm_snapshot_create(si, a_id, "snap_a", 0xfed1,
+                                         stm_sync_current_gen(s), &snap1));
+    STM_ASSERT_OK(stm_snapshot_create(si, c_id, "snap_c", 0xfed2,
+                                         stm_sync_current_gen(s), &snap2));
     STM_ASSERT_OK(stm_snapshot_hold(si, snap1));   /* persisted hold */
 
     STM_ASSERT_OK(stm_sync_commit(s));
@@ -1085,7 +1087,8 @@ STM_TEST(sync_snap_delete_refused_with_clone) {
     /* Create a snap, then a clone of it. */
     uint64_t snap_id = 0;
     STM_ASSERT_OK(stm_snapshot_create(si, /*ds*/ STM_DATASET_ROOT_ID,
-                                        "the_snap", 0xface01, &snap_id));
+                                        "the_snap", 0xface01,
+                                        stm_sync_current_gen(s), &snap_id));
     uint64_t clone_id = 0;
     STM_ASSERT_OK(stm_dataset_create_clone(di, STM_DATASET_ROOT_ID,
                                               "the_clone", snap_id, &clone_id));
@@ -1115,7 +1118,8 @@ STM_TEST(sync_snap_delete_after_clone_destroy) {
 
     uint64_t snap_id = 0;
     STM_ASSERT_OK(stm_snapshot_create(si, STM_DATASET_ROOT_ID,
-                                        "snap", 0xff, &snap_id));
+                                        "snap", 0xff,
+                                        stm_sync_current_gen(s), &snap_id));
     uint64_t c1 = 0, c2 = 0;
     STM_ASSERT_OK(stm_dataset_create_clone(di, STM_DATASET_ROOT_ID,
                                               "c1", snap_id, &c1));
@@ -1146,7 +1150,8 @@ STM_TEST(sync_clone_state_survives_mount) {
 
     uint64_t snap = 0, clone = 0;
     STM_ASSERT_OK(stm_snapshot_create(si, STM_DATASET_ROOT_ID,
-                                        "snap_main", 0xa1, &snap));
+                                        "snap_main", 0xa1,
+                                        stm_sync_current_gen(s), &snap));
     STM_ASSERT_OK(stm_dataset_create_clone(di, STM_DATASET_ROOT_ID,
                                               "clone_x", snap, &clone));
     STM_ASSERT_OK(stm_sync_commit(s));

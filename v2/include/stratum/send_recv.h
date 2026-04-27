@@ -77,18 +77,29 @@
  *   - Plaintext on the wire (caller wraps for transport).
  *   - In-process tests pipe send → recv directly.
  *
- * MVP gap — incremental send: the snap-bounded form
- * (from_snap_id != 0) is wired through the API but currently
- * filters extents by `snapshot.created_txg`, which lives in the
- * snapshot index's counter space — distinct from `sync.current_gen`
- * which stamps `extent.gen`. The two counters do not align at MVP,
- * so the gen filter does not reliably partition pre-snap from
- * post-snap extents. A future chunk will add `extent_txg` to the
- * snapshot record (anticipated format break v13 → v14) capturing
- * `sync.current_gen` at snap-create time; the incremental send
- * filter then becomes meaningful. Until then, callers using
- * non-zero from_snap_id should treat the result as a best-effort
- * lower bound and post-process at the application layer.
+ * Incremental send (P7-8): the snap-bounded form
+ * (from_snap_id != 0) filters extents by
+ * `snapshot.extent_txg`, the value of `sync.current_gen` captured at
+ * SnapshotCreate. Since `extent.gen` is also stamped from
+ * `sync.current_gen` at write time, the filter
+ * `from.extent_txg < extent.gen <= to.extent_txg` is authoritative —
+ * it sits in the same counter space as the values it filters.
+ * The earlier `created_txg`-based filter was best-effort (different
+ * counter space); P7-8 closed that gap (format break v13 → v14;
+ * `snapshot.tla::ExtentTxgBoundedBySync`).
+ *
+ * Operational requirement: for the filter to be EXACT (no extents at
+ * gen == snap.extent_txg falling on the wrong side of the boundary),
+ * the caller MUST `stm_sync_commit` immediately after every
+ * `stm_snapshot_create` so that subsequent extent writes happen at
+ * `sync.current_gen` strictly greater than the snap's captured
+ * `extent_txg`. Without this, multiple writes can share a sync_gen
+ * with a snap-create — the filter then conservatively classifies
+ * such ambiguous extents as pre-snap. ZFS's TXG model handles this
+ * via implicit commit-on-snap; we track it as a documented protocol
+ * obligation rather than an internal commit (avoids surprise I/O
+ * inside `stm_snapshot_create`). Tests in `test_send_recv.c` exhibit
+ * the bracketed pattern: `commit → snap_create → commit`.
  *
  * MVP caveat — stale-paddr during long sends (R39 P3-1): send_init
  * snapshots `paddrs[0..n_replicas-1]` at the time of the call. If

@@ -21,6 +21,21 @@
 (*       The chain is temporally ordered — snap S's created_txg <         *)
 (*       snap_prev[S]'s created_txg's successor's created_txg ... etc.    *)
 (*                                                                           *)
+(*     - Extent-txg captured at create: every snapshot stamps              *)
+(*       `snap_extent_txg[s] = sync_gen` at SnapshotCreate. `sync_gen`    *)
+(*       models the SEPARATE counter that the impl's `sync.current_gen` *)
+(*       inhabits — bumped on Write (extent commits) but NOT on             *)
+(*       SnapshotCreate. The pre-P7-8 impl used `created_txg` (the         *)
+(*       snap-index counter) as the send-filter bound, but that counter   *)
+(*       does not bound `extent.gen` because the two counter spaces        *)
+(*       advance independently. `extent_txg` captures the sync gen so      *)
+(*       send/recv's incremental filter is authoritative. Invariants:      *)
+(*         * ExtentTxgBoundedBySync: snap_extent_txg[s] <= sync_gen        *)
+(*           — captured monotonically at create; sync_gen never decreases. *)
+(*         * ChainExtentTxgOrdered: along snap_prev chain (filtering       *)
+(*           ABSENT links), snap_extent_txg is non-decreasing — older      *)
+(*           snaps have <= extent_txg than newer snaps.                    *)
+(*                                                                           *)
 (*     - Tree_root immutability: a snapshot's tree_root captured at       *)
 (*       create time NEVER changes during the snapshot's lifetime.       *)
 (*       Modifications to the live dataset diverge via COW; the           *)
@@ -73,6 +88,13 @@
 (*   - BuggyChainOutOfOrder — SnapshotCreate uses an arbitrary value       *)
 (*     for `created_txg` instead of `current_txg + 1`. Should violate     *)
 (*     `ChainTxgOrdered`.                                                   *)
+(*                                                                           *)
+(*   - BuggyExtentTxgUnbounded — SnapshotCreate stamps an arbitrary        *)
+(*     value for `snap_extent_txg[s]` instead of capturing `sync_gen`.    *)
+(*     Should violate `ExtentTxgBoundedBySync` (e.g., a future-dated       *)
+(*     extent_txg) or `ChainExtentTxgOrdered` (capturing a value lower    *)
+(*     than the prior snap's). Models the impl bug we're closing in       *)
+(*     P7-8: filtering by a counter that doesn't bound extent.gen.        *)
 (***************************************************************************)
 
 EXTENDS Naturals, FiniteSets
@@ -82,13 +104,15 @@ CONSTANTS
     MaxTxg,
     TreeRoots,
     BuggyDeleteWithHold,
-    BuggyChainOutOfOrder
+    BuggyChainOutOfOrder,
+    BuggyExtentTxgUnbounded
 
 ASSUME MaxSnaps \in (Nat \ {0})
 ASSUME MaxTxg \in (Nat \ {0})
 ASSUME TreeRoots # {}
 ASSUME BuggyDeleteWithHold \in BOOLEAN
 ASSUME BuggyChainOutOfOrder \in BOOLEAN
+ASSUME BuggyExtentTxgUnbounded \in BOOLEAN
 
 SnapIds == 1..MaxSnaps
 NoSnap  == 0
@@ -98,14 +122,17 @@ VARIABLES
     snap_state,         \* SnapIds → "ABSENT" | "PRESENT".
     snap_tree_root,     \* SnapIds → TreeRoots. Frozen at Create.
     snap_created_txg,   \* SnapIds → 0 .. MaxTxg.
+    snap_extent_txg,    \* SnapIds → 0 .. MaxTxg. Sync_gen captured at Create.
     snap_prev,          \* SnapIds → 0 .. MaxSnaps (0 = no previous).
     snap_held,          \* SnapIds → BOOLEAN.
     next_snap_id,       \* 1 .. MaxSnaps + 1.
-    current_txg,        \* 0 .. MaxTxg.
+    current_txg,        \* 0 .. MaxTxg. Snap-index counter; bumps on Create only.
+    sync_gen,           \* 0 .. MaxTxg. Models sync.current_gen; bumps on Write.
     most_recent_snap    \* 0 .. MaxSnaps (0 = no snaps yet).
 
 vars == <<live_tree_root, snap_state, snap_tree_root, snap_created_txg,
-          snap_prev, snap_held, next_snap_id, current_txg, most_recent_snap>>
+          snap_extent_txg, snap_prev, snap_held, next_snap_id,
+          current_txg, sync_gen, most_recent_snap>>
 
 (***************************************************************************)
 (* Pick an arbitrary deterministic initial root from the TreeRoots set.    *)
@@ -118,10 +145,12 @@ Init ==
     /\ snap_state        = [s \in SnapIds |-> "ABSENT"]
     /\ snap_tree_root    = [s \in SnapIds |-> InitialRoot]
     /\ snap_created_txg  = [s \in SnapIds |-> 0]
+    /\ snap_extent_txg   = [s \in SnapIds |-> 0]
     /\ snap_prev         = [s \in SnapIds |-> NoSnap]
     /\ snap_held         = [s \in SnapIds |-> FALSE]
     /\ next_snap_id      = 1
     /\ current_txg       = 0
+    /\ sync_gen          = 0
     /\ most_recent_snap  = NoSnap
 
 (***************************************************************************)
@@ -132,19 +161,27 @@ Present(s) == s \in SnapIds /\ snap_state[s] = "PRESENT"
 (***************************************************************************)
 (* Action: Write — modify the live dataset.                                  *)
 (*                                                                           *)
-(* Modeled as: bump current_txg, switch live_tree_root to a different      *)
-(* element of TreeRoots (COW emits a new root). Existing snapshots' frozen*)
-(* tree_roots are unaffected; this is the structural test of               *)
-(* TreeRootImmutable.                                                        *)
+(* Models a sync_commit that lands extents at gen=sync_gen+1. Bumps        *)
+(* sync_gen (matches the impl: every commit advances sync.current_gen),    *)
+(* leaves current_txg unchanged (snap-index counter only advances on        *)
+(* SnapshotCreate). This separation is the modeling improvement P7-8       *)
+(* introduces: pre-P7-8 the spec collapsed both counters into current_txg, *)
+(* hiding the impl bug that send filtered by `created_txg` instead of      *)
+(* an extent-gen-bound field.                                                *)
+(*                                                                           *)
+(* Switches live_tree_root to a different element of TreeRoots (COW emits  *)
+(* a new root). Existing snapshots' frozen tree_roots are unaffected; this *)
+(* is the structural test of TreeRootImmutable.                              *)
 (***************************************************************************)
 Write ==
-    /\ current_txg < MaxTxg
+    /\ sync_gen < MaxTxg
     /\ \E new_root \in TreeRoots:
         /\ new_root # live_tree_root
         /\ live_tree_root' = new_root
-    /\ current_txg' = current_txg + 1
-    /\ UNCHANGED <<snap_state, snap_tree_root, snap_created_txg, snap_prev,
-                   snap_held, next_snap_id, most_recent_snap>>
+    /\ sync_gen' = sync_gen + 1
+    /\ UNCHANGED <<snap_state, snap_tree_root, snap_created_txg,
+                   snap_extent_txg, snap_prev, snap_held, next_snap_id,
+                   current_txg, most_recent_snap>>
 
 (***************************************************************************)
 (* Action: SnapshotCreate — atomically capture live's tree_root.            *)
@@ -170,12 +207,16 @@ SnapshotCreate ==
         /\ \/ ~BuggyChainOutOfOrder /\ txg = current_txg + 1
            \/ BuggyChainOutOfOrder
         /\ snap_created_txg' = [snap_created_txg EXCEPT ![next_snap_id] = txg]
+    /\ \E etxg \in 0..MaxTxg:
+        /\ \/ ~BuggyExtentTxgUnbounded /\ etxg = sync_gen
+           \/ BuggyExtentTxgUnbounded
+        /\ snap_extent_txg' = [snap_extent_txg EXCEPT ![next_snap_id] = etxg]
     /\ snap_prev'       = [snap_prev EXCEPT ![next_snap_id] = most_recent_snap]
     /\ snap_held'       = [snap_held EXCEPT ![next_snap_id] = FALSE]
     /\ next_snap_id'    = next_snap_id + 1
     /\ current_txg'     = current_txg + 1
     /\ most_recent_snap' = next_snap_id
-    /\ UNCHANGED live_tree_root
+    /\ UNCHANGED <<live_tree_root, sync_gen>>
 
 (***************************************************************************)
 (* Action: SnapshotDelete(s) — mark s ABSENT.                               *)
@@ -201,8 +242,8 @@ SnapshotDelete(s) ==
        \/ ~snap_held[s]
     /\ snap_state' = [snap_state EXCEPT ![s] = "ABSENT"]
     /\ UNCHANGED <<live_tree_root, snap_tree_root, snap_created_txg,
-                   snap_prev, snap_held, next_snap_id, current_txg,
-                   most_recent_snap>>
+                   snap_extent_txg, snap_prev, snap_held, next_snap_id,
+                   current_txg, sync_gen, most_recent_snap>>
 
 (***************************************************************************)
 (* Action: SnapshotHold(s) / SnapshotRelease(s) — toggle hold flag.         *)
@@ -213,8 +254,8 @@ SnapshotHold(s) ==
     /\ ~snap_held[s]
     /\ snap_held' = [snap_held EXCEPT ![s] = TRUE]
     /\ UNCHANGED <<live_tree_root, snap_state, snap_tree_root,
-                   snap_created_txg, snap_prev, next_snap_id, current_txg,
-                   most_recent_snap>>
+                   snap_created_txg, snap_extent_txg, snap_prev,
+                   next_snap_id, current_txg, sync_gen, most_recent_snap>>
 
 SnapshotRelease(s) ==
     /\ s \in SnapIds
@@ -222,8 +263,8 @@ SnapshotRelease(s) ==
     /\ snap_held[s]
     /\ snap_held' = [snap_held EXCEPT ![s] = FALSE]
     /\ UNCHANGED <<live_tree_root, snap_state, snap_tree_root,
-                   snap_created_txg, snap_prev, next_snap_id, current_txg,
-                   most_recent_snap>>
+                   snap_created_txg, snap_extent_txg, snap_prev,
+                   next_snap_id, current_txg, sync_gen, most_recent_snap>>
 
 (***************************************************************************)
 (* Top-level Next.                                                           *)
@@ -246,10 +287,12 @@ TypeOK ==
     /\ snap_state \in [SnapIds -> {"ABSENT", "PRESENT"}]
     /\ snap_tree_root \in [SnapIds -> TreeRoots]
     /\ snap_created_txg \in [SnapIds -> 0..MaxTxg]
+    /\ snap_extent_txg \in [SnapIds -> 0..MaxTxg]
     /\ snap_prev \in [SnapIds -> 0..MaxSnaps]
     /\ snap_held \in [SnapIds -> BOOLEAN]
     /\ next_snap_id \in 1..(MaxSnaps + 1)
     /\ current_txg \in 0..MaxTxg
+    /\ sync_gen \in 0..MaxTxg
     /\ most_recent_snap \in 0..MaxSnaps
 
 (* Every snapshot's created_txg is at most the current commit gen. The     *)
@@ -348,7 +391,35 @@ SnapIdMonotonic ==
         THEN snap_created_txg[s] > 0
         ELSE /\ snap_state[s] = "ABSENT"
              /\ snap_created_txg[s] = 0
+             /\ snap_extent_txg[s] = 0
              /\ snap_prev[s] = NoSnap
              /\ snap_held[s] = FALSE
+
+(* P7-8: extent-txg captured at Create is bounded by current sync_gen.    *)
+(* Captured monotonically; sync_gen never decreases. Refutes a buggy      *)
+(* impl that stamps an arbitrary (or future-dated) extent_txg.             *)
+ExtentTxgBoundedBySync ==
+    \A s \in SnapIds:
+        snap_extent_txg[s] <= sync_gen
+
+(* P7-8: along the snap_prev chain (skip ABSENT links), extent_txg is    *)
+(* non-decreasing — older snaps have ≤ extent_txg than newer snaps. The  *)
+(* equality case is reachable: two SnapshotCreates with no intervening   *)
+(* Write share the same captured sync_gen. We use ≤ rather than < so the *)
+(* invariant tolerates create-after-create with no Write. Refutes a      *)
+(* buggy impl that captures an out-of-order extent_txg (e.g., a stale    *)
+(* sync_gen value).                                                       *)
+RECURSIVE ChainExtentTxgWellOrderedFromN(_, _)
+ChainExtentTxgWellOrderedFromN(s, fuel) ==
+    IF fuel <= 0 \/ s = NoSnap THEN TRUE
+    ELSE LET p == snap_prev[s] IN
+        IF p = NoSnap THEN TRUE
+        ELSE /\ \/ ~Present(p)
+                \/ snap_extent_txg[p] <= snap_extent_txg[s]
+             /\ ChainExtentTxgWellOrderedFromN(p, fuel - 1)
+
+ChainExtentTxgOrdered ==
+    \A s \in SnapIds:
+        Present(s) => ChainExtentTxgWellOrderedFromN(s, MaxSnaps + 1)
 
 ================================================================================

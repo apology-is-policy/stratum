@@ -185,8 +185,19 @@ extern "C" {
  * from a verified source. v12 pools' 32-byte values would be
  * length-rejected by the v13 decoder (size mismatch) — refuses
  * v12 mounts at v13 via the existing STM_EBADVERSION handler. No
- * feature-flag bump (full version bump per ARCH §5.9). */
-#define STM_UB_VERSION        13u
+ * feature-flag bump (full version bump per ARCH §5.9).
+ *
+ * P7-8 (v14, this commit): the per-snapshot value layout grew 8
+ * bytes — a new `extent_txg` field captures `sync.current_gen` at
+ * SnapshotCreate so send/recv's incremental gen filter can
+ * authoritatively bound `extent.gen`. Pre-P7-8 the snap-bounded
+ * filter used `created_txg` (snap-index counter), which lives in
+ * a different counter space than `extent.gen` (sync gen) — the
+ * filter was best-effort only. v13 pools' 48-byte fixed-prefix
+ * snapshot values would be length-rejected by the v14 decoder
+ * (52-byte fixed prefix); refused via STM_EBADVERSION at mount.
+ * Format break, no feature flag. */
+#define STM_UB_VERSION        14u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */

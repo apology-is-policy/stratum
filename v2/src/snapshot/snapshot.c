@@ -236,6 +236,7 @@ stm_status stm_snapshot_create(stm_snapshot_index *idx,
                                  uint64_t dataset_id,
                                  const char *name,
                                  uint64_t tree_root_paddr,
+                                 uint64_t extent_txg,
                                  uint64_t *out_id) {
     if (!idx || !name || !out_id) return STM_EINVAL;
     if (dataset_id == 0) return STM_EINVAL;
@@ -282,6 +283,7 @@ stm_status stm_snapshot_create(stm_snapshot_index *idx,
     s->e.name[name_len]  = '\0';
     s->e.tree_root_paddr = tree_root_paddr;
     s->e.created_txg     = idx->current_txg;
+    s->e.extent_txg      = extent_txg;
     s->e.prev_snap_id    = prev_snap;
     s->e.hold_count      = 0;
     s->e.flags           = 0;
@@ -562,7 +564,10 @@ stm_status stm_snapshot_iter(const stm_snapshot_index *idx,
  * ========================================================================= */
 
 #define SP_KEY_LEN              8u
-#define SP_VAL_FIXED            44u                          /* before name[] */
+/* P7-8 v14: SP_VAL_FIXED grew 44 → 52 to accommodate the new 8-byte
+ * extent_txg field inserted between created_txg (off 16) and
+ * prev_snap_id (off 32). Refuses v13 mounts via length check at decode. */
+#define SP_VAL_FIXED            52u                          /* before name[] */
 #define SP_DEAD_TAIL_FIXED      4u                            /* le32 dead_count */
 #define SP_DEAD_PADDR_BYTES     8u                            /* le64 paddr */
 #define SP_VAL_MAX              (SP_VAL_FIXED + STM_SNAP_NAME_MAX \
@@ -590,6 +595,7 @@ static size_t sp_encode_value(const snapshot_slot *s,
     le64 ds   = stm_store_le64(s->e.dataset_id);
     le64 trp  = stm_store_le64(s->e.tree_root_paddr);
     le64 ctxg = stm_store_le64(s->e.created_txg);
+    le64 etxg = stm_store_le64(s->e.extent_txg);
     le64 prev = stm_store_le64(s->e.prev_snap_id);
     le32 hc   = stm_store_le32(s->e.hold_count);
     le32 fl   = stm_store_le32(s->e.flags);
@@ -598,12 +604,13 @@ static size_t sp_encode_value(const snapshot_slot *s,
     memcpy(out + 0,  ds.v,   8);
     memcpy(out + 8,  trp.v,  8);
     memcpy(out + 16, ctxg.v, 8);
-    memcpy(out + 24, prev.v, 8);
-    memcpy(out + 32, hc.v,   4);
-    memcpy(out + 36, fl.v,   4);
-    memcpy(out + 40, nl.v,   2);
-    /* out[42..44) is pad; zero. */
-    out[42] = 0; out[43] = 0;
+    memcpy(out + 24, etxg.v, 8);
+    memcpy(out + 32, prev.v, 8);
+    memcpy(out + 40, hc.v,   4);
+    memcpy(out + 44, fl.v,   4);
+    memcpy(out + 48, nl.v,   2);
+    /* out[50..52) is pad; zero. */
+    out[50] = 0; out[51] = 0;
     if (s->e.name_len > 0) {
         memcpy(out + SP_VAL_FIXED, s->e.name, s->e.name_len);
     }
@@ -625,16 +632,17 @@ static stm_status sp_decode_value(uint64_t id, const uint8_t *in,
                                      size_t in_len, snapshot_slot *out_slot) {
     if (in_len < SP_VAL_FIXED) return STM_ECORRUPT;
 
-    le64 ds, trp, ctxg, prev;
+    le64 ds, trp, ctxg, etxg, prev;
     le32 hc, fl;
     le16 nl;
     memcpy(ds.v,   in + 0,  8);
     memcpy(trp.v,  in + 8,  8);
     memcpy(ctxg.v, in + 16, 8);
-    memcpy(prev.v, in + 24, 8);
-    memcpy(hc.v,   in + 32, 4);
-    memcpy(fl.v,   in + 36, 4);
-    memcpy(nl.v,   in + 40, 2);
+    memcpy(etxg.v, in + 24, 8);
+    memcpy(prev.v, in + 32, 8);
+    memcpy(hc.v,   in + 40, 4);
+    memcpy(fl.v,   in + 44, 4);
+    memcpy(nl.v,   in + 48, 2);
 
     uint16_t name_len = stm_load_le16(nl);
     if (name_len > STM_SNAP_NAME_MAX) return STM_ECORRUPT;
@@ -656,6 +664,7 @@ static stm_status sp_decode_value(uint64_t id, const uint8_t *in,
     out_slot->e.dataset_id         = stm_load_le64(ds);
     out_slot->e.tree_root_paddr    = stm_load_le64(trp);
     out_slot->e.created_txg        = stm_load_le64(ctxg);
+    out_slot->e.extent_txg         = stm_load_le64(etxg);
     out_slot->e.prev_snap_id       = stm_load_le64(prev);
     out_slot->e.hold_count         = stm_load_le32(hc);
     out_slot->e.flags              = stm_load_le32(fl);
@@ -1037,6 +1046,14 @@ static stm_status sp_validate_shadow(const sp_load_ctx *lc) {
                 if (sj->e.snapshot_id != si->e.prev_snap_id) continue;
                 if (!sj->present) return STM_ECORRUPT;  /* shouldn't happen */
                 if (sj->e.dataset_id != si->e.dataset_id) return STM_ECORRUPT;
+                /* P7-8: snapshot.tla::ChainExtentTxgOrdered. Along the
+                 * snap_prev chain, extent_txg is non-decreasing. A
+                 * decoded chain whose newer snap captured a SMALLER
+                 * extent_txg than its predecessor was either tampered
+                 * with or written by a buggy producer; refuse the load
+                 * rather than serve a chain that silently breaks the
+                 * incremental-send filter's monotonicity assumption. */
+                if (si->e.extent_txg < sj->e.extent_txg) return STM_ECORRUPT;
                 found = true;
                 break;
             }
