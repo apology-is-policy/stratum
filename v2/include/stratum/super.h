@@ -204,11 +204,17 @@ extern "C" {
  * naming which DEK in the dataset's keyschema was used to encrypt
  * the extent. stm_sync_write_extent / _read_extent now resolve the
  * DEK via (dataset_id, key_id) instead of using the per-pool
- * metadata_key. v14 pools' 64-byte extent values would decode under
- * v15 with key_id=0 (legacy xxh field is zero), but we don't shim
- * the meaning: v15 demands the dataset's keyschema have an entry at
- * key_id=0 for every dataset that owns extents, which v14 pools do
- * NOT — STM_EBADVERSION at mount.
+ * metadata_key. Untampered v14 pools fail at the uberblock version
+ * check (`uberblock.c` `version != STM_UB_VERSION` → STM_EBADVERSION)
+ * before the extent value layer is reached. Tamper-then-mount
+ * scenario (an attacker flips ub_version 14→15 and recomputes
+ * ub_csum + the Merkle chain): mount completes, but v14 keyschemas
+ * do not have per-dataset DEKs at all (only the pool metadata key
+ * (0,0) and any rotated entries from `stm_sync_add_dataset_key`
+ * callers; root dataset (1,0) is auto-installed only by v15's
+ * sync_create), so writes/reads to ds≥1 fail STM_ECORRUPT/STM_ENOENT
+ * at runtime — same DoS posture as a (1,0) wrapped-blob tamper
+ * (see R42 P1-1 mount-time hard-fail).
  * Format break, no feature flag. */
 #define STM_UB_VERSION        15u
 

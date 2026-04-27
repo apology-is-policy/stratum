@@ -418,29 +418,36 @@ static int sync_unwrap_cb(uint64_t dataset_id, uint64_t key_id,
 
     if (rc != STM_OK) {
         stm_ct_memzero(dek, sizeof dek);
-        /* R12 P1-3: a tampered RETIRED entry — or any unwrap failure
-         * at a non-pool dataset — would historically abort mount with
-         * the callback's error code. That made a one-shot attacker
-         * with raw-device access + Merkle-recompute able to deny
-         * every future mount by flipping a byte in any retired
-         * wrapped blob (and recomputing the schema node's bp_csum +
-         * ub_merkle_root). The pool metadata key — (0, 0) CURRENT —
-         * is the only key required for mount to proceed; retired
-         * per-dataset keys are only needed for reads of OLD data
-         * encrypted under them, and those failures should surface at
-         * read time (Phase 6 extent layer), not at mount time. */
-        if (dataset_id == STM_SYNC_POOL_DATASET_ID &&
-             key_id     == STM_SYNC_POOL_KEY_ID    &&
-             state      == STM_KS_STATE_CURRENT) {
+        /* R12 P1-3 + R42 P1-1: hard-fail mount on ANY CURRENT
+         * unwrap failure; soft-skip RETIRED / PRUNING.
+         *
+         * Pre-P7-10, the per-pool `metadata_key` was the only DEK
+         * needed for fs operation, so only `(0, 0, CURRENT)` had to
+         * unwrap successfully at mount; per-dataset CURRENTs were
+         * soft-skipped to defend against retired-tamper DoS at
+         * mount (an attacker with raw-device write + BLAKE3-recompute
+         * could otherwise brick every future mount by tampering one
+         * byte of any retired wrapped blob).
+         *
+         * P7-10 makes per-dataset CURRENT keys load-bearing for
+         * every fs_write / fs_read. A soft-skip on a tampered
+         * CURRENT would leave the DEK map missing an entry that
+         * `sync_resolve_current_dek_locked` and `sync_dek_find`
+         * subsequently return STM_ENOENT / STM_ECORRUPT for —
+         * silent runtime DoS without any mount-time signal. The
+         * R42 fix: reject mount on any CURRENT unwrap failure so
+         * the operator sees the corruption immediately. RETIRED
+         * keys retain the original soft-skip (only consequential
+         * for reads of pre-rotation data; the DoS surface is
+         * narrower because reads are degradable). */
+        if (state == STM_KS_STATE_CURRENT) {
             return (int)rc;
         }
-        return 0;    /* soft-skip */
+        return 0;    /* RETIRED / PRUNING — soft-skip */
     }
     if (dek_len != 32) {
         stm_ct_memzero(dek, sizeof dek);
-        if (dataset_id == STM_SYNC_POOL_DATASET_ID &&
-             key_id     == STM_SYNC_POOL_KEY_ID    &&
-             state      == STM_KS_STATE_CURRENT) {
+        if (state == STM_KS_STATE_CURRENT) {
             return (int)STM_EBACKEND;
         }
         return 0;
@@ -3321,6 +3328,16 @@ stm_status stm_sync_add_dataset_key(stm_sync *s,
     if (dataset_id > STM_SYNC_DATASET_ID_MAX) return STM_ERANGE;
 
     pthread_mutex_lock(&s->lock);
+    /* R42 P2-2: same wedged/RO posture as sweep — adding a new DEK
+     * to the in-RAM map on a RO handle would diverge from disk for
+     * the handle's lifetime, with no commit to flush. The
+     * STM_SYNC_ROOT_DATASET_ID auto-install at sync_create runs
+     * BEFORE the handle is exposed to callers (no concurrent flag
+     * mutation possible), so the post-create call's wedged/RO
+     * checks reduce to "the freshly-created handle is neither" —
+     * always-false in practice. */
+    if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
+    if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
 
     /* Refuse if the dataset already has any entry (CURRENT or retired):
      * add is strictly "new dataset". Use rotate for an existing one. */
@@ -3393,6 +3410,9 @@ stm_status stm_sync_rotate_dataset_key(stm_sync *s,
     if (dataset_id > STM_SYNC_DATASET_ID_MAX) return STM_ERANGE;
 
     pthread_mutex_lock(&s->lock);
+    /* R42 P2-2: wedged/RO refuse — symmetric with add + sweep. */
+    if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
+    if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
 
     uint64_t next_id = 0;
     stm_status rc = stm_keyschema_next_key_id(s->keyschema, dataset_id, &next_id);
@@ -3516,6 +3536,14 @@ stm_status stm_sync_keyschema_sweep(stm_sync *s,
     *out_pruned_count = 0;
 
     pthread_mutex_lock(&s->lock);
+    /* R42 P2-2: refuse mutation of in-RAM keyschema state on
+     * wedged / read-only handles. Sweep removes DEK map slots
+     * (sync_dek_remove); on a RO handle the divergence persists
+     * for the handle's lifetime, breaking decryption of any
+     * extent whose key_id was just pruned. Symmetric to the
+     * write_extent / rotate / add wedge guards. */
+    if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
+    if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
 
     sweep_collect col = { .dataset_id_filter = dataset_id };
     stm_status rc = stm_keyschema_iter(s->keyschema, sweep_collect_cb, &col);
@@ -3666,9 +3694,15 @@ static stm_status sync_drop_paddr_locked(stm_sync *s, uint64_t ds, uint64_t padd
  * Returns STM_ECORRUPT if the keyschema CURRENT exists but the DEK
  * map slot is missing (mount unwrap failed silently for this entry —
  * a corruption signal because sync_unwrap_cb populates every CURRENT
- * /RETIRED entry).
- * Caller MUST already hold s->lock. The 32-byte DEK is copied into
- * out_dek; out_key_id receives the resolved key_id.
+ * /RETIRED entry; R42 P1-1 also makes such failures hard-fail mount,
+ * so this code path should be unreachable post-mount).
+ * Caller MUST already hold s->lock AND have already checked
+ * `s->wedged` / `s->read_only` against the appropriate write- or
+ * read-side policy (R42 P3-4 — the helper itself does NOT guard;
+ * its single current caller stm_sync_write_extent already does).
+ * Future write-side callers MUST add the same guards before
+ * invoking; future read-side callers must guard wedged-but-not-RO
+ * per stm_sync_read_extent's precedent.
  *
  * The DEK pointer returned by sync_dek_find is borrowed for the
  * duration of the lock window; copying into out_dek lets callers
@@ -4209,17 +4243,29 @@ sync_scrub_verify_cb(uint64_t paddr, void *ctx)
      * (which scrub.c also calls under sc.lock). Releases s.lock before
      * any bdev I/O so contention with sync_commit stays minimal.
      *
-     * Missing DEK (sync_dek_find returns NULL) is a corruption signal
-     * — the keyschema sweep enforces that no live extent's key_id is
-     * pruned (P7-10 sweep refcount). UNREPAIRABLE is the right fault
-     * mode (semantically a permanent data-loss attestation). */
+     * R42 P2-1: missing DEK (sync_dek_find returns NULL) classifies
+     * as STM_SCRUB_VERIFY_OK rather than UNREPAIRABLE. There's a
+     * narrow race between this cb's `stm_extent_lookup_by_paddr`
+     * (under extent_idx.lock) and the s.lock acquisition here:
+     * another thread can land an Overwrite + sweep_keyschema
+     * between the two locks, removing the captured rec's `key_id`
+     * from `s->deks[]` legitimately (sweep's refcount enforcement
+     * passes because the live extent index no longer references
+     * the old key). The bytes at `rec.paddrs[0]` are still on
+     * disk — possibly in a snapshot's dead-list — but no longer
+     * relevant to the current live state. UNREPAIRABLE here would
+     * misattribute "transitional state" as "data loss"; OK is
+     * correct. The non-race case (truly tampered key with live
+     * extent ref) is impossible by construction: sweep refuses
+     * prune with refs, and the unwrap_cb's R42 P1-1 hard-fail on
+     * tampered CURRENTs makes mount itself fail. */
     uint8_t dek[32];
     {
         pthread_mutex_lock(&s->lock);
         sync_dek_slot *sl = sync_dek_find(s, rec.dataset_id, rec.key_id);
         if (!sl) {
             pthread_mutex_unlock(&s->lock);
-            return STM_SCRUB_VERIFY_UNREPAIRABLE;
+            return STM_SCRUB_VERIFY_OK;   /* R42 P2-1 race tolerance */
         }
         memcpy(dek, sl->dek, 32);
         pthread_mutex_unlock(&s->lock);

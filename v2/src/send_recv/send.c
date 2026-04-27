@@ -57,6 +57,17 @@ typedef struct {
     uint64_t paddrs[STM_EXTENT_MAX_REPLICAS];
 } send_extent_meta;
 
+/* P7-10 / R42 P2-1: snapshot of (key_id, DEK) pairs the send needs.
+ * Captured at send_init (under sync->lock) so a concurrent rotate +
+ * overwrite + keyschema_sweep between init and the per-extent emit
+ * can't poison the send by pruning a key still referenced by the
+ * snapshotted extent set. The wipe on send_close zeros the DEKs
+ * before free. */
+typedef struct {
+    uint64_t key_id;
+    uint8_t  dek[32];
+} send_dek_slot;
+
 struct stm_send_handle {
     stm_sync          *sync;          /* borrowed; must outlive handle */
     uint64_t           dataset_id;
@@ -69,6 +80,10 @@ struct stm_send_handle {
     send_extent_meta  *extents;       /* sorted by (ino, off) */
     size_t             n_extents;
     size_t             cap_extents;
+
+    send_dek_slot     *deks;          /* snapshot per unique key_id */
+    size_t             n_deks;
+    size_t             cap_deks;
 
     /* Stream emission cursor:
      *   0          → emit HEADER on first stm_send_next
@@ -223,6 +238,69 @@ stm_status stm_send_init(stm_sync *sync,
         return is != STM_OK ? is : cc.err;
     }
 
+    /* P7-10 / R42 P2-1: snapshot DEKs for every unique key_id the
+     * collected extents reference. Without this, a concurrent
+     * `stm_sync_rotate_dataset_key` + `stm_sync_write_extent`
+     * (overwrites in the live extent index, dropping the snapshotted
+     * paddrs into a snap dead-list) + `stm_sync_keyschema_sweep`
+     * (sees zero LIVE refs and prunes the now-RETIRED key) would
+     * leave the send unable to decrypt bytes that ARE still on disk.
+     * The snapshot pins the DEK in the handle's RAM regardless of
+     * subsequent keyschema mutations.
+     *
+     * Capture is bounded: at most `n_extents` unique key_ids; in
+     * practice |unique key_ids| ≤ rotation count for the dataset
+     * over the snap range, typically tiny. */
+    for (size_t i = 0; i < h->n_extents; i++) {
+        uint64_t kid = h->extents[i].key_id;
+        bool already = false;
+        for (size_t j = 0; j < h->n_deks; j++) {
+            if (h->deks[j].key_id == kid) { already = true; break; }
+        }
+        if (already) continue;
+
+        if (h->n_deks == h->cap_deks) {
+            size_t new_cap = h->cap_deks == 0 ? 4 : h->cap_deks * 2;
+            send_dek_slot *grown = malloc(new_cap * sizeof *grown);
+            if (!grown) {
+                if (h->deks) {
+                    stm_ct_memzero(h->deks, h->cap_deks * sizeof *h->deks);
+                    free(h->deks);
+                }
+                free(h->extents);
+                stm_blake3_free(h->hasher);
+                free(h);
+                return STM_ENOMEM;
+            }
+            if (h->deks && h->n_deks > 0)
+                memcpy(grown, h->deks, h->n_deks * sizeof *h->deks);
+            memset(grown + h->n_deks, 0,
+                     (new_cap - h->n_deks) * sizeof *grown);
+            if (h->deks) {
+                stm_ct_memzero(h->deks, h->cap_deks * sizeof *h->deks);
+                free(h->deks);
+            }
+            h->deks = grown;
+            h->cap_deks = new_cap;
+        }
+
+        send_dek_slot *slot = &h->deks[h->n_deks++];
+        slot->key_id = kid;
+        stm_status ks = stm_sync_get_dek(sync, dataset_id, kid, slot->dek);
+        if (ks != STM_OK) {
+            /* No DEK for an extent the iter just collected — must
+             * be a sweep race that resolved against this exact
+             * key_id between iter and lookup. Bail; caller can
+             * retry. Wipe whatever DEKs we did capture. */
+            stm_ct_memzero(h->deks, h->cap_deks * sizeof *h->deks);
+            free(h->deks);
+            free(h->extents);
+            stm_blake3_free(h->hasher);
+            free(h);
+            return (ks == STM_ENOENT) ? STM_EBUSY : ks;
+        }
+    }
+
     *out_handle = h;
     return STM_OK;
 }
@@ -289,19 +367,24 @@ static stm_status read_decrypt_extent_plaintext(stm_send_handle *h,
     ad.offset       = m->off;
     ad.content_kind = 0;
 
-    /* P7-10: resolve the source DEK by the extent's stamped key_id
-     * via stm_sync_get_dek (briefly takes sync->lock). NOT the
-     * pool-wide metadata_key — sender's key isolation must respect
-     * the dataset's key_id state. STM_ENOENT here means the key was
-     * pruned while a live extent referenced it (corruption — sweep
-     * refcount enforcement should have refused).  Surface as
-     * STM_ECORRUPT to fail the send rather than emit garbage. */
-    uint8_t dek[32];
-    stm_status ks = stm_sync_get_dek(h->sync, h->dataset_id, m->key_id, dek);
-    if (ks != STM_OK) {
-        free(cbuf);
-        return (ks == STM_ENOENT) ? STM_ECORRUPT : ks;
+    /* P7-10 / R42 P2-1: resolve the source DEK from the handle's
+     * init-time snapshot. The snapshot is pinned for the handle's
+     * lifetime regardless of subsequent rotate/sweep — a concurrent
+     * sweep can prune the keyschema entry, but the bytes at
+     * m->paddrs[0] (which may be in a snap dead-list rather than
+     * the live extent index) remain decryptable under the captured
+     * DEK. STM_ENOENT here is impossible by construction (every
+     * collected extent's key_id was DEK-captured at init); treat
+     * as a programming-error STM_ECORRUPT to fail loudly if the
+     * invariant ever drifts. */
+    const uint8_t *dek_p = NULL;
+    for (size_t i = 0; i < h->n_deks; i++) {
+        if (h->deks[i].key_id == m->key_id) {
+            dek_p = h->deks[i].dek;
+            break;
+        }
     }
+    if (!dek_p) { free(cbuf); return STM_ECORRUPT; }
 
     /* R39 P2-1: walk every replica until one AEAD-decrypts cleanly,
      * mirroring sync.c's stm_sync_read_extent. AEAD nonce is canonical
@@ -319,20 +402,18 @@ static stm_status read_decrypt_extent_plaintext(stm_send_handle *h,
         if (rs != STM_OK) { last_err = rs; continue; }
 
         size_t pt_out = 0;
-        stm_status ds = stm_extent_decrypt(mode, dek,
+        stm_status ds = stm_extent_decrypt(mode, dek_p,
                                               m->paddrs[0], m->gen,
                                               &ad, cbuf, total,
                                               out_plain, m->len, &pt_out);
         if (ds == STM_OK) {
             free(cbuf);
-            stm_ct_memzero(dek, sizeof dek);
             return STM_OK;
         }
         last_err = ds;
     }
 
     free(cbuf);
-    stm_ct_memzero(dek, sizeof dek);
     return last_err;
 }
 
@@ -444,6 +525,10 @@ void stm_send_close(stm_send_handle *h)
 {
     if (!h) return;
     free(h->extents);
+    if (h->deks) {
+        stm_ct_memzero(h->deks, h->cap_deks * sizeof *h->deks);
+        free(h->deks);
+    }
     if (h->hasher) stm_blake3_free(h->hasher);
     free(h);
 }

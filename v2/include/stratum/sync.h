@@ -876,8 +876,19 @@ typedef struct stm_scrub stm_scrub;
  *   - len > 0, multiple of 4 KiB, ≤ 128 KiB (recordsize default).
  *   - off must be 4 KiB aligned.
  *   - Single-extent per call: caller iterates for spans > recordsize.
- *   - Encryption key sourced from sync->metadata_key (per-pool key).
- *     Per-dataset DEKs deferred to a future chunk.
+ *
+ * P7-10: encryption uses the dataset's CURRENT DEK from the
+ * keyschema. The write path resolves (key_id, DEK) for `dataset_id`
+ * via the in-RAM DEK map (populated at sync_open by the unwrap iter
+ * + sync_create's auto-install of root and pool DEKs); encrypts
+ * under the DEK; stamps key_id on the extent record. Read path
+ * looks up DEK by the extent's stamped key_id, so RETIRED keys
+ * still decrypt their original extents. Pre-P7-10 used the per-
+ * pool `metadata_key` for every dataset's data; the new behaviour
+ * gives proper key isolation + enables key rotation. Datasets
+ * whose CURRENT DEK is missing (caller forgot to call
+ * stm_sync_add_dataset_key on a non-root dataset) get STM_ENOENT
+ * from write_extent.
  *
  * Thread safety: serialized by sync's internal mutex. Composes with
  * sync_commit's idempotent persistence — every commit captures all

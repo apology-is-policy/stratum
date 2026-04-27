@@ -1220,4 +1220,42 @@ STM_TEST(fs_io_unprovisioned_dataset_id_refused) {
     unlink(g_key_path);
 }
 
+STM_TEST(fs_keyschema_mutators_refuse_on_read_only_mount) {
+    /* R42 P2-2: stm_sync_keyschema_sweep / _add_dataset_key /
+     * _rotate_dataset_key all mutate in-RAM state that has no path
+     * to disk on a read-only mount. They must refuse with
+     * STM_EROFS rather than silently diverge. */
+    make_tmp("ks_ro");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    /* Format-time pool already has root DEK auto-installed via
+     * sync_create. Open RO so the guards trip on the mutators. */
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    mopts.read_only = true;
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_hybrid_keys wk;
+    STM_ASSERT_OK(stm_keyfile_load(g_key_path, &wk));
+
+    uint64_t kid = 0;
+    STM_ASSERT_ERR(stm_sync_add_dataset_key(sync, 100, &wk, NULL, &kid),
+                       STM_EROFS);
+
+    uint64_t nid = 0, oid = 0;
+    STM_ASSERT_ERR(stm_sync_rotate_dataset_key(sync, 1, &wk, NULL,
+                                                  &nid, &oid),
+                       STM_EROFS);
+
+    size_t pruned = 0;
+    STM_ASSERT_ERR(stm_sync_keyschema_sweep(sync, 1, &pruned), STM_EROFS);
+
+    stm_hybrid_keys_wipe(&wk);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")

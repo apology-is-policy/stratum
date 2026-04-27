@@ -400,6 +400,19 @@ LiveReplicasDisjoint ==
     \A e1, e2 \in extents :
         e1 = e2 \/ e1.replicas \cap e2.replicas = {}
 
+(* P7-10 / R42 P3-1: nonce-uniqueness across DEKs is independent of      *)
+(* `key_id`. The C-impl's AEAD nonce is `(paddrs[0], gen, pool_uuid)` —  *)
+(* `key_id` does NOT participate. Allocator freshness (this spec's       *)
+(* PaddrFreshness combined with allocator.tla::NoReuseInSameGen) makes   *)
+(* `(paddr_0, gen)` unique end-to-end, so changing the DEK between two   *)
+(* writes never reuses a nonce regardless of which DEK encrypts each.    *)
+(* This is a documentation-shaped invariant: the truth lies in           *)
+(* allocator.tla; extent.tla just records that key_id rotation does not  *)
+(* contribute new nonce-uniqueness obligations. A future spec refactor   *)
+(* that wires key_id into the AEAD AD or nonce would invalidate this     *)
+(* note and require a unified schema-and-extents spec.                   *)
+NonceUniquenessIndependentOfKey == TRUE
+
 Invariants ==
     /\ TypeOK
     /\ NoOverlapWithinIno
