@@ -925,14 +925,26 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
  *   - **P7-11**: holds the sync handle's internal lock across all
  *     three phases (lookup → read+re-encrypt → past-extent drop +
  *     drop-route). This makes truncate atomic w.r.t. concurrent
- *     `stm_sync_commit` / `stm_sync_write_extent` / other truncate
- *     callers — closes the R41 P3-1 (Phase 3 fail after Phase 2
- *     success → partial state) and R41 P3-2 (concurrent commit
- *     between Phase 2 and Phase 3 splits the on-disk view) gaps
- *     present in the P7-9 MVP. The trade-off is a longer lock-hold
- *     duration (decrypt + encrypt + bdev I/O all under s->lock);
- *     for the 128 KiB recordsize default this is acceptable.
- *     Concurrent-write atomicity (POSIX truncate-vs-write at the FS
+ *     `stm_sync_commit` and `stm_sync_write_extent` — closes
+ *     **R41 P3-1 case (a)** (concurrent commit between Phase 2 and
+ *     Phase 3) and **R41 P3-2** (same gap, scrub-flavored). The
+ *     remaining gap is **R41 P3-1 case (b)**: Phase 3's
+ *     `stm_extent_truncate` can still return `STM_ENOMEM` on its
+ *     internal `drop_idx[]` / `paddrs[]` allocation, leaving Phase
+ *     2's prefix-shrink in-RAM and committable. No invariant is
+ *     violated; the partial state is a POSIX-atomicity gap, not a
+ *     corruption hazard. Operator mitigation is to retry the
+ *     truncate (idempotent: second call's Phase 1 finds no crossing
+ *     extent, Phase 3 retries the past-extent drop). Closing case
+ *     (b) requires Phase 3 pre-allocation OR a true Phase-2 rollback
+ *     primitive on the extent_idx; deferred follow-on.
+ *   - Trade-off: longer lock-hold duration (decrypt + encrypt +
+ *     bdev I/O all under s->lock); for the 128 KiB recordsize
+ *     default this is acceptable. Cascade: scrub's verify cb takes
+ *     s->lock briefly to look up the per-extent DEK, so concurrent
+ *     truncate extends scrub-step latency by the same window (no
+ *     deadlock — lock-graph stays acyclic).
+ *   - Concurrent-write atomicity (POSIX truncate-vs-write at the FS
  *     boundary) remains the caller's responsibility — Stratum's sync
  *     layer doesn't model the FS-layer file-handle locks that POSIX
  *     specifies.

@@ -4073,8 +4073,7 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
 /* P7-9: POSIX-shape truncate. Shrinks (ds, ino) to new_size bytes;
  * extent.tla::Truncate.
  *
- * Composition strategy (P7-11 single-lock-span — closes R41 P3-1
- * and R41 P3-2 atomicity gaps):
+ * Composition strategy (P7-11 single-lock-span):
  *   1. Acquire sync->lock + check wedged/RO.
  *   2. Look up the crossing extent (single, by NoOverlapWithinIno) at
  *      offset `new_size - 1` via stm_extent_lookup_at.
@@ -4086,22 +4085,45 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
  *      those paddrs through sync_drop_paddr_locked.
  *   5. Release sync->lock.
  *
- * The single lock acquisition makes truncate atomic w.r.t. concurrent
- * stm_sync_commit / stm_sync_write_extent / other truncate calls:
- *   - R41 P3-1 closed: a Phase 4 (extent_truncate) failure no longer
- *     leaves a partial state because Phases 3 and 4 share one
- *     lock-hold; a failed extent_truncate retains the in-RAM state
- *     from before Phase 3's overwrite (extent_overwrite has already
- *     committed, but no commit can land because sync_commit blocks
- *     on s->lock).
- *   - R41 P3-2 closed: a concurrent stm_sync_commit cannot interleave
- *     between the prefix re-encrypt and the past-extents drop because
- *     sync_commit takes s->lock for the duration.
+ * Atomicity scope (R43 P3-1 honest accounting):
+ *
+ *   - **R41 P3-1 case (a) — CLOSED**: a concurrent stm_sync_commit
+ *     can no longer interleave between Phase 3 (prefix re-encrypt)
+ *     and Phase 4 (past-extent drop) because both phases share one
+ *     sync->lock acquisition; sync_commit takes s->lock for its
+ *     entire duration and therefore blocks until truncate releases.
+ *
+ *   - **R41 P3-1 case (b) — STILL OPEN**: Phase 4's
+ *     stm_extent_truncate can still return STM_ENOMEM (its
+ *     drop_by_predicate_locked allocates drop_idx[] + paddrs[]
+ *     proportional to the past-extent count). On that failure path,
+ *     truncate just unlocks and returns ENOMEM. Phase 3's
+ *     extent_overwrite has already mutated the in-RAM extent_idx
+ *     (the prefix-shrunk record is in place, the original crossing
+ *     extent's replicas are dead-listed/freed). The next successful
+ *     stm_sync_commit then persists the partial on-disk state:
+ *     prefix shrunk + past extents still present. No load-bearing
+ *     invariant (NoOverlap, PaddrFreshness, LiveReplicasDisjoint,
+ *     nonce uniqueness) is violated; this is a POSIX-atomicity gap,
+ *     not a corruption hazard. Closing case (b) requires either
+ *     pre-allocating Phase 4's working buffers before Phase 3 (so
+ *     Phase 4 cannot fail with ENOMEM) or implementing a true
+ *     reverse-of-Phase-3 rollback at the extent_idx level. Both are
+ *     deferred follow-on chunks; the operator-visible mitigation
+ *     until then is to retry the truncate (idempotent: the second
+ *     call sees the partial state and only does Phase 4).
+ *
+ *   - **R41 P3-2 — CLOSED**: same single-lock-hold reason as (a).
  *
  * The trade-off is lock-hold duration: the prefix's decrypt + encrypt
  * + bdev I/O all happen under s->lock. For an MVP at 128 KiB
  * recordsize this is acceptable; production extension would either
- * fine-grain the lock or run truncate against a snapshot.
+ * fine-grain the lock or run truncate against a snapshot. Cascade
+ * note (R43 P3-3): scrub's verify cb takes s->lock briefly to look
+ * up the per-extent DEK, so a concurrent truncate that holds s->lock
+ * across bdev I/O extends scrub_step's sc.lock+pool.rdlock hold by
+ * the same window — no deadlock (lock-graph stays acyclic), but
+ * sustained truncate workloads slow scrub-step throughput.
  */
 stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
                                 uint64_t new_size)
