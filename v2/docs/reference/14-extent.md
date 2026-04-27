@@ -88,6 +88,12 @@ stm_status stm_extent_overwrite      (idx, ds, ino, off, len, new_paddr, write_g
                                          **out_dropped_paddrs, *out_n_dropped);
 stm_status stm_extent_truncate       (idx, ds, ino, new_size,
                                          **out_dropped_paddrs, *out_n_dropped);
+stm_status stm_extent_truncate_peek  (idx, ds, ino, new_size,           /* P7-12 */
+                                         *out_n_extents, *out_n_replicas_total);
+stm_status stm_extent_truncate_into  (idx, ds, ino, new_size,           /* P7-12 */
+                                         drop_idx_buf, drop_idx_cap,
+                                         paddrs_buf, paddrs_cap,
+                                         *out_n_dropped);
 stm_status stm_extent_delete_file    (idx, ds, ino,
                                          **out_dropped_paddrs, *out_n_dropped);
 ```
@@ -110,8 +116,8 @@ unchanged and the out-args are zeroed (`*paddrs = NULL`, `*n = 0`).
 Partial-extent shrinking (an extent CROSSING the boundary) is
 handled at the sync layer by `stm_sync_truncate` (P7-9) — the
 extent_index API itself remains drop-only; `stm_sync_truncate`
-issues a fresh-replica re-encrypted prefix-write BEFORE calling
-`stm_extent_truncate`, so the crossing extent is dropped through
+issues a fresh-replica re-encrypted prefix-write BEFORE invoking
+the drop, so the crossing extent is dropped through
 the COW path naturally. See `stm_sync_truncate` in `sync.h` for
 the production POSIX-shape entry point.
 
@@ -119,6 +125,19 @@ the production POSIX-shape entry point.
 
 `Truncate` and `DeleteFile` use the same out-arg shape as `Overwrite`:
 caller owns the malloc'd dropped-paddr array.
+
+**P7-12** adds two paired APIs for fault-free truncate composition:
+
+- `stm_extent_truncate_peek(idx, ds, ino, new_size, *out_n_extents,
+  *out_n_replicas_total)` — pure read; counts past-extents + total
+  replica paddrs without mutating. Returns the exact buffer sizes a
+  subsequent `_into` call needs.
+- `stm_extent_truncate_into(idx, ds, ino, new_size, drop_idx_buf,
+  drop_idx_cap, paddrs_buf, paddrs_cap, *out_n_dropped)` — truncate
+  using caller-provided pre-allocated buffers. Never allocates
+  internally. Returns `STM_ERANGE` atomically (no index mutation) if
+  either cap is insufficient. Used by `stm_sync_truncate` to make
+  Phase 3 fault-free, closing R41 P3-1 case (b).
 
 ### Read paths
 

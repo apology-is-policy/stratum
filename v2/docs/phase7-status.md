@@ -185,6 +185,41 @@ into the CAS tier (which DOES need P6) is a separate concern.
       gen filter is best-effort because `snapshot.created_txg` and
       `sync.current_gen` are independent counters — closed in P7-8.
       No format break in P7-7; STM_UB_VERSION stays at 13.
+- [x] **P7-12 truncate fault-free Phase 3** — landed at `5eba5de`;
+      R44 close `bb5e088` (0 P0 + 0 P1 + 0 P2 + 4 P3 — green
+      signal; P3-1 SPEC-TO-CODE refinement-row backfill + P3-2
+      misleading Phase 3 error-comment rewrite + P3-4 peek
+      zero-before-validate convention all fixed inline; P3-3
+      end-to-end ENOMEM-injection regression test continues R43
+      P3-2's deferral pending a malloc-failure harness in v2's
+      test infra). Closes the last documented atomicity gap:
+      R41 P3-1 case (b) (Phase 3 ENOMEM after Phase 2 succeeded
+      → partial in-RAM state committable by next sync_commit).
+      Adds two new extent_idx APIs:
+        - `stm_extent_truncate_peek(idx, ds, ino, new_size,
+            *out_n_extents, *out_n_replicas_total)` — pure-read,
+            counts past-extents + their total replica paddrs without
+            mutating the index.
+        - `stm_extent_truncate_into(idx, ds, ino, new_size,
+            drop_idx_buf, drop_idx_cap, paddrs_buf, paddrs_cap,
+            *out_n_dropped)` — truncate using caller-provided
+            pre-allocated buffers. Never allocates internally.
+            Returns STM_ERANGE atomically (no index mutation) if
+            either cap is insufficient.
+      stm_sync_truncate's new flow: lock + wedged/RO check → Phase 1
+      lookup crossing → Phase 1b peek + pre-allocate drop_idx +
+      paddrs → Phase 2 read+re-encrypt crossing prefix → Phase 3
+      `_into` (fault-free) → drop-route past-extent paddrs → unlock.
+      Pre-allocation runs BEFORE Phase 2's extent_overwrite, so any
+      ENOMEM surfaces with the index unchanged. Peek's count remains
+      consistent at Phase 3 time because Phase 2 only mutates the
+      crossing extent's range (off in [crossing.off, crossing.off +
+      crossing.len) ⊂ [0, new_size)); past-extents at off ≥ new_size
+      are untouched. Composition with P7-11's single-lock-span makes
+      the whole truncate atomic w.r.t. concurrent commit / write AND
+      ENOMEM-safe. No format break, no spec change. test_extent_index
+      51 → 55 (4 new tests for the peek + into APIs); 33 ctest suites
+      green default + ASan + TSan in isolated runs.
 - [x] **P7-11 truncate _locked atomicity refactor** — landed at
       `0a59ab2`; R43 close `9af916e` (0 P0 + 0 P1 + 0 P2 + 4 P3 —
       P3-1 docstring honesty pass + P3-3 scrub-cascade note fixed

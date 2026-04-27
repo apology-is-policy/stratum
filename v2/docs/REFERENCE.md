@@ -38,8 +38,26 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R43-hash-fixup pending. Substantive `0a59ab2` +
-  R43 close `9af916e`.
+- **Tip**: post-R44-hash-fixup pending. Substantive `5eba5de` +
+  R44 close `bb5e088`.
+  **P7-12 truncate fault-free Phase 3 — closes R41 P3-1 case (b)
+  (the one gap left open by P7-11). Adds `stm_extent_truncate_peek`
+  (pure-read count of past-extents + total replicas) and
+  `stm_extent_truncate_into` (truncate using caller-provided
+  pre-allocated buffers; never allocates internally). `stm_sync_
+  truncate` now peek-counts past-extents and pre-allocates Phase 3
+  buffers BEFORE Phase 2's overwrite — any ENOMEM surfaces with
+  the index unchanged. Phase 3's `_into` cannot fail with ENOMEM;
+  composed with P7-11's single-lock-span, the whole truncate is
+  atomic w.r.t. concurrent commit/write AND ENOMEM-safe. No format
+  break, no spec change. test_extent_index 51 → 55. R44 audit:
+  0 P0 + 0 P1 + 0 P2 + 4 P3 — green signal; P3-1 SPEC-TO-CODE
+  refinement rows + P3-2 misleading comment + P3-4 zero-before-
+  validate convention all fixed inline; P3-3 end-to-end
+  ENOMEM-injection test continues R43 P3-2's deferral (needs
+  malloc-failure harness, not in v2's test infra yet).**
+  Prior: P7-11 truncate _locked atomicity refactor `0a59ab2` +
+  R43 close `9af916e` + hash fixup `d874a04`.
   **P7-11 truncate _locked atomicity refactor — `stm_sync_truncate`
   now holds `sync->lock` across all three phases (lookup → read+
   re-encrypt → past-extent drop + drop-route) under one acquisition.
