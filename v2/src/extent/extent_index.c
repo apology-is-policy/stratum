@@ -16,6 +16,10 @@
  *   extent.tla::Write              → stm_extent_write
  *   extent.tla::Overwrite          → stm_extent_overwrite
  *   extent.tla::Truncate           → stm_extent_truncate
+ *   extent.tla::Truncate (refinement: pure-read peek pair)
+ *                                   → stm_extent_truncate_peek    (P7-12)
+ *   extent.tla::Truncate (refinement: pre-allocated _into)
+ *                                   → stm_extent_truncate_into    (P7-12)
  *   extent.tla::DeleteFile         → stm_extent_delete_file
  *   extent.tla::AdvanceTxg         → stm_extent_index_advance_txg
  *
@@ -546,11 +550,13 @@ stm_status stm_extent_truncate_peek(const stm_extent_index *idx,
                                        uint64_t new_size,
                                        size_t *out_n_extents,
                                        size_t *out_n_replicas_total) {
-    if (!idx || !out_n_extents || !out_n_replicas_total) return STM_EINVAL;
-    if (dataset_id == 0 || ino == 0) return STM_EINVAL;
-
+    /* R44 P3-4: zero out-args before any early return — matches the
+     * R34 P2-1 precedent in stm_extent_truncate / _delete_file. */
+    if (!out_n_extents || !out_n_replicas_total) return STM_EINVAL;
     *out_n_extents        = 0;
     *out_n_replicas_total = 0;
+    if (!idx) return STM_EINVAL;
+    if (dataset_id == 0 || ino == 0) return STM_EINVAL;
 
     pthread_mutex_t *lock = ex_lock(idx);
     must_lock(lock);

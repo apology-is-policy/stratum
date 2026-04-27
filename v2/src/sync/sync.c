@@ -4263,9 +4263,16 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
                                                 paddrs_buf, past_n_replicas,
                                                 &n_dropped);
     if (ts != STM_OK) {
-        /* Should not happen post-peek; surface as ECORRUPT to avoid
-         * silent breakage. The atomicity claim below assumes we don't
-         * get here. */
+        /* R44 P3-2: should not happen post-peek (peek's count is
+         * consistent with current state per the comment block above;
+         * STM_ENOMEM is impossible because _into never allocates;
+         * STM_ERANGE is impossible because the caps came from peek;
+         * STM_EINVAL is impossible because args came from this
+         * function's already-validated locals). If we somehow get
+         * here, propagate the underlying status verbatim — preserves
+         * diagnostic detail rather than translating to STM_ECORRUPT
+         * which would erase context. The atomicity claim above
+         * assumes this branch is unreachable. */
         free(drop_idx_buf);
         free(paddrs_buf);
         pthread_mutex_unlock(&s->lock);
