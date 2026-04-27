@@ -3848,6 +3848,104 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     return STM_OK;
 }
 
+/* P7-9: POSIX-shape truncate. Shrinks (ds, ino) to new_size bytes;
+ * extent.tla::Truncate.
+ *
+ * Composition strategy:
+ *   1. Look up the crossing extent (single, by NoOverlapWithinIno) at
+ *      offset `new_size - 1` via stm_extent_lookup_at — uses the
+ *      extent index's own lock; cheap.
+ *   2. If crossing exists: read + decrypt its full plaintext via
+ *      stm_sync_read_extent, then re-encrypt the [0, prefix_len) bytes
+ *      via stm_sync_write_extent. The latter's extent_overwrite +
+ *      drop-route handles the original's replicas.
+ *   3. Acquire sync lock; call stm_extent_truncate to drop every
+ *      extent past new_size; route those paddrs through
+ *      sync_drop_paddr_locked (dead-list or free).
+ *
+ * Concurrency caveat: between (1) and (3) other threads can mutate
+ * (ds, ino)'s extents. POSIX-style truncate atomicity is the
+ * caller's responsibility (serialize at the FS layer above sync).
+ * The internal lock acquired in (3) ensures the drop-routing of
+ * past extents is atomic with respect to other sync ops.
+ */
+stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
+                                uint64_t new_size)
+{
+    if (!s) return STM_EINVAL;
+    if (dataset_id == 0 || ino == 0) return STM_EINVAL;
+    if ((new_size % STM_UB_SIZE) != 0) return STM_EINVAL;
+
+    /* Phase 1: locate the crossing extent. */
+    stm_extent_record rec;
+    bool has_crossing = false;
+    if (new_size > 0) {
+        stm_status ls = stm_extent_lookup_at(s->extent_idx, dataset_id, ino,
+                                                new_size - 1u, &rec);
+        if (ls == STM_OK) {
+            if (rec.off < new_size && rec.off + rec.len > new_size) {
+                has_crossing = true;
+            }
+            /* Else: extent ends exactly at new_size (rec.off + rec.len ==
+             * new_size). It's neither crossing nor past — leave it. */
+        } else if (ls != STM_ENOENT) {
+            return ls;
+        }
+    }
+
+    /* Phase 2: shrink the crossing extent by read+decrypt+re-encrypt
+     * of the kept prefix. stm_sync_write_extent's extent_overwrite
+     * drops the original (now superseded) and routes its paddrs
+     * through dead-list / free. */
+    if (has_crossing) {
+        void *plain = malloc(rec.len);
+        if (!plain) return STM_ENOMEM;
+        size_t got = 0;
+        stm_status rs = stm_sync_read_extent(s, dataset_id, ino, rec.off,
+                                                plain, rec.len, &got);
+        if (rs != STM_OK) {
+            stm_ct_memzero(plain, rec.len);
+            free(plain);
+            return rs;
+        }
+        if (got != rec.len) {
+            stm_ct_memzero(plain, rec.len);
+            free(plain);
+            return STM_EIO;
+        }
+        size_t prefix_len = (size_t)(new_size - rec.off);
+        stm_status ws = stm_sync_write_extent(s, dataset_id, ino, rec.off,
+                                                 plain, prefix_len);
+        stm_ct_memzero(plain, rec.len);
+        free(plain);
+        if (ws != STM_OK) return ws;
+    }
+
+    /* Phase 3: drop every extent past new_size + drop-route. */
+    pthread_mutex_lock(&s->lock);
+    if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
+    if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
+
+    uint64_t *dropped = NULL;
+    size_t    n_dropped = 0;
+    stm_status ts = stm_extent_truncate(s->extent_idx, dataset_id, ino,
+                                           new_size, &dropped, &n_dropped);
+    if (ts != STM_OK) {
+        pthread_mutex_unlock(&s->lock);
+        return ts;
+    }
+
+    stm_status drop_err = STM_OK;
+    for (size_t i = 0; i < n_dropped; i++) {
+        stm_status drs = sync_drop_paddr_locked(s, dataset_id, dropped[i]);
+        if (drs != STM_OK && drop_err == STM_OK) drop_err = drs;
+    }
+    free(dropped);
+
+    pthread_mutex_unlock(&s->lock);
+    return drop_err;
+}
+
 /* P7-6 production scrub β verify-callback — full bptr.tla replica
  * walk + verify + rewrite-bad protocol.
  *

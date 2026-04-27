@@ -840,4 +840,207 @@ STM_TEST(fs_io_scrub_production_cb_charges_mid_extent_blocks_to_ok) {
     unlink(g_tmp_path);
 }
 
+/* ========================================================================= */
+/* P7-9 stm_sync_truncate (partial-extent shrink + drop-past).                */
+/* ========================================================================= */
+
+STM_TEST(fs_truncate_inside_extent_shrinks_prefix) {
+    /* Write an 8 KiB extent; truncate to 4 KiB. The crossing extent is
+     * shrunk via re-encrypt under fresh paddrs; the second 4 KiB
+     * becomes a hole. */
+    make_tmp("trunc_inside");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[8192];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)(i & 0xFF);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+
+    stm_sync *s = stm_fs_sync_for_test(fs);
+    STM_ASSERT_TRUE(s != NULL);
+    STM_ASSERT_OK(stm_sync_truncate(s, 1, 1, 4096));
+
+    /* Read [0, 4 KiB) — kept prefix. */
+    uint8_t out[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_EQ(got, (size_t)4096);
+    STM_ASSERT_MEM_EQ(plain, out, sizeof out);
+
+    /* Read [4 KiB, 8 KiB) — now a hole, returns zeros. */
+    uint8_t after[4096];
+    memset(after, 0xAA, sizeof after);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 4096, after, sizeof after, &got));
+    STM_ASSERT_EQ(got, (size_t)4096);
+    for (size_t i = 0; i < sizeof after; i++) STM_ASSERT_EQ(after[i], 0u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+STM_TEST(fs_truncate_at_extent_boundary_is_noop_for_extent) {
+    /* Write a 4 KiB extent; truncate at 4 KiB (exactly the extent's
+     * end). The extent is neither crossing nor past — left intact. */
+    make_tmp("trunc_boundary");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[4096];
+    memset(plain, 0xC3, sizeof plain);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+
+    stm_sync *s = stm_fs_sync_for_test(fs);
+    STM_ASSERT_OK(stm_sync_truncate(s, 1, 1, 4096));
+
+    uint8_t out[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(plain, out, sizeof out);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+STM_TEST(fs_truncate_to_zero_drops_all_extents) {
+    /* Write three extents at 0/4K/8K; truncate to 0; all extents
+     * dropped; reads return zeros. */
+    make_tmp("trunc_zero");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[4096];
+    memset(plain, 0x11, sizeof plain);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0,    plain, sizeof plain));
+    memset(plain, 0x22, sizeof plain);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 4096, plain, sizeof plain));
+    memset(plain, 0x33, sizeof plain);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 8192, plain, sizeof plain));
+
+    stm_sync *s = stm_fs_sync_for_test(fs);
+    STM_ASSERT_OK(stm_sync_truncate(s, 1, 1, 0));
+
+    uint8_t out[4096];
+    memset(out, 0xFF, sizeof out);
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    for (size_t i = 0; i < sizeof out; i++) STM_ASSERT_EQ(out[i], 0u);
+
+    memset(out, 0xFF, sizeof out);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 4096, out, sizeof out, &got));
+    for (size_t i = 0; i < sizeof out; i++) STM_ASSERT_EQ(out[i], 0u);
+
+    memset(out, 0xFF, sizeof out);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 8192, out, sizeof out, &got));
+    for (size_t i = 0; i < sizeof out; i++) STM_ASSERT_EQ(out[i], 0u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+STM_TEST(fs_truncate_past_eof_is_noop) {
+    /* Write 4 KiB; truncate to 16 KiB. No crossing, no past extents.
+     * Read at 0 returns the original; read past 4 KiB is a hole. */
+    make_tmp("trunc_past_eof");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[4096];
+    memset(plain, 0x77, sizeof plain);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+
+    stm_sync *s = stm_fs_sync_for_test(fs);
+    STM_ASSERT_OK(stm_sync_truncate(s, 1, 1, 16u * 1024u));
+
+    uint8_t out[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(plain, out, sizeof out);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+STM_TEST(fs_truncate_with_snapshot_routes_old_paddrs_to_dead_list) {
+    /* Write 8 KiB; create snapshot; truncate to 4 KiB. The original
+     * extent's replicas should land in the snap's dead-list (1
+     * paddr per replica × 1 dropped extent = mirror_n entries on
+     * single-device pool's mirror_n=1 setup). The truncate writes
+     * a fresh prefix that's a separate extent (not in the dead-
+     * list). */
+    make_tmp("trunc_snap");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[8192];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)i;
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+
+    stm_sync *s = stm_fs_sync_for_test(fs);
+    STM_ASSERT_TRUE(s != NULL);
+    stm_snapshot_index *snap = stm_sync_snapshot_index(s);
+    STM_ASSERT_TRUE(snap != NULL);
+
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_snapshot_create(snap, /*ds=*/1, "snap_pre_truncate",
+                                          /*tree_root_paddr=*/0xCAFE,
+                                          stm_sync_current_gen(s),
+                                          &snap_id));
+
+    /* Pre-truncate dead-list count is zero. */
+    size_t pre = 999;
+    STM_ASSERT_OK(stm_snapshot_dead_list_count(snap, snap_id, &pre));
+    STM_ASSERT_EQ(pre, (size_t)0);
+
+    STM_ASSERT_OK(stm_sync_truncate(s, 1, 1, 4096));
+
+    /* Post-truncate: the original 8 KiB extent's paddrs are in the
+     * snap's dead-list. The shrunk prefix wrote to fresh paddrs. */
+    size_t post = 0;
+    STM_ASSERT_OK(stm_snapshot_dead_list_count(snap, snap_id, &post));
+    STM_ASSERT_TRUE(post >= 1);
+
+    /* Read prefix [0, 4 KiB) — kept. */
+    uint8_t out[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(plain, out, sizeof out);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
+STM_TEST(fs_truncate_args_validated) {
+    make_tmp("trunc_args");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_sync *s = stm_fs_sync_for_test(fs);
+    STM_ASSERT_ERR(stm_sync_truncate(NULL, 1, 1, 0), STM_EINVAL);
+    STM_ASSERT_ERR(stm_sync_truncate(s, 0, 1, 0),    STM_EINVAL);
+    STM_ASSERT_ERR(stm_sync_truncate(s, 1, 0, 0),    STM_EINVAL);
+    /* Unaligned new_size. */
+    STM_ASSERT_ERR(stm_sync_truncate(s, 1, 1, 1234), STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+}
+
 STM_TEST_MAIN("fs")

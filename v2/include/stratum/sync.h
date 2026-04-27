@@ -893,6 +893,48 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
                                    size_t *out_read);
 
 /*
+ * P7-9: POSIX-shape truncate. Shrinks (dataset_id, ino) to `new_size`
+ * bytes.
+ *
+ * Drops every live extent whose `off >= new_size`. If exactly one
+ * extent crosses the boundary (`off < new_size < off+len`), it is
+ * SHRUNK to `[off, new_size)` by reading + decrypting its full
+ * plaintext, slicing to the kept prefix, and re-encrypting the
+ * prefix under a FRESH (paddr_0, current_gen) AEAD nonce — the
+ * original extent's replica paddrs flow through dead-list / free
+ * per the COW path. Re-encrypting under fresh paddrs prevents
+ * `(paddr, gen)` reuse: the original extent's full ciphertext and
+ * the new shrunk-prefix's plaintext would otherwise share a nonce.
+ * Spec: `extent.tla::Truncate`.
+ *
+ * MVP constraints:
+ *   - `new_size` must be a multiple of `STM_UB_SIZE` (4 KiB blocks).
+ *     Non-aligned truncate would require partial-block read+modify+
+ *     write at the underlying bdev, deferred.
+ *   - Composes the public `stm_sync_write_extent` + `stm_sync_read_extent`
+ *     APIs with the sync handle's internal lock for the final
+ *     `stm_extent_truncate` + drop-routing phase. Concurrent extent
+ *     writes on (dataset_id, ino) during truncate are NOT serialized
+ *     with the read + re-encrypt of the crossing extent — POSIX
+ *     truncate-vs-concurrent-write semantics are the caller's
+ *     responsibility (typical pattern: serialize at the FS layer
+ *     above).
+ *
+ * Returns:
+ *   STM_OK             — truncate complete.
+ *   STM_EINVAL         — bad args (NULL s; ds/ino == 0; new_size
+ *                         not block-aligned).
+ *   STM_EWEDGED        — sync wedged.
+ *   STM_EROFS          — read-only.
+ *   STM_ENOMEM / STM_EIO / STM_EBADTAG / ... — bubbled from the
+ *                         underlying read+write of the crossing extent
+ *                         or the alloc/bdev layer.
+ */
+STM_MUST_USE
+stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
+                                uint64_t new_size);
+
+/*
  * P7-5: install the production scrub β verify-callback on `sc`.
  *
  * The cb resolves each `paddr` against `sync`'s extent index via

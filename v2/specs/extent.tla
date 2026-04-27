@@ -243,19 +243,49 @@ Overwrite(ds, ino, off, len, new_replicas) ==
     /\ UNCHANGED current_txg
 
 (***************************************************************************)
-(* Truncate — drop all extents starting at offset ≥ new_size.                *)
+(* Truncate — shrink (ds, ino) to `new_size` blocks.                          *)
 (*                                                                           *)
-(* Simplification: only drop fully-past-truncation extents. Partial         *)
-(* truncation (an extent crossing the truncation boundary) would shrink    *)
-(* the extent's length; the C impl will need to handle that, but the       *)
-(* spec's NoOverlap invariant is preserved either way.                     *)
+(* Drops every extent whose `off ≥ new_size` (fully past truncation).        *)
+(* If exactly one extent crosses the boundary (`e.off < new_size <           *)
+(* e.off + e.len`), it is REPLACED by a shrunk extent at the same off       *)
+(* with `len = new_size - e.off`, encrypted under a FRESH replica set       *)
+(* (allocator-fresh paddrs, disjoint from `used_paddrs`). The C impl        *)
+(* realizes the shrink by reading + decrypting the crossing extent's        *)
+(* plaintext, slicing to the kept prefix, allocating new replicas + a       *)
+(* fresh `(paddr_0, current_txg)` AEAD nonce, and re-encrypting; the old    *)
+(* replica paddrs flow through `dead_list.tla::OverwriteBlock` and back     *)
+(* to the allocator's free pool. Re-encrypting under a fresh nonce          *)
+(* prevents `(paddr, gen)` reuse — the original extent's full ciphertext    *)
+(* and the new shrunk-prefix's plaintext would otherwise share a nonce.     *)
+(*                                                                           *)
+(* `NoOverlapWithinIno` implies at most one crossing extent for any         *)
+(* `new_size`, so the existential over `crossing` resolves to a single      *)
+(* extent. `new_size = 0` collapses to the no-crossing branch (every        *)
+(* extent has `off ≥ 0 = new_size`, so all extents land in `past_extents`). *)
 (***************************************************************************)
 Truncate(ds, ino, new_size) ==
     /\ ds \in DatasetIds
     /\ ino \in InoIds
     /\ new_size \in 0..MaxFileBlocks
-    /\ extents' = extents \ { e \in ExtentsOf(ds, ino) : e.off >= new_size }
-    /\ UNCHANGED <<used_paddrs, current_txg>>
+    /\ LET past_extents ==
+              { e \in ExtentsOf(ds, ino) : e.off >= new_size }
+           crossing ==
+              { e \in ExtentsOf(ds, ino) :
+                  e.off < new_size /\ e.off + e.len > new_size }
+       IN
+       \/ /\ crossing = {}
+          /\ extents' = extents \ past_extents
+          /\ UNCHANGED used_paddrs
+       \/ \E e \in crossing, new_replicas \in ReplicaSets :
+              /\ new_replicas \cap used_paddrs = {}
+              /\ extents' =
+                  (extents \ (past_extents \cup crossing))
+                  \cup {[ds |-> ds, ino |-> ino, off |-> e.off,
+                         len |-> new_size - e.off,
+                         replicas |-> new_replicas,
+                         gen |-> current_txg]}
+              /\ used_paddrs' = used_paddrs \cup new_replicas
+    /\ UNCHANGED current_txg
 
 (***************************************************************************)
 (* DeleteFile — drop all extents for (ds, ino).                              *)
