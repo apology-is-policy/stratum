@@ -10,6 +10,7 @@
  * Persistent storage (ub_snap_root + btree_store) is a follow-on chunk.
  */
 #include <stratum/snapshot.h>
+#include <stratum/snapshot_testing.h>
 
 #include <stratum/block.h>
 #include <stratum/bootstrap.h>
@@ -232,18 +233,29 @@ stm_status stm_snapshot_index_current_txg(const stm_snapshot_index *idx,
     return STM_OK;
 }
 
-stm_status stm_snapshot_create(stm_snapshot_index *idx,
-                                 uint64_t dataset_id,
-                                 const char *name,
-                                 uint64_t tree_root_paddr,
-                                 uint64_t extent_txg,
-                                 uint64_t *out_id) {
-    if (!idx || !name || !out_id) return STM_EINVAL;
-    if (dataset_id == 0) return STM_EINVAL;
-    *out_id = 0;
-    size_t name_len = strlen(name);
-    if (name_len == 0 || name_len > STM_SNAP_NAME_MAX) return STM_EINVAL;
-
+/* P7-14: shared body for stm_snapshot_create + the test-only
+ * stm_snapshot_create_for_test. Caller does arg validation and
+ * supplies the pre-computed name length; the helper acquires
+ * idx->lock, runs the spec-modeled checks (gated by
+ * skip_chain_check for the test path), appends the slot, stamps
+ * the entry, and releases the lock.
+ *
+ * skip_chain_check=false: production path; full R40 P2-1
+ *   in-process validator (refuses STM_EINVAL on extent_txg < prev's).
+ * skip_chain_check=true: test-only path; the resulting on-disk
+ *   shape will violate snapshot.tla::ChainExtentTxgOrdered and the
+ *   next mount's sp_validate_shadow will reject it with
+ *   STM_ECORRUPT. Used to exercise the structural validator's
+ *   chain-inversion branch in regression tests.
+ */
+static stm_status snapshot_create_inner(stm_snapshot_index *idx,
+                                           uint64_t dataset_id,
+                                           const char *name,
+                                           size_t name_len,
+                                           uint64_t tree_root_paddr,
+                                           uint64_t extent_txg,
+                                           bool skip_chain_check,
+                                           uint64_t *out_id) {
     must_lock(&idx->lock);
 
     /* R29 P3-1: defensive saturation on the monotonic counters.
@@ -275,8 +287,11 @@ stm_status stm_snapshot_create(stm_snapshot_index *idx,
      * reject the chain with STM_ECORRUPT, leaving the pool
      * unmountable. Refuse the create here with STM_EINVAL so the
      * racing thread can retry with a fresher gen instead of
-     * silently corrupting the on-disk shape. */
-    if (prev_snap != STM_SNAP_NO_PREV) {
+     * silently corrupting the on-disk shape. P7-14: the test-only
+     * `_for_test` variant skips this check to construct the
+     * chain-inverted shape on disk and verify the on-disk
+     * validator rejects it. */
+    if (!skip_chain_check && prev_snap != STM_SNAP_NO_PREV) {
         size_t prev_idx = find_slot_locked(idx, prev_snap);
         if (prev_idx != (size_t)-1 && idx->slots[prev_idx].present) {
             if (extent_txg < idx->slots[prev_idx].e.extent_txg) {
@@ -316,6 +331,40 @@ stm_status stm_snapshot_create(stm_snapshot_index *idx,
 
     must_unlock(&idx->lock);
     return STM_OK;
+}
+
+stm_status stm_snapshot_create(stm_snapshot_index *idx,
+                                 uint64_t dataset_id,
+                                 const char *name,
+                                 uint64_t tree_root_paddr,
+                                 uint64_t extent_txg,
+                                 uint64_t *out_id) {
+    if (!idx || !name || !out_id) return STM_EINVAL;
+    if (dataset_id == 0) return STM_EINVAL;
+    *out_id = 0;
+    size_t name_len = strlen(name);
+    if (name_len == 0 || name_len > STM_SNAP_NAME_MAX) return STM_EINVAL;
+
+    return snapshot_create_inner(idx, dataset_id, name, name_len,
+                                    tree_root_paddr, extent_txg,
+                                    /*skip_chain_check=*/false, out_id);
+}
+
+stm_status stm_snapshot_create_for_test(stm_snapshot_index *idx,
+                                          uint64_t dataset_id,
+                                          const char *name,
+                                          uint64_t tree_root_paddr,
+                                          uint64_t extent_txg,
+                                          uint64_t *out_id) {
+    if (!idx || !name || !out_id) return STM_EINVAL;
+    if (dataset_id == 0) return STM_EINVAL;
+    *out_id = 0;
+    size_t name_len = strlen(name);
+    if (name_len == 0 || name_len > STM_SNAP_NAME_MAX) return STM_EINVAL;
+
+    return snapshot_create_inner(idx, dataset_id, name, name_len,
+                                    tree_root_paddr, extent_txg,
+                                    /*skip_chain_check=*/true, out_id);
 }
 
 stm_status stm_snapshot_delete(stm_snapshot_index *idx,

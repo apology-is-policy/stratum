@@ -19,6 +19,7 @@
 #include <stratum/keyfile.h>
 #include <stratum/scrub.h>
 #include <stratum/snapshot.h>
+#include <stratum/snapshot_testing.h>
 #include <stratum/sync.h>
 #include <stratum/types.h>
 
@@ -1502,6 +1503,67 @@ STM_TEST(fs_create_dataset_multi_call_sequencing) {
     }
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* ========================================================================= */
+/* P7-14: on-disk snapshot chain-ordering validator (R40 P3-3).               */
+/* ========================================================================= */
+
+STM_TEST(fs_snap_chain_inversion_on_disk_refused_at_mount) {
+    /* P7-14 closes R40 P3-3: regression for the on-disk
+     * sp_validate_shadow chain-extent-txg-ordered check. The
+     * production producer (stm_snapshot_create) refuses chain
+     * inversion in-process at R40 P2-1, but a buggy producer or
+     * tampered disk could still construct the bad shape; the
+     * structural validator at mount-load is the second line of
+     * defense.
+     *
+     * Test path: install one valid snap and one chain-inverted
+     * snap (via the test-only stm_snapshot_create_for_test
+     * which bypasses the in-process check), commit to disk,
+     * unmount, then attempt to remount — expect a non-OK status
+     * surfaced from the validator. */
+    make_tmp("snap_chain_inv");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_snapshot_index *snap_idx = stm_sync_snapshot_index(sync);
+    STM_ASSERT(snap_idx != NULL);
+
+    /* Snap 1: extent_txg=100. Snap 2 (chain-inverted, via _for_test):
+     * extent_txg=50. Both on the same dataset (root). The validator
+     * is per-dataset, so we need two snaps in one dataset for the
+     * chain-ordering check to fire. */
+    uint64_t s1 = 0, s2 = 0;
+    STM_ASSERT_OK(stm_snapshot_create(snap_idx, /*ds=*/1, "ok",
+                                          /*tree_root=*/0xAABBu,
+                                          /*extent_txg=*/100, &s1));
+    STM_ASSERT_OK(stm_snapshot_create_for_test(snap_idx, /*ds=*/1,
+                                                   "inverted",
+                                                   /*tree_root=*/0xCCDDu,
+                                                   /*extent_txg=*/50, &s2));
+    STM_ASSERT(s2 > s1);
+
+    /* Persist the bad shape. */
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    /* Remount: load_at runs sp_validate_shadow → STM_ECORRUPT
+     * on the chain inversion → mount fails. We don't pin the
+     * exact error (the propagation chain may wrap it), only that
+     * the mount refuses non-zero and *out_fs is not populated. */
+    stm_fs *fs2 = NULL;
+    stm_status rs = stm_fs_mount(g_tmp_path, &mopts, &fs2);
+    STM_ASSERT(rs != STM_OK);
+    STM_ASSERT(fs2 == NULL);
+
     unlink(g_tmp_path);
     unlink(g_key_path);
 }

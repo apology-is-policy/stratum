@@ -20,6 +20,7 @@
 #include <stratum/bootstrap.h>
 #include <stratum/crypto.h>
 #include <stratum/snapshot.h>
+#include <stratum/snapshot_testing.h>
 
 #include <pthread.h>
 #include <stdio.h>
@@ -1226,6 +1227,80 @@ STM_TEST(snapshot_persist_dead_list_idempotent_commit) {
     stm_bootstrap_close(b);
     stm_bdev_close(d);
     unlink(spp_tmp_path);
+}
+
+/* P7-14: in-process chain-ordering check (R40 P2-1). */
+
+STM_TEST(snap_create_in_process_chain_ordering_refused) {
+    /* R40 P2-1: stm_snapshot_create refuses STM_EINVAL when
+     * extent_txg < prev's extent_txg on the same dataset. The
+     * test creates snap1 with extent_txg=10, then attempts
+     * snap2 with extent_txg=5 — the in-process check fires
+     * BEFORE any on-disk validator runs. */
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+
+    uint64_t s1 = 0, s2 = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, /*ds=*/1, "s1",
+                                          /*tree_root=*/0xAABBu,
+                                          /*extent_txg=*/10, &s1));
+    /* Chain inversion within same dataset: refused. */
+    STM_ASSERT_ERR(stm_snapshot_create(idx, /*ds=*/1, "s2",
+                                          /*tree_root=*/0xCCDDu,
+                                          /*extent_txg=*/5, &s2),
+                       STM_EINVAL);
+    STM_ASSERT_EQ(s2, 0u);
+
+    /* Different dataset bypasses the check (chain is per-dataset). */
+    STM_ASSERT_OK(stm_snapshot_create(idx, /*ds=*/2, "s2_other_ds",
+                                          /*tree_root=*/0xCCDDu,
+                                          /*extent_txg=*/5, &s2));
+    STM_ASSERT(s2 > s1);
+
+    /* Equal extent_txg on the same dataset is permitted (the
+     * spec uses non-strict ≤; tolerates the equality case of
+     * back-to-back snap_creates with no intervening Write). */
+    uint64_t s3 = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, /*ds=*/1, "s3",
+                                          /*tree_root=*/0xEEFFu,
+                                          /*extent_txg=*/10, &s3));
+
+    stm_snapshot_index_close(idx);
+}
+
+STM_TEST(snap_create_for_test_bypasses_chain_ordering_check) {
+    /* P7-14: stm_snapshot_create_for_test accepts the chain-
+     * inverted shape that stm_snapshot_create refuses. The
+     * resulting in-RAM index now contains a chain whose
+     * sp_validate_shadow would refuse on disk-load. */
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+
+    uint64_t s1 = 0, s2 = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "s1", 0xAABBu, 10, &s1));
+    STM_ASSERT_OK(stm_snapshot_create_for_test(idx, 1, "s2",
+                                                   0xCCDDu, 5, &s2));
+    STM_ASSERT(s2 > s1);
+
+    stm_snapshot_entry e2;
+    STM_ASSERT_OK(stm_snapshot_lookup(idx, s2, &e2));
+    STM_ASSERT_EQ(e2.extent_txg, 5u);
+    STM_ASSERT_EQ(e2.prev_snap_id, s1);
+
+    /* All other validations still run on _for_test:
+     * NULL args, dataset_id=0, name length, name collision. */
+    uint64_t junk = 0;
+    STM_ASSERT_ERR(stm_snapshot_create_for_test(NULL, 1, "x", 0, 0, &junk),
+                       STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_create_for_test(idx, 0, "x", 0, 0, &junk),
+                       STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_create_for_test(idx, 1, "", 0, 0, &junk),
+                       STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_create_for_test(idx, 1, "s1",
+                                                   0xAABBu, 99, &junk),
+                       STM_EEXIST);
+
+    stm_snapshot_index_close(idx);
 }
 
 STM_TEST_MAIN("snapshot")
