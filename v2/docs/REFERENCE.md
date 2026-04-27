@@ -38,8 +38,59 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R47-hash-fixup pending. Substantive `c02cba8` +
-  R47 close `82fe30e`.
+- **Tip**: post-R48-hash-fixup pending. Substantive `76ce44f` +
+  R48 close `1951f65`.
+  **P7-16 reflinks — closes the long-pending ARCH §11.12 surface
+  (FICLONE-shape O(extent count) reflinks) at v1 MVP scope: same-
+  dataset whole-file reflinks. New public API
+  `stm_fs_reflink(fs, src_ds, src_ino, dst_ds, dst_ino)` bundles
+  a 3-phase composition under sync->lock — collect src extents,
+  bump `stm_alloc_ref` on every replica paddr, insert reflinked
+  records via the new `stm_extent_reflink` with origin INHERITED
+  from src. Format break STM_UB_VERSION 16 → 17: extent on-disk
+  value 64 → 96 bytes adding `origin_dataset_id` (offset 64) +
+  `origin_ino` (72) + `origin_off` (80) + 8 reserved bytes
+  (88..95). The origin triple names the (ds, ino, off) at which
+  the AEAD ciphertext was first encrypted; both reflink-siblings
+  reconstruct AD from origin (rather than live ds/ino/off) so
+  AEGIS-256 verify succeeds across the share. Spec replaces
+  `LiveReplicasDisjoint` with `SharedReplicasAreCohabit`: paddr-
+  share legitimate ONLY when the whole replica set + gen + key_id
+  + origin tuple matches (catches partial overlap + whole-share-
+  with-mismatched-tuple); new `OriginConsistentInBounds`
+  (origin_off + len ≤ MaxFileBlocks). New extent.tla::Reflink
+  action, new `BuggyReflinkRotatesOrigin` variant, new
+  `reflink_rotates_origin_buggy.cfg` (fires at depth 4 / 595
+  states). New `DisableReflink` cfg toggle keeps extent.cfg's
+  bumped bounds (838,164 states / ~1m wall) tractable;
+  extent_keyids.cfg now exercises Reflink with MaxDatasets=2
+  (~3.6M states / ~4m wall). C-impl AD reconstruction at
+  read / scrub / send paths sources from `rec.origin_*` instead
+  of live identity; `send_extent_meta` gains origin fields so the
+  per-extent send wire (post-snapshot capture) reconstructs the
+  same AD as the live read path. ex_validate_shadow's cross-
+  record disjointness replaced with cohabit classification (any-
+  share → must be whole-set + matching gen + key_id + origin
+  tuple, else STM_ECORRUPT). Cross-dataset reflinks deferred per
+  ARCH §11.12.3 same-key requirement; refused with new STM_EXDEV
+  error code (-18). 7 new test_extent_index unit tests + 9 new
+  test_fs integration tests; test_extent_index 62 → 69; test_fs
+  42 → 52 (post-R48 P1-1 regression); test_send_recv +1 (post-R48
+  P0-1 regression). 34 ctest suites green default + ASan + TSan
+  in isolated runs (-j2).
+  R48 fold: P0-1 added `link_gen` field (separate creation-gen
+  vs AEAD-gen) so incremental send catches reflinks in (S_from,
+  S_to]; P1-1 made `sync_drop_paddr_locked` refcount-aware so
+  reflink + snap + dual-overwrite no longer hits R33 P2 single-
+  ownership; P2-1 rewrote Phase 3 rollback to walk the snapshot
+  directly (no leak on delete_file failure); P2-2 added origin_off
+  + dlen overflow check at decode; P3-1 + P3-2 stale comment +
+  dead variable. link_gen uses the v17 reserved bytes 88..95;
+  format-fold within v17, STM_UB_VERSION stays 17. extent_keyids
+  .cfg state space 3.6M → 8.7M (~2.4x), still tractable at ~12m
+  wall under TLC.**
+  Prior: P7-15 repair-log persistence `c02cba8` + R47 close
+  `82fe30e` + hash fixup `c6d9717`.
   **P7-15 repair-log persistence — closes R38 P3-1 (the long-
   deferred audit gap from P7-6 noting that the production scrub
   β cb's replica rewrites had no on-disk audit trail per ARCH
@@ -199,8 +250,9 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   `73019c4` (UB v13 → v14, `extent_txg` field). P7-7 send/recv
   MVP `1122d32`. P7-6 replica-list extension `a958af6` (UB v12
   → v13). Phase 5 tagged `phase-5-complete` at `461e68e`.
-  Spec posture: **20 modules / 24 fixed configs / 24 buggy demos**
-  (added `extent_keyids.cfg`; no new buggy cfg in P7-10).
+  Spec posture: **20 modules / 24 fixed configs / 25 buggy demos**
+  (added `reflink_rotates_origin_buggy.cfg` in P7-16; the prior
+  `extent_keyids.cfg` fixed cfg is unchanged at 24).
 - **Phases**: 1–5 complete; Phase 6 namespace layer feature-
   complete; **Phase 7 progressing**.
   Spec scaffolds: P6-1 (bptr.tla) `032db86`; P6-2 (dataset.tla)

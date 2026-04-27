@@ -185,6 +185,55 @@ into the CAS tier (which DOES need P6) is a separate concern.
       gen filter is best-effort because `snapshot.created_txg` and
       `sync.current_gen` are independent counters — closed in P7-8.
       No format break in P7-7; STM_UB_VERSION stays at 13.
+- [x] **P7-16 reflinks** — landed at `76ce44f`; R48 close
+      `1951f65`. Closes ARCH §11.12 (FICLONE-shape reflinks) at
+      v1 MVP scope: same-dataset whole-file reflinks. New public
+      API `stm_fs_reflink(fs, src_ds, src_ino, dst_ds, dst_ino)`
+      bundles a 3-phase composition under sync->lock: collect src
+      extents via `stm_extent_iter_ds`, bump `stm_alloc_ref` on every
+      replica paddr, insert reflinked records via
+      `stm_extent_reflink` with origin INHERITED from src. Format
+      break STM_UB_VERSION 16 → 17: extent on-disk value 64 → 96
+      bytes adding `origin_dataset_id` (offset 64) +
+      `origin_ino` (72) + `origin_off` (80) + 8 reserved bytes
+      (88..95). The origin triple names the (ds, ino, off) at which
+      the AEAD ciphertext was first encrypted; both reflink-siblings
+      reconstruct AD from origin (rather than live ds/ino/off) so
+      AEGIS-256 verify succeeds across the share. Spec replaces
+      `LiveReplicasDisjoint` with `SharedReplicasAreCohabit`:
+      paddr-share legitimate ONLY when whole replica set + gen +
+      key_id + origin tuple matches (catches partial overlap +
+      whole-share-with-mismatched-tuple). New extent.tla::Reflink
+      action + `BuggyReflinkRotatesOrigin` variant + cfg
+      (`reflink_rotates_origin_buggy.cfg`) fires at depth 4 / 595
+      states. New `OriginConsistentInBounds` invariant
+      (origin_off + len ≤ MaxFileBlocks). New `DisableReflink` cfg
+      toggle keeps the bumped extent.cfg bounds (838,164 states /
+      ~1m wall) tractable; extent_keyids.cfg now exercises Reflink
+      at smaller bounds with MaxDatasets=2 (~3.6M states / ~4m
+      wall). All 5 prior buggy cfgs updated with DisableReflink=
+      TRUE and still fire as designed. C-impl AD reconstruction at
+      read / scrub / send paths sources from `rec.origin_*` instead
+      of live identity; send_extent_meta gains origin fields so the
+      per-extent send wire (post-snapshot capture) reconstructs the
+      same AD as the live read path. ex_validate_shadow's
+      cross-record disjointness replaced with cohabit
+      classification. Cross-dataset reflinks deferred per ARCH
+      §11.12.3 same-key requirement; refused with new STM_EXDEV
+      error code (-18). 7 new test_extent_index unit tests + 9 new
+      test_fs integration tests + 2 R48 regression tests
+      (incremental_send_includes_reflink_in_window for P0-1,
+      fs_reflink_snap_dual_overwrite_no_wedge for P1-1);
+      test_extent_index 62 → 69; test_fs 42 → 52; test_send_recv
+      +1. R48 fold: P0-1 added `link_gen` field at v17 offset 88
+      (separate from AEAD `gen`; send filter uses link_gen so
+      reflinks in (S_from, S_to] are emitted); P1-1 refcount-aware
+      `sync_drop_paddr_locked` (DecRef-only when refcount > 1, no
+      dead-list capture); P2-1 Phase 3 rollback rewrite (no leak
+      on delete_file failure); P2-2 origin_off+dlen overflow check
+      at decode. STM_UB_VERSION stays 17 (link_gen folds into the
+      v17 reserved bytes). 34 ctest suites green default + ASan
+      + TSan in isolated runs.
 - [x] **P7-15 repair-log persistence** — landed at `c02cba8`;
       R47 close `82fe30e` (0 P0 + 0 P1 + 1 P2 + 5 P3). Closes
       the long-deferred R38 P3-1 (since P7-6) for the on-disk
@@ -586,9 +635,9 @@ into the CAS tier (which DOES need P6) is a separate concern.
       of bptr.tla — full replica-walk + rewrite awaits extent
       record's replica-list extension.
 - [ ] CAS tier — pending; needs extent layer + integration.
-- [ ] Send / recv — pending; needs extent layer + birth-txg from
-      snapshots (already in place from P6).
-- [ ] Reflinks — pending; needs extent layer + refcount-bump path.
+- [x] Send / recv — landed P7-7 (`a42d84d`).
+- [x] Reflinks — landed P7-16 (`76ce44f`); cross-dataset deferred
+      per ARCH §11.12.3 same-key requirement.
 - [ ] Migration engine — pending; needs CAS tier.
 
 ## ROADMAP §10.2 exit criteria

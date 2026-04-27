@@ -48,9 +48,13 @@ stm_status stm_extent_index_verify         (idx);
 Same shape + semantics as the snapshot module's persistence API.
 `load_at` runs the structural validator (`ex_validate_shadow`):
 rejects extents with overlapping ranges within the same `(ds, ino)`,
-extents that share a paddr (live-paddr PaddrFreshness violation),
-extents with zero ds / ino / paddr / len, and any decode-format
-violation.
+extents whose replica sets share a paddr WITHOUT also matching whole-
+set + (gen, key_id, origin_*) tuple — i.e., extent.tla::
+SharedReplicasAreCohabit (P7-16; replaces the prior strict
+LiveReplicasDisjoint). Legitimate reflink-siblings are accepted;
+partial overlap or whole-share-with-mismatched-origin is refused.
+Extents with zero ds / ino / paddr / len, zero origin fields, and
+any decode-format violation are also refused.
 
 Idempotent commit: when `dirty == false` AND a prior commit's root
 exists, `_commit` returns the cached `(paddr, csum)` without on-
@@ -96,6 +100,12 @@ stm_status stm_extent_truncate_into  (idx, ds, ino, new_size,           /* P7-12
                                          *out_n_dropped);
 stm_status stm_extent_delete_file    (idx, ds, ino,
                                          **out_dropped_paddrs, *out_n_dropped);
+stm_status stm_extent_reflink        (idx, dst_ds, dst_ino,            /* P7-16 */
+                                         dst_off, len,
+                                         paddrs, n_paddrs,
+                                         gen, key_id,
+                                         origin_dataset_id,
+                                         origin_ino, origin_off);
 ```
 
 All run under an internal `PTHREAD_MUTEX_ERRORCHECK` mutex. Same
@@ -125,6 +135,26 @@ the production POSIX-shape entry point.
 
 `Truncate` and `DeleteFile` use the same out-arg shape as `Overwrite`:
 caller owns the malloc'd dropped-paddr array.
+
+**P7-16** adds the `Reflink` action — extent.tla::Reflink at the
+C-impl boundary. `stm_extent_reflink(idx, dst_ds, dst_ino, dst_off,
+len, paddrs, n_paddrs, gen, key_id, origin_dataset_id, origin_ino,
+origin_off)` inserts a NEW extent record at `(dst_ds, dst_ino,
+dst_off)` that REUSES the supplied paddr set + gen + key_id +
+origin tuple. The caller (sync layer's `stm_sync_reflink`) MUST
+have already bumped allocator refcounts on each paddr — this API
+only inserts the record. `cohabit_check_locked` enforces
+extent.tla::SharedReplicasAreCohabit at insert time: a paddr can
+appear in another live record ONLY when the whole replica set +
+gen + key_id + origin tuple matches; partial overlap or whole-
+share-with-mismatched-tuple is refused with STM_EEXIST. Refusals
+also include zero (dst_ds, dst_ino, origin_ds, origin_ino), zero
+or invalid replica set, dst-overlap with an existing extent, and
+write_gen > current_txg. The dst record's origin is CALLER-
+PROVIDED so the sync layer can pass the SRC's origin (legitimate
+inheritance) — passing dst's live identity instead is the buggy
+"rotates origin" pattern that the spec's
+`BuggyReflinkRotatesOrigin` variant + cfg models.
 
 **P7-12** adds two paired APIs for fault-free truncate composition:
 
@@ -215,7 +245,7 @@ by `(ino, type, offset)`; the unified MVP here is structurally
 compatible (no semantic divergence). Migration to per-file or per-
 dataset trees is incremental.
 
-### Value (64 bytes; P7-6 / v13 layout)
+### Value (96 bytes; P7-16 / v17 layout)
 
 ```
 off  size  field
@@ -229,8 +259,12 @@ off  size  field
  48    4   dlen             (le32) — logical byte length
  52    4   clen_and_comp    (le32) — low 24: stored length; high 8: comp algo
  56    8   key_id           (le64) — P7-10: per-dataset DEK key_id
-                                     (was xxh in v13/v14, always 0 since
-                                     AEAD tag is integrity; v15 repurposes)
+ 64    8   origin_dataset_id (le64) — P7-16: AEAD-AD identity binding;
+                                       != 0 (sentinel guard)
+ 72    8   origin_ino       (le64) — P7-16: AEAD-AD identity; != 0
+ 80    8   origin_off       (le64) — P7-16: AEAD-AD identity
+ 88    8   reserved         (zero) — anti-tamper; future per-extent
+                                     integrity slot
 ```
 
 Each extent stores up to `STM_EXTENT_MAX_REPLICAS=4` paddrs; unused
@@ -238,7 +272,9 @@ slots are zero (sentinel). `paddrs[0]` is the canonical "base" paddr
 used for AEAD nonce (`paddr_0 || gen || pool_uuid`); other replicas
 hold bytewise-identical ciphertext+tag. The decoder enforces:
 n_replicas ∈ [1, 4]; paddrs[0..n) all non-zero; paddrs[n..4) all
-zero; pairwise distinctness within the replica set.
+zero; pairwise distinctness within the replica set; origin_*
+sentinel-non-zero (origin_dataset_id != 0 AND origin_ino != 0);
+bytes [88..95] all-zero.
 
 `key_id` (P7-10): names which DEK in the dataset's keyschema
 (`(dataset_id, key_id)`) decrypts the extent. The sync layer's
@@ -256,6 +292,22 @@ mounted under v15 would have `key_id=0` everywhere (semantically
 keyschemas don't carry per-dataset DEKs at all, so the version
 check at the uberblock layer rejects the mount before the value
 layer is reached.
+
+`origin_dataset_id` / `origin_ino` / `origin_off` (P7-16): name the
+(ds, ino, off) at which the AEAD ciphertext was first encrypted.
+Used by AD reconstruction at read / scrub / send — both reflink-
+siblings sharing the same paddrs reconstruct the SAME AEAD AD
+(invariant via extent.tla::SharedReplicasAreCohabit) so AEGIS-256
+verify succeeds. For non-reflinked extents origin equals the live
+(dataset_id, ino, off) — the prior write/read-path semantics are
+unchanged. `stm_extent_write` / `_overwrite` stamp origin = current
+(ds, ino, off); `stm_extent_reflink` inherits origin from the src
+extent so siblings share. Tampering with origin requires defeating
+the metadata-tree (btnode) AEAD; the field is no weaker than the
+live (dataset_id, ino, off) was for non-reflinked extents. Decoder
+rejects `origin_dataset_id == 0` OR `origin_ino == 0` (sentinel
+guard) with STM_ECORRUPT; bytes 88..95 must be all-zero (anti-
+tamper).
 
 MVP caps:
 - `len` must fit in 24 bits (≤ 0xFFFFFF; ~16 MiB-1) so both `dlen`

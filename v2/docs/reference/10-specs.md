@@ -39,11 +39,11 @@ chapter as specs get wider cross-reference tables).
 | `property.tla` | 6 | Per-dataset property inheritance — local override / inheritable walk / non-inheritable + immutable-at-create. | 1040 states, depth 11 (MaxDatasets=2, 3 props, 2 values) | `property_inherit_non_inh_buggy.cfg`, `property_mutate_immutable_buggy.cfg` |
 | `clone.tla` | 6 | Clone (writable snapshot) lifecycle — clone-from-snap + snap-with-clones-undeletable + promote-breaks-dependency. | 161 states, depth 11 (MaxDatasets=3, MaxSnaps=2) | `clone_delete_snap_with_clones_buggy.cfg` |
 | `dead_list.tla` | 6 | Block-level reachability + per-snapshot dead-list incremental maintenance during COW + ZFS-style SnapDelete (free-unique + merge-surviving-into-pred). | 5656 states, depth 15 (MaxBlocks=4, MaxSnaps=3) | `dead_list_overwrite_forgets_buggy.cfg`, `dead_list_delete_forgets_free_buggy.cfg`, `dead_list_merge_includes_freed_buggy.cfg` |
-| `extent.tla` | 7 | Per-(dataset, ino) extent layout — Write / Overwrite / Truncate / DeleteFile / AdvanceTxg + no-overlap-within-ino + length-positive + birth-txg-bound + paddr-freshness + replica sets per extent (P7-6) + live-replicas-disjoint + Truncate partial-shrink under fresh replicas (P7-9) + key_id stamp on every extent (P7-10). | extent.cfg: 838164 states, depth 7 (MaxDatasets=1, MaxInos=2, MaxFileBlocks=3, MaxPaddrs=5, MaxTxg=1, MaxReplicasPerExtent=2, MaxKeyIds=1; bound bumped P7-9 for branch-(b) coverage). extent_keyids.cfg: 67304 states, depth 7 (MaxFileBlocks=2, MaxPaddrs=4, MaxKeyIds=2; P7-10 spanning-rotation coverage). | `extent_overlap_buggy.cfg`, `extent_zero_length_buggy.cfg`, `extent_overwrite_forgets_drop_buggy.cfg`, `extent_replica_collision_buggy.cfg` |
+| `extent.tla` | 7 | Per-(dataset, ino) extent layout — Write / Overwrite / Truncate / DeleteFile / AdvanceTxg + Reflink (P7-16) + no-overlap-within-ino + length-positive + birth-txg-bound + paddr-freshness + replica sets per extent (P7-6) + Truncate partial-shrink under fresh replicas (P7-9) + key_id stamp on every extent (P7-10) + origin triple per extent + SharedReplicasAreCohabit + OriginConsistentInBounds (P7-16). | extent.cfg: 838164 states, depth 7 (MaxDatasets=1, MaxInos=2, MaxFileBlocks=3, MaxPaddrs=5, MaxTxg=1, MaxReplicasPerExtent=2, MaxKeyIds=1, DisableReflink=TRUE; preserves P7-9 partial-shrink coverage). extent_keyids.cfg: ~3.6M states, depth 18 (MaxDatasets=2, MaxFileBlocks=2, MaxPaddrs=4, MaxKeyIds=2, DisableReflink=FALSE; P7-10 spanning-rotation × P7-16 reflink coverage). | `extent_overlap_buggy.cfg`, `extent_zero_length_buggy.cfg`, `extent_overwrite_forgets_drop_buggy.cfg`, `extent_replica_collision_buggy.cfg`, `reflink_rotates_origin_buggy.cfg` (P7-16) |
 
 All 24 fixed configs green (one per module + `scrub_beta` +
 `scrub_durable` + `scrub_beta_durable` extending `scrub.tla` +
-`extent_keyids.cfg` extending `extent.tla`). All 24 buggy configs
+`extent_keyids.cfg` extending `extent.tla`). All 25 buggy configs
 reproduce their designed invariant violations.
 
 ## Per-module invariants
@@ -933,27 +933,53 @@ Actions:
   otherwise share a nonce. The C impl realizes this via
   `stm_sync_truncate` (read+decrypt+re-encrypt+drop-route).
 - `DeleteFile(ds, ino)` — drop all extents for (ds, ino).
+- `Reflink(src, dst_ds, dst_ino, dst_off)` — **P7-16**: insert a
+  copy of source extent `src` at `(dst_ds, dst_ino, dst_off)`
+  inheriting `replicas`, `gen`, `key_id`, AND `origin_*` from
+  src. Preconditions: `src ∈ extents`, `dst_off + src.len ≤
+  MaxFileBlocks`, `<dst_ds, dst_ino> ≠ <src.ds, src.ino>`, no
+  dst overlap. `used_paddrs` UNCHANGED — Reflink reuses existing
+  paddrs without issuing new ones. Allocator refcount bumps on
+  shared paddrs are an `allocator.tla` concern; extent.tla just
+  records the sharing. Toggleable via the `DisableReflink` cfg
+  constant for state-space-bounded configs.
 - `AdvanceTxg` — bump current_txg.
 
 Invariants:
 
-- `TypeOK`.
+- `TypeOK` (now includes `origin_dataset_id ∈ DatasetIds`,
+  `origin_ino ∈ InoIds`, `origin_off ∈ FileOffsets`; P7-16).
 - `NoOverlapWithinIno` — load-bearing: two distinct extents in
   the same (ds, ino) cannot cover overlapping byte ranges.
   Reads must resolve to ≤ 1 extent.
 - `LengthPositive` — every extent has `len ≥ 1`.
 - `BirthTxgBound` — every extent's `gen ≤ current_txg`.
 - `AllExtentsInBounds` — `off + len ≤ MaxFileBlocks`.
-- `PaddrFreshness` — every extent's paddr is in `used_paddrs`.
-  The monotonic-grow property of `used_paddrs` + the `paddr ∉
-  used_paddrs` precondition on Write/Overwrite imply no two
-  extents share a paddr at any time.
+- `PaddrFreshness` — every extent's replica paddrs are in
+  `used_paddrs`. The monotonic-grow property + the `replicas ∩
+  used_paddrs = ∅` precondition on Write/Overwrite + Reflink's
+  `UNCHANGED used_paddrs` together preserve the invariant.
+- `SharedReplicasAreCohabit` (P7-16; replaces the prior
+  `LiveReplicasDisjoint`). Two distinct extent records sharing
+  ANY replica paddr MUST share the WHOLE replica set AND the
+  same `gen`, `key_id`, `origin_ds`, `origin_ino`, AND
+  `origin_off`. Pins legitimate-sharing pattern: a paddr in any
+  live extent can be re-referenced ONLY via reflink (whole-
+  extent inheritance), not via partial allocator-fresh handout.
+- `OriginConsistentInBounds` (P7-16) — every extent's
+  `origin_off + len ≤ MaxFileBlocks`. Origin must address a byte
+  range that fits in the origin file.
 
 CONSTANTS (bounded TLC scope):
 
 - `MaxDatasets ≥ 1`, `MaxInos ≥ 1`, `MaxFileBlocks ≥ 1`,
   `MaxPaddrs ≥ 1`, `MaxTxg ≥ 1`, `MaxReplicasPerExtent ≥ 1`,
   `MaxKeyIds ≥ 1` (P7-10).
+- `DisableReflink` (P7-16) — when TRUE, the `Reflink` action is
+  excluded from `Next`. Used to keep state-space-bumped cfgs
+  (e.g., `extent.cfg`'s P7-9 partial-shrink coverage at 838,164
+  states) tractable. Set FALSE in `extent_keyids.cfg` to
+  exercise Reflink alongside key_id rotation.
 - `BuggyWriteAllowsOverlap` — Write skips no-overlap
   precondition. `NoOverlapWithinIno` fires.
 - `BuggyZeroLength` — Write allows `len = 0`. `LengthPositive`
@@ -961,7 +987,13 @@ CONSTANTS (bounded TLC scope):
 - `BuggyOverwriteForgetsDrop` — Overwrite inserts the new without
   dropping overlapping olds. `NoOverlapWithinIno` fires.
 - `BuggyReplicaPaddrCollision` — Write skips replica freshness
-  check. `LiveReplicasDisjoint` fires (P7-6).
+  check. `SharedReplicasAreCohabit` fires (because partial
+  overlap is rejected; P7-6 + P7-16 invariant strengthening).
+- `BuggyReflinkRotatesOrigin` (P7-16) — Reflink mutates origin
+  to dst's live identity (`origin_* = (dst_ds, dst_ino,
+  dst_off)`) instead of inheriting from src. Two extents end up
+  with the same `replicas` but mismatched `origin_*`.
+  `SharedReplicasAreCohabit` fires.
 
 P7-10: every extent stamps `key_id ∈ KeyIds` (default `MaxKeyIds=1`
 in extent.cfg keeps the P7-9 partial-shrink coverage at 838164
@@ -978,7 +1010,6 @@ Out of scope:
 
 - Compression metadata (`se_clen_and_comp`).
 - Per-extent integrity (xxHash3 / AEAD tag).
-- Reflinks / refcount-share (Phase 7 §10.4).
 - CAS / cold tier (Phase 7 §10.1, separate spec).
 - Coalescing (quality-of-implementation).
 - Cross-spec composition with key_schema.tla (modeled at C
