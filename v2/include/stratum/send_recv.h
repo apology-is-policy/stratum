@@ -90,6 +90,33 @@
  * non-zero from_snap_id should treat the result as a best-effort
  * lower bound and post-process at the application layer.
  *
+ * MVP caveat — stale-paddr during long sends (R39 P3-1): send_init
+ * snapshots `paddrs[0..n_replicas-1]` at the time of the call. If
+ * the source pool runs `stm_sync_commit` while the send is in
+ * flight AND the source overwrites the snapshotted extent AND the
+ * commit reaps the prior paddrs from PENDING to FREE AND a fresh
+ * write reuses the paddr at a new gen, the next `stm_send_next`
+ * for that extent reads bytes encrypted under a different
+ * (paddr, gen) pair — AEAD verify fails with STM_EBADTAG. The
+ * failure is clean (no silent corruption) but interrupts the
+ * send. To avoid this on busy source pools, callers should either
+ * (a) pause writes during send, or (b) snapshot the source first
+ * (the snapshot's tree_root captures a stable view; future
+ * snap-bounded incremental sends will source from the snapshot).
+ *
+ * MVP caveat — recv durability (R39 P3-2): a successful
+ * `stm_recv_finish` returns STM_OK once HEADER + every EXTENT +
+ * END have been applied AND the END's csum verifies. The applied
+ * extents are written to disk via `stm_sync_write_extent` (which
+ * encrypts + bdev_writes) but are NOT durable until the next
+ * `stm_sync_commit`. A host crash between `stm_recv_finish` and
+ * the next sync-level commit loses every received extent; on
+ * remount the extent index restores from the previously-committed
+ * root. Callers MUST call `stm_sync_commit` (or the higher-level
+ * fs-commit equivalent) before declaring the recv durable.
+ * Future work: have `stm_recv_finish` issue an internal commit
+ * before returning OK, gated by a flag.
+ *
  * Out of scope (future chunks):
  *   - Nested dataset (recursive send).
  *   - Resumable receive (mid-stream checkpoint).
@@ -129,6 +156,15 @@ typedef enum {
 #define STM_SEND_EXTENT_META_LEN 32u
 /* END body length (BLAKE3 csum). */
 #define STM_SEND_END_BODY_LEN    32u
+
+/* Upper bound on a single record's full bytes (framing + body) — used
+ * by recv to reject hostile/oversized records up front before any
+ * dispatch. The largest legitimate record is an EXTENT carrying a
+ * full 128 KiB plaintext payload: 16 (framing) + 32 (meta) + 131072
+ * (plaintext) = 131120 bytes. R39 P2-3. */
+#define STM_SEND_RECORD_MAX_LEN  (STM_SEND_RECORD_HDR_LEN +              \
+                                    STM_SEND_EXTENT_META_LEN +           \
+                                    (128u * 1024u))
 
 /* ========================================================================= */
 /* Send.                                                                      */

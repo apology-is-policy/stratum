@@ -172,6 +172,16 @@ stm_status stm_recv_apply(stm_recv_handle *h,
                              size_t record_len)
 {
     if (!h || !record_bytes || record_len == 0) return STM_EINVAL;
+    /* R39 P2-3: cap the maximum record size up front. Any legitimate
+     * record is ≤ STM_SEND_RECORD_MAX_LEN (16-byte framing + 32-byte
+     * extent meta + 128 KiB plaintext). A larger record indicates
+     * either caller framing error or a hostile stream; refuse before
+     * any per-type dispatch so callers can't be DOS'd into buffering
+     * arbitrarily large blobs. */
+    if (record_len > STM_SEND_RECORD_MAX_LEN) {
+        h->state = RECV_FAILED;
+        return STM_ECORRUPT;
+    }
     if (h->state == RECV_FAILED || h->state == RECV_DONE) return STM_EPROTOCOL;
 
     const uint8_t *p = record_bytes;

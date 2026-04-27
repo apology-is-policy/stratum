@@ -40,13 +40,17 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Internal "frozen extent record" — what we'll replay during send. */
+/* Internal "frozen extent record" — what we'll replay during send.
+ * R39 P2-1: carry the FULL replica set so send_next can fall back to
+ * a healthy replica on per-replica AEAD failure (matching the
+ * read_extent path's resilience). */
 typedef struct {
     uint64_t ino;
     uint64_t off;
     uint64_t len;
     uint64_t gen;
-    uint64_t paddr_0;          /* the canonical replica we read from */
+    uint8_t  n_replicas;       /* 1..STM_EXTENT_MAX_REPLICAS */
+    uint64_t paddrs[STM_EXTENT_MAX_REPLICAS];
 } send_extent_meta;
 
 struct stm_send_handle {
@@ -109,7 +113,13 @@ static bool send_collect_cb(const stm_extent_record *e, void *ctx_) {
     /* Filter by gen range: gen_min_excl < gen ≤ gen_max_incl. */
     if (e->gen <= h->gen_min_excl) return true;
     if (e->gen > h->gen_max_incl)  return true;
-    if (e->n_replicas < 1) return true;     /* defensive */
+    /* R39 P2-2: n_replicas == 0 indicates extent-index corruption.
+     * Refuse the send rather than silently skip — silent skip would
+     * produce an incomplete stream that recv can't detect. */
+    if (e->n_replicas < 1 || e->n_replicas > STM_EXTENT_MAX_REPLICAS) {
+        cc->err = STM_ECORRUPT;
+        return false;
+    }
 
     if (h->n_extents == h->cap_extents) {
         size_t new_cap = h->cap_extents == 0 ? 8 : h->cap_extents * 2;
@@ -119,12 +129,13 @@ static bool send_collect_cb(const stm_extent_record *e, void *ctx_) {
         h->extents     = grown;
         h->cap_extents = new_cap;
     }
-    h->extents[h->n_extents].ino     = e->ino;
-    h->extents[h->n_extents].off     = e->off;
-    h->extents[h->n_extents].len     = e->len;
-    h->extents[h->n_extents].gen     = e->gen;
-    h->extents[h->n_extents].paddr_0 = e->paddrs[0];
-    h->n_extents++;
+    send_extent_meta *m = &h->extents[h->n_extents++];
+    m->ino        = e->ino;
+    m->off        = e->off;
+    m->len        = e->len;
+    m->gen        = e->gen;
+    m->n_replicas = e->n_replicas;
+    for (uint8_t i = 0; i < e->n_replicas; i++) m->paddrs[i] = e->paddrs[i];
     return true;
 }
 
@@ -209,34 +220,18 @@ stm_status stm_send_init(stm_sync *sync,
 static stm_status emit_header_locked(stm_send_handle *h,
                                         uint8_t *out, size_t out_cap)
 {
-    /* Total: 16 (hdr) + 52 (body) = 68 bytes. */
+    /* Total: 16 (framing) + 52 (body) = 68 bytes. Layout per
+     * send_recv.h: magic + version + pool_uuid + dataset_id +
+     * from_snap_id + to_snap_id + reserved. */
     const size_t need = STM_SEND_RECORD_HDR_LEN + STM_SEND_HEADER_BODY_LEN;
     if (out_cap < need) return STM_ERANGE;
 
     write_record_hdr(out, STM_SEND_REC_HEADER, STM_SEND_HEADER_BODY_LEN);
 
     uint8_t *body = out + STM_SEND_RECORD_HDR_LEN;
-    /* Magic + version live in the first 8 bytes of the body so a recv
-     * impl that peeks at the body before parsing the framing can do
-     * a magic-check up front. */
-    put_le32(body + 0, STM_SEND_MAGIC);
-    put_le32(body + 4, STM_SEND_VERSION);
+    memset(body, 0, STM_SEND_HEADER_BODY_LEN);
 
     const uint64_t *puuid = stm_pool_uuid(stm_sync_pool(h->sync));
-    put_le64(body + 8,  puuid[0]);
-    put_le64(body + 16, puuid[1]);
-    /* Body offsets shift since we put magic+version first; remap to
-     * the doc's layout: pool_uuid lives at body[0..16); we shift. */
-    /* Actually let's just lay it out per docstring: pool_uuid first.
-     * Magic+version don't fit in the docstring layout — those live
-     * in the framing's `flags` field is awkward. Simpler: redefine
-     * to put magic+version in the framing-flags.
-     *
-     * Hmm. Let me redo: put magic+version as the FIRST two le32s in
-     * the body, then pool_uuid + dataset_id + ... So body grows by 8.
-     * Update STM_SEND_HEADER_BODY_LEN if needed. */
-    /* Reset body: lay out per (magic, version, pool_uuid, ds, fr, to, txg). */
-    memset(body, 0, STM_SEND_HEADER_BODY_LEN);
     put_le32(body + 0,  STM_SEND_MAGIC);
     put_le32(body + 4,  STM_SEND_VERSION);
     put_le64(body + 8,  puuid[0]);
@@ -244,7 +239,7 @@ static stm_status emit_header_locked(stm_send_handle *h,
     put_le64(body + 24, h->dataset_id);
     put_le64(body + 32, h->from_snap_id);
     put_le64(body + 40, h->to_snap_id);
-    /* body offset 48..52 reserved zero (already memset). */
+    /* body offset 48..52 reserved zero. */
 
     stm_blake3_update(h->hasher, out, need);
     return STM_OK;
@@ -267,13 +262,6 @@ static stm_status read_decrypt_extent_plaintext(stm_send_handle *h,
     void *cbuf = malloc(total);
     if (!cbuf) return STM_ENOMEM;
 
-    uint16_t dev = stm_paddr_device(m->paddr_0);
-    stm_bdev *bd = stm_pool_device_bdev(stm_sync_pool(h->sync), dev);
-    if (!bd) { free(cbuf); return STM_EINVAL; }
-    uint64_t boff = stm_paddr_offset(m->paddr_0) * (uint64_t)STM_UB_SIZE;
-    stm_status rs = stm_bdev_read(bd, boff, cbuf, total);
-    if (rs != STM_OK) { free(cbuf); return rs; }
-
     /* AEAD AD — same shape as stm_sync_write_extent. */
     stm_ad_extent ad;
     memset(&ad, 0, sizeof ad);
@@ -287,13 +275,35 @@ static stm_status read_decrypt_extent_plaintext(stm_send_handle *h,
     ad.offset       = m->off;
     ad.content_kind = 0;
 
-    size_t pt_out = 0;
-    stm_status ds = stm_extent_decrypt(mode, stm_sync_metadata_key(h->sync),
-                                          m->paddr_0, m->gen,
-                                          &ad, cbuf, total,
-                                          out_plain, m->len, &pt_out);
+    /* R39 P2-1: walk every replica until one AEAD-decrypts cleanly,
+     * mirroring sync.c's stm_sync_read_extent. AEAD nonce is canonical
+     * `(paddrs[0], gen)` regardless of which replica's bytes we
+     * sourced, because all replicas were encrypted under that nonce
+     * and replicated bytewise per P7-6. A failed primary doesn't
+     * abort the send if any sibling replica is healthy. */
+    stm_status last_err = STM_EBADTAG;
+    for (uint8_t i = 0; i < m->n_replicas; i++) {
+        uint16_t dev = stm_paddr_device(m->paddrs[i]);
+        stm_bdev *bd = stm_pool_device_bdev(stm_sync_pool(h->sync), dev);
+        if (!bd) { last_err = STM_EINVAL; continue; }
+        uint64_t boff = stm_paddr_offset(m->paddrs[i]) * (uint64_t)STM_UB_SIZE;
+        stm_status rs = stm_bdev_read(bd, boff, cbuf, total);
+        if (rs != STM_OK) { last_err = rs; continue; }
+
+        size_t pt_out = 0;
+        stm_status ds = stm_extent_decrypt(mode, stm_sync_metadata_key(h->sync),
+                                              m->paddrs[0], m->gen,
+                                              &ad, cbuf, total,
+                                              out_plain, m->len, &pt_out);
+        if (ds == STM_OK) {
+            free(cbuf);
+            return STM_OK;
+        }
+        last_err = ds;
+    }
+
     free(cbuf);
-    return ds;
+    return last_err;
 }
 
 static stm_status emit_extent_locked(stm_send_handle *h,
