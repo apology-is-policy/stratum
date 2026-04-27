@@ -38,7 +38,32 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `394150a` (**P7-10 per-dataset DEKs** — every extent
+- **Tip**: post-R43-hash-fixup pending. Substantive `0a59ab2` +
+  R43 close `9af916e`.
+  **P7-11 truncate _locked atomicity refactor — `stm_sync_truncate`
+  now holds `sync->lock` across all three phases (lookup → read+
+  re-encrypt → past-extent drop + drop-route) under one acquisition.
+  Closes **R41 P3-1 case (a)** (concurrent `stm_sync_commit` between
+  Phase 2 and Phase 3 splits the on-disk view) and **R41 P3-2**
+  (scrub-flavored variant). The R41 P3-1 case (b) (Phase 3
+  `stm_extent_truncate` STM_ENOMEM after Phase 2 succeeded → partial
+  in-RAM state committable by next sync_commit) is **NOT** closed by
+  this chunk and remains documented as a deferred POSIX-atomicity
+  gap. Refactors `stm_sync_write_extent` / `stm_sync_read_extent`
+  into thin public-wrapper + internal `_locked` variant pairs;
+  Phase 2 of truncate uses the `_locked` variants under the outer
+  lock-hold. Lock-graph unchanged: `sync.lock` OUTER → `extent_idx.lock`
+  + per-device `alloc.lock` INNER. No format break, no spec change.
+  Trade-off: lock-hold extends across decrypt + encrypt + bdev I/O
+  for the crossing extent's prefix; cascades scrub-step latency
+  through the verify cb's brief s->lock takes. R43 audit: 0 P0 +
+  0 P1 + 0 P2 + 4 P3 — P3-1 (case-(b) docstring overreach) +
+  P3-3 (scrub-step throughput cascade) fixed inline via docstring
+  honesty pass; P3-2 (regression test for case (b)) deferred until
+  the case-(b) fix lands; P3-4 (pre-existing pool.rdlock omission
+  on _write/_read_extent_locked's bdev access) explicitly out of
+  scope for R43, surfaced for future-chunk pickup.**
+  Prior: `394150a` (**P7-10 per-dataset DEKs** — every extent
   now carries a `key_id` field naming which DEK in the dataset's
   keyschema decrypts it; sync resolves DEK by `(dataset_id, key_id)`
   instead of using `metadata_key`. `stm_sync_create` auto-installs

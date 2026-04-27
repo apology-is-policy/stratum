@@ -185,6 +185,33 @@ into the CAS tier (which DOES need P6) is a separate concern.
       gen filter is best-effort because `snapshot.created_txg` and
       `sync.current_gen` are independent counters — closed in P7-8.
       No format break in P7-7; STM_UB_VERSION stays at 13.
+- [x] **P7-11 truncate _locked atomicity refactor** — landed at
+      `0a59ab2`; R43 close `9af916e` (0 P0 + 0 P1 + 0 P2 + 4 P3 —
+      P3-1 docstring honesty pass + P3-3 scrub-cascade note fixed
+      inline; P3-2 regression test deferred until case-(b) fix
+      lands; P3-4 pre-existing pool.rdlock omission out of scope).
+      Refactors stm_sync_write_extent / stm_sync_read_extent into
+      public-wrapper + internal `_locked` variants, then rewrites
+      stm_sync_truncate to hold sync->lock across all three phases
+      under one acquisition. Closes **R41 P3-1 case (a)** (concurrent
+      stm_sync_commit between Phase 2 and Phase 3 splits the on-disk
+      view) and **R41 P3-2** (same gap, scrub-flavored). The R41
+      P3-1 **case (b)** (Phase 3 stm_extent_truncate ENOMEM after
+      Phase 2 succeeded → partial in-RAM state committable by next
+      sync_commit) is NOT closed by this chunk; the on-disk state
+      remains a POSIX-atomicity gap (no invariant violated; no
+      corruption hazard). Operator mitigation is to retry the
+      truncate (idempotent: second call's Phase 1 finds no crossing
+      extent and Phase 3 retries the drop). Closing case (b)
+      requires Phase 3 pre-allocation OR a true Phase 2 rollback
+      primitive on the extent_idx; deferred follow-on. Lock-graph
+      unchanged (sync.lock OUTER → extent_idx.lock + per-device
+      alloc.lock INNER; no back-edges). Lock-hold trade-off: the
+      crossing extent's decrypt + encrypt + bdev I/O all under
+      sync->lock; cascades scrub-step latency by the same window
+      via the verify cb's brief s->lock takes (no deadlock). No
+      format break, no spec change. 33 ctest suites green default
+      + ASan + TSan in isolated runs.
 - [x] **P7-10 per-dataset DEKs** — landed at `a3610f2`;
       R42 close `394150a` (0 P0 + 1 P1 + 2 P2 + 5 P3 — P1-1
       mount-fail on tampered CURRENT for any dataset_id (was only
