@@ -1009,10 +1009,15 @@ STM_TEST(fs_truncate_with_snapshot_routes_old_paddrs_to_dead_list) {
     STM_ASSERT_OK(stm_sync_truncate(s, 1, 1, 4096));
 
     /* Post-truncate: the original 8 KiB extent's paddrs are in the
-     * snap's dead-list. The shrunk prefix wrote to fresh paddrs. */
+     * snap's dead-list. The shrunk prefix wrote to FRESH paddrs
+     * (NOT in the dead-list — they're new allocations). With the
+     * default single-device profile (mirror_n=1), the dropped
+     * extent contributes exactly 1 paddr. R41 P3-3 tightens the
+     * loose `>= 1` assertion to strict `== 1` so a regression that
+     * erroneously dead-listed the FRESH prefix paddrs would fail. */
     size_t post = 0;
     STM_ASSERT_OK(stm_snapshot_dead_list_count(snap, snap_id, &post));
-    STM_ASSERT_TRUE(post >= 1);
+    STM_ASSERT_EQ(post, (size_t)1);
 
     /* Read prefix [0, 4 KiB) — kept. */
     uint8_t out[4096] = {0};

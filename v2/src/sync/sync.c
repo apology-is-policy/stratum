@@ -3898,6 +3898,14 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
      * drops the original (now superseded) and routes its paddrs
      * through dead-list / free. */
     if (has_crossing) {
+        /* R41 P3-5: defense-in-depth on rec.len before malloc. The
+         * write path enforces rec.len ≤ STM_FS_RECORDSIZE_MAX at
+         * write time; a corrupted on-disk record (or a future
+         * format-break drift) could feed an attacker-controlled
+         * malloc size. Mirrors the scrub cb's defensive check. */
+        if (rec.len == 0 || rec.len > STM_FS_RECORDSIZE_MAX) {
+            return STM_ECORRUPT;
+        }
         void *plain = malloc(rec.len);
         if (!plain) return STM_ENOMEM;
         size_t got = 0;

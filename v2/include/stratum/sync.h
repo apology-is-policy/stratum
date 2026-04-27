@@ -919,6 +919,24 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
  *     truncate-vs-concurrent-write semantics are the caller's
  *     responsibility (typical pattern: serialize at the FS layer
  *     above).
+ *   - **NOT atomic across crash / partial failure** (R41 P3-1 / P3-2):
+ *     the function is structured as Phase 1 (lookup, no lock), Phase 2
+ *     (read + write under lock-acquire/release), Phase 3 (extent_truncate
+ *     + drop-route under fresh lock-acquire/release). Three race windows:
+ *     (a) a `stm_sync_commit` between Phase 2 and Phase 3 persists the
+ *     shrunk prefix without the past-extent drops; on crash before
+ *     Phase 3 lands, the file is in a partial state (prefix shrunk,
+ *     past extents still present). (b) Phase 3's `stm_extent_truncate`
+ *     can return STM_ENOMEM after Phase 2 succeeded, leaving the same
+ *     partial state with no commit needed. (c) Phase 3's per-paddr
+ *     drop loop continues on individual `sync_drop_paddr_locked`
+ *     errors — a failed paddr is leaked (neither dead-listed nor
+ *     freed). All three windows produce on-disk states that satisfy
+ *     every load-bearing invariant (NoOverlap, PaddrFreshness,
+ *     LiveReplicasDisjoint, nonce uniqueness); the partial state is
+ *     a POSIX-atomicity gap, not a corruption hazard. Production
+ *     callers requiring atomic truncate semantics serialize at the
+ *     FS layer or batch via the planned `_locked` refactor.
  *
  * Returns:
  *   STM_OK             — truncate complete.
