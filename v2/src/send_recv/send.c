@@ -43,12 +43,16 @@
 /* Internal "frozen extent record" — what we'll replay during send.
  * R39 P2-1: carry the FULL replica set so send_next can fall back to
  * a healthy replica on per-replica AEAD failure (matching the
- * read_extent path's resilience). */
+ * read_extent path's resilience).
+ * P7-10: carry key_id so read_decrypt_extent_plaintext can resolve
+ * the source DEK via stm_sync_get_dek; receiver re-encrypts under
+ * its own pool's CURRENT key. */
 typedef struct {
     uint64_t ino;
     uint64_t off;
     uint64_t len;
     uint64_t gen;
+    uint64_t key_id;
     uint8_t  n_replicas;       /* 1..STM_EXTENT_MAX_REPLICAS */
     uint64_t paddrs[STM_EXTENT_MAX_REPLICAS];
 } send_extent_meta;
@@ -134,6 +138,7 @@ static bool send_collect_cb(const stm_extent_record *e, void *ctx_) {
     m->off        = e->off;
     m->len        = e->len;
     m->gen        = e->gen;
+    m->key_id     = e->key_id;
     m->n_replicas = e->n_replicas;
     for (uint8_t i = 0; i < e->n_replicas; i++) m->paddrs[i] = e->paddrs[i];
     return true;
@@ -284,6 +289,20 @@ static stm_status read_decrypt_extent_plaintext(stm_send_handle *h,
     ad.offset       = m->off;
     ad.content_kind = 0;
 
+    /* P7-10: resolve the source DEK by the extent's stamped key_id
+     * via stm_sync_get_dek (briefly takes sync->lock). NOT the
+     * pool-wide metadata_key — sender's key isolation must respect
+     * the dataset's key_id state. STM_ENOENT here means the key was
+     * pruned while a live extent referenced it (corruption — sweep
+     * refcount enforcement should have refused).  Surface as
+     * STM_ECORRUPT to fail the send rather than emit garbage. */
+    uint8_t dek[32];
+    stm_status ks = stm_sync_get_dek(h->sync, h->dataset_id, m->key_id, dek);
+    if (ks != STM_OK) {
+        free(cbuf);
+        return (ks == STM_ENOENT) ? STM_ECORRUPT : ks;
+    }
+
     /* R39 P2-1: walk every replica until one AEAD-decrypts cleanly,
      * mirroring sync.c's stm_sync_read_extent. AEAD nonce is canonical
      * `(paddrs[0], gen)` regardless of which replica's bytes we
@@ -300,18 +319,20 @@ static stm_status read_decrypt_extent_plaintext(stm_send_handle *h,
         if (rs != STM_OK) { last_err = rs; continue; }
 
         size_t pt_out = 0;
-        stm_status ds = stm_extent_decrypt(mode, stm_sync_metadata_key(h->sync),
+        stm_status ds = stm_extent_decrypt(mode, dek,
                                               m->paddrs[0], m->gen,
                                               &ad, cbuf, total,
                                               out_plain, m->len, &pt_out);
         if (ds == STM_OK) {
             free(cbuf);
+            stm_ct_memzero(dek, sizeof dek);
             return STM_OK;
         }
         last_err = ds;
     }
 
     free(cbuf);
+    stm_ct_memzero(dek, sizeof dek);
     return last_err;
 }
 

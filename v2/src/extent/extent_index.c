@@ -276,7 +276,7 @@ stm_status stm_extent_write(stm_extent_index *idx,
                               uint64_t dataset_id, uint64_t ino,
                               uint64_t off, uint64_t len,
                               const uint64_t *paddrs, size_t n_paddrs,
-                              uint64_t write_gen) {
+                              uint64_t write_gen, uint64_t key_id) {
     if (!idx) return STM_EINVAL;
     if (dataset_id == 0 || ino == 0) return STM_EINVAL;
     if (len == 0) return STM_EINVAL;            /* LengthPositive */
@@ -305,6 +305,7 @@ stm_status stm_extent_write(stm_extent_index *idx,
         .off = off, .len = len,
         .n_replicas = (uint8_t)n_paddrs,
         .gen = write_gen,
+        .key_id = key_id,
     };
     for (size_t i = 0; i < n_paddrs; i++) rec.paddrs[i] = paddrs[i];
     stm_status as = append_record_locked(idx, &rec);
@@ -318,7 +319,7 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
                                   uint64_t off, uint64_t len,
                                   const uint64_t *new_paddrs,
                                   size_t n_new_paddrs,
-                                  uint64_t write_gen,
+                                  uint64_t write_gen, uint64_t key_id,
                                   uint64_t **out_dropped_paddrs,
                                   size_t *out_n_dropped) {
     /* R34 P2-1: zero out-args before any early return so the header
@@ -442,6 +443,7 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
         .off = off, .len = len,
         .n_replicas = (uint8_t)n_new_paddrs,
         .gen = write_gen,
+        .key_id = key_id,
     };
     for (size_t i = 0; i < n_new_paddrs; i++) rec.paddrs[i] = new_paddrs[i];
     idx->records[idx->n_records++] = rec;
@@ -759,7 +761,7 @@ stm_status stm_extent_count_for_ino(const stm_extent_index *idx,
  * via internal dirty flag; atomic shadow swap on load_at; structural
  * validator on the loaded shadow before swap.
  *
- * P7-6 / v13 value layout (64 bytes):
+ * P7-10 / v15 value layout (64 bytes):
  *
  *   off  size  field
  *     0    1   n_replicas       (u8; 1..STM_EXTENT_MAX_REPLICAS=4)
@@ -771,7 +773,12 @@ stm_status stm_extent_count_for_ino(const stm_extent_index *idx,
  *    40    8   write_gen        (le64)
  *    48    4   dlen             (le32; logical byte length)
  *    52    4   clen_and_comp    (le32; low 24: stored len; high 8: comp)
- *    56    8   xxh              (le64; 0 in MVP — AEAD tag is integrity)
+ *    56    8   key_id           (le64; per-dataset DEK key_id; was xxh
+ *                                  in v13/v14 — always 0 there since AEAD
+ *                                  tag is integrity. The v15 decode
+ *                                  treats the bytes as key_id; v14 pools
+ *                                  fail at uberblock version check before
+ *                                  this layer is reached.)
  * ========================================================================= */
 
 #define EX_KEY_LEN              24u                          /* ds + ino + off */
@@ -830,12 +837,12 @@ static stm_status ex_encode_value(const stm_extent_record *r,
     le32 dlen      = stm_store_le32((uint32_t)r->len);
     uint32_t clen_and_comp = (uint32_t)r->len & 0x00FFFFFFu;
     le32 cac        = stm_store_le32(clen_and_comp);
-    le64 xxh        = stm_store_le64((uint64_t)0); /* AEAD-only mode */
+    le64 key_id_le  = stm_store_le64(r->key_id);
 
     memcpy(out + 40, write_gen.v, 8);
     memcpy(out + 48, dlen.v,      4);
     memcpy(out + 52, cac.v,       4);
-    memcpy(out + 56, xxh.v,       8);
+    memcpy(out + 56, key_id_le.v, 8);
     return STM_OK;
 }
 
@@ -869,12 +876,12 @@ static stm_status ex_decode_value(const uint8_t *in, size_t in_len,
         }
     }
 
-    le64 write_gen_le, xxh_le;
+    le64 write_gen_le, key_id_le;
     le32 dlen_le, cac_le;
     memcpy(write_gen_le.v, in + 40, 8);
     memcpy(dlen_le.v,      in + 48, 4);
     memcpy(cac_le.v,       in + 52, 4);
-    memcpy(xxh_le.v,       in + 56, 8);
+    memcpy(key_id_le.v,    in + 56, 8);
 
     uint32_t dlen = stm_load_le32(dlen_le);
     uint32_t cac  = stm_load_le32(cac_le);
@@ -896,8 +903,7 @@ static stm_status ex_decode_value(const uint8_t *in, size_t in_len,
         out_rec->paddrs[i] = paddrs[i];
     }
     out_rec->gen        = stm_load_le64(write_gen_le);
-    /* xxh ignored in MVP (AEAD tag is integrity). */
-    (void)xxh_le;
+    out_rec->key_id     = stm_load_le64(key_id_le);
 
     return STM_OK;
 }

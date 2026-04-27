@@ -156,21 +156,24 @@ STM_TEST(rotate_dataset_key_keyfile) {
     stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
     make_fresh_pool(d, &a, &s, &pool);
 
-    /* Add dataset 1 with key_id 0. */
+    /* P7-10: ds=1 (root) is auto-installed by sync_create. Use a
+     * fresh test dataset id (100) so the add_dataset_key path is
+     * exercised; logic is identical. */
     uint64_t kid0 = UINT64_MAX;
-    STM_ASSERT_OK(stm_sync_add_dataset_key(s, 1, make_wk(), NULL, &kid0));
+    STM_ASSERT_OK(stm_sync_add_dataset_key(s, 100, make_wk(), NULL, &kid0));
     STM_ASSERT_EQ(kid0, 0u);
 
     /* Capture its DEK for later comparison. */
     uint8_t dek_kid0[32];
-    STM_ASSERT_OK(stm_sync_get_dek(s, 1, 0, dek_kid0));
+    STM_ASSERT_OK(stm_sync_get_dek(s, 100, 0, dek_kid0));
 
     size_t deks_before = stm_sync_dek_count(s);
-    STM_ASSERT(deks_before >= 2u);   /* pool (0,0) + (1,0) minimum */
+    /* pool (0,0) + root (1,0) + test (100,0) minimum. */
+    STM_ASSERT(deks_before >= 3u);
 
-    /* Rotate ds=1 → (1, 1) becomes CURRENT, (1, 0) becomes RETIRED. */
+    /* Rotate ds=100 → (100, 1) CURRENT, (100, 0) RETIRED. */
     uint64_t new_id = UINT64_MAX, old_id = UINT64_MAX;
-    STM_ASSERT_OK(stm_sync_rotate_dataset_key(s, 1, make_wk(), NULL,
+    STM_ASSERT_OK(stm_sync_rotate_dataset_key(s, 100, make_wk(), NULL,
                                                  &new_id, &old_id));
     STM_ASSERT_EQ(new_id, 1u);
     STM_ASSERT_EQ(old_id, 0u);
@@ -179,11 +182,11 @@ STM_TEST(rotate_dataset_key_keyfile) {
     STM_ASSERT_EQ(stm_sync_dek_count(s), deks_before + 1u);
 
     uint8_t dek_new[32];
-    STM_ASSERT_OK(stm_sync_get_dek(s, 1, 1, dek_new));
+    STM_ASSERT_OK(stm_sync_get_dek(s, 100, 1, dek_new));
 
     /* Old DEK still accessible. */
     uint8_t dek_old[32];
-    STM_ASSERT_OK(stm_sync_get_dek(s, 1, 0, dek_old));
+    STM_ASSERT_OK(stm_sync_get_dek(s, 100, 0, dek_old));
     STM_ASSERT_MEM_EQ(dek_old, dek_kid0, 32);
 
     /* And the two DEKs differ. */
@@ -191,7 +194,7 @@ STM_TEST(rotate_dataset_key_keyfile) {
 
     /* A second rotation bumps to key_id 2. */
     uint64_t new_id2 = UINT64_MAX, old_id2 = UINT64_MAX;
-    STM_ASSERT_OK(stm_sync_rotate_dataset_key(s, 1, make_wk(), NULL,
+    STM_ASSERT_OK(stm_sync_rotate_dataset_key(s, 100, make_wk(), NULL,
                                                  &new_id2, &old_id2));
     STM_ASSERT_EQ(new_id2, 2u);
     STM_ASSERT_EQ(old_id2, 1u);
@@ -238,31 +241,33 @@ STM_TEST(cross_dataset_isolation) {
     stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
     make_fresh_pool(d, &a, &s, &pool);
 
+    /* P7-10: skip ds=1 (auto-installed); use ds=100/101 for an
+     * isolation test that's symmetric with the post-P7-10 layout. */
     uint64_t kid = 0;
-    STM_ASSERT_OK(stm_sync_add_dataset_key(s, 1, make_wk(), NULL, &kid));
+    STM_ASSERT_OK(stm_sync_add_dataset_key(s, 100, make_wk(), NULL, &kid));
     STM_ASSERT_EQ(kid, 0u);
-    STM_ASSERT_OK(stm_sync_add_dataset_key(s, 2, make_wk(), NULL, &kid));
+    STM_ASSERT_OK(stm_sync_add_dataset_key(s, 101, make_wk(), NULL, &kid));
     STM_ASSERT_EQ(kid, 0u);
 
-    uint8_t ds1_dek[32], ds2_dek[32];
-    STM_ASSERT_OK(stm_sync_get_dek(s, 1, 0, ds1_dek));
-    STM_ASSERT_OK(stm_sync_get_dek(s, 2, 0, ds2_dek));
-    STM_ASSERT(memcmp(ds1_dek, ds2_dek, 32) != 0);
+    uint8_t ds100_dek[32], ds101_dek[32];
+    STM_ASSERT_OK(stm_sync_get_dek(s, 100, 0, ds100_dek));
+    STM_ASSERT_OK(stm_sync_get_dek(s, 101, 0, ds101_dek));
+    STM_ASSERT(memcmp(ds100_dek, ds101_dek, 32) != 0);
 
-    /* Rotate ds=1; ds=2's CURRENT key_id stays at 0. */
+    /* Rotate ds=100; ds=101's CURRENT key_id stays at 0. */
     uint64_t new_id = 0, old_id = 0;
-    STM_ASSERT_OK(stm_sync_rotate_dataset_key(s, 1, make_wk(), NULL,
+    STM_ASSERT_OK(stm_sync_rotate_dataset_key(s, 100, make_wk(), NULL,
                                                  &new_id, &old_id));
     STM_ASSERT_EQ(new_id, 1u);
 
-    /* ds=2 unchanged — still has key 0 accessible. */
-    uint8_t ds2_after[32];
-    STM_ASSERT_OK(stm_sync_get_dek(s, 2, 0, ds2_after));
-    STM_ASSERT_MEM_EQ(ds2_after, ds2_dek, 32);
+    /* ds=101 unchanged — still has key 0 accessible. */
+    uint8_t ds101_after[32];
+    STM_ASSERT_OK(stm_sync_get_dek(s, 101, 0, ds101_after));
+    STM_ASSERT_MEM_EQ(ds101_after, ds101_dek, 32);
 
-    /* ds=2 has no key_id 1. */
+    /* ds=101 has no key_id 1. */
     uint8_t trash[32];
-    stm_status rc = stm_sync_get_dek(s, 2, 1, trash);
+    stm_status rc = stm_sync_get_dek(s, 101, 1, trash);
     STM_ASSERT_EQ(rc, STM_ENOENT);
 
     teardown(a, s, pool);
@@ -280,33 +285,34 @@ STM_TEST(sweep_removes_retired) {
     stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
     make_fresh_pool(d, &a, &s, &pool);
 
+    /* P7-10: ds=1 (root) auto-installed; use ds=100. */
     uint64_t kid = 0;
-    STM_ASSERT_OK(stm_sync_add_dataset_key(s, 1, make_wk(), NULL, &kid));
+    STM_ASSERT_OK(stm_sync_add_dataset_key(s, 100, make_wk(), NULL, &kid));
 
-    /* Rotate twice → (1, 0) RETIRED, (1, 1) RETIRED, (1, 2) CURRENT. */
+    /* Rotate twice → (100, 0) RETIRED, (100, 1) RETIRED, (100, 2) CURRENT. */
     uint64_t nid = 0, oid = 0;
-    STM_ASSERT_OK(stm_sync_rotate_dataset_key(s, 1, make_wk(), NULL, &nid, &oid));
-    STM_ASSERT_OK(stm_sync_rotate_dataset_key(s, 1, make_wk(), NULL, &nid, &oid));
+    STM_ASSERT_OK(stm_sync_rotate_dataset_key(s, 100, make_wk(), NULL, &nid, &oid));
+    STM_ASSERT_OK(stm_sync_rotate_dataset_key(s, 100, make_wk(), NULL, &nid, &oid));
 
-    /* 3 DEKs for ds=1 in RAM. */
+    /* 3 DEKs for ds=100 in RAM. */
     uint8_t dek[32];
-    STM_ASSERT_OK(stm_sync_get_dek(s, 1, 0, dek));
-    STM_ASSERT_OK(stm_sync_get_dek(s, 1, 1, dek));
-    STM_ASSERT_OK(stm_sync_get_dek(s, 1, 2, dek));
+    STM_ASSERT_OK(stm_sync_get_dek(s, 100, 0, dek));
+    STM_ASSERT_OK(stm_sync_get_dek(s, 100, 1, dek));
+    STM_ASSERT_OK(stm_sync_get_dek(s, 100, 2, dek));
 
-    /* Sweep → removes (1, 0) + (1, 1), leaves (1, 2). */
+    /* Sweep → removes (100, 0) + (100, 1), leaves (100, 2). */
     size_t pruned = 0;
-    STM_ASSERT_OK(stm_sync_keyschema_sweep(s, 1, &pruned));
+    STM_ASSERT_OK(stm_sync_keyschema_sweep(s, 100, &pruned));
     STM_ASSERT_EQ(pruned, 2u);
 
     /* Current key still accessible. */
-    STM_ASSERT_OK(stm_sync_get_dek(s, 1, 2, dek));
+    STM_ASSERT_OK(stm_sync_get_dek(s, 100, 2, dek));
     /* Retired DEKs wiped + removed. */
-    STM_ASSERT_EQ(stm_sync_get_dek(s, 1, 0, dek), STM_ENOENT);
-    STM_ASSERT_EQ(stm_sync_get_dek(s, 1, 1, dek), STM_ENOENT);
+    STM_ASSERT_EQ(stm_sync_get_dek(s, 100, 0, dek), STM_ENOENT);
+    STM_ASSERT_EQ(stm_sync_get_dek(s, 100, 1, dek), STM_ENOENT);
 
     /* Second sweep is a no-op: nothing to prune. */
-    STM_ASSERT_OK(stm_sync_keyschema_sweep(s, 1, &pruned));
+    STM_ASSERT_OK(stm_sync_keyschema_sweep(s, 100, &pruned));
     STM_ASSERT_EQ(pruned, 0u);
 
     teardown(a, s, pool);
@@ -320,19 +326,20 @@ STM_TEST(sweep_preserves_current_never_retired) {
     stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
     make_fresh_pool(d, &a, &s, &pool);
 
+    /* P7-10: ds=1 (root) auto-installed; use ds=100. */
     uint64_t kid = 0;
-    STM_ASSERT_OK(stm_sync_add_dataset_key(s, 1, make_wk(), NULL, &kid));
+    STM_ASSERT_OK(stm_sync_add_dataset_key(s, 100, make_wk(), NULL, &kid));
 
     /* Capture the CURRENT DEK. */
     uint8_t dek_cur[32];
-    STM_ASSERT_OK(stm_sync_get_dek(s, 1, 0, dek_cur));
+    STM_ASSERT_OK(stm_sync_get_dek(s, 100, 0, dek_cur));
 
     size_t pruned = 999;
-    STM_ASSERT_OK(stm_sync_keyschema_sweep(s, 1, &pruned));
+    STM_ASSERT_OK(stm_sync_keyschema_sweep(s, 100, &pruned));
     STM_ASSERT_EQ(pruned, 0u);
 
     uint8_t dek_after[32];
-    STM_ASSERT_OK(stm_sync_get_dek(s, 1, 0, dek_after));
+    STM_ASSERT_OK(stm_sync_get_dek(s, 100, 0, dek_after));
     STM_ASSERT_MEM_EQ(dek_after, dek_cur, 32);
 
     teardown(a, s, pool);
@@ -593,18 +600,19 @@ STM_TEST(keyschema_insert_wrapped_narrowed_to_current) {
      * prune (which enforce the key_schema.tla state machine). We
      * can't reach the keyschema handle directly from the sync handle,
      * but we can validate the narrowing is effective by asserting
-     * that rotate still produces RETIRED entries via its own path. */
+     * that rotate still produces RETIRED entries via its own path.
+     * P7-10: ds=1 (root) auto-installed; use ds=100 for a fresh add. */
     uint64_t kid = 0;
-    STM_ASSERT_OK(stm_sync_add_dataset_key(s, 1, make_wk(), NULL, &kid));
+    STM_ASSERT_OK(stm_sync_add_dataset_key(s, 100, make_wk(), NULL, &kid));
     uint64_t nid = 0, oid = 0;
-    STM_ASSERT_OK(stm_sync_rotate_dataset_key(s, 1, make_wk(), NULL, &nid, &oid));
+    STM_ASSERT_OK(stm_sync_rotate_dataset_key(s, 100, make_wk(), NULL, &nid, &oid));
 
-    /* (1, 0) is now RETIRED — its DEK is still in the map, reachable
+    /* (100, 0) is now RETIRED — its DEK is still in the map, reachable
      * via get_dek, proving rotate transitioned the OLD entry to
      * RETIRED without going through insert_wrapped's narrowed path. */
     uint8_t dek[32];
-    STM_ASSERT_OK(stm_sync_get_dek(s, 1, 0, dek));
-    STM_ASSERT_OK(stm_sync_get_dek(s, 1, 1, dek));
+    STM_ASSERT_OK(stm_sync_get_dek(s, 100, 0, dek));
+    STM_ASSERT_OK(stm_sync_get_dek(s, 100, 1, dek));
 
     teardown(a, s, pool);
     stm_bdev_close(d);
@@ -622,17 +630,18 @@ STM_TEST(many_rotations_exercise_dek_map_realloc) {
     stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
     make_fresh_pool(d, &a, &s, &pool);
 
+    /* P7-10: ds=1 (root) auto-installed; use ds=100. */
     uint64_t kid = 0;
-    STM_ASSERT_OK(stm_sync_add_dataset_key(s, 1, make_wk(), NULL, &kid));
+    STM_ASSERT_OK(stm_sync_add_dataset_key(s, 100, make_wk(), NULL, &kid));
 
     /* Drive the map through cap=4, 8, 16 at least. */
     for (int i = 0; i < 20; i++) {
         uint64_t nid = 0, oid = 0;
-        STM_ASSERT_OK(stm_sync_rotate_dataset_key(s, 1, make_wk(), NULL,
+        STM_ASSERT_OK(stm_sync_rotate_dataset_key(s, 100, make_wk(), NULL,
                                                      &nid, &oid));
     }
-    /* Pool + 21 ds=1 entries. */
-    STM_ASSERT_EQ((long long)stm_sync_dek_count(s), 22);
+    /* Pool (0,0) + root (1,0) + 21 ds=100 entries = 23. */
+    STM_ASSERT_EQ((long long)stm_sync_dek_count(s), 23);
 
     teardown(a, s, pool);
     stm_bdev_close(d);
@@ -711,6 +720,67 @@ STM_TEST(rotate_dataset_key_janus) {
     stm_hybrid_keys_wipe(&wk);
     tmp_rm(dir);
     free(dir);
+    unlink(g_tmp_path);
+}
+
+/* ========================================================================= */
+/* P7-10: per-dataset DEK enforcement in fs_write/_read.                       */
+/* ========================================================================= */
+
+STM_TEST(p7_10_root_dek_auto_installed_at_create) {
+    /* sync_create installs a DEK for the root dataset (id=1) so that
+     * stm_sync_write_extent on (ds=1, ...) resolves a per-dataset
+     * DEK out of the box, distinct from the pool metadata key (0,0). */
+    make_tmp("root_dek");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
+
+    /* (0,0) pool metadata key is present. */
+    uint8_t pool_dek[32];
+    STM_ASSERT_OK(stm_sync_get_dek(s, 0, 0, pool_dek));
+
+    /* (1,0) root dataset DEK is present and distinct from (0,0). */
+    uint8_t root_dek[32];
+    STM_ASSERT_OK(stm_sync_get_dek(s, 1, 0, root_dek));
+    STM_ASSERT(memcmp(pool_dek, root_dek, 32) != 0);
+
+    /* dek_count >= 2 (pool + root). */
+    STM_ASSERT(stm_sync_dek_count(s) >= 2u);
+
+    teardown(a, s, pool);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+STM_TEST(p7_10_root_dek_persists_across_mount) {
+    /* Reopening the pool re-hydrates the root DEK via the unwrap iter;
+     * post-mount stm_sync_get_dek(s, 1, 0, ...) succeeds. */
+    make_tmp("root_dek_persist");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
+
+    uint8_t root_dek_before[32];
+    STM_ASSERT_OK(stm_sync_get_dek(s, 1, 0, root_dek_before));
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    teardown(a, s, pool);
+    stm_bdev_close(d);
+
+    d = open_fresh_device();
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
+    stm_pool *pool2 = make_test_pool(d);
+    stm_sync *s2 = NULL;
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
+
+    uint8_t root_dek_after[32];
+    STM_ASSERT_OK(stm_sync_get_dek(s2, 1, 0, root_dek_after));
+    STM_ASSERT_MEM_EQ(root_dek_before, root_dek_after, 32);
+
+    teardown(a2, s2, pool2);
+    stm_bdev_close(d);
     unlink(g_tmp_path);
 }
 

@@ -188,6 +188,12 @@ typedef struct {
     uint8_t  n_replicas;                          /* 1..STM_EXTENT_MAX_REPLICAS */
     uint64_t paddrs[STM_EXTENT_MAX_REPLICAS];     /* valid 0..n_replicas-1 */
     uint64_t gen;                                 /* write_gen; nonce uniqueness */
+    /* P7-10: key_id of the dataset DEK that AEAD-encrypted the extent.
+     * Resolved at read time via stm_sync_get_dek(dataset_id, key_id).
+     * key_id 0 is the dataset's first DEK; rotation advances by 1.
+     * Stored on disk at value offset 56 (le64), repurposing the always-
+     * zero `xxh` slot from v14. extent.tla::ExtentRec.key_id (typed). */
+    uint64_t key_id;
 } stm_extent_record;
 
 struct stm_extent_index;
@@ -258,7 +264,7 @@ stm_status stm_extent_write(stm_extent_index *idx,
                               uint64_t dataset_id, uint64_t ino,
                               uint64_t off, uint64_t len,
                               const uint64_t *paddrs, size_t n_paddrs,
-                              uint64_t write_gen);
+                              uint64_t write_gen, uint64_t key_id);
 
 /*
  * COW overwrite: drop every live extent of (ds, ino) overlapping
@@ -292,7 +298,7 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
                                   uint64_t off, uint64_t len,
                                   const uint64_t *new_paddrs,
                                   size_t n_new_paddrs,
-                                  uint64_t write_gen,
+                                  uint64_t write_gen, uint64_t key_id,
                                   uint64_t **out_dropped_paddrs,
                                   size_t *out_n_dropped);
 

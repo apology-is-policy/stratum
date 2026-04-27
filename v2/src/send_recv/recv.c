@@ -10,10 +10,19 @@
  *
  * The first record MUST be HEADER. Subsequent EXTENT records are
  * dispatched to stm_sync_write_extent on the target dataset (which
- * re-encrypts under the receiver pool's metadata_key with fresh paddrs
- * — no nonce reuse hazard across pools). The final END record carries
- * a BLAKE3 csum over every prior record's framing+body bytes; recv
- * computes its own running hash and rejects on mismatch.
+ * P7-10: re-encrypts under the receiver pool's CURRENT DEK for the
+ * target dataset_id — fresh paddrs + receiver-side key_id; no nonce
+ * reuse hazard across pools, no key sharing across pools). The final
+ * END record carries a BLAKE3 csum over every prior record's framing
+ * + body bytes; recv computes its own running hash and rejects on
+ * mismatch.
+ *
+ * Operator preconditions for receive: the target_dataset_id MUST
+ * already have a CURRENT DEK in the receiver's keyschema. The root
+ * dataset (id=1) is provisioned at sync_create; other datasets need
+ * the operator to call stm_sync_add_dataset_key before stm_recv_init.
+ * Without that, stm_sync_write_extent returns STM_ENOENT for every
+ * EXTENT record and recv reports STM_ENOENT to the caller.
  *
  * Errors are sticky: once recv enters STATE_FAILED, all subsequent
  * apply / finish calls return STM_EPROTOCOL.

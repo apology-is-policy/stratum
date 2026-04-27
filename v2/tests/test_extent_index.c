@@ -41,14 +41,17 @@ static void free_dropped(uint64_t **paddrs, size_t *n) {
 /* P7-6: wrappers that adapt the existing single-paddr tests to the
  * new replica-set API. Each takes a single paddr and forwards as a
  * 1-element replica set. New multi-replica tests below use the
- * underlying stm_extent_write / _overwrite directly. */
+ * underlying stm_extent_write / _overwrite directly.
+ * P7-10: key_id stamped at 0 by default — these unit tests exercise
+ * extent-index logic, not the per-dataset DEK lookup that lives at
+ * the sync layer. Key-id-aware coverage lives in test_keyschema_*. */
 #define EX_WRITE1(idx, ds, ino, off, len, p, gen)                  \
     stm_extent_write((idx), (ds), (ino), (off), (len),             \
-                        (uint64_t[]){ (p) }, 1u, (gen))
+                        (uint64_t[]){ (p) }, 1u, (gen), /*key_id=*/0)
 #define EX_OVERWRITE1(idx, ds, ino, off, len, p, gen, drp, n_drp)  \
     stm_extent_overwrite((idx), (ds), (ino), (off), (len),         \
                             (uint64_t[]){ (p) }, 1u, (gen),         \
-                            (drp), (n_drp))
+                            /*key_id=*/0, (drp), (n_drp))
 
 /* ------------------------------------------------------------------ */
 /* Lifecycle.                                                          */
@@ -1106,7 +1109,7 @@ STM_TEST(ex_write_multi_replica_basic) {
     STM_ASSERT_OK(stm_extent_index_create(0, &idx));
 
     uint64_t replicas[2] = { 0xAA, 0xBB };
-    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, replicas, 2, 0));
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, replicas, 2, 0, /*key_id=*/0));
 
     stm_extent_record e;
     STM_ASSERT_OK(stm_extent_lookup_at(idx, 1, 1, 0, &e));
@@ -1131,7 +1134,7 @@ STM_TEST(ex_write_rejects_within_set_collision) {
     stm_extent_index *idx = NULL;
     STM_ASSERT_OK(stm_extent_index_create(0, &idx));
     uint64_t bad[2] = { 0xAA, 0xAA };
-    STM_ASSERT_ERR(stm_extent_write(idx, 1, 1, 0, 4096, bad, 2, 0),
+    STM_ASSERT_ERR(stm_extent_write(idx, 1, 1, 0, 4096, bad, 2, 0, /*key_id=*/0),
                        STM_EINVAL);
     stm_extent_index_close(idx);
 }
@@ -1140,7 +1143,7 @@ STM_TEST(ex_write_rejects_zero_paddr_in_set) {
     stm_extent_index *idx = NULL;
     STM_ASSERT_OK(stm_extent_index_create(0, &idx));
     uint64_t bad[2] = { 0xAA, 0 };  /* paddrs[1] is the sentinel */
-    STM_ASSERT_ERR(stm_extent_write(idx, 1, 1, 0, 4096, bad, 2, 0),
+    STM_ASSERT_ERR(stm_extent_write(idx, 1, 1, 0, 4096, bad, 2, 0, /*key_id=*/0),
                        STM_EINVAL);
     stm_extent_index_close(idx);
 }
@@ -1152,11 +1155,12 @@ STM_TEST(ex_write_rejects_zero_or_oversized_replica_count) {
     for (size_t i = 0; i < sizeof r / sizeof r[0]; i++)
         r[i] = 0xAA + (uint64_t)i;
     /* n=0: ReplicasNonEmpty fires. */
-    STM_ASSERT_ERR(stm_extent_write(idx, 1, 1, 0, 4096, r, 0, 0),
+    STM_ASSERT_ERR(stm_extent_write(idx, 1, 1, 0, 4096, r, 0, 0, /*key_id=*/0),
                        STM_EINVAL);
     /* n > MAX: ReplicaCountBounded fires. */
     STM_ASSERT_ERR(stm_extent_write(idx, 1, 1, 0, 4096, r,
-                                      STM_EXTENT_MAX_REPLICAS + 1u, 0),
+                                      STM_EXTENT_MAX_REPLICAS + 1u, 0,
+                                      /*key_id=*/0),
                        STM_EINVAL);
     stm_extent_index_close(idx);
 }
@@ -1168,14 +1172,14 @@ STM_TEST(ex_write_rejects_replica_collision_across_extents) {
     STM_ASSERT_OK(stm_extent_index_create(0, &idx));
 
     uint64_t e1[2] = { 0xAA, 0xBB };
-    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, e1, 2, 0));
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, e1, 2, 0, /*key_id=*/0));
     /* Different (ds, ino) but reusing 0xBB → collision. */
     uint64_t e2[2] = { 0xCC, 0xBB };
-    STM_ASSERT_ERR(stm_extent_write(idx, 2, 2, 0, 4096, e2, 2, 0),
+    STM_ASSERT_ERR(stm_extent_write(idx, 2, 2, 0, 4096, e2, 2, 0, /*key_id=*/0),
                        STM_EEXIST);
     /* Fully fresh paddrs → OK. */
     uint64_t e3[2] = { 0xCC, 0xDD };
-    STM_ASSERT_OK(stm_extent_write(idx, 2, 2, 0, 4096, e3, 2, 0));
+    STM_ASSERT_OK(stm_extent_write(idx, 2, 2, 0, 4096, e3, 2, 0, /*key_id=*/0));
 
     stm_extent_index_close(idx);
 }
@@ -1186,13 +1190,13 @@ STM_TEST(ex_overwrite_drops_full_replica_set) {
     STM_ASSERT_OK(stm_extent_index_create(0, &idx));
 
     uint64_t old[3] = { 0xAA, 0xBB, 0xCC };
-    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, old, 3, 0));
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, old, 3, 0, /*key_id=*/0));
 
     uint64_t new_r[2] = { 0xDD, 0xEE };
     uint64_t *dropped = NULL;
     size_t    n_dropped = 0;
     STM_ASSERT_OK(stm_extent_overwrite(idx, 1, 1, 0, 4096,
-                                          new_r, 2, 0,
+                                          new_r, 2, 0, /*key_id=*/0,
                                           &dropped, &n_dropped));
     STM_ASSERT_EQ(n_dropped, (size_t)3);   /* all 3 old replicas */
     /* All three old paddrs appear in the dropped set. */
@@ -1224,14 +1228,14 @@ STM_TEST(ex_overwrite_rejects_cycle_via_any_replica) {
     STM_ASSERT_OK(stm_extent_index_create(0, &idx));
 
     uint64_t old[2] = { 0xAA, 0xBB };
-    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, old, 2, 0));
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, old, 2, 0, /*key_id=*/0));
 
     /* New set's [0] matches old's [1] — cycle. */
     uint64_t new_cycle[2] = { 0xBB, 0xCC };
     uint64_t *dropped = NULL;
     size_t    n_dropped = 0;
     STM_ASSERT_ERR(stm_extent_overwrite(idx, 1, 1, 0, 4096,
-                                           new_cycle, 2, 0,
+                                           new_cycle, 2, 0, /*key_id=*/0,
                                            &dropped, &n_dropped),
                        STM_EINVAL);
     STM_ASSERT_TRUE(dropped == NULL);
@@ -1248,8 +1252,8 @@ STM_TEST(ex_truncate_returns_full_replica_set_for_each_dropped) {
 
     uint64_t r1[2] = { 0xAA, 0xBB };
     uint64_t r2[2] = { 0xCC, 0xDD };
-    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0,    4096, r1, 2, 0));
-    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 4096, 4096, r2, 2, 0));
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0,    4096, r1, 2, 0, /*key_id=*/0));
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 4096, 4096, r2, 2, 0, /*key_id=*/0));
 
     /* Truncate to 4096 — drops the second extent (off >= 4096). */
     uint64_t *dropped = NULL;
@@ -1295,13 +1299,17 @@ STM_TEST(ex_persist_multi_replica_roundtrip) {
     STM_ASSERT_OK(stm_extent_index_set_crypt_ctx(idx, key, pool_uuid,
                                                      device_uuid));
 
-    /* Three extents, varying replica counts. */
+    /* Three extents, varying replica counts; distinct key_ids
+     * verify the new field round-trips through encode/decode. */
     uint64_t r1[1] = { 0x100 };
     uint64_t r2[2] = { 0x200, 0x201 };
     uint64_t r3[3] = { 0x300, 0x301, 0x302 };
-    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0,    4096, r1, 1, 0));
-    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 4096, 4096, r2, 2, 0));
-    STM_ASSERT_OK(stm_extent_write(idx, 1, 2, 0,    8192, r3, 3, 0));
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0,    4096, r1, 1, 0,
+                                      /*key_id=*/0));
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 4096, 4096, r2, 2, 0,
+                                      /*key_id=*/3));
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 2, 0,    8192, r3, 3, 0,
+                                      /*key_id=*/0xAABBCCDD));
 
     uint64_t root_paddr = 0;
     uint8_t  root_csum[32];
@@ -1316,22 +1324,25 @@ STM_TEST(ex_persist_multi_replica_roundtrip) {
                                                      device_uuid));
     STM_ASSERT_OK(stm_extent_index_load_at(idx2, root_paddr, /*gen=*/1, root_csum));
 
-    /* Verify replica counts + paddrs survived. */
+    /* Verify replica counts + paddrs + key_ids survived. */
     stm_extent_record e;
     STM_ASSERT_OK(stm_extent_lookup_at(idx2, 1, 1, 0, &e));
     STM_ASSERT_EQ((int)e.n_replicas, 1);
     STM_ASSERT_EQ(e.paddrs[0], (uint64_t)0x100);
+    STM_ASSERT_EQ(e.key_id, (uint64_t)0);
 
     STM_ASSERT_OK(stm_extent_lookup_at(idx2, 1, 1, 4096, &e));
     STM_ASSERT_EQ((int)e.n_replicas, 2);
     STM_ASSERT_EQ(e.paddrs[0], (uint64_t)0x200);
     STM_ASSERT_EQ(e.paddrs[1], (uint64_t)0x201);
+    STM_ASSERT_EQ(e.key_id, (uint64_t)3);
 
     STM_ASSERT_OK(stm_extent_lookup_at(idx2, 1, 2, 0, &e));
     STM_ASSERT_EQ((int)e.n_replicas, 3);
     STM_ASSERT_EQ(e.paddrs[0], (uint64_t)0x300);
     STM_ASSERT_EQ(e.paddrs[1], (uint64_t)0x301);
     STM_ASSERT_EQ(e.paddrs[2], (uint64_t)0x302);
+    STM_ASSERT_EQ(e.key_id, (uint64_t)0xAABBCCDD);
 
     stm_extent_index_close(idx2);
     stm_bootstrap_close(b);

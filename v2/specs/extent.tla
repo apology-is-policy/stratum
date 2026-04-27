@@ -86,6 +86,7 @@
 (*   - MaxPaddrs ≥ 1 — bound on paddr namespace.                            *)
 (*   - MaxTxg ≥ 1 — bound on transaction-group counter.                     *)
 (*   - MaxReplicasPerExtent ≥ 1 — upper bound on |extent.replicas|.        *)
+(*   - MaxKeyIds ≥ 1 — upper bound on key_id stamped on extents (P7-10).   *)
 (*                                                                           *)
 (*   Buggy variants (FALSE in fixed config; TRUE in buggy demos). Each is *)
 (*   designed to fire in the bounded model:                                  *)
@@ -101,6 +102,19 @@
 (*   - BuggyReplicaPaddrCollision (P7-6) — Write doesn't check that the    *)
 (*     new extent's replica set is disjoint from existing live extents'    *)
 (*     replicas. LiveReplicasDisjoint fires.                                 *)
+(*                                                                           *)
+(* Per-dataset DEK key stamp (P7-10):                                       *)
+(*                                                                           *)
+(*   Every extent carries a `key_id ∈ KeyIds` field naming which DEK       *)
+(*   in the dataset's keyschema (key_schema.tla) decrypts the extent. The   *)
+(*   field is metadata in extent.tla — its load-bearing invariants live    *)
+(*   in key_schema.tla (PruneSafety, MonotonicKeyIds, etc.). extent.tla     *)
+(*   pins only typing: every extent's key_id is in KeyIds. The composition  *)
+(*   between this spec's `extents` set and key_schema.tla's `refs` map is   *)
+(*   enforced at the C boundary by `stm_sync_keyschema_sweep` (refuses to   *)
+(*   prune a key with live extents) — see ROADMAP §10 / phase7-status.md   *)
+(*   §P7-10. Modeling the cross-spec composition would require a unified   *)
+(*   schema-and-extents spec; we keep the responsibility split for now.    *)
 (***************************************************************************)
 
 EXTENDS Naturals, FiniteSets
@@ -112,6 +126,7 @@ CONSTANTS
     MaxPaddrs,
     MaxTxg,
     MaxReplicasPerExtent,
+    MaxKeyIds,
     BuggyWriteAllowsOverlap,
     BuggyZeroLength,
     BuggyOverwriteForgetsDrop,
@@ -123,6 +138,7 @@ ASSUME MaxFileBlocks       \in (Nat \ {0})
 ASSUME MaxPaddrs           \in (Nat \ {0})
 ASSUME MaxTxg              \in (Nat \ {0})
 ASSUME MaxReplicasPerExtent \in (Nat \ {0})
+ASSUME MaxKeyIds           \in (Nat \ {0})
 ASSUME BuggyWriteAllowsOverlap     \in BOOLEAN
 ASSUME BuggyZeroLength             \in BOOLEAN
 ASSUME BuggyOverwriteForgetsDrop   \in BOOLEAN
@@ -135,6 +151,7 @@ LengthsPos  == 1..MaxFileBlocks
 LengthsZ    == 0..MaxFileBlocks         \* including zero, used by BuggyZeroLength
 Paddrs      == 1..MaxPaddrs
 Gens        == 0..MaxTxg
+KeyIds      == 0..(MaxKeyIds - 1)       \* P7-10: per-dataset DEK key_id
 
 \* Replica sets — non-empty subsets of Paddrs bounded by MaxReplicasPerExtent.
 ReplicaSets ==
@@ -144,7 +161,7 @@ ReplicaSets ==
 
 ExtentRec ==
     [ds: DatasetIds, ino: InoIds, off: FileOffsets, len: LengthsZ,
-     replicas: ReplicaSets, gen: Gens]
+     replicas: ReplicaSets, gen: Gens, key_id: KeyIds]
 
 VARIABLES
     extents,        \* SUBSET ExtentRec — the in-memory extent map.
@@ -197,13 +214,14 @@ OverlappingIn(ds, ino, off, len) ==
 (* Effect: insert extent stamped with current_txg. used_paddrs grows by      *)
 (* `replicas`.                                                                *)
 (***************************************************************************)
-Write(ds, ino, off, len, replicas) ==
+Write(ds, ino, off, len, replicas, key_id) ==
     /\ ds \in DatasetIds
     /\ ino \in InoIds
     /\ off \in FileOffsets
     /\ len \in LengthsZ
     /\ off + len <= MaxFileBlocks
     /\ replicas \in ReplicaSets
+    /\ key_id \in KeyIds
     /\ \/ BuggyReplicaPaddrCollision
        \/ replicas \cap used_paddrs = {}     \* allocator freshness
     /\ \/ BuggyZeroLength
@@ -212,7 +230,7 @@ Write(ds, ino, off, len, replicas) ==
        \/ OverlappingIn(ds, ino, off, len) = {}
     /\ extents' = extents \union
         {[ds |-> ds, ino |-> ino, off |-> off, len |-> len,
-          replicas |-> replicas, gen |-> current_txg]}
+          replicas |-> replicas, gen |-> current_txg, key_id |-> key_id]}
     /\ used_paddrs' = used_paddrs \union replicas
     /\ UNCHANGED current_txg
 
@@ -223,13 +241,14 @@ Write(ds, ino, off, len, replicas) ==
 (* dead_list.tla::OverwriteBlock — for each dropped extent, EVERY paddr in *)
 (* its replica set is routed through `stm_snapshot_index_overwrite_block`. *)
 (***************************************************************************)
-Overwrite(ds, ino, off, len, new_replicas) ==
+Overwrite(ds, ino, off, len, new_replicas, key_id) ==
     /\ ds \in DatasetIds
     /\ ino \in InoIds
     /\ off \in FileOffsets
     /\ len \in LengthsPos                  \* Overwrite always len ≥ 1.
     /\ off + len <= MaxFileBlocks
     /\ new_replicas \in ReplicaSets
+    /\ key_id \in KeyIds
     /\ \/ BuggyReplicaPaddrCollision
        \/ new_replicas \cap used_paddrs = {}
     /\ extents' =
@@ -238,7 +257,7 @@ Overwrite(ds, ino, off, len, new_replicas) ==
           ELSE extents \ OverlappingIn(ds, ino, off, len))
          \union
          {[ds |-> ds, ino |-> ino, off |-> off, len |-> len,
-           replicas |-> new_replicas, gen |-> current_txg]}
+           replicas |-> new_replicas, gen |-> current_txg, key_id |-> key_id]}
     /\ used_paddrs' = used_paddrs \union new_replicas
     /\ UNCHANGED current_txg
 
@@ -276,14 +295,15 @@ Truncate(ds, ino, new_size) ==
        \/ /\ crossing = {}
           /\ extents' = extents \ past_extents
           /\ UNCHANGED used_paddrs
-       \/ \E e \in crossing, new_replicas \in ReplicaSets :
+       \/ \E e \in crossing, new_replicas \in ReplicaSets,
+              new_key_id \in KeyIds :
               /\ new_replicas \cap used_paddrs = {}
               /\ extents' =
                   (extents \ (past_extents \cup crossing))
                   \cup {[ds |-> ds, ino |-> ino, off |-> e.off,
                          len |-> new_size - e.off,
                          replicas |-> new_replicas,
-                         gen |-> current_txg]}
+                         gen |-> current_txg, key_id |-> new_key_id]}
               /\ used_paddrs' = used_paddrs \cup new_replicas
     /\ UNCHANGED current_txg
 
@@ -309,11 +329,11 @@ AdvanceTxg ==
 (***************************************************************************)
 Next ==
     \/ \E ds \in DatasetIds, ino \in InoIds, off \in FileOffsets,
-        len \in LengthsZ, replicas \in ReplicaSets :
-            Write(ds, ino, off, len, replicas)
+        len \in LengthsZ, replicas \in ReplicaSets, key_id \in KeyIds :
+            Write(ds, ino, off, len, replicas, key_id)
     \/ \E ds \in DatasetIds, ino \in InoIds, off \in FileOffsets,
-        len \in LengthsPos, replicas \in ReplicaSets :
-            Overwrite(ds, ino, off, len, replicas)
+        len \in LengthsPos, replicas \in ReplicaSets, key_id \in KeyIds :
+            Overwrite(ds, ino, off, len, replicas, key_id)
     \/ \E ds \in DatasetIds, ino \in InoIds, n \in 0..MaxFileBlocks :
         Truncate(ds, ino, n)
     \/ \E ds \in DatasetIds, ino \in InoIds : DeleteFile(ds, ino)

@@ -546,8 +546,12 @@ STM_TEST(fs_io_cross_mount_durability) {
     uint8_t plain[8192];
     for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)((i * 7) & 0xFF);
 
-    STM_ASSERT_OK(stm_fs_write(fs, 42, 99, 0,    plain,        4096));
-    STM_ASSERT_OK(stm_fs_write(fs, 42, 99, 4096, plain + 4096, 4096));
+    /* P7-10: only ds=1 (root) has an auto-installed DEK; non-root
+     * datasets need stm_sync_add_dataset_key first. The fs layer
+     * doesn't yet expose that — see ROADMAP §10 for the planned
+     * fs_create_dataset that bundles dataset_index + keyschema. */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 99, 0,    plain,        4096));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 99, 4096, plain + 4096, 4096));
     STM_ASSERT_OK(stm_fs_commit(fs));
     STM_ASSERT_OK(stm_fs_unmount(fs));
 
@@ -555,9 +559,9 @@ STM_TEST(fs_io_cross_mount_durability) {
     STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
     uint8_t out[8192] = {0};
     size_t got = 0;
-    STM_ASSERT_OK(stm_fs_read(fs, 42, 99, 0,    out,        4096, &got));
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 99, 0,    out,        4096, &got));
     STM_ASSERT_EQ(got, (size_t)4096);
-    STM_ASSERT_OK(stm_fs_read(fs, 42, 99, 4096, out + 4096, 4096, &got));
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 99, 4096, out + 4096, 4096, &got));
     STM_ASSERT_EQ(got, (size_t)4096);
     STM_ASSERT_MEM_EQ(plain, out, sizeof out);
 
@@ -600,17 +604,18 @@ STM_TEST(fs_io_multi_extent_per_ino) {
     memset(b, 0xB2, sizeof b);
     memset(c, 0xC3, sizeof c);
 
-    STM_ASSERT_OK(stm_fs_write(fs, 7, 13, 0,        a, sizeof a));
-    STM_ASSERT_OK(stm_fs_write(fs, 7, 13, 4096,     b, sizeof b));
-    STM_ASSERT_OK(stm_fs_write(fs, 7, 13, 8192,     c, sizeof c));
+    /* P7-10: ds=1 (root) is the only auto-installed dataset. */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 13, 0,        a, sizeof a));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 13, 4096,     b, sizeof b));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 13, 8192,     c, sizeof c));
 
     uint8_t out[4096] = {0};
     size_t got = 0;
-    STM_ASSERT_OK(stm_fs_read(fs, 7, 13, 0,    out, sizeof out, &got));
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 13, 0,    out, sizeof out, &got));
     STM_ASSERT_MEM_EQ(a, out, sizeof a);
-    STM_ASSERT_OK(stm_fs_read(fs, 7, 13, 4096, out, sizeof out, &got));
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 13, 4096, out, sizeof out, &got));
     STM_ASSERT_MEM_EQ(b, out, sizeof b);
-    STM_ASSERT_OK(stm_fs_read(fs, 7, 13, 8192, out, sizeof out, &got));
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 13, 8192, out, sizeof out, &got));
     STM_ASSERT_MEM_EQ(c, out, sizeof c);
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
@@ -670,12 +675,14 @@ STM_TEST(fs_io_scrub_production_cb_verifies_extents) {
     stm_fs *fs = NULL;
     STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
 
-    /* Three 4-KiB extents — one per (ds, ino, off). */
+    /* Three 4-KiB extents — one per (ds, ino, off). P7-10: stays
+     * within ds=1 (root) since other datasets need explicit DEK
+     * installation. The verify-cb test exercises ino-multiplicity. */
     uint8_t buf[4096];
     for (size_t i = 0; i < sizeof buf; i++) buf[i] = (uint8_t)(i & 0xFF);
     STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0,    buf, sizeof buf));
     STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 4096, buf, sizeof buf));
-    STM_ASSERT_OK(stm_fs_write(fs, 2, 7, 0,    buf, sizeof buf));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 7, 0,    buf, sizeof buf));
 
     /* Install cb on a fresh scrub handle. */
     stm_sync *sync = stm_fs_sync_for_test(fs);
@@ -1046,6 +1053,171 @@ STM_TEST(fs_truncate_args_validated) {
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
+}
+
+/* ========================================================================= */
+/* P7-10: per-dataset DEK round-trip + rotation + sweep refcount.              */
+/* ========================================================================= */
+
+STM_TEST(fs_io_per_dataset_dek_rotation_roundtrip) {
+    /* Write under k=0, rotate, write under k=1; both extents stay
+     * decryptable because the read path resolves DEK by the extent's
+     * stamped key_id (NOT the dataset's CURRENT). */
+    make_tmp("dek_rot");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Write 4 KiB at off=0 under k=0 (the auto-installed root DEK). */
+    uint8_t a[4096], b[4096];
+    memset(a, 0xA1, sizeof a);
+    memset(b, 0xB2, sizeof b);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, a, sizeof a));
+
+    /* Rotate the root dataset's DEK → new CURRENT is key_id=1; existing
+     * extent at off=0 still references key_id=0 (RETIRED). */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    STM_ASSERT_TRUE(sync != NULL);
+    stm_hybrid_keys wk;
+    STM_ASSERT_OK(stm_keyfile_load(g_key_path, &wk));
+    uint64_t new_id = 0, old_id = 0;
+    STM_ASSERT_OK(stm_sync_rotate_dataset_key(sync, 1, &wk, NULL,
+                                                 &new_id, &old_id));
+    STM_ASSERT_EQ(new_id, 1u);
+    STM_ASSERT_EQ(old_id, 0u);
+
+    /* Write 4 KiB at off=4096 under the new k=1. */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 4096, b, sizeof b));
+
+    /* Read back: extent at 0 decrypts under k=0 (RETIRED but reachable);
+     * extent at 4096 decrypts under k=1. */
+    uint8_t out[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0,    out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(a, out, sizeof a);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 4096, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(b, out, sizeof b);
+
+    stm_hybrid_keys_wipe(&wk);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_keyschema_sweep_refuses_prune_with_extent_refs) {
+    /* sweep refuses to prune a RETIRED key while any live extent
+     * still references that (dataset_id, key_id). Closes the
+     * key_schema.tla::PruneSafety invariant at the C-impl boundary. */
+    make_tmp("sweep_refs");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Write under k=0, then rotate. (1, 0) is RETIRED with one ref. */
+    uint8_t buf[4096];
+    memset(buf, 0xC3, sizeof buf);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, buf, sizeof buf));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_hybrid_keys wk;
+    STM_ASSERT_OK(stm_keyfile_load(g_key_path, &wk));
+    uint64_t nid = 0, oid = 0;
+    STM_ASSERT_OK(stm_sync_rotate_dataset_key(sync, 1, &wk, NULL, &nid, &oid));
+
+    /* Sweep — refuses because (1, 0) has one live extent ref. */
+    size_t pruned = 99;
+    STM_ASSERT_OK(stm_sync_keyschema_sweep(sync, 1, &pruned));
+    STM_ASSERT_EQ(pruned, 0u);
+    /* Old DEK still in RAM. */
+    uint8_t dek[32];
+    STM_ASSERT_OK(stm_sync_get_dek(sync, 1, 0, dek));
+
+    stm_hybrid_keys_wipe(&wk);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_keyschema_sweep_succeeds_after_overwrite_drops_ref) {
+    /* Same setup, then overwrite the extent (drops the (1, 0) ref).
+     * Sweep now prunes (1, 0). */
+    make_tmp("sweep_after_ow");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t buf[4096];
+    memset(buf, 0xC3, sizeof buf);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, buf, sizeof buf));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_hybrid_keys wk;
+    STM_ASSERT_OK(stm_keyfile_load(g_key_path, &wk));
+    uint64_t nid = 0, oid = 0;
+    STM_ASSERT_OK(stm_sync_rotate_dataset_key(sync, 1, &wk, NULL, &nid, &oid));
+
+    /* Overwrite at off=0 → drops the old extent (referenced k=0)
+     * and inserts a new one referencing k=1. */
+    uint8_t buf2[4096];
+    memset(buf2, 0xD4, sizeof buf2);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, buf2, sizeof buf2));
+
+    /* Sweep — (1, 0) has no extent refs; pruned. */
+    size_t pruned = 0;
+    STM_ASSERT_OK(stm_sync_keyschema_sweep(sync, 1, &pruned));
+    STM_ASSERT_EQ(pruned, 1u);
+
+    /* Old DEK no longer in RAM. */
+    uint8_t dek[32];
+    STM_ASSERT_EQ(stm_sync_get_dek(sync, 1, 0, dek), STM_ENOENT);
+
+    /* New extent still readable under CURRENT k=1. */
+    uint8_t out[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(buf2, out, sizeof buf2);
+
+    stm_hybrid_keys_wipe(&wk);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_io_unprovisioned_dataset_id_refused) {
+    /* fs_write on a dataset_id that has no DEK installed must return
+     * STM_ENOENT, NOT silently encrypt under a fallback key. The fs
+     * layer doesn't yet expose a fs_create_dataset that bundles the
+     * keyschema install — until it does, only ds=1 (root) writes work
+     * out of the box. This test pins the explicit-failure contract. */
+    make_tmp("dek_unprov");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t buf[4096] = {0};
+    /* ds=42 has no DEK — refuse. */
+    STM_ASSERT_ERR(stm_fs_write(fs, 42, 1, 0, buf, sizeof buf), STM_ENOENT);
+
+    /* Provision ds=42 → write succeeds. */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_hybrid_keys wk;
+    STM_ASSERT_OK(stm_keyfile_load(g_key_path, &wk));
+    uint64_t kid = 0;
+    STM_ASSERT_OK(stm_sync_add_dataset_key(sync, 42, &wk, NULL, &kid));
+    STM_ASSERT_OK(stm_fs_write(fs, 42, 1, 0, buf, sizeof buf));
+
+    stm_hybrid_keys_wipe(&wk);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
 }
 
 STM_TEST_MAIN("fs")

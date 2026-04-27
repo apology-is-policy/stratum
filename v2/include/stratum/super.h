@@ -196,8 +196,21 @@ extern "C" {
  * filter was best-effort only. v13 pools' 48-byte fixed-prefix
  * snapshot values would be length-rejected by the v14 decoder
  * (52-byte fixed prefix); refused via STM_EBADVERSION at mount.
+ * Format break, no feature flag.
+ *
+ * v15 (P7-10, 2026-04): per-dataset DEK enforcement on extents.
+ * Extent record gains a `key_id` field (8 bytes le64 at on-disk
+ * value offset 56, repurposing the always-zero `xxh` slot from v14)
+ * naming which DEK in the dataset's keyschema was used to encrypt
+ * the extent. stm_sync_write_extent / _read_extent now resolve the
+ * DEK via (dataset_id, key_id) instead of using the per-pool
+ * metadata_key. v14 pools' 64-byte extent values would decode under
+ * v15 with key_id=0 (legacy xxh field is zero), but we don't shim
+ * the meaning: v15 demands the dataset's keyschema have an entry at
+ * key_id=0 for every dataset that owns extents, which v14 pools do
+ * NOT — STM_EBADVERSION at mount.
  * Format break, no feature flag. */
-#define STM_UB_VERSION        14u
+#define STM_UB_VERSION        15u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */

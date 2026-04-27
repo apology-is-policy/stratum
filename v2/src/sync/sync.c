@@ -59,6 +59,10 @@
  * `stm_sync_add_dataset_key` and rotate freely. */
 #define STM_SYNC_POOL_DATASET_ID   UINT64_C(0)
 #define STM_SYNC_POOL_KEY_ID       UINT64_C(0)
+/* Root dataset id (P7-10). Mirrors stm_dataset_index's seeded root
+ * entry. sync_create installs this dataset's first DEK as a regular
+ * keyschema entry; subsequent datasets are added by callers. */
+#define STM_SYNC_ROOT_DATASET_ID   UINT64_C(1)
 
 /* Per-(dataset_id, key_id) DEK slot. 32-byte DEK lives in RAM only;
  * the on-disk byte is its wrapped form inside the keyschema entry. */
@@ -1062,6 +1066,27 @@ stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
      * STM_EINVAL is impossible because extent_idx->current_txg=0 and
      * s->current_gen=1; advance is strictly increasing. */
     (void)stm_extent_index_advance_txg(s->extent_idx, s->current_gen);
+
+    /* P7-10: auto-install the root dataset's DEK at format time so
+     * stm_sync_write_extent on (ds=1, ...) resolves to a
+     * dataset-specific key out of the box. The dataset index seeds
+     * with id=1 (root), so this is the matching key-schema entry.
+     * Pools that later add datasets >= 2 must call
+     * stm_sync_add_dataset_key themselves; the root dataset is the
+     * sync_create-managed exception (analogous to ds=0 metadata key).
+     * Janus path: stm_sync_create currently only accepts wk, so this
+     * always uses the keyfile wrap path. */
+    {
+        uint64_t root_kid = 0;
+        stm_status rs = stm_sync_add_dataset_key(s,
+                                                   STM_SYNC_ROOT_DATASET_ID,
+                                                   wk, /*janus=*/NULL,
+                                                   &root_kid);
+        if (rs != STM_OK) { stm_sync_close(s); return rs; }
+        /* root_kid is 0 by construction (first DEK for the fresh
+         * dataset); read paths assume key_id=0 for the root pool's
+         * pre-rotation extents. */
+    }
 
     *out_sync = s;
     return STM_OK;
@@ -3448,6 +3473,39 @@ static int sweep_collect_cb(uint64_t dataset_id, uint64_t key_id,
     return 0;
 }
 
+/* P7-10: ref-count callback. ctx points at a (dataset_id-implicit
+ * via the iter scope, key_id, *count) tuple; cb increments count for
+ * every extent whose key_id matches. */
+typedef struct {
+    uint64_t want_key_id;
+    size_t   count;
+} extent_ref_count_ctx;
+
+static bool extent_ref_count_cb(const stm_extent_record *e, void *ctx_)
+{
+    extent_ref_count_ctx *c = ctx_;
+    if (e->key_id == c->want_key_id) c->count++;
+    return true;  /* continue */
+}
+
+/* Walk extent_idx for `dataset_id` and count live extents stamped
+ * with `key_id`. Caller MUST hold s->lock. */
+static size_t sync_extent_refs_for_key_locked(stm_sync *s,
+                                                 uint64_t dataset_id,
+                                                 uint64_t key_id)
+{
+    if (!s->extent_idx) return 0;
+    extent_ref_count_ctx c = { .want_key_id = key_id, .count = 0 };
+    /* iter_ds returns STM_OK on completion or ENOMEM on a temporary
+     * sort-buffer alloc fail. On ENOMEM we fall back to "assume
+     * non-zero refs" (refuse the prune) — safer than skipping the
+     * check. */
+    stm_status rc = stm_extent_iter_ds(s->extent_idx, dataset_id,
+                                          extent_ref_count_cb, &c);
+    if (rc != STM_OK) return SIZE_MAX;
+    return c.count;
+}
+
 stm_status stm_sync_keyschema_sweep(stm_sync *s,
                                       uint64_t dataset_id,
                                       size_t *out_pruned_count)
@@ -3477,9 +3535,24 @@ stm_status stm_sync_keyschema_sweep(stm_sync *s,
     size_t pruned = 0;
     for (size_t i = 0; i < col.count; i++) {
         uint64_t kid = col.keys[i];
-        /* RETIRED → PRUNING. Phase 4 has no extent layer referencing
-         * these keys, so the precondition (refs == 0) is trivially
-         * satisfied. */
+
+        /* P7-10: refuse to prune a RETIRED key while any live extent
+         * still references (dataset_id, kid). This closes the
+         * key_schema.tla::PruneSafety invariant — under it, a pruned
+         * key never had outstanding refs, which the C-impl extent
+         * manager owns. The check walks the in-RAM extent index;
+         * post-mount the extent index reflects the on-disk extent
+         * tree, so the count is authoritative for live (committed
+         * + uncommitted-in-RAM) extents.
+         *
+         * Lock-order: s->lock (held) → extent_idx.lock (LEAF, taken
+         * by stm_extent_count_for_kid). Symmetric with the rest of
+         * sync's extent-index touchpoints. */
+        size_t refs = sync_extent_refs_for_key_locked(s, dataset_id, kid);
+        if (refs > 0) continue;    /* skip — operator can retry after
+                                    * extents migrate */
+
+        /* RETIRED → PRUNING. */
         stm_status ms = stm_keyschema_mark_pruning(s->keyschema,
                                                      dataset_id, kid);
         if (ms != STM_OK) continue;    /* state raced — skip */
@@ -3586,6 +3659,40 @@ static stm_status sync_drop_paddr_locked(stm_sync *s, uint64_t ds, uint64_t padd
     return STM_OK;
 }
 
+/* P7-10: resolve the dataset's CURRENT (key_id, DEK) under sync->lock.
+ * Returns STM_ENOENT if the dataset has no CURRENT entry in the
+ * keyschema (caller forgot stm_sync_add_dataset_key for ds >= 2; or
+ * the keyschema state is corrupt — propagated as ENOENT either way).
+ * Returns STM_ECORRUPT if the keyschema CURRENT exists but the DEK
+ * map slot is missing (mount unwrap failed silently for this entry —
+ * a corruption signal because sync_unwrap_cb populates every CURRENT
+ * /RETIRED entry).
+ * Caller MUST already hold s->lock. The 32-byte DEK is copied into
+ * out_dek; out_key_id receives the resolved key_id.
+ *
+ * The DEK pointer returned by sync_dek_find is borrowed for the
+ * duration of the lock window; copying into out_dek lets callers
+ * release the lock before consuming the bytes. */
+static stm_status sync_resolve_current_dek_locked(const stm_sync *s,
+                                                     uint64_t dataset_id,
+                                                     uint64_t *out_key_id,
+                                                     uint8_t out_dek[32]) {
+    uint64_t kid = 0;
+    stm_status rc = stm_keyschema_lookup_current((const stm_keyschema *)s->keyschema,
+                                                    dataset_id, &kid,
+                                                    /*out_wrapped=*/NULL,
+                                                    /*out_cap=*/0,
+                                                    /*out_len=*/NULL);
+    if (rc != STM_OK) return rc;  /* ENOENT / ECORRUPT bubble up */
+
+    sync_dek_slot *slot = sync_dek_find((stm_sync *)s, dataset_id, kid);
+    if (!slot) return STM_ECORRUPT;
+
+    *out_key_id = kid;
+    memcpy(out_dek, slot->dek, 32);
+    return STM_OK;
+}
+
 /* Determine the desired replica count from the pool's redundancy
  * profile. NONE → 1 replica. MIRROR → mirror_n replicas. Capped at
  * STM_EXTENT_MAX_REPLICAS for the on-disk slot count, and at the
@@ -3617,10 +3724,24 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
     if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
 
+    /* P7-10: resolve the dataset's CURRENT DEK + key_id. STM_ENOENT
+     * here means the caller skipped stm_sync_add_dataset_key for a
+     * non-root dataset; surface as-is so the FS layer can either
+     * provision the key or fail the write deterministically. */
+    uint64_t enc_key_id = 0;
+    uint8_t  dek[32];
+    stm_status rks = sync_resolve_current_dek_locked(s, dataset_id,
+                                                        &enc_key_id, dek);
+    if (rks != STM_OK) {
+        pthread_mutex_unlock(&s->lock);
+        return rks;
+    }
+
     /* R36 P1-3: hardcode AEGIS-256 — see read path comment. */
     stm_aead_mode mode = STM_AEAD_AEGIS256;
     size_t tag_len = stm_aead_tag_len(mode);
     if (tag_len == 0) {
+        stm_ct_memzero(dek, sizeof dek);
         pthread_mutex_unlock(&s->lock);
         return STM_EINVAL;
     }
@@ -3630,6 +3751,7 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     /* P7-6: reserve N replica paddrs across N distinct devices. */
     size_t n_replicas = sync_desired_replica_count_locked(s);
     if (n_replicas < 1) {
+        stm_ct_memzero(dek, sizeof dek);
         pthread_mutex_unlock(&s->lock);
         return STM_EINVAL;
     }
@@ -3643,6 +3765,7 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
              * Defensive abort. */
             for (size_t j = 0; j < reserved_count; j++)
                 (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
+            stm_ct_memzero(dek, sizeof dek);
             pthread_mutex_unlock(&s->lock);
             return STM_EINVAL;
         }
@@ -3650,6 +3773,7 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
         if (rs != STM_OK) {
             for (size_t j = 0; j < reserved_count; j++)
                 (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
+            stm_ct_memzero(dek, sizeof dek);
             pthread_mutex_unlock(&s->lock);
             return rs;
         }
@@ -3665,6 +3789,7 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     if (!cbuf) {
         for (size_t j = 0; j < reserved_count; j++)
             (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
+        stm_ct_memzero(dek, sizeof dek);
         pthread_mutex_unlock(&s->lock);
         return STM_ENOMEM;
     }
@@ -3681,7 +3806,13 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     ad.content_kind = 0;  /* file data */
 
     size_t out_len = 0;
-    stm_status es = stm_extent_encrypt(mode, s->metadata_key,
+    /* P7-10: encrypt under the dataset's CURRENT DEK rather than the
+     * pool-wide metadata_key. The key_id stamped on the extent record
+     * names which DEK in the dataset's keyschema decrypts the bytes
+     * — required for correctness across rotation, where the dataset's
+     * CURRENT advances to a new key_id but already-written extents
+     * stay decryptable under their original RETIRED key_id. */
+    stm_status es = stm_extent_encrypt(mode, dek,
                                           replicas[0], s->current_gen,
                                           &ad, buf, len,
                                           cbuf, total_bytes, &out_len);
@@ -3689,6 +3820,7 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
         free(cbuf);
         for (size_t j = 0; j < reserved_count; j++)
             (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
+        stm_ct_memzero(dek, sizeof dek);
         pthread_mutex_unlock(&s->lock);
         return es;
     }
@@ -3702,6 +3834,7 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
             free(cbuf);
             for (size_t j = 0; j < reserved_count; j++)
                 (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
+            stm_ct_memzero(dek, sizeof dek);
             pthread_mutex_unlock(&s->lock);
             return STM_EINVAL;
         }
@@ -3710,11 +3843,13 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
             free(cbuf);
             for (size_t j = 0; j < reserved_count; j++)
                 (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
+            stm_ct_memzero(dek, sizeof dek);
             pthread_mutex_unlock(&s->lock);
             return ws;
         }
     }
     free(cbuf);
+    stm_ct_memzero(dek, sizeof dek);
 
     /* Update the extent index with the new replica set; collect any
      * dropped paddrs (flat across each dropped extent's replicas).
@@ -3723,7 +3858,7 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     size_t    n_dropped = 0;
     stm_status os = stm_extent_overwrite(s->extent_idx, dataset_id, ino, off,
                                             len, replicas, n_replicas,
-                                            s->current_gen,
+                                            s->current_gen, enc_key_id,
                                             &dropped, &n_dropped);
     if (os != STM_OK) {
         for (size_t j = 0; j < reserved_count; j++)
@@ -3779,16 +3914,41 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
         return STM_ECORRUPT;
     }
 
+    /* P7-10: resolve the DEK by the extent's stamped key_id (NOT
+     * the dataset's CURRENT — old extents written before a rotation
+     * decrypt under their original RETIRED key_id). STM_ENOENT here
+     * means the keyschema entry was pruned while a live extent still
+     * referenced it; this is a corruption signal because
+     * stm_sync_keyschema_sweep refuses to prune keys with extent
+     * refs. Surface as STM_ECORRUPT to the caller. */
+    sync_dek_slot *rd_slot = sync_dek_find(s, dataset_id, rec.key_id);
+    if (!rd_slot) { pthread_mutex_unlock(&s->lock); return STM_ECORRUPT; }
+    uint8_t dek[32];
+    memcpy(dek, rd_slot->dek, 32);
+
     /* R36 P1-3: hardcode AEGIS-256 — see write path for rationale. */
     stm_aead_mode mode = STM_AEAD_AEGIS256;
     size_t tag_len = stm_aead_tag_len(mode);
-    if (tag_len == 0) { pthread_mutex_unlock(&s->lock); return STM_EINVAL; }
+    if (tag_len == 0) {
+        stm_ct_memzero(dek, sizeof dek);
+        pthread_mutex_unlock(&s->lock);
+        return STM_EINVAL;
+    }
 
     size_t total_bytes = rec.len + tag_len;
     void *cbuf = malloc(total_bytes);
-    if (!cbuf) { pthread_mutex_unlock(&s->lock); return STM_ENOMEM; }
+    if (!cbuf) {
+        stm_ct_memzero(dek, sizeof dek);
+        pthread_mutex_unlock(&s->lock);
+        return STM_ENOMEM;
+    }
     void *pbuf = malloc(rec.len);
-    if (!pbuf) { free(cbuf); pthread_mutex_unlock(&s->lock); return STM_ENOMEM; }
+    if (!pbuf) {
+        free(cbuf);
+        stm_ct_memzero(dek, sizeof dek);
+        pthread_mutex_unlock(&s->lock);
+        return STM_ENOMEM;
+    }
 
     stm_ad_extent ad;
     memset(&ad, 0, sizeof ad);
@@ -3821,7 +3981,7 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
         if (rs != STM_OK) { last_err = rs; continue; }
 
         size_t pt_out = 0;
-        stm_status ds = stm_extent_decrypt(mode, s->metadata_key,
+        stm_status ds = stm_extent_decrypt(mode, dek,
                                               rec.paddrs[0], rec.gen,
                                               &ad, cbuf, total_bytes,
                                               pbuf, rec.len, &pt_out);
@@ -3833,6 +3993,7 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     }
 
     free(cbuf);
+    stm_ct_memzero(dek, sizeof dek);
     if (!decrypted) {
         stm_ct_memzero(pbuf, rec.len);
         free(pbuf);
@@ -4041,6 +4202,29 @@ sync_scrub_verify_cb(uint64_t paddr, void *ctx)
     if (rec.len == 0 || rec.len > STM_FS_RECORDSIZE_MAX)
         return STM_SCRUB_VERIFY_UNREPAIRABLE;
 
+    /* P7-10: resolve the DEK by the extent's stamped (dataset_id,
+     * key_id). Briefly takes s->lock; lock-order — sc.lock (caller-
+     * held) → pool.rdlock (caller-held) → s.lock — is the established
+     * outer-to-inner direction of stm_sync_set_scrub_durable_bytes
+     * (which scrub.c also calls under sc.lock). Releases s.lock before
+     * any bdev I/O so contention with sync_commit stays minimal.
+     *
+     * Missing DEK (sync_dek_find returns NULL) is a corruption signal
+     * — the keyschema sweep enforces that no live extent's key_id is
+     * pruned (P7-10 sweep refcount). UNREPAIRABLE is the right fault
+     * mode (semantically a permanent data-loss attestation). */
+    uint8_t dek[32];
+    {
+        pthread_mutex_lock(&s->lock);
+        sync_dek_slot *sl = sync_dek_find(s, rec.dataset_id, rec.key_id);
+        if (!sl) {
+            pthread_mutex_unlock(&s->lock);
+            return STM_SCRUB_VERIFY_UNREPAIRABLE;
+        }
+        memcpy(dek, sl->dek, 32);
+        pthread_mutex_unlock(&s->lock);
+    }
+
     size_t total_bytes = rec.len + tag_len;
 
     void *cbuf = malloc(total_bytes);
@@ -4049,6 +4233,7 @@ sync_scrub_verify_cb(uint64_t paddr, void *ctx)
     void *pbuf      = malloc(rec.len);
     if (!cbuf || !src_bytes || !back_buf || !pbuf) {
         free(cbuf); free(src_bytes); free(back_buf); free(pbuf);
+        stm_ct_memzero(dek, sizeof dek);
         return STM_SCRUB_VERIFY_UNREPAIRABLE;
     }
 
@@ -4079,7 +4264,7 @@ sync_scrub_verify_cb(uint64_t paddr, void *ctx)
         if (rs != STM_OK) continue;
 
         size_t pt_out = 0;
-        stm_status ds = stm_extent_decrypt(mode, s->metadata_key,
+        stm_status ds = stm_extent_decrypt(mode, dek,
                                               rec.paddrs[0], rec.gen,
                                               &ad, cbuf, total_bytes,
                                               pbuf, rec.len, &pt_out);
@@ -4098,6 +4283,7 @@ sync_scrub_verify_cb(uint64_t paddr, void *ctx)
     if (picked < 0) {
         stm_ct_memzero(pbuf, rec.len);
         free(cbuf); free(src_bytes); free(back_buf); free(pbuf);
+        stm_ct_memzero(dek, sizeof dek);
         return STM_SCRUB_VERIFY_UNREPAIRABLE;
     }
 
@@ -4130,7 +4316,7 @@ sync_scrub_verify_cb(uint64_t paddr, void *ctx)
             goto done;
         }
         size_t pt_out2 = 0;
-        stm_status ds = stm_extent_decrypt(mode, s->metadata_key,
+        stm_status ds = stm_extent_decrypt(mode, dek,
                                               rec.paddrs[0], rec.gen,
                                               &ad, back_buf, total_bytes,
                                               pbuf, rec.len, &pt_out2);
@@ -4152,6 +4338,7 @@ done:
     /* src_bytes + back_buf hold ciphertext, not plaintext — no
      * sensitive material. Plain free is fine. */
     free(cbuf); free(src_bytes); free(back_buf); free(pbuf);
+    stm_ct_memzero(dek, sizeof dek);
     return final_outcome;
 }
 
