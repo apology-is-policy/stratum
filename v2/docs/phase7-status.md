@@ -56,6 +56,30 @@ into the CAS tier (which DOES need P6) is a separate concern.
 
 ## Phase 7 status (overall)
 
+- [x] **P7-CAS cold-tier index foundation** — substantive `8eba90a`
+      + R49 close `61205c7` + hash-fixup (this commit). Closes the
+      first half of
+      ARCH §6.9 / NOVEL #3 (the index + persistence + format
+      break); migration / rehydration paths follow in P7-CAS-2.
+      New `src/cas/cas_index.c` module realizes `cas.tla` against
+      an in-RAM linear-array shadow + persistent btree_store-backed
+      Bε-tree on device 0 (bp_kind STM_BPTR_KIND_CAS = 6, carved
+      at v3 but unused until now). 64-byte value layout:
+      n_replicas + paddrs[4] + refcount + length + gen. New AEAD
+      AD struct `stm_ad_cas` (56 bytes) per ARCH §7.6.3.
+      Format break STM_UB_VERSION 17 → 18: `ub_cas_index_root_gen`
+      (le64) carved from head of `ub_reserved` (which shrinks
+      784 → 776); `ub_cas_index_root` field at offset 288 was
+      already there from v3. Extent record value layout adds a
+      1-byte `kind` discriminator at offset 0 (0x01 = HOT, 0x02 =
+      COLD) shifting n_replicas to byte 1 for HOT; COLD replaces
+      bytes 8..39 with content_hash[32]. Bytes 40..95 unchanged.
+      cas.tla: 6 actions / 9 invariants / 6 buggy demos — each
+      fires its expected invariant. cas.cfg green at 2.5M states /
+      depth 10 / 40s wall. 20 new test_cas_index unit tests + 2
+      new test_fs integration tests (format-time presence + cross-
+      mount persistence). 35 ctest suites green default + ASan +
+      TSan in isolation. Spec posture 20/24/25 → 21/25/31.
 - [x] **FastCDC pre-work** — landed at `5cb8900`; R27 close
       `a2ffd38` (0 P0 / 1 P1 / 4 P2 / 4 P3, all addressed
       except P2-4 / P3-2 / P3-4 deferred per audit close commit

@@ -38,8 +38,64 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R48-hash-fixup pending. Substantive `76ce44f` +
-  R48 close `1951f65`.
+- **Tip**: post-R49-hash-fixup. Substantive `8eba90a` + R49 close
+  `61205c7` (0 P0 + 0 P1 + 2 P2 + 2 P3, both P2s deferred to
+  P7-CAS-2 with forward-notes inline; both P3s fixed inline).
+  **P7-CAS cold-tier index foundation — closes the first half of
+  ARCH §6.9 / NOVEL #3 (the index + persistence + format break);
+  migration / rehydration paths follow in P7-CAS-2. New
+  `src/cas/cas_index.c` module realizing `cas.tla` against an
+  in-RAM linear-array shadow + persistent btree_store-backed
+  Bε-tree on device 0. Public API: `stm_cas_index_create / _close /
+  _current_txg / _advance_txg`, `stm_cas_insert / _ref / _deref /
+  _gc`, `stm_cas_lookup / _iter / _count`, plus the persistence
+  triple `_set_storage / _set_crypt_ctx / _load_at / _commit /
+  _get_root / _get_gen / _verify`. ERRORCHECK mutex with
+  must_lock / must_unlock contract — same shape as extent_index.
+  Format break STM_UB_VERSION 17 → 18: adds
+  `ub_cas_index_root_gen` (le64 at offset 3280) carved from the
+  head of `ub_reserved` (which shrinks 784 → 776); the tree-root
+  bptr field `ub_cas_index_root` itself was carved at v3 in the
+  metadata-roots block (offset 288) but went unused until now.
+  Tree's bp_kind is `STM_BPTR_KIND_CAS` (= 6, also carved at v3).
+  Extent record value layout gains a 1-byte `kind` discriminator
+  at on-disk offset 0 (0x01 = HOT, 0x02 = COLD): HOT shifts
+  n_replicas from byte 0 to byte 1 with bytes 2..7 reserved zero;
+  COLD replaces bytes 1..39 with reserved (1..7) + content_hash
+  (8..39, BLAKE3-256). Bytes 40..95 (write_gen, dlen, clen_and_
+  comp, key_id, origin triple, link_gen) are kind-independent.
+  CAS index value layout (64 bytes): n_replicas (u8 at byte 0) +
+  reserved (1..7) + paddrs[4] (8..39) + refcount (u64 at 40..47) +
+  length (u64 at 48..55) + gen (u64 at 56..63). New AEAD AD struct
+  `stm_ad_cas` (56 bytes — magic + version + pool_uuid +
+  content_hash) per ARCH §7.6.3. New `stm_ad_cas_pack` packer.
+  `compute_merkle_root` flows the CAS root csum through (the slot
+  was reserved with zeros from earlier phases; first cold-tier
+  commit populates it). sync_open's recompute equally uses
+  `ub.ub_cas_index_root.bp_csum`. New cas.tla spec: 6 actions
+  (WriteHot / MigrateToCold / RehydrateOnWrite / DeleteFile / GC /
+  AdvanceTxg) + 9 invariants (TypeOK, CASIndexUnique,
+  NoOverlapWithinIno, LengthPositive, BirthTxgBound,
+  PaddrFreshness, RefcountConsistent, NoDanglingColdRef,
+  HotColdReplicasDisjoint, CASReplicasDisjoint); 6 buggy demos
+  (BuggyMigrateForgetsRefBump, BuggyMigrateWithoutDrop,
+  BuggyGCRaceWithRef, BuggyRehydrateWithoutDeref,
+  BuggyDeleteForgetsCASDeref, BuggyMigrateReusesHotPaddr) — each
+  fires its expected invariant under TLC. cas.cfg green at 2.5M
+  distinct states / depth 10 / 40s wall. New test suite
+  `test_cas_index` with 20 unit tests (lifecycle, mutations,
+  GC, iter, multi-step dedup composition); test_fs grows 52 → 54
+  with 2 new integration tests covering format-time presence and
+  cross-mount persistence of the CAS index. 35 ctest suites green
+  default + ASan + TSan in isolation. Spec posture: **21 modules
+  / 25 fixed cfgs / 31 buggy cfgs**.
+  Migration / rehydration paths (cas.tla::MigrateToCold /
+  RehydrateOnWrite at the C impl level, `stm_sync_migrate_to_cold`
+  + auto-rehydrate-on-write) deferred to P7-CAS-2 — the spec +
+  index layer + format break is the foundation; the data-plane
+  pipeline that drives the index is its own chunk.**
+  Prior: P7-16 reflinks `76ce44f` + R48 close `1951f65` + hash
+  fixup `beabd83`.
   **P7-16 reflinks — closes the long-pending ARCH §11.12 surface
   (FICLONE-shape O(extent count) reflinks) at v1 MVP scope: same-
   dataset whole-file reflinks. New public API
@@ -250,9 +306,10 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   `73019c4` (UB v13 → v14, `extent_txg` field). P7-7 send/recv
   MVP `1122d32`. P7-6 replica-list extension `a958af6` (UB v12
   → v13). Phase 5 tagged `phase-5-complete` at `461e68e`.
-  Spec posture: **20 modules / 24 fixed configs / 25 buggy demos**
-  (added `reflink_rotates_origin_buggy.cfg` in P7-16; the prior
-  `extent_keyids.cfg` fixed cfg is unchanged at 24).
+  Spec posture: **21 modules / 25 fixed configs / 31 buggy demos**
+  (P7-CAS adds `cas.tla` + `cas.cfg` + 6 cas_*_buggy.cfg variants;
+  prior P7-16 added `reflink_rotates_origin_buggy.cfg`; the prior
+  `extent_keyids.cfg` fixed cfg is unchanged).
 - **Phases**: 1–5 complete; Phase 6 namespace layer feature-
   complete; **Phase 7 progressing**.
   Spec scaffolds: P6-1 (bptr.tla) `032db86`; P6-2 (dataset.tla)

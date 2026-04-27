@@ -39,11 +39,12 @@ chapter as specs get wider cross-reference tables).
 | `property.tla` | 6 | Per-dataset property inheritance — local override / inheritable walk / non-inheritable + immutable-at-create. | 1040 states, depth 11 (MaxDatasets=2, 3 props, 2 values) | `property_inherit_non_inh_buggy.cfg`, `property_mutate_immutable_buggy.cfg` |
 | `clone.tla` | 6 | Clone (writable snapshot) lifecycle — clone-from-snap + snap-with-clones-undeletable + promote-breaks-dependency. | 161 states, depth 11 (MaxDatasets=3, MaxSnaps=2) | `clone_delete_snap_with_clones_buggy.cfg` |
 | `dead_list.tla` | 6 | Block-level reachability + per-snapshot dead-list incremental maintenance during COW + ZFS-style SnapDelete (free-unique + merge-surviving-into-pred). | 5656 states, depth 15 (MaxBlocks=4, MaxSnaps=3) | `dead_list_overwrite_forgets_buggy.cfg`, `dead_list_delete_forgets_free_buggy.cfg`, `dead_list_merge_includes_freed_buggy.cfg` |
-| `extent.tla` | 7 | Per-(dataset, ino) extent layout — Write / Overwrite / Truncate / DeleteFile / AdvanceTxg + Reflink (P7-16) + no-overlap-within-ino + length-positive + birth-txg-bound + paddr-freshness + replica sets per extent (P7-6) + Truncate partial-shrink under fresh replicas (P7-9) + key_id stamp on every extent (P7-10) + origin triple per extent + SharedReplicasAreCohabit + OriginConsistentInBounds (P7-16). | extent.cfg: 838164 states, depth 7 (MaxDatasets=1, MaxInos=2, MaxFileBlocks=3, MaxPaddrs=5, MaxTxg=1, MaxReplicasPerExtent=2, MaxKeyIds=1, DisableReflink=TRUE; preserves P7-9 partial-shrink coverage). extent_keyids.cfg: ~3.6M states, depth 18 (MaxDatasets=2, MaxFileBlocks=2, MaxPaddrs=4, MaxKeyIds=2, DisableReflink=FALSE; P7-10 spanning-rotation × P7-16 reflink coverage). | `extent_overlap_buggy.cfg`, `extent_zero_length_buggy.cfg`, `extent_overwrite_forgets_drop_buggy.cfg`, `extent_replica_collision_buggy.cfg`, `reflink_rotates_origin_buggy.cfg` (P7-16) |
+| `extent.tla` | 7 | Per-(dataset, ino) extent layout — Write / Overwrite / Truncate / DeleteFile / AdvanceTxg + Reflink (P7-16) + no-overlap-within-ino + length-positive + birth-txg-bound + paddr-freshness + replica sets per extent (P7-6) + Truncate partial-shrink under fresh replicas (P7-9) + key_id stamp on every extent (P7-10) + origin triple per extent + SharedReplicasAreCohabit + OriginConsistentInBounds (P7-16). | extent.cfg: 838164 states, depth 7 (MaxDatasets=1, MaxInos=2, MaxFileBlocks=3, MaxPaddrs=5, MaxTxg=1, MaxReplicasPerExtent=2, MaxKeyIds=1, DisableReflink=TRUE; preserves P7-9 partial-shrink coverage). extent_keyids.cfg: ~8.7M states, depth 18 (MaxDatasets=2, MaxFileBlocks=2, MaxPaddrs=4, MaxKeyIds=2, DisableReflink=FALSE; P7-10 spanning-rotation × P7-16 reflink coverage including link_gen). | `extent_overlap_buggy.cfg`, `extent_zero_length_buggy.cfg`, `extent_overwrite_forgets_drop_buggy.cfg`, `extent_replica_collision_buggy.cfg`, `reflink_rotates_origin_buggy.cfg` (P7-16) |
+| `cas.tla` | 9 | Content-addressed cold-tier index lifecycle (P7-CAS / NOVEL #3) — WriteHot / MigrateToCold / RehydrateOnWrite / DeleteFile / GC / AdvanceTxg + RefcountConsistent + NoDanglingColdRef + HotColdReplicasDisjoint + CASReplicasDisjoint + NoOverlapWithinIno (across HOT and COLD extents) + LengthPositive + BirthTxgBound + PaddrFreshness + CASIndexUnique. | cas.cfg: 2.5M states, depth 10 (MaxDatasets=2, MaxInos=2, MaxFileBlocks=2, MaxPaddrs=4, MaxHashes=2, MaxTxg=2, MaxReplicasPerEntry=1, MaxKeyIds=1, MaxRef=4). | `cas_migrate_forgets_refbump_buggy.cfg`, `cas_migrate_without_drop_buggy.cfg`, `cas_gc_race_buggy.cfg`, `cas_rehydrate_no_deref_buggy.cfg`, `cas_delete_forgets_deref_buggy.cfg`, `cas_migrate_reuses_hot_paddr_buggy.cfg` |
 
-All 24 fixed configs green (one per module + `scrub_beta` +
+All 25 fixed configs green (one per module + `scrub_beta` +
 `scrub_durable` + `scrub_beta_durable` extending `scrub.tla` +
-`extent_keyids.cfg` extending `extent.tla`). All 25 buggy configs
+`extent_keyids.cfg` extending `extent.tla`). All 31 buggy configs
 reproduce their designed invariant violations.
 
 ## Per-module invariants
@@ -1032,6 +1033,89 @@ Truncate / DeleteFile flow back to the caller via
 — that production wiring lands with P7-4 (sync.c COW path
 integration). Reference doc: `reference/14-extent.md`.
 
+### `cas.tla` — content-addressed cold-tier index lifecycle (P7-CAS)
+
+Models the cold tier (ARCH §6.9 / NOVEL #3): a Bε-tree keyed by
+`BLAKE3-256(content)` with per-entry refcount + replicas + length +
+gen. Composes with extent.tla: extents are now either HOT (paddr-
+addressed, retained semantics from extent.tla) or COLD (hash-
+addressed, referencing a CAS index entry). The two layers compose
+under a unified `NoOverlapWithinIno` invariant — a read at
+`(ds, ino, off)` resolves to exactly one HOT or COLD extent or to a
+hole, never to ambiguous content.
+
+State variables:
+
+- `hot_extents : SUBSET HotExtentRec` — paddr-addressed extents
+  (mirrors extent.tla::ExtentRec at the cas.tla level of detail).
+- `cold_extents : SUBSET ColdExtentRec` — hash-addressed extents.
+- `cas_entries : SUBSET CASEntry` — the CAS index (one entry per
+  hash; CASIndexUnique enforces this).
+- `used_paddrs : SUBSET Paddrs` — every paddr ever issued
+  (monotonic; mirrors extent.tla's used_paddrs).
+- `current_txg : 0..MaxTxg` — monotonic.
+
+Actions:
+
+- `WriteHot` — paddr-addressed insert (mirrors extent.tla::Write).
+- `MigrateToCold` — convert a HOT extent to a COLD one. CAS-miss
+  branch allocates fresh paddrs + inserts a new CAS entry; CAS-hit
+  branch bumps the existing entry's refcount. In both branches,
+  inserts a cold-extent record + drops the source hot extent.
+- `RehydrateOnWrite` — replace a COLD extent with a fresh HOT
+  extent + decrement the CAS refcount. (Models the C-impl write
+  path's auto-rehydrate when it encounters a cold extent at the
+  write target.)
+- `DeleteFile` — drops all extents (HOT + COLD) at `(ds, ino)` +
+  decrements per-hash CAS refcounts.
+- `GC` — removes a CAS entry whose refcount has fallen to 0. The
+  entry's replicas become eligible for allocator reclamation.
+- `AdvanceTxg` — bump `current_txg`.
+
+Load-bearing invariants:
+
+- `RefcountConsistent` — for every live CAS entry, `refcount` ==
+  count of cold extents naming this hash. (The CAS-tier dedup
+  property's correctness axis. BuggyMigrateForgetsRefBump,
+  BuggyRehydrateWithoutDeref, BuggyDeleteForgetsCASDeref each fire
+  this.)
+- `NoDanglingColdRef` — every cold extent's hash names a live CAS
+  entry. (Pinned by every action's update path. BuggyGCRaceWithRef
+  fires this.)
+- `HotColdReplicasDisjoint` — a hot extent's replicas never collide
+  with any CAS entry's replicas. (AEAD ADs differ between hot and
+  cold; reusing a paddr across the boundary would imply two distinct
+  ciphertexts decrypt at the same physical location.
+  BuggyMigrateReusesHotPaddr fires this.)
+- `CASReplicasDisjoint` — distinct CAS entries reference distinct
+  paddrs. (Each chunk is independently AEAD-encrypted under its own
+  `(paddr, gen)` nonce.)
+- `NoOverlapWithinIno` — extends extent.tla's invariant across BOTH
+  hot and cold extents in the same `(ds, ino)`. (BuggyMigrateWithoutDrop
+  fires this — hot + cold extents at same byte range.)
+- `LengthPositive`, `BirthTxgBound`, `PaddrFreshness`, `CASIndexUnique`,
+  `TypeOK` — typing / monotonicity / domain correctness.
+
+Buggy variants (all fire as designed at fixed-config bounds):
+
+- `BuggyMigrateForgetsRefBump` — dedup-hit doesn't bump refcount.
+- `BuggyMigrateWithoutDrop` — migrate inserts cold but doesn't drop hot.
+- `BuggyGCRaceWithRef` — GC reclaims an entry with refcount > 0.
+- `BuggyRehydrateWithoutDeref` — rehydrate doesn't decrement refcount.
+- `BuggyDeleteForgetsCASDeref` — delete drops cold extents but
+  doesn't decrement per-hash refcounts.
+- `BuggyMigrateReusesHotPaddr` — migrate's CAS-miss reuses a hot
+  paddr as a CAS replica without re-encrypting on fresh paddrs.
+
+Spec-to-code: `src/cas/cas_index.c` realizes the index actions;
+sync.c hosts the `stm_cas_index *cas_idx` field, lifecycle wiring
+(create / load_at / commit / close), and the `compute_merkle_root`
+slot for CAS csum chaining. Migration / rehydration paths are
+deferred to P7-CAS-2; the cas.tla MigrateToCold + RehydrateOnWrite
+actions stand as the formal contract that the future
+`stm_sync_migrate_to_cold` / write-path-rehydrate must satisfy.
+Reference doc: future `reference/15-cas.md` (P7-CAS-2).
+
 ## Running TLC
 
 ```bash
@@ -1045,7 +1129,7 @@ java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
 # Full sweep — fixed configs (one per module; scrub has 3 extra configs).
 for s in sync concurrency structural balanced merge allocator merkle \
          key_schema quorum metadata_nonce device_lifecycle evac scrub \
-         bptr dataset snapshot property clone dead_list extent; do
+         bptr dataset snapshot property clone dead_list extent cas; do
   echo "== $s ==" && \
   java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
       -config $s.cfg $s.tla 2>&1 | tail -3
