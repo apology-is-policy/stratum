@@ -384,4 +384,42 @@ STM_TEST(repair_log_load_rejects_tampered_next_seq) {
     unlink(g_tmp_path);
 }
 
+STM_TEST(repair_log_emit_refuses_at_single_leaf_cap) {
+    /* R47 P3-1: in-RAM list at STM_REPAIR_LOG_MAX_ENTRIES refuses
+     * subsequent emits with STM_ERANGE rather than letting the
+     * next sync_commit fail and wedge the pool. */
+    make_tmp("cap");
+    stm_bdev *d = open_fresh_device();
+    stm_bootstrap *boot = create_fresh_bootstrap(d);
+
+    stm_repair_log_index *rl = NULL;
+    STM_ASSERT_OK(stm_repair_log_index_create(d, boot, &rl));
+
+    stm_repair_log_entry e = {
+        .timestamp_ns = 1, .target_paddr = 1, .source_paddr = 2,
+        .target_replica_idx = 0, .source_replica_idx = 1,
+        .type = STM_REPAIR_TYPE_CSUM_FAIL,
+        .result = STM_REPAIR_RESULT_OK_VERIFIED,
+    };
+
+    /* Fill to the cap. Each emit succeeds. */
+    for (size_t i = 0; i < STM_REPAIR_LOG_MAX_ENTRIES; i++) {
+        uint64_t out = 0;
+        STM_ASSERT_OK(stm_repair_log_index_emit(rl, &e, &out));
+    }
+    STM_ASSERT_EQ(stm_repair_log_index_count(rl),
+                    (size_t)STM_REPAIR_LOG_MAX_ENTRIES);
+
+    /* The next emit refuses STM_ERANGE; count stays at the cap. */
+    uint64_t out = 0;
+    STM_ASSERT_ERR(stm_repair_log_index_emit(rl, &e, &out), STM_ERANGE);
+    STM_ASSERT_EQ(stm_repair_log_index_count(rl),
+                    (size_t)STM_REPAIR_LOG_MAX_ENTRIES);
+
+    stm_repair_log_index_close(rl);
+    stm_bootstrap_close(boot);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
 STM_TEST_MAIN("repair_log")

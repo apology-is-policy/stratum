@@ -522,6 +522,19 @@ stm_status stm_repair_log_index_emit(stm_repair_log_index *rl,
     memset(node->e.reserved, 0, sizeof node->e.reserved);
 
     must_lock(&rl->lock);
+    /* R47 P3-1: refuse new emits once the in-RAM list reaches the
+     * single-leaf MVP cap. Without this, `_commit` would fail
+     * STM_ERANGE at sync-flush time, wedging every subsequent
+     * sync_commit (data writes, dataset/snapshot mutations, scrub
+     * progress) until the operator drains the list — but the API
+     * has no drain path. Failing fast at emit lets the caller
+     * decide (the scrub cb's emit is best-effort and absorbs
+     * STM_ERANGE; the repair itself still lands). */
+    if (rl->count >= STM_REPAIR_LOG_MAX_ENTRIES) {
+        must_unlock(&rl->lock);
+        free(node);
+        return STM_ERANGE;
+    }
     /* UINT64_MAX of seq_ids is millennia of repairs at any
      * realistic scrub cadence; defensive guard for the saturation
      * case (consistent with R29 P3-1 across the project). */

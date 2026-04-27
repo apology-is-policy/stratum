@@ -478,10 +478,11 @@ static int sync_unwrap_cb(uint64_t dataset_id, uint64_t key_id,
 
 /* Compute pool_merkle_root = BLAKE3-256(
  *     main_root_csum || alloc_root_csum || snap_root_csum ||
- *     cas_root_csum || salt
+ *     cas_root_csum || keyschema_root_csum || extent_root_csum ||
+ *     repair_log_root_csum || salt
  * ). Unpopulated tree roots contribute 32 zero bytes.
  *
- * Phase 3 has only the allocator tree; the other three are zero.
+ * Phase 3 had only the allocator tree; the other three were zero.
  * The field placement mirrors ARCH §7.11.3's formula, so when we
  * wire main/snap/cas in Phase 5/6 the math doesn't change.
  *
@@ -495,21 +496,33 @@ static stm_status compute_merkle_root(const uint8_t main_csum[32],
                                         const uint8_t cas_csum[32],
                                         const uint8_t keyschema_csum[32],
                                         const uint8_t extent_csum[32],
+                                        const uint8_t repair_log_csum[32],
                                         const uint8_t salt[32],
                                         uint8_t out[32])
 {
     stm_blake3_ctx *h = stm_blake3_new();
     if (!h) return STM_ENOMEM;
-    stm_blake3_update(h, main_csum,      32);
-    stm_blake3_update(h, alloc_csum,     32);
-    stm_blake3_update(h, snap_csum,      32);
-    stm_blake3_update(h, cas_csum,       32);
-    stm_blake3_update(h, keyschema_csum, 32);
+    stm_blake3_update(h, main_csum,       32);
+    stm_blake3_update(h, alloc_csum,      32);
+    stm_blake3_update(h, snap_csum,       32);
+    stm_blake3_update(h, cas_csum,        32);
+    stm_blake3_update(h, keyschema_csum,  32);
     /* P7-3 (v12): extent-index tree root csum folded into the Merkle
      * chain. v11 pools (refused at v12 mount) had no extent root, so
      * the new slot is a clean v12-only addition. */
-    stm_blake3_update(h, extent_csum,    32);
-    stm_blake3_update(h, salt,           32);
+    stm_blake3_update(h, extent_csum,     32);
+    /* P7-15 R47 P2-1 (v16): repair-log tree root csum folded into the
+     * Merkle chain. Closes the asymmetry where keyschema (also
+     * plaintext + Merkle-covered) was bound but repair_log was not —
+     * an offline-write attacker could redact audit-trail entries
+     * without leaving a Merkle-detectable trace by recomputing
+     * ub_csum alone. With the repair_log_csum chained in, any tamper
+     * to the repair-log tree forces the Merkle root to change, and
+     * that mismatch fires at sync_open's recompute check. v16 is
+     * unreleased outside this branch, so this Merkle change folds
+     * into v16 rather than bumping to v17. */
+    stm_blake3_update(h, repair_log_csum, 32);
+    stm_blake3_update(h, salt,            32);
     stm_blake3_final(h, out, 32);
     stm_blake3_free(h);
     return STM_OK;
@@ -1486,6 +1499,7 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
                                           zeros32,
                                           ks_hdr.ks_root.bp_csum,
                                           ub.ub_extent_root.bp_csum,
+                                          ub.ub_repair_log_root.bp_csum,
                                           ub.ub_merkle_root_salt,
                                           recomputed);
     if (ms != STM_OK) {
@@ -1695,6 +1709,17 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
         uint64_t rl_next_seq = stm_load_le64(ub.ub_repair_log_next_seq);
         if (rl_paddr != 0) {
             if (ub.ub_repair_log_root.bp_kind != STM_BPTR_KIND_REPAIR_LOG) {
+                stm_sync_close(s2);
+                return STM_ECORRUPT;
+            }
+            /* R47 P3-2: the bootstrap pool lives on device 0 by
+             * construction. A non-zero device portion in the
+             * persisted paddr means the UB was tampered (or
+             * rotted); surface as STM_ECORRUPT rather than letting
+             * `node_read` translate to STM_EINVAL ("caller passed
+             * bad args"), which mis-categorizes a tamper as a
+             * caller bug. */
+            if (stm_paddr_device(rl_paddr) != 0) {
                 stm_sync_close(s2);
                 return STM_ECORRUPT;
             }
@@ -2136,12 +2161,14 @@ stm_status stm_sync_commit(stm_sync *s)
         return sr;
     }
 
-    /* P4-1 / P5-3b / P6-persist / P7-3: compute the pool Merkle root.
-     * The `alloc_root` slot is the ROOTS OBJECT's root csum (transitively
-     * covers every per-device tree root). The `main_root` slot is the
-     * dataset index tree's root csum; `snap_root` is the snapshot
-     * index tree's; `extent_root` is the extent index tree's. Each
-     * feeds in directly. R8-P1-1: refuse to commit on BLAKE3 OOM. */
+    /* P4-1 / P5-3b / P6-persist / P7-3 / P7-15 R47 P2-1: compute the
+     * pool Merkle root. The `alloc_root` slot is the ROOTS OBJECT's
+     * root csum (transitively covers every per-device tree root).
+     * The `main_root` slot is the dataset index tree's root csum;
+     * `snap_root` is the snapshot index tree's; `extent_root` is the
+     * extent index tree's; `repair_log` is the audit-trail tree's
+     * (P7-15 v16). Each feeds in directly. R8-P1-1: refuse to commit
+     * on BLAKE3 OOM. */
     uint8_t zeros32[32] = { 0 };
     uint8_t new_merkle_root[32];
     stm_status ms = compute_merkle_root(main_csum,   /* main */
@@ -2150,6 +2177,7 @@ stm_status stm_sync_commit(stm_sync *s)
                                           zeros32,   /* cas  */
                                           ks_root_csum,
                                           extent_csum,
+                                          repair_log_csum,
                                           s->merkle_salt,
                                           new_merkle_root);
     if (ms != STM_OK) {
@@ -4485,10 +4513,17 @@ static void emit_repair_log(stm_sync *s,
     e.type               = type;
     e.result             = result;
 
-    /* Best-effort: an emit failure (STM_EOVERFLOW after 2^64 seq_ids,
-     * STM_ENOMEM under sustained malloc pressure) doesn't make the
-     * repair worse. The numeric `blocks_repaired` counter on the
-     * scrub status remains the operator's primary signal. */
+    /* Best-effort: an emit failure doesn't make the repair worse —
+     * the rewrite has already landed by the time we reach here.
+     * The numeric `blocks_repaired` counter on the scrub status
+     * remains the operator's primary signal. Three possible
+     * failure modes:
+     *   - STM_EOVERFLOW: 2^64 seq_ids exhausted (millennia of
+     *     scrubs at any realistic cadence; saturation guard).
+     *   - STM_ENOMEM: sustained malloc pressure.
+     *   - STM_ERANGE (R47 P3-1): in-RAM list at the single-leaf
+     *     MVP cap; entry dropped to keep sync_commit progressing.
+     * All three drop one audit-trail entry, not the repair. */
     uint64_t out_seq = 0;
     (void)stm_repair_log_index_emit(s->repair_log, &e, &out_seq);
 }

@@ -71,6 +71,11 @@ stm_add_test(test_send_recv  test_send_recv.c)
 stm_add_test(test_repair_log test_repair_log.c)
 
 # The crash-injection fuzzer runs ~168 independent format+mount+unmount
-# cycles and takes ~25 s on default, ~42 s under ASan/TSan. Bump the
-# timeout so it has headroom on slower CI hardware.
-set_tests_properties(test_crash_inject PROPERTIES TIMEOUT 180)
+# cycles. Original default budget was ~25 s on default, ~42 s under
+# ASan/TSan; subsequent chunks (P7-3 extent index, P7-15 repair-log)
+# added per-cycle metadata-tree commits that compound under TSan's
+# mutex instrumentation. Pre-P7-15 the TSan run was ~120 s; P7-15
+# pushed it past the 180 s cap on contention-heavy CI runs. Bumped to
+# 300 s to give comfortable headroom; the underlying test work hasn't
+# regressed in correctness, just runtime under instrumentation.
+set_tests_properties(test_crash_inject PROPERTIES TIMEOUT 300)

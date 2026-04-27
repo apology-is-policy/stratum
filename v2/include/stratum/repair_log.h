@@ -103,12 +103,25 @@ typedef struct {
     uint8_t           reserved[4];         /* zero on emit; ignored on load */
 } stm_repair_log_entry;
 
-/* Maximum entries the single-leaf MVP can hold. Each entry encodes
- * to 8-byte key + 32-byte value = 40 bytes; the btnode payload is
- * STM_BTNODE_PAYLOAD_MAX (~131 KiB), so ~3200 entries fit. Operators
- * who hit the cap need a multi-leaf graduation (matches keyschema's
- * MVP); the cap is enforced at commit time with STM_ERANGE. */
+/* On-disk value length per entry: 8-byte key + 32-byte value =
+ * 40 bytes encoded. */
 #define STM_REPAIR_LOG_VAL_LEN  32u
+
+/* R47 P3-1 — single-leaf MVP cap, enforced at emit time. The
+ * btnode payload max is ~131 KiB; per-entry encoding overhead
+ * (length prefixes + per-entry framing) varies, so the cap below
+ * is a conservative bound that leaves headroom. Once exceeded,
+ * `stm_repair_log_index_emit` returns STM_ERANGE rather than
+ * letting `_commit` fail at sync-flush time and wedging every
+ * subsequent commit (data writes, dataset/snapshot mutations,
+ * scrub progress) until the operator drains the in-RAM list —
+ * which the API has no path to do today (append-only, by
+ * design). The scrub β cb's emit is best-effort and silently
+ * absorbs the STM_ERANGE; only the audit-trail entry is lost,
+ * the repair itself still lands.
+ *
+ * Multi-leaf graduation is future work; matches keyschema MVP. */
+#define STM_REPAIR_LOG_MAX_ENTRIES  2048u
 
 /* ========================================================================= */
 /* Lifecycle.                                                                 */
@@ -206,10 +219,20 @@ stm_status stm_repair_log_index_emit(stm_repair_log_index *rl,
 size_t stm_repair_log_index_count(const stm_repair_log_index *rl);
 
 /*
- * Iterate every entry in seq_id order; cb returns 0 to continue,
- * non-zero to abort iteration (the non-zero is propagated back
- * as the iter return value's tag — caller distinguishes via the
- * cb-side state).
+ * Iterate every entry in seq_id order. cb returns 0 to continue,
+ * non-zero to stop iteration early. The iter return value is
+ * STM_OK on success (or STM_EINVAL on bad args); the cb-side
+ * state is the only signal of early termination — the iter
+ * itself does not propagate the cb's non-zero return code.
+ *
+ * **R47 P3-4**: the cb runs while the index's internal mutex is
+ * held. The cb MUST NOT call back into any other
+ * `stm_repair_log_index_*` API on the same handle — the mutex is
+ * PTHREAD_MUTEX_ERRORCHECK so re-entry returns EDEADLK rather
+ * than self-deadlocking, but the project's `must_lock` /
+ * `must_unlock` helpers swallow that silently and the resulting
+ * state is undefined. Symmetric with scrub.h's "callback contract"
+ * prohibition on cb re-entry into the scrub API.
  */
 typedef int (*stm_repair_log_iter_cb)(const stm_repair_log_entry *e, void *ctx);
 
