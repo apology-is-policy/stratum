@@ -38,8 +38,33 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R44-hash-fixup pending. Substantive `5eba5de` +
-  R44 close `bb5e088`.
+- **Tip**: post-R45-hash-fixup pending. Substantive `e6a751c` +
+  R45 close `f30db5e`.
+  **P7-13 fs_create_dataset — bundles `stm_dataset_create_child` +
+  `stm_sync_add_dataset_key` into one fs-level API under
+  `fs->lock`. Removes the test_fs restriction "only ds=1 (root)
+  writes work without explicit DEK install"; the freshly-created
+  id is immediately usable for `stm_fs_write` / `stm_fs_read`.
+  R45 P2-1 made wrap-key source implicit: the fs handle retains
+  `keyfile_path` / `janus_socket` strdup'd at mount, and the
+  create call reuses the SAME source per-call (load → use → wipe).
+  Per-call overrides have no documented use case (ARCH §7.7
+  defines wrap keys as pool-wide), and accepting one would let a
+  caller silently persist an unwrappable CURRENT entry that R42
+  P1-1's hard-fail-on-CURRENT-unwrap-failure would turn into a
+  permanent mount refusal — the substantive commit's
+  `stm_fs_create_dataset_opts` was removed in the R-close pass to
+  close that footgun by construction. Atomicity: on
+  `stm_sync_add_dataset_key` failure the freshly-created leaf is
+  rolled back via `stm_dataset_destroy` (infallible-by-spec for a
+  non-root no-children leaf under fs->lock). No format break, no
+  spec change. test_fs 31 → 40 (9 net new tests). R45 audit:
+  0 P0 + 0 P1 + 1 P2 + 4 P3 — P2-1 + P3-1 (docstring drift) +
+  P3-2 (dead defensive wedge) + P3-4 (test gaps: name-length +
+  multi-call sequencing) all fixed inline; P3-3 (next_id burn on
+  STM_ERANGE rollback) cosmetic at any realistic scale, deferred.**
+  Prior: P7-12 truncate fault-free Phase 3 `5eba5de` +
+  R44 close `bb5e088` + hash fixup `31ace1c`.
   **P7-12 truncate fault-free Phase 3 — closes R41 P3-1 case (b)
   (the one gap left open by P7-11). Adds `stm_extent_truncate_peek`
   (pure-read count of past-extents + total replicas) and

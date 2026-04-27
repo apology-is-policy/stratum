@@ -185,6 +185,43 @@ into the CAS tier (which DOES need P6) is a separate concern.
       gen filter is best-effort because `snapshot.created_txg` and
       `sync.current_gen` are independent counters — closed in P7-8.
       No format break in P7-7; STM_UB_VERSION stays at 13.
+- [x] **P7-13 fs_create_dataset** — landed at `e6a751c`; R45 close
+      `f30db5e` (0 P0 + 0 P1 + 1 P2 + 4 P3). New public API
+      `stm_fs_create_dataset(fs, parent_id, name, *out_id)` bundles
+      `stm_dataset_create_child` + `stm_sync_add_dataset_key` under
+      `fs->lock` so the FS observer never sees a half-created
+      dataset. The freshly-created id is immediately usable for
+      `stm_fs_write` / `stm_fs_read` — removes the long-standing
+      test_fs restriction "only ds=1 (root) writes work without
+      explicit DEK install". Atomicity: on
+      `stm_sync_add_dataset_key` failure the freshly-created leaf
+      is rolled back via `stm_dataset_destroy` (infallible-by-spec
+      for a non-root no-children leaf under fs->lock; the project
+      idiom skips runtime assert and uses a `(void)` cast with the
+      analysis pinned in a comment). R45 P2-1 hardened the
+      wrap-key source: substantive `e6a751c` accepted a per-call
+      `stm_fs_create_dataset_opts` (keyfile_path XOR janus_socket)
+      that let a caller persist a wrap-key-mismatched CURRENT
+      entry, which R42 P1-1's hard-fail-on-CURRENT-unwrap-failure
+      would turn into a permanent mount refusal on the next
+      mount. ARCH §7.7 defines wrap keys as pool-wide so per-call
+      overrides have no documented use case — the R-close pass
+      removed the opts struct and now the fs handle retains
+      `keyfile_path` / `janus_socket` strdup'd at mount, with the
+      create call loading from that source per-call. Mismatch is
+      impossible by construction. R45 fixes: P2-1 + P3-1 (docstring
+      drift on return codes — switched to "errors propagate from
+      {keyfile_load, janus_client_connect, dataset_create_child,
+      sync_add_dataset_key}") + P3-2 (defensive wedge-on-rollback-
+      failure was dead code, replaced with `(void)` cast +
+      analysis comment) + P3-4 (added
+      `fs_create_dataset_name_length_boundaries` for empty / over-
+      max / exactly-NAME_MAX, plus `fs_create_dataset_multi_call_
+      sequencing` for 5 datasets in a single mount with distinct
+      ids + remount roundtrip). P3-3 (next_id burn on STM_ERANGE
+      rollback path: cap is 268M, cosmetic at any realistic scale)
+      deferred. No format break, no spec change. test_fs 31 → 40;
+      33 ctest suites green default + ASan + TSan in isolated runs.
 - [x] **P7-12 truncate fault-free Phase 3** — landed at `5eba5de`;
       R44 close `bb5e088` (0 P0 + 0 P1 + 0 P2 + 4 P3 — green
       signal; P3-1 SPEC-TO-CODE refinement-row backfill + P3-2
