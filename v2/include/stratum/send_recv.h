@@ -190,10 +190,12 @@ typedef struct stm_send_handle stm_send_handle;
  *   - from_snap_id: 0 means "full send" (every extent in the dataset's
  *                    current state). Non-zero means "incremental from
  *                    that snapshot": only extents with gen >
- *                    from_snap.created_txg are included.
+ *                    from_snap.extent_txg are included (P7-8;
+ *                    `extent_txg` is in the same counter space as
+ *                    `extent.gen`, unlike the prior `created_txg`).
  *   - to_snap_id: 0 means "current state" (no upper bound). Non-zero
  *                  means "up to this snapshot": only extents with
- *                  gen ≤ to_snap.created_txg are included.
+ *                  gen ≤ to_snap.extent_txg are included.
  *
  * Returns:
  *   STM_OK on success; *out_handle is the opaque handle.

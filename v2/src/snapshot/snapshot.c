@@ -264,6 +264,28 @@ stm_status stm_snapshot_create(stm_snapshot_index *idx,
 
     uint64_t prev_snap = most_recent_locked(idx, dataset_id);
 
+    /* R40 P2-1: defend against the racing-creator scenario where
+     * thread T1 read sync.current_gen=G, thread T2 commits
+     * (current_gen=G+2) and creates a snap with extent_txg=G+2,
+     * then T1 acquires idx->lock and tries to install a snap with
+     * its stale extent_txg=G. Without this check, T1's snap would
+     * be persisted with extent_txg < its prev's extent_txg,
+     * violating snapshot.tla::ChainExtentTxgOrdered. The next
+     * mount's structural validator (sp_validate_shadow) would
+     * reject the chain with STM_ECORRUPT, leaving the pool
+     * unmountable. Refuse the create here with STM_EINVAL so the
+     * racing thread can retry with a fresher gen instead of
+     * silently corrupting the on-disk shape. */
+    if (prev_snap != STM_SNAP_NO_PREV) {
+        size_t prev_idx = find_slot_locked(idx, prev_snap);
+        if (prev_idx != (size_t)-1 && idx->slots[prev_idx].present) {
+            if (extent_txg < idx->slots[prev_idx].e.extent_txg) {
+                must_unlock(&idx->lock);
+                return STM_EINVAL;
+            }
+        }
+    }
+
     size_t new_slot = append_slot_locked(idx);
     if (new_slot == (size_t)-1) {
         must_unlock(&idx->lock);

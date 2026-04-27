@@ -351,10 +351,14 @@ stm_status stm_snapshot_iter(const stm_snapshot_index *idx,
  *   56+L     8*N    dead_paddrs (le64[N]) where N = dead_count
  *
  * Total: 56 + name_len + 8*dead_count bytes (was 48 pre-v14).
- * Crypt + I/O follow the alloc_roots pattern. STM_UB_VERSION = 14
- * gates the new layout — v13 decoders length-rejected on the new
- * extent_txg field's 8-byte insertion, so v13 → v14 is a hard format
- * break. Refused with STM_EBADVERSION at mount.
+ * Crypt + I/O follow the alloc_roots pattern. v13 → v14 is a hard
+ * format break enforced by STM_UB_VERSION mismatch at uberblock
+ * validation (uberblock.c returns STM_EBADVERSION); the snapshot
+ * decoder is never reached on a v13 pool. The 52-byte fixed-prefix
+ * length check in sp_decode_value is defense-in-depth at the
+ * snapshot layer — pure-snapshot-record forgery is not in the threat
+ * model since records are AEAD-validated under metadata_key, but
+ * the length check rejects gross encoding drift cheaply.
  */
 
 STM_MUST_USE

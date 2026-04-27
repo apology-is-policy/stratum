@@ -277,6 +277,76 @@ STM_TEST(incremental_send_filters_by_extent_txg) {
     testpool_teardown(&tgt);
 }
 
+/* R40 P3-4: send_init refuses inverted/swapped from/to with STM_EINVAL. */
+STM_TEST(incremental_send_rejects_swapped_from_to) {
+    testpool src; testpool_setup(&src, "inc_swap", POOL_UUID_SRC);
+
+    stm_sync *s = stm_fs_sync_for_test(src.fs);
+    stm_snapshot_index *sidx = stm_sync_snapshot_index(s);
+    STM_ASSERT_TRUE(sidx != NULL);
+
+    /* Establish a 2-snap chain with snap_a strictly older than snap_b. */
+    uint8_t data[4096]; memset(data, 0xAB, sizeof data);
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, data, sizeof data));
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    uint64_t snap_a = 0;
+    STM_ASSERT_OK(stm_snapshot_create(sidx, /*ds*/1, "a", 0,
+                                          stm_sync_current_gen(s), &snap_a));
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 2, 0, data, sizeof data));
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    uint64_t snap_b = 0;
+    STM_ASSERT_OK(stm_snapshot_create(sidx, /*ds*/1, "b", 0,
+                                          stm_sync_current_gen(s), &snap_b));
+
+    /* from=snap_b (newer) → to=snap_a (older): inverted. */
+    stm_send_handle *sh = NULL;
+    STM_ASSERT_ERR(stm_send_init(s, /*ds=*/1, snap_b, snap_a, &sh), STM_EINVAL);
+    STM_ASSERT_TRUE(sh == NULL);
+
+    testpool_teardown(&src);
+}
+
+/* R40 P3-5: two consecutive snap_creates with no intervening commit
+ * share the same captured extent_txg. Chain accepts (validator uses
+ * < not ≤). send_init refuses the snap-pair with STM_EINVAL since
+ * gen_min_excl >= gen_max_incl (empty diff treated as a caller bug). */
+STM_TEST(incremental_send_equal_extent_txg_chain_accepted_send_rejected) {
+    testpool src; testpool_setup(&src, "inc_eq", POOL_UUID_SRC);
+
+    stm_sync *s = stm_fs_sync_for_test(src.fs);
+    stm_snapshot_index *sidx = stm_sync_snapshot_index(s);
+    STM_ASSERT_TRUE(sidx != NULL);
+
+    /* Two snap_creates back-to-back share current_gen. */
+    uint64_t gen_at_create = stm_sync_current_gen(s);
+    uint64_t snap_a = 0, snap_b = 0;
+    STM_ASSERT_OK(stm_snapshot_create(sidx, /*ds*/1, "a", 0,
+                                          gen_at_create, &snap_a));
+    STM_ASSERT_OK(stm_snapshot_create(sidx, /*ds*/1, "b", 0,
+                                          gen_at_create, &snap_b));
+
+    /* Roundtrip: commit + unmount + remount; chain validator accepts
+     * (extent_txg equal across chain edges is allowed per spec). */
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    stm_snapshot_entry ea = {0}, eb = {0};
+    STM_ASSERT_OK(stm_snapshot_lookup(sidx, snap_a, &ea));
+    STM_ASSERT_OK(stm_snapshot_lookup(sidx, snap_b, &eb));
+    STM_ASSERT_EQ(ea.extent_txg, eb.extent_txg);
+
+    /* send_init with these snaps: gen_min_excl == gen_max_incl ⇒
+     * EINVAL (caller bug — the diff is empty by construction). */
+    stm_send_handle *sh = NULL;
+    STM_ASSERT_ERR(stm_send_init(s, /*ds=*/1, snap_a, snap_b, &sh), STM_EINVAL);
+    STM_ASSERT_TRUE(sh == NULL);
+
+    testpool_teardown(&src);
+}
+
 /* ========================================================================= */
 /* Wire-format / state-machine error paths.                                   */
 /* ========================================================================= */

@@ -632,11 +632,19 @@ STM_TEST(snapshot_persist_commit_load_roundtrip) {
                                                       SPP_POOL_UUID,
                                                       SPP_DEVICE_UUID));
 
-    /* Snap two datasets. */
+    /* Snap two datasets. R40 P3-2: stamp distinct extent_txg
+     * values so the persist-roundtrip exercises every byte of the
+     * new field's encoding (regression-catches an off-by-8 in the
+     * v14 layout). Per-dataset chain ordering: snap_alpha's
+     * extent_txg ≤ snap_beta's (same ds=1); snap_gamma is on ds=2,
+     * unconstrained. */
     uint64_t a = 0, b1 = 0, c = 0;
-    STM_ASSERT_OK(stm_snapshot_create(idx, /*ds*/ 1, "snap_alpha", 0xfeed01, 0, &a));
-    STM_ASSERT_OK(stm_snapshot_create(idx, /*ds*/ 1, "snap_beta",  0xfeed02, 0, &b1));
-    STM_ASSERT_OK(stm_snapshot_create(idx, /*ds*/ 2, "snap_gamma", 0xfeed03, 0, &c));
+    STM_ASSERT_OK(stm_snapshot_create(idx, /*ds*/ 1, "snap_alpha", 0xfeed01,
+                                          /*extent_txg=*/0x1111111111111111ull, &a));
+    STM_ASSERT_OK(stm_snapshot_create(idx, /*ds*/ 1, "snap_beta",  0xfeed02,
+                                          /*extent_txg=*/0x2222222222222222ull, &b1));
+    STM_ASSERT_OK(stm_snapshot_create(idx, /*ds*/ 2, "snap_gamma", 0xfeed03,
+                                          /*extent_txg=*/0x3333333333333333ull, &c));
 
     /* Hold snap_alpha twice (should persist). */
     STM_ASSERT_OK(stm_snapshot_hold(idx, a));
@@ -675,10 +683,13 @@ STM_TEST(snapshot_persist_commit_load_roundtrip) {
     STM_ASSERT_EQ(e.hold_count, (uint32_t)2);   /* persisted holds */
     STM_ASSERT_EQ(e.name_len, (uint32_t)10);
     STM_ASSERT_EQ(memcmp(e.name, "snap_alpha", 10), 0);
+    /* R40 P3-2: extent_txg roundtrip. */
+    STM_ASSERT_EQ(e.extent_txg, (uint64_t)0x1111111111111111ull);
 
     STM_ASSERT_OK(stm_snapshot_lookup(idx2, c, &e));
     STM_ASSERT_EQ(e.dataset_id, (uint64_t)2);
     STM_ASSERT_EQ(e.tree_root_paddr, (uint64_t)0xfeed03);
+    STM_ASSERT_EQ(e.extent_txg, (uint64_t)0x3333333333333333ull);
 
     STM_ASSERT_ERR(stm_snapshot_lookup(idx2, b1, &e), STM_ENOENT);
 
