@@ -38,8 +38,44 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R45-hash-fixup pending. Substantive `e6a751c` +
-  R45 close `f30db5e`.
+- **Tip**: post-R46-hash-fixup pending. Substantive `01b5233` +
+  R46 close `485f0ef`.
+  **P7-14 snap chain-ordering regression — closes R40 P3-3 (the
+  long-standing audit deferral noting there was no on-disk
+  regression test for `sp_validate_shadow`'s
+  `ChainExtentTxgOrdered` validator). New gated test-only API
+  `stm_snapshot_create_for_test` lives in
+  `<stratum/snapshot_testing.h>` and bypasses ONLY the R40 P2-1
+  in-process check (all other arg validation runs); same shape
+  as `stm_snapshot_create` minus the chain-ordering refusal.
+  R40 P2-1's in-process check has its own test
+  (`snap_create_in_process_chain_ordering_refused`); the on-disk
+  validator path is exercised by
+  `fs_snap_chain_inversion_on_disk_refused_at_mount` — full
+  format → mount → install one valid + one chain-inverted snap
+  via `_for_test` → fs_commit → unmount → remount → expect
+  STM_ECORRUPT from sp_validate_shadow. Refactored
+  `stm_snapshot_create`'s body into a static
+  `snapshot_create_inner` helper that takes a `skip_chain_check`
+  flag; both public functions collapse to one-line forwards
+  (single source of truth for arg validation). R46 P2-1 hardened
+  the test seam: gated `_for_test` symbol behind the new
+  `STRATUM_BUILD_TESTING_HOOKS` CMake option (default ON for the
+  in-tree dev/test build, opt-out for production via
+  `-DSTRATUM_BUILD_TESTING_HOOKS=OFF`). Verified out-of-tree:
+  with HOOKS=OFF, `nm libstm_snapshot.a` shows the production
+  `stm_snapshot_create` only — the bypass symbol is absent from
+  the archive, so production code can't even mistakenly
+  extern-declare it. R46 fixes: P2-1 + P3-1 (tightened on-disk
+  assertion to STM_ECORRUPT — propagation chain doesn't wrap)
+  + P3-2 (prelude consolidation) + P3-3 (added NULL-name,
+  NULL-out_id, oversize-name to _for_test test) + P3-4 (chain-
+  inversion rejection added to reference/13-snapshot.md
+  validator-rejection prose). No format break, no spec change.
+  test_snapshot 41 → 43; test_fs 40 → 41. 33 ctest suites green
+  default + ASan + TSan in isolated runs.**
+  Prior: P7-13 fs_create_dataset `e6a751c` + R45 close `f30db5e`
+  + hash fixup `5f65f37`.
   **P7-13 fs_create_dataset — bundles `stm_dataset_create_child` +
   `stm_sync_add_dataset_key` into one fs-level API under
   `fs->lock`. Removes the test_fs restriction "only ds=1 (root)

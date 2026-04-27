@@ -185,6 +185,45 @@ into the CAS tier (which DOES need P6) is a separate concern.
       gen filter is best-effort because `snapshot.created_txg` and
       `sync.current_gen` are independent counters — closed in P7-8.
       No format break in P7-7; STM_UB_VERSION stays at 13.
+- [x] **P7-14 snap chain-ordering regression test** — landed at
+      `01b5233`; R46 close `485f0ef` (0 P0 + 0 P1 + 1 P2 + 4 P3).
+      Closes the long-deferred R40 P3-3 (no on-disk regression
+      test for `sp_validate_shadow`'s `ChainExtentTxgOrdered`
+      check; introduced in P7-8). The R40 P2-1 fix added an
+      in-process producer-side check at `stm_snapshot_create`
+      that refuses STM_EINVAL on chain inversion; the on-disk
+      validator at `sp_validate_shadow` is the second line of
+      defense for cases where a buggy producer or tampered disk
+      sneaks past it, and now has matching regression coverage.
+      New test-only API `stm_snapshot_create_for_test` (in
+      `<stratum/snapshot_testing.h>`) bypasses ONLY the R40 P2-1
+      check; all other arg validation runs. Three new tests: in-
+      process check fires on same-dataset chain inversion +
+      tolerates per-dataset isolation + accepts the equality case
+      (`snap_create_in_process_chain_ordering_refused`); _for_test
+      seam accepts the inverted shape and still validates every
+      other prelude check
+      (`snap_create_for_test_bypasses_chain_ordering_check`); on-
+      disk validator rejects the chain-inverted shape at mount-
+      load with STM_ECORRUPT
+      (`fs_snap_chain_inversion_on_disk_refused_at_mount`).
+      Refactored `stm_snapshot_create`'s body into a static
+      `snapshot_create_inner` helper that takes a
+      `skip_chain_check` flag; both public functions collapse to
+      one-line forwards. R46 P2-1: gated `_for_test` symbol
+      behind a new `STRATUM_BUILD_TESTING_HOOKS` CMake option
+      (default ON for in-tree dev/test build, opt-out via
+      `-DSTRATUM_BUILD_TESTING_HOOKS=OFF`); verified out-of-tree
+      that the production-built `libstm_snapshot.a` exports only
+      `_stm_snapshot_create` with the option OFF. R46 fixes: P2-1
+      + P3-1 (tightened on-disk assertion to STM_ECORRUPT) + P3-2
+      (consolidated arg-validation prelude into the inner helper)
+      + P3-3 (added NULL-name, NULL-out_id, oversize-name to
+      _for_test arg test) + P3-4 (added chain-inversion rejection
+      to reference/13-snapshot.md validator prose). No format
+      break, no spec change. test_snapshot 41 → 43; test_fs 40 →
+      41; 33 ctest suites green default + ASan + TSan in isolated
+      runs.
 - [x] **P7-13 fs_create_dataset** — landed at `e6a751c`; R45 close
       `f30db5e` (0 P0 + 0 P1 + 1 P2 + 4 P3). New public API
       `stm_fs_create_dataset(fs, parent_id, name, *out_id)` bundles
