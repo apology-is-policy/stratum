@@ -540,6 +540,102 @@ stm_status stm_extent_truncate(stm_extent_index *idx,
     return rs;
 }
 
+/* P7-12: peek-only count of past-truncation extents + replicas. */
+stm_status stm_extent_truncate_peek(const stm_extent_index *idx,
+                                       uint64_t dataset_id, uint64_t ino,
+                                       uint64_t new_size,
+                                       size_t *out_n_extents,
+                                       size_t *out_n_replicas_total) {
+    if (!idx || !out_n_extents || !out_n_replicas_total) return STM_EINVAL;
+    if (dataset_id == 0 || ino == 0) return STM_EINVAL;
+
+    *out_n_extents        = 0;
+    *out_n_replicas_total = 0;
+
+    pthread_mutex_t *lock = ex_lock(idx);
+    must_lock(lock);
+    for (size_t i = 0; i < idx->n_records; i++) {
+        const stm_extent_record *e = &idx->records[i];
+        if (e->dataset_id != dataset_id || e->ino != ino) continue;
+        if (e->off < new_size) continue;
+        (*out_n_extents)++;
+        *out_n_replicas_total += e->n_replicas;
+    }
+    must_unlock(lock);
+    return STM_OK;
+}
+
+/* P7-12: drop_by_predicate variant that uses caller-provided
+ * pre-allocated buffers and never allocates. Returns STM_ERANGE if
+ * either cap is insufficient (atomic — index unchanged on ERANGE).
+ *
+ * Caller already holds idx->lock. */
+static stm_status drop_by_predicate_into_locked(stm_extent_index *idx,
+                                                  uint64_t ds, uint64_t ino,
+                                                  bool delete_all,
+                                                  uint64_t threshold,
+                                                  size_t *drop_idx_buf,
+                                                  size_t drop_idx_cap,
+                                                  uint64_t *paddrs_buf,
+                                                  size_t paddrs_cap,
+                                                  size_t *out_n_dropped) {
+    *out_n_dropped = 0;
+
+    /* First pass: collect drop indices into the caller-provided
+     * scratch buffer. STM_ERANGE if cap is too small — index
+     * unchanged. */
+    size_t n_drops = 0;
+    size_t n_replicas_needed = 0;
+    for (size_t i = 0; i < idx->n_records; i++) {
+        const stm_extent_record *e = &idx->records[i];
+        if (e->dataset_id != ds || e->ino != ino) continue;
+        if (!delete_all && e->off < threshold) continue;
+        if (n_drops >= drop_idx_cap) return STM_ERANGE;
+        drop_idx_buf[n_drops++] = i;
+        n_replicas_needed += e->n_replicas;
+    }
+
+    if (n_replicas_needed > paddrs_cap) return STM_ERANGE;
+
+    if (n_drops == 0) return STM_OK;
+
+    /* Second phase: compact + emit paddrs. Reuses the existing
+     * helper. The helper expects out_paddrs sized to the total
+     * replicas — verified above. */
+    size_t emitted = remove_indices_locked(idx, drop_idx_buf, n_drops,
+                                              paddrs_buf);
+    *out_n_dropped = emitted;
+    return STM_OK;
+}
+
+stm_status stm_extent_truncate_into(stm_extent_index *idx,
+                                       uint64_t dataset_id, uint64_t ino,
+                                       uint64_t new_size,
+                                       size_t *drop_idx_buf, size_t drop_idx_cap,
+                                       uint64_t *paddrs_buf, size_t paddrs_cap,
+                                       size_t *out_n_dropped) {
+    if (!out_n_dropped) return STM_EINVAL;
+    *out_n_dropped = 0;
+    if (!idx) return STM_EINVAL;
+    if (dataset_id == 0 || ino == 0) return STM_EINVAL;
+    /* drop_idx_buf / paddrs_buf may be NULL only when their cap is 0
+     * AND no drops are expected; otherwise we'd dereference null.
+     * Allow NULL+0 so a caller that peeked zero can pass NULL safely. */
+    if (drop_idx_cap > 0 && !drop_idx_buf) return STM_EINVAL;
+    if (paddrs_cap   > 0 && !paddrs_buf)   return STM_EINVAL;
+
+    must_lock(&idx->lock);
+    stm_status rs = drop_by_predicate_into_locked(idx, dataset_id, ino,
+                                                     /*delete_all=*/false,
+                                                     /*threshold=*/new_size,
+                                                     drop_idx_buf, drop_idx_cap,
+                                                     paddrs_buf, paddrs_cap,
+                                                     out_n_dropped);
+    if (rs == STM_OK && *out_n_dropped > 0) idx->dirty = true;
+    must_unlock(&idx->lock);
+    return rs;
+}
+
 stm_status stm_extent_delete_file(stm_extent_index *idx,
                                     uint64_t dataset_id, uint64_t ino,
                                     uint64_t **out_dropped_paddrs,

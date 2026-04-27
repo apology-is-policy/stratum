@@ -4085,35 +4085,29 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
  *      those paddrs through sync_drop_paddr_locked.
  *   5. Release sync->lock.
  *
- * Atomicity scope (R43 P3-1 honest accounting):
+ * Atomicity scope (post-P7-12):
  *
- *   - **R41 P3-1 case (a) — CLOSED**: a concurrent stm_sync_commit
- *     can no longer interleave between Phase 3 (prefix re-encrypt)
- *     and Phase 4 (past-extent drop) because both phases share one
- *     sync->lock acquisition; sync_commit takes s->lock for its
- *     entire duration and therefore blocks until truncate releases.
+ *   - **R41 P3-1 case (a) — CLOSED (P7-11)**: a concurrent
+ *     stm_sync_commit can no longer interleave between Phase 3
+ *     (prefix re-encrypt) and Phase 4 (past-extent drop) because
+ *     both phases share one sync->lock acquisition; sync_commit
+ *     takes s->lock for its entire duration and therefore blocks
+ *     until truncate releases.
  *
- *   - **R41 P3-1 case (b) — STILL OPEN**: Phase 4's
- *     stm_extent_truncate can still return STM_ENOMEM (its
- *     drop_by_predicate_locked allocates drop_idx[] + paddrs[]
- *     proportional to the past-extent count). On that failure path,
- *     truncate just unlocks and returns ENOMEM. Phase 3's
- *     extent_overwrite has already mutated the in-RAM extent_idx
- *     (the prefix-shrunk record is in place, the original crossing
- *     extent's replicas are dead-listed/freed). The next successful
- *     stm_sync_commit then persists the partial on-disk state:
- *     prefix shrunk + past extents still present. No load-bearing
- *     invariant (NoOverlap, PaddrFreshness, LiveReplicasDisjoint,
- *     nonce uniqueness) is violated; this is a POSIX-atomicity gap,
- *     not a corruption hazard. Closing case (b) requires either
- *     pre-allocating Phase 4's working buffers before Phase 3 (so
- *     Phase 4 cannot fail with ENOMEM) or implementing a true
- *     reverse-of-Phase-3 rollback at the extent_idx level. Both are
- *     deferred follow-on chunks; the operator-visible mitigation
- *     until then is to retry the truncate (idempotent: the second
- *     call sees the partial state and only does Phase 4).
+ *   - **R41 P3-1 case (b) — CLOSED (P7-12)**: Phase 4's working
+ *     buffers (drop_idx[] + paddrs[]) are now pre-allocated by
+ *     stm_sync_truncate via stm_extent_truncate_peek BEFORE Phase 3
+ *     runs. Phase 4 calls stm_extent_truncate_into which never
+ *     allocates — any ENOMEM surfaces during pre-alloc, before
+ *     Phase 3 has touched the extent_idx, leaving the index
+ *     unchanged. The peek's count remains accurate at Phase 4 time
+ *     because Phase 3's stm_sync_write_extent_locked only touches
+ *     the crossing extent's range [crossing.off, crossing.off +
+ *     crossing.len) ⊂ [0, new_size); past-extents at off ≥ new_size
+ *     are untouched.
  *
- *   - **R41 P3-2 — CLOSED**: same single-lock-hold reason as (a).
+ *   - **R41 P3-2 — CLOSED (P7-11)**: same single-lock-hold reason
+ *     as case (a).
  *
  * The trade-off is lock-hold duration: the prefix's decrypt + encrypt
  * + bdev I/O all happen under s->lock. For an MVP at 128 KiB
@@ -4154,6 +4148,50 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
         }
     }
 
+    /* P7-12: Phase 1b — peek-count past-extents and pre-allocate
+     * Phase 3's working buffers BEFORE Phase 2's overwrite. This
+     * closes R41 P3-1 case (b): without pre-allocation, Phase 3's
+     * stm_extent_truncate could fail with STM_ENOMEM after Phase 2
+     * had already mutated the extent_idx, leaving a partial in-RAM
+     * state committable by the next sync_commit. With pre-alloc,
+     * Phase 3 uses stm_extent_truncate_into which never allocates;
+     * any failure surfaces here BEFORE Phase 2 runs, leaving the
+     * index unchanged.
+     *
+     * Phase 2's stm_sync_write_extent_locked only touches the
+     * crossing extent's range (off in [crossing.off, crossing.off+
+     * crossing.len) ⊂ [0, new_size)); past-extents at off ≥ new_size
+     * are untouched, so the peek's count remains accurate when we
+     * call _into in Phase 3. */
+    size_t past_n_extents = 0, past_n_replicas = 0;
+    {
+        stm_status ps = stm_extent_truncate_peek(s->extent_idx, dataset_id, ino,
+                                                    new_size,
+                                                    &past_n_extents,
+                                                    &past_n_replicas);
+        if (ps != STM_OK) {
+            pthread_mutex_unlock(&s->lock);
+            return ps;
+        }
+    }
+    size_t   *drop_idx_buf = NULL;
+    uint64_t *paddrs_buf   = NULL;
+    if (past_n_extents > 0) {
+        drop_idx_buf = malloc(past_n_extents * sizeof(size_t));
+        if (!drop_idx_buf) {
+            pthread_mutex_unlock(&s->lock);
+            return STM_ENOMEM;
+        }
+        if (past_n_replicas > 0) {
+            paddrs_buf = malloc(past_n_replicas * sizeof(uint64_t));
+            if (!paddrs_buf) {
+                free(drop_idx_buf);
+                pthread_mutex_unlock(&s->lock);
+                return STM_ENOMEM;
+            }
+        }
+    }
+
     /* Phase 2: shrink the crossing extent by read+decrypt+re-encrypt
      * of the kept prefix. stm_sync_write_extent_locked's extent_overwrite
      * drops the original (now superseded) and routes its paddrs
@@ -4165,11 +4203,15 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
          * format-break drift) could feed an attacker-controlled
          * malloc size. Mirrors the scrub cb's defensive check. */
         if (rec.len == 0 || rec.len > STM_FS_RECORDSIZE_MAX) {
+            free(drop_idx_buf);
+            free(paddrs_buf);
             pthread_mutex_unlock(&s->lock);
             return STM_ECORRUPT;
         }
         void *plain = malloc(rec.len);
         if (!plain) {
+            free(drop_idx_buf);
+            free(paddrs_buf);
             pthread_mutex_unlock(&s->lock);
             return STM_ENOMEM;
         }
@@ -4180,12 +4222,16 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
         if (rs != STM_OK) {
             stm_ct_memzero(plain, rec.len);
             free(plain);
+            free(drop_idx_buf);
+            free(paddrs_buf);
             pthread_mutex_unlock(&s->lock);
             return rs;
         }
         if (got != rec.len) {
             stm_ct_memzero(plain, rec.len);
             free(plain);
+            free(drop_idx_buf);
+            free(paddrs_buf);
             pthread_mutex_unlock(&s->lock);
             return STM_EIO;
         }
@@ -4196,27 +4242,46 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
         stm_ct_memzero(plain, rec.len);
         free(plain);
         if (ws != STM_OK) {
+            free(drop_idx_buf);
+            free(paddrs_buf);
             pthread_mutex_unlock(&s->lock);
             return ws;
         }
     }
 
-    /* Phase 3: drop every extent past new_size + drop-route. */
-    uint64_t *dropped = NULL;
-    size_t    n_dropped = 0;
-    stm_status ts = stm_extent_truncate(s->extent_idx, dataset_id, ino,
-                                           new_size, &dropped, &n_dropped);
+    /* Phase 3 (P7-12 fault-free): drop past-extents into the
+     * pre-allocated buffers. By construction this cannot return
+     * STM_ENOMEM — _into never allocates. STM_ERANGE is also
+     * impossible because peek's count is consistent with the
+     * current state (Phase 2's overwrite touched only the crossing
+     * extent's range, leaving past-extents untouched). Any other
+     * status is a programming error. */
+    size_t n_dropped = 0;
+    stm_status ts = stm_extent_truncate_into(s->extent_idx, dataset_id, ino,
+                                                new_size,
+                                                drop_idx_buf, past_n_extents,
+                                                paddrs_buf, past_n_replicas,
+                                                &n_dropped);
     if (ts != STM_OK) {
+        /* Should not happen post-peek; surface as ECORRUPT to avoid
+         * silent breakage. The atomicity claim below assumes we don't
+         * get here. */
+        free(drop_idx_buf);
+        free(paddrs_buf);
         pthread_mutex_unlock(&s->lock);
         return ts;
     }
 
+    /* Drop-route every past-extent's paddrs. Best-effort: a failed
+     * sync_drop_paddr_locked for one paddr surfaces in the return
+     * value but doesn't abort the loop (R36 P1-1 / P2-1). */
     stm_status drop_err = STM_OK;
     for (size_t i = 0; i < n_dropped; i++) {
-        stm_status drs = sync_drop_paddr_locked(s, dataset_id, dropped[i]);
+        stm_status drs = sync_drop_paddr_locked(s, dataset_id, paddrs_buf[i]);
         if (drs != STM_OK && drop_err == STM_OK) drop_err = drs;
     }
-    free(dropped);
+    free(drop_idx_buf);
+    free(paddrs_buf);
 
     pthread_mutex_unlock(&s->lock);
     return drop_err;

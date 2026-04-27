@@ -326,6 +326,61 @@ stm_status stm_extent_truncate(stm_extent_index *idx,
                                   size_t *out_n_dropped);
 
 /*
+ * P7-12: peek-only count of past-truncation extents + their total
+ * replicas, without mutating the index. Returns the exact buffer
+ * sizes a subsequent `stm_extent_truncate_into` will need. Pure
+ * read; idempotent.
+ *
+ * If nothing would be dropped, `*out_n_extents = *out_n_replicas_total
+ * = 0`. Used by `stm_sync_truncate` to pre-allocate Phase 3 buffers
+ * BEFORE Phase 2's overwrite, eliminating the R41 P3-1 case-(b)
+ * partial-state hazard (Phase 3 ENOMEM after Phase 2 succeeded).
+ */
+STM_MUST_USE
+stm_status stm_extent_truncate_peek(const stm_extent_index *idx,
+                                       uint64_t dataset_id, uint64_t ino,
+                                       uint64_t new_size,
+                                       size_t *out_n_extents,
+                                       size_t *out_n_replicas_total);
+
+/*
+ * P7-12: truncate using caller-provided pre-allocated buffers.
+ *
+ * `drop_idx_buf[drop_idx_cap]` is internal scratch (records the
+ * dropped record indices for the compacting walk). `paddrs_buf
+ * [paddrs_cap]` is the output (flattened replica paddrs of every
+ * dropped extent). Both buffers are caller-owned; this function
+ * NEVER allocates.
+ *
+ * Sizing: caller MUST first call `stm_extent_truncate_peek` and
+ * allocate `drop_idx_cap >= out_n_extents`, `paddrs_cap >=
+ * out_n_replicas_total`. Bigger is fine. Smaller surfaces as
+ * STM_ERANGE — atomic, the index is unchanged.
+ *
+ * Atomicity property (R41 P3-1 case (b) closure): if peek-then-
+ * allocate-then-into is invoked sequentially under one outer lock
+ * (stm_sync_truncate's pattern post-P7-11 single-lock-span),
+ * `_into` is fault-free for the cap match: it cannot return
+ * STM_ENOMEM because it never allocates. The whole truncate becomes
+ * commit-atomic w.r.t. the in-RAM extent_idx.
+ *
+ * Returns:
+ *   STM_OK         — drops committed; *out_n_dropped populated;
+ *                     paddrs_buf[0..*out_n_dropped) holds dropped
+ *                     paddrs in record-then-replica order.
+ *   STM_ERANGE     — drop_idx_cap or paddrs_cap insufficient;
+ *                     index unchanged; *out_n_dropped = 0.
+ *   STM_EINVAL     — bad args (NULL idx/buffers/out, zero ds/ino).
+ */
+STM_MUST_USE
+stm_status stm_extent_truncate_into(stm_extent_index *idx,
+                                       uint64_t dataset_id, uint64_t ino,
+                                       uint64_t new_size,
+                                       size_t *drop_idx_buf, size_t drop_idx_cap,
+                                       uint64_t *paddrs_buf, size_t paddrs_cap,
+                                       size_t *out_n_dropped);
+
+/*
  * Drop every live extent for (ds, ino). Used on file unlink.
  *
  * Same out-arg semantics as truncate. Models extent.tla::DeleteFile.

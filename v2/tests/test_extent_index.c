@@ -1350,4 +1350,163 @@ STM_TEST(ex_persist_multi_replica_roundtrip) {
     unlink(mr_tmp_path);
 }
 
+/* ========================================================================= */
+/* P7-12: peek + truncate_into APIs (fault-free truncate composition).         */
+/* ========================================================================= */
+
+STM_TEST(ex_truncate_peek_counts_past_extents) {
+    /* Three extents at 0, 4096, 8192. Peek at new_size = 4096 must
+     * report 2 past extents (off=4096 + off=8192) with their replica
+     * counts summed. */
+    stm_extent_index *idx = NULL;
+    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+
+    uint64_t r1[1] = { 0xAA };
+    uint64_t r2[2] = { 0xBB, 0xCC };
+    uint64_t r3[3] = { 0xDD, 0xEE, 0xFF };
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0,    4096, r1, 1, 0, 0));
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 4096, 4096, r2, 2, 0, 0));
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 8192, 4096, r3, 3, 0, 0));
+
+    /* Peek at 4096 → drops [4096,8192) and [8192,12288) — 2 extents,
+     * 2 + 3 = 5 replicas. */
+    size_t n_ext = 0, n_repl = 0;
+    STM_ASSERT_OK(stm_extent_truncate_peek(idx, 1, 1, 4096, &n_ext, &n_repl));
+    STM_ASSERT_EQ(n_ext, (size_t)2);
+    STM_ASSERT_EQ(n_repl, (size_t)5);
+
+    /* Peek at 0 → drops everything. 3 extents, 1+2+3 = 6 replicas. */
+    STM_ASSERT_OK(stm_extent_truncate_peek(idx, 1, 1, 0, &n_ext, &n_repl));
+    STM_ASSERT_EQ(n_ext, (size_t)3);
+    STM_ASSERT_EQ(n_repl, (size_t)6);
+
+    /* Peek at 12288 (end of file) → drops nothing. */
+    STM_ASSERT_OK(stm_extent_truncate_peek(idx, 1, 1, 12288, &n_ext, &n_repl));
+    STM_ASSERT_EQ(n_ext, (size_t)0);
+    STM_ASSERT_EQ(n_repl, (size_t)0);
+
+    /* Peek doesn't mutate. Verify all 3 extents still present. */
+    size_t cnt = 0;
+    STM_ASSERT_OK(stm_extent_count_for_ino(idx, 1, 1, &cnt));
+    STM_ASSERT_EQ(cnt, (size_t)3);
+
+    stm_extent_index_close(idx);
+}
+
+STM_TEST(ex_truncate_into_uses_pre_allocated_buffers) {
+    /* Same setup; pre-allocate exact-cap buffers and call _into. */
+    stm_extent_index *idx = NULL;
+    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+
+    uint64_t r1[1] = { 0xAA };
+    uint64_t r2[2] = { 0xBB, 0xCC };
+    uint64_t r3[3] = { 0xDD, 0xEE, 0xFF };
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0,    4096, r1, 1, 0, 0));
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 4096, 4096, r2, 2, 0, 0));
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 8192, 4096, r3, 3, 0, 0));
+
+    size_t n_ext = 0, n_repl = 0;
+    STM_ASSERT_OK(stm_extent_truncate_peek(idx, 1, 1, 4096, &n_ext, &n_repl));
+
+    size_t   *drop_idx = malloc(n_ext  * sizeof *drop_idx);
+    uint64_t *paddrs   = malloc(n_repl * sizeof *paddrs);
+    STM_ASSERT(drop_idx != NULL);
+    STM_ASSERT(paddrs   != NULL);
+
+    size_t n_dropped = 0;
+    STM_ASSERT_OK(stm_extent_truncate_into(idx, 1, 1, 4096,
+                                              drop_idx, n_ext,
+                                              paddrs,   n_repl,
+                                              &n_dropped));
+    STM_ASSERT_EQ(n_dropped, (size_t)5);
+
+    /* All 5 dropped paddrs must be from r2 + r3 (in some order). */
+    bool seen[5] = { false };
+    uint64_t expected[5] = { 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
+    for (size_t i = 0; i < n_dropped; i++) {
+        for (size_t j = 0; j < 5; j++) {
+            if (paddrs[i] == expected[j]) { seen[j] = true; break; }
+        }
+    }
+    for (size_t j = 0; j < 5; j++) STM_ASSERT(seen[j]);
+
+    free(drop_idx);
+    free(paddrs);
+
+    /* Only the surviving extent at off=0 remains. */
+    size_t cnt = 0;
+    STM_ASSERT_OK(stm_extent_count_for_ino(idx, 1, 1, &cnt));
+    STM_ASSERT_EQ(cnt, (size_t)1);
+
+    stm_extent_index_close(idx);
+}
+
+STM_TEST(ex_truncate_into_refuses_undersized_buffer_and_keeps_state) {
+    /* If drop_idx_cap or paddrs_cap is smaller than peek would
+     * require, _into returns STM_ERANGE and leaves the index
+     * unchanged. */
+    stm_extent_index *idx = NULL;
+    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+
+    uint64_t r1[2] = { 0xAA, 0xBB };
+    uint64_t r2[2] = { 0xCC, 0xDD };
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0,    4096, r1, 2, 0, 0));
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 4096, 4096, r2, 2, 0, 0));
+
+    /* Need 1 drop + 2 replicas; provide 0 drop_idx slots. */
+    size_t   drop_idx_too_small[1] = { 0 };
+    uint64_t paddrs[8];
+    size_t n_dropped = 99;
+    STM_ASSERT_ERR(stm_extent_truncate_into(idx, 1, 1, 4096,
+                                               drop_idx_too_small, 0,
+                                               paddrs, 8,
+                                               &n_dropped),
+                       STM_ERANGE);
+    STM_ASSERT_EQ(n_dropped, (size_t)0);
+
+    /* Index unchanged: still 2 extents present. */
+    size_t cnt = 0;
+    STM_ASSERT_OK(stm_extent_count_for_ino(idx, 1, 1, &cnt));
+    STM_ASSERT_EQ(cnt, (size_t)2);
+
+    /* Now provide enough drop_idx but undersized paddrs. */
+    size_t   drop_idx[4];
+    uint64_t paddrs_too_small[1];
+    n_dropped = 99;
+    STM_ASSERT_ERR(stm_extent_truncate_into(idx, 1, 1, 4096,
+                                               drop_idx, 4,
+                                               paddrs_too_small, 1,
+                                               &n_dropped),
+                       STM_ERANGE);
+    STM_ASSERT_EQ(n_dropped, (size_t)0);
+
+    /* Index still unchanged. */
+    STM_ASSERT_OK(stm_extent_count_for_ino(idx, 1, 1, &cnt));
+    STM_ASSERT_EQ(cnt, (size_t)2);
+
+    stm_extent_index_close(idx);
+}
+
+STM_TEST(ex_truncate_into_zero_drops_accepts_null_buffers) {
+    /* When peek says 0 + 0, caller may pass NULL/0 buffers. */
+    stm_extent_index *idx = NULL;
+    STM_ASSERT_OK(stm_extent_index_create(0, &idx));
+
+    uint64_t r1[1] = { 0xAA };
+    STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, r1, 1, 0, 0));
+
+    size_t n_dropped = 99;
+    STM_ASSERT_OK(stm_extent_truncate_into(idx, 1, 1, 4096,
+                                              /*drop_idx=*/NULL, 0,
+                                              /*paddrs=*/NULL,   0,
+                                              &n_dropped));
+    STM_ASSERT_EQ(n_dropped, (size_t)0);
+
+    size_t cnt = 0;
+    STM_ASSERT_OK(stm_extent_count_for_ino(idx, 1, 1, &cnt));
+    STM_ASSERT_EQ(cnt, (size_t)1);
+
+    stm_extent_index_close(idx);
+}
+
 STM_TEST_MAIN("test_extent_index")
