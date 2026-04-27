@@ -206,6 +206,16 @@ typedef struct {
     uint64_t origin_dataset_id;
     uint64_t origin_ino;
     uint64_t origin_off;
+    /* P7-16 / R48 P0-1: link_gen — gen at which THIS record was
+     * inserted into the live extent index (separate from `gen` which
+     * is the AEAD encryption gen, inherited from src for reflinks).
+     * Used by the send/recv pipeline's incremental gen filter so a
+     * reflinked record created in window (S_from, S_to] is included
+     * even though its `gen` (= src's AEAD gen) may predate
+     * S_from.extent_txg. For freshly-written extents link_gen == gen;
+     * for reflinked extents link_gen == current_txg-at-reflink-time
+     * (caller-provided to stm_extent_reflink). */
+    uint64_t link_gen;
 } stm_extent_record;
 
 struct stm_extent_index;
@@ -441,7 +451,8 @@ stm_status stm_extent_reflink(stm_extent_index *idx,
                                 uint64_t gen, uint64_t key_id,
                                 uint64_t origin_dataset_id,
                                 uint64_t origin_ino,
-                                uint64_t origin_off);
+                                uint64_t origin_off,
+                                uint64_t link_gen);
 
 /*
  * Look up the live extent of (ds, ino) covering byte offset `off`.

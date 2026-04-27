@@ -64,6 +64,11 @@ typedef struct {
     uint64_t origin_dataset_id;
     uint64_t origin_ino;
     uint64_t origin_off;
+    /* R48 P0-1: link_gen — the gen at which this record was inserted
+     * into the live index. The collect-pass send filter uses link_gen
+     * (NOT gen) so reflinked records created in window (S_from, S_to]
+     * are included even when their AEAD gen predates S_from. */
+    uint64_t link_gen;
 } send_extent_meta;
 
 /* P7-10 / R42 P2-1: snapshot of (key_id, DEK) pairs the send needs.
@@ -138,9 +143,15 @@ static bool send_collect_cb(const stm_extent_record *e, void *ctx_) {
     send_collect_ctx *cc = ctx_;
     stm_send_handle *h = cc->h;
 
-    /* Filter by gen range: gen_min_excl < gen ≤ gen_max_incl. */
-    if (e->gen <= h->gen_min_excl) return true;
-    if (e->gen > h->gen_max_incl)  return true;
+    /* R48 P0-1: filter by link_gen (the gen at which this record was
+     * inserted into the live index), NOT the AEAD gen. Reflinked
+     * records inherit AEAD gen from src but stamp link_gen at
+     * reflink-time, so the (S_from, S_to] window catches them. For
+     * non-reflinked extents link_gen == gen so the semantics match
+     * pre-P7-16 (full + incremental still align with `extent.gen`-
+     * sourced bracketing). */
+    if (e->link_gen <= h->gen_min_excl) return true;
+    if (e->link_gen > h->gen_max_incl)  return true;
     /* R39 P2-2: n_replicas == 0 indicates extent-index corruption.
      * Refuse the send rather than silently skip — silent skip would
      * produce an incomplete stream that recv can't detect. */
@@ -169,6 +180,8 @@ static bool send_collect_cb(const stm_extent_record *e, void *ctx_) {
     m->origin_dataset_id = e->origin_dataset_id;
     m->origin_ino        = e->origin_ino;
     m->origin_off        = e->origin_off;
+    /* R48 P0-1: capture link_gen for the collect-pass filter. */
+    m->link_gen          = e->link_gen;
     return true;
 }
 

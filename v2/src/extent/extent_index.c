@@ -380,6 +380,8 @@ stm_status stm_extent_write(stm_extent_index *idx,
         .origin_dataset_id = dataset_id,
         .origin_ino        = ino,
         .origin_off        = off,
+        /* R48 P0-1: fresh write — link_gen == write_gen. */
+        .link_gen          = write_gen,
     };
     for (size_t i = 0; i < n_paddrs; i++) rec.paddrs[i] = paddrs[i];
     stm_status as = append_record_locked(idx, &rec);
@@ -523,6 +525,8 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
         .origin_dataset_id = dataset_id,
         .origin_ino        = ino,
         .origin_off        = off,
+        /* R48 P0-1: fresh ciphertext — link_gen == write_gen. */
+        .link_gen          = write_gen,
     };
     for (size_t i = 0; i < n_new_paddrs; i++) rec.paddrs[i] = new_paddrs[i];
     idx->records[idx->n_records++] = rec;
@@ -746,7 +750,8 @@ stm_status stm_extent_reflink(stm_extent_index *idx,
                                 uint64_t gen, uint64_t key_id,
                                 uint64_t origin_dataset_id,
                                 uint64_t origin_ino,
-                                uint64_t origin_off) {
+                                uint64_t origin_off,
+                                uint64_t link_gen) {
     if (!idx) return STM_EINVAL;
     if (dst_dataset_id == 0 || dst_ino == 0) return STM_EINVAL;
     if (origin_dataset_id == 0 || origin_ino == 0) return STM_EINVAL;
@@ -761,6 +766,13 @@ stm_status stm_extent_reflink(stm_extent_index *idx,
         must_unlock(&idx->lock);
         return STM_EINVAL;                       /* BirthTxgBound */
     }
+    /* R48 P0-1: link_gen also bounded by current_txg (BirthTxgBound
+     * applies to the link gen as well — the record can't be linked at
+     * a future gen). */
+    if (link_gen > idx->current_txg) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
     /* P7-16: dst-overlap check (NoOverlapWithinIno). */
     if (overlap_in_ino_locked(idx, dst_dataset_id, dst_ino, dst_off, len)) {
         must_unlock(&idx->lock);
@@ -769,7 +781,9 @@ stm_status stm_extent_reflink(stm_extent_index *idx,
     /* P7-16: SharedReplicasAreCohabit. Reuse of any paddr is permitted
      * ONLY when the existing extent's (replicas, gen, key_id, origin_*)
      * tuple matches the candidate. Catches the partial-overlap and
-     * different-origin buggy patterns. */
+     * different-origin buggy patterns. link_gen is excluded from the
+     * cohabit check — siblings created at different gens still share
+     * legitimately. */
     if (!cohabit_check_locked(idx, paddrs, n_paddrs, gen, key_id,
                                  origin_dataset_id, origin_ino, origin_off)) {
         must_unlock(&idx->lock);
@@ -785,6 +799,7 @@ stm_status stm_extent_reflink(stm_extent_index *idx,
         .origin_dataset_id = origin_dataset_id,
         .origin_ino        = origin_ino,
         .origin_off        = origin_off,
+        .link_gen          = link_gen,
     };
     for (size_t i = 0; i < n_paddrs; i++) rec.paddrs[i] = paddrs[i];
     stm_status as = append_record_locked(idx, &rec);
@@ -829,9 +844,16 @@ stm_status stm_extent_lookup_by_paddr(const stm_extent_index *idx,
 
     pthread_mutex_t *lock = ex_lock(idx);
     must_lock(lock);
-    /* P7-6: scan each extent's replica set. extent.tla::
-     * LiveReplicasDisjoint guarantees no paddr appears in two live
-     * extents' replicas, so first match suffices. */
+    /* P7-6: scan each extent's replica set.
+     *
+     * P7-16 / R48 P3-1 update: extent.tla::SharedReplicasAreCohabit
+     * (the relaxed P7-6 LiveReplicasDisjoint) guarantees that any
+     * extent records sharing a paddr ALSO share `gen`, `key_id`,
+     * AND `origin_*` — so the AEAD-AD identity is invariant across
+     * siblings. First match suffices for AD reconstruction; callers
+     * (production scrub β cb) using rec.paddrs[0] for nonce + rec.gen
+     * + rec.origin_* for AD see the same nonce + AD regardless of
+     * which sibling lookup_by_paddr returns. */
     for (size_t i = 0; i < idx->n_records; i++) {
         const stm_extent_record *e = &idx->records[i];
         for (uint8_t r = 0; r < e->n_replicas; r++) {
@@ -1001,7 +1023,9 @@ stm_status stm_extent_count_for_ino(const stm_extent_index *idx,
  *    16    8   paddr_1          (le64; 0 if n_replicas < 2)
  *    24    8   paddr_2          (le64; 0 if n_replicas < 3)
  *    32    8   paddr_3          (le64; 0 if n_replicas < 4)
- *    40    8   write_gen        (le64)
+ *    40    8   write_gen        (le64) — AEAD gen for nonce
+ *                                          construction; inherited from
+ *                                          src on Reflink.
  *    48    4   dlen             (le32; logical byte length)
  *    52    4   clen_and_comp    (le32; low 24: stored len; high 8: comp)
  *    56    8   key_id           (le64; per-dataset DEK key_id)
@@ -1011,12 +1035,20 @@ stm_status stm_extent_count_for_ino(const stm_extent_index *idx,
  *                                  of the encoded key.)
  *    72    8   origin_ino       (le64; AEAD-AD identity binding)
  *    80    8   origin_off       (le64; AEAD-AD identity binding)
- *    88    8   reserved         (zero — future per-extent integrity
- *                                  csum or chunking length slot)
+ *    88    8   link_gen         (le64) — R48 P0-1: gen at which THIS
+ *                                  record was inserted into the live
+ *                                  extent index. For fresh writes
+ *                                  link_gen == write_gen; for reflinks
+ *                                  link_gen == current_txg-at-reflink.
+ *                                  Drives send/recv's incremental
+ *                                  filter (vs `gen` which the AEAD
+ *                                  nonce uses, AEAD-inherited on
+ *                                  Reflink).
  *
  * v15→v16 was the repair-log header carve in superblock; the extent
  * value layout was unchanged in v16. v17 grows it 64 → 96 with the
- * three origin fields + 8 reserved. Format break: STM_UB_VERSION 17.
+ * three origin fields + the link_gen field. Format break:
+ * STM_UB_VERSION 17.
  * ========================================================================= */
 
 #define EX_KEY_LEN              24u                          /* ds + ino + off */
@@ -1084,12 +1116,14 @@ static stm_status ex_encode_value(const stm_extent_record *r,
 
     /* P7-16: origin (dataset_id, ino, offset) at v17 offsets 64..87. */
     le64 origin_ds  = stm_store_le64(r->origin_dataset_id);
-    le64 origin_ino = stm_store_le64(r->origin_ino);
+    le64 origin_ino_le = stm_store_le64(r->origin_ino);
     le64 origin_off = stm_store_le64(r->origin_off);
     memcpy(out + 64, origin_ds.v,  8);
-    memcpy(out + 72, origin_ino.v, 8);
+    memcpy(out + 72, origin_ino_le.v, 8);
     memcpy(out + 80, origin_off.v, 8);
-    /* bytes [88..95] reserved (zero, already zeroed above). */
+    /* R48 P0-1: link_gen at v17 offset 88..95. */
+    le64 link_gen_le = stm_store_le64(r->link_gen);
+    memcpy(out + 88, link_gen_le.v, 8);
     return STM_OK;
 }
 
@@ -1135,8 +1169,9 @@ static stm_status ex_decode_value(const uint8_t *in, size_t in_len,
     memcpy(origin_ds_le.v,  in + 64, 8);
     memcpy(origin_ino_le.v, in + 72, 8);
     memcpy(origin_off_le.v, in + 80, 8);
-    /* bytes [88..95] reserved — must be zero (anti-tamper). */
-    for (size_t i = 88; i < EX_VAL_LEN; i++) if (in[i] != 0) return STM_ECORRUPT;
+    /* R48 P0-1: link_gen at offsets 88..95 (le64). */
+    le64 link_gen_le;
+    memcpy(link_gen_le.v, in + 88, 8);
 
     uint32_t dlen = stm_load_le32(dlen_le);
     uint32_t cac  = stm_load_le32(cac_le);
@@ -1150,13 +1185,16 @@ static stm_status ex_decode_value(const uint8_t *in, size_t in_len,
     if (dlen == 0) return STM_ECORRUPT;
 
     /* P7-16: origin must satisfy basic typing. dataset_id and ino must
-     * be > 0 (sentinels reserved); origin_off has no upper bound here
-     * (extent.tla::OriginConsistentInBounds is enforced at the index-
-     * mutation site, not at the on-disk decode level). */
+     * be > 0 (sentinels reserved). R48 P2-2 also pins
+     * extent.tla::OriginConsistentInBounds: origin_off + dlen must
+     * not overflow (extents past origin's file size cap don't have
+     * legitimate ciphertext). */
     uint64_t origin_ds  = stm_load_le64(origin_ds_le);
-    uint64_t origin_ino = stm_load_le64(origin_ino_le);
+    uint64_t origin_ino_v = stm_load_le64(origin_ino_le);
     uint64_t origin_off = stm_load_le64(origin_off_le);
-    if (origin_ds == 0 || origin_ino == 0) return STM_ECORRUPT;
+    if (origin_ds == 0 || origin_ino_v == 0) return STM_ECORRUPT;
+    if (origin_off > UINT64_MAX - (uint64_t)dlen) return STM_ECORRUPT;
+    uint64_t link_gen_v = stm_load_le64(link_gen_le);
 
     out_rec->dataset_id = ds;
     out_rec->ino        = ino;
@@ -1169,8 +1207,9 @@ static stm_status ex_decode_value(const uint8_t *in, size_t in_len,
     out_rec->gen        = stm_load_le64(write_gen_le);
     out_rec->key_id     = stm_load_le64(key_id_le);
     out_rec->origin_dataset_id = origin_ds;
-    out_rec->origin_ino        = origin_ino;
+    out_rec->origin_ino        = origin_ino_v;
     out_rec->origin_off        = origin_off;
+    out_rec->link_gen          = link_gen_v;
 
     return STM_OK;
 }

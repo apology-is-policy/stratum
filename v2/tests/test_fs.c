@@ -1854,6 +1854,70 @@ STM_TEST(fs_reflink_persists_across_mount) {
     unlink(g_key_path);
 }
 
+/* R48 P1-1: reflink + snap + dual-side-Overwrite must not hit the
+ * R33 P2 single-ownership defense in dead_list. The fix in
+ * sync_drop_paddr_locked checks alloc refcount BEFORE consulting
+ * the snap_idx; a refcount > 1 means another live extent still
+ * references the paddr, so we just DecRef without dead-list capture.
+ * Pre-fix: the second Overwrite returns STM_EINVAL while the first
+ * already added the shared paddr to S.dead_list — paddr leak +
+ * operational confusion. */
+STM_TEST(fs_reflink_snap_dual_overwrite_no_wedge) {
+    make_tmp("rl_snap_dual");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t a[4096], b[4096], c[4096];
+    memset(a, 0xAA, sizeof a);
+    memset(b, 0xBB, sizeof b);
+    memset(c, 0xCC, sizeof c);
+
+    /* 1. write ino_a → paddr P, refcount=1. */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, a, sizeof a));
+    /* 2. reflink ino_a → ino_b. refcount(P)=2. */
+    STM_ASSERT_OK(stm_fs_reflink(fs, 1, 1, 1, 2));
+
+    /* 3. snap_create dataset_a → S. */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_snapshot_index *snap = stm_sync_snapshot_index(sync);
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_snapshot_create(snap, /*ds=*/1, "S",
+                                          /*tree_root_paddr=*/0xCAFE,
+                                          stm_sync_current_gen(sync),
+                                          &snap_id));
+
+    /* 4. write ino_a (overwrite). The old paddr P has refcount=2 →
+     * sync_drop_paddr_locked DecRefs (refcount 2→1) without snap
+     * routing. ino_b still references P, refcount=1. */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, b, sizeof b));
+
+    /* 5. write ino_b (overwrite). The old paddr P has refcount=1 →
+     * snap routing kicks in, dead_list captures. */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 2, 0, c, sizeof c));
+
+    /* Both writes should succeed (NOT STM_EINVAL from R33 P2). */
+    /* Reads return new content. */
+    uint8_t out[4096];
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(b, out, sizeof b);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 2, 0, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(c, out, sizeof c);
+
+    /* dead_list should have exactly 1 entry — captured at step 5
+     * (last reference). Step 4's DecRef did NOT add to dead_list. */
+    size_t dl_count = 0;
+    STM_ASSERT_OK(stm_snapshot_dead_list_count(snap, snap_id, &dl_count));
+    STM_ASSERT_EQ(dl_count, (size_t)1);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST(fs_reflink_rofs_refused) {
     /* RO mount → STM_EROFS at the FS_GUARD_WRITE. */
     make_tmp("rl_rofs");

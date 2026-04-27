@@ -3807,19 +3807,53 @@ stm_repair_log_index *stm_sync_repair_log_index(stm_sync *s)
 #define STM_FS_RECORDSIZE_MAX   (128u * 1024u)
 
 static stm_status sync_drop_paddr_locked(stm_sync *s, uint64_t ds, uint64_t paddr) {
-    /* Composes extent.tla::Overwrite-drop with dead_list.tla::OverwriteBlock:
-     * - If the dataset has a most-recent PRESENT snapshot, the dropped
-     *   paddr is appended to that snap's dead-list.
-     * - Otherwise, no snap holds the paddr — free it directly via the
-     *   correct device's allocator. */
+    /* Composes extent.tla::Overwrite-drop with dead_list.tla::OverwriteBlock
+     * AND P7-16 reflink refcount semantics:
+     *
+     * - If the allocator's refcount is > 1 (the paddr is reflink-shared
+     *   with another live extent), JUST DECREMENT — the live tree
+     *   still references the paddr through the sibling so the snap
+     *   doesn't need to capture it. Adding it to the dead-list at this
+     *   point would either (a) cause R33 P2's single-ownership defense
+     *   to refuse the SECOND drop with STM_EINVAL while the live tree
+     *   still has a sibling, OR (b) double-bookkeep so that on snap-
+     *   delete the dead_list_walk's alloc_free races with the eventual
+     *   sibling-Overwrite for the last reference.
+     *
+     * - If refcount == 1 (last live reference), fall through to the
+     *   pre-P7-16 logic: snap-with-most-recent → dead_list captures;
+     *   no-snap → alloc_free directly.
+     *
+     * dead_list.tla still models single-ownership at the spec level —
+     * R48 P1-1 documents the C-side relaxation as a forward note that
+     * dead_list.tla SHOULD be extended with multi-ref blocks for
+     * full coverage of the cohabit world. */
+    uint16_t dev_id = stm_paddr_device(paddr);
+    if (dev_id >= STM_POOL_DEVICES_MAX || s->allocs[dev_id] == NULL)
+        return STM_EINVAL;
+    uint64_t length = 0;
+    uint32_t refcount = 0;
+    stm_status owns = stm_alloc_lookup(s->allocs[dev_id], paddr,
+                                          &length, &refcount);
+    if (owns != STM_OK) return owns;
+    if (refcount == 0) {
+        /* Already PENDING — should not happen for a paddr just removed
+         * from the live extent index. Surface as STM_ECORRUPT. */
+        return STM_ECORRUPT;
+    }
+    if (refcount > 1) {
+        /* Reflink-shared. Just DecRef; the sibling keeps the paddr
+         * alive at the allocator level. snap_idx is NOT consulted —
+         * we don't add a dead_list entry for a paddr that's still
+         * live elsewhere. */
+        return stm_alloc_free(s->allocs[dev_id], paddr, s->current_gen);
+    }
+    /* refcount == 1: last live reference. Original routing applies. */
     bool should_free = false;
     stm_status os = stm_snapshot_index_overwrite_block(s->snap_idx, ds, paddr,
                                                           &should_free);
     if (os != STM_OK) return os;
     if (should_free) {
-        uint16_t dev_id = stm_paddr_device(paddr);
-        if (dev_id >= STM_POOL_DEVICES_MAX || s->allocs[dev_id] == NULL)
-            return STM_EINVAL;
         return stm_alloc_free(s->allocs[dev_id], paddr, s->current_gen);
     }
     return STM_OK;
@@ -4559,50 +4593,65 @@ stm_status stm_sync_reflink(stm_sync *s,
                                                   e->gen, e->key_id,
                                                   e->origin_dataset_id,
                                                   e->origin_ino,
-                                                  e->origin_off);
+                                                  e->origin_off,
+                                                  /* R48 P0-1: link at
+                                                   * current_txg (NOT
+                                                   * src.gen) so the
+                                                   * send filter sees
+                                                   * post-reflink data
+                                                   * within (S_from,
+                                                   * S_to]. */
+                                                  s->current_gen);
             if (is != STM_OK) {
                 apply_rc = is;
-                /* Roll back already-inserted dst records.
-                 * stm_extent_delete_file on dst_ino drops every
-                 * dst-side insertion at this dst_ino — including
-                 * those we did this turn — and surfaces their
-                 * paddrs in `dropped`. We then DecRef every dropped
-                 * paddr to undo the corresponding Phase 2 bump. */
-                uint64_t *dropped = NULL;
-                size_t    n_drop  = 0;
-                stm_status del = stm_extent_delete_file(s->extent_idx,
-                                                          dst_dataset_id, dst_ino,
-                                                          &dropped, &n_drop);
-                if (del == STM_OK) {
-                    for (size_t k = 0; k < n_drop; k++) {
-                        uint16_t dev = stm_paddr_device(dropped[k]);
-                        if (dev < STM_POOL_DEVICES_MAX && s->allocs[dev]) {
-                            (void)stm_alloc_free(s->allocs[dev], dropped[k],
-                                                    s->current_gen);
-                        }
-                    }
-                }
-                free(dropped);
-                /* Decrement remaining un-dropped refs (paddrs from
-                 * extents whose insert never landed). bumped counts
-                 * total replicas bumped in Phase 2; n_drop counts
-                 * paddrs released by delete_file. The difference is
-                 * the count of refs from extents whose insert
-                 * failed before reaching the index. Walk the
-                 * collect snapshot from the failing index forward
-                 * to compute this exactly. */
-                size_t need_unref_extents = cx.n - i;  /* including i */
-                for (size_t j = i; j < cx.n; j++) {
+                /* R48 P2-1: walk the collect snapshot symmetrically
+                 * with Phase 2 — for every extent in cx.records[0..n),
+                 * decrement every replica paddr's refcount via
+                 * stm_alloc_free. This undoes the Phase 2 bumps for
+                 * all extents (whether their insert landed or not).
+                 * Then a SECOND pass uses stm_extent_delete_file to
+                 * drop the inserted records [0..i) from extent_idx;
+                 * if delete_file fails (e.g., ENOMEM in compaction),
+                 * we MUST set wedged because the index has stale
+                 * records that don't match allocator refcounts.
+                 *
+                 * The earlier dual-pass version called delete_file
+                 * FIRST + relied on its dropped-paddr return; if
+                 * delete_file failed, the pre-bumped refs leaked
+                 * (the function silently skipped DecRef on error).
+                 * The new shape decouples ref-undo from index-cleanup
+                 * so a delete_file failure can't leak refs. */
+                size_t undone = 0;
+                for (size_t j = 0; j < cx.n && undone < bumped; j++) {
                     const stm_extent_record *ee = &cx.records[j];
-                    for (uint8_t r = 0; r < ee->n_replicas; r++) {
+                    for (uint8_t r = 0; r < ee->n_replicas && undone < bumped; r++) {
                         uint16_t dev = stm_paddr_device(ee->paddrs[r]);
                         if (dev < STM_POOL_DEVICES_MAX && s->allocs[dev]) {
                             (void)stm_alloc_free(s->allocs[dev], ee->paddrs[r],
                                                     s->current_gen);
                         }
+                        undone++;
                     }
                 }
-                (void)need_unref_extents;  /* documented above; not needed here */
+                /* Now drop dst's records that DID get inserted
+                 * (records [0..i)). We don't need delete_file's
+                 * dropped-paddr list — refs already undone above. */
+                if (i > 0) {
+                    uint64_t *dropped = NULL;
+                    size_t    n_drop  = 0;
+                    stm_status del = stm_extent_delete_file(s->extent_idx,
+                                                               dst_dataset_id, dst_ino,
+                                                               &dropped, &n_drop);
+                    free(dropped);
+                    if (del != STM_OK) {
+                        /* Wedge: extent_idx has stale records the
+                         * caller can't recover from; sync_commit
+                         * would persist them. Defensive even though
+                         * delete_file's only documented failure is
+                         * STM_ENOMEM in realloc. */
+                        s->wedged = true;
+                    }
+                }
                 break;
             }
         }

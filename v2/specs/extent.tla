@@ -206,10 +206,19 @@ ReplicaSets ==
 \* originally AEAD-encrypted. Freshly-written extents have origin =
 \* current (ds, ino, off); reflinked extents inherit origin from src.
 \* The pinned identity at AEAD-AD-reconstruction time is `origin`.
+\*
+\* R48 P0-1 fix: `link_gen` separately captures the gen at which THIS
+\* record was inserted into the live index. For fresh writes
+\* link_gen == gen; for reflinks link_gen == current_txg-at-reflink-time
+\* (NOT inherited from src). The send/recv pipeline's incremental gen
+\* filter uses `link_gen`, not `gen`, so reflinked records appearing
+\* in window (S_from, S_to] are emitted even when their AEAD `gen`
+\* (inherited from src) predates S_from.extent_txg.
 ExtentRec ==
     [ds: DatasetIds, ino: InoIds, off: FileOffsets, len: LengthsZ,
      replicas: ReplicaSets, gen: Gens, key_id: KeyIds,
-     origin_ds: DatasetIds, origin_ino: InoIds, origin_off: FileOffsets]
+     origin_ds: DatasetIds, origin_ino: InoIds, origin_off: FileOffsets,
+     link_gen: Gens]
 
 VARIABLES
     extents,        \* SUBSET ExtentRec — the in-memory extent map.
@@ -279,7 +288,8 @@ Write(ds, ino, off, len, replicas, key_id) ==
     /\ extents' = extents \union
         {[ds |-> ds, ino |-> ino, off |-> off, len |-> len,
           replicas |-> replicas, gen |-> current_txg, key_id |-> key_id,
-          origin_ds |-> ds, origin_ino |-> ino, origin_off |-> off]}
+          origin_ds |-> ds, origin_ino |-> ino, origin_off |-> off,
+          link_gen |-> current_txg]}
     /\ used_paddrs' = used_paddrs \union replicas
     /\ UNCHANGED current_txg
 
@@ -307,7 +317,8 @@ Overwrite(ds, ino, off, len, new_replicas, key_id) ==
          \union
          {[ds |-> ds, ino |-> ino, off |-> off, len |-> len,
            replicas |-> new_replicas, gen |-> current_txg, key_id |-> key_id,
-           origin_ds |-> ds, origin_ino |-> ino, origin_off |-> off]}
+           origin_ds |-> ds, origin_ino |-> ino, origin_off |-> off,
+           link_gen |-> current_txg]}
     /\ used_paddrs' = used_paddrs \union new_replicas
     /\ UNCHANGED current_txg
 
@@ -355,7 +366,8 @@ Truncate(ds, ino, new_size) ==
                          replicas |-> new_replicas,
                          gen |-> current_txg, key_id |-> new_key_id,
                          origin_ds |-> ds, origin_ino |-> ino,
-                         origin_off |-> e.off]}
+                         origin_off |-> e.off,
+                         link_gen |-> current_txg]}
               /\ used_paddrs' = used_paddrs \cup new_replicas
     /\ UNCHANGED current_txg
 
@@ -403,7 +415,10 @@ Reflink(src, dst_ds, dst_ino, dst_off) ==
           replicas |-> src.replicas, gen |-> src.gen, key_id |-> src.key_id,
           origin_ds  |-> IF BuggyReflinkRotatesOrigin THEN dst_ds   ELSE src.origin_ds,
           origin_ino |-> IF BuggyReflinkRotatesOrigin THEN dst_ino  ELSE src.origin_ino,
-          origin_off |-> IF BuggyReflinkRotatesOrigin THEN dst_off  ELSE src.origin_off]}
+          origin_off |-> IF BuggyReflinkRotatesOrigin THEN dst_off  ELSE src.origin_off,
+          \* R48 P0-1: link_gen freshly stamped (NOT inherited from src) so
+          \* incremental send sees post-reflink data within (S_from, S_to].
+          link_gen   |-> current_txg]}
     /\ UNCHANGED <<used_paddrs, current_txg>>
 
 (***************************************************************************)
@@ -515,6 +530,15 @@ SharedReplicasAreCohabit ==
 OriginConsistentInBounds ==
     \A e \in extents : e.origin_off + e.len <= MaxFileBlocks
 
+(* LinkGenBoundedByTxg (R48 P0-1) — every extent's link_gen ≤ current_  *)
+(* txg. The send filter uses link_gen as a CREATION-time stamp to       *)
+(* include reflinked records in (S_from, S_to] windows even when their *)
+(* AEAD `gen` (inherited from src) predates S_from. Bounded by the     *)
+(* same monotonic txg as `gen`. Closed by every action — Write /       *)
+(* Overwrite / Truncate / Reflink all stamp link_gen = current_txg.    *)
+LinkGenBoundedByTxg ==
+    \A e \in extents : e.link_gen <= current_txg
+
 (* P7-10 / R42 P3-1: nonce-uniqueness across DEKs is independent of      *)
 (* `key_id`. The C-impl's AEAD nonce is `(paddrs[0], gen, pool_uuid)` —  *)
 (* `key_id` does NOT participate. Allocator freshness (this spec's       *)
@@ -539,5 +563,6 @@ Invariants ==
     /\ PaddrFreshness
     /\ SharedReplicasAreCohabit
     /\ OriginConsistentInBounds
+    /\ LinkGenBoundedByTxg
 
 ================================================================================

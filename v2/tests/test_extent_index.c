@@ -1526,7 +1526,8 @@ STM_TEST(ex_reflink_basic_share) {
     STM_ASSERT_OK(stm_extent_reflink(idx, 1, 2, 0, 4096,
                                        r, 1, 0, 0,
                                        /*origin_ds=*/1, /*origin_ino=*/1,
-                                       /*origin_off=*/0));
+                                       /*origin_off=*/0,
+                                       /*link_gen=*/0));
     /* Both extents now exist. */
     size_t n = 0;
     STM_ASSERT_OK(stm_extent_count(idx, &n));
@@ -1560,7 +1561,7 @@ STM_TEST(ex_reflink_rejects_dst_overlap) {
     STM_ASSERT_OK(stm_extent_write(idx, 1, 2, 0, 4096, rB, 1, 0, 0));
     STM_ASSERT_ERR(stm_extent_reflink(idx, 1, 2, 0, 4096,
                                          rA, 1, 0, 0,
-                                         1, 1, 0),
+                                         1, 1, 0, 0),
                       STM_EEXIST);
     stm_extent_index_close(idx);
 }
@@ -1578,7 +1579,7 @@ STM_TEST(ex_reflink_rejects_partial_overlap_with_other) {
     uint64_t r1[1] = { 0xAA };
     STM_ASSERT_ERR(stm_extent_reflink(idx, 1, 2, 0, 4096,
                                          r1, 1, 0, 0,
-                                         1, 1, 0),
+                                         1, 1, 0, 0),
                       STM_EEXIST);
     stm_extent_index_close(idx);
 }
@@ -1599,7 +1600,8 @@ STM_TEST(ex_reflink_rejects_whole_share_different_origin) {
                                          r, 1, 0, 0,
                                          /*origin_ds=*/1,
                                          /*origin_ino=*/2,
-                                         /*origin_off=*/0),
+                                         /*origin_off=*/0,
+                                         /*link_gen=*/0),
                       STM_EEXIST);
     stm_extent_index_close(idx);
 }
@@ -1609,22 +1611,22 @@ STM_TEST(ex_reflink_rejects_invalid_args) {
     STM_ASSERT_OK(stm_extent_index_create(0, &idx));
     uint64_t r[1] = { 0xAA };
     STM_ASSERT_ERR(stm_extent_reflink(NULL, 1, 1, 0, 4096, r, 1, 0, 0,
-                                         1, 1, 0), STM_EINVAL);
+                                         1, 1, 0, 0), STM_EINVAL);
     /* dst_ds == 0 / dst_ino == 0 / origin_ds == 0 / origin_ino == 0 */
     STM_ASSERT_ERR(stm_extent_reflink(idx, 0, 1, 0, 4096, r, 1, 0, 0,
-                                         1, 1, 0), STM_EINVAL);
+                                         1, 1, 0, 0), STM_EINVAL);
     STM_ASSERT_ERR(stm_extent_reflink(idx, 1, 0, 0, 4096, r, 1, 0, 0,
-                                         1, 1, 0), STM_EINVAL);
+                                         1, 1, 0, 0), STM_EINVAL);
     STM_ASSERT_ERR(stm_extent_reflink(idx, 1, 1, 0, 4096, r, 1, 0, 0,
-                                         0, 1, 0), STM_EINVAL);
+                                         0, 1, 0, 0), STM_EINVAL);
     STM_ASSERT_ERR(stm_extent_reflink(idx, 1, 1, 0, 4096, r, 1, 0, 0,
-                                         1, 0, 0), STM_EINVAL);
+                                         1, 0, 0, 0), STM_EINVAL);
     /* len == 0 */
     STM_ASSERT_ERR(stm_extent_reflink(idx, 1, 1, 0, 0, r, 1, 0, 0,
-                                         1, 1, 0), STM_EINVAL);
+                                         1, 1, 0, 0), STM_EINVAL);
     /* NULL paddrs */
     STM_ASSERT_ERR(stm_extent_reflink(idx, 1, 1, 0, 4096, NULL, 1, 0, 0,
-                                         1, 1, 0), STM_EINVAL);
+                                         1, 1, 0, 0), STM_EINVAL);
     stm_extent_index_close(idx);
 }
 
@@ -1637,9 +1639,9 @@ STM_TEST(ex_reflink_multiple_siblings_ok) {
     uint64_t r[1] = { 0xAA };
     STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, r, 1, 0, 0));
     STM_ASSERT_OK(stm_extent_reflink(idx, 1, 2, 0, 4096,
-                                        r, 1, 0, 0, 1, 1, 0));
+                                        r, 1, 0, 0, 1, 1, 0, 0));
     STM_ASSERT_OK(stm_extent_reflink(idx, 1, 3, 0, 4096,
-                                        r, 1, 0, 0, 1, 1, 0));
+                                        r, 1, 0, 0, 1, 1, 0, 0));
     size_t n = 0;
     STM_ASSERT_OK(stm_extent_count(idx, &n));
     STM_ASSERT_EQ(n, (size_t)3);
@@ -1657,7 +1659,7 @@ STM_TEST(ex_overwrite_resets_origin_to_self) {
     STM_ASSERT_OK(stm_extent_write(idx, 1, 1, 0, 4096, r1, 1, 0, 0));
     /* Reflink first to pin origin sharing. */
     STM_ASSERT_OK(stm_extent_reflink(idx, 1, 2, 0, 4096,
-                                        r1, 1, 0, 0, 1, 1, 0));
+                                        r1, 1, 0, 0, 1, 1, 0, 0));
     /* Now COW (1,1) — its old extent drops; new extent at (1, 1, 0)
      * gets fresh paddr + origin = (1, 1, 0) (current). */
     uint64_t r2[1] = { 0xBB };

@@ -538,4 +538,72 @@ STM_TEST(send_next_buffer_too_small_returns_erange_with_needed) {
     testpool_teardown(&src);
 }
 
+/* R48 P0-1: incremental send across a reflink-creation window must
+ * include the reflinked record. Pre-fix (gen-only filter) this test
+ * fails because the reflinked record's `gen` (inherited from src)
+ * predates `from_S.extent_txg`, so the filter excluded it. Post-fix
+ * (link_gen filter), the reflinked record's link_gen is fresh at
+ * reflink time, so it falls in (from.extent_txg, to.extent_txg]. */
+STM_TEST(incremental_send_includes_reflink_in_window) {
+    testpool src; testpool_setup(&src, "inc_reflink", POOL_UUID_SRC);
+    testpool tgt; testpool_setup(&tgt, "inc_rl_tgt", POOL_UUID_TGT);
+
+    stm_sync *s_src = stm_fs_sync_for_test(src.fs);
+    stm_sync *s_tgt = stm_fs_sync_for_test(tgt.fs);
+    stm_snapshot_index *snap_src = stm_sync_snapshot_index(s_src);
+    STM_ASSERT_TRUE(snap_src != NULL);
+
+    /* gen=N: write ino_a = source bytes. */
+    uint8_t data[4096];
+    memset(data, 0xA5, sizeof data);
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, data, sizeof data));
+    STM_ASSERT_OK(stm_sync_commit(s_src));
+
+    /* Snap from_S right AFTER the write committed. */
+    uint64_t from_S = 0;
+    STM_ASSERT_OK(stm_snapshot_create(snap_src, /*ds*/1, "from",
+                                          /*tree_root_paddr=*/0,
+                                          stm_sync_current_gen(s_src),
+                                          &from_S));
+    STM_ASSERT_OK(stm_sync_commit(s_src));
+
+    /* Reflink ino_a → ino_b AFTER from_S. The reflinked record has
+     * `gen` = src.gen (predates from_S.extent_txg) but `link_gen`
+     * = current_txg-at-reflink (which is > from_S.extent_txg). */
+    STM_ASSERT_OK(stm_fs_reflink(src.fs, /*src_ds*/1, /*src_ino*/1,
+                                     /*dst_ds*/1, /*dst_ino*/2));
+    STM_ASSERT_OK(stm_sync_commit(s_src));
+
+    /* Snap to_S after the reflink + commit. */
+    uint64_t to_S = 0;
+    STM_ASSERT_OK(stm_snapshot_create(snap_src, /*ds*/1, "to",
+                                          /*tree_root_paddr=*/0,
+                                          stm_sync_current_gen(s_src),
+                                          &to_S));
+    STM_ASSERT_OK(stm_sync_commit(s_src));
+
+    /* Incremental send (from_S → to_S). With the link_gen-aware
+     * filter, ino_b's reflinked record falls in the window — the
+     * receiver should have ino_b reading the same bytes. */
+    stm_send_handle *sh = NULL;
+    STM_ASSERT_OK(stm_send_init(s_src, /*ds=*/1, from_S, to_S, &sh));
+    stm_recv_handle *rh = NULL;
+    STM_ASSERT_OK(stm_recv_init(s_tgt, /*target_ds=*/1, &rh));
+    STM_ASSERT_OK(pipe_send_to_recv(sh, rh));
+    stm_send_close(sh);
+    stm_recv_close(rh);
+
+    /* Receiver should now have ino_b reading the source bytes (deep-
+     * copied at recv-time; reflink semantics not preserved on the
+     * receiver but the data IS present). */
+    uint8_t out[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 2, 0, out, sizeof out, &got));
+    STM_ASSERT_EQ(got, (size_t)4096);
+    STM_ASSERT_MEM_EQ(data, out, sizeof data);
+
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
 STM_TEST_MAIN("send_recv")
