@@ -38,8 +38,40 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R46-hash-fixup pending. Substantive `01b5233` +
-  R46 close `485f0ef`.
+- **Tip**: post-R47-hash-fixup pending. Substantive `c02cba8` +
+  R47 close `82fe30e`.
+  **P7-15 repair-log persistence — closes R38 P3-1 (the long-
+  deferred audit gap from P7-6 noting that the production scrub
+  β cb's replica rewrites had no on-disk audit trail per ARCH
+  §7.15.4 / bptr.tla::LogIntegrity). New `src/repair_log/`
+  module implements a single-leaf btnode-encoded, plaintext +
+  Merkle-covered append-only log keyed by monotonic seq_id with
+  a 32-byte fixed value layout (timestamp_ns + target/source
+  paddrs + replica indices + corruption type + verification
+  result). Three new uberblock fields carved from `ub_reserved`:
+  `ub_repair_log_root` (stm_bptr at offset 3200), `ub_repair_log_
+  root_gen` (le64 at 3264), `ub_repair_log_next_seq` (le64 at
+  3272); `ub_reserved` shrinks 864 → 784 bytes. New bptr kind
+  `STM_BPTR_KIND_REPAIR_LOG = 11`. Scrub β cb gains per-rewrite
+  emit (both success and failure paths); Phase 1 split adds a
+  parallel `replica_io_err[]` array so the bptr.tla read_outcome
+  tag (CSUM_FAIL vs IO_ERR) propagates to the log entry's `type`
+  field. Format break STM_UB_VERSION 15 → 16. R47 P2-1 folded
+  `repair_log_csum` into `compute_merkle_root` as the 7th input
+  so an offline tamper of the audit trail surfaces as a Merkle
+  mismatch at mount (closes the asymmetry vs keyschema's existing
+  Merkle coverage). R47 fixes inline: P2-1 (Merkle gap) + P3-1
+  (cap collision halts sync_commit — moved to emit-time STM_ERANGE
+  with `STM_REPAIR_LOG_MAX_ENTRIES = 2048` constant) + P3-2
+  (tampered paddr device → STM_ECORRUPT not STM_EINVAL) + P3-3
+  (iter docstring claim) + P3-4 (iter cb re-entry warning).
+  P3-5 (reference-doc gap) deferred to this hash-fixup per the
+  three-commit pattern (R42 P3-2 precedent). 34 ctest suites
+  green default + ASan + TSan; new test_repair_log suite (7
+  tests) + 1 new test_fs integration test. test_crash_inject
+  timeout bumped 180s → 300s for TSan headroom.**
+  Prior: P7-14 snap chain-ordering regression `01b5233` + R46
+  close `485f0ef` + hash fixup `9dd2d9a`.
   **P7-14 snap chain-ordering regression — closes R40 P3-3 (the
   long-standing audit deferral noting there was no on-disk
   regression test for `sp_validate_shadow`'s

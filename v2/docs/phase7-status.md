@@ -185,6 +185,43 @@ into the CAS tier (which DOES need P6) is a separate concern.
       gen filter is best-effort because `snapshot.created_txg` and
       `sync.current_gen` are independent counters — closed in P7-8.
       No format break in P7-7; STM_UB_VERSION stays at 13.
+- [x] **P7-15 repair-log persistence** — landed at `c02cba8`;
+      R47 close `82fe30e` (0 P0 + 0 P1 + 1 P2 + 5 P3). Closes
+      the long-deferred R38 P3-1 (since P7-6) for the on-disk
+      audit-trail surface ARCH §7.15.4 / bptr.tla::LogIntegrity
+      committed to. Every scrub-driven replica rewrite now emits
+      a `stm_repair_log_entry` into a per-pool single-leaf btnode
+      tree rooted at `ub_repair_log_root`; entries carry timestamp
+      (CLOCK_REALTIME), target/source paddrs, replica indices,
+      corruption type (CSUM_FAIL / IO_ERR — sourced from a Phase-1
+      `replica_io_err[]` flag added in this chunk), and
+      verification result (OK_VERIFIED / FAIL — emit fires on both
+      success and failure paths). New module `src/repair_log/`
+      modeled on stm_keyschema (plaintext + Merkle-covered,
+      append-only, idempotent commit per R14b P2-1, in-RAM linked
+      list with O(1) tail-append). Format break STM_UB_VERSION
+      15 → 16: three new fields carved from `ub_reserved` head —
+      `ub_repair_log_root` (stm_bptr at 3200), `ub_repair_log_root_
+      gen` (le64 at 3264), `ub_repair_log_next_seq` (le64 at 3272);
+      `ub_reserved` shrinks 864 → 784. New bptr kind
+      `STM_BPTR_KIND_REPAIR_LOG = 11`. R47 P2-1 folded
+      `repair_log_csum` into `compute_merkle_root` as the 7th
+      input — closes the asymmetry where keyschema (also plaintext
+      + Merkle-covered) was Merkle-bound but repair_log was not,
+      so an offline tamper of the audit trail now fires a Merkle
+      mismatch at mount. R47 P3-1 moved the single-leaf MVP cap
+      enforcement from `_commit` (where exceeded → wedged
+      sync_commit, halted all pool progress) to `_emit` (refuses
+      STM_ERANGE; scrub cb absorbs silently — repair lands, only
+      audit entry dropped). R47 P3-2: tampered paddr-device check
+      surfaces STM_ECORRUPT instead of STM_EINVAL. R47 P3-3 + P3-4
+      docstring fixes on `_iter` (cb-side state is the only
+      early-termination signal; cb runs lock-held and MUST NOT
+      re-enter the API). 7 new test_repair_log tests + 1 new
+      test_fs integration test. test_crash_inject CMake timeout
+      bumped 180s → 300s (TSan headroom under the new per-cycle
+      mutex acquisitions). 34 ctest suites green default + ASan +
+      TSan in isolated runs.
 - [x] **P7-14 snap chain-ordering regression test** — landed at
       `01b5233`; R46 close `485f0ef` (0 P0 + 0 P1 + 1 P2 + 4 P3).
       Closes the long-deferred R40 P3-3 (no on-disk regression

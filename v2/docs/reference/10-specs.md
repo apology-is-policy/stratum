@@ -374,6 +374,13 @@ Invariants (all four `result ∈ {OK, REPAIRED, UNREPAIRABLE}` paths):
 - `LogIntegrity` — every emitted log entry corresponds to a
   rewrite that actually landed AND carries the picked source's
   index. ARCH §7.15.4 repair-log integrity at the protocol level.
+  **C-side coverage (P7-15)**: `stm_repair_log_index_emit`
+  validates `target_replica_idx ≠ source_replica_idx` (else
+  STM_EINVAL) at the API boundary; the production scrub β cb
+  (`sync_scrub_verify_cb`) emits exactly one entry per Phase-3
+  rewrite (both success and failure paths), with the picked
+  source's index threaded through. Persistence is the per-pool
+  single-leaf btnode tree at `ub_repair_log_root` (UB v16).
 - `NoOriginalOKMeansUnrepairable` — at `phase = DONE`, if no
   replica was originally OK, the cb returns `UNREPAIRABLE`. The
   cb never invents good bytes.
