@@ -667,6 +667,62 @@ stm_status stm_extent_iter(const stm_extent_index *idx,
     return STM_OK;
 }
 
+stm_status stm_extent_iter_ds(const stm_extent_index *idx,
+                                  uint64_t dataset_id,
+                                  stm_extent_iter_cb cb, void *ctx) {
+    if (!idx || !cb) return STM_EINVAL;
+    if (dataset_id == 0) return STM_EINVAL;
+
+    pthread_mutex_t *lock = ex_lock(idx);
+    must_lock(lock);
+
+    /* Collect every extent matching ds, then sort by (ino, off). */
+    size_t  cap = 0;
+    size_t  n   = 0;
+    size_t *order = NULL;
+    for (size_t i = 0; i < idx->n_records; i++) {
+        const stm_extent_record *e = &idx->records[i];
+        if (e->dataset_id != dataset_id) continue;
+        if (n == cap) {
+            size_t new_cap = cap == 0 ? 8u : cap * 2u;
+            size_t *grown = realloc(order, new_cap * sizeof(size_t));
+            if (!grown) {
+                free(order);
+                must_unlock(lock);
+                return STM_ENOMEM;
+            }
+            order = grown;
+            cap = new_cap;
+        }
+        order[n++] = i;
+    }
+
+    /* Insertion sort by (ino, off). */
+    for (size_t i = 1; i < n; i++) {
+        size_t key = order[i];
+        uint64_t k_ino = idx->records[key].ino;
+        uint64_t k_off = idx->records[key].off;
+        size_t j = i;
+        while (j > 0) {
+            uint64_t p_ino = idx->records[order[j - 1]].ino;
+            uint64_t p_off = idx->records[order[j - 1]].off;
+            bool greater = (p_ino > k_ino) ||
+                           (p_ino == k_ino && p_off > k_off);
+            if (!greater) break;
+            order[j] = order[j - 1];
+            j--;
+        }
+        order[j] = key;
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        if (!cb(&idx->records[order[i]], ctx)) break;
+    }
+    free(order);
+    must_unlock(lock);
+    return STM_OK;
+}
+
 stm_status stm_extent_count(const stm_extent_index *idx,
                                size_t *out_count) {
     if (!idx || !out_count) return STM_EINVAL;

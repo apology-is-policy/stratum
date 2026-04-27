@@ -183,6 +183,7 @@ add_subdirectory(src/extent)
 add_subdirectory(src/cdc)
 add_subdirectory(src/dataset)
 add_subdirectory(src/snapshot)
+add_subdirectory(src/send_recv)
 
 # ---------------------------------------------------------------------------
 # Public aggregate library.
@@ -214,7 +215,8 @@ target_link_libraries(stratum INTERFACE
     stm_extent
     stm_cdc
     stm_dataset
-    stm_snapshot)
+    stm_snapshot
+    stm_send_recv)
 target_include_directories(stratum INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/include)
 

@@ -148,6 +148,41 @@ into the CAS tier (which DOES need P6) is a separate concern.
       P7-4 tests covering roundtrip / hole / args / COW with-snap
       asserting dead_list_count 0→1 / COW without-snap / cross-
       mount durability / RO blocks / multi-extent).
+- [x] **P7-7 send/recv MVP** — landed at `<TBD-substantive>`;
+      R39 close `<TBD-close>`. New `src/send_recv/` module with
+      separate send + recv translation units sharing a unified
+      `<stratum/send_recv.h>` surface. Wire format: 16-byte framing
+      header (type/flags/body_len) per record; HEADER once
+      (52B body — magic STMS / version 1 / src_pool_uuid / dataset_id
+      / from_snap_id / to_snap_id / reserved); EXTENT* (32B meta —
+      ino/off/len/gen — followed by `len` plaintext bytes); END (32B
+      body = BLAKE3 csum over every prior record's framing+body).
+      Send: snapshots the matching extent set at init time, then
+      `stm_send_next` emits records one-at-a-time into a caller-
+      sized buffer; STM_ERANGE on too-small with `*out_len_needed`.
+      Each EXTENT decrypts the source's ciphertext via
+      `stm_extent_decrypt` and ships plaintext (caller wraps for
+      transport). Recv: strict state-machine HEADER → BODY → DONE
+      with sticky FAILED on errors; `stm_recv_apply` parses framing,
+      validates, hashes, dispatches EXTENT bodies via
+      `stm_sync_write_extent` (which re-encrypts under the target
+      pool's `metadata_key` with fresh paddrs — no cross-pool nonce
+      hazard). End-of-stream csum verified before DONE; mismatch →
+      STM_EBADTAG. `stm_extent_iter_ds(idx, ds, cb, ctx)` added to
+      iterate every live extent of a dataset across all inos in
+      (ino, off) order. `stm_sync_metadata_key` accessor added so
+      the send module can reach the source key without duplicating
+      sync.c's encrypt logic. test_send_recv = 10 tests (init args
+      validation, full-send roundtrip across 3 extents on 2 inos,
+      bad magic refused, extent-before-header refused, tampered
+      end-of-stream csum refused, finish-before-end → STM_EPROTOCOL,
+      buffer-too-small → STM_ERANGE retry path). MVP gap:
+      incremental send (from_snap_id != 0) is API-wired but the
+      gen filter is best-effort because `snapshot.created_txg` and
+      `sync.current_gen` are independent counters; full alignment
+      needs a future format-break (v13 → v14) introducing
+      `extent_txg` on the snapshot record. No format break in P7-7;
+      STM_UB_VERSION stays at 13.
 - [x] **P7-6 replica-list extension** — landed at `2eb898d`;
       R38 close `8d0c172` (0 P0 / 0 P1 / 0 P2 / 2 P3 — P3-1 cb
       LogIntegrity-deferral docstring + P3-2 test_pool.c version-

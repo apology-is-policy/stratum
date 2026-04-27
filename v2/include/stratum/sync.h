@@ -326,6 +326,19 @@ stm_status stm_sync_redundancy_get(const stm_sync *s,
 stm_pool  *stm_sync_pool(const stm_sync *s);
 stm_alloc *stm_sync_alloc(const stm_sync *s, uint16_t device_id);
 
+/*
+ * P7-7: pool-wide metadata key accessor (read-only). Returns the
+ * 32-byte AEAD key sync uses for extent encrypt/decrypt. Intended
+ * for the send/recv module — send decrypts source extents under this
+ * key; recv re-encrypts under its own pool's key. Caller MUST NOT
+ * persist or transmit the returned bytes; the key is sensitive
+ * material kept in RAM. Returns NULL on NULL arg.
+ *
+ * Lifetime: pointer is valid for the lifetime of `s` (key is set at
+ * sync_create + restored at sync_open; never mutated thereafter).
+ */
+const uint8_t *stm_sync_metadata_key(const stm_sync *s);
+
 /* ========================================================================= */
 /* P5-3c: multi-device alloc attach + mirror APIs.                             */
 /* ========================================================================= */

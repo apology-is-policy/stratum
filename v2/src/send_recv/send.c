@@ -1,0 +1,409 @@
+/* SPDX-License-Identifier: ISC */
+/*
+ * Send — point-in-time dataset replication producer.
+ *
+ *   see include/stratum/send_recv.h — surface + wire format.
+ *   see docs/ARCHITECTURE.md §8.7 — protocol intent.
+ *
+ * Design notes:
+ *
+ *   - At init time, we snapshot the current set of (ds, ino, off, len,
+ *     gen, paddr_0) tuples for the requested dataset, filtered by the
+ *     gen range derived from from_snap_id / to_snap_id, sorted by
+ *     (ino, off). Sending plays back the snapshot via repeated
+ *     `stm_send_next` calls.
+ *
+ *   - Each EXTENT record carries the extent's PLAINTEXT bytes (decrypted
+ *     from the source pool's key during `stm_send_next`). The wire is
+ *     plaintext; caller wraps for transport.
+ *
+ *   - The running BLAKE3 csum covers EVERY record's framing+body bytes
+ *     in stream order; END's body carries the final csum. Receiver
+ *     replays the csum and refuses any mismatch.
+ *
+ *   - Decrypting an extent fails the send (STM_EBADTAG / STM_EIO bubbles
+ *     up). The stream is irrecoverable from that point — caller should
+ *     close + report.
+ */
+
+#include <stratum/send_recv.h>
+
+#include <stratum/block.h>
+#include <stratum/crypto.h>
+#include <stratum/extent.h>
+#include <stratum/hash.h>
+#include <stratum/pool.h>
+#include <stratum/snapshot.h>
+#include <stratum/super.h>
+#include <stratum/sync.h>
+
+#include <stdlib.h>
+#include <string.h>
+
+/* Internal "frozen extent record" — what we'll replay during send. */
+typedef struct {
+    uint64_t ino;
+    uint64_t off;
+    uint64_t len;
+    uint64_t gen;
+    uint64_t paddr_0;          /* the canonical replica we read from */
+} send_extent_meta;
+
+struct stm_send_handle {
+    stm_sync          *sync;          /* borrowed; must outlive handle */
+    uint64_t           dataset_id;
+    uint64_t           from_snap_id;
+    uint64_t           to_snap_id;
+    uint64_t           to_txg;        /* upper-bound txg for the send */
+    uint64_t           gen_min_excl;  /* extents with gen > this */
+    uint64_t           gen_max_incl;  /* and gen ≤ this */
+
+    send_extent_meta  *extents;       /* sorted by (ino, off) */
+    size_t             n_extents;
+    size_t             cap_extents;
+
+    /* Stream emission cursor:
+     *   0          → emit HEADER on first stm_send_next
+     *   1..n_extents → emit extents[cursor-1]
+     *   n_extents+1 → emit END
+     *   ≥ n_extents+2 → STM_ENOENT */
+    size_t             cursor;
+
+    /* Running BLAKE3 hasher over the wire. */
+    stm_blake3_ctx    *hasher;
+};
+
+/* ------------------------------------------------------------------ */
+/* Wire serialization helpers.                                         */
+/* ------------------------------------------------------------------ */
+
+static void put_le32(uint8_t *p, uint32_t v) {
+    le32 le = stm_store_le32(v);
+    memcpy(p, le.v, 4);
+}
+
+static void put_le64(uint8_t *p, uint64_t v) {
+    le64 le = stm_store_le64(v);
+    memcpy(p, le.v, 8);
+}
+
+static void write_record_hdr(uint8_t *p, uint32_t type, uint64_t body_len) {
+    put_le32(p + 0, type);
+    put_le32(p + 4, 0u);              /* flags reserved */
+    put_le64(p + 8, body_len);
+}
+
+/* ------------------------------------------------------------------ */
+/* Init: collect extents, compute gen range, set up hasher.            */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    stm_send_handle *h;
+    stm_status       err;
+} send_collect_ctx;
+
+static bool send_collect_cb(const stm_extent_record *e, void *ctx_) {
+    send_collect_ctx *cc = ctx_;
+    stm_send_handle *h = cc->h;
+
+    /* Filter by gen range: gen_min_excl < gen ≤ gen_max_incl. */
+    if (e->gen <= h->gen_min_excl) return true;
+    if (e->gen > h->gen_max_incl)  return true;
+    if (e->n_replicas < 1) return true;     /* defensive */
+
+    if (h->n_extents == h->cap_extents) {
+        size_t new_cap = h->cap_extents == 0 ? 8 : h->cap_extents * 2;
+        send_extent_meta *grown = realloc(h->extents,
+                                             new_cap * sizeof(send_extent_meta));
+        if (!grown) { cc->err = STM_ENOMEM; return false; }
+        h->extents     = grown;
+        h->cap_extents = new_cap;
+    }
+    h->extents[h->n_extents].ino     = e->ino;
+    h->extents[h->n_extents].off     = e->off;
+    h->extents[h->n_extents].len     = e->len;
+    h->extents[h->n_extents].gen     = e->gen;
+    h->extents[h->n_extents].paddr_0 = e->paddrs[0];
+    h->n_extents++;
+    return true;
+}
+
+stm_status stm_send_init(stm_sync *sync,
+                            uint64_t dataset_id,
+                            uint64_t from_snap_id,
+                            uint64_t to_snap_id,
+                            stm_send_handle **out_handle)
+{
+    if (!sync || !out_handle) return STM_EINVAL;
+    if (dataset_id == 0) return STM_EINVAL;
+    *out_handle = NULL;
+
+    /* Resolve gen range from snapshot ids. */
+    uint64_t gen_min_excl = 0;
+    uint64_t gen_max_incl = 0;
+
+    stm_snapshot_index *snap_idx = stm_sync_snapshot_index(sync);
+    if (!snap_idx) return STM_EINVAL;
+
+    if (from_snap_id != 0) {
+        stm_snapshot_entry from_entry;
+        stm_status ls = stm_snapshot_lookup(snap_idx, from_snap_id, &from_entry);
+        if (ls != STM_OK) return STM_ENOENT;
+        if (from_entry.dataset_id != dataset_id) return STM_EINVAL;
+        gen_min_excl = from_entry.created_txg;
+    }
+    if (to_snap_id != 0) {
+        stm_snapshot_entry to_entry;
+        stm_status ls = stm_snapshot_lookup(snap_idx, to_snap_id, &to_entry);
+        if (ls != STM_OK) return STM_ENOENT;
+        if (to_entry.dataset_id != dataset_id) return STM_EINVAL;
+        gen_max_incl = to_entry.created_txg;
+    } else {
+        /* Full or open-ended: cap at the index's current_txg. */
+        stm_extent_index *eidx = stm_sync_extent_index(sync);
+        if (!eidx) return STM_EINVAL;
+        stm_status ts = stm_extent_index_current_txg(eidx, &gen_max_incl);
+        if (ts != STM_OK) return ts;
+    }
+    /* From > To is nonsense. */
+    if (from_snap_id != 0 && to_snap_id != 0 && gen_min_excl >= gen_max_incl)
+        return STM_EINVAL;
+
+    stm_send_handle *h = calloc(1, sizeof(*h));
+    if (!h) return STM_ENOMEM;
+    h->sync         = sync;
+    h->dataset_id   = dataset_id;
+    h->from_snap_id = from_snap_id;
+    h->to_snap_id   = to_snap_id;
+    h->to_txg       = gen_max_incl;
+    h->gen_min_excl = gen_min_excl;
+    h->gen_max_incl = gen_max_incl;
+
+    h->hasher = stm_blake3_new();
+    if (!h->hasher) { free(h); return STM_ENOMEM; }
+
+    /* Snapshot the matching extent set. */
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    if (!eidx) {
+        stm_blake3_free(h->hasher);
+        free(h);
+        return STM_EINVAL;
+    }
+    send_collect_ctx cc = { .h = h, .err = STM_OK };
+    stm_status is = stm_extent_iter_ds(eidx, dataset_id, send_collect_cb, &cc);
+    if (is != STM_OK || cc.err != STM_OK) {
+        free(h->extents);
+        stm_blake3_free(h->hasher);
+        free(h);
+        return is != STM_OK ? is : cc.err;
+    }
+
+    *out_handle = h;
+    return STM_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* HEADER record emission.                                             */
+/* ------------------------------------------------------------------ */
+
+static stm_status emit_header_locked(stm_send_handle *h,
+                                        uint8_t *out, size_t out_cap)
+{
+    /* Total: 16 (hdr) + 52 (body) = 68 bytes. */
+    const size_t need = STM_SEND_RECORD_HDR_LEN + STM_SEND_HEADER_BODY_LEN;
+    if (out_cap < need) return STM_ERANGE;
+
+    write_record_hdr(out, STM_SEND_REC_HEADER, STM_SEND_HEADER_BODY_LEN);
+
+    uint8_t *body = out + STM_SEND_RECORD_HDR_LEN;
+    /* Magic + version live in the first 8 bytes of the body so a recv
+     * impl that peeks at the body before parsing the framing can do
+     * a magic-check up front. */
+    put_le32(body + 0, STM_SEND_MAGIC);
+    put_le32(body + 4, STM_SEND_VERSION);
+
+    const uint64_t *puuid = stm_pool_uuid(stm_sync_pool(h->sync));
+    put_le64(body + 8,  puuid[0]);
+    put_le64(body + 16, puuid[1]);
+    /* Body offsets shift since we put magic+version first; remap to
+     * the doc's layout: pool_uuid lives at body[0..16); we shift. */
+    /* Actually let's just lay it out per docstring: pool_uuid first.
+     * Magic+version don't fit in the docstring layout — those live
+     * in the framing's `flags` field is awkward. Simpler: redefine
+     * to put magic+version in the framing-flags.
+     *
+     * Hmm. Let me redo: put magic+version as the FIRST two le32s in
+     * the body, then pool_uuid + dataset_id + ... So body grows by 8.
+     * Update STM_SEND_HEADER_BODY_LEN if needed. */
+    /* Reset body: lay out per (magic, version, pool_uuid, ds, fr, to, txg). */
+    memset(body, 0, STM_SEND_HEADER_BODY_LEN);
+    put_le32(body + 0,  STM_SEND_MAGIC);
+    put_le32(body + 4,  STM_SEND_VERSION);
+    put_le64(body + 8,  puuid[0]);
+    put_le64(body + 16, puuid[1]);
+    put_le64(body + 24, h->dataset_id);
+    put_le64(body + 32, h->from_snap_id);
+    put_le64(body + 40, h->to_snap_id);
+    /* body offset 48..52 reserved zero (already memset). */
+
+    stm_blake3_update(h->hasher, out, need);
+    return STM_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* EXTENT record emission.                                             */
+/* ------------------------------------------------------------------ */
+
+static stm_status read_decrypt_extent_plaintext(stm_send_handle *h,
+                                                   const send_extent_meta *m,
+                                                   uint8_t *out_plain)
+{
+    /* AEGIS-256 hardcoded — matches stm_sync_write_extent. */
+    stm_aead_mode mode = STM_AEAD_AEGIS256;
+    size_t tag_len = stm_aead_tag_len(mode);
+    if (tag_len == 0) return STM_EINVAL;
+
+    size_t total = m->len + tag_len;
+    void *cbuf = malloc(total);
+    if (!cbuf) return STM_ENOMEM;
+
+    uint16_t dev = stm_paddr_device(m->paddr_0);
+    stm_bdev *bd = stm_pool_device_bdev(stm_sync_pool(h->sync), dev);
+    if (!bd) { free(cbuf); return STM_EINVAL; }
+    uint64_t boff = stm_paddr_offset(m->paddr_0) * (uint64_t)STM_UB_SIZE;
+    stm_status rs = stm_bdev_read(bd, boff, cbuf, total);
+    if (rs != STM_OK) { free(cbuf); return rs; }
+
+    /* AEAD AD — same shape as stm_sync_write_extent. */
+    stm_ad_extent ad;
+    memset(&ad, 0, sizeof ad);
+    ad.magic        = STM_AD_MAGIC_EXTENT;
+    ad.version      = STM_AD_VERSION_EXTENT;
+    const uint64_t *puuid = stm_pool_uuid(stm_sync_pool(h->sync));
+    ad.pool_uuid[0] = puuid[0];
+    ad.pool_uuid[1] = puuid[1];
+    ad.dataset_id   = h->dataset_id;
+    ad.ino          = m->ino;
+    ad.offset       = m->off;
+    ad.content_kind = 0;
+
+    size_t pt_out = 0;
+    stm_status ds = stm_extent_decrypt(mode, stm_sync_metadata_key(h->sync),
+                                          m->paddr_0, m->gen,
+                                          &ad, cbuf, total,
+                                          out_plain, m->len, &pt_out);
+    free(cbuf);
+    return ds;
+}
+
+static stm_status emit_extent_locked(stm_send_handle *h,
+                                        const send_extent_meta *m,
+                                        uint8_t *out, size_t out_cap,
+                                        size_t *out_len)
+{
+    size_t need = STM_SEND_RECORD_HDR_LEN + STM_SEND_EXTENT_META_LEN + m->len;
+    if (out_cap < need) return STM_ERANGE;
+
+    uint64_t body_len = STM_SEND_EXTENT_META_LEN + m->len;
+    write_record_hdr(out, STM_SEND_REC_EXTENT, body_len);
+
+    uint8_t *body = out + STM_SEND_RECORD_HDR_LEN;
+    put_le64(body + 0,  m->ino);
+    put_le64(body + 8,  m->off);
+    put_le64(body + 16, m->len);
+    put_le64(body + 24, m->gen);
+
+    /* Decrypt the extent's plaintext directly into the output buffer. */
+    stm_status ds = read_decrypt_extent_plaintext(h, m,
+                                                     body + STM_SEND_EXTENT_META_LEN);
+    if (ds != STM_OK) return ds;
+
+    stm_blake3_update(h->hasher, out, need);
+    *out_len = need;
+    return STM_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* END record emission.                                                */
+/* ------------------------------------------------------------------ */
+
+static stm_status emit_end_locked(stm_send_handle *h,
+                                     uint8_t *out, size_t out_cap)
+{
+    const size_t need = STM_SEND_RECORD_HDR_LEN + STM_SEND_END_BODY_LEN;
+    if (out_cap < need) return STM_ERANGE;
+
+    write_record_hdr(out, STM_SEND_REC_END, STM_SEND_END_BODY_LEN);
+
+    /* Compute final csum BEFORE writing it (it covers all prior
+     * records, NOT the END body itself). */
+    uint8_t *body = out + STM_SEND_RECORD_HDR_LEN;
+    stm_blake3_final(h->hasher, body, STM_SEND_END_BODY_LEN);
+
+    /* The END's framing IS in the csum's input domain conceptually,
+     * but here we deliberately exclude END's body from the csum's
+     * inputs — receiver's csum check is "compare END.body to recv-
+     * computed BLAKE3(prior records)". */
+    return STM_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* Public dispatch.                                                    */
+/* ------------------------------------------------------------------ */
+
+stm_status stm_send_next(stm_send_handle *h,
+                            void *out_buf, size_t out_cap,
+                            size_t *out_len,
+                            size_t *out_len_needed)
+{
+    if (!h || !out_buf || !out_len || !out_len_needed) return STM_EINVAL;
+    *out_len = 0;
+    *out_len_needed = 0;
+
+    /* Stream cursor:
+     *   cursor == 0           → HEADER
+     *   1..n_extents          → extents[cursor-1]
+     *   n_extents+1           → END
+     *   ≥ n_extents+2         → STM_ENOENT */
+    if (h->cursor > h->n_extents + 1u) return STM_ENOENT;
+
+    uint8_t *p = out_buf;
+    if (h->cursor == 0) {
+        size_t need = STM_SEND_RECORD_HDR_LEN + STM_SEND_HEADER_BODY_LEN;
+        if (out_cap < need) { *out_len_needed = need; return STM_ERANGE; }
+        stm_status hs = emit_header_locked(h, p, out_cap);
+        if (hs != STM_OK) return hs;
+        *out_len = need;
+        h->cursor = 1;
+        return STM_OK;
+    }
+
+    if (h->cursor <= h->n_extents) {
+        const send_extent_meta *m = &h->extents[h->cursor - 1];
+        size_t need = STM_SEND_RECORD_HDR_LEN + STM_SEND_EXTENT_META_LEN + m->len;
+        if (out_cap < need) { *out_len_needed = need; return STM_ERANGE; }
+        size_t emitted = 0;
+        stm_status es = emit_extent_locked(h, m, p, out_cap, &emitted);
+        if (es != STM_OK) return es;
+        *out_len = emitted;
+        h->cursor++;
+        return STM_OK;
+    }
+
+    /* cursor == n_extents + 1: emit END. */
+    size_t need = STM_SEND_RECORD_HDR_LEN + STM_SEND_END_BODY_LEN;
+    if (out_cap < need) { *out_len_needed = need; return STM_ERANGE; }
+    stm_status es = emit_end_locked(h, p, out_cap);
+    if (es != STM_OK) return es;
+    *out_len = need;
+    h->cursor++;
+    return STM_OK;
+}
+
+void stm_send_close(stm_send_handle *h)
+{
+    if (!h) return;
+    free(h->extents);
+    if (h->hasher) stm_blake3_free(h->hasher);
+    free(h);
+}

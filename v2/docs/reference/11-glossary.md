@@ -144,6 +144,7 @@ closed items.
 | R36 | P7-4 fs.c/sync.c COW path integration (extent → dead-list / alloc-free routing). | `64a6278` |
 | R37 | P7-5 production scrub β verify-callback (paddr→bptr resolver via extent walk). | `fc5f619` |
 | R38 | P7-6 replica-list extension on extent records (UB v13 + bptr.tla full replica-walk in scrub cb). | `8d0c172` |
+| R39 | P7-7 send/recv MVP (full-send byte-stream protocol, recv re-encrypts under target pool's key). | `<TBD>` |
 
 ## Phase 6 / clone terms
 
@@ -179,6 +180,9 @@ closed items.
 | **extent replica set** | P7-6 extension to `stm_extent_record`: an extent now carries an array of up to `STM_EXTENT_MAX_REPLICAS=4` paddrs in `paddrs[0..n_replicas)`. The same plaintext is encrypted ONCE under canonical nonce `(paddrs[0], gen)` and the bytewise-identical ciphertext+tag is replicated to every paddr's bdev. `LiveReplicasDisjoint` (extent.tla) requires no paddr appear in two live extents' replica sets; the C impl validates within-set distinctness too. |
 | **STM_EXTENT_MAX_REPLICAS** | C constant (=4) capping the on-disk replica-slot count. Mirror-N pools with N ≤ 4 are supported natively; larger N would need a record-format extension (post-v13). The on-disk record reserves all 4 slots regardless of `n_replicas`; trailing slots are sentinel-zero. |
 | **STM_RED_MIRROR / mirror_n** | Pool redundancy profile bits (sync.h's `stm_redundancy_profile`). `kind=STM_RED_MIRROR, mirror_n=N` directs the extent write path to allocate N replicas across N distinct devices. P7-6 wires this into `stm_sync_write_extent`'s replica fan-out. RAID-Z (`STM_RED_RS`) and LRC (`STM_RED_LRC`) remain unsupported MVP. |
+| **send/recv** | Phase 7 §10.3 dataset replication protocol (P7-7 MVP). `stm_send_init/_next/_close` produces a wire-format byte stream for a source dataset's snapshot range; `stm_recv_init/_apply/_finish/_close` consumes records on the target pool. Wire = HEADER (52B body — magic STMS, version, pool_uuid, dataset_id, snap_ids) + EXTENT* (32B meta + plaintext) + END (32B BLAKE3 csum). Send decrypts source's extents under source pool's `metadata_key`; recv re-encrypts under target's via `stm_sync_write_extent` — fresh paddrs + fresh AEAD key + fresh nonces, no cross-pool nonce reuse hazard. |
+| **send wire format magic** | `STM_SEND_MAGIC = 0x534D5453` ("STMS" little-endian) at the start of every HEADER body. Receiver refuses any HEADER record whose first 4 bytes don't match. |
+| **send incremental gap** | The P7-7 MVP wires `from_snap_id` / `to_snap_id` parameters but the snap-bounded gen filter is best-effort: `snapshot.created_txg` and `sync.current_gen` are independent counters today, so the filter doesn't reliably partition pre-snap from post-snap extents. A future chunk adds an `extent_txg` field to the snapshot record (anticipated v13 → v14 format break) capturing `sync.current_gen` at snap-create time, which then makes the filter authoritative. |
 
 ## Policy terms
 

@@ -38,7 +38,13 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: `8d0c172` (**P7-6 replica-list extension** —
+- **Tip**: `<TBD-P7-7-fixup>` (**P7-7 send/recv MVP** — full-send
+  byte-stream protocol with HEADER + EXTENT records + END+csum;
+  `stm_send_init/_next/_close` produces wire bytes, `stm_recv_init/
+  _apply/_finish/_close` consumes them; recv re-encrypts each extent
+  under the target pool's metadata key — no cross-pool nonce reuse;
+  BLAKE3 end-of-stream csum gates authenticity; new module
+  `src/send_recv/`). Prior: P7-6 replica-list extension —
   extent records grow 32B → 64B with up to 4 replica paddrs;
   `stm_sync_write_extent` allocates N replicas across N devices;
   scrub β cb walks replicas + repairs corrupt ones per bptr.tla's
@@ -83,15 +89,28 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   `LiveReplicasDisjoint` + `ReplicasNonEmpty` +
   `ReplicaCountBounded` invariants; new buggy demo
   `extent_replica_collision_buggy.cfg`**.
+  **P7-7 send/recv MVP `<TBD-substantive>` + R39 close `<TBD-close>`
+  (this commit) — new `src/send_recv/` module. Wire format: framed
+  records (16B framing + body); HEADER once, EXTENT* with plaintext
+  payload, END with BLAKE3 csum over prior bytes. Send decrypts
+  source's extents under source pool's metadata_key; recv re-
+  encrypts under target's. Single-dataset full-send only at MVP;
+  incremental send is API-wired but the snap-bounded gen filter is
+  best-effort until snap.created_txg ↔ sync.current_gen alignment
+  lands (anticipated v13 → v14 format break).** No format break in
+  P7-7; STM_UB_VERSION stays at 13.
   Phase 7 pre-work FastCDC `5cb8900` + R27 close `a2ffd38`.
-  Pending: CAS / send-recv / reflinks (Phase 7 §10.1+); per-
-  dataset DEKs.
-- **Tests**: 32 suites × (default + ASan + TSan, serial) green.
-  test_sync_multi 42; test_pool 48; test_scrub 30; test_alloc 32;
-  test_cdc 12; test_dataset 57; test_snapshot 41; test_sync 24;
+  Pending: CAS / reflinks (Phase 7 §10.1, §10.4); per-dataset DEKs;
+  incremental send alignment.
+- **Tests**: 33 suites × (default + ASan + TSan, serial) green
+  (P7-7 adds test_send_recv = 10 tests).
+  test_sync_multi 42; test_pool 48; test_scrub 34 (30 + 4 P7-6
+  replica-walk); test_alloc 32; test_cdc 12; test_dataset 57;
+  test_snapshot 41; test_sync 24;
   test_extent_index 51 (32 in-RAM + 6 persist + 4 lookup_by_paddr +
-  9 P7-6 multi-replica); test_fs 20; test_scrub 34 (30 prior + 4
-  P7-6 replica-walk).
+  9 P7-6 multi-replica); test_fs 20; test_send_recv 10 (4 arg
+  validation + 1 full-send roundtrip + 5 wire/state-machine error
+  paths).
 - **Specs**: 20 TLA+ modules clean (23 fixed configs: legacy +
   scrub_beta + scrub_durable + scrub_beta_durable + bptr +
   dataset + snapshot + property + clone + dead_list + extent) +

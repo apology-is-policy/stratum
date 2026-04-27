@@ -387,6 +387,20 @@ stm_status stm_extent_iter(const stm_extent_index *idx,
                               stm_extent_iter_cb cb, void *ctx);
 
 /*
+ * Iterate every live extent of `dataset_id` (any ino) in
+ * (ino, off)-ascending order. Used by send/recv (P7-7) to enumerate
+ * a dataset's complete extent set without prior knowledge of which
+ * inos exist. Same locking + cb-borrowed-pointer rules as
+ * `stm_extent_iter`.
+ *
+ * Returns STM_OK / STM_EINVAL / STM_ENOMEM as for stm_extent_iter.
+ */
+STM_MUST_USE
+stm_status stm_extent_iter_ds(const stm_extent_index *idx,
+                                 uint64_t dataset_id,
+                                 stm_extent_iter_cb cb, void *ctx);
+
+/*
  * Count live extents in the index (across all datasets / inos).
  */
 STM_MUST_USE

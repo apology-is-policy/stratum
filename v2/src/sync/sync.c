@@ -2135,6 +2135,14 @@ stm_pool *stm_sync_pool(const stm_sync *s)
     return p;
 }
 
+const uint8_t *stm_sync_metadata_key(const stm_sync *s)
+{
+    if (!s) return NULL;
+    /* metadata_key is set at sync_create / sync_open and never mutated
+     * thereafter; safe to return without taking the lock. */
+    return s->metadata_key;
+}
+
 stm_alloc *stm_sync_alloc(const stm_sync *s, uint16_t device_id)
 {
     if (!s) return NULL;
