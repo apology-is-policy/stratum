@@ -140,7 +140,15 @@ Same shape + semantics as the dataset module's persistence API.
 `load_at` runs the structural validator (`sp_validate_shadow`;
 R31 P2-2): rejects zero ids, forward-pointing prev_snap_id,
 prev_snap_id pointing at a wrong-dataset slot, sibling-name
-collisions within a dataset.
+collisions within a dataset, and **chain inversion** —
+`extent_txg < prev's extent_txg` along the `prev_snap_id` chain
+within a dataset (P7-8 added the field; `snapshot.tla::
+ChainExtentTxgOrdered` is the corresponding invariant). The
+chain-inversion path has a per-process producer-side check at
+`stm_snapshot_create` (R40 P2-1) and the on-disk validator path
+exercised by `fs_snap_chain_inversion_on_disk_refused_at_mount`
+in test_fs (P7-14, closes R40 P3-3); see
+`<stratum/snapshot_testing.h>` for the gated `_for_test` seam.
 
 ### Clone-dependency hook (P6-clone)
 

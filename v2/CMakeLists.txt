@@ -34,6 +34,14 @@ option(STM_BUILD_FUZZERS  "Build libFuzzer targets (clang only)"  OFF)
 option(STM_COVERAGE       "Enable gcov/lcov coverage"             OFF)
 option(STM_WERROR         "Treat warnings as errors"              ON)
 
+# R46 P2-1: when set, compiles in test-only API hooks (currently
+# `stm_snapshot_create_for_test`) that intentionally bypass
+# production-path correctness gates. Default ON so the in-tree
+# test build works; production builds opt out with -DSTRATUM_BUILD_TESTING_HOOKS=OFF
+# so the bypass symbols literally don't exist in the linked archive.
+option(STRATUM_BUILD_TESTING_HOOKS
+    "Compile test-only API hooks (e.g. stm_snapshot_create_for_test)" ON)
+
 set(STM_AEAD_DEFAULT "auto" CACHE STRING
     "Default AEAD: aegis256 | xchacha20-siv | auto")
 set_property(CACHE STM_AEAD_DEFAULT PROPERTY STRINGS aegis256 xchacha20-siv auto)

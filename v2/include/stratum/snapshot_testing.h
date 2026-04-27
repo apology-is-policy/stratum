@@ -18,6 +18,21 @@
  * regression test we need a producer that bypasses the
  * in-process check; this header exposes
  * `stm_snapshot_create_for_test` for exactly that purpose.
+ *
+ * R46 P2-1: every symbol in this header is gated behind the
+ * `STRATUM_BUILD_TESTING_HOOKS` compile flag. The CMake test
+ * build sets it PUBLIC on the underlying `stm_snapshot` library
+ * so test sources see the prototype AND the symbol exists in
+ * the linked archive. A production build with
+ * `-DSTRATUM_BUILD_TESTING_HOOKS=OFF` compiles neither
+ * prototype nor definition: production code can't even
+ * mistakenly extern-declare `stm_snapshot_create_for_test`
+ * because the compile-time guard makes it absent from the
+ * archive. The chain-inversion shape this function produces is
+ * unmountable post-commit — the gate exists because that's a
+ * higher-stakes failure mode than the read-only seams in
+ * `<stratum/fs_testing.h>` and `<stratum/block_inject.h>`,
+ * which intentionally remain ungated per established precedent.
  */
 #ifndef STRATUM_V2_SNAPSHOT_TESTING_H
 #define STRATUM_V2_SNAPSHOT_TESTING_H
@@ -31,6 +46,7 @@ extern "C" {
 struct stm_snapshot_index;
 typedef struct stm_snapshot_index stm_snapshot_index;
 
+#ifdef STRATUM_BUILD_TESTING_HOOKS
 /*
  * Create a snapshot bypassing the R40 P2-1 in-process
  * chain-ordering check. All other validation runs (NULL args,
@@ -55,6 +71,7 @@ stm_status stm_snapshot_create_for_test(stm_snapshot_index *idx,
                                           uint64_t tree_root_paddr,
                                           uint64_t extent_txg,
                                           uint64_t *out_id);
+#endif /* STRATUM_BUILD_TESTING_HOOKS */
 
 #ifdef __cplusplus
 }

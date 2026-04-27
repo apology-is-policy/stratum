@@ -234,11 +234,9 @@ stm_status stm_snapshot_index_current_txg(const stm_snapshot_index *idx,
 }
 
 /* P7-14: shared body for stm_snapshot_create + the test-only
- * stm_snapshot_create_for_test. Caller does arg validation and
- * supplies the pre-computed name length; the helper acquires
- * idx->lock, runs the spec-modeled checks (gated by
- * skip_chain_check for the test path), appends the slot, stamps
- * the entry, and releases the lock.
+ * stm_snapshot_create_for_test. R46 P3-2: the entire arg-
+ * validation prelude lives here so a future check added to one
+ * caller can't drift away from the other.
  *
  * skip_chain_check=false: production path; full R40 P2-1
  *   in-process validator (refuses STM_EINVAL on extent_txg < prev's).
@@ -251,11 +249,16 @@ stm_status stm_snapshot_index_current_txg(const stm_snapshot_index *idx,
 static stm_status snapshot_create_inner(stm_snapshot_index *idx,
                                            uint64_t dataset_id,
                                            const char *name,
-                                           size_t name_len,
                                            uint64_t tree_root_paddr,
                                            uint64_t extent_txg,
                                            bool skip_chain_check,
                                            uint64_t *out_id) {
+    if (!idx || !name || !out_id) return STM_EINVAL;
+    if (dataset_id == 0) return STM_EINVAL;
+    *out_id = 0;
+    size_t name_len = strlen(name);
+    if (name_len == 0 || name_len > STM_SNAP_NAME_MAX) return STM_EINVAL;
+
     must_lock(&idx->lock);
 
     /* R29 P3-1: defensive saturation on the monotonic counters.
@@ -339,33 +342,31 @@ stm_status stm_snapshot_create(stm_snapshot_index *idx,
                                  uint64_t tree_root_paddr,
                                  uint64_t extent_txg,
                                  uint64_t *out_id) {
-    if (!idx || !name || !out_id) return STM_EINVAL;
-    if (dataset_id == 0) return STM_EINVAL;
-    *out_id = 0;
-    size_t name_len = strlen(name);
-    if (name_len == 0 || name_len > STM_SNAP_NAME_MAX) return STM_EINVAL;
-
-    return snapshot_create_inner(idx, dataset_id, name, name_len,
+    return snapshot_create_inner(idx, dataset_id, name,
                                     tree_root_paddr, extent_txg,
                                     /*skip_chain_check=*/false, out_id);
 }
 
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+/* R46 P2-1: this symbol is opt-in via the STRATUM_BUILD_TESTING_HOOKS
+ * compile flag. The CMake test build sets the flag PUBLIC on
+ * stm_snapshot so the symbol is in the test-linked archive AND the
+ * test sources see the prototype in <stratum/snapshot_testing.h>;
+ * a production build configured with -DSTRATUM_BUILD_TESTING_HOOKS=OFF
+ * compiles neither the prototype nor the definition, so no chain-
+ * ordering bypass can reach a production binary even via mistaken
+ * include or hand-rolled extern. */
 stm_status stm_snapshot_create_for_test(stm_snapshot_index *idx,
                                           uint64_t dataset_id,
                                           const char *name,
                                           uint64_t tree_root_paddr,
                                           uint64_t extent_txg,
                                           uint64_t *out_id) {
-    if (!idx || !name || !out_id) return STM_EINVAL;
-    if (dataset_id == 0) return STM_EINVAL;
-    *out_id = 0;
-    size_t name_len = strlen(name);
-    if (name_len == 0 || name_len > STM_SNAP_NAME_MAX) return STM_EINVAL;
-
-    return snapshot_create_inner(idx, dataset_id, name, name_len,
+    return snapshot_create_inner(idx, dataset_id, name,
                                     tree_root_paddr, extent_txg,
                                     /*skip_chain_check=*/true, out_id);
 }
+#endif /* STRATUM_BUILD_TESTING_HOOKS */
 
 stm_status stm_snapshot_delete(stm_snapshot_index *idx,
                                  uint64_t snapshot_id,

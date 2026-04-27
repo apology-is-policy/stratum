@@ -1287,14 +1287,28 @@ STM_TEST(snap_create_for_test_bypasses_chain_ordering_check) {
     STM_ASSERT_EQ(e2.extent_txg, 5u);
     STM_ASSERT_EQ(e2.prev_snap_id, s1);
 
-    /* All other validations still run on _for_test:
-     * NULL args, dataset_id=0, name length, name collision. */
+    /* R46 P3-3: confirm the for_test variant runs every prelude
+     * check that stm_snapshot_create runs. After R46 P3-2's
+     * consolidation both functions share a single inner helper,
+     * so every check below is "the same code path"; the test
+     * pins that contract so a future drift doesn't silently
+     * weaken the test seam. */
     uint64_t junk = 0;
     STM_ASSERT_ERR(stm_snapshot_create_for_test(NULL, 1, "x", 0, 0, &junk),
+                       STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_create_for_test(idx, 1, NULL, 0, 0, &junk),
+                       STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_create_for_test(idx, 1, "x", 0, 0, NULL),
                        STM_EINVAL);
     STM_ASSERT_ERR(stm_snapshot_create_for_test(idx, 0, "x", 0, 0, &junk),
                        STM_EINVAL);
     STM_ASSERT_ERR(stm_snapshot_create_for_test(idx, 1, "", 0, 0, &junk),
+                       STM_EINVAL);
+    /* Oversize name: STM_SNAP_NAME_MAX + 1 'a's. */
+    char too_long[STM_SNAP_NAME_MAX + 2];
+    memset(too_long, 'a', sizeof too_long - 1);
+    too_long[sizeof too_long - 1] = '\0';
+    STM_ASSERT_ERR(stm_snapshot_create_for_test(idx, 1, too_long, 0, 0, &junk),
                        STM_EINVAL);
     STM_ASSERT_ERR(stm_snapshot_create_for_test(idx, 1, "s1",
                                                    0xAABBu, 99, &junk),

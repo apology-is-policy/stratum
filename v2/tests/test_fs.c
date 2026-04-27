@@ -1555,13 +1555,15 @@ STM_TEST(fs_snap_chain_inversion_on_disk_refused_at_mount) {
     STM_ASSERT_OK(stm_fs_commit(fs));
     STM_ASSERT_OK(stm_fs_unmount(fs));
 
-    /* Remount: load_at runs sp_validate_shadow → STM_ECORRUPT
-     * on the chain inversion → mount fails. We don't pin the
-     * exact error (the propagation chain may wrap it), only that
-     * the mount refuses non-zero and *out_fs is not populated. */
+    /* Remount: load_at runs sp_validate_shadow → STM_ECORRUPT on
+     * the chain inversion → mount fails. The propagation chain
+     * (sp_validate_shadow → load_at → sync_open → fs_mount) does
+     * not wrap the status, so STM_ECORRUPT reaches the caller
+     * verbatim. Pinning the exact code (R46 P3-1) discriminates
+     * against unrelated mount failures that would otherwise mask
+     * a regression in the chain-inversion check. */
     stm_fs *fs2 = NULL;
-    stm_status rs = stm_fs_mount(g_tmp_path, &mopts, &fs2);
-    STM_ASSERT(rs != STM_OK);
+    STM_ASSERT_ERR(stm_fs_mount(g_tmp_path, &mopts, &fs2), STM_ECORRUPT);
     STM_ASSERT(fs2 == NULL);
 
     unlink(g_tmp_path);
