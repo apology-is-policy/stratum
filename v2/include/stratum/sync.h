@@ -865,6 +865,17 @@ struct stm_repair_log_index;
 typedef struct stm_repair_log_index stm_repair_log_index;
 stm_repair_log_index *stm_sync_repair_log_index(stm_sync *s);
 
+/*
+ * P7-CAS: CAS-tier index handle. Same lifetime + thread-safety contract
+ * as the other index accessors above. The CAS index is owned by sync
+ * and persists across commits via the lifecycle wiring; migration /
+ * rehydration paths (the future P7-CAS-2 chunk) will operate on it
+ * via the higher-level stm_sync_migrate_to_cold / _rehydrate APIs.
+ */
+struct stm_cas_index;
+typedef struct stm_cas_index stm_cas_index;
+stm_cas_index *stm_sync_cas_index(stm_sync *s);
+
 /* Forward decl for stm_sync_scrub_install_production_cb below. The
  * full type lives in <stratum/scrub.h>; including it here would create
  * a cycle (scrub.h includes types.h which already pulls sync's deps).

@@ -35,6 +35,7 @@
 #include <stratum/alloc_roots.h>
 #include <stratum/block.h>
 #include <stratum/crypto.h>
+#include <stratum/cas.h>
 #include <stratum/dataset.h>
 #include <stratum/extent.h>
 #include <stratum/hash.h>
@@ -247,6 +248,15 @@ struct stm_sync {
      * closed on stm_sync_close. */
     stm_repair_log_index *repair_log;
 
+    /* P7-CAS (v18): content-addressed cold-tier index (ARCH §6.9 /
+     * NOVEL #3, cas.tla). Created at sync_open / sync_create, hydrated
+     * from ub_cas_index_root + ub_cas_index_root_gen if non-zero,
+     * committed every sync_commit. Maps BLAKE3-256 chunk hashes to
+     * (replicas, refcount, length, gen) entries. The cold-tier
+     * migration / rehydration paths are a follow-on chunk; this
+     * lifecycle wiring + persistence layer is the foundation. */
+    stm_cas_index      *cas_idx;
+
     /* Durable mirror of ub_main_root / ub_snap_root state, last-
      * committed. Updated on successful sync_commit; consumed by
      * claim/reservation-phase build_uberblock to keep the prior
@@ -264,6 +274,9 @@ struct stm_sync {
     uint64_t           repair_log_root_gen;
     uint8_t            repair_log_root_csum[32];
     uint64_t           repair_log_next_seq;
+    uint64_t           cas_index_root_paddr;
+    uint64_t           cas_index_root_gen;
+    uint8_t            cas_index_root_csum[32];
 
     /* Mirror of ub_next_dataset_id / ub_next_snap_id. Sourced from the
      * indices' get_next_id at commit; restored at mount via
@@ -674,6 +687,9 @@ static void build_uberblock(stm_uberblock *out,
                               const uint8_t repair_log_root_csum[32],
                               uint64_t repair_log_root_gen,
                               uint64_t repair_log_next_seq,
+                              uint64_t cas_index_root_paddr,
+                              const uint8_t cas_index_root_csum[32],
+                              uint64_t cas_index_root_gen,
                               const uint8_t merkle_root[32],
                               const stm_alloc_stats *astats)
 {
@@ -751,6 +767,18 @@ static void build_uberblock(stm_uberblock *out,
     }
     out->ub_repair_log_root_gen = stm_store_le64(repair_log_root_gen);
     out->ub_repair_log_next_seq = stm_store_le64(repair_log_next_seq);
+
+    /* P7-CAS (v18): CAS-tier index tree root + AEAD gen. Same shape as
+     * extent_root. The tree root field `ub_cas_index_root` lives in
+     * the metadata-roots block at offset 288 (carved at v3); the gen
+     * field `ub_cas_index_root_gen` was added at v18 carved from the
+     * head of `ub_reserved`. */
+    if (cas_index_root_paddr != 0) {
+        out->ub_cas_index_root.bp_paddr = stm_store_le64(cas_index_root_paddr);
+        out->ub_cas_index_root.bp_kind  = STM_BPTR_KIND_CAS;
+        memcpy(out->ub_cas_index_root.bp_csum, cas_index_root_csum, 32);
+    }
+    out->ub_cas_index_root_gen = stm_store_le64(cas_index_root_gen);
 
     /* Pool-wide id counters (ARCH §5.4). Stamped from the indices'
      * get_next_id; restored at mount via the indices' set_next_id. */
@@ -1101,6 +1129,18 @@ stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
         rc = stm_repair_log_index_create(d, boot, &s->repair_log);
         if (rc != STM_OK) { stm_sync_close(s); return rc; }
 
+        /* P7-CAS (v18): CAS-tier index. Same wiring as extent_idx —
+         * AEAD-encrypted Bε-tree under ub_cas_index_root on device 0.
+         * Empty at format time; first sync_commit serializes the
+         * empty btree so subsequent mounts find a valid bptr. */
+        rc = stm_cas_index_create(/*current_txg=*/0, &s->cas_idx);
+        if (rc != STM_OK) { stm_sync_close(s); return rc; }
+        rc = stm_cas_index_set_storage(s->cas_idx, d, boot);
+        if (rc != STM_OK) { stm_sync_close(s); return rc; }
+        rc = stm_cas_index_set_crypt_ctx(s->cas_idx, s->metadata_key,
+                                            s->pool_uuid, s->device_uuid);
+        if (rc != STM_OK) { stm_sync_close(s); return rc; }
+
         /* P6-clone: register the clone-dependency check on snap_idx.
          * Snap delete will now refuse if any present clone in
          * dataset_idx references the target snap. */
@@ -1123,6 +1163,8 @@ stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
      * STM_EINVAL is impossible because extent_idx->current_txg=0 and
      * s->current_gen=1; advance is strictly increasing. */
     (void)stm_extent_index_advance_txg(s->extent_idx, s->current_gen);
+    /* P7-CAS: same advance for the CAS index. */
+    if (s->cas_idx) (void)stm_cas_index_advance_txg(s->cas_idx, s->current_gen);
 
     /* P7-10: auto-install the root dataset's DEK at format time so
      * stm_sync_write_extent on (ds=1, ...) resolves to a
@@ -1486,17 +1528,18 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
         return cs;
     }
 
-    /* P4-1 / P4-4a / P6-persist: verify ub_merkle_root self-consistency.
-     * Inputs match what sync_commit stamps: alloc_roots csum, dataset
-     * tree csum (from ub_main_root), snapshot tree csum (from
-     * ub_snap_root). For pools created pre-P6-persist these csums
-     * are all-zero and the recompute matches. */
-    uint8_t  zeros32[32] = { 0 };
+    /* P4-1 / P4-4a / P6-persist / P7-CAS: verify ub_merkle_root self-
+     * consistency. Inputs match what sync_commit stamps: alloc_roots
+     * csum, dataset tree csum (from ub_main_root), snapshot tree csum
+     * (from ub_snap_root), CAS index csum (from ub_cas_index_root —
+     * zero before the first cold-tier commit), keyschema csum, extent
+     * csum, repair-log csum. For pools created pre-P6-persist these
+     * csums are all-zero and the recompute matches. */
     uint8_t  recomputed[32];
     stm_status ms = compute_merkle_root(ub.ub_main_root.bp_csum,
                                           ub.ub_alloc_root.bp_csum,
                                           ub.ub_snap_root.bp_csum,
-                                          zeros32,
+                                          ub.ub_cas_index_root.bp_csum,
                                           ks_hdr.ks_root.bp_csum,
                                           ub.ub_extent_root.bp_csum,
                                           ub.ub_repair_log_root.bp_csum,
@@ -1741,6 +1784,31 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
         s2->repair_log_next_seq   = rl_next_seq;
         memcpy(s2->repair_log_root_csum, ub.ub_repair_log_root.bp_csum, 32);
 
+        /* P7-CAS: CAS index. Same wiring shape as extent_idx. */
+        stm_status casi = stm_cas_index_create(/*current_txg=*/0, &s2->cas_idx);
+        if (casi != STM_OK) { stm_sync_close(s2); return casi; }
+        casi = stm_cas_index_set_storage(s2->cas_idx, meta_bdev, boot2);
+        if (casi != STM_OK) { stm_sync_close(s2); return casi; }
+        casi = stm_cas_index_set_crypt_ctx(s2->cas_idx, s2->metadata_key,
+                                              s2->pool_uuid, s2->device_uuid);
+        if (casi != STM_OK) { stm_sync_close(s2); return casi; }
+
+        uint64_t cpaddr = stm_load_le64(ub.ub_cas_index_root.bp_paddr);
+        uint64_t cgen   = stm_load_le64(ub.ub_cas_index_root_gen);
+        if (cpaddr != 0) {
+            if (ub.ub_cas_index_root.bp_kind != STM_BPTR_KIND_CAS) {
+                stm_sync_close(s2);
+                return STM_ECORRUPT;
+            }
+            stm_status ls = stm_cas_index_load_at(s2->cas_idx,
+                                                     cpaddr, cgen,
+                                                     ub.ub_cas_index_root.bp_csum);
+            if (ls != STM_OK) { stm_sync_close(s2); return ls; }
+        }
+        s2->cas_index_root_paddr = cpaddr;
+        s2->cas_index_root_gen   = cgen;
+        memcpy(s2->cas_index_root_csum, ub.ub_cas_index_root.bp_csum, 32);
+
         /* P6-clone: register the clone-dependency check now that both
          * indices are populated. Snap delete refuses while any present
          * clone in dataset_idx references the target snap. */
@@ -1795,6 +1863,9 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
                          /*repair_log_csum=*/   s2->repair_log_root_csum,
                          /*repair_log_gen=*/    s2->repair_log_root_gen,
                          /*repair_log_seq=*/    s2->repair_log_next_seq,
+                         /*cas_index_root=*/    s2->cas_index_root_paddr,
+                         /*cas_index_csum=*/    s2->cas_index_root_csum,
+                         /*cas_index_gen=*/     s2->cas_index_root_gen,
                          /*merkle_root=*/       ub.ub_merkle_root,
                          &astats_claim);
         uint32_t lbl  = ring_label_for_gen(auth_gen + 1);
@@ -1836,6 +1907,8 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
      * ≤ persisted s->auth_gen ≤ s2->current_gen; advance is non-
      * regressing (the equal case is a no-op). */
     (void)stm_extent_index_advance_txg(s2->extent_idx, s2->current_gen);
+    /* P7-CAS: same advance for the CAS index. */
+    if (s2->cas_idx) (void)stm_cas_index_advance_txg(s2->cas_idx, s2->current_gen);
 
     *out_sync = s2;
     return STM_OK;
@@ -1864,6 +1937,8 @@ void stm_sync_close(stm_sync *s)
     if (s->extent_idx)  stm_extent_index_close(s->extent_idx);
     /* P7-15: close the repair-log index. */
     if (s->repair_log)  stm_repair_log_index_close(s->repair_log);
+    /* P7-CAS: close the CAS index. */
+    if (s->cas_idx)     stm_cas_index_close(s->cas_idx);
     /* P5-3b: close the allocator-roots handle. Owns its own
      * in-RAM btree; borrows bdev + bootstrap + metadata_key. */
     if (s->roots) stm_alloc_roots_close(s->roots);
@@ -1960,6 +2035,9 @@ stm_status stm_sync_commit(stm_sync *s)
                          /*repair_log_csum=*/   s->repair_log_root_csum,
                          /*repair_log_gen=*/    s->repair_log_root_gen,
                          /*repair_log_seq=*/    s->repair_log_next_seq,
+                         /*cas_index_root=*/    s->cas_index_root_paddr,
+                         /*cas_index_csum=*/    s->cas_index_root_csum,
+                         /*cas_index_gen=*/     s->cas_index_root_gen,
                          /*merkle_root=*/       s->merkle_root,
                          &astats_res);
         uint32_t res_label = ring_label_for_gen(reservation_gen);
@@ -2154,6 +2232,22 @@ stm_status stm_sync_commit(stm_sync *s)
         return rls;
     }
 
+    /* P7-CAS (v18): commit the CAS index. Same shape as extent_idx. */
+    uint64_t cas_paddr = 0;
+    uint8_t  cas_csum[32] = {0};
+    uint64_t cas_gen = 0;
+    stm_status ccs = stm_cas_index_commit(s->cas_idx, target_gen,
+                                            &cas_paddr, cas_csum);
+    if (ccs != STM_OK) {
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
+        return ccs;
+    }
+    ccs = stm_cas_index_get_gen(s->cas_idx, &cas_gen);
+    if (ccs != STM_OK) {
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
+        return ccs;
+    }
+
     stm_alloc_stats astats;
     stm_status sr = stm_alloc_stats_get(s->alloc, &astats);
     if (sr != STM_OK) {
@@ -2167,14 +2261,13 @@ stm_status stm_sync_commit(stm_sync *s)
      * The `main_root` slot is the dataset index tree's root csum;
      * `snap_root` is the snapshot index tree's; `extent_root` is the
      * extent index tree's; `repair_log` is the audit-trail tree's
-     * (P7-15 v16). Each feeds in directly. R8-P1-1: refuse to commit
-     * on BLAKE3 OOM. */
-    uint8_t zeros32[32] = { 0 };
+     * (P7-15 v16); `cas` is the CAS-tier index tree's (P7-CAS v18).
+     * Each feeds in directly. R8-P1-1: refuse to commit on BLAKE3 OOM. */
     uint8_t new_merkle_root[32];
     stm_status ms = compute_merkle_root(main_csum,   /* main */
                                           roots_csum,
                                           snap_csum,
-                                          zeros32,   /* cas  */
+                                          cas_csum,  /* P7-CAS */
                                           ks_root_csum,
                                           extent_csum,
                                           repair_log_csum,
@@ -2196,6 +2289,9 @@ stm_status stm_sync_commit(stm_sync *s)
                      extent_paddr, extent_csum, extent_gen,
                      repair_log_paddr, repair_log_csum,
                      /*repair_log_gen=*/ target_gen, repair_log_seq,
+                     /*cas_index_root=*/ cas_paddr,
+                     /*cas_index_csum=*/ cas_csum,
+                     /*cas_index_gen=*/  cas_gen,
                      new_merkle_root, &astats);
 
     uint32_t fin_label = ring_label_for_gen(target_gen);
@@ -2228,6 +2324,8 @@ stm_status stm_sync_commit(stm_sync *s)
     s->repair_log_root_paddr = repair_log_paddr;
     s->repair_log_root_gen   = target_gen;
     s->repair_log_next_seq   = repair_log_seq;
+    s->cas_index_root_paddr  = cas_paddr;
+    s->cas_index_root_gen    = cas_gen;
     s->next_dataset_id       = main_next_id;
     s->next_snap_id          = snap_next_id;
     memcpy(s->alloc_root_csum,     roots_csum,      32);
@@ -2235,6 +2333,7 @@ stm_status stm_sync_commit(stm_sync *s)
     memcpy(s->main_root_csum,      main_csum,      32);
     memcpy(s->snap_root_csum,      snap_csum,      32);
     memcpy(s->extent_root_csum,    extent_csum,    32);
+    memcpy(s->cas_index_root_csum, cas_csum,        32);
     memcpy(s->repair_log_root_csum, repair_log_csum, 32);
     memcpy(s->merkle_root,         new_merkle_root, 32);
 
@@ -2247,6 +2346,8 @@ stm_status stm_sync_commit(stm_sync *s)
      * sync with the live sync gen. STM_EINVAL on regression is
      * impossible here (target_gen + 2 > prior current_gen always). */
     (void)stm_extent_index_advance_txg(s->extent_idx, s->current_gen);
+    /* P7-CAS: same advance for the CAS index. */
+    if (s->cas_idx) (void)stm_cas_index_advance_txg(s->cas_idx, s->current_gen);
 
     pthread_mutex_unlock(&s->lock);    stm_pool_unlock_shared(s->pool);
     return STM_OK;
@@ -3788,6 +3889,11 @@ stm_extent_index *stm_sync_extent_index(stm_sync *s)
 stm_repair_log_index *stm_sync_repair_log_index(stm_sync *s)
 {
     return s ? s->repair_log : NULL;
+}
+
+stm_cas_index *stm_sync_cas_index(stm_sync *s)
+{
+    return s ? s->cas_idx : NULL;
 }
 
 /* ========================================================================= */

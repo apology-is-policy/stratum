@@ -457,13 +457,18 @@ STM_TEST(pool_fs_roundtrip_populates_roster) {
     STM_ASSERT_OK(stm_sb_mount_scan(d, &ub, &lbl, &slot));
     stm_bdev_close(d);
 
-    /* P7-16 bumped STM_UB_VERSION 16 → 17 for reflinks (ARCH §11.12).
-     * The extent value layout grows 64 → 96 bytes with three origin
-     * fields (origin_dataset_id, origin_ino, origin_off) at offsets
-     * 64..87 plus 8 reserved bytes at 88..95; origin lets reflink-
-     * siblings sharing the same paddrs reconstruct the same AEAD AD.
-     * No uberblock field changes — only the on-disk extent record
-     * layout changed.
+    /* P7-CAS bumped STM_UB_VERSION 17 → 18 for the cold tier (ARCH
+     * §6.9 / §7.6.3 / §12.10, NOVEL #3, cas.tla). Adds
+     * `ub_cas_index_root_gen` (le64) at offset 3280 carved from the
+     * head of `ub_reserved`; the CAS index tree root itself uses the
+     * existing `ub_cas_index_root` field at offset 288 (carved at v3
+     * but unused until now). Extent value layout gains a 1-byte
+     * `kind` discriminator at byte 0 (0x01 = HOT, 0x02 = COLD).
+     * Prior bumps:
+     * P7-16 (16 → 17) for reflinks (ARCH §11.12). The extent value
+     * layout grows 64 → 96 bytes with three origin fields plus a
+     * link_gen field; origin lets reflink-siblings sharing the same
+     * paddrs reconstruct the same AEAD AD.
      * Prior bumps:
      * P7-15 (15 → 16) for the repair-log persistence (ARCH §7.15.4):
      * three new fields carved from the head of ub_reserved —
@@ -486,7 +491,7 @@ STM_TEST(pool_fs_roundtrip_populates_roster) {
      * restated here so a future version bump that forgets to
      * update this test fails loudly. */
     STM_ASSERT_EQ(stm_load_le32(ub.ub_version), STM_UB_VERSION);
-    STM_ASSERT_EQ(STM_UB_VERSION, 17u);
+    STM_ASSERT_EQ(STM_UB_VERSION, 18u);
 
     /* Roster fields are populated. */
     STM_ASSERT_EQ(stm_load_le16(ub.ub_device_count), 1u);

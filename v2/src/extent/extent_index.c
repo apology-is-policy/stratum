@@ -373,6 +373,7 @@ stm_status stm_extent_write(stm_extent_index *idx,
     stm_extent_record rec = {
         .dataset_id = dataset_id, .ino = ino,
         .off = off, .len = len,
+        .kind       = STM_EXTENT_KIND_HOT,    /* P7-CAS: fresh writes are HOT */
         .n_replicas = (uint8_t)n_paddrs,
         .gen = write_gen,
         .key_id = key_id,
@@ -384,6 +385,7 @@ stm_status stm_extent_write(stm_extent_index *idx,
         .link_gen          = write_gen,
     };
     for (size_t i = 0; i < n_paddrs; i++) rec.paddrs[i] = paddrs[i];
+    /* P7-CAS: content_hash zeroed by initializer for HOT extents. */
     stm_status as = append_record_locked(idx, &rec);
     if (as == STM_OK) idx->dirty = true;
     must_unlock(&idx->lock);
@@ -517,6 +519,7 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
     stm_extent_record rec = {
         .dataset_id = dataset_id, .ino = ino,
         .off = off, .len = len,
+        .kind       = STM_EXTENT_KIND_HOT,    /* P7-CAS: COW always HOT */
         .n_replicas = (uint8_t)n_new_paddrs,
         .gen = write_gen,
         .key_id = key_id,
@@ -529,6 +532,7 @@ stm_status stm_extent_overwrite(stm_extent_index *idx,
         .link_gen          = write_gen,
     };
     for (size_t i = 0; i < n_new_paddrs; i++) rec.paddrs[i] = new_paddrs[i];
+    /* P7-CAS: content_hash zeroed by initializer for HOT extents. */
     idx->records[idx->n_records++] = rec;
 
     *out_dropped_paddrs = out_buf;
@@ -793,6 +797,7 @@ stm_status stm_extent_reflink(stm_extent_index *idx,
     stm_extent_record rec = {
         .dataset_id = dst_dataset_id, .ino = dst_ino,
         .off = dst_off, .len = len,
+        .kind       = STM_EXTENT_KIND_HOT,    /* P7-CAS: reflinks share HOT replicas */
         .n_replicas = (uint8_t)n_paddrs,
         .gen = gen,
         .key_id = key_id,
@@ -802,6 +807,64 @@ stm_status stm_extent_reflink(stm_extent_index *idx,
         .link_gen          = link_gen,
     };
     for (size_t i = 0; i < n_paddrs; i++) rec.paddrs[i] = paddrs[i];
+    /* P7-CAS: content_hash zeroed by initializer for HOT extents. */
+    stm_status as = append_record_locked(idx, &rec);
+    if (as == STM_OK) idx->dirty = true;
+    must_unlock(&idx->lock);
+    return as;
+}
+
+/* P7-CAS: insert a COLD extent record. Caller has already inserted /
+ * ref-bumped the CAS index entry and the extent record's content_hash
+ * names that entry. */
+stm_status stm_extent_write_cold(stm_extent_index *idx,
+                                    uint64_t dataset_id, uint64_t ino,
+                                    uint64_t off, uint64_t len,
+                                    const uint8_t content_hash[STM_EXTENT_HASH_LEN],
+                                    uint64_t gen, uint64_t key_id,
+                                    uint64_t origin_dataset_id,
+                                    uint64_t origin_ino,
+                                    uint64_t origin_off,
+                                    uint64_t link_gen) {
+    if (!idx) return STM_EINVAL;
+    if (dataset_id == 0 || ino == 0) return STM_EINVAL;
+    if (origin_dataset_id == 0 || origin_ino == 0) return STM_EINVAL;
+    if (len == 0) return STM_EINVAL;
+    if (!content_hash) return STM_EINVAL;
+    if (off > UINT64_MAX - len) return STM_EOVERFLOW;
+    /* Hash all-zero is reserved sentinel. */
+    bool any_nonzero = false;
+    for (size_t i = 0; i < STM_EXTENT_HASH_LEN; i++) {
+        if (content_hash[i] != 0) { any_nonzero = true; break; }
+    }
+    if (!any_nonzero) return STM_EINVAL;
+
+    must_lock(&idx->lock);
+
+    if (gen > idx->current_txg)         { must_unlock(&idx->lock); return STM_EINVAL; }
+    if (link_gen > idx->current_txg)    { must_unlock(&idx->lock); return STM_EINVAL; }
+    if (origin_off > UINT64_MAX - len)  { must_unlock(&idx->lock); return STM_EINVAL; }
+
+    if (overlap_in_ino_locked(idx, dataset_id, ino, off, len)) {
+        must_unlock(&idx->lock);
+        return STM_EEXIST;
+    }
+
+    stm_extent_record rec = {
+        .dataset_id = dataset_id, .ino = ino,
+        .off = off, .len = len,
+        .kind       = STM_EXTENT_KIND_COLD,
+        .n_replicas = 0u,
+        .gen        = gen,
+        .key_id     = key_id,
+        .origin_dataset_id = origin_dataset_id,
+        .origin_ino        = origin_ino,
+        .origin_off        = origin_off,
+        .link_gen          = link_gen,
+    };
+    /* paddrs[] zeroed by initializer; content_hash copied in. */
+    memcpy(rec.content_hash, content_hash, STM_EXTENT_HASH_LEN);
+
     stm_status as = append_record_locked(idx, &rec);
     if (as == STM_OK) idx->dirty = true;
     must_unlock(&idx->lock);
@@ -1017,12 +1080,15 @@ stm_status stm_extent_count_for_ino(const stm_extent_index *idx,
  * P7-16 / v17 value layout (96 bytes):
  *
  *   off  size  field
- *     0    1   n_replicas       (u8; 1..STM_EXTENT_MAX_REPLICAS=4)
- *     1    7   reserved         (zero)
- *     8    8   paddr_0          (le64; always non-zero)
- *    16    8   paddr_1          (le64; 0 if n_replicas < 2)
- *    24    8   paddr_2          (le64; 0 if n_replicas < 3)
- *    32    8   paddr_3          (le64; 0 if n_replicas < 4)
+ * P7-CAS / v18 value layout (96 bytes, kind-discriminated):
+ *
+ *   off  size  field
+ *     0    1   kind             (u8; 0x01 = HOT, 0x02 = COLD; v18)
+ *
+ *   HOT (kind=0x01) — bytes 1..95:
+ *     1    1   n_replicas       (u8; 1..STM_EXTENT_MAX_REPLICAS=4)
+ *     2    6   reserved         (zero)
+ *     8   32   paddrs[4]        (le64 each; valid 0..n_replicas-1, zero rest)
  *    40    8   write_gen        (le64) — AEAD gen for nonce
  *                                          construction; inherited from
  *                                          src on Reflink.
@@ -1035,24 +1101,22 @@ stm_status stm_extent_count_for_ino(const stm_extent_index *idx,
  *                                  of the encoded key.)
  *    72    8   origin_ino       (le64; AEAD-AD identity binding)
  *    80    8   origin_off       (le64; AEAD-AD identity binding)
- *    88    8   link_gen         (le64) — R48 P0-1: gen at which THIS
- *                                  record was inserted into the live
- *                                  extent index. For fresh writes
- *                                  link_gen == write_gen; for reflinks
- *                                  link_gen == current_txg-at-reflink.
- *                                  Drives send/recv's incremental
- *                                  filter (vs `gen` which the AEAD
- *                                  nonce uses, AEAD-inherited on
- *                                  Reflink).
+ *    88    8   link_gen         (le64) — R48 P0-1.
+ *
+ *   COLD (kind=0x02) — bytes 1..95:
+ *     1    7   reserved         (zero — 1-byte padding + 6-byte gap pre-hash)
+ *     8   32   content_hash     (BLAKE3-256; names a CAS index entry)
+ *    40   56   <same as HOT bytes 40..95>
  *
  * v15→v16 was the repair-log header carve in superblock; the extent
- * value layout was unchanged in v16. v17 grows it 64 → 96 with the
- * three origin fields + the link_gen field. Format break:
- * STM_UB_VERSION 17.
+ * value layout was unchanged in v16. v17 grew it 64 → 96 with the
+ * three origin fields + the link_gen field. v18 adds the kind
+ * discriminator at byte 0 (shifting n_replicas to byte 1 for HOT) and
+ * defines the COLD variant. Format break: STM_UB_VERSION 18.
  * ========================================================================= */
 
 #define EX_KEY_LEN              24u                          /* ds + ino + off */
-#define EX_VAL_LEN              96u                          /* P7-16 / v17    */
+#define EX_VAL_LEN              96u                          /* P7-CAS / v18   */
 /* MVP cap: 24-bit length so dlen + clen_and_comp.clen both fit without
  * compression. Production extends with chunking / per-extent integrity. */
 #define EX_LEN_MAX_24BIT        UINT32_C(0x00FFFFFF)
@@ -1087,22 +1151,40 @@ static stm_status ex_encode_value(const stm_extent_record *r,
      * with the allocator's per-range size tracking (stm_alloc_free
      * uses paddr alone, allocator knows the run length internally). */
     if (r->len > EX_LEN_MAX_24BIT) return STM_ERANGE;
-    if (r->n_replicas < 1 || r->n_replicas > STM_EXTENT_MAX_REPLICAS)
-        return STM_ECORRUPT;
 
     /* Zero entire buffer first so unused replica slots + reserved
      * bytes are deterministic-zero. */
     memset(out, 0, EX_VAL_LEN);
 
-    out[0] = r->n_replicas;
-    /* bytes [1..7] reserved (zero, already zeroed above). */
-    for (uint8_t i = 0; i < r->n_replicas; i++) {
-        if (r->paddrs[i] == 0) return STM_ECORRUPT; /* sentinel guard */
-        le64 p = stm_store_le64(r->paddrs[i]);
-        memcpy(out + 8 + (size_t)i * 8, p.v, 8);
+    /* P7-CAS / v18: byte 0 = kind discriminator. */
+    if (r->kind == STM_EXTENT_KIND_HOT) {
+        if (r->n_replicas < 1 || r->n_replicas > STM_EXTENT_MAX_REPLICAS) {
+            return STM_ECORRUPT;
+        }
+        out[0] = (uint8_t)STM_EXTENT_KIND_HOT;
+        out[1] = r->n_replicas;
+        /* bytes [2..7] reserved (zero, already zeroed above). */
+        for (uint8_t i = 0; i < r->n_replicas; i++) {
+            if (r->paddrs[i] == 0) return STM_ECORRUPT; /* sentinel guard */
+            le64 p = stm_store_le64(r->paddrs[i]);
+            memcpy(out + 8 + (size_t)i * 8, p.v, 8);
+        }
+        /* Trailing replica slots already zero from memset. */
+    } else if (r->kind == STM_EXTENT_KIND_COLD) {
+        if (r->n_replicas != 0u) return STM_ECORRUPT;  /* COLD has no replicas */
+        out[0] = (uint8_t)STM_EXTENT_KIND_COLD;
+        /* bytes [1..7] reserved (zero, already zeroed above). */
+        bool any_nonzero = false;
+        for (size_t i = 0; i < STM_EXTENT_HASH_LEN; i++) {
+            if (r->content_hash[i] != 0) { any_nonzero = true; break; }
+        }
+        if (!any_nonzero) return STM_ECORRUPT;  /* hash-zero is sentinel */
+        memcpy(out + 8, r->content_hash, STM_EXTENT_HASH_LEN);
+    } else {
+        return STM_ECORRUPT;
     }
-    /* Trailing replica slots already zero from memset. */
 
+    /* Bytes 40..95 are kind-independent. */
     le64 write_gen = stm_store_le64(r->gen);
     le32 dlen      = stm_store_le32((uint32_t)r->len);
     uint32_t clen_and_comp = (uint32_t)r->len & 0x00FFFFFFu;
@@ -1132,29 +1214,48 @@ static stm_status ex_decode_value(const uint8_t *in, size_t in_len,
                                      stm_extent_record *out_rec) {
     if (in_len != EX_VAL_LEN) return STM_ECORRUPT;
 
-    uint8_t n_replicas = in[0];
-    if (n_replicas < 1 || n_replicas > STM_EXTENT_MAX_REPLICAS)
-        return STM_ECORRUPT;
-    /* bytes [1..7] reserved — must be zero (anti-tamper). */
-    for (size_t i = 1; i < 8; i++) if (in[i] != 0) return STM_ECORRUPT;
+    /* P7-CAS / v18: byte 0 = kind discriminator. */
+    uint8_t kind_byte = in[0];
+    uint8_t n_replicas = 0;
+    uint64_t paddrs[STM_EXTENT_MAX_REPLICAS] = {0};
+    uint8_t  content_hash[STM_EXTENT_HASH_LEN] = {0};
 
-    /* Decode all 4 replica slots; verify trailing slots are zero. */
-    uint64_t paddrs[STM_EXTENT_MAX_REPLICAS];
-    for (uint8_t i = 0; i < STM_EXTENT_MAX_REPLICAS; i++) {
-        le64 p_le;
-        memcpy(p_le.v, in + 8 + (size_t)i * 8, 8);
-        paddrs[i] = stm_load_le64(p_le);
-        if (i < n_replicas) {
-            if (paddrs[i] == 0) return STM_ECORRUPT;  /* must be set */
-        } else {
-            if (paddrs[i] != 0) return STM_ECORRUPT;  /* must be zero */
+    if (kind_byte == (uint8_t)STM_EXTENT_KIND_HOT) {
+        n_replicas = in[1];
+        if (n_replicas < 1 || n_replicas > STM_EXTENT_MAX_REPLICAS)
+            return STM_ECORRUPT;
+        /* bytes [2..7] reserved — must be zero (anti-tamper). */
+        for (size_t i = 2; i < 8; i++) if (in[i] != 0) return STM_ECORRUPT;
+
+        /* Decode all 4 replica slots; verify trailing slots are zero. */
+        for (uint8_t i = 0; i < STM_EXTENT_MAX_REPLICAS; i++) {
+            le64 p_le;
+            memcpy(p_le.v, in + 8 + (size_t)i * 8, 8);
+            paddrs[i] = stm_load_le64(p_le);
+            if (i < n_replicas) {
+                if (paddrs[i] == 0) return STM_ECORRUPT;  /* must be set */
+            } else {
+                if (paddrs[i] != 0) return STM_ECORRUPT;  /* must be zero */
+            }
         }
-    }
-    /* Within-set distinctness — no replica paddr appears twice. */
-    for (uint8_t i = 0; i < n_replicas; i++) {
-        for (uint8_t j = (uint8_t)(i + 1); j < n_replicas; j++) {
-            if (paddrs[i] == paddrs[j]) return STM_ECORRUPT;
+        /* Within-set distinctness. */
+        for (uint8_t i = 0; i < n_replicas; i++) {
+            for (uint8_t j = (uint8_t)(i + 1); j < n_replicas; j++) {
+                if (paddrs[i] == paddrs[j]) return STM_ECORRUPT;
+            }
         }
+    } else if (kind_byte == (uint8_t)STM_EXTENT_KIND_COLD) {
+        /* bytes [1..7] reserved — must be zero (anti-tamper). */
+        for (size_t i = 1; i < 8; i++) if (in[i] != 0) return STM_ECORRUPT;
+        memcpy(content_hash, in + 8, STM_EXTENT_HASH_LEN);
+        /* Hash-all-zero is the sentinel — refuse on decode. */
+        bool any_nonzero = false;
+        for (size_t i = 0; i < STM_EXTENT_HASH_LEN; i++) {
+            if (content_hash[i] != 0) { any_nonzero = true; break; }
+        }
+        if (!any_nonzero) return STM_ECORRUPT;
+    } else {
+        return STM_ECORRUPT;
     }
 
     le64 write_gen_le, key_id_le;
@@ -1200,10 +1301,14 @@ static stm_status ex_decode_value(const uint8_t *in, size_t in_len,
     out_rec->ino        = ino;
     out_rec->off        = off;
     out_rec->len        = (uint64_t)dlen;
+    out_rec->kind       = (kind_byte == (uint8_t)STM_EXTENT_KIND_HOT)
+                           ? STM_EXTENT_KIND_HOT
+                           : STM_EXTENT_KIND_COLD;
     out_rec->n_replicas = n_replicas;
     for (uint8_t i = 0; i < STM_EXTENT_MAX_REPLICAS; i++) {
         out_rec->paddrs[i] = paddrs[i];
     }
+    memcpy(out_rec->content_hash, content_hash, STM_EXTENT_HASH_LEN);
     out_rec->gen        = stm_load_le64(write_gen_le);
     out_rec->key_id     = stm_load_le64(key_id_le);
     out_rec->origin_dataset_id = origin_ds;

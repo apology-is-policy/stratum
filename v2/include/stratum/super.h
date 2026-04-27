@@ -250,8 +250,36 @@ extern "C" {
  * Tamper-then-mount: a v16 pool whose ub_version is flipped to 17
  * has on-disk extent records still at v16's 64-byte value layout;
  * the v17 decoder requires 96-byte values and refuses with
- * STM_ECORRUPT. Format break, no feature flag. */
-#define STM_UB_VERSION        17u
+ * STM_ECORRUPT. Format break, no feature flag.
+ *
+ * v18 (P7-CAS, this commit): content-addressed cold tier (ARCH §6.9 /
+ * §7.6.3 / §12.10, NOVEL #3, cas.tla). The CAS-tier index tree root
+ * uses the existing `ub_cas_index_root` field at offset 288 (carved
+ * out in the original metadata-roots block at v3 alongside
+ * `ub_main_root` / `ub_alloc_root` / `ub_snap_root`, but unused
+ * until now); the tree's bp_kind is STM_BPTR_KIND_CAS (= 6, also
+ * carved at v3). Adds one new uberblock field carved from the head
+ * of `ub_reserved`: `ub_cas_index_root_gen` (le64) at offset 3280.
+ * Extent value gains a 1-byte `kind` discriminator at value offset 0:
+ *   0x01 = HOT (paddr-addressed, v17 layout for bytes 1..95).
+ *   0x02 = COLD (hash-addressed; bytes 1..7 reserved zero, bytes
+ *           8..39 carry the BLAKE3-256 chunk hash, bytes 40..95
+ *           identical to HOT — gen, dlen, clen_and_comp, key_id,
+ *           origin triple, link_gen).
+ * v17 pools fail at the version check (STM_EBADVERSION) before the
+ * new layouts are reached. Tamper-then-mount: a v17 pool whose
+ * ub_version is flipped to 18 has zero `ub_cas_index_root` (the
+ * field existed at v17 but was never populated) and zero
+ * `ub_cas_index_root_gen` (sits in what was ub_reserved); load_at
+ * treats root_paddr==0 as the empty cold-tier case and the index
+ * comes up empty — no corruption hazard. Pre-existing v17 extent
+ * records (n_replicas in byte 0, range 1..4) decode at v18 only if
+ * a fresh `kind` byte happens to fall in 1..4. v17 had no `kind`
+ * byte at all — byte 0 was n_replicas — so v17→v18 in-place is NOT
+ * forward-compat at the value layer; v18 mounts of v17 pools rely
+ * on the SB version check rejecting first. Format break, no feature
+ * flag. */
+#define STM_UB_VERSION        18u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */
@@ -500,8 +528,16 @@ typedef struct {
      * during the load). Zero before the first commit. */
     le64    ub_repair_log_next_seq;             /* 3272 :  8 */
 
+    /* Gen at which `ub_cas_index_root`'s tree (CAS-tier index, P7-CAS,
+     * v18) was AEAD-encrypted. Same semantics as `ub_extent_root_gen`
+     * / `ub_repair_log_root_gen`. The tree root itself lives at
+     * `ub_cas_index_root` (offset 288, in the metadata-roots block,
+     * carved at v3 but unused until v18). Zero before the first cold-
+     * tier commit. ARCH §6.9, NOVEL #3, spec cas.tla. */
+    le64    ub_cas_index_root_gen;              /* 3280 :  8 */
+
     /* Reserved for future fields + alignment to csum. */
-    uint8_t ub_reserved[784];                   /* 3280 : 784 */
+    uint8_t ub_reserved[776];                   /* 3288 : 776 */
 
     /* Checksum: BLAKE3-256 over the rest of the uberblock with this
      * field zeroed. Self-verifying; a blob whose first 4064 bytes
@@ -528,8 +564,12 @@ _Static_assert(offsetof(stm_uberblock, ub_repair_log_root_gen) == 3264,
                "ub_repair_log_root_gen must be at offset 3264 (v16 layout)");
 _Static_assert(offsetof(stm_uberblock, ub_repair_log_next_seq) == 3272,
                "ub_repair_log_next_seq must be at offset 3272 (v16 layout)");
-_Static_assert(offsetof(stm_uberblock, ub_reserved) == 3280,
-               "ub_reserved must be at offset 3280 (v16 layout)");
+_Static_assert(offsetof(stm_uberblock, ub_cas_index_root) == 288,
+               "ub_cas_index_root must be at offset 288 (v3 layout)");
+_Static_assert(offsetof(stm_uberblock, ub_cas_index_root_gen) == 3280,
+               "ub_cas_index_root_gen must be at offset 3280 (v18 layout)");
+_Static_assert(offsetof(stm_uberblock, ub_reserved) == 3288,
+               "ub_reserved must be at offset 3288 (v18 layout)");
 _Static_assert(offsetof(stm_uberblock, ub_csum) == 4064,
                "ub_csum must be at offset 4064");
 

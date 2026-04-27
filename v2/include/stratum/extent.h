@@ -164,6 +164,29 @@ stm_status stm_extent_decrypt(stm_aead_mode mode,
  * unused slots store 0 (sentinel). */
 #define STM_EXTENT_MAX_REPLICAS  4u
 
+/* P7-CAS / v18: extent_kind discriminator at on-disk value byte 0.
+ *
+ *   STM_EXTENT_KIND_HOT  (0x01) — paddr-addressed; replicas[0..n_replicas)
+ *                                 hold the AEAD ciphertext+tag of the
+ *                                 plaintext at this byte range.
+ *   STM_EXTENT_KIND_COLD (0x02) — content-addressed (CAS tier); the
+ *                                 chunk's plaintext is BLAKE3-hashed and
+ *                                 the hash names a CAS index entry whose
+ *                                 replicas hold the AEAD ciphertext under
+ *                                 CAS AD (ARCH §7.6.3).
+ *
+ * v17 had no kind byte (byte 0 = n_replicas, range 1..4). v18 mounts
+ * of v17 pools rely on the SB version check rejecting first; in-place
+ * forward-compat at the value layer is NOT supported. */
+typedef enum {
+    STM_EXTENT_KIND_HOT  = 0x01u,
+    STM_EXTENT_KIND_COLD = 0x02u,
+} stm_extent_kind;
+
+/* BLAKE3-256 hash length (32 bytes). For COLD extents, names the CAS
+ * index entry whose backing replicas hold the chunk's ciphertext. */
+#define STM_EXTENT_HASH_LEN     32u
+
 /*
  * Per-extent record. Mirrors ARCH §11.6.1 stm_extent_v2 in spirit —
  * stores the modeled fields (ds, ino, off, len, replicas, gen). The
@@ -185,8 +208,14 @@ typedef struct {
     uint64_t ino;                                 /* > 0 */
     uint64_t off;                                 /* byte offset within file */
     uint64_t len;                                 /* extent length in bytes; ≥ 1 */
-    uint8_t  n_replicas;                          /* 1..STM_EXTENT_MAX_REPLICAS */
-    uint64_t paddrs[STM_EXTENT_MAX_REPLICAS];     /* valid 0..n_replicas-1 */
+    /* P7-CAS / v18: kind discriminator. HOT extents use paddrs[]; COLD
+     * extents use content_hash[]. STM_EXTENT_KIND_HOT is the default;
+     * stm_extent_write / _overwrite / _reflink stamp HOT, while the
+     * sync layer's MigrateToCold path uses stm_extent_write_cold. */
+    stm_extent_kind kind;
+    uint8_t  n_replicas;                          /* HOT: 1..STM_EXTENT_MAX_REPLICAS; COLD: 0 */
+    uint64_t paddrs[STM_EXTENT_MAX_REPLICAS];     /* HOT: valid 0..n_replicas-1; COLD: zeros */
+    uint8_t  content_hash[STM_EXTENT_HASH_LEN];   /* COLD: BLAKE3-256; HOT: zeros */
     uint64_t gen;                                 /* write_gen; nonce uniqueness */
     /* P7-10: key_id of the dataset DEK that AEAD-encrypted the extent.
      * Resolved at read time via stm_sync_get_dek(dataset_id, key_id).
@@ -453,6 +482,44 @@ stm_status stm_extent_reflink(stm_extent_index *idx,
                                 uint64_t origin_ino,
                                 uint64_t origin_off,
                                 uint64_t link_gen);
+
+/*
+ * P7-CAS: insert a COLD extent record at (`dataset_id`, `ino`, `off`)
+ * covering [`off`, `off`+`len`) referencing `content_hash` (the BLAKE3-
+ * 256 of the chunk's plaintext). The CAS index entry at `content_hash`
+ * MUST exist + its refcount MUST already be bumped — this API just
+ * inserts the extent record. Atomicity at the sync layer.
+ *
+ * `origin_*` is the (dataset_id, ino, off) at which the chunk's
+ * plaintext was first stored (== the live position for fresh
+ * migrations; differs only for reflinked-then-migrated extents in
+ * future cross-dataset paths).
+ *
+ * Refusals:
+ *   - dataset_id == 0 OR ino == 0 (STM_EINVAL).
+ *   - len == 0 (STM_EINVAL — extent.tla::LengthPositive).
+ *   - content_hash all-zero (STM_EINVAL — reserved sentinel).
+ *   - gen > current_txg (STM_EINVAL — extent.tla::BirthTxgBound).
+ *   - off + len overflows uint64 (STM_EOVERFLOW).
+ *   - any existing live extent of (ds, ino) overlaps [off, off+len)
+ *     (STM_EEXIST — extent.tla::NoOverlapWithinIno; cas.tla::
+ *     NoOverlapWithinIno extends to cover hot+cold).
+ *
+ * Models cas.tla::MigrateToCold's cold-extent-record insert. Pure
+ * insert — no extent is dropped. The caller (sync_migrate_to_cold)
+ * separately drops the source hot extent before invoking this on a
+ * per-chunk basis.
+ */
+STM_MUST_USE
+stm_status stm_extent_write_cold(stm_extent_index *idx,
+                                    uint64_t dataset_id, uint64_t ino,
+                                    uint64_t off, uint64_t len,
+                                    const uint8_t content_hash[STM_EXTENT_HASH_LEN],
+                                    uint64_t gen, uint64_t key_id,
+                                    uint64_t origin_dataset_id,
+                                    uint64_t origin_ino,
+                                    uint64_t origin_off,
+                                    uint64_t link_gen);
 
 /*
  * Look up the live extent of (ds, ino) covering byte offset `off`.

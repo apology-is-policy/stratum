@@ -12,6 +12,7 @@
  */
 #include "tharness.h"
 #include <stratum/alloc.h>
+#include <stratum/cas.h>
 #include <stratum/dataset.h>
 #include <stratum/extent.h>
 #include <stratum/fs.h>
@@ -1939,6 +1940,91 @@ STM_TEST(fs_reflink_rofs_refused) {
     ro.read_only = true;
     STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &ro, &fs));
     STM_ASSERT_ERR(stm_fs_reflink(fs, 1, 1, 1, 2), STM_EROFS);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* ---------------------------------------------------------------- */
+/* P7-CAS (v18): cold-tier index lifecycle + persistence.            */
+/* ---------------------------------------------------------------- */
+
+STM_TEST(fs_cas_index_present_at_format) {
+    /* Fresh format establishes an empty CAS index reachable through
+     * the sync handle. Mount lifecycle wires bdev + bootstrap + crypt
+     * ctx so subsequent commits + load_at can round-trip the tree. */
+    make_tmp("cas_format");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    STM_ASSERT_TRUE(cas != NULL);
+    size_t n = 999;
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_cas_index_persists_across_mount) {
+    /* Insert a CAS entry, sync (commit serializes the tree), unmount,
+     * remount — entry survives because sync_open hydrates from
+     * ub_cas_index_root + ub_cas_index_root_gen. */
+    make_tmp("cas_remount");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Insert two CAS entries with distinct hashes + paddrs. */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    uint8_t h1[STM_CAS_HASH_LEN] = {0};
+    uint8_t h2[STM_CAS_HASH_LEN] = {0};
+    h1[0] = 0xA1; h1[STM_CAS_HASH_LEN - 1] = 0x5E;
+    h2[0] = 0xB2; h2[STM_CAS_HASH_LEN - 1] = 0x4D;
+    /* Use paddrs in a high range so they don't collide with the
+     * bootstrap pool's reserved region. */
+    uint64_t p1[2] = { 0x10000u, 0x10001u };
+    uint64_t p2[1] = { 0x20000u };
+    STM_ASSERT_OK(stm_cas_insert(cas, h1, p1, 2, /*length=*/4096,
+                                    /*gen=*/stm_sync_current_gen(sync)));
+    STM_ASSERT_OK(stm_cas_insert(cas, h2, p2, 1, /*length=*/8192,
+                                    /*gen=*/stm_sync_current_gen(sync)));
+    STM_ASSERT_OK(stm_cas_ref(cas, h1));   /* refcount(h1) = 2 */
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    /* Remount + verify. */
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    sync = stm_fs_sync_for_test(fs);
+    cas  = stm_sync_cas_index(sync);
+    size_t n = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)2);
+
+    stm_cas_record r1, r2;
+    STM_ASSERT_OK(stm_cas_lookup(cas, h1, &r1));
+    STM_ASSERT_EQ(r1.refcount,   2u);
+    STM_ASSERT_EQ(r1.length,     (uint64_t)4096);
+    STM_ASSERT_EQ(r1.n_replicas, (uint8_t)2);
+    STM_ASSERT_EQ(r1.paddrs[0],  (uint64_t)0x10000);
+    STM_ASSERT_EQ(r1.paddrs[1],  (uint64_t)0x10001);
+
+    STM_ASSERT_OK(stm_cas_lookup(cas, h2, &r2));
+    STM_ASSERT_EQ(r2.refcount,   1u);
+    STM_ASSERT_EQ(r2.length,     (uint64_t)8192);
+    STM_ASSERT_EQ(r2.n_replicas, (uint8_t)1);
+    STM_ASSERT_EQ(r2.paddrs[0],  (uint64_t)0x20000);
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
