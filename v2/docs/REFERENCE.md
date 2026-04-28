@@ -38,8 +38,58 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R50-hash-fixup. Substantive `91fff73` +
-  R50 close `6839cf0`.
+- **Tip**: post-R51-hash-fixup. Substantive `5e25cca` +
+  R51 close `<R51 close>` (TBD).
+  **P7-CAS-3 — closes R50 P2-1 + P2-3 forward-noted deferrals + adds
+  cold-extent reflink (CAS-bump shape). (1) **R50 P2-1 paddr-leak fix**:
+  Two-part. (1a) `cas_auto_gc_sweep_locked` moved BEFORE
+  `stm_alloc_commit` in `stm_sync_commit`. The sweep's
+  `stm_alloc_free` calls now produce PENDING(free_gen=target_gen)
+  entries that `stm_alloc_commit` PERSISTS in the on-disk alloc
+  tree (alloc_commit's own sweep predicate `free_gen<committed_gen`
+  excludes our entries from this-cycle reclamation but the PENDING
+  state IS durable). (1b) `stm_alloc_load_tree_at` extended with a
+  pending_head rebuild scan (R51 P1-1 inline fix): post-deserialize
+  walk emits one `pending_entry` per refcount=0 tree entry with
+  `free_gen=root_gen`. Without (1b), unmount loses the in-RAM
+  pending_head and the tree-resident PENDING entries are
+  unreachable to alloc_commit's sweep — the cross-mount leak the
+  R50 P2-1 close claim depends on. With (1a)+(1b), the next mount
+  + commit reclaims; a crash between this commit's final UB and
+  the next sync_commit no longer leaks paddrs.
+  (2) **R50 P2-3 transactional sweep**: refactored
+  `cas_auto_gc_sweep_locked` to a three-phase shape — Phase 1
+  captures (hash, paddrs, n_paddrs) tuples via cas_iter; Phase 2
+  alloc_frees per paddr with idempotent-tolerant pre-check (lookup
+  → refcount=0 means already PENDING from prior partial sweep
+  retry → skip); Phase 3 cas_gcs every captured hash. Phase 2
+  failure aborts WITHOUT calling cas_gc — cas_idx state unchanged,
+  retry safe via the idempotent-PENDING-skip path. STM_EBUSY
+  (concurrent ref-bump via stm_sync_cas_index) and STM_ENOENT
+  (concurrent gc) treated as Phase 3 skip cases. (3) **Cold-
+  extent reflink (CAS-bump shape)**: `stm_sync_reflink`'s
+  `reflink_collect_cb` now accepts COLD extents (was
+  STM_ENOTSUPPORTED in P7-CAS-2 MVP). Phase 2 branches on `e->kind`:
+  HOT calls `stm_alloc_ref` per replica; COLD calls `stm_cas_ref`
+  per cold record. Phase 3 inserts via `stm_extent_reflink` (HOT)
+  or `stm_extent_write_cold` (COLD) — the latter inheriting gen /
+  key_id / origin from src so AEAD AD reconstructs identically
+  across siblings. Rollback path symmetrically undoes both bump
+  classes via cx-snapshot ordered alloc_free / cas_deref capped
+  at hot_bumped / cold_bumped. test_fs grows 67 → 69 — replaces
+  `fs_reflink_refuses_cold_source` with three positive tests:
+  `fs_reflink_cold_extent_basic_share` (refcount=2 dedup),
+  `fs_reflink_cold_extent_overwrite_diverges` (rehydrate on dst →
+  refcount drops to 1; src still reads cold), and
+  `fs_reflink_cold_extent_dst_must_be_empty` (STM_EEXIST pre-
+  condition still enforced). cas.tla unchanged (cold-reflink
+  composes via existing `BumpRef` / MigrateToCold's CAS-hit
+  branch shape; no new spec action). 35 ctest suites green
+  default + ASan + TSan in isolation. No format break —
+  STM_UB_VERSION = 18 preserved. Spec posture 21/25/31
+  unchanged.**
+  Prior P7-CAS-2 substantive `91fff73` + R50 close `6839cf0` +
+  hash fixup `44d0a80`.
   **P7-CAS-2 — migration / rehydrate / auto-GC data plane. Closes the
   second half of ARCH §6.9 / NOVEL #3 (the index foundation landed at
   P7-CAS). New public API `stm_fs_migrate_to_cold(fs, ds, ino)`
