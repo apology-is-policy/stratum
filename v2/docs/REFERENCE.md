@@ -39,7 +39,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 ## Snapshot
 
 - **Tip**: post-R50-hash-fixup. Substantive `91fff73` +
-  R50 close `<R50 close>` (TBD).
+  R50 close `6839cf0`.
   **P7-CAS-2 — migration / rehydrate / auto-GC data plane. Closes the
   second half of ARCH §6.9 / NOVEL #3 (the index foundation landed at
   P7-CAS). New public API `stm_fs_migrate_to_cold(fs, ds, ino)`

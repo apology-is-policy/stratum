@@ -57,7 +57,7 @@ into the CAS tier (which DOES need P6) is a separate concern.
 ## Phase 7 status (overall)
 
 - [x] **P7-CAS-2 migration / rehydrate / auto-GC data plane** —
-      substantive `91fff73` + R50 close `<R50 close>` + hash-fixup
+      substantive `91fff73` + R50 close `6839cf0` + hash-fixup
       (this commit). Closes the second half of ARCH §6.9 / NOVEL #3 (the
       index foundation landed at P7-CAS). Adds the public API
       `stm_fs_migrate_to_cold(fs, dataset_id, ino)` that drives a
