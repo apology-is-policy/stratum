@@ -38,8 +38,8 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R53-hash-fixup. Substantive `<P7-CAS-4b-substantive>` +
-  R53 close `<P7-CAS-4b-Rclose>`.
+- **Tip**: post-R53-hash-fixup. Substantive `ad6be38` +
+  R53 close `b932714`.
   **P7-CAS-4b — FastCDC sub-chunking. Integrates `src/cdc/` (FastCDC,
   P7-prework idle since 2026-04) into `stm_sync_migrate_to_cold` so
   one HOT extent can migrate to N COLD chunks at content-defined

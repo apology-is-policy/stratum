@@ -57,7 +57,7 @@ into the CAS tier (which DOES need P6) is a separate concern.
 ## Phase 7 status (overall)
 
 - [x] **P7-CAS-4b FastCDC sub-chunking** — substantive
-      `<P7-CAS-4b-substantive>` + R53 close `<P7-CAS-4b-Rclose>` +
+      `ad6be38` + R53 close `b932714` +
       hash-fixup (this commit). Integrates `src/cdc/`
       (FastCDC, P7-prework, idle since 2026-04) into the cold-tier
       migration data plane. New per-stm_sync `stm_cdc cdc;` field
