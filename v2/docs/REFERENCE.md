@@ -38,8 +38,8 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R54-hash-fixup. Substantive `<P7-CAS-4c-substantive>` +
-  R54 close `<P7-CAS-4c-Rclose>`.
+- **Tip**: post-R54-hash-fixup. Substantive `dbadc63` +
+  R54 close `223250b`.
   **P7-CAS-4c — snap_idx ↔ CAS hash refcount integration. Closes the
   P7-CAS-2 forward-noted deferral that snapshots-with-cold-extents
   could see dangling-hash reads after auto-GC reclaimed the chunk.

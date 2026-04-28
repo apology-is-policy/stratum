@@ -57,8 +57,8 @@ into the CAS tier (which DOES need P6) is a separate concern.
 ## Phase 7 status (overall)
 
 - [x] **P7-CAS-4c snap_idx ↔ CAS hash refcount integration** —
-      substantive `<P7-CAS-4c-substantive>` + R54 close
-      `<P7-CAS-4c-Rclose>` + hash-fixup (this commit). Closes the
+      substantive `dbadc63` + R54 close
+      `223250b` + hash-fixup (this commit). Closes the
       P7-CAS-2 forward-noted deferral: snapshots-with-cold-extents
       were unsupported because auto-GC could reclaim a chunk still
       referenced by a snap's tree_root view → STM_ECORRUPT on
