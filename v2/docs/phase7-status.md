@@ -57,7 +57,7 @@ into the CAS tier (which DOES need P6) is a separate concern.
 ## Phase 7 status (overall)
 
 - [x] **P7-CAS-4a crossing-cold truncate** — substantive `a9e21f3` +
-      R52 close `<R52 close>` + hash-fixup (this commit). Lifts the
+      R52 close `fe6ac61` + hash-fixup (this commit). Lifts the
       STM_ENOTSUPPORTED refusal P7-CAS-2 placed on truncating
       across a cold extent. Composes via cold-aware
       `stm_sync_read_extent_locked` (P7-CAS-2) + kept-prefix

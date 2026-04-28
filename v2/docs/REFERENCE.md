@@ -39,7 +39,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 ## Snapshot
 
 - **Tip**: post-R52-hash-fixup. Substantive `a9e21f3` +
-  R52 close `<R52 close>` (TBD).
+  R52 close `fe6ac61`.
   **P7-CAS-4a — crossing-cold truncate. Lifts the STM_ENOTSUPPORTED
   refusal P7-CAS-2 placed on truncating ACROSS a cold extent
   (rec.kind == COLD AND rec.off < new_size < rec.off + rec.len).
