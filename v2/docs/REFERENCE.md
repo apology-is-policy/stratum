@@ -39,7 +39,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 ## Snapshot
 
 - **Tip**: post-R51-hash-fixup. Substantive `5e25cca` +
-  R51 close `<R51 close>` (TBD).
+  R51 close `ee25ff6`.
   **P7-CAS-3 — closes R50 P2-1 + P2-3 forward-noted deferrals + adds
   cold-extent reflink (CAS-bump shape). (1) **R50 P2-1 paddr-leak fix**:
   Two-part. (1a) `cas_auto_gc_sweep_locked` moved BEFORE
