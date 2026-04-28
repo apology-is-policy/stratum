@@ -11,20 +11,22 @@ CAS dedup property. The refcount tracks how many cold-extent records
 currently reference each hash; when the refcount falls to zero, the
 chunk's backing replicas are eligible for reclamation.
 
-**Status (P7-CAS-4b / v18)**: index lifecycle + persistence + format
+**Status (P7-CAS-4c / v19)**: index lifecycle + persistence + format
 break + migration / rehydrate / auto-GC data plane + cold-extent
-reflink + crossing-cold truncate + FastCDC sub-chunking all landed.
+reflink + crossing-cold truncate + FastCDC sub-chunking + snap_idx
+↔ CAS hash refcount integration all landed.
 `stm_sync_migrate_to_cold` realizes cas.tla::MigrateToCold (K=1) and
 cas.tla::ChunkedMigrateToColdK2 (K=2; K>=3 composes by induction);
 `stm_sync_write_extent_locked`'s pre-scan + post-deref realizes
-cas.tla::RehydrateOnWrite; the 3-phase transactional
-`cas_auto_gc_sweep_locked` (run BEFORE per-device alloc_commit in
-`stm_sync_commit`) realizes cas.tla::GC + closes the R50 P2-1
-paddr-leak window across crash boundaries; cold-extent reflink
-composes via cas.tla's existing `BumpRef` (= `stm_cas_ref`) shape.
-Remaining deferrals (P7-CAS-4): snap_idx ↔ CAS hash refcount
-integration, background scrub-driven CAS walker, migration policy
-heuristic, send/recv with cold extents.
+cas.tla::RehydrateOnWrite (cold-deref now snap-aware via
+`stm_snapshot_index_overwrite_cold_block` — P7-CAS-4c); the 3-phase
+transactional `cas_auto_gc_sweep_locked` (run BEFORE per-device
+alloc_commit in `stm_sync_commit`) realizes cas.tla::GC + closes the
+R50 P2-1 paddr-leak window across crash boundaries; cold-extent
+reflink composes via cas.tla's existing `BumpRef` (= `stm_cas_ref`)
+shape. Remaining deferrals (P7-CAS-4): background scrub-driven CAS
+walker (closes R51 P3-2 + P3-4), migration policy heuristic
+(NOVEL #6 v1), send/recv with cold extents.
 
 ## Public API
 
@@ -458,16 +460,49 @@ of `extent_overwrite`'s drop — semantically equivalent to
 
 
 
-In the P7-CAS-2 MVP the snap_idx does not track CAS hashes. Auto-GC
-walks all refcount=0 entries unconditionally, even if a snapshot's
-view still references the chunk. Concretely: if you create a
-snapshot then delete a cold-extent file, the deref drives the CAS
-refcount to 0; auto-GC at the next commit reclaims the chunk; the
-snapshot's view of that file becomes stale (the read path will
-return STM_ECORRUPT on dangling-hash lookup).
+**Snapshot interaction (P7-CAS-4c)**: closes the P7-CAS-2 MVP gap.
+Each PRESENT snapshot now carries a per-snap cold-dead-list (mirror
+of the existing paddr dead-list) — a flat byte buffer of N×32-byte
+content_hash values for cold extents that were dropped from the
+LIVE dataset DURING this snap's lifetime. The CAS refcount on each
+captured hash stays bumped while the snap holds it; refcount only
+drops at snap-delete (when the cold-dead-list is handed back to the
+caller for stm_cas_deref routing), at which point auto-GC at the
+next sync_commit reclaims the chunk if refcount hits zero.
 
-Future P7-CAS-4 work: integrate CAS hash refcounts with snap_idx so
-auto-GC composes correctly with snapshot retention.
+Routing: `stm_sync_write_extent_locked`'s rehydrate-on-write
+bookend + `stm_sync_truncate`'s past-/crossing-extent bookends
+call `stm_snapshot_index_overwrite_cold_block(idx, ds, hash,
+*out_should_deref)` for each dropped hash. If a most-recent
+PRESENT snap exists for `ds`, the hash appends to that snap's
+cold-dead-list and `out_should_deref=false`; otherwise
+`out_should_deref=true` and the caller calls `stm_cas_deref`
+directly. Reflink + migrate rollback paths keep direct
+`stm_cas_deref` calls — those records were JUST inserted by the
+failing operation and have not been captured by any snap yet, so
+snap-routing doesn't apply.
+
+`stm_snapshot_delete` returns BOTH dead-lists: paddrs (existing)
+and the new cold-hash buffer. The caller iterates the cold buffer
+in 32-byte strides calling `stm_cas_deref` per entry to release
+the CAS refcount.
+
+Format break STM_UB_VERSION 18 → 19: snap value layout grows past
+the dead_paddrs[] tail with `cold_dead_count` (le32) +
+`cold_dead_hashes[N][32]`. New cap `STM_SNAP_COLD_DEAD_LIST_MAX
+= 256`. See `13-snapshot.md` for the full on-disk encoding.
+
+Spec coverage: `dead_list.tla` extended with parallel cold-tier
+model (`live_cold_extents`, `extent_hash`, `snap_cold_dead`,
+`cold_dereffed`, `used_cold_extents`); new actions `WriteCold` +
+`OverwriteCold`; SnapDelete drains snap_cold_dead → cold_dereffed.
+New invariants: `ColdExtentsTrackedSomewhere`,
+`LiveColdDisjointFromDead`, `LiveColdDisjointFromDereffed`,
+`DereffedColdDisjointFromDead`, `ColdSingleOwnership`. Two new
+buggy variants (`BuggyOverwriteColdForgetsDead`,
+`BuggyDeleteColdForgetsDeref`) both fire
+`ColdExtentsTrackedSomewhere`. dead_list.cfg green at 4.11M
+distinct states / depth 21 / 27s.
 
 ## FastCDC sub-chunking (P7-CAS-4b)
 
@@ -698,7 +733,7 @@ precondition broadens the state space modestly).
 | Transactional auto-GC sweep (R50 P2-3 close) | ✅ P7-CAS-3 | — |
 | Cold-crossing truncate (CAS-aware read+slice) | ✅ P7-CAS-4a | — |
 | Cold-extent FastCDC sub-chunking | ✅ P7-CAS-4b | — |
-| Snapshot-CAS hash refcount integration | — | P7-CAS-4c |
+| Snapshot-CAS hash refcount integration | ✅ P7-CAS-4c | — |
 | Background GC integration with scrub | — | P7-CAS-4 (closes R51 P3-2 + P3-4) |
 | Migration policy heuristic (NOVEL #6 v1) | — | post-P7-CAS-4 |
 | Cross-pool dedup | — | post-v2.0 (NOVEL #3) |

@@ -56,6 +56,71 @@ into the CAS tier (which DOES need P6) is a separate concern.
 
 ## Phase 7 status (overall)
 
+- [x] **P7-CAS-4c snap_idx ↔ CAS hash refcount integration** —
+      substantive `<P7-CAS-4c-substantive>` + R54 close
+      `<P7-CAS-4c-Rclose>` + hash-fixup (this commit). Closes the
+      P7-CAS-2 forward-noted deferral: snapshots-with-cold-extents
+      were unsupported because auto-GC could reclaim a chunk still
+      referenced by a snap's tree_root view → STM_ECORRUPT on
+      dangling-hash lookup. Fix: snap-aware deref routing for cold-
+      record drops. New
+      `stm_snapshot_index_overwrite_cold_block(idx, ds, hash,
+      *out_should_deref)` mirrors the paddr-tier
+      `stm_snapshot_index_overwrite_block` for the cold tier — if a
+      most-recent PRESENT snap exists, append the hash to that
+      snap's cold-dead-list and signal "no immediate deref"; else
+      signal "caller derefs now". Wired into sync.c at the cold-
+      record-drop bookends (write_extent + truncate post-deref
+      bookend), replacing unconditional `stm_cas_deref` with snap-
+      aware routing. Reflink + migrate rollback paths keep direct
+      `stm_cas_deref` (records they JUST inserted; no snap captured
+      them yet — orthogonal). Format break STM_UB_VERSION 18 → 19:
+      snap value layout grows past the dead_paddrs[] tail with
+      `cold_dead_count` (le32) + `cold_dead_hashes[N][32]`. New
+      cap `STM_SNAP_COLD_DEAD_LIST_MAX = 256` (mirror of
+      STM_SNAP_DEAD_LIST_MAX); new helper macro `STM_SNAP_HASH_LEN
+      = 32`. `stm_snapshot_delete` extended with two out-params
+      (`uint8_t **out_freed_cold_hashes`, `size_t
+      *out_freed_cold_count`) — caller iterates the buffer in 32-
+      byte strides calling `stm_cas_deref` per hash. New
+      observability accessor `stm_snapshot_cold_dead_list_count`.
+      Persistence: sp_encode_value / sp_decode_value handle the
+      new tail; sp_validate_shadow gains a within-snap cold-hash
+      uniqueness check (cross-snap collisions are legitimate per
+      spec — distinct snap windows may each capture a drop of a
+      same-hash cold extent, and snap A's cold-dead-list and
+      snap B's cold-dead-list may both contain hash H without
+      violating ColdSingleOwnership at the cold-extent-id level).
+      Spec extension to dead_list.tla: parallel cold-tier model
+      with `live_cold_extents`, `extent_hash`, `snap_cold_dead`,
+      `cold_dereffed`, `used_cold_extents`. New actions
+      `WriteCold(c, h)` + `OverwriteCold(c)`; SnapDelete extended
+      to drain snap_cold_dead[s] into cold_dereffed. New
+      invariants: `ColdExtentsTrackedSomewhere`,
+      `LiveColdDisjointFromDead`, `LiveColdDisjointFromDereffed`,
+      `DereffedColdDisjointFromDead`, `ColdSingleOwnership`. Two
+      new buggy variants: `BuggyOverwriteColdForgetsDead`,
+      `BuggyDeleteColdForgetsDeref` — both fire
+      `ColdExtentsTrackedSomewhere`. dead_list.cfg green at 4.11M
+      distinct states / depth 21 / 27s wall (cold-tier broadens
+      the state space; previously a small bound). All 5 buggy
+      demos fire. R54 audit: 0 P0 + 1 P1 + 0 P2 + 3 P3 — P1-1
+      fixed inline (within-snap dedup-defense scan rejected
+      legitimate intra-COW shared-hash drops; same fix at
+      sp_validate_shadow); P3-1 + P3-2 + P3-3 forward-noted as
+      P7-CAS-4 deferrals (dead-fallback, STM_ENOSPC at cap,
+      arg-validation drift). test_fs grows 77 → 83 (5 new
+      P7-CAS-4c tests + 1 R54 P1-1 regression: snap-holds-cold-
+      after-overwrite, snap-delete-releases-cold-dead, no-snap-
+      cold-overwrite-derefs-directly, cold-dead-list-persists-
+      across-mount, snap-intra-cow-shared-hash-no-leak, arg
+      validation). test_snapshot.c + test_sync.c +
+      bench_snapshot.c updated for the new 6-arg
+      `stm_snapshot_delete` signature. test_pool.c UB version
+      assertion bumped 18 → 19. 35 ctest suites green default +
+      ASan + TSan in isolation. Spec posture: 21 modules / 25
+      fixed cfgs / 33 buggy cfgs (was 31; added 2 cold-tier
+      buggy cfgs).
 - [x] **P7-CAS-4b FastCDC sub-chunking** — substantive
       `ad6be38` + R53 close `b932714` +
       hash-fixup (this commit). Integrates `src/cdc/`

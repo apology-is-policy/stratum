@@ -40,7 +40,9 @@ written so `ub_snap_root` becomes non-zero).
 
 ```c
 stm_status stm_snapshot_create   (idx, dataset_id, name, tree_root_paddr, extent_txg, *out_id);
-stm_status stm_snapshot_delete   (idx, snapshot_id, **out_freed_paddrs, *out_freed_count);
+stm_status stm_snapshot_delete   (idx, snapshot_id,
+                                  **out_freed_paddrs, *out_freed_count,
+                                  **out_freed_cold_hashes, *out_freed_cold_count);
 stm_status stm_snapshot_hold     (idx, snapshot_id);
 stm_status stm_snapshot_release  (idx, snapshot_id);
 ```
@@ -65,23 +67,42 @@ and `ChainExtentTxgOrdered` for the spec-level invariants.
 
 `Delete` refuses with `STM_EBUSY` if `hold_count > 0` or if a
 registered clone-check cb returns true (`clone.tla::SnapWith-
-ClonesUndeletable`). On success the snap's accumulated dead-list
-(see "Dead-list" below) transfers to the caller via
-`*out_freed_paddrs` + `*out_freed_count` — the caller owns the
-malloc'd array (`free()` it) and MUST reclaim every paddr through
-`stm_alloc_free` against the matching device's allocator. Use
-`stm_paddr_device(paddr)` to route. A clean-no-overwrites delete
-returns `*out_freed_paddrs = NULL`, `*out_freed_count = 0`.
+ClonesUndeletable`). On success BOTH dead-lists transfer to the
+caller:
+
+- `*out_freed_paddrs` + `*out_freed_count` — the paddr-tier dead-
+  list. Caller owns the malloc'd array (`free()` it) and MUST
+  reclaim every paddr through `stm_alloc_free` against the
+  matching device's allocator. Use `stm_paddr_device(paddr)` to
+  route.
+- `*out_freed_cold_hashes` + `*out_freed_cold_count` (P7-CAS-4c)
+  — the cold-tier dead-list, a flat byte buffer of N×32 bytes.
+  Caller owns the buffer (`free()` it) and MUST iterate it in
+  32-byte strides calling `stm_cas_deref(cas, hash)` per entry
+  to release the CAS refcount. Composes the cold-tier mirror of
+  the paddr-tier free path.
+
+A clean-no-overwrites delete returns `*out_freed_paddrs = NULL`,
+`*out_freed_count = 0`, `*out_freed_cold_hashes = NULL`,
+`*out_freed_cold_count = 0`.
 
 `Hold` / `Release` increment / decrement `hold_count`. Holds
 persist across mount (matches ZFS semantics). Release of a
 zero-count slot is `STM_EINVAL`.
 
-### Dead-list (P6-deadlist)
+### Dead-list (P6-deadlist + P7-CAS-4c cold-tier)
 
 ```c
-stm_status stm_snapshot_index_overwrite_block (idx, dataset_id, paddr, *out_should_free);
-stm_status stm_snapshot_dead_list_count       (idx, snapshot_id, *out_count);
+/* Paddr-tier (P6). */
+stm_status stm_snapshot_index_overwrite_block       (idx, dataset_id, paddr,
+                                                     *out_should_free);
+stm_status stm_snapshot_dead_list_count             (idx, snapshot_id, *out_count);
+
+/* Cold-tier (P7-CAS-4c). */
+stm_status stm_snapshot_index_overwrite_cold_block  (idx, dataset_id,
+                                                     content_hash[32],
+                                                     *out_should_deref);
+stm_status stm_snapshot_cold_dead_list_count        (idx, snapshot_id, *out_count);
 ```
 
 `overwrite_block` realizes `dead_list.tla::OverwriteBlock`. If the
@@ -111,6 +132,51 @@ empty. The C impl realizes that simplification.
 The OverwriteBlock cb has no production callers in this chunk —
 it's the API surface that P7's extent COW path will plug into
 once the paddr→bptr resolver lands.
+
+**Cold-tier mirror (P7-CAS-4c)**: `overwrite_cold_block` realizes
+`dead_list.tla::OverwriteCold`. Mirror semantics — if the dataset
+has no PRESENT snapshot, no snap holds the dropped cold extent's
+CAS chunk; `*out_should_deref = true` tells the caller to call
+`stm_cas_deref(cas, hash)` immediately. Otherwise the hash is
+appended to the most-recent snap's cold-dead-list and
+`*out_should_deref = false`; the deref obligation is held by the
+snap until snap-delete fires it.
+
+Refusal codes for `overwrite_cold_block`:
+
+- `STM_EINVAL` for `dataset_id == 0`, all-zero hash (CAS sentinel,
+  never live), NULL idx / out / hash, OR a hash already present
+  in the same snap's cold-dead-list (defense-in-depth: catches
+  the SAME drop event being routed twice; cross-snap collisions
+  are explicitly ALLOWED — distinct cold extents legitimately
+  share a hash via dedup, and distinct snap windows may each
+  capture a drop of a same-hash cold extent).
+- `STM_ECORRUPT` if the most-recent snap slot is in a stale
+  state (signals in-RAM index corruption — same shape as the
+  paddr-tier API).
+- `STM_ENOSPC` at the in-line cap `STM_SNAP_COLD_DEAD_LIST_MAX
+  = 256`. Caller SHOULD propagate ENOSPC up to the COW caller
+  and refuse the operation; the alternative (direct-deref + drop
+  the snap's claim) would silently violate
+  `dead_list.tla::ColdExtentsTrackedSomewhere`.
+- `STM_ENOMEM` on realloc failure (existing cold-dead-list
+  preserved).
+
+`cold_dead_list_count` is read-only observability; returns the
+number of cold-extent hashes tracked in `snapshot_id`'s cold-dead-
+list.
+
+Production callers wired in P7-CAS-4c:
+
+- `stm_sync_write_extent_locked` rehydrate-on-write bookend (the
+  `cold_overlap_cb` post-deref loop).
+- `stm_sync_truncate` past-extent + crossing-extent cold-deref
+  bookend.
+
+Reflink + migrate rollback paths keep direct `stm_cas_deref`
+calls — those records were JUST inserted by the failing
+operation and have not been captured by any snap yet, so
+snap-routing doesn't apply.
 
 ### Read-only
 
@@ -183,29 +249,34 @@ sentinel for "first in chain", never used as a key).
 ### Value (variable length)
 
 ```
-off       size  field
-  0        8   dataset_id        (le64; ≠ 0)
-  8        8   tree_root_paddr   (le64; STM_SNAP_NO_TREE_ROOT for stub)
- 16        8   created_txg       (le64; ≤ idx->current_txg)
- 24        8   extent_txg        (le64; ≤ sync.current_gen at Create — P7-8)
- 32        8   prev_snap_id      (le64; STM_SNAP_NO_PREV for chain head)
- 40        4   hold_count        (le32; persists across mount)
- 44        4   flags             (le32)
- 48        2   name_len          (le16; 1..STM_SNAP_NAME_MAX)
- 50        2   pad               (zero)
- 52        L   name              (UTF-8, no NUL)
- 52+L      4   dead_count        (le32; 0..STM_SNAP_DEAD_LIST_MAX)
- 56+L    8*N   dead_paddrs       (le64[N])  N = dead_count
+off            size      field
+  0              8       dataset_id        (le64; ≠ 0)
+  8              8       tree_root_paddr   (le64; STM_SNAP_NO_TREE_ROOT for stub)
+ 16              8       created_txg       (le64; ≤ idx->current_txg)
+ 24              8       extent_txg        (le64; ≤ sync.current_gen at Create — P7-8)
+ 32              8       prev_snap_id      (le64; STM_SNAP_NO_PREV for chain head)
+ 40              4       hold_count        (le32; persists across mount)
+ 44              4       flags             (le32)
+ 48              2       name_len          (le16; 1..STM_SNAP_NAME_MAX)
+ 50              2       pad               (zero)
+ 52              L       name              (UTF-8, no NUL)
+ 52+L            4       dead_count        (le32; 0..STM_SNAP_DEAD_LIST_MAX)
+ 56+L          8*N       dead_paddrs       (le64[N])  N = dead_count
+ 56+L+8*N        4       cold_dead_count   (le32; 0..STM_SNAP_COLD_DEAD_LIST_MAX) — P7-CAS-4c v19
+ 60+L+8*N    32*M       cold_dead_hashes   (uint8_t[M][32])  M = cold_dead_count
 ```
 
-Total: `56 + name_len + 8*dead_count` bytes (was `48 + name_len`
-pre-v14). `SP_VAL_FIXED == 52`; `SP_DEAD_TAIL_FIXED == 4`. The
-v13→v14 bump is a HARD format break — v13's 44-byte fixed prefix
-and v14's 52-byte fixed prefix produce different total lengths
-even at `name_len == 0` and `dead_count == 0`, so a v13 mount-load
-under v14 code length-rejects via the in_len-vs-expected check in
-`sp_decode_value`. Refused at mount via uniform STM_EBADVERSION
-(uberblock.c version gate).
+Total: `56 + name_len + 8*N + 4 + 32*M` bytes (was `56 + name_len
++ 8*N` pre-v19). `SP_VAL_FIXED == 52`; `SP_DEAD_TAIL_FIXED == 4`;
+`SP_COLD_TAIL_FIXED == 4`; `SP_COLD_HASH_BYTES == 32`. The
+v13→v14 bump was a HARD format break (added extent_txg + dead-
+list tail). The v18→v19 bump (P7-CAS-4c) appends the cold-dead-
+list tail past the existing layout — a v18 pool whose ub_version
+is flipped to v19 has snap values lacking the new 4-byte
+cold_dead_count field; the v19 decoder's length check `in_len <
+paddr_tail_end + SP_COLD_TAIL_FIXED` returns STM_ECORRUPT.
+Refused at mount via uniform STM_EBADVERSION (uberblock.c
+version gate) before the snap decoder runs.
 
 ### Crypt + Merkle
 

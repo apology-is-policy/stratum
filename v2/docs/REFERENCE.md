@@ -38,8 +38,58 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R53-hash-fixup. Substantive `ad6be38` +
-  R53 close `b932714`.
+- **Tip**: post-R54-hash-fixup. Substantive `<P7-CAS-4c-substantive>` +
+  R54 close `<P7-CAS-4c-Rclose>`.
+  **P7-CAS-4c — snap_idx ↔ CAS hash refcount integration. Closes the
+  P7-CAS-2 forward-noted deferral that snapshots-with-cold-extents
+  could see dangling-hash reads after auto-GC reclaimed the chunk.
+  Format break STM_UB_VERSION 18 → 19: snapshot value layout extends
+  past the existing dead_paddrs[] tail with `cold_dead_count` (le32)
+  + `cold_dead_hashes[N][32]`. New `STM_SNAP_COLD_DEAD_LIST_MAX = 256`
+  cap + `STM_SNAP_HASH_LEN = 32`. New API
+  `stm_snapshot_index_overwrite_cold_block(idx, ds, hash, *out_should_deref)`:
+  if a most-recent PRESENT snap exists for `ds`, append `hash` to its
+  cold-dead-list (out_should_deref=false, deref deferred to snap-
+  delete); else (no snap), out_should_deref=true and caller calls
+  `stm_cas_deref` directly. `stm_snapshot_delete` extended with two
+  out-params (cold_hashes byte buffer + count) — caller iterates +
+  derefs each hash. New observability accessor
+  `stm_snapshot_cold_dead_list_count`. Wired into sync.c at the
+  cold-record-drop bookends (write_extent + truncate) — both replace
+  the unconditional `stm_cas_deref` with snap-aware routing. Spec
+  extension to dead_list.tla: new `WriteCold` + `OverwriteCold`
+  actions; SnapDelete drains snap_cold_dead → cold_dereffed; new
+  invariants `ColdExtentsTrackedSomewhere` + `LiveColdDisjointFromDead`
+  + `LiveColdDisjointFromDereffed` + `DereffedColdDisjointFromDead`
+  + `ColdSingleOwnership`. Two new buggy variants
+  (BuggyOverwriteColdForgetsDead, BuggyDeleteColdForgetsDeref) both
+  fire ColdExtentsTrackedSomewhere. dead_list.cfg green at 4.11M
+  states / depth 21 / 27s (was much smaller; cold-tier broadens the
+  state space). All 5 buggy demos fire. Persistence: sp_encode_value
+  + sp_decode_value handle the new tail; sp_validate_shadow gains a
+  within-snap cold-hash uniqueness check (cross-snap collisions
+  legitimate per spec). Atomic-swap on load + close + load_at error
+  paths free both arrays. test_fs grows 77 → 83 (5 P7-CAS-4c tests +
+  1 R54 P1-1 regression test: snap-holds-cold-after-overwrite,
+  snap-delete-releases-cold-dead, no-snap-cold-overwrite-derefs-
+  directly, snap-cold-dead-list-persists-across-mount, snap-intra-
+  cow-shared-hash-no-leak, arg validation).
+  test_snapshot.c + test_sync.c + bench_snapshot.c snap_delete
+  callers updated to the new 6-arg signature. test_pool.c UB version
+  assertion bumped 18 → 19. 35 ctest suites green default + ASan +
+  TSan in isolation. Spec posture: 21 modules / 25 fixed cfgs / 33
+  buggy cfgs (was 31 — added 2 cold-tier buggy cfgs). R54 audit:
+  1 P1 + 0 P0 + 0 P2 + 3 P3 — P1-1 (within-snap dedup-defense scan
+  in `stm_snapshot_index_overwrite_cold_block` + matching check in
+  `sp_validate_shadow` rejected legitimate intra-COW shared-hash
+  drops, silently losing CAS-deref obligations and leaving chunks
+  unreclaimable) fixed inline by removing both scans + adding
+  `fs_snap_intra_cow_shared_hash_no_leak` regression test
+  (test_fs 82 → 83). P3-1 + P3-2 + P3-3 forward-noted as
+  P7-CAS-4 deferrals (dead-fallback codepath, STM_ENOSPC at cap
+  exhaustion, arg-validation drift).**
+  Prior P7-CAS-4b substantive `ad6be38` + R53 close `b932714` +
+  hash fixup `04809f8`.
   **P7-CAS-4b — FastCDC sub-chunking. Integrates `src/cdc/` (FastCDC,
   P7-prework idle since 2026-04) into `stm_sync_migrate_to_cold` so
   one HOT extent can migrate to N COLD chunks at content-defined
