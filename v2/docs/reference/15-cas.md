@@ -11,11 +11,14 @@ CAS dedup property. The refcount tracks how many cold-extent records
 currently reference each hash; when the refcount falls to zero, the
 chunk's backing replicas are eligible for reclamation.
 
-**Status (P7-CAS / v18)**: index lifecycle + persistence + format
-break landed. Migration / rehydration paths (`stm_sync_migrate_to_cold`,
-auto-rehydrate-on-write) are deferred to the follow-on chunk
-**P7-CAS-2**. The cas.tla `MigrateToCold` / `RehydrateOnWrite` actions
-stand as the formal contract that the future C-impl must satisfy.
+**Status (P7-CAS-2 / v18)**: index lifecycle + persistence + format
+break + migration / rehydrate / auto-GC data plane all landed.
+`stm_sync_migrate_to_cold` realizes cas.tla::MigrateToCold;
+`stm_sync_write_extent_locked`'s pre-scan + post-deref realizes
+cas.tla::RehydrateOnWrite; `cas_auto_gc_sweep_locked` invoked in
+`stm_sync_commit` realizes cas.tla::GC. Cold-extent reflinks +
+cold-crossing truncates are refused with STM_ENOTSUPPORTED in the
+MVP — clean P7-CAS-3 future-chunk extensions.
 
 ## Public API
 
@@ -228,20 +231,144 @@ boundary that composes both indices and is responsible for ensuring
 fresh allocator-side paddrs flow into the CAS entry's replica set.
 This composition is realized in P7-CAS-2.
 
+## Migration data plane (P7-CAS-2)
+
+`stm_sync_migrate_to_cold(s, ds, ino)` walks every HOT extent at
+(ds, ino) and migrates each to a COLD CAS chunk. The pipeline per
+extent:
+
+1. **Read+decrypt** the source HOT plaintext via the lock-held read
+   helper `stm_sync_read_extent_locked` (uses the dataset's stamped
+   key_id + the extent's origin_* AEAD AD).
+2. **BLAKE3-256 hash** the plaintext (one hash per extent —
+   extent-granularity dedup; FastCDC sub-chunking is a P7-CAS-3+
+   refinement).
+3. **CAS lookup-or-insert**:
+   - HIT: bump refcount via `stm_cas_ref` (cas.tla::MigrateToCold's
+     CAS-hit branch).
+   - MISS: reserve fresh paddrs via `stm_alloc_reserve` across N
+     devices (per the pool's redundancy profile, capped at
+     STM_CAS_MAX_REPLICAS=4); AEAD-encrypt under stm_ad_cas + pool
+     metadata_key onto the fresh paddrs via the new helper
+     `cas_chunk_encrypt_and_write_locked`; insert via
+     `stm_cas_insert` (cas.tla::MigrateToCold's CAS-miss branch).
+4. **Atomic hot→cold swap** via the new
+   `stm_extent_migrate_to_cold` extent API. The swap holds
+   extent_idx.lock across both the drop and the insert, so
+   NoOverlapWithinIno is preserved across the transition (the
+   matching slot is overwritten in place; cardinality preserved).
+5. **Drop-route** the source HOT replicas through the existing
+   refcount-aware `sync_drop_paddr_locked` — composes with reflink
+   refcount-shared paddrs (DecRef when refcount > 1; dead-list /
+   alloc_free when refcount == 1).
+
+**Rollback**: per-extent atomicity. If the swap fails AFTER the
+CAS-side state was set up, the rollback path calls `stm_cas_deref`
+(MISS path: drives refcount to 0 → auto-GC at next commit; HIT
+path: undoes the bump). Earlier-migrated extents in the same
+multi-extent file stay migrated; the caller can retry to resume.
+
+**Allocator-fresh paddr property** (closes R49 P2-1):
+HotColdReplicasDisjoint is enforced at the sync-layer caller via
+`stm_alloc_reserve` rather than inside `stm_cas_insert`. The
+allocator's freshness guarantee (no paddr already in use) gives us
+disjointness vs the extent_idx's HOT replicas without an explicit
+cross-index runtime check.
+
+## Auto-rehydrate on write
+
+`stm_sync_write_extent_locked` pre-scans the (ds, ino) extent_idx
+via the new `cold_overlap_cb` for any COLD extent overlapping the
+write target [off, off+len). Captured `content_hash`es flow through
+to a post-overwrite `stm_cas_deref` loop after `stm_extent_overwrite`
+drops them. Since cold extents have `n_replicas=0`, the existing
+HOT-only paddr drop loop is unchanged; the captured hashes are the
+only piece of the COLD record's identity preserved across the swap.
+
+The same pre-scan + post-deref bookend is applied to
+`stm_sync_truncate`'s past-extent drop path. Crossing-cold truncate
++ reflink-of-cold-source refused with STM_ENOTSUPPORTED in the
+MVP — clean P7-CAS-3 future-chunk extensions.
+
+## COLD-aware read
+
+`stm_sync_read_extent_locked` adds a kind branch: when
+`rec.kind == STM_EXTENT_KIND_COLD`, the helper resolves the
+content_hash → CAS entry via `stm_cas_lookup`, then AEAD-decrypts
+the chunk's ciphertext under `stm_ad_cas` + the pool metadata_key
+(NOT a per-dataset DEK; CAS chunks are cross-dataset shareable per
+ARCH §7.6.3). Nonce is `(cas_rec.paddrs[0], cas_rec.gen,
+pool_uuid)` — the same shape as the encrypt path. Each replica is
+tried in order; first AEAD-verifying replica wins.
+
+## Auto-GC at sync_commit (closes R49 P2-2)
+
+`cas_auto_gc_sweep_locked` runs in `stm_sync_commit` BEFORE
+`stm_cas_index_commit`. Two phases:
+
+1. **Capture**: `stm_cas_iter` callback gathers every refcount=0
+   hash into a flat list. The cb does NOT call back into stm_cas_*
+   (forbidden by the ERRORCHECK mutex).
+2. **GC + free**: per-hash `stm_cas_gc` returns the entry's paddrs;
+   each paddr routes through `stm_alloc_free(s->allocs[dev], paddr,
+   s->current_gen)`. CAS chunk paddrs aren't snapshot-tracked in
+   the MVP (snap_idx doesn't track CAS hashes — see "Snapshot
+   interaction" below), so direct `stm_alloc_free` is correct.
+
+The sweep runs before `stm_cas_index_commit` so the persisted btree
+reflects post-GC state. `stm_cas_index_commit` already excludes
+refcount=0 entries from the persisted btree (P7-CAS); the auto-GC
+adds the missing piece — the paddrs are routed to the allocator's
+free path, closing the orphan-paddr risk on unmount-after-deref.
+
+## Snapshot interaction (MVP limitation)
+
+In the P7-CAS-2 MVP the snap_idx does not track CAS hashes. Auto-GC
+walks all refcount=0 entries unconditionally, even if a snapshot's
+view still references the chunk. Concretely: if you create a
+snapshot then delete a cold-extent file, the deref drives the CAS
+refcount to 0; auto-GC at the next commit reclaims the chunk; the
+snapshot's view of that file becomes stale (the read path will
+return STM_ECORRUPT on dangling-hash lookup).
+
+Future P7-CAS-3 work: integrate CAS hash refcounts with snap_idx so
+auto-GC composes correctly with snapshot retention.
+
 ## Tests
 
 - `v2/tests/test_cas_index.c` — 20 unit tests covering lifecycle,
   insert (basic + invalid args + duplicate-hash refusal +
   paddr-collision refusal), ref / deref / gc, lookup, iter (sorted +
   empty), and a multi-step dedup composition exercise.
-- `v2/tests/test_fs.c` — 2 integration tests:
+- `v2/tests/test_fs.c` — 14 integration tests:
   - `fs_cas_index_present_at_format`: format-time CAS index reachable
     via `stm_sync_cas_index`; empty.
   - `fs_cas_index_persists_across_mount`: insert + ref → commit →
     unmount → remount → entries survive with correct refcounts /
-    replicas / length / gen. Exercises the full lifecycle wiring
-    (`compute_merkle_root` / `build_uberblock` / sync_open
-    `load_at` / sync_commit `commit`).
+    replicas / length / gen.
+  - `fs_migrate_to_cold_basic_roundtrip`: write → migrate → read
+    via the COLD path returns the same plaintext.
+  - `fs_migrate_to_cold_dedup_two_files`: two files with identical
+    content → CAS refcount=2 (single shared entry).
+  - `fs_migrate_to_cold_distinct_content_two_entries`: two files
+    with different content → 2 entries, refcount=1 each.
+  - `fs_migrate_to_cold_idempotent`: second migrate of the same
+    file is a no-op.
+  - `fs_migrate_to_cold_persists_across_mount`: migrate → commit →
+    remount → entry + record persist; reads still round-trip.
+  - `fs_migrate_to_cold_rehydrate_on_write`: migrate → overwrite →
+    cold extent replaced with hot; CAS refcount drops to 0;
+    post-commit auto-GC reclaims (count=0).
+  - `fs_migrate_to_cold_dedup_then_rehydrate_one`: two files share
+    a CAS entry (refcount=2); rehydrate one → refcount=1; auto-GC
+    keeps the entry alive (still referenced).
+  - `fs_migrate_to_cold_truncate_drops_cold_extent`: migrate →
+    truncate-to-zero → CAS deref → auto-GC reclaims.
+  - `fs_migrate_to_cold_invalid_args`: NULL fs / ds=0 / ino=0
+    refused with STM_EINVAL.
+  - `fs_migrate_to_cold_rofs_refused`: STM_EROFS on RO mount.
+  - `fs_reflink_refuses_cold_source`: STM_ENOTSUPPORTED.
+  - `fs_truncate_refuses_cold_crossing`: STM_ENOTSUPPORTED.
 
 35 ctest suites green default + ASan + TSan in isolation (-j2).
 
@@ -254,9 +381,14 @@ This composition is realized in P7-CAS-2.
 | Extent record kind discriminator | ✅ P7-CAS | — |
 | AEAD AD `stm_ad_cas` packer | ✅ P7-CAS | — |
 | TLA+ spec | ✅ P7-CAS | — |
-| Migration (`stm_sync_migrate_to_cold`) | — | P7-CAS-2 |
-| Auto-rehydration on write | — | P7-CAS-2 |
-| Cold-extent FastCDC chunking | — | P7-CAS-2 (`src/cdc/` already exists, P7-prework) |
-| Migration policy heuristic (NOVEL #6 v1) | — | post-P7-CAS-2 |
-| Background GC integration with scrub | — | post-P7-CAS-2 |
+| Migration (`stm_sync_migrate_to_cold` + atomic swap) | ✅ P7-CAS-2 | — |
+| Auto-rehydrate on write | ✅ P7-CAS-2 | — |
+| Cold-extent read path (AEAD-decrypt under CAS AD) | ✅ P7-CAS-2 | — |
+| Auto-GC sweep at sync_commit | ✅ P7-CAS-2 | — |
+| Cold-extent reflink (CAS-bump shape) | — | P7-CAS-3 |
+| Cold-crossing truncate (CAS-aware read+slice) | — | P7-CAS-3 |
+| Cold-extent FastCDC sub-chunking | — | P7-CAS-3 (`src/cdc/` already exists, P7-prework) |
+| Snapshot-CAS hash refcount integration | — | P7-CAS-3 |
+| Migration policy heuristic (NOVEL #6 v1) | — | post-P7-CAS-3 |
+| Background GC integration with scrub | — | post-P7-CAS-3 |
 | Cross-pool dedup | — | post-v2.0 (NOVEL #3) |

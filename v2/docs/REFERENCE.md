@@ -38,9 +38,52 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R49-hash-fixup. Substantive `8eba90a` + R49 close
-  `61205c7` (0 P0 + 0 P1 + 2 P2 + 2 P3, both P2s deferred to
-  P7-CAS-2 with forward-notes inline; both P3s fixed inline).
+- **Tip**: post-R50-hash-fixup. Substantive `91fff73` +
+  R50 close `<R50 close>` (TBD).
+  **P7-CAS-2 — migration / rehydrate / auto-GC data plane. Closes the
+  second half of ARCH §6.9 / NOVEL #3 (the index foundation landed at
+  P7-CAS). New public API `stm_fs_migrate_to_cold(fs, ds, ino)`
+  drives a 3-phase per-extent pipeline: read+decrypt source HOT
+  plaintext → BLAKE3-256 hash → CAS lookup-or-insert (allocator-
+  fresh paddrs, AEAD-encrypt under `stm_ad_cas` onto fresh replicas
+  on miss; `stm_cas_ref` bump on hit) → atomic hot→cold swap via
+  new `stm_extent_migrate_to_cold` (preserves NoOverlapWithinIno
+  across the transition) → drop-route source HOT replicas through
+  `sync_drop_paddr_locked`. Auto-rehydrate on writes: the existing
+  `stm_sync_write_extent_locked` pre-scans for any COLD extent
+  overlapping the write target; after `stm_extent_overwrite` drops
+  it, calls `stm_cas_deref` on the captured hash. Same pre-scan +
+  post-deref bookend in `stm_sync_truncate`'s past-extent drop path.
+  Crossing-COLD truncate + reflink-of-cold-source refused with
+  STM_ENOTSUPPORTED (deferred to P7-CAS-3 to avoid coupling cold-
+  aware read/slice into truncate's prefix-shrink + reflink-of-cold
+  CAS-bump). New COLD-aware read branch in
+  `stm_sync_read_extent_locked` resolves COLD extent → CAS entry →
+  AEAD-decrypt under `stm_ad_cas` + metadata_key (no per-dataset
+  DEK; CAS chunks are cross-dataset shareable per ARCH §7.6.3).
+  Auto-GC sweep at `stm_sync_commit`: walks the CAS index for
+  refcount=0 entries, calls `stm_cas_gc` per hash, routes returned
+  paddrs through `stm_alloc_free` — closes R49 P2-2 forward-note
+  about orphan paddrs on unmount-after-deref. Sweep runs BEFORE
+  `stm_cas_index_commit` so the persisted btree reflects post-GC
+  state. Migration is extent-granularity hashing for the MVP
+  (one BLAKE3 hash per HOT extent → one CAS chunk; FastCDC sub-
+  chunking is a P7-CAS-3+ refinement; the CDC layer at `src/cdc/`
+  remains available but unused by the migration data plane in this
+  chunk). Snapshots that capture cold extents are NOT supported
+  (snap_idx doesn't track CAS hashes; auto-GC may reclaim chunks
+  still referenced by a snapshot's view) — documented MVP
+  limitation. 35 ctest suites green default + ASan + TSan in
+  isolation. test_fs grows 54 → 66 with 12 new integration tests
+  covering basic round-trip, dedup, distinct-content non-dedup,
+  idempotency, persistence-across-mount, rehydrate-on-write,
+  dedup-then-rehydrate-one (refcount math), truncate-drops-cold,
+  arg validation, RO refusal, reflink-cold refusal, truncate-
+  crossing-cold refusal. cas.tla unchanged (P7-CAS-2 is pure
+  data-plane plumbing of the existing model); 21 modules / 25
+  fixed cfgs / 31 buggy cfgs posture preserved.**
+  Prior: P7-CAS foundation `8eba90a` + R49 close `61205c7` + hash
+  fixup `3444422`.
   **P7-CAS cold-tier index foundation — closes the first half of
   ARCH §6.9 / NOVEL #3 (the index + persistence + format break);
   migration / rehydration paths follow in P7-CAS-2. New

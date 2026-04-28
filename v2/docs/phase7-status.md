@@ -56,6 +56,58 @@ into the CAS tier (which DOES need P6) is a separate concern.
 
 ## Phase 7 status (overall)
 
+- [x] **P7-CAS-2 migration / rehydrate / auto-GC data plane** —
+      substantive `91fff73` + R50 close `<R50 close>` + hash-fixup
+      (this commit). Closes the second half of ARCH §6.9 / NOVEL #3 (the
+      index foundation landed at P7-CAS). Adds the public API
+      `stm_fs_migrate_to_cold(fs, dataset_id, ino)` that drives a
+      per-extent pipeline: read+decrypt source HOT plaintext →
+      BLAKE3-256 hash → CAS lookup-or-insert (allocator-fresh paddrs
+      on miss + AEAD-encrypt under `stm_ad_cas` onto fresh replicas;
+      `stm_cas_ref` bump on hit) → atomic hot→cold swap via new
+      `stm_extent_migrate_to_cold` (preserves NoOverlapWithinIno
+      across the transition by overwriting the matching slot in
+      place) → drop-route source HOT replicas through the existing
+      refcount-aware `sync_drop_paddr_locked`. Auto-rehydrate on
+      writes: `stm_sync_write_extent_locked` pre-scans the (ds, ino)
+      extent_idx for any COLD extent overlapping the write target,
+      captures hashes, and after `stm_extent_overwrite` drops them
+      `stm_cas_deref`s each captured hash — completing
+      cas.tla::RehydrateOnWrite. Same pre-scan + post-deref bookend
+      in `stm_sync_truncate`'s past-extent drop path. Crossing-COLD
+      truncate + reflink-of-cold-source refused with
+      STM_ENOTSUPPORTED in this MVP (deferred to P7-CAS-3 to avoid
+      coupling the cold-aware read+slice into truncate's prefix-
+      shrink and the CAS-bump shape into reflink's allocator-bump
+      shape; these are clean future-chunk extensions). New
+      COLD-aware read branch in `stm_sync_read_extent_locked`:
+      resolves COLD extent → CAS entry → AEAD-decrypt under
+      `stm_ad_cas` + pool metadata_key (cross-dataset shareable
+      per ARCH §7.6.3, no per-dataset DEK on CAS chunks). Auto-GC
+      sweep in `stm_sync_commit` (closes R49 P2-2 forward-note):
+      walks the CAS index for refcount=0 entries via
+      `stm_cas_iter`, calls `stm_cas_gc` per hash, routes returned
+      paddrs through `stm_alloc_free`. Sweep runs BEFORE
+      `stm_cas_index_commit` so the persisted btree reflects the
+      post-GC state. Allocator-fresh paddrs in migration close
+      R49 P2-1 forward-note (HotColdReplicasDisjoint enforced at
+      the migration-layer caller via `stm_alloc_reserve` rather
+      than inside `stm_cas_insert`). Migration is extent-
+      granularity hashing for the MVP (one BLAKE3 hash per HOT
+      extent → one CAS chunk; FastCDC sub-chunking is a P7-CAS-3+
+      refinement). Snapshot-CAS interaction: snapshots that capture
+      cold extents are NOT supported in this MVP (snap_idx doesn't
+      track CAS hashes; auto-GC may reclaim chunks still referenced
+      by a snapshot's view) — documented MVP limitation. test_fs
+      grows 54 → 66 with 12 new integration tests (basic round-
+      trip, dedup-two-files, distinct-content-two-entries,
+      idempotency, persists-across-mount, rehydrate-on-write,
+      dedup-then-rehydrate-one [refcount math], truncate-drops-
+      cold, arg validation, RO refusal, reflink-cold refusal,
+      truncate-crossing-cold refusal). cas.tla unchanged (P7-CAS-2
+      is data-plane plumbing of the existing model); 21 modules /
+      25 fixed cfgs / 31 buggy cfgs posture preserved. 35 ctest
+      suites green default + ASan + TSan in isolation.
 - [x] **P7-CAS cold-tier index foundation** — substantive `8eba90a`
       + R49 close `61205c7` + hash-fixup (this commit). Closes the
       first half of

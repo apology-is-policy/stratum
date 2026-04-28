@@ -451,8 +451,16 @@ unrelated to the index API and stays separate.
       crossing case under fresh `replicas \cap used_paddrs = {}`.
 - [ ] Coalescing — quality-of-implementation; correctness preserved
       by `NoOverlapWithinIno`.
-- [ ] Reflinks / refcount-bump path — Phase 7 §10.4.
-- [ ] CAS / cold-tier extents — Phase 7 §10.1.
+- [x] Reflinks / refcount-bump path — Phase 7 §10.4 (P7-16).
+- [x] **CAS / cold-tier extents** (P7-CAS, P7-CAS-2): extent records
+      carry a `kind` discriminator (HOT / COLD) and a `content_hash[32]`
+      field for COLD records. New `stm_extent_write_cold` inserts a
+      COLD record; new `stm_extent_migrate_to_cold` atomically swaps
+      a HOT extent for a COLD extent at the same coordinates. See
+      `15-cas.md` for the cold-tier index module + migration data
+      plane. P7-CAS-3 future extensions: reflink of cold-extent
+      sources (CAS-bump shape) and crossing-cold truncate (CAS-aware
+      read+slice) are refused with STM_ENOTSUPPORTED in P7-CAS-2 MVP.
 - [ ] Per-file or per-dataset Bε-tree partitioning — current unified
       MVP scales to small pools; production scale-out to many-inode
       pools needs partitioning.
