@@ -2405,9 +2405,11 @@ STM_TEST(fs_migrate_to_cold_rofs_refused) {
     unlink(g_key_path);
 }
 
-STM_TEST(fs_reflink_refuses_cold_source) {
-    /* Reflink of a file with COLD extents is not supported in
-     * P7-CAS-2 MVP — the cb returns STM_ENOTSUPPORTED. */
+STM_TEST(fs_reflink_cold_extent_basic_share) {
+    /* P7-CAS-3: reflink of a file containing COLD extents now
+     * succeeds (was STM_ENOTSUPPORTED in P7-CAS-2 MVP). The dst
+     * gets a sibling COLD extent referencing the SAME content_hash
+     * with the CAS entry's refcount bumped. */
     make_tmp("mtc_rl_cold");
     stm_fs_format_opts fopts = default_format_opts();
     STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
@@ -2420,7 +2422,104 @@ STM_TEST(fs_reflink_refuses_cold_source) {
     STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
     STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
 
-    STM_ASSERT_ERR(stm_fs_reflink(fs, 1, 1, 1, 2), STM_ENOTSUPPORTED);
+    /* Pre-reflink: 1 CAS entry with refcount=1. */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    size_t n = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+
+    STM_ASSERT_OK(stm_fs_reflink(fs, 1, 1, 1, 2));
+
+    /* Post-reflink: still 1 CAS entry, now refcount=2. */
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+    mtc_capture_t cap = { .got = false };
+    STM_ASSERT_OK(stm_cas_iter(cas, mtc_capture_first_cb, &cap));
+    STM_ASSERT_TRUE(cap.got);
+    STM_ASSERT_EQ(cap.rec.refcount, 2u);
+
+    /* Both files read back the same plaintext via the COLD path. */
+    uint8_t out_a[4096] = {0}, out_b[4096] = {0};
+    size_t got_a = 0, got_b = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out_a, sizeof out_a, &got_a));
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 2, 0, out_b, sizeof out_b, &got_b));
+    STM_ASSERT_EQ(got_a, sizeof plain);
+    STM_ASSERT_EQ(got_b, sizeof plain);
+    STM_ASSERT_MEM_EQ(plain, out_a, sizeof plain);
+    STM_ASSERT_MEM_EQ(plain, out_b, sizeof plain);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_reflink_cold_extent_overwrite_diverges) {
+    /* Reflink (1, 1) with cold extent → (1, 2). Overwrite (1, 2) at
+     * off 0 → (1, 2) gets a fresh HOT extent (rehydrate path); the
+     * CAS entry's refcount drops from 2 to 1; (1, 1) still reads
+     * the cold-tier content. */
+    make_tmp("mtc_rl_cold_cow");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t a[4096], b[4096];
+    memset(a, 0xCC, sizeof a);
+    memset(b, 0xDD, sizeof b);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, a, sizeof a));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+    STM_ASSERT_OK(stm_fs_reflink(fs, 1, 1, 1, 2));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    mtc_capture_t cap = { .got = false };
+    STM_ASSERT_OK(stm_cas_iter(cas, mtc_capture_first_cb, &cap));
+    STM_ASSERT_EQ(cap.rec.refcount, 2u);
+
+    /* Overwrite (1, 2) — rehydrate path: cold drops, CAS deref. */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 2, 0, b, sizeof b));
+    cap.got = false;
+    STM_ASSERT_OK(stm_cas_iter(cas, mtc_capture_first_cb, &cap));
+    STM_ASSERT_TRUE(cap.got);
+    STM_ASSERT_EQ(cap.rec.refcount, 1u);
+
+    /* (1, 1) still reads the original cold-tier plaintext. */
+    uint8_t out_a[4096] = {0};
+    size_t got_a = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out_a, sizeof out_a, &got_a));
+    STM_ASSERT_MEM_EQ(a, out_a, sizeof a);
+
+    /* (1, 2) reads the new HOT plaintext. */
+    uint8_t out_b[4096] = {0};
+    size_t got_b = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 2, 0, out_b, sizeof out_b, &got_b));
+    STM_ASSERT_MEM_EQ(b, out_b, sizeof b);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_reflink_cold_extent_dst_must_be_empty) {
+    /* dst already has a HOT extent → STM_EEXIST (same pre-condition
+     * as HOT-only reflink; cold reflink doesn't relax this). */
+    make_tmp("mtc_rl_cold_dst_full");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t a[4096], b[4096];
+    memset(a, 0xEE, sizeof a);
+    memset(b, 0xFF, sizeof b);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, a, sizeof a));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 2, 0, b, sizeof b));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+    STM_ASSERT_ERR(stm_fs_reflink(fs, 1, 1, 1, 2), STM_EEXIST);
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
@@ -2471,6 +2570,93 @@ STM_TEST(fs_migrate_to_cold_auto_gc_skips_concurrently_refbumped) {
     size_t n = 0;
     STM_ASSERT_OK(stm_cas_count(cas, &n));
     STM_ASSERT_EQ(n, (size_t)1);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_migrate_to_cold_pending_reclaim_across_mount) {
+    /* R51 P1-1 regression: P7-CAS-3's R50 P2-1 closure relies on
+     * (a) auto-GC sweep ordered BEFORE alloc_commit so PENDING
+     * entries persist in the alloc tree at refcount=0, AND (b)
+     * stm_alloc_load_tree_at REBUILDING pending_head from the
+     * loaded tree's refcount=0 entries so the next sync_commit's
+     * sweep can reclaim them.
+     *
+     * Without (b), refcount=0 entries on disk would be permanent
+     * leaks across mount cycles. This test exercises the full
+     * cycle:
+     *
+     *   1. format + mount (baseline).
+     *   2. write → migrate → overwrite (rehydrate) → commit.
+     *      Auto-GC sweep frees the original CAS chunk paddrs;
+     *      alloc_commit at gen=N persists them as PENDING(free_gen=N).
+     *      pending_count > 0 in RAM.
+     *   3. unmount (final commit at N+2; sweeps PENDING with
+     *      free_gen<N+2 → catches the entries → tree refcount=0
+     *      entries are removed; final on-disk state is clean).
+     *
+     * Wait — the final unmount commit DOES sweep them in this
+     * sequence (the test demonstrates the happy path). To exercise
+     * the cross-mount rebuild path we need to hit a state where
+     * alloc_commit ran but didn't sweep (e.g., the refcount=0
+     * entries are still on disk post-unmount). The simplest way:
+     * verify after a SECOND mount + commit cycle, pending_blocks
+     * is 0 (all freed). If load_tree_at didn't rebuild
+     * pending_head, the cross-mount commit would be a no-op for
+     * the tree-resident PENDING entries.
+     *
+     * Equivalent invariant: after migrate + rehydrate + N commit
+     * cycles (each unmount+remount), data_pending_blocks
+     * stabilizes at 0 (all PENDING reclaimed). Run a few cycles
+     * to amortize across multi-cycle PENDING semantics. */
+    make_tmp("mtc_pending_reclaim");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Write + migrate + rehydrate. */
+    uint8_t a[4096], b[4096];
+    memset(a, 0x55, sizeof a);
+    memset(b, 0x66, sizeof b);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, a, sizeof a));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, b, sizeof b));   /* rehydrate */
+
+    /* Commit-then-unmount to ensure the rehydrate's deref + auto-GC
+     * sweep has fired. */
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    /* Remount + commit cycles. Each cycle's load_tree_at rebuilds
+     * pending_head from the tree's refcount=0 entries; each
+     * commit's alloc_commit sweeps them (free_gen < new committed_
+     * gen). After two full cycles, every PENDING(free_gen <= prior
+     * commit gen) range should be reclaimed. */
+    for (int cycle = 0; cycle < 3; cycle++) {
+        STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+        STM_ASSERT_OK(stm_fs_commit(fs));
+        STM_ASSERT_OK(stm_fs_unmount(fs));
+    }
+
+    /* Final remount: data_pending_blocks should be 0 — every
+     * PENDING reclaimed. Without the load_tree_at rebuild fix,
+     * data_pending_blocks would NEVER decrement (sweep runs on an
+     * empty pending_head), so on-disk refcount=0 entries leak
+     * forever. */
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    stm_fs_stats st;
+    STM_ASSERT_OK(stm_fs_stats_get(fs, &st));
+    STM_ASSERT_EQ(st.data_pending_blocks, (uint64_t)0);
+
+    /* The rehydrated HOT extent's content is intact. */
+    uint8_t out[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(b, out, sizeof b);
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);

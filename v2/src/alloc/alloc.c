@@ -640,6 +640,61 @@ static bool build_crypt_ctx_locked(const stm_alloc *a, stm_btree_crypt_ctx *out)
     return true;
 }
 
+/* P7-CAS-3 R51 P1-1: callback used by load_tree_at to rebuild the
+ * in-RAM pending_head from on-disk refcount=0 entries. Each tree
+ * entry with refcount=0 is a PENDING range that was freed in some
+ * prior gen but never swept (e.g., last cycle's auto-GC of a
+ * refcount=0 CAS entry — the alloc_free landed PENDING in RAM,
+ * alloc_commit persisted the tree state with refcount=0, but the
+ * pending_head entry was lost on unmount). Without this rebuild
+ * pass, `stm_alloc_commit`'s sweep walks an empty pending_head and
+ * never reclaims the on-disk PENDING entries — a cross-mount leak.
+ *
+ * `free_gen = root_gen` is the natural choice: the entry was at
+ * refcount=0 by the time the tree was serialized at root_gen, so
+ * `free_gen <= root_gen`. The next commit at gen >= root_gen+1
+ * sweeps via the predicate `free_gen < committed_gen`. Conservative
+ * vs storing the actual original free_gen (which we don't have on
+ * disk; the tree value layout is just `length_blocks || refcount`).
+ *
+ * Caller holds a->lock. */
+typedef struct {
+    pending_entry **head;          /* &a->pending_head */
+    uint64_t        root_gen;      /* free_gen to stamp on emitted entries */
+    uint64_t       *count_out;     /* &a->pending_count */
+    uint64_t       *blocks_out;    /* &a->pending_blocks */
+    stm_status      err;
+} alloc_pending_rebuild_ctx;
+
+static int alloc_pending_rebuild_cb(const void *key, size_t key_len,
+                                       const void *value, size_t value_len,
+                                       void *ctx_)
+{
+    alloc_pending_rebuild_ctx *ctx = ctx_;
+    if (key_len != 8 || value_len != 8) {
+        ctx->err = STM_ECORRUPT;
+        return 1;
+    }
+    uint32_t length_blocks = 0, refcount = 0;
+    decode_val(value, &length_blocks, &refcount);
+    if (refcount != 0) return 0;       /* live entry — skip */
+    if (length_blocks == 0) {
+        ctx->err = STM_ECORRUPT;
+        return 1;
+    }
+
+    pending_entry *e = malloc(sizeof *e);
+    if (!e) { ctx->err = STM_ENOMEM; return 1; }
+    e->start_block   = decode_key(key);
+    e->length_blocks = length_blocks;
+    e->free_gen      = ctx->root_gen;
+    e->next          = *ctx->head;
+    *ctx->head       = e;
+    *ctx->count_out  += 1;
+    *ctx->blocks_out += length_blocks;
+    return 0;
+}
+
 stm_status stm_alloc_load_tree_at(stm_alloc *a, uint64_t root_paddr,
                                     uint64_t root_gen,
                                     const uint8_t expected_root_csum[32])
@@ -673,6 +728,43 @@ stm_status stm_alloc_load_tree_at(stm_alloc *a, uint64_t root_paddr,
         memcpy(a->current_tree_csum, expected_root_csum, 32);
         /* A loaded tree is NOT dirty — on-disk matches RAM. */
         a->tree_dirty = false;
+
+        /* P7-CAS-3 R51 P1-1: rebuild pending_head from on-disk
+         * refcount=0 entries. Without this, alloc_commit's sweep
+         * (which walks pending_head only) cannot reclaim PENDING
+         * ranges that survived a prior unmount (e.g., paddrs freed
+         * by the prior cycle's auto-GC sweep, which persisted them
+         * as refcount=0 in the alloc tree but lost the in-RAM
+         * pending_entry on unmount). */
+        alloc_pending_rebuild_ctx rctx = {
+            .head       = &a->pending_head,
+            .root_gen   = root_gen,
+            .count_out  = &a->pending_count,
+            .blocks_out = &a->pending_blocks,
+            .err        = STM_OK,
+        };
+        stm_status rs = stm_btree_mt_scan(a->tree, NULL, 0, NULL, 0,
+                                             alloc_pending_rebuild_cb, &rctx);
+        if (rs == STM_OK) rs = rctx.err;
+        if (rs != STM_OK) {
+            /* Free any partially-rebuilt entries; surface the error
+             * to the caller. The tree is still loaded but the
+             * pending list is in an inconsistent state — caller
+             * (typically stm_sync_open) treats this as a mount
+             * failure and discards the handle. */
+            pending_entry *e = a->pending_head;
+            while (e) {
+                pending_entry *next = e->next;
+                free(e);
+                e = next;
+            }
+            a->pending_head   = NULL;
+            a->pending_count  = 0;
+            a->pending_blocks = 0;
+            pthread_mutex_unlock(&a->lock);
+            return rs;
+        }
+
         /* Accel was empty (new handle); rebuild on first query. */
         accel_invalidate_locked(a);
     }

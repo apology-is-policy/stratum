@@ -2068,6 +2068,28 @@ stm_status stm_sync_commit(stm_sync *s)
         return kcs;
     }
 
+    /* P7-CAS-3: auto-GC sweep moved BEFORE the per-device alloc_commit
+     * loop. The sweep's `stm_alloc_free` calls add PENDING(free_gen=
+     * target_gen) entries to the in-RAM alloc trees; alloc_commit
+     * below then persists those PENDING entries (alloc_commit's own
+     * sweep at committed_gen=target_gen requires free_gen <
+     * committed_gen, so PENDING with free_gen=target_gen is NOT
+     * swept-this-cycle but IS persisted). On the NEXT sync_commit at
+     * target_gen+2, alloc_commit at committed_gen=target_gen+2
+     * sweeps PENDING with free_gen<target_gen+2 → catches our
+     * entries → paddrs reach FREE. Closes R50 P2-1 paddr-leak
+     * window: a crash between this commit's final UB and the next
+     * sync_commit no longer leaks paddrs (alloc tree on disk has
+     * them as PENDING, not ALLOCATED — the next mount + commit
+     * sweep reclaims). */
+    if (s->cas_idx) {
+        stm_status gc_err = cas_auto_gc_sweep_locked(s);
+        if (gc_err != STM_OK) {
+            pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
+            return gc_err;
+        }
+    }
+
     /* P5-3c: iterate every attached alloc (= every device with a
      * local tree). Commit each → grab (paddr, csum, gen) → register
      * in roots. Per-device errors propagate immediately; partial-
@@ -2237,29 +2259,11 @@ stm_status stm_sync_commit(stm_sync *s)
         return rls;
     }
 
-    /* P7-CAS-2: auto-GC sweep. Walks the in-RAM CAS index for
-     * refcount=0 entries (deref drove them to zero since the last
-     * commit), reclaims each via stm_cas_gc + routes the freed
-     * paddrs through the allocator. Closes R49 P2-2 forward-note:
-     * without this sweep, refcount=0 entries persist in RAM until
-     * unmount and their paddrs would orphan at the allocator (the
-     * cas_index commit excludes refcount=0 entries from the on-disk
-     * btree, but does not free their paddrs).
-     *
-     * Best-effort drain: a per-entry GC failure surfaces as the
-     * commit's return; later entries continue to drain. The sweep
-     * runs BEFORE cas_index_commit so the persisted btree's
-     * Merkle root reflects the post-GC state, not the transient
-     * refcount=0-then-removed state. */
-    if (s->cas_idx) {
-        stm_status gc_err = cas_auto_gc_sweep_locked(s);
-        if (gc_err != STM_OK) {
-            pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
-            return gc_err;
-        }
-    }
-
-    /* P7-CAS (v18): commit the CAS index. Same shape as extent_idx. */
+    /* P7-CAS (v18): commit the CAS index. Same shape as extent_idx.
+     * Note: auto-GC sweep moved up to BEFORE the alloc_commit loop
+     * (P7-CAS-3 P2-1 closure). By the time we reach this point the
+     * cas_idx in-RAM has refcount=0 entries already removed (Phase 3
+     * of the sweep) and the alloc tree has the paddrs as PENDING. */
     uint64_t cas_paddr = 0;
     uint8_t  cas_csum[32] = {0};
     uint64_t cas_gen = 0;
@@ -4864,15 +4868,10 @@ static bool reflink_collect_cb(const stm_extent_record *e, void *cx) {
     reflink_collect_ctx *ctx = cx;
     if (e->dataset_id != ctx->src_dataset_id || e->ino != ctx->src_ino)
         return true;  /* skip; iter scans entire ds */
-    /* P7-CAS-2 MVP: reflinks of files containing COLD extents would
-     * need to bump CAS refcounts (cas.tla::MigrateToCold's CAS-hit
-     * branch shape) instead of allocator refcounts. Defer to a
-     * future chunk; refuse cleanly here so extent_idx never gains a
-     * sibling cold extent without the corresponding CAS bump. */
-    if (e->kind == STM_EXTENT_KIND_COLD) {
-        ctx->err = STM_ENOTSUPPORTED;
-        return false;
-    }
+    /* P7-CAS-3: capture both HOT and COLD extents. Phase 2 / Phase 3
+     * branch on `e->kind`: HOT bumps allocator refcounts + inserts
+     * via stm_extent_reflink; COLD bumps CAS refcount via
+     * stm_cas_ref + inserts via stm_extent_write_cold. */
     if (ctx->n == ctx->cap) {
         size_t new_cap = ctx->cap == 0 ? 8u : ctx->cap * 2u;
         stm_extent_record *grown = realloc(ctx->records,
@@ -4935,79 +4934,140 @@ stm_status stm_sync_reflink(stm_sync *s,
         return STM_OK;
     }
 
-    /* Phase 2: bump allocator refcount on every replica paddr in every
-     * src extent. On per-paddr failure, roll back any prior bumps and
-     * abort. */
-    size_t bumped = 0;  /* # successful refs taken across (i, r). */
+    /* Phase 2: bump refcounts. HOT extents bump per-replica
+     * allocator refcount via stm_alloc_ref; COLD extents bump the
+     * CAS index entry via stm_cas_ref (one bump per cold record).
+     * On per-extent failure, roll back any prior bumps and abort.
+     *
+     * Tracking: hot_bumped counts successful alloc_ref calls
+     * across the snapshot; cold_bumped counts successful cas_ref
+     * calls (one per COLD record). The rollback path walks the
+     * snapshot in order and undoes the first `hot_bumped` HOT
+     * paddrs + first `cold_bumped` COLD records. */
+    size_t hot_bumped  = 0;
+    size_t cold_bumped = 0;
     stm_status apply_rc = STM_OK;
     for (size_t i = 0; i < cx.n && apply_rc == STM_OK; i++) {
         const stm_extent_record *e = &cx.records[i];
-        for (uint8_t r = 0; r < e->n_replicas; r++) {
-            uint16_t dev = stm_paddr_device(e->paddrs[r]);
-            if (dev >= STM_POOL_DEVICES_MAX || s->allocs[dev] == NULL) {
+        if (e->kind == STM_EXTENT_KIND_HOT) {
+            for (uint8_t r = 0; r < e->n_replicas; r++) {
+                uint16_t dev = stm_paddr_device(e->paddrs[r]);
+                if (dev >= STM_POOL_DEVICES_MAX || s->allocs[dev] == NULL) {
+                    apply_rc = STM_ECORRUPT;
+                    break;
+                }
+                stm_status rs = stm_alloc_ref(s->allocs[dev], e->paddrs[r]);
+                if (rs != STM_OK) {
+                    apply_rc = rs;
+                    break;
+                }
+                hot_bumped++;
+            }
+        } else if (e->kind == STM_EXTENT_KIND_COLD) {
+            if (!s->cas_idx) {
+                /* CAS handle gone — cas_idx is initialized at
+                 * sync_create / sync_open and never torn down
+                 * mid-lifetime; this is a defense-in-depth
+                 * corruption signal. */
                 apply_rc = STM_ECORRUPT;
                 break;
             }
-            stm_status rs = stm_alloc_ref(s->allocs[dev], e->paddrs[r]);
+            stm_status rs = stm_cas_ref(s->cas_idx, e->content_hash);
             if (rs != STM_OK) {
                 apply_rc = rs;
                 break;
             }
-            bumped++;
+            cold_bumped++;
+        } else {
+            /* R51 P3-3: extent record with unknown kind is a serious
+             * corruption signal (kind byte tampered to a value other
+             * than HOT=0x01 / COLD=0x02). Refuse the reflink — the
+             * normal rollback path below symmetrically undoes any
+             * prior bumps but can't repair the corrupt record itself.
+             * Wedge the fs to prevent subsequent commits from
+             * persisting alongside this stale extent. */
+            apply_rc = STM_ECORRUPT;
+            s->wedged = true;
+            break;
         }
     }
 
     if (apply_rc == STM_OK) {
-        /* Phase 3: insert reflinked extent records at dst with origin
-         * INHERITED from src. dst_off equals src.off (whole-file
-         * reflink at v1 MVP). */
+        /* Phase 3: insert reflinked extent records at dst. HOT extents
+         * via stm_extent_reflink (origin INHERITED from src for AEAD AD
+         * reconstruction across siblings). COLD extents via
+         * stm_extent_write_cold (the CAS entry's refcount was just
+         * bumped in Phase 2; insert the cold record at dst inheriting
+         * the same content_hash + gen + key_id + origin from src).
+         * dst_off equals src.off (whole-file reflink at v1 MVP). */
         for (size_t i = 0; i < cx.n; i++) {
             const stm_extent_record *e = &cx.records[i];
-            stm_status is = stm_extent_reflink(s->extent_idx,
-                                                  dst_dataset_id, dst_ino,
-                                                  e->off, e->len,
-                                                  e->paddrs, e->n_replicas,
-                                                  e->gen, e->key_id,
-                                                  e->origin_dataset_id,
-                                                  e->origin_ino,
-                                                  e->origin_off,
-                                                  /* R48 P0-1: link at
-                                                   * current_txg (NOT
-                                                   * src.gen) so the
-                                                   * send filter sees
-                                                   * post-reflink data
-                                                   * within (S_from,
-                                                   * S_to]. */
-                                                  s->current_gen);
+            stm_status is;
+            if (e->kind == STM_EXTENT_KIND_HOT) {
+                is = stm_extent_reflink(s->extent_idx,
+                                          dst_dataset_id, dst_ino,
+                                          e->off, e->len,
+                                          e->paddrs, e->n_replicas,
+                                          e->gen, e->key_id,
+                                          e->origin_dataset_id,
+                                          e->origin_ino,
+                                          e->origin_off,
+                                          /* R48 P0-1: link at
+                                           * current_txg (NOT
+                                           * src.gen) so the send
+                                           * filter sees post-
+                                           * reflink data within
+                                           * (S_from, S_to]. */
+                                          s->current_gen);
+            } else {
+                /* COLD: same link_gen rationale as HOT; the cold
+                 * record's gen / key_id / origin are inherited
+                 * from src so a future migration / rehydrate of
+                 * the dst sibling reconstructs identical AEAD AD
+                 * for the chunk's ciphertext. */
+                is = stm_extent_write_cold(s->extent_idx,
+                                              dst_dataset_id, dst_ino,
+                                              e->off, e->len,
+                                              e->content_hash,
+                                              e->gen, e->key_id,
+                                              e->origin_dataset_id,
+                                              e->origin_ino,
+                                              e->origin_off,
+                                              s->current_gen);
+            }
             if (is != STM_OK) {
                 apply_rc = is;
-                /* R48 P2-1: walk the collect snapshot symmetrically
-                 * with Phase 2 — for every extent in cx.records[0..n),
-                 * decrement every replica paddr's refcount via
-                 * stm_alloc_free. This undoes the Phase 2 bumps for
-                 * all extents (whether their insert landed or not).
-                 * Then a SECOND pass uses stm_extent_delete_file to
-                 * drop the inserted records [0..i) from extent_idx;
-                 * if delete_file fails (e.g., ENOMEM in compaction),
-                 * we MUST set wedged because the index has stale
-                 * records that don't match allocator refcounts.
-                 *
-                 * The earlier dual-pass version called delete_file
-                 * FIRST + relied on its dropped-paddr return; if
-                 * delete_file failed, the pre-bumped refs leaked
-                 * (the function silently skipped DecRef on error).
-                 * The new shape decouples ref-undo from index-cleanup
-                 * so a delete_file failure can't leak refs. */
-                size_t undone = 0;
-                for (size_t j = 0; j < cx.n && undone < bumped; j++) {
+                /* R48 P2-1 + P7-CAS-3: walk the collect snapshot
+                 * symmetrically with Phase 2 — for every extent in
+                 * cx.records[0..n), decrement HOT replica paddr
+                 * refcounts (via stm_alloc_free) capped at
+                 * hot_bumped, AND COLD CAS refcounts (via
+                 * stm_cas_deref) capped at cold_bumped. Then a
+                 * second pass uses stm_extent_delete_file to drop
+                 * the inserted records [0..i) from extent_idx; if
+                 * delete_file fails we wedge. */
+                size_t hot_undone  = 0;
+                size_t cold_undone = 0;
+                for (size_t j = 0; j < cx.n; j++) {
                     const stm_extent_record *ee = &cx.records[j];
-                    for (uint8_t r = 0; r < ee->n_replicas && undone < bumped; r++) {
-                        uint16_t dev = stm_paddr_device(ee->paddrs[r]);
-                        if (dev < STM_POOL_DEVICES_MAX && s->allocs[dev]) {
-                            (void)stm_alloc_free(s->allocs[dev], ee->paddrs[r],
-                                                    s->current_gen);
+                    if (ee->kind == STM_EXTENT_KIND_HOT) {
+                        for (uint8_t r = 0;
+                             r < ee->n_replicas && hot_undone < hot_bumped;
+                             r++) {
+                            uint16_t dev = stm_paddr_device(ee->paddrs[r]);
+                            if (dev < STM_POOL_DEVICES_MAX && s->allocs[dev]) {
+                                (void)stm_alloc_free(s->allocs[dev],
+                                                        ee->paddrs[r],
+                                                        s->current_gen);
+                            }
+                            hot_undone++;
                         }
-                        undone++;
+                    } else if (ee->kind == STM_EXTENT_KIND_COLD
+                               && cold_undone < cold_bumped) {
+                        if (s->cas_idx) {
+                            (void)stm_cas_deref(s->cas_idx, ee->content_hash);
+                        }
+                        cold_undone++;
                     }
                 }
                 /* Now drop dst's records that DID get inserted
@@ -5021,11 +5081,6 @@ stm_status stm_sync_reflink(stm_sync *s,
                                                                &dropped, &n_drop);
                     free(dropped);
                     if (del != STM_OK) {
-                        /* Wedge: extent_idx has stale records the
-                         * caller can't recover from; sync_commit
-                         * would persist them. Defensive even though
-                         * delete_file's only documented failure is
-                         * STM_ENOMEM in realloc. */
                         s->wedged = true;
                     }
                 }
@@ -5033,19 +5088,31 @@ stm_status stm_sync_reflink(stm_sync *s,
             }
         }
     } else {
-        /* Phase 2 partial-fail: we bumped `bumped` paddrs successfully
-         * before the failure. Walk the collect snapshot in the SAME
-         * order we bumped, decrementing the first `bumped` refs. */
-        size_t undone = 0;
-        for (size_t i = 0; i < cx.n && undone < bumped; i++) {
+        /* Phase 2 partial-fail: we bumped hot_bumped HOT paddrs and
+         * cold_bumped COLD records before the failure. Walk the
+         * collect snapshot in the SAME order we bumped, undoing
+         * the first hot_bumped + cold_bumped refs. */
+        size_t hot_undone  = 0;
+        size_t cold_undone = 0;
+        for (size_t i = 0; i < cx.n; i++) {
             const stm_extent_record *e = &cx.records[i];
-            for (uint8_t r = 0; r < e->n_replicas && undone < bumped; r++) {
-                uint16_t dev = stm_paddr_device(e->paddrs[r]);
-                if (dev < STM_POOL_DEVICES_MAX && s->allocs[dev]) {
-                    (void)stm_alloc_free(s->allocs[dev], e->paddrs[r],
-                                            s->current_gen);
+            if (e->kind == STM_EXTENT_KIND_HOT) {
+                for (uint8_t r = 0;
+                     r < e->n_replicas && hot_undone < hot_bumped;
+                     r++) {
+                    uint16_t dev = stm_paddr_device(e->paddrs[r]);
+                    if (dev < STM_POOL_DEVICES_MAX && s->allocs[dev]) {
+                        (void)stm_alloc_free(s->allocs[dev], e->paddrs[r],
+                                                s->current_gen);
+                    }
+                    hot_undone++;
                 }
-                undone++;
+            } else if (e->kind == STM_EXTENT_KIND_COLD
+                       && cold_undone < cold_bumped) {
+                if (s->cas_idx) {
+                    (void)stm_cas_deref(s->cas_idx, e->content_hash);
+                }
+                cold_undone++;
             }
         }
     }
@@ -5425,119 +5492,176 @@ stm_status stm_sync_migrate_to_cold(stm_sync *s,
     return apply_rc;
 }
 
-/* P7-CAS-2: capture every refcount=0 hash from the CAS index into a
- * dynamic list. Called from inside cas_auto_gc_sweep_locked under
- * s->lock; the iter takes cas_idx.lock briefly per the cas API
- * contract. Cb-from-iter reentrancy into the cas API would deadlock
- * (ERRORCHECK mutex), so we capture in this pass and act in a
- * follow-up pass.
- */
+/* P7-CAS-3: transactional auto-GC sweep tuple shape — captures the
+ * full (hash, paddrs[N], n_paddrs) per refcount=0 entry so Phase 2
+ * can free paddrs WITHOUT removing the cas_idx entry first (closes
+ * R50 P2-3). cas_idx removal happens in Phase 3 only after every
+ * paddr's alloc_free has succeeded; if Phase 2 fails partway the
+ * cas_idx state is unchanged, the alloc tree has some PENDING
+ * entries, and a retry's idempotent path (Phase 2 lookup detects
+ * already-PENDING and skips) re-completes without corruption.
+ *
+ * Captured under cas_idx.lock during stm_cas_iter; the iter callback
+ * MUST NOT call back into stm_cas_* (ERRORCHECK mutex would EDEADLK),
+ * so the act-pass runs after iter returns. */
 typedef struct {
-    uint8_t   *hashes;          /* flat: n * STM_CAS_HASH_LEN */
-    size_t     n;
-    size_t     cap;
-    stm_status err;
-} cas_zero_capture_ctx;
+    uint8_t  hash[STM_CAS_HASH_LEN];
+    uint64_t paddrs[STM_CAS_MAX_REPLICAS];
+    uint8_t  n_paddrs;
+} cas_sweep_tuple;
+
+typedef struct {
+    cas_sweep_tuple *tuples;
+    size_t           n;
+    size_t           cap;
+    stm_status       err;
+} cas_sweep_capture_ctx;
 
 static bool cas_capture_zero_cb(const stm_cas_record *r, void *cx) {
-    cas_zero_capture_ctx *ctx = cx;
+    cas_sweep_capture_ctx *ctx = cx;
     if (r->refcount != 0u) return true;
+    /* R51 P3-1 defense-in-depth: clamp n_paddrs at capture so a
+     * memory-corrupted cas_record (n_replicas > STM_CAS_MAX_REPLICAS)
+     * cannot drive Phase 2's `for (j = 0; j < t->n_paddrs; j++)`
+     * loop into out-of-bounds reads on the tuple's fixed-size
+     * paddrs[STM_CAS_MAX_REPLICAS] array. cas_index.c's encoder /
+     * decoder bound n_replicas at on-disk write/load, so this is
+     * a should-not-happen branch — but the clamp is one line of
+     * defense-in-depth against in-RAM tampering / future codepath
+     * drift. */
+    if (r->n_replicas > STM_CAS_MAX_REPLICAS) {
+        ctx->err = STM_ECORRUPT;
+        return false;
+    }
     if (ctx->n == ctx->cap) {
         size_t new_cap = ctx->cap == 0 ? 4u : ctx->cap * 2u;
-        uint8_t *grown = realloc(ctx->hashes, new_cap * STM_CAS_HASH_LEN);
+        cas_sweep_tuple *grown = realloc(ctx->tuples,
+                                            new_cap * sizeof(cas_sweep_tuple));
         if (!grown) { ctx->err = STM_ENOMEM; return false; }
-        ctx->hashes = grown;
+        ctx->tuples = grown;
         ctx->cap    = new_cap;
     }
-    memcpy(ctx->hashes + ctx->n * STM_CAS_HASH_LEN,
-           r->content_hash, STM_CAS_HASH_LEN);
-    ctx->n++;
+    cas_sweep_tuple *t = &ctx->tuples[ctx->n++];
+    memcpy(t->hash, r->content_hash, STM_CAS_HASH_LEN);
+    t->n_paddrs = r->n_replicas;
+    for (uint8_t k = 0; k < STM_CAS_MAX_REPLICAS; k++) {
+        t->paddrs[k] = (k < r->n_replicas) ? r->paddrs[k] : 0u;
+    }
     return true;
 }
 
+/*
+ * P7-CAS-3 transactional sweep.
+ *
+ * Three-phase shape (closes R50 P2-3):
+ *
+ *   Phase 1 (capture): walk cas_idx via stm_cas_iter; collect every
+ *           refcount=0 entry's (hash, paddrs, n_paddrs) tuple.
+ *           No mutation of cas_idx or alloc state.
+ *
+ *   Phase 2 (free): for each tuple, for each paddr, call
+ *           stm_alloc_free. Idempotent-tolerant: if a paddr is
+ *           already PENDING (alloc lookup returns refcount=0), it
+ *           was freed by a prior partial-sweep + retry — skip the
+ *           free, treat as success-by-prior. Other failures abort
+ *           the whole sweep with the cas_idx UNCHANGED — retry
+ *           safe.
+ *
+ *   Phase 3 (gc): only on full Phase 2 success — for each tuple,
+ *           call stm_cas_gc to remove the entry from cas_idx. The
+ *           cas_gc-returned paddrs are ignored (already freed in
+ *           Phase 2). STM_EBUSY here means a concurrent caller
+ *           ref-bumped the entry between capture and gc (R50 P2-2);
+ *           skip rather than abort. STM_ENOENT means the entry
+ *           was already removed (concurrent gc) — also skip.
+ *
+ * Order vs alloc_commit (closes R50 P2-1): this function runs BEFORE
+ * the per-device stm_alloc_commit loop in stm_sync_commit. The
+ * Phase 2 alloc_free calls produce PENDING(free_gen=target_gen)
+ * entries in the in-RAM alloc trees; alloc_commit then PERSISTS
+ * those PENDING entries (alloc_commit's sweep predicate is
+ * free_gen<committed_gen, so PENDING with free_gen=target_gen is
+ * NOT swept this cycle but IS persisted). The next sync_commit's
+ * alloc_commit at committed_gen=target_gen+2 sweeps PENDING with
+ * free_gen<target_gen+2 → catches our entries → paddrs reach FREE.
+ * A crash between this commit's final UB and the next sync_commit
+ * leaves the alloc tree on disk with PENDING entries (not
+ * ALLOCATED) — the next mount + commit reclaims them, no leak.
+ */
 static stm_status cas_auto_gc_sweep_locked(stm_sync *s)
 {
     if (!s || !s->cas_idx) return STM_OK;       /* nothing to sweep */
 
-    /* Phase 1: capture refcount=0 hashes. */
-    cas_zero_capture_ctx zc = { .err = STM_OK };
+    /* Phase 1: capture (hash, paddrs) tuples. */
+    cas_sweep_capture_ctx zc = { .err = STM_OK };
     stm_status its = stm_cas_iter(s->cas_idx, cas_capture_zero_cb, &zc);
     if (its != STM_OK || zc.err != STM_OK) {
-        free(zc.hashes);
+        free(zc.tuples);
         return zc.err != STM_OK ? zc.err : its;
     }
     if (zc.n == 0) return STM_OK;        /* nothing to GC */
 
-    /* Phase 2: per-hash GC + alloc_free. Best-effort; first non-OK
-     * status wins. CAS chunk paddrs were reserved via stm_alloc_reserve
-     * at migration time; they're allocator-owned with refcount=1 and
-     * have no snap_idx involvement (CAS chunks aren't part of
-     * dataset/extent snapshot bookkeeping in the MVP). Direct
-     * stm_alloc_free is correct.
-     *
-     * R50 P2-1 forward-note: the auto-GC sweep runs AFTER each
-     * device's stm_alloc_commit at target_gen has already persisted
-     * the allocator tree. Paddrs freed here land in the in-RAM
-     * PENDING list with free_gen = target_gen and won't make it to
-     * an on-disk alloc tree until the NEXT sync_commit's alloc_commit
-     * at gen >= target_gen + 1. A crash between the final UB write
-     * (which references the alloc tree from BEFORE this sweep) and
-     * the next sync_commit therefore leaks the freed paddrs at the
-     * allocator level (still ALLOCATED on disk; not referenced by
-     * any on-disk index post-cas_index_commit). The leak is bounded
-     * by the per-cycle refcount=0 count (typically small) and is in
-     * the same class as R7d-P0-2 (mid-first-commit bootstrap leak)
-     * — flagged-future-work, not corruption. P7-CAS-3 will close
-     * this by either (a) deferring auto-GC by one cycle so paddrs
-     * land in alloc_commit at the next target_gen-1, or (b) anchoring
-     * a "freed-this-cycle" sub-tree in the UB so post-mount fsck
-     * can reconcile.
-     *
-     * R50 P2-3 forward-note: the per-hash loop is structurally non-
-     * transactional — stm_cas_gc removes the entry from in-RAM
-     * cas_idx BEFORE we attempt alloc_free on its paddrs. If
-     * alloc_free fails after cas_gc succeeded, the entry is gone
-     * from cas_idx but its paddrs aren't freed; they leak forever
-     * (no path to retrieve the (hash, paddrs) tuple). The current
-     * stm_alloc_free contract returns non-OK only on catastrophic
-     * alloc-state corruption (paddr already PENDING, dev_id out of
-     * range), so under healthy state this branch is unreachable.
-     * P7-CAS-3 may add a transactional pattern (collect (hash,
-     * paddrs) tuples, free all, gc only on full success). */
-    stm_status sweep_err = STM_OK;
+    /* Phase 2: alloc_free per paddr, idempotent-tolerant. On any
+     * non-tolerated failure return WITHOUT calling stm_cas_gc — the
+     * cas_idx entries stay (refcount=0 untouched) so a retry can
+     * resume. */
     for (size_t i = 0; i < zc.n; i++) {
-        const uint8_t *h = zc.hashes + i * STM_CAS_HASH_LEN;
-        uint64_t paddrs[STM_CAS_MAX_REPLICAS] = {0};
-        size_t   n_paddrs = 0;
-        stm_status gs = stm_cas_gc(s->cas_idx, h,
-                                      paddrs, STM_CAS_MAX_REPLICAS,
-                                      &n_paddrs);
-        if (gs == STM_EBUSY) {
-            /* R50 P2-2: a concurrent caller via stm_sync_cas_index()
-             * may have ref-bumped this hash between our Phase 1
-             * capture and this gc call. The entry no longer needs
-             * reclamation — skip without aborting the whole commit.
-             * Production callers serialize CAS mutations under
-             * sync->lock so this branch is test-only, but the
-             * defense-in-depth keeps sync_commit progressing. */
-            continue;
-        }
-        if (gs != STM_OK) {
-            if (sweep_err == STM_OK) sweep_err = gs;
-            continue;
-        }
-        for (size_t j = 0; j < n_paddrs; j++) {
-            uint16_t dev = stm_paddr_device(paddrs[j]);
+        const cas_sweep_tuple *t = &zc.tuples[i];
+        for (uint8_t j = 0; j < t->n_paddrs; j++) {
+            uint16_t dev = stm_paddr_device(t->paddrs[j]);
             if (dev >= STM_POOL_DEVICES_MAX || s->allocs[dev] == NULL) {
-                if (sweep_err == STM_OK) sweep_err = STM_EINVAL;
+                free(zc.tuples);
+                return STM_EINVAL;
+            }
+            /* Idempotent-tolerant: lookup the paddr; if already
+             * PENDING (refcount=0), a prior sweep cycle freed it but
+             * crashed before Phase 3 — accept and continue. */
+            uint64_t length = 0;
+            uint32_t refcount = 0;
+            stm_status ls = stm_alloc_lookup(s->allocs[dev], t->paddrs[j],
+                                                &length, &refcount);
+            if (ls != STM_OK) {
+                free(zc.tuples);
+                return ls;
+            }
+            if (refcount == 0u) {
+                /* Already PENDING — earlier-sweep-then-crash retry
+                 * path. Continue to the next paddr. */
                 continue;
             }
-            stm_status fs = stm_alloc_free(s->allocs[dev], paddrs[j],
+            if (refcount > 1u) {
+                /* CAS chunks should not be reflink-shared (cas.tla::
+                 * CASReplicasDisjoint + HotColdReplicasDisjoint). A
+                 * refcount>1 here means alloc-state corruption. */
+                free(zc.tuples);
+                return STM_ECORRUPT;
+            }
+            stm_status fs = stm_alloc_free(s->allocs[dev], t->paddrs[j],
                                               s->current_gen);
-            if (fs != STM_OK && sweep_err == STM_OK) sweep_err = fs;
+            if (fs != STM_OK) {
+                free(zc.tuples);
+                return fs;
+            }
         }
     }
-    free(zc.hashes);
+
+    /* Phase 3: gc each captured hash. STM_EBUSY (concurrent ref-bump
+     * via stm_sync_cas_index — R50 P2-2 case) and STM_ENOENT
+     * (concurrent gc) are skip cases; other errors are surfaced.
+     * The cas_gc-returned paddrs are ignored — they're already
+     * PENDING from Phase 2. */
+    stm_status sweep_err = STM_OK;
+    for (size_t i = 0; i < zc.n; i++) {
+        const cas_sweep_tuple *t = &zc.tuples[i];
+        uint64_t scratch_paddrs[STM_CAS_MAX_REPLICAS] = {0};
+        size_t   scratch_n = 0;
+        stm_status gs = stm_cas_gc(s->cas_idx, t->hash,
+                                      scratch_paddrs, STM_CAS_MAX_REPLICAS,
+                                      &scratch_n);
+        if (gs == STM_EBUSY || gs == STM_ENOENT) continue;
+        if (gs != STM_OK && sweep_err == STM_OK) sweep_err = gs;
+    }
+    free(zc.tuples);
     return sweep_err;
 }
 
