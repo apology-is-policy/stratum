@@ -2663,11 +2663,15 @@ STM_TEST(fs_migrate_to_cold_pending_reclaim_across_mount) {
     unlink(g_key_path);
 }
 
-STM_TEST(fs_truncate_refuses_cold_crossing) {
-    /* Truncating across a cold extent (rec.kind == COLD &&
-     * rec.off < new_size < rec.off + rec.len) is not supported in
-     * P7-CAS-2 MVP. Past-truncation cold drops are supported, but a
-     * crossing cold needs a CAS-aware read+slice path that's deferred. */
+STM_TEST(fs_truncate_crossing_cold_extent_basic) {
+    /* P7-CAS-4a: truncating across a cold extent now succeeds
+     * (was STM_ENOTSUPPORTED in P7-CAS-2). The cold extent is
+     * read+decrypted (CAS path), the kept prefix is re-encrypted
+     * under fresh HOT (paddr_0, current_gen) AEAD nonce, the
+     * original cold extent record is dropped via extent_overwrite
+     * + the cold-overlap pre-scan derefs the CAS hash. Net
+     * effect: file shrinks; first prefix bytes return original
+     * content; CAS refcount on the original hash drops by one. */
     make_tmp("mtc_trunc_cross");
     stm_fs_format_opts fopts = default_format_opts();
     STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
@@ -2680,10 +2684,113 @@ STM_TEST(fs_truncate_refuses_cold_crossing) {
     STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
     STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
 
-    /* Truncate to 4096 — the cold extent at (off=0, len=8192) crosses
+    /* Pre-truncate: 1 CAS entry, refcount=1. */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    size_t n = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+
+    /* Truncate to 4096 — cold extent at (off=0, len=8192) crosses
      * the boundary. */
-    STM_ASSERT_ERR(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 1, 4096),
-                    STM_ENOTSUPPORTED);
+    STM_ASSERT_OK(stm_sync_truncate(sync, 1, 1, 4096));
+
+    /* Read back: first 4 KiB matches the original prefix. */
+    uint8_t out[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_EQ(got, sizeof out);
+    STM_ASSERT_MEM_EQ(plain, out, sizeof out);
+
+    /* Pre-commit: cas refcount=0 entry still in shadow. Post-commit:
+     * auto-GC reclaims (count=0). */
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_truncate_crossing_cold_extent_persists_across_mount) {
+    /* The HOT extent created by cold-crossing truncate persists
+     * across a remount cycle and reads back the original prefix. */
+    make_tmp("mtc_trunc_cross_mnt");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[8192];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)((i * 3) & 0xFF);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+    STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 1, 4096));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint8_t out[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_EQ(got, sizeof out);
+    STM_ASSERT_MEM_EQ(plain, out, sizeof out);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_truncate_crossing_cold_dedup_partial_release) {
+    /* Two files share one CAS entry (refcount=2). Truncating one
+     * across the cold extent rehydrates its prefix as HOT and
+     * derefs the hash → refcount=1. The other file still reads the
+     * full plaintext via the cold path. */
+    make_tmp("mtc_trunc_cross_dedup");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[8192];
+    memset(plain, 0xAB, sizeof plain);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 2, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 2));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    mtc_capture_t cap = { .got = false };
+    STM_ASSERT_OK(stm_cas_iter(cas, mtc_capture_first_cb, &cap));
+    STM_ASSERT_EQ(cap.rec.refcount, 2u);
+
+    /* Truncate (1, 1) across the boundary → file 1 rehydrates
+     * prefix as HOT; CAS refcount on the shared hash drops to 1. */
+    STM_ASSERT_OK(stm_sync_truncate(sync, 1, 1, 4096));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    cap.got = false;
+    STM_ASSERT_OK(stm_cas_iter(cas, mtc_capture_first_cb, &cap));
+    STM_ASSERT_TRUE(cap.got);
+    STM_ASSERT_EQ(cap.rec.refcount, 1u);
+
+    /* (1, 1) returns shrunk prefix. */
+    uint8_t out_a[4096] = {0};
+    size_t got_a = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out_a, sizeof out_a, &got_a));
+    STM_ASSERT_MEM_EQ(plain, out_a, sizeof out_a);
+
+    /* (1, 2) still reads the full 8 KiB cold-tier plaintext. */
+    uint8_t out_b[8192] = {0};
+    size_t got_b = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 2, 0, out_b, sizeof out_b, &got_b));
+    STM_ASSERT_EQ(got_b, sizeof plain);
+    STM_ASSERT_MEM_EQ(plain, out_b, sizeof plain);
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);

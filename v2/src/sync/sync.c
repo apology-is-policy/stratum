@@ -4645,13 +4645,37 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
             return ls;
         }
     }
-    /* P7-CAS-2 MVP: a COLD crossing extent would need a CAS-aware
-     * read+slice+rehydrate path. Defer to a future chunk; refuse
-     * cleanly so extent_idx stays consistent with cas_idx. */
-    if (has_crossing && rec.kind == STM_EXTENT_KIND_COLD) {
-        pthread_mutex_unlock(&s->lock);
-        return STM_ENOTSUPPORTED;
-    }
+    /* P7-CAS-4a: COLD crossing extent now supported — composes via
+     * existing cold-aware read + hot-encrypt write paths. The
+     * Phase 2 below reads `rec.len` bytes via stm_sync_read_extent_
+     * locked (which branches on rec.kind: COLD reads decrypt under
+     * stm_ad_cas via stm_cas_lookup), slices the kept prefix, then
+     * stm_sync_write_extent_locked encrypts the prefix under HOT AD
+     * onto fresh paddrs. extent_overwrite drops the original COLD
+     * record; the cold_overlap_cb pre-scan + post-deref bookend
+     * inside write_extent_locked (P7-CAS-2; sync.c:4241-4296) is
+     * what captures the dropped cold extent's content_hash and
+     * stm_cas_derefs it after overwrite succeeds — NOT the tcox
+     * scan below this comment block, which handles past-cold-
+     * extents at off >= new_size in Phase 3. Net effect: cold
+     * crossing extent is replaced by a HOT extent at [rec.off,
+     * new_size) under fresh AEAD nonce; CAS hash refcount drops by
+     * one (auto-GC at next sync_commit reclaims if it hits zero).
+     *
+     * R52 P3-1: nonce uniqueness. The new HOT prefix encrypts under
+     * `(replicas[0], current_gen, pool_uuid)` where replicas[0] is
+     * allocator-fresh from stm_alloc_reserve, AD = stm_ad_extent
+     * bound to (pool_uuid, dataset_id, ino, rec.off). The cold
+     * extent's CAS chunk paddrs are untouched — they continue
+     * backing the cas_idx entry under the pinned cas_rec.gen + AD =
+     * stm_ad_cas bound to (pool_uuid, content_hash). Disjoint paddr
+     * sets + disjoint AD shapes ⇒ no (paddr, gen) reuse, no AEAD-
+     * tag confusion across the swap.
+     *
+     * No new spec action — composes via cas.tla::RehydrateOnWrite
+     * (the per-cold-extent deref + replacement with a fresh hot
+     * extent) and the existing extent.tla::Write (the prefix's
+     * fresh hot encryption). */
 
     /* P7-12: Phase 1b — peek-count past-extents and pre-allocate
      * Phase 3's working buffers BEFORE Phase 2's overwrite. This
