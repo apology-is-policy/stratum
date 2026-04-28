@@ -178,21 +178,21 @@ stm_status stm_cas_index_advance_txg(stm_cas_index *idx,
  * Insert a new CAS entry at content_hash with the given replicas,
  * length, and gen. refcount is initialized to 1.
  *
- * R49 P2-1 forward-note (deferred to P7-CAS-2): this API validates
- * within-set distinctness + cross-CAS-entry distinctness, but does
- * NOT validate that paddrs are allocator-owned and not in use by hot
- * extents (cas.tla::HotColdReplicasDisjoint). The caller — currently
- * tests only; the future P7-CAS-2 migration path will be the
- * production caller — MUST allocate fresh paddrs from the allocator's
- * hot-side fresh pool before invoking. A buggy migration impl that
- * reuses a hot extent's paddrs as CAS replicas without re-encrypting
- * on fresh paddrs would violate AEAD nonce uniqueness (the same paddr
- * would carry two distinct ciphertexts under different ADs). The
- * runtime defense lives at the migration-layer caller; runtime
- * cross-index validation here would couple cas_index to extent_index
- * which the MVP avoids. Buggy demo
- * `cas_migrate_reuses_hot_paddr_buggy.cfg` fires HotColdReplicasDisjoint
- * at the spec level.
+ * R49 P2-1 (closed in P7-CAS-2): this API validates within-set
+ * distinctness + cross-CAS-entry distinctness, but does NOT validate
+ * that paddrs are allocator-owned and not in use by hot extents
+ * (cas.tla::HotColdReplicasDisjoint). The production caller —
+ * `stm_sync_migrate_to_cold`'s CAS-miss branch — allocates fresh
+ * paddrs via `stm_alloc_reserve` from the allocator's hot-side fresh
+ * pool BEFORE invoking us. The allocator's freshness guarantee (no
+ * paddr already in use anywhere on the volume) gives us
+ * HotColdReplicasDisjoint by composition without an explicit cross-
+ * index runtime check. A buggy migration impl that reused a hot
+ * extent's paddrs as CAS replicas without re-encrypting on fresh
+ * paddrs would violate AEAD nonce uniqueness; the spec-level buggy
+ * demo `cas_migrate_reuses_hot_paddr_buggy.cfg` fires
+ * HotColdReplicasDisjoint to catch any such regression at the model
+ * level.
  *
  * Refusals:
  *   - content_hash == NULL OR all-zero (STM_EINVAL).
@@ -256,20 +256,18 @@ stm_status stm_cas_deref(stm_cas_index *idx,
  * path (`stm_alloc_free` or refcount-aware drop) AFTER the GC commits
  * to disk.
  *
- * R49 P2-2 forward-note (deferred to P7-CAS-2): refcount=0 entries
- * are silently excluded from the persisted btree at commit time
- * (`cas_build_btree_locked` skips them). If a deref drives refcount
- * to 0 but no GC fires before unmount, those paddrs are orphaned at
- * the allocator level: post-remount, the CAS index has forgotten the
- * entry but the allocator still holds its paddrs as in-use. P7-CAS-2
- * will install one of two recovery paths: (a) auto-GC at sync_commit
- * (walks refcount=0 entries + routes through allocator before
- * serialize); (b) a scrub-driven CAS walker that periodically
- * batches `_gc` + alloc_free under the scrub β cb. Until then,
- * callers MUST pair every `_deref` that drives refcount to 0 with
- * an immediate `_gc` + alloc_free in the same txg. The MVP does not
- * test the leak-path because the only caller (test suite) follows
- * this contract by construction.
+ * R49 P2-2 (closed in P7-CAS-2 via auto-GC at sync_commit):
+ * refcount=0 entries are silently excluded from the persisted btree
+ * at commit time (`cas_build_btree_locked` skips them); the orphan-
+ * paddr risk on unmount-after-deref is closed by
+ * `cas_auto_gc_sweep_locked` in `stm_sync_commit`, which walks the
+ * in-RAM shadow for refcount=0 entries + calls this function +
+ * routes the returned paddrs through `stm_alloc_free` BEFORE
+ * `stm_cas_index_commit` serializes. Direct callers via
+ * `stm_sync_cas_index()` may still leak if they `_deref` to zero
+ * outside the sync-layer migration / rehydrate path AND skip
+ * `_gc + _alloc_free` themselves; the auto-GC sweep covers anything
+ * routed through the production data plane.
  *
  * Refusals:
  *   - hash == NULL (STM_EINVAL).

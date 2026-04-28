@@ -518,6 +518,21 @@ stm_status stm_fs_reflink(stm_fs *fs,
     return s;
 }
 
+/* P7-CAS-2: stm_fs_migrate_to_cold. Holds fs->lock across the inner
+ * sync_migrate_to_cold so a concurrent observer never sees a partial
+ * (some-hot-some-cold) state for the file. Errors propagate from
+ * stm_sync_migrate_to_cold. */
+stm_status stm_fs_migrate_to_cold(stm_fs *fs,
+                                     uint64_t dataset_id, uint64_t ino)
+{
+    if (!fs) return STM_EINVAL;
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+    stm_status s = stm_sync_migrate_to_cold(fs->sync, dataset_id, ino);
+    pthread_mutex_unlock(&fs->lock);
+    return s;
+}
+
 /* ========================================================================= */
 /* Dataset creation (P7-13).                                                  */
 /* ========================================================================= */

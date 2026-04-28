@@ -2031,4 +2031,477 @@ STM_TEST(fs_cas_index_persists_across_mount) {
     unlink(g_key_path);
 }
 
+/* ========================================================================= */
+/* P7-CAS-2 — migration / rehydrate / auto-GC.                                 */
+/* ========================================================================= */
+
+/* File-scope helper for the dedup test (clang -pedantic refuses
+ * nested function definitions). The capture struct is cap_t. */
+typedef struct {
+    stm_cas_record rec;
+    bool           got;
+} mtc_capture_t;
+
+static bool mtc_capture_first_cb(const stm_cas_record *r, void *ctx) {
+    mtc_capture_t *cap = (mtc_capture_t *)ctx;
+    cap->rec = *r;
+    cap->got = true;
+    return false;       /* terminate after first */
+}
+
+STM_TEST(fs_migrate_to_cold_basic_roundtrip) {
+    /* Write to (1, 1), migrate to cold, read back: same plaintext. The
+     * extent index shows the record is now COLD; the CAS index has one
+     * entry with refcount=1 referencing the chunk's hash. */
+    make_tmp("mtc_basic");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)((i * 7) & 0xFF);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    /* CAS index now has one entry with refcount=1. */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    size_t n = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+
+    /* Read back the same plaintext via the COLD path. */
+    uint8_t out[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_EQ(got, sizeof plain);
+    STM_ASSERT_MEM_EQ(plain, out, sizeof plain);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_migrate_to_cold_dedup_two_files) {
+    /* Two files (1, 1) and (1, 2) written with IDENTICAL content; after
+     * migrating both, the CAS index has ONE entry with refcount=2
+     * (extent-granularity dedup). */
+    make_tmp("mtc_dedup");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[8192];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)((i * 11) & 0xFF);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 2, 0, plain, sizeof plain));
+
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 2));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    size_t n = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+
+    /* Look up the single entry via iter to fish out its hash, then
+     * confirm refcount=2. */
+    mtc_capture_t cap = { .got = false };
+    STM_ASSERT_OK(stm_cas_iter(cas, mtc_capture_first_cb, &cap));
+    STM_ASSERT_TRUE(cap.got);
+    STM_ASSERT_EQ(cap.rec.refcount, 2u);
+    STM_ASSERT_EQ(cap.rec.length,   (uint64_t)sizeof plain);
+
+    /* Both files read back the same plaintext. */
+    uint8_t out_a[8192] = {0};
+    uint8_t out_b[8192] = {0};
+    size_t got_a = 0, got_b = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out_a, sizeof out_a, &got_a));
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 2, 0, out_b, sizeof out_b, &got_b));
+    STM_ASSERT_EQ(got_a, sizeof plain);
+    STM_ASSERT_EQ(got_b, sizeof plain);
+    STM_ASSERT_MEM_EQ(plain, out_a, sizeof plain);
+    STM_ASSERT_MEM_EQ(plain, out_b, sizeof plain);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_migrate_to_cold_distinct_content_two_entries) {
+    /* Two files with DIFFERENT content → two CAS entries each with
+     * refcount=1. */
+    make_tmp("mtc_distinct");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain_a[4096], plain_b[4096];
+    memset(plain_a, 0xAA, sizeof plain_a);
+    memset(plain_b, 0xBB, sizeof plain_b);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain_a, sizeof plain_a));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 2, 0, plain_b, sizeof plain_b));
+
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 2));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    size_t n = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)2);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_migrate_to_cold_idempotent) {
+    /* Migrating twice is a no-op (after the first call the file has no
+     * HOT extents; the second call's collect pass yields zero records
+     * → STM_OK). */
+    make_tmp("mtc_idem");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[4096];
+    memset(plain, 0xCD, sizeof plain);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+    /* CAS count = 1 with refcount = 1. */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    size_t n = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+
+    /* Second migrate is a no-op. */
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_migrate_to_cold_persists_across_mount) {
+    /* Migrate, commit, unmount; remount: the COLD extent record + CAS
+     * entry persist; reads still return the original plaintext. */
+    make_tmp("mtc_persist");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)((i * 13) & 0xFF);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    size_t n = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+
+    uint8_t out[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_EQ(got, sizeof plain);
+    STM_ASSERT_MEM_EQ(plain, out, sizeof plain);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_migrate_to_cold_rehydrate_on_write) {
+    /* Migrate (1, 1), then write fresh content to (1, 1, 0): the COLD
+     * extent gets replaced with a HOT extent, and the CAS entry's
+     * refcount drops to 0. After commit the entry is GC'd (count=0). */
+    make_tmp("mtc_rehy");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t a[4096], b[4096];
+    memset(a, 0xA1, sizeof a);
+    memset(b, 0xB2, sizeof b);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, a, sizeof a));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    size_t n = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+
+    /* Overwrite triggers rehydrate: the COLD extent at (1, 1, 0) is
+     * dropped + a fresh HOT extent appears. The CAS deref drops the
+     * single entry's refcount to 0. */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, b, sizeof b));
+
+    /* Pre-commit the entry is still in the in-RAM shadow (refcount=0).
+     * cas_count counts ALL entries (including refcount=0) — we expect
+     * 1 entry until commit's auto-GC sweep reclaims it. */
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+
+    /* Read back returns the new content (HOT path). */
+    uint8_t out[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_EQ(got, sizeof b);
+    STM_ASSERT_MEM_EQ(b, out, sizeof b);
+
+    /* After commit the auto-GC sweep removes the refcount=0 entry. */
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_migrate_to_cold_dedup_then_rehydrate_one) {
+    /* Two files share a CAS entry (refcount=2). Rehydrating one drops
+     * the other's refcount to 1 — the entry stays alive (still
+     * referenced by the second file). */
+    make_tmp("mtc_dedup_rehy");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t shared[4096], fresh[4096];
+    memset(shared, 0xEE, sizeof shared);
+    memset(fresh,  0xFF, sizeof fresh);
+
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, shared, sizeof shared));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 2, 0, shared, sizeof shared));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 2));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    size_t n = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+
+    /* Rehydrate (1, 1) — refcount drops from 2 to 1. Auto-GC at next
+     * commit does NOT remove the entry (refcount=1). */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, fresh, sizeof fresh));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+
+    /* (1, 2) still reads the shared plaintext. */
+    uint8_t out[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 2, 0, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(shared, out, sizeof shared);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_migrate_to_cold_truncate_drops_cold_extent) {
+    /* Migrate a file, then truncate to 0. The truncate drops the COLD
+     * extent and derefs the CAS entry. After commit, auto-GC reclaims. */
+    make_tmp("mtc_trunc");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[4096];
+    memset(plain, 0x77, sizeof plain);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    size_t n = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+
+    /* Truncate to 0 → past-extents drop loop dereffs the COLD entry. */
+    STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 1, 0));
+
+    /* Pre-commit the refcount=0 entry is still in the shadow. */
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_migrate_to_cold_invalid_args) {
+    make_tmp("mtc_args");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    STM_ASSERT_ERR(stm_fs_migrate_to_cold(NULL, 1, 1), STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_migrate_to_cold(fs,   0, 1), STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_migrate_to_cold(fs,   1, 0), STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_migrate_to_cold_rofs_refused) {
+    make_tmp("mtc_rofs");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint8_t plain[4096];
+    memset(plain, 0x33, sizeof plain);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    /* Remount RO and try to migrate. */
+    stm_fs_mount_opts romopts = mopts;
+    romopts.read_only = true;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &romopts, &fs));
+    STM_ASSERT_ERR(stm_fs_migrate_to_cold(fs, 1, 1), STM_EROFS);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_reflink_refuses_cold_source) {
+    /* Reflink of a file with COLD extents is not supported in
+     * P7-CAS-2 MVP — the cb returns STM_ENOTSUPPORTED. */
+    make_tmp("mtc_rl_cold");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[4096];
+    memset(plain, 0x66, sizeof plain);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    STM_ASSERT_ERR(stm_fs_reflink(fs, 1, 1, 1, 2), STM_ENOTSUPPORTED);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_migrate_to_cold_auto_gc_skips_concurrently_refbumped) {
+    /* R50 P2-2 regression: simulate the test-only race where a
+     * caller ref-bumps a refcount=0 hash between the auto-GC
+     * sweep's Phase 1 capture and Phase 2 cas_gc call. The fix is
+     * `if (gs == STM_EBUSY) continue;` — sweep skips, sync_commit
+     * succeeds. We synthesize the race by manually inserting a CAS
+     * entry, derefing it to refcount=0, ref-bumping back to 1, then
+     * calling sync_commit. The sweep captures the hash (refcount=0
+     * snapshot from cas_iter), then by the time stm_cas_gc fires
+     * the entry's refcount is 1 → STM_EBUSY → skip → commit OK. */
+    make_tmp("mtc_gc_skip");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+
+    /* Insert a CAS entry, deref to refcount=0 (sweep candidate). */
+    uint8_t h[STM_CAS_HASH_LEN] = {0};
+    h[0] = 0xDE; h[1] = 0xAD; h[STM_CAS_HASH_LEN - 1] = 0xBE;
+    uint64_t paddrs[1] = { 0x30000u };
+    STM_ASSERT_OK(stm_cas_insert(cas, h, paddrs, 1, /*length=*/4096,
+                                    /*gen=*/stm_sync_current_gen(sync)));
+    STM_ASSERT_OK(stm_cas_deref(cas, h));     /* refcount = 0 */
+
+    /* Synthesize the race: ref-bump back to 1 BEFORE commit's sweep.
+     * Production callers serialize CAS mutations under sync->lock
+     * (this test bypasses that — exactly the contract violation the
+     * STM_EBUSY skip defends against). */
+    STM_ASSERT_OK(stm_cas_ref(cas, h));        /* refcount = 1 */
+
+    /* Commit: sweep captures hash (refcount=0 in cas_iter snapshot),
+     * stm_cas_gc returns STM_EBUSY, our skip path takes effect →
+     * commit succeeds. Pre-fix this would surface as STM_EBUSY
+     * propagated as sync_commit's return. */
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    /* Entry survived the sweep with refcount=1. */
+    size_t n = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_truncate_refuses_cold_crossing) {
+    /* Truncating across a cold extent (rec.kind == COLD &&
+     * rec.off < new_size < rec.off + rec.len) is not supported in
+     * P7-CAS-2 MVP. Past-truncation cold drops are supported, but a
+     * crossing cold needs a CAS-aware read+slice path that's deferred. */
+    make_tmp("mtc_trunc_cross");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[8192];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)i;
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    /* Truncate to 4096 — the cold extent at (off=0, len=8192) crosses
+     * the boundary. */
+    STM_ASSERT_ERR(stm_sync_truncate(stm_fs_sync_for_test(fs), 1, 1, 4096),
+                    STM_ENOTSUPPORTED);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")

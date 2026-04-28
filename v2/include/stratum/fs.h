@@ -297,6 +297,45 @@ stm_status stm_fs_reflink(stm_fs *fs,
                             uint64_t src_dataset_id, uint64_t src_ino,
                             uint64_t dst_dataset_id, uint64_t dst_ino);
 
+/*
+ * P7-CAS-2: stm_fs_migrate_to_cold — migrate a file's data from the
+ * HOT tier (paddr-addressed extents) to the COLD tier (content-
+ * addressed CAS chunks). Walks every HOT extent at (dataset_id, ino),
+ * BLAKE3-hashes the plaintext, lookups-or-inserts a CAS chunk per
+ * unique hash (cross-file dedup property — two files with identical
+ * content share a single CAS chunk), and atomically swaps each HOT
+ * extent for a COLD extent record referencing the chunk's hash.
+ *
+ * MVP semantics:
+ *   - Extent-granularity dedup: each HOT extent's full plaintext is
+ *     one BLAKE3 input → one CAS chunk. FastCDC sub-chunking — slicing
+ *     a single HOT extent into multiple variable-size COLD chunks —
+ *     is a future-chunk refinement.
+ *   - Same-pool / single-pool only.
+ *   - Snapshots that capture cold extents are not supported in this
+ *     MVP (snap_idx doesn't track CAS hashes; auto-GC may reclaim
+ *     chunks still referenced by a snapshot's view).
+ *
+ * Refusals:
+ *   - NULL fs (STM_EINVAL).
+ *   - dataset_id == 0 OR ino == 0 (STM_EINVAL).
+ *   - Wedged or read-only (STM_EWEDGED / STM_EROFS).
+ *   - Errors from the inner sync_migrate_to_cold (STM_EBADTAG on
+ *     decrypt failure of a source HOT extent, STM_ENOMEM, STM_EIO,
+ *     allocator-reserve failures) bubble up.
+ *
+ * Atomicity: holds fs->lock across the inner sync_migrate_to_cold so
+ * a concurrent observer never sees a partially-migrated file. Per-
+ * extent atomicity is preserved by stm_extent_migrate_to_cold's atomic
+ * hot→cold swap (NoOverlapWithinIno held across the transition).
+ *
+ * Models cas.tla::MigrateToCold iterated over every (dataset_id, ino)
+ * HOT extent.
+ */
+STM_MUST_USE
+stm_status stm_fs_migrate_to_cold(stm_fs *fs,
+                                     uint64_t dataset_id, uint64_t ino);
+
 /* ========================================================================= */
 /* Inspection + control.                                                      */
 /* ========================================================================= */

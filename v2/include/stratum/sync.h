@@ -1036,6 +1036,76 @@ stm_status stm_sync_reflink(stm_sync *s,
                               uint64_t dst_dataset_id, uint64_t dst_ino);
 
 /*
+ * P7-CAS-2: stm_sync_migrate_to_cold — POSIX-shape "make this file
+ * cold" at the sync layer. Walks every HOT extent at (ds, ino) and
+ * converts each to a COLD extent that references a CAS chunk:
+ *
+ *   For each hot extent E:
+ *     1. Read E's plaintext (decrypt under the dataset's DEK at the
+ *        AEAD AD reconstructed from E.origin_*).
+ *     2. BLAKE3-256(plaintext) → content_hash.
+ *     3. CAS lookup the hash:
+ *        HIT  : bump CAS refcount on the existing entry.
+ *        MISS : reserve fresh hot-side replica paddrs, AEAD-encrypt
+ *               the plaintext under CAS AD = (pool_uuid, content_hash)
+ *               onto the fresh paddrs, write the ciphertext + tag,
+ *               insert a new CAS index entry. (HotColdReplicasDisjoint
+ *               is enforced by allocator-issued fresh paddrs +
+ *               cas.tla::CASReplicasDisjoint scan inside stm_cas_insert
+ *               — closes R49 P2-1 forward-note.)
+ *     4. Atomically swap the HOT extent for a COLD extent at the same
+ *        (ds, ino, off, len) referencing content_hash. (
+ *        stm_extent_migrate_to_cold preserves NoOverlapWithinIno.)
+ *     5. Drop-route the source HOT extent's replicas via
+ *        sync_drop_paddr_locked (refcount-aware: reflink-shared paddrs
+ *        DecRef; otherwise dead-list / alloc_free).
+ *
+ * Atomicity: holds sync->lock across every (ds, ino) extent's
+ * migration. Concurrent stm_sync_write_extent / commit / scrub on a
+ * different (ds, ino) is unaffected; same (ds, ino) write/read
+ * serializes behind us. On a per-extent failure (read-decrypt error,
+ * AEAD-encrypt error, CAS insert error, swap error), already-migrated
+ * extents stay migrated (each per-extent migration is committed
+ * before the next one starts). The caller can retry the whole call
+ * to migrate the remaining extents — every step is idempotent at the
+ * (ds, ino, off) granularity (re-hashing the same plaintext yields
+ * the same hash; a CAS-hit just bumps refcount; the swap refuses if
+ * the source is already COLD with STM_EINVAL — caller treats as
+ * "already migrated" via STM_OK normalization).
+ *
+ * MVP constraints:
+ *   - Same-dataset / same-pool only (CAS chunks shared across
+ *     datasets is the dedup property; the per-dataset DEK does NOT
+ *     bind CAS chunks — they encrypt under the pool metadata key per
+ *     ARCH §7.6.3's CAS AD shape).
+ *   - One BLAKE3 hash per HOT extent (extent-granularity dedup).
+ *     FastCDC sub-chunking — slicing one HOT extent into multiple
+ *     variable-size COLD chunks — is a P7-CAS-3+ refinement.
+ *   - Snapshot interaction: snapshots that capture cold extents are
+ *     NOT supported in P7-CAS-2 MVP (snap_idx doesn't track CAS
+ *     hashes, so auto-GC may reclaim chunks still referenced by a
+ *     snapshot's view). Future work integrates CAS hash refcounts
+ *     with snap_idx.
+ *
+ * Refusals:
+ *   - NULL s (STM_EINVAL).
+ *   - dataset_id == 0 OR ino == 0 (STM_EINVAL).
+ *   - Wedged or read-only (STM_EWEDGED / STM_EROFS).
+ *   - Errors from stm_sync_read_extent_locked (decrypt failure,
+ *     STM_EBADTAG, STM_ENOMEM, STM_EIO) bubble up — the partially-
+ *     migrated state is durable across the failure (per-extent
+ *     atomicity).
+ *
+ * Models cas.tla::MigrateToCold iterated over every (ds, ino) hot
+ * extent; lock-graph: sync.lock OUTER → extent_idx.lock + cas_idx.lock
+ * + per-device alloc.lock INNER. fs->lock is the outermost layer when
+ * called via stm_fs_migrate_to_cold.
+ */
+STM_MUST_USE
+stm_status stm_sync_migrate_to_cold(stm_sync *s,
+                                       uint64_t dataset_id, uint64_t ino);
+
+/*
  * P7-5: install the production scrub β verify-callback on `sc`.
  *
  * The cb resolves each `paddr` against `sync`'s extent index via

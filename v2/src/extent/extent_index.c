@@ -871,6 +871,107 @@ stm_status stm_extent_write_cold(stm_extent_index *idx,
     return as;
 }
 
+/* P7-CAS-2: atomic hot→cold swap. See header for full contract. */
+stm_status stm_extent_migrate_to_cold(stm_extent_index *idx,
+                                         uint64_t dataset_id, uint64_t ino,
+                                         uint64_t off, uint64_t len,
+                                         const uint8_t content_hash[STM_EXTENT_HASH_LEN],
+                                         uint64_t gen, uint64_t key_id,
+                                         uint64_t origin_dataset_id,
+                                         uint64_t origin_ino,
+                                         uint64_t origin_off,
+                                         uint64_t link_gen,
+                                         uint64_t out_paddrs[STM_EXTENT_MAX_REPLICAS],
+                                         uint8_t  *out_n_replicas) {
+    if (!out_paddrs || !out_n_replicas) return STM_EINVAL;
+    *out_n_replicas = 0;
+    for (size_t k = 0; k < STM_EXTENT_MAX_REPLICAS; k++) out_paddrs[k] = 0;
+
+    if (!idx) return STM_EINVAL;
+    if (dataset_id == 0 || ino == 0) return STM_EINVAL;
+    if (origin_dataset_id == 0 || origin_ino == 0) return STM_EINVAL;
+    if (len == 0) return STM_EINVAL;
+    if (!content_hash) return STM_EINVAL;
+    if (off > UINT64_MAX - len) return STM_EOVERFLOW;
+    if (origin_off > UINT64_MAX - len) return STM_EINVAL;
+    bool any_nonzero = false;
+    for (size_t i = 0; i < STM_EXTENT_HASH_LEN; i++) {
+        if (content_hash[i] != 0) { any_nonzero = true; break; }
+    }
+    if (!any_nonzero) return STM_EINVAL;
+
+    must_lock(&idx->lock);
+
+    if (gen > idx->current_txg)      { must_unlock(&idx->lock); return STM_EINVAL; }
+    if (link_gen > idx->current_txg) { must_unlock(&idx->lock); return STM_EINVAL; }
+
+    /* Find the matching HOT extent at (ds, ino, off). NoOverlapWithinIno
+     * guarantees at most one extent matches. */
+    ptrdiff_t found = -1;
+    for (size_t i = 0; i < idx->n_records; i++) {
+        const stm_extent_record *e = &idx->records[i];
+        if (e->dataset_id == dataset_id && e->ino == ino && e->off == off) {
+            found = (ptrdiff_t)i;
+            break;
+        }
+    }
+    if (found < 0) {
+        must_unlock(&idx->lock);
+        return STM_ENOENT;
+    }
+    const stm_extent_record src = idx->records[found];
+    if (src.len != len) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;            /* partial migrate not modeled */
+    }
+    if (src.kind != STM_EXTENT_KIND_HOT) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;            /* COLD already; caller bug */
+    }
+    if (src.n_replicas < 1 || src.n_replicas > STM_EXTENT_MAX_REPLICAS) {
+        must_unlock(&idx->lock);
+        return STM_ECORRUPT;
+    }
+
+    /* Atomic swap: drop the HOT record + append the COLD record. We
+     * compact-in-place the dropped slot by copying the new COLD record
+     * over it (no separate insert append needed since cardinality is
+     * preserved). */
+    stm_extent_record cold_rec = {
+        .dataset_id = dataset_id, .ino = ino,
+        .off = off, .len = len,
+        .kind       = STM_EXTENT_KIND_COLD,
+        .n_replicas = 0u,
+        .gen        = gen,
+        .key_id     = key_id,
+        .origin_dataset_id = origin_dataset_id,
+        .origin_ino        = origin_ino,
+        .origin_off        = origin_off,
+        .link_gen          = link_gen,
+    };
+    /* paddrs[] zeroed by initializer. */
+    memcpy(cold_rec.content_hash, content_hash, STM_EXTENT_HASH_LEN);
+
+    /* Capture dropped HOT replicas FIRST (read from src — already
+     * snapshotted above) so the in-place overwrite below cannot lose
+     * them. */
+    *out_n_replicas = src.n_replicas;
+    for (uint8_t r = 0; r < src.n_replicas; r++) {
+        out_paddrs[r] = src.paddrs[r];
+    }
+
+    /* In-place swap: the COLD record occupies the same slot the HOT
+     * record vacated. NoOverlapWithinIno is preserved across the
+     * transition because we never expose a state where the (ds, ino,
+     * [off, off+len)) range is empty — the lock is held across both
+     * the drop and the insert (the assignment IS both atomically). */
+    idx->records[found] = cold_rec;
+    idx->dirty = true;
+
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
 /* ------------------------------------------------------------------ */
 /* Read paths.                                                         */
 /* ------------------------------------------------------------------ */

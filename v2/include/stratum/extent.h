@@ -522,6 +522,74 @@ stm_status stm_extent_write_cold(stm_extent_index *idx,
                                     uint64_t link_gen);
 
 /*
+ * P7-CAS-2: atomic per-extent hot→cold swap. Drops the existing live
+ * HOT extent at exactly (`dataset_id`, `ino`, `off`) (matching `len`)
+ * AND inserts a COLD extent at the same coordinates referencing
+ * `content_hash`. Returns the dropped HOT extent's replica paddrs in
+ * `out_paddrs[0..*out_n_replicas)` (caller-owned cap of
+ * STM_EXTENT_MAX_REPLICAS) for routing through the sync layer's
+ * refcount-aware drop helper AFTER this call returns.
+ *
+ * Atomic at the index level: the swap holds extent_idx.lock across both
+ * the drop and the insert, so no observer ever sees a state where the
+ * (ds, ino, off, len) range is empty (which would let a concurrent
+ * inserter slip in). The swap therefore preserves NoOverlapWithinIno
+ * across the transition.
+ *
+ * The caller has already (a) read+decrypted the source HOT extent's
+ * plaintext, (b) BLAKE3-hashed it to `content_hash`, (c) populated
+ * the CAS index entry at `content_hash` (insert on miss; ref-bump on
+ * hit), and (d) written the chunk's ciphertext to the CAS replicas
+ * (on miss). This API focuses on the extent-tree mutation only.
+ *
+ * `gen` / `key_id` / `origin_*` / `link_gen` are stamped on the new
+ * COLD extent record. For fresh migrations origin_* equals the live
+ * position; key_id matches the source HOT extent's stamped key_id (so
+ * subsequent rehydrate can re-encrypt under a fresh key without
+ * re-deriving). `link_gen` mirrors the reflink contract (gen at which
+ * THIS record was inserted into the live extent index, not the AEAD
+ * gen of the underlying chunk).
+ *
+ * Refusals:
+ *   - dataset_id == 0 OR ino == 0 (STM_EINVAL).
+ *   - origin_dataset_id == 0 OR origin_ino == 0 (STM_EINVAL).
+ *   - len == 0 (STM_EINVAL — extent.tla::LengthPositive).
+ *   - content_hash all-zero (STM_EINVAL — reserved sentinel).
+ *   - gen > current_txg OR link_gen > current_txg (STM_EINVAL —
+ *     extent.tla::BirthTxgBound).
+ *   - off + len OR origin_off + len overflows uint64 (STM_EOVERFLOW /
+ *     STM_EINVAL).
+ *   - No HOT extent at exactly (ds, ino, off) (STM_ENOENT).
+ *   - The matching extent has a different `len` than the caller
+ *     supplied (STM_EINVAL — partial migrate not modeled).
+ *   - The matching extent is COLD already (STM_EINVAL — caller bug;
+ *     COLD extents go through rehydrate, not migrate).
+ *   - out_paddrs == NULL OR out_n_replicas == NULL (STM_EINVAL).
+ *
+ * On STM_OK: out_paddrs[0..*out_n_replicas) holds the dropped HOT
+ * extent's replica paddrs in the original record's slot order. Caller
+ * MUST route each through `sync_drop_paddr_locked` (P7-16 / R48 P1-1
+ * refcount-aware) BEFORE the next sync_commit. On any non-OK return
+ * the index is unchanged and *out_n_replicas is 0.
+ *
+ * Models cas.tla::MigrateToCold (the "drop hot, insert cold" core
+ * transition); the AEAD chunk write + CAS index update + paddr drop-
+ * route compose at the sync layer (`stm_sync_migrate_to_cold`).
+ */
+STM_MUST_USE
+stm_status stm_extent_migrate_to_cold(stm_extent_index *idx,
+                                         uint64_t dataset_id, uint64_t ino,
+                                         uint64_t off, uint64_t len,
+                                         const uint8_t content_hash[STM_EXTENT_HASH_LEN],
+                                         uint64_t gen, uint64_t key_id,
+                                         uint64_t origin_dataset_id,
+                                         uint64_t origin_ino,
+                                         uint64_t origin_off,
+                                         uint64_t link_gen,
+                                         uint64_t out_paddrs[STM_EXTENT_MAX_REPLICAS],
+                                         uint8_t  *out_n_replicas);
+
+/*
  * Look up the live extent of (ds, ino) covering byte offset `off`.
  * On STM_OK, *out_extent is filled. STM_ENOENT if `off` falls in a
  * hole (no extent covers it). STM_EINVAL on bad args.
