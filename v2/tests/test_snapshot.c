@@ -28,14 +28,19 @@
 #include <string.h>
 #include <unistd.h>
 
-/* P6-deadlist: stm_snapshot_delete now returns the freed-paddr list
- * via out-args. Tests that don't exercise the dead-list use this
- * thin wrapper to retain the single-arg ergonomics. */
+/* P6-deadlist + P7-CAS-4c: stm_snapshot_delete now returns BOTH the
+ * freed-paddr list AND the freed-cold-hash list via out-args. Tests
+ * that don't exercise the dead-lists use this thin wrapper to retain
+ * the single-arg ergonomics. */
 static stm_status snap_delete_simple(stm_snapshot_index *idx, uint64_t id) {
-    uint64_t *freed = NULL;
-    size_t    n     = 0;
-    stm_status rs = stm_snapshot_delete(idx, id, &freed, &n);
+    uint64_t *freed       = NULL;
+    size_t    n           = 0;
+    uint8_t  *cold_hashes = NULL;
+    size_t    cold_n      = 0;
+    stm_status rs = stm_snapshot_delete(idx, id, &freed, &n,
+                                          &cold_hashes, &cold_n);
     free(freed);
+    free(cold_hashes);
     return rs;
 }
 
@@ -1061,13 +1066,19 @@ STM_TEST(snap_delete_returns_dead_list) {
 
     uint64_t *freed = NULL;
     size_t    n     = 0;
-    STM_ASSERT_OK(stm_snapshot_delete(idx, s, &freed, &n));
+    uint8_t  *cold_hashes = NULL;
+    size_t    cold_n      = 0;
+    STM_ASSERT_OK(stm_snapshot_delete(idx, s, &freed, &n,
+                                          &cold_hashes, &cold_n));
     STM_ASSERT_EQ(n, (size_t)3);
     STM_ASSERT_TRUE(freed != NULL);
     STM_ASSERT_EQ(freed[0], (uint64_t)0xA001);
     STM_ASSERT_EQ(freed[1], (uint64_t)0xA002);
     STM_ASSERT_EQ(freed[2], (uint64_t)0xA003);
+    STM_ASSERT_EQ(cold_n, (size_t)0);
+    STM_ASSERT_TRUE(cold_hashes == NULL);
     free(freed);
+    free(cold_hashes);
 
     /* Slot is ABSENT now. */
     stm_snapshot_entry e;
@@ -1085,9 +1096,14 @@ STM_TEST(snap_delete_clean_returns_null_zero) {
 
     uint64_t *freed = (uint64_t *)0xDEADBEEF;  /* will be cleared */
     size_t    n     = 99;
-    STM_ASSERT_OK(stm_snapshot_delete(idx, s, &freed, &n));
+    uint8_t  *cold_hashes = (uint8_t *)0xDEADBEEF;
+    size_t    cold_n      = 99;
+    STM_ASSERT_OK(stm_snapshot_delete(idx, s, &freed, &n,
+                                          &cold_hashes, &cold_n));
     STM_ASSERT_TRUE(freed == NULL);
     STM_ASSERT_EQ(n, (size_t)0);
+    STM_ASSERT_TRUE(cold_hashes == NULL);
+    STM_ASSERT_EQ(cold_n, (size_t)0);
 
     stm_snapshot_index_close(idx);
 }
@@ -1105,9 +1121,14 @@ STM_TEST(snap_delete_refused_held_keeps_dead_list) {
 
     uint64_t *freed = NULL;
     size_t    n     = 99;
-    STM_ASSERT_ERR(stm_snapshot_delete(idx, s, &freed, &n), STM_EBUSY);
+    uint8_t  *cold_hashes = NULL;
+    size_t    cold_n      = 99;
+    STM_ASSERT_ERR(stm_snapshot_delete(idx, s, &freed, &n,
+                                           &cold_hashes, &cold_n), STM_EBUSY);
     STM_ASSERT_TRUE(freed == NULL);
     STM_ASSERT_EQ(n, (size_t)0);
+    STM_ASSERT_TRUE(cold_hashes == NULL);
+    STM_ASSERT_EQ(cold_n, (size_t)0);
 
     /* Dead-list still attached. */
     size_t dc = 0;
@@ -1116,10 +1137,13 @@ STM_TEST(snap_delete_refused_held_keeps_dead_list) {
 
     /* After release, delete succeeds and yields the paddr. */
     STM_ASSERT_OK(stm_snapshot_release(idx, s));
-    STM_ASSERT_OK(stm_snapshot_delete(idx, s, &freed, &n));
+    STM_ASSERT_OK(stm_snapshot_delete(idx, s, &freed, &n,
+                                          &cold_hashes, &cold_n));
     STM_ASSERT_EQ(n, (size_t)1);
     STM_ASSERT_EQ(freed[0], (uint64_t)0xB001);
+    STM_ASSERT_EQ(cold_n, (size_t)0);
     free(freed);
+    free(cold_hashes);
 
     stm_snapshot_index_close(idx);
 }
@@ -1183,8 +1207,12 @@ STM_TEST(snapshot_persist_dead_list_roundtrip) {
 
     /* Delete s1 and verify the persisted paddrs come back. */
     uint64_t *freed = NULL; size_t n = 0;
-    STM_ASSERT_OK(stm_snapshot_delete(idx2, s1, &freed, &n));
+    uint8_t  *cold_hashes = NULL; size_t cold_n = 0;
+    STM_ASSERT_OK(stm_snapshot_delete(idx2, s1, &freed, &n,
+                                           &cold_hashes, &cold_n));
     STM_ASSERT_EQ(n, (size_t)3);
+    STM_ASSERT_EQ(cold_n, (size_t)0);
+    STM_ASSERT_TRUE(cold_hashes == NULL);
     STM_ASSERT_EQ(freed[0], (uint64_t)0x1000);
     STM_ASSERT_EQ(freed[1], (uint64_t)0x2000);
     STM_ASSERT_EQ(freed[2], (uint64_t)0x3000);

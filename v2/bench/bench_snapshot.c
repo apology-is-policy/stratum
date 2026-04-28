@@ -166,14 +166,18 @@ static void bench_snap_delete_vs_dead_list(size_t dead_size)
 
         uint64_t *freed = NULL;
         size_t n = 0;
+        uint8_t *cold_hashes = NULL;
+        size_t   cold_n      = 0;
         double t0 = now_sec();
-        stm_status rs = stm_snapshot_delete(idx, id, &freed, &n);
+        stm_status rs = stm_snapshot_delete(idx, id, &freed, &n,
+                                              &cold_hashes, &cold_n);
         double t1 = now_sec();
         if (rs == STM_OK) {
             total_sec += (t1 - t0);
             n_ok_iters++;
         }
         free(freed);
+        free(cold_hashes);
         stm_snapshot_index_close(idx);
     }
 

@@ -82,6 +82,50 @@
 (*   empty in the model and merge / always-free-all become equivalent   *)
 (*   to the fixed algorithm. They WOULD fire in a richer model with     *)
 (*   multi-snap-holding (deferred future spec extension).                *)
+(*                                                                           *)
+(* P7-CAS-4c extension — cold-tier dead-list:                               *)
+(*                                                                           *)
+(*   Mirrors the paddr dead-list shape for COLD-tier extent records         *)
+(*   (NOVEL #3 cold tier; cas.tla::ColdExtentRec). When a live cold extent  *)
+(*   is dropped via COW (overwrite / truncate / delete), its CAS-deref      *)
+(*   obligation must be DEFERRED to the most-recent snapshot's cold-dead-   *)
+(*   list IF a snap exists — otherwise the snapshot's view of the file      *)
+(*   would dangle (snap's tree_root captures the cold record by reference   *)
+(*   to content_hash; if the live drop derefs the CAS entry to refcount=0,  *)
+(*   auto-GC reclaims the chunk and the snapshot's read returns             *)
+(*   STM_ECORRUPT on a dangling-hash lookup). The cold-dead-list contents   *)
+(*   migrate to `cold_dereffed` on snap-delete, at which point the C impl   *)
+(*   batch-calls `stm_cas_deref` on each entry; refcount drops, and any     *)
+(*   entry that hits zero is reclaimed by the next sync_commit's auto-GC.   *)
+(*                                                                           *)
+(*   Distinct from paddr dead-list:                                         *)
+(*                                                                           *)
+(*     - Cold extents are identified by an opaque `ColdExtentId` (the spec  *)
+(*       analog to a (ds, ino, off, len) tuple). Each cold extent maps to   *)
+(*       exactly one `HashId` (the analog of BLAKE3 content hash); multiple *)
+(*       extents can share a hash.                                           *)
+(*                                                                           *)
+(*     - The cold-dead-list is a SET of cold extent ids, not a multiset.    *)
+(*       Each cold extent is uniquely tracked by id; sharing is at the      *)
+(*       hash level, not the extent-record level.                           *)
+(*                                                                           *)
+(*     - Snap-delete moves cold-dead entries to `cold_dereffed` (no         *)
+(*       successor-filter). Each entry stands alone — no "shared" partition *)
+(*       analogous to paddr dead-list. The composition with cas.tla's      *)
+(*       RefcountConsistent is at the C-impl boundary: cas refcount =       *)
+(*       (count of live cold extents at h) + (count of snap-cold-dead       *)
+(*       entries at h across all snaps).                                    *)
+(*                                                                           *)
+(*   Cold-tier buggy variants:                                              *)
+(*                                                                           *)
+(*   - BuggyOverwriteColdForgetsDead — OverwriteCold removes c from live    *)
+(*     but neither derefs it nor appends it to most_recent_snap.cold_dead. *)
+(*     The cold extent evaporates → `ColdExtentsTrackedSomewhere` fires.   *)
+(*                                                                           *)
+(*   - BuggyDeleteColdForgetsDeref — SnapDelete clears                      *)
+(*     snap_cold_dead[s] without adding to cold_dereffed. Cold extents     *)
+(*     unique to S vanish from tracking → `ColdExtentsTrackedSomewhere`    *)
+(*     fires.                                                                *)
 (***************************************************************************)
 
 EXTENDS Naturals, FiniteSets, Sequences
@@ -89,18 +133,28 @@ EXTENDS Naturals, FiniteSets, Sequences
 CONSTANTS
     MaxBlocks,
     MaxSnaps,
+    MaxColdExtents,
+    MaxHashIds,
     BuggyOverwriteForgetsDead,
     BuggyDeleteForgetsFree,
-    BuggyMergeIncludesFreed
+    BuggyMergeIncludesFreed,
+    BuggyOverwriteColdForgetsDead,
+    BuggyDeleteColdForgetsDeref
 
 ASSUME MaxBlocks \in (Nat \ {0})
 ASSUME MaxSnaps \in (Nat \ {0})
+ASSUME MaxColdExtents \in (Nat \ {0})
+ASSUME MaxHashIds \in (Nat \ {0})
 ASSUME BuggyOverwriteForgetsDead \in BOOLEAN
 ASSUME BuggyDeleteForgetsFree \in BOOLEAN
 ASSUME BuggyMergeIncludesFreed \in BOOLEAN
+ASSUME BuggyOverwriteColdForgetsDead \in BOOLEAN
+ASSUME BuggyDeleteColdForgetsDeref \in BOOLEAN
 
-Blocks  == 1..MaxBlocks
-SnapIds == 1..MaxSnaps
+Blocks         == 1..MaxBlocks
+SnapIds        == 1..MaxSnaps
+ColdExtentIds  == 1..MaxColdExtents
+HashIds        == 1..MaxHashIds
 
 VARIABLES
     live_blocks,        \* SUBSET Blocks — currently in the live dataset.
@@ -112,10 +166,24 @@ VARIABLES
                          \* a history" from "block id never allocated";
                          \* load-bearing for BlocksTrackedSomewhere.
     next_snap_id,       \* 1..(MaxSnaps + 1).
-    most_recent_snap    \* 0..MaxSnaps. 0 = no snap exists yet.
+    most_recent_snap,   \* 0..MaxSnaps. 0 = no snap exists yet.
+    \* P7-CAS-4c: cold-tier mirror.
+    live_cold_extents,  \* SUBSET ColdExtentIds — currently in live dataset.
+    extent_hash,        \* [ColdExtentIds → HashIds] — cold-extent hash map.
+    snap_cold_dead,     \* [SnapIds → SUBSET ColdExtentIds] — per-snap cold
+                         \* dead-list (set of cold extent ids whose CAS-deref
+                         \* obligation is held by snap S). Hashes can repeat
+                         \* across distinct extent ids.
+    cold_dereffed,      \* SUBSET ColdExtentIds — extents whose cas_deref
+                         \* obligation has been applied (snap-delete or
+                         \* direct-deref path).
+    used_cold_extents   \* SUBSET ColdExtentIds — every cold extent ever
+                         \* WriteCold'd; analog of `used` for the paddr tier.
 
 vars == <<live_blocks, snap_state, snap_dead, freed, used,
-          next_snap_id, most_recent_snap>>
+          next_snap_id, most_recent_snap,
+          live_cold_extents, extent_hash, snap_cold_dead,
+          cold_dereffed, used_cold_extents>>
 
 (***************************************************************************)
 (* Init: empty live set, no snaps, nothing freed.                          *)
@@ -128,6 +196,11 @@ Init ==
     /\ used             = {}
     /\ next_snap_id     = 1
     /\ most_recent_snap = 0
+    /\ live_cold_extents = {}
+    /\ extent_hash       = [c \in ColdExtentIds |-> 1]   \* default 1 — overwritten on Write
+    /\ snap_cold_dead    = [s \in SnapIds |-> {}]
+    /\ cold_dereffed     = {}
+    /\ used_cold_extents = {}
 
 (***************************************************************************)
 (* Helpers.                                                                  *)
@@ -157,7 +230,9 @@ WriteBlock(b) ==
     /\ live_blocks' = live_blocks \union {b}
     /\ used' = used \union {b}
     /\ UNCHANGED <<snap_state, snap_dead, freed,
-                   next_snap_id, most_recent_snap>>
+                   next_snap_id, most_recent_snap,
+                   live_cold_extents, extent_hash, snap_cold_dead,
+                   cold_dereffed, used_cold_extents>>
 
 (***************************************************************************)
 (* OverwriteBlock(b) — COW: b is removed from live. If a most-recent snap  *)
@@ -177,7 +252,9 @@ OverwriteBlock(b) ==
             ELSE /\ snap_dead' = [snap_dead EXCEPT
                                      ![most_recent_snap] = @ \union {b}]
                  /\ UNCHANGED freed
-    /\ UNCHANGED <<snap_state, used, next_snap_id, most_recent_snap>>
+    /\ UNCHANGED <<snap_state, used, next_snap_id, most_recent_snap,
+                   live_cold_extents, extent_hash, snap_cold_dead,
+                   cold_dereffed, used_cold_extents>>
 
 (***************************************************************************)
 (* SnapCreate — bump next_snap_id; mark new snap PRESENT; new snap becomes *)
@@ -188,7 +265,9 @@ SnapCreate ==
     /\ snap_state' = [snap_state EXCEPT ![next_snap_id] = "PRESENT"]
     /\ most_recent_snap' = next_snap_id
     /\ next_snap_id' = next_snap_id + 1
-    /\ UNCHANGED <<live_blocks, snap_dead, freed, used>>
+    /\ UNCHANGED <<live_blocks, snap_dead, freed, used,
+                   live_cold_extents, extent_hash, snap_cold_dead,
+                   cold_dereffed, used_cold_extents>>
 
 (***************************************************************************)
 (* SnapDelete(s) — incremental dead-list algorithm.                         *)
@@ -245,7 +324,59 @@ SnapDelete(s) ==
                           ELSE CHOOSE t \in remaining :
                                   \A u \in remaining : t >= u
                   ELSE most_recent_snap
-    /\ UNCHANGED <<live_blocks, used, next_snap_id>>
+           /\ \* P7-CAS-4c: cold-dead-list contents move to cold_dereffed
+              \* (no successor-filter — each cold extent stands alone).
+              cold_dereffed' =
+                  IF BuggyDeleteColdForgetsDeref
+                  THEN cold_dereffed
+                  ELSE cold_dereffed \union snap_cold_dead[s]
+           /\ snap_cold_dead' = [snap_cold_dead EXCEPT ![s] = {}]
+    /\ UNCHANGED <<live_blocks, used, next_snap_id,
+                   live_cold_extents, extent_hash, used_cold_extents>>
+
+(***************************************************************************)
+(* P7-CAS-4c: WriteCold(c, h) — register a fresh cold extent c with hash h.*)
+(* Cold extents are uniquely identified by id; hashes can repeat across   *)
+(* extents (intra-file dedup, cross-file dedup). At the C-impl boundary,  *)
+(* this corresponds to inserting a COLD record into the extent index +    *)
+(* either inserting (CAS-miss) or refbumping (CAS-hit) the cas_idx entry. *)
+(***************************************************************************)
+WriteCold(c, h) ==
+    /\ c \in ColdExtentIds
+    /\ c \notin used_cold_extents
+    /\ h \in HashIds
+    /\ live_cold_extents' = live_cold_extents \union {c}
+    /\ used_cold_extents' = used_cold_extents \union {c}
+    /\ extent_hash' = [extent_hash EXCEPT ![c] = h]
+    /\ UNCHANGED <<live_blocks, snap_state, snap_dead, freed, used,
+                   next_snap_id, most_recent_snap,
+                   snap_cold_dead, cold_dereffed>>
+
+(***************************************************************************)
+(* P7-CAS-4c: OverwriteCold(c) — drop a cold extent from live. If a most- *)
+(* recent snap exists, route c into snap's cold-dead-list (deferring the *)
+(* CAS-deref to snap-delete time). Otherwise mark c as immediately        *)
+(* dereffed.                                                                *)
+(*                                                                           *)
+(* Buggy: BuggyOverwriteColdForgetsDead drops c from live without routing *)
+(* anywhere → ColdExtentsTrackedSomewhere fires.                           *)
+(***************************************************************************)
+OverwriteCold(c) ==
+    /\ c \in ColdExtentIds
+    /\ c \in live_cold_extents
+    /\ live_cold_extents' = live_cold_extents \ {c}
+    /\ IF BuggyOverwriteColdForgetsDead
+       THEN /\ UNCHANGED <<snap_cold_dead, cold_dereffed>>
+       ELSE
+            IF most_recent_snap = 0
+            THEN /\ cold_dereffed' = cold_dereffed \union {c}
+                 /\ UNCHANGED snap_cold_dead
+            ELSE /\ snap_cold_dead' = [snap_cold_dead EXCEPT
+                                          ![most_recent_snap] = @ \union {c}]
+                 /\ UNCHANGED cold_dereffed
+    /\ UNCHANGED <<live_blocks, snap_state, snap_dead, freed, used,
+                   next_snap_id, most_recent_snap,
+                   extent_hash, used_cold_extents>>
 
 (***************************************************************************)
 (* Top-level Next.                                                           *)
@@ -255,6 +386,8 @@ Next ==
     \/ \E b \in Blocks : OverwriteBlock(b)
     \/ SnapCreate
     \/ \E s \in SnapIds : SnapDelete(s)
+    \/ \E c \in ColdExtentIds, h \in HashIds : WriteCold(c, h)
+    \/ \E c \in ColdExtentIds : OverwriteCold(c)
 
 Spec == Init /\ [][Next]_vars
 
@@ -270,6 +403,11 @@ TypeOK ==
     /\ used          \in SUBSET Blocks
     /\ next_snap_id  \in 1..(MaxSnaps + 1)
     /\ most_recent_snap \in 0..MaxSnaps
+    /\ live_cold_extents \in SUBSET ColdExtentIds
+    /\ extent_hash    \in [ColdExtentIds -> HashIds]
+    /\ snap_cold_dead \in [SnapIds -> SUBSET ColdExtentIds]
+    /\ cold_dereffed  \in SUBSET ColdExtentIds
+    /\ used_cold_extents \in SUBSET ColdExtentIds
 
 (* Every block that has been written to live_blocks but is no longer there *)
 (* must be tracked SOMEWHERE — either freed, or in some PRESENT snap's    *)
@@ -327,6 +465,49 @@ SnapIdMonotonic ==
     \A s \in SnapIds :
         s >= next_snap_id => snap_state[s] = "ABSENT"
                               /\ snap_dead[s] = {}
+                              /\ snap_cold_dead[s] = {}
+
+(* P7-CAS-4c: cold-extent analog of BlocksTrackedSomewhere. Every used    *)
+(* cold extent must be tracked SOMEWHERE — in live, in some PRESENT      *)
+(* snap's cold-dead-list, or in cold_dereffed. Otherwise the cold extent *)
+(* leaks: its CAS-deref obligation is lost, and at the C-impl boundary   *)
+(* the CAS refcount fails to reach 0 (chunk never reclaimed).            *)
+(*                                                                           *)
+(* Buggy variants firing this:                                              *)
+(*   BuggyOverwriteColdForgetsDead — drops cold without routing.          *)
+(*   BuggyDeleteColdForgetsDeref — snap_delete clears snap_cold_dead       *)
+(*     without moving entries to cold_dereffed.                            *)
+(***************************************************************************)
+ColdExtentsTrackedSomewhere ==
+    \A c \in used_cold_extents :
+        \/ c \in live_cold_extents
+        \/ c \in cold_dereffed
+        \/ \E s \in SnapIds : SnapPresent(s) /\ c \in snap_cold_dead[s]
+
+(* P7-CAS-4c: live cold extents aren't in any snap's cold-dead-list (a   *)
+(* cold extent can't be both live AND deferred to a snap). Mirror of     *)
+(* LiveDisjointFromDead for the cold tier.                                *)
+LiveColdDisjointFromDead ==
+    \A s \in SnapIds : SnapPresent(s) =>
+        live_cold_extents \cap snap_cold_dead[s] = {}
+
+(* P7-CAS-4c: live cold extents aren't dereffed. *)
+LiveColdDisjointFromDereffed ==
+    live_cold_extents \cap cold_dereffed = {}
+
+(* P7-CAS-4c: dereffed cold extents don't appear in any snap's cold-dead. *)
+DereffedColdDisjointFromDead ==
+    \A s \in SnapIds : cold_dereffed \cap snap_cold_dead[s] = {}
+
+(* P7-CAS-4c: at most one snap holds a cold extent. Each OverwriteCold   *)
+(* routes c to most_recent_snap; subsequent SnapCreate doesn't move c.  *)
+(* This is the cold-tier analog of dead_list.tla's single-ownership     *)
+(* property for paddrs (an implicit consequence of OverwriteBlock        *)
+(* always routing to most_recent_snap).                                  *)
+ColdSingleOwnership ==
+    \A s1, s2 \in SnapIds :
+        s1 # s2 /\ SnapPresent(s1) /\ SnapPresent(s2) =>
+            snap_cold_dead[s1] \cap snap_cold_dead[s2] = {}
 
 Invariants ==
     /\ TypeOK
@@ -336,5 +517,10 @@ Invariants ==
     /\ LiveDisjointFromFreed
     /\ FreedDisjointFromDead
     /\ SnapIdMonotonic
+    /\ ColdExtentsTrackedSomewhere
+    /\ LiveColdDisjointFromDead
+    /\ LiveColdDisjointFromDereffed
+    /\ DereffedColdDisjointFromDead
+    /\ ColdSingleOwnership
 
 ================================================================================

@@ -278,8 +278,24 @@ extern "C" {
  * byte at all — byte 0 was n_replicas — so v17→v18 in-place is NOT
  * forward-compat at the value layer; v18 mounts of v17 pools rely
  * on the SB version check rejecting first. Format break, no feature
- * flag. */
-#define STM_UB_VERSION        18u
+ * flag.
+ *
+ * v19 (P7-CAS-4c, this commit): per-snapshot cold-dead-list — closes
+ * the snap_idx ↔ CAS hash refcount integration gap (P7-CAS-2 deferral:
+ * snapshots with cold-extent captures could see dangling-hash reads
+ * after auto-GC reclaimed the chunk). Snapshot value layout extends
+ * past the existing dead_paddrs[] tail with `cold_dead_count` (le32)
+ * + `cold_dead_hashes[N][32]` where N = cold_dead_count. Total per-
+ * snap value: 56 + name_len + 8*dead_count + 4 + 32*cold_dead_count
+ * (was 56 + name_len + 8*dead_count). When the cold-dead-list is
+ * empty the tail is just 4 bytes (cold_dead_count=0). New constant
+ * STM_SNAP_COLD_DEAD_LIST_MAX = 256 caps the per-snap cold-dead-list
+ * length analogous to STM_SNAP_DEAD_LIST_MAX. No new uberblock fields.
+ * v18 pools fail at the version check; tamper-then-mount drift at
+ * the snap value layer is rejected by the snap-decoder's length
+ * check (the encoded length doesn't match v19 expectations). Format
+ * break, no feature flag. */
+#define STM_UB_VERSION        19u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */

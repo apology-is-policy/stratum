@@ -3142,4 +3142,366 @@ STM_TEST(fs_migrate_to_cold_chunked_cross_file_dedup) {
     unlink(g_key_path);
 }
 
+/* ========================================================================= */
+/* P7-CAS-4c — snap_idx ↔ CAS hash refcount integration.                       */
+/* ========================================================================= */
+
+STM_TEST(fs_snap_holds_cold_extent_after_overwrite) {
+    /* Create snap, migrate hot→cold, overwrite live cold extent: the
+     * snap's cold-dead-list captures the dropped hash and the CAS
+     * refcount stays bumped (snap holds the refcount until delete).
+     * Closes the P7-CAS-2 deferral that snapshots-with-cold-extents
+     * could see dangling-hash reads. */
+    make_tmp("p4c_snap_holds_cold");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)((i * 17u + 5u) & 0xFFu);
+    uint8_t plain2[4096];
+    for (size_t i = 0; i < sizeof plain2; i++) plain2[i] = (uint8_t)((i * 23u + 11u) & 0xFFu);
+
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_snapshot_index *snap_idx = stm_sync_snapshot_index(sync);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    STM_ASSERT_TRUE(snap_idx != NULL && cas != NULL);
+
+    /* Capture refcount before snap. */
+    size_t cas_pre = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &cas_pre));
+    STM_ASSERT_EQ(cas_pre, (size_t)1);
+
+    /* Snap created with the live cold extent in its tree. */
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_snapshot_create(snap_idx, /*ds=*/1, "p4c_a",
+                                          /*tree_root=*/0xC4FE,
+                                          stm_sync_current_gen(sync),
+                                          &snap_id));
+    /* Snap's cold-dead-list is empty before any overwrite. */
+    size_t cdc_pre = 999;
+    STM_ASSERT_OK(stm_snapshot_cold_dead_list_count(snap_idx, snap_id, &cdc_pre));
+    STM_ASSERT_EQ(cdc_pre, (size_t)0);
+
+    /* Overwrite live: cold record dropped → snap-aware bookend routes
+     * the captured hash to snap's cold-dead-list. CAS refcount stays
+     * at 1 — snap now "holds" the chunk on behalf of its captured
+     * tree_root view. */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain2, sizeof plain2));
+
+    size_t cdc_post = 0;
+    STM_ASSERT_OK(stm_snapshot_cold_dead_list_count(snap_idx, snap_id, &cdc_post));
+    STM_ASSERT_EQ(cdc_post, (size_t)1);
+
+    /* Auto-GC at sync_commit doesn't reclaim — refcount is still 1. */
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    size_t cas_post = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &cas_post));
+    STM_ASSERT_EQ(cas_post, (size_t)1);
+
+    /* Live read returns the new (post-overwrite) plaintext. */
+    uint8_t out[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(plain2, out, sizeof out);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_snap_delete_releases_cold_dead) {
+    /* Continuation: delete the snap. cold-dead-list returned to caller;
+     * caller calls stm_cas_deref per hash. CAS refcount drops to 0 →
+     * auto-GC reclaims at next sync_commit. */
+    make_tmp("p4c_snap_delete_cold");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[4096];
+    memset(plain, 0x5A, sizeof plain);
+    uint8_t plain2[4096];
+    memset(plain2, 0xA5, sizeof plain2);
+
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_snapshot_index *snap_idx = stm_sync_snapshot_index(sync);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_snapshot_create(snap_idx, 1, "p4c_b", 0xD00D,
+                                          stm_sync_current_gen(sync),
+                                          &snap_id));
+    /* Drop the cold extent. Snap captures hash. */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain2, sizeof plain2));
+
+    /* Delete snap. caller derefs each cold hash. */
+    uint64_t *freed_paddrs = NULL; size_t n_paddrs = 0;
+    uint8_t  *freed_hashes = NULL; size_t n_hashes = 0;
+    STM_ASSERT_OK(stm_snapshot_delete(snap_idx, snap_id,
+                                          &freed_paddrs, &n_paddrs,
+                                          &freed_hashes, &n_hashes));
+    STM_ASSERT_EQ(n_hashes, (size_t)1);
+    STM_ASSERT_TRUE(freed_hashes != NULL);
+    /* Caller-side: deref each hash. */
+    for (size_t i = 0; i < n_hashes; i++) {
+        STM_ASSERT_OK(stm_cas_deref(cas, freed_hashes + i * STM_SNAP_HASH_LEN));
+    }
+    /* Caller frees buffers. */
+    free(freed_paddrs);
+    free(freed_hashes);
+
+    /* Refcount=0 now; auto-GC at next commit reclaims. */
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    size_t cas_after = 999;
+    STM_ASSERT_OK(stm_cas_count(cas, &cas_after));
+    STM_ASSERT_EQ(cas_after, (size_t)0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_no_snap_cold_overwrite_derefs_directly) {
+    /* Backwards-compat: with no snap, live cold-overwrite derefs
+     * immediately (out_should_deref=true → caller calls cas_deref
+     * inline). Mirrors P7-CAS-2 behavior — no regression for the
+     * snap-less case. */
+    make_tmp("p4c_no_snap");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[4096];
+    memset(plain, 0x42, sizeof plain);
+    uint8_t plain2[4096];
+    memset(plain2, 0x84, sizeof plain2);
+
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    size_t pre = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &pre));
+    STM_ASSERT_EQ(pre, (size_t)1);
+
+    /* No snap — overwrite derefs directly. */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain2, sizeof plain2));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    size_t post = 999;
+    STM_ASSERT_OK(stm_cas_count(cas, &post));
+    STM_ASSERT_EQ(post, (size_t)0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_snap_cold_dead_list_persists_across_mount) {
+    /* The cold-dead-list bytes survive unmount/remount via the v19
+     * snapshot-tree value layout (cold_dead_count + cold_dead_hashes[]
+     * tail). */
+    make_tmp("p4c_persist");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[4096];
+    memset(plain, 0x37, sizeof plain);
+    uint8_t plain2[4096];
+    memset(plain2, 0x73, sizeof plain2);
+
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_snapshot_index *snap_idx = stm_sync_snapshot_index(sync);
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_snapshot_create(snap_idx, 1, "p4c_c", 0x9999,
+                                          stm_sync_current_gen(sync),
+                                          &snap_id));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain2, sizeof plain2));
+    /* Snap's cold-dead-list = 1 entry. */
+    size_t pre = 0;
+    STM_ASSERT_OK(stm_snapshot_cold_dead_list_count(snap_idx, snap_id, &pre));
+    STM_ASSERT_EQ(pre, (size_t)1);
+
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    /* Remount + verify cold-dead-list survived. */
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    sync = stm_fs_sync_for_test(fs);
+    snap_idx = stm_sync_snapshot_index(sync);
+    size_t post = 999;
+    STM_ASSERT_OK(stm_snapshot_cold_dead_list_count(snap_idx, snap_id, &post));
+    STM_ASSERT_EQ(post, (size_t)1);
+
+    /* CAS refcount preserved across mount → cas_count=1. */
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    size_t casn = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &casn));
+    STM_ASSERT_EQ(casn, (size_t)1);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_snap_intra_cow_shared_hash_no_leak) {
+    /* R54 P1-1 regression: a single COW that drops MULTIPLE cold
+     * records sharing a content_hash (e.g., overwriting a whole file
+     * post-migrate-with-intra-file-dedup) MUST capture every drop's
+     * deref obligation in the snap's cold-dead-list. Previously the
+     * within-snap dedup-defense scan rejected the second-and-later
+     * calls with STM_EINVAL → silently lost CAS refs → permanent
+     * unreclaimable chunk + caller-visible STM_EINVAL despite the
+     * data plane succeeding.
+     *
+     * Repro: write 64 KiB plaintext where first half == second half,
+     * install small CDC params so chunked migrate yields ≥2 cold
+     * records sharing a hash (intra-file dedup), snapshot, overwrite
+     * the whole file, then snap-delete + caller-deref + commit. The
+     * CAS count should reach zero (no leak). */
+    make_tmp("p4c_intra_cow_shared");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    STM_ASSERT_OK(mtc4b_install_test_params(fs));
+
+    enum { HALF = 32u * 1024u, LEN = 2u * HALF };
+    uint8_t *plain = malloc(LEN);
+    uint8_t *plain2 = malloc(LEN);
+    STM_ASSERT_TRUE(plain != NULL && plain2 != NULL);
+    /* First half == second half → at least one chunk hash repeats
+     * (intra-file dedup at the chunk-FastCDC level). */
+    for (size_t i = 0; i < HALF; i++) {
+        plain[i] = (uint8_t)((i * 31u + 17u) & 0xFFu);
+    }
+    memcpy(plain + HALF, plain, HALF);
+    memset(plain2, 0xCC, LEN);
+
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, LEN));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_snapshot_index *snap_idx = stm_sync_snapshot_index(sync);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+
+    /* Sanity: cold extents > 1 (chunked migrate produced ≥2 cold
+     * records); CAS count < cold extent count (intra-file dedup hit). */
+    mtc4b_extent_count_t cnt = { .ds = 1, .ino = 1 };
+    STM_ASSERT_OK(stm_extent_iter_ds(stm_sync_extent_index(sync), 1,
+                                          mtc4b_count_cb, &cnt));
+    STM_ASSERT_TRUE(cnt.cold_count >= 2u);
+    size_t cas_after_migrate = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &cas_after_migrate));
+    STM_ASSERT_TRUE(cas_after_migrate < cnt.cold_count);
+
+    /* Snap captures the cold extents. */
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_snapshot_create(snap_idx, 1, "p4c_idd", 0xBEEF,
+                                          stm_sync_current_gen(sync),
+                                          &snap_id));
+
+    /* Overwrite the whole file. Write_extent's bookend MUST collect
+     * every dropped hash (multiset, not set) into snap's cold-dead-
+     * list. Pre-fix: this returned STM_EINVAL. */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain2, LEN));
+
+    /* The cold-dead-list size equals the number of dropped cold
+     * records (cnt.cold_count) — duplicates retained. */
+    size_t cdc = 0;
+    STM_ASSERT_OK(stm_snapshot_cold_dead_list_count(snap_idx, snap_id, &cdc));
+    STM_ASSERT_EQ(cdc, (size_t)cnt.cold_count);
+
+    /* Auto-GC at this commit: refcounts unchanged, no reclaim. */
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    size_t cas_after_overwrite = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &cas_after_overwrite));
+    STM_ASSERT_EQ(cas_after_overwrite, cas_after_migrate);
+
+    /* Delete snap; caller derefs each hash (with multiplicity).
+     * After all derefs, refcount on each unique hash drops to 0;
+     * auto-GC at next commit reclaims everything. */
+    uint64_t *freed_paddrs = NULL; size_t n_paddrs = 0;
+    uint8_t  *freed_hashes = NULL; size_t n_hashes = 0;
+    STM_ASSERT_OK(stm_snapshot_delete(snap_idx, snap_id,
+                                          &freed_paddrs, &n_paddrs,
+                                          &freed_hashes, &n_hashes));
+    STM_ASSERT_EQ(n_hashes, (size_t)cnt.cold_count);
+    for (size_t i = 0; i < n_hashes; i++) {
+        STM_ASSERT_OK(stm_cas_deref(cas, freed_hashes + i * STM_SNAP_HASH_LEN));
+    }
+    free(freed_paddrs);
+    free(freed_hashes);
+
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    size_t cas_final = 999;
+    STM_ASSERT_OK(stm_cas_count(cas, &cas_final));
+    STM_ASSERT_EQ(cas_final, (size_t)0);
+
+    free(plain);
+    free(plain2);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_snap_overwrite_cold_block_arg_validation) {
+    /* New API arg validation: NULL idx / NULL out / dataset_id == 0 /
+     * NULL hash / all-zero hash → STM_EINVAL. */
+    make_tmp("p4c_argval");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_snapshot_index *snap_idx = stm_sync_snapshot_index(sync);
+
+    bool sd = false;
+    uint8_t hash_nz[STM_SNAP_HASH_LEN];
+    memset(hash_nz, 0xAB, sizeof hash_nz);
+    uint8_t hash_zero[STM_SNAP_HASH_LEN] = {0};
+
+    STM_ASSERT_ERR(stm_snapshot_index_overwrite_cold_block(NULL, 1, hash_nz, &sd),
+                       STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_index_overwrite_cold_block(snap_idx, 1, hash_nz, NULL),
+                       STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_index_overwrite_cold_block(snap_idx, 0, hash_nz, &sd),
+                       STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_index_overwrite_cold_block(snap_idx, 1, NULL, &sd),
+                       STM_EINVAL);
+    STM_ASSERT_ERR(stm_snapshot_index_overwrite_cold_block(snap_idx, 1, hash_zero, &sd),
+                       STM_EINVAL);
+
+    /* No snap → out_should_deref=true and STM_OK. */
+    STM_ASSERT_OK(stm_snapshot_index_overwrite_cold_block(snap_idx, 1, hash_nz, &sd));
+    STM_ASSERT_TRUE(sd == true);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")

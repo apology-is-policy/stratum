@@ -33,14 +33,19 @@
 #define TEST_DEVICE_BYTES      (UINT64_C(16) * 1024u * 1024u)
 #define TEST_BOOTSTRAP_BYTES   (UINT64_C(8)  * 1024u * 1024u)
 
-/* P6-deadlist: stm_snapshot_delete now returns the freed-paddr list
- * via out-args. Tests that don't exercise the dead-list use this
- * thin wrapper to retain the single-arg ergonomics. */
+/* P6-deadlist + P7-CAS-4c: stm_snapshot_delete now returns BOTH the
+ * freed-paddr list AND the freed-cold-hash list via out-args. Tests
+ * that don't exercise the dead-lists use this thin wrapper to retain
+ * the single-arg ergonomics. */
 static stm_status snap_delete_simple(stm_snapshot_index *idx, uint64_t id) {
-    uint64_t *freed = NULL;
-    size_t    n     = 0;
-    stm_status rs = stm_snapshot_delete(idx, id, &freed, &n);
+    uint64_t *freed       = NULL;
+    size_t    n           = 0;
+    uint8_t  *cold_hashes = NULL;
+    size_t    cold_n      = 0;
+    stm_status rs = stm_snapshot_delete(idx, id, &freed, &n,
+                                          &cold_hashes, &cold_n);
     free(freed);
+    free(cold_hashes);
     return rs;
 }
 

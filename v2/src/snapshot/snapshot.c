@@ -52,6 +52,17 @@ typedef struct {
     uint64_t          *dead_list;
     size_t             dead_count;
     size_t             dead_capacity;
+
+    /* P7-CAS-4c: per-snapshot cold-extent dead-list. Flat byte buffer
+     * of N×STM_SNAP_HASH_LEN bytes — N=cold_dead_count. Each entry is
+     * a content_hash for a cold extent record dropped from the live
+     * dataset DURING this snap's lifetime. snap_delete transfers the
+     * buffer to caller for stm_cas_deref routing.
+     * cold_dead_count <= cold_dead_capacity <= STM_SNAP_COLD_DEAD_LIST_MAX.
+     * NULL/0 for slots with no cold-record overwrites. */
+    uint8_t           *cold_dead_list;
+    size_t             cold_dead_count;
+    size_t             cold_dead_capacity;
 } snapshot_slot;
 
 struct stm_snapshot_index {
@@ -201,9 +212,11 @@ stm_status stm_snapshot_index_create(uint64_t current_txg,
 void stm_snapshot_index_close(stm_snapshot_index *idx) {
     if (!idx) return;
     pthread_mutex_destroy(&idx->lock);
-    /* P6-deadlist: free per-slot dead_list arrays. */
+    /* P6-deadlist + P7-CAS-4c: free per-slot dead-list arrays (HOT
+     * paddrs + COLD content hashes). */
     for (size_t i = 0; i < idx->slots_len; i++) {
         free(idx->slots[i].dead_list);
+        free(idx->slots[i].cold_dead_list);
     }
     free(idx->slots);
     free(idx);
@@ -371,10 +384,15 @@ stm_status stm_snapshot_create_for_test(stm_snapshot_index *idx,
 stm_status stm_snapshot_delete(stm_snapshot_index *idx,
                                  uint64_t snapshot_id,
                                  uint64_t **out_freed_paddrs,
-                                 size_t *out_freed_count) {
-    if (!idx || !out_freed_paddrs || !out_freed_count) return STM_EINVAL;
-    *out_freed_paddrs = NULL;
-    *out_freed_count  = 0;
+                                 size_t *out_freed_count,
+                                 uint8_t **out_freed_cold_hashes,
+                                 size_t *out_freed_cold_count) {
+    if (!idx || !out_freed_paddrs || !out_freed_count
+        || !out_freed_cold_hashes || !out_freed_cold_count) return STM_EINVAL;
+    *out_freed_paddrs       = NULL;
+    *out_freed_count        = 0;
+    *out_freed_cold_hashes  = NULL;
+    *out_freed_cold_count   = 0;
     must_lock(&idx->lock);
     size_t s = find_slot_locked(idx, snapshot_id);
     if (s == (size_t)-1 || !idx->slots[s].present) {
@@ -395,21 +413,27 @@ stm_status stm_snapshot_delete(stm_snapshot_index *idx,
         must_unlock(&idx->lock);
         return STM_EBUSY;
     }
-    /* P6-deadlist: transfer the dead_list to the caller. In dead_list.tla's
-     * single-ownership model, all entries are unique-and-freed; the
-     * predecessor-merge step is empty so we just hand off the full list
-     * for caller-side reclaim. After the transfer, the slot's dead_list
-     * is NULL/0 — safe to mark ABSENT and leave to the next persist /
-     * close.
+    /* P6-deadlist + P7-CAS-4c: transfer BOTH dead-lists to caller. In
+     * dead_list.tla's single-ownership model, all entries are unique-and-
+     * freed; the predecessor-merge step is empty so we just hand off
+     * the full lists for caller-side reclaim (paddrs via stm_alloc_free,
+     * cold-hashes via stm_cas_deref). After the transfer, the slot's
+     * lists are NULL/0 — safe to mark ABSENT.
      *
      * Note: we do this AFTER all the refusal checks above (hold, clone-
-     * cb), so a refused delete leaves the dead_list intact. */
+     * cb), so a refused delete leaves both dead-lists intact. */
     snapshot_slot *slot = &idx->slots[s];
     *out_freed_paddrs   = slot->dead_list;
     *out_freed_count    = slot->dead_count;
     slot->dead_list     = NULL;
     slot->dead_count    = 0;
     slot->dead_capacity = 0;
+
+    *out_freed_cold_hashes = slot->cold_dead_list;
+    *out_freed_cold_count  = slot->cold_dead_count;
+    slot->cold_dead_list     = NULL;
+    slot->cold_dead_count    = 0;
+    slot->cold_dead_capacity = 0;
 
     slot->present = false;
     idx->dirty    = true;
@@ -501,6 +525,117 @@ stm_status stm_snapshot_dead_list_count(const stm_snapshot_index *idx,
         return STM_ENOENT;
     }
     *out_count = idx->slots[s].dead_count;
+    must_unlock(lock);
+    return STM_OK;
+}
+
+/* P7-CAS-4c: route a dropped COLD-extent record to the most-recent
+ * snap's cold-dead-list. See header for full contract.
+ *
+ * Realizes dead_list.tla::OverwriteCold at the C-impl boundary —
+ * combines with stm_cas_deref (called by caller when out_should_deref =
+ * true) to satisfy ColdExtentsTrackedSomewhere across the COW + snap-
+ * delete lifecycle. */
+stm_status stm_snapshot_index_overwrite_cold_block(stm_snapshot_index *idx,
+                                                      uint64_t dataset_id,
+                                                      const uint8_t content_hash[STM_SNAP_HASH_LEN],
+                                                      bool *out_should_deref) {
+    if (!idx || !out_should_deref) return STM_EINVAL;
+    if (dataset_id == 0) return STM_EINVAL;
+    if (!content_hash) return STM_EINVAL;
+    /* Reject all-zero hash (CAS sentinel). */
+    bool any_nonzero = false;
+    for (size_t k = 0; k < STM_SNAP_HASH_LEN; k++) {
+        if (content_hash[k] != 0) { any_nonzero = true; break; }
+    }
+    if (!any_nonzero) return STM_EINVAL;
+    *out_should_deref = false;
+
+    must_lock(&idx->lock);
+
+    uint64_t mr = most_recent_locked(idx, dataset_id);
+    if (mr == STM_SNAP_NO_PREV) {
+        /* No PRESENT snap holds this hash — caller derefs directly per
+         * dead_list.tla::OverwriteCold with most_recent_snap = 0. */
+        *out_should_deref = true;
+        must_unlock(&idx->lock);
+        return STM_OK;
+    }
+
+    size_t s = find_slot_locked(idx, mr);
+    if (s == (size_t)-1 || !idx->slots[s].present) {
+        must_unlock(&idx->lock);
+        return STM_ECORRUPT;
+    }
+
+    snapshot_slot *slot = &idx->slots[s];
+
+    /* R54 P1-1 fix: NO within-snap dedup-defense scan for cold hashes.
+     *
+     * The paddr-tier OverwriteBlock scans for duplicate paddrs (R33
+     * P2) because paddrs are unique-owned — the alloc layer's live-
+     * tracking guarantees a paddr in any snap's dead-list cannot
+     * also be live, so a re-route of the same paddr is a caller bug.
+     *
+     * Cold-extent hashes are NOT unique-owned. Distinct cold extents
+     * at distinct (ds, ino, off, len) coordinates legitimately share
+     * a content_hash (intra-file dedup, cross-file dedup, FastCDC
+     * sub-chunking with shared content). When a single COW operation
+     * drops MULTIPLE cold records sharing a hash (e.g., overwriting
+     * a whole file post-migrate-with-intra-file-dedup), the post-
+     * deref bookend calls overwrite_cold_block once per record. A
+     * dedup-defense scan would reject the second-and-later calls,
+     * silently losing CAS-deref obligations and leaving the chunk
+     * unreclaimable.
+     *
+     * The cold-dead-list is therefore a MULTISET of hashes — each
+     * entry represents one distinct cold-record-drop's deref
+     * obligation. dead_list.tla::ColdSingleOwnership is at the
+     * cold-extent-ID level, not the hash level; the multiset shape
+     * exactly matches the spec's `snap_cold_dead[s] \subseteq
+     * ColdExtentIds` semantics. */
+
+    if (slot->cold_dead_count >= STM_SNAP_COLD_DEAD_LIST_MAX) {
+        must_unlock(&idx->lock);
+        return STM_ENOSPC;
+    }
+
+    if (slot->cold_dead_count == slot->cold_dead_capacity) {
+        size_t new_cap = slot->cold_dead_capacity == 0
+                            ? 8u : slot->cold_dead_capacity * 2u;
+        if (new_cap > STM_SNAP_COLD_DEAD_LIST_MAX) {
+            new_cap = STM_SNAP_COLD_DEAD_LIST_MAX;
+        }
+        uint8_t *new_buf = realloc(slot->cold_dead_list,
+                                      new_cap * STM_SNAP_HASH_LEN);
+        if (!new_buf) {
+            must_unlock(&idx->lock);
+            return STM_ENOMEM;
+        }
+        slot->cold_dead_list     = new_buf;
+        slot->cold_dead_capacity = new_cap;
+    }
+
+    memcpy(slot->cold_dead_list + slot->cold_dead_count * STM_SNAP_HASH_LEN,
+            content_hash, STM_SNAP_HASH_LEN);
+    slot->cold_dead_count++;
+    idx->dirty = true;
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+stm_status stm_snapshot_cold_dead_list_count(const stm_snapshot_index *idx,
+                                                 uint64_t snapshot_id,
+                                                 size_t *out_count) {
+    if (!idx || !out_count) return STM_EINVAL;
+    pthread_mutex_t *lock = snap_lock(idx);
+    must_lock(lock);
+    size_t s = find_slot_locked(idx, snapshot_id);
+    if (s == (size_t)-1 || !idx->slots[s].present) {
+        must_unlock(lock);
+        return STM_ENOENT;
+    }
+    *out_count = idx->slots[s].cold_dead_count;
     must_unlock(lock);
     return STM_OK;
 }
@@ -642,9 +777,14 @@ stm_status stm_snapshot_iter(const stm_snapshot_index *idx,
 #define SP_VAL_FIXED            52u                          /* before name[] */
 #define SP_DEAD_TAIL_FIXED      4u                            /* le32 dead_count */
 #define SP_DEAD_PADDR_BYTES     8u                            /* le64 paddr */
+/* P7-CAS-4c v19: cold-dead tail = 4 bytes count + 32 bytes per hash. */
+#define SP_COLD_TAIL_FIXED      4u                            /* le32 cold_dead_count */
+#define SP_COLD_HASH_BYTES      32u
 #define SP_VAL_MAX              (SP_VAL_FIXED + STM_SNAP_NAME_MAX \
                                   + SP_DEAD_TAIL_FIXED \
-                                  + STM_SNAP_DEAD_LIST_MAX * SP_DEAD_PADDR_BYTES)
+                                  + STM_SNAP_DEAD_LIST_MAX * SP_DEAD_PADDR_BYTES \
+                                  + SP_COLD_TAIL_FIXED \
+                                  + STM_SNAP_COLD_DEAD_LIST_MAX * SP_COLD_HASH_BYTES)
 
 static void sp_encode_key(uint64_t id, uint8_t out[SP_KEY_LEN]) {
     le64 k = stm_store_le64(id);
@@ -661,7 +801,9 @@ static size_t sp_encode_value(const snapshot_slot *s,
                                  uint8_t *out, size_t out_cap) {
     size_t need = (size_t)SP_VAL_FIXED + s->e.name_len
                 + SP_DEAD_TAIL_FIXED
-                + (size_t)s->dead_count * SP_DEAD_PADDR_BYTES;
+                + (size_t)s->dead_count * SP_DEAD_PADDR_BYTES
+                + SP_COLD_TAIL_FIXED
+                + (size_t)s->cold_dead_count * SP_COLD_HASH_BYTES;
     if (out_cap < need) return 0;
 
     le64 ds   = stm_store_le64(s->e.dataset_id);
@@ -697,6 +839,17 @@ static size_t sp_encode_value(const snapshot_slot *s,
         memcpy(out + tail_off, p.v, 8);
         tail_off += SP_DEAD_PADDR_BYTES;
     }
+
+    /* P7-CAS-4c v19 tail: cold_dead_count then cold_dead_hashes[].
+     * Each hash is 32 bytes verbatim — content_hash is opaque BLAKE3
+     * output, not endian-converted. */
+    le32 cdc = stm_store_le32((uint32_t)s->cold_dead_count);
+    memcpy(out + tail_off, cdc.v, 4);
+    tail_off += SP_COLD_TAIL_FIXED;
+    if (s->cold_dead_count > 0 && s->cold_dead_list != NULL) {
+        memcpy(out + tail_off, s->cold_dead_list,
+                s->cold_dead_count * SP_COLD_HASH_BYTES);
+    }
     return need;
 }
 
@@ -726,8 +879,16 @@ static stm_status sp_decode_value(uint64_t id, const uint8_t *in,
     memcpy(dc.v, in + tail_off, 4);
     uint32_t dead_count = stm_load_le32(dc);
     if (dead_count > STM_SNAP_DEAD_LIST_MAX) return STM_ECORRUPT;
-    size_t expected = tail_off + SP_DEAD_TAIL_FIXED
-                    + (size_t)dead_count * SP_DEAD_PADDR_BYTES;
+    size_t paddr_tail_end = tail_off + SP_DEAD_TAIL_FIXED
+                          + (size_t)dead_count * SP_DEAD_PADDR_BYTES;
+    /* P7-CAS-4c v19: cold_dead_count + cold_dead_hashes[] tail. */
+    if (in_len < paddr_tail_end + SP_COLD_TAIL_FIXED) return STM_ECORRUPT;
+    le32 cdc;
+    memcpy(cdc.v, in + paddr_tail_end, 4);
+    uint32_t cold_dead_count = stm_load_le32(cdc);
+    if (cold_dead_count > STM_SNAP_COLD_DEAD_LIST_MAX) return STM_ECORRUPT;
+    size_t expected = paddr_tail_end + SP_COLD_TAIL_FIXED
+                    + (size_t)cold_dead_count * SP_COLD_HASH_BYTES;
     if (in_len != expected) return STM_ECORRUPT;
 
     memset(out_slot, 0, sizeof *out_slot);
@@ -761,6 +922,44 @@ static stm_status sp_decode_value(uint64_t id, const uint8_t *in,
             out_slot->dead_list[i] = stm_load_le64(p);
             if (out_slot->dead_list[i] == 0) {
                 /* paddr=0 reserved sentinel — refuse on decode. */
+                free(out_slot->dead_list);
+                out_slot->dead_list     = NULL;
+                out_slot->dead_count    = 0;
+                out_slot->dead_capacity = 0;
+                return STM_ECORRUPT;
+            }
+        }
+    }
+
+    /* P7-CAS-4c v19: load cold-dead-list. Each entry is 32 bytes
+     * verbatim; reject all-zero entries (CAS sentinel) for the same
+     * reason paddr=0 is rejected above. */
+    if (cold_dead_count > 0) {
+        out_slot->cold_dead_list = calloc((size_t)cold_dead_count,
+                                              SP_COLD_HASH_BYTES);
+        if (!out_slot->cold_dead_list) {
+            free(out_slot->dead_list);
+            out_slot->dead_list     = NULL;
+            out_slot->dead_count    = 0;
+            out_slot->dead_capacity = 0;
+            return STM_ENOMEM;
+        }
+        out_slot->cold_dead_capacity = cold_dead_count;
+        out_slot->cold_dead_count    = cold_dead_count;
+        size_t coff = paddr_tail_end + SP_COLD_TAIL_FIXED;
+        memcpy(out_slot->cold_dead_list, in + coff,
+                (size_t)cold_dead_count * SP_COLD_HASH_BYTES);
+        for (size_t i = 0; i < cold_dead_count; i++) {
+            const uint8_t *h = out_slot->cold_dead_list + i * SP_COLD_HASH_BYTES;
+            bool any_nonzero = false;
+            for (size_t k = 0; k < SP_COLD_HASH_BYTES; k++) {
+                if (h[k] != 0) { any_nonzero = true; break; }
+            }
+            if (!any_nonzero) {
+                free(out_slot->cold_dead_list);
+                out_slot->cold_dead_list     = NULL;
+                out_slot->cold_dead_count    = 0;
+                out_slot->cold_dead_capacity = 0;
                 free(out_slot->dead_list);
                 out_slot->dead_list     = NULL;
                 out_slot->dead_count    = 0;
@@ -1045,13 +1244,15 @@ static stm_status sp_shadow_append(sp_load_ctx *lc, const snapshot_slot *src) {
     return STM_OK;
 }
 
-/* P6-deadlist: free shadow_slots' per-slot dead_list arrays + the
- * shadow_slots itself. Used on every load_at error path (each shadow
- * slot owns its dead_list malloc'd by sp_decode_value). */
+/* P6-deadlist + P7-CAS-4c: free shadow_slots' per-slot dead-list arrays
+ * (HOT paddrs + COLD content hashes) + the shadow_slots itself. Used
+ * on every load_at error path (each shadow slot owns both arrays
+ * malloc'd by sp_decode_value). */
 static void sp_shadow_free(sp_load_ctx *lc) {
     if (!lc->shadow_slots) return;
     for (size_t i = 0; i < lc->shadow_len; i++) {
         free(lc->shadow_slots[i].dead_list);
+        free(lc->shadow_slots[i].cold_dead_list);
     }
     free(lc->shadow_slots);
     lc->shadow_slots = NULL;
@@ -1082,9 +1283,10 @@ static int sp_load_iter(const void *k, size_t klen,
     }
     stm_status as = sp_shadow_append(lc, &tmp);
     if (as != STM_OK) {
-        /* Append failed; ownership of tmp.dead_list never transferred,
-         * so we own it and must free here. */
+        /* Append failed; ownership of tmp.dead_list / tmp.cold_dead_list
+         * never transferred, so we own them and must free here. */
         free(tmp.dead_list);
+        free(tmp.cold_dead_list);
         lc->err = as;
         return 1;
     }
@@ -1169,6 +1371,18 @@ static stm_status sp_validate_shadow(const sp_load_ctx *lc) {
         }
     }
 
+    /* R54 P1-1 fix: NO within-snap cold-hash uniqueness check. The
+     * cold-dead-list is a multiset of hashes — each entry pins one
+     * distinct cold-record-drop's CAS-deref obligation. Distinct cold
+     * extents at distinct (ds, ino, off, len) coordinates legitimately
+     * share a content_hash (intra-file dedup, cross-file dedup,
+     * FastCDC chunking with shared content); a within-snap uniqueness
+     * check would reject legitimate persisted state from a single COW
+     * dropping multiple shared-hash cold records. dead_list.tla::
+     * ColdSingleOwnership is at the cold-extent-ID level, not the
+     * hash level; a multiset of hashes maps directly to the spec's
+     * `snap_cold_dead[s] \subseteq ColdExtentIds` semantics. */
+
     return STM_OK;
 }
 
@@ -1227,10 +1441,12 @@ stm_status stm_snapshot_index_load_at(stm_snapshot_index *idx,
         return vs;
     }
 
-    /* Atomic swap. P6-deadlist: free OLD slots' dead_list arrays before
-     * dropping the OLD slots[] backing store. */
+    /* Atomic swap. P6-deadlist + P7-CAS-4c: free OLD slots' dead-list
+     * arrays (HOT paddrs + COLD content hashes) before dropping the
+     * OLD slots[] backing store. */
     for (size_t i = 0; i < idx->slots_len; i++) {
         free(idx->slots[i].dead_list);
+        free(idx->slots[i].cold_dead_list);
     }
     free(idx->slots);
     idx->slots     = lc.shadow_slots;

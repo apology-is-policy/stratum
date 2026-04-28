@@ -4333,15 +4333,32 @@ static stm_status stm_sync_write_extent_locked(stm_sync *s,
     }
     free(dropped);
 
-    /* P7-CAS-2: deref every captured COLD-extent hash. Best-effort
-     * drain mirroring the paddr-drop loop above. STM_ENOENT here
-     * would indicate a torn cas_idx vs extent_idx — surface as the
-     * first non-OK status the same way drop_err does. */
+    /* P7-CAS-2 + P7-CAS-4c: route every captured COLD-extent hash
+     * through the snap-aware deref path. If a most-recent snap exists
+     * for this dataset, the deref obligation is held by the snap's
+     * cold-dead-list (deferred to snap-delete); otherwise we deref
+     * the CAS index directly. Best-effort drain mirroring the paddr-
+     * drop loop above. STM_ENOENT on cas_deref indicates a torn
+     * cas_idx vs extent_idx — surface as the first non-OK status the
+     * same way drop_err does. */
     if (s->cas_idx && cox.n_hashes > 0) {
         for (size_t i = 0; i < cox.n_hashes; i++) {
             const uint8_t *h = cox.hashes + i * STM_CAS_HASH_LEN;
-            stm_status crs = stm_cas_deref(s->cas_idx, h);
-            if (crs != STM_OK && drop_err == STM_OK) drop_err = crs;
+            bool should_deref = false;
+            stm_status srs = STM_OK;
+            if (s->snap_idx) {
+                srs = stm_snapshot_index_overwrite_cold_block(
+                        s->snap_idx, dataset_id, h, &should_deref);
+            } else {
+                /* No snap_idx — fall back to direct deref. */
+                should_deref = true;
+            }
+            if (srs == STM_OK && should_deref) {
+                stm_status crs = stm_cas_deref(s->cas_idx, h);
+                if (crs != STM_OK && drop_err == STM_OK) drop_err = crs;
+            } else if (srs != STM_OK && drop_err == STM_OK) {
+                drop_err = srs;
+            }
         }
     }
     free(cox.hashes);
@@ -4901,12 +4918,26 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     free(drop_idx_buf);
     free(paddrs_buf);
 
-    /* P7-CAS-2: deref every captured COLD-extent hash. */
+    /* P7-CAS-2 + P7-CAS-4c: route every captured COLD-extent hash
+     * through the snap-aware deref path. Mirror of write_extent_
+     * locked's bookend — see that function for the contract. */
     if (s->cas_idx && tcox.n_hashes > 0) {
         for (size_t i = 0; i < tcox.n_hashes; i++) {
             const uint8_t *h = tcox.hashes + i * STM_CAS_HASH_LEN;
-            stm_status crs = stm_cas_deref(s->cas_idx, h);
-            if (crs != STM_OK && drop_err == STM_OK) drop_err = crs;
+            bool should_deref = false;
+            stm_status srs = STM_OK;
+            if (s->snap_idx) {
+                srs = stm_snapshot_index_overwrite_cold_block(
+                        s->snap_idx, dataset_id, h, &should_deref);
+            } else {
+                should_deref = true;
+            }
+            if (srs == STM_OK && should_deref) {
+                stm_status crs = stm_cas_deref(s->cas_idx, h);
+                if (crs != STM_OK && drop_err == STM_OK) drop_err = crs;
+            } else if (srs != STM_OK && drop_err == STM_OK) {
+                drop_err = srs;
+            }
         }
     }
     free(tcox.hashes);

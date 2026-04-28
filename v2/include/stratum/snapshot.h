@@ -84,6 +84,24 @@ struct stm_bootstrap;  typedef struct stm_bootstrap  stm_bootstrap;
 #define STM_SNAP_DEAD_LIST_MAX   256u
 
 /*
+ * P7-CAS-4c: per-snapshot cold-dead-list cap. Mirrors STM_SNAP_DEAD_LIST_MAX
+ * for the COLD tier — when a live cold extent is dropped via COW, the
+ * caller routes the dropped extent's content_hash[32] through
+ * `stm_snapshot_index_overwrite_cold_block` which appends to the most-
+ * recent snapshot's cold-dead-list (or signals direct-deref if no snap
+ * exists). On snap-delete, the cold-dead-list contents flow back to the
+ * caller for `stm_cas_deref` routing. The cap is per-snap; STM_ENOSPC
+ * is propagated to callers so the higher-level COW can refuse rather
+ * than silently violating the per-snap reachability invariant
+ * (dead_list.tla::ColdExtentsTrackedSomewhere).
+ */
+#define STM_SNAP_COLD_DEAD_LIST_MAX  256u
+
+/* Length of a content hash. Mirrors STM_EXTENT_HASH_LEN / STM_CAS_HASH_LEN.
+ * Kept locally so consumers don't need to include extent.h or cas.h. */
+#define STM_SNAP_HASH_LEN  32u
+
+/*
  * Per-snapshot entry. Mirrors ARCH §8.5.2 stm_snapshot_entry but
  * stores tree_root as a paddr (uint64_t) rather than a stm_bptr —
  * the bptr layer integration is a follow-on chunk. Other fields
@@ -210,11 +228,29 @@ stm_status stm_snapshot_create(stm_snapshot_index *idx,
  * are valid; callers MUST handle the NULL case by skipping the
  * free + free()-of-array steps.
  */
+/*
+ * P7-CAS-4c: snap-delete also returns the cold-dead-list contents
+ * (N×32-byte content hashes packed as a flat byte buffer). The caller
+ * MUST iterate the buffer in 32-byte strides, calling stm_cas_deref
+ * on each hash to release the CAS refcount. Composes the cold-tier
+ * mirror of the paddr-tier free path.
+ *
+ *   - *out_freed_cold_hashes / *out_freed_cold_count = NULL/0 when
+ *     the snap had no cold-record overwrites. Caller skips the deref
+ *     loop AND the free()-of-buffer step.
+ *   - On non-OK return both pairs are zero/NULL.
+ *
+ * The buffer ownership transfers to the caller; caller MUST free()
+ * the cold-hashes buffer after iterating, identical to the
+ * out_freed_paddrs ownership convention.
+ */
 STM_MUST_USE
 stm_status stm_snapshot_delete(stm_snapshot_index *idx,
                                  uint64_t snapshot_id,
                                  uint64_t **out_freed_paddrs,
-                                 size_t *out_freed_count);
+                                 size_t *out_freed_count,
+                                 uint8_t **out_freed_cold_hashes,
+                                 size_t *out_freed_cold_count);
 
 /*
  * P6-deadlist: append `paddr` to the dead-list of the dataset's
@@ -259,6 +295,69 @@ STM_MUST_USE
 stm_status stm_snapshot_dead_list_count(const stm_snapshot_index *idx,
                                            uint64_t snapshot_id,
                                            size_t *out_count);
+
+/*
+ * P7-CAS-4c: route a dropped COLD-extent record through the snap-aware
+ * deref path. Mirror of `stm_snapshot_index_overwrite_block` for the
+ * cold tier — when a COW operation (overwrite / truncate / delete-file)
+ * drops a cold extent record from the live dataset, the caller MUST
+ * call this to resolve the deref obligation:
+ *
+ *   - If a most-recent PRESENT snapshot exists for `dataset_id`:
+ *     append `content_hash[32]` to that snap's cold-dead-list.
+ *     `*out_should_deref = false`. The CAS-deref obligation is held
+ *     by the snapshot until snap-delete fires it.
+ *   - Otherwise (no PRESENT snap for the dataset): `*out_should_deref
+ *     = true`. The caller MUST call `stm_cas_deref(idx, hash)`
+ *     directly to release the CAS refcount.
+ *
+ * This composition realizes dead_list.tla::OverwriteCold + ensures
+ * snap-captured cold extents remain reachable until the snap is
+ * deleted (closes the P7-CAS-2 forward-noted gap that snapshots-
+ * with-cold-extents could see dangling-hash reads).
+ *
+ * The caller-visible CAS refcount math: the cold record's CAS-deref
+ * obligation is conserved (always exactly one deref per cold record
+ * dropped from live, fired either now or at snap-delete time); cas.tla
+ * ::RefcountConsistent at the C-impl boundary widens to "refcount =
+ * (count of live cold extents at h) + (count of snap-cold-dead entries
+ * at h across all PRESENT snaps)".
+ *
+ * Single-ownership defense-in-depth: scans every PRESENT snap's
+ * cold-dead-list for an existing entry of `content_hash`. The scan is
+ * weaker than the paddr-tier's identical-paddr scan (cold hashes can
+ * legitimately repeat across snaps via sequential migrate-of-same-
+ * content; the scan only catches a programming bug where the SAME
+ * cold-extent-record's hash gets routed twice). Bounded by total
+ * cold-dead entries (≤ STM_SNAP_COLD_DEAD_LIST_MAX × n_snaps).
+ *
+ * Refuses with:
+ *   - STM_EINVAL on NULL idx / NULL out / dataset_id == 0 / NULL hash.
+ *   - STM_EINVAL if hash is all-zero (CAS sentinel, never live).
+ *   - STM_ECORRUPT if most_recent_locked returned a stale slot id (a
+ *     case that signals in-RAM index corruption — same shape as the
+ *     paddr-tier API).
+ *   - STM_ENOSPC if the most-recent snap's cold-dead-list is at the
+ *     STM_SNAP_COLD_DEAD_LIST_MAX cap. Callers SHOULD propagate
+ *     ENOSPC up to the COW caller and refuse the operation (the
+ *     alternative — direct-deref + drop the snap's claim — would
+ *     silently violate dead_list.tla::ColdExtentsTrackedSomewhere).
+ */
+STM_MUST_USE
+stm_status stm_snapshot_index_overwrite_cold_block(stm_snapshot_index *idx,
+                                                      uint64_t dataset_id,
+                                                      const uint8_t content_hash[STM_SNAP_HASH_LEN],
+                                                      bool *out_should_deref);
+
+/*
+ * P7-CAS-4c: count of cold-hash entries in `snapshot_id`'s in-RAM
+ * cold-dead-list. STM_ENOENT if snap not PRESENT. *out_count = 0 for
+ * a snap with no cold-record overwrites.
+ */
+STM_MUST_USE
+stm_status stm_snapshot_cold_dead_list_count(const stm_snapshot_index *idx,
+                                                 uint64_t snapshot_id,
+                                                 size_t *out_count);
 
 /*
  * Increment snapshot's hold count. STM_ENOENT if not PRESENT.
