@@ -38,8 +38,28 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R51-hash-fixup. Substantive `5e25cca` +
-  R51 close `ee25ff6`.
+- **Tip**: post-R52-hash-fixup. Substantive `a9e21f3` +
+  R52 close `<R52 close>` (TBD).
+  **P7-CAS-4a — crossing-cold truncate. Lifts the STM_ENOTSUPPORTED
+  refusal P7-CAS-2 placed on truncating ACROSS a cold extent
+  (rec.kind == COLD AND rec.off < new_size < rec.off + rec.len).
+  No new code paths needed: composes via cold-aware
+  `stm_sync_read_extent_locked` (added P7-CAS-2) + the kept-prefix
+  re-encrypt under fresh `(paddrs[0], current_gen)` HOT AEAD nonce
+  via `stm_sync_write_extent_locked` + the cold_overlap_cb pre-scan
+  + post-deref bookend (P7-CAS-2) which captures the cold extent's
+  content_hash and `stm_cas_deref`s it after `stm_extent_overwrite`
+  drops the cold record. Net effect: the crossing-cold case is now
+  semantically equivalent to "rehydrate the prefix as HOT, drop the
+  rest, deref the hash" — composes via cas.tla::RehydrateOnWrite +
+  extent.tla::Write without a new spec action. test_fs grows
+  70 → 72 (replaced `fs_truncate_refuses_cold_crossing` with
+  `fs_truncate_crossing_cold_extent_basic`,
+  `_persists_across_mount`, `_dedup_partial_release`). cas.tla
+  unchanged. 35 ctest suites green default + ASan + TSan. No format
+  break — STM_UB_VERSION = 18 preserved.**
+  Prior P7-CAS-3 substantive `5e25cca` + R51 close `ee25ff6` +
+  hash fixup `c124e55`.
   **P7-CAS-3 — closes R50 P2-1 + P2-3 forward-noted deferrals + adds
   cold-extent reflink (CAS-bump shape). (1) **R50 P2-1 paddr-leak fix**:
   Two-part. (1a) `cas_auto_gc_sweep_locked` moved BEFORE

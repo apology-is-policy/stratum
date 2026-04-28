@@ -11,9 +11,9 @@ CAS dedup property. The refcount tracks how many cold-extent records
 currently reference each hash; when the refcount falls to zero, the
 chunk's backing replicas are eligible for reclamation.
 
-**Status (P7-CAS-3 / v18)**: index lifecycle + persistence + format
+**Status (P7-CAS-4a / v18)**: index lifecycle + persistence + format
 break + migration / rehydrate / auto-GC data plane + cold-extent
-reflink all landed. `stm_sync_migrate_to_cold` realizes
+reflink + crossing-cold truncate all landed. `stm_sync_migrate_to_cold` realizes
 cas.tla::MigrateToCold; `stm_sync_write_extent_locked`'s pre-scan +
 post-deref realizes cas.tla::RehydrateOnWrite; the 3-phase
 transactional `cas_auto_gc_sweep_locked` (run BEFORE per-device
@@ -407,7 +407,48 @@ is HOT-side only and doesn't apply to COLD records (which have
 n_replicas=0 / paddrs zeroed); cas.tla::RefcountConsistent
 captures the refcount math directly.
 
-## Snapshot interaction (MVP limitation)
+## Crossing-cold truncate (P7-CAS-4a)
+
+`stm_sync_truncate` accepts a COLD crossing extent (rec.kind ==
+COLD AND rec.off < new_size < rec.off + rec.len) — was
+STM_ENOTSUPPORTED in P7-CAS-2 / -3. The fix is purely
+compositional: no new C path, no new spec action.
+
+The Phase 2 crossing-extent flow:
+
+1. `stm_sync_read_extent_locked(rec.off, plain, rec.len, ...)` —
+   the cold-aware read branch (P7-CAS-2) decrypts the chunk
+   under stm_ad_cas via `stm_cas_lookup` + AEAD-decrypt under
+   pool metadata_key + the canonical CAS nonce
+   `(cas_rec.paddrs[0], cas_rec.gen, pool_uuid)`.
+2. Slice the kept prefix `[rec.off, new_size)`.
+3. `stm_sync_write_extent_locked(rec.off, plain, prefix_len)` —
+   reserves fresh paddrs from the allocator, encrypts the prefix
+   under stm_ad_extent + dataset DEK at fresh
+   `(paddrs[0], current_gen)` AEAD nonce.
+
+Inside `stm_sync_write_extent_locked`:
+- `cold_overlap_cb` pre-scan (P7-CAS-2) captures the cold
+  extent's content_hash before extent_overwrite drops it.
+- `stm_extent_overwrite` drops the original cold extent
+  (n_replicas=0 → no paddr drop) and inserts the new HOT extent
+  at (rec.off, prefix_len). Atomic under extent_idx.lock.
+- Post-overwrite, the deref bookend calls `stm_cas_deref` on
+  the captured hash. CAS refcount drops by one; if it hits
+  zero, the next sync_commit's auto-GC reclaims the chunk.
+
+Spec coverage: composes via cas.tla::RehydrateOnWrite (the
+per-cold-extent deref + replacement with a fresh hot extent at
+the same byte range) — but here the new HOT extent's `len` is
+the kept-prefix length, not the original cold extent's length.
+That's still within RehydrateOnWrite's modeled shape (the spec
+allows the rehydrated hot extent to be at any byte range that
+was previously cold). The PAST-portion of the cold extent
+(bytes in `[new_size, rec.off + rec.len)`) is consumed as part
+of `extent_overwrite`'s drop — semantically equivalent to
+"rehydrate prefix + truncate suffix in one atomic step."
+
+
 
 In the P7-CAS-2 MVP the snap_idx does not track CAS hashes. Auto-GC
 walks all refcount=0 entries unconditionally, even if a snapshot's
@@ -426,7 +467,7 @@ auto-GC composes correctly with snapshot retention.
   insert (basic + invalid args + duplicate-hash refusal +
   paddr-collision refusal), ref / deref / gc, lookup, iter (sorted +
   empty), and a multi-step dedup composition exercise.
-- `v2/tests/test_fs.c` — 17 integration tests:
+- `v2/tests/test_fs.c` — 19 integration tests:
   - `fs_cas_index_present_at_format`: format-time CAS index reachable
     via `stm_sync_cas_index`; empty.
   - `fs_cas_index_persists_across_mount`: insert + ref → commit →
@@ -467,6 +508,15 @@ auto-GC composes correctly with snapshot retention.
     R51 P1-1 regression): full migrate → rehydrate → multi-cycle
     unmount/remount/commit; asserts `data_pending_blocks == 0`
     post-cycle (cross-mount PENDING reclamation works).
+  - `fs_truncate_crossing_cold_extent_basic` (P7-CAS-4a):
+    truncate-across-cold rehydrates the prefix as HOT + derefs
+    the CAS hash; auto-GC reclaims at next commit.
+  - `fs_truncate_crossing_cold_extent_persists_across_mount`
+    (P7-CAS-4a): the prefix HOT extent survives unmount/remount.
+  - `fs_truncate_crossing_cold_dedup_partial_release`
+    (P7-CAS-4a): truncating one of two cold-shared files drops
+    refcount 2 → 1; the other still reads full plaintext via
+    cold path.
 
 35 ctest suites green default + ASan + TSan in isolation (-j2).
 
@@ -486,9 +536,9 @@ auto-GC composes correctly with snapshot retention.
 | Cold-extent reflink (CAS-bump shape) | ✅ P7-CAS-3 | — |
 | Auto-GC ordering vs alloc_commit (R50 P2-1 close) | ✅ P7-CAS-3 | — |
 | Transactional auto-GC sweep (R50 P2-3 close) | ✅ P7-CAS-3 | — |
-| Cold-crossing truncate (CAS-aware read+slice) | — | P7-CAS-4 |
-| Cold-extent FastCDC sub-chunking | — | P7-CAS-4 (`src/cdc/` already exists, P7-prework) |
-| Snapshot-CAS hash refcount integration | — | P7-CAS-4 |
+| Cold-crossing truncate (CAS-aware read+slice) | ✅ P7-CAS-4a | — |
+| Cold-extent FastCDC sub-chunking | — | P7-CAS-4b (`src/cdc/` already exists, P7-prework) |
+| Snapshot-CAS hash refcount integration | — | P7-CAS-4c |
+| Background GC integration with scrub | — | P7-CAS-4 (closes R51 P3-2 + P3-4) |
 | Migration policy heuristic (NOVEL #6 v1) | — | post-P7-CAS-4 |
-| Background GC integration with scrub | — | post-P7-CAS-4 |
 | Cross-pool dedup | — | post-v2.0 (NOVEL #3) |

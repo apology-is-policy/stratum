@@ -56,6 +56,20 @@ into the CAS tier (which DOES need P6) is a separate concern.
 
 ## Phase 7 status (overall)
 
+- [x] **P7-CAS-4a crossing-cold truncate** — substantive `a9e21f3` +
+      R52 close `<R52 close>` + hash-fixup (this commit). Lifts the
+      STM_ENOTSUPPORTED refusal P7-CAS-2 placed on truncating
+      across a cold extent. Composes via cold-aware
+      `stm_sync_read_extent_locked` (P7-CAS-2) + kept-prefix
+      re-encrypt under fresh HOT AEAD nonce via
+      `stm_sync_write_extent_locked` + the cold_overlap_cb
+      pre-scan + post-deref bookend (P7-CAS-2) — extent_overwrite
+      drops the cold record + post-deref calls stm_cas_deref on
+      the captured hash. No new code paths; the comment block at
+      the prior refusal site documents the composition. Three
+      positive tests: basic, persists-across-mount, dedup-partial-
+      release. cas.tla unchanged (the composition is captured by
+      RehydrateOnWrite + extent.tla::Write). No format break.
 - [x] **P7-CAS-3 closes R50 P2-1 + P2-3 + adds cold-extent reflink** —
       substantive `5e25cca` + R51 close `ee25ff6` + hash-fixup
       (this commit). Three-prong chunk:
