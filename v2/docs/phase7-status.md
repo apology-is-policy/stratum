@@ -56,6 +56,54 @@ into the CAS tier (which DOES need P6) is a separate concern.
 
 ## Phase 7 status (overall)
 
+- [x] **P7-CAS-4b FastCDC sub-chunking** — substantive
+      `<P7-CAS-4b-substantive>` + R53 close `<P7-CAS-4b-Rclose>` +
+      hash-fixup (this commit). Integrates `src/cdc/`
+      (FastCDC, P7-prework, idle since 2026-04) into the cold-tier
+      migration data plane. New per-stm_sync `stm_cdc cdc;` field
+      initialized at sync_new from `stm_cdc_default_params` (ARCH
+      §6.9.4: 8 MiB avg / 2 MiB min / 32 MiB max). New atomic
+      1-drop+N-insert primitive `stm_extent_migrate_to_cold_chunked`
+      alongside the existing single-chunk `stm_extent_migrate_to_cold`:
+      pre-grows records[] capacity, in-place overwrites the src slot
+      with chunks[0], appends chunks[1..K-1]. Pre-validates chunks tile
+      [src_off, src_off+src_len) with no gap or overlap; refuses K=1
+      (callers use the single-chunk API). New per-chunk descriptor
+      `stm_extent_cold_chunk { off, len, content_hash[32] }`.
+      `migrate_one_extent_locked` rewrite: read+decrypt → FastCDC
+      chunk via `stm_cdc_chunk` → round boundaries to STM_UB_SIZE = 4
+      KiB grid via new `round_chunk_boundaries` (round-to-nearest,
+      drop collapsed boundaries, ensure last chunk >= STM_UB_SIZE) →
+      per-chunk pre-flight via new `cas_chunk_intern_locked` helper
+      (BLAKE3 + CAS lookup-or-insert with paddr reserve / AEAD-encrypt
+      via `cas_chunk_encrypt_and_write_locked` / cas_insert on miss;
+      cas_ref on hit) → atomic migrate (K=1 dispatches to old single
+      API; K>=2 to chunked API) → drop-route src HOT replicas. Rollback
+      walks completed chunks calling `stm_cas_deref` on each (CAS-miss
+      inserts drop refcount → 0 → auto-GC at next commit; CAS-hit
+      bumps undone). Default ARCH §6.9.4 params yield K=1 for 128 KiB
+      recordsize-cap extents (FastCDC min=2 MiB > 128 KiB) → behavior
+      identical to P7-CAS-2. Tests override CDC params via new
+      test-only seam `<stratum/sync_testing.h>::stm_sync_set_cdc_
+      params_for_test` (gated by `STRATUM_BUILD_TESTING_HOOKS`,
+      mirrors snapshot_create_for_test pattern from R46 P2-1).
+      cas.tla extended with `ChunkedMigrateToColdK2` action (atomic
+      K=2 specialization; K=1 covered by existing MigrateToCold;
+      K>=3 composes by induction). Closes pre-existing
+      clamp/invariant inconsistency in MigrateToCold's CAS-hit
+      branch (refcount clamps at MaxRef but invariant doesn't
+      account; new precondition `EntryAt(h).refcount < MaxRef`
+      mirrors C-impl's STM_OVERFLOW return on stm_cas_ref). cas.cfg
+      green at 3.18M states / depth 10 / 3:32 (was 2.5M / depth 10 /
+      40s — added action + cap precondition slightly broadens the
+      state space). All 6 buggy demos still fire their respective
+      invariants. test_fs grows 72 → 77 (5 new chunked-migrate
+      tests: basic round-trip, intra-file dedup, persists across
+      mount, full rehydrate clears CAS, cross-file dedup; plus a
+      `mtc4b_read_full` per-extent helper since `stm_fs_read` is
+      single-extent MVP). 35 ctest suites green default + ASan +
+      TSan in isolation. No format break — STM_UB_VERSION = 18
+      preserved. Spec posture 21/25/31 unchanged.
 - [x] **P7-CAS-4a crossing-cold truncate** — substantive `a9e21f3` +
       R52 close `fe6ac61` + hash-fixup (this commit). Lifts the
       STM_ENOTSUPPORTED refusal P7-CAS-2 placed on truncating

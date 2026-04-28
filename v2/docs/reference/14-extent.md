@@ -452,15 +452,20 @@ unrelated to the index API and stays separate.
 - [ ] Coalescing — quality-of-implementation; correctness preserved
       by `NoOverlapWithinIno`.
 - [x] Reflinks / refcount-bump path — Phase 7 §10.4 (P7-16).
-- [x] **CAS / cold-tier extents** (P7-CAS, P7-CAS-2): extent records
-      carry a `kind` discriminator (HOT / COLD) and a `content_hash[32]`
-      field for COLD records. New `stm_extent_write_cold` inserts a
-      COLD record; new `stm_extent_migrate_to_cold` atomically swaps
-      a HOT extent for a COLD extent at the same coordinates. See
+- [x] **CAS / cold-tier extents** (P7-CAS, P7-CAS-2, P7-CAS-3,
+      P7-CAS-4a, P7-CAS-4b): extent records carry a `kind`
+      discriminator (HOT / COLD) and a `content_hash[32]` field for
+      COLD records. New `stm_extent_write_cold` inserts a COLD record;
+      new `stm_extent_migrate_to_cold` atomically swaps a HOT extent
+      for ONE COLD extent at the same coordinates;
+      `stm_extent_migrate_to_cold_chunked` (P7-CAS-4b) atomically
+      swaps a HOT extent for N >= 2 COLD chunks tiling the source
+      range — pre-grows records[] capacity, in-place overwrites the
+      src slot with chunks[0], appends chunks[1..K-1]. Per-chunk
+      descriptor `stm_extent_cold_chunk { off, len, content_hash[32] }`
+      pre-validated to tile [src_off, src_off+src_len). See
       `15-cas.md` for the cold-tier index module + migration data
-      plane. P7-CAS-3 future extensions: reflink of cold-extent
-      sources (CAS-bump shape) and crossing-cold truncate (CAS-aware
-      read+slice) are refused with STM_ENOTSUPPORTED in P7-CAS-2 MVP.
+      plane + FastCDC sub-chunking integration.
 - [ ] Per-file or per-dataset Bε-tree partitioning — current unified
       MVP scales to small pools; production scale-out to many-inode
       pools needs partitioning.

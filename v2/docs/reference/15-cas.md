@@ -11,18 +11,20 @@ CAS dedup property. The refcount tracks how many cold-extent records
 currently reference each hash; when the refcount falls to zero, the
 chunk's backing replicas are eligible for reclamation.
 
-**Status (P7-CAS-4a / v18)**: index lifecycle + persistence + format
+**Status (P7-CAS-4b / v18)**: index lifecycle + persistence + format
 break + migration / rehydrate / auto-GC data plane + cold-extent
-reflink + crossing-cold truncate all landed. `stm_sync_migrate_to_cold` realizes
-cas.tla::MigrateToCold; `stm_sync_write_extent_locked`'s pre-scan +
-post-deref realizes cas.tla::RehydrateOnWrite; the 3-phase
-transactional `cas_auto_gc_sweep_locked` (run BEFORE per-device
-alloc_commit in `stm_sync_commit`) realizes cas.tla::GC + closes
-the R50 P2-1 paddr-leak window across crash boundaries; cold-extent
-reflink composes via cas.tla's existing `BumpRef` (= `stm_cas_ref`)
-shape. Remaining deferrals (P7-CAS-4): cold-crossing truncate (CAS-
-aware read+slice path), FastCDC sub-chunking, snap_idx ↔ CAS hash
-refcount integration, background scrub-driven CAS walker.
+reflink + crossing-cold truncate + FastCDC sub-chunking all landed.
+`stm_sync_migrate_to_cold` realizes cas.tla::MigrateToCold (K=1) and
+cas.tla::ChunkedMigrateToColdK2 (K=2; K>=3 composes by induction);
+`stm_sync_write_extent_locked`'s pre-scan + post-deref realizes
+cas.tla::RehydrateOnWrite; the 3-phase transactional
+`cas_auto_gc_sweep_locked` (run BEFORE per-device alloc_commit in
+`stm_sync_commit`) realizes cas.tla::GC + closes the R50 P2-1
+paddr-leak window across crash boundaries; cold-extent reflink
+composes via cas.tla's existing `BumpRef` (= `stm_cas_ref`) shape.
+Remaining deferrals (P7-CAS-4): snap_idx ↔ CAS hash refcount
+integration, background scrub-driven CAS walker, migration policy
+heuristic, send/recv with cold extents.
 
 ## Public API
 
@@ -191,9 +193,15 @@ cas.tla::Init                  → stm_cas_index_create
 cas.tla::WriteHot              → (extent layer; not modeled in cas.tla's
                                    C impl — see extent.tla / extent_index.c)
 cas.tla::MigrateToCold (CAS-miss)
-                               → stm_cas_insert
+                               → stm_cas_insert (called by
+                                   cas_chunk_intern_locked at K=1 path
+                                   AND per-chunk in K>=2 path)
 cas.tla::MigrateToCold (CAS-hit)
-                               → stm_cas_ref
+                               → stm_cas_ref (same caller)
+cas.tla::ChunkedMigrateToColdK2 (atomic 1-hot to 2-cold)
+                               → stm_extent_migrate_to_cold_chunked
+                                   composing N x cas_chunk_intern_locked
+                                   results; K=2 modeled, K>=3 by induction
 cas.tla::RehydrateOnWrite (per-hash deref)
                                → stm_cas_deref
 cas.tla::DeleteFile (per-hash deref)
@@ -461,6 +469,141 @@ return STM_ECORRUPT on dangling-hash lookup).
 Future P7-CAS-4 work: integrate CAS hash refcounts with snap_idx so
 auto-GC composes correctly with snapshot retention.
 
+## FastCDC sub-chunking (P7-CAS-4b)
+
+`stm_sync_migrate_to_cold` migrates a single HOT extent to N COLD
+chunks at FastCDC content-defined boundaries. Each chunk is
+independently BLAKE3-hashed, CAS-lookup-or-inserted, and inserted as
+a COLD extent record at chunk-aligned `(off, len)`.
+
+**Default behavior preserved (backwards-compat)**: `stm_sync` carries
+an `stm_cdc cdc;` field initialized at `sync_new` from
+`stm_cdc_default_params` (ARCH §6.9.4: 8 MiB avg / 2 MiB min / 32
+MiB max). With `min=2 MiB > recordsize cap=128 KiB`, FastCDC
+produces ONE chunk per extent for any production-default migrate
+call; the K=1 dispatch path takes the existing single-chunk
+`stm_extent_migrate_to_cold` API. Behavior identical to P7-CAS-2.
+
+**Test override**: `<stratum/sync_testing.h>::stm_sync_set_cdc_
+params_for_test(s, params)` (gated by `STRATUM_BUILD_TESTING_HOOKS`)
+swaps the embedded chunker under `s->lock`. Tests use
+`stm_cdc_make_params(8u * 1024u, ...)` to drive 8 KiB-avg /
+2 KiB-min / 32 KiB-max chunking on the 64 KiB-extent test plaintexts
+→ multiple chunks per extent; chunked-migrate path exercised.
+
+### Chunk boundary alignment (4 KiB grid)
+
+FastCDC's natural boundaries can land anywhere within a block. The
+existing aligned-IO write/read paths require 4-KiB-aligned `len`
+(`stm_sync_write_extent_locked` validates `len % STM_UB_SIZE == 0`).
+`round_chunk_boundaries` in `src/sync/sync.c` reconciles:
+
+- Each FastCDC boundary (other than the last, which equals total) is
+  rounded to the NEAREST 4-KiB grid point (`(b + STM_UB_SIZE / 2) &
+  ~(STM_UB_SIZE - 1)`).
+- Boundaries that collapse onto a previous boundary are dropped.
+- Boundaries that would create a final chunk smaller than
+  STM_UB_SIZE are dropped.
+- The last entry is always the source plaintext's total length.
+
+Chunk-shift resolution after rounding: ±2 KiB. A small data shift
+that moves a FastCDC boundary by ≤ 2 KiB rounds to the same grid
+point → same chunk hash → dedup hits. Shifts > 2 KiB advance to the
+next grid → adjacent chunk affected; downstream chunks are
+unaffected (the property is the FastCDC + 4-KiB-grid composition).
+
+### `stm_extent_migrate_to_cold_chunked`
+
+Atomic 1-drop + N-insert primitive. Caller passes a pre-validated
+`stm_extent_cold_chunk[]` array (each entry: `off, len,
+content_hash[32]`) tiling `[src_off, src_off+src_len)`. The impl:
+
+1. Pre-validates inputs: `n_chunks >= 2` (K=1 callers use single API);
+   chunks contiguous (chunks[0].off == src_off, chunks[i].off ==
+   chunks[i-1].off + chunks[i-1].len, sum == src_len); each chunk's
+   `content_hash` non-zero.
+2. Locks `extent_idx.lock`. Finds the source HOT record at (ds, ino,
+   src_off). Refuses STM_ENOENT / STM_EINVAL on missing or COLD-already.
+3. **Pre-grows** `records[]` capacity to `n_records + n_chunks - 1`.
+   ENOMEM at this step is safe (no mutation yet).
+4. Captures dropped HOT replicas.
+5. **In-place overwrites** the source slot with `chunks[0]`'s COLD
+   record (preserving NoOverlapWithinIno across the transition).
+6. **Appends** chunks 1..n_chunks-1 as additional COLD records.
+7. Sets `dirty`, unlocks, returns dropped paddrs.
+
+Per-chunk record fields: `(ds, ino, chunks[i].off, chunks[i].len,
+COLD, n_replicas=0, paddrs=zeros, content_hash=chunks[i].hash,
+gen=src_gen, key_id=src_key_id, origin_dataset_id=src_origin_ds,
+origin_ino=src_origin_ino, origin_off=src_origin_off + (chunks[i].off
+- src_off), link_gen=link_gen)`. The origin_off offset adjustment
+preserves origin chains across chunked migrate.
+
+### Per-chunk pre-flight via `cas_chunk_intern_locked`
+
+Before the atomic migrate, every chunk's CAS-side state is set up:
+
+1. **BLAKE3 hash** the chunk's plaintext slice. Reject all-zero
+   (sentinel reserved by the CAS index).
+2. **CAS lookup**:
+   - HIT: `stm_cas_ref` bumps the existing entry's refcount.
+   - MISS: reserve fresh paddrs across N devices (per
+     `sync_desired_replica_count_locked`, capped at
+     `STM_CAS_MAX_REPLICAS=4`), AEAD-encrypt the chunk plaintext
+     under `stm_ad_cas` + pool metadata_key onto the fresh replicas
+     via `cas_chunk_encrypt_and_write_locked`, insert via
+     `stm_cas_insert` (refcount=1).
+3. Per-chunk state captured (`cas_inserted` / `cas_bumped` flag +
+   hash) for rollback orchestration.
+
+If any chunk's pre-flight fails, the rollback walks completed
+chunks calling `stm_cas_deref` on each. Inserted entries' refcounts
+drive to 0 → auto-GC at next `stm_sync_commit` reclaims the paddrs.
+Bumped entries' refcounts undo to the prior level.
+
+If the atomic migrate (`stm_extent_migrate_to_cold_chunked`) fails
+AFTER all chunks completed pre-flight, the same per-chunk rollback
+fires. Auto-GC handles inserted-but-orphaned paddrs.
+
+### Intra-extent dedup behavior
+
+If two chunks within the same source extent share a hash (rare under
+FastCDC's content-defined boundaries but possible — e.g., the same
+content appears twice in one file), the per-chunk pre-flight handles
+it correctly:
+
+- Chunk i (first occurrence): CAS-miss → insert with refcount=1.
+- Chunk j > i (same hash): CAS-hit (just-inserted entry visible) →
+  cas_ref bump → refcount=2.
+- Atomic migrate then inserts both COLD records pointing at the
+  shared hash.
+- `cas.tla::ChunkedMigrateToColdK2` Case A (same_hash + miss)
+  inserts with refcount=2 directly; Case B (same_hash + hit) bumps
+  by 2. The C-impl's insert+bump = refcount=1+1=2 produces
+  identical end-state.
+
+### Spec coverage
+
+`v2/specs/cas.tla` extends with `ChunkedMigrateToColdK2(E, len1, h1,
+h2, r1, r2)` — atomic 1-hot-to-2-cold migrate. Captures K=2
+explicitly; K=1 is the existing `MigrateToCold`; K>=3 composes by
+induction (each chunk's invariants compose; the atomic-batch shape is
+the spec-level enforcement). Re-uses existing buggy variants
+(`BuggyMigrateForgetsRefBump`, `BuggyMigrateWithoutDrop`,
+`BuggyMigrateReusesHotPaddr`) — same correctness concerns apply
+per-chunk.
+
+P7-CAS-4b also closed a pre-existing clamp/invariant inconsistency
+in `MigrateToCold`'s CAS-hit branch: `BumpedEntry` clamped at MaxRef
+but `RefcountConsistent` invariant didn't account for the clamp →
+spurious violation when a trace reached refcount=MaxRef and
+cold_extents continued to grow. New precondition `EntryAt(h).
+refcount < MaxRef` refuses the action at-cap, mirroring the C-impl's
+`stm_cas_ref` STM_OVERFLOW return on refcount-overflow at the
+UINT32_MAX boundary. Spec posture: cas.cfg green at 3.18M states /
+depth 10 / 3:32 (was 2.5M / depth 10 / 40s — added action +
+precondition broadens the state space modestly).
+
 ## Tests
 
 - `v2/tests/test_cas_index.c` — 20 unit tests covering lifecycle,
@@ -517,6 +660,23 @@ auto-GC composes correctly with snapshot retention.
     (P7-CAS-4a): truncating one of two cold-shared files drops
     refcount 2 → 1; the other still reads full plaintext via
     cold path.
+  - `fs_migrate_to_cold_chunked_basic_roundtrip` (P7-CAS-4b):
+    write 64 KiB, install 8 KiB-avg CDC params, migrate → N>=2
+    cold extents tile (1, 1); per-extent read iter recovers
+    original plaintext.
+  - `fs_migrate_to_cold_chunked_intra_file_dedup` (P7-CAS-4b):
+    64 KiB plaintext where first 32 KiB == second 32 KiB →
+    chunk dedup → CAS count < cold extent count.
+  - `fs_migrate_to_cold_chunked_persists_across_mount`
+    (P7-CAS-4b): chunked migrate → unmount → remount → all chunks
+    + plaintext survive (CDC params not persisted; chunks are).
+  - `fs_migrate_to_cold_chunked_full_rehydrate_clears_cas`
+    (P7-CAS-4b): chunked migrate → full overwrite → all chunks
+    deref → auto-GC reclaims; CAS count=0 post-commit.
+  - `fs_migrate_to_cold_chunked_cross_file_dedup` (P7-CAS-4b):
+    two files identical plaintext → second migrate's chunks all
+    hit existing CAS entries → CAS count unchanged, refcounts
+    doubled.
 
 35 ctest suites green default + ASan + TSan in isolation (-j2).
 
@@ -537,7 +697,7 @@ auto-GC composes correctly with snapshot retention.
 | Auto-GC ordering vs alloc_commit (R50 P2-1 close) | ✅ P7-CAS-3 | — |
 | Transactional auto-GC sweep (R50 P2-3 close) | ✅ P7-CAS-3 | — |
 | Cold-crossing truncate (CAS-aware read+slice) | ✅ P7-CAS-4a | — |
-| Cold-extent FastCDC sub-chunking | — | P7-CAS-4b (`src/cdc/` already exists, P7-prework) |
+| Cold-extent FastCDC sub-chunking | ✅ P7-CAS-4b | — |
 | Snapshot-CAS hash refcount integration | — | P7-CAS-4c |
 | Background GC integration with scrub | — | P7-CAS-4 (closes R51 P3-2 + P3-4) |
 | Migration policy heuristic (NOVEL #6 v1) | — | post-P7-CAS-4 |

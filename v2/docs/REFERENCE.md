@@ -38,8 +38,51 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R52-hash-fixup. Substantive `a9e21f3` +
-  R52 close `fe6ac61`.
+- **Tip**: post-R53-hash-fixup. Substantive `<P7-CAS-4b-substantive>` +
+  R53 close `<P7-CAS-4b-Rclose>`.
+  **P7-CAS-4b — FastCDC sub-chunking. Integrates `src/cdc/` (FastCDC,
+  P7-prework idle since 2026-04) into `stm_sync_migrate_to_cold` so
+  one HOT extent can migrate to N COLD chunks at content-defined
+  boundaries. New per-stm_sync `stm_cdc cdc;` field initialized from
+  `stm_cdc_default_params` (ARCH §6.9.4: 8 MiB avg / 2 MiB min /
+  32 MiB max). New atomic 1-drop+N-insert primitive
+  `stm_extent_migrate_to_cold_chunked` (pre-grow records[] capacity,
+  in-place overwrite of src slot with chunks[0], append chunks[1..K-1])
+  alongside the existing single-chunk `stm_extent_migrate_to_cold`.
+  `migrate_one_extent_locked` rewrite: read+decrypt → FastCDC chunk
+  → round boundaries to STM_UB_SIZE = 4 KiB grid via
+  `round_chunk_boundaries` (round-to-nearest, drop collapsed
+  boundaries, ensure last chunk >= STM_UB_SIZE) → per-chunk pre-flight
+  via new `cas_chunk_intern_locked` helper (BLAKE3 + CAS lookup-or-
+  insert with paddr reserve / encrypt+write / cas_insert on miss;
+  cas_ref on hit) → atomic migrate (K=1 dispatches to old single API,
+  K>=2 to chunked API) → drop-route src HOT replicas. Rollback walks
+  completed chunks calling `stm_cas_deref` on each (CAS-miss inserts
+  drop refcount → 0 → auto-GC at next commit; CAS-hit bumps undone).
+  Default ARCH §6.9.4 params → K=1 for 128 KiB recordsize-cap extents
+  (FastCDC min=2 MiB > 128 KiB) → behavior identical to P7-CAS-2.
+  Tests override CDC params via new test-only seam
+  `<stratum/sync_testing.h>::stm_sync_set_cdc_params_for_test` to
+  exercise multi-chunk migration. cas.tla extended with
+  `ChunkedMigrateToColdK2` action (K=2 specialization; K=1 covered by
+  existing MigrateToCold; K>=3 composes by induction). Pre-existing
+  clamp/invariant inconsistency in MigrateToCold's CAS-hit branch
+  (refcount clamps at MaxRef but invariant doesn't account) closed
+  via new `EntryAt(h).refcount < MaxRef` precondition. Spec green at
+  3.18M states / depth 10 / 3:32 wall (was 2.5M states / depth 10
+  / 40s — added action + cap precondition). All 6 buggy demos still
+  fire. test_fs grows 72 → 77 (5 new chunked-migrate tests +
+  multi-extent read helper since `stm_fs_read` is single-extent MVP).
+  R53: 0 P0 + 0 P1 + 0 P2 + 10 P3 — green signal. P3-2 + P3-4 + P3-5
+  + P3-7 + P3-8 fixed inline; P3-1 superseded by inline cap-bump
+  (E->len/256 + 8 ≈ 520-entry margin); P3-3 mitigated by
+  stm_cdc_init validation in sync_new; P3-6 + P3-9 + P3-10
+  forward-noted as cosmetic / test-hardening / micro-opt deferrals.
+  35 ctest suites green default + ASan + TSan in isolation
+  (parallel sanitizer matrices time-out per primer's known-issue
+  note). No format break — STM_UB_VERSION = 18 preserved.**
+  Prior P7-CAS-4a substantive `a9e21f3` + R52 close `fe6ac61` +
+  hash fixup `8717514`.
   **P7-CAS-4a — crossing-cold truncate. Lifts the STM_ENOTSUPPORTED
   refusal P7-CAS-2 placed on truncating ACROSS a cold extent
   (rec.kind == COLD AND rec.off < new_size < rec.off + rec.len).
