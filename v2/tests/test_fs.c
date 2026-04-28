@@ -13,6 +13,7 @@
 #include "tharness.h"
 #include <stratum/alloc.h>
 #include <stratum/cas.h>
+#include <stratum/cdc.h>
 #include <stratum/dataset.h>
 #include <stratum/extent.h>
 #include <stratum/fs.h>
@@ -23,6 +24,7 @@
 #include <stratum/snapshot.h>
 #include <stratum/snapshot_testing.h>
 #include <stratum/sync.h>
+#include <stratum/sync_testing.h>
 #include <stratum/types.h>
 
 #include <fcntl.h>
@@ -2792,6 +2794,349 @@ STM_TEST(fs_truncate_crossing_cold_dedup_partial_release) {
     STM_ASSERT_EQ(got_b, sizeof plain);
     STM_ASSERT_MEM_EQ(plain, out_b, sizeof plain);
 
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* ========================================================================= */
+/* P7-CAS-4b — FastCDC sub-chunking.                                          */
+/* ========================================================================= */
+
+/* Test-only CDC params override: avg=8 KiB / min=2 KiB / max=32 KiB.
+ * stm_cdc_make_params clamps min to avg/4. After round_chunk_boundaries
+ * the per-chunk minimum is STM_UB_SIZE (4 KiB). 64 KiB / max=32 KiB
+ * forces at least 2 chunks via the loose-region cutoff. */
+static stm_status mtc4b_install_test_params(stm_fs *fs) {
+    stm_sync *s = stm_fs_sync_for_test(fs);
+    if (!s) return STM_EINVAL;
+    stm_cdc_params p;
+    stm_status mp = stm_cdc_make_params(8u * 1024u, &p);
+    if (mp != STM_OK) return mp;
+    return stm_sync_set_cdc_params_for_test(s, &p);
+}
+
+/* Iter cb that counts COLD extents (kind discriminator) at (ds, ino) by
+ * walking the entire extent index (the existing iter_ds doesn't filter). */
+typedef struct {
+    uint64_t ds;
+    uint64_t ino;
+    uint64_t hot_count;
+    uint64_t cold_count;
+} mtc4b_extent_count_t;
+
+static bool mtc4b_count_cb(const stm_extent_record *e, void *ctx) {
+    mtc4b_extent_count_t *c = (mtc4b_extent_count_t *)ctx;
+    if (e->dataset_id != c->ds || e->ino != c->ino) return true;
+    if (e->kind == STM_EXTENT_KIND_HOT) c->hot_count++;
+    else if (e->kind == STM_EXTENT_KIND_COLD) c->cold_count++;
+    return true;
+}
+
+/* Multi-extent read helper: stm_fs_read is a single-extent MVP — it
+ * refuses STM_EINVAL when the request spans multiple extents. After a
+ * chunked migrate the file is N cold extents; a 64 KiB user-shape read
+ * needs to walk per-extent. This helper iterates lookup_at + per-extent
+ * read until `total` bytes are filled or a hole / error surfaces. */
+static stm_status mtc4b_read_full(stm_fs *fs,
+                                    uint64_t ds, uint64_t ino,
+                                    uint64_t off, void *buf, size_t total) {
+    stm_sync *s = stm_fs_sync_for_test(fs);
+    stm_extent_index *eidx = stm_sync_extent_index(s);
+    uint8_t *cur = (uint8_t *)buf;
+    uint64_t pos = off;
+    uint64_t remaining = total;
+    while (remaining > 0) {
+        stm_extent_record rec;
+        stm_status ls = stm_extent_lookup_at(eidx, ds, ino, pos, &rec);
+        if (ls != STM_OK) return ls;
+        if (rec.off != pos) return STM_EINVAL;
+        size_t take = (rec.len <= remaining) ? rec.len : (size_t)remaining;
+        if (take != rec.len) return STM_EINVAL;     /* MVP: only whole-extent reads */
+        size_t got = 0;
+        stm_status rs = stm_fs_read(fs, ds, ino, pos, cur, take, &got);
+        if (rs != STM_OK) return rs;
+        if (got != take) return STM_EIO;
+        cur       += take;
+        pos       += take;
+        remaining -= take;
+    }
+    return STM_OK;
+}
+
+STM_TEST(fs_migrate_to_cold_chunked_basic_roundtrip) {
+    /* Write 64 KiB of pseudo-random plaintext. With small CDC params
+     * (avg=8 KiB), migrate produces N >= 2 cold extents; reading back
+     * via the COLD path returns the original plaintext. */
+    make_tmp("mtc4b_basic");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    STM_ASSERT_OK(mtc4b_install_test_params(fs));
+
+    enum { LEN = 64u * 1024u };
+    uint8_t *plain = malloc(LEN);
+    STM_ASSERT_TRUE(plain != NULL);
+    /* Pseudo-random pattern — diverse bytes so FastCDC's Gear hash
+     * actually finds boundaries (a constant fill yields just one chunk
+     * via the avg-region match). */
+    for (size_t i = 0; i < LEN; i++) {
+        plain[i] = (uint8_t)((i * 31u + (i >> 3) * 17u) & 0xFFu);
+    }
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, LEN));
+
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    /* (1, 1) now has multiple cold extents tiling [0, 64 KiB). */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    mtc4b_extent_count_t cnt = { .ds = 1, .ino = 1 };
+    STM_ASSERT_OK(stm_extent_iter_ds(eidx, 1, mtc4b_count_cb, &cnt));
+    STM_ASSERT_EQ(cnt.hot_count,  0u);
+    STM_ASSERT_TRUE(cnt.cold_count >= 2u);
+
+    /* CAS index has at least 1 entry (could be < cold_count if intra-
+     * file dedup hit). */
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    size_t n_cas = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n_cas));
+    STM_ASSERT_TRUE(n_cas >= 1u);
+    STM_ASSERT_TRUE(n_cas <= cnt.cold_count);
+
+    /* Read back the full 64 KiB through the COLD path via per-extent
+     * iteration (stm_fs_read is single-extent MVP). */
+    uint8_t *out = calloc(1, LEN);
+    STM_ASSERT_TRUE(out != NULL);
+    STM_ASSERT_OK(mtc4b_read_full(fs, 1, 1, 0, out, LEN));
+    STM_ASSERT_MEM_EQ(plain, out, LEN);
+
+    free(out);
+    free(plain);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_migrate_to_cold_chunked_intra_file_dedup) {
+    /* Write 64 KiB of plaintext where the first 32 KiB is identical to
+     * the second 32 KiB. After chunking + 4-KiB rounding, AT LEAST ONE
+     * chunk in each half should be byte-identical to its counterpart
+     * → CAS count < cold_extent count. */
+    make_tmp("mtc4b_intra");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    STM_ASSERT_OK(mtc4b_install_test_params(fs));
+
+    enum { HALF = 32u * 1024u, LEN = 2u * HALF };
+    uint8_t *plain = malloc(LEN);
+    STM_ASSERT_TRUE(plain != NULL);
+    for (size_t i = 0; i < HALF; i++) {
+        plain[i] = (uint8_t)((i * 13u + 7u) & 0xFFu);
+    }
+    memcpy(plain + HALF, plain, HALF);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, LEN));
+
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    mtc4b_extent_count_t cnt = { .ds = 1, .ino = 1 };
+    STM_ASSERT_OK(stm_extent_iter_ds(eidx, 1, mtc4b_count_cb, &cnt));
+    STM_ASSERT_TRUE(cnt.cold_count >= 2u);
+
+    /* CAS dedup: at least one chunk from the first half matches one
+     * from the second → strict subset of cold_count. */
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    size_t n_cas = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n_cas));
+    STM_ASSERT_TRUE(n_cas < cnt.cold_count);
+
+    /* Round-trip the plaintext per-extent to confirm read path works
+     * across the deduped chunks. */
+    uint8_t *out = calloc(1, LEN);
+    STM_ASSERT_TRUE(out != NULL);
+    STM_ASSERT_OK(mtc4b_read_full(fs, 1, 1, 0, out, LEN));
+    STM_ASSERT_MEM_EQ(plain, out, LEN);
+
+    free(out);
+    free(plain);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_migrate_to_cold_chunked_persists_across_mount) {
+    /* Chunked migrate → commit → unmount → remount → all chunks survive
+     * + read back. CDC params are not persisted, but the cold extents +
+     * CAS entries are. Reads through the COLD path use the persisted
+     * `(content_hash, paddrs, length)` tuple — no CDC needed at read
+     * time. */
+    make_tmp("mtc4b_persist");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    STM_ASSERT_OK(mtc4b_install_test_params(fs));
+
+    enum { LEN = 64u * 1024u };
+    uint8_t *plain = malloc(LEN);
+    STM_ASSERT_TRUE(plain != NULL);
+    for (size_t i = 0; i < LEN; i++) {
+        plain[i] = (uint8_t)((i * 23u + (i >> 5) * 11u) & 0xFFu);
+    }
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, LEN));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    /* Capture pre-remount cold extent + CAS counts. */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    mtc4b_extent_count_t cnt_before = { .ds = 1, .ino = 1 };
+    STM_ASSERT_OK(stm_extent_iter_ds(eidx, 1, mtc4b_count_cb, &cnt_before));
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    size_t n_cas_before = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n_cas_before));
+    STM_ASSERT_TRUE(cnt_before.cold_count >= 2u);
+
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    /* Remount + verify counts + plaintext. */
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    sync = stm_fs_sync_for_test(fs);
+    eidx = stm_sync_extent_index(sync);
+    cas  = stm_sync_cas_index(sync);
+    mtc4b_extent_count_t cnt_after = { .ds = 1, .ino = 1 };
+    STM_ASSERT_OK(stm_extent_iter_ds(eidx, 1, mtc4b_count_cb, &cnt_after));
+    STM_ASSERT_EQ(cnt_after.hot_count,  0u);
+    STM_ASSERT_EQ(cnt_after.cold_count, cnt_before.cold_count);
+    size_t n_cas_after = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n_cas_after));
+    STM_ASSERT_EQ(n_cas_after, n_cas_before);
+
+    uint8_t *out = calloc(1, LEN);
+    STM_ASSERT_TRUE(out != NULL);
+    STM_ASSERT_OK(mtc4b_read_full(fs, 1, 1, 0, out, LEN));
+    STM_ASSERT_MEM_EQ(plain, out, LEN);
+
+    free(out);
+    free(plain);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_migrate_to_cold_chunked_full_rehydrate_clears_cas) {
+    /* Chunked migrate → overwrite the entire range with new content →
+     * every cold chunk derefs (refcount → 0) → auto-GC at next commit
+     * reclaims them all → CAS count == 0. */
+    make_tmp("mtc4b_full_rehydrate");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    STM_ASSERT_OK(mtc4b_install_test_params(fs));
+
+    enum { LEN = 64u * 1024u };
+    uint8_t *plain = malloc(LEN);
+    uint8_t *plain2 = malloc(LEN);
+    STM_ASSERT_TRUE(plain != NULL && plain2 != NULL);
+    for (size_t i = 0; i < LEN; i++) {
+        plain[i]  = (uint8_t)((i * 19u + 5u) & 0xFFu);
+        plain2[i] = (uint8_t)((i * 29u + 13u) & 0xFFu);
+    }
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, LEN));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    size_t n_after_migrate = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n_after_migrate));
+    STM_ASSERT_TRUE(n_after_migrate >= 1u);
+
+    /* Overwrite the entire range. Each cold chunk overlapping the write
+     * target is captured by `cold_overlap_cb` and dereffed
+     * post-extent_overwrite. */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain2, LEN));
+
+    /* Auto-GC fires at sync_commit — all dereffed-to-zero entries reclaimed. */
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    size_t n_after_rehydrate = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n_after_rehydrate));
+    STM_ASSERT_EQ(n_after_rehydrate, (size_t)0);
+
+    /* Read back: hot extent now holds plain2. */
+    uint8_t *out = calloc(1, LEN);
+    STM_ASSERT_TRUE(out != NULL);
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, LEN, &got));
+    STM_ASSERT_EQ(got, (size_t)LEN);
+    STM_ASSERT_MEM_EQ(plain2, out, LEN);
+
+    free(out);
+    free(plain);
+    free(plain2);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_migrate_to_cold_chunked_cross_file_dedup) {
+    /* Two files written with IDENTICAL plaintext → after chunked migrate
+     * each, the CAS index has exactly one entry per UNIQUE chunk hash
+     * across the union of both files. Each entry's refcount = 2 (each
+     * chunk shared between the two files). */
+    make_tmp("mtc4b_cross");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    STM_ASSERT_OK(mtc4b_install_test_params(fs));
+
+    enum { LEN = 64u * 1024u };
+    uint8_t *plain = malloc(LEN);
+    STM_ASSERT_TRUE(plain != NULL);
+    for (size_t i = 0; i < LEN; i++) {
+        plain[i] = (uint8_t)((i * 41u + 23u) & 0xFFu);
+    }
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, LEN));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 2, 0, plain, LEN));
+
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+    /* CAS count after first migrate: equals chunk count for ino=1. */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    size_t n_after_one = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n_after_one));
+
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 2));
+    /* Cross-file dedup: ino=2's chunks ALL hit existing CAS entries
+     * (same plaintext → same hashes) → CAS count UNCHANGED, refcount
+     * doubled across the board. */
+    size_t n_after_both = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n_after_both));
+    STM_ASSERT_EQ(n_after_both, n_after_one);
+
+    /* Round-trip both files via per-extent reads. */
+    uint8_t *out_a = calloc(1, LEN);
+    uint8_t *out_b = calloc(1, LEN);
+    STM_ASSERT_TRUE(out_a != NULL && out_b != NULL);
+    STM_ASSERT_OK(mtc4b_read_full(fs, 1, 1, 0, out_a, LEN));
+    STM_ASSERT_OK(mtc4b_read_full(fs, 1, 2, 0, out_b, LEN));
+    STM_ASSERT_MEM_EQ(plain, out_a, LEN);
+    STM_ASSERT_MEM_EQ(plain, out_b, LEN);
+
+    free(out_a);
+    free(out_b);
+    free(plain);
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
     unlink(g_key_path);

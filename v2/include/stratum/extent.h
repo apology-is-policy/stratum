@@ -590,6 +590,89 @@ stm_status stm_extent_migrate_to_cold(stm_extent_index *idx,
                                          uint8_t  *out_n_replicas);
 
 /*
+ * Per-chunk descriptor for `stm_extent_migrate_to_cold_chunked` (P7-CAS-4b).
+ *
+ * Each chunk represents one cold-extent record that the chunked-migrate
+ * inserts atomically alongside the drop of the source HOT extent. The
+ * chunks must tile the source range [src_off, src_off + src_len) exactly:
+ *   - chunks[0].off == src_off
+ *   - for i > 0: chunks[i].off == chunks[i-1].off + chunks[i-1].len
+ *   - chunks[n-1].off + chunks[n-1].len == src_off + src_len
+ *   - all chunks[i].len > 0
+ *   - all chunks[i].content_hash non-zero (zero is the sentinel)
+ *
+ * Composes cas.tla::ChunkedMigrateToColdK2 (and its K-fold generalization
+ * by induction on chunk count). The AEAD AD on each chunk's CAS chunk is
+ * stm_ad_cas(pool_uuid, content_hash) — independent per chunk.
+ */
+typedef struct {
+    uint64_t off;                                   /* absolute file offset */
+    uint64_t len;                                   /* > 0, in bytes */
+    uint8_t  content_hash[STM_EXTENT_HASH_LEN];     /* BLAKE3-256 of chunk plaintext */
+} stm_extent_cold_chunk;
+
+/*
+ * Atomically replace the source HOT extent at (ds, ino, src_off, src_len)
+ * with `n_chunks` COLD extent records tiling the same byte range.
+ * P7-CAS-4b — the FastCDC-driven extension of `stm_extent_migrate_to_cold`.
+ *
+ * Behavior:
+ *   - Find the matching HOT extent at (ds, ino, src_off). Verify
+ *     existence, kind=HOT, len=src_len. Capture the dropped paddrs.
+ *   - Pre-grow records[] capacity to fit n_chunks-1 additional records.
+ *     If realloc fails, return STM_ENOMEM (no state change).
+ *   - In-place overwrite the src slot with chunks[0] as a COLD record;
+ *     append chunks[1..n_chunks-1] as additional COLD records.
+ *   - Each chunk's record fields:
+ *       (ds, ino, off, len) — from chunks[i].
+ *       kind = COLD; n_replicas = 0; paddrs = zeros.
+ *       content_hash = chunks[i].content_hash.
+ *       gen = src_gen; key_id = src_key_id (inherited from the source
+ *         HOT extent).
+ *       origin_dataset_id = src_origin_dataset_id; origin_ino =
+ *         src_origin_ino. origin_off = src_origin_off + (chunks[i].off
+ *         - src_off) — preserving origin chains across chunked migrate.
+ *       link_gen = link_gen (current_gen of the migrate operation).
+ *
+ * Atomicity: extent_idx.lock is held across all mutations. NoOverlap-
+ * WithinIno is preserved by the tile property — chunks pairwise disjoint
+ * by construction (precondition checks) and other extents in (ds, ino)
+ * either don't overlap src's range (already true pre-call) or are
+ * exactly src (being replaced atomically).
+ *
+ * Refuses with STM_EINVAL if:
+ *   - idx, chunks NULL OR n_chunks == 0.
+ *   - dataset_id == 0, ino == 0, src_origin_dataset_id == 0,
+ *     src_origin_ino == 0, src_len == 0, any chunks[i].len == 0.
+ *   - Chunks don't tile [src_off, src_off+src_len) exactly.
+ *   - Any chunk's content_hash is all-zero.
+ *   - src_gen > current_txg, link_gen > current_txg, src_origin_off
+ *     overflows.
+ *   - n_chunks == 1 (callers should use stm_extent_migrate_to_cold for
+ *     the K=1 case).
+ *
+ * Refuses STM_ENOENT if no HOT extent exists at (ds, ino, src_off).
+ * STM_ECORRUPT if the matching record's n_replicas is out of bounds.
+ *
+ * Returns STM_OK with out_paddrs[0..*out_n_replicas) filled with the
+ * dropped HOT replicas. Caller routes each through
+ * sync_drop_paddr_locked.
+ */
+STM_MUST_USE
+stm_status stm_extent_migrate_to_cold_chunked(
+        stm_extent_index *idx,
+        uint64_t dataset_id, uint64_t ino,
+        uint64_t src_off, uint64_t src_len,
+        const stm_extent_cold_chunk *chunks, size_t n_chunks,
+        uint64_t src_gen, uint64_t src_key_id,
+        uint64_t src_origin_dataset_id,
+        uint64_t src_origin_ino,
+        uint64_t src_origin_off,
+        uint64_t link_gen,
+        uint64_t out_paddrs[STM_EXTENT_MAX_REPLICAS],
+        uint8_t  *out_n_replicas);
+
+/*
  * Look up the live extent of (ds, ino) covering byte offset `off`.
  * On STM_OK, *out_extent is filled. STM_ENOENT if `off` falls in a
  * hole (no extent covers it). STM_EINVAL on bad args.

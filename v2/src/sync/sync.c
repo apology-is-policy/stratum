@@ -36,6 +36,7 @@
 #include <stratum/block.h>
 #include <stratum/crypto.h>
 #include <stratum/cas.h>
+#include <stratum/cdc.h>
 #include <stratum/dataset.h>
 #include <stratum/extent.h>
 #include <stratum/hash.h>
@@ -47,6 +48,9 @@
 #include <stratum/scrub.h>
 #include <stratum/snapshot.h>
 #include <stratum/super.h>
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+#include <stratum/sync_testing.h>
+#endif
 
 #include <pthread.h>
 #include <stdio.h>
@@ -256,6 +260,18 @@ struct stm_sync {
      * migration / rehydration paths are a follow-on chunk; this
      * lifecycle wiring + persistence layer is the foundation. */
     stm_cas_index      *cas_idx;
+
+    /* P7-CAS-4b: FastCDC chunker for the cold-tier migration path. The
+     * chunker is read-only after init (gear[256] table + params); safe
+     * to share across threads. Initialized at sync_create and
+     * sync_open with `stm_cdc_default_params` (8 MiB avg / 2 MiB min /
+     * 32 MiB max, ARCH §6.9.4). Tests override via the
+     * `<stratum/sync_testing.h>` test-only seam to use small params
+     * (e.g., 16 KiB avg) that exercise multi-chunk migrate on the MVP
+     * 128 KiB recordsize cap. CDC params are not persisted on disk
+     * (stateless transformation: same plaintext + same params → same
+     * boundaries). */
+    stm_cdc            cdc;
 
     /* Durable mirror of ub_main_root / ub_snap_root state, last-
      * committed. Updated on successful sync_commit; consumed by
@@ -950,6 +966,18 @@ static stm_sync *sync_new(stm_pool *p, stm_alloc *a)
      * MVP). Multi-device P5-3+ will generalize when alloc fans out. */
     s->device_uuid[0] = d0->uuid[0];
     s->device_uuid[1] = d0->uuid[1];
+
+    /* P7-CAS-4b: initialize the FastCDC chunker with ARCH §6.9.4
+     * defaults (8 MiB avg / 2 MiB min / 32 MiB max). Tests override
+     * via the test-only seam. CDC params are not persisted on disk,
+     * so the same defaults init at create AND every open. */
+    stm_cdc_params cdc_params;
+    stm_cdc_default_params(&cdc_params);
+    if (stm_cdc_init(&s->cdc, &cdc_params) != STM_OK) {
+        pthread_mutex_destroy(&s->lock);
+        free(s);
+        return NULL;
+    }
     return s;
 }
 
@@ -3927,6 +3955,25 @@ stm_cas_index *stm_sync_cas_index(stm_sync *s)
     return s ? s->cas_idx : NULL;
 }
 
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+/* P7-CAS-4b: test-only override of the FastCDC chunker parameters.
+ * See <stratum/sync_testing.h> for the contract. Validates `params`
+ * via stm_cdc_init (same constraints as the public init). Holds
+ * s->lock to serialize with concurrent migrate calls. */
+stm_status stm_sync_set_cdc_params_for_test(stm_sync *s,
+                                              const stm_cdc_params *params)
+{
+    if (!s || !params) return STM_EINVAL;
+    stm_cdc tmp;
+    stm_status is = stm_cdc_init(&tmp, params);
+    if (is != STM_OK) return is;
+    pthread_mutex_lock(&s->lock);
+    s->cdc = tmp;
+    pthread_mutex_unlock(&s->lock);
+    return STM_OK;
+}
+#endif /* STRATUM_BUILD_TESTING_HOOKS */
+
 /* ========================================================================= */
 /* P7-4 — POSIX-shape extent write/read with full COW routing.                */
 /* ========================================================================= */
@@ -5260,51 +5307,84 @@ static bool migrate_collect_cb(const stm_extent_record *e, void *cx) {
     return true;
 }
 
-/* Migrate a single HOT extent E to COLD. Caller holds s->lock + has
- * passed wedged/RO guards. On failure, any reserved paddrs / inserted
- * CAS entries are rolled back (bumped refcounts decremented; freshly-
- * inserted CAS entries dereffed → auto-GC reclaims at next commit).
+/* P7-CAS-4b: round each FastCDC boundary to the nearest STM_UB_SIZE-
+ * aligned position, dropping boundaries that collapse onto a previous
+ * boundary or that would create a final chunk smaller than STM_UB_SIZE
+ * bytes. The output retains monotonic ordering AND the last entry
+ * equals `total`.
  *
- * `extent_snapshot` is a captured copy from the collect pass; we use
- * its fields directly so we don't need to re-look-up E in the live
- * extent_idx (which would race with our own extent_migrate_to_cold).
+ * The 4-KiB rounding is the simplest reconciliation between FastCDC's
+ * content-defined boundaries and the existing aligned-IO write/read
+ * paths (`stm_sync_write_extent_locked` requires 4-KiB-aligned len for
+ * the rehydrate path; CAS chunk replicas allocate at block granularity).
+ * Sacrifices ~half-block of shift-resistance precision per boundary —
+ * acceptable for the MVP. ARCH §6.9.4 documents 4-KiB-grid as the chunk-
+ * shift resolution.
  *
- * Returns STM_OK on success (E is now COLD; CAS entry holds the
- * chunk). Returns the underlying status on failure with the live
- * state unchanged for this E (other extents already migrated stay
- * migrated). */
-static stm_status migrate_one_extent_locked(stm_sync *s,
-                                              const stm_extent_record *E)
+ * Caller-precondition: `total` is a multiple of STM_UB_SIZE and >= 1.
+ * Returns the number of boundaries in the rounded sequence (>= 1; the
+ * final `total` is always present). */
+static size_t round_chunk_boundaries(size_t *bs, size_t n_raw, size_t total) {
+    /* If FastCDC produced no boundaries (or only the final one), the
+     * whole input is one chunk. */
+    if (n_raw == 0 || (n_raw == 1 && bs[0] == total)) {
+        bs[0] = total;
+        return 1;
+    }
+    size_t out = 0;
+    size_t prev = 0;
+    /* Process every boundary except (presumed) the final one which
+     * equals total. */
+    for (size_t i = 0; i < n_raw; i++) {
+        size_t b = bs[i];
+        if (b >= total) break;       /* defensive — shouldn't happen */
+        /* Round to nearest STM_UB_SIZE grid. */
+        size_t aligned = (b + STM_UB_SIZE / 2u) & ~((size_t)STM_UB_SIZE - 1u);
+        if (aligned <= prev) continue;
+        if (total - aligned < STM_UB_SIZE) continue;
+        bs[out++] = aligned;
+        prev = aligned;
+    }
+    bs[out++] = total;
+    return out;
+}
+
+/* P7-CAS-4b: pre-flight one chunk's CAS-side state — BLAKE3 + CAS
+ * lookup-or-insert (with paddr reserve + AEAD-encrypt+write +
+ * stm_cas_insert on miss; stm_cas_ref on hit). Caller holds s->lock +
+ * has passed wedged/RO guards.
+ *
+ * On STM_OK:
+ *   - out_hash[0..STM_CAS_HASH_LEN) holds BLAKE3-256 of (plain, plain_len).
+ *   - Either *out_cas_inserted = true (CAS-miss; this call inserted a
+ *     fresh entry with refcount=1 and the chunk's ciphertext is on
+ *     fresh allocator-fresh CAS paddrs) OR *out_cas_bumped = true
+ *     (CAS-hit; this call bumped an existing entry's refcount).
+ *   - Caller MUST drive rollback for this chunk via stm_cas_deref on
+ *     out_hash if a SUBSEQUENT step fails (cas_deref undoes the bump
+ *     on hit; drives refcount to 0 on miss → auto-GC reclaims at next
+ *     sync_commit).
+ *
+ * On non-OK return:
+ *   - Output flags are FALSE.
+ *   - Any partial paddr reservations have been freed.
+ *   - No CAS-side state committed for this chunk.
+ *   - Underlying status returned (STM_ENOENT on lookup miss is
+ *     handled internally; surfaced errors are real).
+ */
+static stm_status cas_chunk_intern_locked(
+        stm_sync *s,
+        const void *plain, size_t plain_len,
+        uint8_t out_hash[STM_CAS_HASH_LEN],
+        bool *out_cas_inserted, bool *out_cas_bumped)
 {
-    if (E->kind != STM_EXTENT_KIND_HOT) return STM_EINVAL;
-    if (E->len == 0 || E->len > STM_FS_RECORDSIZE_MAX) return STM_ECORRUPT;
+    *out_cas_inserted = false;
+    *out_cas_bumped   = false;
+    if (!plain || plain_len == 0) return STM_EINVAL;
 
-    /* Step 1: read+decrypt the hot extent's plaintext. Use the lock-
-     * held read helper (E.off is block-aligned for any extent that
-     * went through stm_sync_write_extent's MVP constraints; if a
-     * future write path lands non-aligned extents, this MVP refuses
-     * the migration). */
-    if ((E->off % STM_UB_SIZE) != 0) return STM_EINVAL;
-    void *plain = malloc(E->len);
-    if (!plain) return STM_ENOMEM;
-    size_t got = 0;
-    stm_status rs = stm_sync_read_extent_locked(s, E->dataset_id, E->ino,
-                                                   E->off, plain,
-                                                   E->len, &got);
-    if (rs != STM_OK) {
-        stm_ct_memzero(plain, E->len);
-        free(plain);
-        return rs;
-    }
-    if (got != E->len) {
-        stm_ct_memzero(plain, E->len);
-        free(plain);
-        return STM_EIO;
-    }
-
-    /* Step 2: BLAKE3-hash the plaintext. */
+    /* BLAKE3-hash the chunk's plaintext. */
     stm_blake3_hash hash;
-    stm_blake3(plain, E->len, &hash);
+    stm_blake3(plain, plain_len, &hash);
     /* Reject the all-zero hash defensively. BLAKE3 of any non-empty
      * input is overwhelmingly unlikely to be all-zero (~2^-256), but
      * the CAS index reserves all-zero as a sentinel — surface as
@@ -5314,152 +5394,285 @@ static stm_status migrate_one_extent_locked(stm_sync *s,
     for (size_t i = 0; i < STM_CAS_HASH_LEN; i++) {
         if (hash.bytes[i] != 0) { any_nonzero = true; break; }
     }
-    if (!any_nonzero) {
+    if (!any_nonzero) return STM_ECORRUPT;
+    memcpy(out_hash, hash.bytes, STM_CAS_HASH_LEN);
+
+    /* CAS lookup. */
+    stm_cas_record cas_rec;
+    stm_status ls = stm_cas_lookup(s->cas_idx, out_hash, &cas_rec);
+    bool cas_hit = (ls == STM_OK);
+    if (!cas_hit && ls != STM_ENOENT) return ls;
+
+    if (cas_hit) {
+        stm_status rs = stm_cas_ref(s->cas_idx, out_hash);
+        if (rs != STM_OK) return rs;
+        *out_cas_bumped = true;
+        return STM_OK;
+    }
+
+    /* CAS-miss: reserve fresh paddrs across N devices (per the pool's
+     * redundancy profile, capped at STM_CAS_MAX_REPLICAS). */
+    size_t n_replicas = sync_desired_replica_count_locked(s);
+    if (n_replicas < 1) return STM_EINVAL;
+    if (n_replicas > STM_CAS_MAX_REPLICAS) n_replicas = STM_CAS_MAX_REPLICAS;
+    size_t tag_len = stm_aead_tag_len(STM_AEAD_AEGIS256);
+    if (tag_len == 0) return STM_EINVAL;
+    uint64_t total_bytes = (uint64_t)plain_len + (uint64_t)tag_len;
+    uint64_t nblocks = (total_bytes + STM_UB_SIZE - 1u) / STM_UB_SIZE;
+
+    uint64_t paddrs[STM_CAS_MAX_REPLICAS] = {0};
+    size_t   n_reserved = 0;
+
+    for (size_t i = 0; i < n_replicas; i++) {
+        if (i >= STM_POOL_DEVICES_MAX || s->allocs[i] == NULL) {
+            for (size_t j = 0; j < n_reserved; j++)
+                (void)stm_alloc_free(s->allocs[j], paddrs[j], s->current_gen);
+            return STM_EINVAL;
+        }
+        stm_status as = stm_alloc_reserve(s->allocs[i], nblocks, 0, &paddrs[i]);
+        if (as != STM_OK) {
+            for (size_t j = 0; j < n_reserved; j++)
+                (void)stm_alloc_free(s->allocs[j], paddrs[j], s->current_gen);
+            return as;
+        }
+        n_reserved++;
+    }
+
+    /* Encrypt+write the chunk. */
+    stm_status ws = cas_chunk_encrypt_and_write_locked(
+            s, plain, plain_len, paddrs, n_replicas,
+            s->current_gen, out_hash);
+    if (ws != STM_OK) {
+        for (size_t j = 0; j < n_reserved; j++)
+            (void)stm_alloc_free(s->allocs[j], paddrs[j], s->current_gen);
+        return ws;
+    }
+
+    /* Insert CAS entry. cas_insert validates within-set + cross-
+     * CAS-entry paddr disjointness; HotColdReplicasDisjoint at the
+     * cas-vs-extent boundary is enforced by the allocator-fresh
+     * paddrs we just reserved (closes R49 P2-1). */
+    stm_status is = stm_cas_insert(s->cas_idx, out_hash,
+                                      paddrs, n_replicas,
+                                      plain_len, s->current_gen);
+    if (is != STM_OK) {
+        for (size_t j = 0; j < n_reserved; j++)
+            (void)stm_alloc_free(s->allocs[j], paddrs[j], s->current_gen);
+        return is;
+    }
+    *out_cas_inserted = true;
+    /* paddrs are now CAS-owned. */
+    return STM_OK;
+}
+
+/* Migrate a single HOT extent E to one or more COLD chunks per
+ * FastCDC. Caller holds s->lock + has passed wedged/RO guards. On
+ * failure, any reserved paddrs / inserted CAS entries are rolled back
+ * (bumped refcounts decremented; freshly-inserted CAS entries dereffed
+ * → auto-GC reclaims at next commit).
+ *
+ * `extent_snapshot` is a captured copy from the collect pass; we use
+ * its fields directly so we don't need to re-look-up E in the live
+ * extent_idx (which would race with our own extent_migrate_to_cold).
+ *
+ * Pipeline (P7-CAS-4b):
+ *   1. Read+decrypt E's plaintext.
+ *   2. FastCDC-chunk the plaintext, round boundaries to STM_UB_SIZE.
+ *   3. Per-chunk pre-flight: BLAKE3 + CAS lookup-or-insert.
+ *   4. Atomic hot→colds swap (1-drop + N-insert via the chunked extent
+ *      API; K=1 falls through to the existing single-drop+single-insert
+ *      API).
+ *   5. Drop-route the dropped HOT replicas through
+ *      sync_drop_paddr_locked.
+ *
+ * Default ARCH §6.9.4 CDC params (8 MiB avg / 2 MiB min) yield K=1 for
+ * the MVP recordsize cap (128 KiB) — preserving P7-CAS-2 behavior on
+ * default params. Tests override CDC params via
+ * `<stratum/sync_testing.h>` to exercise multi-chunk migration.
+ *
+ * Returns STM_OK on success (E is now N COLD records; CAS entries hold
+ * each chunk). Returns the underlying status on failure with the live
+ * state unchanged for this E (other extents already migrated stay
+ * migrated). */
+static stm_status migrate_one_extent_locked(stm_sync *s,
+                                              const stm_extent_record *E)
+{
+    if (E->kind != STM_EXTENT_KIND_HOT) return STM_EINVAL;
+    if (E->len == 0 || E->len > STM_FS_RECORDSIZE_MAX) return STM_ECORRUPT;
+    if ((E->off % STM_UB_SIZE) != 0) return STM_EINVAL;
+    if ((E->len % STM_UB_SIZE) != 0) return STM_EINVAL;
+
+    /* Step 1: read+decrypt the hot extent's plaintext. */
+    void *plain = malloc(E->len);
+    if (!plain) return STM_ENOMEM;
+    size_t got = 0;
+    stm_status rs = stm_sync_read_extent_locked(s, E->dataset_id, E->ino,
+                                                   E->off, plain,
+                                                   E->len, &got);
+    if (rs != STM_OK || got != E->len) {
+        stm_status err = (rs != STM_OK) ? rs : STM_EIO;
+        stm_ct_memzero(plain, E->len);
+        free(plain);
+        return err;
+    }
+
+    /* Step 2: FastCDC-chunk + round to STM_UB_SIZE grid. The output
+     * boundaries[] holds end-positions; chunk i = plain[bound[i-1] ..
+     * bound[i]) with bound[-1] = 0.
+     *
+     * Cap = E->len / 256 + 8 — generous upper bound. `stm_cdc_make_params`
+     * enforces avg >= 1024 B → min = avg/4 >= 256 B is the smallest
+     * permitted FastCDC min_size. For E->len = 128 KiB that's 520
+     * entries, ~4 KiB heap — negligible. */
+    size_t cap = (E->len / 256u) + 8u;
+    size_t *boundaries = malloc(cap * sizeof(size_t));
+    if (!boundaries) {
+        stm_ct_memzero(plain, E->len);
+        free(plain);
+        return STM_ENOMEM;
+    }
+    size_t n_raw = stm_cdc_chunk(&s->cdc, (const uint8_t *)plain, E->len,
+                                  boundaries, cap);
+    size_t n_chunks = round_chunk_boundaries(boundaries, n_raw, E->len);
+    /* round_chunk_boundaries always produces >= 1 boundary ending at
+     * total; defensive guard. */
+    if (n_chunks == 0) {
+        free(boundaries);
         stm_ct_memzero(plain, E->len);
         free(plain);
         return STM_ECORRUPT;
     }
 
-    /* Step 3: CAS lookup. */
-    stm_cas_record cas_rec;
-    stm_status ls = stm_cas_lookup(s->cas_idx, hash.bytes, &cas_rec);
-    bool cas_hit = (ls == STM_OK);
-    if (!cas_hit && ls != STM_ENOENT) {
+    /* Per-chunk state for orchestrating pre-flight + rollback. */
+    typedef struct {
+        uint8_t  hash[STM_CAS_HASH_LEN];
+        bool     cas_inserted;
+        bool     cas_bumped;
+    } chunk_intern_state;
+
+    chunk_intern_state *st = calloc(n_chunks, sizeof *st);
+    if (!st) {
+        free(boundaries);
         stm_ct_memzero(plain, E->len);
         free(plain);
-        return ls;
+        return STM_ENOMEM;
     }
 
-    /* Track CAS-side rollback state. */
-    bool         cas_inserted = false;       /* MISS path: we inserted */
-    bool         cas_bumped   = false;       /* HIT  path: we ref'd */
-    uint64_t     cas_paddrs[STM_CAS_MAX_REPLICAS] = {0};
-    size_t       cas_n_paddrs = 0;
-    /* Track allocator-side rollback state. cas_n_reserved tracks how
-     * many of cas_paddrs[] are still allocator-owned (i.e., reserved
-     * but neither committed via cas_insert nor freed in rollback). */
-    size_t       cas_n_reserved = 0;
-
-    /* Step 4: differentiate HIT vs MISS. */
-    if (cas_hit) {
-        stm_status rs2 = stm_cas_ref(s->cas_idx, hash.bytes);
-        if (rs2 != STM_OK) {
-            stm_ct_memzero(plain, E->len);
-            free(plain);
-            return rs2;
-        }
-        cas_bumped = true;
-    } else {
-        /* MISS: reserve fresh paddrs across N devices (per the pool's
-         * redundancy profile, capped at STM_CAS_MAX_REPLICAS). */
-        size_t n_replicas = sync_desired_replica_count_locked(s);
-        if (n_replicas < 1) {
-            stm_ct_memzero(plain, E->len);
-            free(plain);
-            return STM_EINVAL;
-        }
-        if (n_replicas > STM_CAS_MAX_REPLICAS) n_replicas = STM_CAS_MAX_REPLICAS;
-        size_t tag_len = stm_aead_tag_len(STM_AEAD_AEGIS256);
-        if (tag_len == 0) {
-            stm_ct_memzero(plain, E->len);
-            free(plain);
-            return STM_EINVAL;
-        }
-        uint64_t total_bytes = (uint64_t)E->len + (uint64_t)tag_len;
-        uint64_t nblocks = (total_bytes + STM_UB_SIZE - 1u) / STM_UB_SIZE;
-
-        for (size_t i = 0; i < n_replicas; i++) {
-            if (i >= STM_POOL_DEVICES_MAX || s->allocs[i] == NULL) {
-                /* Defensive — sync_desired_replica_count_locked caps
-                 * at n_attached. */
-                for (size_t j = 0; j < cas_n_reserved; j++)
-                    (void)stm_alloc_free(s->allocs[j], cas_paddrs[j],
-                                            s->current_gen);
-                stm_ct_memzero(plain, E->len);
-                free(plain);
-                return STM_EINVAL;
+    /* Step 3: per-chunk pre-flight. Track completed chunks for rollback
+     * if a later step fails. */
+    stm_status pre_rc = STM_OK;
+    size_t completed = 0;
+    {
+        size_t prev = 0;
+        for (size_t i = 0; i < n_chunks; i++) {
+            size_t end = boundaries[i];
+            if (end <= prev || end > E->len) {
+                pre_rc = STM_ECORRUPT;       /* defensive */
+                break;
             }
-            stm_status as = stm_alloc_reserve(s->allocs[i], nblocks, 0,
-                                                 &cas_paddrs[i]);
-            if (as != STM_OK) {
-                for (size_t j = 0; j < cas_n_reserved; j++)
-                    (void)stm_alloc_free(s->allocs[j], cas_paddrs[j],
-                                            s->current_gen);
-                stm_ct_memzero(plain, E->len);
-                free(plain);
-                return as;
+            size_t chunk_len = end - prev;
+            const uint8_t *cp = (const uint8_t *)plain + prev;
+
+            stm_status cs = cas_chunk_intern_locked(s, cp, chunk_len,
+                                                       st[i].hash,
+                                                       &st[i].cas_inserted,
+                                                       &st[i].cas_bumped);
+            if (cs != STM_OK) {
+                pre_rc = cs;
+                break;
             }
-            cas_n_reserved++;
+            completed = i + 1;
+            prev = end;
         }
-        cas_n_paddrs = n_replicas;
+    }
 
-        /* Encrypt+write the chunk. */
-        stm_status ws = cas_chunk_encrypt_and_write_locked(
-                s, plain, E->len, cas_paddrs, cas_n_paddrs,
-                s->current_gen, hash.bytes);
-        if (ws != STM_OK) {
-            for (size_t j = 0; j < cas_n_reserved; j++)
-                (void)stm_alloc_free(s->allocs[j], cas_paddrs[j],
-                                        s->current_gen);
-            stm_ct_memzero(plain, E->len);
-            free(plain);
-            return ws;
+    if (pre_rc != STM_OK) {
+        for (size_t i = 0; i < completed; i++) {
+            if (st[i].cas_inserted || st[i].cas_bumped) {
+                (void)stm_cas_deref(s->cas_idx, st[i].hash);
+            }
         }
-
-        /* Insert CAS entry. cas_insert validates within-set + cross-
-         * CAS-entry paddr disjointness; HotColdReplicasDisjoint at the
-         * cas-vs-extent boundary is enforced by the allocator-fresh
-         * paddrs we just reserved (closes R49 P2-1). */
-        stm_status is = stm_cas_insert(s->cas_idx, hash.bytes,
-                                          cas_paddrs, cas_n_paddrs,
-                                          E->len, s->current_gen);
-        if (is != STM_OK) {
-            for (size_t j = 0; j < cas_n_reserved; j++)
-                (void)stm_alloc_free(s->allocs[j], cas_paddrs[j],
-                                        s->current_gen);
-            stm_ct_memzero(plain, E->len);
-            free(plain);
-            return is;
-        }
-        cas_inserted = true;
-        cas_n_reserved = 0;       /* paddrs now CAS-owned */
+        free(st);
+        free(boundaries);
+        stm_ct_memzero(plain, E->len);
+        free(plain);
+        return pre_rc;
     }
 
     /* Plaintext no longer needed; wipe before extent-tree mutation. */
     stm_ct_memzero(plain, E->len);
     free(plain);
+    plain = NULL;
 
-    /* Step 5: atomic hot→cold swap. The src extent's gen / key_id /
-     * origin_* are inherited so the COLD record's identity matches the
-     * HOT record it replaced (a future rehydrate will allocate fresh
-     * paddrs + a fresh gen, but the COLD-state metadata stamps the
-     * original birth). link_gen advances to current_gen so send
+    /* Step 4: atomic hot→cold(s) swap. K=1 falls through to the single-
+     * drop+single-insert API (P7-CAS-2 / pre-P7-CAS-4b behavior); K>=2
+     * uses the chunked API (P7-CAS-4b). The src extent's gen / key_id /
+     * origin_* are inherited so each COLD record's identity matches the
+     * HOT record it replaced. link_gen advances to current_gen so send
      * filters see this txg's migration as a fresh modification. */
     uint64_t dropped_paddrs[STM_EXTENT_MAX_REPLICAS] = {0};
     uint8_t  n_dropped = 0;
-    stm_status ms = stm_extent_migrate_to_cold(s->extent_idx,
-                                                  E->dataset_id, E->ino,
-                                                  E->off, E->len,
-                                                  hash.bytes,
-                                                  E->gen, E->key_id,
-                                                  E->origin_dataset_id,
-                                                  E->origin_ino,
-                                                  E->origin_off,
-                                                  s->current_gen,
-                                                  dropped_paddrs, &n_dropped);
-    if (ms != STM_OK) {
-        /* Rollback CAS-side state. */
-        if (cas_inserted) {
-            (void)stm_cas_deref(s->cas_idx, hash.bytes);
-            /* refcount → 0; auto-GC at next sync_commit reclaims +
-             * frees paddrs. */
-        } else if (cas_bumped) {
-            (void)stm_cas_deref(s->cas_idx, hash.bytes);
+    stm_status ms = STM_OK;
+
+    if (n_chunks == 1) {
+        ms = stm_extent_migrate_to_cold(s->extent_idx,
+                                            E->dataset_id, E->ino,
+                                            E->off, E->len,
+                                            st[0].hash,
+                                            E->gen, E->key_id,
+                                            E->origin_dataset_id,
+                                            E->origin_ino,
+                                            E->origin_off,
+                                            s->current_gen,
+                                            dropped_paddrs, &n_dropped);
+    } else {
+        stm_extent_cold_chunk *chunks_arr =
+            calloc(n_chunks, sizeof(stm_extent_cold_chunk));
+        if (!chunks_arr) {
+            for (size_t i = 0; i < n_chunks; i++) {
+                if (st[i].cas_inserted || st[i].cas_bumped) {
+                    (void)stm_cas_deref(s->cas_idx, st[i].hash);
+                }
+            }
+            free(st);
+            free(boundaries);
+            return STM_ENOMEM;
         }
+        size_t prev = 0;
+        for (size_t i = 0; i < n_chunks; i++) {
+            chunks_arr[i].off = E->off + prev;
+            chunks_arr[i].len = boundaries[i] - prev;
+            memcpy(chunks_arr[i].content_hash, st[i].hash, STM_CAS_HASH_LEN);
+            prev = boundaries[i];
+        }
+        ms = stm_extent_migrate_to_cold_chunked(s->extent_idx,
+                                                   E->dataset_id, E->ino,
+                                                   E->off, E->len,
+                                                   chunks_arr, n_chunks,
+                                                   E->gen, E->key_id,
+                                                   E->origin_dataset_id,
+                                                   E->origin_ino,
+                                                   E->origin_off,
+                                                   s->current_gen,
+                                                   dropped_paddrs, &n_dropped);
+        free(chunks_arr);
+    }
+
+    if (ms != STM_OK) {
+        for (size_t i = 0; i < n_chunks; i++) {
+            if (st[i].cas_inserted || st[i].cas_bumped) {
+                (void)stm_cas_deref(s->cas_idx, st[i].hash);
+            }
+        }
+        free(st);
+        free(boundaries);
         return ms;
     }
 
-    /* Step 6: drop-route the dropped HOT replicas. Best-effort drain
+    free(st);
+    free(boundaries);
+
+    /* Step 5: drop-route the dropped HOT replicas. Best-effort drain
      * mirrors stm_sync_write_extent_locked / stm_sync_truncate. */
     stm_status drop_err = STM_OK;
     for (uint8_t i = 0; i < n_dropped; i++) {

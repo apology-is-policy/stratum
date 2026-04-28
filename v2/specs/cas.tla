@@ -128,6 +128,30 @@
 (*     the source hot extent's paddrs as the new CAS chunk's paddrs without *)
 (*     re-encrypting on fresh paddrs — same paddr would carry two distinct  *)
 (*     ciphertexts under different ADs.)                                     *)
+(*                                                                           *)
+(* P7-CAS-4b extension: ChunkedMigrateToColdK2.                              *)
+(*                                                                           *)
+(* P7-CAS-4b adds FastCDC sub-chunking to the migration data plane: a       *)
+(* single hot extent E migrates atomically to K cold extents tiling E's     *)
+(* range (each chunk independently CAS-lookup-or-inserted by its own        *)
+(* content_hash). The K=2 specialization captures the new mechanism at the  *)
+(* smallest case that demonstrates "more than one chunk." K=1 remains       *)
+(* covered by the existing MigrateToCold action; K>=3 is captured by        *)
+(* induction (the spec-level invariants compose over chunks — each chunk's  *)
+(* (off, len, hash) tuple individually satisfies the per-chunk constraints  *)
+(* and the chunked-batch atomicity is the spec-level enforcement).          *)
+(*                                                                           *)
+(* Re-uses the existing buggy variants — same correctness concerns apply    *)
+(* per-chunk:                                                                *)
+(*   - BuggyMigrateForgetsRefBump fires RefcountConsistent when c1.hash =   *)
+(*     c2.hash (intra-extent dedup) and the action forgets to bump          *)
+(*     refcount by 2 (or fails to insert with refcount=2 in the CAS-miss    *)
+(*     case).                                                                *)
+(*   - BuggyMigrateWithoutDrop fires NoOverlapWithinIno when E persists     *)
+(*     alongside the new cold extents.                                       *)
+(*   - BuggyMigrateReusesHotPaddr fires HotColdReplicasDisjoint when the    *)
+(*     CAS-miss replica set collides with E's own (now-being-dropped) hot   *)
+(*     replicas.                                                              *)
 (***************************************************************************)
 
 EXTENDS Naturals, FiniteSets
@@ -350,6 +374,7 @@ MigrateToCold(E, h, cas_replicas) ==
                 {NewCASEntry(h, cas_replicas, E.len)}
           /\ used_paddrs' = used_paddrs \union cas_replicas
        \/ /\ h \in LiveCASHashes                  \* CAS-hit
+          /\ EntryAt(h).refcount < MaxRef        \* refuse if at-cap
           /\ cas_entries' =
               IF BuggyMigrateForgetsRefBump
               THEN cas_entries
@@ -361,6 +386,172 @@ MigrateToCold(E, h, cas_replicas) ==
         IF BuggyMigrateWithoutDrop
         THEN hot_extents
         ELSE hot_extents \ {E}
+    /\ UNCHANGED current_txg
+
+(***************************************************************************)
+(* ChunkedMigrateToColdK2 — atomic 1-hot-to-2-cold migrate.                  *)
+(*                                                                           *)
+(* Generalizes MigrateToCold to FastCDC sub-chunking: drop hot extent E,    *)
+(* insert two cold extents (cold1, cold2) tiling E's byte range, and        *)
+(* update CAS entries for the two chunk hashes. The K=2 specialization      *)
+(* captures the smallest case demonstrating "more than one chunk per        *)
+(* source extent." K=1 = MigrateToCold. K>=3 composes by induction in the   *)
+(* C impl.                                                                    *)
+(*                                                                           *)
+(* Parameters:                                                                *)
+(*   E         — hot extent to migrate (must satisfy E.len >= 2).            *)
+(*   len1      — length of chunk 1; chunk 2 gets E.len - len1.               *)
+(*   h1, h2    — content hashes for chunks 1 and 2 respectively. May be     *)
+(*               equal (intra-extent dedup) or distinct.                     *)
+(*   r1        — replicas for chunk 1 (used iff CAS-miss for h1).            *)
+(*   r2        — replicas for chunk 2 (used iff CAS-miss for h2 AND h2/=h1). *)
+(*                                                                           *)
+(* Case structure (h1 vs h2 × hit vs miss):                                  *)
+(*                                                                           *)
+(*   Case A (h1=h2, miss): insert ONE CAS entry with refcount=2.             *)
+(*   Case B (h1=h2, hit):  bump existing entry's refcount BY 2.              *)
+(*   Case C (h1#h2, miss/miss): insert two distinct CAS entries with        *)
+(*                                refcount=1 each; r1 and r2 must be        *)
+(*                                disjoint (CASReplicasDisjoint).            *)
+(*   Case D (h1#h2, miss/hit):   insert h1 + bump h2.                        *)
+(*   Case E (h1#h2, hit/miss):   bump h1 + insert h2.                        *)
+(*   Case F (h1#h2, hit/hit):    bump h1 + bump h2.                          *)
+(*                                                                           *)
+(* The disjunction is encoded via let-bindings + IF/ELSE; the action's     *)
+(* outer atomicity (single transition step) ensures all CAS-side state is   *)
+(* applied together with the cold-extent insertions and the hot extent      *)
+(* drop.                                                                      *)
+(*                                                                           *)
+(* Buggy mode coverage:                                                       *)
+(*   BuggyMigrateForgetsRefBump  — Case B / D / E / F skip the refcount     *)
+(*                                  bump (Case A is unaffected since miss   *)
+(*                                  initializes refcount = 2).               *)
+(*   BuggyMigrateWithoutDrop     — E persists alongside the new colds       *)
+(*                                  (NoOverlapWithinIno fires).              *)
+(*   BuggyMigrateReusesHotPaddr  — r1 (or r2) collides with hot replicas    *)
+(*                                  (HotColdReplicasDisjoint fires).         *)
+(***************************************************************************)
+ChunkedMigrateToColdK2(E, len1, h1, h2, r1, r2) ==
+    /\ E \in hot_extents
+    /\ E.len >= 2
+    /\ len1 \in 1..(E.len - 1)
+    /\ h1 \in Hashes
+    /\ h2 \in Hashes
+    /\ r1 \in ReplicaSets
+    /\ r2 \in ReplicaSets
+    /\ LET len2     == E.len - len1
+           cold1    == [ds      |-> E.ds, ino |-> E.ino,
+                        off     |-> E.off, len |-> len1, hash |-> h1,
+                        gen     |-> current_txg, key_id |-> E.key_id]
+           cold2    == [ds      |-> E.ds, ino |-> E.ino,
+                        off     |-> E.off + len1, len |-> len2, hash |-> h2,
+                        gen     |-> current_txg, key_id |-> E.key_id]
+           same     == h1 = h2
+           h1_hit   == h1 \in LiveCASHashes
+           h2_hit   == h2 \in LiveCASHashes
+           \* MissEntry — fresh entry at hash h with given replicas, length,
+           \* and initial refcount. Used for CAS-miss inserts.
+           MissEntry(h, replicas, length, initial_rc) ==
+               [hash     |-> h,
+                replicas |-> replicas,
+                refcount |-> IF initial_rc <= MaxRef THEN initial_rc ELSE MaxRef,
+                length   |-> length,
+                gen      |-> current_txg]
+           \* BumpedBy(h, k) — existing entry at h with refcount += k,
+           \* clamped at MaxRef.
+           BumpedBy(h, k) ==
+               LET e == EntryAt(h) IN
+               [e EXCEPT !.refcount =
+                    IF e.refcount + k <= MaxRef THEN e.refcount + k ELSE MaxRef]
+       IN
+       \* Refuse if a CAS-hit bump would exceed the MaxRef cap. The clamp
+       \* in BumpedBy is defensive; the precondition prevents reaching it.
+       \* Without this, a chunked-migrate that bumps a near-cap entry by 2
+       \* (same_hash + hit) drives the entry to clamp at MaxRef while
+       \* cold_extents continues to grow → spurious RefcountConsistent
+       \* violation. Mirrors the C impl's STM_OVERFLOW return on
+       \* refcount-overflow at stm_cas_ref.
+       \*
+       \* IF/ELSE (not disjunction) so EntryAt(h) is only evaluated when
+       \* h is a live hit — CHOOSE on an empty set raises a TLC error.
+       /\ IF h1_hit
+          THEN EntryAt(h1).refcount + (IF same THEN 2 ELSE 1) <= MaxRef
+          ELSE TRUE
+       /\ IF h2_hit /\ ~same
+          THEN EntryAt(h2).refcount + 1 <= MaxRef
+          ELSE TRUE
+       \* R53 P3-7: refuse Case A (same_hash + miss) when MaxRef < 2.
+       \* MissEntry's refcount=2 would silently clamp to MaxRef while two
+       \* cold extent records reference the entry → RefcountConsistent
+       \* violation. The C impl never reaches this with MaxRef=UINT32_MAX,
+       \* but the spec must refuse at the action level for any MaxRef config.
+       /\ \/ ~same
+          \/ h1_hit
+          \/ MaxRef >= 2
+       \* Per-chunk replica freshness (skipped under BuggyMigrateReusesHotPaddr,
+       \* which models a CAS-miss reusing a hot paddr — fires
+       \* HotColdReplicasDisjoint).
+       /\ \/ h1_hit
+          \/ BuggyMigrateReusesHotPaddr
+          \/ r1 \cap used_paddrs = {}
+       /\ \/ h2_hit
+          \/ same           \* same hash as h1; r2 ignored
+          \/ BuggyMigrateReusesHotPaddr
+          \/ r2 \cap used_paddrs = {}
+       \* Cross-chunk replica disjointness for miss/miss + distinct hash
+       \* (CASReplicasDisjoint).
+       /\ \/ same
+          \/ h1_hit
+          \/ h2_hit
+          \/ r1 \cap r2 = {}
+       \* CAS-side state transition.
+       /\ cas_entries' =
+            IF same
+            THEN
+                IF h1_hit
+                THEN \* Case B: bump by 2.
+                    IF BuggyMigrateForgetsRefBump
+                    THEN cas_entries
+                    ELSE (cas_entries \ {EntryAt(h1)})
+                         \union {BumpedBy(h1, 2)}
+                ELSE \* Case A: insert with refcount=2.
+                    cas_entries \union
+                        {MissEntry(h1, r1, len1, 2)}
+            ELSE \* h1 # h2: per-chunk handling, then union.
+                LET after_h1 ==
+                        IF h1_hit
+                        THEN IF BuggyMigrateForgetsRefBump
+                             THEN cas_entries
+                             ELSE (cas_entries \ {EntryAt(h1)})
+                                  \union {BumpedBy(h1, 1)}
+                        ELSE cas_entries \union
+                                 {MissEntry(h1, r1, len1, 1)}
+                    \* h2 lookup is in `after_h1` (h1's update may add h2 if
+                    \* h1 missed and h2 exists, but since h1#h2 the h1 update
+                    \* doesn't touch h2's entry).
+                    \* Re-define EntryAt for after_h1 inline.
+                    EntryAt2(h) == CHOOSE e \in after_h1 : e.hash = h
+                    LiveCASHashes2 == { e.hash : e \in after_h1 }
+                    h2_hit2 == h2 \in LiveCASHashes2
+                    BumpedBy2(h, k) ==
+                        LET e == EntryAt2(h) IN
+                        [e EXCEPT !.refcount =
+                             IF e.refcount + k <= MaxRef THEN e.refcount + k ELSE MaxRef]
+                IN  IF h2_hit2
+                    THEN IF BuggyMigrateForgetsRefBump
+                         THEN after_h1
+                         ELSE (after_h1 \ {EntryAt2(h2)})
+                              \union {BumpedBy2(h2, 1)}
+                    ELSE after_h1 \union
+                             {MissEntry(h2, r2, len2, 1)}
+       /\ used_paddrs' = used_paddrs
+                         \union (IF h1_hit THEN {} ELSE r1)
+                         \union (IF same \/ h2_hit THEN {} ELSE r2)
+       /\ cold_extents' = cold_extents \union {cold1, cold2}
+       /\ hot_extents' =
+            IF BuggyMigrateWithoutDrop
+            THEN hot_extents
+            ELSE hot_extents \ {E}
     /\ UNCHANGED current_txg
 
 (***************************************************************************)
@@ -466,6 +657,10 @@ Next ==
                 WriteHot(ds, ino, off, len, replicas, key_id)
     \/ \E E \in hot_extents, h \in Hashes, cas_replicas \in ReplicaSets :
                 MigrateToCold(E, h, cas_replicas)
+    \/ \E E \in hot_extents, len1 \in 1..(MaxFileBlocks - 1),
+            h1 \in Hashes, h2 \in Hashes,
+            r1 \in ReplicaSets, r2 \in ReplicaSets :
+                ChunkedMigrateToColdK2(E, len1, h1, h2, r1, r2)
     \/ \E C \in cold_extents, new_replicas \in ReplicaSets,
             new_key_id \in KeyIds :
                 RehydrateOnWrite(C, new_replicas, new_key_id)

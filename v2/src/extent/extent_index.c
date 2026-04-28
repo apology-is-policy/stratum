@@ -47,6 +47,14 @@
  *                                       AND origin_ino > 0 (P7-16).
  */
 #include <stratum/extent.h>
+#include <stratum/cas.h>
+
+/* R53 P3-5: extent's content_hash field and CAS's hash key MUST share
+ * the same byte length — chunked migrate copies between them via
+ * memcpy(STM_EXTENT_HASH_LEN). If a future revision widens one without
+ * the other, the copy would short-fill or buffer-overflow. */
+_Static_assert(STM_EXTENT_HASH_LEN == STM_CAS_HASH_LEN,
+               "extent + CAS hash lengths must agree (cross-index memcpy)");
 
 #include <stratum/block.h>
 #include <stratum/bootstrap.h>
@@ -56,6 +64,7 @@
 #include <stratum/super.h>
 
 #include <pthread.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -968,6 +977,159 @@ stm_status stm_extent_migrate_to_cold(stm_extent_index *idx,
     idx->records[found] = cold_rec;
     idx->dirty = true;
 
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+/* P7-CAS-4b: 1-hot-to-N-cold chunked migrate. See header for full
+ * contract. */
+stm_status stm_extent_migrate_to_cold_chunked(
+        stm_extent_index *idx,
+        uint64_t dataset_id, uint64_t ino,
+        uint64_t src_off, uint64_t src_len,
+        const stm_extent_cold_chunk *chunks, size_t n_chunks,
+        uint64_t src_gen, uint64_t src_key_id,
+        uint64_t src_origin_dataset_id,
+        uint64_t src_origin_ino,
+        uint64_t src_origin_off,
+        uint64_t link_gen,
+        uint64_t out_paddrs[STM_EXTENT_MAX_REPLICAS],
+        uint8_t  *out_n_replicas) {
+    if (!out_paddrs || !out_n_replicas) return STM_EINVAL;
+    *out_n_replicas = 0;
+    for (size_t k = 0; k < STM_EXTENT_MAX_REPLICAS; k++) out_paddrs[k] = 0;
+
+    if (!idx || !chunks) return STM_EINVAL;
+    if (n_chunks == 0) return STM_EINVAL;
+    if (n_chunks == 1) return STM_EINVAL;       /* K=1 → use single migrate */
+    if (dataset_id == 0 || ino == 0) return STM_EINVAL;
+    if (src_origin_dataset_id == 0 || src_origin_ino == 0) return STM_EINVAL;
+    if (src_len == 0) return STM_EINVAL;
+    if (src_off > UINT64_MAX - src_len) return STM_EOVERFLOW;
+    if (src_origin_off > UINT64_MAX - src_len) return STM_EINVAL;
+
+    /* Pre-validate the tile: chunks contiguous, lens > 0, hashes nonzero,
+     * total spans [src_off, src_off+src_len). */
+    uint64_t cursor = src_off;
+    for (size_t i = 0; i < n_chunks; i++) {
+        const stm_extent_cold_chunk *c = &chunks[i];
+        if (c->len == 0) return STM_EINVAL;
+        if (c->off != cursor) return STM_EINVAL;
+        if (c->off > UINT64_MAX - c->len) return STM_EOVERFLOW;
+        bool any_nonzero = false;
+        for (size_t k = 0; k < STM_EXTENT_HASH_LEN; k++) {
+            if (c->content_hash[k] != 0) { any_nonzero = true; break; }
+        }
+        if (!any_nonzero) return STM_EINVAL;
+        cursor = c->off + c->len;
+    }
+    if (cursor != src_off + src_len) return STM_EINVAL;
+
+    must_lock(&idx->lock);
+
+    if (src_gen  > idx->current_txg) { must_unlock(&idx->lock); return STM_EINVAL; }
+    if (link_gen > idx->current_txg) { must_unlock(&idx->lock); return STM_EINVAL; }
+
+    /* Find the matching HOT extent at (ds, ino, src_off). NoOverlap-
+     * WithinIno guarantees at most one extent matches. */
+    ptrdiff_t found = -1;
+    for (size_t i = 0; i < idx->n_records; i++) {
+        const stm_extent_record *e = &idx->records[i];
+        if (e->dataset_id == dataset_id && e->ino == ino && e->off == src_off) {
+            found = (ptrdiff_t)i;
+            break;
+        }
+    }
+    if (found < 0) {
+        must_unlock(&idx->lock);
+        return STM_ENOENT;
+    }
+    const stm_extent_record src = idx->records[found];
+    if (src.len != src_len) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;            /* partial migrate not modeled */
+    }
+    if (src.kind != STM_EXTENT_KIND_HOT) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;            /* COLD already; caller bug */
+    }
+    if (src.n_replicas < 1 || src.n_replicas > STM_EXTENT_MAX_REPLICAS) {
+        must_unlock(&idx->lock);
+        return STM_ECORRUPT;
+    }
+
+    /* Pre-grow records[] capacity to accommodate n_chunks-1 additional
+     * records (chunk 0 takes the dropped src slot). Growing BEFORE any
+     * mutation guarantees ENOMEM-safety: if realloc fails, the index
+     * is unchanged.
+     *
+     * R53 P3-8: refuse if `n_chunks - 1` would overflow when added to
+     * idx->n_records. n_chunks is bounded by recordsize/STM_UB_SIZE
+     * (= 32 for the 128 KiB cap) in practice; idx->n_records is bounded
+     * by RAM. Defense is belt-and-suspenders against a future relaxation. */
+    if (n_chunks - 1u > SIZE_MAX - idx->n_records) {
+        must_unlock(&idx->lock);
+        return STM_EOVERFLOW;
+    }
+    size_t needed = idx->n_records + (n_chunks - 1);
+    if (needed > idx->cap_records) {
+        size_t new_cap = idx->cap_records == 0 ? 8u : idx->cap_records;
+        while (new_cap < needed) new_cap *= 2u;
+        stm_extent_record *new_buf = realloc(idx->records,
+                                                new_cap * sizeof(stm_extent_record));
+        if (!new_buf) {
+            must_unlock(&idx->lock);
+            return STM_ENOMEM;
+        }
+        idx->records     = new_buf;
+        idx->cap_records = new_cap;
+    }
+
+    /* Capture dropped HOT replicas FIRST (read from src — already
+     * snapshotted above) so the in-place overwrite below cannot lose
+     * them. */
+    *out_n_replicas = src.n_replicas;
+    for (uint8_t r = 0; r < src.n_replicas; r++) {
+        out_paddrs[r] = src.paddrs[r];
+    }
+
+    /* Build chunk i's COLD record. R53 P3-4: use `{0}` for paddrs (C99
+     * zero-fills the rest) so this doesn't silently shorten if
+     * STM_EXTENT_MAX_REPLICAS ever changes. */
+    #define BUILD_COLD(i_)                                                     \
+        ((stm_extent_record){                                                  \
+            .dataset_id        = dataset_id,                                   \
+            .ino               = ino,                                          \
+            .off               = chunks[(i_)].off,                             \
+            .len               = chunks[(i_)].len,                             \
+            .kind              = STM_EXTENT_KIND_COLD,                         \
+            .n_replicas        = 0u,                                           \
+            .gen               = src_gen,                                      \
+            .key_id            = src_key_id,                                   \
+            .origin_dataset_id = src_origin_dataset_id,                        \
+            .origin_ino        = src_origin_ino,                               \
+            .origin_off        = src_origin_off + (chunks[(i_)].off - src_off),\
+            .link_gen          = link_gen,                                     \
+            .paddrs            = {0},                                          \
+            .content_hash      = {0},                                          \
+        })
+
+    /* Chunk 0 takes the dropped src slot (in-place overwrite). */
+    {
+        stm_extent_record c0 = BUILD_COLD(0);
+        memcpy(c0.content_hash, chunks[0].content_hash, STM_EXTENT_HASH_LEN);
+        idx->records[found] = c0;
+    }
+
+    /* Chunks 1..n_chunks-1 append at the end (cardinality grows). */
+    for (size_t i = 1; i < n_chunks; i++) {
+        stm_extent_record ci = BUILD_COLD(i);
+        memcpy(ci.content_hash, chunks[i].content_hash, STM_EXTENT_HASH_LEN);
+        idx->records[idx->n_records++] = ci;
+    }
+    #undef BUILD_COLD
+
+    idx->dirty = true;
     must_unlock(&idx->lock);
     return STM_OK;
 }
