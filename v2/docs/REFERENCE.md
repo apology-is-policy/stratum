@@ -38,8 +38,8 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R60-hash-fixup. Substantive `<P7-CAS-9>` +
-  R60 close `<R60>`.
+- **Tip**: post-R60-hash-fixup. Substantive `f398f7f` +
+  R60 close `501d7dd`.
   **P7-CAS-9 — send/recv with cold extents. Wire-format
   extension: a new `STM_SEND_FLAG_COLD` bit on the EXTENT record
   framing header signals the extended COLD body shape (32-byte

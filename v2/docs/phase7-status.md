@@ -57,7 +57,7 @@ into the CAS tier (which DOES need P6) is a separate concern.
 ## Phase 7 status (overall)
 
 - [x] **P7-CAS-9 send/recv with cold extents** — substantive
-      `<P7-CAS-9>` + R60 close `<R60>` + hash-fixup (this
+      `f398f7f` + R60 close `501d7dd` + hash-fixup (this
       commit). Wire-format extension: new `STM_SEND_FLAG_COLD`
       bit on the EXTENT record framing signals the extended
       COLD body shape (32-byte meta + 32-byte BLAKE3-256
