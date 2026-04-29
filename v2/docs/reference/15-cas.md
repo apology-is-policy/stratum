@@ -738,6 +738,88 @@ extension.
   cadence. A daemon that fires the pass periodically on a
   configurable schedule would close the production gap.
 
+## Send/recv with cold extents (P7-CAS-9)
+
+P7-CAS-9 extends the send/recv wire format to preserve cold
+extents across the protocol. Pre-P7-CAS-9, sending a dataset
+that contained any COLD extent failed at `send_collect_cb` with
+STM_ECORRUPT (the n_replicas < 1 check applied unconditionally,
+and COLD extents legitimately have n_replicas == 0).
+
+Wire format (sender side):
+
+- HOT extents continue to use the existing 32-byte EXTENT body
+  meta (ino + off + len + gen) followed by `len` bytes of
+  plaintext.
+- COLD extents use the extended COLD body shape: 32-byte meta +
+  32-byte BLAKE3-256 content_hash + `len` bytes of plaintext
+  (total 64 + len bytes). The framing-header `flags` field
+  carries `STM_SEND_FLAG_COLD` to distinguish the two shapes.
+- Receiver enforces `STM_SEND_FLAG_KNOWN_MASK`: any flag bit
+  beyond known ones causes STM_ECORRUPT. Protocol-evolution
+  discipline — a future bit shipped by a newer sender to an
+  older receiver gets a hard refusal rather than silent ignore.
+
+Receiver-side application (`stm_sync_recv_cold_extent`):
+
+1. **Hash verify**: BLAKE3-256(received_plain) ==
+   claimed_hash. Mismatch → STM_EBADTAG. Without this verify,
+   a malicious or buggy sender could violate the CAS invariant
+   "hash X stores bytes hashing to X" once the cold record is
+   installed; future readers seeing X would AEAD-decrypt
+   successfully (cipher was valid) but the apparent content X
+   doesn't match the actual stored bytes Y.
+2. **CAS lookup-or-insert** via `cas_chunk_intern_locked`. On
+   hit, bump cas_ref. On miss, reserve fresh paddrs across the
+   pool's redundancy profile, AEAD-encrypt the plaintext under
+   `stm_ad_cas(pool_uuid, content_hash)` + the pool metadata
+   key, write to fresh replicas, insert the CAS entry.
+3. **Insert COLD extent record** at (target_ds, ino, off, len)
+   via `stm_extent_write_cold`. Receiver-side gen / key_id /
+   origin are stamped fresh: `gen = s->current_gen`,
+   `key_id = stm_keyschema_lookup_current(target_ds)` (matches
+   HOT recv's key_id stamping for keyschema-sweep
+   compatibility), `origin = (target_ds, ino, off)` (recv
+   treats every received extent as a fresh local write).
+
+Rollback on failure: if `stm_extent_write_cold` fails after a
+successful `cas_chunk_intern`, the cas-ref or freshly inserted
+entry is deref'd via `stm_cas_deref` so the cas_idx state is
+unchanged on failure.
+
+Sender-side decryption: the `send_extent_meta` struct extended
+with `kind + content_hash + cas_paddrs + cas_gen`. At
+send_init, after `stm_extent_iter_ds` collects the dataset's
+extents, a follow-up pass walks every captured COLD extent and
+resolves its CAS chunk paddrs via `stm_cas_lookup` (the cas_idx
+lookup is done OUTSIDE the extent_iter to avoid nesting cas_idx
+under extent_idx; cleanest order is per-call acquire/release
+of cas_idx.lock). The chunk's paddrs and gen are stable across
+the send because every captured COLD extent's chunk has
+refcount ≥ 1 — auto-GC sweeps only reclaim refcount=0 entries.
+
+A new helper `read_decrypt_cold_chunk_plaintext` mirrors the
+HOT path's `read_decrypt_extent_plaintext` shape but uses the
+pool metadata key + `stm_ad_cas` (binds to pool_uuid +
+content_hash) + canonical CAS nonce (paddrs[0] || cas_gen ||
+pool_uuid). Replica fallback: walks every CAS replica until
+one decrypts cleanly, mirroring `stm_sync_read_extent_locked`.
+
+Wire-on-the-wire dedup is NOT preserved (the chunk's plaintext
+is sent inline per-extent; two cold extents referencing the
+same hash send the plaintext twice). Storage-at-rest dedup IS
+preserved on the target — two such extents collapse to one CAS
+entry refcount=2 via the lookup-or-insert path. A future
+chunk could add an "out-of-band chunk store" wire shape that
+sends each unique chunk once + extent records reference by
+hash, but the v1 trade favors simplicity.
+
+Composition: pure caller of `cas_chunk_intern_locked` +
+`stm_extent_write_cold`. `cas.tla::MigrateToCold`'s invariants
+(`HotColdReplicasDisjoint`, `CASReplicasDisjoint`) preserved by
+the allocator-fresh paddrs + cas_insert runtime check. No spec
+extension required.
+
 ## Cold-extent reflink (P7-CAS-3)
 
 `stm_sync_reflink` accepts source files containing COLD extents (was

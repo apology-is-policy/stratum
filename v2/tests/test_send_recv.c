@@ -606,4 +606,237 @@ STM_TEST(incremental_send_includes_reflink_in_window) {
     testpool_teardown(&tgt);
 }
 
+/* ========================================================================= */
+/* P7-CAS-9: send/recv with cold extents.                                     */
+/* ========================================================================= */
+
+#include <stratum/cas.h>
+
+STM_TEST(p7cas9_cold_extent_roundtrip) {
+    /* Send a dataset whose ino has been migrated to COLD; recv on a
+     * fresh target pool. Verify (1) target's extent index has a COLD
+     * extent at the same coordinates, (2) target's CAS index has one
+     * entry, (3) reading back the file via stm_fs_read returns the
+     * same plaintext. */
+    testpool src; testpool_setup(&src, "p7cas9_cold_rt", POOL_UUID_SRC);
+    testpool tgt; testpool_setup(&tgt, "p7cas9_cold_rt_tgt", POOL_UUID_TGT);
+
+    /* Source: write 4 KiB, migrate to cold. */
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)((i * 13u + 7u) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(src.fs, 1, 1));
+
+    /* Source's CAS now has 1 entry. */
+    stm_sync *src_sync = stm_fs_sync_for_test(src.fs);
+    stm_cas_index *src_cas = stm_sync_cas_index(src_sync);
+    size_t n_src_cas = 0;
+    STM_ASSERT_OK(stm_cas_count(src_cas, &n_src_cas));
+    STM_ASSERT_EQ(n_src_cas, (size_t)1);
+
+    /* Send → recv. */
+    stm_send_handle *sh = NULL;
+    STM_ASSERT_OK(stm_send_init(src_sync, 1, 0, 0, &sh));
+    stm_recv_handle *rh = NULL;
+    stm_sync *tgt_sync = stm_fs_sync_for_test(tgt.fs);
+    STM_ASSERT_OK(stm_recv_init(tgt_sync, 1, &rh));
+    STM_ASSERT_OK(pipe_send_to_recv(sh, rh));
+    stm_send_close(sh);
+    stm_recv_close(rh);
+
+    /* Target's CAS has 1 entry (received cold extent triggered an
+     * insert under target's pool metadata key). */
+    stm_cas_index *tgt_cas = stm_sync_cas_index(tgt_sync);
+    size_t n_tgt_cas = 0;
+    STM_ASSERT_OK(stm_cas_count(tgt_cas, &n_tgt_cas));
+    STM_ASSERT_EQ(n_tgt_cas, (size_t)1);
+
+    /* Read-back via stm_fs_read decrypts under target's metadata key
+     * (the COLD-aware read branch in stm_sync_read_extent). */
+    uint8_t out[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_EQ(got, sizeof plain);
+    STM_ASSERT_MEM_EQ(plain, out, sizeof plain);
+
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
+STM_TEST(p7cas9_cold_dedup_preserved_on_target) {
+    /* Two source files with IDENTICAL content, both migrated to COLD;
+     * after send + recv the TARGET pool has ONE CAS entry with
+     * refcount=2 (cold-dedup property preserved across the wire). */
+    testpool src; testpool_setup(&src, "p7cas9_dedup", POOL_UUID_SRC);
+    testpool tgt; testpool_setup(&tgt, "p7cas9_dedup_tgt", POOL_UUID_TGT);
+
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)((i * 23u + 11u) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 2, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(src.fs, 1, 1));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(src.fs, 1, 2));
+
+    stm_sync *src_sync = stm_fs_sync_for_test(src.fs);
+    stm_cas_index *src_cas = stm_sync_cas_index(src_sync);
+    size_t n = 0;
+    STM_ASSERT_OK(stm_cas_count(src_cas, &n));
+    STM_ASSERT_EQ(n, (size_t)1);  /* Source dedup: 1 chunk refcount=2. */
+
+    stm_send_handle *sh = NULL;
+    STM_ASSERT_OK(stm_send_init(src_sync, 1, 0, 0, &sh));
+    stm_recv_handle *rh = NULL;
+    stm_sync *tgt_sync = stm_fs_sync_for_test(tgt.fs);
+    STM_ASSERT_OK(stm_recv_init(tgt_sync, 1, &rh));
+    STM_ASSERT_OK(pipe_send_to_recv(sh, rh));
+    stm_send_close(sh);
+    stm_recv_close(rh);
+
+    /* Target dedup preserved: 1 chunk refcount=2. */
+    stm_cas_index *tgt_cas = stm_sync_cas_index(tgt_sync);
+    size_t n_tgt = 0;
+    STM_ASSERT_OK(stm_cas_count(tgt_cas, &n_tgt));
+    STM_ASSERT_EQ(n_tgt, (size_t)1);
+
+    /* Both target inos read back the same plaintext. */
+    uint8_t a[4096] = {0}, b[4096] = {0};
+    size_t got_a = 0, got_b = 0;
+    STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 1, 0, a, sizeof a, &got_a));
+    STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 2, 0, b, sizeof b, &got_b));
+    STM_ASSERT_EQ(got_a, sizeof plain);
+    STM_ASSERT_EQ(got_b, sizeof plain);
+    STM_ASSERT_MEM_EQ(plain, a, sizeof plain);
+    STM_ASSERT_MEM_EQ(plain, b, sizeof plain);
+
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
+STM_TEST(p7cas9_mixed_hot_cold_roundtrip) {
+    /* Mixed dataset: ino 1 HOT, ino 2 COLD. Send → recv. Target has
+     * the right shape: ino 1 HOT, ino 2 COLD. Reads back fine. */
+    testpool src; testpool_setup(&src, "p7cas9_mixed", POOL_UUID_SRC);
+    testpool tgt; testpool_setup(&tgt, "p7cas9_mixed_tgt", POOL_UUID_TGT);
+
+    uint8_t hot[4096], cold[4096];
+    for (size_t i = 0; i < 4096u; i++) {
+        hot[i]  = (uint8_t)((i * 5u  + 1u) & 0xFFu);
+        cold[i] = (uint8_t)((i * 17u + 3u) & 0xFFu);
+    }
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, hot, sizeof hot));
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 2, 0, cold, sizeof cold));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(src.fs, 1, 2));
+
+    stm_sync *src_sync = stm_fs_sync_for_test(src.fs);
+    stm_send_handle *sh = NULL;
+    STM_ASSERT_OK(stm_send_init(src_sync, 1, 0, 0, &sh));
+
+    stm_sync *tgt_sync = stm_fs_sync_for_test(tgt.fs);
+    stm_recv_handle *rh = NULL;
+    STM_ASSERT_OK(stm_recv_init(tgt_sync, 1, &rh));
+    STM_ASSERT_OK(pipe_send_to_recv(sh, rh));
+    stm_send_close(sh);
+    stm_recv_close(rh);
+
+    /* Target: 1 CAS entry (only ino 2's cold record). */
+    stm_cas_index *tgt_cas = stm_sync_cas_index(tgt_sync);
+    size_t n_tgt = 0;
+    STM_ASSERT_OK(stm_cas_count(tgt_cas, &n_tgt));
+    STM_ASSERT_EQ(n_tgt, (size_t)1);
+
+    uint8_t out_hot[4096] = {0}, out_cold[4096] = {0};
+    size_t got_h = 0, got_c = 0;
+    STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 1, 0, out_hot,  sizeof out_hot,  &got_h));
+    STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 2, 0, out_cold, sizeof out_cold, &got_c));
+    STM_ASSERT_MEM_EQ(hot,  out_hot,  sizeof hot);
+    STM_ASSERT_MEM_EQ(cold, out_cold, sizeof cold);
+
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
+STM_TEST(p7cas9_recv_rejects_unknown_flag_bit) {
+    /* Receiver refuses an unknown flag bit per the strict
+     * STM_SEND_FLAG_KNOWN_MASK enforcement (protocol-evolution
+     * discipline). Hand-craft a HEADER record with an unknown bit. */
+    testpool tgt; testpool_setup(&tgt, "p7cas9_unknown_flag", POOL_UUID_TGT);
+    stm_sync *tgt_sync = stm_fs_sync_for_test(tgt.fs);
+    stm_recv_handle *rh = NULL;
+    STM_ASSERT_OK(stm_recv_init(tgt_sync, 1, &rh));
+
+    uint8_t rec[STM_SEND_RECORD_HDR_LEN + STM_SEND_HEADER_BODY_LEN] = {0};
+    /* type = HEADER */
+    rec[0] = 0x01;
+    /* flags = 0x80000000 (unknown bit) */
+    rec[7] = 0x80;
+    /* body_len = 52 */
+    rec[8] = 52;
+    STM_ASSERT_ERR(stm_recv_apply(rh, rec, sizeof rec), STM_ECORRUPT);
+
+    stm_recv_close(rh);
+    testpool_teardown(&tgt);
+}
+
+STM_TEST(p7cas9_recv_cold_rejects_hash_mismatch) {
+    /* Build a COLD wire record manually with a hash that doesn't
+     * match the plaintext. Receiver must STM_EBADTAG. */
+    testpool tgt; testpool_setup(&tgt, "p7cas9_hash_mismatch", POOL_UUID_TGT);
+    stm_sync *tgt_sync = stm_fs_sync_for_test(tgt.fs);
+
+    /* First send a valid HEADER through recv to put it in
+     * RECV_BODY state. Easiest way: do a real send-init/next on a
+     * fresh source pool and feed only the header through. */
+    testpool src; testpool_setup(&src, "p7cas9_mismatch_src", POOL_UUID_SRC);
+    stm_sync *src_sync = stm_fs_sync_for_test(src.fs);
+    stm_send_handle *sh = NULL;
+    STM_ASSERT_OK(stm_send_init(src_sync, 1, 0, 0, &sh));
+
+    stm_recv_handle *rh = NULL;
+    STM_ASSERT_OK(stm_recv_init(tgt_sync, 1, &rh));
+
+    /* Pipe just the HEADER record. */
+    uint8_t hbuf[256];
+    size_t out_len = 0, needed = 0;
+    STM_ASSERT_OK(stm_send_next(sh, hbuf, sizeof hbuf, &out_len, &needed));
+    STM_ASSERT_OK(stm_recv_apply(rh, hbuf, out_len));
+
+    /* Now hand-craft a COLD EXTENT record with a wrong hash. */
+    uint8_t plain[4096];
+    memset(plain, 0xCC, sizeof plain);
+    uint8_t wrong_hash[32];
+    memset(wrong_hash, 0x42, sizeof wrong_hash);  /* Definitely not BLAKE3(plain). */
+
+    size_t total = STM_SEND_RECORD_HDR_LEN + STM_SEND_COLD_EXTENT_META_LEN
+                       + sizeof plain;
+    uint8_t *rec = malloc(total);
+    STM_ASSERT(rec != NULL);
+    memset(rec, 0, total);
+    /* Framing: type=EXTENT, flags=COLD, body_len = COLD_EXTENT_META + plain. */
+    rec[0] = 0x02;  /* type = EXTENT */
+    rec[4] = 0x01;  /* flags = STM_SEND_FLAG_COLD */
+    uint64_t body_len = STM_SEND_COLD_EXTENT_META_LEN + sizeof plain;
+    for (int i = 0; i < 8; i++) rec[8 + i] = (uint8_t)(body_len >> (8 * i));
+    /* Body: ino=1 (le64 at 16) */
+    rec[STM_SEND_RECORD_HDR_LEN + 0] = 1;
+    /* off=0 (already zero) */
+    /* len=4096 (le64 at +16) */
+    rec[STM_SEND_RECORD_HDR_LEN + 16] = 0;
+    rec[STM_SEND_RECORD_HDR_LEN + 17] = 0x10;  /* 4096 */
+    /* gen=0 (advisory) */
+    /* content_hash @ +32 */
+    memcpy(rec + STM_SEND_RECORD_HDR_LEN + 32, wrong_hash, 32);
+    /* plaintext @ +64 */
+    memcpy(rec + STM_SEND_RECORD_HDR_LEN + STM_SEND_COLD_EXTENT_META_LEN,
+              plain, sizeof plain);
+
+    /* Recv must reject with STM_EBADTAG. */
+    STM_ASSERT_ERR(stm_recv_apply(rh, rec, total), STM_EBADTAG);
+
+    free(rec);
+    stm_send_close(sh);
+    stm_recv_close(rh);
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
 STM_TEST_MAIN("send_recv")

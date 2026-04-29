@@ -68,18 +68,24 @@ static uint64_t get_le64(const uint8_t *p) {
 
 /* Parse a record's framing header. Returns the body length on
  * success; returns SIZE_MAX on malformed framing (caller treats as
- * STM_ECORRUPT). Output: *out_type set to the record type. */
+ * STM_ECORRUPT). Output: *out_type, *out_flags, *out_body_len. */
 static stm_status parse_record_hdr(const uint8_t *bytes, size_t total_len,
                                       uint32_t *out_type,
+                                      uint32_t *out_flags,
                                       uint64_t *out_body_len)
 {
     if (total_len < STM_SEND_RECORD_HDR_LEN) return STM_ECORRUPT;
     *out_type     = get_le32(bytes + 0);
-    /* flags @ +4 reserved; ignore */
+    *out_flags    = get_le32(bytes + 4);
     *out_body_len = get_le64(bytes + 8);
     if (*out_body_len > SIZE_MAX - STM_SEND_RECORD_HDR_LEN) return STM_ECORRUPT;
     if ((size_t)(*out_body_len) + STM_SEND_RECORD_HDR_LEN != total_len)
         return STM_ECORRUPT;
+    /* P7-CAS-9: refuse unknown flag bits — protocol-evolution
+     * discipline. A future flag bit (e.g. compression, larger
+     * record) shipped by a newer sender to an older receiver
+     * deserves a hard refusal rather than silent ignore. */
+    if ((*out_flags & ~STM_SEND_FLAG_KNOWN_MASK) != 0u) return STM_ECORRUPT;
     return STM_OK;
 }
 
@@ -135,7 +141,8 @@ static stm_status apply_header(stm_recv_handle *h,
 }
 
 static stm_status apply_extent(stm_recv_handle *h,
-                                  const uint8_t *body, uint64_t body_len)
+                                  const uint8_t *body, uint64_t body_len,
+                                  uint32_t flags)
 {
     if (body_len < STM_SEND_EXTENT_META_LEN) return STM_ECORRUPT;
     uint64_t ino = get_le64(body + 0);
@@ -144,16 +151,32 @@ static stm_status apply_extent(stm_recv_handle *h,
     /* gen @ +24 advisory; recv re-stamps with its own current_gen */
     if (ino == 0)  return STM_ECORRUPT;
     if (len == 0)  return STM_ECORRUPT;
-    if (body_len != STM_SEND_EXTENT_META_LEN + len) return STM_ECORRUPT;
 
-    const uint8_t *plain = body + STM_SEND_EXTENT_META_LEN;
-
-    /* Apply via stm_sync_write_extent — handles fan-out to N replicas
-     * + AEAD encrypt under recv's pool key + extent index update. */
-    stm_status ws = stm_sync_write_extent(h->sync,
-                                             h->target_dataset_id, ino,
-                                             off, plain, (size_t)len);
-    if (ws != STM_OK) return ws;
+    bool is_cold = (flags & STM_SEND_FLAG_COLD) != 0u;
+    if (is_cold) {
+        /* P7-CAS-9: COLD extent body = 64 bytes meta + len bytes
+         * plaintext; bytes [32, 64) are the source's BLAKE3-256
+         * content_hash. */
+        if (body_len != STM_SEND_COLD_EXTENT_META_LEN + len) return STM_ECORRUPT;
+        const uint8_t *claimed_hash = body + STM_SEND_EXTENT_META_LEN;
+        const uint8_t *plain        = body + STM_SEND_COLD_EXTENT_META_LEN;
+        stm_status rcs = stm_sync_recv_cold_extent(h->sync,
+                                                      h->target_dataset_id,
+                                                      ino, off, len,
+                                                      claimed_hash,
+                                                      plain, (size_t)len);
+        if (rcs != STM_OK) return rcs;
+    } else {
+        if (body_len != STM_SEND_EXTENT_META_LEN + len) return STM_ECORRUPT;
+        const uint8_t *plain = body + STM_SEND_EXTENT_META_LEN;
+        /* Apply via stm_sync_write_extent — handles fan-out to N
+         * replicas + AEAD encrypt under recv's pool key + extent
+         * index update. */
+        stm_status ws = stm_sync_write_extent(h->sync,
+                                                 h->target_dataset_id, ino,
+                                                 off, plain, (size_t)len);
+        if (ws != STM_OK) return ws;
+    }
 
     h->n_extents_applied++;
     return STM_OK;
@@ -195,8 +218,9 @@ stm_status stm_recv_apply(stm_recv_handle *h,
 
     const uint8_t *p = record_bytes;
     uint32_t type = 0;
+    uint32_t flags = 0;
     uint64_t body_len = 0;
-    stm_status ps = parse_record_hdr(p, record_len, &type, &body_len);
+    stm_status ps = parse_record_hdr(p, record_len, &type, &flags, &body_len);
     if (ps != STM_OK) { h->state = RECV_FAILED; return ps; }
 
     const uint8_t *body = p + STM_SEND_RECORD_HDR_LEN;
@@ -207,6 +231,8 @@ stm_status stm_recv_apply(stm_recv_handle *h,
             h->state = RECV_FAILED;
             return STM_ECORRUPT;
         }
+        /* HEADER flags reserved zero. */
+        if (flags != 0u) { h->state = RECV_FAILED; return STM_ECORRUPT; }
         stm_status as = apply_header(h, body, body_len);
         if (as != STM_OK) { h->state = RECV_FAILED; return as; }
         /* Hash AFTER successful validation so a rejected header
@@ -220,7 +246,7 @@ stm_status stm_recv_apply(stm_recv_handle *h,
             h->state = RECV_FAILED;
             return STM_ECORRUPT;
         }
-        stm_status as = apply_extent(h, body, body_len);
+        stm_status as = apply_extent(h, body, body_len, flags);
         if (as != STM_OK) { h->state = RECV_FAILED; return as; }
         stm_blake3_update(h->hasher, p, record_len);
         return STM_OK;
@@ -230,6 +256,8 @@ stm_status stm_recv_apply(stm_recv_handle *h,
             h->state = RECV_FAILED;
             return STM_ECORRUPT;
         }
+        /* END flags reserved zero. */
+        if (flags != 0u) { h->state = RECV_FAILED; return STM_ECORRUPT; }
         /* csum compares against running hash over PRIOR records only
          * — must NOT update hasher with END's bytes first. */
         stm_status as = apply_end(h, body, body_len);

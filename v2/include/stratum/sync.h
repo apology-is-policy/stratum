@@ -1275,6 +1275,70 @@ stm_status stm_sync_migrate_policy_collect(
         uint64_t *out_inos_visited);
 
 /*
+ * P7-CAS-9: stm_sync_recv_cold_extent — receiver-side cold-extent
+ * application. Used by stm_recv_apply when a wire record carries
+ * STM_SEND_FLAG_COLD: the receiver has the plaintext + the source's
+ * claimed BLAKE3-256 content_hash and needs to install a COLD extent
+ * record on the target.
+ *
+ * Behavior under sync->lock:
+ *   1. Verify BLAKE3-256(plain, plain_len) == claimed_hash. Mismatch
+ *      → STM_EBADTAG. Without this verify, a malicious or buggy
+ *      sender could violate the CAS invariant
+ *      "hash X stores bytes hashing to X" — future readers seeing
+ *      hash X would AEAD-decrypt successfully (cipher was valid)
+ *      but the plaintext-vs-hash binding would be broken at the
+ *      semantic layer.
+ *   2. CAS lookup-or-insert (mirrors stm_sync_migrate_to_cold's
+ *      per-chunk `cas_chunk_intern_locked`). On hit, bump
+ *      cas_ref. On miss, reserve fresh paddrs across the pool's
+ *      redundancy profile, AEAD-encrypt the plaintext under
+ *      `stm_ad_cas(pool_uuid, content_hash)` + the pool metadata
+ *      key, write to the fresh replicas, insert the CAS entry.
+ *   3. Insert a COLD extent record at (target_ds, ino, off, len)
+ *      via stm_extent_write_cold, stamping target's current_gen +
+ *      origin = (target_ds, ino, off) (fresh write — recv treats
+ *      every received extent as a fresh local write semantically).
+ *
+ * On any failure after step 2's potential CAS-insert, the orphaned
+ * cas_ref (or freshly inserted entry with refcount=1) is rolled
+ * back via stm_cas_deref so the cas_idx state is unchanged on
+ * failure.
+ *
+ * Lock posture: takes sync->lock OUTER → cas_idx + alloc + extent
+ * locks INNER (matches stm_sync_migrate_to_cold's posture). Caller
+ * MUST NOT hold sync->lock.
+ *
+ * Refusals:
+ *   - NULL s, NULL plain, NULL claimed_hash (STM_EINVAL).
+ *   - target_dataset_id == 0 OR ino == 0 OR plain_len == 0
+ *     (STM_EINVAL).
+ *   - Wedged or read-only (STM_EWEDGED / STM_EROFS).
+ *   - !s->cas_idx (STM_EINVAL — cas_idx must be initialized).
+ *   - Hash mismatch (STM_EBADTAG).
+ *   - Errors from cas_chunk_intern_locked / stm_extent_write_cold
+ *     bubble up (STM_ENOMEM, STM_ENOSPC, STM_EIO, STM_EEXIST).
+ *
+ * Composition: pure caller of cas_chunk_intern_locked +
+ * stm_extent_write_cold. The hash-verify step is the only new
+ * semantic; everything else mirrors the migrate-to-cold path's
+ * MISS branch. cas.tla::MigrateToCold's invariants
+ * (HotColdReplicasDisjoint, CASReplicasDisjoint) are preserved by
+ * the allocator-fresh paddrs reserved on miss + the cas_insert
+ * runtime check on insert. No spec extension required.
+ */
+STM_MUST_USE
+stm_status stm_sync_recv_cold_extent(
+        stm_sync *s,
+        uint64_t target_dataset_id,
+        uint64_t ino,
+        uint64_t off,
+        uint64_t len,
+        const uint8_t claimed_hash[32],
+        const void *plain,
+        size_t plain_len);
+
+/*
  * P7-5: install the production scrub β verify-callback on `sc`.
  *
  * The cb resolves each `paddr` against `sync`'s extent index via

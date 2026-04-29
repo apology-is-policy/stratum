@@ -5859,6 +5859,134 @@ stm_status stm_sync_migrate_to_cold(stm_sync *s,
     return apply_rc;
 }
 
+/* P7-CAS-9: receiver-side cold-extent application. Called from
+ * stm_recv_apply when a wire record carries STM_SEND_FLAG_COLD.
+ *
+ * The sender computed BLAKE3-256 over the source plaintext at write
+ * time (or at migrate-to-cold time) and placed the hash on the wire
+ * alongside the plaintext. The receiver must:
+ *
+ *   1. Verify BLAKE3-256(received_plain) == claimed_hash. The
+ *      stream-level BLAKE3 csum (END record) protects against
+ *      in-flight tampering of the bytes, but a sender lying about
+ *      the hash would still pass that check while violating the
+ *      CAS invariant "hash X stores bytes hashing to X" once the
+ *      cold record is installed.
+ *
+ *   2. Hand the verified plaintext to cas_chunk_intern_locked
+ *      (which re-hashes and CAS lookup-or-inserts under the
+ *      target's pool metadata key + stm_ad_cas).
+ *
+ *   3. Insert a COLD extent record at (target_ds, ino, off, len).
+ *      Receiver-side gen / key_id / origin are stamped fresh
+ *      (target's current_gen, target dataset's CURRENT key_id,
+ *      origin = (target_ds, ino, off)). Cold-record-decryption
+ *      doesn't depend on key_id (CAS chunks are encrypted under
+ *      the pool metadata key per ARCH §7.6.3); key_id is recorded
+ *      for symmetry with HOT records and to satisfy the keyschema
+ *      sweep's invariant that every live extent's key_id maps to
+ *      a known DEK.
+ *
+ * Rollback on extent_write_cold failure: the cas_chunk_intern's
+ * cas_ref or freshly-inserted entry is deref'd to keep cas_idx
+ * state unchanged. (cas_chunk_intern internally rolls back on
+ * its own failures, so we only need to rollback ON its success
+ * followed by extent_write_cold's failure.)
+ *
+ * Locking mirrors stm_sync_migrate_to_cold's per-extent loop body. */
+stm_status stm_sync_recv_cold_extent(
+        stm_sync *s,
+        uint64_t target_dataset_id,
+        uint64_t ino,
+        uint64_t off,
+        uint64_t len,
+        const uint8_t claimed_hash[32],
+        const void *plain,
+        size_t plain_len)
+{
+    if (!s || !plain || !claimed_hash)         return STM_EINVAL;
+    if (target_dataset_id == 0u || ino == 0u)  return STM_EINVAL;
+    if (plain_len == 0u || len != plain_len)   return STM_EINVAL;
+
+    pthread_mutex_lock(&s->lock);
+    if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
+    if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
+    if (!s->cas_idx)  { pthread_mutex_unlock(&s->lock); return STM_EINVAL;  }
+
+    /* Step 1: verify wire hash against re-hash of received plaintext.
+     * cas_chunk_intern_locked also computes BLAKE3 internally, but
+     * by the time it does the CAS lookup-or-insert it would already
+     * have committed to its own hash; we want to FAIL FAST before
+     * any CAS state mutation if the wire was lying. */
+    {
+        stm_blake3_hash verify;
+        stm_blake3(plain, plain_len, &verify);
+        if (memcmp(verify.bytes, claimed_hash, STM_CAS_HASH_LEN) != 0) {
+            pthread_mutex_unlock(&s->lock);
+            return STM_EBADTAG;
+        }
+    }
+
+    /* Step 2: CAS lookup-or-insert under target's pool metadata
+     * key + stm_ad_cas. cas_chunk_intern_locked rolls back its own
+     * partial state on failure (see its definition). */
+    uint8_t out_hash[STM_CAS_HASH_LEN];
+    bool cas_inserted = false, cas_bumped = false;
+    stm_status cs = cas_chunk_intern_locked(s, plain, plain_len,
+                                              out_hash,
+                                              &cas_inserted, &cas_bumped);
+    if (cs != STM_OK) {
+        pthread_mutex_unlock(&s->lock);
+        return cs;
+    }
+    /* Internal hash MUST match the verified wire hash by transitivity
+     * (we just verified BLAKE3(plain) == claimed_hash; cas_chunk_intern
+     * computes BLAKE3(plain) which equals the same). Defensive
+     * check — a future BLAKE3 impl change that diverges between the
+     * two callsites would silently break the CAS invariant. */
+    if (memcmp(out_hash, claimed_hash, STM_CAS_HASH_LEN) != 0) {
+        /* Rollback the just-completed CAS-state mutation. */
+        (void)stm_cas_deref(s->cas_idx, out_hash);
+        pthread_mutex_unlock(&s->lock);
+        return STM_ECORRUPT;
+    }
+
+    /* Step 3: insert COLD extent record on the target. Receiver-side
+     * gen / origin are stamped fresh; key_id resolves to the target
+     * dataset's CURRENT (matches HOT recv via stm_sync_write_extent
+     * — keeps the keyschema-sweep invariant whole). */
+    uint64_t key_id = 0u;
+    {
+        stm_status ks = stm_keyschema_lookup_current(
+                (const stm_keyschema *)s->keyschema,
+                target_dataset_id, &key_id,
+                /*out_wrapped=*/NULL, /*out_cap=*/0, /*out_len=*/NULL);
+        if (ks != STM_OK) {
+            (void)stm_cas_deref(s->cas_idx, out_hash);
+            pthread_mutex_unlock(&s->lock);
+            return ks;
+        }
+    }
+
+    stm_status ws = stm_extent_write_cold(s->extent_idx,
+                                             target_dataset_id, ino,
+                                             off, len,
+                                             out_hash,
+                                             /*gen=*/s->current_gen,
+                                             /*key_id=*/key_id,
+                                             /*origin_*=*/target_dataset_id,
+                                             ino, off,
+                                             /*link_gen=*/s->current_gen);
+    if (ws != STM_OK) {
+        (void)stm_cas_deref(s->cas_idx, out_hash);
+        pthread_mutex_unlock(&s->lock);
+        return ws;
+    }
+
+    pthread_mutex_unlock(&s->lock);
+    return STM_OK;
+}
+
 /* P7-CAS-7: per-ino aggregator state for the migration-policy
  * heuristic's collect pass. extent_iter_ds delivers extents in
  * (ino, off)-ascending order, so all extents for ino N are

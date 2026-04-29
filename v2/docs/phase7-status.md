@@ -56,6 +56,43 @@ into the CAS tier (which DOES need P6) is a separate concern.
 
 ## Phase 7 status (overall)
 
+- [x] **P7-CAS-9 send/recv with cold extents** — substantive
+      `<P7-CAS-9>` + R60 close `<R60>` + hash-fixup (this
+      commit). Wire-format extension: new `STM_SEND_FLAG_COLD`
+      bit on the EXTENT record framing signals the extended
+      COLD body shape (32-byte meta + 32-byte BLAKE3-256
+      content_hash + plaintext, vs HOT's 32-byte meta +
+      plaintext). The wire carries plaintext for COLD extents
+      (no on-wire dedup in v1) but the receiver preserves the
+      cold-dedup property at rest: two cold extents with
+      identical content collapse to one CAS entry on the
+      target with refcount=2. New public API
+      `stm_sync_recv_cold_extent(s, target_ds, ino, off, len,
+      *claimed_hash, *plain, plain_len)` does receiver-side
+      cold application: hash-verify the wire claim against
+      re-hash of received plaintext (catches lying senders +
+      preserves "hash X stores bytes hashing to X" invariant),
+      CAS lookup-or-insert under target's pool metadata key +
+      stm_ad_cas, insert COLD extent record with target's
+      current_gen + CURRENT key_id + origin. Send-side:
+      `send_collect_cb` now accepts COLD extents (the prior
+      `n_replicas < 1` check applied unconditionally and would
+      have refused them); `send_extent_meta` extended with kind
+      + content_hash + cas_paddrs + cas_gen captured at
+      send_init from the source's CAS index; new helper
+      `read_decrypt_cold_chunk_plaintext` mirrors the HOT
+      decrypt helper's shape but uses pool metadata key +
+      stm_ad_cas; `emit_extent_locked` dispatches on kind to
+      emit either a HOT or COLD body. Receiver-side flag-mask
+      validation refuses unknown bits with STM_ECORRUPT —
+      protocol-evolution discipline. Composition over the
+      existing migrate primitives — no spec extension. R60
+      audit forthcoming. test_send_recv grows 14 → 19 (5 new
+      P7-CAS-9 tests). 35 ctest suites green default + ASan +
+      TSan in isolation. Spec posture unchanged: 21 modules /
+      25 fixed cfgs / 34 buggy cfgs. **No format break —
+      STM_UB_VERSION = 20 preserved.**
+
 - [x] **P7-CAS-8 per-dataset tiering opt-in + multi-dataset
       wrapper** — substantive `8410198` + R59 close `c2323fe` +
       hash-fixup (this commit). Format break **STM_UB_VERSION

@@ -38,8 +38,54 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R59-hash-fixup. Substantive `8410198` +
-  R59 close `c2323fe`.
+- **Tip**: post-R60-hash-fixup. Substantive `<P7-CAS-9>` +
+  R60 close `<R60>`.
+  **P7-CAS-9 — send/recv with cold extents. Wire-format
+  extension: a new `STM_SEND_FLAG_COLD` bit on the EXTENT record
+  framing header signals the extended COLD body shape (32-byte
+  meta + 32-byte BLAKE3-256 content_hash + plaintext, vs. HOT's
+  32-byte meta + plaintext). The wire still carries plaintext
+  for COLD extents (no on-wire dedup in v1) but the receiver
+  preserves the cold-dedup property at rest: two cold extents
+  with identical content collapse to one CAS entry on the
+  target with refcount=2. New public sync API
+  `stm_sync_recv_cold_extent(s, target_ds, ino, off, len,
+  *claimed_hash, *plain, plain_len)` does the receiver-side
+  application: BLAKE3-verify the wire hash against re-hash of
+  received plaintext (catches a malicious or buggy sender
+  lying about the hash, which would violate the CAS invariant
+  "hash X stores bytes hashing to X"), CAS lookup-or-insert via
+  `cas_chunk_intern_locked` (mirrors `stm_sync_migrate_to_cold`'s
+  per-chunk shape; reserves fresh paddrs + AEAD-encrypts under
+  target's pool metadata key + stm_ad_cas on miss), insert COLD
+  extent record with target's current_gen + dataset CURRENT
+  key_id + origin = (target_ds, ino, off). Send-side: extends
+  send_extent_meta with kind + content_hash + cas_paddrs +
+  cas_gen captured at send_init from the source's CAS index.
+  New helper `read_decrypt_cold_chunk_plaintext` mirrors
+  `read_decrypt_extent_plaintext`'s shape but uses the pool
+  metadata key + stm_ad_cas. `send_collect_cb` now accepts
+  COLD extents (the prior `n_replicas < 1` STM_ECORRUPT check
+  applied unconditionally and would have refused the send;
+  COLD extents legitimately have n_replicas == 0 in the extent
+  record). Cold AEAD nonce + AD shape match
+  `stm_sync_read_extent_locked`'s COLD branch. Receiver-side
+  flag-mask validation (`STM_SEND_FLAG_KNOWN_MASK`) refuses
+  unknown bits with STM_ECORRUPT — protocol-evolution
+  discipline. Composition over `cas.tla::MigrateToCold` (the
+  data plane is identical to migrate's MISS branch when the
+  target lacks the chunk, IDENTICAL to migrate's HIT branch
+  when the target already has it). No spec extension required
+  — receiver is a pure caller of the existing migrate
+  primitives. test_send_recv grows 14 → 19 (5 new P7-CAS-9
+  tests: cold-extent roundtrip, dedup preserved on target,
+  mixed HOT+COLD roundtrip, recv refuses unknown flag bit,
+  recv refuses cold hash mismatch). 35 ctest suites green
+  default + ASan + TSan in isolation. Spec posture unchanged:
+  21 modules / 25 fixed cfgs / 34 buggy cfgs. No format break
+  — STM_UB_VERSION = 20 preserved. R60 audit forthcoming.**
+  Prior P7-CAS-8 substantive `8410198` + R59 close `c2323fe` +
+  hash fixup `019ed4d`.
   **P7-CAS-8 — per-dataset `STM_PROP_TIERING` opt-in + multi-
   dataset migration-policy wrapper. Format break STM_UB_VERSION
   19 → 20: `STM_PROP_COUNT` grows from 3 to 4, adding

@@ -33,12 +33,32 @@
  *    40     8   to_txg          (le64)
  *    48     4   reserved        (zero)
  *
- *   EXTENT body (32 + len bytes):
+ *   EXTENT body — two shapes (selected by the framing-header `flags`
+ *   field's STM_SEND_FLAG_COLD bit; P7-CAS-9):
+ *
+ *   HOT EXTENT body (32 + len bytes; flags & COLD == 0):
  *     0     8   ino             (le64)
  *     8     8   off             (le64)
  *    16     8   len             (le64)
  *    24     8   gen             (le64)  — source-side write_gen, advisory
  *    32   len   plaintext       (raw bytes)
+ *
+ *   COLD EXTENT body (64 + len bytes; flags & COLD != 0):
+ *     0     8   ino             (le64)
+ *     8     8   off             (le64)
+ *    16     8   len             (le64)
+ *    24     8   gen             (le64)  — source-side write_gen, advisory
+ *    32    32   content_hash    (BLAKE3-256 of plaintext; receiver
+ *                                 verifies against its own re-hash and
+ *                                 uses the verified hash to dedup
+ *                                 against its CAS index)
+ *    64   len   plaintext       (raw bytes)
+ *
+ *   The wire still carries plaintext for cold extents (no on-wire
+ *   dedup in v1) — but the receiver-side CAS lookup-or-insert
+ *   preserves the dedup property at rest. Two cold extents with
+ *   identical content collapse to one CAS entry on the target with
+ *   refcount=2.
  *
  *   END body (32 bytes):
  *     0    32   blake3_csum     — running BLAKE3 over every prior
@@ -163,18 +183,28 @@ typedef enum {
 #define STM_SEND_RECORD_HDR_LEN  16u
 /* HEADER body length. */
 #define STM_SEND_HEADER_BODY_LEN 52u
-/* EXTENT body's metadata length (followed by `len` plaintext bytes). */
+/* HOT EXTENT body's metadata length (followed by `len` plaintext bytes). */
 #define STM_SEND_EXTENT_META_LEN 32u
+/* P7-CAS-9: COLD EXTENT body's metadata length (HOT meta + 32-byte
+ * BLAKE3-256 content_hash, followed by `len` plaintext bytes). */
+#define STM_SEND_COLD_EXTENT_META_LEN  (STM_SEND_EXTENT_META_LEN + 32u)
 /* END body length (BLAKE3 csum). */
 #define STM_SEND_END_BODY_LEN    32u
 
+/* P7-CAS-9: framing flag bit set on cold extent records to signal the
+ * extended body shape (32-byte content_hash before the plaintext).
+ * Unrecognized flag bits MUST cause the recv to refuse with
+ * STM_ECORRUPT — protocol-evolution discipline. */
+#define STM_SEND_FLAG_COLD       UINT32_C(0x00000001)
+#define STM_SEND_FLAG_KNOWN_MASK STM_SEND_FLAG_COLD
+
 /* Upper bound on a single record's full bytes (framing + body) — used
  * by recv to reject hostile/oversized records up front before any
- * dispatch. The largest legitimate record is an EXTENT carrying a
- * full 128 KiB plaintext payload: 16 (framing) + 32 (meta) + 131072
- * (plaintext) = 131120 bytes. R39 P2-3. */
+ * dispatch. The largest legitimate record is a COLD EXTENT carrying a
+ * full 128 KiB plaintext payload: 16 (framing) + 64 (meta + hash) +
+ * 131072 (plaintext) = 131152 bytes (P7-CAS-9). */
 #define STM_SEND_RECORD_MAX_LEN  (STM_SEND_RECORD_HDR_LEN +              \
-                                    STM_SEND_EXTENT_META_LEN +           \
+                                    STM_SEND_COLD_EXTENT_META_LEN +      \
                                     (128u * 1024u))
 
 /* ========================================================================= */
