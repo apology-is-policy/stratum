@@ -56,9 +56,53 @@ into the CAS tier (which DOES need P6) is a separate concern.
 
 ## Phase 7 status (overall)
 
+- [x] **P7-CAS-7 migration-policy heuristic v1** — substantive
+      `<P7-CAS-7>` + R58 close `<R58>` + hash-fixup (this
+      commit). First concrete user of the P7-CAS-2 migration
+      data plane (which had been manual-trigger only since
+      2026-04-26). Adds public API
+      `stm_fs_migrate_policy_step(fs, dataset_id, *params,
+      *out_stats)` that runs an age-based candidate selection
+      over a single dataset and migrates eligible inos within a
+      per-pass budget. v1 heuristic: an ino is eligible iff
+      every live extent at (ds, ino) is HOT and the newest
+      extent's `link_gen` is at least `min_age_txgs` behind the
+      sync layer's current_gen at the call site. Mixed
+      (HOT+COLD) inos are skipped — partial migration is not v1
+      scope. Per-pass budgets `max_inos` (count cap) +
+      `max_bytes` (bytes cap), both 0 = unlimited; checked
+      BEFORE each candidate's migrate. Lock posture: takes
+      fs->lock during candidate collection, drops it between
+      collection and per-ino migrate — the pass is
+      INTERRUPTIBLE (concurrent writers / admin calls
+      interleave). Hard errors (STM_EWEDGED / STM_EROFS /
+      STM_ENOMEM) abort the pass; soft errors (STM_EBADTAG /
+      STM_EIO / STM_ENOSPC / STM_ECORRUPT) are recorded in
+      `out_stats->{last_err, last_err_ino}` and the pass
+      continues. New sync-layer helper
+      `stm_sync_migrate_policy_collect(s, ds, cutoff_link_gen,
+      *out_cands, *out_n_cands, *out_inos_visited)` exposed
+      publicly so future orchestrators can preview candidates
+      without performing migration (RO handles can run collect;
+      only the migrate step refuses RO). Composition over
+      `cas.tla::MigrateToCold` — no new state-machine
+      semantics, no spec extension required. test_fs grows 102
+      → 113 (11 new P7-CAS-7 tests: basic age=0 migrates, age
+      threshold blocks then unblocks after commits, max_inos
+      cap, max_bytes cap, already-cold skipped, mixed-tier
+      skipped, arg validation, RO refused, NULL out_stats
+      accepted, empty dataset no-op, min_age=UINT64_MAX
+      saturating-to-zero). 35 ctest suites green default +
+      ASan + TSan in isolation. Spec posture unchanged: 21
+      modules / 25 fixed cfgs / 34 buggy cfgs. **No format
+      break — STM_UB_VERSION = 19 preserved.** Per-dataset
+      tiering opt-in (`STM_PROP_TIERING`) deferred (would
+      require bumping `STM_PROP_COUNT` from 3 to 4, a UB-version
+      format break — separate chunk).
+
 - [x] **P7-CAS-6 scrub-orchestrator wrapper** — substantive
       `b1a4816` + R57 close `8412194` +
-      hash-fixup (this commit). Adds
+      hash-fixup `ee69459`. Adds
       `stm_sync_scrub_step_with_cas_gc(s, sc, *out_cas_gc_err)`
       that drives one `stm_scrub_step` and fires
       `stm_sync_cas_gc_sweep` on the RUNNING→COMPLETED state

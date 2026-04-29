@@ -4544,4 +4544,390 @@ STM_TEST(fs_p7cas6_scrub_idle_state_no_sweep) {
     unlink(g_key_path);
 }
 
+/* ========================================================================= */
+/* P7-CAS-7: migration-policy heuristic                                       */
+/* ========================================================================= */
+
+STM_TEST(fs_p7cas7_policy_step_basic_age_zero_migrates) {
+    /* min_age_txgs == 0 ⇒ any HOT ino is eligible. Write one HOT
+     * file, run the policy step, observe (1) the cas index now has
+     * one entry, (2) stats: visited=1, eligible=1, migrated=1,
+     * bytes_migrated == file size. */
+    make_tmp("p7cas7_basic");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)((i * 13u) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+
+    stm_fs_migrate_policy_params params = { .min_age_txgs = 0u };
+    stm_fs_migrate_policy_stats  stats  = {0};
+    STM_ASSERT_OK(stm_fs_migrate_policy_step(fs, 1, &params, &stats));
+    STM_ASSERT_EQ(stats.inos_visited,   1u);
+    STM_ASSERT_EQ(stats.inos_eligible,  1u);
+    STM_ASSERT_EQ(stats.inos_migrated,  1u);
+    STM_ASSERT_EQ(stats.bytes_migrated, (uint64_t)sizeof plain);
+    STM_ASSERT_EQ(stats.last_err,       STM_OK);
+    STM_ASSERT_EQ(stats.last_err_ino,   0u);
+
+    /* CAS index now has the migrated chunk. */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    size_t n = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+
+    /* Re-running is a no-op: ino is now COLD, not eligible. */
+    stm_fs_migrate_policy_stats stats2 = {0};
+    STM_ASSERT_OK(stm_fs_migrate_policy_step(fs, 1, &params, &stats2));
+    STM_ASSERT_EQ(stats2.inos_visited,  1u);
+    STM_ASSERT_EQ(stats2.inos_eligible, 0u);
+    STM_ASSERT_EQ(stats2.inos_migrated, 0u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas7_policy_step_recent_extent_blocked_by_age) {
+    /* Write a HOT extent, then query current_gen. Run the policy
+     * with min_age_txgs > 0 — newest_link_gen == cur_gen at write
+     * time, so cur_gen - link_gen == 0 < min_age → not eligible.
+     * After enough commits advance current_gen, the extent ages
+     * past the threshold and becomes eligible. */
+    make_tmp("p7cas7_age_block");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[4096];
+    memset(plain, 0x42, sizeof plain);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    /* Commit so the extent's link_gen is on disk; that doesn't
+     * advance link_gen (it was already stamped at write time). */
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    /* min_age_txgs = 100 → cutoff = current_gen - 100. The extent's
+     * link_gen is well above the cutoff. Not eligible. */
+    stm_fs_migrate_policy_params params_strict = { .min_age_txgs = 100u };
+    stm_fs_migrate_policy_stats  stats_strict  = {0};
+    STM_ASSERT_OK(stm_fs_migrate_policy_step(fs, 1, &params_strict, &stats_strict));
+    STM_ASSERT_EQ(stats_strict.inos_visited,  1u);
+    STM_ASSERT_EQ(stats_strict.inos_eligible, 0u);
+    STM_ASSERT_EQ(stats_strict.inos_migrated, 0u);
+
+    /* Advance current_gen by committing repeatedly. Each commit
+     * advances current_gen by 2 (sync's auth+2 publish). Run >= 50
+     * commits → current_gen - link_gen >= 100. */
+    for (int i = 0; i < 60; i++) {
+        STM_ASSERT_OK(stm_fs_commit(fs));
+    }
+
+    stm_fs_migrate_policy_stats stats_eligible = {0};
+    STM_ASSERT_OK(stm_fs_migrate_policy_step(fs, 1, &params_strict, &stats_eligible));
+    STM_ASSERT_EQ(stats_eligible.inos_visited,  1u);
+    STM_ASSERT_EQ(stats_eligible.inos_eligible, 1u);
+    STM_ASSERT_EQ(stats_eligible.inos_migrated, 1u);
+    STM_ASSERT_EQ(stats_eligible.bytes_migrated, (uint64_t)sizeof plain);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas7_policy_step_max_inos_caps_pass) {
+    /* Three HOT inos with min_age=0; max_inos=2 ⇒ two migrate, one
+     * stays HOT. Re-running with the same cap migrates the third. */
+    make_tmp("p7cas7_max_inos");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain1[4096], plain2[4096], plain3[4096];
+    for (size_t i = 0; i < 4096u; i++) {
+        plain1[i] = (uint8_t)((i * 3u + 1u) & 0xFFu);
+        plain2[i] = (uint8_t)((i * 5u + 2u) & 0xFFu);
+        plain3[i] = (uint8_t)((i * 7u + 3u) & 0xFFu);
+    }
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain1, sizeof plain1));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 2, 0, plain2, sizeof plain2));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 3, 0, plain3, sizeof plain3));
+
+    stm_fs_migrate_policy_params params = {
+        .min_age_txgs = 0u,
+        .max_inos     = 2u,
+    };
+    stm_fs_migrate_policy_stats  stats  = {0};
+    STM_ASSERT_OK(stm_fs_migrate_policy_step(fs, 1, &params, &stats));
+    STM_ASSERT_EQ(stats.inos_visited,  3u);
+    STM_ASSERT_EQ(stats.inos_eligible, 3u);
+    STM_ASSERT_EQ(stats.inos_migrated, 2u);
+    STM_ASSERT_EQ(stats.bytes_migrated, (uint64_t)(2u * sizeof plain1));
+
+    /* Second pass migrates the remaining one. */
+    stm_fs_migrate_policy_stats stats2 = {0};
+    STM_ASSERT_OK(stm_fs_migrate_policy_step(fs, 1, &params, &stats2));
+    STM_ASSERT_EQ(stats2.inos_visited,  3u);
+    STM_ASSERT_EQ(stats2.inos_eligible, 1u);
+    STM_ASSERT_EQ(stats2.inos_migrated, 1u);
+
+    /* CAS index has 3 distinct entries (different content per ino). */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    size_t n = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)3);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas7_policy_step_max_bytes_caps_pass) {
+    /* Two HOT inos of 4 KiB each; max_bytes = 4 KiB ⇒ migrate one,
+     * stop before the second (its 4 KiB would exceed cap). The cap
+     * is checked BEFORE each candidate, so the first migrate is
+     * allowed (bytes_migrated starts at 0). */
+    make_tmp("p7cas7_max_bytes");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain1[4096], plain2[4096];
+    for (size_t i = 0; i < 4096u; i++) {
+        plain1[i] = (uint8_t)((i * 9u + 11u) & 0xFFu);
+        plain2[i] = (uint8_t)((i * 19u + 23u) & 0xFFu);
+    }
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain1, sizeof plain1));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 2, 0, plain2, sizeof plain2));
+
+    stm_fs_migrate_policy_params params = {
+        .min_age_txgs = 0u,
+        .max_bytes    = 4096u,
+    };
+    stm_fs_migrate_policy_stats  stats  = {0};
+    STM_ASSERT_OK(stm_fs_migrate_policy_step(fs, 1, &params, &stats));
+    STM_ASSERT_EQ(stats.inos_visited,  2u);
+    STM_ASSERT_EQ(stats.inos_eligible, 2u);
+    STM_ASSERT_EQ(stats.inos_migrated, 1u);
+    STM_ASSERT_EQ(stats.bytes_migrated, (uint64_t)4096u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas7_policy_step_already_cold_skipped) {
+    /* Migrate a file via the per-file API, then run the policy step.
+     * The all-COLD ino is not eligible — no HOT extents to count.
+     * inos_visited bumps for the COLD ino but inos_eligible stays 0. */
+    make_tmp("p7cas7_already_cold");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[4096];
+    memset(plain, 0x77, sizeof plain);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    stm_fs_migrate_policy_params params = { .min_age_txgs = 0u };
+    stm_fs_migrate_policy_stats  stats  = {0};
+    STM_ASSERT_OK(stm_fs_migrate_policy_step(fs, 1, &params, &stats));
+    STM_ASSERT_EQ(stats.inos_visited,  1u);
+    STM_ASSERT_EQ(stats.inos_eligible, 0u);
+    STM_ASSERT_EQ(stats.inos_migrated, 0u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas7_policy_step_mixed_tier_skipped) {
+    /* Mixed-tier ino: write at offset 0 (HOT), migrate (now COLD),
+     * write at offset 4096 (HOT non-overlapping). Result: ino has
+     * COLD extent at [0, 4096) + HOT extent at [4096, 8192). The
+     * policy step skips it (all_hot==false). */
+    make_tmp("p7cas7_mixed");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t a[4096], b[4096];
+    memset(a, 0xA1, sizeof a);
+    memset(b, 0xB2, sizeof b);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, a, sizeof a));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 4096u, b, sizeof b));
+
+    stm_fs_migrate_policy_params params = { .min_age_txgs = 0u };
+    stm_fs_migrate_policy_stats  stats  = {0};
+    STM_ASSERT_OK(stm_fs_migrate_policy_step(fs, 1, &params, &stats));
+    STM_ASSERT_EQ(stats.inos_visited,  1u);
+    STM_ASSERT_EQ(stats.inos_eligible, 0u);
+    STM_ASSERT_EQ(stats.inos_migrated, 0u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas7_policy_step_arg_validation) {
+    /* NULL fs / NULL params / dataset_id == 0 → STM_EINVAL. */
+    make_tmp("p7cas7_arg");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_fs_migrate_policy_params params = { .min_age_txgs = 0u };
+    stm_fs_migrate_policy_stats  stats  = {0};
+
+    STM_ASSERT_ERR(stm_fs_migrate_policy_step(NULL, 1, &params, &stats),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_migrate_policy_step(fs,   1, NULL,    &stats),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_migrate_policy_step(fs,   0, &params, &stats),
+                   STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas7_policy_step_ro_refused) {
+    /* RO mount: the policy step runs the FS_GUARD_WRITE which fails
+     * with STM_EROFS — the policy mutates state. */
+    make_tmp("p7cas7_ro");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts_rw = rw_mount_opts();
+    stm_fs *fs_rw = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts_rw, &fs_rw));
+    uint8_t plain[4096];
+    memset(plain, 0x55, sizeof plain);
+    STM_ASSERT_OK(stm_fs_write(fs_rw, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_unmount(fs_rw));
+
+    stm_fs_mount_opts mopts_ro = {
+        .read_only    = true,
+        .keyfile_path = g_key_path,
+    };
+    stm_fs *fs_ro = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts_ro, &fs_ro));
+
+    stm_fs_migrate_policy_params params = { .min_age_txgs = 0u };
+    stm_fs_migrate_policy_stats  stats  = {0};
+    STM_ASSERT_ERR(stm_fs_migrate_policy_step(fs_ro, 1, &params, &stats),
+                   STM_EROFS);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs_ro));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas7_policy_step_null_out_stats_ok) {
+    /* out_stats is documented as optional. NULL must be accepted —
+     * the caller may not care about the counters. */
+    make_tmp("p7cas7_null_stats");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[4096];
+    memset(plain, 0x33, sizeof plain);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+
+    stm_fs_migrate_policy_params params = { .min_age_txgs = 0u };
+    STM_ASSERT_OK(stm_fs_migrate_policy_step(fs, 1, &params, NULL));
+
+    /* Verify migration did happen via cas count. */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    size_t n = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas7_policy_step_empty_dataset_no_op) {
+    /* Empty dataset (no extents at all) → 0 visited, 0 eligible,
+     * STM_OK. */
+    make_tmp("p7cas7_empty");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_fs_migrate_policy_params params = { .min_age_txgs = 0u };
+    stm_fs_migrate_policy_stats  stats  = {0};
+    STM_ASSERT_OK(stm_fs_migrate_policy_step(fs, 1, &params, &stats));
+    STM_ASSERT_EQ(stats.inos_visited,  0u);
+    STM_ASSERT_EQ(stats.inos_eligible, 0u);
+    STM_ASSERT_EQ(stats.inos_migrated, 0u);
+    STM_ASSERT_EQ(stats.bytes_migrated, 0u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas7_policy_step_min_age_saturates_to_zero_when_huge) {
+    /* min_age_txgs >= current_gen ⇒ saturating subtraction yields
+     * cutoff=0; only extents with link_gen == 0 would qualify, and
+     * extent.tla::BirthTxgBound forbids link_gen == 0 for live
+     * extents — so nothing is eligible. Behavior must be safe (no
+     * underflow / wrap around to a huge cutoff that picks up
+     * everything). */
+    make_tmp("p7cas7_huge_age");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[4096];
+    memset(plain, 0x88, sizeof plain);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+
+    stm_fs_migrate_policy_params params = { .min_age_txgs = UINT64_MAX };
+    stm_fs_migrate_policy_stats  stats  = {0};
+    STM_ASSERT_OK(stm_fs_migrate_policy_step(fs, 1, &params, &stats));
+    STM_ASSERT_EQ(stats.inos_visited,  1u);
+    STM_ASSERT_EQ(stats.inos_eligible, 0u);
+    STM_ASSERT_EQ(stats.inos_migrated, 0u);
+
+    /* CAS index is empty — no migration ran. */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    size_t n = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")

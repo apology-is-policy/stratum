@@ -1222,6 +1222,55 @@ stm_status stm_sync_migrate_to_cold(stm_sync *s,
                                        uint64_t dataset_id, uint64_t ino);
 
 /*
+ * P7-CAS-7: candidate descriptor returned by
+ * stm_sync_migrate_policy_collect. (ino, total HOT bytes for that
+ * ino at collection time). The (ino)-ascending order matches
+ * stm_extent_iter_ds.
+ */
+typedef struct {
+    uint64_t ino;
+    uint64_t bytes;
+} stm_sync_migrate_candidate;
+
+/*
+ * P7-CAS-7: walk dataset_id's live extents under sync->lock and
+ * return the inos whose every extent is HOT and whose newest
+ * link_gen <= cutoff_link_gen. The candidates are heap-allocated
+ * (caller MUST free *out_cands) in (ino)-ascending order — the
+ * order in which stm_extent_iter_ds delivered them.
+ *
+ * `out_inos_visited` (optional, may be NULL) receives the total
+ * number of distinct inos visited (eligible or not) — informational
+ * counter for the policy step's stats.
+ *
+ * Lock posture: takes sync->lock internally → calls stm_extent_iter_ds.
+ *
+ * Refusals:
+ *   - NULL s OR NULL out_cands OR NULL out_n_cands (STM_EINVAL).
+ *   - dataset_id == 0 (STM_EINVAL).
+ *   - Wedged (STM_EWEDGED) — the policy is read-only against sync
+ *     state, but a wedged handle's extent_idx may be inconsistent.
+ *   - STM_ENOMEM if the candidate buffer cannot grow.
+ *   - Errors from stm_extent_iter_ds bubble up.
+ *
+ * On non-OK returns *out_cands is NULL and *out_n_cands is 0.
+ *
+ * No format break, no spec extension — the heuristic is composition
+ * over the existing extent index iteration plus the migrate
+ * primitive. The decision is purely policy and does NOT introduce
+ * a new invariant (worst case: suboptimal placement, never data
+ * corruption — the migrate primitive's invariants are unchanged).
+ */
+STM_MUST_USE
+stm_status stm_sync_migrate_policy_collect(
+        stm_sync *s,
+        uint64_t dataset_id,
+        uint64_t cutoff_link_gen,
+        stm_sync_migrate_candidate **out_cands,
+        size_t *out_n_cands,
+        uint64_t *out_inos_visited);
+
+/*
  * P7-5: install the production scrub β verify-callback on `sc`.
  *
  * The cb resolves each `paddr` against `sync`'s extent index via

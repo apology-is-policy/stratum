@@ -38,8 +38,53 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R57-hash-fixup. Substantive `b1a4816` +
-  R57 close `8412194`.
+- **Tip**: post-R58-hash-fixup. Substantive `<P7-CAS-7>` +
+  R58 close `<R58>`.
+  **P7-CAS-7 — migration-policy heuristic v1 (NOVEL #6 v1 in
+  CLAUDE.md mission numbering / NOVEL #3.3's "Migration engine:
+  heuristic v1"). First concrete user of the P7-CAS-2 migration
+  data plane (which had been manual-trigger only since 2026-04-26).
+  New public API `stm_fs_migrate_policy_step(fs, dataset_id,
+  *params, *out_stats)` runs an age-based candidate selection over
+  a single dataset and migrates eligible inos within a per-pass
+  budget. v1 heuristic: an ino is eligible iff every live extent
+  at (ds, ino) is HOT and the newest extent's `link_gen` is at
+  least `min_age_txgs` behind the sync layer's current_gen at the
+  call site. Mixed (HOT+COLD) inos are skipped — partial
+  migration is not v1 scope. Empty / fully-COLD inos are skipped
+  silently. Per-pass budgets: `max_inos` (count cap, 0=unlimited)
+  + `max_bytes` (snapshot-at-collect bytes cap, 0=unlimited);
+  budget is checked BEFORE each candidate's migrate so the cap is
+  best-effort, not a hard ceiling — concurrent shrinks/extends
+  between collect and migrate cause `bytes_migrated` to drift.
+  Lock posture: takes fs->lock during candidate collection, drops
+  it between collection and per-ino migrate. Each per-ino migrate
+  re-acquires fs->lock fresh — the pass is INTERRUPTIBLE
+  (concurrent writers / admin calls interleave). Hard errors
+  (STM_EWEDGED / STM_EROFS / STM_ENOMEM) abort the pass and bubble
+  up; soft errors (STM_EBADTAG / STM_EIO / STM_ENOSPC / STM_ECORRUPT)
+  are recorded in `out_stats->{last_err, last_err_ino}` and the
+  pass continues — a single corrupt file does not stall the whole
+  tier. New sync-layer helper
+  `stm_sync_migrate_policy_collect(s, ds, cutoff_link_gen, *out_cands,
+  *out_n_cands, *out_inos_visited)` does the read-only walk under
+  sync->lock — exposed publicly so future orchestrators can preview
+  candidates without performing migration (RO handles can run
+  collect; only the migrate step refuses RO). Composition over
+  `cas.tla::MigrateToCold` — no new state-machine semantics, no
+  spec extension required. v1 limitations + future work documented
+  in `reference/15-cas.md`'s new "Migration policy (P7-CAS-7)"
+  subsection. test_fs grows 102 → 113 (11 new tests: basic age=0
+  migrates, age threshold blocks then unblocks after commits,
+  max_inos cap, max_bytes cap, already-cold skipped, mixed-tier
+  skipped, arg validation, RO refused, NULL out_stats accepted,
+  empty dataset no-op, min_age=UINT64_MAX saturating-to-zero). 35
+  ctest suites green default + ASan + TSan in isolation. Spec
+  posture unchanged: 21 modules / 25 fixed cfgs / 34 buggy cfgs.
+  No format break — STM_UB_VERSION = 19 preserved. R58 audit
+  forthcoming.**
+  Prior P7-CAS-6 substantive `b1a4816` + R57 close `8412194` +
+  hash fixup `ee69459`.
   **P7-CAS-6 — scrub-orchestrator wrapper. Adds public API
   `stm_sync_scrub_step_with_cas_gc(s, sc, *out_cas_gc_err)` that
   drives one `stm_scrub_step` and fires `stm_sync_cas_gc_sweep`

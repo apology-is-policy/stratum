@@ -5859,6 +5859,131 @@ stm_status stm_sync_migrate_to_cold(stm_sync *s,
     return apply_rc;
 }
 
+/* P7-CAS-7: per-ino aggregator state for the migration-policy
+ * heuristic's collect pass. extent_iter_ds delivers extents in
+ * (ino, off)-ascending order, so all extents for ino N are
+ * contiguous; the cb finalizes a transition when ino changes,
+ * updating the in-progress fields to start the next ino.
+ *
+ * `cur_ino == 0` is the sentinel for "no ino in flight" — the first
+ * cb invocation will see ino > 0 and trigger the (no-op) initial
+ * transition. After the iter completes the caller must finalize
+ * once more to flush the last in-flight ino. */
+typedef struct {
+    /* Aggregator state for the in-progress ino. */
+    uint64_t cur_ino;
+    bool     all_hot;             /* false if any extent of cur_ino is COLD */
+    uint64_t newest_link_gen;     /* max(link_gen) over cur_ino's HOT extents */
+    uint64_t total_hot_bytes;     /* sum(len) for cur_ino's HOT extents */
+    /* Filter parameter. */
+    uint64_t cutoff_link_gen;
+    /* Output: candidate list grown geometrically. */
+    stm_sync_migrate_candidate *cands;
+    size_t                       n_cands;
+    size_t                       cap_cands;
+    /* Counter: distinct inos visited (eligible or not). */
+    uint64_t inos_visited;
+    /* Sticky error. */
+    stm_status err;
+} migrate_policy_collect_ctx;
+
+/* Push the in-progress ino if it satisfies the eligibility predicate.
+ * Returns true on success (continue iter) or false on alloc failure
+ * (sets ctx->err and aborts iter). cur_ino == 0 is treated as no-op. */
+static bool migrate_policy_finalize_cur(migrate_policy_collect_ctx *c) {
+    if (c->cur_ino == 0u) return true;
+    /* Bump visited counter regardless of eligibility. */
+    c->inos_visited++;
+    /* Eligibility: all-HOT AND newest_link_gen <= cutoff_link_gen.
+     * An ino with zero HOT extents (all-COLD) has all_hot==true but
+     * newest_link_gen==0 and total_hot_bytes==0 — refuse those (no
+     * work to do, would be a wasted migrate call returning STM_OK
+     * for an already-COLD file). */
+    if (!c->all_hot)                              return true;
+    if (c->total_hot_bytes == 0u)                 return true;
+    if (c->newest_link_gen > c->cutoff_link_gen)  return true;
+    /* Eligible — push. */
+    if (c->n_cands == c->cap_cands) {
+        size_t new_cap = (c->cap_cands == 0u) ? 16u : c->cap_cands * 2u;
+        stm_sync_migrate_candidate *grown =
+                realloc(c->cands, new_cap * sizeof *grown);
+        if (!grown) { c->err = STM_ENOMEM; return false; }
+        c->cands     = grown;
+        c->cap_cands = new_cap;
+    }
+    c->cands[c->n_cands].ino   = c->cur_ino;
+    c->cands[c->n_cands].bytes = c->total_hot_bytes;
+    c->n_cands++;
+    return true;
+}
+
+static bool migrate_policy_collect_cb(const stm_extent_record *e, void *ctx) {
+    migrate_policy_collect_ctx *c = ctx;
+    if (e->ino != c->cur_ino) {
+        if (!migrate_policy_finalize_cur(c)) return false;
+        c->cur_ino         = e->ino;
+        c->all_hot         = true;
+        c->newest_link_gen = 0u;
+        c->total_hot_bytes = 0u;
+    }
+    if (e->kind == STM_EXTENT_KIND_HOT) {
+        if (e->link_gen > c->newest_link_gen) c->newest_link_gen = e->link_gen;
+        c->total_hot_bytes += e->len;
+    } else {
+        /* COLD or unknown kind taints the ino — skip. */
+        c->all_hot = false;
+    }
+    return true;
+}
+
+stm_status stm_sync_migrate_policy_collect(
+        stm_sync *s,
+        uint64_t dataset_id,
+        uint64_t cutoff_link_gen,
+        stm_sync_migrate_candidate **out_cands,
+        size_t *out_n_cands,
+        uint64_t *out_inos_visited)
+{
+    if (!s || !out_cands || !out_n_cands) return STM_EINVAL;
+    /* Out-param init runs BEFORE NULL-arg checks above? — no:
+     * conventional uniform-contract is "if NULL ptrs, return EINVAL
+     * without writing"; init the out params on STM_OK only — but to
+     * keep failure paths uniform with R57 P3-5's pattern, init early
+     * and overwrite to non-NULL on success. */
+    *out_cands   = NULL;
+    *out_n_cands = 0u;
+    if (out_inos_visited) *out_inos_visited = 0u;
+    if (dataset_id == 0u) return STM_EINVAL;
+
+    pthread_mutex_lock(&s->lock);
+    if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
+    /* Read-only handles can run the collect — it's read-only against
+     * sync state. The migrate step refuses RO; the collect itself
+     * doesn't, so an RO observer can preview candidates. */
+
+    migrate_policy_collect_ctx ctx = {
+        .cutoff_link_gen = cutoff_link_gen,
+        .err             = STM_OK,
+    };
+    stm_status its = stm_extent_iter_ds(s->extent_idx, dataset_id,
+                                           migrate_policy_collect_cb, &ctx);
+    /* Flush the last in-flight ino if no error stopped us. */
+    if (its == STM_OK && ctx.err == STM_OK) {
+        (void)migrate_policy_finalize_cur(&ctx);
+    }
+    pthread_mutex_unlock(&s->lock);
+
+    if (its != STM_OK || ctx.err != STM_OK) {
+        free(ctx.cands);
+        return (ctx.err != STM_OK) ? ctx.err : its;
+    }
+
+    *out_cands   = ctx.cands;
+    *out_n_cands = ctx.n_cands;
+    if (out_inos_visited) *out_inos_visited = ctx.inos_visited;
+    return STM_OK;
+}
+
 /* P7-CAS-3: transactional auto-GC sweep tuple shape — captures the
  * full (hash, paddrs[N], n_paddrs) per refcount=0 entry so Phase 2
  * can free paddrs WITHOUT removing the cas_idx entry first (closes

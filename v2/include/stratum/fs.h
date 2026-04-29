@@ -336,6 +336,104 @@ STM_MUST_USE
 stm_status stm_fs_migrate_to_cold(stm_fs *fs,
                                      uint64_t dataset_id, uint64_t ino);
 
+/*
+ * P7-CAS-7: stm_fs_migrate_policy_step — periodic-policy primitive that
+ * selects HOT inos in a single dataset and migrates them to the COLD
+ * tier within a per-pass budget.
+ *
+ * v1 heuristic (NOVEL #6 v1 in CLAUDE.md mission numbering /
+ * NOVEL #3.3's "Migration engine: heuristic v1" in NOVEL.md):
+ * an ino is eligible iff every live extent at (dataset_id, ino) is
+ * HOT and the newest extent's `link_gen` is at least `min_age_txgs`
+ * behind the sync layer's current_gen at the call site. The intent
+ * is to leave recently-written files HOT (where access locality and
+ * the absence of dedup wins favor the hot tier) and migrate inos
+ * whose data has stabilized.
+ *
+ * Mixed (HOT+COLD) inos are skipped — partial migration is not v1
+ * scope. Empty inos and fully-COLD inos are skipped silently
+ * (no-op success).
+ *
+ * Lock posture: takes fs->lock during candidate collection; drops
+ * it between collection and per-ino migrate. Each per-ino migrate
+ * re-acquires fs->lock fresh, so the pass is INTERRUPTIBLE — a
+ * concurrent writer or admin call can interleave between candidates.
+ * Each per-ino migration is atomic in isolation
+ * (stm_fs_migrate_to_cold's existing contract).
+ *
+ * Concurrency drift: between candidate collection and the per-ino
+ * migrate, the file may have been overwritten with HOT writes,
+ * truncated, deleted, or migrated by another caller. The pass
+ * tolerates all of these — the migrate call is idempotent at the
+ * (ds, ino) granularity (already-migrated → STM_OK no-op;
+ * deleted → empty-set STM_OK no-op).
+ *
+ * Per-ino failures (STM_EBADTAG / STM_EIO from a corrupt source,
+ * STM_ENOSPC from cold-tier exhaustion mid-pass) DO NOT abort the
+ * pass. The first such error is recorded in
+ * `out_stats->{last_err, last_err_ino}` and the pass continues to
+ * subsequent candidates. Hard errors (STM_EWEDGED, STM_EROFS,
+ * STM_ENOMEM) abort the pass and bubble up.
+ *
+ * Refusals:
+ *   - NULL fs OR NULL params (STM_EINVAL).
+ *   - dataset_id == 0 (STM_EINVAL).
+ *   - Wedged or read-only (STM_EWEDGED / STM_EROFS).
+ *   - Errors from extent_iter (STM_ENOMEM) bubble up.
+ *
+ * `out_stats` may be NULL — callers that don't care about counters
+ * can pass NULL.
+ *
+ * Composition: pure caller of stm_fs_migrate_to_cold. No new state-
+ * machine semantics beyond the existing migrate primitive — no spec
+ * extension required (cas.tla::MigrateToCold already covers the
+ * data plane; the policy is composition).
+ */
+typedef struct {
+    /* Inclusive minimum age-in-txgs (current_gen - link_gen) for an
+     * ino to be eligible. 0 means "any HOT ino regardless of age" —
+     * useful for one-shot mass migration. Larger values lag migration
+     * so recently-written inos stay HOT. */
+    uint64_t min_age_txgs;
+    /* Maximum number of inos to migrate this pass. 0 = no per-pass
+     * count cap. Inos are visited in (ino)-ascending order. */
+    uint32_t max_inos;
+    /* Reserved alignment padding; clients should zero-init the struct
+     * to be forward-compatible with future fields. */
+    uint32_t _reserved0;
+    /* Maximum total HOT-extent bytes to migrate this pass. 0 = no
+     * per-pass byte cap. The cap is checked BEFORE each candidate's
+     * migrate, using the snapshot-at-collection length sum; once the
+     * cap is reached the pass stops (no partial-ino migration). */
+    uint64_t max_bytes;
+} stm_fs_migrate_policy_params;
+
+typedef struct {
+    /* Total inos visited in this pass (HOT + COLD + mixed). */
+    uint64_t inos_visited;
+    /* Inos that met the all-HOT + age-threshold predicate. Counted
+     * BEFORE budget caps apply. */
+    uint64_t inos_eligible;
+    /* Inos that the per-ino migrate call returned STM_OK on. May be
+     * less than inos_eligible if a budget cap was hit. */
+    uint64_t inos_migrated;
+    /* Sum of HOT-extent bytes (snapshot-at-collection) for migrated
+     * inos. Approximate — concurrent shrinks/extends between
+     * collection and migrate may cause drift. */
+    uint64_t bytes_migrated;
+    /* First per-ino migration error encountered. STM_OK if every
+     * migrate returned STM_OK. */
+    stm_status last_err;
+    /* Ino at which last_err was reported. 0 if last_err == STM_OK. */
+    uint64_t last_err_ino;
+} stm_fs_migrate_policy_stats;
+
+STM_MUST_USE
+stm_status stm_fs_migrate_policy_step(stm_fs *fs,
+                                          uint64_t dataset_id,
+                                          const stm_fs_migrate_policy_params *params,
+                                          stm_fs_migrate_policy_stats *out_stats);
+
 /* ========================================================================= */
 /* Inspection + control.                                                      */
 /* ========================================================================= */

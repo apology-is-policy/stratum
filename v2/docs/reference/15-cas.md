@@ -526,6 +526,107 @@ sweep) until `stm_scrub_start` re-runs. The orchestrator's own
 `running` flag is what exits the loop — the wrapper itself does
 not signal "done"; it just becomes a quiet passthrough.
 
+## Migration policy (P7-CAS-7)
+
+`stm_fs_migrate_to_cold` (P7-CAS-2) is a per-(ds, ino) imperative
+primitive: the caller chooses the file. P7-CAS-7 adds a per-pass
+**policy step** that decides which files to migrate, composing
+over the existing primitive.
+
+```c
+typedef struct {
+    uint64_t min_age_txgs;   /* eligibility threshold */
+    uint32_t max_inos;       /* per-pass count cap (0 = unlimited) */
+    uint32_t _reserved0;
+    uint64_t max_bytes;      /* per-pass byte cap (0 = unlimited) */
+} stm_fs_migrate_policy_params;
+
+typedef struct {
+    uint64_t inos_visited;
+    uint64_t inos_eligible;
+    uint64_t inos_migrated;
+    uint64_t bytes_migrated;
+    stm_status last_err;
+    uint64_t   last_err_ino;
+} stm_fs_migrate_policy_stats;
+
+stm_status stm_fs_migrate_policy_step(stm_fs *fs,
+                                          uint64_t dataset_id,
+                                          const stm_fs_migrate_policy_params *params,
+                                          stm_fs_migrate_policy_stats *out_stats);
+```
+
+**v1 heuristic** (NOVEL #6 v1 in CLAUDE.md mission numbering /
+NOVEL.md §3.3's "Migration engine: heuristic v1"):
+
+- **Eligibility**: every live extent at (ds, ino) is HOT AND
+  the newest extent's `link_gen` is at least `min_age_txgs`
+  behind `stm_sync_current_gen` at the call site. Mixed
+  (HOT+COLD) inos are skipped — partial migration is not v1
+  scope. Empty / fully-COLD inos are skipped silently.
+- **Ordering**: candidates are visited in (ino)-ascending order
+  — the natural delivery order of `stm_extent_iter_ds`. v1 does
+  not prioritize by age / frequency / size.
+- **Budgets**: `max_inos` (count, 0=unlimited) + `max_bytes`
+  (bytes-from-collect-snapshot, 0=unlimited). Checked BEFORE
+  each candidate's migrate; once a cap is reached, the pass
+  stops without partial-ino migration.
+- **Lock posture**: takes fs->lock during candidate collection
+  (delegated to the sync-layer helper
+  `stm_sync_migrate_policy_collect`), drops it between
+  collection and per-ino migrate. Each per-ino migrate
+  re-acquires fs->lock fresh — the pass is **interruptible**
+  (concurrent writers and admin calls interleave between
+  candidates).
+- **Soft vs hard errors**: STM_EWEDGED / STM_EROFS / STM_ENOMEM
+  abort the pass and bubble up. STM_EBADTAG / STM_EIO /
+  STM_ENOSPC / STM_ECORRUPT are recorded in
+  `out_stats->{last_err, last_err_ino}` and the pass continues
+  to subsequent candidates — a single corrupt file should not
+  stall the whole tier.
+- **Concurrency drift**: between collect and per-ino migrate
+  the file may have been overwritten / truncated / deleted /
+  migrated by another caller. The migrate primitive is
+  idempotent at the (ds, ino) granularity (already-migrated →
+  STM_OK no-op; deleted → empty-set STM_OK no-op), so drift is
+  benign. `bytes_migrated` is approximate — concurrent
+  shrinks/extends cause it to drift from the snapshot bytes.
+
+The sync-layer helper `stm_sync_migrate_policy_collect(s, ds,
+cutoff_link_gen, *out_cands, *out_n_cands, *out_inos_visited)` is
+exposed publicly so future orchestrators can preview candidates
+without performing migration. RO handles can run collect; only
+the migrate step refuses RO.
+
+Composition: pure caller of `stm_fs_migrate_to_cold` (which is
+itself a thin wrapper over `stm_sync_migrate_to_cold`). No new
+state-machine semantics → `cas.tla::MigrateToCold` already covers
+the data plane → no spec extension. The heuristic does not
+introduce a load-bearing invariant — worst case is suboptimal
+hot/cold placement, never data corruption.
+
+**Per-dataset opt-in**: v1 leaves dataset selection to the
+caller — a periodic orchestrator iterates the datasets it wants
+to manage and calls the policy step per dataset. A future
+`STM_PROP_TIERING` enum value + a wrapper
+`stm_fs_migrate_policy_pass_all(fs, *params, *out_stats)` that
+walks all datasets with tiering=on would be a separate chunk
+(it requires bumping `STM_PROP_COUNT` from 3 to 4, which is a
+UB-version format break per the dataset-value-layout comment).
+
+**Future work** (not in v1):
+
+- Promotion (cold → hot) heuristic — currently auto-rehydrate
+  is the only cold→hot path, triggered by overlapping writes.
+  A "promote-on-frequent-read" policy would extend the heuristic
+  with a per-extent read counter.
+- Learned policy v2 — replace the age threshold with an
+  ML-derived eligibility predicate (per NOVEL.md §3.3 Phase II
+  scope deferral).
+- `STM_PROP_TIERING` per-dataset opt-in (above).
+- `bytes_migrated` exact accounting via post-migrate count
+  observation (instead of snapshot-from-collect).
+
 ## Cold-extent reflink (P7-CAS-3)
 
 `stm_sync_reflink` accepts source files containing COLD extents (was

@@ -533,6 +533,112 @@ stm_status stm_fs_migrate_to_cold(stm_fs *fs,
     return s;
 }
 
+/* P7-CAS-7: stm_fs_migrate_policy_step. v1 age-based migration-policy
+ * primitive. Composes over stm_fs_migrate_to_cold — selects HOT inos
+ * via stm_sync_migrate_policy_collect under fs->lock, drops fs->lock,
+ * then calls stm_fs_migrate_to_cold per candidate (which re-takes the
+ * lock fresh). The drop-between-candidates pattern means concurrent
+ * writers / admin calls can interleave, which is intentional: a long
+ * migration pass should not block the rest of the FS for its
+ * duration.
+ *
+ * Concurrency drift between collect and per-ino migrate is benign:
+ * already-migrated and deleted inos resolve to STM_OK no-ops. New
+ * HOT writes between collect and migrate just mean the migrated set
+ * is larger than the snapshot; bytes_migrated is approximate as
+ * documented.
+ *
+ * Hard errors (STM_EWEDGED / STM_EROFS / STM_ENOMEM) abort the pass
+ * and bubble up. Soft errors (STM_EBADTAG, STM_EIO, STM_ENOSPC,
+ * STM_ECORRUPT) are recorded in last_err/last_err_ino and the pass
+ * continues — a single corrupt file should not stall the whole tier.
+ * The first soft error wins the last_err slot; subsequent errors are
+ * silently swallowed (they're not the cause of the pass's outcome,
+ * just incidental).
+ */
+stm_status stm_fs_migrate_policy_step(stm_fs *fs,
+                                          uint64_t dataset_id,
+                                          const stm_fs_migrate_policy_params *params,
+                                          stm_fs_migrate_policy_stats *out_stats)
+{
+    if (!fs || !params)         return STM_EINVAL;
+    if (dataset_id == 0u)       return STM_EINVAL;
+
+    /* Init out_stats if provided. We always write the full struct on
+     * success and on partial-progress returns; init to zero up front
+     * so a caller observing on a STM_EINVAL early-return sees a
+     * defined value. */
+    stm_fs_migrate_policy_stats local_stats = {0};
+    stm_fs_migrate_policy_stats *stats = out_stats ? out_stats : &local_stats;
+    *stats = (stm_fs_migrate_policy_stats){0};
+
+    /* Step 1: take fs->lock, run the wedged/RO guards (RO is a hard
+     * refusal — the policy mutates state), read current_gen, compute
+     * cutoff, run the collect. Drop fs->lock. */
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+
+    uint64_t cur_gen = stm_sync_current_gen(fs->sync);
+    /* Saturating subtraction: if min_age >= cur_gen, no live extent's
+     * link_gen (>= 1 for any real extent) qualifies. Use cutoff = 0
+     * which excludes everything (link_gen >= 1 by the index's
+     * BirthTxgBound). */
+    uint64_t cutoff = (params->min_age_txgs >= cur_gen)
+                        ? 0u
+                        : (cur_gen - params->min_age_txgs);
+
+    stm_sync_migrate_candidate *cands = NULL;
+    size_t   n_cands       = 0u;
+    uint64_t inos_visited  = 0u;
+    stm_status cs = stm_sync_migrate_policy_collect(fs->sync, dataset_id,
+                                                       cutoff,
+                                                       &cands, &n_cands,
+                                                       &inos_visited);
+    pthread_mutex_unlock(&fs->lock);
+
+    if (cs != STM_OK) {
+        /* On collect failure, stats reflect zero work — leave the
+         * struct zeroed. cands is guaranteed NULL on failure per
+         * the collect contract. */
+        return cs;
+    }
+
+    stats->inos_visited  = inos_visited;
+    stats->inos_eligible = (uint64_t)n_cands;
+
+    /* Step 2: walk candidates, applying budgets. Each per-ino migrate
+     * re-takes fs->lock fresh — interleaved writers / admin calls
+     * may proceed between candidates. */
+    for (size_t i = 0; i < n_cands; i++) {
+        if (params->max_inos != 0u
+            && stats->inos_migrated >= (uint64_t)params->max_inos) break;
+        if (params->max_bytes != 0u
+            && stats->bytes_migrated >= params->max_bytes) break;
+
+        uint64_t ino   = cands[i].ino;
+        uint64_t bytes = cands[i].bytes;
+        stm_status one = stm_fs_migrate_to_cold(fs, dataset_id, ino);
+        if (one == STM_OK) {
+            stats->inos_migrated++;
+            stats->bytes_migrated += bytes;
+            continue;
+        }
+        /* Hard errors abort the pass — propagate to caller. */
+        if (one == STM_EWEDGED || one == STM_EROFS || one == STM_ENOMEM) {
+            free(cands);
+            return one;
+        }
+        /* Soft error: record first, continue. */
+        if (stats->last_err == STM_OK) {
+            stats->last_err     = one;
+            stats->last_err_ino = ino;
+        }
+    }
+
+    free(cands);
+    return STM_OK;
+}
+
 /* ========================================================================= */
 /* Dataset creation (P7-13).                                                  */
 /* ========================================================================= */
