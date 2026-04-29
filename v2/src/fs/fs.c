@@ -746,9 +746,12 @@ stm_status stm_fs_migrate_policy_pass_all(
 
         stm_fs_migrate_policy_params adj = *params;
         if (adj.max_inos != 0u) {
-            uint64_t remaining = (uint64_t)params->max_inos - stats->inos_migrated;
-            adj.max_inos = (remaining > UINT32_MAX) ? UINT32_MAX
-                                                    : (uint32_t)remaining;
+            /* R59 P3-3: pre-loop check above guarantees
+             * stats->inos_migrated < params->max_inos, so the
+             * subtraction is positive and bounded by uint32_t —
+             * no width-saturation needed. */
+            adj.max_inos =
+                    (uint32_t)((uint64_t)params->max_inos - stats->inos_migrated);
         }
         if (adj.max_bytes != 0u) {
             adj.max_bytes = params->max_bytes - stats->bytes_migrated;
@@ -769,16 +772,20 @@ stm_status stm_fs_migrate_policy_pass_all(
             stats->last_err_ino        = per_stats.last_err_ino;
         }
 
-        /* Hard errors abort. The per-step call already stamps its
-         * own last_err_ino on hard returns (R58 P3-4); we promote
-         * to the pass-all error slot only if no soft error was
-         * already recorded earlier. */
+        /* Hard errors abort. R59 P2-1: unconditionally override the
+         * last_err slot — the hard error IS the proximate cause of
+         * the abort and is what the operator most needs to see. The
+         * per-step primitive (stm_fs_migrate_policy_step) follows
+         * the same pattern under R58 P3-4 (overwrites any soft
+         * last_err on hard return). The prior guarded version
+         * silently retained an earlier soft error in the slot,
+         * leaving the operator with stale dataset/ino info that
+         * pointed at a different file than the one that actually
+         * exhausted memory / wedged the handle. */
         if (rc == STM_EWEDGED || rc == STM_EROFS || rc == STM_ENOMEM) {
-            if (stats->last_err == STM_OK || stats->last_err == filter_err) {
-                stats->last_err            = rc;
-                stats->last_err_dataset_id = ds;
-                stats->last_err_ino        = per_stats.last_err_ino;
-            }
+            stats->last_err            = rc;
+            stats->last_err_dataset_id = ds;
+            stats->last_err_ino        = per_stats.last_err_ino;
             free(ctx.ids);
             return rc;
         }

@@ -70,14 +70,22 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   per-step primitive — no new state-machine semantics, no spec
   extension required. property.tla unchanged (parametric over
   Properties; existing INHERITABLE-class invariants already
-  cover the new property). test_fs grows 116 → 123 (7 new
-  P7-CAS-8 tests covering pool-default off/on, local override,
-  inheritance through chain, shared max_inos budget, arg
-  validation, RO refusal). test_dataset grows 57 → 59 (TIERING
-  classification + inheritance + persistence roundtrip across
-  the v20 layout). 35 ctest suites green default + ASan + TSan
-  in isolation. Spec posture unchanged: 21 modules / 25 fixed
-  cfgs / 34 buggy cfgs. R59 audit forthcoming.**
+  cover the new property). test_fs grows 116 → 125 (7 P7-CAS-8
+  primary tests + 2 R59 regressions: soft-error-then-clean
+  continuation via bdev fault injection; wedged refusal).
+  test_dataset grows 57 → 59 (TIERING classification +
+  inheritance + persistence roundtrip; existing
+  `dataset_persist_commit_load_roundtrip` extended to exercise
+  STM_PROP_TIERING through the v20 encode/decode). 35 ctest
+  suites green default + ASan + TSan in isolation. Spec posture
+  unchanged: 21 modules / 25 fixed cfgs / 34 buggy cfgs. R59
+  audit verdict: 0 P0 + 0 P1 + 1 P2 + 3 P3 — all addressed
+  inline (P2-1 unconditional hard-error override of
+  `stats->last_err` matches the per-step primitive's R58 P3-4
+  contract; P3-1 dataset.h on-disk value-layout doc updated for
+  v20; P3-2 persistence roundtrip extended to exercise
+  STM_PROP_TIERING; P3-3 dropped unreachable width-saturation
+  branch in budget arithmetic).**
   Prior P7-CAS-7 substantive `1d5255c` + R58 close `231e5ff` +
   hash fixup `80d6ba0`.
   **P7-CAS-7 — migration-policy heuristic v1 (NOVEL #6 v1 in

@@ -88,13 +88,23 @@ into the CAS tier (which DOES need P6) is a separate concern.
       spec extension required. property.tla unchanged
       (parametric over Properties; the existing INHERITABLE
       classification + invariants already cover TIERING — same
-      class as `compress`). test_fs grows 116 → 123 (7 new
-      P7-CAS-8 tests). test_dataset grows 57 → 59 (TIERING
-      classification + inheritance + persistence roundtrip
-      across the v20 layout). test_pool UB-version assertion
-      bumped 19 → 20. 35 ctest suites green default + ASan +
-      TSan in isolation. Spec posture unchanged: 21 modules /
-      25 fixed cfgs / 34 buggy cfgs.
+      class as `compress`). test_fs grows 116 → 125 (7 P7-CAS-8
+      primary tests + 2 R59 regressions: soft-error-then-clean
+      continuation, wedged refusal). test_dataset grows 57 →
+      59 (TIERING classification + inheritance + persistence
+      roundtrip; existing `dataset_persist_commit_load_roundtrip`
+      extended to exercise STM_PROP_TIERING through the v20
+      encode/decode). test_pool UB-version assertion bumped
+      19 → 20. 35 ctest suites green default + ASan + TSan in
+      isolation. Spec posture unchanged: 21 modules / 25 fixed
+      cfgs / 34 buggy cfgs. R59 audit verdict: 0 P0 + 0 P1 + 1
+      P2 + 3 P3 — all addressed inline (P2-1 unconditional
+      hard-error override of `stats->last_err` matches per-step
+      primitive's R58 P3-4 contract; P3-1 dataset.h on-disk
+      value-layout doc updated for v20; P3-2 persistence
+      roundtrip extended to verify STM_PROP_TIERING; P3-3
+      dropped unreachable width-saturation branch in budget
+      arithmetic).
 
 - [x] **P7-CAS-7 migration-policy heuristic v1** — substantive
       `1d5255c` + R58 close `231e5ff` + hash-fixup (this

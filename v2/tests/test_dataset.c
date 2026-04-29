@@ -1391,11 +1391,18 @@ STM_TEST(dataset_persist_commit_load_roundtrip) {
     STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID, "alpha", &a_id));
     STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID, "beta",  &b_id));
     STM_ASSERT_OK(stm_dataset_create_child(idx, a_id,                "gamma", &c_id));
-    /* Property work: set inheritable on root, immutable on alpha. */
+    /* Property work: set inheritable on root, immutable on alpha.
+     * R59 P3-2: also exercise the slot-3 encode path by setting
+     * STM_PROP_TIERING (P7-CAS-8) so the v20 layout's 4th
+     * local_value slot survives the on-disk roundtrip. */
     STM_ASSERT_OK(stm_dataset_set_property(idx, STM_DATASET_ROOT_ID,
                                               STM_PROP_COMPRESS, 0xaa));
     STM_ASSERT_OK(stm_dataset_set_property(idx, a_id,
                                               STM_PROP_ENCRYPTION, 0xbb));
+    STM_ASSERT_OK(stm_dataset_set_property(idx, STM_DATASET_ROOT_ID,
+                                              STM_PROP_TIERING, 1u));
+    STM_ASSERT_OK(stm_dataset_set_property(idx, a_id,
+                                              STM_PROP_TIERING, 0u));
     STM_ASSERT_OK(stm_dataset_set_pool_default(idx, STM_PROP_QUOTA, 0x1234));
     /* Destroy beta to exercise ABSENT slots in the encode path. */
     STM_ASSERT_OK(stm_dataset_destroy(idx, b_id));
@@ -1458,6 +1465,18 @@ STM_TEST(dataset_persist_commit_load_roundtrip) {
     STM_ASSERT_OK(stm_dataset_effective_property(idx2, STM_DATASET_ROOT_ID,
                                                     STM_PROP_QUOTA, &v));
     STM_ASSERT_EQ(v, 0x1234u);  /* pool default */
+    /* R59 P3-2: STM_PROP_TIERING (slot 3) survives the v20 layout
+     * encode/decode roundtrip. Root has it set to 1, alpha locally
+     * cleared to 0; gamma inherits alpha's 0. */
+    STM_ASSERT_OK(stm_dataset_effective_property(idx2, STM_DATASET_ROOT_ID,
+                                                    STM_PROP_TIERING, &v));
+    STM_ASSERT_EQ(v, 1u);
+    STM_ASSERT_OK(stm_dataset_effective_property(idx2, a_id,
+                                                    STM_PROP_TIERING, &v));
+    STM_ASSERT_EQ(v, 0u);
+    STM_ASSERT_OK(stm_dataset_effective_property(idx2, c_id,
+                                                    STM_PROP_TIERING, &v));
+    STM_ASSERT_EQ(v, 0u);  /* gamma inherits alpha's local 0 */
 
     stm_dataset_index_close(idx2);
     stm_bootstrap_close(b);

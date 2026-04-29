@@ -434,9 +434,11 @@ stm_status stm_dataset_clones_count_for_snap(const stm_dataset_index *idx,
  * The dataset index is persisted as a btree_store-encoded, AEAD-encrypted
  * tree under `ub_main_root`. The tree's keyspace mixes:
  *   - Dataset entries:       key = le64 dataset_id (≥ 1), value = packed entry.
- *   - Pool-property defaults: key = le64 0, value = STM_PROP_COUNT × le64.
+ *   - Pool-property defaults: key = le64 0, value = STM_PROP_COUNT × le64
+ *                              (32 bytes at v20; 24 bytes at v19; 8 × N).
  *
- * On-disk per-dataset value (variable length, name_len bytes for the name):
+ * On-disk per-dataset value (variable length, name_len bytes for the name).
+ * v20 layout (current):
  *
  *   off  size  field
  *    0    8   parent_id (le64)
@@ -445,13 +447,28 @@ stm_status stm_dataset_clones_count_for_snap(const stm_dataset_index *idx,
  *   24    4   flags (le32)
  *   28    2   local_set_bitmap (le16) — bits 0..STM_PROP_COUNT-1 = local_set[]
  *   30    2   name_len (le16) — 0..STM_DATASET_NAME_MAX
- *   32   24   local_value[STM_PROP_COUNT] (3 × le64, in property-id order)
- *   56    L   name (UTF-8, no NUL)  L = name_len
+ *   32   32   local_value[STM_PROP_COUNT] (4 × le64 at v20, in property-id order)
+ *   64    8   origin_snap_id (le64) — STM_DATASET_NO_ORIGIN (0) for non-clones (v10)
+ *   72    L   name (UTF-8, no NUL)   L = name_len
  *
- * Total: 56 + name_len bytes.  Bumping STM_PROP_COUNT requires a UB-version
- * bump (the value layout shifts).  Crypt + I/O follow the alloc_roots
- * pattern: AEAD nonce paddr‖gen‖pool_uuid, AD pool_uuid‖device_uuid_0,
- * idempotent commit via internal dirty flag.
+ * Total: 72 + name_len bytes (v20).
+ *
+ * Format-break history:
+ *   v9  → v10: added origin_snap_id at offset 56 (P6-clone). Total
+ *              became 64 + name_len bytes.
+ *   v19 → v20: STM_PROP_COUNT 3 → 4 (P7-CAS-8 STM_PROP_TIERING).
+ *              local_value grows from 24 to 32 bytes; origin_snap_id
+ *              moves from offset 56 to offset 64; total 72 + name_len.
+ *
+ * The on-disk encoder/decoder express origin_snap_id's offset as
+ * `32 + 8 * STM_PROP_COUNT` so future STM_PROP_COUNT bumps slide it
+ * without code duplication. Bumping STM_PROP_COUNT requires a
+ * UB-version bump (v19 pools refused at v20 mount via uniform
+ * STM_EBADVERSION).
+ *
+ * Crypt + I/O follow the alloc_roots pattern: AEAD nonce
+ * paddr‖gen‖pool_uuid, AD pool_uuid‖device_uuid_0, idempotent commit
+ * via internal dirty flag.
  */
 
 /*
