@@ -74,15 +74,21 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   `cas.tla::MigrateToCold` — no new state-machine semantics, no
   spec extension required. v1 limitations + future work documented
   in `reference/15-cas.md`'s new "Migration policy (P7-CAS-7)"
-  subsection. test_fs grows 102 → 113 (11 new tests: basic age=0
-  migrates, age threshold blocks then unblocks after commits,
-  max_inos cap, max_bytes cap, already-cold skipped, mixed-tier
-  skipped, arg validation, RO refused, NULL out_stats accepted,
-  empty dataset no-op, min_age=UINT64_MAX saturating-to-zero). 35
-  ctest suites green default + ASan + TSan in isolation. Spec
-  posture unchanged: 21 modules / 25 fixed cfgs / 34 buggy cfgs.
-  No format break — STM_UB_VERSION = 19 preserved. R58 audit
-  forthcoming.**
+  subsection. test_fs grows 102 → 116 (11 P7-CAS-7 primary tests
+  + 3 R58 regressions: multi-dataset filtering, reserved-field
+  rejection, soft-error mid-pass continuation via bdev fault
+  injection). 35 ctest suites green default + ASan + TSan in
+  isolation. Spec posture unchanged: 21 modules / 25 fixed cfgs /
+  34 buggy cfgs. No format break — STM_UB_VERSION = 19 preserved.
+  R58 audit verdict: 0 P0 + 0 P1 + 0 P2 + 7 P3 — green signal;
+  all 7 P3s addressed inline (P3-1 zero-init out_stats before
+  validation; P3-2 same fix on the sync-layer collect helper;
+  P3-3 documented the out_inos_visited error contract; P3-4 stamp
+  last_err / last_err_ino on hard-error abort for operator
+  diagnostics; P3-5 added soft-error mid-pass regression test
+  using stm_bdev_inject_fail_after; P3-6 added multi-dataset
+  filtering test; P3-7 reject non-zero `_reserved0` to lock down
+  forward compat).**
   Prior P7-CAS-6 substantive `b1a4816` + R57 close `8412194` +
   hash fixup `ee69459`.
   **P7-CAS-6 — scrub-orchestrator wrapper. Adds public API

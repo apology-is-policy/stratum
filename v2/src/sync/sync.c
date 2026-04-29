@@ -5944,15 +5944,19 @@ stm_status stm_sync_migrate_policy_collect(
         size_t *out_n_cands,
         uint64_t *out_inos_visited)
 {
+    /* R58 P3-2: init non-NULL out-params BEFORE the null-arg
+     * validation so the documented "on non-OK *out_cands is NULL,
+     * *out_n_cands is 0, *out_inos_visited is 0" contract holds on
+     * EVERY error path including `!s`. The previous order returned
+     * STM_EINVAL on `!s` BEFORE writing the out-params, leaving
+     * pre-call garbage in *out_cands (a caller that trusts the
+     * contract and free()s on EINVAL would attempt to free that
+     * garbage). Symmetric to R57 P3-5's pattern in
+     * stm_sync_scrub_step_with_cas_gc. */
+    if (out_cands)        *out_cands         = NULL;
+    if (out_n_cands)      *out_n_cands       = 0u;
+    if (out_inos_visited) *out_inos_visited  = 0u;
     if (!s || !out_cands || !out_n_cands) return STM_EINVAL;
-    /* Out-param init runs BEFORE NULL-arg checks above? — no:
-     * conventional uniform-contract is "if NULL ptrs, return EINVAL
-     * without writing"; init the out params on STM_OK only — but to
-     * keep failure paths uniform with R57 P3-5's pattern, init early
-     * and overwrite to non-NULL on success. */
-    *out_cands   = NULL;
-    *out_n_cands = 0u;
-    if (out_inos_visited) *out_inos_visited = 0u;
     if (dataset_id == 0u) return STM_EINVAL;
 
     pthread_mutex_lock(&s->lock);

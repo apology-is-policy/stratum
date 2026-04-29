@@ -561,16 +561,23 @@ stm_status stm_fs_migrate_policy_step(stm_fs *fs,
                                           const stm_fs_migrate_policy_params *params,
                                           stm_fs_migrate_policy_stats *out_stats)
 {
+    /* R58 P3-1: zero-init out_stats BEFORE arg validation so a caller
+     * observing on any STM_EINVAL early-return sees a defined value
+     * (matches the documented contract). The previous order initted
+     * AFTER the validation, leaving out_stats as garbage on the
+     * dataset_id==0 path despite the comment claiming otherwise. */
+    if (out_stats) *out_stats = (stm_fs_migrate_policy_stats){0};
     if (!fs || !params)         return STM_EINVAL;
     if (dataset_id == 0u)       return STM_EINVAL;
+    /* R58 P3-7: reject non-zero `_reserved0` so the field stays
+     * exclusively owned by future-version semantics. A caller passing
+     * uninitialized stack memory could otherwise pre-commit to
+     * arbitrary new behavior the day this field becomes meaningful;
+     * locking it down today keeps forward-compat clean. */
+    if (params->_reserved0 != 0u) return STM_EINVAL;
 
-    /* Init out_stats if provided. We always write the full struct on
-     * success and on partial-progress returns; init to zero up front
-     * so a caller observing on a STM_EINVAL early-return sees a
-     * defined value. */
     stm_fs_migrate_policy_stats local_stats = {0};
     stm_fs_migrate_policy_stats *stats = out_stats ? out_stats : &local_stats;
-    *stats = (stm_fs_migrate_policy_stats){0};
 
     /* Step 1: take fs->lock, run the wedged/RO guards (RO is a hard
      * refusal — the policy mutates state), read current_gen, compute
@@ -623,8 +630,13 @@ stm_status stm_fs_migrate_policy_step(stm_fs *fs,
             stats->bytes_migrated += bytes;
             continue;
         }
-        /* Hard errors abort the pass — propagate to caller. */
+        /* Hard errors abort the pass — propagate to caller. R58 P3-4:
+         * also stamp last_err / last_err_ino so the operator sees
+         * which ino's migration triggered the abort. The hard-error
+         * return overrides any prior soft-error recording. */
         if (one == STM_EWEDGED || one == STM_EROFS || one == STM_ENOMEM) {
+            stats->last_err     = one;
+            stats->last_err_ino = ino;
             free(cands);
             return one;
         }

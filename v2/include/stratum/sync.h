@@ -1253,7 +1253,11 @@ typedef struct {
  *   - STM_ENOMEM if the candidate buffer cannot grow.
  *   - Errors from stm_extent_iter_ds bubble up.
  *
- * On non-OK returns *out_cands is NULL and *out_n_cands is 0.
+ * On non-OK returns *out_cands is NULL, *out_n_cands is 0, and
+ * *out_inos_visited (if non-NULL) is 0 — every non-NULL out-param
+ * is initted before any return path so a caller can rely on the
+ * defined-value contract regardless of which validation step
+ * rejected the call.
  *
  * No format break, no spec extension — the heuristic is composition
  * over the existing extent index iteration plus the migrate

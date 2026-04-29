@@ -87,14 +87,18 @@ into the CAS tier (which DOES need P6) is a separate concern.
       only the migrate step refuses RO). Composition over
       `cas.tla::MigrateToCold` — no new state-machine
       semantics, no spec extension required. test_fs grows 102
-      → 113 (11 new P7-CAS-7 tests: basic age=0 migrates, age
-      threshold blocks then unblocks after commits, max_inos
-      cap, max_bytes cap, already-cold skipped, mixed-tier
-      skipped, arg validation, RO refused, NULL out_stats
-      accepted, empty dataset no-op, min_age=UINT64_MAX
-      saturating-to-zero). 35 ctest suites green default +
-      ASan + TSan in isolation. Spec posture unchanged: 21
-      modules / 25 fixed cfgs / 34 buggy cfgs. **No format
+      → 116 (11 P7-CAS-7 primary tests + 3 R58 regressions:
+      multi-dataset filtering, reserved-field rejection,
+      soft-error mid-pass continuation via bdev fault
+      injection). 35 ctest suites green default + ASan + TSan
+      in isolation. Spec posture unchanged: 21 modules / 25
+      fixed cfgs / 34 buggy cfgs. R58 audit verdict: 0 P0 +
+      0 P1 + 0 P2 + 7 P3 — green signal; all 7 P3s addressed
+      inline (zero-init out_stats / *out_cands before
+      validation; documented out_inos_visited error contract;
+      stamp last_err on hard-error abort; soft-error
+      regression test; multi-dataset filtering test; reject
+      non-zero `_reserved0` for forward-compat). **No format
       break — STM_UB_VERSION = 19 preserved.** Per-dataset
       tiering opt-in (`STM_PROP_TIERING`) deferred (would
       require bumping `STM_PROP_COUNT` from 3 to 4, a UB-version

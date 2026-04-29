@@ -378,11 +378,17 @@ stm_status stm_fs_migrate_to_cold(stm_fs *fs,
  * Refusals:
  *   - NULL fs OR NULL params (STM_EINVAL).
  *   - dataset_id == 0 (STM_EINVAL).
+ *   - `params->_reserved0` non-zero (STM_EINVAL — reserved slot,
+ *     R58 P3-7 forward-compat lock).
  *   - Wedged or read-only (STM_EWEDGED / STM_EROFS).
  *   - Errors from extent_iter (STM_ENOMEM) bubble up.
  *
  * `out_stats` may be NULL — callers that don't care about counters
- * can pass NULL.
+ * can pass NULL. When non-NULL, *out_stats is zeroed BEFORE arg
+ * validation runs, so every return path leaves it in a defined
+ * state. R58 P3-4: hard-error returns (STM_EWEDGED / STM_EROFS /
+ * STM_ENOMEM from a per-ino migrate) stamp last_err_ino with the
+ * failing ino so operator diagnostics can identify the offender.
  *
  * Composition: pure caller of stm_fs_migrate_to_cold. No new state-
  * machine semantics beyond the existing migrate primitive — no spec
