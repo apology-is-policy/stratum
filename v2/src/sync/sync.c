@@ -3956,13 +3956,29 @@ stm_cas_index *stm_sync_cas_index(stm_sync *s)
 }
 
 /* P7-CAS-5: out-of-band CAS auto-GC sweep entry point. See sync.h
- * for the contract. Takes sync->lock so the sweep serializes with
- * stm_sync_commit + stm_sync_write_extent + stm_sync_truncate +
- * stm_sync_migrate_to_cold + stm_sync_reflink (all of which mutate
- * cas_idx via paths that hold sync->lock); the cas_idx.lock per-
- * call inside the sweep additionally serializes with the migrate-
- * caller's stm_cas_lookup / stm_cas_ref / stm_cas_insert sequences
- * that themselves take cas_idx.lock briefly per primitive.
+ * for the contract.
+ *
+ * Lock posture (R56 P1-1): mirrors stm_sync_commit at sync.c:2002.
+ * Takes pool.rdlock OUTER → sync.lock INNER per CLAUDE.md's
+ * documented OUTER POOL → INNER SYNC ordering. The pool.rdlock is
+ * required because cas_auto_gc_sweep_locked dereferences
+ * stm_pool_device_info(s->pool, dev) per paddr to consult device
+ * state for the FAULTED/REMOVED skip — pool.h's pointer-returning
+ * readers contract requires pool.rdlock during the deref because
+ * stm_pool_fail_device / stm_pool_finish_evacuation_locked write
+ * slot->state and slot->bdev under pool.wrlock. Without the
+ * rdlock, a TSan run with concurrent stm_pool_fail_device would
+ * diagnose the race; on weakly-ordered hardware the read could
+ * tear the enum value.
+ *
+ * Sync.lock + cas_idx.lock per-call inside the sweep serialize
+ * with stm_sync_commit + stm_sync_write_extent + stm_sync_truncate
+ * + stm_sync_migrate_to_cold + stm_sync_reflink (all of which
+ * mutate cas_idx via paths that hold sync->lock); the cas_idx.lock
+ * per-call inside the sweep additionally serializes with the
+ * migrate-caller's stm_cas_lookup / stm_cas_ref / stm_cas_insert
+ * sequences that themselves take cas_idx.lock briefly per
+ * primitive.
  *
  * Returns STM_OK on success, STM_EWEDGED / STM_EROFS / STM_EINVAL
  * on guard failure, or the first per-tuple non-OK from the sweep
@@ -3970,11 +3986,21 @@ stm_cas_index *stm_sync_cas_index(stm_sync *s)
 stm_status stm_sync_cas_gc_sweep(stm_sync *s)
 {
     if (!s) return STM_EINVAL;
+    stm_pool_lock_shared(s->pool);
     pthread_mutex_lock(&s->lock);
-    if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
-    if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
+    if (s->wedged) {
+        pthread_mutex_unlock(&s->lock);
+        stm_pool_unlock_shared(s->pool);
+        return STM_EWEDGED;
+    }
+    if (s->read_only) {
+        pthread_mutex_unlock(&s->lock);
+        stm_pool_unlock_shared(s->pool);
+        return STM_EROFS;
+    }
     stm_status ret = cas_auto_gc_sweep_locked(s);
     pthread_mutex_unlock(&s->lock);
+    stm_pool_unlock_shared(s->pool);
     return ret;
 }
 

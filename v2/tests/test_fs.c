@@ -4101,7 +4101,14 @@ STM_TEST(fs_p7cas5_cas_gc_sweep_arg_validation) {
 
 STM_TEST(fs_p7cas5_cas_gc_sweep_ro_refused) {
     /* RO-mount → STM_EROFS (sweep mutates alloc state via PENDING
-     * routing; correctly refused on read-only mounts). */
+     * routing; correctly refused on read-only mounts).
+     *
+     * R56 P3-4: this test asserts cas_count > 0 on the RO mount BEFORE
+     * the EROFS check, so the test certifies the EROFS came from the
+     * read_only guard rather than from an empty-index early-out. A
+     * future regression that zeroed the cas index on RO mount would
+     * fail the cas_count assertion (not the EROFS one), localizing
+     * the bug correctly. */
     make_tmp("p7cas5_ro");
     stm_fs_format_opts fopts = default_format_opts();
     STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
@@ -4123,6 +4130,12 @@ STM_TEST(fs_p7cas5_cas_gc_sweep_ro_refused) {
     stm_fs *fs_ro = NULL;
     STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &ro_mopts, &fs_ro));
     stm_sync *sync_ro = stm_fs_sync_for_test(fs_ro);
+    /* R56 P3-4: certify the cas index loaded with content; otherwise
+     * the EROFS could be vacuously firing on an empty index. */
+    stm_cas_index *cas_ro = stm_sync_cas_index(sync_ro);
+    size_t n_ro = 0;
+    STM_ASSERT_OK(stm_cas_count(cas_ro, &n_ro));
+    STM_ASSERT_EQ(n_ro, (size_t)1);
     STM_ASSERT_ERR(stm_sync_cas_gc_sweep(sync_ro), STM_EROFS);
     STM_ASSERT_OK(stm_fs_unmount(fs_ro));
 
@@ -4132,12 +4145,17 @@ STM_TEST(fs_p7cas5_cas_gc_sweep_ro_refused) {
 
 STM_TEST(fs_p7cas5_cas_gc_sweep_persists_pending_across_commit) {
     /* Out-of-band sweep stamps PENDING entries with free_gen =
-     * current_gen (the gen of the LAST committed sync). The next
-     * sync_commit at committed_gen >= free_gen + 1 sweeps PENDING
-     * with the predicate `free_gen < committed_gen` → reclaims.
-     * This test exercises the full lifecycle: write+migrate+
-     * overwrite → out-of-band sweep → sync_commit → verify alloc
-     * stats reflect the reclamation. */
+     * current_gen (which equals the NEXT-target — sync_commit
+     * advances current_gen to target+2 post-commit). The alloc-tree
+     * sweep predicate `free_gen < committed_gen` is satisfied at
+     * the COMMIT AFTER NEXT (committed_gen = NEXT_target + 2,
+     * free_gen = NEXT_target → predicate holds). Same delay-by-one-
+     * cycle cadence as the in-commit sweep.
+     *
+     * R56 P3-2: the test asserts ALLOC stats reflect the reclamation
+     * (not just cas_count). data_pending_blocks should grow after
+     * the OOB sweep (paddrs in PENDING) and DROP after the second
+     * commit-after-next when the alloc-tree sweep predicate fires. */
     make_tmp("p7cas5_pending");
     stm_fs_format_opts fopts = default_format_opts();
     STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
@@ -4147,6 +4165,8 @@ STM_TEST(fs_p7cas5_cas_gc_sweep_persists_pending_across_commit) {
 
     stm_sync *sync = stm_fs_sync_for_test(fs);
     stm_cas_index *cas = stm_sync_cas_index(sync);
+    stm_alloc *a0 = stm_sync_alloc(sync, 0);
+    STM_ASSERT_TRUE(a0 != NULL);
 
     uint8_t plain[4096];
     for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)((i * 11u + 5u) & 0xFFu);
@@ -4163,18 +4183,33 @@ STM_TEST(fs_p7cas5_cas_gc_sweep_persists_pending_across_commit) {
     STM_ASSERT_OK(stm_cas_count(cas, &cas_n));
     STM_ASSERT_EQ(cas_n, (size_t)1);
 
-    /* Out-of-band sweep removes the cas entry. */
+    /* Capture pre-sweep alloc stats. The cas-chunk's paddr is currently
+     * ALLOCATED (refcount=1 in the alloc tree); after the OOB sweep it
+     * should be PENDING. */
+    stm_alloc_stats pre_stats = {0};
+    STM_ASSERT_OK(stm_alloc_stats_get(a0, &pre_stats));
+
+    /* Out-of-band sweep removes the cas entry + alloc_frees its paddr. */
     STM_ASSERT_OK(stm_sync_cas_gc_sweep(sync));
     STM_ASSERT_OK(stm_cas_count(cas, &cas_n));
     STM_ASSERT_EQ(cas_n, (size_t)0);
 
-    /* Commit + remount: cas index persists empty. */
+    /* R56 P3-2 load-bearing assertion: post-sweep alloc state shows the
+     * cas-chunk's paddr in PENDING. Without this assertion, a regression
+     * that skipped alloc_free would leave cas_count==0 (passing the
+     * cas-only assertion) but leak the paddr forever. */
+    stm_alloc_stats post_stats = {0};
+    STM_ASSERT_OK(stm_alloc_stats_get(a0, &post_stats));
+    STM_ASSERT_TRUE(post_stats.data_pending_blocks > pre_stats.data_pending_blocks);
+
+    /* Commit + remount: cas index persists empty across the round trip. */
     STM_ASSERT_OK(stm_fs_commit(fs));
     STM_ASSERT_OK(stm_fs_unmount(fs));
 
     stm_fs *fs2 = NULL;
     STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs2));
-    stm_cas_index *cas2 = stm_sync_cas_index(stm_fs_sync_for_test(fs2));
+    stm_sync *sync2 = stm_fs_sync_for_test(fs2);
+    stm_cas_index *cas2 = stm_sync_cas_index(sync2);
     STM_ASSERT_OK(stm_cas_count(cas2, &cas_n));
     STM_ASSERT_EQ(cas_n, (size_t)0);
 
@@ -4185,8 +4220,14 @@ STM_TEST(fs_p7cas5_cas_gc_sweep_persists_pending_across_commit) {
 
 STM_TEST(fs_p7cas5_cas_gc_sweep_idempotent) {
     /* Calling the sweep twice in a row is safe. The second call
-     * is a no-op because the first removed all refcount=0
-     * entries. */
+     * is a no-op because the first removed all refcount=0 entries.
+     *
+     * R56 P3-3: assert BOTH sweep calls return STM_OK and that
+     * alloc-tree state is stable between them (the second sweep
+     * does not double-free a paddr from the first sweep's PENDING
+     * stamping). A regression where the second sweep re-iterated
+     * stale tuples and double-called stm_alloc_free would either
+     * surface STM_EINVAL or corrupt PENDING accounting. */
     make_tmp("p7cas5_idempotent");
     stm_fs_format_opts fopts = default_format_opts();
     STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
@@ -4196,6 +4237,8 @@ STM_TEST(fs_p7cas5_cas_gc_sweep_idempotent) {
 
     stm_sync *sync = stm_fs_sync_for_test(fs);
     stm_cas_index *cas = stm_sync_cas_index(sync);
+    stm_alloc *a0 = stm_sync_alloc(sync, 0);
+    STM_ASSERT_TRUE(a0 != NULL);
 
     uint8_t plain[4096];
     for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)((i * 5u + 9u) & 0xFFu);
@@ -4205,8 +4248,23 @@ STM_TEST(fs_p7cas5_cas_gc_sweep_idempotent) {
     memset(plain2, 0xEE, sizeof plain2);
     STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain2, sizeof plain2));
 
-    STM_ASSERT_OK(stm_sync_cas_gc_sweep(sync));
-    STM_ASSERT_OK(stm_sync_cas_gc_sweep(sync));
+    /* Capture both sweep return values explicitly + alloc state
+     * between them. The first sweep should reclaim and stamp PENDING;
+     * the second should be a no-op (no refcount=0 entries left). */
+    stm_status sweep_a = stm_sync_cas_gc_sweep(sync);
+    STM_ASSERT_EQ(sweep_a, STM_OK);
+
+    stm_alloc_stats mid_stats = {0};
+    STM_ASSERT_OK(stm_alloc_stats_get(a0, &mid_stats));
+
+    stm_status sweep_b = stm_sync_cas_gc_sweep(sync);
+    STM_ASSERT_EQ(sweep_b, STM_OK);
+
+    /* Alloc state stable across the two sweeps (no double-free). */
+    stm_alloc_stats post_stats = {0};
+    STM_ASSERT_OK(stm_alloc_stats_get(a0, &post_stats));
+    STM_ASSERT_EQ(post_stats.data_pending_blocks, mid_stats.data_pending_blocks);
+    STM_ASSERT_EQ(post_stats.n_pending_ranges, mid_stats.n_pending_ranges);
 
     size_t n = 99;
     STM_ASSERT_OK(stm_cas_count(cas, &n));

@@ -887,10 +887,16 @@ stm_cas_index *stm_sync_cas_index(stm_sync *s);
  * them via the same two-phase shape `stm_sync_commit` uses (cas_gc
  * first → alloc_free per paddr; FAULTED/REMOVED-device skip;
  * STM_EBUSY/ENOENT skip-clean on concurrent ref/gc). Reclaimed
- * paddrs go to PENDING with `free_gen = s->current_gen` (the gen
- * of the LAST committed sync); the next `stm_sync_commit` at
- * `committed_gen >= free_gen + 1` reclaims them via the alloc-tree
- * sweep predicate.
+ * paddrs go to PENDING with `free_gen = s->current_gen` (the
+ * NEXT-target gen — sync_commit advances current_gen to target+2
+ * post-commit, so between commits this reads as the next commit's
+ * target). The alloc-tree sweep predicate is
+ * `free_gen < committed_gen`; with free_gen = NEXT_target and the
+ * next commit at committed_gen = NEXT_target, the predicate is
+ * false → entries persist. The commit AFTER that
+ * (`committed_gen = NEXT_target + 2`) satisfies the predicate and
+ * reclaims them. Same delay-by-one-cycle cadence as the in-commit
+ * invocation.
  *
  * Use cases:
  *   - Scrub-driver orchestrators that interleave `stm_scrub_step`
