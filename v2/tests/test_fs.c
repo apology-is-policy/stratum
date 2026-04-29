@@ -4443,6 +4443,60 @@ STM_TEST(fs_p7cas6_scrub_step_with_cas_gc_arg_validation) {
     unlink(g_key_path);
 }
 
+STM_TEST(fs_p7cas6_scrub_completion_with_null_out_cas_gc_err) {
+    /* R57 P3-4 regression: the completion-firing branch must
+     * tolerate a NULL out_cas_gc_err. A regression that
+     * unconditionally wrote *out_cas_gc_err inside the transition
+     * branch would crash here. The cas_count assertion confirms the
+     * sweep still fired (semantics preserved across NULL-out). */
+    make_tmp("p7cas6_null_out");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+
+    /* Set up a refcount=0 cas entry. */
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)((i * 19u + 7u) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+    uint8_t plain2[4096];
+    memset(plain2, 0xCC, sizeof plain2);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain2, sizeof plain2));
+
+    size_t cas_pre = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &cas_pre));
+    STM_ASSERT_EQ(cas_pre, (size_t)1);
+
+    /* Drive the scrub pass with NULL out_cas_gc_err for every
+     * wrapper call — including the one that fires the sweep. */
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(sync, &sc));
+    STM_ASSERT_OK(stm_sync_scrub_install_production_cb(sync, sc));
+    STM_ASSERT_OK(stm_scrub_start(sc));
+
+    for (int i = 0; i < 4096; i++) {
+        STM_ASSERT_OK(stm_sync_scrub_step_with_cas_gc(sync, sc, NULL));
+        stm_scrub_status st;
+        STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
+        if (st.state == STM_SCRUB_STATE_COMPLETED) break;
+    }
+
+    /* Sweep fired despite NULL out — cas reclaimed. */
+    size_t cas_post = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &cas_post));
+    STM_ASSERT_EQ(cas_post, (size_t)0);
+
+    stm_scrub_close(sc);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST(fs_p7cas6_scrub_idle_state_no_sweep) {
     /* IDLE state: step is a no-op (per scrub.h state-machine
      * docstring). The wrapper does NOT fire the sweep because

@@ -959,10 +959,30 @@ typedef struct stm_scrub stm_scrub;
  * `pool.rdlock + sync.lock`. All released between calls — no
  * lock-graph cycle.
  *
+ * **Single-driver assumption (R57 P3-1 + P3-2)**: this wrapper
+ * assumes the orchestrator is the sole caller of
+ * `stm_scrub_start` / `stm_scrub_pause` / `stm_scrub_reset` on
+ * `sc` for the lifetime of the scrub run. A concurrent
+ * `stm_scrub_reset` or `stm_scrub_start` between the wrapper's
+ * `stm_scrub_step` return and the post-status read can shift
+ * the observed state to IDLE / RUNNING respectively, missing
+ * the RUNNING→COMPLETED transition the wrapper relies on. The
+ * miss is idempotent — the next `stm_sync_commit`'s in-commit
+ * sweep reclaims the same refcount=0 entries — but the cadence
+ * benefit of scrub-driven sweeping is lost for that pass. If
+ * shared-sc orchestration is needed, a sticky completion-signal
+ * mechanism on the scrub side would be the principled fix
+ * (deferred).
+ *
  * Returns:
  *   STM_OK     — step ran (possibly with sweep also firing); check
  *                `*out_cas_gc_err` for sweep status.
- *   STM_EINVAL — NULL `s` or `sc`.
+ *   STM_EINVAL — NULL `s` or `sc`. `*out_cas_gc_err` is set to
+ *                STM_OK before the NULL check (uniform contract:
+ *                the out-param always reflects "no sweep error"
+ *                when the wrapper returns; on STM_EINVAL the
+ *                wrapper hasn't run, so STM_OK is the right
+ *                placeholder).
  *   other      — passthrough from `stm_scrub_step` or
  *                `stm_scrub_status_get`. Sweep not fired.
  *

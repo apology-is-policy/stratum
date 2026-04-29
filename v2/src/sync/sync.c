@@ -6402,8 +6402,13 @@ stm_status stm_sync_scrub_install_production_cb(stm_sync *sync, stm_scrub *sc)
 stm_status stm_sync_scrub_step_with_cas_gc(stm_sync *s, stm_scrub *sc,
                                               stm_status *out_cas_gc_err)
 {
-    if (!s || !sc) return STM_EINVAL;
+    /* R57 P3-5: write the out-param BEFORE the NULL-arg check so
+     * STM_EINVAL and STM_OK paths share the same contract — the
+     * out-param always reflects "no sweep error" when the wrapper
+     * returns. Avoids a stale prior cas_err value leaking through
+     * a loop iteration that bails on EINVAL. */
     if (out_cas_gc_err) *out_cas_gc_err = STM_OK;
+    if (!s || !sc) return STM_EINVAL;
 
     stm_scrub_status before = {0};
     stm_status sb = stm_scrub_status_get(sc, &before);

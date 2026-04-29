@@ -521,8 +521,10 @@ while (running) {
 }
 ```
 
-The wrapper exits the loop at COMPLETED naturally (each step
-post-completion is a no-op per scrub.h's state-machine docstring).
+Subsequent calls in COMPLETED state are no-ops (no work, no
+sweep) until `stm_scrub_start` re-runs. The orchestrator's own
+`running` flag is what exits the loop — the wrapper itself does
+not signal "done"; it just becomes a quiet passthrough.
 
 ## Cold-extent reflink (P7-CAS-3)
 
