@@ -294,8 +294,18 @@ extern "C" {
  * v18 pools fail at the version check; tamper-then-mount drift at
  * the snap value layer is rejected by the snap-decoder's length
  * check (the encoded length doesn't match v19 expectations). Format
- * break, no feature flag. */
-#define STM_UB_VERSION        19u
+ * break, no feature flag.
+ *
+ * v19 → v20 (P7-CAS-8): STM_PROP_COUNT 3 → 4 — adds STM_PROP_TIERING
+ * (INHERITABLE; per-dataset tiering opt-in for the migration-policy
+ * heuristic's pass-all wrapper). Dataset value layout grows past
+ * the local_value[] tail: origin_snap_id moves from offset 56 to
+ * offset 64; DS_VAL_FIXED grows from 64 to 72. Pool-defaults value
+ * length grows from 24 to 32 bytes. v19 pools refused at v20 mount
+ * via uniform STM_EBADVERSION (no in-place forward-compat at the
+ * value layer — same posture as v17→v18 and v18→v19 bumps). No
+ * uberblock field changes. */
+#define STM_UB_VERSION        20u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */

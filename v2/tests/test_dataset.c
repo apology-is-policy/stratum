@@ -680,6 +680,94 @@ STM_TEST(prop_kind_classifier) {
                    (int)STM_PROP_KIND_NONINHERITABLE);
     STM_ASSERT_EQ((int)stm_property_kind_of(STM_PROP_ENCRYPTION),
                    (int)STM_PROP_KIND_IMMUTABLE);
+    /* P7-CAS-8 (UB v20): tiering classified as INHERITABLE so
+     * children inherit the parent's tiering preference unless
+     * locally overridden. */
+    STM_ASSERT_EQ((int)stm_property_kind_of(STM_PROP_TIERING),
+                   (int)STM_PROP_KIND_INHERITABLE);
+}
+
+STM_TEST(prop_tiering_inherits_through_chain) {
+    /* P7-CAS-8: tiering inherits through the parent chain. Setting
+     * tiering=1 on a parent makes effective tiering=1 on every
+     * descendant that doesn't locally override. */
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+
+    uint64_t home = 0, alice = 0, photos = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID,
+                                              "home", &home));
+    STM_ASSERT_OK(stm_dataset_create_child(idx, home, "alice", &alice));
+    STM_ASSERT_OK(stm_dataset_create_child(idx, alice, "photos", &photos));
+
+    /* Pool default 0 (off). */
+    uint64_t v = 999;
+    STM_ASSERT_OK(stm_dataset_effective_property(idx, photos,
+                                                     STM_PROP_TIERING, &v));
+    STM_ASSERT_EQ(v, (uint64_t)0);
+
+    /* Set tiering=1 on home: alice + photos inherit. */
+    STM_ASSERT_OK(stm_dataset_set_property(idx, home, STM_PROP_TIERING, 1));
+    STM_ASSERT_OK(stm_dataset_effective_property(idx, home,
+                                                     STM_PROP_TIERING, &v));
+    STM_ASSERT_EQ(v, (uint64_t)1);
+    STM_ASSERT_OK(stm_dataset_effective_property(idx, alice,
+                                                     STM_PROP_TIERING, &v));
+    STM_ASSERT_EQ(v, (uint64_t)1);
+    STM_ASSERT_OK(stm_dataset_effective_property(idx, photos,
+                                                     STM_PROP_TIERING, &v));
+    STM_ASSERT_EQ(v, (uint64_t)1);
+
+    /* alice locally turns it off — photos inherits alice's 0. */
+    STM_ASSERT_OK(stm_dataset_set_property(idx, alice, STM_PROP_TIERING, 0));
+    STM_ASSERT_OK(stm_dataset_effective_property(idx, photos,
+                                                     STM_PROP_TIERING, &v));
+    STM_ASSERT_EQ(v, (uint64_t)0);
+    /* home still on. */
+    STM_ASSERT_OK(stm_dataset_effective_property(idx, home,
+                                                     STM_PROP_TIERING, &v));
+    STM_ASSERT_EQ(v, (uint64_t)1);
+
+    stm_dataset_index_close(idx);
+}
+
+STM_TEST(prop_tiering_persistence_roundtrip) {
+    /* P7-CAS-8: TIERING value survives commit + load via the v20
+     * dataset value layout (origin_snap_id moved from offset 56 to
+     * offset 64; local_value table now 4 le64 slots). */
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(/*current_txg=*/1, &idx));
+
+    uint64_t home = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID,
+                                              "home", &home));
+    STM_ASSERT_OK(stm_dataset_set_property(idx, home, STM_PROP_TIERING, 1));
+    /* Set every other property too to verify the bitmap+layout
+     * shape across all 4 slots. */
+    STM_ASSERT_OK(stm_dataset_set_property(idx, home, STM_PROP_COMPRESS, 5));
+    STM_ASSERT_OK(stm_dataset_set_property(idx, home, STM_PROP_QUOTA,    42));
+    STM_ASSERT_OK(stm_dataset_set_pool_default(idx, STM_PROP_TIERING, 0));
+
+    /* Encode / decode roundtrip via the index commit cycle is
+     * exercised by the existing dataset_persist_commit_load_roundtrip
+     * test (now covering 4 props after the v20 bump); here we just
+     * confirm that with all 4 properties locally set, lookup reads
+     * back the values we set. */
+    stm_dataset_entry e = {0};
+    STM_ASSERT_OK(stm_dataset_lookup(idx, home, &e));
+    STM_ASSERT_EQ(e.parent_id, (uint64_t)STM_DATASET_ROOT_ID);
+    uint64_t v = 0;
+    STM_ASSERT_OK(stm_dataset_effective_property(idx, home,
+                                                     STM_PROP_TIERING, &v));
+    STM_ASSERT_EQ(v, (uint64_t)1);
+    STM_ASSERT_OK(stm_dataset_effective_property(idx, home,
+                                                     STM_PROP_COMPRESS, &v));
+    STM_ASSERT_EQ(v, (uint64_t)5);
+    STM_ASSERT_OK(stm_dataset_effective_property(idx, home,
+                                                     STM_PROP_QUOTA, &v));
+    STM_ASSERT_EQ(v, (uint64_t)42);
+
+    stm_dataset_index_close(idx);
 }
 
 STM_TEST(prop_pool_default_set_get) {

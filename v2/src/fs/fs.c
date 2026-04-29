@@ -651,6 +651,143 @@ stm_status stm_fs_migrate_policy_step(stm_fs *fs,
     return STM_OK;
 }
 
+/* P7-CAS-8: dataset-id collector for the pass-all wrapper. Filled
+ * during stm_dataset_iter (which holds the dataset_index mutex);
+ * the cb cannot recurse into stm_dataset_*, so property resolution
+ * happens AFTER the iter returns. Geometric-grow buffer matches the
+ * P7-CAS-7 candidate-list pattern. */
+typedef struct {
+    uint64_t  *ids;
+    size_t     n;
+    size_t     cap;
+    stm_status err;
+} pass_all_id_collect_ctx;
+
+static bool pass_all_id_collect_cb(const stm_dataset_entry *e, void *ctx) {
+    pass_all_id_collect_ctx *c = ctx;
+    if (c->n == c->cap) {
+        size_t new_cap = (c->cap == 0u) ? 16u : c->cap * 2u;
+        uint64_t *grown = realloc(c->ids, new_cap * sizeof *grown);
+        if (!grown) { c->err = STM_ENOMEM; return false; }
+        c->ids = grown;
+        c->cap = new_cap;
+    }
+    c->ids[c->n++] = e->id;
+    return true;
+}
+
+stm_status stm_fs_migrate_policy_pass_all(
+        stm_fs *fs,
+        const stm_fs_migrate_policy_params *params,
+        stm_fs_migrate_policy_pass_all_stats *out_stats)
+{
+    /* Uniform out-param contract: zero-init BEFORE arg validation
+     * (R57 P3-5 / R58 P3-1) so a caller observing on EINVAL sees
+     * defined values. */
+    if (out_stats) *out_stats = (stm_fs_migrate_policy_pass_all_stats){0};
+    if (!fs || !params)              return STM_EINVAL;
+    if (params->_reserved0 != 0u)    return STM_EINVAL;
+
+    stm_fs_migrate_policy_pass_all_stats local_stats = {0};
+    stm_fs_migrate_policy_pass_all_stats *stats = out_stats ? out_stats : &local_stats;
+
+    /* Phase 1: under fs->lock, enumerate every PRESENT dataset id,
+     * then resolve effective STM_PROP_TIERING per id. The iter
+     * cb cannot call back into stm_dataset_*, so property
+     * resolution runs AFTER iter returns (still under fs->lock so
+     * the dataset_index handle stays stable). Filter compacts the
+     * id array in-place: enabled ids occupy [0, enabled_n). */
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+
+    stm_dataset_index *idx = stm_sync_dataset_index(fs->sync);
+    pass_all_id_collect_ctx ctx = { .err = STM_OK };
+    stm_status its = stm_dataset_iter(idx, pass_all_id_collect_cb, &ctx);
+    if (its != STM_OK || ctx.err != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        free(ctx.ids);
+        return (ctx.err != STM_OK) ? ctx.err : its;
+    }
+
+    size_t enabled_n = 0;
+    stm_status filter_err = STM_OK;
+    for (size_t i = 0; i < ctx.n; i++) {
+        uint64_t v = 0;
+        stm_status pe = stm_dataset_effective_property(
+                idx, ctx.ids[i], STM_PROP_TIERING, &v);
+        if (pe != STM_OK) {
+            /* A dataset destroyed between iter and this call would
+             * surface as STM_ENOENT here; record once and continue. */
+            if (filter_err == STM_OK) filter_err = pe;
+            continue;
+        }
+        if (v != 0u) {
+            ctx.ids[enabled_n++] = ctx.ids[i];
+        }
+    }
+    pthread_mutex_unlock(&fs->lock);
+
+    stats->datasets_visited  = (uint64_t)ctx.n;
+    stats->datasets_eligible = (uint64_t)enabled_n;
+    if (filter_err != STM_OK) {
+        stats->last_err = filter_err;
+        /* No specific dataset id pinned — `last_err_dataset_id` stays
+         * 0 to signal "phase-2 resolution error, not a per-step
+         * error." */
+    }
+
+    /* Phase 2: per-dataset migrate, with SHARED budget. Adjust
+     * per-step caps by the running total before each call. */
+    for (size_t i = 0; i < enabled_n; i++) {
+        if (params->max_inos != 0u
+            && stats->inos_migrated >= (uint64_t)params->max_inos) break;
+        if (params->max_bytes != 0u
+            && stats->bytes_migrated >= params->max_bytes) break;
+
+        stm_fs_migrate_policy_params adj = *params;
+        if (adj.max_inos != 0u) {
+            uint64_t remaining = (uint64_t)params->max_inos - stats->inos_migrated;
+            adj.max_inos = (remaining > UINT32_MAX) ? UINT32_MAX
+                                                    : (uint32_t)remaining;
+        }
+        if (adj.max_bytes != 0u) {
+            adj.max_bytes = params->max_bytes - stats->bytes_migrated;
+        }
+
+        uint64_t ds = ctx.ids[i];
+        stm_fs_migrate_policy_stats per_stats = {0};
+        stm_status rc = stm_fs_migrate_policy_step(fs, ds, &adj, &per_stats);
+
+        stats->datasets_migrated++;
+        stats->inos_visited   += per_stats.inos_visited;
+        stats->inos_eligible  += per_stats.inos_eligible;
+        stats->inos_migrated  += per_stats.inos_migrated;
+        stats->bytes_migrated += per_stats.bytes_migrated;
+        if (per_stats.last_err != STM_OK && stats->last_err == STM_OK) {
+            stats->last_err            = per_stats.last_err;
+            stats->last_err_dataset_id = ds;
+            stats->last_err_ino        = per_stats.last_err_ino;
+        }
+
+        /* Hard errors abort. The per-step call already stamps its
+         * own last_err_ino on hard returns (R58 P3-4); we promote
+         * to the pass-all error slot only if no soft error was
+         * already recorded earlier. */
+        if (rc == STM_EWEDGED || rc == STM_EROFS || rc == STM_ENOMEM) {
+            if (stats->last_err == STM_OK || stats->last_err == filter_err) {
+                stats->last_err            = rc;
+                stats->last_err_dataset_id = ds;
+                stats->last_err_ino        = per_stats.last_err_ino;
+            }
+            free(ctx.ids);
+            return rc;
+        }
+    }
+
+    free(ctx.ids);
+    return STM_OK;
+}
+
 /* ========================================================================= */
 /* Dataset creation (P7-13).                                                  */
 /* ========================================================================= */

@@ -605,16 +605,125 @@ the data plane → no spec extension. The heuristic does not
 introduce a load-bearing invariant — worst case is suboptimal
 hot/cold placement, never data corruption.
 
-**Per-dataset opt-in**: v1 leaves dataset selection to the
-caller — a periodic orchestrator iterates the datasets it wants
-to manage and calls the policy step per dataset. A future
-`STM_PROP_TIERING` enum value + a wrapper
-`stm_fs_migrate_policy_pass_all(fs, *params, *out_stats)` that
-walks all datasets with tiering=on would be a separate chunk
-(it requires bumping `STM_PROP_COUNT` from 3 to 4, which is a
-UB-version format break per the dataset-value-layout comment).
+## Per-dataset tiering opt-in (P7-CAS-8)
 
-**Future work** (not in v1):
+`stm_fs_migrate_policy_step` (P7-CAS-7) is a per-dataset
+primitive: the caller picks which dataset to scan. P7-CAS-8 adds
+the per-dataset opt-in property + a multi-dataset orchestrator
+that respects it.
+
+**Format break (STM_UB_VERSION 19 → 20)**: `STM_PROP_COUNT` grows
+from 3 to 4. New enum value:
+
+```c
+typedef enum {
+    STM_PROP_COMPRESS    = 0,   /* INHERITABLE   */
+    STM_PROP_QUOTA       = 1,   /* NONINHERITABLE */
+    STM_PROP_ENCRYPTION  = 2,   /* IMMUTABLE     */
+    STM_PROP_TIERING     = 3,   /* INHERITABLE   ← new */
+    STM_PROP_COUNT       = 4
+} stm_property;
+```
+
+`STM_PROP_TIERING` is INHERITABLE: children inherit the parent's
+tiering preference unless locally overridden. Encoded as a
+boolean (uint64_t value: 0 = disabled, non-zero = enabled). The
+pool-default starts at 0; operators opt in via
+`stm_dataset_set_pool_default(idx, STM_PROP_TIERING, 1)` for
+"all datasets default to tiering on" or
+`stm_dataset_set_property(idx, ds, STM_PROP_TIERING, 1)` for
+per-dataset opt-in.
+
+**Dataset value layout (v20)**: `origin_snap_id` (le64) moves
+from on-disk offset 56 to offset 64; `local_value[]` table
+grows from 24 bytes (3 × le64) to 32 bytes (4 × le64).
+`DS_VAL_FIXED` 64 → 72. v19 pools refused at v20 mount via
+uniform STM_EBADVERSION (no in-place forward-compat at the
+value layer — same posture as v17→v18 and v18→v19 bumps).
+
+**Multi-dataset orchestrator**:
+
+```c
+typedef struct {
+    uint64_t datasets_visited;
+    uint64_t datasets_eligible;
+    uint64_t datasets_migrated;
+    uint64_t inos_visited;
+    uint64_t inos_eligible;
+    uint64_t inos_migrated;
+    uint64_t bytes_migrated;
+    stm_status last_err;
+    uint64_t   last_err_dataset_id;
+    uint64_t   last_err_ino;
+} stm_fs_migrate_policy_pass_all_stats;
+
+stm_status stm_fs_migrate_policy_pass_all(
+        stm_fs *fs,
+        const stm_fs_migrate_policy_params *params,
+        stm_fs_migrate_policy_pass_all_stats *out_stats);
+```
+
+**Behavior**:
+
+- Walks every PRESENT dataset via `stm_dataset_iter`.
+- Per dataset: queries effective `STM_PROP_TIERING` via
+  `stm_dataset_effective_property` (walks parent chain). If the
+  value resolves to non-zero, the dataset is eligible.
+- Per eligible dataset: calls `stm_fs_migrate_policy_step` with
+  a budget-adjusted params struct.
+
+**Budget shape**: `max_inos` and `max_bytes` are SHARED across
+enabled datasets — the orchestrator decrements caps by the
+running total before each per-step invocation. Datasets after a
+cap is reached are skipped without per-step invocation.
+`min_age_txgs` is applied uniformly per-step (each dataset's
+cutoff is recomputed against the current sync->current_gen at
+that step).
+
+**Lock posture**:
+
+- Phase 1 (under fs->lock): `stm_dataset_iter` collects all
+  PRESENT dataset ids into a heap-grow buffer. The iter cb
+  cannot recurse into `stm_dataset_*` (the index mutex is held
+  by iter), but `stm_dataset_effective_property` is safe to
+  call AFTER iter returns while still under fs->lock — the
+  index mutex is released by iter and effective_property
+  re-acquires it briefly per call.
+- Phase 2: filter ids in-place by effective TIERING. Drop
+  fs->lock.
+- Phase 3: per-eligible-id, call `stm_fs_migrate_policy_step`
+  (which re-acquires fs->lock fresh per call). The orchestrator
+  is INTERRUPTIBLE between datasets — concurrent writers /
+  admin calls interleave.
+
+**Concurrency drift**: between dataset enumeration and per-step
+invocation, a dataset may have been destroyed. The per-step
+call resolves to STM_OK with `inos_visited == 0` (a destroyed
+dataset looks like an empty dataset to extent_iter_ds). New
+datasets created mid-pass are NOT seen — caller runs another
+pass to pick them up.
+
+**Error policy**:
+
+- Hard errors from any per-step (STM_EWEDGED / STM_EROFS /
+  STM_ENOMEM) abort the orchestrator and bubble up.
+- Soft errors are recorded in
+  `last_err / last_err_dataset_id / last_err_ino` and the
+  orchestrator continues.
+- Phase-2 property-resolution errors (e.g. a dataset destroyed
+  between iter and effective_property) are recorded in
+  `last_err` with `last_err_dataset_id == 0` to signal "phase-2
+  resolution error, not a per-step error."
+
+property.tla unchanged — it is parametric over the property set
+and the existing INHERITABLE-class invariants
+(`InheritFromParent`, `LocalOverrideWins`) already cover the
+new property. Per CLAUDE.md spec-first policy, adding an enum
+value classified the same as an existing one is a "policy
+choice, not invariant" change that doesn't require a spec
+extension.
+
+## Future work (not in v1)
 
 - Promotion (cold → hot) heuristic — currently auto-rehydrate
   is the only cold→hot path, triggered by overlapping writes.
@@ -623,9 +732,11 @@ UB-version format break per the dataset-value-layout comment).
 - Learned policy v2 — replace the age threshold with an
   ML-derived eligibility predicate (per NOVEL.md §3.3 Phase II
   scope deferral).
-- `STM_PROP_TIERING` per-dataset opt-in (above).
 - `bytes_migrated` exact accounting via post-migrate count
   observation (instead of snapshot-from-collect).
+- Cron-style scheduler — currently the operator drives the pass
+  cadence. A daemon that fires the pass periodically on a
+  configurable schedule would close the production gap.
 
 ## Cold-extent reflink (P7-CAS-3)
 

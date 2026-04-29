@@ -440,6 +440,83 @@ stm_status stm_fs_migrate_policy_step(stm_fs *fs,
                                           const stm_fs_migrate_policy_params *params,
                                           stm_fs_migrate_policy_stats *out_stats);
 
+/*
+ * P7-CAS-8: stm_fs_migrate_policy_pass_all — multi-dataset orchestrator
+ * over `stm_fs_migrate_policy_step`. Walks every PRESENT dataset,
+ * resolves each dataset's effective `STM_PROP_TIERING` property
+ * (INHERITABLE; pool-default applies when no ancestor has set it),
+ * and runs the per-dataset policy step on every dataset that resolves
+ * a non-zero TIERING value.
+ *
+ * Budget shape: `params->max_inos` and `params->max_bytes` are
+ * SHARED across all enabled datasets (not per-dataset). The wrapper
+ * decrements each cap by the per-step migrated counter before
+ * invoking the next dataset's step. Datasets after a cap is reached
+ * are skipped without per-step invocation. `params->min_age_txgs`
+ * is applied uniformly per-dataset (the cutoff is recomputed at
+ * each step against the current sync->current_gen).
+ *
+ * Pass shape: aggregates per-step stats into the pass-all stats
+ * struct. Hard errors from any per-step migrate (STM_EWEDGED /
+ * STM_EROFS / STM_ENOMEM) abort the orchestrator and bubble up;
+ * soft errors are recorded in
+ * `out_stats->{last_err, last_err_dataset_id, last_err_ino}` and
+ * the orchestrator continues to subsequent datasets.
+ *
+ * Lock posture: takes fs->lock during dataset enumeration +
+ * property-resolution, drops it before per-step invocation. Each
+ * per-step call re-acquires fs->lock fresh; the orchestrator's
+ * total-pass duration is INTERRUPTIBLE between datasets.
+ *
+ * Concurrency drift: between dataset enumeration and per-step
+ * invocation, a dataset may have been destroyed; the per-step call
+ * returns STM_OK with `inos_visited == 0` (the destroyed dataset
+ * looks like an empty dataset to extent_iter_ds). New datasets
+ * created after enumeration are NOT seen on this pass — caller
+ * runs another pass to pick them up.
+ *
+ * Refusals (delegated to stm_fs_migrate_policy_step's contract):
+ *   - NULL fs OR NULL params (STM_EINVAL).
+ *   - `params->_reserved0` non-zero (STM_EINVAL).
+ *   - Wedged or read-only (STM_EWEDGED / STM_EROFS).
+ *   - STM_ENOMEM if the dataset-id buffer cannot grow.
+ *
+ * `out_stats` may be NULL; the wrapper zero-inits it BEFORE arg
+ * validation runs (uniform out-param contract — R57 P3-5 / R58 P3-1).
+ */
+typedef struct {
+    /* Total PRESENT datasets enumerated. */
+    uint64_t datasets_visited;
+    /* Datasets where effective TIERING > 0. Counted BEFORE budget
+     * caps apply. */
+    uint64_t datasets_eligible;
+    /* Datasets the per-step migrate was actually called on. May be
+     * less than datasets_eligible if a budget cap was reached
+     * mid-pass. */
+    uint64_t datasets_migrated;
+    /* Aggregated per-dataset counters across every per-step call. */
+    uint64_t inos_visited;
+    uint64_t inos_eligible;
+    uint64_t inos_migrated;
+    uint64_t bytes_migrated;
+    /* First per-step error encountered (soft or hard). STM_OK if
+     * every per-step returned STM_OK without recorded soft errors. */
+    stm_status last_err;
+    /* Dataset where last_err was reported. 0 if last_err == STM_OK
+     * OR if the error came from the property-resolution phase
+     * (which doesn't pin a single dataset). */
+    uint64_t last_err_dataset_id;
+    /* Ino within last_err_dataset_id where last_err was reported.
+     * 0 if last_err == STM_OK or the error doesn't pin an ino. */
+    uint64_t last_err_ino;
+} stm_fs_migrate_policy_pass_all_stats;
+
+STM_MUST_USE
+stm_status stm_fs_migrate_policy_pass_all(
+        stm_fs *fs,
+        const stm_fs_migrate_policy_params *params,
+        stm_fs_migrate_policy_pass_all_stats *out_stats);
+
 /* ========================================================================= */
 /* Inspection + control.                                                      */
 /* ========================================================================= */

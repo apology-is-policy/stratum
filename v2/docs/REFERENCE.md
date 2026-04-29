@@ -38,8 +38,48 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R58-hash-fixup. Substantive `1d5255c` +
-  R58 close `231e5ff`.
+- **Tip**: post-R59-hash-fixup. Substantive `<P7-CAS-8>` +
+  R59 close `<R59>`.
+  **P7-CAS-8 — per-dataset `STM_PROP_TIERING` opt-in + multi-
+  dataset migration-policy wrapper. Format break STM_UB_VERSION
+  19 → 20: `STM_PROP_COUNT` grows from 3 to 4, adding
+  `STM_PROP_TIERING` (INHERITABLE — children inherit parent's
+  preference unless locally overridden). Dataset value layout
+  grows past the local_value[] tail: origin_snap_id moves from
+  offset 56 to offset 64; `DS_VAL_FIXED` 64 → 72. Pool-defaults
+  value length 24 → 32 bytes. v19 pools refused at v20 mount via
+  uniform STM_EBADVERSION (same posture as v17→v18 and v18→v19
+  bumps). New public API
+  `stm_fs_migrate_policy_pass_all(fs, *params, *out_stats)`
+  walks every PRESENT dataset, resolves effective TIERING via
+  `stm_dataset_effective_property`, and runs the per-dataset
+  policy step on every dataset that resolves a non-zero value.
+  Budget shape: `max_inos` and `max_bytes` are SHARED across
+  enabled datasets (the wrapper decrements caps by the running
+  total before each per-step call); `min_age_txgs` is uniform
+  per-dataset. New aggregate stats struct
+  `stm_fs_migrate_policy_pass_all_stats` carries
+  `datasets_visited / eligible / migrated` plus the aggregated
+  per-dataset counters. Lock posture: takes fs->lock during
+  dataset enumeration + property resolution, drops it before
+  per-step invocation; the orchestrator is INTERRUPTIBLE
+  between datasets (concurrent writers / admin calls
+  interleave). Hard errors abort the orchestrator; soft errors
+  recorded in `last_err / last_err_dataset_id / last_err_ino`
+  and the orchestrator continues. Composition over P7-CAS-7's
+  per-step primitive — no new state-machine semantics, no spec
+  extension required. property.tla unchanged (parametric over
+  Properties; existing INHERITABLE-class invariants already
+  cover the new property). test_fs grows 116 → 123 (7 new
+  P7-CAS-8 tests covering pool-default off/on, local override,
+  inheritance through chain, shared max_inos budget, arg
+  validation, RO refusal). test_dataset grows 57 → 59 (TIERING
+  classification + inheritance + persistence roundtrip across
+  the v20 layout). 35 ctest suites green default + ASan + TSan
+  in isolation. Spec posture unchanged: 21 modules / 25 fixed
+  cfgs / 34 buggy cfgs. R59 audit forthcoming.**
+  Prior P7-CAS-7 substantive `1d5255c` + R58 close `231e5ff` +
+  hash fixup `80d6ba0`.
   **P7-CAS-7 — migration-policy heuristic v1 (NOVEL #6 v1 in
   CLAUDE.md mission numbering / NOVEL #3.3's "Migration engine:
   heuristic v1"). First concrete user of the P7-CAS-2 migration

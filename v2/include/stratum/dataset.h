@@ -106,7 +106,15 @@ typedef enum {
     STM_PROP_COMPRESS    = 0,   /* INHERITABLE   */
     STM_PROP_QUOTA       = 1,   /* NONINHERITABLE */
     STM_PROP_ENCRYPTION  = 2,   /* IMMUTABLE     */
-    STM_PROP_COUNT       = 3
+    /* P7-CAS-8 (UB v19→v20): tiering opt-in. Boolean encoded as
+     * uint64_t value (0 = disabled, non-zero = enabled). INHERITABLE
+     * — children inherit the parent's tiering preference unless
+     * locally overridden. The migration-policy pass-all wrapper
+     * `stm_fs_migrate_policy_pass_all` enumerates every dataset and
+     * runs the per-dataset policy step on each that resolves
+     * STM_PROP_TIERING != 0. */
+    STM_PROP_TIERING     = 3,   /* INHERITABLE   */
+    STM_PROP_COUNT       = 4
 } stm_property;
 
 typedef enum {

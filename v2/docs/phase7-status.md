@@ -56,6 +56,46 @@ into the CAS tier (which DOES need P6) is a separate concern.
 
 ## Phase 7 status (overall)
 
+- [x] **P7-CAS-8 per-dataset tiering opt-in + multi-dataset
+      wrapper** — substantive `<P7-CAS-8>` + R59 close `<R59>` +
+      hash-fixup (this commit). Format break **STM_UB_VERSION
+      19 → 20**: `STM_PROP_COUNT` grows from 3 to 4, adding
+      `STM_PROP_TIERING` (INHERITABLE; per-dataset tiering
+      opt-in). Dataset value layout grows: `DS_VAL_FIXED` 64 →
+      72 (origin_snap_id moves from offset 56 to offset 64);
+      pool-defaults value length 24 → 32. v19 pools refused at
+      v20 mount via uniform STM_EBADVERSION. New public API
+      `stm_fs_migrate_policy_pass_all(fs, *params, *out_stats)`
+      walks every PRESENT dataset, queries effective TIERING,
+      and runs the per-dataset policy step on every dataset
+      that resolves a non-zero value. Budget shape: `max_inos`
+      and `max_bytes` are SHARED across enabled datasets; the
+      wrapper decrements caps by the running total before each
+      per-step invocation. `min_age_txgs` is applied per-step
+      uniformly. New stats struct
+      `stm_fs_migrate_policy_pass_all_stats` carries
+      datasets_visited/eligible/migrated plus aggregated
+      per-dataset counters. Lock posture: takes fs->lock during
+      dataset enumeration + property resolution (the iter cb
+      cannot recurse into stm_dataset_* but
+      stm_dataset_effective_property is safe to call after iter
+      returns under the still-held fs->lock); drops fs->lock
+      before per-step invocation. Orchestrator is INTERRUPTIBLE
+      between datasets. Hard errors abort; soft errors recorded
+      in last_err/last_err_dataset_id/last_err_ino and the
+      orchestrator continues. Composition over P7-CAS-7's
+      per-step primitive — no new state-machine semantics, no
+      spec extension required. property.tla unchanged
+      (parametric over Properties; the existing INHERITABLE
+      classification + invariants already cover TIERING — same
+      class as `compress`). test_fs grows 116 → 123 (7 new
+      P7-CAS-8 tests). test_dataset grows 57 → 59 (TIERING
+      classification + inheritance + persistence roundtrip
+      across the v20 layout). test_pool UB-version assertion
+      bumped 19 → 20. 35 ctest suites green default + ASan +
+      TSan in isolation. Spec posture unchanged: 21 modules /
+      25 fixed cfgs / 34 buggy cfgs.
+
 - [x] **P7-CAS-7 migration-policy heuristic v1** — substantive
       `1d5255c` + R58 close `231e5ff` + hash-fixup (this
       commit). First concrete user of the P7-CAS-2 migration

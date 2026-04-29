@@ -5045,6 +5045,307 @@ STM_TEST(fs_p7cas7_policy_step_soft_error_continues_pass) {
     unlink(g_key_path);
 }
 
+STM_TEST(fs_p7cas8_pass_all_pool_default_off_no_op) {
+    /* P7-CAS-8: pool default TIERING = 0 (off). pass_all visits
+     * every dataset but none are eligible. No migration runs. */
+    make_tmp("p7cas8_pool_off");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Two datasets, root + ds2. Both with HOT extents. */
+    uint64_t ds2 = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, /*parent=*/1, "home", &ds2));
+    uint8_t plain[4096];
+    memset(plain, 0x11, sizeof plain);
+    STM_ASSERT_OK(stm_fs_write(fs,   1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_write(fs, ds2, 1, 0, plain, sizeof plain));
+
+    stm_fs_migrate_policy_params              params = { .min_age_txgs = 0u };
+    stm_fs_migrate_policy_pass_all_stats      stats  = {0};
+    STM_ASSERT_OK(stm_fs_migrate_policy_pass_all(fs, &params, &stats));
+    STM_ASSERT_EQ(stats.datasets_visited,  2u);
+    STM_ASSERT_EQ(stats.datasets_eligible, 0u);
+    STM_ASSERT_EQ(stats.datasets_migrated, 0u);
+    STM_ASSERT_EQ(stats.inos_migrated,     0u);
+    STM_ASSERT_EQ(stats.bytes_migrated,    0u);
+
+    /* CAS index empty (no migrations). */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    size_t n = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas8_pass_all_pool_default_on_migrates_all) {
+    /* P7-CAS-8: pool default TIERING = 1 (on). pass_all visits
+     * every dataset, all are eligible, all get migrated. */
+    make_tmp("p7cas8_pool_on");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Set pool-default TIERING=1. */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_dataset_index *idx = stm_sync_dataset_index(sync);
+    STM_ASSERT_OK(stm_dataset_set_pool_default(idx, STM_PROP_TIERING, 1));
+
+    uint64_t ds2 = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, /*parent=*/1, "home", &ds2));
+    uint8_t a[4096], b[4096];
+    for (size_t i = 0; i < 4096u; i++) {
+        a[i] = (uint8_t)((i * 7u + 1u) & 0xFFu);
+        b[i] = (uint8_t)((i * 11u + 3u) & 0xFFu);
+    }
+    STM_ASSERT_OK(stm_fs_write(fs,   1, 1, 0, a, sizeof a));
+    STM_ASSERT_OK(stm_fs_write(fs, ds2, 1, 0, b, sizeof b));
+
+    stm_fs_migrate_policy_params              params = { .min_age_txgs = 0u };
+    stm_fs_migrate_policy_pass_all_stats      stats  = {0};
+    STM_ASSERT_OK(stm_fs_migrate_policy_pass_all(fs, &params, &stats));
+    STM_ASSERT_EQ(stats.datasets_visited,  2u);
+    STM_ASSERT_EQ(stats.datasets_eligible, 2u);
+    STM_ASSERT_EQ(stats.datasets_migrated, 2u);
+    STM_ASSERT_EQ(stats.inos_visited,      2u);
+    STM_ASSERT_EQ(stats.inos_eligible,     2u);
+    STM_ASSERT_EQ(stats.inos_migrated,     2u);
+    STM_ASSERT_EQ(stats.bytes_migrated,    (uint64_t)(2u * 4096u));
+    STM_ASSERT_EQ(stats.last_err,          STM_OK);
+
+    /* CAS index has 2 entries (different content). */
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    size_t n = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)2);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas8_pass_all_per_dataset_local_overrides_pool) {
+    /* P7-CAS-8: pool default TIERING = 1; one dataset locally
+     * overrides to 0. pass_all migrates only the non-overridden
+     * datasets. */
+    make_tmp("p7cas8_local_off");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_dataset_index *idx = stm_sync_dataset_index(sync);
+    STM_ASSERT_OK(stm_dataset_set_pool_default(idx, STM_PROP_TIERING, 1));
+
+    uint64_t home = 0, archive = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, /*parent=*/1, "home",    &home));
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, /*parent=*/1, "archive", &archive));
+    /* Locally turn TIERING off on archive. */
+    STM_ASSERT_OK(stm_dataset_set_property(idx, archive, STM_PROP_TIERING, 0));
+
+    uint8_t a[4096], b[4096], c[4096];
+    for (size_t i = 0; i < 4096u; i++) {
+        a[i] = (uint8_t)((i * 13u) & 0xFFu);
+        b[i] = (uint8_t)((i * 17u) & 0xFFu);
+        c[i] = (uint8_t)((i * 19u) & 0xFFu);
+    }
+    STM_ASSERT_OK(stm_fs_write(fs,    1, 1, 0, a, sizeof a));
+    STM_ASSERT_OK(stm_fs_write(fs,  home, 1, 0, b, sizeof b));
+    STM_ASSERT_OK(stm_fs_write(fs, archive, 1, 0, c, sizeof c));
+
+    stm_fs_migrate_policy_params              params = { .min_age_txgs = 0u };
+    stm_fs_migrate_policy_pass_all_stats      stats  = {0};
+    STM_ASSERT_OK(stm_fs_migrate_policy_pass_all(fs, &params, &stats));
+    STM_ASSERT_EQ(stats.datasets_visited,  3u);
+    STM_ASSERT_EQ(stats.datasets_eligible, 2u);   /* root + home; archive opt-out */
+    STM_ASSERT_EQ(stats.datasets_migrated, 2u);
+    STM_ASSERT_EQ(stats.inos_migrated,     2u);
+
+    /* CAS has 2 entries (root's + home's content; archive untouched). */
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    size_t n = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)2);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas8_pass_all_inheritance_through_chain) {
+    /* P7-CAS-8: child datasets inherit parent's TIERING. Setting
+     * tiering=1 on home propagates to alice + alice/photos
+     * automatically; setting tiering=0 on alice locally turns
+     * it off for alice + alice/photos. */
+    make_tmp("p7cas8_inherit");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_dataset_index *idx = stm_sync_dataset_index(sync);
+
+    /* Build chain: root → home → alice → photos. */
+    uint64_t home = 0, alice = 0, photos = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, /*parent=*/1, "home", &home));
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, /*parent=*/home, "alice", &alice));
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, /*parent=*/alice, "photos", &photos));
+
+    /* Set TIERING=1 on home; alice + photos inherit. */
+    STM_ASSERT_OK(stm_dataset_set_property(idx, home, STM_PROP_TIERING, 1));
+    /* Locally clear on alice (= 0 explicitly). photos inherits 0. */
+    STM_ASSERT_OK(stm_dataset_set_property(idx, alice, STM_PROP_TIERING, 0));
+
+    /* Write HOT extent on each dataset. */
+    uint8_t plain[4096];
+    memset(plain, 0x44, sizeof plain);
+    STM_ASSERT_OK(stm_fs_write(fs,    1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_write(fs, home, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_write(fs, alice, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_write(fs, photos, 1, 0, plain, sizeof plain));
+
+    stm_fs_migrate_policy_params              params = { .min_age_txgs = 0u };
+    stm_fs_migrate_policy_pass_all_stats      stats  = {0};
+    STM_ASSERT_OK(stm_fs_migrate_policy_pass_all(fs, &params, &stats));
+
+    STM_ASSERT_EQ(stats.datasets_visited,  4u);
+    /* Eligible: home (local 1). root inherits pool default 0; alice +
+     * photos inherit alice's local 0. */
+    STM_ASSERT_EQ(stats.datasets_eligible, 1u);
+    STM_ASSERT_EQ(stats.datasets_migrated, 1u);
+    STM_ASSERT_EQ(stats.inos_migrated,     1u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas8_pass_all_shared_max_inos_budget) {
+    /* P7-CAS-8: max_inos is SHARED across enabled datasets. Two
+     * datasets each with 2 HOT inos; max_inos=3 ⇒ first dataset
+     * migrates 2, second migrates 1, total = 3. */
+    make_tmp("p7cas8_shared_inos");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_dataset_index *idx = stm_sync_dataset_index(sync);
+    STM_ASSERT_OK(stm_dataset_set_pool_default(idx, STM_PROP_TIERING, 1));
+
+    uint64_t ds2 = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, /*parent=*/1, "home", &ds2));
+
+    uint8_t plain[4096];
+    for (uint64_t ds = 1; ds <= 2u; ds++) {
+        uint64_t target = (ds == 1u) ? 1u : ds2;
+        for (uint64_t ino = 1; ino <= 2u; ino++) {
+            for (size_t i = 0; i < sizeof plain; i++) {
+                plain[i] = (uint8_t)((i * (ds * 7u + ino) + 1u) & 0xFFu);
+            }
+            STM_ASSERT_OK(stm_fs_write(fs, target, ino, 0, plain, sizeof plain));
+        }
+    }
+
+    stm_fs_migrate_policy_params              params = {
+        .min_age_txgs = 0u,
+        .max_inos     = 3u,
+    };
+    stm_fs_migrate_policy_pass_all_stats      stats  = {0};
+    STM_ASSERT_OK(stm_fs_migrate_policy_pass_all(fs, &params, &stats));
+    STM_ASSERT_EQ(stats.datasets_visited,  2u);
+    STM_ASSERT_EQ(stats.datasets_eligible, 2u);
+    STM_ASSERT_EQ(stats.datasets_migrated, 2u);
+    STM_ASSERT_EQ(stats.inos_eligible,     4u);
+    STM_ASSERT_EQ(stats.inos_migrated,     3u);  /* shared cap honored */
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas8_pass_all_arg_validation) {
+    /* NULL fs / params / non-zero _reserved0 → STM_EINVAL with
+     * out_stats zeroed before validation runs (uniform contract). */
+    make_tmp("p7cas8_arg");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_fs_migrate_policy_params              good = { .min_age_txgs = 0u };
+    stm_fs_migrate_policy_params              bad  = { ._reserved0 = 0xCAFE };
+    stm_fs_migrate_policy_pass_all_stats      stats;
+
+    /* Pre-fill stats with sentinels — must be zeroed on EINVAL. */
+    memset(&stats, 0xAA, sizeof stats);
+    STM_ASSERT_ERR(stm_fs_migrate_policy_pass_all(NULL, &good, &stats),
+                   STM_EINVAL);
+    STM_ASSERT_EQ(stats.datasets_visited, 0u);
+    STM_ASSERT_EQ(stats.last_err,         STM_OK);
+
+    memset(&stats, 0xAA, sizeof stats);
+    STM_ASSERT_ERR(stm_fs_migrate_policy_pass_all(fs, NULL, &stats),
+                   STM_EINVAL);
+    STM_ASSERT_EQ(stats.datasets_visited, 0u);
+
+    memset(&stats, 0xAA, sizeof stats);
+    STM_ASSERT_ERR(stm_fs_migrate_policy_pass_all(fs, &bad, &stats),
+                   STM_EINVAL);
+    STM_ASSERT_EQ(stats.datasets_visited, 0u);
+
+    /* NULL out_stats accepted. */
+    STM_ASSERT_OK(stm_fs_migrate_policy_pass_all(fs, &good, NULL));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas8_pass_all_ro_refused) {
+    /* RO mount: pass_all takes FS_GUARD_WRITE which fails with
+     * STM_EROFS (the orchestrator mutates state via the per-step
+     * migrate calls). */
+    make_tmp("p7cas8_ro");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts_rw = rw_mount_opts();
+    stm_fs *fs_rw = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts_rw, &fs_rw));
+    STM_ASSERT_OK(stm_fs_unmount(fs_rw));
+
+    stm_fs_mount_opts mopts_ro = {
+        .read_only    = true,
+        .keyfile_path = g_key_path,
+    };
+    stm_fs *fs_ro = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts_ro, &fs_ro));
+
+    stm_fs_migrate_policy_params              params = { .min_age_txgs = 0u };
+    stm_fs_migrate_policy_pass_all_stats      stats  = {0};
+    STM_ASSERT_ERR(stm_fs_migrate_policy_pass_all(fs_ro, &params, &stats),
+                   STM_EROFS);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs_ro));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST(fs_p7cas7_policy_step_min_age_saturates_to_zero_when_huge) {
     /* min_age_txgs >= current_gen ⇒ saturating subtraction yields
      * cutoff=0; only extents with link_gen == 0 would qualify, and
