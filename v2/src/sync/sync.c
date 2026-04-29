@@ -4608,11 +4608,32 @@ static stm_status stm_sync_read_extent_locked(stm_sync *s,
          * decisions, not to corruption. R62 P2-1: gated by
          * `count_for_promotion` so internal callers (truncate's
          * prefix re-encrypt) don't dirty heuristic state for a
-         * record they're about to drop. */
+         * record they're about to drop.
+         *
+         * P7-CAS-12: the decay window is the dataset's effective
+         * STM_PROP_PROMOTE_DECAY_WINDOW (in txgs) — value 0 falls back
+         * to the compile-time default 1024. The property lookup takes
+         * dataset_idx's internal mutex; lock order is sync->lock (held)
+         * → dataset_idx mutex (acquired here). dataset.c never calls
+         * back into sync, so there's no inversion risk. A failed
+         * lookup (e.g. dataset destroyed mid-read; STM_ENOENT) is
+         * absorbed by the same heuristic-best-effort posture as the
+         * record-missing case below — fall back to the default. */
         if (count_for_promotion) {
+            uint64_t decay_window = STM_SYNC_PROMOTE_DECAY_WINDOW_DEFAULT_TXGS;
+            if (s->dataset_idx) {
+                uint64_t v = 0;
+                if (stm_dataset_effective_property(
+                            s->dataset_idx, dataset_id,
+                            STM_PROP_PROMOTE_DECAY_WINDOW,
+                            &v) == STM_OK
+                    && v != 0u) {
+                    decay_window = v;
+                }
+            }
             (void)stm_extent_record_promote_read_hit(
                     s->extent_idx, dataset_id, ino, off,
-                    s->current_gen, STM_SYNC_PROMOTE_DECAY_WINDOW_TXGS);
+                    s->current_gen, decay_window);
         }
 
         *out_read = len;

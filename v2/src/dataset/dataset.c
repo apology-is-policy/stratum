@@ -532,11 +532,12 @@ stm_status stm_dataset_iter(const stm_dataset_index *idx,
 
 stm_property_kind stm_property_kind_of(stm_property p) {
     switch (p) {
-    case STM_PROP_COMPRESS:    return STM_PROP_KIND_INHERITABLE;
-    case STM_PROP_QUOTA:       return STM_PROP_KIND_NONINHERITABLE;
-    case STM_PROP_ENCRYPTION:  return STM_PROP_KIND_IMMUTABLE;
-    case STM_PROP_TIERING:     return STM_PROP_KIND_INHERITABLE;
-    case STM_PROP_COUNT:       break;
+    case STM_PROP_COMPRESS:                return STM_PROP_KIND_INHERITABLE;
+    case STM_PROP_QUOTA:                   return STM_PROP_KIND_NONINHERITABLE;
+    case STM_PROP_ENCRYPTION:              return STM_PROP_KIND_IMMUTABLE;
+    case STM_PROP_TIERING:                 return STM_PROP_KIND_INHERITABLE;
+    case STM_PROP_PROMOTE_DECAY_WINDOW:    return STM_PROP_KIND_INHERITABLE;
+    case STM_PROP_COUNT:                   break;
     }
     /* R30 P3-4: STM_PROP_COUNT is the count sentinel — out-of-range
      * values should never reach this function (every public API
@@ -799,10 +800,11 @@ stm_status stm_dataset_clones_count_for_snap(const stm_dataset_index *idx,
  * The dataset index is persisted as a single btree_store-encoded tree
  * under ub_main_root. Keyspace:
  *   - le64 0   → pool-property defaults  (value: 8 * STM_PROP_COUNT bytes;
- *                v20 = 32, v19 = 24).
+ *                v22 = 40, v20 = 32, v19 = 24).
  *   - le64 ≥1  → packed dataset entry
  *                  (value: DS_VAL_FIXED + name_len bytes;
- *                   v20 = 72 + name_len, v19 = 64 + name_len).
+ *                   v22 = 80 + name_len, v20 = 72 + name_len,
+ *                   v19 = 64 + name_len).
  *
  * Implementation mirrors src/alloc_roots/alloc_roots.c — same vtable shape,
  * same dirty-flag idempotency, same Merkle + AEAD chain via btree_store.
@@ -815,12 +817,16 @@ stm_status stm_dataset_clones_count_for_snap(const stm_dataset_index *idx,
  *        refused at v20 mount via uniform STM_EBADVERSION (no in-place
  *        forward-compat at the value layer — same posture as v17→v18
  *        and v18→v19 bumps).
+ *   v22: STM_PROP_COUNT 4 → 5 (P7-CAS-12 STM_PROP_PROMOTE_DECAY_WINDOW).
+ *        local_value grows from 32 to 40 bytes; origin_snap_id moves
+ *        from offset 64 to offset 72; DS_VAL_FIXED grows from 72 to 80.
+ *        v21 pools refused at v22 mount via uniform STM_EBADVERSION.
  * ========================================================================= */
 
 #define DS_KEY_LEN              8u
-/* v20: 32 bytes fixed prefix + 32 bytes local_value (4 × le64) + 8 bytes
- * origin_snap_id = 72 fixed bytes. */
-#define DS_VAL_FIXED            72u
+/* v22: 32 bytes fixed prefix + 40 bytes local_value (5 × le64) + 8 bytes
+ * origin_snap_id = 80 fixed bytes. */
+#define DS_VAL_FIXED            80u
 #define DS_VAL_MAX              (DS_VAL_FIXED + STM_DATASET_NAME_MAX)
 #define DS_POOL_DEFAULTS_KEY    UINT64_C(0)
 #define DS_POOL_DEFAULTS_VAL_LEN  (8u * STM_PROP_COUNT)
@@ -873,8 +879,8 @@ static size_t ds_encode_dataset_value(const dataset_slot *s,
         le64 v = stm_store_le64(s->local_value[p]);
         memcpy(out + 32u + p * 8u, v.v, 8);
     }
-    /* v20: origin_snap_id moved from offset 56 to offset
-     * 32 + 8*STM_PROP_COUNT (= 64 at STM_PROP_COUNT=4). */
+    /* v22: origin_snap_id at offset 32 + 8*STM_PROP_COUNT
+     * (= 72 at STM_PROP_COUNT=5). Was at offset 56 pre-v20, 64 at v20. */
     memcpy(out + 32u + 8u * STM_PROP_COUNT, origin.v, 8);
     if (s->e.name_len > 0) {
         memcpy(out + DS_VAL_FIXED, s->e.name, s->e.name_len);
@@ -925,8 +931,8 @@ static stm_status ds_decode_dataset_value(uint64_t id, const uint8_t *in,
         out_slot->local_set[p]   = (bitmap & (uint16_t)(1u << p)) != 0;
     }
     le64 origin;
-    /* v20: origin_snap_id at 32 + 8*STM_PROP_COUNT (= 64 at
-     * STM_PROP_COUNT=4). Mirror of the encode offset. */
+    /* v22: origin_snap_id at 32 + 8*STM_PROP_COUNT (= 72 at
+     * STM_PROP_COUNT=5). Mirror of the encode offset. */
     memcpy(origin.v, in + 32u + 8u * STM_PROP_COUNT, 8);
     out_slot->e.origin_snap_id = stm_load_le64(origin);
     if (name_len > 0) {

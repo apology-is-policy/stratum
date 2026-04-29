@@ -1442,20 +1442,24 @@ stm_status stm_sync_recv_cold_chunk_release(
         const uint8_t claimed_hash[32]);
 
 /*
- * P7-CAS-11: decay window (in txgs) for the per-COLD-extent
- * read-frequency counter. The counter is reset to 1 when a read
- * occurs after `STM_SYNC_PROMOTE_DECAY_WINDOW_TXGS` or more txgs
- * of read inactivity (i.e. `current_gen - last_read_gen > window`);
- * within the window each read saturating-increments the counter.
+ * P7-CAS-11 / P7-CAS-12: decay window (in txgs) for the per-COLD-
+ * extent read-frequency counter. The counter is reset to 1 when a
+ * read occurs after `window` or more txgs of read inactivity (i.e.
+ * `current_gen - last_read_gen > window`); within the window each
+ * read saturating-increments the counter.
  *
- * Hardcoded at v1; future v2 may expose via /ctl/ or per-dataset
- * property. A larger window means the counter accumulates over a
- * longer history (more "memory"); a smaller window means recent
- * read patterns dominate. 1024 txgs balances the two — at typical
- * commit cadence this is hours-to-days of activity for active
- * datasets, weeks for idle ones.
+ * The compile-time default is `STM_SYNC_PROMOTE_DECAY_WINDOW_DEFAULT_TXGS`
+ * = 1024. Per-dataset override available via the
+ * `STM_PROP_PROMOTE_DECAY_WINDOW` property (P7-CAS-12); effective
+ * value 0 = use compile-time default; non-zero = use that window.
+ *
+ * A larger window means the counter accumulates over a longer
+ * history (more "memory" for the heuristic); a smaller window means
+ * recent read patterns dominate. The default 1024 balances the two —
+ * at typical commit cadence this is hours-to-days of activity for
+ * active datasets, weeks for idle ones.
  */
-#define STM_SYNC_PROMOTE_DECAY_WINDOW_TXGS  ((uint64_t)1024u)
+#define STM_SYNC_PROMOTE_DECAY_WINDOW_DEFAULT_TXGS  ((uint64_t)1024u)
 
 /*
  * P7-CAS-11: per-ino promotion data plane. Walks every COLD extent

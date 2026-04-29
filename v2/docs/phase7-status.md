@@ -56,9 +56,40 @@ into the CAS tier (which DOES need P6) is a separate concern.
 
 ## Phase 7 status (overall)
 
+- [x] **P7-CAS-12 promote-decay-window per-dataset property** —
+      substantive `<P7CAS12_SUBSTANTIVE>` + R63 close
+      `<P7CAS12_RCLOSE>` + hash-fixup (this commit). Format break
+      STM_UB_VERSION 21 → 22: STM_PROP_COUNT 4 → 5, adding
+      `STM_PROP_PROMOTE_DECAY_WINDOW` (INHERITABLE; per-dataset
+      override for the per-COLD read-frequency counter's decay
+      window in txgs). Effective value 0 = use compile-time
+      default (`STM_SYNC_PROMOTE_DECAY_WINDOW_DEFAULT_TXGS = 1024`,
+      renamed from the v1 hardcoded `STM_SYNC_PROMOTE_DECAY_WINDOW_TXGS`);
+      non-zero = use that window. The bump call site at
+      `stm_sync_read_extent_locked`'s COLD branch resolves the
+      effective property at each successful decrypt and passes
+      the result to `stm_extent_record_promote_read_hit`. Lock
+      order preserved: sync->lock (held) → dataset_idx mutex
+      (acquired here); dataset.c never calls back into sync.
+      Dataset value layout grows past local_value[]: origin_snap_id
+      moves from offset 64 to 72; DS_VAL_FIXED 72 → 80.
+      Pool-defaults value length grows from 32 to 40 bytes. v21
+      pools refused at v22 mount via uniform STM_EBADVERSION.
+      property.tla unchanged (parametric over Properties; existing
+      INHERITABLE-class invariants already cover the new
+      property). cas.tla unchanged (the bump logic is heuristic
+      state, not load-bearing). **No spec extension required.**
+      test_dataset 61 → 63 (kind classifier + chain inheritance +
+      explicit-zero-as-legal-value); existing
+      `dataset_persist_commit_load_roundtrip` extended to exercise
+      slot-4 in the v22 layout. test_fs 135 → 139 (small-window
+      resets, default preserves baseline, inherits from parent,
+      local-zero resolves to default). test_pool UB-version
+      assertion bumped 21 → 22.
+
 - [x] **P7-CAS-11 promotion (cold → hot) heuristic v1** —
       substantive `51c5cc6` + R62 close `ee00bdf` + hash-fixup
-      (this commit). Format break STM_UB_VERSION 20 → 21: extent
+      `e5b5238`. Format break STM_UB_VERSION 20 → 21: extent
       record value layout grows 96 → 108 with `read_count`
       (le32) + `last_read_gen` (le64) at offsets 96..108. The
       counter is COLD-only — HOT extents have both fields == 0
@@ -68,7 +99,9 @@ into the CAS tier (which DOES need P6) is a separate concern.
       `stm_extent_record_promote_read_hit` after every successful
       chunk decrypt. Windowed-count semantics: reset to 1 if
       `current_gen - last_read_gen >
-      STM_SYNC_PROMOTE_DECAY_WINDOW_TXGS` (= 1024 hardcoded),
+      STM_SYNC_PROMOTE_DECAY_WINDOW_DEFAULT_TXGS` (= 1024
+      compile-time default, per-dataset override via
+      `STM_PROP_PROMOTE_DECAY_WINDOW` from P7-CAS-12),
       else saturating-increment (UINT32_MAX clamp). Race-tolerant
       and best-effort: spurious or skipped updates don't
       compromise soundness — worst case is a less-accurate

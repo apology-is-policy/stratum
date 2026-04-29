@@ -318,8 +318,20 @@ extern "C" {
  * enforces this via bytes-96..108-zero anti-tamper. v20 pools'
  * 96-byte extent records length-rejected by v21 decoder. Refused
  * via uniform STM_EBADVERSION at SB version check. No uberblock
- * field changes. */
-#define STM_UB_VERSION        21u
+ * field changes.
+ *
+ * v21 → v22 bump (P7-CAS-12): STM_PROP_COUNT 4 → 5 — adds
+ * STM_PROP_PROMOTE_DECAY_WINDOW (INHERITABLE; per-dataset override
+ * for the per-COLD read-frequency counter's decay window in txgs).
+ * Effective value 0 = use compile-time default
+ * (STM_SYNC_PROMOTE_DECAY_WINDOW_DEFAULT_TXGS = 1024); non-zero =
+ * use that window. Dataset value layout grows past the
+ * local_value[] tail: origin_snap_id moves from offset 64 to
+ * offset 72; DS_VAL_FIXED grows from 72 to 80. Pool-defaults value
+ * length grows from 32 to 40 bytes. v21 pools refused at v22 mount
+ * via uniform STM_EBADVERSION (same posture as v19→v20). No
+ * uberblock field changes. */
+#define STM_UB_VERSION        22u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */

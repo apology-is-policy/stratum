@@ -38,8 +38,45 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R62-hash-fixup. Substantive `51c5cc6` +
-  R62 close `ee00bdf`.
+- **Tip**: post-R63-hash-fixup. Substantive `<P7CAS12_SUBSTANTIVE>` +
+  R63 close `<P7CAS12_RCLOSE>`.
+  **P7-CAS-12 — promote-decay-window per-dataset property. Format
+  break STM_UB_VERSION 21 → 22: STM_PROP_COUNT 4 → 5, adding
+  `STM_PROP_PROMOTE_DECAY_WINDOW` (INHERITABLE; per-dataset
+  override for the per-COLD read-frequency counter's decay
+  window in txgs). Effective value 0 = use compile-time default
+  (`STM_SYNC_PROMOTE_DECAY_WINDOW_DEFAULT_TXGS = 1024`); non-zero
+  = use that window. The bump call site at
+  `stm_sync_read_extent_locked`'s COLD branch resolves the
+  effective property at each successful decrypt and passes the
+  result to `stm_extent_record_promote_read_hit`. Lock order is
+  preserved: sync->lock (held) → dataset_idx mutex (acquired
+  here); dataset.c never calls back into sync. Dataset value
+  layout grows past local_value[]: origin_snap_id moves from
+  offset 64 to 72; DS_VAL_FIXED 72 → 80. Pool-defaults value
+  length grows from 32 to 40 bytes. v21 pools refused at v22
+  mount via uniform STM_EBADVERSION (no in-place forward-compat —
+  same posture as v19→v20 and v18→v19). The `STM_PROP_TIERING`
+  semantics from P7-CAS-8 are unchanged; `STM_PROP_PROMOTE_DECAY_WINDOW`
+  composes orthogonally — TIERING gates whether a dataset
+  participates at all in the migration/promotion policy passes,
+  while PROMOTE_DECAY_WINDOW tunes the read-frequency heuristic
+  for datasets that already opted in. property.tla unchanged
+  (parametric over Properties; existing INHERITABLE-class
+  invariants already cover the new property). cas.tla unchanged
+  (the bump logic is heuristic state, not load-bearing). **No
+  spec extension required.** test_dataset grows 61 → 63 (2 new
+  P7-CAS-12 tests: kind-classifier + chain-inheritance + zero-as-
+  legal-value); the existing `dataset_persist_commit_load_roundtrip`
+  exercises slot-4 in the v22 layout. test_fs grows 135 → 139 (4
+  new P7-CAS-12 tests: small-window-resets-counter, default-
+  preserves-baseline, inherits-from-parent-dataset, local-zero-
+  resolves-to-default). test_pool UB-version assertion bumped
+  21 → 22. 35 ctest suites green default + ASan + TSan in
+  isolation. Spec posture unchanged: 21 modules / 25 fixed cfgs
+  / 34 buggy cfgs.**
+  Prior P7-CAS-11 substantive `51c5cc6` + R62 close `ee00bdf` +
+  hash fixup `e5b5238`.
   **P7-CAS-11 — promotion (cold → hot) heuristic v1. Format
   break STM_UB_VERSION 20 → 21: extent record value layout
   grows 96 → 108 bytes with `read_count` (le32 at offset
@@ -51,7 +88,10 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   `stm_sync_read_extent_locked`'s COLD branch on every
   successful chunk decrypt — best-effort + race-tolerant.
   Windowed-count semantics with hardcoded
-  `STM_SYNC_PROMOTE_DECAY_WINDOW_TXGS = 1024`: counter resets
+  `STM_SYNC_PROMOTE_DECAY_WINDOW_DEFAULT_TXGS = 1024` (renamed
+  from `STM_SYNC_PROMOTE_DECAY_WINDOW_TXGS` by P7-CAS-12; the
+  per-dataset override knob now lives in
+  `STM_PROP_PROMOTE_DECAY_WINDOW`): counter resets
   to 1 if `current_gen - last_read_gen > window`, else
   saturating-increments (UINT32_MAX clamp). New extent-tree API
   `stm_extent_promote_swap_to_hot` (atomic cold→hot, returns

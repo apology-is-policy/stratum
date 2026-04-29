@@ -685,6 +685,11 @@ STM_TEST(prop_kind_classifier) {
      * locally overridden. */
     STM_ASSERT_EQ((int)stm_property_kind_of(STM_PROP_TIERING),
                    (int)STM_PROP_KIND_INHERITABLE);
+    /* P7-CAS-12 (UB v22): promote-decay-window classified as
+     * INHERITABLE so children inherit the parent's window unless
+     * locally overridden. */
+    STM_ASSERT_EQ((int)stm_property_kind_of(STM_PROP_PROMOTE_DECAY_WINDOW),
+                   (int)STM_PROP_KIND_INHERITABLE);
 }
 
 STM_TEST(prop_tiering_inherits_through_chain) {
@@ -766,6 +771,87 @@ STM_TEST(prop_tiering_persistence_roundtrip) {
     STM_ASSERT_OK(stm_dataset_effective_property(idx, home,
                                                      STM_PROP_QUOTA, &v));
     STM_ASSERT_EQ(v, (uint64_t)42);
+
+    stm_dataset_index_close(idx);
+}
+
+STM_TEST(prop_promote_decay_window_inherits_through_chain) {
+    /* P7-CAS-12: STM_PROP_PROMOTE_DECAY_WINDOW inherits through the
+     * parent chain. Setting a window on a parent makes effective
+     * window equal to that on every descendant that doesn't locally
+     * override. */
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+
+    uint64_t home = 0, alice = 0, photos = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID,
+                                              "home", &home));
+    STM_ASSERT_OK(stm_dataset_create_child(idx, home, "alice", &alice));
+    STM_ASSERT_OK(stm_dataset_create_child(idx, alice, "photos", &photos));
+
+    /* Pool default 0 (= "use compile-time default" at the call site). */
+    uint64_t v = 999;
+    STM_ASSERT_OK(stm_dataset_effective_property(
+            idx, photos, STM_PROP_PROMOTE_DECAY_WINDOW, &v));
+    STM_ASSERT_EQ(v, (uint64_t)0);
+
+    /* Set window=64 on home: alice + photos inherit. */
+    STM_ASSERT_OK(stm_dataset_set_property(
+            idx, home, STM_PROP_PROMOTE_DECAY_WINDOW, 64u));
+    STM_ASSERT_OK(stm_dataset_effective_property(
+            idx, home, STM_PROP_PROMOTE_DECAY_WINDOW, &v));
+    STM_ASSERT_EQ(v, (uint64_t)64);
+    STM_ASSERT_OK(stm_dataset_effective_property(
+            idx, alice, STM_PROP_PROMOTE_DECAY_WINDOW, &v));
+    STM_ASSERT_EQ(v, (uint64_t)64);
+    STM_ASSERT_OK(stm_dataset_effective_property(
+            idx, photos, STM_PROP_PROMOTE_DECAY_WINDOW, &v));
+    STM_ASSERT_EQ(v, (uint64_t)64);
+
+    /* alice locally overrides to a longer window — photos inherits
+     * alice's value. */
+    STM_ASSERT_OK(stm_dataset_set_property(
+            idx, alice, STM_PROP_PROMOTE_DECAY_WINDOW, 4096u));
+    STM_ASSERT_OK(stm_dataset_effective_property(
+            idx, photos, STM_PROP_PROMOTE_DECAY_WINDOW, &v));
+    STM_ASSERT_EQ(v, (uint64_t)4096);
+    /* home still 64. */
+    STM_ASSERT_OK(stm_dataset_effective_property(
+            idx, home, STM_PROP_PROMOTE_DECAY_WINDOW, &v));
+    STM_ASSERT_EQ(v, (uint64_t)64);
+
+    /* alice clears local — photos walks back up to home's 64. */
+    STM_ASSERT_OK(stm_dataset_clear_property(
+            idx, alice, STM_PROP_PROMOTE_DECAY_WINDOW));
+    STM_ASSERT_OK(stm_dataset_effective_property(
+            idx, photos, STM_PROP_PROMOTE_DECAY_WINDOW, &v));
+    STM_ASSERT_EQ(v, (uint64_t)64);
+
+    stm_dataset_index_close(idx);
+}
+
+STM_TEST(prop_promote_decay_window_zero_is_legal_value) {
+    /* P7-CAS-12: explicit 0 is a legal local-set value (semantically
+     * "use compile-time default" at the bump call site, but the
+     * property layer doesn't reject 0 — it's only the consumer's
+     * fallback rule). The set/clear/effective shape is identical to
+     * any other numeric value. */
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+
+    uint64_t home = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID,
+                                              "home", &home));
+    /* Pool default 1024; home set local 0 — effective is 0 (local
+     * wins). */
+    STM_ASSERT_OK(stm_dataset_set_pool_default(
+            idx, STM_PROP_PROMOTE_DECAY_WINDOW, 1024u));
+    STM_ASSERT_OK(stm_dataset_set_property(
+            idx, home, STM_PROP_PROMOTE_DECAY_WINDOW, 0u));
+    uint64_t v = 999;
+    STM_ASSERT_OK(stm_dataset_effective_property(
+            idx, home, STM_PROP_PROMOTE_DECAY_WINDOW, &v));
+    STM_ASSERT_EQ(v, (uint64_t)0);
 
     stm_dataset_index_close(idx);
 }
@@ -1394,6 +1480,9 @@ STM_TEST(dataset_persist_commit_load_roundtrip) {
     /* Property work: set inheritable on root, immutable on alpha.
      * R59 P3-2: also exercise the slot-3 encode path by setting
      * STM_PROP_TIERING (P7-CAS-8) so the v20 layout's 4th
+     * local_value slot survives the on-disk roundtrip.
+     * P7-CAS-12: also exercise the slot-4 encode path by setting
+     * STM_PROP_PROMOTE_DECAY_WINDOW so the v22 layout's 5th
      * local_value slot survives the on-disk roundtrip. */
     STM_ASSERT_OK(stm_dataset_set_property(idx, STM_DATASET_ROOT_ID,
                                               STM_PROP_COMPRESS, 0xaa));
@@ -1403,6 +1492,12 @@ STM_TEST(dataset_persist_commit_load_roundtrip) {
                                               STM_PROP_TIERING, 1u));
     STM_ASSERT_OK(stm_dataset_set_property(idx, a_id,
                                               STM_PROP_TIERING, 0u));
+    STM_ASSERT_OK(stm_dataset_set_property(idx, STM_DATASET_ROOT_ID,
+                                              STM_PROP_PROMOTE_DECAY_WINDOW,
+                                              512u));
+    STM_ASSERT_OK(stm_dataset_set_property(idx, a_id,
+                                              STM_PROP_PROMOTE_DECAY_WINDOW,
+                                              4096u));
     STM_ASSERT_OK(stm_dataset_set_pool_default(idx, STM_PROP_QUOTA, 0x1234));
     /* Destroy beta to exercise ABSENT slots in the encode path. */
     STM_ASSERT_OK(stm_dataset_destroy(idx, b_id));
@@ -1477,6 +1572,21 @@ STM_TEST(dataset_persist_commit_load_roundtrip) {
     STM_ASSERT_OK(stm_dataset_effective_property(idx2, c_id,
                                                     STM_PROP_TIERING, &v));
     STM_ASSERT_EQ(v, 0u);  /* gamma inherits alpha's local 0 */
+    /* P7-CAS-12: STM_PROP_PROMOTE_DECAY_WINDOW (slot 4) survives the
+     * v22 layout encode/decode roundtrip. Root set to 512, alpha
+     * locally overrides to 4096; gamma inherits alpha's 4096. */
+    STM_ASSERT_OK(stm_dataset_effective_property(
+            idx2, STM_DATASET_ROOT_ID,
+            STM_PROP_PROMOTE_DECAY_WINDOW, &v));
+    STM_ASSERT_EQ(v, 512u);
+    STM_ASSERT_OK(stm_dataset_effective_property(
+            idx2, a_id,
+            STM_PROP_PROMOTE_DECAY_WINDOW, &v));
+    STM_ASSERT_EQ(v, 4096u);
+    STM_ASSERT_OK(stm_dataset_effective_property(
+            idx2, c_id,
+            STM_PROP_PROMOTE_DECAY_WINDOW, &v));
+    STM_ASSERT_EQ(v, 4096u);  /* gamma inherits alpha's local 4096 */
 
     stm_dataset_index_close(idx2);
     stm_bootstrap_close(b);

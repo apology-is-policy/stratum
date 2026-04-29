@@ -761,8 +761,18 @@ Counter lifecycle (windowed-count, NOT cumulative):
   - Else: `count = saturating_add(count, 1)` (clamped at
     UINT32_MAX).
 - Always: `last_read_gen = current_gen`.
-- Decay window hardcoded at `STM_SYNC_PROMOTE_DECAY_WINDOW_TXGS
-  = 1024` for v1 (`<stratum/sync.h>`); v2 may expose via /ctl/.
+- Decay window: compile-time default
+  `STM_SYNC_PROMOTE_DECAY_WINDOW_DEFAULT_TXGS = 1024` at
+  `<stratum/sync.h>`. P7-CAS-12 added per-dataset override via
+  `STM_PROP_PROMOTE_DECAY_WINDOW` (INHERITABLE; uint64). The bump
+  call site at `stm_sync_read_extent_locked` resolves the
+  effective property at each successful decrypt; effective value
+  0 → fall back to compile-time default; non-zero → use that
+  window. Lock order: sync->lock (held) → dataset_idx mutex
+  (acquired here); dataset.c never calls back into sync, so no
+  inversion risk. A failed lookup (e.g. dataset destroyed
+  mid-read) falls back to the compile-time default — same
+  heuristic-best-effort posture as the record-missing case.
 
 Race-tolerant: a concurrent overwrite/migrate that removed the
 record between sync-layer read and counter bump returns STM_OK

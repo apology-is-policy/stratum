@@ -103,6 +103,8 @@ Three property kinds (per `property.tla`):
 | `STM_PROP_COMPRESS` | INHERITABLE | local → walk parent chain → pool default |
 | `STM_PROP_QUOTA` | NONINHERITABLE | local → pool default (no walk) |
 | `STM_PROP_ENCRYPTION` | IMMUTABLE | set-once; clear refused |
+| `STM_PROP_TIERING` | INHERITABLE | local → walk parent chain → pool default; gates migration/promotion policy passes (P7-CAS-8 / P7-CAS-11) |
+| `STM_PROP_PROMOTE_DECAY_WINDOW` | INHERITABLE | local → walk parent chain → pool default; effective 0 = use compile-time default `STM_SYNC_PROMOTE_DECAY_WINDOW_DEFAULT_TXGS = 1024`; non-zero = use that window. Read by `stm_sync_read_extent_locked`'s COLD branch at each successful decrypt to set the windowed-counter decay window (P7-CAS-12) |
 
 `set_property` on an IMMUTABLE that is already locally set returns
 `STM_EINVAL` (write-once enforcement). `clear_property` on any
@@ -143,7 +145,7 @@ load leaves the index unchanged.
 `set_next_id` is used at mount to seed from `ub_next_dataset_id`;
 refuses regression below `max_present + 1` (R31 P2-4).
 
-## On-disk encoding (v10)
+## On-disk encoding (v22)
 
 ### Key
 
@@ -157,11 +159,12 @@ refuses regression below `max_present + 1` (R31 P2-4).
 
 ```
 off  size  field
-  0   24   le64 pool_default[STM_PROP_COUNT]
+  0   40   le64 pool_default[STM_PROP_COUNT]
 ```
 
-For `STM_PROP_COUNT == 3`: 24 bytes. Resizing `STM_PROP_COUNT` is a
-format break.
+For `STM_PROP_COUNT == 5` (v22): 40 bytes. Resizing
+`STM_PROP_COUNT` is a format break (v19 = 24 bytes / 3 props,
+v20 = 32 bytes / 4 props, v22 = 40 bytes / 5 props).
 
 ### Dataset value (key ≥ 1)
 
@@ -173,16 +176,27 @@ off  size  field
  24    4   flags            (le32)
  28    2   local_set_bitmap (le16; bits 0..STM_PROP_COUNT-1 = local_set[])
  30    2   name_len         (le16; 0..STM_DATASET_NAME_MAX)
- 32   24   local_value[STM_PROP_COUNT] (3 × le64, in property-id order)
- 56    8   origin_snap_id   (le64; STM_DATASET_NO_ORIGIN for non-clones)
- 64    L   name             (UTF-8, no NUL)
+ 32   40   local_value[STM_PROP_COUNT] (5 × le64, in property-id order)
+ 72    8   origin_snap_id   (le64; STM_DATASET_NO_ORIGIN for non-clones)
+ 80    L   name             (UTF-8, no NUL)
 ```
 
-Total: `64 + name_len` bytes. `DS_VAL_FIXED == 64`.
+Total: `80 + name_len` bytes. `DS_VAL_FIXED == 80`.
 
-Pre-v10 layout was 56 + name_len (no `origin_snap_id`); v9 → v10
-bump (P6-clone) inserted the field at offset 56 and shifted name to
-offset 64.
+Layout history:
+- pre-v10: 56 + name_len (no `origin_snap_id`).
+- v9 → v10 (P6-clone): inserted `origin_snap_id` at offset 56;
+  total 64 + name_len.
+- v19 → v20 (P7-CAS-8 STM_PROP_TIERING): local_value grew from 24
+  to 32 bytes; `origin_snap_id` moved from offset 56 to offset
+  64; total 72 + name_len.
+- v21 → v22 (P7-CAS-12 STM_PROP_PROMOTE_DECAY_WINDOW):
+  local_value grew from 32 to 40 bytes; `origin_snap_id` moved
+  from offset 64 to offset 72; total 80 + name_len.
+
+The encoder/decoder express `origin_snap_id`'s offset as
+`32 + 8 * STM_PROP_COUNT` so future STM_PROP_COUNT bumps slide it
+without code duplication.
 
 ### Crypt + Merkle
 
@@ -228,7 +242,7 @@ runtime).
 
 | Suite | Count | Coverage |
 |---|---|---|
-| `test_dataset` | 57 | Lifecycle (create/destroy/rename/move w/ all error paths); concurrent Create stress (8 threads × 100 ops); IdMonotonic / BirthTxgMonotonic / SiblingNameUnique / ForestStructure / RootInvariant; property API (3 kinds × inherit-walk); clone create + arg validation + sibling-collision; promote semantics; clones_count_for_snap; persist roundtrip including pool defaults, ABSENT slots, properties, clones, and post-mount counters; idempotent commit; tamper detection (csum/key/gen); next_id + current_txg seeding from on-disk + UB. |
+| `test_dataset` | 63 | Lifecycle (create/destroy/rename/move w/ all error paths); concurrent Create stress (8 threads × 100 ops); IdMonotonic / BirthTxgMonotonic / SiblingNameUnique / ForestStructure / RootInvariant; property API (5 props × 3 kinds × inherit-walk); STM_PROP_PROMOTE_DECAY_WINDOW chain inheritance + explicit-zero-as-legal-value (P7-CAS-12); clone create + arg validation + sibling-collision; promote semantics; clones_count_for_snap; persist roundtrip including pool defaults, ABSENT slots, properties (all 5 slots in v22 layout), clones, and post-mount counters; idempotent commit; tamper detection (csum/key/gen); next_id + current_txg seeding from on-disk + UB. |
 | `test_sync` | 24 | Mount/unmount roundtrip via sync handle; snap delete refused with clone (cb wires through); destroy-all-clones unblocks delete; clone state survives mount with cb rehydration. |
 
 ## Status

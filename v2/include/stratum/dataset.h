@@ -114,7 +114,21 @@ typedef enum {
      * runs the per-dataset policy step on each that resolves
      * STM_PROP_TIERING != 0. */
     STM_PROP_TIERING     = 3,   /* INHERITABLE   */
-    STM_PROP_COUNT       = 4
+    /* P7-CAS-12 (UB v21→v22): per-dataset override for the per-COLD-
+     * extent read-frequency counter's decay window (in txgs).
+     * Effective value 0 = use compile-time default
+     * (STM_SYNC_PROMOTE_DECAY_WINDOW_DEFAULT_TXGS = 1024); non-zero
+     * = use that window. INHERITABLE — children inherit the parent's
+     * window unless locally overridden. The promotion bump call site
+     * (`stm_sync_read_extent_locked`'s COLD branch) resolves the
+     * effective property at each successful decrypt and passes the
+     * result to `stm_extent_record_promote_read_hit`. A larger window
+     * accumulates over a longer history (more "memory" for the
+     * heuristic); a smaller window means recent read patterns
+     * dominate. Counter reset semantics see
+     * `stm_extent_record_promote_read_hit` for details. */
+    STM_PROP_PROMOTE_DECAY_WINDOW = 4,   /* INHERITABLE   */
+    STM_PROP_COUNT       = 5
 } stm_property;
 
 typedef enum {
@@ -435,10 +449,11 @@ stm_status stm_dataset_clones_count_for_snap(const stm_dataset_index *idx,
  * tree under `ub_main_root`. The tree's keyspace mixes:
  *   - Dataset entries:       key = le64 dataset_id (≥ 1), value = packed entry.
  *   - Pool-property defaults: key = le64 0, value = STM_PROP_COUNT × le64
- *                              (32 bytes at v20; 24 bytes at v19; 8 × N).
+ *                              (40 bytes at v22; 32 bytes at v20; 24 bytes
+ *                               at v19; 8 × N in general).
  *
  * On-disk per-dataset value (variable length, name_len bytes for the name).
- * v20 layout (current):
+ * v22 layout (current):
  *
  *   off  size  field
  *    0    8   parent_id (le64)
@@ -447,11 +462,11 @@ stm_status stm_dataset_clones_count_for_snap(const stm_dataset_index *idx,
  *   24    4   flags (le32)
  *   28    2   local_set_bitmap (le16) — bits 0..STM_PROP_COUNT-1 = local_set[]
  *   30    2   name_len (le16) — 0..STM_DATASET_NAME_MAX
- *   32   32   local_value[STM_PROP_COUNT] (4 × le64 at v20, in property-id order)
- *   64    8   origin_snap_id (le64) — STM_DATASET_NO_ORIGIN (0) for non-clones (v10)
- *   72    L   name (UTF-8, no NUL)   L = name_len
+ *   32   40   local_value[STM_PROP_COUNT] (5 × le64 at v22, in property-id order)
+ *   72    8   origin_snap_id (le64) — STM_DATASET_NO_ORIGIN (0) for non-clones (v10)
+ *   80    L   name (UTF-8, no NUL)   L = name_len
  *
- * Total: 72 + name_len bytes (v20).
+ * Total: 80 + name_len bytes (v22).
  *
  * Format-break history:
  *   v9  → v10: added origin_snap_id at offset 56 (P6-clone). Total
@@ -459,11 +474,15 @@ stm_status stm_dataset_clones_count_for_snap(const stm_dataset_index *idx,
  *   v19 → v20: STM_PROP_COUNT 3 → 4 (P7-CAS-8 STM_PROP_TIERING).
  *              local_value grows from 24 to 32 bytes; origin_snap_id
  *              moves from offset 56 to offset 64; total 72 + name_len.
+ *   v21 → v22: STM_PROP_COUNT 4 → 5 (P7-CAS-12
+ *              STM_PROP_PROMOTE_DECAY_WINDOW). local_value grows from
+ *              32 to 40 bytes; origin_snap_id moves from offset 64 to
+ *              offset 72; total 80 + name_len.
  *
  * The on-disk encoder/decoder express origin_snap_id's offset as
  * `32 + 8 * STM_PROP_COUNT` so future STM_PROP_COUNT bumps slide it
  * without code duplication. Bumping STM_PROP_COUNT requires a
- * UB-version bump (v19 pools refused at v20 mount via uniform
+ * UB-version bump (v21 pools refused at v22 mount via uniform
  * STM_EBADVERSION).
  *
  * Crypt + I/O follow the alloc_roots pattern: AEAD nonce

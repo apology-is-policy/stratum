@@ -5913,4 +5913,202 @@ STM_TEST(fs_p7cas11_promote_wedged_refused) {
     unlink(g_key_path);
 }
 
+/* ====================================================================== */
+/* P7-CAS-12: STM_PROP_PROMOTE_DECAY_WINDOW per-dataset override.          */
+/* ====================================================================== */
+
+STM_TEST(fs_p7cas12_small_window_property_resets_counter) {
+    /* Set window=1 on root dataset; after 2 commits between reads,
+     * the counter should reset to 1 (gap > window). Without the
+     * property the default 1024-txg window would let the counter
+     * keep growing — this test isolates the property's effect. */
+    make_tmp("p7cas12_small_window");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_dataset_index *idx = stm_sync_dataset_index(sync);
+    STM_ASSERT_OK(stm_dataset_set_property(
+            idx, /*root*/1, STM_PROP_PROMOTE_DECAY_WINDOW, 1u));
+
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++)
+        plain[i] = (uint8_t)((i * 3u + 1u) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    /* Read 1 — counter=1 (sentinel-reset path: last_read_gen was 0). */
+    uint8_t buf[4096];
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, buf, sizeof buf, &got));
+
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record rec;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &rec));
+    STM_ASSERT_EQ((unsigned)rec.read_count, 1u);
+    uint64_t lrg_before = rec.last_read_gen;
+    STM_ASSERT_TRUE(lrg_before > 0u);
+
+    /* Two commits advance current_gen well past last_read_gen by
+     * more than window=1. */
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    /* Read 2 — gap > window → counter resets to 1 (not 2). */
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, buf, sizeof buf, &got));
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &rec));
+    STM_ASSERT_EQ((unsigned)rec.read_count, 1u);
+    STM_ASSERT_TRUE(rec.last_read_gen > lrg_before);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas12_default_property_preserves_pre_v22_behavior) {
+    /* Without setting the property, effective is 0 → call site falls
+     * back to STM_SYNC_PROMOTE_DECAY_WINDOW_DEFAULT_TXGS = 1024. The
+     * counter accumulates across a small number of commits identical
+     * to the P7-CAS-11 baseline. */
+    make_tmp("p7cas12_default");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* No property set anywhere — effective is 0 → fallback default. */
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++)
+        plain[i] = (uint8_t)((i * 5u + 2u) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    uint8_t buf[4096];
+    size_t got = 0;
+    /* Three reads, with commits between them. */
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, buf, sizeof buf, &got));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, buf, sizeof buf, &got));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, buf, sizeof buf, &got));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record rec;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &rec));
+    /* gap-per-commit much smaller than the default 1024-txg window
+     * → counter accumulates: 1 (sentinel reset) → 2 → 3. */
+    STM_ASSERT_EQ((unsigned)rec.read_count, 3u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas12_property_inherits_from_parent_dataset) {
+    /* Set window=1 on parent (root). Child inherits → child's COLD
+     * extents reset their counter when the gap exceeds 1, same as
+     * if the property were locally set on the child. */
+    make_tmp("p7cas12_inherit");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_dataset_index *idx = stm_sync_dataset_index(sync);
+    /* Set window=1 on root; child inherits. */
+    STM_ASSERT_OK(stm_dataset_set_property(
+            idx, /*root*/1, STM_PROP_PROMOTE_DECAY_WINDOW, 1u));
+
+    uint64_t child = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, /*parent=*/1, "child", &child));
+
+    /* Confirm effective resolves to 1 on child via the property
+     * layer. */
+    uint64_t v = 0;
+    STM_ASSERT_OK(stm_dataset_effective_property(
+            idx, child, STM_PROP_PROMOTE_DECAY_WINDOW, &v));
+    STM_ASSERT_EQ(v, 1u);
+
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++)
+        plain[i] = (uint8_t)((i * 23u + 7u) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, child, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, child, 1));
+
+    uint8_t buf[4096];
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, child, 1, 0, buf, sizeof buf, &got));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    /* Gap > 1 → reset to 1 next read. */
+    STM_ASSERT_OK(stm_fs_read(fs, child, 1, 0, buf, sizeof buf, &got));
+
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record rec;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, child, 1, 0, &rec));
+    STM_ASSERT_EQ((unsigned)rec.read_count, 1u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas12_property_local_zero_resolves_to_default) {
+    /* Explicit local 0 means "use compile-time default" at the call
+     * site (sync.c reads effective; treats 0 as fallback). Effective
+     * resolution returns 0 (local-set wins per property.tla); the
+     * call site's "if (v != 0)" gate prevents the bump from using
+     * 0 as a literal window. */
+    make_tmp("p7cas12_local_zero");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_dataset_index *idx = stm_sync_dataset_index(sync);
+    /* Pool default 1 (would force resets every commit); root locally
+     * overrides to 0 (= "use compile-time default = 1024"). */
+    STM_ASSERT_OK(stm_dataset_set_pool_default(
+            idx, STM_PROP_PROMOTE_DECAY_WINDOW, 1u));
+    STM_ASSERT_OK(stm_dataset_set_property(
+            idx, /*root*/1, STM_PROP_PROMOTE_DECAY_WINDOW, 0u));
+    uint64_t v = 999;
+    STM_ASSERT_OK(stm_dataset_effective_property(
+            idx, /*root*/1, STM_PROP_PROMOTE_DECAY_WINDOW, &v));
+    STM_ASSERT_EQ(v, 0u);
+
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++)
+        plain[i] = (uint8_t)((i * 9u + 4u) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    uint8_t buf[4096];
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, buf, sizeof buf, &got));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, buf, sizeof buf, &got));
+
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record rec;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &rec));
+    /* Default 1024 wins (local 0 → compile-time fallback). Counter
+     * accumulates: 1 → 2. */
+    STM_ASSERT_EQ((unsigned)rec.read_count, 2u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")

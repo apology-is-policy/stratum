@@ -577,7 +577,9 @@ stm_status stm_fs_promote_to_hot(stm_fs *fs,
  * Read-counter lifecycle: the counter is incremented automatically
  * by stm_sync_read_extent's COLD path via
  * stm_extent_record_promote_read_hit. The increment is windowed
- * (STM_SYNC_PROMOTE_DECAY_WINDOW_TXGS = 1024 txgs); within the
+ * (compile-time default STM_SYNC_PROMOTE_DECAY_WINDOW_DEFAULT_TXGS
+ * = 1024 txgs; per-dataset override available via the
+ * STM_PROP_PROMOTE_DECAY_WINDOW property — P7-CAS-12); within the
  * window each read saturating-increments, after the window the next
  * read resets to 1. Operators tune `min_read_count` and
  * `min_recency_txgs` to express "how many recent reads justify
@@ -589,10 +591,11 @@ stm_status stm_fs_promote_to_hot(stm_fs *fs,
 typedef struct {
     /* Inclusive minimum read_count for an ino's COLD extents to be
      * eligible. The counter saturates at UINT32_MAX and resets to 1
-     * if no read occurred for STM_SYNC_PROMOTE_DECAY_WINDOW_TXGS
-     * txgs (so a high count = "recently hot," not "ancient
-     * accumulation"). 0 means "any COLD ino regardless of read
-     * frequency" — useful for one-shot mass promote. */
+     * if no read occurred for the dataset's effective decay window
+     * (STM_PROP_PROMOTE_DECAY_WINDOW; compile-time default 1024 txgs)
+     * — so a high count = "recently hot," not "ancient accumulation."
+     * 0 means "any COLD ino regardless of read frequency" — useful
+     * for one-shot mass promote. */
     uint32_t min_read_count;
     /* Reserved alignment padding. */
     uint32_t _reserved0;
