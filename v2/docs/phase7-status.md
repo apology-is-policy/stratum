@@ -56,9 +56,58 @@ into the CAS tier (which DOES need P6) is a separate concern.
 
 ## Phase 7 status (overall)
 
+- [x] **P7-CAS-4 background-GC semantics + R51/R54 P3 closure
+      round** — substantive `<R55-substantive-hash>` + R55 close
+      `<R55-close-hash>` + hash-fixup (this commit). Reorders
+      `cas_auto_gc_sweep_locked` from "alloc_free first → cas_gc
+      second" (P7-CAS-3) to "cas_gc first → alloc_free second" so a
+      concurrent stm_cas_ref bump between Phase 1 capture and
+      Phase 2 cas_gc surfaces as STM_EBUSY → skip the entire tuple
+      cleanly (no entry removal AND no paddr free; next sweep
+      retries when refcount drops back to 0). Closes R51 P3-2 —
+      silent-skip on EBUSY under the prior order leaked alive-
+      entry's paddrs to PENDING under a future without-sync->lock
+      scrub-driven CAS GC, which would reissue the paddrs to a
+      new hot extent → cas.tla::HotColdReplicasDisjoint violation.
+      R51 P3-4: alloc_free now skips STM_DEV_STATE_FAULTED /
+      STM_DEV_STATE_REMOVED devices (alloc_commit's per-device
+      loop already skips them; symmetry keeps in-RAM and on-disk
+      in lockstep). Spec extension to `cas.tla`: new variables
+      `freed_paddrs` + `gc_in_flight`; atomic `GC` action that
+      updates cas_entries + freed_paddrs in lockstep; two-step
+      buggy actions `BuggyGcOldOrderFreePaddrs` +
+      `BuggyGcOldOrderTryRemove` under
+      `BuggyGcOldOrderSilentSkip = TRUE` modeling the race
+      window; new invariant `LiveCASEntriesNotFreed` (no live cas
+      entry's replicas overlap freed_paddrs, modulo `gc_in_flight`
+      in-flight-GC tolerance). cas.cfg green at 3.23M states /
+      depth 10 / ~5:33 wall (was 3.18M / 3:32). New
+      `cas_gc_old_order_silent_skip_buggy.cfg` fires
+      `LiveCASEntriesNotFreed` at depth 7. R54 P3-2 fix: pre-check
+      capacity via new
+      `stm_snapshot_index_cold_dead_list_reserve(idx, dataset_id,
+      n_to_append, *out_can_accept)` API + sync.c bookends call
+      it BEFORE `stm_extent_overwrite` /
+      `stm_extent_truncate_into`; without the pre-check, a per-
+      call STM_ENOSPC mid-bookend silently lost the deref
+      obligation → permanent CAS leak. R54 P3-3:
+      `stm_snapshot_cold_dead_list_count(snapshot_id == 0)`
+      rejected with STM_EINVAL (consistency with rest of snapshot
+      API). R54 P3-1: dead `else { should_deref = true; }`
+      removed in both write_extent and truncate bookends
+      (s->snap_idx unconditionally created at sync_create /
+      sync_open). test_fs grows 83 → 90 (7 new P7-CAS-4 tests +
+      relevant assertions). 35 ctest suites green default + ASan +
+      TSan in isolation. Spec posture: 21 modules / 25 fixed
+      cfgs / 34 buggy cfgs. **No format break — STM_UB_VERSION =
+      19 preserved.** Cold-tier MVP feature-complete. Background
+      scrub-β-cb invocation (the actual scrub-driven path)
+      forward-noted as a follow-on chunk needing lock-graph
+      rework + new non-_locked sweep entry point.
+
 - [x] **P7-CAS-4c snap_idx ↔ CAS hash refcount integration** —
       substantive `dbadc63` + R54 close
-      `223250b` + hash-fixup (this commit). Closes the
+      `223250b` + hash-fixup `f34f0d1`. Closes the
       P7-CAS-2 forward-noted deferral: snapshots-with-cold-extents
       were unsupported because auto-GC could reclaim a chunk still
       referenced by a snap's tree_root view → STM_ECORRUPT on

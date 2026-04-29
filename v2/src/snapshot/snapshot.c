@@ -628,6 +628,8 @@ stm_status stm_snapshot_cold_dead_list_count(const stm_snapshot_index *idx,
                                                  uint64_t snapshot_id,
                                                  size_t *out_count) {
     if (!idx || !out_count) return STM_EINVAL;
+    /* R54 P3-3: snapshot_id == 0 is the pool sentinel, never a valid snap. */
+    if (snapshot_id == 0) return STM_EINVAL;
     pthread_mutex_t *lock = snap_lock(idx);
     must_lock(lock);
     size_t s = find_slot_locked(idx, snapshot_id);
@@ -636,6 +638,51 @@ stm_status stm_snapshot_cold_dead_list_count(const stm_snapshot_index *idx,
         return STM_ENOENT;
     }
     *out_count = idx->slots[s].cold_dead_count;
+    must_unlock(lock);
+    return STM_OK;
+}
+
+/* P7-CAS-4 R54 P3-2: pre-check capacity for n_to_append entries against
+ * the most-recent PRESENT snap. See snapshot.h for semantics. */
+stm_status stm_snapshot_index_cold_dead_list_reserve(
+        const stm_snapshot_index *idx,
+        uint64_t dataset_id,
+        size_t n_to_append,
+        bool *out_can_accept) {
+    if (!idx || !out_can_accept) return STM_EINVAL;
+    if (dataset_id == 0) return STM_EINVAL;
+
+    pthread_mutex_t *lock = snap_lock(idx);
+    must_lock(lock);
+
+    uint64_t mr = most_recent_locked(idx, dataset_id);
+    if (mr == STM_SNAP_NO_PREV) {
+        /* No most-recent PRESENT snap → bookend will direct-deref;
+         * no cold-dead-list slot consumed. */
+        *out_can_accept = true;
+        must_unlock(lock);
+        return STM_OK;
+    }
+
+    size_t s = find_slot_locked(idx, mr);
+    if (s == (size_t)-1 || !idx->slots[s].present) {
+        must_unlock(lock);
+        return STM_ECORRUPT;
+    }
+
+    size_t current = idx->slots[s].cold_dead_count;
+    /* Saturating-sum guard: reject SIZE_MAX-shaped n_to_append before it
+     * wraps into a misleading "fits" answer. Realistic n_to_append values
+     * are bounded by the per-write cold-overlap count (a few hundred
+     * worst-case under FastCDC + recordsize), but defensive math is
+     * cheap. */
+    if (n_to_append > STM_SNAP_COLD_DEAD_LIST_MAX) {
+        *out_can_accept = false;
+    } else if (current > STM_SNAP_COLD_DEAD_LIST_MAX - n_to_append) {
+        *out_can_accept = false;
+    } else {
+        *out_can_accept = true;
+    }
     must_unlock(lock);
     return STM_OK;
 }

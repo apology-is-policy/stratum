@@ -323,13 +323,13 @@ stm_status stm_snapshot_dead_list_count(const stm_snapshot_index *idx,
  * (count of live cold extents at h) + (count of snap-cold-dead entries
  * at h across all PRESENT snaps)".
  *
- * Single-ownership defense-in-depth: scans every PRESENT snap's
- * cold-dead-list for an existing entry of `content_hash`. The scan is
- * weaker than the paddr-tier's identical-paddr scan (cold hashes can
- * legitimately repeat across snaps via sequential migrate-of-same-
- * content; the scan only catches a programming bug where the SAME
- * cold-extent-record's hash gets routed twice). Bounded by total
- * cold-dead entries (≤ STM_SNAP_COLD_DEAD_LIST_MAX × n_snaps).
+ * Cold-dead-list shape: per R54 P1-1, the list is a MULTISET of hashes
+ * (NOT a set) — distinct cold extents legitimately share content_hash
+ * via dedup, intra-file dedup, or FastCDC sub-chunking, and a single
+ * COW operation can drop multiple cold records sharing one hash. Each
+ * entry represents one cold-record-drop's deref obligation.
+ * dead_list.tla::ColdSingleOwnership is at the cold-extent-id level,
+ * not the hash level.
  *
  * Refuses with:
  *   - STM_EINVAL on NULL idx / NULL out / dataset_id == 0 / NULL hash.
@@ -338,10 +338,12 @@ stm_status stm_snapshot_dead_list_count(const stm_snapshot_index *idx,
  *     case that signals in-RAM index corruption — same shape as the
  *     paddr-tier API).
  *   - STM_ENOSPC if the most-recent snap's cold-dead-list is at the
- *     STM_SNAP_COLD_DEAD_LIST_MAX cap. Callers SHOULD propagate
- *     ENOSPC up to the COW caller and refuse the operation (the
- *     alternative — direct-deref + drop the snap's claim — would
- *     silently violate dead_list.tla::ColdExtentsTrackedSomewhere).
+ *     STM_SNAP_COLD_DEAD_LIST_MAX cap. Callers SHOULD pre-check via
+ *     `stm_snapshot_index_cold_dead_list_reserve` BEFORE mutating the
+ *     extent index; absent the pre-check, the cold-record-drop has
+ *     already mutated extent_idx and the caller cannot easily roll
+ *     back, so the deref is lost and the chunk leaks. Pre-check is
+ *     the supported pattern (P7-CAS-4 R54 P3-2 fix).
  */
 STM_MUST_USE
 stm_status stm_snapshot_index_overwrite_cold_block(stm_snapshot_index *idx,
@@ -350,9 +352,45 @@ stm_status stm_snapshot_index_overwrite_cold_block(stm_snapshot_index *idx,
                                                       bool *out_should_deref);
 
 /*
+ * P7-CAS-4 R54 P3-2: pre-check cold-dead-list capacity for `n_to_append`
+ * additional entries against the most-recent PRESENT snap of `dataset_
+ * id`. Used by the COW caller (sync.c bookends) BEFORE mutating
+ * extent_idx, to avoid silent CAS leaks when the per-call STM_ENOSPC
+ * fires mid-batch — at that point extent_idx has dropped the cold
+ * record but the snap can't capture the deref obligation, leading to
+ * a permanent CAS-refcount-stuck-at-1 leak.
+ *
+ * Semantics:
+ *   - No most-recent PRESENT snap for dataset_id → *out_can_accept = true
+ *     (caller's bookend will fall through to direct deref; no list
+ *     mutation needed).
+ *   - Most-recent PRESENT snap exists →
+ *     *out_can_accept = (current cold_dead_count + n_to_append) <=
+ *                       STM_SNAP_COLD_DEAD_LIST_MAX.
+ *
+ * Lock-tradeoff: this take is BRIEF (just the count read). Caller must
+ * still call overwrite_cold_block per-hash; under the sync.c caller's
+ * sync->lock no concurrent snap_create / snap_delete can shift the
+ * most-recent snap between the pre-check and the appends.
+ *
+ * STM_EINVAL on NULL idx / NULL out / dataset_id == 0.
+ * STM_ECORRUPT on stale-slot signal from most_recent_locked.
+ */
+STM_MUST_USE
+stm_status stm_snapshot_index_cold_dead_list_reserve(
+    const stm_snapshot_index *idx,
+    uint64_t dataset_id,
+    size_t n_to_append,
+    bool *out_can_accept);
+
+/*
  * P7-CAS-4c: count of cold-hash entries in `snapshot_id`'s in-RAM
  * cold-dead-list. STM_ENOENT if snap not PRESENT. *out_count = 0 for
  * a snap with no cold-record overwrites.
+ *
+ * P7-CAS-4 R54 P3-3: snapshot_id == 0 is REJECTED with STM_EINVAL
+ * (consistency with the rest of the snapshot API; ds=0 is the pool
+ * sentinel and never names a valid snapshot).
  */
 STM_MUST_USE
 stm_status stm_snapshot_cold_dead_list_count(const stm_snapshot_index *idx,

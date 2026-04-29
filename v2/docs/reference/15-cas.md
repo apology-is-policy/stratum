@@ -315,12 +315,16 @@ ARCH §7.6.3). Nonce is `(cas_rec.paddrs[0], cas_rec.gen,
 pool_uuid)` — the same shape as the encrypt path. Each replica is
 tried in order; first AEAD-verifying replica wins.
 
-## Auto-GC at sync_commit (closes R49 P2-2 + R50 P2-1 + R50 P2-3)
+## Auto-GC at sync_commit (closes R49 P2-2 + R50 P2-1 + R50 P2-3 + R51 P3-2 + R51 P3-4)
 
 `cas_auto_gc_sweep_locked` runs in `stm_sync_commit` BEFORE the
 per-device `stm_alloc_commit` loop (P7-CAS-3 reordering closes
-R50 P2-1). Three-phase transactional shape (P7-CAS-3 closes R50
-P2-3):
+R50 P2-1). **P7-CAS-4 R51 P3-2 + P3-4** reordered the within-tuple
+sub-steps from "alloc_free first → cas_gc second" to "cas_gc first
+→ alloc_free second" and added a FAULTED/REMOVED-device skip for
+alloc_free.
+
+Two-phase shape (post-P7-CAS-4):
 
 1. **Phase 1 (capture)**: walks the in-RAM CAS index via
    `stm_cas_iter` with `cas_capture_zero_cb`; collects every
@@ -329,23 +333,51 @@ P2-3):
    The cb does NOT call back into stm_cas_* (forbidden by the
    ERRORCHECK mutex).
 
-2. **Phase 2 (free)**: for each tuple, for each paddr, calls
-   `stm_alloc_lookup` to detect "already PENDING"
-   (refcount=0) — skip silently (idempotent retry path from a
-   prior partial sweep + crash); refcount>1 → STM_ECORRUPT (CAS
-   chunks aren't reflink-shared per cas.tla::CASReplicasDisjoint);
-   refcount=1 → call `stm_alloc_free(s->allocs[dev], paddr,
-   s->current_gen)`. Any non-tolerated failure aborts WITHOUT
-   calling cas_gc — the cas_idx entries stay (refcount=0
-   untouched) so a retry can resume.
+2. **Phase 2 (gc-then-free)**: for each tuple:
+   - Sub-step A: atomic `stm_cas_gc(s->cas_idx, hash, ...)` —
+     refcount=0 check + entry removal under cas_idx.lock. STM_EBUSY
+     (concurrent ref-bump bumped refcount > 0 since Phase 1's
+     iter snapshot) and STM_ENOENT (concurrent gc) → skip the
+     tuple cleanly; the next sweep retries when refcount drops
+     back to 0. Other errors → surface as `sweep_err`.
+   - Sub-step B: per paddr, call `stm_alloc_free(s->allocs[dev],
+     paddr, s->current_gen)`. **R51 P3-4**: when the target
+     device's pool state is `STM_DEV_STATE_FAULTED` or
+     `STM_DEV_STATE_REMOVED`, the alloc_free is skipped — the
+     `stm_alloc_commit` per-device loop also skips faulted/removed
+     devices, so a successful alloc_free here would dirty the
+     in-RAM alloc tree without ever persisting. Skipping keeps
+     in-RAM and on-disk in lockstep. Other failures surface as
+     `sweep_err`.
 
-3. **Phase 3 (gc)**: only on full Phase 2 success — for each
-   tuple, calls `stm_cas_gc(s->cas_idx, hash, ...)` to remove
-   the entry from cas_idx. The cas_gc-returned paddrs are
-   ignored (already freed in Phase 2). STM_EBUSY (concurrent
-   ref-bump via stm_sync_cas_index — R50 P2-2 case) and
-   STM_ENOENT (concurrent gc) are skip cases; other errors
-   surface.
+**Why the reorder (R51 P3-2)**: the prior P7-CAS-3 ordering
+(alloc_free first, cas_gc second) opened a window between Phase 2
+alloc_free and Phase 3 cas_gc where the cas-index entry was alive
+but its paddrs were PENDING. If a concurrent `stm_cas_ref` bumped
+refcount in that window, Phase 3 returned STM_EBUSY and silently
+skipped — leaving the live entry's paddrs in PENDING. The next
+allocator commit reissued those paddrs to a new hot extent →
+`cas.tla::HotColdReplicasDisjoint` violation in real use. Under
+sync->lock serialization, cas_ref couldn't race the sweep so the
+silent-skip path was defensive-only. A future scrub-driven CAS GC
+running without sync->lock (carved at R51 P3-2) would expose the
+race; the reorder closes it preventively.
+
+**Spec model (P7-CAS-4)**: `cas.tla::GC` models the reordered
+sweep as one atomic action — `cas_entries'` and `freed_paddrs'`
+update in lockstep. The pre-P7-CAS-4 buggy ordering is captured
+by `BuggyGcOldOrderFreePaddrs` + `BuggyGcOldOrderTryRemove` under
+`BuggyGcOldOrderSilentSkip = TRUE`, which fires
+`LiveCASEntriesNotFreed` at depth 7
+(cas_gc_old_order_silent_skip_buggy.cfg).
+
+**Edge case** (P7-CAS-4): alloc_free per-paddr failure AFTER
+cas_gc removed the entry leaks the paddr (ALLOCATED with no live
+referent). Under sync->lock the typical failure modes are
+STM_ECORRUPT (catastrophic; commit will abort) or STM_ENOMEM (rare
+with the small per-tree footprint). The trade-off — bounded leak
+vs corruption-class HotColdReplicasDisjoint violation — is a
+strict improvement.
 
 **Order vs alloc_commit (closes R50 P2-1)**: two-part fix.
 
@@ -734,6 +766,9 @@ precondition broadens the state space modestly).
 | Cold-crossing truncate (CAS-aware read+slice) | ✅ P7-CAS-4a | — |
 | Cold-extent FastCDC sub-chunking | ✅ P7-CAS-4b | — |
 | Snapshot-CAS hash refcount integration | ✅ P7-CAS-4c | — |
-| Background GC integration with scrub | — | P7-CAS-4 (closes R51 P3-2 + P3-4) |
+| Auto-GC reorder (cas_gc-then-alloc_free) | ✅ P7-CAS-4 (R51 P3-2) | — |
+| Auto-GC FAULTED/REMOVED-device alloc_free skip | ✅ P7-CAS-4 (R51 P3-4) | — |
+| Cold-dead-list capacity pre-check | ✅ P7-CAS-4 (R54 P3-2) | — |
+| Background GC scrub-β-cb invocation | — | follow-on (needs lock-graph rework) |
 | Migration policy heuristic (NOVEL #6 v1) | — | post-P7-CAS-4 |
 | Cross-pool dedup | — | post-v2.0 (NOVEL #3) |

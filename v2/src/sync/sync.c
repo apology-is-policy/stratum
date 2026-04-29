@@ -4309,6 +4309,26 @@ static stm_status stm_sync_write_extent_locked(stm_sync *s,
         }
     }
 
+    /* P7-CAS-4 R54 P3-2: pre-check that the most-recent PRESENT snap's
+     * cold-dead-list can absorb cox.n_hashes more entries BEFORE we
+     * mutate extent_idx. If the cap (STM_SNAP_COLD_DEAD_LIST_MAX) would
+     * overflow, refuse the write with STM_ENOSPC up front — the
+     * post-overwrite bookend cannot roll back individual cold-record
+     * drops, so a mid-bookend STM_ENOSPC would silently leak the
+     * unrouted hash's deref obligation (CAS chunk's refcount stuck
+     * at 1 → permanent leak). */
+    if (s->cas_idx && cox.n_hashes > 0) {
+        bool can_accept = true;
+        stm_status rs = stm_snapshot_index_cold_dead_list_reserve(
+                s->snap_idx, dataset_id, cox.n_hashes, &can_accept);
+        if (rs != STM_OK || !can_accept) {
+            free(cox.hashes);
+            for (size_t j = 0; j < reserved_count; j++)
+                (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
+            return rs != STM_OK ? rs : STM_ENOSPC;
+        }
+    }
+
     /* Update the extent index with the new replica set; collect any
      * dropped paddrs (flat across each dropped extent's replicas).
      * Each dropped paddr routes through snapshot dead-list / free. */
@@ -4340,19 +4360,19 @@ static stm_status stm_sync_write_extent_locked(stm_sync *s,
      * the CAS index directly. Best-effort drain mirroring the paddr-
      * drop loop above. STM_ENOENT on cas_deref indicates a torn
      * cas_idx vs extent_idx — surface as the first non-OK status the
-     * same way drop_err does. */
+     * same way drop_err does.
+     *
+     * P7-CAS-4 R54 P3-1: s->snap_idx is unconditionally created at
+     * sync_create / sync_open, so the dead `else { should_deref =
+     * true; }` fallback is removed. The capacity pre-check above
+     * already guarantees overwrite_cold_block will not return
+     * STM_ENOSPC mid-bookend. */
     if (s->cas_idx && cox.n_hashes > 0) {
         for (size_t i = 0; i < cox.n_hashes; i++) {
             const uint8_t *h = cox.hashes + i * STM_CAS_HASH_LEN;
             bool should_deref = false;
-            stm_status srs = STM_OK;
-            if (s->snap_idx) {
-                srs = stm_snapshot_index_overwrite_cold_block(
-                        s->snap_idx, dataset_id, h, &should_deref);
-            } else {
-                /* No snap_idx — fall back to direct deref. */
-                should_deref = true;
-            }
+            stm_status srs = stm_snapshot_index_overwrite_cold_block(
+                    s->snap_idx, dataset_id, h, &should_deref);
             if (srs == STM_OK && should_deref) {
                 stm_status crs = stm_cas_deref(s->cas_idx, h);
                 if (crs != STM_OK && drop_err == STM_OK) drop_err = crs;
@@ -4876,6 +4896,21 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
         }
     }
 
+    /* P7-CAS-4 R54 P3-2: pre-check cold-dead-list capacity. See the
+     * matching write_extent_locked comment block for the rationale. */
+    if (s->cas_idx && tcox.n_hashes > 0) {
+        bool can_accept = true;
+        stm_status rs = stm_snapshot_index_cold_dead_list_reserve(
+                s->snap_idx, dataset_id, tcox.n_hashes, &can_accept);
+        if (rs != STM_OK || !can_accept) {
+            free(tcox.hashes);
+            free(drop_idx_buf);
+            free(paddrs_buf);
+            pthread_mutex_unlock(&s->lock);
+            return rs != STM_OK ? rs : STM_ENOSPC;
+        }
+    }
+
     /* Phase 3 (P7-12 fault-free): drop past-extents into the
      * pre-allocated buffers. By construction this cannot return
      * STM_ENOMEM — _into never allocates. STM_ERANGE is also
@@ -4920,18 +4955,15 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
 
     /* P7-CAS-2 + P7-CAS-4c: route every captured COLD-extent hash
      * through the snap-aware deref path. Mirror of write_extent_
-     * locked's bookend — see that function for the contract. */
+     * locked's bookend — see that function for the contract.
+     * P7-CAS-4 R54 P3-1: dead else-fallback removed; s->snap_idx is
+     * unconditionally created. */
     if (s->cas_idx && tcox.n_hashes > 0) {
         for (size_t i = 0; i < tcox.n_hashes; i++) {
             const uint8_t *h = tcox.hashes + i * STM_CAS_HASH_LEN;
             bool should_deref = false;
-            stm_status srs = STM_OK;
-            if (s->snap_idx) {
-                srs = stm_snapshot_index_overwrite_cold_block(
-                        s->snap_idx, dataset_id, h, &should_deref);
-            } else {
-                should_deref = true;
-            }
+            stm_status srs = stm_snapshot_index_overwrite_cold_block(
+                    s->snap_idx, dataset_id, h, &should_deref);
             if (srs == STM_OK && should_deref) {
                 stm_status crs = stm_cas_deref(s->cas_idx, h);
                 if (crs != STM_OK && drop_err == STM_OK) drop_err = crs;
@@ -5819,42 +5851,64 @@ static bool cas_capture_zero_cb(const stm_cas_record *r, void *cx) {
 }
 
 /*
- * P7-CAS-3 transactional sweep.
+ * P7-CAS-4 reordered sweep. Closes R51 P3-2 (background-GC silent-skip
+ * race) and R51 P3-4 (FAULTED/REMOVED-device alloc_free skip).
  *
- * Three-phase shape (closes R50 P2-3):
+ * Two-phase shape:
  *
  *   Phase 1 (capture): walk cas_idx via stm_cas_iter; collect every
  *           refcount=0 entry's (hash, paddrs, n_paddrs) tuple.
  *           No mutation of cas_idx or alloc state.
  *
- *   Phase 2 (free): for each tuple, for each paddr, call
- *           stm_alloc_free. Idempotent-tolerant: if a paddr is
- *           already PENDING (alloc lookup returns refcount=0), it
- *           was freed by a prior partial-sweep + retry — skip the
- *           free, treat as success-by-prior. Other failures abort
- *           the whole sweep with the cas_idx UNCHANGED — retry
- *           safe.
+ *   Phase 2 (gc-then-free): for each captured tuple, FIRST call
+ *           stm_cas_gc to atomically check refcount=0 and remove the
+ *           entry. STM_EBUSY (concurrent ref-bump via stm_cas_ref or
+ *           a Migrate CAS-hit branch) → no entry removal AND no paddr
+ *           free → skip cleanly; the next sweep retries when refcount
+ *           drops. STM_ENOENT (concurrent gc) → already done → skip.
+ *           STM_OK → we own the paddrs; alloc_free per paddr.
  *
- *   Phase 3 (gc): only on full Phase 2 success — for each tuple,
- *           call stm_cas_gc to remove the entry from cas_idx. The
- *           cas_gc-returned paddrs are ignored (already freed in
- *           Phase 2). STM_EBUSY here means a concurrent caller
- *           ref-bumped the entry between capture and gc (R50 P2-2);
- *           skip rather than abort. STM_ENOENT means the entry
- *           was already removed (concurrent gc) — also skip.
+ * Why the reorder vs P7-CAS-3's two-phase free-then-gc shape:
+ * the prior order opened a window between Phase 2 alloc_free and
+ * Phase 3 cas_gc where the cas-index entry was alive but its paddrs
+ * were PENDING. If a concurrent cas_ref bumped refcount in that
+ * window, Phase 3 returned STM_EBUSY and silently skipped — leaving
+ * the live entry's paddrs in PENDING. The next allocator commit
+ * reissued those paddrs to a new hot extent → cas.tla::HotColdReplicas-
+ * Disjoint violation in real use. Under sync->lock serialization,
+ * cas_ref couldn't race the sweep so the silent-skip path was
+ * defensive-only; but a future scrub-driven CAS GC running without
+ * sync->lock would expose the race. The reorder closes it
+ * preventively.
  *
- * Order vs alloc_commit (closes R50 P2-1): this function runs BEFORE
- * the per-device stm_alloc_commit loop in stm_sync_commit. The
- * Phase 2 alloc_free calls produce PENDING(free_gen=target_gen)
- * entries in the in-RAM alloc trees; alloc_commit then PERSISTS
- * those PENDING entries (alloc_commit's sweep predicate is
- * free_gen<committed_gen, so PENDING with free_gen=target_gen is
- * NOT swept this cycle but IS persisted). The next sync_commit's
- * alloc_commit at committed_gen=target_gen+2 sweeps PENDING with
- * free_gen<target_gen+2 → catches our entries → paddrs reach FREE.
- * A crash between this commit's final UB and the next sync_commit
- * leaves the alloc tree on disk with PENDING entries (not
- * ALLOCATED) — the next mount + commit reclaims them, no leak.
+ * Spec: cas.tla::GC models the reordered sweep as one atomic action
+ * (entry removal + freed_paddrs update in lockstep). The pre-P7-CAS-4
+ * order is captured by `BuggyGcOldOrderFreePaddrs` +
+ * `BuggyGcOldOrderTryRemove` under `BuggyGcOldOrderSilentSkip = TRUE`,
+ * which fires `LiveCASEntriesNotFreed` (cas_gc_old_order_silent_skip_
+ * buggy.cfg, depth 7).
+ *
+ * Edge case: alloc_free per-paddr failure AFTER cas_gc removed the
+ * entry leaks the paddr (ALLOCATED with no live referent). Under
+ * sync->lock the typical failure modes are STM_ECORRUPT (catastrophic;
+ * commit will abort) or STM_ENOMEM (rare with the small per-tree
+ * footprint). For STM_DEV_STATE_FAULTED / STM_DEV_STATE_REMOVED
+ * devices we INTENTIONALLY skip alloc_free (R51 P3-4) — the device's
+ * paddrs were never going to be reused anyway, and stm_alloc_commit's
+ * own per-device loop skips faulted/removed devices, so a successful
+ * alloc_free here would just dirty the in-RAM alloc tree without ever
+ * persisting. Skipping keeps in-RAM and on-disk in lockstep.
+ *
+ * Order vs alloc_commit (P7-CAS-3): this function still runs BEFORE
+ * the per-device stm_alloc_commit loop in stm_sync_commit. Phase 2's
+ * stm_alloc_free calls add PENDING(free_gen=target_gen) entries to
+ * the in-RAM alloc trees; alloc_commit then PERSISTS them with the
+ * sweep predicate `free_gen<committed_gen`. PENDING-with-free_gen=
+ * target_gen is NOT swept this cycle but IS persisted. The next
+ * sync_commit at target_gen+2 sweeps free_gen<target_gen+2 → catches
+ * our entries → paddrs reach FREE. A crash between this commit's
+ * final UB and the next sync_commit leaves PENDING on disk; the next
+ * mount + commit reclaims them. Closes R50 P2-1.
  */
 static stm_status cas_auto_gc_sweep_locked(stm_sync *s)
 {
@@ -5869,66 +5923,45 @@ static stm_status cas_auto_gc_sweep_locked(stm_sync *s)
     }
     if (zc.n == 0) return STM_OK;        /* nothing to GC */
 
-    /* Phase 2: alloc_free per paddr, idempotent-tolerant. On any
-     * non-tolerated failure return WITHOUT calling stm_cas_gc — the
-     * cas_idx entries stay (refcount=0 untouched) so a retry can
-     * resume. */
-    for (size_t i = 0; i < zc.n; i++) {
-        const cas_sweep_tuple *t = &zc.tuples[i];
-        for (uint8_t j = 0; j < t->n_paddrs; j++) {
-            uint16_t dev = stm_paddr_device(t->paddrs[j]);
-            if (dev >= STM_POOL_DEVICES_MAX || s->allocs[dev] == NULL) {
-                free(zc.tuples);
-                return STM_EINVAL;
-            }
-            /* Idempotent-tolerant: lookup the paddr; if already
-             * PENDING (refcount=0), a prior sweep cycle freed it but
-             * crashed before Phase 3 — accept and continue. */
-            uint64_t length = 0;
-            uint32_t refcount = 0;
-            stm_status ls = stm_alloc_lookup(s->allocs[dev], t->paddrs[j],
-                                                &length, &refcount);
-            if (ls != STM_OK) {
-                free(zc.tuples);
-                return ls;
-            }
-            if (refcount == 0u) {
-                /* Already PENDING — earlier-sweep-then-crash retry
-                 * path. Continue to the next paddr. */
-                continue;
-            }
-            if (refcount > 1u) {
-                /* CAS chunks should not be reflink-shared (cas.tla::
-                 * CASReplicasDisjoint + HotColdReplicasDisjoint). A
-                 * refcount>1 here means alloc-state corruption. */
-                free(zc.tuples);
-                return STM_ECORRUPT;
-            }
-            stm_status fs = stm_alloc_free(s->allocs[dev], t->paddrs[j],
-                                              s->current_gen);
-            if (fs != STM_OK) {
-                free(zc.tuples);
-                return fs;
-            }
-        }
-    }
-
-    /* Phase 3: gc each captured hash. STM_EBUSY (concurrent ref-bump
-     * via stm_sync_cas_index — R50 P2-2 case) and STM_ENOENT
-     * (concurrent gc) are skip cases; other errors are surfaced.
-     * The cas_gc-returned paddrs are ignored — they're already
-     * PENDING from Phase 2. */
+    /* Phase 2: gc-then-free per tuple. */
     stm_status sweep_err = STM_OK;
     for (size_t i = 0; i < zc.n; i++) {
         const cas_sweep_tuple *t = &zc.tuples[i];
+
+        /* Sub-step A: atomic cas_gc. STM_EBUSY/ENOENT are race-skip. */
         uint64_t scratch_paddrs[STM_CAS_MAX_REPLICAS] = {0};
         size_t   scratch_n = 0;
         stm_status gs = stm_cas_gc(s->cas_idx, t->hash,
                                       scratch_paddrs, STM_CAS_MAX_REPLICAS,
                                       &scratch_n);
         if (gs == STM_EBUSY || gs == STM_ENOENT) continue;
-        if (gs != STM_OK && sweep_err == STM_OK) sweep_err = gs;
+        if (gs != STM_OK) {
+            if (sweep_err == STM_OK) sweep_err = gs;
+            continue;
+        }
+
+        /* Sub-step B: alloc_free per paddr. R51 P3-4: skip FAULTED/
+         * REMOVED-device paddrs (stm_alloc_commit's per-device loop
+         * skips them too — keeping the in-RAM alloc tree dirty for a
+         * device that won't persist would lose lockstep across
+         * mount cycles). */
+        for (uint8_t j = 0; j < t->n_paddrs; j++) {
+            uint16_t dev = stm_paddr_device(t->paddrs[j]);
+            if (dev >= STM_POOL_DEVICES_MAX || s->allocs[dev] == NULL) {
+                if (sweep_err == STM_OK) sweep_err = STM_EINVAL;
+                continue;
+            }
+            const stm_pool_device *di = stm_pool_device_info(s->pool, dev);
+            if (di && (di->state == STM_DEV_STATE_REMOVED ||
+                       di->state == STM_DEV_STATE_FAULTED)) {
+                continue;       /* R51 P3-4: paddr unreachable for reuse */
+            }
+            stm_status fs = stm_alloc_free(s->allocs[dev], t->paddrs[j],
+                                              s->current_gen);
+            if (fs != STM_OK && sweep_err == STM_OK) sweep_err = fs;
+        }
     }
+
     free(zc.tuples);
     return sweep_err;
 }

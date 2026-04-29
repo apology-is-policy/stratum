@@ -129,6 +129,22 @@
 (*     re-encrypting on fresh paddrs — same paddr would carry two distinct  *)
 (*     ciphertexts under different ADs.)                                     *)
 (*                                                                           *)
+(*   - BuggyGcOldOrderSilentSkip — models the pre-P7-CAS-4 cas auto-GC      *)
+(*     sweep ordering: alloc_free per paddr (Phase 2) BEFORE cas_gc per      *)
+(*     entry (Phase 3). When a concurrent ref-bump fires between the         *)
+(*     refcount=0 observation and the cas_gc, Phase 3 returns STM_EBUSY      *)
+(*     and silently skips. The paddrs are now alloc-side freed but the       *)
+(*     cas entry is alive with refcount=1 → next allocator commit reissues  *)
+(*     the paddrs to a new hot extent → HotColdReplicasDisjoint violated    *)
+(*     in real use; in the spec, LiveCASEntriesNotFreed fires (the cas      *)
+(*     entry's replicas overlap freed_paddrs).                               *)
+(*                                                                           *)
+(*     The fix (P7-CAS-4 R55) reorders to cas_gc FIRST, then alloc_free —   *)
+(*     so a concurrent ref-bump means cas_gc returns STM_EBUSY, no entry    *)
+(*     removal AND no paddr free. The next sweep retries cleanly. The       *)
+(*     fixed `GC` action models this reorder atomically: cas_entries' and   *)
+(*     freed_paddrs' update in lockstep.                                     *)
+(*                                                                           *)
 (* P7-CAS-4b extension: ChunkedMigrateToColdK2.                              *)
 (*                                                                           *)
 (* P7-CAS-4b adds FastCDC sub-chunking to the migration data plane: a       *)
@@ -171,7 +187,8 @@ CONSTANTS
     BuggyGCRaceWithRef,
     BuggyRehydrateWithoutDeref,
     BuggyDeleteForgetsCASDeref,
-    BuggyMigrateReusesHotPaddr
+    BuggyMigrateReusesHotPaddr,
+    BuggyGcOldOrderSilentSkip
 
 ASSUME MaxDatasets         \in (Nat \ {0})
 ASSUME MaxInos             \in (Nat \ {0})
@@ -188,6 +205,7 @@ ASSUME BuggyGCRaceWithRef         \in BOOLEAN
 ASSUME BuggyRehydrateWithoutDeref \in BOOLEAN
 ASSUME BuggyDeleteForgetsCASDeref \in BOOLEAN
 ASSUME BuggyMigrateReusesHotPaddr \in BOOLEAN
+ASSUME BuggyGcOldOrderSilentSkip  \in BOOLEAN
 
 DatasetIds  == 1..MaxDatasets
 InoIds      == 1..MaxInos
@@ -243,9 +261,21 @@ VARIABLES
     cold_extents,   \* SUBSET ColdExtentRec — hash-addressed extents.
     cas_entries,    \* SUBSET CASEntry — the CAS index (≤ 1 entry per hash).
     used_paddrs,    \* SUBSET Paddrs — every paddr ever issued (monotonic).
-    current_txg     \* 0..MaxTxg — monotonic.
+    current_txg,    \* 0..MaxTxg — monotonic.
+    freed_paddrs,   \* SUBSET Paddrs — paddrs that auto-GC has handed back to
+                    \*   the alloc-side free pool. The load-bearing invariant
+                    \*   `LiveCASEntriesNotFreed` says no live cas entry's
+                    \*   replicas overlap freed_paddrs. P7-CAS-4 invariant.
+    gc_in_flight    \* SUBSET Hashes — hashes whose paddrs have been alloc-
+                    \*   side freed by the buggy old-order auto-GC sweep
+                    \*   (Phase 2) but whose cas-index entry has not yet
+                    \*   been removed (Phase 3 not yet fired). Used only by
+                    \*   the BuggyGcOldOrderSilentSkip actions to model the
+                    \*   pre-P7-CAS-4 sweep's interleaving with concurrent
+                    \*   ref-bumps. Always {} under fixed cfg.
 
-vars == <<hot_extents, cold_extents, cas_entries, used_paddrs, current_txg>>
+vars == <<hot_extents, cold_extents, cas_entries, used_paddrs, current_txg,
+          freed_paddrs, gc_in_flight>>
 
 (***************************************************************************)
 (* Init.                                                                     *)
@@ -257,6 +287,8 @@ Init ==
     /\ cas_entries  = {}
     /\ used_paddrs  = {}
     /\ current_txg  = 0
+    /\ freed_paddrs = {}
+    /\ gc_in_flight = {}
 
 (***************************************************************************)
 (* Helpers.                                                                  *)
@@ -311,7 +343,8 @@ WriteHot(ds, ino, off, len, replicas, key_id) ==
         {[ds |-> ds, ino |-> ino, off |-> off, len |-> len,
           replicas |-> replicas, gen |-> current_txg, key_id |-> key_id]}
     /\ used_paddrs' = used_paddrs \union replicas
-    /\ UNCHANGED <<cold_extents, cas_entries, current_txg>>
+    /\ UNCHANGED <<cold_extents, cas_entries, current_txg,
+                    freed_paddrs, gc_in_flight>>
 
 (***************************************************************************)
 (* MigrateToCold — convert a hot extent to a cold extent, threading the    *)
@@ -386,7 +419,7 @@ MigrateToCold(E, h, cas_replicas) ==
         IF BuggyMigrateWithoutDrop
         THEN hot_extents
         ELSE hot_extents \ {E}
-    /\ UNCHANGED current_txg
+    /\ UNCHANGED <<current_txg, freed_paddrs, gc_in_flight>>
 
 (***************************************************************************)
 (* ChunkedMigrateToColdK2 — atomic 1-hot-to-2-cold migrate.                  *)
@@ -552,7 +585,7 @@ ChunkedMigrateToColdK2(E, len1, h1, h2, r1, r2) ==
             IF BuggyMigrateWithoutDrop
             THEN hot_extents
             ELSE hot_extents \ {E}
-    /\ UNCHANGED current_txg
+    /\ UNCHANGED <<current_txg, freed_paddrs, gc_in_flight>>
 
 (***************************************************************************)
 (* RehydrateOnWrite — replace a cold extent C with a fresh hot extent at    *)
@@ -592,7 +625,7 @@ RehydrateOnWrite(C, new_replicas, new_key_id) ==
                   \union {DecrementedEntry(EntryAt(C.hash))}
              ELSE cas_entries
     /\ used_paddrs' = used_paddrs \union new_replicas
-    /\ UNCHANGED current_txg
+    /\ UNCHANGED <<current_txg, freed_paddrs, gc_in_flight>>
 
 (***************************************************************************)
 (* DeleteFile — drop all extents (hot AND cold) at (ds, ino), decrementing  *)
@@ -618,27 +651,89 @@ DeleteFile(ds, ino) ==
                        THEN e.refcount - DropCount(e.hash)
                        ELSE 0]
                   : e \in cas_entries }
-    /\ UNCHANGED <<used_paddrs, current_txg>>
+    /\ UNCHANGED <<used_paddrs, current_txg, freed_paddrs, gc_in_flight>>
 
 (***************************************************************************)
 (* GC — reclaim a CAS entry whose refcount has fallen to zero. Removes     *)
-(* the entry from the index. The chunk's replicas become eligible for     *)
-(* allocator reclamation; we DON'T remove from used_paddrs because         *)
-(* used_paddrs is monotonic (modeling allocator-freshness — a freed paddr  *)
-(* will be re-issued at a later gen by the allocator under              *)
-(* allocator.tla::NoReuseInSameGen, not at the same gen).                  *)
+(* the entry from the index AND adds its replica paddrs to `freed_paddrs`. *)
+(*                                                                           *)
+(* The atomicity here corresponds, in the C impl, to the P7-CAS-4 reorder:  *)
+(* `stm_cas_gc` (entry removal) is performed BEFORE `stm_alloc_free` per    *)
+(* paddr. By the time the alloc-side free happens the cas-index entry is    *)
+(* already gone, so no live CAS entry's replicas can overlap freed_paddrs.  *)
+(* The two C-impl operations span two locks (cas_idx.lock and alloc.lock)   *)
+(* but the spec models the composed semantics as one atomic transition.    *)
+(*                                                                           *)
+(* used_paddrs is NOT shrunk — it stays monotonic (modeling allocator-     *)
+(* freshness — a freed paddr will be re-issued at a later gen by the        *)
+(* allocator under allocator.tla::NoReuseInSameGen, not at the same gen).   *)
+(* freed_paddrs models the alloc-side PENDING set.                          *)
 (*                                                                           *)
 (* `BuggyGCRaceWithRef` allows GC of an entry whose refcount > 0,         *)
 (* simulating a torn-down / racy GC that fires before all refcount        *)
 (* decrements are durable.                                                  *)
+(*                                                                           *)
+(* See `BuggyGcOldOrderFreePaddrs` / `BuggyGcOldOrderTryRemove` below for   *)
+(* the model of the pre-P7-CAS-4 ordering (alloc_free FIRST, then try-     *)
+(* remove with EBUSY skip), which violates LiveCASEntriesNotFreed.          *)
 (***************************************************************************)
 GC(h) ==
     /\ h \in Hashes
     /\ h \in LiveCASHashes
     /\ \/ BuggyGCRaceWithRef
        \/ EntryAt(h).refcount = 0
-    /\ cas_entries' = cas_entries \ {EntryAt(h)}
-    /\ UNCHANGED <<hot_extents, cold_extents, used_paddrs, current_txg>>
+    /\ cas_entries'  = cas_entries \ {EntryAt(h)}
+    /\ freed_paddrs' = freed_paddrs \union EntryAt(h).replicas
+    /\ UNCHANGED <<hot_extents, cold_extents, used_paddrs, current_txg,
+                    gc_in_flight>>
+
+(***************************************************************************)
+(* BuggyGcOldOrderFreePaddrs — Phase 1 + Phase 2 of the pre-P7-CAS-4        *)
+(* sweep, modeled as an atomic step that captures a refcount=0 entry and   *)
+(* alloc-side frees its replicas. The cas-index entry is left alive and    *)
+(* recorded in `gc_in_flight` for the subsequent TryRemove step.            *)
+(*                                                                           *)
+(* Between this step and the TryRemove step, MigrateToCold (CAS-hit branch) *)
+(* or ChunkedMigrateToColdK2 can fire on `h` — that is the race the bug    *)
+(* depends on.                                                               *)
+(*                                                                           *)
+(* Gated by `BuggyGcOldOrderSilentSkip` so the fixed cfg never enters the   *)
+(* in-flight state machine and `gc_in_flight` stays {} throughout.          *)
+(***************************************************************************)
+BuggyGcOldOrderFreePaddrs(h) ==
+    /\ BuggyGcOldOrderSilentSkip
+    /\ h \in Hashes
+    /\ h \in LiveCASHashes
+    /\ EntryAt(h).refcount = 0
+    /\ h \notin gc_in_flight
+    /\ gc_in_flight' = gc_in_flight \union {h}
+    /\ freed_paddrs' = freed_paddrs \union EntryAt(h).replicas
+    /\ UNCHANGED <<hot_extents, cold_extents, cas_entries, used_paddrs,
+                    current_txg>>
+
+(***************************************************************************)
+(* BuggyGcOldOrderTryRemove — Phase 3 of the pre-P7-CAS-4 sweep. Re-checks *)
+(* refcount; if still 0, removes the entry; if > 0 (concurrent ref bumped  *)
+(* between FreePaddrs and TryRemove), silently skips — the alloc-side free *)
+(* persists while the entry stays alive. That is the bug: live entry's    *)
+(* replicas overlap freed_paddrs → LiveCASEntriesNotFreed fires.            *)
+(*                                                                           *)
+(* In the (counterfactual) fixed-old-order variant, the rollback would     *)
+(* re-bump alloc refcount (remove paddrs from freed_paddrs). The P7-CAS-4   *)
+(* fix instead REORDERS Phase 2/3 entirely (see GC), so the rollback path  *)
+(* doesn't appear in the fixed model — only the atomic GC.                  *)
+(***************************************************************************)
+BuggyGcOldOrderTryRemove(h) ==
+    /\ BuggyGcOldOrderSilentSkip
+    /\ h \in Hashes
+    /\ h \in gc_in_flight
+    /\ gc_in_flight' = gc_in_flight \ {h}
+    /\ cas_entries' =
+        IF EntryAt(h).refcount = 0
+        THEN cas_entries \ {EntryAt(h)}
+        ELSE cas_entries        \* silent-skip on concurrent ref — the bug
+    /\ UNCHANGED <<hot_extents, cold_extents, used_paddrs, current_txg,
+                    freed_paddrs>>
 
 (***************************************************************************)
 (* AdvanceTxg — bump the current txg counter.                                *)
@@ -646,7 +741,8 @@ GC(h) ==
 AdvanceTxg ==
     /\ current_txg < MaxTxg
     /\ current_txg' = current_txg + 1
-    /\ UNCHANGED <<hot_extents, cold_extents, cas_entries, used_paddrs>>
+    /\ UNCHANGED <<hot_extents, cold_extents, cas_entries, used_paddrs,
+                    freed_paddrs, gc_in_flight>>
 
 (***************************************************************************)
 (* Top-level Next.                                                           *)
@@ -666,6 +762,8 @@ Next ==
                 RehydrateOnWrite(C, new_replicas, new_key_id)
     \/ \E ds \in DatasetIds, ino \in InoIds : DeleteFile(ds, ino)
     \/ \E h \in Hashes : GC(h)
+    \/ \E h \in Hashes : BuggyGcOldOrderFreePaddrs(h)
+    \/ \E h \in Hashes : BuggyGcOldOrderTryRemove(h)
     \/ AdvanceTxg
 
 Spec == Init /\ [][Next]_vars
@@ -675,11 +773,13 @@ Spec == Init /\ [][Next]_vars
 (***************************************************************************)
 
 TypeOK ==
-    /\ hot_extents  \subseteq HotExtentRec
-    /\ cold_extents \subseteq ColdExtentRec
-    /\ cas_entries  \subseteq CASEntry
-    /\ used_paddrs  \subseteq Paddrs
-    /\ current_txg  \in Gens
+    /\ hot_extents   \subseteq HotExtentRec
+    /\ cold_extents  \subseteq ColdExtentRec
+    /\ cas_entries   \subseteq CASEntry
+    /\ used_paddrs   \subseteq Paddrs
+    /\ current_txg   \in Gens
+    /\ freed_paddrs  \subseteq Paddrs
+    /\ gc_in_flight  \subseteq Hashes
 
 (* CASIndexUnique — at most one entry per hash. Pinned by every action's   *)
 (* update path (Migrate either inserts a new hash or updates the existing   *)
@@ -751,6 +851,35 @@ CASReplicasDisjoint ==
     \A e1, e2 \in cas_entries :
         e1 # e2 => e1.replicas \cap e2.replicas = {}
 
+(* LiveCASEntriesNotFreed — P7-CAS-4 load-bearing invariant.               *)
+(*                                                                           *)
+(* For every cas-index entry NOT currently in the buggy auto-GC sweep's    *)
+(* in-flight set, the entry's replicas don't overlap freed_paddrs.          *)
+(*                                                                           *)
+(* Why the gc_in_flight clause: the pre-P7-CAS-4 ordering (alloc_free in   *)
+(* Phase 2, cas_gc in Phase 3) ALWAYS opens a transient window where the   *)
+(* entry exists with paddrs already in freed_paddrs — that window is      *)
+(* legitimate (the sweep is mid-progress) and is captured by the entry     *)
+(* being in gc_in_flight. The invariant fires only when an entry LEAVES    *)
+(* the in-flight set with its replicas STILL in freed_paddrs — which is    *)
+(* exactly the silent-skip bug: TryRemove sees concurrent ref, drops from  *)
+(* in_flight, leaves freed_paddrs intact, entry alive with refcount > 0.  *)
+(*                                                                           *)
+(* The P7-CAS-4 fix is to REORDER: cas_gc FIRST (entry removal atomic with  *)
+(* refcount=0 check), then alloc_free per paddr. The atomic `GC` action    *)
+(* models this: cas_entries' and freed_paddrs' update in lockstep, so the  *)
+(* in-flight window doesn't exist. Under the fixed model, gc_in_flight      *)
+(* stays {} throughout and the disjunct's first branch is never taken —    *)
+(* the second branch (replicas ∩ freed = {}) holds because freed_paddrs    *)
+(* only grows when an entry is being removed in the same atomic step.       *)
+(*                                                                           *)
+(* Captured-bug demo: `BuggyGcOldOrderFreePaddrs` + `BuggyGcOldOrderTry-    *)
+(* Remove` under `BuggyGcOldOrderSilentSkip = TRUE`.                         *)
+(***************************************************************************)
+LiveCASEntriesNotFreed ==
+    \A e \in cas_entries :
+        e.hash \in gc_in_flight \/ e.replicas \cap freed_paddrs = {}
+
 Invariants ==
     /\ TypeOK
     /\ CASIndexUnique
@@ -762,5 +891,6 @@ Invariants ==
     /\ NoDanglingColdRef
     /\ HotColdReplicasDisjoint
     /\ CASReplicasDisjoint
+    /\ LiveCASEntriesNotFreed
 
 ================================================================================

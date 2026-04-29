@@ -103,6 +103,10 @@ stm_status stm_snapshot_index_overwrite_cold_block  (idx, dataset_id,
                                                      content_hash[32],
                                                      *out_should_deref);
 stm_status stm_snapshot_cold_dead_list_count        (idx, snapshot_id, *out_count);
+
+/* Cold-tier capacity pre-check (P7-CAS-4 R54 P3-2). */
+stm_status stm_snapshot_index_cold_dead_list_reserve(idx, dataset_id,
+                                                     n_to_append, *out_can_accept);
 ```
 
 `overwrite_block` realizes `dead_list.tla::OverwriteBlock`. If the
@@ -145,38 +149,58 @@ snap until snap-delete fires it.
 Refusal codes for `overwrite_cold_block`:
 
 - `STM_EINVAL` for `dataset_id == 0`, all-zero hash (CAS sentinel,
-  never live), NULL idx / out / hash, OR a hash already present
-  in the same snap's cold-dead-list (defense-in-depth: catches
-  the SAME drop event being routed twice; cross-snap collisions
-  are explicitly ALLOWED — distinct cold extents legitimately
-  share a hash via dedup, and distinct snap windows may each
-  capture a drop of a same-hash cold extent).
+  never live), or NULL idx / out / hash. **Per R54 P1-1 the
+  within-snap dedup-defense scan is GONE** — the cold-dead-list
+  is a multiset of hashes (distinct cold extents legitimately
+  share a content_hash via dedup, intra-file dedup, FastCDC sub-
+  chunking, etc.; a single COW operation can drop multiple cold
+  records sharing one hash). dead_list.tla::ColdSingleOwnership is
+  at the cold-extent-id level, not the hash level.
 - `STM_ECORRUPT` if the most-recent snap slot is in a stale
   state (signals in-RAM index corruption — same shape as the
   paddr-tier API).
 - `STM_ENOSPC` at the in-line cap `STM_SNAP_COLD_DEAD_LIST_MAX
-  = 256`. Caller SHOULD propagate ENOSPC up to the COW caller
-  and refuse the operation; the alternative (direct-deref + drop
-  the snap's claim) would silently violate
-  `dead_list.tla::ColdExtentsTrackedSomewhere`.
+  = 256`. Per P7-CAS-4 R54 P3-2 callers MUST pre-check capacity
+  via `stm_snapshot_index_cold_dead_list_reserve` BEFORE mutating
+  extent_idx; the COW caller (sync.c bookends) does so. Without
+  the pre-check, a per-call STM_ENOSPC mid-bookend would silently
+  lose the deref obligation and leak the CAS chunk (refcount
+  stuck at 1).
 - `STM_ENOMEM` on realloc failure (existing cold-dead-list
   preserved).
 
 `cold_dead_list_count` is read-only observability; returns the
 number of cold-extent hashes tracked in `snapshot_id`'s cold-dead-
-list.
+list. Per R54 P3-3, `snapshot_id == 0` (pool sentinel) is rejected
+with STM_EINVAL.
 
-Production callers wired in P7-CAS-4c:
+`cold_dead_list_reserve` is the P7-CAS-4 R54 P3-2 pre-check used by
+the sync.c COW bookends. Returns `*out_can_accept = true` if the
+most-recent PRESENT snap of `dataset_id` can absorb `n_to_append`
+more entries without overflowing `STM_SNAP_COLD_DEAD_LIST_MAX`, OR
+if there is no most-recent PRESENT snap (in which case the bookend
+direct-derefs without consuming a list slot). The pre-check uses
+saturating-sum arithmetic for defense-in-depth against
+SIZE_MAX-shaped `n_to_append`.
 
-- `stm_sync_write_extent_locked` rehydrate-on-write bookend (the
-  `cold_overlap_cb` post-deref loop).
-- `stm_sync_truncate` past-extent + crossing-extent cold-deref
-  bookend.
+Production callers wired in P7-CAS-4c + P7-CAS-4:
+
+- `stm_sync_write_extent_locked` — pre-check via
+  `cold_dead_list_reserve`(cox.n_hashes) BEFORE
+  `stm_extent_overwrite`; bookend per-hash via
+  `overwrite_cold_block`.
+- `stm_sync_truncate` past-extent + crossing-extent cold-deref —
+  same shape via `tcox.n_hashes`.
 
 Reflink + migrate rollback paths keep direct `stm_cas_deref`
 calls — those records were JUST inserted by the failing
 operation and have not been captured by any snap yet, so
 snap-routing doesn't apply.
+
+P7-CAS-4 R54 P3-1 followed up by removing the dead `else
+{ should_deref = true; }` fallback in both bookends — `s->snap_idx`
+is unconditionally created at sync_create / sync_open, so the
+fallback was unreachable.
 
 ### Read-only
 
