@@ -57,7 +57,7 @@ into the CAS tier (which DOES need P6) is a separate concern.
 ## Phase 7 status (overall)
 
 - [x] **P7-CAS-7 migration-policy heuristic v1** — substantive
-      `<P7-CAS-7>` + R58 close `<R58>` + hash-fixup (this
+      `1d5255c` + R58 close `231e5ff` + hash-fixup (this
       commit). First concrete user of the P7-CAS-2 migration
       data plane (which had been manual-trigger only since
       2026-04-26). Adds public API

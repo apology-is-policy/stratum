@@ -38,8 +38,8 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R58-hash-fixup. Substantive `<P7-CAS-7>` +
-  R58 close `<R58>`.
+- **Tip**: post-R58-hash-fixup. Substantive `1d5255c` +
+  R58 close `231e5ff`.
   **P7-CAS-7 — migration-policy heuristic v1 (NOVEL #6 v1 in
   CLAUDE.md mission numbering / NOVEL #3.3's "Migration engine:
   heuristic v1"). First concrete user of the P7-CAS-2 migration
