@@ -259,9 +259,16 @@ typedef struct {
     /* P7-CAS-11: gen at which read_count was last incremented (or
      * reset). Used by the promote-policy step's recency filter
      * (`min_recency_txgs` — only inos with last_read_gen >= cutoff
-     * are eligible). For freshly-migrated COLD records last_read_gen
-     * == migration_gen (so the record starts "recently observed");
-     * HOT records always have last_read_gen == 0. */
+     * are eligible). HOT records always have last_read_gen == 0
+     * (encoder + decoder enforce). Freshly-migrated COLD records
+     * have last_read_gen == 0 (sentinel: "never read yet") — the
+     * struct initializer in stm_extent_migrate_to_cold leaves the
+     * field zero, and the first read after migration triggers the
+     * sentinel-reset path in stm_extent_record_promote_read_hit
+     * (count = 1, last_read_gen = current_gen). With
+     * last_read_gen == 0 the eligibility check
+     * `last_read_gen >= cutoff` necessarily fails, so a never-read
+     * extent is never a promotion candidate — correct behavior. */
     uint64_t last_read_gen;
 } stm_extent_record;
 

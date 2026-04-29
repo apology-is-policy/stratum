@@ -4476,10 +4476,19 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
  * stm_sync_truncate composes this with stm_sync_write_extent_locked
  * to read+re-encrypt the crossing extent's prefix without releasing
  * sync.lock — closes R41 P3-1/P3-2 atomicity gaps. */
+/* P7-CAS-11: `count_for_promotion` gates the COLD-branch's
+ * read_count bump. External (user-driven) reads pass true so the
+ * promote-policy step's heuristic counts genuine accesses. Internal
+ * reads (e.g. truncate's prefix re-encrypt at line 4961) pass false
+ * because their target record is moments-from-being-dropped — the
+ * bump would persist briefly in idx->dirty=true before the
+ * subsequent overwrite drops the record, mis-attributing heuristic
+ * state to a non-user-driven access. R62 P2-1. */
 static stm_status stm_sync_read_extent_locked(stm_sync *s,
                                                  uint64_t dataset_id, uint64_t ino,
                                                  uint64_t off, void *buf,
-                                                 size_t len, size_t *out_read) {
+                                                 size_t len, size_t *out_read,
+                                                 bool count_for_promotion) {
     stm_extent_record rec;
     stm_status ls = stm_extent_lookup_at(s->extent_idx, dataset_id, ino, off, &rec);
     if (ls == STM_ENOENT) {
@@ -4596,10 +4605,15 @@ static stm_status stm_sync_read_extent_locked(stm_sync *s,
          * between lookup and bump returns STM_OK no-op (no record at
          * (ds, ino, off) anymore). The bump's failure modes are
          * cosmetic — the policy step downgrades to "less accurate"
-         * decisions, not to corruption. */
-        (void)stm_extent_record_promote_read_hit(
-                s->extent_idx, dataset_id, ino, off,
-                s->current_gen, STM_SYNC_PROMOTE_DECAY_WINDOW_TXGS);
+         * decisions, not to corruption. R62 P2-1: gated by
+         * `count_for_promotion` so internal callers (truncate's
+         * prefix re-encrypt) don't dirty heuristic state for a
+         * record they're about to drop. */
+        if (count_for_promotion) {
+            (void)stm_extent_record_promote_read_hit(
+                    s->extent_idx, dataset_id, ino, off,
+                    s->current_gen, STM_SYNC_PROMOTE_DECAY_WINDOW_TXGS);
+        }
 
         *out_read = len;
         return STM_OK;
@@ -4718,7 +4732,8 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     if (s->wedged) { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
 
     stm_status rc = stm_sync_read_extent_locked(s, dataset_id, ino,
-                                                   off, buf, len, out_read);
+                                                   off, buf, len, out_read,
+                                                   /*count_for_promotion=*/true);
     pthread_mutex_unlock(&s->lock);
     return rc;
 }
@@ -4958,9 +4973,15 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
             return STM_ENOMEM;
         }
         size_t got = 0;
+        /* R62 P2-1: count_for_promotion=false — this read is the
+         * truncate's prefix-shrink decrypt; the COLD record is
+         * about to be dropped + replaced by a HOT prefix via
+         * stm_sync_write_extent_locked. Bumping the counter on a
+         * doomed record is wasted heuristic state. */
         stm_status rs = stm_sync_read_extent_locked(s, dataset_id, ino,
                                                        rec.off, plain,
-                                                       rec.len, &got);
+                                                       rec.len, &got,
+                                                       /*count_for_promotion=*/false);
         if (rs != STM_OK) {
             stm_ct_memzero(plain, rec.len);
             free(plain);
@@ -5657,13 +5678,19 @@ static stm_status migrate_one_extent_locked(stm_sync *s,
     if ((E->off % STM_UB_SIZE) != 0) return STM_EINVAL;
     if ((E->len % STM_UB_SIZE) != 0) return STM_EINVAL;
 
-    /* Step 1: read+decrypt the hot extent's plaintext. */
+    /* Step 1: read+decrypt the hot extent's plaintext. The migrate
+     * path operates on HOT extents only (E->kind == HOT validated
+     * above), so the COLD-counter-bump branch is never reached;
+     * count_for_promotion can be either value. Pass false for
+     * symmetry with truncate's internal-read suppression — keeps
+     * the convention "internal callers don't count." */
     void *plain = malloc(E->len);
     if (!plain) return STM_ENOMEM;
     size_t got = 0;
     stm_status rs = stm_sync_read_extent_locked(s, E->dataset_id, E->ino,
                                                    E->off, plain,
-                                                   E->len, &got);
+                                                   E->len, &got,
+                                                   /*count_for_promotion=*/false);
     if (rs != STM_OK || got != E->len) {
         stm_status err = (rs != STM_OK) ? rs : STM_EIO;
         stm_ct_memzero(plain, E->len);
