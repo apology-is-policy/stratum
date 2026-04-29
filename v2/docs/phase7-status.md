@@ -57,8 +57,8 @@ into the CAS tier (which DOES need P6) is a separate concern.
 ## Phase 7 status (overall)
 
 - [x] **P7-CAS-11 promotion (cold → hot) heuristic v1** —
-      substantive (this commit) + R62 close (next) + hash-fixup
-      (after). Format break STM_UB_VERSION 20 → 21: extent
+      substantive `51c5cc6` + R62 close `ee00bdf` + hash-fixup
+      (this commit). Format break STM_UB_VERSION 20 → 21: extent
       record value layout grows 96 → 108 with `read_count`
       (le32) + `last_read_gen` (le64) at offsets 96..108. The
       counter is COLD-only — HOT extents have both fields == 0

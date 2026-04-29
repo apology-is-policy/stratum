@@ -38,8 +38,8 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R62-hash-fixup (planned). Substantive (this
-  commit) + R62 close (next) + hash-fixup (after).
+- **Tip**: post-R62-hash-fixup. Substantive `51c5cc6` +
+  R62 close `ee00bdf`.
   **P7-CAS-11 — promotion (cold → hot) heuristic v1. Format
   break STM_UB_VERSION 20 → 21: extent record value layout
   grows 96 → 108 bytes with `read_count` (le32 at offset
