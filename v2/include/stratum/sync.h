@@ -1339,6 +1339,127 @@ stm_status stm_sync_recv_cold_extent(
         size_t plain_len);
 
 /*
+ * P7-CAS-10: out-of-band chunk store recv primitives. Split
+ * stm_sync_recv_cold_extent's "intern + write extent record" into
+ * two callable steps so the recv state machine can:
+ *
+ *   1. Receive a STM_SEND_REC_CHUNK record → call
+ *      stm_sync_recv_cold_chunk to BLAKE3-verify + intern the
+ *      plaintext into the target's CAS index.
+ *
+ *   2. Receive a COLD STM_SEND_REC_EXTENT record (carrying just
+ *      ino/off/len/gen + content_hash, NO plaintext at v2) → call
+ *      stm_sync_recv_cold_extent_ref to bump the chunk's refcount
+ *      + insert a COLD extent record at (target_ds, ino, off, len).
+ *
+ *   3. After the END record + recv_finish: per chunk interned via
+ *      stm_sync_recv_cold_chunk, call
+ *      stm_sync_recv_cold_chunk_release to undo the intern's
+ *      built-in refcount bump (cas_chunk_intern_locked bumps to
+ *      1 on MISS or += 1 on HIT). After all releases, the
+ *      refcount equals (number of COLD extents in the stream
+ *      that referenced the hash) — same final invariant as
+ *      stm_sync_recv_cold_extent's atomic intern+write-extent path.
+ *
+ * Lifecycle invariant: every successful stm_sync_recv_cold_chunk
+ * call MUST be balanced by exactly one stm_sync_recv_cold_chunk_release
+ * call before recv_close returns OK; otherwise the chunk is leaked
+ * at refcount = (extents referencing) + 1, which the next
+ * cas_auto_gc_sweep won't reclaim. The per-stream `chunks_seen`
+ * tracking in stm_recv_handle enforces this.
+ *
+ * Why the split: under the "single-API" P7-CAS-9 shape, every COLD
+ * EXTENT record on the wire carried its full plaintext, so a stream
+ * of N cold extents sharing one chunk shipped N copies of the
+ * plaintext. Splitting CHUNK out of EXTENT lets the sender ship
+ * each unique chunk hash once + N small EXTENT records by hash —
+ * delivering the on-wire dedup ratio that mirrors the at-rest
+ * dedup ratio. Composition over the same `cas.tla::MigrateToCold`
+ * primitive — no spec extension required.
+ *
+ * Lock posture (each function): takes sync->lock OUTER → cas_idx
+ * + alloc + extent locks INNER. Caller MUST NOT hold sync->lock.
+ */
+STM_MUST_USE
+stm_status stm_sync_recv_cold_chunk(
+        stm_sync *s,
+        const uint8_t claimed_hash[32],
+        const void *plain,
+        size_t plain_len);
+
+/*
+ * Refusals:
+ *   - NULL s, NULL claimed_hash, NULL plain (STM_EINVAL).
+ *   - plain_len == 0 (STM_EINVAL).
+ *   - Wedged or read-only (STM_EWEDGED / STM_EROFS).
+ *   - !s->cas_idx (STM_EINVAL).
+ *   - BLAKE3-256(plain, plain_len) != claimed_hash (STM_EBADTAG).
+ *   - Errors from cas_chunk_intern_locked bubble up (STM_ENOMEM,
+ *     STM_ENOSPC, STM_EIO, STM_EEXIST).
+ *
+ * On STM_OK: the CAS index has the chunk at refcount ≥ 1. The
+ * intern's bump is recorded by the caller (recv handle's chunks_seen
+ * set) and must be undone via stm_sync_recv_cold_chunk_release at
+ * recv_close.
+ */
+
+STM_MUST_USE
+stm_status stm_sync_recv_cold_extent_ref(
+        stm_sync *s,
+        uint64_t target_dataset_id,
+        uint64_t ino,
+        uint64_t off,
+        uint64_t len,
+        const uint8_t claimed_hash[32]);
+
+/*
+ * Refusals:
+ *   - NULL s, NULL claimed_hash (STM_EINVAL).
+ *   - target_dataset_id == 0 OR ino == 0 OR len == 0 (STM_EINVAL).
+ *   - Wedged or read-only (STM_EWEDGED / STM_EROFS).
+ *   - !s->cas_idx (STM_EINVAL).
+ *   - claimed_hash not present in CAS (STM_ECORRUPT — the wire
+ *     stream emitted a COLD EXTENT referencing a hash whose CHUNK
+ *     record hasn't been received in this stream OR was never
+ *     emitted; either way the protocol-ordering invariant is
+ *     violated).
+ *   - cas_rec.length != len (STM_ECORRUPT — defensive against torn
+ *     cas_idx records or hash collision; the sender shouldn't
+ *     emit a COLD EXTENT whose len mismatches the chunk's bytes).
+ *   - Errors from stm_cas_ref / stm_extent_write_cold bubble up
+ *     (STM_ENOMEM, STM_EOVERFLOW, STM_EEXIST).
+ *
+ * On STM_OK: the CAS chunk's refcount is incremented by 1 and a
+ * COLD extent record is installed at (target_ds, ino, off, len)
+ * referencing claimed_hash. On any failure after step 2's cas_ref,
+ * the cas_ref is rolled back via cas_deref so the cas_idx state is
+ * unchanged on failure.
+ */
+
+STM_MUST_USE
+stm_status stm_sync_recv_cold_chunk_release(
+        stm_sync *s,
+        const uint8_t claimed_hash[32]);
+
+/*
+ * Refusals:
+ *   - NULL s, NULL claimed_hash (STM_EINVAL).
+ *   - !s->cas_idx (STM_EINVAL).
+ *   - claimed_hash not present (STM_ENOENT — bookkeeping error;
+ *     never expected when called by recv_close after a balanced
+ *     intern). Notably this function does NOT refuse on
+ *     wedged/read-only — a recv_close path for an aborted recv
+ *     must drain its chunks_seen even if the sync layer subsequently
+ *     wedged, so the cas_idx isn't left holding orphan refs from
+ *     this stream.
+ *
+ * On STM_OK: the chunk's refcount is decremented by 1. If the
+ * decrement brings the refcount to 0 AND no live cold extent
+ * references the chunk, the next cas_auto_gc_sweep at commit will
+ * reclaim it.
+ */
+
+/*
  * P7-5: install the production scrub β verify-callback on `sc`.
  *
  * The cb resolves each `paddr` against `sync`'s extent index via

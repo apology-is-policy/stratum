@@ -24,6 +24,7 @@
 #include <stratum/extent.h>
 #include <stratum/fs.h>
 #include <stratum/fs_testing.h>
+#include <stratum/hash.h>
 #include <stratum/keyfile.h>
 #include <stratum/send_recv.h>
 #include <stratum/snapshot.h>
@@ -778,14 +779,14 @@ STM_TEST(p7cas9_recv_rejects_unknown_flag_bit) {
 }
 
 STM_TEST(p7cas9_recv_cold_rejects_hash_mismatch) {
-    /* Build a COLD wire record manually with a hash that doesn't
-     * match the plaintext. Receiver must STM_EBADTAG. */
+    /* P7-CAS-10 retarget: hash mismatch is now caught at the CHUNK
+     * record (claimed_hash vs BLAKE3(plain)), not at the COLD EXTENT
+     * record (which carries no plaintext). Build a CHUNK record by
+     * hand with a wrong hash; receiver must STM_EBADTAG. */
     testpool tgt; testpool_setup(&tgt, "p7cas9_hash_mismatch", POOL_UUID_TGT);
     stm_sync *tgt_sync = stm_fs_sync_for_test(tgt.fs);
 
-    /* First send a valid HEADER through recv to put it in
-     * RECV_BODY state. Easiest way: do a real send-init/next on a
-     * fresh source pool and feed only the header through. */
+    /* HEADER prep: pipe only the header from a real send → recv. */
     testpool src; testpool_setup(&src, "p7cas9_mismatch_src", POOL_UUID_SRC);
     stm_sync *src_sync = stm_fs_sync_for_test(src.fs);
     stm_send_handle *sh = NULL;
@@ -794,42 +795,29 @@ STM_TEST(p7cas9_recv_cold_rejects_hash_mismatch) {
     stm_recv_handle *rh = NULL;
     STM_ASSERT_OK(stm_recv_init(tgt_sync, 1, &rh));
 
-    /* Pipe just the HEADER record. */
     uint8_t hbuf[256];
     size_t out_len = 0, needed = 0;
     STM_ASSERT_OK(stm_send_next(sh, hbuf, sizeof hbuf, &out_len, &needed));
     STM_ASSERT_OK(stm_recv_apply(rh, hbuf, out_len));
 
-    /* Now hand-craft a COLD EXTENT record with a wrong hash. */
+    /* Hand-craft a STM_SEND_REC_CHUNK record with a wrong hash. */
     uint8_t plain[4096];
     memset(plain, 0xCC, sizeof plain);
     uint8_t wrong_hash[32];
     memset(wrong_hash, 0x42, sizeof wrong_hash);  /* Definitely not BLAKE3(plain). */
 
-    size_t total = STM_SEND_RECORD_HDR_LEN + STM_SEND_COLD_EXTENT_META_LEN
-                       + sizeof plain;
+    size_t total = STM_SEND_RECORD_HDR_LEN + STM_SEND_CHUNK_HASH_LEN + sizeof plain;
     uint8_t *rec = malloc(total);
     STM_ASSERT(rec != NULL);
     memset(rec, 0, total);
-    /* Framing: type=EXTENT, flags=COLD, body_len = COLD_EXTENT_META + plain. */
-    rec[0] = 0x02;  /* type = EXTENT */
-    rec[4] = 0x01;  /* flags = STM_SEND_FLAG_COLD */
-    uint64_t body_len = STM_SEND_COLD_EXTENT_META_LEN + sizeof plain;
+    rec[0] = 0x04;  /* type = STM_SEND_REC_CHUNK */
+    /* flags = 0 (CHUNK records carry no flag bits at v2). */
+    uint64_t body_len = (uint64_t)STM_SEND_CHUNK_HASH_LEN + sizeof plain;
     for (int i = 0; i < 8; i++) rec[8 + i] = (uint8_t)(body_len >> (8 * i));
-    /* Body: ino=1 (le64 at 16) */
-    rec[STM_SEND_RECORD_HDR_LEN + 0] = 1;
-    /* off=0 (already zero) */
-    /* len=4096 (le64 at +16) */
-    rec[STM_SEND_RECORD_HDR_LEN + 16] = 0;
-    rec[STM_SEND_RECORD_HDR_LEN + 17] = 0x10;  /* 4096 */
-    /* gen=0 (advisory) */
-    /* content_hash @ +32 */
-    memcpy(rec + STM_SEND_RECORD_HDR_LEN + 32, wrong_hash, 32);
-    /* plaintext @ +64 */
-    memcpy(rec + STM_SEND_RECORD_HDR_LEN + STM_SEND_COLD_EXTENT_META_LEN,
+    memcpy(rec + STM_SEND_RECORD_HDR_LEN, wrong_hash, 32);
+    memcpy(rec + STM_SEND_RECORD_HDR_LEN + STM_SEND_CHUNK_HASH_LEN,
               plain, sizeof plain);
 
-    /* Recv must reject with STM_EBADTAG. */
     STM_ASSERT_ERR(stm_recv_apply(rh, rec, total), STM_EBADTAG);
 
     free(rec);
@@ -936,18 +924,20 @@ STM_TEST(p7cas9_recv_cold_unprovisioned_target_dataset_rollback) {
     STM_ASSERT_TRUE(saw_failure);
 
     /* Target extent index is empty after the failed apply
-     * (stm_extent_write_cold never ran). The CAS rollback path
-     * derefs the freshly-inserted entry to refcount=0 — the entry
-     * stays in the cas_idx until the next commit's
-     * `cas_auto_gc_sweep_locked` reclaims it (standard CAS
-     * lifecycle, R51 / P7-CAS-3). Drive a target commit to force
-     * the sweep + assert empty post-sweep. */
+     * (stm_extent_write_cold never ran). Cas refcount is held
+     * up by the per-CHUNK intern bump until recv_close drains
+     * chunks_seen — only after the drain does the entry hit
+     * refcount=0. P7-CAS-10 lifecycle: recv_close → drain →
+     * commit's auto_gc reclaims. */
     stm_extent_index *tgt_eidx = stm_sync_extent_index(tgt_sync);
     size_t n_ext = 999;
     STM_ASSERT_OK(stm_extent_count(tgt_eidx, &n_ext));
     STM_ASSERT_EQ(n_ext, (size_t)0);
 
-    /* Force target commit + auto_gc sweep. */
+    stm_send_close(sh);
+    stm_recv_close(rh);  /* Drains chunks_seen → refcount=0. */
+
+    /* Force target commit + auto_gc sweep AFTER drain. */
     STM_ASSERT_OK(stm_fs_commit(tgt.fs));
 
     stm_cas_index *tgt_cas = stm_sync_cas_index(tgt_sync);
@@ -955,23 +945,18 @@ STM_TEST(p7cas9_recv_cold_unprovisioned_target_dataset_rollback) {
     STM_ASSERT_OK(stm_cas_count(tgt_cas, &n_cas));
     STM_ASSERT_EQ(n_cas, (size_t)0);
 
-    stm_send_close(sh);
-    stm_recv_close(rh);
     testpool_teardown(&src);
     testpool_teardown(&tgt);
 }
 
 STM_TEST(p7cas9_recv_cold_hash_mismatch_leaves_state_clean) {
-    /* R60 P3-5 #4 strengthening: after the EBADTAG hash-mismatch
-     * rejection, target's cas_idx + extent_idx are unchanged. A
-     * future regression that moves cas_chunk_intern BEFORE the
-     * verify would not be caught by the existing test (which only
-     * asserts the return code). */
+    /* P7-CAS-10 retarget: same idea as above (state-clean after
+     * EBADTAG), but at the CHUNK record (which carries the hash +
+     * plaintext together — the only place hash-mismatch can occur
+     * at v2). */
     testpool tgt; testpool_setup(&tgt, "p7cas9_mm_clean", POOL_UUID_TGT);
     stm_sync *tgt_sync = stm_fs_sync_for_test(tgt.fs);
 
-    /* HEADER prep via a real send → recv (only the header
-     * applied). */
     testpool src; testpool_setup(&src, "p7cas9_mm_src", POOL_UUID_SRC);
     stm_sync *src_sync = stm_fs_sync_for_test(src.fs);
     stm_send_handle *sh = NULL;
@@ -983,31 +968,25 @@ STM_TEST(p7cas9_recv_cold_hash_mismatch_leaves_state_clean) {
     STM_ASSERT_OK(stm_send_next(sh, hbuf, sizeof hbuf, &out_len, &needed));
     STM_ASSERT_OK(stm_recv_apply(rh, hbuf, out_len));
 
-    /* Hand-craft a COLD record with wrong hash. */
+    /* Hand-craft a CHUNK record with wrong hash. */
     uint8_t plain[4096];
     memset(plain, 0xAB, sizeof plain);
     uint8_t wrong_hash[32];
     memset(wrong_hash, 0x55, sizeof wrong_hash);
 
-    size_t total = STM_SEND_RECORD_HDR_LEN + STM_SEND_COLD_EXTENT_META_LEN
-                       + sizeof plain;
+    size_t total = STM_SEND_RECORD_HDR_LEN + STM_SEND_CHUNK_HASH_LEN + sizeof plain;
     uint8_t *rec = malloc(total);
     STM_ASSERT(rec != NULL);
     memset(rec, 0, total);
-    rec[0] = 0x02;  /* type = EXTENT */
-    rec[4] = 0x01;  /* flags = COLD */
-    uint64_t body_len = STM_SEND_COLD_EXTENT_META_LEN + sizeof plain;
+    rec[0] = 0x04;  /* type = STM_SEND_REC_CHUNK */
+    uint64_t body_len = (uint64_t)STM_SEND_CHUNK_HASH_LEN + sizeof plain;
     for (int i = 0; i < 8; i++) rec[8 + i] = (uint8_t)(body_len >> (8 * i));
-    rec[STM_SEND_RECORD_HDR_LEN + 0] = 1;     /* ino = 1 */
-    rec[STM_SEND_RECORD_HDR_LEN + 17] = 0x10; /* len = 4096 */
-    memcpy(rec + STM_SEND_RECORD_HDR_LEN + 32, wrong_hash, 32);
-    memcpy(rec + STM_SEND_RECORD_HDR_LEN + STM_SEND_COLD_EXTENT_META_LEN,
+    memcpy(rec + STM_SEND_RECORD_HDR_LEN, wrong_hash, 32);
+    memcpy(rec + STM_SEND_RECORD_HDR_LEN + STM_SEND_CHUNK_HASH_LEN,
               plain, sizeof plain);
 
     STM_ASSERT_ERR(stm_recv_apply(rh, rec, total), STM_EBADTAG);
 
-    /* Target's cas_idx + extent_idx are EMPTY (verify-before-mutate
-     * means the mismatch fires before any state change). */
     stm_cas_index *tgt_cas = stm_sync_cas_index(tgt_sync);
     size_t n_cas = 999;
     STM_ASSERT_OK(stm_cas_count(tgt_cas, &n_cas));
@@ -1064,6 +1043,521 @@ STM_TEST(p7cas9_send_cold_replica_fallback_on_corrupt_primary) {
     STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 1, 0, out, sizeof out, &got));
     STM_ASSERT_MEM_EQ(plain, out, sizeof plain);
 
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
+/* ========================================================================= */
+/* P7-CAS-10 — out-of-band chunk store wire shape.                            */
+/* ========================================================================= */
+
+/* Helper to count unique record-types observed when piping a send.
+ * Returns counts via output-pointer args; aborts on any send/recv
+ * error. Useful for asserting "K CHUNKs, N EXTENTs" on the wire. */
+static stm_status pipe_and_count(stm_send_handle *sh, stm_recv_handle *rh,
+                                    size_t *out_n_chunk_recs,
+                                    size_t *out_n_extent_recs,
+                                    size_t *out_total_bytes)
+{
+    *out_n_chunk_recs  = 0;
+    *out_n_extent_recs = 0;
+    *out_total_bytes   = 0;
+
+    size_t cap = STM_SEND_RECORD_MAX_LEN;
+    uint8_t *buf = malloc(cap);
+    STM_ASSERT(buf != NULL);
+
+    for (;;) {
+        size_t out_len = 0, needed = 0;
+        stm_status sn = stm_send_next(sh, buf, cap, &out_len, &needed);
+        if (sn == STM_ENOENT) break;
+        STM_ASSERT_OK(sn);
+
+        /* Inspect the record's type byte (le32 at offset 0 → low byte). */
+        uint8_t type = buf[0];
+        if (type == 0x04) (*out_n_chunk_recs)++;
+        else if (type == 0x02) (*out_n_extent_recs)++;
+        *out_total_bytes += out_len;
+
+        stm_status ra = stm_recv_apply(rh, buf, out_len);
+        STM_ASSERT_OK(ra);
+    }
+    free(buf);
+    return stm_recv_finish(rh);
+}
+
+STM_TEST(p7cas10_chunk_store_roundtrip_single_cold_extent) {
+    /* Single COLD extent: sender emits 1 CHUNK + 1 EXTENT (+ HEADER + END).
+     * Receiver reconstructs. Read-back matches. */
+    testpool src; testpool_setup(&src, "p7cas10_single", POOL_UUID_SRC);
+    testpool tgt; testpool_setup(&tgt, "p7cas10_single_tgt", POOL_UUID_TGT);
+
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)((i * 11u + 7u) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(src.fs, 1, 1));
+
+    stm_sync *src_sync = stm_fs_sync_for_test(src.fs);
+    stm_sync *tgt_sync = stm_fs_sync_for_test(tgt.fs);
+    stm_send_handle *sh = NULL;
+    STM_ASSERT_OK(stm_send_init(src_sync, 1, 0, 0, &sh));
+    stm_recv_handle *rh = NULL;
+    STM_ASSERT_OK(stm_recv_init(tgt_sync, 1, &rh));
+
+    size_t n_chunks = 0, n_extents = 0, total_bytes = 0;
+    STM_ASSERT_OK(pipe_and_count(sh, rh, &n_chunks, &n_extents, &total_bytes));
+    STM_ASSERT_EQ(n_chunks,  (size_t)1);
+    STM_ASSERT_EQ(n_extents, (size_t)1);
+
+    stm_send_close(sh);
+    stm_recv_close(rh);
+
+    uint8_t out[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(plain, out, sizeof plain);
+
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
+STM_TEST(p7cas10_dedupes_three_cold_extents_to_one_chunk) {
+    /* 3 cold extents on different inos sharing the same content_hash:
+     * sender ships 1 CHUNK + 3 EXTENT records (+ HEADER + END).
+     * On-wire dedup ratio is materialized.
+     *
+     * Counter-test: the prior P7-CAS-9 wire would have shipped 3 COLD
+     * EXTENTs each with full plaintext = ~3 × 4 KiB = 12+ KiB
+     * plaintext-bytes on the wire. P7-CAS-10 ships 1 chunk's worth
+     * of plaintext (= 4 KiB) + 3 small EXTENT-by-hash records (= 240
+     * bytes). */
+    testpool src; testpool_setup(&src, "p7cas10_dedup3", POOL_UUID_SRC);
+    testpool tgt; testpool_setup(&tgt, "p7cas10_dedup3_tgt", POOL_UUID_TGT);
+
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)((i * 23u + 5u) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 2, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 3, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(src.fs, 1, 1));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(src.fs, 1, 2));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(src.fs, 1, 3));
+
+    stm_sync *src_sync = stm_fs_sync_for_test(src.fs);
+    stm_sync *tgt_sync = stm_fs_sync_for_test(tgt.fs);
+    stm_send_handle *sh = NULL;
+    STM_ASSERT_OK(stm_send_init(src_sync, 1, 0, 0, &sh));
+    stm_recv_handle *rh = NULL;
+    STM_ASSERT_OK(stm_recv_init(tgt_sync, 1, &rh));
+
+    size_t n_chunks = 0, n_extents = 0, total_bytes = 0;
+    STM_ASSERT_OK(pipe_and_count(sh, rh, &n_chunks, &n_extents, &total_bytes));
+    STM_ASSERT_EQ(n_chunks,  (size_t)1);
+    STM_ASSERT_EQ(n_extents, (size_t)3);
+
+    stm_send_close(sh);
+    stm_recv_close(rh);
+
+    /* Target preserves dedup at rest: 1 CAS entry, 3 cold extent
+     * records all referencing the same hash. */
+    stm_cas_index *tgt_cas = stm_sync_cas_index(tgt_sync);
+    size_t n_cas = 0;
+    STM_ASSERT_OK(stm_cas_count(tgt_cas, &n_cas));
+    STM_ASSERT_EQ(n_cas, (size_t)1);
+
+    /* All three target inos read back the same plaintext. */
+    for (uint64_t ino = 1; ino <= 3; ino++) {
+        uint8_t out[4096] = {0};
+        size_t got = 0;
+        STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, ino, 0, out, sizeof out, &got));
+        STM_ASSERT_EQ(got, sizeof plain);
+        STM_ASSERT_MEM_EQ(plain, out, sizeof plain);
+    }
+
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
+STM_TEST(p7cas10_mixed_hot_and_cold_with_dedup) {
+    /* Mixed dataset: 2 HOT extents (different content) + 4 COLD extents
+     * (2 unique chunks, each with 2 referencing extents). Stream =
+     * HEADER + 2 CHUNK + 6 EXTENT + END. */
+    testpool src; testpool_setup(&src, "p7cas10_mixed", POOL_UUID_SRC);
+    testpool tgt; testpool_setup(&tgt, "p7cas10_mixed_tgt", POOL_UUID_TGT);
+
+    uint8_t hot1[4096], hot2[4096], coldA[4096], coldB[4096];
+    for (size_t i = 0; i < 4096u; i++) {
+        hot1[i]  = (uint8_t)((i * 3u  + 1u) & 0xFFu);
+        hot2[i]  = (uint8_t)((i * 5u  + 2u) & 0xFFu);
+        coldA[i] = (uint8_t)((i * 7u  + 3u) & 0xFFu);
+        coldB[i] = (uint8_t)((i * 11u + 4u) & 0xFFu);
+    }
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 10, 0, hot1,  sizeof hot1));
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 20, 0, hot2,  sizeof hot2));
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 30, 0, coldA, sizeof coldA));
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 31, 0, coldA, sizeof coldA));
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 40, 0, coldB, sizeof coldB));
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 41, 0, coldB, sizeof coldB));
+    /* Migrate cold ones; HOT inos stay hot. */
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(src.fs, 1, 30));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(src.fs, 1, 31));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(src.fs, 1, 40));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(src.fs, 1, 41));
+
+    stm_sync *src_sync = stm_fs_sync_for_test(src.fs);
+    stm_sync *tgt_sync = stm_fs_sync_for_test(tgt.fs);
+    stm_send_handle *sh = NULL;
+    STM_ASSERT_OK(stm_send_init(src_sync, 1, 0, 0, &sh));
+    stm_recv_handle *rh = NULL;
+    STM_ASSERT_OK(stm_recv_init(tgt_sync, 1, &rh));
+
+    size_t n_chunks = 0, n_extents = 0, total_bytes = 0;
+    STM_ASSERT_OK(pipe_and_count(sh, rh, &n_chunks, &n_extents, &total_bytes));
+    STM_ASSERT_EQ(n_chunks,  (size_t)2);   /* 2 unique cold hashes */
+    STM_ASSERT_EQ(n_extents, (size_t)6);   /* 2 hot + 4 cold extents */
+
+    stm_send_close(sh);
+    stm_recv_close(rh);
+
+    stm_cas_index *tgt_cas = stm_sync_cas_index(tgt_sync);
+    size_t n_cas = 0;
+    STM_ASSERT_OK(stm_cas_count(tgt_cas, &n_cas));
+    STM_ASSERT_EQ(n_cas, (size_t)2);
+
+    uint8_t buf[4096];
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 10, 0, buf, sizeof buf, &got));
+    STM_ASSERT_MEM_EQ(hot1, buf, sizeof hot1);
+    STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 20, 0, buf, sizeof buf, &got));
+    STM_ASSERT_MEM_EQ(hot2, buf, sizeof hot2);
+    STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 30, 0, buf, sizeof buf, &got));
+    STM_ASSERT_MEM_EQ(coldA, buf, sizeof coldA);
+    STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 31, 0, buf, sizeof buf, &got));
+    STM_ASSERT_MEM_EQ(coldA, buf, sizeof coldA);
+    STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 40, 0, buf, sizeof buf, &got));
+    STM_ASSERT_MEM_EQ(coldB, buf, sizeof coldB);
+    STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 41, 0, buf, sizeof buf, &got));
+    STM_ASSERT_MEM_EQ(coldB, buf, sizeof coldB);
+
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
+STM_TEST(p7cas10_recv_refuses_cold_extent_without_prior_chunk) {
+    /* Hand-craft a HEADER + COLD EXTENT (no preceding CHUNK)
+     * stream: receiver MUST refuse the EXTENT with STM_ECORRUPT
+     * (chunks_seen membership check). */
+    testpool src; testpool_setup(&src, "p7cas10_oop_src", POOL_UUID_SRC);
+    testpool tgt; testpool_setup(&tgt, "p7cas10_oop_tgt", POOL_UUID_TGT);
+
+    stm_sync *src_sync = stm_fs_sync_for_test(src.fs);
+    stm_sync *tgt_sync = stm_fs_sync_for_test(tgt.fs);
+
+    /* HEADER prep via a real send → recv. */
+    stm_send_handle *sh = NULL;
+    STM_ASSERT_OK(stm_send_init(src_sync, 1, 0, 0, &sh));
+    stm_recv_handle *rh = NULL;
+    STM_ASSERT_OK(stm_recv_init(tgt_sync, 1, &rh));
+    uint8_t hbuf[256];
+    size_t out_len = 0, needed = 0;
+    STM_ASSERT_OK(stm_send_next(sh, hbuf, sizeof hbuf, &out_len, &needed));
+    STM_ASSERT_OK(stm_recv_apply(rh, hbuf, out_len));
+
+    /* Hand-craft a COLD EXTENT (body 64 bytes) referencing a hash
+     * the receiver has never seen. */
+    uint8_t fake_hash[32];
+    memset(fake_hash, 0xFE, sizeof fake_hash);
+
+    size_t total = STM_SEND_RECORD_HDR_LEN + STM_SEND_COLD_EXTENT_BODY_LEN;
+    uint8_t rec[total];
+    memset(rec, 0, total);
+    rec[0] = 0x02;  /* type = EXTENT */
+    rec[4] = 0x01;  /* flags = COLD */
+    uint64_t body_len = STM_SEND_COLD_EXTENT_BODY_LEN;
+    for (int i = 0; i < 8; i++) rec[8 + i] = (uint8_t)(body_len >> (8 * i));
+    rec[STM_SEND_RECORD_HDR_LEN + 0]  = 1;     /* ino = 1 */
+    rec[STM_SEND_RECORD_HDR_LEN + 17] = 0x10;  /* len = 4096 */
+    memcpy(rec + STM_SEND_RECORD_HDR_LEN + 32, fake_hash, 32);
+
+    STM_ASSERT_ERR(stm_recv_apply(rh, rec, total), STM_ECORRUPT);
+
+    stm_send_close(sh);
+    stm_recv_close(rh);
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
+STM_TEST(p7cas10_recv_refuses_duplicate_chunk_in_stream) {
+    /* Send the same CHUNK record twice; receiver MUST refuse the
+     * second with STM_ECORRUPT. Sender at v1 dedupes by hash so
+     * this can only happen with hand-crafted streams or future
+     * sender bugs. */
+    testpool src; testpool_setup(&src, "p7cas10_dup_src", POOL_UUID_SRC);
+    testpool tgt; testpool_setup(&tgt, "p7cas10_dup_tgt", POOL_UUID_TGT);
+
+    stm_sync *src_sync = stm_fs_sync_for_test(src.fs);
+    stm_sync *tgt_sync = stm_fs_sync_for_test(tgt.fs);
+
+    stm_send_handle *sh = NULL;
+    STM_ASSERT_OK(stm_send_init(src_sync, 1, 0, 0, &sh));
+    stm_recv_handle *rh = NULL;
+    STM_ASSERT_OK(stm_recv_init(tgt_sync, 1, &rh));
+    uint8_t hbuf[256];
+    size_t out_len = 0, needed = 0;
+    STM_ASSERT_OK(stm_send_next(sh, hbuf, sizeof hbuf, &out_len, &needed));
+    STM_ASSERT_OK(stm_recv_apply(rh, hbuf, out_len));
+
+    /* Build a valid CHUNK record. */
+    uint8_t plain[4096];
+    memset(plain, 0xAA, sizeof plain);
+    stm_blake3_hash hash;
+    stm_blake3(plain, sizeof plain, &hash);
+
+    size_t total = STM_SEND_RECORD_HDR_LEN + STM_SEND_CHUNK_HASH_LEN + sizeof plain;
+    uint8_t *rec = malloc(total);
+    STM_ASSERT(rec != NULL);
+    memset(rec, 0, total);
+    rec[0] = 0x04;  /* type = CHUNK */
+    uint64_t body_len = (uint64_t)STM_SEND_CHUNK_HASH_LEN + sizeof plain;
+    for (int i = 0; i < 8; i++) rec[8 + i] = (uint8_t)(body_len >> (8 * i));
+    memcpy(rec + STM_SEND_RECORD_HDR_LEN, hash.bytes, 32);
+    memcpy(rec + STM_SEND_RECORD_HDR_LEN + STM_SEND_CHUNK_HASH_LEN,
+              plain, sizeof plain);
+
+    /* First CHUNK: accepted. */
+    STM_ASSERT_OK(stm_recv_apply(rh, rec, total));
+    /* Second CHUNK with same hash: refused. */
+    STM_ASSERT_ERR(stm_recv_apply(rh, rec, total), STM_ECORRUPT);
+
+    free(rec);
+    stm_send_close(sh);
+    stm_recv_close(rh);
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
+STM_TEST(p7cas10_orphan_chunk_reclaimed_after_close_and_commit) {
+    /* Send a stream with HEADER + 1 CHUNK + END (no EXTENT
+     * referencing the chunk). After recv_close + commit, the
+     * orphan chunk is reclaimed (refcount=0 from CHUNK's intern
+     * was released by recv_close's drain → auto_gc reclaims). */
+    testpool tgt; testpool_setup(&tgt, "p7cas10_orphan", POOL_UUID_TGT);
+    stm_sync *tgt_sync = stm_fs_sync_for_test(tgt.fs);
+
+    stm_recv_handle *rh = NULL;
+    STM_ASSERT_OK(stm_recv_init(tgt_sync, 1, &rh));
+
+    /* Send a HEADER record from a fresh empty source. */
+    testpool src; testpool_setup(&src, "p7cas10_orphan_src", POOL_UUID_SRC);
+    stm_sync *src_sync = stm_fs_sync_for_test(src.fs);
+    stm_send_handle *sh = NULL;
+    STM_ASSERT_OK(stm_send_init(src_sync, 1, 0, 0, &sh));
+    uint8_t hbuf[256];
+    size_t hlen = 0, needed = 0;
+    STM_ASSERT_OK(stm_send_next(sh, hbuf, sizeof hbuf, &hlen, &needed));
+    STM_ASSERT_OK(stm_recv_apply(rh, hbuf, hlen));
+
+    /* Hand-craft a CHUNK record with valid hash + plaintext. */
+    uint8_t plain[1024];
+    memset(plain, 0xBE, sizeof plain);
+    stm_blake3_hash hash;
+    stm_blake3(plain, sizeof plain, &hash);
+
+    size_t total = STM_SEND_RECORD_HDR_LEN + STM_SEND_CHUNK_HASH_LEN + sizeof plain;
+    uint8_t *rec = malloc(total);
+    STM_ASSERT(rec != NULL);
+    memset(rec, 0, total);
+    rec[0] = 0x04;
+    uint64_t body_len = (uint64_t)STM_SEND_CHUNK_HASH_LEN + sizeof plain;
+    for (int i = 0; i < 8; i++) rec[8 + i] = (uint8_t)(body_len >> (8 * i));
+    memcpy(rec + STM_SEND_RECORD_HDR_LEN, hash.bytes, 32);
+    memcpy(rec + STM_SEND_RECORD_HDR_LEN + STM_SEND_CHUNK_HASH_LEN,
+              plain, sizeof plain);
+    STM_ASSERT_OK(stm_recv_apply(rh, rec, total));
+
+    /* CAS now has the chunk at refcount=1 (from intern). */
+    stm_cas_index *tgt_cas = stm_sync_cas_index(tgt_sync);
+    size_t n_cas = 0;
+    STM_ASSERT_OK(stm_cas_count(tgt_cas, &n_cas));
+    STM_ASSERT_EQ(n_cas, (size_t)1);
+
+    free(rec);
+    stm_send_close(sh);
+    stm_recv_close(rh);  /* Drains chunks_seen → refcount=0. */
+
+    /* Commit + auto_gc reclaims. */
+    STM_ASSERT_OK(stm_fs_commit(tgt.fs));
+    STM_ASSERT_OK(stm_cas_count(tgt_cas, &n_cas));
+    STM_ASSERT_EQ(n_cas, (size_t)0);
+
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
+STM_TEST(p7cas10_pre_populated_target_chunk_bumps_then_balances) {
+    /* Target's CAS already holds a chunk (refcount=1 from a prior
+     * local migrate). Stream sends a CHUNK + EXTENT for the same
+     * hash. After recv_close, the receiver-side refcount equals
+     * (pre-existing) + (new extents). Recv_close's drain undoes
+     * the per-CHUNK intern bump. */
+    testpool tgt; testpool_setup(&tgt, "p7cas10_prepop", POOL_UUID_TGT);
+    stm_sync *tgt_sync = stm_fs_sync_for_test(tgt.fs);
+
+    /* Pre-populate the target's CAS via a local migrate. */
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)((i * 13u + 17u) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(tgt.fs, 1, 99, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(tgt.fs, 1, 99));
+
+    stm_cas_index *tgt_cas = stm_sync_cas_index(tgt_sync);
+    size_t n_cas = 0;
+    STM_ASSERT_OK(stm_cas_count(tgt_cas, &n_cas));
+    STM_ASSERT_EQ(n_cas, (size_t)1);
+
+    /* Source side: same content + migrate; send into target's
+     * dataset 1 onto a new ino. */
+    testpool src; testpool_setup(&src, "p7cas10_prepop_src", POOL_UUID_SRC);
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(src.fs, 1, 1));
+
+    stm_sync *src_sync = stm_fs_sync_for_test(src.fs);
+    stm_send_handle *sh = NULL;
+    STM_ASSERT_OK(stm_send_init(src_sync, 1, 0, 0, &sh));
+    stm_recv_handle *rh = NULL;
+    STM_ASSERT_OK(stm_recv_init(tgt_sync, 1, &rh));
+    STM_ASSERT_OK(pipe_send_to_recv(sh, rh));
+    stm_send_close(sh);
+    stm_recv_close(rh);
+
+    /* Target still has 1 CAS entry (HIT path on intern), now
+     * referenced by 2 extents (pre-existing ino 99 + recv'd ino 1).
+     * cas_count remains 1; the dedup property at-rest is preserved. */
+    STM_ASSERT_OK(stm_cas_count(tgt_cas, &n_cas));
+    STM_ASSERT_EQ(n_cas, (size_t)1);
+
+    /* Pre-existing ino 99 still readable (its cold extent record
+     * wasn't disturbed). */
+    uint8_t out99[4096] = {0};
+    size_t got99 = 0;
+    STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 99, 0, out99, sizeof out99, &got99));
+    STM_ASSERT_MEM_EQ(plain, out99, sizeof plain);
+    /* Newly-recv'd ino 1 readable. */
+    uint8_t out1[4096] = {0};
+    size_t got1 = 0;
+    STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 1, 0, out1, sizeof out1, &got1));
+    STM_ASSERT_MEM_EQ(plain, out1, sizeof plain);
+
+    /* Force a commit + verify nothing reclaimed (still refcount=2). */
+    STM_ASSERT_OK(stm_fs_commit(tgt.fs));
+    STM_ASSERT_OK(stm_cas_count(tgt_cas, &n_cas));
+    STM_ASSERT_EQ(n_cas, (size_t)1);
+
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
+STM_TEST(p7cas10_recv_refuses_chunk_before_header) {
+    /* CHUNK record before HEADER → STM_ECORRUPT (state machine). */
+    testpool tgt; testpool_setup(&tgt, "p7cas10_no_hdr", POOL_UUID_TGT);
+    stm_sync *tgt_sync = stm_fs_sync_for_test(tgt.fs);
+
+    stm_recv_handle *rh = NULL;
+    STM_ASSERT_OK(stm_recv_init(tgt_sync, 1, &rh));
+
+    uint8_t plain[256];
+    memset(plain, 0x33, sizeof plain);
+    stm_blake3_hash hash;
+    stm_blake3(plain, sizeof plain, &hash);
+
+    size_t total = STM_SEND_RECORD_HDR_LEN + STM_SEND_CHUNK_HASH_LEN + sizeof plain;
+    uint8_t *rec = malloc(total);
+    STM_ASSERT(rec != NULL);
+    memset(rec, 0, total);
+    rec[0] = 0x04;
+    uint64_t body_len = (uint64_t)STM_SEND_CHUNK_HASH_LEN + sizeof plain;
+    for (int i = 0; i < 8; i++) rec[8 + i] = (uint8_t)(body_len >> (8 * i));
+    memcpy(rec + STM_SEND_RECORD_HDR_LEN, hash.bytes, 32);
+    memcpy(rec + STM_SEND_RECORD_HDR_LEN + STM_SEND_CHUNK_HASH_LEN,
+              plain, sizeof plain);
+    STM_ASSERT_ERR(stm_recv_apply(rh, rec, total), STM_ECORRUPT);
+
+    free(rec);
+    stm_recv_close(rh);
+    testpool_teardown(&tgt);
+}
+
+STM_TEST(p7cas10_v1_stream_refused_by_v2_receiver) {
+    /* v1 senders shipped STM_SEND_VERSION = 1; v2 receivers refuse
+     * with STM_EBADVERSION at HEADER apply. Hand-craft a v1 HEADER
+     * record + push to a v2 receiver. */
+    testpool tgt; testpool_setup(&tgt, "p7cas10_v1_refuse", POOL_UUID_TGT);
+    stm_sync *tgt_sync = stm_fs_sync_for_test(tgt.fs);
+
+    stm_recv_handle *rh = NULL;
+    STM_ASSERT_OK(stm_recv_init(tgt_sync, 1, &rh));
+
+    uint8_t rec[STM_SEND_RECORD_HDR_LEN + STM_SEND_HEADER_BODY_LEN] = {0};
+    rec[0] = 0x01;  /* type = HEADER */
+    rec[8] = 52;    /* body_len = 52 */
+    /* body[0..4] = magic = 0x534D5453 */
+    rec[STM_SEND_RECORD_HDR_LEN + 0] = 0x53;
+    rec[STM_SEND_RECORD_HDR_LEN + 1] = 0x54;
+    rec[STM_SEND_RECORD_HDR_LEN + 2] = 0x4D;
+    rec[STM_SEND_RECORD_HDR_LEN + 3] = 0x53;
+    /* body[4..8] = version = 1 (le32) */
+    rec[STM_SEND_RECORD_HDR_LEN + 4] = 0x01;
+    /* rest of body zero */
+
+    STM_ASSERT_ERR(stm_recv_apply(rh, rec, sizeof rec), STM_EBADVERSION);
+
+    stm_recv_close(rh);
+    testpool_teardown(&tgt);
+}
+
+STM_TEST(p7cas10_chunk_record_refuses_unknown_flag_bits) {
+    /* CHUNK records are defined to carry no flag bits; an unknown
+     * flag bit on a CHUNK MUST be refused. The earlier
+     * STM_SEND_FLAG_KNOWN_MASK check at parse_record_hdr handles
+     * this for any record kind, but adding a dedicated test
+     * catches future bug where CHUNK gets a special-case path. */
+    testpool tgt; testpool_setup(&tgt, "p7cas10_chunk_flag", POOL_UUID_TGT);
+    stm_sync *tgt_sync = stm_fs_sync_for_test(tgt.fs);
+
+    stm_recv_handle *rh = NULL;
+    STM_ASSERT_OK(stm_recv_init(tgt_sync, 1, &rh));
+
+    /* HEADER prep. */
+    testpool src; testpool_setup(&src, "p7cas10_chunk_flag_src", POOL_UUID_SRC);
+    stm_sync *src_sync = stm_fs_sync_for_test(src.fs);
+    stm_send_handle *sh = NULL;
+    STM_ASSERT_OK(stm_send_init(src_sync, 1, 0, 0, &sh));
+    uint8_t hbuf[256];
+    size_t hlen = 0, needed = 0;
+    STM_ASSERT_OK(stm_send_next(sh, hbuf, sizeof hbuf, &hlen, &needed));
+    STM_ASSERT_OK(stm_recv_apply(rh, hbuf, hlen));
+
+    uint8_t plain[256];
+    memset(plain, 0x77, sizeof plain);
+    stm_blake3_hash hash;
+    stm_blake3(plain, sizeof plain, &hash);
+
+    size_t total = STM_SEND_RECORD_HDR_LEN + STM_SEND_CHUNK_HASH_LEN + sizeof plain;
+    uint8_t *rec = malloc(total);
+    STM_ASSERT(rec != NULL);
+    memset(rec, 0, total);
+    rec[0] = 0x04;
+    rec[4] = 0x01;  /* flags = STM_SEND_FLAG_COLD (1) — known but illegal on CHUNK */
+    uint64_t body_len = (uint64_t)STM_SEND_CHUNK_HASH_LEN + sizeof plain;
+    for (int i = 0; i < 8; i++) rec[8 + i] = (uint8_t)(body_len >> (8 * i));
+    memcpy(rec + STM_SEND_RECORD_HDR_LEN, hash.bytes, 32);
+    memcpy(rec + STM_SEND_RECORD_HDR_LEN + STM_SEND_CHUNK_HASH_LEN,
+              plain, sizeof plain);
+
+    STM_ASSERT_ERR(stm_recv_apply(rh, rec, total), STM_ECORRUPT);
+
+    free(rec);
+    stm_send_close(sh);
+    stm_recv_close(rh);
     testpool_teardown(&src);
     testpool_teardown(&tgt);
 }

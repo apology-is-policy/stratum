@@ -113,11 +113,23 @@ struct stm_send_handle {
     size_t             n_deks;
     size_t             cap_deks;
 
+    /* P7-CAS-10: out-of-band chunk store plan. After collect, we
+     * dedupe cold extents by content_hash and capture one extent
+     * index per unique hash — that extent's cas_paddrs source the
+     * CHUNK record's plaintext. Build order: HEADER, all CHUNKs
+     * (one per unique cold hash), all EXTENTs (HOT + COLD by hash),
+     * END. */
+    size_t            *chunk_plan;    /* len n_chunk_plan; each = extent idx
+                                         providing the chunk's bytes. */
+    size_t             n_chunk_plan;
+    size_t             cap_chunk_plan;
+
     /* Stream emission cursor:
-     *   0          → emit HEADER on first stm_send_next
-     *   1..n_extents → emit extents[cursor-1]
-     *   n_extents+1 → emit END
-     *   ≥ n_extents+2 → STM_ENOENT */
+     *   0                                            → HEADER
+     *   1..n_chunk_plan                              → CHUNK(chunk_plan[c-1])
+     *   n_chunk_plan+1..n_chunk_plan+n_extents       → EXTENT(c-n_chunk_plan-1)
+     *   n_chunk_plan+n_extents+1                     → END
+     *   ≥ n_chunk_plan+n_extents+2                   → STM_ENOENT */
     size_t             cursor;
 
     /* Running BLAKE3 hasher over the wire. */
@@ -370,6 +382,49 @@ stm_status stm_send_init(stm_sync *sync,
         }
     }
 
+    /* P7-CAS-10: build the chunk plan. Walk the captured extents in
+     * (ino, off) order and dedupe COLD content_hashes; for each unique
+     * hash, append the index of its FIRST-encountered extent to
+     * chunk_plan. The CHUNK record at emit-time will source its
+     * plaintext via that extent's cas_paddrs (any extent with the
+     * same hash is bytewise-equivalent for read purposes; using the
+     * first is deterministic).
+     *
+     * O(n_cold²) dedup scan via memcmp — n_cold is bounded by stream
+     * size which is application-bounded. A hash-map dedup would scale
+     * better but adds dependency complexity for marginal benefit at
+     * v1. Future: switch to a hash-table when n_cold routinely
+     * exceeds ~10k per stream. */
+    for (size_t i = 0; i < h->n_extents; i++) {
+        send_extent_meta *m = &h->extents[i];
+        if (m->kind != STM_EXTENT_KIND_COLD) continue;
+        bool already = false;
+        for (size_t j = 0; j < h->n_chunk_plan; j++) {
+            if (memcmp(h->extents[h->chunk_plan[j]].content_hash,
+                          m->content_hash, STM_EXTENT_HASH_LEN) == 0) {
+                already = true;
+                break;
+            }
+        }
+        if (already) continue;
+
+        if (h->n_chunk_plan == h->cap_chunk_plan) {
+            size_t new_cap = h->cap_chunk_plan == 0 ? 8 : h->cap_chunk_plan * 2;
+            size_t *grown = realloc(h->chunk_plan,
+                                       new_cap * sizeof(*h->chunk_plan));
+            if (!grown) {
+                free(h->chunk_plan);
+                free(h->extents);
+                stm_blake3_free(h->hasher);
+                free(h);
+                return STM_ENOMEM;
+            }
+            h->chunk_plan     = grown;
+            h->cap_chunk_plan = new_cap;
+        }
+        h->chunk_plan[h->n_chunk_plan++] = i;
+    }
+
     /* P7-10 / R42 P2-1: snapshot DEKs for every unique key_id the
      * collected extents reference. Without this, a concurrent
      * `stm_sync_rotate_dataset_key` + `stm_sync_write_extent`
@@ -405,6 +460,7 @@ stm_status stm_send_init(stm_sync *sync,
                     stm_ct_memzero(h->deks, h->cap_deks * sizeof *h->deks);
                     free(h->deks);
                 }
+                free(h->chunk_plan);
                 free(h->extents);
                 stm_blake3_free(h->hasher);
                 free(h);
@@ -432,6 +488,7 @@ stm_status stm_send_init(stm_sync *sync,
              * retry. Wipe whatever DEKs we did capture. */
             stm_ct_memzero(h->deks, h->cap_deks * sizeof *h->deks);
             free(h->deks);
+            free(h->chunk_plan);
             free(h->extents);
             stm_blake3_free(h->hasher);
             free(h);
@@ -642,21 +699,25 @@ static stm_status emit_extent_locked(stm_send_handle *h,
                                         uint8_t *out, size_t out_cap,
                                         size_t *out_len)
 {
-    /* P7-CAS-9: HOT extents use the legacy 32-byte body meta;
-     * COLD extents prefix the plaintext with a 32-byte content_hash
-     * (total 64 bytes meta) and set STM_SEND_FLAG_COLD in the
-     * framing header's flags field. */
+    /* P7-CAS-10: HOT extents carry meta + plaintext; COLD extents
+     * carry ONLY meta + content_hash (no plaintext — the chunk's
+     * bytes are already on the receiver via a prior CHUNK record).
+     * The flags field's STM_SEND_FLAG_COLD bit signals the body
+     * shape. */
     bool is_cold = (m->kind == STM_EXTENT_KIND_COLD);
-    size_t meta_len = is_cold ? STM_SEND_COLD_EXTENT_META_LEN
-                              : STM_SEND_EXTENT_META_LEN;
-    size_t need = STM_SEND_RECORD_HDR_LEN + meta_len + m->len;
+    size_t body_len_total;
+    if (is_cold) {
+        body_len_total = STM_SEND_COLD_EXTENT_BODY_LEN;
+    } else {
+        body_len_total = (size_t)STM_SEND_EXTENT_META_LEN + m->len;
+    }
+    size_t need = STM_SEND_RECORD_HDR_LEN + body_len_total;
     if (out_cap < need) return STM_ERANGE;
 
-    uint64_t body_len = (uint64_t)meta_len + m->len;
     /* Custom record header: type=EXTENT, flags=COLD if applicable. */
     put_le32(out + 0, STM_SEND_REC_EXTENT);
     put_le32(out + 4, is_cold ? STM_SEND_FLAG_COLD : 0u);
-    put_le64(out + 8, body_len);
+    put_le64(out + 8, (uint64_t)body_len_total);
 
     uint8_t *body = out + STM_SEND_RECORD_HDR_LEN;
     put_le64(body + 0,  m->ino);
@@ -665,11 +726,11 @@ static stm_status emit_extent_locked(stm_send_handle *h,
     put_le64(body + 24, m->gen);
 
     if (is_cold) {
+        /* COLD body suffix: 32-byte content_hash. No plaintext —
+         * the chunk's bytes were emitted out-of-band via an earlier
+         * CHUNK record. */
         memcpy(body + STM_SEND_EXTENT_META_LEN, m->content_hash,
                   STM_EXTENT_HASH_LEN);
-        stm_status ds = read_decrypt_cold_chunk_plaintext(
-                h, m, body + STM_SEND_COLD_EXTENT_META_LEN);
-        if (ds != STM_OK) return ds;
     } else {
         /* HOT path: decrypt the extent's plaintext directly into
          * the output buffer (extent ciphertext on bdev → plaintext). */
@@ -677,6 +738,42 @@ static stm_status emit_extent_locked(stm_send_handle *h,
                 h, m, body + STM_SEND_EXTENT_META_LEN);
         if (ds != STM_OK) return ds;
     }
+
+    stm_blake3_update(h->hasher, out, need);
+    *out_len = need;
+    return STM_OK;
+}
+
+/* P7-CAS-10: emit one STM_SEND_REC_CHUNK record. Body = 32-byte
+ * BLAKE3-256 content_hash + plaintext. The plaintext comes from
+ * decrypting the chunk on-disk via the source extent's cas_paddrs
+ * (mirrors `read_decrypt_cold_chunk_plaintext`). */
+static stm_status emit_chunk_locked(stm_send_handle *h,
+                                       const send_extent_meta *m,
+                                       uint8_t *out, size_t out_cap,
+                                       size_t *out_len)
+{
+    if (m->kind != STM_EXTENT_KIND_COLD) return STM_ECORRUPT;
+    if (m->len == 0u || m->len > STM_SEND_CHUNK_PLAIN_MAX) return STM_ECORRUPT;
+
+    size_t body_len = (size_t)STM_SEND_CHUNK_HASH_LEN + m->len;
+    size_t need = STM_SEND_RECORD_HDR_LEN + body_len;
+    if (out_cap < need) return STM_ERANGE;
+
+    /* CHUNK records carry no flag bits at v2 (the hash + plaintext
+     * shape is fully determined by the type=CHUNK). */
+    put_le32(out + 0, STM_SEND_REC_CHUNK);
+    put_le32(out + 4, 0u);
+    put_le64(out + 8, (uint64_t)body_len);
+
+    uint8_t *body = out + STM_SEND_RECORD_HDR_LEN;
+    /* Hash prefix. */
+    memcpy(body, m->content_hash, STM_SEND_CHUNK_HASH_LEN);
+    /* Plaintext suffix: decrypt the chunk via the captured cas_paddrs
+     * + cas_gen + pool metadata key + stm_ad_cas. */
+    stm_status ds = read_decrypt_cold_chunk_plaintext(
+            h, m, body + STM_SEND_CHUNK_HASH_LEN);
+    if (ds != STM_OK) return ds;
 
     stm_blake3_update(h->hasher, out, need);
     *out_len = need;
@@ -720,12 +817,14 @@ stm_status stm_send_next(stm_send_handle *h,
     *out_len = 0;
     *out_len_needed = 0;
 
-    /* Stream cursor:
-     *   cursor == 0           → HEADER
-     *   1..n_extents          → extents[cursor-1]
-     *   n_extents+1           → END
-     *   ≥ n_extents+2         → STM_ENOENT */
-    if (h->cursor > h->n_extents + 1u) return STM_ENOENT;
+    /* P7-CAS-10 cursor:
+     *   0                                            → HEADER
+     *   1..n_chunk_plan                              → CHUNK(chunk_plan[c-1])
+     *   n_chunk_plan+1..n_chunk_plan+n_extents       → EXTENT(c-n_chunk_plan-1)
+     *   n_chunk_plan+n_extents+1                     → END
+     *   ≥ n_chunk_plan+n_extents+2                   → STM_ENOENT */
+    size_t end_cursor = h->n_chunk_plan + h->n_extents + 1u;
+    if (h->cursor > end_cursor) return STM_ENOENT;
 
     uint8_t *p = out_buf;
     if (h->cursor == 0) {
@@ -738,12 +837,28 @@ stm_status stm_send_next(stm_send_handle *h,
         return STM_OK;
     }
 
-    if (h->cursor <= h->n_extents) {
-        const send_extent_meta *m = &h->extents[h->cursor - 1];
-        size_t meta_len = (m->kind == STM_EXTENT_KIND_COLD)
-                              ? STM_SEND_COLD_EXTENT_META_LEN
-                              : STM_SEND_EXTENT_META_LEN;
-        size_t need = STM_SEND_RECORD_HDR_LEN + meta_len + m->len;
+    if (h->cursor <= h->n_chunk_plan) {
+        size_t ext_idx = h->chunk_plan[h->cursor - 1];
+        const send_extent_meta *m = &h->extents[ext_idx];
+        size_t need = STM_SEND_RECORD_HDR_LEN + STM_SEND_CHUNK_HASH_LEN + m->len;
+        if (out_cap < need) { *out_len_needed = need; return STM_ERANGE; }
+        size_t emitted = 0;
+        stm_status es = emit_chunk_locked(h, m, p, out_cap, &emitted);
+        if (es != STM_OK) return es;
+        *out_len = emitted;
+        h->cursor++;
+        return STM_OK;
+    }
+
+    if (h->cursor <= h->n_chunk_plan + h->n_extents) {
+        size_t ext_idx = h->cursor - 1u - h->n_chunk_plan;
+        const send_extent_meta *m = &h->extents[ext_idx];
+        size_t need;
+        if (m->kind == STM_EXTENT_KIND_COLD) {
+            need = STM_SEND_RECORD_HDR_LEN + STM_SEND_COLD_EXTENT_BODY_LEN;
+        } else {
+            need = STM_SEND_RECORD_HDR_LEN + STM_SEND_EXTENT_META_LEN + m->len;
+        }
         if (out_cap < need) { *out_len_needed = need; return STM_ERANGE; }
         size_t emitted = 0;
         stm_status es = emit_extent_locked(h, m, p, out_cap, &emitted);
@@ -753,7 +868,7 @@ stm_status stm_send_next(stm_send_handle *h,
         return STM_OK;
     }
 
-    /* cursor == n_extents + 1: emit END. */
+    /* cursor == end_cursor: emit END. */
     size_t need = STM_SEND_RECORD_HDR_LEN + STM_SEND_END_BODY_LEN;
     if (out_cap < need) { *out_len_needed = need; return STM_ERANGE; }
     stm_status es = emit_end_locked(h, p, out_cap);
@@ -767,6 +882,7 @@ void stm_send_close(stm_send_handle *h)
 {
     if (!h) return;
     free(h->extents);
+    free(h->chunk_plan);
     if (h->deks) {
         stm_ct_memzero(h->deks, h->cap_deks * sizeof *h->deks);
         free(h->deks);

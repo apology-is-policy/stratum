@@ -5999,6 +5999,165 @@ stm_status stm_sync_recv_cold_extent(
     return STM_OK;
 }
 
+/* P7-CAS-10: out-of-band chunk store recv primitives. Composition
+ * over cas_chunk_intern_locked (CHUNK side), stm_cas_lookup +
+ * stm_cas_ref + stm_extent_write_cold (EXTENT-by-hash side), and
+ * stm_cas_deref (release). No new cas state machine — the wire
+ * shape changes only how the same operations are sequenced. */
+
+stm_status stm_sync_recv_cold_chunk(stm_sync *s,
+                                       const uint8_t claimed_hash[32],
+                                       const void *plain,
+                                       size_t plain_len)
+{
+    if (!s || !claimed_hash || !plain) return STM_EINVAL;
+    if (plain_len == 0u)               return STM_EINVAL;
+
+    pthread_mutex_lock(&s->lock);
+    if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
+    if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
+    if (!s->cas_idx)  { pthread_mutex_unlock(&s->lock); return STM_EINVAL;  }
+
+    /* Step 1: BLAKE3-verify against the claimed wire hash, BEFORE any
+     * cas state mutation. cas_chunk_intern_locked also computes BLAKE3
+     * internally, but it commits to its own re-hash for the CAS
+     * lookup-or-insert; verifying first ensures we never mutate cas
+     * state on a sender that lied about the hash. */
+    {
+        stm_blake3_hash verify;
+        stm_blake3(plain, plain_len, &verify);
+        if (memcmp(verify.bytes, claimed_hash, STM_CAS_HASH_LEN) != 0) {
+            pthread_mutex_unlock(&s->lock);
+            return STM_EBADTAG;
+        }
+    }
+
+    /* Step 2: CAS lookup-or-insert. cas_chunk_intern_locked rolls back
+     * its own partial state on failure (allocator reservations are
+     * freed; cas_insert is not called). */
+    uint8_t out_hash[STM_CAS_HASH_LEN];
+    bool cas_inserted = false, cas_bumped = false;
+    stm_status cs = cas_chunk_intern_locked(s, plain, plain_len,
+                                              out_hash,
+                                              &cas_inserted, &cas_bumped);
+    if (cs != STM_OK) {
+        pthread_mutex_unlock(&s->lock);
+        return cs;
+    }
+    /* Defensive transitivity check (mirrors stm_sync_recv_cold_extent). */
+    if (memcmp(out_hash, claimed_hash, STM_CAS_HASH_LEN) != 0) {
+        (void)stm_cas_deref(s->cas_idx, out_hash);
+        pthread_mutex_unlock(&s->lock);
+        return STM_ECORRUPT;
+    }
+
+    pthread_mutex_unlock(&s->lock);
+    return STM_OK;
+}
+
+stm_status stm_sync_recv_cold_extent_ref(stm_sync *s,
+                                            uint64_t target_dataset_id,
+                                            uint64_t ino,
+                                            uint64_t off,
+                                            uint64_t len,
+                                            const uint8_t claimed_hash[32])
+{
+    if (!s || !claimed_hash)                                 return STM_EINVAL;
+    if (target_dataset_id == 0u || ino == 0u || len == 0u)   return STM_EINVAL;
+
+    pthread_mutex_lock(&s->lock);
+    if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
+    if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
+    if (!s->cas_idx)  { pthread_mutex_unlock(&s->lock); return STM_EINVAL;  }
+
+    /* Step 1: cas_lookup must HIT — the sender's protocol promise is
+     * that every COLD EXTENT's hash was preceded by a CHUNK record in
+     * the same stream. STM_ENOENT here means out-of-order or missing
+     * CHUNK record (sender bug or hostile stream); STM_ECORRUPT is
+     * the right surface (matches send_recv.h's stream-ordering
+     * invariant). */
+    stm_cas_record cas_rec;
+    stm_status ls = stm_cas_lookup(s->cas_idx, claimed_hash, &cas_rec);
+    if (ls != STM_OK) {
+        pthread_mutex_unlock(&s->lock);
+        if (ls == STM_ENOENT) return STM_ECORRUPT;
+        return ls;
+    }
+    /* Defensive: cas_rec.length pins the chunk's true length; an
+     * EXTENT whose `len` mismatches indicates either a hash collision
+     * (cryptographically impossible per BLAKE3) or a torn cas_idx
+     * record. Refuse rather than installing an extent record whose
+     * len != chunk bytes. */
+    if (cas_rec.length != len) {
+        pthread_mutex_unlock(&s->lock);
+        return STM_ECORRUPT;
+    }
+
+    /* Step 2: bump refcount. Models cas.tla::MigrateToCold's HIT
+     * branch — the EXTENT record installation IS the dedup-hit
+     * action. */
+    stm_status rs = stm_cas_ref(s->cas_idx, claimed_hash);
+    if (rs != STM_OK) {
+        pthread_mutex_unlock(&s->lock);
+        return rs;
+    }
+
+    /* Step 3: resolve target dataset's CURRENT key_id (mirrors
+     * stm_sync_recv_cold_extent / stm_sync_write_extent — every COLD
+     * extent records the target dataset's CURRENT key_id at write
+     * time so the keyschema-sweep invariant holds). */
+    uint64_t key_id = 0u;
+    {
+        stm_status ks = stm_keyschema_lookup_current(
+                (const stm_keyschema *)s->keyschema,
+                target_dataset_id, &key_id,
+                /*out_wrapped=*/NULL, /*out_cap=*/0, /*out_len=*/NULL);
+        if (ks != STM_OK) {
+            (void)stm_cas_deref(s->cas_idx, claimed_hash);
+            pthread_mutex_unlock(&s->lock);
+            return ks;
+        }
+    }
+
+    /* Step 4: insert COLD extent record on the target. Stamping
+     * matches stm_sync_recv_cold_extent's posture. */
+    stm_status ws = stm_extent_write_cold(s->extent_idx,
+                                             target_dataset_id, ino,
+                                             off, len,
+                                             claimed_hash,
+                                             /*gen=*/s->current_gen,
+                                             /*key_id=*/key_id,
+                                             /*origin_*=*/target_dataset_id,
+                                             ino, off,
+                                             /*link_gen=*/s->current_gen);
+    if (ws != STM_OK) {
+        (void)stm_cas_deref(s->cas_idx, claimed_hash);
+        pthread_mutex_unlock(&s->lock);
+        return ws;
+    }
+
+    pthread_mutex_unlock(&s->lock);
+    return STM_OK;
+}
+
+stm_status stm_sync_recv_cold_chunk_release(stm_sync *s,
+                                               const uint8_t claimed_hash[32])
+{
+    if (!s || !claimed_hash) return STM_EINVAL;
+
+    pthread_mutex_lock(&s->lock);
+    if (!s->cas_idx) { pthread_mutex_unlock(&s->lock); return STM_EINVAL; }
+    /* Note: deliberately do NOT refuse on wedged/read-only here —
+     * recv_close needs to drain its chunks_seen regardless of sync
+     * state, and stm_cas_deref is a pure cas_idx mutation that
+     * doesn't touch bdev I/O. A wedged sync that never commits
+     * leaves the deref un-persisted, which is exactly the same
+     * outcome as never calling release. */
+    stm_status ds = stm_cas_deref(s->cas_idx, claimed_hash);
+    pthread_mutex_unlock(&s->lock);
+    return ds;
+}
+
 /* P7-CAS-7: per-ino aggregator state for the migration-policy
  * heuristic's collect pass. extent_iter_ds delivers extents in
  * (ino, off)-ascending order, so all extents for ino N are

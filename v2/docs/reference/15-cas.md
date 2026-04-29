@@ -809,16 +809,135 @@ Wire-on-the-wire dedup is NOT preserved (the chunk's plaintext
 is sent inline per-extent; two cold extents referencing the
 same hash send the plaintext twice). Storage-at-rest dedup IS
 preserved on the target — two such extents collapse to one CAS
-entry refcount=2 via the lookup-or-insert path. A future
-chunk could add an "out-of-band chunk store" wire shape that
-sends each unique chunk once + extent records reference by
-hash, but the v1 trade favors simplicity.
+entry refcount=2 via the lookup-or-insert path.
+
+**P7-CAS-10 closes the on-wire dedup gap** with an out-of-band
+chunk store wire shape (next section).
 
 Composition: pure caller of `cas_chunk_intern_locked` +
 `stm_extent_write_cold`. `cas.tla::MigrateToCold`'s invariants
 (`HotColdReplicasDisjoint`, `CASReplicasDisjoint`) preserved by
 the allocator-fresh paddrs + cas_insert runtime check. No spec
 extension required.
+
+## Out-of-band chunk store wire shape (P7-CAS-10)
+
+P7-CAS-10 closes the on-wire dedup gap from P7-CAS-9. The wire
+ships each unique cold-content hash as one **STM_SEND_REC_CHUNK**
+record (32-byte hash + plaintext) followed by N small **COLD
+EXTENT** records (each is 80 wire bytes: 16 framing + 32 meta + 32
+hash, no plaintext). On a high-dedup workload (VM images,
+container images) the savings on cold-tier streams can exceed
+10×.
+
+**Wire format break**: STM_SEND_VERSION bumped 1 → 2. Receivers
+refuse v1 streams with STM_EBADVERSION at HEADER apply.
+
+Wire format (sender side):
+
+- HOT extents unchanged: 32-byte EXTENT body meta + `len`
+  bytes plaintext.
+- **CHUNK records** (new): 16-byte framing + 32-byte
+  BLAKE3-256 content_hash + `len` bytes plaintext. Sender
+  emits each unique cold hash exactly once before any
+  COLD EXTENT that references it.
+- COLD EXTENT records: 16-byte framing + 32-byte meta + 32-byte
+  hash. Body length is FIXED at 64 bytes — no plaintext follows
+  (the chunk's bytes are already on the receiver via a prior
+  CHUNK record). The framing-header's `STM_SEND_FLAG_COLD` bit
+  signals the body shape.
+
+Stream-ordering invariant: a COLD EXTENT's `content_hash` MUST
+reference a CHUNK record that was emitted earlier in the same
+stream. Sender enforces this by deduping at send_init and
+emitting each unique hash once before any referencing COLD
+EXTENT. Receiver enforces it via the per-stream `chunks_seen`
+membership check at apply_extent COLD time (STM_ECORRUPT on
+miss).
+
+Sender-side plan (send.c):
+
+- After collect, walk extents in (ino, off) order; for each
+  COLD extent with a hash not yet planned, append the index
+  of that extent to `h->chunk_plan` (an array of source extent
+  indices, one per unique hash).
+- Plan ordering: HEADER, all CHUNKs (one per unique cold hash),
+  all EXTENTs (HOT or COLD by hash, in (ino, off) order), END.
+- Cursor logic in `stm_send_next` dispatches via plan; CHUNK
+  records source their plaintext via the indexed extent's
+  `cas_paddrs` (any extent with the same hash is bytewise-
+  equivalent for read purposes; using the first is
+  deterministic).
+- O(N²) hash-dedup scan via memcmp at send_init; bounded by
+  cold-extent count which is application-bounded. Switch to a
+  hash-table when streams routinely exceed ~10k unique cold
+  chunks.
+
+Receiver-side dispatch (recv.c):
+
+- `apply_chunk` (new): validates body_len ≥ 32, refuses
+  duplicate-in-stream, calls `stm_sync_recv_cold_chunk` (which
+  BLAKE3-verifies + interns into CAS), tracks the hash in
+  `chunks_seen`. Per-CHUNK refcount bump is +1 (intern
+  semantics: MISS-insert at 1; HIT-bump += 1).
+- `apply_extent` COLD path: validates body_len == 64,
+  enforces `chunks_seen` membership, calls
+  `stm_sync_recv_cold_extent_ref` (which cas_lookups + cas_refs
+  the existing entry + writes the cold extent record).
+- `recv_close`: drains `chunks_seen` via
+  `stm_sync_recv_cold_chunk_release` (cas_deref) for each
+  hash. After drain, refcount = (number of cold extents in
+  this stream that referenced the hash) + (any pre-existing
+  receiver-side refcount). Same final-state invariant as
+  P7-CAS-9's atomic intern+write-extent path.
+
+Lifecycle invariant: every successful CHUNK MUST be balanced
+by a release at recv_close. Without the drain, the per-CHUNK
+intern bump would leak — refcount = (extent refs) + 1, which
+auto_gc won't reclaim because refcount > 0.
+
+Sync-layer split (3 new APIs):
+
+- `stm_sync_recv_cold_chunk(s, hash, plain, plain_len)` —
+  BLAKE3-verify + cas_chunk_intern_locked. Bumps refcount by 1.
+- `stm_sync_recv_cold_extent_ref(s, target_ds, ino, off, len, hash)` —
+  cas_lookup must HIT, cas_ref + stm_extent_write_cold +
+  rollback (cas_deref) on extent_write_cold failure.
+- `stm_sync_recv_cold_chunk_release(s, hash)` — cas_deref under
+  sync->lock. Doesn't refuse on wedged/read-only — recv_close
+  must drain regardless.
+
+Pre-populated target HIT path: if the receiver already has the
+chunk (e.g. some other ino on the receiver was migrated to
+that content earlier), the CHUNK arrival's
+cas_chunk_intern_locked HITs and bumps refcount; the EXTENT
+arrival's cas_ref bumps refcount further; recv_close's drain
+balances the per-CHUNK bump. Final receiver refcount =
+(pre-existing) + (new extents in stream).
+
+Orphan CHUNK handling: a CHUNK record without any referencing
+EXTENT in the same stream sits at refcount=1 (from intern).
+recv_close's drain decrements to 0; next commit's auto_gc
+reclaims. Sender at v1 doesn't emit orphan CHUNKs (chunk_plan
+includes only hashes that have at least one referencing extent
+captured at send_init), but the receiver tolerates the case.
+
+Composition: still pure callers of the same primitives —
+`cas_chunk_intern_locked`, `stm_cas_ref`, `stm_cas_deref`,
+`stm_extent_write_cold`. The new wire-protocol invariants
+(every COLD EXTENT preceded by CHUNK; no duplicate CHUNK)
+are wire-level, enforced at recv layer. They don't appear in
+cas.tla because cas.tla doesn't model wire records — the
+underlying CAS state machine is unchanged. **No spec extension
+required.**
+
+Wire-bytes math at high dedup ratio: a stream with K unique
+chunks and N referencing cold extents (avg dedup ratio = N/K)
+ships K × (chunk_plain_size + ~80) + N × 80 wire-bytes for the
+cold portion. Pre-P7-CAS-10 the same content shipped
+N × (chunk_plain_size + ~80). Savings = (N-K) × chunk_plain_size.
+For 128 KiB chunks with 10× dedup, savings ≈ 9 chunks × 128 KiB
+per 10 extents = 1.15 MiB saved per 10 extents.
 
 ## Cold-extent reflink (P7-CAS-3)
 

@@ -15,7 +15,7 @@
  *
  * Wire format:
  *
- *   Stream = HEADER ++ EXTENT* ++ END
+ *   Stream = HEADER ++ (CHUNK | EXTENT)* ++ END
  *
  *   Each record:
  *     ┌─────────┬─────────┬──────────────┐
@@ -33,8 +33,22 @@
  *    40     8   to_txg          (le64)
  *    48     4   reserved        (zero)
  *
+ *   CHUNK body (32 + len bytes; P7-CAS-10 — out-of-band chunk store):
+ *     0    32   content_hash    (BLAKE3-256 of plaintext; receiver
+ *                                 verifies against its own re-hash
+ *                                 BEFORE any CAS state mutation)
+ *    32   len   plaintext       (raw bytes — the chunk's plaintext)
+ *
+ *   The CHUNK record interns the plaintext into the receiver's CAS
+ *   index. Each unique cold-content hash is shipped via exactly one
+ *   CHUNK record per send stream; subsequent COLD EXTENTs that share
+ *   the hash reference it without reshipping the bytes. This is the
+ *   on-wire dedup mechanism that makes a high-dedup workload (VM
+ *   images, container images) ship in proportion to the unique
+ *   content rather than the per-extent total.
+ *
  *   EXTENT body — two shapes (selected by the framing-header `flags`
- *   field's STM_SEND_FLAG_COLD bit; P7-CAS-9):
+ *   field's STM_SEND_FLAG_COLD bit):
  *
  *   HOT EXTENT body (32 + len bytes; flags & COLD == 0):
  *     0     8   ino             (le64)
@@ -43,22 +57,27 @@
  *    24     8   gen             (le64)  — source-side write_gen, advisory
  *    32   len   plaintext       (raw bytes)
  *
- *   COLD EXTENT body (64 + len bytes; flags & COLD != 0):
+ *   COLD EXTENT body (64 bytes; flags & COLD != 0; P7-CAS-10 chunk-ref):
  *     0     8   ino             (le64)
  *     8     8   off             (le64)
  *    16     8   len             (le64)
  *    24     8   gen             (le64)  — source-side write_gen, advisory
- *    32    32   content_hash    (BLAKE3-256 of plaintext; receiver
- *                                 verifies against its own re-hash and
- *                                 uses the verified hash to dedup
- *                                 against its CAS index)
- *    64   len   plaintext       (raw bytes)
+ *    32    32   content_hash    (BLAKE3-256; MUST match the hash of
+ *                                 some prior CHUNK record in the
+ *                                 stream; receiver enforces this)
  *
- *   The wire still carries plaintext for cold extents (no on-wire
- *   dedup in v1) — but the receiver-side CAS lookup-or-insert
- *   preserves the dedup property at rest. Two cold extents with
- *   identical content collapse to one CAS entry on the target with
- *   refcount=2.
+ *   The COLD EXTENT body carries no plaintext: the chunk's bytes are
+ *   already on the receiver via the prior CHUNK record. The COLD
+ *   EXTENT records the (ino, off, len, hash) tuple and bumps the
+ *   chunk's refcount on the target's CAS.
+ *
+ *   Stream-ordering invariant: a COLD EXTENT's `content_hash` MUST
+ *   reference a CHUNK record that was emitted earlier in the same
+ *   stream. The sender enforces this by deduping at send_init and
+ *   emitting each unique hash's CHUNK once before any referencing
+ *   COLD EXTENT. The receiver enforces it by tracking the per-stream
+ *   `chunks_seen` set and refusing a COLD EXTENT whose hash isn't
+ *   present (STM_ECORRUPT — out-of-order or missing CHUNK).
  *
  *   END body (32 bytes):
  *     0    32   blake3_csum     — running BLAKE3 over every prior
@@ -69,14 +88,22 @@
  * Properties this protocol guarantees (when neither side is buggy):
  *
  *   - StreamCompleteness: a valid stream contains every extent of the
- *     source's snapshot range, exactly once.
+ *     source's snapshot range, exactly once. Cold extents reference
+ *     chunks via hash; each unique chunk hash ships once per stream.
  *   - Ordering: receive applies records in the order they were emitted;
- *     receiver refuses out-of-order streams (header must be first;
- *     END must follow only after EXTENT records of the source's range).
+ *     receiver refuses out-of-order streams (HEADER must be first;
+ *     END must follow only after CHUNK / EXTENT records of the source's
+ *     range; every COLD EXTENT's hash MUST be preceded by a matching
+ *     CHUNK record).
  *   - Authenticity: the BLAKE3 csum binds the entire stream — any
  *     tampering or truncation fails the end-of-stream check.
  *   - Nonce isolation: receiver re-encrypts; cross-pool nonce reuse
  *     impossible.
+ *   - On-wire dedup (P7-CAS-10): N cold extents sharing one content
+ *     hash ship as 1 CHUNK + N COLD EXTENTs (each EXTENT is 80 bytes
+ *     wire-side); the prior P7-CAS-9 wire shape would have shipped N
+ *     COLD EXTENTs each carrying the full plaintext. Savings scale
+ *     with dedup ratio.
  *
  * Lifecycle:
  *
@@ -185,7 +212,12 @@ struct stm_sync; typedef struct stm_sync stm_sync;
 
 /* Wire constants. */
 #define STM_SEND_MAGIC          UINT32_C(0x534D5453)   /* "STMS" little-endian */
-#define STM_SEND_VERSION        1u
+/* P7-CAS-10: bumped 1 → 2 with the wire shape change. v1 streams
+ * carried the cold chunk's plaintext inline in every COLD EXTENT
+ * record; v2 ships unique chunks via out-of-band STM_SEND_REC_CHUNK
+ * records and references them by hash in each COLD EXTENT. v2
+ * receivers refuse v1 streams with STM_EBADVERSION at HEADER apply. */
+#define STM_SEND_VERSION        2u
 
 /* Record types (stored in the type field of every record's framing
  * header). */
@@ -193,6 +225,11 @@ typedef enum {
     STM_SEND_REC_HEADER  = 1,
     STM_SEND_REC_EXTENT  = 2,
     STM_SEND_REC_END     = 3,
+    /* P7-CAS-10: out-of-band chunk store record. Body = 32-byte
+     * BLAKE3-256 content_hash + plaintext. Receiver BLAKE3-verifies
+     * + interns into the target's CAS via cas_chunk_intern_locked.
+     * One CHUNK record per unique cold-content hash per stream. */
+    STM_SEND_REC_CHUNK   = 4,
 } stm_send_record_type;
 
 /* Per-record framing length (preceding every body). */
@@ -201,27 +238,50 @@ typedef enum {
 #define STM_SEND_HEADER_BODY_LEN 52u
 /* HOT EXTENT body's metadata length (followed by `len` plaintext bytes). */
 #define STM_SEND_EXTENT_META_LEN 32u
-/* P7-CAS-9: COLD EXTENT body's metadata length (HOT meta + 32-byte
- * BLAKE3-256 content_hash, followed by `len` plaintext bytes). */
-#define STM_SEND_COLD_EXTENT_META_LEN  (STM_SEND_EXTENT_META_LEN + 32u)
+/* P7-CAS-10: COLD EXTENT body is now FIXED at 64 bytes (32-byte HOT
+ * meta + 32-byte content_hash; no plaintext follows — the chunk is
+ * sent out-of-band via a prior STM_SEND_REC_CHUNK record).
+ *
+ * For backward-source-readability the constant retains its
+ * P7-CAS-9 name; semantically it is the entire body length (no
+ * `+ len` plaintext follows in v2). */
+#define STM_SEND_COLD_EXTENT_BODY_LEN  (STM_SEND_EXTENT_META_LEN + 32u)
+/* P7-CAS-10: STM_SEND_REC_CHUNK body's hash prefix length (followed
+ * by the chunk's plaintext bytes). */
+#define STM_SEND_CHUNK_HASH_LEN  32u
+/* P7-CAS-10: cap on a CHUNK record's plaintext payload. Mirrors the
+ * HOT EXTENT plaintext cap (which equals the per-extent recordsize
+ * cap of 128 KiB). The chunk size at v1 corresponds to one extent's
+ * worth of bytes; this cap will lift when the recordsize cap lifts
+ * (option A — recordsize lift + cross-extent FastCDC). */
+#define STM_SEND_CHUNK_PLAIN_MAX (128u * 1024u)
 /* END body length (BLAKE3 csum). */
 #define STM_SEND_END_BODY_LEN    32u
 
-/* P7-CAS-9: framing flag bit set on cold extent records to signal the
- * extended body shape (32-byte content_hash before the plaintext).
- * Unrecognized flag bits MUST cause the recv to refuse with
- * STM_ECORRUPT — protocol-evolution discipline. */
+/* P7-CAS-9: framing flag bit set on cold extent records (and only on
+ * cold extent records) to signal the body shape that ends in
+ * content_hash. v2 (P7-CAS-10) keeps the flag bit but redefines the
+ * body to omit the plaintext payload: COLD EXTENT body is fixed at
+ * STM_SEND_COLD_EXTENT_BODY_LEN bytes; the receiver looks the hash
+ * up in chunks_seen (populated by prior CHUNK records in the same
+ * stream) and bumps the CAS refcount. Unrecognized flag bits MUST
+ * cause the recv to refuse with STM_ECORRUPT (protocol-evolution
+ * discipline). */
 #define STM_SEND_FLAG_COLD       UINT32_C(0x00000001)
 #define STM_SEND_FLAG_KNOWN_MASK STM_SEND_FLAG_COLD
 
 /* Upper bound on a single record's full bytes (framing + body) — used
  * by recv to reject hostile/oversized records up front before any
- * dispatch. The largest legitimate record is a COLD EXTENT carrying a
- * full 128 KiB plaintext payload: 16 (framing) + 64 (meta + hash) +
- * 131072 (plaintext) = 131152 bytes (P7-CAS-9). */
+ * dispatch. The largest legitimate record at v2 is either a HOT
+ * EXTENT or a CHUNK carrying a full 128 KiB plaintext payload:
+ *   HOT EXTENT: 16 (framing) + 32 (meta) + 131072 (plaintext) = 131120
+ *   CHUNK:      16 (framing) + 32 (hash) + 131072 (plaintext) = 131120
+ *   COLD EXT:   16 (framing) + 64 (meta + hash, no plaintext) = 80
+ * Max = 131120 bytes (down from P7-CAS-9's 131152 because COLD EXTENT
+ * no longer carries plaintext). */
 #define STM_SEND_RECORD_MAX_LEN  (STM_SEND_RECORD_HDR_LEN +              \
-                                    STM_SEND_COLD_EXTENT_META_LEN +      \
-                                    (128u * 1024u))
+                                    STM_SEND_EXTENT_META_LEN +           \
+                                    STM_SEND_CHUNK_PLAIN_MAX)
 
 /* ========================================================================= */
 /* Send.                                                                      */

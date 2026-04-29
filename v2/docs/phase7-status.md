@@ -56,9 +56,51 @@ into the CAS tier (which DOES need P6) is a separate concern.
 
 ## Phase 7 status (overall)
 
+- [x] **P7-CAS-10 out-of-band chunk store wire shape** —
+      substantive (this commit) + R61 close (next) + hash-fixup
+      (after). Closes the on-wire dedup gap from P7-CAS-9.
+      Wire format break STM_SEND_VERSION 1 → 2: new
+      `STM_SEND_REC_CHUNK = 4` record kind shipping each unique
+      cold-content hash exactly once (32-byte BLAKE3-256 hash +
+      plaintext); COLD EXTENT body shrinks from `64 + len` to a
+      fixed 64 bytes (32-byte meta + 32-byte content_hash, no
+      plaintext follows). The framing-header `STM_SEND_FLAG_COLD`
+      bit is preserved (signals the new body shape). New 3-API
+      sync split:
+      `stm_sync_recv_cold_chunk(s, hash, plain, plain_len)` —
+      BLAKE3-verify + cas_chunk_intern_locked;
+      `stm_sync_recv_cold_extent_ref(s, target_ds, ino, off, len, hash)` —
+      cas_lookup must HIT + cas_ref + stm_extent_write_cold;
+      `stm_sync_recv_cold_chunk_release(s, hash)` — cas_deref
+      under sync->lock, doesn't refuse on wedged/read-only so
+      recv_close can drain. Sender plan precomputed at send_init
+      after the cas_lookup pass: walks captured extents in
+      (ino, off) order, dedupes by content_hash via O(N²) memcmp
+      scan, builds `chunk_plan[]` of source extent indices.
+      Cursor logic in `stm_send_next` dispatches HEADER → CHUNKs
+      → EXTENTs → END. Receiver tracks per-stream `chunks_seen`
+      (dynamic byte array of 32-byte hashes); `apply_chunk` adds
+      to set; `apply_extent` COLD branch enforces membership;
+      `recv_close` drains via release calls. Stream-ordering
+      invariant: every COLD EXTENT's hash MUST be preceded by a
+      CHUNK record in the same stream (sender enforced; receiver
+      enforced via membership check). Lifecycle: every successful
+      CHUNK MUST be balanced at recv_close (else +1 leak). v1
+      streams refused at v2 receivers via STM_EBADVERSION at
+      HEADER apply. Composition: pure callers of
+      `cas_chunk_intern_locked` + `stm_cas_ref` + `stm_cas_deref`
+      + `stm_extent_write_cold` — the new wire-protocol invariants
+      are wire-level, enforced at recv layer; the underlying CAS
+      state machine is unchanged. **No spec extension required.**
+      test_send_recv 23 → 33 (10 new P7-CAS-10 tests + 2
+      P7-CAS-9 hash-mismatch tests retargeted to CHUNK record).
+      35 ctest suites green default + ASan + TSan in isolation.
+      Spec posture unchanged: 21 modules / 25 fixed cfgs / 34
+      buggy cfgs.
+
 - [x] **P7-CAS-9 send/recv with cold extents** — substantive
-      `f398f7f` + R60 close `501d7dd` + hash-fixup (this
-      commit). Wire-format extension: new `STM_SEND_FLAG_COLD`
+      `f398f7f` + R60 close `501d7dd` + hash-fixup
+      `fa90f6f`. Wire-format extension: new `STM_SEND_FLAG_COLD`
       bit on the EXTENT record framing signals the extended
       COLD body shape (32-byte meta + 32-byte BLAKE3-256
       content_hash + plaintext, vs HOT's 32-byte meta +
