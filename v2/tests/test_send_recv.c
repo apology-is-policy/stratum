@@ -1329,9 +1329,21 @@ STM_TEST(p7cas10_recv_refuses_duplicate_chunk_in_stream) {
     /* Second CHUNK with same hash: refused. */
     STM_ASSERT_ERR(stm_recv_apply(rh, rec, total), STM_ECORRUPT);
 
+    /* R61 P3-4: even though recv is now in RECV_FAILED, recv_close
+     * MUST drain chunks_seen so the first CHUNK's intern bump is
+     * released. Otherwise the chunk leaks at refcount=1. After
+     * recv_close + commit, the target's CAS should be empty. */
     free(rec);
     stm_send_close(sh);
     stm_recv_close(rh);
+
+    STM_ASSERT_OK(stm_fs_commit(tgt.fs));
+
+    stm_cas_index *tgt_cas = stm_sync_cas_index(tgt_sync);
+    size_t n_cas = 999;
+    STM_ASSERT_OK(stm_cas_count(tgt_cas, &n_cas));
+    STM_ASSERT_EQ(n_cas, (size_t)0);
+
     testpool_teardown(&src);
     testpool_teardown(&tgt);
 }

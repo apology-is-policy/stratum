@@ -46,6 +46,7 @@
 #include <stratum/repair_log.h>
 #include <stratum/pool.h>
 #include <stratum/scrub.h>
+#include <stratum/send_recv.h>     /* P7-CAS-10: STM_SEND_CHUNK_PLAIN_MAX */
 #include <stratum/snapshot.h>
 #include <stratum/super.h>
 #ifdef STRATUM_BUILD_TESTING_HOOKS
@@ -6012,6 +6013,14 @@ stm_status stm_sync_recv_cold_chunk(stm_sync *s,
 {
     if (!s || !claimed_hash || !plain) return STM_EINVAL;
     if (plain_len == 0u)               return STM_EINVAL;
+    /* R61 P3-1: cap plain_len at the wire-protocol's per-chunk
+     * plaintext maximum. recv-side `apply_chunk` enforces this on the
+     * wire-derived path, but a direct programmatic caller (test or
+     * future feature) could pass an oversized buffer and have
+     * `cas_chunk_intern_locked` fail downstream through the allocator
+     * with a less-targeted error. Defense-in-depth mirroring
+     * `stm_sync_recv_cold_extent`'s `len != plain_len` cross-check. */
+    if (plain_len > (size_t)STM_SEND_CHUNK_PLAIN_MAX) return STM_EINVAL;
 
     pthread_mutex_lock(&s->lock);
     if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }

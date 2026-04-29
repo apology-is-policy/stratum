@@ -324,9 +324,16 @@ static stm_status apply_chunk(stm_recv_handle *h,
     /* Commit to the chunks_seen slot AFTER the intern succeeded. */
     stm_status as = chunks_seen_add(h, claimed_hash);
     if (as != STM_OK) {
-        /* chunks_seen_add can only fail with STM_ENOMEM which we
-         * already pre-checked above — defensive only. Roll back the
-         * intern's ref bump if it does fail. */
+        /* R61 P3-2: this rollback is intentional defense-in-depth.
+         * Today `chunks_seen_add` can only fail with STM_ENOMEM, AND
+         * the pre-grow above synchronizes capacity so the inner
+         * realloc is a no-op; in this configuration the rollback is
+         * dead code. DO NOT REMOVE: if a future refactor folds the
+         * pre-grow into chunks_seen_add itself (single-source the
+         * capacity check) the realloc moves back inside add, and an
+         * OOM there leaves the cas_idx with a +1 intern bump that
+         * MUST be balanced here lest the chunk leak at refcount=1
+         * (auto_gc only reclaims refcount=0). */
         (void)stm_sync_recv_cold_chunk_release(h->sync, claimed_hash);
         return as;
     }
