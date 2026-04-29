@@ -4589,6 +4589,18 @@ static stm_status stm_sync_read_extent_locked(stm_sync *s,
         memcpy(buf, cpbuf, len);
         stm_ct_memzero(cpbuf, rec.len);
         free(cpbuf);
+
+        /* P7-CAS-11: bump the per-COLD-extent read-frequency counter
+         * after every successful decrypt. Best-effort + race-tolerant:
+         * a concurrent overwrite/migrate that removed the record
+         * between lookup and bump returns STM_OK no-op (no record at
+         * (ds, ino, off) anymore). The bump's failure modes are
+         * cosmetic — the policy step downgrades to "less accurate"
+         * decisions, not to corruption. */
+        (void)stm_extent_record_promote_read_hit(
+                s->extent_idx, dataset_id, ino, off,
+                s->current_gen, STM_SYNC_PROMOTE_DECAY_WINDOW_TXGS);
+
         *out_read = len;
         return STM_OK;
     }
@@ -6165,6 +6177,458 @@ stm_status stm_sync_recv_cold_chunk_release(stm_sync *s,
     stm_status ds = stm_cas_deref(s->cas_idx, claimed_hash);
     pthread_mutex_unlock(&s->lock);
     return ds;
+}
+
+/* ===========================================================================
+ * P7-CAS-11: promotion (cold → hot) data plane.
+ *
+ * Models cas.tla::RehydrateOnWrite atomically per-extent; the per-ino
+ * driver loops over COLD extents at (ds, ino) and applies the
+ * transition to each. Compositionally identical to the existing
+ * auto-rehydrate path (stm_sync_write_extent_locked's COLD-overlap
+ * bookend) but without the write trigger — promotion is initiated by
+ * the read-frequency heuristic, not by an overlapping write. No spec
+ * extension required.
+ * =========================================================================== */
+
+/* Promote one COLD extent to HOT in place. Caller holds s->lock and
+ * has passed wedged/RO + cas_idx guards.
+ *
+ * Pipeline:
+ *   1. Decrypt cold chunk plaintext via cas_idx + bdev_read +
+ *      stm_aead_decrypt under stm_ad_cas + pool metadata key.
+ *   2. Reserve fresh HOT paddrs across the pool's redundancy profile.
+ *   3. Resolve dataset's CURRENT DEK + key_id; AEAD-encrypt plaintext
+ *      under (paddrs[0], current_gen) + stm_ad_extent + DEK.
+ *   4. bdev_write the ciphertext+tag to every fresh replica.
+ *   5. Atomic swap via stm_extent_promote_swap_to_hot (drops cold
+ *      record, inserts hot at same coords; returns dropped hash).
+ *   6. stm_cas_deref the dropped hash.
+ *
+ * Rollback on each failure: any reserved paddrs freed via stm_alloc_free.
+ * Step 5+ failures don't trigger rollback (state mutated). On STM_OK
+ * the cold record is gone, hot record is live, CAS refcount decremented.
+ */
+static stm_status promote_one_extent_locked(stm_sync *s,
+                                              const stm_extent_record *C)
+{
+    if (C->kind != STM_EXTENT_KIND_COLD) return STM_EINVAL;
+    if (C->len == 0u || C->len > STM_FS_RECORDSIZE_MAX) return STM_ECORRUPT;
+    if ((C->off % STM_UB_SIZE) != 0u) return STM_EINVAL;
+    if ((C->len % STM_UB_SIZE) != 0u) return STM_EINVAL;
+
+    /* Step 1: read+decrypt cold chunk plaintext. cas_lookup +
+     * bdev_read + AEAD-decrypt mirror stm_sync_read_extent_locked's
+     * COLD branch but bypass the counter bump (we're about to
+     * promote anyway — the bump would be wasted). */
+    stm_cas_record cas_rec;
+    stm_status ls = stm_cas_lookup(s->cas_idx, C->content_hash, &cas_rec);
+    if (ls != STM_OK) return (ls == STM_ENOENT) ? STM_ECORRUPT : ls;
+    if (cas_rec.length != C->len) return STM_ECORRUPT;
+    if (cas_rec.n_replicas < 1
+        || cas_rec.n_replicas > STM_CAS_MAX_REPLICAS) return STM_ECORRUPT;
+
+    stm_aead_mode cmode = STM_AEAD_AEGIS256;
+    size_t ctag_len = stm_aead_tag_len(cmode);
+    if (ctag_len == 0u) return STM_EINVAL;
+    size_t cold_total = C->len + ctag_len;
+
+    void *cold_cbuf = malloc(cold_total);
+    if (!cold_cbuf) return STM_ENOMEM;
+    void *plain = malloc(C->len);
+    if (!plain) { free(cold_cbuf); return STM_ENOMEM; }
+
+    {
+        stm_ad_cas cad;
+        memset(&cad, 0, sizeof cad);
+        cad.magic        = STM_AD_MAGIC_CAS;
+        cad.version      = STM_AD_VERSION_CAS;
+        cad.pool_uuid[0] = s->pool_uuid[0];
+        cad.pool_uuid[1] = s->pool_uuid[1];
+        memcpy(cad.content_hash, C->content_hash, STM_CAS_HASH_LEN);
+        uint8_t cad_packed[STM_AD_CAS_PACKED_LEN];
+        stm_ad_cas_pack(&cad, cad_packed);
+
+        uint8_t cnonce[STM_AEAD_NONCE_LEN];
+        {
+            le64 p_le  = stm_store_le64(cas_rec.paddrs[0]);
+            le64 g_le  = stm_store_le64(cas_rec.gen);
+            le64 u0_le = stm_store_le64(s->pool_uuid[0]);
+            le64 u1_le = stm_store_le64(s->pool_uuid[1]);
+            memcpy(cnonce +  0, p_le.v,  8);
+            memcpy(cnonce +  8, g_le.v,  8);
+            memcpy(cnonce + 16, u0_le.v, 8);
+            memcpy(cnonce + 24, u1_le.v, 8);
+        }
+
+        stm_status last_err = STM_EBADTAG;
+        bool decrypted = false;
+        for (uint8_t i = 0; i < cas_rec.n_replicas && !decrypted; i++) {
+            uint16_t dev = stm_paddr_device(cas_rec.paddrs[i]);
+            stm_bdev *bd = stm_pool_device_bdev(s->pool, dev);
+            if (!bd) { last_err = STM_EINVAL; continue; }
+            uint64_t byte_off = stm_paddr_offset(cas_rec.paddrs[i])
+                                  * (uint64_t)STM_UB_SIZE;
+            stm_status rs = stm_bdev_read(bd, byte_off, cold_cbuf, cold_total);
+            if (rs != STM_OK) { last_err = rs; continue; }
+            size_t pt_out = 0;
+            stm_status ds = stm_aead_decrypt(cmode, s->metadata_key,
+                                                cnonce,
+                                                cad_packed, STM_AD_CAS_PACKED_LEN,
+                                                cold_cbuf, cold_total,
+                                                plain, &pt_out);
+            if (ds == STM_OK && pt_out == C->len) {
+                decrypted = true;
+                break;
+            }
+            last_err = (ds == STM_OK) ? STM_ECORRUPT : ds;
+        }
+        free(cold_cbuf);
+        if (!decrypted) {
+            stm_ct_memzero(plain, C->len);
+            free(plain);
+            return last_err;
+        }
+    }
+
+    /* Step 2: reserve fresh HOT paddrs. */
+    size_t n_replicas = sync_desired_replica_count_locked(s);
+    if (n_replicas < 1) {
+        stm_ct_memzero(plain, C->len);
+        free(plain);
+        return STM_EINVAL;
+    }
+    stm_aead_mode mode = STM_AEAD_AEGIS256;
+    size_t tag_len = stm_aead_tag_len(mode);
+    if (tag_len == 0u) {
+        stm_ct_memzero(plain, C->len);
+        free(plain);
+        return STM_EINVAL;
+    }
+    size_t hot_total = C->len + tag_len;
+    uint64_t nblocks = (hot_total + STM_UB_SIZE - 1u) / STM_UB_SIZE;
+
+    uint64_t replicas[STM_EXTENT_MAX_REPLICAS] = {0};
+    size_t   reserved = 0;
+    for (size_t i = 0; i < n_replicas; i++) {
+        if (i >= STM_POOL_DEVICES_MAX || s->allocs[i] == NULL) {
+            for (size_t j = 0; j < reserved; j++)
+                (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
+            stm_ct_memzero(plain, C->len);
+            free(plain);
+            return STM_EINVAL;
+        }
+        stm_status as = stm_alloc_reserve(s->allocs[i], nblocks, 0, &replicas[i]);
+        if (as != STM_OK) {
+            for (size_t j = 0; j < reserved; j++)
+                (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
+            stm_ct_memzero(plain, C->len);
+            free(plain);
+            return as;
+        }
+        reserved++;
+    }
+
+    /* Step 3: resolve dataset CURRENT DEK + AEAD-encrypt under it.
+     * The HOT extent's identity (origin_*) is the LIVE position,
+     * not the cold record's origin — promotion creates a new HOT
+     * record whose ciphertext was just freshly encrypted. */
+    uint64_t enc_key_id = 0u;
+    uint8_t  dek[32];
+    {
+        stm_status rks = sync_resolve_current_dek_locked(s, C->dataset_id,
+                                                            &enc_key_id, dek);
+        if (rks != STM_OK) {
+            for (size_t j = 0; j < reserved; j++)
+                (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
+            stm_ct_memzero(plain, C->len);
+            free(plain);
+            return rks;
+        }
+    }
+
+    void *hot_cbuf = malloc(hot_total);
+    if (!hot_cbuf) {
+        for (size_t j = 0; j < reserved; j++)
+            (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
+        stm_ct_memzero(dek, sizeof dek);
+        stm_ct_memzero(plain, C->len);
+        free(plain);
+        return STM_ENOMEM;
+    }
+
+    stm_ad_extent ad;
+    memset(&ad, 0, sizeof ad);
+    ad.magic        = STM_AD_MAGIC_EXTENT;
+    ad.version      = STM_AD_VERSION_EXTENT;
+    ad.pool_uuid[0] = s->pool_uuid[0];
+    ad.pool_uuid[1] = s->pool_uuid[1];
+    ad.dataset_id   = C->dataset_id;
+    ad.ino          = C->ino;
+    ad.offset       = C->off;
+    ad.content_kind = 0;
+
+    size_t out_len = 0;
+    stm_status es = stm_extent_encrypt(mode, dek,
+                                          replicas[0], s->current_gen,
+                                          &ad, plain, C->len,
+                                          hot_cbuf, hot_total, &out_len);
+    stm_ct_memzero(plain, C->len);
+    free(plain);
+    stm_ct_memzero(dek, sizeof dek);
+    if (es != STM_OK) {
+        free(hot_cbuf);
+        for (size_t j = 0; j < reserved; j++)
+            (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
+        return es;
+    }
+
+    /* Step 4: bdev_write to every replica. */
+    for (size_t i = 0; i < n_replicas; i++) {
+        uint16_t dev = stm_paddr_device(replicas[i]);
+        uint64_t byte_off = stm_paddr_offset(replicas[i]) * (uint64_t)STM_UB_SIZE;
+        stm_bdev *bd = stm_pool_device_bdev(s->pool, dev);
+        if (!bd) {
+            free(hot_cbuf);
+            for (size_t j = 0; j < reserved; j++)
+                (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
+            return STM_EINVAL;
+        }
+        stm_status ws = stm_bdev_write(bd, byte_off, hot_cbuf, hot_total);
+        if (ws != STM_OK) {
+            free(hot_cbuf);
+            for (size_t j = 0; j < reserved; j++)
+                (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
+            return ws;
+        }
+    }
+    free(hot_cbuf);
+
+    /* Step 5: atomic cold→hot swap. The new HOT record has fresh
+     * origin = (live ds, ino, off) since the AEAD bytes were just
+     * computed under that identity. link_gen = current_gen so
+     * incremental send sees the post-promote record as a fresh
+     * modification within the (S_from, S_to] window. */
+    uint8_t dropped_hash[STM_EXTENT_HASH_LEN];
+    stm_status ms = stm_extent_promote_swap_to_hot(
+            s->extent_idx,
+            C->dataset_id, C->ino,
+            C->off, C->len,
+            replicas, (uint8_t)n_replicas,
+            /*gen=*/s->current_gen,
+            /*key_id=*/enc_key_id,
+            /*origin_*=*/C->dataset_id, C->ino, C->off,
+            /*link_gen=*/s->current_gen,
+            dropped_hash);
+    if (ms != STM_OK) {
+        for (size_t j = 0; j < reserved; j++)
+            (void)stm_alloc_free(s->allocs[j], replicas[j], s->current_gen);
+        return ms;
+    }
+
+    /* Step 6: deref the dropped hash. Failure here is best-effort
+     * (cas_idx in unexpected state); the new HOT record stays live
+     * either way. STM_ENOENT means the entry was concurrently
+     * reclaimed (harmless); other errors propagate to the caller
+     * for diagnostics. */
+    (void)stm_cas_deref(s->cas_idx, dropped_hash);
+    return STM_OK;
+}
+
+/* Iterator context for promote candidate-collection. Mirrors
+ * migrate_collect_ctx but COLD-only. */
+typedef struct {
+    uint64_t                ds;
+    uint64_t                ino;
+    stm_extent_record      *records;
+    size_t                  n;
+    size_t                  cap;
+    stm_status              err;
+} promote_collect_ctx;
+
+static bool promote_collect_cb(const stm_extent_record *e, void *cx) {
+    promote_collect_ctx *ctx = cx;
+    if (e->dataset_id != ctx->ds || e->ino != ctx->ino) return true;
+    if (e->kind != STM_EXTENT_KIND_COLD) return true;       /* skip hot */
+    if (ctx->n == ctx->cap) {
+        size_t new_cap = ctx->cap == 0 ? 8u : ctx->cap * 2u;
+        stm_extent_record *grown = realloc(ctx->records,
+                                              new_cap * sizeof(stm_extent_record));
+        if (!grown) { ctx->err = STM_ENOMEM; return false; }
+        ctx->records = grown;
+        ctx->cap     = new_cap;
+    }
+    ctx->records[ctx->n++] = *e;
+    return true;
+}
+
+stm_status stm_sync_promote_to_hot(stm_sync *s,
+                                      uint64_t dataset_id,
+                                      uint64_t ino)
+{
+    if (!s) return STM_EINVAL;
+    if (dataset_id == 0 || ino == 0) return STM_EINVAL;
+
+    pthread_mutex_lock(&s->lock);
+    if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
+    if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
+    if (!s->cas_idx)  { pthread_mutex_unlock(&s->lock); return STM_EINVAL;  }
+
+    promote_collect_ctx cx = { .ds = dataset_id, .ino = ino,
+                                  .records = NULL, .n = 0, .cap = 0,
+                                  .err = STM_OK };
+    stm_status its = stm_extent_iter_ds(s->extent_idx, dataset_id,
+                                           promote_collect_cb, &cx);
+    if (its != STM_OK || cx.err != STM_OK) {
+        free(cx.records);
+        pthread_mutex_unlock(&s->lock);
+        return (its != STM_OK) ? its : cx.err;
+    }
+    if (cx.n == 0) {
+        pthread_mutex_unlock(&s->lock);
+        return STM_ENOENT;
+    }
+
+    stm_status promote_err = STM_OK;
+    for (size_t i = 0; i < cx.n; i++) {
+        stm_status pe = promote_one_extent_locked(s, &cx.records[i]);
+        if (pe != STM_OK && promote_err == STM_OK) promote_err = pe;
+    }
+
+    free(cx.records);
+    pthread_mutex_unlock(&s->lock);
+    return promote_err;
+}
+
+/* Per-ino aggregator state for the promote-policy collect pass.
+ * Mirrors migrate_policy_collect_ctx but tracks COLD-extent stats
+ * (max read_count, newest last_read_gen, total cold bytes). */
+typedef struct {
+    /* Aggregator state for the in-progress ino. */
+    uint64_t cur_ino;
+    bool     has_cold;            /* at least one COLD extent for cur_ino */
+    uint32_t max_read_count;
+    uint64_t newest_read_gen;
+    uint64_t total_cold_bytes;
+    /* Filter parameters. */
+    uint32_t min_read_count;
+    uint64_t cutoff_recency_gen;
+    /* Output. */
+    stm_sync_promote_candidate *cands;
+    size_t                       n_cands;
+    size_t                       cap_cands;
+    /* Counter. */
+    uint64_t inos_visited;
+    /* Sticky error. */
+    stm_status err;
+} promote_policy_collect_ctx;
+
+/* Finalize the in-progress ino: if it satisfies the thresholds, emit
+ * a candidate. Reset aggregator for the next ino. */
+static stm_status pp_finalize_cur(promote_policy_collect_ctx *cx)
+{
+    if (cx->cur_ino == 0u) return STM_OK;       /* sentinel; nothing in flight */
+    cx->inos_visited++;
+    if (!cx->has_cold) return STM_OK;
+    if (cx->max_read_count < cx->min_read_count) return STM_OK;
+    if (cx->newest_read_gen < cx->cutoff_recency_gen) return STM_OK;
+
+    if (cx->n_cands == cx->cap_cands) {
+        size_t new_cap = cx->cap_cands == 0 ? 8u : cx->cap_cands * 2u;
+        stm_sync_promote_candidate *grown =
+            realloc(cx->cands, new_cap * sizeof(*cx->cands));
+        if (!grown) return STM_ENOMEM;
+        cx->cands = grown;
+        cx->cap_cands = new_cap;
+    }
+    cx->cands[cx->n_cands++] = (stm_sync_promote_candidate){
+        .ino             = cx->cur_ino,
+        .bytes           = cx->total_cold_bytes,
+        .max_read_count  = cx->max_read_count,
+        .newest_read_gen = cx->newest_read_gen,
+    };
+    return STM_OK;
+}
+
+static bool promote_policy_collect_cb(const stm_extent_record *e, void *cx_)
+{
+    promote_policy_collect_ctx *cx = cx_;
+
+    /* New ino: finalize prior, reset state. */
+    if (e->ino != cx->cur_ino) {
+        stm_status fs = pp_finalize_cur(cx);
+        if (fs != STM_OK) { cx->err = fs; return false; }
+        cx->cur_ino          = e->ino;
+        cx->has_cold         = false;
+        cx->max_read_count   = 0u;
+        cx->newest_read_gen  = 0u;
+        cx->total_cold_bytes = 0u;
+    }
+
+    if (e->kind == STM_EXTENT_KIND_COLD) {
+        cx->has_cold = true;
+        if (e->read_count > cx->max_read_count) cx->max_read_count = e->read_count;
+        if (e->last_read_gen > cx->newest_read_gen) cx->newest_read_gen = e->last_read_gen;
+        cx->total_cold_bytes += e->len;
+    }
+    return true;
+}
+
+stm_status stm_sync_promote_policy_collect(stm_sync *s,
+                                              uint64_t dataset_id,
+                                              uint32_t min_read_count,
+                                              uint64_t cutoff_recency_gen,
+                                              stm_sync_promote_candidate **out_cands,
+                                              size_t *out_n_cands,
+                                              uint64_t *out_inos_visited)
+{
+    /* Uniform out-param contract: zero-init BEFORE arg validation. */
+    if (out_cands)        *out_cands        = NULL;
+    if (out_n_cands)      *out_n_cands      = 0u;
+    if (out_inos_visited) *out_inos_visited = 0u;
+
+    if (!s) return STM_EINVAL;
+    if (dataset_id == 0u) return STM_EINVAL;
+    if (!out_cands || !out_n_cands || !out_inos_visited) return STM_EINVAL;
+
+    pthread_mutex_lock(&s->lock);
+    if (s->wedged) { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
+
+    promote_policy_collect_ctx cx = {
+        .cur_ino             = 0u,
+        .has_cold            = false,
+        .max_read_count      = 0u,
+        .newest_read_gen     = 0u,
+        .total_cold_bytes    = 0u,
+        .min_read_count      = min_read_count,
+        .cutoff_recency_gen  = cutoff_recency_gen,
+        .cands               = NULL,
+        .n_cands             = 0u,
+        .cap_cands           = 0u,
+        .inos_visited        = 0u,
+        .err                 = STM_OK,
+    };
+
+    stm_status its = stm_extent_iter_ds(s->extent_idx, dataset_id,
+                                           promote_policy_collect_cb, &cx);
+    if (its == STM_OK && cx.err == STM_OK) {
+        /* Final flush. */
+        stm_status fs = pp_finalize_cur(&cx);
+        if (fs != STM_OK) cx.err = fs;
+    }
+
+    if (its != STM_OK || cx.err != STM_OK) {
+        free(cx.cands);
+        pthread_mutex_unlock(&s->lock);
+        return (its != STM_OK) ? its : cx.err;
+    }
+
+    *out_cands        = cx.cands;
+    *out_n_cands      = cx.n_cands;
+    *out_inos_visited = cx.inos_visited;
+
+    pthread_mutex_unlock(&s->lock);
+    return STM_OK;
 }
 
 /* P7-CAS-7: per-ino aggregator state for the migration-policy

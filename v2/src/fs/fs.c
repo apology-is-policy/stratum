@@ -796,6 +796,204 @@ stm_status stm_fs_migrate_policy_pass_all(
 }
 
 /* ========================================================================= */
+/* Promotion (cold → hot) heuristic — P7-CAS-11.                              */
+/* ========================================================================= */
+
+/* P7-CAS-11: stm_fs_promote_to_hot — wraps stm_sync_promote_to_hot
+ * with the FS-layer guards (wedged/RO via FS_GUARD_WRITE) + the
+ * standard fs->lock posture. The sync-layer primitive does its own
+ * guards too; the FS-layer wrapper exists to (a) keep the public
+ * surface symmetric with stm_fs_migrate_to_cold and (b) take fs->lock
+ * so concurrent admin calls (mount/unmount path, etc.) serialize. */
+stm_status stm_fs_promote_to_hot(stm_fs *fs,
+                                    uint64_t dataset_id,
+                                    uint64_t ino)
+{
+    if (!fs)                  return STM_EINVAL;
+    if (dataset_id == 0u)     return STM_EINVAL;
+    if (ino == 0u)            return STM_EINVAL;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+    stm_status rc = stm_sync_promote_to_hot(fs->sync, dataset_id, ino);
+    pthread_mutex_unlock(&fs->lock);
+    return rc;
+}
+
+/* P7-CAS-11: stm_fs_promote_policy_step. v1 promote-policy primitive.
+ * Composes over stm_sync_promote_policy_collect (candidate selection)
+ * + stm_fs_promote_to_hot (per-ino data plane). Pass shape mirrors
+ * stm_fs_migrate_policy_step's INTERRUPTIBLE pattern: drops fs->lock
+ * between candidate collection and per-ino promote. */
+stm_status stm_fs_promote_policy_step(stm_fs *fs,
+                                         uint64_t dataset_id,
+                                         const stm_fs_promote_policy_params *params,
+                                         stm_fs_promote_policy_stats *out_stats)
+{
+    /* Uniform out-param contract (R57 P3-5 et al.). */
+    if (out_stats) *out_stats = (stm_fs_promote_policy_stats){0};
+    if (!fs || !params)              return STM_EINVAL;
+    if (dataset_id == 0u)            return STM_EINVAL;
+    if (params->_reserved0 != 0u)    return STM_EINVAL;
+    if (params->_reserved1 != 0u)    return STM_EINVAL;
+
+    stm_fs_promote_policy_stats local_stats = {0};
+    stm_fs_promote_policy_stats *stats = out_stats ? out_stats : &local_stats;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+
+    uint64_t cur_gen = stm_sync_current_gen(fs->sync);
+    /* Saturating subtraction for the recency cutoff. */
+    uint64_t cutoff = (params->min_recency_txgs >= cur_gen)
+                        ? 0u
+                        : (cur_gen - params->min_recency_txgs);
+    /* min_recency_txgs == 0 → "no recency filter" → cutoff = 0. */
+
+    stm_sync_promote_candidate *cands = NULL;
+    size_t   n_cands       = 0u;
+    uint64_t inos_visited  = 0u;
+    stm_status cs = stm_sync_promote_policy_collect(fs->sync, dataset_id,
+                                                       params->min_read_count,
+                                                       cutoff,
+                                                       &cands, &n_cands,
+                                                       &inos_visited);
+    pthread_mutex_unlock(&fs->lock);
+    if (cs != STM_OK) return cs;
+
+    stats->inos_visited  = inos_visited;
+    stats->inos_eligible = (uint64_t)n_cands;
+
+    /* Per-ino promote loop. Each call re-takes fs->lock fresh — the
+     * pass is INTERRUPTIBLE. */
+    for (size_t i = 0; i < n_cands; i++) {
+        if (params->max_inos != 0u
+            && stats->inos_promoted >= (uint64_t)params->max_inos) break;
+        if (params->max_bytes != 0u
+            && stats->bytes_promoted >= params->max_bytes) break;
+
+        uint64_t ino   = cands[i].ino;
+        uint64_t bytes = cands[i].bytes;
+        stm_status one = stm_fs_promote_to_hot(fs, dataset_id, ino);
+        if (one == STM_OK) {
+            stats->inos_promoted++;
+            stats->bytes_promoted += bytes;
+            continue;
+        }
+        /* Hard errors abort the pass; stamp last_err_ino. */
+        if (one == STM_EWEDGED || one == STM_EROFS || one == STM_ENOMEM) {
+            stats->last_err     = one;
+            stats->last_err_ino = ino;
+            free(cands);
+            return one;
+        }
+        /* Soft error: record first, continue.
+         *   - STM_ENOENT: the ino had no COLD extents at promote time
+         *     (concurrent migrate / overwrite reclassified or removed).
+         *     Benign — just count it as a failed candidate.
+         *   - STM_EBADTAG / STM_EIO / STM_ECORRUPT / STM_ENOSPC: real
+         *     per-ino issues that shouldn't stall the whole tier. */
+        if (stats->last_err == STM_OK) {
+            stats->last_err     = one;
+            stats->last_err_ino = ino;
+        }
+    }
+
+    free(cands);
+    return STM_OK;
+}
+
+stm_status stm_fs_promote_policy_pass_all(
+        stm_fs *fs,
+        const stm_fs_promote_policy_params *params,
+        stm_fs_promote_policy_pass_all_stats *out_stats)
+{
+    if (out_stats) *out_stats = (stm_fs_promote_policy_pass_all_stats){0};
+    if (!fs || !params)              return STM_EINVAL;
+    if (params->_reserved0 != 0u)    return STM_EINVAL;
+    if (params->_reserved1 != 0u)    return STM_EINVAL;
+
+    stm_fs_promote_policy_pass_all_stats local_stats = {0};
+    stm_fs_promote_policy_pass_all_stats *stats = out_stats ? out_stats : &local_stats;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+
+    stm_dataset_index *idx = stm_sync_dataset_index(fs->sync);
+    pass_all_id_collect_ctx ctx = { .err = STM_OK };
+    stm_status its = stm_dataset_iter(idx, pass_all_id_collect_cb, &ctx);
+    if (its != STM_OK || ctx.err != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        free(ctx.ids);
+        return (ctx.err != STM_OK) ? ctx.err : its;
+    }
+
+    size_t enabled_n = 0;
+    stm_status filter_err = STM_OK;
+    for (size_t i = 0; i < ctx.n; i++) {
+        uint64_t v = 0;
+        stm_status pe = stm_dataset_effective_property(
+                idx, ctx.ids[i], STM_PROP_TIERING, &v);
+        if (pe != STM_OK) {
+            if (filter_err == STM_OK) filter_err = pe;
+            continue;
+        }
+        if (v != 0u) {
+            ctx.ids[enabled_n++] = ctx.ids[i];
+        }
+    }
+    pthread_mutex_unlock(&fs->lock);
+
+    stats->datasets_visited  = (uint64_t)ctx.n;
+    stats->datasets_eligible = (uint64_t)enabled_n;
+    if (filter_err != STM_OK) stats->last_err = filter_err;
+
+    /* Per-dataset promote with SHARED budget. */
+    for (size_t i = 0; i < enabled_n; i++) {
+        if (params->max_inos != 0u
+            && stats->inos_promoted >= (uint64_t)params->max_inos) break;
+        if (params->max_bytes != 0u
+            && stats->bytes_promoted >= params->max_bytes) break;
+
+        stm_fs_promote_policy_params adj = *params;
+        if (adj.max_inos != 0u) {
+            adj.max_inos =
+                    (uint32_t)((uint64_t)params->max_inos - stats->inos_promoted);
+        }
+        if (adj.max_bytes != 0u) {
+            adj.max_bytes = params->max_bytes - stats->bytes_promoted;
+        }
+
+        uint64_t ds = ctx.ids[i];
+        stm_fs_promote_policy_stats per_stats = {0};
+        stm_status rc = stm_fs_promote_policy_step(fs, ds, &adj, &per_stats);
+
+        stats->datasets_promoted++;
+        stats->inos_visited   += per_stats.inos_visited;
+        stats->inos_eligible  += per_stats.inos_eligible;
+        stats->inos_promoted  += per_stats.inos_promoted;
+        stats->bytes_promoted += per_stats.bytes_promoted;
+        if (per_stats.last_err != STM_OK && stats->last_err == STM_OK) {
+            stats->last_err            = per_stats.last_err;
+            stats->last_err_dataset_id = ds;
+            stats->last_err_ino        = per_stats.last_err_ino;
+        }
+
+        if (rc == STM_EWEDGED || rc == STM_EROFS || rc == STM_ENOMEM) {
+            /* R59 P2-1 pattern: unconditional override on hard. */
+            stats->last_err            = rc;
+            stats->last_err_dataset_id = ds;
+            stats->last_err_ino        = per_stats.last_err_ino;
+            free(ctx.ids);
+            return rc;
+        }
+    }
+
+    free(ctx.ids);
+    return STM_OK;
+}
+
+/* ========================================================================= */
 /* Dataset creation (P7-13).                                                  */
 /* ========================================================================= */
 

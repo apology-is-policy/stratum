@@ -5472,4 +5472,445 @@ STM_TEST(fs_p7cas7_policy_step_min_age_saturates_to_zero_when_huge) {
     unlink(g_key_path);
 }
 
+/* ========================================================================= */
+/* P7-CAS-11 — promotion (cold → hot) heuristic.                              */
+/* ========================================================================= */
+
+STM_TEST(fs_p7cas11_cold_read_increments_counter) {
+    /* Write a HOT file, migrate to cold, read it N times. Each read
+     * should bump the COLD record's read_count. Observe via direct
+     * extent_lookup_at after mounting. */
+    make_tmp("p7cas11_counter");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)((i * 7u) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    /* Read 5 times. */
+    uint8_t buf[4096];
+    size_t got = 0;
+    for (int i = 0; i < 5; i++) {
+        memset(buf, 0, sizeof buf);
+        STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, buf, sizeof buf, &got));
+        STM_ASSERT_EQ(got, sizeof plain);
+    }
+
+    /* Observe counter via direct extent index lookup. */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record rec;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &rec));
+    STM_ASSERT_EQ((int)rec.kind, (int)STM_EXTENT_KIND_COLD);
+    STM_ASSERT_EQ((unsigned)rec.read_count, 5u);
+    STM_ASSERT_TRUE(rec.last_read_gen > 0u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas11_promote_to_hot_basic) {
+    /* Write + migrate + read enough → promote_policy_step with
+     * threshold met → ino promoted back to HOT. Verify (1) extent
+     * is now HOT, (2) CAS index is empty post-commit (auto_gc
+     * reclaimed the dereffed chunk), (3) content reads back identical. */
+    make_tmp("p7cas11_basic");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)((i * 19u) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    /* Read 4 times. */
+    uint8_t buf[4096];
+    size_t got = 0;
+    for (int i = 0; i < 4; i++) {
+        memset(buf, 0, sizeof buf);
+        STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, buf, sizeof buf, &got));
+    }
+
+    /* Promote with threshold 3 (4 reads ≥ 3 → eligible). */
+    stm_fs_promote_policy_params params = {
+        .min_read_count   = 3u,
+        .min_recency_txgs = 0u,                  /* no recency filter */
+        .max_inos         = 0u,
+        .max_bytes        = 0u,
+    };
+    stm_fs_promote_policy_stats stats = {0};
+    STM_ASSERT_OK(stm_fs_promote_policy_step(fs, 1, &params, &stats));
+    STM_ASSERT_EQ(stats.inos_visited,   1u);
+    STM_ASSERT_EQ(stats.inos_eligible,  1u);
+    STM_ASSERT_EQ(stats.inos_promoted,  1u);
+    STM_ASSERT_EQ(stats.bytes_promoted, (uint64_t)sizeof plain);
+
+    /* Extent is now HOT. */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record rec;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &rec));
+    STM_ASSERT_EQ((int)rec.kind, (int)STM_EXTENT_KIND_HOT);
+    STM_ASSERT_EQ((unsigned)rec.read_count, 0u);
+    STM_ASSERT_EQ(rec.last_read_gen, (uint64_t)0u);
+
+    /* Drive a commit so auto_gc reclaims the dereffed chunk. */
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    size_t n = 999;
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    /* Content reads back unchanged. */
+    memset(buf, 0, sizeof buf);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, buf, sizeof buf, &got));
+    STM_ASSERT_EQ(got, sizeof plain);
+    STM_ASSERT_MEM_EQ(plain, buf, sizeof plain);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas11_promote_min_read_count_blocks) {
+    /* Read fewer times than threshold → not eligible. */
+    make_tmp("p7cas11_count_block");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[4096];
+    memset(plain, 0xC1, sizeof plain);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    uint8_t buf[4096];
+    size_t got = 0;
+    /* Two reads only. */
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, buf, sizeof buf, &got));
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, buf, sizeof buf, &got));
+
+    stm_fs_promote_policy_params params = { .min_read_count = 5u };
+    stm_fs_promote_policy_stats stats = {0};
+    STM_ASSERT_OK(stm_fs_promote_policy_step(fs, 1, &params, &stats));
+    STM_ASSERT_EQ(stats.inos_visited,  1u);
+    STM_ASSERT_EQ(stats.inos_eligible, 0u);
+    STM_ASSERT_EQ(stats.inos_promoted, 0u);
+
+    /* Extent still COLD. */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record rec;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &rec));
+    STM_ASSERT_EQ((int)rec.kind, (int)STM_EXTENT_KIND_COLD);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas11_promote_to_hot_persists_across_mount) {
+    /* After promote + unmount + remount, the new HOT extent's
+     * content reads back unchanged. Validates the v21 encode/decode
+     * roundtrip (read_count + last_read_gen on COLD records, zero
+     * on HOT records' anti-tamper bytes). */
+    make_tmp("p7cas11_persist");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)((i * 11u + 5u) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    uint8_t buf[4096];
+    size_t got = 0;
+    for (int i = 0; i < 6; i++) {
+        STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, buf, sizeof buf, &got));
+    }
+    stm_fs_promote_policy_params params = { .min_read_count = 3u };
+    stm_fs_promote_policy_stats stats = {0};
+    STM_ASSERT_OK(stm_fs_promote_policy_step(fs, 1, &params, &stats));
+    STM_ASSERT_EQ(stats.inos_promoted, 1u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    /* Remount + verify. */
+    stm_fs *fs2 = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs2));
+    memset(buf, 0, sizeof buf);
+    STM_ASSERT_OK(stm_fs_read(fs2, 1, 1, 0, buf, sizeof buf, &got));
+    STM_ASSERT_EQ(got, sizeof plain);
+    STM_ASSERT_MEM_EQ(plain, buf, sizeof plain);
+
+    /* Extent record's HOT-side counters are 0 (anti-tamper survived
+     * decode). */
+    stm_sync *sync = stm_fs_sync_for_test(fs2);
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record rec;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &rec));
+    STM_ASSERT_EQ((int)rec.kind, (int)STM_EXTENT_KIND_HOT);
+    STM_ASSERT_EQ((unsigned)rec.read_count, 0u);
+    STM_ASSERT_EQ(rec.last_read_gen, (uint64_t)0u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs2));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas11_promote_to_hot_no_cold_returns_enoent) {
+    /* Ino with no COLD extents → stm_fs_promote_to_hot returns
+     * STM_ENOENT (mirrors migrate's empty-set behavior). */
+    make_tmp("p7cas11_no_cold");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[4096];
+    memset(plain, 0xAB, sizeof plain);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    /* Skip migrate — leave HOT. */
+    STM_ASSERT_ERR(stm_fs_promote_to_hot(fs, 1, 1), STM_ENOENT);
+
+    /* Empty ino. */
+    STM_ASSERT_ERR(stm_fs_promote_to_hot(fs, 1, 99), STM_ENOENT);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas11_promote_max_inos_budget_caps) {
+    /* Three eligible inos, max_inos = 2 → only 2 promoted. */
+    make_tmp("p7cas11_budget_inos");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t plain[4096];
+    memset(plain, 0x77, sizeof plain);
+    /* Three unique inos with unique content (so each gets its own
+     * CAS chunk; otherwise dedup gives a single chunk + multi-ref). */
+    uint8_t plain1[4096], plain2[4096], plain3[4096];
+    for (size_t i = 0; i < sizeof plain1; i++) {
+        plain1[i] = (uint8_t)((i + 1u) & 0xFFu);
+        plain2[i] = (uint8_t)((i + 2u) & 0xFFu);
+        plain3[i] = (uint8_t)((i + 3u) & 0xFFu);
+    }
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain1, sizeof plain1));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 2, 0, plain2, sizeof plain2));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 3, 0, plain3, sizeof plain3));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 2));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 3));
+
+    uint8_t buf[4096];
+    size_t got = 0;
+    /* 3 reads each = above any sane threshold. */
+    for (uint64_t ino = 1; ino <= 3; ino++) {
+        for (int r = 0; r < 3; r++)
+            STM_ASSERT_OK(stm_fs_read(fs, 1, ino, 0, buf, sizeof buf, &got));
+    }
+
+    stm_fs_promote_policy_params params = {
+        .min_read_count = 1u,
+        .max_inos       = 2u,
+    };
+    stm_fs_promote_policy_stats stats = {0};
+    STM_ASSERT_OK(stm_fs_promote_policy_step(fs, 1, &params, &stats));
+    STM_ASSERT_EQ(stats.inos_eligible, 3u);
+    STM_ASSERT_EQ(stats.inos_promoted, 2u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas11_promote_pass_all_filtered_by_tiering) {
+    /* Two datasets: ds 1 (root, default tiering) + ds 2 (TIERING=0).
+     * Pass-all should promote ino in ds 1 only. */
+    make_tmp("p7cas11_pass_all");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t ds2 = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, /*parent=*/1, "child", &ds2));
+
+    /* Set TIERING=1 on root (default may already be), TIERING=0 on
+     * child to opt it out. */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_dataset_index *idx = stm_sync_dataset_index(sync);
+    STM_ASSERT_OK(stm_dataset_set_property(idx, 1,    STM_PROP_TIERING, 1u));
+    STM_ASSERT_OK(stm_dataset_set_property(idx, ds2, STM_PROP_TIERING, 0u));
+
+    uint8_t plain1[4096], plain2[4096];
+    for (size_t i = 0; i < sizeof plain1; i++) {
+        plain1[i] = (uint8_t)((i * 23u) & 0xFFu);
+        plain2[i] = (uint8_t)((i * 29u) & 0xFFu);
+    }
+    STM_ASSERT_OK(stm_fs_write(fs, 1,   1, 0, plain1, sizeof plain1));
+    STM_ASSERT_OK(stm_fs_write(fs, ds2, 1, 0, plain2, sizeof plain2));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1,   1));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, ds2, 1));
+
+    uint8_t buf[4096];
+    size_t got = 0;
+    for (int r = 0; r < 5; r++) {
+        STM_ASSERT_OK(stm_fs_read(fs, 1,   1, 0, buf, sizeof buf, &got));
+        STM_ASSERT_OK(stm_fs_read(fs, ds2, 1, 0, buf, sizeof buf, &got));
+    }
+
+    stm_fs_promote_policy_params params = { .min_read_count = 3u };
+    stm_fs_promote_policy_pass_all_stats stats = {0};
+    STM_ASSERT_OK(stm_fs_promote_policy_pass_all(fs, &params, &stats));
+    STM_ASSERT_EQ(stats.datasets_visited,  2u);     /* root + child */
+    STM_ASSERT_EQ(stats.datasets_eligible, 1u);     /* only root TIERING=1 */
+    STM_ASSERT_EQ(stats.inos_promoted,     1u);     /* root's ino only */
+
+    /* Verify ds 2's ino is still COLD. */
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record rec;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, ds2, 1, 0, &rec));
+    STM_ASSERT_EQ((int)rec.kind, (int)STM_EXTENT_KIND_COLD);
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &rec));
+    STM_ASSERT_EQ((int)rec.kind, (int)STM_EXTENT_KIND_HOT);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas11_promote_arg_validation) {
+    /* NULL args, zero ids, non-zero reserved bytes → STM_EINVAL. */
+    make_tmp("p7cas11_argval");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_fs_promote_policy_params params = {0};
+    stm_fs_promote_policy_stats stats = {0};
+
+    STM_ASSERT_ERR(stm_fs_promote_policy_step(NULL, 1, &params, &stats), STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_promote_policy_step(fs,   1, NULL,    &stats), STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_promote_policy_step(fs,   0, &params, &stats), STM_EINVAL);
+
+    /* Reserved-field rejection (forward-compat). */
+    stm_fs_promote_policy_params bad = {0};
+    bad._reserved0 = 1u;
+    STM_ASSERT_ERR(stm_fs_promote_policy_step(fs, 1, &bad, &stats), STM_EINVAL);
+    bad._reserved0 = 0u;
+    bad._reserved1 = 1u;
+    STM_ASSERT_ERR(stm_fs_promote_policy_step(fs, 1, &bad, &stats), STM_EINVAL);
+
+    STM_ASSERT_ERR(stm_fs_promote_to_hot(NULL, 1, 1), STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_promote_to_hot(fs,   0, 1), STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_promote_to_hot(fs,   1, 0), STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas11_promote_decrements_cas_refcount) {
+    /* Two cold extents share a chunk (refcount=2). Promote one →
+     * refcount=1; the other still references the chunk + reads
+     * correctly. cas_count remains 1. */
+    make_tmp("p7cas11_dedup_promote");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Two inos, identical content → dedup hit on second migrate. */
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)((i * 31u) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 2, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 2));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    size_t n = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)1);                /* one chunk, refcount=2 */
+
+    /* Read ino 1 enough; promote ino 1. */
+    uint8_t buf[4096];
+    size_t got = 0;
+    for (int r = 0; r < 5; r++)
+        STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, buf, sizeof buf, &got));
+
+    STM_ASSERT_OK(stm_fs_promote_to_hot(fs, 1, 1));
+
+    /* CAS chunk still alive (ino 2 still refs it). */
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+
+    /* Both inos read back identical content. */
+    memset(buf, 0, sizeof buf);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, buf, sizeof buf, &got));
+    STM_ASSERT_MEM_EQ(plain, buf, sizeof plain);
+    memset(buf, 0, sizeof buf);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 2, 0, buf, sizeof buf, &got));
+    STM_ASSERT_MEM_EQ(plain, buf, sizeof plain);
+
+    /* ino 1 is HOT; ino 2 is still COLD. */
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record rec;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &rec));
+    STM_ASSERT_EQ((int)rec.kind, (int)STM_EXTENT_KIND_HOT);
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 2, 0, &rec));
+    STM_ASSERT_EQ((int)rec.kind, (int)STM_EXTENT_KIND_COLD);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas11_promote_wedged_refused) {
+    make_tmp("p7cas11_wedged");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    stm_fs_mark_wedged(fs);
+
+    stm_fs_promote_policy_params params = { .min_read_count = 1u };
+    stm_fs_promote_policy_stats stats = {0};
+    STM_ASSERT_ERR(stm_fs_promote_policy_step(fs, 1, &params, &stats), STM_EWEDGED);
+    STM_ASSERT_ERR(stm_fs_promote_to_hot(fs, 1, 1), STM_EWEDGED);
+
+    /* Wedged unmount short-circuits commit but unmount itself completes. */
+    (void)stm_fs_unmount(fs);
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")

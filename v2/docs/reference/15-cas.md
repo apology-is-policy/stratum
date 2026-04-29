@@ -725,18 +725,121 @@ extension.
 
 ## Future work (not in v1)
 
-- Promotion (cold → hot) heuristic — currently auto-rehydrate
-  is the only cold→hot path, triggered by overlapping writes.
-  A "promote-on-frequent-read" policy would extend the heuristic
-  with a per-extent read counter.
 - Learned policy v2 — replace the age threshold with an
   ML-derived eligibility predicate (per NOVEL.md §3.3 Phase II
-  scope deferral).
-- `bytes_migrated` exact accounting via post-migrate count
-  observation (instead of snapshot-from-collect).
+  scope deferral). Applies symmetrically to migration AND
+  promotion.
+- `bytes_migrated` / `bytes_promoted` exact accounting via
+  post-migrate / post-promote count observation (instead of
+  snapshot-from-collect).
 - Cron-style scheduler — currently the operator drives the pass
   cadence. A daemon that fires the pass periodically on a
   configurable schedule would close the production gap.
+
+## Promotion (cold → hot) heuristic (P7-CAS-11)
+
+P7-CAS-11 lands the inverse of P7-CAS-2 / P7-CAS-7's migration
+pipeline: a periodic pass that PROMOTES frequently-read COLD
+extents back to HOT. Format break STM_UB_VERSION 20 → 21:
+extent record value layout grows 96 → 108 bytes with a new
+`read_count` (le32 at offset 96..100) + `last_read_gen` (le64
+at offset 100..108) tail. HOT extents always have both fields
+== 0 with on-disk decoder anti-tamper enforcement; COLD extents
+carry the windowed-count state.
+
+Counter lifecycle (windowed-count, NOT cumulative):
+
+- Increment via `stm_extent_record_promote_read_hit(idx, ds,
+  ino, off, current_gen, decay_window)` — called by
+  `stm_sync_read_extent_locked`'s COLD branch on every
+  successful CAS-chunk decrypt.
+- Logic:
+  - If `last_read_gen == 0` (sentinel: never observed) →
+    `count = 1`.
+  - If `current_gen - last_read_gen > decay_window` (out of
+    window) → `count = 1` (reset; the gap counts as cold).
+  - Else: `count = saturating_add(count, 1)` (clamped at
+    UINT32_MAX).
+- Always: `last_read_gen = current_gen`.
+- Decay window hardcoded at `STM_SYNC_PROMOTE_DECAY_WINDOW_TXGS
+  = 1024` for v1 (`<stratum/sync.h>`); v2 may expose via /ctl/.
+
+Race-tolerant: a concurrent overwrite/migrate that removed the
+record between sync-layer read and counter bump returns STM_OK
+no-op. The counter is non-load-bearing heuristic state — a
+spurious update or a skipped update doesn't compromise any
+soundness invariant. Worst outcome: a less-accurate promotion
+decision.
+
+Lookup → bump cost: each COLD read incurs an extra
+extent-tree mutation (in-RAM under `extent_idx.lock`; persisted
+at next sync_commit). For v1 the mutation is direct on every
+read; future optimization may batch via an in-RAM dirty-cache
+flushed at commit boundaries.
+
+Promotion data plane (`stm_sync_promote_to_hot`):
+
+Per COLD extent at `(ds, ino, off)`:
+1. Decrypt the cold chunk's plaintext via the source CAS
+   replicas + pool metadata key + stm_ad_cas.
+2. Reserve fresh HOT paddrs from the allocator (one per
+   replica per the pool's redundancy profile).
+3. Resolve the dataset's CURRENT DEK + key_id; AEAD-encrypt
+   the SAME plaintext under the new `(paddrs[0], current_gen)`
+   nonce + stm_ad_extent.
+4. `bdev_write` the ciphertext+tag to every fresh replica.
+5. Atomic swap via `stm_extent_promote_swap_to_hot` — drops
+   the COLD record, inserts the HOT record at the same
+   coordinates. Returns the dropped COLD's content_hash.
+6. `stm_cas_deref` the dropped hash. If refcount falls to 0
+   (no other live cold extent references the chunk), the
+   next commit's auto_gc reclaims the CAS chunk.
+
+Storage cost: promotion REVERSES the dedup compression. A
+chunk shared by N cold extents (CAS refcount = N) becomes a
+HOT extent with its own paddrs PLUS a CAS chunk at refcount
+= N - 1 (if other refs exist). Post-promote storage usage
+rises by `1 × chunk_len` per promoted extent — the heuristic
+must be confident enough in the future read-rate to justify
+the doubling.
+
+Composition: pure caller of `cas.tla::RehydrateOnWrite`. The
+state-machine semantics are identical to the existing auto-
+rehydrate-on-write path; the only difference is the trigger
+(frequent reads instead of overlapping writes). **No spec
+extension required.**
+
+Heuristic v1 (`stm_fs_promote_policy_step`):
+
+Eligibility (per ino with at least one COLD extent):
+- `max(read_count) >= min_read_count`.
+- `max(last_read_gen) >= cutoff_recency_gen` where
+  `cutoff_recency_gen = sync.current_gen - min_recency_txgs`
+  (saturating; 0 means no recency filter).
+
+Per-pass shape (mirrors P7-CAS-7's `stm_fs_migrate_policy_step`):
+- INTERRUPTIBLE: drops fs->lock between candidate collection
+  and per-ino promotion.
+- Hard errors (STM_EWEDGED / STM_EROFS / STM_ENOMEM) abort +
+  stamp `last_err_ino`.
+- Soft errors (STM_EBADTAG / STM_EIO / STM_ENOSPC /
+  STM_ECORRUPT) recorded in `last_err / last_err_ino` and the
+  pass continues — first soft error wins the slot.
+- Budget caps (`max_inos`, `max_bytes`) checked BEFORE each
+  candidate's promote.
+
+Multi-dataset wrapper (`stm_fs_promote_policy_pass_all`):
+mirrors the migrate-side `pass_all` exactly — walks PRESENT
+datasets, queries effective `STM_PROP_TIERING`, runs per-step
+on every dataset that resolves non-zero. Budget SHARED across
+enabled datasets. The same property gates promotion as gates
+migration; opt-in / opt-out behavior is symmetric.
+
+Mixed HOT+COLD inos: promotion converts COLD extents to HOT
+without disturbing existing HOT siblings. Partial-failure
+states (some COLD extents promoted, others still COLD) are
+valid — reads work either way. A subsequent promote retry can
+finish the work.
 
 ## Send/recv with cold extents (P7-CAS-9)
 

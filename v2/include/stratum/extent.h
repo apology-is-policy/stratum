@@ -245,6 +245,24 @@ typedef struct {
      * for reflinked extents link_gen == current_txg-at-reflink-time
      * (caller-provided to stm_extent_reflink). */
     uint64_t link_gen;
+    /* P7-CAS-11: per-COLD-extent read-frequency counter for the
+     * promotion (cold → hot) heuristic. Incremented by
+     * stm_sync_read_extent_locked's COLD branch after every successful
+     * decrypt; reset to 1 if the record's last_read_gen is more than
+     * `decay_window` txgs behind the current gen (windowed-counting
+     * scheme; v1 simple, v2 may switch to exponential decay). HOT
+     * extents always have read_count == 0; the on-disk decoder enforces
+     * this via the bytes-96..108 anti-tamper check. Saturating uint32:
+     * a cold extent read 4 billion times stays at UINT32_MAX rather
+     * than wrapping (`bytes_promoted` accounting still scales). */
+    uint32_t read_count;
+    /* P7-CAS-11: gen at which read_count was last incremented (or
+     * reset). Used by the promote-policy step's recency filter
+     * (`min_recency_txgs` — only inos with last_read_gen >= cutoff
+     * are eligible). For freshly-migrated COLD records last_read_gen
+     * == migration_gen (so the record starts "recently observed");
+     * HOT records always have last_read_gen == 0. */
+    uint64_t last_read_gen;
 } stm_extent_record;
 
 struct stm_extent_index;
@@ -588,6 +606,111 @@ stm_status stm_extent_migrate_to_cold(stm_extent_index *idx,
                                          uint64_t link_gen,
                                          uint64_t out_paddrs[STM_EXTENT_MAX_REPLICAS],
                                          uint8_t  *out_n_replicas);
+
+/*
+ * P7-CAS-11: atomic per-extent cold→hot swap (the inverse of
+ * stm_extent_migrate_to_cold). Drops the existing live COLD extent at
+ * exactly (`dataset_id`, `ino`, `off`) (matching `len`) AND inserts a
+ * HOT extent at the same coordinates referencing the caller-provided
+ * fresh replica set. Returns the dropped COLD extent's content_hash
+ * via `out_content_hash` for the caller to route through
+ * `stm_cas_deref` AFTER this call returns.
+ *
+ * The caller has already (a) read+decrypted the cold chunk's
+ * plaintext via the source CAS replicas + pool metadata key + stm_ad_cas,
+ * (b) reserved fresh `new_paddrs` from the allocator, and (c) AEAD-
+ * encrypted the same plaintext under the new (paddr_0, gen) nonce +
+ * stm_ad_extent + the dataset's CURRENT DEK, and (d) replicated the
+ * ciphertext bytewise to all `new_paddrs`. This API mutates the
+ * extent-tree only.
+ *
+ * Atomic at the index level: the swap holds extent_idx.lock across both
+ * the drop and the insert, so no observer ever sees a state where the
+ * (ds, ino, off, len) range is empty (which would let a concurrent
+ * inserter slip in). Preserves NoOverlapWithinIno across the
+ * transition.
+ *
+ * `gen` / `key_id` / `origin_*` / `link_gen` are stamped on the new
+ * HOT extent record. For freshly-promoted extents origin_* equals the
+ * live position (the previous cold record's origin is INHERITED from
+ * the original HOT-side write — but on promote we re-AEAD-encrypt
+ * under fresh paddrs so the new HOT extent's AD is reconstructible
+ * from the live identity, the same as a fresh stm_extent_write would
+ * stamp). `link_gen` mirrors the reflink contract (gen at which THIS
+ * record was inserted into the live extent index, NOT the AEAD gen
+ * of the underlying ciphertext).
+ *
+ * Refusals:
+ *   - dataset_id == 0 OR ino == 0 (STM_EINVAL).
+ *   - origin_dataset_id == 0 OR origin_ino == 0 (STM_EINVAL).
+ *   - len == 0 (STM_EINVAL — extent.tla::LengthPositive).
+ *   - n_replicas not in [1, STM_EXTENT_MAX_REPLICAS] (STM_EINVAL).
+ *   - any new_paddrs[i] == 0 OR within-set duplicate (STM_EINVAL).
+ *   - gen > current_txg OR link_gen > current_txg (STM_EINVAL).
+ *   - off + len OR origin_off + len overflows uint64 (STM_EOVERFLOW).
+ *   - No COLD extent at exactly (ds, ino, off) (STM_ENOENT).
+ *   - The matching extent has a different `len` than the caller
+ *     supplied (STM_EINVAL — partial promote not modeled).
+ *   - The matching extent is HOT already (STM_EINVAL — caller bug;
+ *     HOT extents need no promotion).
+ *   - out_content_hash == NULL (STM_EINVAL).
+ *
+ * On STM_OK: out_content_hash holds the dropped COLD extent's
+ * content_hash. Caller MUST route through `stm_cas_deref` BEFORE the
+ * next sync_commit so the cas refcount stays consistent with the live
+ * cold extent count. On any non-OK return the index is unchanged and
+ * out_content_hash is zeroed.
+ *
+ * Models cas.tla::RehydrateOnWrite (the "drop cold, insert hot" core
+ * transition); the AEAD chunk read + new HOT replica reservation +
+ * cas index deref compose at the sync layer (stm_sync_promote_to_hot).
+ */
+STM_MUST_USE
+stm_status stm_extent_promote_swap_to_hot(stm_extent_index *idx,
+                                            uint64_t dataset_id, uint64_t ino,
+                                            uint64_t off, uint64_t len,
+                                            const uint64_t *new_paddrs,
+                                            uint8_t n_replicas,
+                                            uint64_t gen, uint64_t key_id,
+                                            uint64_t origin_dataset_id,
+                                            uint64_t origin_ino,
+                                            uint64_t origin_off,
+                                            uint64_t link_gen,
+                                            uint8_t out_content_hash[STM_EXTENT_HASH_LEN]);
+
+/*
+ * P7-CAS-11: bump the read counter on the COLD extent record at
+ * (`dataset_id`, `ino`, `off`). Called by the sync layer's COLD-read
+ * path (stm_sync_read_extent_locked's COLD branch) after every
+ * successful chunk decrypt. Windowed-count semantics:
+ *   - If `current_gen - last_read_gen` exceeds `decay_window` (or if
+ *     the field is at its u64 sentinel 0): reset count = 1.
+ *   - Else: count = saturating_add(count, 1) (clamped at UINT32_MAX).
+ *   - Either way: last_read_gen = current_gen.
+ *
+ * No-op (returns STM_OK) for HOT extents — the counter is COLD-only.
+ *
+ * Refusals:
+ *   - NULL idx (STM_EINVAL).
+ *   - dataset_id == 0 OR ino == 0 (STM_EINVAL).
+ *   - current_gen > current_txg (STM_EINVAL — caller drift).
+ *   - No live extent at (ds, ino, off): STM_OK no-op (race-tolerant —
+ *     a concurrent overwrite, truncate, or migrate may have removed
+ *     the record between the sync-layer read and this counter bump).
+ *
+ * The C-impl is best-effort: counter mutations are non-load-bearing
+ * heuristic state, so spurious updates or skipped updates don't
+ * compromise any soundness invariant — the worst outcome is a less-
+ * accurate promotion decision. Crash before commit loses any in-flight
+ * counter bumps (acceptable per the heuristic's MVP scope).
+ */
+STM_MUST_USE
+stm_status stm_extent_record_promote_read_hit(stm_extent_index *idx,
+                                                uint64_t dataset_id,
+                                                uint64_t ino,
+                                                uint64_t off,
+                                                uint64_t current_gen,
+                                                uint64_t decay_window);
 
 /*
  * Per-chunk descriptor for `stm_extent_migrate_to_cold_chunked` (P7-CAS-4b).

@@ -56,9 +56,80 @@ into the CAS tier (which DOES need P6) is a separate concern.
 
 ## Phase 7 status (overall)
 
+- [x] **P7-CAS-11 promotion (cold → hot) heuristic v1** —
+      substantive (this commit) + R62 close (next) + hash-fixup
+      (after). Format break STM_UB_VERSION 20 → 21: extent
+      record value layout grows 96 → 108 with `read_count`
+      (le32) + `last_read_gen` (le64) at offsets 96..108. The
+      counter is COLD-only — HOT extents have both fields == 0
+      with decoder anti-tamper enforcement.
+      Counter lifecycle: incremented by
+      `stm_sync_read_extent_locked`'s COLD branch via
+      `stm_extent_record_promote_read_hit` after every successful
+      chunk decrypt. Windowed-count semantics: reset to 1 if
+      `current_gen - last_read_gen >
+      STM_SYNC_PROMOTE_DECAY_WINDOW_TXGS` (= 1024 hardcoded),
+      else saturating-increment (UINT32_MAX clamp). Race-tolerant
+      and best-effort: spurious or skipped updates don't
+      compromise soundness — worst case is a less-accurate
+      promotion decision.
+      New extent-tree APIs:
+      `stm_extent_promote_swap_to_hot` (atomic cold→hot swap,
+      returns the dropped COLD's content_hash for caller's
+      cas_deref) — the inverse of `stm_extent_migrate_to_cold`.
+      `stm_extent_record_promote_read_hit` (windowed-count
+      mutate; race-tolerant; HOT no-op).
+      New sync APIs:
+      `stm_sync_promote_to_hot(s, ds, ino)` — per-ino driver
+      that walks COLD extents at (ds, ino) and converts each
+      via the per-extent pipeline (decrypt CAS chunk → reserve
+      fresh HOT paddrs → AEAD-encrypt under
+      `(paddrs[0], current_gen)` + dataset CURRENT DEK →
+      bdev_write to all replicas → atomic
+      `stm_extent_promote_swap_to_hot` → `stm_cas_deref` the
+      dropped hash).
+      `stm_sync_promote_policy_collect(s, ds, min_read_count,
+      cutoff_recency_gen, *out_cands, *out_n_cands,
+      *out_inos_visited)` — read-only candidate collector
+      under sync->lock; aggregates max(read_count) +
+      max(last_read_gen) per ino across COLD extents, emits
+      candidates passing both thresholds.
+      New fs APIs:
+      `stm_fs_promote_to_hot(fs, ds, ino)` — wrapper over the
+      sync primitive with FS_GUARD_WRITE.
+      `stm_fs_promote_policy_step(fs, ds, *params, *out_stats)` —
+      v1 heuristic. Eligibility: ino has ≥1 COLD extent AND
+      max(read_count) ≥ min_read_count AND
+      max(last_read_gen) ≥ current_gen - min_recency_txgs.
+      INTERRUPTIBLE pass (drops fs->lock between candidates).
+      Hard errors abort + stamp last_err_ino; soft errors
+      recorded + pass continues. Budget caps `max_inos` +
+      `max_bytes`.
+      `stm_fs_promote_policy_pass_all(fs, *params, *out_stats)` —
+      multi-dataset wrapper. Walks PRESENT datasets, queries
+      effective `STM_PROP_TIERING`, runs per-step on every
+      dataset that resolves non-zero. Budget SHARED across
+      enabled datasets. The same property gates BOTH directions
+      (migrate AND promote) — opt-in is symmetric.
+      Composition: pure caller of `cas.tla::RehydrateOnWrite`.
+      Per-extent state-machine semantics identical to the
+      existing auto-rehydrate-on-write path; only the trigger
+      differs (frequent reads vs overlapping write). **No spec
+      extension required.**
+      Storage cost: promotion REVERSES the dedup compression.
+      A chunk shared by N cold extents becomes a HOT extent +
+      a CAS chunk at refcount=N-1; storage usage rises by
+      `1 × chunk_len` per promoted extent. The heuristic must
+      justify the doubling.
+      test_fs grows 125 → 135 (10 new P7-CAS-11 tests).
+      test_pool UB-version assertion bumped 20 → 21. 35 ctest
+      suites green default + ASan + TSan in isolation. Spec
+      posture unchanged: 21 modules / 25 fixed cfgs / 34 buggy
+      cfgs.
+
 - [x] **P7-CAS-10 out-of-band chunk store wire shape** —
       substantive `21449cc` + R61 close `bebf4b7` + hash-fixup
-      (this commit). Closes the on-wire dedup gap from P7-CAS-9.
+      `46328a3`. Closes the on-wire dedup gap from P7-CAS-9.
       Wire format break STM_SEND_VERSION 1 → 2: new
       `STM_SEND_REC_CHUNK = 4` record kind shipping each unique
       cold-content hash exactly once (32-byte BLAKE3-256 hash +

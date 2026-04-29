@@ -38,8 +38,56 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R61-hash-fixup. Substantive `21449cc` +
-  R61 close `bebf4b7`.
+- **Tip**: post-R62-hash-fixup (planned). Substantive (this
+  commit) + R62 close (next) + hash-fixup (after).
+  **P7-CAS-11 — promotion (cold → hot) heuristic v1. Format
+  break STM_UB_VERSION 20 → 21: extent record value layout
+  grows 96 → 108 bytes with `read_count` (le32 at offset
+  96..100) + `last_read_gen` (le64 at offset 100..108). HOT
+  extents always have both fields == 0 with on-disk decoder
+  anti-tamper enforcement; COLD extents carry the windowed-
+  count state. Counter increments via
+  `stm_extent_record_promote_read_hit` from
+  `stm_sync_read_extent_locked`'s COLD branch on every
+  successful chunk decrypt — best-effort + race-tolerant.
+  Windowed-count semantics with hardcoded
+  `STM_SYNC_PROMOTE_DECAY_WINDOW_TXGS = 1024`: counter resets
+  to 1 if `current_gen - last_read_gen > window`, else
+  saturating-increments (UINT32_MAX clamp). New extent-tree API
+  `stm_extent_promote_swap_to_hot` (atomic cold→hot, returns
+  dropped hash for caller to route through cas_deref) — the
+  inverse of `stm_extent_migrate_to_cold`. New sync APIs
+  `stm_sync_promote_to_hot` (per-ino driver: walks COLD
+  extents, decrypts each via CAS, re-encrypts under fresh
+  paddrs + dataset CURRENT DEK, atomic swap, deref) +
+  `stm_sync_promote_policy_collect` (heuristic candidate
+  collector: max(read_count) + max(last_read_gen) per ino
+  filtered by min_read_count + cutoff_recency_gen). New fs APIs
+  `stm_fs_promote_to_hot` + `stm_fs_promote_policy_step` (v1
+  heuristic with INTERRUPTIBLE pass + hard/soft error
+  classification + budget caps; mirrors
+  `stm_fs_migrate_policy_step`'s shape exactly) +
+  `stm_fs_promote_policy_pass_all` (multi-dataset wrapper
+  filtered by effective `STM_PROP_TIERING`; same property gates
+  promotion AND migration — opt-in is symmetric). Composition
+  over `cas.tla::RehydrateOnWrite` — the cold→hot transition is
+  identical to the existing auto-rehydrate-on-write path; only
+  the trigger differs (frequent reads vs overlapping write).
+  **No spec extension required.** Storage cost: promotion
+  REVERSES the dedup compression — a chunk shared by N cold
+  extents becomes 1 HOT extent + a CAS chunk at refcount=N-1,
+  raising storage by 1×chunk_len per promoted extent. The
+  heuristic must justify the doubling via expected read rate.
+  test_fs grows 125 → 135 (10 new P7-CAS-11 tests:
+  cold-read-counter increments, promote-to-hot basic,
+  min-read-count blocks, persists across mount, no-cold returns
+  ENOENT, max_inos budget, pass_all filtered by TIERING, arg
+  validation, decrements CAS refcount, wedged refused).
+  test_pool UB-version assertion bumped 20 → 21. 35 ctest suites
+  green default + ASan + TSan in isolation. Spec posture
+  unchanged: 21 modules / 25 fixed cfgs / 34 buggy cfgs.**
+  Prior P7-CAS-10 substantive `21449cc` + R61 close `bebf4b7` +
+  hash fixup `46328a3`.
   **P7-CAS-10 — out-of-band chunk store wire shape. Closes the
   on-wire dedup gap from P7-CAS-9. Wire format break
   STM_SEND_VERSION 1 → 2: new `STM_SEND_REC_CHUNK = 4` record

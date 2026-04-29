@@ -1134,6 +1134,179 @@ stm_status stm_extent_migrate_to_cold_chunked(
     return STM_OK;
 }
 
+/* P7-CAS-11: atomic per-extent COLD→HOT swap. Mirrors
+ * stm_extent_migrate_to_cold's structure but in the inverse
+ * direction: drops the COLD record at (ds, ino, off) + inserts a
+ * HOT record at the same coords with the caller-provided fresh
+ * replica set. Returns the dropped COLD's content_hash via
+ * out_content_hash for the caller's stm_cas_deref routing. */
+stm_status stm_extent_promote_swap_to_hot(stm_extent_index *idx,
+                                            uint64_t dataset_id, uint64_t ino,
+                                            uint64_t off, uint64_t len,
+                                            const uint64_t *new_paddrs,
+                                            uint8_t n_replicas,
+                                            uint64_t gen, uint64_t key_id,
+                                            uint64_t origin_dataset_id,
+                                            uint64_t origin_ino,
+                                            uint64_t origin_off,
+                                            uint64_t link_gen,
+                                            uint8_t out_content_hash[STM_EXTENT_HASH_LEN])
+{
+    if (!out_content_hash) return STM_EINVAL;
+    memset(out_content_hash, 0, STM_EXTENT_HASH_LEN);
+
+    if (!idx) return STM_EINVAL;
+    if (dataset_id == 0 || ino == 0) return STM_EINVAL;
+    if (origin_dataset_id == 0 || origin_ino == 0) return STM_EINVAL;
+    if (len == 0) return STM_EINVAL;
+    if (!new_paddrs) return STM_EINVAL;
+    if (n_replicas < 1 || n_replicas > STM_EXTENT_MAX_REPLICAS) return STM_EINVAL;
+    /* Within-set distinctness + non-zero. */
+    for (uint8_t i = 0; i < n_replicas; i++) {
+        if (new_paddrs[i] == 0) return STM_EINVAL;
+        for (uint8_t j = (uint8_t)(i + 1); j < n_replicas; j++) {
+            if (new_paddrs[i] == new_paddrs[j]) return STM_EINVAL;
+        }
+    }
+    if (off > UINT64_MAX - len) return STM_EOVERFLOW;
+    if (origin_off > UINT64_MAX - len) return STM_EINVAL;
+
+    must_lock(&idx->lock);
+
+    if (gen > idx->current_txg)      { must_unlock(&idx->lock); return STM_EINVAL; }
+    if (link_gen > idx->current_txg) { must_unlock(&idx->lock); return STM_EINVAL; }
+
+    /* Find the matching extent at (ds, ino, off). */
+    ptrdiff_t found = -1;
+    for (size_t i = 0; i < idx->n_records; i++) {
+        const stm_extent_record *e = &idx->records[i];
+        if (e->dataset_id == dataset_id && e->ino == ino && e->off == off) {
+            found = (ptrdiff_t)i;
+            break;
+        }
+    }
+    if (found < 0) {
+        must_unlock(&idx->lock);
+        return STM_ENOENT;
+    }
+    const stm_extent_record src = idx->records[found];
+    if (src.len != len) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;            /* partial promote not modeled */
+    }
+    if (src.kind != STM_EXTENT_KIND_COLD) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;            /* HOT already; caller bug */
+    }
+
+    /* Capture dropped COLD's content_hash FIRST so a subsequent
+     * in-place overwrite cannot lose it (the caller routes the hash
+     * through stm_cas_deref AFTER this returns OK). */
+    memcpy(out_content_hash, src.content_hash, STM_EXTENT_HASH_LEN);
+
+    /* Build the new HOT record. read_count + last_read_gen are
+     * implicit zero — HOT records always carry zero counters
+     * (decoder anti-tamper enforces this). */
+    stm_extent_record hot_rec = {
+        .dataset_id = dataset_id, .ino = ino,
+        .off = off, .len = len,
+        .kind       = STM_EXTENT_KIND_HOT,
+        .n_replicas = n_replicas,
+        .gen        = gen,
+        .key_id     = key_id,
+        .origin_dataset_id = origin_dataset_id,
+        .origin_ino        = origin_ino,
+        .origin_off        = origin_off,
+        .link_gen          = link_gen,
+    };
+    for (uint8_t r = 0; r < n_replicas; r++) {
+        hot_rec.paddrs[r] = new_paddrs[r];
+    }
+    /* content_hash[] zeroed by initializer for HOT extents. */
+
+    /* In-place swap: NoOverlapWithinIno preserved across the
+     * transition (mirrors migrate_to_cold's posture). */
+    idx->records[found] = hot_rec;
+    idx->dirty = true;
+
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+/* P7-CAS-11: bump the read counter on the COLD extent at
+ * (ds, ino, off). Windowed-count semantics (see header). HOT records
+ * are no-op. Race-tolerant on missing record (returns STM_OK). */
+stm_status stm_extent_record_promote_read_hit(stm_extent_index *idx,
+                                                uint64_t dataset_id,
+                                                uint64_t ino,
+                                                uint64_t off,
+                                                uint64_t current_gen,
+                                                uint64_t decay_window)
+{
+    if (!idx) return STM_EINVAL;
+    if (dataset_id == 0 || ino == 0) return STM_EINVAL;
+
+    must_lock(&idx->lock);
+
+    if (current_gen > idx->current_txg) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
+
+    /* Find the live extent that COVERS `off` (range-match, not exact-
+     * coord). The sync-layer COLD-read passes the byte offset of the
+     * read, which may not equal rec.off — the COW model means a single
+     * extent covers a contiguous range. */
+    ptrdiff_t found = -1;
+    for (size_t i = 0; i < idx->n_records; i++) {
+        const stm_extent_record *e = &idx->records[i];
+        if (e->dataset_id != dataset_id || e->ino != ino) continue;
+        if (off < e->off) continue;
+        if (off >= e->off + e->len) continue;
+        found = (ptrdiff_t)i;
+        break;
+    }
+    if (found < 0) {
+        /* Race-tolerant: between the sync-layer read and this counter
+         * bump a concurrent overwrite/truncate/migrate may have
+         * removed the record. No-op + STM_OK. */
+        must_unlock(&idx->lock);
+        return STM_OK;
+    }
+    stm_extent_record *rec = &idx->records[found];
+    if (rec->kind != STM_EXTENT_KIND_COLD) {
+        /* HOT records have no counter; no-op. */
+        must_unlock(&idx->lock);
+        return STM_OK;
+    }
+
+    /* Windowed-count update.
+     *   - last_read_gen == 0: never observed → reset to 1.
+     *   - current_gen < last_read_gen: clock-rewind (shouldn't happen;
+     *     defensive — treat as old + reset).
+     *   - age > decay_window: out of window → reset to 1.
+     *   - else: saturating-increment count. */
+    bool reset = false;
+    if (rec->last_read_gen == 0u) {
+        reset = true;
+    } else if (current_gen < rec->last_read_gen) {
+        reset = true;
+    } else {
+        uint64_t age = current_gen - rec->last_read_gen;
+        if (age > decay_window) reset = true;
+    }
+    if (reset) {
+        rec->read_count = 1u;
+    } else if (rec->read_count < UINT32_MAX) {
+        rec->read_count++;
+    }
+    rec->last_read_gen = current_gen;
+    idx->dirty = true;
+
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
 /* ------------------------------------------------------------------ */
 /* Read paths.                                                         */
 /* ------------------------------------------------------------------ */
@@ -1371,15 +1544,28 @@ stm_status stm_extent_count_for_ino(const stm_extent_index *idx,
  *     8   32   content_hash     (BLAKE3-256; names a CAS index entry)
  *    40   56   <same as HOT bytes 40..95>
  *
+ * P7-CAS-11 / v21 — extent record value layout grows 96 → 108. The new
+ * tail tracks per-COLD-extent read-frequency for the promotion
+ * heuristic:
+ *
+ *   off  size  field
+ *    96    4   read_count       (le32) — saturating counter of COLD reads
+ *                                 since last_read_gen. HOT extents have
+ *                                 this == 0 (decoder anti-tamper).
+ *   100    8   last_read_gen    (le64) — gen at which read_count was last
+ *                                 incremented. HOT extents have this ==
+ *                                 0 (decoder anti-tamper).
+ *
  * v15→v16 was the repair-log header carve in superblock; the extent
  * value layout was unchanged in v16. v17 grew it 64 → 96 with the
  * three origin fields + the link_gen field. v18 adds the kind
  * discriminator at byte 0 (shifting n_replicas to byte 1 for HOT) and
- * defines the COLD variant. Format break: STM_UB_VERSION 18.
+ * defines the COLD variant. v21 (P7-CAS-11) appends read_count +
+ * last_read_gen at offsets 96..108. Format breaks: 18, 21.
  * ========================================================================= */
 
 #define EX_KEY_LEN              24u                          /* ds + ino + off */
-#define EX_VAL_LEN              96u                          /* P7-CAS / v18   */
+#define EX_VAL_LEN              108u                         /* P7-CAS-11 / v21 */
 /* MVP cap: 24-bit length so dlen + clen_and_comp.clen both fit without
  * compression. Production extends with chunking / per-extent integrity. */
 #define EX_LEN_MAX_24BIT        UINT32_C(0x00FFFFFF)
@@ -1469,6 +1655,19 @@ static stm_status ex_encode_value(const stm_extent_record *r,
     /* R48 P0-1: link_gen at v17 offset 88..95. */
     le64 link_gen_le = stm_store_le64(r->link_gen);
     memcpy(out + 88, link_gen_le.v, 8);
+
+    /* P7-CAS-11 / v21: read_count + last_read_gen at offsets 96..108.
+     * HOT extents must have both == 0; COLD extents carry the counter.
+     * This is enforced at encode time so any in-RAM stm_extent_record
+     * with kind=HOT and non-zero counters fails-fast rather than
+     * silently persisting bogus state. */
+    if (r->kind == STM_EXTENT_KIND_HOT) {
+        if (r->read_count != 0u || r->last_read_gen != 0u) return STM_ECORRUPT;
+    }
+    le32 rc_le  = stm_store_le32(r->read_count);
+    le64 lrg_le = stm_store_le64(r->last_read_gen);
+    memcpy(out + 96,  rc_le.v,  4);
+    memcpy(out + 100, lrg_le.v, 8);
     return STM_OK;
 }
 
@@ -1560,6 +1759,18 @@ static stm_status ex_decode_value(const uint8_t *in, size_t in_len,
     if (origin_off > UINT64_MAX - (uint64_t)dlen) return STM_ECORRUPT;
     uint64_t link_gen_v = stm_load_le64(link_gen_le);
 
+    /* P7-CAS-11 / v21: read_count + last_read_gen at offsets 96..108.
+     * HOT extents must have both == 0 (anti-tamper); COLD extents carry
+     * the windowed-count fields. */
+    le32 rc_le; le64 lrg_le;
+    memcpy(rc_le.v,  in + 96,  4);
+    memcpy(lrg_le.v, in + 100, 8);
+    uint32_t read_count_v   = stm_load_le32(rc_le);
+    uint64_t last_read_gen_v = stm_load_le64(lrg_le);
+    if (kind_byte == (uint8_t)STM_EXTENT_KIND_HOT) {
+        if (read_count_v != 0u || last_read_gen_v != 0u) return STM_ECORRUPT;
+    }
+
     out_rec->dataset_id = ds;
     out_rec->ino        = ino;
     out_rec->off        = off;
@@ -1578,6 +1789,8 @@ static stm_status ex_decode_value(const uint8_t *in, size_t in_len,
     out_rec->origin_ino        = origin_ino_v;
     out_rec->origin_off        = origin_off;
     out_rec->link_gen          = link_gen_v;
+    out_rec->read_count        = read_count_v;
+    out_rec->last_read_gen     = last_read_gen_v;
 
     return STM_OK;
 }

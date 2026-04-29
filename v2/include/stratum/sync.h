@@ -1442,6 +1442,113 @@ stm_status stm_sync_recv_cold_chunk_release(
         const uint8_t claimed_hash[32]);
 
 /*
+ * P7-CAS-11: decay window (in txgs) for the per-COLD-extent
+ * read-frequency counter. The counter is reset to 1 when a read
+ * occurs after `STM_SYNC_PROMOTE_DECAY_WINDOW_TXGS` or more txgs
+ * of read inactivity (i.e. `current_gen - last_read_gen > window`);
+ * within the window each read saturating-increments the counter.
+ *
+ * Hardcoded at v1; future v2 may expose via /ctl/ or per-dataset
+ * property. A larger window means the counter accumulates over a
+ * longer history (more "memory"); a smaller window means recent
+ * read patterns dominate. 1024 txgs balances the two — at typical
+ * commit cadence this is hours-to-days of activity for active
+ * datasets, weeks for idle ones.
+ */
+#define STM_SYNC_PROMOTE_DECAY_WINDOW_TXGS  ((uint64_t)1024u)
+
+/*
+ * P7-CAS-11: per-ino promotion data plane. Walks every COLD extent
+ * at (`dataset_id`, `ino`) and converts each one to a HOT extent
+ * occupying the same coordinates. Inverse of stm_sync_migrate_to_cold.
+ *
+ * Per-extent pipeline:
+ *   1. Read+decrypt the cold chunk's plaintext via the source CAS
+ *      replicas + pool metadata key + stm_ad_cas.
+ *   2. Reserve fresh paddrs across the pool's redundancy profile
+ *      from the allocator.
+ *   3. AEAD-encrypt the SAME plaintext under the new (paddr_0,
+ *      current_gen) nonce + stm_ad_extent + the dataset's CURRENT
+ *      DEK; replicate the ciphertext+tag bytewise to every replica.
+ *   4. Atomic swap via `stm_extent_promote_swap_to_hot` (drops
+ *      COLD record, inserts HOT at the same coords). Returns the
+ *      dropped COLD's content_hash.
+ *   5. `stm_cas_deref` the dropped hash; the chunk's refcount
+ *      drops by one. If it reaches zero AND no other live cold
+ *      extent references it, the next commit's auto_gc reclaims.
+ *
+ * Wedged / read-only refused with STM_EWEDGED / STM_EROFS. The
+ * data plane composes the same `cas.tla::RehydrateOnWrite`
+ * transition as the existing auto-rehydrate path (no new
+ * state-machine semantics; no spec extension required).
+ *
+ * Refusals:
+ *   - NULL s, dataset_id == 0, ino == 0 (STM_EINVAL).
+ *   - Wedged or read-only (STM_EWEDGED / STM_EROFS).
+ *   - !s->cas_idx (STM_EINVAL).
+ *   - Soft errors per-extent (STM_EBADTAG / STM_EIO / STM_ENOSPC /
+ *     STM_ECORRUPT) abort the per-ino promote; partial promotion
+ *     is rolled back via cas_deref of any newly-bumped CAS refs.
+ *
+ * On STM_OK: every COLD extent at (ds, ino) has been replaced by a
+ * HOT extent. Subsequent reads go through the HOT path (no CAS
+ * lookup, no metadata-key decrypt). Returns STM_ENOENT if the ino
+ * has no live extents OR every extent is already HOT.
+ */
+STM_MUST_USE
+stm_status stm_sync_promote_to_hot(stm_sync *s,
+                                      uint64_t dataset_id,
+                                      uint64_t ino);
+
+/*
+ * P7-CAS-11: candidate descriptor for the promote policy step.
+ * Mirrors `stm_sync_migrate_candidate`'s shape.
+ */
+typedef struct {
+    uint64_t ino;
+    uint64_t bytes;          /* sum of len for COLD extents at (ds, ino) */
+    uint32_t max_read_count; /* max(read_count) over (ds, ino)'s COLD set */
+    uint64_t newest_read_gen;/* max(last_read_gen) over (ds, ino)'s COLD set */
+} stm_sync_promote_candidate;
+
+/*
+ * P7-CAS-11: candidate-collect helper. Walks the dataset's extent
+ * index under sync->lock + extent_idx.lock, aggregates per-ino
+ * COLD-extent stats (max read_count, newest last_read_gen, total
+ * bytes), and emits a candidate for every ino satisfying:
+ *   - At least one COLD extent at (ds, ino).
+ *   - max(read_count) >= min_read_count.
+ *   - max(last_read_gen) >= cutoff_recency_gen.
+ *
+ * Mixed (HOT+COLD) inos: included if the COLD subset satisfies the
+ * thresholds. Promotion converts each COLD extent to HOT regardless
+ * of HOT siblings (HOT extents are left intact).
+ *
+ * Out-param contract (R57 P3-5 et al.): `*out_cands`,
+ * `*out_n_cands`, `*out_inos_visited` are zero-init BEFORE arg
+ * validation. Caller frees `*out_cands` (malloc'd geometrically).
+ *
+ * Refusals:
+ *   - NULL s, dataset_id == 0, NULL out_cands, NULL out_n_cands,
+ *     NULL out_inos_visited (STM_EINVAL).
+ *   - Wedged sync (STM_EWEDGED) — RO is acceptable since collect
+ *     is read-only.
+ *
+ * Concurrency: takes sync->lock + extent_idx.lock; releases both
+ * before returning. Caller MAY proceed without sync->lock for the
+ * subsequent per-ino promotions (the pass is INTERRUPTIBLE — same
+ * shape as stm_sync_migrate_policy_collect).
+ */
+STM_MUST_USE
+stm_status stm_sync_promote_policy_collect(stm_sync *s,
+                                              uint64_t dataset_id,
+                                              uint32_t min_read_count,
+                                              uint64_t cutoff_recency_gen,
+                                              stm_sync_promote_candidate **out_cands,
+                                              size_t *out_n_cands,
+                                              uint64_t *out_inos_visited);
+
+/*
  * Refusals:
  *   - NULL s, NULL claimed_hash (STM_EINVAL).
  *   - !s->cas_idx (STM_EINVAL).

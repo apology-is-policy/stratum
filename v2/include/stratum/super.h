@@ -304,8 +304,22 @@ extern "C" {
  * length grows from 24 to 32 bytes. v19 pools refused at v20 mount
  * via uniform STM_EBADVERSION (no in-place forward-compat at the
  * value layer — same posture as v17→v18 and v18→v19 bumps). No
- * uberblock field changes. */
-#define STM_UB_VERSION        20u
+ * uberblock field changes.
+ *
+ * v20 → v21 bump (P7-CAS-11): extent record value layout grows past
+ * the link_gen tail with `read_count` (le32 at offset 96..100) +
+ * `last_read_gen` (le64 at offset 100..108). EX_VAL_LEN 96 → 108.
+ * Promotion (cold→hot) heuristic v1: the read_count tracks how many
+ * times a COLD extent has been read since last_read_gen via a
+ * windowed-count scheme; the promote-policy step reads these fields
+ * to select COLD extents whose access frequency justifies the
+ * storage doubling of converting back to HOT. HOT extents always
+ * have read_count == 0 AND last_read_gen == 0; the on-disk decoder
+ * enforces this via bytes-96..108-zero anti-tamper. v20 pools'
+ * 96-byte extent records length-rejected by v21 decoder. Refused
+ * via uniform STM_EBADVERSION at SB version check. No uberblock
+ * field changes. */
+#define STM_UB_VERSION        21u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */

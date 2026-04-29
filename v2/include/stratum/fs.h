@@ -517,6 +517,159 @@ stm_status stm_fs_migrate_policy_pass_all(
         const stm_fs_migrate_policy_params *params,
         stm_fs_migrate_policy_pass_all_stats *out_stats);
 
+/*
+ * P7-CAS-11: per-ino promotion (cold → hot) primitive. The inverse of
+ * stm_fs_migrate_to_cold. Walks every COLD extent at (`dataset_id`,
+ * `ino`) and converts each to a HOT extent occupying the same
+ * coordinates. After successful promotion the ino reads through the
+ * HOT path (no CAS lookup, no metadata-key decrypt).
+ *
+ * Storage cost: promotion REVERSES the dedup compression. A chunk
+ * shared by N cold extents (CAS refcount = N) becomes a HOT extent
+ * with its own paddrs PLUS a CAS chunk at refcount = N - 1. So the
+ * post-promote storage usage rises by `1 × chunk_len` for each
+ * promoted extent — the heuristic must be confident enough in the
+ * future read-rate to justify the storage doubling.
+ *
+ * Composition: per-extent caller of cas.tla::RehydrateOnWrite. The
+ * underlying CAS state-machine semantics are identical to the
+ * existing auto-rehydrate-on-write path; the only difference is the
+ * trigger (frequent reads instead of overlapping writes). No spec
+ * extension required.
+ *
+ * Refusals (subset of the sync-layer primitive's contract):
+ *   - NULL fs OR dataset_id == 0 OR ino == 0 (STM_EINVAL).
+ *   - Wedged or read-only (STM_EWEDGED / STM_EROFS).
+ *   - Ino has no live extents OR every extent is HOT (STM_ENOENT).
+ *   - Per-extent failures (STM_EBADTAG, STM_EIO, STM_ENOSPC,
+ *     STM_ECORRUPT, STM_ENOMEM) — first non-OK status is returned;
+ *     partial promotion may have completed (the ino is left mixed
+ *     HOT+COLD; subsequent reads work either way, and a future
+ *     promote retry can finish the work).
+ */
+STM_MUST_USE
+stm_status stm_fs_promote_to_hot(stm_fs *fs,
+                                    uint64_t dataset_id,
+                                    uint64_t ino);
+
+/*
+ * P7-CAS-11: policy primitive for the periodic promote-on-read
+ * heuristic. Mirrors stm_fs_migrate_policy_step's shape but on the
+ * inverse direction.
+ *
+ * v1 heuristic:
+ *   - For each ino with at least one COLD extent in the dataset,
+ *     compute `max(read_count)` and `max(last_read_gen)` across the
+ *     ino's COLD set.
+ *   - Eligible iff `max(read_count) >= min_read_count` AND
+ *     `max(last_read_gen) >= cutoff_recency_gen` where
+ *     `cutoff_recency_gen = sync.current_gen - min_recency_txgs`
+ *     (saturating).
+ *   - If eligible AND under budget caps, call stm_fs_promote_to_hot
+ *     for the ino.
+ *
+ * Pass shape: takes fs->lock for candidate collection, drops it
+ * between candidates so the pass is INTERRUPTIBLE. Hard errors
+ * (STM_EWEDGED / STM_EROFS / STM_ENOMEM) abort + stamp last_err_ino.
+ * Soft errors recorded in (last_err, last_err_ino) and the pass
+ * continues — first soft error wins the slot.
+ *
+ * Read-counter lifecycle: the counter is incremented automatically
+ * by stm_sync_read_extent's COLD path via
+ * stm_extent_record_promote_read_hit. The increment is windowed
+ * (STM_SYNC_PROMOTE_DECAY_WINDOW_TXGS = 1024 txgs); within the
+ * window each read saturating-increments, after the window the next
+ * read resets to 1. Operators tune `min_read_count` and
+ * `min_recency_txgs` to express "how many recent reads justify
+ * promotion."
+ *
+ * Refusals + uniform out-param contract identical to the migrate
+ * primitive: out_stats zero-inited BEFORE arg validation.
+ */
+typedef struct {
+    /* Inclusive minimum read_count for an ino's COLD extents to be
+     * eligible. The counter saturates at UINT32_MAX and resets to 1
+     * if no read occurred for STM_SYNC_PROMOTE_DECAY_WINDOW_TXGS
+     * txgs (so a high count = "recently hot," not "ancient
+     * accumulation"). 0 means "any COLD ino regardless of read
+     * frequency" — useful for one-shot mass promote. */
+    uint32_t min_read_count;
+    /* Reserved alignment padding. */
+    uint32_t _reserved0;
+    /* Inclusive minimum recency: an ino's COLD extents are eligible
+     * only if `max(last_read_gen) >= sync.current_gen -
+     * min_recency_txgs` (saturating; if min_recency_txgs >=
+     * current_gen, the cutoff is 0 and any positive last_read_gen
+     * qualifies). 0 means "no recency filter" (only the count
+     * threshold gates eligibility). */
+    uint64_t min_recency_txgs;
+    /* Maximum number of inos to promote this pass. 0 = no per-pass
+     * count cap. */
+    uint32_t max_inos;
+    /* Reserved alignment padding. */
+    uint32_t _reserved1;
+    /* Maximum total COLD-extent bytes to promote this pass. 0 = no
+     * per-pass byte cap. Snapshot-at-collection length sum; concurrent
+     * shrinks/extends/migrates cause drift, same as the migrate
+     * primitive's max_bytes. */
+    uint64_t max_bytes;
+} stm_fs_promote_policy_params;
+
+typedef struct {
+    /* Total inos visited (HOT-only + COLD-bearing + mixed). */
+    uint64_t inos_visited;
+    /* Inos that met the COLD-bearing + read-count + recency
+     * predicate. Counted BEFORE budget caps. */
+    uint64_t inos_eligible;
+    /* Inos the per-ino promote returned STM_OK on. */
+    uint64_t inos_promoted;
+    /* Sum of COLD-extent bytes (snapshot-at-collection) for promoted
+     * inos. Approximate. */
+    uint64_t bytes_promoted;
+    /* First per-ino promote error encountered. STM_OK if all OK. */
+    stm_status last_err;
+    /* Ino at which last_err was reported. 0 if last_err == STM_OK. */
+    uint64_t last_err_ino;
+} stm_fs_promote_policy_stats;
+
+STM_MUST_USE
+stm_status stm_fs_promote_policy_step(stm_fs *fs,
+                                         uint64_t dataset_id,
+                                         const stm_fs_promote_policy_params *params,
+                                         stm_fs_promote_policy_stats *out_stats);
+
+/*
+ * P7-CAS-11: multi-dataset wrapper over stm_fs_promote_policy_step.
+ * Mirrors stm_fs_migrate_policy_pass_all's shape: walks every
+ * PRESENT dataset, resolves effective STM_PROP_TIERING (the same
+ * property gates promotion as gates migration — datasets opted into
+ * tiering use both directions), runs the per-dataset promote step
+ * on every dataset that resolves a non-zero TIERING value.
+ *
+ * Budget shape (max_inos / max_bytes) SHARED across enabled
+ * datasets, decremented between per-step calls.
+ */
+typedef struct {
+    uint64_t datasets_visited;
+    uint64_t datasets_eligible;
+    uint64_t datasets_promoted;
+    /* Aggregated per-dataset counters. */
+    uint64_t inos_visited;
+    uint64_t inos_eligible;
+    uint64_t inos_promoted;
+    uint64_t bytes_promoted;
+    /* First per-step error. */
+    stm_status last_err;
+    uint64_t last_err_dataset_id;
+    uint64_t last_err_ino;
+} stm_fs_promote_policy_pass_all_stats;
+
+STM_MUST_USE
+stm_status stm_fs_promote_policy_pass_all(
+        stm_fs *fs,
+        const stm_fs_promote_policy_params *params,
+        stm_fs_promote_policy_pass_all_stats *out_stats);
+
 /* ========================================================================= */
 /* Inspection + control.                                                      */
 /* ========================================================================= */
