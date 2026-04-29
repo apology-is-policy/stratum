@@ -135,6 +135,22 @@
  * (the snapshot's tree_root captures a stable view; future
  * snap-bounded incremental sends will source from the snapshot).
  *
+ * R60 P3-2: the COLD path (P7-CAS-9) inherits a parallel race at
+ * two distinct points:
+ *
+ *   - `stm_send_init` (between extent_iter and the post-iter
+ *     cas_lookup): if the source's CAS chunk is reclaimed by
+ *     auto_gc in the gap (concurrent overwrite + commit + sweep),
+ *     send_init returns STM_EBUSY (R60 P2-1). Caller retries.
+ *
+ *   - `stm_send_next` (between send_init's cas_lookup and the
+ *     per-extent emit's bdev_read): if the captured cas_paddrs
+ *     are reclaimed-then-reused at a new gen between init and
+ *     emit, the cold-decrypt's AEAD verify fails with STM_EBADTAG
+ *     — same shape as the HOT-path stale-paddr race.
+ *
+ * Same caller mitigation applies (snapshot first, pause source).
+ *
  * MVP caveat — recv durability (R39 P3-2): a successful
  * `stm_recv_finish` returns STM_OK once HEADER + every EXTENT +
  * END have been applied AND the END's csum verifies. The applied

@@ -177,7 +177,18 @@ static bool send_collect_cb(const stm_extent_record *e, void *ctx_) {
             cc->err = STM_ECORRUPT;
             return false;
         }
-    } else if (e->kind != STM_EXTENT_KIND_COLD) {
+    } else if (e->kind == STM_EXTENT_KIND_COLD) {
+        /* R60 P3-4: COLD extents store paddrs CAS-side, not in the
+         * extent record. extent.tla::ExtentRec invariant pins
+         * `n_replicas == 0` for COLD; a torn extent_idx record
+         * with kind=COLD AND n_replicas != 0 indicates extent
+         * corruption — refuse the send rather than silently
+         * paper over it. */
+        if (e->n_replicas != 0) {
+            cc->err = STM_ECORRUPT;
+            return false;
+        }
+    } else {
         /* Defensive: unknown discriminator → corruption. */
         cc->err = STM_ECORRUPT;
         return false;
@@ -301,12 +312,20 @@ stm_status stm_send_init(stm_sync *sync,
      * COLD extent. cas_lookup takes cas_idx.lock; do this AFTER
      * extent_iter_ds returns so we don't nest cas_idx.lock under
      * extent_idx.lock (cleanest order: each per-extent lookup
-     * acquires + releases cas_idx.lock). A concurrent
-     * stm_sync_commit could run auto_gc_sweep between iter and
-     * lookup — the sweep only reclaims refcount=0 entries, and
-     * every captured COLD extent's chunk has refcount >= 1 (the
-     * extent record itself holds the ref), so the chunk stays
-     * alive. */
+     * acquires + releases cas_idx.lock).
+     *
+     * R60 P3-1: a concurrent `stm_sync_commit` between iter and
+     * cas_lookup CAN cause the captured chunk to be reclaimed by
+     * auto_gc — the sequence is: (a) the source extent record is
+     * concurrently overwritten/snap-deleted (drops its CAS ref via
+     * the cold-bookend), AND (b) the resulting refcount reaches
+     * zero, AND (c) auto_gc sweeps in the same commit. The
+     * captured `m->content_hash` then points at a freshly-reclaimed
+     * (or now-empty) hash slot. R60 P2-1: the resulting STM_ENOENT
+     * is a benign transient race (matches the HOT-path R39 P3-1
+     * stale-paddr race in spirit), surfaced as STM_EBUSY so the
+     * caller can retry — STM_ECORRUPT was misleading because no
+     * data-integrity invariant was violated. */
     {
         stm_cas_index *cidx = stm_sync_cas_index(sync);
         for (size_t i = 0; i < h->n_extents; i++) {
@@ -321,12 +340,14 @@ stm_status stm_send_init(stm_sync *sync,
             stm_cas_record cas_rec;
             stm_status ls = stm_cas_lookup(cidx, m->content_hash, &cas_rec);
             if (ls != STM_OK) {
-                /* STM_ENOENT here is a dangling-hash bug —
-                 * CAS index inconsistent with extent index. */
                 free(h->extents);
                 stm_blake3_free(h->hasher);
                 free(h);
-                return (ls == STM_ENOENT) ? STM_ECORRUPT : ls;
+                /* R60 P2-1: STM_ENOENT → benign concurrent-reclaim
+                 * race; STM_EBUSY signals "transient, retry."
+                 * Other ls values (STM_EIO from a torn cas_idx
+                 * read, STM_ENOMEM) propagate as the real cause. */
+                return (ls == STM_ENOENT) ? STM_EBUSY : ls;
             }
             if (cas_rec.length != m->len) {
                 free(h->extents);

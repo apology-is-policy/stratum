@@ -5534,6 +5534,18 @@ static stm_status cas_chunk_intern_locked(
     if (!cas_hit && ls != STM_ENOENT) return ls;
 
     if (cas_hit) {
+        /* R60 P3-3: defensive cross-check of stored chunk length
+         * vs caller's plain_len. By the BLAKE3 collision-resistance
+         * + the CAS invariant (every entry's stored bytes hash to
+         * its key), a hit on hash X with cas_rec.length != plain_len
+         * implies either a hash collision (cryptographically
+         * impossible) or a torn cas_idx record. Either way: refuse
+         * with STM_ECORRUPT rather than bumping refcount over an
+         * inconsistent entry. The COLD-read path
+         * (stm_sync_read_extent_locked, sync.c:4510) does the same
+         * check at read time; catching it on intern is the
+         * fast-fail position. */
+        if (cas_rec.length != plain_len) return STM_ECORRUPT;
         stm_status rs = stm_cas_ref(s->cas_idx, out_hash);
         if (rs != STM_OK) return rs;
         *out_cas_bumped = true;

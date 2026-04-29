@@ -77,13 +77,22 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   target lacks the chunk, IDENTICAL to migrate's HIT branch
   when the target already has it). No spec extension required
   — receiver is a pure caller of the existing migrate
-  primitives. test_send_recv grows 14 → 19 (5 new P7-CAS-9
-  tests: cold-extent roundtrip, dedup preserved on target,
-  mixed HOT+COLD roundtrip, recv refuses unknown flag bit,
-  recv refuses cold hash mismatch). 35 ctest suites green
-  default + ASan + TSan in isolation. Spec posture unchanged:
-  21 modules / 25 fixed cfgs / 34 buggy cfgs. No format break
-  — STM_UB_VERSION = 20 preserved. R60 audit forthcoming.**
+  primitives. test_send_recv grows 14 → 23 (5 P7-CAS-9 primary
+  tests + 4 R60 regressions: pre-populated target HIT path,
+  unprovisioned-target rollback, hash-mismatch state-clean,
+  replica-fallback structural). 35 ctest suites green default
+  + ASan + TSan in isolation. Spec posture unchanged: 21
+  modules / 25 fixed cfgs / 34 buggy cfgs. No format break —
+  STM_UB_VERSION = 20 preserved. R60 audit verdict: 0 P0 + 0
+  P1 + 1 P2 + 5 P3 — all addressed inline (P2-1 send_init's
+  benign concurrent-reclaim race surfaces as STM_EBUSY not
+  STM_ECORRUPT; P3-1 corrected the misleading "chunk stays
+  alive" comment in send.c; P3-2 documented the COLD-path
+  stale-paddr caveat in send_recv.h; P3-3 cas_chunk_intern
+  HIT branch validates cas_rec.length against plain_len; P3-4
+  send_collect_cb refuses COLD with n_replicas != 0; P3-5
+  added 4 new tests covering pre-populated HIT, unprovisioned
+  rollback, hash-mismatch state-clean, replica-fallback).**
   Prior P7-CAS-8 substantive `8410198` + R59 close `c2323fe` +
   hash fixup `019ed4d`.
   **P7-CAS-8 — per-dataset `STM_PROP_TIERING` opt-in + multi-

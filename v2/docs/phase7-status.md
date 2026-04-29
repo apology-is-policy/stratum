@@ -87,11 +87,18 @@ into the CAS tier (which DOES need P6) is a separate concern.
       validation refuses unknown bits with STM_ECORRUPT —
       protocol-evolution discipline. Composition over the
       existing migrate primitives — no spec extension. R60
-      audit forthcoming. test_send_recv grows 14 → 19 (5 new
-      P7-CAS-9 tests). 35 ctest suites green default + ASan +
-      TSan in isolation. Spec posture unchanged: 21 modules /
-      25 fixed cfgs / 34 buggy cfgs. **No format break —
-      STM_UB_VERSION = 20 preserved.**
+      audit verdict: 0 P0 + 0 P1 + 1 P2 + 5 P3 — all
+      addressed inline (P2-1 ENOENT race surfaces as STM_EBUSY
+      not STM_ECORRUPT; P3-1 fixed misleading "chunk stays
+      alive" comment; P3-2 documented COLD stale-paddr caveat;
+      P3-3 cas_chunk_intern HIT validates length; P3-4
+      send_collect_cb refuses COLD with n_replicas != 0; P3-5
+      added 4 regression tests). test_send_recv grows 14 → 23
+      (5 P7-CAS-9 primary + 4 R60 regressions). 35 ctest
+      suites green default + ASan + TSan in isolation. Spec
+      posture unchanged: 21 modules / 25 fixed cfgs / 34
+      buggy cfgs. **No format break — STM_UB_VERSION = 20
+      preserved.**
 
 - [x] **P7-CAS-8 per-dataset tiering opt-in + multi-dataset
       wrapper** — substantive `8410198` + R59 close `c2323fe` +
