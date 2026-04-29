@@ -38,8 +38,8 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R59-hash-fixup. Substantive `<P7-CAS-8>` +
-  R59 close `<R59>`.
+- **Tip**: post-R59-hash-fixup. Substantive `8410198` +
+  R59 close `c2323fe`.
   **P7-CAS-8 — per-dataset `STM_PROP_TIERING` opt-in + multi-
   dataset migration-policy wrapper. Format break STM_UB_VERSION
   19 → 20: `STM_PROP_COUNT` grows from 3 to 4, adding

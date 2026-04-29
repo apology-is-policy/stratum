@@ -57,7 +57,7 @@ into the CAS tier (which DOES need P6) is a separate concern.
 ## Phase 7 status (overall)
 
 - [x] **P7-CAS-8 per-dataset tiering opt-in + multi-dataset
-      wrapper** — substantive `<P7-CAS-8>` + R59 close `<R59>` +
+      wrapper** — substantive `8410198` + R59 close `c2323fe` +
       hash-fixup (this commit). Format break **STM_UB_VERSION
       19 → 20**: `STM_PROP_COUNT` grows from 3 to 4, adding
       `STM_PROP_TIERING` (INHERITABLE; per-dataset tiering
