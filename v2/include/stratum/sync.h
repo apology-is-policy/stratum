@@ -876,6 +876,49 @@ struct stm_cas_index;
 typedef struct stm_cas_index stm_cas_index;
 stm_cas_index *stm_sync_cas_index(stm_sync *s);
 
+/*
+ * P7-CAS-5: trigger one CAS auto-GC sweep cycle out-of-band from
+ * `stm_sync_commit`. Takes `sync->lock` internally; safe to call
+ * from any context that does NOT already hold sync->lock (notably:
+ * scrub orchestrators, periodic timers, manual-trigger fs-level
+ * APIs).
+ *
+ * The sweep walks the cas-index for refcount=0 entries and reclaims
+ * them via the same two-phase shape `stm_sync_commit` uses (cas_gc
+ * first → alloc_free per paddr; FAULTED/REMOVED-device skip;
+ * STM_EBUSY/ENOENT skip-clean on concurrent ref/gc). Reclaimed
+ * paddrs go to PENDING with `free_gen = s->current_gen` (the gen
+ * of the LAST committed sync); the next `stm_sync_commit` at
+ * `committed_gen >= free_gen + 1` reclaims them via the alloc-tree
+ * sweep predicate.
+ *
+ * Use cases:
+ *   - Scrub-driver orchestrators that interleave `stm_scrub_step`
+ *     with cas-gc so cold-tier reclamation keeps pace with scrub
+ *     passes (the natural place for periodic invocation).
+ *   - Manual triggers from a `/ctl/.../cas-gc` admin path.
+ *   - Test harnesses that want to exercise sweep behavior without
+ *     waiting for a sync_commit.
+ *
+ * Returns:
+ *   STM_OK         — sweep ran (possibly with zero entries).
+ *   STM_EWEDGED    — fs is wedged; sweep refused.
+ *   STM_EROFS      — fs is read-only; sweep refused (CAS GC
+ *                    mutates alloc state which is RW-only).
+ *   STM_EINVAL     — NULL `s`.
+ *   other          — first per-tuple non-OK status (idempotent
+ *                    retry: re-call to resume after transient
+ *                    failures).
+ *
+ * Spec: cas.tla::GC (atomic remove-and-mark-freed). The semantics
+ * are identical whether invoked from `stm_sync_commit` or from
+ * this entry point — the cas_idx.lock per-call serialization
+ * ensures no race window between observation of refcount=0 and
+ * entry removal.
+ */
+STM_MUST_USE
+stm_status stm_sync_cas_gc_sweep(stm_sync *s);
+
 /* Forward decl for stm_sync_scrub_install_production_cb below. The
  * full type lives in <stratum/scrub.h>; including it here would create
  * a cycle (scrub.h includes types.h which already pulls sync's deps).

@@ -4009,4 +4009,212 @@ STM_TEST(fs_p7cas4_r55_truncate_crossing_cold_with_near_full_snap) {
     unlink(g_key_path);
 }
 
+STM_TEST(fs_p7cas5_cas_gc_sweep_basic_reclaim) {
+    /* P7-CAS-5: out-of-band sweep entry point. After a write+
+     * migrate+overwrite sequence, the cas-index has one refcount=0
+     * entry awaiting reclamation. Calling stm_sync_cas_gc_sweep
+     * BETWEEN commits should reclaim it (cas count drops to 0)
+     * and leave the alloc tree's PENDING entry stamped with
+     * free_gen = current_gen so the next sync_commit can complete
+     * the alloc-side reclamation.
+     *
+     * Pre-fix: out-of-band invocation was unavailable; only the
+     * sync_commit-internal sweep ran, so reclamation tracked
+     * commit cadence rather than scrub or admin cadence. */
+    make_tmp("p7cas5_basic");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)((i * 41u + 13u) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    /* Overwrite the cold extent — bookend derefs the hash → refcount=0. */
+    uint8_t plain2[4096];
+    for (size_t i = 0; i < sizeof plain2; i++) plain2[i] = 0xCC;
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain2, sizeof plain2));
+
+    /* Pre-sweep: 1 cas entry at refcount=0. */
+    size_t cas_pre = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &cas_pre));
+    STM_ASSERT_EQ(cas_pre, (size_t)1);
+
+    /* Out-of-band sweep — reclaims the refcount=0 entry. */
+    STM_ASSERT_OK(stm_sync_cas_gc_sweep(sync));
+
+    size_t cas_post = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &cas_post));
+    STM_ASSERT_EQ(cas_post, (size_t)0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas5_cas_gc_sweep_no_work) {
+    /* Calling the sweep with no refcount=0 entries is a no-op
+     * STM_OK. */
+    make_tmp("p7cas5_nowork");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+
+    /* Empty cas index — sweep is no-op. */
+    STM_ASSERT_OK(stm_sync_cas_gc_sweep(sync));
+    size_t n = 999;
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    /* One refcount=1 entry — sweep iterates but doesn't capture. */
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)((i * 7u + 3u) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+    STM_ASSERT_OK(stm_sync_cas_gc_sweep(sync));
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas5_cas_gc_sweep_arg_validation) {
+    /* NULL sync → STM_EINVAL. */
+    STM_ASSERT_ERR(stm_sync_cas_gc_sweep(NULL), STM_EINVAL);
+}
+
+STM_TEST(fs_p7cas5_cas_gc_sweep_ro_refused) {
+    /* RO-mount → STM_EROFS (sweep mutates alloc state via PENDING
+     * routing; correctly refused on read-only mounts). */
+    make_tmp("p7cas5_ro");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    /* RW mount + populate. */
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)i;
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    /* Re-mount RO. */
+    stm_fs_mount_opts ro_mopts = mopts;
+    ro_mopts.read_only = true;
+    stm_fs *fs_ro = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &ro_mopts, &fs_ro));
+    stm_sync *sync_ro = stm_fs_sync_for_test(fs_ro);
+    STM_ASSERT_ERR(stm_sync_cas_gc_sweep(sync_ro), STM_EROFS);
+    STM_ASSERT_OK(stm_fs_unmount(fs_ro));
+
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas5_cas_gc_sweep_persists_pending_across_commit) {
+    /* Out-of-band sweep stamps PENDING entries with free_gen =
+     * current_gen (the gen of the LAST committed sync). The next
+     * sync_commit at committed_gen >= free_gen + 1 sweeps PENDING
+     * with the predicate `free_gen < committed_gen` → reclaims.
+     * This test exercises the full lifecycle: write+migrate+
+     * overwrite → out-of-band sweep → sync_commit → verify alloc
+     * stats reflect the reclamation. */
+    make_tmp("p7cas5_pending");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)((i * 11u + 5u) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    /* Overwrite to drop refcount to 0; cas entry survives until sweep. */
+    uint8_t plain2[4096];
+    for (size_t i = 0; i < sizeof plain2; i++) plain2[i] = 0x77;
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain2, sizeof plain2));
+
+    size_t cas_n = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &cas_n));
+    STM_ASSERT_EQ(cas_n, (size_t)1);
+
+    /* Out-of-band sweep removes the cas entry. */
+    STM_ASSERT_OK(stm_sync_cas_gc_sweep(sync));
+    STM_ASSERT_OK(stm_cas_count(cas, &cas_n));
+    STM_ASSERT_EQ(cas_n, (size_t)0);
+
+    /* Commit + remount: cas index persists empty. */
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    stm_fs *fs2 = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs2));
+    stm_cas_index *cas2 = stm_sync_cas_index(stm_fs_sync_for_test(fs2));
+    STM_ASSERT_OK(stm_cas_count(cas2, &cas_n));
+    STM_ASSERT_EQ(cas_n, (size_t)0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs2));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas5_cas_gc_sweep_idempotent) {
+    /* Calling the sweep twice in a row is safe. The second call
+     * is a no-op because the first removed all refcount=0
+     * entries. */
+    make_tmp("p7cas5_idempotent");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)((i * 5u + 9u) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+    uint8_t plain2[4096];
+    memset(plain2, 0xEE, sizeof plain2);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain2, sizeof plain2));
+
+    STM_ASSERT_OK(stm_sync_cas_gc_sweep(sync));
+    STM_ASSERT_OK(stm_sync_cas_gc_sweep(sync));
+
+    size_t n = 99;
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")

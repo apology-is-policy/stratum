@@ -3955,6 +3955,29 @@ stm_cas_index *stm_sync_cas_index(stm_sync *s)
     return s ? s->cas_idx : NULL;
 }
 
+/* P7-CAS-5: out-of-band CAS auto-GC sweep entry point. See sync.h
+ * for the contract. Takes sync->lock so the sweep serializes with
+ * stm_sync_commit + stm_sync_write_extent + stm_sync_truncate +
+ * stm_sync_migrate_to_cold + stm_sync_reflink (all of which mutate
+ * cas_idx via paths that hold sync->lock); the cas_idx.lock per-
+ * call inside the sweep additionally serializes with the migrate-
+ * caller's stm_cas_lookup / stm_cas_ref / stm_cas_insert sequences
+ * that themselves take cas_idx.lock briefly per primitive.
+ *
+ * Returns STM_OK on success, STM_EWEDGED / STM_EROFS / STM_EINVAL
+ * on guard failure, or the first per-tuple non-OK from the sweep
+ * (idempotent retry on next call). */
+stm_status stm_sync_cas_gc_sweep(stm_sync *s)
+{
+    if (!s) return STM_EINVAL;
+    pthread_mutex_lock(&s->lock);
+    if (s->wedged)    { pthread_mutex_unlock(&s->lock); return STM_EWEDGED; }
+    if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
+    stm_status ret = cas_auto_gc_sweep_locked(s);
+    pthread_mutex_unlock(&s->lock);
+    return ret;
+}
+
 #ifdef STRATUM_BUILD_TESTING_HOOKS
 /* P7-CAS-4b: test-only override of the FastCDC chunker parameters.
  * See <stratum/sync_testing.h> for the contract. Validates `params`

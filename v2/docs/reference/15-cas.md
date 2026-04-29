@@ -87,11 +87,40 @@ void stm_ad_cas_pack(const stm_ad_cas *ad,
                      uint8_t out[STM_AD_CAS_PACKED_LEN]);
 ```
 
-`include/stratum/sync.h` accessor (test + future migration path):
+`include/stratum/sync.h` accessor + out-of-band sweep entry point:
 
 ```c
 stm_cas_index *stm_sync_cas_index(stm_sync *s);
+
+/* P7-CAS-5: out-of-band sweep — runs cas_auto_gc_sweep_locked
+ * under sync->lock. Returns STM_OK / STM_EWEDGED / STM_EROFS /
+ * STM_EINVAL on guard failure, OR the first per-tuple non-OK
+ * status from the sweep (idempotent retry). */
+stm_status stm_sync_cas_gc_sweep(stm_sync *s);
 ```
+
+`stm_sync_cas_gc_sweep` invokes the same two-phase shape used
+inside `stm_sync_commit` (cas_gc first → alloc_free per paddr;
+FAULTED/REMOVED-device skip; STM_EBUSY/ENOENT skip-clean on
+concurrent ref/gc). Reclaimed paddrs are stamped PENDING with
+`free_gen = s->current_gen` (the gen of the LAST committed sync);
+the next `stm_sync_commit` at `committed_gen >= free_gen + 1`
+reclaims them via the alloc-tree sweep predicate — same lifecycle
+as commit-time sweeps.
+
+Use cases:
+- Scrub-driver orchestrators that interleave `stm_scrub_step`
+  with cas-gc to keep cold-tier reclamation in pace with scrub
+  passes.
+- Manual triggers from a `/ctl/.../cas-gc` admin path.
+- Test harnesses exercising sweep behavior without waiting for
+  a sync_commit.
+
+The function takes `sync->lock` internally; callers MUST NOT
+already hold it. All other CAS-mutating paths (`stm_sync_write_
+extent_locked`, `stm_sync_truncate`, `stm_sync_migrate_to_cold`,
+`stm_sync_reflink`, `stm_sync_commit`) also take `sync->lock` so
+the out-of-band sweep serializes with them naturally.
 
 ## Implementation
 
@@ -320,13 +349,30 @@ ARCH §7.6.3). Nonce is `(cas_rec.paddrs[0], cas_rec.gen,
 pool_uuid)` — the same shape as the encrypt path. Each replica is
 tried in order; first AEAD-verifying replica wins.
 
-## Auto-GC at sync_commit (closes R49 P2-2 + R50 P2-1 + R50 P2-3 + R51 P3-2 + R51 P3-4)
+## Auto-GC sweep (closes R49 P2-2 + R50 P2-1 + R50 P2-3 + R51 P3-2 + R51 P3-4)
 
-`cas_auto_gc_sweep_locked` runs in `stm_sync_commit` BEFORE the
-per-device `stm_alloc_commit` loop (P7-CAS-3 reordering closes
-R50 P2-1). **P7-CAS-4 R51 P3-2 + P3-4** reordered the within-tuple
-sub-steps from "alloc_free first → cas_gc second" to "cas_gc first
-→ alloc_free second" and added a FAULTED/REMOVED-device skip for
+`cas_auto_gc_sweep_locked` runs in two contexts:
+
+1. **Inside `stm_sync_commit`** (the original path). Runs BEFORE the
+   per-device `stm_alloc_commit` loop (P7-CAS-3 reordering closes
+   R50 P2-1).
+2. **Out-of-band via `stm_sync_cas_gc_sweep`** (P7-CAS-5). Takes
+   `sync->lock` internally; safe to call from any context that
+   does NOT already hold sync->lock — scrub orchestrators,
+   periodic timers, manual `/ctl/`-style admin triggers, or test
+   harnesses.
+
+Both invocations use the same two-phase shape and the same
+serialization (cas_idx.lock + alloc.lock per primitive). The
+out-of-band path stamps PENDING entries with `free_gen =
+s->current_gen` (the gen of the LAST committed sync); the next
+`stm_sync_commit` at `committed_gen >= free_gen + 1` reclaims
+them via the alloc-tree sweep predicate `free_gen<committed_gen`
+— same lifecycle as commit-time sweeps.
+
+**P7-CAS-4 R51 P3-2 + P3-4** reordered the within-tuple sub-steps
+from "alloc_free first → cas_gc second" to "cas_gc first →
+alloc_free second" and added a FAULTED/REMOVED-device skip for
 alloc_free.
 
 Two-phase shape (post-P7-CAS-4):
@@ -774,6 +820,7 @@ precondition broadens the state space modestly).
 | Auto-GC reorder (cas_gc-then-alloc_free) | ✅ P7-CAS-4 (R51 P3-2) | — |
 | Auto-GC FAULTED/REMOVED-device alloc_free skip | ✅ P7-CAS-4 (R51 P3-4) | — |
 | Cold-dead-list capacity pre-check | ✅ P7-CAS-4 (R54 P3-2) | — |
-| Background GC scrub-β-cb invocation | — | follow-on (needs lock-graph rework) |
-| Migration policy heuristic (NOVEL #6 v1) | — | post-P7-CAS-4 |
+| Out-of-band CAS GC entry point (`stm_sync_cas_gc_sweep`) | ✅ P7-CAS-5 | — |
+| Scrub-orchestrator wire-in (auto-call sweep on scrub COMPLETED) | — | follow-on (orchestrator placement) |
+| Migration policy heuristic (NOVEL #6 v1) | — | post-P7-CAS-5 |
 | Cross-pool dedup | — | post-v2.0 (NOVEL #3) |

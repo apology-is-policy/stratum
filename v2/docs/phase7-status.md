@@ -56,9 +56,35 @@ into the CAS tier (which DOES need P6) is a separate concern.
 
 ## Phase 7 status (overall)
 
+- [x] **P7-CAS-5 out-of-band CAS GC entry point** — substantive
+      `<R56-substantive-hash>` + R56 close `<R56-close-hash>` +
+      hash-fixup (this commit). Adds the public API
+      `stm_sync_cas_gc_sweep(s)` that exposes the (now-correct)
+      P7-CAS-4 reordered sweep to orchestrators outside
+      `stm_sync_commit`. Takes `sync->lock` internally; safe to
+      call from any context that does NOT already hold sync->lock.
+      Use cases: scrub-driver orchestrators interleaving
+      `stm_scrub_step` with cas-gc to keep cold-tier reclamation
+      in pace with scrub passes; manual `/ctl/`-style admin
+      triggers; test harnesses. Implementation is a thin wedged/RO
+      guard then `cas_auto_gc_sweep_locked(s)`. Out-of-band
+      reclaimed paddrs get `free_gen = s->current_gen` (the gen
+      of the LAST committed sync); next `stm_sync_commit`
+      reclaims via the alloc-tree sweep predicate. No spec change
+      (cas.tla::GC's atomic remove-and-mark-freed semantics cover
+      both invocation contexts). test_fs grows 91 → 97 (5 new
+      P7-CAS-5 tests covering basic reclaim, no-work no-op, arg
+      validation, RO refusal, persists-pending-across-commit,
+      idempotent retry). 35 ctest suites green default + ASan +
+      TSan in isolation. Spec posture unchanged: 21 modules / 25
+      fixed cfgs / 34 buggy cfgs. **No format break — STM_UB_VERSION
+      = 19 preserved.** Cold-tier MVP feature-complete continues;
+      the actual scrub-orchestrator wire-in (auto-call sweep on
+      scrub state COMPLETED) remains a separate follow-on.
+
 - [x] **P7-CAS-4 background-GC semantics + R51/R54 P3 closure
       round** — substantive `edc3b51` + R55 close
-      `7399004` + hash-fixup (this commit). Reorders
+      `7399004` + hash-fixup `18a2ba3`. Reorders
       `cas_auto_gc_sweep_locked` from "alloc_free first → cas_gc
       second" (P7-CAS-3) to "cas_gc first → alloc_free second" so a
       concurrent stm_cas_ref bump between Phase 1 capture and

@@ -38,8 +38,26 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R55-hash-fixup. Substantive `edc3b51` +
-  R55 close `7399004`.
+- **Tip**: post-R56-hash-fixup. Substantive `<R56-substantive-hash>` +
+  R56 close `<R56-close-hash>`.
+  **P7-CAS-5 — out-of-band CAS GC entry point. Adds public API
+  `stm_sync_cas_gc_sweep(s)` exposing the (now-correct) P7-CAS-4
+  reordered sweep to orchestrators outside `stm_sync_commit`.
+  Takes `sync->lock` internally; safe from any context not already
+  holding it. Implementation is a thin wedged/RO guard +
+  `cas_auto_gc_sweep_locked(s)`. The out-of-band sweep stamps
+  PENDING entries with `free_gen = s->current_gen` (the gen of
+  the LAST committed sync); next `stm_sync_commit` reclaims via
+  the alloc-tree sweep predicate. No spec change (cas.tla::GC's
+  atomic remove-and-mark-freed semantics already cover both the
+  commit-time and out-of-band invocation contexts). test_fs
+  grows 91 → 97 (5 new tests: basic reclaim, no-work no-op,
+  arg validation, RO refusal, persists-pending-across-commit,
+  idempotent retry). 35 ctest suites green default + ASan + TSan
+  in isolation. Spec posture unchanged: 21 modules / 25 fixed
+  cfgs / 34 buggy cfgs. R56 audit forthcoming.**
+  Prior P7-CAS-4 substantive `edc3b51` + R55 close `7399004` +
+  hash fixup `18a2ba3`.
   **P7-CAS-4 — background-GC semantics + R51/R54 P3 closure round.
   Reorders `cas_auto_gc_sweep_locked` from "alloc_free first → cas_gc
   second" (P7-CAS-3) to "cas_gc first → alloc_free second" so a
