@@ -57,8 +57,8 @@ into the CAS tier (which DOES need P6) is a separate concern.
 ## Phase 7 status (overall)
 
 - [x] **P7-CAS-12 promote-decay-window per-dataset property** —
-      substantive `<P7CAS12_SUBSTANTIVE>` + R63 close
-      `<P7CAS12_RCLOSE>` + hash-fixup (this commit). Format break
+      substantive `0523cae` + R63 close
+      `473c7fa` + hash-fixup (this commit). Format break
       STM_UB_VERSION 21 → 22: STM_PROP_COUNT 4 → 5, adding
       `STM_PROP_PROMOTE_DECAY_WINDOW` (INHERITABLE; per-dataset
       override for the per-COLD read-frequency counter's decay

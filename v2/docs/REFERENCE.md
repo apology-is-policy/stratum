@@ -38,8 +38,8 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R63-hash-fixup. Substantive `<P7CAS12_SUBSTANTIVE>` +
-  R63 close `<P7CAS12_RCLOSE>`.
+- **Tip**: post-R63-hash-fixup. Substantive `0523cae` +
+  R63 close `473c7fa`.
   **P7-CAS-12 — promote-decay-window per-dataset property. Format
   break STM_UB_VERSION 21 → 22: STM_PROP_COUNT 4 → 5, adding
   `STM_PROP_PROMOTE_DECAY_WINDOW` (INHERITABLE; per-dataset
