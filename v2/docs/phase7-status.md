@@ -57,7 +57,7 @@ into the CAS tier (which DOES need P6) is a separate concern.
 ## Phase 7 status (overall)
 
 - [x] **P7-CAS-5 out-of-band CAS GC entry point** — substantive
-      `<R56-substantive-hash>` + R56 close `<R56-close-hash>` +
+      `a97c870` + R56 close `cc180c9` +
       hash-fixup (this commit). Adds the public API
       `stm_sync_cas_gc_sweep(s)` that exposes the (now-correct)
       P7-CAS-4 reordered sweep to orchestrators outside

@@ -38,8 +38,8 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R56-hash-fixup. Substantive `<R56-substantive-hash>` +
-  R56 close `<R56-close-hash>`.
+- **Tip**: post-R56-hash-fixup. Substantive `a97c870` +
+  R56 close `cc180c9`.
   **P7-CAS-5 — out-of-band CAS GC entry point. Adds public API
   `stm_sync_cas_gc_sweep(s)` exposing the (now-correct) P7-CAS-4
   reordered sweep to orchestrators outside `stm_sync_commit`.
