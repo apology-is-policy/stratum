@@ -38,8 +38,8 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R57-hash-fixup. Substantive `<R57-substantive-hash>` +
-  R57 close `<R57-close-hash>`.
+- **Tip**: post-R57-hash-fixup. Substantive `b1a4816` +
+  R57 close `8412194`.
   **P7-CAS-6 — scrub-orchestrator wrapper. Adds public API
   `stm_sync_scrub_step_with_cas_gc(s, sc, *out_cas_gc_err)` that
   drives one `stm_scrub_step` and fires `stm_sync_cas_gc_sweep`

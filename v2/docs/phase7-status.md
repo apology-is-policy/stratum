@@ -57,7 +57,7 @@ into the CAS tier (which DOES need P6) is a separate concern.
 ## Phase 7 status (overall)
 
 - [x] **P7-CAS-6 scrub-orchestrator wrapper** — substantive
-      `<R57-substantive-hash>` + R57 close `<R57-close-hash>` +
+      `b1a4816` + R57 close `8412194` +
       hash-fixup (this commit). Adds
       `stm_sync_scrub_step_with_cas_gc(s, sc, *out_cas_gc_err)`
       that drives one `stm_scrub_step` and fires
