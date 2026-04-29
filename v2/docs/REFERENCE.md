@@ -65,16 +65,16 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   (parametric over Properties; existing INHERITABLE-class
   invariants already cover the new property). cas.tla unchanged
   (the bump logic is heuristic state, not load-bearing). **No
-  spec extension required.** test_dataset grows 61 → 63 (2 new
-  P7-CAS-12 tests: kind-classifier + chain-inheritance + zero-as-
-  legal-value); the existing `dataset_persist_commit_load_roundtrip`
-  exercises slot-4 in the v22 layout. test_fs grows 135 → 139 (4
-  new P7-CAS-12 tests: small-window-resets-counter, default-
-  preserves-baseline, inherits-from-parent-dataset, local-zero-
-  resolves-to-default). test_pool UB-version assertion bumped
-  21 → 22. 35 ctest suites green default + ASan + TSan in
-  isolation. Spec posture unchanged: 21 modules / 25 fixed cfgs
-  / 34 buggy cfgs.**
+  spec extension required.** test_dataset grows 59 → 61 (2 new
+  P7-CAS-12 tests: chain-inheritance + zero-as-legal-value, plus
+  kind-classifier extension); the existing
+  `dataset_persist_commit_load_roundtrip` exercises slot-4 in the
+  v22 layout. test_fs grows 135 → 139 (4 new P7-CAS-12 tests:
+  small-window-resets-counter, default-preserves-baseline,
+  inherits-from-parent-dataset, local-zero-resolves-to-default).
+  test_pool UB-version assertion bumped 21 → 22. 35 ctest suites
+  green default + ASan + TSan in isolation. Spec posture
+  unchanged: 21 modules / 25 fixed cfgs / 34 buggy cfgs.**
   Prior P7-CAS-11 substantive `51c5cc6` + R62 close `ee00bdf` +
   hash fixup `e5b5238`.
   **P7-CAS-11 — promotion (cold → hot) heuristic v1. Format

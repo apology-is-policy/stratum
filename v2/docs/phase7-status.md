@@ -79,8 +79,9 @@ into the CAS tier (which DOES need P6) is a separate concern.
       INHERITABLE-class invariants already cover the new
       property). cas.tla unchanged (the bump logic is heuristic
       state, not load-bearing). **No spec extension required.**
-      test_dataset 61 → 63 (kind classifier + chain inheritance +
-      explicit-zero-as-legal-value); existing
+      test_dataset 59 → 61 (chain inheritance +
+      explicit-zero-as-legal-value, plus kind-classifier
+      extension); existing
       `dataset_persist_commit_load_roundtrip` extended to exercise
       slot-4 in the v22 layout. test_fs 135 → 139 (small-window
       resets, default preserves baseline, inherits from parent,

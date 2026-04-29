@@ -242,7 +242,7 @@ runtime).
 
 | Suite | Count | Coverage |
 |---|---|---|
-| `test_dataset` | 63 | Lifecycle (create/destroy/rename/move w/ all error paths); concurrent Create stress (8 threads × 100 ops); IdMonotonic / BirthTxgMonotonic / SiblingNameUnique / ForestStructure / RootInvariant; property API (5 props × 3 kinds × inherit-walk); STM_PROP_PROMOTE_DECAY_WINDOW chain inheritance + explicit-zero-as-legal-value (P7-CAS-12); clone create + arg validation + sibling-collision; promote semantics; clones_count_for_snap; persist roundtrip including pool defaults, ABSENT slots, properties (all 5 slots in v22 layout), clones, and post-mount counters; idempotent commit; tamper detection (csum/key/gen); next_id + current_txg seeding from on-disk + UB. |
+| `test_dataset` | 61 | Lifecycle (create/destroy/rename/move w/ all error paths); concurrent Create stress (8 threads × 100 ops); IdMonotonic / BirthTxgMonotonic / SiblingNameUnique / ForestStructure / RootInvariant; property API (5 props × 3 kinds × inherit-walk); STM_PROP_PROMOTE_DECAY_WINDOW chain inheritance + explicit-zero-as-legal-value (P7-CAS-12); clone create + arg validation + sibling-collision; promote semantics; clones_count_for_snap; persist roundtrip including pool defaults, ABSENT slots, properties (all 5 slots in v22 layout), clones, and post-mount counters; idempotent commit; tamper detection (csum/key/gen); next_id + current_txg seeding from on-disk + UB. |
 | `test_sync` | 24 | Mount/unmount roundtrip via sync handle; snap delete refused with clone (cb wires through); destroy-all-clones unblocks delete; clone state survives mount with cb rehydration. |
 
 ## Status

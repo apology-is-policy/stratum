@@ -836,6 +836,20 @@ stm_status stm_dataset_clones_count_for_snap(const stm_dataset_index *idx,
  * fail at stm_btree_mt_insert with STM_ERANGE. Keeping the math here
  * as a comment for reviewers. */
 
+/* R63 P3-3: the on-disk local_set_bitmap is encoded as a uint16_t
+ * (le16 at offset 28). The encoder/decoder construct the validation
+ * mask as `(uint16_t)((1u << STM_PROP_COUNT) - 1u)` — at
+ * STM_PROP_COUNT > 16 the cast silently truncates and the
+ * anti-tamper check on bitmap bits beyond `STM_PROP_COUNT - 1`
+ * regresses. A future STM_PROP_COUNT bump that exceeds 16 must
+ * also widen the bitmap to le32 (or split into multiple le16s) +
+ * bump STM_UB_VERSION accordingly. Defense-in-depth: fail the
+ * compile loudly so the bump that breaks this gets surfaced
+ * before runtime. */
+_Static_assert(STM_PROP_COUNT <= 16,
+               "DS local_set_bitmap is le16; STM_PROP_COUNT must fit. "
+               "Widen the on-disk bitmap field before bumping past 16.");
+
 /* ---- key + value codec (caller must hold idx->lock for slot reads) ---- */
 
 static void ds_encode_key(uint64_t key_val, uint8_t out[DS_KEY_LEN]) {
