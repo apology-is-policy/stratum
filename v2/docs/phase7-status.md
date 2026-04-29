@@ -57,8 +57,8 @@ into the CAS tier (which DOES need P6) is a separate concern.
 ## Phase 7 status (overall)
 
 - [x] **P7-CAS-4 background-GC semantics + R51/R54 P3 closure
-      round** — substantive `<R55-substantive-hash>` + R55 close
-      `<R55-close-hash>` + hash-fixup (this commit). Reorders
+      round** — substantive `edc3b51` + R55 close
+      `7399004` + hash-fixup (this commit). Reorders
       `cas_auto_gc_sweep_locked` from "alloc_free first → cas_gc
       second" (P7-CAS-3) to "cas_gc first → alloc_free second" so a
       concurrent stm_cas_ref bump between Phase 1 capture and

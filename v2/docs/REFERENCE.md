@@ -38,8 +38,8 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R55-hash-fixup. Substantive `<R55-substantive-hash>` +
-  R55 close `<R55-close-hash>`.
+- **Tip**: post-R55-hash-fixup. Substantive `edc3b51` +
+  R55 close `7399004`.
   **P7-CAS-4 — background-GC semantics + R51/R54 P3 closure round.
   Reorders `cas_auto_gc_sweep_locked` from "alloc_free first → cas_gc
   second" (P7-CAS-3) to "cas_gc first → alloc_free second" so a
