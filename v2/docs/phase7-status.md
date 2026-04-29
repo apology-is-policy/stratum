@@ -57,8 +57,8 @@ into the CAS tier (which DOES need P6) is a separate concern.
 ## Phase 7 status (overall)
 
 - [x] **P7-CAS-10 out-of-band chunk store wire shape** —
-      substantive (this commit) + R61 close (next) + hash-fixup
-      (after). Closes the on-wire dedup gap from P7-CAS-9.
+      substantive `21449cc` + R61 close `bebf4b7` + hash-fixup
+      (this commit). Closes the on-wire dedup gap from P7-CAS-9.
       Wire format break STM_SEND_VERSION 1 → 2: new
       `STM_SEND_REC_CHUNK = 4` record kind shipping each unique
       cold-content hash exactly once (32-byte BLAKE3-256 hash +

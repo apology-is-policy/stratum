@@ -38,8 +38,8 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R61-hash-fixup (planned). Substantive (this
-  commit) + R61 close (next) + hash-fixup (after).
+- **Tip**: post-R61-hash-fixup. Substantive `21449cc` +
+  R61 close `bebf4b7`.
   **P7-CAS-10 — out-of-band chunk store wire shape. Closes the
   on-wire dedup gap from P7-CAS-9. Wire format break
   STM_SEND_VERSION 1 → 2: new `STM_SEND_REC_CHUNK = 4` record
