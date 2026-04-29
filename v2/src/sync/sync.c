@@ -6383,6 +6383,52 @@ stm_status stm_sync_scrub_install_production_cb(stm_sync *sync, stm_scrub *sc)
     return stm_scrub_set_verify_cb(sc, sync_scrub_verify_cb, sync);
 }
 
+/* P7-CAS-6: scrub-orchestrator wrapper. See sync.h for the
+ * contract. Drives stm_scrub_step + observes RUNNING→COMPLETED via
+ * pre/post stm_scrub_status_get. On the transition, fires
+ * stm_sync_cas_gc_sweep so the just-finished scrub pass's
+ * accumulated CAS deref obligations get reclaimed promptly.
+ *
+ * No nested locks: each underlying call takes its locks then
+ * releases. stm_scrub_step takes sc->lock + pool->rdlock for the
+ * step duration; stm_scrub_status_get takes sc->lock briefly; the
+ * sweep takes pool.rdlock + sync.lock. All released between calls.
+ *
+ * Best-effort sweep error reporting: a sweep failure (e.g.,
+ * STM_ENOMEM under sustained pressure) doesn't promote to the
+ * wrapper's return value because the scrub step itself succeeded.
+ * Operators who want to observe sweep errors pass a non-NULL
+ * out_cas_gc_err and inspect it post-call. */
+stm_status stm_sync_scrub_step_with_cas_gc(stm_sync *s, stm_scrub *sc,
+                                              stm_status *out_cas_gc_err)
+{
+    if (!s || !sc) return STM_EINVAL;
+    if (out_cas_gc_err) *out_cas_gc_err = STM_OK;
+
+    stm_scrub_status before = {0};
+    stm_status sb = stm_scrub_status_get(sc, &before);
+    if (sb != STM_OK) return sb;
+
+    stm_status step_err = stm_scrub_step(sc);
+    if (step_err != STM_OK) return step_err;
+
+    stm_scrub_status after = {0};
+    stm_status sa = stm_scrub_status_get(sc, &after);
+    if (sa != STM_OK) return sa;
+
+    /* Fire the sweep on the RUNNING→COMPLETED transition. Other
+     * transitions (RUNNING→RUNNING, RUNNING→PAUSED, IDLE→IDLE,
+     * COMPLETED→COMPLETED) skip the sweep — the wrapper is a no-
+     * orchestration-overhead passthrough for those cases. */
+    if (before.state == STM_SCRUB_STATE_RUNNING &&
+        after.state == STM_SCRUB_STATE_COMPLETED) {
+        stm_status cas_err = stm_sync_cas_gc_sweep(s);
+        if (out_cas_gc_err) *out_cas_gc_err = cas_err;
+    }
+
+    return STM_OK;
+}
+
 size_t stm_sync_dek_count(const stm_sync *s)
 {
     if (!s) return 0;

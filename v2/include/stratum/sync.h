@@ -933,6 +933,53 @@ struct stm_scrub;
 typedef struct stm_scrub stm_scrub;
 
 /*
+ * P7-CAS-6: scrub-orchestrator wrapper. Drives one `stm_scrub_step`
+ * call and, if the step transitions the scrub state from RUNNING to
+ * COMPLETED, fires `stm_sync_cas_gc_sweep(s)` to reclaim refcount=0
+ * CAS entries accumulated during the just-finished pass. This keeps
+ * cold-tier reclamation in pace with scrub passes — the natural
+ * cadence for an orchestrator that already drives scrub.
+ *
+ * Semantics:
+ *   - Pre-step: capture scrub state via `stm_scrub_status_get`.
+ *   - Call `stm_scrub_step(sc)`. Return its status if non-OK; the
+ *     sweep is NOT fired in that case (scrub failure is the
+ *     load-bearing signal).
+ *   - Post-step: capture state again. If pre==RUNNING and
+ *     post==COMPLETED, the pass just finished — fire the sweep.
+ *   - The sweep's status is reported via `*out_cas_gc_err` (best-
+ *     effort: a sweep error doesn't promote to the wrapper's return
+ *     value, since the scrub step itself succeeded). Pass NULL to
+ *     suppress.
+ *
+ * Lock posture: each underlying call takes its own locks
+ * sequentially; no nested holding. `stm_scrub_step` takes
+ * `sc->lock + pool->rdlock`; `stm_scrub_status_get` takes
+ * `sc->lock` briefly; `stm_sync_cas_gc_sweep` takes
+ * `pool.rdlock + sync.lock`. All released between calls — no
+ * lock-graph cycle.
+ *
+ * Returns:
+ *   STM_OK     — step ran (possibly with sweep also firing); check
+ *                `*out_cas_gc_err` for sweep status.
+ *   STM_EINVAL — NULL `s` or `sc`.
+ *   other      — passthrough from `stm_scrub_step` or
+ *                `stm_scrub_status_get`. Sweep not fired.
+ *
+ * Use cases:
+ *   - Production scrub-runner orchestrators (the main use case).
+ *   - Test harnesses that want to drive a scrub pass and observe
+ *     CAS reclamation in lockstep.
+ *
+ * Direct callers of `stm_scrub_step` who don't want the auto-sweep
+ * behavior can continue to use `stm_scrub_step` directly + invoke
+ * `stm_sync_cas_gc_sweep` on their own cadence.
+ */
+STM_MUST_USE
+stm_status stm_sync_scrub_step_with_cas_gc(stm_sync *s, stm_scrub *sc,
+                                              stm_status *out_cas_gc_err);
+
+/*
  * P7-4: POSIX-shape extent write/read with full COW routing.
  *
  * `stm_sync_write_extent` reserves blocks for a fresh extent,

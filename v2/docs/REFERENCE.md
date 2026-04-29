@@ -38,8 +38,28 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R56-hash-fixup. Substantive `a97c870` +
-  R56 close `cc180c9`.
+- **Tip**: post-R57-hash-fixup. Substantive `<R57-substantive-hash>` +
+  R57 close `<R57-close-hash>`.
+  **P7-CAS-6 — scrub-orchestrator wrapper. Adds public API
+  `stm_sync_scrub_step_with_cas_gc(s, sc, *out_cas_gc_err)` that
+  drives one `stm_scrub_step` and fires `stm_sync_cas_gc_sweep`
+  on the RUNNING→COMPLETED state transition. Purely compositional
+  on top of P7-CAS-5: no scrub-side API changes, no new locking,
+  no spec change. The natural cadence for cold-tier reclamation
+  in production scrub-runner orchestrators. Sweep status surfaced
+  via the out-param (best-effort: a sweep failure doesn't fail
+  the scrub step itself). Production pattern documented in
+  `reference/15-cas.md`'s new Orchestration section. test_fs
+  grows 97 → 101 (4 new tests: completion-fires-sweep, RUNNING-
+  state-no-sweep, IDLE-state-no-sweep, arg validation). 35 ctest
+  suites green default + ASan + TSan in isolation. Spec posture
+  unchanged: 21 modules / 25 fixed cfgs / 34 buggy cfgs. R57
+  audit forthcoming. Cold-tier orchestration is now end-to-end:
+  in-commit sweep + out-of-band sweep + scrub-driven sweep all
+  share the same `cas_auto_gc_sweep_locked` core under the
+  P7-CAS-4 reordered semantics.**
+  Prior P7-CAS-5 substantive `a97c870` + R56 close `cc180c9` +
+  hash fixup `7813552`.
   **P7-CAS-5 — out-of-band CAS GC entry point. Adds public API
   `stm_sync_cas_gc_sweep(s)` exposing the (now-correct) P7-CAS-4
   reordered sweep to orchestrators outside `stm_sync_commit`.

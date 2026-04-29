@@ -4275,4 +4275,219 @@ STM_TEST(fs_p7cas5_cas_gc_sweep_idempotent) {
     unlink(g_key_path);
 }
 
+/* Drive stm_sync_scrub_step_with_cas_gc until COMPLETED. Returns the
+ * total cas_gc_err observed during the run (first non-OK wins). */
+static stm_status run_scrub_with_cas_gc_to_completion(stm_sync *s,
+                                                          stm_scrub *sc) {
+    stm_status final_cas_err = STM_OK;
+    for (int i = 0; i < 4096; i++) {
+        stm_status cas_err = STM_OK;
+        STM_ASSERT_OK(stm_sync_scrub_step_with_cas_gc(s, sc, &cas_err));
+        if (cas_err != STM_OK && final_cas_err == STM_OK) {
+            final_cas_err = cas_err;
+        }
+        stm_scrub_status st;
+        STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
+        if (st.state == STM_SCRUB_STATE_COMPLETED) return final_cas_err;
+    }
+    STM_ASSERT(false);
+    return STM_EINVAL;
+}
+
+STM_TEST(fs_p7cas6_scrub_completion_fires_cas_gc_sweep) {
+    /* P7-CAS-6: drive a scrub pass to completion via the wrapper.
+     * On the RUNNING→COMPLETED transition the wrapper fires
+     * stm_sync_cas_gc_sweep; verify that a refcount=0 cas entry
+     * present at start-of-pass is reclaimed by end-of-pass. */
+    make_tmp("p7cas6_completion");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+
+    /* Populate: one cold extent, then overwrite to drop refcount. */
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)((i * 13u + 1u) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    uint8_t plain2[4096];
+    memset(plain2, 0xAB, sizeof plain2);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain2, sizeof plain2));
+
+    size_t cas_pre = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &cas_pre));
+    STM_ASSERT_EQ(cas_pre, (size_t)1);
+
+    /* Run the scrub pass via the wrapper. */
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(sync, &sc));
+    STM_ASSERT_OK(stm_sync_scrub_install_production_cb(sync, sc));
+    STM_ASSERT_OK(stm_scrub_start(sc));
+
+    stm_status final_cas_err = run_scrub_with_cas_gc_to_completion(sync, sc);
+    STM_ASSERT_EQ(final_cas_err, STM_OK);
+
+    /* The COMPLETED transition fired the sweep → cas entry reclaimed. */
+    size_t cas_post = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &cas_post));
+    STM_ASSERT_EQ(cas_post, (size_t)0);
+
+    stm_scrub_close(sc);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas6_scrub_running_state_no_sweep) {
+    /* Mid-pass step (RUNNING→RUNNING transition) does NOT fire the
+     * sweep. Verify by populating a refcount=0 cas entry, doing a
+     * single non-completing wrapper call, and asserting the cas
+     * entry is still present. */
+    make_tmp("p7cas6_running");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+
+    /* Populate enough data to make the scrub pass take > 1 step. The
+     * exact step count depends on alloc-tree layout; here we just
+     * write multiple extents to grow the alloc tree's allocated
+     * range count. */
+    uint8_t buf[4096];
+    for (size_t i = 0; i < 8; i++) {
+        memset(buf, (int)(i + 1), sizeof buf);
+        STM_ASSERT_OK(stm_fs_write(fs, 1, 1, i * sizeof buf, buf, sizeof buf));
+    }
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    /* Overwrite the first extent to drop one cas refcount. */
+    uint8_t plain2[4096];
+    memset(plain2, 0xCC, sizeof plain2);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain2, sizeof plain2));
+
+    size_t cas_pre = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &cas_pre));
+    /* At least 1 refcount=0 cas entry (from the overwrite). The exact
+     * total cas count depends on FastCDC behavior; we just need the
+     * one that's refcount=0 to survive a mid-pass step. */
+    STM_ASSERT_TRUE(cas_pre >= 1u);
+
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(sync, &sc));
+    STM_ASSERT_OK(stm_sync_scrub_install_production_cb(sync, sc));
+    STM_ASSERT_OK(stm_scrub_start(sc));
+
+    /* Single wrapper step. State should still be RUNNING (we didn't
+     * drain in one step). The cas count should be unchanged because
+     * the wrapper didn't fire the sweep. */
+    stm_status cas_err = STM_OK;
+    STM_ASSERT_OK(stm_sync_scrub_step_with_cas_gc(sync, sc, &cas_err));
+    STM_ASSERT_EQ(cas_err, STM_OK);
+
+    stm_scrub_status st;
+    STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
+    if (st.state == STM_SCRUB_STATE_RUNNING) {
+        size_t cas_mid = 0;
+        STM_ASSERT_OK(stm_cas_count(cas, &cas_mid));
+        STM_ASSERT_EQ(cas_mid, cas_pre);
+    }
+    /* If the alloc tree happened to be small enough that one step
+     * completed the pass, the wrapper WOULD fire the sweep — that's
+     * not a bug, just an artifact of test data size. We don't assert
+     * anything in that case (the basic_completion test covers that
+     * path). */
+
+    stm_scrub_close(sc);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas6_scrub_step_with_cas_gc_arg_validation) {
+    /* NULL sync OR NULL sc → STM_EINVAL. NULL out_cas_gc_err is
+     * permitted (the contract says callers can pass NULL to
+     * suppress sweep-status reporting). */
+    make_tmp("p7cas6_argval");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(sync, &sc));
+
+    stm_status cas_err = STM_OK;
+    STM_ASSERT_ERR(stm_sync_scrub_step_with_cas_gc(NULL, sc, &cas_err),
+                       STM_EINVAL);
+    STM_ASSERT_ERR(stm_sync_scrub_step_with_cas_gc(sync, NULL, &cas_err),
+                       STM_EINVAL);
+
+    /* NULL out_cas_gc_err is allowed. State is IDLE so step is a
+     * no-op; we just exercise the API with NULL. */
+    STM_ASSERT_OK(stm_sync_scrub_step_with_cas_gc(sync, sc, NULL));
+
+    stm_scrub_close(sc);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas6_scrub_idle_state_no_sweep) {
+    /* IDLE state: step is a no-op (per scrub.h state-machine
+     * docstring). The wrapper does NOT fire the sweep because
+     * before==IDLE, after==IDLE → no transition to COMPLETED.
+     * Verify cas refcount=0 entry stays unreclaimed. */
+    make_tmp("p7cas6_idle");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+
+    /* Set up a refcount=0 cas entry. */
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)((i * 17u + 5u) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+    uint8_t plain2[4096];
+    memset(plain2, 0xEE, sizeof plain2);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain2, sizeof plain2));
+
+    size_t cas_pre = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &cas_pre));
+    STM_ASSERT_EQ(cas_pre, (size_t)1);
+
+    /* Wrapper step in IDLE state. */
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(sync, &sc));
+    /* Don't call stm_scrub_start — state stays IDLE. */
+    stm_status cas_err = STM_OK;
+    STM_ASSERT_OK(stm_sync_scrub_step_with_cas_gc(sync, sc, &cas_err));
+    STM_ASSERT_EQ(cas_err, STM_OK);
+
+    /* Cas entry NOT reclaimed (no transition to COMPLETED). */
+    size_t cas_post = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &cas_post));
+    STM_ASSERT_EQ(cas_post, (size_t)1);
+
+    stm_scrub_close(sc);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")

@@ -56,9 +56,33 @@ into the CAS tier (which DOES need P6) is a separate concern.
 
 ## Phase 7 status (overall)
 
+- [x] **P7-CAS-6 scrub-orchestrator wrapper** — substantive
+      `<R57-substantive-hash>` + R57 close `<R57-close-hash>` +
+      hash-fixup (this commit). Adds
+      `stm_sync_scrub_step_with_cas_gc(s, sc, *out_cas_gc_err)`
+      that drives one `stm_scrub_step` and fires
+      `stm_sync_cas_gc_sweep` on the RUNNING→COMPLETED state
+      transition. Purely compositional — uses
+      `stm_scrub_status_get` pre/post-step to detect the
+      transition; no scrub-side API changes; no new locking.
+      The natural cadence for cold-tier reclamation: scrub-
+      pass-end is when accumulated refcount=0 cas entries are
+      typically ready for reclaim. Sweep status reported via
+      the out-param (best-effort: a sweep failure doesn't fail
+      the scrub step itself). Production scrub-runner pattern
+      documented in `reference/15-cas.md`'s Orchestration
+      section. test_fs grows 97 → 101 (4 new P7-CAS-6 tests:
+      completion-fires-sweep, RUNNING-state-no-sweep, IDLE-
+      state-no-sweep, arg validation). 35 ctest suites green
+      default + ASan + TSan in isolation. Spec posture
+      unchanged: 21 modules / 25 fixed cfgs / 34 buggy cfgs.
+      **No format break — STM_UB_VERSION = 19 preserved.**
+      Closes the P7-CAS-5 follow-on; cold-tier orchestration
+      now end-to-end with no remaining scaffold gaps.
+
 - [x] **P7-CAS-5 out-of-band CAS GC entry point** — substantive
       `a97c870` + R56 close `cc180c9` +
-      hash-fixup (this commit). Adds the public API
+      hash-fixup `7813552`. Adds the public API
       `stm_sync_cas_gc_sweep(s)` that exposes the (now-correct)
       P7-CAS-4 reordered sweep to orchestrators outside
       `stm_sync_commit`. Takes `sync->lock` internally; safe to

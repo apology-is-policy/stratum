@@ -87,7 +87,8 @@ void stm_ad_cas_pack(const stm_ad_cas *ad,
                      uint8_t out[STM_AD_CAS_PACKED_LEN]);
 ```
 
-`include/stratum/sync.h` accessor + out-of-band sweep entry point:
+`include/stratum/sync.h` accessor + out-of-band sweep entry point
++ scrub-orchestrator wrapper:
 
 ```c
 stm_cas_index *stm_sync_cas_index(stm_sync *s);
@@ -97,6 +98,12 @@ stm_cas_index *stm_sync_cas_index(stm_sync *s);
  * STM_EINVAL on guard failure, OR the first per-tuple non-OK
  * status from the sweep (idempotent retry). */
 stm_status stm_sync_cas_gc_sweep(stm_sync *s);
+
+/* P7-CAS-6: scrub-orchestrator wrapper. Drives one stm_scrub_step
+ * + fires stm_sync_cas_gc_sweep on RUNNING→COMPLETED transition.
+ * Sweep status surfaced via *out_cas_gc_err (best-effort). */
+stm_status stm_sync_scrub_step_with_cas_gc(stm_sync *s, stm_scrub *sc,
+                                              stm_status *out_cas_gc_err);
 ```
 
 `stm_sync_cas_gc_sweep` invokes the same two-phase shape used
@@ -468,6 +475,55 @@ doesn't track CAS hashes — see "Snapshot interaction" below), so
 direct `stm_alloc_free` is correct (no need for the refcount-aware
 `sync_drop_paddr_locked` route).
 
+## Orchestration patterns (P7-CAS-5 + P7-CAS-6)
+
+The auto-GC sweep ships in three invocation modes:
+
+1. **In-commit (always-on)**: `stm_sync_commit` calls
+   `cas_auto_gc_sweep_locked` BEFORE the per-device alloc_commit
+   loop. Existing P7-CAS-2/3/4 behavior; reclamation tracks
+   commit cadence.
+
+2. **Out-of-band manual** (P7-CAS-5): `stm_sync_cas_gc_sweep(s)`
+   runs the same sweep without waiting for a commit. Use cases:
+   admin `/ctl/.../cas-gc` triggers, periodic timers, test
+   harnesses. Caller-driven cadence.
+
+3. **Scrub-orchestrator wrapper** (P7-CAS-6):
+   `stm_sync_scrub_step_with_cas_gc(s, sc, &cas_err)` drives
+   `stm_scrub_step` and fires `stm_sync_cas_gc_sweep` on the
+   RUNNING→COMPLETED transition. This is the natural cadence
+   for cold-tier reclamation: scrub-pass-end is when accumulated
+   refcount=0 entries are typically ready for reclaim. Sweep
+   status surfaced via the out-param (best-effort: a sweep
+   failure doesn't fail the scrub step).
+
+The wrapper is purely compositional — it calls
+`stm_scrub_status_get` pre/post-step + invokes
+`stm_sync_cas_gc_sweep` based on the state transition. No new
+locking, no new spec actions, no scrub-side changes. Direct
+callers of `stm_scrub_step` who want different cadence can
+continue using the lower-level API + invoke
+`stm_sync_cas_gc_sweep` on their own schedule.
+
+Production scrub-runner pattern:
+
+```c
+stm_scrub *sc = ...;
+stm_sync_scrub_install_production_cb(sync, sc);
+stm_scrub_start(sc);
+while (running) {
+    stm_status cas_err = STM_OK;
+    stm_status rc = stm_sync_scrub_step_with_cas_gc(sync, sc, &cas_err);
+    if (rc != STM_OK) handle(rc);
+    if (cas_err != STM_OK) log_warn(cas_err);
+    /* Optional: pause / yield. */
+}
+```
+
+The wrapper exits the loop at COMPLETED naturally (each step
+post-completion is a no-op per scrub.h's state-machine docstring).
+
 ## Cold-extent reflink (P7-CAS-3)
 
 `stm_sync_reflink` accepts source files containing COLD extents (was
@@ -821,6 +877,6 @@ precondition broadens the state space modestly).
 | Auto-GC FAULTED/REMOVED-device alloc_free skip | ✅ P7-CAS-4 (R51 P3-4) | — |
 | Cold-dead-list capacity pre-check | ✅ P7-CAS-4 (R54 P3-2) | — |
 | Out-of-band CAS GC entry point (`stm_sync_cas_gc_sweep`) | ✅ P7-CAS-5 | — |
-| Scrub-orchestrator wire-in (auto-call sweep on scrub COMPLETED) | — | follow-on (orchestrator placement) |
-| Migration policy heuristic (NOVEL #6 v1) | — | post-P7-CAS-5 |
+| Scrub-orchestrator wrapper (`stm_sync_scrub_step_with_cas_gc`) | ✅ P7-CAS-6 | — |
+| Migration policy heuristic (NOVEL #6 v1) | — | post-P7-CAS-6 |
 | Cross-pool dedup | — | post-v2.0 (NOVEL #3) |
