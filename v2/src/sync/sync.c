@@ -4117,6 +4117,13 @@ typedef struct {
     uint64_t   ino;
     uint64_t   range_off;
     uint64_t   range_len;
+    /* P7-CAS-4 R55 P2-2: when set, the cb captures ONLY extents whose
+     * `off >= range_off` (past-extents only, excluding the crossing
+     * extent that has off < range_off). Used by stm_sync_truncate's
+     * pre-Phase-2 tcox capture, where the crossing-cold extent's
+     * deref obligation is handled by the subsequent prefix write's
+     * own cox bookend — avoiding double-deref. */
+    bool       past_only;
     uint8_t   *hashes;          /* flat buffer: n_hashes * STM_CAS_HASH_LEN */
     size_t     n_hashes;
     size_t     cap_hashes;
@@ -4132,6 +4139,8 @@ static bool cold_overlap_cb(const stm_extent_record *e, void *cx) {
      *     e->off < range_off + range_len AND range_off < e->off + e->len. */
     if (!(e->off < ctx->range_off + ctx->range_len)) return true;
     if (!(ctx->range_off < e->off + e->len)) return true;
+    /* P7-CAS-4 R55 P2-2: past_only filter. */
+    if (ctx->past_only && e->off < ctx->range_off) return true;
 
     if (ctx->n_hashes == ctx->cap_hashes) {
         size_t new_cap = ctx->cap_hashes == 0 ? 8u : ctx->cap_hashes * 2u;
@@ -4805,6 +4814,64 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
         }
     }
 
+    /* P7-CAS-4 R55 P2-2: pre-scan past-cold-extents AND combined-
+     * capacity check BEFORE Phase 2's prefix write. Without this
+     * reordering, the prefix write would consume one cold-dead-list
+     * slot (when the crossing extent is COLD), and the truncate-body
+     * tcox reserve below could then fire STM_ENOSPC after extent_idx
+     * had already been mutated by the prefix write — producing a
+     * user-visible "truncate failed" with a partial mutation
+     * persistent in the index.
+     *
+     * Combined need = (1 if has_crossing AND rec.kind == COLD)
+     *                + tcox.n_hashes (past-cold-record count).
+     *
+     * The prefix write's own internal reserve check (inside
+     * stm_sync_write_extent_locked) will then succeed because the
+     * combined capacity has been verified upfront.
+     *
+     * Note: the tcox pre-scan walks the extent index BEFORE the
+     * prefix write mutates it. Phase 2's overwrite drops the
+     * crossing extent (rec) and inserts a new HOT prefix at
+     * [rec.off, new_size), which is fully BELOW new_size — past-
+     * extents at off >= new_size are untouched, so tcox's hash set
+     * remains accurate when we route them through the truncate-
+     * body bookend below. */
+    cold_overlap_ctx tcox = { .ds = dataset_id, .ino = ino,
+                                .range_off = new_size,
+                                .range_len = UINT64_MAX - new_size,
+                                .past_only = true,
+                                .err = STM_OK };
+    if (s->cas_idx) {
+        stm_status its = stm_extent_iter(s->extent_idx, dataset_id, ino,
+                                            cold_overlap_cb, &tcox);
+        if (its != STM_OK || tcox.err != STM_OK) {
+            free(tcox.hashes);
+            free(drop_idx_buf);
+            free(paddrs_buf);
+            pthread_mutex_unlock(&s->lock);
+            return tcox.err != STM_OK ? tcox.err : its;
+        }
+    }
+
+    if (s->cas_idx) {
+        size_t prefix_cold_consume =
+            (has_crossing && rec.kind == STM_EXTENT_KIND_COLD) ? 1u : 0u;
+        size_t combined_n = tcox.n_hashes + prefix_cold_consume;
+        if (combined_n > 0) {
+            bool can_accept = true;
+            stm_status rs = stm_snapshot_index_cold_dead_list_reserve(
+                    s->snap_idx, dataset_id, combined_n, &can_accept);
+            if (rs != STM_OK || !can_accept) {
+                free(tcox.hashes);
+                free(drop_idx_buf);
+                free(paddrs_buf);
+                pthread_mutex_unlock(&s->lock);
+                return rs != STM_OK ? rs : STM_ENOSPC;
+            }
+        }
+    }
+
     /* Phase 2: shrink the crossing extent by read+decrypt+re-encrypt
      * of the kept prefix. stm_sync_write_extent_locked's extent_overwrite
      * drops the original (now superseded) and routes its paddrs
@@ -4859,55 +4926,6 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
             free(paddrs_buf);
             pthread_mutex_unlock(&s->lock);
             return ws;
-        }
-    }
-
-    /* P7-CAS-2: pre-scan past-extents for any COLD records and
-     * capture their content_hashes. The drop in Phase 3 will remove
-     * those records but truncate_into only returns paddrs (HOT
-     * replicas); CAS deref needs the hashes. Pre-scanning under
-     * s->lock ensures the captured set matches what truncate_into
-     * drops. We use the extent_iter cb with a custom "off >= new_size"
-     * filter that overlap_ctx's range_off=new_size, range_len=
-     * UINT64_MAX-new_size encodes (every past-extent overlaps a
-     * range that covers all bytes from new_size up to UINT64_MAX).
-     *
-     * R50 P3-6 clarification: range_off + range_len = new_size +
-     * (UINT64_MAX - new_size) = UINT64_MAX, no overflow regardless
-     * of new_size's value (new_size ∈ [0, UINT64_MAX] from
-     * arg-validation; subtraction is well-defined under unsigned
-     * arithmetic). The overlap predicate becomes
-     * `e->off < UINT64_MAX && new_size < e->off + e->len`, which
-     * captures every extent ending strictly past `new_size` — the
-     * exact set truncate_into drops. */
-    cold_overlap_ctx tcox = { .ds = dataset_id, .ino = ino,
-                                .range_off = new_size,
-                                .range_len = UINT64_MAX - new_size,
-                                .err = STM_OK };
-    if (s->cas_idx) {
-        stm_status its = stm_extent_iter(s->extent_idx, dataset_id, ino,
-                                            cold_overlap_cb, &tcox);
-        if (its != STM_OK || tcox.err != STM_OK) {
-            free(tcox.hashes);
-            free(drop_idx_buf);
-            free(paddrs_buf);
-            pthread_mutex_unlock(&s->lock);
-            return tcox.err != STM_OK ? tcox.err : its;
-        }
-    }
-
-    /* P7-CAS-4 R54 P3-2: pre-check cold-dead-list capacity. See the
-     * matching write_extent_locked comment block for the rationale. */
-    if (s->cas_idx && tcox.n_hashes > 0) {
-        bool can_accept = true;
-        stm_status rs = stm_snapshot_index_cold_dead_list_reserve(
-                s->snap_idx, dataset_id, tcox.n_hashes, &can_accept);
-        if (rs != STM_OK || !can_accept) {
-            free(tcox.hashes);
-            free(drop_idx_buf);
-            free(paddrs_buf);
-            pthread_mutex_unlock(&s->lock);
-            return rs != STM_OK ? rs : STM_ENOSPC;
         }
     }
 
@@ -5944,10 +5962,20 @@ static stm_status cas_auto_gc_sweep_locked(stm_sync *s)
          * REMOVED-device paddrs (stm_alloc_commit's per-device loop
          * skips them too — keeping the in-RAM alloc tree dirty for a
          * device that won't persist would lose lockstep across
-         * mount cycles). */
+         * mount cycles).
+         *
+         * R55 P1-1: pool_device_info is consulted FIRST so the
+         * REMOVED-state skip beats the `s->allocs[dev] == NULL` check.
+         * After `stm_sync_finish_evacuation(N)` clears `s->allocs[N]`
+         * AND marks `di->state = REMOVED`, a CAS entry whose paddr
+         * lived on dev N would have triggered STM_EINVAL under the
+         * prior order, aborting commit. The intent of R51 P3-4 is to
+         * skip-clean for evacuated/faulted devices; the NULL-check
+         * stays as a defense-in-depth guard for ONLINE devices where
+         * a NULL allocs slot is genuine corruption. */
         for (uint8_t j = 0; j < t->n_paddrs; j++) {
             uint16_t dev = stm_paddr_device(t->paddrs[j]);
-            if (dev >= STM_POOL_DEVICES_MAX || s->allocs[dev] == NULL) {
+            if (dev >= STM_POOL_DEVICES_MAX) {
                 if (sweep_err == STM_OK) sweep_err = STM_EINVAL;
                 continue;
             }
@@ -5955,6 +5983,13 @@ static stm_status cas_auto_gc_sweep_locked(stm_sync *s)
             if (di && (di->state == STM_DEV_STATE_REMOVED ||
                        di->state == STM_DEV_STATE_FAULTED)) {
                 continue;       /* R51 P3-4: paddr unreachable for reuse */
+            }
+            if (s->allocs[dev] == NULL) {
+                /* ONLINE device with no alloc handle is genuine
+                 * corruption — surface as STM_EINVAL so the operator
+                 * sees the inconsistency at commit time. */
+                if (sweep_err == STM_OK) sweep_err = STM_EINVAL;
+                continue;
             }
             stm_status fs = stm_alloc_free(s->allocs[dev], t->paddrs[j],
                                               s->current_gen);

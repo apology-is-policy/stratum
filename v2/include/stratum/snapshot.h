@@ -368,10 +368,25 @@ stm_status stm_snapshot_index_overwrite_cold_block(stm_snapshot_index *idx,
  *     *out_can_accept = (current cold_dead_count + n_to_append) <=
  *                       STM_SNAP_COLD_DEAD_LIST_MAX.
  *
- * Lock-tradeoff: this take is BRIEF (just the count read). Caller must
- * still call overwrite_cold_block per-hash; under the sync.c caller's
- * sync->lock no concurrent snap_create / snap_delete can shift the
- * most-recent snap between the pre-check and the appends.
+ * **Caller's lock contract (R55 P2-1)**: the value of
+ * `*out_can_accept` is only valid for the subsequent
+ * `stm_snapshot_index_overwrite_cold_block` calls IF the caller holds
+ * a lock that excludes concurrent `stm_snapshot_create` /
+ * `stm_snapshot_delete` for `dataset_id` over the entire reserve+
+ * append sequence. Without that exclusion, a concurrent snap_delete
+ * could shift the dataset's "most-recent PRESENT snap" to an older
+ * snap with a near-cap cold-dead-list between the reserve check and
+ * the per-hash overwrite_cold_block calls — silently triggering the
+ * STM_ENOSPC the reserve was meant to prevent.
+ *
+ * The current production caller (`sync.c` bookends in
+ * `stm_sync_write_extent_locked` + `stm_sync_truncate`) holds
+ * `sync->lock` continuously across the reserve + the bookend's
+ * per-hash overwrite_cold_block loop, AND every snap_create /
+ * snap_delete entry point in `fs.c` also acquires `sync->lock` —
+ * giving the necessary exclusion by construction. Future callers
+ * MUST satisfy the same exclusion contract OR this API's guarantee
+ * is racy.
  *
  * STM_EINVAL on NULL idx / NULL out / dataset_id == 0.
  * STM_ECORRUPT on stale-slot signal from most_recent_locked.

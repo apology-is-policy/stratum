@@ -3909,4 +3909,104 @@ STM_TEST(fs_p7cas4_gc_reorder_refbumped_entry_keeps_paddrs_alloc) {
     unlink(g_key_path);
 }
 
+STM_TEST(fs_p7cas4_r55_truncate_crossing_cold_with_near_full_snap) {
+    /* R55 P2-2 regression: truncate-with-crossing-cold-extent reserves
+     * 1 cold-dead-list slot for the prefix-write's overwrite_cold_block
+     * (since the crossing-cold extent's hash gets dropped by the prefix
+     * write's bookend) PLUS tcox.n_hashes slots for the truncate-body's
+     * past-extent drops. Pre-R55-P2-2 fix the truncate body checked only
+     * tcox.n_hashes — so when the prefix write's slot consumed brought
+     * the snap to cap, the body's reserve(N>=1) failed STM_ENOSPC AFTER
+     * extent_idx had been mutated by the prefix write.
+     *
+     * Repro setup: cold extent_a at [0, 8192) (crossing-cold under
+     * truncate(4096)) + cold extent_b at [8192, 12288) (past-cold).
+     * Snap created after migration captures both. Drive the snap's
+     * cold-dead-list to (cap - 1). Truncate to 4096 — combined need
+     * 2 (1 for prefix dropping crossing extent_a; 1 for body
+     * dropping extent_b); free slots = 1.
+     *
+     * Pre-fix: prefix write succeeds (consumes 1 → at cap), past-
+     * extent reserve(1) fails STM_ENOSPC, extent_idx half-mutated
+     * (prefix landed; past-extents not yet truncated).
+     *
+     * Post-fix: combined-need pre-check refuses with STM_ENOSPC up
+     * front; no extent_idx mutation. */
+    make_tmp("p4_r55_trunc_combined_cap");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_snapshot_index *snap_idx = stm_sync_snapshot_index(sync);
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+
+    /* Two distinct content blocks → two distinct cold extents post-
+     * migrate (no dedup hit). */
+    uint8_t plain_a[8192];
+    uint8_t plain_b[4096];
+    for (size_t i = 0; i < sizeof plain_a; i++) plain_a[i] = (uint8_t)((i * 7u + 1u) & 0xFFu);
+    for (size_t i = 0; i < sizeof plain_b; i++) plain_b[i] = (uint8_t)((i * 13u + 9u) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain_a, sizeof plain_a));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 8192, plain_b, sizeof plain_b));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_snapshot_create(snap_idx, 1, "p4r55",
+                                          /*tree_root=*/0xC0DE,
+                                          stm_sync_current_gen(sync),
+                                          &snap_id));
+
+    /* Drive snap's cold-dead-list to (cap - 1). */
+    const size_t TARGET = (size_t)STM_SNAP_COLD_DEAD_LIST_MAX - 1u;
+    for (size_t i = 0; i < TARGET; i++) {
+        uint8_t h[STM_SNAP_HASH_LEN] = {0};
+        h[0] = 0xF0;
+        h[1] = (uint8_t)((i >> 8) & 0xFFu);
+        h[2] = (uint8_t)(i & 0xFFu);
+        bool sd = true;
+        STM_ASSERT_OK(stm_snapshot_index_overwrite_cold_block(
+                snap_idx, 1, h, &sd));
+        STM_ASSERT_TRUE(sd == false);
+    }
+
+    size_t cas_pre = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &cas_pre));
+    STM_ASSERT_EQ(cas_pre, (size_t)2);
+
+    /* Truncate to 4096 — crossing-cold extent_a [0, 8192) + past-
+     * cold extent_b [8192, 12288). Combined need 2; free 1. */
+    STM_ASSERT_ERR(stm_sync_truncate(sync, 1, 1, /*new_size=*/4096),
+                       STM_ENOSPC);
+
+    /* extent_idx unchanged: live read of off=0 returns plain_a (full
+     * 8192 bytes; the file is single-extent at this offset). */
+    uint8_t out_a[8192] = {0};
+    size_t got_a = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out_a, sizeof out_a, &got_a));
+    STM_ASSERT_MEM_EQ(plain_a, out_a, sizeof out_a);
+
+    /* Live read of off=8192 also unchanged. */
+    uint8_t out_b[4096] = {0};
+    size_t got_b = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 8192, out_b, sizeof out_b, &got_b));
+    STM_ASSERT_MEM_EQ(plain_b, out_b, sizeof out_b);
+
+    /* CAS unchanged. */
+    size_t cas_post = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &cas_post));
+    STM_ASSERT_EQ(cas_post, cas_pre);
+
+    /* Snap's cold-dead-list still at cap - 1. */
+    size_t cdc = 0;
+    STM_ASSERT_OK(stm_snapshot_cold_dead_list_count(snap_idx, snap_id, &cdc));
+    STM_ASSERT_EQ(cdc, TARGET);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")

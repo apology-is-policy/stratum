@@ -19,14 +19,19 @@ reflink + crossing-cold truncate + FastCDC sub-chunking + snap_idx
 cas.tla::ChunkedMigrateToColdK2 (K=2; K>=3 composes by induction);
 `stm_sync_write_extent_locked`'s pre-scan + post-deref realizes
 cas.tla::RehydrateOnWrite (cold-deref now snap-aware via
-`stm_snapshot_index_overwrite_cold_block` — P7-CAS-4c); the 3-phase
-transactional `cas_auto_gc_sweep_locked` (run BEFORE per-device
-alloc_commit in `stm_sync_commit`) realizes cas.tla::GC + closes the
-R50 P2-1 paddr-leak window across crash boundaries; cold-extent
-reflink composes via cas.tla's existing `BumpRef` (= `stm_cas_ref`)
-shape. Remaining deferrals (P7-CAS-4): background scrub-driven CAS
-walker (closes R51 P3-2 + P3-4), migration policy heuristic
-(NOVEL #6 v1), send/recv with cold extents.
+`stm_snapshot_index_overwrite_cold_block` — P7-CAS-4c); the
+two-phase reordered `cas_auto_gc_sweep_locked` (P7-CAS-4: cas_gc-
+then-alloc_free, run BEFORE per-device alloc_commit in
+`stm_sync_commit`) realizes cas.tla::GC + closes both the R50 P2-1
+paddr-leak window across crash boundaries AND the R51 P3-2 silent-
+skip race + R51 P3-4 FAULTED/REMOVED-device alloc_free skip; cold-
+extent reflink composes via cas.tla's existing `BumpRef`
+(= `stm_cas_ref`) shape. Remaining deferrals: background scrub-
+driven CAS walker invocation (the actual scrub-β-cb wiring; the
+sweep semantics are now safe but the wire-in is a follow-on
+chunk needing lock-graph rework + new non-_locked sweep entry
+point), migration policy heuristic (NOVEL #6 v1), send/recv with
+cold extents.
 
 ## Public API
 
