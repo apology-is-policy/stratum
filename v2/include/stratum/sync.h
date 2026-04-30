@@ -1011,8 +1011,9 @@ stm_status stm_sync_scrub_step_with_cas_gc(stm_sync *s, stm_scrub *sc,
  * ciphertext+tag, AEAD-decrypts, and copies `len` bytes to the
  * caller. Holes (no extent) return zeros.
  *
- * MVP constraints (P7-4):
- *   - len > 0, multiple of 4 KiB, ≤ 128 KiB (recordsize default).
+ * MVP constraints (P7-4; cap lifted at P7-CAS-16):
+ *   - len > 0, multiple of 4 KiB, ≤ STM_FS_RECORDSIZE_MAX (8 MiB
+ *     since UB v23; 128 KiB at v22 and earlier).
  *   - off must be 4 KiB aligned.
  *   - Single-extent per call: caller iterates for spans > recordsize.
  *
@@ -1075,8 +1076,9 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
  *     prefix-shrink committable): on pre-alloc ENOMEM, Phase 2 has
  *     not yet run and the index is unchanged.
  *   - Trade-off: longer lock-hold duration (decrypt + encrypt +
- *     bdev I/O all under s->lock); for the 128 KiB recordsize
- *     default this is acceptable. Cascade: scrub's verify cb takes
+ *     bdev I/O all under s->lock); the lift to 8 MiB recordsize at
+ *     P7-CAS-16 (UB v23) extends the lock window proportionally
+ *     versus the 128 KiB MVP. Cascade: scrub's verify cb takes
  *     s->lock briefly to look up the per-extent DEK, so concurrent
  *     truncate extends scrub-step latency by the same window (no
  *     deadlock — lock-graph stays acyclic).

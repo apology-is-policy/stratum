@@ -216,8 +216,17 @@ struct stm_sync; typedef struct stm_sync stm_sync;
  * carried the cold chunk's plaintext inline in every COLD EXTENT
  * record; v2 ships unique chunks via out-of-band STM_SEND_REC_CHUNK
  * records and references them by hash in each COLD EXTENT. v2
- * receivers refuse v1 streams with STM_EBADVERSION at HEADER apply. */
-#define STM_SEND_VERSION        2u
+ * receivers refuse v1 streams with STM_EBADVERSION at HEADER apply.
+ *
+ * P7-CAS-16: bumped 2 → 3 in lockstep with STM_UB_VERSION 22 → 23
+ * for the recordsize cap lift 128 KiB → 8 MiB. v3 raises the
+ * per-record body cap (STM_SEND_CHUNK_PLAIN_MAX) from 128 KiB to
+ * 8 MiB. v3 receivers refuse v2 streams with STM_EBADVERSION at
+ * HEADER apply because v2 senders silently truncate any
+ * `128 KiB < len <= 8 MiB` extent at the wire layer (the v2
+ * protocol invariant assumes one extent fits in one CHUNK <=
+ * 128 KiB body). */
+#define STM_SEND_VERSION        3u
 
 /* Record types (stored in the type field of every record's framing
  * header). */
@@ -251,10 +260,14 @@ typedef enum {
 #define STM_SEND_CHUNK_HASH_LEN  32u
 /* P7-CAS-10: cap on a CHUNK record's plaintext payload. Mirrors the
  * HOT EXTENT plaintext cap (which equals the per-extent recordsize
- * cap of 128 KiB). The chunk size at v1 corresponds to one extent's
- * worth of bytes; this cap will lift when the recordsize cap lifts
- * (option A — recordsize lift + cross-extent FastCDC). */
-#define STM_SEND_CHUNK_PLAIN_MAX (128u * 1024u)
+ * cap). At STM_SEND_VERSION 2 (UB v17..v22) this cap was 128 KiB;
+ * at STM_SEND_VERSION 3 (UB v23, P7-CAS-16) it lifts to 8 MiB in
+ * lockstep with STM_FS_RECORDSIZE_MAX. The chunk size at the wire
+ * layer corresponds to one extent's worth of bytes; the next lift
+ * (cross-extent FastCDC at write time) deliberately keeps a single
+ * cap on both surfaces — an extent and a CHUNK both ship at most
+ * STM_SEND_CHUNK_PLAIN_MAX bytes. */
+#define STM_SEND_CHUNK_PLAIN_MAX (8u * 1024u * 1024u)
 /* END body length (BLAKE3 csum). */
 #define STM_SEND_END_BODY_LEN    32u
 
@@ -272,13 +285,15 @@ typedef enum {
 
 /* Upper bound on a single record's full bytes (framing + body) — used
  * by recv to reject hostile/oversized records up front before any
- * dispatch. The largest legitimate record at v2 is either a HOT
- * EXTENT or a CHUNK carrying a full 128 KiB plaintext payload:
- *   HOT EXTENT: 16 (framing) + 32 (meta) + 131072 (plaintext) = 131120
- *   CHUNK:      16 (framing) + 32 (hash) + 131072 (plaintext) = 131120
+ * dispatch. The largest legitimate record at v3 (P7-CAS-16) is either
+ * a HOT EXTENT or a CHUNK carrying a full 8 MiB plaintext payload:
+ *   HOT EXTENT: 16 (framing) + 32 (meta) + 8 MiB (plaintext) = 8388656
+ *   CHUNK:      16 (framing) + 32 (hash) + 8 MiB (plaintext) = 8388656
  *   COLD EXT:   16 (framing) + 64 (meta + hash, no plaintext) = 80
- * Max = 131120 bytes (down from P7-CAS-9's 131152 because COLD EXTENT
- * no longer carries plaintext). */
+ * Max = 8388656 bytes (up from v2's 131120 with the recordsize cap
+ * lift). recv MUST allocate per-record buffers up to this size; the
+ * 64× lift trades a larger transient receive buffer for the dedup
+ * unlock on VM-image / container workloads. */
 #define STM_SEND_RECORD_MAX_LEN  (STM_SEND_RECORD_HDR_LEN +              \
                                     STM_SEND_EXTENT_META_LEN +           \
                                     STM_SEND_CHUNK_PLAIN_MAX)

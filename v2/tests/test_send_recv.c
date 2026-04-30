@@ -1574,4 +1574,83 @@ STM_TEST(p7cas10_chunk_record_refuses_unknown_flag_bits) {
     testpool_teardown(&tgt);
 }
 
+/* ========================================================================= */
+/* P7-CAS-16 — Recordsize cap lift 128 KiB → 8 MiB wire-format implications.  */
+/* ========================================================================= */
+
+STM_TEST(p7cas16_v2_stream_refused_by_v3_receiver) {
+    /* P7-CAS-16 bumped STM_SEND_VERSION 2 → 3 in lockstep with the
+     * recordsize cap lift. v2 senders' 128-KiB-CHUNK invariant is
+     * incompatible with v3's 8-MiB-CHUNK shape; a v3 receiver MUST
+     * refuse any v2 stream with STM_EBADVERSION at HEADER apply.
+     * Mirror of p7cas10_v1_stream_refused_by_v2_receiver. */
+    testpool tgt; testpool_setup(&tgt, "p7cas16_v2_refuse", POOL_UUID_TGT);
+    stm_sync *tgt_sync = stm_fs_sync_for_test(tgt.fs);
+
+    stm_recv_handle *rh = NULL;
+    STM_ASSERT_OK(stm_recv_init(tgt_sync, 1, &rh));
+
+    uint8_t rec[STM_SEND_RECORD_HDR_LEN + STM_SEND_HEADER_BODY_LEN] = {0};
+    rec[0] = 0x01;  /* type = HEADER */
+    rec[8] = 52;    /* body_len = 52 */
+    /* body[0..4] = magic = 0x534D5453 */
+    rec[STM_SEND_RECORD_HDR_LEN + 0] = 0x53;
+    rec[STM_SEND_RECORD_HDR_LEN + 1] = 0x54;
+    rec[STM_SEND_RECORD_HDR_LEN + 2] = 0x4D;
+    rec[STM_SEND_RECORD_HDR_LEN + 3] = 0x53;
+    /* body[4..8] = version = 2 (le32) — stale at v3 */
+    rec[STM_SEND_RECORD_HDR_LEN + 4] = 0x02;
+
+    STM_ASSERT_ERR(stm_recv_apply(rh, rec, sizeof rec), STM_EBADVERSION);
+
+    stm_recv_close(rh);
+    testpool_teardown(&tgt);
+}
+
+STM_TEST(p7cas16_1mib_hot_extent_roundtrip) {
+    /* HOT extent at 1 MiB = 8× the old 128 KiB cap exercises the wire
+     * format's per-record buffering path past the v2 record-size limit.
+     * The send-recv pipeline allocates per-record buffers up to
+     * STM_SEND_RECORD_MAX_LEN (8 MiB at v3); a 1 MiB plaintext payload
+     * must round-trip identical bytes through send_next + recv_apply. */
+    testpool src; testpool_setup(&src, "p7cas16_1mib_src", POOL_UUID_SRC);
+    testpool tgt; testpool_setup(&tgt, "p7cas16_1mib_tgt", POOL_UUID_TGT);
+    stm_sync *src_sync = stm_fs_sync_for_test(src.fs);
+    stm_sync *tgt_sync = stm_fs_sync_for_test(tgt.fs);
+
+    enum { LEN = 1u * 1024u * 1024u };
+    uint8_t *plain = malloc(LEN);
+    STM_ASSERT(plain != NULL);
+    /* Deterministic LCG fill — same shape as the fs-side P7-CAS-16
+     * tests use; keeps plaintext distinguishable from zero-fill. */
+    uint64_t s = 0xC0FFEEULL;
+    for (size_t i = 0; i < LEN; i++) {
+        s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+        plain[i] = (uint8_t)(s >> 56);
+    }
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, plain, LEN));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+
+    stm_send_handle *sh = NULL;
+    STM_ASSERT_OK(stm_send_init(src_sync, 1, 0, 0, &sh));
+    stm_recv_handle *rh = NULL;
+    STM_ASSERT_OK(stm_recv_init(tgt_sync, 1, &rh));
+
+    STM_ASSERT_OK(pipe_send_to_recv(sh, rh));
+
+    uint8_t *out = calloc(1, LEN);
+    STM_ASSERT(out != NULL);
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 1, 0, out, LEN, &got));
+    STM_ASSERT_EQ(got, (size_t)LEN);
+    STM_ASSERT_MEM_EQ(plain, out, LEN);
+
+    free(plain);
+    free(out);
+    stm_send_close(sh);
+    stm_recv_close(rh);
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
 STM_TEST_MAIN("send_recv")

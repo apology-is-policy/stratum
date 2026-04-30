@@ -443,9 +443,17 @@ STM_TEST(fs_io_write_args_validated) {
     STM_ASSERT_ERR(stm_fs_write(fs, 1, 1, 0, buf, 1234), STM_EINVAL);
     /* unaligned off. */
     STM_ASSERT_ERR(stm_fs_write(fs, 1, 1, 1024, buf, 4096), STM_EINVAL);
-    /* len > 128 KiB. */
-    uint8_t big[129u * 1024u] = {0};
-    STM_ASSERT_ERR(stm_fs_write(fs, 1, 1, 0, big, sizeof big), STM_ERANGE);
+    /* len > STM_FS_RECORDSIZE_MAX. P7-CAS-16 bumped the cap from
+     * 128 KiB to 8 MiB; one block past the cap rejects with
+     * STM_ERANGE. The buffer is heap-allocated because 8 MiB on
+     * the stack would blow the test runner's default stack size. */
+    {
+        size_t over = (size_t)STM_FS_RECORDSIZE_MAX + 4096u;
+        uint8_t *big = (uint8_t *)calloc(over, 1);
+        STM_ASSERT(big != NULL);
+        STM_ASSERT_ERR(stm_fs_write(fs, 1, 1, 0, big, over), STM_ERANGE);
+        free(big);
+    }
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
@@ -6568,6 +6576,221 @@ STM_TEST(fs_p7cas14_cache_invalidates_on_pool_default_change) {
     STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &rec));
     STM_ASSERT_EQ((unsigned)rec.read_count, 1u);
 
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* ========================================================================= */
+/* P7-CAS-16 — Recordsize cap lift 128 KiB → 8 MiB (UB v23).                  */
+/* ========================================================================= */
+
+/* Recordsize-cap-lift tests use a larger device than the suite default
+ * (16 MiB / 8 MiB) because a single 8 MiB write reserves 2048 blocks and
+ * an overwrite/migrate sequence transiently doubles that to ~4096 blocks
+ * (old paddrs PENDING + new paddrs allocated until commit). 64 MiB device
+ * + 16 MiB bootstrap = 48 MiB data area = 12288 blocks: comfortable
+ * margin for write+commit+overwrite or write+commit+migrate. */
+#define P7CAS16_DEVICE_BYTES     (UINT64_C(64) * 1024u * 1024u)
+#define P7CAS16_BOOTSTRAP_BYTES  (UINT64_C(16) * 1024u * 1024u)
+
+static stm_fs_format_opts p7cas16_format_opts(void) {
+    return (stm_fs_format_opts){
+        .device_size_bytes    = P7CAS16_DEVICE_BYTES,
+        .bootstrap_size_bytes = P7CAS16_BOOTSTRAP_BYTES,
+        .pool_uuid            = { POOL_UUID[0], POOL_UUID[1] },
+        .device_uuid          = { DEVICE_UUID[0], DEVICE_UUID[1] },
+        .keyfile_path         = g_key_path,
+    };
+}
+
+/* Fill `buf` with a deterministic LCG-derived byte stream so the test is
+ * reproducible and the contents are not all-zero (which would compress
+ * trivially or decode-confuse). The seed is the only entropy. */
+static void p7cas16_fill_pseudorandom(uint8_t *buf, size_t n, uint64_t seed) {
+    uint64_t s = seed ? seed : 0x123456789ABCDEF0ULL;
+    for (size_t i = 0; i < n; i++) {
+        s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+        buf[i] = (uint8_t)(s >> 56);
+    }
+}
+
+STM_TEST(fs_p7cas16_write_read_8mib_extent_roundtrip) {
+    /* Single 8 MiB write + read-back at the new cap. Verifies the cap
+     * lift's hot path: reserve 2048 contiguous blocks, AEAD-encrypt 8 MiB
+     * under a single (paddr, gen) nonce, persist the extent record at
+     * len=8 MiB, decode the record on read, AEAD-decrypt + return. */
+    make_tmp("p7cas16_8mib_rt");
+    stm_fs_format_opts fopts = p7cas16_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    enum { LEN = (size_t)STM_FS_RECORDSIZE_MAX };
+    uint8_t *plain = malloc(LEN);
+    STM_ASSERT(plain != NULL);
+    p7cas16_fill_pseudorandom(plain, LEN, 0xC0FFEEULL);
+
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, LEN));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    uint8_t *out = calloc(1, LEN);
+    STM_ASSERT(out != NULL);
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, LEN, &got));
+    STM_ASSERT_EQ(got, (size_t)LEN);
+    STM_ASSERT_MEM_EQ(plain, out, LEN);
+
+    /* Persistence across remount. */
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    memset(out, 0, LEN);
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, out, LEN, &got));
+    STM_ASSERT_EQ(got, (size_t)LEN);
+    STM_ASSERT_MEM_EQ(plain, out, LEN);
+
+    free(plain);
+    free(out);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas16_intermediate_sizes_accepted) {
+    /* Sweep through 1 MiB / 4 MiB / 8 MiB to cover the gap between the
+     * old 128 KiB cap and the new 8 MiB cap. Each size writes + reads
+     * back at a unique ino so the writes don't overlap. */
+    make_tmp("p7cas16_sweep");
+    stm_fs_format_opts fopts = p7cas16_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    const size_t sizes[] = {
+        (size_t)1u * 1024u * 1024u,                 /* 1 MiB */
+        (size_t)4u * 1024u * 1024u,                 /* 4 MiB */
+        (size_t)STM_FS_RECORDSIZE_MAX,              /* 8 MiB */
+    };
+    /* Limit to 1+4 = 5 MiB committed at once + the 8 MiB write requires
+     * ino-2 to be its own commit (else 1+4+8 = 13 MiB > 12 MiB live data
+     * area on a 16-MiB-bootstrap 64-MiB device after btree overhead). */
+    for (size_t i = 0; i < sizeof sizes / sizeof sizes[0]; i++) {
+        size_t LEN = sizes[i];
+        uint8_t *plain = malloc(LEN);
+        STM_ASSERT(plain != NULL);
+        p7cas16_fill_pseudorandom(plain, LEN, 0xABCDEF00ULL + i);
+        STM_ASSERT_OK(stm_fs_write(fs, 1, (uint64_t)(i + 1), 0, plain, LEN));
+        STM_ASSERT_OK(stm_fs_commit(fs));
+
+        uint8_t *out = calloc(1, LEN);
+        STM_ASSERT(out != NULL);
+        size_t got = 0;
+        STM_ASSERT_OK(stm_fs_read(fs, 1, (uint64_t)(i + 1), 0, out, LEN, &got));
+        STM_ASSERT_EQ(got, LEN);
+        STM_ASSERT_MEM_EQ(plain, out, LEN);
+        free(plain);
+        free(out);
+
+        /* Drop ino i's extents to free the data area for the next size.
+         * stm_fs_truncate(0) drops every extent. */
+        STM_ASSERT_OK(stm_sync_truncate(stm_fs_sync_for_test(fs), 1,
+                                        (uint64_t)(i + 1), 0));
+        STM_ASSERT_OK(stm_fs_commit(fs));
+        /* A second commit drains the PENDING-from-truncate paddrs so the
+         * next iteration's reserve can pick them up. */
+        STM_ASSERT_OK(stm_fs_commit(fs));
+    }
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas16_cap_boundary_rejects_at_cap_plus_one_block) {
+    /* Cap exactly accepted; cap + 1 block rejected with STM_ERANGE.
+     * The "+ STM_UB_SIZE" matches the runtime invariant: len must be a
+     * multiple of 4 KiB and must be <= STM_FS_RECORDSIZE_MAX. */
+    make_tmp("p7cas16_boundary");
+    stm_fs_format_opts fopts = p7cas16_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Cap accepted. */
+    {
+        size_t LEN = (size_t)STM_FS_RECORDSIZE_MAX;
+        uint8_t *plain = malloc(LEN);
+        STM_ASSERT(plain != NULL);
+        p7cas16_fill_pseudorandom(plain, LEN, 0xDEADBEEFULL);
+        STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, LEN));
+        free(plain);
+    }
+
+    /* Cap + 1 block rejected. Use a fresh ino so it's not blocked by
+     * the live extent at ino 1. */
+    {
+        size_t LEN = (size_t)STM_FS_RECORDSIZE_MAX + 4096u;
+        uint8_t *plain = calloc(LEN, 1);
+        STM_ASSERT(plain != NULL);
+        STM_ASSERT_ERR(stm_fs_write(fs, 1, 2, 0, plain, LEN), STM_ERANGE);
+        free(plain);
+    }
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas16_8mib_extent_migrates_with_cdc_subchunking) {
+    /* The recordsize lift unlocks the FastCDC sub-chunking path in
+     * `stm_sync_migrate_to_cold`: with the 128 KiB MVP, FastCDC's default
+     * min=2 MiB always emitted K=1 chunks per extent; with an 8 MiB
+     * extent under override-small CDC params (avg=8 KiB / min=2 KiB /
+     * max=32 KiB), migrate emits K >> 1 cold extents at content-defined
+     * boundaries — the dedup precondition for ROADMAP §10.2's 3-5×
+     * target on VM-image workloads. */
+    make_tmp("p7cas16_migrate_subchunk");
+    stm_fs_format_opts fopts = p7cas16_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    /* Install the same small CDC params used by the existing P7-CAS-4b
+     * tests so a small extent (8 MiB) still produces K >> 1. */
+    stm_sync *s = stm_fs_sync_for_test(fs);
+    {
+        stm_cdc_params p;
+        STM_ASSERT_OK(stm_cdc_make_params(8u * 1024u, &p));
+        STM_ASSERT_OK(stm_sync_set_cdc_params_for_test(s, &p));
+    }
+
+    /* 8 MiB pseudorandom plaintext keeps every chunk's content unique
+     * (no auto-CAS-dedup collapsing K). */
+    enum { LEN = (size_t)STM_FS_RECORDSIZE_MAX };
+    uint8_t *plain = malloc(LEN);
+    STM_ASSERT(plain != NULL);
+    p7cas16_fill_pseudorandom(plain, LEN, 0xCDCD1616ULL);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, LEN));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    /* Migrate: HOT 8 MiB → N COLD chunks. */
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    /* Count COLD extents at (1, 1). With LEN=8 MiB and avg=8 KiB
+     * FastCDC params, expect K well above 100. The conservative
+     * assertion is K >= 64 (a soft lower bound that avoids flakiness
+     * if the LCG produces an unusual boundary distribution). */
+    stm_extent_index *eidx = stm_sync_extent_index(s);
+    mtc4b_extent_count_t cnt = { .ds = 1, .ino = 1 };
+    STM_ASSERT_OK(stm_extent_iter_ds(eidx, 1, mtc4b_count_cb, &cnt));
+    STM_ASSERT_EQ(cnt.hot_count, 0u);
+    STM_ASSERT(cnt.cold_count >= 64u);
+
+    free(plain);
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
     unlink(g_key_path);

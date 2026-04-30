@@ -38,8 +38,50 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R66-hash-fixup. Substantive `1a88248` +
-  R66 close `154a959`.
+- **Tip**: P7-CAS-16 substantive (this commit). R67 audit close +
+  hash-fixup TBD.
+  **P7-CAS-16 — recordsize cap lift 128 KiB → 8 MiB. Format break
+  STM_UB_VERSION 22 → 23 + STM_SEND_VERSION 2 → 3 in lockstep.
+  `STM_FS_RECORDSIZE_MAX` (the runtime invariant on extent record
+  `len` enforced at write entry + every decode/load_validate/recv
+  site) lifts from `128 * 1024` to `8 * 1024 * 1024`; promoted from
+  a private define in `src/sync/sync.c` to `include/stratum/fs.h`
+  so call-site invariants and tests can reference it. Wire-format
+  cap `STM_SEND_CHUNK_PLAIN_MAX` lifts in lockstep so HOT-extent
+  + CHUNK-record bodies match the new recordsize. The on-disk
+  extent encoding's 24-bit `dlen`/`clen_and_comp.clen` slot
+  (`EX_LEN_MAX_24BIT = 0x00FFFFFF = 16 MiB - 1`) accommodates 8 MiB
+  comfortably — no encoding shape change. `STM_SEND_RECORD_MAX_LEN`
+  lifts 131120 → 8388656 bytes (recv per-record buffer cap).
+  v22 pools' extent records are forward-compatible at the value
+  layer (`len ≤ 128 KiB ≤ 8 MiB`) but rejected up-front at SB
+  version check via uniform STM_EBADVERSION; the inverse direction
+  (v23 → v22) is unsafe (v23 may have written `128 KiB < len ≤
+  8 MiB` extents that v22 binaries reject as oversized at decode-
+  validation). v2 senders refused at v3 receivers via
+  STM_EBADVERSION at HEADER apply (mirror of P7-CAS-10's v1 → v2).
+  Composition over `cas.tla` / `extent.tla` / `dead_list.tla` /
+  `property.tla` — the cap is a parametric bound, not a
+  load-bearing protocol invariant; all four specs unchanged.
+  **No spec extension required.** Cap lift unlocks FastCDC
+  sub-chunking on `migrate_to_cold` with default ARCH §6.9.4
+  params (avg=8 MiB / min=2 MiB / max=32 MiB): pre-lift, `min=2 MiB
+  > 128 KiB cap` forced K=1 always; post-lift, an 8 MiB extent
+  produces K ≥ 1 chunks at content-defined boundaries — the
+  precondition for ROADMAP §10.2's 3-5× dedup target on VM-image
+  workloads. Cross-extent FastCDC at write time (the "true" dedup
+  unlock) is the next follow-on chunk. test_pool UB-version
+  assertion bumped 22 → 23. test_fs grows 150 → 154 (+4 P7-CAS-16
+  tests: 8 MiB write/read roundtrip + remount; sweep 1/4/8 MiB
+  sizes; cap+1-block boundary STM_ERANGE; 8 MiB extent migrates
+  with override-small CDC params verifying K ≥ 64).
+  test_send_recv grows 35 → 37 (+2 P7-CAS-16 tests: v2 stream
+  refused by v3 receiver; 1 MiB HOT extent send/recv roundtrip).
+  35 ctest suites green default + ASan + TSan in isolation.
+  Spec posture unchanged: 21 modules / 25 fixed cfgs / 34 buggy
+  cfgs.**
+  Prior P7-CAS-15 substantive `1a88248` + R66 close `154a959` +
+  hash-fixup `167ba6b`.
   **P7-CAS-15 — scrub-c sticky completion signal. Closes R57
   P3-1+P3-2 forward-noted shared-sc orchestration race. Adds an
   `_Atomic bool pending_completion_signal` to `stm_scrub`, set by

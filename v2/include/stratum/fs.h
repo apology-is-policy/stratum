@@ -170,6 +170,19 @@ stm_status stm_fs_free(stm_fs *fs, uint64_t paddr, uint64_t free_gen);
 STM_MUST_USE
 stm_status stm_fs_commit(stm_fs *fs);
 
+/* P7-CAS-16 (UB v23): recordsize cap lift 128 KiB → 8 MiB. The cap is
+ * the runtime invariant on extent record `len` — enforced at write
+ * entry AND at every decode + load_validate site (read / migrate /
+ * promote / recv). On-disk encoding's 24-bit dlen / clen_and_comp.clen
+ * slot (EX_LEN_MAX_24BIT = 16 MiB - 1) accommodates 8 MiB without
+ * shape change. v22 pools (128 KiB cap) interop-up under v23 because
+ * their extent records all satisfy `len <= 128 KiB <= 8 MiB`; the
+ * inverse direction is unsafe (v23 can write `128 KiB < len <= 8 MiB`
+ * extents that v22 would reject). Format break gated via
+ * STM_UB_VERSION 22 → 23 + STM_SEND_VERSION 2 → 3. Lifts in lockstep
+ * with send_recv.h's STM_SEND_CHUNK_PLAIN_MAX. */
+#define STM_FS_RECORDSIZE_MAX   (8u * 1024u * 1024u)
+
 /* P7-4: POSIX-shape extent write/read.
  *
  * `stm_fs_write` (encrypts + reserves + writes + extent-overwrite +
@@ -179,8 +192,8 @@ stm_status stm_fs_commit(stm_fs *fs);
  * `stm_fs_read` (extent-lookup + bdev-read + decrypt; holes return
  * zeros).
  *
- * MVP constraints (P7-4):
- *   - len > 0, multiple of 4 KiB, ≤ 128 KiB (recordsize default).
+ * MVP constraints (P7-4; cap lifted at P7-CAS-16):
+ *   - len > 0, multiple of 4 KiB, ≤ STM_FS_RECORDSIZE_MAX (8 MiB).
  *   - off must be 4 KiB aligned.
  *   - Single-extent per call: caller iterates for spans > recordsize.
  *   - Encryption key sourced from the pool's metadata_key. Per-
@@ -191,7 +204,7 @@ stm_status stm_fs_commit(stm_fs *fs);
  *   - STM_EWEDGED / STM_EROFS if the FS is wedged or read-only
  *     (write only).
  *   - STM_EINVAL on bad alignment / args.
- *   - STM_ERANGE if len > 128 KiB.
+ *   - STM_ERANGE if len > STM_FS_RECORDSIZE_MAX.
  *   - STM_ENOMEM on allocation failure.
  *   - STM_EBADTAG on AEAD decrypt failure (read).
  */

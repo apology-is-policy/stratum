@@ -1058,8 +1058,11 @@ chunks and N referencing cold extents (avg dedup ratio = N/K)
 ships K × (chunk_plain_size + ~80) + N × 80 wire-bytes for the
 cold portion. Pre-P7-CAS-10 the same content shipped
 N × (chunk_plain_size + ~80). Savings = (N-K) × chunk_plain_size.
-For 128 KiB chunks with 10× dedup, savings ≈ 9 chunks × 128 KiB
-per 10 extents = 1.15 MiB saved per 10 extents.
+At UB v22 (128 KiB cap) the savings on a 10× dedup stream were
+≈ 9 chunks × 128 KiB ≈ 1.15 MiB per 10 extents. At UB v23 / P7-CAS-16
+(8 MiB cap) the savings scale up 64× for high-dedup workloads: a
+10× dedup stream over 8 MiB chunks saves 9 × 8 MiB ≈ 72 MiB per 10
+extents.
 
 ## Cold-extent reflink (P7-CAS-3)
 
@@ -1187,13 +1190,20 @@ chunks at FastCDC content-defined boundaries. Each chunk is
 independently BLAKE3-hashed, CAS-lookup-or-inserted, and inserted as
 a COLD extent record at chunk-aligned `(off, len)`.
 
-**Default behavior preserved (backwards-compat)**: `stm_sync` carries
-an `stm_cdc cdc;` field initialized at `sync_new` from
+**Default behavior at recordsize lift (P7-CAS-16, UB v23)**: `stm_sync`
+carries an `stm_cdc cdc;` field initialized at `sync_new` from
 `stm_cdc_default_params` (ARCH §6.9.4: 8 MiB avg / 2 MiB min / 32
-MiB max). With `min=2 MiB > recordsize cap=128 KiB`, FastCDC
-produces ONE chunk per extent for any production-default migrate
-call; the K=1 dispatch path takes the existing single-chunk
-`stm_extent_migrate_to_cold` API. Behavior identical to P7-CAS-2.
+MiB max). At v22 the recordsize cap was 128 KiB → `min=2 MiB > 128 KiB`
+forced FastCDC to emit K=1 chunk per extent on every migrate, identical
+to the pre-FastCDC P7-CAS-2 path. At v23 the cap lifts to 8 MiB =
+FastCDC avg, so a single 8 MiB extent under default params now produces
+K ∈ [1, 4] chunks at content-defined boundaries (probabilistic — the
+strict mask region tightens K toward 1 + small-K outcomes). The K=1
+dispatch path still takes the existing single-chunk
+`stm_extent_migrate_to_cold` API; K ≥ 2 takes
+`stm_extent_migrate_to_cold_chunked`. Cross-extent FastCDC at write
+time (the "true" dedup unlock — see ROADMAP §10.2) is the next
+follow-on chunk.
 
 **Test override**: `<stratum/sync_testing.h>::stm_sync_set_cdc_
 params_for_test(s, params)` (gated by `STRATUM_BUILD_TESTING_HOOKS`)

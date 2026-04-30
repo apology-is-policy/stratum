@@ -330,8 +330,29 @@ extern "C" {
  * offset 72; DS_VAL_FIXED grows from 72 to 80. Pool-defaults value
  * length grows from 32 to 40 bytes. v21 pools refused at v22 mount
  * via uniform STM_EBADVERSION (same posture as v19→v20). No
- * uberblock field changes. */
-#define STM_UB_VERSION        22u
+ * uberblock field changes.
+ *
+ * v22 → v23 bump (P7-CAS-16): recordsize cap lift 128 KiB → 8 MiB.
+ * STM_FS_RECORDSIZE_MAX (the runtime invariant on extent record
+ * `len`) lifts from `128 KiB` to `8 MiB`. The cap is enforced at
+ * write entry (`stm_sync_write_extent`), at every extent-record
+ * decode + load_validate site (sync.c read/migrate/promote/recv
+ * paths), and at the wire layer's HOT-extent + CHUNK-record body
+ * length cap (STM_SEND_CHUNK_PLAIN_MAX). v22 pools' extent records
+ * encoded with the 128-KiB cap-tier write paths remain valid under
+ * v23 (their `len` ≤ 128 KiB ≤ 8 MiB). The version bump is required
+ * because the inverse direction is not safe: a v23-written pool may
+ * carry 128 KiB < `len` ≤ 8 MiB extent records that v22 binaries
+ * would reject at decode-validation time as oversized
+ * (STM_ECORRUPT). Refused at SB version check first via uniform
+ * STM_EBADVERSION. The on-disk extent encoding's 24-bit `dlen` /
+ * `clen_and_comp.clen` slot (EX_LEN_MAX_24BIT = 0x00FFFFFF =
+ * 16 MiB - 1; src/extent/extent_index.c) accommodates 8 MiB
+ * comfortably; no encoding shape change. The wire-format cap
+ * STM_SEND_CHUNK_PLAIN_MAX (send_recv.h) lifts in lockstep —
+ * STM_SEND_VERSION 2 → 3 to refuse v2 streams (which assume the
+ * 128-KiB-CHUNK invariant). No uberblock field changes. */
+#define STM_UB_VERSION        23u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */

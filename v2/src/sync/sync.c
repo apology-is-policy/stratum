@@ -39,6 +39,7 @@
 #include <stratum/cdc.h>
 #include <stratum/dataset.h>
 #include <stratum/extent.h>
+#include <stratum/fs.h>            /* P7-CAS-16: STM_FS_RECORDSIZE_MAX */
 #include <stratum/hash.h>
 #include <stratum/janus.h>
 #include <stratum/keyfile.h>
@@ -4068,16 +4069,15 @@ stm_status stm_sync_set_cdc_params_for_test(stm_sync *s,
 /* ========================================================================= */
 
 /*
- * MVP constraints:
+ * MVP constraints (cap lifted at P7-CAS-16, UB v23):
  *   - len must be a positive multiple of STM_UB_SIZE (4 KiB blocks).
- *   - len bounded ≤ STM_FS_RECORDSIZE_MAX (128 KiB) per ARCH §8.4.2
- *     default recordsize.
+ *   - len bounded ≤ STM_FS_RECORDSIZE_MAX (8 MiB at UB v23; was
+ *     128 KiB at v22 and earlier; defined in <stratum/fs.h>).
  *   - off must be a multiple of STM_UB_SIZE.
  *   - Single-extent per call: caller iterates for spans > recordsize.
  *   - Encryption key sourced from sync->metadata_key (per-pool key).
  *     Per-dataset DEKs are deferred to a future chunk.
  */
-#define STM_FS_RECORDSIZE_MAX   (128u * 1024u)
 
 static stm_status sync_drop_paddr_locked(stm_sync *s, uint64_t ds, uint64_t paddr) {
     /* Composes extent.tla::Overwrite-drop with dead_list.tla::OverwriteBlock
