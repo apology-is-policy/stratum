@@ -38,8 +38,8 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R66-hash-fixup. Substantive `<P7CAS15_SUBSTANTIVE>` +
-  R66 close `<P7CAS15_RCLOSE>`.
+- **Tip**: post-R66-hash-fixup. Substantive `1a88248` +
+  R66 close `154a959`.
   **P7-CAS-15 — scrub-c sticky completion signal. Closes R57
   P3-1+P3-2 forward-noted shared-sc orchestration race. Adds an
   `_Atomic bool pending_completion_signal` to `stm_scrub`, set by

@@ -57,8 +57,8 @@ into the CAS tier (which DOES need P6) is a separate concern.
 ## Phase 7 status (overall)
 
 - [x] **P7-CAS-15 scrub-c sticky completion signal** —
-      substantive `<P7CAS15_SUBSTANTIVE>` + R66 close
-      `<P7CAS15_RCLOSE>` + hash-fixup (this commit). Closes R57
+      substantive `1a88248` + R66 close
+      `154a959` + hash-fixup (this commit). Closes R57
       P3-1+P3-2 forward-noted shared-sc orchestration race. Adds
       `_Atomic bool pending_completion_signal` on `stm_scrub` set
       by step at the cursor-drained transition; new public API
