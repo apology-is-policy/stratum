@@ -22,11 +22,16 @@
 
 #include "tharness.h"
 
+#include <stratum/block.h>
+#include <stratum/bootstrap.h>
+#include <stratum/crypto.h>
 #include <stratum/inode.h>
 #include <stratum/types.h>
 
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 /* ------------------------------------------------------------------ */
 /* Lifecycle.                                                          */
@@ -169,9 +174,12 @@ STM_TEST(inode_double_free_refused) {
     stm_inode_index_close(idx);
 }
 
-STM_TEST(inode_free_does_not_lower_next_ino) {
-    /* Allocate 3, free middle one. next_ino is still 4 — alloc-fresh
-     * doesn't reuse FREED slots in P8-POSIX-1 (reuse = P8-POSIX-1b). */
+STM_TEST(inode_alloc_prefers_reuse_with_gen_bump) {
+    /* P8-POSIX-1b AllocReused: free a slot then alloc — same ino
+     * comes back with si_gen += 1. next_ino unchanged across the
+     * reuse cycle. After all FREED slots are exhausted, alloc
+     * falls back to fresh at next_ino. Models inode.tla's
+     * AllocReused → AllocFresh fallback. */
     stm_inode_index *idx = stm_inode_index_create();
     STM_ASSERT_TRUE(idx != NULL);
 
@@ -181,14 +189,77 @@ STM_TEST(inode_free_does_not_lower_next_ino) {
     STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &c));
     STM_ASSERT_OK(stm_inode_free(idx, 1, b));
 
+    /* next_ino remains 4 — alloc-reused does not bump it. */
     uint64_t next = 0;
     STM_ASSERT_OK(stm_inode_next_ino(idx, 1, &next));
     STM_ASSERT_EQ(next, (uint64_t)4);
 
-    /* And the next alloc returns 4, not the freed 2. */
+    /* Next alloc reuses ino=2 with si_gen=1. */
     uint64_t d = 0;
     STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &d));
-    STM_ASSERT_EQ(d, (uint64_t)4);
+    STM_ASSERT_EQ(d, (uint64_t)2);
+
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, d, &v));
+    STM_ASSERT_EQ(stm_load_le64(v.si_gen), (uint64_t)1);
+
+    /* No more FREED slots — next alloc falls back to fresh at 4. */
+    uint64_t e = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &e));
+    STM_ASSERT_EQ(e, (uint64_t)4);
+
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, e, &v));
+    STM_ASSERT_EQ(stm_load_le64(v.si_gen), (uint64_t)0);  /* fresh → gen=0 */
+
+    stm_inode_index_close(idx);
+}
+
+/* P8-POSIX-1b: free + reuse + free + reuse → gen monotonically
+ * increases at the same ino. inode.tla's GenMonotonicAcrossAllocations
+ * pinned at the impl level. */
+STM_TEST(inode_reuse_gen_monotonic_across_cycles) {
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
+    /* First alloc: gen = 0. */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &v));
+    STM_ASSERT_EQ(stm_load_le64(v.si_gen), (uint64_t)0);
+
+    for (uint64_t cycle = 1; cycle <= 5; cycle++) {
+        STM_ASSERT_OK(stm_inode_free(idx, 1, ino));
+        uint64_t reused = 0;
+        STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &reused));
+        STM_ASSERT_EQ(reused, ino);  /* same ino reused */
+        STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &v));
+        STM_ASSERT_EQ(stm_load_le64(v.si_gen), cycle);  /* gen monotonic */
+    }
+
+    stm_inode_index_close(idx);
+}
+
+/* P8-POSIX-1b: stm_inode_set rejects an in_value with the FREED
+ * flag set in si_flags. The flag is the allocator's internal
+ * lifecycle marker; callers reach FREED via stm_inode_free. */
+STM_TEST(inode_set_rejects_freed_flag) {
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
+
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &v));
+
+    /* Caller flags FREED → reject. */
+    v.si_flags = stm_store_le32(STM_INO_FLAG_FREED);
+    STM_ASSERT_ERR(stm_inode_set(idx, 1, ino, &v), STM_EINVAL);
+
+    /* Caller flags FREED + IMMUTABLE → reject (FREED bit dominates). */
+    v.si_flags = stm_store_le32(STM_INO_FLAG_FREED | STM_INO_FLAG_IMMUTABLE);
+    STM_ASSERT_ERR(stm_inode_set(idx, 1, ino, &v), STM_EINVAL);
 
     stm_inode_index_close(idx);
 }
@@ -511,6 +582,216 @@ STM_TEST(inode_struct_size_is_256_bytes) {
      * assertion is ever weakened. */
     STM_ASSERT_EQ(sizeof(struct stm_inode_value), (size_t)256);
     STM_ASSERT_EQ(sizeof(struct stm_inode_value), (size_t)STM_INODE_SIZE_BYTES);
+}
+
+/* ------------------------------------------------------------------ */
+/* P8-POSIX-1b: persistence roundtrip helpers + tests.                 */
+/* ------------------------------------------------------------------ */
+
+#define INP_DEVICE_BYTES     (UINT64_C(8)  * 1024u * 1024u)
+#define INP_BOOTSTRAP_BYTES  (UINT64_C(2)  * 1024u * 1024u)
+
+static const uint64_t INP_POOL_UUID[2]   = { 0xAA00, 0xBB00 };
+static const uint64_t INP_DEVICE_UUID[2] = { 0xCC00, 0xDD00 };
+static const uint8_t  INP_KEY[32]        = { 0x42, 0x43, 0x44 };
+
+static char inp_tmp_path[256];
+
+static void inp_make_tmp(const char *tag) {
+    snprintf(inp_tmp_path, sizeof inp_tmp_path,
+             "/tmp/stm_v2_inode_persist_%s_%d.bin", tag, (int)getpid());
+    unlink(inp_tmp_path);
+}
+
+static void inp_open_fresh(stm_bdev **out_d, stm_bootstrap **out_b) {
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    STM_ASSERT_OK(stm_bdev_open(inp_tmp_path, &bo, out_d));
+    STM_ASSERT_OK(stm_bdev_resize(*out_d, INP_DEVICE_BYTES));
+    STM_ASSERT_OK(stm_crypto_init());
+    STM_ASSERT_OK(stm_bootstrap_create(*out_d, INP_POOL_UUID, INP_DEVICE_UUID,
+                                         INP_BOOTSTRAP_BYTES, out_b));
+}
+
+static void inp_reopen(stm_bdev **out_d, stm_bootstrap **out_b) {
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    STM_ASSERT_OK(stm_bdev_open(inp_tmp_path, &bo, out_d));
+    STM_ASSERT_OK(stm_bootstrap_open(*out_d, out_b));
+}
+
+STM_TEST(inode_persist_commit_load_roundtrip) {
+    inp_make_tmp("rt");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    inp_open_fresh(&d, &b);
+
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+    STM_ASSERT_OK(stm_inode_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_inode_index_set_crypt_ctx(idx, INP_KEY,
+                                                   INP_POOL_UUID,
+                                                   INP_DEVICE_UUID));
+
+    /* Allocate three inodes across two datasets, free the middle one
+     * in dataset 1. The roundtrip should preserve ALLOCATED records,
+     * the FREED record (carrying its gen for future reuse), and the
+     * per-dataset next_ino high-water marks. */
+    uint64_t a1 = 0, a2 = 0, a3 = 0, b1 = 0, b2 = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, /*ds=*/1, 0100644, 1000, 1000, &a1));
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 1000, 1000, &a2));
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 1000, 1000, &a3));
+    STM_ASSERT_OK(stm_inode_alloc(idx, /*ds=*/2, 0100644, 2000, 2000, &b1));
+    STM_ASSERT_OK(stm_inode_alloc(idx, 2, 0100644, 2000, 2000, &b2));
+    STM_ASSERT_OK(stm_inode_free(idx, 1, a2));
+
+    uint64_t paddr = 0; uint8_t cs[32];
+    STM_ASSERT_OK(stm_inode_index_commit(idx, /*committed_gen=*/1u, &paddr, cs));
+    STM_ASSERT(paddr != 0);
+
+    stm_inode_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+
+    /* Remount + load. */
+    inp_reopen(&d, &b);
+    stm_inode_index *idx2 = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx2 != NULL);
+    STM_ASSERT_OK(stm_inode_index_set_storage(idx2, d, b));
+    STM_ASSERT_OK(stm_inode_index_set_crypt_ctx(idx2, INP_KEY,
+                                                    INP_POOL_UUID,
+                                                    INP_DEVICE_UUID));
+    STM_ASSERT_OK(stm_inode_index_load_at(idx2, paddr, 1u, cs));
+
+    /* ALLOCATED counts per dataset survive: 2 in ds=1 (a1, a3 — a2 freed),
+     * 2 in ds=2 (b1, b2). */
+    size_t n = 0;
+    STM_ASSERT_OK(stm_inode_count_for_ds(idx2, 1, &n));
+    STM_ASSERT_EQ(n, (size_t)2);
+    STM_ASSERT_OK(stm_inode_count_for_ds(idx2, 2, &n));
+    STM_ASSERT_EQ(n, (size_t)2);
+
+    /* Lookups: a1 + a3 still ALLOCATED (gen=0). a2 returns ENOENT. */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx2, 1, a1, &v));
+    STM_ASSERT_EQ(stm_load_le64(v.si_gen), (uint64_t)0);
+    STM_ASSERT_EQ(stm_load_le32(v.si_uid), (uint32_t)1000);
+
+    STM_ASSERT_OK(stm_inode_lookup(idx2, 1, a3, &v));
+    STM_ASSERT_EQ(stm_load_le64(v.si_gen), (uint64_t)0);
+
+    STM_ASSERT_ERR(stm_inode_lookup(idx2, 1, a2, &v), STM_ENOENT);
+
+    /* next_ino reconstructed: ds=1 highest seen is a3=3, so next=4. */
+    uint64_t next = 0;
+    STM_ASSERT_OK(stm_inode_next_ino(idx2, 1, &next));
+    STM_ASSERT_EQ(next, (uint64_t)4);
+    STM_ASSERT_OK(stm_inode_next_ino(idx2, 2, &next));
+    STM_ASSERT_EQ(next, (uint64_t)3);
+
+    /* The FREED record (a2) is reused on next alloc with bumped gen. */
+    uint64_t reused = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx2, 1, 0100644, 1000, 1000, &reused));
+    STM_ASSERT_EQ(reused, a2);
+    STM_ASSERT_OK(stm_inode_lookup(idx2, 1, reused, &v));
+    STM_ASSERT_EQ(stm_load_le64(v.si_gen), (uint64_t)1);
+
+    stm_inode_index_close(idx2);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(inp_tmp_path);
+}
+
+/* P8-POSIX-1b: gen survives across mount cycles. AllocReused after
+ * remount continues to bump gen monotonically — the (ino, gen)
+ * tuple-uniqueness invariant from inode.tla extends across the
+ * persistence boundary. */
+STM_TEST(inode_persist_gen_monotonic_across_mount) {
+    inp_make_tmp("genmon");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    inp_open_fresh(&d, &b);
+
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_OK(stm_inode_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_inode_index_set_crypt_ctx(idx, INP_KEY,
+                                                   INP_POOL_UUID,
+                                                   INP_DEVICE_UUID));
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
+    /* Two free+alloc cycles before persist: gen 0 → 1 → 2. */
+    STM_ASSERT_OK(stm_inode_free(idx, 1, ino));
+    uint64_t reused = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &reused));
+    STM_ASSERT_EQ(reused, ino);
+    STM_ASSERT_OK(stm_inode_free(idx, 1, ino));
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &reused));
+
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &v));
+    STM_ASSERT_EQ(stm_load_le64(v.si_gen), (uint64_t)2);
+
+    /* Free + commit + remount. */
+    STM_ASSERT_OK(stm_inode_free(idx, 1, ino));
+
+    uint64_t paddr = 0; uint8_t cs[32];
+    STM_ASSERT_OK(stm_inode_index_commit(idx, 1u, &paddr, cs));
+
+    stm_inode_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+
+    inp_reopen(&d, &b);
+    stm_inode_index *idx2 = stm_inode_index_create();
+    STM_ASSERT_OK(stm_inode_index_set_storage(idx2, d, b));
+    STM_ASSERT_OK(stm_inode_index_set_crypt_ctx(idx2, INP_KEY,
+                                                    INP_POOL_UUID,
+                                                    INP_DEVICE_UUID));
+    STM_ASSERT_OK(stm_inode_index_load_at(idx2, paddr, 1u, cs));
+
+    /* Reuse the persisted FREED slot — gen bumps from 2 to 3. */
+    STM_ASSERT_OK(stm_inode_alloc(idx2, 1, 0100644, 0, 0, &reused));
+    STM_ASSERT_EQ(reused, ino);
+    STM_ASSERT_OK(stm_inode_lookup(idx2, 1, ino, &v));
+    STM_ASSERT_EQ(stm_load_le64(v.si_gen), (uint64_t)3);
+
+    stm_inode_index_close(idx2);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(inp_tmp_path);
+}
+
+/* P8-POSIX-1b: commit-without-storage is refused. */
+STM_TEST(inode_persist_commit_requires_storage_and_crypt) {
+    stm_inode_index *idx = stm_inode_index_create();
+    uint64_t paddr = 0; uint8_t cs[32];
+    STM_ASSERT_ERR(stm_inode_index_commit(idx, 1u, &paddr, cs), STM_EINVAL);
+    stm_inode_index_close(idx);
+}
+
+/* P8-POSIX-1b: idempotent commit when clean. */
+STM_TEST(inode_persist_idempotent_commit_when_clean) {
+    inp_make_tmp("idem");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    inp_open_fresh(&d, &b);
+
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_OK(stm_inode_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_inode_index_set_crypt_ctx(idx, INP_KEY,
+                                                   INP_POOL_UUID,
+                                                   INP_DEVICE_UUID));
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
+
+    uint64_t p1 = 0, p2 = 0; uint8_t c1[32], c2[32];
+    STM_ASSERT_OK(stm_inode_index_commit(idx, 1u, &p1, c1));
+    STM_ASSERT_OK(stm_inode_index_commit(idx, 1u, &p2, c2));
+    /* Second commit is idempotent — same root paddr, same csum. */
+    STM_ASSERT_EQ(p1, p2);
+    STM_ASSERT_MEM_EQ(c1, c2, 32);
+
+    stm_inode_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(inp_tmp_path);
 }
 
 STM_TEST_MAIN("test_inode")

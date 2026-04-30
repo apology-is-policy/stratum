@@ -72,6 +72,20 @@ extern "C" {
 #define STM_INO_FLAG_NODUMP     0x00000004u
 
 /*
+ * Reserved internal flag — set on a record whose ino has been freed
+ * and is eligible for AllocReused. Encodes the inode.tla FREED state
+ * inline within the existing 256-byte struct (no separate state byte
+ * in the persisted format). Distinct from si_nlink == 0 which can
+ * also represent "unlinked but still open" — the FREED flag is set
+ * only when the ino number itself is eligible for reuse with a
+ * bumped si_gen.
+ *
+ * Caller-visible `si_flags` value MUST NOT include this bit; the
+ * stm_inode_set / _alloc paths protect callers from setting it.
+ */
+#define STM_INO_FLAG_FREED      0x80000000u
+
+/*
  * 256-byte inode value. Layout per ARCH §11.3.
  *
  * v2 simplification vs ARCH §11.3.1: the extent-tree-root variant
@@ -169,8 +183,13 @@ void stm_inode_index_close(stm_inode_index *idx);
  * undocumented; future callers using UINT64_MAX as a "no inode"
  * marker now have authoritative coverage.]
  *
- * MVP — alloc-fresh-only path: `*out_ino = next_ino[dataset_id]++`.
- * `si_gen` = 0. Models inode.tla's AllocFresh action.
+ * Allocation policy: prefer reuse of FREED inos (with si_gen bumped
+ * by 1 — models inode.tla's AllocReused action and preserves the
+ * (ino, gen) tuple-uniqueness invariant); fall back to a fresh ino
+ * at `next_ino[dataset_id]++` when no FREED slot is available
+ * (models inode.tla's AllocFresh action with si_gen = 0). The
+ * caller cannot select between paths — the allocator picks
+ * deterministically based on the FREED set.
  *
  * Refusals:
  *   - NULL idx OR NULL out_ino (STM_EINVAL).
@@ -191,9 +210,11 @@ stm_status stm_inode_alloc(stm_inode_index *idx, uint64_t dataset_id,
                               uint64_t *out_ino);
 
 /*
- * Free the inode at (dataset_id, ino). The record's state flips to
- * FREED but the record's `si_gen` is preserved for a future
- * AllocReused (P8-POSIX-1b). Models inode.tla's Free action.
+ * Free the inode at (dataset_id, ino). Sets `STM_INO_FLAG_FREED`
+ * in `si_flags` and clears `si_nlink` to 0. The record's `si_gen`
+ * is preserved so the next AllocReused at this ino bumps it by 1
+ * — preserving the (ino, gen) tuple-uniqueness invariant from
+ * inode.tla. Models inode.tla's Free action.
  *
  * Refusals:
  *   - NULL idx OR dataset_id == 0 OR ino == 0 (STM_EINVAL).
@@ -259,9 +280,9 @@ stm_status stm_inode_count_for_ds(const stm_inode_index *idx,
 
 /*
  * Read the per-dataset `next_ino` high-water mark — the value the
- * NEXT alloc would return. Useful for tests + persistence
- * checkpointing (P8-POSIX-1b will commit this value into the
- * dataset_idx entry).
+ * NEXT alloc would return for a fresh slot (i.e., when no FREED ino
+ * is available for reuse). FREED inos are reused with a bumped gen
+ * before next_ino is touched.
  *
  * Returns 0 in `*out_next` if no inode has ever been allocated in
  * the dataset.
@@ -274,6 +295,89 @@ STM_MUST_USE
 stm_status stm_inode_next_ino(const stm_inode_index *idx,
                                  uint64_t dataset_id,
                                  uint64_t *out_next);
+
+/* ========================================================================= */
+/* Persistence (P8-POSIX-1b, v24).                                           */
+/*                                                                            */
+/* The inode index is persisted as a btree_store-encoded, AEAD-encrypted     */
+/* Bε-tree under `ub_inode_root` on device 0. Same envelope as the dataset / */
+/* extent / cas trees: AEAD nonce `paddr || gen || pool_uuid`, AD            */
+/* `pool_uuid || device_uuid_0`, idempotent commit via internal dirty flag,  */
+/* atomic shadow-swap on load_at.                                            */
+/*                                                                            */
+/* Key (16 bytes, lexicographically sorted):                                 */
+/*                                                                            */
+/*   off  size  field                                                        */
+/*    0    8    le64 dataset_id                                              */
+/*    8    8    le64 ino                                                     */
+/*                                                                            */
+/* Value: 256-byte struct stm_inode_value as defined above. The FREED        */
+/* state is encoded inline via STM_INO_FLAG_FREED in si_flags.               */
+/*                                                                            */
+/* `next_ino` per-dataset high-water mark is reconstructed at load_at        */
+/* time from the deserialized records (max(ino over records-for-ds) + 1),   */
+/* so it does not need a separate persistence slot.                          */
+/* ========================================================================= */
+
+struct stm_bdev;       typedef struct stm_bdev stm_bdev;
+struct stm_bootstrap;  typedef struct stm_bootstrap stm_bootstrap;
+
+/*
+ * Bind the inode index to its on-disk storage (device 0 + bootstrap
+ * allocator). MUST be called before commit() / load_at(). Mirrors
+ * `stm_extent_index_set_storage`.
+ */
+STM_MUST_USE
+stm_status stm_inode_index_set_storage(stm_inode_index *idx,
+                                          stm_bdev *bdev_0,
+                                          stm_bootstrap *boot_0);
+
+/*
+ * Bind the AEAD context (metadata key + pool/device UUIDs). MUST be
+ * called before commit() / load_at(). The pointer to `metadata_key`
+ * is stored — caller MUST keep the buffer alive.
+ */
+STM_MUST_USE
+stm_status stm_inode_index_set_crypt_ctx(stm_inode_index *idx,
+                                            const uint8_t *metadata_key,
+                                            const uint64_t pool_uuid[2],
+                                            const uint64_t device_uuid_0[2]);
+
+/*
+ * Commit the in-RAM index to disk under `committed_gen`. Returns the
+ * new tree's root paddr + 32-byte BLAKE3 csum via out-params, which
+ * the caller stamps into `ub_inode_root`. Idempotent when clean.
+ *
+ * Refusals: STM_EINVAL (NULL idx / out_paddr / out_csum, or storage
+ * / crypt context unset), and any error bubbled from
+ * stm_btree_store_serialize.
+ */
+STM_MUST_USE
+stm_status stm_inode_index_commit(stm_inode_index *idx,
+                                     uint64_t committed_gen,
+                                     uint64_t *out_root_paddr,
+                                     uint8_t out_root_csum[32]);
+
+/*
+ * Atomic shadow-swap load_at. Reads the tree under (root_paddr,
+ * root_gen), validates against expected_csum, deserializes records,
+ * and atomically swaps in the new state. After return, all prior
+ * in-RAM records are replaced (no preservation across load_at).
+ */
+STM_MUST_USE
+stm_status stm_inode_index_load_at(stm_inode_index *idx,
+                                      uint64_t root_paddr, uint64_t root_gen,
+                                      const uint8_t expected_csum[32]);
+
+/* Read the current root paddr / csum / gen — for the sync layer's
+ * dirty-tracking + uberblock stamping. */
+STM_MUST_USE
+stm_status stm_inode_index_get_root(const stm_inode_index *idx,
+                                       uint64_t *out_root_paddr,
+                                       uint8_t out_root_csum[32]);
+STM_MUST_USE
+stm_status stm_inode_index_get_gen(const stm_inode_index *idx,
+                                      uint64_t *out_root_gen);
 
 #ifdef __cplusplus
 }

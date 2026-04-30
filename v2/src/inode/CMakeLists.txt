@@ -5,4 +5,5 @@ target_include_directories(stm_inode PUBLIC
 
 target_link_libraries(stm_inode
     PRIVATE stm_warnings stm_sanitize stm_coverage
-    PUBLIC  Threads::Threads)
+    PUBLIC  stm_block stm_bootstrap stm_btree stm_btree_store
+            stm_sb Threads::Threads)

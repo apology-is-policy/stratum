@@ -351,8 +351,23 @@ extern "C" {
  * comfortably; no encoding shape change. The wire-format cap
  * STM_SEND_CHUNK_PLAIN_MAX (send_recv.h) lifts in lockstep —
  * STM_SEND_VERSION 2 → 3 to refuse v2 streams (which assume the
- * 128-KiB-CHUNK invariant). No uberblock field changes. */
-#define STM_UB_VERSION        23u
+ * 128-KiB-CHUNK invariant). No uberblock field changes.
+ *
+ * v23 → v24 bump (P8-POSIX-1b): per-pool inode tree on-disk
+ * surface introduced. New uberblock fields `ub_inode_root`
+ * (64-byte stm_bptr at offset 3288 — head of the prior
+ * `ub_reserved` block) + `ub_inode_root_gen` (le64 at offset 3352)
+ * carry the root paddr / csum / gen of the AEAD-encrypted Bε-tree
+ * keyed by `(le64 dataset_id || le64 ino)` storing the 256-byte
+ * stm_inode_value records (ARCH §11.3). `ub_reserved` shrinks
+ * 776 → 704 bytes. v23 pools refused at v24 mount via uniform
+ * STM_EBADVERSION at the SB version check (mirrors P7-CAS-16's
+ * STM_UB_VERSION 22 → 23 refusal pattern) — a v24 binary
+ * encountering a v23 pool would find no inode tree, and silently
+ * synthesizing one would break the (ino, gen) tuple-uniqueness
+ * invariant from `inode.tla`. ARCH §11, NOVEL deliverable
+ * implicit in §3.8's Plan-9 lineage. */
+#define STM_UB_VERSION        24u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */
@@ -442,6 +457,7 @@ typedef enum {
     STM_BPTR_KIND_DATASET     = 9,   /* dataset-index tree root (ARCH §8.3.2, P6-persist) */
     STM_BPTR_KIND_EXTENT_TREE = 10,  /* extent-index tree root (ARCH §11.6, P7-3) */
     STM_BPTR_KIND_REPAIR_LOG  = 11,  /* repair-log tree root (ARCH §7.15.4, P7-15) */
+    STM_BPTR_KIND_INODE_TREE  = 12,  /* inode-index tree root (ARCH §11.3, P8-POSIX-1b) */
 } stm_bptr_kind;
 
 typedef struct {
@@ -609,8 +625,24 @@ typedef struct {
      * tier commit. ARCH §6.9, NOVEL #3, spec cas.tla. */
     le64    ub_cas_index_root_gen;              /* 3280 :  8 */
 
+    /* P8-POSIX-1b (v24): per-pool inode tree root. Bptr to the
+     * btree_store-encoded, AEAD-encrypted Bε-tree under
+     * `ub_inode_root` on device 0. Keys: 16 bytes
+     * (le64 dataset_id || le64 ino). Values: 256-byte
+     * stm_inode_value records (ARCH §11.3). The tree's bp_kind is
+     * `STM_BPTR_KIND_INODE_TREE`. Zero before the first commit.
+     * ARCH §11, spec inode.tla. */
+    stm_bptr ub_inode_root;                     /* 3288 : 64 */
+
+    /* Gen at which `ub_inode_root`'s tree was AEAD-encrypted
+     * (P8-POSIX-1b, v24). Same semantics as `ub_extent_root_gen`
+     * / `ub_cas_index_root_gen`. The AEAD nonce on every tree-node
+     * read uses THIS field, not ub_gen. Zero before the first
+     * commit. */
+    le64    ub_inode_root_gen;                  /* 3352 :  8 */
+
     /* Reserved for future fields + alignment to csum. */
-    uint8_t ub_reserved[776];                   /* 3288 : 776 */
+    uint8_t ub_reserved[704];                   /* 3360 : 704 */
 
     /* Checksum: BLAKE3-256 over the rest of the uberblock with this
      * field zeroed. Self-verifying; a blob whose first 4064 bytes
@@ -641,8 +673,12 @@ _Static_assert(offsetof(stm_uberblock, ub_cas_index_root) == 288,
                "ub_cas_index_root must be at offset 288 (v3 layout)");
 _Static_assert(offsetof(stm_uberblock, ub_cas_index_root_gen) == 3280,
                "ub_cas_index_root_gen must be at offset 3280 (v18 layout)");
-_Static_assert(offsetof(stm_uberblock, ub_reserved) == 3288,
-               "ub_reserved must be at offset 3288 (v18 layout)");
+_Static_assert(offsetof(stm_uberblock, ub_inode_root) == 3288,
+               "ub_inode_root must be at offset 3288 (v24 layout)");
+_Static_assert(offsetof(stm_uberblock, ub_inode_root_gen) == 3352,
+               "ub_inode_root_gen must be at offset 3352 (v24 layout)");
+_Static_assert(offsetof(stm_uberblock, ub_reserved) == 3360,
+               "ub_reserved must be at offset 3360 (v24 layout)");
 _Static_assert(offsetof(stm_uberblock, ub_csum) == 4064,
                "ub_csum must be at offset 4064");
 

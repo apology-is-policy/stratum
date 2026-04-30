@@ -36,6 +36,7 @@
 #include <stratum/block.h>
 #include <stratum/crypto.h>
 #include <stratum/cas.h>
+#include <stratum/inode.h>
 #include <stratum/cdc.h>
 #include <stratum/dataset.h>
 #include <stratum/extent.h>
@@ -271,6 +272,14 @@ struct stm_sync {
      * lifecycle wiring + persistence layer is the foundation. */
     stm_cas_index      *cas_idx;
 
+    /* P8-POSIX-1b (v24): per-pool inode index. Same wiring shape as
+     * extent_idx / cas_idx — AEAD-encrypted Bε-tree under
+     * ub_inode_root on device 0. Keys (le64 dataset_id || le64 ino).
+     * Values: 256-byte stm_inode_value records (ARCH §11.3). Empty
+     * at format time; first sync_commit serializes the empty btree
+     * so subsequent mounts find a valid bptr. */
+    stm_inode_index    *inode_idx;
+
     /* P7-CAS-4b: FastCDC chunker for the cold-tier migration path. The
      * chunker is read-only after init (gear[256] table + params); safe
      * to share across threads. Initialized at sync_create and
@@ -338,6 +347,10 @@ struct stm_sync {
     uint64_t           cas_index_root_paddr;
     uint64_t           cas_index_root_gen;
     uint8_t            cas_index_root_csum[32];
+    /* P8-POSIX-1b (v24): inode tree root mirrors the cas/extent shape. */
+    uint64_t           inode_root_paddr;
+    uint64_t           inode_root_gen;
+    uint8_t            inode_root_csum[32];
 
     /* Mirror of ub_next_dataset_id / ub_next_snap_id. Sourced from the
      * indices' get_next_id at commit; restored at mount via
@@ -751,6 +764,9 @@ static void build_uberblock(stm_uberblock *out,
                               uint64_t cas_index_root_paddr,
                               const uint8_t cas_index_root_csum[32],
                               uint64_t cas_index_root_gen,
+                              uint64_t inode_root_paddr,
+                              const uint8_t inode_root_csum[32],
+                              uint64_t inode_root_gen,
                               const uint8_t merkle_root[32],
                               const stm_alloc_stats *astats)
 {
@@ -840,6 +856,17 @@ static void build_uberblock(stm_uberblock *out,
         memcpy(out->ub_cas_index_root.bp_csum, cas_index_root_csum, 32);
     }
     out->ub_cas_index_root_gen = stm_store_le64(cas_index_root_gen);
+
+    /* P8-POSIX-1b (v24): inode tree root + AEAD gen. Same shape as
+     * extent_root / cas_index_root. The tree root field
+     * `ub_inode_root` lives at offset 3288 (head of the prior
+     * `ub_reserved`); `ub_inode_root_gen` is the AEAD gen. */
+    if (inode_root_paddr != 0) {
+        out->ub_inode_root.bp_paddr = stm_store_le64(inode_root_paddr);
+        out->ub_inode_root.bp_kind  = STM_BPTR_KIND_INODE_TREE;
+        memcpy(out->ub_inode_root.bp_csum, inode_root_csum, 32);
+    }
+    out->ub_inode_root_gen = stm_store_le64(inode_root_gen);
 
     /* Pool-wide id counters (ARCH §5.4). Stamped from the indices'
      * get_next_id; restored at mount via the indices' set_next_id. */
@@ -1212,6 +1239,20 @@ stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
         if (rc != STM_OK) { stm_sync_close(s); return rc; }
         rc = stm_cas_index_set_crypt_ctx(s->cas_idx, s->metadata_key,
                                             s->pool_uuid, s->device_uuid);
+        if (rc != STM_OK) { stm_sync_close(s); return rc; }
+
+        /* P8-POSIX-1b (v24): inode index. Same wiring shape as
+         * cas_idx / extent_idx. AEAD-encrypted Bε-tree under
+         * ub_inode_root on device 0. Keys (le64 dataset_id || le64
+         * ino). Values: 256-byte stm_inode_value records. Empty at
+         * format time; first sync_commit serializes the empty btree
+         * so subsequent mounts find a valid bptr. */
+        s->inode_idx = stm_inode_index_create();
+        if (!s->inode_idx) { stm_sync_close(s); return STM_ENOMEM; }
+        rc = stm_inode_index_set_storage(s->inode_idx, d, boot);
+        if (rc != STM_OK) { stm_sync_close(s); return rc; }
+        rc = stm_inode_index_set_crypt_ctx(s->inode_idx, s->metadata_key,
+                                              s->pool_uuid, s->device_uuid);
         if (rc != STM_OK) { stm_sync_close(s); return rc; }
 
         /* P6-clone: register the clone-dependency check on snap_idx.
@@ -1882,6 +1923,33 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
         s2->cas_index_root_gen   = cgen;
         memcpy(s2->cas_index_root_csum, ub.ub_cas_index_root.bp_csum, 32);
 
+        /* P8-POSIX-1b (v24): inode index. Same wiring shape as
+         * cas_idx. Empty (paddr=0) on fresh format / pre-first-commit
+         * pools — load_at is skipped. */
+        s2->inode_idx = stm_inode_index_create();
+        if (!s2->inode_idx) { stm_sync_close(s2); return STM_ENOMEM; }
+        stm_status ini = stm_inode_index_set_storage(s2->inode_idx, meta_bdev, boot2);
+        if (ini != STM_OK) { stm_sync_close(s2); return ini; }
+        ini = stm_inode_index_set_crypt_ctx(s2->inode_idx, s2->metadata_key,
+                                              s2->pool_uuid, s2->device_uuid);
+        if (ini != STM_OK) { stm_sync_close(s2); return ini; }
+
+        uint64_t ipaddr = stm_load_le64(ub.ub_inode_root.bp_paddr);
+        uint64_t igen   = stm_load_le64(ub.ub_inode_root_gen);
+        if (ipaddr != 0) {
+            if (ub.ub_inode_root.bp_kind != STM_BPTR_KIND_INODE_TREE) {
+                stm_sync_close(s2);
+                return STM_ECORRUPT;
+            }
+            stm_status ls = stm_inode_index_load_at(s2->inode_idx,
+                                                       ipaddr, igen,
+                                                       ub.ub_inode_root.bp_csum);
+            if (ls != STM_OK) { stm_sync_close(s2); return ls; }
+        }
+        s2->inode_root_paddr = ipaddr;
+        s2->inode_root_gen   = igen;
+        memcpy(s2->inode_root_csum, ub.ub_inode_root.bp_csum, 32);
+
         /* P6-clone: register the clone-dependency check now that both
          * indices are populated. Snap delete refuses while any present
          * clone in dataset_idx references the target snap. */
@@ -1939,6 +2007,9 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
                          /*cas_index_root=*/    s2->cas_index_root_paddr,
                          /*cas_index_csum=*/    s2->cas_index_root_csum,
                          /*cas_index_gen=*/     s2->cas_index_root_gen,
+                         /*inode_root=*/        s2->inode_root_paddr,
+                         /*inode_csum=*/        s2->inode_root_csum,
+                         /*inode_gen=*/         s2->inode_root_gen,
                          /*merkle_root=*/       ub.ub_merkle_root,
                          &astats_claim);
         uint32_t lbl  = ring_label_for_gen(auth_gen + 1);
@@ -2012,6 +2083,8 @@ void stm_sync_close(stm_sync *s)
     if (s->repair_log)  stm_repair_log_index_close(s->repair_log);
     /* P7-CAS: close the CAS index. */
     if (s->cas_idx)     stm_cas_index_close(s->cas_idx);
+    /* P8-POSIX-1b: close the inode index. */
+    if (s->inode_idx)   stm_inode_index_close(s->inode_idx);
     /* P5-3b: close the allocator-roots handle. Owns its own
      * in-RAM btree; borrows bdev + bootstrap + metadata_key. */
     if (s->roots) stm_alloc_roots_close(s->roots);
@@ -2116,6 +2189,9 @@ stm_status stm_sync_commit(stm_sync *s)
                          /*cas_index_root=*/    s->cas_index_root_paddr,
                          /*cas_index_csum=*/    s->cas_index_root_csum,
                          /*cas_index_gen=*/     s->cas_index_root_gen,
+                         /*inode_root=*/        s->inode_root_paddr,
+                         /*inode_csum=*/        s->inode_root_csum,
+                         /*inode_gen=*/         s->inode_root_gen,
                          /*merkle_root=*/       s->merkle_root,
                          &astats_res);
         uint32_t res_label = ring_label_for_gen(reservation_gen);
@@ -2352,6 +2428,24 @@ stm_status stm_sync_commit(stm_sync *s)
         return ccs;
     }
 
+    /* P8-POSIX-1b (v24): commit the inode index. Same shape as
+     * cas_idx / extent_idx. Empty btree at format time produces a
+     * valid bptr that subsequent mounts find via load_at. */
+    uint64_t inode_paddr = 0;
+    uint8_t  inode_csum[32] = {0};
+    uint64_t inode_gen = 0;
+    stm_status ics = stm_inode_index_commit(s->inode_idx, target_gen,
+                                              &inode_paddr, inode_csum);
+    if (ics != STM_OK) {
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
+        return ics;
+    }
+    ics = stm_inode_index_get_gen(s->inode_idx, &inode_gen);
+    if (ics != STM_OK) {
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
+        return ics;
+    }
+
     stm_alloc_stats astats;
     stm_status sr = stm_alloc_stats_get(s->alloc, &astats);
     if (sr != STM_OK) {
@@ -2396,6 +2490,9 @@ stm_status stm_sync_commit(stm_sync *s)
                      /*cas_index_root=*/ cas_paddr,
                      /*cas_index_csum=*/ cas_csum,
                      /*cas_index_gen=*/  cas_gen,
+                     /*inode_root=*/     inode_paddr,
+                     /*inode_csum=*/     inode_csum,
+                     /*inode_gen=*/      inode_gen,
                      new_merkle_root, &astats);
 
     uint32_t fin_label = ring_label_for_gen(target_gen);
@@ -2430,6 +2527,8 @@ stm_status stm_sync_commit(stm_sync *s)
     s->repair_log_next_seq   = repair_log_seq;
     s->cas_index_root_paddr  = cas_paddr;
     s->cas_index_root_gen    = cas_gen;
+    s->inode_root_paddr      = inode_paddr;
+    s->inode_root_gen        = inode_gen;
     s->next_dataset_id       = main_next_id;
     s->next_snap_id          = snap_next_id;
     memcpy(s->alloc_root_csum,     roots_csum,      32);
@@ -2438,6 +2537,7 @@ stm_status stm_sync_commit(stm_sync *s)
     memcpy(s->snap_root_csum,      snap_csum,      32);
     memcpy(s->extent_root_csum,    extent_csum,    32);
     memcpy(s->cas_index_root_csum, cas_csum,        32);
+    memcpy(s->inode_root_csum,     inode_csum,      32);
     memcpy(s->repair_log_root_csum, repair_log_csum, 32);
     memcpy(s->merkle_root,         new_merkle_root, 32);
 

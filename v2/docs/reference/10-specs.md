@@ -1188,14 +1188,17 @@ Spec-to-code:
   preserves the (ino, gen) uniqueness invariant trivially since
   every alloc is fresh. P8-POSIX-1b will add the reuse path with
   the gen bump per `AllocReused`.
-- `tests/test_inode.c` — 26 tests exercising lifecycle, alloc
+- `tests/test_inode.c` — 32 tests exercising lifecycle, alloc
   monotonicity, per-dataset isolation, free + ENOENT, double-free
   refusal, set-with-identity-mismatch refusal (protects the
   (ino, gen) invariant from caller error), count + next_ino
   accessors, struct size assertion (256B per ARCH §11.3), arg
   validation matrix (R69 P3-7), data_kind reject-unknown (R69
   P3-3), reserved-zero on Set (R69 P3-2), zero-init contract
-  for all passive fields (R69 P3-8).
+  for all passive fields (R69 P3-8). P8-POSIX-1b adds: AllocReused
+  with gen bump (alloc-prefers-reuse + cycles), set-rejects-FREED-
+  flag, persistence roundtrip across mount cycles, gen monotonic
+  across the persistence boundary, idempotent commit when clean.
 - Out-of-scope here: nlink semantics (P8-POSIX-3), tagged data
   union transitions (P8-POSIX-5), on-disk persistence
   (P8-POSIX-1b).
