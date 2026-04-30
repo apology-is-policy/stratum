@@ -1162,11 +1162,17 @@ stm_status stm_fs_effective_dataset_property(stm_fs *fs, uint64_t dataset_id,
                                                 stm_property prop,
                                                 uint64_t *out_value)
 {
+    /* R64 P2-1: uniform out-param contract — zero-init out_value
+     * BEFORE the NULL-arg check so a caller observing on STM_EINVAL
+     * (e.g. NULL fs but non-NULL out_value) still sees a defined
+     * zero rather than uninitialized stack. Same shape as
+     * stm_fs_migrate_policy_step (fs.c:569),
+     * stm_fs_migrate_policy_pass_all (fs.c:687),
+     * stm_fs_promote_policy_step (fs.c:834). The prior order
+     * (NULL-check first) violated the contract on the
+     * `NULL fs + non-NULL out_value` path. */
+    if (out_value) *out_value = 0;
     if (!fs || !out_value) return STM_EINVAL;
-    /* Uniform out-param contract: zero-init before any guard / arg
-     * check so a caller observing on any error still sees a defined
-     * value rather than uninitialized stack. */
-    *out_value = 0;
 
     pthread_mutex_lock(&fs->lock);
     FS_GUARD_READ(fs);

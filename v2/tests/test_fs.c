@@ -6175,9 +6175,16 @@ STM_TEST(fs_p7cas13_arg_validation) {
                        STM_EINVAL);
     STM_ASSERT_ERR(stm_fs_clear_dataset_property(NULL, 1, STM_PROP_TIERING),
                        STM_EINVAL);
+    /* R64 P3-2: use a sentinel rather than an already-zero compound
+     * literal, so the uniform out-param contract is genuinely
+     * exercised — wrapper must zero-init out_value BEFORE the NULL
+     * fs check. A regression to "NULL-check first" would leave
+     * sentinel intact + this assertion would fire. */
+    uint64_t v_sentinel = 0xDEADBEEFu;
     STM_ASSERT_ERR(stm_fs_effective_dataset_property(NULL, 1, STM_PROP_TIERING,
-                                                          (uint64_t[]){0}),
+                                                          &v_sentinel),
                        STM_EINVAL);
+    STM_ASSERT_EQ(v_sentinel, 0u);
     STM_ASSERT_ERR(stm_fs_set_dataset_pool_default(NULL, STM_PROP_TIERING, 0),
                        STM_EINVAL);
 

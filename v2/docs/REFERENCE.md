@@ -52,9 +52,11 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   guards. The wrappers are thin pass-throughs — take fs->lock,
   apply FS_GUARD_WRITE (mutators) or FS_GUARD_READ (effective
   reader), get the dataset_idx via `stm_sync_dataset_index`,
-  delegate to the dataset.c API. Lock posture matches the rest
-  of the fs/* surface (fs->lock → sync->lock → dataset_idx
-  mutex). The reader uses the established uniform out-param
+  delegate to the dataset.c API. Lock posture: fs->lock →
+  dataset_idx mutex (`stm_sync_dataset_index` is a pure pointer
+  load, takes no sync-layer lock). dataset.c never re-enters
+  sync.c or fs.c, so the acquisition is leaf-safe. The reader
+  uses the established uniform out-param
   contract (zero-init `*out_value` BEFORE arg validation, so
   callers observing on STM_EINVAL/STM_EWEDGED still see a
   defined value). Effective reader is allowed on RO mounts
