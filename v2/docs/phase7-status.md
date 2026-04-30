@@ -56,6 +56,31 @@ into the CAS tier (which DOES need P6) is a separate concern.
 
 ## Phase 7 status (overall)
 
+- [~] **P7-VAL-1 dedup ratio benchmark + sweep harness** — landed
+      `v2/bench/bench_dedup.c` + `v2/bench/run_dedup.sh` for the
+      ROADMAP §10.2 exit criterion 1 ("Cold-tier dedup achieves
+      target 3-5× on VM-image test set"). Generates a deterministic
+      synthetic VM-image corpus (a shared `base` byte stream + N
+      files each derived by overwriting `mod_percent` of bytes in
+      scattered regions), ingests via `stm_fs_write`, runs
+      `stm_fs_migrate_to_cold` per file, sums CAS chunk lengths
+      via `stm_cas_iter`, reports `dedup_ratio = bytes_written /
+      sum_of_cas_chunk_lengths`. Local validation (Apple Silicon)
+      passes the 3× target across the headline configurations:
+      `(N=10, mod=10%)` → 4.43×; `(N=20, mod=20%)` → 3.21×;
+      `(N=50, mod=15%)` → 4.59×; `(N=20, mod=20%, chunk=32KiB)` →
+      3.68×. Determinism verified across re-runs (identical
+      `(seed, params)` → identical CAS chunk count + ratio
+      byte-for-byte). Bench code is opt-in via `-DSTM_BUILD_BENCHES=ON`
+      and not in ctest. **Open**: the GCP / Linux run at
+      `medium`/`large` scale (1-10 GiB total) to confirm the
+      ratio holds at production-shape disk traffic. Until that
+      runs, criterion 1 is empirically demonstrated at small
+      scale only — fine for marking Phase 7 substantively complete
+      but the formal exit signoff awaits the larger run. Bench
+      code is not on the audit-trigger surfaces list (consumes
+      public APIs only); no formal R-round.
+
 - [x] **P7-CAS-17 cross-extent FastCDC at migrate** —
       substantive `2ceafb9` + R68 close `3deb833` + hash-fixup
       (this commit). Closes the per-extent isolation gap from P7-CAS-4b

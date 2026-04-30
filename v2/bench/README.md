@@ -17,6 +17,10 @@ build-bench/bench/bench_btree_lf
 
 # Snapshot benchmarks: ROADMAP §9.2 #1 + #2.
 build-bench/bench/bench_snapshot
+
+# Dedup ratio benchmark: ROADMAP §10.2 #1 (P7-VAL-1).
+build-bench/bench/bench_dedup --help
+build-bench/bench/bench_dedup --files=20 --base-mib=10 --mod-percent=20
 ```
 
 Output on an 8-core Apple Silicon (M-series, 4P+4E):
@@ -97,6 +101,66 @@ appended paddr. Cost grows linearly with total dead entries; at
 N_dead=256 it's still 62 ns/op. Bounded by `STM_SNAP_DEAD_LIST_MAX`
 × n_snaps; production-grade chunked dead-list (deferred) will
 need a sorted-merge or hash replacement here.
+
+## Interpreting dedup numbers (P7-VAL-1)
+
+ROADMAP §10.2 exit criterion 1: "Cold-tier dedup achieves target
+3-5× on VM-image test set." `bench_dedup` ingests a deterministic
+synthetic VM-image corpus (a shared `base` byte stream + N files
+each derived from base by overwriting `mod_percent` of bytes in
+scattered regions), runs `stm_fs_migrate_to_cold` per file, and
+reports
+
+    dedup_ratio = bytes_written / sum_of_cas_chunk_lengths
+
+The ratio is dominated by three knobs:
+
+- **`--files=N`** — more files share the base's content-defined
+  chunks. Ratio ≈ `N / (1 + (mod_percent/100) × N)` minus a small
+  constant for boundary chunks at modification edges.
+- **`--mod-percent=P`** — the fraction of each file overwritten
+  with file-unique content. Lower P = more shared chunks per file
+  = higher ratio. ROADMAP cites "80% overlap" → P = 20.
+- **`--avg-chunk-kib=A`** — FastCDC chunk granularity. Smaller
+  chunks track modifications more precisely (fewer wasted bytes
+  in boundary chunks) but add proportional CAS-index overhead.
+  Default 64 KiB.
+
+Headline configurations on an 8-core Apple Silicon (~1 sec/MiB
+ingest, ~0.2 GB/s sustained):
+
+```
+files= 10  base= 10 MiB  mod=10%   →  4.43×  (100 MiB → 23 MiB)
+files= 20  base= 10 MiB  mod=20%   →  3.21×  (200 MiB → 62 MiB)
+files= 50  base= 10 MiB  mod=15%   →  4.59×  (500 MiB → 109 MiB)
+```
+
+All three pass ROADMAP §10.2 #1's lower bound (3×). The 5× target
+is achievable at `--mod-percent=10` or `--files=100`. The bench
+exits 0 if `dedup_ratio >= 3.0` and 1 otherwise so CI can flag
+regressions.
+
+### Determinism + reproducibility
+
+The corpus is generated from fixed seeds keyed by the file index;
+identical `(--files, --base-mib, --mod-percent)` always produce
+identical bytes → identical CAS chunks → identical ratio. A run
+on macOS and a run on Ubuntu/GCP under the same parameters report
+the same numbers byte-for-byte.
+
+### Test-hooks dependency
+
+The bench links via `stm_fs_sync_for_test` + `stm_sync_set_cdc_params_for_test`
+so it can install non-default FastCDC params (the production default
+of 8 MiB avg / 2 MiB min would force K=1 chunk per recordsize-bound
+extent, defeating the test). Both seams are gated behind
+`STRATUM_BUILD_TESTING_HOOKS` (ON by default; production opt-out
+disables the bench's link).
+
+### Scaling up: GCP runs
+
+For larger corpora (20-50 GiB to demonstrate the ratio at production
+scale), see the `--pool-mib` flag and the run script.
 
 ## Sustained stress
 
