@@ -1535,6 +1535,18 @@ stm_status stm_dataset_index_load_at(stm_dataset_index *idx,
     memcpy(idx->root_csum, expected_csum, 32);
     idx->dirty = false;
 
+    /* R65 P3-1: load_at replaces slots[] + pool_default[] wholesale
+     * via the shadow-swap above. Today this is safe because load_at
+     * is only called from sync_open on a fresh dataset_idx before
+     * any sync read. Bumping prop_mutation_gen here is defensive
+     * insurance: if a future code path ever calls load_at mid-flight
+     * on an idx attached to a sync with a populated cache, the cache
+     * would silently serve stale values. The bump invalidates en
+     * masse on next read so the cache picks up the post-load state.
+     * One-line latent-hazard fix. */
+    atomic_fetch_add_explicit(&idx->prop_mutation_gen, 1u,
+                                 memory_order_relaxed);
+
     must_unlock(&idx->lock);
     return STM_OK;
 }

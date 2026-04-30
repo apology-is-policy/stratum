@@ -4547,13 +4547,14 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
  *      bumping; without storing 0 we'd miss-cache and re-walk every
  *      time). Return resolved value with the 0 → default fold.
  *
- * Lock ordering note: `stm_dataset_index_property_mutation_gen` and
- * `stm_dataset_effective_property` both take dataset_idx->lock
- * internally (the gen accessor uses an atomic-load fast-path; the
- * effective lookup walks the parent chain under the mutex). The
- * sync->lock is held throughout; dataset.c never re-enters sync, so
- * the acquisition is leaf-safe. Same direction as the pre-cache
- * implementation.
+ * Lock ordering note: `stm_dataset_effective_property` takes
+ * dataset_idx->lock internally (walks the parent chain under the
+ * mutex). `stm_dataset_index_property_mutation_gen` is a relaxed
+ * atomic load with no lock acquisition — that's what makes the
+ * gen-check fast path correct without contending on the dataset_idx
+ * mutex. The sync->lock is held throughout; dataset.c never
+ * re-enters sync, so the slow-path acquisition is leaf-safe. Same
+ * direction as the pre-cache implementation. R65 P3-2.
  *
  * Race posture: the cache + bump are best-effort. A concurrent
  * mutation between the gen read and the cache lookup may yield a

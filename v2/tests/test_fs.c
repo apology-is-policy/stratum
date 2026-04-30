@@ -6448,6 +6448,77 @@ STM_TEST(fs_p7cas14_cache_invalidates_on_clear_property) {
     unlink(g_key_path);
 }
 
+STM_TEST(fs_p7cas14_cache_invalidates_on_move) {
+    /* R65 P3-4 close: move bumps the gen too (a moved dataset gets a
+     * new parent → INHERITABLE walk results change). This test
+     * builds: root → home (window=10) → child (inherits 10). Reads
+     * on `child` populate the cache with the inherited 10. Then
+     * move `child` directly under root (which has no local
+     * override → effective = pool default 0 → compile-time default
+     * 1024). Without the cache invalidation, the next read on
+     * child would still see window=10. */
+    make_tmp("p7cas14_move");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Set window=10 on home so descendants inherit it. */
+    uint64_t home = 0, child = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, /*parent=*/1, "home", &home));
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, /*parent=*/home, "child", &child));
+    STM_ASSERT_OK(stm_fs_set_dataset_property(
+            fs, home, STM_PROP_PROMOTE_DECAY_WINDOW, 10u));
+
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++)
+        plain[i] = (uint8_t)((i * 37u + 9u) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, child, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, child, 1));
+
+    uint8_t buf[4096];
+    size_t got = 0;
+    /* Read 1 — counter=1 (sentinel reset). Cache populates with
+     * window=10 for child (inherited). */
+    STM_ASSERT_OK(stm_fs_read(fs, child, 1, 0, buf, sizeof buf, &got));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    /* Read 2 — gap=2 ≤ 10 → counter=2 (cache hit on window=10). */
+    STM_ASSERT_OK(stm_fs_read(fs, child, 1, 0, buf, sizeof buf, &got));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record rec;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, child, 1, 0, &rec));
+    STM_ASSERT_EQ((unsigned)rec.read_count, 2u);
+
+    /* Move child directly under root. Effective window for child is
+     * now root's effective (no local; pool default 0; compile-time
+     * default 1024). gen MUST bump → cache invalidates. */
+    stm_dataset_index *idx = stm_sync_dataset_index(sync);
+    STM_ASSERT_OK(stm_dataset_move(idx, child, /*new_parent=*/1));
+
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    /* Read 3 with window=1024: gap=2 ≤ 1024 → counter=3 (cache
+     * recomputes the new effective). Stale cache would still see
+     * window=10, gap=2 ≤ 10 → counter=3 too — same result.
+     * To distinguish, do MANY commits to push gap > 10 but < 1024. */
+    for (int i = 0; i < 11; i++) STM_ASSERT_OK(stm_fs_commit(fs));
+    /* Read 3 — three reads total (1 + 2 + this). Stale cache with
+     * window=10 → gap=2+11=13 > 10 → counter resets to 1. Fresh
+     * cache with window=1024 → gap=13 ≤ 1024 → counter=3
+     * (saturating-increment from prior 2). */
+    STM_ASSERT_OK(stm_fs_read(fs, child, 1, 0, buf, sizeof buf, &got));
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, child, 1, 0, &rec));
+    STM_ASSERT_EQ((unsigned)rec.read_count, 3u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST(fs_p7cas14_cache_invalidates_on_pool_default_change) {
     /* set_pool_default also bumps the gen → cache invalidates.
      * Test: pool default 1024, root has no local override. Read →
