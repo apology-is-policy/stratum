@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Stratum v2 ships 20 TLA+ spec modules covering every load-bearing
+Stratum v2 ships 22 TLA+ spec modules covering every load-bearing
 invariant in the implementation. The specs are the **source of
 truth** for protocol-level behavior; code is an implementation of
 the spec (CLAUDE.md: "spec-first policy"). When the two disagree,
@@ -41,13 +41,16 @@ chapter as specs get wider cross-reference tables).
 | `dead_list.tla` | 6 + P7-CAS-4c | Block-level reachability + per-snapshot dead-list incremental maintenance during COW + ZFS-style SnapDelete (free-unique + merge-surviving-into-pred). P7-CAS-4c extends with parallel cold-tier model: `WriteCold(c, h)` + `OverwriteCold(c)` actions + `snap_cold_dead`, `cold_dereffed`, `used_cold_extents` variables; SnapDelete drains snap_cold_dead → cold_dereffed; new invariants `ColdExtentsTrackedSomewhere`, `LiveColdDisjointFromDead`, `LiveColdDisjointFromDereffed`, `DereffedColdDisjointFromDead`, `ColdSingleOwnership`. | 4.11M states, depth 21 (MaxBlocks=4, MaxSnaps=3, MaxColdExtents=3, MaxHashIds=2) — was 5656 / 15 pre-P7-CAS-4c | `dead_list_overwrite_forgets_buggy.cfg`, `dead_list_delete_forgets_free_buggy.cfg`, `dead_list_merge_includes_freed_buggy.cfg`, `dead_list_overwrite_cold_forgets_buggy.cfg`, `dead_list_delete_cold_forgets_deref_buggy.cfg` |
 | `extent.tla` | 7 | Per-(dataset, ino) extent layout — Write / Overwrite / Truncate / DeleteFile / AdvanceTxg + Reflink (P7-16) + no-overlap-within-ino + length-positive + birth-txg-bound + paddr-freshness + replica sets per extent (P7-6) + Truncate partial-shrink under fresh replicas (P7-9) + key_id stamp on every extent (P7-10) + origin triple per extent + SharedReplicasAreCohabit + OriginConsistentInBounds (P7-16). | extent.cfg: 838164 states, depth 7 (MaxDatasets=1, MaxInos=2, MaxFileBlocks=3, MaxPaddrs=5, MaxTxg=1, MaxReplicasPerExtent=2, MaxKeyIds=1, DisableReflink=TRUE; preserves P7-9 partial-shrink coverage). extent_keyids.cfg: ~8.7M states, depth 18 (MaxDatasets=2, MaxFileBlocks=2, MaxPaddrs=4, MaxKeyIds=2, DisableReflink=FALSE; P7-10 spanning-rotation × P7-16 reflink coverage including link_gen). | `extent_overlap_buggy.cfg`, `extent_zero_length_buggy.cfg`, `extent_overwrite_forgets_drop_buggy.cfg`, `extent_replica_collision_buggy.cfg`, `reflink_rotates_origin_buggy.cfg` (P7-16) |
 | `cas.tla` | 10 | Content-addressed cold-tier index lifecycle (P7-CAS / NOVEL #3) — WriteHot / MigrateToCold / ChunkedMigrateToColdK2 (P7-CAS-4b) / RehydrateOnWrite / DeleteFile / GC (P7-CAS-4 reorder: atomic remove-and-mark-freed) / BuggyGcOldOrderFreePaddrs + BuggyGcOldOrderTryRemove (P7-CAS-4) / AdvanceTxg + RefcountConsistent + NoDanglingColdRef + HotColdReplicasDisjoint + CASReplicasDisjoint + NoOverlapWithinIno + LengthPositive + BirthTxgBound + PaddrFreshness + CASIndexUnique + LiveCASEntriesNotFreed (P7-CAS-4: live cas entries' replicas don't overlap freed_paddrs, modulo the `gc_in_flight` in-flight-GC tolerance). P7-CAS-4b also closed a pre-existing clamp/invariant inconsistency in MigrateToCold's CAS-hit branch via new `EntryAt(h).refcount < MaxRef` precondition. | cas.cfg: 3.23M states, depth 10 / ~5:33 wall (MaxDatasets=2, MaxInos=2, MaxFileBlocks=2, MaxPaddrs=4, MaxHashes=2, MaxTxg=2, MaxReplicasPerEntry=1, MaxKeyIds=1, MaxRef=4). | `cas_migrate_forgets_refbump_buggy.cfg`, `cas_migrate_without_drop_buggy.cfg`, `cas_gc_race_buggy.cfg`, `cas_rehydrate_no_deref_buggy.cfg`, `cas_delete_forgets_deref_buggy.cfg`, `cas_migrate_reuses_hot_paddr_buggy.cfg`, `cas_gc_old_order_silent_skip_buggy.cfg` (P7-CAS-4) |
+| `namespace.tla` | 8 | Per-connection 9P namespaces (P8-NS-1 / NOVEL #8) — Attach / Detach / Bind / Unbind / ObserveLookup. Cross-connection mutation isolation: bindings table for connection c only mutates via c's OWN actions (BindingsMatchAuthored). Cross-connection observation isolation: every captured Lookup observation matches the connection's own bindings at observation time (LookupReflectsOwnBindings). Detach clears bindings (DetachClears). Bind cap bounded (BindCapBound). | namespace.cfg: 73984 distinct states / depth 17 (Connections={c1,c2}, Paths={p_root,p_home}, Sources=3, MaxBindsPerConn=2). | `namespace_global_bindings_buggy.cfg`, `namespace_detach_leaks_buggy.cfg`, `namespace_unbind_crosstalk_buggy.cfg`, `namespace_lookup_crosstalk_buggy.cfg` |
 
-All 25 fixed configs green (one per module + `scrub_beta` +
+All 26 fixed configs green (one per module + `scrub_beta` +
 `scrub_durable` + `scrub_beta_durable` extending `scrub.tla` +
-`extent_keyids.cfg` extending `extent.tla`). All 34 buggy configs
-reproduce their designed invariant violations (was 33; P7-CAS-4
-added `cas_gc_old_order_silent_skip_buggy.cfg` for the pre-P7-CAS-4
-two-step sweep that violates `LiveCASEntriesNotFreed` at depth 7).
+`extent_keyids.cfg` extending `extent.tla`; +1 with P8-NS-1's
+`namespace.cfg`). All 38 buggy configs reproduce their designed
+invariant violations (was 34; P8-NS-1 added four buggy configs
+covering the four canonical isolation-breach failure modes —
+shared global bindings, detach-leaks, unbind-crosstalk, and
+lookup-crosstalk).
 
 ## Per-module invariants
 
@@ -1118,6 +1121,87 @@ actions stand as the formal contract that the future
 `stm_sync_migrate_to_cold` / write-path-rehydrate must satisfy.
 Reference doc: future `reference/15-cas.md` (P7-CAS-2).
 
+### `namespace.tla` — per-connection 9P namespaces (P8-NS-1 entry)
+
+Spec-first scaffold for ROADMAP §11.2 exit criterion #5 (Phase 8:
+"`namespace.tla` proves cross-connection isolation"). Models the
+per-connection mount-table layer that ARCHITECTURE §8.8 commits
+to and NOVEL §3.8 names as the eighth novel angle.
+
+State variables:
+
+- `attached : Connections → BOOLEAN` — true when the connection
+  has executed `Attach` without a subsequent `Detach`.
+- `bindings : Connections → Paths → Sources ∪ {NONE}` — per-
+  connection mount table. Each cell is the source path bound at
+  the target path, or `NONE` for "no binding" (lookup falls
+  through to `DefaultSource`).
+- `global_bindings : Paths → Sources ∪ {NONE}` — used ONLY by
+  `BuggyGlobalBindings`. Healthy variants leave it unread.
+- `audit_lookup : Connections → Paths → NONE | <<observed,
+  expected>>` — at the moment of `ObserveLookup`, captures both
+  the value the spec's `Lookup` function returned (which honors
+  buggy reads) AND the value c's own bindings would yield. The
+  tuple is frozen against future Bind/Unbind so the comparison
+  becomes a stable per-record check.
+- `authored : Connections → Paths → Sources ∪ {NONE}` — shadow of
+  `bindings[c]` that ONLY mutates when c is the actor. Crosstalk
+  bugs (Unbind on c1 that incidentally clears `bindings[c2][p]`)
+  leave `authored[c2]` alone, so `bindings ≠ authored` surfaces
+  the silent-deletion that observation-time invariants miss.
+
+Actions:
+
+- `Attach(c)` — sets `attached[c] = TRUE`. Bindings unchanged
+  (the healthy contract relies on prior `Detach` having cleared).
+- `Detach(c)` — clears `bindings[c]` (healthy) or leaks them
+  (`BuggyDetachLeaks`). Always clears `authored[c]`.
+- `Bind(c, p, s)` — installs a binding. Buggy variants either
+  write to `global_bindings` (BuggyGlobalBindings) or to the
+  correct `bindings[c][p]` (healthy, BuggyDetachLeaks,
+  BuggyUnbindCrosstalk, BuggyLookupCrosstalk).
+- `Unbind(c, p)` — clears the binding at p. Buggy
+  `BuggyUnbindCrosstalk` also clears `bindings[other][p]`.
+- `ObserveLookup(c, p)` — pure read; captures observed + expected
+  into `audit_lookup[c][p]`. Models a 9P `Twalk` arrival.
+
+Headline invariants:
+
+- `LookupReflectsOwnBindings` — every captured `audit_lookup`
+  tuple has observed = expected. Catches `BuggyGlobalBindings`
+  + `BuggyLookupCrosstalk` (observed reads from the wrong table).
+- `BindingsMatchAuthored` — `bindings[c][p] = authored[c][p]`
+  always. Catches `BuggyUnbindCrosstalk` (silent deletion of
+  c's binding without c acting) + `BuggyGlobalBindings`
+  (`bindings[c][p]` stays NONE while `authored[c][p]` is set).
+- `DetachClears` — detached connections have all-NONE bindings.
+  Catches `BuggyDetachLeaks`.
+- `BindCapBound` — `MaxBindsPerConn` cap.
+- `TypeOK`.
+
+Buggy variants (all fire as designed at fixed-config bounds):
+
+- `BuggyGlobalBindings` (12 states / depth 4) — single global
+  table shared across connections; first Bind diverges
+  `bindings[c]` from `authored[c]`.
+- `BuggyDetachLeaks` (55 states / depth 6) — Detach leaks
+  bindings; `~attached[c] ∧ bindings[c][p] ≠ NONE` fires
+  `DetachClears`.
+- `BuggyUnbindCrosstalk` (411 states / depth 9) — Unbind on c1
+  clears `bindings[c2][p]`; `BindingsMatchAuthored` catches the
+  silent deletion that no observation surfaced.
+- `BuggyLookupCrosstalk` (244 states / depth 7) — Lookup reads
+  the wrong connection's bindings; `LookupReflectsOwnBindings`
+  fires at the first observation that returns the wrong value.
+
+Spec-to-code: implementation deferred to P8-9P-2 (per-connection
+namespace composition) — when the 9P server's `src/9p/` adds
+the per-connection mount-table machinery, every state-machine
+field in this spec maps to a concrete data structure in the
+server. The four buggy variants enumerate the implementation
+errors that the server's reviewer should explicitly rule out
+during code review.
+
 ## Running TLC
 
 ```bash
@@ -1131,7 +1215,8 @@ java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
 # Full sweep — fixed configs (one per module; scrub has 3 extra configs).
 for s in sync concurrency structural balanced merge allocator merkle \
          key_schema quorum metadata_nonce device_lifecycle evac scrub \
-         bptr dataset snapshot property clone dead_list extent cas; do
+         bptr dataset snapshot property clone dead_list extent cas \
+         namespace; do
   echo "== $s ==" && \
   java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
       -config $s.cfg $s.tla 2>&1 | tail -3
@@ -1172,6 +1257,12 @@ done
 java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
     -config clone_delete_snap_with_clones_buggy.cfg clone.tla 2>&1 | \
     grep -E "Invariant|Error:" | head -2
+for cfg in namespace_global_bindings_buggy namespace_detach_leaks_buggy \
+           namespace_unbind_crosstalk_buggy namespace_lookup_crosstalk_buggy; do
+  java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
+      -config ${cfg}.cfg namespace.tla 2>&1 | \
+      grep -E "Invariant|Error:" | head -2
+done
 ```
 
 CI runs TLC per spec on every PR touching `v2/specs/` or `v2/src/`.
