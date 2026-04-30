@@ -277,8 +277,12 @@ struct stm_sync {
      * sync_open with `stm_cdc_default_params` (8 MiB avg / 2 MiB min /
      * 32 MiB max, ARCH §6.9.4). Tests override via the
      * `<stratum/sync_testing.h>` test-only seam to use small params
-     * (e.g., 16 KiB avg) that exercise multi-chunk migrate on the MVP
-     * 128 KiB recordsize cap. CDC params are not persisted on disk
+     * (e.g., 16 KiB avg) that exercise multi-chunk migrate. At UB v22
+     * the 128 KiB recordsize cap forced default params to K=1 always
+     * because min=2 MiB > cap; at UB v23 (P7-CAS-16) the cap lifts to
+     * STM_FS_RECORDSIZE_MAX = 8 MiB, so default params can produce
+     * K ≥ 1 chunks at content-defined boundaries on a single
+     * recordsize-bound extent. CDC params are not persisted on disk
      * (stateless transformation: same plaintext + same params → same
      * boundaries). */
     stm_cdc            cdc;
@@ -4917,9 +4921,11 @@ stm_status stm_sync_read_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
  *     as case (a).
  *
  * The trade-off is lock-hold duration: the prefix's decrypt + encrypt
- * + bdev I/O all happen under s->lock. For an MVP at 128 KiB
- * recordsize this is acceptable; production extension would either
- * fine-grain the lock or run truncate against a snapshot. Cascade
+ * + bdev I/O all happen under s->lock. At UB v22 (128 KiB recordsize
+ * cap) this was bounded; at UB v23 (P7-CAS-16, 8 MiB cap) the lock
+ * window grows up to 64× per crossing extent. Production extension
+ * would either fine-grain the lock or run truncate against a
+ * snapshot. Cascade
  * note (R43 P3-3): scrub's verify cb takes s->lock briefly to look
  * up the per-extent DEK, so a concurrent truncate that holds s->lock
  * across bdev I/O extends scrub_step's sc.lock+pool.rdlock hold by
@@ -5800,10 +5806,13 @@ static stm_status cas_chunk_intern_locked(
  *   5. Drop-route the dropped HOT replicas through
  *      sync_drop_paddr_locked.
  *
- * Default ARCH §6.9.4 CDC params (8 MiB avg / 2 MiB min) yield K=1 for
- * the MVP recordsize cap (128 KiB) — preserving P7-CAS-2 behavior on
- * default params. Tests override CDC params via
- * `<stratum/sync_testing.h>` to exercise multi-chunk migration.
+ * Default ARCH §6.9.4 CDC params (8 MiB avg / 2 MiB min) at UB v22's
+ * 128 KiB recordsize cap yielded K=1 always — preserving P7-CAS-2
+ * behavior on default params. At UB v23 (P7-CAS-16, 8 MiB cap) the
+ * default params can now produce K ≥ 1 chunks at content-defined
+ * boundaries on a single recordsize-bound extent. Tests override CDC
+ * params via `<stratum/sync_testing.h>` to exercise multi-chunk
+ * migration on smaller plaintexts.
  *
  * Returns STM_OK on success (E is now N COLD records; CAS entries hold
  * each chunk). Returns the underlying status on failure with the live
@@ -5843,8 +5852,9 @@ static stm_status migrate_one_extent_locked(stm_sync *s,
      *
      * Cap = E->len / 256 + 8 — generous upper bound. `stm_cdc_make_params`
      * enforces avg >= 1024 B → min = avg/4 >= 256 B is the smallest
-     * permitted FastCDC min_size. For E->len = 128 KiB that's 520
-     * entries, ~4 KiB heap — negligible. */
+     * permitted FastCDC min_size. At UB v23's STM_FS_RECORDSIZE_MAX =
+     * 8 MiB the cap is `8388608/256 + 8 = 32776` entries (~256 KiB
+     * heap — still negligible); at v22's 128 KiB it was 520 entries. */
     size_t cap = (E->len / 256u) + 8u;
     size_t *boundaries = malloc(cap * sizeof(size_t));
     if (!boundaries) {

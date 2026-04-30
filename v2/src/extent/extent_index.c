@@ -1065,8 +1065,9 @@ stm_status stm_extent_migrate_to_cold_chunked(
      *
      * R53 P3-8: refuse if `n_chunks - 1` would overflow when added to
      * idx->n_records. n_chunks is bounded by recordsize/STM_UB_SIZE
-     * (= 32 for the 128 KiB cap) in practice; idx->n_records is bounded
-     * by RAM. Defense is belt-and-suspenders against a future relaxation. */
+     * (= 32 at the v22 128 KiB cap; = 2048 at the v23 8 MiB cap) in
+     * practice; idx->n_records is bounded by RAM. Defense is belt-
+     * and-suspenders against a future relaxation. */
     if (n_chunks - 1u > SIZE_MAX - idx->n_records) {
         must_unlock(&idx->lock);
         return STM_EOVERFLOW;

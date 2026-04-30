@@ -366,7 +366,10 @@ stm_status stm_recv_apply(stm_recv_handle *h,
     if (!h || !record_bytes || record_len == 0) return STM_EINVAL;
     /* R39 P2-3: cap the maximum record size up front. Any legitimate
      * record is ≤ STM_SEND_RECORD_MAX_LEN (16-byte framing + 32-byte
-     * extent meta + 128 KiB plaintext). A larger record indicates
+     * extent meta + STM_SEND_CHUNK_PLAIN_MAX plaintext; at v3 / UB v23
+     * the plaintext cap is 8 MiB so the total max is 8388656 bytes —
+     * see send_recv.h's STM_SEND_RECORD_MAX_LEN definition for the
+     * lockstep with STM_FS_RECORDSIZE_MAX). A larger record indicates
      * either caller framing error or a hostile stream; refuse before
      * any per-type dispatch so callers can't be DOS'd into buffering
      * arbitrarily large blobs. */
