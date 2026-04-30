@@ -57,8 +57,8 @@ into the CAS tier (which DOES need P6) is a separate concern.
 ## Phase 7 status (overall)
 
 - [x] **P7-CAS-16 recordsize cap lift 128 KiB → 8 MiB** —
-      substantive (this commit) + R67 close (TBD) + hash-fixup
-      (TBD). Format break **STM_UB_VERSION 22 → 23 +
+      substantive `85b87d6` + R67 close `55c4280` + hash-fixup
+      (this commit). Format break **STM_UB_VERSION 22 → 23 +
       STM_SEND_VERSION 2 → 3** in lockstep. Lifts
       `STM_FS_RECORDSIZE_MAX` (the runtime invariant on extent
       record `len`, enforced at write entry + every decode +

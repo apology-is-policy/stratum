@@ -38,8 +38,8 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P7-CAS-16 substantive (this commit). R67 audit close +
-  hash-fixup TBD.
+- **Tip**: post-R67-hash-fixup. Substantive `85b87d6` +
+  R67 close `55c4280`.
   **P7-CAS-16 — recordsize cap lift 128 KiB → 8 MiB. Format break
   STM_UB_VERSION 22 → 23 + STM_SEND_VERSION 2 → 3 in lockstep.
   `STM_FS_RECORDSIZE_MAX` (the runtime invariant on extent record
