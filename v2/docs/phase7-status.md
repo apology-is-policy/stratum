@@ -57,8 +57,8 @@ into the CAS tier (which DOES need P6) is a separate concern.
 ## Phase 7 status (overall)
 
 - [x] **P7-CAS-17 cross-extent FastCDC at migrate** —
-      substantive (this commit) + R68 close (TBD) + hash-fixup
-      (TBD). Closes the per-extent isolation gap from P7-CAS-4b
+      substantive `2ceafb9` + R68 close `3deb833` + hash-fixup
+      (this commit). Closes the per-extent isolation gap from P7-CAS-4b
       that prevented cross-file dedup with content-shift.
       `stm_sync_migrate_to_cold` now reads+concats ALL HOT
       extents at (ds, ino) into a single buffer, runs FastCDC

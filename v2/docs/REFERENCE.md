@@ -38,8 +38,8 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P7-CAS-17 substantive (this commit). R68 audit close +
-  hash-fixup TBD.
+- **Tip**: post-R68-hash-fixup. Substantive `2ceafb9` +
+  R68 close `3deb833`.
   **P7-CAS-17 — cross-extent FastCDC at migrate. Closes the
   per-extent isolation gap from P7-CAS-4b that prevented cross-file
   dedup on content-shifted overlapping files. `stm_sync_migrate_to_cold`
