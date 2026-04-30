@@ -1240,51 +1240,86 @@ stm_status stm_extent_migrate_whole_ino_to_cold(
         return STM_ENOENT;
     }
 
-    /* Phase 2: sort hot_idxs ascending by record off (insertion sort —
-     * fine for the small N typical for one ino's HOT extents). */
+    /* Phase 2: build an off-sorted VIEW for contiguity validation in
+     * Phase 3 + 4. We must NOT reorder hot_idxs itself: Phase 7's
+     * swap-erase requires hot_idxs to be in INDEX-ascending order so
+     * descending iteration processes highest indices first (the
+     * scan-order from Phase 1 is already index-ascending). Reordering
+     * hot_idxs by off would let off-sorted-but-index-mixed entries
+     * trick the swap-erase into clobbering non-target records and
+     * leaving target HOTs surviving.
+     *
+     * R68 P0 fix: an earlier impl sorted hot_idxs by off here, which
+     * caused the swap-erase to leave stale HOT records when off-order
+     * and index-order didn't match (e.g., descending-off writes
+     * interleaved with writes to other inos). Caller would deref the
+     * collected paddrs while the surviving stale HOTs still claimed
+     * them — refcount-violating dual ownership + NoOverlapWithinIno
+     * violated by the appended COLD chunks overlapping the survivors.
+     * Build a separate (off, len) pair array for contiguity validation
+     * and leave hot_idxs alone. */
+    struct off_len_pair {
+        uint64_t off;
+        uint64_t len;
+    };
+    struct off_len_pair *off_view = malloc(n_hot * sizeof *off_view);
+    if (!off_view) {
+        free(hot_idxs);
+        must_unlock(&idx->lock);
+        return STM_ENOMEM;
+    }
+    for (size_t i = 0; i < n_hot; i++) {
+        off_view[i].off = idx->records[hot_idxs[i]].off;
+        off_view[i].len = idx->records[hot_idxs[i]].len;
+    }
+    /* Insertion-sort off_view by off (small N). */
     for (size_t i = 1; i < n_hot; i++) {
-        size_t   key     = hot_idxs[i];
-        uint64_t key_off = idx->records[key].off;
-        size_t   j       = i;
-        while (j > 0 && idx->records[hot_idxs[j - 1]].off > key_off) {
-            hot_idxs[j] = hot_idxs[j - 1];
+        struct off_len_pair key = off_view[i];
+        size_t j = i;
+        while (j > 0 && off_view[j - 1].off > key.off) {
+            off_view[j] = off_view[j - 1];
             j--;
         }
-        hot_idxs[j] = key;
+        off_view[j] = key;
     }
 
-    /* Phase 3: validate contiguity. Compute total range covered. */
-    uint64_t first_off  = idx->records[hot_idxs[0]].off;
+    /* Phase 3: validate contiguity using the off-sorted view. */
+    uint64_t first_off  = off_view[0].off;
     uint64_t cumulative = first_off;
     for (size_t i = 0; i < n_hot; i++) {
-        const stm_extent_record *r = &idx->records[hot_idxs[i]];
-        if (r->off != cumulative) {
+        if (off_view[i].off != cumulative) {
             /* Gap (sparse file) — refuse. Caller falls back to per-extent. */
             free(hot_idxs);
+            free(off_view);
             must_unlock(&idx->lock);
             return STM_ENOTSUPPORTED;
         }
-        if (cumulative > UINT64_MAX - r->len) {
+        if (cumulative > UINT64_MAX - off_view[i].len) {
             free(hot_idxs);
+            free(off_view);
             must_unlock(&idx->lock);
             return STM_EOVERFLOW;
         }
-        cumulative += r->len;
+        cumulative += off_view[i].len;
     }
     uint64_t total_len = cumulative - first_off;
 
     /* Phase 4: validate chunks tile [first_off, first_off + total_len). */
     if (chunks[0].off != first_off) {
         free(hot_idxs);
+        free(off_view);
         must_unlock(&idx->lock);
         return STM_EINVAL;
     }
     uint64_t chunks_end = chunks[n_chunks - 1].off + chunks[n_chunks - 1].len;
     if (chunks_end != first_off + total_len) {
         free(hot_idxs);
+        free(off_view);
         must_unlock(&idx->lock);
         return STM_EINVAL;
     }
+    free(off_view);
+    off_view = NULL;
 
     /* Phase 5: capture all dropped HOT replica paddrs into a heap-allocated
      * output array. Total = sum of n_replicas across the N source extents. */
@@ -1336,15 +1371,27 @@ stm_status stm_extent_migrate_whole_ino_to_cold(
         }
     }
 
-    /* Phase 7: atomic mutation. Remove HOT extents via swap-erase (descending
-     * order so erasures don't shift hot_idxs). Append COLD chunks.
+    /* Phase 7: atomic mutation. Remove HOT extents via swap-erase.
+     * Then append COLD chunks.
      *
-     * Swap-erase correctness: when erasing hot_idxs[k] in descending order,
-     * the slot at position records[n_records - 1] is guaranteed NOT to be
-     * any hot_idxs[j < k] (because hot_idxs are pairwise distinct by
-     * single-pass scan construction); it's a non-target record (or, if
-     * hot_idxs[k] == n_records - 1, the slot is itself, handled by the
-     * self-copy guard). */
+     * Swap-erase correctness PRECONDITION (R68 P0 fix):
+     *   hot_idxs MUST be in INDEX-ascending order. Iterating descending
+     *   k=n_hot..1 then processes the HIGHEST index first. At each step
+     *   the slot at records[n_records - 1] is guaranteed NOT to be any
+     *   hot_idxs[j < k] because (a) hot_idxs are pairwise distinct by
+     *   single-pass scan construction and (b) hot_idxs being index-
+     *   ascending means all j < k entries point at indices STRICTLY
+     *   LESS than hot_idxs[k - 1], which is itself ≤ n_records - 1. So
+     *   the swap source (n_records - 1) is either hot_idxs[k - 1]
+     *   itself (handled by the self-copy guard) or a NON-target record
+     *   that gets safely moved into the erased slot.
+     *
+     * Phase 1's scan walks records[0..n_records) in index order and
+     * appends matching indices to hot_idxs in scan order, so hot_idxs
+     * is index-ascending by construction. We deliberately do NOT
+     * off-sort hot_idxs (Phase 2's off_view is a separate copy used
+     * only for contiguity validation in Phases 3-4 and freed before
+     * mutation). */
     for (size_t k = n_hot; k > 0; k--) {
         size_t hi = hot_idxs[k - 1];
         if (hi != idx->n_records - 1) {

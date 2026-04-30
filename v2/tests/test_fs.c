@@ -7011,6 +7011,98 @@ STM_TEST(fs_p7cas17_oversized_file_falls_back_to_per_extent) {
     unlink(g_key_path);
 }
 
+STM_TEST(fs_p7cas17_r68_p0_non_monotone_write_order_no_corruption) {
+    /* R68 P0 regression: cross-extent migrate's swap-erase loop must
+     * iterate hot_idxs in INDEX-ascending order regardless of the
+     * extents' OFF order in the index. The pre-fix impl off-sorted
+     * hot_idxs which broke the swap-erase invariant when writes hit
+     * the index in non-monotone-off order — the swap-erase would
+     * leave target HOT records surviving and clobber neighboring
+     * non-target records.
+     *
+     * Repro: arrange `idx->records[]` so target ino=1's two HOT
+     * extents straddle a non-target ino=2 extent, with descending
+     * off-order to force off-order ≠ index-order:
+     *   records[0] = H(ino=1, off=4096)   ← TARGET, written first
+     *   records[1] = H(ino=2, off=0)      ← non-target
+     *   records[2] = H(ino=1, off=0)      ← TARGET, written last
+     * Pre-fix: off-sort hot_idxs to [2, 0]; swap-erase clobbers and
+     * leaves H(ino=1, off=0) surviving + loses H(ino=2, off=0).
+     * Post-fix: hot_idxs stays [0, 2]; swap-erase removes both
+     * targets and preserves the non-target. */
+    make_tmp("p7cas17_r68_p0_nonmonotone");
+    stm_fs_format_opts fopts = p7cas16_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    STM_ASSERT_OK(p7cas17_install_small_cdc(fs));
+
+    /* Three writes interleaved across two inos in descending-off
+     * order for ino=1, sandwiching a write to ino=2 mid-way.
+     * Result: records[0..2] = [H(ino=1,4K), H(ino=2,0), H(ino=1,0)]. */
+    uint8_t a_hi[4096];
+    uint8_t b[4096];
+    uint8_t a_lo[4096];
+    p7cas16_fill_pseudorandom(a_hi, sizeof a_hi, 0x1111ULL);
+    p7cas16_fill_pseudorandom(b,    sizeof b,    0x2222ULL);
+    p7cas16_fill_pseudorandom(a_lo, sizeof a_lo, 0x3333ULL);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, /*ino=*/1, /*off=*/4096,
+                                  a_hi, sizeof a_hi));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, /*ino=*/2, /*off=*/0,
+                                  b,    sizeof b));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, /*ino=*/1, /*off=*/0,
+                                  a_lo, sizeof a_lo));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    /* Migrate ino=1. With the P0 bug, target HOT records survive in
+     * idx->records[] and the non-target ino=2 record is lost. With
+     * the fix, ino=1 becomes all-COLD and ino=2's HOT survives. */
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, /*ds=*/1, /*ino=*/1));
+
+    stm_sync *s = stm_fs_sync_for_test(fs);
+    stm_extent_index *eidx = stm_sync_extent_index(s);
+
+    /* Assertion 1: ino=1 is all-COLD post-migrate. Pre-fix, this would
+     * see hot_count >= 1 (the surviving stale HOT). */
+    mtc4b_extent_count_t cnt1 = { .ds = 1, .ino = 1 };
+    STM_ASSERT_OK(stm_extent_iter_ds(eidx, 1, mtc4b_count_cb, &cnt1));
+    STM_ASSERT_EQ(cnt1.hot_count, 0u);
+    STM_ASSERT(cnt1.cold_count >= 1u);
+
+    /* Assertion 2: ino=2's HOT extent is still in the live index.
+     * Pre-fix, the swap-erase would have moved this record into a
+     * "dead" slot (n_records decremented past it), losing it from
+     * the iter walk. */
+    mtc4b_extent_count_t cnt2 = { .ds = 1, .ino = 2 };
+    STM_ASSERT_OK(stm_extent_iter_ds(eidx, 1, mtc4b_count_cb, &cnt2));
+    STM_ASSERT_EQ(cnt2.hot_count, 1u);
+    STM_ASSERT_EQ(cnt2.cold_count, 0u);
+
+    /* Assertion 3: read-back ino=2's content unchanged. */
+    uint8_t out_b[4096] = {0};
+    size_t got_b = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 2, 0, out_b, sizeof out_b, &got_b));
+    STM_ASSERT_EQ(got_b, sizeof out_b);
+    STM_ASSERT_MEM_EQ(b, out_b, sizeof b);
+
+    /* Assertion 4: read-back ino=1's content via the cold tier. The
+     * concat plaintext was [a_lo || a_hi] (sorted by off in the
+     * concat buffer); migrate-time FastCDC re-chunks it. Use the
+     * existing P7-CAS-4b multi-extent helper that walks per-extent
+     * (the chunk count is FastCDC-determined and not known a priori,
+     * so a single stm_fs_read may refuse with STM_EINVAL if it
+     * doesn't span exactly one extent). */
+    uint8_t out_full[8192] = {0};
+    STM_ASSERT_OK(mtc4b_read_full(fs, 1, 1, 0, out_full, sizeof out_full));
+    STM_ASSERT_MEM_EQ(a_lo, out_full,        sizeof a_lo);
+    STM_ASSERT_MEM_EQ(a_hi, out_full + 4096, sizeof a_hi);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST(fs_p7cas17_partial_migrated_file_falls_back_to_per_extent) {
     /* Mixed HOT+COLD file → cross-extent dispatcher refuses (extent-
      * index returns STM_ENOTSUPPORTED for any-COLD) and falls back to

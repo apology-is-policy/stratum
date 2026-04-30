@@ -6088,10 +6088,20 @@ static stm_status migrate_whole_ino_locked(stm_sync *s,
                                               size_t n_records,
                                               uint64_t total_len)
 {
-    /* Step 0: cross-check that all source records share key_id. */
+    /* Step 0: cross-check that all source records share key_id.
+     *
+     * R68 P2 fix: when keys diverge — the legitimate post-rotation case
+     * where pre-rotation HOT extents stamped the OLD key_id and post-
+     * rotation HOT extents stamped the NEW one — return STM_ENOTSUPPORTED
+     * (a "fall back to per-extent" signal the dispatcher catches),
+     * NOT STM_ECORRUPT. STM_ECORRUPT is reserved for actual corruption;
+     * mixed keys are a non-pathological state that per-extent migrate
+     * handles natively (each per-extent call inherits the source's
+     * key_id). Misclassifying as ECORRUPT could let an aggressive
+     * caller wedge the volume on a benign post-rotation pattern. */
     uint64_t canonical_key_id = records[0].key_id;
     for (size_t i = 1; i < n_records; i++) {
-        if (records[i].key_id != canonical_key_id) return STM_ECORRUPT;
+        if (records[i].key_id != canonical_key_id) return STM_ENOTSUPPORTED;
     }
 
     /* Step 1: allocate concat buffer. */
@@ -6337,11 +6347,24 @@ stm_status stm_sync_migrate_to_cold(stm_sync *s,
             stm_status whole_rc = migrate_whole_ino_locked(s, dataset_id, ino,
                                                               cx.records, cx.n,
                                                               cx.hot_total_len);
-            free(cx.records);
-            pthread_mutex_unlock(&s->lock);
-            return whole_rc;
+            if (whole_rc != STM_ENOTSUPPORTED) {
+                /* Cross-extent path either succeeded or hit a real error
+                 * (STM_ENOMEM / STM_EIO / STM_EBADTAG / STM_ECORRUPT /
+                 * STM_EOVERFLOW). Either way, propagate up — the per-
+                 * extent fallback would not improve a real error. */
+                free(cx.records);
+                pthread_mutex_unlock(&s->lock);
+                return whole_rc;
+            }
+            /* R68 P2: STM_ENOTSUPPORTED from migrate_whole_ino_locked
+             * is the "fall back to per-extent" signal — emitted by
+             * mixed-key_id (post-rotation) and by the extent-index
+             * primitive on mixed-cold or sparse-tiling races (race
+             * with concurrent migrate; would be a defensive surface).
+             * Per-extent migrate handles all of those cases natively;
+             * fall through. */
         }
-        /* Sparse — fall through to per-extent. */
+        /* Sparse / fell-back — fall through to per-extent. */
     }
 
     /* Phase 2 fallback: per-extent migration. Each call commits
