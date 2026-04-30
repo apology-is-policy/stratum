@@ -38,8 +38,8 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R64-hash-fixup. Substantive `<P7CAS13_SUBSTANTIVE>` +
-  R64 close `<P7CAS13_RCLOSE>`.
+- **Tip**: post-R64-hash-fixup. Substantive `2de9a49` +
+  R64 close `e3655ac`.
   **P7-CAS-13 — fs-level dataset property wrappers. Closes R63
   P3-4 forward-noted ergonomic gap by adding production-shape
   public APIs `stm_fs_set_dataset_property`,
