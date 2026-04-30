@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Stratum v2 ships 22 TLA+ spec modules covering every load-bearing
+Stratum v2 ships 23 TLA+ spec modules covering every load-bearing
 invariant in the implementation. The specs are the **source of
 truth** for protocol-level behavior; code is an implementation of
 the spec (CLAUDE.md: "spec-first policy"). When the two disagree,
@@ -41,16 +41,17 @@ chapter as specs get wider cross-reference tables).
 | `dead_list.tla` | 6 + P7-CAS-4c | Block-level reachability + per-snapshot dead-list incremental maintenance during COW + ZFS-style SnapDelete (free-unique + merge-surviving-into-pred). P7-CAS-4c extends with parallel cold-tier model: `WriteCold(c, h)` + `OverwriteCold(c)` actions + `snap_cold_dead`, `cold_dereffed`, `used_cold_extents` variables; SnapDelete drains snap_cold_dead → cold_dereffed; new invariants `ColdExtentsTrackedSomewhere`, `LiveColdDisjointFromDead`, `LiveColdDisjointFromDereffed`, `DereffedColdDisjointFromDead`, `ColdSingleOwnership`. | 4.11M states, depth 21 (MaxBlocks=4, MaxSnaps=3, MaxColdExtents=3, MaxHashIds=2) — was 5656 / 15 pre-P7-CAS-4c | `dead_list_overwrite_forgets_buggy.cfg`, `dead_list_delete_forgets_free_buggy.cfg`, `dead_list_merge_includes_freed_buggy.cfg`, `dead_list_overwrite_cold_forgets_buggy.cfg`, `dead_list_delete_cold_forgets_deref_buggy.cfg` |
 | `extent.tla` | 7 | Per-(dataset, ino) extent layout — Write / Overwrite / Truncate / DeleteFile / AdvanceTxg + Reflink (P7-16) + no-overlap-within-ino + length-positive + birth-txg-bound + paddr-freshness + replica sets per extent (P7-6) + Truncate partial-shrink under fresh replicas (P7-9) + key_id stamp on every extent (P7-10) + origin triple per extent + SharedReplicasAreCohabit + OriginConsistentInBounds (P7-16). | extent.cfg: 838164 states, depth 7 (MaxDatasets=1, MaxInos=2, MaxFileBlocks=3, MaxPaddrs=5, MaxTxg=1, MaxReplicasPerExtent=2, MaxKeyIds=1, DisableReflink=TRUE; preserves P7-9 partial-shrink coverage). extent_keyids.cfg: ~8.7M states, depth 18 (MaxDatasets=2, MaxFileBlocks=2, MaxPaddrs=4, MaxKeyIds=2, DisableReflink=FALSE; P7-10 spanning-rotation × P7-16 reflink coverage including link_gen). | `extent_overlap_buggy.cfg`, `extent_zero_length_buggy.cfg`, `extent_overwrite_forgets_drop_buggy.cfg`, `extent_replica_collision_buggy.cfg`, `reflink_rotates_origin_buggy.cfg` (P7-16) |
 | `cas.tla` | 10 | Content-addressed cold-tier index lifecycle (P7-CAS / NOVEL #3) — WriteHot / MigrateToCold / ChunkedMigrateToColdK2 (P7-CAS-4b) / RehydrateOnWrite / DeleteFile / GC (P7-CAS-4 reorder: atomic remove-and-mark-freed) / BuggyGcOldOrderFreePaddrs + BuggyGcOldOrderTryRemove (P7-CAS-4) / AdvanceTxg + RefcountConsistent + NoDanglingColdRef + HotColdReplicasDisjoint + CASReplicasDisjoint + NoOverlapWithinIno + LengthPositive + BirthTxgBound + PaddrFreshness + CASIndexUnique + LiveCASEntriesNotFreed (P7-CAS-4: live cas entries' replicas don't overlap freed_paddrs, modulo the `gc_in_flight` in-flight-GC tolerance). P7-CAS-4b also closed a pre-existing clamp/invariant inconsistency in MigrateToCold's CAS-hit branch via new `EntryAt(h).refcount < MaxRef` precondition. | cas.cfg: 3.23M states, depth 10 / ~5:33 wall (MaxDatasets=2, MaxInos=2, MaxFileBlocks=2, MaxPaddrs=4, MaxHashes=2, MaxTxg=2, MaxReplicasPerEntry=1, MaxKeyIds=1, MaxRef=4). | `cas_migrate_forgets_refbump_buggy.cfg`, `cas_migrate_without_drop_buggy.cfg`, `cas_gc_race_buggy.cfg`, `cas_rehydrate_no_deref_buggy.cfg`, `cas_delete_forgets_deref_buggy.cfg`, `cas_migrate_reuses_hot_paddr_buggy.cfg`, `cas_gc_old_order_silent_skip_buggy.cfg` (P7-CAS-4) |
-| `namespace.tla` | 8 | Per-connection 9P namespaces (P8-NS-1 / NOVEL #8) — Attach / Detach / Bind / Unbind / ObserveLookup. Cross-connection mutation isolation: bindings table for connection c only mutates via c's OWN actions (BindingsMatchAuthored). Cross-connection observation isolation: every captured Lookup observation matches the connection's own bindings at observation time (LookupReflectsOwnBindings). Detach clears bindings (DetachClears). Bind cap bounded (BindCapBound). | namespace.cfg: 73984 distinct states / depth 17 (Connections={c1,c2}, Paths={p_root,p_home}, Sources=3, MaxBindsPerConn=2). | `namespace_global_bindings_buggy.cfg`, `namespace_detach_leaks_buggy.cfg`, `namespace_unbind_crosstalk_buggy.cfg`, `namespace_lookup_crosstalk_buggy.cfg` |
+| `namespace.tla` | 9 | Per-connection 9P namespaces (P8-NS-1 / NOVEL #8) — Attach / Detach / Bind / Unbind / ObserveLookup. Cross-connection mutation isolation: bindings table for connection c only mutates via c's OWN actions (BindingsMatchAuthored). Cross-connection observation isolation: every captured Lookup observation matches the connection's own bindings at observation time (LookupReflectsOwnBindings). Detach clears bindings (DetachClears). Bind cap bounded (BindCapBound). (Spec landed early during the Phase 8 renumbering — chunk-tag prefix sticks for git-history continuity.) | namespace.cfg: 73984 distinct states / depth 17 (Connections={c1,c2}, Paths={p_root,p_home}, Sources=3, MaxBindsPerConn=2). | `namespace_global_bindings_buggy.cfg`, `namespace_detach_leaks_buggy.cfg`, `namespace_unbind_crosstalk_buggy.cfg`, `namespace_lookup_crosstalk_buggy.cfg` |
+| `inode.tla` | 8 | Inode allocator state machine (P8-POSIX-1 / ARCH §11.3.2) — AllocFresh / AllocReused / Free across an Inos space with per-ino state ∈ {NEVER_USED, ALLOCATED, FREED} + monotonic generation counter. Headline invariant TupleUniqueAllTime: every (ino, gen) tuple appearing in the audit history is unique across the full execution — the foundation for stale-fid detection in 9P (ARCH §11.3.2), per-file derived keys (§7.3.3), and NFS file handles. GenMonotonicAcrossAllocations: gen never decreases across reuse cycles. AllocatedReflectedInHistory: state ALLOCATED implies a matching history entry. | inode.cfg: 879025 distinct states / depth 25 (Inos={i1,i2,i3}, MaxGen=3). | `inode_reuse_no_gen_bump_buggy.cfg`, `inode_double_allocate_buggy.cfg` |
 
-All 26 fixed configs green (one per module + `scrub_beta` +
+All 27 fixed configs green (one per module + `scrub_beta` +
 `scrub_durable` + `scrub_beta_durable` extending `scrub.tla` +
 `extent_keyids.cfg` extending `extent.tla`; +1 with P8-NS-1's
-`namespace.cfg`). All 38 buggy configs reproduce their designed
-invariant violations (was 34; P8-NS-1 added four buggy configs
-covering the four canonical isolation-breach failure modes —
-shared global bindings, detach-leaks, unbind-crosstalk, and
-lookup-crosstalk).
+`namespace.cfg`; +1 with P8-POSIX-1's `inode.cfg`). All 40 buggy
+configs reproduce their designed invariant violations (was 38;
+P8-POSIX-1 added two buggy configs covering the canonical
+ino-allocator failure modes — reuse-without-gen-bump and
+double-allocate).
 
 ## Per-module invariants
 
@@ -1121,6 +1122,71 @@ actions stand as the formal contract that the future
 `stm_sync_migrate_to_cold` / write-path-rehydrate must satisfy.
 Reference doc: future `reference/15-cas.md` (P7-CAS-2).
 
+### `inode.tla` — inode allocator (P8-POSIX-1 entry)
+
+Spec-first scaffold for ROADMAP §11.1 (Phase 8 deliverable: inode
+layer) — the allocator state machine that makes (ino, gen) a
+stable identity-across-time tuple per ARCHITECTURE §11.3.2.
+
+State variables:
+
+- `state : Inos → {NEVER_USED, ALLOCATED, FREED}` — per-ino
+  lifecycle state.
+- `gen : Inos → 0..MaxGen` — generation counter. Starts at 0 for
+  NEVER_USED. AllocFresh sets gen=0. AllocReused (healthy) bumps
+  gen by 1.
+- `history : Inos → Set of <<gen, event_id>>` — audit trail of
+  every allocation event. The TupleUniqueAllTime invariant
+  examines history to assert no (ino, gen) tuple ever appears
+  twice across the full execution.
+- `alloc_event_counter : Nat` — monotonic event id counter.
+
+Actions:
+
+- `AllocFresh(i)` — pick a NEVER_USED ino (or, under
+  BuggyDoubleAllocate, also accept ALLOCATED), set ALLOCATED,
+  gen=0, append to history.
+- `AllocReused(i)` — pick a FREED ino, bump gen (healthy) or
+  keep prior gen (BuggyReuseNoGenBump), set ALLOCATED, append
+  to history.
+- `Free(i)` — ALLOCATED → FREED. gen and history unchanged.
+
+Headline invariants:
+
+- `TupleUniqueAllTime` — for every ino, every (gen, event_id)
+  tuple in history has a unique gen. The single most consequential
+  invariant: a buggy implementation that reuses without bumping
+  gen exposes the entire system to confused-deputy attacks (a 9P
+  client holding a fid for ino X gen 5 silently rerouted to a
+  freshly-created file at ino X gen 5 with potentially different
+  access rights).
+- `GenMonotonicAcrossAllocations` — gen never decreases across
+  reuse cycles for a given ino.
+- `AllocatedReflectedInHistory` — state ALLOCATED implies a
+  matching history entry; catches a bug where state mutates
+  without an audit record (BuggyDoubleAllocate's silent
+  re-issue path).
+- `NoTwoAllocatedSameIno` — trivial sanity check.
+- `TypeOK`.
+
+Buggy variants (both fire as designed):
+
+- `BuggyReuseNoGenBump` (19 states / depth 7) — AllocReused does
+  not bump gen. The canonical confused-deputy failure mode.
+  Fires `TupleUniqueAllTime`.
+- `BuggyDoubleAllocate` (7 states / depth 3) — AllocFresh accepts
+  already-ALLOCATED inos. Silent double-issue. Fires
+  `TupleUniqueAllTime`.
+
+Spec-to-code: implementation lands at P8-POSIX-1 substantive
+(deferred from this spec-only commit). The C-impl `src/inode/`
+module will provide `stm_inode_alloc` / `stm_inode_free` /
+`stm_inode_lookup` over a per-dataset inode tree. The two buggy
+configs serve as the adversarial-review checklist for the
+allocator's reuse path. Out-of-scope for this spec: nlink
+semantics (P8-POSIX-3), tagged data union state (P8-POSIX-5),
+on-disk persistence (composes via existing btree write paths).
+
 ### `namespace.tla` — per-connection 9P namespaces (P8-NS-1 entry)
 
 Spec-first scaffold for ROADMAP §11.2 exit criterion #5 (Phase 8:
@@ -1216,7 +1282,7 @@ java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
 for s in sync concurrency structural balanced merge allocator merkle \
          key_schema quorum metadata_nonce device_lifecycle evac scrub \
          bptr dataset snapshot property clone dead_list extent cas \
-         namespace; do
+         namespace inode; do
   echo "== $s ==" && \
   java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
       -config $s.cfg $s.tla 2>&1 | tail -3
@@ -1261,6 +1327,11 @@ for cfg in namespace_global_bindings_buggy namespace_detach_leaks_buggy \
            namespace_unbind_crosstalk_buggy namespace_lookup_crosstalk_buggy; do
   java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
       -config ${cfg}.cfg namespace.tla 2>&1 | \
+      grep -E "Invariant|Error:" | head -2
+done
+for cfg in inode_reuse_no_gen_bump_buggy inode_double_allocate_buggy; do
+  java -cp /tmp/tla2tools.jar tlc2.TLC -workers auto -deadlock \
+      -config ${cfg}.cfg inode.tla 2>&1 | \
       grep -E "Invariant|Error:" | head -2
 done
 ```
