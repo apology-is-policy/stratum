@@ -38,8 +38,8 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R65-hash-fixup. Substantive `<P7CAS14_SUBSTANTIVE>` +
-  R65 close `<P7CAS14_RCLOSE>`.
+- **Tip**: post-R65-hash-fixup. Substantive `5ed1390` +
+  R65 close `f81dbb1`.
   **P7-CAS-14 — per-COLD-read property cache. Closes R63 P3-2
   forward-noted micro-opt by adding a per-sync cache of the
   effective `STM_PROP_PROMOTE_DECAY_WINDOW` keyed by dataset_id.

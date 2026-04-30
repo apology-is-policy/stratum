@@ -57,8 +57,8 @@ into the CAS tier (which DOES need P6) is a separate concern.
 ## Phase 7 status (overall)
 
 - [x] **P7-CAS-14 per-COLD-read property cache** —
-      substantive `<P7CAS14_SUBSTANTIVE>` + R65 close
-      `<P7CAS14_RCLOSE>` + hash-fixup (this commit). Closes R63
+      substantive `5ed1390` + R65 close
+      `f81dbb1` + hash-fixup (this commit). Closes R63
       P3-2 forward-noted micro-opt. Adds an
       `_Atomic uint64_t prop_mutation_gen` to `stm_dataset_index`
       (bumped on every successful `set_property` /
