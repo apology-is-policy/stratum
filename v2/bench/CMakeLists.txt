@@ -46,3 +46,16 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(bench_reflink_complexity PRIVATE
         "$<LINK_GROUP:RESCAN,stm_sync,stm_scrub>")
 endif()
+
+# P7-VAL-4: migration-policy heuristic validation for ROADMAP §10.2
+# exit criterion 2 ("Migration policy heuristic produces reasonable
+# hot/cold placement on synthetic workloads"). Synthetic workload of
+# hot vs cold inos; runs migrate_policy_pass_all + promote_policy_pass_all
+# and reports placement quality. Same Linux ld cycle gating.
+add_executable(bench_migrate_policy bench_migrate_policy.c)
+target_link_libraries(bench_migrate_policy
+    PRIVATE stratum stm_warnings stm_sanitize)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_libraries(bench_migrate_policy PRIVATE
+        "$<LINK_GROUP:RESCAN,stm_sync,stm_scrub>")
+endif()

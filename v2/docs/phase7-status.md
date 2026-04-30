@@ -56,6 +56,27 @@ into the CAS tier (which DOES need P6) is a separate concern.
 
 ## Phase 7 status (overall)
 
+- [x] **P7-VAL-4 migration-policy heuristic bench + empirical
+      validation** — landed `v2/bench/bench_migrate_policy.c` (and
+      matching CMake target with the standard Linux ld static-library
+      cycle gating) for the ROADMAP §10.2 exit criterion 2
+      ("Migration policy heuristic produces reasonable hot/cold
+      placement on synthetic workloads"). Synthetic workload of
+      `total_inos` partitioned into a HOT group (rewritten every txg
+      cycle, link_gen tracks current_gen) and a COLD group (written
+      once at workload start, link_gen stuck at initial). After T
+      cycles + commits, runs `stm_fs_migrate_policy_pass_all` with
+      `min_age_txgs = T+1`; then re-activates a subset of cold inos
+      via reads (bumping COLD read_count) and runs
+      `stm_fs_promote_policy_pass_all` with `min_read_count = 3`.
+      Verdict: ≥ 90% true-positive rate AND 0 false positives
+      across both passes. **Validated empirically on 2026-04-30**
+      (`docs/validation/p7val4-migpol-2026-04-30.md`): 200-ino
+      sweep at 15%/85% hot/cold split with 30% of cold re-activated
+      → both phases 100% TP with 0 FP. Bench code is opt-in via
+      `-DSTM_BUILD_BENCHES=ON`, not on audit-trigger surfaces; no
+      R-round needed.
+
 - [x] **P7-VAL-3 send/recv snapshot integration tests + empirical
       validation** — landed three new tests in
       `tests/test_send_recv.c` for the ROADMAP §10.2 exit criterion
@@ -1515,8 +1536,8 @@ into the CAS tier (which DOES need P6) is a separate concern.
 
 ## ROADMAP §10.2 exit criteria
 
-Status as of 2026-04-30: 3/4 empirically validated (#1, #3, #4),
-1/4 code-complete pending validation (#2).
+Status as of 2026-04-30: **4/4 empirically validated**. Phase 7
+exit gate satisfied.
 
 - [x] **Cold-tier dedup achieves target 3-5× on VM-image test set.**
       **Empirically met at P7-VAL-1 medium-scale validation
@@ -1529,9 +1550,20 @@ Status as of 2026-04-30: 3/4 empirically validated (#1, #3, #4),
       governed by corpus overlap structure not size; the harness
       `bench/run_dedup.sh large` is ready for a higher-confidence
       run if Phase 9 hardening wants it.
-- [ ] Migration policy heuristic produces reasonable hot/cold
-      placement on synthetic workloads. Code-complete
-      (P7-CAS-7/8/11/12); needs synthetic-workload runner.
+- [x] **Migration policy heuristic produces reasonable hot/cold
+      placement on synthetic workloads.** **Empirically met at
+      P7-VAL-4 migration-policy validation
+      (`docs/validation/p7val4-migpol-2026-04-30.md`)**: 200-ino
+      synthetic workload partitioned into HOT (15%) vs COLD (85%)
+      groups by access pattern. Migrate phase migrates 170/170
+      idle inos to COLD with **0/30 false positives**; promote phase
+      promotes 51/51 re-activated inos back to HOT with **0/119
+      false positives**. Both directions achieve 100% true-positive
+      rate against the 90% target. Code path: P7-CAS-7
+      (migrate_policy_step) + P7-CAS-8 (TIERING property +
+      migrate_policy_pass_all) + P7-CAS-11 (promote_policy_step +
+      promote_policy_pass_all) + P7-CAS-12 (PROMOTE_DECAY_WINDOW
+      property).
 - [x] **Send + receive roundtrip preserves data + metadata +
       snapshots.** **Empirically met at P7-VAL-3 send/recv
       integration validation

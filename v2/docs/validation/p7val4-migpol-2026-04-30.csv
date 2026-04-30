@@ -1,0 +1,5 @@
+phase,group,total,changed_kind,rate,verdict
+migrate,cold,170,170,1.0000,pass
+migrate,hot,30,0,0.0000,pass
+promote,reactive,51,51,1.0000,pass
+promote,dormant,119,0,0.0000,pass
