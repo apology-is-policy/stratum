@@ -56,9 +56,36 @@ into the CAS tier (which DOES need P6) is a separate concern.
 
 ## Phase 7 status (overall)
 
+- [x] **P7-CAS-13 fs-level dataset property wrappers** —
+      substantive `<P7CAS13_SUBSTANTIVE>` + R64 close
+      `<P7CAS13_RCLOSE>` + hash-fixup (this commit). Closes
+      R63 P3-4 forward-noted ergonomic gap by adding production-
+      shape public APIs: `stm_fs_set_dataset_property`,
+      `stm_fs_clear_dataset_property`,
+      `stm_fs_effective_dataset_property`, and
+      `stm_fs_set_dataset_pool_default`. Each takes `fs->lock`,
+      applies FS_GUARD_WRITE (mutators) or FS_GUARD_READ
+      (effective reader), gets the `stm_dataset_index` via
+      `stm_sync_dataset_index`, delegates to the dataset.c
+      property API. Effective reader uses the uniform out-param
+      contract (zero-init `*out_value` BEFORE arg validation).
+      Effective reader allowed on RO mounts (read-only check is
+      mutator-specific); mutators refuse RO with STM_EROFS,
+      wedged with STM_EWEDGED. Persistence: writes through the
+      same `dataset_idx` that the next `stm_fs_commit` /
+      `stm_fs_unmount` flushes — no side cache.
+      No format break (no on-disk surface change). No spec
+      extension (composition over the dataset.c API which is
+      already pinned by property.tla). test_fs grows 139 → 146
+      (7 P7-CAS-13 tests covering the basic roundtrip, pool-
+      default routing, arg-validation matrix, wedged-refused +
+      uniform out-param zero-init, RO-refuses-mutators-allows-
+      effective, IMMUTABLE set-once propagation, persistence
+      through commit+remount).
+
 - [x] **P7-CAS-12 promote-decay-window per-dataset property** —
       substantive `0523cae` + R63 close
-      `473c7fa` + hash-fixup (this commit). Format break
+      `473c7fa` + hash-fixup `aff8eb7`. Format break
       STM_UB_VERSION 21 → 22: STM_PROP_COUNT 4 → 5, adding
       `STM_PROP_PROMOTE_DECAY_WINDOW` (INHERITABLE; per-dataset
       override for the per-COLD read-frequency counter's decay

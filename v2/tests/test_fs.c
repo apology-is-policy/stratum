@@ -6111,4 +6111,227 @@ STM_TEST(fs_p7cas12_property_local_zero_resolves_to_default) {
     unlink(g_key_path);
 }
 
+/* ====================================================================== */
+/* P7-CAS-13: fs-level dataset property wrappers.                          */
+/* ====================================================================== */
+
+STM_TEST(fs_p7cas13_set_get_property_basic) {
+    /* set_property + effective_property routes correctly through
+     * the fs wrapper without needing the test seam. */
+    make_tmp("p7cas13_basic");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Set TIERING=1 on root via the fs wrapper. */
+    STM_ASSERT_OK(stm_fs_set_dataset_property(fs, /*root*/1,
+                                                  STM_PROP_TIERING, 1u));
+
+    /* Effective is 1. */
+    uint64_t v = 0;
+    STM_ASSERT_OK(stm_fs_effective_dataset_property(fs, 1,
+                                                       STM_PROP_TIERING, &v));
+    STM_ASSERT_EQ(v, 1u);
+
+    /* Clear → falls back to pool default 0. */
+    STM_ASSERT_OK(stm_fs_clear_dataset_property(fs, 1, STM_PROP_TIERING));
+    STM_ASSERT_OK(stm_fs_effective_dataset_property(fs, 1,
+                                                       STM_PROP_TIERING, &v));
+    STM_ASSERT_EQ(v, 0u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas13_set_pool_default_basic) {
+    /* set_dataset_pool_default routes to stm_dataset_set_pool_default;
+     * effective on root with no local set returns the new pool
+     * default. */
+    make_tmp("p7cas13_pool");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    STM_ASSERT_OK(stm_fs_set_dataset_pool_default(
+            fs, STM_PROP_PROMOTE_DECAY_WINDOW, 4096u));
+    uint64_t v = 0;
+    STM_ASSERT_OK(stm_fs_effective_dataset_property(
+            fs, 1, STM_PROP_PROMOTE_DECAY_WINDOW, &v));
+    STM_ASSERT_EQ(v, 4096u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas13_arg_validation) {
+    /* NULL fs / NULL out → STM_EINVAL. */
+    STM_ASSERT_ERR(stm_fs_set_dataset_property(NULL, 1, STM_PROP_TIERING, 1),
+                       STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_clear_dataset_property(NULL, 1, STM_PROP_TIERING),
+                       STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_effective_dataset_property(NULL, 1, STM_PROP_TIERING,
+                                                          (uint64_t[]){0}),
+                       STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_set_dataset_pool_default(NULL, STM_PROP_TIERING, 0),
+                       STM_EINVAL);
+
+    /* effective with NULL out_value → STM_EINVAL. */
+    make_tmp("p7cas13_nullout");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    STM_ASSERT_ERR(stm_fs_effective_dataset_property(fs, 1, STM_PROP_TIERING,
+                                                          NULL),
+                       STM_EINVAL);
+
+    /* OOR property → STM_EINVAL. */
+    STM_ASSERT_ERR(stm_fs_set_dataset_property(fs, 1,
+                                                   (stm_property)99u, 1),
+                       STM_EINVAL);
+
+    /* Unknown dataset id → STM_ENOENT. */
+    STM_ASSERT_ERR(stm_fs_set_dataset_property(fs, 9999u,
+                                                   STM_PROP_TIERING, 1),
+                       STM_ENOENT);
+    STM_ASSERT_ERR(stm_fs_effective_dataset_property(fs, 9999u,
+                                                          STM_PROP_TIERING,
+                                                          &(uint64_t){0}),
+                       STM_ENOENT);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas13_wedged_refused) {
+    /* Wedged fs refuses set/clear/pool_default with STM_EWEDGED;
+     * effective also refused (read guard). */
+    make_tmp("p7cas13_wedged");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    stm_fs_mark_wedged(fs);
+
+    STM_ASSERT_ERR(stm_fs_set_dataset_property(fs, 1, STM_PROP_TIERING, 1),
+                       STM_EWEDGED);
+    STM_ASSERT_ERR(stm_fs_clear_dataset_property(fs, 1, STM_PROP_TIERING),
+                       STM_EWEDGED);
+    STM_ASSERT_ERR(stm_fs_set_dataset_pool_default(fs, STM_PROP_TIERING, 0),
+                       STM_EWEDGED);
+    uint64_t v = 999;
+    STM_ASSERT_ERR(stm_fs_effective_dataset_property(fs, 1, STM_PROP_TIERING,
+                                                          &v),
+                       STM_EWEDGED);
+    /* Uniform out-param contract: even on wedged refusal, *out is
+     * zero-inited (not left at 999). */
+    STM_ASSERT_EQ(v, 0u);
+
+    (void)stm_fs_unmount(fs);
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas13_ro_refuses_mutators_allows_effective) {
+    /* RO fs refuses set/clear/pool_default with STM_EROFS; effective
+     * is read-only and PERMITTED on RO mounts (FS_GUARD_READ doesn't
+     * check read_only). */
+    make_tmp("p7cas13_ro");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    /* Set a property under RW mount first so RO mount sees it. */
+    {
+        stm_fs_mount_opts rwm = rw_mount_opts();
+        stm_fs *fsrw = NULL;
+        STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &rwm, &fsrw));
+        STM_ASSERT_OK(stm_fs_set_dataset_property(
+                fsrw, /*root*/1, STM_PROP_TIERING, 1u));
+        STM_ASSERT_OK(stm_fs_unmount(fsrw));
+    }
+
+    stm_fs_mount_opts ro = rw_mount_opts();
+    ro.read_only = true;
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &ro, &fs));
+
+    /* Mutators refused. */
+    STM_ASSERT_ERR(stm_fs_set_dataset_property(fs, 1, STM_PROP_TIERING, 0),
+                       STM_EROFS);
+    STM_ASSERT_ERR(stm_fs_clear_dataset_property(fs, 1, STM_PROP_TIERING),
+                       STM_EROFS);
+    STM_ASSERT_ERR(stm_fs_set_dataset_pool_default(fs, STM_PROP_TIERING, 0),
+                       STM_EROFS);
+
+    /* Reader allowed: returns the value persisted under RW. */
+    uint64_t v = 0;
+    STM_ASSERT_OK(stm_fs_effective_dataset_property(fs, 1, STM_PROP_TIERING,
+                                                       &v));
+    STM_ASSERT_EQ(v, 1u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas13_immutable_set_once_propagates) {
+    /* IMMUTABLE property set-once enforcement reaches through the
+     * wrapper. */
+    make_tmp("p7cas13_immutable");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* First set succeeds. */
+    STM_ASSERT_OK(stm_fs_set_dataset_property(
+            fs, /*root*/1, STM_PROP_ENCRYPTION, 0xAB));
+    /* Second set on already-locally-set IMMUTABLE refused. */
+    STM_ASSERT_ERR(stm_fs_set_dataset_property(
+            fs, 1, STM_PROP_ENCRYPTION, 0xCD), STM_EINVAL);
+    /* Clear on IMMUTABLE refused. */
+    STM_ASSERT_ERR(stm_fs_clear_dataset_property(
+            fs, 1, STM_PROP_ENCRYPTION), STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas13_persists_through_commit_and_remount) {
+    /* Property set via wrapper persists across commit + unmount +
+     * remount — confirms the wrapper goes through the same
+     * dataset_idx that gets persisted at commit, NOT a side-cache. */
+    make_tmp("p7cas13_persist");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    STM_ASSERT_OK(stm_fs_set_dataset_property(
+            fs, 1, STM_PROP_PROMOTE_DECAY_WINDOW, 256u));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    stm_fs *fs2 = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs2));
+    uint64_t v = 0;
+    STM_ASSERT_OK(stm_fs_effective_dataset_property(
+            fs2, 1, STM_PROP_PROMOTE_DECAY_WINDOW, &v));
+    STM_ASSERT_EQ(v, 256u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs2));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")

@@ -38,8 +38,43 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R63-hash-fixup. Substantive `0523cae` +
-  R63 close `473c7fa`.
+- **Tip**: post-R64-hash-fixup. Substantive `<P7CAS13_SUBSTANTIVE>` +
+  R64 close `<P7CAS13_RCLOSE>`.
+  **P7-CAS-13 — fs-level dataset property wrappers. Closes R63
+  P3-4 forward-noted ergonomic gap by adding production-shape
+  public APIs `stm_fs_set_dataset_property`,
+  `stm_fs_clear_dataset_property`,
+  `stm_fs_effective_dataset_property`, and
+  `stm_fs_set_dataset_pool_default`. Pre-P7-CAS-13 the only
+  callable path was via the test seam
+  (`stm_fs_sync_for_test` → `stm_sync_dataset_index` → call the
+  dataset.c API directly), bypassing `fs->lock` + the wedged/RO
+  guards. The wrappers are thin pass-throughs — take fs->lock,
+  apply FS_GUARD_WRITE (mutators) or FS_GUARD_READ (effective
+  reader), get the dataset_idx via `stm_sync_dataset_index`,
+  delegate to the dataset.c API. Lock posture matches the rest
+  of the fs/* surface (fs->lock → sync->lock → dataset_idx
+  mutex). The reader uses the established uniform out-param
+  contract (zero-init `*out_value` BEFORE arg validation, so
+  callers observing on STM_EINVAL/STM_EWEDGED still see a
+  defined value). Effective reader is allowed on RO mounts
+  (read-only check is FS_GUARD_WRITE-specific); mutators refuse
+  RO with STM_EROFS. Persistence: the wrapper writes through the
+  same `dataset_idx` that the next `stm_fs_commit` /
+  `stm_fs_unmount` flushes — no side cache, no replay state. No
+  format break (no on-disk surface change); no spec extension
+  (composition over the dataset.c API which is already pinned by
+  property.tla). test_fs grows 139 → 146 (7 P7-CAS-13 tests:
+  basic set/get/clear roundtrip; pool-default routing;
+  arg-validation matrix including OOR property + unknown
+  dataset id; wedged-refused for all four wrappers + uniform
+  out-param zero-init; RO-refuses-mutators-allows-effective;
+  IMMUTABLE set-once enforcement propagates; persists through
+  commit+remount). 35 ctest suites green default + ASan + TSan
+  in isolation. Spec posture unchanged: 21 modules / 25 fixed
+  cfgs / 34 buggy cfgs.**
+  Prior P7-CAS-12 substantive `0523cae` + R63 close `473c7fa` +
+  hash fixup `aff8eb7`.
   **P7-CAS-12 — promote-decay-window per-dataset property. Format
   break STM_UB_VERSION 21 → 22: STM_PROP_COUNT 4 → 5, adding
   `STM_PROP_PROMOTE_DECAY_WINDOW` (INHERITABLE; per-dataset

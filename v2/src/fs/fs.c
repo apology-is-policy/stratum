@@ -1111,6 +1111,98 @@ stm_status stm_fs_create_dataset(stm_fs *fs, uint64_t parent_id,
 }
 
 /* ========================================================================= */
+/* Dataset property wrappers (P7-CAS-13).                                     */
+/*                                                                            */
+/* Thin pass-through wrappers around the dataset.c property API. Take         */
+/* fs->lock, apply wedged/RO guards, get the dataset_idx via the sync         */
+/* handle, delegate. Closes R63 P3-4: pre-P7-CAS-13 the only callable         */
+/* path was via the test-only `stm_fs_sync_for_test` accessor.                */
+/* ========================================================================= */
+
+stm_status stm_fs_set_dataset_property(stm_fs *fs, uint64_t dataset_id,
+                                          stm_property prop,
+                                          uint64_t value)
+{
+    if (!fs) return STM_EINVAL;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+
+    stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
+    if (!didx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_ECORRUPT;
+    }
+
+    stm_status s = stm_dataset_set_property(didx, dataset_id, prop, value);
+    pthread_mutex_unlock(&fs->lock);
+    return s;
+}
+
+stm_status stm_fs_clear_dataset_property(stm_fs *fs, uint64_t dataset_id,
+                                            stm_property prop)
+{
+    if (!fs) return STM_EINVAL;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+
+    stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
+    if (!didx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_ECORRUPT;
+    }
+
+    stm_status s = stm_dataset_clear_property(didx, dataset_id, prop);
+    pthread_mutex_unlock(&fs->lock);
+    return s;
+}
+
+stm_status stm_fs_effective_dataset_property(stm_fs *fs, uint64_t dataset_id,
+                                                stm_property prop,
+                                                uint64_t *out_value)
+{
+    if (!fs || !out_value) return STM_EINVAL;
+    /* Uniform out-param contract: zero-init before any guard / arg
+     * check so a caller observing on any error still sees a defined
+     * value rather than uninitialized stack. */
+    *out_value = 0;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_READ(fs);
+
+    stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
+    if (!didx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_ECORRUPT;
+    }
+
+    stm_status s = stm_dataset_effective_property(didx, dataset_id,
+                                                     prop, out_value);
+    pthread_mutex_unlock(&fs->lock);
+    return s;
+}
+
+stm_status stm_fs_set_dataset_pool_default(stm_fs *fs, stm_property prop,
+                                              uint64_t value)
+{
+    if (!fs) return STM_EINVAL;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+
+    stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
+    if (!didx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_ECORRUPT;
+    }
+
+    stm_status s = stm_dataset_set_pool_default(didx, prop, value);
+    pthread_mutex_unlock(&fs->lock);
+    return s;
+}
+
+/* ========================================================================= */
 /* Inspection + control.                                                      */
 /* ========================================================================= */
 

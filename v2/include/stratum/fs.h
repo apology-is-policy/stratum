@@ -41,6 +41,7 @@
 #define STRATUM_V2_FS_H
 
 #include <stratum/types.h>
+#include <stratum/dataset.h>     /* stm_property (P7-CAS-13) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -266,6 +267,63 @@ STM_MUST_USE
 stm_status stm_fs_create_dataset(stm_fs *fs, uint64_t parent_id,
                                     const char *name,
                                     uint64_t *out_id);
+
+/*
+ * P7-CAS-13: production-shape fs-level wrappers around the dataset
+ * property API. Pre-P7-CAS-13, callers (including tests) had to
+ * reach the `stm_dataset_index` handle via the test-only
+ * `stm_fs_sync_for_test` + `stm_sync_dataset_index` chain and call
+ * `stm_dataset_set_property` / `_clear_property` /
+ * `_effective_property` / `_set_pool_default` directly, bypassing
+ * fs->lock + the wedged/RO guards. R63 P3-4 forward-noted this gap;
+ * these wrappers close it.
+ *
+ * Lock + guard posture (matches the rest of the fs-layer surface):
+ * - Mutators (`set_property`, `clear_property`, `set_pool_default`)
+ *   take fs->lock + apply FS_GUARD_WRITE (refuses on wedged with
+ *   STM_EWEDGED, on RO with STM_EROFS).
+ * - Reader (`effective_property`) takes fs->lock + applies
+ *   FS_GUARD_READ (refuses on wedged with STM_EWEDGED; allowed on
+ *   RO).
+ *
+ * Persistence: properties are mutated in-RAM under
+ * `dataset_idx->lock`; the on-disk state is flushed at the next
+ * `stm_fs_commit` / `stm_fs_unmount`. A crash between set_property
+ * and commit loses the change (acceptable per the existing
+ * dataset.c contract — same as `stm_fs_create_dataset`'s freshly-
+ * minted dataset).
+ *
+ * Errors propagate from `stm_dataset_*_property`:
+ * - `STM_ENOENT` if the dataset id is not PRESENT.
+ * - `STM_EINVAL` if the property is out of range (>= STM_PROP_COUNT)
+ *   or, for `set_property` on an IMMUTABLE that's already locally
+ *   set, the set-once enforcement.
+ * - `STM_EINVAL` if `clear_property` is called on an IMMUTABLE.
+ * The fs's own `STM_EINVAL` (NULL handle / out-pointer) +
+ * `STM_EWEDGED` + `STM_EROFS` apply at the entry.
+ *
+ * The full set of supported properties (v22) is enumerated in
+ * `<stratum/dataset.h>::stm_property` — see `STM_PROP_COMPRESS`,
+ * `STM_PROP_QUOTA`, `STM_PROP_ENCRYPTION`, `STM_PROP_TIERING`,
+ * `STM_PROP_PROMOTE_DECAY_WINDOW`.
+ */
+STM_MUST_USE
+stm_status stm_fs_set_dataset_property(stm_fs *fs, uint64_t dataset_id,
+                                          stm_property prop,
+                                          uint64_t value);
+
+STM_MUST_USE
+stm_status stm_fs_clear_dataset_property(stm_fs *fs, uint64_t dataset_id,
+                                            stm_property prop);
+
+STM_MUST_USE
+stm_status stm_fs_effective_dataset_property(stm_fs *fs, uint64_t dataset_id,
+                                                stm_property prop,
+                                                uint64_t *out_value);
+
+STM_MUST_USE
+stm_status stm_fs_set_dataset_pool_default(stm_fs *fs, stm_property prop,
+                                              uint64_t value);
 
 /*
  * P7-16: stm_fs_reflink — POSIX-shape FICLONE. Replaces dst's empty

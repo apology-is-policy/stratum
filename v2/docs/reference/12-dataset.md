@@ -96,6 +96,24 @@ stm_status stm_dataset_clear_property        (idx, id, p);
 stm_status stm_dataset_effective_property    (idx, id, p, *out_value);
 ```
 
+Production callers (and post-P7-CAS-13 tests) should prefer the
+fs-level wrappers in `<stratum/fs.h>`:
+
+```c
+stm_status stm_fs_set_dataset_property      (fs, id, p, value);
+stm_status stm_fs_clear_dataset_property    (fs, id, p);
+stm_status stm_fs_effective_dataset_property(fs, id, p, *out_value);
+stm_status stm_fs_set_dataset_pool_default  (fs, p, value);
+```
+
+The wrappers add the standard fs-layer protections (fs->lock,
+wedged/RO guards, uniform out-param zero-init contract) on top
+of the dataset.c API. The bare `stm_dataset_*` API remains
+available for in-process callers (notably the sync layer's
+property lookup at the bump call site for P7-CAS-12) and tests
+that exercise dataset-only behavior without the fs-layer
+plumbing; production callers shouldn't need it.
+
 Three property kinds (per `property.tla`):
 
 | Property | Kind | Resolution |
