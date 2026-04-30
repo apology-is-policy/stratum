@@ -93,13 +93,20 @@ struct stm_scrub {
      * touch this bit — preserving an unconsumed completion across a
      * concurrent reset is the whole point of the sticky design.
      *
-     * The bit is _Atomic bool so the consumer can read without
-     * holding sc->lock (the wrapper at sync.c:7469 calls consume on
-     * a different thread than the one that called step under
-     * sc->lock; relaxed atomic semantics suffice because the bit's
-     * monotonic per-step set + consume's atomic exchange guarantee
-     * "consume returns true at-least-once per step that transitioned
-     * to COMPLETED." Closes R57 P3-1+P3-2 forward-noted edge case. */
+     * Memory-ordering rationale (R66 P3-1, refined): the bit is
+     * `_Atomic bool` so the consumer can read without holding
+     * sc->lock. Relaxed atomic ordering is sufficient because:
+     *   - All atomic operations on the same atomic object form a
+     *     total modification order per C11 §29.3p11.
+     *   - `atomic_exchange` is a read-modify-write; per §29.3p12 it
+     *     reads the latest value in modification order, regardless
+     *     of memory_order argument.
+     *   - The consumer reads/writes only this bit (not other
+     *     state), so no inter-variable ordering is required.
+     * The end-to-end guarantee is "consume returns true at-least-
+     * once per step that transitioned to COMPLETED" — sufficient for
+     * the orchestrator's at-least-once sweep cadence. Closes R57
+     * P3-1+P3-2 forward-noted edge case. */
     _Atomic bool pending_completion_signal;
 };
 
@@ -159,6 +166,14 @@ stm_status stm_scrub_create(stm_sync *sync, stm_scrub **out_scrub)
     }
     sc->sync  = sync;
     sc->pool  = pool;
+    /* R66 P3-2: portable initialization of the _Atomic bool. C11
+     * §7.17.2.1 requires `atomic_init` for atomic objects;
+     * calloc-zero produces strictly indeterminate values per the
+     * standard (in practice _Atomic bool is one byte where 0 ==
+     * false on every reasonable target, but explicit init avoids
+     * the standards-pedantry concern + makes the post-create
+     * state self-evident to a reader). */
+    atomic_init(&sc->pending_completion_signal, false);
 
     /* P5-durable-cursors: restore from the durable scrub-state region
      * that sync_open populated at mount time. Fresh pools have all
@@ -310,8 +325,11 @@ bool stm_scrub_consume_completion_signal(stm_scrub *sc)
      * stays true and the next consume picks it up. If step sets
      * BEFORE our exchange, we observe true and clear. The bit's
      * monotonic per-step set + at-least-once-per-set consume
-     * guarantee is what makes the orchestrator wrapper robust to
-     * concurrent reset/start mutating the visible state. */
+     * semantics are guaranteed by the atomic object's modification
+     * order under C11 §29.3p11 (atomic_exchange always observes
+     * the latest stored value); relaxed ordering is sufficient
+     * because the consumer accesses no other state that requires
+     * inter-variable ordering. R66 P3-1. */
     return atomic_exchange_explicit(&sc->pending_completion_signal,
                                        false,
                                        memory_order_relaxed);
@@ -499,10 +517,12 @@ stm_status stm_scrub_step(stm_scrub *sc)
              * concurrent stm_scrub_reset / stm_scrub_start by another
              * thread can't hide this transition from
              * stm_scrub_consume_completion_signal. The bit is
-             * _Atomic; relaxed ordering is sufficient because the
-             * pthread_mutex_unlock below provides release semantics
-             * — the consumer's mutex acquisition (or its atomic
-             * exchange) synchronizes-with this store. */
+             * _Atomic bool; relaxed ordering is correct here because
+             * the consumer accesses no other state alongside the
+             * bit (see field comment). The total modification order
+             * of the atomic object — guaranteed by C11 §29.3p11 —
+             * means the consumer's atomic_exchange always observes
+             * the latest stored value regardless of memory_order. */
             atomic_store_explicit(&sc->pending_completion_signal,
                                      true, memory_order_relaxed);
             scrub_push_durable_locked(sc);
