@@ -1,143 +1,133 @@
 # Phase 8 — status and pickup guide
 
-Authoritative pickup guide for Phase 8 (client interfaces — 9P
-server, FUSE shim, CLI, /ctl/, libstratum-9p, language bindings).
-**Phase 8 ENTERED 2026-04-30** at `1759caf` after Phase 7's 4/4
-§10.2 exit criteria were empirically validated. Tag
-`phase-7-complete` marks the boundary.
+Authoritative pickup guide for Phase 8 (POSIX surface — inodes,
+dirents, xattr, ACLs, statx, small-file inline, reflink wrapper,
+the full set of POSIX file/dir operations).
+
+**Phase 8 ENTERED 2026-04-30** at `bea7f82` after the user
+surfaced that ARCHITECTURE §11 (POSIX surface) was a missing
+phase under the prior 10-phase ROADMAP numbering. Phase 8 was
+inserted; client interfaces shifted to Phase 9. Tag
+`phase-7-complete` (at `1759caf`) still marks the Phase 7 → 8
+boundary.
 
 ROADMAP §11 lists the deliverables and §11.2 the exit criteria.
-The 9P-first stance from ARCHITECTURE §10 is foundational: the
-stratum daemon exposes exactly one surface — a 9P server on a
-Unix socket — and every other client (FUSE, CLI, libstratum-9p,
-language bindings, future kernel module) is a 9P consumer.
+ARCHITECTURE §11 is the design document — the on-disk shape is
+fully committed there (256-byte `stm_inode`, hash-indexed B-tree
+dirents keyed by `(dir_ino, STM_KEY_DIRENT, fnv1a(name))`, tagged
+data union extent / inline / symlink / device, `si_gen` for
+ino-reuse detection, inline data ≤100 bytes for small files).
+This phase implements §11.
 
-## Phase 8 status (overall)
+## Why this phase exists
 
-- [x] **P8-NS-1 namespace.tla** — spec-first scaffold for ROADMAP
-      §11.2 exit criterion #5 ("`namespace.tla` proves cross-
-      connection isolation"). 22nd TLA+ module. Models per-
-      connection mount tables with Attach / Detach / Bind /
-      Unbind / ObserveLookup actions. Two headline invariants:
-      `LookupReflectsOwnBindings` (every captured 9P-Twalk
-      observation matches the connection's own bindings at
-      observation time) + `BindingsMatchAuthored` (the bindings
-      table for connection c only mutates via c's own actions —
-      catches silent-deletion class bugs that observation-time
-      checks miss). Plus `DetachClears` + `BindCapBound` +
-      `TypeOK`. Four buggy variants enumerate the canonical
-      isolation-breach failure modes the 9P server must rule out:
-      shared global table, detach-leaks, unbind-crosstalk,
-      lookup-crosstalk. Healthy config: 73984 distinct states /
-      depth 17. All four buggy configs fire as designed
-      (`namespace_*_buggy.cfg`). Spec posture: 22 modules / 26
-      fixed cfgs / 38 buggy cfgs (was 21 / 25 / 34 at Phase 7
-      exit). CI matrix updated: `tlc-specs` job adds `namespace`
-      to the per-PR check. No code yet — implementation in P8-9P-2.
+Phase 7 built the data plane (extent records keyed by `(ds, ino,
+off, len)`, FastCDC, CAS tier, send/recv, reflinks) and the
+namespace plane (datasets, snapshots, clones, dead-list). What's
+missing is the **filesystem semantics layer** — the inode metadata
+and directory entry storage that turns a (dataset, ino, byte-
+offset) byte store into a POSIX-shape file/directory tree:
 
-- [ ] **P8-9P-1 9P2000.L baseline** — pending; the core 9P
-      server module under `src/9p/`. Tversion / Tattach (default
-      namespace only; per-connection composition is P8-9P-2) /
-      Tauth (none backend only) / Twalk / Topen / Tread / Twrite
-      / Tclunk / Tremove / Tstat / Twstat. Unix socket transport.
-      Single-connection unit tests in `tests/test_9p_*.c`.
-      Spec-to-code reference for the connection lifecycle:
-      `namespace.tla` Attach / Detach.
+- `stm_fs_lookup(parent_ino, name) → child_ino` — name resolution
+- `stm_fs_create_file` / `stm_fs_mkdir` / `stm_fs_unlink` /
+  `stm_fs_rmdir` / `stm_fs_rename` — directory mutations
+- `stm_fs_stat` / `stm_fs_chmod` / `stm_fs_chown` / `stm_fs_utimens`
+  — metadata ops
+- `stm_fs_readdir` — directory traversal
+- `stm_fs_link` / `stm_fs_symlink` / `stm_fs_readlink` — links
+- xattr + POSIX ACLs
+- modern POSIX features (`O_TMPFILE`, `F_SEAL_*`, `statx`)
 
-- [ ] **P8-9P-2 per-connection namespace composition** — pending;
-      implements `namespace.tla` against the P8-9P-1 server.
-      Adds Tbind / Tunbind extensions per ARCHITECTURE §8.8.2.
-      Connections get private mount-table state allocated at
-      Tattach + freed at Tclunk (the connection's root fid).
-      The four buggy variants in `namespace.tla` are the
-      adversarial-review checklist: any code path that touches
-      a connection's mount table needs to rule out the
-      crosstalk classes.
+v1's `src/fs/fs.c` had this layer; v2 has a flat (ds, ino, off)
+extent API. Phase 8's job is the v2 reimplementation per ARCH
+§11 — extending the prior 88-byte v1 inode to the 256-byte v2
+inode and porting the hash-indexed dirent shape.
 
-- [ ] **P8-9P-3 stratum 9P extensions** — pending; Tpin / Tunpin
-      (snapshot pinning per ARCHITECTURE §3.3.2), Tsync (client-
-      initiated commit), Treflink (O(1) copy via P7-16's
-      stm_fs_reflink), Tfallocate, plus pluggable auth backends
-      (factotum, SASL, token).
+Phase 9 (client interfaces) is gated on Phase 8 exit: 9P's Twalk
+/ Tcreate / Treaddir / Topen / Tstat have nothing to forward to
+without this layer.
 
-- [ ] **P8-CTL-1 /ctl/ synthetic FS** — pending; the layout in
-      ARCHITECTURE §14.3 served as a 9P file tree. Read paths
-      report state; write paths trigger actions. Hosts the
-      Prometheus + OpenTelemetry exposition endpoints.
+## Sub-chunk plan
 
-- [ ] **P8-CLI-1 stratum CLI** — pending; thin (~1000 LOC)
-      wrapper over /ctl/. Subcommands: pool, dataset, snapshot,
-      clone, send, recv, key. Output formats: human (default),
-      JSON, TSV.
+Each sub-chunk is its own substantive + R-close + hash-fixup
+cycle (per CLAUDE.md three-commit pattern) where the audit-trigger
+surface applies. New surfaces added to CLAUDE.md's trigger list
+during this phase:
 
-- [ ] **P8-FUSE-1 stratum-fuse single-threaded MVP** — pending;
-      separate daemon at `src/cmd/fuse/`. FUSE-to-9P translator.
-      Single-threaded op handling for the MVP.
+- `src/inode/` — inode tree write paths.
+- `src/dirent/` — dirent btree mutations + hash-collision chain
+  walks (single-byte invariant violations here are how
+  ext4 + xfs have historically had silent-corruption regressions).
+- `src/fs/fs.c` for any new public POSIX op API additions.
 
-- [ ] **P8-FUSE-2 stratum-fuse multi-threading + perf** —
-      pending; thread-pool dispatcher; performance tuning per
-      ROADMAP §11.3 medium-risk note.
+| Sub-chunk | Scope | TLA+ scaffold | Audit trigger |
+|---|---|---|---|
+| **P8-POSIX-1** | `stm_inode` struct + per-dataset inode tree (key `(ds, ino) → 256B value`). Generation counter. Inline data tagged-union plumbing. New `include/stratum/inode.h`. Inode allocation (alloc / free / reuse). Persistence + roundtrip. | `inode.tla` — alloc / free / nlink / generation invariants | new surface |
+| **P8-POSIX-2** | Dirent layer. Hash-indexed B-tree per ARCH §11: key `(dir_ino, STM_KEY_DIRENT, fnv1a(name))`. Probe-chain for collisions. `stm_fs_lookup` / `stm_fs_create_file` / `stm_fs_mkdir` / `stm_fs_unlink` / `stm_fs_rmdir`. | `dirent.tla` — collision chain + lookup correctness + create/unlink atomicity | new surface |
+| **P8-POSIX-3** | Metadata ops: `stm_fs_stat` / `stm_fs_chmod` / `stm_fs_chown` / `stm_fs_utimens`. nlink tracking. Hard links (`stm_fs_link`). | extends `inode.tla` (nlink under create / link / unlink races) | inode + dirent |
+| **P8-POSIX-4** | `stm_fs_readdir` with stable cookies + restartable iteration + tombstone handling. | extends `dirent.tla` (cookie stability under concurrent insert/delete) | dirent |
+| **P8-POSIX-5** | Inline data optimization: ≤100B files store in `si_inline_data`. Inline-to-extent transition on first write past the threshold (atomic via existing extent COW). | extends `inode.tla` (inline ↔ extent transition) | inode + extent write path |
+| **P8-POSIX-6** | xattr keyspace `(ino, STM_KEY_XATTR, fnv1a(name)) → value`. POSIX ACLs (`system.posix_acl_access` + `system.posix_acl_default`) via xattr. | `xattr.tla` (collision chain mirroring dirent) | new surface |
+| **P8-POSIX-7** | Modern POSIX: `O_TMPFILE` (orphan inode + `linkat` materialization), `F_SEAL_*` flags, `statx(2)` shape with btime + nanosecond timestamps, `fallocate(FALLOC_FL_KEEP_SIZE)` + `FALLOC_FL_PUNCH_HOLE`. | composes over inode.tla | inode + dirent |
+| **P8-POSIX-8** | Symlinks. Inline target ≤100B; longer via extent tree. `stm_fs_symlink` / `stm_fs_readlink`. | composes over inode.tla | inode |
+| **P8-POSIX-9** | `stm_fs_rename`. Atomicity under concurrent dirent mutations in source + target dirs. Cross-directory rename. Cross-dataset rename refused with EXDEV. Same-name target replacement. | extends `dirent.tla` (rename atomicity) | dirent + sync |
+| **P8-POSIX-10** | `copy_file_range` reflink wrapper over existing `stm_fs_reflink` (P7-16). `stm_fs_truncate` inode wrapper over existing extent-level `stm_sync_truncate` (P7-9). | composes over existing reflink + truncate | inode + dirent |
+| **P8-POSIX-11** | Tests + audit + xfstests integration prep. Property-based tests for the file/dir/xattr/ACL layer. Regression suite for ARCH §11 corner cases. | — | full P8 surface |
 
-- [ ] **P8-LIB-1 libstratum-9p sync API** — pending; stable C
-      ABI per ARCHITECTURE §10.2 ("libstratum-9p is the stable
-      public ABI; all language bindings wrap it").
+## Exit criteria (ROADMAP §11.2)
 
-- [ ] **P8-LIB-2 libstratum-9p async API** — pending.
+- [ ] All POSIX file/dir ops produce semantically correct results
+      matching ext4/XFS/APFS for a representative test corpus.
+- [ ] Hash-collision chain works correctly with ≥1k dirents per
+      directory.
+- [ ] Hard link nlink remains correct under concurrent create/unlink.
+- [ ] Inline-to-extent transition recovers correctly across crash
+      boundaries.
+- [ ] `statx` returns nanosecond timestamps + btime.
+- [ ] POSIX ACL roundtrip preserves grants/denies bit-exact.
+- [ ] `inode.tla` + `dirent.tla` (+ likely `xattr.tla`) pin the
+      load-bearing invariants under TLC.
+- [ ] xfstests subset (file/dir/xattr/ACL portion) green on
+      Stratum-backed mount once Phase 9 (FUSE) lands; in Phase 8
+      the equivalent verification runs against the `stm_fs_*` API
+      directly.
 
-- [ ] **P8-BIND-1/2/3 language bindings** — pending; Rust crate
-      `stratum-fs`, Go package, Python module. Parallelizable.
+## Posture going in
 
-## ROADMAP §11.2 exit criteria
+Inheriting from Phase 7 exit (`1759caf` + P8-NS-1 spec at `bea7f82`):
 
-Status as of 2026-04-30: **0/5 met**, **1/5 spec-scaffolded**.
+| | |
+|---|---|
+| STM_UB_VERSION | 23 (last bumped at P7-CAS-16). Phase 8 will likely bump for the inode tree on-disk format addition (probably v23 → v24 at P8-POSIX-1). |
+| STM_SEND_VERSION | 3 |
+| Spec posture | 22 modules / 26 fixed cfgs / 38 buggy cfgs (after P8-NS-1's namespace.tla landed). Phase 8 adds `inode.tla`, `dirent.tla`, probably `xattr.tla` — projected 24-25 modules at Phase 8 exit. |
+| ctest | 35 suites green default + ASan + TSan |
+| test_fs | 159 |
+| test_send_recv | 40 |
+| Audits closed | R0 — R68 |
 
-- [ ] Mount a pool via FUSE; standard POSIX operations succeed.
-      Blocks on P8-9P-1 + P8-FUSE-1.
+## Format break expectations
 
-- [ ] Multiple concurrent 9P connections with different
-      namespaces work correctly. Blocks on P8-9P-2.
+P8-POSIX-1 will add a NEW per-dataset on-disk surface (the inode
+tree). This is a format break — STM_UB_VERSION 23 → 24. v23 pools
+won't have an inode tree; mounting them on v24 would need either
+a migration step or a refusal at mount. Probably refusal at
+mount with STM_EBADVERSION (mirroring P7-CAS-16's pattern), since
+v23 → v24 represents adding a load-bearing structural layer
+rather than extending an existing record shape.
 
-- [ ] CLI covers all admin operations via /ctl/. Blocks on
-      P8-CTL-1 + P8-CLI-1.
-
-- [ ] libstratum-9p + Rust / Go / Python bindings pass smoke
-      tests. Blocks on P8-LIB-1/2 + P8-BIND-1/2/3.
-
-- [ ] **`namespace.tla` proves cross-connection isolation.**
-      **MET (spec-level) at P8-NS-1**: 22nd TLA+ module landed
-      with healthy + four buggy configs. Implementation
-      validation pending P8-9P-2 (the C-impl must compose over
-      the spec; spec-to-code mapping documented at the bottom of
-      `reference/10-specs.md` § `namespace.tla`).
+Format-break signoff required per CLAUDE.md before P8-POSIX-1
+substantive lands.
 
 ## Operational notes
 
-- Spec-first applies (CLAUDE.md): namespace isolation is a load-
-  bearing invariant. P8-NS-1 landed BEFORE P8-9P-2; future P8
-  chunks that touch load-bearing invariants follow the same
-  pattern (e.g., a future fid-lifecycle invariant would deserve
-  its own spec).
-
-- Audit-trigger surfaces: P8-9P-1 and onward will add
-  `src/9p/p9.c` to the CLAUDE.md trigger list (mirror of v1's
-  9P trigger). Until the file exists, no audit cycle. Once code
-  lands, every change to `src/9p/` spawns an Opus 4.7
-  soundness-prosecutor agent per the CLAUDE.md "audit-triggering
-  changes" rule.
-
-- Format break expectations: **none** for the on-disk format.
-  The 9P server is a new external surface; per-connection state
-  is in-memory only. STM_UB_VERSION = 23 should hold through
-  Phase 8 unless an unforeseen on-disk artifact appears (e.g.,
-  if `/ctl/` event-log persistence joins the deliverables —
-  currently in-memory per ARCHITECTURE §14.5).
-
-- Test posture: 35 ctest suites at Phase 7 exit. Phase 8 adds
-  ~5-10 new suites — `test_9p_*.c` (connection lifecycle, fid,
-  Twalk, Tbind/Tunbind), end-to-end FUSE mount tests (Linux CI
-  only; macOS CI uses POSIX backend without FUSE).
-
-- CI matrix: `tlc-specs` job in `.github/workflows/v2-ci.yml`
-  updated at P8-NS-1 to include `namespace`. Future spec
-  additions (none currently planned for Phase 8 beyond
-  `namespace.tla`) extend the same matrix.
+- Spec-first (CLAUDE.md): inode and dirent invariants are
+  load-bearing. `inode.tla` lands BEFORE P8-POSIX-1 substantive,
+  `dirent.tla` lands BEFORE P8-POSIX-2 substantive.
+- Audit-per-change: `src/inode/` and `src/dirent/` join the
+  CLAUDE.md trigger list as soon as the first chunk lands. The
+  v1 `src/p9/p9.c` audit pattern (R6, R12 specifically) carries
+  forward — silent dirent-tree corruption is the canonical
+  failure mode here.
+- Memory primer roll at every chunk close: MEMORY.md index +
+  project_v2_active.md tip / lineage table + project_v2_next_session.md.

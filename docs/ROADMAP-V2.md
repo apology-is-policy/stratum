@@ -46,20 +46,23 @@ Phase 6 ─ Namespaces                           (~2 months)
 Phase 7 ─ Cold tier + features                 (~3 months)
           FastCDC + CAS tier + migration + send/recv + reflinks
 
-Phase 8 ─ Client interfaces                    (~2 months)
+Phase 8 ─ POSIX surface                        (~3 months)
+          Inodes + dirents + xattr + ACLs + statx + reflink wrapper
+
+Phase 9 ─ Client interfaces                    (~2 months)
           9P server + FUSE shim + CLI + /ctl/ + bindings
 
-Phase 9 ─ Hardening                            (~2 months)
+Phase 10 ─ Hardening                           (~2 months)
           Fuzzers, audits, benchmarks, docs
 
-Phase 10 ─ v2.0 release                        (~1 month)
+Phase 11 ─ v2.0 release                        (~1 month)
           Final audit + format freeze + tag + announce
 
 Post-v2.0 (v2.1, v2.2+)                        (ongoing)
           Kernel driver, learned tiering, Windows, zoned storage, …
 ```
 
-Total Phase 1 → Phase 10: **~26 months** from design-freeze to v2.0. Aggressive but bounded. Some phases can overlap (notes per-phase).
+Total Phase 1 → Phase 11: **~29 months** from design-freeze to v2.0. Aggressive but bounded. Some phases can overlap (notes per-phase). Phase 8 (POSIX surface) was inserted post-Phase-7 in 2026-04-30 once the gap was surfaced — the prior 10-phase plan implicitly assumed POSIX semantics existed but had no chunk for them; APIs (now Phase 9) are necessarily downstream.
 
 ## 3. Principles that apply throughout
 
@@ -77,7 +80,7 @@ TLA+ specs are written *before* the corresponding code, not after. A spec forces
 | `allocator.tla` | Phase 3 | Refcount invariants under MVCC |
 | `merkle.tla` | Phase 4 | Hash propagation correctness under COW |
 | `quorum.tla` | Phase 5 | Multi-device commit quorum semantics |
-| `namespace.tla` | Phase 8 | Per-connection namespace isolation |
+| `namespace.tla` | Phase 9 | Per-connection namespace isolation (landed early — P8-NS-1 spec scaffold during the Phase 7 → 8 transition under the prior 10-phase numbering) |
 
 CI runs TLC on every PR that touches a specified file.
 
@@ -667,11 +670,87 @@ section and in `memory/project_v2_active.md`'s carry-over notes.
 
 ---
 
-## 11. Phase 8: Client interfaces
+## 11. Phase 8: POSIX surface
+
+**Scope**: inodes + dirents + xattr + ACLs + statx + small-file inline + reflink wrapper + the full set of POSIX file/dir operations (`lookup`, `mkdir`, `create`, `unlink`, `rmdir`, `rename`, `link`, `symlink`, `readlink`, `readdir`, `stat`, `chmod`, `chown`, `utimens`, `truncate`).
+
+ARCHITECTURE §11 specifies the on-disk shape; this phase implements it. Phase 7 built the data plane (extents) and namespace plane (datasets, snapshots) but left the **filesystem semantics layer** unimplemented — the inode metadata + directory entry layer that turns a (dataset_id, ino, off) byte store into a POSIX-shape file/directory tree. APIs (Phase 9) need this layer; FUSE / CLI / 9P-readdir all consume it.
+
+### 11.1 Deliverables
+
+- **Inode layer** (`src/inode/`):
+  - 256-byte `stm_inode` per ARCH §11.3 (identity + mode + uid/gid/nlink + 4 nanosecond timestamps + size + flags + tagged data union).
+  - Inode tree key: `(dataset_id, ino) → 256B inode value`. Persisted alongside the existing extent tree per dataset.
+  - Inline data (≤100 bytes) for small-file optimization.
+  - Symlink target inline (≤100 bytes) + extent-backed for longer.
+  - Generation counter `si_gen` for ino-reuse detection (NFS handles, 9P stale fids, per-file derived keys).
+- **Directory entry layer** (`src/dirent/`):
+  - Hash-indexed B-tree per ARCH §11: key `(dir_ino, STM_KEY_DIRENT, fnv1a(name)) → child_ino + name`.
+  - Probe-chain for hash collisions.
+  - `stm_fs_lookup` / `stm_fs_create_file` / `stm_fs_mkdir` / `stm_fs_unlink` / `stm_fs_rmdir` / `stm_fs_rename` / `stm_fs_link` / `stm_fs_symlink` / `stm_fs_readlink`.
+- **Metadata ops**:
+  - `stm_fs_stat` / `stm_fs_chmod` / `stm_fs_chown` / `stm_fs_utimens` / `stm_fs_truncate_inode` (wraps existing extent-level truncate).
+  - `statx(2)` shape with btime + nanosecond timestamps.
+  - Hard link tracking (`si_nlink`).
+- **Directory traversal**:
+  - `stm_fs_readdir` with stable cookies + restartable iteration.
+  - Tombstone handling (deleted entry removed mid-iteration).
+- **Xattr**:
+  - Separate keyspace: `(ino, STM_KEY_XATTR, fnv1a(name)) → value`.
+  - Max value 64 KiB per attribute.
+  - `setxattr` / `getxattr` / `removexattr` / `listxattr`.
+- **POSIX ACLs**:
+  - `system.posix_acl_access` / `system.posix_acl_default` via xattr.
+  - Standard Linux encoding (`richacl`-pre-NFSv4).
+- **Modern POSIX features**:
+  - `O_TMPFILE` (orphan inode in the inode tree, materialized via `linkat`).
+  - `F_SEAL_*` (seal flags in `si_flags`).
+  - `copy_file_range` with reflink — wraps the existing `stm_fs_reflink`.
+  - `fallocate` / `FALLOC_FL_*` — initially `FALLOC_FL_KEEP_SIZE` + `FALLOC_FL_PUNCH_HOLE`; the rest as no-ops.
+- **TLA+ spec**: `inode.tla` — formal model of the inode lifecycle (alloc / free / nlink tracking / generation counter), plus `dirent.tla` for the hash-indexed tree's collision-chain invariants and rename atomicity.
+- **Tests**:
+  - Per-op correctness (matches ext4/XFS/APFS semantics).
+  - Hash-collision chains > 1k entries per directory.
+  - Rename atomicity under concurrent access.
+  - Hard-link nlink under create/unlink races.
+  - Inline → extent transition correctness.
+  - xattr roundtrip + ACL encoding.
+  - `statx` btime + nanosecond timestamps.
+  - 9P-style fuzz-shape op sequences.
+
+### 11.2 Exit criteria
+
+- [ ] All POSIX file/dir ops produce semantically correct results matching ext4/XFS/APFS for a representative test corpus.
+- [ ] Hash-collision chain works correctly with ≥1k dirents per directory.
+- [ ] Hard link nlink remains correct under concurrent create/unlink.
+- [ ] Inline-to-extent transition recovers correctly across crash boundaries.
+- [ ] `statx` returns nanosecond timestamps + btime.
+- [ ] POSIX ACL roundtrip preserves grants/denies bit-exact.
+- [ ] `inode.tla` + `dirent.tla` pin the load-bearing invariants under TLC.
+- [ ] xfstests subset — the file/dir/xattr/ACL portion — green on a Stratum-backed mount once Phase 9 (FUSE) lands; in Phase 8 the equivalent verification runs against the `stm_fs_*` API directly.
+
+### 11.3 Risks
+
+- **Low**: inode layout is well-understood; v1's 88-byte struct already exists as a reference (v2 extends to 256 B per ARCH §11.3).
+- **Low-medium**: hash-collision chain semantics need careful invariant work — `dirent.tla` covers it.
+- **Medium**: rename atomicity under concurrent writers; needs spec-first work.
+- **Low**: small-file inline-to-extent transition (covered by existing extent COW + an extra branch in the write path).
+
+### 11.4 Dependencies
+
+- Phase 1-7 (extent layer, allocator, dataset, btree write path, allocator commit ordering).
+
+### 11.5 Parallel opportunities
+
+- Inode + dirent layers depend on each other but xattr / ACL / statx / O_TMPFILE / fallocate / reflink wrapper can land in parallel after the dirent layer is stable.
+
+---
+
+## 12. Phase 9: Client interfaces
 
 **Scope**: 9P server with Stratum extensions, FUSE shim, CLI, /ctl/, libstratum-9p, language bindings.
 
-### 11.1 Deliverables
+### 12.1 Deliverables
 
 - **9P server** (`src/9p/`):
   - 9P2000.L support.
@@ -695,40 +774,42 @@ section and in `memory/project_v2_active.md`'s carry-over notes.
   - Rust crate `stratum-fs`.
   - Go package.
   - Python module.
-- **TLA+ spec**: `namespace.tla`.
+- **TLA+ spec**: `namespace.tla` (landed early as P8-NS-1 spec scaffold during the Phase 7 → Phase 8 transition under the prior 10-phase numbering — chunk identifier sticks for continuity even as POSIX surface became the new Phase 8).
 - **Tests**:
   - End-to-end: mount via FUSE, standard POSIX ops work.
   - Per-connection namespace isolation.
   - CLI smoke tests.
 
-### 11.2 Exit criteria
+### 12.2 Exit criteria
 
 - [ ] Mount a pool via FUSE; standard POSIX operations succeed.
 - [ ] Multiple concurrent 9P connections with different namespaces work correctly.
 - [ ] CLI covers all admin operations via /ctl/.
 - [ ] libstratum-9p + Rust / Go / Python bindings pass smoke tests.
-- [ ] `namespace.tla` proves cross-connection isolation.
+- [x] `namespace.tla` proves cross-connection isolation. **Spec-level MET at P8-NS-1 (commit `bea7f82`)** — landed early during the renumbering. Implementation validation pending the P9-NS-2 9P-impl chunk that composes against the spec.
 
-### 11.3 Risks
+### 12.3 Risks
 
 - **Low**: 9P2000.L is well-understood; our extensions are straightforward.
 - **Medium**: FUSE shim performance tuning.
 
-### 11.4 Dependencies
+### 12.4 Dependencies
 
-- All prior phases (this is where users touch Stratum).
+- All prior phases (this is where users touch Stratum). Phase 8 (POSIX surface) is the immediate prerequisite — without inode/dirent ops, 9P's `Twalk` / `Tcreate` / `Treaddir` have nothing to forward to.
 
-### 11.5 Parallel opportunities
+### 12.5 Parallel opportunities
 
 - 9P server, FUSE shim, CLI, libstratum-9p all independent; multiple devs can work in parallel.
 
 ---
 
-## 12. Phase 9: Hardening
+## 13. Phase 10: Hardening
+
+(was Phase 9 in the prior 10-phase numbering)
 
 **Scope**: fuzzer expansion, audit passes, benchmarks, documentation, pre-release polish.
 
-### 12.1 Deliverables
+### 13.1 Deliverables
 
 - **Fuzzer expansion**:
   - Extended crash-injection fuzzer.
@@ -748,7 +829,7 @@ section and in `memory/project_v2_active.md`'s carry-over notes.
   - Fix p99.9 outliers.
   - Optimize hot paths identified by profiling.
 
-### 12.2 Exit criteria
+### 13.2 Exit criteria
 
 - [ ] Fuzzers run for 1,000+ CPU-hours without finding new correctness bugs.
 - [ ] All audit rounds converge with zero P0/P1/P2 findings.
@@ -756,28 +837,30 @@ section and in `memory/project_v2_active.md`'s carry-over notes.
 - [ ] Throughput targets met.
 - [ ] Documentation reviewed end-to-end.
 
-### 12.3 Risks
+### 13.3 Risks
 
 - Low by design — this phase is about confidence, not features.
 
-### 12.4 Dependencies
+### 13.4 Dependencies
 
 - All prior phases complete.
 
 ---
 
-## 13. Phase 10: v2.0 release
+## 14. Phase 11: v2.0 release
+
+(was Phase 10 in the prior numbering)
 
 **Scope**: final audit, format freeze, tag, announce.
 
-### 13.1 Deliverables
+### 14.1 Deliverables
 
 - **Final audit**: comprehensive pass across every audit-trigger surface, with findings < P2.
 - **Format freeze**: tag the on-disk format as "v2.0 stable." No further changes to field layouts without feature flags.
 - **Release artifacts**: binaries (stratum, stratum-fuse, stratum-keyagent, stratum-cli), debug packages, source tarball.
 - **Announcement**: blog post, release notes, benchmark summary.
 
-### 13.2 Exit criteria
+### 14.2 Exit criteria
 
 - [ ] Stratum v2.0 tagged in git.
 - [ ] Binaries reproducibly built.
@@ -786,9 +869,9 @@ section and in `memory/project_v2_active.md`'s carry-over notes.
 
 ---
 
-## 14. Post-v2.0 roadmap
+## 15. Post-v2.0 roadmap
 
-### 14.1 v2.1 candidates (6–12 months post-v2.0)
+### 15.1 v2.1 candidates (6–12 months post-v2.0)
 
 - **Reed-Solomon erasure coding** (Phase 5 §8.6 deferral):
   ships as a new `stm_redundancy_profile` variant alongside
@@ -805,7 +888,7 @@ section and in `memory/project_v2_active.md`'s carry-over notes.
 - **Zero-copy receive** (`MSG_ZEROCOPY`, AF_XDP): true zero-copy write path.
 - **Wavelet-tree succinct refinement**: target 5 MiB/TiB allocator RAM (from 25 MiB/TiB at v2.0).
 
-### 14.2 v2.2+ candidates (12–24+ months)
+### 15.2 v2.2+ candidates (12–24+ months)
 
 - **LRC (Local Reconstruction Codes)** (Phase 5 §8.6 deferral):
   layered on top of v2.1 RS. Decode-locality optimization for
@@ -818,7 +901,7 @@ section and in `memory/project_v2_active.md`'s carry-over notes.
 - **Coq / Lean verification** of specific subsystems (allocator data structures).
 - **NFSv4 ACLs** (alternative to POSIX ACLs).
 
-### 14.3 Ruled out
+### 15.3 Ruled out
 
 Per VISION §6 non-goals:
 
@@ -831,9 +914,9 @@ Per VISION §6 non-goals:
 
 ---
 
-## 15. Cross-phase concerns
+## 16. Cross-phase concerns
 
-### 15.1 Git workflow
+### 16.1 Git workflow
 
 - Main branch: `main`, always passes CI.
 - Feature branches: `phase-N-<feature>`.
@@ -841,13 +924,13 @@ Per VISION §6 non-goals:
 - CI required: all tests pass, ASAN/TSAN/UBSAN clean, linter clean.
 - Audit-triggered PRs require additional approval from the audit subagent.
 
-### 15.2 Versioning during development
+### 16.2 Versioning during development
 
 - `main` HEAD: "v2.0-dev".
 - Phase exits tagged: `phase-N-complete`.
 - No API stability promise until v2.0 release.
 
-### 15.3 Telemetry / feedback
+### 16.3 Telemetry / feedback
 
 During the development phases, internal deployments generate telemetry that guides tuning:
 
@@ -855,7 +938,7 @@ During the development phases, internal deployments generate telemetry that guid
 - Collect performance + reliability metrics via `/ctl/`.
 - Feed back into fuzzer corpus + benchmark baselines.
 
-### 15.4 Contributor onboarding
+### 16.4 Contributor onboarding
 
 Expected team size: 3–5 core contributors at v2.0 trajectory. Each phase has a "driver" who owns it; reviewers rotate.
 
@@ -867,7 +950,7 @@ Expected team size: 3–5 core contributors at v2.0 trajectory. Each phase has a
 
 ---
 
-## 16. Risk register
+## 17. Risk register
 
 A consolidated view of risks across phases, ordered by severity.
 
@@ -890,24 +973,25 @@ HIGH-risk items dominate: everything else is bounded by the "fallback is defined
 
 ---
 
-## 17. Timeline
+## 18. Timeline
 
 Estimates are guidance, not commitments. Each phase's duration assumes full-time engineering on the driver role + reasonable reviewer availability.
 
 ```
-Phase 1 ─ Foundations            ~3 months  (months 1-3)
-Phase 2 ─ Tree + concurrency     ~4 months  (months 4-7)      [critical path]
-Phase 3 ─ Persistence            ~3 months  (months 8-10)
-Phase 4 ─ Integrity + crypto     ~3 months  (months 10-13)    [overlap w/ P3 tail]
-Phase 5 ─ Multi-device           ~3 months  (months 14-16)
-Phase 6 ─ Namespaces             ~2 months  (months 15-17)    [overlap w/ P5 tail]
-Phase 7 ─ Cold tier + features   ~3 months  (months 18-20)
-Phase 8 ─ Client interfaces      ~2 months  (months 19-21)    [overlap w/ P7 tail]
-Phase 9 ─ Hardening              ~2 months  (months 22-24)
-Phase 10 ─ v2.0 release          ~1 month   (month 25)
+Phase 1  ─ Foundations            ~3 months  (months 1-3)
+Phase 2  ─ Tree + concurrency     ~4 months  (months 4-7)      [critical path]
+Phase 3  ─ Persistence            ~3 months  (months 8-10)
+Phase 4  ─ Integrity + crypto     ~3 months  (months 10-13)    [overlap w/ P3 tail]
+Phase 5  ─ Multi-device           ~3 months  (months 14-16)
+Phase 6  ─ Namespaces             ~2 months  (months 15-17)    [overlap w/ P5 tail]
+Phase 7  ─ Cold tier + features   ~3 months  (months 18-20)
+Phase 8  ─ POSIX surface          ~3 months  (months 21-23)
+Phase 9  ─ Client interfaces      ~2 months  (months 22-24)    [overlap w/ P8 tail]
+Phase 10 ─ Hardening              ~2 months  (months 25-27)
+Phase 11 ─ v2.0 release           ~1 month   (month 28)
 
-Total (with overlaps)                       ~25 months
-Total (no overlaps, single-thread)          ~28 months
+Total (with overlaps)                        ~28 months
+Total (no overlaps, single-thread)           ~31 months
 ```
 
 Aggressive but bounded for a filesystem of this ambition. For reference:
@@ -915,16 +999,16 @@ Aggressive but bounded for a filesystem of this ambition. For reference:
 - btrfs: ~10 years from inception to stable (2007 → 2017).
 - ZFS: ~5 years from inception to release (2001 → 2005).
 
-Our 25-month target assumes: we're starting from a solid v1 foundation + formal design (Phase 0), adequate staffing, and a well-defined scope. It's ambitious but informed by prior work.
+Our 28-month target assumes: we're starting from a solid v1 foundation + formal design (Phase 0), adequate staffing, and a well-defined scope. It's ambitious but informed by prior work. The 25-month → 28-month bump in 2026-04-30 reflects the Phase 8 (POSIX surface) insertion that the prior 10-phase plan implicitly assumed but had no chunk for; APIs (now Phase 9) and the rest of the chain shift accordingly.
 
 ---
 
-## 18. Summary
+## 19. Summary
 
-Stratum v2 is a 10-phase implementation journey from "design complete" to "v2.0 released":
+Stratum v2 is an 11-phase implementation journey from "design complete" to "v2.0 released":
 
 1. **Phase 0 (DONE)**: design documents — VISION, COMPARISON, NOVEL, ARCHITECTURE, ROADMAP-V2.
-2. **Phases 1-10**: ~25 months to v2.0 release.
+2. **Phases 1-11**: ~28 months to v2.0 release.
 3. **Post-v2.0**: kernel driver, learned tiering, zero-copy, Windows, more.
 
 Key commitments:
