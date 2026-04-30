@@ -85,7 +85,7 @@ Stratum v1 went through 15 rounds of adversarial soundness audits (R0–R14, com
 | Btree node cache | `src/btree/cache.c`, `stm_btree_read_node`, `stm_btree_write_node` | Cache correctness depends on invalidate-on-write + COW-fresh-paddr invariant. Any future path that writes a node without going through `stm_btree_write_node` breaks the contract silently. |
 | Extent write ordering | `src/fs/fs.c::stm_fs_write`, `extent_write_data`, `extent_read_data` | Insert-before-free, ebuf tail-zero, partial-extent old-lookup are all audit-derived |
 | Public API contracts | `include/stratum/fs.h`, `stm_fs_open_ro` vs `stm_fs_open` | RO vs RW contract depends on runtime guards; new accessors can create bypass surfaces |
-| Inode allocator | `src/inode/inode.c`, `include/stratum/inode.h` | (P8-POSIX-1) The (ino, si_gen) tuple-uniqueness-across-time invariant from `inode.tla` underpins stale-fid detection in 9P (ARCH §11.3.2), per-file derived keys (§7.3.3), and NFS file handles. A buggy reuse path that doesn't bump gen exposes confused-deputy attacks. The two `inode_*_buggy.cfg` configs enumerate the failure modes the reviewer must rule out. |
+| Inode allocator | `v2/src/inode/inode.c`, `v2/include/stratum/inode.h` | (P8-POSIX-1; v2-only — no v1 analog) The (ino, si_gen) tuple-uniqueness-across-time invariant from `v2/specs/inode.tla` underpins stale-fid detection in 9P (ARCH §11.3.2), per-file derived keys (§7.3.3), and NFS file handles. A buggy reuse path that doesn't bump gen exposes confused-deputy attacks. The two `inode_*_buggy.cfg` configs enumerate the failure modes the reviewer must rule out. [R69 P3-9: row uses explicit v2/ prefix since this surface only exists in v2.] |
 
 **How to run an audit round:**
 

@@ -161,13 +161,28 @@ void stm_inode_index_close(stm_inode_index *idx);
  * at 0 (caller is expected to stamp them on the next set), data_kind
  * = STM_DATA_INLINE with len=0 (empty inline file).
  *
+ * Reserved sentinel ino values: `0` (caller-rejected at every public
+ * API) and `UINT64_MAX` (saturation guard — when next_ino reaches
+ * UINT64_MAX, alloc returns STM_ENOSPC rather than wrap on the
+ * subsequent bump). Practical ceiling is therefore UINT64_MAX-1
+ * issued inodes per dataset. [R69 P3-1: sentinel previously
+ * undocumented; future callers using UINT64_MAX as a "no inode"
+ * marker now have authoritative coverage.]
+ *
  * MVP — alloc-fresh-only path: `*out_ino = next_ino[dataset_id]++`.
  * `si_gen` = 0. Models inode.tla's AllocFresh action.
  *
  * Refusals:
  *   - NULL idx OR NULL out_ino (STM_EINVAL).
  *   - dataset_id == 0 (STM_EINVAL — root dataset id reserved).
- *   - mode == 0 (STM_EINVAL — file type bits required).
+ *   - mode == 0 (STM_EINVAL — non-zero mode required; full S_IFMT
+ *     file-type validation is the dirent layer's responsibility at
+ *     P8-POSIX-2, since the inode allocator alone cannot distinguish
+ *     a regular-file create from a mkdir from a special-file mknod).
+ *     [R69 P2-1: contract reconciled — impl checks non-zero, this
+ *      docstring previously claimed "file type bits required" which
+ *      didn't match the impl. Until P8-POSIX-2 lands the dirent
+ *      layer, callers asking for an inode are trusted with mode.]
  *   - STM_ENOMEM if records array can't grow.
  */
 STM_MUST_USE
@@ -207,7 +222,11 @@ stm_status stm_inode_lookup(const stm_inode_index *idx,
  * `in_value` MUST have `si_ino` and `si_dataset_id` matching the
  * lookup key; `si_gen` MUST match the record's stored gen (so callers
  * cannot accidentally overwrite the spec's tuple-uniqueness invariant
- * via a buggy gen value).
+ * via a buggy gen value); `si_data_kind` MUST be one of STM_DATA_*.
+ * The 44-byte `si_reserved` region is zeroed on every successful
+ * Set so a future format extension reading those bytes inherits a
+ * defined-zero value rather than caller-controlled noise. [R69 P3-2
+ * + P3-3: reserved-passthrough + data_kind-passthrough hardened.]
  *
  * Refusals:
  *   - NULL idx OR NULL in_value (STM_EINVAL).
@@ -216,6 +235,9 @@ stm_status stm_inode_lookup(const stm_inode_index *idx,
  *   - in_value->si_dataset_id mismatch (STM_EINVAL).
  *   - in_value->si_gen mismatch (STM_EINVAL — protects the tuple
  *     uniqueness invariant from caller error).
+ *   - in_value->si_data_kind not in {STM_DATA_EXTENT, STM_DATA_INLINE,
+ *     STM_DATA_SYMLINK, STM_DATA_DEVICE} (STM_EINVAL — protects
+ *     downstream union readers from undefined kind values).
  *   - No record OR record FREED (STM_ENOENT).
  */
 STM_MUST_USE

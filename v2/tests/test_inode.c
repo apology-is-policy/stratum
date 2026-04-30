@@ -356,6 +356,155 @@ STM_TEST(inode_lookup_arg_validation) {
 /* Struct sanity — the 256-byte invariant from ARCH §11.3.            */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* R69 P3-7: arg validation tests for the remaining mutators.          */
+/* ------------------------------------------------------------------ */
+
+STM_TEST(inode_set_arg_validation) {
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &v));
+
+    STM_ASSERT_ERR(stm_inode_set(NULL, 1, ino, &v),  STM_EINVAL);
+    STM_ASSERT_ERR(stm_inode_set(idx,  1, ino, NULL), STM_EINVAL);
+    STM_ASSERT_ERR(stm_inode_set(idx,  0, ino, &v),  STM_EINVAL);
+    STM_ASSERT_ERR(stm_inode_set(idx,  1, 0,   &v),  STM_EINVAL);
+
+    stm_inode_index_close(idx);
+}
+
+STM_TEST(inode_free_arg_validation) {
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    STM_ASSERT_ERR(stm_inode_free(NULL, 1, 1), STM_EINVAL);
+    STM_ASSERT_ERR(stm_inode_free(idx,  0, 1), STM_EINVAL);
+    STM_ASSERT_ERR(stm_inode_free(idx,  1, 0), STM_EINVAL);
+
+    stm_inode_index_close(idx);
+}
+
+STM_TEST(inode_count_for_ds_arg_validation) {
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    size_t n = 0;
+    STM_ASSERT_ERR(stm_inode_count_for_ds(NULL, 1, &n),   STM_EINVAL);
+    STM_ASSERT_ERR(stm_inode_count_for_ds(idx,  0, &n),   STM_EINVAL);
+    STM_ASSERT_ERR(stm_inode_count_for_ds(idx,  1, NULL), STM_EINVAL);
+
+    stm_inode_index_close(idx);
+}
+
+STM_TEST(inode_next_ino_arg_validation) {
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    uint64_t next = 0;
+    STM_ASSERT_ERR(stm_inode_next_ino(NULL, 1, &next), STM_EINVAL);
+    STM_ASSERT_ERR(stm_inode_next_ino(idx,  0, &next), STM_EINVAL);
+    STM_ASSERT_ERR(stm_inode_next_ino(idx,  1, NULL),  STM_EINVAL);
+
+    stm_inode_index_close(idx);
+}
+
+/* R69 P3-3: stm_inode_set rejects unknown si_data_kind. */
+STM_TEST(inode_set_refuses_unknown_data_kind) {
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
+
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &v));
+
+    /* Try every byte value other than the known {1, 2, 3, 4}. */
+    for (unsigned k = 0; k < 256u; k++) {
+        if (k == STM_DATA_EXTENT || k == STM_DATA_INLINE ||
+            k == STM_DATA_SYMLINK || k == STM_DATA_DEVICE) continue;
+        struct stm_inode_value bad = v;
+        bad.si_data_kind = (uint8_t)k;
+        STM_ASSERT_ERR(stm_inode_set(idx, 1, ino, &bad), STM_EINVAL);
+    }
+
+    stm_inode_index_close(idx);
+}
+
+/* R69 P3-2: stm_inode_set zeroes si_reserved on every successful Set
+ * — protects against caller-controlled bytes leaking into a future
+ * format extension that reads from this region. */
+STM_TEST(inode_set_zeroes_reserved_bytes) {
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
+
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &v));
+
+    /* Caller fills reserved with non-zero noise. */
+    memset(v.si_reserved, 0xCD, sizeof v.si_reserved);
+    STM_ASSERT_OK(stm_inode_set(idx, 1, ino, &v));
+
+    /* Read back: reserved must be zero. */
+    struct stm_inode_value out = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &out));
+    for (size_t i = 0; i < sizeof out.si_reserved; i++) {
+        STM_ASSERT_EQ(out.si_reserved[i], (uint8_t)0);
+    }
+
+    stm_inode_index_close(idx);
+}
+
+/* R69 P3-8: pin the alloc-initial state across all zero-init fields,
+ * not just the ones the prior test hit. Catches a future "helpful"
+ * non-zero initializer regression. */
+STM_TEST(inode_alloc_zero_inits_all_passive_fields) {
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
+
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &v));
+
+    /* Timestamps. */
+    STM_ASSERT_EQ(stm_load_le64(v.si_btime_sec), (uint64_t)0);
+    STM_ASSERT_EQ(stm_load_le32(v.si_btime_nsec), (uint32_t)0);
+    STM_ASSERT_EQ(stm_load_le64(v.si_atime_sec), (uint64_t)0);
+    STM_ASSERT_EQ(stm_load_le32(v.si_atime_nsec), (uint32_t)0);
+    STM_ASSERT_EQ(stm_load_le64(v.si_mtime_sec), (uint64_t)0);
+    STM_ASSERT_EQ(stm_load_le32(v.si_mtime_nsec), (uint32_t)0);
+    STM_ASSERT_EQ(stm_load_le64(v.si_ctime_sec), (uint64_t)0);
+    STM_ASSERT_EQ(stm_load_le32(v.si_ctime_nsec), (uint32_t)0);
+
+    /* Size + flags. */
+    STM_ASSERT_EQ(stm_load_le64(v.si_size), (uint64_t)0);
+    STM_ASSERT_EQ(stm_load_le64(v.si_allocated), (uint64_t)0);
+    STM_ASSERT_EQ(stm_load_le16(v.si_xattr_count), (uint16_t)0);
+    STM_ASSERT_EQ(stm_load_le32(v.si_flags), (uint32_t)0);
+
+    /* Data union — every byte is zero in the inline shape (no inline
+     * data written yet). */
+    for (size_t i = 0; i < STM_INODE_INLINE_MAX; i++) {
+        STM_ASSERT_EQ(v.si_data.inline_data[i], (uint8_t)0);
+    }
+
+    /* Reserved. */
+    for (size_t i = 0; i < sizeof v.si_reserved; i++) {
+        STM_ASSERT_EQ(v.si_reserved[i], (uint8_t)0);
+    }
+
+    stm_inode_index_close(idx);
+}
+
 STM_TEST(inode_struct_size_is_256_bytes) {
     /* Compile-time _Static_assert in the header already enforces this;
      * the runtime check pins it as a regression test if the static

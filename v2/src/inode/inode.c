@@ -117,13 +117,23 @@ static const stm_inode_dsstate *find_dsstate_c(const stm_inode_index *idx,
 }
 
 /* Return the dsstate slot for `dataset_id`, allocating a fresh entry
- * with next_ino=1 if absent. Returns NULL only on STM_ENOMEM. */
+ * with next_ino=1 if absent. Returns NULL only on STM_ENOMEM.
+ *
+ * realloc is called under idx->lock (see top-of-file lock posture
+ * note). For the in-memory MVP this is the only allocator-blocking
+ * call inside the critical section and growth is amortized O(1)
+ * per alloc; a future hash-indexed implementation should reconsider
+ * if profiling surfaces lock-hold variance. R69 P3-4 forward-noted
+ * + acknowledged. */
 static stm_inode_dsstate *get_or_create_dsstate(stm_inode_index *idx,
                                                      uint64_t dataset_id) {
     stm_inode_dsstate *s = find_dsstate(idx, dataset_id);
     if (s) return s;
 
     if (idx->n_datasets == idx->cap_datasets) {
+        /* R69 P3-5: cap-doubling overflow guard. SIZE_MAX/2 is the
+         * theoretical ceiling; refuse rather than wrap. */
+        if (idx->cap_datasets > SIZE_MAX / 2u) return NULL;
         size_t new_cap = idx->cap_datasets ? idx->cap_datasets * 2u : 4u;
         stm_inode_dsstate *new_arr =
                 realloc(idx->dsstate, new_cap * sizeof *new_arr);
@@ -137,9 +147,12 @@ static stm_inode_dsstate *get_or_create_dsstate(stm_inode_index *idx,
     return s;
 }
 
-/* Append a fresh record. Returns NULL only on STM_ENOMEM. */
+/* Append a fresh record. Returns NULL only on STM_ENOMEM.
+ * R69 P3-4 + P3-5: realloc-under-lock acknowledged; cap doubling
+ * has the same overflow guard as get_or_create_dsstate. */
 static stm_inode_record *append_record(stm_inode_index *idx) {
     if (idx->n_records == idx->cap_records) {
+        if (idx->cap_records > SIZE_MAX / 2u) return NULL;
         size_t new_cap = idx->cap_records ? idx->cap_records * 2u : 8u;
         stm_inode_record *new_arr =
                 realloc(idx->records, new_cap * sizeof *new_arr);
@@ -165,8 +178,16 @@ stm_inode_index *stm_inode_index_create(void) {
         free(idx);
         return NULL;
     }
-    /* ERRORCHECK: surface lock-misuse as abort, not silent UB. */
-    (void)pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK);
+    /* ERRORCHECK: surface lock-misuse as abort, not silent UB.
+     * R69 P3-6: settype's failure mode is essentially "platform
+     * doesn't support ERRORCHECK", which we'd want to know about
+     * rather than silently fall back to PTHREAD_MUTEX_DEFAULT.
+     * Treat settype failure as init failure. */
+    if (pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK) != 0) {
+        pthread_mutexattr_destroy(&attr);
+        free(idx);
+        return NULL;
+    }
     int rc = pthread_mutex_init(&idx->lock, &attr);
     pthread_mutexattr_destroy(&attr);
     if (rc != 0) {
@@ -307,7 +328,28 @@ stm_status stm_inode_set(stm_inode_index *idx, uint64_t dataset_id,
         must_unlock(idx_lock(idx));
         return STM_EINVAL;
     }
+    /* R69 P3-3: reject unknown si_data_kind. Without this gate,
+     * future readers of the union (P8-POSIX-2 dirent + downstream)
+     * have to defensively validate every byte; closer to the source
+     * is better. The four known variants exhaust the design from
+     * ARCH §11.3.1. */
+    switch (in_value->si_data_kind) {
+        case STM_DATA_EXTENT:
+        case STM_DATA_INLINE:
+        case STM_DATA_SYMLINK:
+        case STM_DATA_DEVICE:
+            break;
+        default:
+            must_unlock(idx_lock(idx));
+            return STM_EINVAL;
+    }
     r->value = *in_value;
+    /* R69 P3-2: zero `si_reserved` on every Set so future format
+     * extensions reading these bytes don't inherit caller-controlled
+     * noise. Defense-in-depth ahead of P8-POSIX-1b's persistence
+     * landing — once these bytes hit disk, leakage becomes a
+     * forward-compat hazard. */
+    memset(r->value.si_reserved, 0, sizeof r->value.si_reserved);
 
     must_unlock(idx_lock(idx));
     return STM_OK;
