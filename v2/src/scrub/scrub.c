@@ -43,6 +43,8 @@
 #include <stratum/sync.h>
 
 #include <pthread.h>
+#include <stdatomic.h>     /* P7-CAS-15 sticky completion-signal bit */
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -77,6 +79,28 @@ struct stm_scrub {
      * scrub.h "Borrowed references". */
     stm_scrub_verify_cb verify_cb;
     void               *verify_ctx;
+
+    /* P7-CAS-15: sticky completion-signal bit. Set to true atomically
+     * by `stm_scrub_step` on the RUNNING→COMPLETED transition (the
+     * only path in this state machine that produces a fresh
+     * completion). Read+cleared atomically by
+     * `stm_scrub_consume_completion_signal` — orchestrators
+     * (notably `stm_sync_scrub_step_with_cas_gc`) consume the bit to
+     * detect a transition that happened during the most-recent step,
+     * even if a concurrent `stm_scrub_reset` or `stm_scrub_start`
+     * mutated the visible state between the step return and the
+     * consume call. start/pause/resume/reset deliberately DO NOT
+     * touch this bit — preserving an unconsumed completion across a
+     * concurrent reset is the whole point of the sticky design.
+     *
+     * The bit is _Atomic bool so the consumer can read without
+     * holding sc->lock (the wrapper at sync.c:7469 calls consume on
+     * a different thread than the one that called step under
+     * sc->lock; relaxed atomic semantics suffice because the bit's
+     * monotonic per-step set + consume's atomic exchange guarantee
+     * "consume returns true at-least-once per step that transitioned
+     * to COMPLETED." Closes R57 P3-1+P3-2 forward-noted edge case. */
+    _Atomic bool pending_completion_signal;
 };
 
 /* Zero cursor + counters. Used by Start, Restart, Reset.
@@ -277,6 +301,22 @@ stm_status stm_scrub_status_get(const stm_scrub *sc, stm_scrub_status *out)
     return STM_OK;
 }
 
+bool stm_scrub_consume_completion_signal(stm_scrub *sc)
+{
+    if (!sc) return false;
+    /* Atomic exchange: returns the prior value, atomically clears
+     * the bit. Race-tolerant by construction: if step is running
+     * concurrently and sets the bit AFTER our exchange, the bit
+     * stays true and the next consume picks it up. If step sets
+     * BEFORE our exchange, we observe true and clear. The bit's
+     * monotonic per-step set + at-least-once-per-set consume
+     * guarantee is what makes the orchestrator wrapper robust to
+     * concurrent reset/start mutating the visible state. */
+    return atomic_exchange_explicit(&sc->pending_completion_signal,
+                                       false,
+                                       memory_order_relaxed);
+}
+
 stm_status stm_scrub_set_verify_cb(stm_scrub          *sc,
                                      stm_scrub_verify_cb cb,
                                      void               *ctx)
@@ -455,6 +495,16 @@ stm_status stm_scrub_step(stm_scrub *sc)
             /* Cursor drained — Complete. (scrub.tla: Complete action.) */
             stm_pool_unlock_shared(sc->pool);
             sc->state = STM_SCRUB_STATE_COMPLETED;
+            /* P7-CAS-15: set the sticky completion-signal bit so a
+             * concurrent stm_scrub_reset / stm_scrub_start by another
+             * thread can't hide this transition from
+             * stm_scrub_consume_completion_signal. The bit is
+             * _Atomic; relaxed ordering is sufficient because the
+             * pthread_mutex_unlock below provides release semantics
+             * — the consumer's mutex acquisition (or its atomic
+             * exchange) synchronizes-with this store. */
+            atomic_store_explicit(&sc->pending_completion_signal,
+                                     true, memory_order_relaxed);
             scrub_push_durable_locked(sc);
             pthread_mutex_unlock(&sc->lock);
             return STM_OK;

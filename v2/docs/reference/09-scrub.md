@@ -140,6 +140,12 @@ stm_status stm_scrub_reset   (stm_scrub *sc);    // COMPLETED → IDLE
 stm_status stm_scrub_step    (stm_scrub *sc);     // process one range
 stm_status stm_scrub_status_get(const stm_scrub *sc, stm_scrub_status *out);
 
+/* P7-CAS-15: sticky completion-signal bit. set on RUNNING→COMPLETED
+ * by step; consume reads + atomically clears. start/pause/resume/
+ * reset don't touch it (preserves unconsumed completions across
+ * concurrent state mutations). */
+bool stm_scrub_consume_completion_signal(stm_scrub *sc);
+
 /* β: install (or clear with cb=NULL,ctx=NULL) the verify-callback. */
 stm_status stm_scrub_set_verify_cb(stm_scrub          *sc,
                                      stm_scrub_verify_cb cb,

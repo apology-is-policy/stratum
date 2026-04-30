@@ -56,9 +56,29 @@ into the CAS tier (which DOES need P6) is a separate concern.
 
 ## Phase 7 status (overall)
 
+- [x] **P7-CAS-15 scrub-c sticky completion signal** —
+      substantive `<P7CAS15_SUBSTANTIVE>` + R66 close
+      `<P7CAS15_RCLOSE>` + hash-fixup (this commit). Closes R57
+      P3-1+P3-2 forward-noted shared-sc orchestration race. Adds
+      `_Atomic bool pending_completion_signal` on `stm_scrub` set
+      by step at the cursor-drained transition; new public API
+      `stm_scrub_consume_completion_signal` atomically reads +
+      clears. start/pause/resume/reset deliberately don't touch
+      the bit — preserving unconsumed completions across
+      concurrent state mutations is the whole point. Wrapper
+      `stm_sync_scrub_step_with_cas_gc` rewrites its transition
+      detection from before/after status comparison to
+      consume()-based; race-free with concurrent reset/start. No
+      format break — STM_UB_VERSION = 22 preserved. No spec
+      extension (sticky bit is an orthogonal eventually-
+      consistent signal; scrub.tla state machine unchanged).
+      test_scrub 34 → 39 (5 P7-CAS-15 tests covering initial-
+      clear, set-on-transition, survives-reset,
+      survives-start, NULL-defensive).
+
 - [x] **P7-CAS-14 per-COLD-read property cache** —
       substantive `5ed1390` + R65 close
-      `f81dbb1` + hash-fixup (this commit). Closes R63
+      `f81dbb1` + hash-fixup `baf91f5`. Closes R63
       P3-2 forward-noted micro-opt. Adds an
       `_Atomic uint64_t prop_mutation_gen` to `stm_dataset_index`
       (bumped on every successful `set_property` /

@@ -1969,4 +1969,166 @@ STM_TEST(scrub_p7_6_read_path_falls_back_to_healthy_replica) {
     mirror2_extent_teardown(&fx);
 }
 
+/* ========================================================================= */
+/* P7-CAS-15: sticky completion-signal bit.                                   */
+/* ========================================================================= */
+
+STM_TEST(scrub_completion_signal_initially_clear) {
+    make_path("p7cas15_init");
+    stm_bdev *bd = open_device();
+    stm_pool *pool = make_single_pool(bd, DEVICE_UUID);
+    stm_alloc *a = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bd, POOL_UUID, DEVICE_UUID,
+                                     TEST_BOOTSTRAP_BYTES, &a));
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), NULL, &s));
+
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(s, &sc));
+    /* Fresh handle: bit is clear (calloc-initialized to 0). */
+    STM_ASSERT_EQ((int)stm_scrub_consume_completion_signal(sc), 0);
+    /* Idempotent: second consume still false. */
+    STM_ASSERT_EQ((int)stm_scrub_consume_completion_signal(sc), 0);
+
+    stm_scrub_close(sc);
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(pool);
+    stm_bdev_close(bd);
+    unlink(g_path);
+}
+
+STM_TEST(scrub_completion_signal_set_on_running_to_completed) {
+    /* Drive a fresh scrub from IDLE through start → step (cursor
+     * drains immediately on an empty pool) → COMPLETED. The
+     * sticky bit must be set; consume returns true once and clears. */
+    make_path("p7cas15_set");
+    stm_bdev *bd = open_device();
+    stm_pool *pool = make_single_pool(bd, DEVICE_UUID);
+    stm_alloc *a = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bd, POOL_UUID, DEVICE_UUID,
+                                     TEST_BOOTSTRAP_BYTES, &a));
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), NULL, &s));
+
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(s, &sc));
+
+    STM_ASSERT_OK(stm_scrub_start(sc));
+    /* Empty pool — first step should reach COMPLETED. */
+    for (int i = 0; i < 64; i++) {
+        STM_ASSERT_OK(stm_scrub_step(sc));
+        stm_scrub_status st;
+        STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
+        if (st.state == STM_SCRUB_STATE_COMPLETED) break;
+    }
+    stm_scrub_status st;
+    STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
+    STM_ASSERT_EQ((int)st.state, (int)STM_SCRUB_STATE_COMPLETED);
+
+    /* Sticky bit set; first consume returns true. */
+    STM_ASSERT_EQ((int)stm_scrub_consume_completion_signal(sc), 1);
+    /* Cleared by exchange; second consume returns false. */
+    STM_ASSERT_EQ((int)stm_scrub_consume_completion_signal(sc), 0);
+
+    stm_scrub_close(sc);
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(pool);
+    stm_bdev_close(bd);
+    unlink(g_path);
+}
+
+STM_TEST(scrub_completion_signal_survives_concurrent_reset) {
+    /* The race the sticky bit closes (R57 P3-1+P3-2): a step
+     * transitions to COMPLETED, but a concurrent reset / start by
+     * another thread mutates the visible state before the
+     * orchestrator's status read. With sticky semantics, the bit
+     * is set BEFORE the reset and survives the reset (reset
+     * deliberately does NOT touch the bit). The next consume picks
+     * up the transition. */
+    make_path("p7cas15_reset");
+    stm_bdev *bd = open_device();
+    stm_pool *pool = make_single_pool(bd, DEVICE_UUID);
+    stm_alloc *a = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bd, POOL_UUID, DEVICE_UUID,
+                                     TEST_BOOTSTRAP_BYTES, &a));
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), NULL, &s));
+
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(s, &sc));
+    STM_ASSERT_OK(stm_scrub_start(sc));
+    for (int i = 0; i < 64; i++) {
+        STM_ASSERT_OK(stm_scrub_step(sc));
+        stm_scrub_status st;
+        STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
+        if (st.state == STM_SCRUB_STATE_COMPLETED) break;
+    }
+
+    /* Sticky bit is set. Now reset to IDLE — bit must survive. */
+    STM_ASSERT_OK(stm_scrub_reset(sc));
+    stm_scrub_status st;
+    STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
+    STM_ASSERT_EQ((int)st.state, (int)STM_SCRUB_STATE_IDLE);
+
+    /* Consume after reset still returns true — the unconsumed
+     * completion is preserved. */
+    STM_ASSERT_EQ((int)stm_scrub_consume_completion_signal(sc), 1);
+    STM_ASSERT_EQ((int)stm_scrub_consume_completion_signal(sc), 0);
+
+    stm_scrub_close(sc);
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(pool);
+    stm_bdev_close(bd);
+    unlink(g_path);
+}
+
+STM_TEST(scrub_completion_signal_survives_concurrent_start) {
+    /* Symmetric to the reset test: a concurrent start (re-running
+     * the scrub from COMPLETED) also preserves the unconsumed
+     * completion. */
+    make_path("p7cas15_start");
+    stm_bdev *bd = open_device();
+    stm_pool *pool = make_single_pool(bd, DEVICE_UUID);
+    stm_alloc *a = NULL;
+    STM_ASSERT_OK(stm_alloc_create(bd, POOL_UUID, DEVICE_UUID,
+                                     TEST_BOOTSTRAP_BYTES, &a));
+    stm_sync *s = NULL;
+    STM_ASSERT_OK(stm_sync_create(pool, a, make_wk(), NULL, &s));
+
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(s, &sc));
+    STM_ASSERT_OK(stm_scrub_start(sc));
+    for (int i = 0; i < 64; i++) {
+        STM_ASSERT_OK(stm_scrub_step(sc));
+        stm_scrub_status st;
+        STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
+        if (st.state == STM_SCRUB_STATE_COMPLETED) break;
+    }
+
+    /* COMPLETED → start → RUNNING. Bit must survive. */
+    STM_ASSERT_OK(stm_scrub_start(sc));
+    stm_scrub_status st;
+    STM_ASSERT_OK(stm_scrub_status_get(sc, &st));
+    STM_ASSERT_EQ((int)st.state, (int)STM_SCRUB_STATE_RUNNING);
+
+    STM_ASSERT_EQ((int)stm_scrub_consume_completion_signal(sc), 1);
+    STM_ASSERT_EQ((int)stm_scrub_consume_completion_signal(sc), 0);
+
+    stm_scrub_close(sc);
+    stm_sync_close(s);
+    stm_alloc_close(a);
+    stm_pool_close(pool);
+    stm_bdev_close(bd);
+    unlink(g_path);
+}
+
+STM_TEST(scrub_completion_signal_null_returns_false) {
+    /* Defensive: NULL sc returns false (matches the documented
+     * defensive contract). */
+    STM_ASSERT_EQ((int)stm_scrub_consume_completion_signal(NULL), 0);
+}
+
 STM_TEST_MAIN("scrub")

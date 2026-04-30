@@ -38,8 +38,33 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R65-hash-fixup. Substantive `5ed1390` +
-  R65 close `f81dbb1`.
+- **Tip**: post-R66-hash-fixup. Substantive `<P7CAS15_SUBSTANTIVE>` +
+  R66 close `<P7CAS15_RCLOSE>`.
+  **P7-CAS-15 — scrub-c sticky completion signal. Closes R57
+  P3-1+P3-2 forward-noted shared-sc orchestration race. Adds an
+  `_Atomic bool pending_completion_signal` to `stm_scrub`, set by
+  `stm_scrub_step` at the cursor-drained transition (the only
+  path that produces a fresh COMPLETED), atomically read +
+  cleared by new public API `stm_scrub_consume_completion_signal`.
+  start/pause/resume/reset deliberately do NOT touch the bit —
+  preserving an unconsumed completion across a concurrent
+  reset/start is the whole point. The wrapper
+  `stm_sync_scrub_step_with_cas_gc` rewrites its transition
+  detection to use consume() instead of the prior before/after
+  status_get comparison; consume's atomic exchange is race-free
+  with concurrent state mutations. Sync.h doc updated to remove
+  the single-driver caveat. property.tla / cas.tla / scrub.tla
+  unchanged (no new state-machine semantics; the sticky bit is
+  an orthogonal eventually-consistent signal). **No spec
+  extension required.** No format break — STM_UB_VERSION = 22
+  preserved (the new bit is RAM-only). test_scrub 34 → 39 (+5
+  P7-CAS-15 tests: initial-clear, set-on-RUNNING-to-COMPLETED,
+  survives-concurrent-reset, survives-concurrent-start,
+  NULL-returns-false). 35 ctest suites green default + ASan +
+  TSan in isolation. Spec posture unchanged: 21 modules / 25
+  fixed cfgs / 34 buggy cfgs.**
+  Prior P7-CAS-14 substantive `5ed1390` + R65 close `f81dbb1` +
+  hash fixup `baf91f5`.
   **P7-CAS-14 — per-COLD-read property cache. Closes R63 P3-2
   forward-noted micro-opt by adding a per-sync cache of the
   effective `STM_PROP_PROMOTE_DECAY_WINDOW` keyed by dataset_id.

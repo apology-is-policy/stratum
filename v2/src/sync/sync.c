@@ -7477,23 +7477,25 @@ stm_status stm_sync_scrub_step_with_cas_gc(stm_sync *s, stm_scrub *sc,
     if (out_cas_gc_err) *out_cas_gc_err = STM_OK;
     if (!s || !sc) return STM_EINVAL;
 
-    stm_scrub_status before = {0};
-    stm_status sb = stm_scrub_status_get(sc, &before);
-    if (sb != STM_OK) return sb;
-
     stm_status step_err = stm_scrub_step(sc);
     if (step_err != STM_OK) return step_err;
 
-    stm_scrub_status after = {0};
-    stm_status sa = stm_scrub_status_get(sc, &after);
-    if (sa != STM_OK) return sa;
-
-    /* Fire the sweep on the RUNNING→COMPLETED transition. Other
-     * transitions (RUNNING→RUNNING, RUNNING→PAUSED, IDLE→IDLE,
-     * COMPLETED→COMPLETED) skip the sweep — the wrapper is a no-
-     * orchestration-overhead passthrough for those cases. */
-    if (before.state == STM_SCRUB_STATE_RUNNING &&
-        after.state == STM_SCRUB_STATE_COMPLETED) {
+    /* P7-CAS-15: consume the sticky completion-signal bit.
+     * `stm_scrub_step` sets the bit on the RUNNING→COMPLETED
+     * transition; consume reads + atomically clears. A concurrent
+     * `stm_scrub_reset` / `stm_scrub_start` between step return and
+     * consume CAN'T hide the transition because reset/start don't
+     * touch the bit. This closes R57 P3-1+P3-2 forward-noted single-
+     * driver assumption — orchestrators sharing `sc` across threads
+     * are now safe.
+     *
+     * Note: replaces the prior before/after status_get pattern,
+     * which was vulnerable to the race the sticky-bit fix closes.
+     * The state-machine logic moved into stm_scrub_step itself
+     * (the only path that can produce a transition is at the
+     * cursor-drained branch; setting the sticky bit there is
+     * race-free under sc->lock). */
+    if (stm_scrub_consume_completion_signal(sc)) {
         stm_status cas_err = stm_sync_cas_gc_sweep(s);
         if (out_cas_gc_err) *out_cas_gc_err = cas_err;
     }

@@ -959,20 +959,19 @@ typedef struct stm_scrub stm_scrub;
  * `pool.rdlock + sync.lock`. All released between calls — no
  * lock-graph cycle.
  *
- * **Single-driver assumption (R57 P3-1 + P3-2)**: this wrapper
- * assumes the orchestrator is the sole caller of
- * `stm_scrub_start` / `stm_scrub_pause` / `stm_scrub_reset` on
- * `sc` for the lifetime of the scrub run. A concurrent
- * `stm_scrub_reset` or `stm_scrub_start` between the wrapper's
- * `stm_scrub_step` return and the post-status read can shift
- * the observed state to IDLE / RUNNING respectively, missing
- * the RUNNING→COMPLETED transition the wrapper relies on. The
- * miss is idempotent — the next `stm_sync_commit`'s in-commit
- * sweep reclaims the same refcount=0 entries — but the cadence
- * benefit of scrub-driven sweeping is lost for that pass. If
- * shared-sc orchestration is needed, a sticky completion-signal
- * mechanism on the scrub side would be the principled fix
- * (deferred).
+ * **Concurrency posture (R57 P3-1+P3-2 closed by P7-CAS-15)**:
+ * the wrapper is robust to concurrent `stm_scrub_start` /
+ * `stm_scrub_pause` / `stm_scrub_reset` calls on `sc` from other
+ * threads. The transition detection uses the sticky completion-
+ * signal bit (`stm_scrub_consume_completion_signal`): the bit is
+ * set by `stm_scrub_step` at the cursor-drained transition under
+ * `sc->lock`, and start/pause/resume/reset deliberately do not
+ * touch it. The wrapper's consume call atomically reads + clears
+ * the bit, so a transition during step-N's invocation always
+ * fires the sweep on the immediately-following consume regardless
+ * of intervening state mutations. The pre-P7-CAS-15 wrapper used
+ * a before/after status_get comparison which was vulnerable to
+ * the race the sticky bit closes.
  *
  * Returns:
  *   STM_OK     — step ran (possibly with sweep also firing); check

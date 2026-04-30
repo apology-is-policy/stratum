@@ -336,6 +336,42 @@ STM_MUST_USE
 stm_status stm_scrub_status_get(const stm_scrub *sc, stm_scrub_status *out);
 
 /*
+ * P7-CAS-15: consume the sticky completion-signal bit.
+ *
+ * The bit is set to true (under sc->lock) by `stm_scrub_step` on the
+ * RUNNING→COMPLETED transition — the only path in the scrub state
+ * machine that produces a fresh completion. This API atomically
+ * reads the bit and clears it, returning the prior value:
+ *   - true  → a step transitioned to COMPLETED since the last
+ *             consume call. Caller should fire whatever
+ *             completion-cadence work is gated on detecting the
+ *             transition (notably, the CAS-GC sweep wired into
+ *             `stm_sync_scrub_step_with_cas_gc`).
+ *   - false → no completion since the last consume. Caller skips
+ *             the gated work.
+ *
+ * The bit is `_Atomic bool`; this API uses atomic_exchange with
+ * relaxed ordering. Race posture: `start` / `pause` / `resume` /
+ * `reset` deliberately do NOT touch the bit, so a concurrent
+ * `reset` immediately after a `step`-driven completion does NOT
+ * hide the transition from a subsequent consume. This is the
+ * sticky-signal mechanism R57's single-driver-assumption forward-
+ * note flagged as the principled fix for shared-sc orchestration.
+ *
+ * Returns false on NULL sc (defensive — never reachable from the
+ * wrapper, which validates sc up front).
+ *
+ * Note: the bit's monotonic semantics permit at-most-one consume
+ * per step that transitioned. Multiple completed runs (Start →
+ * Step→COMPLETED → Reset → Start → Step→COMPLETED) WITHOUT an
+ * intervening consume coalesce to a single true return — the
+ * downstream sweep is idempotent so this is harmless. Callers
+ * that need to count completions individually should call consume
+ * after each step.
+ */
+bool stm_scrub_consume_completion_signal(stm_scrub *sc);
+
+/*
  * Install (or clear) the β verify-callback. Pass cb=NULL, ctx=NULL to
  * clear and revert to α-fallback behavior. ctx is borrowed; caller
  * must keep it valid for the cb's lifetime — see the file header
