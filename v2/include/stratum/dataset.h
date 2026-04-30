@@ -599,6 +599,29 @@ STM_MUST_USE
 stm_status stm_dataset_index_get_next_id(const stm_dataset_index *idx,
                                             uint64_t *out_next_id);
 
+/*
+ * P7-CAS-14: read the property-mutation gen counter.
+ *
+ * The counter monotonically increases with every successful
+ * `stm_dataset_set_property`, `stm_dataset_clear_property`,
+ * `stm_dataset_set_pool_default`, and `stm_dataset_move` call.
+ * Consumers (notably the sync layer's per-COLD-read property cache)
+ * read it WITHOUT holding the dataset_idx mutex to detect when their
+ * cached effective values are stale.
+ *
+ * The counter is _Atomic uint64_t internally; this accessor reads
+ * with relaxed memory ordering since the cache is best-effort and
+ * race-tolerant — a stale window value yields a stale heuristic
+ * decision, never a soundness violation.
+ *
+ * Returns 0 on NULL idx (defensive — the value is never observable
+ * via the public API on a NULL handle anyway). UINT64_MAX wrap is
+ * defined-and-harmless: the cache compares for equality, not
+ * inequality.
+ */
+uint64_t stm_dataset_index_property_mutation_gen(
+        const stm_dataset_index *idx);
+
 #ifdef __cplusplus
 }
 #endif

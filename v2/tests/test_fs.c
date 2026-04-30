@@ -6335,4 +6335,171 @@ STM_TEST(fs_p7cas13_persists_through_commit_and_remount) {
     unlink(g_key_path);
 }
 
+/* ====================================================================== */
+/* P7-CAS-14: per-COLD-read property cache.                                */
+/* ====================================================================== */
+
+STM_TEST(fs_p7cas14_cache_invalidates_on_property_change) {
+    /* Validates that the per-sync cache picks up a property change
+     * BETWEEN reads. Without invalidation the cache would serve the
+     * stale window value and the counter would behave per the OLD
+     * window. The test sets window=10 first, drives a few reads to
+     * populate the cache, then changes window=1 and confirms the
+     * NEW window takes effect on the next read. */
+    make_tmp("p7cas14_invalidate");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* window=10 — wide enough that 2 commits between reads stays
+     * inside the window (counter accumulates). */
+    STM_ASSERT_OK(stm_fs_set_dataset_property(
+            fs, /*root*/1, STM_PROP_PROMOTE_DECAY_WINDOW, 10u));
+
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++)
+        plain[i] = (uint8_t)((i * 17u + 5u) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    uint8_t buf[4096];
+    size_t got = 0;
+    /* Read 1 — counter=1 (sentinel reset path). Cache populates
+     * with window=10. */
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, buf, sizeof buf, &got));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    /* Read 2 — gap=2 ≤ 10 → counter=2 (cache hit on window=10). */
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, buf, sizeof buf, &got));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record rec;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &rec));
+    STM_ASSERT_EQ((unsigned)rec.read_count, 2u);
+
+    /* Now change window=1. Cache MUST invalidate before next read. */
+    STM_ASSERT_OK(stm_fs_set_dataset_property(
+            fs, 1, STM_PROP_PROMOTE_DECAY_WINDOW, 1u));
+
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    /* Read 3 — gap=2 > 1 (NEW window) → counter resets to 1. If the
+     * cache stale-served window=10, gap=2 ≤ 10 → counter=3. */
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, buf, sizeof buf, &got));
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &rec));
+    STM_ASSERT_EQ((unsigned)rec.read_count, 1u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas14_cache_invalidates_on_clear_property) {
+    /* Symmetric test for clear_property: set window=1 locally,
+     * populate cache, clear → cache invalidates → effective falls
+     * back to pool default (= 0 → compile-time default 1024). */
+    make_tmp("p7cas14_clear");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    STM_ASSERT_OK(stm_fs_set_dataset_property(
+            fs, /*root*/1, STM_PROP_PROMOTE_DECAY_WINDOW, 1u));
+
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++)
+        plain[i] = (uint8_t)((i * 19u + 3u) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    uint8_t buf[4096];
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, buf, sizeof buf, &got));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    /* Read 2 with window=1: gap=2 > 1 → counter reset to 1. Cache
+     * still has window=1. */
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, buf, sizeof buf, &got));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record rec;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &rec));
+    STM_ASSERT_EQ((unsigned)rec.read_count, 1u);
+
+    /* Clear local window. Cache MUST invalidate. Effective → default 1024. */
+    STM_ASSERT_OK(stm_fs_clear_dataset_property(
+            fs, 1, STM_PROP_PROMOTE_DECAY_WINDOW));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    /* Read 3 with window=1024 (default): gap=2 ≤ 1024 → counter=2.
+     * Stale cache would still see window=1 and reset to 1. */
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, buf, sizeof buf, &got));
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &rec));
+    STM_ASSERT_EQ((unsigned)rec.read_count, 2u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7cas14_cache_invalidates_on_pool_default_change) {
+    /* set_pool_default also bumps the gen → cache invalidates.
+     * Test: pool default 1024, root has no local override. Read →
+     * cache populates (effective=0 from local check; but the cache
+     * stores the LOCAL effective value, which is 0 → fold to default
+     * at consumer). Counter accumulates with default=1024. Now bump
+     * pool default to 1 — gen bumps → cache invalidates. Next read
+     * uses NEW window=1. */
+    make_tmp("p7cas14_pool");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* No local set; pool default starts at 0 → effective 0 → use
+     * compile-time default (1024). */
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++)
+        plain[i] = (uint8_t)((i * 23u + 11u) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, 1, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    uint8_t buf[4096];
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, buf, sizeof buf, &got));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, buf, sizeof buf, &got));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record rec;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &rec));
+    /* gap=2 ≤ 1024 → counter=2. */
+    STM_ASSERT_EQ((unsigned)rec.read_count, 2u);
+
+    /* Change pool default to 1. gen bumps; cache invalidates. */
+    STM_ASSERT_OK(stm_fs_set_dataset_pool_default(
+            fs, STM_PROP_PROMOTE_DECAY_WINDOW, 1u));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    /* Read 3 with window=1 (from pool default): gap=2 > 1 → reset
+     * to 1. Stale cache would still see window=1024 and accumulate
+     * to 3. */
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, buf, sizeof buf, &got));
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &rec));
+    STM_ASSERT_EQ((unsigned)rec.read_count, 1u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")

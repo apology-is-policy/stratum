@@ -56,9 +56,33 @@ into the CAS tier (which DOES need P6) is a separate concern.
 
 ## Phase 7 status (overall)
 
+- [x] **P7-CAS-14 per-COLD-read property cache** —
+      substantive `<P7CAS14_SUBSTANTIVE>` + R65 close
+      `<P7CAS14_RCLOSE>` + hash-fixup (this commit). Closes R63
+      P3-2 forward-noted micro-opt. Adds an
+      `_Atomic uint64_t prop_mutation_gen` to `stm_dataset_index`
+      (bumped on every successful `set_property` /
+      `clear_property` / `set_pool_default` / `move`) and a
+      per-sync cache (`STM_SYNC_PROMOTE_CACHE_CAP = 64` entries)
+      stamped with the gen at fill time. The bump call site at
+      `stm_sync_read_extent_locked`'s COLD branch reads the
+      atomic gen (no lock), invalidates the cache en masse on
+      mismatch, linear-scans for the dataset_id on hit, and falls
+      back to `stm_dataset_effective_property` on miss. Eviction:
+      refuse-new-on-full. New public accessor
+      `stm_dataset_index_property_mutation_gen` (relaxed atomic
+      load). Cache + bump documented best-effort + race-tolerant
+      per R62 + R63; a stale window value yields a stale
+      heuristic decision, not a soundness violation. No format
+      break — STM_UB_VERSION = 22 preserved. No spec extension
+      (composition over property.tla; cas.tla unchanged because
+      heuristic state isn't load-bearing). test_dataset 61 → 62
+      (+1 gen-counter test). test_fs 146 → 149 (+3 cache-
+      invalidation tests).
+
 - [x] **P7-CAS-13 fs-level dataset property wrappers** —
       substantive `2de9a49` + R64 close
-      `e3655ac` + hash-fixup (this commit). Closes
+      `e3655ac` + hash-fixup `dc55f6f`. Closes
       R63 P3-4 forward-noted ergonomic gap by adding production-
       shape public APIs: `stm_fs_set_dataset_property`,
       `stm_fs_clear_dataset_property`,

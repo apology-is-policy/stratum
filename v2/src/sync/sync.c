@@ -111,6 +111,14 @@ static void build_wrap_ad(const uint64_t pool_uuid[2],
 _Static_assert(STM_SYNC_WRAPPED_KEY_LEN <= STM_KEYSCHEMA_WRAPPED_MAX,
                "wrapped pool key must fit a keyschema entry");
 
+/* P7-CAS-14: capacity of the per-sync property cache. The cache is a
+ * fixed-size array of (dataset_id, decay_window) pairs; the
+ * (cap+1)th distinct dataset on a hot-COLD-read pool will fall back
+ * to the uncached path. Sized to comfortably cover typical pools
+ * (dozens of datasets). Larger pools degrade gracefully — correctness
+ * preserved, perf identical to pre-cache for the overflow set. */
+#define STM_SYNC_PROMOTE_CACHE_CAP   64u
+
 struct stm_sync {
     pthread_mutex_t lock;
 
@@ -273,6 +281,37 @@ struct stm_sync {
      * (stateless transformation: same plaintext + same params → same
      * boundaries). */
     stm_cdc            cdc;
+
+    /* P7-CAS-14: per-COLD-read property cache. Caches the effective
+     * `STM_PROP_PROMOTE_DECAY_WINDOW` value resolved at the bump call
+     * site (`stm_sync_read_extent_locked`'s COLD branch) so the
+     * dataset_idx parent-chain walk runs once per distinct dataset
+     * rather than per-read. Closes R63 P3-2 forward-noted micro-opt.
+     *
+     * Lifecycle: lives entirely under sync->lock — populated /
+     * consulted at the bump site; invalidated lazily when the
+     * dataset_idx's `prop_mutation_gen` advances past the
+     * cache-stamped value. Eviction policy: refuse-new-on-full
+     * (cap = STM_SYNC_PROMOTE_CACHE_CAP); the (cap+1)th distinct
+     * dataset takes the slow path each time. With a typical pool of
+     * dozens of datasets this is a soft upper bound; pools beyond
+     * the cap see degraded but correct behavior.
+     *
+     * Cache invariant: an entry's `decay_window` is the value of
+     * `effective_property(STM_PROP_PROMOTE_DECAY_WINDOW)` AT the gen
+     * stamped in `observed_prop_gen`. A subsequent read sees a
+     * different observed gen → the cache invalidates en masse
+     * (clears n_entries, advances observed_prop_gen). Stale reads
+     * before the invalidation use the prior value, which is
+     * tolerable: the heuristic is best-effort (R62 + R63). */
+    struct {
+        uint64_t observed_prop_gen;
+        size_t   n_entries;
+        struct {
+            uint64_t dataset_id;
+            uint64_t decay_window;
+        } entries[STM_SYNC_PROMOTE_CACHE_CAP];
+    } promote_cache;
 
     /* Durable mirror of ub_main_root / ub_snap_root state, last-
      * committed. Updated on successful sync_commit; consumed by
@@ -4484,6 +4523,90 @@ stm_status stm_sync_write_extent(stm_sync *s, uint64_t dataset_id, uint64_t ino,
  * bump would persist briefly in idx->dirty=true before the
  * subsequent overwrite drops the record, mis-attributing heuristic
  * state to a non-user-driven access. R62 P2-1. */
+
+/* P7-CAS-14: resolve the effective `STM_PROP_PROMOTE_DECAY_WINDOW`
+ * for `dataset_id` through the per-sync cache. Caller MUST hold
+ * sync->lock. Returns the effective window in txgs; on any path that
+ * doesn't yield a positive override (cache hit-with-zero,
+ * dataset_idx == NULL, lookup STM_ENOENT, lookup value == 0) returns
+ * the compile-time default `STM_SYNC_PROMOTE_DECAY_WINDOW_DEFAULT_TXGS`.
+ *
+ * Cache shape: a small fixed-cap array of (dataset_id, decay_window)
+ * pairs stamped with the dataset_idx's `prop_mutation_gen` value at
+ * fill time. Each call:
+ *   1. Reads the current `prop_mutation_gen` (atomic, no lock).
+ *   2. If it differs from `observed_prop_gen`, the cache is stale —
+ *      clear it and stamp the new gen.
+ *   3. Linear-scan the cache for `dataset_id`. On hit, return the
+ *      cached window (folding 0 → compile-time default).
+ *   4. On miss, call `stm_dataset_effective_property` (slow path).
+ *      If room remains, insert the resolved value (including 0 —
+ *      the cache stores the EFFECTIVE value, not the resolved-with-
+ *      fallback value, so a future set_pool_default that changes 0
+ *      to a positive override is detected via the gen counter
+ *      bumping; without storing 0 we'd miss-cache and re-walk every
+ *      time). Return resolved value with the 0 → default fold.
+ *
+ * Lock ordering note: `stm_dataset_index_property_mutation_gen` and
+ * `stm_dataset_effective_property` both take dataset_idx->lock
+ * internally (the gen accessor uses an atomic-load fast-path; the
+ * effective lookup walks the parent chain under the mutex). The
+ * sync->lock is held throughout; dataset.c never re-enters sync, so
+ * the acquisition is leaf-safe. Same direction as the pre-cache
+ * implementation.
+ *
+ * Race posture: the cache + bump are best-effort. A concurrent
+ * mutation between the gen read and the cache lookup may yield a
+ * stale window value for one read; the heuristic absorbs this
+ * (R62 + R63 audits). UINT64_MAX wrap on the gen counter is
+ * defined-and-harmless: the comparison is for equality, not
+ * inequality. */
+static uint64_t sync_resolve_promote_decay_window_cached(stm_sync *s,
+                                                            uint64_t dataset_id)
+{
+    if (!s->dataset_idx) {
+        return STM_SYNC_PROMOTE_DECAY_WINDOW_DEFAULT_TXGS;
+    }
+
+    uint64_t cur_gen =
+            stm_dataset_index_property_mutation_gen(s->dataset_idx);
+    if (cur_gen != s->promote_cache.observed_prop_gen) {
+        s->promote_cache.observed_prop_gen = cur_gen;
+        s->promote_cache.n_entries = 0;
+    }
+
+    /* Cache hit? */
+    for (size_t i = 0; i < s->promote_cache.n_entries; i++) {
+        if (s->promote_cache.entries[i].dataset_id == dataset_id) {
+            uint64_t v = s->promote_cache.entries[i].decay_window;
+            return (v != 0u) ? v
+                             : STM_SYNC_PROMOTE_DECAY_WINDOW_DEFAULT_TXGS;
+        }
+    }
+
+    /* Cache miss — slow path. */
+    uint64_t v = 0;
+    stm_status rc = stm_dataset_effective_property(
+            s->dataset_idx, dataset_id,
+            STM_PROP_PROMOTE_DECAY_WINDOW, &v);
+    if (rc != STM_OK) {
+        /* STM_ENOENT (dataset destroyed mid-read) and other failures
+         * fold to the default. Don't cache — the dataset id may
+         * never be valid again. */
+        return STM_SYNC_PROMOTE_DECAY_WINDOW_DEFAULT_TXGS;
+    }
+
+    /* Insert into cache if room. Refuse-new-on-full: pools beyond the
+     * cap see the slow path each time but remain correct. */
+    if (s->promote_cache.n_entries < STM_SYNC_PROMOTE_CACHE_CAP) {
+        size_t i = s->promote_cache.n_entries++;
+        s->promote_cache.entries[i].dataset_id   = dataset_id;
+        s->promote_cache.entries[i].decay_window = v;
+    }
+
+    return (v != 0u) ? v : STM_SYNC_PROMOTE_DECAY_WINDOW_DEFAULT_TXGS;
+}
+
 static stm_status stm_sync_read_extent_locked(stm_sync *s,
                                                  uint64_t dataset_id, uint64_t ino,
                                                  uint64_t off, void *buf,
@@ -4612,25 +4735,19 @@ static stm_status stm_sync_read_extent_locked(stm_sync *s,
          *
          * P7-CAS-12: the decay window is the dataset's effective
          * STM_PROP_PROMOTE_DECAY_WINDOW (in txgs) — value 0 falls back
-         * to the compile-time default 1024. The property lookup takes
-         * dataset_idx's internal mutex; lock order is sync->lock (held)
-         * → dataset_idx mutex (acquired here). dataset.c never calls
-         * back into sync, so there's no inversion risk. A failed
-         * lookup (e.g. dataset destroyed mid-read; STM_ENOENT) is
-         * absorbed by the same heuristic-best-effort posture as the
-         * record-missing case below — fall back to the default. */
+         * to the compile-time default 1024.
+         *
+         * P7-CAS-14: the lookup goes through the per-sync property
+         * cache (`sync_resolve_promote_decay_window_cached`) — this
+         * avoids the dataset_idx parent-chain walk on every COLD
+         * read for hot-COLD-read workloads. The cache is invalidated
+         * en masse when the dataset_idx's `prop_mutation_gen`
+         * advances (set_property / clear_property / set_pool_default
+         * / move bump it). A failed lookup falls back to the default
+         * per the heuristic-best-effort posture. */
         if (count_for_promotion) {
-            uint64_t decay_window = STM_SYNC_PROMOTE_DECAY_WINDOW_DEFAULT_TXGS;
-            if (s->dataset_idx) {
-                uint64_t v = 0;
-                if (stm_dataset_effective_property(
-                            s->dataset_idx, dataset_id,
-                            STM_PROP_PROMOTE_DECAY_WINDOW,
-                            &v) == STM_OK
-                    && v != 0u) {
-                    decay_window = v;
-                }
-            }
+            uint64_t decay_window =
+                    sync_resolve_promote_decay_window_cached(s, dataset_id);
             (void)stm_extent_record_promote_read_hit(
                     s->extent_idx, dataset_id, ino, off,
                     s->current_gen, decay_window);

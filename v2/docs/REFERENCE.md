@@ -38,8 +38,53 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R64-hash-fixup. Substantive `2de9a49` +
-  R64 close `e3655ac`.
+- **Tip**: post-R65-hash-fixup. Substantive `<P7CAS14_SUBSTANTIVE>` +
+  R65 close `<P7CAS14_RCLOSE>`.
+  **P7-CAS-14 — per-COLD-read property cache. Closes R63 P3-2
+  forward-noted micro-opt by adding a per-sync cache of the
+  effective `STM_PROP_PROMOTE_DECAY_WINDOW` keyed by dataset_id.
+  Pre-P7-CAS-14 every successful COLD decrypt called
+  `stm_dataset_effective_property` from inside
+  `stm_sync_read_extent_locked`'s COLD branch — that lookup
+  acquires `dataset_idx->lock` and walks the parent chain. On
+  hot-COLD-read workloads (backup-replay scrub, cold-archive
+  blob serving) this added a per-read mutex acquire + tree walk
+  on the read fast path. The cache replaces this with a
+  fixed-cap (`STM_SYNC_PROMOTE_CACHE_CAP = 64`) array of
+  (dataset_id, decay_window) pairs stamped with the dataset_idx's
+  property-mutation gen at fill time. On lookup: read the gen
+  (atomic, no lock); if differs from observed → invalidate
+  en masse; linear-scan for the dataset_id; on hit return the
+  cached value (folding 0 → compile-time default); on miss
+  fall back to the original `stm_dataset_effective_property`
+  call + insert into cache. Eviction: refuse-new-on-full —
+  pools beyond the cap see the slow path each time but remain
+  correct. Invalidation: `dataset.c` adds an
+  `_Atomic uint64_t prop_mutation_gen` field bumped on every
+  successful `set_property` / `clear_property` /
+  `set_pool_default` / `move`; new public accessor
+  `stm_dataset_index_property_mutation_gen` reads it with
+  relaxed ordering. Atomic load avoids contending on
+  dataset_idx->lock from the read fast path. Cache is per-sync,
+  accessed under sync->lock; mutations are serialized by
+  dataset_idx->lock. The cache + bump are documented best-effort
+  + race-tolerant per R62 + R63 audits — a stale window value
+  yields a stale heuristic decision, not a soundness violation.
+  No format break (no on-disk surface change). property.tla
+  unchanged (cache is a sync-side optimization). cas.tla
+  unchanged (heuristic state, not load-bearing). **No spec
+  extension required.** test_dataset 61 → 62 (+1 P7-CAS-14
+  gen-counter test verifying bump on each mutation type +
+  no-bump on idempotent operation + no-bump on failed mutation +
+  NULL-defensive read). test_fs 146 → 149 (+3 P7-CAS-14
+  cache-invalidation tests covering set_property,
+  clear_property, set_pool_default — each verifies a stale
+  cache would yield the WRONG counter value, so the test fails
+  loudly if invalidation is missing). 35 ctest suites green
+  default + ASan + TSan in isolation. Spec posture unchanged:
+  21 modules / 25 fixed cfgs / 34 buggy cfgs.**
+  Prior P7-CAS-13 substantive `2de9a49` + R64 close `e3655ac` +
+  hash fixup `dc55f6f` + test-seam cleanup `e8a6f94`.
   **P7-CAS-13 — fs-level dataset property wrappers. Closes R63
   P3-4 forward-noted ergonomic gap by adding production-shape
   public APIs `stm_fs_set_dataset_property`,

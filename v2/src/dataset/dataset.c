@@ -25,6 +25,7 @@
 #include <stratum/super.h>
 
 #include <pthread.h>
+#include <stdatomic.h>      /* P7-CAS-14 prop_mutation_gen */
 #include <stdlib.h>
 #include <string.h>
 
@@ -94,6 +95,20 @@ struct stm_dataset_index {
      * quorum.tla::ContentQuorumAtGen. A non-idempotent commit would
      * allocate a fresh paddr on each call and diverge. */
     bool            dirty;
+
+    /* P7-CAS-14: monotonic counter bumped on every property-state
+     * mutation (set_property + clear_property + set_pool_default +
+     * move). Read by the sync layer's per-COLD-read property cache
+     * to detect when its cached effective values are stale. The
+     * counter is _Atomic so the read side (sync layer at the bump
+     * call site, holding sync->lock but NOT this idx's lock) sees a
+     * coherent value without contending on dataset_idx->lock.
+     *
+     * Bumped under dataset_idx->lock at each mutation site; read with
+     * relaxed ordering since the cache is best-effort + race-tolerant
+     * (a stale window value yields a stale heuristic decision, not a
+     * soundness violation per R62 + R63 audits). */
+    _Atomic uint64_t prop_mutation_gen;
 };
 
 /*
@@ -426,6 +441,13 @@ stm_status stm_dataset_rename(stm_dataset_index *idx, uint64_t id,
     return STM_OK;
 }
 
+uint64_t stm_dataset_index_property_mutation_gen(
+        const stm_dataset_index *idx) {
+    if (!idx) return 0;
+    return atomic_load_explicit(&idx->prop_mutation_gen,
+                                   memory_order_relaxed);
+}
+
 stm_status stm_dataset_move(stm_dataset_index *idx, uint64_t id,
                               uint64_t new_parent_id) {
     if (!idx) return STM_EINVAL;
@@ -458,6 +480,12 @@ stm_status stm_dataset_move(stm_dataset_index *idx, uint64_t id,
     }
     idx->slots[s].e.parent_id = new_parent_id;
     idx->dirty = true;
+    /* P7-CAS-14: a Move changes the moved dataset's parent chain →
+     * effective INHERITABLE values change for the dataset and every
+     * descendant. Bump the property-mutation gen so any sync-side
+     * cache observes its entries as stale and recomputes. */
+    atomic_fetch_add_explicit(&idx->prop_mutation_gen, 1u,
+                                 memory_order_relaxed);
     must_unlock(&idx->lock);
     return STM_OK;
 }
@@ -601,6 +629,11 @@ stm_status stm_dataset_set_pool_default(stm_dataset_index *idx,
     if (idx->pool_default[p] != value) {
         idx->pool_default[p] = value;
         idx->dirty = true;
+        /* P7-CAS-14: bump the property-mutation gen so any sync-side
+         * cache observes a stale window value as out-of-date and
+         * recomputes on next access. */
+        atomic_fetch_add_explicit(&idx->prop_mutation_gen, 1u,
+                                     memory_order_relaxed);
     }
     must_unlock(&idx->lock);
     return STM_OK;
@@ -629,6 +662,9 @@ stm_status stm_dataset_set_property(stm_dataset_index *idx, uint64_t id,
     idx->slots[s].local_set[p]   = true;
     idx->slots[s].local_value[p] = value;
     idx->dirty = true;
+    /* P7-CAS-14: bump the property-mutation gen (see set_pool_default). */
+    atomic_fetch_add_explicit(&idx->prop_mutation_gen, 1u,
+                                 memory_order_relaxed);
     must_unlock(&idx->lock);
     return STM_OK;
 }
@@ -658,6 +694,9 @@ stm_status stm_dataset_clear_property(stm_dataset_index *idx, uint64_t id,
         /* Leave local_value[p] in place; it's not observed when
          * local_set[p] is FALSE. */
         idx->dirty = true;
+        /* P7-CAS-14: bump the property-mutation gen (see set_pool_default). */
+        atomic_fetch_add_explicit(&idx->prop_mutation_gen, 1u,
+                                     memory_order_relaxed);
     }
     must_unlock(&idx->lock);
     return STM_OK;

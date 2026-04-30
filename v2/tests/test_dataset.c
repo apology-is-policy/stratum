@@ -856,6 +856,81 @@ STM_TEST(prop_promote_decay_window_zero_is_legal_value) {
     stm_dataset_index_close(idx);
 }
 
+STM_TEST(prop_mutation_gen_bumps_on_each_mutation) {
+    /* P7-CAS-14: the property-mutation gen counter must advance on
+     * each successful set_property / clear_property /
+     * set_pool_default / move call. Failed mutations (STM_ENOENT
+     * etc) MUST NOT advance — the cache must stay in sync with
+     * actual visible state. */
+    stm_dataset_index *idx = NULL;
+    STM_ASSERT_OK(stm_dataset_index_create(0, &idx));
+
+    uint64_t home = 0, alice = 0;
+    STM_ASSERT_OK(stm_dataset_create_child(idx, STM_DATASET_ROOT_ID,
+                                              "home", &home));
+    STM_ASSERT_OK(stm_dataset_create_child(idx, home, "alice", &alice));
+
+    uint64_t g0 = stm_dataset_index_property_mutation_gen(idx);
+
+    /* set_property bumps. */
+    STM_ASSERT_OK(stm_dataset_set_property(
+            idx, home, STM_PROP_TIERING, 1));
+    uint64_t g1 = stm_dataset_index_property_mutation_gen(idx);
+    STM_ASSERT_TRUE(g1 > g0);
+
+    /* set_property with same value still bumps (impl currently bumps
+     * unconditionally on success — caller doesn't compare prior
+     * value). The cache absorbs the redundant invalidation. */
+    STM_ASSERT_OK(stm_dataset_set_property(
+            idx, home, STM_PROP_TIERING, 1));
+    uint64_t g2 = stm_dataset_index_property_mutation_gen(idx);
+    STM_ASSERT_TRUE(g2 > g1);
+
+    /* clear_property bumps. */
+    STM_ASSERT_OK(stm_dataset_clear_property(
+            idx, home, STM_PROP_TIERING));
+    uint64_t g3 = stm_dataset_index_property_mutation_gen(idx);
+    STM_ASSERT_TRUE(g3 > g2);
+
+    /* clear on already-clear: no bump (clear_property's cleanup is
+     * idempotent — `if (idx->slots[s].local_set[p])` gates the
+     * mutation). */
+    STM_ASSERT_OK(stm_dataset_clear_property(
+            idx, home, STM_PROP_TIERING));
+    uint64_t g4 = stm_dataset_index_property_mutation_gen(idx);
+    STM_ASSERT_EQ(g4, g3);
+
+    /* set_pool_default bumps. */
+    STM_ASSERT_OK(stm_dataset_set_pool_default(
+            idx, STM_PROP_PROMOTE_DECAY_WINDOW, 1024));
+    uint64_t g5 = stm_dataset_index_property_mutation_gen(idx);
+    STM_ASSERT_TRUE(g5 > g4);
+
+    /* set_pool_default with same value: no bump (impl gates by
+     * value-changed). */
+    STM_ASSERT_OK(stm_dataset_set_pool_default(
+            idx, STM_PROP_PROMOTE_DECAY_WINDOW, 1024));
+    uint64_t g6 = stm_dataset_index_property_mutation_gen(idx);
+    STM_ASSERT_EQ(g6, g5);
+
+    /* move bumps. */
+    STM_ASSERT_OK(stm_dataset_move(idx, alice, STM_DATASET_ROOT_ID));
+    uint64_t g7 = stm_dataset_index_property_mutation_gen(idx);
+    STM_ASSERT_TRUE(g7 > g6);
+
+    /* Failed mutation (STM_ENOENT on unknown id) must NOT bump. */
+    STM_ASSERT_ERR(stm_dataset_set_property(
+            idx, 9999u, STM_PROP_TIERING, 1), STM_ENOENT);
+    uint64_t g8 = stm_dataset_index_property_mutation_gen(idx);
+    STM_ASSERT_EQ(g8, g7);
+
+    /* NULL idx accessor returns 0 (defensive). */
+    STM_ASSERT_EQ(stm_dataset_index_property_mutation_gen(NULL),
+                       (uint64_t)0u);
+
+    stm_dataset_index_close(idx);
+}
+
 STM_TEST(prop_pool_default_set_get) {
     stm_dataset_index *idx = NULL;
     STM_ASSERT_OK(stm_dataset_index_create(0, &idx));

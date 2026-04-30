@@ -768,11 +768,20 @@ Counter lifecycle (windowed-count, NOT cumulative):
   call site at `stm_sync_read_extent_locked` resolves the
   effective property at each successful decrypt; effective value
   0 → fall back to compile-time default; non-zero → use that
-  window. Lock order: sync->lock (held) → dataset_idx mutex
-  (acquired here); dataset.c never calls back into sync, so no
-  inversion risk. A failed lookup (e.g. dataset destroyed
-  mid-read) falls back to the compile-time default — same
-  heuristic-best-effort posture as the record-missing case.
+  window. P7-CAS-14 added a per-sync cache
+  (`STM_SYNC_PROMOTE_CACHE_CAP = 64`) so the resolution avoids
+  the dataset_idx parent-chain walk on every COLD read. The
+  cache is invalidated en masse when the dataset_idx's
+  `prop_mutation_gen` (atomic, bumped on set/clear/set_pool_default/move)
+  advances past the cache-stamped value. Eviction:
+  refuse-new-on-full — pools beyond the cap take the slow path
+  for the overflow set. Lock order: sync->lock (held) →
+  dataset_idx atomic-load (no lock for the gen read); cache
+  itself lives entirely under sync->lock. dataset.c never calls
+  back into sync, so the slow-path mutex acquisition is leaf-
+  safe. A failed lookup (e.g. dataset destroyed mid-read) falls
+  back to the compile-time default — same heuristic-best-effort
+  posture as the record-missing case.
 
 Race-tolerant: a concurrent overwrite/migrate that removed the
 record between sync-layer read and counter bump returns STM_OK
