@@ -5094,10 +5094,10 @@ STM_TEST(fs_p7cas8_pass_all_pool_default_on_migrates_all) {
     stm_fs *fs = NULL;
     STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
 
-    /* Set pool-default TIERING=1. */
+    /* Set pool-default TIERING=1 via the production fs-level wrapper. */
+    STM_ASSERT_OK(stm_fs_set_dataset_pool_default(fs, STM_PROP_TIERING, 1));
+    /* sync handle still needed below for the CAS-index inspection. */
     stm_sync *sync = stm_fs_sync_for_test(fs);
-    stm_dataset_index *idx = stm_sync_dataset_index(sync);
-    STM_ASSERT_OK(stm_dataset_set_pool_default(idx, STM_PROP_TIERING, 1));
 
     uint64_t ds2 = 0;
     STM_ASSERT_OK(stm_fs_create_dataset(fs, /*parent=*/1, "home", &ds2));
@@ -5143,15 +5143,16 @@ STM_TEST(fs_p7cas8_pass_all_per_dataset_local_overrides_pool) {
     stm_fs *fs = NULL;
     STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
 
-    stm_sync *sync = stm_fs_sync_for_test(fs);
-    stm_dataset_index *idx = stm_sync_dataset_index(sync);
-    STM_ASSERT_OK(stm_dataset_set_pool_default(idx, STM_PROP_TIERING, 1));
+    STM_ASSERT_OK(stm_fs_set_dataset_pool_default(fs, STM_PROP_TIERING, 1));
 
     uint64_t home = 0, archive = 0;
     STM_ASSERT_OK(stm_fs_create_dataset(fs, /*parent=*/1, "home",    &home));
     STM_ASSERT_OK(stm_fs_create_dataset(fs, /*parent=*/1, "archive", &archive));
-    /* Locally turn TIERING off on archive. */
-    STM_ASSERT_OK(stm_dataset_set_property(idx, archive, STM_PROP_TIERING, 0));
+    /* Locally turn TIERING off on archive via the fs-level wrapper. */
+    STM_ASSERT_OK(stm_fs_set_dataset_property(fs, archive,
+                                                  STM_PROP_TIERING, 0));
+    /* sync handle still needed below for the CAS-index inspection. */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
 
     uint8_t a[4096], b[4096], c[4096];
     for (size_t i = 0; i < 4096u; i++) {
@@ -5194,9 +5195,6 @@ STM_TEST(fs_p7cas8_pass_all_inheritance_through_chain) {
     stm_fs *fs = NULL;
     STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
 
-    stm_sync *sync = stm_fs_sync_for_test(fs);
-    stm_dataset_index *idx = stm_sync_dataset_index(sync);
-
     /* Build chain: root → home → alice → photos. */
     uint64_t home = 0, alice = 0, photos = 0;
     STM_ASSERT_OK(stm_fs_create_dataset(fs, /*parent=*/1, "home", &home));
@@ -5204,9 +5202,9 @@ STM_TEST(fs_p7cas8_pass_all_inheritance_through_chain) {
     STM_ASSERT_OK(stm_fs_create_dataset(fs, /*parent=*/alice, "photos", &photos));
 
     /* Set TIERING=1 on home; alice + photos inherit. */
-    STM_ASSERT_OK(stm_dataset_set_property(idx, home, STM_PROP_TIERING, 1));
+    STM_ASSERT_OK(stm_fs_set_dataset_property(fs, home, STM_PROP_TIERING, 1));
     /* Locally clear on alice (= 0 explicitly). photos inherits 0. */
-    STM_ASSERT_OK(stm_dataset_set_property(idx, alice, STM_PROP_TIERING, 0));
+    STM_ASSERT_OK(stm_fs_set_dataset_property(fs, alice, STM_PROP_TIERING, 0));
 
     /* Write HOT extent on each dataset. */
     uint8_t plain[4096];
@@ -5243,9 +5241,7 @@ STM_TEST(fs_p7cas8_pass_all_shared_max_inos_budget) {
     stm_fs *fs = NULL;
     STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
 
-    stm_sync *sync = stm_fs_sync_for_test(fs);
-    stm_dataset_index *idx = stm_sync_dataset_index(sync);
-    STM_ASSERT_OK(stm_dataset_set_pool_default(idx, STM_PROP_TIERING, 1));
+    STM_ASSERT_OK(stm_fs_set_dataset_pool_default(fs, STM_PROP_TIERING, 1));
 
     uint64_t ds2 = 0;
     STM_ASSERT_OK(stm_fs_create_dataset(fs, /*parent=*/1, "home", &ds2));
@@ -5375,9 +5371,7 @@ STM_TEST(fs_p7cas8_pass_all_soft_error_then_clean_continues) {
     stm_fs *fs = NULL;
     STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
 
-    stm_sync *sync = stm_fs_sync_for_test(fs);
-    stm_dataset_index *idx = stm_sync_dataset_index(sync);
-    STM_ASSERT_OK(stm_dataset_set_pool_default(idx, STM_PROP_TIERING, 1));
+    STM_ASSERT_OK(stm_fs_set_dataset_pool_default(fs, STM_PROP_TIERING, 1));
 
     uint64_t ds2 = 0;
     STM_ASSERT_OK(stm_fs_create_dataset(fs, /*parent=*/1, "home", &ds2));
@@ -5759,10 +5753,10 @@ STM_TEST(fs_p7cas11_promote_pass_all_filtered_by_tiering) {
 
     /* Set TIERING=1 on root (default may already be), TIERING=0 on
      * child to opt it out. */
+    STM_ASSERT_OK(stm_fs_set_dataset_property(fs, 1,   STM_PROP_TIERING, 1u));
+    STM_ASSERT_OK(stm_fs_set_dataset_property(fs, ds2, STM_PROP_TIERING, 0u));
+    /* sync handle still needed below for the extent-index inspection. */
     stm_sync *sync = stm_fs_sync_for_test(fs);
-    stm_dataset_index *idx = stm_sync_dataset_index(sync);
-    STM_ASSERT_OK(stm_dataset_set_property(idx, 1,    STM_PROP_TIERING, 1u));
-    STM_ASSERT_OK(stm_dataset_set_property(idx, ds2, STM_PROP_TIERING, 0u));
 
     uint8_t plain1[4096], plain2[4096];
     for (size_t i = 0; i < sizeof plain1; i++) {
@@ -5929,10 +5923,10 @@ STM_TEST(fs_p7cas12_small_window_property_resets_counter) {
     stm_fs *fs = NULL;
     STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
 
+    STM_ASSERT_OK(stm_fs_set_dataset_property(
+            fs, /*root*/1, STM_PROP_PROMOTE_DECAY_WINDOW, 1u));
+    /* sync handle still needed below for the extent-index inspection. */
     stm_sync *sync = stm_fs_sync_for_test(fs);
-    stm_dataset_index *idx = stm_sync_dataset_index(sync);
-    STM_ASSERT_OK(stm_dataset_set_property(
-            idx, /*root*/1, STM_PROP_PROMOTE_DECAY_WINDOW, 1u));
 
     uint8_t plain[4096];
     for (size_t i = 0; i < sizeof plain; i++)
@@ -6020,21 +6014,21 @@ STM_TEST(fs_p7cas12_property_inherits_from_parent_dataset) {
     stm_fs *fs = NULL;
     STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
 
-    stm_sync *sync = stm_fs_sync_for_test(fs);
-    stm_dataset_index *idx = stm_sync_dataset_index(sync);
     /* Set window=1 on root; child inherits. */
-    STM_ASSERT_OK(stm_dataset_set_property(
-            idx, /*root*/1, STM_PROP_PROMOTE_DECAY_WINDOW, 1u));
+    STM_ASSERT_OK(stm_fs_set_dataset_property(
+            fs, /*root*/1, STM_PROP_PROMOTE_DECAY_WINDOW, 1u));
 
     uint64_t child = 0;
     STM_ASSERT_OK(stm_fs_create_dataset(fs, /*parent=*/1, "child", &child));
 
-    /* Confirm effective resolves to 1 on child via the property
-     * layer. */
+    /* Confirm effective resolves to 1 on child via the fs-level
+     * wrapper. */
     uint64_t v = 0;
-    STM_ASSERT_OK(stm_dataset_effective_property(
-            idx, child, STM_PROP_PROMOTE_DECAY_WINDOW, &v));
+    STM_ASSERT_OK(stm_fs_effective_dataset_property(
+            fs, child, STM_PROP_PROMOTE_DECAY_WINDOW, &v));
     STM_ASSERT_EQ(v, 1u);
+    /* sync handle still needed below for the extent-index inspection. */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
 
     uint8_t plain[4096];
     for (size_t i = 0; i < sizeof plain; i++)
@@ -6073,18 +6067,18 @@ STM_TEST(fs_p7cas12_property_local_zero_resolves_to_default) {
     stm_fs *fs = NULL;
     STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
 
-    stm_sync *sync = stm_fs_sync_for_test(fs);
-    stm_dataset_index *idx = stm_sync_dataset_index(sync);
     /* Pool default 1 (would force resets every commit); root locally
      * overrides to 0 (= "use compile-time default = 1024"). */
-    STM_ASSERT_OK(stm_dataset_set_pool_default(
-            idx, STM_PROP_PROMOTE_DECAY_WINDOW, 1u));
-    STM_ASSERT_OK(stm_dataset_set_property(
-            idx, /*root*/1, STM_PROP_PROMOTE_DECAY_WINDOW, 0u));
+    STM_ASSERT_OK(stm_fs_set_dataset_pool_default(
+            fs, STM_PROP_PROMOTE_DECAY_WINDOW, 1u));
+    STM_ASSERT_OK(stm_fs_set_dataset_property(
+            fs, /*root*/1, STM_PROP_PROMOTE_DECAY_WINDOW, 0u));
     uint64_t v = 999;
-    STM_ASSERT_OK(stm_dataset_effective_property(
-            idx, /*root*/1, STM_PROP_PROMOTE_DECAY_WINDOW, &v));
+    STM_ASSERT_OK(stm_fs_effective_dataset_property(
+            fs, /*root*/1, STM_PROP_PROMOTE_DECAY_WINDOW, &v));
     STM_ASSERT_EQ(v, 0u);
+    /* sync handle still needed below for the extent-index inspection. */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
 
     uint8_t plain[4096];
     for (size_t i = 0; i < sizeof plain; i++)
