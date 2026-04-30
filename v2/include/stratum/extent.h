@@ -803,6 +803,72 @@ stm_status stm_extent_migrate_to_cold_chunked(
         uint8_t  *out_n_replicas);
 
 /*
+ * P7-CAS-17: cross-extent FastCDC at migrate time. Atomically replace ALL
+ * HOT extents at (dataset_id, ino) with `n_chunks` COLD records tiling the
+ * union of the dropped HOT extents' offset range.
+ *
+ * The multi-source extension of stm_extent_migrate_to_cold_chunked: extends
+ * the ChunkedMigrate pattern from "1 src extent → K chunks within
+ * src.range" to "N src extents → K chunks tiling the union range." The
+ * caller pre-computes K chunks at content-defined boundaries by running
+ * FastCDC across the concatenated plaintext of all N HOT extents — which
+ * is what unlocks cross-file dedup (NOVEL #3, ROADMAP §10.2): two files
+ * with content-shifted overlap dedupe at content-defined chunk boundaries
+ * after migrate, regardless of how their HOT extents were split at write
+ * time.
+ *
+ * Behavior:
+ *   - Scan records[] for all extents at (ds, ino). Refuse with STM_ENOTSUPPORTED
+ *     if ANY COLD extent exists at (ds, ino) (caller must fall back to
+ *     per-extent migrate for partially-migrated files; this API requires
+ *     all-HOT input). Refuse with STM_ENOENT if no extents found.
+ *   - Validate the HOT extents tile [first.off, first.off + total_len)
+ *     contiguously (no gaps; sparse files refused with STM_ENOTSUPPORTED —
+ *     concatenating non-contiguous plaintext would chunk synthetic zero
+ *     padding which doesn't represent file content).
+ *   - Validate `chunks[]` tile the same range exactly. Refuse with
+ *     STM_EINVAL on tile failure, zero-len chunks, or zero-hash chunks.
+ *   - Capture all dropped HOT paddrs into a heap-allocated array.
+ *   - Pre-grow records[] if `n_chunks > n_drops` so realloc-failure leaves
+ *     the index unchanged. STM_ENOMEM on alloc failure.
+ *   - Atomic mutation under idx->lock: remove all matching HOT extents
+ *     (swap-erase from records[]), append all new COLD records.
+ *
+ * Stamp values for new COLD records:
+ *   (ds, ino, off, len) — from chunks[i].
+ *   kind = COLD; n_replicas = 0; paddrs = zeros.
+ *   content_hash = chunks[i].content_hash.
+ *   gen = link_gen; key_id = key_id; link_gen = link_gen.
+ *   origin_dataset_id = ds; origin_ino = ino; origin_off = chunks[i].off.
+ *   read_count = 0; last_read_gen = 0 (fresh COLD: never read yet).
+ *
+ * Note that origin_* values name the (ds, ino, off) of the COLD chunk
+ * itself rather than of any source HOT extent. Cross-extent FastCDC
+ * fundamentally re-fragments the file, so per-source origin chains
+ * don't compose — the chunk's own coords are the canonical origin.
+ *
+ * Refuses with STM_EINVAL if: idx/chunks/out_dropped_paddrs/out_n_dropped_paddrs
+ * NULL; dataset_id == 0; ino == 0; n_chunks == 0; any chunks[i].len == 0;
+ * any chunks[i].len > EX_LEN_MAX_24BIT; any chunks[i].content_hash all-zero;
+ * link_gen == 0 OR > current_txg; chunks don't tile contiguously.
+ *
+ * Returns STM_OK with *out_dropped_paddrs (heap-allocated; caller frees
+ * via free()) and *out_n_dropped_paddrs filled with the total paddr count
+ * across all dropped HOT extents (sum of n_replicas). Caller routes each
+ * paddr through sync_drop_paddr_locked — same drop-route semantics as
+ * the existing chunked API.
+ */
+STM_MUST_USE
+stm_status stm_extent_migrate_whole_ino_to_cold(
+        stm_extent_index *idx,
+        uint64_t dataset_id, uint64_t ino,
+        const stm_extent_cold_chunk *chunks, size_t n_chunks,
+        uint64_t key_id,
+        uint64_t link_gen,
+        uint64_t **out_dropped_paddrs,
+        size_t *out_n_dropped_paddrs);
+
+/*
  * Look up the live extent of (ds, ino) covering byte offset `off`.
  * On STM_OK, *out_extent is filled. STM_ENOENT if `off` falls in a
  * hole (no extent covers it). STM_EINVAL on bad args.

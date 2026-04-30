@@ -56,9 +56,44 @@ into the CAS tier (which DOES need P6) is a separate concern.
 
 ## Phase 7 status (overall)
 
+- [x] **P7-CAS-17 cross-extent FastCDC at migrate** —
+      substantive (this commit) + R68 close (TBD) + hash-fixup
+      (TBD). Closes the per-extent isolation gap from P7-CAS-4b
+      that prevented cross-file dedup with content-shift.
+      `stm_sync_migrate_to_cold` now reads+concats ALL HOT
+      extents at (ds, ino) into a single buffer, runs FastCDC
+      across the concat, and atomically replaces the N source
+      HOT extents with K' COLD chunks at content-defined
+      boundaries spanning the source range. New extent-index
+      primitive `stm_extent_migrate_whole_ino_to_cold` provides
+      the atomic N-drop + K-insert. New sync helper
+      `migrate_whole_ino_locked` drives the pipeline (read +
+      concat + AEAD-decrypt → FastCDC → BLAKE3 + CAS-intern
+      per-chunk → atomic replace → drop-route). Dispatcher
+      `stm_sync_migrate_to_cold` branches: cross-extent path
+      if all-HOT + contiguous + total_len ≤
+      `STM_SYNC_MIGRATE_WHOLE_INO_MAX_BYTES = 64 MiB`;
+      per-extent fallback for partial-migrate / sparse /
+      oversized inputs. The 64 MiB cap on concat-buffer size
+      balances RAM budget vs cross-file dedup yield; future
+      work (windowed cross-extent FastCDC) would extend by
+      chunking files in 64 MiB rolling windows. Composition
+      over `cas.tla::MigrateToCold` + `cas.tla::ChunkedMigrate-
+      ToColdK2` (multiset of N atomic per-extent migrations
+      folded into a single batch); **no spec extension
+      required.** No format break — STM_UB_VERSION = 23
+      preserved (no on-disk surface change). test_fs grows
+      154 → 158 (+4 P7-CAS-17 tests: cross-file-dedup with
+      content-shift verifying cas_total ≤ 1.4× max-per-file-
+      chunks; sparse-file fallback; oversized-file structural
+      smoke; partial-migrated-file fallback for idempotent
+      re-migrate). 35 ctest suites green default + ASan +
+      TSan in isolation. Spec posture unchanged: 21 modules /
+      25 fixed cfgs / 34 buggy cfgs.
+
 - [x] **P7-CAS-16 recordsize cap lift 128 KiB → 8 MiB** —
       substantive `85b87d6` + R67 close `55c4280` + hash-fixup
-      (this commit). Format break **STM_UB_VERSION 22 → 23 +
+      `07f6964`. Format break **STM_UB_VERSION 22 → 23 +
       STM_SEND_VERSION 2 → 3** in lockstep. Lifts
       `STM_FS_RECORDSIZE_MAX` (the runtime invariant on extent
       record `len`, enforced at write entry + every decode +

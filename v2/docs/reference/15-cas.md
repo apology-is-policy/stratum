@@ -1201,9 +1201,39 @@ K ∈ [1, 4] chunks at content-defined boundaries (probabilistic — the
 strict mask region tightens K toward 1 + small-K outcomes). The K=1
 dispatch path still takes the existing single-chunk
 `stm_extent_migrate_to_cold` API; K ≥ 2 takes
-`stm_extent_migrate_to_cold_chunked`. Cross-extent FastCDC at write
-time (the "true" dedup unlock — see ROADMAP §10.2) is the next
-follow-on chunk.
+`stm_extent_migrate_to_cold_chunked`.
+
+**Cross-extent FastCDC at migrate (P7-CAS-17)**: closes the per-extent
+isolation gap that was the limitation of P7-CAS-4b's per-extent FastCDC
+sub-chunking. Pre-P7-CAS-17, two files with content-shifted overlap
+got fixed-offset HOT extents at write time → per-extent FastCDC chunks
+boundaries were aligned to each extent's start → no cross-file dedup
+even after migrate. P7-CAS-17 changes `stm_sync_migrate_to_cold` to
+read+concat ALL HOT extents at (ds, ino) into a single buffer, run
+FastCDC across the concat, and atomically replace the N source HOT
+extents with K' COLD chunks at content-defined boundaries that span
+the union of the source range. Two files with shift now dedupe at
+the FastCDC chunk boundaries (shift-resistant by construction). New
+extent-index primitive `stm_extent_migrate_whole_ino_to_cold` for the
+atomic N-drop + K-insert. New sync helper `migrate_whole_ino_locked`
+drives the read+concat → FastCDC → CAS-intern → atomic-replace
+pipeline. The `stm_sync_migrate_to_cold` dispatcher branches: cross-
+extent path if all-HOT + contiguous + total_len ≤
+`STM_SYNC_MIGRATE_WHOLE_INO_MAX_BYTES = 64 MiB`; per-extent fallback
+for partial-migrate / sparse / oversized inputs. Composition over
+`cas.tla::MigrateToCold` + `cas.tla::ChunkedMigrateToColdK2` (multiset
+of N atomic per-extent migrations folded into a single batch); no
+spec extension required. The 64 MiB concat-buffer cap balances RAM
+budget vs cross-file dedup yield; oversized files fall back to the
+per-extent path with the cross-extent dedup window bounded at the
+per-extent boundary (acceptable for typical archive workloads where
+dedup granularity is well within 64 MiB). Future work (windowed
+cross-extent FastCDC) would extend the cap by chunking files in 64
+MiB rolling windows. Test
+`fs_p7cas17_cross_file_dedup_with_content_shift` demonstrates the
+unlock: two 12 MiB files with 4 KiB content shift produce
+near-identical CAS chunks (cas_total ≤ 1.4 × per_file_chunk_count
+where the no-dedup baseline would be 2 × per_file_chunk_count).
 
 **Test override**: `<stratum/sync_testing.h>::stm_sync_set_cdc_
 params_for_test(s, params)` (gated by `STRATUM_BUILD_TESTING_HOOKS`)

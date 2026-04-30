@@ -56,6 +56,16 @@
 _Static_assert(STM_EXTENT_HASH_LEN == STM_CAS_HASH_LEN,
                "extent + CAS hash lengths must agree (cross-index memcpy)");
 
+/* MVP on-disk encoding cap: 24-bit length so `dlen` (le32 at offset 48)
+ * and `clen_and_comp.clen` (low 24 bits of le32 at offset 52) both fit
+ * the same value (no compression). Hoisted to file scope so callers in
+ * this TU can validate against it without forward-declaration; canonical
+ * encoding-section reference at ex_encode_value.
+ *
+ * P7-CAS-17 `stm_extent_migrate_whole_ino_to_cold` validates chunk lens
+ * against this cap. */
+#define EX_LEN_MAX_24BIT        UINT32_C(0x00FFFFFF)
+
 #include <stratum/block.h>
 #include <stratum/bootstrap.h>
 #include <stratum/btnode.h>
@@ -1135,6 +1145,246 @@ stm_status stm_extent_migrate_to_cold_chunked(
     return STM_OK;
 }
 
+/* P7-CAS-17: cross-extent FastCDC at migrate. Atomically replace ALL HOT
+ * extents at (ds, ino) with `n_chunks` COLD records tiling the union of
+ * the dropped HOT extents' offset range. See header for full contract. */
+stm_status stm_extent_migrate_whole_ino_to_cold(
+        stm_extent_index *idx,
+        uint64_t dataset_id, uint64_t ino,
+        const stm_extent_cold_chunk *chunks, size_t n_chunks,
+        uint64_t key_id,
+        uint64_t link_gen,
+        uint64_t **out_dropped_paddrs,
+        size_t *out_n_dropped_paddrs) {
+    /* Uniform out-param zero-init contract (R57 P3-5 + R58 P3-1 + R64 P2-1):
+     * defined values for callers observing on STM_EINVAL regardless of
+     * which validation step rejected. */
+    if (out_dropped_paddrs)   *out_dropped_paddrs = NULL;
+    if (out_n_dropped_paddrs) *out_n_dropped_paddrs = 0;
+
+    if (!idx || !chunks || !out_dropped_paddrs || !out_n_dropped_paddrs)
+        return STM_EINVAL;
+    if (dataset_id == 0 || ino == 0) return STM_EINVAL;
+    if (n_chunks == 0) return STM_EINVAL;
+    if (link_gen == 0) return STM_EINVAL;
+
+    /* Validate chunks: each has non-zero len bounded by 24-bit, alignment
+     * to STM_UB_SIZE, non-zero hash. Validate tile contiguity. */
+    for (size_t i = 0; i < n_chunks; i++) {
+        const stm_extent_cold_chunk *c = &chunks[i];
+        if (c->len == 0) return STM_EINVAL;
+        if (c->len > EX_LEN_MAX_24BIT) return STM_ERANGE;
+        if (c->len % STM_UB_SIZE != 0) return STM_EINVAL;
+        if (c->off > UINT64_MAX - c->len) return STM_EOVERFLOW;
+        bool any_nonzero = false;
+        for (size_t k = 0; k < STM_EXTENT_HASH_LEN; k++) {
+            if (c->content_hash[k] != 0) { any_nonzero = true; break; }
+        }
+        if (!any_nonzero) return STM_EINVAL;
+    }
+    for (size_t i = 1; i < n_chunks; i++) {
+        if (chunks[i].off != chunks[i - 1].off + chunks[i - 1].len)
+            return STM_EINVAL;
+    }
+
+    must_lock(&idx->lock);
+
+    if (link_gen > idx->current_txg) {
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
+
+    /* Phase 1: scan records[] for all extents at (ds, ino). Refuse on:
+     *   - any COLD record found (mixed mode → caller falls back to
+     *     per-extent migrate; STM_ENOTSUPPORTED).
+     *   - any non-HOT non-COLD kind (corruption; STM_ECORRUPT).
+     *   - HOT record with bogus n_replicas (STM_ECORRUPT).
+     * Collect indices into a temporary array. */
+    size_t *hot_idxs = NULL;
+    size_t  n_hot    = 0;
+    size_t  cap_hot  = 0;
+    for (size_t i = 0; i < idx->n_records; i++) {
+        const stm_extent_record *r = &idx->records[i];
+        if (r->dataset_id != dataset_id || r->ino != ino) continue;
+        if (r->kind == STM_EXTENT_KIND_COLD) {
+            free(hot_idxs);
+            must_unlock(&idx->lock);
+            return STM_ENOTSUPPORTED;
+        }
+        if (r->kind != STM_EXTENT_KIND_HOT) {
+            free(hot_idxs);
+            must_unlock(&idx->lock);
+            return STM_ECORRUPT;
+        }
+        if (r->n_replicas < 1 || r->n_replicas > STM_EXTENT_MAX_REPLICAS) {
+            free(hot_idxs);
+            must_unlock(&idx->lock);
+            return STM_ECORRUPT;
+        }
+        if (n_hot == cap_hot) {
+            size_t  new_cap = cap_hot == 0 ? 8u : cap_hot * 2u;
+            size_t *grown   = realloc(hot_idxs, new_cap * sizeof(size_t));
+            if (!grown) {
+                free(hot_idxs);
+                must_unlock(&idx->lock);
+                return STM_ENOMEM;
+            }
+            hot_idxs = grown;
+            cap_hot  = new_cap;
+        }
+        hot_idxs[n_hot++] = i;
+    }
+    if (n_hot == 0) {
+        free(hot_idxs);
+        must_unlock(&idx->lock);
+        return STM_ENOENT;
+    }
+
+    /* Phase 2: sort hot_idxs ascending by record off (insertion sort —
+     * fine for the small N typical for one ino's HOT extents). */
+    for (size_t i = 1; i < n_hot; i++) {
+        size_t   key     = hot_idxs[i];
+        uint64_t key_off = idx->records[key].off;
+        size_t   j       = i;
+        while (j > 0 && idx->records[hot_idxs[j - 1]].off > key_off) {
+            hot_idxs[j] = hot_idxs[j - 1];
+            j--;
+        }
+        hot_idxs[j] = key;
+    }
+
+    /* Phase 3: validate contiguity. Compute total range covered. */
+    uint64_t first_off  = idx->records[hot_idxs[0]].off;
+    uint64_t cumulative = first_off;
+    for (size_t i = 0; i < n_hot; i++) {
+        const stm_extent_record *r = &idx->records[hot_idxs[i]];
+        if (r->off != cumulative) {
+            /* Gap (sparse file) — refuse. Caller falls back to per-extent. */
+            free(hot_idxs);
+            must_unlock(&idx->lock);
+            return STM_ENOTSUPPORTED;
+        }
+        if (cumulative > UINT64_MAX - r->len) {
+            free(hot_idxs);
+            must_unlock(&idx->lock);
+            return STM_EOVERFLOW;
+        }
+        cumulative += r->len;
+    }
+    uint64_t total_len = cumulative - first_off;
+
+    /* Phase 4: validate chunks tile [first_off, first_off + total_len). */
+    if (chunks[0].off != first_off) {
+        free(hot_idxs);
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
+    uint64_t chunks_end = chunks[n_chunks - 1].off + chunks[n_chunks - 1].len;
+    if (chunks_end != first_off + total_len) {
+        free(hot_idxs);
+        must_unlock(&idx->lock);
+        return STM_EINVAL;
+    }
+
+    /* Phase 5: capture all dropped HOT replica paddrs into a heap-allocated
+     * output array. Total = sum of n_replicas across the N source extents. */
+    size_t paddrs_n = 0;
+    for (size_t i = 0; i < n_hot; i++) {
+        paddrs_n += idx->records[hot_idxs[i]].n_replicas;
+    }
+    uint64_t *dropped = malloc(paddrs_n * sizeof(uint64_t));
+    if (!dropped) {
+        free(hot_idxs);
+        must_unlock(&idx->lock);
+        return STM_ENOMEM;
+    }
+    {
+        size_t pi = 0;
+        for (size_t i = 0; i < n_hot; i++) {
+            const stm_extent_record *r = &idx->records[hot_idxs[i]];
+            for (uint8_t k = 0; k < r->n_replicas; k++) {
+                dropped[pi++] = r->paddrs[k];
+            }
+        }
+    }
+
+    /* Phase 6: pre-grow records[] if n_chunks > n_hot so the appended COLD
+     * records fit. Growing BEFORE any mutation guarantees ENOMEM-safety:
+     * if realloc fails, the index is unchanged. */
+    if (n_chunks > n_hot) {
+        size_t added = n_chunks - n_hot;
+        if (added > SIZE_MAX - idx->n_records) {
+            free(hot_idxs);
+            free(dropped);
+            must_unlock(&idx->lock);
+            return STM_EOVERFLOW;
+        }
+        size_t needed = idx->n_records + added;
+        if (needed > idx->cap_records) {
+            size_t new_cap = idx->cap_records == 0 ? 8u : idx->cap_records;
+            while (new_cap < needed) new_cap *= 2u;
+            stm_extent_record *new_buf = realloc(idx->records,
+                    new_cap * sizeof(stm_extent_record));
+            if (!new_buf) {
+                free(hot_idxs);
+                free(dropped);
+                must_unlock(&idx->lock);
+                return STM_ENOMEM;
+            }
+            idx->records     = new_buf;
+            idx->cap_records = new_cap;
+        }
+    }
+
+    /* Phase 7: atomic mutation. Remove HOT extents via swap-erase (descending
+     * order so erasures don't shift hot_idxs). Append COLD chunks.
+     *
+     * Swap-erase correctness: when erasing hot_idxs[k] in descending order,
+     * the slot at position records[n_records - 1] is guaranteed NOT to be
+     * any hot_idxs[j < k] (because hot_idxs are pairwise distinct by
+     * single-pass scan construction); it's a non-target record (or, if
+     * hot_idxs[k] == n_records - 1, the slot is itself, handled by the
+     * self-copy guard). */
+    for (size_t k = n_hot; k > 0; k--) {
+        size_t hi = hot_idxs[k - 1];
+        if (hi != idx->n_records - 1) {
+            idx->records[hi] = idx->records[idx->n_records - 1];
+        }
+        idx->n_records--;
+    }
+
+    /* Append the N' COLD records. */
+    for (size_t i = 0; i < n_chunks; i++) {
+        stm_extent_record *r = &idx->records[idx->n_records];
+        memset(r, 0, sizeof *r);
+        r->dataset_id        = dataset_id;
+        r->ino               = ino;
+        r->off               = chunks[i].off;
+        r->len               = chunks[i].len;
+        r->kind              = STM_EXTENT_KIND_COLD;
+        r->n_replicas        = 0;
+        memcpy(r->content_hash, chunks[i].content_hash, STM_EXTENT_HASH_LEN);
+        r->gen               = link_gen;
+        r->key_id            = key_id;
+        r->origin_dataset_id = dataset_id;
+        r->origin_ino        = ino;
+        r->origin_off        = chunks[i].off;
+        r->link_gen          = link_gen;
+        /* Fresh COLD: never read yet, sentinel zero. */
+        r->read_count        = 0;
+        r->last_read_gen     = 0;
+        idx->n_records++;
+    }
+
+    idx->dirty = true;
+    must_unlock(&idx->lock);
+
+    free(hot_idxs);
+    *out_dropped_paddrs   = dropped;
+    *out_n_dropped_paddrs = paddrs_n;
+    return STM_OK;
+}
+
 /* P7-CAS-11: atomic per-extent COLD→HOT swap. Mirrors
  * stm_extent_migrate_to_cold's structure but in the inverse
  * direction: drops the COLD record at (ds, ino, off) + inserts a
@@ -1567,9 +1817,12 @@ stm_status stm_extent_count_for_ino(const stm_extent_index *idx,
 
 #define EX_KEY_LEN              24u                          /* ds + ino + off */
 #define EX_VAL_LEN              108u                         /* P7-CAS-11 / v21 */
-/* MVP cap: 24-bit length so dlen + clen_and_comp.clen both fit without
- * compression. Production extends with chunking / per-extent integrity. */
-#define EX_LEN_MAX_24BIT        UINT32_C(0x00FFFFFF)
+/* EX_LEN_MAX_24BIT is now defined at file scope near the top so callers
+ * outside this encoding section (P7-CAS-17 whole-ino migrate) can validate
+ * against it without forward-declaration. The encoding-section comment
+ * remains the canonical reference: 24-bit length so `dlen` (le32 at offset
+ * 48) and `clen_and_comp.clen` (low 24 bits of le32 at offset 52) both fit
+ * the same value (no compression). */
 
 static void ex_encode_key(uint64_t ds, uint64_t ino, uint64_t off,
                              uint8_t out[EX_KEY_LEN]) {

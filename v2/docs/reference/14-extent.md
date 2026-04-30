@@ -456,7 +456,7 @@ unrelated to the index API and stays separate.
       by `NoOverlapWithinIno`.
 - [x] Reflinks / refcount-bump path — Phase 7 §10.4 (P7-16).
 - [x] **CAS / cold-tier extents** (P7-CAS, P7-CAS-2, P7-CAS-3,
-      P7-CAS-4a, P7-CAS-4b): extent records carry a `kind`
+      P7-CAS-4a, P7-CAS-4b, P7-CAS-17): extent records carry a `kind`
       discriminator (HOT / COLD) and a `content_hash[32]` field for
       COLD records. New `stm_extent_write_cold` inserts a COLD record;
       new `stm_extent_migrate_to_cold` atomically swaps a HOT extent
@@ -464,11 +464,18 @@ unrelated to the index API and stays separate.
       `stm_extent_migrate_to_cold_chunked` (P7-CAS-4b) atomically
       swaps a HOT extent for N >= 2 COLD chunks tiling the source
       range — pre-grows records[] capacity, in-place overwrites the
-      src slot with chunks[0], appends chunks[1..K-1]. Per-chunk
+      src slot with chunks[0], appends chunks[1..K-1]; `stm_extent_
+      migrate_whole_ino_to_cold` (P7-CAS-17) atomically replaces
+      ALL HOT extents at (ds, ino) with K' COLD chunks tiling the
+      union of the source HOT range — refuses STM_ENOTSUPPORTED for
+      mixed HOT+COLD inputs (caller falls back to per-extent migrate)
+      or sparse files (non-contiguous HOT extents). Per-chunk
       descriptor `stm_extent_cold_chunk { off, len, content_hash[32] }`
-      pre-validated to tile [src_off, src_off+src_len). See
+      pre-validated to tile [src_off, src_off+src_len) (chunked) or
+      [first_off, first_off+total_len) (whole-ino). See
       `15-cas.md` for the cold-tier index module + migration data
-      plane + FastCDC sub-chunking integration.
+      plane + FastCDC sub-chunking integration + cross-extent FastCDC
+      at migrate.
 - [ ] Per-file or per-dataset Bε-tree partitioning — current unified
       MVP scales to small pools; production scale-out to many-inode
       pools needs partitioning.

@@ -38,8 +38,41 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R67-hash-fixup. Substantive `85b87d6` +
-  R67 close `55c4280`.
+- **Tip**: P7-CAS-17 substantive (this commit). R68 audit close +
+  hash-fixup TBD.
+  **P7-CAS-17 — cross-extent FastCDC at migrate. Closes the
+  per-extent isolation gap from P7-CAS-4b that prevented cross-file
+  dedup on content-shifted overlapping files. `stm_sync_migrate_to_cold`
+  now reads+concats ALL HOT extents at (ds, ino) into a single buffer,
+  runs FastCDC across the concat, and atomically replaces the N source
+  HOT extents with K' COLD chunks at content-defined boundaries
+  spanning the source range. New extent-index primitive
+  `stm_extent_migrate_whole_ino_to_cold` provides the atomic N-drop +
+  K-insert. New sync helper `migrate_whole_ino_locked` drives the
+  pipeline (read + concat + AEAD-decrypt → FastCDC → BLAKE3 +
+  CAS-intern per-chunk → atomic replace → drop-route). Dispatcher
+  `stm_sync_migrate_to_cold` branches: cross-extent path if all-HOT
+  + contiguous + total_len ≤ `STM_SYNC_MIGRATE_WHOLE_INO_MAX_BYTES =
+  64 MiB`; per-extent fallback (P7-CAS-4b's per-extent FastCDC) for
+  partial-migrate / sparse / oversized inputs. The 64 MiB cap
+  balances RAM budget vs cross-file dedup yield; future work
+  (windowed cross-extent FastCDC) would extend by chunking files in
+  64 MiB rolling windows. Composition over `cas.tla::MigrateToCold`
+  + `cas.tla::ChunkedMigrateToColdK2` (multiset of N atomic
+  per-extent migrations folded into a single batch); the K-insert
+  primitive's atomicity at the C-impl level is the same shape as
+  ChunkedMigrateToColdK2's 1-drop+K-insert. **No spec extension
+  required.** No format break — STM_UB_VERSION = 23 preserved
+  (no on-disk surface change; new behavior is at the migrate-
+  pipeline layer only). Cross-extent dedup demonstrated in
+  `fs_p7cas17_cross_file_dedup_with_content_shift`: two 12 MiB
+  files with 4 KiB content shift produce cas_total ≤ 1.4× max-
+  per-file-chunks (vs 2× without P7-CAS-17). test_fs grows
+  154 → 158 (+4 P7-CAS-17 tests). 35 ctest suites green default +
+  ASan + TSan in isolation. Spec posture unchanged: 21 modules /
+  25 fixed cfgs / 34 buggy cfgs.**
+  Prior P7-CAS-16 substantive `85b87d6` + R67 close `55c4280` +
+  hash-fixup `07f6964`.
   **P7-CAS-16 — recordsize cap lift 128 KiB → 8 MiB. Format break
   STM_UB_VERSION 22 → 23 + STM_SEND_VERSION 2 → 3 in lockstep.
   `STM_FS_RECORDSIZE_MAX` (the runtime invariant on extent record

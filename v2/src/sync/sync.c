@@ -5590,20 +5590,30 @@ static stm_status cas_chunk_encrypt_and_write_locked(
 
 /* Iterator context for collect-pass: capture every HOT extent at (ds,
  * ino) into a snapshot. Mirrors reflink_collect_ctx but hot-only +
- * single-ino. */
+ * single-ino.
+ *
+ * P7-CAS-17 extension: also count COLD records at (ds, ino) so the
+ * cross-extent FastCDC dispatcher can fall back to per-extent migrate
+ * for partially-migrated inputs. */
 typedef struct {
     uint64_t                ds;
     uint64_t                ino;
     stm_extent_record      *records;
     size_t                  n;
     size_t                  cap;
+    size_t                  cold_count;       /* P7-CAS-17 */
+    uint64_t                hot_total_len;    /* P7-CAS-17: sum of HOT lens */
     stm_status              err;
 } migrate_collect_ctx;
 
 static bool migrate_collect_cb(const stm_extent_record *e, void *cx) {
     migrate_collect_ctx *ctx = cx;
     if (e->dataset_id != ctx->ds || e->ino != ctx->ino) return true;
-    if (e->kind != STM_EXTENT_KIND_HOT) return true;        /* skip cold */
+    if (e->kind == STM_EXTENT_KIND_COLD) {
+        ctx->cold_count++;
+        return true;            /* don't append; cold isn't a migrate target */
+    }
+    if (e->kind != STM_EXTENT_KIND_HOT) return true;        /* skip unknown */
     if (ctx->n == ctx->cap) {
         size_t new_cap = ctx->cap == 0 ? 8u : ctx->cap * 2u;
         stm_extent_record *grown = realloc(ctx->records,
@@ -5613,8 +5623,27 @@ static bool migrate_collect_cb(const stm_extent_record *e, void *cx) {
         ctx->cap     = new_cap;
     }
     ctx->records[ctx->n++] = *e;
+    if (ctx->hot_total_len > UINT64_MAX - e->len) {
+        ctx->err = STM_EOVERFLOW;
+        return false;
+    }
+    ctx->hot_total_len += e->len;
     return true;
 }
+
+/* P7-CAS-17 cap on the cross-extent FastCDC concat buffer. Files larger
+ * than this cap fall back to the per-extent migrate path (each HOT extent
+ * is FastCDC-sub-chunked independently — same as P7-CAS-4b behavior).
+ *
+ * 64 MiB = 8 × STM_FS_RECORDSIZE_MAX. The cap balances:
+ *   - RAM budget: a 64 MiB plaintext concat buffer + the same-size
+ *     boundaries[] / chunks[] arrays peak at ~70 MiB during migrate.
+ *   - Dedup yield: typical VM-image / container workloads have
+ *     content-shift granularity well within 64 MiB; the 64 MiB window
+ *     captures most cross-file dedup.
+ *   - Migrate latency: 64 MiB AEAD decrypt + FastCDC scan + 16 × CAS
+ *     intern + atomic replace fits in ~100 ms on typical hardware. */
+#define STM_SYNC_MIGRATE_WHOLE_INO_MAX_BYTES   (64u * 1024u * 1024u)
 
 /* P7-CAS-4b: round each FastCDC boundary to the nearest STM_UB_SIZE-
  * aligned position, dropping boundaries that collapse onto a previous
@@ -6014,6 +6043,237 @@ static stm_status migrate_one_extent_locked(stm_sync *s,
     return drop_err;
 }
 
+/* P7-CAS-17 helper: migrate ALL HOT extents at (ds, ino) atomically with
+ * cross-extent FastCDC.
+ *
+ * Pre-call invariants enforced by `stm_sync_migrate_to_cold`:
+ *   - All extents at (ds, ino) are HOT (no COLD: caller falls back to
+ *     per-extent migrate for mixed inputs).
+ *   - The N HOT extents tile [first.off, first.off + total_len)
+ *     contiguously (no sparse gaps; caller falls back for sparse files).
+ *   - total_len ≤ STM_SYNC_MIGRATE_WHOLE_INO_MAX_BYTES (caller-enforced).
+ *   - records[] is sorted ascending by off (caller-sorted).
+ *
+ * Pipeline:
+ *   1. Allocate a contiguous concat buffer sized total_len.
+ *   2. For each source HOT extent in offset order: read+decrypt into the
+ *      concat at the appropriate offset.
+ *   3. Run FastCDC on the concat → boundaries[].
+ *   4. Round to STM_UB_SIZE grid.
+ *   5. Per-chunk: BLAKE3 + cas_chunk_intern_locked. Track completed for
+ *      rollback.
+ *   6. Atomic N-drop + K-insert via stm_extent_migrate_whole_ino_to_cold.
+ *      On failure, deref every interned chunk to roll back CAS state.
+ *   7. Drop-route every dropped HOT paddr.
+ *
+ * Stamp values for new COLD records:
+ *   - link_gen = s->current_gen (the migrate's commit gen).
+ *   - key_id = HOT extent's stamped key_id. Because all N HOT extents
+ *     share the same dataset, they all stamp the same dataset CURRENT
+ *     key_id at write time. The first record's key_id is canonical;
+ *     a defensive cross-check rejects mixed key_ids as STM_ECORRUPT.
+ *
+ * The first-record key_id approach is safe: dataset CURRENT advances at
+ * key rotation, but extents written at the same gen all stamp the same
+ * key_id (the dataset's CURRENT at that gen). Mixed key_ids across HOT
+ * extents at the same (ds, ino) would imply a write spanning a key
+ * rotation — possible in principle but a corruption signal at migrate
+ * time because key rotation is a rare admin operation, not a per-write
+ * event.
+ */
+static stm_status migrate_whole_ino_locked(stm_sync *s,
+                                              uint64_t dataset_id,
+                                              uint64_t ino,
+                                              const stm_extent_record *records,
+                                              size_t n_records,
+                                              uint64_t total_len)
+{
+    /* Step 0: cross-check that all source records share key_id. */
+    uint64_t canonical_key_id = records[0].key_id;
+    for (size_t i = 1; i < n_records; i++) {
+        if (records[i].key_id != canonical_key_id) return STM_ECORRUPT;
+    }
+
+    /* Step 1: allocate concat buffer. */
+    if (total_len == 0 || total_len > STM_SYNC_MIGRATE_WHOLE_INO_MAX_BYTES)
+        return STM_EINVAL;
+    void *concat = malloc(total_len);
+    if (!concat) return STM_ENOMEM;
+
+    /* Step 2: read+decrypt each HOT extent into the concat. The records
+     * are pre-sorted ascending by off; offsets are contiguous starting
+     * at records[0].off. */
+    uint64_t base_off  = records[0].off;
+    size_t   concat_pos = 0;
+    for (size_t i = 0; i < n_records; i++) {
+        const stm_extent_record *e = &records[i];
+        if (e->kind != STM_EXTENT_KIND_HOT) {
+            stm_ct_memzero(concat, total_len);
+            free(concat);
+            return STM_ECORRUPT;          /* defensive */
+        }
+        if (e->off != base_off + concat_pos) {
+            stm_ct_memzero(concat, total_len);
+            free(concat);
+            return STM_ECORRUPT;          /* contiguity invariant lost */
+        }
+        size_t got = 0;
+        stm_status rs = stm_sync_read_extent_locked(s, dataset_id, ino,
+                                                       e->off,
+                                                       (uint8_t *)concat + concat_pos,
+                                                       e->len, &got,
+                                                       /*count_for_promotion=*/false);
+        if (rs != STM_OK || got != e->len) {
+            stm_status err = (rs != STM_OK) ? rs : STM_EIO;
+            stm_ct_memzero(concat, total_len);
+            free(concat);
+            return err;
+        }
+        concat_pos += e->len;
+    }
+    if (concat_pos != total_len) {
+        stm_ct_memzero(concat, total_len);
+        free(concat);
+        return STM_ECORRUPT;
+    }
+
+    /* Step 3: FastCDC on the concat. Cap = total_len/256 + 8 — same shape
+     * as `migrate_one_extent_locked`'s cap math; bounded by the small-
+     * params floor (avg=1024 → min=256) at 64 MiB / 256 = 262152 entries
+     * (~2 MiB heap — still negligible). */
+    size_t cap = (size_t)(total_len / 256u) + 8u;
+    size_t *boundaries = malloc(cap * sizeof(size_t));
+    if (!boundaries) {
+        stm_ct_memzero(concat, total_len);
+        free(concat);
+        return STM_ENOMEM;
+    }
+    size_t n_raw = stm_cdc_chunk(&s->cdc, (const uint8_t *)concat,
+                                  (size_t)total_len, boundaries, cap);
+    size_t n_chunks = round_chunk_boundaries(boundaries, n_raw, (size_t)total_len);
+    if (n_chunks == 0) {
+        free(boundaries);
+        stm_ct_memzero(concat, total_len);
+        free(concat);
+        return STM_ECORRUPT;
+    }
+
+    /* Step 4: per-chunk pre-flight. CAS-intern each chunk; track for rollback. */
+    typedef struct {
+        uint8_t  hash[STM_CAS_HASH_LEN];
+        bool     cas_inserted;
+        bool     cas_bumped;
+    } chunk_intern_state;
+
+    chunk_intern_state *st = calloc(n_chunks, sizeof *st);
+    if (!st) {
+        free(boundaries);
+        stm_ct_memzero(concat, total_len);
+        free(concat);
+        return STM_ENOMEM;
+    }
+
+    stm_status pre_rc = STM_OK;
+    size_t completed = 0;
+    {
+        size_t prev = 0;
+        for (size_t i = 0; i < n_chunks; i++) {
+            size_t end = boundaries[i];
+            if (end <= prev || end > (size_t)total_len) {
+                pre_rc = STM_ECORRUPT;
+                break;
+            }
+            size_t chunk_len = end - prev;
+            const uint8_t *cp = (const uint8_t *)concat + prev;
+            stm_status cs = cas_chunk_intern_locked(s, cp, chunk_len,
+                                                       st[i].hash,
+                                                       &st[i].cas_inserted,
+                                                       &st[i].cas_bumped);
+            if (cs != STM_OK) {
+                pre_rc = cs;
+                break;
+            }
+            completed = i + 1;
+            prev = end;
+        }
+    }
+
+    if (pre_rc != STM_OK) {
+        for (size_t i = 0; i < completed; i++) {
+            if (st[i].cas_inserted || st[i].cas_bumped)
+                (void)stm_cas_deref(s->cas_idx, st[i].hash);
+        }
+        free(st);
+        free(boundaries);
+        stm_ct_memzero(concat, total_len);
+        free(concat);
+        return pre_rc;
+    }
+
+    /* Concat plaintext no longer needed; wipe before extent-tree mutation. */
+    stm_ct_memzero(concat, total_len);
+    free(concat);
+
+    /* Step 5: build chunks_arr[] for the atomic API. The chunks tile
+     * [base_off, base_off + total_len) at content-defined boundaries
+     * (rounded to STM_UB_SIZE). */
+    stm_extent_cold_chunk *chunks_arr =
+        calloc(n_chunks, sizeof(stm_extent_cold_chunk));
+    if (!chunks_arr) {
+        for (size_t i = 0; i < n_chunks; i++) {
+            if (st[i].cas_inserted || st[i].cas_bumped)
+                (void)stm_cas_deref(s->cas_idx, st[i].hash);
+        }
+        free(st);
+        free(boundaries);
+        return STM_ENOMEM;
+    }
+    {
+        size_t prev = 0;
+        for (size_t i = 0; i < n_chunks; i++) {
+            chunks_arr[i].off = base_off + prev;
+            chunks_arr[i].len = boundaries[i] - prev;
+            memcpy(chunks_arr[i].content_hash, st[i].hash, STM_CAS_HASH_LEN);
+            prev = boundaries[i];
+        }
+    }
+
+    /* Step 6: atomic N-drop + K-insert via the new extent-index API. */
+    uint64_t *dropped_paddrs = NULL;
+    size_t   n_dropped = 0;
+    stm_status ms = stm_extent_migrate_whole_ino_to_cold(s->extent_idx,
+                                                            dataset_id, ino,
+                                                            chunks_arr, n_chunks,
+                                                            canonical_key_id,
+                                                            s->current_gen,
+                                                            &dropped_paddrs,
+                                                            &n_dropped);
+    free(chunks_arr);
+
+    if (ms != STM_OK) {
+        for (size_t i = 0; i < n_chunks; i++) {
+            if (st[i].cas_inserted || st[i].cas_bumped)
+                (void)stm_cas_deref(s->cas_idx, st[i].hash);
+        }
+        free(st);
+        free(boundaries);
+        return ms;
+    }
+
+    free(st);
+    free(boundaries);
+
+    /* Step 7: drop-route the dropped HOT replicas. Best-effort drain. */
+    stm_status drop_err = STM_OK;
+    for (size_t i = 0; i < n_dropped; i++) {
+        stm_status drs = sync_drop_paddr_locked(s, dataset_id,
+                                                   dropped_paddrs[i]);
+        if (drs != STM_OK && drop_err == STM_OK) drop_err = drs;
+    }
+    free(dropped_paddrs);
+    return drop_err;
+}
+
 stm_status stm_sync_migrate_to_cold(stm_sync *s,
                                        uint64_t dataset_id, uint64_t ino)
 {
@@ -6025,7 +6285,7 @@ stm_status stm_sync_migrate_to_cold(stm_sync *s,
     if (s->read_only) { pthread_mutex_unlock(&s->lock); return STM_EROFS;   }
     if (!s->cas_idx)  { pthread_mutex_unlock(&s->lock); return STM_EINVAL;  }
 
-    /* Phase 1: collect HOT extents at (ds, ino) into a snapshot. */
+    /* Phase 1: collect HOT extents + count COLDs at (ds, ino). */
     migrate_collect_ctx cx = { .ds = dataset_id, .ino = ino,
                                 .err = STM_OK };
     stm_status its = stm_extent_iter_ds(s->extent_idx, dataset_id,
@@ -6043,9 +6303,50 @@ stm_status stm_sync_migrate_to_cold(stm_sync *s,
         return STM_OK;
     }
 
-    /* Phase 2: per-extent migration. Each call commits independently;
-     * partial-failure-then-retry resumes from the first un-migrated
-     * extent. */
+    /* P7-CAS-17 dispatch decision: cross-extent FastCDC if all-HOT,
+     * within byte budget, and contiguous (no sparse gaps). Else
+     * fall back to per-extent migrate for partial / oversized /
+     * sparse cases. */
+    bool can_use_whole_ino =
+        (cx.cold_count == 0u) &&
+        (cx.hot_total_len <= STM_SYNC_MIGRATE_WHOLE_INO_MAX_BYTES);
+
+    if (can_use_whole_ino) {
+        /* Sort cx.records ascending by off (insertion sort — N typically
+         * 1..8 for a recordsize-bounded file ≤ 64 MiB / 8 MiB extent). */
+        for (size_t i = 1; i < cx.n; i++) {
+            stm_extent_record key = cx.records[i];
+            size_t j = i;
+            while (j > 0 && cx.records[j - 1].off > key.off) {
+                cx.records[j] = cx.records[j - 1];
+                j--;
+            }
+            cx.records[j] = key;
+        }
+        /* Verify contiguity. If sparse → fall back. */
+        bool contiguous = true;
+        uint64_t cursor = cx.records[0].off;
+        for (size_t i = 0; i < cx.n; i++) {
+            if (cx.records[i].off != cursor) { contiguous = false; break; }
+            if (cursor > UINT64_MAX - cx.records[i].len) {
+                contiguous = false; break;
+            }
+            cursor += cx.records[i].len;
+        }
+        if (contiguous) {
+            stm_status whole_rc = migrate_whole_ino_locked(s, dataset_id, ino,
+                                                              cx.records, cx.n,
+                                                              cx.hot_total_len);
+            free(cx.records);
+            pthread_mutex_unlock(&s->lock);
+            return whole_rc;
+        }
+        /* Sparse — fall through to per-extent. */
+    }
+
+    /* Phase 2 fallback: per-extent migration. Each call commits
+     * independently; partial-failure-then-retry resumes from the first
+     * un-migrated extent. */
     stm_status apply_rc = STM_OK;
     for (size_t i = 0; i < cx.n; i++) {
         stm_status one = migrate_one_extent_locked(s, &cx.records[i]);
