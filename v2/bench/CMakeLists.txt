@@ -32,3 +32,17 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(bench_dedup PRIVATE
         "$<LINK_GROUP:RESCAN,stm_sync,stm_scrub>")
 endif()
+
+# P7-VAL-2: reflink complexity benchmark for ROADMAP §10.2 exit criterion 4
+# ("Reflink is O(extent count) not O(data size)"). Sweeps two axes — extent
+# count at fixed extent size, then extent size at fixed extent count — and
+# reports per-extent wall-clock. Verdict: per-extent cost roughly constant
+# across both axes proves the complexity claim. Same Linux ld cycle gating
+# as bench_dedup.
+add_executable(bench_reflink_complexity bench_reflink_complexity.c)
+target_link_libraries(bench_reflink_complexity
+    PRIVATE stratum stm_warnings stm_sanitize)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_libraries(bench_reflink_complexity PRIVATE
+        "$<LINK_GROUP:RESCAN,stm_sync,stm_scrub>")
+endif()

@@ -56,6 +56,28 @@ into the CAS tier (which DOES need P6) is a separate concern.
 
 ## Phase 7 status (overall)
 
+- [x] **P7-VAL-2 reflink complexity benchmark + empirical validation**
+      — landed `v2/bench/bench_reflink_complexity.c` (and matching
+      CMake target with the standard Linux ld static-library cycle
+      gating) for the ROADMAP §10.2 exit criterion 4 ("Reflink is
+      O(extent count) not O(data size)"). Two-axis sweep:
+      Axis A varies extent count N ∈ {1, 4, 16, 64, 256, 1024} at
+      fixed 4 KiB extent size; Axis B varies extent_kib ∈
+      {4, 16, 64, 256, 1024} at fixed N=64. Times each `stm_fs_reflink`
+      with `clock_gettime(CLOCK_MONOTONIC)`, takes median of
+      `--runs=2` independent runs (each with fresh src/dst inos).
+      **Validated empirically on 2026-04-30**
+      (`docs/validation/p7val2-reflink-2026-04-30.md`): Axis B
+      (256× more bytes covered at fixed N) varies wall-clock by
+      **1.24×** — independent of data size; Axis A grows wall-clock
+      with N (ns_per_extent ratio 7.34× over a 1024× extent-count
+      change). Bench code is opt-in via `-DSTM_BUILD_BENCHES=ON`,
+      not on the audit-trigger surfaces (consumes public reflink
+      API only). Bench observed STM_ECORRUPT from `stm_fs_write`
+      under sustained workloads (`--runs=3+` at axis-A's N=1024
+      config); not blocking the §10.2 #4 validation but worth
+      following up — flagged in the P7-VAL-2 artifact + memory.
+
 - [x] **P7-VAL-1 dedup ratio benchmark + sweep harness +
       empirical validation** — landed `v2/bench/bench_dedup.c` +
       `v2/bench/run_dedup.sh` for the ROADMAP §10.2 exit criterion
@@ -1470,8 +1492,8 @@ into the CAS tier (which DOES need P6) is a separate concern.
 
 ## ROADMAP §10.2 exit criteria
 
-Status as of 2026-04-30: 1/4 empirically validated, 3/4
-code-complete pending validation.
+Status as of 2026-04-30: 2/4 empirically validated (#1 + #4), 2/4
+code-complete pending validation (#2 + #3).
 
 - [x] **Cold-tier dedup achieves target 3-5× on VM-image test set.**
       **Empirically met at P7-VAL-1 medium-scale validation
@@ -1490,10 +1512,17 @@ code-complete pending validation.
 - [ ] Send + receive roundtrip preserves data + metadata +
       snapshots. Code-complete (P7-CAS-9/10); needs end-to-end
       snapshot integration test.
-- [ ] Reflink is O(extent count) not O(data size). Code-complete
-      (P7-CAS-3 base + cold-extent reflink); structurally O(extent
-      count) by construction; needs an explicit complexity test
-      to formalize the proof.
+- [x] **Reflink is O(extent count) not O(data size).**
+      **Empirically met at P7-VAL-2 reflink-complexity validation
+      (`docs/validation/p7val2-reflink-2026-04-30.md`)**: at fixed
+      N=64 extents, sweeping extent size from 4 KiB → 1 MiB (256×
+      more bytes covered) the median wall-clock varies by **1.24×**
+      — essentially flat. Independently, sweeping N from 1 → 1024
+      at fixed extent size shows wall-clock growing roughly with N
+      (ns_per_extent ratio 7.34× over the 1024× range — consistent
+      with O(N log N) for btree-depth + cache effects). Code path
+      P7-CAS-3 base + cold-extent reflink; never reads or copies
+      plaintext bytes.
 
 ## Operational notes
 

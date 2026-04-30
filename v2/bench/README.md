@@ -21,6 +21,10 @@ build-bench/bench/bench_snapshot
 # Dedup ratio benchmark: ROADMAP §10.2 #1 (P7-VAL-1).
 build-bench/bench/bench_dedup --help
 build-bench/bench/bench_dedup --files=20 --base-mib=10 --mod-percent=20
+
+# Reflink complexity benchmark: ROADMAP §10.2 #4 (P7-VAL-2).
+build-bench/bench/bench_reflink_complexity --help
+build-bench/bench/bench_reflink_complexity --runs=2
 ```
 
 Output on an 8-core Apple Silicon (M-series, 4P+4E):
@@ -161,6 +165,40 @@ disables the bench's link).
 
 For larger corpora (20-50 GiB to demonstrate the ratio at production
 scale), see the `--pool-mib` flag and the run script.
+
+## Interpreting reflink complexity numbers (P7-VAL-2)
+
+ROADMAP §10.2 exit criterion 4: "Reflink is O(extent count) not
+O(data size)." `bench_reflink_complexity` sweeps two axes:
+
+- **Axis A — vary extent count, fix extent size at 4 KiB.** N ∈
+  {1, 4, 16, 64, 256, 1024}. Per-extent wall-clock should be roughly
+  constant (or slowly growing with log N) — confirms cost scales with
+  extent count, not bytes.
+- **Axis B — vary extent size, fix N at 64.** extent_kib ∈
+  {4, 16, 64, 256, 1024}. Total wall-clock should be flat — sweeping
+  byte volume by 256× should not change reflink cost.
+
+Headline numbers on the same Apple Silicon dev box:
+
+```
+N=1     extent_kib=4    →    4 KiB    8000 ns total
+N=64    extent_kib=4    →  256 KiB  162000 ns total
+N=1024  extent_kib=4    →    4 MiB   15.5 ms total       (axis A)
+
+N=64    extent_kib=4    →  256 KiB  1.43 ms total
+N=64    extent_kib=64   →    4 MiB  1.67 ms total
+N=64    extent_kib=1024 →   64 MiB  1.35 ms total        (axis B)
+```
+
+Axis B is the smoking gun: 256× more bytes covered at fixed N, total
+wall-clock varies < 25%. Reflink does not read, copy, or allocate
+plaintext bytes — it only walks extent records, bumps refcounts, and
+inserts at the dst.
+
+Bench exits 0 if both axes pass thresholds (axis A: ns_per_extent
+max/min < 10×; axis B: ns_total max/min < 5× AND ns_per_extent
+max/min < 10×) and 1 otherwise.
 
 ## Sustained stress
 

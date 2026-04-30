@@ -18,5 +18,6 @@ specs/*.toolbox/
 third_party/BLAKE3_src/.git/
 third_party/xxHash_src/.git/
 
-# Benchmark output CSVs from bench/run_dedup.sh
+# Benchmark output CSVs from bench/run_dedup.sh / bench/run_reflink.sh
 bench/dedup_results_*.csv
+bench/reflink_results_*.csv
