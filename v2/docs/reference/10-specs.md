@@ -1178,14 +1178,24 @@ Buggy variants (both fire as designed):
   already-ALLOCATED inos. Silent double-issue. Fires
   `TupleUniqueAllTime`.
 
-Spec-to-code: implementation lands at P8-POSIX-1 substantive
-(deferred from this spec-only commit). The C-impl `src/inode/`
-module will provide `stm_inode_alloc` / `stm_inode_free` /
-`stm_inode_lookup` over a per-dataset inode tree. The two buggy
-configs serve as the adversarial-review checklist for the
-allocator's reuse path. Out-of-scope for this spec: nlink
-semantics (P8-POSIX-3), tagged data union state (P8-POSIX-5),
-on-disk persistence (composes via existing btree write paths).
+Spec-to-code:
+- `include/stratum/inode.h` — 256-byte `struct stm_inode_value`
+  per ARCH §11.3 + public API declarations.
+- `src/inode/inode.c` — in-memory allocator implementation.
+  `stm_inode_alloc` realizes `AllocFresh`; `stm_inode_free`
+  realizes `Free`. `AllocReused` is modeled in the spec but not
+  yet exercised by the C impl — alloc-fresh-only in P8-POSIX-1
+  preserves the (ino, gen) uniqueness invariant trivially since
+  every alloc is fresh. P8-POSIX-1b will add the reuse path with
+  the gen bump per `AllocReused`.
+- `tests/test_inode.c` — 19 tests exercising lifecycle, alloc
+  monotonicity, per-dataset isolation, free + ENOENT, double-free
+  refusal, set-with-identity-mismatch refusal (protects the
+  (ino, gen) invariant from caller error), count + next_ino
+  accessors, struct size assertion (256B per ARCH §11.3).
+- Out-of-scope here: nlink semantics (P8-POSIX-3), tagged data
+  union transitions (P8-POSIX-5), on-disk persistence
+  (P8-POSIX-1b).
 
 ### `namespace.tla` — per-connection 9P namespaces (P8-NS-1 entry)
 
