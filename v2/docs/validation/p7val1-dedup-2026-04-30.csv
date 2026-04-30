@@ -1,0 +1,5 @@
+scale,files,base_mib,mod_percent,avg_chunk_kib,total_written_bytes,unique_stored_bytes,cas_chunk_count,dedup_ratio,elapsed_sec
+medium,10,40,10,64,419430400,96346112,1270,4.35,3.85
+medium,20,40,20,64,838860800,260952064,3418,3.21,8.26
+medium,50,40,15,64,2097152000,469012480,6035,4.47,21.45
+medium,20,40,20,32,838860800,228573184,6077,3.67,9.20
