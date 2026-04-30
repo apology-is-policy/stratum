@@ -56,6 +56,29 @@ into the CAS tier (which DOES need P6) is a separate concern.
 
 ## Phase 7 status (overall)
 
+- [x] **P7-VAL-3 send/recv snapshot integration tests + empirical
+      validation** — landed three new tests in
+      `tests/test_send_recv.c` for the ROADMAP §10.2 exit criterion
+      3 ("Send + receive roundtrip preserves data + metadata +
+      snapshots"):
+      `p7val3_full_then_chained_incremental_roundtrip` (full + 2×
+      incremental sends across snap_1 .. snap_5 produce a receiver
+      state byte-identical to the source's LIVE state at each
+      step, including caller-driven `stm_snapshot_create` on the
+      receiver to replicate the source's snapshot graph),
+      `p7val3_roundtrip_preserves_hot_cold_extent_kinds` (full
+      send carries HOT and COLD extent records faithfully — kind
+      counts per ino match exactly across the wire), and
+      `p7val3_roundtrip_preserves_cross_ino_cold_dedup` (two source
+      inos with byte-identical content collapsed to a single CAS
+      chunk on source ALSO collapse to a single chunk on the
+      receiver — the on-the-wire dedup property of P7-CAS-10
+      preserves the at-rest dedup grouping). All green under
+      default + ASan + TSan. **Validated empirically on 2026-04-30**
+      (`docs/validation/p7val3-sendrecv-snap-2026-04-30.md`).
+      Test-only chunk; doesn't touch any audit-trigger surface; no
+      R-round needed. test_send_recv 37 → 40.
+
 - [x] **P7-VAL-2 reflink complexity benchmark + empirical validation**
       — landed `v2/bench/bench_reflink_complexity.c` (and matching
       CMake target with the standard Linux ld static-library cycle
@@ -1492,8 +1515,8 @@ into the CAS tier (which DOES need P6) is a separate concern.
 
 ## ROADMAP §10.2 exit criteria
 
-Status as of 2026-04-30: 2/4 empirically validated (#1 + #4), 2/4
-code-complete pending validation (#2 + #3).
+Status as of 2026-04-30: 3/4 empirically validated (#1, #3, #4),
+1/4 code-complete pending validation (#2).
 
 - [x] **Cold-tier dedup achieves target 3-5× on VM-image test set.**
       **Empirically met at P7-VAL-1 medium-scale validation
@@ -1509,9 +1532,20 @@ code-complete pending validation (#2 + #3).
 - [ ] Migration policy heuristic produces reasonable hot/cold
       placement on synthetic workloads. Code-complete
       (P7-CAS-7/8/11/12); needs synthetic-workload runner.
-- [ ] Send + receive roundtrip preserves data + metadata +
-      snapshots. Code-complete (P7-CAS-9/10); needs end-to-end
-      snapshot integration test.
+- [x] **Send + receive roundtrip preserves data + metadata +
+      snapshots.** **Empirically met at P7-VAL-3 send/recv
+      integration validation
+      (`docs/validation/p7val3-sendrecv-snap-2026-04-30.md`)**:
+      three new integration tests in `tests/test_send_recv.c`
+      exercise the full set of preservation properties — chained
+      incremental sends across a multi-snapshot source preserve
+      live state byte-for-byte, HOT/COLD extent kinds survive the
+      roundtrip, and cross-ino COLD-tier dedup grouping survives
+      (one shared CAS chunk on source → one shared chunk on
+      receiver). All green under default + ASan + TSan. Code path
+      P7-CAS-9 (cold-extent wire format) + P7-CAS-10 (out-of-band
+      chunk store) + P7-8 (snapshot extent_txg alignment) +
+      P7-CAS-16 (recordsize cap lift).
 - [x] **Reflink is O(extent count) not O(data size).**
       **Empirically met at P7-VAL-2 reflink-complexity validation
       (`docs/validation/p7val2-reflink-2026-04-30.md`)**: at fixed

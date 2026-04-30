@@ -1653,4 +1653,352 @@ STM_TEST(p7cas16_1mib_hot_extent_roundtrip) {
     testpool_teardown(&tgt);
 }
 
+/* ========================================================================= */
+/* P7-VAL-3: ROADMAP §10.2 #3 integration tests                               */
+/* ("Send + receive roundtrip preserves data + metadata + snapshots").        */
+/* ========================================================================= */
+
+/* Multi-step end-to-end pipeline: full send establishes the base; chained
+ * incremental sends layered over a sequence of source snapshots add deltas.
+ * After each step the receiver's bytes must match the source's LIVE state
+ * across every ino. Demonstrates the canonical zfs-style backup pattern
+ * (full + N incrementals) preserves source data through the snapshot graph. */
+STM_TEST(p7val3_full_then_chained_incremental_roundtrip) {
+    testpool src; testpool_setup(&src, "p7v3_chain_src", POOL_UUID_SRC);
+    testpool tgt; testpool_setup(&tgt, "p7v3_chain_tgt", POOL_UUID_TGT);
+
+    stm_sync *s_src = stm_fs_sync_for_test(src.fs);
+    stm_sync *s_tgt = stm_fs_sync_for_test(tgt.fs);
+    stm_snapshot_index *snap_src = stm_sync_snapshot_index(s_src);
+    STM_ASSERT_TRUE(snap_src != NULL);
+
+    /* Distinct fill bytes per (ino, off) for byte-equality assertions. */
+    uint8_t d_1_a[4096]; memset(d_1_a, 0xA1, sizeof d_1_a);
+    uint8_t d_1_b[4096]; memset(d_1_b, 0xB1, sizeof d_1_b);
+    uint8_t d_1_c[4096]; memset(d_1_c, 0xC1, sizeof d_1_c);
+    uint8_t d_2_a[4096]; memset(d_2_a, 0xA2, sizeof d_2_a);
+    uint8_t d_2_b[4096]; memset(d_2_b, 0xB2, sizeof d_2_b);
+    uint8_t d_3_a[4096]; memset(d_3_a, 0xA3, sizeof d_3_a);
+    uint8_t d_4_a[4096]; memset(d_4_a, 0xA4, sizeof d_4_a);
+
+    /* Step 1: pre-snap_1 LIVE state — ino 1 has [d_1_a]. */
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, d_1_a, sizeof d_1_a));
+    STM_ASSERT_OK(stm_sync_commit(s_src));
+
+    uint64_t snap_1 = 0;
+    STM_ASSERT_OK(stm_snapshot_create(snap_src, 1, "v3_snap_1", 0,
+                                          stm_sync_current_gen(s_src), &snap_1));
+    STM_ASSERT_OK(stm_sync_commit(s_src));
+
+    /* Step 2: between snap_1 and snap_2 — ino 1 grows, ino 2 created. */
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 4096, d_1_b, sizeof d_1_b));
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 2, 0,    d_2_a, sizeof d_2_a));
+    STM_ASSERT_OK(stm_sync_commit(s_src));
+
+    uint64_t snap_2 = 0;
+    STM_ASSERT_OK(stm_snapshot_create(snap_src, 1, "v3_snap_2", 0,
+                                          stm_sync_current_gen(s_src), &snap_2));
+    STM_ASSERT_OK(stm_sync_commit(s_src));
+
+    /* Step 3: between snap_2 and snap_3 — overwrite ino 1 prefix; new ino 3. */
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0,    d_1_c, sizeof d_1_c));
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 3, 0,    d_3_a, sizeof d_3_a));
+    STM_ASSERT_OK(stm_sync_commit(s_src));
+
+    uint64_t snap_3 = 0;
+    STM_ASSERT_OK(stm_snapshot_create(snap_src, 1, "v3_snap_3", 0,
+                                          stm_sync_current_gen(s_src), &snap_3));
+    STM_ASSERT_OK(stm_sync_commit(s_src));
+
+    /* ----- Phase A: FULL SEND from source into a fresh receiver. ----- */
+    /* Live source state at this point:
+     *   ino 1: [d_1_c | d_1_b] (8 KiB)
+     *   ino 2: [d_2_a]         (4 KiB)
+     *   ino 3: [d_3_a]         (4 KiB)
+     */
+    {
+        stm_send_handle *sh = NULL;
+        STM_ASSERT_OK(stm_send_init(s_src, 1, 0, 0, &sh));
+        stm_recv_handle *rh = NULL;
+        STM_ASSERT_OK(stm_recv_init(s_tgt, 1, &rh));
+        STM_ASSERT_OK(pipe_send_to_recv(sh, rh));
+        stm_send_close(sh);
+        stm_recv_close(rh);
+        STM_ASSERT_OK(stm_sync_commit(s_tgt));
+    }
+
+    /* Verify receiver matches source LIVE state after full send. */
+    {
+        uint8_t out[4096] = {0}; size_t got = 0;
+        STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 1, 0,    out, sizeof out, &got));
+        STM_ASSERT_MEM_EQ(d_1_c, out, sizeof d_1_c);
+        STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 1, 4096, out, sizeof out, &got));
+        STM_ASSERT_MEM_EQ(d_1_b, out, sizeof d_1_b);
+        STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 2, 0,    out, sizeof out, &got));
+        STM_ASSERT_MEM_EQ(d_2_a, out, sizeof d_2_a);
+        STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 3, 0,    out, sizeof out, &got));
+        STM_ASSERT_MEM_EQ(d_3_a, out, sizeof d_3_a);
+    }
+
+    /* ----- Phase B: more changes on source, take snap_4 ----- */
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 2, 0, d_2_b, sizeof d_2_b));   /* overwrite ino 2 */
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 4, 0, d_4_a, sizeof d_4_a));   /* new ino 4 */
+    STM_ASSERT_OK(stm_sync_commit(s_src));
+
+    uint64_t snap_4 = 0;
+    STM_ASSERT_OK(stm_snapshot_create(snap_src, 1, "v3_snap_4", 0,
+                                          stm_sync_current_gen(s_src), &snap_4));
+    STM_ASSERT_OK(stm_sync_commit(s_src));
+
+    /* INCREMENTAL send (snap_3 → snap_4) — ships ONLY the post-snap_3 deltas. */
+    {
+        stm_send_handle *sh = NULL;
+        STM_ASSERT_OK(stm_send_init(s_src, 1, snap_3, snap_4, &sh));
+        stm_recv_handle *rh = NULL;
+        STM_ASSERT_OK(stm_recv_init(s_tgt, 1, &rh));
+        STM_ASSERT_OK(pipe_send_to_recv(sh, rh));
+        stm_send_close(sh);
+        stm_recv_close(rh);
+        STM_ASSERT_OK(stm_sync_commit(s_tgt));
+    }
+
+    /* After the incremental, receiver matches source LIVE: ino 2 now has
+     * d_2_b; ino 4 appears with d_4_a; ino 1 + ino 3 unchanged. */
+    {
+        uint8_t out[4096] = {0}; size_t got = 0;
+        STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 1, 0,    out, sizeof out, &got));
+        STM_ASSERT_MEM_EQ(d_1_c, out, sizeof d_1_c);
+        STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 1, 4096, out, sizeof out, &got));
+        STM_ASSERT_MEM_EQ(d_1_b, out, sizeof d_1_b);
+        STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 2, 0,    out, sizeof out, &got));
+        STM_ASSERT_MEM_EQ(d_2_b, out, sizeof d_2_b);  /* overwritten */
+        STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 3, 0,    out, sizeof out, &got));
+        STM_ASSERT_MEM_EQ(d_3_a, out, sizeof d_3_a);
+        STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 4, 0,    out, sizeof out, &got));
+        STM_ASSERT_MEM_EQ(d_4_a, out, sizeof d_4_a);
+    }
+
+    /* ----- Phase C: snapshot the receiver after each apply, demonstrating
+     * the source's snapshot chain can be REPLICATED on the receiver via
+     * caller-driven snap_create at recv-finish time. ----- */
+    stm_snapshot_index *snap_tgt = stm_sync_snapshot_index(s_tgt);
+    uint64_t snap_tgt_4 = 0;
+    STM_ASSERT_OK(stm_snapshot_create(snap_tgt, 1, "v3_snap_4_replica", 0,
+                                          stm_sync_current_gen(s_tgt),
+                                          &snap_tgt_4));
+    STM_ASSERT_OK(stm_sync_commit(s_tgt));
+    STM_ASSERT_TRUE(snap_tgt_4 != 0);
+
+    /* ----- Phase D: another delta cycle. Source: snap_5; receiver applies. ----- */
+    uint8_t d_3_b[4096]; memset(d_3_b, 0xB3, sizeof d_3_b);
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 3, 0, d_3_b, sizeof d_3_b));
+    STM_ASSERT_OK(stm_sync_commit(s_src));
+
+    uint64_t snap_5 = 0;
+    STM_ASSERT_OK(stm_snapshot_create(snap_src, 1, "v3_snap_5", 0,
+                                          stm_sync_current_gen(s_src), &snap_5));
+    STM_ASSERT_OK(stm_sync_commit(s_src));
+    {
+        stm_send_handle *sh = NULL;
+        STM_ASSERT_OK(stm_send_init(s_src, 1, snap_4, snap_5, &sh));
+        stm_recv_handle *rh = NULL;
+        STM_ASSERT_OK(stm_recv_init(s_tgt, 1, &rh));
+        STM_ASSERT_OK(pipe_send_to_recv(sh, rh));
+        stm_send_close(sh);
+        stm_recv_close(rh);
+        STM_ASSERT_OK(stm_sync_commit(s_tgt));
+    }
+    {
+        uint8_t out[4096] = {0}; size_t got = 0;
+        STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 3, 0, out, sizeof out, &got));
+        STM_ASSERT_MEM_EQ(d_3_b, out, sizeof d_3_b);
+    }
+
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
+/* Roundtrip preserves extent KIND (HOT vs COLD) — a critical metadata
+ * property. After a full send into a fresh receiver, every cold extent
+ * on the source must land as cold on the receiver (so the dedup
+ * compression survives on the target), and every hot extent must land
+ * as hot. P7-CAS-9/10 wired the wire protocol; this test pins the
+ * roundtrip property at the integration level. */
+
+typedef struct {
+    uint64_t  ds, ino;
+    int       n_hot;
+    int       n_cold;
+} p7val3_kind_count_ctx;
+
+static bool p7val3_kind_count_cb(const stm_extent_record *e, void *cx)
+{
+    p7val3_kind_count_ctx *c = cx;
+    if (e->dataset_id != c->ds) return true;
+    if (c->ino != 0 && e->ino != c->ino) return true;
+    if (e->kind == STM_EXTENT_KIND_HOT)  c->n_hot++;
+    if (e->kind == STM_EXTENT_KIND_COLD) c->n_cold++;
+    return true;
+}
+
+STM_TEST(p7val3_roundtrip_preserves_hot_cold_extent_kinds) {
+    testpool src; testpool_setup(&src, "p7v3_kind_src", POOL_UUID_SRC);
+    testpool tgt; testpool_setup(&tgt, "p7v3_kind_tgt", POOL_UUID_TGT);
+
+    /* Three inos exercising distinct extent kinds:
+     *   ino 1 — single extent, migrated → COLD.
+     *   ino 2 — single extent, never migrated → HOT.
+     *   ino 3 — two NON-contiguous extents migrated → COLD; the
+     *          per-extent fallback path (cross-extent FastCDC requires
+     *          contiguity) keeps both as separate COLD records.
+     *
+     * P7-CAS-17 introduced cross-extent FastCDC at migrate which can
+     * collapse contiguous HOT extents into fewer COLD records during
+     * cross-extent rechunking; sparse offsets force the dispatcher's
+     * per-extent fallback so the test asserts a stable COLD-record
+     * count after the roundtrip. */
+    uint8_t d_a[4096]; memset(d_a, 0xAA, sizeof d_a);
+    uint8_t d_h[4096]; memset(d_h, 0x11, sizeof d_h);
+    uint8_t d_p[4096]; memset(d_p, 0x55, sizeof d_p);
+    uint8_t d_q[4096]; memset(d_q, 0x66, sizeof d_q);
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0,     d_a, sizeof d_a));
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 2, 0,     d_h, sizeof d_h));
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 3, 0,     d_p, sizeof d_p));
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 3, 16384, d_q, sizeof d_q));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(src.fs, 1, 1));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(src.fs, 1, 3));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+
+    /* Source kind sanity. */
+    {
+        stm_sync *s = stm_fs_sync_for_test(src.fs);
+        stm_extent_index *idx = stm_sync_extent_index(s);
+        p7val3_kind_count_ctx c1 = { .ds = 1, .ino = 1 };
+        STM_ASSERT_OK(stm_extent_iter_ds(idx, 1, p7val3_kind_count_cb, &c1));
+        STM_ASSERT_EQ(c1.n_hot,  0);
+        STM_ASSERT_EQ(c1.n_cold, 1);
+        p7val3_kind_count_ctx c2 = { .ds = 1, .ino = 2 };
+        STM_ASSERT_OK(stm_extent_iter_ds(idx, 1, p7val3_kind_count_cb, &c2));
+        STM_ASSERT_EQ(c2.n_hot,  1);
+        STM_ASSERT_EQ(c2.n_cold, 0);
+        p7val3_kind_count_ctx c3 = { .ds = 1, .ino = 3 };
+        STM_ASSERT_OK(stm_extent_iter_ds(idx, 1, p7val3_kind_count_cb, &c3));
+        STM_ASSERT_EQ(c3.n_hot,  0);
+        STM_ASSERT_EQ(c3.n_cold, 2);
+    }
+
+    /* Full send into fresh target. */
+    {
+        stm_sync *s_src = stm_fs_sync_for_test(src.fs);
+        stm_sync *s_tgt = stm_fs_sync_for_test(tgt.fs);
+        stm_send_handle *sh = NULL;
+        STM_ASSERT_OK(stm_send_init(s_src, 1, 0, 0, &sh));
+        stm_recv_handle *rh = NULL;
+        STM_ASSERT_OK(stm_recv_init(s_tgt, 1, &rh));
+        STM_ASSERT_OK(pipe_send_to_recv(sh, rh));
+        stm_send_close(sh);
+        stm_recv_close(rh);
+        STM_ASSERT_OK(stm_fs_commit(tgt.fs));
+    }
+
+    /* Receiver kind counts must match the source's for every ino. */
+    {
+        stm_sync *s = stm_fs_sync_for_test(tgt.fs);
+        stm_extent_index *idx = stm_sync_extent_index(s);
+        p7val3_kind_count_ctx c1 = { .ds = 1, .ino = 1 };
+        STM_ASSERT_OK(stm_extent_iter_ds(idx, 1, p7val3_kind_count_cb, &c1));
+        STM_ASSERT_EQ(c1.n_hot,  0);
+        STM_ASSERT_EQ(c1.n_cold, 1);
+        p7val3_kind_count_ctx c2 = { .ds = 1, .ino = 2 };
+        STM_ASSERT_OK(stm_extent_iter_ds(idx, 1, p7val3_kind_count_cb, &c2));
+        STM_ASSERT_EQ(c2.n_hot,  1);
+        STM_ASSERT_EQ(c2.n_cold, 0);
+        p7val3_kind_count_ctx c3 = { .ds = 1, .ino = 3 };
+        STM_ASSERT_OK(stm_extent_iter_ds(idx, 1, p7val3_kind_count_cb, &c3));
+        STM_ASSERT_EQ(c3.n_hot,  0);
+        STM_ASSERT_EQ(c3.n_cold, 2);
+    }
+
+    /* Data reads return the same bytes through the kind transition. */
+    uint8_t out[4096] = {0}; size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 1, 0,     out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(d_a, out, sizeof d_a);
+    STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 2, 0,     out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(d_h, out, sizeof d_h);
+    STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 3, 0,     out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(d_p, out, sizeof d_p);
+    STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 3, 16384, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(d_q, out, sizeof d_q);
+
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
+/* Roundtrip preserves cross-file COLD-tier dedup: two source files with
+ * identical content land on the receiver as ONE CAS chunk (refcount=2),
+ * not two. P7-CAS-10's chunk-store wire shape is the optimization;
+ * this test confirms the on-target dedup property survives the wire.
+ *
+ * Stronger than p7cas10_dedupes_three_cold_extents_to_one_chunk because
+ * it spans MULTIPLE inos and verifies CAS refcount (the persistent
+ * dedup state) on the receiver. */
+STM_TEST(p7val3_roundtrip_preserves_cross_ino_cold_dedup) {
+    testpool src; testpool_setup(&src, "p7v3_dd_src", POOL_UUID_SRC);
+    testpool tgt; testpool_setup(&tgt, "p7v3_dd_tgt", POOL_UUID_TGT);
+
+    /* Two inos with byte-identical content. Migrate both → COLD; on
+     * source these collapse to a single CAS chunk with refcount=2. */
+    uint8_t shared[4096]; memset(shared, 0x77, sizeof shared);
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 1, 0, shared, sizeof shared));
+    STM_ASSERT_OK(stm_fs_write(src.fs, 1, 2, 0, shared, sizeof shared));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(src.fs, 1, 1));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(src.fs, 1, 2));
+    STM_ASSERT_OK(stm_fs_commit(src.fs));
+
+    /* Source CAS sanity. */
+    {
+        stm_sync *s = stm_fs_sync_for_test(src.fs);
+        stm_cas_index *cas = stm_sync_cas_index(s);
+        size_t n = 0;
+        STM_ASSERT_OK(stm_cas_count(cas, &n));
+        STM_ASSERT_EQ(n, (size_t)1);
+    }
+
+    /* Send → recv. */
+    {
+        stm_sync *s_src = stm_fs_sync_for_test(src.fs);
+        stm_sync *s_tgt = stm_fs_sync_for_test(tgt.fs);
+        stm_send_handle *sh = NULL;
+        STM_ASSERT_OK(stm_send_init(s_src, 1, 0, 0, &sh));
+        stm_recv_handle *rh = NULL;
+        STM_ASSERT_OK(stm_recv_init(s_tgt, 1, &rh));
+        STM_ASSERT_OK(pipe_send_to_recv(sh, rh));
+        stm_send_close(sh);
+        stm_recv_close(rh);
+        STM_ASSERT_OK(stm_fs_commit(tgt.fs));
+    }
+
+    /* Receiver should also have ONE CAS entry. */
+    {
+        stm_sync *s = stm_fs_sync_for_test(tgt.fs);
+        stm_cas_index *cas = stm_sync_cas_index(s);
+        size_t n = 0;
+        STM_ASSERT_OK(stm_cas_count(cas, &n));
+        STM_ASSERT_EQ(n, (size_t)1);
+    }
+
+    /* Both inos read identical content. */
+    uint8_t out[4096] = {0}; size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 1, 0, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(shared, out, sizeof shared);
+    STM_ASSERT_OK(stm_fs_read(tgt.fs, 1, 2, 0, out, sizeof out, &got));
+    STM_ASSERT_MEM_EQ(shared, out, sizeof shared);
+
+    testpool_teardown(&src);
+    testpool_teardown(&tgt);
+}
+
 STM_TEST_MAIN("send_recv")

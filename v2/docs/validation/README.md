@@ -21,6 +21,7 @@ Examples: `p7val1-dedup-2026-04-30.csv`, `p9-zfs-comparison-2027-XX-XX.csv`.
 |---|---|---|---|
 | [p7val1-dedup-2026-04-30](p7val1-dedup-2026-04-30.md) | 2026-04-30 | ROADMAP §10.2 exit criterion 1 (3-5× dedup on VM-image set) | **MET** — 4 configurations all in 3.21×-4.47× band |
 | [p7val2-reflink-2026-04-30](p7val2-reflink-2026-04-30.md) | 2026-04-30 | ROADMAP §10.2 exit criterion 4 (reflink O(extent count) not O(data size)) | **MET** — wall-clock independent of bytes (1.24× over 256× byte-volume change); grows with extent count (7.34× ns/extent ratio over 1024× extent-count change) |
+| [p7val3-sendrecv-snap-2026-04-30](p7val3-sendrecv-snap-2026-04-30.md) | 2026-04-30 | ROADMAP §10.2 exit criterion 3 (send/recv preserves data + metadata + snapshots) | **MET** — 3 new integration tests exercise full + chained-incremental snapshot pipeline, HOT/COLD kind preservation, cross-ino dedup preservation; all green under default + ASan + TSan |
 
 ## Adding a new artifact
 
