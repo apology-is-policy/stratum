@@ -1215,6 +1215,15 @@ Spec-to-code:
   inode_root_paddr/csum/gen triple, compute_merkle_root folding
   inode_csum (R70 P0-1) — first-commit (1-phase) and second-commit
   (2-phase) paths both exercised.
+- `tests/test_sync.c::sync_dirent_persistence_roundtrip` — R72 P2-1
+  end-to-end coverage of sync.c's dirent wiring (analog of inode
+  variant): set_storage / set_crypt_ctx / load_at order between
+  inode_idx and dirent_idx, bp_kind check on
+  `ub_dirent_root.bp_kind`, csum mirror in `s->dirent_root_csum`,
+  build_uberblock with the dirent_root_paddr/csum/gen triple,
+  compute_merkle_root folding dirent_csum as the 9th input.
+  Exercises 4 dirent records across 2 (ds, dir) pairs with one
+  tombstoned, plus tombstone-slot-reuse post-load (R72 P3-2).
 - Out-of-scope here: nlink semantics (P8-POSIX-3), tagged data
   union transitions (P8-POSIX-5).
 
