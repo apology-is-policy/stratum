@@ -1541,6 +1541,8 @@ stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
             }
             iv.si_data_len = (uint8_t)new_size;
             iv.si_size     = stm_store_le64(new_size);
+            /* R76 P3-1 / R78 P3-1: stm_inode_set infallible in this
+             * lock posture (see fs_write_regular_locked's annotation). */
             stm_status rs = stm_inode_set(iidx, dataset_id, ino, &iv);
             pthread_mutex_unlock(&fs->lock);
             return rs;
@@ -1581,6 +1583,9 @@ stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
         iv.si_data_len  = 0;
         memset(&iv.si_data, 0, sizeof iv.si_data);
         iv.si_size      = stm_store_le64(new_size);
+        /* R76 P3-1 / R78 P3-1: stm_inode_set infallible in this lock
+         * posture — fs->lock excludes every alloc/free path that
+         * could mutate (state, gen, nlink, kind) behind our back. */
         stm_status rs = stm_inode_set(iidx, dataset_id, ino, &iv);
         pthread_mutex_unlock(&fs->lock);
         return rs;
@@ -1612,6 +1617,8 @@ stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
          * that have no extent record — POSIX-correct zero-fill. */
 
         iv.si_size = stm_store_le64(new_size);
+        /* R76 P3-2 / R78 P3-1: stm_inode_set infallible — same lock-
+         * posture argument. Only mutated field is si_size. */
         stm_status rs = stm_inode_set(iidx, dataset_id, ino, &iv);
         pthread_mutex_unlock(&fs->lock);
         return rs;

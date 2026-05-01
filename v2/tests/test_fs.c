@@ -9470,4 +9470,92 @@ STM_TEST(fs_p10_truncate_noop_returns_ok) {
     unlink(g_key_path);
 }
 
+/* R78 P3-2: lock truncate-then-write composition. Two scenarios: */
+
+STM_TEST(fs_p10_r78_p3_2_truncate_then_write_within_inline) {
+    /* INLINE-grow to 80 (zero-fill), then write at offset 90 within
+     * inline cap. Expected: zero-fill from 80 to 90, write at 90. */
+    make_tmp("p10_r78_inline_then_write");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+    /* Initial 20 bytes 'A'. */
+    uint8_t a[20];
+    memset(a, 'A', sizeof a);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, a, 20));
+
+    /* Truncate to 80 — zero-fills [20, 80). */
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, f, 80));
+
+    /* Write 5 'B' bytes at offset 90 — extends to 95, zero-fills
+     * [80, 90) which was already zeroed by truncate. */
+    uint8_t b[5];
+    memset(b, 'B', sizeof b);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 90, b, 5));
+
+    struct stm_inode_value iv = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &iv));
+    STM_ASSERT_EQ(iv.si_data_kind, (uint8_t)STM_DATA_INLINE);
+    STM_ASSERT_EQ(iv.si_data_len, (uint8_t)95);
+    STM_ASSERT_EQ(stm_load_le64(iv.si_size), (uint64_t)95);
+    /* Bytes [0..20) = 'A', [20..90) = 0, [90..95) = 'B'. */
+    for (size_t i = 0; i < 20; i++) STM_ASSERT_EQ(iv.si_data.inline_data[i], (uint8_t)'A');
+    for (size_t i = 20; i < 90; i++) STM_ASSERT_EQ(iv.si_data.inline_data[i], (uint8_t)0);
+    for (size_t i = 90; i < 95; i++) STM_ASSERT_EQ(iv.si_data.inline_data[i], (uint8_t)'B');
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p10_r78_p3_2_truncate_extent_then_write_inside_no_size_regress) {
+    /* EXTENT grow to 8 KiB via truncate, then overwrite first 4 KiB
+     * via fs_write. si_size must remain 8192 — write at offset 0
+     * with len 4096 ends at 4096 which is < cur_size; the bump-only
+     * logic in fs_write_regular_locked must not regress si_size. */
+    make_tmp("p10_r78_extent_no_regress");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+    /* Force EXTENT via 4 KiB write. */
+    uint8_t blk[4096];
+    memset(blk, 'X', sizeof blk);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, blk, 4096));
+
+    /* Truncate-grow to 8 KiB. */
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, f, 8192));
+
+    /* Overwrite first 4 KiB. */
+    uint8_t blk2[4096];
+    memset(blk2, 'Y', sizeof blk2);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, blk2, 4096));
+
+    /* si_size must NOT regress to 4096. */
+    struct stm_inode_value iv = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &iv));
+    STM_ASSERT_EQ(stm_load_le64(iv.si_size), (uint64_t)8192);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")
