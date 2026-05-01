@@ -9172,4 +9172,302 @@ STM_TEST(fs_p8_r77_p1_1_inode_set_rejects_oversize_si_data_len) {
     unlink(g_key_path);
 }
 
+/* ========================================================================= */
+/* P8-POSIX-10: truncate.                                                     */
+/* ========================================================================= */
+
+STM_TEST(fs_p10_truncate_inline_shrink) {
+    /* INLINE file shrink: si_data_len + si_size shrink in lockstep,
+     * kind stays INLINE. */
+    make_tmp("p10_inline_shrink");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+    uint8_t buf[80];
+    memset(buf, 'A', sizeof buf);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, buf, 80));
+
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, f, 30));
+    struct stm_inode_value iv = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &iv));
+    STM_ASSERT_EQ(iv.si_data_kind, (uint8_t)STM_DATA_INLINE);
+    STM_ASSERT_EQ(iv.si_data_len, (uint8_t)30);
+    STM_ASSERT_EQ(stm_load_le64(iv.si_size), (uint64_t)30);
+    /* Bytes 30..80 are unreachable now; reads past EOF return 0. */
+    uint8_t out[80] = {0};
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, f, 0, out, 80, &n));
+    STM_ASSERT_EQ(n, (size_t)30);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p10_truncate_inline_grow_within_cap) {
+    /* INLINE file grow within inline cap: zero-fill the gap. */
+    make_tmp("p10_inline_grow");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+    uint8_t buf[20];
+    memset(buf, 'B', sizeof buf);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, buf, 20));
+
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, f, 80));
+    struct stm_inode_value iv = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &iv));
+    STM_ASSERT_EQ(iv.si_data_kind, (uint8_t)STM_DATA_INLINE);
+    STM_ASSERT_EQ(iv.si_data_len, (uint8_t)80);
+    STM_ASSERT_EQ(stm_load_le64(iv.si_size), (uint64_t)80);
+    /* Bytes 0..20 = 'B'; bytes 20..80 = 0. */
+    for (size_t i = 0; i < 20; i++) STM_ASSERT_EQ(iv.si_data.inline_data[i], (uint8_t)'B');
+    for (size_t i = 20; i < 80; i++) STM_ASSERT_EQ(iv.si_data.inline_data[i], (uint8_t)0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p10_truncate_inline_grow_past_cap_transitions) {
+    /* INLINE file grow past inline cap: triggers transition to
+     * EXTENT (just like a write past the cap would). */
+    make_tmp("p10_inline_to_extent");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+    uint8_t prefix[40];
+    memset(prefix, 'C', sizeof prefix);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, prefix, 40));
+
+    /* Truncate to 4096 — past inline cap, triggers transition. */
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, f, 4096));
+
+    struct stm_inode_value iv = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &iv));
+    STM_ASSERT_EQ(iv.si_data_kind, (uint8_t)STM_DATA_EXTENT);
+    STM_ASSERT_EQ(stm_load_le64(iv.si_size), (uint64_t)4096);
+
+    /* Read back: bytes 0..40 = 'C', bytes 40..4096 = 0. */
+    uint8_t out[4096] = {0};
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, f, 0, out, 4096, &n));
+    STM_ASSERT_EQ(n, (size_t)4096);
+    for (size_t i = 0; i < 40; i++) STM_ASSERT_EQ(out[i], (uint8_t)'C');
+    for (size_t i = 40; i < 4096; i++) STM_ASSERT_EQ(out[i], (uint8_t)0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p10_truncate_extent_shrink) {
+    /* EXTENT file shrink to a 4 KiB-aligned size. */
+    make_tmp("p10_extent_shrink");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+    /* Force EXTENT: write 8 KiB. */
+    uint8_t blk[8192];
+    memset(blk, 'D', sizeof blk);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, blk, 8192));
+
+    /* Verify EXTENT. */
+    struct stm_inode_value iv = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &iv));
+    STM_ASSERT_EQ(iv.si_data_kind, (uint8_t)STM_DATA_EXTENT);
+    STM_ASSERT_EQ(stm_load_le64(iv.si_size), (uint64_t)8192);
+
+    /* Truncate to 4 KiB. Stays EXTENT (one-way). */
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, f, 4096));
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &iv));
+    STM_ASSERT_EQ(iv.si_data_kind, (uint8_t)STM_DATA_EXTENT);
+    STM_ASSERT_EQ(stm_load_le64(iv.si_size), (uint64_t)4096);
+
+    /* Read past new EOF returns 0 bytes. */
+    uint8_t out[4096];
+    size_t n = 999;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, f, 4096, out, 4096, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p10_truncate_extent_to_zero_stays_extent) {
+    /* ARCH §11.3.3 one-way: truncate to 0 from EXTENT does NOT
+     * revert to INLINE. Kind stays EXTENT. */
+    make_tmp("p10_extent_zero");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+    uint8_t blk[4096];
+    memset(blk, 'E', sizeof blk);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, blk, 4096));
+
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, f, 0));
+    struct stm_inode_value iv = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &iv));
+    STM_ASSERT_EQ(iv.si_data_kind, (uint8_t)STM_DATA_EXTENT);   /* one-way */
+    STM_ASSERT_EQ(stm_load_le64(iv.si_size), (uint64_t)0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p10_truncate_extent_grow_zerofills) {
+    /* EXTENT grow: si_size advances; reads in [old_size, new_size)
+     * return 0 (sparse extent semantics). */
+    make_tmp("p10_extent_grow");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+    uint8_t blk[4096];
+    memset(blk, 'F', sizeof blk);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, blk, 4096));
+
+    /* Grow to 8 KiB. */
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, f, 8192));
+    struct stm_inode_value iv = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &iv));
+    STM_ASSERT_EQ(stm_load_le64(iv.si_size), (uint64_t)8192);
+
+    /* Read [4096, 8192) returns zeros (sparse). */
+    uint8_t out[4096];
+    memset(out, 0xFF, sizeof out);
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, f, 4096, out, 4096, &n));
+    STM_ASSERT_EQ(n, (size_t)4096);
+    for (size_t i = 0; i < 4096; i++) STM_ASSERT_EQ(out[i], (uint8_t)0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p10_truncate_arg_validation) {
+    make_tmp("p10_argv");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+
+    STM_ASSERT_ERR(stm_fs_truncate(NULL, 1, f, 0), STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_truncate(fs, 0, f, 0), STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_truncate(fs, 1, 0, 0), STM_EINVAL);
+    /* Missing inode → ENOENT. */
+    STM_ASSERT_ERR(stm_fs_truncate(fs, 1, 9999, 0), STM_ENOENT);
+    /* Directory → EISDIR per POSIX. */
+    STM_ASSERT_ERR(stm_fs_truncate(fs, 1, root, 0), STM_EISDIR);
+    /* Non-S_IFREG (symlink) → EINVAL. */
+    uint64_t lnk = 0;
+    STM_ASSERT_OK(stm_fs_symlink(fs, 1, root, (const uint8_t *)"l", 1,
+                                       (const uint8_t *)"x", 1, 0, 0, &lnk));
+    STM_ASSERT_ERR(stm_fs_truncate(fs, 1, lnk, 0), STM_EINVAL);
+
+    /* EXTENT-mode sub-block truncate → EINVAL. Force EXTENT first. */
+    uint8_t blk[4096];
+    memset(blk, 'X', sizeof blk);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, blk, 4096));
+    STM_ASSERT_ERR(stm_fs_truncate(fs, 1, f, 100), STM_EINVAL);   /* not aligned */
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p10_truncate_noop_returns_ok) {
+    /* Truncate to current size is a no-op. */
+    make_tmp("p10_noop");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+    uint8_t buf[20];
+    memset(buf, 'G', sizeof buf);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, buf, 20));
+
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, f, 20));
+    struct stm_inode_value iv = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &iv));
+    STM_ASSERT_EQ(iv.si_data_kind, (uint8_t)STM_DATA_INLINE);
+    STM_ASSERT_EQ(stm_load_le64(iv.si_size), (uint64_t)20);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")

@@ -446,6 +446,60 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
                           const uint8_t *dst_name, uint8_t dst_name_len);
 
 /* ========================================================================= */
+/* P8-POSIX-10: truncate (regular file).                                      */
+/* ========================================================================= */
+
+/*
+ * POSIX-shape `truncate(2)` for a regular file at (dataset_id, ino).
+ * The file is shrunk or grown to exactly `new_size` bytes:
+ *
+ *   - SHRINK (new_size < si_size):
+ *       INLINE: just shrink si_data_len + si_size. data bytes past
+ *               new_size become unreachable (POSIX-correct).
+ *       EXTENT: stm_sync_truncate drops past-EOF extents + drop-routes
+ *               their paddrs through the snapshot dead-list (P7-11 +
+ *               P7-12); requires `new_size` 4 KiB-aligned; update
+ *               si_size. Per ARCH §11.3.3, kind STAYS EXTENT even when
+ *               new_size ≤ STM_INODE_INLINE_MAX (one-way invariant
+ *               from inode.tla::OneWayInlineToExtent).
+ *
+ *   - GROW (new_size > si_size):
+ *       INLINE + new_size ≤ STM_INODE_INLINE_MAX: zero-fill
+ *               si_inline_data[si_data_len .. new_size); update
+ *               si_data_len + si_size; stays INLINE.
+ *       INLINE + new_size > STM_INODE_INLINE_MAX: triggers the same
+ *               combined-buffer transition as P8-POSIX-5's grow-
+ *               write — flushes existing inline prefix + zero-pad to
+ *               next 4 KiB boundary; flips si_data_kind=EXTENT.
+ *       EXTENT: just update si_size. POSIX grow-truncate zero-fills
+ *               the extended portion; the extent layer's sparse-
+ *               read semantics return 0 for any offset in the
+ *               [old_size, new_size) range that has no extent record,
+ *               which is exactly what POSIX requires.
+ *
+ *   - NO-OP (new_size == si_size): inode unchanged; STM_OK.
+ *
+ * Refusals:
+ *   - NULL fs (STM_EINVAL).
+ *   - dataset_id == 0 OR ino == 0 (STM_EINVAL).
+ *   - inode not found OR FREED (STM_ENOENT).
+ *   - inode is a directory (STM_EISDIR) — POSIX truncate(2) returns
+ *     EISDIR for directory operands.
+ *   - inode is not S_IFREG (STM_EINVAL — symlink / device truncate
+ *     not supported in MVP).
+ *   - EXTENT-mode truncate with non-4 KiB-aligned `new_size`
+ *     (STM_EINVAL — sub-block truncate would require read-modify-
+ *     write at the bdev; deferred).
+ *   - INLINE-to-EXTENT transition where new_size > STM_FS_RECORDSIZE_MAX
+ *     (STM_ERANGE — caller can split via stm_fs_write at smaller
+ *     chunks, then truncate down).
+ *   - fs read-only or wedged (STM_EROFS / STM_EWEDGED).
+ */
+STM_MUST_USE
+stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                              uint64_t new_size);
+
+/* ========================================================================= */
 /* P8-POSIX-8: symlinks.                                                      */
 /* ========================================================================= */
 

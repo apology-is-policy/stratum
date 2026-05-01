@@ -1481,6 +1481,148 @@ stm_status stm_fs_readlink(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 }
 
 /* ========================================================================= */
+/* P8-POSIX-10: stm_fs_truncate.                                              */
+/* ========================================================================= */
+
+stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                              uint64_t new_size)
+{
+    if (!fs) return STM_EINVAL;
+    if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+
+    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+    if (!iidx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;
+    }
+
+    struct stm_inode_value iv = {0};
+    stm_status ls = stm_inode_lookup(iidx, dataset_id, ino, &iv);
+    if (ls != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return ls;       /* STM_ENOENT */
+    }
+
+    uint32_t mode = stm_load_le32(iv.si_mode);
+    uint32_t ifmt = mode & (uint32_t)S_IFMT;
+    if (ifmt == (uint32_t)S_IFDIR) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EISDIR;       /* POSIX truncate(2): EISDIR */
+    }
+    if (ifmt != (uint32_t)S_IFREG) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;       /* symlink / device / etc. */
+    }
+
+    /* R77 P1-1 defense-in-depth — bound si_data_len. */
+    if (iv.si_data_kind == STM_DATA_INLINE &&
+        iv.si_data_len > STM_INODE_INLINE_MAX) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_ECORRUPT;
+    }
+
+    uint64_t cur_size = stm_load_le64(iv.si_size);
+    if (new_size == cur_size) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_OK;       /* no-op */
+    }
+
+    uint8_t kind = iv.si_data_kind;
+
+    if (kind == STM_DATA_INLINE) {
+        if (new_size <= (uint64_t)STM_INODE_INLINE_MAX) {
+            /* Stays inline. Grow zero-fills; shrink truncates. */
+            if (new_size > (uint64_t)iv.si_data_len) {
+                memset(iv.si_data.inline_data + iv.si_data_len, 0,
+                       (size_t)(new_size - iv.si_data_len));
+            }
+            iv.si_data_len = (uint8_t)new_size;
+            iv.si_size     = stm_store_le64(new_size);
+            stm_status rs = stm_inode_set(iidx, dataset_id, ino, &iv);
+            pthread_mutex_unlock(&fs->lock);
+            return rs;
+        }
+
+        /* Grow past inline cap → transition to EXTENT. Build a
+         * single block-aligned combined buffer (existing inline prefix
+         * + zero pad to next 4 KiB boundary). Same shape as
+         * fs_write_regular_locked's transition path. */
+        if (new_size > (uint64_t)STM_FS_RECORDSIZE_MAX) {
+            pthread_mutex_unlock(&fs->lock);
+            return STM_ERANGE;
+        }
+
+        const uint64_t BLK = 4096u;
+        uint64_t aligned_size = (new_size + BLK - 1u) & ~(BLK - 1u);
+        if (aligned_size == 0u) aligned_size = BLK;
+
+        uint8_t *combined = calloc(1, (size_t)aligned_size);
+        if (!combined) {
+            pthread_mutex_unlock(&fs->lock);
+            return STM_ENOMEM;
+        }
+        if (iv.si_data_len > 0u) {
+            memcpy(combined, iv.si_data.inline_data, iv.si_data_len);
+        }
+        stm_status ws = stm_sync_write_extent(fs->sync, dataset_id, ino,
+                                                  /*off=*/0u,
+                                                  combined,
+                                                  (size_t)aligned_size);
+        free(combined);
+        if (ws != STM_OK) {
+            pthread_mutex_unlock(&fs->lock);
+            return ws;
+        }
+
+        iv.si_data_kind = STM_DATA_EXTENT;
+        iv.si_data_len  = 0;
+        memset(&iv.si_data, 0, sizeof iv.si_data);
+        iv.si_size      = stm_store_le64(new_size);
+        stm_status rs = stm_inode_set(iidx, dataset_id, ino, &iv);
+        pthread_mutex_unlock(&fs->lock);
+        return rs;
+    }
+
+    if (kind == STM_DATA_EXTENT) {
+        /* EXTENT mode. Per ARCH §11.3.3 / inode.tla::OneWayInlineToExtent:
+         * once EXTENT, stays EXTENT — even when new_size ≤ inline cap. */
+        const uint64_t BLK = 4096u;
+        if ((new_size & (BLK - 1u)) != 0u) {
+            /* Sub-block truncate not supported. POSIX truncate(2) accepts
+             * arbitrary new_size; sync_truncate's MVP requires 4 KiB
+             * alignment. Caller must align the truncate point. */
+            pthread_mutex_unlock(&fs->lock);
+            return STM_EINVAL;
+        }
+
+        if (new_size < cur_size) {
+            /* Shrink: drop past-EOF extents. */
+            stm_status ts = stm_sync_truncate(fs->sync, dataset_id, ino,
+                                                 new_size);
+            if (ts != STM_OK) {
+                pthread_mutex_unlock(&fs->lock);
+                return ts;
+            }
+        }
+        /* Grow case: just update si_size. The extent layer's sparse-
+         * read semantics return 0 for offsets in [cur_size, new_size)
+         * that have no extent record — POSIX-correct zero-fill. */
+
+        iv.si_size = stm_store_le64(new_size);
+        stm_status rs = stm_inode_set(iidx, dataset_id, ino, &iv);
+        pthread_mutex_unlock(&fs->lock);
+        return rs;
+    }
+
+    /* SYMLINK / DEVICE — not a regular-file kind; rejected. */
+    pthread_mutex_unlock(&fs->lock);
+    return STM_ENOTSUPPORTED;
+}
+
+/* ========================================================================= */
 /* P8-POSIX-4: stm_fs_readdir.                                                */
 /* ========================================================================= */
 
