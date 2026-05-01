@@ -627,6 +627,87 @@ STM_TEST(sync_xattr_persistence_roundtrip) {
     unlink(g_tmp_path);
 }
 
+/* R80 P2-2 regression: tamper-detection on `ub_xattr_root.bp_csum`.
+ *
+ * The R47 P2-1 / R70 P0-1 / R72 lesson: every load-bearing tree-root
+ * field MUST be folded into compute_merkle_root in the same commit
+ * that introduces the field. P8-POSIX-6 added `xattr_csum` as the
+ * 10th input. Without a tamper-injection test, a future regression
+ * dropping `xattr_csum` from BOTH commit AND open-recompute paths
+ * would preserve the consistency tests' write+read agreement (both
+ * sides would compute the SAME wrong merkle_root) — silent regression.
+ *
+ * This test directly tampers the on-disk `ub_xattr_root.bp_csum`,
+ * recomputes `ub_csum` to match the tampered SB (so the SB's own
+ * integrity check passes), then attempts to mount. The Merkle
+ * recompute at sync_open MUST detect the tamper because xattr_csum
+ * is one of the 10 chained inputs — a tampered csum produces a
+ * different recomputed merkle_root that fails the on-disk
+ * comparison.
+ *
+ * If a future change drops xattr_csum from compute_merkle_root, the
+ * recompute would AGREE with the tampered SB (because ub_csum
+ * doesn't depend on xattr_root.bp_csum either) and the mount would
+ * succeed with a swapped xattr tree. This test fires when that
+ * regression lands.
+ *
+ * Same shape as the dirent / inode tamper-detection tests are
+ * expected to land at P8-POSIX-11 (per audit forward-note). */
+STM_TEST(sync_xattr_root_csum_tamper_detected) {
+    make_tmp("xattr_tamper");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
+
+    /* Set one xattr so the xattr tree's root is non-zero post-commit. */
+    stm_xattr_index *xidx = stm_sync_xattr_index(s);
+    STM_ASSERT_OK(stm_xattr_set(xidx, 1, 100,
+                                   (const uint8_t *)"user.k", 6,
+                                   (const uint8_t *)"v", 1, 0, NULL));
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    /* Capture the live UB's (label, slot). */
+    stm_sync_info info;
+    STM_ASSERT_OK(stm_sync_info_get(s, &info));
+    uint32_t live_label = info.live_label_idx;
+    uint32_t live_slot  = info.live_slot_idx;
+
+    teardown(a, s, pool);
+    stm_bdev_close(d);
+
+    /* Reopen the device R/W to tamper the SB byte. */
+    stm_bdev_open_opts bo = stm_bdev_open_opts_default();
+    stm_bdev *raw = NULL;
+    STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &bo, &raw));
+
+    stm_uberblock ub;
+    STM_ASSERT_OK(stm_sb_label_read(raw, live_label, live_slot, &ub));
+
+    /* Tamper one bit of ub_xattr_root.bp_csum. ub_csum auto-recomputes
+     * inside stm_sb_label_write (via stm_ub_encode), so the SB's own
+     * BLAKE3 integrity check passes — only the Merkle recompute at
+     * sync_open should catch it. */
+    ub.ub_xattr_root.bp_csum[0] ^= 0x01u;
+    STM_ASSERT_OK(stm_sb_label_write(raw, live_label, live_slot, &ub));
+    stm_bdev_close(raw);
+
+    /* Reopen + try to mount — sync_open's compute_merkle_root MUST
+     * reject the tampered SB with STM_ECORRUPT. */
+    d = open_fresh_device();
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
+    stm_sync *s2 = NULL;
+    stm_pool *pool2 = make_test_pool(d);
+    stm_status rs = stm_sync_open(pool2, a2, make_wk(), NULL, &s2);
+    STM_ASSERT_EQ((int)rs, (int)STM_ECORRUPT);
+    /* Pool ref must be cleaned up; sync handle was never returned so
+     * nothing to teardown except the alloc + bdev. */
+    stm_alloc_close(a2);
+    stm_pool_close(pool2);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
 STM_TEST(sync_commit_advances_ring_label_slot) {
     /* P5-2: successive commits under the 2-phase protocol land at:
      *   commit #1 (fresh, 1-phase): final gen=1 → (label 1, slot 1)

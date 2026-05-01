@@ -247,8 +247,18 @@ static void xa_encode_value(const stm_xattr_record *r,
     if (r->name_len > 0u) {
         memcpy(out + XA_VAL_FIXED, r->name, r->name_len);
     }
-    if (r->value_len > 0u && r->value) {
-        memcpy(out + XA_VAL_FIXED + r->name_len, r->value, r->value_len);
+    /* R80 P3-4: encode invariant — value_len > 0 ⇒ value != NULL.
+     * install_bytes / xa_decode_value pair value_len with non-NULL
+     * value; tombstones have value_len == 0 + value == NULL. The
+     * `else` branch zero-fills any value_len bytes if the upstream
+     * invariant is violated (defense-in-depth) so we never disclose
+     * heap content via an unset value pointer. */
+    if (r->value_len > 0u) {
+        if (r->value) {
+            memcpy(out + XA_VAL_FIXED + r->name_len, r->value, r->value_len);
+        } else {
+            memset(out + XA_VAL_FIXED + r->name_len, 0, r->value_len);
+        }
     }
     *out_len = (size_t)XA_VAL_FIXED
                 + (size_t)r->name_len
@@ -297,6 +307,17 @@ static stm_status xa_decode_value(const void *in, size_t in_len,
     }
 
     bool is_tomb = (flags & STM_XATTR_FLAG_TOMBSTONE) != 0u;
+
+    /* R80 P3-6: zero-init key fields explicitly so the contract is
+     * "xa_decode_value fully initializes out except for caller-
+     * supplied (dataset_id, ino, hash_probe) which the caller fills
+     * post-call from the on-disk key". The xa_load_iter caller's
+     * memset(&r, 0, sizeof r) at the top makes this redundant in
+     * practice, but documenting it here protects future reuse of
+     * this function in a context without that upstream init. */
+    out->dataset_id = 0u;
+    out->ino        = 0u;
+    out->hash_probe = 0u;
 
     /* Tombstone vs live invariants. */
     if (is_tomb) {
@@ -579,6 +600,7 @@ stm_status stm_xattr_set(stm_xattr_index *idx,
 
     /* Install at install_probe. */
     stm_xattr_record *target;
+    bool target_freshly_appended = false;
     if (install_tomb) {
         target = install_tomb;
     } else {
@@ -587,17 +609,25 @@ stm_status stm_xattr_set(stm_xattr_index *idx,
             must_unlock(idx_lock(idx));
             return STM_ENOMEM;
         }
+        target_freshly_appended = true;
     }
     stm_status is = install_bytes(target, dataset_id, ino, install_probe,
                                         name, name_len, value, value_len);
     if (is != STM_OK) {
-        /* Note: target may be a freshly-appended record on STM_ENOMEM.
-         * Leaving it in records[] with all-zero header (memset by
-         * append_record) is safe — find_record_at_probe matches by
-         * (ds, ino, hash_probe), and zero ds rejects every future
-         * lookup. The next append_record reuses; cap-doubling not
-         * triggered. Bookkeeping cost is one zero record per OOM,
-         * bounded by the OOM rate; tolerable. */
+        /* R80 P0-1 fix: roll back the freshly-appended slot on
+         * install_bytes failure. Without this, the zero-keyed zombie
+         * record (memset by append_record) survives in records[] and
+         * gets serialized by xa_build_btree_locked at the next commit
+         * with key 24 zero bytes. On the subsequent mount,
+         * xa_load_iter rejects ds==0 keys with STM_ECORRUPT and the
+         * pool wedges. The rollback restores the pre-call invariant
+         * (records[] holds only legitimate (ds!=0, ino!=0) entries).
+         * If install_tomb was used, the tombstone is preserved
+         * unchanged (install_bytes' malloc-before-free ordering
+         * guarantees target's prior state is intact on STM_ENOMEM). */
+        if (target_freshly_appended) {
+            idx->n_records--;
+        }
         must_unlock(idx_lock(idx));
         return is;
     }

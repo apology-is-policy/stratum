@@ -2035,6 +2035,15 @@ fs_xattr_namespaces[] = {
 static bool fs_xattr_name_in_posix_namespace(const uint8_t *name,
                                                   uint8_t name_len) {
     if (!name || name_len == 0) return false;
+    /* R80 P2-1: reject NUL bytes anywhere in the name. POSIX permits
+     * arbitrary bytes in xattr names, but listxattr's NUL-separated
+     * output convention means an embedded NUL would split the name
+     * into a "ghost" entry on the caller side — confusion attack
+     * shape. The fs-layer guard rejects pre-write so the on-disk
+     * tree never carries such names. */
+    for (uint8_t i = 0; i < name_len; i++) {
+        if (name[i] == 0u) return false;
+    }
     for (size_t i = 0;
             i < sizeof fs_xattr_namespaces / sizeof fs_xattr_namespaces[0];
             i++) {
@@ -2215,9 +2224,19 @@ stm_status stm_fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
         /* R77 P1-1-style defense: cap name_len at the fs → xattr
          * trust boundary even though the xattr-layer + decoder both
          * enforce ≤ STM_XATTR_NAME_MAX. Closes any future-bypass
-         * surface. */
+         * surface. R80 P3-5: same cap on value_len for forward-
+         * compat — fs_listxattr doesn't memcpy value bytes today,
+         * but a future maintainer extending this loop to use value_len
+         * would inherit the OOB shape if any future bypass slipped
+         * an oversize record past the writer/decoder symmetric
+         * guards. */
         if (batch[i].name_len == 0 ||
             batch[i].name_len > STM_FS_XATTR_NAME_MAX) {
+            free(batch);
+            pthread_mutex_unlock(&fs->lock);
+            return STM_ECORRUPT;
+        }
+        if (batch[i].value_len > STM_FS_XATTR_VALUE_MAX) {
             free(batch);
             pthread_mutex_unlock(&fs->lock);
             return STM_ECORRUPT;

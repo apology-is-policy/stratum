@@ -10341,6 +10341,46 @@ STM_TEST(fs_p6_xattr_ro_mount_refuses_writes) {
     unlink(g_key_path);
 }
 
+/* R80 P2-1 regression: setxattr rejects names containing embedded
+ * NUL bytes — these would split a listxattr stream into "ghost"
+ * entries on the caller side (POSIX listxattr is NUL-separated). */
+STM_TEST(fs_p6_r80_p2_1_setxattr_refuses_nul_in_name) {
+    make_tmp("p6_r80_nul");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+
+    /* "user.\0evil" — NUL after the prefix. Pre-fix this was accepted
+     * and listxattr returned a buffer that a caller splitting on NUL
+     * would parse as ["user.", "evil"] — confusion vector. Post-fix:
+     * STM_EINVAL at the fs boundary. */
+    uint8_t bad[] = { 'u', 's', 'e', 'r', '.', 0, 'e', 'v', 'i', 'l' };
+    STM_ASSERT_ERR(stm_fs_setxattr(fs, 1, f, bad, sizeof bad,
+                                        (const uint8_t *)"v", 1, 0, NULL),
+                   STM_EINVAL);
+    /* NUL anywhere — at start of suffix, mid-suffix, end. */
+    uint8_t bad_end[] = { 'u', 's', 'e', 'r', '.', 'x', 0 };
+    STM_ASSERT_ERR(stm_fs_setxattr(fs, 1, f, bad_end, sizeof bad_end,
+                                        (const uint8_t *)"v", 1, 0, NULL),
+                   STM_EINVAL);
+    /* Confirm a same-shape name WITHOUT the NUL succeeds — verifies the
+     * NUL check isn't over-rejecting. */
+    STM_ASSERT_OK(stm_fs_setxattr(fs, 1, f, (const uint8_t *)"user.evil", 9,
+                                       (const uint8_t *)"v", 1, 0, NULL));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 /* R80-anticipated regression test: writer-side guard rejects oversized
  * value_len at the fs boundary BEFORE reaching the xattr layer
  * (R71 P1-1 + R77 P1-1 lesson — defense-in-depth at every trust

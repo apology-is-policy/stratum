@@ -153,8 +153,10 @@ void stm_xattr_index_close(stm_xattr_index *idx);
  * Setting both bits is invalid (STM_EINVAL).
  *
  * `out_replaced` (optional) is set to true iff a prior live record for
- * `name` was replaced (i.e. `flags == 0` AND name was found live).
- * Pass NULL to ignore.
+ * `name` was replaced — i.e., `flags & STM_XATTR_FLAG_CREATE` is zero
+ * AND `name` was found live (under default OR REPLACE flag semantics;
+ * CREATE-flag-set on existing returns STM_EEXIST without setting
+ * out_replaced). Pass NULL to ignore.
  *
  * Refusals:
  *   - NULL idx OR NULL name OR NULL value when value_len > 0 (STM_EINVAL).
@@ -339,6 +341,12 @@ stm_status stm_xattr_index_load_at(stm_xattr_index *idx,
                                       uint64_t root_gen,
                                       const uint8_t expected_csum[32]);
 
+/* R80 P3-1: stm_xattr_index_get_root has no in-tree caller as of
+ * the P8-POSIX-6 substantive landing (sync.c only consumes _commit /
+ * _get_gen / _load_at). Exported for symmetry with the dirent /
+ * inode index APIs and for future debug tooling / forensics paths
+ * that snapshot the live root paddr+csum without driving a commit.
+ * Safe to remove if no consumer materializes by Phase 8 exit. */
 STM_MUST_USE
 stm_status stm_xattr_index_get_root(const stm_xattr_index *idx,
                                        uint64_t *out_root_paddr,
