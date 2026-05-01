@@ -702,11 +702,41 @@ ARCHITECTURE §11 specifies the on-disk shape; this phase implements it. Phase 7
 - **POSIX ACLs**:
   - `system.posix_acl_access` / `system.posix_acl_default` via xattr.
   - Standard Linux encoding (`richacl`-pre-NFSv4).
-- **Modern POSIX features**:
+- **Modern POSIX features** (commitment: full coverage of the
+  modern Linux/POSIX surface; no hedged "subset" baseline. Each
+  feature lands as part of P8-POSIX-7 or its dedicated sub-chunk):
   - `O_TMPFILE` (orphan inode in the inode tree, materialized via `linkat`).
-  - `F_SEAL_*` (seal flags in `si_flags`).
+  - `F_SEAL_*` (every seal flag: `F_SEAL_SEAL`, `F_SEAL_SHRINK`,
+    `F_SEAL_GROW`, `F_SEAL_WRITE`, `F_SEAL_FUTURE_WRITE`; encoded in
+    `si_flags`).
   - `copy_file_range` with reflink — wraps the existing `stm_fs_reflink`.
-  - `fallocate` / `FALLOC_FL_*` — initially `FALLOC_FL_KEEP_SIZE` + `FALLOC_FL_PUNCH_HOLE`; the rest as no-ops.
+  - `fallocate` / `FALLOC_FL_*` — every flag, not a subset:
+    `FALLOC_FL_KEEP_SIZE`, `FALLOC_FL_PUNCH_HOLE`,
+    `FALLOC_FL_COLLAPSE_RANGE`, `FALLOC_FL_ZERO_RANGE`,
+    `FALLOC_FL_INSERT_RANGE`, `FALLOC_FL_UNSHARE_RANGE`. The
+    extent-tree manipulation primitives required for COLLAPSE / INSERT
+    land alongside; UNSHARE composes with the CAS rehydrate path.
+  - `renameat2(2)` flags: `RENAME_NOREPLACE`, `RENAME_EXCHANGE`,
+    `RENAME_WHITEOUT`. Atomicity invariants pinned in `dirent.tla`'s
+    rename extension at P8-POSIX-9.
+  - `name_to_handle_at(2)` / `open_by_handle_at(2)` — Stratum's
+    `(dataset_id, ino, si_gen)` tuple maps directly to the NFS-style
+    file handle shape (per ARCH §11.3.2). Stale-handle detection is
+    free given the `(ino, gen)` tuple-uniqueness invariant from
+    `inode.tla`.
+  - `posix_fadvise(2)` — pass through to the `STM_PROP_TIERING` /
+    page-cache advisory layer where meaningful (`POSIX_FADV_*`),
+    no-op for the rest with documented behavior.
+  - Advisory locking: `flock(2)` + `fcntl(2)` `F_SETLK` / `F_GETLK` /
+    `F_OFD_SETLK` (open-file-description locks). Per-inode lock
+    table; deadlock detection via wait-for graph.
+  - `*at` family (`openat` / `mkdirat` / `unlinkat` / `symlinkat` /
+    `linkat` / `renameat` / `fchownat` / `fstatat` / etc.) — all
+    composable from the per-ino base APIs at the syscall-binding
+    layer (Phase 9 FUSE / 9P).
+  - `statx(2)` shape with btime + nanosecond timestamps (already
+    listed under metadata ops; restated here for completeness as a
+    modern-POSIX deliverable).
 - **TLA+ spec**: `inode.tla` — formal model of the inode lifecycle (alloc / free / nlink tracking / generation counter), plus `dirent.tla` for the hash-indexed tree's collision-chain invariants and rename atomicity.
 - **Tests**:
   - Per-op correctness (matches ext4/XFS/APFS semantics).
@@ -726,8 +756,13 @@ ARCHITECTURE §11 specifies the on-disk shape; this phase implements it. Phase 7
 - [ ] Inline-to-extent transition recovers correctly across crash boundaries.
 - [ ] `statx` returns nanosecond timestamps + btime.
 - [ ] POSIX ACL roundtrip preserves grants/denies bit-exact.
-- [ ] `inode.tla` + `dirent.tla` pin the load-bearing invariants under TLC.
-- [ ] xfstests subset — the file/dir/xattr/ACL portion — green on a Stratum-backed mount once Phase 9 (FUSE) lands; in Phase 8 the equivalent verification runs against the `stm_fs_*` API directly.
+- [ ] **Every** `FALLOC_FL_*` flag round-trips correctly under crash injection (KEEP_SIZE, PUNCH_HOLE, COLLAPSE_RANGE, ZERO_RANGE, INSERT_RANGE, UNSHARE_RANGE). No flag is a no-op or unsupported.
+- [ ] **Every** `F_SEAL_*` flag is honored at the write/grow/shrink boundary.
+- [ ] `renameat2` `RENAME_EXCHANGE` is atomic under TLC verification (`dirent.tla` rename extension).
+- [ ] `name_to_handle_at` / `open_by_handle_at` round-trip survives ino reuse via the `si_gen` tuple-uniqueness invariant from `inode.tla` — stale handles return `ESTALE`, valid handles resolve correctly.
+- [ ] Advisory locks (`flock` + `fcntl F_OFD_*`) interoperate with the per-inode lock table across concurrent openers.
+- [ ] `inode.tla` + `dirent.tla` pin the load-bearing invariants under TLC, including the rename + nlink + open-handle extensions.
+- [ ] xfstests subset — the file/dir/xattr/ACL portion plus the modern-POSIX-features test groups (auto-FALLOC, auto-rename, auto-flock) — green on a Stratum-backed mount once Phase 9 (FUSE) lands; in Phase 8 the equivalent verification runs against the `stm_fs_*` API directly.
 
 ### 11.3 Risks
 
