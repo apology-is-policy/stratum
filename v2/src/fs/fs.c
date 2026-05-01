@@ -1738,7 +1738,11 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
 
     /* If dst exists: drop dst dirent + drop dst inode (cascade-free
      * if nlink reaches 0). The dirent_unlink turns the slot into a
-     * tombstone, which dirent_alloc below will reuse. */
+     * tombstone in the chain (R79 P3-2: dirent_alloc below walks
+     * the chain from Hash[dst_name] and may pick this slot OR an
+     * earlier install-eligible slot — either is correct because
+     * the chain probes deterministically by hash, so subsequent
+     * lookups of dst_name will find the new record). */
     bool dst_freed_unused = false;
     if (dst_exists) {
         stm_status du = stm_dirent_unlink(didx, dataset_id, dst_parent_ino,
@@ -1802,9 +1806,19 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
     if (su != STM_OK) {
         /* Defensive rollback: drop the dst dirent we just created
          * and re-link the original (if overwrite). On any rollback
-         * failure, wedge. */
-        (void)stm_dirent_unlink(didx, dataset_id, dst_parent_ino,
-                                    dst_name, dst_name_len);
+         * failure, wedge.
+         *
+         * R79 P3-1: capture the rollback dst_unlink return so the
+         * "drop the freshly-installed dst" leg's failure (silent
+         * 1-dirent / 2-reference desync if dst_exists=false)
+         * triggers the wedge guard. In current code-paths this
+         * cannot fire — we just dirent_alloc'd at dst_name, so
+         * unlink will find it — but capturing the rv is defense-
+         * in-depth for any future refactor that breaks the
+         * invariant. */
+        stm_status r0 = stm_dirent_unlink(didx, dataset_id, dst_parent_ino,
+                                                dst_name, dst_name_len);
+        if (r0 != STM_OK) stm_fs_mark_wedged(fs);
         if (dst_exists) {
             stm_status r1 = stm_dirent_alloc(didx, dataset_id, dst_parent_ino,
                                                   dst_name, dst_name_len,
