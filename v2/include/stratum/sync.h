@@ -891,6 +891,20 @@ typedef struct stm_inode_index stm_inode_index;
 stm_inode_index *stm_sync_inode_index(stm_sync *s);
 
 /*
+ * P8-POSIX-2: per-pool dirent index handle. Same lifetime + thread-
+ * safety contract as the other index accessors above. The dirent
+ * index is owned by sync and persists across commits via the
+ * lifecycle wiring (set_storage / set_crypt_ctx in sync_create,
+ * load_at on mount, commit + UB stamping in sync_commit). Higher-
+ * level POSIX-surface APIs (P8-POSIX-2b fs wrappers + downstream
+ * chunks) operate on it via fs.c wrappers; tests reach it directly
+ * to roundtrip persistence + verify the sync-layer wiring.
+ */
+struct stm_dirent_index;
+typedef struct stm_dirent_index stm_dirent_index;
+stm_dirent_index *stm_sync_dirent_index(stm_sync *s);
+
+/*
  * P7-CAS-5: trigger one CAS auto-GC sweep cycle out-of-band from
  * `stm_sync_commit`. Takes `sync->lock` internally; safe to call
  * from any context that does NOT already hold sync->lock (notably:

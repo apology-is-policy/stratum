@@ -195,6 +195,7 @@ add_subdirectory(src/send_recv)
 add_subdirectory(src/repair_log)
 add_subdirectory(src/cas)
 add_subdirectory(src/inode)
+add_subdirectory(src/dirent)
 
 # ---------------------------------------------------------------------------
 # Public aggregate library.
@@ -230,7 +231,8 @@ target_link_libraries(stratum INTERFACE
     stm_send_recv
     stm_repair_log
     stm_cas
-    stm_inode)
+    stm_inode
+    stm_dirent)
 target_include_directories(stratum INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/include)
 

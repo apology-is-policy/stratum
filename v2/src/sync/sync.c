@@ -37,6 +37,7 @@
 #include <stratum/crypto.h>
 #include <stratum/cas.h>
 #include <stratum/inode.h>
+#include <stratum/dirent.h>
 #include <stratum/cdc.h>
 #include <stratum/dataset.h>
 #include <stratum/extent.h>
@@ -280,6 +281,14 @@ struct stm_sync {
      * so subsequent mounts find a valid bptr. */
     stm_inode_index    *inode_idx;
 
+    /* P8-POSIX-2 (v25): per-pool dirent index. Same wiring shape as
+     * inode_idx — AEAD-encrypted Bε-tree under ub_dirent_root on
+     * device 0. Keys (le64 dataset_id || le64 dir_ino || le64
+     * hash_probe). Values: variable-length 32 + name_len byte dirent
+     * records (ARCH §11.4, spec dirent.tla). Open-addressing chain
+     * integrity per dirent.tla. */
+    stm_dirent_index   *dirent_idx;
+
     /* P7-CAS-4b: FastCDC chunker for the cold-tier migration path. The
      * chunker is read-only after init (gear[256] table + params); safe
      * to share across threads. Initialized at sync_create and
@@ -351,6 +360,10 @@ struct stm_sync {
     uint64_t           inode_root_paddr;
     uint64_t           inode_root_gen;
     uint8_t            inode_root_csum[32];
+    /* P8-POSIX-2 (v25): dirent tree root mirrors the inode shape. */
+    uint64_t           dirent_root_paddr;
+    uint64_t           dirent_root_gen;
+    uint8_t            dirent_root_csum[32];
 
     /* Mirror of ub_next_dataset_id / ub_next_snap_id. Sourced from the
      * indices' get_next_id at commit; restored at mount via
@@ -585,6 +598,7 @@ static stm_status compute_merkle_root(const uint8_t main_csum[32],
                                         const uint8_t extent_csum[32],
                                         const uint8_t repair_log_csum[32],
                                         const uint8_t inode_csum[32],
+                                        const uint8_t dirent_csum[32],
                                         const uint8_t salt[32],
                                         uint8_t out[32])
 {
@@ -623,6 +637,15 @@ static stm_status compute_merkle_root(const uint8_t main_csum[32],
      * inode-tree's introduction commit; v23 pools have no inode
      * tree and are refused at v24 mount. */
     stm_blake3_update(h, inode_csum,      32);
+    /* P8-POSIX-2 (v25): dirent-tree root csum folded into the Merkle
+     * chain in lockstep with `ub_dirent_root`'s introduction. Same
+     * shape + same rationale as the R70 P0-1 inode_csum binding:
+     * carrying the writer-side guard discipline forward (R71 P1-1
+     * lesson — every load-bearing tree-root field MUST be folded
+     * into the Merkle chain in the same commit that introduces the
+     * field). v24 pools refused at v25 mount via uniform
+     * STM_EBADVERSION. */
+    stm_blake3_update(h, dirent_csum,     32);
     stm_blake3_update(h, salt,            32);
     stm_blake3_final(h, out, 32);
     stm_blake3_free(h);
@@ -781,6 +804,9 @@ static void build_uberblock(stm_uberblock *out,
                               uint64_t inode_root_paddr,
                               const uint8_t inode_root_csum[32],
                               uint64_t inode_root_gen,
+                              uint64_t dirent_root_paddr,
+                              const uint8_t dirent_root_csum[32],
+                              uint64_t dirent_root_gen,
                               const uint8_t merkle_root[32],
                               const stm_alloc_stats *astats)
 {
@@ -874,13 +900,25 @@ static void build_uberblock(stm_uberblock *out,
     /* P8-POSIX-1b (v24): inode tree root + AEAD gen. Same shape as
      * extent_root / cas_index_root. The tree root field
      * `ub_inode_root` lives at offset 3288 (head of the prior
-     * `ub_reserved`); `ub_inode_root_gen` is the AEAD gen. */
+     * `ub_reserved`); `ub_inode_root_gen` is the AEAD gen.
+     *
+     * P8-POSIX-2 (v25): dirent tree root + AEAD gen, same shape as
+     * inode_root. `ub_dirent_root` lives at offset 3360 (head of the
+     * prior `ub_reserved` after v24 carve); `ub_dirent_root_gen` at
+     * 3424. Stamped below in lockstep with the inode triple. */
     if (inode_root_paddr != 0) {
         out->ub_inode_root.bp_paddr = stm_store_le64(inode_root_paddr);
         out->ub_inode_root.bp_kind  = STM_BPTR_KIND_INODE_TREE;
         memcpy(out->ub_inode_root.bp_csum, inode_root_csum, 32);
     }
     out->ub_inode_root_gen = stm_store_le64(inode_root_gen);
+
+    if (dirent_root_paddr != 0) {
+        out->ub_dirent_root.bp_paddr = stm_store_le64(dirent_root_paddr);
+        out->ub_dirent_root.bp_kind  = STM_BPTR_KIND_DIRENT_TREE;
+        memcpy(out->ub_dirent_root.bp_csum, dirent_root_csum, 32);
+    }
+    out->ub_dirent_root_gen = stm_store_le64(dirent_root_gen);
 
     /* Pool-wide id counters (ARCH §5.4). Stamped from the indices'
      * get_next_id; restored at mount via the indices' set_next_id. */
@@ -1267,6 +1305,19 @@ stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
         if (rc != STM_OK) { stm_sync_close(s); return rc; }
         rc = stm_inode_index_set_crypt_ctx(s->inode_idx, s->metadata_key,
                                               s->pool_uuid, s->device_uuid);
+        if (rc != STM_OK) { stm_sync_close(s); return rc; }
+
+        /* P8-POSIX-2 (v25): dirent index. Same wiring shape as
+         * inode_idx. AEAD-encrypted Bε-tree under ub_dirent_root on
+         * device 0. Keys (le64 dataset_id || le64 dir_ino || le64
+         * hash_probe). Values: variable-length 32 + name_len byte
+         * dirent records. Empty at format time. */
+        s->dirent_idx = stm_dirent_index_create();
+        if (!s->dirent_idx) { stm_sync_close(s); return STM_ENOMEM; }
+        rc = stm_dirent_index_set_storage(s->dirent_idx, d, boot);
+        if (rc != STM_OK) { stm_sync_close(s); return rc; }
+        rc = stm_dirent_index_set_crypt_ctx(s->dirent_idx, s->metadata_key,
+                                                s->pool_uuid, s->device_uuid);
         if (rc != STM_OK) { stm_sync_close(s); return rc; }
 
         /* P6-clone: register the clone-dependency check on snap_idx.
@@ -1674,6 +1725,7 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
                                           ub.ub_extent_root.bp_csum,
                                           ub.ub_repair_log_root.bp_csum,
                                           ub.ub_inode_root.bp_csum,
+                                          ub.ub_dirent_root.bp_csum,
                                           ub.ub_merkle_root_salt,
                                           recomputed);
     if (ms != STM_OK) {
@@ -1967,6 +2019,31 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
         s2->inode_root_gen   = igen;
         memcpy(s2->inode_root_csum, ub.ub_inode_root.bp_csum, 32);
 
+        /* P8-POSIX-2 (v25): dirent index. Same wiring as inode_idx. */
+        s2->dirent_idx = stm_dirent_index_create();
+        if (!s2->dirent_idx) { stm_sync_close(s2); return STM_ENOMEM; }
+        stm_status dni = stm_dirent_index_set_storage(s2->dirent_idx, meta_bdev, boot2);
+        if (dni != STM_OK) { stm_sync_close(s2); return dni; }
+        dni = stm_dirent_index_set_crypt_ctx(s2->dirent_idx, s2->metadata_key,
+                                                s2->pool_uuid, s2->device_uuid);
+        if (dni != STM_OK) { stm_sync_close(s2); return dni; }
+
+        uint64_t dpaddr = stm_load_le64(ub.ub_dirent_root.bp_paddr);
+        uint64_t dgen   = stm_load_le64(ub.ub_dirent_root_gen);
+        if (dpaddr != 0) {
+            if (ub.ub_dirent_root.bp_kind != STM_BPTR_KIND_DIRENT_TREE) {
+                stm_sync_close(s2);
+                return STM_ECORRUPT;
+            }
+            stm_status ls = stm_dirent_index_load_at(s2->dirent_idx,
+                                                        dpaddr, dgen,
+                                                        ub.ub_dirent_root.bp_csum);
+            if (ls != STM_OK) { stm_sync_close(s2); return ls; }
+        }
+        s2->dirent_root_paddr = dpaddr;
+        s2->dirent_root_gen   = dgen;
+        memcpy(s2->dirent_root_csum, ub.ub_dirent_root.bp_csum, 32);
+
         /* P6-clone: register the clone-dependency check now that both
          * indices are populated. Snap delete refuses while any present
          * clone in dataset_idx references the target snap. */
@@ -2027,6 +2104,9 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
                          /*inode_root=*/        s2->inode_root_paddr,
                          /*inode_csum=*/        s2->inode_root_csum,
                          /*inode_gen=*/         s2->inode_root_gen,
+                         /*dirent_root=*/       s2->dirent_root_paddr,
+                         /*dirent_csum=*/       s2->dirent_root_csum,
+                         /*dirent_gen=*/        s2->dirent_root_gen,
                          /*merkle_root=*/       ub.ub_merkle_root,
                          &astats_claim);
         uint32_t lbl  = ring_label_for_gen(auth_gen + 1);
@@ -2102,6 +2182,7 @@ void stm_sync_close(stm_sync *s)
     if (s->cas_idx)     stm_cas_index_close(s->cas_idx);
     /* P8-POSIX-1b: close the inode index. */
     if (s->inode_idx)   stm_inode_index_close(s->inode_idx);
+    if (s->dirent_idx)  stm_dirent_index_close(s->dirent_idx);
     /* P5-3b: close the allocator-roots handle. Owns its own
      * in-RAM btree; borrows bdev + bootstrap + metadata_key. */
     if (s->roots) stm_alloc_roots_close(s->roots);
@@ -2209,6 +2290,9 @@ stm_status stm_sync_commit(stm_sync *s)
                          /*inode_root=*/        s->inode_root_paddr,
                          /*inode_csum=*/        s->inode_root_csum,
                          /*inode_gen=*/         s->inode_root_gen,
+                         /*dirent_root=*/       s->dirent_root_paddr,
+                         /*dirent_csum=*/       s->dirent_root_csum,
+                         /*dirent_gen=*/        s->dirent_root_gen,
                          /*merkle_root=*/       s->merkle_root,
                          &astats_res);
         uint32_t res_label = ring_label_for_gen(reservation_gen);
@@ -2463,6 +2547,23 @@ stm_status stm_sync_commit(stm_sync *s)
         return ics;
     }
 
+    /* P8-POSIX-2 (v25): commit the dirent index. Same shape as
+     * inode_idx. */
+    uint64_t dirent_paddr = 0;
+    uint8_t  dirent_csum[32] = {0};
+    uint64_t dirent_gen = 0;
+    stm_status dcs = stm_dirent_index_commit(s->dirent_idx, target_gen,
+                                                &dirent_paddr, dirent_csum);
+    if (dcs != STM_OK) {
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
+        return dcs;
+    }
+    dcs = stm_dirent_index_get_gen(s->dirent_idx, &dirent_gen);
+    if (dcs != STM_OK) {
+        pthread_mutex_unlock(&s->lock);        stm_pool_unlock_shared(s->pool);
+        return dcs;
+    }
+
     stm_alloc_stats astats;
     stm_status sr = stm_alloc_stats_get(s->alloc, &astats);
     if (sr != STM_OK) {
@@ -2489,6 +2590,7 @@ stm_status stm_sync_commit(stm_sync *s)
                                           extent_csum,
                                           repair_log_csum,
                                           inode_csum,    /* P8-POSIX-1b */
+                                          dirent_csum,   /* P8-POSIX-2 */
                                           s->merkle_salt,
                                           new_merkle_root);
     if (ms != STM_OK) {
@@ -2513,6 +2615,9 @@ stm_status stm_sync_commit(stm_sync *s)
                      /*inode_root=*/     inode_paddr,
                      /*inode_csum=*/     inode_csum,
                      /*inode_gen=*/      inode_gen,
+                     /*dirent_root=*/    dirent_paddr,
+                     /*dirent_csum=*/    dirent_csum,
+                     /*dirent_gen=*/     dirent_gen,
                      new_merkle_root, &astats);
 
     uint32_t fin_label = ring_label_for_gen(target_gen);
@@ -2549,6 +2654,8 @@ stm_status stm_sync_commit(stm_sync *s)
     s->cas_index_root_gen    = cas_gen;
     s->inode_root_paddr      = inode_paddr;
     s->inode_root_gen        = inode_gen;
+    s->dirent_root_paddr     = dirent_paddr;
+    s->dirent_root_gen       = dirent_gen;
     s->next_dataset_id       = main_next_id;
     s->next_snap_id          = snap_next_id;
     memcpy(s->alloc_root_csum,     roots_csum,      32);
@@ -2558,6 +2665,7 @@ stm_status stm_sync_commit(stm_sync *s)
     memcpy(s->extent_root_csum,    extent_csum,    32);
     memcpy(s->cas_index_root_csum, cas_csum,        32);
     memcpy(s->inode_root_csum,     inode_csum,      32);
+    memcpy(s->dirent_root_csum,    dirent_csum,     32);
     memcpy(s->repair_log_root_csum, repair_log_csum, 32);
     memcpy(s->merkle_root,         new_merkle_root, 32);
 
@@ -4123,6 +4231,11 @@ stm_cas_index *stm_sync_cas_index(stm_sync *s)
 stm_inode_index *stm_sync_inode_index(stm_sync *s)
 {
     return s ? s->inode_idx : NULL;
+}
+
+stm_dirent_index *stm_sync_dirent_index(stm_sync *s)
+{
+    return s ? s->dirent_idx : NULL;
 }
 
 /* P7-CAS-5: out-of-band CAS auto-GC sweep entry point. See sync.h

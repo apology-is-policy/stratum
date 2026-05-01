@@ -1,0 +1,270 @@
+/* SPDX-License-Identifier: ISC */
+/*
+ * Stratum v2 — directory entry layer (P8-POSIX-2).
+ *
+ * Implements the on-disk dirent record + the per-pool dirent index
+ * per ARCHITECTURE §11.4. The index is the canonical mapping from
+ * `(dataset_id, dir_ino, hash_probe)` → dirent record, where
+ * `hash_probe = fnv1a64(name) + probe_offset` resolves hash
+ * collisions via open-addressing per ARCH §11.4.2.
+ *
+ * Spec-to-code: this file realizes the dirent state machine modeled
+ * in `v2/specs/dirent.tla`. Each new public action below maps to a
+ * TLA+ action of the same name. The three buggy variants in the
+ * spec enumerate the canonical chain-integrity failure modes the
+ * reviewer must rule out — `BuggyUnlinkUsesEmpty` (silent loss of
+ * colliding-name reachability), `BuggyCreateOverwritesNoProbe`
+ * (silent overwrite of colliding occupant), and
+ * `BuggyLookupStopsOnTombstone` (read-side analog of
+ * UnlinkUsesEmpty).
+ *
+ * MVP scope (P8-POSIX-2):
+ *   - Per-pool dirent tree backed by btree_store (mirrors stm_inode_index
+ *     persistence shape). Format break STM_UB_VERSION 24 → 25 adds a
+ *     new `ub_dirent_root` tree-root field and binds its csum into the
+ *     pool's Merkle root chain (R70 P0-1 lesson).
+ *   - Open-addressing chain integrity per dirent.tla. Tombstones are
+ *     kept in the btree on Unlink (encoded via STM_DIRENT_FLAG_TOMBSTONE
+ *     in the value's flags byte) so a colliding name at a higher probe
+ *     index stays reachable. Lookup walks past tombstones.
+ *   - Probe cap STM_DIRENT_PROBE_MAX = 64 per ARCH §11.4.2.
+ *   - Writer-side invariants symmetric with decoder-side (R71 P1-1
+ *     lesson): every constraint the decoder enforces on read is also
+ *     enforced at the alloc API boundary, so a buggy or hostile caller
+ *     cannot commit a record that would wedge the pool on next mount.
+ *
+ * Out of scope here:
+ *   - readdir (cursor stability + restartable iteration) — P8-POSIX-4.
+ *   - rename atomicity — P8-POSIX-9.
+ *   - case-insensitivity (per-dataset property) — abstracted via the
+ *     hash function; `casesensitive=insensitive` substitutes
+ *     `fnv1a64(NFKD(lower(name)))` at the call site without changing
+ *     the on-disk shape. Full impl deferred to the property layer.
+ *   - Higher-level fs APIs (stm_fs_lookup / _create_file / _mkdir /
+ *     _unlink / _rmdir) that compose this layer with the inode
+ *     allocator — landed in P8-POSIX-2b (or P8-POSIX-3 depending on
+ *     scope).
+ */
+#ifndef STRATUM_V2_DIRENT_H
+#define STRATUM_V2_DIRENT_H
+
+#include <stratum/types.h>
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ========================================================================= */
+/* On-disk constants. ARCH §11.4.                                            */
+/* ========================================================================= */
+
+/* POSIX NAME_MAX — the byte cap on a single dirent's name field. */
+#define STM_DIRENT_NAME_MAX 255u
+
+/* Probe-chain cap per ARCH §11.4.2: a lookup at probe=k for k ≥ 64
+ * gives up and returns ENOENT. 64 is the bounded tail that lets the
+ * reviewer assert termination without unbounded scan. */
+#define STM_DIRENT_PROBE_MAX 64u
+
+/* Tombstone flag — set in the value's `flags` byte to mark a dirent
+ * record whose name has been Unlinked but whose slot must remain
+ * present in the chain so a colliding name at a higher probe index
+ * stays reachable. Per dirent.tla: Unlink leaves a TOMBSTONE marker;
+ * Lookup walks past tombstones. */
+#define STM_DIRENT_FLAG_TOMBSTONE 0x01u
+
+/* Child-type discriminator (POSIX-shape; matches dirent.h DT_*).
+ *
+ * STM_DT_UNKNOWN = 0 is INVALID for live records (the writer rejects
+ * it; the decoder rejects it). Tombstones encode child_type = 0
+ * implicitly via the TOMBSTONE flag. */
+#define STM_DT_UNKNOWN  0u
+#define STM_DT_FIFO     1u
+#define STM_DT_CHR      2u
+#define STM_DT_DIR      4u
+#define STM_DT_BLK      6u
+#define STM_DT_REG      8u
+#define STM_DT_LNK     10u
+#define STM_DT_SOCK    12u
+
+/* On-disk value layout (variable-length, 32 + name_len bytes):
+ *
+ *   off  size  field                       contract
+ *    0     8   le64 child_ino              live: != 0; tombstone: 0
+ *    8     8   le64 child_gen              live: any; tombstone: 0
+ *   16     1   u8   child_type             live: STM_DT_* (non-zero, valid);
+ *                                          tombstone: 0
+ *   17     1   u8   name_len               live: 1..255; tombstone: 0
+ *   18     1   u8   flags                  bit 0: TOMBSTONE
+ *   19    13   u8[13] reserved             zero (anti-tamper)
+ *   32   var   u8[name_len] name           live: name_len bytes (no NUL);
+ *                                          tombstone: 0 bytes
+ *
+ * Total = 32 + name_len bytes.
+ *
+ * On-disk key layout (fixed 24 bytes):
+ *
+ *   off  size  field                       contract
+ *    0     8   le64 dataset_id             non-zero
+ *    8     8   le64 dir_ino                non-zero
+ *   16     8   le64 hash_probe             fnv1a64(name) + probe_offset
+ */
+
+/* ========================================================================= */
+/* Forward decl + lifecycle.                                                 */
+/* ========================================================================= */
+
+struct stm_dirent_index;
+typedef struct stm_dirent_index stm_dirent_index;
+
+/* Allocate an empty in-memory dirent index. Returns NULL on
+ * STM_ENOMEM. Mirrors `stm_inode_index_create`. */
+stm_dirent_index *stm_dirent_index_create(void);
+
+/* Free the index (in-RAM records, persistence handles). Safe on NULL. */
+void stm_dirent_index_close(stm_dirent_index *idx);
+
+/* ========================================================================= */
+/* In-memory operations. Models dirent.tla's actions.                         */
+/* ========================================================================= */
+
+/*
+ * Create — link `name` to `child_ino` in directory `dir_ino` of
+ * `dataset_id`. Models `dirent.tla::Create`.
+ *
+ * Walks the open-addressing chain from probe 0 looking for either:
+ *   - first EMPTY slot (no record at that key) → install here;
+ *   - first TOMBSTONE slot → remember as install candidate, keep walking
+ *     to verify `name` not already present further in the chain;
+ *   - record with same name → STM_EEXIST;
+ *   - record with different name → continue probing.
+ *
+ * Refusals:
+ *   - NULL idx OR NULL name (STM_EINVAL).
+ *   - dataset_id == 0 OR dir_ino == 0 OR child_ino == 0 (STM_EINVAL).
+ *   - name_len == 0 OR name_len > STM_DIRENT_NAME_MAX (STM_EINVAL).
+ *   - child_type not one of {STM_DT_FIFO, _CHR, _DIR, _BLK, _REG, _LNK,
+ *     _SOCK} (STM_EINVAL — STM_DT_UNKNOWN=0 is reserved for tombstones).
+ *   - name already linked in (dataset_id, dir_ino) (STM_EEXIST).
+ *   - chain exhausted (STM_DIRENT_PROBE_MAX probes consumed without finding
+ *     an install slot) → STM_ENOSPC.
+ */
+STM_MUST_USE
+stm_status stm_dirent_alloc(stm_dirent_index *idx,
+                                uint64_t dataset_id, uint64_t dir_ino,
+                                const uint8_t *name, uint8_t name_len,
+                                uint64_t child_ino, uint64_t child_gen,
+                                uint8_t child_type);
+
+/*
+ * Lookup `name` in directory `dir_ino`. Models `dirent.tla::LookupWalk`.
+ *
+ * Walks the chain from probe 0:
+ *   - EMPTY slot → STM_ENOENT (chain ends here).
+ *   - TOMBSTONE slot → continue.
+ *   - record with same name → return child triple via out params.
+ *   - record with different name → continue.
+ *   - chain exhausted (STM_DIRENT_PROBE_MAX probes) → STM_ENOENT.
+ *
+ * `out_child_ino` is required; `out_child_gen` and `out_child_type`
+ * are optional (pass NULL if not needed).
+ *
+ * Refusals:
+ *   - NULL idx OR NULL name OR NULL out_child_ino (STM_EINVAL).
+ *   - dataset_id == 0 OR dir_ino == 0 (STM_EINVAL).
+ *   - name_len == 0 OR name_len > STM_DIRENT_NAME_MAX (STM_EINVAL).
+ *   - No match in chain → STM_ENOENT.
+ */
+STM_MUST_USE
+stm_status stm_dirent_lookup(const stm_dirent_index *idx,
+                                 uint64_t dataset_id, uint64_t dir_ino,
+                                 const uint8_t *name, uint8_t name_len,
+                                 uint64_t *out_child_ino,
+                                 uint64_t *out_child_gen,
+                                 uint8_t *out_child_type);
+
+/*
+ * Unlink `name` from directory `dir_ino`. Models `dirent.tla::Unlink`.
+ *
+ * Walks the chain to find the live record matching `name`, replaces
+ * the slot with a TOMBSTONE (NOT EMPTY — that would break colliding
+ * names at higher probe indices per dirent.tla::BuggyUnlinkUsesEmpty).
+ *
+ * Refusals:
+ *   - NULL idx OR NULL name (STM_EINVAL).
+ *   - dataset_id == 0 OR dir_ino == 0 (STM_EINVAL).
+ *   - name_len == 0 OR name_len > STM_DIRENT_NAME_MAX (STM_EINVAL).
+ *   - No match in chain → STM_ENOENT.
+ */
+STM_MUST_USE
+stm_status stm_dirent_unlink(stm_dirent_index *idx,
+                                 uint64_t dataset_id, uint64_t dir_ino,
+                                 const uint8_t *name, uint8_t name_len);
+
+/*
+ * Count live (non-tombstone) dirents in directory `dir_ino`. Used to
+ * implement POSIX `nlink` for directories (parent + children + 1 for
+ * `.` self-link) and to gate `rmdir` on empty directories.
+ *
+ * Refusals:
+ *   - NULL idx OR NULL out_count (STM_EINVAL).
+ *   - dataset_id == 0 OR dir_ino == 0 (STM_EINVAL).
+ */
+STM_MUST_USE
+stm_status stm_dirent_count_for_dir(const stm_dirent_index *idx,
+                                        uint64_t dataset_id, uint64_t dir_ino,
+                                        size_t *out_count);
+
+/* ========================================================================= */
+/* Persistence (P8-POSIX-2, v25).                                            */
+/*                                                                            */
+/* The dirent index is persisted as a btree_store-encoded, AEAD-encrypted    */
+/* Bε-tree under `ub_dirent_root` on device 0. Same envelope as the inode    */
+/* / extent / cas trees: AEAD nonce `paddr || gen || pool_uuid`, AD          */
+/* `pool_uuid || device_uuid_0`, idempotent commit via internal dirty flag,  */
+/* atomic shadow-swap on load_at.                                            */
+/* ========================================================================= */
+
+struct stm_bdev;       typedef struct stm_bdev stm_bdev;
+struct stm_bootstrap;  typedef struct stm_bootstrap stm_bootstrap;
+
+STM_MUST_USE
+stm_status stm_dirent_index_set_storage(stm_dirent_index *idx,
+                                            stm_bdev *bdev_0,
+                                            stm_bootstrap *boot_0);
+
+STM_MUST_USE
+stm_status stm_dirent_index_set_crypt_ctx(stm_dirent_index *idx,
+                                              const uint8_t *metadata_key,
+                                              const uint64_t pool_uuid[2],
+                                              const uint64_t device_uuid_0[2]);
+
+STM_MUST_USE
+stm_status stm_dirent_index_commit(stm_dirent_index *idx,
+                                       uint64_t committed_gen,
+                                       uint64_t *out_root_paddr,
+                                       uint8_t out_root_csum[32]);
+
+STM_MUST_USE
+stm_status stm_dirent_index_load_at(stm_dirent_index *idx,
+                                        uint64_t root_paddr,
+                                        uint64_t root_gen,
+                                        const uint8_t expected_csum[32]);
+
+STM_MUST_USE
+stm_status stm_dirent_index_get_root(const stm_dirent_index *idx,
+                                         uint64_t *out_root_paddr,
+                                         uint8_t out_root_csum[32]);
+
+STM_MUST_USE
+stm_status stm_dirent_index_get_gen(const stm_dirent_index *idx,
+                                        uint64_t *out_root_gen);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* STRATUM_V2_DIRENT_H */
