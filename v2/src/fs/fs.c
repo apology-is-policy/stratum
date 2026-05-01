@@ -1630,6 +1630,202 @@ stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 }
 
 /* ========================================================================= */
+/* P8-POSIX-9: stm_fs_rename.                                                 */
+/* ========================================================================= */
+
+stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
+                            uint64_t src_parent_ino,
+                            const uint8_t *src_name, uint8_t src_name_len,
+                            uint64_t dst_parent_ino,
+                            const uint8_t *dst_name, uint8_t dst_name_len,
+                            uint32_t flags)
+{
+    if (!fs) return STM_EINVAL;
+    if (dataset_id == 0u || src_parent_ino == 0u || dst_parent_ino == 0u) {
+        return STM_EINVAL;
+    }
+    if ((flags & ~(uint32_t)STM_FS_RENAME_NOREPLACE) != 0u) return STM_EINVAL;
+
+    stm_status nv = fs_validate_dirent_name(src_name, src_name_len);
+    if (nv != STM_OK) return nv;
+    nv = fs_validate_dirent_name(dst_name, dst_name_len);
+    if (nv != STM_OK) return nv;
+
+    /* Same-path no-op. POSIX rename(src, src) returns 0. */
+    if (src_parent_ino == dst_parent_ino &&
+        src_name_len == dst_name_len &&
+        memcmp(src_name, dst_name, src_name_len) == 0) {
+        return STM_OK;
+    }
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+
+    stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
+    stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
+    if (!iidx || !didx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;
+    }
+
+    /* Validate src parent + dst parent are directories. */
+    struct stm_inode_value spv = {0};
+    stm_status sps = fs_load_parent_dir(iidx, dataset_id, src_parent_ino, &spv);
+    if (sps != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return sps;
+    }
+    struct stm_inode_value dpv = {0};
+    stm_status dps = fs_load_parent_dir(iidx, dataset_id, dst_parent_ino, &dpv);
+    if (dps != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return dps;
+    }
+
+    /* Lookup src dirent — must exist. */
+    uint64_t src_ino = 0, src_gen = 0;
+    uint8_t  src_type = 0;
+    stm_status srs = stm_dirent_lookup(didx, dataset_id, src_parent_ino,
+                                            src_name, src_name_len,
+                                            &src_ino, &src_gen, &src_type);
+    if (srs != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return srs;       /* STM_ENOENT */
+    }
+
+    /* Lookup dst dirent — may or may not exist. */
+    uint64_t dst_ino = 0, dst_gen = 0;
+    uint8_t  dst_type = 0;
+    stm_status drs = stm_dirent_lookup(didx, dataset_id, dst_parent_ino,
+                                            dst_name, dst_name_len,
+                                            &dst_ino, &dst_gen, &dst_type);
+    bool dst_exists = (drs == STM_OK);
+    if (drs != STM_OK && drs != STM_ENOENT) {
+        pthread_mutex_unlock(&fs->lock);
+        return drs;
+    }
+
+    if (dst_exists && (flags & STM_FS_RENAME_NOREPLACE)) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EEXIST;
+    }
+
+    /* If dst exists, validate kind compatibility:
+     *   - src is dir, dst is non-dir → STM_ENOTDIR (POSIX).
+     *   - src is non-dir, dst is dir → STM_EISDIR.
+     *   - src is dir, dst is dir AND dst non-empty → STM_ENOTEMPTY. */
+    if (dst_exists) {
+        bool src_is_dir = (src_type == STM_DT_DIR);
+        bool dst_is_dir = (dst_type == STM_DT_DIR);
+        if (src_is_dir && !dst_is_dir) {
+            pthread_mutex_unlock(&fs->lock);
+            return STM_ENOTDIR;
+        }
+        if (!src_is_dir && dst_is_dir) {
+            pthread_mutex_unlock(&fs->lock);
+            return STM_EISDIR;
+        }
+        if (src_is_dir && dst_is_dir) {
+            size_t n = 0;
+            stm_status cs = stm_dirent_count_for_dir(didx, dataset_id,
+                                                          dst_ino, &n);
+            if (cs == STM_OK && n > 0u) {
+                pthread_mutex_unlock(&fs->lock);
+                return STM_ENOTEMPTY;
+            }
+        }
+    }
+
+    /* If dst exists: drop dst dirent + drop dst inode (cascade-free
+     * if nlink reaches 0). The dirent_unlink turns the slot into a
+     * tombstone, which dirent_alloc below will reuse. */
+    bool dst_freed_unused = false;
+    if (dst_exists) {
+        stm_status du = stm_dirent_unlink(didx, dataset_id, dst_parent_ino,
+                                                dst_name, dst_name_len);
+        if (du != STM_OK) {
+            /* Should not happen — we just looked up the entry. */
+            pthread_mutex_unlock(&fs->lock);
+            return du;
+        }
+        stm_status iu = stm_inode_unlink(iidx, dataset_id, dst_ino,
+                                            &dst_freed_unused);
+        if (iu != STM_OK) {
+            /* Rollback: re-create dst dirent. Under fs->lock-held
+             * posture, this should succeed (the slot is still a
+             * tombstone we just created; alloc reuses it). */
+            (void)stm_dirent_alloc(didx, dataset_id, dst_parent_ino,
+                                       dst_name, dst_name_len,
+                                       dst_ino, dst_gen, dst_type);
+            pthread_mutex_unlock(&fs->lock);
+            return iu;
+        }
+    }
+
+    /* Install dirent at dst pointing at src_ino. */
+    stm_status as = stm_dirent_alloc(didx, dataset_id, dst_parent_ino,
+                                          dst_name, dst_name_len,
+                                          src_ino, src_gen, src_type);
+    if (as != STM_OK) {
+        /* Rollback the dst-overwrite: re-create dst dirent + bump
+         * dst inode's nlink back. If the rollback fails (memory
+         * pressure / pathological state), wedge the volume — the
+         * on-disk state is now incompatible with the cached invariants
+         * (orphan inode that nothing points to + missing dst dirent). */
+        if (dst_exists) {
+            stm_status r1 = stm_dirent_alloc(didx, dataset_id, dst_parent_ino,
+                                                  dst_name, dst_name_len,
+                                                  dst_ino, dst_gen, dst_type);
+            stm_status r2 = STM_OK;
+            if (!dst_freed_unused) {
+                r2 = stm_inode_link(iidx, dataset_id, dst_ino);
+            } else {
+                /* dst inode was cascade-freed — can't bring it back
+                 * without an alloc-reuse cycle (gen bump required).
+                 * Wedge: data loss has already occurred from the
+                 * caller's perspective (dst's content is gone) and
+                 * the original alloc was unrecoverable. */
+                stm_fs_mark_wedged(fs);
+            }
+            if (r1 != STM_OK || r2 != STM_OK) {
+                stm_fs_mark_wedged(fs);
+            }
+        }
+        pthread_mutex_unlock(&fs->lock);
+        return as;
+    }
+
+    /* Drop src dirent. Under fs->lock-held posture, this is the
+     * straightforward write to a tombstone — should not fail. */
+    stm_status su = stm_dirent_unlink(didx, dataset_id, src_parent_ino,
+                                            src_name, src_name_len);
+    if (su != STM_OK) {
+        /* Defensive rollback: drop the dst dirent we just created
+         * and re-link the original (if overwrite). On any rollback
+         * failure, wedge. */
+        (void)stm_dirent_unlink(didx, dataset_id, dst_parent_ino,
+                                    dst_name, dst_name_len);
+        if (dst_exists) {
+            stm_status r1 = stm_dirent_alloc(didx, dataset_id, dst_parent_ino,
+                                                  dst_name, dst_name_len,
+                                                  dst_ino, dst_gen, dst_type);
+            if (!dst_freed_unused) {
+                stm_status r2 = stm_inode_link(iidx, dataset_id, dst_ino);
+                if (r1 != STM_OK || r2 != STM_OK) stm_fs_mark_wedged(fs);
+            } else {
+                /* dst inode gone; can't restore. */
+                stm_fs_mark_wedged(fs);
+            }
+        }
+        pthread_mutex_unlock(&fs->lock);
+        return su;
+    }
+
+    pthread_mutex_unlock(&fs->lock);
+    return STM_OK;
+}
+
+/* ========================================================================= */
 /* P8-POSIX-4: stm_fs_readdir.                                                */
 /* ========================================================================= */
 

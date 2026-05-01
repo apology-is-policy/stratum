@@ -446,6 +446,72 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
                           const uint8_t *dst_name, uint8_t dst_name_len);
 
 /* ========================================================================= */
+/* P8-POSIX-9: rename.                                                        */
+/* ========================================================================= */
+
+/* Refuse to overwrite an existing dst entry. Maps to Linux
+ * `RENAME_NOREPLACE` (renameat2(2)). Without this flag the call
+ * silently overwrites dst (drops the dst dirent and decrements its
+ * inode's nlink, cascade-freeing if nlink reaches 0). */
+#define STM_FS_RENAME_NOREPLACE  0x01u
+
+/*
+ * Atomically rename a directory entry from `(src_parent_ino,
+ * src_name)` to `(dst_parent_ino, dst_name)`. Same-directory rename
+ * (src_parent_ino == dst_parent_ino) and cross-directory rename
+ * (different parents within the same dataset) are both supported.
+ *
+ * Atomicity: under `fs->lock`, the rename composes
+ *   `dirent_alloc(dst → src_ino)` + `dirent_unlink(src)` + (overwrite)
+ *   `dirent_unlink(dst-prior)` + `inode_unlink(dst-prior-ino)`
+ * as a single transactional unit — both old and new dirent state
+ * either persist or roll back together. The next `sync_commit`
+ * flushes them as a unit, so a crash mid-rename either yields the
+ * pre-rename state (if commit hadn't fired) or the post-rename
+ * state (if commit had fired).
+ *
+ * MVP scope: basic rename + RENAME_NOREPLACE flag. Deferred:
+ *   - RENAME_EXCHANGE (atomic two-slot swap; needs a new dirent
+ *     primitive — follow-up sub-chunk).
+ *   - RENAME_WHITEOUT (creates a "whiteout" entry at src; rare;
+ *     follow-up).
+ *   - Cross-dataset rename: refused with STM_EXDEV (the single
+ *     `dataset_id` parameter precludes cross-dataset by signature;
+ *     a future xds variant would surface the error explicitly).
+ *   - Directory-rename-into-itself loop check (POSIX EINVAL/ELOOP):
+ *     deferred — caller (FUSE/9P) typically detects via path walk
+ *     before invoking this API.
+ *   - Non-empty-directory overwrite: rejected with STM_ENOTEMPTY
+ *     when the dst is a directory containing entries.
+ *
+ * Refusals:
+ *   - any name validation failure (STM_EINVAL).
+ *   - dataset_id == 0 OR src_parent_ino == 0 OR dst_parent_ino == 0
+ *     (STM_EINVAL).
+ *   - flags has unknown bits (STM_EINVAL — forward-compat guard).
+ *   - src parent OR dst parent not a directory (STM_ENOTDIR).
+ *   - src not present in src_parent (STM_ENOENT).
+ *   - dst exists AND STM_FS_RENAME_NOREPLACE set (STM_EEXIST).
+ *   - dst exists AND dst is a non-empty directory (STM_ENOTEMPTY).
+ *   - dst exists AND src is a directory but dst is not (STM_ENOTDIR;
+ *     POSIX rename(2) requires both to be the same kind for the
+ *     directory-replaces-non-directory case).
+ *   - dst exists AND src is NOT a directory but dst IS (STM_EISDIR).
+ *   - dirent chain exhausted at dst's hash (STM_ENOSPC — pathological).
+ *   - fs read-only or wedged (STM_EROFS / STM_EWEDGED).
+ *
+ * Same-path rename (src == dst, both name and parent equal): no-op,
+ * returns STM_OK.
+ */
+STM_MUST_USE
+stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
+                            uint64_t src_parent_ino,
+                            const uint8_t *src_name, uint8_t src_name_len,
+                            uint64_t dst_parent_ino,
+                            const uint8_t *dst_name, uint8_t dst_name_len,
+                            uint32_t flags);
+
+/* ========================================================================= */
 /* P8-POSIX-10: truncate (regular file).                                      */
 /* ========================================================================= */
 
