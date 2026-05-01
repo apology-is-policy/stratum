@@ -22,6 +22,7 @@
 #include <stratum/keyfile.h>
 #include <stratum/pool.h>
 #include <stratum/snapshot.h>
+#include <stratum/inode.h>
 #include <stratum/super.h>
 #include <stratum/sync.h>
 
@@ -278,6 +279,98 @@ STM_TEST(sync_alloc_state_survives_mount) {
     STM_ASSERT_EQ(len, 16u);
 
     teardown(a2, s2, pool2);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* P8-POSIX-1b R70 P2-1: sync-level inode persistence roundtrip.
+ *
+ * Covers the wiring that test_inode.c can't exercise because it
+ * stands up bdev/bootstrap by hand:
+ *   - set_storage + set_crypt_ctx in stm_sync_create / _open
+ *   - load_at order between cas_idx and inode_idx
+ *   - bp_kind check on ub_inode_root.bp_kind
+ *   - csum mirror in s->inode_root_csum
+ *   - build_uberblock with the inode_root_paddr / csum / gen triple
+ *   - compute_merkle_root folding inode_csum (R70 P0-1)
+ *
+ * Concrete trace: alloc 3 inodes across two datasets, commit, close,
+ * reopen, verify all three roundtrip + their gen + uid/gid persist.
+ * Then alloc one more, commit again, remount, verify the new
+ * allocation also persists. The first-commit and second-commit paths
+ * exercise different sync.c branches (1-phase vs 2-phase) — both
+ * must end with a Merkle-binding-correct UB for sync_open's
+ * recompute check to pass. */
+STM_TEST(sync_inode_persistence_roundtrip) {
+    make_tmp("inode_rt");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
+
+    stm_inode_index *iidx = stm_sync_inode_index(s);
+    STM_ASSERT_TRUE(iidx != NULL);
+
+    uint64_t a1 = 0, a2 = 0, b1 = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, /*ds=*/1, 0100644, 1000, 1000, &a1));
+    STM_ASSERT_OK(stm_inode_alloc(iidx, 1, 0100755, 1001, 1001, &a2));
+    STM_ASSERT_OK(stm_inode_alloc(iidx, /*ds=*/2, 0040755, 2000, 2000, &b1));
+
+    /* First commit (1-phase, fresh pool): writes UB at gen=1 with the
+     * inode tree root + the merkle binding folding inode_csum. */
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    teardown(a, s, pool);
+    stm_bdev_close(d);
+
+    /* Remount — sync_open's compute_merkle_root recompute would fail
+     * with STM_ECORRUPT if the inode_csum binding got dropped (R70
+     * P0-1 regression detector). load_at exercises the bp_kind check
+     * + csum verification path on the inode tree. */
+    d = open_fresh_device();
+    stm_alloc *a2_handle = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d, &a2_handle));
+    stm_sync *s2 = NULL;
+    stm_pool *pool2 = make_test_pool(d);
+    STM_ASSERT_OK(stm_sync_open(pool2, a2_handle, make_wk(), NULL, &s2));
+
+    stm_inode_index *iidx2 = stm_sync_inode_index(s2);
+    STM_ASSERT_TRUE(iidx2 != NULL);
+
+    /* All three inodes survive the remount with metadata intact. */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_inode_lookup(iidx2, 1, a1, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_uid),  (uint32_t)1000);
+    STM_ASSERT_EQ(stm_load_le32(v.si_gid),  (uint32_t)1000);
+    STM_ASSERT_EQ(stm_load_le32(v.si_mode), (uint32_t)0100644);
+    STM_ASSERT_EQ(stm_load_le64(v.si_gen),  (uint64_t)0);
+
+    STM_ASSERT_OK(stm_inode_lookup(iidx2, 1, a2, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_mode), (uint32_t)0100755);
+
+    STM_ASSERT_OK(stm_inode_lookup(iidx2, 2, b1, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_uid),  (uint32_t)2000);
+
+    /* Allocate one more across the mount boundary, commit (now 2-
+     * phase), remount, verify it persists too. */
+    uint64_t a3 = 0;
+    STM_ASSERT_OK(stm_inode_alloc(iidx2, 1, 0100644, 1002, 1002, &a3));
+    STM_ASSERT_OK(stm_sync_commit(s2));
+
+    teardown(a2_handle, s2, pool2);
+    stm_bdev_close(d);
+
+    d = open_fresh_device();
+    stm_alloc *a3_handle = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d, &a3_handle));
+    stm_sync *s3 = NULL;
+    stm_pool *pool3 = make_test_pool(d);
+    STM_ASSERT_OK(stm_sync_open(pool3, a3_handle, make_wk(), NULL, &s3));
+
+    stm_inode_index *iidx3 = stm_sync_inode_index(s3);
+    STM_ASSERT_OK(stm_inode_lookup(iidx3, 1, a3, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_uid), (uint32_t)1002);
+
+    teardown(a3_handle, s3, pool3);
     stm_bdev_close(d);
     unlink(g_tmp_path);
 }

@@ -1188,7 +1188,7 @@ Spec-to-code:
   preserves the (ino, gen) uniqueness invariant trivially since
   every alloc is fresh. P8-POSIX-1b will add the reuse path with
   the gen bump per `AllocReused`.
-- `tests/test_inode.c` — 32 tests exercising lifecycle, alloc
+- `tests/test_inode.c` — 35 tests exercising lifecycle, alloc
   monotonicity, per-dataset isolation, free + ENOENT, double-free
   refusal, set-with-identity-mismatch refusal (protects the
   (ino, gen) invariant from caller error), count + next_ino
@@ -1199,9 +1199,18 @@ Spec-to-code:
   with gen bump (alloc-prefers-reuse + cycles), set-rejects-FREED-
   flag, persistence roundtrip across mount cycles, gen monotonic
   across the persistence boundary, idempotent commit when clean.
+  R70 close adds: set_storage refuses re-bind (P3-6), set_crypt_ctx
+  refuses re-bind (P3-6), no-op Set doesn't re-dirty (P3-4).
+- `tests/test_sync.c::sync_inode_persistence_roundtrip` — R70 P2-1
+  end-to-end coverage of sync.c's inode wiring: set_storage +
+  set_crypt_ctx in sync_create / sync_open, load_at order between
+  cas_idx and inode_idx, bp_kind check on `ub_inode_root.bp_kind`,
+  csum mirror in `s->inode_root_csum`, build_uberblock with the
+  inode_root_paddr/csum/gen triple, compute_merkle_root folding
+  inode_csum (R70 P0-1) — first-commit (1-phase) and second-commit
+  (2-phase) paths both exercised.
 - Out-of-scope here: nlink semantics (P8-POSIX-3), tagged data
-  union transitions (P8-POSIX-5), on-disk persistence
-  (P8-POSIX-1b).
+  union transitions (P8-POSIX-5).
 
 ### `namespace.tla` — per-connection 9P namespaces (P8-NS-1 entry)
 

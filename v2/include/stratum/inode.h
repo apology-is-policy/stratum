@@ -370,7 +370,16 @@ stm_status stm_inode_index_load_at(stm_inode_index *idx,
                                       const uint8_t expected_csum[32]);
 
 /* Read the current root paddr / csum / gen — for the sync layer's
- * dirty-tracking + uberblock stamping. */
+ * dirty-tracking + uberblock stamping. `out_root_paddr` is required;
+ * `out_root_csum` is optional (pass NULL if the csum is not needed).
+ *
+ * Forward use: P8-POSIX-2's dirent layer + future POSIX-surface
+ * chunks call this to mirror the inode tree's root state during
+ * the per-fs commit cadence. R70 P2-2 + P3-8: presently no in-tree
+ * caller — the accessor is published with the persistence API as
+ * part of P8-POSIX-1b so the sync.c → inode.c contract stays
+ * symmetric with the equivalent extent / cas / repair_log
+ * accessors that all carry their own root-mirror getter. */
 STM_MUST_USE
 stm_status stm_inode_index_get_root(const stm_inode_index *idx,
                                        uint64_t *out_root_paddr,

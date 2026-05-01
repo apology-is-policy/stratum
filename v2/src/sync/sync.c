@@ -584,6 +584,7 @@ static stm_status compute_merkle_root(const uint8_t main_csum[32],
                                         const uint8_t keyschema_csum[32],
                                         const uint8_t extent_csum[32],
                                         const uint8_t repair_log_csum[32],
+                                        const uint8_t inode_csum[32],
                                         const uint8_t salt[32],
                                         uint8_t out[32])
 {
@@ -609,6 +610,19 @@ static stm_status compute_merkle_root(const uint8_t main_csum[32],
      * unreleased outside this branch, so this Merkle change folds
      * into v16 rather than bumping to v17. */
     stm_blake3_update(h, repair_log_csum, 32);
+    /* P8-POSIX-1b R70 P0-1 (v24): inode-tree root csum folded into the
+     * Merkle chain. Same shape as the R47 P2-1 fix for repair_log:
+     * `ub_inode_root.bp_paddr` + `ub_inode_root.bp_csum` are
+     * plaintext-and-Merkle-covered fields, but until this binding
+     * was added an offline-write attacker could swap the inode tree
+     * (e.g., point at a stale snapshot of the prior tree at a
+     * recorded paddr/csum) and recompute `ub_csum` alone — the
+     * recompute at mount would still match because the stored
+     * Merkle root never depended on inode_csum. With this binding,
+     * any tamper forces a Merkle mismatch at sync_open. v24 is the
+     * inode-tree's introduction commit; v23 pools have no inode
+     * tree and are refused at v24 mount. */
+    stm_blake3_update(h, inode_csum,      32);
     stm_blake3_update(h, salt,            32);
     stm_blake3_final(h, out, 32);
     stm_blake3_free(h);
@@ -1642,13 +1656,15 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
         return cs;
     }
 
-    /* P4-1 / P4-4a / P6-persist / P7-CAS: verify ub_merkle_root self-
-     * consistency. Inputs match what sync_commit stamps: alloc_roots
-     * csum, dataset tree csum (from ub_main_root), snapshot tree csum
-     * (from ub_snap_root), CAS index csum (from ub_cas_index_root —
-     * zero before the first cold-tier commit), keyschema csum, extent
-     * csum, repair-log csum. For pools created pre-P6-persist these
-     * csums are all-zero and the recompute matches. */
+    /* P4-1 / P4-4a / P6-persist / P7-CAS / P8-POSIX-1b R70 P0-1:
+     * verify ub_merkle_root self-consistency. Inputs match what
+     * sync_commit stamps: alloc_roots csum, dataset tree csum
+     * (from ub_main_root), snapshot tree csum (from ub_snap_root),
+     * CAS index csum (from ub_cas_index_root — zero before the
+     * first cold-tier commit), keyschema csum, extent csum, repair-
+     * log csum, inode-tree csum (from ub_inode_root — zero before
+     * the first inode-touching commit). For pools created pre-
+     * P6-persist these csums are all-zero and the recompute matches. */
     uint8_t  recomputed[32];
     stm_status ms = compute_merkle_root(ub.ub_main_root.bp_csum,
                                           ub.ub_alloc_root.bp_csum,
@@ -1657,6 +1673,7 @@ stm_status stm_sync_open(stm_pool *p, stm_alloc *a,
                                           ks_hdr.ks_root.bp_csum,
                                           ub.ub_extent_root.bp_csum,
                                           ub.ub_repair_log_root.bp_csum,
+                                          ub.ub_inode_root.bp_csum,
                                           ub.ub_merkle_root_salt,
                                           recomputed);
     if (ms != STM_OK) {
@@ -2453,14 +2470,16 @@ stm_status stm_sync_commit(stm_sync *s)
         return sr;
     }
 
-    /* P4-1 / P5-3b / P6-persist / P7-3 / P7-15 R47 P2-1: compute the
-     * pool Merkle root. The `alloc_root` slot is the ROOTS OBJECT's
-     * root csum (transitively covers every per-device tree root).
-     * The `main_root` slot is the dataset index tree's root csum;
-     * `snap_root` is the snapshot index tree's; `extent_root` is the
-     * extent index tree's; `repair_log` is the audit-trail tree's
-     * (P7-15 v16); `cas` is the CAS-tier index tree's (P7-CAS v18).
-     * Each feeds in directly. R8-P1-1: refuse to commit on BLAKE3 OOM. */
+    /* P4-1 / P5-3b / P6-persist / P7-3 / P7-15 R47 P2-1 / P8-POSIX-1b
+     * R70 P0-1: compute the pool Merkle root. The `alloc_root` slot
+     * is the ROOTS OBJECT's root csum (transitively covers every
+     * per-device tree root). The `main_root` slot is the dataset
+     * index tree's root csum; `snap_root` is the snapshot index
+     * tree's; `extent_root` is the extent index tree's; `repair_log`
+     * is the audit-trail tree's (P7-15 v16); `cas` is the CAS-tier
+     * index tree's (P7-CAS v18); `inode` is the per-pool inode tree's
+     * (P8-POSIX-1b v24). Each feeds in directly. R8-P1-1: refuse to
+     * commit on BLAKE3 OOM. */
     uint8_t new_merkle_root[32];
     stm_status ms = compute_merkle_root(main_csum,   /* main */
                                           roots_csum,
@@ -2469,6 +2488,7 @@ stm_status stm_sync_commit(stm_sync *s)
                                           ks_root_csum,
                                           extent_csum,
                                           repair_log_csum,
+                                          inode_csum,    /* P8-POSIX-1b */
                                           s->merkle_salt,
                                           new_merkle_root);
     if (ms != STM_OK) {
@@ -4098,6 +4118,11 @@ stm_repair_log_index *stm_sync_repair_log_index(stm_sync *s)
 stm_cas_index *stm_sync_cas_index(stm_sync *s)
 {
     return s ? s->cas_idx : NULL;
+}
+
+stm_inode_index *stm_sync_inode_index(stm_sync *s)
+{
+    return s ? s->inode_idx : NULL;
 }
 
 /* P7-CAS-5: out-of-band CAS auto-GC sweep entry point. See sync.h

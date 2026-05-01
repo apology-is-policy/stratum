@@ -794,4 +794,69 @@ STM_TEST(inode_persist_idempotent_commit_when_clean) {
     unlink(inp_tmp_path);
 }
 
+/* R70 P3-6: stm_inode_index_set_storage refuses re-binding. */
+STM_TEST(inode_p3_6_set_storage_refuses_rebind) {
+    inp_make_tmp("p3_6_st");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    inp_open_fresh(&d, &b);
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_OK(stm_inode_index_set_storage(idx, d, b));
+    STM_ASSERT_ERR(stm_inode_index_set_storage(idx, d, b), STM_EINVAL);
+    stm_inode_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(inp_tmp_path);
+}
+
+/* R70 P3-6: stm_inode_index_set_crypt_ctx refuses re-binding. */
+STM_TEST(inode_p3_6_set_crypt_ctx_refuses_rebind) {
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_OK(stm_inode_index_set_crypt_ctx(idx, INP_KEY,
+                                                   INP_POOL_UUID,
+                                                   INP_DEVICE_UUID));
+    STM_ASSERT_ERR(stm_inode_index_set_crypt_ctx(idx, INP_KEY,
+                                                    INP_POOL_UUID,
+                                                    INP_DEVICE_UUID),
+                   STM_EINVAL);
+    stm_inode_index_close(idx);
+}
+
+/* R70 P3-4: a no-op stm_inode_set (writing the same value back) does
+ * NOT re-dirty the index — the next commit returns the same root
+ * paddr/csum as before the no-op. Catches a regression where Set
+ * unconditionally flips dirty=true and forces a re-serialize on
+ * every clean-mount + identity-write workload. */
+STM_TEST(inode_p3_4_set_no_op_doesnt_redirty) {
+    inp_make_tmp("p3_4");
+    stm_bdev *d = NULL; stm_bootstrap *b = NULL;
+    inp_open_fresh(&d, &b);
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_OK(stm_inode_index_set_storage(idx, d, b));
+    STM_ASSERT_OK(stm_inode_index_set_crypt_ctx(idx, INP_KEY,
+                                                   INP_POOL_UUID,
+                                                   INP_DEVICE_UUID));
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
+
+    uint64_t p1 = 0; uint8_t c1[32];
+    STM_ASSERT_OK(stm_inode_index_commit(idx, 1u, &p1, c1));
+
+    /* Read the freshly-committed value, write it back unchanged. */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &v));
+    STM_ASSERT_OK(stm_inode_set(idx, 1, ino, &v));
+
+    /* Idempotent commit — same root because dirty stayed false. */
+    uint64_t p2 = 0; uint8_t c2[32];
+    STM_ASSERT_OK(stm_inode_index_commit(idx, 1u, &p2, c2));
+    STM_ASSERT_EQ(p1, p2);
+    STM_ASSERT_MEM_EQ(c1, c2, 32);
+
+    stm_inode_index_close(idx);
+    stm_bootstrap_close(b);
+    stm_bdev_close(d);
+    unlink(inp_tmp_path);
+}
+
 STM_TEST_MAIN("test_inode")

@@ -89,6 +89,10 @@ struct stm_inode_index {
     uint64_t        pool_uuid[2];
     uint64_t        device_uuid[2];
     bool            crypt_set;
+    bool            storage_set;     /* R70 P3-6: latched on first
+                                       * successful set_storage; further
+                                       * set_storage / set_crypt_ctx calls
+                                       * refused with STM_EINVAL. */
     uint64_t        root_paddr;
     uint64_t        root_gen;
     uint8_t         root_csum[32];
@@ -141,12 +145,18 @@ static const stm_inode_dsstate *find_dsstate_c(const stm_inode_index *idx,
     return NULL;
 }
 
-/* Scan records[] for a FREED slot in dataset_id. NULL on miss. */
+/* Scan records[] for a FREED slot in dataset_id whose prior gen
+ * isn't UINT64_MAX (R70 P3-1: a slot at UINT64_MAX would wrap on
+ * AllocReused's gen+1 — silently violating the (ino, gen) tuple-
+ * uniqueness invariant. Skip such slots; the caller falls through
+ * to AllocFresh on a NULL return). NULL on miss. */
 static stm_inode_record *find_freed_record(stm_inode_index *idx,
                                                  uint64_t dataset_id) {
     for (size_t i = 0; i < idx->n_records; i++) {
         stm_inode_record *r = &idx->records[i];
         if (r->dataset_id == dataset_id && r->state == STM_INODE_STATE_FREED) {
+            uint64_t prior_gen = stm_load_le64(r->value.si_gen);
+            if (prior_gen == UINT64_MAX) continue;
             return r;
         }
     }
@@ -259,6 +269,15 @@ static stm_status in_decode_value(const void *in, size_t in_len,
             ? STM_INODE_STATE_FREED
             : STM_INODE_STATE_ALLOCATED;
 
+    /* R70 P3-3: pin the FREED ⇔ nlink=0 invariant at decode. The
+     * healthy paths (stm_inode_alloc / _free) already maintain this
+     * by construction; rejecting tampered records that violate the
+     * invariant catches single-bit-flip + offline-tamper attacks
+     * one layer earlier than the API surface. */
+    uint32_t nlink = stm_load_le32(out->value.si_nlink);
+    if (out->state == STM_INODE_STATE_FREED && nlink != 0) return STM_ECORRUPT;
+    if (out->state == STM_INODE_STATE_ALLOCATED && nlink == 0) return STM_ECORRUPT;
+
     out->dataset_id = expected_ds;
     out->ino        = expected_ino;
     return STM_OK;
@@ -342,7 +361,7 @@ stm_inode_index *stm_inode_index_create(void) {
         free(idx);
         return NULL;
     }
-    int rc = pthread_mutex_init(&idx->lock, &attr);
+    int rc = pthread_mutex_init(idx_lock(idx), &attr);
     pthread_mutexattr_destroy(&attr);
     if (rc != 0) {
         free(idx);
@@ -353,7 +372,7 @@ stm_inode_index *stm_inode_index_create(void) {
 
 void stm_inode_index_close(stm_inode_index *idx) {
     if (!idx) return;
-    pthread_mutex_destroy(&idx->lock);
+    pthread_mutex_destroy(idx_lock(idx));
     free(idx->records);
     free(idx->dsstate);
     free(idx);
@@ -384,39 +403,36 @@ stm_status stm_inode_alloc(stm_inode_index *idx, uint64_t dataset_id,
      * by 1, mark ALLOCATED. Models inode.tla's AllocReused action.
      * The bump preserves the (ino, gen) tuple-uniqueness invariant
      * — every distinct allocation at this ino has a strictly
-     * greater gen than any prior allocation at the same ino. */
+     * greater gen than any prior allocation at the same ino.
+     *
+     * R70 P3-1: find_freed_record now skips slots at UINT64_MAX gen
+     * (which would wrap on bump), so any returned slot is eligible
+     * for reuse without further checks. */
     stm_inode_record *r = find_freed_record(idx, dataset_id);
     uint64_t fresh_ino = 0;
     if (r) {
         uint64_t prior_gen = stm_load_le64(r->value.si_gen);
-        if (prior_gen == UINT64_MAX) {
-            /* gen would wrap on bump — refuse this slot. Fall through
-             * to AllocFresh by wiping the FREED flag is unsafe (would
-             * leak the slot); instead, leave it FREED and try fresh. */
-            r = NULL;
-        } else {
-            uint64_t new_gen = prior_gen + 1u;
-            /* Re-init the value: identity preserved (ino, dataset_id),
-             * gen bumped, all other fields restored to alloc-fresh
-             * defaults. The ino number is preserved (this IS the
-             * point of reuse). */
-            uint64_t reused_ino = r->ino;
-            memset(&r->value, 0, sizeof r->value);
-            r->state             = STM_INODE_STATE_ALLOCATED;
-            r->value.si_ino      = stm_store_le64(reused_ino);
-            r->value.si_dataset_id = stm_store_le64(dataset_id);
-            r->value.si_gen      = stm_store_le64(new_gen);
-            r->value.si_mode     = stm_store_le32(mode);
-            r->value.si_uid      = stm_store_le32(uid);
-            r->value.si_gid      = stm_store_le32(gid);
-            r->value.si_nlink    = stm_store_le32(1);
-            r->value.si_data_kind = STM_DATA_INLINE;
-            r->value.si_data_len = 0;
-            *out_ino             = reused_ino;
-            idx->dirty           = true;
-            must_unlock(idx_lock(idx));
-            return STM_OK;
-        }
+        uint64_t new_gen = prior_gen + 1u;
+        /* Re-init the value: identity preserved (ino, dataset_id),
+         * gen bumped, all other fields restored to alloc-fresh
+         * defaults. The ino number is preserved (this IS the
+         * point of reuse). */
+        uint64_t reused_ino = r->ino;
+        memset(&r->value, 0, sizeof r->value);
+        r->state             = STM_INODE_STATE_ALLOCATED;
+        r->value.si_ino      = stm_store_le64(reused_ino);
+        r->value.si_dataset_id = stm_store_le64(dataset_id);
+        r->value.si_gen      = stm_store_le64(new_gen);
+        r->value.si_mode     = stm_store_le32(mode);
+        r->value.si_uid      = stm_store_le32(uid);
+        r->value.si_gid      = stm_store_le32(gid);
+        r->value.si_nlink    = stm_store_le32(1);
+        r->value.si_data_kind = STM_DATA_INLINE;
+        r->value.si_data_len = 0;
+        *out_ino             = reused_ino;
+        idx->dirty           = true;
+        must_unlock(idx_lock(idx));
+        return STM_OK;
     }
 
     /* AllocFresh path: ino = next_ino[ds], bump.
@@ -548,9 +564,23 @@ stm_status stm_inode_set(stm_inode_index *idx, uint64_t dataset_id,
             return STM_EINVAL;
         }
     }
-    r->value = *in_value;
-    /* R69 P3-2: zero `si_reserved` on every Set. */
-    memset(r->value.si_reserved, 0, sizeof r->value.si_reserved);
+    /* R70 P3-4 + R69 P3-2: build the canonical post-write candidate
+     * (caller's value with si_reserved zeroed per the R69 contract)
+     * and skip the dirty flip + memcpy when the candidate is byte-
+     * identical to the existing record. Avoids re-serializing the
+     * entire inode tree on a clean-mount + immediate-set-no-op
+     * pool. The compare is across the whole 256-byte struct
+     * including si_reserved — that's intentional: if the in-RAM
+     * record currently carries non-zero si_reserved (e.g., from an
+     * old impl that didn't zero it on Set), this Set still rewrites
+     * it via the candidate path. */
+    struct stm_inode_value candidate = *in_value;
+    memset(candidate.si_reserved, 0, sizeof candidate.si_reserved);
+    if (memcmp(&candidate, &r->value, sizeof candidate) == 0) {
+        must_unlock(idx_lock(idx));
+        return STM_OK;
+    }
+    r->value = candidate;
     idx->dirty = true;
 
     must_unlock(idx_lock(idx));
@@ -601,10 +631,18 @@ stm_status stm_inode_index_set_storage(stm_inode_index *idx,
                                           stm_bdev *bdev_0,
                                           stm_bootstrap *boot_0) {
     if (!idx || !bdev_0 || !boot_0) return STM_EINVAL;
-    must_lock(&idx->lock);
+    must_lock(idx_lock(idx));
+    /* R70 P3-6: refuse re-binding once latched. Mid-commit re-bind
+     * would corrupt the AEAD ctx + storage handles in flight; the
+     * sole legitimate caller (sync.c) binds exactly once at create. */
+    if (idx->storage_set) {
+        must_unlock(idx_lock(idx));
+        return STM_EINVAL;
+    }
     idx->bdev = bdev_0;
     idx->boot = boot_0;
-    must_unlock(&idx->lock);
+    idx->storage_set = true;
+    must_unlock(idx_lock(idx));
     return STM_OK;
 }
 
@@ -613,14 +651,19 @@ stm_status stm_inode_index_set_crypt_ctx(stm_inode_index *idx,
                                             const uint64_t pool_uuid[2],
                                             const uint64_t device_uuid_0[2]) {
     if (!idx || !metadata_key || !pool_uuid || !device_uuid_0) return STM_EINVAL;
-    must_lock(&idx->lock);
+    must_lock(idx_lock(idx));
+    /* R70 P3-6: refuse re-binding once latched. */
+    if (idx->crypt_set) {
+        must_unlock(idx_lock(idx));
+        return STM_EINVAL;
+    }
     idx->metadata_key   = metadata_key;
     idx->pool_uuid[0]   = pool_uuid[0];
     idx->pool_uuid[1]   = pool_uuid[1];
     idx->device_uuid[0] = device_uuid_0[0];
     idx->device_uuid[1] = device_uuid_0[1];
     idx->crypt_set      = true;
-    must_unlock(&idx->lock);
+    must_unlock(idx_lock(idx));
     return STM_OK;
 }
 
@@ -675,10 +718,10 @@ stm_status stm_inode_index_commit(stm_inode_index *idx,
                                      uint64_t *out_root_paddr,
                                      uint8_t out_root_csum[32]) {
     if (!idx || !out_root_paddr || !out_root_csum) return STM_EINVAL;
-    must_lock(&idx->lock);
+    must_lock(idx_lock(idx));
 
     if (!idx->crypt_set || !idx->bdev || !idx->boot) {
-        must_unlock(&idx->lock);
+        must_unlock(idx_lock(idx));
         return STM_EINVAL;
     }
 
@@ -686,14 +729,14 @@ stm_status stm_inode_index_commit(stm_inode_index *idx,
     if (!idx->dirty && idx->root_paddr != 0) {
         *out_root_paddr = idx->root_paddr;
         memcpy(out_root_csum, idx->root_csum, 32);
-        must_unlock(&idx->lock);
+        must_unlock(idx_lock(idx));
         return STM_OK;
     }
 
     stm_btree_mt *t = NULL;
     stm_status bs = in_build_btree_locked(idx, &t);
     if (bs != STM_OK) {
-        must_unlock(&idx->lock);
+        must_unlock(idx_lock(idx));
         return bs;
     }
 
@@ -708,7 +751,7 @@ stm_status stm_inode_index_commit(stm_inode_index *idx,
                                                  &new_paddr, new_csum);
     stm_btree_mt_free(t);
     if (ss != STM_OK) {
-        must_unlock(&idx->lock);
+        must_unlock(idx_lock(idx));
         return ss;
     }
 
@@ -727,7 +770,7 @@ stm_status stm_inode_index_commit(stm_inode_index *idx,
                                                      &IN_STORE_VT, &sc, &cx);
         if (fs != STM_OK) {
             IN_ROLLBACK_RESERVE();
-            must_unlock(&idx->lock);
+            must_unlock(idx_lock(idx));
             return fs;
         }
     }
@@ -735,7 +778,7 @@ stm_status stm_inode_index_commit(stm_inode_index *idx,
     stm_status bsc = stm_bootstrap_commit(idx->boot, committed_gen);
     if (bsc != STM_OK) {
         IN_ROLLBACK_RESERVE();
-        must_unlock(&idx->lock);
+        must_unlock(idx_lock(idx));
         return bsc;
     }
     #undef IN_ROLLBACK_RESERVE
@@ -747,7 +790,7 @@ stm_status stm_inode_index_commit(stm_inode_index *idx,
 
     *out_root_paddr = new_paddr;
     memcpy(out_root_csum, new_csum, 32);
-    must_unlock(&idx->lock);
+    must_unlock(idx_lock(idx));
     return STM_OK;
 }
 
@@ -782,7 +825,19 @@ static int in_load_iter(const void *k, size_t klen,
     uint64_t ds = 0, ino = 0;
     stm_status ks = in_decode_key(k, klen, &ds, &ino);
     if (ks != STM_OK) { lc->err = ks; return 1; }
-    if (ds == 0 || ino == 0) { lc->err = STM_ECORRUPT; return 1; }
+    /* R70 P3-2: reject ino == UINT64_MAX. Such a record would cause
+     * the rebuild walk's `r->ino + 1u` to wrap to 0, leaving
+     * next_ino at its prior value (often 0) and making subsequent
+     * stm_inode_alloc return fresh_ino=0 — the "invalid sentinel"
+     * that the rest of the API refuses. STM_ECORRUPT-on-decode is
+     * the cleaner posture; healthy allocators never produce a
+     * UINT64_MAX-keyed record because the next_ino monotonic raise
+     * stops one short of UINT64_MAX (no AllocFresh slot at the
+     * sentinel). */
+    if (ds == 0 || ino == 0 || ino == UINT64_MAX) {
+        lc->err = STM_ECORRUPT;
+        return 1;
+    }
 
     stm_inode_record r;
     memset(&r, 0, sizeof r);
@@ -842,9 +897,9 @@ stm_status stm_inode_index_load_at(stm_inode_index *idx,
                                       const uint8_t expected_csum[32]) {
     if (!idx || !expected_csum) return STM_EINVAL;
     if (root_paddr == 0) return STM_EINVAL;
-    must_lock(&idx->lock);
+    must_lock(idx_lock(idx));
     if (!idx->crypt_set || !idx->bdev || !idx->boot) {
-        must_unlock(&idx->lock);
+        must_unlock(idx_lock(idx));
         return STM_EINVAL;
     }
 
@@ -853,7 +908,7 @@ stm_status stm_inode_index_load_at(stm_inode_index *idx,
     stm_btree_mt *t = NULL;
     stm_status ts = stm_btree_mt_new(&opts, &t);
     if (ts != STM_OK) {
-        must_unlock(&idx->lock);
+        must_unlock(idx_lock(idx));
         return ts;
     }
 
@@ -865,7 +920,7 @@ stm_status stm_inode_index_load_at(stm_inode_index *idx,
                                                    &IN_STORE_VT, &sc, &cx);
     if (ds != STM_OK) {
         stm_btree_mt_free(t);
-        must_unlock(&idx->lock);
+        must_unlock(idx_lock(idx));
         return ds;
     }
 
@@ -876,12 +931,12 @@ stm_status stm_inode_index_load_at(stm_inode_index *idx,
 
     if (sr != STM_OK) {
         free(lc.shadow_records);
-        must_unlock(&idx->lock);
+        must_unlock(idx_lock(idx));
         return sr;
     }
     if (lc.err != STM_OK) {
         free(lc.shadow_records);
-        must_unlock(&idx->lock);
+        must_unlock(idx_lock(idx));
         return lc.err;
     }
 
@@ -895,7 +950,7 @@ stm_status stm_inode_index_load_at(stm_inode_index *idx,
                                                           &new_cap_ds);
     if (rs != STM_OK) {
         free(lc.shadow_records);
-        must_unlock(&idx->lock);
+        must_unlock(idx_lock(idx));
         return rs;
     }
 
@@ -914,6 +969,6 @@ stm_status stm_inode_index_load_at(stm_inode_index *idx,
     memcpy(idx->root_csum, expected_csum, 32);
     idx->dirty      = false;
 
-    must_unlock(&idx->lock);
+    must_unlock(idx_lock(idx));
     return STM_OK;
 }

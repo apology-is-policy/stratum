@@ -877,6 +877,20 @@ typedef struct stm_cas_index stm_cas_index;
 stm_cas_index *stm_sync_cas_index(stm_sync *s);
 
 /*
+ * P8-POSIX-1b: per-pool inode index handle. Same lifetime + thread-
+ * safety contract as the other index accessors above. The inode
+ * index is owned by sync and persists across commits via the
+ * lifecycle wiring (set_storage / set_crypt_ctx in sync_create,
+ * load_at on mount, commit + UB stamping in sync_commit). Higher-
+ * level POSIX-surface APIs (P8-POSIX-2 dirent layer + downstream
+ * chunks) operate on it via fs.c wrappers; tests reach it directly
+ * to roundtrip persistence + verify the sync-layer wiring.
+ */
+struct stm_inode_index;
+typedef struct stm_inode_index stm_inode_index;
+stm_inode_index *stm_sync_inode_index(stm_sync *s);
+
+/*
  * P7-CAS-5: trigger one CAS auto-GC sweep cycle out-of-band from
  * `stm_sync_commit`. Takes `sync->lock` internally; safe to call
  * from any context that does NOT already hold sync->lock (notably:
