@@ -4,16 +4,18 @@
 \*   ARCHITECTURE §11.4 (Directory format — hash-indexed B-tree).
 \*   ARCHITECTURE §11.4.1 (Dirent record + key shape).
 \*   ARCHITECTURE §11.4.2 (Lookup protocol — open-addressing).
-\*   ROADMAP    §11.1 (P8 deliverable: dirent layer).
+\*   ARCHITECTURE §11.4.3 (Directory scaling — readdir hash-order range).
+\*   ROADMAP    §11.1 (P8 deliverable: dirent layer + readdir).
 \*
-\* Pin: open-addressing chain integrity. ARCH §11.4 specifies that a
-\* directory entry for `name` lives in the main btree at key
+\* Pin: open-addressing chain integrity AND readdir cursor stability.
+\* ARCH §11.4 specifies that a directory entry for `name` lives in the
+\* main btree at key
 \*
 \*     (dir_ino, STM_KEY_DIRENT, fnv1a(name) + probe_offset)
 \*
 \* with `probe_offset` resolving collisions via open addressing
-\* (linear probing). Three invariants must hold for the chain to
-\* answer Lookup correctly:
+\* (linear probing). Three integrity invariants (P8-POSIX-2) and
+\* three cursor-stability invariants (P8-POSIX-4) must hold:
 \*
 \*   (1) Unlink leaves a TOMBSTONE marker in the slot — not EMPTY —
 \*       so a colliding name living at a higher probe index is still
@@ -24,13 +26,23 @@
 \*       a colliding occupant.
 \*   (3) Lookup skips TOMBSTONE slots. A bug that treats TOMBSTONE
 \*       as EMPTY short-circuits and silently returns ENOENT.
+\*   (4) Readdir does NOT emit tombstones — they're internal markers,
+\*       not POSIX-visible entries. A bug that emits tombstone slots
+\*       would surface the unlink trail to userspace.
+\*   (5) Readdir cursor strictly advances past every emitted slot —
+\*       same probe never returned twice. A bug that emits without
+\*       advancing the cursor would re-emit on the next step.
+\*   (6) Readdir scans every reachable slot before terminating —
+\*       a live record at a higher probe must be emitted, not skipped.
+\*       A bug that skips live records would silently lose entries.
 \*
-\* These three together let `LookupResult(d, name)` walk the slot
-\* table and return the inode that the abstract `links` oracle says
-\* is currently linked under `name` — or the NONE sentinel iff no
-\* such name is linked.
+\* These six together let `LookupResult(d, name)` walk the slot table
+\* and return the inode that the abstract `links` oracle says is
+\* currently linked under `name` — or the NONE sentinel iff no such
+\* name is linked — AND let `ReaddirAll(d)` recover the full set of
+\* currently-linked entries (over a stable directory).
 \*
-\* Buggy variants — each maps to one of the three integrity rules:
+\* Buggy variants — each maps to one of the six integrity rules:
 \*
 \*   BuggyUnlinkUsesEmpty
 \*       Unlink writes EMPTY to the slot instead of TOMBSTONE. Fires
@@ -52,6 +64,29 @@
 \*       path rather than the write path — Lookup of a name living
 \*       past a tombstone returns NotFound.
 \*
+\*   BuggyReaddirIncludesTombstones
+\*       Readdir emits the tombstone slot value as if it were a live
+\*       record. Fires ReaddirNoTombstoneEmitted — userspace would
+\*       see synthetic entries with kind="tombstone" and zeroed
+\*       (ino, name) fields, breaking POSIX `struct dirent`'s
+\*       contract.
+\*
+\*   BuggyReaddirNoCursorAdvance
+\*       Readdir emits a live record but doesn't advance the cursor
+\*       past the slot. Fires ReaddirNoDuplicateProbeInLog — the same
+\*       (probe, record) tuple is emitted on every subsequent step
+\*       until something else advances the cursor (which never
+\*       happens), producing infinitely-many duplicates in finite
+\*       steps via TLC's exhaustive search. Userspace would see the
+\*       same dirent returned over and over.
+\*
+\*   BuggyReaddirSkipsLiveRecord
+\*       Readdir advances the cursor past a live slot without emitting
+\*       its record. Fires ReaddirCompleteAtEnd — when iteration
+\*       terminates (cursor = MaxProbe), at least one live record's
+\*       probe is missing from the emit log, so userspace would
+\*       silently lose entries.
+\*
 \* Scope. The spec models the open-addressing slot table as a flat
 \* function 0..MaxProbe-1 → SlotEntry per directory. It deliberately
 \* does NOT model:
@@ -62,15 +97,23 @@
 \*     parametric over a single directory's slot table; per-directory
 \*     isolation reduces to per-dir by the btree key scheme
 \*     (dir_ino prefix in the key).
-\*   - readdir cursor stability. Modeled separately when P8-POSIX-4
-\*     extends this spec.
 \*   - rename atomicity. Modeled separately when P8-POSIX-9 extends
 \*     this spec.
 \*   - case-insensitivity (ARCH §11.4.5). Abstracted via the Hash
 \*     function — case-insensitive impl uses Hash(NFKD(lower(name)))
 \*     but the chain-integrity properties are identical.
+\*   - Concurrent Create/Unlink WITHIN an in-flight readdir. POSIX
+\*     allows interleaved mutations during readdir but the resulting
+\*     "torn view" is caller-relative — what's load-bearing is that
+\*     each individual cursor-advance step preserves the integrity
+\*     invariants (no duplicate, no tombstone-as-record, cursor
+\*     monotonic). Modeled here via the `iter_active[d]` flag that
+\*     gates Create/Unlink: mutations may only fire BETWEEN
+\*     iterations, not during. Cross-step interleaving is then a
+\*     separate concern (and is verified runtime-side by the C
+\*     impl's tests under concurrent fs.c API calls).
 
-EXTENDS Integers, FiniteSets, TLC
+EXTENDS Integers, FiniteSets, Sequences, TLC
 
 CONSTANTS
     Dirs,                      \* set of directory inodes
@@ -89,7 +132,10 @@ CONSTANTS
                                \*   tuples
     BuggyUnlinkUsesEmpty,
     BuggyCreateOverwritesNoProbe,
-    BuggyLookupStopsOnTombstone
+    BuggyLookupStopsOnTombstone,
+    BuggyReaddirIncludesTombstones,
+    BuggyReaddirNoCursorAdvance,
+    BuggyReaddirSkipsLiveRecord
 
 ASSUME /\ Dirs # {}
        /\ Names # {}
@@ -100,6 +146,9 @@ ASSUME /\ Dirs # {}
        /\ BuggyUnlinkUsesEmpty \in BOOLEAN
        /\ BuggyCreateOverwritesNoProbe \in BOOLEAN
        /\ BuggyLookupStopsOnTombstone \in BOOLEAN
+       /\ BuggyReaddirIncludesTombstones \in BOOLEAN
+       /\ BuggyReaddirNoCursorAdvance \in BOOLEAN
+       /\ BuggyReaddirSkipsLiveRecord \in BOOLEAN
 
 \* --------------------------------------------------------------------------
 \* Hash function override target.
@@ -165,13 +214,36 @@ IsRecord(s) == s.kind = "record"
 \*       tuples. Mutated atomically by Create/Unlink — the
 \*       authoritative ground truth that the slot table must
 \*       faithfully encode.
+\*
+\*   iter : [Dirs -> 0..MaxProbe]                 (P8-POSIX-4)
+\*       Per-dir readdir cursor. iter[d] = MaxProbe means
+\*       "iteration done"; iter[d] < MaxProbe means "next slot
+\*       to scan is iter[d]". The C impl's opaque uint64_t cursor
+\*       is the same primitive at runtime: the next probe to
+\*       consider.
+\*
+\*   emit_log : [Dirs -> Seq([probe: 0..MaxProbe-1, slot: SlotEntry])]
+\*                                                  (P8-POSIX-4)
+\*       Per-dir sequence of (probe, slot) pairs emitted by readdir
+\*       during the current iteration. A SEQUENCE (not a set) so
+\*       duplicate emits — which BuggyReaddirNoCursorAdvance
+\*       produces — are observable. Reset to <<>> on ReaddirReset.
+\*
+\*   iter_active : [Dirs -> BOOLEAN]                 (P8-POSIX-4)
+\*       Per-dir flag: TRUE iff a readdir iteration is currently
+\*       in flight. Gates Create/Unlink to model "stable
+\*       iteration" — POSIX-allowed concurrent mutation is then
+\*       a separate concern verified runtime-side by the C tests.
 \* --------------------------------------------------------------------------
 
 VARIABLES
     slots,
-    links
+    links,
+    iter,
+    emit_log,
+    iter_active
 
-vars == <<slots, links>>
+vars == <<slots, links, iter, emit_log, iter_active>>
 
 \* --------------------------------------------------------------------------
 \* Probe-chain helpers.
@@ -237,22 +309,26 @@ LiveRecordSlot(d, name, k) ==
             ELSE LiveRecordSlot(d, name, k + 1)
 
 \* --------------------------------------------------------------------------
-\* Initial state — all slots EMPTY, no links.
+\* Initial state — all slots EMPTY, no links, no readdir in flight.
 \* --------------------------------------------------------------------------
 
 Init ==
-    /\ slots = [d \in Dirs |-> [k \in 0..MaxProbe-1 |-> EMPTY]]
-    /\ links = [d \in Dirs |-> {}]
+    /\ slots       = [d \in Dirs |-> [k \in 0..MaxProbe-1 |-> EMPTY]]
+    /\ links       = [d \in Dirs |-> {}]
+    /\ iter        = [d \in Dirs |-> MaxProbe]   \* sentinel: no iter in flight
+    /\ emit_log    = [d \in Dirs |-> <<>>]
+    /\ iter_active = [d \in Dirs |-> FALSE]
 
 \* --------------------------------------------------------------------------
-\* Actions.
+\* Actions — write side (Create / Unlink).
 \* --------------------------------------------------------------------------
 
 \* Create — link `name` to (ino, gen) in dir `d`.
 \*
 \* Precondition: `name` not currently in links[d] (the abstract
 \* "no-replace create" semantics; replace would be modeled as
-\* unlink-then-create).
+\* unlink-then-create). AND no readdir is currently in flight in
+\* `d` (P8-POSIX-4: stable-iteration model).
 \*
 \* Healthy: install at FirstInstallSlot — first EMPTY/TOMBSTONE
 \* in the chain.
@@ -261,6 +337,7 @@ Init ==
 \* unconditionally, overwriting whatever was there. Models a
 \* hypothetical implementation that forgot the probe loop.
 Create(d, name, ino, g) ==
+    /\ ~iter_active[d]
     /\ ~\E t \in links[d] : t[1] = name
     /\ \/ /\ ~BuggyCreateOverwritesNoProbe
           /\ FirstInstallSlot(d, name, 0) # -1
@@ -272,10 +349,12 @@ Create(d, name, ino, g) ==
                           ![d][Hash[name]] = DirentRec(name, ino, g)]
     /\ links' = [links EXCEPT
                     ![d] = links[d] \cup {<<name, ino, g>>}]
+    /\ UNCHANGED <<iter, emit_log, iter_active>>
 
 \* Unlink — remove `name` from dir `d`.
 \*
-\* Precondition: `name` is currently linked in `d`.
+\* Precondition: `name` is currently linked in `d`, AND no readdir
+\* is in flight (P8-POSIX-4: stable-iteration model).
 \*
 \* Healthy: walk the chain to the live record, replace the slot
 \* with TOMBSTONE.
@@ -284,6 +363,7 @@ Create(d, name, ino, g) ==
 \* chain integrity for any colliding name living at a higher
 \* probe index.
 Unlink(d, name) ==
+    /\ ~iter_active[d]
     /\ \E t \in links[d] : t[1] = name
     /\ LiveRecordSlot(d, name, 0) # -1
     /\ LET marker == IF BuggyUnlinkUsesEmpty THEN EMPTY ELSE TOMBSTONE
@@ -291,6 +371,97 @@ Unlink(d, name) ==
                        ![d][LiveRecordSlot(d, name, 0)] = marker]
     /\ links' = [links EXCEPT
                     ![d] = {t \in links[d] : t[1] # name}]
+    /\ UNCHANGED <<iter, emit_log, iter_active>>
+
+\* --------------------------------------------------------------------------
+\* Actions — read side (P8-POSIX-4 readdir).
+\*
+\* Three actions model a full readdir cycle:
+\*   ReaddirReset   — start a new iteration (iter -> 0, emit_log -> <<>>)
+\*   ReaddirStep    — advance the cursor by one slot, conditionally emit
+\*   ReaddirEnd     — terminate the iteration (clears iter_active so
+\*                    Create / Unlink can fire again)
+\*
+\* The C impl's `stm_dirent_readdir` collapses Reset+Step*+End into
+\* a single call boundary; the spec splits them so TLC can interleave
+\* multiple step firings within one iteration.
+\* --------------------------------------------------------------------------
+
+\* Begin a new readdir iteration in dir `d`. Resets cursor + log;
+\* sets iter_active so concurrent Create/Unlink is blocked until
+\* ReaddirEnd fires.
+ReaddirReset(d) ==
+    /\ ~iter_active[d]
+    /\ iter'        = [iter EXCEPT ![d] = 0]
+    /\ emit_log'    = [emit_log EXCEPT ![d] = <<>>]
+    /\ iter_active' = [iter_active EXCEPT ![d] = TRUE]
+    /\ UNCHANGED <<slots, links>>
+
+\* Advance the cursor by one slot. Three cases on slots[d][iter[d]]:
+\*
+\*   - record: emit + advance cursor. Buggy variants:
+\*       BuggyReaddirNoCursorAdvance — emit but DON'T advance
+\*           (re-emits same probe on next step → duplicate in log).
+\*       BuggyReaddirSkipsLiveRecord — advance WITHOUT emitting
+\*           (live record lost from log → completeness violated).
+\*
+\*   - tombstone: skip + advance cursor. Buggy variant:
+\*       BuggyReaddirIncludesTombstones — emit tombstone slot value
+\*           as if it were a record (tombstone leaks to userspace).
+\*
+\*   - empty: skip + advance cursor (no buggy variant — EMPTY is
+\*       indistinguishable from "no record at this probe" and the
+\*       C impl never emits anything for EMPTY).
+ReaddirStep(d) ==
+    /\ iter_active[d]
+    /\ iter[d] < MaxProbe
+    /\ LET k == iter[d]
+           s == slots[d][k]
+       IN \/ \* Record at k
+             /\ IsRecord(s)
+             /\ \/ /\ ~BuggyReaddirNoCursorAdvance
+                   /\ ~BuggyReaddirSkipsLiveRecord
+                   /\ iter'     = [iter EXCEPT ![d] = k + 1]
+                   /\ emit_log' = [emit_log EXCEPT
+                                       ![d] = Append(emit_log[d],
+                                                     [probe |-> k,
+                                                      slot  |-> s])]
+                \/ /\ BuggyReaddirNoCursorAdvance
+                   /\ iter'     = iter   \* don't advance
+                   /\ emit_log' = [emit_log EXCEPT
+                                       ![d] = Append(emit_log[d],
+                                                     [probe |-> k,
+                                                      slot  |-> s])]
+                \/ /\ BuggyReaddirSkipsLiveRecord
+                   /\ iter'     = [iter EXCEPT ![d] = k + 1]
+                   /\ emit_log' = emit_log   \* don't emit
+          \/ \* Tombstone at k
+             /\ s = TOMBSTONE
+             /\ \/ /\ ~BuggyReaddirIncludesTombstones
+                   /\ iter'     = [iter EXCEPT ![d] = k + 1]
+                   /\ emit_log' = emit_log
+                \/ /\ BuggyReaddirIncludesTombstones
+                   /\ iter'     = [iter EXCEPT ![d] = k + 1]
+                   /\ emit_log' = [emit_log EXCEPT
+                                       ![d] = Append(emit_log[d],
+                                                     [probe |-> k,
+                                                      slot  |-> s])]
+          \/ \* Empty at k
+             /\ s = EMPTY
+             /\ iter'     = [iter EXCEPT ![d] = k + 1]
+             /\ emit_log' = emit_log
+    /\ UNCHANGED <<slots, links, iter_active>>
+
+\* Terminate the iteration — only enabled when cursor reached the
+\* end. Clears iter_active so subsequent Create/Unlink can fire.
+\* The cursor + emit_log are preserved across End so post-iteration
+\* invariants (e.g., ReaddirCompleteAtEnd) can be evaluated at the
+\* terminal state.
+ReaddirEnd(d) ==
+    /\ iter_active[d]
+    /\ iter[d] = MaxProbe
+    /\ iter_active' = [iter_active EXCEPT ![d] = FALSE]
+    /\ UNCHANGED <<slots, links, iter, emit_log>>
 
 \* --------------------------------------------------------------------------
 \* Next.
@@ -301,11 +472,14 @@ Next ==
            Create(d, name, ino, g)
     \/ \E d \in Dirs, name \in Names :
            Unlink(d, name)
+    \/ \E d \in Dirs : ReaddirReset(d)
+    \/ \E d \in Dirs : ReaddirStep(d)
+    \/ \E d \in Dirs : ReaddirEnd(d)
 
 Spec == Init /\ [][Next]_vars
 
 \* --------------------------------------------------------------------------
-\* Invariants.
+\* Invariants — write side (existing P8-POSIX-2 set).
 \* --------------------------------------------------------------------------
 
 \* Type correctness.
@@ -313,6 +487,10 @@ TypeOK ==
     /\ slots \in [Dirs -> [0..MaxProbe-1 -> SlotEntry]]
     /\ links \in [Dirs ->
                     SUBSET (Names \X Inos \X (0..MaxGen))]
+    /\ iter \in [Dirs -> 0..MaxProbe]
+    /\ iter_active \in [Dirs -> BOOLEAN]
+    /\ emit_log \in [Dirs ->
+                       Seq([probe: 0..MaxProbe-1, slot: SlotEntry])]
 
 \* HEADLINE INVARIANT — Lookup, walking the chain per the protocol,
 \* returns the (ino, gen) tuple that the abstract `links` oracle
@@ -321,8 +499,8 @@ TypeOK ==
 \*
 \* This is the single property that makes dirents correct: the
 \* slot table is a faithful encoding of the logical name → ino
-\* mapping. Every buggy variant fires this invariant via a
-\* differently-shaped chain-integrity violation.
+\* mapping. Every buggy write-side variant fires this invariant
+\* via a differently-shaped chain-integrity violation.
 LookupAgreesWithLinks ==
     \A d \in Dirs, name \in Names :
         LET expected ==
@@ -359,6 +537,56 @@ SlotsAgreeWithLinks ==
         IN slot_tuples = links[d]
 
 \* --------------------------------------------------------------------------
+\* Invariants — read side (P8-POSIX-4 readdir).
+\* --------------------------------------------------------------------------
+
+\* No tombstone ever appears in emit_log. Tombstones are an internal
+\* chain-integrity primitive (preserve reachability of colliding
+\* names past unlinks) and must not surface as POSIX dirents.
+\* Fired by BuggyReaddirIncludesTombstones.
+ReaddirNoTombstoneEmitted ==
+    \A d \in Dirs :
+        \A i \in DOMAIN emit_log[d] :
+            emit_log[d][i].slot.kind # "tombstone"
+
+\* No probe appears twice in emit_log within a single iteration.
+\* The cursor's strict-monotone advance guarantees this: once
+\* iter[d] crosses k, future ReaddirSteps fire at k' > k. Fired
+\* by BuggyReaddirNoCursorAdvance — the same record at probe k
+\* is appended on every step until the cursor advances (which it
+\* never does under the bug, so duplicate appearances accumulate
+\* until TLC catches the second occurrence).
+ReaddirNoDuplicateProbeInLog ==
+    \A d \in Dirs :
+        \A i, j \in DOMAIN emit_log[d] :
+            i # j => emit_log[d][i].probe # emit_log[d][j].probe
+
+\* emit_log is sorted strictly by probe — direct consequence of
+\* cursor monotonicity. Defense-in-depth invariant; fires for
+\* the same buggy variants as NoDuplicateProbeInLog and would
+\* also fire for any future bug that emits out-of-order (e.g.,
+\* an impl that returns to a previous slot via cursor reset).
+ReaddirCursorMonotonicEmits ==
+    \A d \in Dirs :
+        \A i, j \in DOMAIN emit_log[d] :
+            i < j => emit_log[d][i].probe < emit_log[d][j].probe
+
+\* Completeness at termination: when the iteration ends (cursor
+\* reached MaxProbe AND iter_active still TRUE just before End),
+\* every live record's probe in slots[d] is in emit_log[d]. Stable
+\* because Create/Unlink can't fire while iter_active is TRUE.
+\* Fired by BuggyReaddirSkipsLiveRecord — cursor advances past a
+\* live slot without emitting, so the live record's probe is
+\* missing from the log when iter reaches MaxProbe.
+ReaddirCompleteAtEnd ==
+    \A d \in Dirs :
+        (iter_active[d] /\ iter[d] = MaxProbe) =>
+            \A k \in 0..MaxProbe-1 :
+                IsRecord(slots[d][k]) =>
+                    \E i \in DOMAIN emit_log[d] :
+                        emit_log[d][i].probe = k
+
+\* --------------------------------------------------------------------------
 \* All invariants bundle.
 \* --------------------------------------------------------------------------
 
@@ -367,5 +595,9 @@ Invariants ==
     /\ LookupAgreesWithLinks
     /\ NoDuplicateRecord
     /\ SlotsAgreeWithLinks
+    /\ ReaddirNoTombstoneEmitted
+    /\ ReaddirNoDuplicateProbeInLog
+    /\ ReaddirCursorMonotonicEmits
+    /\ ReaddirCompleteAtEnd
 
 =============================================================================

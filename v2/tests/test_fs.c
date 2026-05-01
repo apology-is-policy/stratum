@@ -7884,4 +7884,385 @@ STM_TEST(fs_p3_link_refuses_existing_dst) {
     unlink(g_key_path);
 }
 
+/* ========================================================================= */
+/* P8-POSIX-4: readdir.                                                       */
+/* ========================================================================= */
+
+STM_TEST(fs_p4_readdir_empty_dir_synth_dots) {
+    /* An empty directory with default flags returns "." and ".." in
+     * the first call (max_entries large enough), then 0. */
+    make_tmp("p4_readdir_empty_dots");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t cursor = 0;
+    stm_fs_dirent_entry batch[16];
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_readdir(fs, /*ds=*/1, /*dir=*/root, /*parent=*/root,
+                                       /*flags=*/0u,
+                                       &cursor, batch, 16, &n));
+    STM_ASSERT_EQ(n, (size_t)2);
+    STM_ASSERT_EQ(batch[0].name_len, (uint8_t)1);
+    STM_ASSERT_EQ(batch[0].name[0], (uint8_t)'.');
+    STM_ASSERT_EQ(batch[0].child_ino, root);
+    STM_ASSERT_EQ(batch[0].child_type, (uint8_t)STM_DT_DIR);
+    STM_ASSERT_EQ(batch[1].name_len, (uint8_t)2);
+    STM_ASSERT_EQ(batch[1].name[0], (uint8_t)'.');
+    STM_ASSERT_EQ(batch[1].name[1], (uint8_t)'.');
+    STM_ASSERT_EQ(batch[1].child_ino, root);  /* root's ".." is itself */
+    STM_ASSERT_EQ(batch[1].child_type, (uint8_t)STM_DT_DIR);
+
+    /* Second call: 0 entries (cursor advanced past synth phase, no
+     * stored dirents). */
+    n = 999;
+    STM_ASSERT_OK(stm_fs_readdir(fs, 1, root, root, 0u, &cursor, batch, 16, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p4_readdir_with_entries) {
+    /* mkdir + create_file × 3 → readdir returns "." + ".." + 3 entries. */
+    make_tmp("p4_readdir_with_entries");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t a = 0, b = 0, c = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"alpha", 5,
+                                          0644u, 0, 0, &a));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"beta", 4,
+                                          0644u, 0, 0, &b));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"gamma", 5,
+                                          0644u, 0, 0, &c));
+
+    uint64_t cursor = 0;
+    stm_fs_dirent_entry batch[16];
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_readdir(fs, 1, root, root, 0u,
+                                       &cursor, batch, 16, &n));
+    STM_ASSERT_EQ(n, (size_t)5);                      /* "." + ".." + 3 */
+    /* First two are dots. */
+    STM_ASSERT_EQ(batch[0].name_len, (uint8_t)1);
+    STM_ASSERT_EQ(batch[1].name_len, (uint8_t)2);
+    /* Last three carry the three created inos (in hash-probe order;
+     * their ordering is FNV-determined, not lexicographic). */
+    bool saw_a = false, saw_b = false, saw_c = false;
+    for (size_t i = 2; i < n; i++) {
+        if (batch[i].child_ino == a) saw_a = true;
+        if (batch[i].child_ino == b) saw_b = true;
+        if (batch[i].child_ino == c) saw_c = true;
+        STM_ASSERT_EQ(batch[i].child_type, (uint8_t)STM_DT_REG);
+    }
+    STM_ASSERT_TRUE(saw_a && saw_b && saw_c);
+
+    /* Second call: 0. */
+    n = 999;
+    STM_ASSERT_OK(stm_fs_readdir(fs, 1, root, root, 0u,
+                                       &cursor, batch, 16, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p4_readdir_no_dots_flag) {
+    /* With STM_FS_READDIR_FLAG_NO_DOTS, "." / ".." are skipped — only
+     * stored dirents are returned. */
+    make_tmp("p4_readdir_no_dots");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t a = 0, b = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"x", 1,
+                                          0644u, 0, 0, &a));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"y", 1,
+                                          0644u, 0, 0, &b));
+
+    uint64_t cursor = 0;
+    stm_fs_dirent_entry batch[16];
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_readdir(fs, 1, root, root,
+                                       STM_FS_READDIR_FLAG_NO_DOTS,
+                                       &cursor, batch, 16, &n));
+    STM_ASSERT_EQ(n, (size_t)2);                  /* dots skipped */
+    /* Neither returned entry is "." or "..". */
+    for (size_t i = 0; i < n; i++) {
+        STM_ASSERT_TRUE(!(batch[i].name_len == 1u && batch[i].name[0] == '.'));
+        STM_ASSERT_TRUE(!(batch[i].name_len == 2u &&
+                              batch[i].name[0] == '.' && batch[i].name[1] == '.'));
+    }
+
+    /* Empty dir under NO_DOTS returns 0. */
+    uint64_t empty_dir = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"empty", 5,
+                                    0755u, 0, 0, &empty_dir));
+    cursor = 0; n = 999;
+    STM_ASSERT_OK(stm_fs_readdir(fs, 1, empty_dir, root,
+                                       STM_FS_READDIR_FLAG_NO_DOTS,
+                                       &cursor, batch, 16, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p4_readdir_pagination_one_at_a_time) {
+    /* max_entries=1, iterate to completion. Verify "." + ".." + N
+     * stored entries are each emitted exactly once. */
+    make_tmp("p4_readdir_pagination");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t inos[4] = {0};
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"e1", 2,
+                                          0644u, 0, 0, &inos[0]));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"e2", 2,
+                                          0644u, 0, 0, &inos[1]));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"e3", 2,
+                                          0644u, 0, 0, &inos[2]));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"e4", 2,
+                                          0644u, 0, 0, &inos[3]));
+
+    uint64_t cursor = 0;
+    int saw_dot = 0, saw_dotdot = 0;
+    int saw_ino[4] = {0};
+    size_t total_returned = 0;
+    for (int iter = 0; iter < 50; iter++) {
+        stm_fs_dirent_entry batch[1];
+        size_t n = 0;
+        STM_ASSERT_OK(stm_fs_readdir(fs, 1, root, root, 0u,
+                                           &cursor, batch, 1, &n));
+        if (n == 0) break;
+        STM_ASSERT_EQ(n, (size_t)1);
+        total_returned++;
+        if (batch[0].name_len == 1u && batch[0].name[0] == '.') {
+            saw_dot++;
+        } else if (batch[0].name_len == 2u &&
+                   batch[0].name[0] == '.' && batch[0].name[1] == '.') {
+            saw_dotdot++;
+        } else {
+            for (int k = 0; k < 4; k++) {
+                if (batch[0].child_ino == inos[k]) saw_ino[k]++;
+            }
+        }
+    }
+    STM_ASSERT_EQ(total_returned, (size_t)6);  /* "." + ".." + 4 */
+    STM_ASSERT_EQ(saw_dot, 1);
+    STM_ASSERT_EQ(saw_dotdot, 1);
+    for (int k = 0; k < 4; k++) STM_ASSERT_EQ(saw_ino[k], 1);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p4_readdir_refuses_non_directory) {
+    /* readdir on a regular file inode returns STM_ENOTDIR. */
+    make_tmp("p4_readdir_notdir");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"file", 4,
+                                          0644u, 0, 0, &f));
+
+    uint64_t cursor = 0;
+    stm_fs_dirent_entry batch[4];
+    size_t n = 999;
+    STM_ASSERT_ERR(stm_fs_readdir(fs, 1, /*dir=*/f, /*parent=*/root,
+                                        0u, &cursor, batch, 4, &n),
+                   STM_ENOTDIR);
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    /* Missing directory inode → STM_ENOENT. */
+    n = 999;
+    STM_ASSERT_ERR(stm_fs_readdir(fs, 1, /*dir=*/9999, /*parent=*/root,
+                                        0u, &cursor, batch, 4, &n),
+                   STM_ENOENT);
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p4_readdir_arg_validation) {
+    make_tmp("p4_readdir_argv");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t cursor = 0;
+    stm_fs_dirent_entry batch[4];
+    size_t n = 0;
+
+    STM_ASSERT_ERR(stm_fs_readdir(NULL, 1, root, root, 0u,
+                                        &cursor, batch, 4, &n),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_readdir(fs, 1, root, root, 0u,
+                                        NULL, batch, 4, &n),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_readdir(fs, 1, root, root, 0u,
+                                        &cursor, NULL, 4, &n),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_readdir(fs, 1, root, root, 0u,
+                                        &cursor, batch, 4, NULL),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_readdir(fs, 0, root, root, 0u,
+                                        &cursor, batch, 4, &n),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_readdir(fs, 1, /*dir=*/0, root, 0u,
+                                        &cursor, batch, 4, &n),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_readdir(fs, 1, root, /*parent=*/0, 0u,
+                                        &cursor, batch, 4, &n),
+                   STM_EINVAL);
+    /* max_entries=0 rejected. */
+    STM_ASSERT_ERR(stm_fs_readdir(fs, 1, root, root, 0u,
+                                        &cursor, batch, 0, &n),
+                   STM_EINVAL);
+    /* Unknown flag bit rejected (forward-compat guard). */
+    STM_ASSERT_ERR(stm_fs_readdir(fs, 1, root, root, /*flags=*/0x80000000u,
+                                        &cursor, batch, 4, &n),
+                   STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p4_readdir_pagination_with_create_unlink_between_calls) {
+    /* Inter-call concurrent mutation: between paginated calls,
+     * create new entries + unlink some. The cursor's monotone advance
+     * guarantees no entry returned in a prior call appears again.
+     * Tombstones (from unlinks) never appear. */
+    make_tmp("p4_readdir_concurrent");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t orig_inos[3] = {0};
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"o1", 2,
+                                          0644u, 0, 0, &orig_inos[0]));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"o2", 2,
+                                          0644u, 0, 0, &orig_inos[1]));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"o3", 2,
+                                          0644u, 0, 0, &orig_inos[2]));
+
+    /* Call 1: max_entries=2 (might be ".", ".." or one dot + one
+     * stored). */
+    uint64_t cursor = 0;
+    stm_fs_dirent_entry batch[16];
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_readdir(fs, 1, root, root, 0u,
+                                       &cursor, batch, 2, &n));
+    STM_ASSERT_EQ(n, (size_t)2);
+
+    /* Mutate: unlink o1, create new entries o4, o5 between calls. */
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, root, (const uint8_t *)"o1", 2));
+    uint64_t new_inos[2] = {0};
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"o4", 2,
+                                          0644u, 0, 0, &new_inos[0]));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"o5", 2,
+                                          0644u, 0, 0, &new_inos[1]));
+
+    /* Continue iterating. The KEY assertion for cursor-monotone-advance
+     * is: o1 (now tombstoned) is NEVER returned. Other concurrent-
+     * mutation visibility (o4 / o5 returned or not) is hash-determined
+     * and not asserted at the name level here — that's the
+     * dirent-layer pagination test's job. */
+    int saw_o1 = 0;
+    for (int iter = 0; iter < 50; iter++) {
+        stm_fs_dirent_entry batch2[4];
+        size_t n2 = 0;
+        STM_ASSERT_OK(stm_fs_readdir(fs, 1, root, root, 0u,
+                                           &cursor, batch2, 4, &n2));
+        if (n2 == 0) break;
+        for (size_t i = 0; i < n2; i++) {
+            if (batch2[i].name_len == 2u &&
+                memcmp(batch2[i].name, "o1", 2) == 0) {
+                saw_o1 = 1;
+            }
+        }
+    }
+    /* Tombstone (o1) MUST never be returned. */
+    STM_ASSERT_EQ(saw_o1, 0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p4_readdir_wedged_refused) {
+    make_tmp("p4_readdir_wedged");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    /* Mark wedged. */
+    stm_fs_mark_wedged(fs);
+
+    uint64_t cursor = 0;
+    stm_fs_dirent_entry batch[4];
+    size_t n = 999;
+    STM_ASSERT_ERR(stm_fs_readdir(fs, 1, root, root, 0u,
+                                        &cursor, batch, 4, &n),
+                   STM_EWEDGED);
+    /* out_returned was 0-init'd before the guard. */
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")

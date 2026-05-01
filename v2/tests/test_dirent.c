@@ -512,4 +512,315 @@ STM_TEST(dirent_r73_p2_1_drop_for_dir_arg_validation) {
     stm_dirent_index_close(idx);
 }
 
+/* ------------------------------------------------------------------ */
+/* P8-POSIX-4 readdir tests.                                            */
+/* ------------------------------------------------------------------ */
+
+STM_TEST(dirent_readdir_empty_dir) {
+    stm_dirent_index *idx = stm_dirent_index_create();
+    /* Empty directory: readdir returns 0 entries, cursor unchanged. */
+    uint64_t cursor = 0;
+    stm_dirent_entry batch[16];
+    size_t n = 999;
+    STM_ASSERT_OK(stm_dirent_readdir(idx, 1, 2, &cursor, batch, 16, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+    STM_ASSERT_EQ(cursor, (uint64_t)0);
+    stm_dirent_index_close(idx);
+}
+
+STM_TEST(dirent_readdir_single_entry) {
+    stm_dirent_index *idx = stm_dirent_index_create();
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"foo", 3,
+                                       100, 7, STM_DT_REG));
+
+    uint64_t cursor = 0;
+    stm_dirent_entry batch[16];
+    size_t n = 0;
+    STM_ASSERT_OK(stm_dirent_readdir(idx, 1, 2, &cursor, batch, 16, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+    STM_ASSERT_EQ(batch[0].child_ino, (uint64_t)100);
+    STM_ASSERT_EQ(batch[0].child_gen, (uint64_t)7);
+    STM_ASSERT_EQ(batch[0].child_type, (uint8_t)STM_DT_REG);
+    STM_ASSERT_EQ(batch[0].name_len, (uint8_t)3);
+    STM_ASSERT_TRUE(memcmp(batch[0].name, "foo", 3) == 0);
+    /* cursor advanced past the entry's hash_probe. */
+    STM_ASSERT_TRUE(cursor > batch[0].hash_probe);
+
+    /* Second call: no more entries. */
+    n = 999;
+    STM_ASSERT_OK(stm_dirent_readdir(idx, 1, 2, &cursor, batch, 16, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    stm_dirent_index_close(idx);
+}
+
+STM_TEST(dirent_readdir_multiple_entries_hash_order) {
+    stm_dirent_index *idx = stm_dirent_index_create();
+    /* Insert 5 entries; readdir returns them in hash_probe-ascending
+     * order regardless of insertion order. */
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"alpha", 5,
+                                       1, 0, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"beta", 4,
+                                       2, 0, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"gamma", 5,
+                                       3, 0, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"delta", 5,
+                                       4, 0, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"epsilon", 7,
+                                       5, 0, STM_DT_REG));
+
+    uint64_t cursor = 0;
+    stm_dirent_entry batch[16];
+    size_t n = 0;
+    STM_ASSERT_OK(stm_dirent_readdir(idx, 1, 2, &cursor, batch, 16, &n));
+    STM_ASSERT_EQ(n, (size_t)5);
+
+    /* Verify hash_probe-ascending order. */
+    for (size_t i = 1; i < n; i++) {
+        STM_ASSERT_TRUE(batch[i - 1].hash_probe < batch[i].hash_probe);
+    }
+
+    /* All five inos are present. Track via bitmap; probe-order is
+     * hash-determined. */
+    uint8_t seen[6] = {0};
+    for (size_t i = 0; i < n; i++) {
+        STM_ASSERT_TRUE(batch[i].child_ino >= 1 && batch[i].child_ino <= 5);
+        seen[batch[i].child_ino] = 1;
+    }
+    for (size_t i = 1; i <= 5; i++) STM_ASSERT_TRUE(seen[i]);
+
+    /* Second call: 0 entries. */
+    n = 999;
+    STM_ASSERT_OK(stm_dirent_readdir(idx, 1, 2, &cursor, batch, 16, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    stm_dirent_index_close(idx);
+}
+
+STM_TEST(dirent_readdir_skips_tombstones) {
+    /* Models dirent.tla::ReaddirNoTombstoneEmitted — tombstones from
+     * prior unlinks are NEVER returned. Forced FNV collision: "n_a"
+     * and "n_b" hash differently here (not the spec's collision pair),
+     * but the principle is the same — unlink one, readdir returns the
+     * other but never the tombstone. */
+    stm_dirent_index *idx = stm_dirent_index_create();
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"keep1", 5,
+                                       100, 0, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"drop", 4,
+                                       101, 0, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"keep2", 5,
+                                       102, 0, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_unlink(idx, 1, 2, (const uint8_t *)"drop", 4));
+
+    uint64_t cursor = 0;
+    stm_dirent_entry batch[16];
+    size_t n = 0;
+    STM_ASSERT_OK(stm_dirent_readdir(idx, 1, 2, &cursor, batch, 16, &n));
+    STM_ASSERT_EQ(n, (size_t)2);
+
+    /* Neither returned entry is the tombstone (101). */
+    for (size_t i = 0; i < n; i++) {
+        STM_ASSERT_TRUE(batch[i].child_ino != (uint64_t)101);
+        STM_ASSERT_TRUE(batch[i].name_len > 0u);
+    }
+    /* Both 100 and 102 are present. */
+    bool saw_100 = false, saw_102 = false;
+    for (size_t i = 0; i < n; i++) {
+        if (batch[i].child_ino == 100u) saw_100 = true;
+        if (batch[i].child_ino == 102u) saw_102 = true;
+    }
+    STM_ASSERT_TRUE(saw_100 && saw_102);
+
+    stm_dirent_index_close(idx);
+}
+
+STM_TEST(dirent_readdir_pagination_max_entries_one) {
+    /* Models dirent.tla::ReaddirNoDuplicateProbeInLog — strict cursor
+     * advance prevents same-probe re-emit. With max_entries=1, a full
+     * iteration emits each record exactly once. */
+    stm_dirent_index *idx = stm_dirent_index_create();
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"e1", 2,
+                                       1, 0, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"e2", 2,
+                                       2, 0, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"e3", 2,
+                                       3, 0, STM_DT_REG));
+
+    uint64_t cursor = 0;
+    uint64_t seen_inos[3] = {0};
+    size_t total = 0;
+    for (int iter = 0; iter < 10; iter++) {
+        stm_dirent_entry batch[1];
+        size_t n = 0;
+        STM_ASSERT_OK(stm_dirent_readdir(idx, 1, 2, &cursor, batch, 1, &n));
+        if (n == 0) break;
+        STM_ASSERT_EQ(n, (size_t)1);
+        STM_ASSERT_TRUE(total < 3);
+        seen_inos[total++] = batch[0].child_ino;
+    }
+    STM_ASSERT_EQ(total, (size_t)3);
+
+    /* All three inos returned exactly once. */
+    bool s1 = false, s2 = false, s3 = false;
+    for (size_t i = 0; i < 3; i++) {
+        if (seen_inos[i] == 1u) s1 = true;
+        if (seen_inos[i] == 2u) s2 = true;
+        if (seen_inos[i] == 3u) s3 = true;
+    }
+    STM_ASSERT_TRUE(s1 && s2 && s3);
+
+    stm_dirent_index_close(idx);
+}
+
+STM_TEST(dirent_readdir_per_dir_isolation) {
+    stm_dirent_index *idx = stm_dirent_index_create();
+    /* Same name in three different (ds, dir) pairs. readdir on each
+     * sees only its own. */
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"name", 4,
+                                       100, 0, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 3, (const uint8_t *)"name", 4,
+                                       200, 0, STM_DT_DIR));
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 2, 2, (const uint8_t *)"name", 4,
+                                       300, 0, STM_DT_LNK));
+
+    stm_dirent_entry batch[16];
+    uint64_t cursor;
+    size_t n;
+
+    /* readdir(ds=1, dir=2) → only child_ino=100. */
+    cursor = 0; n = 0;
+    STM_ASSERT_OK(stm_dirent_readdir(idx, 1, 2, &cursor, batch, 16, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+    STM_ASSERT_EQ(batch[0].child_ino, (uint64_t)100);
+
+    /* readdir(ds=1, dir=3) → only child_ino=200. */
+    cursor = 0; n = 0;
+    STM_ASSERT_OK(stm_dirent_readdir(idx, 1, 3, &cursor, batch, 16, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+    STM_ASSERT_EQ(batch[0].child_ino, (uint64_t)200);
+
+    /* readdir(ds=2, dir=2) → only child_ino=300. */
+    cursor = 0; n = 0;
+    STM_ASSERT_OK(stm_dirent_readdir(idx, 2, 2, &cursor, batch, 16, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+    STM_ASSERT_EQ(batch[0].child_ino, (uint64_t)300);
+
+    stm_dirent_index_close(idx);
+}
+
+STM_TEST(dirent_readdir_resume_after_create_past_cursor) {
+    /* Verify between-call concurrent-Create semantics: a Create that
+     * lands at a probe ≥ remaining-cursor is visible to the next
+     * readdir step; one that lands at probe < cursor is invisible.
+     *
+     * Concrete: paginate 1 entry at a time. After the first call,
+     * insert a NEW entry. If its hash_probe lands ≥ cursor, the
+     * next call returns it; otherwise not. We don't predict the
+     * hash, but we verify that whichever happens, the returned set
+     * is consistent (no probe-duplicates, no original entry returned
+     * twice).
+     */
+    stm_dirent_index *idx = stm_dirent_index_create();
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"alpha", 5,
+                                       1, 0, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"beta", 4,
+                                       2, 0, STM_DT_REG));
+
+    /* First call: emits one of {1, 2}. */
+    uint64_t cursor = 0;
+    stm_dirent_entry first[1];
+    size_t fn = 0;
+    STM_ASSERT_OK(stm_dirent_readdir(idx, 1, 2, &cursor, first, 1, &fn));
+    STM_ASSERT_EQ(fn, (size_t)1);
+    uint64_t cursor_after_first = cursor;
+
+    /* Insert a new entry. Its probe is FNV-determined (we don't
+     * predict). */
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"gamma", 5,
+                                       3, 0, STM_DT_REG));
+
+    /* Continue iterating. We may see 2 entries (other original + new)
+     * or 1 entry (just other original) depending on where "gamma"
+     * landed. In either case, we never see the FIRST returned entry
+     * again — that's the cursor-monotone-advance guarantee. */
+    uint64_t seen_inos[3] = { first[0].child_ino, 0, 0 };
+    size_t   total = 1;
+    for (int iter = 0; iter < 10; iter++) {
+        stm_dirent_entry batch[1];
+        size_t n = 0;
+        STM_ASSERT_OK(stm_dirent_readdir(idx, 1, 2, &cursor, batch, 1, &n));
+        if (n == 0) break;
+        STM_ASSERT_EQ(n, (size_t)1);
+        /* Returned entry must not equal the first. */
+        STM_ASSERT_TRUE(batch[0].child_ino != first[0].child_ino);
+        STM_ASSERT_TRUE(total < 3);
+        seen_inos[total++] = batch[0].child_ino;
+    }
+    /* No duplicates among seen_inos. */
+    if (total >= 2) STM_ASSERT_TRUE(seen_inos[0] != seen_inos[1]);
+    if (total >= 3) {
+        STM_ASSERT_TRUE(seen_inos[0] != seen_inos[2]);
+        STM_ASSERT_TRUE(seen_inos[1] != seen_inos[2]);
+    }
+    /* Cursor monotonically advanced. */
+    STM_ASSERT_TRUE(cursor >= cursor_after_first);
+
+    stm_dirent_index_close(idx);
+}
+
+STM_TEST(dirent_readdir_arg_validation) {
+    stm_dirent_index *idx = stm_dirent_index_create();
+    uint64_t cursor = 0;
+    stm_dirent_entry batch[4];
+    size_t n = 0;
+
+    /* NULL idx. */
+    STM_ASSERT_ERR(stm_dirent_readdir(NULL, 1, 2, &cursor, batch, 4, &n),
+                   STM_EINVAL);
+    /* NULL cursor. */
+    STM_ASSERT_ERR(stm_dirent_readdir(idx, 1, 2, NULL, batch, 4, &n),
+                   STM_EINVAL);
+    /* NULL out_entries. */
+    STM_ASSERT_ERR(stm_dirent_readdir(idx, 1, 2, &cursor, NULL, 4, &n),
+                   STM_EINVAL);
+    /* NULL out_returned. */
+    STM_ASSERT_ERR(stm_dirent_readdir(idx, 1, 2, &cursor, batch, 4, NULL),
+                   STM_EINVAL);
+    /* dataset_id == 0. */
+    STM_ASSERT_ERR(stm_dirent_readdir(idx, 0, 2, &cursor, batch, 4, &n),
+                   STM_EINVAL);
+    /* dir_ino == 0. */
+    STM_ASSERT_ERR(stm_dirent_readdir(idx, 1, 0, &cursor, batch, 4, &n),
+                   STM_EINVAL);
+    /* max_entries == 0. */
+    STM_ASSERT_ERR(stm_dirent_readdir(idx, 1, 2, &cursor, batch, 0, &n),
+                   STM_EINVAL);
+
+    stm_dirent_index_close(idx);
+}
+
+STM_TEST(dirent_readdir_after_drop_for_dir) {
+    /* drop_for_dir wipes records[]; subsequent readdir on the dir
+     * returns 0 entries. */
+    stm_dirent_index *idx = stm_dirent_index_create();
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"a", 1, 1, 0, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"b", 1, 2, 0, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_unlink(idx, 1, 2, (const uint8_t *)"a", 1));
+    /* Pre-drop: readdir returns "b" (one live + one tombstone). */
+    uint64_t cursor = 0;
+    stm_dirent_entry batch[16];
+    size_t n = 0;
+    STM_ASSERT_OK(stm_dirent_readdir(idx, 1, 2, &cursor, batch, 16, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+    STM_ASSERT_EQ(batch[0].child_ino, (uint64_t)2);
+    /* drop the dir. */
+    STM_ASSERT_OK(stm_dirent_drop_for_dir(idx, 1, 2, NULL));
+    /* Post-drop: readdir from cursor=0 returns 0. */
+    cursor = 0; n = 999;
+    STM_ASSERT_OK(stm_dirent_readdir(idx, 1, 2, &cursor, batch, 16, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    stm_dirent_index_close(idx);
+}
+
 STM_TEST_MAIN("test_dirent")

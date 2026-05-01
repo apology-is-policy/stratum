@@ -42,6 +42,7 @@
 
 #include <stratum/types.h>
 #include <stratum/dataset.h>     /* stm_property (P7-CAS-13) */
+#include <stratum/dirent.h>      /* STM_DIRENT_NAME_MAX, STM_DT_* (P8-POSIX-4) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -443,6 +444,92 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
                           const uint8_t *src_name, uint8_t src_name_len,
                           uint64_t dst_parent_ino,
                           const uint8_t *dst_name, uint8_t dst_name_len);
+
+/* ========================================================================= */
+/* P8-POSIX-4: readdir.                                                       */
+/* ========================================================================= */
+
+/*
+ * On-the-wire entry returned by stm_fs_readdir. Same shape as POSIX
+ * `struct dirent` modulo the v2 additions:
+ *   - child_gen: caller-validated stale-fid detection (per
+ *     inode.tla's (ino, si_gen) tuple-uniqueness invariant). 0 for
+ *     synthesized "." / ".." (which never become stale).
+ *   - child_type: STM_DT_* (matches POSIX DT_*).
+ */
+typedef struct stm_fs_dirent_entry {
+    uint64_t child_ino;
+    uint64_t child_gen;
+    uint8_t  child_type;
+    uint8_t  name_len;
+    uint8_t  name[STM_DIRENT_NAME_MAX];
+} stm_fs_dirent_entry;
+
+/*
+ * Skip synthesizing "." and ".." entries.
+ *
+ * Without this flag (default): the first call with `*cursor == 0`
+ * emits "." (child_ino = dir_ino) as the first entry; the second
+ * cursor step emits ".." (child_ino = parent_ino). Caller's
+ * `parent_ino` argument is what gets emitted for ".." — for the
+ * dataset root, pass `parent_ino = dir_ino` (POSIX root convention:
+ * root's ".." is itself).
+ *
+ * With this flag: synthesized dots are silently skipped — useful when
+ * the consumer (e.g., a 9P readdir that handles "." / ".." in its own
+ * Twalk machinery) wants only stored dirents. The cursor still passes
+ * through phases 0 and 1 internally; the caller only sees stored
+ * dirents starting at cursor phase 2.
+ */
+#define STM_FS_READDIR_FLAG_NO_DOTS  0x01u
+
+/*
+ * Iterate live entries in directory `dir_ino` of `dataset_id`. Returns
+ * up to `max_entries` per call. The opaque `*cursor` advances past
+ * every emitted entry — the strict monotone advance guarantees that no
+ * entry returned by a prior call is returned again by a later call
+ * within the same iteration.
+ *
+ * Cursor semantics (opaque to caller; treat as `uint64_t`):
+ *   - Initial call: pass `*cursor = 0`.
+ *   - Subsequent calls: pass back the prior call's returned `*cursor`.
+ *   - Iteration done: `*out_returned == 0` after a call.
+ *
+ * The cursor encoding combines the synthesized "." / ".." phase with
+ * the stored dirent scan:
+ *   - cursor in {0, 1}: synth phase ("." at 0, ".." at 1). Each step
+ *     emits the corresponding synth entry (or skips it under
+ *     STM_FS_READDIR_FLAG_NO_DOTS) and advances cursor by 1.
+ *   - cursor ≥ 2: stored dirent scan. Internally the impl uses
+ *     `cursor - 2` as the underlying `stm_dirent_readdir` cursor.
+ *
+ * Stability under concurrent Create/Unlink (between-call interleaving):
+ *   matches stm_dirent_readdir's contract — Create at probe < cursor
+ *   invisible; Create at probe ≥ cursor visible if reached;
+ *   tombstones never returned; same probe never returned twice.
+ *
+ * Synthesized "." has child_ino = dir_ino, child_gen = 0,
+ * child_type = STM_DT_DIR, name = "." (name_len = 1).
+ * Synthesized ".." has child_ino = parent_ino, child_gen = 0,
+ * child_type = STM_DT_DIR, name = ".." (name_len = 2).
+ *
+ * Refusals:
+ *   - NULL fs OR NULL cursor OR NULL out_entries OR NULL out_returned
+ *     (STM_EINVAL).
+ *   - dataset_id == 0 OR dir_ino == 0 OR parent_ino == 0 (STM_EINVAL).
+ *   - max_entries == 0 (STM_EINVAL).
+ *   - flags has bits other than STM_FS_READDIR_FLAG_NO_DOTS (STM_EINVAL).
+ *   - dir_ino not present OR not a directory (STM_ENOENT / STM_ENOTDIR).
+ *   - fs wedged (STM_EWEDGED). RO mounts allowed.
+ */
+STM_MUST_USE
+stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
+                              uint64_t dir_ino, uint64_t parent_ino,
+                              uint32_t flags,
+                              uint64_t *cursor,
+                              stm_fs_dirent_entry *out_entries,
+                              size_t max_entries,
+                              size_t *out_returned);
 
 /* ========================================================================= */
 /* Dataset creation (P7-13).                                                  */

@@ -1070,6 +1070,155 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
     return STM_OK;
 }
 
+/* ========================================================================= */
+/* P8-POSIX-4: stm_fs_readdir.                                                */
+/* ========================================================================= */
+
+/* Synthesize a "." or ".." entry into out_entries[idx]. dot_kind = 1
+ * for "." (single dot), 2 for ".." (double dot). The synthesized
+ * child_ino is caller-provided (`dir_ino` for ".", `parent_ino` for
+ * ".."). child_gen = 0 (synth entries never go stale; the dir's own
+ * inode owns the gen bump). child_type = STM_DT_DIR. */
+static void fs_readdir_synth_dot(stm_fs_dirent_entry *out_entry,
+                                      uint64_t child_ino, uint8_t dot_kind)
+{
+    memset(out_entry, 0, sizeof *out_entry);
+    out_entry->child_ino  = child_ino;
+    out_entry->child_gen  = 0;
+    out_entry->child_type = STM_DT_DIR;
+    out_entry->name_len   = dot_kind;
+    out_entry->name[0]    = '.';
+    if (dot_kind == 2u) out_entry->name[1] = '.';
+}
+
+stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
+                              uint64_t dir_ino, uint64_t parent_ino,
+                              uint32_t flags,
+                              uint64_t *cursor,
+                              stm_fs_dirent_entry *out_entries,
+                              size_t max_entries,
+                              size_t *out_returned)
+{
+    if (!fs || !cursor || !out_entries || !out_returned) return STM_EINVAL;
+    if (dataset_id == 0u || dir_ino == 0u || parent_ino == 0u) return STM_EINVAL;
+    if (max_entries == 0u) return STM_EINVAL;
+    /* Reject unknown flag bits (forward-compat guard). */
+    if ((flags & ~(uint32_t)STM_FS_READDIR_FLAG_NO_DOTS) != 0u) return STM_EINVAL;
+
+    *out_returned = 0;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_READ(fs);
+
+    stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
+    stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
+    if (!iidx || !didx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;
+    }
+
+    /* Validate dir_ino exists + is a directory. */
+    struct stm_inode_value dv = {0};
+    stm_status ds = fs_load_parent_dir(iidx, dataset_id, dir_ino, &dv);
+    if (ds != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return ds;
+    }
+
+    bool no_dots = (flags & STM_FS_READDIR_FLAG_NO_DOTS) != 0u;
+    uint64_t local_cursor = *cursor;
+    size_t emitted = 0;
+
+    /* Phase 0: emit "." (or skip + advance). */
+    if (local_cursor == 0u) {
+        if (!no_dots) {
+            if (emitted < max_entries) {
+                fs_readdir_synth_dot(&out_entries[emitted], dir_ino, 1);
+                emitted++;
+                local_cursor = 1u;
+            }
+            /* If max_entries == 0 we'd have rejected above; the
+             * "no advance" branch isn't reachable. */
+        } else {
+            local_cursor = 1u;
+        }
+    }
+
+    /* Phase 1: emit ".." (or skip + advance). */
+    if (local_cursor == 1u) {
+        if (!no_dots) {
+            if (emitted < max_entries) {
+                fs_readdir_synth_dot(&out_entries[emitted], parent_ino, 2);
+                emitted++;
+                local_cursor = 2u;
+            }
+        } else {
+            local_cursor = 2u;
+        }
+    }
+
+    /* Phase 2+: stored dirents. */
+    if (local_cursor >= 2u && emitted < max_entries) {
+        /* Subtract the synth-phase offset to reach the dirent layer's
+         * cursor space. */
+        uint64_t dirent_cursor = local_cursor - 2u;
+        size_t dirent_max = max_entries - emitted;
+
+        /* Heap-allocate the temp dirent batch — caller's max_entries
+         * × ~280 bytes per stm_dirent_entry can be a few KB to many
+         * MB; the readdir uses STM_FS_READDIR's max_entries minus the
+         * already-emitted dot count, so the heap_alloc here matches
+         * the caller's space discipline. */
+        if (dirent_max > SIZE_MAX / sizeof(stm_dirent_entry)) {
+            pthread_mutex_unlock(&fs->lock);
+            return STM_ENOMEM;
+        }
+        stm_dirent_entry *batch = malloc(dirent_max * sizeof *batch);
+        if (!batch) {
+            pthread_mutex_unlock(&fs->lock);
+            return STM_ENOMEM;
+        }
+
+        size_t batch_n = 0;
+        stm_status rs = stm_dirent_readdir(didx, dataset_id, dir_ino,
+                                              &dirent_cursor, batch, dirent_max,
+                                              &batch_n);
+        if (rs != STM_OK) {
+            free(batch);
+            pthread_mutex_unlock(&fs->lock);
+            return rs;
+        }
+
+        /* Copy into out_entries. */
+        for (size_t k = 0; k < batch_n; k++) {
+            out_entries[emitted].child_ino  = batch[k].child_ino;
+            out_entries[emitted].child_gen  = batch[k].child_gen;
+            out_entries[emitted].child_type = batch[k].child_type;
+            out_entries[emitted].name_len   = batch[k].name_len;
+            memset(out_entries[emitted].name, 0, sizeof out_entries[emitted].name);
+            if (batch[k].name_len > 0u)
+                memcpy(out_entries[emitted].name, batch[k].name,
+                          batch[k].name_len);
+            emitted++;
+        }
+        free(batch);
+
+        /* Translate dirent-layer cursor back into fs-layer cursor.
+         * Saturate at UINT64_MAX so wraparound doesn't reset the
+         * iteration in pathological cases. */
+        if (dirent_cursor > UINT64_MAX - 2u) {
+            local_cursor = UINT64_MAX;
+        } else {
+            local_cursor = dirent_cursor + 2u;
+        }
+    }
+
+    *cursor = local_cursor;
+    *out_returned = emitted;
+    pthread_mutex_unlock(&fs->lock);
+    return STM_OK;
+}
+
 /* P7-16: stm_fs_reflink. POSIX-shape FICLONE — replaces dst's empty
  * extent tree with a reflink-share of src's. Holds fs->lock across the
  * inner sync_reflink so a concurrent observer can't see a partial

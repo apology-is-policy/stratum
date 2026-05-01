@@ -18,7 +18,7 @@
  * `BuggyLookupStopsOnTombstone` (read-side analog of
  * UnlinkUsesEmpty).
  *
- * MVP scope (P8-POSIX-2):
+ * MVP scope (P8-POSIX-2 + P8-POSIX-4):
  *   - Per-pool dirent tree backed by btree_store (mirrors stm_inode_index
  *     persistence shape). Format break STM_UB_VERSION 24 → 25 adds a
  *     new `ub_dirent_root` tree-root field and binds its csum into the
@@ -32,9 +32,17 @@
  *     lesson): every constraint the decoder enforces on read is also
  *     enforced at the alloc API boundary, so a buggy or hostile caller
  *     cannot commit a record that would wedge the pool on next mount.
+ *   - readdir cursor stability per dirent.tla (P8-POSIX-4):
+ *     `stm_dirent_readdir` emits live records in hash_probe-ascending
+ *     order, skipping tombstones. The opaque uint64_t cursor advances
+ *     past every emitted slot — same probe never returned twice within
+ *     an iteration. Caller-side iteration is safe under concurrent
+ *     Create/Unlink (mutations may interleave between calls); the
+ *     cursor's monotone advance guarantees that no entry returned by
+ *     a prior call is returned again by a later call within the same
+ *     iteration.
  *
  * Out of scope here:
- *   - readdir (cursor stability + restartable iteration) — P8-POSIX-4.
  *   - rename atomicity — P8-POSIX-9.
  *   - case-insensitivity (per-dataset property) — abstracted via the
  *     hash function; `casesensitive=insensitive` substitutes
@@ -217,6 +225,74 @@ STM_MUST_USE
 stm_status stm_dirent_count_for_dir(const stm_dirent_index *idx,
                                         uint64_t dataset_id, uint64_t dir_ino,
                                         size_t *out_count);
+
+/* ========================================================================= */
+/* Readdir (P8-POSIX-4). Models dirent.tla's ReaddirReset/Step/End cycle.    */
+/* ========================================================================= */
+
+/*
+ * On-the-wire entry returned by stm_dirent_readdir. The `hash_probe`
+ * field is informational (= the slot at which the record lives in the
+ * open-addressing chain) — useful for debugging and for callers that
+ * want to encode a per-entry resume token. The fs-layer wrapper
+ * (`stm_fs_readdir`) does not surface this field.
+ */
+typedef struct stm_dirent_entry {
+    uint64_t child_ino;
+    uint64_t child_gen;
+    uint64_t hash_probe;
+    uint8_t  child_type;          /* STM_DT_* */
+    uint8_t  name_len;
+    uint8_t  name[STM_DIRENT_NAME_MAX];
+} stm_dirent_entry;
+
+/*
+ * Iterate live records under (dataset_id, dir_ino) in hash_probe
+ * ascending order. Models dirent.tla's `ReaddirReset(d) ; ReaddirStep(d)*
+ * ; ReaddirEnd(d)` cycle, but collapsed to a single C call boundary —
+ * a single call advances the cursor through up to `max_entries` records.
+ *
+ * Cursor semantics (opaque to caller; treat as `uint64_t`):
+ *   - First call: pass `*cursor = 0`. The impl returns the smallest-
+ *     probe live records.
+ *   - Subsequent calls: pass back the `*cursor` value the prior call
+ *     returned. The impl resumes at the next probe past the last
+ *     returned record (strict monotonic advance — no duplicate emit).
+ *   - Iteration done: `*out_returned == 0` after a call. The cursor
+ *     value at that point is "past the highest-probe live record"
+ *     (saturated at UINT64_MAX if the highest live probe is at
+ *     UINT64_MAX, but realistic FNV-1a 64-bit hashes don't reach
+ *     that far).
+ *
+ * Stability under concurrent Create/Unlink (between-call interleaving):
+ *   - A Create that installs at probe < cursor is invisible to the
+ *     remaining iteration (the cursor has already passed).
+ *   - A Create at probe ≥ cursor will be returned IF the iteration
+ *     reaches that probe before the next Create displaces it.
+ *   - An Unlink (which leaves a tombstone) at any probe is honored:
+ *     tombstones are skipped — never returned as live entries.
+ *   - The same record's hash_probe never appears twice within a
+ *     single iteration, even under interleaved Create/Unlink — the
+ *     cursor's strict monotone advance guarantees this.
+ *
+ * POSIX: matches the contract of `readdir(3)` — caller-relative
+ * stability for entries that survive the iteration window; entries
+ * created/deleted mid-iteration are caller-defined (POSIX permits
+ * either visible or invisible).
+ *
+ * Refusals:
+ *   - NULL idx OR NULL cursor OR NULL out_entries OR NULL out_returned
+ *     (STM_EINVAL).
+ *   - dataset_id == 0 OR dir_ino == 0 (STM_EINVAL).
+ *   - max_entries == 0 (STM_EINVAL).
+ */
+STM_MUST_USE
+stm_status stm_dirent_readdir(const stm_dirent_index *idx,
+                                  uint64_t dataset_id, uint64_t dir_ino,
+                                  uint64_t *cursor,
+                                  stm_dirent_entry *out_entries,
+                                  size_t max_entries,
+                                  size_t *out_returned);
 
 /*
  * Drop EVERY record (live + tombstone) keyed at `(dataset_id, dir_ino,

@@ -585,6 +585,125 @@ stm_status stm_dirent_count_for_dir(const stm_dirent_index *idx,
     return STM_OK;
 }
 
+/* P8-POSIX-4 readdir: emits live records under (ds, dir_ino) in
+ * hash_probe-ascending order, starting at *cursor. Models dirent.tla's
+ * ReaddirReset/Step/End cycle.
+ *
+ * Implementation: filter records[] for matches (ds, dir_ino, hp >=
+ * cursor, !tombstone), copy match indices + probes into a temp buffer,
+ * qsort by hash_probe, emit up to max_entries. Memory cost: one
+ * malloc'd `(uint64_t hp, size_t idx)` pair per match. For a directory
+ * with N total records, this is O(N) memory + O(N log N) time per
+ * call. Future optimization (when xfstests stresses 1M-entry dirs):
+ * top-K heap select with O(max_entries) memory + O(N log K) time.
+ */
+typedef struct {
+    uint64_t hash_probe;
+    size_t   record_idx;
+} di_readdir_match;
+
+static int di_readdir_match_cmp(const void *a, const void *b) {
+    const di_readdir_match *pa = a, *pb = b;
+    if (pa->hash_probe < pb->hash_probe) return -1;
+    if (pa->hash_probe > pb->hash_probe) return  1;
+    return 0;
+}
+
+stm_status stm_dirent_readdir(const stm_dirent_index *idx,
+                                  uint64_t dataset_id, uint64_t dir_ino,
+                                  uint64_t *cursor,
+                                  stm_dirent_entry *out_entries,
+                                  size_t max_entries,
+                                  size_t *out_returned)
+{
+    if (!idx || !cursor || !out_entries || !out_returned) return STM_EINVAL;
+    if (dataset_id == 0u || dir_ino == 0u) return STM_EINVAL;
+    if (max_entries == 0u) return STM_EINVAL;
+
+    *out_returned = 0;
+
+    /* Cast away const for lock acquisition; idx is logically read-only
+     * across this call but we need write access to its mutex. Mirrors
+     * the const-cast in find_record_at_probe_c's lock pattern. */
+    pthread_mutex_t *lk = idx_lock(idx);
+    must_lock(lk);
+
+    /* Pass 1: count matches.
+     *
+     * "Match" = same dataset_id + dir_ino + non-tombstone + probe ≥
+     * cursor. We allocate enough space for all matches even if many
+     * exceed max_entries — the post-sort prefix gives the smallest
+     * max_entries by probe, which is what readdir needs. */
+    size_t n_match = 0;
+    for (size_t i = 0; i < idx->n_records; i++) {
+        const stm_dirent_record *r = &idx->records[i];
+        if (r->dataset_id != dataset_id) continue;
+        if (r->dir_ino    != dir_ino)    continue;
+        if (record_is_tombstone(r))      continue;
+        if (r->hash_probe < *cursor)     continue;
+        n_match++;
+    }
+    if (n_match == 0) {
+        /* No matches: leave *cursor unchanged, *out_returned = 0. */
+        must_unlock(lk);
+        return STM_OK;
+    }
+
+    /* Bounded multiplication: SIZE_MAX / sizeof guarantees no overflow. */
+    if (n_match > SIZE_MAX / sizeof(di_readdir_match)) {
+        must_unlock(lk);
+        return STM_ENOMEM;
+    }
+    di_readdir_match *matches = malloc(n_match * sizeof *matches);
+    if (!matches) {
+        must_unlock(lk);
+        return STM_ENOMEM;
+    }
+
+    /* Pass 2: collect matches. */
+    size_t j = 0;
+    for (size_t i = 0; i < idx->n_records; i++) {
+        const stm_dirent_record *r = &idx->records[i];
+        if (r->dataset_id != dataset_id) continue;
+        if (r->dir_ino    != dir_ino)    continue;
+        if (record_is_tombstone(r))      continue;
+        if (r->hash_probe < *cursor)     continue;
+        matches[j].hash_probe = r->hash_probe;
+        matches[j].record_idx = i;
+        j++;
+    }
+    /* j must equal n_match — both passes use identical filter. */
+
+    qsort(matches, n_match, sizeof *matches, di_readdir_match_cmp);
+
+    /* Emit prefix. */
+    size_t emit = (max_entries < n_match) ? max_entries : n_match;
+    for (size_t k = 0; k < emit; k++) {
+        const stm_dirent_record *r = &idx->records[matches[k].record_idx];
+        out_entries[k].child_ino  = r->child_ino;
+        out_entries[k].child_gen  = r->child_gen;
+        out_entries[k].hash_probe = r->hash_probe;
+        out_entries[k].child_type = r->child_type;
+        out_entries[k].name_len   = r->name_len;
+        memset(out_entries[k].name, 0, sizeof out_entries[k].name);
+        if (r->name_len > 0u)
+            memcpy(out_entries[k].name, r->name, r->name_len);
+    }
+
+    /* Advance cursor to (last_returned_probe + 1), saturating at
+     * UINT64_MAX so caller-side arithmetic doesn't wrap. The next
+     * call resumes at this cursor; matches with probe < cursor are
+     * filtered out, ensuring strict monotone advance per
+     * dirent.tla::ReaddirCursorMonotonicEmits. */
+    uint64_t last_probe = matches[emit - 1].hash_probe;
+    *cursor = (last_probe == UINT64_MAX) ? UINT64_MAX : (last_probe + 1u);
+    *out_returned = emit;
+
+    free(matches);
+    must_unlock(lk);
+    return STM_OK;
+}
+
 /* P8-POSIX-2b R73 P2-1: bulk-drop every record keyed at (ds, dir_ino,
  * *). Walks records[] once, compacts in place. After this returns the
  * dirent btree on the next sync_commit will not encode any record at
