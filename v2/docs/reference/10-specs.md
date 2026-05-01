@@ -43,15 +43,17 @@ chapter as specs get wider cross-reference tables).
 | `cas.tla` | 10 | Content-addressed cold-tier index lifecycle (P7-CAS / NOVEL #3) — WriteHot / MigrateToCold / ChunkedMigrateToColdK2 (P7-CAS-4b) / RehydrateOnWrite / DeleteFile / GC (P7-CAS-4 reorder: atomic remove-and-mark-freed) / BuggyGcOldOrderFreePaddrs + BuggyGcOldOrderTryRemove (P7-CAS-4) / AdvanceTxg + RefcountConsistent + NoDanglingColdRef + HotColdReplicasDisjoint + CASReplicasDisjoint + NoOverlapWithinIno + LengthPositive + BirthTxgBound + PaddrFreshness + CASIndexUnique + LiveCASEntriesNotFreed (P7-CAS-4: live cas entries' replicas don't overlap freed_paddrs, modulo the `gc_in_flight` in-flight-GC tolerance). P7-CAS-4b also closed a pre-existing clamp/invariant inconsistency in MigrateToCold's CAS-hit branch via new `EntryAt(h).refcount < MaxRef` precondition. | cas.cfg: 3.23M states, depth 10 / ~5:33 wall (MaxDatasets=2, MaxInos=2, MaxFileBlocks=2, MaxPaddrs=4, MaxHashes=2, MaxTxg=2, MaxReplicasPerEntry=1, MaxKeyIds=1, MaxRef=4). | `cas_migrate_forgets_refbump_buggy.cfg`, `cas_migrate_without_drop_buggy.cfg`, `cas_gc_race_buggy.cfg`, `cas_rehydrate_no_deref_buggy.cfg`, `cas_delete_forgets_deref_buggy.cfg`, `cas_migrate_reuses_hot_paddr_buggy.cfg`, `cas_gc_old_order_silent_skip_buggy.cfg` (P7-CAS-4) |
 | `namespace.tla` | 9 | Per-connection 9P namespaces (P8-NS-1 / NOVEL #8) — Attach / Detach / Bind / Unbind / ObserveLookup. Cross-connection mutation isolation: bindings table for connection c only mutates via c's OWN actions (BindingsMatchAuthored). Cross-connection observation isolation: every captured Lookup observation matches the connection's own bindings at observation time (LookupReflectsOwnBindings). Detach clears bindings (DetachClears). Bind cap bounded (BindCapBound). (Spec landed early during the Phase 8 renumbering — chunk-tag prefix sticks for git-history continuity.) | namespace.cfg: 73984 distinct states / depth 17 (Connections={c1,c2}, Paths={p_root,p_home}, Sources=3, MaxBindsPerConn=2). | `namespace_global_bindings_buggy.cfg`, `namespace_detach_leaks_buggy.cfg`, `namespace_unbind_crosstalk_buggy.cfg`, `namespace_lookup_crosstalk_buggy.cfg` |
 | `inode.tla` | 8 | Inode allocator state machine (P8-POSIX-1 / ARCH §11.3.2) — AllocFresh / AllocReused / Free across an Inos space with per-ino state ∈ {NEVER_USED, ALLOCATED, FREED} + monotonic generation counter. Headline invariant TupleUniqueAllTime: every (ino, gen) tuple appearing in the audit history is unique across the full execution — the foundation for stale-fid detection in 9P (ARCH §11.3.2), per-file derived keys (§7.3.3), and NFS file handles. GenMonotonicAcrossAllocations: gen never decreases across reuse cycles. AllocatedReflectedInHistory: state ALLOCATED implies a matching history entry. | inode.cfg: 879025 distinct states / depth 25 (Inos={i1,i2,i3}, MaxGen=3). | `inode_reuse_no_gen_bump_buggy.cfg`, `inode_double_allocate_buggy.cfg` |
+| `dirent.tla` | 8 | Directory entry layer — open-addressing chain integrity (P8-POSIX-2 / ARCH §11.4). Models per-dir slot table keyed by `(dir_ino, STM_KEY_DIRENT, fnv1a(name) + probe_offset)` per ARCH §11.4.1. Three integrity rules: (1) Unlink leaves a TOMBSTONE (not EMPTY) so colliding names at higher probe indices stay reachable; (2) Create locates the install slot via a full chain walk (not blind write at `Hash(name)`); (3) Lookup skips TOMBSTONE slots (not treated as EMPTY). Headline invariant LookupAgreesWithLinks: Lookup walking the chain returns the (ino, gen) tuple that the abstract `links` oracle says is currently linked, or NONE iff the name is unlinked. SlotsAgreeWithLinks: slot-resident records exactly equal links (catches BuggyCreateOverwritesNoProbe's silent-overwrite class). NoDuplicateRecord: at most one slot per (dir, name). | dirent.cfg: 581 distinct states / depth 7 (Dirs={d1}, Names={"n_a","n_b","n_c"}, Inos={ino_1,ino_2}, MaxGen=1, MaxProbe=3, Hash colliding n_a + n_b at slot 0 / n_c at slot 1). | `dirent_unlink_uses_empty_buggy.cfg`, `dirent_create_overwrites_no_probe_buggy.cfg`, `dirent_lookup_stops_on_tombstone_buggy.cfg` |
 
-All 27 fixed configs green (one per module + `scrub_beta` +
+All 28 fixed configs green (one per module + `scrub_beta` +
 `scrub_durable` + `scrub_beta_durable` extending `scrub.tla` +
 `extent_keyids.cfg` extending `extent.tla`; +1 with P8-NS-1's
-`namespace.cfg`; +1 with P8-POSIX-1's `inode.cfg`). All 40 buggy
-configs reproduce their designed invariant violations (was 38;
-P8-POSIX-1 added two buggy configs covering the canonical
-ino-allocator failure modes — reuse-without-gen-bump and
-double-allocate).
+`namespace.cfg`; +1 with P8-POSIX-1's `inode.cfg`; +1 with
+P8-POSIX-2's `dirent.cfg`). All 43 buggy configs reproduce
+their designed invariant violations (was 40; P8-POSIX-2 added
+three buggy configs covering the canonical open-addressing
+chain-integrity failure modes — unlink-uses-empty,
+create-overwrites-no-probe, lookup-stops-on-tombstone).
 
 ## Per-module invariants
 
@@ -1292,6 +1294,94 @@ field in this spec maps to a concrete data structure in the
 server. The four buggy variants enumerate the implementation
 errors that the server's reviewer should explicitly rule out
 during code review.
+
+### `dirent.tla` — directory entry layer (P8-POSIX-2 entry)
+
+Spec-first scaffold for ROADMAP §11 P8-POSIX-2 deliverable. Models
+the open-addressing chain that ARCHITECTURE §11.4 specifies for
+hash-indexed directories: dirent records live in the main btree
+at key `(dir_ino, STM_KEY_DIRENT, fnv1a(name) + probe_offset)`,
+with `probe_offset` resolving collisions via linear probing.
+
+State variables:
+
+- `slots : Dirs → 0..MaxProbe-1 → SlotEntry` — per-dir slot table.
+  Each entry is a tagged record with `kind ∈ {"empty", "tombstone",
+  "record"}`. The "record" variant carries the dirent payload
+  (`name`, `ino`, `gen`); EMPTY and TOMBSTONE carry sentinel zero
+  values that the slot-walk code never reads.
+- `links : Dirs → SUBSET (Names × Inos × 0..MaxGen)` — abstract
+  oracle. The set of currently-linked `(name, ino, gen)` tuples;
+  mutated atomically by Create/Unlink. Authoritative ground truth
+  that the slot table must faithfully encode.
+
+Helper operators (TLC-evaluable recursive walkers):
+
+- `LookupWalk(d, name, k)` — implements ARCH §11.4.2's lookup
+  protocol. Returns `<<ino, gen>>` on the first matching record,
+  `NONE` on EMPTY short-circuit (or TOMBSTONE under
+  `BuggyLookupStopsOnTombstone`), `NONE` on chain exhaustion.
+- `FirstInstallSlot(d, name, k)` — first chain slot suitable for
+  installing `name` (EMPTY / TOMBSTONE / same-name overwrite).
+- `LiveRecordSlot(d, name, k)` — first chain slot holding a record
+  with this exact name; honors EMPTY-short-circuit.
+- `HashAB_C` — operator-override target for the `Hash` constant.
+  Encodes the canonical "n_a + n_b collide at slot 0; n_c at slot
+  1" pattern. Configs bind via `Hash <- HashAB_C`.
+
+Actions:
+
+- `Create(d, name, ino, g)` — link `name`. Precondition: `name` not
+  already in `links[d]`. Healthy: install at `FirstInstallSlot`.
+  `BuggyCreateOverwritesNoProbe`: install at `Hash[name]`
+  unconditionally, overwriting any colliding occupant.
+- `Unlink(d, name)` — remove `name`. Precondition: `name` linked.
+  Healthy: replace the matching slot with TOMBSTONE.
+  `BuggyUnlinkUsesEmpty`: replace with EMPTY.
+
+Headline invariants:
+
+- `LookupAgreesWithLinks` — `LookupWalk(d, name, 0)` returns the
+  `(ino, gen)` tuple that `links[d]` says is currently linked
+  under `name`, or `NONE` iff no such link. The single property
+  that makes dirents correct: the slot table is a faithful
+  encoding of the logical name → ino mapping. Every buggy
+  variant fires this invariant via a differently-shaped chain-
+  integrity violation.
+- `SlotsAgreeWithLinks` — slot-resident records exactly equal
+  `links` as a set of `(name, ino, gen)` tuples. Catches
+  `BuggyCreateOverwritesNoProbe`'s silent-overwrite class
+  directly (the overwritten name's tuple stays in `links` while
+  vanishing from slots).
+- `NoDuplicateRecord` — at most one slot per `(dir, name)` pair.
+- `TypeOK`.
+
+Buggy variants (all fire at fixed-config bounds):
+
+- `BuggyUnlinkUsesEmpty` (82 distinct states / 126 generated) —
+  Unlink writes EMPTY (not TOMBSTONE); colliding name at higher
+  probe index becomes unreachable; `LookupAgreesWithLinks` fires.
+- `BuggyCreateOverwritesNoProbe` (14 states / 14 generated) —
+  Create blindly writes at `Hash[name]`, overwriting colliding
+  occupants; `SlotsAgreeWithLinks` and `LookupAgreesWithLinks`
+  fire fast.
+- `BuggyLookupStopsOnTombstone` (84 states / 126 generated) —
+  Lookup terminates on TOMBSTONE; same failure shape as
+  UnlinkUsesEmpty but on the read path; fires
+  `LookupAgreesWithLinks`.
+
+Healthy: 581 distinct states / depth 7 (Dirs={d1},
+Names={"n_a","n_b","n_c"}, Inos={ino_1,ino_2}, MaxGen=1,
+MaxProbe=3, collision pattern AB_C).
+
+Spec-to-code: implementation lands at P8-POSIX-2 substantive — new
+`src/dirent/` joins the CLAUDE.md trigger list at substantive
+landing. The three buggy variants enumerate the implementation
+errors that the reviewer should explicitly rule out during code
+review (silent-corruption regressions in dirent btrees are how
+ext4 + xfs have historically had silent-data-loss CVEs). Future
+spec extensions: P8-POSIX-4 readdir cursor stability,
+P8-POSIX-9 rename atomicity.
 
 ## Running TLC
 
