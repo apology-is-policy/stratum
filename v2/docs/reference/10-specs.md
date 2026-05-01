@@ -1190,19 +1190,23 @@ Spec-to-code:
   preserves the (ino, gen) uniqueness invariant trivially since
   every alloc is fresh. P8-POSIX-1b will add the reuse path with
   the gen bump per `AllocReused`.
-- `tests/test_inode.c` — 35 tests exercising lifecycle, alloc
+- `tests/test_inode.c` — 36 tests exercising lifecycle, alloc
   monotonicity, per-dataset isolation, free + ENOENT, double-free
   refusal, set-with-identity-mismatch refusal (protects the
   (ino, gen) invariant from caller error), count + next_ino
   accessors, struct size assertion (256B per ARCH §11.3), arg
   validation matrix (R69 P3-7), data_kind reject-unknown (R69
-  P3-3), reserved-zero on Set (R69 P3-2), zero-init contract
-  for all passive fields (R69 P3-8). P8-POSIX-1b adds: AllocReused
-  with gen bump (alloc-prefers-reuse + cycles), set-rejects-FREED-
-  flag, persistence roundtrip across mount cycles, gen monotonic
-  across the persistence boundary, idempotent commit when clean.
-  R70 close adds: set_storage refuses re-bind (P3-6), set_crypt_ctx
-  refuses re-bind (P3-6), no-op Set doesn't re-dirty (P3-4).
+  P3-3) + state-preservation post-rejection (R71b P3-2), reserved-
+  zero on Set (R69 P3-2), zero-init contract for all passive fields
+  (R69 P3-8). P8-POSIX-1b adds: AllocReused with gen bump (alloc-
+  prefers-reuse + cycles), set-rejects-FREED-flag, persistence
+  roundtrip across mount cycles, gen monotonic across the
+  persistence boundary, idempotent commit when clean. R70 close
+  adds: set_storage refuses re-bind (P3-6), set_crypt_ctx refuses
+  re-bind (P3-6), no-op Set doesn't re-dirty (P3-4). R71 close
+  adds: nlink=0 reject on ALLOCATED record (P1-1, closes the
+  silent-commit-then-wedge surface left by R70's asymmetric
+  decoder-only FREED ⇔ nlink invariant).
 - `tests/test_sync.c::sync_inode_persistence_roundtrip` — R70 P2-1
   end-to-end coverage of sync.c's inode wiring: set_storage +
   set_crypt_ctx in sync_create / sync_open, load_at order between

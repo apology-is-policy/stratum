@@ -369,9 +369,12 @@ stm_status stm_inode_index_load_at(stm_inode_index *idx,
                                       uint64_t root_paddr, uint64_t root_gen,
                                       const uint8_t expected_csum[32]);
 
-/* Read the current root paddr / csum / gen — for the sync layer's
+/* Read the current root paddr / csum — for the sync layer's
  * dirty-tracking + uberblock stamping. `out_root_paddr` is required;
  * `out_root_csum` is optional (pass NULL if the csum is not needed).
+ * For the AEAD gen, use the sibling `stm_inode_index_get_gen` below.
+ * (R71 P2-2: docstring referenced "/ gen" but the function does not
+ * return it; gen lives in the dedicated accessor.)
  *
  * Forward use: P8-POSIX-2's dirent layer + future POSIX-surface
  * chunks call this to mirror the inode tree's root state during

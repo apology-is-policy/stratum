@@ -88,11 +88,17 @@ struct stm_inode_index {
     const uint8_t  *metadata_key;
     uint64_t        pool_uuid[2];
     uint64_t        device_uuid[2];
-    bool            crypt_set;
-    bool            storage_set;     /* R70 P3-6: latched on first
-                                       * successful set_storage; further
-                                       * set_storage / set_crypt_ctx calls
+    bool            crypt_set;       /* R70 P3-6: latched on first
+                                       * successful set_crypt_ctx;
+                                       * further set_crypt_ctx calls
                                        * refused with STM_EINVAL. */
+    bool            storage_set;     /* R70 P3-6: latched on first
+                                       * successful set_storage;
+                                       * further set_storage calls
+                                       * refused with STM_EINVAL.
+                                       * R71 P2-1: comment split from
+                                       * crypt_set — the two latches are
+                                       * independent. */
     uint64_t        root_paddr;
     uint64_t        root_gen;
     uint8_t         root_csum[32];
@@ -167,14 +173,17 @@ static stm_inode_record *find_freed_record(stm_inode_index *idx,
  * with next_ino=1 if absent. Returns NULL only on STM_ENOMEM.
  *
  * realloc is called under idx->lock (R69 P3-4 acknowledged + P3-5
- * cap-doubling overflow guard). */
+ * cap-doubling overflow guard + R71b P3-1 size-multiplication guard
+ * — bounds `new_cap * sizeof *new_arr` in addition to the doubling
+ * itself). */
 static stm_inode_dsstate *get_or_create_dsstate(stm_inode_index *idx,
                                                      uint64_t dataset_id) {
     stm_inode_dsstate *s = find_dsstate(idx, dataset_id);
     if (s) return s;
 
     if (idx->n_datasets == idx->cap_datasets) {
-        if (idx->cap_datasets > SIZE_MAX / 2u) return NULL;
+        if (idx->cap_datasets > (SIZE_MAX / sizeof *idx->dsstate) / 2u)
+            return NULL;
         size_t new_cap = idx->cap_datasets ? idx->cap_datasets * 2u : 4u;
         stm_inode_dsstate *new_arr =
                 realloc(idx->dsstate, new_cap * sizeof *new_arr);
@@ -188,10 +197,17 @@ static stm_inode_dsstate *get_or_create_dsstate(stm_inode_index *idx,
     return s;
 }
 
-/* Append a fresh record. Returns NULL only on STM_ENOMEM. */
+/* Append a fresh record. Returns NULL only on STM_ENOMEM.
+ *
+ * R71b P3-1: cap-doubling guard tightened to bound the
+ * `new_cap * sizeof *new_arr` multiplication, not just the
+ * doubling. Reachability is theoretical (~2^54 records on 64-bit
+ * given `sizeof(stm_inode_record) ≈ 280`) but the tighter form
+ * matches the intended defense-in-depth posture. */
 static stm_inode_record *append_record(stm_inode_index *idx) {
     if (idx->n_records == idx->cap_records) {
-        if (idx->cap_records > SIZE_MAX / 2u) return NULL;
+        if (idx->cap_records > (SIZE_MAX / sizeof *idx->records) / 2u)
+            return NULL;
         size_t new_cap = idx->cap_records ? idx->cap_records * 2u : 8u;
         stm_inode_record *new_arr =
                 realloc(idx->records, new_cap * sizeof *new_arr);
@@ -563,6 +579,18 @@ stm_status stm_inode_set(stm_inode_index *idx, uint64_t dataset_id,
             must_unlock(idx_lock(idx));
             return STM_EINVAL;
         }
+    }
+    /* R71 P1-1: pin the FREED ⇔ nlink≥1 invariant on the WRITE side
+     * (R70 P3-3 pinned it on the READ side at in_decode_value).
+     * Writing nlink=0 to an ALLOCATED record was previously accepted
+     * here — Set succeeds, sync_commit persists the corrupt record,
+     * next mount's load_at decoder rejects with STM_ECORRUPT and
+     * wedges the pool unrecoverably without offline tooling. The
+     * symmetric writer-side guard closes the silent-commit-then-
+     * wedge path. */
+    if (stm_load_le32(in_value->si_nlink) == 0) {
+        must_unlock(idx_lock(idx));
+        return STM_EINVAL;
     }
     /* R70 P3-4 + R69 P3-2: build the canonical post-write candidate
      * (caller's value with si_reserved zeroed per the R69 contract)

@@ -503,6 +503,41 @@ STM_TEST(inode_set_refuses_unknown_data_kind) {
         STM_ASSERT_ERR(stm_inode_set(idx, 1, ino, &bad), STM_EINVAL);
     }
 
+    /* R71b P3-2: state-preservation post-rejection — the rejected
+     * Set must not have mutated the record. A regression that
+     * reorders validation after the assignment would not be caught
+     * by the loop above because every iteration writes a different
+     * invalid kind; the lookup-after assertion pins the original. */
+    struct stm_inode_value after = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &after));
+    STM_ASSERT_EQ(after.si_data_kind, (uint8_t)STM_DATA_INLINE);
+
+    stm_inode_index_close(idx);
+}
+
+/* R71 P1-1: stm_inode_set rejects writing nlink=0 on an ALLOCATED
+ * record (the FREED ⇔ nlink≥1 invariant the decoder pins on the
+ * READ side). Without this guard a buggy or hostile caller could
+ * commit a corrupt record that wedges the pool on next mount. */
+STM_TEST(inode_r71_p1_1_set_rejects_nlink_zero) {
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
+
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_nlink), (uint32_t)1);
+
+    v.si_nlink = stm_store_le32(0);
+    STM_ASSERT_ERR(stm_inode_set(idx, 1, ino, &v), STM_EINVAL);
+
+    /* State preservation: rejected Set must not mutate the record. */
+    struct stm_inode_value after = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &after));
+    STM_ASSERT_EQ(stm_load_le32(after.si_nlink), (uint32_t)1);
+
     stm_inode_index_close(idx);
 }
 
