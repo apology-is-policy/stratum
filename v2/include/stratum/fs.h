@@ -730,6 +730,138 @@ stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
                               size_t *out_returned);
 
 /* ========================================================================= */
+/* Extended attributes (P8-POSIX-6).                                          */
+/* ========================================================================= */
+
+/* Maximum xattr name length (POSIX-aligned, matches Linux
+ * <linux/limits.h> XATTR_NAME_MAX). */
+#define STM_FS_XATTR_NAME_MAX   255u
+
+/* Maximum xattr value length (POSIX-aligned, matches Linux
+ * <linux/limits.h> XATTR_SIZE_MAX). */
+#define STM_FS_XATTR_VALUE_MAX  65536u
+
+/* setxattr flags (POSIX-aligned values, matches Linux <sys/xattr.h>). */
+#define STM_FS_XATTR_CREATE     0x01u   /* refuse if exists (STM_EEXIST) */
+#define STM_FS_XATTR_REPLACE    0x02u   /* refuse if doesn't exist (STM_ENODATA) */
+
+/*
+ * stm_fs_setxattr — set an extended attribute on (dataset_id, ino).
+ *
+ * POSIX setxattr(2) shape with namespace gating per ARCH §11.5.1:
+ *
+ *   Name format: must start with one of `user.`, `system.`,
+ *     `security.`, `trusted.` (the four POSIX-defined namespaces).
+ *     Names not matching any prefix → STM_EINVAL. The 5-byte prefix
+ *     is included in name_len.
+ *
+ *   Flags:
+ *     - 0                       : default (replace-or-create)
+ *     - STM_FS_XATTR_CREATE     : refuse if already exists (STM_EEXIST)
+ *     - STM_FS_XATTR_REPLACE    : refuse if doesn't exist (STM_ENODATA)
+ *     - both                    : STM_EINVAL
+ *
+ * `out_replaced` (optional) is set to true iff a prior live record was
+ * replaced (default flags, name was found live). Pass NULL to ignore.
+ *
+ * Refusals:
+ *   - NULL fs / name / value (when value_len > 0) (STM_EINVAL).
+ *   - dataset_id == 0 OR ino == 0 (STM_EINVAL).
+ *   - name_len == 0 OR name_len > STM_FS_XATTR_NAME_MAX (STM_EINVAL).
+ *   - name doesn't start with a POSIX namespace prefix (STM_EINVAL).
+ *   - value_len > STM_FS_XATTR_VALUE_MAX (STM_ERANGE).
+ *   - flags has unknown bits or both CREATE and REPLACE (STM_EINVAL).
+ *   - CREATE flag set + name already linked (STM_EEXIST).
+ *   - REPLACE flag set + name not present (STM_ENODATA).
+ *   - Inode not present at (dataset_id, ino) (STM_ENOENT).
+ *   - chain exhausted at the xattr layer (STM_ENOSPC).
+ *   - fs wedged (STM_EWEDGED) / RO (STM_EROFS).
+ */
+STM_MUST_USE
+stm_status stm_fs_setxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                              const uint8_t *name, uint8_t name_len,
+                              const uint8_t *value, uint32_t value_len,
+                              uint32_t flags,
+                              bool *out_replaced);
+
+/*
+ * stm_fs_getxattr — read an extended attribute on (dataset_id, ino).
+ *
+ * POSIX getxattr(2) shape:
+ *   - `*out_size` is set to the FULL value byte count regardless of
+ *     `value_max`. Callers can probe by passing `value_max=0` to get
+ *     the size, then re-call with a sufficient buffer.
+ *   - If `value_max > 0` AND `value_max < *out_size`, returns
+ *     STM_ERANGE; `*out_size` set to the full value size.
+ *   - If `value_max >= *out_size`, copies the full value into
+ *     `value_buf` and returns STM_OK.
+ *
+ * Refusals:
+ *   - NULL fs / name / out_size (STM_EINVAL).
+ *   - NULL value_buf with value_max > 0 (STM_EINVAL).
+ *   - dataset_id == 0 OR ino == 0 (STM_EINVAL).
+ *   - name_len == 0 OR name_len > STM_FS_XATTR_NAME_MAX (STM_EINVAL).
+ *   - name doesn't start with a POSIX namespace prefix (STM_EINVAL).
+ *   - Inode not present at (dataset_id, ino) (STM_ENOENT).
+ *   - No such attribute → STM_ENODATA.
+ *   - value_max > 0 AND value_max < value_len → STM_ERANGE
+ *     (*out_size still set to the full value size).
+ *   - fs wedged (STM_EWEDGED). RO mounts allowed.
+ */
+STM_MUST_USE
+stm_status stm_fs_getxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                              const uint8_t *name, uint8_t name_len,
+                              uint8_t *value_buf, uint32_t value_max,
+                              uint32_t *out_size);
+
+/*
+ * stm_fs_listxattr — list every xattr on (dataset_id, ino).
+ *
+ * POSIX listxattr(2) shape:
+ *   - Names are returned NUL-separated in `name_buf` (e.g.
+ *     "user.foo\0user.bar\0system.acl\0"). Each name includes its
+ *     trailing NUL — total bytes = sum of (name_len + 1) per entry.
+ *   - `*out_total_len` is set to the FULL byte count regardless of
+ *     `buf_max`. Callers can probe by passing `buf_max=0` to get the
+ *     size, then re-call with a sufficient buffer.
+ *   - If `buf_max > 0` AND `buf_max < *out_total_len`, returns
+ *     STM_ERANGE; `*out_total_len` set to the full size.
+ *
+ * Refusals:
+ *   - NULL fs / out_total_len (STM_EINVAL).
+ *   - NULL name_buf with buf_max > 0 (STM_EINVAL).
+ *   - dataset_id == 0 OR ino == 0 (STM_EINVAL).
+ *   - Inode not present at (dataset_id, ino) (STM_ENOENT).
+ *   - buf_max > 0 AND buf_max < total_len → STM_ERANGE.
+ *   - fs wedged (STM_EWEDGED). RO mounts allowed.
+ */
+STM_MUST_USE
+stm_status stm_fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                               uint8_t *name_buf, size_t buf_max,
+                               size_t *out_total_len);
+
+/*
+ * stm_fs_removexattr — remove an extended attribute on (dataset_id,
+ * ino).
+ *
+ * POSIX removexattr(2) shape:
+ *   - Returns STM_ENODATA if the attribute doesn't exist (matches
+ *     POSIX ENODATA / glibc ENOATTR convention).
+ *
+ * Refusals:
+ *   - NULL fs / name (STM_EINVAL).
+ *   - dataset_id == 0 OR ino == 0 (STM_EINVAL).
+ *   - name_len == 0 OR name_len > STM_FS_XATTR_NAME_MAX (STM_EINVAL).
+ *   - name doesn't start with a POSIX namespace prefix (STM_EINVAL).
+ *   - Inode not present at (dataset_id, ino) (STM_ENOENT).
+ *   - No such attribute → STM_ENODATA.
+ *   - fs wedged (STM_EWEDGED) / RO (STM_EROFS).
+ */
+STM_MUST_USE
+stm_status stm_fs_removexattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                                 const uint8_t *name, uint8_t name_len);
+
+/* ========================================================================= */
 /* Dataset creation (P7-13).                                                  */
 /* ========================================================================= */
 

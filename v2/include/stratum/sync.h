@@ -905,6 +905,20 @@ typedef struct stm_dirent_index stm_dirent_index;
 stm_dirent_index *stm_sync_dirent_index(stm_sync *s);
 
 /*
+ * P8-POSIX-6: per-pool xattr index handle. Same lifetime + thread-
+ * safety contract as the other index accessors above. The xattr index
+ * is owned by sync and persists across commits via the lifecycle
+ * wiring (set_storage / set_crypt_ctx in sync_create, load_at on
+ * mount, commit + UB stamping in sync_commit). The fs APIs
+ * stm_fs_setxattr / _getxattr / _listxattr / _removexattr operate on
+ * it via fs.c wrappers; tests reach it directly to roundtrip
+ * persistence + verify the sync-layer wiring.
+ */
+struct stm_xattr_index;
+typedef struct stm_xattr_index stm_xattr_index;
+stm_xattr_index *stm_sync_xattr_index(stm_sync *s);
+
+/*
  * P7-CAS-5: trigger one CAS auto-GC sweep cycle out-of-band from
  * `stm_sync_commit`. Takes `sync->lock` internally; safe to call
  * from any context that does NOT already hold sync->lock (notably:

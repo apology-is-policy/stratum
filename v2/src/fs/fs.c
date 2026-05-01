@@ -39,6 +39,7 @@
 #include <stratum/dataset.h>
 #include <stratum/dirent.h>
 #include <stratum/inode.h>
+#include <stratum/xattr.h>
 #include <stratum/janus.h>
 #include <stratum/keyfile.h>
 #include <stratum/pool.h>
@@ -2010,6 +2011,279 @@ stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
     *out_returned = emitted;
     pthread_mutex_unlock(&fs->lock);
     return STM_OK;
+}
+
+/* ========================================================================= */
+/* P8-POSIX-6: extended attributes (setxattr/getxattr/listxattr/removexattr). */
+/* ========================================================================= */
+
+/* POSIX namespace prefixes per ARCH §11.5.1. The fs-layer setxattr /
+ * removexattr (and getxattr, for symmetry) require name to start with
+ * one of these. The xattr.c layer is namespace-agnostic — only the fs
+ * wrapper enforces the prefix.
+ *
+ * Each entry is { prefix bytes, prefix length }. A name `n` of length
+ * `nl` matches if `nl >= prefix_len` AND `memcmp(n, prefix, prefix_len) == 0`. */
+static const struct { const char *prefix; uint8_t prefix_len; }
+fs_xattr_namespaces[] = {
+    { "user.",     5u },
+    { "system.",   7u },
+    { "security.", 9u },
+    { "trusted.",  8u },
+};
+
+static bool fs_xattr_name_in_posix_namespace(const uint8_t *name,
+                                                  uint8_t name_len) {
+    if (!name || name_len == 0) return false;
+    for (size_t i = 0;
+            i < sizeof fs_xattr_namespaces / sizeof fs_xattr_namespaces[0];
+            i++) {
+        uint8_t pl = fs_xattr_namespaces[i].prefix_len;
+        if (name_len >= pl &&
+            memcmp(name, fs_xattr_namespaces[i].prefix, pl) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Verify that an inode is present (live) at (dataset_id, ino). Returns
+ * STM_OK if present + live, STM_ENOENT otherwise. Caller holds fs->lock.
+ * Used by every xattr API as a precondition: xattr operations on a
+ * non-existent inode must surface as ENOENT, not as an unrelated
+ * xattr-layer error or a silent success that leaks records into
+ * `(ds, ino, *)` for an unallocated ino. */
+static stm_status fs_xattr_require_inode(stm_fs *fs,
+                                              uint64_t dataset_id, uint64_t ino) {
+    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+    if (!iidx) return STM_EINVAL;
+    struct stm_inode_value iv;
+    memset(&iv, 0, sizeof iv);
+    return stm_inode_lookup(iidx, dataset_id, ino, &iv);
+}
+
+stm_status stm_fs_setxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                              const uint8_t *name, uint8_t name_len,
+                              const uint8_t *value, uint32_t value_len,
+                              uint32_t flags,
+                              bool *out_replaced) {
+    /* R75 P3-1-style zero-init: out_replaced BEFORE arg validation. */
+    if (out_replaced) *out_replaced = false;
+
+    if (!fs) return STM_EINVAL;
+    if (!name) return STM_EINVAL;
+    if (value_len > 0u && !value) return STM_EINVAL;
+    if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+    if (name_len == 0u || name_len > STM_FS_XATTR_NAME_MAX) return STM_EINVAL;
+    if (value_len > STM_FS_XATTR_VALUE_MAX) return STM_ERANGE;
+    if (!fs_xattr_name_in_posix_namespace(name, name_len)) return STM_EINVAL;
+    /* xattr.c re-validates flags, but reject unknown bits at the fs
+     * boundary too so callers see a consistent error surface. */
+    uint32_t known = STM_FS_XATTR_CREATE | STM_FS_XATTR_REPLACE;
+    if ((flags & ~known) != 0u) return STM_EINVAL;
+    if ((flags & STM_FS_XATTR_CREATE) &&
+        (flags & STM_FS_XATTR_REPLACE)) return STM_EINVAL;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+
+    stm_status ps = fs_xattr_require_inode(fs, dataset_id, ino);
+    if (ps != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return ps;
+    }
+
+    stm_xattr_index *xidx = stm_sync_xattr_index(fs->sync);
+    if (!xidx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;
+    }
+    /* Map fs flags to xattr flags. Values are the same (POSIX-aligned)
+     * but go through an explicit mapping so the two layers stay
+     * separable if either changes. */
+    uint32_t xa_flags = 0;
+    if (flags & STM_FS_XATTR_CREATE)  xa_flags |= STM_XATTR_FLAG_CREATE;
+    if (flags & STM_FS_XATTR_REPLACE) xa_flags |= STM_XATTR_FLAG_REPLACE;
+
+    stm_status s = stm_xattr_set(xidx, dataset_id, ino,
+                                    name, name_len,
+                                    value, value_len, xa_flags,
+                                    out_replaced);
+    pthread_mutex_unlock(&fs->lock);
+    return s;
+}
+
+stm_status stm_fs_getxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                              const uint8_t *name, uint8_t name_len,
+                              uint8_t *value_buf, uint32_t value_max,
+                              uint32_t *out_size) {
+    if (out_size) *out_size = 0;
+
+    if (!fs) return STM_EINVAL;
+    if (!name || !out_size) return STM_EINVAL;
+    if (value_max > 0u && !value_buf) return STM_EINVAL;
+    if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+    if (name_len == 0u || name_len > STM_FS_XATTR_NAME_MAX) return STM_EINVAL;
+    if (!fs_xattr_name_in_posix_namespace(name, name_len)) return STM_EINVAL;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_READ(fs);
+
+    stm_status ps = fs_xattr_require_inode(fs, dataset_id, ino);
+    if (ps != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return ps;
+    }
+
+    stm_xattr_index *xidx = stm_sync_xattr_index(fs->sync);
+    if (!xidx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;
+    }
+    stm_status s = stm_xattr_get(xidx, dataset_id, ino,
+                                    name, name_len,
+                                    value_buf, value_max, out_size);
+    pthread_mutex_unlock(&fs->lock);
+    return s;
+}
+
+stm_status stm_fs_listxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                               uint8_t *name_buf, size_t buf_max,
+                               size_t *out_total_len) {
+    if (out_total_len) *out_total_len = 0;
+
+    if (!fs) return STM_EINVAL;
+    if (!out_total_len) return STM_EINVAL;
+    if (buf_max > 0u && !name_buf) return STM_EINVAL;
+    if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_READ(fs);
+
+    stm_status ps = fs_xattr_require_inode(fs, dataset_id, ino);
+    if (ps != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return ps;
+    }
+
+    stm_xattr_index *xidx = stm_sync_xattr_index(fs->sync);
+    if (!xidx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;
+    }
+
+    /* First pass: probe the count via xa_list with max_entries=0 to
+     * compute the total. */
+    size_t n_total = 0;
+    stm_status ps0 = stm_xattr_list(xidx, dataset_id, ino,
+                                       NULL, 0, &n_total);
+    if (ps0 != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return ps0;
+    }
+
+    if (n_total == 0) {
+        *out_total_len = 0;
+        pthread_mutex_unlock(&fs->lock);
+        return STM_OK;
+    }
+
+    /* Allocate a temp batch to receive the entries; we don't know the
+     * total byte length until we see the names. SIZE_MAX/sizeof
+     * guard against overflow. */
+    if (n_total > SIZE_MAX / sizeof(stm_xattr_entry)) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_ENOMEM;
+    }
+    stm_xattr_entry *batch = malloc(n_total * sizeof *batch);
+    if (!batch) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_ENOMEM;
+    }
+    size_t got = 0;
+    stm_status ls = stm_xattr_list(xidx, dataset_id, ino,
+                                      batch, n_total, &got);
+    if (ls != STM_OK || got != n_total) {
+        free(batch);
+        pthread_mutex_unlock(&fs->lock);
+        return (ls != STM_OK) ? ls : STM_ECORRUPT;
+    }
+
+    /* Compute total byte length (sum of (name_len + 1)). */
+    size_t total_len = 0;
+    for (size_t i = 0; i < got; i++) {
+        /* R77 P1-1-style defense: cap name_len at the fs → xattr
+         * trust boundary even though the xattr-layer + decoder both
+         * enforce ≤ STM_XATTR_NAME_MAX. Closes any future-bypass
+         * surface. */
+        if (batch[i].name_len == 0 ||
+            batch[i].name_len > STM_FS_XATTR_NAME_MAX) {
+            free(batch);
+            pthread_mutex_unlock(&fs->lock);
+            return STM_ECORRUPT;
+        }
+        size_t entry_bytes = (size_t)batch[i].name_len + 1u;
+        if (total_len > SIZE_MAX - entry_bytes) {
+            free(batch);
+            pthread_mutex_unlock(&fs->lock);
+            return STM_EOVERFLOW;
+        }
+        total_len += entry_bytes;
+    }
+    *out_total_len = total_len;
+
+    if (buf_max == 0) {
+        /* Probe-only call. */
+        free(batch);
+        pthread_mutex_unlock(&fs->lock);
+        return STM_OK;
+    }
+    if (buf_max < total_len) {
+        free(batch);
+        pthread_mutex_unlock(&fs->lock);
+        return STM_ERANGE;
+    }
+
+    /* Copy out as NUL-separated strings. */
+    size_t off = 0;
+    for (size_t i = 0; i < got; i++) {
+        memcpy(name_buf + off, batch[i].name, batch[i].name_len);
+        off += batch[i].name_len;
+        name_buf[off++] = 0;
+    }
+    /* off must equal total_len; abort would be harsh, so leave as
+     * implicit invariant. */
+
+    free(batch);
+    pthread_mutex_unlock(&fs->lock);
+    return STM_OK;
+}
+
+stm_status stm_fs_removexattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                                 const uint8_t *name, uint8_t name_len) {
+    if (!fs) return STM_EINVAL;
+    if (!name) return STM_EINVAL;
+    if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+    if (name_len == 0u || name_len > STM_FS_XATTR_NAME_MAX) return STM_EINVAL;
+    if (!fs_xattr_name_in_posix_namespace(name, name_len)) return STM_EINVAL;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+
+    stm_status ps = fs_xattr_require_inode(fs, dataset_id, ino);
+    if (ps != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return ps;
+    }
+
+    stm_xattr_index *xidx = stm_sync_xattr_index(fs->sync);
+    if (!xidx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;
+    }
+    stm_status s = stm_xattr_remove(xidx, dataset_id, ino, name, name_len);
+    pthread_mutex_unlock(&fs->lock);
+    return s;
 }
 
 /* P7-16: stm_fs_reflink. POSIX-shape FICLONE — replaces dst's empty

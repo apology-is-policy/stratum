@@ -9912,4 +9912,463 @@ STM_TEST(fs_p9_r79_p2_1_rename_hardlink_same_inode_consistent) {
     unlink(g_key_path);
 }
 
+/* ========================================================================= */
+/* P8-POSIX-6: extended attributes — fs-level integration tests.              */
+/* ========================================================================= */
+
+STM_TEST(fs_p6_setxattr_getxattr_roundtrip) {
+    make_tmp("p6_setget_rt");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+
+    /* Set + get + verify. */
+    const uint8_t name[]  = "user.color";
+    const uint8_t value[] = "ultraviolet";
+    bool replaced = true;
+    STM_ASSERT_OK(stm_fs_setxattr(fs, 1, f,
+                                       name, (uint8_t)(sizeof name - 1u),
+                                       value, (uint32_t)(sizeof value - 1u),
+                                       0, &replaced));
+    STM_ASSERT_TRUE(!replaced);
+
+    uint8_t  buf[32] = { 0 };
+    uint32_t sz = 0;
+    STM_ASSERT_OK(stm_fs_getxattr(fs, 1, f,
+                                       name, (uint8_t)(sizeof name - 1u),
+                                       buf, sizeof buf, &sz));
+    STM_ASSERT_EQ(sz, (uint32_t)(sizeof value - 1u));
+    STM_ASSERT_TRUE(memcmp(buf, value, sizeof value - 1u) == 0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p6_setxattr_namespace_validation) {
+    make_tmp("p6_ns");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+
+    /* Each of the 4 namespaces accepted. */
+    STM_ASSERT_OK(stm_fs_setxattr(fs, 1, f, (const uint8_t *)"user.x", 6,
+                                       (const uint8_t *)"v", 1, 0, NULL));
+    STM_ASSERT_OK(stm_fs_setxattr(fs, 1, f, (const uint8_t *)"system.x", 8,
+                                       (const uint8_t *)"v", 1, 0, NULL));
+    STM_ASSERT_OK(stm_fs_setxattr(fs, 1, f, (const uint8_t *)"security.x", 10,
+                                       (const uint8_t *)"v", 1, 0, NULL));
+    STM_ASSERT_OK(stm_fs_setxattr(fs, 1, f, (const uint8_t *)"trusted.x", 9,
+                                       (const uint8_t *)"v", 1, 0, NULL));
+    /* Unknown namespace prefix → STM_EINVAL. */
+    STM_ASSERT_ERR(stm_fs_setxattr(fs, 1, f, (const uint8_t *)"foo.x", 5,
+                                        (const uint8_t *)"v", 1, 0, NULL),
+                   STM_EINVAL);
+    /* Empty prefix (no dot) → STM_EINVAL. */
+    STM_ASSERT_ERR(stm_fs_setxattr(fs, 1, f, (const uint8_t *)"abc", 3,
+                                        (const uint8_t *)"v", 1, 0, NULL),
+                   STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p6_setxattr_create_replace_flags) {
+    make_tmp("p6_flags");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+
+    /* CREATE on missing → OK. */
+    STM_ASSERT_OK(stm_fs_setxattr(fs, 1, f, (const uint8_t *)"user.k", 6,
+                                       (const uint8_t *)"v1", 2,
+                                       STM_FS_XATTR_CREATE, NULL));
+    /* CREATE on existing → STM_EEXIST. */
+    STM_ASSERT_ERR(stm_fs_setxattr(fs, 1, f, (const uint8_t *)"user.k", 6,
+                                        (const uint8_t *)"v1b", 3,
+                                        STM_FS_XATTR_CREATE, NULL),
+                   STM_EEXIST);
+    /* REPLACE on existing → OK. */
+    STM_ASSERT_OK(stm_fs_setxattr(fs, 1, f, (const uint8_t *)"user.k", 6,
+                                       (const uint8_t *)"v2", 2,
+                                       STM_FS_XATTR_REPLACE, NULL));
+    /* REPLACE on missing → STM_ENODATA. */
+    STM_ASSERT_ERR(stm_fs_setxattr(fs, 1, f, (const uint8_t *)"user.zzz", 8,
+                                        (const uint8_t *)"v", 1,
+                                        STM_FS_XATTR_REPLACE, NULL),
+                   STM_ENODATA);
+    /* CREATE | REPLACE → STM_EINVAL. */
+    STM_ASSERT_ERR(stm_fs_setxattr(fs, 1, f, (const uint8_t *)"user.k", 6,
+                                        (const uint8_t *)"v", 1,
+                                        STM_FS_XATTR_CREATE | STM_FS_XATTR_REPLACE,
+                                        NULL),
+                   STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p6_getxattr_probe_and_erange) {
+    make_tmp("p6_probe");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_setxattr(fs, 1, f, (const uint8_t *)"user.x", 6,
+                                       (const uint8_t *)"hello", 5, 0, NULL));
+
+    /* Probe: value_max=0 → returns size. */
+    uint32_t sz = 0;
+    STM_ASSERT_OK(stm_fs_getxattr(fs, 1, f, (const uint8_t *)"user.x", 6,
+                                       NULL, 0, &sz));
+    STM_ASSERT_EQ(sz, (uint32_t)5);
+
+    /* Buffer too small → STM_ERANGE; sz still set. */
+    uint8_t  small[3] = { 0 };
+    STM_ASSERT_ERR(stm_fs_getxattr(fs, 1, f, (const uint8_t *)"user.x", 6,
+                                        small, sizeof small, &sz),
+                   STM_ERANGE);
+    STM_ASSERT_EQ(sz, (uint32_t)5);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p6_listxattr_basic_and_nul_separated) {
+    make_tmp("p6_list");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_setxattr(fs, 1, f, (const uint8_t *)"user.a", 6,
+                                       (const uint8_t *)"v", 1, 0, NULL));
+    STM_ASSERT_OK(stm_fs_setxattr(fs, 1, f, (const uint8_t *)"user.bb", 7,
+                                       (const uint8_t *)"v", 1, 0, NULL));
+    STM_ASSERT_OK(stm_fs_setxattr(fs, 1, f, (const uint8_t *)"system.x", 8,
+                                       (const uint8_t *)"v", 1, 0, NULL));
+
+    /* Probe: total len = (6+1) + (7+1) + (8+1) = 24. */
+    size_t total = 0;
+    STM_ASSERT_OK(stm_fs_listxattr(fs, 1, f, NULL, 0, &total));
+    STM_ASSERT_EQ(total, (size_t)(6 + 1 + 7 + 1 + 8 + 1));
+
+    uint8_t buf[64] = { 0 };
+    STM_ASSERT_OK(stm_fs_listxattr(fs, 1, f, buf, sizeof buf, &total));
+    STM_ASSERT_EQ(total, (size_t)(6 + 1 + 7 + 1 + 8 + 1));
+
+    /* Verify each name appears in the buffer with a trailing NUL. */
+    bool saw_a = false, saw_bb = false, saw_x = false;
+    size_t off = 0;
+    while (off < total) {
+        size_t name_len = 0;
+        while (off + name_len < total && buf[off + name_len] != 0) name_len++;
+        if (name_len == 6  && memcmp(buf + off, "user.a", 6) == 0) saw_a = true;
+        if (name_len == 7  && memcmp(buf + off, "user.bb", 7) == 0) saw_bb = true;
+        if (name_len == 8  && memcmp(buf + off, "system.x", 8) == 0) saw_x = true;
+        off += name_len + 1u;     /* skip name + NUL */
+    }
+    STM_ASSERT_TRUE(saw_a && saw_bb && saw_x);
+
+    /* Buffer too small → STM_ERANGE; total still set. */
+    uint8_t small[10] = { 0 };
+    total = 0;
+    STM_ASSERT_ERR(stm_fs_listxattr(fs, 1, f, small, sizeof small, &total),
+                   STM_ERANGE);
+    STM_ASSERT_EQ(total, (size_t)(6 + 1 + 7 + 1 + 8 + 1));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p6_removexattr_basic) {
+    make_tmp("p6_remove");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_setxattr(fs, 1, f, (const uint8_t *)"user.gone", 9,
+                                       (const uint8_t *)"v", 1, 0, NULL));
+    /* Remove + verify gone. */
+    STM_ASSERT_OK(stm_fs_removexattr(fs, 1, f, (const uint8_t *)"user.gone", 9));
+    uint32_t sz = 0;
+    STM_ASSERT_ERR(stm_fs_getxattr(fs, 1, f, (const uint8_t *)"user.gone", 9,
+                                        NULL, 0, &sz),
+                   STM_ENODATA);
+    /* Remove again → STM_ENODATA. */
+    STM_ASSERT_ERR(stm_fs_removexattr(fs, 1, f, (const uint8_t *)"user.gone", 9),
+                   STM_ENODATA);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p6_xattr_on_nonexistent_inode_enoent) {
+    /* setxattr / getxattr / removexattr on an unallocated ino → STM_ENOENT. */
+    make_tmp("p6_noent");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* No file ever allocated; ino 99999 is unallocated. */
+    uint32_t sz = 0;
+    STM_ASSERT_ERR(stm_fs_setxattr(fs, 1, 99999u,
+                                        (const uint8_t *)"user.x", 6,
+                                        (const uint8_t *)"v", 1, 0, NULL),
+                   STM_ENOENT);
+    STM_ASSERT_ERR(stm_fs_getxattr(fs, 1, 99999u,
+                                        (const uint8_t *)"user.x", 6,
+                                        NULL, 0, &sz),
+                   STM_ENOENT);
+    STM_ASSERT_ERR(stm_fs_removexattr(fs, 1, 99999u,
+                                           (const uint8_t *)"user.x", 6),
+                   STM_ENOENT);
+    size_t total = 0;
+    STM_ASSERT_ERR(stm_fs_listxattr(fs, 1, 99999u, NULL, 0, &total),
+                   STM_ENOENT);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p6_xattr_persists_across_mount) {
+    /* End-to-end: setxattr on inode, commit, unmount, remount, read back.
+     * Exercises the v25 → v26 format break + Merkle binding through
+     * the full fs API surface. */
+    make_tmp("p6_persist");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_setxattr(fs, 1, f,
+                                       (const uint8_t *)"user.persist", 12,
+                                       (const uint8_t *)"survives-mount", 14,
+                                       0, NULL));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    /* Remount. */
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint8_t  buf[32] = { 0 };
+    uint32_t sz = 0;
+    STM_ASSERT_OK(stm_fs_getxattr(fs, 1, f,
+                                       (const uint8_t *)"user.persist", 12,
+                                       buf, sizeof buf, &sz));
+    STM_ASSERT_EQ(sz, (uint32_t)14);
+    STM_ASSERT_TRUE(memcmp(buf, "survives-mount", 14) == 0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p6_xattr_arg_validation_matrix) {
+    make_tmp("p6_args");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+
+    /* setxattr — every documented refusal. */
+    STM_ASSERT_ERR(stm_fs_setxattr(NULL, 1, f, (const uint8_t *)"user.x", 6,
+                                        (const uint8_t *)"v", 1, 0, NULL),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_setxattr(fs, 0, f, (const uint8_t *)"user.x", 6,
+                                        (const uint8_t *)"v", 1, 0, NULL),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_setxattr(fs, 1, 0, (const uint8_t *)"user.x", 6,
+                                        (const uint8_t *)"v", 1, 0, NULL),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_setxattr(fs, 1, f, NULL, 6,
+                                        (const uint8_t *)"v", 1, 0, NULL),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_setxattr(fs, 1, f, (const uint8_t *)"user.x", 0,
+                                        (const uint8_t *)"v", 1, 0, NULL),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_setxattr(fs, 1, f, (const uint8_t *)"user.x", 6,
+                                        NULL, 1, 0, NULL),
+                   STM_EINVAL);
+
+    /* getxattr — every documented refusal. */
+    uint8_t  buf[16] = { 0 };
+    uint32_t sz = 0;
+    STM_ASSERT_ERR(stm_fs_getxattr(NULL, 1, f, (const uint8_t *)"user.x", 6,
+                                        buf, sizeof buf, &sz),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_getxattr(fs, 1, f, (const uint8_t *)"user.x", 6,
+                                        buf, sizeof buf, NULL),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_getxattr(fs, 1, f, NULL, 6,
+                                        buf, sizeof buf, &sz),
+                   STM_EINVAL);
+
+    /* removexattr — every documented refusal. */
+    STM_ASSERT_ERR(stm_fs_removexattr(NULL, 1, f, (const uint8_t *)"user.x", 6),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_removexattr(fs, 0, f, (const uint8_t *)"user.x", 6),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_removexattr(fs, 1, f, NULL, 6),
+                   STM_EINVAL);
+
+    /* listxattr — every documented refusal. */
+    size_t total = 0;
+    STM_ASSERT_ERR(stm_fs_listxattr(NULL, 1, f, NULL, 0, &total),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_listxattr(fs, 1, f, NULL, 0, NULL),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_listxattr(fs, 1, f, NULL, 16, &total),
+                   STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p6_xattr_ro_mount_refuses_writes) {
+    /* RO-mount: getxattr + listxattr allowed, setxattr + removexattr
+     * refused with STM_EROFS. */
+    make_tmp("p6_ro");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_setxattr(fs, 1, f, (const uint8_t *)"user.k", 6,
+                                       (const uint8_t *)"v", 1, 0, NULL));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    /* Remount RO. */
+    stm_fs_mount_opts ro_mopts = mopts;
+    ro_mopts.read_only = true;
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &ro_mopts, &fs));
+
+    /* Read paths OK. */
+    uint8_t  buf[16] = { 0 };
+    uint32_t sz = 0;
+    STM_ASSERT_OK(stm_fs_getxattr(fs, 1, f, (const uint8_t *)"user.k", 6,
+                                       buf, sizeof buf, &sz));
+    STM_ASSERT_EQ(sz, (uint32_t)1);
+    size_t total = 0;
+    STM_ASSERT_OK(stm_fs_listxattr(fs, 1, f, NULL, 0, &total));
+    STM_ASSERT_EQ(total, (size_t)(6 + 1));
+
+    /* Write paths refused with STM_EROFS. */
+    STM_ASSERT_ERR(stm_fs_setxattr(fs, 1, f, (const uint8_t *)"user.k", 6,
+                                        (const uint8_t *)"v2", 2, 0, NULL),
+                   STM_EROFS);
+    STM_ASSERT_ERR(stm_fs_removexattr(fs, 1, f, (const uint8_t *)"user.k", 6),
+                   STM_EROFS);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* R80-anticipated regression test: writer-side guard rejects oversized
+ * value_len at the fs boundary BEFORE reaching the xattr layer
+ * (R71 P1-1 + R77 P1-1 lesson — defense-in-depth at every trust
+ * boundary). */
+STM_TEST(fs_p6_setxattr_oversize_value_returns_erange) {
+    make_tmp("p6_oversize");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+
+    /* Static buffer at MAX + 1 to exercise the oversize boundary. */
+    static uint8_t big[STM_FS_XATTR_VALUE_MAX + 1] = { 0 };
+    STM_ASSERT_ERR(stm_fs_setxattr(fs, 1, f, (const uint8_t *)"user.k", 6,
+                                        big, (uint32_t)(STM_FS_XATTR_VALUE_MAX + 1u),
+                                        0, NULL),
+                   STM_ERANGE);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")

@@ -24,6 +24,7 @@
 #include <stratum/snapshot.h>
 #include <stratum/dirent.h>
 #include <stratum/inode.h>
+#include <stratum/xattr.h>
 #include <stratum/super.h>
 #include <stratum/sync.h>
 
@@ -490,6 +491,136 @@ STM_TEST(sync_dirent_persistence_roundtrip) {
                                         na, (uint8_t)(sizeof na - 1u),
                                         &ci, NULL, NULL));
     STM_ASSERT_EQ(ci, (uint64_t)201);
+
+    teardown(a3, s3, pool3);
+    stm_bdev_close(d);
+    unlink(g_tmp_path);
+}
+
+/* P8-POSIX-6 R80 P2-1 (anticipated coverage gap):
+ * sync-level xattr roundtrip — pins the v25 → v26 format break wiring
+ * end-to-end:
+ *
+ *   - sync_create's xattr_idx lifecycle (set_storage + set_crypt_ctx).
+ *   - load_at order between dirent_idx and xattr_idx (xattr_idx loads
+ *     LAST in the lifecycle block — must not assume any preceding tree's
+ *     state).
+ *   - bp_kind check on `ub_xattr_root.bp_kind` (mismatched kind →
+ *     STM_ECORRUPT).
+ *   - csum mirror in `s->xattr_root_csum` (used by build_uberblock at
+ *     reservation phase to keep prior root intact across gen bump).
+ *   - build_uberblock with the xattr_root_paddr/csum/gen triple
+ *     (3 call sites: claim, reservation, finish).
+ *   - compute_merkle_root folding xattr_csum as the 10th input
+ *     (regression detector — if removed, sync_open's recompute would
+ *     fail with STM_ECORRUPT). Same pattern as R47 P2-1 (repair_log_csum)
+ *     + R70 P0-1 (inode_csum) + R72 (dirent_csum).
+ *
+ * Concrete trace: set 4 xattr records (3 LIVE + 1 removed → TOMBSTONE)
+ * across two (ds, ino) pairs, commit, close, reopen, verify all 3 LIVE
+ * survive + the removed name returns ENODATA. Then set one more across
+ * the mount boundary, commit (now 2-phase), remount, verify the new
+ * setxattr persists. */
+STM_TEST(sync_xattr_persistence_roundtrip) {
+    make_tmp("xattr_rt");
+    stm_bdev *d = open_fresh_device();
+    stm_alloc *a = NULL; stm_sync *s = NULL; stm_pool *pool = NULL;
+    make_fresh_pool(d, &a, &s, &pool);
+
+    stm_xattr_index *xidx = stm_sync_xattr_index(s);
+    STM_ASSERT_TRUE(xidx != NULL);
+
+    const uint8_t na[] = "user.alpha";
+    const uint8_t nb[] = "user.beta";
+    const uint8_t nc[] = "user.gamma";
+    const uint8_t nd[] = "user.delta";
+    STM_ASSERT_OK(stm_xattr_set(xidx, /*ds=*/1, /*ino=*/100,
+                                   na, (uint8_t)(sizeof na - 1u),
+                                   (const uint8_t *)"AAAA", 4, 0, NULL));
+    STM_ASSERT_OK(stm_xattr_set(xidx, 1, 100,
+                                   nb, (uint8_t)(sizeof nb - 1u),
+                                   (const uint8_t *)"BBBBBBBB", 8, 0, NULL));
+    STM_ASSERT_OK(stm_xattr_set(xidx, /*ds=*/1, /*ino=*/101,
+                                   nc, (uint8_t)(sizeof nc - 1u),
+                                   (const uint8_t *)"CCCCCCCCCCCC", 12, 0, NULL));
+    STM_ASSERT_OK(stm_xattr_set(xidx, /*ds=*/2, /*ino=*/100,
+                                   nd, (uint8_t)(sizeof nd - 1u),
+                                   (const uint8_t *)"DDDDDDDDDDDDDDDD", 16, 0, NULL));
+    /* Tombstone na on (ds=1, ino=100). */
+    STM_ASSERT_OK(stm_xattr_remove(xidx, 1, 100,
+                                      na, (uint8_t)(sizeof na - 1u)));
+
+    /* First commit (1-phase, fresh pool): writes UB at gen=1 with the
+     * xattr tree root + the merkle binding folding xattr_csum. */
+    STM_ASSERT_OK(stm_sync_commit(s));
+
+    teardown(a, s, pool);
+    stm_bdev_close(d);
+
+    /* Remount — sync_open's compute_merkle_root recompute would fail
+     * with STM_ECORRUPT if the xattr_csum binding regressed. load_at
+     * exercises the bp_kind check + csum verification path on the
+     * xattr tree. */
+    d = open_fresh_device();
+    stm_alloc *a2 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d, &a2));
+    stm_sync *s2 = NULL;
+    stm_pool *pool2 = make_test_pool(d);
+    STM_ASSERT_OK(stm_sync_open(pool2, a2, make_wk(), NULL, &s2));
+
+    stm_xattr_index *xidx2 = stm_sync_xattr_index(s2);
+    STM_ASSERT_TRUE(xidx2 != NULL);
+
+    /* alpha (tombstoned) returns ENODATA; beta + gamma + delta survive. */
+    uint8_t  buf[64] = { 0 };
+    uint32_t sz = 0;
+    STM_ASSERT_ERR(stm_xattr_get(xidx2, 1, 100,
+                                     na, (uint8_t)(sizeof na - 1u),
+                                     buf, sizeof buf, &sz),
+                   STM_ENODATA);
+
+    STM_ASSERT_OK(stm_xattr_get(xidx2, 1, 100,
+                                    nb, (uint8_t)(sizeof nb - 1u),
+                                    buf, sizeof buf, &sz));
+    STM_ASSERT_EQ(sz, (uint32_t)8);
+    STM_ASSERT_TRUE(memcmp(buf, "BBBBBBBB", 8) == 0);
+
+    STM_ASSERT_OK(stm_xattr_get(xidx2, 1, 101,
+                                    nc, (uint8_t)(sizeof nc - 1u),
+                                    buf, sizeof buf, &sz));
+    STM_ASSERT_EQ(sz, (uint32_t)12);
+    STM_ASSERT_TRUE(memcmp(buf, "CCCCCCCCCCCC", 12) == 0);
+
+    STM_ASSERT_OK(stm_xattr_get(xidx2, 2, 100,
+                                    nd, (uint8_t)(sizeof nd - 1u),
+                                    buf, sizeof buf, &sz));
+    STM_ASSERT_EQ(sz, (uint32_t)16);
+    STM_ASSERT_TRUE(memcmp(buf, "DDDDDDDDDDDDDDDD", 16) == 0);
+
+    /* Set one more across the mount boundary, commit (2-phase),
+     * remount, verify it persists. Also re-set `user.alpha` to verify
+     * the surviving tombstone slot is reusable. */
+    STM_ASSERT_OK(stm_xattr_set(xidx2, 1, 100,
+                                    na, (uint8_t)(sizeof na - 1u),
+                                    (const uint8_t *)"REVIVED", 7, 0, NULL));
+    STM_ASSERT_OK(stm_sync_commit(s2));
+
+    teardown(a2, s2, pool2);
+    stm_bdev_close(d);
+
+    d = open_fresh_device();
+    stm_alloc *a3 = NULL;
+    STM_ASSERT_OK(stm_alloc_open_blank(d, &a3));
+    stm_sync *s3 = NULL;
+    stm_pool *pool3 = make_test_pool(d);
+    STM_ASSERT_OK(stm_sync_open(pool3, a3, make_wk(), NULL, &s3));
+
+    stm_xattr_index *xidx3 = stm_sync_xattr_index(s3);
+    STM_ASSERT_OK(stm_xattr_get(xidx3, 1, 100,
+                                    na, (uint8_t)(sizeof na - 1u),
+                                    buf, sizeof buf, &sz));
+    STM_ASSERT_EQ(sz, (uint32_t)7);
+    STM_ASSERT_TRUE(memcmp(buf, "REVIVED", 7) == 0);
 
     teardown(a3, s3, pool3);
     stm_bdev_close(d);

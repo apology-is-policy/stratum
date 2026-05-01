@@ -32,6 +32,7 @@ const char *stm_strerror(stm_status s)
     case STM_EISDIR:         return "is a directory";
     case STM_ENOTEMPTY:      return "directory not empty";
     case STM_ENAMETOOLONG:   return "name or target too long";
+    case STM_ENODATA:        return "no such xattr";
     }
     return "unknown error";
 }

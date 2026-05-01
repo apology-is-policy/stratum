@@ -447,8 +447,11 @@ STM_TEST(dirent_set_crypt_ctx_refuses_rebind) {
     stm_dirent_index_close(idx);
 }
 
-STM_TEST(dirent_ub_version_is_25) {
-    STM_ASSERT_EQ(STM_UB_VERSION, 25u);
+STM_TEST(dirent_ub_version_is_v26) {
+    /* P8-POSIX-6 bumped STM_UB_VERSION 25 → 26 for the new xattr tree
+     * (v2/include/stratum/super.h). The dirent layer is unchanged
+     * since v25 but rides the latest version constant. */
+    STM_ASSERT_EQ(STM_UB_VERSION, 26u);
 }
 
 /* R73 P2-1: stm_dirent_drop_for_dir bulk-removes every record keyed

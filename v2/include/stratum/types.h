@@ -96,6 +96,11 @@ typedef enum {
     STM_EISDIR          =  -21,   /* entry is a directory but shouldn't be */
     STM_ENOTEMPTY       =  -39,   /* directory non-empty                   */
     STM_ENAMETOOLONG    =  -36,   /* path / symlink target / name exceeds bound */
+
+    /* P8-POSIX-6: xattr / extended-attribute errors. POSIX-aligned values
+     * (matches Linux errno.h on most systems; also returned for
+     * getxattr/removexattr "no such attribute" per Linux man getxattr(2)). */
+    STM_ENODATA         =  -61,   /* xattr name not present                */
 } stm_status;
 
 const char *stm_strerror(stm_status s);

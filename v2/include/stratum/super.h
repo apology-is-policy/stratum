@@ -381,8 +381,27 @@ extern "C" {
  * 9th input to `compute_merkle_root` in lockstep with this field's
  * introduction (R70 P0-1 lesson — every load-bearing tree-root field
  * MUST be folded into the Merkle chain in the same commit). v24
- * pools refused at v25 mount via uniform STM_EBADVERSION. */
-#define STM_UB_VERSION        25u
+ * pools refused at v25 mount via uniform STM_EBADVERSION.
+ *
+ * v25 → v26 bump (P8-POSIX-6): per-pool xattr tree on-disk surface
+ * introduced. New uberblock fields `ub_xattr_root` (64-byte stm_bptr
+ * at offset 3432 — head of the prior `ub_reserved` block) +
+ * `ub_xattr_root_gen` (le64 at offset 3496) carry the root paddr /
+ * csum / gen of the AEAD-encrypted Bε-tree keyed by `(le64
+ * dataset_id || le64 ino || le64 hash_probe)` (24 bytes — same
+ * shape as dirent's key but rooted at ino instead of dir_ino)
+ * storing variable-length value records per ARCH §11.5 + xattr.tla.
+ * `ub_reserved` shrinks 632 → 560 bytes. New `STM_BPTR_KIND_XATTR_TREE
+ * = 14`. Merkle binding extended: `xattr_csum` becomes the 10th
+ * input to `compute_merkle_root` in lockstep with this field's
+ * introduction (R70 P0-1 lesson, carried forward from R72's
+ * dirent_csum binding — every load-bearing tree-root field MUST be
+ * folded into the Merkle chain in the same commit). Writer-side
+ * guards on name_len + value_len mirror decoder-side guards (R71
+ * P1-1 + R77 P1-1 lesson — the OOB-read shape extends from inline
+ * data to xattr value records). v25 pools refused at v26 mount via
+ * uniform STM_EBADVERSION. */
+#define STM_UB_VERSION        26u
 
 /* Fixed sizes. */
 #define STM_UB_SIZE           4096u                      /* one uberblock */
@@ -474,6 +493,7 @@ typedef enum {
     STM_BPTR_KIND_REPAIR_LOG  = 11,  /* repair-log tree root (ARCH §7.15.4, P7-15) */
     STM_BPTR_KIND_INODE_TREE  = 12,  /* inode-index tree root (ARCH §11.3, P8-POSIX-1b) */
     STM_BPTR_KIND_DIRENT_TREE = 13,  /* dirent-index tree root (ARCH §11.4, P8-POSIX-2) */
+    STM_BPTR_KIND_XATTR_TREE  = 14,  /* xattr-index tree root (ARCH §11.5, P8-POSIX-6) */
 } stm_bptr_kind;
 
 typedef struct {
@@ -670,8 +690,21 @@ typedef struct {
      * (P8-POSIX-2, v25). Same semantics as `ub_inode_root_gen`. */
     le64    ub_dirent_root_gen;                 /* 3424 :  8 */
 
+    /* P8-POSIX-6 (v26): per-pool xattr tree root. Bptr to the
+     * btree_store-encoded, AEAD-encrypted Bε-tree under
+     * `ub_xattr_root` on device 0. Keys: 24 bytes
+     * (le64 dataset_id || le64 ino || le64 hash_probe). Values:
+     * variable-length name_len + value_len byte xattr records (ARCH
+     * §11.5, spec xattr.tla). The tree's bp_kind is
+     * `STM_BPTR_KIND_XATTR_TREE`. Zero before the first commit. */
+    stm_bptr ub_xattr_root;                     /* 3432 : 64 */
+
+    /* Gen at which `ub_xattr_root`'s tree was AEAD-encrypted
+     * (P8-POSIX-6, v26). Same semantics as `ub_dirent_root_gen`. */
+    le64    ub_xattr_root_gen;                  /* 3496 :  8 */
+
     /* Reserved for future fields + alignment to csum. */
-    uint8_t ub_reserved[632];                   /* 3432 : 632 */
+    uint8_t ub_reserved[560];                   /* 3504 : 560 */
 
     /* Checksum: BLAKE3-256 over the rest of the uberblock with this
      * field zeroed. Self-verifying; a blob whose first 4064 bytes
@@ -710,8 +743,12 @@ _Static_assert(offsetof(stm_uberblock, ub_dirent_root) == 3360,
                "ub_dirent_root must be at offset 3360 (v25 layout)");
 _Static_assert(offsetof(stm_uberblock, ub_dirent_root_gen) == 3424,
                "ub_dirent_root_gen must be at offset 3424 (v25 layout)");
-_Static_assert(offsetof(stm_uberblock, ub_reserved) == 3432,
-               "ub_reserved must be at offset 3432 (v25 layout)");
+_Static_assert(offsetof(stm_uberblock, ub_xattr_root) == 3432,
+               "ub_xattr_root must be at offset 3432 (v26 layout)");
+_Static_assert(offsetof(stm_uberblock, ub_xattr_root_gen) == 3496,
+               "ub_xattr_root_gen must be at offset 3496 (v26 layout)");
+_Static_assert(offsetof(stm_uberblock, ub_reserved) == 3504,
+               "ub_reserved must be at offset 3504 (v26 layout)");
 _Static_assert(offsetof(stm_uberblock, ub_csum) == 4064,
                "ub_csum must be at offset 4064");
 
