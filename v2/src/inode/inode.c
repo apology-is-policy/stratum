@@ -512,6 +512,74 @@ stm_status stm_inode_free(stm_inode_index *idx, uint64_t dataset_id,
     return STM_OK;
 }
 
+/* P8-POSIX-3: nlink-aware Link / Unlink. Models inode.tla::Link and
+ * ::Unlink with the cascade-free-on-zero invariant. Replaces
+ * stm_inode_free's role in the per-fs unlink/rmdir wrappers — the
+ * single-link MVP at P8-POSIX-2b unconditionally called free; the
+ * nlink-aware path decrements + frees only on the last reference. */
+stm_status stm_inode_link(stm_inode_index *idx, uint64_t dataset_id,
+                              uint64_t ino) {
+    if (!idx) return STM_EINVAL;
+    if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+
+    must_lock(idx_lock(idx));
+
+    stm_inode_record *r = find_record(idx, dataset_id, ino);
+    if (!r || r->state != STM_INODE_STATE_ALLOCATED) {
+        must_unlock(idx_lock(idx));
+        return STM_ENOENT;
+    }
+    uint32_t cur_nlink = stm_load_le32(r->value.si_nlink);
+    if (cur_nlink == UINT32_MAX) {
+        must_unlock(idx_lock(idx));
+        return STM_EOVERFLOW;
+    }
+    r->value.si_nlink = stm_store_le32(cur_nlink + 1u);
+    idx->dirty = true;
+
+    must_unlock(idx_lock(idx));
+    return STM_OK;
+}
+
+stm_status stm_inode_unlink(stm_inode_index *idx, uint64_t dataset_id,
+                                uint64_t ino, bool *out_freed) {
+    if (out_freed) *out_freed = false;
+    if (!idx) return STM_EINVAL;
+    if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+
+    must_lock(idx_lock(idx));
+
+    stm_inode_record *r = find_record(idx, dataset_id, ino);
+    if (!r || r->state != STM_INODE_STATE_ALLOCATED) {
+        must_unlock(idx_lock(idx));
+        return STM_ENOENT;
+    }
+    uint32_t cur_nlink = stm_load_le32(r->value.si_nlink);
+    if (cur_nlink == 0u) {
+        /* Invariant violation: ALLOCATED + nlink=0 is the very orphan
+         * R71 P1-1 / inode.tla::LinkedAllocatedHasPositiveNlink
+         * pin against. Refuse rather than silently underflow. */
+        must_unlock(idx_lock(idx));
+        return STM_ECORRUPT;
+    }
+    uint32_t new_nlink = cur_nlink - 1u;
+    if (new_nlink == 0u) {
+        /* Cascade-free per inode.tla::Unlink: atomically transition
+         * to FREED + zero nlink + set FREED flag. gen preserved. */
+        r->state = STM_INODE_STATE_FREED;
+        uint32_t flags = stm_load_le32(r->value.si_flags);
+        r->value.si_flags = stm_store_le32(flags | STM_INO_FLAG_FREED);
+        r->value.si_nlink = stm_store_le32(0u);
+        if (out_freed) *out_freed = true;
+    } else {
+        r->value.si_nlink = stm_store_le32(new_nlink);
+    }
+    idx->dirty = true;
+
+    must_unlock(idx_lock(idx));
+    return STM_OK;
+}
+
 stm_status stm_inode_lookup(const stm_inode_index *idx,
                                uint64_t dataset_id, uint64_t ino,
                                struct stm_inode_value *out_value) {

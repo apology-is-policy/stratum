@@ -7617,4 +7617,271 @@ STM_TEST(fs_p2b_create_rolls_back_inode_on_eexist) {
     unlink(g_key_path);
 }
 
+/* ========================================================================= */
+/* P8-POSIX-3: metadata ops + hard links.                                     */
+/* ========================================================================= */
+
+STM_TEST(fs_p3_stat_basic) {
+    make_tmp("p3_stat");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t child = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root,
+                                          (const uint8_t *)"f", 1,
+                                          0644u, /*uid=*/1000, /*gid=*/2000,
+                                          &child));
+
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, child, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_uid), (uint32_t)1000);
+    STM_ASSERT_EQ(stm_load_le32(v.si_gid), (uint32_t)2000);
+    STM_ASSERT_EQ(stm_load_le32(v.si_nlink), (uint32_t)1);
+    /* Mode preserves S_IFREG | 0644. */
+    uint32_t mode = stm_load_le32(v.si_mode);
+    STM_ASSERT_EQ(mode & (uint32_t)S_IFMT, (uint32_t)S_IFREG);
+    STM_ASSERT_EQ(mode & 07777u, 0644u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p3_chmod_preserves_type) {
+    make_tmp("p3_chmod");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t child = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root,
+                                          (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &child));
+
+    /* chmod with type bits zeroed → preserves S_IFREG. */
+    STM_ASSERT_OK(stm_fs_chmod(fs, 1, child, 0755u));
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, child, &v));
+    uint32_t mode = stm_load_le32(v.si_mode);
+    STM_ASSERT_EQ(mode & (uint32_t)S_IFMT, (uint32_t)S_IFREG);
+    STM_ASSERT_EQ(mode & 07777u, 0755u);
+
+    /* chmod with matching type bits → also OK. */
+    STM_ASSERT_OK(stm_fs_chmod(fs, 1, child, (uint32_t)S_IFREG | 0600u));
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, child, &v));
+    mode = stm_load_le32(v.si_mode);
+    STM_ASSERT_EQ(mode & 07777u, 0600u);
+
+    /* chmod with mismatched type bits → STM_EINVAL. */
+    STM_ASSERT_ERR(stm_fs_chmod(fs, 1, child,
+                                    (uint32_t)S_IFDIR | 0755u),
+                   STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p3_chown_minus_one_semantics) {
+    make_tmp("p3_chown");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t child = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root,
+                                          (const uint8_t *)"f", 1,
+                                          0644u, 1000, 2000, &child));
+
+    /* Change uid only; UINT32_MAX leaves gid unchanged. */
+    STM_ASSERT_OK(stm_fs_chown(fs, 1, child, /*uid=*/3000, /*gid=*/UINT32_MAX));
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, child, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_uid), (uint32_t)3000);
+    STM_ASSERT_EQ(stm_load_le32(v.si_gid), (uint32_t)2000);
+
+    /* Change gid only. */
+    STM_ASSERT_OK(stm_fs_chown(fs, 1, child, UINT32_MAX, /*gid=*/4000));
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, child, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_uid), (uint32_t)3000);
+    STM_ASSERT_EQ(stm_load_le32(v.si_gid), (uint32_t)4000);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p3_utimens_basic) {
+    make_tmp("p3_utimens");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t child = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root,
+                                          (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &child));
+
+    STM_ASSERT_OK(stm_fs_utimens(fs, 1, child,
+                                      /*atime=*/1234567u, 100u,
+                                      /*mtime=*/2345678u, 200u,
+                                      /*ctime=*/3456789u, 300u));
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, child, &v));
+    STM_ASSERT_EQ(stm_load_le64(v.si_atime_sec),  (uint64_t)1234567u);
+    STM_ASSERT_EQ(stm_load_le32(v.si_atime_nsec), (uint32_t)100u);
+    STM_ASSERT_EQ(stm_load_le64(v.si_mtime_sec),  (uint64_t)2345678u);
+    STM_ASSERT_EQ(stm_load_le32(v.si_mtime_nsec), (uint32_t)200u);
+    STM_ASSERT_EQ(stm_load_le64(v.si_ctime_sec),  (uint64_t)3456789u);
+    STM_ASSERT_EQ(stm_load_le32(v.si_ctime_nsec), (uint32_t)300u);
+
+    /* nsec >= 1e9 → STM_EINVAL. */
+    STM_ASSERT_ERR(stm_fs_utimens(fs, 1, child,
+                                       0, 1000000000u,
+                                       0, 0, 0, 0),
+                   STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p3_link_basic_and_nlink_tracking) {
+    make_tmp("p3_link");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    /* Create source file (nlink=1). */
+    uint64_t child = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root,
+                                          (const uint8_t *)"a", 1,
+                                          0644u, 0, 0, &child));
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, child, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_nlink), (uint32_t)1);
+
+    /* Hard link a → b. nlink should be 2. */
+    STM_ASSERT_OK(stm_fs_link(fs, 1,
+                                   /*src_parent=*/root,
+                                   (const uint8_t *)"a", 1,
+                                   /*dst_parent=*/root,
+                                   (const uint8_t *)"b", 1));
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, child, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_nlink), (uint32_t)2);
+
+    /* Both names resolve to the same ino. */
+    uint64_t found = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root,
+                                     (const uint8_t *)"a", 1, &found));
+    STM_ASSERT_EQ(found, child);
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root,
+                                     (const uint8_t *)"b", 1, &found));
+    STM_ASSERT_EQ(found, child);
+
+    /* Unlink "a" — nlink drops to 1, inode survives, "b" still resolves. */
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, root, (const uint8_t *)"a", 1));
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, child, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_nlink), (uint32_t)1);
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root,
+                                     (const uint8_t *)"b", 1, &found));
+    STM_ASSERT_EQ(found, child);
+
+    /* Unlink "b" — nlink drops to 0, inode cascade-freed. */
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, root, (const uint8_t *)"b", 1));
+    STM_ASSERT_ERR(stm_fs_stat(fs, 1, child, &v), STM_ENOENT);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p3_link_refuses_directory) {
+    make_tmp("p3_link_dir");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t sub = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root,
+                                    (const uint8_t *)"d", 1,
+                                    0755u, 0, 0, &sub));
+
+    /* Hard-link-on-directory is forbidden by POSIX. */
+    STM_ASSERT_ERR(stm_fs_link(fs, 1,
+                                    root, (const uint8_t *)"d", 1,
+                                    root, (const uint8_t *)"d2", 2),
+                   STM_ENOTSUPPORTED);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p3_link_refuses_existing_dst) {
+    make_tmp("p3_link_eexist");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t a = 0, b = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root,
+                                          (const uint8_t *)"a", 1,
+                                          0644u, 0, 0, &a));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root,
+                                          (const uint8_t *)"b", 1,
+                                          0644u, 0, 0, &b));
+
+    /* Hard-linking a → b where b already exists is EEXIST + nlink
+     * rolled back. */
+    STM_ASSERT_ERR(stm_fs_link(fs, 1,
+                                    root, (const uint8_t *)"a", 1,
+                                    root, (const uint8_t *)"b", 1),
+                   STM_EEXIST);
+    /* a's nlink should still be 1 (rollback succeeded). */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, a, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_nlink), (uint32_t)1);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")

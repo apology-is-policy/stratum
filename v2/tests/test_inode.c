@@ -894,4 +894,76 @@ STM_TEST(inode_p3_4_set_no_op_doesnt_redirty) {
     unlink(inp_tmp_path);
 }
 
+/* P8-POSIX-3: stm_inode_link / stm_inode_unlink with cascade-free. */
+STM_TEST(inode_p3_link_increments_nlink) {
+    stm_inode_index *idx = stm_inode_index_create();
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
+
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_nlink), (uint32_t)1);
+
+    STM_ASSERT_OK(stm_inode_link(idx, 1, ino));
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_nlink), (uint32_t)2);
+
+    STM_ASSERT_OK(stm_inode_link(idx, 1, ino));
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_nlink), (uint32_t)3);
+
+    stm_inode_index_close(idx);
+}
+
+STM_TEST(inode_p3_unlink_cascade_freed_only_at_zero) {
+    stm_inode_index *idx = stm_inode_index_create();
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
+    STM_ASSERT_OK(stm_inode_link(idx, 1, ino));    /* nlink=2 */
+    STM_ASSERT_OK(stm_inode_link(idx, 1, ino));    /* nlink=3 */
+
+    bool freed = true;
+    STM_ASSERT_OK(stm_inode_unlink(idx, 1, ino, &freed));
+    STM_ASSERT_EQ(freed, false);     /* nlink=2 after */
+
+    STM_ASSERT_OK(stm_inode_unlink(idx, 1, ino, &freed));
+    STM_ASSERT_EQ(freed, false);     /* nlink=1 after */
+
+    STM_ASSERT_OK(stm_inode_unlink(idx, 1, ino, &freed));
+    STM_ASSERT_EQ(freed, true);      /* nlink=0 → cascade */
+
+    /* Post-cascade: lookup returns ENOENT (FREED). */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_ERR(stm_inode_lookup(idx, 1, ino, &v), STM_ENOENT);
+
+    stm_inode_index_close(idx);
+}
+
+STM_TEST(inode_p3_link_refuses_freed) {
+    stm_inode_index *idx = stm_inode_index_create();
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
+    STM_ASSERT_OK(stm_inode_free(idx, 1, ino));
+
+    STM_ASSERT_ERR(stm_inode_link(idx, 1, ino), STM_ENOENT);
+
+    stm_inode_index_close(idx);
+}
+
+STM_TEST(inode_p3_link_unlink_arg_validation) {
+    stm_inode_index *idx = stm_inode_index_create();
+    bool freed = false;
+    STM_ASSERT_ERR(stm_inode_link(NULL, 1, 1), STM_EINVAL);
+    STM_ASSERT_ERR(stm_inode_link(idx, 0, 1), STM_EINVAL);
+    STM_ASSERT_ERR(stm_inode_link(idx, 1, 0), STM_EINVAL);
+    STM_ASSERT_ERR(stm_inode_unlink(NULL, 1, 1, &freed), STM_EINVAL);
+    STM_ASSERT_ERR(stm_inode_unlink(idx, 0, 1, &freed), STM_EINVAL);
+    STM_ASSERT_ERR(stm_inode_unlink(idx, 1, 0, &freed), STM_EINVAL);
+    /* out_freed optional. */
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
+    STM_ASSERT_OK(stm_inode_unlink(idx, 1, ino, NULL));
+    stm_inode_index_close(idx);
+}
+
 STM_TEST_MAIN("test_inode")

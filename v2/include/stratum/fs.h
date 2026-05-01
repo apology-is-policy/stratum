@@ -354,6 +354,89 @@ stm_status stm_fs_rmdir(stm_fs *fs, uint64_t dataset_id,
                            const uint8_t *name, uint8_t name_len);
 
 /* ========================================================================= */
+/* P8-POSIX-3: metadata ops + hard links.                                     */
+/* ========================================================================= */
+
+struct stm_inode_value;            /* forward — full layout in inode.h */
+
+/*
+ * Read the full inode value for (dataset_id, ino). MVP: returns the
+ * raw 256-byte struct stm_inode_value (callers parse the fields they
+ * care about). Future: a `stm_fs_statx_t` shape that maps to Linux
+ * `statx(2)` semantics with btime + nanosecond timestamps lands at
+ * P8-POSIX-7.
+ *
+ * Refusals:
+ *   - NULL fs OR NULL out_value (STM_EINVAL).
+ *   - dataset_id == 0 OR ino == 0 (STM_EINVAL).
+ *   - inode not present OR FREED (STM_ENOENT).
+ *   - fs wedged (STM_EWEDGED). RO mounts allowed.
+ */
+STM_MUST_USE
+stm_status stm_fs_stat(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                          struct stm_inode_value *out_value);
+
+/*
+ * Change permission bits on an inode. The new `mode` MUST preserve
+ * the file-type bits (S_IFMT) of the existing inode — passing a
+ * different type is STM_EINVAL. Pass mode with type bits zeroed AND
+ * the wrapper preserves the inode's existing type, OR pass mode with
+ * the matching type bits.
+ *
+ * Refusals: same shape as stm_fs_stat plus STM_EROFS on RO mounts
+ * and STM_EINVAL on type mismatch.
+ */
+STM_MUST_USE
+stm_status stm_fs_chmod(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                           uint32_t mode);
+
+/*
+ * Change owner (uid) and/or group (gid). Pass `uid == UINT32_MAX` or
+ * `gid == UINT32_MAX` to leave that field unchanged (POSIX
+ * `chown(-1, ...)` semantics).
+ */
+STM_MUST_USE
+stm_status stm_fs_chown(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                           uint32_t uid, uint32_t gid);
+
+/*
+ * Set atime + mtime nanosecond-precision timestamps on an inode.
+ * `*_nsec` are in [0, 999999999]. ctime is updated automatically by
+ * the wrapper to reflect the metadata change (caller-supplied via
+ * `ctime_sec` / `ctime_nsec`; pass 0 in both to leave unchanged —
+ * future: integrate a real clock at P8-POSIX-7's `statx` shape).
+ */
+STM_MUST_USE
+stm_status stm_fs_utimens(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                              uint64_t atime_sec, uint32_t atime_nsec,
+                              uint64_t mtime_sec, uint32_t mtime_nsec,
+                              uint64_t ctime_sec, uint32_t ctime_nsec);
+
+/*
+ * Add a hard link: a new dirent at `(dst_parent_ino, dst_name)`
+ * pointing at the SAME inode as `(src_parent_ino, src_name)`. The
+ * inode's `si_nlink` is incremented (per inode.tla::Link). Both
+ * (src, dst) MUST be in the SAME `dataset_id` per ARCH §11.1
+ * ("Hard links same-dataset only"). Cross-dataset link returns
+ * STM_EXDEV (call stm_fs_reflink for cross-dataset content sharing).
+ *
+ * Refusals:
+ *   - any name validation refusal (STM_EINVAL).
+ *   - src not found OR dst already exists (STM_ENOENT / STM_EEXIST).
+ *   - src is a directory (STM_EPERM — POSIX forbids hardlinks-on-dirs).
+ *   - parent_inos not directories (STM_ENOTDIR).
+ *   - cross-dataset (STM_EXDEV).
+ *   - nlink at UINT32_MAX (STM_EOVERFLOW).
+ *   - fs wedged or read-only (STM_EWEDGED / STM_EROFS).
+ */
+STM_MUST_USE
+stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
+                          uint64_t src_parent_ino,
+                          const uint8_t *src_name, uint8_t src_name_len,
+                          uint64_t dst_parent_ino,
+                          const uint8_t *dst_name, uint8_t dst_name_len);
+
+/* ========================================================================= */
 /* Dataset creation (P7-13).                                                  */
 /* ========================================================================= */
 

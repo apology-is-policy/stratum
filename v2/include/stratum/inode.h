@@ -220,6 +220,41 @@ stm_status stm_inode_alloc(stm_inode_index *idx, uint64_t dataset_id,
  *   - NULL idx OR dataset_id == 0 OR ino == 0 (STM_EINVAL).
  *   - No record at (dataset_id, ino) OR record already FREED (STM_ENOENT).
  */
+/*
+ * Bump nlink on (dataset_id, ino). Models inode.tla's `Link` action:
+ * ALLOCATED + nlink ≥ 1 + nlink < UINT32_MAX → nlink := nlink + 1.
+ * Used by stm_fs_link to add a second-or-later dirent referencing
+ * an existing inode (POSIX hard link).
+ *
+ * Refusals:
+ *   - NULL idx OR dataset_id == 0 OR ino == 0 (STM_EINVAL).
+ *   - No record at (dataset_id, ino) OR record FREED (STM_ENOENT).
+ *   - nlink at UINT32_MAX (STM_EOVERFLOW — caller must enforce the
+ *     POSIX LINK_MAX cap before reaching this).
+ */
+STM_MUST_USE
+stm_status stm_inode_link(stm_inode_index *idx, uint64_t dataset_id,
+                              uint64_t ino);
+
+/*
+ * Decrement nlink on (dataset_id, ino). Models inode.tla's `Unlink`
+ * action: ALLOCATED + nlink ≥ 1 → nlink := nlink - 1. If nlink
+ * reaches 0, the record atomically transitions to FREED via the
+ * cascade-free path (sets STM_INO_FLAG_FREED in si_flags + zeros
+ * si_nlink); the `si_gen` is preserved so the next AllocReused
+ * bumps it. Caller can detect the cascade-free via *out_freed (if
+ * non-NULL) — true iff this unlink was the last reference.
+ *
+ * Refusals:
+ *   - NULL idx OR dataset_id == 0 OR ino == 0 (STM_EINVAL).
+ *   - No record at (dataset_id, ino) OR record FREED (STM_ENOENT).
+ *   - nlink at 0 (STM_ECORRUPT — invariant violation; healthy paths
+ *     never reach this).
+ */
+STM_MUST_USE
+stm_status stm_inode_unlink(stm_inode_index *idx, uint64_t dataset_id,
+                                uint64_t ino, bool *out_freed);
+
 STM_MUST_USE
 stm_status stm_inode_free(stm_inode_index *idx, uint64_t dataset_id,
                              uint64_t ino);

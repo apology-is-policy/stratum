@@ -45,18 +45,28 @@ CONSTANTS
     MaxGen,                        \* bound on generation counter
                                    \*   (TLC tractability; real impl
                                    \*    uses uint64_t)
+    MaxNlink,                      \* bound on per-ino nlink counter
+                                   \*   (P8-POSIX-3; real impl is u32).
     BuggyReuseNoGenBump,           \* TRUE → AllocReused does not bump
                                    \*   gen. Demonstrates the canonical
                                    \*   stale-fid-attack failure mode.
-    BuggyDoubleAllocate            \* TRUE → AllocFresh also picks
+    BuggyDoubleAllocate,           \* TRUE → AllocFresh also picks
                                    \*   already-ALLOCATED inos.
                                    \*   Demonstrates allocator
                                    \*   double-issue.
+    BuggyUnlinkLeavesZeroNlink     \* TRUE → Unlink decrements nlink
+                                   \*   to 0 but leaves ALLOCATED state
+                                   \*   (no cascade-free). Demonstrates
+                                   \*   the "ALLOCATED+nlink=0" orphan
+                                   \*   that R71 P1-1 caught at the
+                                   \*   writer-side guard.
 
 ASSUME /\ Inos # {}
        /\ MaxGen \in Nat /\ MaxGen >= 1
+       /\ MaxNlink \in Nat /\ MaxNlink >= 1
        /\ BuggyReuseNoGenBump \in BOOLEAN
        /\ BuggyDoubleAllocate \in BOOLEAN
+       /\ BuggyUnlinkLeavesZeroNlink \in BOOLEAN
 
 \* Inode states.
 NEVER_USED == "never_used"
@@ -89,10 +99,12 @@ FREED      == "freed"
 VARIABLES
     state,
     gen,
+    nlink,                         \* per-ino hard-link counter
+                                   \*   (P8-POSIX-3 extension).
     history,
     alloc_event_counter
 
-vars == <<state, gen, history, alloc_event_counter>>
+vars == <<state, gen, nlink, history, alloc_event_counter>>
 
 \* --------------------------------------------------------------------------
 \* Initial state — all inos NEVER_USED, all gen=0, empty history.
@@ -101,6 +113,7 @@ vars == <<state, gen, history, alloc_event_counter>>
 Init ==
     /\ state               = [i \in Inos |-> NEVER_USED]
     /\ gen                 = [i \in Inos |-> 0]
+    /\ nlink               = [i \in Inos |-> 0]
     /\ history             = [i \in Inos |-> {}]
     /\ alloc_event_counter = 0
 
@@ -122,7 +135,8 @@ NeverUsedSet == {i \in Inos : state[i] = NEVER_USED}
 \* --------------------------------------------------------------------------
 
 \* AllocFresh: pick a NEVER_USED ino, mark ALLOCATED with gen=0.
-\* Healthy: only NEVER_USED inos eligible.
+\* Healthy: only NEVER_USED inos eligible. nlink starts at 1 (the
+\* dirent that the alloc action models is being created in lockstep).
 \* BuggyDoubleAllocate: also accepts ALLOCATED inos (silent
 \* re-issue of an in-use ino number).
 AllocFresh(i) ==
@@ -132,6 +146,7 @@ AllocFresh(i) ==
     /\ gen[i] + 0 <= MaxGen
     /\ state'               = [state EXCEPT ![i] = ALLOCATED]
     /\ gen'                 = [gen   EXCEPT ![i] = 0]
+    /\ nlink'               = [nlink EXCEPT ![i] = 1]
     /\ alloc_event_counter' = alloc_event_counter + 1
     /\ history'             = [history EXCEPT
                                   ![i] = history[i] \cup
@@ -149,17 +164,46 @@ AllocReused(i) ==
         /\ new_gen <= MaxGen
         /\ state'               = [state EXCEPT ![i] = ALLOCATED]
         /\ gen'                 = [gen   EXCEPT ![i] = new_gen]
+        /\ nlink'               = [nlink EXCEPT ![i] = 1]
         /\ alloc_event_counter' = alloc_event_counter + 1
         /\ history'             = [history EXCEPT
                                       ![i] = history[i] \cup
                                               {<<new_gen,
                                                  alloc_event_counter + 1>>}]
 
-\* Free: ALLOCATED ino → FREED.
-Free(i) ==
+\* Link: ALLOCATED ino with nlink in [1, MaxNlink-1] gets nlink + 1.
+\* Models stm_fs_link adding a new dirent that references this ino.
+\* The "resurrect FREED via Link" bug is OUT OF SPEC SCOPE for this
+\* chunk — catching it cleanly requires a per-ino "last-free event"
+\* shadow var to detect "ALLOCATED state set without a fresh alloc-
+\* event" patterns. The C impl's Link API simply rejects FREED state
+\* with STM_ENOENT (mirrors stm_inode_set's existing FREED guard);
+\* the writer-side reject is symmetric with the decoder-side
+\* invariant LinkedAllocatedHasPositiveNlink + FreedHasZeroNlink
+\* via the cascade-free that Unlink performs.
+Link(i) ==
     /\ state[i] = ALLOCATED
-    /\ state'               = [state EXCEPT ![i] = FREED]
-    /\ UNCHANGED <<gen, history, alloc_event_counter>>
+    /\ nlink[i] >= 1
+    /\ nlink[i] < MaxNlink
+    /\ nlink' = [nlink EXCEPT ![i] = @ + 1]
+    /\ UNCHANGED <<state, gen, history, alloc_event_counter>>
+
+\* Unlink: ALLOCATED ino with nlink >= 1 gets nlink - 1. If healthy
+\* and nlink reaches 0, atomically transitions to FREED (cascade-
+\* free). BuggyUnlinkLeavesZeroNlink: leaves ALLOCATED state when
+\* nlink reaches 0 — produces the (ALLOCATED, nlink=0) orphan that
+\* R71 P1-1 caught at the writer-side guard.
+Unlink(i) ==
+    /\ state[i] = ALLOCATED
+    /\ nlink[i] >= 1
+    /\ LET new_nlink == nlink[i] - 1
+           cascade_free == new_nlink = 0 /\ ~BuggyUnlinkLeavesZeroNlink
+       IN
+        /\ nlink' = [nlink EXCEPT ![i] = new_nlink]
+        /\ state' = IF cascade_free
+                    THEN [state EXCEPT ![i] = FREED]
+                    ELSE state
+        /\ UNCHANGED <<gen, history, alloc_event_counter>>
 
 \* --------------------------------------------------------------------------
 \* Next.
@@ -168,7 +212,8 @@ Free(i) ==
 Next ==
     \/ \E i \in Inos : AllocFresh(i)
     \/ \E i \in Inos : AllocReused(i)
-    \/ \E i \in Inos : Free(i)
+    \/ \E i \in Inos : Link(i)
+    \/ \E i \in Inos : Unlink(i)
 
 Spec == Init /\ [][Next]_vars
 
@@ -180,6 +225,7 @@ Spec == Init /\ [][Next]_vars
 TypeOK ==
     /\ state \in [Inos -> {NEVER_USED, ALLOCATED, FREED}]
     /\ gen \in [Inos -> 0..MaxGen]
+    /\ nlink \in [Inos -> 0..MaxNlink]
     /\ alloc_event_counter \in Nat
     /\ \A i \in Inos : history[i] \subseteq (0..MaxGen) \X (0..alloc_event_counter)
 
@@ -229,6 +275,37 @@ NoTwoAllocatedSameIno ==
     \A i, j \in Inos :
         (state[i] = ALLOCATED /\ state[j] = ALLOCATED /\ i # j) => TRUE
 
+\* P8-POSIX-3: ALLOCATED ⇔ nlink ≥ 1. Pins the
+\* "FREED ⇔ nlink=0 / ALLOCATED ⇒ nlink≥1" decoder invariant
+\* (R70 P3-3) at the spec level. BuggyUnlinkLeavesZeroNlink fires
+\* this directly: post-decrement to 0, state stays ALLOCATED while
+\* nlink is now 0.
+LinkedAllocatedHasPositiveNlink ==
+    \A i \in Inos :
+        (state[i] = ALLOCATED) => (nlink[i] >= 1)
+
+\* P8-POSIX-3: FREED ⇒ nlink = 0. Combined with the above, gives
+\* the full FREED ⇔ nlink=0 / ALLOCATED ⇔ nlink≥1 biconditional.
+\* Healthy AllocFresh / AllocReused set nlink=1; healthy Unlink
+\* drops to 0 only in lockstep with the FREED transition; healthy
+\* Link only mutates nlink while state=ALLOCATED. Buggy paths
+\* (BuggyLinkResurrectsFreed: bumps nlink while state=FREED is the
+\* SOURCE state for the action; the action transitions to ALLOCATED
+\* atomically with nlink=1, so this invariant still holds). The
+\* invariant fires when an action leaves the (FREED, nlink>0)
+\* state visible at any point.
+FreedHasZeroNlink ==
+    \A i \in Inos :
+        (state[i] = FREED) => (nlink[i] = 0)
+
+\* P8-POSIX-3: every ALLOCATED ino has at least one history entry
+\* whose gen matches the current gen. This was already pinned by
+\* AllocatedReflectedInHistory; the BuggyLinkResurrectsFreed bug
+\* fires it because Link doesn't append a history entry — so a
+\* resurrected ino has state=ALLOCATED + gen=prior_gen but no
+\* history entry recording that allocation event.
+\* (Already in the existing invariant set; no new addition needed.)
+
 \* --------------------------------------------------------------------------
 \* Bundle.
 \* --------------------------------------------------------------------------
@@ -239,5 +316,7 @@ Invariants ==
     /\ GenMonotonicAcrossAllocations
     /\ AllocatedReflectedInHistory
     /\ NoTwoAllocatedSameIno
+    /\ LinkedAllocatedHasPositiveNlink
+    /\ FreedHasZeroNlink
 
 =============================================================================

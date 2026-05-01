@@ -766,18 +766,15 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
     }
 
     /* Unlink the dirent first so a concurrent lookup can no longer
-     * resolve to the about-to-be-freed inode. Then free the inode.
+     * resolve to the about-to-be-freed inode. Then decrement nlink;
+     * cascade-free fires only on the last reference.
      *
-     * P8-POSIX-3-TODO: replace the unconditional inode_free with a
-     * proper nlink-decrement + cascade-free-on-zero. The current
-     * shape is correct for the single-link MVP — every alloc creates
-     * si_nlink=1, so unlinking the sole dirent always drops the
-     * inode. Hard links (`stm_fs_link`) at P8-POSIX-3 break this
-     * assumption: link(/a, /b) creates a SECOND dirent referencing
-     * the same inode (and bumps si_nlink to 2); unlink(/a) must then
-     * decrement nlink to 1 and KEEP the inode. The transition WILL
-     * change the wrapper's behavior — grep for `P8-POSIX-3-TODO` to
-     * locate the call site at conversion time. */
+     * P8-POSIX-3: nlink-aware. stm_inode_unlink decrements si_nlink;
+     * if it reaches 0, the inode atomically transitions to FREED
+     * via the cascade path (per inode.tla::Unlink). Hard links
+     * (stm_fs_link) bump nlink past 1; unlinking one dirent
+     * decrements but keeps the inode reachable via the other
+     * dirent(s) until they too unlink. */
     stm_status us = stm_dirent_unlink(didx, dataset_id, parent_ino,
                                           name, name_len);
     if (us != STM_OK) {
@@ -794,17 +791,23 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
      * si_gen per inode.tla), the new directory inherits the orphan
      * tombstones and burns probe budget walking past them. The
      * cleanup is best-effort — a failure leaves the orphan tombstones
-     * behind but doesn't break the rmdir's correctness. */
+     * behind but doesn't break the rmdir's correctness.
+     *
+     * For directories at P8-POSIX-3: directories themselves should
+     * never have nlink > 1 (POSIX hard-link-on-dir is forbidden), so
+     * unlink-of-dir always cascade-frees on the rmdir path. */
     if (expect_dir) {
         (void)stm_dirent_drop_for_dir(didx, dataset_id, child_ino, NULL);
     }
 
-    /* Best-effort inode free. If this fails, the inode leaks but the
-     * dirent removal is durable — preferable to a half-state where
-     * the dirent persists pointing at a freed inode. The leak surfaces
-     * via stm_inode_count_for_ds drift and is recoverable by future
-     * scrub-style passes. */
-    (void)stm_inode_free(iidx, dataset_id, child_ino);
+    /* P8-POSIX-3: nlink-aware unlink. Decrement nlink; cascade-free
+     * triggers atomically when nlink reaches 0. For the MVP-single-
+     * link case (no hard links yet, every alloc has nlink=1) this
+     * always cascades — same observable outcome as the prior
+     * unconditional stm_inode_free, but with the nlink semantics
+     * that hard-link-aware paths require. */
+    bool freed = false;
+    (void)stm_inode_unlink(iidx, dataset_id, child_ino, &freed);
 
     pthread_mutex_unlock(&fs->lock);
     return STM_OK;
@@ -834,6 +837,225 @@ stm_status stm_fs_rmdir(stm_fs *fs, uint64_t dataset_id,
     return fs_unlink_inode_and_dirent(fs, dataset_id, parent_ino,
                                           name, name_len,
                                           /*expect_dir=*/true);
+}
+
+/* ========================================================================= */
+/* P8-POSIX-3: metadata ops + hard links.                                     */
+/* ========================================================================= */
+
+stm_status stm_fs_stat(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                          struct stm_inode_value *out_value)
+{
+    if (!fs || !out_value) return STM_EINVAL;
+    if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_READ(fs);
+
+    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+    if (!iidx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;
+    }
+    stm_status s = stm_inode_lookup(iidx, dataset_id, ino, out_value);
+    pthread_mutex_unlock(&fs->lock);
+    return s;
+}
+
+stm_status stm_fs_chmod(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                           uint32_t mode)
+{
+    if (!fs) return STM_EINVAL;
+    if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+
+    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+    if (!iidx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;
+    }
+
+    struct stm_inode_value v = {0};
+    stm_status ls = stm_inode_lookup(iidx, dataset_id, ino, &v);
+    if (ls != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return ls;
+    }
+    /* Preserve the existing file-type bits. Caller may pass either a
+     * mode with type bits zeroed (preserve current) or a mode that
+     * matches the existing type. Mismatched type bits are rejected. */
+    uint32_t cur_mode = stm_load_le32(v.si_mode);
+    uint32_t cur_type = cur_mode & (uint32_t)S_IFMT;
+    uint32_t new_type = mode & (uint32_t)S_IFMT;
+    if (new_type != 0u && new_type != cur_type) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;
+    }
+    uint32_t new_mode = cur_type | (mode & 07777u);
+    v.si_mode = stm_store_le32(new_mode);
+
+    stm_status ss = stm_inode_set(iidx, dataset_id, ino, &v);
+    pthread_mutex_unlock(&fs->lock);
+    return ss;
+}
+
+stm_status stm_fs_chown(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                           uint32_t uid, uint32_t gid)
+{
+    if (!fs) return STM_EINVAL;
+    if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+
+    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+    if (!iidx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;
+    }
+
+    struct stm_inode_value v = {0};
+    stm_status ls = stm_inode_lookup(iidx, dataset_id, ino, &v);
+    if (ls != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return ls;
+    }
+    /* POSIX chown(-1, ...) semantics: UINT32_MAX leaves the field
+     * unchanged. Both UINT32_MAX is a no-op. */
+    if (uid != UINT32_MAX) v.si_uid = stm_store_le32(uid);
+    if (gid != UINT32_MAX) v.si_gid = stm_store_le32(gid);
+
+    stm_status ss = stm_inode_set(iidx, dataset_id, ino, &v);
+    pthread_mutex_unlock(&fs->lock);
+    return ss;
+}
+
+stm_status stm_fs_utimens(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                              uint64_t atime_sec, uint32_t atime_nsec,
+                              uint64_t mtime_sec, uint32_t mtime_nsec,
+                              uint64_t ctime_sec, uint32_t ctime_nsec)
+{
+    if (!fs) return STM_EINVAL;
+    if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+    if (atime_nsec >= 1000000000u || mtime_nsec >= 1000000000u ||
+        ctime_nsec >= 1000000000u) return STM_EINVAL;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+
+    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+    if (!iidx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;
+    }
+
+    struct stm_inode_value v = {0};
+    stm_status ls = stm_inode_lookup(iidx, dataset_id, ino, &v);
+    if (ls != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return ls;
+    }
+    v.si_atime_sec  = stm_store_le64(atime_sec);
+    v.si_atime_nsec = stm_store_le32(atime_nsec);
+    v.si_mtime_sec  = stm_store_le64(mtime_sec);
+    v.si_mtime_nsec = stm_store_le32(mtime_nsec);
+    /* POSIX semantics: ctime is updated to "now" on metadata change.
+     * Without an in-tree clock yet, the wrapper requires the caller
+     * to pass ctime explicitly; pass 0/0 to leave unchanged.
+     * P8-POSIX-7's `statx` integration will replace this with an
+     * automatic clock-source. */
+    if (ctime_sec != 0u || ctime_nsec != 0u) {
+        v.si_ctime_sec  = stm_store_le64(ctime_sec);
+        v.si_ctime_nsec = stm_store_le32(ctime_nsec);
+    }
+
+    stm_status ss = stm_inode_set(iidx, dataset_id, ino, &v);
+    pthread_mutex_unlock(&fs->lock);
+    return ss;
+}
+
+stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
+                          uint64_t src_parent_ino,
+                          const uint8_t *src_name, uint8_t src_name_len,
+                          uint64_t dst_parent_ino,
+                          const uint8_t *dst_name, uint8_t dst_name_len)
+{
+    if (!fs) return STM_EINVAL;
+    if (dataset_id == 0u || src_parent_ino == 0u || dst_parent_ino == 0u)
+        return STM_EINVAL;
+    stm_status nv1 = fs_validate_dirent_name(src_name, src_name_len);
+    if (nv1 != STM_OK) return nv1;
+    stm_status nv2 = fs_validate_dirent_name(dst_name, dst_name_len);
+    if (nv2 != STM_OK) return nv2;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+
+    stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
+    stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
+    if (!iidx || !didx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;
+    }
+
+    /* Both parents must be directories. */
+    struct stm_inode_value spv = {0};
+    stm_status ps1 = fs_load_parent_dir(iidx, dataset_id, src_parent_ino, &spv);
+    if (ps1 != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return ps1;
+    }
+    /* If src and dst share parent, skip the second lookup; otherwise
+     * verify dst parent is also a directory. */
+    if (dst_parent_ino != src_parent_ino) {
+        struct stm_inode_value dpv = {0};
+        stm_status ps2 = fs_load_parent_dir(iidx, dataset_id, dst_parent_ino, &dpv);
+        if (ps2 != STM_OK) {
+            pthread_mutex_unlock(&fs->lock);
+            return ps2;
+        }
+    }
+
+    /* Resolve src dirent → child_ino. */
+    uint64_t child_ino = 0;
+    uint64_t child_gen = 0;
+    uint8_t  child_type = 0;
+    stm_status ds = stm_dirent_lookup(didx, dataset_id, src_parent_ino,
+                                          src_name, src_name_len,
+                                          &child_ino, &child_gen, &child_type);
+    if (ds != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return ds;     /* STM_ENOENT if src not linked */
+    }
+
+    /* POSIX forbids hard-link-on-directory. */
+    if (child_type == STM_DT_DIR) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_ENOTSUPPORTED;     /* maps to EPERM at the syscall layer */
+    }
+
+    /* Bump nlink first; rollback if dirent install fails. */
+    stm_status ils = stm_inode_link(iidx, dataset_id, child_ino);
+    if (ils != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return ils;
+    }
+    stm_status das = stm_dirent_alloc(didx, dataset_id, dst_parent_ino,
+                                          dst_name, dst_name_len,
+                                          child_ino, child_gen, child_type);
+    if (das != STM_OK) {
+        /* Rollback the nlink bump. The unlink path's cascade-free
+         * doesn't fire here because nlink was just bumped above 1. */
+        bool freed_unused = false;
+        (void)stm_inode_unlink(iidx, dataset_id, child_ino, &freed_unused);
+        pthread_mutex_unlock(&fs->lock);
+        return das;       /* STM_EEXIST if name already linked, etc. */
+    }
+
+    pthread_mutex_unlock(&fs->lock);
+    return STM_OK;
 }
 
 /* P7-16: stm_fs_reflink. POSIX-shape FICLONE — replaces dst's empty
