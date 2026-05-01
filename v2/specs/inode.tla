@@ -54,12 +54,40 @@ CONSTANTS
                                    \*   already-ALLOCATED inos.
                                    \*   Demonstrates allocator
                                    \*   double-issue.
-    BuggyUnlinkLeavesZeroNlink     \* TRUE → Unlink decrements nlink
+    BuggyUnlinkLeavesZeroNlink,    \* TRUE → Unlink decrements nlink
                                    \*   to 0 but leaves ALLOCATED state
                                    \*   (no cascade-free). Demonstrates
                                    \*   the "ALLOCATED+nlink=0" orphan
                                    \*   that R71 P1-1 caught at the
                                    \*   writer-side guard.
+    EnableInlineDataModel,         \* TRUE → enable data_kind /
+                                   \*   data_len / ever_extent shadow
+                                   \*   tracking + the 5 inline-
+                                   \*   specific actions in Next
+                                   \*   (P8-POSIX-5). FALSE → existing
+                                   \*   actions UNCHANGED on these
+                                   \*   vars, so existing configs (e.g.,
+                                   \*   inode.cfg's 9.87M-state run)
+                                   \*   don't explode their state space.
+    MaxFileLen,                    \* bound on file logical size
+                                   \*   (TLC tractability; real impl
+                                   \*    uses uint64_t).
+    MaxInline,                     \* inline-storage cap (≤ MaxFileLen).
+                                   \*   Real impl: STM_INODE_INLINE_MAX
+                                   \*   = 100 bytes (ARCH §11.3.3).
+    BuggyTruncateReinlines,        \* TRUE → TruncateExtent shrinking
+                                   \*   to ≤ MaxInline transitions
+                                   \*   data_kind back to "inline" —
+                                   \*   violates ARCH §11.3.3's one-
+                                   \*   way INLINE → EXTENT semantics
+                                   \*   ("once extent-backed, stays
+                                   \*    extent-backed").
+    BuggyInlineWriteSpills         \* TRUE → WriteInline allows
+                                   \*   data_len > MaxInline without
+                                   \*   transitioning. Demonstrates
+                                   \*   the "data spilled past inline
+                                   \*   cap but kind still claims
+                                   \*   INLINE" corruption shape.
 
 ASSUME /\ Inos # {}
        /\ MaxGen \in Nat /\ MaxGen >= 1
@@ -67,11 +95,25 @@ ASSUME /\ Inos # {}
        /\ BuggyReuseNoGenBump \in BOOLEAN
        /\ BuggyDoubleAllocate \in BOOLEAN
        /\ BuggyUnlinkLeavesZeroNlink \in BOOLEAN
+       /\ EnableInlineDataModel \in BOOLEAN
+       /\ MaxFileLen \in Nat
+       /\ MaxInline \in Nat /\ MaxInline <= MaxFileLen
+       /\ BuggyTruncateReinlines \in BOOLEAN
+       /\ BuggyInlineWriteSpills \in BOOLEAN
 
 \* Inode states.
 NEVER_USED == "never_used"
 ALLOCATED  == "allocated"
 FREED      == "freed"
+
+\* Data-kind tags (P8-POSIX-5). On-disk equivalents live in
+\* `include/stratum/inode.h` as STM_DATA_INLINE / STM_DATA_EXTENT;
+\* "none" is the spec sentinel for NEVER_USED / FREED inos and has
+\* no on-disk encoding (the inode record itself doesn't exist for
+\* NEVER_USED, and is FREED-flagged for FREED).
+KIND_NONE   == "none"
+KIND_INLINE == "inline"
+KIND_EXTENT == "extent"
 
 \* --------------------------------------------------------------------------
 \* State.
@@ -102,9 +144,35 @@ VARIABLES
     nlink,                         \* per-ino hard-link counter
                                    \*   (P8-POSIX-3 extension).
     history,
-    alloc_event_counter
+    alloc_event_counter,
+    data_kind,                     \* per-ino data layout tag
+                                   \*   (P8-POSIX-5): KIND_NONE for
+                                   \*   non-ALLOCATED inos, KIND_INLINE
+                                   \*   for inline-stored data,
+                                   \*   KIND_EXTENT for extent-tree-
+                                   \*   stored data.
+    data_len,                      \* per-ino logical size
+                                   \*   (P8-POSIX-5). For KIND_INLINE
+                                   \*   inos, the bound `data_len <=
+                                   \*   MaxInline` is the load-bearing
+                                   \*   invariant. For KIND_EXTENT the
+                                   \*   spec doesn't track length —
+                                   \*   the extent layer manages that.
+    ever_extent                    \* per-ino BOOLEAN (P8-POSIX-5):
+                                   \*   set TRUE on first
+                                   \*   TransitionToExtent; reset on
+                                   \*   AllocReused / cascade-free.
+                                   \*   Pins the one-way "once EXTENT,
+                                   \*   stays EXTENT until freed"
+                                   \*   property — a buggy
+                                   \*   TruncateExtent that reverts
+                                   \*   to KIND_INLINE while
+                                   \*   ever_extent[i] = TRUE fires
+                                   \*   the OneWayInlineToExtent
+                                   \*   invariant.
 
-vars == <<state, gen, nlink, history, alloc_event_counter>>
+vars == <<state, gen, nlink, history, alloc_event_counter,
+          data_kind, data_len, ever_extent>>
 
 \* --------------------------------------------------------------------------
 \* Initial state — all inos NEVER_USED, all gen=0, empty history.
@@ -116,6 +184,9 @@ Init ==
     /\ nlink               = [i \in Inos |-> 0]
     /\ history             = [i \in Inos |-> {}]
     /\ alloc_event_counter = 0
+    /\ data_kind           = [i \in Inos |-> KIND_NONE]
+    /\ data_len            = [i \in Inos |-> 0]
+    /\ ever_extent         = [i \in Inos |-> FALSE]
 
 \* --------------------------------------------------------------------------
 \* Helpers.
@@ -139,6 +210,10 @@ NeverUsedSet == {i \in Inos : state[i] = NEVER_USED}
 \* dirent that the alloc action models is being created in lockstep).
 \* BuggyDoubleAllocate: also accepts ALLOCATED inos (silent
 \* re-issue of an in-use ino number).
+\*
+\* P8-POSIX-5 (when EnableInlineDataModel=TRUE): a fresh inode starts
+\* in KIND_INLINE with data_len=0; ever_extent=FALSE so the one-way
+\* invariant restarts at every fresh alloc.
 AllocFresh(i) ==
     /\ \/ state[i] = NEVER_USED
        \/ /\ BuggyDoubleAllocate
@@ -151,10 +226,21 @@ AllocFresh(i) ==
     /\ history'             = [history EXCEPT
                                   ![i] = history[i] \cup
                                           {<<0, alloc_event_counter + 1>>}]
+    /\ \/ /\ EnableInlineDataModel
+          /\ data_kind'   = [data_kind EXCEPT ![i] = KIND_INLINE]
+          /\ data_len'    = [data_len EXCEPT ![i] = 0]
+          /\ ever_extent' = [ever_extent EXCEPT ![i] = FALSE]
+       \/ /\ ~EnableInlineDataModel
+          /\ UNCHANGED <<data_kind, data_len, ever_extent>>
 
 \* AllocReused: pick a FREED ino, mark ALLOCATED. Healthy: bump gen.
 \* BuggyReuseNoGenBump: keep prior gen — the canonical (ino, gen)
 \* aliasing bug.
+\*
+\* P8-POSIX-5: same as AllocFresh — a re-allocated inode gets a fresh
+\* data lifecycle (KIND_INLINE, data_len=0, ever_extent=FALSE). The
+\* one-way "once EXTENT, stays EXTENT" property only applies WITHIN
+\* a single allocation; reuse legitimately resets it.
 AllocReused(i) ==
     /\ state[i] = FREED
     /\ LET new_gen ==
@@ -170,6 +256,12 @@ AllocReused(i) ==
                                       ![i] = history[i] \cup
                                               {<<new_gen,
                                                  alloc_event_counter + 1>>}]
+        /\ \/ /\ EnableInlineDataModel
+              /\ data_kind'   = [data_kind EXCEPT ![i] = KIND_INLINE]
+              /\ data_len'    = [data_len EXCEPT ![i] = 0]
+              /\ ever_extent' = [ever_extent EXCEPT ![i] = FALSE]
+           \/ /\ ~EnableInlineDataModel
+              /\ UNCHANGED <<data_kind, data_len, ever_extent>>
 
 \* Link: ALLOCATED ino with nlink in [1, MaxNlink-1] gets nlink + 1.
 \* Models stm_fs_link adding a new dirent that references this ino.
@@ -186,7 +278,8 @@ Link(i) ==
     /\ nlink[i] >= 1
     /\ nlink[i] < MaxNlink
     /\ nlink' = [nlink EXCEPT ![i] = @ + 1]
-    /\ UNCHANGED <<state, gen, history, alloc_event_counter>>
+    /\ UNCHANGED <<state, gen, history, alloc_event_counter,
+                    data_kind, data_len, ever_extent>>
 
 \* Unlink: ALLOCATED ino with nlink >= 1 gets nlink - 1. If healthy
 \* and nlink reaches 0, atomically transitions to FREED (cascade-
@@ -203,7 +296,128 @@ Unlink(i) ==
         /\ state' = IF cascade_free
                     THEN [state EXCEPT ![i] = FREED]
                     ELSE state
+        \* P8-POSIX-5: cascade-free clears data_kind / data_len /
+        \* ever_extent so a subsequent AllocReused starts a fresh
+        \* data lifecycle. Non-cascade Unlinks (nlink decremented but
+        \* still > 0) leave data state alone. With
+        \* EnableInlineDataModel=FALSE, all data state is UNCHANGED
+        \* regardless of cascade.
+        /\ \/ /\ EnableInlineDataModel
+              /\ \/ /\ cascade_free
+                    /\ data_kind'   = [data_kind EXCEPT ![i] = KIND_NONE]
+                    /\ data_len'    = [data_len EXCEPT ![i] = 0]
+                    /\ ever_extent' = [ever_extent EXCEPT ![i] = FALSE]
+                 \/ /\ ~cascade_free
+                    /\ UNCHANGED <<data_kind, data_len, ever_extent>>
+           \/ /\ ~EnableInlineDataModel
+              /\ UNCHANGED <<data_kind, data_len, ever_extent>>
         /\ UNCHANGED <<gen, history, alloc_event_counter>>
+
+\* --------------------------------------------------------------------------
+\* P8-POSIX-5 — inline data layout actions.
+\*
+\* These five actions model the inline ↔ extent-tree transition per
+\* ARCH §11.3.3:
+\*
+\*   - WriteInline:        INLINE → INLINE (data_len grows or shrinks
+\*                         within MaxInline; healthy precond bounds
+\*                         data_len ≤ MaxInline; BuggyInlineWriteSpills
+\*                         drops the bound).
+\*   - TransitionToExtent: INLINE → EXTENT (one-way; sets ever_extent
+\*                         to TRUE so the OneWayInlineToExtent
+\*                         invariant catches any future revert).
+\*   - WriteExtent:        EXTENT → EXTENT (no-op at spec level —
+\*                         the extent layer manages length and
+\*                         layout; the spec only tracks kind).
+\*   - TruncateInline:     INLINE → INLINE (data_len shrinks).
+\*   - TruncateExtent:     EXTENT → EXTENT (healthy: kind preserved
+\*                         even when new_len ≤ MaxInline;
+\*                         BuggyTruncateReinlines reverts to
+\*                         KIND_INLINE — fires
+\*                         OneWayInlineToExtent).
+\*
+\* All five actions are gated by EnableInlineDataModel=TRUE in Next
+\* — when the flag is FALSE, none fire and the spec collapses to
+\* the P8-POSIX-1/3 alloc/link/unlink semantics.
+\* --------------------------------------------------------------------------
+
+\* WriteInline: write `new_len` bytes to an INLINE-state inode.
+\*
+\* Precondition: ALLOCATED + KIND_INLINE.
+\*
+\* Healthy: new_len ≤ MaxInline.
+\* BuggyInlineWriteSpills: new_len > MaxInline allowed — fires
+\* InlineLenBounded.
+WriteInline(i, new_len) ==
+    /\ state[i] = ALLOCATED
+    /\ data_kind[i] = KIND_INLINE
+    /\ new_len \in 0..MaxFileLen
+    /\ \/ /\ ~BuggyInlineWriteSpills
+          /\ new_len <= MaxInline
+       \/ BuggyInlineWriteSpills
+    /\ data_len' = [data_len EXCEPT ![i] = new_len]
+    /\ UNCHANGED <<state, gen, nlink, history, alloc_event_counter,
+                    data_kind, ever_extent>>
+
+\* TransitionToExtent: a write that grows an INLINE inode past
+\* MaxInline triggers the cutover. ARCH §11.3.3 step:
+\*   1. Allocate extent storage.
+\*   2. Write combined (existing inline + new) data to the extent.
+\*   3. Update inode: si_data_kind = STM_DATA_EXTENT,
+\*      si_extent_tree_root = <new extent tree root>.
+\*
+\* The spec abstracts the extent allocation + write — the only
+\* state change relevant here is data_kind: INLINE → EXTENT, and
+\* setting ever_extent[i] := TRUE. data_len is reset to 0 because
+\* the extent layer now manages length.
+TransitionToExtent(i) ==
+    /\ state[i] = ALLOCATED
+    /\ data_kind[i] = KIND_INLINE
+    /\ data_kind'   = [data_kind EXCEPT ![i] = KIND_EXTENT]
+    /\ data_len'    = [data_len EXCEPT ![i] = 0]
+    /\ ever_extent' = [ever_extent EXCEPT ![i] = TRUE]
+    /\ UNCHANGED <<state, gen, nlink, history, alloc_event_counter>>
+
+\* WriteExtent: a write to an already-EXTENT inode is a no-op at
+\* the spec level (the extent layer's invariants are pinned by
+\* extent.tla; this spec only models the kind transition).
+WriteExtent(i) ==
+    /\ state[i] = ALLOCATED
+    /\ data_kind[i] = KIND_EXTENT
+    /\ UNCHANGED vars
+
+\* TruncateInline: truncate an INLINE inode to `new_len`. Shrinks
+\* data_len; kind stays INLINE. (Growing truncate would land in the
+\* WriteInline / TransitionToExtent path depending on size.)
+TruncateInline(i, new_len) ==
+    /\ state[i] = ALLOCATED
+    /\ data_kind[i] = KIND_INLINE
+    /\ new_len \in 0..MaxFileLen
+    /\ new_len <= data_len[i]   \* shrinking
+    /\ data_len' = [data_len EXCEPT ![i] = new_len]
+    /\ UNCHANGED <<state, gen, nlink, history, alloc_event_counter,
+                    data_kind, ever_extent>>
+
+\* TruncateExtent: truncate an EXTENT inode to `new_len`. Per
+\* ARCH §11.3.3: "Once extent-backed, stays extent-backed" — even
+\* when truncating to a size that would have fit inline.
+\*
+\* Healthy: kind STAYS EXTENT regardless of new_len.
+\* BuggyTruncateReinlines: when new_len ≤ MaxInline, kind reverts
+\*   to INLINE. Fires OneWayInlineToExtent (ever_extent[i] is
+\*   still TRUE from the prior TransitionToExtent).
+TruncateExtent(i, new_len) ==
+    /\ state[i] = ALLOCATED
+    /\ data_kind[i] = KIND_EXTENT
+    /\ new_len \in 0..MaxFileLen
+    /\ \/ /\ ~BuggyTruncateReinlines
+          /\ UNCHANGED vars   \* kind preserved; spec doesn't track extent length
+       \/ /\ BuggyTruncateReinlines
+          /\ new_len <= MaxInline
+          /\ data_kind' = [data_kind EXCEPT ![i] = KIND_INLINE]
+          /\ data_len'  = [data_len EXCEPT ![i] = new_len]
+          /\ UNCHANGED <<state, gen, nlink, history, alloc_event_counter,
+                          ever_extent>>   \* ever_extent stays TRUE (the bug)
 
 \* --------------------------------------------------------------------------
 \* Next.
@@ -214,6 +428,12 @@ Next ==
     \/ \E i \in Inos : AllocReused(i)
     \/ \E i \in Inos : Link(i)
     \/ \E i \in Inos : Unlink(i)
+    \/ /\ EnableInlineDataModel
+       /\ \/ \E i \in Inos, n \in 0..MaxFileLen : WriteInline(i, n)
+          \/ \E i \in Inos : TransitionToExtent(i)
+          \/ \E i \in Inos : WriteExtent(i)
+          \/ \E i \in Inos, n \in 0..MaxFileLen : TruncateInline(i, n)
+          \/ \E i \in Inos, n \in 0..MaxFileLen : TruncateExtent(i, n)
 
 Spec == Init /\ [][Next]_vars
 
@@ -228,6 +448,9 @@ TypeOK ==
     /\ nlink \in [Inos -> 0..MaxNlink]
     /\ alloc_event_counter \in Nat
     /\ \A i \in Inos : history[i] \subseteq (0..MaxGen) \X (0..alloc_event_counter)
+    /\ data_kind \in [Inos -> {KIND_NONE, KIND_INLINE, KIND_EXTENT}]
+    /\ data_len \in [Inos -> 0..MaxFileLen]
+    /\ ever_extent \in [Inos -> BOOLEAN]
 
 \* HEADLINE INVARIANT — (ino, gen) uniqueness across all time.
 \*
@@ -306,6 +529,65 @@ FreedHasZeroNlink ==
 \* history entry recording that allocation event.
 \* (Already in the existing invariant set; no new addition needed.)
 
+\* P8-POSIX-5 — data_kind matches state. NEVER_USED / FREED inos
+\* have KIND_NONE; ALLOCATED inos have KIND_INLINE or KIND_EXTENT.
+\* Catches a bug where Free leaves data_kind as INLINE/EXTENT (storage
+\* leak / unreachable-byte loss) or where AllocFresh leaves data_kind
+\* at NONE (decoder later refuses to read the inode's data union).
+\*
+\* Vacuously TRUE when EnableInlineDataModel = FALSE — the flag
+\* gating means existing actions UNCHANGED data_kind (it stays
+\* KIND_NONE for every ino regardless of state), so the post-state
+\* relationship between state and data_kind only carries semantic
+\* weight when the inline tracking is on.
+DataKindMatchesState ==
+    EnableInlineDataModel =>
+        \A i \in Inos :
+            \/ /\ state[i] # ALLOCATED
+               /\ data_kind[i] = KIND_NONE
+            \/ /\ state[i] = ALLOCATED
+               /\ data_kind[i] \in {KIND_INLINE, KIND_EXTENT}
+
+\* P8-POSIX-5 — INLINE bytes fit in MaxInline. The whole point of
+\* inline-data optimization is to keep tiny files in si_inline_data[]
+\* and avoid the extent-tree round-trip; if data_len exceeds MaxInline
+\* while still claiming KIND_INLINE, the storage-vs-claim drift would
+\* corrupt readers (they'd memcpy past si_inline_data's bound).
+\*
+\* BuggyInlineWriteSpills fires this directly.
+\*
+\* When EnableInlineDataModel = FALSE: data_kind is always KIND_NONE
+\* per the flag-gated existing-action UNCHANGED semantics, so the
+\* implication's antecedent is vacuously false everywhere. Still
+\* gated explicitly for clarity.
+InlineLenBounded ==
+    EnableInlineDataModel =>
+        \A i \in Inos :
+            data_kind[i] = KIND_INLINE => data_len[i] <= MaxInline
+
+\* P8-POSIX-5 — once a file has been EXTENT-backed, it stays EXTENT-
+\* backed for the rest of its current allocation. ARCH §11.3.3:
+\* "Reverse direction (truncate from large to tiny): the inode could
+\*  migrate back to inline, but we skip this — truncation to tiny is
+\*  rare, and the code complexity isn't worth it. Once extent-backed,
+\*  stays extent-backed."
+\*
+\* Reset semantics: AllocReused (and AllocFresh of a previously-FREED
+\* ino's slot) clears ever_extent[i] := FALSE — a reuse legitimately
+\* starts a fresh data lifecycle.
+\*
+\* BuggyTruncateReinlines fires this when TruncateExtent reverts to
+\* KIND_INLINE while ever_extent[i] is still TRUE.
+\*
+\* When EnableInlineDataModel = FALSE: ever_extent is always FALSE
+\* per the flag-gated UNCHANGED semantics, so the implication is
+\* vacuously TRUE. Gated explicitly for clarity.
+OneWayInlineToExtent ==
+    EnableInlineDataModel =>
+        \A i \in Inos :
+            (state[i] = ALLOCATED /\ ever_extent[i])
+                => data_kind[i] = KIND_EXTENT
+
 \* --------------------------------------------------------------------------
 \* Bundle.
 \* --------------------------------------------------------------------------
@@ -318,5 +600,8 @@ Invariants ==
     /\ NoTwoAllocatedSameIno
     /\ LinkedAllocatedHasPositiveNlink
     /\ FreedHasZeroNlink
+    /\ DataKindMatchesState
+    /\ InlineLenBounded
+    /\ OneWayInlineToExtent
 
 =============================================================================

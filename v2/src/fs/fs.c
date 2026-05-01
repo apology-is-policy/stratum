@@ -478,13 +478,192 @@ stm_status stm_fs_commit(stm_fs *fs)
  * about to dereference it) and a wedge-state-guard race (a
  * stm_fs_mark_wedged in the released window let the write through).
  * Lock hierarchy fs.lock OUTER → sync.lock INNER (fs.c:25) permits
- * this; matches the existing reserve/free/commit pattern. */
+ * this; matches the existing reserve/free/commit pattern.
+ *
+ * P8-POSIX-5: extended with inline-data dispatch. When the (ds, ino)
+ * names a regular file (S_IFREG) recorded in the inode index, the
+ * write/read path branches on `iv.si_data_kind`:
+ *   - STM_DATA_INLINE + write fits ≤ STM_INODE_INLINE_MAX:
+ *       update si_inline_data + si_data_len + si_size in place.
+ *   - STM_DATA_INLINE + write would grow past inline cap:
+ *       transition to STM_DATA_EXTENT (one-way per inode.tla's
+ *       OneWayInlineToExtent invariant) — flush existing inline
+ *       prefix to the extent layer, then write new bytes through
+ *       the extent layer, then update inode kind.
+ *   - STM_DATA_EXTENT: delegate to stm_sync_write_extent + bump
+ *       si_size if the write grew the file.
+ * Reads invert the dispatch — INLINE reads memcpy from
+ * si_inline_data, EXTENT reads delegate.
+ *
+ * For (ds, ino) tuples NOT in the inode index, OR for inodes with
+ * `si_mode` not S_IFREG (directory / symlink / device / unknown),
+ * the legacy direct-extent path is used. This keeps the older P7-era
+ * tests (which write extent data at hardcoded ino numbers without
+ * allocating an inode first) working.
+ */
+
+/* Update si_size if `end_off` (= write_off + write_len) extends the
+ * file. Returns updated value. Caller persists via stm_inode_set. */
+static void fs_inode_bump_size(struct stm_inode_value *iv, uint64_t end_off)
+{
+    uint64_t cur_size = stm_load_le64(iv->si_size);
+    if (end_off > cur_size) iv->si_size = stm_store_le64(end_off);
+}
+
+/* Inline-aware write for S_IFREG inode `iv` at (ds, ino). On entry:
+ * caller holds fs->lock; iv has already been loaded. On STM_OK
+ * return: inode + extent layer are in sync. */
+static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
+                                                uint64_t ds, uint64_t ino,
+                                                struct stm_inode_value *iv,
+                                                uint64_t off,
+                                                const void *buf, size_t len)
+{
+    uint8_t kind = iv->si_data_kind;
+    uint64_t end_off = off + (uint64_t)len;
+
+    if (kind == STM_DATA_INLINE) {
+        if (end_off <= (uint64_t)STM_INODE_INLINE_MAX) {
+            /* Inline fast path. Zero-fill any gap from current
+             * data_len up to off, then memcpy new bytes. */
+            uint8_t cur_len = iv->si_data_len;
+            if (off > cur_len) {
+                memset(iv->si_data.inline_data + cur_len, 0,
+                       (size_t)(off - cur_len));
+            }
+            if (len > 0u) {
+                memcpy(iv->si_data.inline_data + off, buf, len);
+            }
+            uint8_t new_len = (uint8_t)((end_off > cur_len) ? end_off : cur_len);
+            iv->si_data_len = new_len;
+            fs_inode_bump_size(iv, end_off);
+            return stm_inode_set(iidx, ds, ino, iv);
+        }
+
+        /* Transition: build a single block-aligned combined buffer
+         * (existing inline prefix + user's bytes overlaid + zero pad)
+         * and write it as one stm_sync_write_extent call at offset 0.
+         * This is necessary because the extent layer requires both
+         * `off` and `len` to be 4 KiB aligned (sync.h §1042-1046),
+         * which sub-block user writes typically aren't.
+         *
+         * Constraint: aligned_size must fit in a single
+         * sync_write_extent call (≤ STM_FS_RECORDSIZE_MAX = 8 MiB).
+         * Larger transitions return STM_ERANGE — caller can split
+         * the user write into smaller chunks, the first of which
+         * triggers the transition and subsequent chunks land in the
+         * EXTENT path. */
+        uint64_t cur_size = stm_load_le64(iv->si_size);
+        uint64_t new_size = (end_off > cur_size) ? end_off : cur_size;
+        if (new_size > (uint64_t)STM_FS_RECORDSIZE_MAX) return STM_ERANGE;
+
+        const uint64_t BLK = 4096u;
+        uint64_t aligned_size = (new_size + BLK - 1u) & ~(BLK - 1u);
+        if (aligned_size == 0u) aligned_size = BLK;  /* always at least one block */
+
+        uint8_t *combined = calloc(1, (size_t)aligned_size);
+        if (!combined) return STM_ENOMEM;
+
+        if (iv->si_data_len > 0u) {
+            memcpy(combined, iv->si_data.inline_data, iv->si_data_len);
+        }
+        if (len > 0u) {
+            memcpy(combined + off, buf, len);
+        }
+
+        stm_status fs1 = stm_sync_write_extent(fs->sync, ds, ino,
+                                                    /*off=*/0u,
+                                                    combined,
+                                                    (size_t)aligned_size);
+        free(combined);
+        if (fs1 != STM_OK) return fs1;
+
+        /* Flip kind = EXTENT. The si_size stays at the LOGICAL value
+         * (new_size, not the block-padded aligned_size) so reads past
+         * the logical EOF return 0 bytes, matching POSIX semantics. */
+        iv->si_data_kind = STM_DATA_EXTENT;
+        iv->si_data_len = 0;
+        memset(&iv->si_data, 0, sizeof iv->si_data);
+        iv->si_size = stm_store_le64(new_size);
+        return stm_inode_set(iidx, ds, ino, iv);
+    }
+
+    if (kind == STM_DATA_EXTENT) {
+        /* Pure extent path. */
+        stm_status ws = stm_sync_write_extent(fs->sync, ds, ino, off, buf, len);
+        if (ws != STM_OK) return ws;
+        uint64_t cur_size = stm_load_le64(iv->si_size);
+        if (end_off > cur_size) {
+            iv->si_size = stm_store_le64(end_off);
+            return stm_inode_set(iidx, ds, ino, iv);
+        }
+        return STM_OK;
+    }
+
+    /* SYMLINK / DEVICE / unknown: regular-file write rejected. The
+     * caller (FUSE / 9P binding) maps this to an appropriate POSIX
+     * errno at the syscall boundary. */
+    return STM_ENOTSUPPORTED;
+}
+
+/* Inline-aware read for S_IFREG inode `iv`. */
+static stm_status fs_read_regular_locked(stm_fs *fs,
+                                              uint64_t ds, uint64_t ino,
+                                              const struct stm_inode_value *iv,
+                                              uint64_t off,
+                                              void *buf, size_t len,
+                                              size_t *out_read)
+{
+    uint8_t kind = iv->si_data_kind;
+    if (kind == STM_DATA_INLINE) {
+        uint64_t cur_size = stm_load_le64(iv->si_size);
+        if (off >= cur_size) {
+            if (out_read) *out_read = 0;
+            return STM_OK;
+        }
+        size_t avail = (size_t)(cur_size - off);
+        size_t copy_n = (len < avail) ? len : avail;
+        if (copy_n > 0u) memcpy(buf, iv->si_data.inline_data + off, copy_n);
+        if (out_read) *out_read = copy_n;
+        return STM_OK;
+    }
+    if (kind == STM_DATA_EXTENT) {
+        return stm_sync_read_extent(fs->sync, ds, ino, off, buf, len, out_read);
+    }
+    return STM_ENOTSUPPORTED;
+}
+
 stm_status stm_fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                           uint64_t off, const void *buf, size_t len)
 {
     if (!fs) return STM_EINVAL;
     pthread_mutex_lock(&fs->lock);
     FS_GUARD_WRITE(fs);
+
+    /* Inline-aware dispatch only when (a) inode index is bound, (b)
+     * the (ds, ino) names a real inode in the index, and (c) the
+     * inode is a regular file (S_IFREG). Otherwise fall through to
+     * the legacy direct-extent path so older tests + non-regular-
+     * file writers (e.g., the dataset metadata test seam) keep
+     * working. */
+    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+    if (iidx) {
+        struct stm_inode_value iv = {0};
+        stm_status ls = stm_inode_lookup(iidx, dataset_id, ino, &iv);
+        if (ls == STM_OK) {
+            uint32_t mode = stm_load_le32(iv.si_mode);
+            if ((mode & (uint32_t)S_IFMT) == (uint32_t)S_IFREG) {
+                stm_status rs = fs_write_regular_locked(fs, iidx,
+                                                              dataset_id, ino,
+                                                              &iv, off, buf, len);
+                pthread_mutex_unlock(&fs->lock);
+                return rs;
+            }
+            /* Not a regular file — fall through. */
+        }
+        /* Inode not found — fall through. */
+    }
+
     stm_status s = stm_sync_write_extent(fs->sync, dataset_id, ino, off,
                                             buf, len);
     pthread_mutex_unlock(&fs->lock);
@@ -498,6 +677,24 @@ stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (!fs) return STM_EINVAL;
     pthread_mutex_lock(&fs->lock);
     FS_GUARD_READ(fs);
+
+    /* Same dispatch shape as fs_write. */
+    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+    if (iidx) {
+        struct stm_inode_value iv = {0};
+        stm_status ls = stm_inode_lookup(iidx, dataset_id, ino, &iv);
+        if (ls == STM_OK) {
+            uint32_t mode = stm_load_le32(iv.si_mode);
+            if ((mode & (uint32_t)S_IFMT) == (uint32_t)S_IFREG) {
+                stm_status rs = fs_read_regular_locked(fs, dataset_id, ino,
+                                                            &iv, off, buf, len,
+                                                            out_read);
+                pthread_mutex_unlock(&fs->lock);
+                return rs;
+            }
+        }
+    }
+
     stm_status s = stm_sync_read_extent(fs->sync, dataset_id, ino, off,
                                            buf, len, out_read);
     pthread_mutex_unlock(&fs->lock);

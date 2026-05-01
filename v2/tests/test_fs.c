@@ -8398,4 +8398,314 @@ STM_TEST(fs_p4_readdir_wedged_refused) {
     unlink(g_key_path);
 }
 
+/* ========================================================================= */
+/* P8-POSIX-5: inline data optimization.                                      */
+/* ========================================================================= */
+
+STM_TEST(fs_p5_write_small_stays_inline) {
+    /* Files ≤ STM_INODE_INLINE_MAX (100 bytes) stay inline:
+     *   - si_data_kind == STM_DATA_INLINE
+     *   - si_data_len == bytes written
+     *   - si_size == bytes written
+     *   - si_inline_data carries the bytes
+     * No extent allocation required. */
+    make_tmp("p5_inline_small");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"tiny", 4,
+                                          0644u, 0, 0, &f));
+
+    const uint8_t payload[64] = {
+        'h', 'i', 0, 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k',
+    };
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, /*off=*/0, payload, 64));
+
+    /* Inspect the inode via stm_fs_stat. */
+    struct stm_inode_value iv = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &iv));
+    STM_ASSERT_EQ(iv.si_data_kind, (uint8_t)STM_DATA_INLINE);
+    STM_ASSERT_EQ(iv.si_data_len, (uint8_t)64);
+    STM_ASSERT_EQ(stm_load_le64(iv.si_size), (uint64_t)64);
+    STM_ASSERT_TRUE(memcmp(iv.si_data.inline_data, payload, 64) == 0);
+
+    /* Read it back via fs_read — should hit the inline fast path. */
+    uint8_t out[64] = {0};
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, f, 0, out, 64, &n));
+    STM_ASSERT_EQ(n, (size_t)64);
+    STM_ASSERT_TRUE(memcmp(out, payload, 64) == 0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p5_write_grow_triggers_transition) {
+    /* A write that grows the file past STM_INODE_INLINE_MAX (100 B)
+     * triggers the inline → extent transition. After the transition:
+     *   - si_data_kind == STM_DATA_EXTENT
+     *   - si_size == max(prev_size, end_off) — file's logical size
+     *   - si_data_len == 0 (not used in EXTENT mode)
+     *   - The data is readable via fs_read at any offset.
+     *
+     * The combined-buffer transition path (P8-POSIX-5) handles sub-
+     * block user writes by composing a block-aligned write that
+     * carries inline prefix + user bytes + zero pad. */
+    make_tmp("p5_inline_grow");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"grow", 4,
+                                          0644u, 0, 0, &f));
+
+    /* First, write 50 bytes inline. */
+    uint8_t prefix[50];
+    for (size_t i = 0; i < 50; i++) prefix[i] = (uint8_t)('A' + (i % 26));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, prefix, 50));
+
+    struct stm_inode_value iv = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &iv));
+    STM_ASSERT_EQ(iv.si_data_kind, (uint8_t)STM_DATA_INLINE);
+    STM_ASSERT_EQ(iv.si_data_len, (uint8_t)50);
+
+    /* Now write 200 bytes at offset 50 — total file size 250 > 100,
+     * triggers transition. Sub-block (250 < 4096) so the combined-
+     * buffer path overlays inline prefix + user bytes into a single
+     * block-aligned write. */
+    uint8_t big[200];
+    for (size_t i = 0; i < 200; i++) big[i] = (uint8_t)('a' + (i % 26));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 50, big, 200));
+
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &iv));
+    STM_ASSERT_EQ(iv.si_data_kind, (uint8_t)STM_DATA_EXTENT);
+    STM_ASSERT_EQ(stm_load_le64(iv.si_size), (uint64_t)250);
+
+    /* Read back full file. */
+    uint8_t out[250] = {0};
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, f, 0, out, 250, &n));
+    STM_ASSERT_EQ(n, (size_t)250);
+    STM_ASSERT_TRUE(memcmp(out, prefix, 50) == 0);
+    STM_ASSERT_TRUE(memcmp(out + 50, big, 200) == 0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p5_write_at_offset_zerofills_gap_inline) {
+    /* Write at offset > current data_len within inline cap — gap is
+     * zero-filled. */
+    make_tmp("p5_inline_gap");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"gap", 3,
+                                          0644u, 0, 0, &f));
+
+    /* Write 10 bytes at offset 20. Bytes [0..20) zero-filled. */
+    uint8_t payload[10] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 20, payload, 10));
+
+    struct stm_inode_value iv = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &iv));
+    STM_ASSERT_EQ(iv.si_data_kind, (uint8_t)STM_DATA_INLINE);
+    STM_ASSERT_EQ(iv.si_data_len, (uint8_t)30);
+    STM_ASSERT_EQ(stm_load_le64(iv.si_size), (uint64_t)30);
+    /* Verify the gap is zeros + payload at offset 20. */
+    for (size_t i = 0; i < 20; i++) STM_ASSERT_EQ(iv.si_data.inline_data[i], 0u);
+    STM_ASSERT_TRUE(memcmp(iv.si_data.inline_data + 20, payload, 10) == 0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p5_read_past_eof_returns_zero) {
+    /* Reading past EOF returns 0 bytes, not an error. */
+    make_tmp("p5_inline_past_eof");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"e", 1,
+                                          0644u, 0, 0, &f));
+    /* Empty file. */
+    uint8_t out[16];
+    size_t n = 999;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, f, 0, out, 16, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    /* Write 5 inline; read past EOF returns 0. */
+    uint8_t pf[5] = { 1, 2, 3, 4, 5 };
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, pf, 5));
+    n = 999;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, f, /*off=*/100, out, 16, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+    /* Read partially across EOF: returns up to EOF. */
+    n = 999;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, f, /*off=*/3, out, 16, &n));
+    STM_ASSERT_EQ(n, (size_t)2);  /* Bytes [3..5) = pf[3], pf[4]. */
+    STM_ASSERT_EQ(out[0], (uint8_t)4);
+    STM_ASSERT_EQ(out[1], (uint8_t)5);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p5_overwrite_inline_preserves_si_size) {
+    /* An overwrite that doesn't extend the file shouldn't shrink
+     * si_size. */
+    make_tmp("p5_inline_overw");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"o", 1,
+                                          0644u, 0, 0, &f));
+
+    /* Write 50 bytes. */
+    uint8_t a[50];
+    memset(a, 'A', 50);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, a, 50));
+
+    /* Overwrite first 20 bytes. si_size stays 50. */
+    uint8_t b[20];
+    memset(b, 'B', 20);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, b, 20));
+
+    struct stm_inode_value iv = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &iv));
+    STM_ASSERT_EQ(iv.si_data_kind, (uint8_t)STM_DATA_INLINE);
+    STM_ASSERT_EQ(iv.si_data_len, (uint8_t)50);
+    STM_ASSERT_EQ(stm_load_le64(iv.si_size), (uint64_t)50);
+    /* Verify content. */
+    for (size_t i = 0; i < 20; i++) STM_ASSERT_EQ(iv.si_data.inline_data[i], (uint8_t)'B');
+    for (size_t i = 20; i < 50; i++) STM_ASSERT_EQ(iv.si_data.inline_data[i], (uint8_t)'A');
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p5_legacy_path_for_dir_ino_preserved) {
+    /* The legacy direct-extent path for non-S_IFREG inodes is
+     * preserved — older tests writing to ino=root (S_IFDIR) succeed
+     * via the extent layer without inline transitions. The inode's
+     * data_kind is unchanged. */
+    make_tmp("p5_legacy_dir");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    /* Inspect root inode pre-write. */
+    struct stm_inode_value iv0 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, root, &iv0));
+    uint8_t pre_kind = iv0.si_data_kind;
+
+    /* Write 4 KiB to root dir's extent (legacy path; bypasses
+     * S_IFREG dispatch since root is S_IFDIR). */
+    uint8_t buf[4096];
+    memset(buf, 0xAB, sizeof buf);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, root, 0, buf, 4096));
+
+    /* Inode kind unchanged — the legacy path doesn't touch the
+     * inode record. */
+    struct stm_inode_value iv1 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, root, &iv1));
+    STM_ASSERT_EQ(iv1.si_data_kind, pre_kind);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p5_write_extent_path_bumps_si_size) {
+    /* Files already in EXTENT mode (post-transition) have si_size
+     * correctly updated on subsequent writes. EXTENT-mode writes go
+     * through the existing sync_write_extent path which requires
+     * 4 KiB alignment for both `off` and `len`. */
+    make_tmp("p5_extent_bump");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"x", 1,
+                                          0644u, 0, 0, &f));
+
+    /* Force transition by writing one 4 KiB block at offset 0. */
+    uint8_t blk[4096];
+    memset(blk, 'X', sizeof blk);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, blk, 4096));
+
+    struct stm_inode_value iv = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &iv));
+    STM_ASSERT_EQ(iv.si_data_kind, (uint8_t)STM_DATA_EXTENT);
+    STM_ASSERT_EQ(stm_load_le64(iv.si_size), (uint64_t)4096);
+
+    /* Append another aligned 4 KiB — si_size grows. */
+    uint8_t blk2[4096];
+    memset(blk2, 'Y', sizeof blk2);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 4096, blk2, 4096));
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &iv));
+    STM_ASSERT_EQ(stm_load_le64(iv.si_size), (uint64_t)8192);
+
+    /* Overwrite first block — si_size unchanged. */
+    uint8_t blk3[4096];
+    memset(blk3, 'Z', sizeof blk3);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, blk3, 4096));
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &iv));
+    STM_ASSERT_EQ(stm_load_le64(iv.si_size), (uint64_t)8192);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")
