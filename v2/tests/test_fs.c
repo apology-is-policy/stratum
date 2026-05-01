@@ -8836,4 +8836,289 @@ STM_TEST(fs_p5_r76_p3_4_transition_with_empty_inline) {
     unlink(g_key_path);
 }
 
+/* ========================================================================= */
+/* P8-POSIX-8: symlinks.                                                      */
+/* ========================================================================= */
+
+STM_TEST(fs_p8_symlink_create_and_readlink_roundtrip) {
+    /* Create a symlink, read it back, verify target. */
+    make_tmp("p8_symlink_basic");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    const uint8_t target[] = "/etc/passwd";
+    uint16_t target_len = (uint16_t)(sizeof target - 1u);
+    uint64_t link_ino = 0;
+    STM_ASSERT_OK(stm_fs_symlink(fs, 1, root,
+                                       (const uint8_t *)"link", 4,
+                                       target, target_len,
+                                       1000u, 1000u, &link_ino));
+    STM_ASSERT(link_ino != 0);
+
+    /* Verify inode kind + mode + data. */
+    struct stm_inode_value iv = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, link_ino, &iv));
+    STM_ASSERT_EQ(iv.si_data_kind, (uint8_t)STM_DATA_SYMLINK);
+    STM_ASSERT_EQ(iv.si_data_len, (uint8_t)target_len);
+    STM_ASSERT_EQ(stm_load_le32(iv.si_mode) & (uint32_t)S_IFMT,
+                   (uint32_t)S_IFLNK);
+    STM_ASSERT_EQ(stm_load_le64(iv.si_size), (uint64_t)target_len);
+    STM_ASSERT_TRUE(memcmp(iv.si_data.symlink_target, target, target_len) == 0);
+
+    /* readlink reads back the target. */
+    uint8_t buf[256];
+    size_t len = 0;
+    STM_ASSERT_OK(stm_fs_readlink(fs, 1, link_ino, buf, sizeof buf, &len));
+    STM_ASSERT_EQ(len, (size_t)target_len);
+    STM_ASSERT_TRUE(memcmp(buf, target, target_len) == 0);
+
+    /* Verify dirent: lookup via name returns the symlink ino. */
+    uint64_t found = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root,
+                                       (const uint8_t *)"link", 4, &found));
+    STM_ASSERT_EQ(found, link_ino);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p8_symlink_target_too_long_refused) {
+    /* Targets > STM_INODE_INLINE_MAX (100 B) refused with
+     * STM_ENAMETOOLONG (long-symlink extent storage deferred). */
+    make_tmp("p8_symlink_too_long");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    /* 101-byte target exceeds the inline cap. */
+    uint8_t big_target[101];
+    memset(big_target, 'A', sizeof big_target);
+    uint64_t link_ino = 0;
+    STM_ASSERT_ERR(stm_fs_symlink(fs, 1, root,
+                                        (const uint8_t *)"l", 1,
+                                        big_target, 101u,
+                                        0u, 0u, &link_ino),
+                   STM_ENAMETOOLONG);
+    STM_ASSERT_EQ(link_ino, 0u);
+
+    /* Exactly 100 bytes works. */
+    uint8_t exactly_max[100];
+    memset(exactly_max, 'B', sizeof exactly_max);
+    STM_ASSERT_OK(stm_fs_symlink(fs, 1, root,
+                                       (const uint8_t *)"m", 1,
+                                       exactly_max, 100u,
+                                       0u, 0u, &link_ino));
+    STM_ASSERT(link_ino != 0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p8_symlink_arg_validation) {
+    make_tmp("p8_symlink_argv");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t out = 0;
+    const uint8_t target[] = "x";
+
+    STM_ASSERT_ERR(stm_fs_symlink(NULL, 1, root, (const uint8_t *)"a", 1,
+                                        target, 1, 0, 0, &out),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_symlink(fs, 0, root, (const uint8_t *)"a", 1,
+                                        target, 1, 0, 0, &out),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_symlink(fs, 1, 0, (const uint8_t *)"a", 1,
+                                        target, 1, 0, 0, &out),
+                   STM_EINVAL);
+    /* NULL name. */
+    STM_ASSERT_ERR(stm_fs_symlink(fs, 1, root, NULL, 1, target, 1, 0, 0, &out),
+                   STM_EINVAL);
+    /* name_len 0. */
+    STM_ASSERT_ERR(stm_fs_symlink(fs, 1, root, (const uint8_t *)"a", 0,
+                                        target, 1, 0, 0, &out),
+                   STM_EINVAL);
+    /* NULL target. */
+    STM_ASSERT_ERR(stm_fs_symlink(fs, 1, root, (const uint8_t *)"a", 1,
+                                        NULL, 1, 0, 0, &out),
+                   STM_EINVAL);
+    /* target_len 0. */
+    STM_ASSERT_ERR(stm_fs_symlink(fs, 1, root, (const uint8_t *)"a", 1,
+                                        target, 0, 0, 0, &out),
+                   STM_EINVAL);
+    /* target with NUL byte. */
+    const uint8_t bad_target[] = { 'x', 0, 'y' };
+    STM_ASSERT_ERR(stm_fs_symlink(fs, 1, root, (const uint8_t *)"a", 1,
+                                        bad_target, 3, 0, 0, &out),
+                   STM_EINVAL);
+    /* NULL out_child_ino. */
+    STM_ASSERT_ERR(stm_fs_symlink(fs, 1, root, (const uint8_t *)"a", 1,
+                                        target, 1, 0, 0, NULL),
+                   STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p8_readlink_arg_validation) {
+    make_tmp("p8_readlink_argv");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint8_t buf[16];
+    size_t len = 999;
+
+    STM_ASSERT_ERR(stm_fs_readlink(NULL, 1, root, buf, 16, &len), STM_EINVAL);
+    STM_ASSERT_EQ(len, (size_t)0);
+
+    len = 999;
+    STM_ASSERT_ERR(stm_fs_readlink(fs, 0, root, buf, 16, &len), STM_EINVAL);
+    STM_ASSERT_EQ(len, (size_t)0);
+
+    len = 999;
+    STM_ASSERT_ERR(stm_fs_readlink(fs, 1, 0, buf, 16, &len), STM_EINVAL);
+    STM_ASSERT_EQ(len, (size_t)0);
+
+    /* NULL target_buf. */
+    len = 999;
+    STM_ASSERT_ERR(stm_fs_readlink(fs, 1, root, NULL, 16, &len), STM_EINVAL);
+    STM_ASSERT_EQ(len, (size_t)0);
+
+    /* target_max == 0. */
+    len = 999;
+    STM_ASSERT_ERR(stm_fs_readlink(fs, 1, root, buf, 0, &len), STM_EINVAL);
+    STM_ASSERT_EQ(len, (size_t)0);
+
+    /* NULL out_len. */
+    STM_ASSERT_ERR(stm_fs_readlink(fs, 1, root, buf, 16, NULL), STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p8_readlink_on_directory_einval) {
+    /* readlink on a directory inode → STM_EINVAL (POSIX). */
+    make_tmp("p8_readlink_dir");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint8_t buf[16];
+    size_t len = 0;
+    STM_ASSERT_ERR(stm_fs_readlink(fs, 1, root, buf, 16, &len), STM_EINVAL);
+
+    /* Same for regular files. */
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root,
+                                          (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+    STM_ASSERT_ERR(stm_fs_readlink(fs, 1, f, buf, 16, &len), STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p8_readlink_truncating_buffer_returns_full_len) {
+    /* readlink with a buffer smaller than the target: copies what
+     * fits, returns full target length via *out_len so the caller
+     * can re-call with a larger buffer. */
+    make_tmp("p8_readlink_trunc");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    const uint8_t target[] = "/path/that/is/longer/than/buffer";
+    uint16_t target_len = (uint16_t)(sizeof target - 1u);
+    uint64_t link_ino = 0;
+    STM_ASSERT_OK(stm_fs_symlink(fs, 1, root,
+                                       (const uint8_t *)"l", 1,
+                                       target, target_len,
+                                       0, 0, &link_ino));
+
+    uint8_t small_buf[8] = {0};
+    size_t len = 0;
+    STM_ASSERT_OK(stm_fs_readlink(fs, 1, link_ino, small_buf, 8, &len));
+    STM_ASSERT_EQ(len, (size_t)target_len);   /* full length reported */
+    STM_ASSERT_TRUE(memcmp(small_buf, target, 8) == 0);   /* prefix copied */
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p8_symlink_unlink_frees_inode) {
+    /* Unlink a symlink: dirent removed, inode goes through cascade-
+     * free (per P8-POSIX-3 nlink semantics). */
+    make_tmp("p8_symlink_unlink");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    const uint8_t target[] = "x";
+    uint64_t link_ino = 0;
+    STM_ASSERT_OK(stm_fs_symlink(fs, 1, root,
+                                       (const uint8_t *)"l", 1,
+                                       target, 1, 0, 0, &link_ino));
+
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, root, (const uint8_t *)"l", 1));
+
+    /* Lookup is ENOENT. */
+    uint64_t found = 0;
+    STM_ASSERT_ERR(stm_fs_lookup(fs, 1, root,
+                                       (const uint8_t *)"l", 1, &found),
+                   STM_ENOENT);
+    /* readlink on the freed inode is ENOENT. */
+    uint8_t buf[16];
+    size_t len = 0;
+    STM_ASSERT_ERR(stm_fs_readlink(fs, 1, link_ino, buf, 16, &len),
+                   STM_ENOENT);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")

@@ -1308,6 +1308,152 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
 }
 
 /* ========================================================================= */
+/* P8-POSIX-8: symlinks.                                                      */
+/* ========================================================================= */
+
+stm_status stm_fs_symlink(stm_fs *fs, uint64_t dataset_id,
+                              uint64_t parent_ino,
+                              const uint8_t *name, uint8_t name_len,
+                              const uint8_t *target, uint16_t target_len,
+                              uint32_t uid, uint32_t gid,
+                              uint64_t *out_child_ino)
+{
+    if (!fs || !out_child_ino) return STM_EINVAL;
+    if (dataset_id == 0u || parent_ino == 0u) return STM_EINVAL;
+    stm_status nv = fs_validate_dirent_name(name, name_len);
+    if (nv != STM_OK) return nv;
+
+    /* Validate target. Empty targets rejected per Linux symlink(2)
+     * semantics ("symlink: target must be a non-empty string"). */
+    if (!target) return STM_EINVAL;
+    if (target_len == 0u) return STM_EINVAL;
+    if (target_len > (uint16_t)STM_INODE_INLINE_MAX) return STM_ENAMETOOLONG;
+    /* No NUL byte — symlink targets are paths (C-string-shaped); a
+     * mid-string NUL would prematurely terminate them on read. */
+    for (uint16_t i = 0; i < target_len; i++) {
+        if (target[i] == 0u) return STM_EINVAL;
+    }
+
+    *out_child_ino = 0;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+
+    stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
+    stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
+    if (!iidx || !didx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;
+    }
+
+    struct stm_inode_value pv = {0};
+    stm_status ps = fs_load_parent_dir(iidx, dataset_id, parent_ino, &pv);
+    if (ps != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return ps;
+    }
+
+    /* Allocate inode with mode = S_IFLNK | 0777 (POSIX convention —
+     * symlink permission bits unused by the kernel; the resolved
+     * target's perms gate access). */
+    uint32_t full_mode = (uint32_t)S_IFLNK | 0777u;
+    uint64_t child_ino = 0;
+    stm_status as = stm_inode_alloc(iidx, dataset_id, full_mode, uid, gid,
+                                       &child_ino);
+    if (as != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return as;
+    }
+
+    /* Stamp the symlink target into the inode's data union. The
+     * allocator left si_data_kind=STM_DATA_INLINE + si_data_len=0;
+     * we override to SYMLINK + target_len + bytes. */
+    struct stm_inode_value cv = {0};
+    stm_status cs = stm_inode_lookup(iidx, dataset_id, child_ino, &cv);
+    if (cs != STM_OK) {
+        (void)stm_inode_free(iidx, dataset_id, child_ino);
+        pthread_mutex_unlock(&fs->lock);
+        return cs;
+    }
+    cv.si_data_kind = STM_DATA_SYMLINK;
+    cv.si_data_len  = (uint8_t)target_len;
+    memset(&cv.si_data, 0, sizeof cv.si_data);
+    memcpy(cv.si_data.symlink_target, target, (size_t)target_len);
+    cv.si_size = stm_store_le64((uint64_t)target_len);
+    stm_status sse = stm_inode_set(iidx, dataset_id, child_ino, &cv);
+    if (sse != STM_OK) {
+        (void)stm_inode_free(iidx, dataset_id, child_ino);
+        pthread_mutex_unlock(&fs->lock);
+        return sse;
+    }
+
+    uint64_t child_gen = stm_load_le64(cv.si_gen);
+
+    /* Link in parent. Roll back on failure. */
+    stm_status ds = stm_dirent_alloc(didx, dataset_id, parent_ino,
+                                          name, name_len,
+                                          child_ino, child_gen, STM_DT_LNK);
+    if (ds != STM_OK) {
+        (void)stm_inode_free(iidx, dataset_id, child_ino);
+        pthread_mutex_unlock(&fs->lock);
+        return ds;
+    }
+
+    *out_child_ino = child_ino;
+    pthread_mutex_unlock(&fs->lock);
+    return STM_OK;
+}
+
+stm_status stm_fs_readlink(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                              uint8_t *target_buf, size_t target_max,
+                              size_t *out_len)
+{
+    /* Uniform out-param contract (R57 P3-5 / R58 P3-1): zero-init
+     * BEFORE arg validation. */
+    if (out_len) *out_len = 0;
+
+    if (!fs || !target_buf || !out_len) return STM_EINVAL;
+    if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+    if (target_max == 0u) return STM_EINVAL;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_READ(fs);
+
+    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+    if (!iidx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;
+    }
+
+    struct stm_inode_value iv = {0};
+    stm_status ls = stm_inode_lookup(iidx, dataset_id, ino, &iv);
+    if (ls != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return ls;       /* STM_ENOENT */
+    }
+
+    uint32_t mode = stm_load_le32(iv.si_mode);
+    if ((mode & (uint32_t)S_IFMT) != (uint32_t)S_IFLNK) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;       /* POSIX EINVAL on non-symlink readlink */
+    }
+    if (iv.si_data_kind != STM_DATA_SYMLINK) {
+        /* Decoder-vs-mode mismatch: the inode says S_IFLNK but the
+         * data union doesn't carry SYMLINK bytes. Treat as corrupt. */
+        pthread_mutex_unlock(&fs->lock);
+        return STM_ECORRUPT;
+    }
+
+    size_t actual_len = (size_t)iv.si_data_len;
+    size_t copy_n = (target_max < actual_len) ? target_max : actual_len;
+    if (copy_n > 0u) memcpy(target_buf, iv.si_data.symlink_target, copy_n);
+    *out_len = actual_len;       /* full length, even if truncated */
+
+    pthread_mutex_unlock(&fs->lock);
+    return STM_OK;
+}
+
+/* ========================================================================= */
 /* P8-POSIX-4: stm_fs_readdir.                                                */
 /* ========================================================================= */
 

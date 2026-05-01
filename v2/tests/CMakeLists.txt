@@ -82,3 +82,9 @@ stm_add_test(test_dirent     test_dirent.c)
 # 300 s to give comfortable headroom; the underlying test work hasn't
 # regressed in correctness, just runtime under instrumentation.
 set_tests_properties(test_crash_inject PROPERTIES TIMEOUT 300)
+
+# test_fs has grown past 200 tests through Phase 8 (each test format/
+# mounts/unmounts which is ~150ms wall under -j2 with ASan/TSan); the
+# full suite takes ~40s wall on a quiet machine and longer under
+# parallel pressure. Bump to 180s to leave headroom.
+set_tests_properties(test_fs PROPERTIES TIMEOUT 180)

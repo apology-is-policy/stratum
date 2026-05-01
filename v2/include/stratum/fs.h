@@ -446,6 +446,77 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
                           const uint8_t *dst_name, uint8_t dst_name_len);
 
 /* ========================================================================= */
+/* P8-POSIX-8: symlinks.                                                      */
+/* ========================================================================= */
+
+/*
+ * Create a symbolic link `name` in directory `parent_ino` pointing at
+ * `target`. The new symlink's inode number is returned via
+ * `out_child_ino`.
+ *
+ * MVP scope (P8-POSIX-8): inline-only targets, ≤ STM_INODE_INLINE_MAX
+ * (100 bytes). Targets longer than that are refused with
+ * STM_ENAMETOOLONG. Long-symlink (extent-backed) support deferred to
+ * a follow-up chunk that composes with P8-POSIX-5's inline → extent
+ * transition path.
+ *
+ * The symlink inode's `si_mode` is set to `S_IFLNK | 0777` per POSIX
+ * convention (symlink permission bits are unused by the kernel — the
+ * resolved target's permission bits gate access). `si_data_kind` is
+ * STM_DATA_SYMLINK; `si_data_len` is `target_len`; `si_data.symlink_target`
+ * holds `target_len` bytes of the target path.
+ *
+ * Atomicity: alloc inode → link in parent dirent. On link failure the
+ * inode is freed before returning. POSIX `symlink(2)` returns EEXIST
+ * if `name` already exists; we map the dirent layer's STM_EEXIST.
+ *
+ * Refusals:
+ *   - any name validation failure (STM_EINVAL).
+ *   - target == NULL OR target_len == 0 (STM_EINVAL — empty symlink
+ *     not allowed, matches Linux behavior).
+ *   - target_len > STM_INODE_INLINE_MAX (STM_ENAMETOOLONG).
+ *   - target contains NUL byte (STM_EINVAL — symlink targets are
+ *     C strings; NUL would terminate them prematurely on read).
+ *   - parent not a directory (STM_ENOTDIR).
+ *   - name already linked in parent (STM_EEXIST).
+ *   - inode-allocator out of slots (STM_ENOSPC).
+ *   - dirent chain exhausted (STM_ENOSPC).
+ *   - fs read-only or wedged (STM_EROFS / STM_EWEDGED).
+ */
+STM_MUST_USE
+stm_status stm_fs_symlink(stm_fs *fs, uint64_t dataset_id,
+                              uint64_t parent_ino,
+                              const uint8_t *name, uint8_t name_len,
+                              const uint8_t *target, uint16_t target_len,
+                              uint32_t uid, uint32_t gid,
+                              uint64_t *out_child_ino);
+
+/*
+ * Read the target string of symlink `ino` into `target_buf`. Up to
+ * `target_max` bytes are copied; the actual target length is
+ * returned via `*out_len` (which may be > `target_max` if the
+ * caller's buffer was too small — caller can re-call with a larger
+ * buffer). The target is NOT NUL-terminated by this API; the
+ * caller must use `*out_len` to size the result.
+ *
+ * POSIX `readlink(2)` returns a count, never a NUL-terminated string;
+ * this API matches that semantic (`*out_len` is the count).
+ *
+ * Refusals:
+ *   - NULL fs OR NULL target_buf OR NULL out_len (STM_EINVAL).
+ *   - dataset_id == 0 OR ino == 0 (STM_EINVAL).
+ *   - target_max == 0 (STM_EINVAL).
+ *   - inode not present OR FREED (STM_ENOENT).
+ *   - inode is not a symlink (STM_EINVAL — POSIX `EINVAL` for
+ *     non-symlink readlink targets).
+ *   - fs wedged (STM_EWEDGED). RO mounts allowed.
+ */
+STM_MUST_USE
+stm_status stm_fs_readlink(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                              uint8_t *target_buf, size_t target_max,
+                              size_t *out_len);
+
+/* ========================================================================= */
 /* P8-POSIX-4: readdir.                                                       */
 /* ========================================================================= */
 

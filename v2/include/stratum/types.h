@@ -95,6 +95,7 @@ typedef enum {
     STM_ENOTDIR         =  -20,   /* entry isn't a directory but should be */
     STM_EISDIR          =  -21,   /* entry is a directory but shouldn't be */
     STM_ENOTEMPTY       =  -39,   /* directory non-empty                   */
+    STM_ENAMETOOLONG    =  -36,   /* path / symlink target / name exceeds bound */
 } stm_status;
 
 const char *stm_strerror(stm_status s);
