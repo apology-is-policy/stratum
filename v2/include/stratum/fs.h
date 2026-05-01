@@ -415,17 +415,25 @@ stm_status stm_fs_utimens(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 /*
  * Add a hard link: a new dirent at `(dst_parent_ino, dst_name)`
  * pointing at the SAME inode as `(src_parent_ino, src_name)`. The
- * inode's `si_nlink` is incremented (per inode.tla::Link). Both
- * (src, dst) MUST be in the SAME `dataset_id` per ARCH §11.1
- * ("Hard links same-dataset only"). Cross-dataset link returns
- * STM_EXDEV (call stm_fs_reflink for cross-dataset content sharing).
+ * inode's `si_nlink` is incremented (per inode.tla::Link).
+ *
+ * Same-dataset is structural at the API level: the single
+ * `dataset_id` parameter applies to both (src, dst), so cross-
+ * dataset hardlinks are not expressible via this API per ARCH §11.1
+ * ("Hard links same-dataset only"). For cross-dataset content
+ * sharing (when keys are compatible), use `stm_fs_reflink`.
+ * (R74 P3-1: a hypothetical future `stm_fs_link_xds` taking
+ * separate src+dst dataset ids would refuse cross-dataset with
+ * STM_EXDEV; this API does not need that error path because the
+ * single-`dataset_id` signature precludes the case.)
  *
  * Refusals:
  *   - any name validation refusal (STM_EINVAL).
  *   - src not found OR dst already exists (STM_ENOENT / STM_EEXIST).
- *   - src is a directory (STM_EPERM — POSIX forbids hardlinks-on-dirs).
+ *   - src is a directory (STM_ENOTSUPPORTED — POSIX forbids
+ *     hardlinks-on-dirs; maps to EPERM at the 9P/FUSE syscall
+ *     binding layer). [R74 P3-2: docstring updated to match impl.]
  *   - parent_inos not directories (STM_ENOTDIR).
- *   - cross-dataset (STM_EXDEV).
  *   - nlink at UINT32_MAX (STM_EOVERFLOW).
  *   - fs wedged or read-only (STM_EWEDGED / STM_EROFS).
  */

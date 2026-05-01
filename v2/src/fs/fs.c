@@ -1030,10 +1030,13 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
         return ds;     /* STM_ENOENT if src not linked */
     }
 
-    /* POSIX forbids hard-link-on-directory. */
+    /* POSIX forbids hard-link-on-directory. STM_ENOTSUPPORTED maps to
+     * EPERM at the 9P/FUSE syscall-binding layer (R74 P3-2: types.h
+     * does not currently define STM_EPERM; STM_ENOTSUPPORTED is the
+     * closest existing code). */
     if (child_type == STM_DT_DIR) {
         pthread_mutex_unlock(&fs->lock);
-        return STM_ENOTSUPPORTED;     /* maps to EPERM at the syscall layer */
+        return STM_ENOTSUPPORTED;
     }
 
     /* Bump nlink first; rollback if dirent install fails. */
@@ -1047,7 +1050,16 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
                                           child_ino, child_gen, child_type);
     if (das != STM_OK) {
         /* Rollback the nlink bump. The unlink path's cascade-free
-         * doesn't fire here because nlink was just bumped above 1. */
+         * doesn't fire here because nlink was just bumped above 1.
+         * R74 P3-3 forward-note: the rollback's `(void)`-cast on
+         * stm_inode_unlink could theoretically swallow a STM_ECORRUPT
+         * (nlink underflow). Under fs->lock held throughout, the
+         * rollback can't actually fail — child_ino was just looked
+         * up + linked above, so it's still ALLOCATED with nlink ≥ 2.
+         * If the unreachable failure ever triggers, future-us should
+         * stm_fs_mark_wedged the volume, since it indicates load-
+         * bearing-invariant corruption (LinkedAllocatedHasPositiveNlink
+         * from inode.tla). */
         bool freed_unused = false;
         (void)stm_inode_unlink(iidx, dataset_id, child_ino, &freed_unused);
         pthread_mutex_unlock(&fs->lock);
