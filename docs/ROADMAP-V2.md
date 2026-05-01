@@ -806,9 +806,57 @@ ARCHITECTURE §11 specifies the on-disk shape; this phase implements it. Phase 7
   - Stable public ABI.
   - Sync + async variants of all 9P ops.
 - **Language bindings**:
-  - Rust crate `stratum-fs`.
+  - Rust crate `stratum-fs`. Generated via `bindgen` over
+    `include/stratum/*.h`; `build.rs` invokes cmake to build
+    `libstratum.a` (the existing aggregate static lib) and links
+    statically. This is the Rust crate that the no-daemon TUI
+    (next bullet) consumes; same crate also serves as the public
+    Rust API for downstream Rust applications.
   - Go package.
   - Python module.
+- **Stratum-TUI v2** (`stratum-tui/`, single-binary, no-daemon):
+  - **Architecture**: portable static-linked binary. The full
+    stratum-v2 library (`libstratum.a`) is linked directly into
+    the Rust executable via the `stratum-fs` crate's FFI. NO
+    daemon, NO 9P / FUSE round-trip. The TUI process opens the
+    volume file, calls `stm_fs_mount` in-process, drives all ops
+    via direct C function calls, and `stm_fs_unmount`s on exit.
+    Compare v1's TUI which talked over 9P to a separate
+    `stratum-daemon`.
+  - **Why this matters**: gives stratum-v2 immediate practical
+    value as a portable encryptor — same use-case as VeraCrypt /
+    cryptsetup (mount an encrypted volume file, browse + edit,
+    unmount) but with a much lighter UX (single 5–10 MiB binary,
+    no kernel module / FUSE setup / privilege escalation) AND a
+    fully-featured COW filesystem underneath (snapshots, dedup,
+    PQ encryption, content-defined chunking) where competitors
+    expose a flat block device.
+  - **Feature parity with v1 TUI** (see `tui/`): dual-pane file
+    manager (host-fs panel + stratum-fs panel side-by-side);
+    encrypted volume create dialog (passphrase + compression
+    algo: lz4 / zstd / none / **+ PQ-hybrid wrap as the v2
+    default**); volume open with passphrase; copy / delete with
+    conflict resolution (skip / overwrite / keep-both); snapshot
+    create / list / delete; built-in text editor for files; tab-
+    based navigation; keyboard-only operation.
+  - **v2-specific additions** beyond v1 parity:
+    - Per-dataset properties UI (compression, dedup, tiering,
+      casesensitivity, recordsize) — exposes the
+      `stm_fs_*_dataset_property` API.
+    - Snapshot send / recv between volumes (uses
+      `stm_sync_send_*` / `_recv_*` directly; no network needed).
+    - Reflink-aware copy (FICLONE-equivalent within a volume —
+      `stm_fs_reflink`).
+    - Dedup statistics view (CAS index counts + storage savings).
+    - On-demand Merkle integrity verification
+      (`stm_fs_verify_merkle_chain` from Phase 8.5) — distinct
+      from scrub's data-integrity scan; proves tamper-detection.
+    - NFS-style file-handle export (use the `(ds, ino, si_gen)`
+      tuple from `stm_fs_stat` / `name_to_handle_at` per
+      P8-POSIX-7).
+  - **Distribution**: single portable binary per OS/arch
+    (linux-x86_64, linux-arm64, macos-arm64). No installer
+    required; `chmod +x` and run.
 - **TLA+ spec**: `namespace.tla` (landed early as P8-NS-1 spec scaffold during the Phase 7 → Phase 8 transition under the prior 10-phase numbering — chunk identifier sticks for continuity even as POSIX surface became the new Phase 8).
 - **Tests**:
   - End-to-end: mount via FUSE, standard POSIX ops work.
@@ -821,12 +869,14 @@ ARCHITECTURE §11 specifies the on-disk shape; this phase implements it. Phase 7
 - [ ] Multiple concurrent 9P connections with different namespaces work correctly.
 - [ ] CLI covers all admin operations via /ctl/.
 - [ ] libstratum-9p + Rust / Go / Python bindings pass smoke tests.
+- [ ] **Stratum-TUI v2** ships as a portable static-linked single binary on linux-x86_64 / linux-arm64 / macos-arm64. Feature-parity-or-better with v1 TUI: encrypted volume create + open, dual-pane file manager, copy / delete / conflict resolution, snapshot create / list / delete, built-in editor — PLUS v2-specific surface: per-dataset properties, snapshot send/recv, reflink-aware copy, dedup stats, on-demand Merkle verify (`stm_fs_verify_merkle_chain` from Phase 8.5), NFS-style file-handle export. NO daemon — `libstratum.a` linked directly into the Rust executable via the `stratum-fs` crate's FFI. Binary size ≤ 15 MiB stripped. Smoke test: create encrypted volume → mount in-process → create file → snapshot → unmount → reopen → snapshot still there → roundtrip clean.
 - [x] `namespace.tla` proves cross-connection isolation. **Spec-level MET at P8-NS-1 (commit `bea7f82`)** — landed early during the renumbering. Implementation validation pending the P9-NS-2 9P-impl chunk that composes against the spec.
 
 ### 12.3 Risks
 
 - **Low**: 9P2000.L is well-understood; our extensions are straightforward.
 - **Medium**: FUSE shim performance tuning.
+- **Low**: Stratum-TUI v2 in-process FFI integration. Static-linking C libs into Rust binaries is well-trodden (rocksdb-rs, libsodium-sys, openssl-sys are precedents). The aggregate `libstratum.a` already builds; the Rust side wires up via `bindgen` + `build.rs` calling cmake. Cross-platform binary distribution (linux-{x86_64,arm64} + macos-arm64) is standard `cargo build --release` + `strip`. Risk is the v1 TUI's `tui/` codebase (~4700 LOC of Ratatui UI) needing rewrite of the data layer from 9P-client to direct-FFI calls — mechanical translation, no new design problems.
 
 ### 12.4 Dependencies
 
