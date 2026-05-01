@@ -28,6 +28,9 @@ const char *stm_strerror(stm_status s)
     case STM_EPROTOCOL:      return "protocol violation";
     case STM_EBACKEND:       return "backend error";
     case STM_EQUORUM:        return "quorum not reached";
+    case STM_ENOTDIR:        return "not a directory";
+    case STM_EISDIR:         return "is a directory";
+    case STM_ENOTEMPTY:      return "directory not empty";
     }
     return "unknown error";
 }

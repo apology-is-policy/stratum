@@ -11,14 +11,18 @@
  *   - stats report accurate current_gen + allocated_blocks.
  */
 #include "tharness.h"
+#include <sys/stat.h>
+
 #include <stratum/alloc.h>
 #include <stratum/block_inject.h>
 #include <stratum/cas.h>
 #include <stratum/cdc.h>
 #include <stratum/dataset.h>
+#include <stratum/dirent.h>
 #include <stratum/extent.h>
 #include <stratum/fs.h>
 #include <stratum/fs_testing.h>
+#include <stratum/inode.h>
 #include <stratum/keyfile.h>
 #include <stratum/repair_log.h>
 #include <stratum/scrub.h>
@@ -7153,6 +7157,389 @@ STM_TEST(fs_p7cas17_partial_migrated_file_falls_back_to_per_extent) {
     STM_ASSERT_EQ(cnt2.cold_count, cnt1.cold_count);
 
     free(plain);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* ========================================================================= */
+/* P8-POSIX-2b: fs.c POSIX wrappers (lookup / create_file / mkdir /           */
+/*              unlink / rmdir).                                              */
+/* ========================================================================= */
+
+/* Alloc a root directory inode (S_IFDIR | 0755) in dataset 1 so the
+ * tests have a parent to operate against. Returns the new ino via
+ * out param. */
+static void p2b_alloc_root_dir(stm_fs *fs, uint64_t *out_root_ino)
+{
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync_for_test(fs));
+    STM_ASSERT_TRUE(iidx != NULL);
+    uint32_t mode = (uint32_t)S_IFDIR | 0755u;
+    STM_ASSERT_OK(stm_inode_alloc(iidx, /*ds=*/1, mode, /*uid=*/0, /*gid=*/0,
+                                       out_root_ino));
+    STM_ASSERT(*out_root_ino != 0);
+}
+
+STM_TEST(fs_p2b_lookup_returns_enoent_when_unlinked) {
+    make_tmp("p2b_lookup_enoent");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t child = 0;
+    STM_ASSERT_ERR(stm_fs_lookup(fs, 1, root,
+                                     (const uint8_t *)"missing", 7, &child),
+                   STM_ENOENT);
+    STM_ASSERT_EQ(child, 0u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p2b_create_file_lookup_roundtrip) {
+    make_tmp("p2b_create_lookup");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t child = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root,
+                                          (const uint8_t *)"foo", 3,
+                                          0644u, /*uid=*/1000, /*gid=*/1000,
+                                          &child));
+    STM_ASSERT(child != 0);
+
+    uint64_t found = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root,
+                                     (const uint8_t *)"foo", 3, &found));
+    STM_ASSERT_EQ(found, child);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p2b_create_file_refuses_duplicate) {
+    make_tmp("p2b_dup");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t a = 0, b = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root,
+                                          (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &a));
+    STM_ASSERT_ERR(stm_fs_create_file(fs, 1, root,
+                                           (const uint8_t *)"f", 1,
+                                           0644u, 0, 0, &b),
+                   STM_EEXIST);
+    STM_ASSERT_EQ(b, 0u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p2b_mkdir_basic) {
+    make_tmp("p2b_mkdir");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t sub = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root,
+                                    (const uint8_t *)"d", 1,
+                                    0755u, 0, 0, &sub));
+    STM_ASSERT(sub != 0);
+
+    /* Create a file inside the new sub-directory — verifies the
+     * sub-directory itself functions as a parent for further ops. */
+    uint64_t inner = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, sub,
+                                          (const uint8_t *)"inside", 6,
+                                          0644u, 0, 0, &inner));
+    STM_ASSERT(inner != 0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p2b_unlink_basic) {
+    make_tmp("p2b_unlink");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t child = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root,
+                                          (const uint8_t *)"x", 1,
+                                          0644u, 0, 0, &child));
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, root, (const uint8_t *)"x", 1));
+
+    /* Lookup post-unlink returns ENOENT. */
+    uint64_t found = 0;
+    STM_ASSERT_ERR(stm_fs_lookup(fs, 1, root,
+                                     (const uint8_t *)"x", 1, &found),
+                   STM_ENOENT);
+
+    /* Re-creating the same name succeeds (different inode). */
+    uint64_t child2 = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root,
+                                          (const uint8_t *)"x", 1,
+                                          0644u, 0, 0, &child2));
+    STM_ASSERT(child2 != 0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p2b_unlink_refuses_directory) {
+    make_tmp("p2b_unlink_isdir");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t sub = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root,
+                                    (const uint8_t *)"d", 1,
+                                    0755u, 0, 0, &sub));
+    STM_ASSERT_ERR(stm_fs_unlink(fs, 1, root,
+                                      (const uint8_t *)"d", 1),
+                   STM_EISDIR);
+
+    /* rmdir succeeds on the directory (it's empty). */
+    STM_ASSERT_OK(stm_fs_rmdir(fs, 1, root, (const uint8_t *)"d", 1));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p2b_rmdir_refuses_non_empty) {
+    make_tmp("p2b_rmdir_nonempty");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t sub = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root,
+                                    (const uint8_t *)"d", 1,
+                                    0755u, 0, 0, &sub));
+    uint64_t inner = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, sub,
+                                          (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &inner));
+
+    STM_ASSERT_ERR(stm_fs_rmdir(fs, 1, root,
+                                     (const uint8_t *)"d", 1),
+                   STM_ENOTEMPTY);
+
+    /* Drain the child + retry. */
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, sub, (const uint8_t *)"f", 1));
+    STM_ASSERT_OK(stm_fs_rmdir(fs, 1, root, (const uint8_t *)"d", 1));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p2b_rmdir_refuses_file) {
+    make_tmp("p2b_rmdir_notdir");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t child = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root,
+                                          (const uint8_t *)"x", 1,
+                                          0644u, 0, 0, &child));
+    STM_ASSERT_ERR(stm_fs_rmdir(fs, 1, root,
+                                     (const uint8_t *)"x", 1),
+                   STM_ENOTDIR);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p2b_lookup_refuses_when_parent_is_file) {
+    make_tmp("p2b_parent_notdir");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t child = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root,
+                                          (const uint8_t *)"file", 4,
+                                          0644u, 0, 0, &child));
+
+    /* Trying to look up inside a regular file as if it were a
+     * directory must refuse with STM_ENOTDIR. */
+    uint64_t found = 0;
+    STM_ASSERT_ERR(stm_fs_lookup(fs, 1, child,
+                                      (const uint8_t *)"x", 1, &found),
+                   STM_ENOTDIR);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p2b_arg_validation) {
+    make_tmp("p2b_argval");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t out = 0;
+    /* NULL fs / out / name */
+    STM_ASSERT_ERR(stm_fs_lookup(NULL, 1, root,
+                                      (const uint8_t *)"a", 1, &out),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_lookup(fs, 1, root,
+                                      (const uint8_t *)"a", 1, NULL),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_create_file(fs, 1, root,
+                                           (const uint8_t *)"a", 1,
+                                           0644u, 0, 0, NULL),
+                   STM_EINVAL);
+    /* Reserved names "." and ".." */
+    STM_ASSERT_ERR(stm_fs_create_file(fs, 1, root,
+                                           (const uint8_t *)".", 1,
+                                           0644u, 0, 0, &out),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_create_file(fs, 1, root,
+                                           (const uint8_t *)"..", 2,
+                                           0644u, 0, 0, &out),
+                   STM_EINVAL);
+    /* '/' byte in name */
+    STM_ASSERT_ERR(stm_fs_create_file(fs, 1, root,
+                                           (const uint8_t *)"a/b", 3,
+                                           0644u, 0, 0, &out),
+                   STM_EINVAL);
+    /* NUL byte in name */
+    STM_ASSERT_ERR(stm_fs_create_file(fs, 1, root,
+                                           (const uint8_t *)"a\0b", 3,
+                                           0644u, 0, 0, &out),
+                   STM_EINVAL);
+    /* Empty name */
+    STM_ASSERT_ERR(stm_fs_create_file(fs, 1, root,
+                                           (const uint8_t *)"", 0,
+                                           0644u, 0, 0, &out),
+                   STM_EINVAL);
+    /* mode S_IFMT mismatch — passing S_IFDIR to create_file */
+    STM_ASSERT_ERR(stm_fs_create_file(fs, 1, root,
+                                           (const uint8_t *)"f", 1,
+                                           (uint32_t)S_IFDIR | 0644u,
+                                           0, 0, &out),
+                   STM_EINVAL);
+    /* mode S_IFMT mismatch — passing S_IFREG to mkdir */
+    STM_ASSERT_ERR(stm_fs_mkdir(fs, 1, root,
+                                     (const uint8_t *)"d", 1,
+                                     (uint32_t)S_IFREG | 0755u,
+                                     0, 0, &out),
+                   STM_EINVAL);
+    /* dataset_id == 0 / parent_ino == 0 */
+    STM_ASSERT_ERR(stm_fs_lookup(fs, 0, root,
+                                      (const uint8_t *)"a", 1, &out),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_lookup(fs, 1, 0,
+                                      (const uint8_t *)"a", 1, &out),
+                   STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p2b_create_rolls_back_inode_on_eexist) {
+    /* When stm_dirent_alloc returns STM_EEXIST, the freshly-allocated
+     * inode must be freed (no orphan). Verify by counting inodes
+     * before + after a refused create. */
+    make_tmp("p2b_rollback");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t a = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root,
+                                          (const uint8_t *)"x", 1,
+                                          0644u, 0, 0, &a));
+
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync_for_test(fs));
+    size_t before = 0;
+    STM_ASSERT_OK(stm_inode_count_for_ds(iidx, 1, &before));
+
+    /* Refused — name already linked. */
+    uint64_t b = 0;
+    STM_ASSERT_ERR(stm_fs_create_file(fs, 1, root,
+                                           (const uint8_t *)"x", 1,
+                                           0644u, 0, 0, &b),
+                   STM_EEXIST);
+    STM_ASSERT_EQ(b, 0u);
+
+    size_t after = 0;
+    STM_ASSERT_OK(stm_inode_count_for_ds(iidx, 1, &after));
+    STM_ASSERT_EQ(after, before);    /* No orphan inode left behind. */
+
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
     unlink(g_key_path);

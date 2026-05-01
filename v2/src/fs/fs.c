@@ -37,11 +37,15 @@
 #include <stratum/block.h>
 #include <stratum/bootstrap.h>
 #include <stratum/dataset.h>
+#include <stratum/dirent.h>
+#include <stratum/inode.h>
 #include <stratum/janus.h>
 #include <stratum/keyfile.h>
 #include <stratum/pool.h>
 #include <stratum/super.h>
 #include <stratum/sync.h>
+
+#include <sys/stat.h>            /* S_IFMT / S_IFREG / S_IFDIR */
 
 #include <pthread.h>
 #include <stdlib.h>
@@ -498,6 +502,315 @@ stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                                            buf, len, out_read);
     pthread_mutex_unlock(&fs->lock);
     return s;
+}
+
+/* ========================================================================= */
+/* POSIX directory + file ops (P8-POSIX-2b).                                  */
+/* ========================================================================= */
+
+/* Validate a dirent name per POSIX:
+ *   - non-empty, ≤ 255 bytes
+ *   - no NUL or '/' byte
+ *   - "." and ".." are reserved (synthesized at the path-walk layer,
+ *     never stored as dirents)
+ *
+ * Returns STM_EINVAL on any rule violation; STM_OK if the name is a
+ * legal dirent label. */
+static stm_status fs_validate_dirent_name(const uint8_t *name, uint8_t name_len)
+{
+    if (!name) return STM_EINVAL;
+    if (name_len == 0u || name_len > 255u) return STM_EINVAL;
+    for (uint8_t i = 0; i < name_len; i++) {
+        if (name[i] == '/' || name[i] == '\0') return STM_EINVAL;
+    }
+    if (name_len == 1u && name[0] == '.') return STM_EINVAL;
+    if (name_len == 2u && name[0] == '.' && name[1] == '.') return STM_EINVAL;
+    return STM_OK;
+}
+
+/* Look up `parent_ino` and verify it's a directory (S_IFDIR). On
+ * STM_OK, the parent's inode value is in *out_pv. Caller already
+ * holds fs->lock. */
+static stm_status fs_load_parent_dir(stm_inode_index *iidx,
+                                          uint64_t dataset_id, uint64_t parent_ino,
+                                          struct stm_inode_value *out_pv)
+{
+    stm_status ps = stm_inode_lookup(iidx, dataset_id, parent_ino, out_pv);
+    if (ps != STM_OK) return ps;             /* STM_ENOENT if missing */
+    uint32_t pmode = stm_load_le32(out_pv->si_mode);
+    if ((pmode & (uint32_t)S_IFMT) != (uint32_t)S_IFDIR) return STM_ENOTDIR;
+    return STM_OK;
+}
+
+stm_status stm_fs_lookup(stm_fs *fs, uint64_t dataset_id,
+                            uint64_t parent_ino,
+                            const uint8_t *name, uint8_t name_len,
+                            uint64_t *out_child_ino)
+{
+    if (!fs || !out_child_ino) return STM_EINVAL;
+    if (dataset_id == 0u || parent_ino == 0u) return STM_EINVAL;
+    stm_status nv = fs_validate_dirent_name(name, name_len);
+    if (nv != STM_OK) return nv;
+
+    *out_child_ino = 0;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_READ(fs);
+
+    stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
+    stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
+    if (!iidx || !didx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;
+    }
+
+    struct stm_inode_value pv = {0};
+    stm_status ps = fs_load_parent_dir(iidx, dataset_id, parent_ino, &pv);
+    if (ps != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return ps;
+    }
+
+    uint64_t child_ino = 0;
+    stm_status ds = stm_dirent_lookup(didx, dataset_id, parent_ino,
+                                          name, name_len,
+                                          &child_ino, NULL, NULL);
+    pthread_mutex_unlock(&fs->lock);
+    if (ds == STM_OK) *out_child_ino = child_ino;
+    return ds;
+}
+
+/* Common path for create_file / mkdir. `child_mode_type` is S_IFREG
+ * or S_IFDIR; `child_dt_type` is STM_DT_REG or STM_DT_DIR. Caller
+ * has already validated the name + verified mode's S_IFMT bits are
+ * either zero or match `child_mode_type`. */
+static stm_status fs_create_inode_and_link(stm_fs *fs,
+                                                uint64_t dataset_id,
+                                                uint64_t parent_ino,
+                                                const uint8_t *name,
+                                                uint8_t name_len,
+                                                uint32_t mode,
+                                                uint32_t uid, uint32_t gid,
+                                                uint32_t child_mode_type,
+                                                uint8_t  child_dt_type,
+                                                uint64_t *out_child_ino)
+{
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+
+    stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
+    stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
+    if (!iidx || !didx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;
+    }
+
+    struct stm_inode_value pv = {0};
+    stm_status ps = fs_load_parent_dir(iidx, dataset_id, parent_ino, &pv);
+    if (ps != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return ps;
+    }
+
+    /* Allocate the new inode. The wrapper composes file-type bits
+     * over caller-supplied permission bits; if the caller passed
+     * S_IFMT bits, they must agree with `child_mode_type`. */
+    uint32_t full_mode = (mode & 07777u) | child_mode_type;
+    uint64_t child_ino = 0;
+    stm_status as = stm_inode_alloc(iidx, dataset_id, full_mode, uid, gid,
+                                       &child_ino);
+    if (as != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return as;
+    }
+
+    /* Read back the alloc'd inode's gen for the dirent's child_gen
+     * field — `stm_inode_alloc` stamps gen via AllocFresh (=0) or
+     * AllocReused (= prior_gen + 1); the dirent records this so
+     * stale-fid detection works across the lifecycle. */
+    struct stm_inode_value cv = {0};
+    stm_status cs = stm_inode_lookup(iidx, dataset_id, child_ino, &cv);
+    if (cs != STM_OK) {
+        /* Defensive: should never happen right after alloc. Roll back. */
+        (void)stm_inode_free(iidx, dataset_id, child_ino);
+        pthread_mutex_unlock(&fs->lock);
+        return cs;
+    }
+    uint64_t child_gen = stm_load_le64(cv.si_gen);
+
+    /* Link in parent. Roll back the inode if the dirent fails. */
+    stm_status ds = stm_dirent_alloc(didx, dataset_id, parent_ino,
+                                          name, name_len,
+                                          child_ino, child_gen, child_dt_type);
+    if (ds != STM_OK) {
+        (void)stm_inode_free(iidx, dataset_id, child_ino);
+        pthread_mutex_unlock(&fs->lock);
+        return ds;
+    }
+
+    *out_child_ino = child_ino;
+    pthread_mutex_unlock(&fs->lock);
+    return STM_OK;
+}
+
+stm_status stm_fs_create_file(stm_fs *fs, uint64_t dataset_id,
+                                  uint64_t parent_ino,
+                                  const uint8_t *name, uint8_t name_len,
+                                  uint32_t mode, uint32_t uid, uint32_t gid,
+                                  uint64_t *out_child_ino)
+{
+    if (!fs || !out_child_ino) return STM_EINVAL;
+    if (dataset_id == 0u || parent_ino == 0u) return STM_EINVAL;
+    stm_status nv = fs_validate_dirent_name(name, name_len);
+    if (nv != STM_OK) return nv;
+    /* Caller's S_IFMT bits must be 0 or S_IFREG; any other type is a
+     * mode/API mismatch. */
+    uint32_t mtype = mode & (uint32_t)S_IFMT;
+    if (mtype != 0u && mtype != (uint32_t)S_IFREG) return STM_EINVAL;
+    *out_child_ino = 0;
+    return fs_create_inode_and_link(fs, dataset_id, parent_ino,
+                                       name, name_len, mode, uid, gid,
+                                       (uint32_t)S_IFREG, STM_DT_REG,
+                                       out_child_ino);
+}
+
+stm_status stm_fs_mkdir(stm_fs *fs, uint64_t dataset_id,
+                            uint64_t parent_ino,
+                            const uint8_t *name, uint8_t name_len,
+                            uint32_t mode, uint32_t uid, uint32_t gid,
+                            uint64_t *out_child_ino)
+{
+    if (!fs || !out_child_ino) return STM_EINVAL;
+    if (dataset_id == 0u || parent_ino == 0u) return STM_EINVAL;
+    stm_status nv = fs_validate_dirent_name(name, name_len);
+    if (nv != STM_OK) return nv;
+    uint32_t mtype = mode & (uint32_t)S_IFMT;
+    if (mtype != 0u && mtype != (uint32_t)S_IFDIR) return STM_EINVAL;
+    *out_child_ino = 0;
+    return fs_create_inode_and_link(fs, dataset_id, parent_ino,
+                                       name, name_len, mode, uid, gid,
+                                       (uint32_t)S_IFDIR, STM_DT_DIR,
+                                       out_child_ino);
+}
+
+/* Common path for unlink / rmdir. `expect_dir` selects the type
+ * filter: true → child must be S_IFDIR (rmdir), false → child must
+ * NOT be S_IFDIR (unlink). On the rmdir path the child must also be
+ * empty (count_for_dir == 0). */
+static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
+                                                  uint64_t dataset_id,
+                                                  uint64_t parent_ino,
+                                                  const uint8_t *name,
+                                                  uint8_t name_len,
+                                                  bool expect_dir)
+{
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+
+    stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
+    stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
+    if (!iidx || !didx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;
+    }
+
+    struct stm_inode_value pv = {0};
+    stm_status ps = fs_load_parent_dir(iidx, dataset_id, parent_ino, &pv);
+    if (ps != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return ps;
+    }
+
+    /* Resolve child_ino via dirent lookup. */
+    uint64_t child_ino = 0;
+    stm_status ds = stm_dirent_lookup(didx, dataset_id, parent_ino,
+                                          name, name_len,
+                                          &child_ino, NULL, NULL);
+    if (ds != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return ds;       /* STM_ENOENT if not linked */
+    }
+
+    /* Verify type. Read child's inode for both type discrimination
+     * AND the rmdir empty-check. */
+    struct stm_inode_value cv = {0};
+    stm_status cs = stm_inode_lookup(iidx, dataset_id, child_ino, &cv);
+    if (cs != STM_OK) {
+        /* Dirent points at a missing inode — corruption. Refuse rather
+         * than silently unlink the dirent (which would orphan the
+         * dirent's slot). The pool needs scrub-level recovery. */
+        pthread_mutex_unlock(&fs->lock);
+        return cs;
+    }
+    uint32_t cmode = stm_load_le32(cv.si_mode);
+    bool child_is_dir = ((cmode & (uint32_t)S_IFMT) == (uint32_t)S_IFDIR);
+    if (expect_dir && !child_is_dir) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_ENOTDIR;
+    }
+    if (!expect_dir && child_is_dir) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EISDIR;
+    }
+    if (expect_dir) {
+        size_t n = 0;
+        stm_status cn = stm_dirent_count_for_dir(didx, dataset_id, child_ino, &n);
+        if (cn != STM_OK) {
+            pthread_mutex_unlock(&fs->lock);
+            return cn;
+        }
+        if (n != 0u) {
+            pthread_mutex_unlock(&fs->lock);
+            return STM_ENOTEMPTY;
+        }
+    }
+
+    /* Unlink the dirent first so a concurrent lookup can no longer
+     * resolve to the about-to-be-freed inode. Then free the inode.
+     * MVP: single-link semantics — unlink the dirent, then drop the
+     * inode. P8-POSIX-3 will replace the unconditional free with a
+     * proper nlink decrement + cascade-free-on-zero. */
+    stm_status us = stm_dirent_unlink(didx, dataset_id, parent_ino,
+                                          name, name_len);
+    if (us != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return us;
+    }
+    /* Best-effort inode free. If this fails, the inode leaks but the
+     * dirent removal is durable — preferable to a half-state where
+     * the dirent persists pointing at a freed inode. The leak surfaces
+     * via stm_inode_count_for_ds drift and is recoverable by future
+     * scrub-style passes. */
+    (void)stm_inode_free(iidx, dataset_id, child_ino);
+
+    pthread_mutex_unlock(&fs->lock);
+    return STM_OK;
+}
+
+stm_status stm_fs_unlink(stm_fs *fs, uint64_t dataset_id,
+                            uint64_t parent_ino,
+                            const uint8_t *name, uint8_t name_len)
+{
+    if (!fs) return STM_EINVAL;
+    if (dataset_id == 0u || parent_ino == 0u) return STM_EINVAL;
+    stm_status nv = fs_validate_dirent_name(name, name_len);
+    if (nv != STM_OK) return nv;
+    return fs_unlink_inode_and_dirent(fs, dataset_id, parent_ino,
+                                          name, name_len,
+                                          /*expect_dir=*/false);
+}
+
+stm_status stm_fs_rmdir(stm_fs *fs, uint64_t dataset_id,
+                           uint64_t parent_ino,
+                           const uint8_t *name, uint8_t name_len)
+{
+    if (!fs) return STM_EINVAL;
+    if (dataset_id == 0u || parent_ino == 0u) return STM_EINVAL;
+    stm_status nv = fs_validate_dirent_name(name, name_len);
+    if (nv != STM_OK) return nv;
+    return fs_unlink_inode_and_dirent(fs, dataset_id, parent_ino,
+                                          name, name_len,
+                                          /*expect_dir=*/true);
 }
 
 /* P7-16: stm_fs_reflink. POSIX-shape FICLONE — replaces dst's empty

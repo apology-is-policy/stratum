@@ -89,6 +89,12 @@ typedef enum {
     STM_EPROTOCOL       = -206,   /* protocol / wire-format violation      */
     STM_EBACKEND        = -207,   /* backend reported an opaque failure    */
     STM_EQUORUM         = -208,   /* multi-device commit/mount lacked quorum confirmations */
+
+    /* P8-POSIX-2b: dirent / directory-shape errors. POSIX-aligned values
+     * (matches Linux errno.h) so callers can interpret without translation. */
+    STM_ENOTDIR         =  -20,   /* entry isn't a directory but should be */
+    STM_EISDIR          =  -21,   /* entry is a directory but shouldn't be */
+    STM_ENOTEMPTY       =  -39,   /* directory non-empty                   */
 } stm_status;
 
 const char *stm_strerror(stm_status s);

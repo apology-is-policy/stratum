@@ -218,6 +218,142 @@ stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                          size_t *out_read);
 
 /* ========================================================================= */
+/* POSIX directory + file ops (P8-POSIX-2b).                                  */
+/* ========================================================================= */
+
+/*
+ * Compose the dirent + inode layers into the per-fs lock chain so
+ * higher-level callers (9P / FUSE / language bindings) don't need to
+ * orchestrate the two indices themselves. Per ARCH §11.4.
+ *
+ * MVP scope (P8-POSIX-2b): single-link semantics. Each create
+ * allocates a fresh inode with `si_nlink = 1`; each unlink frees the
+ * inode unconditionally. Hard links (link / nlink decrement / cascade
+ * delete on nlink == 0) are the P8-POSIX-3 surface.
+ *
+ * Name validation: names must be 1..255 bytes, no NUL, no '/'. The
+ * literal "." and ".." are reserved (synthesized by future path-walk
+ * helpers, never stored as dirents).
+ *
+ * Lock posture: each entry takes `fs->lock`, dispatches into the
+ * inode_idx + dirent_idx via the `stm_sync_*_index` accessors. Lock
+ * chain: `fs->lock → inode_idx mutex` (for the inode op) and
+ * `fs->lock → dirent_idx mutex` (for the dirent op). The two indices
+ * are siblings under sync, with no cross-locking — both layers' own
+ * mutexes are held only for the duration of their respective op.
+ *
+ * Atomicity: create-paths are best-effort transactional within a
+ * single fs->lock acquisition — if the dirent-link step fails after
+ * inode-alloc succeeds, the inode is rolled back via stm_inode_free
+ * before returning the failure. So a successful create is always
+ * fully linked; a failed create leaves no orphan inode.
+ */
+
+/*
+ * Look up `name` in directory `parent_ino` of `dataset_id`. Returns
+ * the child inode number via `out_child_ino`.
+ *
+ * Refusals:
+ *   - NULL fs OR NULL name OR NULL out_child_ino (STM_EINVAL).
+ *   - dataset_id == 0 OR parent_ino == 0 (STM_EINVAL).
+ *   - name_len == 0 OR > 255 (STM_EINVAL).
+ *   - name contains NUL or '/' byte (STM_EINVAL).
+ *   - name == "." or ".." (STM_EINVAL — reserved).
+ *   - parent inode not found OR not a directory (STM_ENOENT / STM_ENOTDIR).
+ *   - name not linked in parent (STM_ENOENT).
+ *   - fs wedged (STM_EWEDGED).
+ */
+STM_MUST_USE
+stm_status stm_fs_lookup(stm_fs *fs, uint64_t dataset_id,
+                            uint64_t parent_ino,
+                            const uint8_t *name, uint8_t name_len,
+                            uint64_t *out_child_ino);
+
+/*
+ * Create a regular file `name` in directory `parent_ino`, returning
+ * the new inode number via `out_child_ino`.
+ *
+ * `mode` is the POSIX mode word: file-type bits (S_IFMT) MUST be
+ * 0 or S_IFREG (0100000); permission bits (07777) are stored as-is.
+ * The wrapper sets `(mode & 07777) | S_IFREG` in the new inode's
+ * `si_mode` and `STM_DT_REG` in the parent's dirent record.
+ *
+ * Atomicity: alloc inode → link in parent dirent. On link failure,
+ * the inode is freed before returning.
+ *
+ * Refusals: same as stm_fs_lookup, plus:
+ *   - NULL out_child_ino (STM_EINVAL).
+ *   - mode S_IFMT bits set to a non-S_IFREG type (STM_EINVAL).
+ *   - name already linked in parent (STM_EEXIST).
+ *   - chain exhausted (STM_ENOSPC — should never happen in practice).
+ *   - inode-allocator out of slots (STM_ENOSPC).
+ *   - fs read-only or wedged (STM_EROFS / STM_EWEDGED).
+ */
+STM_MUST_USE
+stm_status stm_fs_create_file(stm_fs *fs, uint64_t dataset_id,
+                                  uint64_t parent_ino,
+                                  const uint8_t *name, uint8_t name_len,
+                                  uint32_t mode, uint32_t uid, uint32_t gid,
+                                  uint64_t *out_child_ino);
+
+/*
+ * Create a sub-directory `name` in directory `parent_ino`, returning
+ * the new inode number via `out_child_ino`.
+ *
+ * `mode` is the POSIX mode word: file-type bits (S_IFMT) MUST be
+ * 0 or S_IFDIR (0040000); permission bits (07777) are stored as-is.
+ * The wrapper sets `(mode & 07777) | S_IFDIR` in the new inode's
+ * `si_mode` and `STM_DT_DIR` in the parent's dirent record.
+ *
+ * The new directory is created empty (no entries). `.` and `..`
+ * are synthesized at lookup time, not stored as dirents (ARCH §11.4.4).
+ *
+ * Atomicity + refusals: same shape as stm_fs_create_file.
+ */
+STM_MUST_USE
+stm_status stm_fs_mkdir(stm_fs *fs, uint64_t dataset_id,
+                            uint64_t parent_ino,
+                            const uint8_t *name, uint8_t name_len,
+                            uint32_t mode, uint32_t uid, uint32_t gid,
+                            uint64_t *out_child_ino);
+
+/*
+ * Unlink `name` from directory `parent_ino`. Removes the dirent and
+ * (P8-POSIX-2b MVP) frees the child inode unconditionally.
+ *
+ * P8-POSIX-3 will replace the unconditional free with proper nlink
+ * decrement + cascade-free-on-nlink-zero semantics. Until then, the
+ * MVP is correct for single-link files; hard links will surface as
+ * a behavioral change at P8-POSIX-3.
+ *
+ * Unlink refuses on a directory child (STM_EISDIR). Use stm_fs_rmdir
+ * for directories.
+ *
+ * Refusals: same as stm_fs_lookup, plus:
+ *   - child is a directory (STM_EISDIR — use rmdir).
+ *   - fs read-only or wedged (STM_EROFS / STM_EWEDGED).
+ */
+STM_MUST_USE
+stm_status stm_fs_unlink(stm_fs *fs, uint64_t dataset_id,
+                            uint64_t parent_ino,
+                            const uint8_t *name, uint8_t name_len);
+
+/*
+ * Remove sub-directory `name` from directory `parent_ino`. The child
+ * directory must be empty (no live dirents). Removes the dirent and
+ * frees the child inode.
+ *
+ * Refusals:
+ *   - child not a directory (STM_ENOTDIR — use unlink).
+ *   - child not empty (STM_ENOTEMPTY).
+ *   - else same as stm_fs_unlink.
+ */
+STM_MUST_USE
+stm_status stm_fs_rmdir(stm_fs *fs, uint64_t dataset_id,
+                           uint64_t parent_ino,
+                           const uint8_t *name, uint8_t name_len);
+
+/* ========================================================================= */
 /* Dataset creation (P7-13).                                                  */
 /* ========================================================================= */
 
