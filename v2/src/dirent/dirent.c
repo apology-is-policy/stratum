@@ -585,6 +585,39 @@ stm_status stm_dirent_count_for_dir(const stm_dirent_index *idx,
     return STM_OK;
 }
 
+/* P8-POSIX-2b R73 P2-1: bulk-drop every record keyed at (ds, dir_ino,
+ * *). Walks records[] once, compacts in place. After this returns the
+ * dirent btree on the next sync_commit will not encode any record at
+ * that (ds, dir_ino) prefix — including tombstones from prior unlinks. */
+stm_status stm_dirent_drop_for_dir(stm_dirent_index *idx,
+                                       uint64_t dataset_id, uint64_t dir_ino,
+                                       size_t *out_dropped) {
+    if (!idx) return STM_EINVAL;
+    if (dataset_id == 0u || dir_ino == 0u) return STM_EINVAL;
+
+    must_lock(idx_lock(idx));
+
+    size_t kept = 0;
+    size_t dropped = 0;
+    for (size_t i = 0; i < idx->n_records; i++) {
+        stm_dirent_record *r = &idx->records[i];
+        if (r->dataset_id == dataset_id && r->dir_ino == dir_ino) {
+            dropped++;
+            continue;
+        }
+        if (kept != i) {
+            idx->records[kept] = *r;
+        }
+        kept++;
+    }
+    idx->n_records = kept;
+    if (dropped > 0u) idx->dirty = true;
+    if (out_dropped) *out_dropped = dropped;
+
+    must_unlock(idx_lock(idx));
+    return STM_OK;
+}
+
 /* ------------------------------------------------------------------ */
 /* Public API — persistence (mirrors stm_inode_index).                  */
 /* ------------------------------------------------------------------ */

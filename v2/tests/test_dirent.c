@@ -451,4 +451,65 @@ STM_TEST(dirent_ub_version_is_25) {
     STM_ASSERT_EQ(STM_UB_VERSION, 25u);
 }
 
+/* R73 P2-1: stm_dirent_drop_for_dir bulk-removes every record keyed
+ * under (ds, dir_ino, *), including tombstones from prior unlinks. */
+STM_TEST(dirent_r73_p2_1_drop_for_dir_clears_records_and_tombstones) {
+    stm_dirent_index *idx = stm_dirent_index_create();
+
+    /* Three live + one tombstone in dir=2, plus one live in dir=3
+     * (must survive — drop_for_dir is scoped). */
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"a", 1,
+                                       100, 0, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"b", 1,
+                                       101, 0, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"c", 1,
+                                       102, 0, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_unlink(idx, 1, 2, (const uint8_t *)"b", 1));
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 3, (const uint8_t *)"x", 1,
+                                       200, 0, STM_DT_REG));
+
+    /* Drop dir=2: removes 3 records (a + b-tombstone + c). */
+    size_t dropped = 0;
+    STM_ASSERT_OK(stm_dirent_drop_for_dir(idx, 1, 2, &dropped));
+    STM_ASSERT_EQ(dropped, (size_t)3);
+
+    /* dir=2 is fully empty (no live, no tombstone). */
+    size_t n = 0;
+    STM_ASSERT_OK(stm_dirent_count_for_dir(idx, 1, 2, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+    /* Lookup of any prior name is ENOENT. */
+    uint64_t ci = 0;
+    STM_ASSERT_ERR(stm_dirent_lookup(idx, 1, 2, (const uint8_t *)"a", 1,
+                                         &ci, NULL, NULL),
+                   STM_ENOENT);
+
+    /* dir=3's record survives. */
+    STM_ASSERT_OK(stm_dirent_lookup(idx, 1, 3, (const uint8_t *)"x", 1,
+                                        &ci, NULL, NULL));
+    STM_ASSERT_EQ(ci, (uint64_t)200);
+
+    /* Reuse the cleared dir: alloc into dir=2 succeeds with the
+     * SAME name `b` that was previously tombstoned — proving the
+     * tombstone is gone (not reused). The test seam: post-drop, the
+     * chain at fnv1a64("b") starts EMPTY, install at probe 0. */
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"b", 1,
+                                       300, 0, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_lookup(idx, 1, 2, (const uint8_t *)"b", 1,
+                                        &ci, NULL, NULL));
+    STM_ASSERT_EQ(ci, (uint64_t)300);
+
+    stm_dirent_index_close(idx);
+}
+
+STM_TEST(dirent_r73_p2_1_drop_for_dir_arg_validation) {
+    stm_dirent_index *idx = stm_dirent_index_create();
+    size_t n = 0;
+    STM_ASSERT_ERR(stm_dirent_drop_for_dir(NULL, 1, 2, &n), STM_EINVAL);
+    STM_ASSERT_ERR(stm_dirent_drop_for_dir(idx, 0, 2, &n),  STM_EINVAL);
+    STM_ASSERT_ERR(stm_dirent_drop_for_dir(idx, 1, 0, &n),  STM_EINVAL);
+    /* out_dropped optional — STM_OK with NULL. */
+    STM_ASSERT_OK(stm_dirent_drop_for_dir(idx, 1, 2, NULL));
+    stm_dirent_index_close(idx);
+}
+
 STM_TEST_MAIN("test_dirent")

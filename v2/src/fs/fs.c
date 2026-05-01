@@ -767,15 +767,38 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
 
     /* Unlink the dirent first so a concurrent lookup can no longer
      * resolve to the about-to-be-freed inode. Then free the inode.
-     * MVP: single-link semantics — unlink the dirent, then drop the
-     * inode. P8-POSIX-3 will replace the unconditional free with a
-     * proper nlink decrement + cascade-free-on-zero. */
+     *
+     * P8-POSIX-3-TODO: replace the unconditional inode_free with a
+     * proper nlink-decrement + cascade-free-on-zero. The current
+     * shape is correct for the single-link MVP — every alloc creates
+     * si_nlink=1, so unlinking the sole dirent always drops the
+     * inode. Hard links (`stm_fs_link`) at P8-POSIX-3 break this
+     * assumption: link(/a, /b) creates a SECOND dirent referencing
+     * the same inode (and bumps si_nlink to 2); unlink(/a) must then
+     * decrement nlink to 1 and KEEP the inode. The transition WILL
+     * change the wrapper's behavior — grep for `P8-POSIX-3-TODO` to
+     * locate the call site at conversion time. */
     stm_status us = stm_dirent_unlink(didx, dataset_id, parent_ino,
                                           name, name_len);
     if (us != STM_OK) {
         pthread_mutex_unlock(&fs->lock);
         return us;
     }
+
+    /* P8-POSIX-2b R73 P2-1: rmdir cleans up every record keyed under
+     * the freed dir's ino — both live (none, by the empty-check above)
+     * and tombstones from prior unlinks of the dir's children. Without
+     * this, a directory with churn (create-then-unlink across many
+     * entries) leaves tombstones in the btree that survive rmdir. If
+     * the dir's ino is later reused via AllocReused (with bumped
+     * si_gen per inode.tla), the new directory inherits the orphan
+     * tombstones and burns probe budget walking past them. The
+     * cleanup is best-effort — a failure leaves the orphan tombstones
+     * behind but doesn't break the rmdir's correctness. */
+    if (expect_dir) {
+        (void)stm_dirent_drop_for_dir(didx, dataset_id, child_ino, NULL);
+    }
+
     /* Best-effort inode free. If this fails, the inode leaks but the
      * dirent removal is durable — preferable to a half-state where
      * the dirent persists pointing at a freed inode. The leak surfaces

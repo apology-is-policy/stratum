@@ -218,6 +218,35 @@ stm_status stm_dirent_count_for_dir(const stm_dirent_index *idx,
                                         uint64_t dataset_id, uint64_t dir_ino,
                                         size_t *out_count);
 
+/*
+ * Drop EVERY record (live + tombstone) keyed at `(dataset_id, dir_ino,
+ * *)`. Used by `stm_fs_rmdir` (P8-POSIX-2b R73 P2-1) to GC the
+ * orphan-tombstone trail left by unlinks of the directory's prior
+ * children before the directory itself is freed. Without this, a
+ * directory with churn (create-then-unlink across many entries)
+ * leaves tombstones in the btree that survive the rmdir; if the dir's
+ * ino is later AllocReused for a fresh directory, that new directory
+ * inherits the old tombstones and burns probe budget walking past
+ * them.
+ *
+ * Output: `*out_dropped` (optional) is set to the number of records
+ * removed (live + tombstone, summed). Pass NULL to ignore.
+ *
+ * Caller-visible-elsewhere semantic: tests + future scrub-style GC
+ * passes use this to drive directory-scope cleanup. Live records
+ * removed are not POSIX-orphaned in the rmdir use-case (the dir
+ * itself was just empty-checked) — for general callers, ensure the
+ * dir is empty BEFORE calling.
+ *
+ * Refusals:
+ *   - NULL idx (STM_EINVAL).
+ *   - dataset_id == 0 OR dir_ino == 0 (STM_EINVAL).
+ */
+STM_MUST_USE
+stm_status stm_dirent_drop_for_dir(stm_dirent_index *idx,
+                                       uint64_t dataset_id, uint64_t dir_ino,
+                                       size_t *out_dropped);
+
 /* ========================================================================= */
 /* Persistence (P8-POSIX-2, v25).                                            */
 /*                                                                            */
