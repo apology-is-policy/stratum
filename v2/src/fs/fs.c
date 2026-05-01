@@ -580,7 +580,19 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
 
         /* Flip kind = EXTENT. The si_size stays at the LOGICAL value
          * (new_size, not the block-padded aligned_size) so reads past
-         * the logical EOF return 0 bytes, matching POSIX semantics. */
+         * the logical EOF return 0 bytes, matching POSIX semantics.
+         *
+         * R76 P3-1 (theoretical-only): `stm_inode_set` cannot fail in
+         * this lock posture. Every `STM_E*` return from set
+         * presupposes a state mutation only the allocator / free path
+         * can perform (gen bump, FREED transition, nlink=0 transition,
+         * data_kind set to unknown). All those paths are mutex-
+         * excluded by fs->lock. The args we pass are derived from a
+         * lookup performed under the same fs->lock with no
+         * intervening release. So the post-extent-write inconsistency
+         * (extent has data, inode still INLINE) is unreachable today.
+         * Future maintainers: if you add an alloc path that doesn't
+         * take fs->lock, this assumption breaks. */
         iv->si_data_kind = STM_DATA_EXTENT;
         iv->si_data_len = 0;
         memset(&iv->si_data, 0, sizeof iv->si_data);
@@ -595,6 +607,9 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
         uint64_t cur_size = stm_load_le64(iv->si_size);
         if (end_off > cur_size) {
             iv->si_size = stm_store_le64(end_off);
+            /* R76 P3-2: same infallibility argument as P3-1 — the
+             * lock posture excludes every STM_E* path through
+             * stm_inode_set. */
             return stm_inode_set(iidx, ds, ino, iv);
         }
         return STM_OK;
@@ -615,8 +630,9 @@ static stm_status fs_read_regular_locked(stm_fs *fs,
                                               size_t *out_read)
 {
     uint8_t kind = iv->si_data_kind;
+    uint64_t cur_size = stm_load_le64(iv->si_size);
+
     if (kind == STM_DATA_INLINE) {
-        uint64_t cur_size = stm_load_le64(iv->si_size);
         if (off >= cur_size) {
             if (out_read) *out_read = 0;
             return STM_OK;
@@ -628,7 +644,27 @@ static stm_status fs_read_regular_locked(stm_fs *fs,
         return STM_OK;
     }
     if (kind == STM_DATA_EXTENT) {
-        return stm_sync_read_extent(fs->sync, ds, ino, off, buf, len, out_read);
+        /* R76 P2-1: clamp the EXTENT-mode read by si_size. The
+         * combined-buffer transition path block-pads writes up to
+         * the next 4 KiB boundary, so the extent layer holds zero-
+         * padded bytes past the logical EOF; without this clamp,
+         * `stm_sync_read_extent` would surface those padding bytes
+         * as if they were file content, diverging from the INLINE
+         * path's POSIX-EOF semantics (and from `read(2)`'s
+         * "returns up to EOF" contract). */
+        if (off >= cur_size) {
+            if (out_read) *out_read = 0;
+            return STM_OK;
+        }
+        stm_status rs = stm_sync_read_extent(fs->sync, ds, ino, off,
+                                                buf, len, out_read);
+        if (rs == STM_OK && out_read) {
+            uint64_t logical_avail = cur_size - off;
+            if ((uint64_t)*out_read > logical_avail) {
+                *out_read = (size_t)logical_avail;
+            }
+        }
+        return rs;
     }
     return STM_ENOTSUPPORTED;
 }
@@ -674,6 +710,10 @@ stm_status stm_fs_read(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                          uint64_t off, void *buf, size_t len,
                          size_t *out_read)
 {
+    /* R76 P3-3: zero-init out_read BEFORE arg validation per the
+     * R57 P3-5 / R58 P3-1 uniform out-param contract. Callers that
+     * observe on STM_EINVAL get a defined value (0). */
+    if (out_read) *out_read = 0;
     if (!fs) return STM_EINVAL;
     pthread_mutex_lock(&fs->lock);
     FS_GUARD_READ(fs);

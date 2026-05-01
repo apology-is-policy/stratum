@@ -8708,4 +8708,132 @@ STM_TEST(fs_p5_write_extent_path_bumps_si_size) {
     unlink(g_key_path);
 }
 
+/* R76 P3-4 regression tests. */
+
+STM_TEST(fs_p5_r76_p3_4_transition_oversize_returns_erange) {
+    /* A write that would push new_size > STM_FS_RECORDSIZE_MAX during
+     * the inline → extent transition is rejected with STM_ERANGE.
+     * Caller is expected to split the write. */
+    make_tmp("p5_r76_oversize");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"big", 3,
+                                          0644u, 0, 0, &f));
+
+    /* Sparse write at off = 8 MiB - 50, len = 200 — would yield
+     * new_size ≈ 8 MiB + 150 > STM_FS_RECORDSIZE_MAX. */
+    uint8_t small[200];
+    memset(small, 'X', sizeof small);
+    uint64_t far_off = (uint64_t)STM_FS_RECORDSIZE_MAX - 50u;
+    STM_ASSERT_ERR(stm_fs_write(fs, 1, f, far_off, small, 200), STM_ERANGE);
+
+    /* Inode kind unchanged — the failure is detected before any
+     * state mutation. */
+    struct stm_inode_value iv = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &iv));
+    STM_ASSERT_EQ(iv.si_data_kind, (uint8_t)STM_DATA_INLINE);
+    STM_ASSERT_EQ(iv.si_data_len, (uint8_t)0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p5_r76_p3_4_transition_with_hole_at_end) {
+    /* Transition when the write is past current data_len: combined
+     * buffer must zero-fill the gap [data_len .. off). */
+    make_tmp("p5_r76_hole");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"hole", 4,
+                                          0644u, 0, 0, &f));
+
+    /* First write 30 inline bytes. */
+    uint8_t prefix[30];
+    memset(prefix, 'A', sizeof prefix);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, prefix, 30));
+
+    /* Write 100 bytes at offset 200 — total file size 300,
+     * gap [30..200) must be zero-filled. */
+    uint8_t payload[100];
+    memset(payload, 'B', sizeof payload);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 200, payload, 100));
+
+    struct stm_inode_value iv = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &iv));
+    STM_ASSERT_EQ(iv.si_data_kind, (uint8_t)STM_DATA_EXTENT);
+    STM_ASSERT_EQ(stm_load_le64(iv.si_size), (uint64_t)300);
+
+    /* Read back the full file and verify gap is zeros. */
+    uint8_t out[300] = {0};
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, f, 0, out, 300, &n));
+    STM_ASSERT_EQ(n, (size_t)300);
+    for (size_t i = 0; i < 30; i++) STM_ASSERT_EQ(out[i], (uint8_t)'A');
+    for (size_t i = 30; i < 200; i++) STM_ASSERT_EQ(out[i], (uint8_t)0);
+    for (size_t i = 200; i < 300; i++) STM_ASSERT_EQ(out[i], (uint8_t)'B');
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p5_r76_p3_4_transition_with_empty_inline) {
+    /* Transition from a freshly-created file (data_len=0) — the
+     * inline-prefix branch is skipped via `if (iv->si_data_len > 0u)`,
+     * the combined buffer holds only the user's bytes + zero pad. */
+    make_tmp("p5_r76_empty_inline");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"e", 1,
+                                          0644u, 0, 0, &f));
+
+    /* Empty file → write 200 bytes at off=0 → triggers transition,
+     * inline-prefix step is skipped. */
+    uint8_t buf[200];
+    memset(buf, 'C', sizeof buf);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, buf, 200));
+
+    struct stm_inode_value iv = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &iv));
+    STM_ASSERT_EQ(iv.si_data_kind, (uint8_t)STM_DATA_EXTENT);
+    STM_ASSERT_EQ(stm_load_le64(iv.si_size), (uint64_t)200);
+
+    /* Read back. R76 P2-1 fix: read clamps to si_size=200 even
+     * though the extent layer holds 4 KiB (block-padded). */
+    uint8_t out[4096] = {0};
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, f, 0, out, 4096, &n));
+    STM_ASSERT_EQ(n, (size_t)200);
+    for (size_t i = 0; i < 200; i++) STM_ASSERT_EQ(out[i], (uint8_t)'C');
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")
