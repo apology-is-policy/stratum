@@ -1099,13 +1099,23 @@ stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
                               size_t max_entries,
                               size_t *out_returned)
 {
+    /* R75 P3-1: zero-init out-param BEFORE arg validation per the
+     * uniform R57 P3-5 / R58 P3-1 out-param contract. */
+    if (out_returned) *out_returned = 0;
+
     if (!fs || !cursor || !out_entries || !out_returned) return STM_EINVAL;
     if (dataset_id == 0u || dir_ino == 0u || parent_ino == 0u) return STM_EINVAL;
     if (max_entries == 0u) return STM_EINVAL;
     /* Reject unknown flag bits (forward-compat guard). */
     if ((flags & ~(uint32_t)STM_FS_READDIR_FLAG_NO_DOTS) != 0u) return STM_EINVAL;
 
-    *out_returned = 0;
+    /* R75 P2-1: cursor saturation sentinel. Mirror of the dirent-layer
+     * guard — short-circuit the call when the cursor has already
+     * saturated to UINT64_MAX from a prior emit at the maximum
+     * representable probe. Without this, the dirent-layer's
+     * underlying filter would re-emit a hostile record at
+     * UINT64_MAX. */
+    if (*cursor == UINT64_MAX) return STM_OK;
 
     pthread_mutex_lock(&fs->lock);
     FS_GUARD_READ(fs);
@@ -1191,6 +1201,20 @@ stm_status stm_fs_readdir(stm_fs *fs, uint64_t dataset_id,
 
         /* Copy into out_entries. */
         for (size_t k = 0; k < batch_n; k++) {
+            /* R75 P3-4: defense-in-depth name_len bound at the
+             * fs.c → dirent.c trust boundary (R71 P1-1 lesson —
+             * symmetric guards across trust boundaries). The dirent
+             * decoder + alloc paths already reject name_len >
+             * STM_DIRENT_NAME_MAX, so reaching this branch implies
+             * a buggy refactor of the dirent layer. Treat as
+             * STM_ECORRUPT defensively rather than memcpy past the
+             * out-buffer's name[] array (which would be a stack
+             * overrun in caller-allocated batch[] storage). */
+            if (batch[k].name_len > STM_DIRENT_NAME_MAX) {
+                free(batch);
+                pthread_mutex_unlock(&fs->lock);
+                return STM_ECORRUPT;
+            }
             out_entries[emitted].child_ino  = batch[k].child_ino;
             out_entries[emitted].child_gen  = batch[k].child_gen;
             out_entries[emitted].child_type = batch[k].child_type;

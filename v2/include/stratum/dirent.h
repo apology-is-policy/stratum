@@ -259,10 +259,19 @@ typedef struct stm_dirent_entry {
  *     returned. The impl resumes at the next probe past the last
  *     returned record (strict monotonic advance — no duplicate emit).
  *   - Iteration done: `*out_returned == 0` after a call. The cursor
- *     value at that point is "past the highest-probe live record"
- *     (saturated at UINT64_MAX if the highest live probe is at
- *     UINT64_MAX, but realistic FNV-1a 64-bit hashes don't reach
- *     that far).
+ *     value at that point is "past the highest-probe live record",
+ *     saturated at UINT64_MAX if the highest live record was at
+ *     UINT64_MAX itself.
+ *
+ * UINT64_MAX as iteration sentinel (R75 P2-1): when the impl
+ * advances the cursor to UINT64_MAX (either organically from
+ * `last_probe + 1` or saturating from a record at probe=UINT64_MAX
+ * itself), subsequent calls short-circuit on entry — they return
+ * STM_OK with `*out_returned = 0` regardless of whether further
+ * records exist at lower probes. This means callers MUST start
+ * iteration at `*cursor = 0` (not UINT64_MAX) and treat
+ * `*cursor == UINT64_MAX` after a call as "iteration done"
+ * equivalently to `*out_returned == 0`.
  *
  * Stability under concurrent Create/Unlink (between-call interleaving):
  *   - A Create that installs at probe < cursor is invisible to the

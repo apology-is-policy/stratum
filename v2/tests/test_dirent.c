@@ -799,6 +799,62 @@ STM_TEST(dirent_readdir_arg_validation) {
     stm_dirent_index_close(idx);
 }
 
+/* R75 P2-1: cursor saturation sentinel. When the caller passes
+ * cursor=UINT64_MAX (either organically from a prior emit's
+ * saturation, or from caller error), readdir short-circuits and
+ * returns 0 entries. Without this guard, a record at probe=UINT64_MAX
+ * would re-emit forever because the strict-less-than filter
+ * `r->hash_probe < UINT64_MAX` is false at probe=UINT64_MAX. */
+STM_TEST(dirent_readdir_r75_p2_1_cursor_saturation_terminates) {
+    stm_dirent_index *idx = stm_dirent_index_create();
+    /* Even with a live record present, cursor=UINT64_MAX returns 0. */
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 2, (const uint8_t *)"foo", 3,
+                                       100, 0, STM_DT_REG));
+    uint64_t cursor = UINT64_MAX;
+    stm_dirent_entry batch[16];
+    size_t n = 999;
+    STM_ASSERT_OK(stm_dirent_readdir(idx, 1, 2, &cursor, batch, 16, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+    STM_ASSERT_EQ(cursor, (uint64_t)UINT64_MAX);
+
+    /* Empty dir + saturated cursor also returns 0 (no infinite loop). */
+    cursor = UINT64_MAX; n = 999;
+    STM_ASSERT_OK(stm_dirent_readdir(idx, 1, 999, &cursor, batch, 16, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    stm_dirent_index_close(idx);
+}
+
+/* R75 P3-1: out-param zero-init contract. *out_returned must be
+ * zero-init'd BEFORE arg validation, so callers observing on
+ * STM_EINVAL see a defined value (0) regardless of which validation
+ * step rejected. */
+STM_TEST(dirent_readdir_r75_p3_1_out_param_zero_init_on_einval) {
+    stm_dirent_index *idx = stm_dirent_index_create();
+    uint64_t cursor = 0;
+    stm_dirent_entry batch[4];
+
+    /* Pre-fill with sentinel; STM_EINVAL must overwrite to 0. */
+    size_t n = 0xDEADBEEFu;
+    STM_ASSERT_ERR(stm_dirent_readdir(idx, /*ds=*/0, 2, &cursor, batch, 4, &n),
+                   STM_EINVAL);
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    /* dir_ino = 0 — same contract. */
+    n = 0xDEADBEEFu;
+    STM_ASSERT_ERR(stm_dirent_readdir(idx, 1, /*dir=*/0, &cursor, batch, 4, &n),
+                   STM_EINVAL);
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    /* max_entries = 0 — same. */
+    n = 0xDEADBEEFu;
+    STM_ASSERT_ERR(stm_dirent_readdir(idx, 1, 2, &cursor, batch, 0, &n),
+                   STM_EINVAL);
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    stm_dirent_index_close(idx);
+}
+
 STM_TEST(dirent_readdir_after_drop_for_dir) {
     /* drop_for_dir wipes records[]; subsequent readdir on the dir
      * returns 0 entries. */

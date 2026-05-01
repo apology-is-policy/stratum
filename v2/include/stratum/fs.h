@@ -493,7 +493,10 @@ typedef struct stm_fs_dirent_entry {
  * Cursor semantics (opaque to caller; treat as `uint64_t`):
  *   - Initial call: pass `*cursor = 0`.
  *   - Subsequent calls: pass back the prior call's returned `*cursor`.
- *   - Iteration done: `*out_returned == 0` after a call.
+ *   - Iteration done: `*out_returned == 0` after a call. May also be
+ *     signaled by `*cursor == UINT64_MAX` — the impl saturates the
+ *     cursor at UINT64_MAX as a "done" sentinel and short-circuits
+ *     on entry when the caller passes UINT64_MAX (R75 P2-1 fix).
  *
  * The cursor encoding combines the synthesized "." / ".." phase with
  * the stored dirent scan:

@@ -616,11 +616,24 @@ stm_status stm_dirent_readdir(const stm_dirent_index *idx,
                                   size_t max_entries,
                                   size_t *out_returned)
 {
+    /* R75 P3-1: zero-init out-param BEFORE arg validation so callers
+     * observing on STM_EINVAL see defined values regardless of which
+     * validation step rejected. Mirrors the R57 P3-5 / R58 P3-1
+     * uniform out-param contract used elsewhere in the codebase. */
+    if (out_returned) *out_returned = 0;
+
     if (!idx || !cursor || !out_entries || !out_returned) return STM_EINVAL;
     if (dataset_id == 0u || dir_ino == 0u) return STM_EINVAL;
     if (max_entries == 0u) return STM_EINVAL;
 
-    *out_returned = 0;
+    /* R75 P2-1: cursor saturation sentinel. Once the prior call's
+     * cursor advance hit UINT64_MAX (either from `last_probe + 1`
+     * saturation or because the highest live probe was UINT64_MAX
+     * itself), iteration is done — short-circuit before the filter
+     * loop. Without this guard, a record at probe=UINT64_MAX would
+     * get re-emitted forever because the strict-less-than filter
+     * `r->hash_probe < UINT64_MAX` is false at probe=UINT64_MAX. */
+    if (*cursor == UINT64_MAX) return STM_OK;
 
     /* Cast away const for lock acquisition; idx is logically read-only
      * across this call but we need write access to its mutex. Mirrors

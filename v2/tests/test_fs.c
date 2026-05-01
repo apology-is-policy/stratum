@@ -8237,6 +8237,139 @@ STM_TEST(fs_p4_readdir_pagination_with_create_unlink_between_calls) {
     unlink(g_key_path);
 }
 
+/* R75 P2-1: cursor saturation sentinel at the fs.c wrapper layer. */
+STM_TEST(fs_p4_readdir_r75_p2_1_cursor_saturation_terminates) {
+    make_tmp("p4_readdir_r75_sat");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    /* Populate a real entry so the dir is non-empty. */
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"x", 1,
+                                          0644u, 0, 0, &f));
+
+    /* Caller passes saturated cursor; readdir returns 0 entries. */
+    uint64_t cursor = UINT64_MAX;
+    stm_fs_dirent_entry batch[16];
+    size_t n = 999;
+    STM_ASSERT_OK(stm_fs_readdir(fs, 1, root, root, 0u,
+                                       &cursor, batch, 16, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+    STM_ASSERT_EQ(cursor, (uint64_t)UINT64_MAX);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* R75 P3-1: fs-layer zero-init contract on STM_EINVAL paths. */
+STM_TEST(fs_p4_readdir_r75_p3_1_out_param_zero_init_on_einval) {
+    make_tmp("p4_readdir_r75_zinit");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t cursor = 0;
+    stm_fs_dirent_entry batch[4];
+
+    /* Sentinel-prefilled. STM_EINVAL on any validation step must zero
+     * the out_returned. */
+    size_t n = 0xDEADBEEFu;
+    STM_ASSERT_ERR(stm_fs_readdir(fs, /*ds=*/0, root, root, 0u,
+                                        &cursor, batch, 4, &n),
+                   STM_EINVAL);
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    n = 0xDEADBEEFu;
+    STM_ASSERT_ERR(stm_fs_readdir(fs, 1, /*dir=*/0, root, 0u,
+                                        &cursor, batch, 4, &n),
+                   STM_EINVAL);
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    n = 0xDEADBEEFu;
+    STM_ASSERT_ERR(stm_fs_readdir(fs, 1, root, /*parent=*/0, 0u,
+                                        &cursor, batch, 4, &n),
+                   STM_EINVAL);
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    n = 0xDEADBEEFu;
+    STM_ASSERT_ERR(stm_fs_readdir(fs, 1, root, root, 0u,
+                                        &cursor, batch, /*max=*/0, &n),
+                   STM_EINVAL);
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    n = 0xDEADBEEFu;
+    STM_ASSERT_ERR(stm_fs_readdir(fs, 1, root, root, /*flags=*/0x80000000u,
+                                        &cursor, batch, 4, &n),
+                   STM_EINVAL);
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* R75 P3-3: RO-mount positive readdir test. fs.h documents that RO
+ * mounts are allowed; readdir composes only RO ops (lookup parent +
+ * dirent_readdir scan). */
+STM_TEST(fs_p4_readdir_r75_p3_3_ro_mount_succeeds) {
+    make_tmp("p4_readdir_r75_ro");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    /* Create + commit some entries while RW. */
+    uint64_t a = 0, b = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"alpha", 5,
+                                          0644u, 0, 0, &a));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"beta", 4,
+                                          0644u, 0, 0, &b));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    /* Remount RO. */
+    stm_fs_mount_opts ro_mopts = mopts;
+    ro_mopts.read_only = true;
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &ro_mopts, &fs));
+
+    /* readdir succeeds + returns the entries. */
+    uint64_t cursor = 0;
+    stm_fs_dirent_entry batch[16];
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_readdir(fs, 1, root, root, 0u,
+                                       &cursor, batch, 16, &n));
+    STM_ASSERT_EQ(n, (size_t)4);  /* "." + ".." + alpha + beta */
+
+    /* Verify alpha and beta are among the returned entries. */
+    bool saw_a = false, saw_b = false;
+    for (size_t i = 0; i < n; i++) {
+        if (batch[i].child_ino == a) saw_a = true;
+        if (batch[i].child_ino == b) saw_b = true;
+    }
+    STM_ASSERT_TRUE(saw_a && saw_b);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST(fs_p4_readdir_wedged_refused) {
     make_tmp("p4_readdir_wedged");
     stm_fs_format_opts fopts = default_format_opts();
