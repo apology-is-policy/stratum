@@ -279,6 +279,22 @@ static stm_status in_decode_value(const void *in, size_t in_len,
             return STM_ECORRUPT;
     }
 
+    /* R77 P1-1: bound `si_data_len` by STM_INODE_INLINE_MAX for INLINE
+     * and SYMLINK kinds. The on-disk value's `si_data.inline_data[100]`
+     * (and `symlink_target[100]`) slot is exactly STM_INODE_INLINE_MAX
+     * bytes — any larger value would cause readers (the inline-data
+     * memcpy in fs_write_regular_locked / fs_read_regular_locked, or
+     * stm_fs_readlink's symlink memcpy) to OOB-read past the union
+     * into si_reserved + off the end of the 256-byte struct, leaking
+     * stack to caller-controlled buffers. Same shape as R71 P1-1's
+     * writer-side / decoder-side symmetry: catch malformed records at
+     * the decode boundary so no API surface trusts unvalidated bytes
+     * downstream. */
+    if (out->value.si_data_kind == STM_DATA_INLINE ||
+        out->value.si_data_kind == STM_DATA_SYMLINK) {
+        if (out->value.si_data_len > STM_INODE_INLINE_MAX) return STM_ECORRUPT;
+    }
+
     /* Reconstruct state from the FREED flag. */
     uint32_t flags = stm_load_le32(out->value.si_flags);
     out->state = (flags & STM_INO_FLAG_FREED)
@@ -637,6 +653,21 @@ stm_status stm_inode_set(stm_inode_index *idx, uint64_t dataset_id,
         default:
             must_unlock(idx_lock(idx));
             return STM_EINVAL;
+    }
+    /* R77 P1-1: bound si_data_len by STM_INODE_INLINE_MAX for
+     * INLINE / SYMLINK kinds — symmetric with the decoder-side
+     * guard so a hostile or buggy caller can't commit a record that
+     * would OOB-read on the next stm_fs_readlink / inline-data
+     * fetch (fs.c::fs_write_regular_locked / fs_read_regular_locked /
+     * stm_fs_readlink all memcpy `si_data.inline_data` /
+     * `symlink_target` for `si_data_len` bytes; the on-disk slot is
+     * exactly STM_INODE_INLINE_MAX bytes). */
+    if (in_value->si_data_kind == STM_DATA_INLINE ||
+        in_value->si_data_kind == STM_DATA_SYMLINK) {
+        if (in_value->si_data_len > STM_INODE_INLINE_MAX) {
+            must_unlock(idx_lock(idx));
+            return STM_EINVAL;
+        }
     }
     /* Reject Set with the FREED bit set in si_flags — that bit is
      * the allocator's internal lifecycle marker; callers reach FREED

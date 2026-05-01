@@ -475,6 +475,10 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
  *   - target == NULL OR target_len == 0 (STM_EINVAL — empty symlink
  *     not allowed, matches Linux behavior).
  *   - target_len > STM_INODE_INLINE_MAX (STM_ENAMETOOLONG).
+ *     [R77 P3-2: STM_ENAMETOOLONG is the POSIX-aligned errno for
+ *      path-shaped fields (filenames, symlink targets); STM_ERANGE
+ *      (used by stm_fs_write for size-too-large refusals) is for
+ *      counts. Different semantic categories — don't conflate.]
  *   - target contains NUL byte (STM_EINVAL — symlink targets are
  *     C strings; NUL would terminate them prematurely on read).
  *   - parent not a directory (STM_ENOTDIR).

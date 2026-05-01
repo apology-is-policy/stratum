@@ -9121,4 +9121,55 @@ STM_TEST(fs_p8_symlink_unlink_frees_inode) {
     unlink(g_key_path);
 }
 
+/* R77 P1-1: writer-side guard — stm_inode_set must reject
+ * `si_data_len > STM_INODE_INLINE_MAX` for INLINE / SYMLINK kinds.
+ * Without this guard a hostile/buggy caller could commit a record
+ * that would OOB-read on the next stm_fs_readlink (or inline-data
+ * read) memcpy. */
+STM_TEST(fs_p8_r77_p1_1_inode_set_rejects_oversize_si_data_len) {
+    make_tmp("p8_r77_oversize_dl");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    /* Allocate a valid symlink first. */
+    const uint8_t target[] = "x";
+    uint64_t link_ino = 0;
+    STM_ASSERT_OK(stm_fs_symlink(fs, 1, root, (const uint8_t *)"l", 1,
+                                       target, 1, 0, 0, &link_ino));
+
+    /* Read the inode, mutate si_data_len to 200, attempt to set
+     * via the test seam. The writer guard rejects with STM_EINVAL. */
+    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync_for_test(fs));
+    STM_ASSERT(iidx != NULL);
+    struct stm_inode_value iv = {0};
+    STM_ASSERT_OK(stm_inode_lookup(iidx, 1, link_ino, &iv));
+
+    /* Crafted: SYMLINK kind + oversize si_data_len. */
+    iv.si_data_len = 200;
+    STM_ASSERT_ERR(stm_inode_set(iidx, 1, link_ino, &iv), STM_EINVAL);
+
+    /* Same shape for INLINE. */
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+    struct stm_inode_value iv2 = {0};
+    STM_ASSERT_OK(stm_inode_lookup(iidx, 1, f, &iv2));
+    iv2.si_data_len = 200;       /* INLINE + oversize */
+    STM_ASSERT_ERR(stm_inode_set(iidx, 1, f, &iv2), STM_EINVAL);
+
+    /* Sanity: with si_data_len at the cap (100), set succeeds. */
+    iv.si_data_len = (uint8_t)STM_INODE_INLINE_MAX;
+    STM_ASSERT_OK(stm_inode_set(iidx, 1, link_ino, &iv));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")

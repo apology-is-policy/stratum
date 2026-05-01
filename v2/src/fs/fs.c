@@ -522,6 +522,16 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
     uint8_t kind = iv->si_data_kind;
     uint64_t end_off = off + (uint64_t)len;
 
+    /* R77 P1-1 defense-in-depth: bound si_data_len by inline cap on
+     * the read of the existing inline prefix (memcpy at the inline
+     * fast-path's zero-fill + the transition path's combined-buffer
+     * build). Decoder + stm_inode_set both reject oversize already
+     * — this is belt-and-suspenders for any layer that bypassed
+     * either guard. */
+    if (kind == STM_DATA_INLINE && iv->si_data_len > STM_INODE_INLINE_MAX) {
+        return STM_ECORRUPT;
+    }
+
     if (kind == STM_DATA_INLINE) {
         if (end_off <= (uint64_t)STM_INODE_INLINE_MAX) {
             /* Inline fast path. Zero-fill any gap from current
@@ -631,6 +641,12 @@ static stm_status fs_read_regular_locked(stm_fs *fs,
 {
     uint8_t kind = iv->si_data_kind;
     uint64_t cur_size = stm_load_le64(iv->si_size);
+
+    /* R77 P1-1 defense-in-depth: bound si_data_len by inline cap on
+     * INLINE reads. */
+    if (kind == STM_DATA_INLINE && iv->si_data_len > STM_INODE_INLINE_MAX) {
+        return STM_ECORRUPT;
+    }
 
     if (kind == STM_DATA_INLINE) {
         if (off >= cur_size) {
@@ -1318,6 +1334,10 @@ stm_status stm_fs_symlink(stm_fs *fs, uint64_t dataset_id,
                               uint32_t uid, uint32_t gid,
                               uint64_t *out_child_ino)
 {
+    /* R77 P3-1: zero-init out_child_ino BEFORE arg validation per
+     * the R57 P3-5 / R76 P3-3 uniform out-param contract. */
+    if (out_child_ino) *out_child_ino = 0;
+
     if (!fs || !out_child_ino) return STM_EINVAL;
     if (dataset_id == 0u || parent_ino == 0u) return STM_EINVAL;
     stm_status nv = fs_validate_dirent_name(name, name_len);
@@ -1333,8 +1353,6 @@ stm_status stm_fs_symlink(stm_fs *fs, uint64_t dataset_id,
     for (uint16_t i = 0; i < target_len; i++) {
         if (target[i] == 0u) return STM_EINVAL;
     }
-
-    *out_child_ino = 0;
 
     pthread_mutex_lock(&fs->lock);
     FS_GUARD_WRITE(fs);
@@ -1440,6 +1458,15 @@ stm_status stm_fs_readlink(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (iv.si_data_kind != STM_DATA_SYMLINK) {
         /* Decoder-vs-mode mismatch: the inode says S_IFLNK but the
          * data union doesn't carry SYMLINK bytes. Treat as corrupt. */
+        pthread_mutex_unlock(&fs->lock);
+        return STM_ECORRUPT;
+    }
+    /* R77 P1-1 defense-in-depth: even though `stm_inode_set` and
+     * `in_decode_value` now both bound si_data_len ≤
+     * STM_INODE_INLINE_MAX for SYMLINK records, the reader checks
+     * before the memcpy so a hypothetical bypass at either layer
+     * (test seam, future refactor) can't OOB-read the union. */
+    if (iv.si_data_len > STM_INODE_INLINE_MAX) {
         pthread_mutex_unlock(&fs->lock);
         return STM_ECORRUPT;
     }
