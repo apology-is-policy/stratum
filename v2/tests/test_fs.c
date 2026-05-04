@@ -37,6 +37,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #define TEST_DEVICE_BYTES     (UINT64_C(16) * 1024u * 1024u)
@@ -7743,18 +7744,24 @@ STM_TEST(fs_p3_utimens_basic) {
                                           (const uint8_t *)"f", 1,
                                           0644u, 0, 0, &child));
 
+    /* P8-POSIX-7a: utimens always auto-stamps ctime to "now" per
+     * POSIX utimensat(2) semantics — the caller-supplied ctime args
+     * are ignored. atime/mtime use the caller-supplied values
+     * verbatim. */
     STM_ASSERT_OK(stm_fs_utimens(fs, 1, child,
                                       /*atime=*/1234567u, 100u,
                                       /*mtime=*/2345678u, 200u,
-                                      /*ctime=*/3456789u, 300u));
+                                      /*ctime_unused=*/0u, 0u));
     struct stm_inode_value v = {0};
     STM_ASSERT_OK(stm_fs_stat(fs, 1, child, &v));
     STM_ASSERT_EQ(stm_load_le64(v.si_atime_sec),  (uint64_t)1234567u);
     STM_ASSERT_EQ(stm_load_le32(v.si_atime_nsec), (uint32_t)100u);
     STM_ASSERT_EQ(stm_load_le64(v.si_mtime_sec),  (uint64_t)2345678u);
     STM_ASSERT_EQ(stm_load_le32(v.si_mtime_nsec), (uint32_t)200u);
-    STM_ASSERT_EQ(stm_load_le64(v.si_ctime_sec),  (uint64_t)3456789u);
-    STM_ASSERT_EQ(stm_load_le32(v.si_ctime_nsec), (uint32_t)300u);
+    /* ctime auto-stamped to "now" — not a fixed value. Only verify
+     * it's been set (non-zero) AND that it's NOT the caller-supplied
+     * zero (proving auto-stamp ran). */
+    STM_ASSERT_TRUE(stm_load_le64(v.si_ctime_sec) > 0u);
 
     /* nsec >= 1e9 → STM_EINVAL. */
     STM_ASSERT_ERR(stm_fs_utimens(fs, 1, child,
@@ -10375,6 +10382,464 @@ STM_TEST(fs_p6_r80_p2_1_setxattr_refuses_nul_in_name) {
      * NUL check isn't over-rejecting. */
     STM_ASSERT_OK(stm_fs_setxattr(fs, 1, f, (const uint8_t *)"user.evil", 9,
                                        (const uint8_t *)"v", 1, 0, NULL));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* ========================================================================= */
+/* P8-POSIX-7a: clock-source + ctime/mtime/btime stamping discipline tests.   */
+/* ========================================================================= */
+
+/* Helper to stamp a "before" wall-clock time for stamping tests.
+ * Returns CLOCK_REALTIME seconds; tests assert post-op timestamps
+ * are >= this value (modulo coarse second-boundary timing). */
+static uint64_t fs_p7a_now_sec(void) {
+    struct timespec ts = {0, 0};
+    (void)clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec;
+}
+
+STM_TEST(fs_p7a_create_stamps_btime_atime_mtime_ctime) {
+    make_tmp("p7a_create_stamps");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t before = fs_p7a_now_sec();
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v));
+    /* All four timestamps should be >= before (clock resolution permitting). */
+    uint64_t btime = stm_load_le64(v.si_btime_sec);
+    uint64_t atime = stm_load_le64(v.si_atime_sec);
+    uint64_t mtime = stm_load_le64(v.si_mtime_sec);
+    uint64_t ctime = stm_load_le64(v.si_ctime_sec);
+    STM_ASSERT_TRUE(btime >= before);
+    STM_ASSERT_TRUE(atime >= before);
+    STM_ASSERT_TRUE(mtime >= before);
+    STM_ASSERT_TRUE(ctime >= before);
+    /* btime + atime + mtime + ctime stamped together — same wall-clock
+     * tick (nsec diff < 1 second). */
+    STM_ASSERT_EQ(btime, atime);
+    STM_ASSERT_EQ(btime, mtime);
+    STM_ASSERT_EQ(btime, ctime);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_mkdir_stamps_btime_atime_mtime_ctime) {
+    make_tmp("p7a_mkdir_stamps");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t before = fs_p7a_now_sec();
+    uint64_t d = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"d", 1,
+                                    0755u, 0, 0, &d));
+
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, d, &v));
+    STM_ASSERT_TRUE(stm_load_le64(v.si_btime_sec) >= before);
+    STM_ASSERT_TRUE(stm_load_le64(v.si_ctime_sec) >= before);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_symlink_stamps_btime_atime_mtime_ctime) {
+    make_tmp("p7a_symlink_stamps");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t before = fs_p7a_now_sec();
+    uint64_t s = 0;
+    STM_ASSERT_OK(stm_fs_symlink(fs, 1, root, (const uint8_t *)"l", 1,
+                                      (const uint8_t *)"/target", 7,
+                                      0, 0, &s));
+
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, s, &v));
+    STM_ASSERT_TRUE(stm_load_le64(v.si_btime_sec) >= before);
+    STM_ASSERT_TRUE(stm_load_le64(v.si_ctime_sec) >= before);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* Pin: chmod stamps ctime, preserves btime + mtime. */
+STM_TEST(fs_p7a_chmod_stamps_ctime_preserves_btime_mtime) {
+    make_tmp("p7a_chmod_ctime");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+
+    struct stm_inode_value v0 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v0));
+    uint64_t btime0 = stm_load_le64(v0.si_btime_sec);
+    uint64_t mtime0 = stm_load_le64(v0.si_mtime_sec);
+
+    /* Sleep one second to ensure clock advances at second granularity. */
+    struct timespec slp = {1, 0};
+    (void)nanosleep(&slp, NULL);
+
+    STM_ASSERT_OK(stm_fs_chmod(fs, 1, f, 0755u));
+    struct stm_inode_value v1 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v1));
+    /* btime + mtime preserved, ctime advanced. */
+    STM_ASSERT_EQ(stm_load_le64(v1.si_btime_sec), btime0);
+    STM_ASSERT_EQ(stm_load_le64(v1.si_mtime_sec), mtime0);
+    STM_ASSERT_TRUE(stm_load_le64(v1.si_ctime_sec) > stm_load_le64(v0.si_ctime_sec));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* Pin: chown stamps ctime when uid/gid changed; no-op (UINT32_MAX,
+ * UINT32_MAX) leaves ctime alone. */
+STM_TEST(fs_p7a_chown_stamps_ctime_when_changed) {
+    make_tmp("p7a_chown_ctime");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+
+    struct stm_inode_value v0 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v0));
+    uint64_t ctime0 = stm_load_le64(v0.si_ctime_sec);
+
+    struct timespec slp = {1, 0};
+    (void)nanosleep(&slp, NULL);
+
+    /* Real chown — ctime advances. */
+    STM_ASSERT_OK(stm_fs_chown(fs, 1, f, 1234, 5678));
+    struct stm_inode_value v1 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v1));
+    STM_ASSERT_TRUE(stm_load_le64(v1.si_ctime_sec) > ctime0);
+
+    /* No-op chown — ctime preserved. */
+    uint64_t ctime1 = stm_load_le64(v1.si_ctime_sec);
+    (void)nanosleep(&slp, NULL);
+    STM_ASSERT_OK(stm_fs_chown(fs, 1, f, UINT32_MAX, UINT32_MAX));
+    struct stm_inode_value v2 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v2));
+    STM_ASSERT_EQ(stm_load_le64(v2.si_ctime_sec), ctime1);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* Pin: write stamps mtime + ctime; preserves btime. */
+STM_TEST(fs_p7a_write_stamps_mtime_ctime_preserves_btime) {
+    make_tmp("p7a_write_mtime");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+
+    struct stm_inode_value v0 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v0));
+    uint64_t btime0 = stm_load_le64(v0.si_btime_sec);
+    uint64_t mtime0 = stm_load_le64(v0.si_mtime_sec);
+
+    struct timespec slp = {1, 0};
+    (void)nanosleep(&slp, NULL);
+
+    /* Write inline. */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, (const uint8_t *)"hi", 2));
+
+    struct stm_inode_value v1 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v1));
+    /* btime preserved; mtime + ctime advanced. */
+    STM_ASSERT_EQ(stm_load_le64(v1.si_btime_sec), btime0);
+    STM_ASSERT_TRUE(stm_load_le64(v1.si_mtime_sec) > mtime0);
+    STM_ASSERT_TRUE(stm_load_le64(v1.si_ctime_sec) > stm_load_le64(v0.si_ctime_sec));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* Pin: truncate stamps mtime + ctime; preserves btime. */
+STM_TEST(fs_p7a_truncate_stamps_mtime_ctime) {
+    make_tmp("p7a_trunc_mtime");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, (const uint8_t *)"hello", 5));
+
+    struct stm_inode_value v0 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v0));
+    uint64_t btime0 = stm_load_le64(v0.si_btime_sec);
+    uint64_t mtime0 = stm_load_le64(v0.si_mtime_sec);
+
+    struct timespec slp = {1, 0};
+    (void)nanosleep(&slp, NULL);
+
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, f, 3u));
+
+    struct stm_inode_value v1 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v1));
+    STM_ASSERT_EQ(stm_load_le64(v1.si_btime_sec), btime0);
+    STM_ASSERT_TRUE(stm_load_le64(v1.si_mtime_sec) > mtime0);
+    STM_ASSERT_TRUE(stm_load_le64(v1.si_ctime_sec) > stm_load_le64(v0.si_ctime_sec));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* Pin: setxattr stamps ctime; preserves mtime + btime. */
+STM_TEST(fs_p7a_setxattr_stamps_ctime_preserves_mtime) {
+    make_tmp("p7a_setxattr_ctime");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+
+    struct stm_inode_value v0 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v0));
+    uint64_t btime0 = stm_load_le64(v0.si_btime_sec);
+    uint64_t mtime0 = stm_load_le64(v0.si_mtime_sec);
+
+    struct timespec slp = {1, 0};
+    (void)nanosleep(&slp, NULL);
+
+    STM_ASSERT_OK(stm_fs_setxattr(fs, 1, f,
+                                       (const uint8_t *)"user.k", 6,
+                                       (const uint8_t *)"v", 1, 0, NULL));
+
+    struct stm_inode_value v1 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v1));
+    /* btime + mtime preserved; ctime advanced. */
+    STM_ASSERT_EQ(stm_load_le64(v1.si_btime_sec), btime0);
+    STM_ASSERT_EQ(stm_load_le64(v1.si_mtime_sec), mtime0);
+    STM_ASSERT_TRUE(stm_load_le64(v1.si_ctime_sec) > stm_load_le64(v0.si_ctime_sec));
+
+    /* removexattr: same shape — ctime advances, mtime + btime
+     * preserved. */
+    uint64_t ctime1 = stm_load_le64(v1.si_ctime_sec);
+    (void)nanosleep(&slp, NULL);
+
+    STM_ASSERT_OK(stm_fs_removexattr(fs, 1, f, (const uint8_t *)"user.k", 6));
+
+    struct stm_inode_value v2 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v2));
+    STM_ASSERT_EQ(stm_load_le64(v2.si_btime_sec), btime0);
+    STM_ASSERT_EQ(stm_load_le64(v2.si_mtime_sec), mtime0);
+    STM_ASSERT_TRUE(stm_load_le64(v2.si_ctime_sec) > ctime1);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* Pin: link stamps ctime on the linked inode; unlink stamps ctime when
+ * not cascade-freed; preserves mtime + btime. */
+STM_TEST(fs_p7a_link_unlink_stamps_ctime) {
+    make_tmp("p7a_link_ctime");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"a", 1,
+                                          0644u, 0, 0, &f));
+
+    struct stm_inode_value v0 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v0));
+    uint64_t btime0 = stm_load_le64(v0.si_btime_sec);
+    uint64_t mtime0 = stm_load_le64(v0.si_mtime_sec);
+
+    struct timespec slp = {1, 0};
+    (void)nanosleep(&slp, NULL);
+
+    /* link: ctime stamp on inode. */
+    STM_ASSERT_OK(stm_fs_link(fs, 1, root, (const uint8_t *)"a", 1,
+                                    root, (const uint8_t *)"b", 1));
+
+    struct stm_inode_value v1 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v1));
+    STM_ASSERT_EQ(stm_load_le64(v1.si_btime_sec), btime0);
+    STM_ASSERT_EQ(stm_load_le64(v1.si_mtime_sec), mtime0);
+    STM_ASSERT_TRUE(stm_load_le64(v1.si_ctime_sec) > stm_load_le64(v0.si_ctime_sec));
+    STM_ASSERT_EQ(stm_load_le32(v1.si_nlink), (uint32_t)2);
+
+    /* unlink one of the two names — ctime advances on the surviving
+     * inode (nlink → 1, not cascade-freed). */
+    uint64_t ctime1 = stm_load_le64(v1.si_ctime_sec);
+    (void)nanosleep(&slp, NULL);
+
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, root, (const uint8_t *)"a", 1));
+
+    struct stm_inode_value v2 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v2));
+    STM_ASSERT_EQ(stm_load_le32(v2.si_nlink), (uint32_t)1);
+    STM_ASSERT_EQ(stm_load_le64(v2.si_btime_sec), btime0);
+    STM_ASSERT_EQ(stm_load_le64(v2.si_mtime_sec), mtime0);
+    STM_ASSERT_TRUE(stm_load_le64(v2.si_ctime_sec) > ctime1);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* Pin: rename stamps ctime on the moved inode; preserves mtime + btime. */
+STM_TEST(fs_p7a_rename_stamps_ctime_on_moved_inode) {
+    make_tmp("p7a_rename_ctime");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"old", 3,
+                                          0644u, 0, 0, &f));
+
+    struct stm_inode_value v0 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v0));
+    uint64_t btime0 = stm_load_le64(v0.si_btime_sec);
+    uint64_t mtime0 = stm_load_le64(v0.si_mtime_sec);
+    uint64_t ctime0 = stm_load_le64(v0.si_ctime_sec);
+
+    struct timespec slp = {1, 0};
+    (void)nanosleep(&slp, NULL);
+
+    STM_ASSERT_OK(stm_fs_rename(fs, 1, root, (const uint8_t *)"old", 3,
+                                       root, (const uint8_t *)"new", 3, 0u));
+
+    struct stm_inode_value v1 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v1));
+    STM_ASSERT_EQ(stm_load_le64(v1.si_btime_sec), btime0);
+    STM_ASSERT_EQ(stm_load_le64(v1.si_mtime_sec), mtime0);
+    STM_ASSERT_TRUE(stm_load_le64(v1.si_ctime_sec) > ctime0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* Pin: btime is immutable post-create — every metadata op preserves it.
+ * Composite test covering chmod / chown / write / truncate / setxattr
+ * / link / rename in sequence; final btime equals create-time btime. */
+STM_TEST(fs_p7a_btime_immutable_across_all_ops) {
+    make_tmp("p7a_btime_immutable");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+
+    struct stm_inode_value v0 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v0));
+    uint64_t btime0 = stm_load_le64(v0.si_btime_sec);
+    uint32_t btime0_nsec = stm_load_le32(v0.si_btime_nsec);
+
+    struct timespec slp = {0, 100000000};   /* 100 ms */
+    (void)nanosleep(&slp, NULL);
+
+    /* Sequence of metadata-mutating ops. */
+    STM_ASSERT_OK(stm_fs_chmod(fs, 1, f, 0755u));
+    STM_ASSERT_OK(stm_fs_chown(fs, 1, f, 100, 200));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, (const uint8_t *)"x", 1));
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, f, 0));
+    STM_ASSERT_OK(stm_fs_setxattr(fs, 1, f, (const uint8_t *)"user.k", 6,
+                                       (const uint8_t *)"v", 1, 0, NULL));
+    STM_ASSERT_OK(stm_fs_removexattr(fs, 1, f, (const uint8_t *)"user.k", 6));
+    STM_ASSERT_OK(stm_fs_utimens(fs, 1, f, 1u, 0u, 1u, 0u, 0u, 0u));
+    STM_ASSERT_OK(stm_fs_rename(fs, 1, root, (const uint8_t *)"f", 1,
+                                       root, (const uint8_t *)"g", 1, 0u));
+
+    /* btime preserved through every op. */
+    struct stm_inode_value v1 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v1));
+    STM_ASSERT_EQ(stm_load_le64(v1.si_btime_sec),  btime0);
+    STM_ASSERT_EQ(stm_load_le32(v1.si_btime_nsec), btime0_nsec);
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);

@@ -47,6 +47,7 @@
 #include <stratum/sync.h>
 
 #include <sys/stat.h>            /* S_IFMT / S_IFREG / S_IFDIR */
+#include <time.h>                /* clock_gettime / CLOCK_REALTIME */
 
 #include <pthread.h>
 #include <stdlib.h>
@@ -107,6 +108,87 @@ struct stm_fs {
         return STM_EROFS;                                                  \
     }                                                                      \
 } while (0)
+
+/* ========================================================================= */
+/* P8-POSIX-7a: clock source + ctime/mtime/btime stamping discipline.        */
+/*                                                                            */
+/* Closes the P8-wide R78 P3-3 forward-noted gap. Pre-7a, every inode         */
+/* came out of `stm_inode_alloc` with all timestamps zeroed and the various   */
+/* fs ops (chmod / chown / link / unlink / write / truncate / setxattr) did   */
+/* not touch ctime/mtime — `stm_fs_utimens` was the only stamping path,       */
+/* and it required the caller to supply ctime explicitly. Post-7a, every      */
+/* metadata-changing op auto-stamps ctime to "now" via CLOCK_REALTIME +       */
+/* every content-changing op auto-stamps mtime + ctime, matching POSIX        */
+/* semantics for ext4/XFS/APFS. btime is stamped exactly once at inode        */
+/* creation (POSIX `creation time`; never modified thereafter).               */
+/*                                                                            */
+/* Atime-on-read is deliberately NOT stamped in this chunk (Linux `noatime`   */
+/* default shape — every read becoming a write to the inode tree would        */
+/* dominate the read path's cost). atime is stamped at create + via the      */
+/* explicit `stm_fs_utimens` API. A future P8-POSIX-7a-relatime chunk could  */
+/* add per-dataset opt-in via STM_PROP_*.                                     */
+/*                                                                            */
+/* Clock source: CLOCK_REALTIME via clock_gettime(2). The per-call cost is   */
+/* a single VDSO syscall on Linux + macOS — negligible vs the inode_set      */
+/* it bookends. Failure (extremely rare; bad arg only) leaves the timespec    */
+/* at zero and stamps zero — degenerate but bounded.                          */
+/*                                                                            */
+/* Why CLOCK_REALTIME and not CLOCK_MONOTONIC: POSIX timestamps are wall-    */
+/* clock; users compare them across reboots and across machines. A MONOTONIC */
+/* source would survive clock skew but not be comparable across boots.       */
+/* Future work: pin a max-skew invariant via scrub if NTP-monotonicity        */
+/* becomes load-bearing (currently a soft property).                          */
+/* ========================================================================= */
+
+/* Capture CLOCK_REALTIME into LE seconds + LE nanoseconds. */
+static inline void fs_clock_now_le(le64 *out_sec, le32 *out_nsec)
+{
+    struct timespec ts = { 0, 0 };
+    /* clock_gettime errors only on bad arg / bad clock id; both are
+     * compile-time wrong here. Defensive: ignore rv, ts stays zero. */
+    (void)clock_gettime(CLOCK_REALTIME, &ts);
+    if (out_sec)  *out_sec  = stm_store_le64((uint64_t)ts.tv_sec);
+    if (out_nsec) *out_nsec = stm_store_le32((uint32_t)ts.tv_nsec);
+}
+
+/* Stamp btime + atime + mtime + ctime to "now". Used at every inode
+ * creation site so freshly-allocated inodes carry a defined creation
+ * time + initial atime/mtime/ctime. POSIX requires btime be set at
+ * create and never modified thereafter; subsequent stamping helpers
+ * preserve btime. */
+static inline void fs_stamp_create_times(struct stm_inode_value *iv)
+{
+    le64 sec; le32 nsec;
+    fs_clock_now_le(&sec, &nsec);
+    iv->si_btime_sec = sec; iv->si_btime_nsec = nsec;
+    iv->si_atime_sec = sec; iv->si_atime_nsec = nsec;
+    iv->si_mtime_sec = sec; iv->si_mtime_nsec = nsec;
+    iv->si_ctime_sec = sec; iv->si_ctime_nsec = nsec;
+}
+
+/* Stamp mtime + ctime to "now". Used after content-change ops:
+ * fs_write, fs_truncate (size or content change). POSIX: mtime
+ * captures content modification + ctime captures any inode
+ * metadata change (which a size/content change implies). btime
+ * is preserved (immutable post-create per POSIX). */
+static inline void fs_stamp_mtime_ctime_now(struct stm_inode_value *iv)
+{
+    le64 sec; le32 nsec;
+    fs_clock_now_le(&sec, &nsec);
+    iv->si_mtime_sec = sec; iv->si_mtime_nsec = nsec;
+    iv->si_ctime_sec = sec; iv->si_ctime_nsec = nsec;
+}
+
+/* Stamp ctime to "now". Used after metadata-change ops: chmod,
+ * chown, link, unlink (the linked/unlinked inode), setxattr,
+ * removexattr, rename. POSIX: ctime captures any inode metadata
+ * change without modifying mtime. btime preserved. */
+static inline void fs_stamp_ctime_now(struct stm_inode_value *iv)
+{
+    le64 sec; le32 nsec;
+    fs_clock_now_le(&sec, &nsec);
+    iv->si_ctime_sec = sec; iv->si_ctime_nsec = nsec;
+}
 
 /* ========================================================================= */
 /* Format.                                                                    */
@@ -548,6 +630,10 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
             uint8_t new_len = (uint8_t)((end_off > cur_len) ? end_off : cur_len);
             iv->si_data_len = new_len;
             fs_inode_bump_size(iv, end_off);
+            /* P8-POSIX-7a: stamp mtime + ctime on the modified inode.
+             * Every successful fs_write is a content change → both
+             * mtime + ctime advance per POSIX. */
+            fs_stamp_mtime_ctime_now(iv);
             return stm_inode_set(iidx, ds, ino, iv);
         }
 
@@ -608,6 +694,11 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
         iv->si_data_len = 0;
         memset(&iv->si_data, 0, sizeof iv->si_data);
         iv->si_size = stm_store_le64(new_size);
+        /* P8-POSIX-7a: stamp mtime + ctime on the transitioned inode.
+         * The transition is both a content change (data moved into
+         * extent) AND a kind transition (INLINE → EXTENT) — POSIX
+         * stamps mtime + ctime on either alone. */
+        fs_stamp_mtime_ctime_now(iv);
         return stm_inode_set(iidx, ds, ino, iv);
     }
 
@@ -618,12 +709,17 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
         uint64_t cur_size = stm_load_le64(iv->si_size);
         if (end_off > cur_size) {
             iv->si_size = stm_store_le64(end_off);
-            /* R76 P3-2: same infallibility argument as P3-1 — the
-             * lock posture excludes every STM_E* path through
-             * stm_inode_set. */
-            return stm_inode_set(iidx, ds, ino, iv);
         }
-        return STM_OK;
+        /* P8-POSIX-7a: stamp mtime + ctime on every successful extent
+         * write — including the no-grow case (overwrite-within-bounds
+         * is still a content modification per POSIX). The no-grow
+         * branch previously returned STM_OK without calling
+         * stm_inode_set; post-7a, every write goes through set so
+         * the timestamp persists. The cost is one inode-tree write
+         * per fs_write call; trade-off accepted for POSIX compliance.
+         * R76 P3-2: lock-posture infallibility argument applies. */
+        fs_stamp_mtime_ctime_now(iv);
+        return stm_inode_set(iidx, ds, ino, iv);
     }
 
     /* SYMLINK / DEVICE / unknown: regular-file write rejected. The
@@ -892,6 +988,27 @@ static stm_status fs_create_inode_and_link(stm_fs *fs,
     }
     uint64_t child_gen = stm_load_le64(cv.si_gen);
 
+    /* P8-POSIX-7a: stamp btime + atime + mtime + ctime at creation.
+     * POSIX requires btime set at create and never modified thereafter.
+     * The freshly-allocated inode comes out of stm_inode_alloc with
+     * all timestamps zero — without this, statx would surface
+     * (0, 0) as the creation time which downstream tools treat as
+     * "1970-01-01 epoch" or as a sentinel for "never set". Stamp
+     * BEFORE the dirent install so a successful create publishes
+     * the inode with live timestamps; failed dirent rolls back the
+     * inode entirely. Lock-posture infallibility: stm_inode_set
+     * cannot fail here (R76 P3-1 / R78 P3-1 argument — every
+     * STM_E* return presupposes a state mutation only the
+     * alloc/free path can perform; fs->lock holding excludes
+     * concurrent allocator activity). */
+    fs_stamp_create_times(&cv);
+    stm_status ts = stm_inode_set(iidx, dataset_id, child_ino, &cv);
+    if (ts != STM_OK) {
+        (void)stm_inode_free(iidx, dataset_id, child_ino);
+        pthread_mutex_unlock(&fs->lock);
+        return ts;
+    }
+
     /* Link in parent. Roll back the inode if the dirent fails. */
     stm_status ds = stm_dirent_alloc(didx, dataset_id, parent_ino,
                                           name, name_len,
@@ -1063,6 +1180,19 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
     bool freed = false;
     (void)stm_inode_unlink(iidx, dataset_id, child_ino, &freed);
 
+    /* P8-POSIX-7a: unlink that decrements nlink without cascade-freeing
+     * is a metadata change → ctime auto-stamps to "now" on the
+     * surviving inode. Cascade-freed inodes are no longer ALLOCATED
+     * (FREED state), so stamping is skipped. */
+    if (!freed) {
+        struct stm_inode_value cv2 = {0};
+        stm_status ls2 = stm_inode_lookup(iidx, dataset_id, child_ino, &cv2);
+        if (ls2 == STM_OK) {
+            fs_stamp_ctime_now(&cv2);
+            (void)stm_inode_set(iidx, dataset_id, child_ino, &cv2);
+        }
+    }
+
     pthread_mutex_unlock(&fs->lock);
     return STM_OK;
 }
@@ -1150,6 +1280,10 @@ stm_status stm_fs_chmod(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     uint32_t new_mode = cur_type | (mode & 07777u);
     v.si_mode = stm_store_le32(new_mode);
 
+    /* P8-POSIX-7a: chmod is a metadata change → ctime auto-stamps to
+     * "now" per POSIX. mtime + btime preserved. */
+    fs_stamp_ctime_now(&v);
+
     stm_status ss = stm_inode_set(iidx, dataset_id, ino, &v);
     pthread_mutex_unlock(&fs->lock);
     return ss;
@@ -1178,8 +1312,16 @@ stm_status stm_fs_chown(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     }
     /* POSIX chown(-1, ...) semantics: UINT32_MAX leaves the field
      * unchanged. Both UINT32_MAX is a no-op. */
-    if (uid != UINT32_MAX) v.si_uid = stm_store_le32(uid);
-    if (gid != UINT32_MAX) v.si_gid = stm_store_le32(gid);
+    bool changed = false;
+    if (uid != UINT32_MAX) { v.si_uid = stm_store_le32(uid); changed = true; }
+    if (gid != UINT32_MAX) { v.si_gid = stm_store_le32(gid); changed = true; }
+
+    /* P8-POSIX-7a: chown is a metadata change → ctime auto-stamps to
+     * "now" per POSIX, but ONLY if at least one of uid / gid actually
+     * changed. The (UINT32_MAX, UINT32_MAX) no-op path leaves ctime
+     * unchanged so callers can probe via chown without bumping
+     * ctime. mtime + btime preserved. */
+    if (changed) fs_stamp_ctime_now(&v);
 
     stm_status ss = stm_inode_set(iidx, dataset_id, ino, &v);
     pthread_mutex_unlock(&fs->lock);
@@ -1215,15 +1357,16 @@ stm_status stm_fs_utimens(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     v.si_atime_nsec = stm_store_le32(atime_nsec);
     v.si_mtime_sec  = stm_store_le64(mtime_sec);
     v.si_mtime_nsec = stm_store_le32(mtime_nsec);
-    /* POSIX semantics: ctime is updated to "now" on metadata change.
-     * Without an in-tree clock yet, the wrapper requires the caller
-     * to pass ctime explicitly; pass 0/0 to leave unchanged.
-     * P8-POSIX-7's `statx` integration will replace this with an
-     * automatic clock-source. */
-    if (ctime_sec != 0u || ctime_nsec != 0u) {
-        v.si_ctime_sec  = stm_store_le64(ctime_sec);
-        v.si_ctime_nsec = stm_store_le32(ctime_nsec);
-    }
+    /* P8-POSIX-7a: ctime auto-stamps to "now" on every utimens call
+     * (POSIX utimensat semantics: setting atime/mtime is a metadata
+     * change → ctime updates). The historical caller-supplied
+     * ctime_sec/ctime_nsec args are now IGNORED — kept in the
+     * signature for API stability. Future API cleanup may drop them.
+     * If caller-supplied ctime is non-zero, we still ignore it; the
+     * pre-7a "0/0 = leave unchanged" semantic is gone — the closest
+     * non-mutating equivalent is "don't call utimens at all". */
+    (void)ctime_sec; (void)ctime_nsec;
+    fs_stamp_ctime_now(&v);
 
     stm_status ss = stm_inode_set(iidx, dataset_id, ino, &v);
     pthread_mutex_unlock(&fs->lock);
@@ -1298,6 +1441,19 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
     if (ils != STM_OK) {
         pthread_mutex_unlock(&fs->lock);
         return ils;
+    }
+    /* P8-POSIX-7a: link bumps nlink → ctime auto-stamps to "now"
+     * per POSIX (link(2) is a metadata change to the inode). Lookup
+     * back the post-bump inode + stamp + set. Lock-posture infallibility
+     * applies (R76 P3-1 argument): under fs->lock the inode_lookup
+     * cannot fail (we just incremented nlink). */
+    {
+        struct stm_inode_value cv2 = {0};
+        stm_status ls2 = stm_inode_lookup(iidx, dataset_id, child_ino, &cv2);
+        if (ls2 == STM_OK) {
+            fs_stamp_ctime_now(&cv2);
+            (void)stm_inode_set(iidx, dataset_id, child_ino, &cv2);
+        }
     }
     stm_status das = stm_dirent_alloc(didx, dataset_id, dst_parent_ino,
                                           dst_name, dst_name_len,
@@ -1399,6 +1555,8 @@ stm_status stm_fs_symlink(stm_fs *fs, uint64_t dataset_id,
     memset(&cv.si_data, 0, sizeof cv.si_data);
     memcpy(cv.si_data.symlink_target, target, (size_t)target_len);
     cv.si_size = stm_store_le64((uint64_t)target_len);
+    /* P8-POSIX-7a: stamp btime + atime + mtime + ctime at create. */
+    fs_stamp_create_times(&cv);
     stm_status sse = stm_inode_set(iidx, dataset_id, child_ino, &cv);
     if (sse != STM_OK) {
         (void)stm_inode_free(iidx, dataset_id, child_ino);
@@ -1542,6 +1700,9 @@ stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
             }
             iv.si_data_len = (uint8_t)new_size;
             iv.si_size     = stm_store_le64(new_size);
+            /* P8-POSIX-7a: truncate is a content + size change →
+             * stamp mtime + ctime. */
+            fs_stamp_mtime_ctime_now(&iv);
             /* R76 P3-1 / R78 P3-1: stm_inode_set infallible in this
              * lock posture (see fs_write_regular_locked's annotation). */
             stm_status rs = stm_inode_set(iidx, dataset_id, ino, &iv);
@@ -1584,6 +1745,9 @@ stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
         iv.si_data_len  = 0;
         memset(&iv.si_data, 0, sizeof iv.si_data);
         iv.si_size      = stm_store_le64(new_size);
+        /* P8-POSIX-7a: truncate transition is a content + size + kind
+         * change → stamp mtime + ctime. */
+        fs_stamp_mtime_ctime_now(&iv);
         /* R76 P3-1 / R78 P3-1: stm_inode_set infallible in this lock
          * posture — fs->lock excludes every alloc/free path that
          * could mutate (state, gen, nlink, kind) behind our back. */
@@ -1618,8 +1782,13 @@ stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
          * that have no extent record — POSIX-correct zero-fill. */
 
         iv.si_size = stm_store_le64(new_size);
+        /* P8-POSIX-7a: truncate is a size change → stamp mtime + ctime
+         * (per POSIX truncate(2): mtime + ctime are updated even on
+         * grow; only no-op size==cur_size leaves them alone, and that
+         * path returned earlier above). */
+        fs_stamp_mtime_ctime_now(&iv);
         /* R76 P3-2 / R78 P3-1: stm_inode_set infallible — same lock-
-         * posture argument. Only mutated field is si_size. */
+         * posture argument. Only mutated field is si_size + ts. */
         stm_status rs = stm_inode_set(iidx, dataset_id, ino, &iv);
         pthread_mutex_unlock(&fs->lock);
         return rs;
@@ -1834,6 +2003,18 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
         }
         pthread_mutex_unlock(&fs->lock);
         return su;
+    }
+
+    /* P8-POSIX-7a: rename mutates the moved inode's parent + name,
+     * which POSIX models as a metadata change → ctime auto-stamps to
+     * "now" on src_ino. mtime + btime preserved. Best-effort, same
+     * shape as setxattr's stamp. */
+    {
+        struct stm_inode_value iv2 = {0};
+        if (stm_inode_lookup(iidx, dataset_id, src_ino, &iv2) == STM_OK) {
+            fs_stamp_ctime_now(&iv2);
+            (void)stm_inode_set(iidx, dataset_id, src_ino, &iv2);
+        }
     }
 
     pthread_mutex_unlock(&fs->lock);
@@ -2118,6 +2299,23 @@ stm_status stm_fs_setxattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                                     name, name_len,
                                     value, value_len, xa_flags,
                                     out_replaced);
+    /* P8-POSIX-7a: setxattr is a metadata change → ctime auto-stamps
+     * to "now". Stamping is best-effort: if the lookup or set fails,
+     * the xattr write already succeeded so we return STM_OK from the
+     * primary op. The timestamp gap is bounded (worst case: ctime
+     * stays at prior value while xattr is set). Lock-posture
+     * infallibility argument applies (R76 P3-1) — under fs->lock
+     * the inode_lookup + set cannot fail. */
+    if (s == STM_OK) {
+        stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+        if (iidx) {
+            struct stm_inode_value iv2 = {0};
+            if (stm_inode_lookup(iidx, dataset_id, ino, &iv2) == STM_OK) {
+                fs_stamp_ctime_now(&iv2);
+                (void)stm_inode_set(iidx, dataset_id, ino, &iv2);
+            }
+        }
+    }
     pthread_mutex_unlock(&fs->lock);
     return s;
 }
@@ -2301,6 +2499,18 @@ stm_status stm_fs_removexattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
         return STM_EINVAL;
     }
     stm_status s = stm_xattr_remove(xidx, dataset_id, ino, name, name_len);
+    /* P8-POSIX-7a: removexattr is a metadata change → ctime auto-stamps
+     * to "now". Best-effort, same shape as setxattr's stamp above. */
+    if (s == STM_OK) {
+        stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+        if (iidx) {
+            struct stm_inode_value iv2 = {0};
+            if (stm_inode_lookup(iidx, dataset_id, ino, &iv2) == STM_OK) {
+                fs_stamp_ctime_now(&iv2);
+                (void)stm_inode_set(iidx, dataset_id, ino, &iv2);
+            }
+        }
+    }
     pthread_mutex_unlock(&fs->lock);
     return s;
 }
