@@ -4087,7 +4087,18 @@ stm_status stm_fs_fadvise(stm_fs *fs,
 
     /* Drop fs->lock BEFORE delegating — stm_fs_promote_to_hot /
      * stm_fs_migrate_to_cold take fs->lock + FS_GUARD_WRITE themselves;
-     * holding it nested would deadlock. */
+     * holding it nested would deadlock.
+     *
+     * R87 P3-5 acknowledgment: the swallow contract intentionally
+     * masks every inner status (STM_ENOENT for all-HOT inos on
+     * WILLNEED, STM_EROFS on RO mounts, STM_EBADTAG/STM_EIO on
+     * per-extent corruption, STM_ENOSPC on cold-tier exhaustion,
+     * STM_EWEDGED if the FS becomes wedged after the front-check
+     * unlock). No fault-injection test pins this — the dispatch
+     * shape is a self-evident `(void)rc` discard, not a status-
+     * dependent branch — but a future refactor that introduces
+     * status-dependent behavior here MUST land with a fault-
+     * injection regression test that pins the swallow surface. */
     switch (advice) {
     case STM_FS_FADV_WILLNEED: {
         stm_status rc = stm_fs_promote_to_hot(fs, dataset_id, ino);

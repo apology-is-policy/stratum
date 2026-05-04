@@ -1756,9 +1756,15 @@ stm_status stm_fs_promote_policy_pass_all(
 /* P8-POSIX-7e: posix_fadvise(2) pass-through.                                */
 /* ========================================================================= */
 
-/* Linux POSIX_FADV_* hints. Numerically identical to Linux's so a 9P/FUSE
- * binding can pass through the kernel-supplied advice value verbatim
- * (also matches the values fadvise(2) accepts on glibc/musl Linux). */
+/* Linux POSIX_FADV_* hints. Values match the GENERIC Linux UAPI (every
+ * architecture except s390). On s390, `arch/s390/include/uapi/asm/fadvise.h`
+ * defines POSIX_FADV_DONTNEED=6 and POSIX_FADV_NOREUSE=7 (a historic
+ * 32-vs-64-bit ABI quirk). A 9P/FUSE/syscall binding running on s390
+ * MUST translate the kernel-supplied advice from the s390 numbering to
+ * the generic numbering before calling stm_fs_fadvise — otherwise the
+ * unknown-advice STM_EINVAL refusal fires. On every other Linux arch
+ * + on macOS/BSD bindings the kernel-supplied advice can be passed
+ * through verbatim. (R87 P2-1.) */
 #define STM_FS_FADV_NORMAL       0u
 #define STM_FS_FADV_RANDOM       1u
 #define STM_FS_FADV_SEQUENTIAL   2u
@@ -1771,9 +1777,26 @@ stm_status stm_fs_promote_policy_pass_all(
  *
  * MVP scope: the hint is interpreted at INODE granularity — `off` and
  * `len` are accepted (for forward-compat with full-range fadvise) but
- * IGNORED. The hint applies to the whole file. A future per-extent
- * shape would need new sync-layer primitives; today's tiering machinery
+ * IGNORED. The hint applies to the WHOLE file regardless of (off, len)
+ * — this is an OVERSCOPE relative to POSIX's range semantics
+ * (`posix_fadvise(fd, off, len, DONTNEED)` POSIX-properly evicts only
+ * `[off, off+len)`, but Stratum's MVP evicts the whole file). For
+ * DONTNEED specifically, this can evict bytes outside the requested
+ * range — callers needing strict-range semantics must defer to a
+ * future per-extent shape. (R87 P3-1.) Future per-extent fadvise
+ * would need new sync-layer primitives; today's tiering machinery
  * (`stm_fs_promote_to_hot` / `stm_fs_migrate_to_cold`) is per-ino.
+ *
+ * Cost amplification: on a paging-cache filesystem (ext4 / xfs)
+ * `posix_fadvise(2)` is ~free. On Stratum, WILLNEED/DONTNEED triggers
+ * a full per-extent decrypt+re-encrypt+rewrite cycle — `O(file_size /
+ * chunk_len)` AEAD operations + bdev writes per call. A binding layer
+ * exposing fadvise to unprivileged callers MUST add per-uid
+ * rate-limiting; without it, an adversary calling `fadvise(WILLNEED);
+ * fadvise(DONTNEED);` in a loop on a large file gets a CPU+IO
+ * amplification primitive against the host pool. The swallow contract
+ * (advisory) means even ENOMEM/ENOSPC are masked from the caller, so
+ * the API itself does not signal back-pressure. (R87 P2-2.)
  *
  * Advice mapping:
  *   - `STM_FS_FADV_NORMAL` / `_SEQUENTIAL` / `_RANDOM` / `_NOREUSE` —
@@ -1811,7 +1834,14 @@ stm_status stm_fs_promote_policy_pass_all(
  * Lock posture: takes fs->lock + FS_GUARD_READ for the wedged
  * check, drops it BEFORE delegating to `stm_fs_promote_to_hot` /
  * `stm_fs_migrate_to_cold` (which take fs->lock + FS_GUARD_WRITE
- * themselves — held nested would deadlock).
+ * themselves — held nested would deadlock). Race window: a thread
+ * marking the FS wedged AFTER the front-check unlocks but BEFORE
+ * the delegate's lock is held will produce STM_OK (the delegate
+ * returns STM_EWEDGED which fadvise SWALLOWS per advisory contract).
+ * "STM_OK" thus means "wedged at front-check time was false"; it
+ * does NOT mean "the FS was non-wedged for the entire duration of
+ * the call". Callers needing wedged-detection should use a
+ * non-advisory API. (R87 P3-2.)
  *
  * Composes over P7-CAS-7/11 + P7-CAS-2 — no new spec, no new
  * state-machine semantics. POSIX `posix_fadvise(2)` advisory contract

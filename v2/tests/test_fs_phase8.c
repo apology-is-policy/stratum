@@ -6583,8 +6583,11 @@ STM_TEST(fs_p7e_fadvise_missing_ino_is_silent_noop) {
 }
 
 STM_TEST(fs_p7e_fadvise_wedged_refused) {
-    /* Wedged FS refuses every fadvise call with STM_EWEDGED — the
-     * existence-check guard fires before any branching. */
+    /* R87 P3-3: cover ALL 6 STM_FS_FADV_* values on a wedged FS.
+     * The dispatch path is uniform (front-check fires before the
+     * advice switch) so every advice value must surface STM_EWEDGED
+     * — but a future refactor that adds per-advice early-return
+     * paths could regress without this coverage. */
     make_tmp("p7e_wedged");
     stm_fs_format_opts fopts = default_format_opts();
     STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
@@ -6597,10 +6600,219 @@ STM_TEST(fs_p7e_fadvise_wedged_refused) {
 
     STM_ASSERT_ERR(stm_fs_fadvise(fs, 1, 1, 0, 0, STM_FS_FADV_NORMAL),
                    STM_EWEDGED);
+    STM_ASSERT_ERR(stm_fs_fadvise(fs, 1, 1, 0, 0, STM_FS_FADV_RANDOM),
+                   STM_EWEDGED);
+    STM_ASSERT_ERR(stm_fs_fadvise(fs, 1, 1, 0, 0, STM_FS_FADV_SEQUENTIAL),
+                   STM_EWEDGED);
     STM_ASSERT_ERR(stm_fs_fadvise(fs, 1, 1, 0, 0, STM_FS_FADV_WILLNEED),
                    STM_EWEDGED);
     STM_ASSERT_ERR(stm_fs_fadvise(fs, 1, 1, 0, 0, STM_FS_FADV_DONTNEED),
                    STM_EWEDGED);
+    STM_ASSERT_ERR(stm_fs_fadvise(fs, 1, 1, 0, 0, STM_FS_FADV_NOREUSE),
+                   STM_EWEDGED);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7e_r87_p3_4_fadvise_ro_mount_with_preexisting_cold_swallows) {
+    /* R87 P3-4: regress the case where the file has COLD extents
+     * at RO-mount time. Pre-fix, the inner promote attempt would
+     * exercise a different lock path (alloc + crypt) before the
+     * FS_GUARD_WRITE check fires. fadvise's swallow contract must
+     * convert STM_EROFS to STM_OK transparently regardless of which
+     * inner failure mode the delegate hit. */
+    make_tmp("p7e_r87_p3_4_ro_cold");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    p7e_write_one_block(fs, 1);
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    /* Verify COLD extent persists across the unmount. */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record rec;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &rec));
+    STM_ASSERT_EQ((int)rec.kind, (int)STM_EXTENT_KIND_COLD);
+
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    /* Remount RO; tier should still be COLD. */
+    stm_fs_mount_opts ro_mopts = mopts;
+    ro_mopts.read_only = true;
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &ro_mopts, &fs));
+
+    /* WILLNEED on RO with pre-existing COLD: the inner promote
+     * would attempt allocation, hit FS_GUARD_WRITE → STM_EROFS,
+     * fadvise swallows → STM_OK. */
+    STM_ASSERT_OK(stm_fs_fadvise(fs, 1, 1, 0, 0, STM_FS_FADV_WILLNEED));
+    /* DONTNEED on RO: same path; the file is already COLD so the
+     * inner migrate's no-op-success returns OK before EROFS even
+     * fires, but the swallow handles either outcome. */
+    STM_ASSERT_OK(stm_fs_fadvise(fs, 1, 1, 0, 0, STM_FS_FADV_DONTNEED));
+
+    /* Tier unchanged — still COLD on the RO mount. */
+    sync = stm_fs_sync_for_test(fs);
+    eidx = stm_sync_extent_index(sync);
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &rec));
+    STM_ASSERT_EQ((int)rec.kind, (int)STM_EXTENT_KIND_COLD);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7e_r87_p3_6_dontneed_on_sealed_file_does_not_violate_seal) {
+    /* R87 P3-6 (cross-feature with P8-POSIX-7a-seals): DONTNEED on
+     * a SEAL_WRITE-sealed file. Seals enforce at the fs.c
+     * write/truncate seams; the migrate primitive operates at the
+     * extent layer (no seal check). The seal protects USER writes
+     * — internal tier migration is not a user write. The test pins
+     * that:
+     *   - DONTNEED succeeds on a sealed file (returns STM_OK)
+     *   - The seal mask survives the migration unchanged
+     *   - Subsequent user write still refuses with STM_EPERM
+     *   - Reads still return the original plaintext
+     */
+    make_tmp("p7e_r87_p3_6_seal");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Build a real inode-backed file so seals apply. */
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"sealed",
+                                          6u, 0644u, 0, 0, &f));
+
+    /* Write a 4 KiB block to drive a real extent. */
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++)
+        plain[i] = (uint8_t)((i * 13u + 7u) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, plain, sizeof plain));
+
+    /* Seal the file against future writes. */
+    STM_ASSERT_OK(stm_fs_add_seals(fs, 1, f, STM_FS_SEAL_WRITE));
+
+    /* DONTNEED migrates to cold despite the seal — internal tier
+     * migration is not a user write. */
+    STM_ASSERT_OK(stm_fs_fadvise(fs, 1, f, 0, 0, STM_FS_FADV_DONTNEED));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record rec;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, f, 0, &rec));
+    STM_ASSERT_EQ((int)rec.kind, (int)STM_EXTENT_KIND_COLD);
+
+    /* Seal mask is unchanged. */
+    uint32_t seals = 0;
+    STM_ASSERT_OK(stm_fs_get_seals(fs, 1, f, &seals));
+    STM_ASSERT_EQ(seals, (uint32_t)STM_FS_SEAL_WRITE);
+
+    /* User writes still refused. */
+    STM_ASSERT_ERR(stm_fs_write(fs, 1, f, 0, plain, sizeof plain),
+                   STM_EPERM);
+
+    /* Reads still return the original plaintext via the COLD path. */
+    uint8_t buf[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, f, 0, buf, sizeof buf, &got));
+    STM_ASSERT_EQ(got, sizeof plain);
+    STM_ASSERT_MEM_EQ(plain, buf, sizeof plain);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7e_r87_p3_6_willneed_preserves_xattrs_and_hardlinks) {
+    /* R87 P3-6 (cross-feature with P8-POSIX-3 hardlinks + P8-POSIX-6
+     * xattr): WILLNEED-driven promote on an ino with a hardlink and
+     * an active xattr. The tier swap MUST NOT touch nlink, dirent
+     * state, or xattr records. */
+    make_tmp("p7e_r87_p3_6_hardlink_xattr");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"a", 1,
+                                          0644u, 0, 0, &f));
+
+    /* Add a hardlink + an xattr. */
+    STM_ASSERT_OK(stm_fs_link(fs, 1, root, (const uint8_t *)"a", 1,
+                                    root, (const uint8_t *)"b", 1));
+    STM_ASSERT_OK(stm_fs_setxattr(fs, 1, f,
+                                       (const uint8_t *)"user.tag", 8u,
+                                       (const uint8_t *)"hello", 5u, 0u, NULL));
+
+    /* Write data + migrate to cold. */
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++)
+        plain[i] = (uint8_t)((i * 19u + 3u) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, plain, sizeof plain));
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, f));
+
+    /* Pre-promote sanity: nlink=2, xattr present, COLD. */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_nlink), 2u);
+
+    uint8_t xv[8] = {0};
+    uint32_t xv_size = 0;
+    STM_ASSERT_OK(stm_fs_getxattr(fs, 1, f,
+                                       (const uint8_t *)"user.tag", 8u,
+                                       xv, (uint32_t)sizeof xv, &xv_size));
+    STM_ASSERT_EQ(xv_size, (uint32_t)5);
+    STM_ASSERT_MEM_EQ((const uint8_t *)"hello", xv, 5u);
+
+    /* WILLNEED triggers promote_to_hot. */
+    STM_ASSERT_OK(stm_fs_fadvise(fs, 1, f, 0, 0, STM_FS_FADV_WILLNEED));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record rec;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, f, 0, &rec));
+    STM_ASSERT_EQ((int)rec.kind, (int)STM_EXTENT_KIND_HOT);
+
+    /* nlink unchanged. */
+    memset(&v, 0, sizeof v);
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_nlink), 2u);
+
+    /* Both names still resolve to the same ino. */
+    uint64_t found = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root, (const uint8_t *)"a", 1, &found));
+    STM_ASSERT_EQ(found, f);
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root, (const uint8_t *)"b", 1, &found));
+    STM_ASSERT_EQ(found, f);
+
+    /* xattr survives. */
+    memset(xv, 0, sizeof xv);
+    xv_size = 0;
+    STM_ASSERT_OK(stm_fs_getxattr(fs, 1, f,
+                                       (const uint8_t *)"user.tag", 8u,
+                                       xv, (uint32_t)sizeof xv, &xv_size));
+    STM_ASSERT_EQ(xv_size, (uint32_t)5);
+    STM_ASSERT_MEM_EQ((const uint8_t *)"hello", xv, 5u);
+
+    /* Plaintext readback unchanged. */
+    uint8_t buf[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, f, 0, buf, sizeof buf, &got));
+    STM_ASSERT_EQ(got, sizeof plain);
+    STM_ASSERT_MEM_EQ(plain, buf, sizeof plain);
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path); unlink(g_key_path);
