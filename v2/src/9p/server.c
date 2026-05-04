@@ -112,6 +112,25 @@ typedef struct p9_fid {
     bool        is_open;
     uint32_t    open_flags;     /* Linux O_* from Tlopen */
     uint64_t    open_iounit;    /* per-fid iounit reported in Rlopen */
+
+    /* AUX_XATTR state. Used only when kind == P9_FID_AUX_XATTR. The
+     * aux fid encapsulates one of two flavors:
+     *   - Txattrwalk LIST/VALUE-READ: `xattr_buf` holds the bytes
+     *     fetched at walk time; subsequent Tread streams from it.
+     *     `xattr_name` may be NULL for LIST; non-NULL for the named
+     *     value-read.
+     *   - Txattrcreate: `xattr_buf` accumulates value bytes from
+     *     subsequent Twrite calls; `xattr_expected_size` is the
+     *     announced total; Tclunk commits via stm_fs_setxattr if
+     *     the accumulated size matches, else discards.
+     * `is_xattr_create` discriminates the two flavors.                  */
+    bool        is_xattr_create;
+    char       *xattr_name;        /* heap-owned NUL-terminated name */
+    uint8_t    *xattr_buf;         /* heap-owned bytes buffer */
+    size_t      xattr_buf_len;     /* current bytes filled */
+    size_t      xattr_buf_cap;     /* allocated capacity */
+    uint64_t    xattr_expected_size;  /* WRITE only */
+    uint32_t    xattr_create_flags;   /* WRITE only — XATTR_CREATE / REPLACE */
 } p9_fid;
 
 struct stm_9p_server {
@@ -250,7 +269,8 @@ static p9_fid *fid_alloc(stm_9p_server *s, uint32_t fid)
 /* Release a fid (caller holds server lock). For node-kind fids that
  * have held locks, also drop their lock-owner registration via
  * stm_fs_release_lock_owner (composes against locks.tla / fid.tla
- * Clunk action's lock-release-on-clunk semantics). */
+ * Clunk action's lock-release-on-clunk semantics). For aux-xattr
+ * fids, frees the heap-owned name + buffer. */
 static void fid_release_locked(stm_9p_server *s, p9_fid *f)
 {
     if (!f || f->kind == P9_FID_FREE) return;
@@ -261,7 +281,10 @@ static void fid_release_locked(stm_9p_server *s, p9_fid *f)
         uint64_t owner_id = s->lock_owner_base + f->fid;
         (void)stm_fs_release_lock_owner(s->fs, owner_id);
     }
-    /* AUX_XATTR cleanup adds buffer free in P9-9P-1d when xattr handlers land. */
+    if (f->kind == P9_FID_AUX_XATTR) {
+        free(f->xattr_name);
+        free(f->xattr_buf);
+    }
     memset(f, 0, sizeof *f);
     f->kind = P9_FID_FREE;
 }
@@ -446,13 +469,36 @@ static stm_status h_clunk(stm_9p_server *s,
                             uint32_t *resp_len)
 {
     if (body_len < 4)
-        return reply_rlerror(resp, resp_cap, resp_len, tag, EPROTO);
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
     uint32_t fid = p9l_g32(body);
     p9_fid *f = fid_get(s, fid);
     if (!f)
-        return reply_rlerror(resp, resp_cap, resp_len, tag, EBADF);
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+
+    /* AUX_XATTR_WRITE clunk-time commit: if the fid was opened via
+     * Txattrcreate AND the announced attr_size has been fully filled
+     * via Twrite, commit via stm_fs_setxattr atomically. Mismatched
+     * size means the client gave up mid-write or sent the wrong size;
+     * we discard the buffered bytes (no commit). On commit failure the
+     * fid is still released (per .L semantics — Tclunk always frees the
+     * fid); the error is surfaced via Rlerror. */
+    stm_status commit_rc = STM_OK;
+    if (f->kind == P9_FID_AUX_XATTR && f->is_xattr_create) {
+        if (f->xattr_buf_len == f->xattr_expected_size && f->xattr_name) {
+            commit_rc = stm_fs_setxattr(s->fs, f->dataset_id, f->ino,
+                                          (const uint8_t *)f->xattr_name,
+                                          (uint8_t)strlen(f->xattr_name),
+                                          f->xattr_buf,
+                                          (uint32_t)f->xattr_buf_len,
+                                          f->xattr_create_flags,
+                                          /*out_replaced=*/NULL);
+        }
+    }
 
     fid_release_locked(s, f);
+
+    if (commit_rc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, commit_rc);
 
     uint32_t need = STM_9P_HDR_SIZE;
     if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
@@ -830,6 +876,37 @@ static stm_status h_read(stm_9p_server *s,
     p9_fid *f = fid_get(s, fid);
     if (!f)
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+
+    /* AUX_XATTR (read flavor): stream from the cached buffer. The
+     * write flavor (is_xattr_create=true) refuses reads — Tread on
+     * a Txattrcreate fid is undefined per .L spec. */
+    if (f->kind == P9_FID_AUX_XATTR) {
+        if (f->is_xattr_create)
+            return reply_rlerror(resp, resp_cap, resp_len, tag,
+                                  STM_9P_ECODE_EINVAL);
+        uint32_t max_payload = iounit_for_msize(s->msize);
+        if (count > max_payload) count = max_payload;
+        if (resp_cap < STM_9P_HDR_SIZE + 4u + count) {
+            *resp_len = 0;
+            return STM_EINVAL;
+        }
+        uint8_t *wp = resp + 4;
+        *wp++ = STM_9P_RREAD;
+        p9l_p16(wp, tag); wp += 2;
+        uint8_t *count_field = wp;
+        wp += 4;
+        uint32_t emit = 0;
+        if (offset < f->xattr_buf_len) {
+            uint64_t avail = f->xattr_buf_len - offset;
+            emit = (avail < count) ? (uint32_t)avail : count;
+            memcpy(wp, f->xattr_buf + offset, emit);
+        }
+        p9l_p32(count_field, emit);
+        wp += emit;
+        resp_finish(resp, resp_len, wp);
+        return STM_OK;
+    }
+
     if (!f->is_open)
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
     if (f->qid_type & STM_9P_QTDIR)
@@ -900,6 +977,33 @@ static stm_status h_write(stm_9p_server *s,
     p9_fid *f = fid_get(s, fid);
     if (!f)
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+
+    /* AUX_XATTR (write flavor): append to the value buffer. Read
+     * flavors refuse Twrite. */
+    if (f->kind == P9_FID_AUX_XATTR) {
+        if (!f->is_xattr_create)
+            return reply_rlerror(resp, resp_cap, resp_len, tag,
+                                  STM_9P_ECODE_EINVAL);
+        if (offset != f->xattr_buf_len)
+            return reply_rlerror(resp, resp_cap, resp_len, tag,
+                                  STM_9P_ECODE_EINVAL);   /* must be append */
+        if ((uint64_t)offset + count > f->xattr_expected_size)
+            return reply_rlerror(resp, resp_cap, resp_len, tag,
+                                  STM_9P_ECODE_EINVAL);   /* over announced */
+        if (count > 0)
+            memcpy(f->xattr_buf + offset, body + 16, count);
+        f->xattr_buf_len += count;
+
+        uint32_t need = STM_9P_HDR_SIZE + 4u;
+        if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
+        uint8_t *wp = resp + 4;
+        *wp++ = STM_9P_RWRITE;
+        p9l_p16(wp, tag); wp += 2;
+        p9l_p32(wp, count); wp += 4;
+        resp_finish(resp, resp_len, wp);
+        return STM_OK;
+    }
+
     if (!f->is_open)
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
     if (f->qid_type & STM_9P_QTDIR)
@@ -1840,6 +1944,238 @@ static stm_status h_getlock(stm_9p_server *s,
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
+/* h_xattrwalk — Txattrwalk / Rxattrwalk.                                 */
+/* Txattrwalk: fid[4] newfid[4] name[s]                                    */
+/* Rxattrwalk: size[8]                                                      */
+/*                                                                         */
+/* If `name` is empty: newfid binds to a LIST aux fid holding the         */
+/* concatenated NUL-separated xattr names buffer (Linux listxattr        */
+/* shape). Subsequent Tread on newfid streams from the buffer.            */
+/* If `name` is non-empty: newfid binds to a VALUE aux fid holding the    */
+/* named xattr's value. Tread streams from the buffer.                    */
+/* The aux fid is freed at Tclunk.                                        */
+/* ────────────────────────────────────────────────────────────────────── */
+
+static stm_status h_xattrwalk(stm_9p_server *s,
+                                const uint8_t *body, uint32_t body_len,
+                                uint16_t tag,
+                                uint8_t *resp, uint32_t resp_cap,
+                                uint32_t *resp_len)
+{
+    if (body_len < 4 + 4 + 2)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+    uint32_t fid    = p9l_g32(body);
+    uint32_t newfid = p9l_g32(body + 4);
+    const uint8_t *bp = body + 8;
+    const uint8_t *end = body + body_len;
+    uint16_t nlen;
+    const char *name = p9l_gstr(&bp, end, &nlen);
+    if (!name && nlen != 0)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+
+    p9_fid *f = fid_get(s, fid);
+    if (!f)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+    if (f->kind != P9_FID_NODE)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
+    stm_status vrc = verify_fid_fresh(s, f, NULL);
+    if (vrc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
+
+    /* The newfid slot must be free or = fid (rewind not really
+     * meaningful for xattr-walk; refuse). */
+    if (newfid == fid)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
+    if (fid_get(s, newfid))
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+
+    /* Allocate the aux fid slot. */
+    p9_fid *nf = NULL;
+    for (size_t i = 0; i < STM_9P_MAX_FIDS; i++) {
+        if (s->fids[i].kind == P9_FID_FREE) {
+            memset(&s->fids[i], 0, sizeof s->fids[i]);
+            s->fids[i].kind = P9_FID_AUX_XATTR;
+            s->fids[i].fid  = newfid;
+            nf = &s->fids[i];
+            break;
+        }
+    }
+    if (!nf)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+    nf->dataset_id = f->dataset_id;
+    nf->ino        = f->ino;
+    nf->cached_gen = f->cached_gen;
+
+    uint64_t size = 0;
+    if (nlen == 0) {
+        /* LIST: fetch the xattr names buffer. Two-pass: ask for
+         * size first (NULL buf), then alloc + fetch. */
+        size_t total = 0;
+        stm_status rc = stm_fs_listxattr(s->fs, f->dataset_id, f->ino,
+                                            NULL, 0, &total);
+        if (rc != STM_OK && rc != STM_ERANGE) {
+            fid_release_locked(s, nf);
+            return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+        }
+        if (total > 0) {
+            nf->xattr_buf = malloc(total);
+            if (!nf->xattr_buf) {
+                fid_release_locked(s, nf);
+                return reply_rlerror(resp, resp_cap, resp_len, tag,
+                                      STM_9P_ECODE_ENOMEM);
+            }
+            size_t got = 0;
+            rc = stm_fs_listxattr(s->fs, f->dataset_id, f->ino,
+                                    nf->xattr_buf, total, &got);
+            if (rc != STM_OK) {
+                fid_release_locked(s, nf);
+                return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+            }
+            nf->xattr_buf_cap = total;
+            nf->xattr_buf_len = got;
+        }
+        size = (uint64_t)nf->xattr_buf_len;
+    } else {
+        if (nlen > 255u) {
+            fid_release_locked(s, nf);
+            return reply_rlerror(resp, resp_cap, resp_len, tag,
+                                  STM_9P_ECODE_ENAMETOOLONG);
+        }
+        /* VALUE-READ: fetch the named xattr's value. Two-pass. */
+        uint32_t want = 0;
+        stm_status rc = stm_fs_getxattr(s->fs, f->dataset_id, f->ino,
+                                           (const uint8_t *)name, (uint8_t)nlen,
+                                           NULL, 0, &want);
+        if (rc != STM_OK && rc != STM_ERANGE) {
+            fid_release_locked(s, nf);
+            return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+        }
+        if (want > 0) {
+            nf->xattr_buf = malloc(want);
+            if (!nf->xattr_buf) {
+                fid_release_locked(s, nf);
+                return reply_rlerror(resp, resp_cap, resp_len, tag,
+                                      STM_9P_ECODE_ENOMEM);
+            }
+            uint32_t got = 0;
+            rc = stm_fs_getxattr(s->fs, f->dataset_id, f->ino,
+                                   (const uint8_t *)name, (uint8_t)nlen,
+                                   nf->xattr_buf, want, &got);
+            if (rc != STM_OK) {
+                fid_release_locked(s, nf);
+                return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+            }
+            nf->xattr_buf_cap = want;
+            nf->xattr_buf_len = got;
+        }
+        nf->xattr_name = malloc(nlen + 1u);
+        if (nf->xattr_name) {
+            memcpy(nf->xattr_name, name, nlen);
+            nf->xattr_name[nlen] = '\0';
+        }
+        size = (uint64_t)nf->xattr_buf_len;
+    }
+
+    uint32_t need = STM_9P_HDR_SIZE + 8u;
+    if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
+    uint8_t *wp = resp + 4;
+    *wp++ = STM_9P_RXATTRWALK;
+    p9l_p16(wp, tag); wp += 2;
+    p9l_p64(wp, size); wp += 8;
+    resp_finish(resp, resp_len, wp);
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* h_xattrcreate — Txattrcreate / Rxattrcreate.                            */
+/* Txattrcreate:  fid[4] name[s] attr_size[8] flags[4]                     */
+/* Rxattrcreate:  (header only)                                             */
+/*                                                                         */
+/* The fid is REPURPOSED into a WRITE aux fid that will accumulate         */
+/* `attr_size` bytes of value via subsequent Twrite calls; Tclunk          */
+/* atomically commits via stm_fs_setxattr if the accumulated size           */
+/* matches, else returns STM_EINVAL at clunk time.                         */
+/* ────────────────────────────────────────────────────────────────────── */
+
+static stm_status h_xattrcreate(stm_9p_server *s,
+                                  const uint8_t *body, uint32_t body_len,
+                                  uint16_t tag,
+                                  uint8_t *resp, uint32_t resp_cap,
+                                  uint32_t *resp_len)
+{
+    if (body_len < 4 + 2)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+    uint32_t fid = p9l_g32(body);
+    const uint8_t *bp = body + 4;
+    const uint8_t *end = body + body_len;
+    uint16_t nlen;
+    const char *name = p9l_gstr(&bp, end, &nlen);
+    if (!name)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+    if (end - bp < 12)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+    uint64_t attr_size = p9l_g64(bp); bp += 8;
+    uint32_t flags     = p9l_g32(bp); bp += 4;
+
+    if (nlen == 0 || nlen > 255u)
+        return reply_rlerror(resp, resp_cap, resp_len, tag,
+                              STM_9P_ECODE_EINVAL);
+    /* Bound attr_size to a sane max (matches stm_fs_setxattr's
+     * STM_FS_XATTR_VALUE_MAX = 64 KiB). */
+    if (attr_size > (1u << 16))
+        return reply_rlerror(resp, resp_cap, resp_len, tag,
+                              STM_9P_ECODE_EFBIG);
+
+    p9_fid *f = fid_get(s, fid);
+    if (!f)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+    if (f->kind != P9_FID_NODE)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
+    stm_status vrc = verify_fid_fresh(s, f, NULL);
+    if (vrc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
+
+    /* Repurpose into AUX_XATTR_WRITE. The original NODE state (ino,
+     * dataset_id, cached_gen) is preserved so the eventual setxattr at
+     * clunk-time targets the right inode. */
+    char *name_copy = malloc((size_t)nlen + 1u);
+    if (!name_copy)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_ENOMEM);
+    memcpy(name_copy, name, nlen);
+    name_copy[nlen] = '\0';
+
+    uint8_t *buf = NULL;
+    if (attr_size > 0) {
+        buf = malloc((size_t)attr_size);
+        if (!buf) {
+            free(name_copy);
+            return reply_rlerror(resp, resp_cap, resp_len, tag,
+                                  STM_9P_ECODE_ENOMEM);
+        }
+    }
+
+    /* fid stays bound to the same ino but kind flips to AUX_XATTR
+     * with is_xattr_create=true. is_open stays false; xattr ops use
+     * the fid's special read/write paths. */
+    f->kind            = P9_FID_AUX_XATTR;
+    f->is_xattr_create = true;
+    f->xattr_name      = name_copy;
+    f->xattr_buf       = buf;
+    f->xattr_buf_cap   = (size_t)attr_size;
+    f->xattr_buf_len   = 0;
+    f->xattr_expected_size = attr_size;
+    f->xattr_create_flags  = flags;
+
+    uint32_t need = STM_9P_HDR_SIZE;
+    if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
+    uint8_t *wp = resp + 4;
+    *wp++ = STM_9P_RXATTRCREATE;
+    p9l_p16(wp, tag); wp += 2;
+    resp_finish(resp, resp_len, wp);
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
 /* Public API.                                                             */
 /* ────────────────────────────────────────────────────────────────────── */
 
@@ -1986,6 +2322,12 @@ stm_status stm_9p_server_handle(stm_9p_server *s,
         break;
     case STM_9P_TGETLOCK:
         rc = h_getlock(s, body, body_len, tag, resp, resp_cap, resp_len);
+        break;
+    case STM_9P_TXATTRWALK:
+        rc = h_xattrwalk(s, body, body_len, tag, resp, resp_cap, resp_len);
+        break;
+    case STM_9P_TXATTRCREATE:
+        rc = h_xattrcreate(s, body, body_len, tag, resp, resp_cap, resp_len);
         break;
     case STM_9P_TAUTH:
         /* Stratum uses Unix-socket SO_PEERCRED for authn at the daemon

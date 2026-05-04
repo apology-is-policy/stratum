@@ -385,6 +385,41 @@ static uint32_t build_tlock(uint8_t *req, uint16_t tag, uint32_t fid,
     return sz;
 }
 
+static uint32_t build_txattrwalk(uint8_t *req, uint16_t tag,
+                                   uint32_t fid, uint32_t newfid,
+                                   const char *name)
+{
+    uint8_t *p = req + 7;
+    pack_u32(p, fid);    p += 4;
+    pack_u32(p, newfid); p += 4;
+    uint16_t nl = name ? (uint16_t)strlen(name) : 0;
+    pack_u16(p, nl); p += 2;
+    if (nl) { memcpy(p, name, nl); p += nl; }
+    uint32_t sz = (uint32_t)(p - req);
+    pack_u32(req, sz);
+    req[4] = STM_9P_TXATTRWALK;
+    pack_u16(req + 5, tag);
+    return sz;
+}
+
+static uint32_t build_txattrcreate(uint8_t *req, uint16_t tag, uint32_t fid,
+                                     const char *name, uint64_t attr_size,
+                                     uint32_t flags)
+{
+    uint8_t *p = req + 7;
+    pack_u32(p, fid); p += 4;
+    uint16_t nl = (uint16_t)strlen(name);
+    pack_u16(p, nl); p += 2;
+    memcpy(p, name, nl); p += nl;
+    pack_u64(p, attr_size); p += 8;
+    pack_u32(p, flags); p += 4;
+    uint32_t sz = (uint32_t)(p - req);
+    pack_u32(req, sz);
+    req[4] = STM_9P_TXATTRCREATE;
+    pack_u16(req + 5, tag);
+    return sz;
+}
+
 /* ── helpers ─────────────────────────────────────────────────────────── */
 
 static stm_9p_server *make_server(stm_fs *fs)
@@ -1630,6 +1665,168 @@ STM_TEST(p9_lock_released_on_clunk) {
                       0, 100, 2, "b");
     STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
     STM_ASSERT_EQ(resp[7], STM_9P_LOCK_SUCCESS);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* ── P9-9P-1e tests: Txattrwalk / Txattrcreate ───────────────────────── */
+
+STM_TEST(p9_xattrcreate_then_xattrwalk_value_roundtrip) {
+    make_tmp("9p_xattr_rt");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)mk_file(fs, root, "f");
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "f");
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    /* Txattrcreate fid=101 name="user.color" size=4 flags=0 →
+     * fid 101 becomes a WRITE aux fid. */
+    uint32_t sz = build_txattrcreate(req, 2, 101, "user.color", 4, 0);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RXATTRCREATE);
+    /* Twrite the value bytes. */
+    sz = build_twrite(req, 3, 101, 0, "blue", 4);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWRITE);
+    /* Tclunk commits. */
+    sz = build_tclunk(req, 4, 101);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RCLUNK);
+
+    /* Re-walk + Txattrwalk to read the value back. */
+    walk_to(s, 100, 102, "f");
+    sz = build_txattrwalk(req, 5, 102, 103, "user.color");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RXATTRWALK);
+    /* Rxattrwalk: size[8] — should be 4. */
+    uint64_t size = load_u64(resp + 7);
+    STM_ASSERT_EQ(size, 4u);
+
+    /* Tread on the aux fid streams the value bytes. */
+    sz = build_tread(req, 6, 103, 0, 64);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RREAD);
+    STM_ASSERT_EQ(load_u32(resp + 7), 4u);
+    STM_ASSERT_MEM_EQ(resp + 11, "blue", 4);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_xattrwalk_list_returns_names) {
+    make_tmp("9p_xattr_list");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)mk_file(fs, root, "f");
+    /* Pre-set two xattrs via the fs API so listxattr has names. */
+    uint64_t fino = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root,
+                                     (const uint8_t *)"f", 1, &fino));
+    bool replaced = false;
+    STM_ASSERT_OK(stm_fs_setxattr(fs, 1, fino,
+                                       (const uint8_t *)"user.a", 6,
+                                       (const uint8_t *)"X", 1, 0, &replaced));
+    STM_ASSERT_OK(stm_fs_setxattr(fs, 1, fino,
+                                       (const uint8_t *)"user.b", 6,
+                                       (const uint8_t *)"Y", 1, 0, &replaced));
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "f");
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    /* Txattrwalk with empty name → LIST aux fid. */
+    uint32_t sz = build_txattrwalk(req, 2, 101, 102, "");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RXATTRWALK);
+    uint64_t total = load_u64(resp + 7);
+    STM_ASSERT(total > 0);
+
+    /* Tread streams the names buffer (NUL-separated). */
+    sz = build_tread(req, 3, 102, 0, 1024);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RREAD);
+    uint32_t got = load_u32(resp + 7);
+    STM_ASSERT_EQ((uint64_t)got, total);
+
+    /* Verify "user.a" and "user.b" are both present in the buffer. */
+    int has_a = 0, has_b = 0;
+    const char *p = (const char *)(resp + 11);
+    const char *end = p + got;
+    while (p < end) {
+        size_t len = strnlen(p, (size_t)(end - p));
+        if (len == 6 && memcmp(p, "user.a", 6) == 0) has_a = 1;
+        if (len == 6 && memcmp(p, "user.b", 6) == 0) has_b = 1;
+        p += len + 1;          /* skip NUL */
+    }
+    STM_ASSERT_TRUE(has_a);
+    STM_ASSERT_TRUE(has_b);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_xattrcreate_short_write_discards) {
+    make_tmp("9p_xattr_short");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)mk_file(fs, root, "f");
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "f");
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    /* Txattrcreate announces 4 bytes but client clunks after 2 →
+     * commit must NOT happen. */
+    uint32_t sz = build_txattrcreate(req, 2, 101, "user.short", 4, 0);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RXATTRCREATE);
+    sz = build_twrite(req, 3, 101, 0, "AB", 2);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWRITE);
+    sz = build_tclunk(req, 4, 101);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RCLUNK);
+
+    /* Re-walk + Txattrwalk for the value should fail with ENODATA
+     * since the short-write was discarded. */
+    walk_to(s, 100, 102, "f");
+    sz = build_txattrwalk(req, 5, 102, 103, "user.short");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_ENODATA);
 
     free(req); free(resp);
     stm_9p_server_destroy(s);
