@@ -49,7 +49,13 @@
 \* Out of scope (deferred or covered by other specs):
 \*   - Twalk multi-component path resolution. The spec models
 \*     single-component walks; multi-component walks compose by
-\*     induction over the spec's Walk action.
+\*     induction over the spec's Walk action. The composition
+\*     ASSUMES the impl atomically commits OR aborts the entire
+\*     multi-component walk; a partial-bind violation
+\*     (newfid bound to an intermediate dir despite a later
+\*     component failing) is impl-level + wire-level, NOT
+\*     modelable in the per-component spec — the substantive's
+\*     reviewer must verify Twalk's atomicity at code level.
 \*   - Twalk partial-resolution semantics (newfid bound iff every
 \*     component resolves). 9P-wire-level invariant; covered in
 \*     the substantive impl + tests, not specced here.
@@ -112,6 +118,18 @@ CONSTANTS
                                    \*   same connection slot inherits
                                    \*   the prior client's open
                                    \*   capabilities. Fires DetachClears.
+    BuggyIORejectFalseAlarms,      \* (R91 P2-2) TRUE → IOReject admits
+                                   \*   bindings whose cached_gen
+                                   \*   matches current_gen and alive
+                                   \*   is TRUE. Demonstrates the DoS
+                                   \*   class where a valid client
+                                   \*   gets ESTALE for no reason. The
+                                   \*   biconditional IOOnlyAgainst-
+                                   \*   CurrentGen invariant catches
+                                   \*   this direction too: audit_io
+                                   \*   records observed_ok=FALSE
+                                   \*   while cached=current /\ alive,
+                                   \*   the equivalence fires.
     NONE                           \* sentinel meaning "fid free" /
                                    \*   "no observation captured yet";
                                    \*   declared as a CONSTANTS model
@@ -130,6 +148,7 @@ ASSUME /\ Connections # {}
        /\ BuggyWalkSnapshotsStaleGen \in BOOLEAN
        /\ BuggyClunkLeaksFid         \in BOOLEAN
        /\ BuggyDetachLeaksFids       \in BOOLEAN
+       /\ BuggyIORejectFalseAlarms   \in BOOLEAN
 
 \* --------------------------------------------------------------------------
 \* State.
@@ -162,7 +181,14 @@ ASSUME /\ Connections # {}
 \*       observed_cached = observed_current /\ observed_alive; the
 \*       buggy variant drops the gate. The IOOnlyAgainstCurrentGen
 \*       invariant examines the audit and fires when observed_ok = TRUE
-\*       but the gate condition is FALSE.
+\*       but the gate condition is FALSE — OR symmetrically, when
+\*       observed_ok = FALSE but the gate condition is TRUE (caught by
+\*       BuggyIORejectFalseAlarms).
+\*       (R91 P3-2) Note: not cleared on Walk rebind — the captured
+\*       tuple is self-contained (carries cached, current, alive at
+\*       observation time), so a stale record from a prior binding
+\*       remains invariant-correct. The next IO on the new binding
+\*       overwrites with fresh values.
 \*
 \*   audit_walk : Connections -> Fids -> AuditWalk
 \*       Per-(c, fid) bind observation captured at Walk / Attach time.
@@ -226,6 +252,15 @@ Init ==
 \* CURRENT gen at this exact moment. Buggy: snapshots 0 (a constant
 \* stand-in for "any value not equal to current"; the invariant only
 \* cares whether they match, not what the wrong value is).
+\*
+\* (R91 P2-1) Note: under BuggyWalkSnapshotsStaleGen, Attach paths
+\* can never fire WalkBindsWithCurrentGen because the spec models
+\* Attach-to-RootIno only and Free's `i /= RootIno` precondition
+\* keeps current_gen[RootIno] = 0 forever, equal to the buggy
+\* snapshot 0. The buggy variant fires only via Walk to a non-root
+\* reused ino. The Attach side of the bug is therefore vacuously
+\* covered by the existing buggy cfg; no separate Attach-targeted
+\* variant is needed.
 BindCachedGen(target_ino) ==
     IF BuggyWalkSnapshotsStaleGen
     THEN 0
@@ -313,11 +348,15 @@ IOSuccess(c, fid) ==
                     audit_walk, pending_clear>>
 
 \* IOReject(c, fid): the server rejects the IO with ESTALE / ENOENT.
-\* Healthy precondition: fid is bound but EITHER the gen has moved on
-\* OR the inode is dead. Always allowed (the buggy variant doesn't
-\* alter rejection — it adds extra successes — so this action is
-\* unchanged across configs). The audit captures the observation
-\* with observed_ok = FALSE.
+\* Healthy precondition: fid is bound AND EITHER the gen has moved
+\* on OR the inode is dead.
+\*
+\* (R91 P2-2) Buggy variant `BuggyIORejectFalseAlarms`: drops the
+\* gate condition; IOReject can fire even when cached = current
+\* AND alive — the "valid client gets ESTALE" DoS class. The
+\* biconditional IOOnlyAgainstCurrentGen catches this direction
+\* too: audit_io records observed_ok = FALSE while cached =
+\* current /\ alive, and the equivalence fires.
 IOReject(c, fid) ==
     /\ attached[c]
     /\ fids[c][fid] /= NONE
@@ -326,7 +365,8 @@ IOReject(c, fid) ==
            cur    == current_gen[ino]
            al     == alive[ino]
        IN
-       /\ \/ cached /= cur
+       /\ \/ BuggyIORejectFalseAlarms
+          \/ cached /= cur
           \/ ~al
        /\ audit_io' = [audit_io EXCEPT
                           ![c][fid] = <<FALSE, cached, cur, al>>]

@@ -45,7 +45,7 @@ language bindings, future kernel module) is a 9P consumer.
       (`namespace_*_buggy.cfg`). Spec posture: 22 modules / 26
       fixed cfgs / 38 buggy cfgs (was 21 / 25 / 34 at Phase 7
       exit). CI matrix updated: `tlc-specs` job adds `namespace`
-      to the per-PR check. No code yet — implementation in P8-9P-2.
+      to the per-PR check. No code yet — implementation in P9-9P-2.
 
 - [x] **P9-9P-0 fid.tla** — spec-first scaffold for the fid
       lifecycle invariants that the P9-9P-1 server must uphold.
@@ -63,7 +63,7 @@ language bindings, future kernel module) is a 9P consumer.
       current_gen atomically), `ClunkClears`, `DetachClears`,
       `TypeOK`. Healthy: 1.35M distinct states / depth 19 / 14s
       wall (Connections={c1,c2}, Fids={f1,f2},
-      Inos={i_root,i_other}, MaxGen=2). Four buggy variants
+      Inos={i_root,i_other}, MaxGen=2). Five buggy variants
       enumerate the canonical 9P-server failure modes:
       `BuggyIOSkipsGenCheck` (confused-deputy stale-fid attack;
       fires `IOOnlyAgainstCurrentGen`),
@@ -71,9 +71,13 @@ language bindings, future kernel module) is a 9P consumer.
       fires `WalkBindsWithCurrentGen`), `BuggyClunkLeaksFid`
       (use-after-clunk + capability leak; fires `ClunkClears`),
       `BuggyDetachLeaksFids` (cross-client capability leak via
-      connection-slot reuse; fires `DetachClears`). All four
-      fire as designed. Spec posture: 27 modules / 34 fixed
-      cfgs / 61 buggy cfgs (was 26 / 33 / 57 at Phase 8 exit).
+      connection-slot reuse; fires `DetachClears`),
+      `BuggyIORejectFalseAlarms` (R91 P2-2; false-negative
+      ESTALE DoS class — valid client gets ESTALE for no reason
+      — fires `IOOnlyAgainstCurrentGen` via the symmetric
+      biconditional direction). All five fire as designed.
+      Spec posture: 27 modules / 34 fixed cfgs / 62 buggy cfgs
+      (was 26 / 33 / 57 at Phase 8 exit).
       CI matrix updated: `tlc-specs` job adds `fid` to the
       per-PR check (also adds the fall-out R88 P3-2 / R90 P2-3
       additions deferred to Phase 8.5 hardening). 10-specs.md
@@ -129,31 +133,31 @@ language bindings, future kernel module) is a 9P consumer.
       post-perf-tuning. Integration tests with real socket
       roundtrip in `tests/test_9p_socket_*.c`.
 
-- [ ] **P8-CTL-1 /ctl/ synthetic FS** — pending; the layout in
+- [ ] **P9-CTL-1 /ctl/ synthetic FS** — pending; the layout in
       ARCHITECTURE §14.3 served as a 9P file tree. Read paths
       report state; write paths trigger actions. Hosts the
       Prometheus + OpenTelemetry exposition endpoints.
 
-- [ ] **P8-CLI-1 stratum CLI** — pending; thin (~1000 LOC)
+- [ ] **P9-CLI-1 stratum CLI** — pending; thin (~1000 LOC)
       wrapper over /ctl/. Subcommands: pool, dataset, snapshot,
       clone, send, recv, key. Output formats: human (default),
       JSON, TSV.
 
-- [ ] **P8-FUSE-1 stratum-fuse single-threaded MVP** — pending;
+- [ ] **P9-FUSE-1 stratum-fuse single-threaded MVP** — pending;
       separate daemon at `src/cmd/fuse/`. FUSE-to-9P translator.
       Single-threaded op handling for the MVP.
 
-- [ ] **P8-FUSE-2 stratum-fuse multi-threading + perf** —
+- [ ] **P9-FUSE-2 stratum-fuse multi-threading + perf** —
       pending; thread-pool dispatcher; performance tuning per
       ROADMAP §11.3 medium-risk note.
 
-- [ ] **P8-LIB-1 libstratum-9p sync API** — pending; stable C
+- [ ] **P9-LIB-1 libstratum-9p sync API** — pending; stable C
       ABI per ARCHITECTURE §10.2 ("libstratum-9p is the stable
       public ABI; all language bindings wrap it").
 
-- [ ] **P8-LIB-2 libstratum-9p async API** — pending.
+- [ ] **P9-LIB-2 libstratum-9p async API** — pending.
 
-- [ ] **P8-BIND-1/2/3 language bindings** — pending; Rust crate
+- [ ] **P9-BIND-1/2/3 language bindings** — pending; Rust crate
       `stratum-fs`, Go package, Python module. Parallelizable.
 
 ## ROADMAP §11.2 exit criteria
@@ -161,33 +165,33 @@ language bindings, future kernel module) is a 9P consumer.
 Status as of 2026-04-30: **0/5 met**, **1/5 spec-scaffolded**.
 
 - [ ] Mount a pool via FUSE; standard POSIX operations succeed.
-      Blocks on P8-9P-1 + P8-FUSE-1.
+      Blocks on P9-9P-1 + P9-FUSE-1.
 
 - [ ] Multiple concurrent 9P connections with different
-      namespaces work correctly. Blocks on P8-9P-2.
+      namespaces work correctly. Blocks on P9-9P-2.
 
 - [ ] CLI covers all admin operations via /ctl/. Blocks on
-      P8-CTL-1 + P8-CLI-1.
+      P9-CTL-1 + P9-CLI-1.
 
 - [ ] libstratum-9p + Rust / Go / Python bindings pass smoke
-      tests. Blocks on P8-LIB-1/2 + P8-BIND-1/2/3.
+      tests. Blocks on P9-LIB-1/2 + P9-BIND-1/2/3.
 
 - [ ] **`namespace.tla` proves cross-connection isolation.**
       **MET (spec-level) at P8-NS-1**: 22nd TLA+ module landed
       with healthy + four buggy configs. Implementation
-      validation pending P8-9P-2 (the C-impl must compose over
+      validation pending P9-9P-2 (the C-impl must compose over
       the spec; spec-to-code mapping documented at the bottom of
       `reference/10-specs.md` § `namespace.tla`).
 
 ## Operational notes
 
 - Spec-first applies (CLAUDE.md): namespace isolation is a load-
-  bearing invariant. P8-NS-1 landed BEFORE P8-9P-2; future P8
-  chunks that touch load-bearing invariants follow the same
-  pattern (e.g., a future fid-lifecycle invariant would deserve
-  its own spec).
+  bearing invariant. P8-NS-1 landed BEFORE P9-9P-2; the analogous
+  fid-lifecycle spec (`fid.tla`) landed at P9-9P-0 BEFORE P9-9P-1.
+  Future P9-* chunks that touch load-bearing invariants follow
+  the same pattern.
 
-- Audit-trigger surfaces: P8-9P-1 and onward will add
+- Audit-trigger surfaces: P9-9P-1 and onward will add
   `src/9p/p9.c` to the CLAUDE.md trigger list (mirror of v1's
   9P trigger). Until the file exists, no audit cycle. Once code
   lands, every change to `src/9p/` spawns an Opus 4.7
