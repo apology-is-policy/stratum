@@ -84,11 +84,21 @@ extern "C" {
  * Lookup walks past tombstones. */
 #define STM_DIRENT_FLAG_TOMBSTONE 0x01u
 
+/* Whiteout flag (P8-POSIX-9b — Linux renameat2 RENAME_WHITEOUT) —
+ * marks a slot as a whiteout: distinct from TOMBSTONE in that the
+ * `name` field is preserved (so readdir can EMIT the whiteout for
+ * overlayfs userspace to interpret) but child_ino is zero (so the
+ * name is hidden from lookup). Mutually exclusive with TOMBSTONE
+ * — a slot is exactly one of {live record, tombstone, whiteout,
+ * empty}. Per dirent.tla::Whiteout. */
+#define STM_DIRENT_FLAG_WHITEOUT 0x02u
+
 /* Child-type discriminator (POSIX-shape; matches dirent.h DT_*).
  *
  * STM_DT_UNKNOWN = 0 is INVALID for live records (the writer rejects
  * it; the decoder rejects it). Tombstones encode child_type = 0
- * implicitly via the TOMBSTONE flag. */
+ * implicitly via the TOMBSTONE flag. Whiteouts encode child_type =
+ * STM_DT_WHITEOUT = 14 (matches Linux DT_WHT). */
 #define STM_DT_UNKNOWN  0u
 #define STM_DT_FIFO     1u
 #define STM_DT_CHR      2u
@@ -97,6 +107,7 @@ extern "C" {
 #define STM_DT_REG      8u
 #define STM_DT_LNK     10u
 #define STM_DT_SOCK    12u
+#define STM_DT_WHITEOUT 14u
 
 /* On-disk value layout (variable-length, 32 + name_len bytes):
  *
@@ -248,6 +259,48 @@ stm_status stm_dirent_swap_two(stm_dirent_index *idx,
                                    const uint8_t *name1, uint8_t name1_len,
                                    uint64_t dir2_ino,
                                    const uint8_t *name2, uint8_t name2_len);
+
+/*
+ * P8-POSIX-9b: convert a live record at `(dataset_id, dir_ino, name)`
+ * to a WHITEOUT marker. Models `dirent.tla::Whiteout`.
+ *
+ * Linux `renameat2(2)` `RENAME_WHITEOUT` semantics: after the rename,
+ *   - dst gets src's prior inode reference (handled by the caller via
+ *     `stm_dirent_alloc(dst, src_ino)`),
+ *   - src becomes a WHITEOUT slot — preserves the name (visible to
+ *     readdir as a `STM_DT_WHITEOUT` entry with `child_ino = 0`)
+ *     so overlayfs userspace can interpret it as "hide the lower
+ *     layer's same name".
+ *
+ * Distinct from TOMBSTONE:
+ *   - TOMBSTONE: invisible to readdir + invisible to lookup; the
+ *     name field is cleared.
+ *   - WHITEOUT:  VISIBLE to readdir (with `STM_DT_WHITEOUT` type +
+ *     `child_ino=0`); INVISIBLE to lookup (returns STM_ENOENT); the
+ *     name field is PRESERVED so userspace sees the whiteout marker.
+ *
+ * After this returns:
+ *   - `stm_dirent_lookup(name)` returns `STM_ENOENT` (the whiteout
+ *     hides the name).
+ *   - `stm_dirent_alloc(name, ...)` SUCCEEDS by overwriting the
+ *     whiteout slot with a fresh live record (chain integrity
+ *     preserved by construction — the slot position doesn't change).
+ *   - `stm_dirent_readdir` emits the whiteout entry with
+ *     `child_ino=0`, `child_type=STM_DT_WHITEOUT`, and the original
+ *     name preserved in the entry.
+ *
+ * Refusals:
+ *   - NULL idx OR NULL name (STM_EINVAL).
+ *   - dataset_id == 0 OR dir_ino == 0 (STM_EINVAL).
+ *   - name_len == 0 OR name_len > STM_DIRENT_NAME_MAX (STM_EINVAL).
+ *   - No live record at `(dataset_id, dir_ino, name)` (STM_ENOENT —
+ *     the chain ended at EMPTY/TOMBSTONE/WHITEOUT/end before
+ *     finding a matching live record).
+ */
+STM_MUST_USE
+stm_status stm_dirent_whiteout(stm_dirent_index *idx,
+                                   uint64_t dataset_id, uint64_t dir_ino,
+                                   const uint8_t *name, uint8_t name_len);
 
 /*
  * Count live (non-tombstone) dirents in directory `dir_ino`. Used to

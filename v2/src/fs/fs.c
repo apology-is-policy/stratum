@@ -2360,11 +2360,23 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
         return STM_EINVAL;
     }
     if ((flags & ~(uint32_t)(STM_FS_RENAME_NOREPLACE |
-                              STM_FS_RENAME_EXCHANGE)) != 0u) return STM_EINVAL;
+                              STM_FS_RENAME_EXCHANGE  |
+                              STM_FS_RENAME_WHITEOUT)) != 0u) return STM_EINVAL;
     /* RENAME_EXCHANGE + RENAME_NOREPLACE are mutually exclusive
      * (POSIX-aligned: Linux returns EINVAL on the combination). */
     if ((flags & STM_FS_RENAME_EXCHANGE) &&
         (flags & STM_FS_RENAME_NOREPLACE)) {
+        return STM_EINVAL;
+    }
+    /* P8-POSIX-9b: RENAME_WHITEOUT cannot combine with EXCHANGE
+     * (the EXCHANGE-then-whiteout combination is semantically
+     * incoherent — EXCHANGE preserves both names, WHITEOUT
+     * replaces src with a whiteout marker). Linux refuses with
+     * EINVAL. RENAME_WHITEOUT | RENAME_NOREPLACE IS allowed
+     * per Linux semantics ("rename with whiteout, refuse if dst
+     * exists"). */
+    if ((flags & STM_FS_RENAME_WHITEOUT) &&
+        (flags & STM_FS_RENAME_EXCHANGE)) {
         return STM_EINVAL;
     }
 
@@ -2564,9 +2576,23 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
     }
 
     /* Drop src dirent. Under fs->lock-held posture, this is the
-     * straightforward write to a tombstone — should not fail. */
-    stm_status su = stm_dirent_unlink(didx, dataset_id, src_parent_ino,
-                                            src_name, src_name_len);
+     * straightforward write to a tombstone — should not fail.
+     *
+     * P8-POSIX-9b RENAME_WHITEOUT: instead of unlinking src (which
+     * leaves a TOMBSTONE invisible to readdir), convert src to a
+     * WHITEOUT marker (visible to readdir as STM_DT_WHITEOUT with
+     * child_ino=0 — overlayfs userspace interprets the marker as
+     * "hide the lower layer's same name"). Both the unlink and
+     * the whiteout primitives operate on the same chain slot;
+     * chain integrity is preserved by either path. */
+    stm_status su;
+    if (flags & STM_FS_RENAME_WHITEOUT) {
+        su = stm_dirent_whiteout(didx, dataset_id, src_parent_ino,
+                                       src_name, src_name_len);
+    } else {
+        su = stm_dirent_unlink(didx, dataset_id, src_parent_ino,
+                                     src_name, src_name_len);
+    }
     if (su != STM_OK) {
         /* Defensive rollback: drop the dst dirent we just created
          * and re-link the original (if overwrite). On any rollback

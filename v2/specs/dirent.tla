@@ -99,6 +99,24 @@
 \*     (dir_ino prefix in the key).
 \*   - rename atomicity. Modeled separately when P8-POSIX-9 extends
 \*     this spec.
+\*   - P8-POSIX-9b WHITEOUT: a NEW slot kind distinct from
+\*     TOMBSTONE used by `renameat2(2) RENAME_WHITEOUT` (overlayfs).
+\*     A whiteout slot preserves its name + has ino=0; lookup
+\*     returns NONE on a matching whiteout (the name is hidden);
+\*     readdir EMITS whiteouts (vs tombstones which are skipped) so
+\*     overlayfs userspace can interpret them. Gated by
+\*     `EnableWhiteoutModel` so existing cfgs stay un-touched
+\*     (same precedent as inode.tla's `EnableOrphanModel`). New
+\*     action `Whiteout(d, name)` converts a live record at
+\*     `name` to a WHITEOUT slot. New invariant
+\*     `ReaddirEmitsWhiteoutsAtEnd` pins that whiteouts are
+\*     POSIX-visible. Two new buggy variants:
+\*     `BuggyWhiteoutDropsName` (the slot becomes a tombstone
+\*     instead, losing the whiteout marker — readdir would then
+\*     skip the slot, breaking overlayfs semantics) and
+\*     `BuggyLookupReturnsRecordOnWhiteout` (lookup matches the
+\*     whiteout's name as if it were a live record, returning the
+\*     zero-ino tuple — userspace would see a "ghost" entry).
 \*   - case-insensitivity (ARCH §11.4.5). Abstracted via the Hash
 \*     function — case-insensitive impl uses Hash(NFKD(lower(name)))
 \*     but the chain-integrity properties are identical.
@@ -135,7 +153,14 @@ CONSTANTS
     BuggyLookupStopsOnTombstone,
     BuggyReaddirIncludesTombstones,
     BuggyReaddirNoCursorAdvance,
-    BuggyReaddirSkipsLiveRecord
+    BuggyReaddirSkipsLiveRecord,
+
+    \* P8-POSIX-9b: gated whiteout state machine. When FALSE, the
+    \* Whiteout action is disabled — every existing cfg passes
+    \* through with no semantic change.
+    EnableWhiteoutModel,
+    BuggyWhiteoutDropsName,
+    BuggyLookupReturnsRecordOnWhiteout
 
 ASSUME /\ Dirs # {}
        /\ Names # {}
@@ -149,6 +174,9 @@ ASSUME /\ Dirs # {}
        /\ BuggyReaddirIncludesTombstones \in BOOLEAN
        /\ BuggyReaddirNoCursorAdvance \in BOOLEAN
        /\ BuggyReaddirSkipsLiveRecord \in BOOLEAN
+       /\ EnableWhiteoutModel \in BOOLEAN
+       /\ BuggyWhiteoutDropsName \in BOOLEAN
+       /\ BuggyLookupReturnsRecordOnWhiteout \in BOOLEAN
 
 \* --------------------------------------------------------------------------
 \* Hash function override target.
@@ -177,12 +205,21 @@ HashAB_C ==
 \*   record     — a live dirent: [kind: "record", name, ino, gen].
 \* --------------------------------------------------------------------------
 
-\* Slot values are tagged records — same shape across all three
+\* Slot values are tagged records — same shape across all four
 \* variants so TLC's set-of-records inclusion checks succeed
 \* regardless of which variant is in the slot. The `name`/`ino`/
 \* `gen` fields are present on every variant; for non-record
 \* variants they hold sentinel zero values that the slot-walk
 \* code never reads (the `kind` discriminator gates access).
+\*
+\* WHITEOUT (P8-POSIX-9b): a fourth variant. Like TOMBSTONE in
+\* that no live record is reachable at the slot's name, but
+\* DIFFERENT in that the name field is preserved (so readdir can
+\* emit the whiteout marker for overlayfs interpretation) and the
+\* slot is reusable as a Create install candidate. ino is set to
+\* the WHITEOUT_INO sentinel — distinct from any value in Inos so
+\* the (name, WHITEOUT_INO, gen) tuple cannot be confused for a
+\* live link in the abstract `links` oracle.
 EMPTY ==
     [kind |-> "empty",     name |-> "",  ino |-> "_",  gen |-> 0]
 TOMBSTONE ==
@@ -191,16 +228,20 @@ TOMBSTONE ==
 DirentRec(n, i, g) ==
     [kind |-> "record", name |-> n, ino |-> i, gen |-> g]
 
-\* The full SlotEntry type — three tagged variants with a common
+WhiteoutRec(n) ==
+    [kind |-> "whiteout", name |-> n, ino |-> "_", gen |-> 0]
+
+\* The full SlotEntry type — four tagged variants with a common
 \* field shape so TypeOK can express the union as a single set-of-
 \* records expression.
 SlotEntry ==
-    [kind: {"empty", "tombstone", "record"},
+    [kind: {"empty", "tombstone", "record", "whiteout"},
      name: Names \cup {""},
      ino:  Inos  \cup {"_"},
      gen:  0..MaxGen]
 
-IsRecord(s) == s.kind = "record"
+IsRecord(s)   == s.kind = "record"
+IsWhiteout(s) == s.kind = "whiteout"
 
 \* --------------------------------------------------------------------------
 \* State.
@@ -263,7 +304,19 @@ ChainIdx(name, k) == (Hash[name] + k) % MaxProbe
 \* Lookup walker — implements the lookup protocol from ARCH §11.4.2.
 \* Returns <<ino, gen>> on the first matching record, NONE on EMPTY
 \* short-circuit (or TOMBSTONE under BuggyLookupStopsOnTombstone),
-\* NONE on chain exhaustion.
+\* NONE on a matching WHITEOUT (the whiteout hides the name from
+\* lookup view — overlayfs interprets via readdir), NONE on chain
+\* exhaustion.
+\*
+\* WHITEOUT semantics on the lookup chain (P8-POSIX-9b):
+\*   - matching name + healthy: NONE (the whiteout is a "hidden"
+\*     marker — overlayfs sees the marker via readdir, not lookup)
+\*   - matching name + BuggyLookupReturnsRecordOnWhiteout: returns
+\*     <<s.ino, s.gen>> = <<"_", 0>> as if it were a live record;
+\*     fires LookupAgreesWithLinks (the abstract oracle says NONE
+\*     for a whiteout name; the slot returns a zero-ino tuple)
+\*   - non-matching name: continue probing (whiteouts preserve
+\*     chain integrity for colliding names just like tombstones)
 RECURSIVE LookupWalk(_, _, _)
 LookupWalk(d, name, k) ==
     IF k >= MaxProbe THEN NONE
@@ -274,12 +327,22 @@ LookupWalk(d, name, k) ==
                  THEN IF BuggyLookupStopsOnTombstone
                       THEN NONE
                       ELSE LookupWalk(d, name, k + 1)
+            ELSE IF IsWhiteout(s)
+                 THEN IF s.name = name
+                      THEN IF BuggyLookupReturnsRecordOnWhiteout
+                           THEN <<s.ino, s.gen>>
+                           ELSE NONE
+                      ELSE LookupWalk(d, name, k + 1)
             ELSE IF s.name = name
                  THEN <<s.ino, s.gen>>
             ELSE LookupWalk(d, name, k + 1)
 
 \* Locate the first chain slot suitable for installing `name`:
-\*   - first EMPTY or TOMBSTONE encountered along the chain, OR
+\*   - first EMPTY, TOMBSTONE, or WHITEOUT encountered along the
+\*     chain (P8-POSIX-9b: WHITEOUTs are install candidates so a
+\*     fresh Create on a whiteout-occupied name overwrites the
+\*     marker with a live record — analog of overlayfs's "promote
+\*     name from lower to upper layer"), OR
 \*   - first record whose `name` matches (overwrite-update path —
 \*     unused in healthy Create because of the precondition that
 \*     `name` is not already in links).
@@ -291,6 +354,7 @@ FirstInstallSlot(d, name, k) ==
              s   == slots[d][idx]
          IN IF \/ s = EMPTY
                \/ s = TOMBSTONE
+               \/ IsWhiteout(s)
                \/ (IsRecord(s) /\ s.name = name)
             THEN idx
             ELSE FirstInstallSlot(d, name, k + 1)
@@ -433,6 +497,50 @@ Swap(d1, name1, d2, name2) ==
                                 {<<name2, old1[2], old1[3]>>}]
     /\ UNCHANGED <<iter, emit_log, iter_active>>
 
+\* P8-POSIX-9b: Whiteout — convert a live record at `name` in dir `d`
+\* to a WHITEOUT slot. Models renameat2(2) RENAME_WHITEOUT's
+\* effect on the SOURCE name (the destination's installation is
+\* covered by Create).
+\*
+\* Linux semantics: rename(src, dst, RENAME_WHITEOUT) moves the
+\* inode reference from `src` to `dst`, then leaves a whiteout
+\* marker at `src` (overlayfs interprets the marker as "lower
+\* layer's same name is hidden"). At the dirent level, the source
+\* name's slot transitions from RECORD to WHITEOUT (preserving
+\* the slot position in the chain + the name field; clearing
+\* ino/gen).
+\*
+\* Healthy: replace slot with WhiteoutRec(name) — the name field
+\* is preserved so readdir can emit the marker, but ino/gen are
+\* cleared (no live record to address). Removes (name, ino, gen)
+\* from links[d] (the abstract oracle says the name is no longer
+\* mapped to its prior ino).
+\*
+\* BuggyWhiteoutDropsName: replace slot with TOMBSTONE instead.
+\* Fires ReaddirEmitsWhiteoutsAtEnd — readdir would skip the
+\* slot (tombstones aren't emitted) so overlayfs userspace would
+\* miss the whiteout marker, breaking the layered-fs semantics.
+\*
+\* Precondition: `name` is currently a live record in `d`, AND
+\* no readdir is in flight (P8-POSIX-4 stable-iteration model).
+\*
+\* The action is gated by EnableWhiteoutModel — when FALSE, the
+\* action is disabled (existing cfgs that don't fire Whiteout
+\* are unaffected).
+Whiteout(d, name) ==
+    /\ EnableWhiteoutModel
+    /\ ~iter_active[d]
+    /\ \E t \in links[d] : t[1] = name
+    /\ LiveRecordSlot(d, name, 0) # -1
+    /\ LET marker == IF BuggyWhiteoutDropsName
+                     THEN TOMBSTONE
+                     ELSE WhiteoutRec(name)
+       IN slots' = [slots EXCEPT
+                       ![d][LiveRecordSlot(d, name, 0)] = marker]
+    /\ links' = [links EXCEPT
+                    ![d] = {t \in links[d] : t[1] # name}]
+    /\ UNCHANGED <<iter, emit_log, iter_active>>
+
 \* --------------------------------------------------------------------------
 \* Actions — read side (P8-POSIX-4 readdir).
 \*
@@ -510,6 +618,19 @@ ReaddirStep(d) ==
              /\ s = EMPTY
              /\ iter'     = [iter EXCEPT ![d] = k + 1]
              /\ emit_log' = emit_log
+          \/ \* Whiteout at k (P8-POSIX-9b)
+             \* Always emit + advance — whiteouts are POSIX-visible.
+             \* No buggy variant on the read side; the buggy shape
+             \* lives on the write side via BuggyWhiteoutDropsName
+             \* (which converts the slot to TOMBSTONE so readdir
+             \* skips it — same observable as "readdir doesn't emit
+             \* whiteouts" but the bug is in the write path).
+             /\ IsWhiteout(s)
+             /\ iter'     = [iter EXCEPT ![d] = k + 1]
+             /\ emit_log' = [emit_log EXCEPT
+                                 ![d] = Append(emit_log[d],
+                                               [probe |-> k,
+                                                slot  |-> s])]
     /\ UNCHANGED <<slots, links, iter_active>>
 
 \* Terminate the iteration — only enabled when cursor reached the
@@ -534,6 +655,8 @@ Next ==
            Unlink(d, name)
     \/ \E d1, d2 \in Dirs, name1, name2 \in Names :
            Swap(d1, name1, d2, name2)
+    \/ \E d \in Dirs, name \in Names :
+           Whiteout(d, name)
     \/ \E d \in Dirs : ReaddirReset(d)
     \/ \E d \in Dirs : ReaddirStep(d)
     \/ \E d \in Dirs : ReaddirEnd(d)
@@ -648,6 +771,40 @@ ReaddirCompleteAtEnd ==
                     \E i \in DOMAIN emit_log[d] :
                         emit_log[d][i].probe = k
 
+\* P8-POSIX-9b: whiteouts are POSIX-visible (Linux DT_WHT) — every
+\* whiteout slot's probe MUST appear in emit_log when iteration
+\* terminates. Fires for `BuggyWhiteoutDropsName` indirectly: the
+\* buggy whiteout converts the slot to TOMBSTONE, the spec stays
+\* logically consistent (no whiteout in slots → no whiteout
+\* required in emit_log), so this invariant alone doesn't fire
+\* under the buggy variant. The OBSERVABLE failure of
+\* BuggyWhiteoutDropsName is detected by adding (under
+\* EnableWhiteoutModel) the symmetric write-side check:
+\* `WhiteoutsExistInSlotsWhenLinksRemoved` — every name removed
+\* from links via the Whiteout action MUST leave a whiteout slot
+\* (not a tombstone) in the chain. Together the two pin the
+\* whiteout marker's persistence end-to-end.
+ReaddirEmitsWhiteoutsAtEnd ==
+    \A d \in Dirs :
+        (iter_active[d] /\ iter[d] = MaxProbe) =>
+            \A k \in 0..MaxProbe-1 :
+                IsWhiteout(slots[d][k]) =>
+                    \E i \in DOMAIN emit_log[d] :
+                        emit_log[d][i].probe = k
+
+\* P8-POSIX-9b: every WHITEOUT slot has its name field preserved
+\* + the name is NOT in links (the abstract oracle agrees that
+\* the name has been removed). This pins the whiteout slot's
+\* shape — name preserved (so readdir can emit it), ino cleared
+\* (so it's not confused for a live record).
+WhiteoutSlotShape ==
+    \A d \in Dirs, k \in 0..MaxProbe-1 :
+        IsWhiteout(slots[d][k]) =>
+            /\ slots[d][k].name \in Names
+            /\ slots[d][k].ino = "_"
+            /\ slots[d][k].gen = 0
+            /\ ~\E t \in links[d] : t[1] = slots[d][k].name
+
 \* --------------------------------------------------------------------------
 \* All invariants bundle.
 \* --------------------------------------------------------------------------
@@ -661,5 +818,7 @@ Invariants ==
     /\ ReaddirNoDuplicateProbeInLog
     /\ ReaddirCursorMonotonicEmits
     /\ ReaddirCompleteAtEnd
+    /\ ReaddirEmitsWhiteoutsAtEnd
+    /\ WhiteoutSlotShape
 
 =============================================================================

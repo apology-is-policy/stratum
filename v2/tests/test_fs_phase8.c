@@ -6349,6 +6349,421 @@ static void p7e_write_one_block(stm_fs *fs, uint64_t ino) {
     STM_ASSERT_OK(stm_fs_write(fs, 1, ino, 0, plain, sizeof plain));
 }
 
+/* ========================================================================= */
+/* P8-POSIX-9b: RENAME_WHITEOUT (renameat2 RENAME_WHITEOUT).                  */
+/* ========================================================================= */
+
+STM_TEST(fs_p9b_rename_whiteout_basic) {
+    /* rename(src, dst, WHITEOUT): dst gets src's prior inode; src
+     * becomes a whiteout entry. lookup(dst) → src_ino;
+     * lookup(src) → ENOENT (whiteout hides). */
+    make_tmp("p9b_whiteout_basic");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t src_ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"src", 3,
+                                          0644u, 0, 0, &src_ino));
+
+    STM_ASSERT_OK(stm_fs_rename(fs, 1,
+                                     root, (const uint8_t *)"src", 3,
+                                     root, (const uint8_t *)"dst", 3,
+                                     STM_FS_RENAME_WHITEOUT));
+
+    /* dst points at src_ino. */
+    uint64_t found = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root, (const uint8_t *)"dst", 3,
+                                      &found));
+    STM_ASSERT_EQ(found, src_ino);
+
+    /* src is hidden by whiteout — lookup ENOENT. */
+    STM_ASSERT_ERR(stm_fs_lookup(fs, 1, root, (const uint8_t *)"src", 3,
+                                       &found),
+                   STM_ENOENT);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p9b_rename_whiteout_emits_marker_in_readdir) {
+    /* The whiteout entry shows up in readdir output as
+     * (child_ino=0, child_type=STM_DT_WHITEOUT, name="src").
+     * Overlayfs userspace would consume this. */
+    make_tmp("p9b_whiteout_readdir");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t src_ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"src", 3,
+                                          0644u, 0, 0, &src_ino));
+    STM_ASSERT_OK(stm_fs_rename(fs, 1,
+                                     root, (const uint8_t *)"src", 3,
+                                     root, (const uint8_t *)"dst", 3,
+                                     STM_FS_RENAME_WHITEOUT));
+
+    uint64_t cursor = 0;
+    stm_fs_dirent_entry batch[16];
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_readdir(fs, 1, root, root, 0u,
+                                       &cursor, batch, 16, &n));
+    /* "." + ".." + dst (live) + src (whiteout). */
+    STM_ASSERT_EQ(n, (size_t)4);
+
+    bool saw_dst = false, saw_src_whiteout = false;
+    for (size_t i = 0; i < n; i++) {
+        if (batch[i].name_len == 3 &&
+            memcmp(batch[i].name, "dst", 3) == 0) {
+            STM_ASSERT_EQ(batch[i].child_ino, src_ino);
+            STM_ASSERT_EQ((int)batch[i].child_type, (int)STM_DT_REG);
+            saw_dst = true;
+        } else if (batch[i].name_len == 3 &&
+                   memcmp(batch[i].name, "src", 3) == 0) {
+            STM_ASSERT_EQ(batch[i].child_ino, (uint64_t)0);
+            STM_ASSERT_EQ((int)batch[i].child_type, (int)STM_DT_WHITEOUT);
+            saw_src_whiteout = true;
+        }
+    }
+    STM_ASSERT_TRUE(saw_dst && saw_src_whiteout);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p9b_rename_whiteout_then_create_at_src) {
+    /* After RENAME_WHITEOUT, creating a fresh file at the SOURCE
+     * name overwrites the whiteout slot (chain integrity preserved).
+     * Subsequent lookup returns the new inode. */
+    make_tmp("p9b_whiteout_recreate");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t src_ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"src", 3,
+                                          0644u, 0, 0, &src_ino));
+    STM_ASSERT_OK(stm_fs_rename(fs, 1,
+                                     root, (const uint8_t *)"src", 3,
+                                     root, (const uint8_t *)"dst", 3,
+                                     STM_FS_RENAME_WHITEOUT));
+
+    /* Re-create at "src". */
+    uint64_t new_src_ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"src", 3,
+                                          0600u, 1, 1, &new_src_ino));
+    STM_ASSERT_TRUE(new_src_ino != src_ino);
+
+    /* Lookup src returns the NEW ino (whiteout has been overwritten). */
+    uint64_t found = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root, (const uint8_t *)"src", 3,
+                                      &found));
+    STM_ASSERT_EQ(found, new_src_ino);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p9b_rename_whiteout_replaces_dst) {
+    /* RENAME_WHITEOUT honors the same dst-replacement semantics as
+     * plain rename — if dst exists (and not NOREPLACE), drop dst's
+     * inode + install src's content. The whiteout marker lands at
+     * src. */
+    make_tmp("p9b_whiteout_replace_dst");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t src_ino = 0, dst_ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"src", 3,
+                                          0644u, 0, 0, &src_ino));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"dst", 3,
+                                          0644u, 0, 0, &dst_ino));
+
+    STM_ASSERT_OK(stm_fs_rename(fs, 1,
+                                     root, (const uint8_t *)"src", 3,
+                                     root, (const uint8_t *)"dst", 3,
+                                     STM_FS_RENAME_WHITEOUT));
+
+    uint64_t found = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root, (const uint8_t *)"dst", 3,
+                                      &found));
+    STM_ASSERT_EQ(found, src_ino);   /* dst now points at src_ino */
+
+    /* dst_ino was cascade-freed (nlink dropped to 0). */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_ERR(stm_fs_stat(fs, 1, dst_ino, &v), STM_ENOENT);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p9b_rename_whiteout_with_noreplace_refuses_existing) {
+    /* RENAME_WHITEOUT | RENAME_NOREPLACE — if dst exists, refuse
+     * with EEXIST without leaving a whiteout. (Linux semantics:
+     * the two flags ARE compatible; the semantic is "rename + leave
+     * whiteout, but only if dst doesn't exist".) */
+    make_tmp("p9b_whiteout_noreplace");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t src_ino = 0, dst_ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"src", 3,
+                                          0644u, 0, 0, &src_ino));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"dst", 3,
+                                          0644u, 0, 0, &dst_ino));
+
+    STM_ASSERT_ERR(stm_fs_rename(fs, 1,
+                                       root, (const uint8_t *)"src", 3,
+                                       root, (const uint8_t *)"dst", 3,
+                                       STM_FS_RENAME_WHITEOUT |
+                                           STM_FS_RENAME_NOREPLACE),
+                   STM_EEXIST);
+
+    /* src + dst both still live; no whiteout left. */
+    uint64_t found = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root, (const uint8_t *)"src", 3,
+                                      &found));
+    STM_ASSERT_EQ(found, src_ino);
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root, (const uint8_t *)"dst", 3,
+                                      &found));
+    STM_ASSERT_EQ(found, dst_ino);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p9b_rename_whiteout_with_exchange_refused) {
+    /* RENAME_WHITEOUT | RENAME_EXCHANGE → STM_EINVAL (semantically
+     * incoherent — EXCHANGE preserves both names; WHITEOUT replaces
+     * src). Linux refuses with EINVAL. */
+    make_tmp("p9b_whiteout_exchange_refused");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t a = 0, b = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"a", 1,
+                                          0644u, 0, 0, &a));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"b", 1,
+                                          0644u, 0, 0, &b));
+
+    STM_ASSERT_ERR(stm_fs_rename(fs, 1,
+                                       root, (const uint8_t *)"a", 1,
+                                       root, (const uint8_t *)"b", 1,
+                                       STM_FS_RENAME_WHITEOUT |
+                                           STM_FS_RENAME_EXCHANGE),
+                   STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p9b_rename_whiteout_src_missing_returns_enoent) {
+    /* RENAME_WHITEOUT on a missing src — no whiteout left. */
+    make_tmp("p9b_whiteout_src_missing");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    STM_ASSERT_ERR(stm_fs_rename(fs, 1,
+                                       root, (const uint8_t *)"nope", 4,
+                                       root, (const uint8_t *)"dst", 3,
+                                       STM_FS_RENAME_WHITEOUT),
+                   STM_ENOENT);
+
+    /* Verify no whiteout was installed (readdir sees 2 entries —
+     * "." + ".."). */
+    uint64_t cursor = 0;
+    stm_fs_dirent_entry batch[16];
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_readdir(fs, 1, root, root, 0u,
+                                       &cursor, batch, 16, &n));
+    STM_ASSERT_EQ(n, (size_t)2);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p9b_rename_whiteout_persists_across_remount) {
+    /* The whiteout slot is encoded on disk via the dirent btree.
+     * After unmount + remount, lookup(src) still returns ENOENT
+     * + readdir still emits the whiteout marker. */
+    make_tmp("p9b_whiteout_persist");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t src_ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"src", 3,
+                                          0644u, 0, 0, &src_ino));
+    STM_ASSERT_OK(stm_fs_rename(fs, 1,
+                                     root, (const uint8_t *)"src", 3,
+                                     root, (const uint8_t *)"dst", 3,
+                                     STM_FS_RENAME_WHITEOUT));
+
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    /* Remount + verify. */
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t found = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root, (const uint8_t *)"dst", 3,
+                                      &found));
+    STM_ASSERT_EQ(found, src_ino);
+    STM_ASSERT_ERR(stm_fs_lookup(fs, 1, root, (const uint8_t *)"src", 3,
+                                       &found),
+                   STM_ENOENT);
+
+    /* Readdir still shows the whiteout entry. */
+    uint64_t cursor = 0;
+    stm_fs_dirent_entry batch[16];
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_readdir(fs, 1, root, root, 0u,
+                                       &cursor, batch, 16, &n));
+    STM_ASSERT_EQ(n, (size_t)4);
+    bool saw_src_whiteout = false;
+    for (size_t i = 0; i < n; i++) {
+        if (batch[i].name_len == 3 &&
+            memcmp(batch[i].name, "src", 3) == 0 &&
+            batch[i].child_type == STM_DT_WHITEOUT) {
+            saw_src_whiteout = true;
+        }
+    }
+    STM_ASSERT_TRUE(saw_src_whiteout);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p9b_rename_whiteout_count_excludes_whiteout) {
+    /* count_for_dir reports only LIVE entries — whiteouts don't
+     * contribute to nlink/empty-check semantics. After RENAME_WHITEOUT
+     * the directory's effective live count drops by 0 (we moved 1
+     * file out, but kept it as a whiteout marker AND created the dst
+     * — net zero live entries). */
+    make_tmp("p9b_whiteout_count");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t src_ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"src", 3,
+                                          0644u, 0, 0, &src_ino));
+
+    /* Now: 1 live entry. After rename-whiteout: src=whiteout,
+     * dst=live → still 1 live entry. */
+    STM_ASSERT_OK(stm_fs_rename(fs, 1,
+                                     root, (const uint8_t *)"src", 3,
+                                     root, (const uint8_t *)"dst", 3,
+                                     STM_FS_RENAME_WHITEOUT));
+
+    /* Empty rmdir requires zero live entries — root has 1 (dst).
+     * Drop dst, verify directory is now empty (whiteout doesn't
+     * count). The intent here is to verify count_for_dir treats
+     * whiteouts like tombstones for emptiness. */
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, root, (const uint8_t *)"dst", 3));
+
+    /* Internal check via readdir: only the synth + whiteout remain. */
+    uint64_t cursor = 0;
+    stm_fs_dirent_entry batch[16];
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_readdir(fs, 1, root, root, 0u,
+                                       &cursor, batch, 16, &n));
+    /* "." + ".." + whiteout("src") = 3 entries (whiteout emitted). */
+    STM_ASSERT_EQ(n, (size_t)3);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p9b_rename_whiteout_stamps_ctime_on_moved_inode) {
+    /* The MOVED inode (src, now at dst) gets ctime stamped to
+     * "now". Same shape as plain rename. */
+    make_tmp("p9b_whiteout_ctime");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t src_ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"src", 3,
+                                          0644u, 0, 0, &src_ino));
+
+    struct stm_inode_value before = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, src_ino, &before));
+    uint64_t ctime_before = stm_load_le64(before.si_ctime_sec);
+
+    /* Sleep 1.1 sec to ensure clock advances at second-grain. */
+    struct timespec ts = { .tv_sec = 1, .tv_nsec = 100000000 };
+    nanosleep(&ts, NULL);
+
+    STM_ASSERT_OK(stm_fs_rename(fs, 1,
+                                     root, (const uint8_t *)"src", 3,
+                                     root, (const uint8_t *)"dst", 3,
+                                     STM_FS_RENAME_WHITEOUT));
+
+    struct stm_inode_value after = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, src_ino, &after));
+    uint64_t ctime_after = stm_load_le64(after.si_ctime_sec);
+    STM_ASSERT_TRUE(ctime_after > ctime_before);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
 STM_TEST(fs_p7e_fadvise_normal_seq_rand_noreuse_are_noops) {
     /* The four pure-hint advice values just check existence + return
      * STM_OK. They don't touch the tier; an ino that started HOT

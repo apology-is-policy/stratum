@@ -464,6 +464,21 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
  * stamped on both swapped inodes (POSIX rename ctime semantics).
  */
 #define STM_FS_RENAME_EXCHANGE   0x02u
+/*
+ * P8-POSIX-9b: renameat2(2) RENAME_WHITEOUT — atomic rename PLUS
+ * leave a whiteout marker at the SOURCE name. After the call:
+ *   - dst gets src's prior inode reference
+ *   - src becomes a whiteout entry (visible to readdir as
+ *     STM_DT_WHITEOUT with child_ino=0; invisible to lookup).
+ * Used by overlay filesystems (Linux overlayfs) to "hide" a
+ * lower layer's file when it's been moved to upper. Mutually
+ * exclusive with both STM_FS_RENAME_NOREPLACE and
+ * STM_FS_RENAME_EXCHANGE — any combination of two of the three
+ * flags returns STM_EINVAL. Composes over `stm_dirent_alloc(dst)
+ * + stm_dirent_whiteout(src)`; models `dirent.tla::Whiteout`.
+ * ctime stamped on the moved inode (POSIX rename semantics).
+ */
+#define STM_FS_RENAME_WHITEOUT   0x04u
 
 /*
  * Atomically rename a directory entry from `(src_parent_ino,

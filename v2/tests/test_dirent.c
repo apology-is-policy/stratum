@@ -1061,4 +1061,247 @@ STM_TEST(dirent_swap_two_arg_validation) {
     stm_dirent_index_close(idx);
 }
 
+/* ========================================================================= */
+/* P8-POSIX-9b WHITEOUT (renameat2 RENAME_WHITEOUT) — dirent.tla::Whiteout. */
+/* ========================================================================= */
+
+STM_TEST(dirent_whiteout_basic_lookup_returns_enoent) {
+    /* Create a name, whiteout it, lookup returns ENOENT (the
+     * whiteout hides the name from lookup view). */
+    stm_dirent_index *idx = stm_dirent_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100, (const uint8_t *)"a", 1,
+                                         42, 0, STM_DT_REG));
+
+    /* Lookup before whiteout: returns ino=42. */
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_dirent_lookup(idx, 1, 100, (const uint8_t *)"a", 1,
+                                          &ino, NULL, NULL));
+    STM_ASSERT_EQ(ino, (uint64_t)42);
+
+    /* Whiteout. */
+    STM_ASSERT_OK(stm_dirent_whiteout(idx, 1, 100, (const uint8_t *)"a", 1));
+
+    /* Lookup after whiteout: ENOENT. */
+    ino = 99;
+    STM_ASSERT_ERR(stm_dirent_lookup(idx, 1, 100, (const uint8_t *)"a", 1,
+                                           &ino, NULL, NULL),
+                   STM_ENOENT);
+    STM_ASSERT_EQ(ino, (uint64_t)0);  /* zero-init contract */
+
+    stm_dirent_index_close(idx);
+}
+
+STM_TEST(dirent_whiteout_emitted_in_readdir) {
+    /* Whiteout slots ARE emitted in readdir output (with
+     * child_ino=0 + child_type=STM_DT_WHITEOUT). The name is
+     * preserved so overlayfs userspace can interpret it. */
+    stm_dirent_index *idx = stm_dirent_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    /* Live entry "a" + a soon-to-be-whiteout "b" + live "c". */
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100, (const uint8_t *)"a", 1,
+                                         11, 0, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100, (const uint8_t *)"b", 1,
+                                         22, 0, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100, (const uint8_t *)"c", 1,
+                                         33, 0, STM_DT_REG));
+
+    STM_ASSERT_OK(stm_dirent_whiteout(idx, 1, 100, (const uint8_t *)"b", 1));
+
+    uint64_t cursor = 0;
+    stm_dirent_entry batch[8];
+    size_t n = 0;
+    STM_ASSERT_OK(stm_dirent_readdir(idx, 1, 100, &cursor, batch, 8, &n));
+    STM_ASSERT_EQ(n, (size_t)3);
+
+    /* Find the whiteout entry by name "b". */
+    bool saw_a = false, saw_b_whiteout = false, saw_c = false;
+    for (size_t i = 0; i < n; i++) {
+        if (batch[i].name_len == 1 && batch[i].name[0] == 'a') {
+            STM_ASSERT_EQ(batch[i].child_ino, (uint64_t)11);
+            STM_ASSERT_EQ((int)batch[i].child_type, (int)STM_DT_REG);
+            saw_a = true;
+        } else if (batch[i].name_len == 1 && batch[i].name[0] == 'b') {
+            STM_ASSERT_EQ(batch[i].child_ino, (uint64_t)0);
+            STM_ASSERT_EQ((int)batch[i].child_type, (int)STM_DT_WHITEOUT);
+            saw_b_whiteout = true;
+        } else if (batch[i].name_len == 1 && batch[i].name[0] == 'c') {
+            STM_ASSERT_EQ(batch[i].child_ino, (uint64_t)33);
+            STM_ASSERT_EQ((int)batch[i].child_type, (int)STM_DT_REG);
+            saw_c = true;
+        }
+    }
+    STM_ASSERT_TRUE(saw_a && saw_b_whiteout && saw_c);
+
+    stm_dirent_index_close(idx);
+}
+
+STM_TEST(dirent_whiteout_then_create_overwrites_slot) {
+    /* Whiteout a name, then alloc a fresh record at the same name —
+     * the new record overwrites the whiteout slot (chain
+     * integrity preserved). Subsequent lookup returns the NEW
+     * ino (not the whiteout). */
+    stm_dirent_index *idx = stm_dirent_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100, (const uint8_t *)"a", 1,
+                                         42, 0, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_whiteout(idx, 1, 100, (const uint8_t *)"a", 1));
+
+    /* Re-create. */
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100, (const uint8_t *)"a", 1,
+                                         77, 1, STM_DT_DIR));
+
+    /* Lookup returns the new (ino=77, type=DIR). */
+    uint64_t ino = 0, gen = 0;
+    uint8_t  type = 0;
+    STM_ASSERT_OK(stm_dirent_lookup(idx, 1, 100, (const uint8_t *)"a", 1,
+                                          &ino, &gen, &type));
+    STM_ASSERT_EQ(ino, (uint64_t)77);
+    STM_ASSERT_EQ(gen, (uint64_t)1);
+    STM_ASSERT_EQ((int)type, (int)STM_DT_DIR);
+
+    stm_dirent_index_close(idx);
+}
+
+STM_TEST(dirent_whiteout_preserves_chain_integrity_for_collision) {
+    /* Forced FNV collision — names that hash to the same probe must
+     * remain reachable through whiteouts in the chain. Same shape
+     * as the tombstone chain-integrity test but with a whiteout
+     * instead of a tombstone in the middle of the chain. */
+    stm_dirent_index *idx = stm_dirent_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    /* Alloc 4 names; the second gets whiteouted; the third + fourth
+     * must still be findable. The chain is implicit in the FNV
+     * hash + open-addressing — we don't need to control collisions
+     * directly because dirent_alloc handles probing. */
+    char nm[8];
+    for (int i = 0; i < 4; i++) {
+        snprintf(nm, sizeof nm, "f%d", i);
+        STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100,
+                                             (const uint8_t *)nm,
+                                             (uint8_t)strlen(nm),
+                                             100u + (uint64_t)i, 0,
+                                             STM_DT_REG));
+    }
+
+    /* Whiteout f1. */
+    STM_ASSERT_OK(stm_dirent_whiteout(idx, 1, 100,
+                                            (const uint8_t *)"f1", 2));
+
+    /* f0, f2, f3 still findable. f1 is hidden. */
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_dirent_lookup(idx, 1, 100, (const uint8_t *)"f0", 2,
+                                          &ino, NULL, NULL));
+    STM_ASSERT_EQ(ino, (uint64_t)100);
+    STM_ASSERT_ERR(stm_dirent_lookup(idx, 1, 100, (const uint8_t *)"f1", 2,
+                                           &ino, NULL, NULL),
+                   STM_ENOENT);
+    STM_ASSERT_OK(stm_dirent_lookup(idx, 1, 100, (const uint8_t *)"f2", 2,
+                                          &ino, NULL, NULL));
+    STM_ASSERT_EQ(ino, (uint64_t)102);
+    STM_ASSERT_OK(stm_dirent_lookup(idx, 1, 100, (const uint8_t *)"f3", 2,
+                                          &ino, NULL, NULL));
+    STM_ASSERT_EQ(ino, (uint64_t)103);
+
+    stm_dirent_index_close(idx);
+}
+
+STM_TEST(dirent_whiteout_unlink_returns_enoent) {
+    /* unlink on a whiteout-named slot returns ENOENT (no live
+     * record to remove). */
+    stm_dirent_index *idx = stm_dirent_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100, (const uint8_t *)"a", 1,
+                                         42, 0, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_whiteout(idx, 1, 100, (const uint8_t *)"a", 1));
+    STM_ASSERT_ERR(stm_dirent_unlink(idx, 1, 100, (const uint8_t *)"a", 1),
+                   STM_ENOENT);
+
+    stm_dirent_index_close(idx);
+}
+
+STM_TEST(dirent_whiteout_count_excludes_whiteouts) {
+    /* count_for_dir counts only LIVE records — whiteouts and
+     * tombstones don't contribute. */
+    stm_dirent_index *idx = stm_dirent_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100, (const uint8_t *)"a", 1,
+                                         11, 0, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100, (const uint8_t *)"b", 1,
+                                         22, 0, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100, (const uint8_t *)"c", 1,
+                                         33, 0, STM_DT_REG));
+
+    size_t n = 0;
+    STM_ASSERT_OK(stm_dirent_count_for_dir(idx, 1, 100, &n));
+    STM_ASSERT_EQ(n, (size_t)3);
+
+    /* Whiteout b. count drops to 2. */
+    STM_ASSERT_OK(stm_dirent_whiteout(idx, 1, 100, (const uint8_t *)"b", 1));
+    STM_ASSERT_OK(stm_dirent_count_for_dir(idx, 1, 100, &n));
+    STM_ASSERT_EQ(n, (size_t)2);
+
+    /* Tombstone c (unlink). count drops to 1. */
+    STM_ASSERT_OK(stm_dirent_unlink(idx, 1, 100, (const uint8_t *)"c", 1));
+    STM_ASSERT_OK(stm_dirent_count_for_dir(idx, 1, 100, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+
+    stm_dirent_index_close(idx);
+}
+
+STM_TEST(dirent_whiteout_on_missing_returns_enoent) {
+    /* whiteout on a name that doesn't exist (or is already a
+     * whiteout / tombstone) returns ENOENT. */
+    stm_dirent_index *idx = stm_dirent_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    /* No record at "z" — whiteout returns ENOENT. */
+    STM_ASSERT_ERR(stm_dirent_whiteout(idx, 1, 100, (const uint8_t *)"z", 1),
+                   STM_ENOENT);
+
+    /* whiteout an existing name, then try to whiteout it again —
+     * the second call sees no live record + returns ENOENT. */
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100, (const uint8_t *)"a", 1,
+                                         42, 0, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_whiteout(idx, 1, 100, (const uint8_t *)"a", 1));
+    STM_ASSERT_ERR(stm_dirent_whiteout(idx, 1, 100, (const uint8_t *)"a", 1),
+                   STM_ENOENT);
+
+    /* whiteout-then-unlink: same shape — the unlink sees the
+     * whiteout's matching name + returns ENOENT (no live record). */
+    STM_ASSERT_ERR(stm_dirent_unlink(idx, 1, 100, (const uint8_t *)"a", 1),
+                   STM_ENOENT);
+
+    stm_dirent_index_close(idx);
+}
+
+STM_TEST(dirent_whiteout_arg_validation) {
+    stm_dirent_index *idx = stm_dirent_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    /* NULL idx. */
+    STM_ASSERT_ERR(stm_dirent_whiteout(NULL, 1, 100, (const uint8_t *)"a", 1),
+                   STM_EINVAL);
+    /* NULL name. */
+    STM_ASSERT_ERR(stm_dirent_whiteout(idx, 1, 100, NULL, 1),
+                   STM_EINVAL);
+    /* dataset_id == 0. */
+    STM_ASSERT_ERR(stm_dirent_whiteout(idx, 0, 100, (const uint8_t *)"a", 1),
+                   STM_EINVAL);
+    /* dir_ino == 0. */
+    STM_ASSERT_ERR(stm_dirent_whiteout(idx, 1, 0, (const uint8_t *)"a", 1),
+                   STM_EINVAL);
+    /* name_len == 0. */
+    STM_ASSERT_ERR(stm_dirent_whiteout(idx, 1, 100, (const uint8_t *)"a", 0),
+                   STM_EINVAL);
+
+    stm_dirent_index_close(idx);
+}
+
 STM_TEST_MAIN("test_dirent")

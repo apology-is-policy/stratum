@@ -101,6 +101,20 @@ static inline bool record_is_tombstone(const stm_dirent_record *r) {
     return (r->flags & STM_DIRENT_FLAG_TOMBSTONE) != 0u;
 }
 
+/* P8-POSIX-9b: a slot is a whiteout iff the WHITEOUT flag bit is
+ * set. Whiteouts and tombstones are mutually exclusive (the
+ * decoder rejects flags with both bits set; the writer never
+ * encodes both simultaneously). */
+static inline bool record_is_whiteout(const stm_dirent_record *r) {
+    return (r->flags & STM_DIRENT_FLAG_WHITEOUT) != 0u;
+}
+
+/* A slot is "live" iff it's neither a tombstone nor a whiteout —
+ * i.e., it actually carries an addressable child_ino. */
+static inline bool record_is_live(const stm_dirent_record *r) {
+    return !record_is_tombstone(r) && !record_is_whiteout(r);
+}
+
 static inline bool record_name_eq(const stm_dirent_record *r,
                                        const uint8_t *name, uint8_t name_len) {
     return r->name_len == name_len &&
@@ -248,9 +262,16 @@ static stm_status di_decode_value(const void *in, size_t in_len,
     if (in_len != (size_t)DI_VAL_FIXED + (size_t)out->name_len)
         return STM_ECORRUPT;
 
-    bool is_tomb = record_is_tombstone(out);
+    bool is_tomb  = record_is_tombstone(out);
+    bool is_white = record_is_whiteout(out);
 
-    /* Tombstone vs live invariants. */
+    /* Mutually exclusive: a slot is exactly one of {tombstone,
+     * whiteout, live record}. The decoder refuses any record with
+     * both bits set as STM_ECORRUPT (writer-side guards in
+     * stm_dirent_unlink + stm_dirent_whiteout never encode both
+     * simultaneously — R71 P1-1 lesson). */
+    if (is_tomb && is_white) return STM_ECORRUPT;
+
     if (is_tomb) {
         if (out->child_ino  != 0u)   return STM_ECORRUPT;
         if (out->child_gen  != 0u)   return STM_ECORRUPT;
@@ -259,7 +280,24 @@ static stm_status di_decode_value(const void *in, size_t in_len,
         /* Other flag bits beyond TOMBSTONE are reserved zero. */
         if ((out->flags & ~(uint8_t)STM_DIRENT_FLAG_TOMBSTONE) != 0u)
             return STM_ECORRUPT;
+    } else if (is_white) {
+        /* Whiteout shape: child_ino == 0, child_gen == 0,
+         * child_type == STM_DT_WHITEOUT, name preserved. Other flag
+         * bits beyond WHITEOUT are reserved zero. */
+        if (out->child_ino  != 0u)               return STM_ECORRUPT;
+        if (out->child_gen  != 0u)               return STM_ECORRUPT;
+        if (out->child_type != STM_DT_WHITEOUT)  return STM_ECORRUPT;
+        if (out->name_len == 0u ||
+            out->name_len > STM_DIRENT_NAME_MAX) return STM_ECORRUPT;
+        if ((out->flags & ~(uint8_t)STM_DIRENT_FLAG_WHITEOUT) != 0u)
+            return STM_ECORRUPT;
+        memcpy(out->name, b + DI_VAL_FIXED, out->name_len);
     } else {
+        /* Live record: child_ino non-zero, name_len in [1, 255],
+         * child_type in the valid POSIX-shape DT_* set EXCLUDING
+         * STM_DT_WHITEOUT (whiteouts are flag-bit-encoded, not
+         * type-encoded — a record claiming type=WHITEOUT but no
+         * WHITEOUT flag bit is malformed). */
         if (out->child_ino == 0u)    return STM_ECORRUPT;
         if (out->name_len == 0u || out->name_len > STM_DIRENT_NAME_MAX)
             return STM_ECORRUPT;
@@ -415,12 +453,18 @@ stm_status stm_dirent_alloc(stm_dirent_index *idx,
 
     uint64_t hash_base = fnv1a64(name, (size_t)name_len);
 
-    /* Walk the chain. Track the FIRST install-eligible slot (EMPTY or
-     * TOMBSTONE) but keep walking to verify the name isn't already
-     * linked further in the chain (would be EEXIST). */
+    /* Walk the chain. Track the FIRST install-eligible slot (EMPTY,
+     * TOMBSTONE, or WHITEOUT) but keep walking to verify the name
+     * isn't already linked further in the chain (would be EEXIST).
+     *
+     * P8-POSIX-9b: WHITEOUT slots are install candidates (overwrite
+     * the whiteout with a live record) — analog of overlayfs's
+     * "promote name from lower to upper layer". Whiteout-overwrite
+     * semantics are tested in test_dirent.c's
+     * dirent_whiteout_then_create_overwrites_slot. */
     bool     have_install_slot = false;
     uint64_t install_probe     = 0;
-    stm_dirent_record *install_tomb = NULL;  /* non-NULL iff install_probe is a TOMBSTONE */
+    stm_dirent_record *install_existing = NULL;  /* tombstone or whiteout to overwrite */
 
     for (uint32_t k = 0; k < STM_DIRENT_PROBE_MAX; k++) {
         uint64_t probe = hash_base + (uint64_t)k;
@@ -431,15 +475,15 @@ stm_status stm_dirent_alloc(stm_dirent_index *idx,
              * (this EMPTY if none earlier was found). */
             if (!have_install_slot) {
                 install_probe     = probe;
-                install_tomb      = NULL;
+                install_existing  = NULL;
                 have_install_slot = true;
             }
             break;
         }
-        if (record_is_tombstone(r)) {
+        if (record_is_tombstone(r) || record_is_whiteout(r)) {
             if (!have_install_slot) {
                 install_probe     = probe;
-                install_tomb      = r;
+                install_existing  = r;
                 have_install_slot = true;
             }
             continue;
@@ -458,8 +502,8 @@ stm_status stm_dirent_alloc(stm_dirent_index *idx,
 
     /* Install at install_probe. */
     stm_dirent_record *target;
-    if (install_tomb) {
-        target = install_tomb;
+    if (install_existing) {
+        target = install_existing;
     } else {
         target = append_record(idx);
         if (!target) {
@@ -511,6 +555,17 @@ stm_status stm_dirent_lookup(const stm_dirent_index *idx,
             return STM_ENOENT;
         }
         if (record_is_tombstone(r)) continue;
+        if (record_is_whiteout(r)) {
+            /* P8-POSIX-9b: a matching whiteout HIDES the name from
+             * lookup view (overlayfs interprets via readdir).
+             * Non-matching whiteout slots preserve chain integrity
+             * for colliding names — continue probing past them. */
+            if (record_name_eq(r, name, name_len)) {
+                must_unlock(idx_lock(idx));
+                return STM_ENOENT;
+            }
+            continue;
+        }
         if (record_name_eq(r, name, name_len)) {
             *out_child_ino = r->child_ino;
             if (out_child_gen)  *out_child_gen  = r->child_gen;
@@ -544,6 +599,16 @@ stm_status stm_dirent_unlink(stm_dirent_index *idx,
             return STM_ENOENT;
         }
         if (record_is_tombstone(r)) continue;
+        if (record_is_whiteout(r)) {
+            /* P8-POSIX-9b: a matching whiteout name has no live
+             * record to unlink — return ENOENT. Non-matching
+             * whiteouts preserve chain integrity (continue probing). */
+            if (record_name_eq(r, name, name_len)) {
+                must_unlock(idx_lock(idx));
+                return STM_ENOENT;
+            }
+            continue;
+        }
         if (record_name_eq(r, name, name_len)) {
             /* Replace with TOMBSTONE — preserves chain integrity for
              * colliding names at higher probe indices. */
@@ -566,7 +631,10 @@ stm_status stm_dirent_unlink(stm_dirent_index *idx,
 /* P8-POSIX-9b: helper that walks the chain to locate the live
  * record at (dataset_id, dir_ino, name). Returns NULL if not
  * found OR if the chain runs into EMPTY before the name appears.
- * Caller MUST hold the index mutex. */
+ * Whiteouts are NOT live records — a matching whiteout returns
+ * NULL (caller sees this as ENOENT). Non-matching whiteouts
+ * preserve chain integrity (continue probing). Caller MUST
+ * hold the index mutex. */
 static stm_dirent_record *
 find_live_record(stm_dirent_index *idx, uint64_t dataset_id,
                       uint64_t dir_ino,
@@ -579,6 +647,10 @@ find_live_record(stm_dirent_index *idx, uint64_t dataset_id,
                 find_record_at_probe(idx, dataset_id, dir_ino, probe);
         if (!r) return NULL;   /* EMPTY — chain ends */
         if (record_is_tombstone(r)) continue;
+        if (record_is_whiteout(r)) {
+            if (record_name_eq(r, name, name_len)) return NULL;
+            continue;
+        }
         if (record_name_eq(r, name, name_len)) return r;
     }
     return NULL;
@@ -645,6 +717,43 @@ stm_status stm_dirent_swap_two(stm_dirent_index *idx,
     return STM_OK;
 }
 
+/* P8-POSIX-9b: convert a live record at (ds, dir_ino, name) to a
+ * WHITEOUT marker. Models dirent.tla::Whiteout. */
+stm_status stm_dirent_whiteout(stm_dirent_index *idx,
+                                   uint64_t dataset_id, uint64_t dir_ino,
+                                   const uint8_t *name, uint8_t name_len) {
+    if (!idx || !name) return STM_EINVAL;
+    if (dataset_id == 0u || dir_ino == 0u) return STM_EINVAL;
+    if (name_len == 0u || name_len > STM_DIRENT_NAME_MAX) return STM_EINVAL;
+
+    must_lock(idx_lock(idx));
+
+    stm_dirent_record *r =
+            find_live_record(idx, dataset_id, dir_ino, name, name_len);
+    if (!r) {
+        must_unlock(idx_lock(idx));
+        return STM_ENOENT;
+    }
+
+    /* Convert the live record to a WHITEOUT slot in place. Slot
+     * position (hash_probe + array index) UNCHANGED — chain
+     * integrity preserved by construction. The name field is
+     * PRESERVED (so readdir can emit the marker). child_ino /
+     * child_gen are CLEARED. child_type is reassigned to
+     * STM_DT_WHITEOUT (Linux DT_WHT). The flags byte holds ONLY
+     * the WHITEOUT bit (mutually exclusive with TOMBSTONE per
+     * the decoder). */
+    r->child_ino  = 0;
+    r->child_gen  = 0;
+    r->child_type = STM_DT_WHITEOUT;
+    r->flags      = STM_DIRENT_FLAG_WHITEOUT;
+    /* name + name_len UNCHANGED. */
+    idx->dirty = true;
+
+    must_unlock(idx_lock(idx));
+    return STM_OK;
+}
+
 stm_status stm_dirent_count_for_dir(const stm_dirent_index *idx,
                                         uint64_t dataset_id, uint64_t dir_ino,
                                         size_t *out_count) {
@@ -654,12 +763,18 @@ stm_status stm_dirent_count_for_dir(const stm_dirent_index *idx,
     *out_count = 0;
     must_lock(idx_lock(idx));
 
+    /* P8-POSIX-9b: only LIVE records count toward the directory's
+     * link count. Tombstones (invisible) and whiteouts (visible-
+     * to-readdir markers but no addressable child_ino) do not
+     * contribute to nlink/empty-check semantics. A directory with
+     * only whiteouts is empty for rmdir purposes (POSIX:
+     * whiteouts shouldn't block rmdir per overlayfs semantics). */
     size_t count = 0;
     for (size_t i = 0; i < idx->n_records; i++) {
         const stm_dirent_record *r = &idx->records[i];
         if (r->dataset_id == dataset_id &&
             r->dir_ino    == dir_ino &&
-            !record_is_tombstone(r)) count++;
+            record_is_live(r)) count++;
     }
     *out_count = count;
 
@@ -725,8 +840,11 @@ stm_status stm_dirent_readdir(const stm_dirent_index *idx,
 
     /* Pass 1: count matches.
      *
-     * "Match" = same dataset_id + dir_ino + non-tombstone + probe ≥
-     * cursor. We allocate enough space for all matches even if many
+     * "Match" = same dataset_id + dir_ino + (live record OR whiteout)
+     * + probe ≥ cursor. Tombstones are NEVER emitted (they're internal
+     * chain-integrity markers). Whiteouts ARE emitted (P8-POSIX-9b —
+     * Linux DT_WHT semantics; overlayfs userspace interprets the
+     * marker). We allocate enough space for all matches even if many
      * exceed max_entries — the post-sort prefix gives the smallest
      * max_entries by probe, which is what readdir needs. */
     size_t n_match = 0;
