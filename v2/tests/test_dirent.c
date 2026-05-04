@@ -24,6 +24,7 @@
 #include <stratum/bootstrap.h>
 #include <stratum/crypto.h>
 #include <stratum/dirent.h>
+#include <stratum/dirent_testing.h>
 #include <stratum/super.h>
 #include <stratum/types.h>
 
@@ -1300,6 +1301,134 @@ STM_TEST(dirent_whiteout_arg_validation) {
     /* name_len == 0. */
     STM_ASSERT_ERR(stm_dirent_whiteout(idx, 1, 100, (const uint8_t *)"a", 0),
                    STM_EINVAL);
+
+    stm_dirent_index_close(idx);
+}
+
+STM_TEST(dirent_whiteout_preserved_under_hash_collision) {
+    /* R88 P2-1 regression: a different-name alloc whose chain
+     * walk visits a non-matching whiteout slot MUST NOT overwrite
+     * the whiteout marker. Pre-fix, stm_dirent_alloc treated EVERY
+     * whiteout (regardless of name) as install candidate; the
+     * collision case silently destroyed the marker.
+     *
+     * Forced-collision construction: install a whiteout for
+     * "foo" at the EXACT starting probe of "baz"'s chain (using
+     * the test-only stm_dirent_install_at_probe_for_test). Then
+     * alloc("baz"). Pre-fix outcome: chain walks from baz's hash,
+     * sees the whiteout, treats it as install candidate, walks
+     * past, hits EMPTY, installs at the whiteout's slot — whiteout
+     * for "foo" gone. Post-fix outcome: chain walks past the
+     * different-name whiteout (treats it like a colliding live
+     * record), installs at the next EMPTY probe — whiteout for
+     * "foo" preserved.
+     *
+     * Verification via readdir output: post-alloc, both "baz"
+     * (live REG) and "foo" (WHITEOUT) MUST be present. */
+    stm_dirent_index *idx = stm_dirent_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    uint64_t baz_hash =
+            stm_dirent_fnv1a64_for_test((const uint8_t *)"baz", 3);
+
+    /* Install a whiteout for "foo" at baz's starting probe. The
+     * test seam bypasses the chain walk so we don't need names
+     * that actually fnv-1a-collide. */
+    STM_ASSERT_OK(stm_dirent_install_at_probe_for_test(
+            idx, 1, 100, baz_hash,
+            (const uint8_t *)"foo", 3,
+            /* child_ino = */ 0, /* child_gen = */ 0,
+            STM_DT_WHITEOUT, STM_DIRENT_FLAG_WHITEOUT));
+
+    /* Now alloc("baz") — the chain walks from baz_hash + 0,
+     * sees the whiteout for "foo" first, MUST walk past
+     * (different name), and install at the next EMPTY probe. */
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100, (const uint8_t *)"baz", 3,
+                                         /* child_ino = */ 99, 0,
+                                         STM_DT_REG));
+
+    /* Verify via readdir that BOTH the whiteout and the live
+     * record are present. */
+    uint64_t cursor = 0;
+    stm_dirent_entry batch[8];
+    size_t n = 0;
+    STM_ASSERT_OK(stm_dirent_readdir(idx, 1, 100, &cursor, batch, 8, &n));
+    STM_ASSERT_EQ(n, (size_t)2);
+
+    bool saw_foo_whiteout = false, saw_baz_live = false;
+    for (size_t i = 0; i < n; i++) {
+        if (batch[i].name_len == 3 &&
+            memcmp(batch[i].name, "foo", 3) == 0 &&
+            batch[i].child_type == STM_DT_WHITEOUT &&
+            batch[i].child_ino == 0u) {
+            saw_foo_whiteout = true;
+        }
+        if (batch[i].name_len == 3 &&
+            memcmp(batch[i].name, "baz", 3) == 0 &&
+            batch[i].child_type == STM_DT_REG &&
+            batch[i].child_ino == 99u) {
+            saw_baz_live = true;
+        }
+    }
+    STM_ASSERT_TRUE(saw_foo_whiteout);   /* fires under R88 P2-1 bug */
+    STM_ASSERT_TRUE(saw_baz_live);
+
+    /* Also verify that the live "baz" record landed at a probe
+     * STRICTLY GREATER than baz_hash (the whiteout's slot at
+     * baz_hash is preserved + occupied). */
+    bool found_baz_record = false;
+    for (size_t i = 0; i < n; i++) {
+        if (batch[i].name_len == 3 &&
+            memcmp(batch[i].name, "baz", 3) == 0) {
+            STM_ASSERT_TRUE(batch[i].hash_probe > baz_hash);
+            found_baz_record = true;
+        }
+    }
+    STM_ASSERT_TRUE(found_baz_record);
+
+    stm_dirent_index_close(idx);
+}
+
+STM_TEST(dirent_whiteout_same_name_create_overwrites_under_collision) {
+    /* Sibling test to R88 P2-1: the SAME-NAME alloc-after-whiteout
+     * IS expected to overwrite the whiteout slot (the overlayfs
+     * "promote name from lower to upper layer" semantic). The fix
+     * preserves this behavior — only DIFFERENT-name whiteouts are
+     * skipped past as install candidates.
+     *
+     * Test: install whiteout for "foo" at foo's starting probe;
+     * alloc("foo") MUST overwrite the slot, not install at a new
+     * probe. */
+    stm_dirent_index *idx = stm_dirent_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    uint64_t foo_hash =
+            stm_dirent_fnv1a64_for_test((const uint8_t *)"foo", 3);
+
+    STM_ASSERT_OK(stm_dirent_install_at_probe_for_test(
+            idx, 1, 100, foo_hash,
+            (const uint8_t *)"foo", 3,
+            0, 0, STM_DT_WHITEOUT, STM_DIRENT_FLAG_WHITEOUT));
+
+    /* alloc("foo", ino=42) — same-name promote: should land at
+     * the whiteout's slot (foo_hash), not at foo_hash+1. */
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100, (const uint8_t *)"foo", 3,
+                                         42, 0, STM_DT_REG));
+
+    /* Lookup returns the live record; readdir sees only one entry
+     * (no whiteout, no double slot). */
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_dirent_lookup(idx, 1, 100, (const uint8_t *)"foo", 3,
+                                          &ino, NULL, NULL));
+    STM_ASSERT_EQ(ino, (uint64_t)42);
+
+    uint64_t cursor = 0;
+    stm_dirent_entry batch[4];
+    size_t n = 0;
+    STM_ASSERT_OK(stm_dirent_readdir(idx, 1, 100, &cursor, batch, 4, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+    STM_ASSERT_EQ((int)batch[0].child_type, (int)STM_DT_REG);
+    STM_ASSERT_EQ(batch[0].hash_probe, foo_hash);  /* same slot */
 
     stm_dirent_index_close(idx);
 }

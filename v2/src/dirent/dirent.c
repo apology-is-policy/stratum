@@ -20,6 +20,7 @@
  * with this commit (P8-POSIX-2 substantive).
  */
 #include <stratum/dirent.h>
+#include <stratum/dirent_testing.h>
 #include <stratum/types.h>
 #include <stratum/block.h>
 #include <stratum/bootstrap.h>
@@ -454,17 +455,27 @@ stm_status stm_dirent_alloc(stm_dirent_index *idx,
     uint64_t hash_base = fnv1a64(name, (size_t)name_len);
 
     /* Walk the chain. Track the FIRST install-eligible slot (EMPTY,
-     * TOMBSTONE, or WHITEOUT) but keep walking to verify the name
-     * isn't already linked further in the chain (would be EEXIST).
+     * TOMBSTONE, or SAME-NAME WHITEOUT) but keep walking to verify
+     * the name isn't already linked further in the chain (would be
+     * EEXIST).
      *
-     * P8-POSIX-9b: WHITEOUT slots are install candidates (overwrite
-     * the whiteout with a live record) — analog of overlayfs's
-     * "promote name from lower to upper layer". Whiteout-overwrite
-     * semantics are tested in test_dirent.c's
-     * dirent_whiteout_then_create_overwrites_slot. */
+     * P8-POSIX-9b: WHITEOUT slots are install candidates ONLY when
+     * the whiteout's name matches the name being installed
+     * (overlayfs's "promote NAME from lower to upper layer"
+     * semantic). A DIFFERENT-named whiteout in the chain MUST be
+     * preserved — otherwise an unrelated colliding-named create
+     * would silently destroy the whiteout marker, breaking
+     * RENAME_WHITEOUT's contract that whiteouts persist across
+     * other dir ops (R88 P2-1). Walking past a non-matching
+     * whiteout treats it as a chain-occupying slot (like a
+     * different-named live record) — chain integrity preserved.
+     * Whiteout-overwrite semantics are tested in test_dirent.c's
+     * dirent_whiteout_then_create_overwrites_slot;
+     * whiteout-preservation under hash collision is tested by
+     * dirent_whiteout_preserved_under_hash_collision. */
     bool     have_install_slot = false;
     uint64_t install_probe     = 0;
-    stm_dirent_record *install_existing = NULL;  /* tombstone or whiteout to overwrite */
+    stm_dirent_record *install_existing = NULL;  /* tombstone or same-name whiteout to overwrite */
 
     for (uint32_t k = 0; k < STM_DIRENT_PROBE_MAX; k++) {
         uint64_t probe = hash_base + (uint64_t)k;
@@ -480,11 +491,27 @@ stm_status stm_dirent_alloc(stm_dirent_index *idx,
             }
             break;
         }
-        if (record_is_tombstone(r) || record_is_whiteout(r)) {
+        if (record_is_tombstone(r)) {
             if (!have_install_slot) {
                 install_probe     = probe;
                 install_existing  = r;
                 have_install_slot = true;
+            }
+            continue;
+        }
+        if (record_is_whiteout(r)) {
+            /* SAME-NAME whiteout: install candidate (overlayfs
+             * "promote name" — overwrites the whiteout with a
+             * fresh live record at the same name). DIFFERENT-NAME
+             * whiteout: MUST be preserved to honor RENAME_WHITEOUT's
+             * persistence contract — walk past it as an occupying
+             * slot. (R88 P2-1) */
+            if (record_name_eq(r, name, name_len)) {
+                if (!have_install_slot) {
+                    install_probe     = probe;
+                    install_existing  = r;
+                    have_install_slot = true;
+                }
             }
             continue;
         }
@@ -1224,3 +1251,56 @@ stm_status stm_dirent_index_load_at(stm_dirent_index *idx,
     must_unlock(idx_lock(idx));
     return STM_OK;
 }
+
+
+/* ------------------------------------------------------------------ */
+/* P8-POSIX-9b R88 P2-1 testing hooks (gated by                        */
+/* STRATUM_BUILD_TESTING_HOOKS).                                       */
+/* ------------------------------------------------------------------ */
+
+#ifdef STRATUM_BUILD_TESTING_HOOKS
+/* Production callers MUST NOT use these. See <stratum/dirent_testing.h>
+ * for rationale. */
+
+stm_status stm_dirent_install_at_probe_for_test(
+        stm_dirent_index *idx,
+        uint64_t dataset_id, uint64_t dir_ino, uint64_t hash_probe,
+        const uint8_t *name, uint8_t name_len,
+        uint64_t child_ino, uint64_t child_gen,
+        uint8_t child_type, uint8_t flags)
+{
+    if (!idx) return STM_EINVAL;
+    if (dataset_id == 0u || dir_ino == 0u) return STM_EINVAL;
+    if (name_len > STM_DIRENT_NAME_MAX) return STM_EINVAL;
+
+    must_lock(idx_lock(idx));
+
+    stm_dirent_record *target =
+            find_record_at_probe(idx, dataset_id, dir_ino, hash_probe);
+    if (!target) {
+        target = append_record(idx);
+        if (!target) {
+            must_unlock(idx_lock(idx));
+            return STM_ENOMEM;
+        }
+    }
+    target->dataset_id = dataset_id;
+    target->dir_ino    = dir_ino;
+    target->hash_probe = hash_probe;
+    target->child_ino  = child_ino;
+    target->child_gen  = child_gen;
+    target->child_type = child_type;
+    target->name_len   = name_len;
+    target->flags      = flags;
+    memset(target->name, 0, sizeof target->name);
+    if (name && name_len > 0u) memcpy(target->name, name, name_len);
+    idx->dirty = true;
+
+    must_unlock(idx_lock(idx));
+    return STM_OK;
+}
+
+uint64_t stm_dirent_fnv1a64_for_test(const uint8_t *name, size_t len) {
+    return fnv1a64(name, len);
+}
+#endif /* STRATUM_BUILD_TESTING_HOOKS */

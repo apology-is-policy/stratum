@@ -111,16 +111,26 @@ extern "C" {
 
 /* On-disk value layout (variable-length, 32 + name_len bytes):
  *
- *   off  size  field                       contract
- *    0     8   le64 child_ino              live: != 0; tombstone: 0
- *    8     8   le64 child_gen              live: any; tombstone: 0
- *   16     1   u8   child_type             live: STM_DT_* (non-zero, valid);
- *                                          tombstone: 0
- *   17     1   u8   name_len               live: 1..255; tombstone: 0
- *   18     1   u8   flags                  bit 0: TOMBSTONE
- *   19    13   u8[13] reserved             zero (anti-tamper)
- *   32   var   u8[name_len] name           live: name_len bytes (no NUL);
- *                                          tombstone: 0 bytes
+ *   off  size  field           live           tombstone   whiteout (P9b)
+ *    0     8   le64 child_ino  != 0           0           0
+ *    8     8   le64 child_gen  any            0           0
+ *   16     1   u8   child_type STM_DT_*       0           STM_DT_WHITEOUT (14)
+ *                              (1,2,4,6,8,
+ *                              10,12; not 14)
+ *   17     1   u8   name_len   1..255         0           1..255
+ *   18     1   u8   flags      0              bit 0       bit 1
+ *                                             (TOMBSTONE) (WHITEOUT)
+ *   19    13   u8[13] reserved 0 (anti-tamper, all kinds)
+ *   32   var   u8[name_len]    name_len bytes 0 bytes     name_len bytes
+ *              name            (no NUL)                   (no NUL — preserved
+ *                                                          from prior live
+ *                                                          record)
+ *
+ * Bits 0 (TOMBSTONE) and 1 (WHITEOUT) are mutually exclusive — the
+ * decoder rejects records with both set. Bits 2..7 are reserved
+ * zero. STM_DT_WHITEOUT (=14) is reserved for whiteout slots ONLY:
+ * the decoder rejects "live" records claiming type=14, and rejects
+ * whiteouts claiming any other type.
  *
  * Total = 32 + name_len bytes.
  *

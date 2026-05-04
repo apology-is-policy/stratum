@@ -338,15 +338,21 @@ LookupWalk(d, name, k) ==
             ELSE LookupWalk(d, name, k + 1)
 
 \* Locate the first chain slot suitable for installing `name`:
-\*   - first EMPTY, TOMBSTONE, or WHITEOUT encountered along the
-\*     chain (P8-POSIX-9b: WHITEOUTs are install candidates so a
-\*     fresh Create on a whiteout-occupied name overwrites the
-\*     marker with a live record — analog of overlayfs's "promote
-\*     name from lower to upper layer"), OR
+\*   - first EMPTY or TOMBSTONE encountered along the chain, OR
+\*   - first SAME-NAME WHITEOUT encountered (P8-POSIX-9b R88 P2-1
+\*     fix: only same-name whiteouts are install candidates —
+\*     overlayfs's "promote NAME from lower to upper layer".
+\*     A DIFFERENT-name whiteout MUST be preserved otherwise an
+\*     unrelated colliding-name create would silently destroy the
+\*     whiteout marker, breaking RENAME_WHITEOUT's persistence
+\*     contract), OR
 \*   - first record whose `name` matches (overwrite-update path —
 \*     unused in healthy Create because of the precondition that
 \*     `name` is not already in links).
 \* Returns -1 if no such slot exists in the bounded chain.
+\* Different-name whiteouts (and live records of different names)
+\* are skipped past — they preserve the chain for the matching
+\* name's slot location, just like in lookup.
 RECURSIVE FirstInstallSlot(_, _, _)
 FirstInstallSlot(d, name, k) ==
     IF k >= MaxProbe THEN -1
@@ -354,7 +360,7 @@ FirstInstallSlot(d, name, k) ==
              s   == slots[d][idx]
          IN IF \/ s = EMPTY
                \/ s = TOMBSTONE
-               \/ IsWhiteout(s)
+               \/ (IsWhiteout(s) /\ s.name = name)
                \/ (IsRecord(s) /\ s.name = name)
             THEN idx
             ELSE FirstInstallSlot(d, name, k + 1)

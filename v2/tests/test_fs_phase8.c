@@ -6725,6 +6725,223 @@ STM_TEST(fs_p9b_rename_whiteout_count_excludes_whiteout) {
     unlink(g_tmp_path); unlink(g_key_path);
 }
 
+STM_TEST(fs_p9b_r88_p3_4_rename_whiteout_directory_inode) {
+    /* R88 P3-4: WHITEOUT on a directory inode. fs.c rename
+     * permits WHITEOUT for directories (the kind-mismatch + non-
+     * empty checks still apply but WHITEOUT itself is orthogonal
+     * to kind). Pin the behavior so a future refactor can't
+     * silently break it. */
+    make_tmp("p9b_r88_p3_4_dir_whiteout");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t srcdir_ino = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"srcdir", 6,
+                                     0755u, 0, 0, &srcdir_ino));
+
+    /* WHITEOUT-rename the directory. */
+    STM_ASSERT_OK(stm_fs_rename(fs, 1,
+                                     root, (const uint8_t *)"srcdir", 6,
+                                     root, (const uint8_t *)"dstdir", 6,
+                                     STM_FS_RENAME_WHITEOUT));
+
+    /* Lookup dstdir → srcdir_ino (directory inode preserved). */
+    uint64_t found = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root, (const uint8_t *)"dstdir", 6,
+                                      &found));
+    STM_ASSERT_EQ(found, srcdir_ino);
+
+    /* Lookup srcdir → ENOENT (whiteout hides). */
+    STM_ASSERT_ERR(stm_fs_lookup(fs, 1, root, (const uint8_t *)"srcdir", 6,
+                                       &found),
+                   STM_ENOENT);
+
+    /* Readdir of root: ".", "..", "dstdir" (DIR), "srcdir" (WHITEOUT
+     * — the whiteout marker has child_type=STM_DT_WHITEOUT, NOT
+     * DT_DIR; even though the moved inode is a directory, the
+     * whiteout marker has its own type per Linux DT_WHT). */
+    uint64_t cursor = 0;
+    stm_fs_dirent_entry batch[16];
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_readdir(fs, 1, root, root, 0u,
+                                       &cursor, batch, 16, &n));
+    STM_ASSERT_EQ(n, (size_t)4);
+
+    bool saw_dstdir_dir = false, saw_srcdir_whiteout = false;
+    for (size_t i = 0; i < n; i++) {
+        if (batch[i].name_len == 6 &&
+            memcmp(batch[i].name, "dstdir", 6) == 0) {
+            STM_ASSERT_EQ((int)batch[i].child_type, (int)STM_DT_DIR);
+            STM_ASSERT_EQ(batch[i].child_ino, srcdir_ino);
+            saw_dstdir_dir = true;
+        }
+        if (batch[i].name_len == 6 &&
+            memcmp(batch[i].name, "srcdir", 6) == 0) {
+            STM_ASSERT_EQ((int)batch[i].child_type, (int)STM_DT_WHITEOUT);
+            STM_ASSERT_EQ(batch[i].child_ino, (uint64_t)0);
+            saw_srcdir_whiteout = true;
+        }
+    }
+    STM_ASSERT_TRUE(saw_dstdir_dir && saw_srcdir_whiteout);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p9b_r88_p3_5_rename_whiteout_cross_directory) {
+    /* R88 P3-5: RENAME_WHITEOUT across two different parent
+     * directories. The whiteout lands at src_parent; the live
+     * entry lands at dst_parent. */
+    make_tmp("p9b_r88_p3_5_cross_dir");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t srcdir = 0, dstdir = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"srcdir", 6,
+                                     0755u, 0, 0, &srcdir));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"dstdir", 6,
+                                     0755u, 0, 0, &dstdir));
+
+    uint64_t file_ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, srcdir, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &file_ino));
+
+    /* Cross-dir whiteout-rename. */
+    STM_ASSERT_OK(stm_fs_rename(fs, 1,
+                                     srcdir, (const uint8_t *)"f", 1,
+                                     dstdir, (const uint8_t *)"f", 1,
+                                     STM_FS_RENAME_WHITEOUT));
+
+    /* dstdir/f → file_ino. */
+    uint64_t found = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, dstdir, (const uint8_t *)"f", 1,
+                                      &found));
+    STM_ASSERT_EQ(found, file_ino);
+
+    /* srcdir/f → ENOENT (whiteout hides). */
+    STM_ASSERT_ERR(stm_fs_lookup(fs, 1, srcdir, (const uint8_t *)"f", 1,
+                                       &found),
+                   STM_ENOENT);
+
+    /* Readdir of srcdir sees the whiteout. */
+    uint64_t cursor = 0;
+    stm_fs_dirent_entry batch[8];
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_readdir(fs, 1, srcdir, root, 0u,
+                                       &cursor, batch, 8, &n));
+    STM_ASSERT_EQ(n, (size_t)3);  /* "." + ".." + whiteout("f") */
+
+    bool saw_whiteout = false;
+    for (size_t i = 0; i < n; i++) {
+        if (batch[i].name_len == 1 && batch[i].name[0] == 'f' &&
+            batch[i].child_type == STM_DT_WHITEOUT) {
+            saw_whiteout = true;
+        }
+    }
+    STM_ASSERT_TRUE(saw_whiteout);
+
+    /* Readdir of dstdir sees the live entry; no whiteout there. */
+    cursor = 0;
+    n = 0;
+    STM_ASSERT_OK(stm_fs_readdir(fs, 1, dstdir, root, 0u,
+                                       &cursor, batch, 8, &n));
+    STM_ASSERT_EQ(n, (size_t)3);  /* "." + ".." + live("f") */
+    bool saw_live = false;
+    for (size_t i = 0; i < n; i++) {
+        if (batch[i].name_len == 1 && batch[i].name[0] == 'f' &&
+            batch[i].child_type == STM_DT_REG) {
+            STM_ASSERT_EQ(batch[i].child_ino, file_ino);
+            saw_live = true;
+        }
+    }
+    STM_ASSERT_TRUE(saw_live);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p9b_r88_p3_6_rmdir_drops_whiteouts_with_empty_dir) {
+    /* R88 P3-6: a directory containing only whiteouts is
+     * rmdir-eligible (count_for_dir excludes whiteouts). After
+     * rmdir, stm_dirent_drop_for_dir cleans every record at the
+     * subdir's prefix (live + tombstone + whiteout). Verify by
+     * round-tripping: rmdir succeeds, the subdir's ino can be
+     * re-allocated, and no inherited whiteouts remain. */
+    make_tmp("p9b_r88_p3_6_rmdir_whiteouts");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t subdir = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"sub", 3,
+                                     0755u, 0, 0, &subdir));
+
+    /* Populate subdir with a file, then rename-WHITEOUT it
+     * outside subdir. Result: subdir contains only a whiteout. */
+    uint64_t f_ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, subdir, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f_ino));
+    STM_ASSERT_OK(stm_fs_rename(fs, 1,
+                                     subdir, (const uint8_t *)"f", 1,
+                                     root, (const uint8_t *)"moved", 5,
+                                     STM_FS_RENAME_WHITEOUT));
+
+    /* Subdir's only entry is the whiteout marker for "f". Verify
+     * via readdir: ".", "..", whiteout. */
+    uint64_t cursor = 0;
+    stm_fs_dirent_entry batch[8];
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_readdir(fs, 1, subdir, root, 0u,
+                                       &cursor, batch, 8, &n));
+    STM_ASSERT_EQ(n, (size_t)3);
+
+    /* rmdir succeeds — count_for_dir excludes whiteouts so subdir
+     * is empty for rmdir purposes. */
+    STM_ASSERT_OK(stm_fs_rmdir(fs, 1, root, (const uint8_t *)"sub", 3));
+
+    /* Subdir is gone. Lookup returns ENOENT. */
+    uint64_t found = 0;
+    STM_ASSERT_ERR(stm_fs_lookup(fs, 1, root, (const uint8_t *)"sub", 3,
+                                       &found),
+                   STM_ENOENT);
+
+    /* Re-create a fresh subdir (will likely get a new ino with
+     * bumped gen per inode.tla::AllocReused). Populate + readdir.
+     * The fresh subdir MUST NOT inherit whiteouts from the freed
+     * predecessor — `stm_dirent_drop_for_dir` cleaned them at
+     * rmdir time. */
+    uint64_t fresh_subdir = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"sub2", 4,
+                                     0755u, 0, 0, &fresh_subdir));
+
+    cursor = 0;
+    n = 0;
+    STM_ASSERT_OK(stm_fs_readdir(fs, 1, fresh_subdir, root, 0u,
+                                       &cursor, batch, 8, &n));
+    /* Only "." and ".." — no inherited whiteouts. */
+    STM_ASSERT_EQ(n, (size_t)2);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
 STM_TEST(fs_p9b_rename_whiteout_stamps_ctime_on_moved_inode) {
     /* The MOVED inode (src, now at dst) gets ctime stamped to
      * "now". Same shape as plain rename. */
