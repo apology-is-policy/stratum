@@ -52,7 +52,8 @@ stm_add_test(test_btree_store test_btree_store.c)
 stm_add_test(test_alloc      test_alloc.c)
 stm_add_test(test_alloc_roots test_alloc_roots.c)
 stm_add_test(test_sync       test_sync.c)
-stm_add_test(test_fs         test_fs.c)
+stm_add_test(test_fs         test_fs.c       test_fs_common.c)
+stm_add_test(test_fs_phase8  test_fs_phase8.c test_fs_common.c)
 stm_add_test(test_sdarray    test_sdarray.c)
 stm_add_test(test_xor_filter test_xor_filter.c)
 stm_add_test(test_crash_inject test_crash_inject.c)
@@ -84,8 +85,10 @@ stm_add_test(test_xattr      test_xattr.c)
 # regressed in correctness, just runtime under instrumentation.
 set_tests_properties(test_crash_inject PROPERTIES TIMEOUT 300)
 
-# test_fs has grown past 200 tests through Phase 8 (each test format/
-# mounts/unmounts which is ~150ms wall under -j2 with ASan/TSan); the
-# full suite takes ~40s wall on a quiet machine and longer under
-# parallel pressure. Bump to 180s to leave headroom.
-set_tests_properties(test_fs PROPERTIES TIMEOUT 180)
+# test_fs + test_fs_phase8 each format/mount/unmount per test
+# (~150ms wall under -j2 with ASan/TSan). Pre-split, the combined
+# 322-test test_fs took ~80s. Post-split: ~150-test test_fs (Phase
+# 1-7) ~40s; ~170-test test_fs_phase8 ~50s. Bump both to 180s
+# (1.5x headroom for parallel pressure / sanitizer slowdown).
+set_tests_properties(test_fs        PROPERTIES TIMEOUT 180)
+set_tests_properties(test_fs_phase8 PROPERTIES TIMEOUT 180)
