@@ -1978,6 +1978,131 @@ stm_status stm_fs_get_seals(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 }
 
 /* ========================================================================= */
+/* P8-POSIX-7c: file handles (name_to_handle_at + open_by_handle_at).         */
+/* ========================================================================= */
+
+stm_status stm_fs_name_to_handle(stm_fs *fs, uint64_t dataset_id,
+                                       uint64_t parent_ino,
+                                       const uint8_t *name, uint8_t name_len,
+                                       stm_fs_file_handle *out_handle)
+{
+    /* Uniform out-param contract — zero-init BEFORE arg validation. */
+    if (out_handle) memset(out_handle, 0, sizeof *out_handle);
+    if (!fs || !name || !out_handle) return STM_EINVAL;
+    if (dataset_id == 0u || parent_ino == 0u) return STM_EINVAL;
+
+    stm_status nv = fs_validate_dirent_name(name, name_len);
+    if (nv != STM_OK) return nv;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_READ(fs);
+
+    stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
+    stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
+    if (!iidx || !didx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;
+    }
+
+    /* Validate parent is a directory + look up the child. */
+    struct stm_inode_value pv = {0};
+    stm_status sps = fs_load_parent_dir(iidx, dataset_id, parent_ino, &pv);
+    if (sps != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return sps;
+    }
+
+    uint64_t child_ino = 0, child_gen_ignored = 0;
+    uint8_t  child_type = 0;
+    stm_status ds = stm_dirent_lookup(didx, dataset_id, parent_ino,
+                                          name, name_len,
+                                          &child_ino, &child_gen_ignored,
+                                          &child_type);
+    if (ds != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return ds;
+    }
+
+    /* Read the inode's CURRENT si_gen. The dirent stores a
+     * `child_gen` snapshot at link time, but that snapshot is the
+     * gen AT the moment the dirent was created; we want the inode's
+     * authoritative current gen so a later open_by_handle compare
+     * is meaningful. */
+    struct stm_inode_value cv = {0};
+    stm_status cs = stm_inode_lookup(iidx, dataset_id, child_ino, &cv);
+    if (cs != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return cs;
+    }
+
+    out_handle->h_magic      = stm_store_le32(STM_FS_HANDLE_MAGIC);
+    out_handle->h_version    = stm_store_le32(STM_FS_HANDLE_VERSION);
+    out_handle->h_dataset_id = stm_store_le64(dataset_id);
+    out_handle->h_ino        = stm_store_le64(child_ino);
+    out_handle->h_si_gen     = stm_store_le64(stm_load_le64(cv.si_gen));
+
+    pthread_mutex_unlock(&fs->lock);
+    return STM_OK;
+}
+
+stm_status stm_fs_open_by_handle(stm_fs *fs,
+                                       const stm_fs_file_handle *handle,
+                                       uint64_t *out_ino)
+{
+    /* Uniform out-param contract. */
+    if (out_ino) *out_ino = 0;
+    if (!fs || !handle || !out_ino) return STM_EINVAL;
+
+    /* Validate the wire-format header BEFORE touching the inode index.
+     * Magic mismatch is STM_EBADTAG (signals "not one of our handles" —
+     * caller passed garbage); version mismatch is STM_EBADVERSION
+     * (signals "handle from a future release; caller must upgrade"). */
+    if (stm_load_le32(handle->h_magic) != STM_FS_HANDLE_MAGIC) {
+        return STM_EBADTAG;
+    }
+    if (stm_load_le32(handle->h_version) != STM_FS_HANDLE_VERSION) {
+        return STM_EBADVERSION;
+    }
+
+    uint64_t ds = stm_load_le64(handle->h_dataset_id);
+    uint64_t ino = stm_load_le64(handle->h_ino);
+    uint64_t want_gen = stm_load_le64(handle->h_si_gen);
+    if (ds == 0u || ino == 0u) return STM_EINVAL;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_READ(fs);
+
+    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+    if (!iidx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;
+    }
+
+    struct stm_inode_value v = {0};
+    stm_status ls = stm_inode_lookup(iidx, ds, ino, &v);
+    if (ls != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        /* STM_ENOENT (inode not found OR FREED) → "the file the
+         * handle described no longer exists at this identity". */
+        return ls;
+    }
+
+    /* Stale-handle detection: gen must match. A mismatch means the
+     * (ds, ino) tuple has been recycled via Free + AllocReused since
+     * the handle was issued. inode.tla's TupleUniqueAllTime invariant
+     * pins that the new (ino, gen) tuple is distinct from the old. */
+    uint64_t cur_gen = stm_load_le64(v.si_gen);
+    if (cur_gen != want_gen) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_ENOENT;
+    }
+
+    *out_ino = ino;
+    pthread_mutex_unlock(&fs->lock);
+    return STM_OK;
+}
+
+/* ========================================================================= */
 /* P8-POSIX-9: stm_fs_rename.                                                 */
 /* ========================================================================= */
 

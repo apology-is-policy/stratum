@@ -642,6 +642,110 @@ stm_status stm_fs_get_seals(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                                 uint32_t *out_seals);
 
 /* ========================================================================= */
+/* P8-POSIX-7c: file handles (Linux name_to_handle_at + open_by_handle_at).   */
+/* ========================================================================= */
+
+/*
+ * Opaque file handle. Encodes the (dataset_id, ino, si_gen) triple +
+ * a 4-byte magic + 4-byte version for forward-compat. Stale-handle
+ * detection uses inode.tla's `TupleUniqueAllTime` invariant: a handle
+ * captured before the inode was freed carries the OLD `si_gen`; after
+ * Free + AllocReused the same `ino` has a NEW `si_gen`; mismatch on
+ * import resolves to STM_ENOENT.
+ *
+ * Wire shape (32 bytes):
+ *
+ *   off  size  field
+ *    0    4    le32 magic = STM_FS_HANDLE_MAGIC ('STMH' = 0x484D5453)
+ *    4    4    le32 version = STM_FS_HANDLE_VERSION (1)
+ *    8    8    le64 dataset_id
+ *   16    8    le64 ino
+ *   24    8    le64 si_gen
+ *
+ * The handle is opaque to callers — they pass it back through
+ * stm_fs_open_by_handle without inspection. Future format extensions
+ * bump `version` + carve from any future trailing bytes (currently
+ * the struct is exactly 32 bytes; future versions may be larger).
+ *
+ * A handle is valid only against the same fs handle that produced it.
+ * Cross-pool handles (handle from pool A, used against pool B) resolve
+ * to STM_ENOENT because the pools have independent ino allocators
+ * (the (dataset_id, ino, si_gen) triple is pool-local).
+ */
+#define STM_FS_HANDLE_MAGIC    0x484D5453u   /* 'STMH' little-endian */
+#define STM_FS_HANDLE_VERSION  1u
+#define STM_FS_HANDLE_BYTES    32u
+
+typedef struct stm_fs_file_handle {
+    le32    h_magic;
+    le32    h_version;
+    le64    h_dataset_id;
+    le64    h_ino;
+    le64    h_si_gen;
+} stm_fs_file_handle;
+
+STM_STATIC_ASSERT(sizeof(stm_fs_file_handle) == STM_FS_HANDLE_BYTES,
+                  "stm_fs_file_handle must be exactly 32 bytes");
+
+/*
+ * Resolve `name` in directory `parent_ino` of `dataset_id` and produce
+ * a serializable file handle for the resulting child inode. The
+ * handle captures the child's current `si_gen` so a later
+ * `stm_fs_open_by_handle` call can detect AllocReused-after-Free
+ * staleness via gen mismatch.
+ *
+ * Refusals:
+ *   - NULL fs OR NULL name OR NULL out_handle (STM_EINVAL).
+ *   - dataset_id == 0 OR parent_ino == 0 (STM_EINVAL).
+ *   - name validation failure (same shape as stm_fs_lookup).
+ *   - parent inode not found OR not a directory (STM_ENOTDIR / STM_ENOENT).
+ *   - name not linked in parent (STM_ENOENT).
+ *   - fs wedged (STM_EWEDGED). RO mounts allowed (read-only op).
+ *
+ * Uniform out-param contract: `*out_handle` is zero-initialized BEFORE
+ * arg validation runs (R57 P3-5 / R58 P3-1).
+ */
+STM_MUST_USE
+stm_status stm_fs_name_to_handle(stm_fs *fs, uint64_t dataset_id,
+                                       uint64_t parent_ino,
+                                       const uint8_t *name, uint8_t name_len,
+                                       stm_fs_file_handle *out_handle);
+
+/*
+ * Validate a previously-issued file handle and return the inode
+ * number it resolves to via `*out_ino`. The (dataset_id, ino, si_gen)
+ * triple is checked against the current inode index: ino must exist
+ * and be ALLOCATED, AND its current si_gen must equal the handle's
+ * captured si_gen.
+ *
+ * Stale handle (post-unlink + AllocReused at same ino, gens differ)
+ * resolves to STM_ENOENT — caller treats as if the file no longer
+ * exists. Linux open_by_handle_at returns ESTALE for the same case;
+ * our STM_ENOENT is the closest existing code that matches the
+ * "no longer exists at this identity" semantic.
+ *
+ * Refusals:
+ *   - NULL fs OR NULL handle OR NULL out_ino (STM_EINVAL).
+ *   - handle->h_magic != STM_FS_HANDLE_MAGIC (STM_EBADTAG —
+ *     caller passed garbage / corrupt handle).
+ *   - handle->h_version != STM_FS_HANDLE_VERSION (STM_EBADVERSION —
+ *     handle from a future v2 release; caller must upgrade).
+ *   - handle->h_dataset_id == 0 OR handle->h_ino == 0 (STM_EINVAL —
+ *     reserved sentinel values).
+ *   - inode not found OR FREED (STM_ENOENT — definitively gone).
+ *   - inode found but si_gen differs from handle's (STM_ENOENT —
+ *     ino reused for a different file post-Free).
+ *   - fs wedged (STM_EWEDGED). RO mounts allowed.
+ *
+ * Uniform out-param contract: `*out_ino` is zero-initialized BEFORE
+ * arg validation runs (R57 P3-5 / R58 P3-1).
+ */
+STM_MUST_USE
+stm_status stm_fs_open_by_handle(stm_fs *fs,
+                                       const stm_fs_file_handle *handle,
+                                       uint64_t *out_ino);
+
+/* ========================================================================= */
 /* P8-POSIX-8: symlinks.                                                      */
 /* ========================================================================= */
 
