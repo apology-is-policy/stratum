@@ -6235,4 +6235,102 @@ STM_TEST(fs_p9b_rename_unknown_flag_refused) {
     unlink(g_tmp_path); unlink(g_key_path);
 }
 
+STM_TEST(fs_p9b_r86_p3_2_rename_exchange_within_chain_collision) {
+    /* R86 P3-2 regression: when sibling names share FNV-1a hash
+     * collisions, they live at consecutive probes within the same
+     * chain. Each find_live_record walks from base hash + accepts
+     * only the matching name; multi-probe walks must work post-
+     * swap. We can't synthesize an exact FNV-1a collision in-test,
+     * so we exercise the broader "many siblings" property — with
+     * 16 sibling files, several pairs will exercise multi-probe
+     * walks; verifying every name resolves correctly post-swap is
+     * the key property. */
+    make_tmp("p9b_r86_p3_2_chain_collision");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    enum { N = 16 };
+    uint64_t inos[N] = {0};
+    char name_buf[16];
+    for (int i = 0; i < N; i++) {
+        snprintf(name_buf, sizeof name_buf, "f%02d", i);
+        STM_ASSERT_OK(stm_fs_create_file(fs, 1, root,
+                                              (const uint8_t *)name_buf,
+                                              (uint8_t)strlen(name_buf),
+                                              0644u, 0, 0, &inos[i]));
+    }
+
+    /* Swap the first + last via EXCHANGE. */
+    STM_ASSERT_OK(stm_fs_rename(fs, 1,
+                                     root, (const uint8_t *)"f00", 3,
+                                     root, (const uint8_t *)"f15", 3,
+                                     STM_FS_RENAME_EXCHANGE));
+
+    uint64_t found = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root, (const uint8_t *)"f00", 3,
+                                     &found));
+    STM_ASSERT_EQ(found, inos[15]);
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root, (const uint8_t *)"f15", 3,
+                                     &found));
+    STM_ASSERT_EQ(found, inos[0]);
+    /* All siblings unchanged. */
+    for (int i = 1; i < N - 1; i++) {
+        snprintf(name_buf, sizeof name_buf, "f%02d", i);
+        STM_ASSERT_OK(stm_fs_lookup(fs, 1, root,
+                                         (const uint8_t *)name_buf,
+                                         (uint8_t)strlen(name_buf), &found));
+        STM_ASSERT_EQ(found, inos[i]);
+    }
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p9b_r86_p3_3_rename_exchange_hardlinks_to_same_inode) {
+    /* R86 P3-3 regression: swap two hardlinks to the SAME inode.
+     * Observationally a no-op (both names continue pointing at the
+     * same ino) but the swap MUST NOT mutate nlink (no inode is
+     * being created or freed under EXCHANGE semantics). */
+    make_tmp("p9b_r86_p3_3_hardlinks_same_ino");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"a", 1,
+                                          0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_link(fs, 1, root, (const uint8_t *)"a", 1,
+                                    root, (const uint8_t *)"b", 1));
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_nlink), 2u);
+
+    STM_ASSERT_OK(stm_fs_rename(fs, 1,
+                                     root, (const uint8_t *)"a", 1,
+                                     root, (const uint8_t *)"b", 1,
+                                     STM_FS_RENAME_EXCHANGE));
+
+    uint64_t found = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root, (const uint8_t *)"a", 1, &found));
+    STM_ASSERT_EQ(found, f);
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root, (const uint8_t *)"b", 1, &found));
+    STM_ASSERT_EQ(found, f);
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_nlink), 2u);   /* nlink preserved */
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
 STM_TEST_MAIN("test_fs_phase8")

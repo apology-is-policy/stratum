@@ -603,6 +603,15 @@ stm_status stm_dirent_swap_two(stm_dirent_index *idx,
         return STM_EINVAL;
     }
 
+    /* R86 P3-1: spec-impl gap note — dirent.tla::Swap requires
+     * `~iter_active[d1]` and `~iter_active[d2]`. The C impl doesn't
+     * carry an explicit iter_active flag; the index mutex held
+     * across the entire swap window substitutes for the spec's
+     * stable-iteration guard (readdir at the C layer also takes
+     * this same mutex). Don't introduce a separate iter_active
+     * flag without simultaneously redesigning readdir to release
+     * the mutex between cursor steps; today both serialize through
+     * the same lock and the spec precondition is satisfied de facto. */
     must_lock(idx_lock(idx));
 
     stm_dirent_record *r1 =
