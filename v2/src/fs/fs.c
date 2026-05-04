@@ -613,6 +613,25 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
     uint8_t kind = iv->si_data_kind;
     uint64_t end_off = off + (uint64_t)len;
 
+    /* P8-POSIX-7a-seals: refuse writes per the inode's seal mask BEFORE
+     * any state mutation. SEAL_WRITE / SEAL_FUTURE_WRITE block all
+     * writes (Linux fcntl(2) F_SEAL_WRITE / F_SEAL_FUTURE_WRITE);
+     * SEAL_GROW blocks any write that would extend si_size past its
+     * current value. Refusal is STM_EPERM (POSIX errno that Linux
+     * returns for the same condition). The check is performed before
+     * the zero-length short-circuit's caller path so that even probe-
+     * shaped writes don't appear to "succeed" against a sealed inode
+     * (the short-circuit above already handled len == 0 — at this point
+     * len > 0, so a write that would proceed). */
+    uint32_t flags = stm_load_le32(iv->si_flags);
+    if (flags & (STM_INO_FLAG_SEAL_WRITE | STM_INO_FLAG_SEAL_FUTURE_WRITE)) {
+        return STM_EPERM;
+    }
+    if (flags & STM_INO_FLAG_SEAL_GROW) {
+        uint64_t cur_size = stm_load_le64(iv->si_size);
+        if (end_off > cur_size) return STM_EPERM;
+    }
+
     /* R77 P1-1 defense-in-depth: bound si_data_len by inline cap on
      * the read of the existing inline prefix (memcpy at the inline
      * fast-path's zero-fill + the transition path's combined-buffer
@@ -1705,6 +1724,31 @@ stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
         return STM_OK;       /* no-op */
     }
 
+    /* P8-POSIX-7a-seals: refuse the truncate per the inode's seal mask
+     * BEFORE any state mutation. The size delta is already known
+     * (new_size != cur_size) — branch on the direction and the
+     * applicable seals. SEAL_WRITE / SEAL_FUTURE_WRITE block all
+     * size-changing truncate (Linux fcntl(2) F_SEAL_WRITE refuses
+     * truncate(2) outright); SEAL_GROW blocks new_size > cur_size;
+     * SEAL_SHRINK blocks new_size < cur_size. The same-size no-op
+     * branch returned earlier above so we do NOT need to defend it
+     * here. Refusal is STM_EPERM. */
+    {
+        uint32_t flags = stm_load_le32(iv.si_flags);
+        if (flags & (STM_INO_FLAG_SEAL_WRITE | STM_INO_FLAG_SEAL_FUTURE_WRITE)) {
+            pthread_mutex_unlock(&fs->lock);
+            return STM_EPERM;
+        }
+        if (new_size > cur_size && (flags & STM_INO_FLAG_SEAL_GROW)) {
+            pthread_mutex_unlock(&fs->lock);
+            return STM_EPERM;
+        }
+        if (new_size < cur_size && (flags & STM_INO_FLAG_SEAL_SHRINK)) {
+            pthread_mutex_unlock(&fs->lock);
+            return STM_EPERM;
+        }
+    }
+
     uint8_t kind = iv.si_data_kind;
 
     if (kind == STM_DATA_INLINE) {
@@ -1813,6 +1857,99 @@ stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     /* SYMLINK / DEVICE — not a regular-file kind; rejected. */
     pthread_mutex_unlock(&fs->lock);
     return STM_ENOTSUPPORTED;
+}
+
+/* ========================================================================= */
+/* P8-POSIX-7a-seals: file seals.                                             */
+/* ========================================================================= */
+
+stm_status stm_fs_add_seals(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                                uint32_t seals)
+{
+    if (!fs) return STM_EINVAL;
+    if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+    /* Reject any out-of-mask bit so future format extensions can rely
+     * on every set bit being a known seal. */
+    if ((seals & ~(uint32_t)STM_FS_SEAL_MASK) != 0u) return STM_EINVAL;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+
+    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+    if (!iidx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;
+    }
+
+    struct stm_inode_value iv = {0};
+    stm_status ls = stm_inode_lookup(iidx, dataset_id, ino, &iv);
+    if (ls != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return ls;
+    }
+
+    uint32_t cur_flags = stm_load_le32(iv.si_flags);
+
+    /* SEAL is sticky: once set, no further additions are accepted —
+     * even no-op re-adds of already-set bits, per Linux fcntl(2)
+     * behavior on a SEAL-sealed inode (every F_ADD_SEALS returns
+     * EPERM regardless of the requested mask). The exception is
+     * `seals == 0` which is a trivial no-op + allowed. */
+    if ((cur_flags & STM_INO_FLAG_SEAL_SEAL) && seals != 0u) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EPERM;
+    }
+
+    /* No-op: every requested bit already set (or seals == 0).
+     * Linux returns 0 with no inode mutation. We mirror — no ctime
+     * bump, no inode_set call, no persistence churn. */
+    uint32_t new_flags = cur_flags | seals;
+    if (new_flags == cur_flags) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_OK;
+    }
+
+    iv.si_flags = stm_store_le32(new_flags);
+    /* Seals are inode metadata — bump ctime (matches Linux behavior:
+     * `kernel/fs/inode.c::file_seals_change` unconditionally calls
+     * `inode_inc_iversion + ctime stamp` on a successful F_ADD_SEALS).
+     * R76 P3-1 / R78 P3-1 lock-posture infallibility: only fields
+     * touched are si_flags + ctime. */
+    fs_stamp_ctime_now(&iv);
+    stm_status rs = stm_inode_set(iidx, dataset_id, ino, &iv);
+    pthread_mutex_unlock(&fs->lock);
+    return rs;
+}
+
+stm_status stm_fs_get_seals(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                                uint32_t *out_seals)
+{
+    /* Uniform out-param contract (R57 P3-5 / R58 P3-1): zero-init
+     * BEFORE arg validation so callers observing on STM_EINVAL see a
+     * defined value (0). */
+    if (out_seals) *out_seals = 0;
+    if (!fs || !out_seals) return STM_EINVAL;
+    if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_READ(fs);
+
+    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+    if (!iidx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;
+    }
+
+    struct stm_inode_value iv = {0};
+    stm_status ls = stm_inode_lookup(iidx, dataset_id, ino, &iv);
+    if (ls != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return ls;
+    }
+
+    *out_seals = stm_load_le32(iv.si_flags) & (uint32_t)STM_FS_SEAL_MASK;
+    pthread_mutex_unlock(&fs->lock);
+    return STM_OK;
 }
 
 /* ========================================================================= */

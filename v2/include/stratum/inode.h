@@ -72,6 +72,49 @@ extern "C" {
 #define STM_INO_FLAG_NODUMP     0x00000004u
 
 /*
+ * P8-POSIX-7a-seals: per-inode file seals (Linux memfd_create
+ * F_SEAL_* surface; POSIX shape via fcntl(F_ADD_SEALS, F_GET_SEALS)).
+ * Seals are sticky additions on a per-inode basis — they can only be
+ * ADDED, never cleared. Once `STM_INO_FLAG_SEAL_SEAL` is set, no
+ * further seal additions are accepted (refused with STM_EPERM at the
+ * fs-layer wrapper).
+ *
+ * Bit layout (bits 8..12 inside the 32-bit `si_flags`):
+ *
+ *   - SEAL_SEAL          (0x100u): refuse further seal additions.
+ *   - SEAL_SHRINK        (0x200u): refuse truncate-down.
+ *   - SEAL_GROW          (0x400u): refuse truncate-up + write past EOF
+ *                                  (any size-extending operation).
+ *   - SEAL_WRITE         (0x800u): refuse all content modification —
+ *                                  write, truncate (any direction).
+ *   - SEAL_FUTURE_WRITE  (0x1000u): semantically identical to SEAL_WRITE
+ *                                  in v2 MVP (no mmap surface yet);
+ *                                  the bit is published so future mmap
+ *                                  support can distinguish "block new
+ *                                  writers" from "block all writes" per
+ *                                  Linux fcntl(2) F_SEAL_FUTURE_WRITE.
+ *
+ * Bits 3..7 are reserved for future ext-style flag bits (DIRSYNC,
+ * NOATIME, etc.) so that the seal block is contiguous + non-colliding.
+ *
+ * Spec posture: seals compose over inode.tla — adding a flag bit
+ * doesn't change the alloc/free/link/unlink state machine; the
+ * write/truncate refusal is enforced at the fs-layer wrapper which
+ * sits above the inode-tree state machine.
+ */
+#define STM_INO_FLAG_SEAL_SEAL          0x00000100u
+#define STM_INO_FLAG_SEAL_SHRINK        0x00000200u
+#define STM_INO_FLAG_SEAL_GROW          0x00000400u
+#define STM_INO_FLAG_SEAL_WRITE         0x00000800u
+#define STM_INO_FLAG_SEAL_FUTURE_WRITE  0x00001000u
+
+#define STM_INO_FLAG_SEAL_MASK          (STM_INO_FLAG_SEAL_SEAL | \
+                                         STM_INO_FLAG_SEAL_SHRINK | \
+                                         STM_INO_FLAG_SEAL_GROW | \
+                                         STM_INO_FLAG_SEAL_WRITE | \
+                                         STM_INO_FLAG_SEAL_FUTURE_WRITE)
+
+/*
  * Reserved internal flag — set on a record whose ino has been freed
  * and is eligible for AllocReused. Encodes the inode.tla FREED state
  * inline within the existing 256-byte struct (no separate state byte

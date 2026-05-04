@@ -11070,4 +11070,466 @@ STM_TEST(fs_p6_setxattr_oversize_value_returns_erange) {
     unlink(g_key_path);
 }
 
+/* ========================================================================= */
+/* P8-POSIX-7a-seals: file-seal tests.                                        */
+/* ========================================================================= */
+
+/* Helper: format / mount / alloc root / create one regular file at "f".
+ * Tests that exercise the seal API + enforcement reuse this rig. */
+static void p7a_seals_setup(stm_fs **out_fs, uint64_t *out_root_ino,
+                                 uint64_t *out_file_ino)
+{
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+    *out_fs = fs;
+    *out_root_ino = root;
+    *out_file_ino = f;
+}
+
+STM_TEST(fs_p7a_seals_initial_state_is_zero) {
+    make_tmp("p7a_seals_initial_zero");
+    stm_fs *fs = NULL; uint64_t root = 0, f = 0;
+    p7a_seals_setup(&fs, &root, &f);
+
+    uint32_t mask = 0xFFFFFFFFu;
+    STM_ASSERT_OK(stm_fs_get_seals(fs, 1, f, &mask));
+    STM_ASSERT_EQ(mask, 0u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_seals_add_get_roundtrip) {
+    make_tmp("p7a_seals_roundtrip");
+    stm_fs *fs = NULL; uint64_t root = 0, f = 0;
+    p7a_seals_setup(&fs, &root, &f);
+
+    /* Add SHRINK + GROW one at a time; verify accumulation. */
+    STM_ASSERT_OK(stm_fs_add_seals(fs, 1, f, STM_FS_SEAL_SHRINK));
+    uint32_t mask = 0;
+    STM_ASSERT_OK(stm_fs_get_seals(fs, 1, f, &mask));
+    STM_ASSERT_EQ(mask, (uint32_t)STM_FS_SEAL_SHRINK);
+
+    STM_ASSERT_OK(stm_fs_add_seals(fs, 1, f, STM_FS_SEAL_GROW));
+    STM_ASSERT_OK(stm_fs_get_seals(fs, 1, f, &mask));
+    STM_ASSERT_EQ(mask, (uint32_t)(STM_FS_SEAL_SHRINK | STM_FS_SEAL_GROW));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_seals_idempotent_re_add_is_noop) {
+    make_tmp("p7a_seals_idempotent");
+    stm_fs *fs = NULL; uint64_t root = 0, f = 0;
+    p7a_seals_setup(&fs, &root, &f);
+
+    STM_ASSERT_OK(stm_fs_add_seals(fs, 1, f, STM_FS_SEAL_WRITE));
+    /* Capture the post-first-add ctime. */
+    struct stm_inode_value v1 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v1));
+    uint64_t ctime1_sec = stm_load_le64(v1.si_ctime_sec);
+    uint32_t ctime1_nsec = stm_load_le32(v1.si_ctime_nsec);
+
+    /* Sleep to advance the clock past second-boundary granularity. */
+    struct timespec slp = {1, 0};
+    (void)nanosleep(&slp, NULL);
+
+    /* Re-add the SAME bit — should be a no-op (no ctime bump). */
+    STM_ASSERT_OK(stm_fs_add_seals(fs, 1, f, STM_FS_SEAL_WRITE));
+
+    struct stm_inode_value v2 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v2));
+    STM_ASSERT_EQ(stm_load_le64(v2.si_ctime_sec), ctime1_sec);
+    STM_ASSERT_EQ(stm_load_le32(v2.si_ctime_nsec), ctime1_nsec);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_seals_zero_arg_is_noop) {
+    make_tmp("p7a_seals_zero_arg");
+    stm_fs *fs = NULL; uint64_t root = 0, f = 0;
+    p7a_seals_setup(&fs, &root, &f);
+
+    /* seals == 0: legal no-op (matches Linux fcntl(F_ADD_SEALS, 0)). */
+    STM_ASSERT_OK(stm_fs_add_seals(fs, 1, f, 0u));
+    uint32_t mask = 0xFFFFFFFFu;
+    STM_ASSERT_OK(stm_fs_get_seals(fs, 1, f, &mask));
+    STM_ASSERT_EQ(mask, 0u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_seals_add_stamps_ctime) {
+    make_tmp("p7a_seals_add_stamps_ctime");
+    stm_fs *fs = NULL; uint64_t root = 0, f = 0;
+    p7a_seals_setup(&fs, &root, &f);
+
+    /* Capture the pre-add ctime. */
+    struct stm_inode_value v0 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v0));
+    uint64_t mtime0 = stm_load_le64(v0.si_mtime_sec);
+    uint64_t btime0 = stm_load_le64(v0.si_btime_sec);
+
+    /* Sleep to advance the clock. */
+    struct timespec slp = {1, 0};
+    (void)nanosleep(&slp, NULL);
+
+    uint64_t before = fs_p7a_now_sec();
+    STM_ASSERT_OK(stm_fs_add_seals(fs, 1, f, STM_FS_SEAL_SHRINK));
+
+    struct stm_inode_value v1 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v1));
+    /* ctime bumped, mtime + btime unchanged. */
+    STM_ASSERT_TRUE(stm_load_le64(v1.si_ctime_sec) >= before);
+    STM_ASSERT_EQ(stm_load_le64(v1.si_mtime_sec), mtime0);
+    STM_ASSERT_EQ(stm_load_le64(v1.si_btime_sec), btime0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_seals_invalid_bits_refused) {
+    make_tmp("p7a_seals_invalid_bits");
+    stm_fs *fs = NULL; uint64_t root = 0, f = 0;
+    p7a_seals_setup(&fs, &root, &f);
+
+    /* Bits outside STM_FS_SEAL_MASK are STM_EINVAL — incl. the FREED
+     * sentinel which the public API must NOT let callers stamp. */
+    STM_ASSERT_ERR(stm_fs_add_seals(fs, 1, f, 0x80000000u), STM_EINVAL);
+    /* Mix valid + invalid → also rejected. */
+    STM_ASSERT_ERR(stm_fs_add_seals(fs, 1, f,
+                                          STM_FS_SEAL_WRITE | 0x40u), STM_EINVAL);
+
+    /* Inode unchanged after rejection. */
+    uint32_t mask = 0xFFFFFFFFu;
+    STM_ASSERT_OK(stm_fs_get_seals(fs, 1, f, &mask));
+    STM_ASSERT_EQ(mask, 0u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_seals_seal_seal_blocks_further_adds) {
+    make_tmp("p7a_seals_seal_blocks");
+    stm_fs *fs = NULL; uint64_t root = 0, f = 0;
+    p7a_seals_setup(&fs, &root, &f);
+
+    STM_ASSERT_OK(stm_fs_add_seals(fs, 1, f, STM_FS_SEAL_SEAL));
+    /* Subsequent additions refused. */
+    STM_ASSERT_ERR(stm_fs_add_seals(fs, 1, f, STM_FS_SEAL_WRITE), STM_EPERM);
+    STM_ASSERT_ERR(stm_fs_add_seals(fs, 1, f, STM_FS_SEAL_GROW), STM_EPERM);
+    /* Even re-adding SEAL itself is refused (Linux behavior). */
+    STM_ASSERT_ERR(stm_fs_add_seals(fs, 1, f, STM_FS_SEAL_SEAL), STM_EPERM);
+    /* seals == 0 on a SEAL-sealed inode is still OK (trivial no-op). */
+    STM_ASSERT_OK(stm_fs_add_seals(fs, 1, f, 0u));
+
+    /* Mask still has only SEAL set. */
+    uint32_t mask = 0;
+    STM_ASSERT_OK(stm_fs_get_seals(fs, 1, f, &mask));
+    STM_ASSERT_EQ(mask, (uint32_t)STM_FS_SEAL_SEAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_seals_write_blocks_write) {
+    make_tmp("p7a_seals_write_blocks_write");
+    stm_fs *fs = NULL; uint64_t root = 0, f = 0;
+    p7a_seals_setup(&fs, &root, &f);
+
+    /* Write some data first; pre-seal writes succeed. */
+    static const uint8_t buf[17] = "0123456789abcdef";
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, buf, 16));
+
+    STM_ASSERT_OK(stm_fs_add_seals(fs, 1, f, STM_FS_SEAL_WRITE));
+
+    /* Post-seal writes refused. Both overwrite-within-bounds AND
+     * extend-past-eof. */
+    STM_ASSERT_ERR(stm_fs_write(fs, 1, f, 0, buf, 8), STM_EPERM);
+    STM_ASSERT_ERR(stm_fs_write(fs, 1, f, 16, buf, 8), STM_EPERM);
+
+    /* Read still works. */
+    uint8_t obuf[16] = {0};
+    size_t nread = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, f, 0, obuf, 16, &nread));
+    STM_ASSERT_EQ(nread, 16u);
+    STM_ASSERT_EQ(memcmp(obuf, buf, 16), 0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_seals_future_write_blocks_write) {
+    make_tmp("p7a_seals_future_blocks_write");
+    stm_fs *fs = NULL; uint64_t root = 0, f = 0;
+    p7a_seals_setup(&fs, &root, &f);
+
+    static const uint8_t buf[17] = "0123456789abcdef";
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, buf, 16));
+
+    /* FUTURE_WRITE in MVP behaves identically to WRITE for non-mmap
+     * write paths. */
+    STM_ASSERT_OK(stm_fs_add_seals(fs, 1, f, STM_FS_SEAL_FUTURE_WRITE));
+    STM_ASSERT_ERR(stm_fs_write(fs, 1, f, 0, buf, 8), STM_EPERM);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_seals_grow_blocks_extend_past_eof) {
+    make_tmp("p7a_seals_grow_blocks_extend");
+    stm_fs *fs = NULL; uint64_t root = 0, f = 0;
+    p7a_seals_setup(&fs, &root, &f);
+
+    static const uint8_t buf[17] = "0123456789abcdef";
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, buf, 16));
+
+    STM_ASSERT_OK(stm_fs_add_seals(fs, 1, f, STM_FS_SEAL_GROW));
+
+    /* Overwrite-within-bounds still allowed. */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, buf, 8));
+    /* Extend past EOF refused. */
+    STM_ASSERT_ERR(stm_fs_write(fs, 1, f, 16, buf, 8), STM_EPERM);
+    STM_ASSERT_ERR(stm_fs_write(fs, 1, f, 8, buf, 16), STM_EPERM);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_seals_grow_blocks_truncate_up) {
+    make_tmp("p7a_seals_grow_blocks_truncate_up");
+    stm_fs *fs = NULL; uint64_t root = 0, f = 0;
+    p7a_seals_setup(&fs, &root, &f);
+
+    static const uint8_t buf[17] = "0123456789abcdef";
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, buf, 16));
+
+    STM_ASSERT_OK(stm_fs_add_seals(fs, 1, f, STM_FS_SEAL_GROW));
+
+    /* truncate-up refused. */
+    STM_ASSERT_ERR(stm_fs_truncate(fs, 1, f, 32u), STM_EPERM);
+    /* truncate-down still allowed. */
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, f, 8u));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_seals_shrink_blocks_truncate_down) {
+    make_tmp("p7a_seals_shrink_blocks_truncate_down");
+    stm_fs *fs = NULL; uint64_t root = 0, f = 0;
+    p7a_seals_setup(&fs, &root, &f);
+
+    static const uint8_t buf[17] = "0123456789abcdef";
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, buf, 16));
+
+    STM_ASSERT_OK(stm_fs_add_seals(fs, 1, f, STM_FS_SEAL_SHRINK));
+
+    /* truncate-down refused. */
+    STM_ASSERT_ERR(stm_fs_truncate(fs, 1, f, 8u), STM_EPERM);
+    /* truncate-up still allowed (within inline cap). */
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, f, 32u));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_seals_write_blocks_truncate_in_either_direction) {
+    make_tmp("p7a_seals_write_blocks_truncate");
+    stm_fs *fs = NULL; uint64_t root = 0, f = 0;
+    p7a_seals_setup(&fs, &root, &f);
+
+    static const uint8_t buf[17] = "0123456789abcdef";
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, buf, 16));
+
+    STM_ASSERT_OK(stm_fs_add_seals(fs, 1, f, STM_FS_SEAL_WRITE));
+
+    /* Linux F_SEAL_WRITE refuses truncate(2) outright in either
+     * direction. */
+    STM_ASSERT_ERR(stm_fs_truncate(fs, 1, f, 8u), STM_EPERM);
+    STM_ASSERT_ERR(stm_fs_truncate(fs, 1, f, 32u), STM_EPERM);
+    /* No-op truncate (same size) is unconditionally OK. */
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, f, 16u));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_seals_persist_across_remount) {
+    make_tmp("p7a_seals_persist");
+    stm_fs *fs = NULL; uint64_t root = 0, f = 0;
+    p7a_seals_setup(&fs, &root, &f);
+
+    /* Set a multi-bit seal mask, then remount. */
+    uint32_t want = STM_FS_SEAL_SEAL | STM_FS_SEAL_WRITE | STM_FS_SEAL_GROW;
+    STM_ASSERT_OK(stm_fs_add_seals(fs, 1, f, want));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint32_t mask = 0;
+    STM_ASSERT_OK(stm_fs_get_seals(fs, 1, f, &mask));
+    STM_ASSERT_EQ(mask, want);
+
+    /* Enforcement intact across remount: SEAL stops further adds; WRITE
+     * stops content modification; GROW stops truncate-up. */
+    STM_ASSERT_ERR(stm_fs_add_seals(fs, 1, f, STM_FS_SEAL_SHRINK), STM_EPERM);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_seals_arg_validation) {
+    make_tmp("p7a_seals_arg_validation");
+    stm_fs *fs = NULL; uint64_t root = 0, f = 0;
+    p7a_seals_setup(&fs, &root, &f);
+
+    /* add_seals: NULL fs / zero ds / zero ino / non-existent ino. */
+    STM_ASSERT_ERR(stm_fs_add_seals(NULL, 1, f, STM_FS_SEAL_WRITE), STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_add_seals(fs, 0, f, STM_FS_SEAL_WRITE), STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_add_seals(fs, 1, 0, STM_FS_SEAL_WRITE), STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_add_seals(fs, 1, 999999u, STM_FS_SEAL_WRITE),
+                   STM_ENOENT);
+
+    /* get_seals: NULL fs / NULL out / zero ds / zero ino / non-existent.
+     * Also exercise the uniform out-param contract: out_seals must be
+     * zero-initialized on every STM_EINVAL return. */
+    uint32_t sentinel = 0xDEADBEEFu;
+    STM_ASSERT_ERR(stm_fs_get_seals(NULL, 1, f, &sentinel), STM_EINVAL);
+    STM_ASSERT_EQ(sentinel, 0u);
+    sentinel = 0xDEADBEEFu;
+    STM_ASSERT_ERR(stm_fs_get_seals(fs, 0, f, &sentinel), STM_EINVAL);
+    STM_ASSERT_EQ(sentinel, 0u);
+    sentinel = 0xDEADBEEFu;
+    STM_ASSERT_ERR(stm_fs_get_seals(fs, 1, 0, &sentinel), STM_EINVAL);
+    STM_ASSERT_EQ(sentinel, 0u);
+    STM_ASSERT_ERR(stm_fs_get_seals(fs, 1, f, NULL), STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_get_seals(fs, 1, 999999u, &sentinel), STM_ENOENT);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_seals_extent_path_enforced) {
+    /* All previous tests use INLINE-mode files (size <= 100 bytes).
+     * This one drives the file into EXTENT mode, then exercises the
+     * seal enforcement on the EXTENT branch of fs_write_regular_locked
+     * and on the EXTENT branch of stm_fs_truncate. */
+    make_tmp("p7a_seals_extent_path");
+    stm_fs *fs = NULL; uint64_t root = 0, f = 0;
+    p7a_seals_setup(&fs, &root, &f);
+
+    /* Force extent mode by writing past the inline cap. */
+    static uint8_t big[8192] = {0};
+    for (size_t i = 0; i < sizeof big; i++) big[i] = (uint8_t)(i & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, big, 4096));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 4096, big + 4096, 4096));
+
+    /* Confirm we're in EXTENT mode. */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v));
+    STM_ASSERT_EQ(v.si_data_kind, (uint8_t)STM_DATA_EXTENT);
+
+    /* SEAL_GROW: extent overwrite-within-bounds OK; extend refused. */
+    STM_ASSERT_OK(stm_fs_add_seals(fs, 1, f, STM_FS_SEAL_GROW));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, big, 4096));
+    STM_ASSERT_ERR(stm_fs_write(fs, 1, f, 4096, big, 8192), STM_EPERM);
+    STM_ASSERT_ERR(stm_fs_truncate(fs, 1, f, 16384u), STM_EPERM);
+
+    /* SEAL_SHRINK: extent shrink refused. */
+    STM_ASSERT_OK(stm_fs_add_seals(fs, 1, f, STM_FS_SEAL_SHRINK));
+    STM_ASSERT_ERR(stm_fs_truncate(fs, 1, f, 4096u), STM_EPERM);
+
+    /* SEAL_WRITE: any extent write refused. */
+    STM_ASSERT_OK(stm_fs_add_seals(fs, 1, f, STM_FS_SEAL_WRITE));
+    STM_ASSERT_ERR(stm_fs_write(fs, 1, f, 0, big, 4096), STM_EPERM);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_seals_grow_inline_to_extent_transition_blocked) {
+    /* Cover the INLINE-grow-past-cap-transitions path: a write that
+     * would push si_size from <= 100 to a larger value transitions
+     * INLINE → EXTENT in fs_write_regular_locked. SEAL_GROW must
+     * block this transition same as it blocks any other size grow. */
+    make_tmp("p7a_seals_inline_to_extent_block");
+    stm_fs *fs = NULL; uint64_t root = 0, f = 0;
+    p7a_seals_setup(&fs, &root, &f);
+
+    static uint8_t buf[200] = {0};
+    /* Pre-existing inline content (size = 16). */
+    static const uint8_t pre[17] = "abcdefghijklmnop";
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, pre, 16));
+
+    STM_ASSERT_OK(stm_fs_add_seals(fs, 1, f, STM_FS_SEAL_GROW));
+
+    /* Write that would push past inline cap → transition to EXTENT —
+     * but it grows (16 → 200), so SEAL_GROW refuses. */
+    STM_ASSERT_ERR(stm_fs_write(fs, 1, f, 0, buf, 200), STM_EPERM);
+
+    /* Inode unchanged: still INLINE, size still 16. */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v));
+    STM_ASSERT_EQ(v.si_data_kind, (uint8_t)STM_DATA_INLINE);
+    STM_ASSERT_EQ(stm_load_le64(v.si_size), 16u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_seals_wedged_refuses_add) {
+    make_tmp("p7a_seals_wedged_refuses_add");
+    stm_fs *fs = NULL; uint64_t root = 0, f = 0;
+    p7a_seals_setup(&fs, &root, &f);
+
+    stm_fs_mark_wedged(fs);
+    STM_ASSERT_ERR(stm_fs_add_seals(fs, 1, f, STM_FS_SEAL_WRITE), STM_EWEDGED);
+    /* get_seals also refuses on wedged (same FS_GUARD_READ contract as
+     * other readers). */
+    uint32_t mask = 0;
+    STM_ASSERT_ERR(stm_fs_get_seals(fs, 1, f, &mask), STM_EWEDGED);
+
+    /* Cannot unmount cleanly when wedged — best-effort cleanup. */
+    (void)stm_fs_unmount(fs);
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_seals_ro_refuses_add_allows_get) {
+    make_tmp("p7a_seals_ro_mount");
+    stm_fs *fs = NULL; uint64_t root = 0, f = 0;
+    p7a_seals_setup(&fs, &root, &f);
+    /* Add a seal in RW so we can verify get on RO returns the same. */
+    STM_ASSERT_OK(stm_fs_add_seals(fs, 1, f, STM_FS_SEAL_WRITE));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    mopts.read_only = true;
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* RO refuses add. */
+    STM_ASSERT_ERR(stm_fs_add_seals(fs, 1, f, STM_FS_SEAL_GROW), STM_EROFS);
+    /* RO permits get. */
+    uint32_t mask = 0;
+    STM_ASSERT_OK(stm_fs_get_seals(fs, 1, f, &mask));
+    STM_ASSERT_EQ(mask, (uint32_t)STM_FS_SEAL_WRITE);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")

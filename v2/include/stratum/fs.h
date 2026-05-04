@@ -566,6 +566,82 @@ stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                               uint64_t new_size);
 
 /* ========================================================================= */
+/* P8-POSIX-7a-seals: file seals (Linux memfd_create F_SEAL_* surface).       */
+/* ========================================================================= */
+
+/*
+ * Public seal-flag constants. Same numeric values as the
+ * `STM_INO_FLAG_SEAL_*` bits inside `si_flags`; published with the
+ * `STM_FS_SEAL_*` prefix so callers compose against the public fs API
+ * surface without pulling in the inode-internal header. Bitwise-OR
+ * combinations passed to `stm_fs_add_seals` are sticky additive — once
+ * set, only `stm_fs_add_seals` can be called again (until SEAL itself
+ * is set, which makes the whole seal set immutable).
+ */
+#define STM_FS_SEAL_SEAL          0x00000100u   /* refuse further seal additions */
+#define STM_FS_SEAL_SHRINK        0x00000200u   /* refuse truncate-down */
+#define STM_FS_SEAL_GROW          0x00000400u   /* refuse truncate-up + write past EOF */
+#define STM_FS_SEAL_WRITE         0x00000800u   /* refuse all content modification */
+#define STM_FS_SEAL_FUTURE_WRITE  0x00001000u   /* refuse all writes (mmap-aware future) */
+
+#define STM_FS_SEAL_MASK          (STM_FS_SEAL_SEAL | \
+                                   STM_FS_SEAL_SHRINK | \
+                                   STM_FS_SEAL_GROW | \
+                                   STM_FS_SEAL_WRITE | \
+                                   STM_FS_SEAL_FUTURE_WRITE)
+
+/*
+ * Add one or more seals to (dataset_id, ino). Sticky additive — the
+ * passed `seals` mask is OR'd into the inode's existing seal set. Per
+ * Linux fcntl(2) F_ADD_SEALS, no operation can ever clear a seal.
+ *
+ * Once `STM_FS_SEAL_SEAL` is set, every subsequent call is refused
+ * with STM_EPERM (the seal set is permanently frozen). Idempotent
+ * within a non-sealed inode: re-adding the same bit is STM_OK with
+ * no-op effect (matches Linux kernel behavior — fcntl returns 0 + no
+ * ctime bump).
+ *
+ * On a successful effective change (at least one new seal bit added),
+ * the inode's ctime is stamped to "now" — seals are inode metadata.
+ * No-op calls (every requested bit already set, or `seals == 0`) do
+ * NOT stamp ctime.
+ *
+ * Atomicity: held under fs->lock. The inode's si_flags is mutated
+ * in-RAM + persisted via stm_inode_set; on stm_inode_set failure the
+ * inode is unchanged (lock-posture infallibility per R76 P3-1 / R78
+ * P3-1: the only fields touched are si_flags + ctime; gen / nlink /
+ * data_kind unchanged).
+ *
+ * Refusals:
+ *   - NULL fs (STM_EINVAL).
+ *   - dataset_id == 0 OR ino == 0 (STM_EINVAL).
+ *   - `seals` has bits outside STM_FS_SEAL_MASK (STM_EINVAL).
+ *   - inode not found OR FREED (STM_ENOENT).
+ *   - inode already has STM_FS_SEAL_SEAL set AND `seals` would add
+ *     ANY new bit (STM_EPERM — POSIX-aligned).
+ *   - fs read-only or wedged (STM_EROFS / STM_EWEDGED).
+ */
+STM_MUST_USE
+stm_status stm_fs_add_seals(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                                uint32_t seals);
+
+/*
+ * Read the current seal mask on (dataset_id, ino). Returns the bitwise
+ * union of all `STM_FS_SEAL_*` bits currently set on the inode; never
+ * returns bits outside `STM_FS_SEAL_MASK`. Allowed on RO mounts; refused
+ * on wedged.
+ *
+ * Refusals:
+ *   - NULL fs OR NULL out_seals (STM_EINVAL).
+ *   - dataset_id == 0 OR ino == 0 (STM_EINVAL).
+ *   - inode not found OR FREED (STM_ENOENT).
+ *   - fs wedged (STM_EWEDGED).
+ */
+STM_MUST_USE
+stm_status stm_fs_get_seals(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
+                                uint32_t *out_seals);
+
+/* ========================================================================= */
 /* P8-POSIX-8: symlinks.                                                      */
 /* ========================================================================= */
 

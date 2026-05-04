@@ -101,6 +101,16 @@ typedef enum {
      * (matches Linux errno.h on most systems; also returned for
      * getxattr/removexattr "no such attribute" per Linux man getxattr(2)). */
     STM_ENODATA         =  -61,   /* xattr name not present                */
+
+    /* P8-POSIX-7a-seals: file-seal violations. Linux memfd_create's
+     * F_ADD_SEALS / F_GET_SEALS surface returns EPERM on every seal-rule
+     * violation (write into SEAL_WRITE'd file; truncate-up into
+     * SEAL_GROW'd; truncate-down into SEAL_SHRINK'd; F_ADD_SEALS into a
+     * SEAL_SEAL'd inode). POSIX-aligned (`EPERM = 1`); kept distinct
+     * from STM_EACCES (mode-permission denial) and STM_EROFS (mount-
+     * level read-only) so callers can route the seal-rejection branch
+     * separately. */
+    STM_EPERM           =   -1,   /* operation not permitted (sealed)      */
 } stm_status;
 
 const char *stm_strerror(stm_status s);
