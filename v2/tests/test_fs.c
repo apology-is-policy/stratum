@@ -13017,4 +13017,333 @@ STM_TEST(fs_p7a_anon_wedged_refused) {
     unlink(g_tmp_path); unlink(g_key_path);
 }
 
+/* ========================================================================= */
+/* P8-POSIX-9b: stm_fs_rename RENAME_EXCHANGE.                                */
+/* ========================================================================= */
+
+STM_TEST(fs_p9b_rename_exchange_swaps_files) {
+    make_tmp("p9b_rename_exchange_files");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t a = 0, b = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"a", 1,
+                                          0644u, 0, 0, &a));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"b", 1,
+                                          0644u, 0, 0, &b));
+    STM_ASSERT_TRUE(a != b);
+
+    STM_ASSERT_OK(stm_fs_rename(fs, 1,
+                                     root, (const uint8_t *)"a", 1,
+                                     root, (const uint8_t *)"b", 1,
+                                     STM_FS_RENAME_EXCHANGE));
+
+    /* Now a → b's old ino, b → a's old ino. */
+    uint64_t found = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root, (const uint8_t *)"a", 1,
+                                     &found));
+    STM_ASSERT_EQ(found, b);
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root, (const uint8_t *)"b", 1,
+                                     &found));
+    STM_ASSERT_EQ(found, a);
+
+    /* Both files still exist + nlink unchanged. */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, a, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_nlink), 1u);
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, b, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_nlink), 1u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p9b_rename_exchange_cross_directory) {
+    make_tmp("p9b_rename_exchange_xdir");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t d1 = 0, d2 = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"d1", 2,
+                                    0755u, 0, 0, &d1));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"d2", 2,
+                                    0755u, 0, 0, &d2));
+
+    uint64_t a = 0, b = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, d1, (const uint8_t *)"a", 1,
+                                          0644u, 0, 0, &a));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, d2, (const uint8_t *)"b", 1,
+                                          0644u, 0, 0, &b));
+
+    STM_ASSERT_OK(stm_fs_rename(fs, 1,
+                                     d1, (const uint8_t *)"a", 1,
+                                     d2, (const uint8_t *)"b", 1,
+                                     STM_FS_RENAME_EXCHANGE));
+
+    /* d1/a → b's old ino, d2/b → a's old ino. */
+    uint64_t found = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, d1, (const uint8_t *)"a", 1, &found));
+    STM_ASSERT_EQ(found, b);
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, d2, (const uint8_t *)"b", 1, &found));
+    STM_ASSERT_EQ(found, a);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p9b_rename_exchange_dir_with_file_swaps_kinds) {
+    /* Linux RENAME_EXCHANGE allows swapping a file with a directory —
+     * unlike regular rename which refuses kind mismatches with EISDIR
+     * /ENOTDIR. The exchange branch bypasses the kind-mismatch check
+     * because no inode is being deleted. */
+    make_tmp("p9b_rename_exchange_dir_file");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0, d = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"d", 1,
+                                    0755u, 0, 0, &d));
+
+    STM_ASSERT_OK(stm_fs_rename(fs, 1,
+                                     root, (const uint8_t *)"f", 1,
+                                     root, (const uint8_t *)"d", 1,
+                                     STM_FS_RENAME_EXCHANGE));
+
+    uint64_t found = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root, (const uint8_t *)"f", 1, &found));
+    STM_ASSERT_EQ(found, d);
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root, (const uint8_t *)"d", 1, &found));
+    STM_ASSERT_EQ(found, f);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p9b_rename_exchange_dst_missing_returns_enoent) {
+    make_tmp("p9b_rename_exchange_dst_missing");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t a = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"a", 1,
+                                          0644u, 0, 0, &a));
+
+    /* Dst doesn't exist → ENOENT (RENAME_EXCHANGE requires both). */
+    STM_ASSERT_ERR(stm_fs_rename(fs, 1,
+                                       root, (const uint8_t *)"a", 1,
+                                       root, (const uint8_t *)"missing", 7,
+                                       STM_FS_RENAME_EXCHANGE),
+                   STM_ENOENT);
+
+    /* Src doesn't exist → ENOENT (the standard src-missing path
+     * fires BEFORE the EXCHANGE branch). */
+    STM_ASSERT_ERR(stm_fs_rename(fs, 1,
+                                       root, (const uint8_t *)"missing", 7,
+                                       root, (const uint8_t *)"a", 1,
+                                       STM_FS_RENAME_EXCHANGE),
+                   STM_ENOENT);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p9b_rename_exchange_with_noreplace_refused) {
+    make_tmp("p9b_rename_exchange_noreplace_refused");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t a = 0, b = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"a", 1,
+                                          0644u, 0, 0, &a));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"b", 1,
+                                          0644u, 0, 0, &b));
+
+    /* Mutually exclusive flag combination → EINVAL. */
+    STM_ASSERT_ERR(stm_fs_rename(fs, 1,
+                                       root, (const uint8_t *)"a", 1,
+                                       root, (const uint8_t *)"b", 1,
+                                       STM_FS_RENAME_EXCHANGE |
+                                       STM_FS_RENAME_NOREPLACE),
+                   STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p9b_rename_exchange_self_is_noop) {
+    /* Same path on both sides — POSIX rename(src, src) returns
+     * STM_OK as a no-op; the exchange flag doesn't change that
+     * because the same-path short-circuit fires before the flag
+     * branch. */
+    make_tmp("p9b_rename_exchange_self");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t a = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"a", 1,
+                                          0644u, 0, 0, &a));
+
+    STM_ASSERT_OK(stm_fs_rename(fs, 1,
+                                     root, (const uint8_t *)"a", 1,
+                                     root, (const uint8_t *)"a", 1,
+                                     STM_FS_RENAME_EXCHANGE));
+
+    /* a still exists + still points at the same ino. */
+    uint64_t found = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root, (const uint8_t *)"a", 1, &found));
+    STM_ASSERT_EQ(found, a);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p9b_rename_exchange_stamps_ctime_on_both) {
+    make_tmp("p9b_rename_exchange_ctime");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t a = 0, b = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"a", 1,
+                                          0644u, 0, 0, &a));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"b", 1,
+                                          0644u, 0, 0, &b));
+
+    /* Capture pre-swap ctimes. */
+    struct stm_inode_value va0 = {0}, vb0 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, a, &va0));
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, b, &vb0));
+    uint64_t a_ctime0 = stm_load_le64(va0.si_ctime_sec);
+    uint64_t b_ctime0 = stm_load_le64(vb0.si_ctime_sec);
+
+    /* Sleep to advance wall-clock past second granularity. */
+    struct timespec slp = {1, 0};
+    (void)nanosleep(&slp, NULL);
+
+    uint64_t before = fs_p7a_now_sec();
+    STM_ASSERT_OK(stm_fs_rename(fs, 1,
+                                     root, (const uint8_t *)"a", 1,
+                                     root, (const uint8_t *)"b", 1,
+                                     STM_FS_RENAME_EXCHANGE));
+
+    /* Both inodes' ctime advanced (POSIX rename ctime semantics). */
+    struct stm_inode_value va1 = {0}, vb1 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, a, &va1));
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, b, &vb1));
+    STM_ASSERT_TRUE(stm_load_le64(va1.si_ctime_sec) >= before);
+    STM_ASSERT_TRUE(stm_load_le64(vb1.si_ctime_sec) >= before);
+    STM_ASSERT_TRUE(stm_load_le64(va1.si_ctime_sec) > a_ctime0);
+    STM_ASSERT_TRUE(stm_load_le64(vb1.si_ctime_sec) > b_ctime0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p9b_rename_exchange_persists_across_remount) {
+    make_tmp("p9b_rename_exchange_persist");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t a = 0, b = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"a", 1,
+                                          0644u, 0, 0, &a));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"b", 1,
+                                          0644u, 0, 0, &b));
+    STM_ASSERT_OK(stm_fs_rename(fs, 1,
+                                     root, (const uint8_t *)"a", 1,
+                                     root, (const uint8_t *)"b", 1,
+                                     STM_FS_RENAME_EXCHANGE));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    /* Remount; swap state should persist. */
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t found = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root, (const uint8_t *)"a", 1, &found));
+    STM_ASSERT_EQ(found, b);
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root, (const uint8_t *)"b", 1, &found));
+    STM_ASSERT_EQ(found, a);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p9b_rename_unknown_flag_refused) {
+    make_tmp("p9b_rename_unknown_flag");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t a = 0, b = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"a", 1,
+                                          0644u, 0, 0, &a));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"b", 1,
+                                          0644u, 0, 0, &b));
+
+    /* Future flag bit not yet defined → STM_EINVAL. */
+    STM_ASSERT_ERR(stm_fs_rename(fs, 1,
+                                       root, (const uint8_t *)"a", 1,
+                                       root, (const uint8_t *)"b", 1,
+                                       0x80u),
+                   STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")

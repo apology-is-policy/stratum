@@ -2359,7 +2359,14 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
     if (dataset_id == 0u || src_parent_ino == 0u || dst_parent_ino == 0u) {
         return STM_EINVAL;
     }
-    if ((flags & ~(uint32_t)STM_FS_RENAME_NOREPLACE) != 0u) return STM_EINVAL;
+    if ((flags & ~(uint32_t)(STM_FS_RENAME_NOREPLACE |
+                              STM_FS_RENAME_EXCHANGE)) != 0u) return STM_EINVAL;
+    /* RENAME_EXCHANGE + RENAME_NOREPLACE are mutually exclusive
+     * (POSIX-aligned: Linux returns EINVAL on the combination). */
+    if ((flags & STM_FS_RENAME_EXCHANGE) &&
+        (flags & STM_FS_RENAME_NOREPLACE)) {
+        return STM_EINVAL;
+    }
 
     stm_status nv = fs_validate_dirent_name(src_name, src_name_len);
     if (nv != STM_OK) return nv;
@@ -2423,6 +2430,48 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
     if (dst_exists && (flags & STM_FS_RENAME_NOREPLACE)) {
         pthread_mutex_unlock(&fs->lock);
         return STM_EEXIST;
+    }
+
+    /* P8-POSIX-9b: RENAME_EXCHANGE — both src + dst MUST exist.
+     * Atomically swap their (ino, gen, type) at the dirent layer
+     * via stm_dirent_swap_two. Stamp ctime on both swapped inodes
+     * (POSIX rename ctime semantics — the operation modifies inode
+     * metadata: the directory entry's ino reference). NO inode is
+     * created or freed; nlink unchanged on both sides. Composes
+     * over dirent.tla::Swap. */
+    if (flags & STM_FS_RENAME_EXCHANGE) {
+        if (!dst_exists) {
+            pthread_mutex_unlock(&fs->lock);
+            return STM_ENOENT;
+        }
+        /* Atomically swap. */
+        stm_status ws = stm_dirent_swap_two(didx, dataset_id,
+                                                 src_parent_ino,
+                                                 src_name, src_name_len,
+                                                 dst_parent_ino,
+                                                 dst_name, dst_name_len);
+        if (ws != STM_OK) {
+            pthread_mutex_unlock(&fs->lock);
+            return ws;
+        }
+        /* Stamp ctime on both inodes (post-swap). The two inodes
+         * have ALREADY been swapped at the dirent layer; src_ino
+         * + dst_ino are the inos that were originally at src and
+         * dst. Both still exist (Swap preserves nlink). Failure
+         * to stamp is best-effort under R76 P3-1 / R78 P3-1
+         * lock-posture infallibility — only ctime mutates. */
+        struct stm_inode_value siv2 = {0};
+        if (stm_inode_lookup(iidx, dataset_id, src_ino, &siv2) == STM_OK) {
+            fs_stamp_ctime_now(&siv2);
+            (void)stm_inode_set(iidx, dataset_id, src_ino, &siv2);
+        }
+        struct stm_inode_value div2 = {0};
+        if (stm_inode_lookup(iidx, dataset_id, dst_ino, &div2) == STM_OK) {
+            fs_stamp_ctime_now(&div2);
+            (void)stm_inode_set(iidx, dataset_id, dst_ino, &div2);
+        }
+        pthread_mutex_unlock(&fs->lock);
+        return STM_OK;
     }
 
     /* If dst exists, validate kind compatibility:

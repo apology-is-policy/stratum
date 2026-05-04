@@ -454,6 +454,16 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
  * silently overwrites dst (drops the dst dirent and decrements its
  * inode's nlink, cascade-freeing if nlink reaches 0). */
 #define STM_FS_RENAME_NOREPLACE  0x01u
+/*
+ * P8-POSIX-9b: renameat2(2) RENAME_EXCHANGE — atomically swap
+ * src and dst. After the call, src refers to dst's prior inode
+ * and vice versa; both names continue to exist. Both src and dst
+ * MUST exist (else STM_ENOENT). Mutually exclusive with
+ * STM_FS_RENAME_NOREPLACE (combination → STM_EINVAL). Composes
+ * over `stm_dirent_swap_two`; models `dirent.tla::Swap`. ctime
+ * stamped on both swapped inodes (POSIX rename ctime semantics).
+ */
+#define STM_FS_RENAME_EXCHANGE   0x02u
 
 /*
  * Atomically rename a directory entry from `(src_parent_ino,

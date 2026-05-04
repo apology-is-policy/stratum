@@ -213,6 +213,43 @@ stm_status stm_dirent_unlink(stm_dirent_index *idx,
                                  const uint8_t *name, uint8_t name_len);
 
 /*
+ * P8-POSIX-9b: atomically swap the (child_ino, child_gen, child_type)
+ * triples of two live dirents. Models `dirent.tla::Swap`.
+ *
+ * Linux `renameat2(2)` `RENAME_EXCHANGE` semantics: after the call,
+ *   dir1/name1 refers to what dir2/name2 used to refer to (and vice
+ *   versa); both names continue to exist; no inode is created or
+ *   freed.
+ *
+ * Implementation: walks each chain to find the live record at
+ * (dir1, name1) and (dir2, name2), then swaps the (ino, gen, type)
+ * fields in-place. Slot positions don't move — chain integrity is
+ * preserved by construction.
+ *
+ * Same-dir + cross-dir cases are unified — `dir1 == dir2` is legal
+ * provided `name1 != name2`. Self-swap (same dir AND same name)
+ * refuses with STM_EINVAL.
+ *
+ * Atomicity: under the inode-index mutex (the only lock dirent
+ * primitives take), the two slot updates land in one critical
+ * section — no observer can see a half-swapped state.
+ *
+ * Refusals:
+ *   - NULL idx OR NULL name1 OR NULL name2 (STM_EINVAL).
+ *   - dataset_id == 0 OR either dir_ino == 0 (STM_EINVAL).
+ *   - any name_len == 0 OR > STM_DIRENT_NAME_MAX (STM_EINVAL).
+ *   - dir1 == dir2 AND name1 == name2 (STM_EINVAL — self-swap).
+ *   - either name not found in its dir (STM_ENOENT).
+ */
+STM_MUST_USE
+stm_status stm_dirent_swap_two(stm_dirent_index *idx,
+                                   uint64_t dataset_id,
+                                   uint64_t dir1_ino,
+                                   const uint8_t *name1, uint8_t name1_len,
+                                   uint64_t dir2_ino,
+                                   const uint8_t *name2, uint8_t name2_len);
+
+/*
  * Count live (non-tombstone) dirents in directory `dir_ino`. Used to
  * implement POSIX `nlink` for directories (parent + children + 1 for
  * `.` self-link) and to gate `rmdir` on empty directories.

@@ -373,6 +373,66 @@ Unlink(d, name) ==
                     ![d] = {t \in links[d] : t[1] # name}]
     /\ UNCHANGED <<iter, emit_log, iter_active>>
 
+\* P8-POSIX-9b: Swap — atomically swap the (ino, gen) values of two
+\* live dirents. Models renameat2(2) RENAME_EXCHANGE.
+\*
+\* Linux semantics: rename(old, new, RENAME_EXCHANGE) atomically
+\* exchanges the inode references at the two paths. After the call:
+\*   - `old` refers to what `new` used to refer to (and vice versa)
+\*   - both names continue to exist
+\*   - no inode is created or freed
+\*
+\* Spec encoding: the slot positions (chain indices) are determined
+\* by the names + don't change. Only the (ino, gen) value at each
+\* slot changes. Same-dir + cross-dir cases are unified — d1 = d2 is
+\* legal as long as name1 # name2.
+\*
+\* Precondition: both names live in their respective dirs, and no
+\* readdir is in flight in either dir (P8-POSIX-4 stable-iteration
+\* model — same gating as Create/Unlink).
+\*
+\* No buggy variant for Swap in this iteration. The atomic-swap
+\* shape doesn't violate the chain-integrity invariants the spec
+\* already pins (the slot's hash position + EMPTY/TOMBSTONE/RECORD
+\* status are unchanged); a half-applied swap would desynchronize
+\* slots[d] vs links[d] but TLA+'s atomic-action model doesn't
+\* admit that state.
+Swap(d1, name1, d2, name2) ==
+    /\ ~iter_active[d1]
+    /\ ~iter_active[d2]
+    /\ ~ (d1 = d2 /\ name1 = name2)   \* self-swap forbidden
+    /\ \E t \in links[d1] : t[1] = name1
+    /\ \E t \in links[d2] : t[1] = name2
+    /\ LET s1 == LiveRecordSlot(d1, name1, 0)
+           s2 == LiveRecordSlot(d2, name2, 0)
+       IN
+        /\ s1 # -1 /\ s2 # -1
+        /\ LET r1 == slots[d1][s1]
+               r2 == slots[d2][s2]
+           IN slots' =
+                IF d1 = d2
+                THEN [slots EXCEPT
+                          ![d1] = [@ EXCEPT
+                                       ![s1] = DirentRec(name1, r2.ino, r2.gen),
+                                       ![s2] = DirentRec(name2, r1.ino, r1.gen)]]
+                ELSE [slots EXCEPT
+                          ![d1][s1] = DirentRec(name1, r2.ino, r2.gen),
+                          ![d2][s2] = DirentRec(name2, r1.ino, r1.gen)]
+    /\ LET old1 == CHOOSE t \in links[d1] : t[1] = name1
+           old2 == CHOOSE t \in links[d2] : t[1] = name2
+       IN links' =
+            IF d1 = d2
+            THEN [links EXCEPT
+                      ![d1] = (links[d1] \ {old1, old2}) \cup
+                                {<<name1, old2[2], old2[3]>>,
+                                 <<name2, old1[2], old1[3]>>}]
+            ELSE [links EXCEPT
+                      ![d1] = (links[d1] \ {old1}) \cup
+                                {<<name1, old2[2], old2[3]>>},
+                      ![d2] = (links[d2] \ {old2}) \cup
+                                {<<name2, old1[2], old1[3]>>}]
+    /\ UNCHANGED <<iter, emit_log, iter_active>>
+
 \* --------------------------------------------------------------------------
 \* Actions — read side (P8-POSIX-4 readdir).
 \*
@@ -472,6 +532,8 @@ Next ==
            Create(d, name, ino, g)
     \/ \E d \in Dirs, name \in Names :
            Unlink(d, name)
+    \/ \E d1, d2 \in Dirs, name1, name2 \in Names :
+           Swap(d1, name1, d2, name2)
     \/ \E d \in Dirs : ReaddirReset(d)
     \/ \E d \in Dirs : ReaddirStep(d)
     \/ \E d \in Dirs : ReaddirEnd(d)

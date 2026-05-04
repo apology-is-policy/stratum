@@ -563,6 +563,79 @@ stm_status stm_dirent_unlink(stm_dirent_index *idx,
     return STM_ENOENT;
 }
 
+/* P8-POSIX-9b: helper that walks the chain to locate the live
+ * record at (dataset_id, dir_ino, name). Returns NULL if not
+ * found OR if the chain runs into EMPTY before the name appears.
+ * Caller MUST hold the index mutex. */
+static stm_dirent_record *
+find_live_record(stm_dirent_index *idx, uint64_t dataset_id,
+                      uint64_t dir_ino,
+                      const uint8_t *name, uint8_t name_len)
+{
+    uint64_t hash_base = fnv1a64(name, (size_t)name_len);
+    for (uint32_t k = 0; k < STM_DIRENT_PROBE_MAX; k++) {
+        uint64_t probe = hash_base + (uint64_t)k;
+        stm_dirent_record *r =
+                find_record_at_probe(idx, dataset_id, dir_ino, probe);
+        if (!r) return NULL;   /* EMPTY — chain ends */
+        if (record_is_tombstone(r)) continue;
+        if (record_name_eq(r, name, name_len)) return r;
+    }
+    return NULL;
+}
+
+stm_status stm_dirent_swap_two(stm_dirent_index *idx,
+                                   uint64_t dataset_id,
+                                   uint64_t dir1_ino,
+                                   const uint8_t *name1, uint8_t name1_len,
+                                   uint64_t dir2_ino,
+                                   const uint8_t *name2, uint8_t name2_len) {
+    if (!idx || !name1 || !name2) return STM_EINVAL;
+    if (dataset_id == 0u || dir1_ino == 0u || dir2_ino == 0u) return STM_EINVAL;
+    if (name1_len == 0u || name1_len > STM_DIRENT_NAME_MAX) return STM_EINVAL;
+    if (name2_len == 0u || name2_len > STM_DIRENT_NAME_MAX) return STM_EINVAL;
+    /* Self-swap forbidden — same-dir + same-name is a no-op the
+     * caller should have rejected upstream. dirent.tla::Swap
+     * mirrors this precondition. */
+    if (dir1_ino == dir2_ino &&
+        name1_len == name2_len &&
+        memcmp(name1, name2, name1_len) == 0) {
+        return STM_EINVAL;
+    }
+
+    must_lock(idx_lock(idx));
+
+    stm_dirent_record *r1 =
+            find_live_record(idx, dataset_id, dir1_ino, name1, name1_len);
+    if (!r1) {
+        must_unlock(idx_lock(idx));
+        return STM_ENOENT;
+    }
+    stm_dirent_record *r2 =
+            find_live_record(idx, dataset_id, dir2_ino, name2, name2_len);
+    if (!r2) {
+        must_unlock(idx_lock(idx));
+        return STM_ENOENT;
+    }
+
+    /* Swap (child_ino, child_gen, child_type). Slot positions +
+     * names + flags + name_len UNCHANGED — chain integrity by
+     * construction. */
+    uint64_t c_ino  = r1->child_ino;
+    uint64_t c_gen  = r1->child_gen;
+    uint8_t  c_type = r1->child_type;
+    r1->child_ino  = r2->child_ino;
+    r1->child_gen  = r2->child_gen;
+    r1->child_type = r2->child_type;
+    r2->child_ino  = c_ino;
+    r2->child_gen  = c_gen;
+    r2->child_type = c_type;
+    idx->dirty = true;
+
+    must_unlock(idx_lock(idx));
+    return STM_OK;
+}
+
 stm_status stm_dirent_count_for_dir(const stm_dirent_index *idx,
                                         uint64_t dataset_id, uint64_t dir_ino,
                                         size_t *out_count) {

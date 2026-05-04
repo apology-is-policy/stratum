@@ -882,4 +882,183 @@ STM_TEST(dirent_readdir_after_drop_for_dir) {
     stm_dirent_index_close(idx);
 }
 
+/* ========================================================================= */
+/* P8-POSIX-9b: stm_dirent_swap_two — RENAME_EXCHANGE primitive.              */
+/* ========================================================================= */
+
+STM_TEST(dirent_swap_two_same_dir) {
+    stm_dirent_index *idx = stm_dirent_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    /* Two distinct dirents in the same directory. */
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100,
+                                        (const uint8_t *)"a", 1,
+                                        10, 1, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100,
+                                        (const uint8_t *)"b", 1,
+                                        20, 2, STM_DT_DIR));
+
+    STM_ASSERT_OK(stm_dirent_swap_two(idx, 1,
+                                            100, (const uint8_t *)"a", 1,
+                                            100, (const uint8_t *)"b", 1));
+
+    /* a → 20/2/DIR, b → 10/1/REG. */
+    uint64_t ino = 0, gen = 0; uint8_t typ = 0;
+    STM_ASSERT_OK(stm_dirent_lookup(idx, 1, 100, (const uint8_t *)"a", 1,
+                                          &ino, &gen, &typ));
+    STM_ASSERT_EQ(ino, 20u);
+    STM_ASSERT_EQ(gen, 2u);
+    STM_ASSERT_EQ(typ, (uint8_t)STM_DT_DIR);
+
+    STM_ASSERT_OK(stm_dirent_lookup(idx, 1, 100, (const uint8_t *)"b", 1,
+                                          &ino, &gen, &typ));
+    STM_ASSERT_EQ(ino, 10u);
+    STM_ASSERT_EQ(gen, 1u);
+    STM_ASSERT_EQ(typ, (uint8_t)STM_DT_REG);
+
+    stm_dirent_index_close(idx);
+}
+
+STM_TEST(dirent_swap_two_cross_dir) {
+    stm_dirent_index *idx = stm_dirent_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100,
+                                        (const uint8_t *)"x", 1,
+                                        10, 1, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 200,
+                                        (const uint8_t *)"y", 1,
+                                        20, 2, STM_DT_REG));
+
+    STM_ASSERT_OK(stm_dirent_swap_two(idx, 1,
+                                            100, (const uint8_t *)"x", 1,
+                                            200, (const uint8_t *)"y", 1));
+
+    uint64_t ino = 0, gen = 0; uint8_t typ = 0;
+    STM_ASSERT_OK(stm_dirent_lookup(idx, 1, 100, (const uint8_t *)"x", 1,
+                                          &ino, &gen, &typ));
+    STM_ASSERT_EQ(ino, 20u);
+    STM_ASSERT_EQ(gen, 2u);
+    STM_ASSERT_OK(stm_dirent_lookup(idx, 1, 200, (const uint8_t *)"y", 1,
+                                          &ino, &gen, &typ));
+    STM_ASSERT_EQ(ino, 10u);
+    STM_ASSERT_EQ(gen, 1u);
+
+    stm_dirent_index_close(idx);
+}
+
+STM_TEST(dirent_swap_two_is_self_inverse) {
+    /* Swap is its own inverse: swap(a,b) twice restores identity. */
+    stm_dirent_index *idx = stm_dirent_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100,
+                                        (const uint8_t *)"a", 1,
+                                        10, 1, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100,
+                                        (const uint8_t *)"b", 1,
+                                        20, 2, STM_DT_DIR));
+
+    STM_ASSERT_OK(stm_dirent_swap_two(idx, 1,
+                                            100, (const uint8_t *)"a", 1,
+                                            100, (const uint8_t *)"b", 1));
+    STM_ASSERT_OK(stm_dirent_swap_two(idx, 1,
+                                            100, (const uint8_t *)"a", 1,
+                                            100, (const uint8_t *)"b", 1));
+
+    uint64_t ino = 0, gen = 0; uint8_t typ = 0;
+    STM_ASSERT_OK(stm_dirent_lookup(idx, 1, 100, (const uint8_t *)"a", 1,
+                                          &ino, &gen, &typ));
+    STM_ASSERT_EQ(ino, 10u);
+    STM_ASSERT_EQ(gen, 1u);
+    STM_ASSERT_EQ(typ, (uint8_t)STM_DT_REG);
+    STM_ASSERT_OK(stm_dirent_lookup(idx, 1, 100, (const uint8_t *)"b", 1,
+                                          &ino, &gen, &typ));
+    STM_ASSERT_EQ(ino, 20u);
+    STM_ASSERT_EQ(gen, 2u);
+    STM_ASSERT_EQ(typ, (uint8_t)STM_DT_DIR);
+
+    stm_dirent_index_close(idx);
+}
+
+STM_TEST(dirent_swap_two_self_swap_refused) {
+    stm_dirent_index *idx = stm_dirent_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100,
+                                        (const uint8_t *)"a", 1,
+                                        10, 1, STM_DT_REG));
+
+    /* Same dir, same name → STM_EINVAL. */
+    STM_ASSERT_ERR(stm_dirent_swap_two(idx, 1,
+                                             100, (const uint8_t *)"a", 1,
+                                             100, (const uint8_t *)"a", 1),
+                   STM_EINVAL);
+
+    stm_dirent_index_close(idx);
+}
+
+STM_TEST(dirent_swap_two_missing_either_returns_enoent) {
+    stm_dirent_index *idx = stm_dirent_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100,
+                                        (const uint8_t *)"a", 1,
+                                        10, 1, STM_DT_REG));
+
+    /* Missing src → ENOENT. */
+    STM_ASSERT_ERR(stm_dirent_swap_two(idx, 1,
+                                             100, (const uint8_t *)"missing", 7,
+                                             100, (const uint8_t *)"a", 1),
+                   STM_ENOENT);
+    /* Missing dst → ENOENT. */
+    STM_ASSERT_ERR(stm_dirent_swap_two(idx, 1,
+                                             100, (const uint8_t *)"a", 1,
+                                             100, (const uint8_t *)"missing", 7),
+                   STM_ENOENT);
+
+    stm_dirent_index_close(idx);
+}
+
+STM_TEST(dirent_swap_two_arg_validation) {
+    stm_dirent_index *idx = stm_dirent_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100,
+                                        (const uint8_t *)"a", 1,
+                                        10, 1, STM_DT_REG));
+    STM_ASSERT_OK(stm_dirent_alloc(idx, 1, 100,
+                                        (const uint8_t *)"b", 1,
+                                        20, 2, STM_DT_REG));
+
+    /* NULL idx. */
+    STM_ASSERT_ERR(stm_dirent_swap_two(NULL, 1,
+                                             100, (const uint8_t *)"a", 1,
+                                             100, (const uint8_t *)"b", 1),
+                   STM_EINVAL);
+    /* Zero ds / dir. */
+    STM_ASSERT_ERR(stm_dirent_swap_two(idx, 0,
+                                             100, (const uint8_t *)"a", 1,
+                                             100, (const uint8_t *)"b", 1),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_dirent_swap_two(idx, 1,
+                                             0,   (const uint8_t *)"a", 1,
+                                             100, (const uint8_t *)"b", 1),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_dirent_swap_two(idx, 1,
+                                             100, (const uint8_t *)"a", 1,
+                                             0,   (const uint8_t *)"b", 1),
+                   STM_EINVAL);
+    /* NULL name / zero name_len. */
+    STM_ASSERT_ERR(stm_dirent_swap_two(idx, 1,
+                                             100, NULL, 1,
+                                             100, (const uint8_t *)"b", 1),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_dirent_swap_two(idx, 1,
+                                             100, (const uint8_t *)"a", 0,
+                                             100, (const uint8_t *)"b", 1),
+                   STM_EINVAL);
+
+    stm_dirent_index_close(idx);
+}
+
 STM_TEST_MAIN("test_dirent")
