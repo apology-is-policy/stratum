@@ -212,6 +212,109 @@ static uint32_t build_treaddir(uint8_t *req, uint16_t tag, uint32_t fid,
     return sz;
 }
 
+static uint32_t build_tlcreate(uint8_t *req, uint16_t tag, uint32_t fid,
+                                const char *name, uint32_t flags,
+                                uint32_t mode, uint32_t gid)
+{
+    uint8_t *p = req + 7;
+    pack_u32(p, fid); p += 4;
+    uint16_t nl = (uint16_t)strlen(name);
+    pack_u16(p, nl); p += 2;
+    memcpy(p, name, nl); p += nl;
+    pack_u32(p, flags); p += 4;
+    pack_u32(p, mode);  p += 4;
+    pack_u32(p, gid);   p += 4;
+    uint32_t sz = (uint32_t)(p - req);
+    pack_u32(req, sz);
+    req[4] = STM_9P_TLCREATE;
+    pack_u16(req + 5, tag);
+    return sz;
+}
+
+static uint32_t build_tmkdir(uint8_t *req, uint16_t tag, uint32_t dfid,
+                              const char *name, uint32_t mode, uint32_t gid)
+{
+    uint8_t *p = req + 7;
+    pack_u32(p, dfid); p += 4;
+    uint16_t nl = (uint16_t)strlen(name);
+    pack_u16(p, nl); p += 2;
+    memcpy(p, name, nl); p += nl;
+    pack_u32(p, mode); p += 4;
+    pack_u32(p, gid);  p += 4;
+    uint32_t sz = (uint32_t)(p - req);
+    pack_u32(req, sz);
+    req[4] = STM_9P_TMKDIR;
+    pack_u16(req + 5, tag);
+    return sz;
+}
+
+static uint32_t build_tsymlink(uint8_t *req, uint16_t tag, uint32_t dfid,
+                                const char *name, const char *symtgt,
+                                uint32_t gid)
+{
+    uint8_t *p = req + 7;
+    pack_u32(p, dfid); p += 4;
+    uint16_t nl = (uint16_t)strlen(name);
+    pack_u16(p, nl); p += 2;
+    memcpy(p, name, nl); p += nl;
+    uint16_t tl = (uint16_t)strlen(symtgt);
+    pack_u16(p, tl); p += 2;
+    memcpy(p, symtgt, tl); p += tl;
+    pack_u32(p, gid); p += 4;
+    uint32_t sz = (uint32_t)(p - req);
+    pack_u32(req, sz);
+    req[4] = STM_9P_TSYMLINK;
+    pack_u16(req + 5, tag);
+    return sz;
+}
+
+static uint32_t build_treadlink(uint8_t *req, uint16_t tag, uint32_t fid)
+{
+    uint8_t *p = req + 7;
+    pack_u32(p, fid); p += 4;
+    uint32_t sz = (uint32_t)(p - req);
+    pack_u32(req, sz);
+    req[4] = STM_9P_TREADLINK;
+    pack_u16(req + 5, tag);
+    return sz;
+}
+
+static uint32_t build_tunlinkat(uint8_t *req, uint16_t tag, uint32_t dirfd,
+                                 const char *name, uint32_t flags)
+{
+    uint8_t *p = req + 7;
+    pack_u32(p, dirfd); p += 4;
+    uint16_t nl = (uint16_t)strlen(name);
+    pack_u16(p, nl); p += 2;
+    memcpy(p, name, nl); p += nl;
+    pack_u32(p, flags); p += 4;
+    uint32_t sz = (uint32_t)(p - req);
+    pack_u32(req, sz);
+    req[4] = STM_9P_TUNLINKAT;
+    pack_u16(req + 5, tag);
+    return sz;
+}
+
+static uint32_t build_trenameat(uint8_t *req, uint16_t tag,
+                                 uint32_t old_dirfid, const char *old_name,
+                                 uint32_t new_dirfid, const char *new_name)
+{
+    uint8_t *p = req + 7;
+    pack_u32(p, old_dirfid); p += 4;
+    uint16_t onl = (uint16_t)strlen(old_name);
+    pack_u16(p, onl); p += 2;
+    memcpy(p, old_name, onl); p += onl;
+    pack_u32(p, new_dirfid); p += 4;
+    uint16_t nnl = (uint16_t)strlen(new_name);
+    pack_u16(p, nnl); p += 2;
+    memcpy(p, new_name, nnl); p += nnl;
+    uint32_t sz = (uint32_t)(p - req);
+    pack_u32(req, sz);
+    req[4] = STM_9P_TRENAMEAT;
+    pack_u16(req + 5, tag);
+    return sz;
+}
+
 /* ── helpers ─────────────────────────────────────────────────────────── */
 
 static stm_9p_server *make_server(stm_fs *fs)
@@ -936,6 +1039,226 @@ STM_TEST(p9_tread_on_dir_returns_eisdir) {
     STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
     STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
     STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EISDIR);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* ── P9-9P-1c tests: Tlcreate / Tmkdir / Tsymlink / Treadlink /────────── */
+/*                    Tunlinkat / Trenameat                                */
+
+STM_TEST(p9_lcreate_creates_and_repurposes_fid) {
+    make_tmp("9p_lcreate");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    /* Walk-clone the dir fid first (so Tlcreate's repurpose doesn't
+     * lose the dir reference). */
+    uint32_t sz = build_twalk(req, 2, 100, 101, 0, NULL);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    sz = build_tlcreate(req, 3, 101, "newfile", STM_9P_O_RDWR, 0644, 0);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLCREATE);
+
+    /* fid 101 now points at the new file. Twrite + Tread roundtrip. */
+    sz = build_twrite(req, 4, 101, 0, "hello", 5);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWRITE);
+    sz = build_tread(req, 5, 101, 0, 64);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RREAD);
+    STM_ASSERT_EQ(load_u32(resp + 7), 5u);
+    STM_ASSERT_MEM_EQ(resp + 11, "hello", 5);
+
+    /* The original fid 100 should still be the root dir — verify
+     * Twalk to "newfile" succeeds. */
+    walk_to(s, 100, 102, "newfile");
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_mkdir_creates_subdir) {
+    make_tmp("9p_mkdir");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    uint32_t sz = build_tmkdir(req, 2, 100, "subdir", 0755, 0);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RMKDIR);
+    STM_ASSERT_EQ(resp[7], STM_9P_QTDIR);    /* qid.type = dir */
+
+    /* fid 100 still points at root — walk into the new subdir. */
+    walk_to(s, 100, 101, "subdir");
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_symlink_then_readlink_roundtrip) {
+    make_tmp("9p_symlink");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+
+    const char *target = "/etc/passwd";
+    uint32_t sz = build_tsymlink(req, 2, 100, "mylink", target, 0);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RSYMLINK);
+    STM_ASSERT_EQ(resp[7], STM_9P_QTSYMLINK);
+
+    walk_to(s, 100, 101, "mylink");
+    sz = build_treadlink(req, 3, 101);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RREADLINK);
+    uint16_t tlen = load_u16(resp + 7);
+    STM_ASSERT_EQ(tlen, (uint16_t)strlen(target));
+    STM_ASSERT_MEM_EQ(resp + 9, target, tlen);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_unlinkat_removes_file) {
+    make_tmp("9p_unlinkat");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)mk_file(fs, root, "victim");
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    uint32_t sz = build_tunlinkat(req, 2, 100, "victim", 0);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RUNLINKAT);
+
+    /* Walk should now fail with ENOENT. */
+    const char *path[] = { "victim" };
+    sz = build_twalk(req, 3, 100, 101, 1, path);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_ENOENT);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_unlinkat_at_removedir_removes_dir) {
+    make_tmp("9p_unlinkat_dir");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    uint32_t sz = build_tmkdir(req, 2, 100, "dustbin", 0755, 0);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RMKDIR);
+
+    /* Tunlinkat WITHOUT AT_REMOVEDIR refuses dir → fs returns
+     * STM_EISDIR (POSIX unlink-on-dir behavior). */
+    sz = build_tunlinkat(req, 3, 100, "dustbin", 0);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EISDIR);
+
+    /* WITH AT_REMOVEDIR succeeds. */
+    sz = build_tunlinkat(req, 4, 100, "dustbin", STM_9P_AT_REMOVEDIR);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RUNLINKAT);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_renameat_within_same_dir) {
+    make_tmp("9p_renameat");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)mk_file(fs, root, "old");
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    uint32_t sz = build_trenameat(req, 2, 100, "old", 100, "new");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RRENAMEAT);
+
+    /* Old name gone, new name present. */
+    const char *old_path[] = { "old" };
+    sz = build_twalk(req, 3, 100, 101, 1, old_path);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    walk_to(s, 100, 102, "new");
 
     free(req); free(resp);
     stm_9p_server_destroy(s);

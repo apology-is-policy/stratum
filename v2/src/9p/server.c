@@ -1065,6 +1065,413 @@ static stm_status h_readdir(stm_9p_server *s,
     return STM_OK;
 }
 
+/* Validate a 9P-string name (1..STM_9P_NAME_MAX bytes, no '/' or '\0'). */
+static stm_status validate_name(const uint8_t *name, uint16_t name_len)
+{
+    if (name_len == 0 || name_len > STM_9P_NAME_MAX) return STM_EINVAL;
+    for (uint16_t i = 0; i < name_len; i++) {
+        if (name[i] == 0 || name[i] == '/') return STM_EINVAL;
+    }
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* h_lcreate — Tlcreate / Rlcreate.                                        */
+/* Tlcreate:  fid[4] name[s] flags[4] mode[4] gid[4]                       */
+/* Rlcreate:  qid[13] iounit[4]                                            */
+/*                                                                         */
+/* Per .L spec: fid initially refers to the parent directory; after        */
+/* the call it refers to the newly-created file with the requested        */
+/* open flags. Clients typically Twalk-clone the dir fid first.            */
+/* ────────────────────────────────────────────────────────────────────── */
+
+static stm_status h_lcreate(stm_9p_server *s,
+                              const uint8_t *body, uint32_t body_len,
+                              uint16_t tag,
+                              uint8_t *resp, uint32_t resp_cap,
+                              uint32_t *resp_len)
+{
+    if (body_len < 4 + 2)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+    uint32_t fid = p9l_g32(body);
+    const uint8_t *bp = body + 4;
+    const uint8_t *end = body + body_len;
+    uint16_t nlen;
+    const char *name = p9l_gstr(&bp, end, &nlen);
+    if (!name)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+    if (end - bp < 12)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+    uint32_t flags = p9l_g32(bp); bp += 4;
+    uint32_t mode  = p9l_g32(bp); bp += 4;
+    uint32_t gid   = p9l_g32(bp); bp += 4;
+
+    stm_status nv = validate_name((const uint8_t *)name, nlen);
+    if (nv != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, nv);
+
+    p9_fid *f = fid_get(s, fid);
+    if (!f)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+    if (f->is_open)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
+    if (!(f->qid_type & STM_9P_QTDIR))
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_ENOTDIR);
+    stm_status vrc = verify_fid_fresh(s, f, NULL);
+    if (vrc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
+
+    uint32_t use_uid = (flags & 0u) ? s->auth_uid : s->auth_uid;  /* always auth_uid */
+    (void)use_uid;
+    uint64_t new_ino = 0;
+    stm_status rc = stm_fs_create_file(s->fs, f->dataset_id, f->ino,
+                                          (const uint8_t *)name, (uint8_t)nlen,
+                                          mode & 07777u,
+                                          s->auth_uid, gid, &new_ino);
+    if (rc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+
+    /* Stat the new inode to get its si_gen + actual mode. */
+    struct stm_inode_value iv;
+    rc = stm_fs_stat(s->fs, f->dataset_id, new_ino, &iv);
+    if (rc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+
+    /* Repurpose fid: now points at the new file, with the requested
+     * open flags. Per .L semantics. */
+    f->ino        = new_ino;
+    f->cached_gen = (uint32_t)stm_load_le64(iv.si_gen);
+    f->qid_type   = qid_type_from_mode(stm_load_le32(iv.si_mode));
+    f->is_open    = true;
+    f->open_flags = flags;
+    f->open_iounit = iounit_for_msize(s->msize);
+
+    uint32_t need = STM_9P_HDR_SIZE + STM_9P_QID_SIZE + 4u;
+    if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
+    uint8_t *wp = resp + 4;
+    *wp++ = STM_9P_RLCREATE;
+    p9l_p16(wp, tag); wp += 2;
+    p9l_pqid(wp, f->qid_type, f->cached_gen,
+              qid_path(f->dataset_id, f->ino));
+    wp += STM_9P_QID_SIZE;
+    p9l_p32(wp, (uint32_t)f->open_iounit); wp += 4;
+    resp_finish(resp, resp_len, wp);
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* h_mkdir — Tmkdir / Rmkdir.                                              */
+/* Tmkdir:  dfid[4] name[s] mode[4] gid[4]                                 */
+/* Rmkdir:  qid[13]                                                         */
+/*                                                                         */
+/* dfid stays bound to the parent (NOT rebound, unlike Tlcreate).          */
+/* ────────────────────────────────────────────────────────────────────── */
+
+static stm_status h_mkdir(stm_9p_server *s,
+                            const uint8_t *body, uint32_t body_len,
+                            uint16_t tag,
+                            uint8_t *resp, uint32_t resp_cap,
+                            uint32_t *resp_len)
+{
+    if (body_len < 4 + 2)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+    uint32_t dfid = p9l_g32(body);
+    const uint8_t *bp = body + 4;
+    const uint8_t *end = body + body_len;
+    uint16_t nlen;
+    const char *name = p9l_gstr(&bp, end, &nlen);
+    if (!name)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+    if (end - bp < 8)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+    uint32_t mode = p9l_g32(bp); bp += 4;
+    uint32_t gid  = p9l_g32(bp); bp += 4;
+
+    stm_status nv = validate_name((const uint8_t *)name, nlen);
+    if (nv != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, nv);
+
+    p9_fid *f = fid_get(s, dfid);
+    if (!f)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+    if (!(f->qid_type & STM_9P_QTDIR))
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_ENOTDIR);
+    stm_status vrc = verify_fid_fresh(s, f, NULL);
+    if (vrc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
+
+    uint64_t new_ino = 0;
+    stm_status rc = stm_fs_mkdir(s->fs, f->dataset_id, f->ino,
+                                    (const uint8_t *)name, (uint8_t)nlen,
+                                    mode & 07777u,
+                                    s->auth_uid, gid, &new_ino);
+    if (rc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+
+    struct stm_inode_value iv;
+    rc = stm_fs_stat(s->fs, f->dataset_id, new_ino, &iv);
+    if (rc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+
+    uint32_t need = STM_9P_HDR_SIZE + STM_9P_QID_SIZE;
+    if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
+    uint8_t *wp = resp + 4;
+    *wp++ = STM_9P_RMKDIR;
+    p9l_p16(wp, tag); wp += 2;
+    p9l_pqid(wp, STM_9P_QTDIR, (uint32_t)stm_load_le64(iv.si_gen),
+              qid_path(f->dataset_id, new_ino));
+    wp += STM_9P_QID_SIZE;
+    resp_finish(resp, resp_len, wp);
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* h_symlink — Tsymlink / Rsymlink.                                        */
+/* Tsymlink:  dfid[4] name[s] symtgt[s] gid[4]                             */
+/* Rsymlink:  qid[13]                                                       */
+/* ────────────────────────────────────────────────────────────────────── */
+
+static stm_status h_symlink(stm_9p_server *s,
+                              const uint8_t *body, uint32_t body_len,
+                              uint16_t tag,
+                              uint8_t *resp, uint32_t resp_cap,
+                              uint32_t *resp_len)
+{
+    if (body_len < 4 + 2 + 2)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+    uint32_t dfid = p9l_g32(body);
+    const uint8_t *bp = body + 4;
+    const uint8_t *end = body + body_len;
+    uint16_t nlen;
+    const char *name = p9l_gstr(&bp, end, &nlen);
+    if (!name)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+    uint16_t tlen;
+    const char *symtgt = p9l_gstr(&bp, end, &tlen);
+    if (!symtgt)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+    if (end - bp < 4)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+    uint32_t gid = p9l_g32(bp); bp += 4;
+
+    stm_status nv = validate_name((const uint8_t *)name, nlen);
+    if (nv != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, nv);
+
+    p9_fid *f = fid_get(s, dfid);
+    if (!f)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+    if (!(f->qid_type & STM_9P_QTDIR))
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_ENOTDIR);
+    stm_status vrc = verify_fid_fresh(s, f, NULL);
+    if (vrc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
+
+    uint64_t new_ino = 0;
+    stm_status rc = stm_fs_symlink(s->fs, f->dataset_id, f->ino,
+                                      (const uint8_t *)name, (uint8_t)nlen,
+                                      (const uint8_t *)symtgt, tlen,
+                                      s->auth_uid, gid, &new_ino);
+    if (rc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+
+    struct stm_inode_value iv;
+    rc = stm_fs_stat(s->fs, f->dataset_id, new_ino, &iv);
+    if (rc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+
+    uint32_t need = STM_9P_HDR_SIZE + STM_9P_QID_SIZE;
+    if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
+    uint8_t *wp = resp + 4;
+    *wp++ = STM_9P_RSYMLINK;
+    p9l_p16(wp, tag); wp += 2;
+    p9l_pqid(wp, STM_9P_QTSYMLINK, (uint32_t)stm_load_le64(iv.si_gen),
+              qid_path(f->dataset_id, new_ino));
+    wp += STM_9P_QID_SIZE;
+    resp_finish(resp, resp_len, wp);
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* h_readlink — Treadlink / Rreadlink.                                     */
+/* Treadlink:  fid[4]                                                       */
+/* Rreadlink:  target[s]                                                    */
+/* ────────────────────────────────────────────────────────────────────── */
+
+static stm_status h_readlink(stm_9p_server *s,
+                               const uint8_t *body, uint32_t body_len,
+                               uint16_t tag,
+                               uint8_t *resp, uint32_t resp_cap,
+                               uint32_t *resp_len)
+{
+    if (body_len < 4)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+    uint32_t fid = p9l_g32(body);
+    p9_fid *f = fid_get(s, fid);
+    if (!f)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+    if (!(f->qid_type & STM_9P_QTSYMLINK))
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
+    stm_status vrc = verify_fid_fresh(s, f, NULL);
+    if (vrc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
+
+    uint8_t buf[STM_9P_NAME_MAX + 1];
+    size_t got = 0;
+    stm_status rc = stm_fs_readlink(s->fs, f->dataset_id, f->ino,
+                                       buf, sizeof buf, &got);
+    if (rc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+    if (got > UINT16_MAX)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EOVERFLOW);
+
+    uint32_t need = STM_9P_HDR_SIZE + 2u + (uint32_t)got;
+    if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
+    uint8_t *wp = resp + 4;
+    *wp++ = STM_9P_RREADLINK;
+    p9l_p16(wp, tag); wp += 2;
+    p9l_pstr(&wp, (const char *)buf, (uint16_t)got);
+    resp_finish(resp, resp_len, wp);
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* h_unlinkat — Tunlinkat / Runlinkat.                                     */
+/* Tunlinkat:  dirfd[4] name[s] flags[4]                                   */
+/* Runlinkat:  (header only)                                               */
+/*                                                                         */
+/* AT_REMOVEDIR routes to stm_fs_rmdir; otherwise stm_fs_unlink.          */
+/* ────────────────────────────────────────────────────────────────────── */
+
+static stm_status h_unlinkat(stm_9p_server *s,
+                               const uint8_t *body, uint32_t body_len,
+                               uint16_t tag,
+                               uint8_t *resp, uint32_t resp_cap,
+                               uint32_t *resp_len)
+{
+    if (body_len < 4 + 2)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+    uint32_t dirfd = p9l_g32(body);
+    const uint8_t *bp = body + 4;
+    const uint8_t *end = body + body_len;
+    uint16_t nlen;
+    const char *name = p9l_gstr(&bp, end, &nlen);
+    if (!name)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+    if (end - bp < 4)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+    uint32_t flags = p9l_g32(bp);
+
+    stm_status nv = validate_name((const uint8_t *)name, nlen);
+    if (nv != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, nv);
+
+    p9_fid *f = fid_get(s, dirfd);
+    if (!f)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+    if (!(f->qid_type & STM_9P_QTDIR))
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_ENOTDIR);
+    stm_status vrc = verify_fid_fresh(s, f, NULL);
+    if (vrc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
+
+    stm_status rc;
+    if (flags & STM_9P_AT_REMOVEDIR) {
+        rc = stm_fs_rmdir(s->fs, f->dataset_id, f->ino,
+                           (const uint8_t *)name, (uint8_t)nlen);
+    } else {
+        rc = stm_fs_unlink(s->fs, f->dataset_id, f->ino,
+                            (const uint8_t *)name, (uint8_t)nlen);
+    }
+    if (rc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+
+    uint32_t need = STM_9P_HDR_SIZE;
+    if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
+    uint8_t *wp = resp + 4;
+    *wp++ = STM_9P_RUNLINKAT;
+    p9l_p16(wp, tag); wp += 2;
+    resp_finish(resp, resp_len, wp);
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* h_renameat — Trenameat / Rrenameat.                                     */
+/* Trenameat:  olddirfid[4] oldname[s] newdirfid[4] newname[s]             */
+/* Rrenameat:  (header only)                                               */
+/*                                                                         */
+/* Both src + dst dirs must be bound + freshness-verified.                 */
+/* ────────────────────────────────────────────────────────────────────── */
+
+static stm_status h_renameat(stm_9p_server *s,
+                               const uint8_t *body, uint32_t body_len,
+                               uint16_t tag,
+                               uint8_t *resp, uint32_t resp_cap,
+                               uint32_t *resp_len)
+{
+    if (body_len < 4 + 2)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+    uint32_t old_dirfid = p9l_g32(body);
+    const uint8_t *bp = body + 4;
+    const uint8_t *end = body + body_len;
+    uint16_t old_nlen;
+    const char *old_name = p9l_gstr(&bp, end, &old_nlen);
+    if (!old_name)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+    if (end - bp < 4 + 2)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+    uint32_t new_dirfid = p9l_g32(bp); bp += 4;
+    uint16_t new_nlen;
+    const char *new_name = p9l_gstr(&bp, end, &new_nlen);
+    if (!new_name)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+
+    stm_status nv1 = validate_name((const uint8_t *)old_name, old_nlen);
+    if (nv1 != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, nv1);
+    stm_status nv2 = validate_name((const uint8_t *)new_name, new_nlen);
+    if (nv2 != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, nv2);
+
+    p9_fid *of = fid_get(s, old_dirfid);
+    if (!of)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+    if (!(of->qid_type & STM_9P_QTDIR))
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_ENOTDIR);
+    p9_fid *nf = fid_get(s, new_dirfid);
+    if (!nf)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+    if (!(nf->qid_type & STM_9P_QTDIR))
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_ENOTDIR);
+    /* Cross-dataset rename is not supported. */
+    if (of->dataset_id != nf->dataset_id)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EXDEV);
+
+    stm_status v1 = verify_fid_fresh(s, of, NULL);
+    if (v1 != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, v1);
+    stm_status v2 = verify_fid_fresh(s, nf, NULL);
+    if (v2 != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, v2);
+
+    stm_status rc = stm_fs_rename(s->fs, of->dataset_id,
+                                     of->ino,
+                                     (const uint8_t *)old_name, (uint8_t)old_nlen,
+                                     nf->ino,
+                                     (const uint8_t *)new_name, (uint8_t)new_nlen,
+                                     /*flags=*/0);
+    if (rc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+
+    uint32_t need = STM_9P_HDR_SIZE;
+    if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
+    uint8_t *wp = resp + 4;
+    *wp++ = STM_9P_RRENAMEAT;
+    p9l_p16(wp, tag); wp += 2;
+    resp_finish(resp, resp_len, wp);
+    return STM_OK;
+}
+
 /* ────────────────────────────────────────────────────────────────────── */
 /* Public API.                                                             */
 /* ────────────────────────────────────────────────────────────────────── */
@@ -1179,6 +1586,24 @@ stm_status stm_9p_server_handle(stm_9p_server *s,
         break;
     case STM_9P_TREADDIR:
         rc = h_readdir(s, body, body_len, tag, resp, resp_cap, resp_len);
+        break;
+    case STM_9P_TLCREATE:
+        rc = h_lcreate(s, body, body_len, tag, resp, resp_cap, resp_len);
+        break;
+    case STM_9P_TMKDIR:
+        rc = h_mkdir(s, body, body_len, tag, resp, resp_cap, resp_len);
+        break;
+    case STM_9P_TSYMLINK:
+        rc = h_symlink(s, body, body_len, tag, resp, resp_cap, resp_len);
+        break;
+    case STM_9P_TREADLINK:
+        rc = h_readlink(s, body, body_len, tag, resp, resp_cap, resp_len);
+        break;
+    case STM_9P_TUNLINKAT:
+        rc = h_unlinkat(s, body, body_len, tag, resp, resp_cap, resp_len);
+        break;
+    case STM_9P_TRENAMEAT:
+        rc = h_renameat(s, body, body_len, tag, resp, resp_cap, resp_len);
         break;
     case STM_9P_TAUTH:
         /* Stratum uses Unix-socket SO_PEERCRED for authn at the daemon
