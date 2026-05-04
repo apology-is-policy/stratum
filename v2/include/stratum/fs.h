@@ -642,6 +642,107 @@ stm_status stm_fs_get_seals(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                                 uint32_t *out_seals);
 
 /* ========================================================================= */
+/* P8-POSIX-7a-anon: O_TMPFILE — anonymous (orphan) inode lifecycle.          */
+/* ========================================================================= */
+
+/*
+ * Linux O_TMPFILE creates a regular-file inode with no dirent
+ * (anonymous; nlink=0). The file lives until either materialized
+ * via linkat(2) (which moves it from anonymous → linked at a real
+ * pathname) or explicitly freed (close-with-no-link).
+ *
+ * v2 splits the surface into three APIs:
+ *
+ *   stm_fs_create_anon  — alloc inode + leave nlink=0 + ORPHAN flag set
+ *   stm_fs_linkat_anon  — materialize: install dirent + flip nlink 0→1 +
+ *                         clear ORPHAN flag; matches Linux linkat(O_TMPFILE-fd)
+ *   stm_fs_unlink_anon  — explicit free of an orphan inode (close-with-
+ *                         no-link path)
+ *
+ * Models inode.tla's `AllocAnon` / `Materialize` / `FreeAnon` actions
+ * (P8-POSIX-7a-anon spec extension). The orphan state is the ONLY way
+ * an ALLOCATED inode can have nlink=0; the dual invariant pair
+ * `LinkedAllocatedHasPositiveNlink` (ALLOCATED + ever_linked → nlink≥1)
+ * + `OrphanHasZeroNlink` (ALLOCATED + ~ever_linked → nlink=0) pin the
+ * lifecycle.
+ */
+
+/*
+ * stm_fs_create_anon — create an anonymous regular-file inode (Linux
+ * O_TMPFILE). Returns the new ino in `*out_child_ino`. The inode is
+ * ALLOCATED with nlink=0 + STM_INO_FLAG_ORPHAN set; it is NOT linked
+ * into any directory.
+ *
+ * `mode`: same shape as `stm_fs_create_file`'s mode — file-type bits
+ * (S_IFMT) MUST be 0 or S_IFREG. The wrapper sets `(mode & 07777) |
+ * S_IFREG` in the new inode.
+ *
+ * The orphan inode persists across remount + survives sync_commit
+ * unchanged. To clean up an orphan, callers MUST call either
+ * `stm_fs_linkat_anon` (to materialize it) or `stm_fs_unlink_anon`
+ * (to free it). An orphan inode is otherwise NOT garbage-collected;
+ * future "orphan reaper" cleanup is forward-noted.
+ *
+ * Refusals:
+ *   - NULL fs OR NULL out_child_ino (STM_EINVAL).
+ *   - dataset_id == 0 (STM_EINVAL).
+ *   - mode S_IFMT bits set to a non-S_IFREG type (STM_EINVAL).
+ *   - inode-allocator out of slots (STM_ENOSPC).
+ *   - fs read-only or wedged (STM_EROFS / STM_EWEDGED).
+ *
+ * Uniform out-param contract: `*out_child_ino` zero-initialized
+ * BEFORE arg validation runs.
+ */
+STM_MUST_USE
+stm_status stm_fs_create_anon(stm_fs *fs, uint64_t dataset_id,
+                                  uint32_t mode, uint32_t uid, uint32_t gid,
+                                  uint64_t *out_child_ino);
+
+/*
+ * stm_fs_linkat_anon — materialize an orphan inode by linking it
+ * into `parent_ino` as `name`. Atomically: install the dirent +
+ * clear the ORPHAN flag + flip nlink 0→1. Mirrors Linux
+ * `linkat(2)` against an O_TMPFILE-derived fd.
+ *
+ * Atomicity: held under fs->lock. On dirent_alloc failure, the
+ * inode is left UNCHANGED (still orphan, still ALLOCATED) — the
+ * caller can retry or unlink_anon to free.
+ *
+ * Refusals:
+ *   - NULL fs OR NULL name (STM_EINVAL).
+ *   - dataset_id == 0 OR ino == 0 OR parent_ino == 0 (STM_EINVAL).
+ *   - inode not found OR FREED (STM_ENOENT).
+ *   - inode is NOT in the orphan state (STM_EINVAL — caller must
+ *     have created it via stm_fs_create_anon).
+ *   - parent not a directory (STM_ENOTDIR).
+ *   - name validation failure (STM_EINVAL).
+ *   - name already exists in parent (STM_EEXIST).
+ *   - dirent chain exhausted (STM_ENOSPC).
+ *   - fs read-only or wedged (STM_EROFS / STM_EWEDGED).
+ */
+STM_MUST_USE
+stm_status stm_fs_linkat_anon(stm_fs *fs, uint64_t dataset_id,
+                                  uint64_t ino,
+                                  uint64_t parent_ino,
+                                  const uint8_t *name, uint8_t name_len);
+
+/*
+ * stm_fs_unlink_anon — explicitly free an orphan inode (close-with-
+ * no-link path). Transitions ALLOCATED + ORPHAN → FREED.
+ *
+ * Refusals:
+ *   - NULL fs (STM_EINVAL).
+ *   - dataset_id == 0 OR ino == 0 (STM_EINVAL).
+ *   - inode not found OR already FREED (STM_ENOENT).
+ *   - inode is NOT in the orphan state (STM_EINVAL — caller asked
+ *     to free a linked inode; should use stm_fs_unlink instead).
+ *   - fs read-only or wedged (STM_EROFS / STM_EWEDGED).
+ */
+STM_MUST_USE
+stm_status stm_fs_unlink_anon(stm_fs *fs, uint64_t dataset_id,
+                                  uint64_t ino);
+
+/* ========================================================================= */
 /* P8-POSIX-7c: file handles (Linux name_to_handle_at + open_by_handle_at).   */
 /* ========================================================================= */
 

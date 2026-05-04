@@ -1021,4 +1021,204 @@ STM_TEST(inode_p3_link_unlink_arg_validation) {
     stm_inode_index_close(idx);
 }
 
+/* ========================================================================= */
+/* P8-POSIX-7a-anon: orphan inode + Materialize.                              */
+/* ========================================================================= */
+
+STM_TEST(inode_alloc_anon_starts_orphan_nlink_zero) {
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc_anon(idx, 1, 0100644, 0, 0, &ino));
+    STM_ASSERT_TRUE(ino > 0);
+
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_nlink), 0u);
+    STM_ASSERT_TRUE((stm_load_le32(v.si_flags) & STM_INO_FLAG_ORPHAN) != 0);
+    /* gen starts at 0 for fresh AllocAnon. */
+    STM_ASSERT_EQ(stm_load_le64(v.si_gen), 0u);
+
+    stm_inode_index_close(idx);
+}
+
+STM_TEST(inode_materialize_clears_orphan_bumps_nlink) {
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc_anon(idx, 1, 0100644, 0, 0, &ino));
+
+    /* Capture pre-materialize gen — must be preserved
+     * (TupleUniqueAllTime). */
+    struct stm_inode_value v0 = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &v0));
+    uint64_t pre_gen = stm_load_le64(v0.si_gen);
+
+    STM_ASSERT_OK(stm_inode_materialize(idx, 1, ino));
+
+    struct stm_inode_value v1 = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &v1));
+    STM_ASSERT_EQ(stm_load_le32(v1.si_nlink), 1u);
+    STM_ASSERT_EQ(stm_load_le32(v1.si_flags) & STM_INO_FLAG_ORPHAN, 0u);
+    STM_ASSERT_EQ(stm_load_le64(v1.si_gen), pre_gen);
+
+    stm_inode_index_close(idx);
+}
+
+STM_TEST(inode_materialize_refuses_non_orphan) {
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    /* Linked inode (not orphan) → materialize refused. */
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
+    STM_ASSERT_ERR(stm_inode_materialize(idx, 1, ino), STM_EINVAL);
+
+    /* Non-existent ino → ENOENT. */
+    STM_ASSERT_ERR(stm_inode_materialize(idx, 1, 99999u), STM_ENOENT);
+
+    /* FREED ino → ENOENT. */
+    STM_ASSERT_OK(stm_inode_free(idx, 1, ino));
+    STM_ASSERT_ERR(stm_inode_materialize(idx, 1, ino), STM_ENOENT);
+
+    /* Arg validation. */
+    uint64_t ino2 = 0;
+    STM_ASSERT_OK(stm_inode_alloc_anon(idx, 1, 0100644, 0, 0, &ino2));
+    STM_ASSERT_ERR(stm_inode_materialize(NULL, 1, ino2), STM_EINVAL);
+    STM_ASSERT_ERR(stm_inode_materialize(idx, 0, ino2), STM_EINVAL);
+    STM_ASSERT_ERR(stm_inode_materialize(idx, 1, 0), STM_EINVAL);
+
+    stm_inode_index_close(idx);
+}
+
+STM_TEST(inode_link_refuses_orphan) {
+    /* Direct stm_inode_link on an orphan must refuse —
+     * the materialize path is the only legal way to bump
+     * nlink 0→1 on an orphan. */
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc_anon(idx, 1, 0100644, 0, 0, &ino));
+
+    STM_ASSERT_ERR(stm_inode_link(idx, 1, ino), STM_EINVAL);
+    /* State preserved. */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_nlink), 0u);
+    STM_ASSERT_TRUE((stm_load_le32(v.si_flags) & STM_INO_FLAG_ORPHAN) != 0);
+
+    stm_inode_index_close(idx);
+}
+
+STM_TEST(inode_unlink_refuses_orphan) {
+    /* Direct stm_inode_unlink on an orphan must refuse —
+     * caller must use stm_inode_free (via stm_fs_unlink_anon). */
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc_anon(idx, 1, 0100644, 0, 0, &ino));
+
+    bool freed = false;
+    STM_ASSERT_ERR(stm_inode_unlink(idx, 1, ino, &freed), STM_EINVAL);
+    STM_ASSERT_EQ(freed, false);
+
+    stm_inode_index_close(idx);
+}
+
+STM_TEST(inode_set_refuses_orphan_bit_change) {
+    /* stm_inode_set must refuse a candidate that toggles the ORPHAN
+     * flag — orphan-state transitions go through alloc_anon /
+     * materialize, not through Set. */
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
+    /* Non-orphan record. Try setting ORPHAN via Set → refused. */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &v));
+    uint32_t flags0 = stm_load_le32(v.si_flags);
+    v.si_flags = stm_store_le32(flags0 | STM_INO_FLAG_ORPHAN);
+    /* Setting ORPHAN bit + nlink remains 1 → orphan/nlink mismatch
+     * also fires the dual rejection (orphan+nlink>0). Either path
+     * rejects with STM_EINVAL. */
+    STM_ASSERT_ERR(stm_inode_set(idx, 1, ino, &v), STM_EINVAL);
+
+    /* Orphan record. Try clearing ORPHAN via Set → refused. */
+    uint64_t ino2 = 0;
+    STM_ASSERT_OK(stm_inode_alloc_anon(idx, 1, 0100644, 0, 0, &ino2));
+    struct stm_inode_value v2 = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino2, &v2));
+    uint32_t flags2 = stm_load_le32(v2.si_flags);
+    v2.si_flags = stm_store_le32(flags2 & ~(uint32_t)STM_INO_FLAG_ORPHAN);
+    /* Clearing ORPHAN with nlink=0 → ORPHAN-mismatch + nlink=0
+     * non-orphan check fires. STM_EINVAL either way. */
+    STM_ASSERT_ERR(stm_inode_set(idx, 1, ino2, &v2), STM_EINVAL);
+
+    stm_inode_index_close(idx);
+}
+
+STM_TEST(inode_set_orphan_with_nlink_nonzero_rejected) {
+    /* stm_inode_set must enforce ORPHAN ⇒ nlink=0 (writer-side
+     * mirror of decoder's R70 P3-3). A candidate with ORPHAN flag
+     * + nlink > 0 violates the dual invariant. */
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc_anon(idx, 1, 0100644, 0, 0, &ino));
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &v));
+    /* Try ORPHAN + nlink=5. Should refuse. */
+    v.si_nlink = stm_store_le32(5u);
+    STM_ASSERT_ERR(stm_inode_set(idx, 1, ino, &v), STM_EINVAL);
+
+    stm_inode_index_close(idx);
+}
+
+STM_TEST(inode_alloc_anon_after_free_bumps_gen) {
+    /* AllocAnon on a previously-FREED slot bumps gen — same
+     * TupleUniqueAllTime invariant as regular AllocReused. */
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    uint64_t ino1 = 0;
+    STM_ASSERT_OK(stm_inode_alloc_anon(idx, 1, 0100644, 0, 0, &ino1));
+    /* Free it. */
+    STM_ASSERT_OK(stm_inode_free(idx, 1, ino1));
+    /* Alloc anon again — should reuse the slot with bumped gen. */
+    uint64_t ino2 = 0;
+    STM_ASSERT_OK(stm_inode_alloc_anon(idx, 1, 0100644, 0, 0, &ino2));
+    STM_ASSERT_EQ(ino2, ino1);   /* AllocReused returns same ino */
+
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino2, &v));
+    STM_ASSERT_EQ(stm_load_le64(v.si_gen), 1u);   /* bumped */
+    STM_ASSERT_EQ(stm_load_le32(v.si_nlink), 0u);
+    STM_ASSERT_TRUE((stm_load_le32(v.si_flags) & STM_INO_FLAG_ORPHAN) != 0);
+
+    stm_inode_index_close(idx);
+}
+
+STM_TEST(inode_alloc_anon_arg_validation) {
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    uint64_t ino = 0;
+    STM_ASSERT_ERR(stm_inode_alloc_anon(NULL, 1, 0100644, 0, 0, &ino),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_inode_alloc_anon(idx, 0, 0100644, 0, 0, &ino),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_inode_alloc_anon(idx, 1, 0, 0, 0, &ino),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_inode_alloc_anon(idx, 1, 0100644, 0, 0, NULL),
+                   STM_EINVAL);
+
+    stm_inode_index_close(idx);
+}
+
 STM_TEST_MAIN("test_inode")

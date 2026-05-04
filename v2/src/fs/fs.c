@@ -1074,6 +1074,187 @@ stm_status stm_fs_create_file(stm_fs *fs, uint64_t dataset_id,
                                        out_child_ino);
 }
 
+/* P8-POSIX-7a-anon: stm_fs_create_anon — Linux O_TMPFILE shape.
+ * Allocates an orphan inode (nlink=0 + STM_INO_FLAG_ORPHAN) and
+ * does NOT install any dirent. The orphan persists until explicitly
+ * materialized via stm_fs_linkat_anon or freed via stm_fs_unlink_anon.
+ * Composes inode.tla::AllocAnon. */
+stm_status stm_fs_create_anon(stm_fs *fs, uint64_t dataset_id,
+                                  uint32_t mode, uint32_t uid, uint32_t gid,
+                                  uint64_t *out_child_ino)
+{
+    /* Uniform out-param contract: zero-init BEFORE arg validation. */
+    if (out_child_ino) *out_child_ino = 0;
+    if (!fs || !out_child_ino) return STM_EINVAL;
+    if (dataset_id == 0u) return STM_EINVAL;
+    /* Same mode-bits contract as stm_fs_create_file. */
+    uint32_t mtype = mode & (uint32_t)S_IFMT;
+    if (mtype != 0u && mtype != (uint32_t)S_IFREG) return STM_EINVAL;
+    uint32_t effective_mode = (mode & 07777u) | (uint32_t)S_IFREG;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+
+    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+    if (!iidx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;
+    }
+
+    uint64_t new_ino = 0;
+    stm_status as = stm_inode_alloc_anon(iidx, dataset_id, effective_mode,
+                                              uid, gid, &new_ino);
+    if (as != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return as;
+    }
+
+    /* Stamp creation timestamps + persist. The fresh-allocated record
+     * is read back, stamped, and committed via stm_inode_set so the
+     * post-create state is consistent (mirrors the regular
+     * fs_create_inode_and_link's create-stamp shape). */
+    struct stm_inode_value iv = {0};
+    stm_status ls = stm_inode_lookup(iidx, dataset_id, new_ino, &iv);
+    if (ls == STM_OK) {
+        fs_stamp_create_times(&iv);
+        /* stm_inode_set's writer-side guards exempt orphan records
+         * (ORPHAN flag set + nlink=0) from the FREED⇔nlink≥1 check —
+         * see the inode.c R71 P1-1 / P8-POSIX-7a-anon symmetry. */
+        (void)stm_inode_set(iidx, dataset_id, new_ino, &iv);
+    }
+
+    *out_child_ino = new_ino;
+    pthread_mutex_unlock(&fs->lock);
+    return STM_OK;
+}
+
+/* P8-POSIX-7a-anon: stm_fs_linkat_anon — materialize an orphan inode
+ * by installing the first dirent + flipping nlink 0→1 + clearing the
+ * ORPHAN flag. Composes inode.tla::Materialize. */
+stm_status stm_fs_linkat_anon(stm_fs *fs, uint64_t dataset_id,
+                                  uint64_t ino,
+                                  uint64_t parent_ino,
+                                  const uint8_t *name, uint8_t name_len)
+{
+    if (!fs || !name) return STM_EINVAL;
+    if (dataset_id == 0u || ino == 0u || parent_ino == 0u) return STM_EINVAL;
+    stm_status nv = fs_validate_dirent_name(name, name_len);
+    if (nv != STM_OK) return nv;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+
+    stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
+    stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
+    if (!iidx || !didx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;
+    }
+
+    /* Validate parent is a directory. */
+    struct stm_inode_value pv = {0};
+    stm_status ps = fs_load_parent_dir(iidx, dataset_id, parent_ino, &pv);
+    if (ps != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return ps;
+    }
+
+    /* Validate target inode exists + is in orphan state. The detailed
+     * check happens inside stm_inode_materialize (which returns
+     * STM_ENOENT if not found, STM_EINVAL if not orphan); we look up
+     * here too for the dirent_alloc gen + child_type. */
+    struct stm_inode_value iv = {0};
+    stm_status ls = stm_inode_lookup(iidx, dataset_id, ino, &iv);
+    if (ls != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return ls;
+    }
+    uint32_t flags = stm_load_le32(iv.si_flags);
+    if (!(flags & STM_INO_FLAG_ORPHAN)) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;
+    }
+    uint64_t child_gen = stm_load_le64(iv.si_gen);
+
+    /* Two-step atomicity: install the dirent FIRST (so a failed
+     * dirent_alloc leaves the orphan unchanged + caller can retry).
+     * On dirent_alloc success, materialize the inode (cannot fail
+     * under fs->lock per R76 P3-1 / R78 P3-1 lock-posture argument).
+     * On a hypothetical post-materialize-rollback we'd need to undo
+     * the dirent — but materialize is provably infallible here (no
+     * gen / nlink / FREED race), so no rollback path needed. */
+    stm_status das = stm_dirent_alloc(didx, dataset_id, parent_ino,
+                                          name, name_len,
+                                          ino, child_gen, STM_DT_REG);
+    if (das != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return das;
+    }
+    stm_status ms = stm_inode_materialize(iidx, dataset_id, ino);
+    if (ms != STM_OK) {
+        /* Defense-in-depth — best-effort rollback (should never fire). */
+        (void)stm_dirent_unlink(didx, dataset_id, parent_ino,
+                                     name, name_len);
+        pthread_mutex_unlock(&fs->lock);
+        stm_fs_mark_wedged(fs);
+        return ms;
+    }
+
+    /* Stamp ctime on the now-linked inode (the materialization is a
+     * metadata change). Read back since materialize mutates si_flags
+     * + si_nlink. */
+    struct stm_inode_value iv2 = {0};
+    stm_status ls2 = stm_inode_lookup(iidx, dataset_id, ino, &iv2);
+    if (ls2 == STM_OK) {
+        fs_stamp_ctime_now(&iv2);
+        (void)stm_inode_set(iidx, dataset_id, ino, &iv2);
+    }
+
+    pthread_mutex_unlock(&fs->lock);
+    return STM_OK;
+}
+
+/* P8-POSIX-7a-anon: stm_fs_unlink_anon — explicitly free an orphan.
+ * Composes inode.tla::FreeAnon. */
+stm_status stm_fs_unlink_anon(stm_fs *fs, uint64_t dataset_id,
+                                  uint64_t ino)
+{
+    if (!fs) return STM_EINVAL;
+    if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+
+    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+    if (!iidx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;
+    }
+
+    /* Validate the target is an orphan before freeing — caller must
+     * use stm_fs_unlink for linked inodes. */
+    struct stm_inode_value iv = {0};
+    stm_status ls = stm_inode_lookup(iidx, dataset_id, ino, &iv);
+    if (ls != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return ls;
+    }
+    uint32_t flags = stm_load_le32(iv.si_flags);
+    if (!(flags & STM_INO_FLAG_ORPHAN)) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;
+    }
+
+    /* stm_inode_free transitions ALLOCATED → FREED, sets FREED flag,
+     * clears nlink. The ORPHAN flag survives in si_flags but is moot
+     * (FREED records aren't readable via lookup). The next AllocReused
+     * on this slot's records[] entry will memset the value, clearing
+     * both flags. */
+    stm_status fs_free = stm_inode_free(iidx, dataset_id, ino);
+    pthread_mutex_unlock(&fs->lock);
+    return fs_free;
+}
+
 stm_status stm_fs_mkdir(stm_fs *fs, uint64_t dataset_id,
                             uint64_t parent_ino,
                             const uint8_t *name, uint8_t name_len,

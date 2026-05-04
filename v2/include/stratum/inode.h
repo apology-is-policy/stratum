@@ -67,15 +67,21 @@ extern "C" {
 #define STM_INODE_INLINE_MAX 100u
 
 /*
- * `si_flags` is a 32-bit field. Bit allocation (R82 P3-2):
+ * `si_flags` is a 32-bit field. Bit allocation (R82 P3-2,
+ * P8-POSIX-7a-anon update):
  *
  *   bits  0..2   ext-style flags (IMMUTABLE / APPEND / NODUMP) — defined
  *   bits  3..7   reserved for future ext-style flag bits (DIRSYNC,
  *                NOATIME, etc.); must be zero on writes today
  *   bits  8..12  P8-POSIX-7a-seals SEAL_* (SEAL / SHRINK / GROW / WRITE
  *                / FUTURE_WRITE)
- *   bits 13..30  reserved-zero — not yet allocated to any feature; must
+ *   bits 13..29  reserved-zero — not yet allocated to any feature; must
  *                be zero on writes; future feature blocks claim these
+ *   bit  30      STM_INO_FLAG_ORPHAN — internal allocator state for
+ *                P8-POSIX-7a-anon O_TMPFILE inodes (ALLOCATED + nlink=0
+ *                + never-linked). Cleared on stm_inode_materialize.
+ *                Caller MUST NOT set via stm_inode_set; the dedicated
+ *                stm_inode_alloc_anon / _materialize paths manage it.
  *   bit  31      STM_INO_FLAG_FREED — internal allocator state encoding
  *                (FREED ⇔ ALLOCATED). Caller MUST NOT set via stm_inode_set;
  *                the write paths protect against this.
@@ -128,6 +134,25 @@ extern "C" {
                                          STM_INO_FLAG_SEAL_GROW | \
                                          STM_INO_FLAG_SEAL_WRITE | \
                                          STM_INO_FLAG_SEAL_FUTURE_WRITE)
+
+/*
+ * P8-POSIX-7a-anon: orphan-inode marker. Set on an ALLOCATED
+ * record produced by `stm_inode_alloc_anon` (Linux O_TMPFILE
+ * shape — no dirent points here yet, nlink is 0). Cleared by
+ * `stm_inode_materialize` when the orphan is linked into a parent
+ * directory for the first time.
+ *
+ * The orphan state is the ONLY way an ALLOCATED inode can have
+ * nlink = 0 (post-AllocAnon, pre-Materialize). Linked inodes
+ * always have nlink ≥ 1; cascade-free transitions ALLOCATED →
+ * FREED at nlink=0 atomically. Models inode.tla's `~ever_linked`
+ * shadow var.
+ *
+ * Caller-visible `si_flags` value MUST NOT include this bit
+ * directly via stm_inode_set; the dedicated _alloc_anon /
+ * _materialize paths manage it.
+ */
+#define STM_INO_FLAG_ORPHAN     0x40000000u
 
 /*
  * Reserved internal flag — set on a record whose ino has been freed
@@ -266,6 +291,56 @@ STM_MUST_USE
 stm_status stm_inode_alloc(stm_inode_index *idx, uint64_t dataset_id,
                               uint32_t mode, uint32_t uid, uint32_t gid,
                               uint64_t *out_ino);
+
+/*
+ * P8-POSIX-7a-anon: allocate an ANONYMOUS (orphan) inode. Mirrors
+ * `stm_inode_alloc`'s allocation policy (AllocReused-from-FREED
+ * preferred, AllocFresh-from-next_ino fallback) but produces an
+ * inode with `nlink = 0` and `STM_INO_FLAG_ORPHAN` set in
+ * `si_flags`. The orphan state encodes inode.tla's
+ * `~ever_linked` shadow var: an orphan inode is ALLOCATED but
+ * has never been linked to a dirent.
+ *
+ * Models inode.tla's `AllocAnon` action. The (ino, si_gen) tuple
+ * is unique-across-time per `TupleUniqueAllTime`; gen bumps on the
+ * AllocReused path same as `stm_inode_alloc`.
+ *
+ * Lifecycle: an orphan inode lives until either:
+ *   - `stm_inode_materialize` flips it to linked (nlink := 1,
+ *     ORPHAN flag cleared) — models `Materialize`.
+ *   - `stm_inode_free` frees it explicitly — models `FreeAnon`.
+ *
+ * NB: regular `stm_inode_link` / `_unlink` REJECT orphan inodes
+ * (the orphan must materialize first). The fs.c-layer wrappers
+ * route through the appropriate path.
+ *
+ * Refusals: same shape as `stm_inode_alloc`.
+ */
+STM_MUST_USE
+stm_status stm_inode_alloc_anon(stm_inode_index *idx, uint64_t dataset_id,
+                                   uint32_t mode, uint32_t uid, uint32_t gid,
+                                   uint64_t *out_ino);
+
+/*
+ * P8-POSIX-7a-anon: materialize an orphan inode — flip nlink 0→1
+ * and clear `STM_INO_FLAG_ORPHAN` in `si_flags`. Models
+ * inode.tla's `Materialize` action: ALLOCATED + nlink=0 +
+ * ~ever_linked → ALLOCATED + nlink=1 + ever_linked=TRUE.
+ *
+ * `si_gen` is preserved (matches the inode.tla's
+ * `TupleUniqueAllTime` invariant — the (ino, gen) tuple identity
+ * is stable across materialization).
+ *
+ * Refusals:
+ *   - NULL idx OR dataset_id == 0 OR ino == 0 (STM_EINVAL).
+ *   - No record at (dataset_id, ino) OR record FREED (STM_ENOENT).
+ *   - Record is NOT in the orphan state (i.e., `STM_INO_FLAG_ORPHAN`
+ *     not set OR nlink != 0) — STM_EINVAL. Caller must use
+ *     `stm_inode_link` for already-linked inodes.
+ */
+STM_MUST_USE
+stm_status stm_inode_materialize(stm_inode_index *idx, uint64_t dataset_id,
+                                    uint64_t ino);
 
 /*
  * Free the inode at (dataset_id, ino). Sets `STM_INO_FLAG_FREED`

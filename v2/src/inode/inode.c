@@ -305,10 +305,31 @@ static stm_status in_decode_value(const void *in, size_t in_len,
      * healthy paths (stm_inode_alloc / _free) already maintain this
      * by construction; rejecting tampered records that violate the
      * invariant catches single-bit-flip + offline-tamper attacks
-     * one layer earlier than the API surface. */
+     * one layer earlier than the API surface.
+     *
+     * P8-POSIX-7a-anon: orphan inodes (ALLOCATED + ORPHAN flag set)
+     * legitimately have nlink=0; the inode.tla::OrphanHasZeroNlink
+     * invariant guarantees ALLOCATED + ~ever_linked → nlink=0. The
+     * dual `LinkedAllocatedHasPositiveNlink` (ALLOCATED + ever_linked
+     * → nlink ≥ 1) is enforced here by gating the nlink=0 rejection
+     * on ~ORPHAN. Tampered records claiming both ORPHAN and nlink>0
+     * are caught separately (see below). */
     uint32_t nlink = stm_load_le32(out->value.si_nlink);
+    bool is_orphan = (flags & STM_INO_FLAG_ORPHAN) != 0;
     if (out->state == STM_INODE_STATE_FREED && nlink != 0) return STM_ECORRUPT;
-    if (out->state == STM_INODE_STATE_ALLOCATED && nlink == 0) return STM_ECORRUPT;
+    if (out->state == STM_INODE_STATE_ALLOCATED && nlink == 0 && !is_orphan) {
+        return STM_ECORRUPT;
+    }
+    /* P8-POSIX-7a-anon: ORPHAN ⇒ nlink=0 (the dual invariant —
+     * inode.tla::OrphanHasZeroNlink). Tampered records claiming
+     * ORPHAN with nlink > 0 are caught here. */
+    if (is_orphan && nlink != 0) return STM_ECORRUPT;
+    /* P8-POSIX-7a-anon: ORPHAN ⇒ ALLOCATED. A FREED record carrying
+     * the ORPHAN flag is structurally inconsistent (orphans are an
+     * intermediate ALLOCATED state). */
+    if (is_orphan && out->state != STM_INODE_STATE_ALLOCATED) {
+        return STM_ECORRUPT;
+    }
 
     out->dataset_id = expected_ds;
     out->ino        = expected_ino;
@@ -502,6 +523,120 @@ stm_status stm_inode_alloc(stm_inode_index *idx, uint64_t dataset_id,
     return STM_OK;
 }
 
+/* P8-POSIX-7a-anon: alloc_anon — same allocation policy as
+ * stm_inode_alloc but produces an orphan inode (nlink=0 +
+ * STM_INO_FLAG_ORPHAN set). Models inode.tla's AllocAnon. */
+stm_status stm_inode_alloc_anon(stm_inode_index *idx, uint64_t dataset_id,
+                                   uint32_t mode, uint32_t uid, uint32_t gid,
+                                   uint64_t *out_ino) {
+    if (!idx || !out_ino) return STM_EINVAL;
+    if (dataset_id == 0) return STM_EINVAL;
+    if (mode == 0) return STM_EINVAL;
+
+    must_lock(idx_lock(idx));
+
+    stm_inode_dsstate *s = get_or_create_dsstate(idx, dataset_id);
+    if (!s) {
+        must_unlock(idx_lock(idx));
+        return STM_ENOMEM;
+    }
+
+    /* AllocReused-anon path: prefer FREED record, bump gen, mark
+     * ALLOCATED + orphan. Same gen-bump invariant as the regular
+     * alloc path — preserves (ino, gen) tuple-uniqueness across
+     * the orphan lifecycle too. */
+    stm_inode_record *r = find_freed_record(idx, dataset_id);
+    if (r) {
+        uint64_t prior_gen = stm_load_le64(r->value.si_gen);
+        uint64_t new_gen = prior_gen + 1u;
+        uint64_t reused_ino = r->ino;
+        memset(&r->value, 0, sizeof r->value);
+        r->state               = STM_INODE_STATE_ALLOCATED;
+        r->value.si_ino        = stm_store_le64(reused_ino);
+        r->value.si_dataset_id = stm_store_le64(dataset_id);
+        r->value.si_gen        = stm_store_le64(new_gen);
+        r->value.si_mode       = stm_store_le32(mode);
+        r->value.si_uid        = stm_store_le32(uid);
+        r->value.si_gid        = stm_store_le32(gid);
+        /* Orphan distinction: nlink=0 + ORPHAN flag set. */
+        r->value.si_nlink      = stm_store_le32(0);
+        r->value.si_flags      = stm_store_le32(STM_INO_FLAG_ORPHAN);
+        r->value.si_data_kind  = STM_DATA_INLINE;
+        r->value.si_data_len   = 0;
+        *out_ino   = reused_ino;
+        idx->dirty = true;
+        must_unlock(idx_lock(idx));
+        return STM_OK;
+    }
+
+    /* AllocFresh-anon path: same shape as stm_inode_alloc's fresh
+     * path with nlink=0 + ORPHAN flag. */
+    uint64_t fresh_ino = s->next_ino;
+    if (fresh_ino == UINT64_MAX) {
+        must_unlock(idx_lock(idx));
+        return STM_ENOSPC;
+    }
+    r = append_record(idx);
+    if (!r) {
+        must_unlock(idx_lock(idx));
+        return STM_ENOMEM;
+    }
+    r->dataset_id = dataset_id;
+    r->ino        = fresh_ino;
+    r->state      = STM_INODE_STATE_ALLOCATED;
+    r->value.si_ino        = stm_store_le64(fresh_ino);
+    r->value.si_dataset_id = stm_store_le64(dataset_id);
+    r->value.si_gen        = stm_store_le64(0);
+    r->value.si_mode       = stm_store_le32(mode);
+    r->value.si_uid        = stm_store_le32(uid);
+    r->value.si_gid        = stm_store_le32(gid);
+    r->value.si_nlink      = stm_store_le32(0);
+    r->value.si_flags      = stm_store_le32(STM_INO_FLAG_ORPHAN);
+    r->value.si_data_kind  = STM_DATA_INLINE;
+    r->value.si_data_len   = 0;
+
+    s->next_ino  = fresh_ino + 1u;
+    *out_ino     = fresh_ino;
+    idx->dirty   = true;
+
+    must_unlock(idx_lock(idx));
+    return STM_OK;
+}
+
+/* P8-POSIX-7a-anon: materialize — flip an orphan inode to linked.
+ * Models inode.tla's Materialize action. */
+stm_status stm_inode_materialize(stm_inode_index *idx, uint64_t dataset_id,
+                                    uint64_t ino) {
+    if (!idx) return STM_EINVAL;
+    if (dataset_id == 0 || ino == 0) return STM_EINVAL;
+
+    must_lock(idx_lock(idx));
+
+    stm_inode_record *r = find_record(idx, dataset_id, ino);
+    if (!r || r->state != STM_INODE_STATE_ALLOCATED) {
+        must_unlock(idx_lock(idx));
+        return STM_ENOENT;
+    }
+    /* Must be in orphan state: ORPHAN flag set + nlink == 0.
+     * Both checks defensive — the on-disk decoder pins them
+     * symmetrically (R71 P1-1 lesson). */
+    uint32_t flags = stm_load_le32(r->value.si_flags);
+    uint32_t nlink = stm_load_le32(r->value.si_nlink);
+    if (!(flags & STM_INO_FLAG_ORPHAN) || nlink != 0) {
+        must_unlock(idx_lock(idx));
+        return STM_EINVAL;
+    }
+
+    /* Flip: clear ORPHAN, set nlink=1. si_gen preserved
+     * (TupleUniqueAllTime — handle stability across materialization). */
+    r->value.si_flags = stm_store_le32(flags & ~(uint32_t)STM_INO_FLAG_ORPHAN);
+    r->value.si_nlink = stm_store_le32(1);
+    idx->dirty = true;
+
+    must_unlock(idx_lock(idx));
+    return STM_OK;
+}
+
 stm_status stm_inode_free(stm_inode_index *idx, uint64_t dataset_id,
                              uint64_t ino) {
     if (!idx) return STM_EINVAL;
@@ -545,6 +680,19 @@ stm_status stm_inode_link(stm_inode_index *idx, uint64_t dataset_id,
         must_unlock(idx_lock(idx));
         return STM_ENOENT;
     }
+    /* P8-POSIX-7a-anon: orphan inodes (ALLOCATED + ORPHAN flag) must
+     * NOT go through stm_inode_link — caller should use
+     * stm_inode_materialize for the first link. Refuse explicitly so
+     * a buggy fs-layer wrapper can't bump nlink past 0 while
+     * leaving the ORPHAN flag set (state would violate the
+     * `OrphanHasZeroNlink` invariant). */
+    {
+        uint32_t flags = stm_load_le32(r->value.si_flags);
+        if (flags & STM_INO_FLAG_ORPHAN) {
+            must_unlock(idx_lock(idx));
+            return STM_EINVAL;
+        }
+    }
     uint32_t cur_nlink = stm_load_le32(r->value.si_nlink);
     if (cur_nlink == UINT32_MAX) {
         must_unlock(idx_lock(idx));
@@ -570,11 +718,23 @@ stm_status stm_inode_unlink(stm_inode_index *idx, uint64_t dataset_id,
         must_unlock(idx_lock(idx));
         return STM_ENOENT;
     }
+    /* P8-POSIX-7a-anon: orphan inodes have nlink=0 and aren't linked
+     * to any dirent, so unlinking is meaningless on them — caller
+     * should use stm_inode_free (via stm_fs_unlink_anon) to release
+     * the orphan explicitly. Refuse explicitly. */
+    {
+        uint32_t flags = stm_load_le32(r->value.si_flags);
+        if (flags & STM_INO_FLAG_ORPHAN) {
+            must_unlock(idx_lock(idx));
+            return STM_EINVAL;
+        }
+    }
     uint32_t cur_nlink = stm_load_le32(r->value.si_nlink);
     if (cur_nlink == 0u) {
-        /* Invariant violation: ALLOCATED + nlink=0 is the very orphan
-         * R71 P1-1 / inode.tla::LinkedAllocatedHasPositiveNlink
-         * pin against. Refuse rather than silently underflow. */
+        /* Invariant violation: ALLOCATED + nlink=0 + non-orphan is
+         * the corrupt-record shape R71 P1-1 / inode.tla::
+         * LinkedAllocatedHasPositiveNlink pins against. Refuse
+         * rather than silently underflow. */
         must_unlock(idx_lock(idx));
         return STM_ECORRUPT;
     }
@@ -671,10 +831,26 @@ stm_status stm_inode_set(stm_inode_index *idx, uint64_t dataset_id,
     }
     /* Reject Set with the FREED bit set in si_flags — that bit is
      * the allocator's internal lifecycle marker; callers reach FREED
-     * via stm_inode_free, not by writing the flag. */
+     * via stm_inode_free, not by writing the flag.
+     *
+     * P8-POSIX-7a-anon: same applies to STM_INO_FLAG_ORPHAN —
+     * orphan-state transitions go through stm_inode_alloc_anon /
+     * stm_inode_materialize, NOT through stm_inode_set. A caller
+     * setting the ORPHAN bit directly (or clearing it) would
+     * desynchronize the allocator state from the writer's view.
+     * Writer-side guard: forbid any change to the ORPHAN bit via
+     * Set — the candidate's ORPHAN bit MUST equal the existing
+     * record's. */
     {
         uint32_t flags = stm_load_le32(in_value->si_flags);
         if (flags & STM_INO_FLAG_FREED) {
+            must_unlock(idx_lock(idx));
+            return STM_EINVAL;
+        }
+        uint32_t cur_flags  = stm_load_le32(r->value.si_flags);
+        bool in_orphan  = (flags     & STM_INO_FLAG_ORPHAN) != 0;
+        bool cur_orphan = (cur_flags & STM_INO_FLAG_ORPHAN) != 0;
+        if (in_orphan != cur_orphan) {
             must_unlock(idx_lock(idx));
             return STM_EINVAL;
         }
@@ -686,10 +862,24 @@ stm_status stm_inode_set(stm_inode_index *idx, uint64_t dataset_id,
      * next mount's load_at decoder rejects with STM_ECORRUPT and
      * wedges the pool unrecoverably without offline tooling. The
      * symmetric writer-side guard closes the silent-commit-then-
-     * wedge path. */
-    if (stm_load_le32(in_value->si_nlink) == 0) {
-        must_unlock(idx_lock(idx));
-        return STM_EINVAL;
+     * wedge path.
+     *
+     * P8-POSIX-7a-anon: orphan inodes (ORPHAN flag set) legitimately
+     * have nlink=0; the writer-side guard exempts them. The dual
+     * invariant (ORPHAN ⇒ nlink=0) is enforced symmetrically — a
+     * candidate carrying ORPHAN with nlink > 0 is rejected. */
+    {
+        uint32_t in_flags = stm_load_le32(in_value->si_flags);
+        bool in_orphan = (in_flags & STM_INO_FLAG_ORPHAN) != 0;
+        uint32_t in_nlink = stm_load_le32(in_value->si_nlink);
+        if (!in_orphan && in_nlink == 0) {
+            must_unlock(idx_lock(idx));
+            return STM_EINVAL;
+        }
+        if (in_orphan && in_nlink != 0) {
+            must_unlock(idx_lock(idx));
+            return STM_EINVAL;
+        }
     }
     /* R82 P2-2: pin the seal-stickiness invariant on the writer side
      * (the fs.c::stm_fs_add_seals seam already enforces SEAL_SEAL

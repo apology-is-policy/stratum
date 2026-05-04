@@ -12650,4 +12650,323 @@ STM_TEST(fs_p10b_r84_p3_4_seal_future_write_only_refuses_reflink) {
     unlink(g_tmp_path); unlink(g_key_path);
 }
 
+/* ========================================================================= */
+/* P8-POSIX-7a-anon: O_TMPFILE — anonymous (orphan) inode lifecycle.          */
+/* ========================================================================= */
+
+STM_TEST(fs_p7a_anon_create_returns_orphan_inode) {
+    make_tmp("p7a_anon_create");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_anon(fs, 1, 0644u, 0, 0, &ino));
+    STM_ASSERT_TRUE(ino > 0);
+
+    /* Inode is ALLOCATED + ORPHAN + nlink=0 + S_IFREG. */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, ino, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_nlink), 0u);
+    STM_ASSERT_TRUE((stm_load_le32(v.si_flags) & STM_INO_FLAG_ORPHAN) != 0);
+    STM_ASSERT_EQ(stm_load_le32(v.si_mode) & (uint32_t)S_IFMT,
+                  (uint32_t)S_IFREG);
+    /* Create timestamps stamped. */
+    STM_ASSERT_TRUE(stm_load_le64(v.si_btime_sec) > 0);
+    STM_ASSERT_TRUE(stm_load_le64(v.si_ctime_sec) > 0);
+
+    /* Not findable via parent lookup (no dirent installed). */
+    uint64_t found = 0;
+    STM_ASSERT_ERR(stm_fs_lookup(fs, 1, root, (const uint8_t *)"x", 1,
+                                       &found),
+                   STM_ENOENT);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_anon_linkat_materializes) {
+    make_tmp("p7a_anon_linkat");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_anon(fs, 1, 0644u, 0, 0, &ino));
+
+    /* Materialize at root/named. */
+    STM_ASSERT_OK(stm_fs_linkat_anon(fs, 1, ino, root,
+                                          (const uint8_t *)"named", 5));
+
+    /* Now findable. */
+    uint64_t found = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root, (const uint8_t *)"named", 5,
+                                     &found));
+    STM_ASSERT_EQ(found, ino);
+
+    /* nlink=1, ORPHAN cleared. */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, ino, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_nlink), 1u);
+    STM_ASSERT_EQ(stm_load_le32(v.si_flags) & STM_INO_FLAG_ORPHAN, 0u);
+
+    /* Subsequent unlink works the same as a regular file. */
+    STM_ASSERT_OK(stm_fs_unlink(fs, 1, root, (const uint8_t *)"named", 5));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_anon_unlink_anon_frees) {
+    make_tmp("p7a_anon_unlink_anon");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_anon(fs, 1, 0644u, 0, 0, &ino));
+
+    STM_ASSERT_OK(stm_fs_unlink_anon(fs, 1, ino));
+
+    /* stat now returns ENOENT (FREED). */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_ERR(stm_fs_stat(fs, 1, ino, &v), STM_ENOENT);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_anon_linkat_refuses_non_orphan) {
+    make_tmp("p7a_anon_linkat_non_orphan");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    /* Create a regular (linked) file. */
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+    /* linkat_anon refuses — it's already linked. */
+    STM_ASSERT_ERR(stm_fs_linkat_anon(fs, 1, f, root,
+                                            (const uint8_t *)"f2", 2),
+                   STM_EINVAL);
+    /* And unlink_anon refuses. */
+    STM_ASSERT_ERR(stm_fs_unlink_anon(fs, 1, f), STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_anon_linkat_refuses_existing_name) {
+    make_tmp("p7a_anon_linkat_eexist");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    /* Pre-existing file at the target name. */
+    uint64_t pre = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root,
+                                          (const uint8_t *)"taken", 5,
+                                          0644u, 0, 0, &pre));
+
+    uint64_t orphan = 0;
+    STM_ASSERT_OK(stm_fs_create_anon(fs, 1, 0644u, 0, 0, &orphan));
+
+    /* linkat_anon at "taken" → STM_EEXIST. Orphan stays orphan. */
+    STM_ASSERT_ERR(stm_fs_linkat_anon(fs, 1, orphan, root,
+                                            (const uint8_t *)"taken", 5),
+                   STM_EEXIST);
+
+    /* Orphan unchanged (still ALLOCATED + ORPHAN + nlink=0). */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, orphan, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_nlink), 0u);
+    STM_ASSERT_TRUE((stm_load_le32(v.si_flags) & STM_INO_FLAG_ORPHAN) != 0);
+
+    /* Caller can retry at a different name. */
+    STM_ASSERT_OK(stm_fs_linkat_anon(fs, 1, orphan, root,
+                                          (const uint8_t *)"free", 4));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_anon_persist_across_remount) {
+    make_tmp("p7a_anon_persist");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_anon(fs, 1, 0644u, 0, 0, &ino));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    /* Remount; orphan should persist (it lives in the inode tree). */
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, ino, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_nlink), 0u);
+    STM_ASSERT_TRUE((stm_load_le32(v.si_flags) & STM_INO_FLAG_ORPHAN) != 0);
+
+    /* Materialize after remount works. */
+    STM_ASSERT_OK(stm_fs_linkat_anon(fs, 1, ino, root,
+                                          (const uint8_t *)"after", 5));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_anon_create_then_write_then_link) {
+    /* Realistic O_TMPFILE shape: open anonymous, write content,
+     * then linkat to make it visible. */
+    make_tmp("p7a_anon_write_then_link");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_anon(fs, 1, 0644u, 0, 0, &ino));
+
+    /* Write content while orphan. */
+    static const uint8_t hello[] = "hello-world!";   /* 13 with NUL */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, ino, 0, hello, 12));
+
+    /* Materialize. */
+    STM_ASSERT_OK(stm_fs_linkat_anon(fs, 1, ino, root,
+                                          (const uint8_t *)"out", 3));
+
+    /* Read content via the new path's ino. */
+    uint8_t buf[16] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, ino, 0, buf, 16, &got));
+    STM_ASSERT_EQ(got, 12u);
+    STM_ASSERT_MEM_EQ(buf, hello, 12);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_anon_arg_validation) {
+    make_tmp("p7a_anon_arg_validation");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t ino = 0xCAFEBABEu;
+    /* create_anon: zero-init out_child_ino on STM_EINVAL. */
+    STM_ASSERT_ERR(stm_fs_create_anon(NULL, 1, 0644u, 0, 0, &ino),
+                   STM_EINVAL);
+    STM_ASSERT_EQ(ino, 0u);
+    ino = 0xCAFEBABEu;
+    STM_ASSERT_ERR(stm_fs_create_anon(fs, 0, 0644u, 0, 0, &ino),
+                   STM_EINVAL);
+    STM_ASSERT_EQ(ino, 0u);
+    STM_ASSERT_ERR(stm_fs_create_anon(fs, 1, 0644u, 0, 0, NULL),
+                   STM_EINVAL);
+    /* Non-S_IFREG mode → EINVAL. */
+    STM_ASSERT_ERR(stm_fs_create_anon(fs, 1, S_IFDIR | 0755u, 0, 0, &ino),
+                   STM_EINVAL);
+
+    /* linkat_anon: arg validation. */
+    uint64_t valid = 0;
+    STM_ASSERT_OK(stm_fs_create_anon(fs, 1, 0644u, 0, 0, &valid));
+
+    STM_ASSERT_ERR(stm_fs_linkat_anon(NULL, 1, valid, root,
+                                            (const uint8_t *)"n", 1),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_linkat_anon(fs, 0, valid, root,
+                                            (const uint8_t *)"n", 1),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_linkat_anon(fs, 1, 0, root,
+                                            (const uint8_t *)"n", 1),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_linkat_anon(fs, 1, valid, 0,
+                                            (const uint8_t *)"n", 1),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_linkat_anon(fs, 1, valid, root, NULL, 1),
+                   STM_EINVAL);
+    /* Non-existent ino → ENOENT. */
+    STM_ASSERT_ERR(stm_fs_linkat_anon(fs, 1, 99999u, root,
+                                            (const uint8_t *)"n", 1),
+                   STM_ENOENT);
+
+    /* unlink_anon: arg validation. */
+    STM_ASSERT_ERR(stm_fs_unlink_anon(NULL, 1, valid), STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_unlink_anon(fs, 0, valid), STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_unlink_anon(fs, 1, 0), STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_unlink_anon(fs, 1, 99999u), STM_ENOENT);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_anon_wedged_refused) {
+    make_tmp("p7a_anon_wedged");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_anon(fs, 1, 0644u, 0, 0, &ino));
+
+    stm_fs_mark_wedged(fs);
+
+    uint64_t ino2 = 0;
+    STM_ASSERT_ERR(stm_fs_create_anon(fs, 1, 0644u, 0, 0, &ino2),
+                   STM_EWEDGED);
+    STM_ASSERT_ERR(stm_fs_linkat_anon(fs, 1, ino, root,
+                                            (const uint8_t *)"n", 1),
+                   STM_EWEDGED);
+    STM_ASSERT_ERR(stm_fs_unlink_anon(fs, 1, ino), STM_EWEDGED);
+
+    (void)stm_fs_unmount(fs);
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")

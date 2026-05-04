@@ -82,12 +82,35 @@ CONSTANTS
                                    \*   way INLINE → EXTENT semantics
                                    \*   ("once extent-backed, stays
                                    \*    extent-backed").
-    BuggyInlineWriteSpills         \* TRUE → WriteInline allows
+    BuggyInlineWriteSpills,        \* TRUE → WriteInline allows
                                    \*   data_len > MaxInline without
                                    \*   transitioning. Demonstrates
                                    \*   the "data spilled past inline
                                    \*   cap but kind still claims
                                    \*   INLINE" corruption shape.
+    EnableOrphanModel,             \* TRUE → enable orphan-state shadow
+                                   \*   tracking + AllocAnon /
+                                   \*   Materialize / FreeAnon actions
+                                   \*   (P8-POSIX-7a-anon, O_TMPFILE).
+                                   \*   FALSE → existing actions
+                                   \*   UNCHANGED on ever_linked, so
+                                   \*   existing inode.cfg's 9.87M-
+                                   \*   state run is unaffected (Init
+                                   \*   sets ever_linked = TRUE for
+                                   \*   every ino, so the reformulated
+                                   \*   LinkedAllocatedHasPositiveNlink
+                                   \*   reduces to its pre-7a form).
+    BuggyAllocAnonClaimsLinked     \* TRUE → AllocAnon sets
+                                   \*   ever_linked = TRUE while
+                                   \*   leaving nlink = 0. Demonstrates
+                                   \*   the "linked file with nlink=0"
+                                   \*   shape that
+                                   \*   LinkedAllocatedHasPositiveNlink
+                                   \*   catches. Pinned at the spec
+                                   \*   level so a buggy O_TMPFILE
+                                   \*   impl that conflates linked +
+                                   \*   orphan states is provably
+                                   \*   detected.
 
 ASSUME /\ Inos # {}
        /\ MaxGen \in Nat /\ MaxGen >= 1
@@ -100,6 +123,8 @@ ASSUME /\ Inos # {}
        /\ MaxInline \in Nat /\ MaxInline <= MaxFileLen
        /\ BuggyTruncateReinlines \in BOOLEAN
        /\ BuggyInlineWriteSpills \in BOOLEAN
+       /\ EnableOrphanModel \in BOOLEAN
+       /\ BuggyAllocAnonClaimsLinked \in BOOLEAN
 
 \* Inode states.
 NEVER_USED == "never_used"
@@ -158,7 +183,7 @@ VARIABLES
                                    \*   invariant. For KIND_EXTENT the
                                    \*   spec doesn't track length —
                                    \*   the extent layer manages that.
-    ever_extent                    \* per-ino BOOLEAN (P8-POSIX-5):
+    ever_extent,                   \* per-ino BOOLEAN (P8-POSIX-5):
                                    \*   set TRUE on first
                                    \*   TransitionToExtent; reset on
                                    \*   AllocReused / cascade-free.
@@ -170,9 +195,34 @@ VARIABLES
                                    \*   ever_extent[i] = TRUE fires
                                    \*   the OneWayInlineToExtent
                                    \*   invariant.
+    ever_linked                    \* per-ino BOOLEAN (P8-POSIX-7a-anon):
+                                   \*   tracks whether THIS allocation
+                                   \*   has ever been linked to a
+                                   \*   dirent (or carries a non-zero
+                                   \*   nlink). AllocFresh / AllocReused
+                                   \*   set TRUE; AllocAnon sets FALSE
+                                   \*   (orphan state); Materialize
+                                   \*   flips FALSE → TRUE.
+                                   \*
+                                   \*   Init: TRUE for every ino — when
+                                   \*   EnableOrphanModel = FALSE the
+                                   \*   pre-existing actions don't
+                                   \*   touch ever_linked, so all
+                                   \*   ALLOCATED inos have
+                                   \*   ever_linked = TRUE and the
+                                   \*   reformulated invariant reduces
+                                   \*   to its pre-7a form. Healthy
+                                   \*   behavior under EnableOrphanModel
+                                   \*   = TRUE: AllocFresh / AllocReused
+                                   \*   explicitly set TRUE; AllocAnon
+                                   \*   sets FALSE; Materialize sets
+                                   \*   TRUE. Cascade-free + FreeAnon
+                                   \*   leave ever_linked unchanged
+                                   \*   (FREED inos don't use it; reset
+                                   \*   happens at the next allocation).
 
 vars == <<state, gen, nlink, history, alloc_event_counter,
-          data_kind, data_len, ever_extent>>
+          data_kind, data_len, ever_extent, ever_linked>>
 
 \* --------------------------------------------------------------------------
 \* Initial state — all inos NEVER_USED, all gen=0, empty history.
@@ -187,6 +237,7 @@ Init ==
     /\ data_kind           = [i \in Inos |-> KIND_NONE]
     /\ data_len            = [i \in Inos |-> 0]
     /\ ever_extent         = [i \in Inos |-> FALSE]
+    /\ ever_linked         = [i \in Inos |-> TRUE]
 
 \* --------------------------------------------------------------------------
 \* Helpers.
@@ -226,6 +277,11 @@ AllocFresh(i) ==
     /\ history'             = [history EXCEPT
                                   ![i] = history[i] \cup
                                           {<<0, alloc_event_counter + 1>>}]
+    \* P8-POSIX-7a-anon: AllocFresh's healthy contract is "create
+    \* an inode that's already linked to a dirent" — set ever_linked
+    \* := TRUE. AllocReused does the same; only AllocAnon leaves
+    \* ever_linked = FALSE.
+    /\ ever_linked' = [ever_linked EXCEPT ![i] = TRUE]
     /\ \/ /\ EnableInlineDataModel
           /\ data_kind'   = [data_kind EXCEPT ![i] = KIND_INLINE]
           /\ data_len'    = [data_len EXCEPT ![i] = 0]
@@ -256,6 +312,11 @@ AllocReused(i) ==
                                       ![i] = history[i] \cup
                                               {<<new_gen,
                                                  alloc_event_counter + 1>>}]
+        \* P8-POSIX-7a-anon: AllocReused's healthy contract matches
+        \* AllocFresh — the new allocation IS linked. ever_linked must
+        \* be reset to TRUE here to clear any orphan-state remnant
+        \* from a prior AllocAnon → FreeAnon cycle on this slot.
+        /\ ever_linked' = [ever_linked EXCEPT ![i] = TRUE]
         /\ \/ /\ EnableInlineDataModel
               /\ data_kind'   = [data_kind EXCEPT ![i] = KIND_INLINE]
               /\ data_len'    = [data_len EXCEPT ![i] = 0]
@@ -279,7 +340,7 @@ Link(i) ==
     /\ nlink[i] < MaxNlink
     /\ nlink' = [nlink EXCEPT ![i] = @ + 1]
     /\ UNCHANGED <<state, gen, history, alloc_event_counter,
-                    data_kind, data_len, ever_extent>>
+                    data_kind, data_len, ever_extent, ever_linked>>
 
 \* Unlink: ALLOCATED ino with nlink >= 1 gets nlink - 1. If healthy
 \* and nlink reaches 0, atomically transitions to FREED (cascade-
@@ -311,7 +372,12 @@ Unlink(i) ==
                     /\ UNCHANGED <<data_kind, data_len, ever_extent>>
            \/ /\ ~EnableInlineDataModel
               /\ UNCHANGED <<data_kind, data_len, ever_extent>>
-        /\ UNCHANGED <<gen, history, alloc_event_counter>>
+        \* P8-POSIX-7a-anon: Unlink preserves ever_linked. The inode's
+        \* "ever-linked" status doesn't reset until a fresh AllocFresh /
+        \* AllocReused / AllocAnon. Cascade-free leaves the slot in
+        \* FREED state with ever_linked still TRUE, but FREED inos
+        \* don't enter the LinkedAllocatedHasPositiveNlink antecedent.
+        /\ UNCHANGED <<gen, history, alloc_event_counter, ever_linked>>
 
 \* --------------------------------------------------------------------------
 \* P8-POSIX-5 — inline data layout actions.
@@ -357,7 +423,7 @@ WriteInline(i, new_len) ==
        \/ BuggyInlineWriteSpills
     /\ data_len' = [data_len EXCEPT ![i] = new_len]
     /\ UNCHANGED <<state, gen, nlink, history, alloc_event_counter,
-                    data_kind, ever_extent>>
+                    data_kind, ever_extent, ever_linked>>
 
 \* TransitionToExtent: a write that grows an INLINE inode past
 \* MaxInline triggers the cutover. ARCH §11.3.3 step:
@@ -376,7 +442,8 @@ TransitionToExtent(i) ==
     /\ data_kind'   = [data_kind EXCEPT ![i] = KIND_EXTENT]
     /\ data_len'    = [data_len EXCEPT ![i] = 0]
     /\ ever_extent' = [ever_extent EXCEPT ![i] = TRUE]
-    /\ UNCHANGED <<state, gen, nlink, history, alloc_event_counter>>
+    /\ UNCHANGED <<state, gen, nlink, history, alloc_event_counter,
+                    ever_linked>>
 
 \* WriteExtent: a write to an already-EXTENT inode is a no-op at
 \* the spec level (the extent layer's invariants are pinned by
@@ -396,7 +463,7 @@ TruncateInline(i, new_len) ==
     /\ new_len <= data_len[i]   \* shrinking
     /\ data_len' = [data_len EXCEPT ![i] = new_len]
     /\ UNCHANGED <<state, gen, nlink, history, alloc_event_counter,
-                    data_kind, ever_extent>>
+                    data_kind, ever_extent, ever_linked>>
 
 \* TruncateExtent: truncate an EXTENT inode to `new_len`. Per
 \* ARCH §11.3.3: "Once extent-backed, stays extent-backed" — even
@@ -417,7 +484,108 @@ TruncateExtent(i, new_len) ==
           /\ data_kind' = [data_kind EXCEPT ![i] = KIND_INLINE]
           /\ data_len'  = [data_len EXCEPT ![i] = new_len]
           /\ UNCHANGED <<state, gen, nlink, history, alloc_event_counter,
-                          ever_extent>>   \* ever_extent stays TRUE (the bug)
+                          ever_extent, ever_linked>>   \* ever_extent stays TRUE (the bug)
+
+\* --------------------------------------------------------------------------
+\* P8-POSIX-7a-anon — orphan inode + Materialize.
+\*
+\* Linux O_TMPFILE creates a regular-file inode with no dirent
+\* (nlink=0, "anonymous"). The inode lives until either materialized
+\* via linkat(2) (orphan → linked, nlink 0→1, ever_linked F→T) or
+\* explicitly freed via close-with-no-link (orphan → freed). The
+\* spec models all three transitions as separate actions:
+\*
+\*   - AllocAnon:    NEVER_USED / FREED → ALLOCATED (nlink=0,
+\*                   ever_linked=FALSE). Matches stm_fs_create_anon.
+\*   - Materialize:  ALLOCATED + nlink=0 + ~ever_linked
+\*                   → ALLOCATED + nlink=1 + ever_linked=TRUE.
+\*                   Matches stm_fs_linkat_anon.
+\*   - FreeAnon:     ALLOCATED + nlink=0 + ~ever_linked → FREED.
+\*                   Matches stm_fs_unlink_anon.
+\*
+\* The orphan state is the ONLY way an ALLOCATED inode can have
+\* nlink=0 (post-AllocAnon, pre-Materialize). Once materialized,
+\* the inode behaves identically to one created via AllocFresh +
+\* never goes back to orphan. The relaxed
+\* LinkedAllocatedHasPositiveNlink invariant pins this:
+\*   ALLOCATED + ever_linked → nlink ≥ 1
+\* and the new OrphanHasZeroNlink invariant pins the dual:
+\*   ALLOCATED + ~ever_linked → nlink = 0
+\*
+\* All three actions gated on EnableOrphanModel; FALSE collapses
+\* the spec to its pre-7a-anon shape.
+\* --------------------------------------------------------------------------
+
+\* AllocAnon: pick a NEVER_USED or FREED ino, mark ALLOCATED with
+\* nlink=0 + ever_linked=FALSE. Models stm_fs_create_anon
+\* (O_TMPFILE-equivalent).
+\*
+\* Healthy: nlink := 0, ever_linked := FALSE.
+\* BuggyAllocAnonClaimsLinked: ever_linked := TRUE (orphan misclaimed
+\* as linked; combined with nlink=0 fires
+\* LinkedAllocatedHasPositiveNlink).
+AllocAnon(i) ==
+    /\ EnableOrphanModel
+    /\ \/ state[i] = NEVER_USED
+       \/ state[i] = FREED
+    /\ LET new_gen ==
+            IF state[i] = NEVER_USED THEN 0
+            ELSE gen[i] + 1
+       IN
+        /\ new_gen <= MaxGen
+        /\ state'               = [state EXCEPT ![i] = ALLOCATED]
+        /\ gen'                 = [gen   EXCEPT ![i] = new_gen]
+        /\ nlink'               = [nlink EXCEPT ![i] = 0]
+        /\ alloc_event_counter' = alloc_event_counter + 1
+        /\ history'             = [history EXCEPT
+                                      ![i] = history[i] \cup
+                                              {<<new_gen,
+                                                 alloc_event_counter + 1>>}]
+        /\ ever_linked' = IF BuggyAllocAnonClaimsLinked
+                          THEN [ever_linked EXCEPT ![i] = TRUE]
+                          ELSE [ever_linked EXCEPT ![i] = FALSE]
+        /\ \/ /\ EnableInlineDataModel
+              /\ data_kind'   = [data_kind EXCEPT ![i] = KIND_INLINE]
+              /\ data_len'    = [data_len EXCEPT ![i] = 0]
+              /\ ever_extent' = [ever_extent EXCEPT ![i] = FALSE]
+           \/ /\ ~EnableInlineDataModel
+              /\ UNCHANGED <<data_kind, data_len, ever_extent>>
+
+\* Materialize: orphan → linked. ALLOCATED + nlink=0 + ~ever_linked
+\* transitions to ALLOCATED + nlink=1 + ever_linked=TRUE. Models
+\* stm_fs_linkat_anon installing the first dirent for an O_TMPFILE
+\* inode + bumping nlink. gen is preserved (the (ino, gen) tuple
+\* identity is stable across materialization — POSIX file_handle
+\* semantics).
+Materialize(i) ==
+    /\ EnableOrphanModel
+    /\ state[i] = ALLOCATED
+    /\ nlink[i] = 0
+    /\ ~ever_linked[i]
+    /\ nlink'       = [nlink       EXCEPT ![i] = 1]
+    /\ ever_linked' = [ever_linked EXCEPT ![i] = TRUE]
+    /\ UNCHANGED <<state, gen, history, alloc_event_counter,
+                    data_kind, data_len, ever_extent>>
+
+\* FreeAnon: orphan → freed. Explicit cleanup of an unmaterialized
+\* O_TMPFILE inode (e.g., process closed the fd without linking).
+\* ALLOCATED + nlink=0 + ~ever_linked → FREED. data state cleared
+\* (mirrors cascade-free's data-clear branch for the EnableInlineDataModel
+\* case). gen preserved so the next AllocReused / AllocAnon at this
+\* ino bumps it.
+FreeAnon(i) ==
+    /\ EnableOrphanModel
+    /\ state[i] = ALLOCATED
+    /\ nlink[i] = 0
+    /\ ~ever_linked[i]
+    /\ state' = [state EXCEPT ![i] = FREED]
+    /\ \/ /\ EnableInlineDataModel
+          /\ data_kind'   = [data_kind EXCEPT ![i] = KIND_NONE]
+          /\ data_len'    = [data_len EXCEPT ![i] = 0]
+          /\ ever_extent' = [ever_extent EXCEPT ![i] = FALSE]
+       \/ /\ ~EnableInlineDataModel
+          /\ UNCHANGED <<data_kind, data_len, ever_extent>>
+    /\ UNCHANGED <<gen, nlink, history, alloc_event_counter, ever_linked>>
 
 \* --------------------------------------------------------------------------
 \* Next.
@@ -434,6 +602,10 @@ Next ==
           \/ \E i \in Inos : WriteExtent(i)
           \/ \E i \in Inos, n \in 0..MaxFileLen : TruncateInline(i, n)
           \/ \E i \in Inos, n \in 0..MaxFileLen : TruncateExtent(i, n)
+    \/ /\ EnableOrphanModel
+       /\ \/ \E i \in Inos : AllocAnon(i)
+          \/ \E i \in Inos : Materialize(i)
+          \/ \E i \in Inos : FreeAnon(i)
 
 Spec == Init /\ [][Next]_vars
 
@@ -451,6 +623,7 @@ TypeOK ==
     /\ data_kind \in [Inos -> {KIND_NONE, KIND_INLINE, KIND_EXTENT}]
     /\ data_len \in [Inos -> 0..MaxFileLen]
     /\ ever_extent \in [Inos -> BOOLEAN]
+    /\ ever_linked \in [Inos -> BOOLEAN]
 
 \* HEADLINE INVARIANT — (ino, gen) uniqueness across all time.
 \*
@@ -503,9 +676,35 @@ NoTwoAllocatedSameIno ==
 \* (R70 P3-3) at the spec level. BuggyUnlinkLeavesZeroNlink fires
 \* this directly: post-decrement to 0, state stays ALLOCATED while
 \* nlink is now 0.
+\*
+\* P8-POSIX-7a-anon refinement: when EnableOrphanModel = TRUE the
+\* orphan state (ALLOCATED + nlink=0 + ~ever_linked) is a legitimate
+\* intermediate. The reformulated invariant guards only the LINKED
+\* portion of the ALLOCATED state. Init sets ever_linked = TRUE for
+\* every ino, and pre-7a-anon configs (EnableOrphanModel=FALSE) leave
+\* ever_linked at TRUE for every ALLOCATED ino — so the reformulated
+\* form reduces to its pre-7a-anon shape (ALLOCATED ⇒ nlink ≥ 1).
+\* BuggyUnlinkLeavesZeroNlink still fires (post-decrement: ALLOCATED +
+\* nlink=0 + ever_linked=TRUE — antecedent matches, consequent fails).
+\* BuggyAllocAnonClaimsLinked fires this too (AllocAnon sets
+\* ever_linked=TRUE while nlink stays 0).
 LinkedAllocatedHasPositiveNlink ==
     \A i \in Inos :
-        (state[i] = ALLOCATED) => (nlink[i] >= 1)
+        (state[i] = ALLOCATED /\ ever_linked[i]) => (nlink[i] >= 1)
+
+\* P8-POSIX-7a-anon: ORPHAN HAS ZERO NLINK. The dual of
+\* LinkedAllocatedHasPositiveNlink — orphan inodes (post-AllocAnon,
+\* pre-Materialize) MUST have nlink = 0. A buggy AllocAnon that sets
+\* nlink=1 + ever_linked=FALSE (or any path that produces ALLOCATED +
+\* ~ever_linked + nlink>0) fires this invariant.
+\*
+\* Vacuously TRUE under EnableOrphanModel = FALSE because Init sets
+\* ever_linked = TRUE everywhere + pre-existing actions don't reset
+\* it; the antecedent (ALLOCATED + ~ever_linked) never holds.
+OrphanHasZeroNlink ==
+    EnableOrphanModel =>
+        \A i \in Inos :
+            (state[i] = ALLOCATED /\ ~ever_linked[i]) => (nlink[i] = 0)
 
 \* P8-POSIX-3: FREED ⇒ nlink = 0. Combined with the above, gives
 \* the full FREED ⇔ nlink=0 / ALLOCATED ⇔ nlink≥1 biconditional.
@@ -603,5 +802,6 @@ Invariants ==
     /\ DataKindMatchesState
     /\ InlineLenBounded
     /\ OneWayInlineToExtent
+    /\ OrphanHasZeroNlink
 
 =============================================================================
