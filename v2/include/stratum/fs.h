@@ -1753,6 +1753,77 @@ stm_status stm_fs_promote_policy_pass_all(
         stm_fs_promote_policy_pass_all_stats *out_stats);
 
 /* ========================================================================= */
+/* P8-POSIX-7e: posix_fadvise(2) pass-through.                                */
+/* ========================================================================= */
+
+/* Linux POSIX_FADV_* hints. Numerically identical to Linux's so a 9P/FUSE
+ * binding can pass through the kernel-supplied advice value verbatim
+ * (also matches the values fadvise(2) accepts on glibc/musl Linux). */
+#define STM_FS_FADV_NORMAL       0u
+#define STM_FS_FADV_RANDOM       1u
+#define STM_FS_FADV_SEQUENTIAL   2u
+#define STM_FS_FADV_WILLNEED     3u
+#define STM_FS_FADV_DONTNEED     4u
+#define STM_FS_FADV_NOREUSE      5u
+
+/*
+ * stm_fs_fadvise — POSIX `posix_fadvise(2)` advisory hint pass-through.
+ *
+ * MVP scope: the hint is interpreted at INODE granularity — `off` and
+ * `len` are accepted (for forward-compat with full-range fadvise) but
+ * IGNORED. The hint applies to the whole file. A future per-extent
+ * shape would need new sync-layer primitives; today's tiering machinery
+ * (`stm_fs_promote_to_hot` / `stm_fs_migrate_to_cold`) is per-ino.
+ *
+ * Advice mapping:
+ *   - `STM_FS_FADV_NORMAL` / `_SEQUENTIAL` / `_RANDOM` / `_NOREUSE` —
+ *     no-op (stratum has no userspace page cache to bias). Returns
+ *     STM_OK after the existence check.
+ *   - `STM_FS_FADV_WILLNEED` — best-effort `stm_fs_promote_to_hot`.
+ *     Inner failures (STM_ENOENT for all-HOT inos, STM_EROFS on RO
+ *     mounts, STM_EBADTAG / STM_EIO / STM_ENOSPC on per-extent
+ *     failures) are SWALLOWED — `posix_fadvise(2)` is advisory and
+ *     callers must not depend on the hint being honored.
+ *   - `STM_FS_FADV_DONTNEED` — best-effort `stm_fs_migrate_to_cold`.
+ *     Same swallow semantics as WILLNEED.
+ *
+ * Refusals (the only paths that DO return non-OK):
+ *   - NULL fs (STM_EINVAL).
+ *   - dataset_id == 0 OR ino == 0 (STM_EINVAL).
+ *   - `advice` not one of the STM_FS_FADV_* constants (STM_EINVAL —
+ *     forward-compat lock; future extensions will get distinct values).
+ *   - Wedged (STM_EWEDGED) — checked under fs->lock. Wedged FSes
+ *     refuse every API uniformly per Phase 4 design.
+ *
+ * No existence check: `posix_fadvise(2)` does not validate file
+ * contents, and stratum's legacy direct-extent files (created via
+ * `stm_fs_write` without `stm_fs_create_file`) have no inode-index
+ * entry but are valid fadvise targets — the inner promote/migrate
+ * primitives accept them. The delegate's own ino-not-found path
+ * surfaces inside its return code, which fadvise then swallows.
+ *
+ * RO mounts: the wedged check passes (FS_GUARD_READ allows RO);
+ * WILLNEED/DONTNEED's swallow converts the inner STM_EROFS to
+ * STM_OK transparently. NORMAL/SEQ/RAND/NOREUSE always return STM_OK
+ * on RO. This mirrors Linux behavior — `posix_fadvise(2)` does not
+ * fail on read-only file systems.
+ *
+ * Lock posture: takes fs->lock + FS_GUARD_READ for the wedged
+ * check, drops it BEFORE delegating to `stm_fs_promote_to_hot` /
+ * `stm_fs_migrate_to_cold` (which take fs->lock + FS_GUARD_WRITE
+ * themselves — held nested would deadlock).
+ *
+ * Composes over P7-CAS-7/11 + P7-CAS-2 — no new spec, no new
+ * state-machine semantics. POSIX `posix_fadvise(2)` advisory contract
+ * matches today's pass-through.
+ */
+STM_MUST_USE
+stm_status stm_fs_fadvise(stm_fs *fs,
+                                  uint64_t dataset_id, uint64_t ino,
+                                  uint64_t off, uint64_t len,
+                                  uint32_t advice);
+
+/* ========================================================================= */
 /* Inspection + control.                                                      */
 /* ========================================================================= */
 

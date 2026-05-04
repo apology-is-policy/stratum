@@ -4036,6 +4036,77 @@ stm_status stm_fs_set_dataset_pool_default(stm_fs *fs, stm_property prop,
 }
 
 /* ========================================================================= */
+/* P8-POSIX-7e: posix_fadvise(2) pass-through.                                */
+/* ========================================================================= */
+
+/* Drift guard between the public STM_FS_FADV_* constants and Linux's
+ * POSIX_FADV_* values. They are numerically identical so a binding
+ * layer (9P/FUSE) can pass the kernel's advice through untranslated.
+ * See `man 2 posix_fadvise` — values are stable since Linux 2.5.60. */
+_Static_assert(STM_FS_FADV_NORMAL     == 0u, "POSIX_FADV_NORMAL drift");
+_Static_assert(STM_FS_FADV_RANDOM     == 1u, "POSIX_FADV_RANDOM drift");
+_Static_assert(STM_FS_FADV_SEQUENTIAL == 2u, "POSIX_FADV_SEQUENTIAL drift");
+_Static_assert(STM_FS_FADV_WILLNEED   == 3u, "POSIX_FADV_WILLNEED drift");
+_Static_assert(STM_FS_FADV_DONTNEED   == 4u, "POSIX_FADV_DONTNEED drift");
+_Static_assert(STM_FS_FADV_NOREUSE    == 5u, "POSIX_FADV_NOREUSE drift");
+
+stm_status stm_fs_fadvise(stm_fs *fs,
+                                  uint64_t dataset_id, uint64_t ino,
+                                  uint64_t off, uint64_t len,
+                                  uint32_t advice)
+{
+    (void)off;
+    (void)len;
+
+    if (!fs) return STM_EINVAL;
+    if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+
+    switch (advice) {
+    case STM_FS_FADV_NORMAL:
+    case STM_FS_FADV_RANDOM:
+    case STM_FS_FADV_SEQUENTIAL:
+    case STM_FS_FADV_WILLNEED:
+    case STM_FS_FADV_DONTNEED:
+    case STM_FS_FADV_NOREUSE:
+        break;
+    default:
+        return STM_EINVAL;
+    }
+
+    /* Wedged check via FS_GUARD_READ. RO mounts pass — the
+     * WILLNEED/DONTNEED delegate's own FS_GUARD_WRITE will refuse
+     * with STM_EROFS, which we then SWALLOW (advisory). No
+     * existence check: posix_fadvise(2) doesn't validate file
+     * contents, and stratum's legacy direct-extent files have no
+     * inode-index entry but are valid fadvise targets (the inner
+     * promote/migrate primitives accept them). The delegate's
+     * own ino-not-found path is also swallowed. */
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_READ(fs);
+    pthread_mutex_unlock(&fs->lock);
+
+    /* Drop fs->lock BEFORE delegating — stm_fs_promote_to_hot /
+     * stm_fs_migrate_to_cold take fs->lock + FS_GUARD_WRITE themselves;
+     * holding it nested would deadlock. */
+    switch (advice) {
+    case STM_FS_FADV_WILLNEED: {
+        stm_status rc = stm_fs_promote_to_hot(fs, dataset_id, ino);
+        (void)rc;  /* advisory — swallow per POSIX posix_fadvise(2) */
+        return STM_OK;
+    }
+    case STM_FS_FADV_DONTNEED: {
+        stm_status rc = stm_fs_migrate_to_cold(fs, dataset_id, ino);
+        (void)rc;  /* advisory — swallow */
+        return STM_OK;
+    }
+    default:
+        /* NORMAL / RANDOM / SEQUENTIAL / NOREUSE — no-op. Stratum has
+         * no userspace page cache to bias by access pattern. */
+        return STM_OK;
+    }
+}
+
+/* ========================================================================= */
 /* Inspection + control.                                                      */
 /* ========================================================================= */
 

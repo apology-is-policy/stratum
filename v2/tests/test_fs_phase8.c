@@ -32,13 +32,16 @@
  *   P8-POSIX-10b  fs_p10b_reflink_stamps_dst_mtime_ctime_*    (~5300)
  *   P8-POSIX-7a-anon   fs_p7a_anon_*                          (~5670)
  *   P8-POSIX-9b   fs_p9b_rename_exchange_*                    (~6020)
+ *   P8-POSIX-7e   fs_p7e_fadvise_*                            (~6340)
  */
 #include "tharness.h"
 #include "test_fs_common.h"
 
 #include <sys/stat.h>
 
+#include <stratum/cas.h>
 #include <stratum/dirent.h>
+#include <stratum/extent.h>
 #include <stratum/fs.h>
 #include <stratum/fs_testing.h>
 #include <stratum/inode.h>
@@ -6328,6 +6331,315 @@ STM_TEST(fs_p9b_r86_p3_3_rename_exchange_hardlinks_to_same_inode) {
     STM_ASSERT_EQ(found, f);
     STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v));
     STM_ASSERT_EQ(stm_load_le32(v.si_nlink), 2u);   /* nlink preserved */
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+/* ========================================================================= */
+/* P8-POSIX-7e: posix_fadvise(2) pass-through.                                */
+/* ========================================================================= */
+
+/* Helper: write a 4 KiB block to (1, ino) at off=0 with a deterministic
+ * pattern. Matches the pattern used by P7-CAS migrate tests. */
+static void p7e_write_one_block(stm_fs *fs, uint64_t ino) {
+    uint8_t plain[4096];
+    for (size_t i = 0; i < sizeof plain; i++)
+        plain[i] = (uint8_t)((i * 11u + ino) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, ino, 0, plain, sizeof plain));
+}
+
+STM_TEST(fs_p7e_fadvise_normal_seq_rand_noreuse_are_noops) {
+    /* The four pure-hint advice values just check existence + return
+     * STM_OK. They don't touch the tier; an ino that started HOT
+     * stays HOT regardless of how often we call them. */
+    make_tmp("p7e_pure_hints");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    p7e_write_one_block(fs, 1);
+
+    STM_ASSERT_OK(stm_fs_fadvise(fs, 1, 1, 0, 0, STM_FS_FADV_NORMAL));
+    STM_ASSERT_OK(stm_fs_fadvise(fs, 1, 1, 0, 0, STM_FS_FADV_SEQUENTIAL));
+    STM_ASSERT_OK(stm_fs_fadvise(fs, 1, 1, 0, 0, STM_FS_FADV_RANDOM));
+    STM_ASSERT_OK(stm_fs_fadvise(fs, 1, 1, 0, 0, STM_FS_FADV_NOREUSE));
+
+    /* Tier unchanged: extent is HOT. */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record rec;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &rec));
+    STM_ASSERT_EQ((int)rec.kind, (int)STM_EXTENT_KIND_HOT);
+
+    /* CAS index untouched. */
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    size_t n = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7e_fadvise_dontneed_migrates_hot_to_cold) {
+    /* DONTNEED on a HOT-bearing ino delegates to migrate_to_cold —
+     * post-call, the extent is COLD + the CAS index has one chunk. */
+    make_tmp("p7e_dontneed_migrates");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    p7e_write_one_block(fs, 1);
+
+    STM_ASSERT_OK(stm_fs_fadvise(fs, 1, 1, 0, 0, STM_FS_FADV_DONTNEED));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record rec;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &rec));
+    STM_ASSERT_EQ((int)rec.kind, (int)STM_EXTENT_KIND_COLD);
+
+    stm_cas_index *cas = stm_sync_cas_index(sync);
+    size_t n = 0;
+    STM_ASSERT_OK(stm_cas_count(cas, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7e_fadvise_willneed_promotes_cold_to_hot) {
+    /* WILLNEED on a COLD-bearing ino delegates to promote_to_hot —
+     * post-call, the extent is HOT + the CAS chunk's refcount has
+     * dropped to zero so the next commit's auto-GC reclaims it. */
+    make_tmp("p7e_willneed_promotes");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    p7e_write_one_block(fs, 1);
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record rec;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &rec));
+    STM_ASSERT_EQ((int)rec.kind, (int)STM_EXTENT_KIND_COLD);
+
+    STM_ASSERT_OK(stm_fs_fadvise(fs, 1, 1, 0, 0, STM_FS_FADV_WILLNEED));
+
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &rec));
+    STM_ASSERT_EQ((int)rec.kind, (int)STM_EXTENT_KIND_HOT);
+
+    /* Plaintext readback is identical post-promote. */
+    uint8_t buf[4096];
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, 1, 0, buf, sizeof buf, &got));
+    STM_ASSERT_EQ(got, (size_t)4096);
+    for (size_t i = 0; i < sizeof buf; i++)
+        STM_ASSERT_EQ(buf[i], (uint8_t)((i * 11u + 1u) & 0xFFu));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7e_fadvise_willneed_on_all_hot_is_noop) {
+    /* WILLNEED on an ino with no COLD extents: the inner promote
+     * returns STM_ENOENT — fadvise SWALLOWS it (advisory) and returns
+     * STM_OK. The tier is unchanged. */
+    make_tmp("p7e_willneed_all_hot");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    p7e_write_one_block(fs, 1);
+
+    STM_ASSERT_OK(stm_fs_fadvise(fs, 1, 1, 0, 0, STM_FS_FADV_WILLNEED));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record rec;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &rec));
+    STM_ASSERT_EQ((int)rec.kind, (int)STM_EXTENT_KIND_HOT);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7e_fadvise_dontneed_on_all_cold_is_noop) {
+    /* DONTNEED on an already-all-COLD ino: the inner migrate is a
+     * silent no-op success per its contract; fadvise returns STM_OK. */
+    make_tmp("p7e_dontneed_all_cold");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    p7e_write_one_block(fs, 1);
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, 1));
+
+    STM_ASSERT_OK(stm_fs_fadvise(fs, 1, 1, 0, 0, STM_FS_FADV_DONTNEED));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record rec;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &rec));
+    STM_ASSERT_EQ((int)rec.kind, (int)STM_EXTENT_KIND_COLD);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7e_fadvise_off_and_len_are_ignored) {
+    /* MVP per-ino granularity: any (off, len) caller passes is
+     * accepted but ignored. Probe with garbage values + verify the
+     * call still routes to migrate_to_cold (DONTNEED) on the WHOLE
+     * file. */
+    make_tmp("p7e_off_len_ignored");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    p7e_write_one_block(fs, 1);
+
+    /* Wildly out-of-range off/len — fadvise still treats this as a
+     * whole-file hint. */
+    STM_ASSERT_OK(stm_fs_fadvise(fs, 1, 1,
+                                       UINT64_MAX - 16, UINT64_MAX,
+                                       STM_FS_FADV_DONTNEED));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record rec;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &rec));
+    STM_ASSERT_EQ((int)rec.kind, (int)STM_EXTENT_KIND_COLD);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7e_fadvise_arg_validation) {
+    make_tmp("p7e_arg_validation");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    p7e_write_one_block(fs, 1);
+
+    STM_ASSERT_ERR(stm_fs_fadvise(NULL, 1, 1, 0, 0, STM_FS_FADV_NORMAL),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_fadvise(fs,   0, 1, 0, 0, STM_FS_FADV_NORMAL),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_fadvise(fs,   1, 0, 0, 0, STM_FS_FADV_NORMAL),
+                   STM_EINVAL);
+    /* Unknown advice — every value beyond the 6 known constants
+     * refuses with STM_EINVAL (forward-compat lock — future kernels
+     * may add new POSIX_FADV_* but Stratum must surface the unknown
+     * advice rather than silently accept it as NORMAL). */
+    STM_ASSERT_ERR(stm_fs_fadvise(fs, 1, 1, 0, 0, 6u),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_fadvise(fs, 1, 1, 0, 0, 99u),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_fadvise(fs, 1, 1, 0, 0, UINT32_MAX),
+                   STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7e_fadvise_missing_ino_is_silent_noop) {
+    /* posix_fadvise(2) doesn't validate the underlying object —
+     * fadvise on an unallocated ino is a SILENT no-op (STM_OK).
+     * The inner promote/migrate's STM_ENOENT is swallowed per
+     * advisory contract. */
+    make_tmp("p7e_missing_ino");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* No write to ino 99 — every advice variant still returns OK. */
+    STM_ASSERT_OK(stm_fs_fadvise(fs, 1, 99, 0, 0, STM_FS_FADV_NORMAL));
+    STM_ASSERT_OK(stm_fs_fadvise(fs, 1, 99, 0, 0, STM_FS_FADV_WILLNEED));
+    STM_ASSERT_OK(stm_fs_fadvise(fs, 1, 99, 0, 0, STM_FS_FADV_DONTNEED));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7e_fadvise_wedged_refused) {
+    /* Wedged FS refuses every fadvise call with STM_EWEDGED — the
+     * existence-check guard fires before any branching. */
+    make_tmp("p7e_wedged");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    p7e_write_one_block(fs, 1);
+    stm_fs_mark_wedged(fs);
+
+    STM_ASSERT_ERR(stm_fs_fadvise(fs, 1, 1, 0, 0, STM_FS_FADV_NORMAL),
+                   STM_EWEDGED);
+    STM_ASSERT_ERR(stm_fs_fadvise(fs, 1, 1, 0, 0, STM_FS_FADV_WILLNEED),
+                   STM_EWEDGED);
+    STM_ASSERT_ERR(stm_fs_fadvise(fs, 1, 1, 0, 0, STM_FS_FADV_DONTNEED),
+                   STM_EWEDGED);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7e_fadvise_ro_mount_swallows_willneed_dontneed) {
+    /* RO mount: the existence check passes (FS_GUARD_READ allows RO),
+     * NORMAL/SEQ/RAND/NOREUSE return STM_OK directly, and
+     * WILLNEED/DONTNEED's inner-primitive STM_EROFS is SWALLOWED so
+     * fadvise returns STM_OK to the caller. POSIX `posix_fadvise(2)`
+     * does not fail on RO file systems — advisory hints are dropped
+     * silently. */
+    make_tmp("p7e_ro_swallows");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    p7e_write_one_block(fs, 1);
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    /* Remount RO. */
+    stm_fs_mount_opts ro_mopts = mopts;
+    ro_mopts.read_only = true;
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &ro_mopts, &fs));
+
+    STM_ASSERT_OK(stm_fs_fadvise(fs, 1, 1, 0, 0, STM_FS_FADV_NORMAL));
+    STM_ASSERT_OK(stm_fs_fadvise(fs, 1, 1, 0, 0, STM_FS_FADV_WILLNEED));
+    STM_ASSERT_OK(stm_fs_fadvise(fs, 1, 1, 0, 0, STM_FS_FADV_DONTNEED));
+
+    /* Tier unchanged — the advisory hint was silently dropped on RO. */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record rec;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, 1, 0, &rec));
+    STM_ASSERT_EQ((int)rec.kind, (int)STM_EXTENT_KIND_HOT);
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path); unlink(g_key_path);
