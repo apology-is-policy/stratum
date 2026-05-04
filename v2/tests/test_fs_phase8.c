@@ -6550,6 +6550,42 @@ STM_TEST(fs_p7d_lock_wedged_refused) {
     unlink(g_tmp_path); unlink(g_key_path);
 }
 
+STM_TEST(fs_p7d_r90_p3_5_lock_no_persistence_across_mount) {
+    /* R90 P3-5 regression: locks are RAM-only — they MUST NOT
+     * persist across unmount + remount. A regression that
+     * accidentally persisted via btree_store (analog of
+     * dirent/xattr) would silently break the close-releases
+     * contract. */
+    make_tmp("p7d_r90_p3_5_no_persist");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    STM_ASSERT_OK(stm_fs_lock(fs, 1, 100, 1, STM_FS_LOCK_EXCLUSIVE, 0, 100));
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_lock_count(fs, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Fresh mount: no locks. */
+    STM_ASSERT_OK(stm_fs_lock_count(fs, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    /* Previously-conflicting range now acquirable by a different
+     * owner — the prior lock didn't survive. */
+    STM_ASSERT_OK(stm_fs_lock(fs, 1, 100, 99, STM_FS_LOCK_EXCLUSIVE, 0, 100));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
 STM_TEST(fs_p7d_lock_ro_mount_allowed) {
     /* Advisory locks on RO mounts are allowed (RAM-only state, doesn't
      * mutate on-disk; matches Linux behavior). */

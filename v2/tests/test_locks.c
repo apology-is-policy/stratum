@@ -107,6 +107,37 @@ STM_TEST(locks_acquire_different_inos_admitted) {
     stm_lock_table_close(t);
 }
 
+STM_TEST(locks_acquire_different_datasets_isolated) {
+    /* R90 P3-3 regression: same (ino, range, type) across
+     * different datasets MUST NOT conflict. The conflict check's
+     * `dataset_id` short-circuit is critical for correctness — a
+     * regression dropping the check would silently break every
+     * multi-tenant deployment. */
+    stm_lock_table *t = stm_lock_table_create();
+    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 1, STM_LOCK_EXCLUSIVE, 0, 100));
+    STM_ASSERT_OK(stm_lock_acquire(t, 2, 100, 2, STM_LOCK_EXCLUSIVE, 0, 100));
+    /* Same owner across datasets also non-conflicting. */
+    STM_ASSERT_OK(stm_lock_acquire(t, 3, 100, 1, STM_LOCK_EXCLUSIVE, 0, 100));
+    size_t n = 0;
+    STM_ASSERT_OK(stm_lock_count(t, &n));
+    STM_ASSERT_EQ(n, (size_t)3);
+    stm_lock_table_close(t);
+}
+
+STM_TEST(locks_degenerate_zero_len_at_uint64_max_refused) {
+    /* R90 P3-8 regression: len=0 with off=UINT64_MAX would
+     * normalize to [UINT64_MAX, UINT64_MAX) — empty range that
+     * Linux fcntl refuses with EINVAL. Stratum mirrors. */
+    stm_lock_table *t = stm_lock_table_create();
+    STM_ASSERT_ERR(stm_lock_acquire(t, 1, 100, 1, STM_LOCK_SHARED,
+                                          UINT64_MAX, 0),
+                   STM_EINVAL);
+    /* But len=0 at any other off (means "to EOF") is admitted. */
+    STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 1, STM_LOCK_SHARED,
+                                         0, 0));
+    stm_lock_table_close(t);
+}
+
 STM_TEST(locks_release_exact_match) {
     stm_lock_table *t = stm_lock_table_create();
     STM_ASSERT_OK(stm_lock_acquire(t, 1, 100, 1, STM_LOCK_SHARED, 0, 100));

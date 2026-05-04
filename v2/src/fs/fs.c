@@ -4411,6 +4411,17 @@ _Static_assert(STM_FS_LOCK_SHARED    == STM_LOCK_SHARED,
 _Static_assert(STM_FS_LOCK_EXCLUSIVE == STM_LOCK_EXCLUSIVE,
                "STM_FS_LOCK_EXCLUSIVE drift");
 
+/* R90 P1-1 fix: every lock wrapper HOLDS fs->lock through the
+ * inner stm_lock_* call. The earlier "drop fs->lock before
+ * delegating" posture created a UAF window vs concurrent
+ * stm_fs_unmount (which holds fs->lock through stm_lock_table_close
+ * + free(fs)). Holding fs->lock serializes lock-table ops behind
+ * other fs ops, which is the same posture every other v2 fs API
+ * uses (stm_fs_reserve / stm_fs_lookup / etc). The lock-table's
+ * own internal mutex is then a fast path under fs->lock — its
+ * primary purpose post-fix is to guard the records[] array
+ * against the (admittedly now-impossible) concurrent caller. */
+
 stm_status stm_fs_lock(stm_fs *fs,
                               uint64_t dataset_id, uint64_t ino,
                               uint64_t owner_id, uint8_t type,
@@ -4420,13 +4431,10 @@ stm_status stm_fs_lock(stm_fs *fs,
 
     pthread_mutex_lock(&fs->lock);
     FS_GUARD_READ(fs);
+    stm_status s = stm_lock_acquire(fs->locks, dataset_id, ino,
+                                          owner_id, type, off, len);
     pthread_mutex_unlock(&fs->lock);
-
-    /* Lock-table mutex is independent of fs->lock; acquire takes
-     * its own. RO mounts may hold locks (advisory locks are
-     * RAM-only; don't mutate on-disk state). */
-    return stm_lock_acquire(fs->locks, dataset_id, ino,
-                                  owner_id, type, off, len);
+    return s;
 }
 
 stm_status stm_fs_unlock(stm_fs *fs,
@@ -4438,10 +4446,10 @@ stm_status stm_fs_unlock(stm_fs *fs,
 
     pthread_mutex_lock(&fs->lock);
     FS_GUARD_READ(fs);
+    stm_status s = stm_lock_release(fs->locks, dataset_id, ino,
+                                          owner_id, off, len);
     pthread_mutex_unlock(&fs->lock);
-
-    return stm_lock_release(fs->locks, dataset_id, ino,
-                                  owner_id, off, len);
+    return s;
 }
 
 stm_status stm_fs_lock_test(stm_fs *fs,
@@ -4458,11 +4466,12 @@ stm_status stm_fs_lock_test(stm_fs *fs,
 
     pthread_mutex_lock(&fs->lock);
     FS_GUARD_READ(fs);
+    stm_status s = stm_lock_test(fs->locks, dataset_id, ino,
+                                       owner_id, type, off, len,
+                                       out_would_grant,
+                                       out_conflicting_owner);
     pthread_mutex_unlock(&fs->lock);
-
-    return stm_lock_test(fs->locks, dataset_id, ino,
-                              owner_id, type, off, len,
-                              out_would_grant, out_conflicting_owner);
+    return s;
 }
 
 stm_status stm_fs_release_lock_owner(stm_fs *fs, uint64_t owner_id)
@@ -4471,9 +4480,9 @@ stm_status stm_fs_release_lock_owner(stm_fs *fs, uint64_t owner_id)
 
     pthread_mutex_lock(&fs->lock);
     FS_GUARD_READ(fs);
+    stm_status s = stm_lock_release_owner(fs->locks, owner_id);
     pthread_mutex_unlock(&fs->lock);
-
-    return stm_lock_release_owner(fs->locks, owner_id);
+    return s;
 }
 
 stm_status stm_fs_lock_count(stm_fs *fs, size_t *out_count)
@@ -4483,9 +4492,9 @@ stm_status stm_fs_lock_count(stm_fs *fs, size_t *out_count)
 
     pthread_mutex_lock(&fs->lock);
     FS_GUARD_READ(fs);
+    stm_status s = stm_lock_count(fs->locks, out_count);
     pthread_mutex_unlock(&fs->lock);
-
-    return stm_lock_count(fs->locks, out_count);
+    return s;
 }
 
 /* ========================================================================= */

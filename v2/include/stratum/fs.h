@@ -1774,10 +1774,9 @@ stm_status stm_fs_promote_policy_pass_all(
 /* Lock-type discriminator. Mirrors `<stratum/locks.h>`'s
  * STM_LOCK_SHARED / EXCLUSIVE. The fs API takes a uint8_t directly;
  * the constants below are convenience aliases for callers that don't
- * pull `<stratum/locks.h>`. Values match Linux's F_RDLCK / F_WRLCK
- * convention IS NOT — Linux uses F_RDLCK=0, F_WRLCK=1, F_UNLCK=2.
- * Stratum's constants are defined in `<stratum/locks.h>` to match
- * Linux's read=0/write=1 parity. */
+ * pull `<stratum/locks.h>`. Values match Linux's F_RDLCK=0 /
+ * F_WRLCK=1 numerically. Linux's F_UNLCK=2 has no analog — stratum's
+ * release path is a separate API (stm_fs_unlock), not a lock-type. */
 #define STM_FS_LOCK_SHARED     0u   /* matches F_RDLCK */
 #define STM_FS_LOCK_EXCLUSIVE  1u   /* matches F_WRLCK */
 

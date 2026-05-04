@@ -94,6 +94,10 @@ void stm_lock_table_close(stm_lock_table *t) {
 static stm_status normalize_range(uint64_t off, uint64_t len,
                                        uint64_t *out_end) {
     if (len == 0u) {
+        /* R90 P3-8: refuse the degenerate empty range [UINT64_MAX,
+         * UINT64_MAX) — Linux fcntl returns EINVAL for
+         * `l_start=UINT64_MAX, l_len=0`. */
+        if (off == UINT64_MAX) return STM_EINVAL;
         *out_end = UINT64_MAX;
         return STM_OK;
     }
@@ -262,6 +266,12 @@ stm_status stm_lock_release_owner(stm_lock_table *t, uint64_t owner_id) {
 }
 
 stm_status stm_lock_count(const stm_lock_table *t, size_t *out_count) {
+    /* R90 P3-1: uniform out-param zero-init contract — set
+     * `*out_count = 0` BEFORE arg validation so callers observing
+     * on STM_EINVAL see a defined value (R57 P3-5 / R58 P3-1
+     * pattern). The fs-level wrapper already does this; the
+     * underlying primitive should match. */
+    if (out_count) *out_count = 0;
     if (!t || !out_count) return STM_EINVAL;
     must_lock(tbl_lock(t));
     *out_count = t->n_records;
