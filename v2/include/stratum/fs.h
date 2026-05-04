@@ -1768,6 +1768,91 @@ stm_status stm_fs_promote_policy_pass_all(
         stm_fs_promote_policy_pass_all_stats *out_stats);
 
 /* ========================================================================= */
+/* P8-POSIX-7d: advisory locks — flock(2) + fcntl(2) F_OFD_SETLK shape.       */
+/* ========================================================================= */
+
+/* Lock-type discriminator. Mirrors `<stratum/locks.h>`'s
+ * STM_LOCK_SHARED / EXCLUSIVE. The fs API takes a uint8_t directly;
+ * the constants below are convenience aliases for callers that don't
+ * pull `<stratum/locks.h>`. Values match Linux's F_RDLCK / F_WRLCK
+ * convention IS NOT — Linux uses F_RDLCK=0, F_WRLCK=1, F_UNLCK=2.
+ * Stratum's constants are defined in `<stratum/locks.h>` to match
+ * Linux's read=0/write=1 parity. */
+#define STM_FS_LOCK_SHARED     0u   /* matches F_RDLCK */
+#define STM_FS_LOCK_EXCLUSIVE  1u   /* matches F_WRLCK */
+
+/*
+ * stm_fs_lock — advisory-lock acquire (NON-BLOCKING).
+ *
+ * Owners: `owner_id` is a caller-managed opaque uint64_t. POSIX
+ * F_OFD_SETLK locks are tied to an "open file description"
+ * (kernel-side fd identity); stratum has no fd concept, so the
+ * binding layer (9P/FUSE) is responsible for assigning a unique
+ * non-zero owner_id per-open AND calling
+ * `stm_fs_release_lock_owner` at close. owner_id 0 is reserved
+ * (refused with STM_EINVAL).
+ *
+ * Range: `len = 0` means "to EOF" — internally normalized to
+ * UINT64_MAX - off so range arithmetic is uniform. Linux fcntl(2)
+ * treats len=0 the same way.
+ *
+ * Same-owner re-lock: ALWAYS admitted (POSIX permits an owner to
+ * upgrade/downgrade/stack its own locks; this MVP doesn't merge
+ * or split records — each Acquire adds a discrete record).
+ *
+ * Refusals:
+ *   - NULL fs (STM_EINVAL).
+ *   - dataset_id == 0 OR ino == 0 OR owner_id == 0 (STM_EINVAL).
+ *   - type not in {STM_FS_LOCK_SHARED, STM_FS_LOCK_EXCLUSIVE}
+ *     (STM_EINVAL).
+ *   - off + len overflows uint64_t when len != 0 (STM_EOVERFLOW).
+ *   - Wedged FS (STM_EWEDGED).
+ *   - Conflicting lock present → STM_EAGAIN.
+ *   - STM_ENOMEM if the lock table can't grow.
+ *
+ * Lock posture: takes fs->lock + FS_GUARD_READ for the wedged
+ * gate, drops it, then acquires the lock-table's internal mutex.
+ * RO mounts MAY hold locks (advisory locks don't mutate on-disk
+ * state).
+ */
+STM_MUST_USE
+stm_status stm_fs_lock(stm_fs *fs,
+                              uint64_t dataset_id, uint64_t ino,
+                              uint64_t owner_id, uint8_t type,
+                              uint64_t off, uint64_t len);
+
+/* Release locks held by `owner_id` at (dataset_id, ino) matching
+ * EXACTLY (off, len). Idempotent. MVP: exact-match only — caller
+ * passes the same range it acquired. */
+STM_MUST_USE
+stm_status stm_fs_unlock(stm_fs *fs,
+                                uint64_t dataset_id, uint64_t ino,
+                                uint64_t owner_id,
+                                uint64_t off, uint64_t len);
+
+/* F_GETLK shape — does NOT acquire. On STM_OK,
+ * `*out_would_grant=true` means an acquire would succeed; `false`
+ * means a conflict. `out_conflicting_owner` (optional) gets one
+ * of the conflicting owners' id on `out_would_grant=false`. */
+STM_MUST_USE
+stm_status stm_fs_lock_test(stm_fs *fs,
+                                   uint64_t dataset_id, uint64_t ino,
+                                   uint64_t owner_id, uint8_t type,
+                                   uint64_t off, uint64_t len,
+                                   bool *out_would_grant,
+                                   uint64_t *out_conflicting_owner);
+
+/* Release every lock held by `owner_id` across all inodes — the
+ * post-close cleanup pattern. Bindings call this on fd-close. */
+STM_MUST_USE
+stm_status stm_fs_release_lock_owner(stm_fs *fs, uint64_t owner_id);
+
+/* Diagnostic: count currently-held locks across the whole FS.
+ * Used by tests + admin tools. */
+STM_MUST_USE
+stm_status stm_fs_lock_count(stm_fs *fs, size_t *out_count);
+
+/* ========================================================================= */
 /* P8-POSIX-7b: fallocate(2) — every FALLOC_FL_* flag.                        */
 /* ========================================================================= */
 

@@ -6337,6 +6337,131 @@ STM_TEST(fs_p9b_r86_p3_3_rename_exchange_hardlinks_to_same_inode) {
 }
 
 /* ========================================================================= */
+/* P8-POSIX-7d: advisory locks — flock(2) + fcntl(2) F_OFD_SETLK shape.       */
+/* ========================================================================= */
+
+STM_TEST(fs_p7d_lock_basic_acquire_release) {
+    make_tmp("p7d_lock_basic");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    STM_ASSERT_OK(stm_fs_lock(fs, 1, 100, 1, STM_FS_LOCK_SHARED, 0, 100));
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_lock_count(fs, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+    STM_ASSERT_OK(stm_fs_unlock(fs, 1, 100, 1, 0, 100));
+    STM_ASSERT_OK(stm_fs_lock_count(fs, &n));
+    STM_ASSERT_EQ(n, (size_t)0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7d_lock_excl_blocks_other_owner) {
+    make_tmp("p7d_lock_excl");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    STM_ASSERT_OK(stm_fs_lock(fs, 1, 100, 1, STM_FS_LOCK_EXCLUSIVE, 0, 100));
+    STM_ASSERT_ERR(stm_fs_lock(fs, 1, 100, 2, STM_FS_LOCK_SHARED, 0, 100),
+                   STM_EAGAIN);
+    STM_ASSERT_ERR(stm_fs_lock(fs, 1, 100, 2, STM_FS_LOCK_EXCLUSIVE, 0, 100),
+                   STM_EAGAIN);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7d_lock_test_reports_conflict) {
+    make_tmp("p7d_lock_test");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    STM_ASSERT_OK(stm_fs_lock(fs, 1, 100, 1, STM_FS_LOCK_EXCLUSIVE, 0, 100));
+
+    bool would_grant = true;
+    uint64_t conflicting = 0;
+    STM_ASSERT_OK(stm_fs_lock_test(fs, 1, 100, 2, STM_FS_LOCK_SHARED,
+                                          0, 100, &would_grant, &conflicting));
+    STM_ASSERT_TRUE(!would_grant);
+    STM_ASSERT_EQ(conflicting, (uint64_t)1);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7d_release_lock_owner_drops_all) {
+    make_tmp("p7d_release_owner");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    STM_ASSERT_OK(stm_fs_lock(fs, 1, 100, 1, STM_FS_LOCK_SHARED, 0, 100));
+    STM_ASSERT_OK(stm_fs_lock(fs, 1, 200, 1, STM_FS_LOCK_SHARED, 0, 100));
+    STM_ASSERT_OK(stm_fs_lock(fs, 1, 100, 2, STM_FS_LOCK_SHARED, 200, 100));
+
+    STM_ASSERT_OK(stm_fs_release_lock_owner(fs, 1));
+    size_t n = 0;
+    STM_ASSERT_OK(stm_fs_lock_count(fs, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7d_lock_wedged_refused) {
+    make_tmp("p7d_lock_wedged");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_fs_mark_wedged(fs);
+    STM_ASSERT_ERR(stm_fs_lock(fs, 1, 100, 1, STM_FS_LOCK_SHARED, 0, 100),
+                   STM_EWEDGED);
+    STM_ASSERT_ERR(stm_fs_unlock(fs, 1, 100, 1, 0, 100),
+                   STM_EWEDGED);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7d_lock_ro_mount_allowed) {
+    /* Advisory locks on RO mounts are allowed (RAM-only state, doesn't
+     * mutate on-disk; matches Linux behavior). */
+    make_tmp("p7d_lock_ro");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    stm_fs_mount_opts ro_mopts = mopts;
+    ro_mopts.read_only = true;
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &ro_mopts, &fs));
+
+    STM_ASSERT_OK(stm_fs_lock(fs, 1, 100, 1, STM_FS_LOCK_SHARED, 0, 100));
+    STM_ASSERT_OK(stm_fs_lock(fs, 1, 100, 1, STM_FS_LOCK_EXCLUSIVE, 0, 100));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+/* ========================================================================= */
 /* P8-POSIX-7b: fallocate(2) — every FALLOC_FL_* flag.                        */
 /* ========================================================================= */
 
@@ -6350,7 +6475,10 @@ static void p7b_write_block(stm_fs *fs, uint64_t ino, uint64_t off,
 }
 
 STM_TEST(fs_p7b_fallocate_default_grows_size) {
-    /* fallocate(off=0, len=4096, flags=0): bump si_size to 4096. */
+    /* fallocate(off=0, len=8192, flags=0) on EXTENT-mode file:
+     * bump si_size to 8192. Pre-write 4096 bytes to force the
+     * INLINE→EXTENT transition (R89 P0-1: fallocate refuses
+     * default-grow on INLINE that would exceed inline cap). */
     make_tmp("p7b_default_grow");
     stm_fs_format_opts fopts = default_format_opts();
     STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
@@ -6363,11 +6491,131 @@ STM_TEST(fs_p7b_fallocate_default_grows_size) {
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
                                           0644u, 0, 0, &ino));
+    p7b_write_block(fs, ino, 0, 1);     /* INLINE → EXTENT, size=4096 */
 
-    STM_ASSERT_OK(stm_fs_fallocate(fs, 1, ino, 0, 4096u, 0u));
+    STM_ASSERT_OK(stm_fs_fallocate(fs, 1, ino, 0, 8192u, 0u));
     struct stm_inode_value v = {0};
     STM_ASSERT_OK(stm_fs_stat(fs, 1, ino, &v));
-    STM_ASSERT_EQ(stm_load_le64(v.si_size), (uint64_t)4096);
+    STM_ASSERT_EQ(stm_load_le64(v.si_size), (uint64_t)8192);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7b_r89_p0_inline_default_grow_past_cap_refused) {
+    /* R89 P0-1 regression: default fallocate on INLINE-mode file
+     * that would grow size past STM_INODE_INLINE_MAX=100 refuses
+     * with STM_ERANGE (avoids OOB on subsequent INLINE read). */
+    make_tmp("p7b_r89_p0_inline_grow");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &ino));
+    /* Fresh file is INLINE-mode + size=0. */
+    STM_ASSERT_ERR(stm_fs_fallocate(fs, 1, ino, 0, 4096u, 0u),
+                   STM_ERANGE);
+
+    /* But growing ONLY within inline cap is allowed. */
+    STM_ASSERT_OK(stm_fs_fallocate(fs, 1, ino, 0, 50u, 0u));
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, ino, &v));
+    STM_ASSERT_EQ(stm_load_le64(v.si_size), (uint64_t)50);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7b_r89_p0_inline_range_op_refused) {
+    /* R89 P0-1/2/3 regression: range ops (PUNCH/ZERO/COLLAPSE/
+     * INSERT/UNSHARE) refuse on INLINE-mode files with
+     * STM_ENOTSUPPORTED. */
+    make_tmp("p7b_r89_p0_inline_rangeop");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &ino));
+    /* INLINE-mode file. Each range op must refuse. */
+    STM_ASSERT_ERR(stm_fs_fallocate(fs, 1, ino, 0, 4096u,
+                                          STM_FS_FALLOC_FL_PUNCH_HOLE |
+                                              STM_FS_FALLOC_FL_KEEP_SIZE),
+                   STM_ENOTSUPPORTED);
+    STM_ASSERT_ERR(stm_fs_fallocate(fs, 1, ino, 0, 4096u,
+                                          STM_FS_FALLOC_FL_ZERO_RANGE),
+                   STM_ENOTSUPPORTED);
+    STM_ASSERT_ERR(stm_fs_fallocate(fs, 1, ino, 0, 4096u,
+                                          STM_FS_FALLOC_FL_COLLAPSE_RANGE),
+                   STM_ENOTSUPPORTED);
+    STM_ASSERT_ERR(stm_fs_fallocate(fs, 1, ino, 0, 4096u,
+                                          STM_FS_FALLOC_FL_INSERT_RANGE),
+                   STM_ENOTSUPPORTED);
+    STM_ASSERT_ERR(stm_fs_fallocate(fs, 1, ino, 0, 4096u,
+                                          STM_FS_FALLOC_FL_UNSHARE_RANGE),
+                   STM_ENOTSUPPORTED);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7b_r89_p2_collapse_beyond_eof_refused) {
+    /* R89 P2-1 regression: COLLAPSE refuses when off+len > cur_size. */
+    make_tmp("p7b_r89_p2_collapse_eof");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &ino));
+    p7b_write_block(fs, ino, 0, 1);   /* size=4096 */
+
+    STM_ASSERT_ERR(stm_fs_fallocate(fs, 1, ino, 4096u, 4096u,
+                                          STM_FS_FALLOC_FL_COLLAPSE_RANGE),
+                   STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7b_r89_p2_insert_at_or_past_eof_refused) {
+    /* R89 P2-2 regression: INSERT refuses when off >= cur_size. */
+    make_tmp("p7b_r89_p2_insert_eof");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &ino));
+    p7b_write_block(fs, ino, 0, 1);   /* size=4096 */
+
+    STM_ASSERT_ERR(stm_fs_fallocate(fs, 1, ino, 4096u, 4096u,
+                                          STM_FS_FALLOC_FL_INSERT_RANGE),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_fallocate(fs, 1, ino, 8192u, 4096u,
+                                          STM_FS_FALLOC_FL_INSERT_RANGE),
+                   STM_EINVAL);
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path); unlink(g_key_path);

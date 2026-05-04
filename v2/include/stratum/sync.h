@@ -1150,6 +1150,31 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
                                 uint64_t new_size);
 
 /*
+ * P8-POSIX-7b: punch a hole [off, off+len) in (ds, ino). Drops every
+ * fully-contained HOT extent + routes their paddrs through the
+ * snapshot dead-list + alloc free, mirroring stm_sync_truncate's
+ * pattern. Refuses STM_ENOTSUPPORTED on:
+ *   - any extent crossing either boundary (sub-block split is not
+ *     in MVP scope),
+ *   - any COLD extent overlapping the range (cold-tier dead-list
+ *     bookkeeping for partial CAS-chunk dereferencing is not yet
+ *     wired through this primitive — fs-layer callers MUST promote
+ *     the range to HOT first via stm_fs_promote_to_hot, OR use
+ *     the existing stm_sync_truncate path which DOES handle COLD).
+ *
+ * Refusals:
+ *   - NULL s (STM_EINVAL).
+ *   - dataset_id == 0 OR ino == 0 OR len == 0 (STM_EINVAL).
+ *   - off + len overflows uint64_t (STM_EOVERFLOW).
+ *   - Wedged (STM_EWEDGED), read-only (STM_EROFS).
+ *   - Any crossing-boundary OR COLD extent (STM_ENOTSUPPORTED).
+ */
+STM_MUST_USE
+stm_status stm_sync_punch_range(stm_sync *s,
+                                      uint64_t dataset_id, uint64_t ino,
+                                      uint64_t off, uint64_t len);
+
+/*
  * P7-16: stm_sync_reflink — POSIX-shape FICLONE at the sync layer.
  * Replaces dst's empty extent tree with a reflink-share of src's
  * extent tree. For each (src_dataset_id, src_ino) extent E, this

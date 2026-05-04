@@ -40,6 +40,7 @@
 #include <stratum/dirent.h>
 #include <stratum/extent.h>
 #include <stratum/inode.h>
+#include <stratum/locks.h>
 #include <stratum/xattr.h>
 #include <stratum/janus.h>
 #include <stratum/keyfile.h>
@@ -65,6 +66,7 @@ struct stm_fs {
     stm_pool  *pool;         /* owned — P5-1 N=1 wrapper over bdev */
     stm_alloc *alloc;        /* owned */
     stm_sync  *sync;         /* owned */
+    stm_lock_table *locks;   /* P8-POSIX-7d: in-RAM advisory lock table */
 
     /* P7-13 R45 P2-1: mount-time wrap-key source. Exactly one is
      * non-NULL; both freed at unmount. Retained so
@@ -342,6 +344,14 @@ static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
     fs->pool      = pool;
     fs->alloc     = a;
     fs->sync      = sync;
+    fs->locks     = stm_lock_table_create();
+    if (!fs->locks) {
+        free(fs->janus_socket);
+        free(fs->keyfile_path);
+        pthread_mutex_destroy(&fs->lock);
+        free(fs);
+        return NULL;
+    }
     fs->read_only = ro;
     fs->wedged    = false;
     return fs;
@@ -507,6 +517,7 @@ stm_status stm_fs_unmount(stm_fs *fs)
     stm_alloc_close(fs->alloc);
     stm_pool_close(fs->pool);
     stm_bdev_close(fs->bdev);
+    stm_lock_table_close(fs->locks);
 
     pthread_mutex_unlock(&fs->lock);
     pthread_mutex_destroy(&fs->lock);
@@ -4082,7 +4093,11 @@ _Static_assert(STM_FS_FALLOC_FL_INSERT_RANGE   == 0x20u,
 _Static_assert(STM_FS_FALLOC_FL_UNSHARE_RANGE  == 0x40u,
                "FALLOC_FL_UNSHARE_RANGE drift");
 
-#define FS_FALLOC_BLOCK 4096u
+/* R89 P3-2: alias to STM_UB_SIZE (the canonical 4 KiB block).
+ * Drift-protected via Static_assert below. */
+#define FS_FALLOC_BLOCK ((uint64_t)STM_UB_SIZE)
+_Static_assert(STM_UB_SIZE == 4096u,
+               "FS_FALLOC_BLOCK assumes STM_UB_SIZE == 4 KiB");
 
 /* Look up the inode + verify it's a regular file. Returns the
  * inode_value via *out_iv. Caller MUST hold fs->lock. */
@@ -4142,6 +4157,14 @@ stm_status stm_fs_fallocate(stm_fs *fs,
         if ((len % FS_FALLOC_BLOCK) != 0u) return STM_EINVAL;
     }
 
+    /* R89 P2-3: COLLAPSE / INSERT pass `(int64_t)len` to the
+     * shift-keys primitive; refuse `len > INT64_MAX` upfront so
+     * the cast never produces signed overflow (UB at
+     * -fsanitize=signed-integer-overflow). */
+    if ((collapse || insert) && len > (uint64_t)INT64_MAX) {
+        return STM_EINVAL;
+    }
+
     pthread_mutex_lock(&fs->lock);
     FS_GUARD_WRITE(fs);
 
@@ -4150,6 +4173,38 @@ stm_status stm_fs_fallocate(stm_fs *fs,
     if (vs != STM_OK) {
         pthread_mutex_unlock(&fs->lock);
         return vs;
+    }
+
+    /* R89 P0-1/2/3 fix: si_data_kind discrimination.
+     *
+     * INLINE-mode files don't have extents — they store data
+     * directly in si_data.inline_data[100]. fallocate ops that
+     * mutate range or extend si_size past STM_INODE_INLINE_MAX
+     * would either OOB-read on subsequent reads (the INLINE read
+     * path computes `avail = cur_size - off` and memcpy's from
+     * inline_data) OR silently no-op without effect.
+     *
+     * MVP refusal posture: every range op refuses
+     * STM_ENOTSUPPORTED on INLINE-mode files. The default
+     * preallocate (flags=0 / KEEP_SIZE alone) is allowed but
+     * refuses with STM_ERANGE if it would grow si_size past the
+     * inline cap (would create the OOB shape). Callers that need
+     * fallocate on INLINE files must transition the file to
+     * EXTENT first via `stm_fs_truncate` (which has the
+     * INLINE→EXTENT transition path baked in). */
+    uint8_t kind = iv.si_data_kind;
+    if (kind == STM_DATA_INLINE) {
+        if (any_range_op) {
+            pthread_mutex_unlock(&fs->lock);
+            return STM_ENOTSUPPORTED;
+        }
+        /* Default preallocate on INLINE: allow ONLY if not extending
+         * past the inline cap. Otherwise refuse — caller must
+         * truncate-up first to trigger the INLINE→EXTENT transition. */
+        if (!keep_size && (off + len) > (uint64_t)STM_INODE_INLINE_MAX) {
+            pthread_mutex_unlock(&fs->lock);
+            return STM_ERANGE;
+        }
     }
 
     /* Sealed-file enforcement: F_SEAL_WRITE / FUTURE_WRITE block
@@ -4196,17 +4251,11 @@ stm_status stm_fs_fallocate(stm_fs *fs,
     stm_status s = STM_OK;
 
     if (punch) {
-        /* PUNCH_HOLE | KEEP_SIZE: drop fully-contained extents in
-         * range. Refuse if any extent crosses a boundary
-         * (STM_ENOTSUPPORTED). MVP: drop paddrs leak through the
-         * extent_index until next sync_commit's auto_gc drains them
-         * — TODO at P11 forward-note level: route through the
-         * snapshot dead-list per dead_list.tla::OverwriteBlock. */
-        uint64_t *dropped = NULL;
-        size_t n_dropped = 0;
-        s = stm_extent_punch_range(eidx, dataset_id, ino, off, len,
-                                        &dropped, &n_dropped);
-        free(dropped);
+        /* PUNCH_HOLE | KEEP_SIZE: route through stm_sync_punch_range
+         * which (R89 P0-4 fix) properly drops paddrs through the
+         * snapshot dead-list + alloc free pool. Refuses
+         * STM_ENOTSUPPORTED on crossing or COLD extents. */
+        s = stm_sync_punch_range(fs->sync, dataset_id, ino, off, len);
         if (s == STM_OK) {
             fs_stamp_mtime_ctime_now(&iv);
             stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
@@ -4215,13 +4264,20 @@ stm_status stm_fs_fallocate(stm_fs *fs,
     } else if (collapse) {
         /* COLLAPSE_RANGE: range must already be empty + no crossing
          * boundary extents (refuse STM_ENOTSUPPORTED). Shift
-         * extents above off+len down by len. Shrink si_size by len
-         * (clamped to 0). */
+         * extents above off+len down by len. Shrink si_size by len.
+         *
+         * R89 P2-1: Linux fallocate(2) refuses with EINVAL when
+         * `off + len >= cur_size` (collapse beyond EOF is
+         * undefined). Mirror that. */
+        if (off + len > cur_size) {
+            pthread_mutex_unlock(&fs->lock);
+            return STM_EINVAL;
+        }
         s = stm_extent_shift_range_keys(eidx, dataset_id, ino,
                                              off + len,
                                              -(int64_t)len);
         if (s == STM_OK) {
-            uint64_t new_size = (cur_size > len) ? (cur_size - len) : 0u;
+            uint64_t new_size = cur_size - len;
             iv.si_size = stm_store_le64(new_size);
             fs_stamp_mtime_ctime_now(&iv);
             stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
@@ -4230,7 +4286,16 @@ stm_status stm_fs_fallocate(stm_fs *fs,
     } else if (insert) {
         /* INSERT_RANGE: shift extents at off' >= off up by len.
          * Refuse if extent crosses off (STM_ENOTSUPPORTED).
-         * si_size grows by len. */
+         * si_size grows by len.
+         *
+         * R89 P2-2: Linux fallocate(2) refuses with EINVAL when
+         * `off >= cur_size` (inserting past EOF is undefined —
+         * inserting at exactly cur_size is also refused since
+         * that's just appending). */
+        if (off >= cur_size) {
+            pthread_mutex_unlock(&fs->lock);
+            return STM_EINVAL;
+        }
         if (cur_size > UINT64_MAX - len) {
             pthread_mutex_unlock(&fs->lock);
             return STM_EOVERFLOW;
@@ -4244,16 +4309,12 @@ stm_status stm_fs_fallocate(stm_fs *fs,
             (void)stm_inode_set(iidx, dataset_id, ino, &iv);
         }
     } else if (zero_r) {
-        /* ZERO_RANGE: punch + (if !keep_size and would_grow) bump
+        /* ZERO_RANGE: punch via stm_sync_punch_range (R89 P0-4
+         * paddr-routing fix) + (if !keep_size and would_grow) bump
          * si_size. MVP: equivalent to PUNCH_HOLE structurally — the
          * extent slots are dropped; subsequent reads return zeros
-         * via sparse-extent semantics. Doesn't require KEEP_SIZE,
-         * so si_size MAY grow to off+len. */
-        uint64_t *dropped = NULL;
-        size_t n_dropped = 0;
-        s = stm_extent_punch_range(eidx, dataset_id, ino, off, len,
-                                        &dropped, &n_dropped);
-        free(dropped);
+         * via sparse-extent semantics. */
+        s = stm_sync_punch_range(fs->sync, dataset_id, ino, off, len);
         if (s == STM_OK) {
             if (!keep_size && (off + len) > cur_size) {
                 iv.si_size = stm_store_le64(off + len);
@@ -4292,6 +4353,95 @@ stm_status stm_fs_fallocate(stm_fs *fs,
 
     pthread_mutex_unlock(&fs->lock);
     return s;
+}
+
+/* ========================================================================= */
+/* P8-POSIX-7d: advisory locks — flock(2) + fcntl(2) F_OFD_SETLK shape.       */
+/* ========================================================================= */
+
+/* Drift guards: STM_FS_LOCK_* in fs.h must match STM_LOCK_* in
+ * locks.h numerically so callers can pass the fs.h alias straight
+ * through. */
+_Static_assert(STM_FS_LOCK_SHARED    == STM_LOCK_SHARED,
+               "STM_FS_LOCK_SHARED drift");
+_Static_assert(STM_FS_LOCK_EXCLUSIVE == STM_LOCK_EXCLUSIVE,
+               "STM_FS_LOCK_EXCLUSIVE drift");
+
+stm_status stm_fs_lock(stm_fs *fs,
+                              uint64_t dataset_id, uint64_t ino,
+                              uint64_t owner_id, uint8_t type,
+                              uint64_t off, uint64_t len)
+{
+    if (!fs) return STM_EINVAL;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_READ(fs);
+    pthread_mutex_unlock(&fs->lock);
+
+    /* Lock-table mutex is independent of fs->lock; acquire takes
+     * its own. RO mounts may hold locks (advisory locks are
+     * RAM-only; don't mutate on-disk state). */
+    return stm_lock_acquire(fs->locks, dataset_id, ino,
+                                  owner_id, type, off, len);
+}
+
+stm_status stm_fs_unlock(stm_fs *fs,
+                                uint64_t dataset_id, uint64_t ino,
+                                uint64_t owner_id,
+                                uint64_t off, uint64_t len)
+{
+    if (!fs) return STM_EINVAL;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_READ(fs);
+    pthread_mutex_unlock(&fs->lock);
+
+    return stm_lock_release(fs->locks, dataset_id, ino,
+                                  owner_id, off, len);
+}
+
+stm_status stm_fs_lock_test(stm_fs *fs,
+                                   uint64_t dataset_id, uint64_t ino,
+                                   uint64_t owner_id, uint8_t type,
+                                   uint64_t off, uint64_t len,
+                                   bool *out_would_grant,
+                                   uint64_t *out_conflicting_owner)
+{
+    /* Uniform out-param zero-init contract. */
+    if (out_would_grant) *out_would_grant = false;
+    if (out_conflicting_owner) *out_conflicting_owner = 0;
+    if (!fs || !out_would_grant) return STM_EINVAL;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_READ(fs);
+    pthread_mutex_unlock(&fs->lock);
+
+    return stm_lock_test(fs->locks, dataset_id, ino,
+                              owner_id, type, off, len,
+                              out_would_grant, out_conflicting_owner);
+}
+
+stm_status stm_fs_release_lock_owner(stm_fs *fs, uint64_t owner_id)
+{
+    if (!fs) return STM_EINVAL;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_READ(fs);
+    pthread_mutex_unlock(&fs->lock);
+
+    return stm_lock_release_owner(fs->locks, owner_id);
+}
+
+stm_status stm_fs_lock_count(stm_fs *fs, size_t *out_count)
+{
+    if (out_count) *out_count = 0;
+    if (!fs || !out_count) return STM_EINVAL;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_READ(fs);
+    pthread_mutex_unlock(&fs->lock);
+
+    return stm_lock_count(fs->locks, out_count);
 }
 
 /* ========================================================================= */

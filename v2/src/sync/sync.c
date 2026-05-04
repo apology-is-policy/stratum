@@ -5579,6 +5579,91 @@ stm_status stm_sync_truncate(stm_sync *s, uint64_t dataset_id, uint64_t ino,
     return drop_err;
 }
 
+/* P8-POSIX-7b stm_sync_punch_range scan helper — checks every
+ * record at (ds, ino) overlapping the punch range. Sets
+ * `saw_cold_in_range` if any overlapping extent is COLD; sets
+ * `saw_crossing` if any overlapping extent crosses a boundary
+ * (full or partial overlap that's not fully-contained). */
+typedef struct {
+    uint64_t target_ino;
+    uint64_t target_off;
+    uint64_t target_end;     /* off + len */
+    bool     saw_cold_in_range;
+    bool     saw_crossing;
+} punch_scan_ctx;
+
+static bool punch_scan_cb(const stm_extent_record *e, void *ctx_) {
+    punch_scan_ctx *c = ctx_;
+    if (e->ino != c->target_ino) return true;
+    uint64_t e_end = e->off + e->len;
+    bool overlaps = (e->off < c->target_end && e_end > c->target_off);
+    if (!overlaps) return true;
+    bool fully_in = (e->off >= c->target_off && e_end <= c->target_end);
+    if (!fully_in) c->saw_crossing = true;
+    if (e->kind == STM_EXTENT_KIND_COLD) c->saw_cold_in_range = true;
+    return true;     /* keep iterating to surface every issue */
+}
+
+stm_status stm_sync_punch_range(stm_sync *s,
+                                      uint64_t dataset_id, uint64_t ino,
+                                      uint64_t off, uint64_t len)
+{
+    if (!s) return STM_EINVAL;
+    if (dataset_id == 0u || ino == 0u || len == 0u) return STM_EINVAL;
+    if (off > UINT64_MAX - len) return STM_EOVERFLOW;
+
+    pthread_mutex_lock(&s->lock);
+    if (s->wedged) {
+        pthread_mutex_unlock(&s->lock);
+        return STM_EWEDGED;
+    }
+    if (s->read_only) {
+        pthread_mutex_unlock(&s->lock);
+        return STM_EROFS;
+    }
+
+    stm_extent_index *eidx = s->extent_idx;
+    punch_scan_ctx scan = {
+        .target_ino = ino,
+        .target_off = off,
+        .target_end = off + len,
+        .saw_cold_in_range = false,
+        .saw_crossing = false,
+    };
+    stm_status is = stm_extent_iter_ds(eidx, dataset_id,
+                                             punch_scan_cb, &scan);
+    if (is != STM_OK) {
+        pthread_mutex_unlock(&s->lock);
+        return is;
+    }
+    if (scan.saw_cold_in_range || scan.saw_crossing) {
+        pthread_mutex_unlock(&s->lock);
+        return STM_ENOTSUPPORTED;
+    }
+
+    /* Drop the HOT extents + route their paddrs through the snap
+     * dead-list + alloc free. */
+    uint64_t *dropped = NULL;
+    size_t   n_dropped = 0;
+    stm_status ps = stm_extent_punch_range(eidx, dataset_id, ino,
+                                                 off, len,
+                                                 &dropped, &n_dropped);
+    if (ps != STM_OK) {
+        pthread_mutex_unlock(&s->lock);
+        return ps;
+    }
+
+    stm_status drop_err = STM_OK;
+    for (size_t i = 0; i < n_dropped; i++) {
+        stm_status drs = sync_drop_paddr_locked(s, dataset_id, dropped[i]);
+        if (drs != STM_OK && drop_err == STM_OK) drop_err = drs;
+    }
+    free(dropped);
+
+    pthread_mutex_unlock(&s->lock);
+    return drop_err;
+}
+
 /* ========================================================================= */
 /* P7-16 — reflink (FICLONE).                                                 */
 /* ========================================================================= */

@@ -197,6 +197,7 @@ add_subdirectory(src/cas)
 add_subdirectory(src/inode)
 add_subdirectory(src/dirent)
 add_subdirectory(src/xattr)
+add_subdirectory(src/locks)
 
 # ---------------------------------------------------------------------------
 # Public aggregate library.
@@ -234,7 +235,8 @@ target_link_libraries(stratum INTERFACE
     stm_cas
     stm_inode
     stm_dirent
-    stm_xattr)
+    stm_xattr
+    stm_locks)
 target_include_directories(stratum INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/include)
 

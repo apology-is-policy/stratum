@@ -74,6 +74,7 @@ stm_add_test(test_repair_log test_repair_log.c)
 stm_add_test(test_inode      test_inode.c)
 stm_add_test(test_dirent     test_dirent.c)
 stm_add_test(test_xattr      test_xattr.c)
+stm_add_test(test_locks      test_locks.c)
 
 # The crash-injection fuzzer runs ~168 independent format+mount+unmount
 # cycles. Original default budget was ~25 s on default, ~42 s under
