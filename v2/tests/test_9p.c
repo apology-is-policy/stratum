@@ -315,6 +315,76 @@ static uint32_t build_trenameat(uint8_t *req, uint16_t tag,
     return sz;
 }
 
+static uint32_t build_tsetattr(uint8_t *req, uint16_t tag, uint32_t fid,
+                                uint32_t valid, uint32_t mode,
+                                uint32_t uid, uint32_t gid, uint64_t size,
+                                uint64_t at_sec, uint64_t at_nsec,
+                                uint64_t mt_sec, uint64_t mt_nsec)
+{
+    uint8_t *p = req + 7;
+    pack_u32(p, fid);    p += 4;
+    pack_u32(p, valid);  p += 4;
+    pack_u32(p, mode);   p += 4;
+    pack_u32(p, uid);    p += 4;
+    pack_u32(p, gid);    p += 4;
+    pack_u64(p, size);   p += 8;
+    pack_u64(p, at_sec); p += 8;
+    pack_u64(p, at_nsec);p += 8;
+    pack_u64(p, mt_sec); p += 8;
+    pack_u64(p, mt_nsec);p += 8;
+    uint32_t sz = (uint32_t)(p - req);
+    pack_u32(req, sz);
+    req[4] = STM_9P_TSETATTR;
+    pack_u16(req + 5, tag);
+    return sz;
+}
+
+static uint32_t build_tstatfs(uint8_t *req, uint16_t tag, uint32_t fid)
+{
+    uint8_t *p = req + 7;
+    pack_u32(p, fid); p += 4;
+    uint32_t sz = (uint32_t)(p - req);
+    pack_u32(req, sz);
+    req[4] = STM_9P_TSTATFS;
+    pack_u16(req + 5, tag);
+    return sz;
+}
+
+static uint32_t build_tfsync(uint8_t *req, uint16_t tag, uint32_t fid,
+                              uint32_t datasync)
+{
+    uint8_t *p = req + 7;
+    pack_u32(p, fid);      p += 4;
+    pack_u32(p, datasync); p += 4;
+    uint32_t sz = (uint32_t)(p - req);
+    pack_u32(req, sz);
+    req[4] = STM_9P_TFSYNC;
+    pack_u16(req + 5, tag);
+    return sz;
+}
+
+static uint32_t build_tlock(uint8_t *req, uint16_t tag, uint32_t fid,
+                             uint8_t type, uint32_t flags,
+                             uint64_t start, uint64_t length,
+                             uint32_t proc_id, const char *cid)
+{
+    uint8_t *p = req + 7;
+    pack_u32(p, fid);     p += 4;
+    *p++ = type;
+    pack_u32(p, flags);   p += 4;
+    pack_u64(p, start);   p += 8;
+    pack_u64(p, length);  p += 8;
+    pack_u32(p, proc_id); p += 4;
+    uint16_t cl = cid ? (uint16_t)strlen(cid) : 0;
+    pack_u16(p, cl); p += 2;
+    if (cl) { memcpy(p, cid, cl); p += cl; }
+    uint32_t sz = (uint32_t)(p - req);
+    pack_u32(req, sz);
+    req[4] = STM_9P_TLOCK;
+    pack_u16(req + 5, tag);
+    return sz;
+}
+
 /* ── helpers ─────────────────────────────────────────────────────────── */
 
 static stm_9p_server *make_server(stm_fs *fs)
@@ -1259,6 +1329,307 @@ STM_TEST(p9_renameat_within_same_dir) {
     STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
     STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
     walk_to(s, 100, 102, "new");
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* ── P9-9P-1d tests: Tsetattr / Tstatfs / Tfsync / Tlock / Tgetlock ──── */
+
+STM_TEST(p9_setattr_chmod_via_valid_mask) {
+    make_tmp("9p_setattr_chmod");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)mk_file(fs, root, "f");
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "f");
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    /* Set mode to 0600. */
+    uint32_t sz = build_tsetattr(req, 2, 101,
+                                  STM_9P_SETATTR_MODE,
+                                  /*mode=*/0600,
+                                  0, 0, 0, 0, 0, 0, 0);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RSETATTR);
+
+    /* Verify via Tgetattr. */
+    sz = build_tgetattr(req, 3, 101, STM_9P_GETATTR_BASIC);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RGETATTR);
+    /* Skip header(7) + valid(8) + qid(13) → mode at offset 7+8+13 = 28. */
+    uint32_t mode = load_u32(resp + 28);
+    STM_ASSERT_EQ(mode & 0777u, 0600u);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_setattr_size_truncates_file) {
+    make_tmp("9p_setattr_size");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)mk_file(fs, root, "f");
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "f");
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    /* Open + write some bytes first. */
+    uint32_t sz = build_tlopen(req, 2, 101, STM_9P_O_RDWR);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    sz = build_twrite(req, 3, 101, 0, "ABCDE", 5);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    /* Now truncate via Tsetattr SIZE. */
+    sz = build_tsetattr(req, 4, 101,
+                        STM_9P_SETATTR_SIZE,
+                        0, 0, 0, /*size=*/2, 0, 0, 0, 0);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RSETATTR);
+    /* Read back — should be 2 bytes "AB". */
+    sz = build_tread(req, 5, 101, 0, 64);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RREAD);
+    STM_ASSERT_EQ(load_u32(resp + 7), 2u);
+    STM_ASSERT_MEM_EQ(resp + 11, "AB", 2);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_setattr_size_on_dir_returns_einval) {
+    make_tmp("9p_setattr_size_dir");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    /* Tsetattr SIZE on root fid (a dir) → EINVAL. */
+    uint32_t sz = build_tsetattr(req, 2, 100,
+                                  STM_9P_SETATTR_SIZE,
+                                  0, 0, 0, 0, 0, 0, 0, 0);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EINVAL);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_statfs_returns_stratum_magic) {
+    make_tmp("9p_statfs");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    uint32_t sz = build_tstatfs(req, 2, 100);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RSTATFS);
+    /* Rstatfs: type[4] bsize[4] blocks[8] bfree[8] bavail[8] files[8]
+     *            ffree[8] fsid[8] namelen[4] */
+    uint32_t type = load_u32(resp + 7);
+    STM_ASSERT_EQ(type, 0x53545241u);   /* "STRA" */
+    uint32_t bsize = load_u32(resp + 11);
+    STM_ASSERT_EQ(bsize, 4096u);
+    /* namelen at offset 7+4+4+8+8+8+8+8+8 = 63. */
+    uint32_t namelen = load_u32(resp + 63);
+    STM_ASSERT_EQ(namelen, STM_9P_NAME_MAX);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_fsync_returns_rfsync) {
+    make_tmp("9p_fsync");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    uint32_t sz = build_tfsync(req, 2, 100, /*datasync=*/0);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RFSYNC);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_lock_acquire_and_release) {
+    make_tmp("9p_lock");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)mk_file(fs, root, "f");
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "f");
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    /* Acquire WRLCK on [0, 100). */
+    uint32_t sz = build_tlock(req, 2, 101,
+                                STM_9P_LOCK_TYPE_WRLCK, 0,
+                                0, 100, 1234, "client_a");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLOCK);
+    STM_ASSERT_EQ(resp[7], STM_9P_LOCK_SUCCESS);
+
+    /* Release. */
+    sz = build_tlock(req, 3, 101,
+                      STM_9P_LOCK_TYPE_UNLCK, 0,
+                      0, 100, 1234, "client_a");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLOCK);
+    STM_ASSERT_EQ(resp[7], STM_9P_LOCK_SUCCESS);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_lock_blocked_on_conflict) {
+    make_tmp("9p_lock_conflict");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)mk_file(fs, root, "f");
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "f");
+    walk_to(s, 100, 102, "f");
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    /* fid 101 acquires WRLCK on [0, 100). */
+    uint32_t sz = build_tlock(req, 2, 101,
+                                STM_9P_LOCK_TYPE_WRLCK, 0,
+                                0, 100, 1, "a");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[7], STM_9P_LOCK_SUCCESS);
+
+    /* fid 102 tries WRLCK on overlapping range — different owner_id
+     * (different fid → different lock_owner_base+fid), should BLOCK. */
+    sz = build_tlock(req, 3, 102,
+                      STM_9P_LOCK_TYPE_WRLCK, STM_9P_LOCK_FLAG_BLOCK,
+                      50, 100, 2, "b");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLOCK);
+    STM_ASSERT_EQ(resp[7], STM_9P_LOCK_BLOCKED);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_lock_released_on_clunk) {
+    make_tmp("9p_lock_clunk");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)mk_file(fs, root, "f");
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "f");
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    /* fid 101 acquires WRLCK. */
+    uint32_t sz = build_tlock(req, 2, 101,
+                                STM_9P_LOCK_TYPE_WRLCK, 0,
+                                0, 100, 1, "a");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[7], STM_9P_LOCK_SUCCESS);
+
+    /* Clunk — must release the lock (composes locks.tla::ReleaseOwner +
+     * fid.tla::Clunk's lock-release-on-clunk). */
+    sz = build_tclunk(req, 3, 101);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RCLUNK);
+
+    /* A fresh fid must now be able to acquire the same range. */
+    walk_to(s, 100, 102, "f");
+    sz = build_tlock(req, 4, 102,
+                      STM_9P_LOCK_TYPE_WRLCK, 0,
+                      0, 100, 2, "b");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[7], STM_9P_LOCK_SUCCESS);
 
     free(req); free(resp);
     stm_9p_server_destroy(s);

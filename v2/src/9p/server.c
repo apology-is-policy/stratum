@@ -35,6 +35,7 @@
 #include <stratum/dirent.h>     /* STM_DT_* */
 #include <stratum/fs.h>
 #include <stratum/inode.h>
+#include <stratum/locks.h>      /* STM_LOCK_SHARED / EXCLUSIVE */
 #include <stratum/types.h>
 
 #include "wire.h"
@@ -1473,6 +1474,372 @@ static stm_status h_renameat(stm_9p_server *s,
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
+/* h_setattr — Tsetattr / Rsetattr.                                        */
+/* Tsetattr:  fid[4] valid[4] mode[4] uid[4] gid[4] size[8]                */
+/*            atime_sec[8] atime_nsec[8]                                   */
+/*            mtime_sec[8] mtime_nsec[8]                                   */
+/* Rsetattr:  (header only)                                                 */
+/*                                                                         */
+/* Routes per the valid mask: SIZE → stm_fs_truncate; MODE → stm_fs_chmod; */
+/* UID/GID → stm_fs_chown; ATIME/MTIME → stm_fs_utimens. CTIME-set is      */
+/* handled by stm_fs_chmod / utimens stamping ctime automatically.         */
+/* ────────────────────────────────────────────────────────────────────── */
+
+static stm_status h_setattr(stm_9p_server *s,
+                              const uint8_t *body, uint32_t body_len,
+                              uint16_t tag,
+                              uint8_t *resp, uint32_t resp_cap,
+                              uint32_t *resp_len)
+{
+    if (body_len < 4 + 4 + 4 + 4 + 4 + 8 + 8 + 8 + 8 + 8)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+    uint32_t fid        = p9l_g32(body);
+    uint32_t valid      = p9l_g32(body + 4);
+    uint32_t new_mode   = p9l_g32(body + 8);
+    uint32_t new_uid    = p9l_g32(body + 12);
+    uint32_t new_gid    = p9l_g32(body + 16);
+    uint64_t new_size   = p9l_g64(body + 20);
+    uint64_t at_sec     = p9l_g64(body + 28);
+    uint64_t at_nsec    = p9l_g64(body + 36);
+    uint64_t mt_sec     = p9l_g64(body + 44);
+    uint64_t mt_nsec    = p9l_g64(body + 52);
+
+    p9_fid *f = fid_get(s, fid);
+    if (!f)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+    /* Snapshot current attrs for the chown(-1, ...) "leave unchanged"
+     * semantics — Linux uses UINT32_MAX as the sentinel; .L's valid
+     * mask is the cleaner mechanism but stm_fs_chown takes the
+     * sentinel, so we plumb both. */
+    struct stm_inode_value iv;
+    stm_status vrc = verify_fid_fresh(s, f, &iv);
+    if (vrc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
+
+    /* SIZE — refused on dirs/symlinks (Linux POSIX). */
+    if (valid & STM_9P_SETATTR_SIZE) {
+        uint32_t curmode = stm_load_le32(iv.si_mode);
+        if ((curmode & 0170000u) != 0100000u)   /* not S_IFREG */
+            return reply_rlerror(resp, resp_cap, resp_len, tag,
+                                  STM_9P_ECODE_EINVAL);
+        stm_status rc = stm_fs_truncate(s->fs, f->dataset_id, f->ino, new_size);
+        if (rc != STM_OK)
+            return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+        /* Refresh cached_gen after potential gen bump. */
+        struct stm_inode_value post;
+        if (stm_fs_stat(s->fs, f->dataset_id, f->ino, &post) == STM_OK)
+            f->cached_gen = (uint32_t)stm_load_le64(post.si_gen);
+    }
+
+    /* MODE. */
+    if (valid & STM_9P_SETATTR_MODE) {
+        stm_status rc = stm_fs_chmod(s->fs, f->dataset_id, f->ino,
+                                        new_mode & 07777u);
+        if (rc != STM_OK)
+            return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+    }
+
+    /* UID / GID. .L sends both fields always; the valid mask says
+     * which to apply. Use UINT32_MAX as the "leave unchanged" sentinel
+     * passed into stm_fs_chown (matches Linux chown(-1, ...)). */
+    if ((valid & STM_9P_SETATTR_UID) || (valid & STM_9P_SETATTR_GID)) {
+        uint32_t pass_uid = (valid & STM_9P_SETATTR_UID) ? new_uid : UINT32_MAX;
+        uint32_t pass_gid = (valid & STM_9P_SETATTR_GID) ? new_gid : UINT32_MAX;
+        stm_status rc = stm_fs_chown(s->fs, f->dataset_id, f->ino,
+                                        pass_uid, pass_gid);
+        if (rc != STM_OK)
+            return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+    }
+
+    /* ATIME / MTIME. ATIME_SET / MTIME_SET indicate the sec/nsec is
+     * client-supplied; without those bits but with ATIME / MTIME, the
+     * client wants "now" (Linux UTIME_NOW semantics). For v2.0 we
+     * always plumb the supplied sec/nsec; stm_fs_utimens stamps ctime
+     * automatically. */
+    if ((valid & STM_9P_SETATTR_ATIME) || (valid & STM_9P_SETATTR_MTIME)) {
+        /* If a field isn't being updated, pass through current value. */
+        uint64_t use_at_sec = (valid & STM_9P_SETATTR_ATIME) ? at_sec
+                              : stm_load_le64(iv.si_atime_sec);
+        uint32_t use_at_nsec = (valid & STM_9P_SETATTR_ATIME) ? (uint32_t)at_nsec
+                              : stm_load_le32(iv.si_atime_nsec);
+        uint64_t use_mt_sec = (valid & STM_9P_SETATTR_MTIME) ? mt_sec
+                              : stm_load_le64(iv.si_mtime_sec);
+        uint32_t use_mt_nsec = (valid & STM_9P_SETATTR_MTIME) ? (uint32_t)mt_nsec
+                              : stm_load_le32(iv.si_mtime_nsec);
+        /* ctime stamped to "now" by the wrapper — pass 0/0 to signal
+         * "use current time". */
+        stm_status rc = stm_fs_utimens(s->fs, f->dataset_id, f->ino,
+                                          use_at_sec, use_at_nsec,
+                                          use_mt_sec, use_mt_nsec,
+                                          /*ctime_sec=*/0,
+                                          /*ctime_nsec=*/0);
+        if (rc != STM_OK)
+            return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+    }
+
+    uint32_t need = STM_9P_HDR_SIZE;
+    if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
+    uint8_t *wp = resp + 4;
+    *wp++ = STM_9P_RSETATTR;
+    p9l_p16(wp, tag); wp += 2;
+    resp_finish(resp, resp_len, wp);
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* h_statfs — Tstatfs / Rstatfs.                                           */
+/* Tstatfs:  fid[4]                                                         */
+/* Rstatfs:  type[4] bsize[4] blocks[8] bfree[8] bavail[8]                  */
+/*           files[8] ffree[8] fsid[8] namelen[4]                           */
+/* ────────────────────────────────────────────────────────────────────── */
+
+#define STM_9P_FS_MAGIC  0x53545241u   /* "STRA" — Stratum FS magic. */
+
+static stm_status h_statfs(stm_9p_server *s,
+                             const uint8_t *body, uint32_t body_len,
+                             uint16_t tag,
+                             uint8_t *resp, uint32_t resp_cap,
+                             uint32_t *resp_len)
+{
+    if (body_len < 4)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+    uint32_t fid = p9l_g32(body);
+    p9_fid *f = fid_get(s, fid);
+    if (!f)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+
+    stm_fs_stats stats;
+    stm_status rc = stm_fs_stats_get(s->fs, &stats);
+    if (rc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+
+    /* fsid: derive from the server's lock_owner_base — a process-wide
+     * monotonic that's stable for the server's lifetime. Better than 0
+     * for clients that deduplicate by fsid. v2.1+ could use the pool
+     * UUID. */
+    uint64_t fsid = s->lock_owner_base;
+    /* files / ffree: the inode allocator is unbounded by ino space
+     * size up to UINT64_MAX. Reporting a huge files count + ffree
+     * tracks the spirit of "approximately unlimited" without ever
+     * misleading a `df -i` consumer. */
+    uint64_t files  = UINT64_C(1) << 56;
+    uint64_t ffree  = files - 1u;       /* ~all free */
+
+    uint32_t need = STM_9P_HDR_SIZE + 4u + 4u + 8u*5u + 4u;
+    if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
+    uint8_t *wp = resp + 4;
+    *wp++ = STM_9P_RSTATFS;
+    p9l_p16(wp, tag); wp += 2;
+    p9l_p32(wp, STM_9P_FS_MAGIC); wp += 4;
+    p9l_p32(wp, 4096u); wp += 4;                          /* bsize */
+    p9l_p64(wp, stats.data_total_blocks); wp += 8;
+    p9l_p64(wp, stats.data_free_blocks);  wp += 8;        /* bfree */
+    p9l_p64(wp, stats.data_free_blocks);  wp += 8;        /* bavail */
+    p9l_p64(wp, files); wp += 8;
+    p9l_p64(wp, ffree); wp += 8;
+    p9l_p64(wp, fsid);  wp += 8;
+    p9l_p32(wp, STM_9P_NAME_MAX); wp += 4;                /* namelen */
+    resp_finish(resp, resp_len, wp);
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* h_fsync — Tfsync / Rfsync.                                              */
+/* Tfsync:  fid[4] datasync[4]                                             */
+/* Rfsync:  (header only)                                                   */
+/*                                                                         */
+/* For v2.0 routes to stm_fs_commit (whole-pool fsync). datasync flag      */
+/* ignored — we don't yet differentiate data-only vs full fsync;           */
+/* per-file fsync requires a new stm_fs_* API (forward-note).              */
+/* ────────────────────────────────────────────────────────────────────── */
+
+static stm_status h_fsync(stm_9p_server *s,
+                            const uint8_t *body, uint32_t body_len,
+                            uint16_t tag,
+                            uint8_t *resp, uint32_t resp_cap,
+                            uint32_t *resp_len)
+{
+    if (body_len < 4 + 4)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+    uint32_t fid = p9l_g32(body);
+    /* datasync = body+4 ignored — see header comment. */
+    p9_fid *f = fid_get(s, fid);
+    if (!f)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+
+    stm_status rc = stm_fs_commit(s->fs);
+    if (rc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+
+    uint32_t need = STM_9P_HDR_SIZE;
+    if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
+    uint8_t *wp = resp + 4;
+    *wp++ = STM_9P_RFSYNC;
+    p9l_p16(wp, tag); wp += 2;
+    resp_finish(resp, resp_len, wp);
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* h_lock — Tlock / Rlock.                                                 */
+/* Tlock:   fid[4] type[1] flags[4] start[8] length[8]                     */
+/*          proc_id[4] client_id[s]                                        */
+/* Rlock:   status[1]                                                       */
+/*                                                                         */
+/* type ∈ {RDLCK=0, WRLCK=1, UNLCK=2}.                                     */
+/* For UNLCK: stm_fs_unlock. For RDLCK/WRLCK: stm_fs_lock (non-blocking).  */
+/* If BLOCK flag is set + the acquire fails with EAGAIN, return BLOCKED    */
+/* status (the client retries). client_id passed through advisory; the    */
+/* server's lock-owner is per-fid (lock_owner_base + fid) — matches OFD-  */
+/* lock semantics (Linux F_OFD_SETLK). v2.1+ may map client_id+proc_id   */
+/* into the owner_id for traditional fcntl semantics (forward-note).      */
+/* ────────────────────────────────────────────────────────────────────── */
+
+static stm_status h_lock(stm_9p_server *s,
+                           const uint8_t *body, uint32_t body_len,
+                           uint16_t tag,
+                           uint8_t *resp, uint32_t resp_cap,
+                           uint32_t *resp_len)
+{
+    if (body_len < 4 + 1 + 4 + 8 + 8 + 4 + 2)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+    uint32_t fid    = p9l_g32(body);
+    uint8_t  type   = body[4];
+    uint32_t flags  = p9l_g32(body + 5);
+    uint64_t start  = p9l_g64(body + 9);
+    uint64_t length = p9l_g64(body + 17);
+    /* proc_id at body+25 ignored (advisory). */
+    const uint8_t *bp = body + 29;
+    const uint8_t *end = body + body_len;
+    uint16_t cid_len;
+    const char *cid __attribute__((unused)) = p9l_gstr(&bp, end, &cid_len);
+    /* cid_len == 0 is fine (some clients send empty client_id). */
+
+    p9_fid *f = fid_get(s, fid);
+    if (!f)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+    stm_status vrc = verify_fid_fresh(s, f, NULL);
+    if (vrc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
+
+    uint64_t owner_id = s->lock_owner_base + f->fid;
+    uint8_t status = STM_9P_LOCK_SUCCESS;
+
+    if (type == STM_9P_LOCK_TYPE_UNLCK) {
+        stm_status rc = stm_fs_unlock(s->fs, f->dataset_id, f->ino,
+                                         owner_id, start, length);
+        if (rc != STM_OK)
+            return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+    } else if (type == STM_9P_LOCK_TYPE_RDLCK ||
+               type == STM_9P_LOCK_TYPE_WRLCK) {
+        uint8_t lock_type = (type == STM_9P_LOCK_TYPE_WRLCK)
+                              ? STM_LOCK_EXCLUSIVE
+                              : STM_LOCK_SHARED;
+        stm_status rc = stm_fs_lock(s->fs, f->dataset_id, f->ino,
+                                       owner_id, lock_type, start, length);
+        if (rc == STM_EAGAIN) {
+            /* Conflict. Per .L: BLOCK flag → return BLOCKED status,
+             * client retries. Without BLOCK flag → return BLOCKED too
+             * (the only meaningful EAGAIN-shape status; ERROR is for
+             * permanent-failure cases). */
+            status = STM_9P_LOCK_BLOCKED;
+            (void)flags;        /* both with + without BLOCK: BLOCKED */
+        } else if (rc != STM_OK) {
+            return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+        }
+    } else {
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
+    }
+
+    uint32_t need = STM_9P_HDR_SIZE + 1u;
+    if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
+    uint8_t *wp = resp + 4;
+    *wp++ = STM_9P_RLOCK;
+    p9l_p16(wp, tag); wp += 2;
+    *wp++ = status;
+    resp_finish(resp, resp_len, wp);
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* h_getlock — Tgetlock / Rgetlock.                                        */
+/* Tgetlock:  fid[4] type[1] start[8] length[8] proc_id[4] client_id[s]    */
+/* Rgetlock:  type[1] start[8] length[8] proc_id[4] client_id[s]           */
+/*                                                                         */
+/* If a conflicting lock exists, return its details (type ∈ {RD,WR}LCK,    */
+/* the conflicting owner). Otherwise return type=UNLCK with the request's */
+/* own start/length/proc_id/client_id echoed back.                         */
+/* ────────────────────────────────────────────────────────────────────── */
+
+static stm_status h_getlock(stm_9p_server *s,
+                              const uint8_t *body, uint32_t body_len,
+                              uint16_t tag,
+                              uint8_t *resp, uint32_t resp_cap,
+                              uint32_t *resp_len)
+{
+    if (body_len < 4 + 1 + 8 + 8 + 4 + 2)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+    uint32_t fid    = p9l_g32(body);
+    uint8_t  type   = body[4];
+    uint64_t start  = p9l_g64(body + 5);
+    uint64_t length = p9l_g64(body + 13);
+    uint32_t proc_id = p9l_g32(body + 21);
+    const uint8_t *bp = body + 25;
+    const uint8_t *end = body + body_len;
+    uint16_t cid_len;
+    const char *cid = p9l_gstr(&bp, end, &cid_len);
+    if (!cid && cid_len != 0)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+
+    p9_fid *f = fid_get(s, fid);
+    if (!f)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+    stm_status vrc = verify_fid_fresh(s, f, NULL);
+    if (vrc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
+
+    uint64_t owner_id = s->lock_owner_base + f->fid;
+    uint8_t lock_type = (type == STM_9P_LOCK_TYPE_WRLCK)
+                          ? STM_LOCK_EXCLUSIVE
+                          : STM_LOCK_SHARED;
+    bool would_grant = false;
+    uint64_t conflict_owner = 0;
+    stm_status rc = stm_fs_lock_test(s->fs, f->dataset_id, f->ino,
+                                        owner_id, lock_type, start, length,
+                                        &would_grant, &conflict_owner);
+    if (rc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+
+    /* If would_grant: type=UNLCK, echo request's start/length/proc_id/cid.
+     * Otherwise: type=RDLCK/WRLCK (we don't track which); use the lock's
+     * own values. We don't track the conflicting lock's start/length —
+     * v2.0 reports the request's range; the conflict_owner is folded
+     * into proc_id for diagnosis. */
+    uint8_t out_type = STM_9P_LOCK_TYPE_UNLCK;
+    uint64_t out_start = start;
+    uint64_t out_length = length;
+    uint32_t out_proc_id = proc_id;
+    uint16_t out_cid_len = cid_len;
+    if (!would_grant) {
+        out_type = STM_9P_LOCK_TYPE_WRLCK;   /* conservative */
+        out_proc_id = (uint32_t)conflict_owner;
+    }
+
+    uint32_t need = STM_9P_HDR_SIZE + 1u + 8u + 8u + 4u + 2u + out_cid_len;
+    if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
+    uint8_t *wp = resp + 4;
+    *wp++ = STM_9P_RGETLOCK;
+    p9l_p16(wp, tag); wp += 2;
+    *wp++ = out_type;
+    p9l_p64(wp, out_start);  wp += 8;
+    p9l_p64(wp, out_length); wp += 8;
+    p9l_p32(wp, out_proc_id); wp += 4;
+    p9l_pstr(&wp, cid ? cid : "", out_cid_len);
+    resp_finish(resp, resp_len, wp);
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
 /* Public API.                                                             */
 /* ────────────────────────────────────────────────────────────────────── */
 
@@ -1604,6 +1971,21 @@ stm_status stm_9p_server_handle(stm_9p_server *s,
         break;
     case STM_9P_TRENAMEAT:
         rc = h_renameat(s, body, body_len, tag, resp, resp_cap, resp_len);
+        break;
+    case STM_9P_TSETATTR:
+        rc = h_setattr(s, body, body_len, tag, resp, resp_cap, resp_len);
+        break;
+    case STM_9P_TSTATFS:
+        rc = h_statfs(s, body, body_len, tag, resp, resp_cap, resp_len);
+        break;
+    case STM_9P_TFSYNC:
+        rc = h_fsync(s, body, body_len, tag, resp, resp_cap, resp_len);
+        break;
+    case STM_9P_TLOCK:
+        rc = h_lock(s, body, body_len, tag, resp, resp_cap, resp_len);
+        break;
+    case STM_9P_TGETLOCK:
+        rc = h_getlock(s, body, body_len, tag, resp, resp_cap, resp_len);
         break;
     case STM_9P_TAUTH:
         /* Stratum uses Unix-socket SO_PEERCRED for authn at the daemon
