@@ -2879,44 +2879,167 @@ stm_status stm_fs_removexattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     return s;
 }
 
+/* P7-16 / P10b: shared inner reflink under caller's fs->lock.
+ *
+ * Held-fs->lock helper used by stm_fs_reflink + stm_fs_copy_file_range.
+ * Centralizes the lookup → guards → sync_reflink → post-success
+ * stamping pipeline so callers don't drop the lock mid-operation
+ * (R84 P2-1 fix: prevents the size-probe TOCTOU between cfp's
+ * size-assertion lookup and the inner reflink).
+ *
+ * R82 P0-1: seal enforcement on dst (SEAL_WRITE / FUTURE_WRITE
+ * refuse all reflinks; SEAL_GROW refuses if src would extend dst).
+ *
+ * R84 P2-2 fix: refuse if src or dst is not S_IFREG (matches Linux
+ * FICLONE / copy_file_range — non-regular files refuse with EINVAL).
+ * Closes the corruption path where a directory / symlink / device
+ * dst would receive si_size=src_size + INLINE-empty stamping.
+ *
+ * R84 P0-1 fix: refuse if src is any non-EXTENT kind with non-zero
+ * size (was: only refused INLINE-with-content). SYMLINK-with-content
+ * src would otherwise silently leave dst with si_size=src_size +
+ * si_data_kind=INLINE + si_data_len=0; reads return src_size zero
+ * bytes — data fabrication. Generalized guard catches SYMLINK,
+ * DEVICE, and any future non-EXTENT kind.
+ *
+ * R84 P3-1 fix: src + dst lookups happen UNCONDITIONALLY (legacy
+ * mixed-state callers — dst legacy + src INLINE — would otherwise
+ * skip the inline-source guard).
+ *
+ * R81 P3-8 / P10b: post-success stamping aligns dst's si_size +
+ * si_data_kind to src's + stamps mtime/ctime to "now" — only fires
+ * when dst has an inode record in the index. */
+static stm_status fs_reflink_locked(stm_fs *fs,
+                                          uint64_t src_dataset_id,
+                                          uint64_t src_ino,
+                                          uint64_t dst_dataset_id,
+                                          uint64_t dst_ino)
+{
+    /* Caller holds fs->lock + has applied FS_GUARD_WRITE. */
+
+    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+    struct stm_inode_value div = {0};
+    struct stm_inode_value siv = {0};
+    bool dst_has_inode = false;
+    bool src_has_inode = false;
+    if (iidx) {
+        /* R84 P3-1: lookups run independently — neither is gated on
+         * the other's success. */
+        stm_status sls = stm_inode_lookup(iidx, src_dataset_id,
+                                               src_ino, &siv);
+        if (sls == STM_OK) src_has_inode = true;
+        stm_status dls = stm_inode_lookup(iidx, dst_dataset_id,
+                                               dst_ino, &div);
+        if (dls == STM_OK) dst_has_inode = true;
+    }
+
+    /* R84 P2-2: refuse if either side is not S_IFREG. POSIX
+     * copy_file_range / Linux FICLONE both refuse non-regular files
+     * (EINVAL). v2's stm_fs_reflink previously accepted any kind,
+     * which combined with stamping left a corruption surface for
+     * directory / symlink / device dst. */
+    if (src_has_inode) {
+        uint32_t smode = stm_load_le32(siv.si_mode);
+        if ((smode & (uint32_t)S_IFMT) != (uint32_t)S_IFREG) {
+            return STM_EINVAL;
+        }
+    }
+    if (dst_has_inode) {
+        uint32_t dmode = stm_load_le32(div.si_mode);
+        if ((dmode & (uint32_t)S_IFMT) != (uint32_t)S_IFREG) {
+            return STM_EINVAL;
+        }
+    }
+
+    /* R82 P0-1: seal enforcement on dst. */
+    if (dst_has_inode) {
+        uint32_t dflags = stm_load_le32(div.si_flags);
+        if (dflags & (STM_INO_FLAG_SEAL_WRITE |
+                      STM_INO_FLAG_SEAL_FUTURE_WRITE)) {
+            return STM_EPERM;
+        }
+        if (dflags & STM_INO_FLAG_SEAL_GROW) {
+            /* SEAL_GROW refuses if reflink would extend dst's
+             * si_size. POSIX-conservative: refuse on any source with
+             * more bytes than dst, regardless of whether dst is
+             * actually empty (sync_reflink also refuses dst with
+             * extents via STM_EEXIST, so this only matters for
+             * empty-dst cases). */
+            if (src_has_inode) {
+                uint64_t src_size = stm_load_le64(siv.si_size);
+                uint64_t dst_size = stm_load_le64(div.si_size);
+                if (src_size > dst_size) {
+                    return STM_EPERM;
+                }
+            }
+        }
+    }
+
+    /* R84 P0-1 + R84 P3-1: refuse non-EXTENT src with non-zero size
+     * REGARDLESS of dst_has_inode. The pre-fix gate was conditioned
+     * on dst_has_inode; legacy mixed-state callers would skip this
+     * check and hit the silent-empty-dst data-loss path.
+     *
+     * Catches: STM_DATA_INLINE with content (src has inline_data
+     * but no extents); STM_DATA_SYMLINK with content (src has
+     * symlink_target but no extents); future STM_DATA_DEVICE with
+     * size > 0; any future non-EXTENT kind. STM_DATA_EXTENT is the
+     * only kind reflink can correctly share. */
+    if (src_has_inode &&
+        siv.si_data_kind != STM_DATA_EXTENT &&
+        stm_load_le64(siv.si_size) > 0) {
+        return STM_ENOTSUPPORTED;
+    }
+
+    stm_status s = stm_sync_reflink(fs->sync,
+                                       src_dataset_id, src_ino,
+                                       dst_dataset_id, dst_ino);
+    if (s != STM_OK) return s;
+
+    /* R81 P3-8 / P10b: post-success stamping + size/kind sync. */
+    if (dst_has_inode) {
+        if (src_has_inode) {
+            uint64_t src_size = stm_load_le64(siv.si_size);
+            div.si_size = stm_store_le64(src_size);
+            /* If src had extents (the only path past the non-EXTENT
+             * guard), mirror on dst so subsequent reads dispatch to
+             * the EXTENT path. inode.tla::OneWayInlineToExtent
+             * permits this transition. */
+            if (siv.si_data_kind == STM_DATA_EXTENT) {
+                div.si_data_kind = STM_DATA_EXTENT;
+                div.si_data_len = 0;
+                memset(&div.si_data, 0, sizeof div.si_data);
+            }
+        }
+        /* R84 P3-2 forward-note: when src_has_inode is FALSE (legacy
+         * direct-extent src) but sync_reflink installed records on
+         * dst, dst's si_data_kind stays at its loaded value (typically
+         * INLINE). Today no production callsite mixes legacy src with
+         * indexed dst, so this is latent. Future "extent-count probe"
+         * fix would query stm_extent_count_for_ino post-success and
+         * flip data_kind to EXTENT if non-zero. */
+        fs_stamp_mtime_ctime_now(&div);
+        /* R76 P3-1 / R78 P3-1 lock-posture infallibility: only fields
+         * touched are si_size + si_data_kind + si_data + ts; gen /
+         * nlink / seal-bits unchanged. */
+        return stm_inode_set(iidx, dst_dataset_id, dst_ino, &div);
+    }
+
+    return STM_OK;
+}
+
 /* P7-16: stm_fs_reflink. POSIX-shape FICLONE — replaces dst's empty
- * extent tree with a reflink-share of src's. Holds fs->lock across the
- * inner sync_reflink so a concurrent observer can't see a partial
- * dst. Errors propagate from stm_sync_reflink.
+ * extent tree with a reflink-share of src's. Holds fs->lock across
+ * the entire pipeline (lookup + guards + sync_reflink + stamping)
+ * via fs_reflink_locked.
  *
- * R82 P0-1 fix: enforce dst-inode file seals BEFORE delegating to
- * stm_sync_reflink. Reflink installs HOT/COLD extent records onto
- * dst's empty extent tree — from the POSIX/FICLONE perspective this
- * IS a content modification (Linux's kernel reflink path checks
- * IS_IMMUTABLE + F_SEAL_WRITE and refuses with EPERM). Without this
- * check a SEAL_WRITE'd dst could be silently overwritten via reflink,
- * defeating the whole sealing surface. SEAL_GROW also refuses if the
- * source has any content (reflink would extend dst's si_size from 0).
+ * Refuses non-regular files (R84 P2-2; matches Linux FICLONE) and
+ * non-EXTENT-kind sources with non-zero size (R84 P0-1; would
+ * otherwise silently leave dst empty with INLINE/SYMLINK src state
+ * stamped onto a regular-file dst — a data-fabrication path).
  *
- * The seal check is best-effort — if dst inode lookup fails (missing
- * inode-index, ENOENT), we fall through to stm_sync_reflink which
- * will surface the error itself; we don't synthesize errors here.
- * For dst inodes that DO exist, the seal mask is read under fs->lock
- * which is held across the entire reflink so there's no race window.
- *
- * P8-POSIX-10b R81 P3-8 fix: on successful sync_reflink, stamp dst-
- * inode mtime+ctime + update si_size to match src's si_size + flip
- * si_data_kind to STM_DATA_EXTENT if src had any extent records
- * (signaled by src's si_data_kind == EXTENT post-load). Per POSIX
- * copy_file_range(2): "On success, copy_file_range() also updates
- * the file timestamps of the destination file." Stamping runs only
- * when dst has an inode record in the index — legacy direct-extent
- * callers (no inode in index) preserve their pre-7a behavior.
- *
- * Inline-source caveat: if src is STM_DATA_INLINE (size <=
- * STM_INODE_INLINE_MAX, content stored in inline_data), the extent
- * iter in sync_reflink finds nothing to share; dst's extent tree
- * stays empty + size stays 0 + content is silently lost. The
- * post-success stamping path detects this (src_size > 0 but no
- * extent_kind on src) and returns STM_ENOTSUPPORTED, leaving dst
- * unchanged. Future "inline-aware reflink" sub-chunk would either
- * copy inline data via inode_set OR transition src to EXTENT before
- * reflink. Forward-noted in phase8-status P8-POSIX-10 row. */
+ * Errors propagate from stm_sync_reflink + the inode-layer guards
+ * documented in fs_reflink_locked. */
 stm_status stm_fs_reflink(stm_fs *fs,
                             uint64_t src_dataset_id, uint64_t src_ino,
                             uint64_t dst_dataset_id, uint64_t dst_ino)
@@ -2924,101 +3047,10 @@ stm_status stm_fs_reflink(stm_fs *fs,
     if (!fs) return STM_EINVAL;
     pthread_mutex_lock(&fs->lock);
     FS_GUARD_WRITE(fs);
-
-    /* R82 P0-1: seal enforcement on the destination inode +
-     * P10b R81 P3-8: cache src + dst inode values for post-success
-     * stamping (avoids re-lookup after sync_reflink). */
-    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
-    struct stm_inode_value div = {0};
-    struct stm_inode_value siv = {0};
-    bool dst_has_inode = false;
-    bool src_has_inode = false;
-    if (iidx) {
-        stm_status dls = stm_inode_lookup(iidx, dst_dataset_id, dst_ino, &div);
-        if (dls == STM_OK) {
-            dst_has_inode = true;
-            uint32_t dflags = stm_load_le32(div.si_flags);
-            if (dflags & (STM_INO_FLAG_SEAL_WRITE |
-                          STM_INO_FLAG_SEAL_FUTURE_WRITE)) {
-                pthread_mutex_unlock(&fs->lock);
-                return STM_EPERM;
-            }
-            stm_status sls = stm_inode_lookup(iidx, src_dataset_id,
-                                                   src_ino, &siv);
-            if (sls == STM_OK) src_has_inode = true;
-
-            if (dflags & STM_INO_FLAG_SEAL_GROW) {
-                /* SEAL_GROW refuses if reflink would extend dst's
-                 * si_size. Probe src's size — if non-zero, reflink
-                 * grows dst from current size (typically 0) up to
-                 * src's size. POSIX-conservative: refuse on any
-                 * source with content, regardless of whether dst is
-                 * actually empty (the post-fix invariant should be
-                 * "SEAL_GROW dst can never grow", not "depends on
-                 * src/dst-empty interaction"). */
-                if (src_has_inode) {
-                    uint64_t src_size = stm_load_le64(siv.si_size);
-                    uint64_t dst_size = stm_load_le64(div.si_size);
-                    if (src_size > dst_size) {
-                        pthread_mutex_unlock(&fs->lock);
-                        return STM_EPERM;
-                    }
-                }
-            }
-
-            /* P10b: refuse silent-data-loss on inline-source reflink.
-             * sync_reflink walks src's extent records; if src is
-             * STM_DATA_INLINE with non-zero size, the extent iter
-             * finds nothing to share + dst would silently be left
-             * empty. Refuse with STM_ENOTSUPPORTED so the caller can
-             * fall back to read+write (or wait for the future
-             * inline-aware reflink chunk). */
-            if (src_has_inode &&
-                siv.si_data_kind == STM_DATA_INLINE &&
-                stm_load_le64(siv.si_size) > 0) {
-                pthread_mutex_unlock(&fs->lock);
-                return STM_ENOTSUPPORTED;
-            }
-        }
-    }
-
-    stm_status s = stm_sync_reflink(fs->sync,
-                                       src_dataset_id, src_ino,
-                                       dst_dataset_id, dst_ino);
-    if (s != STM_OK) {
-        pthread_mutex_unlock(&fs->lock);
-        return s;
-    }
-
-    /* P10b R81 P3-8: post-success stamping + size/kind sync on dst.
-     * Only fires when dst has an inode record (legacy direct-extent
-     * callers without an inode skip stamping — pre-7a behavior). */
-    if (dst_has_inode) {
-        if (src_has_inode) {
-            uint64_t src_size = stm_load_le64(siv.si_size);
-            div.si_size = stm_store_le64(src_size);
-            /* If src had extents (and we got here past the inline-
-             * source guard), src_data_kind is EXTENT; mirror on dst
-             * so subsequent reads dispatch to the EXTENT path.
-             * stm_inode.tla::OneWayInlineToExtent permits this
-             * transition. */
-            if (siv.si_data_kind == STM_DATA_EXTENT) {
-                div.si_data_kind = STM_DATA_EXTENT;
-                div.si_data_len = 0;
-                memset(&div.si_data, 0, sizeof div.si_data);
-            }
-        }
-        fs_stamp_mtime_ctime_now(&div);
-        /* R76 P3-1 / R78 P3-1 lock-posture infallibility: only fields
-         * touched are si_size + si_data_kind + si_data + ts; gen /
-         * nlink / seal-bits unchanged. */
-        stm_status rs = stm_inode_set(iidx, dst_dataset_id, dst_ino, &div);
-        pthread_mutex_unlock(&fs->lock);
-        return rs;
-    }
-
+    stm_status s = fs_reflink_locked(fs, src_dataset_id, src_ino,
+                                          dst_dataset_id, dst_ino);
     pthread_mutex_unlock(&fs->lock);
-    return STM_OK;
+    return s;
 }
 
 /* P8-POSIX-10b: stm_fs_copy_file_range — POSIX copy_file_range(2)
@@ -3027,16 +3059,12 @@ stm_status stm_fs_reflink(stm_fs *fs,
  * lengths refuse with STM_ENOTSUPPORTED. Caller can fall back to
  * read+write loops for arbitrary ranges (the binding layer typically
  * does this naturally via the EOPNOTSUPP-fallback pattern in glibc's
- * copy_file_range wrapper).
+ * copy_file_range wrapper). `len == 0` is a legal POSIX no-op.
  *
- * Composes over stm_fs_reflink: same atomicity (fs->lock held across
- * the inner reflink), same seal enforcement (R82 P0-1 on dst), same
- * mtime/ctime stamping on success (R81 P3-8 / P10b above), same
- * inline-source refusal (STM_ENOTSUPPORTED for INLINE-with-content).
- *
- * Same-fs only — POSIX copy_file_range across mounts requires the
- * cross-fs path which v2 doesn't have (would need cross-pool
- * encryption-key compatibility checks per ARCH §11.12.3). */
+ * R84 P2-1 fix: holds fs->lock across BOTH the size-validation
+ * lookup AND the inner reflink — closes the size-probe TOCTOU
+ * window where src could grow between probe + reflink, leaving
+ * out_copied < dst's actual post-reflink size. */
 stm_status stm_fs_copy_file_range(stm_fs *fs,
                                     uint64_t src_dataset_id, uint64_t src_ino,
                                     uint64_t src_off,
@@ -3059,10 +3087,8 @@ stm_status stm_fs_copy_file_range(stm_fs *fs,
     pthread_mutex_lock(&fs->lock);
     FS_GUARD_WRITE(fs);
 
-    /* Validate that the requested len matches src's size — partial
-     * copies are not supported in MVP. We could lookup src here for
-     * the assertion + delegate to reflink; reflink itself re-looks-
-     * up under the same fs->lock so the duplication is harmless. */
+    /* Validate that len matches src's size + delegate to the locked
+     * helper — all under the SAME fs->lock acquisition (R84 P2-1). */
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
     if (!iidx) {
         pthread_mutex_unlock(&fs->lock);
@@ -3079,16 +3105,10 @@ stm_status stm_fs_copy_file_range(stm_fs *fs,
         pthread_mutex_unlock(&fs->lock);
         return STM_ENOTSUPPORTED;
     }
-    pthread_mutex_unlock(&fs->lock);
 
-    /* Delegate to stm_fs_reflink which re-acquires fs->lock + does
-     * the actual share + stamping. The brief drop-and-reacquire here
-     * is acceptable because stm_fs_copy_file_range is the public-API
-     * entry; concurrent writers / sealers between the size probe and
-     * reflink-call would surface as STM_EPERM / STM_EEXIST inside
-     * reflink. */
-    stm_status s = stm_fs_reflink(fs, src_dataset_id, src_ino,
-                                       dst_dataset_id, dst_ino);
+    stm_status s = fs_reflink_locked(fs, src_dataset_id, src_ino,
+                                          dst_dataset_id, dst_ino);
+    pthread_mutex_unlock(&fs->lock);
     if (s != STM_OK) return s;
 
     if (out_copied) *out_copied = src_size;

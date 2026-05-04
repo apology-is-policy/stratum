@@ -12521,4 +12521,133 @@ STM_TEST(fs_p10b_copy_file_range_src_missing_returns_enoent) {
     unlink(g_tmp_path); unlink(g_key_path);
 }
 
+STM_TEST(fs_p10b_r84_p0_1_symlink_source_refused) {
+    /* R84 P0-1 regression: pre-fix, reflinking from a SYMLINK src
+     * to a regfile dst silently succeeded (sync_reflink found no
+     * extents on src → dst stayed empty + post-success stamping
+     * wrote si_size=src_size with si_data_kind=INLINE +
+     * si_data_len=0); a subsequent read returned src_size zero
+     * bytes — data fabrication. Post-fix, generalized non-EXTENT
+     * src guard refuses with STM_ENOTSUPPORTED. */
+    make_tmp("p10b_r84_p0_1_symlink_src");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    /* Create a symlink as src + a regfile as dst. */
+    uint64_t lnk = 0, dst = 0;
+    STM_ASSERT_OK(stm_fs_symlink(fs, 1, root, (const uint8_t *)"l", 1,
+                                      (const uint8_t *)"/etc/passwd", 11,
+                                      0, 0, &lnk));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"d", 1,
+                                          0644u, 0, 0, &dst));
+
+    /* Pre-fix: STM_OK + dst silently fabricates 11 zero bytes.
+     * Post-fix: STM_EINVAL (S_IFREG check fires first since
+     * symlink is S_IFLNK, not S_IFREG). */
+    STM_ASSERT_ERR(stm_fs_reflink(fs, 1, lnk, 1, dst), STM_EINVAL);
+
+    /* dst unchanged: still INLINE, size 0. */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, dst, &v));
+    STM_ASSERT_EQ(v.si_data_kind, (uint8_t)STM_DATA_INLINE);
+    STM_ASSERT_EQ(stm_load_le64(v.si_size), 0u);
+
+    /* And dst reads as empty (the data-fabrication shape would have
+     * surfaced 11 zero bytes here pre-fix). */
+    uint8_t buf[16] = {0xAAu};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, dst, 0, buf, 16, &got));
+    STM_ASSERT_EQ(got, 0u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p10b_r84_p2_2_directory_dst_refused) {
+    /* R84 P2-2 regression: pre-fix, reflink onto a directory dst
+     * was accepted (sync_reflink only checks dst-empty, not dst-
+     * mode). Post-fix, S_IFREG check on dst refuses with STM_EINVAL
+     * to match Linux FICLONE semantics. */
+    make_tmp("p10b_r84_p2_2_dir_dst");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t src = 0, dir = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"s", 1,
+                                          0644u, 0, 0, &src));
+    static uint8_t blk[4096] = {0};
+    STM_ASSERT_OK(stm_fs_write(fs, 1, src, 0, blk, 4096));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"d", 1,
+                                    0755u, 0, 0, &dir));
+
+    STM_ASSERT_ERR(stm_fs_reflink(fs, 1, src, 1, dir), STM_EINVAL);
+
+    /* Directory unchanged: still S_IFDIR, size 0. */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, dir, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_mode) & (uint32_t)S_IFMT,
+                  (uint32_t)S_IFDIR);
+    STM_ASSERT_EQ(stm_load_le64(v.si_size), 0u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p10b_r84_p2_2_symlink_dst_refused) {
+    /* Symmetric P2-2: reflink onto a symlink dst also refused. */
+    make_tmp("p10b_r84_p2_2_lnk_dst");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t src = 0, lnk = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"s", 1,
+                                          0644u, 0, 0, &src));
+    static uint8_t blk[4096] = {0};
+    STM_ASSERT_OK(stm_fs_write(fs, 1, src, 0, blk, 4096));
+    STM_ASSERT_OK(stm_fs_symlink(fs, 1, root, (const uint8_t *)"l", 1,
+                                      (const uint8_t *)"/tgt", 4,
+                                      0, 0, &lnk));
+
+    STM_ASSERT_ERR(stm_fs_reflink(fs, 1, src, 1, lnk), STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p10b_r84_p3_4_seal_future_write_only_refuses_reflink) {
+    /* R84 P3-4: SEAL_FUTURE_WRITE alone (no SEAL_WRITE) must also
+     * refuse reflink — sealing surface treats both the same for
+     * non-mmap content modification. The R82 P0-1 fix tested the
+     * combined check via SEAL_WRITE only; this pins FUTURE_WRITE-
+     * solo. */
+    make_tmp("p10b_r84_p3_4_future_write_solo");
+    stm_fs *fs = NULL; uint64_t src = 0, dst = 0;
+    p10b_setup_named_pair(&fs, &src, &dst);
+
+    static uint8_t blk[4096] = {0};
+    STM_ASSERT_OK(stm_fs_write(fs, 1, src, 0, blk, 4096));
+
+    STM_ASSERT_OK(stm_fs_add_seals(fs, 1, dst, STM_FS_SEAL_FUTURE_WRITE));
+    STM_ASSERT_ERR(stm_fs_reflink(fs, 1, src, 1, dst), STM_EPERM);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")
