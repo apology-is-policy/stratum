@@ -766,6 +766,172 @@ stm_status stm_extent_delete_file(stm_extent_index *idx,
     return rs;
 }
 
+/* P8-POSIX-7b PUNCH_HOLE: drop every extent at (ds, ino) fully
+ * contained in [off, off+len). Refuse if any extent crosses a
+ * boundary. */
+stm_status stm_extent_punch_range(stm_extent_index *idx,
+                                       uint64_t dataset_id, uint64_t ino,
+                                       uint64_t off, uint64_t len,
+                                       uint64_t **out_dropped_paddrs,
+                                       size_t *out_n_dropped_paddrs) {
+    if (out_dropped_paddrs) *out_dropped_paddrs = NULL;
+    if (out_n_dropped_paddrs) *out_n_dropped_paddrs = 0;
+    if (!idx || !out_dropped_paddrs || !out_n_dropped_paddrs)
+        return STM_EINVAL;
+    if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+    if (len == 0u) return STM_EINVAL;
+    if (off > UINT64_MAX - len) return STM_EOVERFLOW;
+
+    must_lock(&idx->lock);
+
+    /* Pre-check: refuse if any extent crosses either boundary. */
+    uint64_t r_end = off + len;
+    for (size_t i = 0; i < idx->n_records; i++) {
+        const stm_extent_record *e = &idx->records[i];
+        if (e->dataset_id != dataset_id || e->ino != ino) continue;
+        uint64_t e_end = e->off + e->len;
+        bool overlaps = (e->off < r_end && e_end > off);
+        if (!overlaps) continue;
+        bool fully_in = (e->off >= off && e_end <= r_end);
+        if (!fully_in) {
+            must_unlock(&idx->lock);
+            return STM_ENOTSUPPORTED;
+        }
+    }
+
+    /* Collect drop indices. */
+    size_t *drop_idx = NULL;
+    size_t  n_drops  = 0;
+    size_t  cap      = 0;
+    for (size_t i = 0; i < idx->n_records; i++) {
+        const stm_extent_record *e = &idx->records[i];
+        if (e->dataset_id != dataset_id || e->ino != ino) continue;
+        uint64_t e_end = e->off + e->len;
+        bool fully_in = (e->off >= off && e_end <= r_end);
+        if (!fully_in) continue;
+        if (n_drops == cap) {
+            size_t new_cap = cap == 0 ? 4u : cap * 2u;
+            if (new_cap > SIZE_MAX / sizeof(size_t)) {
+                free(drop_idx);
+                must_unlock(&idx->lock);
+                return STM_ENOMEM;
+            }
+            size_t *grown = realloc(drop_idx, new_cap * sizeof(size_t));
+            if (!grown) {
+                free(drop_idx);
+                must_unlock(&idx->lock);
+                return STM_ENOMEM;
+            }
+            drop_idx = grown;
+            cap = new_cap;
+        }
+        drop_idx[n_drops++] = i;
+    }
+    if (n_drops == 0) {
+        free(drop_idx);
+        must_unlock(&idx->lock);
+        return STM_OK;
+    }
+
+    size_t total = total_replicas_in_drop_set(idx, drop_idx, n_drops);
+    uint64_t *paddrs = calloc(total, sizeof(uint64_t));
+    if (!paddrs) {
+        free(drop_idx);
+        must_unlock(&idx->lock);
+        return STM_ENOMEM;
+    }
+    size_t emitted = remove_indices_locked(idx, drop_idx, n_drops, paddrs);
+    free(drop_idx);
+
+    *out_dropped_paddrs = paddrs;
+    *out_n_dropped_paddrs = emitted;
+    idx->dirty = true;
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+/* P8-POSIX-7b COLLAPSE_RANGE / INSERT_RANGE: shift extent keys at
+ * off >= cutoff by the signed `delta`. Updates records[] in place;
+ * persistence happens at next commit (the btree is rebuilt from
+ * records[]). */
+stm_status stm_extent_shift_range_keys(stm_extent_index *idx,
+                                            uint64_t dataset_id, uint64_t ino,
+                                            uint64_t cutoff,
+                                            int64_t  delta) {
+    if (!idx) return STM_EINVAL;
+    if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+    if (delta == 0) return STM_EINVAL;
+
+    must_lock(&idx->lock);
+
+    /* Validate preconditions across all (ds, ino) extents BEFORE
+     * mutating anything. */
+    for (size_t i = 0; i < idx->n_records; i++) {
+        const stm_extent_record *e = &idx->records[i];
+        if (e->dataset_id != dataset_id || e->ino != ino) continue;
+        uint64_t e_end = e->off + e->len;
+
+        if (delta < 0) {
+            uint64_t adelta = (uint64_t)(-delta);
+            /* COLLAPSE: cutoff is the END of the punched range; the
+             * range [cutoff - adelta, cutoff) must be empty (already
+             * punched). Equivalently, no extent may overlap that
+             * range. */
+            if (cutoff < adelta) {
+                must_unlock(&idx->lock);
+                return STM_EINVAL;
+            }
+            uint64_t hole_start = cutoff - adelta;
+            if (e->off < cutoff && e_end > hole_start) {
+                /* Extent overlaps the hole — caller must clear it
+                 * (e.g., via stm_extent_punch_range) before shifting. */
+                must_unlock(&idx->lock);
+                return STM_ENOTSUPPORTED;
+            }
+            /* Below the hole: untouched. Above cutoff: shift down by
+             * adelta. Range underflow guard. */
+            if (e->off >= cutoff && e->off < adelta) {
+                must_unlock(&idx->lock);
+                return STM_EINVAL;
+            }
+        } else {
+            uint64_t adelta = (uint64_t)delta;
+            /* INSERT: no extent may cross the cutoff. Below cutoff:
+             * untouched. At/above cutoff: shift up by adelta —
+             * shifted end MUST NOT overflow uint64_t. */
+            if (e->off < cutoff && e_end > cutoff) {
+                must_unlock(&idx->lock);
+                return STM_ENOTSUPPORTED;
+            }
+            if (e->off >= cutoff && e->off > UINT64_MAX - adelta) {
+                must_unlock(&idx->lock);
+                return STM_EOVERFLOW;
+            }
+            if (e->off >= cutoff && e_end > UINT64_MAX - adelta) {
+                must_unlock(&idx->lock);
+                return STM_EOVERFLOW;
+            }
+        }
+    }
+
+    /* Apply shift in place — preconditions check passed for all
+     * (ds, ino) extents above. */
+    for (size_t i = 0; i < idx->n_records; i++) {
+        stm_extent_record *e = &idx->records[i];
+        if (e->dataset_id != dataset_id || e->ino != ino) continue;
+        if (e->off < cutoff) continue;
+        if (delta < 0) {
+            uint64_t adelta = (uint64_t)(-delta);
+            e->off -= adelta;
+        } else {
+            e->off += (uint64_t)delta;
+        }
+    }
+    idx->dirty = true;
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
 stm_status stm_extent_reflink(stm_extent_index *idx,
                                 uint64_t dst_dataset_id, uint64_t dst_ino,
                                 uint64_t dst_off, uint64_t len,

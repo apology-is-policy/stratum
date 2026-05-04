@@ -422,6 +422,94 @@ Reflink(src, dst_ds, dst_ino, dst_off) ==
     /\ UNCHANGED <<used_paddrs, current_txg>>
 
 (***************************************************************************)
+(* PunchHole (P8-POSIX-7b) — drop every extent whose range is fully         *)
+(* contained in [off, off+len). Models Linux fallocate(2) FALLOC_FL_PUNCH_  *)
+(* HOLE in its block-aligned shape: when no extent crosses the punch        *)
+(* boundary, the action is a pure drop. Partial-block punches at the       *)
+(* boundaries (extents that straddle off or off+len) are handled by the    *)
+(* C impl as an in-place zero Overwrite — modeled by Overwrite, not by    *)
+(* this action — preserving the spec's structural simplicity.               *)
+(*                                                                           *)
+(* Precondition: every overlapping extent is FULLY CONTAINED in the punch *)
+(* range. The C impl rejects punch ranges that partially-overlap an extent *)
+(* with STM_EINVAL OR re-encrypts the partial-overlap range as zeros via   *)
+(* Overwrite.                                                                *)
+(***************************************************************************)
+PunchHole(ds, ino, off, len) ==
+    /\ ds \in DatasetIds /\ ino \in InoIds
+    /\ off \in FileOffsets /\ len \in LengthsPos
+    /\ off + len <= MaxFileBlocks
+    /\ LET in_range == OverlappingIn(ds, ino, off, len)
+       IN
+        /\ \A e \in in_range :
+              off <= e.off /\ e.off + e.len <= off + len
+        /\ extents' = extents \ in_range
+    /\ UNCHANGED <<used_paddrs, current_txg>>
+
+(***************************************************************************)
+(* CollapseRange (P8-POSIX-7b) — shift every extent at off' >= off+len     *)
+(* down by len, removing the [off, off+len) range entirely. Models Linux   *)
+(* fallocate(2) FALLOC_FL_COLLAPSE_RANGE.                                  *)
+(*                                                                           *)
+(* Preconditions:                                                            *)
+(*   - The range [off, off+len) is empty of extents (no extents to drop).   *)
+(*   - No extent crosses either boundary (off or off+len). Block-aligned    *)
+(*     ranges only — Linux requires this too.                                *)
+(*                                                                           *)
+(* Effect: extents below off stay in place; extents at off' >= off+len      *)
+(* shift to (off' - len). used_paddrs UNCHANGED — the underlying extent    *)
+(* data doesn't move; only its (ds, ino, off) key changes.                  *)
+(***************************************************************************)
+CollapseRange(ds, ino, off, len) ==
+    /\ ds \in DatasetIds /\ ino \in InoIds
+    /\ off \in FileOffsets /\ len \in LengthsPos
+    /\ off + len <= MaxFileBlocks
+    /\ OverlappingIn(ds, ino, off, len) = {}
+    \* No extent crosses the collapse boundary. (The empty-range
+    \* precondition above implies no extent crosses INTO the range
+    \* — this clause forbids extents whose tail extends past
+    \* off+len after shifting would overlap the new keys' range.)
+    /\ \A e \in ExtentsOf(ds, ino) :
+         ~(e.off < off /\ e.off + e.len > off)
+    /\ LET kept_below ==
+              { e \in ExtentsOf(ds, ino) : e.off + e.len <= off }
+           shifted_above ==
+              { [e EXCEPT !.off = e.off - len] :
+                  e \in { e2 \in ExtentsOf(ds, ino) : e2.off >= off + len } }
+       IN extents' = (extents \ ExtentsOf(ds, ino))
+                     \cup kept_below \cup shifted_above
+    /\ UNCHANGED <<used_paddrs, current_txg>>
+
+(***************************************************************************)
+(* InsertRange (P8-POSIX-7b) — shift every extent at off' >= off up by     *)
+(* len, opening a hole [off, off+len). Models Linux fallocate(2)            *)
+(* FALLOC_FL_INSERT_RANGE.                                                  *)
+(*                                                                           *)
+(* Preconditions:                                                            *)
+(*   - No extent crosses the off boundary (block-aligned).                   *)
+(*   - All shifted extents stay within MaxFileBlocks (no out-of-bounds).    *)
+(*                                                                           *)
+(* Effect: extents below off stay in place; extents at off' >= off shift   *)
+(* to (off' + len). used_paddrs UNCHANGED.                                  *)
+(***************************************************************************)
+InsertRange(ds, ino, off, len) ==
+    /\ ds \in DatasetIds /\ ino \in InoIds
+    /\ off \in FileOffsets /\ len \in LengthsPos
+    /\ off + len <= MaxFileBlocks
+    /\ \A e \in ExtentsOf(ds, ino) :
+         ~(e.off < off /\ e.off + e.len > off)   \* no crossing
+    /\ \A e \in ExtentsOf(ds, ino) :
+         e.off >= off => e.off + len + e.len <= MaxFileBlocks
+    /\ LET kept_below ==
+              { e \in ExtentsOf(ds, ino) : e.off < off }
+           shifted_above ==
+              { [e EXCEPT !.off = e.off + len] :
+                  e \in { e2 \in ExtentsOf(ds, ino) : e2.off >= off } }
+       IN extents' = (extents \ ExtentsOf(ds, ino))
+                     \cup kept_below \cup shifted_above
+    /\ UNCHANGED <<used_paddrs, current_txg>>
+
+(***************************************************************************)
 (* AdvanceTxg — bump the current txg counter.                                *)
 (***************************************************************************)
 AdvanceTxg ==
@@ -446,6 +534,15 @@ Next ==
        /\ \E src \in extents, dst_ds \in DatasetIds, dst_ino \in InoIds,
               dst_off \in FileOffsets :
                 Reflink(src, dst_ds, dst_ino, dst_off)
+    \/ \E ds \in DatasetIds, ino \in InoIds, off \in FileOffsets,
+           len \in LengthsPos :
+            PunchHole(ds, ino, off, len)
+    \/ \E ds \in DatasetIds, ino \in InoIds, off \in FileOffsets,
+           len \in LengthsPos :
+            CollapseRange(ds, ino, off, len)
+    \/ \E ds \in DatasetIds, ino \in InoIds, off \in FileOffsets,
+           len \in LengthsPos :
+            InsertRange(ds, ino, off, len)
     \/ AdvanceTxg
 
 Spec == Init /\ [][Next]_vars

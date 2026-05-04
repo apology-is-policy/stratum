@@ -38,6 +38,7 @@
 #include <stratum/bootstrap.h>
 #include <stratum/dataset.h>
 #include <stratum/dirent.h>
+#include <stratum/extent.h>
 #include <stratum/inode.h>
 #include <stratum/xattr.h>
 #include <stratum/janus.h>
@@ -4057,6 +4058,238 @@ stm_status stm_fs_set_dataset_pool_default(stm_fs *fs, stm_property prop,
     }
 
     stm_status s = stm_dataset_set_pool_default(didx, prop, value);
+    pthread_mutex_unlock(&fs->lock);
+    return s;
+}
+
+/* ========================================================================= */
+/* P8-POSIX-7b: fallocate(2) — every FALLOC_FL_* flag.                        */
+/* ========================================================================= */
+
+/* Linux FALLOC_FL_* drift guards. Every STM_FS_FALLOC_FL_* constant
+ * must match Linux's value verbatim so a 9P/FUSE binding can pass
+ * the kernel's flags through. */
+_Static_assert(STM_FS_FALLOC_FL_KEEP_SIZE      == 0x01u,
+               "FALLOC_FL_KEEP_SIZE drift");
+_Static_assert(STM_FS_FALLOC_FL_PUNCH_HOLE     == 0x02u,
+               "FALLOC_FL_PUNCH_HOLE drift");
+_Static_assert(STM_FS_FALLOC_FL_COLLAPSE_RANGE == 0x08u,
+               "FALLOC_FL_COLLAPSE_RANGE drift");
+_Static_assert(STM_FS_FALLOC_FL_ZERO_RANGE     == 0x10u,
+               "FALLOC_FL_ZERO_RANGE drift");
+_Static_assert(STM_FS_FALLOC_FL_INSERT_RANGE   == 0x20u,
+               "FALLOC_FL_INSERT_RANGE drift");
+_Static_assert(STM_FS_FALLOC_FL_UNSHARE_RANGE  == 0x40u,
+               "FALLOC_FL_UNSHARE_RANGE drift");
+
+#define FS_FALLOC_BLOCK 4096u
+
+/* Look up the inode + verify it's a regular file. Returns the
+ * inode_value via *out_iv. Caller MUST hold fs->lock. */
+static stm_status fs_fallocate_validate_target(stm_fs *fs,
+                                                    uint64_t dataset_id,
+                                                    uint64_t ino,
+                                                    struct stm_inode_value *out_iv) {
+    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+    if (!iidx) return STM_EINVAL;
+    stm_status ls = stm_inode_lookup(iidx, dataset_id, ino, out_iv);
+    if (ls != STM_OK) return ls;
+    uint32_t mode = stm_load_le32(out_iv->si_mode);
+    if ((mode & (uint32_t)S_IFMT) != (uint32_t)S_IFREG) return STM_EINVAL;
+    return STM_OK;
+}
+
+stm_status stm_fs_fallocate(stm_fs *fs,
+                                  uint64_t dataset_id, uint64_t ino,
+                                  uint64_t off, uint64_t len,
+                                  uint32_t flags)
+{
+    if (!fs) return STM_EINVAL;
+    if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+    if (len == 0u) return STM_EINVAL;
+    if (off > UINT64_MAX - len) return STM_EINVAL;
+    if ((flags & ~(uint32_t)STM_FS_FALLOC_MASK) != 0u) return STM_EINVAL;
+
+    /* Flag-combination matrix.
+     *   - PUNCH_HOLE requires KEEP_SIZE.
+     *   - COLLAPSE / INSERT cannot combine with any other flag.
+     *   - UNSHARE may combine with KEEP_SIZE only.
+     *   - ZERO_RANGE may combine with KEEP_SIZE only.
+     *   - KEEP_SIZE alone is legal.
+     *   - 0 (default preallocate) is legal. */
+    bool keep_size = (flags & STM_FS_FALLOC_FL_KEEP_SIZE) != 0u;
+    bool punch     = (flags & STM_FS_FALLOC_FL_PUNCH_HOLE) != 0u;
+    bool collapse  = (flags & STM_FS_FALLOC_FL_COLLAPSE_RANGE) != 0u;
+    bool zero_r    = (flags & STM_FS_FALLOC_FL_ZERO_RANGE) != 0u;
+    bool insert    = (flags & STM_FS_FALLOC_FL_INSERT_RANGE) != 0u;
+    bool unshare   = (flags & STM_FS_FALLOC_FL_UNSHARE_RANGE) != 0u;
+
+    /* At most ONE of {punch, collapse, zero_r, insert, unshare} set. */
+    int n_op = (int)punch + (int)collapse + (int)zero_r + (int)insert +
+               (int)unshare;
+    if (n_op > 1) return STM_EINVAL;
+
+    if (punch && !keep_size) return STM_EINVAL;
+    if (collapse && (flags & ~(uint32_t)STM_FS_FALLOC_FL_COLLAPSE_RANGE) != 0u)
+        return STM_EINVAL;
+    if (insert && (flags & ~(uint32_t)STM_FS_FALLOC_FL_INSERT_RANGE) != 0u)
+        return STM_EINVAL;
+
+    /* Block-alignment: every range op requires block-aligned off + len. */
+    bool any_range_op = punch || collapse || zero_r || insert || unshare;
+    if (any_range_op) {
+        if ((off % FS_FALLOC_BLOCK) != 0u) return STM_EINVAL;
+        if ((len % FS_FALLOC_BLOCK) != 0u) return STM_EINVAL;
+    }
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+
+    struct stm_inode_value iv = {0};
+    stm_status vs = fs_fallocate_validate_target(fs, dataset_id, ino, &iv);
+    if (vs != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return vs;
+    }
+
+    /* Sealed-file enforcement: F_SEAL_WRITE / FUTURE_WRITE block
+     * every fallocate op (mutates content); F_SEAL_GROW blocks ops
+     * that would extend the file (default preallocate without
+     * KEEP_SIZE, INSERT_RANGE, ZERO_RANGE without KEEP_SIZE);
+     * F_SEAL_SHRINK blocks ops that would shrink (COLLAPSE_RANGE,
+     * PUNCH_HOLE without KEEP_SIZE — but we already required
+     * KEEP_SIZE for PUNCH_HOLE so PUNCH never shrinks logical
+     * size). Match Linux fallocate(2)'s seal enforcement at the
+     * kernel-VFS layer. */
+    uint32_t cur_flags = stm_load_le32(iv.si_flags);
+    if (cur_flags & (uint32_t)(STM_INO_FLAG_SEAL_WRITE |
+                                STM_INO_FLAG_SEAL_FUTURE_WRITE)) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EPERM;
+    }
+    uint64_t cur_size = stm_load_le64(iv.si_size);
+    bool would_grow = false;
+    if (!any_range_op && !keep_size) {
+        /* Default preallocate: bump si_size to off+len if extending. */
+        if (off + len > cur_size) would_grow = true;
+    } else if (insert) {
+        would_grow = true;
+    } else if (zero_r && !keep_size) {
+        if (off + len > cur_size) would_grow = true;
+    }
+    bool would_shrink = collapse;
+    if (would_grow && (cur_flags & (uint32_t)STM_INO_FLAG_SEAL_GROW)) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EPERM;
+    }
+    if (would_shrink && (cur_flags & (uint32_t)STM_INO_FLAG_SEAL_SHRINK)) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EPERM;
+    }
+
+    stm_extent_index *eidx = stm_sync_extent_index(fs->sync);
+    if (!eidx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;
+    }
+
+    stm_status s = STM_OK;
+
+    if (punch) {
+        /* PUNCH_HOLE | KEEP_SIZE: drop fully-contained extents in
+         * range. Refuse if any extent crosses a boundary
+         * (STM_ENOTSUPPORTED). MVP: drop paddrs leak through the
+         * extent_index until next sync_commit's auto_gc drains them
+         * — TODO at P11 forward-note level: route through the
+         * snapshot dead-list per dead_list.tla::OverwriteBlock. */
+        uint64_t *dropped = NULL;
+        size_t n_dropped = 0;
+        s = stm_extent_punch_range(eidx, dataset_id, ino, off, len,
+                                        &dropped, &n_dropped);
+        free(dropped);
+        if (s == STM_OK) {
+            fs_stamp_mtime_ctime_now(&iv);
+            stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+            (void)stm_inode_set(iidx, dataset_id, ino, &iv);
+        }
+    } else if (collapse) {
+        /* COLLAPSE_RANGE: range must already be empty + no crossing
+         * boundary extents (refuse STM_ENOTSUPPORTED). Shift
+         * extents above off+len down by len. Shrink si_size by len
+         * (clamped to 0). */
+        s = stm_extent_shift_range_keys(eidx, dataset_id, ino,
+                                             off + len,
+                                             -(int64_t)len);
+        if (s == STM_OK) {
+            uint64_t new_size = (cur_size > len) ? (cur_size - len) : 0u;
+            iv.si_size = stm_store_le64(new_size);
+            fs_stamp_mtime_ctime_now(&iv);
+            stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+            (void)stm_inode_set(iidx, dataset_id, ino, &iv);
+        }
+    } else if (insert) {
+        /* INSERT_RANGE: shift extents at off' >= off up by len.
+         * Refuse if extent crosses off (STM_ENOTSUPPORTED).
+         * si_size grows by len. */
+        if (cur_size > UINT64_MAX - len) {
+            pthread_mutex_unlock(&fs->lock);
+            return STM_EOVERFLOW;
+        }
+        s = stm_extent_shift_range_keys(eidx, dataset_id, ino,
+                                             off, (int64_t)len);
+        if (s == STM_OK) {
+            iv.si_size = stm_store_le64(cur_size + len);
+            fs_stamp_mtime_ctime_now(&iv);
+            stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+            (void)stm_inode_set(iidx, dataset_id, ino, &iv);
+        }
+    } else if (zero_r) {
+        /* ZERO_RANGE: punch + (if !keep_size and would_grow) bump
+         * si_size. MVP: equivalent to PUNCH_HOLE structurally — the
+         * extent slots are dropped; subsequent reads return zeros
+         * via sparse-extent semantics. Doesn't require KEEP_SIZE,
+         * so si_size MAY grow to off+len. */
+        uint64_t *dropped = NULL;
+        size_t n_dropped = 0;
+        s = stm_extent_punch_range(eidx, dataset_id, ino, off, len,
+                                        &dropped, &n_dropped);
+        free(dropped);
+        if (s == STM_OK) {
+            if (!keep_size && (off + len) > cur_size) {
+                iv.si_size = stm_store_le64(off + len);
+            }
+            fs_stamp_mtime_ctime_now(&iv);
+            stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+            (void)stm_inode_set(iidx, dataset_id, ino, &iv);
+        }
+    } else if (unshare) {
+        /* UNSHARE_RANGE: composes via stm_fs_promote_to_hot —
+         * promote_to_hot promotes EVERY COLD extent at the ino
+         * (broader than POSIX requires for a partial range, but
+         * correct + conservative). Drop fs->lock first since
+         * promote_to_hot takes fs->lock. */
+        pthread_mutex_unlock(&fs->lock);
+        stm_status ps = stm_fs_promote_to_hot(fs, dataset_id, ino);
+        /* STM_ENOENT is "no COLD extents to promote" — already
+         * unshared, return OK. Other errors bubble up. */
+        if (ps == STM_ENOENT) return STM_OK;
+        return ps;
+    } else {
+        /* Default preallocate (flags == 0 OR flags == KEEP_SIZE).
+         * MVP: stratum is sparse-by-construction so "preallocate"
+         * is a metadata-only op. Bump si_size to off+len if not
+         * KEEP_SIZE and extending. */
+        if (!keep_size) {
+            if ((off + len) > cur_size) {
+                iv.si_size = stm_store_le64(off + len);
+                fs_stamp_mtime_ctime_now(&iv);
+                stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+                (void)stm_inode_set(iidx, dataset_id, ino, &iv);
+            }
+        }
+        s = STM_OK;
+    }
+
     pthread_mutex_unlock(&fs->lock);
     return s;
 }

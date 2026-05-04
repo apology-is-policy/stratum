@@ -420,6 +420,68 @@ stm_status stm_extent_truncate_peek(const stm_extent_index *idx,
                                        size_t *out_n_replicas_total);
 
 /*
+ * P8-POSIX-7b: drop every extent at (ds, ino) whose range is FULLY
+ * contained in [off, off+len). Models extent.tla::PunchHole.
+ *
+ * Refuses with STM_ENOTSUPPORTED if any extent crosses either
+ * boundary (off OR off+len) — partial-extent punch is not in MVP
+ * scope. Caller's policy: refuse non-block-aligned ranges before
+ * calling.
+ *
+ * Returned `*out_dropped_paddrs` is a malloc'd array of every paddr
+ * across every dropped extent's replica set, owned by the caller —
+ * caller frees AND ROUTES each paddr through the snapshot dead-list
+ * (P5-1) + alloc free pool. `*out_n_dropped_paddrs` is the count.
+ * If no extent is fully contained, returns STM_OK with both nulled.
+ *
+ * Refusals:
+ *   - NULL idx (STM_EINVAL).
+ *   - dataset_id == 0 OR ino == 0 (STM_EINVAL).
+ *   - len == 0 (STM_EINVAL).
+ *   - Crossing extent at boundary (STM_ENOTSUPPORTED).
+ *   - STM_ENOMEM if the dropped-paddrs buffer can't grow.
+ */
+STM_MUST_USE
+stm_status stm_extent_punch_range(stm_extent_index *idx,
+                                       uint64_t dataset_id, uint64_t ino,
+                                       uint64_t off, uint64_t len,
+                                       uint64_t **out_dropped_paddrs,
+                                       size_t *out_n_dropped_paddrs);
+
+/*
+ * P8-POSIX-7b: shift every extent at (ds, ino) whose off >= cutoff
+ * by `delta`, signed. delta < 0 implements COLLAPSE_RANGE (shift
+ * down); delta > 0 implements INSERT_RANGE (shift up).
+ *
+ * Preconditions enforced inline (refusal returns STM_ENOTSUPPORTED):
+ *   - For COLLAPSE (delta < 0): no extent overlaps [cutoff + delta,
+ *     cutoff). Equivalently, every extent either has off + len <=
+ *     cutoff + delta OR off >= cutoff. (The "punched" range is
+ *     already empty.)
+ *   - For INSERT (delta > 0): no extent crosses the cutoff (no
+ *     extent's range straddles cutoff). Shifted extents must not
+ *     exceed STM_FS_RECORDSIZE_MAX-derived end-of-file cap.
+ *
+ * Effect: walks (ds, ino) extents. Below cutoff: untouched. At or
+ * above cutoff: drops the original key + reinserts at off + delta.
+ * paddrs/replicas/gen/key_id/origin all unchanged — only the (off)
+ * key changes. Atomic at the C level (single mutex hold of the
+ * extent index).
+ *
+ * Refusals (more in addition to the preconditions above):
+ *   - NULL idx (STM_EINVAL).
+ *   - dataset_id == 0 OR ino == 0 (STM_EINVAL).
+ *   - delta == 0 (STM_EINVAL — no-op caller; should short-circuit).
+ *   - cutoff + delta underflows OR overflows uint64_t (STM_EINVAL).
+ *   - STM_ENOMEM if the shift workspace can't grow.
+ */
+STM_MUST_USE
+stm_status stm_extent_shift_range_keys(stm_extent_index *idx,
+                                            uint64_t dataset_id, uint64_t ino,
+                                            uint64_t cutoff,
+                                            int64_t  delta);
+
+/*
  * P7-12: truncate using caller-provided pre-allocated buffers.
  *
  * `drop_idx_buf[drop_idx_cap]` is internal scratch (records the

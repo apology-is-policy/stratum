@@ -1768,6 +1768,113 @@ stm_status stm_fs_promote_policy_pass_all(
         stm_fs_promote_policy_pass_all_stats *out_stats);
 
 /* ========================================================================= */
+/* P8-POSIX-7b: fallocate(2) — every FALLOC_FL_* flag.                        */
+/* ========================================================================= */
+
+/* Linux FALLOC_FL_* flag values (verbatim — `<linux/falloc.h>`). 0x04 is
+ * Linux's defunct NO_HIDE_STALE; we leave the bit reserved-zero. A
+ * 9P/FUSE binding can pass the kernel's flags through verbatim. */
+#define STM_FS_FALLOC_FL_KEEP_SIZE       0x01u
+#define STM_FS_FALLOC_FL_PUNCH_HOLE      0x02u
+#define STM_FS_FALLOC_FL_COLLAPSE_RANGE  0x08u
+#define STM_FS_FALLOC_FL_ZERO_RANGE      0x10u
+#define STM_FS_FALLOC_FL_INSERT_RANGE    0x20u
+#define STM_FS_FALLOC_FL_UNSHARE_RANGE   0x40u
+
+#define STM_FS_FALLOC_MASK \
+    (STM_FS_FALLOC_FL_KEEP_SIZE      | \
+     STM_FS_FALLOC_FL_PUNCH_HOLE     | \
+     STM_FS_FALLOC_FL_COLLAPSE_RANGE | \
+     STM_FS_FALLOC_FL_ZERO_RANGE     | \
+     STM_FS_FALLOC_FL_INSERT_RANGE   | \
+     STM_FS_FALLOC_FL_UNSHARE_RANGE)
+
+/*
+ * stm_fs_fallocate — Linux fallocate(2) shape.
+ *
+ * Flag combinations (Linux-aligned semantics; refusal matrix matches
+ * `<linux/falloc.h>` + man fallocate(2)):
+ *
+ *   - flags == 0: pre-allocate (sparse) [off, off+len) and bump
+ *     si_size to max(si_size, off+len). MVP: stratum is sparse-by-
+ *     construction, so "pre-allocate" is effectively "bump si_size";
+ *     no extents are reserved up front (subsequent writes lazily
+ *     allocate).
+ *   - KEEP_SIZE alone: same as flags=0 except si_size is NOT bumped
+ *     (preallocate space without changing file size — Linux convention
+ *     for log preallocation).
+ *   - PUNCH_HOLE | KEEP_SIZE (REQUIRED — bare PUNCH_HOLE refuses with
+ *     STM_EINVAL): drop every extent fully contained in [off, off+len).
+ *     Block-aligned only (off and len both 4 KiB-aligned and len > 0);
+ *     non-aligned ranges refuse with STM_EINVAL. The hole reads as
+ *     zeros via sparse-extent semantics. Models extent.tla::PunchHole.
+ *   - ZERO_RANGE: zero the bytes in [off, off+len). MVP: composes via
+ *     overwrite-with-zeros (existing extents get re-encrypted under
+ *     fresh paddrs with plaintext = zeros). MAY combine with KEEP_SIZE
+ *     (don't bump si_size); else si_size grows to off+len if extending.
+ *   - COLLAPSE_RANGE: shift extents at off' >= off+len down by len —
+ *     [off, off+len) is removed entirely; file shrinks by len.
+ *     Block-aligned only. Cannot combine with any other flag (Linux
+ *     convention). Precondition: [off, off+len) must already be empty
+ *     of extents AND no extent crosses either boundary; else
+ *     STM_ENOTSUPPORTED. si_size shrinks by len.
+ *   - INSERT_RANGE: shift extents at off' >= off up by len — opens a
+ *     hole at [off, off+len); file grows by len. Block-aligned only.
+ *     Cannot combine. Precondition: no extent crosses off (no
+ *     mid-extent insert); shifted extents must fit within
+ *     STM_FS_RECORDSIZE_MAX-bounded file; else STM_ENOTSUPPORTED /
+ *     STM_ERANGE. si_size grows by len.
+ *   - UNSHARE_RANGE: force CAS-shared (COLD) extents in range to be
+ *     promoted to HOT (private copies). MVP: composes over
+ *     stm_fs_promote_to_hot — promotes EVERY COLD extent at the ino
+ *     (broader scope than POSIX requires; correct but conservative).
+ *     MAY combine with KEEP_SIZE; else default si_size handling.
+ *
+ * Block alignment: STM_FS_RECORDSIZE_MAX-aligned operations are
+ * sufficient. Sub-block operations refuse with STM_EINVAL — the C impl
+ * doesn't split extents at byte boundaries (Linux ext4/xfs do; stratum
+ * v2 is structurally simpler at the cost of refusing partial-block
+ * fallocate). Callers needing byte-grain semantics fall back to
+ * stm_fs_write with zero-buffer.
+ *
+ * Refusals (the only paths returning non-OK):
+ *   - NULL fs (STM_EINVAL).
+ *   - dataset_id == 0 OR ino == 0 (STM_EINVAL).
+ *   - flags has bit outside STM_FS_FALLOC_MASK (STM_EINVAL).
+ *   - Wedged or read-only (STM_EWEDGED / STM_EROFS).
+ *   - Inode does not exist (STM_ENOENT).
+ *   - Not a regular file (STM_EINVAL).
+ *   - len == 0 (STM_EINVAL — Linux refuses).
+ *   - off + len overflows uint64_t (STM_EINVAL).
+ *   - PUNCH_HOLE without KEEP_SIZE (STM_EINVAL — Linux requires).
+ *   - COLLAPSE_RANGE / INSERT_RANGE / UNSHARE_RANGE combined with any
+ *     other flag (except UNSHARE+KEEP_SIZE legal) → STM_EINVAL.
+ *   - Any range op not block-aligned (STM_EINVAL).
+ *   - PUNCH_HOLE with a partially-overlapping extent
+ *     (STM_ENOTSUPPORTED — sub-extent punch not in MVP).
+ *   - COLLAPSE_RANGE with extents inside the range OR crossing a
+ *     boundary (STM_ENOTSUPPORTED).
+ *   - INSERT_RANGE with an extent crossing the off boundary
+ *     (STM_ENOTSUPPORTED).
+ *   - INSERT_RANGE shifted extent end exceeds
+ *     STM_FS_RECORDSIZE_MAX-derived limit (STM_ERANGE).
+ *
+ * Lock posture: takes fs->lock + FS_GUARD_WRITE. Composes over
+ * extent_index primitives; the extent layer takes its own mutex
+ * downstream.
+ *
+ * Composes over `extent.tla::PunchHole` / `CollapseRange` /
+ * `InsertRange`; UNSHARE composes over `cas.tla::RehydrateOnWrite`
+ * (per-extent promote). No spec extension needed for ZERO_RANGE
+ * (composes via Overwrite); KEEP_SIZE is a metadata-only flag.
+ */
+STM_MUST_USE
+stm_status stm_fs_fallocate(stm_fs *fs,
+                                  uint64_t dataset_id, uint64_t ino,
+                                  uint64_t off, uint64_t len,
+                                  uint32_t flags);
+
+/* ========================================================================= */
 /* P8-POSIX-7e: posix_fadvise(2) pass-through.                                */
 /* ========================================================================= */
 

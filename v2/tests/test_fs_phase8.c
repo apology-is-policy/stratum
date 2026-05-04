@@ -6337,6 +6337,420 @@ STM_TEST(fs_p9b_r86_p3_3_rename_exchange_hardlinks_to_same_inode) {
 }
 
 /* ========================================================================= */
+/* P8-POSIX-7b: fallocate(2) — every FALLOC_FL_* flag.                        */
+/* ========================================================================= */
+
+/* Helper: write a 4 KiB block to (1, ino) at off=0. */
+static void p7b_write_block(stm_fs *fs, uint64_t ino, uint64_t off,
+                                  uint8_t pattern) {
+    uint8_t buf[4096];
+    for (size_t i = 0; i < sizeof buf; i++)
+        buf[i] = (uint8_t)((i * 7u + pattern) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, ino, off, buf, sizeof buf));
+}
+
+STM_TEST(fs_p7b_fallocate_default_grows_size) {
+    /* fallocate(off=0, len=4096, flags=0): bump si_size to 4096. */
+    make_tmp("p7b_default_grow");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &ino));
+
+    STM_ASSERT_OK(stm_fs_fallocate(fs, 1, ino, 0, 4096u, 0u));
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, ino, &v));
+    STM_ASSERT_EQ(stm_load_le64(v.si_size), (uint64_t)4096);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7b_fallocate_keep_size_alone) {
+    /* fallocate(KEEP_SIZE): si_size NOT bumped. */
+    make_tmp("p7b_keep_size");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &ino));
+
+    STM_ASSERT_OK(stm_fs_fallocate(fs, 1, ino, 0, 4096u,
+                                         STM_FS_FALLOC_FL_KEEP_SIZE));
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, ino, &v));
+    STM_ASSERT_EQ(stm_load_le64(v.si_size), (uint64_t)0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7b_fallocate_punch_hole_drops_extent) {
+    /* Write 2 blocks; punch the first; verify it's gone (sparse hole
+     * via extent-index drop) but the second block survives. */
+    make_tmp("p7b_punch_drops");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Use legacy direct-extent path (no inode) so we can test
+     * extent-only punch. Actually we need an inode for fallocate
+     * to validate as S_IFREG. */
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &ino));
+
+    /* Write 2 blocks via fs_write — these go through the inode-aware
+     * path. The first write transitions inline → extent. */
+    p7b_write_block(fs, ino, 0,    1);
+    p7b_write_block(fs, ino, 4096, 2);
+
+    /* Punch [0, 4096). */
+    STM_ASSERT_OK(stm_fs_fallocate(fs, 1, ino, 0, 4096u,
+                                         STM_FS_FALLOC_FL_PUNCH_HOLE |
+                                             STM_FS_FALLOC_FL_KEEP_SIZE));
+
+    /* Verify extent at off=0 is gone. */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record rec;
+    STM_ASSERT_ERR(stm_extent_lookup_at(eidx, 1, ino, 0, &rec),
+                   STM_ENOENT);
+    /* And the second block survives. */
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, ino, 4096, &rec));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7b_fallocate_punch_requires_keep_size) {
+    /* PUNCH_HOLE without KEEP_SIZE: STM_EINVAL (Linux convention). */
+    make_tmp("p7b_punch_needs_keep");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &ino));
+
+    STM_ASSERT_ERR(stm_fs_fallocate(fs, 1, ino, 0, 4096u,
+                                          STM_FS_FALLOC_FL_PUNCH_HOLE),
+                   STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7b_fallocate_collapse_range_shifts_extents) {
+    /* Write 3 blocks at 0/4096/8192. Collapse [0, 4096): the first
+     * extent must be empty (we punch it first), then shift the
+     * remaining 2 down. After: extent at 0 holds prior block 1's
+     * content; extent at 4096 holds prior block 2. file shrinks. */
+    make_tmp("p7b_collapse");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &ino));
+
+    p7b_write_block(fs, ino, 0,    11);
+    p7b_write_block(fs, ino, 4096, 22);
+    p7b_write_block(fs, ino, 8192, 33);
+
+    /* Punch first block, then collapse. */
+    STM_ASSERT_OK(stm_fs_fallocate(fs, 1, ino, 0, 4096u,
+                                         STM_FS_FALLOC_FL_PUNCH_HOLE |
+                                             STM_FS_FALLOC_FL_KEEP_SIZE));
+    STM_ASSERT_OK(stm_fs_fallocate(fs, 1, ino, 0, 4096u,
+                                         STM_FS_FALLOC_FL_COLLAPSE_RANGE));
+
+    /* Verify shift: extent at 0 holds prior block-22, extent at 4096
+     * holds prior block-33. */
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record rec;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, ino, 0, &rec));
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, ino, 4096, &rec));
+    STM_ASSERT_ERR(stm_extent_lookup_at(eidx, 1, ino, 8192, &rec),
+                   STM_ENOENT);
+
+    /* si_size shrank by 4096. Pre-collapse it was 12288. */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, ino, &v));
+    STM_ASSERT_EQ(stm_load_le64(v.si_size), (uint64_t)8192);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7b_fallocate_insert_range_shifts_extents_up) {
+    /* Write block at off=0 (inline → extent transition produces a
+     * single extent at off=0, len=4096). Insert [0, 4096): shifts
+     * the block up to off=4096. file grows by 4096. */
+    make_tmp("p7b_insert");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &ino));
+
+    p7b_write_block(fs, ino, 0, 5);
+    /* size is 4096 after that write. */
+
+    STM_ASSERT_OK(stm_fs_fallocate(fs, 1, ino, 0, 4096u,
+                                         STM_FS_FALLOC_FL_INSERT_RANGE));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record rec;
+    STM_ASSERT_ERR(stm_extent_lookup_at(eidx, 1, ino, 0, &rec),
+                   STM_ENOENT);
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, ino, 4096, &rec));
+
+    /* si_size grew by 4096. */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, ino, &v));
+    STM_ASSERT_EQ(stm_load_le64(v.si_size), (uint64_t)8192);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7b_fallocate_zero_range_drops_extent) {
+    /* ZERO_RANGE on a written extent: extent gets dropped; subsequent
+     * read returns zeros via sparse-extent semantics. */
+    make_tmp("p7b_zero_range");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &ino));
+
+    p7b_write_block(fs, ino, 0, 7);
+
+    STM_ASSERT_OK(stm_fs_fallocate(fs, 1, ino, 0, 4096u,
+                                         STM_FS_FALLOC_FL_ZERO_RANGE));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record rec;
+    STM_ASSERT_ERR(stm_extent_lookup_at(eidx, 1, ino, 0, &rec),
+                   STM_ENOENT);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7b_fallocate_unshare_promotes_cold) {
+    /* UNSHARE_RANGE on an ino with COLD extents promotes them. */
+    make_tmp("p7b_unshare");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &ino));
+
+    p7b_write_block(fs, ino, 0, 9);
+    STM_ASSERT_OK(stm_fs_migrate_to_cold(fs, 1, ino));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_extent_index *eidx = stm_sync_extent_index(sync);
+    stm_extent_record rec;
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, ino, 0, &rec));
+    STM_ASSERT_EQ((int)rec.kind, (int)STM_EXTENT_KIND_COLD);
+
+    STM_ASSERT_OK(stm_fs_fallocate(fs, 1, ino, 0, 4096u,
+                                         STM_FS_FALLOC_FL_UNSHARE_RANGE));
+
+    STM_ASSERT_OK(stm_extent_lookup_at(eidx, 1, ino, 0, &rec));
+    STM_ASSERT_EQ((int)rec.kind, (int)STM_EXTENT_KIND_HOT);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7b_fallocate_collapse_with_other_flags_refused) {
+    /* COLLAPSE | KEEP_SIZE → STM_EINVAL (Linux: COLLAPSE cannot
+     * combine with any other flag). */
+    make_tmp("p7b_collapse_combo");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &ino));
+
+    STM_ASSERT_ERR(stm_fs_fallocate(fs, 1, ino, 0, 4096u,
+                                          STM_FS_FALLOC_FL_COLLAPSE_RANGE |
+                                              STM_FS_FALLOC_FL_KEEP_SIZE),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_fallocate(fs, 1, ino, 0, 4096u,
+                                          STM_FS_FALLOC_FL_COLLAPSE_RANGE |
+                                              STM_FS_FALLOC_FL_PUNCH_HOLE),
+                   STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7b_fallocate_block_alignment_required) {
+    /* PUNCH_HOLE with non-block-aligned off → STM_EINVAL. */
+    make_tmp("p7b_align");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &ino));
+
+    STM_ASSERT_ERR(stm_fs_fallocate(fs, 1, ino, 100, 4096u,
+                                          STM_FS_FALLOC_FL_PUNCH_HOLE |
+                                              STM_FS_FALLOC_FL_KEEP_SIZE),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_fallocate(fs, 1, ino, 0, 100u,
+                                          STM_FS_FALLOC_FL_PUNCH_HOLE |
+                                              STM_FS_FALLOC_FL_KEEP_SIZE),
+                   STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7b_fallocate_arg_validation) {
+    make_tmp("p7b_args");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &ino));
+
+    STM_ASSERT_ERR(stm_fs_fallocate(NULL, 1, ino, 0, 4096u, 0),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_fallocate(fs, 0, ino, 0, 4096u, 0),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_fallocate(fs, 1, 0, 0, 4096u, 0),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_fallocate(fs, 1, ino, 0, 0, 0),
+                   STM_EINVAL);
+    /* Unknown flag bit. */
+    STM_ASSERT_ERR(stm_fs_fallocate(fs, 1, ino, 0, 4096u, 0x80u),
+                   STM_EINVAL);
+    /* Two range ops together → STM_EINVAL. */
+    STM_ASSERT_ERR(stm_fs_fallocate(fs, 1, ino, 0, 4096u,
+                                          STM_FS_FALLOC_FL_ZERO_RANGE |
+                                              STM_FS_FALLOC_FL_INSERT_RANGE),
+                   STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7b_fallocate_wedged_refused) {
+    make_tmp("p7b_wedged");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_fs_mark_wedged(fs);
+    STM_ASSERT_ERR(stm_fs_fallocate(fs, 1, 1, 0, 4096u, 0),
+                   STM_EWEDGED);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7b_fallocate_seal_write_blocks_punch) {
+    /* SEAL_WRITE blocks all fallocate ops that mutate content
+     * (PUNCH_HOLE included). */
+    make_tmp("p7b_seal_write");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &ino));
+    p7b_write_block(fs, ino, 0, 1);
+    STM_ASSERT_OK(stm_fs_add_seals(fs, 1, ino, STM_FS_SEAL_WRITE));
+
+    STM_ASSERT_ERR(stm_fs_fallocate(fs, 1, ino, 0, 4096u,
+                                          STM_FS_FALLOC_FL_PUNCH_HOLE |
+                                              STM_FS_FALLOC_FL_KEEP_SIZE),
+                   STM_EPERM);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+/* ========================================================================= */
 /* P8-POSIX-7e: posix_fadvise(2) pass-through.                                */
 /* ========================================================================= */
 
