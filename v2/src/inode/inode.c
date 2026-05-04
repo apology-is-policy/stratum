@@ -653,9 +653,22 @@ stm_status stm_inode_free(stm_inode_index *idx, uint64_t dataset_id,
     /* Encode FREED state in si_flags so the on-disk record carries
      * the lifecycle bit. Clear nlink as well (POSIX-shape: a freed
      * inode has zero links). gen is preserved for the next
-     * AllocReused's bump. */
+     * AllocReused's bump.
+     *
+     * R85 P0-1 fix: ALSO clear STM_INO_FLAG_ORPHAN on free. The
+     * P8-POSIX-7a-anon decoder enforces FREED+ORPHAN as
+     * "structurally inconsistent" (orphans are an ALLOCATED
+     * intermediate; freeing one transitions to FREED, which
+     * extinguishes the orphan property). Pre-fix, freeing an orphan
+     * left both bits set on-disk; the next sync_commit would
+     * persist the corrupt record + the next mount's load_at
+     * decoder would reject with STM_ECORRUPT — a silent wedge
+     * across mount cycles for the headline O_TMPFILE workflow
+     * (create_anon → unlink_anon → unmount → unmountable pool). */
     uint32_t flags = stm_load_le32(r->value.si_flags);
-    r->value.si_flags = stm_store_le32(flags | STM_INO_FLAG_FREED);
+    flags = (flags | (uint32_t)STM_INO_FLAG_FREED) &
+            ~(uint32_t)STM_INO_FLAG_ORPHAN;
+    r->value.si_flags = stm_store_le32(flags);
     r->value.si_nlink = stm_store_le32(0);
     idx->dirty = true;
 
@@ -741,10 +754,20 @@ stm_status stm_inode_unlink(stm_inode_index *idx, uint64_t dataset_id,
     uint32_t new_nlink = cur_nlink - 1u;
     if (new_nlink == 0u) {
         /* Cascade-free per inode.tla::Unlink: atomically transition
-         * to FREED + zero nlink + set FREED flag. gen preserved. */
+         * to FREED + zero nlink + set FREED flag. gen preserved.
+         *
+         * R85 P3-1 (defense-in-depth): also clear ORPHAN on
+         * cascade-free, mirroring stm_inode_free's R85 P0-1 fix.
+         * Today unreachable because stm_inode_unlink refuses orphan
+         * inputs at line 740..743 — but the symmetric clear is the
+         * right hygiene if a future caller path ever lets an orphan
+         * reach this branch (e.g., a refactor that changes the
+         * orphan-input refusal). */
         r->state = STM_INODE_STATE_FREED;
         uint32_t flags = stm_load_le32(r->value.si_flags);
-        r->value.si_flags = stm_store_le32(flags | STM_INO_FLAG_FREED);
+        flags = (flags | (uint32_t)STM_INO_FLAG_FREED) &
+                ~(uint32_t)STM_INO_FLAG_ORPHAN;
+        r->value.si_flags = stm_store_le32(flags);
         r->value.si_nlink = stm_store_le32(0u);
         if (out_freed) *out_freed = true;
     } else {

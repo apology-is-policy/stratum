@@ -12942,6 +12942,54 @@ STM_TEST(fs_p7a_anon_arg_validation) {
     unlink(g_tmp_path); unlink(g_key_path);
 }
 
+STM_TEST(fs_p7a_anon_r85_p0_1_unlink_anon_persists_across_remount) {
+    /* R85 P0-1 regression: pre-fix, stm_inode_free set FREED but
+     * left STM_INO_FLAG_ORPHAN set in si_flags. The on-disk record
+     * carried FREED+ORPHAN; the next mount's load_at decoder
+     * rejected it as structurally inconsistent (ORPHAN ⇒ ALLOCATED
+     * per inode.tla::OrphanHasZeroNlink's dual). The pool became
+     * unmountable for the headline O_TMPFILE workflow:
+     *
+     *   create_anon → unlink_anon → unmount → STM_ECORRUPT remount
+     *
+     * Post-fix, stm_inode_free clears ORPHAN alongside setting FREED
+     * so the on-disk record is clean. */
+    make_tmp("p7a_anon_r85_p0_1_unlink_persist");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_anon(fs, 1, 0644u, 0, 0, &ino));
+    /* Free the orphan via unlink_anon — exercises stm_inode_free. */
+    STM_ASSERT_OK(stm_fs_unlink_anon(fs, 1, ino));
+
+    /* Unmount commits the freed-orphan record to disk. */
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    /* Remount: pre-fix, this returned STM_ECORRUPT due to
+     * FREED+ORPHAN load_at decoder rejection. Post-fix, clean. */
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* The freed slot is reusable: a fresh AllocReused on it should
+     * succeed + bump gen. */
+    uint64_t ino2 = 0;
+    STM_ASSERT_OK(stm_fs_create_anon(fs, 1, 0644u, 0, 0, &ino2));
+    /* AllocReused returns the same ino with bumped gen. */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, ino2, &v));
+    STM_ASSERT_TRUE(stm_load_le64(v.si_gen) >= 1u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
 STM_TEST(fs_p7a_anon_wedged_refused) {
     make_tmp("p7a_anon_wedged");
     stm_fs_format_opts fopts = default_format_opts();
