@@ -1835,4 +1835,206 @@ STM_TEST(p9_xattrcreate_short_write_discards) {
     unlink(g_key_path);
 }
 
+/* ── R92 regression tests ────────────────────────────────────────────── */
+
+STM_TEST(p9_r92_p1_1_two_servers_independent_lock_owners) {
+    /* Two servers on the same fs; each acquires a WRLCK on the same
+     * (ino, range) via different fid values. Pre-fix the additive
+     * lock_owner_base allowed cross-server fid values to alias to the
+     * SAME owner_id; one server's clunk would silently release the
+     * other's locks. Post-fix server-shifted base + OR composition
+     * makes (server, fid) → owner_id a bijection. */
+    make_tmp("9p_r92_two_servers");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)mk_file(fs, root, "f");
+
+    stm_9p_server *sa = make_server(fs);
+    stm_9p_server *sb = make_server(fs);
+    do_version_attach(sa, 100);
+    do_version_attach(sb, 100);
+    walk_to(sa, 100, 200, "f");
+    walk_to(sb, 100, 200, "f");
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    /* Server A's fid 200 acquires WRLCK on [0, 100). */
+    uint32_t sz = build_tlock(req, 2, 200,
+                                STM_9P_LOCK_TYPE_WRLCK, 0,
+                                0, 100, 1, "a");
+    STM_ASSERT_OK(stm_9p_server_handle(sa, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[7], STM_9P_LOCK_SUCCESS);
+
+    /* Server B's fid 200 acquires WRLCK on the SAME range. Pre-fix:
+     * same fid value + colliding owner-id namespace would let
+     * stm_lock_acquire's same-owner-stack admit this. Post-fix:
+     * different server_idx makes the owner_ids disjoint, so this
+     * conflicts and returns BLOCKED. */
+    sz = build_tlock(req, 3, 200,
+                      STM_9P_LOCK_TYPE_WRLCK, 0,
+                      0, 100, 2, "b");
+    STM_ASSERT_OK(stm_9p_server_handle(sb, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLOCK);
+    STM_ASSERT_EQ(resp[7], STM_9P_LOCK_BLOCKED);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(sa);
+    stm_9p_server_destroy(sb);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_r92_p1_2_readdir_truncated_count_no_drops) {
+    /* Pre-fix: when Treaddir's count budget runs out mid-batch the
+     * cursor was already advanced past un-emitted entries, dropping
+     * them. Post-fix: BATCH=1 + cursor rewind on no-room; multiple
+     * Treaddirs at successive offsets cover EVERY entry exactly once. */
+    make_tmp("9p_r92_readdir_trunc");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    /* Create 8 files. With STM_9P_QID_SIZE+8+1+2+name_len ≈ 30 bytes
+     * per entry (+ "." and "..") and `count` = 64, ~2 entries fit
+     * per Treaddir — exercises the truncate path. */
+    char name[8];
+    for (int i = 0; i < 8; i++) {
+        snprintf(name, sizeof name, "f%d", i);
+        (void)mk_file(fs, root, name);
+    }
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    uint32_t sz = build_tlopen(req, 2, 100, STM_9P_O_RDONLY);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+
+    /* Iteratively Treaddir with count=64 until we get an empty reply.
+     * Sum the unique names and verify we see "." + ".." + 8 files
+     * (10 total) with no duplicates. */
+    int seen_dot = 0, seen_dotdot = 0;
+    int seen_files = 0;
+    char seen_file_marks[8] = {0};
+    uint64_t offset = 0;
+    int iterations = 0;
+    while (iterations < 50) {
+        sz = build_treaddir(req, (uint16_t)(10 + iterations), 100,
+                             offset, /*count=*/64);
+        STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+        STM_ASSERT_EQ(resp[4], STM_9P_RREADDIR);
+        uint32_t cnt = load_u32(resp + 7);
+        if (cnt == 0) break;
+        const uint8_t *q = resp + 11;
+        const uint8_t *end = q + cnt;
+        uint64_t last_offset = 0;
+        while (q < end) {
+            const uint8_t *entry = q;
+            if (end - entry < 13 + 8 + 1 + 2) break;
+            uint64_t entry_offset = load_u64(entry + 13);
+            const uint8_t *np = entry + 13 + 8 + 1;
+            uint16_t nl = load_u16(np);
+            if (end - np - 2 < nl) break;
+            const char *nm = (const char *)(np + 2);
+            if (nl == 1 && nm[0] == '.')                      seen_dot++;
+            else if (nl == 2 && nm[0] == '.' && nm[1] == '.') seen_dotdot++;
+            else if (nl == 2 && nm[0] == 'f') {
+                int idx = nm[1] - '0';
+                if (idx >= 0 && idx < 8) {
+                    seen_file_marks[idx]++;
+                    seen_files++;
+                }
+            }
+            last_offset = entry_offset;
+            q = np + 2 + nl;
+        }
+        offset = last_offset;
+        iterations++;
+    }
+    /* Each entry seen exactly once, and all 8 files plus . and ..
+     * accounted for. */
+    STM_ASSERT_EQ(seen_dot,    1);
+    STM_ASSERT_EQ(seen_dotdot, 1);
+    STM_ASSERT_EQ(seen_files,  8);
+    for (int i = 0; i < 8; i++) STM_ASSERT_EQ(seen_file_marks[i], 1);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_r92_p2_1_xattrcreate_releases_locks_on_clunk) {
+    /* Pre-fix: fid_release_locked checked kind == NODE before calling
+     * stm_fs_release_lock_owner. A fid that held byte-range locks
+     * then got REPURPOSED into AUX_XATTR via Txattrcreate would skip
+     * the lock release at clunk. Post-fix: release fires
+     * unconditionally regardless of kind. */
+    make_tmp("9p_r92_xattr_locks");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)mk_file(fs, root, "f");
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "f");
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+
+    /* Acquire a WRLCK. */
+    uint32_t sz = build_tlock(req, 2, 101,
+                                STM_9P_LOCK_TYPE_WRLCK, 0,
+                                0, 100, 1, "a");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[7], STM_9P_LOCK_SUCCESS);
+
+    /* Repurpose the fid via Txattrcreate. */
+    sz = build_txattrcreate(req, 3, 101, "user.x", 1, 0);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RXATTRCREATE);
+    sz = build_twrite(req, 4, 101, 0, "Z", 1);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    sz = build_tclunk(req, 5, 101);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RCLUNK);
+
+    /* The lock should have been released at clunk. Verify via a
+     * fresh fid that can acquire the same range. */
+    walk_to(s, 100, 102, "f");
+    sz = build_tlock(req, 6, 102,
+                      STM_9P_LOCK_TYPE_WRLCK, 0,
+                      0, 100, 2, "b");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLOCK);
+    STM_ASSERT_EQ(resp[7], STM_9P_LOCK_SUCCESS);
+
+    /* Bonus: the lock-table count must be exactly 1 (the new acquire) —
+     * the old lock from fid 101 should be gone. */
+    size_t ncount = 0;
+    STM_ASSERT_OK(stm_fs_lock_count(fs, &ncount));
+    STM_ASSERT_EQ(ncount, 1u);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("9p")

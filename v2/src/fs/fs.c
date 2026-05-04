@@ -4546,8 +4546,14 @@ stm_status stm_fs_release_lock_owner(stm_fs *fs, uint64_t owner_id)
 {
     if (!fs) return STM_EINVAL;
 
+    /* (R92 P2-2) Lock release is RAM-only cleanup with no fs-durability
+     * implications; tolerate wedged + RO state. The previous
+     * FS_GUARD_READ gate refused on wedged, which silently dropped
+     * lock-cleanup-on-clunk in the wedged window — DoS shape (lock-
+     * table grows unbounded as long as the wedged fs stays mounted).
+     * Take the lock to serialize against unmount, then release without
+     * the wedge guard. */
     pthread_mutex_lock(&fs->lock);
-    FS_GUARD_READ(fs);
     stm_status s = stm_lock_release_owner(fs->locks, owner_id);
     pthread_mutex_unlock(&fs->lock);
     return s;

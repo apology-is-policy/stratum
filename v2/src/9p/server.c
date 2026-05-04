@@ -126,6 +126,11 @@ typedef struct p9_fid {
      * `is_xattr_create` discriminates the two flavors.                  */
     bool        is_xattr_create;
     char       *xattr_name;        /* heap-owned NUL-terminated name */
+    uint8_t     xattr_name_len;    /* exact name byte length from the wire
+                                    *  (R92 P3-2 — strlen-based length on
+                                    *  commit truncated names with embedded
+                                    *  NUL bytes; explicit length avoids the
+                                    *  asymmetry). */
     uint8_t    *xattr_buf;         /* heap-owned bytes buffer */
     size_t      xattr_buf_len;     /* current bytes filled */
     size_t      xattr_buf_cap;     /* allocated capacity */
@@ -219,10 +224,22 @@ static uint32_t status_to_errno(stm_status s)
 /* qid encoding.                                                           */
 /* ────────────────────────────────────────────────────────────────────── */
 
-/* qid.path = (dataset_id << 32) | ino. Each (ds, ino) pair has a unique
- * 64-bit path. The (path, version) tuple is unique-across-time given
- * inode.tla's TupleUniqueAllTime contract — version (= si_gen) strictly
- * increases on inode reuse. */
+/* qid.path = (dataset_id << 32) | (ino & 0xFFFFFFFF). Each (ds, ino)
+ * pair has a unique 64-bit path while ino fits in 32 bits. The
+ * (path, version) tuple is unique-across-time given inode.tla's
+ * TupleUniqueAllTime contract — version (= si_gen) strictly
+ * increases on inode reuse.
+ *
+ * (R92 P3-3) Limitation: the inode allocator allows ino up to
+ * UINT64_MAX, but this encoding truncates to 32 bits. Distinct
+ * inos with identical low-32-bit values would collide in qid.path
+ * for clients that compare paths directly. Mitigation: in v2.0
+ * the inode allocator's monotonic next_ino starts at 1 and
+ * increments, so a single mounted dataset would need 4B+ ino
+ * allocations (with reuse) before risking collision. Forward-
+ * note: bound the inode allocator at UINT32_MAX OR widen qid.path
+ * encoding (e.g., by hashing) — deferred to post-v2.0.
+ */
 static inline uint64_t qid_path(uint64_t dataset_id, uint64_t ino) {
     return (dataset_id << 32) | (ino & 0xFFFFFFFFu);
 }
@@ -266,21 +283,28 @@ static p9_fid *fid_alloc(stm_9p_server *s, uint32_t fid)
     return NULL;
 }
 
-/* Release a fid (caller holds server lock). For node-kind fids that
- * have held locks, also drop their lock-owner registration via
- * stm_fs_release_lock_owner (composes against locks.tla / fid.tla
- * Clunk action's lock-release-on-clunk semantics). For aux-xattr
- * fids, frees the heap-owned name + buffer. */
+/* Compose owner_id from server-server_idx + fid. server_idx occupies
+ * the high 32 bits and fid the low 32 bits, so distinct (server,
+ * fid) tuples produce distinct owner_ids and the 32-bit fid space
+ * never crosses into the next server's range — closes R92 P1-1. */
+static inline uint64_t fid_owner_id(stm_9p_server *s, uint32_t fid)
+{
+    return s->lock_owner_base | (uint64_t)fid;
+}
+
+/* Release a fid (caller holds server lock). Drops any held byte-range
+ * locks via stm_fs_release_lock_owner UNCONDITIONALLY — the fs primitive
+ * is idempotent on owners that never acquired anything, and clearing
+ * applies to every fid kind (not just NODE) since AUX_XATTR repurposing
+ * preserves the fid number AND its previously-acquired locks (R92 P2-1).
+ * Composes locks.tla::ReleaseOwner + fid.tla::Clunk's lock-release-on-
+ * clunk discipline. For aux-xattr fids also frees the heap-owned name +
+ * buffer. */
 static void fid_release_locked(stm_9p_server *s, p9_fid *f)
 {
     if (!f || f->kind == P9_FID_FREE) return;
-    if (f->kind == P9_FID_NODE) {
-        /* Drop any held byte-range locks for this fid's owner_id.
-         * stm_fs_release_lock_owner is idempotent on owners that
-         * never acquired anything — safe to call unconditionally. */
-        uint64_t owner_id = s->lock_owner_base + f->fid;
-        (void)stm_fs_release_lock_owner(s->fs, owner_id);
-    }
+    /* Always drop locks, regardless of fid kind (R92 P2-1). */
+    (void)stm_fs_release_lock_owner(s->fs, fid_owner_id(s, f->fid));
     if (f->kind == P9_FID_AUX_XATTR) {
         free(f->xattr_name);
         free(f->xattr_buf);
@@ -485,9 +509,11 @@ static stm_status h_clunk(stm_9p_server *s,
     stm_status commit_rc = STM_OK;
     if (f->kind == P9_FID_AUX_XATTR && f->is_xattr_create) {
         if (f->xattr_buf_len == f->xattr_expected_size && f->xattr_name) {
+            /* R92 P3-2: use the wire-supplied name_len, not strlen
+             * (which would truncate embedded NULs). */
             commit_rc = stm_fs_setxattr(s->fs, f->dataset_id, f->ino,
                                           (const uint8_t *)f->xattr_name,
-                                          (uint8_t)strlen(f->xattr_name),
+                                          f->xattr_name_len,
                                           f->xattr_buf,
                                           (uint32_t)f->xattr_buf_len,
                                           f->xattr_create_flags,
@@ -1092,77 +1118,68 @@ static stm_status h_readdir(stm_9p_server *s,
     wp += 4;
     uint8_t *data_start = wp;
 
-    /* Pull entries in batches from stm_fs_readdir, stop when out of
-     * room or the dir is exhausted. Each on-wire entry is
-     * 13 (qid) + 8 (offset) + 1 (type) + 2 (name_len) + name_len. */
-    enum { BATCH = 32 };
-    stm_fs_dirent_entry batch[BATCH];
+    /* Per-entry cursor advance with rewind-on-no-room (R92 P1-2 fix).
+     * Pull one entry at a time so the cursor advances per-call; on
+     * OUT-OF-ROOM rewind cursor to the pre-fetch value (which the
+     * client recovers via the LAST emitted entry's offset cookie =
+     * the cursor immediately after that entry, i.e., the pre-fetch
+     * of the un-emitted next entry). The fs layer's cursor is
+     * monotonic + opaque per dirent.tla's readdir-cursor invariants;
+     * stm_fs_readdir is well-defined for the resume case. Each
+     * on-wire entry is 13 (qid) + 8 (offset) + 1 (type) + 2 (name_len)
+     * + name_len. */
+    stm_fs_dirent_entry one;
 
     /* Parent ino for ".." synthesis. For the dataset root the
-     * convention is parent_ino = dir_ino (POSIX "/.." -> "/"). The
-     * fid table doesn't track parent walk-history; conservative
-     * choice is parent = dir's ino (matches root semantics; for
-     * non-root dirs the synthesized ".." cookie may be incorrect
-     * — clients that rely on Twalk for parent traversal won't
-     * notice. Future improvement: track each fid's lineage). */
+     * convention is parent_ino = dir_ino (POSIX "/.." → "/"). The fid
+     * table doesn't track parent walk-history; conservative choice is
+     * parent = dir's ino (matches root semantics; for non-root dirs
+     * the synthesized ".." cookie may be incorrect — clients that
+     * rely on Twalk for parent traversal won't notice. Future
+     * improvement: track each fid's lineage). */
     uint64_t parent_ino = f->ino;
 
     uint64_t cursor = offset;
-    bool space_left = true;
 
-    while (space_left) {
+    for (;;) {
+        uint64_t pre_cursor = cursor;
         size_t got = 0;
         stm_status rc = stm_fs_readdir(s->fs, f->dataset_id, f->ino,
                                           parent_ino,
                                           /*flags=*/0,
                                           &cursor,
-                                          batch, BATCH, &got);
+                                          &one, 1, &got);
         if (rc != STM_OK)
             return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
         if (got == 0) break;        /* exhausted */
 
-        for (size_t i = 0; i < got; i++) {
-            const stm_fs_dirent_entry *e = &batch[i];
-            uint32_t entry_size = STM_9P_QID_SIZE + 8u + 1u + 2u + e->name_len;
-            if ((uint32_t)(wp - data_start) + entry_size > count) {
-                /* Out of room — back the cursor up so the next
-                 * Treaddir starts at this entry. The cursor returned
-                 * by stm_fs_readdir is post-batch; we need pre-batch
-                 * value of THIS entry. Conservative: stop here, use
-                 * the cursor from the BATCH-START state on next
-                 * call. The fs layer's cursor monotonicity makes
-                 * this correct — re-querying with the same offset
-                 * will resume cleanly. */
-                space_left = false;
-                /* We must NOT advance cursor past `i`; tell the
-                 * client to retry with `cursor before i` next time.
-                 * But we don't have that — stm_fs_readdir advanced
-                 * past the whole batch. Alternative: emit at most
-                 * one entry, then stop, advancing one cursor step
-                 * at a time. To avoid this complication for v2.0,
-                 * we use BATCH=1 for now via a follow-up; for the
-                 * MVP, accept the rare client-side over-emit
-                 * (Linux v9fs handles short-read by re-trying at
-                 * the SAME offset; this code's cursor-rewind would
-                 * then skip nothing). The bounded msize case is
-                 * the only path that hits this — diagnosed and
-                 * forward-noted for P9-9P-1d hardening. */
-                break;
-            }
-            /* qid: type from STM_DT_ → STM_9P_QT_ */
-            uint8_t qt = STM_9P_QTFILE;
-            if (e->child_type == STM_DT_DIR) qt = STM_9P_QTDIR;
-            else if (e->child_type == STM_DT_LNK) qt = STM_9P_QTSYMLINK;
-            p9l_pqid(wp, qt, (uint32_t)e->child_gen,
-                      qid_path(f->dataset_id, e->child_ino));
-            wp += STM_9P_QID_SIZE;
-            /* offset cookie — use the cursor value AFTER this entry. */
-            p9l_p64(wp, cursor); wp += 8;
-            /* type */
-            *wp++ = e->child_type;
-            /* name */
-            p9l_pstr(&wp, (const char *)e->name, e->name_len);
+        uint32_t entry_size = STM_9P_QID_SIZE + 8u + 1u + 2u + one.name_len;
+        if ((uint32_t)(wp - data_start) + entry_size > count) {
+            /* No room. Rewind cursor so a re-issued Treaddir from the
+             * last-emitted offset cookie (or the original `offset` if
+             * no entry was emitted yet) re-fetches THIS entry. The fs
+             * layer's cursor is opaque + monotonic; setting it back
+             * to pre_cursor is well-defined per dirent.tla's
+             * cursor-stability invariants. Without this rewind the
+             * entry would be silently dropped (the original P1-2
+             * bug). */
+            cursor = pre_cursor;
+            break;
         }
+        /* qid: type from STM_DT_ → STM_9P_QT_ */
+        uint8_t qt = STM_9P_QTFILE;
+        if (one.child_type == STM_DT_DIR)      qt = STM_9P_QTDIR;
+        else if (one.child_type == STM_DT_LNK) qt = STM_9P_QTSYMLINK;
+        p9l_pqid(wp, qt, (uint32_t)one.child_gen,
+                  qid_path(f->dataset_id, one.child_ino));
+        wp += STM_9P_QID_SIZE;
+        /* offset cookie — the post-entry cursor is the next Treaddir's
+         * starting point. */
+        p9l_p64(wp, cursor); wp += 8;
+        /* type */
+        *wp++ = one.child_type;
+        /* name */
+        p9l_pstr(&wp, (const char *)one.name, one.name_len);
     }
 
     p9l_p32(count_field, (uint32_t)(wp - data_start));
@@ -1226,8 +1243,6 @@ static stm_status h_lcreate(stm_9p_server *s,
     if (vrc != STM_OK)
         return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
 
-    uint32_t use_uid = (flags & 0u) ? s->auth_uid : s->auth_uid;  /* always auth_uid */
-    (void)use_uid;
     uint64_t new_ino = 0;
     stm_status rc = stm_fs_create_file(s->fs, f->dataset_id, f->ino,
                                           (const uint8_t *)name, (uint8_t)nlen,
@@ -1826,7 +1841,7 @@ static stm_status h_lock(stm_9p_server *s,
     if (vrc != STM_OK)
         return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
 
-    uint64_t owner_id = s->lock_owner_base + f->fid;
+    uint64_t owner_id = fid_owner_id(s, f->fid);
     uint8_t status = STM_9P_LOCK_SUCCESS;
 
     if (type == STM_9P_LOCK_TYPE_UNLCK) {
@@ -1902,7 +1917,7 @@ static stm_status h_getlock(stm_9p_server *s,
     if (vrc != STM_OK)
         return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
 
-    uint64_t owner_id = s->lock_owner_base + f->fid;
+    uint64_t owner_id = fid_owner_id(s, f->fid);
     uint8_t lock_type = (type == STM_9P_LOCK_TYPE_WRLCK)
                           ? STM_LOCK_EXCLUSIVE
                           : STM_LOCK_SHARED;
@@ -2160,6 +2175,7 @@ static stm_status h_xattrcreate(stm_9p_server *s,
     f->kind            = P9_FID_AUX_XATTR;
     f->is_xattr_create = true;
     f->xattr_name      = name_copy;
+    f->xattr_name_len  = (uint8_t)nlen;
     f->xattr_buf       = buf;
     f->xattr_buf_cap   = (size_t)attr_size;
     f->xattr_buf_len   = 0;
@@ -2179,9 +2195,36 @@ static stm_status h_xattrcreate(stm_9p_server *s,
 /* Public API.                                                             */
 /* ────────────────────────────────────────────────────────────────────── */
 
-/* Process-wide owner-id seed counter — every server_create takes a
- * fresh slice. Avoids cross-server owner-id collisions. */
-static _Atomic uint64_t g_owner_seq = 1;
+/* Process-wide server-id counter. Each server_create gets a unique
+ * 32-bit index used as the high 32 bits of every owner_id this server
+ * passes to stm_fs_lock. Coupled with the client-supplied 32-bit fid
+ * in the low 32 bits, this makes (server, fid) → owner_id a bijection
+ * across all servers in the process. Closes R92 P1-1 (lock-owner
+ * collision via additive arithmetic).
+ *
+ * Starts at 1 so the first server's owner_ids are >= (1 << 32),
+ * preventing any owner_id == 0 (which stm_fs_lock rejects). */
+static _Atomic uint32_t g_server_seq = 1;
+
+/* (R92 P3-4) Runtime assertion that the canonical Linux errno
+ * table values match what we send on the wire. The compile-time
+ * _Static_assert block at the top of this file fires only on Linux
+ * builds; this runtime check fires on every server_create regardless
+ * of host. Uses a representative subset (ENOSYS, ENOENT, EIO,
+ * ENOTSUP, ESTALE) — drift in any of these strongly correlates with
+ * drift across the rest of the table. */
+static void canonical_errno_runtime_check(void)
+{
+    /* Linux errno values per <asm-generic/errno-base.h> +
+     * <asm-generic/errno.h>. Held constant as part of the kernel ABI
+     * since the early 1990s; drift means we've corrupted the table. */
+    if (STM_9P_ECODE_ENOSYS != 38u) abort();
+    if (STM_9P_ECODE_ENOENT !=  2u) abort();
+    if (STM_9P_ECODE_EIO    !=  5u) abort();
+    if (STM_9P_ECODE_ENOTSUP != 95u) abort();
+    if (STM_9P_ECODE_ESTALE != 116u) abort();
+    if (STM_9P_ECODE_EAGAIN != 11u) abort();
+}
 
 stm_status stm_9p_server_create(stm_fs *fs,
                                   uint64_t root_dataset,
@@ -2190,6 +2233,7 @@ stm_status stm_9p_server_create(stm_fs *fs,
                                   uint32_t msize_max,
                                   stm_9p_server **out)
 {
+    canonical_errno_runtime_check();
     if (!fs || !out) return STM_EINVAL;
     if (root_dataset == 0u) return STM_EINVAL;
     *out = NULL;
@@ -2216,11 +2260,15 @@ stm_status stm_9p_server_create(stm_fs *fs,
     s->msize_max = msize_max;
     s->msize     = STM_9P_MSIZE_MIN;     /* pre-Tversion floor */
 
-    /* Take the next slice of STM_9P_MAX_FIDS owner IDs from the
-     * process-wide counter. fids[i].fid + lock_owner_base is always
-     * unique across server instances. */
-    s->lock_owner_base = atomic_fetch_add_explicit(
-        &g_owner_seq, (uint64_t)STM_9P_MAX_FIDS, memory_order_relaxed);
+    /* Server-id high half: each server gets a unique 32-bit index,
+     * shifted into the upper 32 bits of every owner_id. Combined with
+     * the 32-bit client-supplied fid in the lower 32 bits via OR
+     * (fid_owner_id), every (server, fid) tuple maps to a distinct
+     * uint64_t owner_id — independent of the magnitude of fid values.
+     * R92 P1-1 fix. */
+    uint32_t server_idx = atomic_fetch_add_explicit(
+        &g_server_seq, 1u, memory_order_relaxed);
+    s->lock_owner_base = (uint64_t)server_idx << 32;
 
     *out = s;
     return STM_OK;
