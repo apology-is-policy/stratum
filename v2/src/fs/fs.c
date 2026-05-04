@@ -1091,6 +1091,74 @@ stm_status stm_fs_create_file(stm_fs *fs, uint64_t dataset_id,
  * does NOT install any dirent. The orphan persists until explicitly
  * materialized via stm_fs_linkat_anon or freed via stm_fs_unlink_anon.
  * Composes inode.tla::AllocAnon. */
+/* P9-9P-1a: initialize a dataset's root inode. Allocates the
+ * dataset's first inode (which the allocator returns as ino=1)
+ * with mode S_IFDIR | (mode & 0777). Refuses if the dataset
+ * already has an inode at ino=1 (returns STM_EEXIST). The 9P
+ * server's Tattach handler binds the connection's root fid to
+ * (dataset_id, 1); this wrapper closes the bootstrap gap. */
+stm_status stm_fs_init_dataset_root(stm_fs *fs, uint64_t dataset_id,
+                                       uint32_t mode, uint32_t uid,
+                                       uint32_t gid,
+                                       uint64_t *out_root_ino)
+{
+    /* Uniform out-param contract: zero-init BEFORE arg validation. */
+    if (out_root_ino) *out_root_ino = 0;
+    if (!fs || !out_root_ino) return STM_EINVAL;
+    if (dataset_id == 0u) return STM_EINVAL;
+    uint32_t effective_mode = (mode & 07777u) | (uint32_t)S_IFDIR;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+
+    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+    if (!iidx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;
+    }
+
+    /* Refuse if dataset already has ino=1 — caller invoked twice or
+     * the dataset was already initialized via the test seam. */
+    struct stm_inode_value probe = {0};
+    stm_status ps = stm_inode_lookup(iidx, dataset_id, /*ino=*/1u, &probe);
+    if (ps == STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EEXIST;
+    }
+    if (ps != STM_ENOENT) {
+        pthread_mutex_unlock(&fs->lock);
+        return ps;
+    }
+
+    uint64_t new_ino = 0;
+    stm_status as = stm_inode_alloc(iidx, dataset_id, effective_mode,
+                                         uid, gid, &new_ino);
+    if (as != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return as;
+    }
+    /* Allocator state on a fresh dataset MUST yield ino=1. If not,
+     * the dataset was non-fresh in a way the EEXIST probe missed
+     * (e.g., ino=2 exists but ino=1 doesn't — pathological). */
+    if (new_ino != 1u) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_ECORRUPT;
+    }
+
+    /* Stamp creation timestamps + persist (mirrors stm_fs_create_anon
+     * + the regular create-stamp shape). */
+    struct stm_inode_value iv = {0};
+    stm_status ls = stm_inode_lookup(iidx, dataset_id, new_ino, &iv);
+    if (ls == STM_OK) {
+        fs_stamp_create_times(&iv);
+        (void)stm_inode_set(iidx, dataset_id, new_ino, &iv);
+    }
+
+    *out_root_ino = new_ino;
+    pthread_mutex_unlock(&fs->lock);
+    return STM_OK;
+}
+
 stm_status stm_fs_create_anon(stm_fs *fs, uint64_t dataset_id,
                                   uint32_t mode, uint32_t uid, uint32_t gid,
                                   uint64_t *out_child_ino)

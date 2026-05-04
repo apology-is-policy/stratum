@@ -59,6 +59,35 @@ _Static_assert(STM_9P_O_CREAT     == O_CREAT,     "O_CREAT drift");
 _Static_assert(STM_9P_O_EXCL      == O_EXCL,      "O_EXCL drift");
 _Static_assert(STM_9P_O_TRUNC     == O_TRUNC,     "O_TRUNC drift");
 _Static_assert(STM_9P_O_APPEND    == O_APPEND,    "O_APPEND drift");
+/* Errno table drift guards — STM_9P_ECODE_* constants must equal the
+ * host's <errno.h> values on Linux builds (verifies our hand-rolled
+ * canonical table matches the kernel's). On non-Linux builds we use
+ * the canonical table directly without comparison. */
+_Static_assert(STM_9P_ECODE_EPERM        == EPERM,        "EPERM drift");
+_Static_assert(STM_9P_ECODE_ENOENT       == ENOENT,       "ENOENT drift");
+_Static_assert(STM_9P_ECODE_EIO          == EIO,          "EIO drift");
+_Static_assert(STM_9P_ECODE_EBADF        == EBADF,        "EBADF drift");
+_Static_assert(STM_9P_ECODE_EAGAIN       == EAGAIN,       "EAGAIN drift");
+_Static_assert(STM_9P_ECODE_ENOMEM       == ENOMEM,       "ENOMEM drift");
+_Static_assert(STM_9P_ECODE_EACCES       == EACCES,       "EACCES drift");
+_Static_assert(STM_9P_ECODE_EBUSY        == EBUSY,        "EBUSY drift");
+_Static_assert(STM_9P_ECODE_EEXIST       == EEXIST,       "EEXIST drift");
+_Static_assert(STM_9P_ECODE_EXDEV        == EXDEV,        "EXDEV drift");
+_Static_assert(STM_9P_ECODE_ENODEV       == ENODEV,       "ENODEV drift");
+_Static_assert(STM_9P_ECODE_ENOTDIR      == ENOTDIR,      "ENOTDIR drift");
+_Static_assert(STM_9P_ECODE_EISDIR       == EISDIR,       "EISDIR drift");
+_Static_assert(STM_9P_ECODE_EINVAL       == EINVAL,       "EINVAL drift");
+_Static_assert(STM_9P_ECODE_EFBIG        == EFBIG,        "EFBIG drift");
+_Static_assert(STM_9P_ECODE_ENOSPC       == ENOSPC,       "ENOSPC drift");
+_Static_assert(STM_9P_ECODE_EROFS        == EROFS,        "EROFS drift");
+_Static_assert(STM_9P_ECODE_ERANGE       == ERANGE,       "ERANGE drift");
+_Static_assert(STM_9P_ECODE_ENAMETOOLONG == ENAMETOOLONG, "ENAMETOOLONG drift");
+_Static_assert(STM_9P_ECODE_ENOSYS       == ENOSYS,       "ENOSYS drift");
+_Static_assert(STM_9P_ECODE_ENOTEMPTY    == ENOTEMPTY,    "ENOTEMPTY drift");
+_Static_assert(STM_9P_ECODE_ENODATA      == ENODATA,      "ENODATA drift");
+_Static_assert(STM_9P_ECODE_EPROTO       == EPROTO,       "EPROTO drift");
+_Static_assert(STM_9P_ECODE_EOVERFLOW    == EOVERFLOW,    "EOVERFLOW drift");
+_Static_assert(STM_9P_ECODE_ESTALE       == ESTALE,       "ESTALE drift");
 #endif
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -122,43 +151,46 @@ static inline void must_unlock(pthread_mutex_t *m) {
 /* stm_status → Linux errno.                                              */
 /* ────────────────────────────────────────────────────────────────────── */
 
+/* Map stm_status → 9P2000.L wire-format errno. Routes through the
+ * canonical STM_9P_ECODE_* table (Linux's errno values verbatim) so
+ * the wire format is correct regardless of the build host's
+ * <errno.h> mapping (macOS's ENOSYS=78 vs Linux's 38, etc.). */
 static uint32_t status_to_errno(stm_status s)
 {
     switch (s) {
     case STM_OK:               return 0;
-    /* These are negative Linux errnos already. */
-    case STM_EINVAL:           return EINVAL;
-    case STM_ENOMEM:           return ENOMEM;
-    case STM_ENOSPC:           return ENOSPC;
-    case STM_EOVERFLOW:        return EOVERFLOW;
-    case STM_ERANGE:           return ERANGE;
-    case STM_EIO:              return EIO;
-    case STM_ENOENT:           return ENOENT;
-    case STM_EEXIST:           return EEXIST;
-    case STM_EACCES:           return EACCES;
-    case STM_EBUSY:            return EBUSY;
-    case STM_EAGAIN:           return EAGAIN;
-    case STM_ENODEV:           return ENODEV;
-    case STM_EROFS:            return EROFS;
-    case STM_EXDEV:            return EXDEV;
-    case STM_ENOTDIR:          return ENOTDIR;
-    case STM_EISDIR:           return EISDIR;
-    case STM_ENOTEMPTY:        return ENOTEMPTY;
-    case STM_ENAMETOOLONG:     return ENAMETOOLONG;
-    case STM_ENODATA:          return ENODATA;
-    case STM_EPERM:            return EPERM;
-    case STM_ESTALE:           return ESTALE;
-    /* Stratum-specific codes that fold into POSIX shapes. */
-    case STM_ECORRUPT:         return EIO;
-    case STM_EBADTAG:          return EIO;
-    case STM_EBADVERSION:      return EPROTO;
-    case STM_EBADFEATURE:      return EPROTO;
-    case STM_EWEDGED:          return EIO;
-    case STM_ENOTSUPPORTED:    return ENOTSUP;
-    case STM_EPROTOCOL:        return EPROTO;
-    case STM_EBACKEND:         return EIO;
-    case STM_EQUORUM:          return EIO;
-    default:                   return EIO;
+    case STM_EINVAL:           return STM_9P_ECODE_EINVAL;
+    case STM_ENOMEM:           return STM_9P_ECODE_ENOMEM;
+    case STM_ENOSPC:           return STM_9P_ECODE_ENOSPC;
+    case STM_EOVERFLOW:        return STM_9P_ECODE_EOVERFLOW;
+    case STM_ERANGE:           return STM_9P_ECODE_ERANGE;
+    case STM_EIO:              return STM_9P_ECODE_EIO;
+    case STM_ENOENT:           return STM_9P_ECODE_ENOENT;
+    case STM_EEXIST:           return STM_9P_ECODE_EEXIST;
+    case STM_EACCES:           return STM_9P_ECODE_EACCES;
+    case STM_EBUSY:            return STM_9P_ECODE_EBUSY;
+    case STM_EAGAIN:           return STM_9P_ECODE_EAGAIN;
+    case STM_ENODEV:           return STM_9P_ECODE_ENODEV;
+    case STM_EROFS:            return STM_9P_ECODE_EROFS;
+    case STM_EXDEV:            return STM_9P_ECODE_EXDEV;
+    case STM_ENOTDIR:          return STM_9P_ECODE_ENOTDIR;
+    case STM_EISDIR:           return STM_9P_ECODE_EISDIR;
+    case STM_ENOTEMPTY:        return STM_9P_ECODE_ENOTEMPTY;
+    case STM_ENAMETOOLONG:     return STM_9P_ECODE_ENAMETOOLONG;
+    case STM_ENODATA:          return STM_9P_ECODE_ENODATA;
+    case STM_EPERM:            return STM_9P_ECODE_EPERM;
+    case STM_ESTALE:           return STM_9P_ECODE_ESTALE;
+    /* Stratum-specific codes fold into POSIX shapes. */
+    case STM_ECORRUPT:         return STM_9P_ECODE_EIO;
+    case STM_EBADTAG:          return STM_9P_ECODE_EIO;
+    case STM_EBADVERSION:      return STM_9P_ECODE_EPROTO;
+    case STM_EBADFEATURE:      return STM_9P_ECODE_EPROTO;
+    case STM_EWEDGED:          return STM_9P_ECODE_EIO;
+    case STM_ENOTSUPPORTED:    return STM_9P_ECODE_ENOTSUP;
+    case STM_EPROTOCOL:        return STM_9P_ECODE_EPROTO;
+    case STM_EBACKEND:         return STM_9P_ECODE_EIO;
+    case STM_EQUORUM:          return STM_9P_ECODE_EIO;
+    default:                   return STM_9P_ECODE_EIO;
     }
 }
 

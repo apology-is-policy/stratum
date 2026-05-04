@@ -199,6 +199,46 @@ enum {
 #define STM_9P_AT_REMOVEDIR    0x200u
 
 /* ────────────────────────────────────────────────────────────────────── */
+/* Canonical 9P2000.L errno table.                                        */
+/*                                                                         */
+/* Per the 9P2000.L spec, Rlerror's `ecode` field carries Linux errno     */
+/* values verbatim (a Linux v9fs client reads ecode as if it were errno).  */
+/* On Linux these constants are guaranteed to equal `<errno.h>`'s values  */
+/* (drift-asserted via `_Static_assert` in server.c). On non-Linux builds */
+/* (macOS, *BSD) the host's `<errno.h>` mapping differs — the SERVER MUST */
+/* still send Linux's values on the wire so that Linux v9fs clients can   */
+/* interpret correctly. status_to_errno() in server.c routes through      */
+/* this table.                                                            */
+/* ────────────────────────────────────────────────────────────────────── */
+
+#define STM_9P_ECODE_EPERM            1u
+#define STM_9P_ECODE_ENOENT           2u
+#define STM_9P_ECODE_EIO              5u
+#define STM_9P_ECODE_EBADF            9u
+#define STM_9P_ECODE_EAGAIN          11u
+#define STM_9P_ECODE_ENOMEM          12u
+#define STM_9P_ECODE_EACCES          13u
+#define STM_9P_ECODE_EBUSY           16u
+#define STM_9P_ECODE_EEXIST          17u
+#define STM_9P_ECODE_EXDEV           18u
+#define STM_9P_ECODE_ENODEV          19u
+#define STM_9P_ECODE_ENOTDIR         20u
+#define STM_9P_ECODE_EISDIR          21u
+#define STM_9P_ECODE_EINVAL          22u
+#define STM_9P_ECODE_EFBIG           27u
+#define STM_9P_ECODE_ENOSPC          28u
+#define STM_9P_ECODE_EROFS           30u
+#define STM_9P_ECODE_ERANGE          34u
+#define STM_9P_ECODE_ENAMETOOLONG    36u
+#define STM_9P_ECODE_ENOSYS          38u
+#define STM_9P_ECODE_ENOTEMPTY       39u
+#define STM_9P_ECODE_ENODATA         61u
+#define STM_9P_ECODE_EPROTO          71u
+#define STM_9P_ECODE_EOVERFLOW       75u
+#define STM_9P_ECODE_ENOTSUP         95u
+#define STM_9P_ECODE_ESTALE         116u
+
+/* ────────────────────────────────────────────────────────────────────── */
 /* Server.                                                                */
 /* ────────────────────────────────────────────────────────────────────── */
 

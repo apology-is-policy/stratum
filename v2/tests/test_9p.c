@@ -18,9 +18,6 @@
 
 #include <stratum/9p.h>
 #include <stratum/fs.h>
-#include <stratum/fs_testing.h>
-#include <stratum/inode.h>
-#include <stratum/sync.h>
 #include <stratum/types.h>
 
 #include <errno.h>
@@ -60,19 +57,16 @@ static uint64_t load_u64(const uint8_t *p) {
 
 #define RBUF (256u * 1024u)
 
-/* Pre-allocate the root directory of dataset 1 at ino=1. Mirrors
- * test_fs_phase8.c's p2b_alloc_root_dir — the 9P server's Tattach
- * binds to this. v2's bootstrap doesn't auto-create a dataset root
- * (the test seam handles it; production callers would need a
- * future stm_fs_init_dataset_root API — forward-note). */
+/* Pre-allocate the root directory of dataset 1 at ino=1. Uses the
+ * production-shape stm_fs_init_dataset_root wrapper landed at
+ * P9-9P-1a; the 9P server's Tattach binds to this. */
 static void p9_alloc_root_dir(stm_fs *fs, uint64_t *out_root_ino)
 {
-    stm_inode_index *iidx = stm_sync_inode_index(stm_fs_sync_for_test(fs));
-    STM_ASSERT_TRUE(iidx != NULL);
-    uint32_t mode = (uint32_t)S_IFDIR | 0755u;
-    STM_ASSERT_OK(stm_inode_alloc(iidx, /*ds=*/1, mode, /*uid=*/0, /*gid=*/0,
-                                       out_root_ino));
-    STM_ASSERT(*out_root_ino != 0);
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, /*ds=*/1u,
+                                              /*mode=*/0755u,
+                                              /*uid=*/0, /*gid=*/0,
+                                              out_root_ino));
+    STM_ASSERT_EQ(*out_root_ino, 1u);
 }
 
 /* ── request builders ────────────────────────────────────────────────── */
@@ -452,6 +446,33 @@ STM_TEST(p9_getattr_root_returns_dir_qid) {
 
     free(req); free(resp);
     stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(fs_init_dataset_root_double_call_refuses_eexist) {
+    /* Regression for stm_fs_init_dataset_root's STM_EEXIST refusal of
+     * a second init on the same dataset. Validates the EEXIST probe
+     * gate (catches the double-init mistake before it'd allocate
+     * ino=2 with mode=S_IFDIR and leak as a stray dir inode). */
+    make_tmp("9p_init_dup");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t r = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1u, 0755u, 0, 0, &r));
+    STM_ASSERT_EQ(r, 1u);
+
+    /* Second call must refuse with STM_EEXIST. */
+    uint64_t r2 = 0xDEADBEEFu;
+    STM_ASSERT_ERR(stm_fs_init_dataset_root(fs, 1u, 0755u, 0, 0, &r2),
+                   STM_EEXIST);
+    STM_ASSERT_EQ(r2, 0u);   /* zero-init contract on STM_EEXIST */
+
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
     unlink(g_key_path);

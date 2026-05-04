@@ -1260,6 +1260,46 @@ stm_status stm_fs_create_dataset(stm_fs *fs, uint64_t parent_id,
                                     uint64_t *out_id);
 
 /*
+ * P9-9P-1a: initialize a freshly-created dataset's root inode.
+ *
+ * Allocates a directory inode at `dataset_id`'s ino space. The
+ * call MUST be the FIRST inode allocation in the dataset — the
+ * inode allocator's initial state means the resulting ino is
+ * guaranteed to be 1 (the root convention). Subsequent inode
+ * allocations (mkdir, create_file, ...) use ino 2, 3, ...
+ *
+ * Mode bits: file-type forced to S_IFDIR; permission bits taken
+ * from `mode & 0777`. uid / gid stamped onto the new record.
+ *
+ * Refusals:
+ *   - STM_EINVAL (NULL fs, dataset_id == 0, NULL out_root_ino).
+ *   - STM_EWEDGED on a wedged fs.
+ *   - STM_EROFS on a read-only mount.
+ *   - STM_EEXIST if ino 1 already exists in the dataset (caller
+ *     called this twice, or the dataset was already initialized).
+ *   - STM_ENOMEM on alloc failure.
+ *   - STM_ECORRUPT if the allocated ino comes back != 1 (allocator
+ *     state corruption — should never happen on a fresh dataset).
+ *
+ * Lock posture: takes fs->lock + FS_GUARD_WRITE; same shape as
+ * `stm_fs_create_anon`.
+ *
+ * Composition: the 9P server's Tattach binds the connection's
+ * root fid to (dataset_id, ino=1); production callers must run
+ * this immediately after `stm_fs_create_dataset` (or after
+ * format on the pool's root dataset_id == 1) so Tattach can
+ * resolve. Pre-P9-9P-1a, tests reached past the public API to
+ * call `stm_inode_alloc` via the inode-index test seam — that
+ * pattern remains in tests/test_fs_phase8.c (`p2b_alloc_root_dir`)
+ * for legacy reasons but new tests should use this wrapper.
+ */
+STM_MUST_USE
+stm_status stm_fs_init_dataset_root(stm_fs *fs, uint64_t dataset_id,
+                                       uint32_t mode, uint32_t uid,
+                                       uint32_t gid,
+                                       uint64_t *out_root_ino);
+
+/*
  * P7-CAS-13: production-shape fs-level wrappers around the dataset
  * property API. Pre-P7-CAS-13, callers (including tests) had to
  * reach the `stm_dataset_index` handle via the test-only
