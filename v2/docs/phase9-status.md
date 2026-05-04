@@ -47,17 +47,64 @@ language bindings, future kernel module) is a 9P consumer.
       exit). CI matrix updated: `tlc-specs` job adds `namespace`
       to the per-PR check. No code yet — implementation in P8-9P-2.
 
-- [ ] **P8-9P-1 9P2000.L baseline** — pending; the core 9P
-      server module under `src/9p/`. Tversion / Tattach (default
-      namespace only; per-connection composition is P8-9P-2) /
-      Tauth (none backend only) / Twalk / Topen / Tread / Twrite
-      / Tclunk / Tremove / Tstat / Twstat. Unix socket transport.
-      Single-connection unit tests in `tests/test_9p_*.c`.
-      Spec-to-code reference for the connection lifecycle:
-      `namespace.tla` Attach / Detach.
+- [x] **P9-9P-0 fid.tla** — spec-first scaffold for the fid
+      lifecycle invariants that the P9-9P-1 server must uphold.
+      27th TLA+ module. Models per-connection fid table state
+      machine: Attach / Walk / IOSuccess / IOReject / Clunk /
+      Detach + Free / ReuseAlloc on the inode side. Composes
+      against `inode.tla`'s `TupleUniqueAllTime` invariant
+      (`(ino, gen)` strict-monotonic-on-reuse) — fid.tla pins
+      the runtime gate that uses the unique-tuple property at
+      every IO/Walk/Bind boundary. Headline invariant
+      `IOOnlyAgainstCurrentGen`: every captured IO observation
+      that succeeded did so against a fid whose cached_gen
+      matched current_gen[ino] AT THAT MOMENT AND alive[ino].
+      Plus `WalkBindsWithCurrentGen` (every bind snapshots
+      current_gen atomically), `ClunkClears`, `DetachClears`,
+      `TypeOK`. Healthy: 1.35M distinct states / depth 19 / 14s
+      wall (Connections={c1,c2}, Fids={f1,f2},
+      Inos={i_root,i_other}, MaxGen=2). Four buggy variants
+      enumerate the canonical 9P-server failure modes:
+      `BuggyIOSkipsGenCheck` (confused-deputy stale-fid attack;
+      fires `IOOnlyAgainstCurrentGen`),
+      `BuggyWalkSnapshotsStaleGen` (stale-from-creation fid;
+      fires `WalkBindsWithCurrentGen`), `BuggyClunkLeaksFid`
+      (use-after-clunk + capability leak; fires `ClunkClears`),
+      `BuggyDetachLeaksFids` (cross-client capability leak via
+      connection-slot reuse; fires `DetachClears`). All four
+      fire as designed. Spec posture: 27 modules / 34 fixed
+      cfgs / 61 buggy cfgs (was 26 / 33 / 57 at Phase 8 exit).
+      CI matrix updated: `tlc-specs` job adds `fid` to the
+      per-PR check (also adds the fall-out R88 P3-2 / R90 P2-3
+      additions deferred to Phase 8.5 hardening). 10-specs.md
+      catalog row + per-module section added; `locks.tla` row
+      also added in the same edit (closes R90 P2-2 forward-
+      note). No code yet — implementation in P9-9P-1.
 
-- [ ] **P8-9P-2 per-connection namespace composition** — pending;
-      implements `namespace.tla` against the P8-9P-1 server.
+- [ ] **P9-9P-1 9P2000.L baseline** — pending; the core 9P
+      server module under `src/9p/` (separate from `src/p9/`,
+      janus's key-agent codec — keeps the two consumers
+      independent). Reuses `wire.h` from `src/p9/`. Public API
+      `stm_9p_server_create(stm_fs *fs, root_ds, ...)` taking
+      a live `stm_fs` handle directly (no vops abstraction —
+      the server is bound to stm_fs). Fid table per
+      `fid.tla`'s state machine. qid encoding: `path =
+      (ds:32 << 32) | ino:32`, `version = si_gen`, `type ∈
+      {qtdir, qtfile, qtsymlink}`. Handlers: Tversion
+      (negotiates "9P2000.L"), Rlerror, Tattach (Unix-socket
+      SO_PEERCRED), Twalk, Tlopen, Tlcreate, Tmkdir, Tsymlink,
+      Treadlink, Tlink, Tunlinkat, Trenameat, Tread, Twrite,
+      Tclunk, Treaddir, Tgetattr, Tsetattr, Tlock, Tgetlock,
+      Txattrwalk, Txattrcreate, Tfsync, Tstatfs, Tflush.
+      Adds `src/9p/` to CLAUDE.md trigger list. New tests in
+      `tests/test_9p.c`. Spec-to-code: every `IOSuccess` /
+      `IOReject` action in fid.tla maps to the gen-check gate
+      in the server's per-handler stale-fid detection; every
+      `Walk` action maps to Twalk's qid + cached_gen
+      population.
+
+- [ ] **P9-9P-2 per-connection namespace composition** — pending;
+      implements `namespace.tla` against the P9-9P-1 server.
       Adds Tbind / Tunbind extensions per ARCHITECTURE §8.8.2.
       Connections get private mount-table state allocated at
       Tattach + freed at Tclunk (the connection's root fid).
@@ -66,11 +113,21 @@ language bindings, future kernel module) is a 9P consumer.
       a connection's mount table needs to rule out the
       crosstalk classes.
 
-- [ ] **P8-9P-3 stratum 9P extensions** — pending; Tpin / Tunpin
+- [ ] **P9-9P-3 stratum 9P extensions** — pending; Tpin / Tunpin
       (snapshot pinning per ARCHITECTURE §3.3.2), Tsync (client-
       initiated commit), Treflink (O(1) copy via P7-16's
       stm_fs_reflink), Tfallocate, plus pluggable auth backends
       (factotum, SASL, token).
+
+- [ ] **P9-9P-4 stratumd Unix socket transport** — pending;
+      `src/cmd/stratumd/` daemon binary. Listens on
+      `/var/run/stratum.sock` (configurable). Accept-loop
+      spawns a server-instance per connection (one fid
+      namespace per connection per the p9.h / 9p.h comment;
+      concurrency across clients is the daemon's problem).
+      Single-threaded event loop at v2.0 — multi-thread
+      post-perf-tuning. Integration tests with real socket
+      roundtrip in `tests/test_9p_socket_*.c`.
 
 - [ ] **P8-CTL-1 /ctl/ synthetic FS** — pending; the layout in
       ARCHITECTURE §14.3 served as a 9P file tree. Read paths
