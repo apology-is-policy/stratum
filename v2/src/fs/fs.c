@@ -602,6 +602,14 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
                                                 uint64_t off,
                                                 const void *buf, size_t len)
 {
+    /* R81 P3-3: zero-length write is a no-op; skip the stamp and the
+     * inode_set entirely so spurious mtime/ctime bumps don't fool
+     * `make` / build systems that probe via write(fd, buf, 0). The
+     * EXTENT path's stm_sync_write_extent already rejects len==0 with
+     * STM_EINVAL, so this short-circuit makes INLINE behavior
+     * symmetric with EXTENT. Linux ext4/XFS short-circuit similarly. */
+    if (len == 0u) return STM_OK;
+
     uint8_t kind = iv->si_data_kind;
     uint64_t end_off = off + (uint64_t)len;
 
@@ -1335,8 +1343,12 @@ stm_status stm_fs_utimens(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 {
     if (!fs) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
-    if (atime_nsec >= 1000000000u || mtime_nsec >= 1000000000u ||
-        ctime_nsec >= 1000000000u) return STM_EINVAL;
+    /* R81 P3-6: ctime_nsec arg is now ignored (P8-POSIX-7a auto-stamps
+     * ctime to "now"); skip its validation so weird values don't
+     * spuriously reject. atime_nsec / mtime_nsec are still stored
+     * and need POSIX bounds. */
+    if (atime_nsec >= 1000000000u || mtime_nsec >= 1000000000u)
+        return STM_EINVAL;
 
     pthread_mutex_lock(&fs->lock);
     FS_GUARD_WRITE(fs);
@@ -1442,19 +1454,6 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
         pthread_mutex_unlock(&fs->lock);
         return ils;
     }
-    /* P8-POSIX-7a: link bumps nlink → ctime auto-stamps to "now"
-     * per POSIX (link(2) is a metadata change to the inode). Lookup
-     * back the post-bump inode + stamp + set. Lock-posture infallibility
-     * applies (R76 P3-1 argument): under fs->lock the inode_lookup
-     * cannot fail (we just incremented nlink). */
-    {
-        struct stm_inode_value cv2 = {0};
-        stm_status ls2 = stm_inode_lookup(iidx, dataset_id, child_ino, &cv2);
-        if (ls2 == STM_OK) {
-            fs_stamp_ctime_now(&cv2);
-            (void)stm_inode_set(iidx, dataset_id, child_ino, &cv2);
-        }
-    }
     stm_status das = stm_dirent_alloc(didx, dataset_id, dst_parent_ino,
                                           dst_name, dst_name_len,
                                           child_ino, child_gen, child_type);
@@ -1474,6 +1473,23 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
         (void)stm_inode_unlink(iidx, dataset_id, child_ino, &freed_unused);
         pthread_mutex_unlock(&fs->lock);
         return das;       /* STM_EEXIST if name already linked, etc. */
+    }
+
+    /* R81 P3-1: link bumps nlink → ctime auto-stamps to "now" per
+     * POSIX (link(2) is a metadata change to the inode). Stamp ONLY
+     * after the dirent_alloc has succeeded — pre-fix, the stamp
+     * landed before dirent_alloc, and a failed dirent_alloc rolled
+     * back nlink but left the bumped ctime persisted (POSIX divergence
+     * — Linux ext4 doesn't bump ctime on failed link(2)). Lock-
+     * posture infallibility applies (R76 P3-1 argument): under
+     * fs->lock the inode_lookup cannot fail. */
+    {
+        struct stm_inode_value cv2 = {0};
+        stm_status ls2 = stm_inode_lookup(iidx, dataset_id, child_ino, &cv2);
+        if (ls2 == STM_OK) {
+            fs_stamp_ctime_now(&cv2);
+            (void)stm_inode_set(iidx, dataset_id, child_ino, &cv2);
+        }
     }
 
     pthread_mutex_unlock(&fs->lock);
@@ -2518,7 +2534,15 @@ stm_status stm_fs_removexattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 /* P7-16: stm_fs_reflink. POSIX-shape FICLONE — replaces dst's empty
  * extent tree with a reflink-share of src's. Holds fs->lock across the
  * inner sync_reflink so a concurrent observer can't see a partial
- * dst. Errors propagate from stm_sync_reflink. */
+ * dst. Errors propagate from stm_sync_reflink.
+ *
+ * R81 P3-8 forward-note: dst-inode mtime/ctime stamping deferred to
+ * the P8-POSIX-10 reflink-wrapper follow-up sub-chunk. Per POSIX
+ * copy_file_range(2), "On success, copy_file_range() also updates
+ * the file timestamps of the destination file" — current impl does
+ * not stamp. Fix lands when the reflink-wrapper sub-chunk surfaces
+ * the inode-level integration (see phase8-status.md P8-POSIX-10
+ * row). */
 stm_status stm_fs_reflink(stm_fs *fs,
                             uint64_t src_dataset_id, uint64_t src_ino,
                             uint64_t dst_dataset_id, uint64_t dst_ino)

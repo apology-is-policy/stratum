@@ -10846,6 +10846,200 @@ STM_TEST(fs_p7a_btime_immutable_across_all_ops) {
     unlink(g_key_path);
 }
 
+/* R81 P3-4: timestamps persist across sync_commit + unmount + remount.
+ * The encoder is memcpy-of-struct so persistence is structurally
+ * guaranteed, but no positive test pinned this — a future refactor
+ * of in_encode_value / in_decode_value that drops timestamps would
+ * not surface without this regression detector. */
+STM_TEST(fs_p7a_r81_p3_4_timestamps_persist_across_remount) {
+    make_tmp("p7a_r81_persist");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+
+    /* Capture all four timestamps + each sub-precision. */
+    struct stm_inode_value v0 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v0));
+    uint64_t btime0_sec  = stm_load_le64(v0.si_btime_sec);
+    uint32_t btime0_nsec = stm_load_le32(v0.si_btime_nsec);
+    uint64_t atime0_sec  = stm_load_le64(v0.si_atime_sec);
+    uint32_t atime0_nsec = stm_load_le32(v0.si_atime_nsec);
+    uint64_t mtime0_sec  = stm_load_le64(v0.si_mtime_sec);
+    uint32_t mtime0_nsec = stm_load_le32(v0.si_mtime_nsec);
+    uint64_t ctime0_sec  = stm_load_le64(v0.si_ctime_sec);
+    uint32_t ctime0_nsec = stm_load_le32(v0.si_ctime_nsec);
+
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    /* Remount + re-stat. */
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    struct stm_inode_value v1 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v1));
+
+    /* Every timestamp field bit-exact. */
+    STM_ASSERT_EQ(stm_load_le64(v1.si_btime_sec),  btime0_sec);
+    STM_ASSERT_EQ(stm_load_le32(v1.si_btime_nsec), btime0_nsec);
+    STM_ASSERT_EQ(stm_load_le64(v1.si_atime_sec),  atime0_sec);
+    STM_ASSERT_EQ(stm_load_le32(v1.si_atime_nsec), atime0_nsec);
+    STM_ASSERT_EQ(stm_load_le64(v1.si_mtime_sec),  mtime0_sec);
+    STM_ASSERT_EQ(stm_load_le32(v1.si_mtime_nsec), mtime0_nsec);
+    STM_ASSERT_EQ(stm_load_le64(v1.si_ctime_sec),  ctime0_sec);
+    STM_ASSERT_EQ(stm_load_le32(v1.si_ctime_nsec), ctime0_nsec);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* R81 P3-5: truncate(new_size == cur_size) is a no-op and MUST NOT
+ * bump mtime/ctime. The current short-circuit at fs.c:1687-1690
+ * returns STM_OK before any stamping; this test pins the invariant
+ * so a future refactor moving the no-op short-circuit below the
+ * stamp call would regress visibly. */
+STM_TEST(fs_p7a_r81_p3_5_no_op_truncate_skips_stamp) {
+    make_tmp("p7a_r81_noop_trunc");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, (const uint8_t *)"hello", 5));
+
+    struct stm_inode_value v0 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v0));
+    uint64_t mtime0 = stm_load_le64(v0.si_mtime_sec);
+    uint32_t mtime0_nsec = stm_load_le32(v0.si_mtime_nsec);
+    uint64_t ctime0 = stm_load_le64(v0.si_ctime_sec);
+    uint32_t ctime0_nsec = stm_load_le32(v0.si_ctime_nsec);
+    uint64_t cur_size = stm_load_le64(v0.si_size);
+
+    /* Sleep so a real stamp would advance, then call no-op truncate. */
+    struct timespec slp = {1, 0};
+    (void)nanosleep(&slp, NULL);
+
+    STM_ASSERT_OK(stm_fs_truncate(fs, 1, f, cur_size));
+
+    struct stm_inode_value v1 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v1));
+    /* mtime + ctime UNCHANGED (no-op skipped the stamp). */
+    STM_ASSERT_EQ(stm_load_le64(v1.si_mtime_sec),  mtime0);
+    STM_ASSERT_EQ(stm_load_le32(v1.si_mtime_nsec), mtime0_nsec);
+    STM_ASSERT_EQ(stm_load_le64(v1.si_ctime_sec),  ctime0);
+    STM_ASSERT_EQ(stm_load_le32(v1.si_ctime_nsec), ctime0_nsec);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* R81 P3-3: zero-length write is a no-op and MUST NOT bump mtime/ctime.
+ * Pre-fix, the inline fast path stamped on every successful write
+ * regardless of len; len==0 spuriously bumped mtime — POSIX/Linux
+ * divergence. Post-fix: short-circuit at the top of
+ * fs_write_regular_locked. */
+STM_TEST(fs_p7a_r81_p3_3_zero_length_write_skips_stamp) {
+    make_tmp("p7a_r81_zerolen");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, (const uint8_t *)"hi", 2));
+
+    struct stm_inode_value v0 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v0));
+    uint64_t mtime0 = stm_load_le64(v0.si_mtime_sec);
+    uint32_t mtime0_nsec = stm_load_le32(v0.si_mtime_nsec);
+
+    struct timespec slp = {1, 0};
+    (void)nanosleep(&slp, NULL);
+
+    /* Zero-length write — should be a no-op. */
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f, 0, (const uint8_t *)"", 0));
+
+    struct stm_inode_value v1 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, f, &v1));
+    STM_ASSERT_EQ(stm_load_le64(v1.si_mtime_sec),  mtime0);
+    STM_ASSERT_EQ(stm_load_le32(v1.si_mtime_nsec), mtime0_nsec);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* R81 P3-1: ctime is NOT bumped on failed link(2). Pre-fix, the link
+ * path stamped ctime BEFORE dirent_alloc — a failed dirent_alloc
+ * (e.g., STM_EEXIST) rolled back nlink but left the bumped ctime.
+ * Post-fix: stamp moved to AFTER dirent_alloc success. */
+STM_TEST(fs_p7a_r81_p3_1_failed_link_does_not_bump_ctime) {
+    make_tmp("p7a_r81_link_fail");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t a = 0, b = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"a", 1,
+                                          0644u, 0, 0, &a));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"b", 1,
+                                          0644u, 0, 0, &b));
+
+    struct stm_inode_value va0 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, a, &va0));
+    uint64_t a_ctime0 = stm_load_le64(va0.si_ctime_sec);
+    uint32_t a_ctime0_nsec = stm_load_le32(va0.si_ctime_nsec);
+
+    struct timespec slp = {1, 0};
+    (void)nanosleep(&slp, NULL);
+
+    /* Try to link `a` to a name that already exists (`b`).
+     * dirent_alloc returns STM_EEXIST → rollback nlink. ctime on `a`
+     * MUST stay at the pre-call value (no spurious bump). */
+    STM_ASSERT_ERR(stm_fs_link(fs, 1, root, (const uint8_t *)"a", 1,
+                                     root, (const uint8_t *)"b", 1),
+                   STM_EEXIST);
+
+    struct stm_inode_value va1 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, a, &va1));
+    STM_ASSERT_EQ(stm_load_le64(va1.si_ctime_sec),  a_ctime0);
+    STM_ASSERT_EQ(stm_load_le32(va1.si_ctime_nsec), a_ctime0_nsec);
+    /* nlink also rolled back to 1. */
+    STM_ASSERT_EQ(stm_load_le32(va1.si_nlink), (uint32_t)1);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 /* R80-anticipated regression test: writer-side guard rejects oversized
  * value_len at the fs boundary BEFORE reaching the xattr layer
  * (R71 P1-1 + R77 P1-1 lesson — defense-in-depth at every trust
