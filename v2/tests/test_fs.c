@@ -11683,10 +11683,10 @@ STM_TEST(fs_p7c_handle_persists_across_remount) {
     unlink(g_tmp_path); unlink(g_key_path);
 }
 
-STM_TEST(fs_p7c_handle_stale_after_unlink_is_enoent) {
-    /* Pre-fix model would let a stale handle open a different file
-     * (ino reused for an unrelated inode). The si_gen mismatch
-     * detection fires here. */
+STM_TEST(fs_p7c_handle_stale_after_unlink_is_estale) {
+    /* R83 P2-2 update: post-unlink resolves to STM_ESTALE (Linux
+     * ESTALE), distinct from STM_ENOENT ("never existed"). The
+     * file used to live at this (ds, ino) but is gone. */
     make_tmp("p7c_handle_stale_after_unlink");
     stm_fs_format_opts fopts = default_format_opts();
     STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
@@ -11705,23 +11705,53 @@ STM_TEST(fs_p7c_handle_stale_after_unlink_is_enoent) {
                                               (const uint8_t *)"f", 1, &h));
 
     /* Unlink — drops nlink to 0, cascade-frees the inode. Handle
-     * now refers to a FREED inode → STM_ENOENT. */
+     * now refers to a FREED inode → STM_ESTALE (not STM_ENOENT
+     * because the inode existed at this slot at some point). */
     STM_ASSERT_OK(stm_fs_unlink(fs, 1, root, (const uint8_t *)"f", 1));
 
     uint64_t resolved = 0;
-    STM_ASSERT_ERR(stm_fs_open_by_handle(fs, &h, &resolved), STM_ENOENT);
+    STM_ASSERT_ERR(stm_fs_open_by_handle(fs, &h, &resolved), STM_ESTALE);
     STM_ASSERT_EQ(resolved, 0u);
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path); unlink(g_key_path);
 }
 
-STM_TEST(fs_p7c_handle_stale_after_reuse_with_gen_bump_is_enoent) {
-    /* Linux's open_by_handle_at returns ESTALE for the AllocReused-
-     * after-Free shape: handle captured at gen=N, then unlink + new
-     * file created at the SAME ino (AllocReused with gen=N+1).
-     * The new inode is a different file at the same number. Our
-     * STM_ENOENT signals "no longer the file you remembered". */
+STM_TEST(fs_p7c_handle_never_existed_is_enoent) {
+    /* R83 P2-2: handle with (ds, ino) values that the allocator
+     * has NEVER reached (ino > next_ino) → STM_ENOENT. Distinct
+     * from STM_ESTALE which means "was here, gone now". */
+    make_tmp("p7c_handle_never_existed");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+
+    /* Forge a handle pointing at an ino the allocator hasn't reached. */
+    stm_fs_file_handle h = {0};
+    STM_ASSERT_OK(stm_fs_name_to_handle(fs, 1, root,
+                                              (const uint8_t *)"f", 1, &h));
+    h.h_ino = stm_store_le64(99999u);   /* far past next_ino */
+
+    uint64_t resolved = 0;
+    STM_ASSERT_ERR(stm_fs_open_by_handle(fs, &h, &resolved), STM_ENOENT);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7c_handle_stale_after_reuse_with_gen_bump_is_estale) {
+    /* R83 P2-2 update: AllocReused-after-Free → STM_ESTALE (Linux
+     * ESTALE). Handle captured at gen=N, then unlink + new file
+     * created at the SAME ino (AllocReused with gen=N+1). The new
+     * inode is a different file at the same number. */
     make_tmp("p7c_handle_stale_after_reuse");
     stm_fs_format_opts fopts = default_format_opts();
     STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
@@ -11756,10 +11786,10 @@ STM_TEST(fs_p7c_handle_stale_after_reuse_with_gen_bump_is_enoent) {
     uint64_t new_gen = stm_load_le64(v.si_gen);
     STM_ASSERT_TRUE(new_gen > old_gen);   /* gen bumped per inode.tla */
 
-    /* Old handle still has old_gen; resolves to STM_ENOENT
+    /* Old handle still has old_gen; resolves to STM_ESTALE
      * (gen mismatch) — does NOT silently open f2. */
     uint64_t resolved = 0;
-    STM_ASSERT_ERR(stm_fs_open_by_handle(fs, &h, &resolved), STM_ENOENT);
+    STM_ASSERT_ERR(stm_fs_open_by_handle(fs, &h, &resolved), STM_ESTALE);
     STM_ASSERT_EQ(resolved, 0u);
 
     /* A FRESH handle for f2 resolves correctly. */
@@ -11791,15 +11821,21 @@ STM_TEST(fs_p7c_handle_corrupt_magic_refused) {
     STM_ASSERT_OK(stm_fs_name_to_handle(fs, 1, root,
                                               (const uint8_t *)"f", 1, &h));
 
-    /* Tamper magic. */
+    /* Tamper magic — R83 P3-2: returns STM_EINVAL (was STM_EBADTAG;
+     * EBADTAG's "aead tag mismatch" string mismatched the structural
+     * "bad magic byte" semantic). Out_ino zero on STM_EINVAL per
+     * uniform contract. */
     h.h_magic = stm_store_le32(0xCAFEBABEu);
-    uint64_t resolved = 0;
-    STM_ASSERT_ERR(stm_fs_open_by_handle(fs, &h, &resolved), STM_EBADTAG);
+    uint64_t resolved = 0xDEADBEEFu;
+    STM_ASSERT_ERR(stm_fs_open_by_handle(fs, &h, &resolved), STM_EINVAL);
+    STM_ASSERT_EQ(resolved, 0u);
 
     /* Restore magic, tamper version. */
     h.h_magic = stm_store_le32(STM_FS_HANDLE_MAGIC);
     h.h_version = stm_store_le32(99u);   /* future version */
+    resolved = 0xDEADBEEFu;
     STM_ASSERT_ERR(stm_fs_open_by_handle(fs, &h, &resolved), STM_EBADVERSION);
+    STM_ASSERT_EQ(resolved, 0u);
 
     /* Restore version, zero ino → EINVAL. */
     h.h_version = stm_store_le32(STM_FS_HANDLE_VERSION);
@@ -11963,10 +11999,234 @@ STM_TEST(fs_p7c_handle_cross_dataset_isolation) {
                                               (const uint8_t *)"f", 1, &h));
 
     /* Tamper the handle's dataset_id to a non-existent ds. The
-     * inode lookup path will return STM_ENOENT for that (ds, ino). */
+     * inode lookup path will return STM_ENOENT for that (ds, ino) —
+     * the allocator never reached this ino in the bogus dataset
+     * (next_ino = 0 for non-existent ds, so ino=f >= 0 falls into
+     * the "never existed" branch per R83 P2-2). */
     h.h_dataset_id = stm_store_le64(99u);
     uint64_t resolved = 0;
     STM_ASSERT_ERR(stm_fs_open_by_handle(fs, &h, &resolved), STM_ENOENT);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7c_handle_r83_p2_1_cross_pool_isolation_via_pool_uuid) {
+    /* R83 P2-1 regression: pre-fix, two pools' independent ino
+     * allocators could each produce identical (ds=1, ino=N, gen=0)
+     * triples; a handle from pool A presented to pool B would
+     * silently open a different file. Post-fix, the handle binds
+     * to pool_uuid + open_by_handle refuses with STM_ESTALE on
+     * pool mismatch. */
+    char path_a[256] = {0};
+    char path_b[256] = {0};
+
+    /* Create pool A. */
+    make_tmp("p7c_handle_pool_a");
+    snprintf(path_a, sizeof path_a, "%s", g_tmp_path);
+
+    stm_fs_format_opts fopts_a = default_format_opts();
+    /* Distinct pool_uuid for pool A. */
+    fopts_a.pool_uuid[0] = 0xAAAAAAAAAAAAAAAAull;
+    fopts_a.pool_uuid[1] = 0xAAAAAAAAAAAAAAAAull;
+    STM_ASSERT_OK(stm_fs_format(path_a, &fopts_a));
+    stm_fs_mount_opts mopts_a = rw_mount_opts();
+    stm_fs *fs_a = NULL;
+    STM_ASSERT_OK(stm_fs_mount(path_a, &mopts_a, &fs_a));
+
+    uint64_t root_a = 0;
+    p2b_alloc_root_dir(fs_a, &root_a);
+    uint64_t f_a = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs_a, 1, root_a, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f_a));
+
+    stm_fs_file_handle h_a = {0};
+    STM_ASSERT_OK(stm_fs_name_to_handle(fs_a, 1, root_a,
+                                              (const uint8_t *)"f", 1, &h_a));
+    STM_ASSERT_OK(stm_fs_unmount(fs_a));
+
+    /* Create pool B at a separate path with a DIFFERENT pool_uuid. */
+    make_tmp("p7c_handle_pool_b");
+    snprintf(path_b, sizeof path_b, "%s", g_tmp_path);
+
+    stm_fs_format_opts fopts_b = default_format_opts();
+    fopts_b.pool_uuid[0] = 0xBBBBBBBBBBBBBBBBull;
+    fopts_b.pool_uuid[1] = 0xBBBBBBBBBBBBBBBBull;
+    STM_ASSERT_OK(stm_fs_format(path_b, &fopts_b));
+    stm_fs_mount_opts mopts_b = rw_mount_opts();
+    stm_fs *fs_b = NULL;
+    STM_ASSERT_OK(stm_fs_mount(path_b, &mopts_b, &fs_b));
+
+    uint64_t root_b = 0;
+    p2b_alloc_root_dir(fs_b, &root_b);
+    uint64_t f_b = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs_b, 1, root_b, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f_b));
+    /* Confirm the inos collide structurally (would defeat handle
+     * isolation pre-fix). */
+    STM_ASSERT_EQ(f_a, f_b);
+
+    /* Present pool A's handle to pool B. Post-fix: STM_ESTALE
+     * (pool_uuid mismatch). Pre-fix would have returned STM_OK
+     * + resolved to f_b silently — the bug. */
+    uint64_t resolved = 0;
+    STM_ASSERT_ERR(stm_fs_open_by_handle(fs_b, &h_a, &resolved), STM_ESTALE);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs_b));
+    unlink(path_a); unlink(path_b); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7c_handle_r83_p3_4_directory_handle_resolves) {
+    /* R83 P3-4: handles work for any inode kind. Directory inodes
+     * resolve correctly via name_to_handle on their parent + the
+     * directory's name. */
+    make_tmp("p7c_handle_dir");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t d = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"d", 1,
+                                    0755u, 0, 0, &d));
+
+    stm_fs_file_handle h = {0};
+    STM_ASSERT_OK(stm_fs_name_to_handle(fs, 1, root,
+                                              (const uint8_t *)"d", 1, &h));
+    uint64_t resolved = 0;
+    STM_ASSERT_OK(stm_fs_open_by_handle(fs, &h, &resolved));
+    STM_ASSERT_EQ(resolved, d);
+
+    /* Verify the resolved ino is indeed a directory. */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, resolved, &v));
+    uint32_t mode = stm_load_le32(v.si_mode);
+    STM_ASSERT_EQ(mode & (uint32_t)S_IFMT, (uint32_t)S_IFDIR);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7c_handle_r83_p3_4_symlink_handle_resolves_without_following) {
+    /* R83 P3-4: handle for a symlink resolves to the symlink inode
+     * itself, NOT the target. Linux name_to_handle_at(AT_SYMLINK_NOFOLLOW)
+     * is the equivalent semantic; our (parent, name) lookup naturally
+     * doesn't follow symlinks at the dirent layer. */
+    make_tmp("p7c_handle_symlink");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t s = 0;
+    STM_ASSERT_OK(stm_fs_symlink(fs, 1, root, (const uint8_t *)"l", 1,
+                                      (const uint8_t *)"/target", 7,
+                                      0, 0, &s));
+
+    stm_fs_file_handle h = {0};
+    STM_ASSERT_OK(stm_fs_name_to_handle(fs, 1, root,
+                                              (const uint8_t *)"l", 1, &h));
+    uint64_t resolved = 0;
+    STM_ASSERT_OK(stm_fs_open_by_handle(fs, &h, &resolved));
+    STM_ASSERT_EQ(resolved, s);
+
+    /* Verify the resolved ino is the symlink, not its target. */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, resolved, &v));
+    uint32_t mode = stm_load_le32(v.si_mode);
+    STM_ASSERT_EQ(mode & (uint32_t)S_IFMT, (uint32_t)S_IFLNK);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7c_handle_r83_p3_4_gen_monotonicity_across_many_cycles) {
+    /* R83 P3-4: pin gen-monotonicity across multiple alloc/free
+     * cycles. After N create/unlink iterations on the same name,
+     * the original handle (gen captured at iteration 0) MUST
+     * STILL resolve to STM_ESTALE — every iteration bumped gen
+     * (or AllocFresh skipped to a higher ino). The (ino, gen)
+     * tuple-uniqueness invariant from inode.tla holds across
+     * arbitrarily many cycles. */
+    make_tmp("p7c_handle_gen_monotonicity");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    /* Create the first file + capture its handle. */
+    uint64_t f0 = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f0));
+    stm_fs_file_handle h0 = {0};
+    STM_ASSERT_OK(stm_fs_name_to_handle(fs, 1, root,
+                                              (const uint8_t *)"f", 1, &h0));
+
+    /* 32 create/unlink cycles. Each unlinks the file + creates a
+     * fresh one at the same name; AllocReused returns the same ino
+     * with bumped gen each time. */
+    for (int i = 0; i < 32; i++) {
+        STM_ASSERT_OK(stm_fs_unlink(fs, 1, root, (const uint8_t *)"f", 1));
+        uint64_t fi = 0;
+        STM_ASSERT_OK(stm_fs_create_file(fs, 1, root,
+                                              (const uint8_t *)"f", 1,
+                                              0644u, 0, 0, &fi));
+        STM_ASSERT_EQ(fi, f0);   /* AllocReused returns same ino */
+    }
+
+    /* Original handle still STM_ESTALE — gen has bumped 32+ times. */
+    uint64_t resolved = 0;
+    STM_ASSERT_ERR(stm_fs_open_by_handle(fs, &h0, &resolved), STM_ESTALE);
+
+    /* A FRESH handle for the current file resolves OK. */
+    stm_fs_file_handle hN = {0};
+    STM_ASSERT_OK(stm_fs_name_to_handle(fs, 1, root,
+                                              (const uint8_t *)"f", 1, &hN));
+    STM_ASSERT_OK(stm_fs_open_by_handle(fs, &hN, &resolved));
+    STM_ASSERT_EQ(resolved, f0);
+    /* The fresh handle's gen is strictly greater than the original. */
+    STM_ASSERT_TRUE(stm_load_le64(hN.h_si_gen) > stm_load_le64(h0.h_si_gen));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7c_handle_r83_p3_4_out_ino_zero_on_ebadversion) {
+    /* R83 P3-4: pre-poison out_ino with non-zero garbage; assert
+     * STM_EBADVERSION zeros it (uniform out-param contract). The
+     * substantive's existing arg-validation test sets resolved=0
+     * before each call, masking whether the API itself zeros. */
+    make_tmp("p7c_handle_out_ino_zero_ebadversion");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+    stm_fs_file_handle h = {0};
+    STM_ASSERT_OK(stm_fs_name_to_handle(fs, 1, root,
+                                              (const uint8_t *)"f", 1, &h));
+
+    /* Tamper version. Pre-poison out_ino. */
+    h.h_version = stm_store_le32(99u);
+    uint64_t resolved = 0xCAFEBABEu;
+    STM_ASSERT_ERR(stm_fs_open_by_handle(fs, &h, &resolved), STM_EBADVERSION);
+    STM_ASSERT_EQ(resolved, 0u);   /* zero-init contract */
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path); unlink(g_key_path);

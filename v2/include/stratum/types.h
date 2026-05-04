@@ -111,6 +111,15 @@ typedef enum {
      * level read-only) so callers can route the seal-rejection branch
      * separately. */
     STM_EPERM           =   -1,   /* operation not permitted (sealed)      */
+
+    /* P8-POSIX-7c R83 P2-2: stale file handle. Linux open_by_handle_at(2)
+     * returns ESTALE = -116 when a handle's inode is FREED OR was
+     * reused under a bumped si_gen (handle's captured gen no longer
+     * equals current si_gen). Distinct from STM_ENOENT ("never
+     * existed") so POSIX-aware callers (e.g. NFS server, FUSE)
+     * can route the cache-invalidate-and-retry branch separately
+     * from the give-up branch. */
+    STM_ESTALE          = -116,   /* stale handle (inode freed or reused)  */
 } stm_status;
 
 const char *stm_strerror(stm_status s);

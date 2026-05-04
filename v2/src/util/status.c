@@ -34,6 +34,7 @@ const char *stm_strerror(stm_status s)
     case STM_ENAMETOOLONG:   return "name or target too long";
     case STM_ENODATA:        return "no such xattr";
     case STM_EPERM:          return "operation not permitted";
+    case STM_ESTALE:         return "stale file handle";
     }
     return "unknown error";
 }

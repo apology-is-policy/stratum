@@ -646,46 +646,61 @@ stm_status stm_fs_get_seals(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 /* ========================================================================= */
 
 /*
- * Opaque file handle. Encodes the (dataset_id, ino, si_gen) triple +
- * a 4-byte magic + 4-byte version for forward-compat. Stale-handle
- * detection uses inode.tla's `TupleUniqueAllTime` invariant: a handle
- * captured before the inode was freed carries the OLD `si_gen`; after
- * Free + AllocReused the same `ino` has a NEW `si_gen`; mismatch on
- * import resolves to STM_ENOENT.
+ * Opaque file handle. Encodes the (pool_uuid, dataset_id, ino, si_gen)
+ * tuple + a 4-byte magic + 4-byte version for forward-compat. Stale-
+ * handle detection uses inode.tla's `TupleUniqueAllTime` invariant:
+ * a handle captured before the inode was freed carries the OLD
+ * `si_gen`; after Free + AllocReused the same `ino` has a NEW
+ * `si_gen`; mismatch on import resolves to STM_ESTALE.
  *
- * Wire shape (32 bytes):
+ * Wire shape (48 bytes):
  *
  *   off  size  field
  *    0    4    le32 magic = STM_FS_HANDLE_MAGIC ('STMH' = 0x484D5453)
- *    4    4    le32 version = STM_FS_HANDLE_VERSION (1)
- *    8    8    le64 dataset_id
- *   16    8    le64 ino
- *   24    8    le64 si_gen
+ *    4    4    le32 version = STM_FS_HANDLE_VERSION (2)
+ *    8   16    le64 pool_uuid[2]   (R83 P2-1: cross-pool isolation)
+ *   24    8    le64 dataset_id
+ *   32    8    le64 ino
+ *   40    8    le64 si_gen
  *
  * The handle is opaque to callers — they pass it back through
- * stm_fs_open_by_handle without inspection. Future format extensions
- * bump `version` + carve from any future trailing bytes (currently
- * the struct is exactly 32 bytes; future versions may be larger).
+ * stm_fs_open_by_handle without inspection. The size is fixed at
+ * 48 bytes; future format extensions bump the version field. Old
+ * v=1 (32-byte) handles from pre-release v2 builds are NOT supported.
  *
- * A handle is valid only against the same fs handle that produced it.
- * Cross-pool handles (handle from pool A, used against pool B) resolve
- * to STM_ENOENT because the pools have independent ino allocators
- * (the (dataset_id, ino, si_gen) triple is pool-local).
+ * **Cross-pool isolation (R83 P2-1):** the `pool_uuid` field binds
+ * the handle to the pool it was issued from. open_by_handle compares
+ * the handle's pool_uuid against the mounted fs's pool_uuid; mismatch
+ * → STM_ESTALE. Pre-fix, two pools with independent ino allocators
+ * could each produce identical (dataset_id=1, ino=N, si_gen=0)
+ * triples — a handle from pool A presented to pool B would silently
+ * open a different file. The pool_uuid binding closes that
+ * confused-deputy path structurally.
+ *
+ * **NOT cryptographically authenticated (R83 P3-3):** handles are
+ * tuple-encoded identifiers, not signed tokens. A caller with access
+ * to the fs can construct any handle for any inode they know exists.
+ * Authorization for `open_by_handle` is governed by the caller's
+ * pre-existing fs access (the same mount permissions + dataset
+ * encryption keys that gate every other op), NOT by handle contents.
+ * This parallels POSIX `name_to_handle_at`'s contract — handles are
+ * portable identifiers, not capabilities.
  */
 #define STM_FS_HANDLE_MAGIC    0x484D5453u   /* 'STMH' little-endian */
-#define STM_FS_HANDLE_VERSION  1u
-#define STM_FS_HANDLE_BYTES    32u
+#define STM_FS_HANDLE_VERSION  2u            /* R83 P2-1 bump: pool_uuid added */
+#define STM_FS_HANDLE_BYTES    48u
 
 typedef struct stm_fs_file_handle {
     le32    h_magic;
     le32    h_version;
+    le64    h_pool_uuid[2];
     le64    h_dataset_id;
     le64    h_ino;
     le64    h_si_gen;
 } stm_fs_file_handle;
 
 STM_STATIC_ASSERT(sizeof(stm_fs_file_handle) == STM_FS_HANDLE_BYTES,
-                  "stm_fs_file_handle must be exactly 32 bytes");
+                  "stm_fs_file_handle must be exactly 48 bytes");
 
 /*
  * Resolve `name` in directory `parent_ino` of `dataset_id` and produce
@@ -713,28 +728,41 @@ stm_status stm_fs_name_to_handle(stm_fs *fs, uint64_t dataset_id,
 
 /*
  * Validate a previously-issued file handle and return the inode
- * number it resolves to via `*out_ino`. The (dataset_id, ino, si_gen)
- * triple is checked against the current inode index: ino must exist
- * and be ALLOCATED, AND its current si_gen must equal the handle's
- * captured si_gen.
+ * number it resolves to via `*out_ino`. The (pool_uuid, dataset_id,
+ * ino, si_gen) tuple is checked against the current fs's pool +
+ * inode index: pool_uuid must match the mounted pool; ino must
+ * exist and be ALLOCATED in the named dataset; current si_gen
+ * must equal the handle's captured si_gen.
  *
- * Stale handle (post-unlink + AllocReused at same ino, gens differ)
- * resolves to STM_ENOENT — caller treats as if the file no longer
- * exists. Linux open_by_handle_at returns ESTALE for the same case;
- * our STM_ENOENT is the closest existing code that matches the
- * "no longer exists at this identity" semantic.
+ * Linux ESTALE-equivalent error semantics (R83 P2-2):
+ *   - STM_ESTALE: pool_uuid mismatch (cross-pool handle); inode is
+ *     FREED (gone but not reused); inode reused with bumped gen
+ *     (same ino, different file). All three resolve to "the file
+ *     the handle described no longer exists at this identity" —
+ *     caller cache-invalidate-and-retry.
+ *   - STM_ENOENT: handle's (ds, ino) never resolved to a real inode
+ *     in this pool (e.g., forged-with-bad-tuple, or dataset doesn't
+ *     exist). Caller gives up.
  *
  * Refusals:
  *   - NULL fs OR NULL handle OR NULL out_ino (STM_EINVAL).
- *   - handle->h_magic != STM_FS_HANDLE_MAGIC (STM_EBADTAG —
- *     caller passed garbage / corrupt handle).
+ *   - handle->h_magic != STM_FS_HANDLE_MAGIC (STM_EINVAL —
+ *     R83 P3-2: was STM_EBADTAG, repurposed to STM_EINVAL since
+ *     "bad magic" is structural-validation, not an AEAD-tag
+ *     authentication failure; STM_EBADTAG's status string
+ *     "aead tag mismatch" doesn't fit handle-magic mismatch).
  *   - handle->h_version != STM_FS_HANDLE_VERSION (STM_EBADVERSION —
- *     handle from a future v2 release; caller must upgrade).
+ *     handle from a different v2 release; caller must regenerate).
  *   - handle->h_dataset_id == 0 OR handle->h_ino == 0 (STM_EINVAL —
  *     reserved sentinel values).
- *   - inode not found OR FREED (STM_ENOENT — definitively gone).
- *   - inode found but si_gen differs from handle's (STM_ENOENT —
- *     ino reused for a different file post-Free).
+ *   - handle->h_pool_uuid != fs's pool_uuid (STM_ESTALE — the
+ *     handle was issued by a different pool; "stale" semantically
+ *     because the handle no longer references a file the caller
+ *     has access to in THIS pool).
+ *   - inode not found in this dataset (STM_ENOENT — never existed).
+ *   - inode found but FREED (STM_ESTALE — the file is gone).
+ *   - inode found, ALLOCATED, but si_gen differs from handle's
+ *     (STM_ESTALE — ino reused for a different file post-Free).
  *   - fs wedged (STM_EWEDGED). RO mounts allowed.
  *
  * Uniform out-param contract: `*out_ino` is zero-initialized BEFORE

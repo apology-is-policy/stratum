@@ -2023,11 +2023,17 @@ stm_status stm_fs_name_to_handle(stm_fs *fs, uint64_t dataset_id,
         return ds;
     }
 
-    /* Read the inode's CURRENT si_gen. The dirent stores a
-     * `child_gen` snapshot at link time, but that snapshot is the
-     * gen AT the moment the dirent was created; we want the inode's
-     * authoritative current gen so a later open_by_handle compare
-     * is meaningful. */
+    /* R83 P3-6 defense-in-depth: re-read the inode's si_gen from the
+     * inode index rather than trusting the dirent's child_gen
+     * snapshot. The dirent's child_gen IS provably equal to the
+     * inode's current si_gen for any ALLOCATED inode (per inode.tla:
+     * si_gen is immutable for the ALLOCATED lifetime; only AllocReused
+     * bumps it during the FREED → ALLOCATED transition, at which point
+     * any dirent referencing the old (ino, gen) pair is also gone via
+     * cascade-free). The redundant lookup costs an O(records) scan but
+     * provides defense-in-depth against any future invariant violation
+     * — if the dirent's child_gen ever drifts from the inode's si_gen,
+     * the handle should reflect the inode's authoritative value. */
     struct stm_inode_value cv = {0};
     stm_status cs = stm_inode_lookup(iidx, dataset_id, child_ino, &cv);
     if (cs != STM_OK) {
@@ -2037,9 +2043,22 @@ stm_status stm_fs_name_to_handle(stm_fs *fs, uint64_t dataset_id,
 
     out_handle->h_magic      = stm_store_le32(STM_FS_HANDLE_MAGIC);
     out_handle->h_version    = stm_store_le32(STM_FS_HANDLE_VERSION);
+    /* R83 P2-1: bind handle to pool_uuid for cross-pool isolation.
+     * Two pools' independent ino allocators can produce identical
+     * (ds=1, ino=N, gen=0) triples — without pool_uuid, a handle
+     * from pool A presented to pool B would silently open a different
+     * file. The structural fix forecloses this confused-deputy. */
+    {
+        const uint64_t *pu = stm_pool_uuid(fs->pool);
+        out_handle->h_pool_uuid[0] = stm_store_le64(pu[0]);
+        out_handle->h_pool_uuid[1] = stm_store_le64(pu[1]);
+    }
     out_handle->h_dataset_id = stm_store_le64(dataset_id);
     out_handle->h_ino        = stm_store_le64(child_ino);
-    out_handle->h_si_gen     = stm_store_le64(stm_load_le64(cv.si_gen));
+    /* R83 P3-5: cv.si_gen is already le64 + h_si_gen is le64; direct
+     * assignment is bit-equivalent to the prior load+store round-trip
+     * and saves a byte-swap pair on big-endian builds. */
+    out_handle->h_si_gen     = cv.si_gen;
 
     pthread_mutex_unlock(&fs->lock);
     return STM_OK;
@@ -2054,11 +2073,14 @@ stm_status stm_fs_open_by_handle(stm_fs *fs,
     if (!fs || !handle || !out_ino) return STM_EINVAL;
 
     /* Validate the wire-format header BEFORE touching the inode index.
-     * Magic mismatch is STM_EBADTAG (signals "not one of our handles" —
-     * caller passed garbage); version mismatch is STM_EBADVERSION
-     * (signals "handle from a future release; caller must upgrade"). */
+     * R83 P3-2: magic mismatch returns STM_EINVAL (was STM_EBADTAG in
+     * the substantive); STM_EBADTAG's status string "aead tag mismatch"
+     * doesn't fit handle-magic mismatch — that's structural validation
+     * of caller-provided bytes, semantically EINVAL. Version mismatch
+     * is STM_EBADVERSION (handle from a different v2 release; caller
+     * must regenerate). */
     if (stm_load_le32(handle->h_magic) != STM_FS_HANDLE_MAGIC) {
-        return STM_EBADTAG;
+        return STM_EINVAL;
     }
     if (stm_load_le32(handle->h_version) != STM_FS_HANDLE_VERSION) {
         return STM_EBADVERSION;
@@ -2072,18 +2094,57 @@ stm_status stm_fs_open_by_handle(stm_fs *fs,
     pthread_mutex_lock(&fs->lock);
     FS_GUARD_READ(fs);
 
+    /* R83 P2-1: cross-pool isolation. Compare the handle's pool_uuid
+     * against the mounted fs's pool_uuid; mismatch → STM_ESTALE
+     * (the file the handle described isn't in THIS pool — could be
+     * a different mount, a different pool, or a forged tuple). */
+    {
+        const uint64_t *pu = stm_pool_uuid(fs->pool);
+        if (stm_load_le64(handle->h_pool_uuid[0]) != pu[0] ||
+            stm_load_le64(handle->h_pool_uuid[1]) != pu[1]) {
+            pthread_mutex_unlock(&fs->lock);
+            return STM_ESTALE;
+        }
+    }
+
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
     if (!iidx) {
         pthread_mutex_unlock(&fs->lock);
         return STM_EINVAL;
     }
 
+    /* R83 P2-2: distinguish STM_ENOENT (never existed) from STM_ESTALE
+     * (was here, gone now). stm_inode_lookup currently fuses both
+     * cases (no record OR record FREED) into a single STM_ENOENT
+     * return; we re-discriminate via the (ino < next_ino) heuristic.
+     * If ino < next_ino, the slot was at some point allocated — the
+     * inode is either FREED or never existed AT THIS ino but the
+     * allocator is past it, which is structurally impossible (alloc
+     * is monotonic + AllocReused returns to FREED slots). So
+     * lookup-fail with ino < next_ino ⇒ FREED ⇒ STM_ESTALE. ino >=
+     * next_ino ⇒ never existed in this dataset ⇒ STM_ENOENT.
+     *
+     * Lookup-success with gen mismatch ⇒ AllocReused since handle
+     * issuance ⇒ STM_ESTALE (the new (ino, gen) is a different
+     * file). Lookup-success with gen match ⇒ STM_OK. */
     struct stm_inode_value v = {0};
     stm_status ls = stm_inode_lookup(iidx, ds, ino, &v);
+    if (ls == STM_ENOENT) {
+        uint64_t next_ino = 0;
+        stm_status ns = stm_inode_next_ino(iidx, ds, &next_ino);
+        pthread_mutex_unlock(&fs->lock);
+        if (ns == STM_OK && ino < next_ino) {
+            /* Slot was allocated at some point; either FREED-not-
+             * yet-reused or skipped-via-AllocFresh-monotonicity (no
+             * collision with ino since fresh paths bump next_ino).
+             * Either way, the file the handle described is gone. */
+            return STM_ESTALE;
+        }
+        /* Allocator never reached this ino in this dataset. */
+        return STM_ENOENT;
+    }
     if (ls != STM_OK) {
         pthread_mutex_unlock(&fs->lock);
-        /* STM_ENOENT (inode not found OR FREED) → "the file the
-         * handle described no longer exists at this identity". */
         return ls;
     }
 
@@ -2094,7 +2155,7 @@ stm_status stm_fs_open_by_handle(stm_fs *fs,
     uint64_t cur_gen = stm_load_le64(v.si_gen);
     if (cur_gen != want_gen) {
         pthread_mutex_unlock(&fs->lock);
-        return STM_ENOENT;
+        return STM_ESTALE;
     }
 
     *out_ino = ino;
