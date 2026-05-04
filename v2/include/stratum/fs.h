@@ -1221,6 +1221,51 @@ stm_status stm_fs_reflink(stm_fs *fs,
                             uint64_t dst_dataset_id, uint64_t dst_ino);
 
 /*
+ * P8-POSIX-10b: stm_fs_copy_file_range — POSIX `copy_file_range(2)`
+ * shape over `stm_fs_reflink`. MVP scope: WHOLE-FILE copy only —
+ * caller MUST request the exact (0, src_size) range; non-zero
+ * src/dst offsets or partial lengths refuse with STM_ENOTSUPPORTED.
+ * The binding layer (FUSE / 9P / language wrappers) typically falls
+ * back to a read+write loop on EOPNOTSUPP, mirroring glibc's
+ * copy_file_range wrapper. `len == 0` is a legal POSIX no-op
+ * (returns STM_OK with `*out_copied = 0`).
+ *
+ * Cross-dataset / cross-pool copies are deferred — same constraints
+ * as `stm_fs_reflink` (STM_EXDEV cross-dataset; pool isolation
+ * enforced at handle-level for `open_by_handle_at`).
+ *
+ * On success, dst's mtime + ctime are stamped to "now" + dst's
+ * si_size + si_data_kind are aligned to src's (R81 P3-8 fix; same
+ * shape as `stm_fs_reflink`). Seal enforcement on dst inherits
+ * from `stm_fs_reflink`'s R82 P0-1 logic.
+ *
+ * Inline-source caveat: if src is `STM_DATA_INLINE` with size > 0,
+ * reflink can't share inline data (sync_reflink walks src's extent
+ * records, finds none, and would silently leave dst empty). Refused
+ * with STM_ENOTSUPPORTED so the caller falls back to read+write.
+ *
+ * Refusals:
+ *   - NULL fs (STM_EINVAL).
+ *   - any (ds, ino) == 0 (STM_EINVAL).
+ *   - src_off != 0 OR dst_off != 0 (STM_ENOTSUPPORTED — MVP).
+ *   - len > 0 AND len != src's si_size (STM_ENOTSUPPORTED — MVP
+ *     requires whole-file copy).
+ *   - any reflink refusal (STM_EXDEV / STM_EEXIST / STM_EPERM /
+ *     STM_ENOTSUPPORTED for inline src / STM_EWEDGED / STM_EROFS).
+ *
+ * Uniform out-param contract: `*out_copied` zero-initialized BEFORE
+ * arg validation runs.
+ */
+STM_MUST_USE
+stm_status stm_fs_copy_file_range(stm_fs *fs,
+                                    uint64_t src_dataset_id, uint64_t src_ino,
+                                    uint64_t src_off,
+                                    uint64_t dst_dataset_id, uint64_t dst_ino,
+                                    uint64_t dst_off,
+                                    uint64_t len,
+                                    uint64_t *out_copied);
+
+/*
  * P7-CAS-2: stm_fs_migrate_to_cold — migrate a file's data from the
  * HOT tier (paddr-addressed extents) to the COLD tier (content-
  * addressed CAS chunks). Walks every HOT extent at (dataset_id, ino),

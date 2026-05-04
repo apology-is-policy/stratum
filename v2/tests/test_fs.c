@@ -12232,4 +12232,293 @@ STM_TEST(fs_p7c_handle_r83_p3_4_out_ino_zero_on_ebadversion) {
     unlink(g_tmp_path); unlink(g_key_path);
 }
 
+/* ========================================================================= */
+/* P8-POSIX-10b: stm_fs_copy_file_range + reflink dst stamping (R81 P3-8).    */
+/* ========================================================================= */
+
+/* Helper: format / mount / alloc root / create src + dst as named files
+ * via stm_fs_create_file (so they have inode index records — exercises
+ * the inode-aware reflink path for stamping). */
+static void p10b_setup_named_pair(stm_fs **out_fs,
+                                       uint64_t *out_src, uint64_t *out_dst)
+{
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t src = 0, dst = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"src", 3,
+                                          0644u, 0, 0, &src));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"dst", 3,
+                                          0644u, 0, 0, &dst));
+    *out_fs = fs;
+    *out_src = src;
+    *out_dst = dst;
+}
+
+STM_TEST(fs_p10b_reflink_stamps_dst_mtime_ctime_r81_p3_8) {
+    /* R81 P3-8 regression: pre-fix, stm_fs_reflink completed without
+     * touching dst's mtime/ctime. Post-fix, both are stamped to "now"
+     * on success. POSIX copy_file_range(2) requirement. */
+    make_tmp("p10b_reflink_stamps_dst");
+    stm_fs *fs = NULL; uint64_t src = 0, dst = 0;
+    p10b_setup_named_pair(&fs, &src, &dst);
+
+    /* Force src to EXTENT mode (single 4 KiB extent — sync_read_extent's
+     * MVP single-extent constraint requires per-extent reads). */
+    static uint8_t big[4096] = {0};
+    for (size_t i = 0; i < sizeof big; i++) big[i] = (uint8_t)(i & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, src, 0, big, 4096));
+
+    /* Capture dst's pre-reflink mtime/ctime. */
+    struct stm_inode_value v0 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, dst, &v0));
+    uint64_t mtime0 = stm_load_le64(v0.si_mtime_sec);
+    uint64_t ctime0 = stm_load_le64(v0.si_ctime_sec);
+    uint64_t btime0 = stm_load_le64(v0.si_btime_sec);
+
+    /* Sleep to advance the wall-clock past second granularity. */
+    struct timespec slp = {1, 0};
+    (void)nanosleep(&slp, NULL);
+
+    uint64_t before = fs_p7a_now_sec();
+    STM_ASSERT_OK(stm_fs_reflink(fs, 1, src, 1, dst));
+
+    /* dst now has src's content. mtime + ctime stamped to "now". */
+    struct stm_inode_value v1 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, dst, &v1));
+    STM_ASSERT_TRUE(stm_load_le64(v1.si_mtime_sec) >= before);
+    STM_ASSERT_TRUE(stm_load_le64(v1.si_ctime_sec) >= before);
+    STM_ASSERT_TRUE(stm_load_le64(v1.si_mtime_sec) > mtime0);
+    STM_ASSERT_TRUE(stm_load_le64(v1.si_ctime_sec) > ctime0);
+    /* btime preserved. */
+    STM_ASSERT_EQ(stm_load_le64(v1.si_btime_sec), btime0);
+    /* size + kind aligned with src. */
+    STM_ASSERT_EQ(stm_load_le64(v1.si_size), 4096u);
+    STM_ASSERT_EQ(v1.si_data_kind, (uint8_t)STM_DATA_EXTENT);
+
+    /* And content is readable. */
+    static uint8_t obuf[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, dst, 0, obuf, 4096, &got));
+    STM_ASSERT_EQ(got, 4096u);
+    STM_ASSERT_MEM_EQ(obuf, big, 4096);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p10b_reflink_inline_source_refused) {
+    /* Inline-source caveat: sync_reflink walks src's extent records;
+     * if src is INLINE with content, the iter finds nothing to share +
+     * dst would silently be left empty. Refused with STM_ENOTSUPPORTED
+     * so caller falls back. dst MUST be unchanged after refusal. */
+    make_tmp("p10b_reflink_inline_src");
+    stm_fs *fs = NULL; uint64_t src = 0, dst = 0;
+    p10b_setup_named_pair(&fs, &src, &dst);
+
+    /* src stays INLINE with 50 bytes of content (≤ 100 cap). */
+    static const uint8_t small_buf[50] = {'a'};
+    STM_ASSERT_OK(stm_fs_write(fs, 1, src, 0, small_buf, 50));
+
+    struct stm_inode_value sv = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, src, &sv));
+    STM_ASSERT_EQ(sv.si_data_kind, (uint8_t)STM_DATA_INLINE);
+
+    STM_ASSERT_ERR(stm_fs_reflink(fs, 1, src, 1, dst), STM_ENOTSUPPORTED);
+
+    /* dst unchanged: still INLINE, size 0. */
+    struct stm_inode_value dv = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, dst, &dv));
+    STM_ASSERT_EQ(dv.si_data_kind, (uint8_t)STM_DATA_INLINE);
+    STM_ASSERT_EQ(stm_load_le64(dv.si_size), 0u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p10b_reflink_seal_refusal_does_not_stamp) {
+    /* SEAL_WRITE on dst refuses reflink (R82 P0-1). The post-success
+     * stamping path MUST NOT fire — dst's mtime/ctime stay at create-
+     * time. Confirms the stamping is gated by sync_reflink success. */
+    make_tmp("p10b_reflink_seal_no_stamp");
+    stm_fs *fs = NULL; uint64_t src = 0, dst = 0;
+    p10b_setup_named_pair(&fs, &src, &dst);
+
+    static uint8_t big[4096] = {0};
+    STM_ASSERT_OK(stm_fs_write(fs, 1, src, 0, big, 4096));
+
+    /* Seal dst against writes. */
+    STM_ASSERT_OK(stm_fs_add_seals(fs, 1, dst, STM_FS_SEAL_WRITE));
+
+    /* Capture dst's post-seal mtime/ctime (the seal stamped ctime). */
+    struct stm_inode_value v0 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, dst, &v0));
+    uint64_t mtime0 = stm_load_le64(v0.si_mtime_sec);
+    uint64_t ctime0 = stm_load_le64(v0.si_ctime_sec);
+
+    /* Sleep, then attempt reflink — refused. */
+    struct timespec slp = {1, 0};
+    (void)nanosleep(&slp, NULL);
+    STM_ASSERT_ERR(stm_fs_reflink(fs, 1, src, 1, dst), STM_EPERM);
+
+    /* dst's mtime/ctime UNCHANGED — refusal didn't stamp. */
+    struct stm_inode_value v1 = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, dst, &v1));
+    STM_ASSERT_EQ(stm_load_le64(v1.si_mtime_sec), mtime0);
+    STM_ASSERT_EQ(stm_load_le64(v1.si_ctime_sec), ctime0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p10b_copy_file_range_whole_file) {
+    /* POSIX-shape wrapper. Whole-file copy with offsets 0/0 + len =
+     * src_size succeeds + sets *out_copied to src's size. */
+    make_tmp("p10b_copy_file_range_whole");
+    stm_fs *fs = NULL; uint64_t src = 0, dst = 0;
+    p10b_setup_named_pair(&fs, &src, &dst);
+
+    static uint8_t big[4096] = {0};
+    for (size_t i = 0; i < sizeof big; i++) big[i] = (uint8_t)((i + 7) & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, src, 0, big, 4096));
+
+    uint64_t copied = 0;
+    STM_ASSERT_OK(stm_fs_copy_file_range(fs, 1, src, 0,
+                                              1, dst, 0, 4096, &copied));
+    STM_ASSERT_EQ(copied, 4096u);
+
+    /* dst has src's content. */
+    static uint8_t obuf[4096] = {0};
+    size_t got = 0;
+    STM_ASSERT_OK(stm_fs_read(fs, 1, dst, 0, obuf, 4096, &got));
+    STM_ASSERT_EQ(got, 4096u);
+    STM_ASSERT_MEM_EQ(obuf, big, 4096);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p10b_copy_file_range_partial_or_offset_refused) {
+    /* MVP: any non-zero offset OR partial len is STM_ENOTSUPPORTED.
+     * Caller is expected to fall back to read+write. */
+    make_tmp("p10b_copy_file_range_partial_refused");
+    stm_fs *fs = NULL; uint64_t src = 0, dst = 0;
+    p10b_setup_named_pair(&fs, &src, &dst);
+
+    static uint8_t big[4096] = {0};
+    STM_ASSERT_OK(stm_fs_write(fs, 1, src, 0, big, 4096));
+
+    uint64_t copied = 0xDEADBEEFu;
+    /* Non-zero src_off. */
+    STM_ASSERT_ERR(stm_fs_copy_file_range(fs, 1, src, 100,
+                                                1, dst, 0, 4096, &copied),
+                   STM_ENOTSUPPORTED);
+    STM_ASSERT_EQ(copied, 0u);
+    /* Non-zero dst_off. */
+    copied = 0xDEADBEEFu;
+    STM_ASSERT_ERR(stm_fs_copy_file_range(fs, 1, src, 0,
+                                                1, dst, 100, 4096, &copied),
+                   STM_ENOTSUPPORTED);
+    STM_ASSERT_EQ(copied, 0u);
+    /* Partial len < src_size. */
+    copied = 0xDEADBEEFu;
+    STM_ASSERT_ERR(stm_fs_copy_file_range(fs, 1, src, 0,
+                                                1, dst, 0, 2048, &copied),
+                   STM_ENOTSUPPORTED);
+    STM_ASSERT_EQ(copied, 0u);
+    /* len > src_size also refused. */
+    copied = 0xDEADBEEFu;
+    STM_ASSERT_ERR(stm_fs_copy_file_range(fs, 1, src, 0,
+                                                1, dst, 0, 8192, &copied),
+                   STM_ENOTSUPPORTED);
+    STM_ASSERT_EQ(copied, 0u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p10b_copy_file_range_zero_len_is_noop) {
+    /* len == 0 is a legal POSIX no-op. *out_copied = 0; STM_OK. */
+    make_tmp("p10b_copy_file_range_zero_len");
+    stm_fs *fs = NULL; uint64_t src = 0, dst = 0;
+    p10b_setup_named_pair(&fs, &src, &dst);
+
+    uint64_t copied = 0xDEADBEEFu;
+    STM_ASSERT_OK(stm_fs_copy_file_range(fs, 1, src, 0,
+                                              1, dst, 0, 0, &copied));
+    STM_ASSERT_EQ(copied, 0u);
+
+    /* dst still empty. */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, dst, &v));
+    STM_ASSERT_EQ(stm_load_le64(v.si_size), 0u);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p10b_copy_file_range_arg_validation) {
+    make_tmp("p10b_copy_file_range_args");
+    stm_fs *fs = NULL; uint64_t src = 0, dst = 0;
+    p10b_setup_named_pair(&fs, &src, &dst);
+
+    /* NULL fs. */
+    uint64_t copied = 0xDEADBEEFu;
+    STM_ASSERT_ERR(stm_fs_copy_file_range(NULL, 1, src, 0,
+                                                1, dst, 0, 100, &copied),
+                   STM_EINVAL);
+    STM_ASSERT_EQ(copied, 0u);
+    /* Zero src ds / ino. */
+    copied = 0xDEADBEEFu;
+    STM_ASSERT_ERR(stm_fs_copy_file_range(fs, 0, src, 0,
+                                                1, dst, 0, 100, &copied),
+                   STM_EINVAL);
+    STM_ASSERT_EQ(copied, 0u);
+    copied = 0xDEADBEEFu;
+    STM_ASSERT_ERR(stm_fs_copy_file_range(fs, 1, 0, 0,
+                                                1, dst, 0, 100, &copied),
+                   STM_EINVAL);
+    STM_ASSERT_EQ(copied, 0u);
+    /* Zero dst ds / ino. */
+    copied = 0xDEADBEEFu;
+    STM_ASSERT_ERR(stm_fs_copy_file_range(fs, 1, src, 0,
+                                                0, dst, 0, 100, &copied),
+                   STM_EINVAL);
+    STM_ASSERT_EQ(copied, 0u);
+    copied = 0xDEADBEEFu;
+    STM_ASSERT_ERR(stm_fs_copy_file_range(fs, 1, src, 0,
+                                                1, 0, 0, 100, &copied),
+                   STM_EINVAL);
+    STM_ASSERT_EQ(copied, 0u);
+
+    /* NULL out_copied is OK (optional out-param). */
+    /* But len != src_size still refused per ENOTSUPPORTED rule. */
+    /* src has size 0; len 0 is no-op + len > 0 doesn't match. */
+    STM_ASSERT_OK(stm_fs_copy_file_range(fs, 1, src, 0,
+                                              1, dst, 0, 0, NULL));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p10b_copy_file_range_src_missing_returns_enoent) {
+    make_tmp("p10b_copy_file_range_src_missing");
+    stm_fs *fs = NULL; uint64_t src = 0, dst = 0;
+    p10b_setup_named_pair(&fs, &src, &dst);
+
+    /* Forge a src ino that doesn't exist. */
+    uint64_t copied = 0;
+    STM_ASSERT_ERR(stm_fs_copy_file_range(fs, 1, 99999u, 0,
+                                                1, dst, 0, 100, &copied),
+                   STM_ENOENT);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
 STM_TEST_MAIN("fs")
