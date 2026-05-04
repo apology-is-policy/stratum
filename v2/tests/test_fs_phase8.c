@@ -6337,6 +6337,118 @@ STM_TEST(fs_p9b_r86_p3_3_rename_exchange_hardlinks_to_same_inode) {
 }
 
 /* ========================================================================= */
+/* P8-POSIX-11: Phase 8 exit forward-note closures.                           */
+/* ========================================================================= */
+
+STM_TEST(fs_p11_r86_p2_2_rename_stamps_parent_mtime_ctime) {
+    /* R86 P2-2 regression: rename stamps src_parent + dst_parent's
+     * mtime + ctime (POSIX: rename modifies parent dirs' contents). */
+    make_tmp("p11_r86_p2_2_parent_mtime");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t srcdir = 0, dstdir = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"srcdir", 6,
+                                     0755u, 0, 0, &srcdir));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"dstdir", 6,
+                                     0755u, 0, 0, &dstdir));
+    uint64_t f = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, srcdir, (const uint8_t *)"f", 1,
+                                          0644u, 0, 0, &f));
+
+    struct stm_inode_value sv_pre = {0}, dv_pre = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, srcdir, &sv_pre));
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, dstdir, &dv_pre));
+    uint64_t src_mtime_pre = stm_load_le64(sv_pre.si_mtime_sec);
+    uint64_t dst_mtime_pre = stm_load_le64(dv_pre.si_mtime_sec);
+
+    struct timespec ts = { .tv_sec = 1, .tv_nsec = 100000000 };
+    nanosleep(&ts, NULL);
+
+    STM_ASSERT_OK(stm_fs_rename(fs, 1,
+                                     srcdir, (const uint8_t *)"f", 1,
+                                     dstdir, (const uint8_t *)"f", 1, 0u));
+
+    struct stm_inode_value sv_post = {0}, dv_post = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, srcdir, &sv_post));
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, dstdir, &dv_post));
+    STM_ASSERT_TRUE(stm_load_le64(sv_post.si_mtime_sec) > src_mtime_pre);
+    STM_ASSERT_TRUE(stm_load_le64(dv_post.si_mtime_sec) > dst_mtime_pre);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p11_r86_p2_1_rename_exchange_immediate_cycle_refused) {
+    /* R86 P2-1 regression: RENAME_EXCHANGE that would create an
+     * immediate parent-child cycle refuses with STM_EINVAL.
+     * Trace: /A is dir, /A/sub is dir. EXCHANGE(/A, /A/sub) →
+     * src=A; src_parent=root; dst=sub; dst_parent=A. So
+     * src_ino == dst_parent_ino (A == A). Cycle. */
+    make_tmp("p11_r86_p2_1_cycle");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t a = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"a", 1,
+                                     0755u, 0, 0, &a));
+    uint64_t sub = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, a, (const uint8_t *)"sub", 3,
+                                     0755u, 0, 0, &sub));
+
+    /* EXCHANGE root/a (a is dir, parent=root) with a/sub (sub is
+     * dir, parent=a). a is the IMMEDIATE parent of sub →
+     * src_ino=a, dst_parent_ino=a → cycle. */
+    STM_ASSERT_ERR(stm_fs_rename(fs, 1,
+                                       root, (const uint8_t *)"a", 1,
+                                       a, (const uint8_t *)"sub", 3,
+                                       STM_FS_RENAME_EXCHANGE),
+                   STM_EINVAL);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p11_r86_p2_1_dir_to_dir_exchange_unrelated_allowed) {
+    /* Sibling test: EXCHANGE of two unrelated directories (neither
+     * is an ancestor of the other) is admitted — only immediate-
+     * parent cycles are refused; deeper-ancestor checking is a
+     * forward-note. */
+    make_tmp("p11_r86_p2_1_unrelated");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+    uint64_t a = 0, b = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"a", 1,
+                                     0755u, 0, 0, &a));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"b", 1,
+                                     0755u, 0, 0, &b));
+
+    STM_ASSERT_OK(stm_fs_rename(fs, 1,
+                                     root, (const uint8_t *)"a", 1,
+                                     root, (const uint8_t *)"b", 1,
+                                     STM_FS_RENAME_EXCHANGE));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+/* ========================================================================= */
 /* P8-POSIX-7d: advisory locks — flock(2) + fcntl(2) F_OFD_SETLK shape.       */
 /* ========================================================================= */
 

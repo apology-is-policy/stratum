@@ -2468,6 +2468,32 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
             pthread_mutex_unlock(&fs->lock);
             return STM_ENOENT;
         }
+        /* R86 P2-1 (P11 close): immediate-parent directory-cycle
+         * detection. EXCHANGE of two directories where one is the
+         * IMMEDIATE parent of the other creates a cycle: post-
+         * exchange, the parent's slot points to the (former) child
+         * dir, while the child's slot points to the (former) parent
+         * — which now contains itself transitively. Refuse with
+         * STM_EINVAL (POSIX-aligned: Linux returns EINVAL for the
+         * cycle case).
+         *
+         * Forward-note: deeper-ancestor cycle detection (e.g.,
+         * EXCHANGE(/A, /A/sub/sub)) requires ancestor-walk via
+         * dirent traversal, which is O(depth) and lacks an
+         * indexed parent_ino field on the inode (would be a
+         * format break to add). The immediate-parent check
+         * catches the most common abuse case; deeper cycles are
+         * forward-noted for a future hardening chunk that adds
+         * either a parent_ino index or ancestor-walk via reverse-
+         * dirent lookup. */
+        bool src_is_dir = (src_type == STM_DT_DIR);
+        bool dst_is_dir = (dst_type == STM_DT_DIR);
+        if (src_is_dir && dst_is_dir) {
+            if (src_ino == dst_parent_ino || dst_ino == src_parent_ino) {
+                pthread_mutex_unlock(&fs->lock);
+                return STM_EINVAL;
+            }
+        }
         /* Atomically swap. */
         stm_status ws = stm_dirent_swap_two(didx, dataset_id,
                                                  src_parent_ino,
@@ -2640,12 +2666,30 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
     /* P8-POSIX-7a: rename mutates the moved inode's parent + name,
      * which POSIX models as a metadata change → ctime auto-stamps to
      * "now" on src_ino. mtime + btime preserved. Best-effort, same
-     * shape as setxattr's stamp. */
+     * shape as setxattr's stamp.
+     *
+     * R86 P2-2 (P11 close): also stamp src_parent + dst_parent
+     * directories' mtime + ctime — POSIX says rename modifies both
+     * parent directories (their dirent contents change). For
+     * same-parent rename (src_parent == dst_parent), stamp once. */
     {
         struct stm_inode_value iv2 = {0};
         if (stm_inode_lookup(iidx, dataset_id, src_ino, &iv2) == STM_OK) {
             fs_stamp_ctime_now(&iv2);
             (void)stm_inode_set(iidx, dataset_id, src_ino, &iv2);
+        }
+        struct stm_inode_value spv2 = {0};
+        if (stm_inode_lookup(iidx, dataset_id, src_parent_ino, &spv2) == STM_OK) {
+            fs_stamp_mtime_ctime_now(&spv2);
+            (void)stm_inode_set(iidx, dataset_id, src_parent_ino, &spv2);
+        }
+        if (src_parent_ino != dst_parent_ino) {
+            struct stm_inode_value dpv2 = {0};
+            if (stm_inode_lookup(iidx, dataset_id, dst_parent_ino,
+                                       &dpv2) == STM_OK) {
+                fs_stamp_mtime_ctime_now(&dpv2);
+                (void)stm_inode_set(iidx, dataset_id, dst_parent_ino, &dpv2);
+            }
         }
     }
 
