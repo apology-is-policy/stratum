@@ -66,6 +66,21 @@ extern "C" {
 /* Cap on inline data + symlink target (ARCH §11.3.3). */
 #define STM_INODE_INLINE_MAX 100u
 
+/*
+ * `si_flags` is a 32-bit field. Bit allocation (R82 P3-2):
+ *
+ *   bits  0..2   ext-style flags (IMMUTABLE / APPEND / NODUMP) — defined
+ *   bits  3..7   reserved for future ext-style flag bits (DIRSYNC,
+ *                NOATIME, etc.); must be zero on writes today
+ *   bits  8..12  P8-POSIX-7a-seals SEAL_* (SEAL / SHRINK / GROW / WRITE
+ *                / FUTURE_WRITE)
+ *   bits 13..30  reserved-zero — not yet allocated to any feature; must
+ *                be zero on writes; future feature blocks claim these
+ *   bit  31      STM_INO_FLAG_FREED — internal allocator state encoding
+ *                (FREED ⇔ ALLOCATED). Caller MUST NOT set via stm_inode_set;
+ *                the write paths protect against this.
+ */
+
 /* Common file flags (subset of v1's set; extends as needed). */
 #define STM_INO_FLAG_IMMUTABLE  0x00000001u
 #define STM_INO_FLAG_APPEND     0x00000002u

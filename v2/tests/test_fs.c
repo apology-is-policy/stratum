@@ -7845,11 +7845,13 @@ STM_TEST(fs_p3_link_refuses_directory) {
                                     (const uint8_t *)"d", 1,
                                     0755u, 0, 0, &sub));
 
-    /* Hard-link-on-directory is forbidden by POSIX. */
+    /* Hard-link-on-directory is forbidden by POSIX → STM_EPERM (R82 P2-1
+     * — was STM_ENOTSUPPORTED before P8-POSIX-7a-seals added STM_EPERM
+     * to the error-code set). */
     STM_ASSERT_ERR(stm_fs_link(fs, 1,
                                     root, (const uint8_t *)"d", 1,
                                     root, (const uint8_t *)"d2", 2),
-                   STM_ENOTSUPPORTED);
+                   STM_EPERM);
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
@@ -11505,6 +11507,88 @@ STM_TEST(fs_p7a_seals_wedged_refuses_add) {
 
     /* Cannot unmount cleanly when wedged — best-effort cleanup. */
     (void)stm_fs_unmount(fs);
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_seals_r82_p0_1_reflink_refused_when_dst_sealed_write) {
+    /* R82 P0-1 regression: pre-fix, stm_fs_reflink installed extents on
+     * a SEAL_WRITE'd dst inode without checking the seal mask, silently
+     * defeating the seal. Post-fix, seal_write blocks reflink. */
+    make_tmp("p7a_seals_r82_p0_1_reflink_seal_write");
+    stm_fs *fs = NULL; uint64_t root = 0, src = 0;
+    p7a_seals_setup(&fs, &root, &src);
+
+    /* Give src some content so reflink would meaningfully copy. */
+    static uint8_t big[8192] = {0};
+    for (size_t i = 0; i < sizeof big; i++) big[i] = (uint8_t)(i & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, src, 0, big, 4096));
+
+    /* Create a sealed empty dst. */
+    uint64_t dst = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root,
+                                          (const uint8_t *)"dst", 3,
+                                          0644u, 0, 0, &dst));
+    STM_ASSERT_OK(stm_fs_add_seals(fs, 1, dst, STM_FS_SEAL_WRITE));
+
+    /* Reflink must refuse with STM_EPERM. */
+    STM_ASSERT_ERR(stm_fs_reflink(fs, 1, src, 1, dst), STM_EPERM);
+
+    /* dst remains empty (size 0; data_kind INLINE; data_len 0). */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, dst, &v));
+    STM_ASSERT_EQ(stm_load_le64(v.si_size), 0u);
+    STM_ASSERT_EQ(v.si_data_kind, (uint8_t)STM_DATA_INLINE);
+    STM_ASSERT_EQ(v.si_data_len, (uint8_t)0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_seals_r82_p0_1_reflink_refused_when_dst_sealed_grow) {
+    /* SEAL_GROW also refuses reflink when src has content (would
+     * extend dst's si_size from 0 to non-zero). */
+    make_tmp("p7a_seals_r82_p0_1_reflink_seal_grow");
+    stm_fs *fs = NULL; uint64_t root = 0, src = 0;
+    p7a_seals_setup(&fs, &root, &src);
+
+    static uint8_t big[8192] = {0};
+    for (size_t i = 0; i < sizeof big; i++) big[i] = (uint8_t)(i & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, src, 0, big, 4096));
+
+    uint64_t dst = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root,
+                                          (const uint8_t *)"dst", 3,
+                                          0644u, 0, 0, &dst));
+    STM_ASSERT_OK(stm_fs_add_seals(fs, 1, dst, STM_FS_SEAL_GROW));
+
+    STM_ASSERT_ERR(stm_fs_reflink(fs, 1, src, 1, dst), STM_EPERM);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path); unlink(g_key_path);
+}
+
+STM_TEST(fs_p7a_seals_r82_p0_1_reflink_allowed_when_dst_only_seal_shrink) {
+    /* SEAL_SHRINK alone does not block reflink (reflink doesn't shrink
+     * dst — empty dst grows to src's size). Pre-fix, reflink wasn't
+     * checked at all; post-fix, only the WRITE / FUTURE_WRITE / GROW
+     * branches refuse. */
+    make_tmp("p7a_seals_r82_p0_1_reflink_seal_shrink_ok");
+    stm_fs *fs = NULL; uint64_t root = 0, src = 0;
+    p7a_seals_setup(&fs, &root, &src);
+
+    static uint8_t big[8192] = {0};
+    for (size_t i = 0; i < sizeof big; i++) big[i] = (uint8_t)(i & 0xFFu);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, src, 0, big, 4096));
+
+    uint64_t dst = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root,
+                                          (const uint8_t *)"dst", 3,
+                                          0644u, 0, 0, &dst));
+    STM_ASSERT_OK(stm_fs_add_seals(fs, 1, dst, STM_FS_SEAL_SHRINK));
+
+    STM_ASSERT_OK(stm_fs_reflink(fs, 1, src, 1, dst));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path); unlink(g_key_path);
 }
 

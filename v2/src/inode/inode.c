@@ -691,6 +691,34 @@ stm_status stm_inode_set(stm_inode_index *idx, uint64_t dataset_id,
         must_unlock(idx_lock(idx));
         return STM_EINVAL;
     }
+    /* R82 P2-2: pin the seal-stickiness invariant on the writer side
+     * (the fs.c::stm_fs_add_seals seam already enforces SEAL_SEAL
+     * gating + idempotent-add semantics for the public API). The
+     * inode-layer guard catches any future or test-only path that
+     * assembles an `iv` from scratch with cleared seal bits — by
+     * mistake or by malicious intent — and would otherwise silently
+     * defeat the whole sealing surface. Same shape as R71 P1-1's
+     * writer/decoder symmetry: a write that clears a seal bit is
+     * rejected here regardless of which caller assembled the value.
+     *
+     * Pure read-modify-write callers (fs.c::stm_fs_chmod / _chown /
+     * _utimens / _link / _unlink / _rename / write / truncate /
+     * setxattr / removexattr) preserve the bits naturally and stay
+     * unaffected. The check fires only when a candidate-iv carries
+     * fewer seal bits than the persisted record, regardless of what
+     * other fields changed. */
+    {
+        uint32_t in_seals  = stm_load_le32(in_value->si_flags) &
+                             (uint32_t)STM_INO_FLAG_SEAL_MASK;
+        uint32_t cur_seals = stm_load_le32(r->value.si_flags) &
+                             (uint32_t)STM_INO_FLAG_SEAL_MASK;
+        /* `cur_seals & ~in_seals` is the set of bits previously set
+         * that the candidate would clear. Any non-zero result rejects. */
+        if (cur_seals & ~in_seals) {
+            must_unlock(idx_lock(idx));
+            return STM_EINVAL;
+        }
+    }
     /* R70 P3-4 + R69 P3-2: build the canonical post-write candidate
      * (caller's value with si_reserved zeroed per the R69 contract)
      * and skip the dirty flip + memcpy when the candidate is byte-

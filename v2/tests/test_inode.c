@@ -541,6 +541,61 @@ STM_TEST(inode_r71_p1_1_set_rejects_nlink_zero) {
     stm_inode_index_close(idx);
 }
 
+/* R82 P2-2: stm_inode_set rejects writes that clear seal bits.
+ * The fs.c::stm_fs_add_seals seam already enforces SEAL_SEAL gating
+ * + sticky-additive semantics for the public API; the inode-layer
+ * guard catches any future or test-only path that builds an `iv`
+ * from scratch (rather than via lookup-modify-set) and would
+ * otherwise silently defeat the whole sealing surface. Same shape
+ * as R71 P1-1's writer/decoder symmetry — a write that clears any
+ * seal bit is rejected here regardless of caller. */
+STM_TEST(inode_r82_p2_2_set_rejects_clearing_seal_bits) {
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
+
+    /* Set SEAL_WRITE | SEAL_GROW on the record via a legitimate
+     * Set (callers add seals through fs_add_seals; here we simulate
+     * the same effect with a direct read-modify-write). */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &v));
+    uint32_t flags0 = stm_load_le32(v.si_flags);
+    v.si_flags = stm_store_le32(flags0 | STM_INO_FLAG_SEAL_WRITE |
+                                          STM_INO_FLAG_SEAL_GROW);
+    STM_ASSERT_OK(stm_inode_set(idx, 1, ino, &v));
+
+    /* Build a candidate that clears SEAL_WRITE — should refuse. */
+    struct stm_inode_value cv = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &cv));
+    uint32_t cur = stm_load_le32(cv.si_flags);
+    cv.si_flags = stm_store_le32(cur & ~(uint32_t)STM_INO_FLAG_SEAL_WRITE);
+    STM_ASSERT_ERR(stm_inode_set(idx, 1, ino, &cv), STM_EINVAL);
+
+    /* State preservation: rejected Set must not mutate the record. */
+    struct stm_inode_value after = {0};
+    STM_ASSERT_OK(stm_inode_lookup(idx, 1, ino, &after));
+    uint32_t after_flags = stm_load_le32(after.si_flags) &
+                           (uint32_t)STM_INO_FLAG_SEAL_MASK;
+    STM_ASSERT_EQ(after_flags, (uint32_t)(STM_INO_FLAG_SEAL_WRITE |
+                                          STM_INO_FLAG_SEAL_GROW));
+
+    /* Adding a NEW seal bit while preserving the existing ones
+     * is OK — that's the legitimate stm_fs_add_seals path's shape. */
+    cv = after;
+    uint32_t cur2 = stm_load_le32(cv.si_flags);
+    cv.si_flags = stm_store_le32(cur2 | STM_INO_FLAG_SEAL_SHRINK);
+    STM_ASSERT_OK(stm_inode_set(idx, 1, ino, &cv));
+
+    /* Clearing ALL seal bits also rejected (cur != 0 forbids any
+     * regression to a less-sealed state). */
+    cv.si_flags = stm_store_le32(0);
+    STM_ASSERT_ERR(stm_inode_set(idx, 1, ino, &cv), STM_EINVAL);
+
+    stm_inode_index_close(idx);
+}
+
 /* R69 P3-2: stm_inode_set zeroes si_reserved on every successful Set
  * — protects against caller-controlled bytes leaking into a future
  * format extension that reads from this region. */

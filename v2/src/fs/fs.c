@@ -618,11 +618,13 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
      * writes (Linux fcntl(2) F_SEAL_WRITE / F_SEAL_FUTURE_WRITE);
      * SEAL_GROW blocks any write that would extend si_size past its
      * current value. Refusal is STM_EPERM (POSIX errno that Linux
-     * returns for the same condition). The check is performed before
-     * the zero-length short-circuit's caller path so that even probe-
-     * shaped writes don't appear to "succeed" against a sealed inode
-     * (the short-circuit above already handled len == 0 — at this point
-     * len > 0, so a write that would proceed). */
+     * returns for the same condition).
+     *
+     * R82 P3-1: ordering note — the zero-length short-circuit above
+     * (line 611) returns STM_OK without checking seals, matching
+     * Linux's `write(fd, buf, 0)` semantics on a sealed file (write(2)
+     * with count=0 is a no-op even on read-only FDs / sealed files).
+     * Past line 611 we know len > 0 and the seal check is meaningful. */
     uint32_t flags = stm_load_le32(iv->si_flags);
     if (flags & (STM_INO_FLAG_SEAL_WRITE | STM_INO_FLAG_SEAL_FUTURE_WRITE)) {
         return STM_EPERM;
@@ -1458,13 +1460,17 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
         return ds;     /* STM_ENOENT if src not linked */
     }
 
-    /* POSIX forbids hard-link-on-directory. STM_ENOTSUPPORTED maps to
-     * EPERM at the 9P/FUSE syscall-binding layer (R74 P3-2: types.h
-     * does not currently define STM_EPERM; STM_ENOTSUPPORTED is the
-     * closest existing code). */
+    /* POSIX forbids hard-link-on-directory; Linux link(2) returns EPERM.
+     * Pre-R82, types.h didn't define STM_EPERM and STM_ENOTSUPPORTED was
+     * the closest existing code (R74 P3-2). R82 P2-1 closes that gap:
+     * P8-POSIX-7a-seals (de3a6b3) added STM_EPERM = -1 (POSIX-aligned)
+     * for sealed-file rejection, and the same code is the natural fit
+     * here too — both shapes are POSIX EPERM at the syscall layer. The
+     * 9P/FUSE binding layer can now route the EPERM branch directly
+     * without a translation hop. */
     if (child_type == STM_DT_DIR) {
         pthread_mutex_unlock(&fs->lock);
-        return STM_ENOTSUPPORTED;
+        return STM_EPERM;
     }
 
     /* Bump nlink first; rollback if dirent install fails. */
@@ -1862,6 +1868,25 @@ stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 /* ========================================================================= */
 /* P8-POSIX-7a-seals: file seals.                                             */
 /* ========================================================================= */
+
+/* R82 P3-3: drift guard between the public STM_FS_SEAL_* constants in
+ * fs.h and the inode-internal STM_INO_FLAG_SEAL_* bits in inode.h.
+ * The two must stay numerically identical or the seal mask check in
+ * stm_fs_add_seals would let through bits that the enforcement seams
+ * (fs_write_regular_locked + stm_fs_truncate) read directly off
+ * si_flags. Catch any drift at compile time. */
+_Static_assert(STM_FS_SEAL_MASK == STM_INO_FLAG_SEAL_MASK,
+               "fs.h SEAL mask must match inode.h SEAL mask");
+_Static_assert(STM_FS_SEAL_SEAL == STM_INO_FLAG_SEAL_SEAL,
+               "STM_FS_SEAL_SEAL must match STM_INO_FLAG_SEAL_SEAL");
+_Static_assert(STM_FS_SEAL_SHRINK == STM_INO_FLAG_SEAL_SHRINK,
+               "STM_FS_SEAL_SHRINK must match STM_INO_FLAG_SEAL_SHRINK");
+_Static_assert(STM_FS_SEAL_GROW == STM_INO_FLAG_SEAL_GROW,
+               "STM_FS_SEAL_GROW must match STM_INO_FLAG_SEAL_GROW");
+_Static_assert(STM_FS_SEAL_WRITE == STM_INO_FLAG_SEAL_WRITE,
+               "STM_FS_SEAL_WRITE must match STM_INO_FLAG_SEAL_WRITE");
+_Static_assert(STM_FS_SEAL_FUTURE_WRITE == STM_INO_FLAG_SEAL_FUTURE_WRITE,
+               "STM_FS_SEAL_FUTURE_WRITE must match STM_INO_FLAG_SEAL_FUTURE_WRITE");
 
 stm_status stm_fs_add_seals(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                                 uint32_t seals)
@@ -2679,7 +2704,22 @@ stm_status stm_fs_removexattr(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
  * the file timestamps of the destination file" — current impl does
  * not stamp. Fix lands when the reflink-wrapper sub-chunk surfaces
  * the inode-level integration (see phase8-status.md P8-POSIX-10
- * row). */
+ * row).
+ *
+ * R82 P0-1 fix: enforce dst-inode file seals BEFORE delegating to
+ * stm_sync_reflink. Reflink installs HOT/COLD extent records onto
+ * dst's empty extent tree — from the POSIX/FICLONE perspective this
+ * IS a content modification (Linux's kernel reflink path checks
+ * IS_IMMUTABLE + F_SEAL_WRITE and refuses with EPERM). Without this
+ * check a SEAL_WRITE'd dst could be silently overwritten via reflink,
+ * defeating the whole sealing surface. SEAL_GROW also refuses if the
+ * source has any content (reflink would extend dst's si_size from 0).
+ *
+ * The check is best-effort — if dst inode lookup fails (missing
+ * inode-index, ENOENT), we fall through to stm_sync_reflink which
+ * will surface the error itself; we don't synthesize errors here.
+ * For dst inodes that DO exist, the seal mask is read under fs->lock
+ * which is held across the entire reflink so there's no race window. */
 stm_status stm_fs_reflink(stm_fs *fs,
                             uint64_t src_dataset_id, uint64_t src_ino,
                             uint64_t dst_dataset_id, uint64_t dst_ino)
@@ -2687,6 +2727,43 @@ stm_status stm_fs_reflink(stm_fs *fs,
     if (!fs) return STM_EINVAL;
     pthread_mutex_lock(&fs->lock);
     FS_GUARD_WRITE(fs);
+
+    /* R82 P0-1: seal enforcement on the destination inode. */
+    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+    if (iidx) {
+        struct stm_inode_value div = {0};
+        stm_status dls = stm_inode_lookup(iidx, dst_dataset_id, dst_ino, &div);
+        if (dls == STM_OK) {
+            uint32_t dflags = stm_load_le32(div.si_flags);
+            if (dflags & (STM_INO_FLAG_SEAL_WRITE |
+                          STM_INO_FLAG_SEAL_FUTURE_WRITE)) {
+                pthread_mutex_unlock(&fs->lock);
+                return STM_EPERM;
+            }
+            if (dflags & STM_INO_FLAG_SEAL_GROW) {
+                /* SEAL_GROW refuses if reflink would extend dst's
+                 * si_size. Probe src's size — if non-zero, reflink
+                 * grows dst from current size (typically 0) up to
+                 * src's size. POSIX-conservative: refuse on any
+                 * source with content, regardless of whether dst is
+                 * actually empty (the post-fix invariant should be
+                 * "SEAL_GROW dst can never grow", not "depends on
+                 * src/dst-empty interaction"). */
+                struct stm_inode_value siv = {0};
+                stm_status sls = stm_inode_lookup(iidx, src_dataset_id,
+                                                       src_ino, &siv);
+                if (sls == STM_OK) {
+                    uint64_t src_size = stm_load_le64(siv.si_size);
+                    uint64_t dst_size = stm_load_le64(div.si_size);
+                    if (src_size > dst_size) {
+                        pthread_mutex_unlock(&fs->lock);
+                        return STM_EPERM;
+                    }
+                }
+            }
+        }
+    }
+
     stm_status s = stm_sync_reflink(fs->sync,
                                        src_dataset_id, src_ino,
                                        dst_dataset_id, dst_ino);
