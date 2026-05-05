@@ -25,6 +25,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -94,24 +96,43 @@ static uint32_t decode_le32(const uint8_t *p)
 /* listen_unix.                                                           */
 /* ────────────────────────────────────────────────────────────────────── */
 
-int stm_stratumd_listen_unix(const char *path, int backlog)
+int stm_stratumd_listen_unix(const char *path, int backlog, mode_t mode)
 {
     if (!path || !*path) return -EINVAL;
     if (strlen(path) >= sizeof((struct sockaddr_un *)0)->sun_path)
         return -ENAMETOOLONG;
+
+    /* Substitute the default mode if caller passed 0. R95 P1-1 fix —
+     * default 0600 mirrors janus's R11 P1-1 fix. Mask away non-perm
+     * bits so callers can't sneak in setuid/sticky/etc. */
+    if (mode == 0) mode = STM_STRATUMD_DEFAULT_SOCKET_MODE;
+    mode &= 07777;
 
     /* Clamp backlog. SOMAXCONN is at least 128 on every supported
      * platform; the kernel may further cap. */
     if (backlog < 1) backlog = 1;
     if (backlog > SOMAXCONN) backlog = SOMAXCONN;
 
+    /* R95 P3-1 — refuse to clobber a non-socket file at `path`.
+     * Operators who typo `--listen /etc/passwd` deserve protection.
+     * lstat (not stat) so a symlink-to-non-socket also refuses. */
+    {
+        struct stat st;
+        if (lstat(path, &st) == 0) {
+            if (!S_ISSOCK(st.st_mode))
+                return -EEXIST;
+        } else if (errno != ENOENT) {
+            /* Permission denied / IO error reading the path — refuse
+             * rather than blunder in. */
+            return -errno;
+        }
+    }
+    /* Stale socket: unlink. ENOENT tolerated; other errors fatal
+     * (mirrors janus's R11 P3-X discipline). */
+    if (unlink(path) != 0 && errno != ENOENT) return -errno;
+
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -errno;
-
-    /* Best-effort cleanup of any stale socket file. unlink() returns
-     * ENOENT if missing — fine. EISDIR / EACCES indicate a real
-     * collision; surface as bind() error below. */
-    (void)unlink(path);
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof addr);
@@ -120,14 +141,32 @@ int stm_stratumd_listen_unix(const char *path, int backlog)
      * by the field width for defense-in-depth. */
     strncpy(addr.sun_path, path, sizeof addr.sun_path - 1);
 
-    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
+    /* R95 P1-1 — clamp the socket file's mode BEFORE bind() creates
+     * it via umask, then explicit chmod() AFTER bind to close the
+     * window where a connector could slip in at the kernel-default
+     * mode (Linux <3.17 ignores umask for AF_UNIX entirely; some
+     * filesystems can't carry full Unix perms). chmod failure is
+     * FATAL — close + unlink + return -errno — matching janus's
+     * R11 P1-1 fix. */
+    mode_t prev_umask = umask(0777 & ~mode);
+    int    bind_rc    = bind(fd, (struct sockaddr *)&addr, sizeof addr);
+    int    bind_errno = errno;
+    umask(prev_umask);
+    if (bind_rc < 0) {
+        close(fd);
+        return -bind_errno;
+    }
+    if (chmod(path, mode) < 0) {
         int e = errno;
         close(fd);
+        (void)unlink(path);
         return -e;
     }
+
     if (listen(fd, backlog) < 0) {
         int e = errno;
         close(fd);
+        (void)unlink(path);
         return -e;
     }
 
@@ -179,7 +218,8 @@ static int peer_creds(int fd, uid_t *out_uid, gid_t *out_gid)
 stm_status stm_stratumd_serve_client(int fd, stm_fs *fs,
                                        uid_t peer_uid, gid_t peer_gid,
                                        uint32_t msize_max,
-                                       uint64_t root_dataset)
+                                       uint64_t root_dataset,
+                                       uint32_t idle_timeout_ms)
 {
     if (fd < 0 || !fs) {
         if (fd >= 0) close(fd);
@@ -191,6 +231,22 @@ stm_status stm_stratumd_serve_client(int fd, stm_fs *fs,
      * to hold any negotiable message. */
     if (msize_max < STM_9P_MSIZE_MIN) msize_max = STM_9P_MSIZE_MIN;
     if (msize_max > STM_9P_MSIZE_MAX) msize_max = STM_9P_MSIZE_MAX;
+
+    /* R95 P2-1 — bound the time a single connection can hold the
+     * accept slot. The serial accept loop is one-client-at-a-time, so
+     * a misbehaving peer that opens but never sends would otherwise
+     * DoS every other mount user. Apply SO_RCVTIMEO + SO_SNDTIMEO;
+     * read_full / write_full surface EAGAIN/EWOULDBLOCK and the
+     * connection ends with STM_EIO. Default 30 s matches janus's
+     * R11 P2-4. idle_timeout_ms == 0 is "no timeout" (intended for
+     * tests that drive the wire synchronously). */
+    if (idle_timeout_ms > 0u) {
+        struct timeval tv;
+        tv.tv_sec  = (time_t)(idle_timeout_ms / 1000u);
+        tv.tv_usec = (suseconds_t)((idle_timeout_ms % 1000u) * 1000u);
+        (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    }
 
     stm_9p_server *srv = NULL;
     stm_status rc = stm_9p_server_create(fs, root_dataset,
@@ -271,9 +327,17 @@ stm_status stm_stratumd_serve_client(int fd, stm_fs *fs,
 stm_status stm_stratumd_accept_loop(int listen_fd, stm_fs *fs,
                                       uint32_t msize_max,
                                       uint64_t root_dataset,
+                                      uint32_t idle_timeout_ms,
+                                      bool allow_unauthenticated_peer,
                                       atomic_bool *stop_flag)
 {
     if (listen_fd < 0 || !fs) return STM_EINVAL;
+
+    /* idle_timeout_ms == 0 here is interpreted as "use default";
+     * tests that explicitly want no timeout pass it directly to
+     * stm_stratumd_serve_client and bypass the loop. */
+    if (idle_timeout_ms == 0u)
+        idle_timeout_ms = STM_STRATUMD_DEFAULT_IDLE_MS;
 
     while (1) {
         /* Stop-flag check happens BEFORE accept blocks. The
@@ -300,13 +364,25 @@ stm_status stm_stratumd_accept_loop(int listen_fd, stm_fs *fs,
 
         uid_t peer_uid = (uid_t)-1;
         gid_t peer_gid = (gid_t)-1;
-        if (peer_creds(client_fd, &peer_uid, &peer_gid) != 0) {
-            /* Fall back to the daemon's own credentials. The 9P
-             * server still gets a uid/gid pair to stamp on created
-             * files; an authoritatively-deployed stratumd should
-             * reject the connection here, but v2.0 accepts. Forward-
-             * note: when auth backends land, this is the entry point
-             * for plug-in dispatch. */
+        int   pc_rc    = peer_creds(client_fd, &peer_uid, &peer_gid);
+        if (pc_rc != 0) {
+            /* R95 P2-2 — peer-credential resolution failed. Default
+             * is to REFUSE the connection: the daemon has no way to
+             * attribute the peer, and falling back to the daemon's
+             * own uid/gid is a confused-deputy hole. The opt-in
+             * `allow_unauthenticated_peer` flag exists for testing
+             * on platforms without SO_PEERCRED / getpeereid (the
+             * #else arm of peer_creds) but defaults off in
+             * production. Mirror janus's R11 P1-2 strict posture. */
+            if (!allow_unauthenticated_peer) {
+                fprintf(stderr,
+                    "stratumd: refusing connection: "
+                    "peer credentials unavailable (errno=%d); "
+                    "set allow_unauthenticated_peer to opt in\n",
+                    -pc_rc);
+                close(client_fd);
+                continue;
+            }
             peer_uid = (uid_t)getuid();
             peer_gid = (gid_t)getgid();
         }
@@ -314,7 +390,8 @@ stm_status stm_stratumd_accept_loop(int listen_fd, stm_fs *fs,
         /* Serve to disconnect; closes client_fd internally. */
         (void)stm_stratumd_serve_client(client_fd, fs,
                                             peer_uid, peer_gid,
-                                            msize_max, root_dataset);
+                                            msize_max, root_dataset,
+                                            idle_timeout_ms);
     }
     return STM_OK;
 }
@@ -338,10 +415,22 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
     stm_status rc = stm_fs_mount(opts->fs_path, &mopts, &fs);
     if (rc != STM_OK) return rc;
 
-    int backlog = opts->backlog > 0 ? opts->backlog
-                                     : STM_STRATUMD_DEFAULT_BACKLOG;
-    int listen_fd = stm_stratumd_listen_unix(opts->socket_path, backlog);
+    int      backlog = opts->backlog > 0 ? opts->backlog
+                                          : STM_STRATUMD_DEFAULT_BACKLOG;
+    mode_t   mode    = opts->socket_mode != 0 ? opts->socket_mode
+                                              : STM_STRATUMD_DEFAULT_SOCKET_MODE;
+    int listen_fd = stm_stratumd_listen_unix(opts->socket_path,
+                                                backlog, mode);
     if (listen_fd < 0) {
+        /* R95 P3-4 — preserve the actual errno in the diagnostic so
+         * an operator can distinguish ENAMETOOLONG / EADDRINUSE /
+         * EACCES / EEXIST (non-socket clobber refusal) etc. The
+         * top-level return narrows to STM_EBACKEND for now (no
+         * dedicated error codes for socket / FS-perm errors yet); a
+         * future hardening can extend stm_status. */
+        fprintf(stderr,
+            "stratumd: listen on %s failed: %s\n",
+            opts->socket_path, strerror(-listen_fd));
         (void)stm_fs_unmount(fs);
         return STM_EBACKEND;
     }
@@ -352,6 +441,8 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
                                                   : 1u;
 
     rc = stm_stratumd_accept_loop(listen_fd, fs, msize_max, root_ds,
+                                       opts->idle_timeout_ms,
+                                       opts->allow_unauthenticated_peer,
                                        opts->stop_flag);
 
     /* Clean shutdown: close listen fd, unlink socket, unmount fs. */

@@ -19,6 +19,7 @@
 #include <stratum/types.h>
 
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -54,16 +55,22 @@ static uint32_t load_u32(const uint8_t *p) {
 typedef struct {
     int            listen_fd;
     stm_fs        *fs;
+    uint32_t       idle_timeout_ms;  /* 0 → loop substitutes default 30 s */
     atomic_bool    stop_flag;
-    stm_status     run_status;     /* set by worker on exit */
+    stm_status     run_status;       /* set by worker on exit */
 } accept_ctx;
 
 static void *accept_loop_thread(void *arg)
 {
     accept_ctx *ctx = (accept_ctx *)arg;
+    /* allow_unauthenticated_peer = false: tests run on Linux/macOS
+     * where SO_PEERCRED / getpeereid succeed for connected Unix
+     * sockets, so the strict policy never fires the refusal path. */
     ctx->run_status = stm_stratumd_accept_loop(ctx->listen_fd, ctx->fs,
                                                   STM_9P_MSIZE_DEFAULT,
                                                   /*root_dataset=*/1u,
+                                                  ctx->idle_timeout_ms,
+                                                  /*allow_unauth=*/false,
                                                   &ctx->stop_flag);
     return NULL;
 }
@@ -225,7 +232,7 @@ STM_TEST(p9_socket_listen_path_too_long_rejected) {
     char too_long[200];
     memset(too_long, 'a', sizeof too_long - 1);
     too_long[sizeof too_long - 1] = '\0';
-    int fd = stm_stratumd_listen_unix(too_long, 4);
+    int fd = stm_stratumd_listen_unix(too_long, 4, 0600);
     STM_ASSERT_TRUE(fd < 0);
     STM_ASSERT_EQ(fd, -ENAMETOOLONG);
 }
@@ -246,11 +253,14 @@ STM_TEST(p9_socket_listen_then_handshake) {
                                               /*uid=*/0, /*gid=*/0,
                                               &root_ino));
 
-    int listen_fd = stm_stratumd_listen_unix(g_sock_path, 4);
+    int listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600);
     STM_ASSERT_TRUE(listen_fd >= 0);
 
     accept_ctx ctx = { .listen_fd = listen_fd, .fs = fs,
-                        .stop_flag = false, .run_status = STM_EBACKEND };
+                        .run_status = STM_EBACKEND };
+    /* R95 P3-2: atomic_bool on auto-storage requires atomic_init per
+     * C11 §7.17.2.1 (designated-init via plain `false` is impl-defined). */
+    atomic_init(&ctx.stop_flag, false);
     pthread_t worker;
     STM_ASSERT_EQ(pthread_create(&worker, NULL, accept_loop_thread, &ctx), 0);
 
@@ -287,11 +297,14 @@ STM_TEST(p9_socket_two_sequential_clients) {
     uint64_t root_ino = 0;
     STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1u, 0755u, 0, 0, &root_ino));
 
-    int listen_fd = stm_stratumd_listen_unix(g_sock_path, 4);
+    int listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600);
     STM_ASSERT_TRUE(listen_fd >= 0);
 
     accept_ctx ctx = { .listen_fd = listen_fd, .fs = fs,
-                        .stop_flag = false, .run_status = STM_EBACKEND };
+                        .run_status = STM_EBACKEND };
+    /* R95 P3-2: atomic_bool on auto-storage requires atomic_init per
+     * C11 §7.17.2.1 (designated-init via plain `false` is impl-defined). */
+    atomic_init(&ctx.stop_flag, false);
     pthread_t worker;
     STM_ASSERT_EQ(pthread_create(&worker, NULL, accept_loop_thread, &ctx), 0);
 
@@ -335,10 +348,13 @@ STM_TEST(p9_socket_protocol_violation_disconnects) {
     uint64_t root_ino = 0;
     STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1u, 0755u, 0, 0, &root_ino));
 
-    int listen_fd = stm_stratumd_listen_unix(g_sock_path, 4);
+    int listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600);
     STM_ASSERT_TRUE(listen_fd >= 0);
     accept_ctx ctx = { .listen_fd = listen_fd, .fs = fs,
-                        .stop_flag = false, .run_status = STM_EBACKEND };
+                        .run_status = STM_EBACKEND };
+    /* R95 P3-2: atomic_bool on auto-storage requires atomic_init per
+     * C11 §7.17.2.1 (designated-init via plain `false` is impl-defined). */
+    atomic_init(&ctx.stop_flag, false);
     pthread_t worker;
     STM_ASSERT_EQ(pthread_create(&worker, NULL, accept_loop_thread, &ctx), 0);
 
@@ -366,6 +382,104 @@ STM_TEST(p9_socket_protocol_violation_disconnects) {
     STM_ASSERT_EQ(do_handshake(cfd2, /*fid=*/100), 0);
     STM_ASSERT_EQ(do_clunk(cfd2, /*tag=*/2, /*fid=*/100), 0);
     close(cfd2);
+
+    wake_and_join(&ctx, worker);
+    STM_ASSERT_EQ(ctx.run_status, STM_OK);
+
+    close(listen_fd);
+    (void)unlink(g_sock_path);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* ── R95 regression tests ─────────────────────────────────────────── */
+
+/* R95 P1-1: stm_stratumd_listen_unix MUST clamp the socket file's
+ * mode tight (default 0600) so a local-user "any-can-connect" hole
+ * doesn't exist. Janus has the same gate (R11 P1-1); replicating
+ * here. */
+STM_TEST(p9_socket_r95_p1_1_socket_mode_is_0600) {
+    build_sock_path("r95_p1_1_mode");
+    int fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600);
+    STM_ASSERT_TRUE(fd >= 0);
+
+    struct stat st;
+    STM_ASSERT_EQ(lstat(g_sock_path, &st), 0);
+    STM_ASSERT_EQ(st.st_mode & 07777, (mode_t)0600);
+
+    close(fd);
+    (void)unlink(g_sock_path);
+}
+
+/* R95 P3-1: non-socket file at the listen path → -EEXIST refusal. */
+STM_TEST(p9_socket_r95_p3_1_non_socket_refused) {
+    build_sock_path("r95_p3_1_non_socket");
+    /* Create a regular file at the path. */
+    int rfd = open(g_sock_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    STM_ASSERT_TRUE(rfd >= 0);
+    close(rfd);
+
+    int fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600);
+    STM_ASSERT_EQ(fd, -EEXIST);
+
+    /* The pre-existing regular file must still be there (we refused
+     * to clobber it). */
+    struct stat st;
+    STM_ASSERT_EQ(lstat(g_sock_path, &st), 0);
+    STM_ASSERT_TRUE(S_ISREG(st.st_mode));
+
+    (void)unlink(g_sock_path);
+}
+
+/* R95 P2-1: a slow-loris client (connects but never sends) must NOT
+ * indefinitely block the serial accept loop. With idle_timeout_ms
+ * set small (250 ms here for fast test), the daemon's serve_client
+ * times out on the size-header read; serve_client returns STM_EIO,
+ * accept loop frees up to accept the next client. */
+STM_TEST(p9_socket_r95_p2_1_slow_loris_releases_slot) {
+    make_tmp("9p_sock_r95_p2_1");
+    build_sock_path("r95_p2_1_slow");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root_ino = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, 1u, 0755u, 0, 0, &root_ino));
+
+    int listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600);
+    STM_ASSERT_TRUE(listen_fd >= 0);
+
+    accept_ctx ctx = { .listen_fd = listen_fd, .fs = fs,
+                        .idle_timeout_ms = 250u,    /* short for test */
+                        .run_status = STM_EBACKEND };
+    atomic_init(&ctx.stop_flag, false);
+    pthread_t worker;
+    STM_ASSERT_EQ(pthread_create(&worker, NULL, accept_loop_thread, &ctx), 0);
+
+    /* Slow-loris: connect, send NOTHING, eventually close on test
+     * exit. Worker's serve_client should time out on the size-header
+     * read and return STM_EIO, freeing the accept slot. */
+    int loris_fd = connect_client(g_sock_path);
+    STM_ASSERT_TRUE(loris_fd >= 0);
+    /* Wait long enough for the daemon's read to time out (idle
+     * timeout = 250ms); 600ms gives 2.4× safety margin under
+     * sanitizer/CI scheduling jitter. */
+    struct timespec ts = { 0, 600 * 1000 * 1000 };
+    nanosleep(&ts, NULL);
+
+    /* A SECOND client must succeed even though loris is still
+     * holding its connection — verifies the daemon released the
+     * serial slot. */
+    int cfd = connect_client(g_sock_path);
+    STM_ASSERT_TRUE(cfd >= 0);
+    STM_ASSERT_EQ(do_handshake(cfd, /*fid=*/100), 0);
+    STM_ASSERT_EQ(do_clunk(cfd, /*tag=*/2, /*fid=*/100), 0);
+    close(cfd);
+
+    /* Now close the loris fd. */
+    close(loris_fd);
 
     wake_and_join(&ctx, worker);
     STM_ASSERT_EQ(ctx.run_status, STM_OK);

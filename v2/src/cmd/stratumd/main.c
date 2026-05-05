@@ -10,6 +10,7 @@
  */
 
 #include <stratum/stratumd.h>
+#include <stratum/sync.h>      /* STM_SYNC_DATASET_ID_MAX (R95 P3-5) */
 #include <stratum/types.h>
 
 #include <errno.h>
@@ -20,6 +21,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* R95 P3-3 — the SIGINT/SIGTERM handler calls atomic_store_explicit
+ * on g_stop_flag. Per C11 §7.14.1.1 ¶5 + POSIX 2024 signal-safety,
+ * this is async-signal-safe ONLY if atomic_bool is lock-free. On
+ * every supported platform atomic_bool is lock-free
+ * (ATOMIC_BOOL_LOCK_FREE == 2); declaring this assumption explicitly
+ * makes the contract auditable for future ports to exotic ABIs (some
+ * MIPS / SPARC / RISC-V variants without single-byte CAS would fail
+ * this assertion at compile time, surfacing the issue before runtime
+ * deadlock between signal handler and main thread). */
+_Static_assert(ATOMIC_BOOL_LOCK_FREE == 2,
+                "stratumd's signal-driven stop_flag requires "
+                "lock-free atomic_bool for async-signal-safety");
 
 /* ────────────────────────────────────────────────────────────────────── */
 /* Signal handling.                                                       */
@@ -140,9 +154,13 @@ int main(int argc, char **argv)
         if (!strcmp(a, "--root-dataset") && i + 1 < argc) {
             char *end = NULL;
             unsigned long long v = strtoull(argv[++i], &end, 10);
-            if (!end || *end != '\0' || v == 0ull) {
+            if (!end || *end != '\0' || v == 0ull
+                || v > (unsigned long long)STM_SYNC_DATASET_ID_MAX) {
                 fprintf(stderr,
-                    "stratumd: invalid --root-dataset: %s\n", argv[i]);
+                    "stratumd: invalid --root-dataset: %s "
+                    "(must be in [1, %llu])\n",
+                    argv[i],
+                    (unsigned long long)STM_SYNC_DATASET_ID_MAX);
                 return 1;
             }
             opts.root_dataset = (uint64_t)v;

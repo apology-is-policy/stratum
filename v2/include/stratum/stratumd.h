@@ -56,6 +56,20 @@ extern "C" {
 #define STM_STRATUMD_DEFAULT_SOCKET   "/var/run/stratum.sock"
 #define STM_STRATUMD_DEFAULT_BACKLOG  16
 
+/* Default mode for the listen socket file. 0600 mirrors janus's
+ * R11 P1-1 fix — root + the operator who started the daemon are
+ * the only principals who can connect. Until pluggable auth
+ * backends land (forward-noted), the socket file's mode bits ARE
+ * the daemon's only access-control gate, and they MUST be tight
+ * by default. R95 P1-1 fix. */
+#define STM_STRATUMD_DEFAULT_SOCKET_MODE  ((mode_t)0600)
+
+/* Default per-connection socket idle timeout. Bounds the time one
+ * client can hold the serial accept slot (R95 P2-1 fix). 30 s
+ * matches janus's R11 P2-4 fix; legitimate 9P clients exchange
+ * messages on millisecond timescales. */
+#define STM_STRATUMD_DEFAULT_IDLE_MS  (30u * 1000u)
+
 /* ────────────────────────────────────────────────────────────────────── */
 /* Daemon options.                                                        */
 /* ────────────────────────────────────────────────────────────────────── */
@@ -72,10 +86,23 @@ typedef struct stm_stratumd_opts {
     /* Listen config. */
     const char *socket_path;      /* required (Unix socket path) */
     int         backlog;          /* listen() backlog; clamped to ≥ 1 */
+    mode_t      socket_mode;      /* socket-file mode (0 → DEFAULT 0600) */
 
     /* Per-connection 9P config. */
     uint32_t    msize_max;        /* clamped to [STM_9P_MSIZE_MIN, MAX] */
     uint64_t    root_dataset;     /* dataset id new attachers bind to */
+    uint32_t    idle_timeout_ms;  /* per-conn idle timeout (0 → DEFAULT 30s);
+                                   * applied to accepted client fds via
+                                   * SO_RCVTIMEO + SO_SNDTIMEO */
+
+    /* Auth fallback policy (R95 P2-2). When peer-credential
+     * resolution fails (platform without SO_PEERCRED / getpeereid),
+     * the default behavior is to REFUSE the connection — the daemon
+     * has no way to attribute the connecting peer. Set
+     * `allow_unauthenticated_peer = true` to opt INTO the legacy
+     * fallback (peer = daemon's own uid/gid); intended for testing
+     * on exotic platforms or controlled deployments only. */
+    bool        allow_unauthenticated_peer;
 
     /* Stop signaling — writer (e.g., signal handler or test driver)
      * sets *stop_flag = true; the accept loop checks between accept()
@@ -111,14 +138,18 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts);
 
 /*
  * Bind + listen on a Unix-domain SOCK_STREAM at `path`. Removes any
- * stale socket file at `path` first (the conventional pattern; an
- * existing live socket would have its bind fail with EADDRINUSE
- * regardless). Returns the listen fd on success (caller close()s
- * after stm_stratumd_accept_loop returns), or -errno on failure.
+ * stale socket file at `path` first AFTER verifying it is in fact a
+ * socket (S_ISSOCK gate, R95 P3-1 fix). The socket file's mode is
+ * clamped to `mode` via umask-then-chmod; chmod failure is fatal,
+ * matching janus's R11 P1-1 pattern (R95 P1-1 fix).
  *
- * `backlog` is clamped to [1, SOMAXCONN].
+ * Returns the listen fd on success (caller close()s after
+ * stm_stratumd_accept_loop returns), or -errno on failure.
+ *
+ * `backlog` is clamped to [1, SOMAXCONN]. `mode` of 0 substitutes
+ * STM_STRATUMD_DEFAULT_SOCKET_MODE (0600).
  */
-int stm_stratumd_listen_unix(const char *path, int backlog);
+int stm_stratumd_listen_unix(const char *path, int backlog, mode_t mode);
 
 /*
  * Serve a single already-accepted client connection until disconnect.
@@ -132,12 +163,19 @@ int stm_stratumd_listen_unix(const char *path, int backlog);
  * peer_uid / peer_gid come from getsockopt(SO_PEERCRED) on Linux or
  * getpeereid() on BSD/macOS — captured by the accept loop and passed
  * here verbatim.
+ *
+ * `idle_timeout_ms` is applied to the fd via SO_RCVTIMEO + SO_SNDTIMEO
+ * before the per-message loop starts; 0 means "no timeout" (intended
+ * for tests). Production callers pass STM_STRATUMD_DEFAULT_IDLE_MS or
+ * a deployment-tuned value to bound slow-loris hold time per the
+ * R95 P2-1 fix.
  */
 STM_MUST_USE
 stm_status stm_stratumd_serve_client(int fd, stm_fs *fs,
                                        uid_t peer_uid, gid_t peer_gid,
                                        uint32_t msize_max,
-                                       uint64_t root_dataset);
+                                       uint64_t root_dataset,
+                                       uint32_t idle_timeout_ms);
 
 /*
  * Accept loop. Serially accept() each incoming connection, resolve
@@ -147,12 +185,19 @@ stm_status stm_stratumd_serve_client(int fd, stm_fs *fs,
  *
  * Does NOT close listen_fd on return (caller's responsibility).
  *
+ * `idle_timeout_ms` and `allow_unauthenticated_peer` mirror the
+ * options on `stm_stratumd_opts`; idle_timeout_ms == 0 substitutes
+ * STM_STRATUMD_DEFAULT_IDLE_MS; allow_unauthenticated_peer defaults
+ * to false.
+ *
  * Returns STM_OK on stop-flag exit, non-OK on accept() error.
  */
 STM_MUST_USE
 stm_status stm_stratumd_accept_loop(int listen_fd, stm_fs *fs,
                                       uint32_t msize_max,
                                       uint64_t root_dataset,
+                                      uint32_t idle_timeout_ms,
+                                      bool allow_unauthenticated_peer,
                                       atomic_bool *stop_flag);
 
 #ifdef __cplusplus
