@@ -285,6 +285,29 @@ language bindings, future kernel module) is a 9P consumer.
             Forward-noted to P9-CTL-1b' devices subtree: wire
             device_class_name / device_role_name /
             device_state_name; add qid_device_id extractor.
+      - [x] **P9-CTL-1b' /pools/<uuid>/devices/<id>/ devices
+            subtree** — substantive complete. Adds three new
+            kinds (KIND_DEVICES_DIR, KIND_DEVICE_DIR,
+            KIND_DEVICE_STATUS); KIND_MAX = 9. Wires
+            device_class_name / device_role_name /
+            device_state_name (R97 P3-3 close — no more
+            `(void)func_name` shrouds). New `qid_device_id`
+            extractor. Per-device status surface:
+            ```
+            device-id: <n>
+            device-uuid: <hex>
+            size-bytes: <n>
+            class: <ssd|hdd|pmem|zns|unset>
+            role: <data|log|cache|spare|unset>
+            state: <online|offline|degraded|faulted|removed|evacuating|unset>
+            ```
+            Strict canonical decimal device-id parser (rejects
+            leading zeros + values ≥ STM_POOL_DEVICES_MAX = 64).
+            Readdir of /pools/<uuid>/devices/ enumerates total
+            roster (includes REMOVED slots per pool's invariant).
+            5 new tests in `tests/test_ctl.c`; ctest 25 → 30 in
+            test_ctl. R98 audit pending.
+
       - [ ] **P9-CTL-1c /datasets/** — pending; per-dataset
             properties + stats + snapshot list + create/rollback
             triggers.

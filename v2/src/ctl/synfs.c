@@ -91,12 +91,15 @@
 /* ── kind enum + meta table ─────────────────────────────────────────── */
 
 typedef enum {
-    KIND_ROOT         = 0,
-    KIND_VERSION      = 1,
-    KIND_STATE        = 2,
-    KIND_POOLS_DIR    = 3,    /* /pools/ */
-    KIND_POOL_DIR     = 4,    /* /pools/<uuid>/ */
-    KIND_POOL_STATUS  = 5,    /* /pools/<uuid>/status */
+    KIND_ROOT          = 0,
+    KIND_VERSION       = 1,
+    KIND_STATE         = 2,
+    KIND_POOLS_DIR     = 3,    /* /pools/ */
+    KIND_POOL_DIR      = 4,    /* /pools/<uuid>/ */
+    KIND_POOL_STATUS   = 5,    /* /pools/<uuid>/status */
+    KIND_DEVICES_DIR   = 6,    /* /pools/<uuid>/devices/ */
+    KIND_DEVICE_DIR    = 7,    /* /pools/<uuid>/devices/<id>/ */
+    KIND_DEVICE_STATUS = 8,    /* /pools/<uuid>/devices/<id>/status */
     KIND_MAX
 } ctl_kind;
 
@@ -107,30 +110,35 @@ typedef struct {
 } ctl_kind_meta;
 
 static const ctl_kind_meta KIND_META[KIND_MAX] = {
-    [KIND_ROOT]         = { true,  0555, "/"       },
-    [KIND_VERSION]      = { false, 0444, "version" },
-    [KIND_STATE]        = { false, 0444, "state"   },
-    [KIND_POOLS_DIR]    = { true,  0555, "pools"   },
-    [KIND_POOL_DIR]     = { true,  0555, NULL      },  /* dynamic uuid */
-    [KIND_POOL_STATUS]  = { false, 0444, "status"  },
+    [KIND_ROOT]          = { true,  0555, "/"       },
+    [KIND_VERSION]       = { false, 0444, "version" },
+    [KIND_STATE]         = { false, 0444, "state"   },
+    [KIND_POOLS_DIR]     = { true,  0555, "pools"   },
+    [KIND_POOL_DIR]      = { true,  0555, NULL      },  /* dynamic uuid */
+    [KIND_POOL_STATUS]   = { false, 0444, "status"  },
+    [KIND_DEVICES_DIR]   = { true,  0555, "devices" },
+    [KIND_DEVICE_DIR]    = { true,  0555, NULL      },  /* dynamic device id */
+    [KIND_DEVICE_STATUS] = { false, 0444, "status"  },
 };
 
 /* R96 P3-2: pin every static-name literal length below STM_P9_NAME_MAX
  * (63) at build time. Update both this assert block and KIND_META in
  * lockstep when adding new static-named kinds. (Dynamic names like
- * uuid hex (36 chars) are also < 63 — that's a runtime bound check
- * in the dynamic decoder.) */
+ * uuid hex (36 chars) and decimal device id (≤5 digits for 64 slots)
+ * are also < 63 — that's a runtime bound check in the dynamic
+ * decoder.) */
 _Static_assert(sizeof("/") - 1        <= STM_P9_NAME_MAX, "/ctl/ root literal");
 _Static_assert(sizeof("version") - 1  <= STM_P9_NAME_MAX, "/ctl/ /version literal");
 _Static_assert(sizeof("state") - 1    <= STM_P9_NAME_MAX, "/ctl/ /state literal");
 _Static_assert(sizeof("pools") - 1    <= STM_P9_NAME_MAX, "/ctl/ /pools literal");
 _Static_assert(sizeof("status") - 1   <= STM_P9_NAME_MAX, "/ctl/ /pools/.../status literal");
+_Static_assert(sizeof("devices") - 1  <= STM_P9_NAME_MAX, "/ctl/ /pools/.../devices literal");
 
 /* R97 P3-7: pin KIND_MAX so adding a new ctl_kind without extending
  * KIND_META[] trips this assert at build time, even if a downstream
  * build silently suppresses -Wmissing-field-initializers. Update the
  * literal in lockstep when growing the enum. */
-_Static_assert(KIND_MAX == 6,
+_Static_assert(KIND_MAX == 9,
                "KIND_META[KIND_MAX] sized to enum cardinality; "
                "update both ctl_kind enum + KIND_META[] in lockstep");
 
@@ -160,6 +168,11 @@ static ctl_kind qid_kind(uint64_t q)
 static uint32_t qid_pool_idx(uint64_t q)
 {
     return (uint32_t)((q >> 32) & POOL_IDX_MASK);
+}
+
+static uint32_t qid_device_id(uint64_t q)
+{
+    return (uint32_t)(q & DEVICE_ID_MASK);
 }
 
 /* ── per-fid materialized body ──────────────────────────────────────── */
@@ -303,6 +316,25 @@ static int uuid_parse_hex(const char *s, size_t len, uint8_t out[16])
 static bool uuid_eq(const uint8_t a[16], const uint8_t b[16])
 {
     return memcmp(a, b, 16) == 0;
+}
+
+/* Parse `name[0..len)` as an unsigned decimal device-id in
+ * [0, STM_POOL_DEVICES_MAX). Strict canonical: rejects leading
+ * zeros on multi-char names (so the wire form has exactly one
+ * spelling per slot). Returns 0 on success, -1 on malformed. */
+static int parse_device_id(const char *name, size_t len, uint16_t *out)
+{
+    if (len == 0 || len > 3) return -1;     /* 0..63 fits in 2 chars; defensive 3 */
+    if (len > 1 && name[0] == '0') return -1;
+    uint32_t v = 0;
+    for (size_t i = 0; i < len; i++) {
+        char ch = name[i];
+        if (ch < '0' || ch > '9') return -1;
+        v = v * 10u + (uint32_t)(ch - '0');
+        if (v >= STM_POOL_DEVICES_MAX) return -1;
+    }
+    *out = (uint16_t)v;
+    return 0;
 }
 
 /* Get the attached pool's UUID as 16 bytes, or return false if no pool
@@ -528,12 +560,61 @@ static stm_status materialize_pool_status(stm_ctl *c, ctl_session *s)
         (unsigned)sum.per_state[STM_DEV_STATE_FAULTED],
         (unsigned)sum.per_state[STM_DEV_STATE_REMOVED],
         (unsigned)sum.per_state[STM_DEV_STATE_EVACUATING]);
-    /* Suppress unused-static-fn warnings for the helpers — they
-     * are reserved for the next sub-sub-chunk that adds the
-     * /pools/<uuid>/devices/<id>/{class,role,state,...} surface. */
-    (void)device_class_name;
-    (void)device_role_name;
-    (void)device_state_name;
+    if (n < 0) return STM_EIO;
+    if ((size_t)n >= sizeof s->buf) return STM_ERANGE;
+    s->len = (uint32_t)n;
+    return STM_OK;
+}
+
+/* Materialize /pools/<uuid>/devices/<id>/status — per-device record
+ * snapshot. R97 P3-3 close: device_class_name/device_role_name/
+ * device_state_name now wired here. */
+static stm_status materialize_device_status(stm_ctl *c, ctl_session *s)
+{
+    if (!c->pool) return STM_EBACKEND;     /* gated at vops_open */
+    uint16_t did = (uint16_t)qid_device_id(s->qid_path);
+
+    stm_pool_lock_shared(c->pool);
+    size_t total = stm_pool_device_count(c->pool);
+    if (did >= total) {
+        stm_pool_unlock_shared(c->pool);
+        return STM_ENOENT;
+    }
+    const stm_pool_device *d = stm_pool_device_info(c->pool, did);
+    if (!d) {
+        stm_pool_unlock_shared(c->pool);
+        return STM_ENOENT;
+    }
+    /* Snapshot to a local before unlock — the device record fields
+     * the formatter touches (uuid, size_bytes, role, class_, state)
+     * are all in the slot itself, which mutates only under the
+     * exclusive side. We hold rdlock so reads are stable. */
+    stm_pool_device snap = *d;
+    stm_pool_unlock_shared(c->pool);
+
+    uint8_t uuid_b[16];
+    /* device uuid is uint64_t[2] — same shape as pool uuid. Reuse
+     * the LE byte-pack convention for consistency at the wire form. */
+    for (size_t i = 0; i < 8; i++) {
+        uuid_b[i]     = (uint8_t)(snap.uuid[0] >> (i * 8));
+        uuid_b[i + 8] = (uint8_t)(snap.uuid[1] >> (i * 8));
+    }
+    char uuid_s[UUID_HEX_LEN + 1];
+    uuid_format_hex(uuid_b, uuid_s);
+
+    int n = snprintf((char *)s->buf, sizeof s->buf,
+        "device-id: %u\n"
+        "device-uuid: %s\n"
+        "size-bytes: %llu\n"
+        "class: %s\n"
+        "role: %s\n"
+        "state: %s\n",
+        (unsigned)did,
+        uuid_s,
+        (unsigned long long)snap.size_bytes,
+        device_class_name(snap.class_),
+        device_role_name(snap.role),
+        device_state_name(snap.state));
     if (n < 0) return STM_EIO;
     if ((size_t)n >= sizeof s->buf) return STM_ERANGE;
     s->len = (uint32_t)n;
@@ -543,12 +624,15 @@ static stm_status materialize_pool_status(stm_ctl *c, ctl_session *s)
 static stm_status materialize_locked(stm_ctl *c, ctl_session *s)
 {
     switch (qid_kind(s->qid_path)) {
-    case KIND_VERSION:     return materialize_version(c, s);
-    case KIND_STATE:       return materialize_state(c, s);
-    case KIND_POOL_STATUS: return materialize_pool_status(c, s);
+    case KIND_VERSION:       return materialize_version(c, s);
+    case KIND_STATE:         return materialize_state(c, s);
+    case KIND_POOL_STATUS:   return materialize_pool_status(c, s);
+    case KIND_DEVICE_STATUS: return materialize_device_status(c, s);
     case KIND_ROOT:
     case KIND_POOLS_DIR:
     case KIND_POOL_DIR:
+    case KIND_DEVICES_DIR:
+    case KIND_DEVICE_DIR:
     case KIND_MAX:
         break;
     }
@@ -580,20 +664,40 @@ static stm_status stat_at(stm_ctl *c, uint64_t qid_path,
     const char *name = meta->static_name;
     size_t name_len = name ? strlen(name) : 0;
 
+    /* Pool-related kinds: pool_idx must be 0 (single-pool v2.0). */
+    if (k == KIND_POOLS_DIR || k == KIND_POOL_DIR
+        || k == KIND_POOL_STATUS || k == KIND_DEVICES_DIR
+        || k == KIND_DEVICE_DIR || k == KIND_DEVICE_STATUS) {
+        if (qid_pool_idx(qid_path) != 0) return STM_ENOENT;
+    }
+
     if (k == KIND_POOL_DIR) {
         uint8_t uuid_b[16];
         if (!ctl_pool_uuid_bytes(c, uuid_b)) return STM_ENOENT;
-        if (qid_pool_idx(qid_path) != 0) return STM_ENOENT;
         uuid_format_hex(uuid_b, dyn_name);
         name = dyn_name;
         name_len = UUID_HEX_LEN;
     }
-    if ((k == KIND_POOL_STATUS) && !c->pool) {
+    if ((k == KIND_POOL_STATUS || k == KIND_DEVICES_DIR) && !c->pool) {
         return STM_ENOENT;
     }
-    if ((k == KIND_POOLS_DIR) || (k == KIND_POOL_DIR)
-        || (k == KIND_POOL_STATUS)) {
-        if (qid_pool_idx(qid_path) != 0) return STM_ENOENT;
+    if (k == KIND_DEVICE_DIR || k == KIND_DEVICE_STATUS) {
+        if (!c->pool) return STM_ENOENT;
+        uint32_t did = qid_device_id(qid_path);
+        stm_pool_lock_shared(c->pool);
+        size_t total = stm_pool_device_count(c->pool);
+        const stm_pool_device *d =
+            (did < total) ? stm_pool_device_info(c->pool, (uint16_t)did) : NULL;
+        bool valid = (d != NULL);
+        stm_pool_unlock_shared(c->pool);
+        if (!valid) return STM_ENOENT;
+        if (k == KIND_DEVICE_DIR) {
+            /* Format the device id as decimal (≤ 5 chars). */
+            int n = snprintf(dyn_name, sizeof dyn_name, "%u", (unsigned)did);
+            if (n < 0 || n >= (int)sizeof dyn_name) return STM_EIO;
+            name = dyn_name;
+            name_len = (size_t)n;
+        }
     }
 
     memset(out, 0, sizeof *out);
@@ -654,11 +758,29 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
         if (!c->pool) return STM_ENOENT;
         if (str_eq(name, name_len, KIND_META[KIND_POOL_STATUS].static_name))
             return stat_at(c, qid_root(KIND_POOL_STATUS), out);
+        if (str_eq(name, name_len, KIND_META[KIND_DEVICES_DIR].static_name))
+            return stat_at(c, qid_root(KIND_DEVICES_DIR), out);
         return STM_ENOENT;
+
+    case KIND_DEVICES_DIR: {
+        if (!c->pool) return STM_ENOENT;
+        uint16_t did = 0;
+        if (parse_device_id(name, name_len, &did) != 0) return STM_ENOENT;
+        return stat_at(c, qid_of(KIND_DEVICE_DIR, 0, did), out);
+    }
+
+    case KIND_DEVICE_DIR: {
+        if (!c->pool) return STM_ENOENT;
+        if (!str_eq(name, name_len, KIND_META[KIND_DEVICE_STATUS].static_name))
+            return STM_ENOENT;
+        uint32_t did = qid_device_id(dir_qid_path);
+        return stat_at(c, qid_of(KIND_DEVICE_STATUS, 0, did), out);
+    }
 
     case KIND_VERSION:
     case KIND_STATE:
     case KIND_POOL_STATUS:
+    case KIND_DEVICE_STATUS:
     case KIND_MAX:
         break;
     }
@@ -695,11 +817,35 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
 
     case KIND_POOL_DIR:
         if (!c->pool) return STM_ENOENT;
-        return emit_entry(c, cb, cb_ctx, qid_root(KIND_POOL_STATUS));
+        rc = emit_entry(c, cb, cb_ctx, qid_root(KIND_POOL_STATUS));
+        if (rc != STM_OK) return rc;
+        return emit_entry(c, cb, cb_ctx, qid_root(KIND_DEVICES_DIR));
+
+    case KIND_DEVICES_DIR: {
+        if (!c->pool) return STM_ENOENT;
+        stm_pool_lock_shared(c->pool);
+        size_t total = stm_pool_device_count(c->pool);
+        stm_pool_unlock_shared(c->pool);
+        for (size_t i = 0; i < total; i++) {
+            stm_status erc = emit_entry(c, cb, cb_ctx,
+                qid_of(KIND_DEVICE_DIR, 0, (uint32_t)i));
+            if (erc == STM_ENOENT) continue;   /* slot disappeared mid-iteration */
+            if (erc != STM_OK) return erc;
+        }
+        return STM_OK;
+    }
+
+    case KIND_DEVICE_DIR: {
+        if (!c->pool) return STM_ENOENT;
+        uint32_t did = qid_device_id(dir_qid_path);
+        return emit_entry(c, cb, cb_ctx,
+            qid_of(KIND_DEVICE_STATUS, 0, did));
+    }
 
     case KIND_VERSION:
     case KIND_STATE:
     case KIND_POOL_STATUS:
+    case KIND_DEVICE_STATUS:
     case KIND_MAX:
         break;
     }
@@ -719,14 +865,24 @@ static stm_status vops_open(void *ctx, uint32_t fid, uint64_t qid_path,
 
     /* Directories: open is advisory; readdir handles iteration. */
     if (meta->is_dir) {
-        /* Validate the directory still exists in the current state
-         * (e.g. /pools/<uuid>/ requires c->pool != NULL). */
-        if (k == KIND_POOL_DIR && !c->pool) return STM_ENOENT;
+        /* Validate the directory still exists in the current state. */
+        if ((k == KIND_POOL_DIR || k == KIND_DEVICES_DIR
+                || k == KIND_DEVICE_DIR) && !c->pool)
+            return STM_ENOENT;
+        if (k == KIND_DEVICE_DIR) {
+            /* Slot must still be in range. */
+            uint32_t did = qid_device_id(qid_path);
+            stm_pool_lock_shared(c->pool);
+            size_t total = stm_pool_device_count(c->pool);
+            stm_pool_unlock_shared(c->pool);
+            if (did >= total) return STM_ENOENT;
+        }
         return STM_OK;
     }
 
     /* File kinds: validate context, materialize body. */
-    if (k == KIND_POOL_STATUS && !c->pool) return STM_ENOENT;
+    if ((k == KIND_POOL_STATUS || k == KIND_DEVICE_STATUS) && !c->pool)
+        return STM_ENOENT;
 
     pthread_mutex_lock(&c->mu);
     ctl_session *s = session_alloc_locked(c, fid, qid_path);
