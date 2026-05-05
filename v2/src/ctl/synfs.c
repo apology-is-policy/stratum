@@ -289,6 +289,15 @@ static uint64_t qid_dataset_id(uint64_t q)
 #define STM_CTL_BODY_MAX     1024u
 #define STM_CTL_MAX_SESSIONS 64u
 
+/* Cap on action-verb body length for write triggers
+ * (KIND_POOL_SCRUB_TRIGGER and any future writable kind that takes
+ * a verb). The longest legitimate verb today is "resume" at 6 chars;
+ * 16 leaves headroom for "integrity-check" / "bg-rescan" without
+ * ever letting a malicious 1 GiB body cause an unbounded memcmp.
+ * R104 P3-4 lifted this from a hard-coded 16 to a #define for
+ * searchability + ease of re-tuning. */
+#define STM_CTL_VERB_MAX     16u
+
 typedef struct ctl_session {
     int       active;
     uint32_t  fid;
@@ -1981,6 +1990,14 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
      *   (d) consistent KIND_META[] mode-bit + vops_write/open
      *       dispatch (mode_check at vops_open already handled).
      *
+     * Gate ordering (R104 P3-5 — locked against drive-by edits):
+     *   admin re-check  →  zero-byte refusal  →  scrub-attached
+     *     →  session lookup-and-validate.
+     * Rationale: an unauthenticated zero-byte write must report
+     * EACCES (the admin gate), not EINVAL (the zero-byte gate) —
+     * same POSIX-priority shape as path-traversal returning EACCES
+     * over EINVAL when a refused dirfd is hit first.
+     *
      * Audit log: every action attempt records (uid, verb, result)
      * via stm_ctl_log_event regardless of success — so an operator
      * reading /events sees both successful and failed dispatches.
@@ -1997,6 +2014,19 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
             return STM_EBACKEND;
         }
         pthread_mutex_unlock(&c->mu);
+        /* R104 P2-1 / F-5: c->mu is INTENTIONALLY released before
+         * verb dispatch. The session lookup above is purely a
+         * pre-dispatch fid-validity gate — we don't reuse `s` after
+         * unlock. Releasing c->mu before invoking verb_op keeps the
+         * scrub's internal sc->lock from nesting under c->mu (which
+         * stm_ctl_log_event also takes); the lock order is therefore
+         * sc->lock → release → c->mu. Under v2.0's serial-server
+         * posture this is trivially safe (no concurrent dispatch can
+         * race against `stm_ctl_drop_all_sessions`, which would also
+         * take c->mu). Concurrent-accept upgrades MUST re-strengthen
+         * the validation gate (e.g., per-session refcount that
+         * drop_all_sessions waits on) — same R94 P2-1 / R97 P2-2
+         * forward-note class. */
 
         /* Trim trailing whitespace + newline. The verb table is
          * matched against the trimmed slice. Bound the comparison
@@ -2011,22 +2041,38 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         }
         if (end == 0) return STM_EINVAL;     /* whitespace-only body */
 
-        /* Cap the verb length at 16 so a malicious 1 GiB body doesn't
-         * cause us to scan unbounded memory. The longest legitimate
-         * verb is 6 chars; anything past 16 is definitely garbage. */
-        size_t cmp_len = (end > 16) ? 16 : end;
+        /* Cap the verb length at STM_CTL_VERB_MAX so a malicious 1
+         * GiB body doesn't cause us to scan unbounded memory. The
+         * longest legitimate verb is "resume" (6 chars); anything
+         * past 16 is definitely garbage. */
+        size_t cmp_len = (end > STM_CTL_VERB_MAX) ? STM_CTL_VERB_MAX : end;
+
+        /* R104 P3-3: verb dispatch table — replaces the per-clause
+         * if-chain. Easier to extend (e.g., a future "step" verb for
+         * testing) and reads the cmp_len-vs-name-length comparison
+         * without per-line repetition of the size literal. */
+        static const struct {
+            const char *name;
+            size_t      name_len;
+            stm_status (*op)(stm_scrub *);
+        } VERBS[] = {
+            { "start",  5, stm_scrub_start  },
+            { "pause",  5, stm_scrub_pause  },
+            { "resume", 6, stm_scrub_resume },
+            { "reset",  5, stm_scrub_reset  },
+        };
 
         const char *verb_str = NULL;
         stm_status (*verb_op)(stm_scrub *) = NULL;
-        if (cmp_len == 5 && memcmp(buf, "start", 5) == 0) {
-            verb_str = "start"; verb_op = stm_scrub_start;
-        } else if (cmp_len == 5 && memcmp(buf, "pause", 5) == 0) {
-            verb_str = "pause"; verb_op = stm_scrub_pause;
-        } else if (cmp_len == 6 && memcmp(buf, "resume", 6) == 0) {
-            verb_str = "resume"; verb_op = stm_scrub_resume;
-        } else if (cmp_len == 5 && memcmp(buf, "reset", 5) == 0) {
-            verb_str = "reset"; verb_op = stm_scrub_reset;
-        } else {
+        for (size_t i = 0; i < sizeof VERBS / sizeof VERBS[0]; i++) {
+            if (cmp_len == VERBS[i].name_len
+                  && memcmp(buf, VERBS[i].name, VERBS[i].name_len) == 0) {
+                verb_str = VERBS[i].name;
+                verb_op  = VERBS[i].op;
+                break;
+            }
+        }
+        if (!verb_op) {
             /* Unknown verb. Log + refuse. */
             stm_ctl_log_event(c, "scrub-trigger uid=%u verb=<unknown> result=einval",
                                 (unsigned)c->caller_uid);

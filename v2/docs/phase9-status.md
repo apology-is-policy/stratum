@@ -517,7 +517,15 @@ language bindings, future kernel module) is a 9P consumer.
                   ctl_d5_scrub_trigger_whitespace_only_einval,
                   ctl_d5_scrub_trigger_topen_nonadmin_eacces,
                   ctl_d5_scrub_trigger_omitted_when_unattached.
-                  R104 audit pending.
+                  **R104 close** YELLOW (verdict MERGE) — 0 P0 + 0 P1
+                  + 1 P2 + 6 P3. P2-1 documented post-unlock dispatch
+                  contract (sc->lock → release → c->mu intentional;
+                  concurrent-accept forward-note). P3-1 added ORDWR
+                  Topen rejection. P3-2 pinned out_written byte-count
+                  semantics on whitespace-trimmed bodies. P3-3+P3-4
+                  refactored verb if-chain to a static VERBS[] table
+                  + STM_CTL_VERB_MAX define. P3-5 documented gate
+                  ordering rationale. P3-6 cosmetic-only.
             - [ ] **P9-CTL-1d-actions-snapshot** — pending; snapshot
                   create / rollback write triggers. Composes against
                   -1d-uid admin gate + -1d-events audit log; R99 P2-1

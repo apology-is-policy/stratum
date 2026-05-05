@@ -38,7 +38,23 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9-CTL-1d-scrub-trigger substantive (this commit). 43
+- **Tip**: P9-CTL-1d-scrub-trigger R104 close (this commit) —
+  YELLOW, 0 P0 + 0 P1 + 1 P2 + 6 P3 (verdict MERGE). 43 ctest
+  suites green default. test_ctl 88/88 (close adds inline assertions
+  to existing tests rather than new tests). R104 close: P2-1
+  documented post-unlock dispatch contract + concurrent-accept
+  forward-note (ordering: sc->lock → release → c->mu, intentional);
+  P3-1 added ORDWR Topen rejection assertion alongside OREAD;
+  P3-2 added out_written byte-count assertions to pause+resume
+  round-trip (POSIX `write(fd, "pause\n", 6)` returns 6, not the
+  trimmed 5); P3-3 + P3-4 refactored verb if-chain to a static
+  const VERBS[] table + STM_CTL_VERB_MAX define for searchability;
+  P3-5 documented the gate-ordering rationale (admin→zero-byte→
+  scrub→session) inline; P3-6 cosmetic-only (no change). The
+  writable-kind family pattern is now established and well-
+  documented.
+
+- **Pre-tip-1**: P9-CTL-1d-scrub-trigger substantive. 43
   ctest suites green default. test_ctl 88/88 (was 80 at R103 close;
   +8 -1d-scrub-trigger). **P9-CTL-1d-scrub-trigger** adds /pools/
   <uuid>/scrub-trigger (admin-only mode 0200 write trigger). Body

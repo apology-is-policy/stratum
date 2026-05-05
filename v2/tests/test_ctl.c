@@ -3500,17 +3500,24 @@ STM_TEST(ctl_d5_scrub_trigger_pause_resume_round_trip)
     STM_ASSERT_EQ(resp[4], STM_P9_RWRITE);
 
     char body[1024];
-    /* pause: trailing newline must be stripped */
+    /* pause: trailing newline must be stripped from the verb match,
+     * but R104 P3-2: out_written returns the FULL byte count
+     * including the stripped whitespace — POSIX `write(fd, "pause\n",
+     * 6)` returns 6, not 5. Future regression that returned the
+     * trimmed length (`end`) instead of `len` would silently break
+     * here. */
     sz = build_twrite(req, 5, 11, 0, "pause\n", 6);
     STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
     STM_ASSERT_EQ(resp[4], STM_P9_RWRITE);
+    STM_ASSERT_EQ(load_u32(resp + 7), 6u);
     read_scrub_state(&f, 6, 12, body, sizeof body);
     STM_ASSERT(strstr(body, "state: paused\n") != NULL);
 
-    /* resume */
+    /* resume — no trailing whitespace; out_written = len = 6. */
     sz = build_twrite(req, 10, 11, 0, "resume", 6);
     STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
     STM_ASSERT_EQ(resp[4], STM_P9_RWRITE);
+    STM_ASSERT_EQ(load_u32(resp + 7), 6u);
     read_scrub_state(&f, 11, 13, body, sizeof body);
     STM_ASSERT(strstr(body, "state: running\n") != NULL);
 
@@ -3628,6 +3635,15 @@ STM_TEST(ctl_d5_scrub_trigger_topen_nonadmin_eacces)
 
     /* Mode != OWRITE also rejected — file is write-only. */
     sz = build_topen(req, 4, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* R104 P3-1: ORDWR (mode 2) is symmetric with OREAD against the
+     * write-only mode-gate at vops_open — both rejected with EACCES.
+     * The earlier OREAD-only assertion left the ORDWR path untested;
+     * this catches a future regression that flipped the gate from
+     * `mode != STM_P9_OWRITE` to `mode == STM_P9_OREAD`. */
+    sz = build_topen(req, 5, 11, STM_P9_ORDWR);
     STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
     STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
 
