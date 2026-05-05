@@ -187,6 +187,27 @@ STM_MUST_USE
 stm_status stm_ctl_set_admin_uid(stm_ctl *c, uid_t admin_uid);
 
 /*
+ * Drop all active per-fid sessions on this stm_ctl (R101 P1-1).
+ * stratumd's serial-accept loop MUST call this between connections
+ * (typically right after stm_p9_server_destroy + before the next
+ * accept) so that a leaked session from connection N can't leak
+ * into connection N+1's view.
+ *
+ * Without this hook, the chunk's "safe across SEQUENTIAL
+ * stm_p9_server use" claim breaks down: when conn-N+1 reuses the
+ * same fid number that conn-N's session occupied, the session-
+ * lookup pre-empts the new alloc and conn-N+1 reads conn-N's
+ * stale snapshot_len. Worse, conn-N+1's Tclunk frees conn-N's
+ * slot and orphans its own — STM_CTL_MAX_SESSIONS depletes
+ * permanently.
+ *
+ * Mirrors janus_synfs_drop_all_sessions (R12 P3-5).
+ *
+ * Safe on NULL c.
+ */
+void stm_ctl_drop_all_sessions(stm_ctl *c);
+
+/*
  * Append a timestamped line to the /ctl/events log buffer (P9-CTL-
  * 1d-events). Format: `<sec>.<nsec> <fmt-output>\n`. Lines truncated
  * past 511 bytes get a forced-newline terminator (no merge with the

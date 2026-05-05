@@ -2190,4 +2190,164 @@ STM_TEST(ctl_r100_p3_3_set_admin_uid_can_reset)
     stm_ctl_destroy(c);
 }
 
+/* ── R101 regressions ─────────────────────────────────────────────── */
+
+/* R101 P1-1 regression: stm_ctl_drop_all_sessions clears the per-fid
+ * session table so a sequential server-on-same-stm_ctl pattern
+ * can't leak sessions from prior connections. Simulates the
+ * stratumd-integration shape: server-1 logs an /events Topen
+ * (slot allocated), server-1 destroyed without explicit clunk,
+ * stm_ctl_drop_all_sessions called, server-2 fresh Topen on the
+ * same fid succeeds with a fresh snapshot. Without the drop, the
+ * prior session would pre-empt the new alloc. */
+STM_TEST(ctl_r101_p1_1_drop_all_sessions_releases_slots)
+{
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    stm_ctl_log_event(c, "first event");
+
+    /* Conn 1: open /events on fid 11. */
+    stm_p9_server *s1 = make_ctl_server(c);
+    do_handshake(s1, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "events" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 1, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s1, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s1, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+
+    /* Tear down conn 1 WITHOUT a Tclunk — leaks the session. */
+    stm_p9_server_destroy(s1);
+
+    /* Without drop_all_sessions, the leaked slot would interfere
+     * with conn 2's reuse of fid 11. Drain it. */
+    stm_ctl_drop_all_sessions(c);
+
+    /* Conn 2 with a fresh server on the same stm_ctl. */
+    stm_ctl_log_event(c, "second event");
+    stm_p9_server *s2 = make_ctl_server(c);
+    do_handshake(s2, 10);
+
+    sz = build_twalk(req, 2, 10, 11, 1, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s2, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s2, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+
+    /* Read should yield the FRESH snapshot — both events visible. */
+    sz = build_tread(req, 4, 11, 0, 8192);
+    STM_ASSERT_OK(stm_p9_server_handle(s2, req, sz, resp, sizeof resp, &rlen));
+    uint32_t count = load_u32(resp + 7);
+    char body[1024];
+    memcpy(body, resp + 11, count);
+    body[count] = '\0';
+    STM_ASSERT(strstr(body, "first event")  != NULL);
+    STM_ASSERT(strstr(body, "second event") != NULL);
+
+    stm_p9_server_destroy(s2);
+    stm_ctl_destroy(c);
+}
+
+STM_TEST(ctl_r101_p1_1_drop_all_sessions_safe_on_null)
+{
+    stm_ctl_drop_all_sessions(NULL);    /* must not crash */
+}
+
+/* R101 P2-1 regression: a /events reader with an open fid sees
+ * clean EOF (count=0) after a concurrent clear, NOT the
+ * frankenstein view where the buffer was zero'd but snapshot_len
+ * wasn't reset. The fix invalidates active /events sessions in
+ * vops_write's clear path. */
+STM_TEST(ctl_r101_p2_1_clear_invalidates_active_event_snapshots)
+{
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));    /* root */
+    stm_ctl_log_event(c, "before clear: this should not leak");
+
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+
+    /* Open /events on fid 11 — captures a snapshot of the pre-clear log. */
+    const char *epath[] = { "events" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 1, epath);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+
+    /* Trigger clear via /admin/clear-events. */
+    const char *cpath[] = { "admin", "clear-events" };
+    sz = build_twalk(req, 4, 10, 12, 2, cpath);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 5, 12, STM_P9_OWRITE);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_twrite(req, 6, 12, 0, "x", 1);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWRITE);
+
+    /* The original fid 11's read MUST now return clean EOF (0
+     * bytes) — NOT the pre-clear content, NOT zero-padded
+     * frankenstein bytes. */
+    sz = build_tread(req, 7, 11, 0, 8192);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    STM_ASSERT_EQ(load_u32(resp + 7), 0u);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
+/* R101 P2-2 regression: 0-byte Twrite to /admin/clear-events is
+ * refused with STM_EINVAL (not silently triggers the clear). The
+ * documented "any data triggers" wording really means non-empty. */
+STM_TEST(ctl_r101_p2_2_zero_byte_clear_refused)
+{
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));
+    stm_ctl_log_event(c, "this must survive a 0-byte clear attempt");
+
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "admin", "clear-events" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+
+    sz = build_topen(req, 3, 11, STM_P9_OWRITE);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+
+    /* Twrite count=0 — refused. */
+    sz = build_twrite(req, 4, 11, 0, "", 0);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* Verify log intact. */
+    const char *epath[] = { "events" };
+    sz = build_twalk(req, 5, 10, 12, 1, epath);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 6, 12, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_tread(req, 7, 12, 0, 8192);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    uint32_t count = load_u32(resp + 7);
+    char body[1024];
+    memcpy(body, resp + 11, count);
+    body[count] = '\0';
+    STM_ASSERT(strstr(body, "this must survive a 0-byte clear attempt")
+                != NULL);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
 STM_TEST_MAIN("ctl")

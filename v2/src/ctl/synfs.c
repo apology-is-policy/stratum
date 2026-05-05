@@ -74,6 +74,7 @@
  * are reflected on the next Topen.
  */
 
+#include <stratum/crypto.h>         /* stm_ct_memzero (R101 P3-1) */
 #include <stratum/ctl.h>
 #include <stratum/dataset.h>        /* stm_property + stm_dataset_entry */
 #include <stratum/fs.h>
@@ -1579,6 +1580,12 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
      * catches it. */
     if (k == KIND_ADMIN_CLEAR_EVENTS) {
         if (!ctl_caller_is_admin(c)) return STM_EACCES;
+        /* R101 P2-2: refuse 0-byte Twrite. The contract says "any
+         * data triggers" — 0 bytes isn't data. POSIX `write(fd, _,
+         * 0)` is well-defined as no-op-or-implementation-defined,
+         * so accepting 0-byte writes as triggers is a UX surprise
+         * (`echo -n "" >...` would silently destroy the log). */
+        if (len == 0) return STM_EINVAL;
         pthread_mutex_lock(&c->mu);
         ctl_session *s = session_get_locked(c, fid);
         if (!s || s->qid_path != qid_path) {
@@ -1588,8 +1595,22 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         /* Reset the event log. Any data the client sent is ignored —
          * the trigger is the act of writing, not the content. */
         if (c->event_buf) {
-            memset(c->event_buf, 0, c->event_cap);
+            stm_ct_memzero(c->event_buf, c->event_cap);
             c->event_len = 0;
+        }
+        /* R101 P2-1: invalidate any active /events snapshots. Without
+         * this, a reader holding snapshot_len = N from before the
+         * clear would see N bytes of zeros (post-memset) — a frankenstein
+         * view that violates the documented "snapshot stability"
+         * contract. Reset uses_event_buf and snapshot_len on every
+         * active /events session so subsequent Treads return clean EOF
+         * (count=0). Operators re-Topen to see the post-clear log. */
+        for (uint32_t i = 0; i < STM_CTL_MAX_SESSIONS; i++) {
+            ctl_session *e = &c->sessions[i];
+            if (e->active && e->uses_event_buf) {
+                e->uses_event_buf = 0;
+                e->snapshot_len = 0;
+            }
         }
         pthread_mutex_unlock(&c->mu);
         /* Self-log the clear so operators have a marker even after
@@ -1663,6 +1684,16 @@ stm_status stm_ctl_set_admin_uid(stm_ctl *c, uid_t admin_uid)
     return STM_OK;
 }
 
+void stm_ctl_drop_all_sessions(stm_ctl *c)
+{
+    if (!c) return;
+    pthread_mutex_lock(&c->mu);
+    for (uint32_t i = 0; i < STM_CTL_MAX_SESSIONS; i++) {
+        if (c->sessions[i].active) session_free_locked(&c->sessions[i]);
+    }
+    pthread_mutex_unlock(&c->mu);
+}
+
 stm_status stm_ctl_attach_pool(stm_ctl *c, struct stm_pool *pool)
 {
     /* R97 P2-1: NULL pool is rejected. Earlier shape silently
@@ -1686,9 +1717,13 @@ void stm_ctl_destroy(stm_ctl *c)
     /* P9-CTL-1d-events: release the event log buffer. Zero before
      * free — the log may contain operationally-sensitive context
      * (uids, dataset names, etc.) that an attacker recovering freed
-     * heap pages could harvest. memset is cheap insurance. */
+     * heap pages could harvest. R101 P3-1: stm_ct_memzero (not
+     * memset) because the write has no observable effect post-free
+     * and a DSE-eligible memset could be elided by aggressive
+     * optimizers. Matches janus's audit_buf cleanup pattern
+     * (synfs.c:904). */
     if (c->event_buf) {
-        memset(c->event_buf, 0, c->event_cap);
+        stm_ct_memzero(c->event_buf, c->event_cap);
         free(c->event_buf);
     }
     pthread_mutex_destroy(&c->mu);
