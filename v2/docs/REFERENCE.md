@@ -38,7 +38,42 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: post-R68-hash-fixup. Substantive `2ceafb9` +
+- **Tip**: P9-CTL-1a substantive (this commit). 43 ctest suites
+  green default. STM_UB_VERSION = 26 (no on-disk format change in
+  P9-CTL-*; /ctl/ is in-memory operator state). Spec posture
+  unchanged: 27 modules / 35 fixed cfgs / 64 buggy cfgs (last
+  changed at P9-9P-2c). **P9-CTL-1a — /ctl/ synthetic FS
+  foundation.** New module `src/ctl/synfs.c` + public header
+  `include/stratum/ctl.h`. The /ctl/ tree (ARCH §14.3) is the
+  operator-state surface served as a vops backend for the generic
+  `stm_p9_server` (NOT `stm_9p_server` — same mechanism janus's
+  /keys/ uses). v2.0 layout: `/`, `/version` (read-only:
+  stratum-version + STM_UB_VERSION + STM_FS_HANDLE_VERSION +
+  STM_SEND_VERSION), `/state` (read-only: mounted? read-only?
+  wedged? gen, allocator counters via `stm_fs_stats_get`).
+  qid_path encodes kind in high byte (8 bits); 56 bits reserved
+  for sub-chunks. Per-fid body materialization at Topen via
+  STM_CTL_BODY_MAX-bounded scratch; snprintf-then-check pattern.
+  Every node read-only at v2.0 (Twrite returns EACCES);
+  action-trigger files are sub-chunk scope. 10 tests in
+  `tests/test_ctl.c`; ctest 42 → 43. CLAUDE.md trigger list
+  extended with `v2/src/ctl/`. Subsequent sub-chunks: -1b
+  /pools/, -1c /datasets/, -1d /tracing/+/debug/+/events,
+  -1e /metrics/.
+
+  **REFERENCE drift forward-note**: this Snapshot last had
+  per-chunk entries through P7-CAS-17 (R68). Phase 8 (POSIX
+  surface) and Phase 9 (9P-server stack) shipped without
+  Snapshot updates; the catalog of `reference/NN-*.md` files
+  also has no entries for the new modules
+  (`v2/src/{inode,dirent,xattr,locks,9p,ctl,cmd/stratumd}/`).
+  Backfilling those is a chunk-of-its-own and not in scope
+  here. The phase status docs (`phase8-status.md`,
+  `phase9-status.md`) carry the per-chunk detail in the
+  meantime. The historical snapshot below is preserved
+  untouched until backfill.
+
+- **Pre-Phase-8 tip**: post-R68-hash-fixup. Substantive `2ceafb9` +
   R68 close `3deb833`.
   **P7-CAS-17 — cross-extent FastCDC at migrate. Closes the
   per-extent isolation gap from P7-CAS-4b that prevented cross-file

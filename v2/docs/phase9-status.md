@@ -210,10 +210,45 @@ language bindings, future kernel module) is a 9P consumer.
       installed by CMake yet (install rules deferred). R95
       audit pending.
 
-- [ ] **P9-CTL-1 /ctl/ synthetic FS** — pending; the layout in
-      ARCHITECTURE §14.3 served as a 9P file tree. Read paths
-      report state; write paths trigger actions. Hosts the
-      Prometheus + OpenTelemetry exposition endpoints.
+- [~] **P9-CTL-1 /ctl/ synthetic FS** — in progress; multi-sub-chunk.
+      ARCHITECTURE §14.3 layout served as a 9P file tree on top of
+      the generic `stm_p9_server` (NOT `stm_9p_server` — same
+      vops mechanism janus's /keys/ uses).
+
+      - [x] **P9-CTL-1a foundation** — substantive complete.
+            `src/ctl/synfs.c` + `include/stratum/ctl.h`. Initial
+            layout:
+            ```
+            /                  dir, ro
+            /version           ro file: stratum-version, ub-version,
+                                fs-handle-version, send-version
+            /state             ro file: mounted? ro? wedged? gen,
+                                allocator counters (or `mounted: no`
+                                when fs is unattached)
+            ```
+            qid_path encodes kind in high byte (8 bits); 56 bits
+            reserved for sub-chunk extensions. Per-fid body
+            materialization at Topen via STM_CTL_BODY_MAX-bounded
+            scratch buffer; snprintf-then-check pattern. Body
+            snapshotted at Topen so concurrent Treads at varying
+            offsets see a consistent view.
+            Every node is read-only at v2.0 — Twrite returns
+            EACCES across the board. Future sub-chunks add
+            action-trigger files (e.g. `/pools/<n>/scrub`) with
+            uid-gated write paths.
+            10 tests in `tests/test_ctl.c`; ctest 42 → 43 (was
+            42 at P9-9P-4 close).
+            CLAUDE.md trigger list extended with `v2/src/ctl/`.
+            R96 audit pending.
+      - [ ] **P9-CTL-1b /pools/** — pending; per-pool status,
+            devices, datasets sub-trees.
+      - [ ] **P9-CTL-1c /datasets/** — pending; per-dataset
+            properties + stats + snapshot list + create/rollback
+            triggers.
+      - [ ] **P9-CTL-1d /tracing/, /debug/, /events** — pending;
+            tracing toggle, debug dumps, event log.
+      - [ ] **P9-CTL-1e /metrics/** — pending; Prometheus +
+            OpenTelemetry exposition.
 
 - [ ] **P9-CLI-1 stratum CLI** — pending; thin (~1000 LOC)
       wrapper over /ctl/. Subcommands: pool, dataset, snapshot,
