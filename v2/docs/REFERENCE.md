@@ -38,7 +38,24 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9-CTL-1d-scrub-read R103 close (this commit) — GREEN,
+- **Tip**: P9-CTL-1d-scrub-trigger substantive (this commit). 43
+  ctest suites green default. test_ctl 88/88 (was 80 at R103 close;
+  +8 -1d-scrub-trigger). **P9-CTL-1d-scrub-trigger** adds /pools/
+  <uuid>/scrub-trigger (admin-only mode 0200 write trigger). Body
+  parses one of four action verbs — start, pause, resume, reset —
+  trims trailing whitespace, dispatches to stm_scrub_*. Audit log
+  via stm_ctl_log_event records every attempt with uid+verb+result
+  (success OR failure). Composes against -1d-uid admin gate +
+  -1d-events audit log + -1d-scrub-read state surface. KIND_MAX = 21
+  (was 20); single new kind KIND_POOL_SCRUB_TRIGGER. R101 P2-2
+  zero-byte refusal + R101 P2-1 admin re-check at vops_write
+  carried. Whitespace-only body refused (trim leaves nothing). Verb
+  match capped at 16 chars to avoid pathological huge-buffer scans.
+  vops_open's mode-gate now lists both writable kinds explicitly —
+  this is the second writable kind, the family pattern is now
+  established. R104 audit pending.
+
+- **Pre-tip-1**: P9-CTL-1d-scrub-read R103 close — GREEN,
   0 P0 + 0 P1 + 0 P2 + 4 P3 forward-notes, all addressed inline or
   forward-noted. 43 ctest suites green default. test_ctl 80/80 (was
   71 at R102 close; +6 -1d-scrub-read + 3 R103). R103 P3-1 close:

@@ -493,10 +493,35 @@ language bindings, future kernel module) is a 9P consumer.
                   P3-3 forward-noted (Phase 8.5 detach API).
                   P3-4 tightened body-cap comment to actual computed
                   275-byte ceiling. test_ctl 77 → 80 (3 R103 tests).
-            - [ ] **P9-CTL-1d-actions** — pending; snapshot create /
-                  rollback + scrub start/pause/resume/reset write
-                  triggers. Composes against -1d-uid admin gate +
-                  -1d-events audit log + -1d-scrub-read state surface.
+            - [x] **P9-CTL-1d-scrub-trigger** — first scrub
+                  write trigger. Adds /pools/<uuid>/scrub-trigger
+                  (admin-only mode 0200). Body parses one of four
+                  action verbs (start, pause, resume, reset),
+                  trims trailing whitespace, dispatches to stm_
+                  scrub_*. Every attempt records (uid, verb, result)
+                  to /events via stm_ctl_log_event — both successful
+                  and failed dispatches. Verb match capped at 16
+                  chars to avoid pathological scans on huge bodies.
+                  R101 P2-2 (zero-byte refusal) + R101 P2-1 (admin
+                  re-check at vops_write) lessons carried. KIND_MAX
+                  = 21 (was 20); KIND_POOL_SCRUB_TRIGGER is the
+                  second writable kind. vops_open's mode-gate
+                  enumerates both writable kinds explicitly — the
+                  family pattern is now established. 8 -1d-scrub-
+                  trigger tests in test_ctl.c (80 → 88):
+                  ctl_d5_scrub_trigger_start_drives_running,
+                  ctl_d5_scrub_trigger_pause_resume_round_trip,
+                  ctl_d5_scrub_trigger_reset_before_complete_fails,
+                  ctl_d5_scrub_trigger_bogus_verb_einval,
+                  ctl_d5_scrub_trigger_zero_byte_einval,
+                  ctl_d5_scrub_trigger_whitespace_only_einval,
+                  ctl_d5_scrub_trigger_topen_nonadmin_eacces,
+                  ctl_d5_scrub_trigger_omitted_when_unattached.
+                  R104 audit pending.
+            - [ ] **P9-CTL-1d-actions-snapshot** — pending; snapshot
+                  create / rollback write triggers. Composes against
+                  -1d-uid admin gate + -1d-events audit log; R99 P2-1
+                  name-validation pattern carries.
             - [ ] **P9-CTL-1d-tracing** — pending; /tracing/enable +
                   /tracing/sample-rate + /tracing/traces (ARCH §14.6).
       - [ ] **P9-CTL-1e /metrics/** — pending; Prometheus +

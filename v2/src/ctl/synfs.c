@@ -23,6 +23,7 @@
  *   /admin/clear-events                     write: reset /events log (admin)
  *   /events                                 read: append-only event log (world)
  *   /pools/<uuid>/scrub                     read: scrub state+counters (world)
+ *   /pools/<uuid>/scrub-trigger             write: action verb (admin)
  *   /debug/                                 directory: admin-only diagnostics
  *   /debug/allocator-state/                 directory: per-device allocator state
  *   /debug/allocator-state/<device_id>      read: allocator stats (admin)
@@ -136,6 +137,7 @@ typedef enum {
     KIND_DEBUG_ALLOC_DIR      = 17,   /* /debug/allocator-state/ — per-device alloc */
     KIND_DEBUG_ALLOC          = 18,   /* /debug/allocator-state/<id> — admin-only file */
     KIND_POOL_SCRUB           = 19,   /* /pools/<uuid>/scrub — read state+counters */
+    KIND_POOL_SCRUB_TRIGGER   = 20,   /* /pools/<uuid>/scrub-trigger — admin write */
     KIND_MAX
 } ctl_kind;
 
@@ -167,6 +169,7 @@ static const ctl_kind_meta KIND_META[KIND_MAX] = {
     [KIND_DEBUG_ALLOC_DIR]    = { true,  true,  0500, "allocator-state" }, /* admin-only dir */
     [KIND_DEBUG_ALLOC]        = { false, true,  0400, NULL              }, /* admin-only, dynamic device id */
     [KIND_POOL_SCRUB]         = { false, false, 0444, "scrub"           }, /* world-readable scrub state */
+    [KIND_POOL_SCRUB_TRIGGER] = { false, true,  0200, "scrub-trigger"   }, /* admin write trigger */
 };
 
 /* R96 P3-2: pin every static-name literal length below STM_P9_NAME_MAX
@@ -192,6 +195,7 @@ _Static_assert(sizeof("allocator-state") - 1 <= STM_P9_NAME_MAX, "/ctl/ /debug/a
 /* The "scrub" literal is shared with KIND_POOL_STATUS's "status" — both
  * are 5-7 chars under STM_P9_NAME_MAX. */
 _Static_assert(sizeof("scrub") - 1     <= STM_P9_NAME_MAX, "/ctl/ /pools/.../scrub literal");
+_Static_assert(sizeof("scrub-trigger") - 1 <= STM_P9_NAME_MAX, "/ctl/ /pools/.../scrub-trigger literal");
 /* Dynamic names: pool-uuid hex (36 chars), decimal device-id (≤2
  * chars at v2.0's STM_POOL_DEVICES_MAX = 64 cap), decimal dataset-id
  * (≤9 chars at STM_SYNC_DATASET_ID_MAX = 0x0FFFFFFF ~= 268M = 9
@@ -202,7 +206,7 @@ _Static_assert(sizeof("scrub") - 1     <= STM_P9_NAME_MAX, "/ctl/ /pools/.../scr
  * KIND_META[] trips this assert at build time, even if a downstream
  * build silently suppresses -Wmissing-field-initializers. Update the
  * literal in lockstep when growing the enum. */
-_Static_assert(KIND_MAX == 20,
+_Static_assert(KIND_MAX == 21,
                "KIND_META[KIND_MAX] sized to enum cardinality; "
                "update both ctl_kind enum + KIND_META[] in lockstep");
 
@@ -1180,6 +1184,7 @@ static stm_status materialize_locked(stm_ctl *c, ctl_session *s)
     case KIND_DEBUG_ALLOC_DIR:
     case KIND_EVENTS:                 /* served direct from event_buf */
     case KIND_ADMIN_CLEAR_EVENTS:     /* write-only; no body to materialize */
+    case KIND_POOL_SCRUB_TRIGGER:     /* write-only; no body to materialize */
     case KIND_MAX:
         break;
     }
@@ -1215,7 +1220,7 @@ static stm_status stat_at(stm_ctl *c, uint64_t qid_path,
     if (k == KIND_POOLS_DIR || k == KIND_POOL_DIR
         || k == KIND_POOL_STATUS || k == KIND_DEVICES_DIR
         || k == KIND_DEVICE_DIR || k == KIND_DEVICE_STATUS
-        || k == KIND_POOL_SCRUB) {
+        || k == KIND_POOL_SCRUB || k == KIND_POOL_SCRUB_TRIGGER) {
         if (qid_pool_idx(qid_path) != 0) return STM_ENOENT;
     }
 
@@ -1233,8 +1238,12 @@ static stm_status stat_at(stm_ctl *c, uint64_t qid_path,
      * exists) AND (b) scrub attached (so we have a handle to query).
      * A pool-attached-but-no-scrub state surfaces as "scrub file
      * doesn't exist," matching the operator's intuition: "no scrub
-     * configured = no scrub file." */
-    if (k == KIND_POOL_SCRUB && (!c->pool || !c->scrub)) return STM_ENOENT;
+     * configured = no scrub file." Same gate for the trigger file:
+     * without a scrub handle there's nothing to dispatch to, so
+     * the trigger doesn't exist either. */
+    if ((k == KIND_POOL_SCRUB || k == KIND_POOL_SCRUB_TRIGGER)
+            && (!c->pool || !c->scrub))
+        return STM_ENOENT;
     if (k == KIND_DEVICE_DIR || k == KIND_DEVICE_STATUS) {
         if (!c->pool) return STM_ENOENT;
         uint32_t did = qid_device_id(qid_path);
@@ -1386,6 +1395,16 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
         if (c->scrub
               && str_eq(name, name_len, KIND_META[KIND_POOL_SCRUB].static_name))
             return stat_at(c, qid_root(KIND_POOL_SCRUB), out);
+        /* /pools/<uuid>/scrub-trigger paired with the scrub-read
+         * surface. Same conditional-dirent posture (R103 P3-2 carry):
+         * exists iff scrub handle attached. The admin gate fires at
+         * vops_open's meta->admin_required check; one-step Twalk
+         * succeeds for any caller (POSIX `stat` against an admin-
+         * only file is allowed — only open is gated). */
+        if (c->scrub
+              && str_eq(name, name_len,
+                          KIND_META[KIND_POOL_SCRUB_TRIGGER].static_name))
+            return stat_at(c, qid_root(KIND_POOL_SCRUB_TRIGGER), out);
         return STM_ENOENT;
 
     case KIND_DEVICES_DIR: {
@@ -1476,6 +1495,7 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
     case KIND_ADMIN_CLEAR_EVENTS:
     case KIND_DEBUG_ALLOC:
     case KIND_POOL_SCRUB:
+    case KIND_POOL_SCRUB_TRIGGER:
     case KIND_MAX:
         break;
     }
@@ -1543,9 +1563,15 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
         if (rc != STM_OK) return rc;
         /* Conditional: scrub entry only emitted when a scrub handle
          * is attached. Mirrors the stat_at gate so readdir + Twalk
-         * are consistent — the entry isn't visible without a scrub. */
+         * are consistent — the entry isn't visible without a scrub.
+         * The trigger entry pairs with the read entry (same scrub-
+         * attached gate) — admin-only file (mode 0200) but visible
+         * in readdir to non-admin per POSIX semantics; Tstat shows
+         * mode 0200, only Topen+Twrite gate on admin. */
         if (c->scrub) {
             rc = emit_entry(c, cb, cb_ctx, qid_root(KIND_POOL_SCRUB));
+            if (rc != STM_OK) return rc;
+            rc = emit_entry(c, cb, cb_ctx, qid_root(KIND_POOL_SCRUB_TRIGGER));
             if (rc != STM_OK) return rc;
         }
         return STM_OK;
@@ -1678,6 +1704,7 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
     case KIND_ADMIN_CLEAR_EVENTS:
     case KIND_DEBUG_ALLOC:
     case KIND_POOL_SCRUB:
+    case KIND_POOL_SCRUB_TRIGGER:
     case KIND_MAX:
         break;
     }
@@ -1692,10 +1719,15 @@ static stm_status vops_open(void *ctx, uint32_t fid, uint64_t qid_path,
     if (k == KIND_MAX) return STM_ENOENT;
     const ctl_kind_meta *meta = &KIND_META[k];
 
-    /* Mode-gating: most nodes are read-only. P9-CTL-1d-events
-     * introduces the FIRST writable kind: KIND_ADMIN_CLEAR_EVENTS
-     * accepts OWRITE (write-only, mode 0200). */
-    if (k == KIND_ADMIN_CLEAR_EVENTS) {
+    /* Mode-gating: most nodes are read-only. KIND_ADMIN_CLEAR_EVENTS
+     * (P9-CTL-1d-events) and KIND_POOL_SCRUB_TRIGGER (P9-CTL-1d-
+     * scrub-trigger) are write-only triggers (mode 0200) — accept
+     * OWRITE only. R101 P3-5 forward-note suggested folding this
+     * into `meta->mode & 0222` once the writable-kind family grew;
+     * with two writable kinds we now have the family. The explicit
+     * check below is still preferred since the kind list is small
+     * and explicit-by-kind reads more clearly than a bitmask test. */
+    if (k == KIND_ADMIN_CLEAR_EVENTS || k == KIND_POOL_SCRUB_TRIGGER) {
         if (mode != STM_P9_OWRITE) return STM_EACCES;
     } else {
         if (mode != STM_P9_OREAD) return STM_EACCES;
@@ -1751,10 +1783,12 @@ static stm_status vops_open(void *ctx, uint32_t fid, uint64_t qid_path,
     if ((k == KIND_POOL_STATUS || k == KIND_DEVICE_STATUS) && !c->pool)
         return STM_ENOENT;
     if ((k == KIND_DATASET_PROPERTIES) && !c->fs) return STM_ENOENT;
-    /* /pools/<uuid>/scrub requires both pool + scrub attached.
-     * The dual-gate posture mirrors stat_at — without scrub, the
-     * file doesn't exist (consistent operator semantics). */
-    if (k == KIND_POOL_SCRUB && (!c->pool || !c->scrub)) return STM_ENOENT;
+    /* /pools/<uuid>/scrub + /pools/<uuid>/scrub-trigger both require
+     * pool + scrub attached. The dual-gate mirrors stat_at — without
+     * scrub, the file doesn't exist (consistent operator semantics). */
+    if ((k == KIND_POOL_SCRUB || k == KIND_POOL_SCRUB_TRIGGER)
+            && (!c->pool || !c->scrub))
+        return STM_ENOENT;
     if (k == KIND_DEBUG_ALLOC) {
         if (!c->fs) return STM_ENOENT;
         uint32_t did = qid_device_id(qid_path);
@@ -1791,10 +1825,10 @@ static stm_status vops_open(void *ctx, uint32_t fid, uint64_t qid_path,
         return STM_OK;
     }
 
-    /* P9-CTL-1d-events: KIND_ADMIN_CLEAR_EVENTS allocates a session
-     * for write tracking. Body buffer unused; vops_write triggers
-     * the clear action. */
-    if (k == KIND_ADMIN_CLEAR_EVENTS) {
+    /* P9-CTL-1d-events + P9-CTL-1d-scrub-trigger: write-only trigger
+     * kinds allocate a session for write tracking. Body buffer
+     * unused; vops_write does the action dispatch. */
+    if (k == KIND_ADMIN_CLEAR_EVENTS || k == KIND_POOL_SCRUB_TRIGGER) {
         pthread_mutex_lock(&c->mu);
         ctl_session *s = session_alloc_locked(c, fid, qid_path);
         if (!s) {
@@ -1930,6 +1964,80 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
          * the action runs. */
         stm_ctl_log_event(c, "events log cleared by uid=%u",
                             (unsigned)c->caller_uid);
+        *out_written = len;
+        return STM_OK;
+    }
+
+    /* P9-CTL-1d-scrub-trigger: KIND_POOL_SCRUB_TRIGGER — second
+     * writable kind. The body holds an action verb identifying which
+     * scrub state-machine transition to drive: "start", "pause",
+     * "resume", or "reset". The verb is parsed against a fixed table;
+     * dispatch invokes the matching stm_scrub_* primitive.
+     *
+     * Carries the R101 P2-2 / P2-1 / P3-5 lessons:
+     *   (a) admin gate at vops_open's meta->admin_required (primary).
+     *   (b) defense-in-depth admin re-check at vops_write.
+     *   (c) zero-byte Twrite refusal — len == 0 is STM_EINVAL.
+     *   (d) consistent KIND_META[] mode-bit + vops_write/open
+     *       dispatch (mode_check at vops_open already handled).
+     *
+     * Audit log: every action attempt records (uid, verb, result)
+     * via stm_ctl_log_event regardless of success — so an operator
+     * reading /events sees both successful and failed dispatches.
+     * Failed dispatches return the underlying scrub_* status to the
+     * client; the audit log captures the same. */
+    if (k == KIND_POOL_SCRUB_TRIGGER) {
+        if (!ctl_caller_is_admin(c)) return STM_EACCES;
+        if (len == 0) return STM_EINVAL;
+        if (!c->scrub) return STM_EBACKEND;     /* gated at vops_open */
+        pthread_mutex_lock(&c->mu);
+        ctl_session *s = session_get_locked(c, fid);
+        if (!s || s->qid_path != qid_path) {
+            pthread_mutex_unlock(&c->mu);
+            return STM_EBACKEND;
+        }
+        pthread_mutex_unlock(&c->mu);
+
+        /* Trim trailing whitespace + newline. The verb table is
+         * matched against the trimmed slice. Bound the comparison
+         * length to avoid pathological huge-buffer strncmp scans —
+         * the longest verb is "resume" (6 chars). */
+        size_t end = len;
+        while (end > 0) {
+            uint8_t ch = ((const uint8_t *)buf)[end - 1];
+            if (ch != '\n' && ch != '\r' && ch != ' ' && ch != '\t')
+                break;
+            end--;
+        }
+        if (end == 0) return STM_EINVAL;     /* whitespace-only body */
+
+        /* Cap the verb length at 16 so a malicious 1 GiB body doesn't
+         * cause us to scan unbounded memory. The longest legitimate
+         * verb is 6 chars; anything past 16 is definitely garbage. */
+        size_t cmp_len = (end > 16) ? 16 : end;
+
+        const char *verb_str = NULL;
+        stm_status (*verb_op)(stm_scrub *) = NULL;
+        if (cmp_len == 5 && memcmp(buf, "start", 5) == 0) {
+            verb_str = "start"; verb_op = stm_scrub_start;
+        } else if (cmp_len == 5 && memcmp(buf, "pause", 5) == 0) {
+            verb_str = "pause"; verb_op = stm_scrub_pause;
+        } else if (cmp_len == 6 && memcmp(buf, "resume", 6) == 0) {
+            verb_str = "resume"; verb_op = stm_scrub_resume;
+        } else if (cmp_len == 5 && memcmp(buf, "reset", 5) == 0) {
+            verb_str = "reset"; verb_op = stm_scrub_reset;
+        } else {
+            /* Unknown verb. Log + refuse. */
+            stm_ctl_log_event(c, "scrub-trigger uid=%u verb=<unknown> result=einval",
+                                (unsigned)c->caller_uid);
+            return STM_EINVAL;
+        }
+
+        stm_status rc = verb_op(c->scrub);
+        stm_ctl_log_event(c, "scrub-trigger uid=%u verb=%s result=%s",
+                            (unsigned)c->caller_uid, verb_str,
+                            rc == STM_OK ? "ok" : "err");
+        if (rc != STM_OK) return rc;
         *out_written = len;
         return STM_OK;
     }

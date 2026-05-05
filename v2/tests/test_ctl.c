@@ -3340,4 +3340,346 @@ STM_TEST(ctl_r103_p3_1_scrub_tstat_reports_0444)
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
 
+/* ── P9-CTL-1d-scrub-trigger /pools/<uuid>/scrub-trigger ─────────── */
+
+/* Helper: format the live pool's UUID hex into `out` (sized for 37
+ * chars including NUL). Used by every scrub-trigger test that needs
+ * to address /pools/<uuid>/. */
+static void format_pool_uuid_hex(stm_pool *pool, char out[64])
+{
+    const uint64_t *uuid_words = stm_pool_uuid(pool);
+    uint8_t uuid_b[16];
+    for (size_t i = 0; i < 8; i++) {
+        uuid_b[i]     = (uint8_t)(uuid_words[0] >> (i * 8));
+        uuid_b[i + 8] = (uint8_t)(uuid_words[1] >> (i * 8));
+    }
+    static const char hexd[] = "0123456789abcdef";
+    size_t pp = 0;
+    for (size_t i = 0; i < 16; i++) {
+        out[pp++] = hexd[uuid_b[i] >> 4];
+        out[pp++] = hexd[uuid_b[i] & 0xF];
+        if (i == 3 || i == 5 || i == 7 || i == 9) out[pp++] = '-';
+    }
+    out[pp] = '\0';
+}
+
+/* Fixture for scrub-trigger tests: real fs + sync + pool + scrub +
+ * /ctl/ all wired. Caller drains via destroy_scrub_trigger_fixture. */
+typedef struct {
+    stm_fs        *fs;
+    stm_scrub     *sc;
+    stm_pool      *pool;
+    stm_ctl       *c;
+    stm_p9_server *s;
+    char           uuid_hex[64];
+} scrub_trigger_fixture;
+
+static scrub_trigger_fixture make_scrub_trigger_fixture(const char *tag, uid_t uid)
+{
+    scrub_trigger_fixture f = {0};
+    make_tmp(tag);
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &f.fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(f.fs);
+    STM_ASSERT(sync != NULL);
+    f.pool = stm_sync_pool(sync);
+    STM_ASSERT(f.pool != NULL);
+    STM_ASSERT_OK(stm_scrub_create(sync, &f.sc));
+
+    STM_ASSERT_OK(stm_ctl_create(f.fs, &f.c));
+    STM_ASSERT_OK(stm_ctl_attach_pool(f.c, f.pool));
+    STM_ASSERT_OK(stm_ctl_attach_scrub(f.c, f.sc));
+    STM_ASSERT_OK(stm_ctl_set_caller(f.c, uid, uid));
+
+    f.s = make_ctl_server(f.c);
+    do_handshake(f.s, 10);
+
+    format_pool_uuid_hex(f.pool, f.uuid_hex);
+    return f;
+}
+
+static void destroy_scrub_trigger_fixture(scrub_trigger_fixture f)
+{
+    stm_p9_server_destroy(f.s);
+    stm_ctl_destroy(f.c);
+    stm_scrub_close(f.sc);
+    STM_ASSERT_OK(stm_fs_unmount(f.fs));
+}
+
+/* Walk + open the trigger file under the given fid; helper for the
+ * happy-path tests. */
+static void open_scrub_trigger(scrub_trigger_fixture *f, uint16_t tag,
+                                  uint32_t fid)
+{
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "pools", f->uuid_hex, "scrub-trigger" };
+    uint32_t sz = build_twalk(req, tag, 10, fid, 3, path);
+    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    sz = build_topen(req, (uint16_t)(tag + 1), fid, STM_P9_OWRITE);
+    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+}
+
+/* Read scrub state (via /pools/<uuid>/scrub) into body[]. Returns
+ * the read byte count. Tests use this to assert state transitions. */
+static uint32_t read_scrub_state(scrub_trigger_fixture *f, uint16_t tag,
+                                    uint32_t fid, char *body, size_t cap)
+{
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "pools", f->uuid_hex, "scrub" };
+    uint32_t sz = build_twalk(req, tag, 10, fid, 3, path);
+    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, (uint16_t)(tag + 1), fid, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_tread(req, (uint16_t)(tag + 2), fid, 0, (uint32_t)(cap - 1));
+    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    uint32_t count = load_u32(resp + 7);
+    STM_ASSERT(count < cap);
+    memcpy(body, resp + 11, count);
+    body[count] = '\0';
+    /* Clunk the read fid so we can reuse the slot. */
+    sz = build_tclunk(req, (uint16_t)(tag + 3), fid);
+    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    return count;
+}
+
+/* admin "start" → state RUNNING + /events records the action. */
+STM_TEST(ctl_d5_scrub_trigger_start_drives_running)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_d5_start", 0);
+    open_scrub_trigger(&f, 2, 11);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    uint32_t sz = build_twrite(req, 4, 11, 0, "start", 5);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWRITE);
+    /* Server returns the byte count written. */
+    STM_ASSERT_EQ(load_u32(resp + 7), 5u);
+
+    char body[1024];
+    read_scrub_state(&f, 5, 12, body, sizeof body);
+    STM_ASSERT(strstr(body, "state: running\n") != NULL);
+
+    /* Audit log captures the action. */
+    const char *epath[] = { "events" };
+    sz = build_twalk(req, 9, 10, 13, 1, epath);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 10, 13, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_tread(req, 11, 13, 0, 8192);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    uint32_t count = load_u32(resp + 7);
+    char ebody[8192];
+    STM_ASSERT(count < sizeof ebody);
+    memcpy(ebody, resp + 11, count);
+    ebody[count] = '\0';
+    STM_ASSERT(strstr(ebody, "scrub-trigger uid=0 verb=start result=ok") != NULL);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* admin "pause" + "resume" round-trip drives RUNNING → PAUSED → RUNNING. */
+STM_TEST(ctl_d5_scrub_trigger_pause_resume_round_trip)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_d5_pr", 0);
+    open_scrub_trigger(&f, 2, 11);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    /* start */
+    uint32_t sz = build_twrite(req, 4, 11, 0, "start", 5);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWRITE);
+
+    char body[1024];
+    /* pause: trailing newline must be stripped */
+    sz = build_twrite(req, 5, 11, 0, "pause\n", 6);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWRITE);
+    read_scrub_state(&f, 6, 12, body, sizeof body);
+    STM_ASSERT(strstr(body, "state: paused\n") != NULL);
+
+    /* resume */
+    sz = build_twrite(req, 10, 11, 0, "resume", 6);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWRITE);
+    read_scrub_state(&f, 11, 13, body, sizeof body);
+    STM_ASSERT(strstr(body, "state: running\n") != NULL);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* "reset" while not COMPLETED returns RERROR (stm_scrub_reset's
+ * STM_EINVAL contract). The audit log records the failure. */
+STM_TEST(ctl_d5_scrub_trigger_reset_before_complete_fails)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_d5_reset", 0);
+    open_scrub_trigger(&f, 2, 11);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    /* IDLE → reset → STM_EINVAL (only COMPLETED → IDLE is valid). */
+    uint32_t sz = build_twrite(req, 4, 11, 0, "reset", 5);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* Audit log records the failed dispatch. */
+    const char *epath[] = { "events" };
+    sz = build_twalk(req, 5, 10, 12, 1, epath);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 6, 12, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_tread(req, 7, 12, 0, 8192);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    uint32_t count = load_u32(resp + 7);
+    char ebody[8192];
+    memcpy(ebody, resp + 11, count);
+    ebody[count] = '\0';
+    STM_ASSERT(strstr(ebody, "scrub-trigger uid=0 verb=reset result=err") != NULL);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* Bogus verb returns RERROR; audit log marks it as <unknown>. */
+STM_TEST(ctl_d5_scrub_trigger_bogus_verb_einval)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_d5_bogus", 0);
+    open_scrub_trigger(&f, 2, 11);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    uint32_t sz = build_twrite(req, 4, 11, 0, "frobnicate", 10);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* Audit log: <unknown> verb form. */
+    const char *epath[] = { "events" };
+    sz = build_twalk(req, 5, 10, 12, 1, epath);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 6, 12, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_tread(req, 7, 12, 0, 8192);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    uint32_t count = load_u32(resp + 7);
+    char ebody[8192];
+    memcpy(ebody, resp + 11, count);
+    ebody[count] = '\0';
+    STM_ASSERT(strstr(ebody, "scrub-trigger uid=0 verb=<unknown>") != NULL);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* R101 P2-2 carry: 0-byte Twrite refused with RERROR. */
+STM_TEST(ctl_d5_scrub_trigger_zero_byte_einval)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_d5_zero", 0);
+    open_scrub_trigger(&f, 2, 11);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    uint32_t sz = build_twrite(req, 4, 11, 0, "", 0);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* Whitespace-only body refused (trim leaves nothing). */
+STM_TEST(ctl_d5_scrub_trigger_whitespace_only_einval)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_d5_ws", 0);
+    open_scrub_trigger(&f, 2, 11);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    uint32_t sz = build_twrite(req, 4, 11, 0, "  \n\t\r", 5);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* Non-admin Topen refused with EACCES (admin gate at vops_open's
+ * meta->admin_required). Walk to the trigger succeeds (POSIX
+ * `stat /pools/<uuid>/scrub-trigger` is allowed for any caller). */
+STM_TEST(ctl_d5_scrub_trigger_topen_nonadmin_eacces)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_d5_nadm", 1000);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "pools", f.uuid_hex, "scrub-trigger" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 3, path);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);   /* walk succeeds */
+
+    /* Topen for OWRITE rejected by the admin gate. */
+    sz = build_topen(req, 3, 11, STM_P9_OWRITE);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* Mode != OWRITE also rejected — file is write-only. */
+    sz = build_topen(req, 4, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* Trigger entry omitted from /pools/<uuid>/ readdir when scrub is
+ * not attached (same conditional-dirent posture as the read entry). */
+STM_TEST(ctl_d5_scrub_trigger_omitted_when_unattached)
+{
+    ctl_pool_fixture f = make_test_pool();
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
+
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "pools", CTL_TEST_POOL_UUID_HEX };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_tread(req, 4, 11, 0, 8192);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    uint32_t count = load_u32(resp + 7);
+
+    int saw_trigger = 0;
+    const uint8_t *q = resp + 11;
+    const uint8_t *end = q + count;
+    while (q < end) {
+        uint16_t inner = load_u16(q);
+        const uint8_t *rec = q + 2;
+        const uint8_t *np = rec + 2 + 4 + 13 + 4 + 4 + 4 + 8;
+        uint16_t nl = load_u16(np);
+        const char *nm = (const char *)(np + 2);
+        if (nl == 13 && memcmp(nm, "scrub-trigger", 13) == 0) saw_trigger = 1;
+        q += 2 + inner;
+    }
+    STM_ASSERT_TRUE(!saw_trigger);
+
+    /* Walk to scrub-trigger: RERROR. */
+    const char *spath[] = { "pools", CTL_TEST_POOL_UUID_HEX, "scrub-trigger" };
+    sz = build_twalk(req, 5, 10, 12, 3, spath);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+    destroy_test_pool(f);
+}
+
 STM_TEST_MAIN("ctl")
