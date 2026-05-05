@@ -3564,4 +3564,178 @@ STM_TEST(p9_pin_unpin_return_enosys) {
     unlink(g_key_path);
 }
 
+/* ── R94 regression tests ─────────────────────────────────────────── */
+
+/* R94 P3-2: Treflink with src_fid == dst_fid must refuse with EINVAL.
+ * stm_fs_reflink at the fs layer self-checks for src==dst; the wire
+ * wrapper forwards the EINVAL. Pins the wire-error mapping so a
+ * future fs-layer regression in this corner is caught at the 9P
+ * boundary. */
+STM_TEST(p9_r94_p3_2_reflink_src_eq_dst_returns_einval) {
+    make_tmp("9p_r94_p3_2");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)mk_file(fs, root, "f");
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "f");
+
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    /* Treflink(101, 101): same fid both sides → EINVAL. */
+    uint32_t sz = build_treflink(req, 1, 101, 101);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EINVAL);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* R94 P3-3: Treflink against a non-empty dst must refuse with EEXIST.
+ * stm_fs_reflink contract requires "caller MUST clear dst first";
+ * non-empty dst → STM_EEXIST → wire EEXIST. */
+STM_TEST(p9_r94_p3_3_reflink_non_empty_dst_returns_eexist) {
+    make_tmp("9p_r94_p3_3");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    /* Both src and dst have extent content (4 KiB each, same value
+     * pattern). dst already has data → reflink refuses. */
+    uint64_t src_ino = mk_file(fs, root, "src");
+    uint64_t dst_ino = mk_file(fs, root, "dst");
+    uint8_t buf[4096];
+    for (size_t i = 0; i < sizeof buf; i++) buf[i] = (uint8_t)(i & 0xFF);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, src_ino, 0, buf, sizeof buf));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, dst_ino, 0, buf, sizeof buf));
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "src");
+    walk_to(s, 100, 102, "dst");
+
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    uint32_t sz = build_treflink(req, 1, 101, 102);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EEXIST);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* R94 P3-4a: Tsync on a wedged fs returns EIO. */
+STM_TEST(p9_r94_p3_4_sync_on_wedged_returns_eio) {
+    make_tmp("9p_r94_p3_4_wedged");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+
+    stm_fs_mark_wedged(fs);
+
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    uint32_t sz = build_tsync(req, 1);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EIO);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* R94 P3-4b: Tsync on a read-only mount returns EROFS. */
+STM_TEST(p9_r94_p3_4_sync_on_readonly_returns_erofs) {
+    make_tmp("9p_r94_p3_4_ro");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    /* Pre-init root dir under RW so the fs has a valid root. */
+    stm_fs_mount_opts rw = rw_mount_opts();
+    stm_fs *fs_rw = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &rw, &fs_rw));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs_rw, &root);
+    STM_ASSERT_OK(stm_fs_unmount(fs_rw));
+
+    /* Re-mount RO. */
+    stm_fs_mount_opts ro = rw_mount_opts();
+    ro.read_only = true;
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &ro, &fs));
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    uint32_t sz = build_tsync(req, 1);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EROFS);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* R94 P3-5: Tfallocate with PUNCH_HOLE missing the required KEEP_SIZE
+ * companion flag must refuse with EINVAL (fs-layer combination check).
+ * Per stm_fs_fallocate: PUNCH_HOLE without KEEP_SIZE → STM_EINVAL. */
+STM_TEST(p9_r94_p3_5_fallocate_punch_without_keep_size_returns_einval) {
+    make_tmp("9p_r94_p3_5");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)mk_file(fs, root, "f");
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "f");
+
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    /* PUNCH_HOLE alone (no KEEP_SIZE) — EINVAL at the fs layer. */
+    uint32_t sz = build_tfallocate(req, 1, 101,
+                                      STM_9P_FALLOC_FL_PUNCH_HOLE,
+                                      0u, 4096u);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EINVAL);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("9p")

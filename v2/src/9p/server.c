@@ -3179,9 +3179,20 @@ static stm_status h_sync(stm_9p_server *s,
 /*                                                                         */
 /* FICLONE-shape: both src_fid and dst_fid are existing NODE fids; dst   */
 /* MUST be empty (stm_fs_reflink contract). On success, dst's content    */
-/* shares src's extents via refcount; dst's qid version (= si_gen) and   */
-/* size both update — Rreflink returns the post-commit qid so the client */
-/* can refresh its cache. Cross-dataset is STM_EXDEV per stm_fs_reflink. */
+/* shares src's extents via refcount; dst's si_size + si_data_kind +     */
+/* mtime + ctime update. Cross-dataset is STM_EXDEV per stm_fs_reflink.  */
+/*                                                                         */
+/* Caveat (R94 P3-1): dst's si_gen does NOT bump on reflink — stm_inode_ */
+/* set enforces gen-unchanged, and only the inode allocator (free + ino  */
+/* reuse) increments gen. Consequently the Rreflink-returned qid carries */
+/* the SAME version as before reflink, and a v9fs client that keys cache */
+/* invalidation on qid.version may serve stale bytes from a fd open at   */
+/* reflink time. POSIX FICLONE expects post-clone reads to see new       */
+/* content; this is a known v9fs cache-coherence concern, forward-noted  */
+/* for v2.1+ (would need an inode.tla extension to model "content swap   */
+/* without gen bump" before the impl can safely add a gen-incrementing   */
+/* path through the allocator). Clients that re-open dst after reflink   */
+/* see the new content (fresh stm_fs_stat).                               */
 /* ────────────────────────────────────────────────────────────────────── */
 
 static stm_status h_reflink(stm_9p_server *s,
@@ -3567,7 +3578,17 @@ stm_status stm_9p_server_handle(stm_9p_server *s,
         /* Pinned-snapshot read view (ARCH §3.3.2) — needs MVCC reader
          * infra in stm_fs that v2.0 doesn't have yet. Wire opcodes
          * reserved; runtime returns ENOSYS until the reader-pin API
-         * lands. */
+         * lands.
+         *
+         * R94 P3-6 forward-note: when the implementation lands, MOVE
+         * Tpin / Tunpin OUT of this reserved-opcode case and into
+         * proper handler functions (h_pin / h_unpin) with explicit
+         * body validation (Tpin's wire body is reserved as `fid[4]`
+         * per the ARCH §3.3.2 sketch but not currently consumed —
+         * the dispatcher silently ignores body bytes). The handler
+         * MUST validate body_len, fid existence + kind == NODE +
+         * verify_fid_fresh before accepting, matching the discipline
+         * of every other fid-bound handler. */
         rc = reply_rlerror(resp, resp_cap, resp_len, tag,
                               STM_9P_ECODE_ENOSYS);
         break;
