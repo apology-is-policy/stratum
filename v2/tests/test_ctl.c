@@ -1548,4 +1548,200 @@ STM_TEST(ctl_c1_dataset_properties_write_rejected)
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
 
+/* ── P9-CTL-1d-uid /admin/ admin gate ────────────────────────────── */
+
+STM_TEST(ctl_d1_admin_dir_listed_to_all)
+{
+    /* /admin/ is mode 0500 — non-admin Topen of the dir refused, but
+     * the dirent for /admin/ IS listed in the root readdir for any
+     * caller (admin or not). Same posture as POSIX root + 0500 dir. */
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    /* Caller is unset → non-admin. */
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    uint32_t sz = build_topen(req, 2, 10, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+
+    sz = build_tread(req, 3, 10, 0, 8192);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    uint32_t count = load_u32(resp + 7);
+    STM_ASSERT(count > 0);
+
+    int saw_admin = 0;
+    const uint8_t *q = resp + 11;
+    const uint8_t *end = q + count;
+    while (q < end) {
+        uint16_t inner = load_u16(q);
+        const uint8_t *rec = q + 2;
+        const uint8_t *np = rec + 2 + 4 + 13 + 4 + 4 + 4 + 8;
+        uint16_t nl = load_u16(np);
+        const char *nm = (const char *)(np + 2);
+        if (nl == 5 && memcmp(nm, "admin", 5) == 0) saw_admin = 1;
+        q += 2 + inner;
+    }
+    STM_ASSERT_TRUE(saw_admin);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
+STM_TEST(ctl_d1_admin_topen_nonadmin_eacces)
+{
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    /* No set_caller → caller_uid is unset (sentinel) → non-admin. */
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "admin" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 1, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    /* Walk succeeds — stat doesn't admin-gate; only Topen does. */
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
+STM_TEST(ctl_d1_admin_peer_admin_succeeds)
+{
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    /* Stamp uid 0 → admin per the v2.0 baseline policy. */
+    STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "admin", "peer" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+
+    sz = build_tread(req, 4, 11, 0, 4096);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    uint32_t count = load_u32(resp + 7);
+    STM_ASSERT(count > 0);
+
+    char body[1024];
+    STM_ASSERT(count < sizeof body);
+    memcpy(body, resp + 11, count);
+    body[count] = '\0';
+
+    STM_ASSERT(strstr(body, "caller-uid: 0\n")  != NULL);
+    STM_ASSERT(strstr(body, "caller-gid: 0\n")  != NULL);
+    STM_ASSERT(strstr(body, "is-admin: yes\n")  != NULL);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
+STM_TEST(ctl_d1_admin_peer_nonroot_admin_via_admin_uid)
+{
+    /* Non-root admin: caller_uid = 1000, admin_uid = 1000 → admin. */
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    STM_ASSERT_OK(stm_ctl_set_admin_uid(c, 1000));
+    STM_ASSERT_OK(stm_ctl_set_caller(c, 1000, 1000));
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "admin", "peer" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+
+    sz = build_tread(req, 4, 11, 0, 4096);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    uint32_t count = load_u32(resp + 7);
+    STM_ASSERT(count > 0);
+
+    char body[1024];
+    memcpy(body, resp + 11, count);
+    body[count] = '\0';
+
+    STM_ASSERT(strstr(body, "caller-uid: 1000\n")  != NULL);
+    STM_ASSERT(strstr(body, "admin-uid: 1000\n")   != NULL);
+    STM_ASSERT(strstr(body, "is-admin: yes\n")     != NULL);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
+STM_TEST(ctl_d1_admin_peer_nonadmin_eacces)
+{
+    /* Non-admin caller: uid 1000, no admin_uid set → uid 0 only is admin. */
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    STM_ASSERT_OK(stm_ctl_set_caller(c, 1000, 1000));
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "admin", "peer" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
+STM_TEST(ctl_d1_admin_peer_unset_caller_eacces)
+{
+    /* Caller never stamped (the (uid_t)-1 sentinel) → non-admin. */
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    /* Note: we deliberately DO NOT call stm_ctl_set_caller. */
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "admin", "peer" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
+STM_TEST(ctl_d1_set_caller_null_rejected)
+{
+    /* Defensive: NULL stm_ctl → STM_EINVAL. */
+    STM_ASSERT_ERR(stm_ctl_set_caller(NULL, 0, 0), STM_EINVAL);
+    STM_ASSERT_ERR(stm_ctl_set_admin_uid(NULL, 0), STM_EINVAL);
+}
+
 STM_TEST_MAIN("ctl")

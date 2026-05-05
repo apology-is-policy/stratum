@@ -89,6 +89,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>      /* uid_t, gid_t */
 
 /* ── kind enum + meta table ─────────────────────────────────────────── */
 
@@ -105,28 +106,33 @@ typedef enum {
     KIND_DATASETS_DIR       = 9,    /* /datasets/ */
     KIND_DATASET_DIR        = 10,   /* /datasets/<id>/ */
     KIND_DATASET_PROPERTIES = 11,   /* /datasets/<id>/properties */
+    KIND_ADMIN_DIR          = 12,   /* /admin/ — admin-only directory */
+    KIND_ADMIN_PEER         = 13,   /* /admin/peer — admin-only file */
     KIND_MAX
 } ctl_kind;
 
 typedef struct {
     bool         is_dir;
+    bool         admin_required; /* P9-CTL-1d-uid: admin-only access */
     uint32_t     mode;          /* posix mode bits, sans STM_P9_DMDIR */
     const char  *static_name;   /* NULL when name is dynamic (e.g. UUID) */
 } ctl_kind_meta;
 
 static const ctl_kind_meta KIND_META[KIND_MAX] = {
-    [KIND_ROOT]               = { true,  0555, "/"          },
-    [KIND_VERSION]            = { false, 0444, "version"    },
-    [KIND_STATE]              = { false, 0444, "state"      },
-    [KIND_POOLS_DIR]          = { true,  0555, "pools"      },
-    [KIND_POOL_DIR]           = { true,  0555, NULL         },  /* dynamic uuid */
-    [KIND_POOL_STATUS]        = { false, 0444, "status"     },
-    [KIND_DEVICES_DIR]        = { true,  0555, "devices"    },
-    [KIND_DEVICE_DIR]         = { true,  0555, NULL         },  /* dynamic device id */
-    [KIND_DEVICE_STATUS]      = { false, 0444, "status"     },
-    [KIND_DATASETS_DIR]       = { true,  0555, "datasets"   },
-    [KIND_DATASET_DIR]        = { true,  0555, NULL         },  /* dynamic dataset id */
-    [KIND_DATASET_PROPERTIES] = { false, 0444, "properties" },
+    [KIND_ROOT]               = { true,  false, 0555, "/"          },
+    [KIND_VERSION]            = { false, false, 0444, "version"    },
+    [KIND_STATE]              = { false, false, 0444, "state"      },
+    [KIND_POOLS_DIR]          = { true,  false, 0555, "pools"      },
+    [KIND_POOL_DIR]           = { true,  false, 0555, NULL         },  /* dynamic uuid */
+    [KIND_POOL_STATUS]        = { false, false, 0444, "status"     },
+    [KIND_DEVICES_DIR]        = { true,  false, 0555, "devices"    },
+    [KIND_DEVICE_DIR]         = { true,  false, 0555, NULL         },  /* dynamic device id */
+    [KIND_DEVICE_STATUS]      = { false, false, 0444, "status"     },
+    [KIND_DATASETS_DIR]       = { true,  false, 0555, "datasets"   },
+    [KIND_DATASET_DIR]        = { true,  false, 0555, NULL         },  /* dynamic dataset id */
+    [KIND_DATASET_PROPERTIES] = { false, false, 0444, "properties" },
+    [KIND_ADMIN_DIR]          = { true,  true,  0500, "admin"      },  /* admin-only dir */
+    [KIND_ADMIN_PEER]         = { false, true,  0400, "peer"       },  /* admin-only file */
 };
 
 /* R96 P3-2: pin every static-name literal length below STM_P9_NAME_MAX
@@ -143,6 +149,8 @@ _Static_assert(sizeof("status") - 1   <= STM_P9_NAME_MAX, "/ctl/ /pools/.../stat
 _Static_assert(sizeof("devices") - 1   <= STM_P9_NAME_MAX, "/ctl/ /pools/.../devices literal");
 _Static_assert(sizeof("datasets") - 1  <= STM_P9_NAME_MAX, "/ctl/ /datasets literal");
 _Static_assert(sizeof("properties") - 1 <= STM_P9_NAME_MAX, "/ctl/ /datasets/.../properties literal");
+_Static_assert(sizeof("admin") - 1     <= STM_P9_NAME_MAX, "/ctl/ /admin literal");
+_Static_assert(sizeof("peer") - 1      <= STM_P9_NAME_MAX, "/ctl/ /admin/peer literal");
 /* Dynamic names: pool-uuid hex (36 chars), decimal device-id (≤2
  * chars at v2.0's STM_POOL_DEVICES_MAX = 64 cap), decimal dataset-id
  * (≤9 chars at STM_SYNC_DATASET_ID_MAX = 0x0FFFFFFF ~= 268M = 9
@@ -152,7 +160,7 @@ _Static_assert(sizeof("properties") - 1 <= STM_P9_NAME_MAX, "/ctl/ /datasets/...
  * KIND_META[] trips this assert at build time, even if a downstream
  * build silently suppresses -Wmissing-field-initializers. Update the
  * literal in lockstep when growing the enum. */
-_Static_assert(KIND_MAX == 12,
+_Static_assert(KIND_MAX == 14,
                "KIND_META[KIND_MAX] sized to enum cardinality; "
                "update both ctl_kind enum + KIND_META[] in lockstep");
 
@@ -244,9 +252,31 @@ typedef struct ctl_session {
 struct stm_ctl {
     struct stm_fs   *fs;             /* may be NULL (unattached) */
     struct stm_pool *pool;           /* may be NULL (no pool attached) */
+    /* P9-CTL-1d-uid: peer credentials + admin policy. Set by
+     * stratumd via stm_ctl_set_caller / stm_ctl_set_admin_uid
+     * BEFORE the first stm_p9_server_handle invocation; not
+     * mu-protected on read paths. */
+    uid_t            caller_uid;     /* (uid_t)-1 = unset */
+    gid_t            caller_gid;     /* (gid_t)-1 = unset */
+    uid_t            admin_uid;      /* (uid_t)-1 = no daemon-euid admin */
     pthread_mutex_t  mu;             /* guards sessions[] only */
     ctl_session      sessions[STM_CTL_MAX_SESSIONS];
 };
+
+/* P9-CTL-1d-uid: admin gate. Permits a caller iff:
+ *   caller_uid == 0           (root)
+ *   OR caller_uid == admin_uid (typically the daemon's effective uid)
+ * The default unset states are caller_uid = (uid_t)-1 and admin_uid =
+ * (uid_t)-1, which deny admin access. Explicit "uid 0 is admin" is
+ * the v2.0 baseline policy; future configurable allowlist deferred. */
+static bool ctl_caller_is_admin(const stm_ctl *c)
+{
+    if (c->caller_uid == (uid_t)-1) return false;
+    if (c->caller_uid == 0) return true;
+    if (c->admin_uid != (uid_t)-1 && c->caller_uid == c->admin_uid)
+        return true;
+    return false;
+}
 
 static ctl_session *session_get_locked(stm_ctl *c, uint32_t fid)
 {
@@ -821,6 +851,32 @@ static stm_status materialize_dataset_properties(stm_ctl *c, ctl_session *s)
     return STM_OK;
 }
 
+/* Materialize /admin/peer — exposes the connecting client's uid/gid
+ * + admin status as observed by the daemon. Read-only; admin-only
+ * (vops_open enforces).
+ *
+ * Useful operationally: an admin running `cat /ctl/admin/peer` can
+ * confirm "the daemon sees me as uid X / gid Y / admin=yes" before
+ * trying privileged operations. Distinguishes "admin gate refused
+ * because I'm not admin" from "the daemon thinks my uid is wrong"
+ * (e.g., SO_PEERCRED returned the wrong identity). */
+static stm_status materialize_admin_peer(stm_ctl *c, ctl_session *s)
+{
+    int n = snprintf((char *)s->buf, sizeof s->buf,
+        "caller-uid: %u\n"
+        "caller-gid: %u\n"
+        "admin-uid: %u\n"
+        "is-admin: %s\n",
+        (unsigned)c->caller_uid,
+        (unsigned)c->caller_gid,
+        (unsigned)c->admin_uid,
+        ctl_caller_is_admin(c) ? "yes" : "no");
+    if (n < 0) return STM_EIO;
+    if ((size_t)n >= sizeof s->buf) return STM_ERANGE;
+    s->len = (uint32_t)n;
+    return STM_OK;
+}
+
 static stm_status materialize_locked(stm_ctl *c, ctl_session *s)
 {
     switch (qid_kind(s->qid_path)) {
@@ -829,6 +885,7 @@ static stm_status materialize_locked(stm_ctl *c, ctl_session *s)
     case KIND_POOL_STATUS:        return materialize_pool_status(c, s);
     case KIND_DEVICE_STATUS:      return materialize_device_status(c, s);
     case KIND_DATASET_PROPERTIES: return materialize_dataset_properties(c, s);
+    case KIND_ADMIN_PEER:         return materialize_admin_peer(c, s);
     case KIND_ROOT:
     case KIND_POOLS_DIR:
     case KIND_POOL_DIR:
@@ -836,6 +893,7 @@ static stm_status materialize_locked(stm_ctl *c, ctl_session *s)
     case KIND_DEVICE_DIR:
     case KIND_DATASETS_DIR:
     case KIND_DATASET_DIR:
+    case KIND_ADMIN_DIR:
     case KIND_MAX:
         break;
     }
@@ -978,6 +1036,8 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
             return stat_at(c, qid_root(KIND_POOLS_DIR), out);
         if (str_eq(name, name_len, KIND_META[KIND_DATASETS_DIR].static_name))
             return stat_at(c, qid_root(KIND_DATASETS_DIR), out);
+        if (str_eq(name, name_len, KIND_META[KIND_ADMIN_DIR].static_name))
+            return stat_at(c, qid_root(KIND_ADMIN_DIR), out);
         return STM_ENOENT;
 
     case KIND_POOLS_DIR: {
@@ -1029,11 +1089,17 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
                         out);
     }
 
+    case KIND_ADMIN_DIR:
+        if (str_eq(name, name_len, KIND_META[KIND_ADMIN_PEER].static_name))
+            return stat_at(c, qid_root(KIND_ADMIN_PEER), out);
+        return STM_ENOENT;
+
     case KIND_VERSION:
     case KIND_STATE:
     case KIND_POOL_STATUS:
     case KIND_DEVICE_STATUS:
     case KIND_DATASET_PROPERTIES:
+    case KIND_ADMIN_PEER:
     case KIND_MAX:
         break;
     }
@@ -1068,7 +1134,14 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
          * readdir simply returns empty. R99 P3-1 — earlier comment
          * here contradicted the code; rewritten to reflect the
          * actual always-listed semantics. */
-        return emit_entry(c, cb, cb_ctx, qid_root(KIND_DATASETS_DIR));
+        rc = emit_entry(c, cb, cb_ctx, qid_root(KIND_DATASETS_DIR));
+        if (rc != STM_OK) return rc;
+        /* /admin/ is always-listed at the dir level (mode 0500
+         * conveys "admin-only"; non-admin readdir of root SEES the
+         * /admin dirent but Topen on it returns EACCES). Same
+         * posture as POSIX root + 0500 dir: existence is visible,
+         * contents aren't. */
+        return emit_entry(c, cb, cb_ctx, qid_root(KIND_ADMIN_DIR));
 
     case KIND_POOLS_DIR:
         /* Enumerate registered pools. v2.0: at most one pool. */
@@ -1157,11 +1230,15 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
             qid_of(KIND_DATASET_PROPERTIES, 0, (uint32_t)dsid));
     }
 
+    case KIND_ADMIN_DIR:
+        return emit_entry(c, cb, cb_ctx, qid_root(KIND_ADMIN_PEER));
+
     case KIND_VERSION:
     case KIND_STATE:
     case KIND_POOL_STATUS:
     case KIND_DEVICE_STATUS:
     case KIND_DATASET_PROPERTIES:
+    case KIND_ADMIN_PEER:
     case KIND_MAX:
         break;
     }
@@ -1178,6 +1255,16 @@ static stm_status vops_open(void *ctx, uint32_t fid, uint64_t qid_path,
 
     /* Mode-gating: every node is read-only at v2.0. */
     if (mode != STM_P9_OREAD) return STM_EACCES;
+
+    /* P9-CTL-1d-uid: admin gate. Refuse non-admin Topen on
+     * admin-only kinds with EACCES. The check happens BEFORE the
+     * per-kind validity gates (e.g., dataset-still-PRESENT) so a
+     * non-admin probing the existence of /admin/peer cannot
+     * distinguish "EACCES because not admin" from "ENOENT because
+     * the path doesn't exist" — same defensive posture as POSIX
+     * mode 0500 directories. */
+    if (meta->admin_required && !ctl_caller_is_admin(c))
+        return STM_EACCES;
 
     /* Directories: open is advisory; readdir handles iteration. */
     if (meta->is_dir) {
@@ -1314,7 +1401,29 @@ stm_status stm_ctl_create(struct stm_fs *fs, stm_ctl **out)
     }
     c->fs = fs;
     c->pool = NULL;
+    /* P9-CTL-1d-uid: caller credentials default to "unset" sentinel
+     * (uid_t)-1 / (gid_t)-1. With both unset, ctl_caller_is_admin
+     * returns false → admin-only kinds refuse access. Stratumd
+     * stamps real credentials via stm_ctl_set_caller before serving. */
+    c->caller_uid = (uid_t)-1;
+    c->caller_gid = (gid_t)-1;
+    c->admin_uid  = (uid_t)-1;
     *out = c;
+    return STM_OK;
+}
+
+stm_status stm_ctl_set_caller(stm_ctl *c, uid_t caller_uid, gid_t caller_gid)
+{
+    if (!c) return STM_EINVAL;
+    c->caller_uid = caller_uid;
+    c->caller_gid = caller_gid;
+    return STM_OK;
+}
+
+stm_status stm_ctl_set_admin_uid(stm_ctl *c, uid_t admin_uid)
+{
+    if (!c) return STM_EINVAL;
+    c->admin_uid = admin_uid;
     return STM_OK;
 }
 

@@ -48,6 +48,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/types.h>     /* uid_t, gid_t */
 
 #ifdef __cplusplus
 extern "C" {
@@ -133,6 +134,57 @@ stm_status stm_ctl_attach_pool(stm_ctl *c, struct stm_pool *pool);
  * Safe on NULL.
  */
 void stm_ctl_destroy(stm_ctl *c);
+
+/*
+ * Stamp the connecting peer's credentials into the /ctl/ instance.
+ * Used by the admin gate (`is_admin`) to decide whether
+ * admin-required kinds are accessible. The default (unset) caller
+ * is treated as non-admin.
+ *
+ * Stratumd typically calls this once per accept, between the
+ * SO_PEERCRED / getpeereid lookup and the first
+ * `stm_p9_server_handle` invocation. Mirrors stratumd's existing
+ * peer-cred default-deny posture (R95 P2-2): if the daemon can't
+ * resolve the peer's uid, it should refuse the connection rather
+ * than calling set_caller with a placeholder.
+ *
+ * Timing (P9-CTL-1d-uid): same posture as stm_ctl_attach_pool's
+ * timing rule (R97 P2-2). MUST be called BEFORE the first
+ * stm_p9_server_handle invocation. Caller fields are not mu-
+ * protected on the vops read paths; concurrent set_caller +
+ * vops dispatch is a C11 data race. v2.0's serial-accept posture
+ * makes this safe.
+ *
+ * The instance is one-server-one-stm_ctl under concurrent accept
+ * (sessions[] keyed by fid alone — same R96 lesson). Per-server
+ * caller stamps mean per-connection peer identity; cross-server
+ * sharing of one stm_ctl + per-fid caller stamping is a future
+ * concurrent-accept extension.
+ *
+ * Returns STM_EINVAL if `c` is NULL.
+ */
+STM_MUST_USE
+stm_status stm_ctl_set_caller(stm_ctl *c, uid_t caller_uid, gid_t caller_gid);
+
+/*
+ * Set the daemon's "admin" uid policy. The admin gate (`is_admin`)
+ * permits a caller iff:
+ *   caller_uid == 0           (root, always admin)
+ *   OR caller_uid == admin_uid (typically the daemon's effective uid).
+ *
+ * Stratumd typically calls this once at startup with `geteuid()`
+ * — the operator who runs the daemon controls /ctl/ admin paths.
+ * The default `admin_uid` (set at stm_ctl_create) is `(uid_t)-1`
+ * meaning "no admin uid configured; only uid 0 is admin."
+ *
+ * Forward-note: a more configurable policy (allowlist of admin uids,
+ * group-based admin via gid, or pluggable callback) is deferred to
+ * a future sub-chunk. v2.0 ships the simplest enforceable policy.
+ *
+ * Returns STM_EINVAL if `c` is NULL.
+ */
+STM_MUST_USE
+stm_status stm_ctl_set_admin_uid(stm_ctl *c, uid_t admin_uid);
 
 /*
  * The vops table to pass to stm_p9_server_create. Static lifetime —
