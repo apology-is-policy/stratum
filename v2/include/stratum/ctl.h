@@ -53,9 +53,11 @@
 extern "C" {
 #endif
 
-/* Forward decl — full def in <stratum/fs.h>; including it here would
- * be a heavy dependency for anyone embedding /ctl/. */
+/* Forward decls — full defs in <stratum/fs.h> + <stratum/pool.h>;
+ * including them here would be a heavy dependency for anyone
+ * embedding /ctl/. */
 struct stm_fs;
+struct stm_pool;
 
 typedef struct stm_ctl stm_ctl;
 
@@ -79,8 +81,26 @@ STM_MUST_USE
 stm_status stm_ctl_create(struct stm_fs *fs, stm_ctl **out);
 
 /*
- * Destroy a /ctl/ instance. Does not destroy the attached `fs` —
- * caller retains ownership.
+ * Attach a `stm_pool *` to surface its roster + per-device state at
+ * `/pools/<uuid>/...`. The instance does NOT take ownership of
+ * `pool`; the caller must keep the pointer valid for the lifetime
+ * of the stm_ctl instance.
+ *
+ * Returns STM_EINVAL if `c` is NULL; STM_EEXIST if a different
+ * pool is already attached. Re-attaching the same pool pointer is
+ * a no-op (STM_OK). v2.0 supports at most one attached pool.
+ *
+ * Lifetime: same precondition as stm_ctl_destroy — every server
+ * using this stm_ctl as ctx MUST be destroyed before the attached
+ * pool's lifecycle ends. The pool's own R13 P2-1 lifetime contract
+ * (stm_pool_close after every consumer closes) extends here.
+ */
+STM_MUST_USE
+stm_status stm_ctl_attach_pool(stm_ctl *c, struct stm_pool *pool);
+
+/*
+ * Destroy a /ctl/ instance. Does not destroy the attached `fs` or
+ * `pool` — caller retains ownership.
  *
  * PRECONDITION: every `stm_p9_server` that was created with this
  * stm_ctl as its `ctx` MUST be destroyed (`stm_p9_server_destroy`)

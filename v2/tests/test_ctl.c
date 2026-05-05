@@ -3,19 +3,22 @@
  * test_ctl — exercises the /ctl/ synthetic FS via the generic
  * stm_p9_server.
  *
- * P9-CTL-1a scope: foundation. /version + /state. Subsequent
- * sub-chunks add /pools, /datasets, /tracing, /debug.
+ * P9-CTL-1a scope: foundation. /version + /state.
+ * P9-CTL-1b scope: /pools/<uuid>/status.
+ * Subsequent sub-chunks add /datasets, /tracing, /debug.
  *
  * Pattern mirrors test_p9.c: build 9P frames, drive them through
  * stm_p9_server_handle, decode replies. /state with an attached
  * fs reuses the format+mount helpers from test_fs_common.h.
  */
 
+#include <stratum/block.h>
 #include <stratum/ctl.h>
 #include <stratum/fs.h>
 #include <stratum/p9.h>
+#include <stratum/pool.h>
 #include <stratum/send_recv.h>     /* STM_SEND_VERSION */
-#include <stratum/super.h>          /* STM_UB_VERSION */
+#include <stratum/super.h>          /* STM_UB_VERSION + STM_DEV_*_ */
 #include <stratum/types.h>
 
 #include "test_fs_common.h"
@@ -576,6 +579,363 @@ STM_TEST(ctl_r96_p2_3_read_last_byte_only)
 
     stm_p9_server_destroy(s);
     stm_ctl_destroy(c);
+}
+
+/* ── P9-CTL-1b /pools/ surface ─────────────────────────────────────── */
+
+/* Build a single-device test pool. Caller must close+free both the
+ * stm_pool and the stm_bdev (in that order). Body modeled on
+ * test_pool.c::make_single_device_pool. */
+static const uint64_t CTL_TEST_POOL_UUID[2]   = {
+    0x0123456789abcdefULL, 0xfedcba9876543210ULL
+};
+/* The 36-char UUID hex form for the constants above. Little-endian
+ * formatting (matches synfs.c uuid_to_bytes): word[0] LSB first then
+ * word[1] LSB first.
+ *   word0 = 0x0123_4567_89ab_cdef → bytes ef cd ab 89 67 45 23 01
+ *   word1 = 0xfedc_ba98_7654_3210 → bytes 10 32 54 76 98 ba dc fe
+ * Formatted with dashes after bytes 4, 6, 8, 10:
+ *   efcdab89-6745-2301-1032-547698badcfe
+ */
+#define CTL_TEST_POOL_UUID_HEX  "efcdab89-6745-2301-1032-547698badcfe"
+
+static const uint64_t CTL_TEST_DEVICE_UUID[2] = {
+    0x1111111111111111ULL, 0x2222222222222222ULL
+};
+
+typedef struct {
+    stm_bdev *bdev;
+    stm_pool *pool;
+} ctl_pool_fixture;
+
+static ctl_pool_fixture make_test_pool(void)
+{
+    make_tmp("ctl_b1");
+    ctl_pool_fixture f = {0};
+
+    stm_bdev_open_opts bopts = stm_bdev_open_opts_default();
+    STM_ASSERT_OK(stm_bdev_open(g_tmp_path, &bopts, &f.bdev));
+    STM_ASSERT_OK(stm_bdev_resize(f.bdev, TEST_DEVICE_BYTES));
+
+    const stm_bdev_caps *caps = stm_bdev_caps_of(f.bdev);
+    STM_ASSERT(caps != NULL);
+
+    stm_pool_open_opts opts;
+    memset(&opts, 0, sizeof opts);
+    opts.pool_uuid[0] = CTL_TEST_POOL_UUID[0];
+    opts.pool_uuid[1] = CTL_TEST_POOL_UUID[1];
+    opts.device_count = 1;
+    opts.devices[0].uuid[0]    = CTL_TEST_DEVICE_UUID[0];
+    opts.devices[0].uuid[1]    = CTL_TEST_DEVICE_UUID[1];
+    opts.devices[0].size_bytes = caps->size_bytes;
+    opts.devices[0].role       = STM_DEV_ROLE_DATA;
+    opts.devices[0].class_     = STM_DEV_CLASS_SSD;
+    opts.devices[0].state      = STM_DEV_STATE_ONLINE;
+    opts.devices[0].bdev       = f.bdev;
+    STM_ASSERT_OK(stm_pool_open(&opts, &f.pool));
+    return f;
+}
+
+static void destroy_test_pool(ctl_pool_fixture f)
+{
+    stm_pool_close(f.pool);
+    stm_bdev_close(f.bdev);
+}
+
+STM_TEST(ctl_b1_pools_appears_in_root_listing)
+{
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    uint32_t sz = build_topen(req, 2, 10, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+
+    sz = build_tread(req, 3, 10, 0, 8192);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    uint32_t count = load_u32(resp + 7);
+    STM_ASSERT(count > 0);
+
+    int saw_pools = 0;
+    const uint8_t *q = resp + 11;
+    const uint8_t *end = q + count;
+    while (q < end) {
+        uint16_t inner = load_u16(q);
+        const uint8_t *rec = q + 2;
+        const uint8_t *np = rec + 2 + 4 + 13 + 4 + 4 + 4 + 8;
+        uint16_t nl = load_u16(np);
+        const char *nm = (const char *)(np + 2);
+        if (nl == 5 && memcmp(nm, "pools", 5) == 0) saw_pools = 1;
+        q += 2 + inner;
+    }
+    STM_ASSERT_TRUE(saw_pools);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
+STM_TEST(ctl_b1_pools_dir_empty_when_no_pool)
+{
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "pools" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 1, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+
+    sz = build_tread(req, 4, 11, 0, 8192);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    STM_ASSERT_EQ(load_u32(resp + 7), 0u);   /* empty dir = zero stat bytes */
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
+STM_TEST(ctl_b1_walk_pool_uuid_enoent_when_no_pool)
+{
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "pools", CTL_TEST_POOL_UUID_HEX };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
+STM_TEST(ctl_b1_attach_pool_then_walk_succeeds)
+{
+    ctl_pool_fixture f = make_test_pool();
+
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
+
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "pools", CTL_TEST_POOL_UUID_HEX, "status" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 3, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_EQ(load_u16(resp + 7), 3u);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+    destroy_test_pool(f);
+}
+
+STM_TEST(ctl_b1_pool_status_reports_uuid_and_counts)
+{
+    ctl_pool_fixture f = make_test_pool();
+
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
+
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "pools", CTL_TEST_POOL_UUID_HEX, "status" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 3, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+
+    sz = build_tread(req, 4, 11, 0, 4096);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    uint32_t count = load_u32(resp + 7);
+    STM_ASSERT(count > 0);
+
+    char body[1024];
+    STM_ASSERT(count < sizeof body);
+    memcpy(body, resp + 11, count);
+    body[count] = '\0';
+
+    char want[128];
+    snprintf(want, sizeof want, "pool-uuid: %s", CTL_TEST_POOL_UUID_HEX);
+    STM_ASSERT(strstr(body, want) != NULL);
+    STM_ASSERT(strstr(body, "device-count-total: 1\n") != NULL);
+    STM_ASSERT(strstr(body, "device-count-live: 1\n") != NULL);
+    STM_ASSERT(strstr(body, "class-ssd: 1\n") != NULL);
+    STM_ASSERT(strstr(body, "role-data: 1\n") != NULL);
+    STM_ASSERT(strstr(body, "state-online: 1\n") != NULL);
+    STM_ASSERT(strstr(body, "roster-hash: 0x") != NULL);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+    destroy_test_pool(f);
+}
+
+STM_TEST(ctl_b1_attach_same_pool_twice_idempotent)
+{
+    ctl_pool_fixture f = make_test_pool();
+
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
+    STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));   /* idempotent */
+
+    stm_ctl_destroy(c);
+    destroy_test_pool(f);
+}
+
+STM_TEST(ctl_b1_attach_different_pool_refused)
+{
+    ctl_pool_fixture f = make_test_pool();
+    /* Build a 2nd pool with a DIFFERENT UUID. Reuse the same bdev so we
+     * don't need a 2nd file; pool layer doesn't validate cross-pool
+     * device-uuid uniqueness, only intra-pool. */
+    stm_pool_open_opts opts;
+    memset(&opts, 0, sizeof opts);
+    opts.pool_uuid[0] = 0xaaaaaaaaaaaaaaaaULL;
+    opts.pool_uuid[1] = 0xbbbbbbbbbbbbbbbbULL;
+    opts.device_count = 1;
+    opts.devices[0].uuid[0]    = 0xccccccccccccccccULL;
+    opts.devices[0].uuid[1]    = 0xddddddddddddddddULL;
+    opts.devices[0].size_bytes = stm_bdev_caps_of(f.bdev)->size_bytes;
+    opts.devices[0].role       = STM_DEV_ROLE_DATA;
+    opts.devices[0].class_     = STM_DEV_CLASS_SSD;
+    opts.devices[0].state      = STM_DEV_STATE_ONLINE;
+    opts.devices[0].bdev       = f.bdev;
+    stm_pool *p2 = NULL;
+    STM_ASSERT_OK(stm_pool_open(&opts, &p2));
+
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
+    /* Attaching a different pool while one is bound is refused. */
+    STM_ASSERT_ERR(stm_ctl_attach_pool(c, p2), STM_EEXIST);
+
+    stm_ctl_destroy(c);
+    stm_pool_close(p2);
+    destroy_test_pool(f);
+}
+
+STM_TEST(ctl_b1_pools_readdir_lists_attached_pool)
+{
+    ctl_pool_fixture f = make_test_pool();
+
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "pools" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 1, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+
+    sz = build_tread(req, 4, 11, 0, 8192);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    uint32_t count = load_u32(resp + 7);
+    STM_ASSERT(count > 0);
+
+    int saw_pool = 0;
+    const uint8_t *q = resp + 11;
+    const uint8_t *end = q + count;
+    while (q < end) {
+        uint16_t inner = load_u16(q);
+        const uint8_t *rec = q + 2;
+        const uint8_t *np = rec + 2 + 4 + 13 + 4 + 4 + 4 + 8;
+        uint16_t nl = load_u16(np);
+        const char *nm = (const char *)(np + 2);
+        if (nl == 36 && memcmp(nm, CTL_TEST_POOL_UUID_HEX, 36) == 0)
+            saw_pool = 1;
+        q += 2 + inner;
+    }
+    STM_ASSERT_TRUE(saw_pool);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+    destroy_test_pool(f);
+}
+
+STM_TEST(ctl_b1_walk_wrong_uuid_enoent)
+{
+    ctl_pool_fixture f = make_test_pool();
+
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    /* Different UUID — should ENOENT under /pools/. */
+    const char *path[] = { "pools", "00000000-0000-0000-0000-000000000000" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* Malformed (not 36 chars) — also ENOENT. */
+    const char *path2[] = { "pools", "not-a-uuid" };
+    sz = build_twalk(req, 3, 10, 12, 2, path2);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+    destroy_test_pool(f);
+}
+
+STM_TEST(ctl_b1_pool_status_write_rejected)
+{
+    ctl_pool_fixture f = make_test_pool();
+
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "pools", CTL_TEST_POOL_UUID_HEX, "status" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 3, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+
+    /* Open ORDWR — every node read-only at v2.0. */
+    sz = build_topen(req, 3, 11, STM_P9_ORDWR);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+    destroy_test_pool(f);
 }
 
 STM_TEST_MAIN("ctl")
