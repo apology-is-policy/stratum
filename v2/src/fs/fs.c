@@ -4233,6 +4233,38 @@ stm_status stm_fs_dataset_iter(stm_fs *fs, stm_dataset_iter_cb cb, void *ctx)
     return s;
 }
 
+/* P9-CTL-1d-debug: per-device alloc stats accessor for /ctl/debug/
+ * allocator-state/<device_id>. Mirrors stm_fs_stats_get's wedged-OK
+ * posture — alloc stats are diagnostic and operators most need them
+ * exactly when fs is wedged. STM_EROFS does not apply.
+ *
+ * device_id is range-checked against STM_POOL_DEVICES_MAX up front so
+ * an out-of-bounds caller doesn't enter sync. stm_sync_alloc returns
+ * NULL for unattached or REMOVED slots; that fans out to STM_ENOENT
+ * as the public-API contract on the wrapper. */
+stm_status stm_fs_alloc_stats_get(const stm_fs *fs, uint16_t device_id,
+                                     stm_alloc_stats *out)
+{
+    if (out) memset(out, 0, sizeof *out);
+    if (!fs || !out) return STM_EINVAL;
+    if (device_id >= STM_POOL_DEVICES_MAX) return STM_EINVAL;
+
+    stm_fs *mfs = (stm_fs *)fs;
+    pthread_mutex_lock(&mfs->lock);
+    /* Allow reading stats on a wedged fs — matches stm_fs_stats_get
+     * (fs.c:4737) for the same reason: diagnostics. */
+
+    stm_alloc *a = stm_sync_alloc(fs->sync, device_id);
+    if (!a) {
+        pthread_mutex_unlock(&mfs->lock);
+        return STM_ENOENT;
+    }
+
+    stm_status s = stm_alloc_stats_get(a, out);
+    pthread_mutex_unlock(&mfs->lock);
+    return s;
+}
+
 stm_status stm_fs_set_dataset_pool_default(stm_fs *fs, stm_property prop,
                                               uint64_t value)
 {

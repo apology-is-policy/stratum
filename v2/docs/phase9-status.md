@@ -389,8 +389,73 @@ language bindings, future kernel module) is a 9P consumer.
             chunk).
             ctest 30 → 38 in test_ctl (6 -1c + 2 R99). 43/43
             ctest green.
-      - [ ] **P9-CTL-1d /tracing/, /debug/, /events** — pending;
-            tracing toggle, debug dumps, event log.
+      - [~] **P9-CTL-1d /tracing/, /debug/, /events, action triggers**
+            — in progress; multi-sub-chunk arc.
+            - [x] **P9-CTL-1d-uid (R100)** — caller stamping +
+                  admin gate + /admin/ + /admin/peer (admin-only file
+                  exposing caller uid/gid/admin status).
+                  R100 P2-1 lesson: walk-through-admin gate at
+                  vops_walk for KIND_ADMIN_DIR (Tstat-after-partial-
+                  walk would otherwise leak the file's mode bits —
+                  same posture as POSIX path-traversal through a
+                  mode-0500 dir).
+            - [x] **P9-CTL-1d-events (R101)** — /events
+                  world-readable append-only log + /admin/clear-events
+                  admin write trigger. New public APIs:
+                  stm_ctl_log_event (printf-format event appender) +
+                  stm_ctl_drop_all_sessions (mandatory between
+                  connections under serial accept). R101 lessons:
+                  (P1-1) sequential-server doctrine needs an explicit
+                  drain hook; (P2-1) writable kinds that mutate
+                  snapshot-shared buffers MUST invalidate active
+                  reader snapshots (frankenstein view defense);
+                  (P2-2) zero-byte Twrite to action triggers MUST
+                  refuse with STM_EINVAL.
+            - [x] **P9-CTL-1d-debug-alloc** — first
+                  /debug/ surface. /debug/ + /debug/allocator-state/ +
+                  /debug/allocator-state/<device_id> (admin-only
+                  read). New public API stm_fs_alloc_stats_get(fs,
+                  device_id, *out) — thin read-side wrapper that
+                  resolves stm_sync_alloc + calls stm_alloc_stats_get
+                  under fs->lock with stm_fs_stats_get's wedged-OK
+                  posture. KIND_MAX = 19; three new kinds
+                  (KIND_DEBUG_DIR, KIND_DEBUG_ALLOC_DIR,
+                  KIND_DEBUG_ALLOC). Per-device body: 13-line
+                  bootstrap+data alloc-stats record, ~650 bytes
+                  worst case (UINT64_MAX-padded), STM_CTL_BODY_MAX
+                  comfortable. R100 P2-1 walk-through gate carries
+                  to KIND_DEBUG_DIR (admin-required dir, same
+                  shape as KIND_ADMIN_DIR). 9 new tests in
+                  test_ctl.c (60 → 69):
+                  ctl_d3_debug_dir_in_root_listing,
+                  ctl_d3_debug_topen_nonadmin_eacces,
+                  ctl_d3_debug_walk_through_nonadmin_rejected,
+                  ctl_d3_debug_alloc_admin_reads_stats,
+                  ctl_d3_debug_alloc_dir_lists_attached_devices,
+                  ctl_d3_debug_alloc_oob_device_enoent,
+                  ctl_d3_debug_alloc_leading_zero_rejected,
+                  ctl_d3_debug_alloc_dir_unattached_fs_walks_then_topen_enoent,
+                  ctl_d3_alloc_stats_get_null_args_einval (direct
+                  unit tests of the stm_fs_alloc_stats_get wrapper:
+                  NULL fs / NULL out / OOB device_id / unattached
+                  slot / valid case). R102 audit pending.
+                  Forward-noted to subsequent /debug/ sub-chunks:
+                  /debug/tree-walk + /debug/extent-map +
+                  /debug/integrity-verify (path-write-then-read
+                  pattern; need new stm_fs query primitives that
+                  don't exist today — stm_fs_btree_dump,
+                  stm_fs_extent_map, stm_fs_verify_path_integrity).
+            - [ ] **P9-CTL-1d-debug-trees** — pending; tree-walk +
+                  extent-map admin write triggers + read-back dump
+                  buffers. Requires new stm_fs query primitives.
+            - [ ] **P9-CTL-1d-debug-integrity** — pending;
+                  integrity-verify trigger + result file. Requires
+                  Phase 8.5 stm_fs_verify_merkle_chain.
+            - [ ] **P9-CTL-1d-actions** — pending; snapshot create /
+                  rollback + scrub start/stop write triggers. Composes
+                  against -1d-uid admin gate + -1d-events audit log.
+            - [ ] **P9-CTL-1d-tracing** — pending; /tracing/enable +
+                  /tracing/sample-rate + /tracing/traces (ARCH §14.6).
       - [ ] **P9-CTL-1e /metrics/** — pending; Prometheus +
             OpenTelemetry exposition.
 

@@ -2,17 +2,34 @@
 /*
  * stm_ctl synfs — operational synthetic filesystem (ARCH §14.3).
  *
- * Phase 9 P9-CTL-1a foundation + P9-CTL-1b /pools/ subtree:
+ * Phase 9 P9-CTL-1a foundation + P9-CTL-1b /pools/ subtree +
+ * P9-CTL-1c /datasets/ + P9-CTL-1d-uid admin gate + P9-CTL-1d-events
+ * /events log + P9-CTL-1d-debug-alloc /debug/allocator-state/:
  *
- *   /                        directory (ro, world-readable)
- *   /version                 read: build identity + format versions
- *   /state                   read: attached-fs state (or placeholder)
- *   /pools/                  directory: registered pool(s)
- *   /pools/<uuid>/           directory: per-pool entries
- *   /pools/<uuid>/status     read: pool roster summary, redundancy
+ *   /                                       directory (ro, world-readable)
+ *   /version                                read: build identity + format versions
+ *   /state                                  read: attached-fs state (or placeholder)
+ *   /pools/                                 directory: registered pool(s)
+ *   /pools/<uuid>/                          directory: per-pool entries
+ *   /pools/<uuid>/status                    read: pool roster summary
+ *   /pools/<uuid>/devices/                  directory: roster (incl REMOVED)
+ *   /pools/<uuid>/devices/<id>/             directory: per-device
+ *   /pools/<uuid>/devices/<id>/status       read: device-level state
+ *   /datasets/                              directory: registered datasets
+ *   /datasets/<id>/                         directory: per-dataset
+ *   /datasets/<id>/properties               read: combined entry+effective props
+ *   /admin/                                 directory: admin-only (mode 0500)
+ *   /admin/peer                             read: caller uid/gid+is-admin (admin)
+ *   /admin/clear-events                     write: reset /events log (admin)
+ *   /events                                 read: append-only event log (world)
+ *   /debug/                                 directory: admin-only diagnostics
+ *   /debug/allocator-state/                 directory: per-device allocator state
+ *   /debug/allocator-state/<device_id>      read: allocator stats (admin)
  *
- * Subsequent sub-chunks layer on /pools/<uuid>/devices/<id>/{...},
- * /datasets/, /tracing/, /debug/, /events, /metrics/.
+ * Subsequent /debug/ sub-chunks add tree-walk, extent-map,
+ * integrity-verify (admin-write triggers + admin-read dump files);
+ * /tracing/, action triggers (snapshot create, scrub start), and
+ * /metrics/ (Prometheus + OTLP) follow.
  *
  * qid_path encoding
  * ─────────────────
@@ -113,6 +130,9 @@ typedef enum {
     KIND_ADMIN_PEER           = 13,   /* /admin/peer — admin-only file */
     KIND_EVENTS               = 14,   /* /events — append-only event log */
     KIND_ADMIN_CLEAR_EVENTS   = 15,   /* /admin/clear-events — admin write trigger */
+    KIND_DEBUG_DIR            = 16,   /* /debug/ — admin-only diagnostic dir */
+    KIND_DEBUG_ALLOC_DIR      = 17,   /* /debug/allocator-state/ — per-device alloc */
+    KIND_DEBUG_ALLOC          = 18,   /* /debug/allocator-state/<id> — admin-only file */
     KIND_MAX
 } ctl_kind;
 
@@ -140,6 +160,9 @@ static const ctl_kind_meta KIND_META[KIND_MAX] = {
     [KIND_ADMIN_PEER]         = { false, true,  0400, "peer"       },  /* admin-only file */
     [KIND_EVENTS]             = { false, false, 0444, "events"     },  /* world-readable log */
     [KIND_ADMIN_CLEAR_EVENTS] = { false, true,  0200, "clear-events" }, /* admin write-only */
+    [KIND_DEBUG_DIR]          = { true,  true,  0500, "debug"           }, /* admin-only dir */
+    [KIND_DEBUG_ALLOC_DIR]    = { true,  true,  0500, "allocator-state" }, /* admin-only dir */
+    [KIND_DEBUG_ALLOC]        = { false, true,  0400, NULL              }, /* admin-only, dynamic device id */
 };
 
 /* R96 P3-2: pin every static-name literal length below STM_P9_NAME_MAX
@@ -160,16 +183,19 @@ _Static_assert(sizeof("admin") - 1     <= STM_P9_NAME_MAX, "/ctl/ /admin literal
 _Static_assert(sizeof("peer") - 1      <= STM_P9_NAME_MAX, "/ctl/ /admin/peer literal");
 _Static_assert(sizeof("events") - 1    <= STM_P9_NAME_MAX, "/ctl/ /events literal");
 _Static_assert(sizeof("clear-events") - 1 <= STM_P9_NAME_MAX, "/ctl/ /admin/clear-events literal");
+_Static_assert(sizeof("debug") - 1     <= STM_P9_NAME_MAX, "/ctl/ /debug literal");
+_Static_assert(sizeof("allocator-state") - 1 <= STM_P9_NAME_MAX, "/ctl/ /debug/allocator-state literal");
 /* Dynamic names: pool-uuid hex (36 chars), decimal device-id (≤2
  * chars at v2.0's STM_POOL_DEVICES_MAX = 64 cap), decimal dataset-id
  * (≤9 chars at STM_SYNC_DATASET_ID_MAX = 0x0FFFFFFF ~= 268M = 9
- * digits). All bounded at runtime in the dynamic decoders. */
+ * digits). KIND_DEBUG_ALLOC reuses the same decimal device-id parser.
+ * All bounded at runtime in the dynamic decoders. */
 
 /* R97 P3-7: pin KIND_MAX so adding a new ctl_kind without extending
  * KIND_META[] trips this assert at build time, even if a downstream
  * build silently suppresses -Wmissing-field-initializers. Update the
  * literal in lockstep when growing the enum. */
-_Static_assert(KIND_MAX == 16,
+_Static_assert(KIND_MAX == 19,
                "KIND_META[KIND_MAX] sized to enum cardinality; "
                "update both ctl_kind enum + KIND_META[] in lockstep");
 
@@ -241,10 +267,12 @@ static uint64_t qid_dataset_id(uint64_t q)
  * snprintf-then-check and refuse with STM_ERANGE on overflow.
  * Today's kinds (/version ~80 bytes, /state ~352 bytes worst case
  * with all-UINT64_MAX counters, /pools/<uuid>/status ~256 bytes
- * with full 64-device roster summary) sit comfortably under 1 KiB.
- * Future sub-chunks (/pools/<n>/devices, /datasets/<id>/properties
- * with many properties) may need to bump or per-kind-cap; do so
- * in lockstep with adding the new kind, and document the per-kind
+ * with full 64-device roster summary, /datasets/<id>/properties
+ * ~615 bytes with all-max counters + 255-byte name, /debug/
+ * allocator-state/<n> ~650 bytes with all-UINT64_MAX counters)
+ * sit comfortably under 1 KiB.
+ * Future sub-chunks may need to bump or per-kind-cap; do so in
+ * lockstep with adding the new kind, and document the per-kind
  * justification (R96 P3-3).
  */
 #define STM_CTL_BODY_MAX     1024u
@@ -996,6 +1024,59 @@ static stm_status materialize_admin_peer(stm_ctl *c, ctl_session *s)
     return STM_OK;
 }
 
+/* Materialize /debug/allocator-state/<device_id> — per-device allocator
+ * state snapshot. Composes against stm_fs_alloc_stats_get (fs.c), which
+ * resolves the per-device stm_alloc via stm_sync's attach table.
+ *
+ * Body cap: 13 lines × ~50 chars worst case (UINT64_MAX = 20 digits +
+ * label) ≈ 650 bytes; STM_CTL_BODY_MAX = 1024. ~35% headroom.
+ *
+ * Returns STM_ENOENT if the device slot has no allocator attached
+ * (unattached or REMOVED) — same shape as KIND_DEVICE_STATUS for
+ * out-of-roster ids. The vops_open + stat_at gates trap most of these
+ * before reaching here; this is the inner-leg verification. */
+static stm_status materialize_debug_alloc(stm_ctl *c, ctl_session *s)
+{
+    if (!c->fs) return STM_EBACKEND;     /* gated at vops_open */
+    uint16_t did = (uint16_t)qid_device_id(s->qid_path);
+
+    stm_alloc_stats stats;
+    stm_status rc = stm_fs_alloc_stats_get(c->fs, did, &stats);
+    if (rc != STM_OK) return rc;
+
+    int n = snprintf((char *)s->buf, sizeof s->buf,
+        "device-id: %u\n"
+        "bootstrap-size-blocks: %llu\n"
+        "bootstrap-total-units: %llu\n"
+        "bootstrap-allocated-units: %llu\n"
+        "bootstrap-bitmap-gen: %llu\n"
+        "data-first-block: %llu\n"
+        "data-last-block: %llu\n"
+        "data-total-blocks: %llu\n"
+        "data-allocated-blocks: %llu\n"
+        "data-pending-blocks: %llu\n"
+        "data-free-blocks: %llu\n"
+        "n-allocated-ranges: %llu\n"
+        "n-pending-ranges: %llu\n",
+        (unsigned)did,
+        (unsigned long long)stats.bootstrap_size_blocks,
+        (unsigned long long)stats.bootstrap_total_units,
+        (unsigned long long)stats.bootstrap_allocated_units,
+        (unsigned long long)stats.bootstrap_bitmap_gen,
+        (unsigned long long)stats.data_first_block,
+        (unsigned long long)stats.data_last_block,
+        (unsigned long long)stats.data_total_blocks,
+        (unsigned long long)stats.data_allocated_blocks,
+        (unsigned long long)stats.data_pending_blocks,
+        (unsigned long long)stats.data_free_blocks,
+        (unsigned long long)stats.n_allocated_ranges,
+        (unsigned long long)stats.n_pending_ranges);
+    if (n < 0) return STM_EIO;
+    if ((size_t)n >= sizeof s->buf) return STM_ERANGE;
+    s->len = (uint32_t)n;
+    return STM_OK;
+}
+
 static stm_status materialize_locked(stm_ctl *c, ctl_session *s)
 {
     switch (qid_kind(s->qid_path)) {
@@ -1005,6 +1086,7 @@ static stm_status materialize_locked(stm_ctl *c, ctl_session *s)
     case KIND_DEVICE_STATUS:      return materialize_device_status(c, s);
     case KIND_DATASET_PROPERTIES: return materialize_dataset_properties(c, s);
     case KIND_ADMIN_PEER:         return materialize_admin_peer(c, s);
+    case KIND_DEBUG_ALLOC:        return materialize_debug_alloc(c, s);
     case KIND_ROOT:
     case KIND_POOLS_DIR:
     case KIND_POOL_DIR:
@@ -1013,6 +1095,8 @@ static stm_status materialize_locked(stm_ctl *c, ctl_session *s)
     case KIND_DATASETS_DIR:
     case KIND_DATASET_DIR:
     case KIND_ADMIN_DIR:
+    case KIND_DEBUG_DIR:
+    case KIND_DEBUG_ALLOC_DIR:
     case KIND_EVENTS:                 /* served direct from event_buf */
     case KIND_ADMIN_CLEAR_EVENTS:     /* write-only; no body to materialize */
     case KIND_MAX:
@@ -1112,6 +1196,32 @@ static stm_status stat_at(stm_ctl *c, uint64_t qid_path,
         }
     }
 
+    /* /debug/ subtree (P9-CTL-1d-debug). KIND_DEBUG_DIR itself is
+     * always-stat-able at the root readdir level (mode 0500 conveys
+     * "admin-only"); the walk-through gate at vops_walk fires on
+     * non-admin traversal — same R100 P2-1 posture as /admin/.
+     * The KIND_DEBUG_ALLOC_DIR + KIND_DEBUG_ALLOC kinds require fs
+     * for any meaningful answer; without fs they ENOENT. */
+    if (k == KIND_DEBUG_ALLOC_DIR && !c->fs) return STM_ENOENT;
+    if (k == KIND_DEBUG_ALLOC) {
+        if (!c->fs) return STM_ENOENT;
+        /* Validate device_id has an allocator attached. The same probe
+         * as the materializer — fans NULL alloc out to STM_ENOENT.
+         * Range-check is inside stm_fs_alloc_stats_get (refuses ≥
+         * STM_POOL_DEVICES_MAX with STM_EINVAL); we treat that as
+         * ENOENT at the synfs boundary so wire ops see "no such
+         * file" not "invalid argument" for an out-of-range id. */
+        uint32_t did = qid_device_id(qid_path);
+        if (did >= STM_POOL_DEVICES_MAX) return STM_ENOENT;
+        stm_alloc_stats tmp;
+        stm_status arc = stm_fs_alloc_stats_get(c->fs, (uint16_t)did, &tmp);
+        if (arc != STM_OK) return STM_ENOENT;
+        int n = snprintf(dyn_name, sizeof dyn_name, "%u", (unsigned)did);
+        if (n < 0 || n >= (int)sizeof dyn_name) return STM_EIO;
+        name = dyn_name;
+        name_len = (size_t)n;
+    }
+
     memset(out, 0, sizeof *out);
     out->qid_path = qid_path;
     if (meta->is_dir) {
@@ -1161,6 +1271,8 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
             return stat_at(c, qid_root(KIND_ADMIN_DIR), out);
         if (str_eq(name, name_len, KIND_META[KIND_EVENTS].static_name))
             return stat_at(c, qid_root(KIND_EVENTS), out);
+        if (str_eq(name, name_len, KIND_META[KIND_DEBUG_DIR].static_name))
+            return stat_at(c, qid_root(KIND_DEBUG_DIR), out);
         return STM_ENOENT;
 
     case KIND_POOLS_DIR: {
@@ -1235,6 +1347,29 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
             return stat_at(c, qid_root(KIND_ADMIN_CLEAR_EVENTS), out);
         return STM_ENOENT;
 
+    case KIND_DEBUG_DIR:
+        /* R100 P2-1 posture (carried for the second admin-only dir
+         * tree): walk-through /debug/ refuses non-admin with ENOENT
+         * so child qid metadata never leaks. The single child today
+         * is /debug/allocator-state/. /debug/ itself remains visible
+         * at root readdir (mode 0500 conveys "admin-only" without
+         * leaking children). Future /debug/{tree-walk, extent-map,
+         * integrity-verify} sub-chunks add new walk targets here. */
+        if (!ctl_caller_is_admin(c)) return STM_ENOENT;
+        if (str_eq(name, name_len, KIND_META[KIND_DEBUG_ALLOC_DIR].static_name))
+            return stat_at(c, qid_root(KIND_DEBUG_ALLOC_DIR), out);
+        return STM_ENOENT;
+
+    case KIND_DEBUG_ALLOC_DIR: {
+        /* Defense-in-depth admin re-check — primary gate at
+         * KIND_DEBUG_DIR walk-through above already fired. */
+        if (!ctl_caller_is_admin(c)) return STM_ENOENT;
+        if (!c->fs) return STM_ENOENT;
+        uint16_t did = 0;
+        if (parse_device_id(name, name_len, &did) != 0) return STM_ENOENT;
+        return stat_at(c, qid_of(KIND_DEBUG_ALLOC, 0, did), out);
+    }
+
     case KIND_VERSION:
     case KIND_STATE:
     case KIND_POOL_STATUS:
@@ -1243,6 +1378,7 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
     case KIND_ADMIN_PEER:
     case KIND_EVENTS:
     case KIND_ADMIN_CLEAR_EVENTS:
+    case KIND_DEBUG_ALLOC:
     case KIND_MAX:
         break;
     }
@@ -1289,7 +1425,13 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
         /* /events is world-readable (mode 0444) — any caller can
          * tail-read the operational event log. Admin-only write
          * trigger (clear-events) lives under /admin/. */
-        return emit_entry(c, cb, cb_ctx, qid_root(KIND_EVENTS));
+        rc = emit_entry(c, cb, cb_ctx, qid_root(KIND_EVENTS));
+        if (rc != STM_OK) return rc;
+        /* /debug/ is always-listed at the root level (mode 0500
+         * conveys "admin-only"; non-admin readdir-of-root SEES the
+         * /debug dirent but Twalk-through and Topen both refuse
+         * with ENOENT/EACCES). Same posture as /admin/. */
+        return emit_entry(c, cb, cb_ctx, qid_root(KIND_DEBUG_DIR));
 
     case KIND_POOLS_DIR:
         /* Enumerate registered pools. v2.0: at most one pool. */
@@ -1383,6 +1525,39 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
         if (rc != STM_OK) return rc;
         return emit_entry(c, cb, cb_ctx, qid_root(KIND_ADMIN_CLEAR_EVENTS));
 
+    case KIND_DEBUG_DIR:
+        /* /debug/ readdir doesn't gate on admin — vops_open already
+         * gated at the dir-open level. A non-admin who got past
+         * vops_open is impossible; this case only fires for an
+         * admin's readdir. (Defense in depth would be redundant; the
+         * walk-through gate at vops_walk + the open gate at vops_open
+         * are the trust boundary.) Single child today: allocator-
+         * state. Future sub-chunks add tree-walk, extent-map,
+         * integrity-verify here. */
+        return emit_entry(c, cb, cb_ctx, qid_root(KIND_DEBUG_ALLOC_DIR));
+
+    case KIND_DEBUG_ALLOC_DIR: {
+        /* If no fs attached, the dir is empty — same posture as
+         * /datasets/ when fs is unattached. Iterate device slots
+         * 0..STM_POOL_DEVICES_MAX, emit only those that have an
+         * allocator attached (stm_fs_alloc_stats_get returns
+         * STM_OK). REMOVED slots and never-attached slots return
+         * STM_ENOENT and get skipped. The 64-slot bound caps the
+         * lock-cycle cost; admin-only diagnostic surface so the
+         * cost is acceptable. */
+        if (!c->fs) return STM_OK;
+        for (uint16_t did = 0; did < STM_POOL_DEVICES_MAX; did++) {
+            stm_alloc_stats tmp;
+            stm_status arc = stm_fs_alloc_stats_get(c->fs, did, &tmp);
+            if (arc != STM_OK) continue;
+            stm_status erc = emit_entry(c, cb, cb_ctx,
+                qid_of(KIND_DEBUG_ALLOC, 0, did));
+            if (erc == STM_ENOENT) continue;     /* race: detached after probe */
+            if (erc != STM_OK) return erc;
+        }
+        return STM_OK;
+    }
+
     case KIND_VERSION:
     case KIND_STATE:
     case KIND_POOL_STATUS:
@@ -1391,6 +1566,7 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
     case KIND_ADMIN_PEER:
     case KIND_EVENTS:
     case KIND_ADMIN_CLEAR_EVENTS:
+    case KIND_DEBUG_ALLOC:
     case KIND_MAX:
         break;
     }
@@ -1451,6 +1627,12 @@ static stm_status vops_open(void *ctx, uint32_t fid, uint64_t qid_path,
             stm_status drc = stm_fs_dataset_lookup(c->fs, dsid, &tmp);
             if (drc != STM_OK) return drc;
         }
+        /* /debug/ is always-open (admin gate fired above); /debug/
+         * allocator-state requires fs since it iterates over per-
+         * device alloc state. Without fs the dir is empty (vops_
+         * readdir returns STM_OK with no entries). */
+        if (k == KIND_DEBUG_ALLOC_DIR && !c->fs)
+            return STM_ENOENT;
         return STM_OK;
     }
 
@@ -1458,6 +1640,22 @@ static stm_status vops_open(void *ctx, uint32_t fid, uint64_t qid_path,
     if ((k == KIND_POOL_STATUS || k == KIND_DEVICE_STATUS) && !c->pool)
         return STM_ENOENT;
     if ((k == KIND_DATASET_PROPERTIES) && !c->fs) return STM_ENOENT;
+    if (k == KIND_DEBUG_ALLOC) {
+        if (!c->fs) return STM_ENOENT;
+        uint32_t did = qid_device_id(qid_path);
+        if (did >= STM_POOL_DEVICES_MAX) return STM_ENOENT;
+        /* Re-probe at Topen — between Twalk and Topen the device
+         * could have been removed (forward-noted: today the sync
+         * attach table only mutates at sync_create / replace_device_
+         * online; a future evacuate path would race here). The
+         * subsequent materialize call also fans NULL alloc to
+         * STM_ENOENT; keeping the gate here ensures a consistent
+         * "exists at Topen" semantics for the per-fid session
+         * lifetime. */
+        stm_alloc_stats tmp;
+        stm_status arc = stm_fs_alloc_stats_get(c->fs, (uint16_t)did, &tmp);
+        if (arc != STM_OK) return STM_ENOENT;
+    }
 
     /* P9-CTL-1d-events: KIND_EVENTS reads from c->event_buf directly
      * (the log can grow past STM_CTL_BODY_MAX = 1 KiB). Snapshot the

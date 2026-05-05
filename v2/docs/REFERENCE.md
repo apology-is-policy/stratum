@@ -38,7 +38,50 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9-CTL-1c R99 close (this commit). 43 ctest suites
+- **Tip**: P9-CTL-1d-debug-alloc substantive (this commit). 43
+  ctest suites green default. test_ctl 69/69 (was 60 at R101
+  close; +9 -1d-debug-alloc). **P9-CTL-1d-debug-alloc** adds
+  /debug/ (admin-only diagnostic dir tree) + /debug/allocator-
+  state/ + /debug/allocator-state/<device_id> (admin-only
+  read of per-device allocator stats). KIND_MAX = 19 (was 16);
+  three new kinds (KIND_DEBUG_DIR, KIND_DEBUG_ALLOC_DIR,
+  KIND_DEBUG_ALLOC). New public API
+  stm_fs_alloc_stats_get(fs, device_id, *out) — thin wrapper
+  that resolves stm_sync_alloc + calls stm_alloc_stats_get
+  under fs->lock with stm_fs_stats_get's wedged-OK posture.
+  Per-device body surfaces 13 fields (bootstrap_size_blocks,
+  bootstrap_total_units, bootstrap_allocated_units,
+  bootstrap_bitmap_gen, data_first_block, data_last_block,
+  data_total_blocks, data_allocated_blocks, data_pending_blocks,
+  data_free_blocks, n_allocated_ranges, n_pending_ranges +
+  device-id), ~650 bytes worst case under STM_CTL_BODY_MAX.
+  R100 P2-1 walk-through gate for KIND_DEBUG_DIR carries the
+  admin-only-tree posture from /admin/ — Twalk-through to a
+  child returns ENOENT for non-admin (POSIX mode-0500 dir
+  shape). vops_open's admin gate fires at meta->admin_required.
+  vops_readdir at KIND_DEBUG_ALLOC_DIR iterates 0..STM_POOL_
+  DEVICES_MAX, emits only ids with attached allocators —
+  REMOVED + never-attached slots ENOENT and get skipped
+  (analog of /datasets/ readdir's race-skip). R102 audit
+  pending. Forward-notes: -1d-debug-trees (tree-walk +
+  extent-map admin-write-then-read triggers, gated on new
+  stm_fs query primitives that don't exist today),
+  -1d-debug-integrity (integrity-verify gated on Phase 8.5
+  stm_fs_verify_merkle_chain), -1d-actions, -1d-tracing.
+
+- **Pre-tip-1**: P9-CTL-1d-events R101 close. 43 ctest suites
+  green default. test_ctl 60/60. **P9-CTL-1d-events** added
+  /events world-readable append-only log + /admin/clear-events
+  admin-only write trigger. New public APIs: stm_ctl_log_event
+  (printf-format event appender) + stm_ctl_drop_all_sessions
+  (mandatory between connections under serial accept). R101
+  lessons: P1-1 sequential-server doctrine needs explicit
+  drain hook; P2-1 writable kinds that mutate snapshot-shared
+  buffers MUST invalidate active reader snapshots
+  (frankenstein view defense); P2-2 zero-byte Twrite to
+  action triggers MUST refuse with STM_EINVAL.
+
+- **Pre-tip-2**: P9-CTL-1c R99 close. 43 ctest suites
   green default. test_ctl 38/38 (was 13 at -1a R96 close;
   +10 -1b + 2 R97 + 5 -1b' + 6 -1c + 2 R99). **P9-CTL-1c +
   P9-CTL-1b'** added /pools/<uuid>/devices/<id>/status (b'),

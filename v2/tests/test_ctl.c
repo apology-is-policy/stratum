@@ -2350,4 +2350,340 @@ STM_TEST(ctl_r101_p2_2_zero_byte_clear_refused)
     stm_ctl_destroy(c);
 }
 
+/* ── P9-CTL-1d-debug-alloc /debug/allocator-state/<device_id> ─────── */
+
+/* /debug/ is always-listed at root readdir (mode 0500 conveys
+ * admin-only). A non-admin can SEE that /debug exists; only
+ * traversal + open are gated. Same posture as /admin/. */
+STM_TEST(ctl_d3_debug_dir_in_root_listing)
+{
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    /* No caller stamped → not-admin → still sees /debug at root. */
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    uint32_t sz = build_topen(req, 2, 10, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+
+    sz = build_tread(req, 3, 10, 0, 8192);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    uint32_t count = load_u32(resp + 7);
+    STM_ASSERT(count > 0);
+
+    int saw_debug = 0;
+    const uint8_t *q = resp + 11;
+    const uint8_t *end = q + count;
+    while (q < end) {
+        uint16_t inner = load_u16(q);
+        const uint8_t *rec = q + 2;
+        const uint8_t *np = rec + 2 + 4 + 13 + 4 + 4 + 4 + 8;
+        uint16_t nl = load_u16(np);
+        const char *nm = (const char *)(np + 2);
+        if (nl == 5 && memcmp(nm, "debug", 5) == 0) saw_debug = 1;
+        q += 2 + inner;
+    }
+    STM_ASSERT_TRUE(saw_debug);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
+/* Topen(/debug) from a non-admin caller returns RERROR (admin gate
+ * fires at vops_open via meta->admin_required). The walk to /debug
+ * itself succeeds (one-step dir lookup matches POSIX `stat /debug`
+ * for mode-0500 dirs); attempting to enumerate refuses. */
+STM_TEST(ctl_d3_debug_topen_nonadmin_eacces)
+{
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    STM_ASSERT_OK(stm_ctl_set_caller(c, 1000, 1000));   /* not admin */
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "debug" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 1, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
+/* R100 P2-1 walk-through carry: Twalk(root, "debug", "allocator-state")
+ * from non-admin fails — child qid never bound. Same shape as the
+ * R100 P2-1 admin-walk test for /admin/peer. */
+STM_TEST(ctl_d3_debug_walk_through_nonadmin_rejected)
+{
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    STM_ASSERT_OK(stm_ctl_set_caller(c, 1000, 1000));
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "debug", "allocator-state" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
+/* Admin reads /debug/allocator-state/0 and gets the documented field
+ * set. The format on disk has one device, so device id 0 is attached. */
+STM_TEST(ctl_d3_debug_alloc_admin_reads_stats)
+{
+    make_tmp("ctl_debug_alloc");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(fs, &c));
+    STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));     /* root → admin */
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "debug", "allocator-state", "0" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 3, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+
+    sz = build_tread(req, 4, 11, 0, 4096);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    uint32_t count = load_u32(resp + 7);
+    STM_ASSERT(count > 0);
+    char body[1024];
+    STM_ASSERT(count < sizeof body);
+    memcpy(body, resp + 11, count);
+    body[count] = '\0';
+
+    /* All 13 documented fields appear; values are non-deterministic
+     * (depends on format geometry) so we just assert the labels. */
+    STM_ASSERT(strstr(body, "device-id: 0\n") != NULL);
+    STM_ASSERT(strstr(body, "bootstrap-size-blocks: ") != NULL);
+    STM_ASSERT(strstr(body, "bootstrap-total-units: ") != NULL);
+    STM_ASSERT(strstr(body, "bootstrap-allocated-units: ") != NULL);
+    STM_ASSERT(strstr(body, "bootstrap-bitmap-gen: ") != NULL);
+    STM_ASSERT(strstr(body, "data-first-block: ") != NULL);
+    STM_ASSERT(strstr(body, "data-last-block: ") != NULL);
+    STM_ASSERT(strstr(body, "data-total-blocks: ") != NULL);
+    STM_ASSERT(strstr(body, "data-allocated-blocks: ") != NULL);
+    STM_ASSERT(strstr(body, "data-pending-blocks: ") != NULL);
+    STM_ASSERT(strstr(body, "data-free-blocks: ") != NULL);
+    STM_ASSERT(strstr(body, "n-allocated-ranges: ") != NULL);
+    STM_ASSERT(strstr(body, "n-pending-ranges: ") != NULL);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
+/* readdir of /debug/allocator-state lists exactly one device entry
+ * named "0" for a single-device pool. Tests vops_readdir's iteration
+ * over device slots + the skip-on-ENOENT defense. */
+STM_TEST(ctl_d3_debug_alloc_dir_lists_attached_devices)
+{
+    make_tmp("ctl_debug_alloc_dir");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(fs, &c));
+    STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "debug", "allocator-state" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+
+    sz = build_tread(req, 4, 11, 0, 8192);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    uint32_t count = load_u32(resp + 7);
+    STM_ASSERT(count > 0);
+
+    int saw_zero = 0, saw_other = 0;
+    const uint8_t *q = resp + 11;
+    const uint8_t *end = q + count;
+    while (q < end) {
+        uint16_t inner = load_u16(q);
+        const uint8_t *rec = q + 2;
+        const uint8_t *np = rec + 2 + 4 + 13 + 4 + 4 + 4 + 8;
+        uint16_t nl = load_u16(np);
+        const char *nm = (const char *)(np + 2);
+        if (nl == 1 && nm[0] == '0') saw_zero = 1;
+        else                          saw_other = 1;
+        q += 2 + inner;
+    }
+    STM_ASSERT_TRUE(saw_zero);
+    STM_ASSERT_TRUE(!saw_other);    /* single-device fs */
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
+/* Admin walk to a device id past the cap returns ENOENT. parse_device_id
+ * caps numeric value at STM_POOL_DEVICES_MAX (64). */
+STM_TEST(ctl_d3_debug_alloc_oob_device_enoent)
+{
+    make_tmp("ctl_debug_alloc_oob");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(fs, &c));
+    STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    /* "64" is the first OOB id (cap = 64). */
+    const char *path[] = { "debug", "allocator-state", "64" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 3, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* Single-device fs has slot 0 only; slot 1 has no allocator
+     * attached. Walk binds (parser accepts "1"), but materialize via
+     * stat_at probes stm_fs_alloc_stats_get and ENOENTs. */
+    const char *path1[] = { "debug", "allocator-state", "1" };
+    sz = build_twalk(req, 3, 10, 12, 3, path1);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
+/* parse_device_id leading-zero rejection: "00", "01" must be refused
+ * so each device has exactly one canonical wire spelling. */
+STM_TEST(ctl_d3_debug_alloc_leading_zero_rejected)
+{
+    make_tmp("ctl_debug_alloc_lz");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(fs, &c));
+    STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "debug", "allocator-state", "00" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 3, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
+/* Without an attached fs, /debug/allocator-state readdir returns an
+ * empty body — no entries to enumerate (no per-device alloc to query).
+ * Mirrors /datasets/'s "empty when fs unattached" posture. */
+STM_TEST(ctl_d3_debug_alloc_dir_unattached_fs_walks_then_topen_enoent)
+{
+    /* No fs attached. */
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    /* Walk-through /debug to /debug/allocator-state: stat_at gates on
+     * fs (returns ENOENT for KIND_DEBUG_ALLOC_DIR when c->fs is NULL),
+     * so the walk itself fails — same shape as /datasets/<id> when fs
+     * unattached. */
+    const char *path[] = { "debug", "allocator-state" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
+/* Direct unit tests of the stm_fs_alloc_stats_get wrapper.
+ * Test boundary classes: NULL fs, NULL out, OOB device id, unattached
+ * slot, valid case. The wrapper is the trust boundary between /ctl/
+ * and stm_sync; these tests pin its contract independent of the
+ * synfs presentation layer. */
+STM_TEST(ctl_d3_alloc_stats_get_null_args_einval)
+{
+    stm_alloc_stats st;
+    /* NULL fs. */
+    STM_ASSERT_EQ(stm_fs_alloc_stats_get(NULL, 0, &st), STM_EINVAL);
+
+    /* NULL out (we still need a valid fs to test that path). */
+    make_tmp("ctl_alloc_null");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    STM_ASSERT_EQ(stm_fs_alloc_stats_get(fs, 0, NULL), STM_EINVAL);
+
+    /* OOB device id. STM_POOL_DEVICES_MAX = 64 → 64 is OOB. */
+    STM_ASSERT_EQ(stm_fs_alloc_stats_get(fs, STM_POOL_DEVICES_MAX, &st),
+                  STM_EINVAL);
+
+    /* Unattached slot: device 1 has no alloc on a single-device fs. */
+    STM_ASSERT_EQ(stm_fs_alloc_stats_get(fs, 1, &st), STM_ENOENT);
+
+    /* Valid case: device 0 → STM_OK, populated stats. */
+    memset(&st, 0xAA, sizeof st);
+    STM_ASSERT_OK(stm_fs_alloc_stats_get(fs, 0, &st));
+    STM_ASSERT(st.data_total_blocks > 0);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
 STM_TEST_MAIN("ctl")

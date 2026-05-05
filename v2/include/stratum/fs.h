@@ -42,6 +42,7 @@
 
 #include <stratum/types.h>
 #include <stratum/dataset.h>     /* stm_property (P7-CAS-13) */
+#include <stratum/alloc.h>       /* stm_alloc_stats (P9-CTL-1d-debug) */
 #include <stratum/dirent.h>      /* STM_DIRENT_NAME_MAX, STM_DT_* (P8-POSIX-4) */
 
 #ifdef __cplusplus
@@ -1384,6 +1385,34 @@ stm_status stm_fs_dataset_count(stm_fs *fs, size_t *out_count);
 
 STM_MUST_USE
 stm_status stm_fs_dataset_iter(stm_fs *fs, stm_dataset_iter_cb cb, void *ctx);
+
+/*
+ * P9-CTL-1d-debug: per-device allocator-stats accessor for /ctl/debug/
+ * allocator-state/<device_id>. Resolves the device's stm_alloc via the
+ * fs's stm_sync attach table and returns the same stats struct already
+ * exposed by `stm_alloc_stats_get`.
+ *
+ * Lock posture mirrors `stm_fs_stats_get` (fs.c): takes fs->lock for
+ * the dispatch but DOES NOT call FS_GUARD_READ — alloc stats are a
+ * diagnostic surface that operators most need exactly when fs is
+ * wedged. STM_EROFS does not apply.
+ *
+ * Returns:
+ *   STM_EINVAL — NULL fs, NULL out, OR device_id >= STM_POOL_DEVICES_MAX
+ *                (the static cap; cheaper than dispatching to stm_sync).
+ *   STM_ENOENT — device_id is in-range but no allocator is attached at
+ *                that slot (REMOVED slot, never attached, or the slot's
+ *                attach is racing in a future concurrent-mutate world).
+ *   STM_OK     — *out populated.
+ *
+ * Composes against:
+ *   stm_sync_alloc(s, device_id) — ARCH §6.5.1 attach table accessor;
+ *     returns NULL for unattached slots per <stratum/sync.h>:327.
+ *   stm_alloc_stats_get(a, *)   — <stratum/alloc.h>:317.
+ */
+STM_MUST_USE
+stm_status stm_fs_alloc_stats_get(const stm_fs *fs, uint16_t device_id,
+                                     stm_alloc_stats *out);
 
 /*
  * P7-16: stm_fs_reflink — POSIX-shape FICLONE. Replaces dst's empty
