@@ -86,9 +86,22 @@ stm_status stm_ctl_create(struct stm_fs *fs, stm_ctl **out);
  * `pool`; the caller must keep the pointer valid for the lifetime
  * of the stm_ctl instance.
  *
- * Returns STM_EINVAL if `c` is NULL; STM_EEXIST if a different
- * pool is already attached. Re-attaching the same pool pointer is
- * a no-op (STM_OK). v2.0 supports at most one attached pool.
+ * Returns STM_EINVAL if `c` or `pool` is NULL; STM_EEXIST if a
+ * different pool is already attached. Re-attaching the same pool
+ * pointer is a no-op (STM_OK). v2.0 supports at most one attached
+ * pool. (R97 P2-1: NULL-pool argument is rejected, not silently
+ * no-op'd as before.)
+ *
+ * Timing (R97 P2-2): `stm_ctl_attach_pool` MUST be called BEFORE
+ * the first `stm_p9_server_handle` invocation against any server
+ * that uses this stm_ctl as `ctx`. The internal pool pointer is
+ * not protected by the instance mutex on the vops read paths —
+ * concurrent attach + vops dispatch is a C11 data race on
+ * `c->pool`. The serial-server posture (one stm_p9_server at a
+ * time, drained between accept iterations) makes this trivially
+ * safe in practice; future concurrent-accept transports MUST
+ * either complete attach before serving or extend the locking
+ * to cover c->pool.
  *
  * Lifetime: same precondition as stm_ctl_destroy — every server
  * using this stm_ctl as ctx MUST be destroyed before the attached

@@ -126,6 +126,14 @@ _Static_assert(sizeof("state") - 1    <= STM_P9_NAME_MAX, "/ctl/ /state literal"
 _Static_assert(sizeof("pools") - 1    <= STM_P9_NAME_MAX, "/ctl/ /pools literal");
 _Static_assert(sizeof("status") - 1   <= STM_P9_NAME_MAX, "/ctl/ /pools/.../status literal");
 
+/* R97 P3-7: pin KIND_MAX so adding a new ctl_kind without extending
+ * KIND_META[] trips this assert at build time, even if a downstream
+ * build silently suppresses -Wmissing-field-initializers. Update the
+ * literal in lockstep when growing the enum. */
+_Static_assert(KIND_MAX == 6,
+               "KIND_META[KIND_MAX] sized to enum cardinality; "
+               "update both ctl_kind enum + KIND_META[] in lockstep");
+
 /* ── qid_path encoding ──────────────────────────────────────────────── */
 
 #define POOL_IDX_MASK    0x00FFFFFFu
@@ -410,7 +418,22 @@ static stm_status materialize_state(stm_ctl *c, ctl_session *s)
 
 /* Per-class device count in the roster. The roster includes REMOVED
  * slots; we report both totals and live counts so an operator can
- * spot evacuation-in-progress from the ratio. */
+ * spot evacuation-in-progress from the ratio.
+ *
+ * R97 P3-2: array bounds (5 / 5 / 7) pinned against the canonical
+ * stm_device_* enum cardinalities below. If a future enum gains a
+ * new value past the current top, the assert trips at build time
+ * and the developer must extend BOTH the array bound AND every
+ * per-class/role/state output formatter in lockstep. The
+ * if-guard's silent "skip" used to hide the missed case at
+ * runtime; the assert surfaces it at compile time. */
+_Static_assert(STM_DEV_CLASS_ZNS == 4,
+               "synfs.c per_class[5] depends on STM_DEV_CLASS_* range");
+_Static_assert(STM_DEV_ROLE_SPARE == 4,
+               "synfs.c per_role[5] depends on STM_DEV_ROLE_* range");
+_Static_assert(STM_DEV_STATE_EVACUATING == 6,
+               "synfs.c per_state[7] depends on STM_DEV_STATE_* range");
+
 typedef struct {
     uint16_t total;
     uint16_t live;
@@ -811,7 +834,10 @@ stm_status stm_ctl_create(struct stm_fs *fs, stm_ctl **out)
 
 stm_status stm_ctl_attach_pool(stm_ctl *c, struct stm_pool *pool)
 {
-    if (!c) return STM_EINVAL;
+    /* R97 P2-1: NULL pool is rejected. Earlier shape silently
+     * "succeeded" by storing NULL, which let a programmer-error
+     * caller pass STM_OK back unnoticed. */
+    if (!c || !pool) return STM_EINVAL;
     /* Idempotent attach of the SAME pool is a no-op; attaching a
      * different pool with one already bound is refused — the daemon
      * lifecycle that produces concurrent multi-pool /ctl/ is forward-

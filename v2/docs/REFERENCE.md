@@ -38,11 +38,38 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9-CTL-1a substantive (this commit). 43 ctest suites
-  green default. STM_UB_VERSION = 26 (no on-disk format change in
-  P9-CTL-*; /ctl/ is in-memory operator state). Spec posture
-  unchanged: 27 modules / 35 fixed cfgs / 64 buggy cfgs (last
-  changed at P9-9P-2c). **P9-CTL-1a — /ctl/ synthetic FS
+- **Tip**: P9-CTL-1b R97 close (this commit). 43 ctest suites
+  green default. test_ctl 25/25 (was 13 at -1a R96 close;
+  +10 -1b /pools/ tests +2 R97 regressions). STM_UB_VERSION = 26
+  (no on-disk format change in P9-CTL-*; /ctl/ is in-memory
+  operator state). Spec posture unchanged: 27 modules / 35 fixed
+  cfgs / 64 buggy cfgs (last changed at P9-9P-2c). **P9-CTL-1b —
+  /pools/ subtree + R96 P3-6 kind-table refactor.** Substantive
+  `aac3e10`, R97 close YELLOW (0 P0 + 0 P1 + 2 P2 + 8 P3, all
+  addressed inline OR forward-noted). Adds /pools/ +
+  /pools/<uuid>/ + /pools/<uuid>/status (read paths only); new
+  public API `stm_ctl_attach_pool(stm_ctl *, struct stm_pool *)`
+  with idempotent same-pointer + STM_EEXIST on different-pool +
+  R97 P2-1 STM_EINVAL on NULL pool. R96 P3-6 close: kind-handling
+  refactored into a centralized KIND_META[] table indexed by
+  `ctl_kind` enum — single source of truth for (kind →
+  static_name + is_dir + mode); compile-time guards include
+  `_Static_assert` on each literal name length AND on
+  `KIND_MAX == 6` (R97 P3-7) so adding a kind without extending
+  the table trips at build time. R97 P3-2 adds three more
+  `_Static_assert`s pinning per-class/role/state array bounds
+  against stm_device_* enum cardinalities. qid_path encoding
+  extends to `kind:8 | pool_idx:24 | device_id:32`. Pool roster
+  reads bracketed by `stm_pool_lock_shared`. Forward-noted to
+  P9-CTL-1b' (devices subtree): wire device_class_name /
+  device_role_name / device_state_name; add qid_device_id
+  extractor. Forward-noted to concurrent-accept reviewer
+  (R97 P2-2): attach-vs-vops timing — c->pool reads on vops
+  paths are not mu-protected; either complete attach before
+  serving or extend locking.
+
+- **Pre-Phase-9 tip**: P9-CTL-1a substantive. 43 ctest suites
+  green default. **P9-CTL-1a — /ctl/ synthetic FS
   foundation.** New module `src/ctl/synfs.c` + public header
   `include/stratum/ctl.h`. The /ctl/ tree (ARCH §14.3) is the
   operator-state surface served as a vops backend for the generic

@@ -938,4 +938,69 @@ STM_TEST(ctl_b1_pool_status_write_rejected)
     destroy_test_pool(f);
 }
 
+/* ── R97 regression tests ──────────────────────────────────────────── */
+
+/* R97 P2-1: stm_ctl_attach_pool(c, NULL) was previously a silent
+ * no-op (stored NULL, returned OK). Now refused with STM_EINVAL so
+ * a programmer-error caller surfaces the bug instead of receiving
+ * a misleading STM_OK. */
+STM_TEST(ctl_r97_p2_1_attach_null_pool_rejected)
+{
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+
+    STM_ASSERT_ERR(stm_ctl_attach_pool(c, NULL), STM_EINVAL);
+    STM_ASSERT_ERR(stm_ctl_attach_pool(NULL, NULL), STM_EINVAL);
+
+    stm_ctl_destroy(c);
+}
+
+/* R97 P3-6 forward-note close: 36-char UUID-shape strings that are
+ * NOT valid hex must be rejected at the walk gate. The pre-R97
+ * test only covered short malformed strings (length-check) and
+ * 36-char-valid-but-wrong-pool. This adds non-hex content + dashes
+ * in wrong positions to lock the parser's full contract. */
+STM_TEST(ctl_r97_p3_6_36char_malformed_uuid_rejected)
+{
+    ctl_pool_fixture f = make_test_pool();
+
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+
+    /* All non-hex content, exactly 36 chars (plus 4 dashes at correct
+     * positions): "gggggggg-gggg-gggg-gggg-gggggggggggg" */
+    const char *all_g[] = { "pools", "gggggggg-gggg-gggg-gggg-gggggggggggg" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 2, all_g);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* Hex content but dash in wrong position (dash at idx 7 instead
+     * of 8). 36 chars total. */
+    const char *bad_dash[] = {
+        "pools", "efcdab8-96745-2301-1032-547698badcfee" };
+    sz = build_twalk(req, 3, 10, 12, 2, bad_dash);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* Mixed-case version of the correct UUID — uuid_parse_hex accepts
+     * both cases per the documented client-friendliness contract.
+     * This walk MUST succeed (asserts the parser's case-insensitive
+     * contract). */
+    const char *mixed[] = {
+        "pools", "EFCDAB89-6745-2301-1032-547698BADCFE" };
+    sz = build_twalk(req, 4, 10, 13, 2, mixed);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+    destroy_test_pool(f);
+}
+
 STM_TEST_MAIN("ctl")
