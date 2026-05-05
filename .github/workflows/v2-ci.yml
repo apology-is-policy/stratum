@@ -123,12 +123,26 @@ jobs:
         run: ctest --test-dir build --output-on-failure
 
   tlc-specs:
-    name: TLC / ${{ matrix.spec }}
+    name: TLC / ${{ matrix.cfg }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        spec: [sync, concurrency, structural, balanced, merge, allocator, namespace, inode, fid]
+        # Each entry runs `cfg` against `tla`. Most cfgs have a 1:1
+        # name match with a tla file; namespace_multi_bind is a second
+        # cfg sharing namespace.tla (added at P9-9P-2c for atomicity
+        # coverage).
+        include:
+          - { tla: sync,                cfg: sync }
+          - { tla: concurrency,         cfg: concurrency }
+          - { tla: structural,          cfg: structural }
+          - { tla: balanced,            cfg: balanced }
+          - { tla: merge,               cfg: merge }
+          - { tla: allocator,           cfg: allocator }
+          - { tla: namespace,           cfg: namespace }
+          - { tla: namespace,           cfg: namespace_multi_bind }
+          - { tla: inode,               cfg: inode }
+          - { tla: fid,                 cfg: fid }
     steps:
       - uses: actions/checkout@v4
 
@@ -139,9 +153,9 @@ jobs:
           wget -q -O /tmp/tla2tools.jar \
               https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
 
-      - name: check ${{ matrix.spec }}.tla
+      - name: check ${{ matrix.cfg }}.cfg against ${{ matrix.tla }}.tla
         run: |
           cd specs
           java -cp /tmp/tla2tools.jar tlc2.TLC \
               -workers auto -deadlock \
-              -config ${{ matrix.spec }}.cfg ${{ matrix.spec }}.tla
+              -config ${{ matrix.cfg }}.cfg ${{ matrix.tla }}.tla

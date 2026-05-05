@@ -58,6 +58,11 @@ CONSTANTS
     NONE,                         \* sentinel meaning "no binding at this path";
                                   \*   declared as a separate model value so it
                                   \*   compares cleanly against Sources elements
+    NO_BATCH,                     \* sentinel meaning "no multi-bind batch in
+                                  \*   progress"; separate model value so the
+                                  \*   record-shape `batch_state[c]` value can
+                                  \*   be unambiguously distinguished from a
+                                  \*   real batch record.
     MaxBindsPerConn,              \* per-connection cap on bindings
     BuggyGlobalBindings,          \* TRUE → all connections share one
                                   \*   bindings table. Demonstrates the
@@ -70,22 +75,45 @@ CONSTANTS
                                   \*   path on the "next" connection.
                                   \*   Demonstrates a wild-pointer-style
                                   \*   index bug in the unbind path.
-    BuggyLookupCrosstalk          \* TRUE → Lookup(c, p) reads from the
+    BuggyLookupCrosstalk,         \* TRUE → Lookup(c, p) reads from the
                                   \*   "next" connection's bindings.
                                   \*   Demonstrates a fid-routing bug
                                   \*   that reads the wrong connection's
                                   \*   mount table at Twalk time.
+    EnableMultiBind,              \* TRUE → enable the multi-bind batch
+                                  \*   actions (StartBatch / ApplyNextInBatch
+                                  \*   / CommitBatch / AbortBatch). Models
+                                  \*   the impl's apply_attach_spec semantics
+                                  \*   (P9-9P-2b's Tattach with `aname =
+                                  \*   "spec:..."`). Gated so the existing
+                                  \*   namespace.cfg posture stays unchanged.
+    BuggyMultiBindNoRollback,     \* TRUE → AbortBatch leaves bindings as-is
+                                  \*   while restoring authored to the
+                                  \*   pre-batch snapshot. Models the
+                                  \*   "abort-doesn't-revert" failure mode.
+    BuggyMultiBindTruncateOnly    \* TRUE → AbortBatch restores ONLY paths
+                                  \*   that were NONE in the pre-batch
+                                  \*   snapshot (undoing appends but NOT
+                                  \*   in-place REPLACE on pre-existing
+                                  \*   bindings). Models the R93 P2-1 bug
+                                  \*   shape: truncate-from-end rollback
+                                  \*   leaks REPLACE'd entries.
 
 ASSUME /\ Connections # {}
        /\ Paths # {}
        /\ Sources # {}
        /\ DefaultSource \in Sources
        /\ NONE \notin Sources
+       /\ NO_BATCH \notin Sources
+       /\ NO_BATCH # NONE
        /\ MaxBindsPerConn \in Nat /\ MaxBindsPerConn >= 1
        /\ BuggyGlobalBindings \in BOOLEAN
        /\ BuggyDetachLeaks \in BOOLEAN
        /\ BuggyUnbindCrosstalk \in BOOLEAN
        /\ BuggyLookupCrosstalk \in BOOLEAN
+       /\ EnableMultiBind \in BOOLEAN
+       /\ BuggyMultiBindNoRollback \in BOOLEAN
+       /\ BuggyMultiBindTruncateOnly \in BOOLEAN
 
 \* --------------------------------------------------------------------------
 \* State.
@@ -121,7 +149,8 @@ VARIABLES
     bindings,
     global_bindings,
     audit_lookup,
-    authored
+    authored,
+    batch_state
 
 \* `authored[c]` is a shadow of bindings[c] that ONLY mutates when
 \* connection c is the actor (Bind(c, ...), Unbind(c, ...), Detach(c)
@@ -133,7 +162,17 @@ VARIABLES
 \* that LookupReflectsOwnBindings (an observation-time check) misses
 \* when no subsequent ObserveLookup happens to surface the mutation.
 
-vars == <<attached, bindings, global_bindings, audit_lookup, authored>>
+\* `batch_state[c]` is the connection's currently-in-progress multi-
+\* bind batch — NO_BATCH when none in progress, otherwise a record
+\* with `snapshot` (pre-batch bindings[c]), `target` (the desired
+\* binding for each path; NONE for paths not in the batch), `pending`
+\* (the set of paths still to apply), and `applied` (the set already
+\* applied). Models the impl's apply_attach_spec semantics — pre-batch
+\* snapshot taken, entries applied one-at-a-time, abort restores
+\* snapshot.
+
+vars == <<attached, bindings, global_bindings, audit_lookup, authored,
+            batch_state>>
 
 \* --------------------------------------------------------------------------
 \* "Next connection" for crosstalk-buggy variants.
@@ -183,11 +222,13 @@ Init ==
     /\ global_bindings = EmptyBindingTable
     /\ audit_lookup   = [c \in Connections |-> [p \in Paths |-> NONE]]
     /\ authored       = [c \in Connections |-> EmptyBindingTable]
+    /\ batch_state    = [c \in Connections |-> NO_BATCH]
     \* audit_lookup[c][p] is either NONE (no observation yet) or a
     \* 2-tuple <<observed, expected>>. The TypeOK invariant accepts
     \* either shape. authored[c] always mirrors what connection c
     \* has commanded its own bindings table to be — its evolution
     \* is independent of any crosstalk-style buggy variant.
+    \* batch_state[c] is NO_BATCH at init — no multi-bind in progress.
 
 \* --------------------------------------------------------------------------
 \* Actions.
@@ -201,7 +242,7 @@ Attach(c) ==
     /\ attached'       = [attached EXCEPT ![c] = TRUE]
     /\ bindings'       = bindings
     /\ global_bindings' = global_bindings
-    /\ UNCHANGED <<audit_lookup, authored>>
+    /\ UNCHANGED <<audit_lookup, authored, batch_state>>
 
 \* Detach: clear bindings for the connection (healthy) or leak them
 \* (buggy). Always flips attached to FALSE.
@@ -216,12 +257,16 @@ Detach(c) ==
     \* clears, surfacing the leak as a bindings ≠ authored mismatch.
     /\ authored' = [authored EXCEPT ![c] = EmptyBindingTable]
     /\ global_bindings' = global_bindings
+    \* Detach also clears any in-progress batch (the connection is
+    \* leaving; partial multi-bind state has nowhere to land).
+    /\ batch_state' = [batch_state EXCEPT ![c] = NO_BATCH]
     /\ UNCHANGED audit_lookup
 
 \* Bind: install a binding (target path → source) on the acting
 \* connection's mount table. Cap the table size.
 Bind(c, p, s) ==
     /\ attached[c]
+    /\ batch_state[c] = NO_BATCH    \* exclude during multi-bind in flight
     /\ BindCount(c) < MaxBindsPerConn
     /\ IF BuggyGlobalBindings
        THEN /\ global_bindings' = [global_bindings EXCEPT ![p] = s]
@@ -231,13 +276,14 @@ Bind(c, p, s) ==
     \* authored[c][p] always reflects the most-recent intent of c's
     \* OWN bind/unbind, regardless of buggy variant.
     /\ authored' = [authored EXCEPT ![c][p] = s]
-    /\ UNCHANGED <<attached, audit_lookup>>
+    /\ UNCHANGED <<attached, audit_lookup, batch_state>>
 
 \* Unbind: clear a binding on the acting connection's mount table.
 \* BuggyUnbindCrosstalk: also clears the same path on the "other"
 \* connection. Only meaningful if |Connections| >= 2.
 Unbind(c, p) ==
     /\ attached[c]
+    /\ batch_state[c] = NO_BATCH    \* exclude during multi-bind in flight
     /\ IF BuggyGlobalBindings
        THEN /\ global_bindings' = [global_bindings EXCEPT ![p] = NONE]
             /\ bindings' = bindings
@@ -254,7 +300,7 @@ Unbind(c, p) ==
     \* authored[other][p], which surfaces as a bindings ≠ authored
     \* divergence on the other connection.
     /\ authored' = [authored EXCEPT ![c][p] = NONE]
-    /\ UNCHANGED <<attached, audit_lookup>>
+    /\ UNCHANGED <<attached, audit_lookup, batch_state>>
 
 \* Lookup: models a 9P Twalk arrival on connection c targeting path p.
 \* Records BOTH the observed value (from the spec's Lookup function,
@@ -272,7 +318,126 @@ ObserveLookup(c, p) ==
                        ELSE bindings[c][p]
        IN audit_lookup' = [audit_lookup EXCEPT
                               ![c][p] = <<observed, expected>>]
-    /\ UNCHANGED <<attached, bindings, global_bindings, authored>>
+    /\ UNCHANGED <<attached, bindings, global_bindings, authored,
+                     batch_state>>
+
+\* --------------------------------------------------------------------------
+\* Multi-bind batch actions (P9-9P-2c).
+\*
+\* The impl's apply_attach_spec (Tattach with `aname = "spec:..."`)
+\* applies a list of bindings transactionally: snapshot pre-batch
+\* state, apply entries one-at-a-time, on any failure restore the
+\* snapshot. The atomicity-on-failure contract is what R93 P2-1's
+\* original truncate-from-end rollback violated — a buggy abort
+\* leaks REPLACE'd entries that pre-existed the batch.
+\*
+\* We model the batch as a four-phase lifecycle:
+\*   StartBatch(c, target_map) — begin, snapshot bindings.
+\*   ApplyNextInBatch(c)       — apply one entry from `pending`.
+\*   CommitBatch(c)            — finalize success.
+\*   AbortBatch(c)              — rollback. Healthy: restore snapshot
+\*                                for both bindings + authored. Buggy
+\*                                variants leak partial applies in
+\*                                two distinct shapes:
+\*                                  * BuggyMultiBindNoRollback —
+\*                                    bindings stay; authored reverts.
+\*                                    Observable as bindings ≠ authored
+\*                                    on every applied entry.
+\*                                  * BuggyMultiBindTruncateOnly —
+\*                                    bindings restored only for paths
+\*                                    that were NONE pre-batch; in-place
+\*                                    REPLACE on pre-existing bindings
+\*                                    is NOT undone. Models R93 P2-1
+\*                                    directly. Observable as
+\*                                    bindings ≠ authored on REPLACE'd
+\*                                    entries.
+\*
+\* All four actions gate on `EnableMultiBind`. The existing healthy
+\* namespace.cfg sets EnableMultiBind = FALSE so its state-space
+\* count is preserved. New cfgs (namespace_multi_bind*.cfg) enable
+\* the batch state machine.
+\* --------------------------------------------------------------------------
+
+\* StartBatch: begin a multi-bind batch. `target_map` is a function
+\* assigning a desired source (or NONE) to each path; paths with
+\* a non-NONE entry are "pending" — to be applied. pending must be
+\* non-empty AND its size ≤ MaxBindsPerConn (atomic-batch cap; the
+\* impl's P9_ATTACH_SPEC_MAX = 16 ≤ STM_9P_MAX_BINDINGS = 128).
+StartBatch(c, target_map) ==
+    /\ EnableMultiBind
+    /\ attached[c]
+    /\ batch_state[c] = NO_BATCH
+    /\ LET pending == {p \in Paths : target_map[p] # NONE}
+       IN /\ pending # {}
+          /\ Cardinality(pending) <= MaxBindsPerConn
+          /\ batch_state' = [batch_state EXCEPT
+                                ![c] = [snapshot |-> bindings[c],
+                                        target  |-> target_map,
+                                        pending |-> pending,
+                                        applied |-> {}]]
+    /\ UNCHANGED <<attached, bindings, global_bindings, audit_lookup,
+                     authored>>
+
+\* ApplyNextInBatch: pick a pending path and install its binding.
+\* Both bindings[c][p] AND authored[c][p] update — at this point
+\* the entry has been "authored" by c via the in-progress batch.
+ApplyNextInBatch(c) ==
+    /\ EnableMultiBind
+    /\ batch_state[c] # NO_BATCH
+    /\ \E p \in batch_state[c].pending :
+         LET s == batch_state[c].target[p] IN
+         /\ bindings'  = [bindings  EXCEPT ![c][p] = s]
+         /\ authored'  = [authored  EXCEPT ![c][p] = s]
+         /\ batch_state' = [batch_state EXCEPT
+                                ![c] = [snapshot |-> batch_state[c].snapshot,
+                                        target  |-> batch_state[c].target,
+                                        pending |-> batch_state[c].pending \ {p},
+                                        applied |-> batch_state[c].applied \cup {p}]]
+    /\ UNCHANGED <<attached, global_bindings, audit_lookup>>
+
+\* CommitBatch: finalize a successfully-applied batch. Requires no
+\* entries left to apply. Clears batch_state.
+CommitBatch(c) ==
+    /\ EnableMultiBind
+    /\ batch_state[c] # NO_BATCH
+    /\ batch_state[c].pending = {}
+    /\ batch_state' = [batch_state EXCEPT ![c] = NO_BATCH]
+    /\ UNCHANGED <<attached, bindings, global_bindings, audit_lookup,
+                     authored>>
+
+\* AbortBatch: roll back the in-progress batch. Healthy variant
+\* restores both bindings and authored to the pre-batch snapshot.
+\* Buggy variants leak partial applies in distinct shapes — see
+\* the section header for failure-mode descriptions.
+AbortBatch(c) ==
+    /\ EnableMultiBind
+    /\ batch_state[c] # NO_BATCH
+    /\ \/ /\ ~BuggyMultiBindNoRollback
+          /\ ~BuggyMultiBindTruncateOnly
+          \* Healthy: restore both.
+          /\ bindings' = [bindings EXCEPT
+                            ![c] = batch_state[c].snapshot]
+          /\ authored' = [authored EXCEPT
+                            ![c] = batch_state[c].snapshot]
+       \/ /\ BuggyMultiBindNoRollback
+          \* Buggy: bindings stay (full leak); authored reverts.
+          /\ bindings' = bindings
+          /\ authored' = [authored EXCEPT
+                            ![c] = batch_state[c].snapshot]
+       \/ /\ BuggyMultiBindTruncateOnly
+          \* Buggy: bindings restored only for paths that were NONE
+          \* in the snapshot (undo appends). In-place REPLACE on
+          \* pre-existing bindings is NOT undone. Models R93 P2-1.
+          \* authored fully reverts.
+          /\ bindings' = [bindings EXCEPT
+                            ![c] = [p \in Paths |->
+                                IF batch_state[c].snapshot[p] = NONE
+                                THEN NONE
+                                ELSE bindings[c][p]]]
+          /\ authored' = [authored EXCEPT
+                            ![c] = batch_state[c].snapshot]
+    /\ batch_state' = [batch_state EXCEPT ![c] = NO_BATCH]
+    /\ UNCHANGED <<attached, global_bindings, audit_lookup>>
 
 \* --------------------------------------------------------------------------
 \* Next.
@@ -284,6 +449,11 @@ Next ==
     \/ \E c \in Connections, p \in Paths, s \in Sources : Bind(c, p, s)
     \/ \E c \in Connections, p \in Paths : Unbind(c, p)
     \/ \E c \in Connections, p \in Paths : ObserveLookup(c, p)
+    \/ \E c \in Connections,
+          tm \in [Paths -> Sources \cup {NONE}] : StartBatch(c, tm)
+    \/ \E c \in Connections : ApplyNextInBatch(c)
+    \/ \E c \in Connections : CommitBatch(c)
+    \/ \E c \in Connections : AbortBatch(c)
 
 Spec == Init /\ [][Next]_vars
 
@@ -307,6 +477,15 @@ TypeOK ==
          \/ audit_lookup[c][p] = NONE
          \/ /\ audit_lookup[c][p] \in Seq(Sources)
             /\ Len(audit_lookup[c][p]) = 2
+    /\ \A c \in Connections :
+         \/ batch_state[c] = NO_BATCH
+         \/ /\ DOMAIN batch_state[c] = {"snapshot", "target",
+                                            "pending", "applied"}
+            /\ batch_state[c].snapshot \in [Paths -> Sources \cup {NONE}]
+            /\ batch_state[c].target   \in [Paths -> Sources \cup {NONE}]
+            /\ batch_state[c].pending  \subseteq Paths
+            /\ batch_state[c].applied  \subseteq Paths
+            /\ (batch_state[c].pending \cap batch_state[c].applied) = {}
 
 \* Per-connection bind-count cap is never exceeded.
 BindCapBound ==
