@@ -154,6 +154,17 @@ static uint32_t build_tclunk(uint8_t *req, uint16_t tag, uint32_t fid)
     return sz;
 }
 
+static uint32_t build_tstat(uint8_t *req, uint16_t tag, uint32_t fid)
+{
+    uint8_t *p = req + 7;
+    pack_u32(p, fid); p += 4;
+    uint32_t sz = (uint32_t)(p - req);
+    pack_u32(req, sz);
+    req[4] = STM_P9_TSTAT;
+    pack_u16(req + 5, tag);
+    return sz;
+}
+
 /* ── server helpers ─────────────────────────────────────────────────── */
 
 static stm_p9_server *make_ctl_server(stm_ctl *c)
@@ -1690,9 +1701,14 @@ STM_TEST(ctl_d1_admin_peer_nonroot_admin_via_admin_uid)
     stm_ctl_destroy(c);
 }
 
-STM_TEST(ctl_d1_admin_peer_nonadmin_eacces)
+STM_TEST(ctl_d1_admin_peer_nonadmin_walk_rejected)
 {
-    /* Non-admin caller: uid 1000, no admin_uid set → uid 0 only is admin. */
+    /* Non-admin caller: uid 1000, no admin_uid set → uid 0 only is
+     * admin. R100 P2-1 fix: walk-THROUGH /admin/ from non-admin
+     * returns ENOENT at step 1, server replies RERROR (file not
+     * found) per stm_p9_server's partial-walk handling. The
+     * non-admin sees the same wire response as if /admin/peer
+     * didn't exist — the documented POSIX-mode-0500 posture. */
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_set_caller(c, 1000, 1000));
@@ -1704,10 +1720,7 @@ STM_TEST(ctl_d1_admin_peer_nonadmin_eacces)
     const char *path[] = { "admin", "peer" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
     STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
-
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    /* R100 P2-1 (post-fix): walk fails — partial walk treated as RERROR. */
     STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
 
     stm_p9_server_destroy(s);
@@ -1742,6 +1755,166 @@ STM_TEST(ctl_d1_set_caller_null_rejected)
     /* Defensive: NULL stm_ctl → STM_EINVAL. */
     STM_ASSERT_ERR(stm_ctl_set_caller(NULL, 0, 0), STM_EINVAL);
     STM_ASSERT_ERR(stm_ctl_set_admin_uid(NULL, 0), STM_EINVAL);
+}
+
+/* ── R100 regressions ─────────────────────────────────────────────── */
+
+/* R100 P2-1 regression: confirm walk-then-stat info-disclosure is
+ * closed. A non-admin Twalk(root, "admin", "peer") must NOT bind a
+ * fid for /admin/peer; subsequent Tstat MUST NOT leak the file's
+ * mode bits. The single-step Twalk(root, "admin") still succeeds
+ * (matches POSIX `stat /admin` for mode-0500 dirs), and Tstat on
+ * THAT fid returns the dir's mode 0500 — which is acceptable per
+ * POSIX (you can stat a 0500 dir without traversing it). */
+STM_TEST(ctl_r100_p2_1_admin_walk_through_blocks_nonadmin)
+{
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    STM_ASSERT_OK(stm_ctl_set_caller(c, 1000, 1000));
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+
+    /* Walk INTO /admin/ — succeeds; non-admin sees the dir exists
+     * (matches POSIX visibility of a mode-0500 dir from outside). */
+    const char *p_admin[] = { "admin" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 1, p_admin);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+
+    /* Tstat on /admin/ — succeeds, returns mode 0500. POSIX
+     * analogue: `stat /admin` works for non-admin even when the
+     * dir's mode forbids traversal. */
+    sz = build_tstat(req, 3, 11);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RSTAT);
+
+    /* Walk THROUGH /admin/ for a child — fails. Server returns
+     * RERROR (file not found) per partial-walk semantics: step 0
+     * succeeded but step 1's vops_walk returned ENOENT. */
+    const char *p_peer[] = { "admin", "peer" };
+    sz = build_twalk(req, 4, 10, 12, 2, p_peer);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* fid 12 was NOT bound (per the partial-walk binding rule).
+     * Tstat on fid 12 returns RERROR (unknown fid) — no /admin/peer
+     * mode leak. */
+    sz = build_tstat(req, 5, 12);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
+/* R100 P3-1 regression: when admin_uid is unset (the documented
+ * default), the materializer must render "(unset)" not the integer
+ * sentinel UINT_MAX. A root caller with default config sees the
+ * difference here. */
+STM_TEST(ctl_r100_p3_1_unset_admin_uid_renders_unset)
+{
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));
+    /* Deliberately do NOT call stm_ctl_set_admin_uid — admin_uid
+     * stays at the (uid_t)-1 sentinel. */
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "admin", "peer" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+
+    sz = build_tread(req, 4, 11, 0, 4096);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    uint32_t count = load_u32(resp + 7);
+    char body[1024];
+    memcpy(body, resp + 11, count);
+    body[count] = '\0';
+
+    STM_ASSERT(strstr(body, "admin-uid: (unset)\n") != NULL);
+    STM_ASSERT(strstr(body, "is-admin: yes\n")      != NULL);  /* root */
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
+/* R100 P3-2 regression: caller_uid == 0 (root) MUST be admin
+ * regardless of admin_uid value. A future predicate-reorder bug
+ * (e.g., "caller_uid == admin_uid" check first, root short-circuit
+ * second) would silently strip root's admin status when admin_uid
+ * is set to a non-root uid. Pin the priority. */
+STM_TEST(ctl_r100_p3_2_root_beats_admin_uid)
+{
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    STM_ASSERT_OK(stm_ctl_set_admin_uid(c, 1000));
+    STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "admin", "peer" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+
+    sz = build_tread(req, 4, 11, 0, 4096);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    uint32_t count = load_u32(resp + 7);
+    char body[1024];
+    memcpy(body, resp + 11, count);
+    body[count] = '\0';
+    STM_ASSERT(strstr(body, "is-admin: yes\n")    != NULL);
+    STM_ASSERT(strstr(body, "admin-uid: 1000\n")  != NULL);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
+/* R100 P3-3 regression: stm_ctl_set_admin_uid(c, (uid_t)-1) resets
+ * to the unset sentinel; a previously-admin uid (e.g., 1000) loses
+ * admin status. Tightens the contract: the setter is unconditional,
+ * not skip-if-already-set. */
+STM_TEST(ctl_r100_p3_3_set_admin_uid_can_reset)
+{
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    STM_ASSERT_OK(stm_ctl_set_admin_uid(c, 1000));
+    STM_ASSERT_OK(stm_ctl_set_caller(c, 1000, 1000));
+    /* uid 1000 is admin while admin_uid == 1000. */
+
+    /* Reset admin_uid back to unset. */
+    STM_ASSERT_OK(stm_ctl_set_admin_uid(c, (uid_t)-1));
+
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    /* uid 1000 is no longer admin → walk through /admin/ refused. */
+    const char *path[] = { "admin", "peer" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
 }
 
 STM_TEST_MAIN("ctl")

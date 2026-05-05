@@ -851,6 +851,22 @@ static stm_status materialize_dataset_properties(stm_ctl *c, ctl_session *s)
     return STM_OK;
 }
 
+/* R100 P3-1: render uid/gid sentinel ((uid_t)-1 / (gid_t)-1) as the
+ * literal "(unset)" rather than the integer max. Without this, an
+ * operator running `cat /ctl/admin/peer` with a default-config
+ * stratumd would see "admin-uid: 4294967295" — indistinguishable
+ * from the daemon explicitly setting admin_uid = UINT_MAX. */
+static int append_uid_line(char *buf, size_t cap, const char *label, uid_t v)
+{
+    if (v == (uid_t)-1) return snprintf(buf, cap, "%s(unset)\n", label);
+    return snprintf(buf, cap, "%s%u\n", label, (unsigned)v);
+}
+static int append_gid_line(char *buf, size_t cap, const char *label, gid_t v)
+{
+    if (v == (gid_t)-1) return snprintf(buf, cap, "%s(unset)\n", label);
+    return snprintf(buf, cap, "%s%u\n", label, (unsigned)v);
+}
+
 /* Materialize /admin/peer — exposes the connecting client's uid/gid
  * + admin status as observed by the daemon. Read-only; admin-only
  * (vops_open enforces).
@@ -859,21 +875,29 @@ static stm_status materialize_dataset_properties(stm_ctl *c, ctl_session *s)
  * confirm "the daemon sees me as uid X / gid Y / admin=yes" before
  * trying privileged operations. Distinguishes "admin gate refused
  * because I'm not admin" from "the daemon thinks my uid is wrong"
- * (e.g., SO_PEERCRED returned the wrong identity). */
+ * (e.g., SO_PEERCRED returned the wrong identity).
+ *
+ * Body cap: 4 lines, ~30 chars worst case (incl. "(unset)" sentinel
+ * placeholders) ≈ 120 bytes; STM_CTL_BODY_MAX = 1 KiB. Comfortable. */
 static stm_status materialize_admin_peer(stm_ctl *c, ctl_session *s)
 {
-    int n = snprintf((char *)s->buf, sizeof s->buf,
-        "caller-uid: %u\n"
-        "caller-gid: %u\n"
-        "admin-uid: %u\n"
-        "is-admin: %s\n",
-        (unsigned)c->caller_uid,
-        (unsigned)c->caller_gid,
-        (unsigned)c->admin_uid,
-        ctl_caller_is_admin(c) ? "yes" : "no");
-    if (n < 0) return STM_EIO;
-    if ((size_t)n >= sizeof s->buf) return STM_ERANGE;
-    s->len = (uint32_t)n;
+    char *p = (char *)s->buf;
+    size_t left = sizeof s->buf;
+    int n;
+    n = append_uid_line(p, left, "caller-uid: ", c->caller_uid);
+    if (n < 0 || (size_t)n >= left) return STM_ERANGE;
+    p += n; left -= (size_t)n;
+    n = append_gid_line(p, left, "caller-gid: ", c->caller_gid);
+    if (n < 0 || (size_t)n >= left) return STM_ERANGE;
+    p += n; left -= (size_t)n;
+    n = append_uid_line(p, left, "admin-uid: ", c->admin_uid);
+    if (n < 0 || (size_t)n >= left) return STM_ERANGE;
+    p += n; left -= (size_t)n;
+    n = snprintf(p, left, "is-admin: %s\n",
+                  ctl_caller_is_admin(c) ? "yes" : "no");
+    if (n < 0 || (size_t)n >= left) return STM_ERANGE;
+    p += n;
+    s->len = (uint32_t)(p - (char *)s->buf);
     return STM_OK;
 }
 
@@ -1090,6 +1114,21 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
     }
 
     case KIND_ADMIN_DIR:
+        /* R100 P2-1: gate walk-THROUGH /admin/ for non-admin callers
+         * so children's qids never leak. Without this gate, a non-
+         * admin could Twalk(root, "admin", "peer") successfully —
+         * step 0 binds /admin/'s qid (correct, matches POSIX
+         * `stat /admin` for mode-0500 dirs), step 1 binds
+         * /admin/peer's qid (LEAK — POSIX `stat /admin/peer` for a
+         * non-admin would fail with EACCES on the parent traversal,
+         * never revealing the file's metadata). The non-admin would
+         * then Tstat the bound fid to read mode=0400 + qid_type. We
+         * use STM_ENOENT (not STM_EACCES) so the wire response is
+         * indistinguishable from "/admin/no_such_file" — the
+         * documented "POSIX-mode-0500-dir" posture. The /admin/
+         * dirent at root readdir remains visible (emit_entry calls
+         * stat_at, not vops_walk; readdir doesn't traverse). */
+        if (!ctl_caller_is_admin(c)) return STM_ENOENT;
         if (str_eq(name, name_len, KIND_META[KIND_ADMIN_PEER].static_name))
             return stat_at(c, qid_root(KIND_ADMIN_PEER), out);
         return STM_ENOENT;
