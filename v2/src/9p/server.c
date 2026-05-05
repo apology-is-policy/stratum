@@ -131,6 +131,20 @@ typedef struct p9_fid {
     char       *ns_path;
     size_t      ns_path_len;     /* strlen(ns_path); 0 iff ns_path == NULL */
 
+    /* Connection's namespace root for THIS fid. ARC §8.8.1's
+     * Tattach-with-aname forms can set the connection root at a
+     * non-dataset-root inode (the "chroot" form: aname="/sub" makes
+     * the fid see /sub as "/"). The (conn_root_dataset, conn_root_ino)
+     * pair is the (ds, ino) at which the connection's "/" is rooted
+     * — used by Twalk to resolve ".." that pops above cur_path's
+     * recordable namespace state, AND by ".." at the connection root
+     * (clamps to conn_root_ino, matching Plan 9 chroot semantics).
+     * Inherited at every Twalk so cloned fids preserve the root
+     * context; preserved at Tlcreate (the repurposed fid is in the
+     * same connection). R93 P3-1 fix. */
+    uint64_t    conn_root_dataset;
+    uint64_t    conn_root_ino;
+
     /* AUX_XATTR state. Used only when kind == P9_FID_AUX_XATTR. The
      * aux fid encapsulates one of two flavors:
      *   - Txattrwalk LIST/VALUE-READ: `xattr_buf` holds the bytes
@@ -582,27 +596,33 @@ static stm_status fid_set_ns_path(p9_fid *f,
     return STM_OK;
 }
 
-/* Walk an absolute path within a dataset, starting at ino == 1 (the
- * dataset's root inode per ARCH §11.3 / inode.tla::RootIno). Returns
- * the resolved (ino, gen, qid_type) on success.
+/* Walk an absolute path within a dataset, starting at `start_ino`
+ * (typically ino == 1 for dataset-rooted walks, or a fid's
+ * `conn_root_ino` for connection-rooted walks). Returns the
+ * resolved (ino, gen, qid_type) on success.
  *
- * Used by P9-9P-2b's `aname` parsing — both the absolute-path
- * "chroot" form ("/some/dir") and the spec form (each spec entry's
- * source path) need this primitive.
+ * Used by:
+ *   - P9-9P-2b's `aname` parsing (start_ino = 1) — both the
+ *     absolute-path "chroot" form and the spec form's source paths.
+ *   - h_walk's "." / ".." resolution (start_ino = f->conn_root_ino)
+ *     — reroutes when canonicalization pops above the underlying-tree
+ *     parent or when "." re-stats current cumulative path.
  *
  * The path is canonicalized first so that "/foo/../bar" resolves
  * cleanly. Bindings are NOT consulted — this resolves against the
- * UNDERLYING dataset tree, which is the correct semantics for
- * Tattach-time path resolution: the connection's own bindings table
- * is empty until Tattach succeeds and the spec entries install them.
+ * UNDERLYING dataset tree, which is the correct semantics for both
+ * Tattach-time resolution AND for Twalk's fallthrough on "." / ".."
+ * (a binding's target path was already consulted before this helper
+ * is invoked).
  *
  * Returns STM_ENOENT if any component is missing, STM_EINVAL if the
  * path is malformed, STM_ENAMETOOLONG / STM_EOVERFLOW for size limits. */
-static stm_status ns_walk_abs_path(stm_9p_server *s, uint64_t ds,
-                                       const char *path, size_t path_len,
-                                       uint64_t *out_ino,
-                                       uint32_t *out_gen,
-                                       uint8_t  *out_qt)
+static stm_status ns_walk_abs_path_from(stm_9p_server *s, uint64_t ds,
+                                            uint64_t start_ino,
+                                            const char *path, size_t path_len,
+                                            uint64_t *out_ino,
+                                            uint32_t *out_gen,
+                                            uint8_t  *out_qt)
 {
     char   canon[STM_9P_NS_PATH_MAX + 1u];
     size_t canon_len = 0;
@@ -610,7 +630,7 @@ static stm_status ns_walk_abs_path(stm_9p_server *s, uint64_t ds,
                                        canon, sizeof canon, &canon_len);
     if (rc != STM_OK) return rc;
 
-    uint64_t cur_ino = 1u;
+    uint64_t cur_ino = start_ino;
     if (canon_len > 1u) {
         size_t i = 1u;
         while (i < canon_len) {
@@ -638,6 +658,17 @@ static stm_status ns_walk_abs_path(stm_9p_server *s, uint64_t ds,
     return STM_OK;
 }
 
+/* Convenience: dataset-rooted absolute-path walk (start_ino = 1). */
+static stm_status ns_walk_abs_path(stm_9p_server *s, uint64_t ds,
+                                       const char *path, size_t path_len,
+                                       uint64_t *out_ino,
+                                       uint32_t *out_gen,
+                                       uint8_t  *out_qt)
+{
+    return ns_walk_abs_path_from(s, ds, /* start_ino */ 1u,
+                                    path, path_len, out_ino, out_gen, out_qt);
+}
+
 /* Cap on entries in a single Tattach spec string. Spec entries are
  * comma-separated `src=tgt` pairs; STM_9P_MAX_BINDINGS is the
  * connection-wide cap (so a single spec cannot exceed it either),
@@ -646,50 +677,99 @@ static stm_status ns_walk_abs_path(stm_9p_server *s, uint64_t ds,
  * subsequent Tbind calls. */
 #define P9_ATTACH_SPEC_MAX  16u
 
+/* Helper for apply_attach_spec — free every entry in [arr, arr+n)
+ * and the array itself. Used by both the snapshot teardown (success
+ * path) and the rollback restoration (failure path). */
+static void p9_bindings_free_array(p9_binding *arr, uint32_t n)
+{
+    if (!arr) return;
+    for (uint32_t i = 0; i < n; i++) free(arr[i].path);
+    free(arr);
+}
+
+/* Deep-copy s->bindings into *out_arr (out_n = s->num_bindings).
+ * Allocates *out_arr; caller frees via p9_bindings_free_array on
+ * abandonment OR installs into s->bindings on rollback. Returns
+ * STM_ENOMEM on malloc failure (with no allocations leaked). */
+static stm_status p9_bindings_snapshot(stm_9p_server *s,
+                                          p9_binding **out_arr,
+                                          uint32_t *out_n)
+{
+    *out_arr = NULL;
+    *out_n = 0;
+    if (s->num_bindings == 0u) return STM_OK;
+    p9_binding *arr = calloc(s->num_bindings, sizeof *arr);
+    if (!arr) return STM_ENOMEM;
+    for (uint32_t i = 0; i < s->num_bindings; i++) {
+        arr[i] = s->bindings[i];                /* shallow scalar copy */
+        arr[i].path = malloc(s->bindings[i].path_len + 1u);
+        if (!arr[i].path) {
+            for (uint32_t j = 0; j < i; j++) free(arr[j].path);
+            free(arr);
+            return STM_ENOMEM;
+        }
+        memcpy(arr[i].path,
+                s->bindings[i].path, s->bindings[i].path_len);
+        arr[i].path[s->bindings[i].path_len] = '\0';
+    }
+    *out_arr = arr;
+    *out_n = s->num_bindings;
+    return STM_OK;
+}
+
 /* Apply an `aname = "spec:..."` directive to the connection. Each
  * entry is `src_path=tgt_path`; entries separated by ','. src_path is
  * walked in the dataset to resolve the source ino; tgt_path is
  * canonicalized in the connection's namespace. Each entry maps to one
  * namespace.tla::Bind action.
  *
- * Atomic-on-failure: if any entry fails, ALL bindings installed by
- * this call are rolled back so the connection is left with an empty
- * bindings table (matching the post-server-create initial state).
- * The fid is the caller's problem (h_attach releases on failure).
+ * Atomic-on-failure (R93 P2-1): on any error, the connection's
+ * bindings are restored to the EXACT pre-call state — including
+ * pre-existing entries that may have been overwritten in-place via
+ * ns_bindings_set's REPLACE branch. Implemented via
+ * snapshot-then-restore: a deep copy of s->bindings is taken before
+ * the parse loop; on failure we tear down the (mutated) current array
+ * and reinstate the snapshot. STM_9P_MAX_BINDINGS = 128 so the O(n)
+ * snapshot cost is trivial.
  *
  * The spec uses '=' and ',' as delimiters — names containing those
  * bytes are unrepresentable here and produce STM_EINVAL. v2.0
  * compromise documented in commit message; spec is rare in practice
- * and clients with such names can use Tbind individually. */
+ * and clients with such names can use Tbind individually.
+ *
+ * R93 P3-2: trailing-comma in the spec is rejected with STM_EINVAL
+ * (the comma demands a following entry; an empty trailing entry has
+ * no '=' so the parser already rejects, and the explicit check at
+ * loop exit closes the case where comma was followed by NUL). */
 static stm_status apply_attach_spec(stm_9p_server *s,
                                        uint64_t ds,
                                        const char *spec, size_t spec_len)
 {
-    /* spec_len includes the "spec:" prefix already stripped by caller;
+    /* spec_len excludes the "spec:" prefix already stripped by caller;
      * `spec` points at the first byte after "spec:". */
-    uint32_t before = s->num_bindings;
-    size_t   parsed_entries = 0;
-    size_t   p = 0;
+    p9_binding *snap_arr = NULL;
+    uint32_t    snap_n   = 0;
+    stm_status  snap_rc  = p9_bindings_snapshot(s, &snap_arr, &snap_n);
+    if (snap_rc != STM_OK) return snap_rc;
+
+    size_t parsed_entries = 0;
+    size_t p = 0;
+    stm_status rc = STM_OK;
 
     while (p < spec_len) {
         if (parsed_entries >= P9_ATTACH_SPEC_MAX) {
-            /* Spec too long — rollback. */
-            while (s->num_bindings > before) {
-                p9_binding *last = &s->bindings[s->num_bindings - 1u];
-                free(last->path);
-                memset(last, 0, sizeof *last);
-                s->num_bindings--;
-            }
-            return STM_EOVERFLOW;
+            rc = STM_EOVERFLOW;
+            goto fail;
         }
 
-        /* Find next '=' within this entry (terminator = ',' or end). */
         size_t eq = p;
         while (eq < spec_len && spec[eq] != '=' && spec[eq] != ',')
             eq++;
-        if (eq >= spec_len || spec[eq] != '=') goto bad;
+        if (eq >= spec_len || spec[eq] != '=') {
+            rc = STM_EINVAL;
+            goto fail;
+        }
 
-        /* Find next ',' (or end) — entry terminator. */
         size_t comma = eq + 1u;
         while (comma < spec_len && spec[comma] != ',') comma++;
 
@@ -698,50 +778,54 @@ static stm_status apply_attach_spec(stm_9p_server *s,
         const char *tgt = spec + eq + 1u;
         size_t      tgt_len = comma - (eq + 1u);
 
-        if (src_len == 0u || tgt_len == 0u) goto bad;
+        if (src_len == 0u || tgt_len == 0u) {
+            rc = STM_EINVAL;
+            goto fail;
+        }
 
-        /* Resolve source ino. */
         uint64_t src_ino = 0;
-        stm_status rc = ns_walk_abs_path(s, ds, src, src_len,
-                                              &src_ino, NULL, NULL);
-        if (rc != STM_OK) goto cleanup_and_fail_with_rc;
+        rc = ns_walk_abs_path(s, ds, src, src_len, &src_ino, NULL, NULL);
+        if (rc != STM_OK) goto fail;
 
-        /* Canonicalize target. */
         char   canon_tgt[STM_9P_NS_PATH_MAX + 1u];
         size_t canon_tgt_len = 0;
         rc = ns_canonicalize(tgt, tgt_len,
                                 canon_tgt, sizeof canon_tgt, &canon_tgt_len);
-        if (rc != STM_OK) goto cleanup_and_fail_with_rc;
+        if (rc != STM_OK) goto fail;
 
-        /* Install. */
         rc = ns_bindings_set(s, canon_tgt, canon_tgt_len,
                                 ds, src_ino, STM_9P_BIND_REPLACE);
-        if (rc != STM_OK) goto cleanup_and_fail_with_rc;
+        if (rc != STM_OK) goto fail;
 
         parsed_entries++;
         if (comma >= spec_len) break;
+        /* Trailing-comma rejection (R93 P3-2): if the comma is the
+         * LAST byte of the spec body, the next loop iteration would
+         * see an empty entry. Detect here and reject explicitly. */
+        if (comma + 1u >= spec_len) {
+            rc = STM_EINVAL;
+            goto fail;
+        }
         p = comma + 1u;
-        continue;
-
-      cleanup_and_fail_with_rc:
-        while (s->num_bindings > before) {
-            p9_binding *last = &s->bindings[s->num_bindings - 1u];
-            free(last->path);
-            memset(last, 0, sizeof *last);
-            s->num_bindings--;
-        }
-        return rc;
-      bad:
-        while (s->num_bindings > before) {
-            p9_binding *last = &s->bindings[s->num_bindings - 1u];
-            free(last->path);
-            memset(last, 0, sizeof *last);
-            s->num_bindings--;
-        }
-        return STM_EINVAL;
     }
-    if (parsed_entries == 0u) return STM_EINVAL;
+    if (parsed_entries == 0u) {
+        rc = STM_EINVAL;
+        goto fail;
+    }
+
+    /* Success — discard the snapshot. */
+    p9_bindings_free_array(snap_arr, snap_n);
     return STM_OK;
+
+  fail:
+    /* Tear down any partial mutations of s->bindings AND any in-place
+     * REPLACE that overwrote pre-existing entries. Reinstate the
+     * snapshot wholesale. */
+    p9_bindings_free_array(s->bindings, s->num_bindings);
+    s->bindings     = snap_arr;
+    s->num_bindings = snap_n;
+    s->bindings_cap = snap_n;     /* tight cap; future Bind grows */
+    return rc;
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -831,9 +915,16 @@ static stm_status h_version(stm_9p_server *s,
     if (client_msize > s->msize_max)     client_msize = s->msize_max;
     s->msize = client_msize;
 
-    /* A new Tversion abandons every fid per spec. */
+    /* A new Tversion abandons every fid per spec. The .L spec frames
+     * Tversion as "begin a new session"; per-connection namespace
+     * state outlives a single Tversion in our impl ONLY if no fids
+     * are needed to interpret it (which contradicts the entire
+     * Twalk → bindings-route flow). Drain bindings alongside the fid
+     * table so namespace.tla::Detach's clears-bindings discipline
+     * applies symmetrically. R93 P3-4 fix. */
     for (size_t i = 0; i < STM_9P_MAX_FIDS; i++)
         fid_release_locked(s, &s->fids[i]);
+    ns_bindings_clear(s);
 
     uint32_t need = STM_9P_HDR_SIZE + 4u + 2u + neg_len;
     if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
@@ -940,6 +1031,14 @@ static stm_status h_attach(stm_9p_server *s,
     f->ino        = bound_ino;
     f->cached_gen = bound_gen;
     f->qid_type   = bound_qt;
+
+    /* The (conn_root_dataset, conn_root_ino) pair pins this fid's
+     * connection-namespace root. For the default + spec aname kinds
+     * it's (root_dataset, 1); for the chroot form it's (root_dataset,
+     * resolved_ino). Used by Twalk to resolve "." / ".." that would
+     * otherwise pop above the underlying-tree parent. R93 P3-1 fix. */
+    f->conn_root_dataset = s->root_dataset;
+    f->conn_root_ino     = bound_ino;
 
     /* ns_path = "/" — the root of the connection's namespace. Even for
      * the absolute-path "chroot" form, the connection sees its root
@@ -1083,6 +1182,18 @@ static stm_status h_walk(stm_9p_server *s,
     p9_fid *f = fid_get(s, fid);
     if (!f)
         return reply_rlerror(resp, resp_cap, resp_len, tag, EBADF);
+    /* AUX_XATTR fids are aux state, not navigation bindings.
+     * Refusing Twalk on them prevents:
+     *   (a) the kind-flip-back-to-NODE leak (R93 P2-2) — if Twalk
+     *       on an AUX_XATTR fid succeeded, the kind=NODE assignment
+     *       at the end would orphan the still-allocated xattr_buf
+     *       and xattr_name.
+     *   (b) the AUX_XATTR-confused-deputy class (R93 P1-1) —
+     *       AUX_XATTR fids must transition to FREE via Tclunk (which
+     *       commits their xattr-create payload if applicable);
+     *       no other handler should mutate them. */
+    if (f->kind != P9_FID_NODE)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, EINVAL);
     if (f->is_open)
         return reply_rlerror(resp, resp_cap, resp_len, tag, EINVAL);
 
@@ -1141,7 +1252,14 @@ static stm_status h_walk(stm_9p_server *s,
 
         uint64_t next_ds  = cur_ds;
         uint64_t next_ino = 0;
-        bool     binding_hit = false;
+
+        /* "." (no-op on cumulative state) and ".." (pops a component
+         * via canonicalization) are wire-legal Twalk components per
+         * the .L spec, but the underlying fs_validate_dirent_name
+         * rejects them. Detect via length-prefix to avoid pattern
+         * mistakes (a name "..foo" is NOT ".."). R93 P3-1 fix. */
+        bool is_dot    = (slen == 1u && name[0] == '.');
+        bool is_dotdot = (slen == 2u && name[0] == '.' && name[1] == '.');
 
         /* namespace.tla::Lookup — exact-match on the cumulative path.
          * A binding routes (cur_ds, cur_ino) to the binding's source. */
@@ -1149,7 +1267,34 @@ static stm_status h_walk(stm_9p_server *s,
         if (b) {
             next_ds  = b->source_dataset;
             next_ino = b->source_ino;
-            binding_hit = true;
+        } else if (is_dot ||
+                    (is_dotdot && new_path_len == cur_path_len &&
+                     memcmp(new_path, cur_path, cur_path_len) == 0)) {
+            /* "." anywhere or ".." that canonicalizes to the same
+             * path (i.e., already at the namespace root) — no state
+             * change. cur_ino is preserved; we re-stat below for
+             * fresh gen. Composes against fid.tla::Walk: the audit
+             * record at this step binds at current_gen[cur_ino]. */
+            next_ds  = cur_ds;
+            next_ino = cur_ino;
+        } else if (is_dotdot) {
+            /* ".." that popped a component AND no binding fired —
+             * re-resolve new_path from the connection's namespace
+             * root. ns_walk_abs_path_from canonicalizes again
+             * (idempotent on already-canonical input) and walks
+             * each remaining component via stm_fs_lookup. Bindings
+             * are NOT consulted along the way — the spec's
+             * lookup-then-fallthrough order has already had its
+             * chance for new_path itself; intermediate paths during
+             * the re-resolution were already considered as binding
+             * candidates during the original forward walk that
+             * brought us to cur_path. */
+            rc = ns_walk_abs_path_from(s, f->conn_root_dataset,
+                                          f->conn_root_ino,
+                                          new_path, new_path_len,
+                                          &next_ino, NULL, NULL);
+            if (rc != STM_OK) break;
+            next_ds = f->conn_root_dataset;
         } else {
             rc = stm_fs_lookup(s->fs, cur_ds, cur_ino,
                                  (const uint8_t *)name, (uint8_t)slen,
@@ -1172,7 +1317,6 @@ static stm_status h_walk(stm_9p_server *s,
         memcpy(cur_path, new_path, new_path_len);
         cur_path[new_path_len] = '\0';
         cur_path_len = new_path_len;
-        (void)binding_hit;   /* future audit hook for ObserveLookup */
 
         p9l_pqid(qids + nwqid * STM_9P_QID_SIZE,
                   cur_qt, cur_gen, qid_path(cur_ds, cur_ino));
@@ -1239,6 +1383,13 @@ static stm_status h_walk(stm_9p_server *s,
     nf->qid_type   = cur_qt;
     nf->kind       = P9_FID_NODE;
 
+    /* Inherit the connection-namespace root from the source fid. All
+     * fids on the same connection share the same conn_root, so a
+     * cloned/walked fid sees the same "/" interpretation as its
+     * progenitor. R93 P3-1 fix. */
+    nf->conn_root_dataset = f->conn_root_dataset;
+    nf->conn_root_ino     = f->conn_root_ino;
+
     /* Publish ns_path onto the bound fid (P9-9P-2). new_ns was already
      * allocated above; this is now infallible. */
     free(nf->ns_path);
@@ -1283,6 +1434,11 @@ static stm_status h_getattr(stm_9p_server *s,
     p9_fid *f = fid_get(s, fid);
     if (!f)
         return reply_rlerror(resp, resp_cap, resp_len, tag, EBADF);
+    /* Tgetattr semantically targets a filesystem inode, not aux state
+     * (R93 P1-1). AUX_XATTR fids hold xattr-buffer state; rejecting
+     * here prevents the confused-deputy class. */
+    if (f->kind != P9_FID_NODE)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, EINVAL);
 
     struct stm_inode_value iv;
     stm_status rc = verify_fid_fresh(s, f, &iv);
@@ -1382,6 +1538,10 @@ static stm_status h_lopen(stm_9p_server *s,
     p9_fid *f = fid_get(s, fid);
     if (!f)
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+    /* Tlopen on AUX_XATTR has no defined semantics (.L spec).
+     * R93 P1-1: refuse the confused-deputy class. */
+    if (f->kind != P9_FID_NODE)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
     if (f->is_open)
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
 
@@ -1660,6 +1820,9 @@ static stm_status h_readdir(stm_9p_server *s,
     p9_fid *f = fid_get(s, fid);
     if (!f)
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+    /* R93 P1-1 — AUX_XATTR fids are not navigation bindings. */
+    if (f->kind != P9_FID_NODE)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
     if (!f->is_open)
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
     if (!(f->qid_type & STM_9P_QTDIR))
@@ -1800,6 +1963,13 @@ static stm_status h_lcreate(stm_9p_server *s,
     p9_fid *f = fid_get(s, fid);
     if (!f)
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+    /* R93 P1-1 fix — refuse the AUX_XATTR-confused-deputy class.
+     * Without this, an AUX_XATTR-repurposed fid (whose qid_type stays
+     * QTDIR from its source) would pass the QTDIR check and let the
+     * client create a file under the dir while the fid still carries
+     * an attacker-loaded xattr-buffer that Tclunk would commit. */
+    if (f->kind != P9_FID_NODE)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
     if (f->is_open)
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
     if (!(f->qid_type & STM_9P_QTDIR))
@@ -1910,6 +2080,8 @@ static stm_status h_mkdir(stm_9p_server *s,
     p9_fid *f = fid_get(s, dfid);
     if (!f)
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+    if (f->kind != P9_FID_NODE)   /* R93 P1-1 */
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
     if (!(f->qid_type & STM_9P_QTDIR))
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_ENOTDIR);
     stm_status vrc = verify_fid_fresh(s, f, NULL);
@@ -1977,6 +2149,8 @@ static stm_status h_symlink(stm_9p_server *s,
     p9_fid *f = fid_get(s, dfid);
     if (!f)
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+    if (f->kind != P9_FID_NODE)   /* R93 P1-1 */
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
     if (!(f->qid_type & STM_9P_QTDIR))
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_ENOTDIR);
     stm_status vrc = verify_fid_fresh(s, f, NULL);
@@ -2026,6 +2200,8 @@ static stm_status h_readlink(stm_9p_server *s,
     p9_fid *f = fid_get(s, fid);
     if (!f)
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+    if (f->kind != P9_FID_NODE)   /* R93 P1-1 */
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
     if (!(f->qid_type & STM_9P_QTSYMLINK))
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
     stm_status vrc = verify_fid_fresh(s, f, NULL);
@@ -2085,6 +2261,8 @@ static stm_status h_unlinkat(stm_9p_server *s,
     p9_fid *f = fid_get(s, dirfd);
     if (!f)
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+    if (f->kind != P9_FID_NODE)   /* R93 P1-1 */
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
     if (!(f->qid_type & STM_9P_QTDIR))
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_ENOTDIR);
     stm_status vrc = verify_fid_fresh(s, f, NULL);
@@ -2152,11 +2330,15 @@ static stm_status h_renameat(stm_9p_server *s,
     p9_fid *of = fid_get(s, old_dirfid);
     if (!of)
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+    if (of->kind != P9_FID_NODE)   /* R93 P1-1 */
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
     if (!(of->qid_type & STM_9P_QTDIR))
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_ENOTDIR);
     p9_fid *nf = fid_get(s, new_dirfid);
     if (!nf)
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+    if (nf->kind != P9_FID_NODE)   /* R93 P1-1 */
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
     if (!(nf->qid_type & STM_9P_QTDIR))
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_ENOTDIR);
     /* Cross-dataset rename is not supported. */
@@ -2222,6 +2404,8 @@ static stm_status h_setattr(stm_9p_server *s,
     p9_fid *f = fid_get(s, fid);
     if (!f)
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+    if (f->kind != P9_FID_NODE)   /* R93 P1-1 */
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
     /* Snapshot current attrs for the chown(-1, ...) "leave unchanged"
      * semantics — Linux uses UINT32_MAX as the sentinel; .L's valid
      * mask is the cleaner mechanism but stm_fs_chown takes the
@@ -2322,6 +2506,8 @@ static stm_status h_statfs(stm_9p_server *s,
     p9_fid *f = fid_get(s, fid);
     if (!f)
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+    if (f->kind != P9_FID_NODE)   /* R93 P1-1 */
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
 
     stm_fs_stats stats;
     stm_status rc = stm_fs_stats_get(s->fs, &stats);
@@ -2381,6 +2567,8 @@ static stm_status h_fsync(stm_9p_server *s,
     p9_fid *f = fid_get(s, fid);
     if (!f)
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+    if (f->kind != P9_FID_NODE)   /* R93 P1-1 */
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
 
     stm_status rc = stm_fs_commit(s->fs);
     if (rc != STM_OK)
@@ -2433,6 +2621,8 @@ static stm_status h_lock(stm_9p_server *s,
     p9_fid *f = fid_get(s, fid);
     if (!f)
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+    if (f->kind != P9_FID_NODE)   /* R93 P1-1 */
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
     stm_status vrc = verify_fid_fresh(s, f, NULL);
     if (vrc != STM_OK)
         return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
@@ -2509,6 +2699,8 @@ static stm_status h_getlock(stm_9p_server *s,
     p9_fid *f = fid_get(s, fid);
     if (!f)
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+    if (f->kind != P9_FID_NODE)   /* R93 P1-1 */
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
     stm_status vrc = verify_fid_fresh(s, f, NULL);
     if (vrc != STM_OK)
         return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);

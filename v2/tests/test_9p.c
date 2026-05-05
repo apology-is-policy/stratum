@@ -2926,4 +2926,269 @@ STM_TEST(p9_destroy_clears_bindings_no_leak) {
     unlink(g_key_path);
 }
 
+/* ── R93 regression tests ─────────────────────────────────────────── */
+
+/* R93 P1-1: Tlcreate / Tmkdir / Twalk / Tsetattr / etc on a fid that
+ * was Txattrcreate-repurposed (kind = AUX_XATTR) must be refused with
+ * EINVAL, not silently misroute as a confused-deputy. */
+STM_TEST(p9_r93_p1_1_tlcreate_on_xattr_fid_refuses) {
+    make_tmp("9p_r93_p1_1");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+
+    /* Clone the root fid into 101 via 0-component Twalk; this leaves
+     * fid 101 bound to root (kind = NODE) ready for Txattrcreate. */
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    uint32_t sz = build_twalk(req, 1, 100, 101, 0, NULL);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALK);
+
+    /* Txattrcreate on fid 101: kind flips to AUX_XATTR. */
+    uint8_t *p = req + 7;
+    pack_u32(p, 101);             p += 4;
+    uint16_t nl = (uint16_t)strlen("user.malicious");
+    pack_u16(p, nl);              p += 2;
+    memcpy(p, "user.malicious", nl); p += nl;
+    pack_u64(p, 4u);              p += 8;   /* attr_size = 4 */
+    pack_u32(p, 0u);              p += 4;   /* flags = 0 */
+    sz = (uint32_t)(p - req);
+    pack_u32(req, sz);
+    req[4] = STM_9P_TXATTRCREATE;
+    pack_u16(req + 5, 2);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RXATTRCREATE);
+
+    /* Tlcreate on fid 101 (now AUX_XATTR) MUST be refused with EINVAL,
+     * not silently route the attacker's xattr-buf to the new file. */
+    sz = build_tlcreate(req, 3, 101, "newfile", STM_9P_O_RDWR, 0644u, 0);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EINVAL);
+
+    /* Twalk on fid 101 (AUX_XATTR) MUST be refused with EINVAL. */
+    sz = build_twalk(req, 4, 101, 102, 0, NULL);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EINVAL);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* R93 P2-1: Tattach spec rollback must restore in-place REPLACE on
+ * pre-existing bindings. Reproducer:
+ *   1. Tbind /x → a.   (bindings[0] = (/x, a))
+ *   2. Tattach with spec "/b=/x,/nope=/y" — first entry REPLACEs
+ *      /x → b in-place; second fails (ENOENT). Rollback must restore
+ *      /x → a, NOT leave /x → b. */
+STM_TEST(p9_r93_p2_1_attach_spec_rollback_restores_in_place_replace) {
+    make_tmp("9p_r93_p2_1");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    uint64_t a_ino = 0, b_ino = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"a", 1,
+                                  0755u, 0, 0, &a_ino));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"b", 1,
+                                  0755u, 0, 0, &b_ino));
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "a");
+    do_bind(s, 101, "/x");
+
+    /* Now Tattach a SECOND time with a spec that REPLACEs /x then
+     * fails. */
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    uint32_t sz = build_tattach_with_aname(req, 1, 200,
+                                              "spec:/b=/x,/nope=/y");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_ENOENT);
+
+    /* Walk "x" from fid=100: must still route to a_ino (not b_ino). */
+    const char *path[] = { "x" };
+    sz = build_twalk(req, 2, 100, 102, 1, path);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALK);
+    uint64_t got_path = load_u64(resp + 9 + 1 + 4);
+    uint64_t expected = ((uint64_t)1u << 32) | (a_ino & 0xFFFFFFFFu);
+    STM_ASSERT_EQ(got_path, expected);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* R93 P3-1: Twalk with ".." or "." canonicalizes correctly even
+ * without a coincidental binding hit. ".." at root clamps; ".."
+ * deeper pops a component. */
+STM_TEST(p9_r93_p3_1_walk_dotdot_at_root_clamps) {
+    make_tmp("9p_r93_p3_1_root");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+
+    /* Twalk(".." from root): nwqid = 1, qid path = root. */
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    const char *path[] = { ".." };
+    uint32_t sz = build_twalk(req, 1, 100, 101, 1, path);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALK);
+    uint16_t nwqid = load_u16(resp + 7);
+    STM_ASSERT_EQ(nwqid, 1u);
+    uint64_t got_path = load_u64(resp + 9 + 1 + 4);
+    STM_ASSERT_EQ(got_path, ((uint64_t)1u << 32) | 1u);
+
+    /* Twalk("." from root): same. */
+    const char *path2[] = { "." };
+    sz = build_twalk(req, 2, 100, 102, 1, path2);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALK);
+    nwqid = load_u16(resp + 7);
+    STM_ASSERT_EQ(nwqid, 1u);
+    got_path = load_u64(resp + 9 + 1 + 4);
+    STM_ASSERT_EQ(got_path, ((uint64_t)1u << 32) | 1u);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_r93_p3_1_walk_dotdot_pops_component) {
+    /* /sub exists; Twalk("sub", "..") from root must produce 2 qids
+     * with the second pointing at root_ino — no binding involved. */
+    make_tmp("9p_r93_p3_1_pop");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    uint64_t sub_ino = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"sub", 3,
+                                  0755u, 0, 0, &sub_ino));
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    const char *path[] = { "sub", ".." };
+    uint32_t sz = build_twalk(req, 1, 100, 101, 2, path);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALK);
+    uint16_t nwqid = load_u16(resp + 7);
+    STM_ASSERT_EQ(nwqid, 2u);
+    /* Second qid path must equal root. */
+    uint64_t got_path =
+        load_u64(resp + 9 + STM_9P_QID_SIZE + 1 + 4);
+    STM_ASSERT_EQ(got_path, ((uint64_t)1u << 32) | 1u);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* R93 P3-2: trailing-comma in Tattach spec must produce EINVAL. */
+STM_TEST(p9_r93_p3_2_attach_spec_trailing_comma_rejected) {
+    make_tmp("9p_r93_p3_2");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    uint64_t a_ino = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"a", 1,
+                                  0755u, 0, 0, &a_ino));
+
+    stm_9p_server *s = make_server(fs);
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    uint32_t sz = build_tversion(req, STM_9P_MSIZE_DEFAULT, "9P2000.L");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_tattach_with_aname(req, 1, 100, "spec:/a=/x,");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EINVAL);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* R93 P3-4: Tversion abandons every fid AND clears bindings. */
+STM_TEST(p9_r93_p3_4_tversion_clears_bindings) {
+    make_tmp("9p_r93_p3_4");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    uint64_t sub_ino = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"sub", 3,
+                                  0755u, 0, 0, &sub_ino));
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "sub");
+    do_bind(s, 101, "/alias");
+
+    /* Re-Tversion + Tattach. The /alias binding from the prior
+     * session must NOT survive — Twalk("alias") returns ENOENT. */
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    uint32_t sz = build_tversion(req, STM_9P_MSIZE_DEFAULT, "9P2000.L");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RVERSION);
+
+    sz = build_tattach(req, 2, 100);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RATTACH);
+
+    const char *path[] = { "alias" };
+    sz = build_twalk(req, 3, 100, 102, 1, path);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_ENOENT);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("9p")
