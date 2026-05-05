@@ -259,8 +259,22 @@ language bindings, future kernel module) is a 9P consumer.
             13 tests in `tests/test_ctl.c` (10 baseline +
             3 R96 regressions); ctest 42 → 43.
             CLAUDE.md trigger list extended with `v2/src/ctl/`.
-      - [ ] **P9-CTL-1b /pools/** — pending; per-pool status,
-            devices, datasets sub-trees.
+      - [x] **P9-CTL-1b /pools/ subtree + kind-table refactor**
+            — substantive complete (`aac3e10`). R97 audit pending.
+            Lands `/pools/` + `/pools/<uuid>/` + `/pools/<uuid>/
+            status` (read paths only). Centralizes kind-handling
+            into `KIND_META[]` table (R96 P3-6 close). New public
+            API `stm_ctl_attach_pool(stm_ctl *, struct stm_pool *)`
+            — idempotent same-pointer; STM_EEXIST if a different
+            pool is already bound.
+            qid_path encoding extended to `kind:8 | pool_idx:24 |
+            device_id:32`. Pool roster reads under
+            `stm_pool_lock_shared` for snapshot consistency.
+            10 new tests in `test_ctl.c`; ctest 13 → 23 in test_ctl.
+            Devices subtree (`/pools/<uuid>/devices/<id>/...`)
+            forward-noted to next sub-sub-chunk; the device-info
+            stringifiers (device_class_name etc) are wired but
+            unused at -1b.
       - [ ] **P9-CTL-1c /datasets/** — pending; per-dataset
             properties + stats + snapshot list + create/rollback
             triggers.
