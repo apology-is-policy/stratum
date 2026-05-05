@@ -78,6 +78,7 @@ stm_add_test(test_locks      test_locks.c)
 stm_add_test(test_9p         test_9p.c       test_fs_common.c)
 stm_add_test(test_9p_socket  test_9p_socket.c test_fs_common.c)
 target_link_libraries(test_9p_socket PRIVATE stm_stratumd)
+stm_add_test(test_ctl        test_ctl.c      test_fs_common.c)
 
 # The crash-injection fuzzer runs ~168 independent format+mount+unmount
 # cycles. Original default budget was ~25 s on default, ~42 s under
