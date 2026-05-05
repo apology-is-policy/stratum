@@ -385,6 +385,35 @@ static uint32_t build_tlock(uint8_t *req, uint16_t tag, uint32_t fid,
     return sz;
 }
 
+static uint32_t build_tbind(uint8_t *req, uint16_t tag,
+                             uint32_t sfid, const char *name, uint8_t mode)
+{
+    uint8_t *p = req + 7;
+    pack_u32(p, sfid); p += 4;
+    uint16_t nl = (uint16_t)strlen(name);
+    pack_u16(p, nl); p += 2;
+    memcpy(p, name, nl); p += nl;
+    *p++ = mode;
+    uint32_t sz = (uint32_t)(p - req);
+    pack_u32(req, sz);
+    req[4] = STM_9P_TBIND;
+    pack_u16(req + 5, tag);
+    return sz;
+}
+
+static uint32_t build_tunbind(uint8_t *req, uint16_t tag, const char *name)
+{
+    uint8_t *p = req + 7;
+    uint16_t nl = (uint16_t)strlen(name);
+    pack_u16(p, nl); p += 2;
+    memcpy(p, name, nl); p += nl;
+    uint32_t sz = (uint32_t)(p - req);
+    pack_u32(req, sz);
+    req[4] = STM_9P_TUNBIND;
+    pack_u16(req + 5, tag);
+    return sz;
+}
+
 static uint32_t build_txattrwalk(uint8_t *req, uint16_t tag,
                                    uint32_t fid, uint32_t newfid,
                                    const char *name)
@@ -2032,6 +2061,545 @@ STM_TEST(p9_r92_p2_1_xattrcreate_releases_locks_on_clunk) {
 
     free(req); free(resp);
     stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* ── P9-9P-2: per-connection namespace composition (Tbind / Tunbind) ─── */
+/*                                                                         */
+/* Composes against `v2/specs/namespace.tla`. Each test enumerates one     */
+/* observable consequence of the spec's invariants. The four buggy        */
+/* variants in namespace.tla (BuggyGlobalBindings / BuggyDetachLeaks /    */
+/* BuggyUnbindCrosstalk / BuggyLookupCrosstalk) describe the canonical    */
+/* failure modes a reviewer must see ruled out — these tests demonstrate */
+/* the healthy spec's expected behavior.                                   */
+
+/* Helper: bind sfid → target with REPLACE; expect Rbind. */
+static void do_bind(stm_9p_server *s, uint32_t sfid, const char *target)
+{
+    uint8_t  req[1024], resp[1024];
+    uint32_t rlen = 0;
+    uint32_t sz = build_tbind(req, 200, sfid, target, STM_9P_BIND_REPLACE);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RBIND);
+}
+
+/* Helper: unbind target; expect Rrunbind. */
+static void do_unbind(stm_9p_server *s, const char *target)
+{
+    uint8_t  req[1024], resp[1024];
+    uint32_t rlen = 0;
+    uint32_t sz = build_tunbind(req, 201, target);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RUNBIND);
+}
+
+STM_TEST(p9_bind_walk_routes_to_source) {
+    /* Bind /alias to a SUBDIR's ino; subsequently Twalk("alias") from
+     * the connection root yields a qid whose path matches the SUBDIR's
+     * (ds, ino), not the underlying root's missing "alias" entry.
+     * Demonstrates the lookup gate consults s->bindings before stm_fs. */
+    make_tmp("9p_bind_routes");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    /* Create /sub on disk to use as the source. */
+    uint64_t sub_ino = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, /*ds=*/1, root,
+                                  (const uint8_t *)"sub", 3, 0755u, 0, 0,
+                                  &sub_ino));
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    /* Walk to /sub on a clone fid 101 — that fid carries (ds=1, ino=sub_ino). */
+    walk_to(s, 100, 101, "sub");
+
+    /* Bind /alias → fid 101's source. */
+    do_bind(s, 101, "/alias");
+
+    /* Now Twalk("alias") from the root fid 100; expect Rwalk with one
+     * qid whose path = qid_path(1, sub_ino). */
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    const char *path[] = { "alias" };
+    uint32_t sz = build_twalk(req, 1, 100, 102, 1, path);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALK);
+    /* Rwalk: nwqid[2] qid*[13]. */
+    uint16_t nwqid = load_u16(resp + 7);
+    STM_ASSERT_EQ(nwqid, 1u);
+    uint64_t expected_path = ((uint64_t)1u << 32) | (sub_ino & 0xFFFFFFFFu);
+    /* qid layout: type[1] version[4] path[8]. */
+    uint64_t got_path = load_u64(resp + 9 + 1 + 4);
+    STM_ASSERT_EQ(got_path, expected_path);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_bind_walk_through_into_source_tree) {
+    /* Bind /alias → /sub. Create /sub/inner on disk. Walk from root
+     * via "alias" then "inner" should resolve all components: the
+     * first hits the binding (lands at sub), the second walks `inner`
+     * relative to sub via stm_fs_lookup. Two qids returned. */
+    make_tmp("9p_bind_walk_through");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    uint64_t sub_ino = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"sub", 3,
+                                  0755u, 0, 0, &sub_ino));
+    uint64_t inner_ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, sub_ino,
+                                          (const uint8_t *)"inner", 5,
+                                          0644u, 0, 0, &inner_ino));
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "sub");
+    do_bind(s, 101, "/alias");
+
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    const char *path[] = { "alias", "inner" };
+    uint32_t sz = build_twalk(req, 1, 100, 102, 2, path);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALK);
+    uint16_t nwqid = load_u16(resp + 7);
+    STM_ASSERT_EQ(nwqid, 2u);
+    /* Second qid path = qid_path(1, inner_ino). */
+    uint64_t got_path =
+        load_u64(resp + 9 + STM_9P_QID_SIZE + 1 + 4);
+    uint64_t expected =
+        ((uint64_t)1u << 32) | (inner_ino & 0xFFFFFFFFu);
+    STM_ASSERT_EQ(got_path, expected);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_unbind_clears_route) {
+    /* After Tbind /alias then Tunbind /alias, Twalk("alias") falls
+     * through to stm_fs_lookup and returns ENOENT (no underlying
+     * "alias" entry at root). Demonstrates ns_bindings_unset correctly
+     * removes the entry. */
+    make_tmp("9p_unbind_clears");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    uint64_t sub_ino = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"sub", 3,
+                                  0755u, 0, 0, &sub_ino));
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "sub");
+    do_bind(s, 101, "/alias");
+    do_unbind(s, "/alias");
+
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    const char *path[] = { "alias" };
+    uint32_t sz = build_twalk(req, 1, 100, 102, 1, path);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    /* ENOENT — partial walk with 0 components, returns Rlerror. */
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_ENOENT);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_unbind_unknown_returns_enoent) {
+    /* Tunbind on a target with no current binding → ENOENT. */
+    make_tmp("9p_unbind_unknown");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    uint32_t sz = build_tunbind(req, 1, "/nonexistent");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_ENOENT);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_bind_canonicalizes_target) {
+    /* "/home/../home" canonicalizes to "/home"; subsequent
+     * Tunbind("/home") finds it (proves the same canonical key was
+     * stored at Bind time and at Unbind lookup time). */
+    make_tmp("9p_bind_canon");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    uint64_t sub_ino = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"sub", 3,
+                                  0755u, 0, 0, &sub_ino));
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "sub");
+
+    /* Bind under non-canonical form. */
+    do_bind(s, 101, "/home/../home");
+    /* Unbind under canonical form — must succeed. */
+    do_unbind(s, "/home");
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_bind_rejects_relative_target) {
+    /* Tbind with a non-absolute target → EINVAL (canonicalizer
+     * rejects paths that don't start with '/'). */
+    make_tmp("9p_bind_rel");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    uint32_t sz = build_tbind(req, 1, 100, "home", STM_9P_BIND_REPLACE);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EINVAL);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_bind_union_modes_unsupported) {
+    /* UNION_OVER and UNION_UNDER are reserved on the wire but
+     * unsupported at v2.0 — server returns ENOTSUP. The spec
+     * (namespace.tla) currently models REPLACE only; promising to
+     * implement union semantics that the spec doesn't cover would
+     * leak undefined behavior. */
+    make_tmp("9p_bind_union");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    uint32_t sz = build_tbind(req, 1, 100, "/home", STM_9P_BIND_UNION_OVER);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_ENOTSUP);
+
+    sz = build_tbind(req, 2, 100, "/home", STM_9P_BIND_UNION_UNDER);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_ENOTSUP);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_bind_cap_enforced) {
+    /* Sequentially bind STM_9P_MAX_BINDINGS distinct paths — every one
+     * must succeed. The (cap+1)-th distinct path must fail with
+     * EOVERFLOW (BindCapBound invariant from namespace.tla). */
+    make_tmp("9p_bind_cap");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+
+    uint8_t  req[1024], resp[1024];
+    uint32_t rlen = 0;
+    char     path[64];
+    /* Use the root fid (100) as the source for every binding — same
+     * source ino across distinct target paths is fine; namespace.tla
+     * keys bindings on the path. */
+    for (uint32_t i = 0; i < STM_9P_MAX_BINDINGS; i++) {
+        snprintf(path, sizeof path, "/p%u", i);
+        uint32_t sz = build_tbind(req, (uint16_t)i, 100, path,
+                                    STM_9P_BIND_REPLACE);
+        STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp,
+                                              &rlen));
+        STM_ASSERT_EQ(resp[4], STM_9P_RBIND);
+    }
+    /* (cap+1)-th distinct binding triggers EOVERFLOW. */
+    snprintf(path, sizeof path, "/over");
+    uint32_t sz = build_tbind(req, 999, 100, path, STM_9P_BIND_REPLACE);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EOVERFLOW);
+
+    /* But REPLACE on a path already in the table still succeeds (it
+     * doesn't grow the table). */
+    sz = build_tbind(req, 1000, 100, "/p0", STM_9P_BIND_REPLACE);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RBIND);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_two_servers_isolated_bindings) {
+    /* Two server instances on the same fs. Bind /alias on s1; s2's
+     * Twalk("alias") returns ENOENT — proving s2 does NOT see s1's
+     * binding. Composes against namespace.tla::LookupReflectsOwn-
+     * Bindings + BindingsMatchAuthored — cross-connection isolation
+     * is structural. */
+    make_tmp("9p_two_servers_iso");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    uint64_t sub_ino = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"sub", 3,
+                                  0755u, 0, 0, &sub_ino));
+
+    stm_9p_server *s1 = make_server(fs);
+    stm_9p_server *s2 = make_server(fs);
+    do_version_attach(s1, 100);
+    do_version_attach(s2, 100);
+    walk_to(s1, 100, 101, "sub");
+    do_bind(s1, 101, "/alias");
+
+    /* s2 doesn't see /alias. */
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    const char *path[] = { "alias" };
+    uint32_t sz = build_twalk(req, 1, 100, 102, 1, path);
+    STM_ASSERT_OK(stm_9p_server_handle(s2, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_ENOENT);
+
+    /* s1's view is unchanged — its /alias binding still routes. */
+    sz = build_twalk(req, 2, 100, 102, 1, path);
+    STM_ASSERT_OK(stm_9p_server_handle(s1, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALK);
+
+    stm_9p_server_destroy(s1);
+    stm_9p_server_destroy(s2);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_bind_replace_overwrites_source) {
+    /* Tbind on a path that's already bound replaces the source. The
+     * spec's `Bind` action uses functional update on bindings[c][p],
+     * which in the impl means: same path key, new (ds, ino) value. */
+    make_tmp("9p_bind_replace");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    uint64_t a_ino = 0, b_ino = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"a", 1,
+                                  0755u, 0, 0, &a_ino));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"b", 1,
+                                  0755u, 0, 0, &b_ino));
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "a");
+    walk_to(s, 100, 102, "b");
+
+    do_bind(s, 101, "/alias");
+    /* Re-bind /alias to the other source. Should succeed (same path
+     * key), now routes to b. */
+    do_bind(s, 102, "/alias");
+
+    /* Twalk("alias") from root must yield b_ino. */
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    const char *path[] = { "alias" };
+    uint32_t sz = build_twalk(req, 1, 100, 103, 1, path);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALK);
+    uint64_t got_path = load_u64(resp + 9 + 1 + 4);
+    uint64_t expected = ((uint64_t)1u << 32) | (b_ino & 0xFFFFFFFFu);
+    STM_ASSERT_EQ(got_path, expected);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_bind_with_unknown_sfid_returns_ebadf) {
+    /* Tbind with a sfid the server hasn't bound → EBADF (no fid table
+     * slot). fid.tla::IOReject precondition — every operation that
+     * names a fid must validate the fid is bound + fresh. */
+    make_tmp("9p_bind_badfid");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    uint32_t sz = build_tbind(req, 1, /*sfid=*/4242, "/home",
+                                STM_9P_BIND_REPLACE);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EBADF);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_walk_double_dot_through_binding) {
+    /* With /alias bound to /sub (which contains "inner"), Twalk
+     * sequence "alias" → "inner" → ".." should land back at /alias
+     * (which routes to sub via the binding). The test verifies that
+     * the cumulative ns_path drives the binding lookup and that ".."
+     * doesn't leak through the binding into the source's parent. */
+    make_tmp("9p_walk_dotdot");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    uint64_t sub_ino = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root, (const uint8_t *)"sub", 3,
+                                  0755u, 0, 0, &sub_ino));
+    uint64_t inner_ino = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, sub_ino,
+                                  (const uint8_t *)"inner", 5,
+                                  0755u, 0, 0, &inner_ino));
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "sub");
+    do_bind(s, 101, "/alias");
+
+    /* Walk "alias" → "inner" → "..". Three components: the third
+     * component canonicalizes /alias/inner/.. to /alias, which fires
+     * the binding and lands at sub_ino (NOT at sub's parent in the
+     * underlying tree). */
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    const char *path[] = { "alias", "inner", ".." };
+    uint32_t sz = build_twalk(req, 1, 100, 102, 3, path);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALK);
+    uint16_t nwqid = load_u16(resp + 7);
+    STM_ASSERT_EQ(nwqid, 3u);
+    /* Third qid path = qid_path(1, sub_ino) — the binding fired again
+     * on the canonicalized "/alias" path. */
+    uint64_t got_path =
+        load_u64(resp + 9 + 2 * STM_9P_QID_SIZE + 1 + 4);
+    uint64_t expected =
+        ((uint64_t)1u << 32) | (sub_ino & 0xFFFFFFFFu);
+    STM_ASSERT_EQ(got_path, expected);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_destroy_clears_bindings_no_leak) {
+    /* Bind multiple targets, then destroy the server. Under ASan / a
+     * leak detector this is a heap-leak check on the bindings
+     * cleanup path — namespace.tla::DetachClears.
+     * Without ASan the test still validates that destroy works after
+     * a populated bindings table (no double-free, no stuck mutex). */
+    make_tmp("9p_destroy_leak");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    /* 5 bindings — exercises both the initial allocation and the
+     * geometric grow-by-2x path (cap progression 8 covers 5 entries). */
+    char path[64];
+    for (uint32_t i = 0; i < 5u; i++) {
+        snprintf(path, sizeof path, "/m%u", i);
+        do_bind(s, 100, path);
+    }
+    stm_9p_server_destroy(s);
+
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);
     unlink(g_key_path);

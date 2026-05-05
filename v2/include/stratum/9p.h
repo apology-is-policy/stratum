@@ -81,7 +81,16 @@ enum {
     STM_9P_TREAD          = 116,  STM_9P_RREAD          = 117,
     STM_9P_TWRITE         = 118,  STM_9P_RWRITE         = 119,
     STM_9P_TCLUNK         = 120,  STM_9P_RCLUNK         = 121,
-    STM_9P_TREMOVE        = 122,  STM_9P_RREMOVE        = 123
+    STM_9P_TREMOVE        = 122,  STM_9P_RREMOVE        = 123,
+
+    /* Stratum extensions (ARCH §10.10.4, §8.8.2). Numbers chosen past
+     * the 9P2000 base range (Tremove/Rremove = 122/123) AND past the
+     * 9P2000.L assigned ops (TUNLINKAT/RUNLINKAT = 76/77 with no
+     * upstream additions in the 78-99 range as of 2026-04). 124-159
+     * is the Stratum-extension band; P9-9P-2 fills 124-127, P9-9P-3
+     * will fill 128-139. */
+    STM_9P_TBIND          = 124,  STM_9P_RBIND          = 125,
+    STM_9P_TUNBIND        = 126,  STM_9P_RUNBIND        = 127
 };
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -197,6 +206,47 @@ enum {
 /* ────────────────────────────────────────────────────────────────────── */
 
 #define STM_9P_AT_REMOVEDIR    0x200u
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* Per-connection namespace composition (P9-9P-2).                        */
+/*                                                                         */
+/* Composes against `v2/specs/namespace.tla`:                              */
+/*   - Bind / Unbind actions map to h_bind / h_unbind.                    */
+/*   - server_create allocates the per-connection bindings table          */
+/*     (namespace.tla::Attach effectively materializes at the C level     */
+/*     when the server struct is created; Tattach itself only binds the   */
+/*     root fid).                                                          */
+/*   - server_destroy clears bindings (namespace.tla::Detach).            */
+/*   - Lookup-time consultation happens during Twalk's per-component      */
+/*     loop in server.c — every new ns_path is checked against the        */
+/*     bindings table before falling through to stm_fs_lookup.            */
+/*                                                                         */
+/* Cross-connection isolation is structural: each server instance owns    */
+/* its bindings table; there is no global table. The four buggy variants  */
+/* in namespace.tla enumerate the canonical failure modes a reviewer      */
+/* must rule out (BuggyGlobalBindings, BuggyDetachLeaks,                  */
+/* BuggyUnbindCrosstalk, BuggyLookupCrosstalk).                            */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/* Bind modes. Spec covers REPLACE only; UNION_OVER / UNION_UNDER are
+ * accepted on the wire but rejected with ENOTSUP at v2.0 (deferred to
+ * v2.1+ where the spec gets extended for layered composition). */
+#define STM_9P_BIND_REPLACE     0u
+#define STM_9P_BIND_UNION_OVER  1u
+#define STM_9P_BIND_UNION_UNDER 2u
+
+/* Per-connection cap on bindings. Mirrors namespace.tla's
+ * MaxBindsPerConn parameter. ARCH §8.11 lists 128 as the initial
+ * lean; raise via a new feature flag if a workload genuinely needs
+ * more. STM_9P_MAX_BINDINGS+1 binds → Rlerror(EOVERFLOW). */
+#define STM_9P_MAX_BINDINGS     128u
+
+/* Maximum connection-namespace path length (the canonical absolute
+ * path string the server tracks per-fid via Twalk). Matches Linux's
+ * PATH_MAX so that any path Linux can express in a vfs request fits.
+ * Components within a path are individually bounded by STM_9P_NAME_MAX
+ * (= 255). */
+#define STM_9P_NS_PATH_MAX      4096u
 
 /* ────────────────────────────────────────────────────────────────────── */
 /* Canonical 9P2000.L errno table.                                        */

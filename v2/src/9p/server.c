@@ -113,6 +113,24 @@ typedef struct p9_fid {
     uint32_t    open_flags;     /* Linux O_* from Tlopen */
     uint64_t    open_iounit;    /* per-fid iounit reported in Rlopen */
 
+    /* Connection-namespace path. The canonical absolute path this fid
+     * points at WITHIN THE CLIENT'S NAMESPACE (not necessarily the
+     * underlying-tree path — bindings can route a target path to a
+     * different source ino). Used at Twalk to compose new paths and
+     * consult the server's bindings table.
+     *
+     * - NULL for AUX_XATTR fids (they're transient state, not
+     *   namespace-located).
+     * - Heap-owned NUL-terminated string for NODE fids; freed at
+     *   fid_release_locked. Empty string is invalid; "/" is the
+     *   canonical root path.
+     *
+     * P9-9P-2 — composes against `v2/specs/namespace.tla`. Set at
+     * Tattach (= "/"), updated at Twalk on every full or partial
+     * walk, set at Tlcreate to the new file's logical path. */
+    char       *ns_path;
+    size_t      ns_path_len;     /* strlen(ns_path); 0 iff ns_path == NULL */
+
     /* AUX_XATTR state. Used only when kind == P9_FID_AUX_XATTR. The
      * aux fid encapsulates one of two flavors:
      *   - Txattrwalk LIST/VALUE-READ: `xattr_buf` holds the bytes
@@ -138,6 +156,18 @@ typedef struct p9_fid {
     uint32_t    xattr_create_flags;   /* WRITE only — XATTR_CREATE / REPLACE */
 } p9_fid;
 
+/* Per-connection binding entry. namespace.tla models bindings as a
+ * flat function `Paths → Sources \cup {NONE}`; the C representation
+ * is a dynamic array of (path, source) tuples. Linear search on
+ * lookup is fine for STM_9P_MAX_BINDINGS = 128. */
+typedef struct p9_binding {
+    char     *path;             /* heap-owned canonical absolute path */
+    size_t    path_len;
+    uint64_t  source_dataset;
+    uint64_t  source_ino;
+    uint8_t   mode;             /* STM_9P_BIND_REPLACE only at v2.0 */
+} p9_binding;
+
 struct stm_9p_server {
     pthread_mutex_t lock;
 
@@ -153,6 +183,17 @@ struct stm_9p_server {
      * fid number. Linear search on lookup. STM_9P_MAX_FIDS is small
      * enough (4096) to keep this fast in practice. */
     p9_fid        fids[STM_9P_MAX_FIDS];
+
+    /* Per-connection bindings table (P9-9P-2). namespace.tla's
+     * `bindings[c]` mapping for THIS connection. Owning storage is
+     * server-local — there is NO global bindings state in the process,
+     * which is what gives namespace.tla's LookupReflectsOwnBindings +
+     * BindingsMatchAuthored invariants their structural guarantee.
+     * Capacity grows on demand up to STM_9P_MAX_BINDINGS; entries are
+     * heap-owned strings freed at server_destroy. */
+    p9_binding   *bindings;
+    uint32_t      num_bindings;
+    uint32_t      bindings_cap;
 
     /* Lock-owner base — every fid that holds locks via Tlock uses
      * `lock_owner_base + fid` as its owner_id passed to stm_fs_lock.
@@ -299,18 +340,246 @@ static inline uint64_t fid_owner_id(stm_9p_server *s, uint32_t fid)
  * preserves the fid number AND its previously-acquired locks (R92 P2-1).
  * Composes locks.tla::ReleaseOwner + fid.tla::Clunk's lock-release-on-
  * clunk discipline. For aux-xattr fids also frees the heap-owned name +
- * buffer. */
+ * buffer. The connection-namespace path (`ns_path`, P9-9P-2) is also
+ * heap-owned and freed here — kind-agnostic, since both NODE and
+ * AUX_XATTR fids may carry one (AUX_XATTR inherits the source NODE
+ * fid's ns_path on Txattrcreate repurpose). */
 static void fid_release_locked(stm_9p_server *s, p9_fid *f)
 {
     if (!f || f->kind == P9_FID_FREE) return;
     /* Always drop locks, regardless of fid kind (R92 P2-1). */
     (void)stm_fs_release_lock_owner(s->fs, fid_owner_id(s, f->fid));
+    free(f->ns_path);
     if (f->kind == P9_FID_AUX_XATTR) {
         free(f->xattr_name);
         free(f->xattr_buf);
     }
     memset(f, 0, sizeof *f);
     f->kind = P9_FID_FREE;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* Namespace path canonicalization + bindings table (P9-9P-2).            */
+/* Composes against `v2/specs/namespace.tla`.                              */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/* Canonicalize a path string in-place into `out`. Rules:
+ *   - Path must start with '/' (absolute).
+ *   - Collapse consecutive '/' runs into one.
+ *   - Drop "." components.
+ *   - Pop one component on "..", clamping at root (so "/.." → "/").
+ *   - Reject components longer than STM_9P_NAME_MAX.
+ *   - Reject embedded NUL bytes (defensive — wire-format strings are
+ *     length-prefixed, but this is a trust-boundary check).
+ *   - Return an error if the canonical form exceeds STM_9P_NS_PATH_MAX.
+ *
+ * Output is always NUL-terminated. *out_len excludes the NUL.
+ * Stack-bounded via a fixed-size component scratch (depth ≤
+ * STM_9P_NS_MAX_DEPTH), which is generous (any namespace tree deeper
+ * than this is pathological).
+ *
+ * The canonical form composes safely with namespace.tla's `Paths`
+ * abstract set: distinct user-supplied path strings that resolve to
+ * the same canonical form bind/unbind/look up the SAME entry, which
+ * matches the spec's semantics of paths-as-keys.
+ */
+#define P9_NS_MAX_DEPTH  64u
+
+static stm_status ns_canonicalize(const char *in, size_t in_len,
+                                    char *out, size_t out_cap,
+                                    size_t *out_len)
+{
+    if (in_len == 0 || in[0] != '/') return STM_EINVAL;
+    if (out_cap < 2u) return STM_EOVERFLOW;
+
+    const char *comps[P9_NS_MAX_DEPTH];
+    size_t      comps_len[P9_NS_MAX_DEPTH];
+    size_t      n_comps = 0;
+
+    for (size_t i = 0; i < in_len; i++) {
+        if (in[i] == '\0') return STM_EINVAL;
+    }
+
+    size_t i = 0;
+    while (i < in_len) {
+        while (i < in_len && in[i] == '/') i++;
+        if (i >= in_len) break;
+        size_t start = i;
+        while (i < in_len && in[i] != '/') i++;
+        size_t comp_len = i - start;
+        if (comp_len > STM_9P_NAME_MAX) return STM_ENAMETOOLONG;
+        if (comp_len == 1 && in[start] == '.') continue;
+        if (comp_len == 2 && in[start] == '.' && in[start + 1] == '.') {
+            if (n_comps > 0) n_comps--;
+            continue;
+        }
+        if (n_comps >= P9_NS_MAX_DEPTH) return STM_ENAMETOOLONG;
+        comps[n_comps] = in + start;
+        comps_len[n_comps] = comp_len;
+        n_comps++;
+    }
+
+    if (n_comps == 0) {
+        out[0] = '/';
+        out[1] = '\0';
+        if (out_len) *out_len = 1;
+        return STM_OK;
+    }
+
+    size_t total = 0;
+    for (size_t k = 0; k < n_comps; k++) total += 1u + comps_len[k];
+    if (total >= out_cap) return STM_EOVERFLOW;
+    if (total > STM_9P_NS_PATH_MAX) return STM_ENAMETOOLONG;
+
+    size_t w = 0;
+    for (size_t k = 0; k < n_comps; k++) {
+        out[w++] = '/';
+        memcpy(out + w, comps[k], comps_len[k]);
+        w += comps_len[k];
+    }
+    out[w] = '\0';
+    if (out_len) *out_len = w;
+    return STM_OK;
+}
+
+/* Join `parent` + "/" + `name`, canonicalize, write to `out`.
+ * Used by Twalk's per-component loop: parent is the source fid's
+ * current ns_path, name is the next walk component (after bounds-
+ * checking name_len ≤ STM_9P_NAME_MAX). */
+static stm_status ns_join(const char *parent, size_t parent_len,
+                            const char *name, size_t name_len,
+                            char *out, size_t out_cap, size_t *out_len)
+{
+    if (!parent || parent_len == 0 || parent[0] != '/') return STM_EINVAL;
+    if (!name || name_len == 0 || name_len > STM_9P_NAME_MAX) return STM_EINVAL;
+    /* Names containing '/' would expand the walk into multiple
+     * components — Twalk components must be single-name per .L spec. */
+    for (size_t k = 0; k < name_len; k++)
+        if (name[k] == '/' || name[k] == '\0') return STM_EINVAL;
+
+    /* Stack scratch sized for the worst case (parent + '/' + name). */
+    size_t need = parent_len + 1u + name_len + 1u;
+    if (need > STM_9P_NS_PATH_MAX + STM_9P_NAME_MAX + 4u)
+        return STM_ENAMETOOLONG;
+    char tmp[STM_9P_NS_PATH_MAX + STM_9P_NAME_MAX + 4u];
+    memcpy(tmp, parent, parent_len);
+    tmp[parent_len] = '/';
+    memcpy(tmp + parent_len + 1u, name, name_len);
+    tmp[parent_len + 1u + name_len] = '\0';
+    return ns_canonicalize(tmp, parent_len + 1u + name_len,
+                            out, out_cap, out_len);
+}
+
+/* Linear search over s->bindings. namespace.tla::Lookup uses exact-
+ * match keying on Paths — a binding at "/home" does NOT fire for a
+ * lookup at "/home/alice". (The Twalk loop consults bindings on every
+ * intermediate path, so navigating INTO a bound directory still
+ * routes through the binding's source ino at the moment the path
+ * matches; subsequent walks proceed from source's tree.) */
+static p9_binding *ns_bindings_lookup(stm_9p_server *s,
+                                          const char *path, size_t path_len)
+{
+    if (!path || path_len == 0) return NULL;
+    for (uint32_t i = 0; i < s->num_bindings; i++) {
+        p9_binding *b = &s->bindings[i];
+        if (b->path_len == path_len &&
+            memcmp(b->path, path, path_len) == 0) {
+            return b;
+        }
+    }
+    return NULL;
+}
+
+/* Install or REPLACE a binding for `path` (must be canonical).
+ * namespace.tla::Bind action — bindings[c][p] := s.
+ * Caller holds server lock. */
+static stm_status ns_bindings_set(stm_9p_server *s,
+                                     const char *path, size_t path_len,
+                                     uint64_t source_dataset,
+                                     uint64_t source_ino,
+                                     uint8_t mode)
+{
+    p9_binding *existing = ns_bindings_lookup(s, path, path_len);
+    if (existing) {
+        existing->source_dataset = source_dataset;
+        existing->source_ino     = source_ino;
+        existing->mode           = mode;
+        return STM_OK;
+    }
+    /* BindCapBound (namespace.tla) — STM_9P_MAX_BINDINGS hard cap. */
+    if (s->num_bindings >= STM_9P_MAX_BINDINGS) return STM_EOVERFLOW;
+    if (s->num_bindings >= s->bindings_cap) {
+        uint32_t new_cap = s->bindings_cap ? s->bindings_cap * 2u : 8u;
+        if (new_cap > STM_9P_MAX_BINDINGS) new_cap = STM_9P_MAX_BINDINGS;
+        if (new_cap <= s->bindings_cap) return STM_ENOMEM;
+        p9_binding *new_arr = realloc(s->bindings, new_cap * sizeof *new_arr);
+        if (!new_arr) return STM_ENOMEM;
+        s->bindings     = new_arr;
+        s->bindings_cap = new_cap;
+    }
+    char *path_dup = malloc(path_len + 1u);
+    if (!path_dup) return STM_ENOMEM;
+    memcpy(path_dup, path, path_len);
+    path_dup[path_len] = '\0';
+    p9_binding *b = &s->bindings[s->num_bindings];
+    b->path           = path_dup;
+    b->path_len       = path_len;
+    b->source_dataset = source_dataset;
+    b->source_ino     = source_ino;
+    b->mode           = mode;
+    s->num_bindings++;
+    return STM_OK;
+}
+
+/* Remove a binding. namespace.tla::Unbind — bindings[c][p] := NONE.
+ * STM_ENOENT if no binding exists at `path`. Caller holds server lock. */
+static stm_status ns_bindings_unset(stm_9p_server *s,
+                                       const char *path, size_t path_len)
+{
+    for (uint32_t i = 0; i < s->num_bindings; i++) {
+        p9_binding *b = &s->bindings[i];
+        if (b->path_len == path_len &&
+            memcmp(b->path, path, path_len) == 0) {
+            free(b->path);
+            /* Compact: move the last entry into this slot. Order is
+             * unimportant; lookup is linear-scan. */
+            if (i + 1u < s->num_bindings) {
+                s->bindings[i] = s->bindings[s->num_bindings - 1u];
+            }
+            memset(&s->bindings[s->num_bindings - 1u], 0, sizeof(p9_binding));
+            s->num_bindings--;
+            return STM_OK;
+        }
+    }
+    return STM_ENOENT;
+}
+
+/* Free every binding + the array itself. namespace.tla::Detach's
+ * bindings clear; called at server_destroy. */
+static void ns_bindings_clear(stm_9p_server *s)
+{
+    for (uint32_t i = 0; i < s->num_bindings; i++) {
+        free(s->bindings[i].path);
+    }
+    free(s->bindings);
+    s->bindings     = NULL;
+    s->num_bindings = 0;
+    s->bindings_cap = 0;
+}
+
+/* Set fid's ns_path, replacing any prior value. Returns STM_ENOMEM on
+ * dup failure. Path must be canonical. */
+static stm_status fid_set_ns_path(p9_fid *f,
+                                     const char *path, size_t path_len)
+{
+    char *dup = malloc(path_len + 1u);
+    if (!dup) return STM_ENOMEM;
+    memcpy(dup, path, path_len);
+    dup[path_len] = '\0';
+    free(f->ns_path);
+    f->ns_path     = dup;
+    f->ns_path_len = path_len;
+    return STM_OK;
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -443,10 +712,16 @@ static stm_status h_attach(stm_9p_server *s,
     if (!aname && alen != 0)
         return reply_rlerror(resp, resp_cap, resp_len, tag, EPROTO);
 
-    /* aname-based namespace composition (ARCH §8.8.1) is P9-9P-2;
-     * for now ignore aname — connection roots at root_dataset's root
-     * inode unconditionally. n_uname (4 bytes after aname) is .L's
-     * numeric uid hint; we already have peer-creds, so ignore. */
+    /* aname-based namespace composition (ARCH §8.8.1) — non-trivial
+     * aname forms (path / spec:...) are handled by P9-9P-2b. For now
+     * "" and "/" both bind the root fid to the root dataset's root
+     * inode with ns_path = "/"; any other aname → EINVAL until P9-9P-2b
+     * lands the parser. n_uname (4 bytes after aname) is .L's numeric
+     * uid hint; we already have peer-creds, so ignore. */
+    bool aname_default = (alen == 0u) ||
+                         (alen == 1u && aname && aname[0] == '/');
+    if (!aname_default)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
 
     p9_fid *f = fid_alloc(s, fid);
     if (!f)
@@ -468,6 +743,15 @@ static stm_status h_attach(stm_9p_server *s,
     f->ino        = 1u;
     f->cached_gen = (uint32_t)stm_load_le64(root_iv.si_gen);
     f->qid_type   = qid_type_from_mode(stm_load_le32(root_iv.si_mode));
+
+    /* ns_path = "/" — the root of the connection's namespace. Subsequent
+     * Twalk consults s->bindings against the cumulative path; root is
+     * the conventional starting point. (P9-9P-2.) */
+    rc = fid_set_ns_path(f, "/", 1u);
+    if (rc != STM_OK) {
+        fid_release_locked(s, f);
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+    }
 
     uint32_t need = STM_9P_HDR_SIZE + STM_9P_QID_SIZE;
     if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
@@ -599,13 +883,34 @@ static stm_status h_walk(stm_9p_server *s,
     /* Walk over the components, accumulating qids. Partial resolution
      * is the 9P2000.L convention: if k < nwname components resolved,
      * Rwalk returns k qids (k > 0) AND newfid is NOT bound. k = 0 with
-     * nwname > 0 returns Rlerror(ENOENT). */
+     * nwname > 0 returns Rlerror(ENOENT).
+     *
+     * P9-9P-2: at each component, the cumulative ns_path is consulted
+     * against the per-connection bindings table BEFORE falling through
+     * to stm_fs_lookup. A binding hit reroutes the underlying
+     * (cur_ds, cur_ino) to the binding's source while keeping the
+     * client-visible ns_path. ns_path is published onto newfid only
+     * after the full walk succeeds (or onto fid itself if newfid == fid). */
     uint8_t  qids[STM_9P_MAX_WALK * STM_9P_QID_SIZE];
     uint16_t nwqid = 0;
     uint64_t cur_ds  = f->dataset_id;
     uint64_t cur_ino = f->ino;
     uint32_t cur_gen = f->cached_gen;
     uint8_t  cur_qt  = f->qid_type;
+
+    /* Stack-allocated ns_path scratch — sized for the longest canonical
+     * path the namespace allows (STM_9P_NS_PATH_MAX) plus NUL. */
+    char   cur_path[STM_9P_NS_PATH_MAX + 1u];
+    size_t cur_path_len = 0;
+    /* The source fid's ns_path is the starting cursor. f->ns_path must
+     * be non-NULL for any NODE fid since Tattach sets it; defensive
+     * null-check returns EINVAL if a future code path neglected it. */
+    if (!f->ns_path || f->ns_path_len == 0 ||
+        f->ns_path_len > STM_9P_NS_PATH_MAX)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, EINVAL);
+    memcpy(cur_path, f->ns_path, f->ns_path_len);
+    cur_path[f->ns_path_len] = '\0';
+    cur_path_len = f->ns_path_len;
 
     for (uint16_t i = 0; i < nwname; i++) {
         uint16_t slen;
@@ -615,22 +920,48 @@ static stm_status h_walk(stm_9p_server *s,
         /* stm_fs_lookup name_len is uint8_t (NAME_MAX = 255). */
         if (slen == 0 || slen > STM_9P_NAME_MAX) break;
 
+        /* Compose the new ns_path. */
+        char   new_path[STM_9P_NS_PATH_MAX + 1u];
+        size_t new_path_len = 0;
+        stm_status rc = ns_join(cur_path, cur_path_len, name, slen,
+                                  new_path, sizeof new_path, &new_path_len);
+        if (rc != STM_OK) break;
+
+        uint64_t next_ds  = cur_ds;
         uint64_t next_ino = 0;
-        stm_status rc = stm_fs_lookup(s->fs, cur_ds, cur_ino,
-                                        (const uint8_t *)name, (uint8_t)slen,
-                                        &next_ino);
-        if (rc != STM_OK) break;
+        bool     binding_hit = false;
 
-        /* Stat the resolved ino — captures BOTH si_gen (cached_gen
-         * snapshot per fid.tla::Walk's bind-time gen) AND si_mode
-         * (qid_type). */
+        /* namespace.tla::Lookup — exact-match on the cumulative path.
+         * A binding routes (cur_ds, cur_ino) to the binding's source. */
+        p9_binding *b = ns_bindings_lookup(s, new_path, new_path_len);
+        if (b) {
+            next_ds  = b->source_dataset;
+            next_ino = b->source_ino;
+            binding_hit = true;
+        } else {
+            rc = stm_fs_lookup(s->fs, cur_ds, cur_ino,
+                                 (const uint8_t *)name, (uint8_t)slen,
+                                 &next_ino);
+            if (rc != STM_OK) break;
+        }
+
+        /* Stat the resolved ino — captures si_gen (cached_gen snapshot
+         * per fid.tla::Walk's bind-time gen) AND si_mode (qid_type).
+         * Fires on bindings too so the qid encoding reflects the
+         * underlying source's current state. */
         struct stm_inode_value next_iv;
-        rc = stm_fs_stat(s->fs, cur_ds, next_ino, &next_iv);
+        rc = stm_fs_stat(s->fs, next_ds, next_ino, &next_iv);
         if (rc != STM_OK) break;
 
+        cur_ds  = next_ds;
         cur_ino = next_ino;
         cur_gen = (uint32_t)stm_load_le64(next_iv.si_gen);
         cur_qt  = qid_type_from_mode(stm_load_le32(next_iv.si_mode));
+        memcpy(cur_path, new_path, new_path_len);
+        cur_path[new_path_len] = '\0';
+        cur_path_len = new_path_len;
+        (void)binding_hit;   /* future audit hook for ObserveLookup */
+
         p9l_pqid(qids + nwqid * STM_9P_QID_SIZE,
                   cur_qt, cur_gen, qid_path(cur_ds, cur_ino));
         nwqid++;
@@ -679,6 +1010,20 @@ static stm_status h_walk(stm_9p_server *s,
     nf->cached_gen = cur_gen;       /* fid.tla cached_gen snapshot */
     nf->qid_type   = cur_qt;
     nf->kind       = P9_FID_NODE;
+
+    /* Publish ns_path onto the bound fid (P9-9P-2). For nwname == 0
+     * with newfid != fid this clones the source's ns_path; for
+     * nwname > 0 it is the cumulative path after every component
+     * resolved. ns_path memory mutation comes AFTER the structural
+     * fid binding above so that on a fid_set_ns_path failure the fid
+     * is still in a coherent state (just with a stale ns_path).
+     * The next fid_set_ns_path failure path releases nf to keep the
+     * fid table clean. */
+    stm_status sp = fid_set_ns_path(nf, cur_path, cur_path_len);
+    if (sp != STM_OK) {
+        if (newfid != fid) fid_release_locked(s, nf);
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, sp);
+    }
 
     uint32_t need = STM_9P_HDR_SIZE + 2u + (uint32_t)nwqid * STM_9P_QID_SIZE;
     if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
@@ -1265,6 +1610,21 @@ static stm_status h_lcreate(stm_9p_server *s,
     f->is_open    = true;
     f->open_flags = flags;
     f->open_iounit = iounit_for_msize(s->msize);
+
+    /* Update ns_path to point at the new file inside the parent's
+     * connection-namespace path (P9-9P-2). The new logical path is
+     * parent_ns_path + "/" + name, canonicalized via ns_join. On
+     * failure we keep the parent's ns_path on the fid — the file IS
+     * created on disk regardless, and the client will observe an
+     * inconsistent ns_path that subsequent Twalk corrects. */
+    if (f->ns_path) {
+        char   new_path[STM_9P_NS_PATH_MAX + 1u];
+        size_t new_path_len = 0;
+        if (ns_join(f->ns_path, f->ns_path_len, name, nlen,
+                     new_path, sizeof new_path, &new_path_len) == STM_OK) {
+            (void)fid_set_ns_path(f, new_path, new_path_len);
+        }
+    }
 
     uint32_t need = STM_9P_HDR_SIZE + STM_9P_QID_SIZE + 4u;
     if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
@@ -2192,6 +2552,143 @@ static stm_status h_xattrcreate(stm_9p_server *s,
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
+/* h_bind — Tbind / Rbind (Stratum extension).                            */
+/* Tbind:   sfid[4] name[s] mode[1]                                        */
+/* Rbind:   (header only)                                                  */
+/*                                                                         */
+/* sfid identifies the SOURCE — the (dataset, ino) tuple to mount at the  */
+/* target path. name is the target path string in the connection's        */
+/* namespace (canonicalized server-side; clients may send                  */
+/* "/home/alice/../bob" and we'll resolve to "/home/bob"). mode is one of */
+/* STM_9P_BIND_REPLACE (= 0; v2.0 default), STM_9P_BIND_UNION_OVER (= 1), */
+/* STM_9P_BIND_UNION_UNDER (= 2). UNION_* are accepted on the wire but    */
+/* return ENOTSUP at v2.0 — namespace.tla scope models REPLACE only;      */
+/* layered composition is a v2.1+ extension.                              */
+/*                                                                         */
+/* namespace.tla::Bind(c, p, s) — adds bindings[c][p] = s.                 */
+/* ────────────────────────────────────────────────────────────────────── */
+
+static stm_status h_bind(stm_9p_server *s,
+                            const uint8_t *body, uint32_t body_len,
+                            uint16_t tag,
+                            uint8_t *resp, uint32_t resp_cap,
+                            uint32_t *resp_len)
+{
+    if (body_len < 4u + 2u + 1u)
+        return reply_rlerror(resp, resp_cap, resp_len, tag,
+                              STM_9P_ECODE_EPROTO);
+    uint32_t sfid = p9l_g32(body);
+    const uint8_t *bp = body + 4;
+    const uint8_t *end = body + body_len;
+    uint16_t nlen;
+    const char *name = p9l_gstr(&bp, end, &nlen);
+    if (!name)
+        return reply_rlerror(resp, resp_cap, resp_len, tag,
+                              STM_9P_ECODE_EPROTO);
+    if (end - bp < 1)
+        return reply_rlerror(resp, resp_cap, resp_len, tag,
+                              STM_9P_ECODE_EPROTO);
+    uint8_t mode = *bp++;
+
+    /* v2.0 ships REPLACE only. UNION_* shapes are reserved on the wire
+     * but rejected — the spec does not yet model layered composition,
+     * so the impl must not promise to honor them. */
+    if (mode != STM_9P_BIND_REPLACE)
+        return reply_rlerror(resp, resp_cap, resp_len, tag,
+                              STM_9P_ECODE_ENOTSUP);
+
+    /* Empty target path is meaningless ("/" is the canonical root and
+     * MAY be bound — that mounts the source at the connection's root). */
+    if (nlen == 0)
+        return reply_rlerror(resp, resp_cap, resp_len, tag,
+                              STM_9P_ECODE_EINVAL);
+
+    /* Source fid must be a live, fresh NODE fid — fid.tla::IOReject
+     * gate. AUX_XATTR fids are not bindable; they're aux state, not a
+     * (dataset, ino) anchor. */
+    p9_fid *sf = fid_get(s, sfid);
+    if (!sf || sf->kind != P9_FID_NODE)
+        return reply_rlerror(resp, resp_cap, resp_len, tag,
+                              STM_9P_ECODE_EBADF);
+    stm_status vrc = verify_fid_fresh(s, sf, NULL);
+    if (vrc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
+
+    /* Canonicalize the target path. Rejects relative paths, embedded
+     * NULs, over-long components, and paths that escape root via "..".
+     * The canonical form is what stm_9p_server stores in s->bindings —
+     * subsequent Twalk lookups will key off the same canonical form. */
+    char   tgt[STM_9P_NS_PATH_MAX + 1u];
+    size_t tgt_len = 0;
+    stm_status rc = ns_canonicalize(name, nlen, tgt, sizeof tgt, &tgt_len);
+    if (rc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+
+    /* Install the binding. namespace.tla::Bind(c, p, s) — bindings[c][p] := s.
+     * BindCapBound enforced via STM_9P_MAX_BINDINGS. Cross-connection
+     * isolation is structural (s->bindings is server-local). */
+    rc = ns_bindings_set(s, tgt, tgt_len,
+                            sf->dataset_id, sf->ino, mode);
+    if (rc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+
+    uint32_t need = STM_9P_HDR_SIZE;
+    if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
+    uint8_t *wp = resp + 4;
+    *wp++ = STM_9P_RBIND;
+    p9l_p16(wp, tag); wp += 2;
+    resp_finish(resp, resp_len, wp);
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* h_unbind — Tunbind / Runbind (Stratum extension).                      */
+/* Tunbind:  name[s]                                                       */
+/* Runbind:  (header only)                                                 */
+/*                                                                         */
+/* namespace.tla::Unbind(c, p) — bindings[c][p] := NONE.                   */
+/* ────────────────────────────────────────────────────────────────────── */
+
+static stm_status h_unbind(stm_9p_server *s,
+                              const uint8_t *body, uint32_t body_len,
+                              uint16_t tag,
+                              uint8_t *resp, uint32_t resp_cap,
+                              uint32_t *resp_len)
+{
+    if (body_len < 2u)
+        return reply_rlerror(resp, resp_cap, resp_len, tag,
+                              STM_9P_ECODE_EPROTO);
+    const uint8_t *bp = body;
+    const uint8_t *end = body + body_len;
+    uint16_t nlen;
+    const char *name = p9l_gstr(&bp, end, &nlen);
+    if (!name)
+        return reply_rlerror(resp, resp_cap, resp_len, tag,
+                              STM_9P_ECODE_EPROTO);
+    if (nlen == 0)
+        return reply_rlerror(resp, resp_cap, resp_len, tag,
+                              STM_9P_ECODE_EINVAL);
+
+    char   tgt[STM_9P_NS_PATH_MAX + 1u];
+    size_t tgt_len = 0;
+    stm_status rc = ns_canonicalize(name, nlen, tgt, sizeof tgt, &tgt_len);
+    if (rc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+
+    rc = ns_bindings_unset(s, tgt, tgt_len);
+    if (rc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+
+    uint32_t need = STM_9P_HDR_SIZE;
+    if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
+    uint8_t *wp = resp + 4;
+    *wp++ = STM_9P_RUNBIND;
+    p9l_p16(wp, tag); wp += 2;
+    resp_finish(resp, resp_len, wp);
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
 /* Public API.                                                             */
 /* ────────────────────────────────────────────────────────────────────── */
 
@@ -2282,9 +2779,11 @@ uint32_t stm_9p_server_msize(const stm_9p_server *s)
 void stm_9p_server_destroy(stm_9p_server *s)
 {
     if (!s) return;
-    /* fid.tla::Detach — clear every fid + release any held locks. */
+    /* fid.tla::Detach — clear every fid + release any held locks.
+     * namespace.tla::Detach — clear bindings (DetachClears invariant). */
     for (size_t i = 0; i < STM_9P_MAX_FIDS; i++)
         fid_release_locked(s, &s->fids[i]);
+    ns_bindings_clear(s);
     pthread_mutex_destroy(&s->lock);
     free(s);
 }
@@ -2376,6 +2875,12 @@ stm_status stm_9p_server_handle(stm_9p_server *s,
         break;
     case STM_9P_TXATTRCREATE:
         rc = h_xattrcreate(s, body, body_len, tag, resp, resp_cap, resp_len);
+        break;
+    case STM_9P_TBIND:
+        rc = h_bind(s, body, body_len, tag, resp, resp_cap, resp_len);
+        break;
+    case STM_9P_TUNBIND:
+        rc = h_unbind(s, body, body_len, tag, resp, resp_cap, resp_len);
         break;
     case STM_9P_TAUTH:
         /* Stratum uses Unix-socket SO_PEERCRED for authn at the daemon
