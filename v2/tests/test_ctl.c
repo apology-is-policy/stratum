@@ -457,4 +457,125 @@ STM_TEST(ctl_destroy_with_no_fs_no_crash)
     stm_ctl_destroy(NULL); /* must be safe */
 }
 
+/* ── R96 P2-3 regressions ────────────────────────────────────────── */
+
+/* R96 P2-3 (1): pool exhaustion. STM_CTL_MAX_SESSIONS = 64; opening
+ * 65 fids without intervening clunk must refuse the 65th with an
+ * RError (vops_open returns STM_ENOMEM, server dispatches RError). */
+STM_TEST(ctl_r96_p2_3_session_pool_exhaustion)
+{
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+
+    /* Walk + Topen 64 distinct fids successfully. */
+    for (uint32_t i = 0; i < 64; i++) {
+        const char *path[] = { "version" };
+        uint32_t fid = 100 + i;
+        uint32_t sz = build_twalk(req, (uint16_t)(2 + i), 10, fid, 1, path);
+        STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+        STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+
+        sz = build_topen(req, (uint16_t)(200 + i), fid, STM_P9_OREAD);
+        STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+        STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    }
+
+    /* The 65th Topen must fail — sessions[] full. */
+    const char *path[] = { "version" };
+    uint32_t sz = build_twalk(req, 999, 10, 999, 1, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+
+    sz = build_topen(req, 998, 999, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* Clunk one open fid — pool now has room again; Topen succeeds. */
+    sz = build_tclunk(req, 997, 100);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RCLUNK);
+
+    sz = build_topen(req, 996, 999, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
+/* R96 P2-3 (2): defensive — vops_read called directly with a fid that
+ * has no session must return STM_EBACKEND (not crash, not OOB-read,
+ * not return stale data). The branch is unreachable through the public
+ * 9P interface (server gates is_open) — this exercises the defensive
+ * gate that catches a hypothetical future server bug. */
+STM_TEST(ctl_r96_p2_3_vops_read_no_session_rejects)
+{
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+
+    const stm_p9_vops *v = stm_ctl_vops();
+    uint8_t buf[64];
+    uint32_t len = sizeof buf;
+    /* fid 999 was never allocated; qid_path encodes a valid kind so
+     * the kind-check passes and we hit the session-lookup branch. */
+    uint64_t fake_qid = ((uint64_t)1 << 56);  /* KIND_VERSION */
+    stm_status rc = v->read(c, 999, fake_qid, 0, buf, &len);
+    STM_ASSERT_EQ(rc, STM_EBACKEND);
+    STM_ASSERT_EQ(len, 0u);
+
+    /* Symmetric: bad kind → STM_ENOENT (different defensive path). */
+    uint64_t bad_qid = ((uint64_t)99 << 56);
+    len = sizeof buf;
+    rc = v->read(c, 999, bad_qid, 0, buf, &len);
+    STM_ASSERT_EQ(rc, STM_ENOENT);
+    STM_ASSERT_EQ(len, 0u);
+
+    stm_ctl_destroy(c);
+}
+
+/* R96 P2-3 (3): fast-path boundary — read at exact `len-1` with
+ * `count > 1` returns exactly 1 byte (the last). Ensures avail
+ * computation isn't off-by-one. */
+STM_TEST(ctl_r96_p2_3_read_last_byte_only)
+{
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "version" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 1, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+
+    /* Determine body length. */
+    sz = build_tread(req, 4, 11, 0, 4096);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    uint32_t body_len = load_u32(resp + 7);
+    STM_ASSERT(body_len > 0);
+
+    /* Read at offset = body_len - 1, count = 4096. Must return exactly 1. */
+    sz = build_tread(req, 5, 11, body_len - 1u, 4096);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    STM_ASSERT_EQ(load_u32(resp + 7), 1u);
+
+    /* Read at offset = body_len - 1, count = 1. Same: returns 1. */
+    sz = build_tread(req, 6, 11, body_len - 1u, 1);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(load_u32(resp + 7), 1u);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
 STM_TEST_MAIN("ctl")

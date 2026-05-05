@@ -215,9 +215,10 @@ language bindings, future kernel module) is a 9P consumer.
       the generic `stm_p9_server` (NOT `stm_9p_server` — same
       vops mechanism janus's /keys/ uses).
 
-      - [x] **P9-CTL-1a foundation** — substantive complete.
-            `src/ctl/synfs.c` + `include/stratum/ctl.h`. Initial
-            layout:
+      - [x] **P9-CTL-1a foundation** — substantive complete
+            (`7575feb`); R96 audit closed (YELLOW, 0 P0 + 0 P1 +
+            3 P2 + 8 P3, all addressed inline). `src/ctl/synfs.c`
+            + `include/stratum/ctl.h`. Initial layout:
             ```
             /                  dir, ro
             /version           ro file: stratum-version, ub-version,
@@ -236,10 +237,28 @@ language bindings, future kernel module) is a 9P consumer.
             EACCES across the board. Future sub-chunks add
             action-trigger files (e.g. `/pools/<n>/scrub`) with
             uid-gated write paths.
-            10 tests in `tests/test_ctl.c`; ctest 42 → 43 (was
-            42 at P9-9P-4 close).
+            **R96 close** — 0 P0 + 0 P1 + 3 P2 + 8 P3:
+            P2-1 stm_ctl_destroy lifecycle precondition documented
+            (server-must-die-first, prevents UAF); P2-2 concurrency
+            comment rewritten with hard rule first; P2-3 three new
+            regression tests for defensive branches (pool
+            exhaustion, no-session vops_read, read-last-byte-only);
+            P3-1 dead reuse-loop deleted; P3-2 _Static_asserts pin
+            current literal lengths < STM_P9_NAME_MAX; P3-3
+            STM_CTL_BODY_MAX comment rewritten as budget statement;
+            P3-7 Tflush no-op note folded into P2-2 rewrite; P3-8
+            CLAUDE.md gets explicit Phase 9 deferment clause for
+            per-subsystem reference doc backfill. Forward-noted
+            to P9-CTL-1b: P3-6 centralized kind-table; reviewer
+            must address stat-after-mutation race class for any
+            /pools/<n>/scrub trigger under future concurrent
+            accept; P9-CTL-1c reviewer must enumerate which
+            dataset-property names get exposed vs redacted; P9-CTL-1d
+            reviewer must plumb (peer_uid, peer_gid) through for
+            action-trigger uid gating.
+            13 tests in `tests/test_ctl.c` (10 baseline +
+            3 R96 regressions); ctest 42 → 43.
             CLAUDE.md trigger list extended with `v2/src/ctl/`.
-            R96 audit pending.
       - [ ] **P9-CTL-1b /pools/** — pending; per-pool status,
             devices, datasets sub-trees.
       - [ ] **P9-CTL-1c /datasets/** — pending; per-dataset

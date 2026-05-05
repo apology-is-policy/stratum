@@ -21,23 +21,34 @@
  *
  * Concurrency
  * ───────────
- * Read paths are fully reentrant: stat/walk/readdir/open/read/clunk
- * touch only `stm_ctl::fs`, which is set at construction and never
- * mutated again. Body materialization for /version /state writes
- * a per-fid scratch buffer guarded by the instance mutex.
- * The fs-stats accessor (`stm_fs_stats_get`) is itself thread-safe.
+ * The hard rule:
+ *   - Safe to share one stm_ctl across SEQUENTIAL stm_p9_server use
+ *     (one server at a time — v2.0 stratumd serial accept).
+ *   - NOT safe to share one stm_ctl across CONCURRENT stm_p9_server
+ *     instances. The future concurrent-accept transport upgrade
+ *     (R95 forward-note) MUST either give each server its own
+ *     stm_ctl, or extend sessions[]'s key from `fid` to
+ *     `(server_idx, fid)` — the same posture src/9p/server.c took
+ *     at P9-9P-1 (`lock_owner = (server_idx << 32) | fid`).
  *
- * The instance is safe to share across SEQUENTIAL stm_p9_server
- * use — one server, run, destroy, next server, run, destroy —
- * because the sessions[] array is fully drained per-server-tear-
- * down via vops_clunk on every clunked fid. It is NOT safe to
- * share across CONCURRENT stm_p9_server instances: sessions[] is
- * keyed by `fid` alone (server-local), and two concurrently-active
- * servers can both hold fid=1, colliding. The future concurrent-
- * accept transport upgrade (R95 forward-note) must either give
- * each server its own stm_ctl, or extend the key to
- * `(server_idx, fid)` — the same posture src/9p/server.c took at
- * P9-9P-1 with `lock_owner = (server_idx << 32) | fid`.
+ * Why the mutex isn't enough
+ * ──────────────────────────
+ * The instance mutex (`mu`) protects byte-level access to
+ * `sessions[]` — within ONE server's vops calls, the mutex
+ * serializes alloc/lookup/free. But the mutex does NOT protect
+ * against fid-namespace collisions: two concurrent servers each
+ * running `vops_open(fid=1)` would race in sessions[] and the
+ * mutex doesn't know which server's fid 1 to associate with which
+ * slot. So the mutex is defense-in-depth WITHIN a single server's
+ * timeline (where the generic stm_p9_server is itself single-
+ * threaded per connection — Tflush is a server-level no-op so
+ * cannot interrupt a vops call); it is NOT cross-server safety.
+ *
+ * Read paths against subsystem state (`stm_fs *`) call into those
+ * subsystems' own thread-safe accessors (e.g. `stm_fs_stats_get`).
+ * Body materialization snapshots state at Topen so subsequent
+ * Treads see a consistent view; concurrent fs mutations after
+ * Topen are reflected on the next Topen.
  */
 
 #include <stratum/ctl.h>
@@ -79,11 +90,15 @@ static uint8_t qid_kind(uint64_t q)
  * consistent snapshot. For unattached or post-attach state changes,
  * the body is regenerated on the next Topen.
  *
- * STM_CTL_BODY_MAX is the upper bound on a single materialization;
- * /version + /state both fit comfortably under 1 KiB (a couple
- * hundred bytes each). Cap chosen with headroom for future fields
- * but small enough that JANUS_MAX_SESSIONS-shaped pressure stays
- * cheap.
+ * STM_CTL_BODY_MAX is the per-fid scratch budget. Each kind that
+ * gets opened must materialize within this cap; the materializers
+ * snprintf-then-check and refuse with STM_ERANGE on overflow.
+ * Today's kinds (/version ~80 bytes, /state ~352 bytes worst case
+ * with all-UINT64_MAX counters) sit comfortably under 1 KiB.
+ * Future sub-chunks (/pools/<n>/devices, /datasets/<id>/properties
+ * with many properties) may need to bump or per-kind-cap; do so
+ * in lockstep with adding the new kind, and document the per-kind
+ * justification (R96 P3-3).
  */
 #define STM_CTL_BODY_MAX     1024u
 #define STM_CTL_MAX_SESSIONS 64u
@@ -113,17 +128,11 @@ static ctl_session *session_get_locked(stm_ctl *c, uint32_t fid)
 static ctl_session *session_alloc_locked(stm_ctl *c, uint32_t fid,
                                           uint64_t qid_path)
 {
-    /* If the fid already has a session (e.g. open after a previous
-     * open without intervening clunk — server may not enforce that
-     * universally), reuse the slot. */
-    for (uint32_t i = 0; i < STM_CTL_MAX_SESSIONS; i++) {
-        if (c->sessions[i].active && c->sessions[i].fid == fid) {
-            c->sessions[i].qid_path = qid_path;
-            c->sessions[i].len = 0;
-            memset(c->sessions[i].buf, 0, sizeof c->sessions[i].buf);
-            return &c->sessions[i];
-        }
-    }
+    /* The generic stm_p9_server rejects re-Topen on an open fid
+     * (h_open: STM_EEXIST when is_open), so under the current
+     * server we only see fresh fids here. R96 P3-1 audited the
+     * old reuse-loop as dead and we removed it; the assertion
+     * below documents the contract. */
     for (uint32_t i = 0; i < STM_CTL_MAX_SESSIONS; i++) {
         if (!c->sessions[i].active) {
             ctl_session *s = &c->sessions[i];
@@ -219,6 +228,16 @@ static stm_status materialize_locked(stm_ctl *c, ctl_session *s)
 }
 
 /* ── name table ─────────────────────────────────────────────────────── */
+
+/* R96 P3-2: pin every literal name length below STM_P9_NAME_MAX (63)
+ * at build time. If a future sub-chunk introduces a name that
+ * doesn't fit, the assertion fires before set_name's silent
+ * truncation can hide the bug. Update both this assert and the
+ * kind_name() switch in lockstep. */
+_Static_assert(sizeof("version") - 1 <= STM_P9_NAME_MAX,
+               "/ctl/ /version literal exceeds STM_P9_NAME_MAX");
+_Static_assert(sizeof("state") - 1 <= STM_P9_NAME_MAX,
+               "/ctl/ /state literal exceeds STM_P9_NAME_MAX");
 
 static const char *kind_name(uint8_t kind)
 {

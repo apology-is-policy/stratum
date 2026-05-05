@@ -125,6 +125,8 @@ The reference is intentionally distinct from `docs/ARCHITECTURE.md` (design inte
 
 If a chunk's diff doesn't include a reference-doc update, the reviewer should ask whether it was intentional (e.g., pure bug fix that doesn't change documented surface) or an oversight.
 
+**Phase 9 deferment** (R96 P3-8): the per-subsystem `reference/NN-*.md` catalog last had entries for the post-P7 (Phase 7) modules. Phase 8 (POSIX surface — `inode/`, `dirent/`, `xattr/`, `locks/`) and Phase 9 (9P-server stack — `9p/`, `cmd/stratumd/`, `ctl/`) chunks have shipped without per-subsystem reference docs; the per-chunk detail lives in `phase8-status.md` / `phase9-status.md` instead. The REFERENCE.md Snapshot section is updated per-chunk with a tip line summary. Backfilling the per-subsystem catalog is a chunk-of-its-own scheduled before Phase 9 close. Until that chunk lands, Phase 8/9 chunks update phase status docs + Snapshot tip; new per-subsystem `reference/NN-*.md` files are NOT required as a precondition for chunk merge.
+
 ## Regression testing
 
 - Every audit finding that can be made to fail without the fix should land a regression test. See `tests/test_fs.c::test_fs_sync_two_phase_gen_invariant`, `test_fs_mount_bump_encrypted`, `test_fs_write_gap_is_zeroed*`, `tests/test_snap.c::test_snap_rollback_bumps_gen_encrypted`, `tests/test_p9.c::test_p9_wire_validation`, `test_p9_fid_cache_and_dup` for the pattern.

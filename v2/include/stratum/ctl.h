@@ -67,6 +67,12 @@ typedef struct stm_ctl stm_ctl;
  * The instance does NOT take ownership of `fs`; the caller must
  * keep the pointer valid for the lifetime of the stm_ctl instance.
  *
+ * Lifetime contract: the returned `*out` MUST outlive every
+ * `stm_p9_server` that holds it as `ctx`. Concretely: destroy all
+ * servers FIRST, then `stm_ctl_destroy`. Destroying the stm_ctl
+ * while a server still holds a dangling `ctx` is a use-after-free
+ * on the next vops call (R96 P2-1).
+ *
  * Returns STM_EINVAL if `out` is NULL, STM_ENOMEM on alloc failure.
  */
 STM_MUST_USE
@@ -75,6 +81,12 @@ stm_status stm_ctl_create(struct stm_fs *fs, stm_ctl **out);
 /*
  * Destroy a /ctl/ instance. Does not destroy the attached `fs` —
  * caller retains ownership.
+ *
+ * PRECONDITION: every `stm_p9_server` that was created with this
+ * stm_ctl as its `ctx` MUST be destroyed (`stm_p9_server_destroy`)
+ * BEFORE this call. Destroying in the wrong order leaves the
+ * server with a dangling ctx pointer and the next vops call is a
+ * use-after-free (R96 P2-1).
  *
  * Safe on NULL.
  */
