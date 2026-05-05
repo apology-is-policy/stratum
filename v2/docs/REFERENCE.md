@@ -38,9 +38,24 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9-CTL-1d-scrub-read substantive (this commit). 43 ctest
-  suites green default. test_ctl 77/77 (was 71 at R102 close; +6
-  -1d-scrub-read). **P9-CTL-1d-scrub-read** adds /pools/<uuid>/scrub
+- **Tip**: P9-CTL-1d-scrub-read R103 close (this commit) — GREEN,
+  0 P0 + 0 P1 + 0 P2 + 4 P3 forward-notes, all addressed inline or
+  forward-noted. 43 ctest suites green default. test_ctl 80/80 (was
+  71 at R102 close; +6 -1d-scrub-read + 3 R103). R103 P3-1 close:
+  added ctl_r103_p3_1_scrub_topen_rdwr_eacces (mode != OREAD
+  refused), _scrub_twrite_eacces (write to read-only fid refused),
+  _scrub_tstat_reports_0444 (Tstat-projection asserts mode 0444 +
+  qid_type=QTFILE, pinning the kind-table mode-bit invariant).
+  P3-2 close: stm_ctl_attach_scrub doc-comment notes attach state
+  is observable via /pools/<uuid>/ readdir (intentional, non-
+  sensitive). P3-3 forward-noted to Phase 8.5 concurrent-accept
+  hardening (no detach API today; matches existing c->pool/c->fs
+  posture). P3-4 close: tightened body-cap comment from "~50 chars
+  / ~400 bytes" to actual computed ceiling "275 bytes worst case
+  (state=\"completed\" 9 chars + 5-digit cursor + 6× UINT64_MAX 20-
+  digit + per-line labels)."
+
+- **Pre-tip-1**: P9-CTL-1d-scrub-read substantive. test_ctl 77/77. **P9-CTL-1d-scrub-read** adds /pools/<uuid>/scrub
   (read-only state + counters, world-readable mode 0444). New public
   API stm_ctl_attach_scrub(c, scrub) with R97 P2-1 NULL-rejection +
   idempotent same-pointer + STM_EEXIST on different. KIND_MAX = 20

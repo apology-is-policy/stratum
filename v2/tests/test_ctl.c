@@ -3124,4 +3124,220 @@ STM_TEST(ctl_d4_scrub_world_readable_nonadmin_succeeds)
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
 
+/* R103 P3-1 close: pin the contract that /pools/<uuid>/scrub is
+ * read-only via 3 negative-path tests — Topen with non-OREAD,
+ * Twrite, and Tstat-shows-0444. The gates are correct by code
+ * inspection (mode-check at vops_open + EACCES default branch in
+ * vops_write + KIND_META[KIND_POOL_SCRUB].mode = 0444), but the
+ * regression tests pin the contract against future refactors. */
+STM_TEST(ctl_r103_p3_1_scrub_topen_rdwr_eacces)
+{
+    make_tmp("ctl_r103_topen");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_pool *pool = stm_sync_pool(sync);
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(sync, &sc));
+
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(fs, &c));
+    STM_ASSERT_OK(stm_ctl_attach_pool(c, pool));
+    STM_ASSERT_OK(stm_ctl_attach_scrub(c, sc));
+
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    const uint64_t *uuid_words = stm_pool_uuid(pool);
+    uint8_t uuid_b[16];
+    for (size_t i = 0; i < 8; i++) {
+        uuid_b[i]     = (uint8_t)(uuid_words[0] >> (i * 8));
+        uuid_b[i + 8] = (uint8_t)(uuid_words[1] >> (i * 8));
+    }
+    char uuid_hex[64];
+    static const char hexd[] = "0123456789abcdef";
+    size_t pp = 0;
+    for (size_t i = 0; i < 16; i++) {
+        uuid_hex[pp++] = hexd[uuid_b[i] >> 4];
+        uuid_hex[pp++] = hexd[uuid_b[i] & 0xF];
+        if (i == 3 || i == 5 || i == 7 || i == 9) uuid_hex[pp++] = '-';
+    }
+    uuid_hex[pp] = '\0';
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *spath[] = { "pools", uuid_hex, "scrub" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 3, spath);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+
+    /* ORDWR refused — file is mode 0444. */
+    sz = build_topen(req, 3, 11, STM_P9_ORDWR);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* OWRITE refused. */
+    sz = build_topen(req, 4, 11, STM_P9_OWRITE);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* OREAD succeeds — sanity-check the gate is mode-specific. */
+    sz = build_topen(req, 5, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+    stm_scrub_close(sc);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
+/* R103 P3-1 close (b): Twrite to /pools/<uuid>/scrub returns RERROR
+ * (vops_write's default branch refuses non-CLEAR_EVENTS kinds). The
+ * "happy path" Topen is OREAD; this test re-opens with OREAD then
+ * attempts Twrite to confirm the trigger is read-only. */
+STM_TEST(ctl_r103_p3_1_scrub_twrite_eacces)
+{
+    make_tmp("ctl_r103_twrite");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_pool *pool = stm_sync_pool(sync);
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(sync, &sc));
+
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(fs, &c));
+    STM_ASSERT_OK(stm_ctl_attach_pool(c, pool));
+    STM_ASSERT_OK(stm_ctl_attach_scrub(c, sc));
+
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    const uint64_t *uuid_words = stm_pool_uuid(pool);
+    uint8_t uuid_b[16];
+    for (size_t i = 0; i < 8; i++) {
+        uuid_b[i]     = (uint8_t)(uuid_words[0] >> (i * 8));
+        uuid_b[i + 8] = (uint8_t)(uuid_words[1] >> (i * 8));
+    }
+    char uuid_hex[64];
+    static const char hexd[] = "0123456789abcdef";
+    size_t pp = 0;
+    for (size_t i = 0; i < 16; i++) {
+        uuid_hex[pp++] = hexd[uuid_b[i] >> 4];
+        uuid_hex[pp++] = hexd[uuid_b[i] & 0xF];
+        if (i == 3 || i == 5 || i == 7 || i == 9) uuid_hex[pp++] = '-';
+    }
+    uuid_hex[pp] = '\0';
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *spath[] = { "pools", uuid_hex, "scrub" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 3, spath);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+
+    /* Twrite "start" to the read-fid → RERROR. The body content is
+     * irrelevant; the kind-mode gate refuses any write to KIND_POOL_
+     * SCRUB. (Future scrub-action sub-chunk will introduce a separate
+     * KIND_POOL_SCRUB_TRIGGER for write actions, mirroring the
+     * KIND_ADMIN_CLEAR_EVENTS pattern.) */
+    sz = build_twrite(req, 4, 11, 0, "start", 5);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+    stm_scrub_close(sc);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
+/* R103 P3-1 close (c): Tstat against /pools/<uuid>/scrub fid reports
+ * mode 0444 + qid_type=QTFILE. Pins the kind-table mode-bit projection
+ * — a future regression that flipped the mode in KIND_META[] would
+ * fail this test. */
+STM_TEST(ctl_r103_p3_1_scrub_tstat_reports_0444)
+{
+    make_tmp("ctl_r103_tstat");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_pool *pool = stm_sync_pool(sync);
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(sync, &sc));
+
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(fs, &c));
+    STM_ASSERT_OK(stm_ctl_attach_pool(c, pool));
+    STM_ASSERT_OK(stm_ctl_attach_scrub(c, sc));
+
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    const uint64_t *uuid_words = stm_pool_uuid(pool);
+    uint8_t uuid_b[16];
+    for (size_t i = 0; i < 8; i++) {
+        uuid_b[i]     = (uint8_t)(uuid_words[0] >> (i * 8));
+        uuid_b[i + 8] = (uint8_t)(uuid_words[1] >> (i * 8));
+    }
+    char uuid_hex[64];
+    static const char hexd[] = "0123456789abcdef";
+    size_t pp = 0;
+    for (size_t i = 0; i < 16; i++) {
+        uuid_hex[pp++] = hexd[uuid_b[i] >> 4];
+        uuid_hex[pp++] = hexd[uuid_b[i] & 0xF];
+        if (i == 3 || i == 5 || i == 7 || i == 9) uuid_hex[pp++] = '-';
+    }
+    uuid_hex[pp] = '\0';
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *spath[] = { "pools", uuid_hex, "scrub" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 3, spath);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+
+    sz = build_tstat(req, 3, 11);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RSTAT);
+    /* Rstat layout: header (7) + stat_size (2) + inner_size (2) +
+     * type (2) + dev (4) + qid_type (1) + qid_version (4) +
+     * qid_path (8) + mode (4) + ... — see test_p9.c for the
+     * canonical decoder. mode is at offset 7 + 2 + 2 + 2 + 4 + 1 +
+     * 4 + 8 = 30 from the start of the response, plus the qid_type
+     * byte we want. */
+    /* The 9P RSTAT response packs the stat record at resp + 7 + 2
+     * (where the leading u16 is the inner stat-size length).  See
+     * the test_p9.c stat-decode pattern. The mode field is 4 bytes
+     * starting at offset 23 within the inner stat block:
+     *   inner: type(2) dev(4) qid_type(1) qid_version(4) qid_path(8) mode(4)
+     *           = 2 + 4 + 1 + 4 + 8 = 19 → mode at +19. */
+    const uint8_t *stat = resp + 7 + 2;     /* skip RSTAT header + outer u16 */
+    /* Skip the inner u16 too — server packs it as a length prefix. */
+    stat += 2;
+    /* type(2) + dev(4) + qid_type(1) + qid_ver(4) + qid_path(8) = 19 */
+    uint8_t qid_type = stat[2 + 4];
+    uint32_t mode = load_u32(stat + 19);
+    STM_ASSERT_EQ((unsigned)qid_type, (unsigned)STM_P9_QTFILE);
+    /* Mode 0444 (no DMDIR). */
+    STM_ASSERT_EQ(mode & 0777u, 0444u);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+    stm_scrub_close(sc);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
 STM_TEST_MAIN("ctl")

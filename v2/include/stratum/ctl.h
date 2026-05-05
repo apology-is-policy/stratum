@@ -146,6 +146,16 @@ stm_status stm_ctl_attach_pool(stm_ctl *c, struct stm_pool *pool);
  * `stm_sync` (passed at `stm_scrub_create`) is borrowed by `scrub`
  * and outlives it. Caller MUST close servers FIRST, then close
  * stm_ctl, then close scrub, then close sync. Out-of-order is UB.
+ *
+ * Observability (R103 P3-2): the attach state is observable to ANY
+ * connected client via `readdir` of `/pools/<uuid>/` — the "scrub"
+ * dirent appears iff a scrub handle is attached. This is intentional
+ * (matches the operator semantic "no scrub configured = no scrub
+ * file" and is consistent across stat/walk/readdir/open). It does
+ * mean "is a scrub handle attached?" is non-secret — non-admin
+ * clients can probe via the pool readdir. v2.0's threat model
+ * treats this as non-sensitive (the attach is a daemon-level
+ * configuration choice, not a per-client capability).
  */
 STM_MUST_USE
 stm_status stm_ctl_attach_scrub(stm_ctl *c, struct stm_scrub *scrub);

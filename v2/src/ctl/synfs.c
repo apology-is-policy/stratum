@@ -1053,8 +1053,11 @@ static stm_status materialize_admin_peer(stm_ctl *c, ctl_session *s)
 /* Materialize /pools/<uuid>/scrub — read-only state + counters from
  * stm_scrub_status_get. Body: state (idle/running/paused/completed) +
  * cursor (device_id + start_block) + counters (verified, failed,
- * repaired, unrepairable, ranges_processed). 8 lines × ~50 chars
- * worst case ~400 bytes; STM_CTL_BODY_MAX = 1024. Comfortable.
+ * repaired, unrepairable, ranges_processed). 8 lines worst case ~275
+ * bytes (state="completed" 9 chars + cursor_device_id 5 digits +
+ * 6× UINT64_MAX 20-digit + per-line labels). STM_CTL_BODY_MAX = 1024
+ * — ~3.7× headroom (R103 P3-4: tightened from earlier "~400 bytes"
+ * estimate to the actual computed ceiling).
  *
  * stm_scrub_status_get takes sc's internal mutex; safe to call
  * without external coordination. The status snapshot reflects the

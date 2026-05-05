@@ -485,7 +485,14 @@ language bindings, future kernel module) is a 9P consumer.
                   ctl_d4_scrub_listed_and_reads_idle,
                   ctl_d4_scrub_state_running_after_start,
                   ctl_d4_scrub_world_readable_nonadmin_succeeds.
-                  R103 audit pending.
+                  **R103 close** GREEN — 0 P0 + 0 P1 + 0 P2 + 4 P3.
+                  P3-1 added 3 negative-mode regression tests
+                  (mode != OREAD → EACCES; Twrite → EACCES; Tstat
+                  reports mode 0444 + QTFILE). P3-2 documented
+                  attach-state observability in the API doc-comment.
+                  P3-3 forward-noted (Phase 8.5 detach API).
+                  P3-4 tightened body-cap comment to actual computed
+                  275-byte ceiling. test_ctl 77 → 80 (3 R103 tests).
             - [ ] **P9-CTL-1d-actions** — pending; snapshot create /
                   rollback + scrub start/pause/resume/reset write
                   triggers. Composes against -1d-uid admin gate +
