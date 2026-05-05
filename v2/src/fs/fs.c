@@ -4241,7 +4241,18 @@ stm_status stm_fs_dataset_iter(stm_fs *fs, stm_dataset_iter_cb cb, void *ctx)
  * device_id is range-checked against STM_POOL_DEVICES_MAX up front so
  * an out-of-bounds caller doesn't enter sync. stm_sync_alloc returns
  * NULL for unattached or REMOVED slots; that fans out to STM_ENOENT
- * as the public-API contract on the wrapper. */
+ * as the public-API contract on the wrapper.
+ *
+ * Lock posture (R102 P3-2): holds fs->lock across stm_sync_alloc +
+ * stm_alloc_stats_get. The two acquire different mutexes (sync's lock
+ * is internal to stm_sync_alloc) and do not coordinate. ARCH §6.5.1
+ * guarantees stm_sync_alloc's return pointer is valid until the next
+ * attach-table mutation (sync_create / replace_device_online); v2.0
+ * is single-mutator at sync_create + serial-accept at the daemon, so
+ * this is trivially safe. Future concurrent-attach-mutation paths
+ * (forward-noted under Phase 8.5+) MUST either extend the lock to
+ * span sync's attach table or accept stale-pointer faults — same
+ * shape as stm_fs_stats_get. */
 stm_status stm_fs_alloc_stats_get(const stm_fs *fs, uint16_t device_id,
                                      stm_alloc_stats *out)
 {
@@ -4263,6 +4274,26 @@ stm_status stm_fs_alloc_stats_get(const stm_fs *fs, uint16_t device_id,
     stm_status s = stm_alloc_stats_get(a, out);
     pthread_mutex_unlock(&mfs->lock);
     return s;
+}
+
+/* R102 P3-1: lightweight is-attached predicate. The /ctl/ readdir
+ * loop probes 64 slots per call; without this, each probe would
+ * trigger a full alloc-tree scan via stm_alloc_stats_get on every
+ * attached slot. Bypass the scan by checking only stm_sync_alloc's
+ * NULL/non-NULL return. Same wedged-OK posture as the heavy variant. */
+stm_status stm_fs_alloc_attached(const stm_fs *fs, uint16_t device_id,
+                                    bool *out)
+{
+    if (out) *out = false;
+    if (!fs || !out) return STM_EINVAL;
+    if (device_id >= STM_POOL_DEVICES_MAX) return STM_EINVAL;
+
+    stm_fs *mfs = (stm_fs *)fs;
+    pthread_mutex_lock(&mfs->lock);
+    stm_alloc *a = stm_sync_alloc(fs->sync, device_id);
+    *out = (a != NULL);
+    pthread_mutex_unlock(&mfs->lock);
+    return STM_OK;
 }
 
 stm_status stm_fs_set_dataset_pool_default(stm_fs *fs, stm_property prop,

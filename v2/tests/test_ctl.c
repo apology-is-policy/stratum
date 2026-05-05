@@ -2686,4 +2686,87 @@ STM_TEST(ctl_d3_alloc_stats_get_null_args_einval)
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
 
+/* R102 P3-5 forward-note close: non-admin who walked root → "debug"
+ * binds a fid to KIND_DEBUG_DIR — Tstat against that fid MUST return
+ * the dir's stat (mode 0500) without leaking children. Mirrors the
+ * /admin/ posture closed in R100. The walk-through gate (R100 P2-1)
+ * fires only on Twalk-THROUGH /debug; the one-step Twalk to /debug
+ * itself succeeds for any caller, matching POSIX `stat /debug` for
+ * mode-0500 dirs. */
+STM_TEST(ctl_r102_p3_5_debug_dir_stat_for_nonadmin)
+{
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    STM_ASSERT_OK(stm_ctl_set_caller(c, 1000, 1000));    /* not admin */
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    /* Single-step walk: root → "debug". Succeeds — returns the dir
+     * qid. Same wire shape as `stat /debug` from a non-privileged
+     * caller on a POSIX 0500 dir (visible, not enterable). */
+    const char *path[] = { "debug" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 1, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+
+    /* Tstat the bound fid. Returns dir stat with mode 0500 +
+     * STM_P9_DMDIR set. */
+    sz = build_tstat(req, 3, 11);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RSTAT);
+
+    /* Two-step Twalk-through is rejected (R100 P2-1 carry test
+     * already covers this; sanity-check here too). */
+    const char *path2[] = { "debug", "allocator-state" };
+    sz = build_twalk(req, 4, 10, 12, 2, path2);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
+/* R102 P3-1 close: stm_fs_alloc_attached cheap predicate boundary
+ * tests. Pin the contract: NULL/NULL fs/out is EINVAL; OOB device_id
+ * is EINVAL; unattached slot returns OK + *out=false; attached slot
+ * returns OK + *out=true. Mirrors the heavy-stats wrapper's tests
+ * but exercises the no-tree-scan path. */
+STM_TEST(ctl_r102_p3_1_alloc_attached_predicate_boundary)
+{
+    /* NULL fs. */
+    bool attached = true;
+    STM_ASSERT_EQ(stm_fs_alloc_attached(NULL, 0, &attached), STM_EINVAL);
+    STM_ASSERT_TRUE(!attached);    /* zero-init contract */
+
+    make_tmp("ctl_alloc_attached");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* NULL out. */
+    STM_ASSERT_EQ(stm_fs_alloc_attached(fs, 0, NULL), STM_EINVAL);
+
+    /* OOB device id. */
+    attached = true;
+    STM_ASSERT_EQ(stm_fs_alloc_attached(fs, STM_POOL_DEVICES_MAX, &attached),
+                  STM_EINVAL);
+    STM_ASSERT_TRUE(!attached);
+
+    /* Unattached slot: device 1 has no alloc on a single-device fs. */
+    attached = true;
+    STM_ASSERT_OK(stm_fs_alloc_attached(fs, 1, &attached));
+    STM_ASSERT_TRUE(!attached);
+
+    /* Attached slot: device 0 → STM_OK + true. */
+    attached = false;
+    STM_ASSERT_OK(stm_fs_alloc_attached(fs, 0, &attached));
+    STM_ASSERT_TRUE(attached);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
 STM_TEST_MAIN("ctl")

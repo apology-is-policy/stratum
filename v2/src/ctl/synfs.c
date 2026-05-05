@@ -1038,7 +1038,18 @@ static stm_status materialize_admin_peer(stm_ctl *c, ctl_session *s)
 static stm_status materialize_debug_alloc(stm_ctl *c, ctl_session *s)
 {
     if (!c->fs) return STM_EBACKEND;     /* gated at vops_open */
-    uint16_t did = (uint16_t)qid_device_id(s->qid_path);
+    /* R102 P3-3: defense-in-depth bound check on the qid's low-32
+     * device_id slot. All client-reachable qids for KIND_DEBUG_ALLOC
+     * are constructed via qid_of(KIND_DEBUG_ALLOC, 0, did) with did
+     * already < STM_POOL_DEVICES_MAX (parse_device_id + readdir
+     * loop), so this never fires today. But narrowing uint32 → uint16
+     * silently wraps if a future qid producer passes did > 65535;
+     * the explicit gate keeps the materializer self-validating
+     * regardless of upstream changes. Mirrors materialize_device_
+     * status's defensive shape. */
+    uint32_t did_wide = qid_device_id(s->qid_path);
+    if (did_wide >= STM_POOL_DEVICES_MAX) return STM_ENOENT;
+    uint16_t did = (uint16_t)did_wide;
 
     stm_alloc_stats stats;
     stm_status rc = stm_fs_alloc_stats_get(c->fs, did, &stats);
@@ -1205,17 +1216,18 @@ static stm_status stat_at(stm_ctl *c, uint64_t qid_path,
     if (k == KIND_DEBUG_ALLOC_DIR && !c->fs) return STM_ENOENT;
     if (k == KIND_DEBUG_ALLOC) {
         if (!c->fs) return STM_ENOENT;
-        /* Validate device_id has an allocator attached. The same probe
-         * as the materializer — fans NULL alloc out to STM_ENOENT.
-         * Range-check is inside stm_fs_alloc_stats_get (refuses ≥
-         * STM_POOL_DEVICES_MAX with STM_EINVAL); we treat that as
+        /* R102 P3-1: use the cheap is-attached predicate, NOT the
+         * full stats_get tree-scan, since stat_at runs once per
+         * emit_entry in the readdir loop (64× per readdir). The
+         * range-check is inside stm_fs_alloc_attached (STM_EINVAL on
+         * device_id ≥ STM_POOL_DEVICES_MAX); we treat that as
          * ENOENT at the synfs boundary so wire ops see "no such
          * file" not "invalid argument" for an out-of-range id. */
         uint32_t did = qid_device_id(qid_path);
         if (did >= STM_POOL_DEVICES_MAX) return STM_ENOENT;
-        stm_alloc_stats tmp;
-        stm_status arc = stm_fs_alloc_stats_get(c->fs, (uint16_t)did, &tmp);
-        if (arc != STM_OK) return STM_ENOENT;
+        bool attached = false;
+        stm_status arc = stm_fs_alloc_attached(c->fs, (uint16_t)did, &attached);
+        if (arc != STM_OK || !attached) return STM_ENOENT;
         int n = snprintf(dyn_name, sizeof dyn_name, "%u", (unsigned)did);
         if (n < 0 || n >= (int)sizeof dyn_name) return STM_EIO;
         name = dyn_name;
@@ -1537,19 +1549,23 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
         return emit_entry(c, cb, cb_ctx, qid_root(KIND_DEBUG_ALLOC_DIR));
 
     case KIND_DEBUG_ALLOC_DIR: {
-        /* If no fs attached, the dir is empty — same posture as
-         * /datasets/ when fs is unattached. Iterate device slots
-         * 0..STM_POOL_DEVICES_MAX, emit only those that have an
-         * allocator attached (stm_fs_alloc_stats_get returns
-         * STM_OK). REMOVED slots and never-attached slots return
-         * STM_ENOENT and get skipped. The 64-slot bound caps the
-         * lock-cycle cost; admin-only diagnostic surface so the
+        /* R102 P3-4: vops_open at KIND_DEBUG_ALLOC_DIR refuses with
+         * STM_ENOENT when c->fs is NULL (line 1634), so this branch
+         * is reachable only with c->fs != NULL. (Earlier comment
+         * here described a "/datasets/-style empty-when-unattached"
+         * posture that the code does not implement; corrected.)
+         *
+         * Iterate device slots 0..STM_POOL_DEVICES_MAX, emit only
+         * those that have an allocator attached. REMOVED slots and
+         * never-attached slots get skipped via the cheap predicate
+         * (R102 P3-1: stm_fs_alloc_attached avoids the heavy tree-
+         * scan from stm_fs_alloc_stats_get). The 64-slot bound caps
+         * the lock-cycle cost; admin-only diagnostic surface so the
          * cost is acceptable. */
-        if (!c->fs) return STM_OK;
         for (uint16_t did = 0; did < STM_POOL_DEVICES_MAX; did++) {
-            stm_alloc_stats tmp;
-            stm_status arc = stm_fs_alloc_stats_get(c->fs, did, &tmp);
-            if (arc != STM_OK) continue;
+            bool attached = false;
+            stm_status arc = stm_fs_alloc_attached(c->fs, did, &attached);
+            if (arc != STM_OK || !attached) continue;
             stm_status erc = emit_entry(c, cb, cb_ctx,
                 qid_of(KIND_DEBUG_ALLOC, 0, did));
             if (erc == STM_ENOENT) continue;     /* race: detached after probe */
@@ -1644,17 +1660,17 @@ static stm_status vops_open(void *ctx, uint32_t fid, uint64_t qid_path,
         if (!c->fs) return STM_ENOENT;
         uint32_t did = qid_device_id(qid_path);
         if (did >= STM_POOL_DEVICES_MAX) return STM_ENOENT;
-        /* Re-probe at Topen — between Twalk and Topen the device
+        /* R102 P3-1: cheap is-attached predicate; the materialize
+         * call below runs the full stats_get tree-scan on the OK
+         * path. Avoids two scans on every Topen.
+         *
+         * Re-probe at Topen — between Twalk and Topen the device
          * could have been removed (forward-noted: today the sync
          * attach table only mutates at sync_create / replace_device_
-         * online; a future evacuate path would race here). The
-         * subsequent materialize call also fans NULL alloc to
-         * STM_ENOENT; keeping the gate here ensures a consistent
-         * "exists at Topen" semantics for the per-fid session
-         * lifetime. */
-        stm_alloc_stats tmp;
-        stm_status arc = stm_fs_alloc_stats_get(c->fs, (uint16_t)did, &tmp);
-        if (arc != STM_OK) return STM_ENOENT;
+         * online; a future evacuate path would race here). */
+        bool attached = false;
+        stm_status arc = stm_fs_alloc_attached(c->fs, (uint16_t)did, &attached);
+        if (arc != STM_OK || !attached) return STM_ENOENT;
     }
 
     /* P9-CTL-1d-events: KIND_EVENTS reads from c->event_buf directly

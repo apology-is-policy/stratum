@@ -438,7 +438,19 @@ language bindings, future kernel module) is a 9P consumer.
                   ctl_d3_alloc_stats_get_null_args_einval (direct
                   unit tests of the stm_fs_alloc_stats_get wrapper:
                   NULL fs / NULL out / OOB device_id / unattached
-                  slot / valid case). R102 audit pending.
+                  slot / valid case). **R102 close** GREEN — 0 P0 +
+                  0 P1 + 0 P2 + 5 P3 forward-notes, all addressed
+                  inline: P3-1 added cheap stm_fs_alloc_attached
+                  predicate (avoids 64× tree-scan in readdir);
+                  P3-2 documented cross-lock posture (matches stm_
+                  fs_stats_get precedent); P3-3 widened materialize_
+                  debug_alloc's did to uint32 + bound-check before
+                  narrowing; P3-4 removed dead `!c->fs` readdir
+                  branch + fixed misleading comment; P3-5 cap
+                  arithmetic confirmed correct. 2 R102 regression
+                  tests added (ctl_r102_p3_5_debug_dir_stat_for_
+                  nonadmin + ctl_r102_p3_1_alloc_attached_predicate_
+                  boundary). test_ctl 60 → 71. 43/43 ctest green.
                   Forward-noted to subsequent /debug/ sub-chunks:
                   /debug/tree-walk + /debug/extent-map +
                   /debug/integrity-verify (path-write-then-read

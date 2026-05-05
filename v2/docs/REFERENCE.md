@@ -38,9 +38,23 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9-CTL-1d-debug-alloc substantive (this commit). 43
-  ctest suites green default. test_ctl 69/69 (was 60 at R101
-  close; +9 -1d-debug-alloc). **P9-CTL-1d-debug-alloc** adds
+- **Tip**: P9-CTL-1d-debug-alloc R102 close (this commit) — GREEN,
+  0 P0 + 0 P1 + 0 P2 + 5 P3 forward-notes, all addressed inline. 43
+  ctest suites green default. test_ctl 71/71 (was 60 at R101 close;
+  +9 -1d-debug-alloc + 2 R102). New public API
+  `stm_fs_alloc_attached(fs, device_id, *out)` — cheap is-attached
+  predicate that avoids the heavy `stm_alloc_stats_get` tree-scan
+  (R102 P3-1). materialize_debug_alloc + stat_at + vops_open + vops_
+  readdir all migrated to use it. Readdir-loop cost drops from
+  O(64 × tree-scan) to O(64 × pointer-deref). materialize_debug_
+  alloc widens did to uint32 + bound-checks before narrowing (R102
+  P3-3 defense-in-depth). Dead readdir branch + misleading comment
+  removed (R102 P3-4). 2 R102 regression tests:
+  ctl_r102_p3_5_debug_dir_stat_for_nonadmin (R100 P2-1 carry — Tstat
+  the bound /debug fid for non-admin returns dir stat 0500 without
+  leaking children; matches POSIX mode-0500 dir posture);
+  ctl_r102_p3_1_alloc_attached_predicate_boundary (NULL/OOB/
+  unattached/attached contract pinned). **P9-CTL-1d-debug-alloc** adds
   /debug/ (admin-only diagnostic dir tree) + /debug/allocator-
   state/ + /debug/allocator-state/<device_id> (admin-only
   read of per-device allocator stats). KIND_MAX = 19 (was 16);

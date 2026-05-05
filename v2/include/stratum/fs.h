@@ -1415,6 +1415,26 @@ stm_status stm_fs_alloc_stats_get(const stm_fs *fs, uint16_t device_id,
                                      stm_alloc_stats *out);
 
 /*
+ * R102 P3-1: lightweight "is an allocator attached at this slot?"
+ * predicate. Avoids the full `stm_alloc_stats_get` tree-scan that
+ * `stm_fs_alloc_stats_get` triggers — the readdir loop in /debug/
+ * allocator-state/ probes 64 slots per call and can ill-afford a
+ * 64× tree scan on a fs with millions of allocator entries.
+ *
+ * Resolves through `stm_sync_alloc(fs->sync, device_id)`; *out is
+ * `true` iff a non-NULL allocator handle is attached at the slot.
+ *
+ * Lock posture: same wedged-OK as `stm_fs_alloc_stats_get`.
+ *
+ * Returns:
+ *   STM_EINVAL — NULL fs OR NULL out OR device_id >= STM_POOL_DEVICES_MAX.
+ *   STM_OK     — *out populated.
+ */
+STM_MUST_USE
+stm_status stm_fs_alloc_attached(const stm_fs *fs, uint16_t device_id,
+                                    bool *out);
+
+/*
  * P7-16: stm_fs_reflink — POSIX-shape FICLONE. Replaces dst's empty
  * extent tree with a reflink-share of src's extent tree. Same
  * semantics as `ioctl(fd_dst, FICLONE, fd_src)` for a freshly-created
