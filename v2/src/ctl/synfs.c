@@ -22,6 +22,7 @@
  *   /admin/peer                             read: caller uid/gid+is-admin (admin)
  *   /admin/clear-events                     write: reset /events log (admin)
  *   /events                                 read: append-only event log (world)
+ *   /pools/<uuid>/scrub                     read: scrub state+counters (world)
  *   /debug/                                 directory: admin-only diagnostics
  *   /debug/allocator-state/                 directory: per-device allocator state
  *   /debug/allocator-state/<device_id>      read: allocator stats (admin)
@@ -97,6 +98,7 @@
 #include <stratum/fs.h>
 #include <stratum/p9.h>
 #include <stratum/pool.h>
+#include <stratum/scrub.h>          /* stm_scrub_state, stm_scrub_status */
 #include <stratum/send_recv.h>      /* STM_SEND_VERSION */
 #include <stratum/super.h>          /* STM_UB_VERSION + STM_DEV_*_ values */
 #include <stratum/sync.h>           /* STM_SYNC_DATASET_ID_MAX */
@@ -133,6 +135,7 @@ typedef enum {
     KIND_DEBUG_DIR            = 16,   /* /debug/ — admin-only diagnostic dir */
     KIND_DEBUG_ALLOC_DIR      = 17,   /* /debug/allocator-state/ — per-device alloc */
     KIND_DEBUG_ALLOC          = 18,   /* /debug/allocator-state/<id> — admin-only file */
+    KIND_POOL_SCRUB           = 19,   /* /pools/<uuid>/scrub — read state+counters */
     KIND_MAX
 } ctl_kind;
 
@@ -163,6 +166,7 @@ static const ctl_kind_meta KIND_META[KIND_MAX] = {
     [KIND_DEBUG_DIR]          = { true,  true,  0500, "debug"           }, /* admin-only dir */
     [KIND_DEBUG_ALLOC_DIR]    = { true,  true,  0500, "allocator-state" }, /* admin-only dir */
     [KIND_DEBUG_ALLOC]        = { false, true,  0400, NULL              }, /* admin-only, dynamic device id */
+    [KIND_POOL_SCRUB]         = { false, false, 0444, "scrub"           }, /* world-readable scrub state */
 };
 
 /* R96 P3-2: pin every static-name literal length below STM_P9_NAME_MAX
@@ -185,6 +189,9 @@ _Static_assert(sizeof("events") - 1    <= STM_P9_NAME_MAX, "/ctl/ /events litera
 _Static_assert(sizeof("clear-events") - 1 <= STM_P9_NAME_MAX, "/ctl/ /admin/clear-events literal");
 _Static_assert(sizeof("debug") - 1     <= STM_P9_NAME_MAX, "/ctl/ /debug literal");
 _Static_assert(sizeof("allocator-state") - 1 <= STM_P9_NAME_MAX, "/ctl/ /debug/allocator-state literal");
+/* The "scrub" literal is shared with KIND_POOL_STATUS's "status" — both
+ * are 5-7 chars under STM_P9_NAME_MAX. */
+_Static_assert(sizeof("scrub") - 1     <= STM_P9_NAME_MAX, "/ctl/ /pools/.../scrub literal");
 /* Dynamic names: pool-uuid hex (36 chars), decimal device-id (≤2
  * chars at v2.0's STM_POOL_DEVICES_MAX = 64 cap), decimal dataset-id
  * (≤9 chars at STM_SYNC_DATASET_ID_MAX = 0x0FFFFFFF ~= 268M = 9
@@ -195,7 +202,7 @@ _Static_assert(sizeof("allocator-state") - 1 <= STM_P9_NAME_MAX, "/ctl/ /debug/a
  * KIND_META[] trips this assert at build time, even if a downstream
  * build silently suppresses -Wmissing-field-initializers. Update the
  * literal in lockstep when growing the enum. */
-_Static_assert(KIND_MAX == 19,
+_Static_assert(KIND_MAX == 20,
                "KIND_META[KIND_MAX] sized to enum cardinality; "
                "update both ctl_kind enum + KIND_META[] in lockstep");
 
@@ -304,8 +311,9 @@ typedef struct ctl_session {
 #define STM_CTL_EVENT_MAX  (8u * 1024u * 1024u)
 
 struct stm_ctl {
-    struct stm_fs   *fs;             /* may be NULL (unattached) */
-    struct stm_pool *pool;           /* may be NULL (no pool attached) */
+    struct stm_fs    *fs;             /* may be NULL (unattached) */
+    struct stm_pool  *pool;           /* may be NULL (no pool attached) */
+    struct stm_scrub *scrub;          /* may be NULL (no scrub attached) */
     /* P9-CTL-1d-uid: peer credentials + admin policy. Set by
      * stratumd via stm_ctl_set_caller / stm_ctl_set_admin_uid
      * BEFORE the first stm_p9_server_handle invocation; not
@@ -570,6 +578,24 @@ static const char *device_state_name(stm_device_state state)
     case STM_DEV_STATE_FAULTED:    return "faulted";
     case STM_DEV_STATE_REMOVED:    return "removed";
     case STM_DEV_STATE_EVACUATING: return "evacuating";
+    }
+    return "unknown";
+}
+
+/* R98 P3-4 lesson: trailing "unknown" return is LOAD-BEARING. While
+ * stm_scrub_state values today are produced exclusively by scrub.c
+ * under sc->lock (no on-disk parsing path that would skip range-check
+ * — scrub state is in-memory only), keeping the default deterministic
+ * matches the device_*_name discipline AND defends against a future
+ * persisted-scrub-cursor extension that would re-introduce the parsing
+ * trust boundary. */
+static const char *scrub_state_name(stm_scrub_state st)
+{
+    switch (st) {
+    case STM_SCRUB_STATE_IDLE:      return "idle";
+    case STM_SCRUB_STATE_RUNNING:   return "running";
+    case STM_SCRUB_STATE_PAUSED:    return "paused";
+    case STM_SCRUB_STATE_COMPLETED: return "completed";
     }
     return "unknown";
 }
@@ -1024,6 +1050,46 @@ static stm_status materialize_admin_peer(stm_ctl *c, ctl_session *s)
     return STM_OK;
 }
 
+/* Materialize /pools/<uuid>/scrub — read-only state + counters from
+ * stm_scrub_status_get. Body: state (idle/running/paused/completed) +
+ * cursor (device_id + start_block) + counters (verified, failed,
+ * repaired, unrepairable, ranges_processed). 8 lines × ~50 chars
+ * worst case ~400 bytes; STM_CTL_BODY_MAX = 1024. Comfortable.
+ *
+ * stm_scrub_status_get takes sc's internal mutex; safe to call
+ * without external coordination. The status snapshot reflects the
+ * scrub at the moment of the call; subsequent steps mutate it. */
+static stm_status materialize_pool_scrub(stm_ctl *c, ctl_session *s)
+{
+    if (!c->scrub) return STM_EBACKEND;     /* gated at vops_open */
+
+    stm_scrub_status st;
+    stm_status rc = stm_scrub_status_get(c->scrub, &st);
+    if (rc != STM_OK) return rc;
+
+    int n = snprintf((char *)s->buf, sizeof s->buf,
+        "state: %s\n"
+        "cursor-device-id: %u\n"
+        "cursor-start-block: %llu\n"
+        "blocks-verified: %llu\n"
+        "blocks-failed: %llu\n"
+        "blocks-repaired: %llu\n"
+        "blocks-unrepairable: %llu\n"
+        "ranges-processed: %llu\n",
+        scrub_state_name(st.state),
+        (unsigned)st.cursor_device_id,
+        (unsigned long long)st.cursor_start_block,
+        (unsigned long long)st.blocks_verified,
+        (unsigned long long)st.blocks_failed,
+        (unsigned long long)st.blocks_repaired,
+        (unsigned long long)st.blocks_unrepairable,
+        (unsigned long long)st.ranges_processed);
+    if (n < 0) return STM_EIO;
+    if ((size_t)n >= sizeof s->buf) return STM_ERANGE;
+    s->len = (uint32_t)n;
+    return STM_OK;
+}
+
 /* Materialize /debug/allocator-state/<device_id> — per-device allocator
  * state snapshot. Composes against stm_fs_alloc_stats_get (fs.c), which
  * resolves the per-device stm_alloc via stm_sync's attach table.
@@ -1098,6 +1164,7 @@ static stm_status materialize_locked(stm_ctl *c, ctl_session *s)
     case KIND_DATASET_PROPERTIES: return materialize_dataset_properties(c, s);
     case KIND_ADMIN_PEER:         return materialize_admin_peer(c, s);
     case KIND_DEBUG_ALLOC:        return materialize_debug_alloc(c, s);
+    case KIND_POOL_SCRUB:         return materialize_pool_scrub(c, s);
     case KIND_ROOT:
     case KIND_POOLS_DIR:
     case KIND_POOL_DIR:
@@ -1144,7 +1211,8 @@ static stm_status stat_at(stm_ctl *c, uint64_t qid_path,
     /* Pool-related kinds: pool_idx must be 0 (single-pool v2.0). */
     if (k == KIND_POOLS_DIR || k == KIND_POOL_DIR
         || k == KIND_POOL_STATUS || k == KIND_DEVICES_DIR
-        || k == KIND_DEVICE_DIR || k == KIND_DEVICE_STATUS) {
+        || k == KIND_DEVICE_DIR || k == KIND_DEVICE_STATUS
+        || k == KIND_POOL_SCRUB) {
         if (qid_pool_idx(qid_path) != 0) return STM_ENOENT;
     }
 
@@ -1158,6 +1226,12 @@ static stm_status stat_at(stm_ctl *c, uint64_t qid_path,
     if ((k == KIND_POOL_STATUS || k == KIND_DEVICES_DIR) && !c->pool) {
         return STM_ENOENT;
     }
+    /* /pools/<uuid>/scrub requires (a) pool attached (so the dir
+     * exists) AND (b) scrub attached (so we have a handle to query).
+     * A pool-attached-but-no-scrub state surfaces as "scrub file
+     * doesn't exist," matching the operator's intuition: "no scrub
+     * configured = no scrub file." */
+    if (k == KIND_POOL_SCRUB && (!c->pool || !c->scrub)) return STM_ENOENT;
     if (k == KIND_DEVICE_DIR || k == KIND_DEVICE_STATUS) {
         if (!c->pool) return STM_ENOENT;
         uint32_t did = qid_device_id(qid_path);
@@ -1302,6 +1376,13 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
             return stat_at(c, qid_root(KIND_POOL_STATUS), out);
         if (str_eq(name, name_len, KIND_META[KIND_DEVICES_DIR].static_name))
             return stat_at(c, qid_root(KIND_DEVICES_DIR), out);
+        /* /pools/<uuid>/scrub is conditional on c->scrub attachment.
+         * If the scrub handle isn't attached, the file simply
+         * doesn't exist (Twalk fails, readdir omits it). Once
+         * attached, world-readable. */
+        if (c->scrub
+              && str_eq(name, name_len, KIND_META[KIND_POOL_SCRUB].static_name))
+            return stat_at(c, qid_root(KIND_POOL_SCRUB), out);
         return STM_ENOENT;
 
     case KIND_DEVICES_DIR: {
@@ -1391,6 +1472,7 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
     case KIND_EVENTS:
     case KIND_ADMIN_CLEAR_EVENTS:
     case KIND_DEBUG_ALLOC:
+    case KIND_POOL_SCRUB:
     case KIND_MAX:
         break;
     }
@@ -1454,7 +1536,16 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
         if (!c->pool) return STM_ENOENT;
         rc = emit_entry(c, cb, cb_ctx, qid_root(KIND_POOL_STATUS));
         if (rc != STM_OK) return rc;
-        return emit_entry(c, cb, cb_ctx, qid_root(KIND_DEVICES_DIR));
+        rc = emit_entry(c, cb, cb_ctx, qid_root(KIND_DEVICES_DIR));
+        if (rc != STM_OK) return rc;
+        /* Conditional: scrub entry only emitted when a scrub handle
+         * is attached. Mirrors the stat_at gate so readdir + Twalk
+         * are consistent — the entry isn't visible without a scrub. */
+        if (c->scrub) {
+            rc = emit_entry(c, cb, cb_ctx, qid_root(KIND_POOL_SCRUB));
+            if (rc != STM_OK) return rc;
+        }
+        return STM_OK;
 
     case KIND_DEVICES_DIR: {
         if (!c->pool) return STM_ENOENT;
@@ -1583,6 +1674,7 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
     case KIND_EVENTS:
     case KIND_ADMIN_CLEAR_EVENTS:
     case KIND_DEBUG_ALLOC:
+    case KIND_POOL_SCRUB:
     case KIND_MAX:
         break;
     }
@@ -1656,6 +1748,10 @@ static stm_status vops_open(void *ctx, uint32_t fid, uint64_t qid_path,
     if ((k == KIND_POOL_STATUS || k == KIND_DEVICE_STATUS) && !c->pool)
         return STM_ENOENT;
     if ((k == KIND_DATASET_PROPERTIES) && !c->fs) return STM_ENOENT;
+    /* /pools/<uuid>/scrub requires both pool + scrub attached.
+     * The dual-gate posture mirrors stat_at — without scrub, the
+     * file doesn't exist (consistent operator semantics). */
+    if (k == KIND_POOL_SCRUB && (!c->pool || !c->scrub)) return STM_ENOENT;
     if (k == KIND_DEBUG_ALLOC) {
         if (!c->fs) return STM_ENOENT;
         uint32_t did = qid_device_id(qid_path);
@@ -1920,6 +2016,21 @@ stm_status stm_ctl_attach_pool(stm_ctl *c, struct stm_pool *pool)
      * noted to a future sub-chunk. */
     if (c->pool && c->pool != pool) return STM_EEXIST;
     c->pool = pool;
+    return STM_OK;
+}
+
+stm_status stm_ctl_attach_scrub(stm_ctl *c, struct stm_scrub *scrub)
+{
+    /* R97 P2-1 carry: NULL scrub is rejected with STM_EINVAL — same
+     * shape as attach_pool. Idempotent same-pointer; STM_EEXIST on
+     * different scrub. v2.0 supports at most one attached scrub.
+     *
+     * R97 P2-2 carry: this writes c->scrub without c->mu; vops read
+     * paths read c->scrub without c->mu. Serial-server posture is the
+     * implicit safety; concurrent-accept must extend locking. */
+    if (!c || !scrub) return STM_EINVAL;
+    if (c->scrub && c->scrub != scrub) return STM_EEXIST;
+    c->scrub = scrub;
     return STM_OK;
 }
 

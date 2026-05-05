@@ -38,7 +38,26 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9-CTL-1d-debug-alloc R102 close (this commit) — GREEN,
+- **Tip**: P9-CTL-1d-scrub-read substantive (this commit). 43 ctest
+  suites green default. test_ctl 77/77 (was 71 at R102 close; +6
+  -1d-scrub-read). **P9-CTL-1d-scrub-read** adds /pools/<uuid>/scrub
+  (read-only state + counters, world-readable mode 0444). New public
+  API stm_ctl_attach_scrub(c, scrub) with R97 P2-1 NULL-rejection +
+  idempotent same-pointer + STM_EEXIST on different. KIND_MAX = 20
+  (was 19); single new kind KIND_POOL_SCRUB. Body surfaces 8 fields
+  from stm_scrub_status_get: state (idle/running/paused/completed)
+  + cursor (device_id, start_block) + counters (verified, failed,
+  repaired, unrepairable, ranges_processed). The /pools/<uuid>/
+  readdir + Twalk both gate on c->scrub != NULL — without scrub
+  attached, the entry doesn't exist (consistent operator semantics:
+  "no scrub configured = no scrub file"). New scrub_state_name
+  stringifier with R98 P3-4 trailing "unknown" tamper-resilience
+  posture. R103 audit pending. Forward-noted: write triggers
+  (start/pause/resume/reset action verbs) deferred to next sub-
+  chunk; would compose against the admin gate from -1d-uid +
+  audit log from -1d-events.
+
+- **Pre-tip-1**: P9-CTL-1d-debug-alloc R102 close — GREEN,
   0 P0 + 0 P1 + 0 P2 + 5 P3 forward-notes, all addressed inline. 43
   ctest suites green default. test_ctl 71/71 (was 60 at R101 close;
   +9 -1d-debug-alloc + 2 R102). New public API

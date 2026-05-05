@@ -15,10 +15,13 @@
 #include <stratum/block.h>
 #include <stratum/ctl.h>
 #include <stratum/fs.h>
+#include <stratum/fs_testing.h>     /* stm_fs_sync_for_test */
 #include <stratum/p9.h>
 #include <stratum/pool.h>
+#include <stratum/scrub.h>          /* P9-CTL-1d-scrub-read */
 #include <stratum/send_recv.h>     /* STM_SEND_VERSION */
 #include <stratum/super.h>          /* STM_UB_VERSION + STM_DEV_*_ */
+#include <stratum/sync.h>           /* stm_sync_pool */
 #include <stratum/types.h>
 
 #include "test_fs_common.h"
@@ -2766,6 +2769,358 @@ STM_TEST(ctl_r102_p3_1_alloc_attached_predicate_boundary)
     STM_ASSERT_OK(stm_fs_alloc_attached(fs, 0, &attached));
     STM_ASSERT_TRUE(attached);
 
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
+/* ── P9-CTL-1d-scrub-read /pools/<uuid>/scrub ────────────────────────── */
+
+/* Boundary: stm_ctl_attach_scrub(c, NULL) refused with STM_EINVAL.
+ * Mirrors stm_ctl_attach_pool's R97 P2-1 contract. */
+STM_TEST(ctl_d4_scrub_attach_null_rejected)
+{
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    STM_ASSERT_EQ(stm_ctl_attach_scrub(c, NULL), STM_EINVAL);
+    STM_ASSERT_EQ(stm_ctl_attach_scrub(NULL, NULL), STM_EINVAL);
+    stm_ctl_destroy(c);
+}
+
+/* Idempotent same-pointer attach + STM_EEXIST on different pointer.
+ * Same shape as stm_ctl_attach_pool's idempotency contract. */
+STM_TEST(ctl_d4_scrub_attach_idempotent_and_eexists)
+{
+    make_tmp("ctl_d4_attach");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    STM_ASSERT(sync != NULL);
+    stm_scrub *sc1 = NULL, *sc2 = NULL;
+    STM_ASSERT_OK(stm_scrub_create(sync, &sc1));
+    STM_ASSERT_OK(stm_scrub_create(sync, &sc2));
+
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(fs, &c));
+
+    /* Same-pointer twice: STM_OK. */
+    STM_ASSERT_OK(stm_ctl_attach_scrub(c, sc1));
+    STM_ASSERT_OK(stm_ctl_attach_scrub(c, sc1));
+
+    /* Different scrub: STM_EEXIST. */
+    STM_ASSERT_EQ(stm_ctl_attach_scrub(c, sc2), STM_EEXIST);
+
+    stm_ctl_destroy(c);
+    stm_scrub_close(sc1);
+    stm_scrub_close(sc2);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
+/* When pool is attached but scrub is NOT, /pools/<uuid>/ readdir does
+ * NOT include "scrub". Twalk to "scrub" returns RERROR. */
+STM_TEST(ctl_d4_scrub_omitted_from_readdir_when_unattached)
+{
+    ctl_pool_fixture f = make_test_pool();
+
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
+
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "pools", CTL_TEST_POOL_UUID_HEX };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+
+    sz = build_tread(req, 4, 11, 0, 8192);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    uint32_t count = load_u32(resp + 7);
+    STM_ASSERT(count > 0);
+
+    int saw_scrub = 0;
+    const uint8_t *q = resp + 11;
+    const uint8_t *end = q + count;
+    while (q < end) {
+        uint16_t inner = load_u16(q);
+        const uint8_t *rec = q + 2;
+        const uint8_t *np = rec + 2 + 4 + 13 + 4 + 4 + 4 + 8;
+        uint16_t nl = load_u16(np);
+        const char *nm = (const char *)(np + 2);
+        if (nl == 5 && memcmp(nm, "scrub", 5) == 0) saw_scrub = 1;
+        q += 2 + inner;
+    }
+    STM_ASSERT_TRUE(!saw_scrub);
+
+    /* Twalk to scrub: RERROR. */
+    const char *spath[] = { "pools", CTL_TEST_POOL_UUID_HEX, "scrub" };
+    sz = build_twalk(req, 5, 10, 12, 3, spath);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+    destroy_test_pool(f);
+}
+
+/* When pool + scrub are attached, /pools/<uuid>/ readdir includes
+ * "scrub" entry; Twalk + Topen + Tread succeed and return idle state. */
+STM_TEST(ctl_d4_scrub_listed_and_reads_idle)
+{
+    make_tmp("ctl_d4_idle");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    STM_ASSERT(sync != NULL);
+    stm_pool *pool = stm_sync_pool(sync);
+    STM_ASSERT(pool != NULL);
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(sync, &sc));
+
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(fs, &c));
+    STM_ASSERT_OK(stm_ctl_attach_pool(c, pool));
+    STM_ASSERT_OK(stm_ctl_attach_scrub(c, sc));
+
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    /* Resolve the formatted pool uuid hex from the live pool. */
+    const uint64_t *uuid_words = stm_pool_uuid(pool);
+    uint8_t uuid_b[16];
+    for (size_t i = 0; i < 8; i++) {
+        uuid_b[i]     = (uint8_t)(uuid_words[0] >> (i * 8));
+        uuid_b[i + 8] = (uint8_t)(uuid_words[1] >> (i * 8));
+    }
+    char uuid_hex[64];
+    static const char hexd[] = "0123456789abcdef";
+    size_t pp = 0;
+    for (size_t i = 0; i < 16; i++) {
+        uuid_hex[pp++] = hexd[uuid_b[i] >> 4];
+        uuid_hex[pp++] = hexd[uuid_b[i] & 0xF];
+        if (i == 3 || i == 5 || i == 7 || i == 9) uuid_hex[pp++] = '-';
+    }
+    uuid_hex[pp] = '\0';
+
+    /* Twalk to /pools/<uuid>/scrub. */
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *spath[] = { "pools", uuid_hex, "scrub" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 3, spath);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+
+    sz = build_tread(req, 4, 11, 0, 4096);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    uint32_t count = load_u32(resp + 7);
+    STM_ASSERT(count > 0);
+    char body[1024];
+    STM_ASSERT(count < sizeof body);
+    memcpy(body, resp + 11, count);
+    body[count] = '\0';
+
+    STM_ASSERT(strstr(body, "state: idle\n")             != NULL);
+    STM_ASSERT(strstr(body, "cursor-device-id: 0\n")     != NULL);
+    STM_ASSERT(strstr(body, "cursor-start-block: 0\n")   != NULL);
+    STM_ASSERT(strstr(body, "blocks-verified: 0\n")      != NULL);
+    STM_ASSERT(strstr(body, "blocks-failed: 0\n")        != NULL);
+    STM_ASSERT(strstr(body, "blocks-repaired: 0\n")      != NULL);
+    STM_ASSERT(strstr(body, "blocks-unrepairable: 0\n")  != NULL);
+    STM_ASSERT(strstr(body, "ranges-processed: 0\n")     != NULL);
+
+    /* Re-readdir to verify "scrub" appears alongside status + devices. */
+    const char *ppath[] = { "pools", uuid_hex };
+    sz = build_twalk(req, 5, 10, 13, 2, ppath);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    sz = build_topen(req, 6, 13, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_tread(req, 7, 13, 0, 8192);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    count = load_u32(resp + 7);
+
+    int saw_status = 0, saw_devices = 0, saw_scrub = 0;
+    const uint8_t *q = resp + 11;
+    const uint8_t *end = q + count;
+    while (q < end) {
+        uint16_t inner = load_u16(q);
+        const uint8_t *rec = q + 2;
+        const uint8_t *np = rec + 2 + 4 + 13 + 4 + 4 + 4 + 8;
+        uint16_t nl = load_u16(np);
+        const char *nm = (const char *)(np + 2);
+        if (nl == 6 && memcmp(nm, "status",  6) == 0) saw_status  = 1;
+        if (nl == 7 && memcmp(nm, "devices", 7) == 0) saw_devices = 1;
+        if (nl == 5 && memcmp(nm, "scrub",   5) == 0) saw_scrub   = 1;
+        q += 2 + inner;
+    }
+    STM_ASSERT_TRUE(saw_status);
+    STM_ASSERT_TRUE(saw_devices);
+    STM_ASSERT_TRUE(saw_scrub);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+    stm_scrub_close(sc);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
+/* After stm_scrub_start, /pools/<uuid>/scrub reports state="running". */
+STM_TEST(ctl_d4_scrub_state_running_after_start)
+{
+    make_tmp("ctl_d4_running");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_pool *pool = stm_sync_pool(sync);
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(sync, &sc));
+
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(fs, &c));
+    STM_ASSERT_OK(stm_ctl_attach_pool(c, pool));
+    STM_ASSERT_OK(stm_ctl_attach_scrub(c, sc));
+
+    /* Drive the scrub into RUNNING before serving — read should
+     * reflect that state. */
+    STM_ASSERT_OK(stm_scrub_start(sc));
+
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    const uint64_t *uuid_words = stm_pool_uuid(pool);
+    uint8_t uuid_b[16];
+    for (size_t i = 0; i < 8; i++) {
+        uuid_b[i]     = (uint8_t)(uuid_words[0] >> (i * 8));
+        uuid_b[i + 8] = (uint8_t)(uuid_words[1] >> (i * 8));
+    }
+    char uuid_hex[64];
+    static const char hexd[] = "0123456789abcdef";
+    size_t pp = 0;
+    for (size_t i = 0; i < 16; i++) {
+        uuid_hex[pp++] = hexd[uuid_b[i] >> 4];
+        uuid_hex[pp++] = hexd[uuid_b[i] & 0xF];
+        if (i == 3 || i == 5 || i == 7 || i == 9) uuid_hex[pp++] = '-';
+    }
+    uuid_hex[pp] = '\0';
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *spath[] = { "pools", uuid_hex, "scrub" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 3, spath);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_tread(req, 4, 11, 0, 4096);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    uint32_t count = load_u32(resp + 7);
+    char body[1024];
+    memcpy(body, resp + 11, count);
+    body[count] = '\0';
+    STM_ASSERT(strstr(body, "state: running\n") != NULL);
+
+    /* Pause + re-read → state="paused"; on a re-Topen the snapshot
+     * advances. */
+    STM_ASSERT_OK(stm_scrub_pause(sc));
+    sz = build_tclunk(req, 5, 11);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    const char *spath2[] = { "pools", uuid_hex, "scrub" };
+    sz = build_twalk(req, 6, 10, 12, 3, spath2);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 7, 12, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_tread(req, 8, 12, 0, 4096);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    count = load_u32(resp + 7);
+    memcpy(body, resp + 11, count);
+    body[count] = '\0';
+    STM_ASSERT(strstr(body, "state: paused\n") != NULL);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+    stm_scrub_close(sc);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
+/* /pools/<uuid>/scrub is mode 0444 — world-readable, NOT admin-only.
+ * Confirm a non-admin caller can read it. */
+STM_TEST(ctl_d4_scrub_world_readable_nonadmin_succeeds)
+{
+    make_tmp("ctl_d4_world");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(fs);
+    stm_pool *pool = stm_sync_pool(sync);
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(sync, &sc));
+
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(fs, &c));
+    STM_ASSERT_OK(stm_ctl_attach_pool(c, pool));
+    STM_ASSERT_OK(stm_ctl_attach_scrub(c, sc));
+    STM_ASSERT_OK(stm_ctl_set_caller(c, 1000, 1000));    /* not admin */
+
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    const uint64_t *uuid_words = stm_pool_uuid(pool);
+    uint8_t uuid_b[16];
+    for (size_t i = 0; i < 8; i++) {
+        uuid_b[i]     = (uint8_t)(uuid_words[0] >> (i * 8));
+        uuid_b[i + 8] = (uint8_t)(uuid_words[1] >> (i * 8));
+    }
+    char uuid_hex[64];
+    static const char hexd[] = "0123456789abcdef";
+    size_t pp = 0;
+    for (size_t i = 0; i < 16; i++) {
+        uuid_hex[pp++] = hexd[uuid_b[i] >> 4];
+        uuid_hex[pp++] = hexd[uuid_b[i] & 0xF];
+        if (i == 3 || i == 5 || i == 7 || i == 9) uuid_hex[pp++] = '-';
+    }
+    uuid_hex[pp] = '\0';
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *spath[] = { "pools", uuid_hex, "scrub" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 3, spath);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    sz = build_tread(req, 4, 11, 0, 4096);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    uint32_t count = load_u32(resp + 7);
+    STM_ASSERT(count > 0);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+    stm_scrub_close(sc);
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
 

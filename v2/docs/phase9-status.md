@@ -463,9 +463,33 @@ language bindings, future kernel module) is a 9P consumer.
             - [ ] **P9-CTL-1d-debug-integrity** — pending;
                   integrity-verify trigger + result file. Requires
                   Phase 8.5 stm_fs_verify_merkle_chain.
+            - [x] **P9-CTL-1d-scrub-read** — read-only
+                  /pools/<uuid>/scrub surface. Adds KIND_POOL_SCRUB
+                  (mode 0444, world-readable; KIND_MAX = 20). New
+                  public API stm_ctl_attach_scrub(c, scrub) with R97
+                  P2-1 NULL-rejection + idempotent same-pointer +
+                  STM_EEXIST on different. Body: state (idle/running/
+                  paused/completed) + cursor (device_id, start_block)
+                  + counters (verified, failed, repaired,
+                  unrepairable, ranges_processed) — 8 lines × ~50
+                  chars worst case. The /pools/<uuid>/ readdir +
+                  Twalk both gate on c->scrub != NULL; without scrub
+                  attached the entry simply doesn't exist (matches
+                  the "no scrub configured = no scrub file" operator
+                  semantic). New scrub_state_name stringifier with
+                  R98 P3-4 trailing "unknown" tamper-resilience.
+                  6 -1d-scrub-read tests in test_ctl.c (71 → 77):
+                  ctl_d4_scrub_attach_null_rejected,
+                  ctl_d4_scrub_attach_idempotent_and_eexists,
+                  ctl_d4_scrub_omitted_from_readdir_when_unattached,
+                  ctl_d4_scrub_listed_and_reads_idle,
+                  ctl_d4_scrub_state_running_after_start,
+                  ctl_d4_scrub_world_readable_nonadmin_succeeds.
+                  R103 audit pending.
             - [ ] **P9-CTL-1d-actions** — pending; snapshot create /
-                  rollback + scrub start/stop write triggers. Composes
-                  against -1d-uid admin gate + -1d-events audit log.
+                  rollback + scrub start/pause/resume/reset write
+                  triggers. Composes against -1d-uid admin gate +
+                  -1d-events audit log + -1d-scrub-read state surface.
             - [ ] **P9-CTL-1d-tracing** — pending; /tracing/enable +
                   /tracing/sample-rate + /tracing/traces (ARCH §14.6).
       - [ ] **P9-CTL-1e /metrics/** — pending; Prometheus +

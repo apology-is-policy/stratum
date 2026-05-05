@@ -54,11 +54,12 @@
 extern "C" {
 #endif
 
-/* Forward decls — full defs in <stratum/fs.h> + <stratum/pool.h>;
- * including them here would be a heavy dependency for anyone
- * embedding /ctl/. */
+/* Forward decls — full defs in <stratum/fs.h> + <stratum/pool.h> +
+ * <stratum/scrub.h>; including them here would be a heavy dependency
+ * for anyone embedding /ctl/. */
 struct stm_fs;
 struct stm_pool;
+struct stm_scrub;
 
 typedef struct stm_ctl stm_ctl;
 
@@ -120,6 +121,34 @@ stm_status stm_ctl_create(struct stm_fs *fs, stm_ctl **out);
  */
 STM_MUST_USE
 stm_status stm_ctl_attach_pool(stm_ctl *c, struct stm_pool *pool);
+
+/*
+ * Attach a `stm_scrub *` to surface its state + counters at
+ * `/pools/<uuid>/scrub` (read-only at this sub-chunk; write triggers
+ * deferred). The instance does NOT take ownership of `scrub`; the
+ * caller must keep the pointer valid for the lifetime of the stm_ctl
+ * instance.
+ *
+ * Returns STM_EINVAL if `c` or `scrub` is NULL; STM_EEXIST if a
+ * different scrub is already attached. Re-attaching the same scrub
+ * pointer is a no-op (STM_OK). v2.0 supports at most one attached
+ * scrub per /ctl/ (matches the v2.0 single-pool posture).
+ *
+ * Timing (R97 P2-2 carry): MUST be called BEFORE the first
+ * `stm_p9_server_handle` invocation against any server using this
+ * stm_ctl as `ctx`. The internal scrub pointer is not protected by
+ * the instance mutex on vops read paths — concurrent attach + vops
+ * dispatch is a C11 data race on `c->scrub`. The serial-server
+ * posture makes this trivially safe in practice; future concurrent-
+ * accept transports must extend locking.
+ *
+ * Lifetime ordering (R26 P3-4 carry from scrub.h): the underlying
+ * `stm_sync` (passed at `stm_scrub_create`) is borrowed by `scrub`
+ * and outlives it. Caller MUST close servers FIRST, then close
+ * stm_ctl, then close scrub, then close sync. Out-of-order is UB.
+ */
+STM_MUST_USE
+stm_status stm_ctl_attach_scrub(stm_ctl *c, struct stm_scrub *scrub);
 
 /*
  * Destroy a /ctl/ instance. Does not destroy the attached `fs` or

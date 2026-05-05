@@ -7,4 +7,4 @@ target_include_directories(stm_ctl
 
 target_link_libraries(stm_ctl
     PRIVATE stm_warnings stm_sanitize stm_coverage
-    PUBLIC  stm_p9 stm_fs stm_pool)
+    PUBLIC  stm_p9 stm_fs stm_pool stm_scrub)
