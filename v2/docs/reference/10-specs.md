@@ -1320,13 +1320,45 @@ Buggy variants (all fire as designed at fixed-config bounds):
   the wrong connection's bindings; `LookupReflectsOwnBindings`
   fires at the first observation that returns the wrong value.
 
-Spec-to-code: implementation deferred to P8-9P-2 (per-connection
-namespace composition) — when the 9P server's `src/9p/` adds
-the per-connection mount-table machinery, every state-machine
-field in this spec maps to a concrete data structure in the
-server. The four buggy variants enumerate the implementation
-errors that the server's reviewer should explicitly rule out
-during code review.
+Spec-to-code: implementation lands at P9-9P-2 (per-connection
+namespace composition) — `v2/src/9p/server.c` adds:
+
+- `struct stm_9p_server::bindings` — the per-connection bindings
+  table (heap-grown linear array up to `STM_9P_MAX_BINDINGS = 128`).
+  Server-local — there is no global bindings state in the process,
+  giving `LookupReflectsOwnBindings` + `BindingsMatchAuthored` their
+  structural guarantee.
+- `ns_bindings_set` / `ns_bindings_unset` / `ns_bindings_lookup` /
+  `ns_bindings_clear` map to the spec's `Bind` / `Unbind` /
+  (read-side of `Lookup`) / `Detach` actions.
+- `ns_canonicalize` enforces the canonical-key invariant: distinct
+  user-supplied path strings that resolve to the same canonical form
+  bind/unbind/look up the SAME entry, matching the spec's paths-as-keys.
+- Wire surface: `STM_9P_TBIND` / `STM_9P_RBIND` (124/125),
+  `STM_9P_TUNBIND` / `STM_9P_RUNBIND` (126/127). `STM_9P_BIND_REPLACE`
+  is the only mode honored at v2.0 (matching the spec's REPLACE-only
+  scope); UNION_OVER / UNION_UNDER return ENOTSUP on the wire.
+- Tattach `aname` parser composes the connection's initial namespace:
+  `""` / `"/"` → default; `"/abs/path"` → "chroot" form; `"spec:..."`
+  → multi-binding spec resolved atomically (rolls back installed
+  bindings on any per-entry failure).
+- Twalk routes through bindings: at every per-component step,
+  `ns_join(cur_path, name)` produces the new cumulative path; the
+  bindings table is consulted before falling through to
+  `stm_fs_lookup`. ".." canonicalizes via the same lookup-then-bind
+  logic, which prevents leak-through-binding on backward walks.
+- `server_destroy` calls `ns_bindings_clear` (DetachClears).
+
+The four buggy variants in namespace.tla still enumerate the
+canonical failure modes the reviewer must explicitly rule out:
+BuggyGlobalBindings (no global bindings table — verified by
+absence), BuggyDetachLeaks (server_destroy clears every entry),
+BuggyUnbindCrosstalk (no path mutates another server's table by
+construction), BuggyLookupCrosstalk (Twalk reads only s->bindings).
+Tests `p9_two_servers_isolated_bindings` /
+`p9_walk_double_dot_through_binding` /
+`p9_attach_aname_spec_partial_failure_rolls_back` pin the
+observable consequences.
 
 ### `dirent.tla` — directory entry layer (P8-POSIX-2 entry)
 

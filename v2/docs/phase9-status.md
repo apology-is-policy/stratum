@@ -85,37 +85,50 @@ language bindings, future kernel module) is a 9P consumer.
       also added in the same edit (closes R90 P2-2 forward-
       note). No code yet — implementation in P9-9P-1.
 
-- [ ] **P9-9P-1 9P2000.L baseline** — pending; the core 9P
-      server module under `src/9p/` (separate from `src/p9/`,
-      janus's key-agent codec — keeps the two consumers
-      independent). Reuses `wire.h` from `src/p9/`. Public API
-      `stm_9p_server_create(stm_fs *fs, root_ds, ...)` taking
-      a live `stm_fs` handle directly (no vops abstraction —
-      the server is bound to stm_fs). Fid table per
-      `fid.tla`'s state machine. qid encoding: `path =
-      (ds:32 << 32) | ino:32`, `version = si_gen`, `type ∈
-      {qtdir, qtfile, qtsymlink}`. Handlers: Tversion
-      (negotiates "9P2000.L"), Rlerror, Tattach (Unix-socket
-      SO_PEERCRED), Twalk, Tlopen, Tlcreate, Tmkdir, Tsymlink,
-      Treadlink, Tlink, Tunlinkat, Trenameat, Tread, Twrite,
-      Tclunk, Treaddir, Tgetattr, Tsetattr, Tlock, Tgetlock,
-      Txattrwalk, Txattrcreate, Tfsync, Tstatfs, Tflush.
-      Adds `src/9p/` to CLAUDE.md trigger list. New tests in
-      `tests/test_9p.c`. Spec-to-code: every `IOSuccess` /
-      `IOReject` action in fid.tla maps to the gen-check gate
-      in the server's per-handler stale-fid detection; every
-      `Walk` action maps to Twalk's qid + cached_gen
-      population.
+- [x] **P9-9P-1 9P2000.L baseline** — substantive complete
+      (commits `7a4c614` foundation through `fb3d382` xattr).
+      `src/9p/server.c` + `src/9p/wire.h` + `include/stratum/9p.h`.
+      24 of ~30 .L message types implemented; ENOSYS for Tlink
+      (forward-noted: needs `stm_fs_link_by_ino`), Tmknod (FIFO/
+      socket/dev — ARCH §11.11 deferral), Trename + Tremove
+      (legacy 9P2000 supplanted by Trenameat + Tunlinkat). qid
+      encoding `(ds:32<<32)|ino` with `version=si_gen`; stale-fid
+      detection via `verify_fid_fresh` (the fid.tla::IOReject gate
+      at every IO handler). Lock-owner namespace shifted by
+      `(server_idx << 32)` so cross-server collisions are
+      structurally impossible. Treaddir uses BATCH=1 + cursor
+      rewind on no-room (matches Linux v9fs short-read retry).
+      `src/9p/` added to CLAUDE.md trigger list. R92 audit closed
+      (commit `de3ab63`) — 0 P0 + 2 P1 + 2 P2 + 4 P3 inline +
+      3 regression tests.
 
-- [ ] **P9-9P-2 per-connection namespace composition** — pending;
-      implements `namespace.tla` against the P9-9P-1 server.
-      Adds Tbind / Tunbind extensions per ARCHITECTURE §8.8.2.
-      Connections get private mount-table state allocated at
-      Tattach + freed at Tclunk (the connection's root fid).
+- [x] **P9-9P-2 per-connection namespace composition** — substantive
+      complete (P9-9P-2a `8b1a6fa` Tbind/Tunbind + per-fid ns_path,
+      P9-9P-2b `04484ed` Tattach aname parser). Implements
+      `namespace.tla` against the P9-9P-1 server.
+      - Wire opcodes 124-127 (Tbind/Rbind, Tunbind/Runbind);
+        Stratum-extension band 124-159 reserved.
+      - Per-connection bindings table (heap-grown, capped at
+        `STM_9P_MAX_BINDINGS = 128`). Server-local — no global
+        bindings state in the process; `LookupReflectsOwnBindings`
+        + `BindingsMatchAuthored` follow structurally.
+      - Per-fid `ns_path` tracks the fid's location in the
+        client's namespace. Twalk consults the bindings table at
+        every cumulative path before falling through to
+        `stm_fs_lookup`; ".." canonicalizes via the same
+        lookup-then-bind logic, preventing leak-through-binding.
+      - `STM_9P_BIND_REPLACE` only at v2.0 (matching the spec's
+        REPLACE-only scope); UNION_OVER / UNION_UNDER reserved on
+        the wire but return ENOTSUP.
+      - Tattach `aname` parser handles `""` / `"/"` (default) /
+        `"/abs/path"` (chroot) / `"spec:src=tgt,..."` (atomic
+        multi-binding). `apply_attach_spec` rolls back installed
+        bindings on any per-entry failure.
+      - server_destroy → `ns_bindings_clear` (DetachClears).
+      - 21 new tests in `tests/test_9p.c` (13 -2a + 8 -2b);
+        test_9p grows 39 → 60 in ~7s.
       The four buggy variants in `namespace.tla` are the
-      adversarial-review checklist: any code path that touches
-      a connection's mount table needs to rule out the
-      crosstalk classes.
+      adversarial-review checklist for R93. Audit pending.
 
 - [ ] **P9-9P-3 stratum 9P extensions** — pending; Tpin / Tunpin
       (snapshot pinning per ARCHITECTURE §3.3.2), Tsync (client-
