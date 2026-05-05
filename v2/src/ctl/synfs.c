@@ -193,7 +193,18 @@ static uint32_t qid_device_id(uint64_t q)
  * dataset surface; STM_SYNC_DATASET_ID_MAX = 0x0FFFFFFF (28 bits)
  * fits comfortably in the 32-bit field. Kept as a separate name
  * so the reader of stat_at / vops_walk can tell which kind's
- * data they're extracting. */
+ * data they're extracting.
+ *
+ * R99 P3-7: pin the format-bump invariant — if STM_SYNC_DATASET_ID_MAX
+ * ever exceeds UINT32_MAX, the (uint32_t)dsid casts in qid_of() calls
+ * silently truncate the high bits; a confused-deputy follows. The
+ * static_assert below trips at build time so the format-widening
+ * chunk MUST also widen qid_of's device_id field (or split it). */
+_Static_assert(STM_SYNC_DATASET_ID_MAX <= UINT32_MAX,
+               "qid_of's device_id field is uint32_t; widening "
+               "STM_SYNC_DATASET_ID_MAX past UINT32_MAX requires "
+               "widening the qid layout in lockstep");
+
 static uint64_t qid_dataset_id(uint64_t q)
 {
     return q & DEVICE_ID_MASK;
@@ -380,6 +391,12 @@ static int parse_dataset_id(const char *name, size_t len, uint64_t *out)
         v = v * 10u + (uint64_t)(ch - '0');
         if (v > STM_SYNC_DATASET_ID_MAX) return -1;
     }
+    /* R99 P3-2: dataset id 0 is reserved (the canonical id space
+     * starts at STM_DATASET_ROOT_ID = 1). Reject "0" at the parser
+     * boundary so the wire form has exactly one spelling per slot
+     * and "syntactically refused" is distinguishable from "looked
+     * up and missed." */
+    if (v == 0) return -1;
     *out = v;
     return 0;
 }
@@ -709,12 +726,32 @@ static stm_status materialize_device_status(stm_ctl *c, ctl_session *s)
     return STM_OK;
 }
 
+/* R99 P3-4: pin the property-line block against STM_PROP_COUNT. If a
+ * future chunk grows the enum (e.g., adds STM_PROP_DEDUP), the
+ * materializer below silently omits the new property until a manual
+ * edit catches up. Trip at build time. Update both this assert AND
+ * materialize_dataset_properties's printf block in lockstep. */
+_Static_assert(STM_PROP_COUNT == 5,
+               "materialize_dataset_properties prints exactly 5 "
+               "user-settable properties; extend the printf block "
+               "whenever STM_PROP_COUNT grows (ARCH §8.4.2)");
+
 /* Materialize /datasets/<id>/properties — surfaces the dataset's
  * five user-settable properties (effective values, with parent-walk
  * inheritance per property.tla::Effective) AND the metadata fields
  * from stm_dataset_entry (name, parent_id, created_txg, next_ino,
  * origin_snap_id). Combined to give operators a single view of the
- * dataset's full state. */
+ * dataset's full state.
+ *
+ * Body cap: worst-case ~615 bytes (255-byte name + 11 × 20-digit
+ * decimals + line decoration). R99 P3-3 corrected from earlier
+ * "~280 bytes" estimate — comfortable under STM_CTL_BODY_MAX
+ * (60% headroom).
+ *
+ * Name safety: dataset.c's name_chars_valid (R99 P2-1) refuses
+ * bytes < 0x20 + 0x7F at create_child / rename / create_clone, so
+ * the `name: %.*s\n` formatter cannot embed a forged `\nflags: ...`
+ * line. UTF-8 multi-byte sequences are accepted unchanged. */
 static stm_status materialize_dataset_properties(stm_ctl *c, ctl_session *s)
 {
     if (!c->fs) return STM_EBACKEND;     /* gated at vops_open */
@@ -1026,12 +1063,11 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
         if (rc != STM_OK) return rc;
         rc = emit_entry(c, cb, cb_ctx, qid_root(KIND_POOLS_DIR));
         if (rc != STM_OK) return rc;
-        /* /datasets/ is conditional on c->fs being attached. When
-         * unattached, the directory entry is omitted from the root
-         * listing — matches the /pools/ posture (it's listed even
-         * when c->pool is NULL because /pools/ as a directory is
-         * always-present, just empty; /datasets/ takes the same
-         * always-listed posture for symmetry). */
+        /* /datasets/ is always listed (matches /pools/ posture):
+         * the directory exists even when c->fs is unattached;
+         * readdir simply returns empty. R99 P3-1 — earlier comment
+         * here contradicted the code; rewritten to reflect the
+         * actual always-listed semantics. */
         return emit_entry(c, cb, cb_ctx, qid_root(KIND_DATASETS_DIR));
 
     case KIND_POOLS_DIR:

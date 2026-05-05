@@ -369,8 +369,26 @@ language bindings, future kernel module) is a 9P consumer.
             stats (/datasets/<id>/stats) + create-snapshot /
             rollback action triggers deferred to subsequent
             sub-chunks.
-            6 new tests in `tests/test_ctl.c`; ctest 30 → 36 in
-            test_ctl. R99 audit pending.
+            6 -1c tests + 2 R99 regressions (newline-in-name
+            refused; dataset id "0" parser-rejected).
+            **R99 close** items: P2-1 dataset name validation
+            added in `dataset.c::stm_dataset_create_child` +
+            `stm_dataset_rename` + `stm_dataset_create_clone`
+            via new `name_chars_valid` static helper (refuses
+            bytes < 0x20 + 0x7F). UTF-8 multi-byte sequences
+            (≥0x80) accepted unchanged. P3-1 root-listing
+            comment fixed. P3-2 parse_dataset_id rejects "0".
+            P3-3 body-cap comment corrected (~615 bytes worst
+            case, not 280). P3-4 _Static_assert(STM_PROP_COUNT
+            == 5) pins materializer's printf block against
+            future enum extensions. P3-5 c->fs immutability
+            documented in header. P3-7 _Static_assert
+            STM_SYNC_DATASET_ID_MAX <= UINT32_MAX pins the
+            qid_of cast invariant. P3 forward-noted: P3-6
+            paginated readdir for >1024 datasets (cursor-state
+            chunk).
+            ctest 30 → 38 in test_ctl (6 -1c + 2 R99). 43/43
+            ctest green.
       - [ ] **P9-CTL-1d /tracing/, /debug/, /events** — pending;
             tracing toggle, debug dumps, event log.
       - [ ] **P9-CTL-1e /metrics/** — pending; Prometheus +

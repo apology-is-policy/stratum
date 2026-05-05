@@ -69,6 +69,15 @@ typedef struct stm_ctl stm_ctl;
  * The instance does NOT take ownership of `fs`; the caller must
  * keep the pointer valid for the lifetime of the stm_ctl instance.
  *
+ * Immutability (R99 P3-5): `fs` is bound at create time and is
+ * IMMUTABLE for the lifetime of the instance. There is no
+ * stm_ctl_attach_fs / stm_ctl_detach_fs API today; reassigning the
+ * fs requires destroy + recreate. Forward-note: a future daemon
+ * surface that needs to swap fs without tearing down the /ctl/
+ * server would re-introduce the R97 P2-2 race window for the fs
+ * pointer (vops dispatch reads c->fs without c->mu); the same
+ * timing-must-be-pre-handle posture would apply.
+ *
  * Lifetime contract: the returned `*out` MUST outlive every
  * `stm_p9_server` that holds it as `ctx`. Concretely: destroy all
  * servers FIRST, then `stm_ctl_destroy`. Destroying the stm_ctl

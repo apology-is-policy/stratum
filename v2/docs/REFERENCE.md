@@ -38,9 +38,24 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9-CTL-1b R97 close (this commit). 43 ctest suites
-  green default. test_ctl 25/25 (was 13 at -1a R96 close;
-  +10 -1b /pools/ tests +2 R97 regressions). STM_UB_VERSION = 26
+- **Tip**: P9-CTL-1c R99 close (this commit). 43 ctest suites
+  green default. test_ctl 38/38 (was 13 at -1a R96 close;
+  +10 -1b + 2 R97 + 5 -1b' + 6 -1c + 2 R99). **P9-CTL-1c +
+  P9-CTL-1b'** added /pools/<uuid>/devices/<id>/status (b'),
+  /datasets/, /datasets/<id>/, /datasets/<id>/properties (c).
+  Three new fs read-side wrappers (stm_fs_dataset_lookup /
+  _count / _iter). Centralized KIND_META[KIND_MAX] now tracks
+  12 kinds. R99 P2-1 added dataset name validation in
+  dataset.c (refuses bytes < 0x20 + 0x7F at create_child /
+  rename / create_clone) — closes a confused-deputy attack
+  vector where forged property lines could be injected via
+  newline-bearing dataset names. Forward-notes accumulated
+  through R99: paginated readdir for >1024 datasets;
+  dataset.tla::Name spec extension; concurrent-accept
+  attach-vs-vops race + R94 P2-1 stat-after-mutation class.
+
+- **Pre-Phase-9 milestone tip**: P9-CTL-1b R97 close. 43
+  ctest suites green default. test_ctl 25/25. STM_UB_VERSION = 26
   (no on-disk format change in P9-CTL-*; /ctl/ is in-memory
   operator state). Spec posture unchanged: 27 modules / 35 fixed
   cfgs / 64 buggy cfgs (last changed at P9-9P-2c). **P9-CTL-1b —

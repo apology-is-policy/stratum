@@ -47,6 +47,25 @@ static inline void must_unlock(pthread_mutex_t *m) {
     if (rc != 0) abort();
 }
 
+/* R99 P2-1: dataset name validation. Refuses ASCII control characters
+ * (bytes < 0x20, including \n \r \t) and 0x7F (DEL). UTF-8 multi-byte
+ * sequences (bytes ≥ 0x80) are accepted — they're typical printable
+ * chars in non-ASCII names ("résumé", "用户/家"). The control-char
+ * refusal hardens every line-oriented surface that prints the name —
+ * /ctl/datasets/<id>/properties was the first such surface, but
+ * future ones (event log entries, tracing spans, debug dumps,
+ * Prometheus metric labels) inherit the same protection without
+ * each surface needing per-call escaping. R99 P2-1 in the cumulative
+ * audit closed-list. */
+static inline bool name_chars_valid(const char *name, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        unsigned char b = (unsigned char)name[i];
+        if (b < 0x20) return false;     /* C0 controls (incl. \n \r \t \0) */
+        if (b == 0x7F) return false;    /* DEL */
+    }
+    return true;
+}
+
 /*
  * Per-slot record. The public stm_dataset_entry plus a "present" flag
  * (PRESENT vs ABSENT/destroyed) plus per-property local state.
@@ -332,6 +351,7 @@ stm_status stm_dataset_create_child(stm_dataset_index *idx,
     *out_id = 0;
     size_t name_len = strlen(name);
     if (name_len == 0 || name_len > STM_DATASET_NAME_MAX) return STM_EINVAL;
+    if (!name_chars_valid(name, name_len)) return STM_EINVAL;
 
     must_lock(&idx->lock);
 
@@ -408,10 +428,13 @@ stm_status stm_dataset_destroy(stm_dataset_index *idx, uint64_t id) {
 
 stm_status stm_dataset_rename(stm_dataset_index *idx, uint64_t id,
                                 const char *new_name) {
+    /* Note: the name_len + name_chars_valid checks below mirror
+     * stm_dataset_create_child + stm_dataset_create_clone. R99 P2-1. */
     if (!idx || !new_name) return STM_EINVAL;
     if (id == STM_DATASET_ROOT_ID) return STM_EINVAL;
     size_t name_len = strlen(new_name);
     if (name_len == 0 || name_len > STM_DATASET_NAME_MAX) return STM_EINVAL;
+    if (!name_chars_valid(new_name, name_len)) return STM_EINVAL;
 
     must_lock(&idx->lock);
     size_t s = find_slot_locked(idx, id);
@@ -733,6 +756,7 @@ stm_status stm_dataset_create_clone(stm_dataset_index *idx,
     if (origin_snap_id == STM_DATASET_NO_ORIGIN) return STM_EINVAL;
     size_t name_len = strlen(name);
     if (name_len == 0 || name_len > STM_DATASET_NAME_MAX) return STM_EINVAL;
+    if (!name_chars_valid(name, name_len)) return STM_EINVAL;
 
     must_lock(&idx->lock);
 

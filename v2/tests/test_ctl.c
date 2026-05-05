@@ -1447,6 +1447,78 @@ STM_TEST(ctl_c1_walk_nonexistent_dataset_id_enoent)
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
 
+/* R99 P2-1 regression: dataset names with control chars (newlines,
+ * etc.) MUST be rejected at create time so /ctl/datasets/<id>/
+ * properties cannot inject forged property lines into its line-
+ * oriented body. The check sits in dataset.c::stm_dataset_create_child
+ * + stm_dataset_rename + stm_dataset_create_clone, gating bytes
+ * < 0x20 + 0x7F. */
+STM_TEST(ctl_r99_p2_1_dataset_name_newline_rejected)
+{
+    make_tmp("ctl_r99_p2_1");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Newline injection — the canonical attack shape. */
+    uint64_t bad_id = 0;
+    STM_ASSERT_ERR(stm_fs_create_dataset(fs, 1, "innocent\nflags: 0xdeadbeef",
+                                            &bad_id),
+                   STM_EINVAL);
+
+    /* Carriage return + tab + bare DEL — every C0 control + DEL
+     * rejected. */
+    STM_ASSERT_ERR(stm_fs_create_dataset(fs, 1, "tab\there", &bad_id),
+                   STM_EINVAL);
+    STM_ASSERT_ERR(stm_fs_create_dataset(fs, 1, "cr\rhere", &bad_id),
+                   STM_EINVAL);
+    char with_del[] = { 'd', 'e', 'l', 0x7F, '\0' };
+    STM_ASSERT_ERR(stm_fs_create_dataset(fs, 1, with_del, &bad_id),
+                   STM_EINVAL);
+
+    /* Plain ASCII printable + UTF-8 multi-byte still accepted. */
+    uint64_t ok_id = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "tank-home", &ok_id));
+    STM_ASSERT(ok_id > 1);
+    uint64_t utf8_id = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "résumé", &utf8_id));
+    STM_ASSERT(utf8_id > ok_id);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
+/* R99 P3-2 regression: parse_dataset_id rejects "0" — the canonical
+ * id space starts at STM_DATASET_ROOT_ID = 1, so "0" should be
+ * "syntactically refused" at the parser, not "looked up and missed"
+ * via dataset_lookup. Distinguishable error path. */
+STM_TEST(ctl_r99_p3_2_dataset_id_zero_rejected_at_parser)
+{
+    make_tmp("ctl_r99_p3_2");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(fs, &c));
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *p0[] = { "datasets", "0" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 2, p0);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
 STM_TEST(ctl_c1_dataset_properties_write_rejected)
 {
     make_tmp("ctl_c1_wr");
