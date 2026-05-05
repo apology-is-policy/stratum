@@ -102,9 +102,10 @@ language bindings, future kernel module) is a 9P consumer.
       (commit `de3ab63`) — 0 P0 + 2 P1 + 2 P2 + 4 P3 inline +
       3 regression tests.
 
-- [x] **P9-9P-2 per-connection namespace composition** — substantive
-      complete (P9-9P-2a `8b1a6fa` Tbind/Tunbind + per-fid ns_path,
-      P9-9P-2b `04484ed` Tattach aname parser). Implements
+- [x] **P9-9P-2 per-connection namespace composition** — complete
+      (substantive: P9-9P-2a `8b1a6fa` Tbind/Tunbind + per-fid
+      ns_path; P9-9P-2b `04484ed` Tattach aname parser; R93 close
+      `d881ee2` 0 P0 + 1 P1 + 2 P2 + 4 P3 — YELLOW). Implements
       `namespace.tla` against the P9-9P-1 server.
       - Wire opcodes 124-127 (Tbind/Rbind, Tunbind/Runbind);
         Stratum-extension band 124-159 reserved.
