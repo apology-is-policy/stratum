@@ -165,15 +165,50 @@ language bindings, future kernel module) is a 9P consumer.
       8 new tests in `tests/test_9p.c`; test_9p 66 → 74. R94
       audit pending.
 
-- [ ] **P9-9P-4 stratumd Unix socket transport** — pending;
-      `src/cmd/stratumd/` daemon binary. Listens on
-      `/var/run/stratum.sock` (configurable). Accept-loop
-      spawns a server-instance per connection (one fid
-      namespace per connection per the p9.h / 9p.h comment;
-      concurrency across clients is the daemon's problem).
-      Single-threaded event loop at v2.0 — multi-thread
-      post-perf-tuning. Integration tests with real socket
-      roundtrip in `tests/test_9p_socket_*.c`.
+- [x] **P9-9P-4 stratumd Unix socket transport** — substantive
+      complete (commit `3bb4c9c`). `src/cmd/stratumd/` daemon
+      binary listening on a Unix socket (default
+      `/var/run/stratum.sock`). Architecture:
+      - **Library `stm_stratumd`** with four building blocks:
+        `stm_stratumd_listen_unix`, `stm_stratumd_serve_client`,
+        `stm_stratumd_accept_loop`, `stm_stratumd_run`.
+      - **Binary `stratumd`** at `src/cmd/stratumd/main.c` —
+        thin wrapper around `stm_stratumd_run`. Args:
+        `<fs-path> [--listen <path>] [--keyfile <path> |
+        --janus-socket <path>] [--read-only] [--msize <bytes>]
+        [--root-dataset <id>] [--backlog <n>]`.
+      - **Serial accept** at v2.0: accept() blocks; each
+        connection served to disconnect on the same thread;
+        subsequent clients queue in the listen backlog. This
+        STRUCTURALLY AVOIDS the R94 P2-1 stat-after-mutation
+        race class (h_lcreate / h_mkdir / h_renameat /
+        h_reflink) because no two server instances ever
+        interleave handlers.
+      - **Authentication**: SO_PEERCRED on Linux,
+        getpeereid() on macOS/BSD. uid/gid stamped onto
+        stm_9p_server_create per connection. Fall back to
+        daemon's uid/gid if peer creds unavailable.
+        Pluggable auth backends (factotum / SASL / token per
+        ARCH §10.10.3) forward-noted.
+      - **Trust boundaries**: 4-byte LE size header bounded
+        to [STM_9P_HDR_SIZE, msize_max]; out-of-range size
+        disconnects. Read/write robust to EINTR; clean EOF on
+        header read = clean disconnect; EOF mid-message =
+        STM_EIO. listen_unix rejects sun_path-too-long with
+        -ENAMETOOLONG; CLOEXEC defensively set.
+      - **Signal handling**: SIGINT/SIGTERM toggle stop_flag
+        (atomic_bool with explicit memory_order; async-signal-
+        safe per C11). No SA_RESTART so accept() returns
+        EINTR. SIGPIPE ignored.
+      - 4 new integration tests in `tests/test_9p_socket.c`:
+        sun_path-too-long, end-to-end Tversion+Tattach+Tclunk,
+        two-sequential-clients, protocol-violation-recovery.
+      Forward-notes: concurrent multi-connection (epoll /
+      pthread-per-connection) is v2.1+ work whose reviewer
+      MUST address the R94 P2-1 stat-after-mutation class
+      before shipping. Daemon binary is built but not
+      installed by CMake yet (install rules deferred). R95
+      audit pending.
 
 - [ ] **P9-CTL-1 /ctl/ synthetic FS** — pending; the layout in
       ARCHITECTURE §14.3 served as a 9P file tree. Read paths
