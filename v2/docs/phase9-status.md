@@ -131,11 +131,39 @@ language bindings, future kernel module) is a 9P consumer.
       The four buggy variants in `namespace.tla` are the
       adversarial-review checklist for R93. Audit pending.
 
-- [ ] **P9-9P-3 stratum 9P extensions** — pending; Tpin / Tunpin
-      (snapshot pinning per ARCHITECTURE §3.3.2), Tsync (client-
-      initiated commit), Treflink (O(1) copy via P7-16's
-      stm_fs_reflink), Tfallocate, plus pluggable auth backends
-      (factotum, SASL, token).
+- [x] **P9-9P-3 stratum 9P extensions** — substantive complete
+      (commit `6627667`). Wire opcodes 128-139 fill the
+      Stratum-extension band 124-159:
+      - **Tsync** (128/129) → `stm_fs_commit`. Whole-pool
+        commit; complements Tfsync (which takes a fid arg and
+        routes to the same primitive).
+      - **Treflink** (130/131) → `stm_fs_reflink`. FICLONE shape
+        (both fids must be NODE; dst MUST be empty). Returns
+        Rreflink with the post-commit dst qid for client-cache
+        refresh. Cross-dataset is STM_EXDEV per stm_fs_reflink;
+        inline-source returns STM_ENOTSUPPORTED → wire ENOTSUP.
+      - **Tfallocate** (132/133) → `stm_fs_fallocate`. Every
+        FALLOC_FL_* flag (KEEP_SIZE / PUNCH_HOLE / COLLAPSE_RANGE
+        / ZERO_RANGE / INSERT_RANGE / UNSHARE_RANGE). Defensive
+        flag-mask pre-check refuses any bit outside
+        STM_FS_FALLOC_MASK with EINVAL.
+      - **Tfadvise** (134/135) → `stm_fs_fadvise`. POSIX_FADV_*
+        hints (NORMAL / RANDOM / SEQUENTIAL / WILLNEED / DONTNEED
+        / NOREUSE). MVP scope: hint applied at INODE granularity;
+        offset/length advisory but not enforced.
+      - **Tpin / Tunpin** (136/137 + 138/139) — wire opcodes
+        reserved; runtime returns ENOSYS until MVCC reader-pin
+        infra in stm_fs lands. ARCH §3.3.2 pinned-snapshot read
+        view is a future v2.1+ chunk.
+      - **Auth backend plug-ins** (factotum / SASL / token per
+        ARCH §10.10.3): v2.0 keeps Unix-socket SO_PEERCRED as
+        the default. Pluggable Tauth backends are post-v2.0.
+      Drift-asserted constants: STM_9P_FALLOC_FL_* /
+      STM_9P_FADV_* match Linux's <linux/falloc.h> /
+      <linux/fadvise.h> verbatim; _Static_assert at compile time
+      against STM_FS_FALLOC_FL_* / STM_FS_FADV_* runtime values.
+      8 new tests in `tests/test_9p.c`; test_9p 66 → 74. R94
+      audit pending.
 
 - [ ] **P9-9P-4 stratumd Unix socket transport** — pending;
       `src/cmd/stratumd/` daemon binary. Listens on
