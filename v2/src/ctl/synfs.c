@@ -85,29 +85,33 @@
 #include <stratum/types.h>
 
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>      /* uid_t, gid_t */
+#include <time.h>           /* clock_gettime */
 
 /* ── kind enum + meta table ─────────────────────────────────────────── */
 
 typedef enum {
-    KIND_ROOT               = 0,
-    KIND_VERSION            = 1,
-    KIND_STATE              = 2,
-    KIND_POOLS_DIR          = 3,    /* /pools/ */
-    KIND_POOL_DIR           = 4,    /* /pools/<uuid>/ */
-    KIND_POOL_STATUS        = 5,    /* /pools/<uuid>/status */
-    KIND_DEVICES_DIR        = 6,    /* /pools/<uuid>/devices/ */
-    KIND_DEVICE_DIR         = 7,    /* /pools/<uuid>/devices/<id>/ */
-    KIND_DEVICE_STATUS      = 8,    /* /pools/<uuid>/devices/<id>/status */
-    KIND_DATASETS_DIR       = 9,    /* /datasets/ */
-    KIND_DATASET_DIR        = 10,   /* /datasets/<id>/ */
-    KIND_DATASET_PROPERTIES = 11,   /* /datasets/<id>/properties */
-    KIND_ADMIN_DIR          = 12,   /* /admin/ — admin-only directory */
-    KIND_ADMIN_PEER         = 13,   /* /admin/peer — admin-only file */
+    KIND_ROOT                 = 0,
+    KIND_VERSION              = 1,
+    KIND_STATE                = 2,
+    KIND_POOLS_DIR            = 3,    /* /pools/ */
+    KIND_POOL_DIR             = 4,    /* /pools/<uuid>/ */
+    KIND_POOL_STATUS          = 5,    /* /pools/<uuid>/status */
+    KIND_DEVICES_DIR          = 6,    /* /pools/<uuid>/devices/ */
+    KIND_DEVICE_DIR           = 7,    /* /pools/<uuid>/devices/<id>/ */
+    KIND_DEVICE_STATUS        = 8,    /* /pools/<uuid>/devices/<id>/status */
+    KIND_DATASETS_DIR         = 9,    /* /datasets/ */
+    KIND_DATASET_DIR          = 10,   /* /datasets/<id>/ */
+    KIND_DATASET_PROPERTIES   = 11,   /* /datasets/<id>/properties */
+    KIND_ADMIN_DIR            = 12,   /* /admin/ — admin-only directory */
+    KIND_ADMIN_PEER           = 13,   /* /admin/peer — admin-only file */
+    KIND_EVENTS               = 14,   /* /events — append-only event log */
+    KIND_ADMIN_CLEAR_EVENTS   = 15,   /* /admin/clear-events — admin write trigger */
     KIND_MAX
 } ctl_kind;
 
@@ -133,6 +137,8 @@ static const ctl_kind_meta KIND_META[KIND_MAX] = {
     [KIND_DATASET_PROPERTIES] = { false, false, 0444, "properties" },
     [KIND_ADMIN_DIR]          = { true,  true,  0500, "admin"      },  /* admin-only dir */
     [KIND_ADMIN_PEER]         = { false, true,  0400, "peer"       },  /* admin-only file */
+    [KIND_EVENTS]             = { false, false, 0444, "events"     },  /* world-readable log */
+    [KIND_ADMIN_CLEAR_EVENTS] = { false, true,  0200, "clear-events" }, /* admin write-only */
 };
 
 /* R96 P3-2: pin every static-name literal length below STM_P9_NAME_MAX
@@ -151,6 +157,8 @@ _Static_assert(sizeof("datasets") - 1  <= STM_P9_NAME_MAX, "/ctl/ /datasets lite
 _Static_assert(sizeof("properties") - 1 <= STM_P9_NAME_MAX, "/ctl/ /datasets/.../properties literal");
 _Static_assert(sizeof("admin") - 1     <= STM_P9_NAME_MAX, "/ctl/ /admin literal");
 _Static_assert(sizeof("peer") - 1      <= STM_P9_NAME_MAX, "/ctl/ /admin/peer literal");
+_Static_assert(sizeof("events") - 1    <= STM_P9_NAME_MAX, "/ctl/ /events literal");
+_Static_assert(sizeof("clear-events") - 1 <= STM_P9_NAME_MAX, "/ctl/ /admin/clear-events literal");
 /* Dynamic names: pool-uuid hex (36 chars), decimal device-id (≤2
  * chars at v2.0's STM_POOL_DEVICES_MAX = 64 cap), decimal dataset-id
  * (≤9 chars at STM_SYNC_DATASET_ID_MAX = 0x0FFFFFFF ~= 268M = 9
@@ -160,7 +168,7 @@ _Static_assert(sizeof("peer") - 1      <= STM_P9_NAME_MAX, "/ctl/ /admin/peer li
  * KIND_META[] trips this assert at build time, even if a downstream
  * build silently suppresses -Wmissing-field-initializers. Update the
  * literal in lockstep when growing the enum. */
-_Static_assert(KIND_MAX == 14,
+_Static_assert(KIND_MAX == 16,
                "KIND_META[KIND_MAX] sized to enum cardinality; "
                "update both ctl_kind enum + KIND_META[] in lockstep");
 
@@ -247,7 +255,24 @@ typedef struct ctl_session {
     uint64_t  qid_path;
     uint8_t   buf[STM_CTL_BODY_MAX];
     uint32_t  len;
+    /* P9-CTL-1d-events: when reading /events, the body lives in
+     * c->event_buf rather than session->buf (the log can grow
+     * larger than STM_CTL_BODY_MAX = 1 KiB). At Topen we snapshot
+     * the event_len into snapshot_len; subsequent Treads serve
+     * c->event_buf[0..snapshot_len] under c->mu, ignoring events
+     * appended after Topen. uses_event_buf=1 marks this branch. */
+    int       uses_event_buf;
+    uint32_t  snapshot_len;
 } ctl_session;
+
+/* P9-CTL-1d-events: event log buffer. Realloc-doubling growth like
+ * janus's audit_buf (janus/synfs.c:260+). Lines are
+ * `<sec>.<nsec> <text>\n` with monotonic timestamps. Bounded by
+ * STM_CTL_EVENT_MAX (8 MiB) to prevent runaway growth from a chatty
+ * producer; once exceeded, append refuses (drops the line) — better
+ * than realloc'ing into OOM. /admin/clear-events resets the buffer
+ * (admin-only). */
+#define STM_CTL_EVENT_MAX  (8u * 1024u * 1024u)
 
 struct stm_ctl {
     struct stm_fs   *fs;             /* may be NULL (unattached) */
@@ -259,7 +284,12 @@ struct stm_ctl {
     uid_t            caller_uid;     /* (uid_t)-1 = unset */
     gid_t            caller_gid;     /* (gid_t)-1 = unset */
     uid_t            admin_uid;      /* (uid_t)-1 = no daemon-euid admin */
-    pthread_mutex_t  mu;             /* guards sessions[] only */
+    pthread_mutex_t  mu;              /* guards sessions[] + event_buf */
+    /* P9-CTL-1d-events: event log. Mu-protected. event_buf may be
+     * realloc'd; readers must hold mu while copying out. */
+    uint8_t         *event_buf;
+    size_t           event_len;
+    size_t           event_cap;
     ctl_session      sessions[STM_CTL_MAX_SESSIONS];
 };
 
@@ -867,6 +897,70 @@ static int append_gid_line(char *buf, size_t cap, const char *label, gid_t v)
     return snprintf(buf, cap, "%s%u\n", label, (unsigned)v);
 }
 
+/* ── event log (P9-CTL-1d-events) ─────────────────────────────────── */
+
+/* Append `len` bytes to c->event_buf under c->mu (must already be
+ * held). Realloc-doubling growth, capped at STM_CTL_EVENT_MAX. On
+ * cap exceed or alloc failure, drops the line silently — better
+ * than refusing future events or aborting. */
+static void event_append_locked(stm_ctl *c, const char *data, size_t len)
+{
+    if (len == 0) return;
+    size_t need = c->event_len + len;
+    if (need > STM_CTL_EVENT_MAX) return;
+    if (need > c->event_cap) {
+        size_t new_cap = c->event_cap ? c->event_cap : 4096;
+        while (new_cap < need) {
+            size_t grown = new_cap * 2;
+            if (grown < new_cap) return;     /* overflow */
+            new_cap = grown;
+        }
+        if (new_cap > STM_CTL_EVENT_MAX) new_cap = STM_CTL_EVENT_MAX;
+        if (new_cap < need) return;           /* still too small */
+        uint8_t *grown = realloc(c->event_buf, new_cap);
+        if (!grown) return;                   /* alloc failed; drop */
+        c->event_buf = grown;
+        c->event_cap = new_cap;
+    }
+    memcpy(c->event_buf + c->event_len, data, len);
+    c->event_len += len;
+}
+
+/* Format a timestamped line and append. Mirrors janus_synfs_auditf
+ * (janus/synfs.c::janus_synfs_auditf): clock_gettime(CLOCK_REALTIME)
+ * + vsnprintf-into-stack-buffer + append. Truncated lines are
+ * forced-newline-terminated (R11 P3-4 lesson) so the line-oriented
+ * format stays valid. */
+void stm_ctl_log_event(stm_ctl *c, const char *fmt, ...)
+{
+    if (!c || !fmt) return;
+    char line[512];
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    int pfx = snprintf(line, sizeof line, "%lld.%09ld ",
+                        (long long)ts.tv_sec, (long)ts.tv_nsec);
+    if (pfx < 0 || (size_t)pfx >= sizeof line) return;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(line + pfx, sizeof line - (size_t)pfx, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    size_t total = (size_t)pfx + (size_t)n;
+    if (total >= sizeof line) total = sizeof line - 1;
+    /* Force trailing newline (R11 P3-4 — every log entry MUST end
+     * with \n even on the truncation path; otherwise readout merges
+     * the truncated line with the next entry). */
+    if (total == sizeof line - 1) {
+        line[sizeof line - 2] = '\n';
+        total = sizeof line - 1;
+    } else if (total == 0 || line[total - 1] != '\n') {
+        line[total++] = '\n';
+    }
+    pthread_mutex_lock(&c->mu);
+    event_append_locked(c, line, total);
+    pthread_mutex_unlock(&c->mu);
+}
+
 /* Materialize /admin/peer — exposes the connecting client's uid/gid
  * + admin status as observed by the daemon. Read-only; admin-only
  * (vops_open enforces).
@@ -918,6 +1012,8 @@ static stm_status materialize_locked(stm_ctl *c, ctl_session *s)
     case KIND_DATASETS_DIR:
     case KIND_DATASET_DIR:
     case KIND_ADMIN_DIR:
+    case KIND_EVENTS:                 /* served direct from event_buf */
+    case KIND_ADMIN_CLEAR_EVENTS:     /* write-only; no body to materialize */
     case KIND_MAX:
         break;
     }
@@ -1062,6 +1158,8 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
             return stat_at(c, qid_root(KIND_DATASETS_DIR), out);
         if (str_eq(name, name_len, KIND_META[KIND_ADMIN_DIR].static_name))
             return stat_at(c, qid_root(KIND_ADMIN_DIR), out);
+        if (str_eq(name, name_len, KIND_META[KIND_EVENTS].static_name))
+            return stat_at(c, qid_root(KIND_EVENTS), out);
         return STM_ENOENT;
 
     case KIND_POOLS_DIR: {
@@ -1131,6 +1229,9 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
         if (!ctl_caller_is_admin(c)) return STM_ENOENT;
         if (str_eq(name, name_len, KIND_META[KIND_ADMIN_PEER].static_name))
             return stat_at(c, qid_root(KIND_ADMIN_PEER), out);
+        if (str_eq(name, name_len,
+                     KIND_META[KIND_ADMIN_CLEAR_EVENTS].static_name))
+            return stat_at(c, qid_root(KIND_ADMIN_CLEAR_EVENTS), out);
         return STM_ENOENT;
 
     case KIND_VERSION:
@@ -1139,6 +1240,8 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
     case KIND_DEVICE_STATUS:
     case KIND_DATASET_PROPERTIES:
     case KIND_ADMIN_PEER:
+    case KIND_EVENTS:
+    case KIND_ADMIN_CLEAR_EVENTS:
     case KIND_MAX:
         break;
     }
@@ -1180,7 +1283,12 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
          * /admin dirent but Topen on it returns EACCES). Same
          * posture as POSIX root + 0500 dir: existence is visible,
          * contents aren't. */
-        return emit_entry(c, cb, cb_ctx, qid_root(KIND_ADMIN_DIR));
+        rc = emit_entry(c, cb, cb_ctx, qid_root(KIND_ADMIN_DIR));
+        if (rc != STM_OK) return rc;
+        /* /events is world-readable (mode 0444) — any caller can
+         * tail-read the operational event log. Admin-only write
+         * trigger (clear-events) lives under /admin/. */
+        return emit_entry(c, cb, cb_ctx, qid_root(KIND_EVENTS));
 
     case KIND_POOLS_DIR:
         /* Enumerate registered pools. v2.0: at most one pool. */
@@ -1270,7 +1378,9 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
     }
 
     case KIND_ADMIN_DIR:
-        return emit_entry(c, cb, cb_ctx, qid_root(KIND_ADMIN_PEER));
+        rc = emit_entry(c, cb, cb_ctx, qid_root(KIND_ADMIN_PEER));
+        if (rc != STM_OK) return rc;
+        return emit_entry(c, cb, cb_ctx, qid_root(KIND_ADMIN_CLEAR_EVENTS));
 
     case KIND_VERSION:
     case KIND_STATE:
@@ -1278,6 +1388,8 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
     case KIND_DEVICE_STATUS:
     case KIND_DATASET_PROPERTIES:
     case KIND_ADMIN_PEER:
+    case KIND_EVENTS:
+    case KIND_ADMIN_CLEAR_EVENTS:
     case KIND_MAX:
         break;
     }
@@ -1292,8 +1404,14 @@ static stm_status vops_open(void *ctx, uint32_t fid, uint64_t qid_path,
     if (k == KIND_MAX) return STM_ENOENT;
     const ctl_kind_meta *meta = &KIND_META[k];
 
-    /* Mode-gating: every node is read-only at v2.0. */
-    if (mode != STM_P9_OREAD) return STM_EACCES;
+    /* Mode-gating: most nodes are read-only. P9-CTL-1d-events
+     * introduces the FIRST writable kind: KIND_ADMIN_CLEAR_EVENTS
+     * accepts OWRITE (write-only, mode 0200). */
+    if (k == KIND_ADMIN_CLEAR_EVENTS) {
+        if (mode != STM_P9_OWRITE) return STM_EACCES;
+    } else {
+        if (mode != STM_P9_OREAD) return STM_EACCES;
+    }
 
     /* P9-CTL-1d-uid: admin gate. Refuse non-admin Topen on
      * admin-only kinds with EACCES. The check happens BEFORE the
@@ -1340,6 +1458,39 @@ static stm_status vops_open(void *ctx, uint32_t fid, uint64_t qid_path,
         return STM_ENOENT;
     if ((k == KIND_DATASET_PROPERTIES) && !c->fs) return STM_ENOENT;
 
+    /* P9-CTL-1d-events: KIND_EVENTS reads from c->event_buf directly
+     * (the log can grow past STM_CTL_BODY_MAX = 1 KiB). Snapshot the
+     * length at Topen so subsequent Treads see a stable view; events
+     * appended after Topen are visible only on a re-Topen. */
+    if (k == KIND_EVENTS) {
+        pthread_mutex_lock(&c->mu);
+        ctl_session *s = session_alloc_locked(c, fid, qid_path);
+        if (!s) {
+            pthread_mutex_unlock(&c->mu);
+            return STM_ENOMEM;
+        }
+        s->uses_event_buf = 1;
+        s->snapshot_len = (c->event_len > UINT32_MAX)
+            ? UINT32_MAX
+            : (uint32_t)c->event_len;
+        pthread_mutex_unlock(&c->mu);
+        return STM_OK;
+    }
+
+    /* P9-CTL-1d-events: KIND_ADMIN_CLEAR_EVENTS allocates a session
+     * for write tracking. Body buffer unused; vops_write triggers
+     * the clear action. */
+    if (k == KIND_ADMIN_CLEAR_EVENTS) {
+        pthread_mutex_lock(&c->mu);
+        ctl_session *s = session_alloc_locked(c, fid, qid_path);
+        if (!s) {
+            pthread_mutex_unlock(&c->mu);
+            return STM_ENOMEM;
+        }
+        pthread_mutex_unlock(&c->mu);
+        return STM_OK;
+    }
+
     pthread_mutex_lock(&c->mu);
     ctl_session *s = session_alloc_locked(c, fid, qid_path);
     if (!s) {
@@ -1382,6 +1533,22 @@ static stm_status vops_read(void *ctx, uint32_t fid, uint64_t qid_path,
         *inout_len = 0;
         return STM_EBACKEND;
     }
+    /* P9-CTL-1d-events: /events reads from c->event_buf directly
+     * (bypasses session->buf since the log can be >1 KiB). The
+     * snapshot_len captured at Topen is the upper bound; events
+     * appended after Topen are not visible to this fid. */
+    if (s->uses_event_buf) {
+        if (offset >= s->snapshot_len) {
+            *inout_len = 0;
+            pthread_mutex_unlock(&c->mu);
+            return STM_OK;
+        }
+        uint32_t avail = s->snapshot_len - (uint32_t)offset;
+        if (*inout_len > avail) *inout_len = avail;
+        memcpy(buf, c->event_buf + offset, *inout_len);
+        pthread_mutex_unlock(&c->mu);
+        return STM_OK;
+    }
     if (offset >= s->len) {
         *inout_len = 0;
         pthread_mutex_unlock(&c->mu);
@@ -1398,12 +1565,42 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
                                uint64_t offset, const void *buf,
                                uint32_t len, uint32_t *out_written)
 {
-    (void)ctx; (void)fid; (void)qid_path;
-    (void)offset; (void)buf; (void)len;
+    stm_ctl *c = ctx;
+    (void)offset; (void)buf;
     *out_written = 0;
-    /* P9-CTL-1a/-1b: every node is read-only. Future sub-chunks add
-     * action-trigger files (e.g. /pools/<n>/scrub) with their own
-     * write paths and uid gating. */
+    ctl_kind k = qid_kind(qid_path);
+
+    /* P9-CTL-1d-events: KIND_ADMIN_CLEAR_EVENTS — first writable
+     * kind. Admin gate already fired at vops_open; if we reach
+     * vops_write the caller IS admin (the fid couldn't have opened
+     * for write otherwise). Defense-in-depth re-check anyway:
+     * vops_open's gate is the primary, but if a future server bug
+     * routed write to this fid without proper open, the gate here
+     * catches it. */
+    if (k == KIND_ADMIN_CLEAR_EVENTS) {
+        if (!ctl_caller_is_admin(c)) return STM_EACCES;
+        pthread_mutex_lock(&c->mu);
+        ctl_session *s = session_get_locked(c, fid);
+        if (!s || s->qid_path != qid_path) {
+            pthread_mutex_unlock(&c->mu);
+            return STM_EBACKEND;
+        }
+        /* Reset the event log. Any data the client sent is ignored —
+         * the trigger is the act of writing, not the content. */
+        if (c->event_buf) {
+            memset(c->event_buf, 0, c->event_cap);
+            c->event_len = 0;
+        }
+        pthread_mutex_unlock(&c->mu);
+        /* Self-log the clear so operators have a marker even after
+         * the action runs. */
+        stm_ctl_log_event(c, "events log cleared by uid=%u",
+                            (unsigned)c->caller_uid);
+        *out_written = len;
+        return STM_OK;
+    }
+
+    /* All other kinds remain read-only. */
     return STM_EACCES;
 }
 
@@ -1486,6 +1683,14 @@ void stm_ctl_destroy(stm_ctl *c)
     if (!c) return;
     for (uint32_t i = 0; i < STM_CTL_MAX_SESSIONS; i++)
         if (c->sessions[i].active) session_free_locked(&c->sessions[i]);
+    /* P9-CTL-1d-events: release the event log buffer. Zero before
+     * free — the log may contain operationally-sensitive context
+     * (uids, dataset names, etc.) that an attacker recovering freed
+     * heap pages could harvest. memset is cheap insurance. */
+    if (c->event_buf) {
+        memset(c->event_buf, 0, c->event_cap);
+        free(c->event_buf);
+    }
     pthread_mutex_destroy(&c->mu);
     free(c);
 }

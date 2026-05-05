@@ -1891,6 +1891,279 @@ STM_TEST(ctl_r100_p3_2_root_beats_admin_uid)
  * to the unset sentinel; a previously-admin uid (e.g., 1000) loses
  * admin status. Tightens the contract: the setter is unconditional,
  * not skip-if-already-set. */
+/* ── P9-CTL-1d-events /events log + /admin/clear-events trigger ──── */
+
+STM_TEST(ctl_d2_events_in_root_listing)
+{
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    uint32_t sz = build_topen(req, 2, 10, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+
+    sz = build_tread(req, 3, 10, 0, 8192);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    uint32_t count = load_u32(resp + 7);
+    STM_ASSERT(count > 0);
+
+    int saw_events = 0;
+    const uint8_t *q = resp + 11;
+    const uint8_t *end = q + count;
+    while (q < end) {
+        uint16_t inner = load_u16(q);
+        const uint8_t *rec = q + 2;
+        const uint8_t *np = rec + 2 + 4 + 13 + 4 + 4 + 4 + 8;
+        uint16_t nl = load_u16(np);
+        const char *nm = (const char *)(np + 2);
+        if (nl == 6 && memcmp(nm, "events", 6) == 0) saw_events = 1;
+        q += 2 + inner;
+    }
+    STM_ASSERT_TRUE(saw_events);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
+STM_TEST(ctl_d2_events_empty_when_no_log)
+{
+    /* Fresh stm_ctl: event log empty; /events read returns zero bytes. */
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "events" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 1, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+
+    sz = build_tread(req, 4, 11, 0, 8192);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    STM_ASSERT_EQ(load_u32(resp + 7), 0u);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
+STM_TEST(ctl_d2_log_event_then_read_back)
+{
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+
+    stm_ctl_log_event(c, "first event id=42");
+    stm_ctl_log_event(c, "second event delta=%llu", (unsigned long long)100);
+
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "events" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 1, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+
+    sz = build_tread(req, 4, 11, 0, 8192);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    uint32_t count = load_u32(resp + 7);
+    STM_ASSERT(count > 0);
+
+    char body[8192];
+    STM_ASSERT(count < sizeof body);
+    memcpy(body, resp + 11, count);
+    body[count] = '\0';
+
+    /* Verify both lines appear, with timestamp prefix + content. */
+    STM_ASSERT(strstr(body, "first event id=42\n") != NULL);
+    STM_ASSERT(strstr(body, "second event delta=100\n") != NULL);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
+STM_TEST(ctl_d2_clear_events_admin_succeeds)
+{
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));   /* root */
+    stm_ctl_log_event(c, "before clear");
+
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "admin", "clear-events" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+
+    sz = build_topen(req, 3, 11, STM_P9_OWRITE);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+
+    /* Any payload triggers the clear — content ignored. */
+    sz = build_twrite(req, 4, 11, 0, "x", 1);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWRITE);
+
+    /* Verify the log was cleared. The clear itself self-logs an
+     * "events log cleared by uid=0" entry, so the buffer is now
+     * just that one line — not empty, but the "before clear" line
+     * should be gone. */
+    const char *epath[] = { "events" };
+    sz = build_twalk(req, 5, 10, 12, 1, epath);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+
+    sz = build_topen(req, 6, 12, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+
+    sz = build_tread(req, 7, 12, 0, 8192);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    uint32_t count = load_u32(resp + 7);
+    char body[1024];
+    memcpy(body, resp + 11, count);
+    body[count] = '\0';
+    STM_ASSERT(strstr(body, "before clear") == NULL);
+    STM_ASSERT(strstr(body, "events log cleared by uid=0") != NULL);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
+STM_TEST(ctl_d2_clear_events_nonadmin_eacces)
+{
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    STM_ASSERT_OK(stm_ctl_set_caller(c, 1000, 1000));    /* non-admin */
+    stm_ctl_log_event(c, "should survive non-admin attempt");
+
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    /* Walk through /admin/ as non-admin → ENOENT (R100 P2-1 gate). */
+    const char *path[] = { "admin", "clear-events" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* Verify the log is intact. */
+    const char *epath[] = { "events" };
+    sz = build_twalk(req, 3, 10, 12, 1, epath);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+
+    sz = build_topen(req, 4, 12, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+
+    sz = build_tread(req, 5, 12, 0, 8192);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    uint32_t count = load_u32(resp + 7);
+    char body[1024];
+    memcpy(body, resp + 11, count);
+    body[count] = '\0';
+    STM_ASSERT(strstr(body, "should survive non-admin attempt") != NULL);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
+STM_TEST(ctl_d2_events_snapshot_at_topen)
+{
+    /* Events appended after Topen are NOT visible to that fid;
+     * they show up on a re-Topen. Documented snapshot-at-Topen
+     * semantics. */
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+
+    stm_ctl_log_event(c, "before topen");
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "events" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 1, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+
+    /* Add a new event AFTER Topen. The current fid's view should
+     * not include it. */
+    stm_ctl_log_event(c, "after topen");
+
+    sz = build_tread(req, 4, 11, 0, 8192);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    uint32_t count = load_u32(resp + 7);
+    char body[1024];
+    memcpy(body, resp + 11, count);
+    body[count] = '\0';
+    STM_ASSERT(strstr(body, "before topen") != NULL);
+    STM_ASSERT(strstr(body, "after topen")  == NULL);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
+STM_TEST(ctl_d2_log_event_truncation_keeps_newline)
+{
+    /* R11 P3-4 carry-over: a line longer than the 512-byte stack
+     * buffer in stm_ctl_log_event must still end in '\n', so a
+     * subsequent line doesn't get merged with the truncated one. */
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+
+    char huge[1024];
+    memset(huge, 'A', sizeof huge - 1);
+    huge[sizeof huge - 1] = '\0';
+    stm_ctl_log_event(c, "%s", huge);
+    stm_ctl_log_event(c, "next line");
+
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "events" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 1, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+
+    sz = build_tread(req, 4, 11, 0, 8192);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    uint32_t count = load_u32(resp + 7);
+    char body[8192];
+    memcpy(body, resp + 11, count);
+    body[count] = '\0';
+
+    /* Truncated AAA line ends in newline; "next line" follows
+     * cleanly on its own line, not merged. */
+    STM_ASSERT(strstr(body, "\nnext line\n") != NULL ||
+                strstr(body, "next line\n") != NULL);
+    /* No "AAAnext" merger. */
+    STM_ASSERT(strstr(body, "AAAnext") == NULL);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
 STM_TEST(ctl_r100_p3_3_set_admin_uid_can_reset)
 {
     stm_ctl *c = NULL;

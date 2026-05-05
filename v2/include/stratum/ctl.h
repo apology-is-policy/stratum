@@ -187,6 +187,23 @@ STM_MUST_USE
 stm_status stm_ctl_set_admin_uid(stm_ctl *c, uid_t admin_uid);
 
 /*
+ * Append a timestamped line to the /ctl/events log buffer (P9-CTL-
+ * 1d-events). Format: `<sec>.<nsec> <fmt-output>\n`. Lines truncated
+ * past 511 bytes get a forced-newline terminator (no merge with the
+ * next entry).
+ *
+ * Bounded by STM_CTL_EVENT_MAX (8 MiB internal cap); once the log
+ * reaches the cap, further appends are silently dropped — log
+ * pressure should never produce OOM. Operators reset the log via
+ * an admin-only Twrite to /admin/clear-events.
+ *
+ * Thread-safe (takes c->mu). Safe to call from any subsystem hook.
+ * Safe on NULL c.
+ */
+void stm_ctl_log_event(stm_ctl *c, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+
+/*
  * The vops table to pass to stm_p9_server_create. Static lifetime —
  * caller does not free.
  */
