@@ -286,7 +286,9 @@ language bindings, future kernel module) is a 9P consumer.
             device_class_name / device_role_name /
             device_state_name; add qid_device_id extractor.
       - [x] **P9-CTL-1b' /pools/<uuid>/devices/<id>/ devices
-            subtree** — substantive complete. Adds three new
+            subtree** — substantive complete (`71b6ab8`); R98
+            audit closed YELLOW (0 P0 + 0 P1 + 1 P2 + 8 P3, all
+            addressed inline OR forward-noted). Adds three new
             kinds (KIND_DEVICES_DIR, KIND_DEVICE_DIR,
             KIND_DEVICE_STATUS); KIND_MAX = 9. Wires
             device_class_name / device_role_name /
@@ -305,8 +307,28 @@ language bindings, future kernel module) is a 9P consumer.
             leading zeros + values ≥ STM_POOL_DEVICES_MAX = 64).
             Readdir of /pools/<uuid>/devices/ enumerates total
             roster (includes REMOVED slots per pool's invariant).
-            5 new tests in `tests/test_ctl.c`; ctest 25 → 30 in
-            test_ctl. R98 audit pending.
+            **R98 close** items: P2-1 doc-vs-code drift on the
+            "skip mid-iteration REMOVED slot" logic — comments
+            and rationale rewritten to reflect actual semantics
+            (count is monotonic; REMOVED slots persist with
+            non-NULL info for burn-audit per ARCH §4.3.1). The
+            `if (!d)` defensive checks kept as defense-in-depth
+            with explicit comments noting they're unreachable
+            today. P3-1 "≤5 digits" comment corrected to "≤2 at
+            v2.0 cap". P3-2 device-uuid hex string pinned in
+            existing `ctl_b1p_device_status_reports_class_role_
+            state` test (catches future LE/BE byte-order
+            regressions). P3-3 4-character device-id rejection
+            covered in `ctl_b1p_device_dir_oob_enoent`. P3-4
+            tamper-resilience comment on device_*_name's
+            trailing "unknown" return (load-bearing for
+            corrupt-but-csum-bypassed roster bytes from
+            `stm_pool_roster_decode`'s no-range-check shape).
+            Forward-noted: P3-7 error-message specificity in
+            tests; P3-8 concurrent-mutation thread harness.
+            5 -1b' tests + R98 polish in-test; ctest test_ctl
+            25 → 30 (steady at 30 — R98 strengthens existing
+            assertions rather than adding new tests).
 
       - [ ] **P9-CTL-1c /datasets/** — pending; per-dataset
             properties + stats + snapshot list + create/rollback

@@ -1132,7 +1132,15 @@ STM_TEST(ctl_b1p_device_status_reports_class_role_state)
     body[count] = '\0';
 
     STM_ASSERT(strstr(body, "device-id: 0\n")  != NULL);
-    STM_ASSERT(strstr(body, "device-uuid: ")   != NULL);
+    /* R98 P3-2: pin the exact device-uuid hex string so a future
+     * regression that swaps byte order in the manual LE pack at
+     * synfs.c::materialize_device_status surfaces here, not later
+     * in `stratum pool inspect`. CTL_TEST_DEVICE_UUID =
+     * { 0x1111111111111111, 0x2222222222222222 } → bytes
+     * 11 11 11 11 11 11 11 11 22 22 22 22 22 22 22 22 → formatted
+     * 11111111-1111-1111-2222-222222222222. */
+    STM_ASSERT(strstr(body,
+        "device-uuid: 11111111-1111-1111-2222-222222222222\n") != NULL);
     STM_ASSERT(strstr(body, "size-bytes: ")    != NULL);
     STM_ASSERT(strstr(body, "class: ssd\n")    != NULL);
     STM_ASSERT(strstr(body, "role: data\n")    != NULL);
@@ -1178,6 +1186,17 @@ STM_TEST(ctl_b1p_device_dir_oob_enoent)
     /* Non-numeric rejected. */
     const char *pa[] = { "pools", CTL_TEST_POOL_UUID_HEX, "devices", "x" };
     sz = build_twalk(req, 5, 10, 14, 4, pa);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* R98 P3-3: 4-character input rejected by the parser's `len > 3`
+     * early-out (before the numeric overflow check). Today this is
+     * defense in depth — STM_POOL_DEVICES_MAX = 64 means valid ids
+     * are ≤ 2 chars — but the bound is intentional headroom for a
+     * future cap raise. */
+    const char *p1234[] = {
+        "pools", CTL_TEST_POOL_UUID_HEX, "devices", "1234" };
+    sz = build_twalk(req, 6, 10, 15, 4, p1234);
     STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
 

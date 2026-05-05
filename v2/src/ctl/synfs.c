@@ -133,6 +133,10 @@ _Static_assert(sizeof("state") - 1    <= STM_P9_NAME_MAX, "/ctl/ /state literal"
 _Static_assert(sizeof("pools") - 1    <= STM_P9_NAME_MAX, "/ctl/ /pools literal");
 _Static_assert(sizeof("status") - 1   <= STM_P9_NAME_MAX, "/ctl/ /pools/.../status literal");
 _Static_assert(sizeof("devices") - 1  <= STM_P9_NAME_MAX, "/ctl/ /pools/.../devices literal");
+/* Dynamic names: pool-uuid hex (36 chars) and decimal device-id
+ * (≤2 chars at v2.0's STM_POOL_DEVICES_MAX = 64 cap; cap can grow
+ * up to STM_P9_NAME_MAX without overflowing dyn_name). Bounded at
+ * runtime in the dynamic decoders. */
 
 /* R97 P3-7: pin KIND_MAX so adding a new ctl_kind without extending
  * KIND_META[] trips this assert at build time, even if a downstream
@@ -348,6 +352,14 @@ static bool ctl_pool_uuid_bytes(const stm_ctl *c, uint8_t out[16])
 
 /* ── enum stringification ───────────────────────────────────────────── */
 
+/* R98 P3-4: trailing "unknown" returns are LOAD-BEARING for tamper-
+ * resilience, not redundant default fallbacks. `stm_pool_roster_
+ * decode` writes the on-disk byte directly into the enum-typed
+ * field without range-checking (pool.c:142-144), so a corrupt-but-
+ * csum-bypassed roster could surface a slot with class/role/state
+ * value past the documented enum top. The trailing return gives
+ * deterministic output instead of UB; the synfs is the last line
+ * of defense before operator-visible bytes. */
 static const char *device_class_name(stm_device_class cls)
 {
     switch (cls) {
@@ -580,6 +592,12 @@ static stm_status materialize_device_status(stm_ctl *c, ctl_session *s)
         stm_pool_unlock_shared(c->pool);
         return STM_ENOENT;
     }
+    /* R98 P2-1 / P3-5: stm_pool_device_info returns &devices[id] for
+     * any in-bounds id (incl. REMOVED slots, which keep their UUID
+     * + state for burn-audit). The `(d == NULL)` defensive check
+     * below is unreachable under the current pool semantics; keeping
+     * it as defense-in-depth against a future pool API that could
+     * return NULL for in-bounds slots, but not load-bearing today. */
     const stm_pool_device *d = stm_pool_device_info(c->pool, did);
     if (!d) {
         stm_pool_unlock_shared(c->pool);
@@ -686,13 +704,20 @@ static stm_status stat_at(stm_ctl *c, uint64_t qid_path,
         uint32_t did = qid_device_id(qid_path);
         stm_pool_lock_shared(c->pool);
         size_t total = stm_pool_device_count(c->pool);
+        /* R98 P2-1 / P3-5: see materialize_device_status. The `d ==
+         * NULL` check below is unreachable for in-bounds ids today
+         * (REMOVED slots persist with non-NULL info). Defense-in-
+         * depth against future pool semantics. */
         const stm_pool_device *d =
             (did < total) ? stm_pool_device_info(c->pool, (uint16_t)did) : NULL;
         bool valid = (d != NULL);
         stm_pool_unlock_shared(c->pool);
         if (!valid) return STM_ENOENT;
         if (k == KIND_DEVICE_DIR) {
-            /* Format the device id as decimal (≤ 5 chars). */
+            /* R98 P3-1: device id formats as decimal up to 2 chars
+             * at v2.0's STM_POOL_DEVICES_MAX = 64 (max id 63). The
+             * 37-byte dyn_name buffer (sized for the 36-char UUID
+             * case) has comfortable headroom. */
             int n = snprintf(dyn_name, sizeof dyn_name, "%u", (unsigned)did);
             if (n < 0 || n >= (int)sizeof dyn_name) return STM_EIO;
             name = dyn_name;
@@ -826,10 +851,22 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
         stm_pool_lock_shared(c->pool);
         size_t total = stm_pool_device_count(c->pool);
         stm_pool_unlock_shared(c->pool);
+        /* R98 P2-1: stm_pool_device_count is monotonic-non-decreasing
+         * (only stm_pool_add_device increments; finish_evacuation
+         * marks slots REMOVED but never decrements count). So
+         * `total` captured here remains a valid upper bound for the
+         * for-loop, and every `i < total` is a live in-bounds slot
+         * for the duration of the iteration. REMOVED slots persist
+         * in the roster and surface with state="removed" via
+         * materialize_device_status — by design (R16 F3 burned-UUID
+         * audit trail). The continue-on-STM_ENOENT below is
+         * defense-in-depth for a future pool-layer change that
+         * decrements count or returns NULL for in-bounds slots; not
+         * exercised today. */
         for (size_t i = 0; i < total; i++) {
             stm_status erc = emit_entry(c, cb, cb_ctx,
                 qid_of(KIND_DEVICE_DIR, 0, (uint32_t)i));
-            if (erc == STM_ENOENT) continue;   /* slot disappeared mid-iteration */
+            if (erc == STM_ENOENT) continue;
             if (erc != STM_OK) return erc;
         }
         return STM_OK;
