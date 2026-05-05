@@ -421,6 +421,78 @@ static uint32_t build_tbind(uint8_t *req, uint16_t tag,
     return sz;
 }
 
+static uint32_t build_tsync(uint8_t *req, uint16_t tag)
+{
+    uint32_t sz = 7;
+    pack_u32(req, sz);
+    req[4] = STM_9P_TSYNC;
+    pack_u16(req + 5, tag);
+    return sz;
+}
+
+static uint32_t build_treflink(uint8_t *req, uint16_t tag,
+                                 uint32_t src_fid, uint32_t dst_fid)
+{
+    uint8_t *p = req + 7;
+    pack_u32(p, src_fid); p += 4;
+    pack_u32(p, dst_fid); p += 4;
+    uint32_t sz = (uint32_t)(p - req);
+    pack_u32(req, sz);
+    req[4] = STM_9P_TREFLINK;
+    pack_u16(req + 5, tag);
+    return sz;
+}
+
+static uint32_t build_tfallocate(uint8_t *req, uint16_t tag, uint32_t fid,
+                                   uint32_t flags, uint64_t offset,
+                                   uint64_t length)
+{
+    uint8_t *p = req + 7;
+    pack_u32(p, fid);    p += 4;
+    pack_u32(p, flags);  p += 4;
+    pack_u64(p, offset); p += 8;
+    pack_u64(p, length); p += 8;
+    uint32_t sz = (uint32_t)(p - req);
+    pack_u32(req, sz);
+    req[4] = STM_9P_TFALLOCATE;
+    pack_u16(req + 5, tag);
+    return sz;
+}
+
+static uint32_t build_tfadvise(uint8_t *req, uint16_t tag, uint32_t fid,
+                                 uint64_t offset, uint64_t length,
+                                 uint32_t advice)
+{
+    uint8_t *p = req + 7;
+    pack_u32(p, fid);    p += 4;
+    pack_u64(p, offset); p += 8;
+    pack_u64(p, length); p += 8;
+    pack_u32(p, advice); p += 4;
+    uint32_t sz = (uint32_t)(p - req);
+    pack_u32(req, sz);
+    req[4] = STM_9P_TFADVISE;
+    pack_u16(req + 5, tag);
+    return sz;
+}
+
+static uint32_t build_tpin(uint8_t *req, uint16_t tag)
+{
+    uint32_t sz = 7;
+    pack_u32(req, sz);
+    req[4] = STM_9P_TPIN;
+    pack_u16(req + 5, tag);
+    return sz;
+}
+
+static uint32_t build_tunpin(uint8_t *req, uint16_t tag)
+{
+    uint32_t sz = 7;
+    pack_u32(req, sz);
+    req[4] = STM_9P_TUNPIN;
+    pack_u16(req + 5, tag);
+    return sz;
+}
+
 static uint32_t build_tunbind(uint8_t *req, uint16_t tag, const char *name)
 {
     uint8_t *p = req + 7;
@@ -3184,6 +3256,307 @@ STM_TEST(p9_r93_p3_4_tversion_clears_bindings) {
     STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
     STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_ENOENT);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* ── P9-9P-3: Stratum extensions (Tsync / Treflink / Tfallocate /     ── */
+/*             Tfadvise) — pass-through wrappers over stm_fs_*.       ── */
+
+STM_TEST(p9_sync_returns_rsync) {
+    /* Tsync wraps stm_fs_commit; success is just an Rsync echo. */
+    make_tmp("9p_sync");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    uint32_t sz = build_tsync(req, 1);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RSYNC);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_reflink_clones_src_to_dst) {
+    /* Create src with content; create empty dst; Treflink(src, dst);
+     * Tread on dst returns the same bytes. */
+    make_tmp("9p_reflink");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    /* src file with 4 KiB of content — must exceed STM_INODE_INLINE_MAX
+     * (100 B) so the file is stored as extents (stm_fs_reflink refuses
+     * inline-source per its R82 P0-1 / inline-source-caveat docstring). */
+    uint64_t src_ino = mk_file(fs, root, "src");
+    uint8_t src_buf[4096];
+    for (size_t i = 0; i < sizeof src_buf; i++) src_buf[i] = (uint8_t)(i & 0xFF);
+    STM_ASSERT_OK(stm_fs_write(fs, 1, src_ino, 0, src_buf, sizeof src_buf));
+    /* dst stays empty. */
+    uint64_t dst_ino __attribute__((unused)) = mk_file(fs, root, "dst");
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "src");
+    walk_to(s, 100, 102, "dst");
+
+    /* Treflink(101, 102). */
+    uint8_t req[8192], resp[8192];
+    uint32_t rlen = 0;
+    uint32_t sz = build_treflink(req, 1, 101, 102);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RREFLINK);
+
+    /* Open dst RO and read 4 KiB — must match src_buf. */
+    sz = build_tlopen(req, 2, 102, STM_9P_O_RDONLY);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLOPEN);
+    sz = build_tread(req, 3, 102, 0, sizeof src_buf);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RREAD);
+    uint32_t count = load_u32(resp + 7);
+    STM_ASSERT_EQ(count, (uint32_t)sizeof src_buf);
+    STM_ASSERT_MEM_EQ(resp + 11, src_buf, sizeof src_buf);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_reflink_refuses_aux_xattr_fid) {
+    /* If src fid has been Txattrcreate-repurposed, Treflink → EINVAL.
+     * Verifies the kind == NODE gate (R93 P1-1 carryover). */
+    make_tmp("9p_reflink_aux");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)mk_file(fs, root, "src");
+    (void)mk_file(fs, root, "dst");
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "src");
+    walk_to(s, 100, 102, "dst");
+    /* Repurpose fid 101 to AUX_XATTR_WRITE. */
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    uint8_t *p = req + 7;
+    pack_u32(p, 101);             p += 4;
+    uint16_t nl = (uint16_t)strlen("user.x");
+    pack_u16(p, nl);              p += 2;
+    memcpy(p, "user.x", nl);      p += nl;
+    pack_u64(p, 4u);              p += 8;
+    pack_u32(p, 0u);              p += 4;
+    uint32_t sz = (uint32_t)(p - req);
+    pack_u32(req, sz);
+    req[4] = STM_9P_TXATTRCREATE;
+    pack_u16(req + 5, 1);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RXATTRCREATE);
+
+    /* Now Treflink(101=AUX, 102=NODE) → EINVAL. */
+    sz = build_treflink(req, 2, 101, 102);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EINVAL);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_fallocate_zero_range) {
+    /* Create file with content, then fallocate(ZERO_RANGE) over part
+     * of it; subsequent Tread of that range returns zero bytes (size
+     * preserved). */
+    make_tmp("9p_fallocate_zero");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    uint64_t f_ino = mk_file(fs, root, "f");
+    /* 4 KiB content — exceeds STM_INODE_INLINE_MAX (100 B) so a real
+     * extent gets recorded, which is what ZERO_RANGE operates on. */
+    uint8_t content[4096];
+    for (size_t i = 0; i < sizeof content; i++) content[i] = (uint8_t)('a' + (i % 26));
+    STM_ASSERT_OK(stm_fs_write(fs, 1, f_ino, 0, content, sizeof content));
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "f");
+
+    uint8_t req[8192], resp[8192];
+    uint32_t rlen = 0;
+    /* Tfallocate(101, ZERO_RANGE, off=0, len=4096) — full-extent zero.
+     * This pattern matches test_fs_phase8::fs_p7b_fallocate_zero_range_*
+     * which exercises the same wrapper at the fs layer. Subsequent read
+     * returns all zeros (extent dropped → sparse read). */
+    uint32_t sz = build_tfallocate(req, 1, 101,
+                                      STM_9P_FALLOC_FL_ZERO_RANGE,
+                                      0u, sizeof content);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RFALLOCATE);
+
+    /* Open RO + Tread the full range — every byte must be zero. */
+    sz = build_tlopen(req, 2, 101, STM_9P_O_RDONLY);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLOPEN);
+    sz = build_tread(req, 3, 101, 0, sizeof content);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RREAD);
+    uint32_t count = load_u32(resp + 7);
+    STM_ASSERT_EQ(count, (uint32_t)sizeof content);
+    uint8_t zeros[4096] = {0};
+    STM_ASSERT_MEM_EQ(resp + 11, zeros, sizeof content);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_fallocate_invalid_flag_returns_einval) {
+    /* Tfallocate with a flag bit outside STM_FS_FALLOC_MASK → EINVAL. */
+    make_tmp("9p_fallocate_inv");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)mk_file(fs, root, "f");
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "f");
+
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    uint32_t sz = build_tfallocate(req, 1, 101, /*flags=*/0xFFFFu,
+                                      /*off=*/0, /*len=*/100);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EINVAL);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_fadvise_normal_returns_rfadvise) {
+    /* Tfadvise is advisory; any valid combination must succeed. */
+    make_tmp("9p_fadvise");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)mk_file(fs, root, "f");
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "f");
+
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    uint32_t sz = build_tfadvise(req, 1, 101, /*off=*/0, /*len=*/4096,
+                                    STM_9P_FADV_SEQUENTIAL);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RFADVISE);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_fadvise_invalid_advice_returns_einval) {
+    /* Advice values outside the canonical set → EINVAL via stm_fs. */
+    make_tmp("9p_fadvise_inv");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+    (void)mk_file(fs, root, "f");
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+    walk_to(s, 100, 101, "f");
+
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    uint32_t sz = build_tfadvise(req, 1, 101, 0, 4096, /*advice=*/99u);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EINVAL);
+
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+STM_TEST(p9_pin_unpin_return_enosys) {
+    /* Tpin / Tunpin reserved for future MVCC reader-pin support; v2.0
+     * returns ENOSYS so wire opcodes are stable but unimplemented. */
+    make_tmp("9p_pin_enosys");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+
+    uint8_t req[1024], resp[1024];
+    uint32_t rlen = 0;
+    uint32_t sz = build_tpin(req, 1);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_ENOSYS);
+
+    sz = build_tunpin(req, 2);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_ENOSYS);
 
     stm_9p_server_destroy(s);
     STM_ASSERT_OK(stm_fs_unmount(fs));

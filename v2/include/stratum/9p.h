@@ -87,10 +87,30 @@ enum {
      * the 9P2000 base range (Tremove/Rremove = 122/123) AND past the
      * 9P2000.L assigned ops (TUNLINKAT/RUNLINKAT = 76/77 with no
      * upstream additions in the 78-99 range as of 2026-04). 124-159
-     * is the Stratum-extension band; P9-9P-2 fills 124-127, P9-9P-3
-     * will fill 128-139. */
+     * is the Stratum-extension band. P9-9P-2 fills 124-127, P9-9P-3
+     * fills 128-139.
+     *
+     * P9-9P-3 wire wrappers map to existing stm_fs_* primitives:
+     *   - TSYNC      → stm_fs_commit (Stratum-ext explicit whole-pool
+     *                  commit; complements Tfsync which routes to the
+     *                  same primitive but takes a fid arg).
+     *   - TREFLINK   → stm_fs_reflink (FICLONE shape — both fids must
+     *                  be open NODE fids, dst MUST be empty per
+     *                  stm_fs_reflink contract).
+     *   - TFALLOCATE → stm_fs_fallocate (every FALLOC_FL_* flag).
+     *   - TFADVISE   → stm_fs_fadvise (every POSIX_FADV_* hint).
+     *   - TPIN / TUNPIN — pinned-snapshot read view per ARCH §3.3.2.
+     *                    Returns ENOSYS at v2.0; needs MVCC reader
+     *                    infra in stm_fs first. Wire opcodes reserved
+     *                    so the Stratum-ext range stays stable. */
     STM_9P_TBIND          = 124,  STM_9P_RBIND          = 125,
-    STM_9P_TUNBIND        = 126,  STM_9P_RUNBIND        = 127
+    STM_9P_TUNBIND        = 126,  STM_9P_RUNBIND        = 127,
+    STM_9P_TSYNC          = 128,  STM_9P_RSYNC          = 129,
+    STM_9P_TREFLINK       = 130,  STM_9P_RREFLINK       = 131,
+    STM_9P_TFALLOCATE     = 132,  STM_9P_RFALLOCATE     = 133,
+    STM_9P_TFADVISE       = 134,  STM_9P_RFADVISE       = 135,
+    STM_9P_TPIN           = 136,  STM_9P_RPIN           = 137,
+    STM_9P_TUNPIN         = 138,  STM_9P_RUNPIN         = 139
 };
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -247,6 +267,36 @@ enum {
  * Components within a path are individually bounded by STM_9P_NAME_MAX
  * (= 255). */
 #define STM_9P_NS_PATH_MAX      4096u
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* Stratum extension constants (P9-9P-3).                                 */
+/*                                                                         */
+/* Wire-format flag/advice values for the Tfallocate and Tfadvise         */
+/* extensions. Numeric values match the Linux kernel UAPI verbatim so a   */
+/* Linux v9fs client (or any wrapper that uses the kernel's <linux/       */
+/* falloc.h> / <linux/fadvise.h> values) can pass them through unchanged. */
+/* Drift between these constants and the runtime stm_fs_* values is       */
+/* asserted via _Static_assert in src/9p/server.c.                        */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/* Tfallocate flags. Match `<linux/falloc.h>` AND STM_FS_FALLOC_FL_*. */
+#define STM_9P_FALLOC_FL_KEEP_SIZE       0x01u
+#define STM_9P_FALLOC_FL_PUNCH_HOLE      0x02u
+#define STM_9P_FALLOC_FL_COLLAPSE_RANGE  0x08u
+#define STM_9P_FALLOC_FL_ZERO_RANGE      0x10u
+#define STM_9P_FALLOC_FL_INSERT_RANGE    0x20u
+#define STM_9P_FALLOC_FL_UNSHARE_RANGE   0x40u
+
+/* Tfadvise advice values. Match `<linux/fadvise.h>` (generic) AND
+ * STM_FS_FADV_*. Bindings on s390 must translate the platform's
+ * POSIX_FADV_DONTNEED/NOREUSE values to the generic numbering before
+ * sending Tfadvise — see stm_fs_fadvise's R87 P2-1 commentary. */
+#define STM_9P_FADV_NORMAL               0u
+#define STM_9P_FADV_RANDOM               1u
+#define STM_9P_FADV_SEQUENTIAL           2u
+#define STM_9P_FADV_WILLNEED             3u
+#define STM_9P_FADV_DONTNEED             4u
+#define STM_9P_FADV_NOREUSE              5u
 
 /* ────────────────────────────────────────────────────────────────────── */
 /* Canonical 9P2000.L errno table.                                        */

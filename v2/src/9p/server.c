@@ -92,6 +92,30 @@ _Static_assert(STM_9P_ECODE_EOVERFLOW    == EOVERFLOW,    "EOVERFLOW drift");
 _Static_assert(STM_9P_ECODE_ESTALE       == ESTALE,       "ESTALE drift");
 #endif
 
+/* P9-9P-3: drift guards for Tfallocate flag values and Tfadvise advice
+ * values. The wire constants must equal the runtime stm_fs_* values so
+ * the server can pass through verbatim without translation. (These are
+ * runtime checks regardless of host — every supported OS uses identical
+ * flag/advice numbering as required by the on-the-wire spec.) */
+_Static_assert(STM_9P_FALLOC_FL_KEEP_SIZE      == STM_FS_FALLOC_FL_KEEP_SIZE,
+                "FALLOC_FL_KEEP_SIZE drift");
+_Static_assert(STM_9P_FALLOC_FL_PUNCH_HOLE     == STM_FS_FALLOC_FL_PUNCH_HOLE,
+                "FALLOC_FL_PUNCH_HOLE drift");
+_Static_assert(STM_9P_FALLOC_FL_COLLAPSE_RANGE == STM_FS_FALLOC_FL_COLLAPSE_RANGE,
+                "FALLOC_FL_COLLAPSE_RANGE drift");
+_Static_assert(STM_9P_FALLOC_FL_ZERO_RANGE     == STM_FS_FALLOC_FL_ZERO_RANGE,
+                "FALLOC_FL_ZERO_RANGE drift");
+_Static_assert(STM_9P_FALLOC_FL_INSERT_RANGE   == STM_FS_FALLOC_FL_INSERT_RANGE,
+                "FALLOC_FL_INSERT_RANGE drift");
+_Static_assert(STM_9P_FALLOC_FL_UNSHARE_RANGE  == STM_FS_FALLOC_FL_UNSHARE_RANGE,
+                "FALLOC_FL_UNSHARE_RANGE drift");
+_Static_assert(STM_9P_FADV_NORMAL      == STM_FS_FADV_NORMAL,      "FADV_NORMAL drift");
+_Static_assert(STM_9P_FADV_RANDOM      == STM_FS_FADV_RANDOM,      "FADV_RANDOM drift");
+_Static_assert(STM_9P_FADV_SEQUENTIAL  == STM_FS_FADV_SEQUENTIAL,  "FADV_SEQUENTIAL drift");
+_Static_assert(STM_9P_FADV_WILLNEED    == STM_FS_FADV_WILLNEED,    "FADV_WILLNEED drift");
+_Static_assert(STM_9P_FADV_DONTNEED    == STM_FS_FADV_DONTNEED,    "FADV_DONTNEED drift");
+_Static_assert(STM_9P_FADV_NOREUSE     == STM_FS_FADV_NOREUSE,     "FADV_NOREUSE drift");
+
 /* ────────────────────────────────────────────────────────────────────── */
 /* Internal types.                                                        */
 /* ────────────────────────────────────────────────────────────────────── */
@@ -3117,6 +3141,222 @@ static stm_status h_unbind(stm_9p_server *s,
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
+/* h_sync — Tsync / Rsync (Stratum extension, P9-9P-3).                   */
+/* Tsync:  (no body)                                                       */
+/* Rsync:  (header only)                                                   */
+/*                                                                         */
+/* Whole-pool commit. Distinct from .L's Tfsync (which takes a fid arg    */
+/* and routes to the same primitive) — Tsync is the Stratum-extension    */
+/* shape for clients that want explicit pool-wide commit without holding */
+/* an open fid. Maps to stm_fs_commit.                                    */
+/* ────────────────────────────────────────────────────────────────────── */
+
+static stm_status h_sync(stm_9p_server *s,
+                            const uint8_t *body, uint32_t body_len,
+                            uint16_t tag,
+                            uint8_t *resp, uint32_t resp_cap,
+                            uint32_t *resp_len)
+{
+    (void)body; (void)body_len;
+
+    stm_status rc = stm_fs_commit(s->fs);
+    if (rc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+
+    uint32_t need = STM_9P_HDR_SIZE;
+    if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
+    uint8_t *wp = resp + 4;
+    *wp++ = STM_9P_RSYNC;
+    p9l_p16(wp, tag); wp += 2;
+    resp_finish(resp, resp_len, wp);
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* h_reflink — Treflink / Rreflink (Stratum extension, P9-9P-3).          */
+/* Treflink:  src_fid[4] dst_fid[4]                                        */
+/* Rreflink:  dst_qid[13]                                                  */
+/*                                                                         */
+/* FICLONE-shape: both src_fid and dst_fid are existing NODE fids; dst   */
+/* MUST be empty (stm_fs_reflink contract). On success, dst's content    */
+/* shares src's extents via refcount; dst's qid version (= si_gen) and   */
+/* size both update — Rreflink returns the post-commit qid so the client */
+/* can refresh its cache. Cross-dataset is STM_EXDEV per stm_fs_reflink. */
+/* ────────────────────────────────────────────────────────────────────── */
+
+static stm_status h_reflink(stm_9p_server *s,
+                               const uint8_t *body, uint32_t body_len,
+                               uint16_t tag,
+                               uint8_t *resp, uint32_t resp_cap,
+                               uint32_t *resp_len)
+{
+    if (body_len < 8u)
+        return reply_rlerror(resp, resp_cap, resp_len, tag,
+                              STM_9P_ECODE_EPROTO);
+    uint32_t src_fid = p9l_g32(body);
+    uint32_t dst_fid = p9l_g32(body + 4);
+
+    p9_fid *sf = fid_get(s, src_fid);
+    if (!sf)
+        return reply_rlerror(resp, resp_cap, resp_len, tag,
+                              STM_9P_ECODE_EBADF);
+    if (sf->kind != P9_FID_NODE)
+        return reply_rlerror(resp, resp_cap, resp_len, tag,
+                              STM_9P_ECODE_EINVAL);
+    p9_fid *df = fid_get(s, dst_fid);
+    if (!df)
+        return reply_rlerror(resp, resp_cap, resp_len, tag,
+                              STM_9P_ECODE_EBADF);
+    if (df->kind != P9_FID_NODE)
+        return reply_rlerror(resp, resp_cap, resp_len, tag,
+                              STM_9P_ECODE_EINVAL);
+
+    /* fid.tla::IOReject gate on both fids. */
+    stm_status vrc = verify_fid_fresh(s, sf, NULL);
+    if (vrc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
+    vrc = verify_fid_fresh(s, df, NULL);
+    if (vrc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
+
+    /* stm_fs_reflink enforces: src and dst are regular files; dst is
+     * empty (size == 0 + no extents); same dataset (else STM_EXDEV);
+     * etc. */
+    stm_status rc = stm_fs_reflink(s->fs,
+                                       sf->dataset_id, sf->ino,
+                                       df->dataset_id, df->ino);
+    if (rc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+
+    /* Re-stat dst to refresh cached_gen + emit the post-reflink qid. */
+    struct stm_inode_value iv;
+    rc = stm_fs_stat(s->fs, df->dataset_id, df->ino, &iv);
+    if (rc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+    df->cached_gen = (uint32_t)stm_load_le64(iv.si_gen);
+    df->qid_type   = qid_type_from_mode(stm_load_le32(iv.si_mode));
+
+    uint32_t need = STM_9P_HDR_SIZE + STM_9P_QID_SIZE;
+    if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
+    uint8_t *wp = resp + 4;
+    *wp++ = STM_9P_RREFLINK;
+    p9l_p16(wp, tag); wp += 2;
+    p9l_pqid(wp, df->qid_type, df->cached_gen,
+              qid_path(df->dataset_id, df->ino));
+    wp += STM_9P_QID_SIZE;
+    resp_finish(resp, resp_len, wp);
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* h_fallocate — Tfallocate / Rfallocate (Stratum extension, P9-9P-3).    */
+/* Tfallocate:  fid[4] flags[4] offset[8] length[8]                        */
+/* Rfallocate:  (header only)                                              */
+/*                                                                         */
+/* Wraps stm_fs_fallocate. Every FALLOC_FL_* flag (KEEP_SIZE, PUNCH_HOLE, */
+/* COLLAPSE_RANGE, ZERO_RANGE, INSERT_RANGE, UNSHARE_RANGE) is supported  */
+/* per P8-POSIX-7b. Wire flag values match Linux's <linux/falloc.h>      */
+/* verbatim so a v9fs client can pass kernel-supplied flags through.     */
+/* fs validates flag combinations.                                        */
+/* ────────────────────────────────────────────────────────────────────── */
+
+static stm_status h_fallocate(stm_9p_server *s,
+                                 const uint8_t *body, uint32_t body_len,
+                                 uint16_t tag,
+                                 uint8_t *resp, uint32_t resp_cap,
+                                 uint32_t *resp_len)
+{
+    if (body_len < 4u + 4u + 8u + 8u)
+        return reply_rlerror(resp, resp_cap, resp_len, tag,
+                              STM_9P_ECODE_EPROTO);
+    uint32_t fid    = p9l_g32(body);
+    uint32_t flags  = p9l_g32(body + 4);
+    uint64_t offset = p9l_g64(body + 8);
+    uint64_t length = p9l_g64(body + 16);
+
+    p9_fid *f = fid_get(s, fid);
+    if (!f)
+        return reply_rlerror(resp, resp_cap, resp_len, tag,
+                              STM_9P_ECODE_EBADF);
+    if (f->kind != P9_FID_NODE)
+        return reply_rlerror(resp, resp_cap, resp_len, tag,
+                              STM_9P_ECODE_EINVAL);
+    stm_status vrc = verify_fid_fresh(s, f, NULL);
+    if (vrc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
+
+    /* Defensive flag mask pre-check (fs also validates). Any bit
+     * outside STM_FS_FALLOC_MASK is rejected with EINVAL. */
+    if ((flags & ~(uint32_t)STM_FS_FALLOC_MASK) != 0u)
+        return reply_rlerror(resp, resp_cap, resp_len, tag,
+                              STM_9P_ECODE_EINVAL);
+
+    stm_status rc = stm_fs_fallocate(s->fs, f->dataset_id, f->ino,
+                                          offset, length, flags);
+    if (rc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+
+    uint32_t need = STM_9P_HDR_SIZE;
+    if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
+    uint8_t *wp = resp + 4;
+    *wp++ = STM_9P_RFALLOCATE;
+    p9l_p16(wp, tag); wp += 2;
+    resp_finish(resp, resp_len, wp);
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* h_fadvise — Tfadvise / Rfadvise (Stratum extension, P9-9P-3).          */
+/* Tfadvise:  fid[4] offset[8] length[8] advice[4]                         */
+/* Rfadvise:  (header only)                                                */
+/*                                                                         */
+/* Wraps stm_fs_fadvise (P8-POSIX-7e). MVP scope: hint is interpreted at  */
+/* INODE granularity — offset+length advisory but not enforced. Wire     */
+/* advice values match Linux's <linux/fadvise.h> (generic numbering). On */
+/* s390 the kernel-supplied advice differs (DONTNEED=6, NOREUSE=7); a    */
+/* binding running on s390 MUST translate to generic before sending.     */
+/* ────────────────────────────────────────────────────────────────────── */
+
+static stm_status h_fadvise(stm_9p_server *s,
+                               const uint8_t *body, uint32_t body_len,
+                               uint16_t tag,
+                               uint8_t *resp, uint32_t resp_cap,
+                               uint32_t *resp_len)
+{
+    if (body_len < 4u + 8u + 8u + 4u)
+        return reply_rlerror(resp, resp_cap, resp_len, tag,
+                              STM_9P_ECODE_EPROTO);
+    uint32_t fid    = p9l_g32(body);
+    uint64_t offset = p9l_g64(body + 4);
+    uint64_t length = p9l_g64(body + 12);
+    uint32_t advice = p9l_g32(body + 20);
+
+    p9_fid *f = fid_get(s, fid);
+    if (!f)
+        return reply_rlerror(resp, resp_cap, resp_len, tag,
+                              STM_9P_ECODE_EBADF);
+    if (f->kind != P9_FID_NODE)
+        return reply_rlerror(resp, resp_cap, resp_len, tag,
+                              STM_9P_ECODE_EINVAL);
+    stm_status vrc = verify_fid_fresh(s, f, NULL);
+    if (vrc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, vrc);
+
+    stm_status rc = stm_fs_fadvise(s->fs, f->dataset_id, f->ino,
+                                        offset, length, advice);
+    if (rc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+
+    uint32_t need = STM_9P_HDR_SIZE;
+    if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
+    uint8_t *wp = resp + 4;
+    *wp++ = STM_9P_RFADVISE;
+    p9l_p16(wp, tag); wp += 2;
+    resp_finish(resp, resp_len, wp);
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
 /* Public API.                                                             */
 /* ────────────────────────────────────────────────────────────────────── */
 
@@ -3309,6 +3549,27 @@ stm_status stm_9p_server_handle(stm_9p_server *s,
         break;
     case STM_9P_TUNBIND:
         rc = h_unbind(s, body, body_len, tag, resp, resp_cap, resp_len);
+        break;
+    case STM_9P_TSYNC:
+        rc = h_sync(s, body, body_len, tag, resp, resp_cap, resp_len);
+        break;
+    case STM_9P_TREFLINK:
+        rc = h_reflink(s, body, body_len, tag, resp, resp_cap, resp_len);
+        break;
+    case STM_9P_TFALLOCATE:
+        rc = h_fallocate(s, body, body_len, tag, resp, resp_cap, resp_len);
+        break;
+    case STM_9P_TFADVISE:
+        rc = h_fadvise(s, body, body_len, tag, resp, resp_cap, resp_len);
+        break;
+    case STM_9P_TPIN:
+    case STM_9P_TUNPIN:
+        /* Pinned-snapshot read view (ARCH §3.3.2) — needs MVCC reader
+         * infra in stm_fs that v2.0 doesn't have yet. Wire opcodes
+         * reserved; runtime returns ENOSYS until the reader-pin API
+         * lands. */
+        rc = reply_rlerror(resp, resp_cap, resp_len, tag,
+                              STM_9P_ECODE_ENOSYS);
         break;
     case STM_9P_TAUTH:
         /* Stratum uses Unix-socket SO_PEERCRED for authn at the daemon
