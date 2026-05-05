@@ -1232,4 +1232,248 @@ STM_TEST(ctl_b1p_device_status_write_rejected)
     destroy_test_pool(f);
 }
 
+/* ── P9-CTL-1c /datasets/ surface ─────────────────────────────────── */
+
+/* The root dataset is created at fs format time with id 1 (per
+ * STM_DATASET_ROOT_ID). Tests use that as the "always there"
+ * dataset id. */
+#define CTL_TEST_DATASET_ROOT_ID  "1"
+
+STM_TEST(ctl_c1_datasets_in_root_listing)
+{
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    uint32_t sz = build_topen(req, 2, 10, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+
+    sz = build_tread(req, 3, 10, 0, 8192);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    uint32_t count = load_u32(resp + 7);
+    STM_ASSERT(count > 0);
+
+    int saw_datasets = 0;
+    const uint8_t *q = resp + 11;
+    const uint8_t *end = q + count;
+    while (q < end) {
+        uint16_t inner = load_u16(q);
+        const uint8_t *rec = q + 2;
+        const uint8_t *np = rec + 2 + 4 + 13 + 4 + 4 + 4 + 8;
+        uint16_t nl = load_u16(np);
+        const char *nm = (const char *)(np + 2);
+        if (nl == 8 && memcmp(nm, "datasets", 8) == 0) saw_datasets = 1;
+        q += 2 + inner;
+    }
+    STM_ASSERT_TRUE(saw_datasets);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
+STM_TEST(ctl_c1_datasets_dir_empty_when_no_fs)
+{
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "datasets" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 1, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+
+    sz = build_tread(req, 4, 11, 0, 8192);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    STM_ASSERT_EQ(load_u32(resp + 7), 0u);  /* empty dir */
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
+STM_TEST(ctl_c1_datasets_readdir_lists_root_dataset)
+{
+    make_tmp("ctl_c1");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(fs, &c));
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "datasets" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 1, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+
+    sz = build_tread(req, 4, 11, 0, 8192);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    uint32_t count = load_u32(resp + 7);
+    STM_ASSERT(count > 0);
+
+    int saw_root = 0;
+    const uint8_t *q = resp + 11;
+    const uint8_t *end = q + count;
+    while (q < end) {
+        uint16_t inner = load_u16(q);
+        const uint8_t *rec = q + 2;
+        const uint8_t *np = rec + 2 + 4 + 13 + 4 + 4 + 4 + 8;
+        uint16_t nl = load_u16(np);
+        const char *nm = (const char *)(np + 2);
+        if (nl == 1 && nm[0] == '1') saw_root = 1;
+        q += 2 + inner;
+    }
+    STM_ASSERT_TRUE(saw_root);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
+STM_TEST(ctl_c1_dataset_properties_reports_root_metadata)
+{
+    make_tmp("ctl_c1_props");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(fs, &c));
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "datasets", CTL_TEST_DATASET_ROOT_ID, "properties" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 3, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_EQ(load_u16(resp + 7), 3u);
+
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+
+    sz = build_tread(req, 4, 11, 0, 4096);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    uint32_t count = load_u32(resp + 7);
+    STM_ASSERT(count > 0);
+
+    char body[1024];
+    STM_ASSERT(count < sizeof body);
+    memcpy(body, resp + 11, count);
+    body[count] = '\0';
+
+    STM_ASSERT(strstr(body, "dataset-id: 1\n")              != NULL);
+    STM_ASSERT(strstr(body, "name: ")                        != NULL);
+    STM_ASSERT(strstr(body, "parent-id: ")                   != NULL);
+    STM_ASSERT(strstr(body, "created-txg: ")                 != NULL);
+    STM_ASSERT(strstr(body, "next-ino: ")                    != NULL);
+    STM_ASSERT(strstr(body, "compression: ")                 != NULL);
+    STM_ASSERT(strstr(body, "quota: ")                       != NULL);
+    STM_ASSERT(strstr(body, "encryption: ")                  != NULL);
+    STM_ASSERT(strstr(body, "tiering: ")                     != NULL);
+    STM_ASSERT(strstr(body, "promote-decay-window: ")        != NULL);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
+STM_TEST(ctl_c1_walk_nonexistent_dataset_id_enoent)
+{
+    make_tmp("ctl_c1_enoent");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(fs, &c));
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+
+    /* Dataset id 999 was never created. */
+    const char *p999[] = { "datasets", "999" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 2, p999);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* Leading-zero canonical-form rejection. */
+    const char *p01[] = { "datasets", "01" };
+    sz = build_twalk(req, 3, 10, 12, 2, p01);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* Out-of-range (> STM_SYNC_DATASET_ID_MAX = 268435455). */
+    const char *p_huge[] = { "datasets", "9999999999" };
+    sz = build_twalk(req, 4, 10, 13, 2, p_huge);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* 11-character input (length cap). */
+    const char *p_long[] = { "datasets", "12345678901" };
+    sz = build_twalk(req, 5, 10, 14, 2, p_long);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
+STM_TEST(ctl_c1_dataset_properties_write_rejected)
+{
+    make_tmp("ctl_c1_wr");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(fs, &c));
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "datasets", CTL_TEST_DATASET_ROOT_ID, "properties" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 3, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+
+    sz = build_topen(req, 3, 11, STM_P9_OWRITE);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
 STM_TEST_MAIN("ctl")

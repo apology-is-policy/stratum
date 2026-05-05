@@ -75,11 +75,13 @@
  */
 
 #include <stratum/ctl.h>
+#include <stratum/dataset.h>        /* stm_property + stm_dataset_entry */
 #include <stratum/fs.h>
 #include <stratum/p9.h>
 #include <stratum/pool.h>
 #include <stratum/send_recv.h>      /* STM_SEND_VERSION */
 #include <stratum/super.h>          /* STM_UB_VERSION + STM_DEV_*_ values */
+#include <stratum/sync.h>           /* STM_SYNC_DATASET_ID_MAX */
 #include <stratum/types.h>
 
 #include <pthread.h>
@@ -91,15 +93,18 @@
 /* ── kind enum + meta table ─────────────────────────────────────────── */
 
 typedef enum {
-    KIND_ROOT          = 0,
-    KIND_VERSION       = 1,
-    KIND_STATE         = 2,
-    KIND_POOLS_DIR     = 3,    /* /pools/ */
-    KIND_POOL_DIR      = 4,    /* /pools/<uuid>/ */
-    KIND_POOL_STATUS   = 5,    /* /pools/<uuid>/status */
-    KIND_DEVICES_DIR   = 6,    /* /pools/<uuid>/devices/ */
-    KIND_DEVICE_DIR    = 7,    /* /pools/<uuid>/devices/<id>/ */
-    KIND_DEVICE_STATUS = 8,    /* /pools/<uuid>/devices/<id>/status */
+    KIND_ROOT               = 0,
+    KIND_VERSION            = 1,
+    KIND_STATE              = 2,
+    KIND_POOLS_DIR          = 3,    /* /pools/ */
+    KIND_POOL_DIR           = 4,    /* /pools/<uuid>/ */
+    KIND_POOL_STATUS        = 5,    /* /pools/<uuid>/status */
+    KIND_DEVICES_DIR        = 6,    /* /pools/<uuid>/devices/ */
+    KIND_DEVICE_DIR         = 7,    /* /pools/<uuid>/devices/<id>/ */
+    KIND_DEVICE_STATUS      = 8,    /* /pools/<uuid>/devices/<id>/status */
+    KIND_DATASETS_DIR       = 9,    /* /datasets/ */
+    KIND_DATASET_DIR        = 10,   /* /datasets/<id>/ */
+    KIND_DATASET_PROPERTIES = 11,   /* /datasets/<id>/properties */
     KIND_MAX
 } ctl_kind;
 
@@ -110,15 +115,18 @@ typedef struct {
 } ctl_kind_meta;
 
 static const ctl_kind_meta KIND_META[KIND_MAX] = {
-    [KIND_ROOT]          = { true,  0555, "/"       },
-    [KIND_VERSION]       = { false, 0444, "version" },
-    [KIND_STATE]         = { false, 0444, "state"   },
-    [KIND_POOLS_DIR]     = { true,  0555, "pools"   },
-    [KIND_POOL_DIR]      = { true,  0555, NULL      },  /* dynamic uuid */
-    [KIND_POOL_STATUS]   = { false, 0444, "status"  },
-    [KIND_DEVICES_DIR]   = { true,  0555, "devices" },
-    [KIND_DEVICE_DIR]    = { true,  0555, NULL      },  /* dynamic device id */
-    [KIND_DEVICE_STATUS] = { false, 0444, "status"  },
+    [KIND_ROOT]               = { true,  0555, "/"          },
+    [KIND_VERSION]            = { false, 0444, "version"    },
+    [KIND_STATE]              = { false, 0444, "state"      },
+    [KIND_POOLS_DIR]          = { true,  0555, "pools"      },
+    [KIND_POOL_DIR]           = { true,  0555, NULL         },  /* dynamic uuid */
+    [KIND_POOL_STATUS]        = { false, 0444, "status"     },
+    [KIND_DEVICES_DIR]        = { true,  0555, "devices"    },
+    [KIND_DEVICE_DIR]         = { true,  0555, NULL         },  /* dynamic device id */
+    [KIND_DEVICE_STATUS]      = { false, 0444, "status"     },
+    [KIND_DATASETS_DIR]       = { true,  0555, "datasets"   },
+    [KIND_DATASET_DIR]        = { true,  0555, NULL         },  /* dynamic dataset id */
+    [KIND_DATASET_PROPERTIES] = { false, 0444, "properties" },
 };
 
 /* R96 P3-2: pin every static-name literal length below STM_P9_NAME_MAX
@@ -132,17 +140,19 @@ _Static_assert(sizeof("version") - 1  <= STM_P9_NAME_MAX, "/ctl/ /version litera
 _Static_assert(sizeof("state") - 1    <= STM_P9_NAME_MAX, "/ctl/ /state literal");
 _Static_assert(sizeof("pools") - 1    <= STM_P9_NAME_MAX, "/ctl/ /pools literal");
 _Static_assert(sizeof("status") - 1   <= STM_P9_NAME_MAX, "/ctl/ /pools/.../status literal");
-_Static_assert(sizeof("devices") - 1  <= STM_P9_NAME_MAX, "/ctl/ /pools/.../devices literal");
-/* Dynamic names: pool-uuid hex (36 chars) and decimal device-id
- * (≤2 chars at v2.0's STM_POOL_DEVICES_MAX = 64 cap; cap can grow
- * up to STM_P9_NAME_MAX without overflowing dyn_name). Bounded at
- * runtime in the dynamic decoders. */
+_Static_assert(sizeof("devices") - 1   <= STM_P9_NAME_MAX, "/ctl/ /pools/.../devices literal");
+_Static_assert(sizeof("datasets") - 1  <= STM_P9_NAME_MAX, "/ctl/ /datasets literal");
+_Static_assert(sizeof("properties") - 1 <= STM_P9_NAME_MAX, "/ctl/ /datasets/.../properties literal");
+/* Dynamic names: pool-uuid hex (36 chars), decimal device-id (≤2
+ * chars at v2.0's STM_POOL_DEVICES_MAX = 64 cap), decimal dataset-id
+ * (≤9 chars at STM_SYNC_DATASET_ID_MAX = 0x0FFFFFFF ~= 268M = 9
+ * digits). All bounded at runtime in the dynamic decoders. */
 
 /* R97 P3-7: pin KIND_MAX so adding a new ctl_kind without extending
  * KIND_META[] trips this assert at build time, even if a downstream
  * build silently suppresses -Wmissing-field-initializers. Update the
  * literal in lockstep when growing the enum. */
-_Static_assert(KIND_MAX == 9,
+_Static_assert(KIND_MAX == 12,
                "KIND_META[KIND_MAX] sized to enum cardinality; "
                "update both ctl_kind enum + KIND_META[] in lockstep");
 
@@ -177,6 +187,16 @@ static uint32_t qid_pool_idx(uint64_t q)
 static uint32_t qid_device_id(uint64_t q)
 {
     return (uint32_t)(q & DEVICE_ID_MASK);
+}
+
+/* Alias for the same low-32-bits slot but typed as uint64_t for the
+ * dataset surface; STM_SYNC_DATASET_ID_MAX = 0x0FFFFFFF (28 bits)
+ * fits comfortably in the 32-bit field. Kept as a separate name
+ * so the reader of stat_at / vops_walk can tell which kind's
+ * data they're extracting. */
+static uint64_t qid_dataset_id(uint64_t q)
+{
+    return q & DEVICE_ID_MASK;
 }
 
 /* ── per-fid materialized body ──────────────────────────────────────── */
@@ -339,6 +359,56 @@ static int parse_device_id(const char *name, size_t len, uint16_t *out)
     }
     *out = (uint16_t)v;
     return 0;
+}
+
+/* Parse `name[0..len)` as an unsigned decimal dataset-id in
+ * (0, STM_SYNC_DATASET_ID_MAX]. Same strict-canonical posture as
+ * parse_device_id (rejects leading zeros on multi-char names).
+ * STM_SYNC_DATASET_ID_MAX = 0x0FFFFFFF ~= 268435455 fits in 9
+ * decimal digits; cap len at 10 defensive. Dataset id 0 is reserved
+ * (STM_DATASET_ROOT_ID = 1; root takes id 1). The dataset_id type
+ * is uint64_t to match the dataset.h surface, even though the wire
+ * encoding caps at 28 bits. */
+static int parse_dataset_id(const char *name, size_t len, uint64_t *out)
+{
+    if (len == 0 || len > 10) return -1;
+    if (len > 1 && name[0] == '0') return -1;
+    uint64_t v = 0;
+    for (size_t i = 0; i < len; i++) {
+        char ch = name[i];
+        if (ch < '0' || ch > '9') return -1;
+        v = v * 10u + (uint64_t)(ch - '0');
+        if (v > STM_SYNC_DATASET_ID_MAX) return -1;
+    }
+    *out = v;
+    return 0;
+}
+
+/* Cap on the number of dataset ids collected per /datasets/ readdir
+ * pass. v2.0 readdir returns one batch (caller pages via 9P-level
+ * Tread offsets). Stratum's design point is hundreds of datasets at
+ * most for typical pools; STM_CTL_DATASET_LIST_CAP = 1024 covers
+ * realistic operational sizes with a 8 KiB stack footprint. Pools
+ * with more than 1024 datasets would be truncated at the readdir
+ * boundary — forward-noted to a future paginated-readdir chunk;
+ * v2.0's /ctl/ doesn't carry persistent cursor state. */
+#define STM_CTL_DATASET_LIST_CAP  1024u
+
+/* Iter callback used by vops_readdir for KIND_DATASETS_DIR. Captures
+ * the entry id into the caller's out array. Bounded by `cap`; on
+ * overflow we stop iterating and the readdir result truncates. */
+typedef struct {
+    uint64_t *out;
+    size_t   *n;
+    size_t    cap;
+} ds_collect_ctx;
+
+static bool ds_collect_cb(const stm_dataset_entry *entry, void *ctx_v)
+{
+    ds_collect_ctx *ctx = ctx_v;
+    if (*ctx->n >= ctx->cap) return false;     /* stop iteration */
+    ctx->out[(*ctx->n)++] = entry->id;
+    return true;
 }
 
 /* Get the attached pool's UUID as 16 bytes, or return false if no pool
@@ -639,18 +709,96 @@ static stm_status materialize_device_status(stm_ctl *c, ctl_session *s)
     return STM_OK;
 }
 
+/* Materialize /datasets/<id>/properties — surfaces the dataset's
+ * five user-settable properties (effective values, with parent-walk
+ * inheritance per property.tla::Effective) AND the metadata fields
+ * from stm_dataset_entry (name, parent_id, created_txg, next_ino,
+ * origin_snap_id). Combined to give operators a single view of the
+ * dataset's full state. */
+static stm_status materialize_dataset_properties(stm_ctl *c, ctl_session *s)
+{
+    if (!c->fs) return STM_EBACKEND;     /* gated at vops_open */
+    uint64_t dsid = qid_dataset_id(s->qid_path);
+
+    stm_dataset_entry e;
+    stm_status rc = stm_fs_dataset_lookup(c->fs, dsid, &e);
+    if (rc != STM_OK) return rc;
+
+    uint64_t compress = 0, quota = 0, encryption = 0, tiering = 0,
+             promote_decay = 0;
+    /* Each property lookup re-takes fs->lock. The values are read
+     * over multiple short critical sections — between them, a
+     * concurrent set_property could cause us to surface a mixed
+     * snapshot. /ctl/ is operator state, not a transactional
+     * surface; this is documented as a freshness tradeoff (R96
+     * lesson on materialize-at-Topen semantics). Re-open to refresh. */
+    rc = stm_fs_effective_dataset_property(c->fs, dsid,
+                                              STM_PROP_COMPRESS, &compress);
+    if (rc != STM_OK) return rc;
+    rc = stm_fs_effective_dataset_property(c->fs, dsid,
+                                              STM_PROP_QUOTA, &quota);
+    if (rc != STM_OK) return rc;
+    rc = stm_fs_effective_dataset_property(c->fs, dsid,
+                                              STM_PROP_ENCRYPTION, &encryption);
+    if (rc != STM_OK) return rc;
+    rc = stm_fs_effective_dataset_property(c->fs, dsid,
+                                              STM_PROP_TIERING, &tiering);
+    if (rc != STM_OK) return rc;
+    rc = stm_fs_effective_dataset_property(c->fs, dsid,
+                                              STM_PROP_PROMOTE_DECAY_WINDOW,
+                                              &promote_decay);
+    if (rc != STM_OK) return rc;
+
+    /* Note: `name` is dataset-supplied and should be safe (validated
+     * at create_child against length + collision); but we still
+     * truncate-check below. parent_id, created_txg, next_ino,
+     * origin_snap_id are dataset-internal counters. */
+    int n = snprintf((char *)s->buf, sizeof s->buf,
+        "dataset-id: %llu\n"
+        "name: %.*s\n"
+        "parent-id: %llu\n"
+        "created-txg: %llu\n"
+        "next-ino: %llu\n"
+        "origin-snap-id: %llu\n"
+        "flags: 0x%08x\n"
+        "compression: %llu\n"
+        "quota: %llu\n"
+        "encryption: %llu\n"
+        "tiering: %llu\n"
+        "promote-decay-window: %llu\n",
+        (unsigned long long)e.id,
+        (int)e.name_len, (const char *)e.name,
+        (unsigned long long)e.parent_id,
+        (unsigned long long)e.created_txg,
+        (unsigned long long)e.next_ino,
+        (unsigned long long)e.origin_snap_id,
+        (unsigned)e.flags,
+        (unsigned long long)compress,
+        (unsigned long long)quota,
+        (unsigned long long)encryption,
+        (unsigned long long)tiering,
+        (unsigned long long)promote_decay);
+    if (n < 0) return STM_EIO;
+    if ((size_t)n >= sizeof s->buf) return STM_ERANGE;
+    s->len = (uint32_t)n;
+    return STM_OK;
+}
+
 static stm_status materialize_locked(stm_ctl *c, ctl_session *s)
 {
     switch (qid_kind(s->qid_path)) {
-    case KIND_VERSION:       return materialize_version(c, s);
-    case KIND_STATE:         return materialize_state(c, s);
-    case KIND_POOL_STATUS:   return materialize_pool_status(c, s);
-    case KIND_DEVICE_STATUS: return materialize_device_status(c, s);
+    case KIND_VERSION:            return materialize_version(c, s);
+    case KIND_STATE:              return materialize_state(c, s);
+    case KIND_POOL_STATUS:        return materialize_pool_status(c, s);
+    case KIND_DEVICE_STATUS:      return materialize_device_status(c, s);
+    case KIND_DATASET_PROPERTIES: return materialize_dataset_properties(c, s);
     case KIND_ROOT:
     case KIND_POOLS_DIR:
     case KIND_POOL_DIR:
     case KIND_DEVICES_DIR:
     case KIND_DEVICE_DIR:
+    case KIND_DATASETS_DIR:
+    case KIND_DATASET_DIR:
     case KIND_MAX:
         break;
     }
@@ -725,6 +873,29 @@ static stm_status stat_at(stm_ctl *c, uint64_t qid_path,
         }
     }
 
+    /* KIND_DATASETS_DIR is always accessible (just empty when fs is
+     * unattached), matching the /pools/ posture. The fs check lives
+     * on the per-dataset kinds below. */
+    if (k == KIND_DATASET_DIR || k == KIND_DATASET_PROPERTIES) {
+        if (!c->fs) return STM_ENOENT;
+        uint64_t dsid = qid_dataset_id(qid_path);
+        /* Validate the dataset is PRESENT (i.e. not destroyed).
+         * stm_fs_dataset_lookup takes fs->lock briefly. R98 P2-1
+         * lesson: dataset_destroy IS supported, so this gate is
+         * load-bearing — STM_ENOENT here is a real "this id was
+         * destroyed" signal, not defense-in-depth. */
+        stm_dataset_entry tmp;
+        stm_status drc = stm_fs_dataset_lookup(c->fs, dsid, &tmp);
+        if (drc != STM_OK) return drc;
+        if (k == KIND_DATASET_DIR) {
+            int n = snprintf(dyn_name, sizeof dyn_name, "%llu",
+                              (unsigned long long)dsid);
+            if (n < 0 || n >= (int)sizeof dyn_name) return STM_EIO;
+            name = dyn_name;
+            name_len = (size_t)n;
+        }
+    }
+
     memset(out, 0, sizeof *out);
     out->qid_path = qid_path;
     if (meta->is_dir) {
@@ -768,6 +939,8 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
             return stat_at(c, qid_root(KIND_STATE), out);
         if (str_eq(name, name_len, KIND_META[KIND_POOLS_DIR].static_name))
             return stat_at(c, qid_root(KIND_POOLS_DIR), out);
+        if (str_eq(name, name_len, KIND_META[KIND_DATASETS_DIR].static_name))
+            return stat_at(c, qid_root(KIND_DATASETS_DIR), out);
         return STM_ENOENT;
 
     case KIND_POOLS_DIR: {
@@ -802,10 +975,28 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
         return stat_at(c, qid_of(KIND_DEVICE_STATUS, 0, did), out);
     }
 
+    case KIND_DATASETS_DIR: {
+        if (!c->fs) return STM_ENOENT;
+        uint64_t dsid = 0;
+        if (parse_dataset_id(name, name_len, &dsid) != 0) return STM_ENOENT;
+        return stat_at(c, qid_of(KIND_DATASET_DIR, 0, (uint32_t)dsid), out);
+    }
+
+    case KIND_DATASET_DIR: {
+        if (!c->fs) return STM_ENOENT;
+        if (!str_eq(name, name_len,
+                     KIND_META[KIND_DATASET_PROPERTIES].static_name))
+            return STM_ENOENT;
+        uint64_t dsid = qid_dataset_id(dir_qid_path);
+        return stat_at(c, qid_of(KIND_DATASET_PROPERTIES, 0, (uint32_t)dsid),
+                        out);
+    }
+
     case KIND_VERSION:
     case KIND_STATE:
     case KIND_POOL_STATUS:
     case KIND_DEVICE_STATUS:
+    case KIND_DATASET_PROPERTIES:
     case KIND_MAX:
         break;
     }
@@ -833,7 +1024,15 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
         if (rc != STM_OK) return rc;
         rc = emit_entry(c, cb, cb_ctx, qid_root(KIND_STATE));
         if (rc != STM_OK) return rc;
-        return emit_entry(c, cb, cb_ctx, qid_root(KIND_POOLS_DIR));
+        rc = emit_entry(c, cb, cb_ctx, qid_root(KIND_POOLS_DIR));
+        if (rc != STM_OK) return rc;
+        /* /datasets/ is conditional on c->fs being attached. When
+         * unattached, the directory entry is omitted from the root
+         * listing — matches the /pools/ posture (it's listed even
+         * when c->pool is NULL because /pools/ as a directory is
+         * always-present, just empty; /datasets/ takes the same
+         * always-listed posture for symmetry). */
+        return emit_entry(c, cb, cb_ctx, qid_root(KIND_DATASETS_DIR));
 
     case KIND_POOLS_DIR:
         /* Enumerate registered pools. v2.0: at most one pool. */
@@ -879,10 +1078,54 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
             qid_of(KIND_DEVICE_STATUS, 0, did));
     }
 
+    case KIND_DATASETS_DIR: {
+        /* If no fs attached, the directory is empty. */
+        if (!c->fs) return STM_OK;
+        /* Collect ids via stm_fs_dataset_iter (which holds fs->lock
+         * for the duration), then emit_entry per id AFTER releasing
+         * the lock. emit_entry → stat_at → stm_fs_dataset_lookup
+         * re-acquires fs->lock; doing this from inside the iter
+         * callback would deadlock.
+         *
+         * R98 P2-1 lesson applied correctly: dataset_destroy IS
+         * supported, so dataset_count is NOT monotonic and ids
+         * are sparse. We can't iterate by id from 0 to count — must
+         * use the iter API.
+         *
+         * The window between collect and emit allows a destroy to
+         * happen, in which case stat_at returns STM_ENOENT for that
+         * id; we treat as "skip and continue" — REAL race-skip,
+         * unlike /pools/devices/ where the equivalent is dead code. */
+        uint64_t collected[STM_CTL_DATASET_LIST_CAP];
+        size_t n_collected = 0;
+        ds_collect_ctx collect_ctx = {
+            .out = collected,
+            .n = &n_collected,
+            .cap = STM_CTL_DATASET_LIST_CAP,
+        };
+        rc = stm_fs_dataset_iter(c->fs, ds_collect_cb, &collect_ctx);
+        if (rc != STM_OK) return rc;
+        for (size_t i = 0; i < n_collected; i++) {
+            stm_status erc = emit_entry(c, cb, cb_ctx,
+                qid_of(KIND_DATASET_DIR, 0, (uint32_t)collected[i]));
+            if (erc == STM_ENOENT) continue;   /* destroyed mid-readdir */
+            if (erc != STM_OK) return erc;
+        }
+        return STM_OK;
+    }
+
+    case KIND_DATASET_DIR: {
+        if (!c->fs) return STM_ENOENT;
+        uint64_t dsid = qid_dataset_id(dir_qid_path);
+        return emit_entry(c, cb, cb_ctx,
+            qid_of(KIND_DATASET_PROPERTIES, 0, (uint32_t)dsid));
+    }
+
     case KIND_VERSION:
     case KIND_STATE:
     case KIND_POOL_STATUS:
     case KIND_DEVICE_STATUS:
+    case KIND_DATASET_PROPERTIES:
     case KIND_MAX:
         break;
     }
@@ -914,12 +1157,26 @@ static stm_status vops_open(void *ctx, uint32_t fid, uint64_t qid_path,
             stm_pool_unlock_shared(c->pool);
             if (did >= total) return STM_ENOENT;
         }
+        /* /datasets/ is always-open (matches /pools/ posture); only
+         * the per-dataset kinds require fs. */
+        if (k == KIND_DATASET_DIR && !c->fs)
+            return STM_ENOENT;
+        if (k == KIND_DATASET_DIR) {
+            /* Dataset must still be PRESENT (could have been
+             * destroyed between Twalk and Topen). R98 P2-1 lesson:
+             * this is a REAL race-skip, not dead defense. */
+            uint64_t dsid = qid_dataset_id(qid_path);
+            stm_dataset_entry tmp;
+            stm_status drc = stm_fs_dataset_lookup(c->fs, dsid, &tmp);
+            if (drc != STM_OK) return drc;
+        }
         return STM_OK;
     }
 
     /* File kinds: validate context, materialize body. */
     if ((k == KIND_POOL_STATUS || k == KIND_DEVICE_STATUS) && !c->pool)
         return STM_ENOENT;
+    if ((k == KIND_DATASET_PROPERTIES) && !c->fs) return STM_ENOENT;
 
     pthread_mutex_lock(&c->mu);
     ctl_session *s = session_alloc_locked(c, fid, qid_path);

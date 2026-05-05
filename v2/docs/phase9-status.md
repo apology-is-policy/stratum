@@ -330,9 +330,47 @@ language bindings, future kernel module) is a 9P consumer.
             25 → 30 (steady at 30 — R98 strengthens existing
             assertions rather than adding new tests).
 
-      - [ ] **P9-CTL-1c /datasets/** — pending; per-dataset
-            properties + stats + snapshot list + create/rollback
-            triggers.
+      - [x] **P9-CTL-1c /datasets/ read paths** — substantive
+            complete. Adds three new kinds (KIND_DATASETS_DIR,
+            KIND_DATASET_DIR, KIND_DATASET_PROPERTIES); KIND_MAX
+            = 12. New stm_fs read-side wrappers in fs.c +
+            include/stratum/fs.h:
+            ```
+            stm_fs_dataset_lookup(fs, id, *out)
+            stm_fs_dataset_count(fs, *out_count)
+            stm_fs_dataset_iter(fs, cb, ctx)
+            ```
+            All take fs->lock for the duration of the dispatch
+            (READ-guarded — STM_EWEDGED if wedged). The iter
+            callback runs WITH fs->lock held — must not call back
+            into stm_fs_*. Layout:
+            ```
+            /datasets/                  directory: registered datasets
+            /datasets/<id>/             directory: per-dataset
+            /datasets/<id>/properties   read: per-dataset record
+            ```
+            Per-dataset properties surface combines
+            stm_dataset_entry metadata (id, name, parent_id,
+            created_txg, next_ino, origin_snap_id, flags) with
+            the five user-settable properties resolved via
+            stm_fs_effective_dataset_property (compression,
+            quota, encryption, tiering, promote_decay_window).
+            Strict canonical decimal dataset-id parser (rejects
+            leading zeros + > STM_SYNC_DATASET_ID_MAX = 0x0FFFFFFF
+            + len > 10). New `qid_dataset_id` extractor (alias
+            for low 32 bits, typed uint64).
+            **R98 P2-1 lesson applied correctly**: dataset_destroy
+            IS supported, ids are sparse — readdir uses
+            stm_fs_dataset_iter (collects ids, emits OUTSIDE the
+            lock); the `if (rc == STM_ENOENT) continue` skip
+            during emit IS load-bearing for the real
+            dataset-destroyed-mid-readdir race.
+            Snapshots subtree (/datasets/<id>/snapshots/) +
+            stats (/datasets/<id>/stats) + create-snapshot /
+            rollback action triggers deferred to subsequent
+            sub-chunks.
+            6 new tests in `tests/test_ctl.c`; ctest 30 → 36 in
+            test_ctl. R99 audit pending.
       - [ ] **P9-CTL-1d /tracing/, /debug/, /events** — pending;
             tracing toggle, debug dumps, event log.
       - [ ] **P9-CTL-1e /metrics/** — pending; Prometheus +

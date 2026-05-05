@@ -1357,6 +1357,35 @@ stm_status stm_fs_set_dataset_pool_default(stm_fs *fs, stm_property prop,
                                               uint64_t value);
 
 /*
+ * P9-CTL-1c: read-side enumeration / lookup wrappers for /ctl/datasets/
+ * and similar consumers. Take fs->lock for the duration of the
+ * dispatch (READ-guarded — STM_EWEDGED if wedged; STM_EROFS does NOT
+ * apply). The iter callback runs WITH fs->lock held — must not call
+ * any stm_fs_* API back (would deadlock).
+ *
+ * `stm_fs_dataset_lookup`: copies the entry into `*out` on success.
+ * STM_ENOENT if dataset_id is not PRESENT.
+ *
+ * `stm_fs_dataset_count`: counts PRESENT datasets; never includes
+ * destroyed slots.
+ *
+ * `stm_fs_dataset_iter`: invokes `cb(entry, ctx)` for every PRESENT
+ * dataset in increasing-id order. cb returning false terminates
+ * iteration early; cb's return is propagated as STM_OK. ids may be
+ * sparse — use this rather than a count-and-iterate-by-id loop, since
+ * stm_dataset_destroy creates gaps.
+ */
+STM_MUST_USE
+stm_status stm_fs_dataset_lookup(stm_fs *fs, uint64_t dataset_id,
+                                    stm_dataset_entry *out);
+
+STM_MUST_USE
+stm_status stm_fs_dataset_count(stm_fs *fs, size_t *out_count);
+
+STM_MUST_USE
+stm_status stm_fs_dataset_iter(stm_fs *fs, stm_dataset_iter_cb cb, void *ctx);
+
+/*
  * P7-16: stm_fs_reflink — POSIX-shape FICLONE. Replaces dst's empty
  * extent tree with a reflink-share of src's extent tree. Same
  * semantics as `ioctl(fd_dst, FICLONE, fd_src)` for a freshly-created

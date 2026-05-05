@@ -4166,6 +4166,73 @@ stm_status stm_fs_effective_dataset_property(stm_fs *fs, uint64_t dataset_id,
     return s;
 }
 
+/* P9-CTL-1c read-side wrappers: /ctl/datasets/ and similar consumers
+ * need to enumerate, look up, and count datasets without piercing
+ * fs's encapsulation via the test-only fs_testing.h chain.
+ *
+ * Lock posture: each wrapper takes fs->lock for the duration of the
+ * dataset call. For stm_fs_dataset_iter, the user-supplied callback
+ * runs WITH fs->lock held — the callback MUST NOT call back into
+ * any stm_fs_* API (would deadlock). Typical usage (the /ctl/
+ * readdir builder) only formats the entry into a buffer and emits
+ * dirents, which is safe. */
+stm_status stm_fs_dataset_lookup(stm_fs *fs, uint64_t dataset_id,
+                                    stm_dataset_entry *out)
+{
+    if (out) memset(out, 0, sizeof *out);
+    if (!fs || !out) return STM_EINVAL;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_READ(fs);
+
+    stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
+    if (!didx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_ECORRUPT;
+    }
+
+    stm_status s = stm_dataset_lookup(didx, dataset_id, out);
+    pthread_mutex_unlock(&fs->lock);
+    return s;
+}
+
+stm_status stm_fs_dataset_count(stm_fs *fs, size_t *out_count)
+{
+    if (out_count) *out_count = 0;
+    if (!fs || !out_count) return STM_EINVAL;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_READ(fs);
+
+    stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
+    if (!didx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_ECORRUPT;
+    }
+
+    stm_status s = stm_dataset_count(didx, out_count);
+    pthread_mutex_unlock(&fs->lock);
+    return s;
+}
+
+stm_status stm_fs_dataset_iter(stm_fs *fs, stm_dataset_iter_cb cb, void *ctx)
+{
+    if (!fs || !cb) return STM_EINVAL;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_READ(fs);
+
+    stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
+    if (!didx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_ECORRUPT;
+    }
+
+    stm_status s = stm_dataset_iter(didx, cb, ctx);
+    pthread_mutex_unlock(&fs->lock);
+    return s;
+}
+
 stm_status stm_fs_set_dataset_pool_default(stm_fs *fs, stm_property prop,
                                               uint64_t value)
 {
