@@ -1497,7 +1497,10 @@ stm_status stm_fs_create_snapshot(stm_fs *fs, uint64_t dataset_id,
  * snapshot.h.
  *
  * Refusals propagated from stm_snapshot_delete:
- *   STM_EINVAL  — NULL fs; snapshot_id == 0; index unavailable
+ *   STM_EINVAL  — NULL fs; snapshot_id == 0
+ *   STM_ECORRUPT — snapshot index unavailable (sync layer corrupt;
+ *                  R106 P3-1 fix — docstring previously misclassified
+ *                  this case as STM_EINVAL)
  *   STM_ENOENT  — snapshot_id unknown / already-deleted
  *   STM_EBUSY   — hold_count > 0 OR clone-check cb reports a clone
  *

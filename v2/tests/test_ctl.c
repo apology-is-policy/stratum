@@ -4306,4 +4306,84 @@ STM_TEST(ctl_d7_delete_snapshot_readonly_erofs)
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
 
+/* R106 P3-3 close: exercise the dead-list reclaim path that the
+ * wrapper's reason-for-being is built around. Create a snap, write
+ * data that overwrites blocks (pushing dead-list entries to the
+ * snap), then delete the snap and assert out_freed_count > 0.
+ *
+ * Without this test, the per-device routing loop (stm_paddr_device
+ * → stm_sync_alloc → stm_alloc_free) is exercised only through the
+ * snapshot.c end-to-end test path, not directly through the new
+ * stm_fs_delete_snapshot wrapper. A future regression that broke
+ * the wrapper's loop (say, by mishandling cross-device paddrs) would
+ * not fire on the existing wrapper-empty-snap test. */
+STM_TEST(ctl_r106_p3_3_delete_snapshot_with_overwrites_reclaims)
+{
+    make_tmp("ctl_r106_overwrites");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Write some data to the root dataset. STM_DATASET_ROOT_ID = 1. */
+    uint8_t data[4096];
+    memset(data, 0xAA, sizeof data);
+    STM_ASSERT_OK(stm_fs_write(fs, /*ds=*/1, /*ino=*/2, /*off=*/0,
+                                  data, sizeof data));
+
+    /* Sync so the snap captures a clean gen. */
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    /* Create snap A. */
+    uint64_t snap_a = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "with_overwrites", 15,
+                                            &snap_a));
+
+    /* Sync so post-snap writes happen at strictly higher gen. */
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    /* Now overwrite — same offset, different content. Each overwrite
+     * pushes the prior block to snap_a's dead-list. */
+    memset(data, 0xBB, sizeof data);
+    STM_ASSERT_OK(stm_fs_write(fs, /*ds=*/1, /*ino=*/2, /*off=*/0,
+                                  data, sizeof data));
+    STM_ASSERT_OK(stm_fs_commit(fs));
+
+    /* Delete snap A — the wrapper routes the dead-list paddrs back
+     * through stm_alloc_free per-device. out_freed_count reflects
+     * the dead-list size. */
+    size_t freed = 0;
+    STM_ASSERT_OK(stm_fs_delete_snapshot(fs, snap_a, &freed));
+    /* At least one paddr in the dead-list (the overwritten block). */
+    STM_ASSERT(freed >= 1);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
+/* R106 P3-4 close: wedged fs refuses delete-snapshot via FS_GUARD_
+ * WRITE → STM_EWEDGED. Mirror of ctl_r105_p3_4_create_snapshot_
+ * wedged_ewedged. The FS_GUARD_WRITE macro is the trust boundary
+ * for every write-shape wrapper; this pin is symmetric. */
+STM_TEST(ctl_r106_p3_4_delete_snapshot_wedged_ewedged)
+{
+    make_tmp("ctl_r106_wedge");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Create a snap so we have a target — the wedge gate must fire
+     * BEFORE the snapshot-lookup, so even a valid snap_id refuses. */
+    uint64_t snap_id = setup_snapshot(fs, 1, "wedge_target");
+
+    stm_fs_mark_wedged(fs);
+
+    STM_ASSERT_EQ(stm_fs_delete_snapshot(fs, snap_id, NULL),
+                  STM_EWEDGED);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
 STM_TEST_MAIN("ctl")

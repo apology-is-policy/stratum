@@ -593,7 +593,18 @@ language bindings, future kernel module) is a 9P consumer.
                   ctl_d7_delete_snapshot_whitespace_only_einval,
                   ctl_d7_delete_snapshot_wrapper_boundaries,
                   ctl_d7_delete_snapshot_readonly_erofs.
-                  R106 audit pending.
+                  **R106 close** GREEN — 0 P0 + 0 P1 + 0 P2 + 4 P3
+                  (verdict MERGE), all addressed inline. P3-1 fs.h
+                  docstring corrected (STM_ECORRUPT not STM_EINVAL
+                  for "index unavailable"). P3-2 CLAUDE.md trigger
+                  row clause 4 expanded to explicitly call out the
+                  cold-hash buffer + STM_CAS_HASH_LEN stride
+                  discipline (future snapshot-mutation chunks
+                  inherit). P3-3 added regression test exercising
+                  the actual per-device routing loop (snap with
+                  overwrite-induced dead-list entries — out_freed_
+                  count >= 1). P3-4 added wedged-fs test mirror.
+                  test_ctl 108 → 110.
             - [ ] **P9-CTL-1d-actions-snapshot-rollback** — pending;
                   higher-risk (mutates working tree); requires
                   snapshot-rollback invariant analysis. Check

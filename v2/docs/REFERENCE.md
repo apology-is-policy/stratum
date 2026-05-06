@@ -38,9 +38,25 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9-CTL-1d-actions-snapshot-delete substantive (this
-  commit). 43 ctest suites green default. test_ctl 108/108 (was
-  99 at R105 close; +9 -1d-actions-snapshot-delete). **P9-CTL-1d-
+- **Tip**: P9-CTL-1d-actions-snapshot-delete R106 close (this
+  commit) — GREEN, 0 P0 + 0 P1 + 0 P2 + 4 P3 (verdict MERGE), all
+  addressed inline. 43 ctest suites green default. test_ctl 110/110
+  (was 99 at R105 close; +9 -1d-actions-snapshot-delete + 2 R106).
+  R106 close: P3-1 fs.h docstring corrected (STM_ECORRUPT not
+  STM_EINVAL for "index unavailable"); P3-2 CLAUDE.md trigger row
+  clause 4 expanded to explicitly call out cold-hash buffer + STM_
+  CAS_HASH_LEN-stride iteration discipline (future snapshot-mutation
+  chunks inherit); P3-3 added ctl_r106_p3_3_delete_snapshot_with_
+  overwrites_reclaims regression test that creates a snap, writes
+  overwriting blocks, deletes the snap, and asserts out_freed_count
+  >= 1 — exercises the per-device routing loop the wrapper's
+  reason-for-being is built around; P3-4 added ctl_r106_p3_4_delete_
+  snapshot_wedged_ewedged (FS_GUARD_WRITE → STM_EWEDGED, mirror of
+  R105 P3-4's create-snapshot test).
+
+- **Pre-tip-1**: P9-CTL-1d-actions-snapshot-delete substantive.
+  test_ctl 108/108 (was 99 at R105 close; +9 -1d-actions-snapshot-
+  delete). **P9-CTL-1d-
   actions-snapshot-delete** adds /datasets/<id>/delete-snapshot
   (admin-only mode 0200). KIND_MAX = 23 (was 22); single new kind
   KIND_DATASET_DELETE_SNAPSHOT. New public API stm_fs_delete_
