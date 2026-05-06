@@ -809,6 +809,27 @@ language bindings, future kernel module) is a 9P consumer.
       test_9p_client 12 → 13 (+1 R111 P0 regression). 44/44 ctest
       green.
 
+      **P9-LIB-1 cleanup (audit-light)** closes 4 of 5 R111 P3
+      forward-notes uniformly. F-6: stm_9p_read with NULL buf +
+      count > 0 silently-discarded data pre-fix; now returns
+      STM_EINVAL. F-9: last_errno reset on every successful
+      round-trip. F-10: strict body-len equality on Rclunk +
+      Rwalk (was lax `<`, now `!=`). F-11: connection-poisoned
+      flag enforced — every public op checks c->poisoned at
+      entry; tag-mismatch reply sets the flag in check_reply;
+      subsequent ops refuse with STM_EBACKEND without ever
+      reaching the wire. New static helper op_entry_check used
+      by all 6 public ops. F-8 (timeouts) stays forward-noted to
+      P9-LIB-2 async API. Two new regression tests:
+      `p9_client_read_null_buf_with_count_einval` (F-6) +
+      `p9_client_tag_mismatch_poisons_subsequent_ops_refused`
+      (F-11; uses hand-rolled mock server replying to Tclunk
+      with WRONG tag 0xDEAD, asserts subsequent walk/getattr/
+      clunk all refuse with STM_EBACKEND). Header trust-boundary
+      doctrine extended (clauses 4-6) documenting the caller-
+      cap bound, poison flag, and strict body-len equality.
+      test_9p_client 13 → 15.
+
 - [ ] **P9-LIB-2 libstratum-9p async API** — pending.
 
 - [ ] **P9-BIND-1/2/3 language bindings** — pending; Rust crate

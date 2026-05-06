@@ -62,6 +62,21 @@
  *      STM_EOVERFLOW since synchronous send/recv can't disambiguate
  *      a wrap-collision from a stale reply. Callers wanting more
  *      than 64K ops per client must reconnect.
+ *   4. Caller-cap bound: every server-supplied count field used as
+ *      a write target into a caller buffer is bounded against the
+ *      caller-supplied cap BEFORE the write. R111 P0 F-1 lesson:
+ *      wire-side body_len validation alone is insufficient;
+ *      out-of-spec server replies (e.g. Rwalk(nwqid=99) on a
+ *      Twalk(n_names=2)) would OOB-write attacker-controlled data
+ *      into the caller's buffer.
+ *   5. Connection-poisoned flag (R111 P3 F-11 cleanup): tag-mismatch
+ *      replies poison the client. Once poisoned, EVERY public op
+ *      short-circuits to STM_EBACKEND at entry. Caller MUST close
+ *      the client and reconnect — the lib cannot recover state.
+ *   6. Strict body-length equality (R111 P3 F-10 cleanup): Rclunk
+ *      and Rwalk parsers refuse extra trailing bytes (was lax `<`,
+ *      now `!=`) — defends against a future server bug emitting
+ *      hidden extra payload that could mask a real shape change.
  */
 #ifndef STRATUM_V2_9P_CLIENT_H
 #define STRATUM_V2_9P_CLIENT_H

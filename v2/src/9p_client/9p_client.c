@@ -118,6 +118,14 @@ struct stm_9p_client {
     uint32_t  iounit;         /* msize - hdr - 4 */
     uint16_t  next_tag;       /* monotonic counter; 0 reserved by spec */
     int       last_errno;
+    /* P9-LIB-1 cleanup R111 F-11: connection-poisoned flag. Set by
+     * check_reply on any tag-mismatch reply (the lib can no longer
+     * match replies to requests; subsequent ops would see arbitrary
+     * stale replies). Once set, every public op short-circuits to
+     * STM_EBACKEND so callers see consistent behavior + know to
+     * close + reconnect. The doctrine was previously informational-
+     * only in the doc; the flag enforces it. */
+    int       poisoned;
     /* Per-op scratch buffer sized to msize. Allocated at dial-time so
      * each op doesn't malloc/free. */
     uint8_t  *buf;
@@ -198,6 +206,16 @@ static stm_status send_msg(stm_9p_client *c, uint32_t msg_len)
     return send_all(c, c->buf, msg_len);
 }
 
+/* R111 P3 F-11 (cleanup): every public op checks for poison BEFORE
+ * any send/recv. Returns STM_EBACKEND if the client has been poisoned
+ * by a prior tag-mismatch reply. */
+static stm_status op_entry_check(stm_9p_client *c)
+{
+    if (!c) return STM_EINVAL;
+    if (c->poisoned) return STM_EBACKEND;
+    return STM_OK;
+}
+
 /* ────────────────────────────────────────────────────────────────────── */
 /* Tag allocation.                                                        */
 /* ────────────────────────────────────────────────────────────────────── */
@@ -227,6 +245,16 @@ static stm_status check_reply(stm_9p_client *c, uint32_t msg_size,
     uint16_t tag  = g_u16(c->buf + 5);
     if (tag != expected_tag) {
         c->last_errno = EPROTO;
+        /* R111 P3 F-11 (cleanup): tag-mismatch poisons the client.
+         * Once we've seen a reply that didn't match our request's
+         * tag, subsequent recvs read arbitrary stale replies — the
+         * lib cannot recover. Setting poisoned=1 makes every
+         * future public op short-circuit at the entry guard
+         * (op_entry_check) so callers see uniform STM_EBACKEND
+         * + know to stm_9p_close + reconnect. Without the flag,
+         * a paranoid caller had to remember to close the client
+         * after one tag-mismatch — easy to forget. */
+        c->poisoned = 1;
         return STM_EBACKEND;
     }
     if (type == STM_9P_RLERROR) {
@@ -235,12 +263,22 @@ static stm_status check_reply(stm_9p_client *c, uint32_t msg_size,
             return STM_EBACKEND;
         }
         uint32_t ecode = g_u32(c->buf + 7);
+        /* R111 P3 F-9 (cleanup): reset last_errno on a successful
+         * round-trip — including Rlerror, which IS a valid server
+         * reply (the err_map result is the operation's status, not
+         * a transport-level errno). The errno field is for OS-level
+         * diagnostics on STM_EIO, not protocol-level errors. */
+        c->last_errno = 0;
         return err_map(ecode);
     }
     if (type != expected_type) {
         c->last_errno = EPROTO;
         return STM_EBACKEND;
     }
+    /* R111 P3 F-9 (cleanup): clear last_errno on successful reply
+     * so callers don't see stale OS errno from a prior failed op
+     * surviving across a successful one. */
+    c->last_errno = 0;
     *out_body     = c->buf + STM_9P_HDR_SIZE;
     *out_body_len = msg_size - STM_9P_HDR_SIZE;
     return STM_OK;
@@ -469,7 +507,8 @@ stm_status stm_9p_walk(stm_9p_client *c,
                           stm_9p_qid *out_qids, uint16_t *out_walked)
 {
     if (out_walked) *out_walked = 0;
-    if (!c) return STM_EINVAL;
+    stm_status ec = op_entry_check(c);
+    if (ec != STM_OK) return ec;
     if (n_names > STM_9P_MAX_WALK) return STM_EINVAL;
     if (n_names > 0 && !names) return STM_EINVAL;
 
@@ -516,7 +555,13 @@ stm_status stm_9p_walk(stm_9p_client *c,
         return STM_EBACKEND;
     }
     uint16_t nwqid = g_u16(body);
-    if (body_len < 2u + (uint32_t)nwqid * STM_9P_QID_SIZE) {
+    /* R111 P3 F-10 (cleanup): strict body-length equality on Rwalk
+     * — server MUST send exactly 2 (nwqid) + nwqid * 13 (qids)
+     * bytes; extra trailing bytes are a protocol violation, not
+     * silent padding. Was `<` (lax); now `!=` (strict). Defends
+     * against a future server bug emitting hidden extra bytes
+     * that mask a real shape change. */
+    if (body_len != 2u + (uint32_t)nwqid * STM_9P_QID_SIZE) {
         c->last_errno = EPROTO;
         return STM_EBACKEND;
     }
@@ -555,7 +600,8 @@ stm_status stm_9p_walk(stm_9p_client *c,
 stm_status stm_9p_lopen(stm_9p_client *c, uint32_t fid, uint32_t flags,
                            stm_9p_qid *out_qid, uint32_t *out_iounit)
 {
-    if (!c) return STM_EINVAL;
+    stm_status ec = op_entry_check(c);
+    if (ec != STM_OK) return ec;
     uint32_t msg_size = STM_9P_HDR_SIZE + 4u + 4u;
     if (msg_size > c->buf_cap) return STM_ERANGE;
     uint16_t tag = 0;
@@ -599,7 +645,14 @@ stm_status stm_9p_read(stm_9p_client *c, uint32_t fid, uint64_t offset,
                           void *buf, uint32_t count, uint32_t *out_count)
 {
     if (out_count) *out_count = 0;
-    if (!c) return STM_EINVAL;
+    stm_status ec = op_entry_check(c);
+    if (ec != STM_OK) return ec;
+    /* R111 P3 F-6 (cleanup): NULL buf with count > 0 silently
+     * discarded data pre-fix. Refuse explicitly — no caller can
+     * reasonably want a Tread that throws away bytes. count == 0
+     * with NULL buf is a legitimate "test the fid is open"
+     * shape (no data wanted), so allow that path. */
+    if (count > 0 && !buf) return STM_EINVAL;
     if (count == 0) {
         if (out_count) *out_count = 0;
         return STM_OK;
@@ -655,7 +708,8 @@ stm_status stm_9p_read(stm_9p_client *c, uint32_t fid, uint64_t offset,
 
 stm_status stm_9p_clunk(stm_9p_client *c, uint32_t fid)
 {
-    if (!c) return STM_EINVAL;
+    stm_status ec = op_entry_check(c);
+    if (ec != STM_OK) return ec;
     uint32_t msg_size = STM_9P_HDR_SIZE + 4u;
     if (msg_size > c->buf_cap) return STM_ERANGE;
     uint16_t tag = 0;
@@ -674,9 +728,16 @@ stm_status stm_9p_clunk(stm_9p_client *c, uint32_t fid)
     const uint8_t *body = NULL;
     uint32_t body_len = 0;
     rc = check_reply(c, reply_size, STM_9P_RCLUNK, tag, &body, &body_len);
-    /* Rclunk has no body — body_len == 0 expected. */
-    (void)body; (void)body_len;
-    return rc;
+    if (rc != STM_OK) return rc;
+    /* R111 P3 F-10 (cleanup): Rclunk has NO body per the .L spec —
+     * strict equality refuses any trailing bytes (defends against
+     * future server bug emitting hidden extra payload). */
+    if (body_len != 0u) {
+        c->last_errno = EPROTO;
+        return STM_EBACKEND;
+    }
+    (void)body;
+    return STM_OK;
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -686,7 +747,9 @@ stm_status stm_9p_clunk(stm_9p_client *c, uint32_t fid)
 stm_status stm_9p_getattr(stm_9p_client *c, uint32_t fid,
                              uint64_t request_mask, stm_9p_attr *out)
 {
-    if (!c || !out) return STM_EINVAL;
+    stm_status ec = op_entry_check(c);
+    if (ec != STM_OK) return ec;
+    if (!out) return STM_EINVAL;
     uint32_t msg_size = STM_9P_HDR_SIZE + 4u + 8u;
     if (msg_size > c->buf_cap) return STM_ERANGE;
     uint16_t tag = 0;
@@ -754,7 +817,9 @@ stm_status stm_9p_readdir(stm_9p_client *c, uint32_t fid,
 {
     if (out_entries)     *out_entries = 0;
     if (out_next_offset) *out_next_offset = offset;
-    if (!c || !cb) return STM_EINVAL;
+    stm_status ec = op_entry_check(c);
+    if (ec != STM_OK) return ec;
+    if (!cb) return STM_EINVAL;
     if (count == 0 || count > c->iounit) count = c->iounit;
 
     uint32_t msg_size = STM_9P_HDR_SIZE + 4u + 8u + 4u;

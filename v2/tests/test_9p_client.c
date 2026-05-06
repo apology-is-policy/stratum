@@ -720,4 +720,156 @@ STM_TEST(p9_client_walk_malicious_nwqid_refused_no_oob)
     (void)unlink(g_sock_path);
 }
 
+/* R111 P3 F-6 (cleanup): stm_9p_read with NULL buf + count > 0 is
+ * silently-discarded data pre-fix; post-fix returns STM_EINVAL.
+ * NULL buf with count == 0 stays valid ("test the fid" shape). */
+STM_TEST(p9_client_read_null_buf_with_count_einval)
+{
+    client_fixture f = make_client_fixture("read_null_buf");
+
+    static const uint8_t NAME[] = "f";
+    static const uint8_t DATA[] = "hi";
+    uint64_t file_ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(f.fs, /*ds=*/1u, f.root_ino,
+                                       NAME, (uint8_t)(sizeof NAME - 1),
+                                       /*mode=*/0644u, 0, 0, &file_ino));
+    STM_ASSERT_OK(stm_fs_write(f.fs, /*ds=*/1u, file_ino,
+                                  0, DATA, sizeof DATA - 1));
+    STM_ASSERT_OK(stm_fs_commit(f.fs));
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    const char *names[] = { (const char *)NAME };
+    stm_9p_qid qids[1];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 1, names, qids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 101, STM_9P_O_RDONLY, NULL, NULL));
+
+    /* NULL buf with count > 0 → STM_EINVAL. */
+    uint32_t got = 0xFFFFFFFF;
+    STM_ASSERT_EQ(stm_9p_read(c, 101, 0, NULL, 100, &got), STM_EINVAL);
+    /* out_count zeroed defensively. */
+    STM_ASSERT_EQ(got, 0u);
+
+    /* NULL buf with count == 0 → STM_OK (no data wanted). */
+    got = 0xFFFFFFFF;
+    STM_ASSERT_OK(stm_9p_read(c, 101, 0, NULL, 0, &got));
+    STM_ASSERT_EQ(got, 0u);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* R111 P3 F-11 (cleanup): connection-poisoned flag. After a
+ * tag-mismatch reply, the lib MUST refuse subsequent ops with
+ * STM_EBACKEND so callers see uniform "this client is unusable"
+ * behavior. Pre-fix: the doc claimed this posture but the flag
+ * wasn't enforced; a paranoid caller had to remember to close +
+ * reconnect after every tag-mismatch. */
+typedef struct {
+    int       listen_fd;
+    int       run_status;
+} mock_poison_ctx;
+
+static void *mock_poison_thread(void *arg)
+{
+    mock_poison_ctx *ctx = (mock_poison_ctx *)arg;
+    int cfd = accept(ctx->listen_fd, NULL, NULL);
+    if (cfd < 0) { ctx->run_status = -1; return NULL; }
+
+    uint8_t buf[8192];
+    uint32_t size = 0;
+
+    /* Tversion: valid Rversion. */
+    if (mock_recv_msg(cfd, buf, sizeof buf, &size) != 0) goto fail;
+    if (buf[4] != STM_9P_TVERSION) goto fail;
+    uint32_t cmsize = (uint32_t)buf[7] | ((uint32_t)buf[8] << 8)
+                    | ((uint32_t)buf[9] << 16) | ((uint32_t)buf[10] << 24);
+    uint8_t  resp[64];
+    uint32_t rsz = 7u + 4u + 2u + 8u;
+    mock_pack_u32(resp, rsz);
+    resp[4] = STM_9P_RVERSION;
+    mock_pack_u16(resp + 5, STM_9P_NOTAG);
+    mock_pack_u32(resp + 7, cmsize);
+    mock_pack_u16(resp + 11, 8);
+    memcpy(resp + 13, "9P2000.L", 8);
+    if (mock_send_msg(cfd, resp, rsz) != 0) goto fail;
+
+    /* Tattach: valid Rattach. */
+    if (mock_recv_msg(cfd, buf, sizeof buf, &size) != 0) goto fail;
+    if (buf[4] != STM_9P_TATTACH) goto fail;
+    uint16_t att_tag = (uint16_t)((uint16_t)buf[5] | ((uint16_t)buf[6] << 8));
+    rsz = 7u + 13u;
+    mock_pack_u32(resp, rsz);
+    resp[4] = STM_9P_RATTACH;
+    mock_pack_u16(resp + 5, att_tag);
+    memset(resp + 7, 0, 13);
+    if (mock_send_msg(cfd, resp, rsz) != 0) goto fail;
+
+    /* Tclunk: reply with a WRONG TAG (att_tag - 1) — triggers
+     * the tag-mismatch poison path. */
+    if (mock_recv_msg(cfd, buf, sizeof buf, &size) != 0) goto fail;
+    if (buf[4] != STM_9P_TCLUNK) goto fail;
+    rsz = 7u + 4u;
+    mock_pack_u32(resp, rsz);
+    resp[4] = STM_9P_RLERROR;
+    mock_pack_u16(resp + 5, 0xDEAD);    /* deliberately wrong */
+    mock_pack_u32(resp + 7, 5);          /* EIO */
+    if (mock_send_msg(cfd, resp, rsz) != 0) goto fail;
+
+    /* The lib should now be poisoned; subsequent ops should not
+     * even reach us. Wait briefly then exit. */
+    struct timespec ts = { 0, 100 * 1000 * 1000 };
+    nanosleep(&ts, NULL);
+    ctx->run_status = 0;
+    close(cfd);
+    return NULL;
+fail:
+    ctx->run_status = -1;
+    close(cfd);
+    return NULL;
+}
+
+STM_TEST(p9_client_tag_mismatch_poisons_subsequent_ops_refused)
+{
+    build_sock_path("poison");
+    int listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600);
+    STM_ASSERT_TRUE(listen_fd >= 0);
+
+    mock_poison_ctx ctx = { .listen_fd = listen_fd, .run_status = -1 };
+    pthread_t worker;
+    STM_ASSERT_EQ(pthread_create(&worker, NULL, mock_poison_thread, &ctx), 0);
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    /* Tclunk replies with wrong tag → STM_EBACKEND + poison. */
+    STM_ASSERT_EQ(stm_9p_clunk(c, 100), STM_EBACKEND);
+
+    /* Subsequent ops MUST refuse with STM_EBACKEND — the entry
+     * guard fires before any send. The mock server never sees
+     * these requests. */
+    STM_ASSERT_EQ(stm_9p_clunk(c, 100), STM_EBACKEND);
+
+    stm_9p_qid qids[1];
+    uint16_t walked = 0;
+    const char *names[] = { "x" };
+    STM_ASSERT_EQ(stm_9p_walk(c, 100, 101, 1, names, qids, &walked),
+                    STM_EBACKEND);
+
+    stm_9p_attr attr;
+    STM_ASSERT_EQ(stm_9p_getattr(c, 100, STM_9P_GETATTR_BASIC, &attr),
+                    STM_EBACKEND);
+
+    stm_9p_close(c);
+    pthread_join(worker, NULL);
+    close(listen_fd);
+    (void)unlink(g_sock_path);
+}
+
 STM_TEST_MAIN("9p_client")

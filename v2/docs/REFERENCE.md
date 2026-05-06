@@ -38,7 +38,33 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9-LIB-1 R111 audit close (this commit). 44 ctest suites
+- **Tip**: P9-LIB-1 cleanup chunk (this commit). 44 ctest suites
+  green. test_9p_client 13 → 15 (+1 F-6 regression + 1 F-11
+  poison-flag regression). **P9-LIB-1 cleanup** (audit-light, R111
+  doctrine carry) closes 4 of 5 P3 forward-notes from R111
+  uniformly. **F-6** stm_9p_read with NULL buf + count > 0 was
+  silently-discarded data; now refuses with STM_EINVAL.
+  Regression: `p9_client_read_null_buf_with_count_einval`.
+  **F-9** last_errno is now reset on every successful round-trip
+  (clears stale OS errno across calls). **F-10** strict body-len
+  equality on Rclunk + Rwalk (was lax `<` allowing extra trailing
+  bytes; now `!=` refuses with STM_EBACKEND). Defends against a
+  future server bug emitting hidden extra payload that masks a
+  real shape change. **F-11** connection-poisoned flag enforced:
+  every public op checks `c->poisoned` at entry; tag-mismatch
+  reply sets the flag in check_reply; subsequent ops refuse with
+  STM_EBACKEND. Pre-fix the doctrine was informational-only; now
+  the flag is load-bearing. New static helper `op_entry_check`
+  used by stm_9p_walk / lopen / read / clunk / getattr / readdir.
+  Regression: `p9_client_tag_mismatch_poisons_subsequent_ops_
+  refused` — uses a hand-rolled mock server that replies to
+  Tclunk with WRONG tag (0xDEAD), then asserts subsequent
+  walk/getattr/clunk all refuse with STM_EBACKEND without ever
+  reaching the server. **F-8** stays forward-noted (timeouts
+  belong to P9-LIB-2 async API which has io_uring transport with
+  timer fds).
+
+- **Pre-tip-1**: P9-LIB-1 R111 audit close. 44 ctest suites
   green default. test_9p_client 13/13 (was 12; +1 R111 P0 F-1
   regression test). **R111 close** RED → YELLOW MERGE: 1 P0 + 0 P1 +
   3 P2 + 7 P3, all P0/P2 addressed inline + 4 P3 polish addressed +
