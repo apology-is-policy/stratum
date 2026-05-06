@@ -38,7 +38,21 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9-TUI-2a stratum-tui v2 wholesale lift (this commit). 45
+- **Tip**: stratum-mkfs CLI (this commit). New artifact: `stratum-mkfs`
+  binary at `v2/src/cmd/stratum-mkfs/`. Wraps `stm_fs_format` +
+  initial dataset-root setup so users can `stratum-mkfs vol.stm` and
+  immediately point stratumd at the resulting image. Defaults: 64 MiB
+  device, 16 MiB bootstrap pool, auto-generated PQ-hybrid keyfile at
+  `<image>.key` (or use existing one via `--keyfile PATH`). Auto-
+  initialises dataset id=1 with a single root inode (mode 0755,
+  uid/gid 0) — matches stratumd's `--root-dataset 1` default. Volume
+  identity: pool/device UUIDs derived from time+pid (good enough for
+  v1.0; cryptographic random UUIDs are a v1.1 forward-note). 45 ctest
+  suites green (mkfs is a thin wrapper, no new test target). End-to-
+  end roundtrip verified manually: `mkfs → stratumd serve → stratum-fs
+  ls/mkdir/write/read` all succeed.
+
+- **Pre-tip-1**: P9-TUI-2a stratum-tui v2 wholesale lift. 45
   ctest suites green (TUI is Rust crate; not in ctest). New artifact:
   `stratum-tui` binary at `v2/tui/`. ratatui chrome (FAR
   Commander-style dual-pane file manager + inline editor) lifted
