@@ -1,0 +1,23 @@
+[package]
+name = "stratum-tui"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# v2 stratum-tui: FAR Commander-style dual-pane file manager + editor
+# for stratum, lifted wholesale from v1's TUI (tui/) with the 9P client
+# rewired to libstratum-9p (9P2000.L). v1.0 ships with the FS surface
+# working end-to-end against a running stratumd; admin views (snapshot,
+# pool, scrub, /events) ship in v1.1 once /ctl/-on-stratumd lands.
+
+[dependencies]
+ratatui  = "0.29"
+crossterm = "0.28"
+anyhow = "1"
+dirs = "6"
+libc = "0.2"
+tui-textarea = "0.7"
+
+[[bin]]
+name = "stratum-tui"
+path = "src/main.rs"

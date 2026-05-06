@@ -38,7 +38,35 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9-CLI-1 FS-only stratum-fs CLI (this commit). 45 ctest
+- **Tip**: P9-TUI-2a stratum-tui v2 wholesale lift (this commit). 45
+  ctest suites green (TUI is Rust crate; not in ctest). New artifact:
+  `stratum-tui` binary at `v2/tui/`. ratatui chrome (FAR
+  Commander-style dual-pane file manager + inline editor) lifted
+  verbatim from v1's TUI; the 9P client (which spoke 9P2000) replaced
+  by a libstratum-9p (.L) FFI shim that preserves v1's `P9Client`
+  surface — `connect_unix`, `walk`, `open`, `create`, `read`,
+  `write_data`, `clunk`, `stat`, `readdir`, `remove`. The shim
+  absorbs two friction points: (1) v2 .L has no Tremove-by-fid, so
+  the shim tracks each fid's walk-path and synthesises
+  parent-walk + Tunlinkat on `remove(fid)` (auto-detects directory
+  via Tgetattr for AT_REMOVEDIR); (2) v2 .L splits readdir + getattr,
+  so the shim does per-entry Tgetattr to fill v1's stat-shaped
+  results — costs N RTTs per readdir, OK for panels under a few
+  hundred entries (forward-noted: bulk-stat extension for v1.1).
+  v2-specific deferrals: TCP transport stubbed (Unix socket only at
+  v1.0); subprocess-spawned stratumd model dropped (TUI dials a
+  pre-running daemon); MkVolume dialog UI lifted but action errors
+  (no `stratum mkfs` CLI yet); snapshot ops lifted but error pending
+  P9-CTL-2 (`/ctl/-on-stratumd`); `cli` subcommand replaced by a
+  redirect to `stratum-fs`. Build: standalone cargo crate at
+  `v2/tui/` with `build.rs` discovering the cmake build dir
+  (`STM_BUILD_DIR` env or `../build` fallback). Design captured at
+  `docs/TUI-DESIGN.md`. Phased plan: this is -2a (lift + shim +
+  file-side ops); P9-CTL-2 migrates `/ctl/` to .L + wires it on
+  stratumd; -2b replaces dialog action handlers with /ctl/ reads
+  and writes for the full admin surface.
+
+- **Pre-tip-1**: P9-CLI-1 FS-only stratum-fs CLI. 45 ctest
   suites green (was 44; +test_stratum_fs). test_stratum_fs 0 → 15
   integration tests. New artifact: `stratum-fs` binary at
   `v2/src/cmd/stratum-fs/`. Plan-9-shaped subcommand dispatcher

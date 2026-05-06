@@ -739,6 +739,39 @@ language bindings, future kernel module) is a 9P consumer.
       pending; thread-pool dispatcher; performance tuning per
       ROADMAP §11.3 medium-risk note.
 
+- [~] **P9-TUI-2a stratum-tui v2 wholesale lift** — partial.
+      Cargo crate at `v2/tui/`. v1's ratatui chrome (ui.rs /
+      panel.rs / app.rs / editor.rs / hostfs.rs / config.rs) lifted
+      verbatim; new `p9.rs` is a libstratum-9p (.L) FFI shim
+      preserving v1's `P9Client` API surface. Two friction points
+      absorbed: (1) Tremove-by-fid → walk-path tracking +
+      synthesised Tunlinkat; (2) bulk readdir → per-entry Tgetattr
+      to fill v1's stat-shaped results (forward-noted: bulk-stat
+      extension for v1.1). v2-specific deferrals: TCP transport
+      stubbed; subprocess-spawned stratumd dropped (TUI dials a
+      running daemon); MkVolume dialog errors (no mkfs CLI);
+      snapshot ops error pending P9-CTL-2; `cli` subcommand
+      redirects to `stratum-fs`. Build: standalone cargo with
+      `build.rs` discovering cmake build dir. Design captured at
+      `docs/TUI-DESIGN.md`. The chrome is reachable today — file
+      browse / view / edit / copy / move / delete / mkdir over a
+      running stratumd Unix socket. Admin surfaces (snapshot, pool,
+      dataset, scrub, /events) blocked on -2b after P9-CTL-2.
+
+- [ ] **P9-CTL-2 /ctl/-on-stratumd over .L** — pending; gates
+      P9-TUI-2b admin surfaces. Two pieces: (1) migrate `v2/src/ctl/`
+      codec from 9P2000 (current) to 9P2000.L; (2) wire `/ctl/` as a
+      second listener in `stratumd` (or aname-routed on the same
+      socket, TBD). Architectural decision per ARCH §10.2 ".L
+      baseline" commitment — the lib stays .L-only, /ctl/ moves
+      to .L.
+
+- [ ] **P9-TUI-2b admin surfaces** — pending; depends on P9-CTL-2.
+      Replace the snapshot / pool / dataset / scrub / events dialog
+      action handlers with /ctl/ reads + writes via libstratum-9p.
+      Visual chrome stays from -2a; only the action plumbing
+      changes.
+
 - [~] **P9-LIB-1 libstratum-9p sync API** — foundation in progress.
       v2.0 sync read-side primitives shipped: dial+Tversion+Tattach
       handshake, Twalk, TLopen, Tread, Tclunk, Tgetattr, Treaddir.
