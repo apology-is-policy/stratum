@@ -731,9 +731,60 @@ language bindings, future kernel module) is a 9P consumer.
       pending; thread-pool dispatcher; performance tuning per
       ROADMAP §11.3 medium-risk note.
 
-- [ ] **P9-LIB-1 libstratum-9p sync API** — pending; stable C
-      ABI per ARCHITECTURE §10.2 ("libstratum-9p is the stable
-      public ABI; all language bindings wrap it").
+- [~] **P9-LIB-1 libstratum-9p sync API** — foundation in progress.
+      v2.0 sync read-side primitives shipped: dial+Tversion+Tattach
+      handshake, Twalk, TLopen, Tread, Tclunk, Tgetattr, Treaddir.
+      Targets 9P2000.L only (matches stratumd's wire). Header at
+      `v2/include/stratum/9p_client.h`, impl at
+      `v2/src/9p_client/9p_client.c`. Tests at
+      `v2/tests/test_9p_client.c` against the in-process stratumd
+      accept loop (mirrors test_9p_socket harness pattern).
+      Foundation for P9-CLI-1, P9-FUSE-1, P9-BIND-1/2/3.
+      Public API:
+        stm_9p_dial_unix(socket_path, opts, *out)   — full handshake
+        stm_9p_close(c)
+        stm_9p_msize(c)
+        stm_9p_last_errno(c)
+        stm_9p_walk(c, fid, new_fid, n, names, qids, *walked)
+        stm_9p_lopen(c, fid, flags, *qid, *iounit)
+        stm_9p_read(c, fid, offset, buf, count, *got)
+        stm_9p_clunk(c, fid)
+        stm_9p_getattr(c, fid, mask, *out)
+        stm_9p_readdir(c, fid, off, count, cb, ctx, *entries, *next)
+      Trust boundaries:
+        (a) Wire framing: 4-byte LE size header bounded to
+            [STM_9P_HDR_SIZE, msize] before parse; out-of-range
+            → STM_EBACKEND. Mirrors stratumd's `read_msg`.
+        (b) Rlerror parsing: Linux ecode mapped via err_map() into
+            a closed stm_status set; unknown ecodes collapse to
+            STM_EBACKEND.
+        (c) Tag allocation: monotonic counter; STM_EOVERFLOW once
+            STM_9P_NOTAG hit (sync client can't disambiguate
+            wrap-collisions).
+        (d) Tag mismatch on reply: STM_EBACKEND (lib can no
+            longer match replies → connection-poisoned posture).
+        (e) Body length validation: every Rxxx parser checks
+            body_len before consuming fields; truncated replies
+            → STM_EBACKEND.
+        (f) Server-returned read count > requested: protocol
+            violation → STM_EBACKEND.
+      Deferred to follow-up chunks:
+        - Write-side (Twrite, Tlcreate, Tmkdir, Tsetattr, Trenameat,
+          Tunlinkat, Tsymlink, Tlink, Treadlink, Tfsync, Txattr*).
+        - Async API (P9-LIB-2): pipelined Txx + reply matching by
+          tag + io_uring transport.
+        - Stratum-extension opcodes (Tsync/Treflink/Tfallocate/
+          Tfadvise from the 124-159 band).
+        - 9P2000 (non-.L) dialect support; /ctl/ access via the lib
+          requires /ctl/-on-stratumd integration (deferred).
+      12 tests in test_9p_client.c covering: dial NULL/EINVAL +
+      too-long-path + no-listener + handshake; close-on-NULL no-op;
+      walk 0-step clone + n_too_large EINVAL + missing→ENOENT;
+      open+read+clunk round-trip; getattr BASIC mask; readdir root
+      enumeration; offset-resumption (INLINE, since v2.0
+      stm_sync_read_extent rejects partial-extent reads — single-
+      extent MVP). Builds + tests green at the chunk's tip. R111
+      audit pending.
 
 - [ ] **P9-LIB-2 libstratum-9p async API** — pending.
 

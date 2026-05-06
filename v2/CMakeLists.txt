@@ -199,6 +199,7 @@ add_subdirectory(src/dirent)
 add_subdirectory(src/xattr)
 add_subdirectory(src/locks)
 add_subdirectory(src/9p)
+add_subdirectory(src/9p_client)
 add_subdirectory(src/ctl)
 add_subdirectory(src/cmd)
 

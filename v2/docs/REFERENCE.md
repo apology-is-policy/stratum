@@ -38,7 +38,31 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9-CTL-1e R110 audit close (this commit). 43 ctest suites
+- **Tip**: P9-LIB-1 sync API foundation (this commit). 44 ctest suites
+  green default (43 → 44 with new test_9p_client). test_9p_client
+  12/12. **P9-LIB-1** ships the libstratum-9p public C ABI per ARCH
+  §10.2 ("libstratum-9p is the stable public ABI; all language
+  bindings wrap it"). Foundation chunk covers v2.0 read-side: dial
+  (TVERSION + TATTACH), Twalk, TLopen, Tread, Tclunk, Tgetattr,
+  Treaddir, with monotonic tag allocation + Linux-ecode → stm_status
+  mapping closed under err_map. Targets 9P2000.L only (matches
+  stratumd's wire). Header at v2/include/stratum/9p_client.h
+  (~210 lines); impl at v2/src/9p_client/9p_client.c (~620 lines);
+  tests at v2/tests/test_9p_client.c (12 tests, ~540 lines)
+  against the in-process stratumd accept loop. Trust boundaries:
+  wire framing bounded by msize, Rlerror parsing closed under
+  err_map(), tag mismatch → STM_EBACKEND (connection-poisoned
+  posture), body-length validation per Rxxx, server-returned count
+  > requested → STM_EBACKEND. Per-client buffer pre-allocated at
+  msize at dial-time so per-op malloc/free is avoided. Deferred to
+  follow-ups: write-side (Twrite/Tlcreate/Tmkdir/Tsetattr/
+  Trenameat/Tunlinkat/Tsymlink/Tlink/Treadlink/Tfsync/Txattr*),
+  async API (P9-LIB-2), Stratum-extension opcodes (Tsync/Treflink/
+  Tfallocate/Tfadvise), 9P2000-dialect support. The chunk pioneers
+  the v2 9P client surface that P9-CLI-1, P9-FUSE-1, and
+  P9-BIND-1/2/3 will all wrap. R111 audit pending.
+
+- **Pre-tip-1**: P9-CTL-1e R110 audit close. 43 ctest suites
   green default. test_ctl 140/140 (was 138 at substantive; +2 R110
   regression tests). **R110 close** YELLOW — 0 P0 + 0 P1 + 1 P2 + 7
   P3, all addressed inline. **P2-1 (load-bearing wedged-fs
