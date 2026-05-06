@@ -718,10 +718,18 @@ language bindings, future kernel module) is a 9P consumer.
             exercising the `if (have_fs)` omit-fs-section branch.
             test_ctl 138 → 140 (+2 R110 tests). 43/43 ctest green.
 
-- [ ] **P9-CLI-1 stratum CLI** — pending; thin (~1000 LOC)
-      wrapper over /ctl/. Subcommands: pool, dataset, snapshot,
-      clone, send, recv, key. Output formats: human (default),
-      JSON, TSV.
+- [~] **P9-CLI-1 stratum CLI** — partial. **P9-CLI-1 FS-only**
+      shipped: `stratum-fs` binary at `v2/src/cmd/stratum-fs/`,
+      Plan-9-shaped subcommand interface wrapping libstratum-9p
+      for the common POSIX file ops (ls / stat / read / write /
+      mkdir / create / rm / rmdir / chmod / mv / ln / lns /
+      readlink / sync). Socket via `-s SOCKET` flag, `STRATUM_
+      SOCKET` env var, or `/var/run/stratum.sock` default. 15
+      integration tests in test_stratum_fs.c (fork+exec'd against
+      in-process stratumd). The /ctl/-using subcommands (pool /
+      dataset / snapshot / scrub / key) blocked on /ctl/-on-
+      stratumd integration. Output formats: human only at FS
+      level; JSON / TSV deferred.
 
 - [ ] **P9-FUSE-1 stratum-fuse single-threaded MVP** — pending;
       separate daemon at `src/cmd/fuse/`. FUSE-to-9P translator.

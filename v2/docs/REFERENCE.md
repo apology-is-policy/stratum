@@ -38,7 +38,31 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9-LIB-1d-link Tlink end-to-end (this commit). 44 ctest
+- **Tip**: P9-CLI-1 FS-only stratum-fs CLI (this commit). 45 ctest
+  suites green (was 44; +test_stratum_fs). test_stratum_fs 0 → 15
+  integration tests. New artifact: `stratum-fs` binary at
+  `v2/src/cmd/stratum-fs/`. Plan-9-shaped subcommand dispatcher
+  wrapping libstratum-9p for the common POSIX file ops: ls / stat /
+  read / write / mkdir / create / rm / rmdir / chmod / mv / ln /
+  lns / readlink / sync. Socket selection: `-s SOCKET`,
+  `STRATUM_SOCKET` env, or `/var/run/stratum.sock` default. Path
+  semantics: absolute only, ".." / "." rejected for safety, ≤
+  STM_9P_MAX_WALK (16) components. Exit codes: 0 success / 1 usage
+  / 2 I/O / 3 not-found. /ctl/-using subcommands (pool / dataset /
+  snapshot / scrub / key) deferred until /ctl/-on-stratumd
+  integration lands. Tests fork+exec the binary against an
+  in-process stratumd accept loop, capturing stdout/stderr +
+  exit code via pipe. Two macOS-specific gotchas surfaced:
+  (1) the readdir loop needs a defensive `next_offset == prev`
+  break to bound iteration when the server returns stable cookies
+  (mirrors test_9p_client's pattern); (2) the test fixture's
+  wake_and_join MUST `close(listen_fd)` rather than `shutdown()`,
+  because fork+exec'd children's transient listen-fd references
+  prevent shutdown() from unblocking accept() on macOS — close()
+  invalidates the fd at the syscall level so accept() returns
+  EBADF and the worker loop exits cleanly.
+
+- **Pre-tip-1**: P9-LIB-1d-link Tlink end-to-end. 44 ctest
   suites green. test_9p_client 39 → 43 (+4 link tests). test_9p
   79 → 83 (+4 server-side h_link tests). test_fs_phase8 +3
   link_by_ino tests.

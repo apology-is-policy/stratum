@@ -81,6 +81,12 @@ target_link_libraries(test_9p_socket PRIVATE stm_stratumd)
 stm_add_test(test_9p_client  test_9p_client.c test_fs_common.c)
 target_link_libraries(test_9p_client PRIVATE stm_stratumd stm_9p_client)
 stm_add_test(test_ctl        test_ctl.c      test_fs_common.c)
+stm_add_test(test_stratum_fs test_stratum_fs.c test_fs_common.c)
+target_link_libraries(test_stratum_fs PRIVATE stm_stratumd)
+# stratum-fs binary path passed in via env so the test can fork/exec it.
+set_tests_properties(test_stratum_fs PROPERTIES
+    ENVIRONMENT "STM_STRATUM_FS_BIN=$<TARGET_FILE:stratum-fs>"
+    TIMEOUT 120)
 
 # The crash-injection fuzzer runs ~168 independent format+mount+unmount
 # cycles. Original default budget was ~25 s on default, ~42 s under
