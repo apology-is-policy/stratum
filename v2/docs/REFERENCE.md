@@ -38,7 +38,40 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9-LIB-1d 5-op write-side completion (this commit). 44
+- **Tip**: P9-LIB-1d-link Tlink end-to-end (this commit). 44 ctest
+  suites green. test_9p_client 39 → 43 (+4 link tests). test_9p
+  79 → 83 (+4 server-side h_link tests). test_fs_phase8 +3
+  link_by_ino tests.
+  **P9-LIB-1d-link** (audit-light, R74 + R111 doctrine carry) closes
+  the Tlink forward-note from P9-LIB-1d. Adds three concrete pieces:
+  (1) new public fs API `stm_fs_link_by_ino(fs, ds, src_ino,
+  dst_parent_ino, dst_name, dst_name_len)` — POSIX link(2) by source
+  inode. Mirrors stm_fs_link's invariant maintenance (R74 P3-2
+  STM_EPERM-on-dir, R81 P3-1 ctime-stamp-after-success, R74 P3-3
+  rollback infallibility). Type check covers S_IFREG (REG), S_IFLNK
+  (LNK); refuses S_IFDIR + every unsupported type with EPERM. (2)
+  new server-side handler h_link in v2/src/9p/server.c. Wire shape:
+  dfid[4] fid[4] name[s]; reply: header only. Verifies both fids are
+  fresh NODE fids in the same dataset (cross-dataset → EXDEV),
+  validate_name on the new name, then delegates to
+  stm_fs_link_by_ino. Dispatcher case STM_9P_TLINK wired. (3) new
+  client primitive `stm_9p_link(c, dfid, fid, name)` inheriting the
+  R111 doctrine (op_entry_check, name validation, strict body-len
+  equality on Rlink (0 B), poison flag). Tests (4 + 4 + 3 = 11
+  new): test_9p_client adds round-trip, on-directory → EACCES
+  (lib's err_map collapses POSIX EPERM/EACCES), EEXIST when target
+  exists, invalid-name EINVAL; test_9p adds round-trip with
+  nlink=2 verification, on-directory → EPERM (raw 9P ECODE),
+  EEXIST + nlink rollback, mixed bad-args (empty name, ".", non-
+  dir dfid → ENOTDIR, missing fid → EBADF); test_fs_phase8 adds
+  fs-level link_by_ino basic + dir-refusal + EEXIST-rollback.
+  Cumulative libstratum-9p public API: read-side (dial, walk, lopen,
+  read, getattr, readdir) + write-side (write, lcreate, mkdir,
+  unlinkat, setattr, renameat, symlink, readlink, fsync, link).
+  Surface is now POSIX-complete for everything except xattr ops and
+  advisory locking.
+
+- **Pre-tip-1**: P9-LIB-1d 5-op write-side completion. 44
   ctest suites green. test_9p_client 27 → 39 (+12 P9-LIB-1d tests).
   **P9-LIB-1d** (audit-light, R111 doctrine carry) closes the
   CLI-shape write-side primitive set with five ops: stm_9p_setattr

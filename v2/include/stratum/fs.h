@@ -446,6 +446,31 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
                           uint64_t dst_parent_ino,
                           const uint8_t *dst_name, uint8_t dst_name_len);
 
+/* P9-LIB-1d-link: hard-link by source inode (Tlink / link(2) shape).
+ *
+ * Same semantics as stm_fs_link, but takes the source as a (dataset, ino)
+ * tuple instead of resolving via (parent, name). This is the natural shape
+ * for 9P2000.L Tlink: the wire-supplied source is a fid (already bound to
+ * an inode), not a directory + name.
+ *
+ * Refusals (mirror stm_fs_link's set):
+ *   - src_ino is a directory (STM_EPERM — POSIX forbids hardlinks-on-dirs).
+ *   - dst_parent not a directory (STM_ENOTDIR).
+ *   - dst_name fails name validation (STM_EINVAL).
+ *   - src_ino doesn't exist (STM_ENOENT).
+ *   - dst_name already exists in dst_parent (STM_EEXIST).
+ *   - nlink at UINT32_MAX (STM_EOVERFLOW).
+ *   - fs wedged or read-only (STM_EWEDGED / STM_EROFS).
+ *
+ * On success, the (src_ino) inode's nlink is incremented + ctime stamped
+ * to "now" + a new dirent is added to dst_parent referencing src_ino.
+ */
+STM_MUST_USE
+stm_status stm_fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
+                                 uint64_t src_ino,
+                                 uint64_t dst_parent_ino,
+                                 const uint8_t *dst_name, uint8_t dst_name_len);
+
 /* ========================================================================= */
 /* P8-POSIX-9: rename.                                                        */
 /* ========================================================================= */

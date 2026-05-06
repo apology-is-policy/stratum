@@ -862,6 +862,27 @@ language bindings, future kernel module) is a 9P consumer.
       Foundation ready for CLI mkdir/touch/rm/rmdir. test_9p_client
       19 → 27.
 
+      **P9-LIB-1d-link Tlink end-to-end** (audit-light, R74 + R111
+      doctrine carry): closes the Tlink forward-note from P9-LIB-1d.
+      Three pieces: (1) new public fs API stm_fs_link_by_ino (POSIX
+      link(2) by source inode; mirrors stm_fs_link's R74/R81 audit
+      posture); (2) new server-side h_link handler in
+      v2/src/9p/server.c (Tlink dispatcher case wired); (3) new
+      client primitive stm_9p_link inheriting R111 doctrine
+      (op_entry_check, name validation, strict body-len equality
+      on 0-byte Rlink, poison flag). Wire shape per .L spec:
+      dfid[4] fid[4] name[s]; reply: header only. Verifies both
+      fids fresh + same-dataset (cross-dataset → EXDEV), source
+      type non-dir (POSIX → EPERM, mapped to STM_EACCES at the
+      lib boundary via err_map). 11 new tests: test_9p_client +4
+      (round-trip + on-dir EACCES + EEXIST + invalid-name EINVAL),
+      test_9p +4 (round-trip with nlink=2, on-dir EPERM raw, EEXIST
+      + rollback, mixed-bad-args), test_fs_phase8 +3 (link_by_ino
+      basic, dir-refusal, EEXIST-rollback). Cumulative libstratum-9p
+      public API now POSIX-complete except for xattr + advisory
+      locking. test_9p_client 39 → 43, test_9p 79 → 83,
+      test_fs_phase8 218 → 221.
+
       **P9-LIB-1d 5-op write-side completion** (audit-light): adds
       the remaining POSIX-shape write-side primitives:
       stm_9p_setattr (Tsetattr — uses new public struct

@@ -370,6 +370,22 @@ static uint32_t build_tstatfs(uint8_t *req, uint16_t tag, uint32_t fid)
     return sz;
 }
 
+static uint32_t build_tlink(uint8_t *req, uint16_t tag,
+                             uint32_t dfid, uint32_t fid, const char *name)
+{
+    uint8_t *p = req + 7;
+    pack_u32(p, dfid); p += 4;
+    pack_u32(p, fid);  p += 4;
+    uint16_t nl = (uint16_t)strlen(name);
+    pack_u16(p, nl);   p += 2;
+    memcpy(p, name, nl); p += nl;
+    uint32_t sz = (uint32_t)(p - req);
+    pack_u32(req, sz);
+    req[4] = STM_9P_TLINK;
+    pack_u16(req + 5, tag);
+    return sz;
+}
+
 static uint32_t build_tfsync(uint8_t *req, uint16_t tag, uint32_t fid,
                               uint32_t datasync)
 {
@@ -3732,6 +3748,213 @@ STM_TEST(p9_r94_p3_5_fallocate_punch_without_keep_size_returns_einval) {
     STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
     STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EINVAL);
 
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* ──────────────────────────────────────────────────────────────────── */
+/* P9-LIB-1d-link: h_link / Tlink server-side tests.                    */
+/* ──────────────────────────────────────────────────────────────────── */
+
+/* Tlink round-trip: lcreate file, walk to it, Tlink to a new name.
+ * The new name resolves to the same inode (same qid path). */
+STM_TEST(p9_link_round_trip) {
+    make_tmp("9p_link_rt");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+
+    /* lcreate src.txt via Twalk-clone fid 100 → 101 then Tlcreate. */
+    uint32_t sz = build_twalk(req, 1, 100, 101, 0, NULL);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RWALK);
+
+    sz = build_tlcreate(req, 2, 101, "src.txt", 0u /*flags*/,
+                         0644u /*mode*/, 0u /*gid*/);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLCREATE);
+
+    /* Clunk src fid + walk fresh fid 102 to src.txt. */
+    sz = build_tclunk(req, 3, 101);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    walk_to(s, 100, 102, "src.txt");
+
+    /* Tlink: dfid=100, fid=102, name="link.txt" → success (no body). */
+    sz = build_tlink(req, 4, 100, 102, "link.txt");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLINK);
+
+    /* Walk to "link.txt" → 103. Verify same qid as src (path equality). */
+    walk_to(s, 100, 103, "link.txt");
+    sz = build_tgetattr(req, 5, 102, STM_9P_GETATTR_BASIC);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RGETATTR);
+    /* nlink at body+8+13+12 = +33 (valid[8] + qid[13] + mode/uid/gid[12]). */
+    uint64_t nlink = load_u64(resp + 7 + 33);
+    STM_ASSERT_EQ(nlink, 2u);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* Tlink on a directory → STM_9P_ECODE_EPERM (POSIX rejects
+ * hardlinks-on-dirs). */
+STM_TEST(p9_link_on_directory_eperm) {
+    make_tmp("9p_link_dir");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+
+    /* mkdir "subdir". */
+    uint32_t sz = build_tmkdir(req, 1, 100, "subdir", 0755u, 0u);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RMKDIR);
+
+    /* Walk to subdir → fid 101. */
+    walk_to(s, 100, 101, "subdir");
+
+    /* Tlink fid=101 (dir) into root with name "alias" → EPERM. */
+    sz = build_tlink(req, 2, 100, 101, "alias");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EPERM);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* Tlink with name that already exists in the parent → EEXIST. */
+STM_TEST(p9_link_eexist_when_target_exists) {
+    make_tmp("9p_link_eexist");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+
+    /* lcreate src.txt + dup.txt (both via temporary fid 101). */
+    uint32_t sz = build_twalk(req, 1, 100, 101, 0, NULL);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    sz = build_tlcreate(req, 2, 101, "src.txt", 0u, 0644u, 0u);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    sz = build_tclunk(req, 3, 101);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+
+    sz = build_twalk(req, 4, 100, 101, 0, NULL);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    sz = build_tlcreate(req, 5, 101, "dup.txt", 0u, 0644u, 0u);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    sz = build_tclunk(req, 6, 101);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+
+    /* Walk to src.txt → 102. */
+    walk_to(s, 100, 102, "src.txt");
+
+    /* Tlink dst=100, fid=102, name="dup.txt" → EEXIST. */
+    sz = build_tlink(req, 7, 100, 102, "dup.txt");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EEXIST);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* Tlink with bad arg shapes:
+ *  - empty name              → EINVAL
+ *  - name "."                → EINVAL
+ *  - dfid is not a directory → ENOTDIR
+ *  - source fid does not exist → EBADF */
+STM_TEST(p9_link_invalid_args) {
+    make_tmp("9p_link_inv");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+
+    /* lcreate file.txt to have a known non-dir fid (102). */
+    uint32_t sz = build_twalk(req, 1, 100, 101, 0, NULL);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    sz = build_tlcreate(req, 2, 101, "file.txt", 0u, 0644u, 0u);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    sz = build_tclunk(req, 3, 101);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    walk_to(s, 100, 102, "file.txt");
+
+    /* Empty name (server validates via validate_name). */
+    sz = build_tlink(req, 4, 100, 102, "");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    /* Bad name → STM_EINVAL → STM_9P_ECODE_EINVAL. */
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EINVAL);
+
+    /* "." name (validate_name rejects). */
+    sz = build_tlink(req, 5, 100, 102, ".");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EINVAL);
+
+    /* dfid is the file itself (not a directory) → ENOTDIR. */
+    sz = build_tlink(req, 6, /*dfid=*/102, /*fid=*/102, "ln");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_ENOTDIR);
+
+    /* Source fid 999 doesn't exist → EBADF. */
+    sz = build_tlink(req, 7, 100, /*fid=*/999, "ln");
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EBADF);
+
+    free(req); free(resp);
     stm_9p_server_destroy(s);
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);

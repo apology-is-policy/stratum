@@ -1183,6 +1183,50 @@ stm_status stm_9p_readlink(stm_9p_client *c, uint32_t fid,
     return STM_OK;
 }
 
+stm_status stm_9p_link(stm_9p_client *c, uint32_t dfid, uint32_t fid,
+                          const char *name)
+{
+    stm_status ec = op_entry_check(c);
+    if (ec != STM_OK) return ec;
+    size_t nl = 0;
+    ec = validate_name_for_lib(name, &nl);
+    if (ec != STM_OK) return ec;
+
+    /* Wire: hdr + dfid(4) + fid(4) + nlen(2) + name(nl). */
+    uint32_t msg_size = STM_9P_HDR_SIZE + 4u + 4u + 2u + (uint32_t)nl;
+    if (msg_size > c->buf_cap) return STM_ERANGE;
+    uint16_t tag = 0;
+    stm_status rc = alloc_tag(c, &tag);
+    if (rc != STM_OK) return rc;
+
+    uint8_t *wp = c->buf;
+    p_u32(wp, msg_size);
+    wp[4] = STM_9P_TLINK;
+    p_u16(wp + 5, tag);
+    uint8_t *bp = wp + 7;
+    p_u32(bp, dfid);             bp += 4;
+    p_u32(bp, fid);              bp += 4;
+    p_u16(bp, (uint16_t)nl);     bp += 2;
+    memcpy(bp, name, nl);        bp += nl;
+    rc = send_msg(c, msg_size);
+    if (rc != STM_OK) return rc;
+
+    uint32_t reply_size = 0;
+    rc = recv_msg(c, &reply_size);
+    if (rc != STM_OK) return rc;
+    const uint8_t *body = NULL;
+    uint32_t body_len = 0;
+    rc = check_reply(c, reply_size, STM_9P_RLINK, tag, &body, &body_len);
+    if (rc != STM_OK) return rc;
+    /* Rlink has NO body. Strict equality. */
+    if (body_len != 0u) {
+        c->last_errno = EPROTO;
+        return STM_EBACKEND;
+    }
+    (void)body;
+    return STM_OK;
+}
+
 stm_status stm_9p_fsync(stm_9p_client *c, uint32_t fid, uint32_t datasync)
 {
     stm_status ec = op_entry_check(c);

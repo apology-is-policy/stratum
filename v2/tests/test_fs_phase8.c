@@ -785,6 +785,107 @@ STM_TEST(fs_p3_link_refuses_existing_dst) {
     unlink(g_key_path);
 }
 
+/* P9-LIB-1d-link: stm_fs_link_by_ino — same semantics as stm_fs_link
+ * but takes the source as a (dataset, ino) tuple. Mirrors the basic +
+ * directory-refusal tests. */
+STM_TEST(fs_link_by_ino_basic_and_nlink_tracking) {
+    make_tmp("link_by_ino");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t a = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root,
+                                          (const uint8_t *)"a", 1,
+                                          0644u, 0, 0, &a));
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, a, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_nlink), (uint32_t)1);
+
+    /* Link by ino: src_ino=a, dst_parent=root, dst_name="b". */
+    STM_ASSERT_OK(stm_fs_link_by_ino(fs, 1, /*src_ino=*/a,
+                                          /*dst_parent=*/root,
+                                          (const uint8_t *)"b", 1));
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, a, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_nlink), (uint32_t)2);
+
+    /* Both names resolve to a. */
+    uint64_t found = 0;
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root,
+                                     (const uint8_t *)"a", 1, &found));
+    STM_ASSERT_EQ(found, a);
+    STM_ASSERT_OK(stm_fs_lookup(fs, 1, root,
+                                     (const uint8_t *)"b", 1, &found));
+    STM_ASSERT_EQ(found, a);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* link_by_ino refuses directories (POSIX hardlinks-on-dirs forbidden). */
+STM_TEST(fs_link_by_ino_refuses_directory) {
+    make_tmp("link_by_ino_dir");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t sub = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, 1, root,
+                                    (const uint8_t *)"d", 1,
+                                    0755u, 0, 0, &sub));
+    STM_ASSERT_ERR(stm_fs_link_by_ino(fs, 1, /*src_ino=*/sub,
+                                           /*dst_parent=*/root,
+                                           (const uint8_t *)"d2", 2),
+                   STM_EPERM);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* link_by_ino EEXIST + nlink rollback when dst name exists. */
+STM_TEST(fs_link_by_ino_eexist_rolls_back_nlink) {
+    make_tmp("link_by_ino_eexist");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t root = 0;
+    p2b_alloc_root_dir(fs, &root);
+
+    uint64_t a = 0, b = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"a", 1,
+                                          0644u, 0, 0, &a));
+    STM_ASSERT_OK(stm_fs_create_file(fs, 1, root, (const uint8_t *)"b", 1,
+                                          0644u, 0, 0, &b));
+
+    STM_ASSERT_ERR(stm_fs_link_by_ino(fs, 1, /*src_ino=*/a,
+                                           /*dst_parent=*/root,
+                                           (const uint8_t *)"b", 1),
+                   STM_EEXIST);
+    /* a's nlink unchanged (rollback). */
+    struct stm_inode_value v = {0};
+    STM_ASSERT_OK(stm_fs_stat(fs, 1, a, &v));
+    STM_ASSERT_EQ(stm_load_le32(v.si_nlink), (uint32_t)1);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 /* ========================================================================= */
 /* P8-POSIX-4: readdir.                                                       */
 /* ========================================================================= */

@@ -2138,6 +2138,82 @@ static stm_status h_mkdir(stm_9p_server *s,
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
+/* h_link — Tlink / Rlink (P9-LIB-1d-link).                                */
+/* Tlink:   dfid[4] fid[4] name[s]                                         */
+/* Rlink:   (header only)                                                  */
+/*                                                                         */
+/* dfid is the destination directory; fid is the SOURCE inode (must be a  */
+/* non-directory, non-aux NODE fid). Cross-dataset link → STM_EXDEV.      */
+/* Both fids must be live + verify_fid_fresh-clean. Routes to             */
+/* stm_fs_link_by_ino which mirrors stm_fs_link's invariant maintenance   */
+/* (R74 P3-2 STM_EPERM-on-dir, R81 P3-1 ctime-stamp-after-success,        */
+/* R74 P3-3 lock-posture rollback infallibility).                         */
+/* ────────────────────────────────────────────────────────────────────── */
+
+static stm_status h_link(stm_9p_server *s,
+                            const uint8_t *body, uint32_t body_len,
+                            uint16_t tag,
+                            uint8_t *resp, uint32_t resp_cap,
+                            uint32_t *resp_len)
+{
+    if (body_len < 4 + 4 + 2)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+    uint32_t dfid_n = p9l_g32(body);
+    uint32_t fid_n  = p9l_g32(body + 4);
+    const uint8_t *bp = body + 8;
+    const uint8_t *end = body + body_len;
+    uint16_t nlen;
+    const char *name = p9l_gstr(&bp, end, &nlen);
+    if (!name)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EPROTO);
+
+    stm_status nv = validate_name((const uint8_t *)name, nlen);
+    if (nv != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, nv);
+
+    p9_fid *df = fid_get(s, dfid_n);
+    if (!df)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+    if (df->kind != P9_FID_NODE)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
+    if (!(df->qid_type & STM_9P_QTDIR))
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_ENOTDIR);
+
+    p9_fid *sf = fid_get(s, fid_n);
+    if (!sf)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EBADF);
+    if (sf->kind != P9_FID_NODE)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EINVAL);
+
+    /* Cross-dataset link is forbidden — Linux link(2) → EXDEV. */
+    if (sf->dataset_id != df->dataset_id)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EXDEV);
+
+    stm_status v1 = verify_fid_fresh(s, sf, NULL);
+    if (v1 != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, v1);
+    stm_status v2 = verify_fid_fresh(s, df, NULL);
+    if (v2 != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, v2);
+
+    stm_status rc = stm_fs_link_by_ino(s->fs, sf->dataset_id,
+                                          sf->ino,
+                                          df->ino,
+                                          (const uint8_t *)name,
+                                          (uint8_t)nlen);
+    if (rc != STM_OK)
+        return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+
+    uint32_t need = STM_9P_HDR_SIZE;
+    if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
+    uint8_t *wp = resp + 4;
+    *wp++ = STM_9P_RLINK;
+    p9l_p16(wp, tag); wp += 2;
+    resp_finish(resp, resp_len, wp);
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
 /* h_symlink — Tsymlink / Rsymlink.                                        */
 /* Tsymlink:  dfid[4] name[s] symtgt[s] gid[4]                             */
 /* Rsymlink:  qid[13]                                                       */
@@ -3521,6 +3597,9 @@ stm_status stm_9p_server_handle(stm_9p_server *s,
         break;
     case STM_9P_TMKDIR:
         rc = h_mkdir(s, body, body_len, tag, resp, resp_cap, resp_len);
+        break;
+    case STM_9P_TLINK:
+        rc = h_link(s, body, body_len, tag, resp, resp_cap, resp_len);
         break;
     case STM_9P_TSYMLINK:
         rc = h_symlink(s, body, body_len, tag, resp, resp_cap, resp_len);

@@ -1697,6 +1697,144 @@ STM_TEST(p9_client_readlink_on_non_symlink_einval)
     destroy_client_fixture(&f);
 }
 
+/* Tlink — round-trip: lcreate file, walk to it, then link to a new
+ * name in the same parent dir. Both names should resolve to the same
+ * inode (verified by getattr returning identical qid.path). */
+STM_TEST(p9_client_link_round_trip)
+{
+    client_fixture f = make_client_fixture("link_rt");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    /* lcreate "src.txt" via cloned root fid 100 → 101. */
+    stm_9p_qid clone_qids[STM_9P_MAX_WALK];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 0, NULL, clone_qids, &walked));
+    stm_9p_qid lq;
+    STM_ASSERT_OK(stm_9p_lcreate(c, 101, "src.txt",
+                                    STM_9P_O_RDWR, 0644u, 0, &lq, NULL));
+    /* fid 101 is now bound to src.txt; clunk + walk fresh fid 102 to
+     * src.txt so we have an independent fid for the source. */
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+    const char *src_names[] = { "src.txt" };
+    stm_9p_qid src_wqids[1];
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 102, 1, src_names, src_wqids, &walked));
+
+    /* Tlink: dfid=100 (root), fid=102 (src.txt), name="link.txt". */
+    STM_ASSERT_OK(stm_9p_link(c, /*dfid=*/100, /*fid=*/102, "link.txt"));
+
+    /* Walk to "link.txt" → 103. Both fids should resolve to the same
+     * inode (qid.path equality). */
+    const char *link_names[] = { "link.txt" };
+    stm_9p_qid link_wqids[1];
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 103, 1, link_names, link_wqids, &walked));
+    STM_ASSERT_EQ(link_wqids[0].path, src_wqids[0].path);
+
+    /* Getattr: nlink should be 2 now. */
+    stm_9p_attr a = {0};
+    STM_ASSERT_OK(stm_9p_getattr(c, 102, STM_9P_GETATTR_BASIC, &a));
+    STM_ASSERT_EQ(a.nlink, 2u);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 103));
+    STM_ASSERT_OK(stm_9p_clunk(c, 102));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Tlink on a directory → STM_EPERM (POSIX forbids hardlinks-on-dirs). */
+STM_TEST(p9_client_link_on_directory_eperm)
+{
+    client_fixture f = make_client_fixture("link_dir");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    /* mkdir "subdir". */
+    stm_9p_qid mq;
+    STM_ASSERT_OK(stm_9p_mkdir(c, 100, "subdir", 0755u, 0, &mq));
+
+    /* Walk into subdir → 101 (so we have a fid bound to a dir). */
+    const char *names[] = { "subdir" };
+    stm_9p_qid wqids[1];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 1, names, wqids, &walked));
+
+    /* Tlink fid=101 (the dir) into root with name "alias" → STM_EPERM. */
+    stm_status rc = stm_9p_link(c, 100, 101, "alias");
+    STM_ASSERT_EQ(rc, STM_EACCES);
+    /* err_map maps STM_9P_ECODE_EPERM → STM_EACCES. The lib's status
+     * surface collapses POSIX EPERM and EACCES into one symbol — both
+     * are "access denied". This matches the lib's err_map design. */
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Tlink with name that already exists → STM_EEXIST. */
+STM_TEST(p9_client_link_eexist_when_target_exists)
+{
+    client_fixture f = make_client_fixture("link_exists");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    /* lcreate "src.txt" + clunk. */
+    stm_9p_qid clone_qids[STM_9P_MAX_WALK];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 0, NULL, clone_qids, &walked));
+    stm_9p_qid lq;
+    STM_ASSERT_OK(stm_9p_lcreate(c, 101, "src.txt",
+                                    STM_9P_O_RDWR, 0644u, 0, &lq, NULL));
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+
+    /* lcreate "dup.txt" + clunk. */
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 0, NULL, clone_qids, &walked));
+    STM_ASSERT_OK(stm_9p_lcreate(c, 101, "dup.txt",
+                                    STM_9P_O_RDWR, 0644u, 0, &lq, NULL));
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+
+    /* Walk to src.txt → 102. */
+    const char *src_names[] = { "src.txt" };
+    stm_9p_qid wqids[1];
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 102, 1, src_names, wqids, &walked));
+
+    /* Try to link src.txt as "dup.txt" → STM_EEXIST. */
+    stm_status rc = stm_9p_link(c, 100, 102, "dup.txt");
+    STM_ASSERT_EQ(rc, STM_EEXIST);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 102));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Tlink with invalid names → STM_EINVAL (lib-side, no round-trip). */
+STM_TEST(p9_client_link_invalid_name_einval)
+{
+    client_fixture f = make_client_fixture("link_inv");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    STM_ASSERT_EQ(stm_9p_link(c, 100, 100, NULL),  STM_EINVAL);
+    STM_ASSERT_EQ(stm_9p_link(c, 100, 100, ""),    STM_EINVAL);
+    STM_ASSERT_EQ(stm_9p_link(c, 100, 100, "."),   STM_EINVAL);
+    STM_ASSERT_EQ(stm_9p_link(c, 100, 100, ".."),  STM_EINVAL);
+    STM_ASSERT_EQ(stm_9p_link(c, 100, 100, "a/b"), STM_EINVAL);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
 /* Tfsync — happy path. Datasync=0 is a full fsync; v2.0 server-side
  * routes through stm_fs_commit. */
 STM_TEST(p9_client_fsync_round_trip)

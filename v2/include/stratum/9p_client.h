@@ -451,6 +451,23 @@ STM_MUST_USE
 stm_status stm_9p_readlink(stm_9p_client *c, uint32_t fid,
                               char *buf, size_t buf_cap, size_t *out_len);
 
+/* TLink: create a hard link `name` in directory `dfid` referencing the
+ * inode bound to `fid`. fid stays bound (NOT rebound). Both fids must
+ * be in the same dataset (cross-dataset link → STM_EXDEV); fid must
+ * NOT be a directory (POSIX link(2) → EPERM, mapped to STM_EPERM).
+ *
+ * Returns:
+ *   - STM_OK on success.
+ *   - STM_EINVAL on NULL c / name, name == "" / "." / ".." or '/'
+ *     in name.
+ *   - STM_EXDEV if dfid and fid are in different datasets.
+ *   - STM_EPERM if fid is a directory.
+ *   - STM_EEXIST if `name` already exists in dfid.
+ *   - Any Rlerror's mapped status. */
+STM_MUST_USE
+stm_status stm_9p_link(stm_9p_client *c, uint32_t dfid, uint32_t fid,
+                          const char *name);
+
 /* TFsync: sync `fid`'s data to stable storage. `datasync` is the .L
  * datasync flag (1 ⇒ data only, no metadata; 0 ⇒ full fsync). v2.0
  * server-side stratumd ignores `datasync` and routes every fsync

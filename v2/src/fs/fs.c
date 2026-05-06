@@ -1784,6 +1784,108 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
     return STM_OK;
 }
 
+/* P9-LIB-1d-link: stm_fs_link_by_ino — POSIX link(2) by source inode.
+ *
+ * Same invariants as stm_fs_link but takes the source inode directly
+ * (as 9P2000.L Tlink provides via a fid). Skips the (parent, name) →
+ * src_ino dirent resolution; otherwise structurally identical.
+ *
+ * Mirrors stm_fs_link's audit-derived posture (R74 P3-2: hardlink-on-dir
+ * → STM_EPERM; R81 P3-1: ctime stamp AFTER successful dirent_alloc not
+ * before; R74 P3-3: lock-posture infallibility for the rollback's
+ * stm_inode_unlink (void)-cast).
+ */
+stm_status stm_fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
+                                 uint64_t src_ino,
+                                 uint64_t dst_parent_ino,
+                                 const uint8_t *dst_name, uint8_t dst_name_len)
+{
+    if (!fs) return STM_EINVAL;
+    if (dataset_id == 0u || src_ino == 0u || dst_parent_ino == 0u)
+        return STM_EINVAL;
+    stm_status nv = fs_validate_dirent_name(dst_name, dst_name_len);
+    if (nv != STM_OK) return nv;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+
+    stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
+    stm_dirent_index *didx = stm_sync_dirent_index(fs->sync);
+    if (!iidx || !didx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EINVAL;
+    }
+
+    /* Verify dst_parent is a directory. */
+    struct stm_inode_value dpv = {0};
+    stm_status ps = fs_load_parent_dir(iidx, dataset_id, dst_parent_ino, &dpv);
+    if (ps != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return ps;
+    }
+
+    /* Look up source inode + classify type. */
+    struct stm_inode_value siv = {0};
+    stm_status sl = stm_inode_lookup(iidx, dataset_id, src_ino, &siv);
+    if (sl != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return sl;     /* STM_ENOENT */
+    }
+    uint32_t src_mode = stm_load_le32(siv.si_mode);
+    uint64_t src_gen  = stm_load_le64(siv.si_gen);
+    uint8_t  src_dt;
+    /* POSIX forbids hard-link-on-directory; Linux link(2) → EPERM.
+     * Mirrors stm_fs_link's R82 P2-1 STM_EPERM mapping. */
+    if ((src_mode & 0170000u) == 0040000u) {       /* S_IFDIR */
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EPERM;
+    } else if ((src_mode & 0170000u) == 0100000u) {/* S_IFREG */
+        src_dt = STM_DT_REG;
+    } else if ((src_mode & 0170000u) == 0120000u) {/* S_IFLNK */
+        src_dt = STM_DT_LNK;
+    } else {
+        /* Other types (chr/blk/fifo/sock) are unreachable at v2.0 — the
+         * fs API only creates regs / dirs / symlinks. Defense-in-depth:
+         * refuse to link any unsupported type. */
+        pthread_mutex_unlock(&fs->lock);
+        return STM_EPERM;
+    }
+
+    /* Bump nlink first; rollback if dirent install fails (mirror
+     * stm_fs_link's order so the same R74 P3-3 lock-posture argument
+     * applies). */
+    stm_status ils = stm_inode_link(iidx, dataset_id, src_ino);
+    if (ils != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return ils;     /* STM_EOVERFLOW on UINT32_MAX */
+    }
+    stm_status das = stm_dirent_alloc(didx, dataset_id, dst_parent_ino,
+                                          dst_name, dst_name_len,
+                                          src_ino, src_gen, src_dt);
+    if (das != STM_OK) {
+        bool freed_unused = false;
+        (void)stm_inode_unlink(iidx, dataset_id, src_ino, &freed_unused);
+        pthread_mutex_unlock(&fs->lock);
+        return das;       /* STM_EEXIST if name already linked, etc. */
+    }
+
+    /* R81 P3-1: stamp ctime to "now" AFTER dirent_alloc succeeds.
+     * Lock-posture infallibility argument applies (R76 P3-1) — under
+     * fs->lock the inode_lookup cannot fail since src_ino was just
+     * linked above. */
+    {
+        struct stm_inode_value cv2 = {0};
+        stm_status ls2 = stm_inode_lookup(iidx, dataset_id, src_ino, &cv2);
+        if (ls2 == STM_OK) {
+            fs_stamp_ctime_now(&cv2);
+            (void)stm_inode_set(iidx, dataset_id, src_ino, &cv2);
+        }
+    }
+
+    pthread_mutex_unlock(&fs->lock);
+    return STM_OK;
+}
+
 /* ========================================================================= */
 /* P8-POSIX-8: symlinks.                                                      */
 /* ========================================================================= */
