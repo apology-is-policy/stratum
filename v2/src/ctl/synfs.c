@@ -147,6 +147,8 @@ typedef enum {
     KIND_DATASET_DELETE_SNAPSHOT = 22, /* /datasets/<id>/delete-snapshot — admin write */
     KIND_DATASET_HOLD_SNAPSHOT   = 23, /* /datasets/<id>/hold-snapshot — admin write */
     KIND_DATASET_RELEASE_SNAPSHOT = 24, /* /datasets/<id>/release-snapshot — admin write */
+    KIND_POOL_METRICS_DIR        = 25, /* /pools/<uuid>/metrics/ — observability subtree */
+    KIND_POOL_METRICS_PROMETHEUS = 26, /* /pools/<uuid>/metrics/prometheus — bulk exposition */
     KIND_MAX
 } ctl_kind;
 
@@ -183,6 +185,8 @@ static const ctl_kind_meta KIND_META[KIND_MAX] = {
     [KIND_DATASET_DELETE_SNAPSHOT] = { false, true, 0200, "delete-snapshot" }, /* admin write trigger */
     [KIND_DATASET_HOLD_SNAPSHOT]   = { false, true, 0200, "hold-snapshot"   }, /* admin write trigger */
     [KIND_DATASET_RELEASE_SNAPSHOT] = { false, true, 0200, "release-snapshot" }, /* admin write trigger */
+    [KIND_POOL_METRICS_DIR]        = { true,  false, 0555, "metrics"    }, /* world-readable observability dir */
+    [KIND_POOL_METRICS_PROMETHEUS] = { false, false, 0444, "prometheus" }, /* world-readable bulk exposition */
 };
 
 /* R96 P3-2: pin every static-name literal length below STM_P9_NAME_MAX
@@ -213,6 +217,8 @@ _Static_assert(sizeof("create-snapshot") - 1 <= STM_P9_NAME_MAX, "/ctl/ /dataset
 _Static_assert(sizeof("delete-snapshot") - 1 <= STM_P9_NAME_MAX, "/ctl/ /datasets/.../delete-snapshot literal");
 _Static_assert(sizeof("hold-snapshot") - 1   <= STM_P9_NAME_MAX, "/ctl/ /datasets/.../hold-snapshot literal");
 _Static_assert(sizeof("release-snapshot") - 1 <= STM_P9_NAME_MAX, "/ctl/ /datasets/.../release-snapshot literal");
+_Static_assert(sizeof("metrics") - 1    <= STM_P9_NAME_MAX, "/ctl/ /pools/.../metrics literal");
+_Static_assert(sizeof("prometheus") - 1 <= STM_P9_NAME_MAX, "/ctl/ /pools/.../metrics/prometheus literal");
 /* Dynamic names: pool-uuid hex (36 chars), decimal device-id (≤2
  * chars at v2.0's STM_POOL_DEVICES_MAX = 64 cap), decimal dataset-id
  * (≤9 chars at STM_SYNC_DATASET_ID_MAX = 0x0FFFFFFF ~= 268M = 9
@@ -223,7 +229,7 @@ _Static_assert(sizeof("release-snapshot") - 1 <= STM_P9_NAME_MAX, "/ctl/ /datase
  * KIND_META[] trips this assert at build time, even if a downstream
  * build silently suppresses -Wmissing-field-initializers. Update the
  * literal in lockstep when growing the enum. */
-_Static_assert(KIND_MAX == 25,
+_Static_assert(KIND_MAX == 27,
                "KIND_META[KIND_MAX] sized to enum cardinality; "
                "update both ctl_kind enum + KIND_META[] in lockstep");
 
@@ -315,6 +321,19 @@ static uint64_t qid_dataset_id(uint64_t q)
  * searchability + ease of re-tuning. */
 #define STM_CTL_VERB_MAX     16u
 
+/* P9-CTL-1e: per-fid heap-allocated body cap for bulk-format kinds.
+ * /pools/<uuid>/metrics/prometheus emits HELP+TYPE comments + per-
+ * device records + scrub counters, which on a 64-device pool sums
+ * to ~30 KiB; 64 KiB leaves headroom for forward additions
+ * (per-dataset counters, latency histograms when added). Refuses
+ * with STM_ERANGE if a single materialization would exceed the cap
+ * — protects against runaway label-cardinality bugs.
+ *
+ * Enforced via prom_grow's bound check; the realloc-doubling growth
+ * starts at STM_CTL_METRICS_INITIAL_CAP and doubles up to this cap. */
+#define STM_CTL_METRICS_MAX           (64u * 1024u)
+#define STM_CTL_METRICS_INITIAL_CAP   4096u
+
 typedef struct ctl_session {
     int       active;
     uint32_t  fid;
@@ -329,6 +348,19 @@ typedef struct ctl_session {
      * appended after Topen. uses_event_buf=1 marks this branch. */
     int       uses_event_buf;
     uint32_t  snapshot_len;
+    /* P9-CTL-1e: per-fid heap-allocated body for bulk kinds whose
+     * worst-case bytes exceed STM_CTL_BODY_MAX. NULL on the bounded-
+     * body path. Owned by the session; freed at session_free_locked
+     * (the free runs BEFORE the memset that clears the slot, since
+     * memset would otherwise lose the pointer and leak the alloc).
+     *
+     * Lifecycle: allocated at vops_open's materializer call, freed
+     * at vops_clunk → session_free_locked. The slot is calloc'd at
+     * stm_ctl_create time; subsequent allocs after a free see
+     * bulk_buf=NULL because session_free_locked memsets the whole
+     * struct. */
+    uint8_t  *bulk_buf;
+    uint32_t  bulk_len;
 } ctl_session;
 
 /* P9-CTL-1d-events: event log buffer. Realloc-doubling growth like
@@ -397,6 +429,14 @@ static ctl_session *session_alloc_locked(stm_ctl *c, uint32_t fid,
             s->fid = fid;
             s->qid_path = qid_path;
             s->len = 0;
+            s->uses_event_buf = 0;
+            s->snapshot_len = 0;
+            /* P9-CTL-1e: bulk_buf carries over from the prior
+             * free (memset of the full struct). Defensive null —
+             * a future maintainer changing session_free_locked must
+             * not break this invariant. */
+            s->bulk_buf = NULL;
+            s->bulk_len = 0;
             memset(s->buf, 0, sizeof s->buf);
             return s;
         }
@@ -407,6 +447,13 @@ static ctl_session *session_alloc_locked(stm_ctl *c, uint32_t fid,
 static void session_free_locked(ctl_session *s)
 {
     if (!s || !s->active) return;
+    /* P9-CTL-1e: free the bulk buffer BEFORE memset zeros the
+     * pointer — otherwise the struct memset loses the pointer and
+     * the alloc leaks. free(NULL) is well-defined, so the bounded-
+     * body path (bulk_buf=NULL) skips this safely. The bulk body is
+     * non-secret (counters + UUIDs), so memzero is not required;
+     * mirrors the primary buf[]'s "no memzero needed" posture. */
+    free(s->bulk_buf);
     /* Body bytes are non-secret — version strings + counters. No
      * memzero needed. */
     memset(s, 0, sizeof *s);
@@ -1248,6 +1295,339 @@ static stm_status materialize_debug_alloc(stm_ctl *c, ctl_session *s)
     return STM_OK;
 }
 
+/* ── Prometheus exposition (P9-CTL-1e) ──────────────────────────────────── */
+/*
+ * Bulk-format materializer for /pools/<uuid>/metrics/prometheus
+ * (ARCH §14.8.1). Body shape: HELP + TYPE comments + samples,
+ * line-oriented ASCII, terminated by '\n'. World-readable (mode 0444).
+ *
+ * Body lives in s->bulk_buf (heap-allocated, capped at STM_CTL_METRICS_
+ * MAX = 64 KiB). Bounded materializers use s->buf[STM_CTL_BODY_MAX];
+ * /metrics/prometheus exceeds 1 KiB once per-device + scrub data are
+ * emitted (~30 KiB on a 64-device pool with all sections active).
+ *
+ * Lock posture: each subsystem accessor takes its own lock; we don't
+ * hold any cross-subsystem lock concurrently. Pool roster snapshot
+ * captured under stm_pool_lock_shared, scrub status under sc->lock,
+ * fs stats under fs->lock — independently. Output is computed from
+ * the snapshots after the locks are released, so format-time errors
+ * don't pin contended state.
+ *
+ * Trust boundaries:
+ *   - Body MUST NOT leak secret bytes: only counters, UUIDs (public
+ *     identifiers), enum-name strings filtered through device_*_name
+ *     / scrub_state_name (R98 P3-4 trailing-"unknown" tamper-resilient).
+ *   - Label values fed into the body are bounded: pool/device UUIDs
+ *     are 36-char hex (no escaping needed); enum-name strings are a
+ *     fixed allowlist. NO user-supplied strings (no dataset names, no
+ *     snapshot names) flow into Prometheus labels at v2.0 — defers the
+ *     Prometheus label-escape rule (R99 P2-1 line-injection class
+ *     extends to label-value-injection in the exposition format).
+ *     Forward-note: when per-dataset metrics are added, the dataset
+ *     name MUST be sanitized OR labels keyed by dataset_id only.
+ */
+
+/* Realloc-doubling growth bounded by STM_CTL_METRICS_MAX. Returns
+ * STM_OK on success, STM_ERANGE if the cap would be exceeded,
+ * STM_ENOMEM on alloc failure. *buf may be NULL on entry; sets
+ * *buf to the (possibly new) backing pointer. */
+static stm_status prom_grow(uint8_t **buf, uint32_t *cap, uint32_t want)
+{
+    if (want <= *cap) return STM_OK;
+    if (want > STM_CTL_METRICS_MAX) return STM_ERANGE;
+    uint32_t new_cap = (*cap == 0) ? STM_CTL_METRICS_INITIAL_CAP : *cap;
+    while (new_cap < want) {
+        if (new_cap > STM_CTL_METRICS_MAX / 2) {
+            new_cap = STM_CTL_METRICS_MAX;
+            break;
+        }
+        new_cap *= 2;
+    }
+    if (new_cap < want) return STM_ERANGE;
+    uint8_t *grown = realloc(*buf, new_cap);
+    if (!grown) return STM_ENOMEM;
+    *buf = grown;
+    *cap = new_cap;
+    return STM_OK;
+}
+
+/* vsnprintf-then-grow append. *len is updated on success; on failure
+ * the buffer state is unchanged from the caller's perspective (cap
+ * may have grown but len is preserved). */
+static stm_status prom_appendf(uint8_t **buf, uint32_t *cap, uint32_t *len,
+                                const char *fmt, ...)
+    __attribute__((format(printf, 4, 5)));
+
+static stm_status prom_appendf(uint8_t **buf, uint32_t *cap, uint32_t *len,
+                                const char *fmt, ...)
+{
+    /* First pass: measure with NULL/0 so we know how much to grow. */
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (n < 0) return STM_EIO;
+    /* +1 for the NUL that vsnprintf writes; Prometheus body itself
+     * doesn't need NUL termination but we use vsnprintf which always
+     * writes one. The trailing NUL is overwritten by the next
+     * append. */
+    if ((uint64_t)*len + (uint64_t)n + 1 > UINT32_MAX) return STM_ERANGE;
+    uint32_t need = *len + (uint32_t)n + 1;
+    stm_status rc = prom_grow(buf, cap, need);
+    if (rc != STM_OK) return rc;
+    va_start(ap, fmt);
+    int wrote = vsnprintf((char *)(*buf) + *len, *cap - *len, fmt, ap);
+    va_end(ap);
+    if (wrote < 0 || wrote != n) return STM_EIO;
+    *len += (uint32_t)wrote;
+    return STM_OK;
+}
+
+/* Per-device snapshot used for the metrics walk. Captured under
+ * stm_pool_lock_shared and rendered after release so format-time
+ * cost doesn't pin the pool roster lock. */
+typedef struct {
+    uint16_t           device_id;
+    uint8_t            uuid[16];
+    uint64_t           size_bytes;
+    stm_device_class   class_;
+    stm_device_role    role;
+    stm_device_state   state;
+} prom_device_snap;
+
+#define STM_CTL_PROM_DEVICES_CAP  STM_POOL_DEVICES_MAX
+
+static stm_status materialize_pool_metrics_prometheus(stm_ctl *c,
+                                                        ctl_session *s)
+{
+    if (!c->pool) return STM_EBACKEND;     /* gated at vops_open */
+
+    /* ── Gather snapshots ───────────────────────────────────────── */
+    uint8_t pool_uuid_b[16];
+    uuid_to_bytes(stm_pool_uuid(c->pool), pool_uuid_b);
+    char pool_uuid_s[UUID_HEX_LEN + 1];
+    uuid_format_hex(pool_uuid_b, pool_uuid_s);
+
+    /* Pool roster snapshot. */
+    pool_summary sum;
+    stm_pool_lock_shared(c->pool);
+    summarize_pool_locked(c->pool, &sum);
+    /* Per-device records. STM_POOL_DEVICES_MAX = 64 fits comfortably
+     * on the stack (64 × 48 bytes = 3 KiB). */
+    prom_device_snap devs[STM_CTL_PROM_DEVICES_CAP];
+    size_t total = stm_pool_device_count(c->pool);
+    if (total > STM_CTL_PROM_DEVICES_CAP) total = STM_CTL_PROM_DEVICES_CAP;
+    size_t n_devs = 0;
+    for (size_t i = 0; i < total; i++) {
+        const stm_pool_device *d =
+            stm_pool_device_info(c->pool, (uint16_t)i);
+        if (!d) continue;
+        prom_device_snap *out = &devs[n_devs++];
+        out->device_id = (uint16_t)i;
+        uuid_to_bytes(d->uuid, out->uuid);
+        out->size_bytes = d->size_bytes;
+        out->class_ = d->class_;
+        out->role = d->role;
+        out->state = d->state;
+    }
+    stm_pool_unlock_shared(c->pool);
+
+    /* fs stats (optional — when fs is unattached, fs gauges are
+     * omitted; the materializer still produces a valid response). */
+    bool have_fs = (c->fs != NULL);
+    stm_fs_stats fs_stats;
+    memset(&fs_stats, 0, sizeof fs_stats);
+    size_t dataset_count = 0;
+    if (have_fs) {
+        stm_status frc = stm_fs_stats_get(c->fs, &fs_stats);
+        if (frc != STM_OK) {
+            /* Wedged-OK posture: stm_fs_stats_get returns STM_OK with
+             * the wedged flag set, so a non-OK here is a real backend
+             * failure (alloc tree fault). Surface as STM_EBACKEND so
+             * the caller can distinguish from a clean unattached fs. */
+            return STM_EBACKEND;
+        }
+        stm_status drc = stm_fs_dataset_count(c->fs, &dataset_count);
+        if (drc != STM_OK) {
+            /* Same treatment: refuse the read on backend failure
+             * rather than emit partial metrics. */
+            return STM_EBACKEND;
+        }
+    }
+
+    /* Scrub status (optional). */
+    bool have_scrub = (c->scrub != NULL);
+    stm_scrub_status scrub_st;
+    memset(&scrub_st, 0, sizeof scrub_st);
+    if (have_scrub) {
+        stm_status src = stm_scrub_status_get(c->scrub, &scrub_st);
+        if (src != STM_OK) return STM_EBACKEND;
+    }
+
+    /* ── Format body ────────────────────────────────────────────── */
+    uint8_t *buf = NULL;
+    uint32_t cap = 0;
+    uint32_t len = 0;
+    stm_status rc;
+
+#define P(...) do { \
+    rc = prom_appendf(&buf, &cap, &len, __VA_ARGS__); \
+    if (rc != STM_OK) goto fail; \
+} while (0)
+
+    /* fs gauges (when attached). */
+    if (have_fs) {
+        P("# HELP stratum_pool_data_total_blocks Total data-area blocks.\n"
+          "# TYPE stratum_pool_data_total_blocks gauge\n"
+          "stratum_pool_data_total_blocks{pool=\"%s\"} %llu\n",
+          pool_uuid_s, (unsigned long long)fs_stats.data_total_blocks);
+        P("# HELP stratum_pool_data_allocated_blocks Allocated data-area blocks.\n"
+          "# TYPE stratum_pool_data_allocated_blocks gauge\n"
+          "stratum_pool_data_allocated_blocks{pool=\"%s\"} %llu\n",
+          pool_uuid_s, (unsigned long long)fs_stats.data_allocated_blocks);
+        P("# HELP stratum_pool_data_free_blocks Free data-area blocks.\n"
+          "# TYPE stratum_pool_data_free_blocks gauge\n"
+          "stratum_pool_data_free_blocks{pool=\"%s\"} %llu\n",
+          pool_uuid_s, (unsigned long long)fs_stats.data_free_blocks);
+        P("# HELP stratum_pool_data_pending_blocks Allocated-but-uncommitted blocks.\n"
+          "# TYPE stratum_pool_data_pending_blocks gauge\n"
+          "stratum_pool_data_pending_blocks{pool=\"%s\"} %llu\n",
+          pool_uuid_s, (unsigned long long)fs_stats.data_pending_blocks);
+        P("# HELP stratum_pool_n_allocated_ranges Distinct allocated ranges.\n"
+          "# TYPE stratum_pool_n_allocated_ranges gauge\n"
+          "stratum_pool_n_allocated_ranges{pool=\"%s\"} %llu\n",
+          pool_uuid_s, (unsigned long long)fs_stats.n_allocated_ranges);
+        P("# HELP stratum_pool_current_gen Pool transaction generation.\n"
+          "# TYPE stratum_pool_current_gen counter\n"
+          "stratum_pool_current_gen{pool=\"%s\"} %llu\n",
+          pool_uuid_s, (unsigned long long)fs_stats.current_gen);
+        P("# HELP stratum_pool_read_only 1 if mounted read-only.\n"
+          "# TYPE stratum_pool_read_only gauge\n"
+          "stratum_pool_read_only{pool=\"%s\"} %d\n",
+          pool_uuid_s, (int)fs_stats.read_only);
+        P("# HELP stratum_pool_wedged 1 if wedged (read-only-after-error).\n"
+          "# TYPE stratum_pool_wedged gauge\n"
+          "stratum_pool_wedged{pool=\"%s\"} %d\n",
+          pool_uuid_s, (int)fs_stats.wedged);
+        P("# HELP stratum_pool_datasets_total Number of registered datasets.\n"
+          "# TYPE stratum_pool_datasets_total gauge\n"
+          "stratum_pool_datasets_total{pool=\"%s\"} %llu\n",
+          pool_uuid_s, (unsigned long long)dataset_count);
+    }
+
+    /* Pool roster gauges. Always emitted (pool attached is the
+     * gate to reach this materializer). */
+    P("# HELP stratum_pool_devices_total Total devices in roster (incl. removed).\n"
+      "# TYPE stratum_pool_devices_total gauge\n"
+      "stratum_pool_devices_total{pool=\"%s\"} %u\n",
+      pool_uuid_s, (unsigned)sum.total);
+    P("# HELP stratum_pool_devices_live Live (non-removed) devices.\n"
+      "# TYPE stratum_pool_devices_live gauge\n"
+      "stratum_pool_devices_live{pool=\"%s\"} %u\n",
+      pool_uuid_s, (unsigned)sum.live);
+    P("# HELP stratum_pool_size_bytes_total Total roster size (incl. removed).\n"
+      "# TYPE stratum_pool_size_bytes_total gauge\n"
+      "stratum_pool_size_bytes_total{pool=\"%s\"} %llu\n",
+      pool_uuid_s, (unsigned long long)sum.total_size_bytes);
+    P("# HELP stratum_pool_size_bytes_live Live (non-removed) roster size.\n"
+      "# TYPE stratum_pool_size_bytes_live gauge\n"
+      "stratum_pool_size_bytes_live{pool=\"%s\"} %llu\n",
+      pool_uuid_s, (unsigned long long)sum.live_size_bytes);
+
+    P("# HELP stratum_pool_devices_by_state Per-state device counts.\n"
+      "# TYPE stratum_pool_devices_by_state gauge\n");
+    for (uint8_t st = 0; st < 7; st++) {
+        P("stratum_pool_devices_by_state{pool=\"%s\",state=\"%s\"} %u\n",
+          pool_uuid_s, device_state_name((stm_device_state)st),
+          (unsigned)sum.per_state[st]);
+    }
+    P("# HELP stratum_pool_devices_by_class Per-class device counts.\n"
+      "# TYPE stratum_pool_devices_by_class gauge\n");
+    for (uint8_t cls = 0; cls < 5; cls++) {
+        P("stratum_pool_devices_by_class{pool=\"%s\",class=\"%s\"} %u\n",
+          pool_uuid_s, device_class_name((stm_device_class)cls),
+          (unsigned)sum.per_class[cls]);
+    }
+    P("# HELP stratum_pool_devices_by_role Per-role device counts.\n"
+      "# TYPE stratum_pool_devices_by_role gauge\n");
+    for (uint8_t r = 0; r < 5; r++) {
+        P("stratum_pool_devices_by_role{pool=\"%s\",role=\"%s\"} %u\n",
+          pool_uuid_s, device_role_name((stm_device_role)r),
+          (unsigned)sum.per_role[r]);
+    }
+
+    /* Per-device records. */
+    if (n_devs > 0) {
+        P("# HELP stratum_device_size_bytes Per-device size.\n"
+          "# TYPE stratum_device_size_bytes gauge\n");
+        for (size_t i = 0; i < n_devs; i++) {
+            char dev_uuid_s[UUID_HEX_LEN + 1];
+            uuid_format_hex(devs[i].uuid, dev_uuid_s);
+            P("stratum_device_size_bytes{pool=\"%s\",device=\"%s\"} %llu\n",
+              pool_uuid_s, dev_uuid_s,
+              (unsigned long long)devs[i].size_bytes);
+        }
+        P("# HELP stratum_device_info Per-device metadata; value always 1.\n"
+          "# TYPE stratum_device_info gauge\n");
+        for (size_t i = 0; i < n_devs; i++) {
+            char dev_uuid_s[UUID_HEX_LEN + 1];
+            uuid_format_hex(devs[i].uuid, dev_uuid_s);
+            P("stratum_device_info{pool=\"%s\",device=\"%s\","
+              "device_id=\"%u\",class=\"%s\",role=\"%s\",state=\"%s\"} 1\n",
+              pool_uuid_s, dev_uuid_s, (unsigned)devs[i].device_id,
+              device_class_name(devs[i].class_),
+              device_role_name(devs[i].role),
+              device_state_name(devs[i].state));
+        }
+    }
+
+    /* Scrub gauges + counters (optional). */
+    if (have_scrub) {
+        P("# HELP stratum_scrub_state Scrub state (1 = active state).\n"
+          "# TYPE stratum_scrub_state gauge\n");
+        static const stm_scrub_state STATES[] = {
+            STM_SCRUB_STATE_IDLE,    STM_SCRUB_STATE_RUNNING,
+            STM_SCRUB_STATE_PAUSED,  STM_SCRUB_STATE_COMPLETED,
+        };
+        for (size_t i = 0; i < sizeof STATES / sizeof STATES[0]; i++) {
+            P("stratum_scrub_state{pool=\"%s\",state=\"%s\"} %d\n",
+              pool_uuid_s, scrub_state_name(STATES[i]),
+              (int)(scrub_st.state == STATES[i]));
+        }
+        P("# HELP stratum_scrub_blocks_verified Blocks successfully verified.\n"
+          "# TYPE stratum_scrub_blocks_verified counter\n"
+          "stratum_scrub_blocks_verified{pool=\"%s\"} %llu\n",
+          pool_uuid_s, (unsigned long long)scrub_st.blocks_verified);
+        P("# HELP stratum_scrub_blocks_failed Blocks failing verification.\n"
+          "# TYPE stratum_scrub_blocks_failed counter\n"
+          "stratum_scrub_blocks_failed{pool=\"%s\"} %llu\n",
+          pool_uuid_s, (unsigned long long)scrub_st.blocks_failed);
+        P("# HELP stratum_scrub_blocks_repaired Blocks repaired after failure.\n"
+          "# TYPE stratum_scrub_blocks_repaired counter\n"
+          "stratum_scrub_blocks_repaired{pool=\"%s\"} %llu\n",
+          pool_uuid_s, (unsigned long long)scrub_st.blocks_repaired);
+        P("# HELP stratum_scrub_blocks_unrepairable Failed blocks that could not be repaired.\n"
+          "# TYPE stratum_scrub_blocks_unrepairable counter\n"
+          "stratum_scrub_blocks_unrepairable{pool=\"%s\"} %llu\n",
+          pool_uuid_s, (unsigned long long)scrub_st.blocks_unrepairable);
+        P("# HELP stratum_scrub_ranges_processed Allocated ranges processed.\n"
+          "# TYPE stratum_scrub_ranges_processed counter\n"
+          "stratum_scrub_ranges_processed{pool=\"%s\"} %llu\n",
+          pool_uuid_s, (unsigned long long)scrub_st.ranges_processed);
+    }
+
+#undef P
+
+    /* Hand the buffer to the session; vops_clunk frees. */
+    s->bulk_buf = buf;
+    s->bulk_len = len;
+    return STM_OK;
+
+fail:
+    free(buf);
+    return rc;
+}
+
 static stm_status materialize_locked(stm_ctl *c, ctl_session *s)
 {
     switch (qid_kind(s->qid_path)) {
@@ -1259,6 +1639,8 @@ static stm_status materialize_locked(stm_ctl *c, ctl_session *s)
     case KIND_ADMIN_PEER:         return materialize_admin_peer(c, s);
     case KIND_DEBUG_ALLOC:        return materialize_debug_alloc(c, s);
     case KIND_POOL_SCRUB:         return materialize_pool_scrub(c, s);
+    case KIND_POOL_METRICS_PROMETHEUS:
+        return materialize_pool_metrics_prometheus(c, s);
     case KIND_ROOT:
     case KIND_POOLS_DIR:
     case KIND_POOL_DIR:
@@ -1269,6 +1651,7 @@ static stm_status materialize_locked(stm_ctl *c, ctl_session *s)
     case KIND_ADMIN_DIR:
     case KIND_DEBUG_DIR:
     case KIND_DEBUG_ALLOC_DIR:
+    case KIND_POOL_METRICS_DIR:       /* dir; no body */
     case KIND_EVENTS:                 /* served direct from event_buf */
     case KIND_ADMIN_CLEAR_EVENTS:     /* write-only; no body to materialize */
     case KIND_POOL_SCRUB_TRIGGER:     /* write-only; no body to materialize */
@@ -1311,7 +1694,8 @@ static stm_status stat_at(stm_ctl *c, uint64_t qid_path,
     if (k == KIND_POOLS_DIR || k == KIND_POOL_DIR
         || k == KIND_POOL_STATUS || k == KIND_DEVICES_DIR
         || k == KIND_DEVICE_DIR || k == KIND_DEVICE_STATUS
-        || k == KIND_POOL_SCRUB || k == KIND_POOL_SCRUB_TRIGGER) {
+        || k == KIND_POOL_SCRUB || k == KIND_POOL_SCRUB_TRIGGER
+        || k == KIND_POOL_METRICS_DIR || k == KIND_POOL_METRICS_PROMETHEUS) {
         if (qid_pool_idx(qid_path) != 0) return STM_ENOENT;
     }
 
@@ -1325,6 +1709,13 @@ static stm_status stat_at(stm_ctl *c, uint64_t qid_path,
     if ((k == KIND_POOL_STATUS || k == KIND_DEVICES_DIR) && !c->pool) {
         return STM_ENOENT;
     }
+    /* /pools/<uuid>/metrics/ + /metrics/prometheus exist iff a pool is
+     * attached. World-readable (mode 0444 / 0555) — no admin gate. The
+     * fs/scrub attachments are optional; the materializer adapts the
+     * body shape to what's available. */
+    if ((k == KIND_POOL_METRICS_DIR || k == KIND_POOL_METRICS_PROMETHEUS)
+            && !c->pool)
+        return STM_ENOENT;
     /* /pools/<uuid>/scrub requires (a) pool attached (so the dir
      * exists) AND (b) scrub attached (so we have a handle to query).
      * A pool-attached-but-no-scrub state surfaces as "scrub file
@@ -1500,6 +1891,21 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
               && str_eq(name, name_len,
                           KIND_META[KIND_POOL_SCRUB_TRIGGER].static_name))
             return stat_at(c, qid_root(KIND_POOL_SCRUB_TRIGGER), out);
+        /* /pools/<uuid>/metrics/ exists unconditionally when c->pool
+         * is attached — fs/scrub attachments shape the body content
+         * but don't gate the dirent. World-readable observability. */
+        if (str_eq(name, name_len,
+                     KIND_META[KIND_POOL_METRICS_DIR].static_name))
+            return stat_at(c, qid_root(KIND_POOL_METRICS_DIR), out);
+        return STM_ENOENT;
+
+    case KIND_POOL_METRICS_DIR:
+        /* P9-CTL-1e: /pools/<uuid>/metrics/ children — only
+         * "prometheus" today; OTLP exposition deferred. */
+        if (!c->pool) return STM_ENOENT;
+        if (str_eq(name, name_len,
+                     KIND_META[KIND_POOL_METRICS_PROMETHEUS].static_name))
+            return stat_at(c, qid_root(KIND_POOL_METRICS_PROMETHEUS), out);
         return STM_ENOENT;
 
     case KIND_DEVICES_DIR: {
@@ -1611,6 +2017,7 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
     case KIND_DATASET_DELETE_SNAPSHOT:
     case KIND_DATASET_HOLD_SNAPSHOT:
     case KIND_DATASET_RELEASE_SNAPSHOT:
+    case KIND_POOL_METRICS_PROMETHEUS:
     case KIND_MAX:
         break;
     }
@@ -1689,7 +2096,17 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
             rc = emit_entry(c, cb, cb_ctx, qid_root(KIND_POOL_SCRUB_TRIGGER));
             if (rc != STM_OK) return rc;
         }
-        return STM_OK;
+        /* /pools/<uuid>/metrics/ is unconditional — observability is
+         * always offered. Body content adapts to fs/scrub attachment;
+         * see materialize_pool_metrics_prometheus. */
+        return emit_entry(c, cb, cb_ctx, qid_root(KIND_POOL_METRICS_DIR));
+
+    case KIND_POOL_METRICS_DIR:
+        /* /pools/<uuid>/metrics/ — single child today. Future
+         * sub-chunks add /metrics/opentelemetry (OTLP exposition). */
+        if (!c->pool) return STM_ENOENT;
+        return emit_entry(c, cb, cb_ctx,
+            qid_root(KIND_POOL_METRICS_PROMETHEUS));
 
     case KIND_DEVICES_DIR: {
         if (!c->pool) return STM_ENOENT;
@@ -1840,6 +2257,7 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
     case KIND_DATASET_DELETE_SNAPSHOT:
     case KIND_DATASET_HOLD_SNAPSHOT:
     case KIND_DATASET_RELEASE_SNAPSHOT:
+    case KIND_POOL_METRICS_PROMETHEUS:
     case KIND_MAX:
         break;
     }
@@ -1886,7 +2304,8 @@ static stm_status vops_open(void *ctx, uint32_t fid, uint64_t qid_path,
     if (meta->is_dir) {
         /* Validate the directory still exists in the current state. */
         if ((k == KIND_POOL_DIR || k == KIND_DEVICES_DIR
-                || k == KIND_DEVICE_DIR) && !c->pool)
+                || k == KIND_DEVICE_DIR
+                || k == KIND_POOL_METRICS_DIR) && !c->pool)
             return STM_ENOENT;
         if (k == KIND_DEVICE_DIR) {
             /* Slot must still be in range. */
@@ -1919,7 +2338,8 @@ static stm_status vops_open(void *ctx, uint32_t fid, uint64_t qid_path,
     }
 
     /* File kinds: validate context, materialize body. */
-    if ((k == KIND_POOL_STATUS || k == KIND_DEVICE_STATUS) && !c->pool)
+    if ((k == KIND_POOL_STATUS || k == KIND_DEVICE_STATUS
+            || k == KIND_POOL_METRICS_PROMETHEUS) && !c->pool)
         return STM_ENOENT;
     if ((k == KIND_DATASET_PROPERTIES) && !c->fs) return STM_ENOENT;
     if (k == KIND_DATASET_CREATE_SNAPSHOT
@@ -2049,6 +2469,22 @@ static stm_status vops_read(void *ctx, uint32_t fid, uint64_t qid_path,
         uint32_t avail = s->snapshot_len - (uint32_t)offset;
         if (*inout_len > avail) *inout_len = avail;
         memcpy(buf, c->event_buf + offset, *inout_len);
+        pthread_mutex_unlock(&c->mu);
+        return STM_OK;
+    }
+    /* P9-CTL-1e: bulk-format kinds (currently only /pools/<uuid>/
+     * metrics/prometheus) live in s->bulk_buf — heap-allocated at
+     * Topen, freed at Tclunk. The bulk_buf is per-session-owned, so
+     * concurrent reads at varying offsets see the same snapshot. */
+    if (s->bulk_buf) {
+        if (offset >= s->bulk_len) {
+            *inout_len = 0;
+            pthread_mutex_unlock(&c->mu);
+            return STM_OK;
+        }
+        uint32_t avail = s->bulk_len - (uint32_t)offset;
+        if (*inout_len > avail) *inout_len = avail;
+        memcpy(buf, s->bulk_buf + offset, *inout_len);
         pthread_mutex_unlock(&c->mu);
         return STM_OK;
     }

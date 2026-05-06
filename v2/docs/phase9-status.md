@@ -639,8 +639,55 @@ language bindings, future kernel module) is a 9P consumer.
                   yet.
             - [ ] **P9-CTL-1d-tracing** — pending; /tracing/enable +
                   /tracing/sample-rate + /tracing/traces (ARCH §14.6).
-      - [ ] **P9-CTL-1e /metrics/** — pending; Prometheus +
-            OpenTelemetry exposition.
+      - [x] **P9-CTL-1e /metrics/** — Prometheus exposition surface
+            (per ARCH §14.8.1). Adds /pools/<uuid>/metrics/ +
+            /pools/<uuid>/metrics/prometheus (world-readable mode 0444;
+            no admin gate — exposition is public). Two new kinds
+            (KIND_POOL_METRICS_DIR, KIND_POOL_METRICS_PROMETHEUS);
+            KIND_MAX = 27 (was 25). Body content adapts to attachment:
+              - pool only          → roster gauges + per-device records
+              - fs+pool            → adds fs gauges (data blocks,
+                                     gen, dataset count, RO+wedged)
+              - fs+pool+scrub      → adds scrub state + counters
+            Per-fid bulk_buf (heap-allocated, capped at STM_CTL_METRICS_
+            MAX = 64 KiB) used for the body — sized for forward
+            additions like per-dataset counters or latency histograms;
+            today's body is well under 4 KiB on a 1-device test pool.
+            New helpers: prom_grow (realloc-doubling growth bounded by
+            the cap; STM_ERANGE on cap exceed), prom_appendf
+            (vsnprintf-then-grow with __attribute__((format(printf,
+            4, 5)))). Lock posture: each subsystem accessor takes its
+            own lock; no cross-subsystem lock held. Pool roster snapshot
+            captured under stm_pool_lock_shared, fs gauges via
+            stm_fs_stats_get + stm_fs_dataset_count, scrub status via
+            stm_scrub_status_get — independently. Output formatted
+            after release. Trust boundary: NO user-supplied strings
+            (dataset names, snapshot names) flow into Prometheus
+            labels at v2.0; only UUIDs (36-char hex, no escaping
+            needed) and enum-name strings filtered through device_*_
+            name / scrub_state_name. Forward-noted: when per-dataset
+            metrics are added, the dataset name MUST be sanitized OR
+            labels keyed by dataset_id only (R99 P2-1 line-injection
+            class extends to label-value-injection in the exposition
+            format). 14 -1e tests in test_ctl.c (124 → 138):
+            ctl_e1_metrics_dir_in_pool_listing,
+            ctl_e1_metrics_dir_listing_has_prometheus,
+            ctl_e1_metrics_prometheus_world_readable_topen_succeeds,
+            ctl_e1_metrics_prometheus_admin_topen_succeeds,
+            ctl_e1_metrics_prometheus_body_has_pool_uuid_and_help_lines,
+            ctl_e1_metrics_prometheus_body_has_fs_gauges_when_attached,
+            ctl_e1_metrics_prometheus_body_omits_scrub_when_unattached,
+            ctl_e1_metrics_prometheus_body_includes_scrub_when_attached,
+            ctl_e1_metrics_prometheus_per_device_records_present,
+            ctl_e1_metrics_prometheus_topen_for_write_eacces,
+            ctl_e1_metrics_prometheus_tstat_reports_world_readable_file,
+            ctl_e1_metrics_prometheus_offset_resumption_consistent,
+            ctl_e1_metrics_prometheus_body_fits_under_metrics_cap,
+            ctl_e1_metrics_prometheus_devices_by_state_complete.
+            Forward-notes: OTLP exposition (binary protobuf format)
+            deferred — sidecar translator is the simplest path.
+            Per-dataset op counters + latency histograms deferred
+            to instrumentation hot-path work.
 
 - [ ] **P9-CLI-1 stratum CLI** — pending; thin (~1000 LOC)
       wrapper over /ctl/. Subcommands: pool, dataset, snapshot,

@@ -38,8 +38,43 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P8.5 cleanup-2 — family-wide RO tests + result=err:rc
-  enrichment (this commit). 43 ctest suites green default. test_ctl
+- **Tip**: P9-CTL-1e — /pools/<uuid>/metrics/prometheus per-pool
+  Prometheus exposition (this commit). 43 ctest suites green
+  default. test_ctl 138/138 (was 124 at R109 close; +14 -1e tests).
+  **P9-CTL-1e** adds the per-pool /metrics/ subtree (ARCH §14.8.1):
+  /pools/<uuid>/metrics/ + /pools/<uuid>/metrics/prometheus
+  (world-readable mode 0444 — no admin gate, exposition is public).
+  KIND_MAX = 27 (was 25); two new kinds (KIND_POOL_METRICS_DIR,
+  KIND_POOL_METRICS_PROMETHEUS). Body content adapts to attachment:
+  pool-only renders roster gauges + per-device records; fs+pool
+  adds fs gauges (data blocks, current_gen, datasets_total,
+  read_only/wedged); fs+pool+scrub adds scrub state gauge +
+  counters. Per-fid `bulk_buf` (heap-allocated, capped at
+  STM_CTL_METRICS_MAX = 64 KiB) used for the body — the FIRST kind
+  whose worst-case exceeds STM_CTL_BODY_MAX (1 KiB); future bulk-
+  format kinds (debug tree-walk dumps, etc.) inherit the same
+  pattern. New static helpers prom_grow (realloc-doubling, STM_
+  ERANGE on cap exceed) + prom_appendf (vsnprintf-then-grow with
+  __attribute__((format(printf, 4, 5)))). Lock posture: each
+  subsystem accessor takes its own lock; no cross-subsystem lock
+  held concurrently. Trust boundary (CLAUDE.md clause 10): NO
+  user-supplied strings flow into Prometheus labels at v2.0 — only
+  UUIDs (36-char hex, no escaping needed) and enum-name strings
+  filtered through device_*_name / scrub_state_name. Forward-note:
+  per-dataset metrics MUST sanitize dataset names OR key labels by
+  dataset_id (R99 P2-1 line-injection class extends to label-value-
+  injection in the exposition format). 14 -1e tests cover listing,
+  mode/world-readable, body content (HELP+TYPE comments, pool/
+  device labels, fs gauges, scrub-omitted-when-unattached, scrub-
+  present-when-attached), per-device records, mode-gate (OWRITE→
+  EACCES), Tstat, offset-resumption snapshot consistency, body
+  fits-under-cap, all 7 device states present. R110 audit pending.
+  OTLP exposition (binary protobuf) deferred — sidecar translator
+  is the simplest path. Per-dataset op counters + latency
+  histograms deferred until instrumentation hot-path work.
+
+- **Pre-tip-1**: P8.5 cleanup-2 — family-wide RO tests + result=err:rc
+  enrichment. 43 ctest suites green default. test_ctl
   124/124 (was 120 at R108 close; +4 R109 cleanup tests). **R109
   audit-light close** (isomorphic to R107 — direct doctrine carry,
   no separate prosecutor). Closes R108 P3-2 + P3-5 forward-notes:
@@ -62,7 +97,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   result=err:enoent). 2 R109 P3-2 RO-mount regression tests for
   hold + release.
 
-- **Pre-tip-1**: P9-CTL-1d-actions-snapshot-hold R108 close —
+- **Pre-tip-2**: P9-CTL-1d-actions-snapshot-hold R108 close —
   YELLOW MERGE, 0 P0 + 0 P1 + 1 P2 + 5 P3. 43 ctest
   suites green default. test_ctl 120/120 (was 112 at R107 close;
   +7 -1d-actions-snapshot-hold + 1 R108 P2-1 regression test).

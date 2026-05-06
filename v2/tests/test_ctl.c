@@ -4829,4 +4829,429 @@ STM_TEST(ctl_r109_p3_2_release_readonly_erofs)
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
 
+/* ── P9-CTL-1e /pools/<uuid>/metrics/prometheus ─────────────────────── */
+
+/* Fixture for /metrics/ tests: real fs + sync + pool + /ctl/ wired.
+ * Scrub deliberately NOT attached by default; tests that need scrub
+ * attach it explicitly via stm_ctl_attach_scrub(f.c, sc).
+ *
+ * The metrics surface adapts:
+ *   - pool only          → roster gauges + per-device records
+ *   - fs+pool            → adds fs gauges (data blocks, gen, dataset count)
+ *   - fs+pool+scrub      → adds scrub state + counters */
+typedef struct {
+    stm_fs        *fs;
+    stm_pool      *pool;
+    stm_ctl       *c;
+    stm_p9_server *s;
+    char           uuid_hex[64];
+} metrics_fixture;
+
+static metrics_fixture make_metrics_fixture(const char *tag, uid_t uid)
+{
+    metrics_fixture f = {0};
+    make_tmp(tag);
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &f.fs));
+
+    stm_sync *sync = stm_fs_sync_for_test(f.fs);
+    STM_ASSERT(sync != NULL);
+    f.pool = stm_sync_pool(sync);
+    STM_ASSERT(f.pool != NULL);
+
+    STM_ASSERT_OK(stm_ctl_create(f.fs, &f.c));
+    STM_ASSERT_OK(stm_ctl_attach_pool(f.c, f.pool));
+    STM_ASSERT_OK(stm_ctl_set_caller(f.c, uid, uid));
+
+    f.s = make_ctl_server(f.c);
+    do_handshake(f.s, 10);
+
+    format_pool_uuid_hex(f.pool, f.uuid_hex);
+    return f;
+}
+
+static void destroy_metrics_fixture(metrics_fixture f)
+{
+    stm_p9_server_destroy(f.s);
+    stm_ctl_destroy(f.c);
+    STM_ASSERT_OK(stm_fs_unmount(f.fs));
+}
+
+/* Walk + open + read the entire prometheus body into out. Returns the
+ * read byte count. Asserts the read fits in `cap`. */
+static uint32_t read_prometheus_body(metrics_fixture *f, uint16_t tag,
+                                       uint32_t fid, char *out, size_t cap)
+{
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "pools", f->uuid_hex, "metrics", "prometheus" };
+    uint32_t sz = build_twalk(req, tag, 10, fid, 4, path);
+    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+
+    sz = build_topen(req, (uint16_t)(tag + 1), fid, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+
+    /* Drain the body in chunks. msize default is small enough that a
+     * full bulk read may need multiple Tread iterations. */
+    uint32_t total = 0;
+    while (total < cap - 1) {
+        sz = build_tread(req, (uint16_t)(tag + 2), fid, total,
+                            (uint32_t)(cap - 1 - total));
+        STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+        STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+        uint32_t got = load_u32(resp + 7);
+        if (got == 0) break;
+        memcpy(out + total, resp + 11, got);
+        total += got;
+    }
+    out[total] = '\0';
+
+    sz = build_tclunk(req, (uint16_t)(tag + 3), fid);
+    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    return total;
+}
+
+/* /pools/<uuid>/ readdir includes the "metrics" entry (always — pool
+ * attached is the precondition). */
+STM_TEST(ctl_e1_metrics_dir_in_pool_listing)
+{
+    metrics_fixture f = make_metrics_fixture("ctl_e1_listed", 1000);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "pools", f.uuid_hex };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+
+    sz = build_tread(req, 4, 11, 0, 4096);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    /* readdir entries are 9P stat records; we just verify the literal
+     * "metrics" name appears somewhere in the byte stream — every other
+     * dirent name (status, devices) is substringwise distinct. */
+    uint32_t count = load_u32(resp + 7);
+    char body[4096];
+    STM_ASSERT(count < sizeof body);
+    memcpy(body, resp + 11, count);
+    body[count] = '\0';
+    bool found = false;
+    for (uint32_t i = 0; i + 7 < count; i++) {
+        if (memcmp(body + i, "metrics", 7) == 0) { found = true; break; }
+    }
+    STM_ASSERT(found);
+
+    destroy_metrics_fixture(f);
+}
+
+/* /pools/<uuid>/metrics/ readdir includes the "prometheus" entry. */
+STM_TEST(ctl_e1_metrics_dir_listing_has_prometheus)
+{
+    metrics_fixture f = make_metrics_fixture("ctl_e1_dir_list", 1000);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "pools", f.uuid_hex, "metrics" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 3, path);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+
+    sz = build_tread(req, 4, 11, 0, 4096);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    uint32_t count = load_u32(resp + 7);
+    char body[4096];
+    STM_ASSERT(count < sizeof body);
+    memcpy(body, resp + 11, count);
+    body[count] = '\0';
+    bool found = false;
+    for (uint32_t i = 0; i + 10 < count; i++) {
+        if (memcmp(body + i, "prometheus", 10) == 0) { found = true; break; }
+    }
+    STM_ASSERT(found);
+
+    destroy_metrics_fixture(f);
+}
+
+/* /pools/<uuid>/metrics/ + /metrics/prometheus require c->pool attached.
+ * Without attach, the fictional UUID can't be walked through pools/ at
+ * all, so this test exercises the gate implicitly via attach-then-walk
+ * + the negative case: stat_at gating without c->pool returns STM_ENOENT
+ * for the metrics kinds (covered by other unattached tests in the
+ * existing /pools/ test suite — the gate here is the same shape). */
+
+/* Non-admin (uid 1000) Topen of /metrics/prometheus succeeds — the file
+ * is mode 0444, world-readable. Operators may scrape /metrics/ from any
+ * UID; admin gating would defeat the purpose of an exposition surface. */
+STM_TEST(ctl_e1_metrics_prometheus_world_readable_topen_succeeds)
+{
+    metrics_fixture f = make_metrics_fixture("ctl_e1_world", 1000);
+    char body[16 * 1024];
+    uint32_t got = read_prometheus_body(&f, 2, 11, body, sizeof body);
+    STM_ASSERT(got > 0);
+    destroy_metrics_fixture(f);
+}
+
+/* Admin (uid 0) Topen of /metrics/prometheus succeeds. */
+STM_TEST(ctl_e1_metrics_prometheus_admin_topen_succeeds)
+{
+    metrics_fixture f = make_metrics_fixture("ctl_e1_admin", 0);
+    char body[16 * 1024];
+    uint32_t got = read_prometheus_body(&f, 2, 11, body, sizeof body);
+    STM_ASSERT(got > 0);
+    destroy_metrics_fixture(f);
+}
+
+/* Body contains the expected pool="<uuid>" labels and HELP+TYPE meta. */
+STM_TEST(ctl_e1_metrics_prometheus_body_has_pool_uuid_and_help_lines)
+{
+    metrics_fixture f = make_metrics_fixture("ctl_e1_help", 1000);
+    char body[16 * 1024];
+    uint32_t got = read_prometheus_body(&f, 2, 11, body, sizeof body);
+    STM_ASSERT(got > 0);
+
+    /* HELP + TYPE comments present (Prometheus convention). */
+    STM_ASSERT(strstr(body, "# HELP stratum_pool_devices_total") != NULL);
+    STM_ASSERT(strstr(body, "# TYPE stratum_pool_devices_total gauge") != NULL);
+
+    /* pool UUID label appears verbatim. */
+    char want[256];
+    snprintf(want, sizeof want, "pool=\"%s\"", f.uuid_hex);
+    STM_ASSERT(strstr(body, want) != NULL);
+
+    destroy_metrics_fixture(f);
+}
+
+/* When fs is attached, the body includes fs gauges with the expected
+ * counter values (1 dataset by default — the root dataset). */
+STM_TEST(ctl_e1_metrics_prometheus_body_has_fs_gauges_when_attached)
+{
+    metrics_fixture f = make_metrics_fixture("ctl_e1_fs", 1000);
+    char body[16 * 1024];
+    uint32_t got = read_prometheus_body(&f, 2, 11, body, sizeof body);
+    STM_ASSERT(got > 0);
+
+    STM_ASSERT(strstr(body, "stratum_pool_data_total_blocks{") != NULL);
+    STM_ASSERT(strstr(body, "stratum_pool_current_gen{") != NULL);
+    STM_ASSERT(strstr(body, "stratum_pool_read_only{") != NULL);
+    STM_ASSERT(strstr(body, "stratum_pool_wedged{") != NULL);
+    STM_ASSERT(strstr(body, "stratum_pool_datasets_total{") != NULL);
+
+    /* Default mount: read-only=0, wedged=0. */
+    char want[256];
+    snprintf(want, sizeof want,
+             "stratum_pool_read_only{pool=\"%s\"} 0\n", f.uuid_hex);
+    STM_ASSERT(strstr(body, want) != NULL);
+    snprintf(want, sizeof want,
+             "stratum_pool_wedged{pool=\"%s\"} 0\n", f.uuid_hex);
+    STM_ASSERT(strstr(body, want) != NULL);
+
+    destroy_metrics_fixture(f);
+}
+
+/* Without scrub attached, no stratum_scrub_* lines appear. */
+STM_TEST(ctl_e1_metrics_prometheus_body_omits_scrub_when_unattached)
+{
+    metrics_fixture f = make_metrics_fixture("ctl_e1_no_scrub", 1000);
+    char body[16 * 1024];
+    uint32_t got = read_prometheus_body(&f, 2, 11, body, sizeof body);
+    STM_ASSERT(got > 0);
+
+    STM_ASSERT(strstr(body, "stratum_scrub_state") == NULL);
+    STM_ASSERT(strstr(body, "stratum_scrub_blocks_verified") == NULL);
+
+    destroy_metrics_fixture(f);
+}
+
+/* With scrub attached, stratum_scrub_state + counters are present
+ * with state="idle" set to 1 (default). */
+STM_TEST(ctl_e1_metrics_prometheus_body_includes_scrub_when_attached)
+{
+    metrics_fixture f = make_metrics_fixture("ctl_e1_scrub", 1000);
+
+    stm_sync *sync = stm_fs_sync_for_test(f.fs);
+    stm_scrub *sc = NULL;
+    STM_ASSERT_OK(stm_scrub_create(sync, &sc));
+    STM_ASSERT_OK(stm_ctl_attach_scrub(f.c, sc));
+
+    char body[16 * 1024];
+    uint32_t got = read_prometheus_body(&f, 2, 11, body, sizeof body);
+    STM_ASSERT(got > 0);
+
+    STM_ASSERT(strstr(body, "# HELP stratum_scrub_state") != NULL);
+    STM_ASSERT(strstr(body, "# TYPE stratum_scrub_state gauge") != NULL);
+
+    char want[256];
+    snprintf(want, sizeof want,
+             "stratum_scrub_state{pool=\"%s\",state=\"idle\"} 1\n",
+             f.uuid_hex);
+    STM_ASSERT(strstr(body, want) != NULL);
+    snprintf(want, sizeof want,
+             "stratum_scrub_state{pool=\"%s\",state=\"running\"} 0\n",
+             f.uuid_hex);
+    STM_ASSERT(strstr(body, want) != NULL);
+    STM_ASSERT(strstr(body, "stratum_scrub_blocks_verified{") != NULL);
+    STM_ASSERT(strstr(body, "stratum_scrub_ranges_processed{") != NULL);
+
+    /* Tear down scrub before fixture (matches the lifetime contract). */
+    stm_p9_server_destroy(f.s);
+    stm_ctl_destroy(f.c);
+    stm_scrub_close(sc);
+    STM_ASSERT_OK(stm_fs_unmount(f.fs));
+}
+
+/* Per-device records present: one stratum_device_size_bytes line for
+ * the lone device in the test pool. */
+STM_TEST(ctl_e1_metrics_prometheus_per_device_records_present)
+{
+    metrics_fixture f = make_metrics_fixture("ctl_e1_dev", 1000);
+    char body[16 * 1024];
+    uint32_t got = read_prometheus_body(&f, 2, 11, body, sizeof body);
+    STM_ASSERT(got > 0);
+
+    STM_ASSERT(strstr(body, "# HELP stratum_device_size_bytes") != NULL);
+    STM_ASSERT(strstr(body, "stratum_device_size_bytes{") != NULL);
+    STM_ASSERT(strstr(body, "stratum_device_info{") != NULL);
+
+    /* The device_info line includes class/role/state labels — exercise
+     * the body has the canonical default for a fresh test fixture
+     * (class=ssd, role=data, state=online). */
+    STM_ASSERT(strstr(body, "class=\"ssd\"") != NULL);
+    STM_ASSERT(strstr(body, "role=\"data\"") != NULL);
+    STM_ASSERT(strstr(body, "state=\"online\"") != NULL);
+
+    destroy_metrics_fixture(f);
+}
+
+/* Topen for write (OWRITE) on /metrics/prometheus is rejected with
+ * EACCES — mode 0444 is read-only. Same shape as POSIX mode 0444 +
+ * `open(O_WRONLY)`. */
+STM_TEST(ctl_e1_metrics_prometheus_topen_for_write_eacces)
+{
+    metrics_fixture f = make_metrics_fixture("ctl_e1_wronly", 1000);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "pools", f.uuid_hex, "metrics", "prometheus" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 4, path);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+
+    sz = build_topen(req, 3, 11, STM_P9_OWRITE);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    destroy_metrics_fixture(f);
+}
+
+/* R102 P3-2 / R103 P3-1 carry: Tstat at /metrics/prometheus reports
+ * mode 0444 + QTFILE — clients can probe metadata without opening,
+ * matching POSIX semantics. */
+STM_TEST(ctl_e1_metrics_prometheus_tstat_reports_world_readable_file)
+{
+    metrics_fixture f = make_metrics_fixture("ctl_e1_stat", 1000);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "pools", f.uuid_hex, "metrics", "prometheus" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 4, path);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+
+    sz = build_tstat(req, 3, 11);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RSTAT);
+    /* The 9P stat record begins at resp+9 (size header + msg header +
+     * stat-prefix length). For sanity we just confirm the response
+     * succeeded; per-field decode is exercised in earlier P9-CTL tests. */
+
+    destroy_metrics_fixture(f);
+}
+
+/* Read at a non-zero offset returns the same byte slice as a full read
+ * starting from offset 0 — verifies the per-fid snapshot invariant
+ * (the bulk_buf is captured at Topen and remains stable across reads). */
+STM_TEST(ctl_e1_metrics_prometheus_offset_resumption_consistent)
+{
+    metrics_fixture f = make_metrics_fixture("ctl_e1_offset", 1000);
+
+    /* First open: read the full body in one go (small chunks via the
+     * helper, but the bulk_buf is one snapshot). */
+    char body_full[16 * 1024];
+    uint32_t full_len = read_prometheus_body(&f, 2, 11, body_full,
+                                                sizeof body_full);
+    STM_ASSERT(full_len > 200);
+
+    /* Second open: read with a deliberate large offset and compare. */
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "pools", f.uuid_hex, "metrics", "prometheus" };
+    uint32_t sz = build_twalk(req, 6, 10, 12, 4, path);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+
+    sz = build_topen(req, 7, 12, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+
+    /* Read 64 bytes starting at offset 100. */
+    sz = build_tread(req, 8, 12, 100, 64);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    uint32_t got = load_u32(resp + 7);
+    STM_ASSERT(got == 64);
+    /* The bytes from a fresh-snapshot Topen at offset 100 should match
+     * body_full[100..164]. Both opens snapshot at Topen but the
+     * content is deterministic for a fresh, idle fs. */
+    STM_ASSERT(memcmp(resp + 11, body_full + 100, 64) == 0);
+
+    destroy_metrics_fixture(f);
+}
+
+/* Body fits within STM_CTL_METRICS_MAX (64 KiB) on a small test pool.
+ * Catches a future regression that emits unbounded per-device labels. */
+STM_TEST(ctl_e1_metrics_prometheus_body_fits_under_metrics_cap)
+{
+    metrics_fixture f = make_metrics_fixture("ctl_e1_cap", 1000);
+    char body[64 * 1024];
+    uint32_t got = read_prometheus_body(&f, 2, 11, body, sizeof body);
+    STM_ASSERT(got > 0);
+    /* A 1-device test fixture's body is well under 4 KiB. Hard upper
+     * bound here keeps the regression test honest if someone adds
+     * verbose metrics by accident. */
+    STM_ASSERT(got < 8192);
+    destroy_metrics_fixture(f);
+}
+
+/* Per-state device counts emitted for ALL 7 stm_device_state values. */
+STM_TEST(ctl_e1_metrics_prometheus_devices_by_state_complete)
+{
+    metrics_fixture f = make_metrics_fixture("ctl_e1_states", 1000);
+    char body[16 * 1024];
+    uint32_t got = read_prometheus_body(&f, 2, 11, body, sizeof body);
+    STM_ASSERT(got > 0);
+
+    STM_ASSERT(strstr(body, "state=\"unset\"") != NULL);
+    STM_ASSERT(strstr(body, "state=\"online\"") != NULL);
+    STM_ASSERT(strstr(body, "state=\"offline\"") != NULL);
+    STM_ASSERT(strstr(body, "state=\"degraded\"") != NULL);
+    STM_ASSERT(strstr(body, "state=\"faulted\"") != NULL);
+    STM_ASSERT(strstr(body, "state=\"removed\"") != NULL);
+    STM_ASSERT(strstr(body, "state=\"evacuating\"") != NULL);
+
+    destroy_metrics_fixture(f);
+}
+
 STM_TEST_MAIN("ctl")

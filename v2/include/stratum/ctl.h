@@ -39,6 +39,16 @@
  *
  * Subsequent sub-chunks (P9-CTL-1b..) add /pools/, /datasets/,
  * /tracing/, /debug/, /events, /metrics/.
+ *
+ * P9-CTL-1e adds the per-pool /metrics/ subtree:
+ *   /pools/<uuid>/metrics/             directory
+ *   /pools/<uuid>/metrics/prometheus   read: Prometheus exposition
+ *                                       (per ARCH §14.8.1) — fs +
+ *                                       pool + per-device + scrub
+ *                                       gauges + counters.
+ * /metrics/ has no public API surface of its own — it is a read-only
+ * synthetic file rendered from the existing attached subsystems
+ * (stm_fs / stm_pool / stm_scrub). OTLP exposition deferred.
  */
 #ifndef STRATUM_V2_CTL_H
 #define STRATUM_V2_CTL_H
