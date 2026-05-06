@@ -6,14 +6,23 @@
  * subsystem exposes counters, properties, and action triggers as a
  * 9P file tree. Read paths report state; write paths trigger
  * actions. External tools (`stratum` CLI, Prometheus scrapers,
- * OpenTelemetry exporters) talk to this tree over 9P.
+ * OpenTelemetry exporters) talk to this tree over 9P2000.L.
  *
- * Architecture: stm_ctl is a backend for the GENERIC stm_p9_server
- * (`<stratum/p9.h>`) — same mechanism janus's /keys/ uses. It is
- * NOT routed through `<stratum/9p.h>` (the .L filesystem server),
- * because /ctl/ does not surface a posix-shaped filesystem on top
- * of stm_fs — it surfaces operator state on top of process-level
- * objects (stm_fs, future stm_pool, future stm_scrub_state).
+ * Architecture: stm_ctl is a backend for the GENERIC stm_lp9_server
+ * (`<stratum/lp9.h>`) — same generic-vops shape janus's /keys/ uses
+ * (currently still on stm_p9_server / 9P2000), but on the .L wire so
+ * libstratum-9p (which is .L-only) can dial /ctl/ end-to-end without
+ * a dialect bridge. It is NOT routed through `<stratum/9p.h>` (the
+ * FS-bound .L server), because /ctl/ does not surface a posix-shaped
+ * filesystem on top of stm_fs — it surfaces operator state on top
+ * of process-level objects (stm_fs, future stm_pool, future
+ * stm_scrub_state).
+ *
+ * Migration history: P9-CTL-2b migrated /ctl/'s codec from
+ * stm_p9_server (9P2000) to stm_lp9_server (.L). The KIND_META[]
+ * table, qid encoding, materialize functions, admin gate, session
+ * lifecycle, and audit-log doctrine ALL stayed identical — only
+ * the wire codec + vops adapter shape changed.
  *
  * Concurrency:
  *   - Internal state (per-fid materialization buffers) is mutex-
@@ -21,7 +30,7 @@
  *   - Reads of attached subsystem state (stm_fs *) call into those
  *     subsystems' own thread-safe accessors (stm_fs_stats_get).
  *   - A single stm_ctl instance is safe to share across SEQUENTIAL
- *     stm_p9_server instances (one server at a time, e.g. v2.0
+ *     stm_lp9_server instances (one server at a time, e.g. v2.0
  *     stratumd serial accept). It is NOT safe to share across
  *     CONCURRENT servers: per-fid sessions[] is keyed by fid
  *     alone, and two concurrently-active servers can each issue
@@ -53,7 +62,7 @@
 #ifndef STRATUM_V2_CTL_H
 #define STRATUM_V2_CTL_H
 
-#include <stratum/p9.h>
+#include <stratum/lp9.h>
 #include <stratum/types.h>
 
 #include <stddef.h>
@@ -91,7 +100,7 @@ typedef struct stm_ctl stm_ctl;
  * timing-must-be-pre-handle posture would apply.
  *
  * Lifetime contract: the returned `*out` MUST outlive every
- * `stm_p9_server` that holds it as `ctx`. Concretely: destroy all
+ * `stm_lp9_server` that holds it as `ctx`. Concretely: destroy all
  * servers FIRST, then `stm_ctl_destroy`. Destroying the stm_ctl
  * while a server still holds a dangling `ctx` is a use-after-free
  * on the next vops call (R96 P2-1).
@@ -114,7 +123,7 @@ stm_status stm_ctl_create(struct stm_fs *fs, stm_ctl **out);
  * no-op'd as before.)
  *
  * Timing (R97 P2-2): `stm_ctl_attach_pool` MUST be called BEFORE
- * the first `stm_p9_server_handle` invocation against any server
+ * the first `stm_lp9_server_handle` invocation against any server
  * that uses this stm_ctl as `ctx`. The internal pool pointer is
  * not protected by the instance mutex on the vops read paths —
  * concurrent attach + vops dispatch is a C11 data race on
@@ -145,7 +154,7 @@ stm_status stm_ctl_attach_pool(stm_ctl *c, struct stm_pool *pool);
  * scrub per /ctl/ (matches the v2.0 single-pool posture).
  *
  * Timing (R97 P2-2 carry): MUST be called BEFORE the first
- * `stm_p9_server_handle` invocation against any server using this
+ * `stm_lp9_server_handle` invocation against any server using this
  * stm_ctl as `ctx`. The internal scrub pointer is not protected by
  * the instance mutex on vops read paths — concurrent attach + vops
  * dispatch is a C11 data race on `c->scrub`. The serial-server
@@ -174,8 +183,8 @@ stm_status stm_ctl_attach_scrub(stm_ctl *c, struct stm_scrub *scrub);
  * Destroy a /ctl/ instance. Does not destroy the attached `fs` or
  * `pool` — caller retains ownership.
  *
- * PRECONDITION: every `stm_p9_server` that was created with this
- * stm_ctl as its `ctx` MUST be destroyed (`stm_p9_server_destroy`)
+ * PRECONDITION: every `stm_lp9_server` that was created with this
+ * stm_ctl as its `ctx` MUST be destroyed (`stm_lp9_server_destroy`)
  * BEFORE this call. Destroying in the wrong order leaves the
  * server with a dangling ctx pointer and the next vops call is a
  * use-after-free (R96 P2-1).
@@ -192,14 +201,14 @@ void stm_ctl_destroy(stm_ctl *c);
  *
  * Stratumd typically calls this once per accept, between the
  * SO_PEERCRED / getpeereid lookup and the first
- * `stm_p9_server_handle` invocation. Mirrors stratumd's existing
+ * `stm_lp9_server_handle` invocation. Mirrors stratumd's existing
  * peer-cred default-deny posture (R95 P2-2): if the daemon can't
  * resolve the peer's uid, it should refuse the connection rather
  * than calling set_caller with a placeholder.
  *
  * Timing (P9-CTL-1d-uid): same posture as stm_ctl_attach_pool's
  * timing rule (R97 P2-2). MUST be called BEFORE the first
- * stm_p9_server_handle invocation. Caller fields are not mu-
+ * stm_lp9_server_handle invocation. Caller fields are not mu-
  * protected on the vops read paths; concurrent set_caller +
  * vops dispatch is a C11 data race. v2.0's serial-accept posture
  * makes this safe.
@@ -238,12 +247,12 @@ stm_status stm_ctl_set_admin_uid(stm_ctl *c, uid_t admin_uid);
 /*
  * Drop all active per-fid sessions on this stm_ctl (R101 P1-1).
  * stratumd's serial-accept loop MUST call this between connections
- * (typically right after stm_p9_server_destroy + before the next
+ * (typically right after stm_lp9_server_destroy + before the next
  * accept) so that a leaked session from connection N can't leak
  * into connection N+1's view.
  *
  * Without this hook, the chunk's "safe across SEQUENTIAL
- * stm_p9_server use" claim breaks down: when conn-N+1 reuses the
+ * stm_lp9_server use" claim breaks down: when conn-N+1 reuses the
  * same fid number that conn-N's session occupied, the session-
  * lookup pre-empts the new alloc and conn-N+1 reads conn-N's
  * stale snapshot_len. Worse, conn-N+1's Tclunk frees conn-N's
@@ -274,14 +283,14 @@ void stm_ctl_log_event(stm_ctl *c, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 
 /*
- * The vops table to pass to stm_p9_server_create. Static lifetime —
+ * The vops table to pass to stm_lp9_server_create. Static lifetime —
  * caller does not free.
  */
-const stm_p9_vops *stm_ctl_vops(void);
+const stm_lp9_vops *stm_ctl_vops(void);
 
 /*
  * The root qid_path to pass as `root_qid_path` to
- * stm_p9_server_create. Identical for every stm_ctl instance —
+ * stm_lp9_server_create. Identical for every stm_ctl instance —
  * the qid layout encodes node identity in the high bits, not the
  * instance pointer.
  */

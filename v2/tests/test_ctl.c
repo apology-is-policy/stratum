@@ -1,14 +1,14 @@
 /* SPDX-License-Identifier: ISC */
 /*
  * test_ctl — exercises the /ctl/ synthetic FS via the generic
- * stm_p9_server.
+ * stm_lp9_server.
  *
  * P9-CTL-1a scope: foundation. /version + /state.
  * P9-CTL-1b scope: /pools/<uuid>/status.
  * Subsequent sub-chunks add /datasets, /tracing, /debug.
  *
  * Pattern mirrors test_p9.c: build 9P frames, drive them through
- * stm_p9_server_handle, decode replies. /state with an attached
+ * stm_lp9_server_handle, decode replies. /state with an attached
  * fs reuses the format+mount helpers from test_fs_common.h.
  */
 
@@ -16,7 +16,7 @@
 #include <stratum/ctl.h>
 #include <stratum/fs.h>
 #include <stratum/fs_testing.h>     /* stm_fs_sync_for_test */
-#include <stratum/p9.h>
+#include <stratum/lp9.h>
 #include <stratum/pool.h>
 #include <stratum/scrub.h>          /* P9-CTL-1d-scrub-read */
 #include <stratum/snapshot.h>       /* P9-CTL-1d-actions-snapshot-create */
@@ -35,7 +35,11 @@
 
 #define RBUF 65536
 
-/* ── wire helpers (clone of test_p9.c — keep local; cheap) ─────────── */
+/* ── wire helpers (9P2000.L, hand-packed; keep local for diff size) ─── */
+
+/* POSIX file-type mode bits (matches src/ctl/synfs.c::CTL_S_IFDIR). */
+#define CTL_S_IFDIR   0040000u
+#define CTL_S_IFREG   0100000u
 
 static void pack_u16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 static void pack_u32(uint8_t *p, uint32_t v)
@@ -57,34 +61,43 @@ static uint32_t load_u32(const uint8_t *p)
     return (uint32_t)p[0]        | ((uint32_t)p[1] << 8)
          | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
+static __attribute__((unused)) uint64_t load_u64(const uint8_t *p)
+{
+    return (uint64_t)load_u32(p) | ((uint64_t)load_u32(p + 4) << 32);
+}
 
+/* Tversion(msize, "9P2000.L"). */
 static uint32_t build_tversion(uint8_t *req, uint32_t msize)
 {
     uint8_t *p = req + 7;
     pack_u32(p, msize); p += 4;
-    pack_u16(p, 6);     p += 2;
-    memcpy(p, "9P2000", 6); p += 6;
+    pack_u16(p, 8);     p += 2;
+    memcpy(p, "9P2000.L", 8); p += 8;
     uint32_t sz = (uint32_t)(p - req);
     pack_u32(req, sz);
-    req[4] = STM_P9_TVERSION;
-    pack_u16(req + 5, STM_P9_NOTAG);
+    req[4] = STM_LP9_TVERSION;
+    pack_u16(req + 5, STM_LP9_NOTAG);
     return sz;
 }
 
+/* Tattach(fid, afid=NOFID, uname="", aname="", n_uname=0). The .L
+ * Tattach has the trailing n_uname[4] field that 9P2000 lacks. */
 static uint32_t build_tattach(uint8_t *req, uint16_t tag, uint32_t fid)
 {
     uint8_t *p = req + 7;
     pack_u32(p, fid);              p += 4;
-    pack_u32(p, STM_P9_NOFID);     p += 4;
+    pack_u32(p, STM_LP9_NOFID);    p += 4;
     pack_u16(p, 0); p += 2;        /* uname "" */
     pack_u16(p, 0); p += 2;        /* aname "" */
+    pack_u32(p, 0); p += 4;        /* n_uname (auth — ignored) */
     uint32_t sz = (uint32_t)(p - req);
     pack_u32(req, sz);
-    req[4] = STM_P9_TATTACH;
+    req[4] = STM_LP9_TATTACH;
     pack_u16(req + 5, tag);
     return sz;
 }
 
+/* Twalk(fid, newfid, nwname, wname[]). Same wire shape as 9P2000. */
 static uint32_t build_twalk(uint8_t *req, uint16_t tag,
                             uint32_t fid, uint32_t newfid,
                             uint16_t n, const char **names)
@@ -100,24 +113,28 @@ static uint32_t build_twalk(uint8_t *req, uint16_t tag,
     }
     uint32_t sz = (uint32_t)(p - req);
     pack_u32(req, sz);
-    req[4] = STM_P9_TWALK;
+    req[4] = STM_LP9_TWALK;
     pack_u16(req + 5, tag);
     return sz;
 }
 
+/* Tlopen(fid, flags). The .L Tlopen replaces 9P2000's 1-byte mode
+ * Topen with a 4-byte Linux O_* flags field. The function name stays
+ * `build_topen` to minimize per-test diff; semantics are .L. */
 static uint32_t build_topen(uint8_t *req, uint16_t tag,
-                            uint32_t fid, uint8_t mode)
+                            uint32_t fid, uint32_t flags)
 {
     uint8_t *p = req + 7;
-    pack_u32(p, fid); p += 4;
-    *p++ = mode;
+    pack_u32(p, fid);   p += 4;
+    pack_u32(p, flags); p += 4;
     uint32_t sz = (uint32_t)(p - req);
     pack_u32(req, sz);
-    req[4] = STM_P9_TOPEN;
+    req[4] = STM_LP9_TLOPEN;
     pack_u16(req + 5, tag);
     return sz;
 }
 
+/* Tread(fid, offset, count). Same shape as 9P2000. */
 static uint32_t build_tread(uint8_t *req, uint16_t tag, uint32_t fid,
                             uint64_t offset, uint32_t count)
 {
@@ -127,7 +144,26 @@ static uint32_t build_tread(uint8_t *req, uint16_t tag, uint32_t fid,
     pack_u32(p, count);  p += 4;
     uint32_t sz = (uint32_t)(p - req);
     pack_u32(req, sz);
-    req[4] = STM_P9_TREAD;
+    req[4] = STM_LP9_TREAD;
+    pack_u16(req + 5, tag);
+    return sz;
+}
+
+/* Treaddir(fid, offset_cookie, count). .L-specific opcode 40 — the
+ * only way to read directory entries (unlike 9P2000 where Tread on a
+ * dir fid sequentially yielded stat records). Server replies with
+ * Rreaddir(count, data) where data is a packed sequence of
+ * qid(13)+cookie(8)+dt_type(1)+name[s] records. */
+static uint32_t build_treaddir(uint8_t *req, uint16_t tag, uint32_t fid,
+                                 uint64_t offset, uint32_t count)
+{
+    uint8_t *p = req + 7;
+    pack_u32(p, fid);    p += 4;
+    pack_u64(p, offset); p += 8;
+    pack_u32(p, count);  p += 4;
+    uint32_t sz = (uint32_t)(p - req);
+    pack_u32(req, sz);
+    req[4] = STM_LP9_TREADDIR;
     pack_u16(req + 5, tag);
     return sz;
 }
@@ -142,7 +178,7 @@ static uint32_t build_twrite(uint8_t *req, uint16_t tag, uint32_t fid,
     memcpy(p, data, len); p += len;
     uint32_t sz = (uint32_t)(p - req);
     pack_u32(req, sz);
-    req[4] = STM_P9_TWRITE;
+    req[4] = STM_LP9_TWRITE;
     pack_u16(req + 5, tag);
     return sz;
 }
@@ -153,49 +189,82 @@ static uint32_t build_tclunk(uint8_t *req, uint16_t tag, uint32_t fid)
     pack_u32(p, fid); p += 4;
     uint32_t sz = (uint32_t)(p - req);
     pack_u32(req, sz);
-    req[4] = STM_P9_TCLUNK;
+    req[4] = STM_LP9_TCLUNK;
     pack_u16(req + 5, tag);
     return sz;
 }
 
+/* Tgetattr(fid, request_mask). The .L analog of 9P2000's Tstat;
+ * returns Rgetattr(valid, qid, mode, uid, gid, nlink, rdev, size,
+ * blksize, blocks, atime/mtime/ctime/btime, gen, data_version) —
+ * fixed 153-byte body. The function name stays `build_tstat` to
+ * minimize per-test diff. */
 static uint32_t build_tstat(uint8_t *req, uint16_t tag, uint32_t fid)
 {
     uint8_t *p = req + 7;
     pack_u32(p, fid); p += 4;
+    pack_u64(p, STM_LP9_GETATTR_BASIC); p += 8;
     uint32_t sz = (uint32_t)(p - req);
     pack_u32(req, sz);
-    req[4] = STM_P9_TSTAT;
+    req[4] = STM_LP9_TGETATTR;
     pack_u16(req + 5, tag);
     return sz;
 }
 
+/* Rgetattr field offsets from the body start (right after the 7-byte
+ * header). Layout: valid[8] qid[13] mode[4] uid[4] gid[4] nlink[8]
+ * rdev[8] size[8] blksize[8] blocks[8] + 4 timestamp pairs (8+8 each)
+ * + gen[8] data_version[8]. */
+#define RGETATTR_OFF_VALID    0u
+#define RGETATTR_OFF_QID      8u
+#define RGETATTR_OFF_MODE     (8u + STM_LP9_QID_SIZE)
+#define RGETATTR_OFF_NLINK    (RGETATTR_OFF_MODE + 12u)
+#define RGETATTR_OFF_SIZE     (RGETATTR_OFF_NLINK + 16u)
+
+/* Decode the ecode from an Rlerror reply. Body layout: ecode[4]. */
+static __attribute__((unused)) uint32_t rlerror_ecode(const uint8_t *resp)
+{
+    return load_u32(resp + 7);
+}
+
+/* Assert that a Twalk(req, ..., n_requested, ...) failed to fully
+ * resolve all components. .L spec: Rlerror only when the FIRST
+ * component fails; otherwise Rwalk with nwqid < n_requested (and
+ * server doesn't bind newfid). The /ctl/ tests track "walk did NOT
+ * succeed" — which is true for both shapes. */
+#define ASSERT_WALK_FAILED(resp, n_requested) do {                  \
+    if ((resp)[4] == STM_LP9_RLERROR) break;                        \
+    STM_ASSERT_EQ((resp)[4], STM_LP9_RWALK);                        \
+    STM_ASSERT(load_u16((resp) + 7) < (n_requested));               \
+} while (0)
+
 /* ── server helpers ─────────────────────────────────────────────────── */
 
-static stm_p9_server *make_ctl_server(stm_ctl *c)
+static stm_lp9_server *make_ctl_server(stm_ctl *c)
 {
-    stm_p9_server *s = NULL;
-    STM_ASSERT_OK(stm_p9_server_create(stm_ctl_vops(), c, stm_ctl_root(c),
-                                          STM_P9_MSIZE_DEFAULT, &s));
+    stm_lp9_server *s = NULL;
+    STM_ASSERT_OK(stm_lp9_server_create(stm_ctl_vops(), c, stm_ctl_root(c),
+                                          STM_LP9_MSIZE_DEFAULT, &s));
     return s;
 }
 
-static void do_handshake(stm_p9_server *s, uint32_t root_fid)
+static void do_handshake(stm_lp9_server *s, uint32_t root_fid)
 {
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
 
-    uint32_t sz = build_tversion(req, STM_P9_MSIZE_DEFAULT);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RVERSION);
+    uint32_t sz = build_tversion(req, STM_LP9_MSIZE_DEFAULT);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RVERSION);
 
     sz = build_tattach(req, 1, root_fid);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RATTACH);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RATTACH);
 }
 
 /* Walk + open + read the entire body of `name` under root, into `out`.
- * Returns the byte count read (clamped to STM_P9_MSIZE_DEFAULT - hdr). */
-static uint32_t read_root_file(stm_p9_server *s, uint32_t root_fid,
+ * Returns the byte count read (clamped to STM_LP9_MSIZE_DEFAULT - hdr). */
+static uint32_t read_root_file(stm_lp9_server *s, uint32_t root_fid,
                                   uint32_t fid, const char *name,
                                   char *out, size_t out_cap)
 {
@@ -204,16 +273,16 @@ static uint32_t read_root_file(stm_p9_server *s, uint32_t root_fid,
     const char *path[] = { name };
 
     uint32_t sz = build_twalk(req, 2, root_fid, fid, 1, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
-    sz = build_topen(req, 3, fid, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    sz = build_topen(req, 3, fid, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
     sz = build_tread(req, 4, fid, 0, (uint32_t)(out_cap - 1));
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RREAD);
     uint32_t count = load_u32(resp + 7);
     STM_ASSERT(count < out_cap);
     memcpy(out, resp + 11, count);
@@ -227,11 +296,11 @@ STM_TEST(ctl_version_attach)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
 
     do_handshake(s, 10);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -239,7 +308,7 @@ STM_TEST(ctl_walk_version_reads_versions)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     char body[1024];
@@ -262,7 +331,7 @@ STM_TEST(ctl_walk_version_reads_versions)
               (unsigned)STM_SEND_VERSION);
     STM_ASSERT(strstr(body, want_send) != NULL);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -270,7 +339,7 @@ STM_TEST(ctl_walk_state_unattached_says_no)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     char body[1024];
@@ -281,7 +350,7 @@ STM_TEST(ctl_walk_state_unattached_says_no)
      * lie. */
     STM_ASSERT(strstr(body, "data-total-blocks") == NULL);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -296,7 +365,7 @@ STM_TEST(ctl_walk_state_attached_reports_counters)
 
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(fs, &c));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     char body[1024];
@@ -310,7 +379,7 @@ STM_TEST(ctl_walk_state_attached_reports_counters)
     STM_ASSERT(strstr(body, "data-allocated-blocks: ") != NULL);
     STM_ASSERT(strstr(body, "data-free-blocks: ") != NULL);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
@@ -319,20 +388,21 @@ STM_TEST(ctl_readdir_root_lists_entries)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
-    /* Open the root fid for read; Tread on a directory yields stat
-     * records back-to-back. */
+    /* Open the root fid for read, then Treaddir to enumerate the
+     * children. .L's Rreaddir packs qid(13) + cookie(8) + dt_type(1)
+     * + name[s] records; iterate until end-of-buffer. */
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
-    uint32_t sz = build_topen(req, 2, 10, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    uint32_t sz = build_topen(req, 2, 10, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
-    sz = build_tread(req, 3, 10, 0, 8192);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    sz = build_treaddir(req, 3, 10, 0, 8192);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RREADDIR);
     uint32_t count = load_u32(resp + 7);
     STM_ASSERT(count > 0);
 
@@ -340,19 +410,19 @@ STM_TEST(ctl_readdir_root_lists_entries)
     const uint8_t *q = resp + 11;
     const uint8_t *end = q + count;
     while (q < end) {
-        uint16_t inner = load_u16(q);
-        const uint8_t *rec = q + 2;
-        const uint8_t *np = rec + 2 + 4 + 13 + 4 + 4 + 4 + 8;
+        STM_ASSERT((size_t)(end - q) >= STM_LP9_QID_SIZE + 8u + 1u + 2u);
+        const uint8_t *np = q + STM_LP9_QID_SIZE + 8u + 1u;
         uint16_t nl = load_u16(np);
         const char *nm = (const char *)(np + 2);
+        STM_ASSERT((size_t)(end - (np + 2)) >= nl);
         if (nl == 7 && memcmp(nm, "version", 7) == 0) saw_version = 1;
         if (nl == 5 && memcmp(nm, "state",   5) == 0) saw_state   = 1;
-        q += 2 + inner;
+        q = np + 2 + nl;
     }
     STM_ASSERT_TRUE(saw_version);
     STM_ASSERT_TRUE(saw_state);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -360,17 +430,17 @@ STM_TEST(ctl_walk_missing_returns_enoent)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "nonexistent" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 1, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -378,30 +448,30 @@ STM_TEST(ctl_write_to_version_rejected)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "version" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 1, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
     /* Open ORDWR — server gates this at vops_open. */
-    sz = build_topen(req, 3, 11, STM_P9_ORDWR);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDWR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     /* Re-open ORDONLY succeeds; subsequent Twrite still rejected. */
-    sz = build_topen(req, 4, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    sz = build_topen(req, 4, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
     sz = build_twrite(req, 5, 11, 0, "x", 1);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -409,7 +479,7 @@ STM_TEST(ctl_clunk_releases_session_slot)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -419,19 +489,19 @@ STM_TEST(ctl_clunk_releases_session_slot)
     for (int i = 0; i < 100; i++) {
         const char *path[] = { "version" };
         uint32_t sz = build_twalk(req, (uint16_t)(2 + i), 10, 11, 1, path);
-        STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-        STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+        STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+        STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
-        sz = build_topen(req, (uint16_t)(3 + i), 11, STM_P9_OREAD);
-        STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-        STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+        sz = build_topen(req, (uint16_t)(3 + i), 11, STM_LP9_O_RDONLY);
+        STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+        STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
         sz = build_tclunk(req, (uint16_t)(4 + i), 11);
-        STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-        STM_ASSERT_EQ(resp[4], STM_P9_RCLUNK);
+        STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+        STM_ASSERT_EQ(resp[4], STM_LP9_RCLUNK);
     }
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -439,31 +509,31 @@ STM_TEST(ctl_read_past_eof_returns_zero)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "version" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 1, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
     /* Read entire body (it's a few hundred bytes). */
     sz = build_tread(req, 4, 11, 0, 4096);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t first = load_u32(resp + 7);
     STM_ASSERT(first > 0);
 
     /* Re-read from offset = first (i.e. EOF) — must yield 0. */
     sz = build_tread(req, 5, 11, first, 4096);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RREAD);
     STM_ASSERT_EQ(load_u32(resp + 7), 0);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -484,7 +554,7 @@ STM_TEST(ctl_r96_p2_3_session_pool_exhaustion)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -495,34 +565,34 @@ STM_TEST(ctl_r96_p2_3_session_pool_exhaustion)
         const char *path[] = { "version" };
         uint32_t fid = 100 + i;
         uint32_t sz = build_twalk(req, (uint16_t)(2 + i), 10, fid, 1, path);
-        STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-        STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+        STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+        STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
-        sz = build_topen(req, (uint16_t)(200 + i), fid, STM_P9_OREAD);
-        STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-        STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+        sz = build_topen(req, (uint16_t)(200 + i), fid, STM_LP9_O_RDONLY);
+        STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+        STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
     }
 
     /* The 65th Topen must fail — sessions[] full. */
     const char *path[] = { "version" };
     uint32_t sz = build_twalk(req, 999, 10, 999, 1, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
-    sz = build_topen(req, 998, 999, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    sz = build_topen(req, 998, 999, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     /* Clunk one open fid — pool now has room again; Topen succeeds. */
     sz = build_tclunk(req, 997, 100);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RCLUNK);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RCLUNK);
 
-    sz = build_topen(req, 996, 999, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    sz = build_topen(req, 996, 999, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -536,7 +606,7 @@ STM_TEST(ctl_r96_p2_3_vops_read_no_session_rejects)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
 
-    const stm_p9_vops *v = stm_ctl_vops();
+    const stm_lp9_vops *v = stm_ctl_vops();
     uint8_t buf[64];
     uint32_t len = sizeof buf;
     /* fid 999 was never allocated; qid_path encodes a valid kind so
@@ -563,36 +633,36 @@ STM_TEST(ctl_r96_p2_3_read_last_byte_only)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "version" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 1, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
     /* Determine body length. */
     sz = build_tread(req, 4, 11, 0, 4096);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t body_len = load_u32(resp + 7);
     STM_ASSERT(body_len > 0);
 
     /* Read at offset = body_len - 1, count = 4096. Must return exactly 1. */
     sz = build_tread(req, 5, 11, body_len - 1u, 4096);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RREAD);
     STM_ASSERT_EQ(load_u32(resp + 7), 1u);
 
     /* Read at offset = body_len - 1, count = 1. Same: returns 1. */
     sz = build_tread(req, 6, 11, body_len - 1u, 1);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     STM_ASSERT_EQ(load_u32(resp + 7), 1u);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -661,16 +731,16 @@ STM_TEST(ctl_b1_pools_appears_in_root_listing)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
-    uint32_t sz = build_topen(req, 2, 10, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    uint32_t sz = build_topen(req, 2, 10, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
-    sz = build_tread(req, 3, 10, 0, 8192);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_treaddir(req, 3, 10, 0, 8192);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     STM_ASSERT(count > 0);
 
@@ -678,17 +748,16 @@ STM_TEST(ctl_b1_pools_appears_in_root_listing)
     const uint8_t *q = resp + 11;
     const uint8_t *end = q + count;
     while (q < end) {
-        uint16_t inner = load_u16(q);
-        const uint8_t *rec = q + 2;
-        const uint8_t *np = rec + 2 + 4 + 13 + 4 + 4 + 4 + 8;
+        STM_ASSERT((size_t)(end - q) >= STM_LP9_QID_SIZE + 8u + 1u + 2u);
+        const uint8_t *np = q + STM_LP9_QID_SIZE + 8u + 1u;
         uint16_t nl = load_u16(np);
         const char *nm = (const char *)(np + 2);
         if (nl == 5 && memcmp(nm, "pools", 5) == 0) saw_pools = 1;
-        q += 2 + inner;
+        q = np + 2 + nl;
     }
     STM_ASSERT_TRUE(saw_pools);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -696,26 +765,26 @@ STM_TEST(ctl_b1_pools_dir_empty_when_no_pool)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "pools" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 1, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
-    sz = build_tread(req, 4, 11, 0, 8192);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
-    STM_ASSERT_EQ(load_u32(resp + 7), 0u);   /* empty dir = zero stat bytes */
+    sz = build_treaddir(req, 4, 11, 0, 8192);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RREADDIR);
+    STM_ASSERT_EQ(load_u32(resp + 7), 0u);   /* empty dir = zero entry bytes */
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -723,17 +792,17 @@ STM_TEST(ctl_b1_walk_pool_uuid_enoent_when_no_pool)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "pools", CTL_TEST_POOL_UUID_HEX };
     uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 2);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -745,18 +814,18 @@ STM_TEST(ctl_b1_attach_pool_then_walk_succeeds)
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
 
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "pools", CTL_TEST_POOL_UUID_HEX, "status" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 3, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
     STM_ASSERT_EQ(load_u16(resp + 7), 3u);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
     destroy_test_pool(f);
 }
@@ -769,23 +838,23 @@ STM_TEST(ctl_b1_pool_status_reports_uuid_and_counts)
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
 
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "pools", CTL_TEST_POOL_UUID_HEX, "status" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 3, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
     sz = build_tread(req, 4, 11, 0, 4096);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RREAD);
     uint32_t count = load_u32(resp + 7);
     STM_ASSERT(count > 0);
 
@@ -804,7 +873,7 @@ STM_TEST(ctl_b1_pool_status_reports_uuid_and_counts)
     STM_ASSERT(strstr(body, "state-online: 1\n") != NULL);
     STM_ASSERT(strstr(body, "roster-hash: 0x") != NULL);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
     destroy_test_pool(f);
 }
@@ -861,20 +930,20 @@ STM_TEST(ctl_b1_pools_readdir_lists_attached_pool)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "pools" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 1, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
-    sz = build_tread(req, 4, 11, 0, 8192);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_treaddir(req, 4, 11, 0, 8192);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     STM_ASSERT(count > 0);
 
@@ -882,18 +951,17 @@ STM_TEST(ctl_b1_pools_readdir_lists_attached_pool)
     const uint8_t *q = resp + 11;
     const uint8_t *end = q + count;
     while (q < end) {
-        uint16_t inner = load_u16(q);
-        const uint8_t *rec = q + 2;
-        const uint8_t *np = rec + 2 + 4 + 13 + 4 + 4 + 4 + 8;
+        STM_ASSERT((size_t)(end - q) >= STM_LP9_QID_SIZE + 8u + 1u + 2u);
+        const uint8_t *np = q + STM_LP9_QID_SIZE + 8u + 1u;
         uint16_t nl = load_u16(np);
         const char *nm = (const char *)(np + 2);
         if (nl == 36 && memcmp(nm, CTL_TEST_POOL_UUID_HEX, 36) == 0)
             saw_pool = 1;
-        q += 2 + inner;
+        q = np + 2 + nl;
     }
     STM_ASSERT_TRUE(saw_pool);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
     destroy_test_pool(f);
 }
@@ -905,7 +973,7 @@ STM_TEST(ctl_b1_walk_wrong_uuid_enoent)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -913,16 +981,16 @@ STM_TEST(ctl_b1_walk_wrong_uuid_enoent)
     /* Different UUID — should ENOENT under /pools/. */
     const char *path[] = { "pools", "00000000-0000-0000-0000-000000000000" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 2);
 
     /* Malformed (not 36 chars) — also ENOENT. */
     const char *path2[] = { "pools", "not-a-uuid" };
     sz = build_twalk(req, 3, 10, 12, 2, path2);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 2);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
     destroy_test_pool(f);
 }
@@ -934,21 +1002,21 @@ STM_TEST(ctl_b1_pool_status_write_rejected)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "pools", CTL_TEST_POOL_UUID_HEX, "status" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 3, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
     /* Open ORDWR — every node read-only at v2.0. */
-    sz = build_topen(req, 3, 11, STM_P9_ORDWR);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDWR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 3);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
     destroy_test_pool(f);
 }
@@ -982,7 +1050,7 @@ STM_TEST(ctl_r97_p3_6_36char_malformed_uuid_rejected)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -992,16 +1060,16 @@ STM_TEST(ctl_r97_p3_6_36char_malformed_uuid_rejected)
      * positions): "gggggggg-gggg-gggg-gggg-gggggggggggg" */
     const char *all_g[] = { "pools", "gggggggg-gggg-gggg-gggg-gggggggggggg" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 2, all_g);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 2);
 
     /* Hex content but dash in wrong position (dash at idx 7 instead
      * of 8). 36 chars total. */
     const char *bad_dash[] = {
         "pools", "efcdab8-96745-2301-1032-547698badcfee" };
     sz = build_twalk(req, 3, 10, 12, 2, bad_dash);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 2);
 
     /* Mixed-case version of the correct UUID — uuid_parse_hex accepts
      * both cases per the documented client-friendliness contract.
@@ -1010,10 +1078,10 @@ STM_TEST(ctl_r97_p3_6_36char_malformed_uuid_rejected)
     const char *mixed[] = {
         "pools", "EFCDAB89-6745-2301-1032-547698BADCFE" };
     sz = build_twalk(req, 4, 10, 13, 2, mixed);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
     destroy_test_pool(f);
 }
@@ -1027,7 +1095,7 @@ STM_TEST(ctl_b1p_devices_dir_appears_under_pool)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -1036,13 +1104,13 @@ STM_TEST(ctl_b1p_devices_dir_appears_under_pool)
      * AND "devices". */
     const char *path[] = { "pools", CTL_TEST_POOL_UUID_HEX };
     uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
-    sz = build_tread(req, 4, 11, 0, 8192);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_treaddir(req, 4, 11, 0, 8192);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     STM_ASSERT(count > 0);
 
@@ -1050,19 +1118,18 @@ STM_TEST(ctl_b1p_devices_dir_appears_under_pool)
     const uint8_t *q = resp + 11;
     const uint8_t *end = q + count;
     while (q < end) {
-        uint16_t inner = load_u16(q);
-        const uint8_t *rec = q + 2;
-        const uint8_t *np = rec + 2 + 4 + 13 + 4 + 4 + 4 + 8;
+        STM_ASSERT((size_t)(end - q) >= STM_LP9_QID_SIZE + 8u + 1u + 2u);
+        const uint8_t *np = q + STM_LP9_QID_SIZE + 8u + 1u;
         uint16_t nl = load_u16(np);
         const char *nm = (const char *)(np + 2);
         if (nl == 6 && memcmp(nm, "status", 6) == 0)  saw_status = 1;
         if (nl == 7 && memcmp(nm, "devices", 7) == 0) saw_devices = 1;
-        q += 2 + inner;
+        q = np + 2 + nl;
     }
     STM_ASSERT_TRUE(saw_status);
     STM_ASSERT_TRUE(saw_devices);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
     destroy_test_pool(f);
 }
@@ -1074,21 +1141,21 @@ STM_TEST(ctl_b1p_devices_readdir_lists_one_slot)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "pools", CTL_TEST_POOL_UUID_HEX, "devices" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 3, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
-    sz = build_tread(req, 4, 11, 0, 8192);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_treaddir(req, 4, 11, 0, 8192);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     STM_ASSERT(count > 0);
 
@@ -1096,17 +1163,16 @@ STM_TEST(ctl_b1p_devices_readdir_lists_one_slot)
     const uint8_t *q = resp + 11;
     const uint8_t *end = q + count;
     while (q < end) {
-        uint16_t inner = load_u16(q);
-        const uint8_t *rec = q + 2;
-        const uint8_t *np = rec + 2 + 4 + 13 + 4 + 4 + 4 + 8;
+        STM_ASSERT((size_t)(end - q) >= STM_LP9_QID_SIZE + 8u + 1u + 2u);
+        const uint8_t *np = q + STM_LP9_QID_SIZE + 8u + 1u;
         uint16_t nl = load_u16(np);
         const char *nm = (const char *)(np + 2);
         if (nl == 1 && nm[0] == '0') saw_zero = 1;
-        q += 2 + inner;
+        q = np + 2 + nl;
     }
     STM_ASSERT_TRUE(saw_zero);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
     destroy_test_pool(f);
 }
@@ -1118,7 +1184,7 @@ STM_TEST(ctl_b1p_device_status_reports_class_role_state)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -1127,17 +1193,17 @@ STM_TEST(ctl_b1p_device_status_reports_class_role_state)
         "pools", CTL_TEST_POOL_UUID_HEX, "devices", "0", "status"
     };
     uint32_t sz = build_twalk(req, 2, 10, 11, 5, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
     STM_ASSERT_EQ(load_u16(resp + 7), 5u);
 
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
     sz = build_tread(req, 4, 11, 0, 4096);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RREAD);
     uint32_t count = load_u32(resp + 7);
     STM_ASSERT(count > 0);
 
@@ -1161,7 +1227,7 @@ STM_TEST(ctl_b1p_device_status_reports_class_role_state)
     STM_ASSERT(strstr(body, "role: data\n")    != NULL);
     STM_ASSERT(strstr(body, "state: online\n") != NULL);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
     destroy_test_pool(f);
 }
@@ -1173,7 +1239,7 @@ STM_TEST(ctl_b1p_device_dir_oob_enoent)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -1182,27 +1248,27 @@ STM_TEST(ctl_b1p_device_dir_oob_enoent)
     /* Slot 1 is out-of-range for a 1-device pool. */
     const char *p1[] = { "pools", CTL_TEST_POOL_UUID_HEX, "devices", "1" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 4, p1);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 4);
 
     /* Slot 64 (== STM_POOL_DEVICES_MAX) — parser refuses since it
      * exceeds the cap. */
     const char *p64[] = { "pools", CTL_TEST_POOL_UUID_HEX, "devices", "64" };
     sz = build_twalk(req, 3, 10, 12, 4, p64);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 4);
 
     /* Leading-zero spelling rejected (strict canonical). */
     const char *p00[] = { "pools", CTL_TEST_POOL_UUID_HEX, "devices", "00" };
     sz = build_twalk(req, 4, 10, 13, 4, p00);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 4);
 
     /* Non-numeric rejected. */
     const char *pa[] = { "pools", CTL_TEST_POOL_UUID_HEX, "devices", "x" };
     sz = build_twalk(req, 5, 10, 14, 4, pa);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 4);
 
     /* R98 P3-3: 4-character input rejected by the parser's `len > 3`
      * early-out (before the numeric overflow check). Today this is
@@ -1212,10 +1278,10 @@ STM_TEST(ctl_b1p_device_dir_oob_enoent)
     const char *p1234[] = {
         "pools", CTL_TEST_POOL_UUID_HEX, "devices", "1234" };
     sz = build_twalk(req, 6, 10, 15, 4, p1234);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 4);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
     destroy_test_pool(f);
 }
@@ -1227,7 +1293,7 @@ STM_TEST(ctl_b1p_device_status_write_rejected)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -1236,13 +1302,13 @@ STM_TEST(ctl_b1p_device_status_write_rejected)
         "pools", CTL_TEST_POOL_UUID_HEX, "devices", "0", "status"
     };
     uint32_t sz = build_twalk(req, 2, 10, 11, 5, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
-    sz = build_topen(req, 3, 11, STM_P9_OWRITE);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    sz = build_topen(req, 3, 11, STM_LP9_O_WRONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 5);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
     destroy_test_pool(f);
 }
@@ -1258,16 +1324,16 @@ STM_TEST(ctl_c1_datasets_in_root_listing)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
-    uint32_t sz = build_topen(req, 2, 10, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    uint32_t sz = build_topen(req, 2, 10, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
-    sz = build_tread(req, 3, 10, 0, 8192);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_treaddir(req, 3, 10, 0, 8192);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     STM_ASSERT(count > 0);
 
@@ -1275,17 +1341,16 @@ STM_TEST(ctl_c1_datasets_in_root_listing)
     const uint8_t *q = resp + 11;
     const uint8_t *end = q + count;
     while (q < end) {
-        uint16_t inner = load_u16(q);
-        const uint8_t *rec = q + 2;
-        const uint8_t *np = rec + 2 + 4 + 13 + 4 + 4 + 4 + 8;
+        STM_ASSERT((size_t)(end - q) >= STM_LP9_QID_SIZE + 8u + 1u + 2u);
+        const uint8_t *np = q + STM_LP9_QID_SIZE + 8u + 1u;
         uint16_t nl = load_u16(np);
         const char *nm = (const char *)(np + 2);
         if (nl == 8 && memcmp(nm, "datasets", 8) == 0) saw_datasets = 1;
-        q += 2 + inner;
+        q = np + 2 + nl;
     }
     STM_ASSERT_TRUE(saw_datasets);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -1293,26 +1358,26 @@ STM_TEST(ctl_c1_datasets_dir_empty_when_no_fs)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "datasets" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 1, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
-    sz = build_tread(req, 4, 11, 0, 8192);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    sz = build_treaddir(req, 4, 11, 0, 8192);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RREADDIR);
     STM_ASSERT_EQ(load_u32(resp + 7), 0u);  /* empty dir */
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -1327,20 +1392,20 @@ STM_TEST(ctl_c1_datasets_readdir_lists_root_dataset)
 
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(fs, &c));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "datasets" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 1, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
-    sz = build_tread(req, 4, 11, 0, 8192);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_treaddir(req, 4, 11, 0, 8192);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     STM_ASSERT(count > 0);
 
@@ -1348,17 +1413,16 @@ STM_TEST(ctl_c1_datasets_readdir_lists_root_dataset)
     const uint8_t *q = resp + 11;
     const uint8_t *end = q + count;
     while (q < end) {
-        uint16_t inner = load_u16(q);
-        const uint8_t *rec = q + 2;
-        const uint8_t *np = rec + 2 + 4 + 13 + 4 + 4 + 4 + 8;
+        STM_ASSERT((size_t)(end - q) >= STM_LP9_QID_SIZE + 8u + 1u + 2u);
+        const uint8_t *np = q + STM_LP9_QID_SIZE + 8u + 1u;
         uint16_t nl = load_u16(np);
         const char *nm = (const char *)(np + 2);
         if (nl == 1 && nm[0] == '1') saw_root = 1;
-        q += 2 + inner;
+        q = np + 2 + nl;
     }
     STM_ASSERT_TRUE(saw_root);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
@@ -1374,24 +1438,24 @@ STM_TEST(ctl_c1_dataset_properties_reports_root_metadata)
 
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(fs, &c));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "datasets", CTL_TEST_DATASET_ROOT_ID, "properties" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 3, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
     STM_ASSERT_EQ(load_u16(resp + 7), 3u);
 
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
     sz = build_tread(req, 4, 11, 0, 4096);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RREAD);
     uint32_t count = load_u32(resp + 7);
     STM_ASSERT(count > 0);
 
@@ -1411,7 +1475,7 @@ STM_TEST(ctl_c1_dataset_properties_reports_root_metadata)
     STM_ASSERT(strstr(body, "tiering: ")                     != NULL);
     STM_ASSERT(strstr(body, "promote-decay-window: ")        != NULL);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
@@ -1427,7 +1491,7 @@ STM_TEST(ctl_c1_walk_nonexistent_dataset_id_enoent)
 
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(fs, &c));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -1436,28 +1500,28 @@ STM_TEST(ctl_c1_walk_nonexistent_dataset_id_enoent)
     /* Dataset id 999 was never created. */
     const char *p999[] = { "datasets", "999" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 2, p999);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 2);
 
     /* Leading-zero canonical-form rejection. */
     const char *p01[] = { "datasets", "01" };
     sz = build_twalk(req, 3, 10, 12, 2, p01);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 2);
 
     /* Out-of-range (> STM_SYNC_DATASET_ID_MAX = 268435455). */
     const char *p_huge[] = { "datasets", "9999999999" };
     sz = build_twalk(req, 4, 10, 13, 2, p_huge);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 2);
 
     /* 11-character input (length cap). */
     const char *p_long[] = { "datasets", "12345678901" };
     sz = build_twalk(req, 5, 10, 14, 2, p_long);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 2);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
@@ -1519,17 +1583,17 @@ STM_TEST(ctl_r99_p3_2_dataset_id_zero_rejected_at_parser)
 
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(fs, &c));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *p0[] = { "datasets", "0" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 2, p0);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 2);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
@@ -1545,20 +1609,20 @@ STM_TEST(ctl_c1_dataset_properties_write_rejected)
 
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(fs, &c));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "datasets", CTL_TEST_DATASET_ROOT_ID, "properties" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 3, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
-    sz = build_topen(req, 3, 11, STM_P9_OWRITE);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    sz = build_topen(req, 3, 11, STM_LP9_O_WRONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 3);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
@@ -1573,16 +1637,16 @@ STM_TEST(ctl_d1_admin_dir_listed_to_all)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     /* Caller is unset → non-admin. */
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
-    uint32_t sz = build_topen(req, 2, 10, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    uint32_t sz = build_topen(req, 2, 10, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
-    sz = build_tread(req, 3, 10, 0, 8192);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_treaddir(req, 3, 10, 0, 8192);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     STM_ASSERT(count > 0);
 
@@ -1590,17 +1654,16 @@ STM_TEST(ctl_d1_admin_dir_listed_to_all)
     const uint8_t *q = resp + 11;
     const uint8_t *end = q + count;
     while (q < end) {
-        uint16_t inner = load_u16(q);
-        const uint8_t *rec = q + 2;
-        const uint8_t *np = rec + 2 + 4 + 13 + 4 + 4 + 4 + 8;
+        STM_ASSERT((size_t)(end - q) >= STM_LP9_QID_SIZE + 8u + 1u + 2u);
+        const uint8_t *np = q + STM_LP9_QID_SIZE + 8u + 1u;
         uint16_t nl = load_u16(np);
         const char *nm = (const char *)(np + 2);
         if (nl == 5 && memcmp(nm, "admin", 5) == 0) saw_admin = 1;
-        q += 2 + inner;
+        q = np + 2 + nl;
     }
     STM_ASSERT_TRUE(saw_admin);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -1609,22 +1672,22 @@ STM_TEST(ctl_d1_admin_topen_nonadmin_eacces)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     /* No set_caller → caller_uid is unset (sentinel) → non-admin. */
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "admin" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 1, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     /* Walk succeeds — stat doesn't admin-gate; only Topen does. */
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -1634,23 +1697,23 @@ STM_TEST(ctl_d1_admin_peer_admin_succeeds)
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     /* Stamp uid 0 → admin per the v2.0 baseline policy. */
     STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "admin", "peer" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
     sz = build_tread(req, 4, 11, 0, 4096);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RREAD);
     uint32_t count = load_u32(resp + 7);
     STM_ASSERT(count > 0);
 
@@ -1663,7 +1726,7 @@ STM_TEST(ctl_d1_admin_peer_admin_succeeds)
     STM_ASSERT(strstr(body, "caller-gid: 0\n")  != NULL);
     STM_ASSERT(strstr(body, "is-admin: yes\n")  != NULL);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -1674,22 +1737,22 @@ STM_TEST(ctl_d1_admin_peer_nonroot_admin_via_admin_uid)
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_set_admin_uid(c, 1000));
     STM_ASSERT_OK(stm_ctl_set_caller(c, 1000, 1000));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "admin", "peer" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
     sz = build_tread(req, 4, 11, 0, 4096);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     STM_ASSERT(count > 0);
 
@@ -1701,7 +1764,7 @@ STM_TEST(ctl_d1_admin_peer_nonroot_admin_via_admin_uid)
     STM_ASSERT(strstr(body, "admin-uid: 1000\n")   != NULL);
     STM_ASSERT(strstr(body, "is-admin: yes\n")     != NULL);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -1710,24 +1773,24 @@ STM_TEST(ctl_d1_admin_peer_nonadmin_walk_rejected)
     /* Non-admin caller: uid 1000, no admin_uid set → uid 0 only is
      * admin. R100 P2-1 fix: walk-THROUGH /admin/ from non-admin
      * returns ENOENT at step 1, server replies RERROR (file not
-     * found) per stm_p9_server's partial-walk handling. The
+     * found) per stm_lp9_server's partial-walk handling. The
      * non-admin sees the same wire response as if /admin/peer
      * didn't exist — the documented POSIX-mode-0500 posture. */
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_set_caller(c, 1000, 1000));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "admin", "peer" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     /* R100 P2-1 (post-fix): walk fails — partial walk treated as RERROR. */
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    ASSERT_WALK_FAILED(resp, 2);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -1737,20 +1800,20 @@ STM_TEST(ctl_d1_admin_peer_unset_caller_eacces)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     /* Note: we deliberately DO NOT call stm_ctl_set_caller. */
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "admin", "peer" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 2);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -1775,7 +1838,7 @@ STM_TEST(ctl_r100_p2_1_admin_walk_through_blocks_nonadmin)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_set_caller(c, 1000, 1000));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -1785,32 +1848,32 @@ STM_TEST(ctl_r100_p2_1_admin_walk_through_blocks_nonadmin)
      * (matches POSIX visibility of a mode-0500 dir from outside). */
     const char *p_admin[] = { "admin" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 1, p_admin);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
     /* Tstat on /admin/ — succeeds, returns mode 0500. POSIX
      * analogue: `stat /admin` works for non-admin even when the
      * dir's mode forbids traversal. */
     sz = build_tstat(req, 3, 11);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RSTAT);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RGETATTR);
 
     /* Walk THROUGH /admin/ for a child — fails. Server returns
      * RERROR (file not found) per partial-walk semantics: step 0
      * succeeded but step 1's vops_walk returned ENOENT. */
     const char *p_peer[] = { "admin", "peer" };
     sz = build_twalk(req, 4, 10, 12, 2, p_peer);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 2);
 
     /* fid 12 was NOT bound (per the partial-walk binding rule).
      * Tstat on fid 12 returns RERROR (unknown fid) — no /admin/peer
      * mode leak. */
     sz = build_tstat(req, 5, 12);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -1825,22 +1888,22 @@ STM_TEST(ctl_r100_p3_1_unset_admin_uid_renders_unset)
     STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));
     /* Deliberately do NOT call stm_ctl_set_admin_uid — admin_uid
      * stays at the (uid_t)-1 sentinel. */
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "admin", "peer" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
     sz = build_tread(req, 4, 11, 0, 4096);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     char body[1024];
     memcpy(body, resp + 11, count);
@@ -1849,7 +1912,7 @@ STM_TEST(ctl_r100_p3_1_unset_admin_uid_renders_unset)
     STM_ASSERT(strstr(body, "admin-uid: (unset)\n") != NULL);
     STM_ASSERT(strstr(body, "is-admin: yes\n")      != NULL);  /* root */
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -1864,22 +1927,22 @@ STM_TEST(ctl_r100_p3_2_root_beats_admin_uid)
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_set_admin_uid(c, 1000));
     STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "admin", "peer" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
     sz = build_tread(req, 4, 11, 0, 4096);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     char body[1024];
     memcpy(body, resp + 11, count);
@@ -1887,7 +1950,7 @@ STM_TEST(ctl_r100_p3_2_root_beats_admin_uid)
     STM_ASSERT(strstr(body, "is-admin: yes\n")    != NULL);
     STM_ASSERT(strstr(body, "admin-uid: 1000\n")  != NULL);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -1901,16 +1964,16 @@ STM_TEST(ctl_d2_events_in_root_listing)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
-    uint32_t sz = build_topen(req, 2, 10, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    uint32_t sz = build_topen(req, 2, 10, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
-    sz = build_tread(req, 3, 10, 0, 8192);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_treaddir(req, 3, 10, 0, 8192);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     STM_ASSERT(count > 0);
 
@@ -1918,17 +1981,16 @@ STM_TEST(ctl_d2_events_in_root_listing)
     const uint8_t *q = resp + 11;
     const uint8_t *end = q + count;
     while (q < end) {
-        uint16_t inner = load_u16(q);
-        const uint8_t *rec = q + 2;
-        const uint8_t *np = rec + 2 + 4 + 13 + 4 + 4 + 4 + 8;
+        STM_ASSERT((size_t)(end - q) >= STM_LP9_QID_SIZE + 8u + 1u + 2u);
+        const uint8_t *np = q + STM_LP9_QID_SIZE + 8u + 1u;
         uint16_t nl = load_u16(np);
         const char *nm = (const char *)(np + 2);
         if (nl == 6 && memcmp(nm, "events", 6) == 0) saw_events = 1;
-        q += 2 + inner;
+        q = np + 2 + nl;
     }
     STM_ASSERT_TRUE(saw_events);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -1937,26 +1999,26 @@ STM_TEST(ctl_d2_events_empty_when_no_log)
     /* Fresh stm_ctl: event log empty; /events read returns zero bytes. */
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "events" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 1, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
     sz = build_tread(req, 4, 11, 0, 8192);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RREAD);
     STM_ASSERT_EQ(load_u32(resp + 7), 0u);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -1968,20 +2030,20 @@ STM_TEST(ctl_d2_log_event_then_read_back)
     stm_ctl_log_event(c, "first event id=42");
     stm_ctl_log_event(c, "second event delta=%llu", (unsigned long long)100);
 
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "events" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 1, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
     sz = build_tread(req, 4, 11, 0, 8192);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     STM_ASSERT(count > 0);
 
@@ -1994,7 +2056,7 @@ STM_TEST(ctl_d2_log_event_then_read_back)
     STM_ASSERT(strstr(body, "first event id=42\n") != NULL);
     STM_ASSERT(strstr(body, "second event delta=100\n") != NULL);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -2005,24 +2067,24 @@ STM_TEST(ctl_d2_clear_events_admin_succeeds)
     STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));   /* root */
     stm_ctl_log_event(c, "before clear");
 
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "admin", "clear-events" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
-    sz = build_topen(req, 3, 11, STM_P9_OWRITE);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    sz = build_topen(req, 3, 11, STM_LP9_O_WRONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
     /* Any payload triggers the clear — content ignored. */
     sz = build_twrite(req, 4, 11, 0, "x", 1);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWRITE);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWRITE);
 
     /* Verify the log was cleared. The clear itself self-logs an
      * "events log cleared by uid=0" entry, so the buffer is now
@@ -2030,13 +2092,13 @@ STM_TEST(ctl_d2_clear_events_admin_succeeds)
      * should be gone. */
     const char *epath[] = { "events" };
     sz = build_twalk(req, 5, 10, 12, 1, epath);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
-    sz = build_topen(req, 6, 12, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 6, 12, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
     sz = build_tread(req, 7, 12, 0, 8192);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     char body[1024];
     memcpy(body, resp + 11, count);
@@ -2044,7 +2106,7 @@ STM_TEST(ctl_d2_clear_events_admin_succeeds)
     STM_ASSERT(strstr(body, "before clear") == NULL);
     STM_ASSERT(strstr(body, "events log cleared by uid=0") != NULL);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -2055,7 +2117,7 @@ STM_TEST(ctl_d2_clear_events_nonadmin_eacces)
     STM_ASSERT_OK(stm_ctl_set_caller(c, 1000, 1000));    /* non-admin */
     stm_ctl_log_event(c, "should survive non-admin attempt");
 
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -2063,26 +2125,26 @@ STM_TEST(ctl_d2_clear_events_nonadmin_eacces)
     /* Walk through /admin/ as non-admin → ENOENT (R100 P2-1 gate). */
     const char *path[] = { "admin", "clear-events" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 2);
 
     /* Verify the log is intact. */
     const char *epath[] = { "events" };
     sz = build_twalk(req, 3, 10, 12, 1, epath);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
-    sz = build_topen(req, 4, 12, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 4, 12, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
     sz = build_tread(req, 5, 12, 0, 8192);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     char body[1024];
     memcpy(body, resp + 11, count);
     body[count] = '\0';
     STM_ASSERT(strstr(body, "should survive non-admin attempt") != NULL);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -2095,24 +2157,24 @@ STM_TEST(ctl_d2_events_snapshot_at_topen)
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
 
     stm_ctl_log_event(c, "before topen");
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "events" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 1, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
     /* Add a new event AFTER Topen. The current fid's view should
      * not include it. */
     stm_ctl_log_event(c, "after topen");
 
     sz = build_tread(req, 4, 11, 0, 8192);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     char body[1024];
     memcpy(body, resp + 11, count);
@@ -2120,7 +2182,7 @@ STM_TEST(ctl_d2_events_snapshot_at_topen)
     STM_ASSERT(strstr(body, "before topen") != NULL);
     STM_ASSERT(strstr(body, "after topen")  == NULL);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -2138,20 +2200,20 @@ STM_TEST(ctl_d2_log_event_truncation_keeps_newline)
     stm_ctl_log_event(c, "%s", huge);
     stm_ctl_log_event(c, "next line");
 
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "events" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 1, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
     sz = build_tread(req, 4, 11, 0, 8192);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     char body[8192];
     memcpy(body, resp + 11, count);
@@ -2164,7 +2226,7 @@ STM_TEST(ctl_d2_log_event_truncation_keeps_newline)
     /* No "AAAnext" merger. */
     STM_ASSERT(strstr(body, "AAAnext") == NULL);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -2179,7 +2241,7 @@ STM_TEST(ctl_r100_p3_3_set_admin_uid_can_reset)
     /* Reset admin_uid back to unset. */
     STM_ASSERT_OK(stm_ctl_set_admin_uid(c, (uid_t)-1));
 
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -2187,10 +2249,10 @@ STM_TEST(ctl_r100_p3_3_set_admin_uid_can_reset)
     /* uid 1000 is no longer admin → walk through /admin/ refused. */
     const char *path[] = { "admin", "peer" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 2);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -2211,20 +2273,20 @@ STM_TEST(ctl_r101_p1_1_drop_all_sessions_releases_slots)
     stm_ctl_log_event(c, "first event");
 
     /* Conn 1: open /events on fid 11. */
-    stm_p9_server *s1 = make_ctl_server(c);
+    stm_lp9_server *s1 = make_ctl_server(c);
     do_handshake(s1, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "events" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 1, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s1, req, sz, resp, sizeof resp, &rlen));
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s1, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    STM_ASSERT_OK(stm_lp9_server_handle(s1, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s1, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
     /* Tear down conn 1 WITHOUT a Tclunk — leaks the session. */
-    stm_p9_server_destroy(s1);
+    stm_lp9_server_destroy(s1);
 
     /* Without drop_all_sessions, the leaked slot would interfere
      * with conn 2's reuse of fid 11. Drain it. */
@@ -2232,18 +2294,18 @@ STM_TEST(ctl_r101_p1_1_drop_all_sessions_releases_slots)
 
     /* Conn 2 with a fresh server on the same stm_ctl. */
     stm_ctl_log_event(c, "second event");
-    stm_p9_server *s2 = make_ctl_server(c);
+    stm_lp9_server *s2 = make_ctl_server(c);
     do_handshake(s2, 10);
 
     sz = build_twalk(req, 2, 10, 11, 1, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s2, req, sz, resp, sizeof resp, &rlen));
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s2, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    STM_ASSERT_OK(stm_lp9_server_handle(s2, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s2, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
     /* Read should yield the FRESH snapshot — both events visible. */
     sz = build_tread(req, 4, 11, 0, 8192);
-    STM_ASSERT_OK(stm_p9_server_handle(s2, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s2, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     char body[1024];
     memcpy(body, resp + 11, count);
@@ -2251,7 +2313,7 @@ STM_TEST(ctl_r101_p1_1_drop_all_sessions_releases_slots)
     STM_ASSERT(strstr(body, "first event")  != NULL);
     STM_ASSERT(strstr(body, "second event") != NULL);
 
-    stm_p9_server_destroy(s2);
+    stm_lp9_server_destroy(s2);
     stm_ctl_destroy(c);
 }
 
@@ -2272,7 +2334,7 @@ STM_TEST(ctl_r101_p2_1_clear_invalidates_active_event_snapshots)
     STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));    /* root */
     stm_ctl_log_event(c, "before clear: this should not leak");
 
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -2281,29 +2343,29 @@ STM_TEST(ctl_r101_p2_1_clear_invalidates_active_event_snapshots)
     /* Open /events on fid 11 — captures a snapshot of the pre-clear log. */
     const char *epath[] = { "events" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 1, epath);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
     /* Trigger clear via /admin/clear-events. */
     const char *cpath[] = { "admin", "clear-events" };
     sz = build_twalk(req, 4, 10, 12, 2, cpath);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    sz = build_topen(req, 5, 12, STM_P9_OWRITE);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 5, 12, STM_LP9_O_WRONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     sz = build_twrite(req, 6, 12, 0, "x", 1);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWRITE);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWRITE);
 
     /* The original fid 11's read MUST now return clean EOF (0
      * bytes) — NOT the pre-clear content, NOT zero-padded
      * frankenstein bytes. */
     sz = build_tread(req, 7, 11, 0, 8192);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RREAD);
     STM_ASSERT_EQ(load_u32(resp + 7), 0u);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -2317,32 +2379,32 @@ STM_TEST(ctl_r101_p2_2_zero_byte_clear_refused)
     STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));
     stm_ctl_log_event(c, "this must survive a 0-byte clear attempt");
 
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "admin", "clear-events" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
-    sz = build_topen(req, 3, 11, STM_P9_OWRITE);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    sz = build_topen(req, 3, 11, STM_LP9_O_WRONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
     /* Twrite count=0 — refused. */
     sz = build_twrite(req, 4, 11, 0, "", 0);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     /* Verify log intact. */
     const char *epath[] = { "events" };
     sz = build_twalk(req, 5, 10, 12, 1, epath);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    sz = build_topen(req, 6, 12, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 6, 12, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     sz = build_tread(req, 7, 12, 0, 8192);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     char body[1024];
     memcpy(body, resp + 11, count);
@@ -2350,7 +2412,7 @@ STM_TEST(ctl_r101_p2_2_zero_byte_clear_refused)
     STM_ASSERT(strstr(body, "this must survive a 0-byte clear attempt")
                 != NULL);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -2364,18 +2426,18 @@ STM_TEST(ctl_d3_debug_dir_in_root_listing)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     /* No caller stamped → not-admin → still sees /debug at root. */
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
-    uint32_t sz = build_topen(req, 2, 10, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    uint32_t sz = build_topen(req, 2, 10, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
-    sz = build_tread(req, 3, 10, 0, 8192);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    sz = build_treaddir(req, 3, 10, 0, 8192);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RREADDIR);
     uint32_t count = load_u32(resp + 7);
     STM_ASSERT(count > 0);
 
@@ -2383,17 +2445,16 @@ STM_TEST(ctl_d3_debug_dir_in_root_listing)
     const uint8_t *q = resp + 11;
     const uint8_t *end = q + count;
     while (q < end) {
-        uint16_t inner = load_u16(q);
-        const uint8_t *rec = q + 2;
-        const uint8_t *np = rec + 2 + 4 + 13 + 4 + 4 + 4 + 8;
+        STM_ASSERT((size_t)(end - q) >= STM_LP9_QID_SIZE + 8u + 1u + 2u);
+        const uint8_t *np = q + STM_LP9_QID_SIZE + 8u + 1u;
         uint16_t nl = load_u16(np);
         const char *nm = (const char *)(np + 2);
         if (nl == 5 && memcmp(nm, "debug", 5) == 0) saw_debug = 1;
-        q += 2 + inner;
+        q = np + 2 + nl;
     }
     STM_ASSERT_TRUE(saw_debug);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -2406,21 +2467,21 @@ STM_TEST(ctl_d3_debug_topen_nonadmin_eacces)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_set_caller(c, 1000, 1000));   /* not admin */
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "debug" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 1, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -2432,17 +2493,17 @@ STM_TEST(ctl_d3_debug_walk_through_nonadmin_rejected)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_set_caller(c, 1000, 1000));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "debug", "allocator-state" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 2);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -2460,23 +2521,23 @@ STM_TEST(ctl_d3_debug_alloc_admin_reads_stats)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(fs, &c));
     STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));     /* root → admin */
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "debug", "allocator-state", "0" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 3, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
     sz = build_tread(req, 4, 11, 0, 4096);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RREAD);
     uint32_t count = load_u32(resp + 7);
     STM_ASSERT(count > 0);
     char body[1024];
@@ -2500,7 +2561,7 @@ STM_TEST(ctl_d3_debug_alloc_admin_reads_stats)
     STM_ASSERT(strstr(body, "n-allocated-ranges: ") != NULL);
     STM_ASSERT(strstr(body, "n-pending-ranges: ") != NULL);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
@@ -2520,23 +2581,23 @@ STM_TEST(ctl_d3_debug_alloc_dir_lists_attached_devices)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(fs, &c));
     STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "debug", "allocator-state" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
-    sz = build_tread(req, 4, 11, 0, 8192);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    sz = build_treaddir(req, 4, 11, 0, 8192);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RREADDIR);
     uint32_t count = load_u32(resp + 7);
     STM_ASSERT(count > 0);
 
@@ -2544,19 +2605,18 @@ STM_TEST(ctl_d3_debug_alloc_dir_lists_attached_devices)
     const uint8_t *q = resp + 11;
     const uint8_t *end = q + count;
     while (q < end) {
-        uint16_t inner = load_u16(q);
-        const uint8_t *rec = q + 2;
-        const uint8_t *np = rec + 2 + 4 + 13 + 4 + 4 + 4 + 8;
+        STM_ASSERT((size_t)(end - q) >= STM_LP9_QID_SIZE + 8u + 1u + 2u);
+        const uint8_t *np = q + STM_LP9_QID_SIZE + 8u + 1u;
         uint16_t nl = load_u16(np);
         const char *nm = (const char *)(np + 2);
         if (nl == 1 && nm[0] == '0') saw_zero = 1;
         else                          saw_other = 1;
-        q += 2 + inner;
+        q = np + 2 + nl;
     }
     STM_ASSERT_TRUE(saw_zero);
     STM_ASSERT_TRUE(!saw_other);    /* single-device fs */
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
@@ -2575,7 +2635,7 @@ STM_TEST(ctl_d3_debug_alloc_oob_device_enoent)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(fs, &c));
     STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -2583,18 +2643,18 @@ STM_TEST(ctl_d3_debug_alloc_oob_device_enoent)
     /* "64" is the first OOB id (cap = 64). */
     const char *path[] = { "debug", "allocator-state", "64" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 3, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 3);
 
     /* Single-device fs has slot 0 only; slot 1 has no allocator
      * attached. Walk binds (parser accepts "1"), but materialize via
      * stat_at probes stm_fs_alloc_stats_get and ENOENTs. */
     const char *path1[] = { "debug", "allocator-state", "1" };
     sz = build_twalk(req, 3, 10, 12, 3, path1);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 3);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
@@ -2613,17 +2673,17 @@ STM_TEST(ctl_d3_debug_alloc_leading_zero_rejected)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(fs, &c));
     STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "debug", "allocator-state", "00" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 3, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 3);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
@@ -2637,7 +2697,7 @@ STM_TEST(ctl_d3_debug_alloc_dir_unattached_fs_walks_then_topen_enoent)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -2648,10 +2708,10 @@ STM_TEST(ctl_d3_debug_alloc_dir_unattached_fs_walks_then_topen_enoent)
      * unattached. */
     const char *path[] = { "debug", "allocator-state" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 2);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -2702,7 +2762,7 @@ STM_TEST(ctl_r102_p3_5_debug_dir_stat_for_nonadmin)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_set_caller(c, 1000, 1000));    /* not admin */
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -2712,23 +2772,23 @@ STM_TEST(ctl_r102_p3_5_debug_dir_stat_for_nonadmin)
      * caller on a POSIX 0500 dir (visible, not enterable). */
     const char *path[] = { "debug" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 1, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
     /* Tstat the bound fid. Returns dir stat with mode 0500 +
-     * STM_P9_DMDIR set. */
+     * CTL_S_IFDIR set. */
     sz = build_tstat(req, 3, 11);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RSTAT);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RGETATTR);
 
     /* Two-step Twalk-through is rejected (R100 P2-1 carry test
      * already covers this; sanity-check here too). */
     const char *path2[] = { "debug", "allocator-state" };
     sz = build_twalk(req, 4, 10, 12, 2, path2);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 2);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -2829,22 +2889,22 @@ STM_TEST(ctl_d4_scrub_omitted_from_readdir_when_unattached)
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
 
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "pools", CTL_TEST_POOL_UUID_HEX };
     uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
-    sz = build_tread(req, 4, 11, 0, 8192);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_treaddir(req, 4, 11, 0, 8192);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     STM_ASSERT(count > 0);
 
@@ -2852,23 +2912,22 @@ STM_TEST(ctl_d4_scrub_omitted_from_readdir_when_unattached)
     const uint8_t *q = resp + 11;
     const uint8_t *end = q + count;
     while (q < end) {
-        uint16_t inner = load_u16(q);
-        const uint8_t *rec = q + 2;
-        const uint8_t *np = rec + 2 + 4 + 13 + 4 + 4 + 4 + 8;
+        STM_ASSERT((size_t)(end - q) >= STM_LP9_QID_SIZE + 8u + 1u + 2u);
+        const uint8_t *np = q + STM_LP9_QID_SIZE + 8u + 1u;
         uint16_t nl = load_u16(np);
         const char *nm = (const char *)(np + 2);
         if (nl == 5 && memcmp(nm, "scrub", 5) == 0) saw_scrub = 1;
-        q += 2 + inner;
+        q = np + 2 + nl;
     }
     STM_ASSERT_TRUE(!saw_scrub);
 
     /* Twalk to scrub: RERROR. */
     const char *spath[] = { "pools", CTL_TEST_POOL_UUID_HEX, "scrub" };
     sz = build_twalk(req, 5, 10, 12, 3, spath);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 3);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
     destroy_test_pool(f);
 }
@@ -2896,7 +2955,7 @@ STM_TEST(ctl_d4_scrub_listed_and_reads_idle)
     STM_ASSERT_OK(stm_ctl_attach_pool(c, pool));
     STM_ASSERT_OK(stm_ctl_attach_scrub(c, sc));
 
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     /* Resolve the formatted pool uuid hex from the live pool. */
@@ -2921,16 +2980,16 @@ STM_TEST(ctl_d4_scrub_listed_and_reads_idle)
     uint32_t rlen = 0;
     const char *spath[] = { "pools", uuid_hex, "scrub" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 3, spath);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
     sz = build_tread(req, 4, 11, 0, 4096);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RREAD);
     uint32_t count = load_u32(resp + 7);
     STM_ASSERT(count > 0);
     char body[1024];
@@ -2950,33 +3009,32 @@ STM_TEST(ctl_d4_scrub_listed_and_reads_idle)
     /* Re-readdir to verify "scrub" appears alongside status + devices. */
     const char *ppath[] = { "pools", uuid_hex };
     sz = build_twalk(req, 5, 10, 13, 2, ppath);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
-    sz = build_topen(req, 6, 13, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    sz = build_tread(req, 7, 13, 0, 8192);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
+    sz = build_topen(req, 6, 13, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_treaddir(req, 7, 13, 0, 8192);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     count = load_u32(resp + 7);
 
     int saw_status = 0, saw_devices = 0, saw_scrub = 0;
     const uint8_t *q = resp + 11;
     const uint8_t *end = q + count;
     while (q < end) {
-        uint16_t inner = load_u16(q);
-        const uint8_t *rec = q + 2;
-        const uint8_t *np = rec + 2 + 4 + 13 + 4 + 4 + 4 + 8;
+        STM_ASSERT((size_t)(end - q) >= STM_LP9_QID_SIZE + 8u + 1u + 2u);
+        const uint8_t *np = q + STM_LP9_QID_SIZE + 8u + 1u;
         uint16_t nl = load_u16(np);
         const char *nm = (const char *)(np + 2);
         if (nl == 6 && memcmp(nm, "status",  6) == 0) saw_status  = 1;
         if (nl == 7 && memcmp(nm, "devices", 7) == 0) saw_devices = 1;
         if (nl == 5 && memcmp(nm, "scrub",   5) == 0) saw_scrub   = 1;
-        q += 2 + inner;
+        q = np + 2 + nl;
     }
     STM_ASSERT_TRUE(saw_status);
     STM_ASSERT_TRUE(saw_devices);
     STM_ASSERT_TRUE(saw_scrub);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
     stm_scrub_close(sc);
     STM_ASSERT_OK(stm_fs_unmount(fs));
@@ -3006,7 +3064,7 @@ STM_TEST(ctl_d4_scrub_state_running_after_start)
      * reflect that state. */
     STM_ASSERT_OK(stm_scrub_start(sc));
 
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     const uint64_t *uuid_words = stm_pool_uuid(pool);
@@ -3029,11 +3087,11 @@ STM_TEST(ctl_d4_scrub_state_running_after_start)
     uint32_t rlen = 0;
     const char *spath[] = { "pools", uuid_hex, "scrub" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 3, spath);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     sz = build_tread(req, 4, 11, 0, 4096);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     char body[1024];
     memcpy(body, resp + 11, count);
@@ -3044,20 +3102,20 @@ STM_TEST(ctl_d4_scrub_state_running_after_start)
      * advances. */
     STM_ASSERT_OK(stm_scrub_pause(sc));
     sz = build_tclunk(req, 5, 11);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     const char *spath2[] = { "pools", uuid_hex, "scrub" };
     sz = build_twalk(req, 6, 10, 12, 3, spath2);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    sz = build_topen(req, 7, 12, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 7, 12, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     sz = build_tread(req, 8, 12, 0, 4096);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     count = load_u32(resp + 7);
     memcpy(body, resp + 11, count);
     body[count] = '\0';
     STM_ASSERT(strstr(body, "state: paused\n") != NULL);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
     stm_scrub_close(sc);
     STM_ASSERT_OK(stm_fs_unmount(fs));
@@ -3085,7 +3143,7 @@ STM_TEST(ctl_d4_scrub_world_readable_nonadmin_succeeds)
     STM_ASSERT_OK(stm_ctl_attach_scrub(c, sc));
     STM_ASSERT_OK(stm_ctl_set_caller(c, 1000, 1000));    /* not admin */
 
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     const uint64_t *uuid_words = stm_pool_uuid(pool);
@@ -3108,18 +3166,18 @@ STM_TEST(ctl_d4_scrub_world_readable_nonadmin_succeeds)
     uint32_t rlen = 0;
     const char *spath[] = { "pools", uuid_hex, "scrub" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 3, spath);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
     sz = build_tread(req, 4, 11, 0, 4096);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RREAD);
     uint32_t count = load_u32(resp + 7);
     STM_ASSERT(count > 0);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
     stm_scrub_close(sc);
     STM_ASSERT_OK(stm_fs_unmount(fs));
@@ -3150,7 +3208,7 @@ STM_TEST(ctl_r103_p3_1_scrub_topen_rdwr_eacces)
     STM_ASSERT_OK(stm_ctl_attach_pool(c, pool));
     STM_ASSERT_OK(stm_ctl_attach_scrub(c, sc));
 
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     const uint64_t *uuid_words = stm_pool_uuid(pool);
@@ -3173,24 +3231,24 @@ STM_TEST(ctl_r103_p3_1_scrub_topen_rdwr_eacces)
     uint32_t rlen = 0;
     const char *spath[] = { "pools", uuid_hex, "scrub" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 3, spath);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
     /* ORDWR refused — file is mode 0444. */
-    sz = build_topen(req, 3, 11, STM_P9_ORDWR);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDWR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 3);
 
     /* OWRITE refused. */
-    sz = build_topen(req, 4, 11, STM_P9_OWRITE);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    sz = build_topen(req, 4, 11, STM_LP9_O_WRONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     /* OREAD succeeds — sanity-check the gate is mode-specific. */
-    sz = build_topen(req, 5, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    sz = build_topen(req, 5, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
     stm_scrub_close(sc);
     STM_ASSERT_OK(stm_fs_unmount(fs));
@@ -3219,7 +3277,7 @@ STM_TEST(ctl_r103_p3_1_scrub_twrite_eacces)
     STM_ASSERT_OK(stm_ctl_attach_pool(c, pool));
     STM_ASSERT_OK(stm_ctl_attach_scrub(c, sc));
 
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     const uint64_t *uuid_words = stm_pool_uuid(pool);
@@ -3242,10 +3300,10 @@ STM_TEST(ctl_r103_p3_1_scrub_twrite_eacces)
     uint32_t rlen = 0;
     const char *spath[] = { "pools", uuid_hex, "scrub" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 3, spath);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
     /* Twrite "start" to the read-fid → RERROR. The body content is
      * irrelevant; the kind-mode gate refuses any write to KIND_POOL_
@@ -3253,10 +3311,10 @@ STM_TEST(ctl_r103_p3_1_scrub_twrite_eacces)
      * KIND_POOL_SCRUB_TRIGGER for write actions, mirroring the
      * KIND_ADMIN_CLEAR_EVENTS pattern.) */
     sz = build_twrite(req, 4, 11, 0, "start", 5);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
     stm_scrub_close(sc);
     STM_ASSERT_OK(stm_fs_unmount(fs));
@@ -3285,7 +3343,7 @@ STM_TEST(ctl_r103_p3_1_scrub_tstat_reports_0444)
     STM_ASSERT_OK(stm_ctl_attach_pool(c, pool));
     STM_ASSERT_OK(stm_ctl_attach_scrub(c, sc));
 
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     const uint64_t *uuid_words = stm_pool_uuid(pool);
@@ -3308,34 +3366,24 @@ STM_TEST(ctl_r103_p3_1_scrub_tstat_reports_0444)
     uint32_t rlen = 0;
     const char *spath[] = { "pools", uuid_hex, "scrub" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 3, spath);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
     sz = build_tstat(req, 3, 11);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RSTAT);
-    /* Rstat layout: header (7) + stat_size (2) + inner_size (2) +
-     * type (2) + dev (4) + qid_type (1) + qid_version (4) +
-     * qid_path (8) + mode (4) + ... — see test_p9.c for the
-     * canonical decoder. mode is at offset 7 + 2 + 2 + 2 + 4 + 1 +
-     * 4 + 8 = 30 from the start of the response, plus the qid_type
-     * byte we want. */
-    /* The 9P RSTAT response packs the stat record at resp + 7 + 2
-     * (where the leading u16 is the inner stat-size length).  See
-     * the test_p9.c stat-decode pattern. The mode field is 4 bytes
-     * starting at offset 23 within the inner stat block:
-     *   inner: type(2) dev(4) qid_type(1) qid_version(4) qid_path(8) mode(4)
-     *           = 2 + 4 + 1 + 4 + 8 = 19 → mode at +19. */
-    const uint8_t *stat = resp + 7 + 2;     /* skip RSTAT header + outer u16 */
-    /* Skip the inner u16 too — server packs it as a length prefix. */
-    stat += 2;
-    /* type(2) + dev(4) + qid_type(1) + qid_ver(4) + qid_path(8) = 19 */
-    uint8_t qid_type = stat[2 + 4];
-    uint32_t mode = load_u32(stat + 19);
-    STM_ASSERT_EQ((unsigned)qid_type, (unsigned)STM_P9_QTFILE);
-    /* Mode 0444 (no DMDIR). */
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RGETATTR);
+    /* Rgetattr body layout (153 bytes after the 7-byte header):
+     *   valid[8] qid[13] mode[4] uid[4] gid[4] nlink[8] rdev[8]
+     *   size[8] blksize[8] blocks[8] + 4 timestamp pairs(16 each) +
+     *   gen[8] data_version[8].
+     * qid bytes: qtype[1] version[4] path[8]. */
+    const uint8_t *body = resp + 7;
+    uint8_t qid_type = body[RGETATTR_OFF_QID];          /* qid.qtype */
+    uint32_t mode    = load_u32(body + RGETATTR_OFF_MODE);
+    STM_ASSERT_EQ((unsigned)qid_type, (unsigned)STM_LP9_QTFILE);
+    /* Mode 0444 (no S_IFDIR). */
     STM_ASSERT_EQ(mode & 0777u, 0444u);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
     stm_scrub_close(sc);
     STM_ASSERT_OK(stm_fs_unmount(fs));
@@ -3371,7 +3419,7 @@ typedef struct {
     stm_scrub     *sc;
     stm_pool      *pool;
     stm_ctl       *c;
-    stm_p9_server *s;
+    stm_lp9_server *s;
     char           uuid_hex[64];
 } scrub_trigger_fixture;
 
@@ -3404,7 +3452,7 @@ static scrub_trigger_fixture make_scrub_trigger_fixture(const char *tag, uid_t u
 
 static void destroy_scrub_trigger_fixture(scrub_trigger_fixture f)
 {
-    stm_p9_server_destroy(f.s);
+    stm_lp9_server_destroy(f.s);
     stm_ctl_destroy(f.c);
     stm_scrub_close(f.sc);
     STM_ASSERT_OK(stm_fs_unmount(f.fs));
@@ -3419,11 +3467,11 @@ static void open_scrub_trigger(scrub_trigger_fixture *f, uint16_t tag,
     uint32_t rlen = 0;
     const char *path[] = { "pools", f->uuid_hex, "scrub-trigger" };
     uint32_t sz = build_twalk(req, tag, 10, fid, 3, path);
-    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
-    sz = build_topen(req, (uint16_t)(tag + 1), fid, STM_P9_OWRITE);
-    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    STM_ASSERT_OK(stm_lp9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
+    sz = build_topen(req, (uint16_t)(tag + 1), fid, STM_LP9_O_WRONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 }
 
 /* Read scrub state (via /pools/<uuid>/scrub) into body[]. Returns
@@ -3435,19 +3483,19 @@ static uint32_t read_scrub_state(scrub_trigger_fixture *f, uint16_t tag,
     uint32_t rlen = 0;
     const char *path[] = { "pools", f->uuid_hex, "scrub" };
     uint32_t sz = build_twalk(req, tag, 10, fid, 3, path);
-    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
-    sz = build_topen(req, (uint16_t)(tag + 1), fid, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, (uint16_t)(tag + 1), fid, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
     sz = build_tread(req, (uint16_t)(tag + 2), fid, 0, (uint32_t)(cap - 1));
-    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    STM_ASSERT_OK(stm_lp9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RREAD);
     uint32_t count = load_u32(resp + 7);
     STM_ASSERT(count < cap);
     memcpy(body, resp + 11, count);
     body[count] = '\0';
     /* Clunk the read fid so we can reuse the slot. */
     sz = build_tclunk(req, (uint16_t)(tag + 3), fid);
-    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
     return count;
 }
 
@@ -3460,8 +3508,8 @@ STM_TEST(ctl_d5_scrub_trigger_start_drives_running)
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     uint32_t sz = build_twrite(req, 4, 11, 0, "start", 5);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWRITE);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWRITE);
     /* Server returns the byte count written. */
     STM_ASSERT_EQ(load_u32(resp + 7), 5u);
 
@@ -3472,11 +3520,11 @@ STM_TEST(ctl_d5_scrub_trigger_start_drives_running)
     /* Audit log captures the action. */
     const char *epath[] = { "events" };
     sz = build_twalk(req, 9, 10, 13, 1, epath);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    sz = build_topen(req, 10, 13, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 10, 13, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
     sz = build_tread(req, 11, 13, 0, 8192);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     char ebody[8192];
     STM_ASSERT(count < sizeof ebody);
@@ -3497,8 +3545,8 @@ STM_TEST(ctl_d5_scrub_trigger_pause_resume_round_trip)
     uint32_t rlen = 0;
     /* start */
     uint32_t sz = build_twrite(req, 4, 11, 0, "start", 5);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWRITE);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWRITE);
 
     char body[1024];
     /* pause: trailing newline must be stripped from the verb match,
@@ -3508,16 +3556,16 @@ STM_TEST(ctl_d5_scrub_trigger_pause_resume_round_trip)
      * trimmed length (`end`) instead of `len` would silently break
      * here. */
     sz = build_twrite(req, 5, 11, 0, "pause\n", 6);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWRITE);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWRITE);
     STM_ASSERT_EQ(load_u32(resp + 7), 6u);
     read_scrub_state(&f, 6, 12, body, sizeof body);
     STM_ASSERT(strstr(body, "state: paused\n") != NULL);
 
     /* resume — no trailing whitespace; out_written = len = 6. */
     sz = build_twrite(req, 10, 11, 0, "resume", 6);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWRITE);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWRITE);
     STM_ASSERT_EQ(load_u32(resp + 7), 6u);
     read_scrub_state(&f, 11, 13, body, sizeof body);
     STM_ASSERT(strstr(body, "state: running\n") != NULL);
@@ -3536,17 +3584,17 @@ STM_TEST(ctl_d5_scrub_trigger_reset_before_complete_fails)
     uint32_t rlen = 0;
     /* IDLE → reset → STM_EINVAL (only COMPLETED → IDLE is valid). */
     uint32_t sz = build_twrite(req, 4, 11, 0, "reset", 5);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     /* Audit log records the failed dispatch. */
     const char *epath[] = { "events" };
     sz = build_twalk(req, 5, 10, 12, 1, epath);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    sz = build_topen(req, 6, 12, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 6, 12, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
     sz = build_tread(req, 7, 12, 0, 8192);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     char ebody[8192];
     memcpy(ebody, resp + 11, count);
@@ -3565,17 +3613,17 @@ STM_TEST(ctl_d5_scrub_trigger_bogus_verb_einval)
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     uint32_t sz = build_twrite(req, 4, 11, 0, "frobnicate", 10);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     /* Audit log: <unknown> verb form. */
     const char *epath[] = { "events" };
     sz = build_twalk(req, 5, 10, 12, 1, epath);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    sz = build_topen(req, 6, 12, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 6, 12, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
     sz = build_tread(req, 7, 12, 0, 8192);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     char ebody[8192];
     memcpy(ebody, resp + 11, count);
@@ -3594,8 +3642,8 @@ STM_TEST(ctl_d5_scrub_trigger_zero_byte_einval)
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     uint32_t sz = build_twrite(req, 4, 11, 0, "", 0);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     destroy_scrub_trigger_fixture(f);
 }
@@ -3609,8 +3657,8 @@ STM_TEST(ctl_d5_scrub_trigger_whitespace_only_einval)
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     uint32_t sz = build_twrite(req, 4, 11, 0, "  \n\t\r", 5);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     destroy_scrub_trigger_fixture(f);
 }
@@ -3626,27 +3674,27 @@ STM_TEST(ctl_d5_scrub_trigger_topen_nonadmin_eacces)
     uint32_t rlen = 0;
     const char *path[] = { "pools", f.uuid_hex, "scrub-trigger" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 3, path);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);   /* walk succeeds */
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);   /* walk succeeds */
 
     /* Topen for OWRITE rejected by the admin gate. */
-    sz = build_topen(req, 3, 11, STM_P9_OWRITE);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    sz = build_topen(req, 3, 11, STM_LP9_O_WRONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 3);
 
     /* Mode != OWRITE also rejected — file is write-only. */
-    sz = build_topen(req, 4, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    sz = build_topen(req, 4, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     /* R104 P3-1: ORDWR (mode 2) is symmetric with OREAD against the
      * write-only mode-gate at vops_open — both rejected with EACCES.
      * The earlier OREAD-only assertion left the ORDWR path untested;
      * this catches a future regression that flipped the gate from
-     * `mode != STM_P9_OWRITE` to `mode == STM_P9_OREAD`. */
-    sz = build_topen(req, 5, 11, STM_P9_ORDWR);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+     * `mode != STM_LP9_O_WRONLY` to `mode == STM_LP9_O_RDONLY`. */
+    sz = build_topen(req, 5, 11, STM_LP9_O_RDWR);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     destroy_scrub_trigger_fixture(f);
 }
@@ -3660,41 +3708,40 @@ STM_TEST(ctl_d5_scrub_trigger_omitted_when_unattached)
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
 
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "pools", CTL_TEST_POOL_UUID_HEX };
     uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    sz = build_tread(req, 4, 11, 0, 8192);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_treaddir(req, 4, 11, 0, 8192);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
 
     int saw_trigger = 0;
     const uint8_t *q = resp + 11;
     const uint8_t *end = q + count;
     while (q < end) {
-        uint16_t inner = load_u16(q);
-        const uint8_t *rec = q + 2;
-        const uint8_t *np = rec + 2 + 4 + 13 + 4 + 4 + 4 + 8;
+        STM_ASSERT((size_t)(end - q) >= STM_LP9_QID_SIZE + 8u + 1u + 2u);
+        const uint8_t *np = q + STM_LP9_QID_SIZE + 8u + 1u;
         uint16_t nl = load_u16(np);
         const char *nm = (const char *)(np + 2);
         if (nl == 13 && memcmp(nm, "scrub-trigger", 13) == 0) saw_trigger = 1;
-        q += 2 + inner;
+        q = np + 2 + nl;
     }
     STM_ASSERT_TRUE(!saw_trigger);
 
     /* Walk to scrub-trigger: RERROR. */
     const char *spath[] = { "pools", CTL_TEST_POOL_UUID_HEX, "scrub-trigger" };
     sz = build_twalk(req, 5, 10, 12, 3, spath);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 3);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
     destroy_test_pool(f);
 }
@@ -3711,11 +3758,11 @@ static void open_create_snapshot(scrub_trigger_fixture *f, uint64_t dataset_id,
     uint32_t rlen = 0;
     const char *path[] = { "datasets", ds_str, "create-snapshot" };
     uint32_t sz = build_twalk(req, tag, 10, fid, 3, path);
-    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
-    sz = build_topen(req, (uint16_t)(tag + 1), fid, STM_P9_OWRITE);
-    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    STM_ASSERT_OK(stm_lp9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
+    sz = build_topen(req, (uint16_t)(tag + 1), fid, STM_LP9_O_WRONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 }
 
 /* Read /events into body[]; helper for asserting audit log content. */
@@ -3726,17 +3773,17 @@ static uint32_t read_events_log(scrub_trigger_fixture *f, uint16_t tag,
     uint32_t rlen = 0;
     const char *path[] = { "events" };
     uint32_t sz = build_twalk(req, tag, 10, fid, 1, path);
-    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
-    sz = build_topen(req, (uint16_t)(tag + 1), fid, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, (uint16_t)(tag + 1), fid, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
     sz = build_tread(req, (uint16_t)(tag + 2), fid, 0, (uint32_t)(cap - 1));
-    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     STM_ASSERT(count < cap);
     memcpy(body, resp + 11, count);
     body[count] = '\0';
     sz = build_tclunk(req, (uint16_t)(tag + 3), fid);
-    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
     return count;
 }
 
@@ -3751,8 +3798,8 @@ STM_TEST(ctl_d6_create_snapshot_admin_succeeds)
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     uint32_t sz = build_twrite(req, 4, 11, 0, "snap_a", 6);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWRITE);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWRITE);
     STM_ASSERT_EQ(load_u32(resp + 7), 6u);
 
     /* /events records the success. */
@@ -3782,8 +3829,8 @@ STM_TEST(ctl_d6_create_snapshot_trailing_newline_stripped)
     uint32_t rlen = 0;
     /* "snap_b\n" — len=7, name=6 chars after trim. */
     uint32_t sz = build_twrite(req, 4, 11, 0, "snap_b\n", 7);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWRITE);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWRITE);
     STM_ASSERT_EQ(load_u32(resp + 7), 7u);
 
     /* Audit log records name-len=6 (post-trim). */
@@ -3807,8 +3854,8 @@ STM_TEST(ctl_d6_create_snapshot_control_char_rejected)
     uint32_t rlen = 0;
     /* Name with embedded \n — refused at snapshot_create_inner. */
     uint32_t sz = build_twrite(req, 4, 11, 0, "evil\nflags: 0xdeadbeef", 22);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     /* Audit log records the failure but the embedded \n is in the
      * count, not the verbatim — no line-injection because the log
@@ -3888,8 +3935,8 @@ STM_TEST(ctl_d6_create_snapshot_nonexistent_dataset_enoent)
     uint32_t rlen = 0;
     const char *path[] = { "datasets", "99999999", "create-snapshot" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 3, path);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 3);
 
     destroy_scrub_trigger_fixture(f);
 }
@@ -3905,12 +3952,12 @@ STM_TEST(ctl_d6_create_snapshot_nonadmin_eacces)
     uint32_t rlen = 0;
     const char *path[] = { "datasets", "1", "create-snapshot" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 3, path);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
-    sz = build_topen(req, 3, 11, STM_P9_OWRITE);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    sz = build_topen(req, 3, 11, STM_LP9_O_WRONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 3);
 
     destroy_scrub_trigger_fixture(f);
 }
@@ -3924,8 +3971,8 @@ STM_TEST(ctl_d6_create_snapshot_zero_byte_einval)
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     uint32_t sz = build_twrite(req, 4, 11, 0, "", 0);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     destroy_scrub_trigger_fixture(f);
 }
@@ -3941,13 +3988,13 @@ STM_TEST(ctl_d6_create_snapshot_duplicate_name_eexists)
     uint32_t rlen = 0;
     /* First create succeeds. */
     uint32_t sz = build_twrite(req, 4, 11, 0, "snap_x", 6);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWRITE);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWRITE);
 
     /* Second with same name → RERROR (STM_EEXIST). */
     sz = build_twrite(req, 5, 11, 0, "snap_x", 6);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     destroy_scrub_trigger_fixture(f);
 }
@@ -4016,20 +4063,20 @@ STM_TEST(ctl_r105_p3_1_post_admin_refusals_logged)
 
     /* Zero-byte refusal. */
     uint32_t sz = build_twrite(req, 4, 11, 0, "", 0);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     /* Whitespace-only refusal. */
     sz = build_twrite(req, 5, 11, 0, "  \n\t", 4);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     /* Oversize name (256 bytes — past STM_SNAP_NAME_MAX = 255). */
     char too_long[STM_SNAP_NAME_MAX + 1];
     memset(too_long, 'a', sizeof too_long);
     sz = build_twrite(req, 6, 11, 0, too_long, sizeof too_long);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     /* All three refusals should appear in /events. */
     char ebody[8192];
@@ -4061,11 +4108,11 @@ static void open_delete_snapshot(scrub_trigger_fixture *f, uint64_t dataset_id,
     uint32_t rlen = 0;
     const char *path[] = { "datasets", ds_str, "delete-snapshot" };
     uint32_t sz = build_twalk(req, tag, 10, fid, 3, path);
-    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
-    sz = build_topen(req, (uint16_t)(tag + 1), fid, STM_P9_OWRITE);
-    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    STM_ASSERT_OK(stm_lp9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
+    sz = build_topen(req, (uint16_t)(tag + 1), fid, STM_LP9_O_WRONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 }
 
 /* Helper: create a snapshot directly through the wrapper (bypasses
@@ -4095,8 +4142,8 @@ STM_TEST(ctl_d7_delete_snapshot_admin_succeeds)
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     uint32_t sz = build_twrite(req, 4, 11, 0, body, (uint32_t)n);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWRITE);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWRITE);
     STM_ASSERT_EQ(load_u32(resp + 7), (uint32_t)n);
 
     /* /events records the success. */
@@ -4133,8 +4180,8 @@ STM_TEST(ctl_d7_delete_snapshot_trailing_newline_stripped)
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     uint32_t sz = build_twrite(req, 4, 11, 0, body, (uint32_t)n);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWRITE);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWRITE);
     /* out_written returns the FULL byte count (R104 P3-2 carry). */
     STM_ASSERT_EQ(load_u32(resp + 7), (uint32_t)n);
 
@@ -4153,18 +4200,18 @@ STM_TEST(ctl_d7_delete_snapshot_bad_parse_einval)
 
     /* Leading zero refused. */
     uint32_t sz = build_twrite(req, 4, 11, 0, "01", 2);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     /* "0" refused. */
     sz = build_twrite(req, 5, 11, 0, "0", 1);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     /* Non-numeric refused. */
     sz = build_twrite(req, 6, 11, 0, "abc", 3);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     /* Audit log records all 3 refusals. */
     char ebody[8192];
@@ -4184,8 +4231,8 @@ STM_TEST(ctl_d7_delete_snapshot_nonexistent_enoent)
     uint32_t rlen = 0;
     /* snap-id 99999 doesn't exist (no snaps created). */
     uint32_t sz = build_twrite(req, 4, 11, 0, "99999", 5);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     /* Audit log records the failure. */
     char ebody[8192];
@@ -4204,12 +4251,12 @@ STM_TEST(ctl_d7_delete_snapshot_nonadmin_eacces)
     uint32_t rlen = 0;
     const char *path[] = { "datasets", "1", "delete-snapshot" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 3, path);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
-    sz = build_topen(req, 3, 11, STM_P9_OWRITE);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    sz = build_topen(req, 3, 11, STM_LP9_O_WRONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 3);
 
     destroy_scrub_trigger_fixture(f);
 }
@@ -4223,8 +4270,8 @@ STM_TEST(ctl_d7_delete_snapshot_zero_byte_einval)
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     uint32_t sz = build_twrite(req, 4, 11, 0, "", 0);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     /* Audit log records snap-id=0 (the post-admin "0 means we
      * never parsed" sentinel). */
@@ -4244,8 +4291,8 @@ STM_TEST(ctl_d7_delete_snapshot_whitespace_only_einval)
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     uint32_t sz = build_twrite(req, 4, 11, 0, "  \n\t", 4);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     destroy_scrub_trigger_fixture(f);
 }
@@ -4403,30 +4450,30 @@ STM_TEST(ctl_r107_clear_events_zero_byte_logs)
     /* Pre-seed an event so we can assert log is non-empty. */
     stm_ctl_log_event(c, "pre-attempt sentinel");
 
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "admin", "clear-events" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    sz = build_topen(req, 3, 11, STM_P9_OWRITE);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 3, 11, STM_LP9_O_WRONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
 
     /* Zero-byte Twrite — refused + logs. */
     sz = build_twrite(req, 4, 11, 0, "", 0);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     /* Read /events and assert the new log line appears. */
     const char *epath[] = { "events" };
     sz = build_twalk(req, 5, 10, 12, 1, epath);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    sz = build_topen(req, 6, 12, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 6, 12, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     sz = build_tread(req, 7, 12, 0, 8192);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
     uint32_t count = load_u32(resp + 7);
     char body[8192];
     memcpy(body, resp + 11, count);
@@ -4434,7 +4481,7 @@ STM_TEST(ctl_r107_clear_events_zero_byte_logs)
     STM_ASSERT(strstr(body, "events log clear refused (zero-byte) by uid=0") != NULL);
     STM_ASSERT(strstr(body, "pre-attempt sentinel") != NULL);   /* not cleared */
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
 }
 
@@ -4450,13 +4497,13 @@ STM_TEST(ctl_r107_scrub_trigger_post_admin_refusals_log)
 
     /* Zero-byte refusal. */
     uint32_t sz = build_twrite(req, 4, 11, 0, "", 0);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     /* Whitespace-only refusal. */
     sz = build_twrite(req, 5, 11, 0, "  \n\t", 4);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     /* Both should appear in /events. */
     char ebody[8192];
@@ -4484,11 +4531,11 @@ static void open_hold_release(scrub_trigger_fixture *f, const char *kind_name,
     path[1] = ds_str;
     path[2] = kind_name;
     uint32_t sz = build_twalk(req, tag, 10, fid, 3, path);
-    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
-    sz = build_topen(req, (uint16_t)(tag + 1), fid, STM_P9_OWRITE);
-    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    STM_ASSERT_OK(stm_lp9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
+    sz = build_topen(req, (uint16_t)(tag + 1), fid, STM_LP9_O_WRONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 }
 
 /* Hold a snapshot, then attempt delete → STM_EBUSY. Release the
@@ -4507,8 +4554,8 @@ STM_TEST(ctl_d8_hold_blocks_delete_release_unblocks)
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     uint32_t sz = build_twrite(req, 4, 11, 0, body, (uint32_t)n);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWRITE);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWRITE);
 
     /* Attempt to delete — refused with STM_EBUSY → RERROR. */
     STM_ASSERT_EQ(stm_fs_delete_snapshot(f.fs, snap_id, NULL), STM_EBUSY);
@@ -4516,8 +4563,8 @@ STM_TEST(ctl_d8_hold_blocks_delete_release_unblocks)
     /* Release the hold. */
     open_hold_release(&f, "release-snapshot", 1, 6, 12);
     sz = build_twrite(req, 8, 12, 0, body, (uint32_t)n);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWRITE);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWRITE);
 
     /* Now delete succeeds. */
     STM_ASSERT_OK(stm_fs_delete_snapshot(f.fs, snap_id, NULL));
@@ -4626,12 +4673,12 @@ STM_TEST(ctl_d8_hold_release_nonadmin_eacces)
         uint32_t sz = build_twalk(req, (uint16_t)(2 + i*2), 10,
                                      (uint32_t)(11 + i),
                                      3, paths[i]);
-        STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-        STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+        STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+        STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
         sz = build_topen(req, (uint16_t)(3 + i*2), (uint32_t)(11 + i),
-                            STM_P9_OWRITE);
-        STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-        STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+                            STM_LP9_O_WRONLY);
+        STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+        STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
     }
 
     destroy_scrub_trigger_fixture(f);
@@ -4648,13 +4695,13 @@ STM_TEST(ctl_d8_hold_post_admin_refusals_log)
 
     /* Zero-byte. */
     uint32_t sz = build_twrite(req, 4, 11, 0, "", 0);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     /* Bad parse. */
     sz = build_twrite(req, 5, 11, 0, "abc", 3);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     /* Audit log captures both. */
     char ebody[8192];
@@ -4734,8 +4781,8 @@ STM_TEST(ctl_r109_p3_5_delete_held_snap_logs_ebusy)
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     uint32_t sz = build_twrite(req, 4, 11, 0, body, (uint32_t)n);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     /* Audit log records "result=err:ebusy" — operator can grep
      * for the specific status code rather than "err" generically. */
@@ -4764,8 +4811,8 @@ STM_TEST(ctl_r109_p3_5_hold_nonexistent_logs_enoent)
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     uint32_t sz = build_twrite(req, 4, 11, 0, "99999", 5);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     char ebody[8192];
     read_events_log(&f, 5, 12, ebody, sizeof ebody);
@@ -4843,7 +4890,7 @@ typedef struct {
     stm_fs        *fs;
     stm_pool      *pool;
     stm_ctl       *c;
-    stm_p9_server *s;
+    stm_lp9_server *s;
     char           uuid_hex[64];
 } metrics_fixture;
 
@@ -4874,7 +4921,7 @@ static metrics_fixture make_metrics_fixture(const char *tag, uid_t uid)
 
 static void destroy_metrics_fixture(metrics_fixture f)
 {
-    stm_p9_server_destroy(f.s);
+    stm_lp9_server_destroy(f.s);
     stm_ctl_destroy(f.c);
     STM_ASSERT_OK(stm_fs_unmount(f.fs));
 }
@@ -4888,12 +4935,12 @@ static uint32_t read_prometheus_body(metrics_fixture *f, uint16_t tag,
     uint32_t rlen = 0;
     const char *path[] = { "pools", f->uuid_hex, "metrics", "prometheus" };
     uint32_t sz = build_twalk(req, tag, 10, fid, 4, path);
-    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
-    sz = build_topen(req, (uint16_t)(tag + 1), fid, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    sz = build_topen(req, (uint16_t)(tag + 1), fid, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
     /* Drain the body in chunks. msize default is small enough that a
      * full bulk read may need multiple Tread iterations. */
@@ -4901,8 +4948,8 @@ static uint32_t read_prometheus_body(metrics_fixture *f, uint16_t tag,
     while (total < cap - 1) {
         sz = build_tread(req, (uint16_t)(tag + 2), fid, total,
                             (uint32_t)(cap - 1 - total));
-        STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
-        STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+        STM_ASSERT_OK(stm_lp9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+        STM_ASSERT_EQ(resp[4], STM_LP9_RREAD);
         uint32_t got = load_u32(resp + 7);
         if (got == 0) break;
         memcpy(out + total, resp + 11, got);
@@ -4911,7 +4958,7 @@ static uint32_t read_prometheus_body(metrics_fixture *f, uint16_t tag,
     out[total] = '\0';
 
     sz = build_tclunk(req, (uint16_t)(tag + 3), fid);
-    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
     return total;
 }
 
@@ -4925,26 +4972,30 @@ STM_TEST(ctl_e1_metrics_dir_in_pool_listing)
     uint32_t rlen = 0;
     const char *path[] = { "pools", f.uuid_hex };
     uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
-    sz = build_tread(req, 4, 11, 0, 4096);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
-    /* readdir entries are 9P stat records; we just verify the literal
-     * "metrics" name appears somewhere in the byte stream — every other
-     * dirent name (status, devices) is substringwise distinct. */
+    sz = build_treaddir(req, 4, 11, 0, 4096);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RREADDIR);
+    /* Rreaddir packs qid(13)+cookie(8)+dt_type(1)+name[s] records;
+     * we verify the literal "metrics" name appears somewhere in the
+     * byte stream — every other dirent name (status, devices) is
+     * substringwise distinct. */
     uint32_t count = load_u32(resp + 7);
     char body[4096];
     STM_ASSERT(count < sizeof body);
     memcpy(body, resp + 11, count);
     body[count] = '\0';
     bool found = false;
-    for (uint32_t i = 0; i + 7 < count; i++) {
+    /* Loop bound `i + 7 <= count` includes the case where the
+     * substring is at the very end (.L dirent records end with the
+     * name; no trailing fields beyond it). */
+    for (uint32_t i = 0; i + 7 <= count; i++) {
         if (memcmp(body + i, "metrics", 7) == 0) { found = true; break; }
     }
     STM_ASSERT(found);
@@ -4961,23 +5012,23 @@ STM_TEST(ctl_e1_metrics_dir_listing_has_prometheus)
     uint32_t rlen = 0;
     const char *path[] = { "pools", f.uuid_hex, "metrics" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 3, path);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
-    sz = build_tread(req, 4, 11, 0, 4096);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    sz = build_treaddir(req, 4, 11, 0, 4096);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RREADDIR);
     uint32_t count = load_u32(resp + 7);
     char body[4096];
     STM_ASSERT(count < sizeof body);
     memcpy(body, resp + 11, count);
     body[count] = '\0';
     bool found = false;
-    for (uint32_t i = 0; i + 10 < count; i++) {
+    for (uint32_t i = 0; i + 10 <= count; i++) {
         if (memcmp(body + i, "prometheus", 10) == 0) { found = true; break; }
     }
     STM_ASSERT(found);
@@ -5106,7 +5157,7 @@ STM_TEST(ctl_e1_metrics_prometheus_body_includes_scrub_when_attached)
     STM_ASSERT(strstr(body, "stratum_scrub_ranges_processed{") != NULL);
 
     /* Tear down scrub before fixture (matches the lifetime contract). */
-    stm_p9_server_destroy(f.s);
+    stm_lp9_server_destroy(f.s);
     stm_ctl_destroy(f.c);
     stm_scrub_close(sc);
     STM_ASSERT_OK(stm_fs_unmount(f.fs));
@@ -5146,12 +5197,12 @@ STM_TEST(ctl_e1_metrics_prometheus_topen_for_write_eacces)
     uint32_t rlen = 0;
     const char *path[] = { "pools", f.uuid_hex, "metrics", "prometheus" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 4, path);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
-    sz = build_topen(req, 3, 11, STM_P9_OWRITE);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    sz = build_topen(req, 3, 11, STM_LP9_O_WRONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    ASSERT_WALK_FAILED(resp, 4);
 
     destroy_metrics_fixture(f);
 }
@@ -5167,12 +5218,12 @@ STM_TEST(ctl_e1_metrics_prometheus_tstat_reports_world_readable_file)
     uint32_t rlen = 0;
     const char *path[] = { "pools", f.uuid_hex, "metrics", "prometheus" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 4, path);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
     sz = build_tstat(req, 3, 11);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RSTAT);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RGETATTR);
     /* The 9P stat record begins at resp+9 (size header + msg header +
      * stat-prefix length). For sanity we just confirm the response
      * succeeded; per-field decode is exercised in earlier P9-CTL tests. */
@@ -5194,12 +5245,12 @@ STM_TEST(ctl_e1_metrics_prometheus_offset_resumption_consistent)
     uint32_t rlen = 0;
     const char *path[] = { "pools", f.uuid_hex, "metrics", "prometheus" };
     uint32_t sz = build_twalk(req, 2, 10, 11, 4, path);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
     /* First read: drain the full body via the SAME fid (single Topen
      * snapshot). */
@@ -5207,8 +5258,8 @@ STM_TEST(ctl_e1_metrics_prometheus_offset_resumption_consistent)
     uint32_t total = 0;
     while (total < sizeof body_full - 1) {
         sz = build_tread(req, 4, 11, total, (uint32_t)(sizeof body_full - 1 - total));
-        STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-        STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+        STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+        STM_ASSERT_EQ(resp[4], STM_LP9_RREAD);
         uint32_t got_chunk = load_u32(resp + 7);
         if (got_chunk == 0) break;
         memcpy(body_full + total, resp + 11, got_chunk);
@@ -5220,14 +5271,14 @@ STM_TEST(ctl_e1_metrics_prometheus_offset_resumption_consistent)
      * The bulk_buf snapshot was taken at Topen and stays stable
      * across reads against the same fid — that's the invariant. */
     sz = build_tread(req, 5, 11, 100, 64);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RREAD);
     uint32_t got = load_u32(resp + 7);
     STM_ASSERT(got == 64);
     STM_ASSERT(memcmp(resp + 11, body_full + 100, 64) == 0);
 
     sz = build_tclunk(req, 6, 11);
-    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_OK(stm_lp9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
 
     destroy_metrics_fixture(f);
 }
@@ -5278,7 +5329,7 @@ STM_TEST(ctl_e1_metrics_prometheus_pool_only_omits_fs_gauges)
     STM_ASSERT_OK(stm_ctl_attach_pool(c, pf.pool));
     STM_ASSERT_OK(stm_ctl_set_caller(c, 1000, 1000));
 
-    stm_p9_server *s = make_ctl_server(c);
+    stm_lp9_server *s = make_ctl_server(c);
     do_handshake(s, 10);
 
     /* Walk + open + read /pools/<uuid>/metrics/prometheus. The fixture
@@ -5289,20 +5340,20 @@ STM_TEST(ctl_e1_metrics_prometheus_pool_only_omits_fs_gauges)
         "pools", CTL_TEST_POOL_UUID_HEX, "metrics", "prometheus"
     };
     uint32_t sz = build_twalk(req, 2, 10, 11, 4, path);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
-    sz = build_topen(req, 3, 11, STM_P9_OREAD);
-    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+    sz = build_topen(req, 3, 11, STM_LP9_O_RDONLY);
+    STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
     char body[16 * 1024];
     uint32_t total = 0;
     while (total < sizeof body - 1) {
         sz = build_tread(req, 4, 11, total,
                             (uint32_t)(sizeof body - 1 - total));
-        STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
-        STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+        STM_ASSERT_OK(stm_lp9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+        STM_ASSERT_EQ(resp[4], STM_LP9_RREAD);
         uint32_t got_chunk = load_u32(resp + 7);
         if (got_chunk == 0) break;
         memcpy(body + total, resp + 11, got_chunk);
@@ -5324,7 +5375,7 @@ STM_TEST(ctl_e1_metrics_prometheus_pool_only_omits_fs_gauges)
     /* scrub gauges absent (no scrub attached). */
     STM_ASSERT(strstr(body, "stratum_scrub_state") == NULL);
 
-    stm_p9_server_destroy(s);
+    stm_lp9_server_destroy(s);
     stm_ctl_destroy(c);
     destroy_test_pool(pf);
 }

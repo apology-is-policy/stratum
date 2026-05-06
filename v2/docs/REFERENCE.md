@@ -38,22 +38,41 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9-CTL-2a stm_lp9_server (this commit). New library
-  `v2/src/lp9/` — generic vops-based 9P2000.L server, sibling to
-  `stm_p9_server` (9P2000 vops) but on the .L wire. v1.0 wire-handles
-  Tversion/Tattach/Twalk/Tlopen/Tread/Twrite/Tclunk/Tflush/Tgetattr/
-  Treaddir; optional ops return Rlerror(ENOSYS) when their vops slot
-  is NULL. Trust-boundary discipline lifted verbatim from
-  `v2/src/9p/server.c` (the FS-bound .L server). 5 unit tests in
-  `test_lp9.c` exercising the wire codec via direct
-  stm_lp9_server_handle calls with a tiny in-test 3-file synfs
-  vops. The library is the foundation for P9-CTL-2b (/ctl/
-  migration from 9P2000 to .L) + P9-SLATE-1 (slate daemon's synfs
-  server) — both build on top without touching this code. CLAUDE.md
-  trigger row added for the new wire-codec surface. 46/46 ctest
-  green (was 45; +test_lp9).
+- **Tip**: P9-CTL-2b /ctl/ codec migration to lp9 (this commit).
+  `v2/src/ctl/synfs.c` + `v2/include/stratum/ctl.h` + `v2/tests/test_ctl.c`
+  all re-keyed from `stm_p9_server` (9P2000 vops) to `stm_lp9_server`
+  (.L vops). The `KIND_META[]` table, `qid_path` encoding, materializer
+  functions, admin gate, session lifecycle, and audit-log doctrine
+  are preserved verbatim — only the wire codec + vops adapter shape
+  changed. Concrete edits: (a) vops_stat → vops_getattr returns
+  statx-shaped `stm_lp9_attr`; (b) vops_walk returns `stm_lp9_qid`
+  only (a thin wrapper `walk_to_qid` calls getattr_at and extracts
+  the qid); (c) vops_readdir takes a `cookie_start` cursor and emits
+  `stm_lp9_dirent` entries with monotonic-position cookies (cookies
+  count over existence-validated entries only — STM_ENOENT slots
+  don't consume a cookie, keeping the sequence dense); (d) vops_open
+  → vops_lopen takes Linux O_* flags and gates on
+  `flags & STM_LP9_O_ACCMODE` rather than 9P2000's 1-byte mode field;
+  (e) `stm_ctl_vops()` returns `const stm_lp9_vops *` (header break).
+  Test surgery: 13 dir-Tread + decoder-loop sites converted to
+  Treaddir + .L-shape decoders; 37 partial-walk Rlerror assertions
+  rewritten via new `ASSERT_WALK_FAILED(resp, n)` macro (.L spec:
+  Rlerror only on i==0 fail; Rwalk-with-prefix on later fails);
+  Rstat decoder for scrub-mode test rewritten against fixed Rgetattr
+  153-byte body. CLAUDE.md /ctl/ trigger row updated to mention the
+  migration; the lp9 trigger row notes /ctl/ as the first consumer.
+  46/46 ctest green; 140/140 test_ctl pass.
 
-- **Pre-tip-1**: stratum-mkfs CLI. New artifact: `stratum-mkfs`
+- **Pre-tip-1**: P9-CTL-2a stm_lp9_server. New library `v2/src/lp9/`
+  — generic vops-based 9P2000.L server, sibling to `stm_p9_server`
+  (9P2000 vops) but on the .L wire. v1.0 wire-handles Tversion/
+  Tattach/Twalk/Tlopen/Tread/Twrite/Tclunk/Tflush/Tgetattr/Treaddir;
+  optional ops return Rlerror(ENOSYS) when their vops slot is NULL.
+  Trust-boundary discipline lifted verbatim from `v2/src/9p/server.c`
+  (the FS-bound .L server). 5 unit tests in `test_lp9.c`. CLAUDE.md
+  trigger row added.
+
+- **Pre-tip-2**: stratum-mkfs CLI. New artifact: `stratum-mkfs`
   binary at `v2/src/cmd/stratum-mkfs/`. Wraps `stm_fs_format` +
   initial dataset-root setup so users can `stratum-mkfs vol.stm` and
   immediately point stratumd at the resulting image. Defaults: 64 MiB

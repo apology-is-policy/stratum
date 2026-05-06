@@ -39,8 +39,8 @@
  *
  * qid_path encoding
  * ─────────────────
- * The generic stm_p9_server passes our qid_path back to us on every
- * walk/stat/read; the layout encodes:
+ * The generic stm_lp9_server passes our qid_path back to us on every
+ * walk/getattr/read; the layout encodes:
  *
  *   bits 56-63   kind          (8 bits — index into KIND_META)
  *   bits 32-55   pool_idx      (24 bits — currently always 0; one pool max)
@@ -62,14 +62,14 @@
  *   3. Wire walk/readdir/materialize switches.
  *   4. Add a _Static_assert pinning the literal name length.
  * Forgetting (2) trips a clang -Wmissing-field-initializers; (4)
- * trips at build time if the name overflows STM_P9_NAME_MAX.
+ * trips at build time if the name overflows STM_LP9_NAME_MAX.
  *
  * Concurrency
  * ───────────
  * The hard rule:
- *   - Safe to share one stm_ctl across SEQUENTIAL stm_p9_server use
+ *   - Safe to share one stm_ctl across SEQUENTIAL stm_lp9_server use
  *     (one server at a time — v2.0 stratumd serial accept).
- *   - NOT safe to share one stm_ctl across CONCURRENT stm_p9_server
+ *   - NOT safe to share one stm_ctl across CONCURRENT stm_lp9_server
  *     instances. The future concurrent-accept transport upgrade
  *     (R95 forward-note) MUST either give each server its own
  *     stm_ctl, or extend sessions[]'s key from `fid` to
@@ -82,26 +82,26 @@
  * `sessions[]` — within ONE server's vops calls, the mutex
  * serializes alloc/lookup/free. But the mutex does NOT protect
  * against fid-namespace collisions: two concurrent servers each
- * running `vops_open(fid=1)` would race in sessions[] and the
+ * running `vops_lopen(fid=1)` would race in sessions[] and the
  * mutex doesn't know which server's fid 1 to associate with which
  * slot. So the mutex is defense-in-depth WITHIN a single server's
- * timeline (where the generic stm_p9_server is itself single-
+ * timeline (where the generic stm_lp9_server is itself single-
  * threaded per connection — Tflush is a server-level no-op so
  * cannot interrupt a vops call); it is NOT cross-server safety.
  *
  * Read paths against subsystem state (`stm_fs *`, `stm_pool *`)
  * call into those subsystems' own thread-safe accessors
  * (`stm_fs_stats_get`, `stm_pool_lock_shared` etc.). Body
- * materialization snapshots state at Topen so subsequent Treads
- * see a consistent view; concurrent fs/pool mutations after Topen
- * are reflected on the next Topen.
+ * materialization snapshots state at Tlopen so subsequent Treads
+ * see a consistent view; concurrent fs/pool mutations after Tlopen
+ * are reflected on the next Tlopen.
  */
 
 #include <stratum/crypto.h>         /* stm_ct_memzero (R101 P3-1) */
 #include <stratum/ctl.h>
 #include <stratum/dataset.h>        /* stm_property + stm_dataset_entry */
 #include <stratum/fs.h>
-#include <stratum/p9.h>
+#include <stratum/lp9.h>
 #include <stratum/pool.h>
 #include <stratum/scrub.h>          /* stm_scrub_state, stm_scrub_status */
 #include <stratum/snapshot.h>       /* STM_SNAP_NAME_MAX */
@@ -155,7 +155,9 @@ typedef enum {
 typedef struct {
     bool         is_dir;
     bool         admin_required; /* P9-CTL-1d-uid: admin-only access */
-    uint32_t     mode;          /* posix mode bits, sans STM_P9_DMDIR */
+    uint32_t     mode;          /* posix permission bits only;
+                                 * file-type bits (S_IFDIR / S_IFREG)
+                                 * are added by getattr_at based on is_dir */
     const char  *static_name;   /* NULL when name is dynamic (e.g. UUID) */
 } ctl_kind_meta;
 
@@ -189,36 +191,36 @@ static const ctl_kind_meta KIND_META[KIND_MAX] = {
     [KIND_POOL_METRICS_PROMETHEUS] = { false, false, 0444, "prometheus" }, /* world-readable bulk exposition */
 };
 
-/* R96 P3-2: pin every static-name literal length below STM_P9_NAME_MAX
+/* R96 P3-2: pin every static-name literal length below STM_LP9_NAME_MAX
  * (63) at build time. Update both this assert block and KIND_META in
  * lockstep when adding new static-named kinds. (Dynamic names like
  * uuid hex (36 chars) and decimal device id (≤5 digits for 64 slots)
  * are also < 63 — that's a runtime bound check in the dynamic
  * decoder.) */
-_Static_assert(sizeof("/") - 1        <= STM_P9_NAME_MAX, "/ctl/ root literal");
-_Static_assert(sizeof("version") - 1  <= STM_P9_NAME_MAX, "/ctl/ /version literal");
-_Static_assert(sizeof("state") - 1    <= STM_P9_NAME_MAX, "/ctl/ /state literal");
-_Static_assert(sizeof("pools") - 1    <= STM_P9_NAME_MAX, "/ctl/ /pools literal");
-_Static_assert(sizeof("status") - 1   <= STM_P9_NAME_MAX, "/ctl/ /pools/.../status literal");
-_Static_assert(sizeof("devices") - 1   <= STM_P9_NAME_MAX, "/ctl/ /pools/.../devices literal");
-_Static_assert(sizeof("datasets") - 1  <= STM_P9_NAME_MAX, "/ctl/ /datasets literal");
-_Static_assert(sizeof("properties") - 1 <= STM_P9_NAME_MAX, "/ctl/ /datasets/.../properties literal");
-_Static_assert(sizeof("admin") - 1     <= STM_P9_NAME_MAX, "/ctl/ /admin literal");
-_Static_assert(sizeof("peer") - 1      <= STM_P9_NAME_MAX, "/ctl/ /admin/peer literal");
-_Static_assert(sizeof("events") - 1    <= STM_P9_NAME_MAX, "/ctl/ /events literal");
-_Static_assert(sizeof("clear-events") - 1 <= STM_P9_NAME_MAX, "/ctl/ /admin/clear-events literal");
-_Static_assert(sizeof("debug") - 1     <= STM_P9_NAME_MAX, "/ctl/ /debug literal");
-_Static_assert(sizeof("allocator-state") - 1 <= STM_P9_NAME_MAX, "/ctl/ /debug/allocator-state literal");
+_Static_assert(sizeof("/") - 1        <= STM_LP9_NAME_MAX, "/ctl/ root literal");
+_Static_assert(sizeof("version") - 1  <= STM_LP9_NAME_MAX, "/ctl/ /version literal");
+_Static_assert(sizeof("state") - 1    <= STM_LP9_NAME_MAX, "/ctl/ /state literal");
+_Static_assert(sizeof("pools") - 1    <= STM_LP9_NAME_MAX, "/ctl/ /pools literal");
+_Static_assert(sizeof("status") - 1   <= STM_LP9_NAME_MAX, "/ctl/ /pools/.../status literal");
+_Static_assert(sizeof("devices") - 1   <= STM_LP9_NAME_MAX, "/ctl/ /pools/.../devices literal");
+_Static_assert(sizeof("datasets") - 1  <= STM_LP9_NAME_MAX, "/ctl/ /datasets literal");
+_Static_assert(sizeof("properties") - 1 <= STM_LP9_NAME_MAX, "/ctl/ /datasets/.../properties literal");
+_Static_assert(sizeof("admin") - 1     <= STM_LP9_NAME_MAX, "/ctl/ /admin literal");
+_Static_assert(sizeof("peer") - 1      <= STM_LP9_NAME_MAX, "/ctl/ /admin/peer literal");
+_Static_assert(sizeof("events") - 1    <= STM_LP9_NAME_MAX, "/ctl/ /events literal");
+_Static_assert(sizeof("clear-events") - 1 <= STM_LP9_NAME_MAX, "/ctl/ /admin/clear-events literal");
+_Static_assert(sizeof("debug") - 1     <= STM_LP9_NAME_MAX, "/ctl/ /debug literal");
+_Static_assert(sizeof("allocator-state") - 1 <= STM_LP9_NAME_MAX, "/ctl/ /debug/allocator-state literal");
 /* The "scrub" literal is shared with KIND_POOL_STATUS's "status" — both
- * are 5-7 chars under STM_P9_NAME_MAX. */
-_Static_assert(sizeof("scrub") - 1     <= STM_P9_NAME_MAX, "/ctl/ /pools/.../scrub literal");
-_Static_assert(sizeof("scrub-trigger") - 1 <= STM_P9_NAME_MAX, "/ctl/ /pools/.../scrub-trigger literal");
-_Static_assert(sizeof("create-snapshot") - 1 <= STM_P9_NAME_MAX, "/ctl/ /datasets/.../create-snapshot literal");
-_Static_assert(sizeof("delete-snapshot") - 1 <= STM_P9_NAME_MAX, "/ctl/ /datasets/.../delete-snapshot literal");
-_Static_assert(sizeof("hold-snapshot") - 1   <= STM_P9_NAME_MAX, "/ctl/ /datasets/.../hold-snapshot literal");
-_Static_assert(sizeof("release-snapshot") - 1 <= STM_P9_NAME_MAX, "/ctl/ /datasets/.../release-snapshot literal");
-_Static_assert(sizeof("metrics") - 1    <= STM_P9_NAME_MAX, "/ctl/ /pools/.../metrics literal");
-_Static_assert(sizeof("prometheus") - 1 <= STM_P9_NAME_MAX, "/ctl/ /pools/.../metrics/prometheus literal");
+ * are 5-7 chars under STM_LP9_NAME_MAX. */
+_Static_assert(sizeof("scrub") - 1     <= STM_LP9_NAME_MAX, "/ctl/ /pools/.../scrub literal");
+_Static_assert(sizeof("scrub-trigger") - 1 <= STM_LP9_NAME_MAX, "/ctl/ /pools/.../scrub-trigger literal");
+_Static_assert(sizeof("create-snapshot") - 1 <= STM_LP9_NAME_MAX, "/ctl/ /datasets/.../create-snapshot literal");
+_Static_assert(sizeof("delete-snapshot") - 1 <= STM_LP9_NAME_MAX, "/ctl/ /datasets/.../delete-snapshot literal");
+_Static_assert(sizeof("hold-snapshot") - 1   <= STM_LP9_NAME_MAX, "/ctl/ /datasets/.../hold-snapshot literal");
+_Static_assert(sizeof("release-snapshot") - 1 <= STM_LP9_NAME_MAX, "/ctl/ /datasets/.../release-snapshot literal");
+_Static_assert(sizeof("metrics") - 1    <= STM_LP9_NAME_MAX, "/ctl/ /pools/.../metrics literal");
+_Static_assert(sizeof("prometheus") - 1 <= STM_LP9_NAME_MAX, "/ctl/ /pools/.../metrics/prometheus literal");
 /* Dynamic names: pool-uuid hex (36 chars), decimal device-id (≤2
  * chars at v2.0's STM_POOL_DEVICES_MAX = 64 cap), decimal dataset-id
  * (≤9 chars at STM_SYNC_DATASET_ID_MAX = 0x0FFFFFFF ~= 268M = 9
@@ -269,7 +271,7 @@ static uint32_t qid_device_id(uint64_t q)
 /* Alias for the same low-32-bits slot but typed as uint64_t for the
  * dataset surface; STM_SYNC_DATASET_ID_MAX = 0x0FFFFFFF (28 bits)
  * fits comfortably in the 32-bit field. Kept as a separate name
- * so the reader of stat_at / vops_walk can tell which kind's
+ * so the reader of getattr_at / vops_walk can tell which kind's
  * data they're extracting.
  *
  * R99 P3-7: pin the format-bump invariant — if STM_SYNC_DATASET_ID_MAX
@@ -291,10 +293,10 @@ static uint64_t qid_dataset_id(uint64_t q)
 
 /*
  * /version, /state, /pools/<uuid>/status read as text — we
- * materialize the entire body once per Topen so subsequent Treads
+ * materialize the entire body once per Tlopen so subsequent Treads
  * at varying offsets see a consistent snapshot. For unattached
  * or post-attach state changes, the body is regenerated on the
- * next Topen.
+ * next Tlopen.
  *
  * STM_CTL_BODY_MAX is the per-fid scratch budget. Each kind that
  * gets opened must materialize within this cap; the materializers
@@ -342,10 +344,10 @@ typedef struct ctl_session {
     uint32_t  len;
     /* P9-CTL-1d-events: when reading /events, the body lives in
      * c->event_buf rather than session->buf (the log can grow
-     * larger than STM_CTL_BODY_MAX = 1 KiB). At Topen we snapshot
+     * larger than STM_CTL_BODY_MAX = 1 KiB). At Tlopen we snapshot
      * the event_len into snapshot_len; subsequent Treads serve
      * c->event_buf[0..snapshot_len] under c->mu, ignoring events
-     * appended after Topen. uses_event_buf=1 marks this branch. */
+     * appended after Tlopen. uses_event_buf=1 marks this branch. */
     int       uses_event_buf;
     uint32_t  snapshot_len;
     /* P9-CTL-1e: per-fid heap-allocated body for bulk kinds whose
@@ -354,7 +356,7 @@ typedef struct ctl_session {
      * (the free runs BEFORE the memset that clears the slot, since
      * memset would otherwise lose the pointer and leak the alloc).
      *
-     * Lifecycle: allocated at vops_open's materializer call, freed
+     * Lifecycle: allocated at vops_lopen's materializer call, freed
      * at vops_clunk → session_free_locked. The slot is calloc'd at
      * stm_ctl_create time; subsequent allocs after a free see
      * bulk_buf=NULL because session_free_locked memsets the whole
@@ -378,7 +380,7 @@ struct stm_ctl {
     struct stm_scrub *scrub;          /* may be NULL (no scrub attached) */
     /* P9-CTL-1d-uid: peer credentials + admin policy. Set by
      * stratumd via stm_ctl_set_caller / stm_ctl_set_admin_uid
-     * BEFORE the first stm_p9_server_handle invocation; not
+     * BEFORE the first stm_lp9_server_handle invocation; not
      * mu-protected on read paths. */
     uid_t            caller_uid;     /* (uid_t)-1 = unset */
     gid_t            caller_gid;     /* (gid_t)-1 = unset */
@@ -418,7 +420,7 @@ static ctl_session *session_get_locked(stm_ctl *c, uint32_t fid)
 static ctl_session *session_alloc_locked(stm_ctl *c, uint32_t fid,
                                           uint64_t qid_path)
 {
-    /* The generic stm_p9_server rejects re-Topen on an open fid
+    /* The generic stm_lp9_server rejects re-Tlopen on an open fid
      * (h_open: STM_EEXIST when is_open), so under the current
      * server we only see fresh fids here. R96 P3-1 audited the
      * old reuse-loop as dead and we removed it. */
@@ -850,7 +852,7 @@ static void summarize_pool_locked(stm_pool *pool, pool_summary *out)
 static stm_status materialize_pool_status(stm_ctl *c, ctl_session *s)
 {
     if (!c->pool) {
-        /* Should not be reachable — vops_open gates KIND_POOL_STATUS
+        /* Should not be reachable — vops_lopen gates KIND_POOL_STATUS
          * on c->pool != NULL. Defensive. */
         int n = snprintf((char *)s->buf, sizeof s->buf,
             "pool: not-attached\n");
@@ -923,7 +925,7 @@ static stm_status materialize_pool_status(stm_ctl *c, ctl_session *s)
  * device_state_name now wired here. */
 static stm_status materialize_device_status(stm_ctl *c, ctl_session *s)
 {
-    if (!c->pool) return STM_EBACKEND;     /* gated at vops_open */
+    if (!c->pool) return STM_EBACKEND;     /* gated at vops_lopen */
     uint16_t did = (uint16_t)qid_device_id(s->qid_path);
 
     stm_pool_lock_shared(c->pool);
@@ -1007,7 +1009,7 @@ _Static_assert(STM_PROP_COUNT == 5,
  * line. UTF-8 multi-byte sequences are accepted unchanged. */
 static stm_status materialize_dataset_properties(stm_ctl *c, ctl_session *s)
 {
-    if (!c->fs) return STM_EBACKEND;     /* gated at vops_open */
+    if (!c->fs) return STM_EBACKEND;     /* gated at vops_lopen */
     uint64_t dsid = qid_dataset_id(s->qid_path);
 
     stm_dataset_entry e;
@@ -1021,7 +1023,7 @@ static stm_status materialize_dataset_properties(stm_ctl *c, ctl_session *s)
      * concurrent set_property could cause us to surface a mixed
      * snapshot. /ctl/ is operator state, not a transactional
      * surface; this is documented as a freshness tradeoff (R96
-     * lesson on materialize-at-Topen semantics). Re-open to refresh. */
+     * lesson on materialize-at-Tlopen semantics). Re-open to refresh. */
     rc = stm_fs_effective_dataset_property(c->fs, dsid,
                                               STM_PROP_COMPRESS, &compress);
     if (rc != STM_OK) return rc;
@@ -1156,7 +1158,7 @@ void stm_ctl_log_event(stm_ctl *c, const char *fmt, ...)
 
 /* Materialize /admin/peer — exposes the connecting client's uid/gid
  * + admin status as observed by the daemon. Read-only; admin-only
- * (vops_open enforces).
+ * (vops_lopen enforces).
  *
  * Useful operationally: an admin running `cat /ctl/admin/peer` can
  * confirm "the daemon sees me as uid X / gid Y / admin=yes" before
@@ -1202,7 +1204,7 @@ static stm_status materialize_admin_peer(stm_ctl *c, ctl_session *s)
  * scrub at the moment of the call; subsequent steps mutate it. */
 static stm_status materialize_pool_scrub(stm_ctl *c, ctl_session *s)
 {
-    if (!c->scrub) return STM_EBACKEND;     /* gated at vops_open */
+    if (!c->scrub) return STM_EBACKEND;     /* gated at vops_lopen */
 
     stm_scrub_status st;
     stm_status rc = stm_scrub_status_get(c->scrub, &st);
@@ -1240,11 +1242,11 @@ static stm_status materialize_pool_scrub(stm_ctl *c, ctl_session *s)
  *
  * Returns STM_ENOENT if the device slot has no allocator attached
  * (unattached or REMOVED) — same shape as KIND_DEVICE_STATUS for
- * out-of-roster ids. The vops_open + stat_at gates trap most of these
+ * out-of-roster ids. The vops_lopen + getattr_at gates trap most of these
  * before reaching here; this is the inner-leg verification. */
 static stm_status materialize_debug_alloc(stm_ctl *c, ctl_session *s)
 {
-    if (!c->fs) return STM_EBACKEND;     /* gated at vops_open */
+    if (!c->fs) return STM_EBACKEND;     /* gated at vops_lopen */
     /* R102 P3-3: defense-in-depth bound check on the qid's low-32
      * device_id slot. All client-reachable qids for KIND_DEBUG_ALLOC
      * are constructed via qid_of(KIND_DEBUG_ALLOC, 0, did) with did
@@ -1308,7 +1310,7 @@ static stm_status materialize_debug_alloc(stm_ctl *c, ctl_session *s)
  *
  * Lock posture (R110 P3-5 + P3-8 polish): we don't hold MULTIPLE
  * subsystem locks concurrently. c->mu is held by the caller throughout
- * (vops_open's session-alloc loop); within that, the pool / fs / scrub
+ * (vops_lopen's session-alloc loop); within that, the pool / fs / scrub
  * accessors each take their own internal lock SERIALLY (one at a time,
  * none nested). Pool roster snapshot via stm_pool_lock_shared
  * (released before the format pass), fs stats via stm_fs_stats_get +
@@ -1409,7 +1411,7 @@ typedef struct {
 static stm_status materialize_pool_metrics_prometheus(stm_ctl *c,
                                                         ctl_session *s)
 {
-    if (!c->pool) return STM_EBACKEND;     /* gated at vops_open */
+    if (!c->pool) return STM_EBACKEND;     /* gated at vops_lopen */
 
     /* ── Gather snapshots ───────────────────────────────────────── */
     uint8_t pool_uuid_b[16];
@@ -1704,20 +1706,31 @@ static stm_status materialize_locked(stm_ctl *c, ctl_session *s)
     return STM_EBACKEND;
 }
 
-/* ── stat / walk / readdir ──────────────────────────────────────────── */
+/* ── getattr / walk / readdir ───────────────────────────────────────── */
 
-static void set_name(stm_p9_node_stat *out, const char *name, size_t name_len)
+/* POSIX file-type mode bits applied alongside KIND_META[].mode. */
+#define CTL_S_IFDIR   0040000u
+#define CTL_S_IFREG   0100000u
+
+static void set_dirent_name(stm_lp9_dirent *out, const char *name,
+                              size_t name_len)
 {
-    if (name_len > STM_P9_NAME_MAX) name_len = STM_P9_NAME_MAX;
+    if (name_len > STM_LP9_NAME_MAX) name_len = STM_LP9_NAME_MAX;
     memcpy(out->name, name, name_len);
     out->name[name_len] = '\0';
     out->name_len = (uint16_t)name_len;
 }
 
-/* Fill `out` for a node with the given qid_path, computing its display
- * name from KIND_META + (for KIND_POOL_DIR) the attached pool's UUID. */
-static stm_status stat_at(stm_ctl *c, uint64_t qid_path,
-                           stm_p9_node_stat *out)
+/* Fill `out` for a node with the given qid_path. The .L attr is
+ * statx-shaped — fields the backend doesn't track (uid/gid/atime/
+ * mtime/ctime/btime/blocks/blksize/rdev/gen/data_version) stay zero;
+ * the materializer can set additional fields later. The `dyn_name` /
+ * `dyn_name_len` outputs (when non-NULL) carry the synthetic name
+ * for use by the readdir caller — getattr's wire reply has no name
+ * field (names appear only in Twalk + Treaddir). */
+static stm_status getattr_at(stm_ctl *c, uint64_t qid_path,
+                               stm_lp9_attr *out,
+                               char *out_dyn_name, size_t *out_dyn_len)
 {
     ctl_kind k = qid_kind(qid_path);
     if (k == KIND_MAX) return STM_ENOENT;
@@ -1827,7 +1840,7 @@ static stm_status stat_at(stm_ctl *c, uint64_t qid_path,
     if (k == KIND_DEBUG_ALLOC) {
         if (!c->fs) return STM_ENOENT;
         /* R102 P3-1: use the cheap is-attached predicate, NOT the
-         * full stats_get tree-scan, since stat_at runs once per
+         * full stats_get tree-scan, since getattr_at runs once per
          * emit_entry in the readdir loop (64× per readdir). The
          * range-check is inside stm_fs_alloc_attached (STM_EINVAL on
          * device_id ≥ STM_POOL_DEVICES_MAX); we treat that as
@@ -1845,26 +1858,47 @@ static stm_status stat_at(stm_ctl *c, uint64_t qid_path,
     }
 
     memset(out, 0, sizeof *out);
-    out->qid_path = qid_path;
+    out->qid.path = qid_path;
+    out->valid    = STM_LP9_GETATTR_BASIC;
+    out->nlink    = 1;
     if (meta->is_dir) {
-        out->qid_type = STM_P9_QTDIR;
-        out->mode     = meta->mode | STM_P9_DMDIR;
+        out->qid.qtype = STM_LP9_QTDIR;
+        out->mode      = CTL_S_IFDIR | meta->mode;
     } else {
-        out->qid_type = STM_P9_QTFILE;
-        out->mode     = meta->mode;
-        /* `length` is reported as 0 for synthetic files: the actual
-         * body is materialized at Topen and the FS doesn't know its
+        out->qid.qtype = STM_LP9_QTFILE;
+        out->mode      = CTL_S_IFREG | meta->mode;
+        /* `size` is reported as 0 for synthetic files: the actual
+         * body is materialized at Tlopen and the FS doesn't know its
          * size in advance. Standard 9P pattern (see /proc on Linux);
          * clients read until EOF. */
     }
-    set_name(out, name, name_len);
+    if (out_dyn_name && out_dyn_len) {
+        if (name_len > UUID_HEX_LEN) name_len = UUID_HEX_LEN;
+        memcpy(out_dyn_name, name, name_len);
+        out_dyn_name[name_len] = '\0';
+        *out_dyn_len = name_len;
+    }
     return STM_OK;
 }
 
-static stm_status vops_stat(void *ctx, uint64_t qid_path,
-                              stm_p9_node_stat *out)
+static stm_status vops_getattr(void *ctx, uint64_t qid_path,
+                                 uint64_t request_mask, stm_lp9_attr *out)
 {
-    return stat_at(ctx, qid_path, out);
+    (void)request_mask;     /* v1.0 always returns BASIC fields */
+    return getattr_at(ctx, qid_path, out, NULL, NULL);
+}
+
+/* vops_walk helper: getattr_at → extract qid only. The existence
+ * gates (pool/scrub/fs attached, dataset PRESENT, device in roster,
+ * etc.) all fire inside getattr_at; the caller wants just the qid. */
+static stm_status walk_to_qid(stm_ctl *c, uint64_t qid_path,
+                                stm_lp9_qid *out)
+{
+    stm_lp9_attr a;
+    stm_status rc = getattr_at(c, qid_path, &a, NULL, NULL);
+    if (rc != STM_OK) return rc;
+    *out = a.qid;
+    return STM_OK;
 }
 
 static int str_eq(const char *s, size_t slen, const char *lit)
@@ -1875,26 +1909,26 @@ static int str_eq(const char *s, size_t slen, const char *lit)
 
 static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
                               const char *name, size_t name_len,
-                              stm_p9_node_stat *out)
+                              stm_lp9_qid *out)
 {
     stm_ctl *c = ctx;
     ctl_kind dk = qid_kind(dir_qid_path);
     switch (dk) {
     case KIND_ROOT:
         if (str_eq(name, name_len, KIND_META[KIND_VERSION].static_name))
-            return stat_at(c, qid_root(KIND_VERSION), out);
+            return walk_to_qid(c, qid_root(KIND_VERSION), out);
         if (str_eq(name, name_len, KIND_META[KIND_STATE].static_name))
-            return stat_at(c, qid_root(KIND_STATE), out);
+            return walk_to_qid(c, qid_root(KIND_STATE), out);
         if (str_eq(name, name_len, KIND_META[KIND_POOLS_DIR].static_name))
-            return stat_at(c, qid_root(KIND_POOLS_DIR), out);
+            return walk_to_qid(c, qid_root(KIND_POOLS_DIR), out);
         if (str_eq(name, name_len, KIND_META[KIND_DATASETS_DIR].static_name))
-            return stat_at(c, qid_root(KIND_DATASETS_DIR), out);
+            return walk_to_qid(c, qid_root(KIND_DATASETS_DIR), out);
         if (str_eq(name, name_len, KIND_META[KIND_ADMIN_DIR].static_name))
-            return stat_at(c, qid_root(KIND_ADMIN_DIR), out);
+            return walk_to_qid(c, qid_root(KIND_ADMIN_DIR), out);
         if (str_eq(name, name_len, KIND_META[KIND_EVENTS].static_name))
-            return stat_at(c, qid_root(KIND_EVENTS), out);
+            return walk_to_qid(c, qid_root(KIND_EVENTS), out);
         if (str_eq(name, name_len, KIND_META[KIND_DEBUG_DIR].static_name))
-            return stat_at(c, qid_root(KIND_DEBUG_DIR), out);
+            return walk_to_qid(c, qid_root(KIND_DEBUG_DIR), out);
         return STM_ENOENT;
 
     case KIND_POOLS_DIR: {
@@ -1903,38 +1937,38 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
         uint8_t want[16];
         if (uuid_parse_hex(name, name_len, want) != 0) return STM_ENOENT;
         if (!uuid_eq(uuid_b, want)) return STM_ENOENT;
-        return stat_at(c, qid_root(KIND_POOL_DIR), out);
+        return walk_to_qid(c, qid_root(KIND_POOL_DIR), out);
     }
 
     case KIND_POOL_DIR:
         if (!c->pool) return STM_ENOENT;
         if (str_eq(name, name_len, KIND_META[KIND_POOL_STATUS].static_name))
-            return stat_at(c, qid_root(KIND_POOL_STATUS), out);
+            return walk_to_qid(c, qid_root(KIND_POOL_STATUS), out);
         if (str_eq(name, name_len, KIND_META[KIND_DEVICES_DIR].static_name))
-            return stat_at(c, qid_root(KIND_DEVICES_DIR), out);
+            return walk_to_qid(c, qid_root(KIND_DEVICES_DIR), out);
         /* /pools/<uuid>/scrub is conditional on c->scrub attachment.
          * If the scrub handle isn't attached, the file simply
          * doesn't exist (Twalk fails, readdir omits it). Once
          * attached, world-readable. */
         if (c->scrub
               && str_eq(name, name_len, KIND_META[KIND_POOL_SCRUB].static_name))
-            return stat_at(c, qid_root(KIND_POOL_SCRUB), out);
+            return walk_to_qid(c, qid_root(KIND_POOL_SCRUB), out);
         /* /pools/<uuid>/scrub-trigger paired with the scrub-read
          * surface. Same conditional-dirent posture (R103 P3-2 carry):
          * exists iff scrub handle attached. The admin gate fires at
-         * vops_open's meta->admin_required check; one-step Twalk
+         * vops_lopen's meta->admin_required check; one-step Twalk
          * succeeds for any caller (POSIX `stat` against an admin-
          * only file is allowed — only open is gated). */
         if (c->scrub
               && str_eq(name, name_len,
                           KIND_META[KIND_POOL_SCRUB_TRIGGER].static_name))
-            return stat_at(c, qid_root(KIND_POOL_SCRUB_TRIGGER), out);
+            return walk_to_qid(c, qid_root(KIND_POOL_SCRUB_TRIGGER), out);
         /* /pools/<uuid>/metrics/ exists unconditionally when c->pool
          * is attached — fs/scrub attachments shape the body content
          * but don't gate the dirent. World-readable observability. */
         if (str_eq(name, name_len,
                      KIND_META[KIND_POOL_METRICS_DIR].static_name))
-            return stat_at(c, qid_root(KIND_POOL_METRICS_DIR), out);
+            return walk_to_qid(c, qid_root(KIND_POOL_METRICS_DIR), out);
         return STM_ENOENT;
 
     case KIND_POOL_METRICS_DIR:
@@ -1943,14 +1977,14 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
         if (!c->pool) return STM_ENOENT;
         if (str_eq(name, name_len,
                      KIND_META[KIND_POOL_METRICS_PROMETHEUS].static_name))
-            return stat_at(c, qid_root(KIND_POOL_METRICS_PROMETHEUS), out);
+            return walk_to_qid(c, qid_root(KIND_POOL_METRICS_PROMETHEUS), out);
         return STM_ENOENT;
 
     case KIND_DEVICES_DIR: {
         if (!c->pool) return STM_ENOENT;
         uint16_t did = 0;
         if (parse_device_id(name, name_len, &did) != 0) return STM_ENOENT;
-        return stat_at(c, qid_of(KIND_DEVICE_DIR, 0, did), out);
+        return walk_to_qid(c, qid_of(KIND_DEVICE_DIR, 0, did), out);
     }
 
     case KIND_DEVICE_DIR: {
@@ -1958,14 +1992,14 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
         if (!str_eq(name, name_len, KIND_META[KIND_DEVICE_STATUS].static_name))
             return STM_ENOENT;
         uint32_t did = qid_device_id(dir_qid_path);
-        return stat_at(c, qid_of(KIND_DEVICE_STATUS, 0, did), out);
+        return walk_to_qid(c, qid_of(KIND_DEVICE_STATUS, 0, did), out);
     }
 
     case KIND_DATASETS_DIR: {
         if (!c->fs) return STM_ENOENT;
         uint64_t dsid = 0;
         if (parse_dataset_id(name, name_len, &dsid) != 0) return STM_ENOENT;
-        return stat_at(c, qid_of(KIND_DATASET_DIR, 0, (uint32_t)dsid), out);
+        return walk_to_qid(c, qid_of(KIND_DATASET_DIR, 0, (uint32_t)dsid), out);
     }
 
     case KIND_DATASET_DIR: {
@@ -1973,23 +2007,23 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
         uint64_t dsid = qid_dataset_id(dir_qid_path);
         if (str_eq(name, name_len,
                      KIND_META[KIND_DATASET_PROPERTIES].static_name))
-            return stat_at(c,
+            return walk_to_qid(c,
                 qid_of(KIND_DATASET_PROPERTIES, 0, (uint32_t)dsid), out);
         if (str_eq(name, name_len,
                      KIND_META[KIND_DATASET_CREATE_SNAPSHOT].static_name))
-            return stat_at(c,
+            return walk_to_qid(c,
                 qid_of(KIND_DATASET_CREATE_SNAPSHOT, 0, (uint32_t)dsid), out);
         if (str_eq(name, name_len,
                      KIND_META[KIND_DATASET_DELETE_SNAPSHOT].static_name))
-            return stat_at(c,
+            return walk_to_qid(c,
                 qid_of(KIND_DATASET_DELETE_SNAPSHOT, 0, (uint32_t)dsid), out);
         if (str_eq(name, name_len,
                      KIND_META[KIND_DATASET_HOLD_SNAPSHOT].static_name))
-            return stat_at(c,
+            return walk_to_qid(c,
                 qid_of(KIND_DATASET_HOLD_SNAPSHOT, 0, (uint32_t)dsid), out);
         if (str_eq(name, name_len,
                      KIND_META[KIND_DATASET_RELEASE_SNAPSHOT].static_name))
-            return stat_at(c,
+            return walk_to_qid(c,
                 qid_of(KIND_DATASET_RELEASE_SNAPSHOT, 0, (uint32_t)dsid), out);
         return STM_ENOENT;
     }
@@ -2003,18 +2037,18 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
          * /admin/peer's qid (LEAK — POSIX `stat /admin/peer` for a
          * non-admin would fail with EACCES on the parent traversal,
          * never revealing the file's metadata). The non-admin would
-         * then Tstat the bound fid to read mode=0400 + qid_type. We
+         * then Tgetattr the bound fid to read mode=0400 + qid_type. We
          * use STM_ENOENT (not STM_EACCES) so the wire response is
          * indistinguishable from "/admin/no_such_file" — the
          * documented "POSIX-mode-0500-dir" posture. The /admin/
          * dirent at root readdir remains visible (emit_entry calls
-         * stat_at, not vops_walk; readdir doesn't traverse). */
+         * getattr_at, not vops_walk; readdir doesn't traverse). */
         if (!ctl_caller_is_admin(c)) return STM_ENOENT;
         if (str_eq(name, name_len, KIND_META[KIND_ADMIN_PEER].static_name))
-            return stat_at(c, qid_root(KIND_ADMIN_PEER), out);
+            return walk_to_qid(c, qid_root(KIND_ADMIN_PEER), out);
         if (str_eq(name, name_len,
                      KIND_META[KIND_ADMIN_CLEAR_EVENTS].static_name))
-            return stat_at(c, qid_root(KIND_ADMIN_CLEAR_EVENTS), out);
+            return walk_to_qid(c, qid_root(KIND_ADMIN_CLEAR_EVENTS), out);
         return STM_ENOENT;
 
     case KIND_DEBUG_DIR:
@@ -2027,7 +2061,7 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
          * integrity-verify} sub-chunks add new walk targets here. */
         if (!ctl_caller_is_admin(c)) return STM_ENOENT;
         if (str_eq(name, name_len, KIND_META[KIND_DEBUG_ALLOC_DIR].static_name))
-            return stat_at(c, qid_root(KIND_DEBUG_ALLOC_DIR), out);
+            return walk_to_qid(c, qid_root(KIND_DEBUG_ALLOC_DIR), out);
         return STM_ENOENT;
 
     case KIND_DEBUG_ALLOC_DIR: {
@@ -2037,7 +2071,7 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
         if (!c->fs) return STM_ENOENT;
         uint16_t did = 0;
         if (parse_device_id(name, name_len, &did) != 0) return STM_ENOENT;
-        return stat_at(c, qid_of(KIND_DEBUG_ALLOC, 0, did), out);
+        return walk_to_qid(c, qid_of(KIND_DEBUG_ALLOC, 0, did), out);
     }
 
     case KIND_VERSION:
@@ -2062,89 +2096,129 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
     return STM_ENOENT;
 }
 
-static stm_status emit_entry(stm_ctl *c, stm_p9_readdir_cb cb, void *cb_ctx,
+/*
+ * Cookie pagination helper. Each Treaddir invocation builds a fresh
+ * `readdir_emit` and walks the directory's children, calling
+ * emit_entry per candidate. emit_entry consults getattr_at to
+ * existence-validate, then either:
+ *   (a) returns STM_ENOENT → caller's `continue` skips this slot
+ *       (existing race-skip semantics in /datasets/, /devices/);
+ *   (b) skips silently because the candidate's position is at-or-
+ *       before the client-supplied cookie cursor;
+ *   (c) emits a stm_lp9_dirent with cookie = position+1.
+ *
+ * Position counter advances ONLY for entries that pass existence-
+ * validation; STM_ENOENT slots don't consume a cookie. That keeps
+ * the cookie sequence dense over actually-emittable entries, which
+ * is what v9fs-Linux clients observe (and which makes the
+ * "Treaddir(offset=N) skips first N entries" contract straightforward).
+ */
+typedef struct {
+    uint64_t          offset;       /* cursor — Treaddir's `offset` */
+    uint64_t          pos;          /* entries existence-confirmed so far */
+    stm_lp9_dirent_cb cb;
+    void             *cb_ctx;
+} readdir_emit;
+
+static stm_status emit_entry(stm_ctl *c, readdir_emit *em,
                                uint64_t qid_path)
 {
-    stm_p9_node_stat st;
-    stm_status rc = stat_at(c, qid_path, &st);
+    stm_lp9_attr a;
+    char dyn_name[UUID_HEX_LEN + 1];
+    size_t dyn_len = 0;
+    stm_status rc = getattr_at(c, qid_path, &a, dyn_name, &dyn_len);
     if (rc != STM_OK) return rc;
-    return cb(&st, cb_ctx);
+
+    uint64_t this_cookie = ++em->pos;
+    if (this_cookie <= em->offset) return STM_OK;     /* before cursor */
+
+    stm_lp9_dirent e;
+    memset(&e, 0, sizeof e);
+    e.qid     = a.qid;
+    e.cookie  = this_cookie;
+    /* dt_type: DT_DIR=4 for dirs, DT_REG=8 for files. /ctl/ has no
+     * symlinks, sockets, devices, or pipes. */
+    e.dt_type = (a.qid.qtype & STM_LP9_QTDIR) ? 4u : 8u;
+    set_dirent_name(&e, dyn_name, dyn_len);
+    return em->cb(&e, em->cb_ctx);
 }
 
 static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
-                                 stm_p9_readdir_cb cb, void *cb_ctx)
+                                 uint64_t cookie_start,
+                                 stm_lp9_dirent_cb cb, void *cb_ctx)
 {
     stm_ctl *c = ctx;
     ctl_kind dk = qid_kind(dir_qid_path);
+    readdir_emit em = { .offset = cookie_start, .pos = 0, .cb = cb,
+                          .cb_ctx = cb_ctx };
     stm_status rc;
     switch (dk) {
     case KIND_ROOT:
-        rc = emit_entry(c, cb, cb_ctx, qid_root(KIND_VERSION));
+        rc = emit_entry(c, &em, qid_root(KIND_VERSION));
         if (rc != STM_OK) return rc;
-        rc = emit_entry(c, cb, cb_ctx, qid_root(KIND_STATE));
+        rc = emit_entry(c, &em, qid_root(KIND_STATE));
         if (rc != STM_OK) return rc;
-        rc = emit_entry(c, cb, cb_ctx, qid_root(KIND_POOLS_DIR));
+        rc = emit_entry(c, &em, qid_root(KIND_POOLS_DIR));
         if (rc != STM_OK) return rc;
         /* /datasets/ is always listed (matches /pools/ posture):
          * the directory exists even when c->fs is unattached;
          * readdir simply returns empty. R99 P3-1 — earlier comment
          * here contradicted the code; rewritten to reflect the
          * actual always-listed semantics. */
-        rc = emit_entry(c, cb, cb_ctx, qid_root(KIND_DATASETS_DIR));
+        rc = emit_entry(c, &em, qid_root(KIND_DATASETS_DIR));
         if (rc != STM_OK) return rc;
         /* /admin/ is always-listed at the dir level (mode 0500
          * conveys "admin-only"; non-admin readdir of root SEES the
-         * /admin dirent but Topen on it returns EACCES). Same
+         * /admin dirent but Tlopen on it returns EACCES). Same
          * posture as POSIX root + 0500 dir: existence is visible,
          * contents aren't. */
-        rc = emit_entry(c, cb, cb_ctx, qid_root(KIND_ADMIN_DIR));
+        rc = emit_entry(c, &em, qid_root(KIND_ADMIN_DIR));
         if (rc != STM_OK) return rc;
         /* /events is world-readable (mode 0444) — any caller can
          * tail-read the operational event log. Admin-only write
          * trigger (clear-events) lives under /admin/. */
-        rc = emit_entry(c, cb, cb_ctx, qid_root(KIND_EVENTS));
+        rc = emit_entry(c, &em, qid_root(KIND_EVENTS));
         if (rc != STM_OK) return rc;
         /* /debug/ is always-listed at the root level (mode 0500
          * conveys "admin-only"; non-admin readdir-of-root SEES the
-         * /debug dirent but Twalk-through and Topen both refuse
+         * /debug dirent but Twalk-through and Tlopen both refuse
          * with ENOENT/EACCES). Same posture as /admin/. */
-        return emit_entry(c, cb, cb_ctx, qid_root(KIND_DEBUG_DIR));
+        return emit_entry(c, &em, qid_root(KIND_DEBUG_DIR));
 
     case KIND_POOLS_DIR:
         /* Enumerate registered pools. v2.0: at most one pool. */
         if (!c->pool) return STM_OK;
-        return emit_entry(c, cb, cb_ctx, qid_root(KIND_POOL_DIR));
+        return emit_entry(c, &em, qid_root(KIND_POOL_DIR));
 
     case KIND_POOL_DIR:
         if (!c->pool) return STM_ENOENT;
-        rc = emit_entry(c, cb, cb_ctx, qid_root(KIND_POOL_STATUS));
+        rc = emit_entry(c, &em, qid_root(KIND_POOL_STATUS));
         if (rc != STM_OK) return rc;
-        rc = emit_entry(c, cb, cb_ctx, qid_root(KIND_DEVICES_DIR));
+        rc = emit_entry(c, &em, qid_root(KIND_DEVICES_DIR));
         if (rc != STM_OK) return rc;
         /* Conditional: scrub entry only emitted when a scrub handle
-         * is attached. Mirrors the stat_at gate so readdir + Twalk
+         * is attached. Mirrors the getattr_at gate so readdir + Twalk
          * are consistent — the entry isn't visible without a scrub.
          * The trigger entry pairs with the read entry (same scrub-
          * attached gate) — admin-only file (mode 0200) but visible
-         * in readdir to non-admin per POSIX semantics; Tstat shows
-         * mode 0200, only Topen+Twrite gate on admin. */
+         * in readdir to non-admin per POSIX semantics; Tgetattr shows
+         * mode 0200, only Tlopen+Twrite gate on admin. */
         if (c->scrub) {
-            rc = emit_entry(c, cb, cb_ctx, qid_root(KIND_POOL_SCRUB));
+            rc = emit_entry(c, &em, qid_root(KIND_POOL_SCRUB));
             if (rc != STM_OK) return rc;
-            rc = emit_entry(c, cb, cb_ctx, qid_root(KIND_POOL_SCRUB_TRIGGER));
+            rc = emit_entry(c, &em, qid_root(KIND_POOL_SCRUB_TRIGGER));
             if (rc != STM_OK) return rc;
         }
         /* /pools/<uuid>/metrics/ is unconditional — observability is
          * always offered. Body content adapts to fs/scrub attachment;
          * see materialize_pool_metrics_prometheus. */
-        return emit_entry(c, cb, cb_ctx, qid_root(KIND_POOL_METRICS_DIR));
+        return emit_entry(c, &em, qid_root(KIND_POOL_METRICS_DIR));
 
     case KIND_POOL_METRICS_DIR:
         /* /pools/<uuid>/metrics/ — single child today. Future
          * sub-chunks add /metrics/opentelemetry (OTLP exposition). */
         if (!c->pool) return STM_ENOENT;
-        return emit_entry(c, cb, cb_ctx,
-            qid_root(KIND_POOL_METRICS_PROMETHEUS));
+        return emit_entry(c, &em, qid_root(KIND_POOL_METRICS_PROMETHEUS));
 
     case KIND_DEVICES_DIR: {
         if (!c->pool) return STM_ENOENT;
@@ -2164,7 +2238,7 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
          * decrements count or returns NULL for in-bounds slots; not
          * exercised today. */
         for (size_t i = 0; i < total; i++) {
-            stm_status erc = emit_entry(c, cb, cb_ctx,
+            stm_status erc = emit_entry(c, &em,
                 qid_of(KIND_DEVICE_DIR, 0, (uint32_t)i));
             if (erc == STM_ENOENT) continue;
             if (erc != STM_OK) return erc;
@@ -2175,8 +2249,7 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
     case KIND_DEVICE_DIR: {
         if (!c->pool) return STM_ENOENT;
         uint32_t did = qid_device_id(dir_qid_path);
-        return emit_entry(c, cb, cb_ctx,
-            qid_of(KIND_DEVICE_STATUS, 0, did));
+        return emit_entry(c, &em, qid_of(KIND_DEVICE_STATUS, 0, did));
     }
 
     case KIND_DATASETS_DIR: {
@@ -2184,7 +2257,7 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
         if (!c->fs) return STM_OK;
         /* Collect ids via stm_fs_dataset_iter (which holds fs->lock
          * for the duration), then emit_entry per id AFTER releasing
-         * the lock. emit_entry → stat_at → stm_fs_dataset_lookup
+         * the lock. emit_entry → getattr_at → stm_fs_dataset_lookup
          * re-acquires fs->lock; doing this from inside the iter
          * callback would deadlock.
          *
@@ -2194,7 +2267,7 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
          * use the iter API.
          *
          * The window between collect and emit allows a destroy to
-         * happen, in which case stat_at returns STM_ENOENT for that
+         * happen, in which case getattr_at returns STM_ENOENT for that
          * id; we treat as "skip and continue" — REAL race-skip,
          * unlike /pools/devices/ where the equivalent is dead code. */
         uint64_t collected[STM_CTL_DATASET_LIST_CAP];
@@ -2207,7 +2280,7 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
         rc = stm_fs_dataset_iter(c->fs, ds_collect_cb, &collect_ctx);
         if (rc != STM_OK) return rc;
         for (size_t i = 0; i < n_collected; i++) {
-            stm_status erc = emit_entry(c, cb, cb_ctx,
+            stm_status erc = emit_entry(c, &em,
                 qid_of(KIND_DATASET_DIR, 0, (uint32_t)collected[i]));
             if (erc == STM_ENOENT) continue;   /* destroyed mid-readdir */
             if (erc != STM_OK) return erc;
@@ -2218,44 +2291,44 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
     case KIND_DATASET_DIR: {
         if (!c->fs) return STM_ENOENT;
         uint64_t dsid = qid_dataset_id(dir_qid_path);
-        rc = emit_entry(c, cb, cb_ctx,
+        rc = emit_entry(c, &em,
             qid_of(KIND_DATASET_PROPERTIES, 0, (uint32_t)dsid));
         if (rc != STM_OK) return rc;
         /* The trigger entries are admin-only (mode 0200) but visible
-         * in readdir to non-admin per POSIX semantics — Tstat shows
-         * mode 0200; only Topen+Twrite gate on admin. Same posture
+         * in readdir to non-admin per POSIX semantics — Tgetattr shows
+         * mode 0200; only Tlopen+Twrite gate on admin. Same posture
          * as /pools/<uuid>/scrub-trigger. */
-        rc = emit_entry(c, cb, cb_ctx,
+        rc = emit_entry(c, &em,
             qid_of(KIND_DATASET_CREATE_SNAPSHOT, 0, (uint32_t)dsid));
         if (rc != STM_OK) return rc;
-        rc = emit_entry(c, cb, cb_ctx,
+        rc = emit_entry(c, &em,
             qid_of(KIND_DATASET_DELETE_SNAPSHOT, 0, (uint32_t)dsid));
         if (rc != STM_OK) return rc;
-        rc = emit_entry(c, cb, cb_ctx,
+        rc = emit_entry(c, &em,
             qid_of(KIND_DATASET_HOLD_SNAPSHOT, 0, (uint32_t)dsid));
         if (rc != STM_OK) return rc;
-        return emit_entry(c, cb, cb_ctx,
+        return emit_entry(c, &em,
             qid_of(KIND_DATASET_RELEASE_SNAPSHOT, 0, (uint32_t)dsid));
     }
 
     case KIND_ADMIN_DIR:
-        rc = emit_entry(c, cb, cb_ctx, qid_root(KIND_ADMIN_PEER));
+        rc = emit_entry(c, &em, qid_root(KIND_ADMIN_PEER));
         if (rc != STM_OK) return rc;
-        return emit_entry(c, cb, cb_ctx, qid_root(KIND_ADMIN_CLEAR_EVENTS));
+        return emit_entry(c, &em, qid_root(KIND_ADMIN_CLEAR_EVENTS));
 
     case KIND_DEBUG_DIR:
-        /* /debug/ readdir doesn't gate on admin — vops_open already
+        /* /debug/ readdir doesn't gate on admin — vops_lopen already
          * gated at the dir-open level. A non-admin who got past
-         * vops_open is impossible; this case only fires for an
+         * vops_lopen is impossible; this case only fires for an
          * admin's readdir. (Defense in depth would be redundant; the
-         * walk-through gate at vops_walk + the open gate at vops_open
+         * walk-through gate at vops_walk + the open gate at vops_lopen
          * are the trust boundary.) Single child today: allocator-
          * state. Future sub-chunks add tree-walk, extent-map,
          * integrity-verify here. */
-        return emit_entry(c, cb, cb_ctx, qid_root(KIND_DEBUG_ALLOC_DIR));
+        return emit_entry(c, &em, qid_root(KIND_DEBUG_ALLOC_DIR));
 
     case KIND_DEBUG_ALLOC_DIR: {
-        /* R102 P3-4: vops_open at KIND_DEBUG_ALLOC_DIR refuses with
+        /* R102 P3-4: vops_lopen at KIND_DEBUG_ALLOC_DIR refuses with
          * STM_ENOENT when c->fs is NULL (line 1634), so this branch
          * is reachable only with c->fs != NULL. (Earlier comment
          * here described a "/datasets/-style empty-when-unattached"
@@ -2272,7 +2345,7 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
             bool attached = false;
             stm_status arc = stm_fs_alloc_attached(c->fs, did, &attached);
             if (arc != STM_OK || !attached) continue;
-            stm_status erc = emit_entry(c, cb, cb_ctx,
+            stm_status erc = emit_entry(c, &em,
                 qid_of(KIND_DEBUG_ALLOC, 0, did));
             if (erc == STM_ENOENT) continue;     /* race: detached after probe */
             if (erc != STM_OK) return erc;
@@ -2302,18 +2375,27 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
     return STM_ENOENT;
 }
 
-static stm_status vops_open(void *ctx, uint32_t fid, uint64_t qid_path,
-                              uint8_t mode)
+static stm_status vops_lopen(void *ctx, uint32_t fid, uint64_t qid_path,
+                               uint32_t flags)
 {
     stm_ctl *c = ctx;
     ctl_kind k = qid_kind(qid_path);
     if (k == KIND_MAX) return STM_ENOENT;
     const ctl_kind_meta *meta = &KIND_META[k];
 
+    /* Extract POSIX access mode from the .L Tlopen flags. The lp9
+     * server has already validated dir/file vs O_DIRECTORY (returns
+     * ENOTDIR/EISDIR before reaching us); our remaining job is the
+     * read-only-vs-write-only gate per kind. We refuse any flags
+     * we don't understand (the trigger files only support pure
+     * O_WRONLY; opening with O_RDWR or O_TRUNC etc. is refused at
+     * the "right access mode" check below). */
+    uint32_t accmode = flags & STM_LP9_O_ACCMODE;
+
     /* Mode-gating: most nodes are read-only. KIND_ADMIN_CLEAR_EVENTS
      * (P9-CTL-1d-events) and KIND_POOL_SCRUB_TRIGGER (P9-CTL-1d-
      * scrub-trigger) are write-only triggers (mode 0200) — accept
-     * OWRITE only. R101 P3-5 forward-note suggested folding this
+     * O_WRONLY only. R101 P3-5 forward-note suggested folding this
      * into `meta->mode & 0222` once the writable-kind family grew;
      * with two writable kinds we now have the family. The explicit
      * check below is still preferred since the kind list is small
@@ -2323,12 +2405,12 @@ static stm_status vops_open(void *ctx, uint32_t fid, uint64_t qid_path,
             || k == KIND_DATASET_DELETE_SNAPSHOT
             || k == KIND_DATASET_HOLD_SNAPSHOT
             || k == KIND_DATASET_RELEASE_SNAPSHOT) {
-        if (mode != STM_P9_OWRITE) return STM_EACCES;
+        if (accmode != STM_LP9_O_WRONLY) return STM_EACCES;
     } else {
-        if (mode != STM_P9_OREAD) return STM_EACCES;
+        if (accmode != STM_LP9_O_RDONLY) return STM_EACCES;
     }
 
-    /* P9-CTL-1d-uid: admin gate. Refuse non-admin Topen on
+    /* P9-CTL-1d-uid: admin gate. Refuse non-admin Tlopen on
      * admin-only kinds with EACCES. The check happens BEFORE the
      * per-kind validity gates (e.g., dataset-still-PRESENT) so a
      * non-admin probing the existence of /admin/peer cannot
@@ -2359,7 +2441,7 @@ static stm_status vops_open(void *ctx, uint32_t fid, uint64_t qid_path,
             return STM_ENOENT;
         if (k == KIND_DATASET_DIR) {
             /* Dataset must still be PRESENT (could have been
-             * destroyed between Twalk and Topen). R98 P2-1 lesson:
+             * destroyed between Twalk and Tlopen). R98 P2-1 lesson:
              * this is a REAL race-skip, not dead defense. */
             uint64_t dsid = qid_dataset_id(qid_path);
             stm_dataset_entry tmp;
@@ -2386,14 +2468,14 @@ static stm_status vops_open(void *ctx, uint32_t fid, uint64_t qid_path,
             || k == KIND_DATASET_RELEASE_SNAPSHOT) {
         if (!c->fs) return STM_ENOENT;
         /* Dataset must still be PRESENT (R98 P2-1 carry — destroyed
-         * mid-walk-then-Topen returns ENOENT). */
+         * mid-walk-then-Tlopen returns ENOENT). */
         uint64_t dsid = qid_dataset_id(qid_path);
         stm_dataset_entry tmp;
         stm_status drc = stm_fs_dataset_lookup(c->fs, dsid, &tmp);
         if (drc != STM_OK) return drc;
     }
     /* /pools/<uuid>/scrub + /pools/<uuid>/scrub-trigger both require
-     * pool + scrub attached. The dual-gate mirrors stat_at — without
+     * pool + scrub attached. The dual-gate mirrors getattr_at — without
      * scrub, the file doesn't exist (consistent operator semantics). */
     if ((k == KIND_POOL_SCRUB || k == KIND_POOL_SCRUB_TRIGGER)
             && (!c->pool || !c->scrub))
@@ -2404,9 +2486,9 @@ static stm_status vops_open(void *ctx, uint32_t fid, uint64_t qid_path,
         if (did >= STM_POOL_DEVICES_MAX) return STM_ENOENT;
         /* R102 P3-1: cheap is-attached predicate; the materialize
          * call below runs the full stats_get tree-scan on the OK
-         * path. Avoids two scans on every Topen.
+         * path. Avoids two scans on every Tlopen.
          *
-         * Re-probe at Topen — between Twalk and Topen the device
+         * Re-probe at Tlopen — between Twalk and Tlopen the device
          * could have been removed (forward-noted: today the sync
          * attach table only mutates at sync_create / replace_device_
          * online; a future evacuate path would race here). */
@@ -2417,8 +2499,8 @@ static stm_status vops_open(void *ctx, uint32_t fid, uint64_t qid_path,
 
     /* P9-CTL-1d-events: KIND_EVENTS reads from c->event_buf directly
      * (the log can grow past STM_CTL_BODY_MAX = 1 KiB). Snapshot the
-     * length at Topen so subsequent Treads see a stable view; events
-     * appended after Topen are visible only on a re-Topen. */
+     * length at Tlopen so subsequent Treads see a stable view; events
+     * appended after Tlopen are visible only on a re-Tlopen. */
     if (k == KIND_EVENTS) {
         pthread_mutex_lock(&c->mu);
         ctl_session *s = session_alloc_locked(c, fid, qid_path);
@@ -2480,7 +2562,7 @@ static stm_status vops_read(void *ctx, uint32_t fid, uint64_t qid_path,
     pthread_mutex_lock(&c->mu);
     ctl_session *s = session_get_locked(c, fid);
     if (!s) {
-        /* Read without prior open — generic stm_p9_server gates this
+        /* Read without prior open — generic stm_lp9_server gates this
          * via per-fid is_open, so we shouldn't get here on the happy
          * path. Defensive: refuse. */
         pthread_mutex_unlock(&c->mu);
@@ -2496,8 +2578,8 @@ static stm_status vops_read(void *ctx, uint32_t fid, uint64_t qid_path,
     }
     /* P9-CTL-1d-events: /events reads from c->event_buf directly
      * (bypasses session->buf since the log can be >1 KiB). The
-     * snapshot_len captured at Topen is the upper bound; events
-     * appended after Topen are not visible to this fid. */
+     * snapshot_len captured at Tlopen is the upper bound; events
+     * appended after Tlopen are not visible to this fid. */
     if (s->uses_event_buf) {
         if (offset >= s->snapshot_len) {
             *inout_len = 0;
@@ -2512,7 +2594,7 @@ static stm_status vops_read(void *ctx, uint32_t fid, uint64_t qid_path,
     }
     /* P9-CTL-1e: bulk-format kinds (currently only /pools/<uuid>/
      * metrics/prometheus) live in s->bulk_buf — heap-allocated at
-     * Topen, freed at Tclunk. The bulk_buf is per-session-owned, so
+     * Tlopen, freed at Tclunk. The bulk_buf is per-session-owned, so
      * concurrent reads at varying offsets see the same snapshot. */
     if (s->bulk_buf) {
         if (offset >= s->bulk_len) {
@@ -2548,10 +2630,10 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
     ctl_kind k = qid_kind(qid_path);
 
     /* P9-CTL-1d-events: KIND_ADMIN_CLEAR_EVENTS — first writable
-     * kind. Admin gate already fired at vops_open; if we reach
+     * kind. Admin gate already fired at vops_lopen; if we reach
      * vops_write the caller IS admin (the fid couldn't have opened
      * for write otherwise). Defense-in-depth re-check anyway:
-     * vops_open's gate is the primary, but if a future server bug
+     * vops_lopen's gate is the primary, but if a future server bug
      * routed write to this fid without proper open, the gate here
      * catches it. */
     if (k == KIND_ADMIN_CLEAR_EVENTS) {
@@ -2589,7 +2671,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
          * view that violates the documented "snapshot stability"
          * contract. Reset uses_event_buf and snapshot_len on every
          * active /events session so subsequent Treads return clean EOF
-         * (count=0). Operators re-Topen to see the post-clear log. */
+         * (count=0). Operators re-Tlopen to see the post-clear log. */
         for (uint32_t i = 0; i < STM_CTL_MAX_SESSIONS; i++) {
             ctl_session *e = &c->sessions[i];
             if (e->active && e->uses_event_buf) {
@@ -2613,11 +2695,11 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
      * dispatch invokes the matching stm_scrub_* primitive.
      *
      * Carries the R101 P2-2 / P2-1 / P3-5 lessons:
-     *   (a) admin gate at vops_open's meta->admin_required (primary).
+     *   (a) admin gate at vops_lopen's meta->admin_required (primary).
      *   (b) defense-in-depth admin re-check at vops_write.
      *   (c) zero-byte Twrite refusal — len == 0 is STM_EINVAL.
      *   (d) consistent KIND_META[] mode-bit + vops_write/open
-     *       dispatch (mode_check at vops_open already handled).
+     *       dispatch (mode_check at vops_lopen already handled).
      *
      * Gate ordering (R104 P3-5 — locked against drive-by edits):
      *   admin re-check  →  zero-byte refusal  →  scrub-attached
@@ -2642,7 +2724,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
                 (unsigned)c->caller_uid);
             return STM_EINVAL;
         }
-        if (!c->scrub) return STM_EBACKEND;     /* gated at vops_open */
+        if (!c->scrub) return STM_EBACKEND;     /* gated at vops_lopen */
         pthread_mutex_lock(&c->mu);
         ctl_session *s = session_get_locked(c, fid);
         if (!s || s->qid_path != qid_path) {
@@ -2737,7 +2819,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
      * dataset_id comes from the qid_path.
      *
      * Carries the established writable-kind family discipline:
-     *   (a) admin gate at vops_open's meta->admin_required.
+     *   (a) admin gate at vops_lopen's meta->admin_required.
      *   (b) defense-in-depth admin re-check at vops_write.
      *   (c) zero-byte Twrite refusal (R101 P2-2).
      *   (d) gate ordering: admin → zero-byte → fs-attached →
@@ -2758,7 +2840,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
          * rejection, name collision, etc.) DO log so the operator
          * has a forensic trail of every authorized attempt. */
         if (!ctl_caller_is_admin(c)) return STM_EACCES;
-        if (!c->fs) return STM_EBACKEND;     /* gated at vops_open */
+        if (!c->fs) return STM_EBACKEND;     /* gated at vops_lopen */
         pthread_mutex_lock(&c->mu);
         ctl_session *s = session_get_locked(c, fid);
         if (!s || s->qid_path != qid_path) {
@@ -2834,7 +2916,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
      * read snap-id from /events at create time. */
     if (k == KIND_DATASET_DELETE_SNAPSHOT) {
         if (!ctl_caller_is_admin(c)) return STM_EACCES;
-        if (!c->fs) return STM_EBACKEND;     /* gated at vops_open */
+        if (!c->fs) return STM_EBACKEND;     /* gated at vops_lopen */
         pthread_mutex_lock(&c->mu);
         ctl_session *s = session_get_locked(c, fid);
         if (!s || s->qid_path != qid_path) {
@@ -2910,7 +2992,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
                               ? "hold-snapshot" : "release-snapshot";
 
         if (!ctl_caller_is_admin(c)) return STM_EACCES;
-        if (!c->fs) return STM_EBACKEND;     /* gated at vops_open */
+        if (!c->fs) return STM_EBACKEND;     /* gated at vops_lopen */
         pthread_mutex_lock(&c->mu);
         ctl_session *s = session_get_locked(c, fid);
         if (!s || s->qid_path != qid_path) {
@@ -2984,14 +3066,25 @@ static void vops_clunk(void *ctx, uint32_t fid, uint64_t qid_path)
     pthread_mutex_unlock(&c->mu);
 }
 
-static const stm_p9_vops g_vops = {
-    .stat    = vops_stat,
-    .walk    = vops_walk,
-    .readdir = vops_readdir,
-    .open    = vops_open,
-    .read    = vops_read,
-    .write   = vops_write,
-    .clunk   = vops_clunk,
+static const stm_lp9_vops g_vops = {
+    .getattr  = vops_getattr,
+    .walk     = vops_walk,
+    .readdir  = vops_readdir,
+    .lopen    = vops_lopen,
+    .read     = vops_read,
+    .write    = vops_write,
+    .clunk    = vops_clunk,
+    /* Optional ops: NULL → server replies Rlerror(ENOSYS). /ctl/'s
+     * tree is fixed by code; no Tlcreate / Tmkdir / Tunlinkat /
+     * Tsymlink slots. /ctl/'s synthetic files don't expose
+     * settable attrs (Tsetattr) or Treadlink / Tfsync surfaces. */
+    .lcreate  = NULL,
+    .mkdir    = NULL,
+    .unlinkat = NULL,
+    .setattr  = NULL,
+    .fsync    = NULL,
+    .symlink  = NULL,
+    .readlink = NULL,
 };
 
 /* ── public API ─────────────────────────────────────────────────────── */
@@ -3094,7 +3187,7 @@ void stm_ctl_destroy(stm_ctl *c)
     free(c);
 }
 
-const stm_p9_vops *stm_ctl_vops(void)
+const stm_lp9_vops *stm_ctl_vops(void)
 {
     return &g_vops;
 }
