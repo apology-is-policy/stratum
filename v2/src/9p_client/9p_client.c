@@ -940,6 +940,287 @@ stm_status stm_9p_unlinkat(stm_9p_client *c, uint32_t dirfd,
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
+/* P9-LIB-1d: Tsetattr / Trenameat / Tsymlink / Treadlink / Tfsync.       */
+/*                                                                         */
+/* Each inherits the R111 doctrine carry: op_entry_check at entry,        */
+/* name validation at the lib boundary (saves a round-trip + gives a      */
+/* stable status), strict body-len equality on every Rxx parser, no       */
+/* server-supplied count used as a write target without caller-cap        */
+/* bounding (Treadlink's target length is the only server-supplied count  */
+/* of relevance here — bounded against caller's buf_cap).                 */
+/* ────────────────────────────────────────────────────────────────────── */
+
+stm_status stm_9p_setattr(stm_9p_client *c, uint32_t fid,
+                             const stm_9p_setattr_in *in)
+{
+    stm_status ec = op_entry_check(c);
+    if (ec != STM_OK) return ec;
+    if (!in) return STM_EINVAL;
+
+    /* Wire: hdr + fid(4) + valid(4) + mode(4) + uid(4) + gid(4)
+     *       + size(8) + atime_sec(8) + atime_nsec(8)
+     *       + mtime_sec(8) + mtime_nsec(8) = body 56 bytes. */
+    uint32_t msg_size = STM_9P_HDR_SIZE
+                      + 4u + 4u + 4u + 4u + 4u + 8u + 8u + 8u + 8u + 8u;
+    if (msg_size > c->buf_cap) return STM_ERANGE;
+    uint16_t tag = 0;
+    stm_status rc = alloc_tag(c, &tag);
+    if (rc != STM_OK) return rc;
+
+    uint8_t *wp = c->buf;
+    p_u32(wp, msg_size);
+    wp[4] = STM_9P_TSETATTR;
+    p_u16(wp + 5, tag);
+    uint8_t *bp = wp + 7;
+    p_u32(bp, fid);             bp += 4;
+    p_u32(bp, in->valid);       bp += 4;
+    p_u32(bp, in->mode);        bp += 4;
+    p_u32(bp, in->uid);         bp += 4;
+    p_u32(bp, in->gid);         bp += 4;
+    p_u64(bp, in->size);        bp += 8;
+    p_u64(bp, in->atime_sec);   bp += 8;
+    p_u64(bp, in->atime_nsec);  bp += 8;
+    p_u64(bp, in->mtime_sec);   bp += 8;
+    p_u64(bp, in->mtime_nsec);  bp += 8;
+    rc = send_msg(c, msg_size);
+    if (rc != STM_OK) return rc;
+
+    uint32_t reply_size = 0;
+    rc = recv_msg(c, &reply_size);
+    if (rc != STM_OK) return rc;
+    const uint8_t *body = NULL;
+    uint32_t body_len = 0;
+    rc = check_reply(c, reply_size, STM_9P_RSETATTR, tag, &body, &body_len);
+    if (rc != STM_OK) return rc;
+    /* Rsetattr has NO body. Strict equality refuses extra trailing bytes. */
+    if (body_len != 0u) {
+        c->last_errno = EPROTO;
+        return STM_EBACKEND;
+    }
+    (void)body;
+    return STM_OK;
+}
+
+stm_status stm_9p_renameat(stm_9p_client *c,
+                              uint32_t old_dirfid, const char *old_name,
+                              uint32_t new_dirfid, const char *new_name)
+{
+    stm_status ec = op_entry_check(c);
+    if (ec != STM_OK) return ec;
+    size_t onl = 0, nnl = 0;
+    ec = validate_name_for_lib(old_name, &onl);
+    if (ec != STM_OK) return ec;
+    ec = validate_name_for_lib(new_name, &nnl);
+    if (ec != STM_OK) return ec;
+
+    /* Wire: hdr + olddirfid(4) + onlen(2) + old_name(onl)
+     *       + newdirfid(4) + nnlen(2) + new_name(nnl). */
+    uint32_t msg_size = STM_9P_HDR_SIZE
+                      + 4u + 2u + (uint32_t)onl
+                      + 4u + 2u + (uint32_t)nnl;
+    if (msg_size > c->buf_cap) return STM_ERANGE;
+    uint16_t tag = 0;
+    stm_status rc = alloc_tag(c, &tag);
+    if (rc != STM_OK) return rc;
+
+    uint8_t *wp = c->buf;
+    p_u32(wp, msg_size);
+    wp[4] = STM_9P_TRENAMEAT;
+    p_u16(wp + 5, tag);
+    uint8_t *bp = wp + 7;
+    p_u32(bp, old_dirfid);       bp += 4;
+    p_u16(bp, (uint16_t)onl);    bp += 2;
+    memcpy(bp, old_name, onl);   bp += onl;
+    p_u32(bp, new_dirfid);       bp += 4;
+    p_u16(bp, (uint16_t)nnl);    bp += 2;
+    memcpy(bp, new_name, nnl);   bp += nnl;
+    rc = send_msg(c, msg_size);
+    if (rc != STM_OK) return rc;
+
+    uint32_t reply_size = 0;
+    rc = recv_msg(c, &reply_size);
+    if (rc != STM_OK) return rc;
+    const uint8_t *body = NULL;
+    uint32_t body_len = 0;
+    rc = check_reply(c, reply_size, STM_9P_RRENAMEAT, tag, &body, &body_len);
+    if (rc != STM_OK) return rc;
+    /* Rrenameat has NO body. Strict equality. */
+    if (body_len != 0u) {
+        c->last_errno = EPROTO;
+        return STM_EBACKEND;
+    }
+    (void)body;
+    return STM_OK;
+}
+
+/* Validate a symlink target. Differs from validate_name_for_lib:
+ * '/' IS allowed (paths are valid targets), "." / ".." are valid
+ * components in a target path, and length cap is UINT16_MAX (the
+ * wire field's range). NUL bytes are forbidden — server-side
+ * stm_fs_symlink takes a length-bounded buffer but the on-disk
+ * inline representation uses a length prefix without an embedded
+ * NUL, so a target with embedded NUL would round-trip differently
+ * across readlink/lookup. */
+static stm_status validate_target_for_lib(const char *target, size_t *out_len)
+{
+    if (!target) return STM_EINVAL;
+    size_t tl = strlen(target);
+    if (tl == 0 || tl > UINT16_MAX) return STM_EINVAL;
+    /* strlen already excludes a NUL terminator; embedded NULs
+     * cannot appear in a strlen-bounded scan, so no extra check
+     * needed. */
+    *out_len = tl;
+    return STM_OK;
+}
+
+stm_status stm_9p_symlink(stm_9p_client *c, uint32_t dfid,
+                             const char *name, const char *target,
+                             uint32_t gid, stm_9p_qid *out_qid)
+{
+    stm_status ec = op_entry_check(c);
+    if (ec != STM_OK) return ec;
+    size_t nl = 0, tl = 0;
+    ec = validate_name_for_lib(name, &nl);
+    if (ec != STM_OK) return ec;
+    ec = validate_target_for_lib(target, &tl);
+    if (ec != STM_OK) return ec;
+
+    /* Wire: hdr + dfid(4) + nlen(2) + name(nl) + tlen(2) + target(tl)
+     *       + gid(4). */
+    uint32_t msg_size = STM_9P_HDR_SIZE
+                      + 4u + 2u + (uint32_t)nl + 2u + (uint32_t)tl + 4u;
+    if (msg_size > c->buf_cap) return STM_ERANGE;
+    uint16_t tag = 0;
+    stm_status rc = alloc_tag(c, &tag);
+    if (rc != STM_OK) return rc;
+
+    uint8_t *wp = c->buf;
+    p_u32(wp, msg_size);
+    wp[4] = STM_9P_TSYMLINK;
+    p_u16(wp + 5, tag);
+    uint8_t *bp = wp + 7;
+    p_u32(bp, dfid);             bp += 4;
+    p_u16(bp, (uint16_t)nl);     bp += 2;
+    memcpy(bp, name, nl);        bp += nl;
+    p_u16(bp, (uint16_t)tl);     bp += 2;
+    memcpy(bp, target, tl);      bp += tl;
+    p_u32(bp, gid);              bp += 4;
+    rc = send_msg(c, msg_size);
+    if (rc != STM_OK) return rc;
+
+    uint32_t reply_size = 0;
+    rc = recv_msg(c, &reply_size);
+    if (rc != STM_OK) return rc;
+    const uint8_t *body = NULL;
+    uint32_t body_len = 0;
+    rc = check_reply(c, reply_size, STM_9P_RSYMLINK, tag, &body, &body_len);
+    if (rc != STM_OK) return rc;
+    /* Rsymlink body: qid[13]. Strict equality. */
+    if (body_len != STM_9P_QID_SIZE) {
+        c->last_errno = EPROTO;
+        return STM_EBACKEND;
+    }
+    if (out_qid) {
+        out_qid->type    = body[0];
+        out_qid->version = g_u32(body + 1);
+        out_qid->path    = g_u64(body + 5);
+    }
+    return STM_OK;
+}
+
+stm_status stm_9p_readlink(stm_9p_client *c, uint32_t fid,
+                              char *buf, size_t buf_cap, size_t *out_len)
+{
+    if (out_len) *out_len = 0;
+    stm_status ec = op_entry_check(c);
+    if (ec != STM_OK) return ec;
+    if (!buf) return STM_EINVAL;
+    if (buf_cap == 0) return STM_EINVAL;
+
+    /* Wire: hdr + fid(4). */
+    uint32_t msg_size = STM_9P_HDR_SIZE + 4u;
+    if (msg_size > c->buf_cap) return STM_ERANGE;
+    uint16_t tag = 0;
+    stm_status rc = alloc_tag(c, &tag);
+    if (rc != STM_OK) return rc;
+
+    uint8_t *wp = c->buf;
+    p_u32(wp, msg_size);
+    wp[4] = STM_9P_TREADLINK;
+    p_u16(wp + 5, tag);
+    p_u32(wp + 7, fid);
+    rc = send_msg(c, msg_size);
+    if (rc != STM_OK) return rc;
+
+    uint32_t reply_size = 0;
+    rc = recv_msg(c, &reply_size);
+    if (rc != STM_OK) return rc;
+    const uint8_t *body = NULL;
+    uint32_t body_len = 0;
+    rc = check_reply(c, reply_size, STM_9P_RREADLINK, tag, &body, &body_len);
+    if (rc != STM_OK) return rc;
+    /* Rreadlink body: target[s] = tlen[2] + target_bytes[tlen]. Strict
+     * equality. */
+    if (body_len < 2u) {
+        c->last_errno = EPROTO;
+        return STM_EBACKEND;
+    }
+    uint16_t tlen = g_u16(body);
+    if (body_len != 2u + (uint32_t)tlen) {
+        c->last_errno = EPROTO;
+        return STM_EBACKEND;
+    }
+    /* Caller-cap bound (R111 P0 F-1 lesson): tlen is server-supplied;
+     * tlen >= buf_cap means we don't have room for the target + NUL.
+     * Report STM_ERANGE so caller can resize. *out_len reports the
+     * required byte length so the caller knows the exact size. */
+    if (out_len) *out_len = (size_t)tlen;
+    if ((size_t)tlen >= buf_cap) {
+        return STM_ERANGE;
+    }
+    if (tlen > 0) memcpy(buf, body + 2, tlen);
+    buf[tlen] = '\0';
+    return STM_OK;
+}
+
+stm_status stm_9p_fsync(stm_9p_client *c, uint32_t fid, uint32_t datasync)
+{
+    stm_status ec = op_entry_check(c);
+    if (ec != STM_OK) return ec;
+
+    /* Wire: hdr + fid(4) + datasync(4). */
+    uint32_t msg_size = STM_9P_HDR_SIZE + 4u + 4u;
+    if (msg_size > c->buf_cap) return STM_ERANGE;
+    uint16_t tag = 0;
+    stm_status rc = alloc_tag(c, &tag);
+    if (rc != STM_OK) return rc;
+
+    uint8_t *wp = c->buf;
+    p_u32(wp, msg_size);
+    wp[4] = STM_9P_TFSYNC;
+    p_u16(wp + 5, tag);
+    p_u32(wp + 7, fid);
+    p_u32(wp + 11, datasync);
+    rc = send_msg(c, msg_size);
+    if (rc != STM_OK) return rc;
+
+    uint32_t reply_size = 0;
+    rc = recv_msg(c, &reply_size);
+    if (rc != STM_OK) return rc;
+    const uint8_t *body = NULL;
+    uint32_t body_len = 0;
+    rc = check_reply(c, reply_size, STM_9P_RFSYNC, tag, &body, &body_len);
+    if (rc != STM_OK) return rc;
+    /* Rfsync has NO body. Strict equality. */
+    if (body_len != 0u) {
+        c->last_errno = EPROTO;
+        return STM_EBACKEND;
+    }
+    (void)body;
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
 /* Tclunk.                                                                 */
 /* ────────────────────────────────────────────────────────────────────── */
 

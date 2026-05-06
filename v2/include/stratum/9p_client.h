@@ -9,11 +9,12 @@
  * server. This header is the C surface every consumer compiles
  * against.
  *
- * Scope at v2.0 (P9-LIB-1 sync API foundation):
+ * Scope at v2.0 (P9-LIB-1 sync API foundation + 1b/1c/1d follow-ons):
  *   - Connect over Unix socket, negotiate Tversion("9P2000.L").
  *   - Tattach to a root fid with Linux uname/aname/n_uname.
- *   - Twalk + TLopen (Linux flags) + Tread + Tclunk + Tgetattr +
- *     Treaddir.
+ *   - Read-side: Twalk + TLopen + Tread + Tclunk + Tgetattr + Treaddir.
+ *   - Write-side: Twrite (1b), Tlcreate / Tmkdir / Tunlinkat (1c),
+ *     Tsetattr / Trenameat / Tsymlink / Treadlink / Tfsync (1d).
  *   - Synchronous one-op-at-a-time client: each call sends a Tmsg
  *     and blocks on the matching Rmsg. Single-threaded by design;
  *     callers wanting concurrent ops open multiple connections.
@@ -25,8 +26,17 @@
  *     impossible.
  *
  * Deferred to subsequent chunks:
- *   - Write-side ops (Twrite, Tlcreate, Tmkdir, Tsetattr, Trenameat,
- *     Tunlinkat, Tsymlink, Tlink, Treadlink, Tfsync, Txattr*).
+ *   - Tlink (hard link). Server-side h_link is not yet wired in
+ *     v2/src/9p/server.c (dispatcher returns ENOSYS); the client
+ *     primitive will land alongside the server handler in a follow-on
+ *     chunk (P9-LIB-1e or whichever ships first).
+ *   - Txattrwalk / Txattrcreate (server present, client deferred to
+ *     keep this chunk POSIX-shape primitives only).
+ *   - Tlock / Tgetlock (advisory locking; relies on owner-id
+ *     plumbing tied to per-process state, less useful for the CLI
+ *     than for FUSE).
+ *   - Tstatfs (filesystem statistics; CLI-helpful but small —
+ *     bundled with /ctl/-on-stratumd or a separate tail chunk).
  *   - Async API (P9-LIB-2): pipelined Txx with reply matching by tag,
  *     io_uring transport, callback-based completion.
  *   - Stratum-extension opcodes (Tsync/Treflink/Tfallocate/Tfadvise
@@ -336,6 +346,125 @@ stm_status stm_9p_mkdir(stm_9p_client *c, uint32_t dfid,
 STM_MUST_USE
 stm_status stm_9p_unlinkat(stm_9p_client *c, uint32_t dirfd,
                               const char *name, uint32_t flags);
+
+/* TSetattr request fields. Only fields whose corresponding
+ * STM_9P_SETATTR_* bit is set in `valid` are applied; the rest are
+ * left unchanged. Mirrors the .L wire shape in struct form for a
+ * cleaner API.
+ *
+ * SIZE applies only to regular files (server returns EINVAL on dirs/
+ * symlinks). MODE / UID / GID / ATIME / MTIME apply to any fid.
+ * CTIME-set is implied by MODE / utimens (server stamps ctime to
+ * "now" on every mutation; explicit STM_9P_SETATTR_CTIME is accepted
+ * but doesn't carry a separate value). ATIME_SET / MTIME_SET are .L
+ * extensions: when set together with ATIME / MTIME the supplied
+ * sec/nsec is used; without those bits server interprets atime/mtime
+ * as "now" (Linux UTIME_NOW semantics). */
+typedef struct {
+    uint32_t valid;          /* STM_9P_SETATTR_* bitmask */
+    uint32_t mode;           /* low 12 bits significant */
+    uint32_t uid;
+    uint32_t gid;
+    uint64_t size;
+    uint64_t atime_sec;
+    uint64_t atime_nsec;
+    uint64_t mtime_sec;
+    uint64_t mtime_nsec;
+} stm_9p_setattr_in;
+
+/* Tsetattr: apply the masked attributes in `in` to `fid`. fid must
+ * be bound (Tattach/Twalk); fid does NOT need to be Topen'd.
+ *
+ * Returns:
+ *   - STM_OK on success.
+ *   - STM_EINVAL on NULL c, NULL in, SIZE-on-non-regular, mode bits
+ *     outside permission range (server-side).
+ *   - STM_EROFS if fs is read-only.
+ *   - Any Rlerror's mapped status. */
+STM_MUST_USE
+stm_status stm_9p_setattr(stm_9p_client *c, uint32_t fid,
+                             const stm_9p_setattr_in *in);
+
+/* TRenameat: move the entry `old_name` from directory `old_dirfid`
+ * to `new_name` in directory `new_dirfid`. Without RENAME_NOREPLACE
+ * etc. flags (.L Trenameat has no flags field — those are renameat2
+ * extensions accessible only via FUSE renameat2 or the Stratum
+ * extension Treflink), the call silently overwrites an existing
+ * destination per POSIX rename(2). Cross-dataset rename is refused
+ * server-side with STM_EXDEV.
+ *
+ * Returns:
+ *   - STM_OK on success.
+ *   - STM_EINVAL on NULL c / names, name == "" / "." / "..", or '/'
+ *     in any name.
+ *   - STM_ENOENT if old_name doesn't exist.
+ *   - STM_EXDEV on cross-dataset rename.
+ *   - Any Rlerror's mapped status. */
+STM_MUST_USE
+stm_status stm_9p_renameat(stm_9p_client *c,
+                              uint32_t old_dirfid, const char *old_name,
+                              uint32_t new_dirfid, const char *new_name);
+
+/* TSymlink: create a symlink `name` in directory `dfid` whose target
+ * string is `target`. dfid stays bound to the parent. The new
+ * symlink is NOT walked-into / opened — callers wanting the new
+ * symlink's fid should Twalk to `name` after the call.
+ *
+ * `target` is a free-form path (may contain '/'); only constraint is
+ * length ≤ UINT16_MAX (wire constraint). Server-side stratum forbids
+ * embedded NULs. `gid` is the .L group field; 0 typical.
+ *
+ * On success populates `*out_qid` with the new symlink's qid if
+ * non-NULL.
+ *
+ * Returns:
+ *   - STM_OK on success.
+ *   - STM_EINVAL on NULL c / name / target, name == "" / "." / "..",
+ *     '/' in name, or target containing an embedded NUL or
+ *     length > UINT16_MAX.
+ *   - STM_EEXIST if the name already exists.
+ *   - Any Rlerror's mapped status. */
+STM_MUST_USE
+stm_status stm_9p_symlink(stm_9p_client *c, uint32_t dfid,
+                             const char *name, const char *target,
+                             uint32_t gid, stm_9p_qid *out_qid);
+
+/* TReadlink: read the target string of the symlink bound to `fid`.
+ * fid MUST be a symlink (Tgetattr to verify if unsure); reading a
+ * non-symlink returns STM_EINVAL.
+ *
+ * Behavior:
+ *   - On success, the target is copied into `buf` and NUL-terminated.
+ *     `*out_len` (if non-NULL) is set to the target byte length
+ *     (excluding the trailing NUL).
+ *   - If the target is longer than `buf_cap - 1` (no room for NUL),
+ *     returns STM_ERANGE; `*out_len` is set to the required byte
+ *     length (so caller can resize and retry).
+ *   - `buf_cap == 0` → STM_EINVAL (need at least 1 byte for NUL).
+ *
+ * Returns:
+ *   - STM_OK on success.
+ *   - STM_EINVAL on NULL c / buf, buf_cap == 0.
+ *   - STM_ERANGE if target doesn't fit (target_len ≥ buf_cap).
+ *   - Any Rlerror's mapped status. */
+STM_MUST_USE
+stm_status stm_9p_readlink(stm_9p_client *c, uint32_t fid,
+                              char *buf, size_t buf_cap, size_t *out_len);
+
+/* TFsync: sync `fid`'s data to stable storage. `datasync` is the .L
+ * datasync flag (1 ⇒ data only, no metadata; 0 ⇒ full fsync). v2.0
+ * server-side stratumd ignores `datasync` and routes every fsync
+ * through stm_fs_commit (whole-pool sync). The flag is plumbed for
+ * forward compatibility — clients SHOULD pass the correct value so
+ * a future per-file fsync can use it.
+ *
+ * Returns:
+ *   - STM_OK on success.
+ *   - STM_EINVAL on NULL c.
+ *   - Any Rlerror's mapped status (e.g. server-side stm_fs_commit
+ *     failure surfaces as STM_EBACKEND / STM_EIO). */
+STM_MUST_USE
+stm_status stm_9p_fsync(stm_9p_client *c, uint32_t fid, uint32_t datasync);
 
 /* Tclunk: forget `fid`. The fid number becomes available for reuse
  * after this call returns OK. Even on error the fid SHOULD be

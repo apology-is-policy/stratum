@@ -38,7 +38,44 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9-LIB-1c mutation triad (this commit). 44 ctest suites
+- **Tip**: P9-LIB-1d 5-op write-side completion (this commit). 44
+  ctest suites green. test_9p_client 27 → 39 (+12 P9-LIB-1d tests).
+  **P9-LIB-1d** (audit-light, R111 doctrine carry) closes the
+  CLI-shape write-side primitive set with five ops: stm_9p_setattr
+  (Tsetattr — uses new public struct stm_9p_setattr_in for the
+  9-field mask + values), stm_9p_renameat (Trenameat — same-dir or
+  cross-dir; refuses cross-dataset → STM_EXDEV server-side),
+  stm_9p_symlink (Tsymlink — new validate_target_for_lib helper
+  permits '/'-containing paths but refuses NULL/empty/embedded-NUL
+  targets, capped at UINT16_MAX wire-field width), stm_9p_readlink
+  (Treadlink — buffer-too-small returns STM_ERANGE with *out_len
+  set to required size so callers can resize-and-retry), stm_9p_
+  fsync (Tfsync — datasync flag plumbed for forward-compat though
+  v2.0 server routes everything through stm_fs_commit). Each
+  inherits all R111 doctrine: op_entry_check at entry, lib-side
+  validation (saves a round-trip + stable status), strict body-
+  len equality on every Rxx (Rsetattr/Rrenameat/Rfsync = 0 B,
+  Rsymlink = 13 B, Rreadlink = 2 + tlen B), caller-cap bound on
+  every server-supplied count used as a write target (Treadlink's
+  tlen vs caller's buf_cap is the only relevant one here). 12 new
+  tests cover: setattr-mode round-trip, setattr-size truncate +
+  gen-bump, NULL-in EINVAL, renameat-same-dir, renameat-cross-dir,
+  renameat-invalid-names, symlink+readlink round-trip, symlink-
+  invalid-args (NULL/empty name + target), readlink-buf-too-small
+  STM_ERANGE with out_len reporting required size, readlink-NULL/
+  zero-cap EINVAL, readlink-on-non-symlink → server EINVAL,
+  fsync round-trip with datasync ∈ {0, 1}. **Tlink (hard link)
+  scoped OUT** — server-side h_link is not yet wired in v2/src/9p/
+  server.c (dispatcher returns ENOSYS); the client primitive will
+  land alongside the server handler in a follow-on chunk. Other
+  remaining write-side ops (Txattrwalk, Txattrcreate, Tlock,
+  Tgetlock, Tstatfs) deferred to keep this chunk POSIX-shape
+  primitives only. Stratum-extension band (Tsync/Treflink/
+  Tfallocate/Tfadvise) is a separate scope. The libstratum-9p ABI
+  now covers the full set the CLI needs for `mkdir/touch/rm/rmdir
+  /chmod/chown/touch -d/mv/ln -s/readlink/cat/echo X > /file/sync`.
+
+- **Pre-tip-1**: P9-LIB-1c mutation triad. 44 ctest suites
   green. test_9p_client 19 → 27 (+8 mutation tests).
   **P9-LIB-1c** (audit-light, R111 doctrine carry) extends the lib
   with the file-mutation primitive set: stm_9p_lcreate (create
@@ -53,12 +90,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   tests cover round-trip + EEXIST + invalid-names + dir-walk-
   into-newly-mkdired-dir + ENOTEMPTY (Linux) → STM_EBUSY mapping
   + AT_REMOVEDIR semantics (without-flag-on-dir refused, with-
-  flag-empty-dir succeeds, with-flag-non-empty → EBUSY). Foundation
-  is now ready for the CLI's full mutation set
-  (`mkdir / touch / rm / rmdir`); the remaining write-side ops
-  (Tsetattr, Trenameat, Tsymlink, Tlink, Treadlink, Tfsync, +
-  Stratum-extension Tsync/Treflink/Tfallocate/Tfadvise) are
-  natural follow-up chunks.
+  flag-empty-dir succeeds, with-flag-non-empty → EBUSY).
 
 - **Pre-tip-1**: P9-LIB-1b Twrite primitive. 44 ctest suites
   green. test_9p_client 15 → 19 (+4 Twrite tests). **P9-LIB-1b**

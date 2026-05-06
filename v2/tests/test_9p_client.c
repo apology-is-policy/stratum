@@ -1332,4 +1332,401 @@ STM_TEST(p9_client_unlinkat_removedir_nonempty_ebusy)
     destroy_client_fixture(&f);
 }
 
+/* ────────────────────────────────────────────────────────────────────── */
+/* P9-LIB-1d: Tsetattr / Trenameat / Tsymlink / Treadlink / Tfsync.        */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/* Tsetattr — apply MODE only and verify via Tgetattr. */
+STM_TEST(p9_client_setattr_mode_round_trip)
+{
+    client_fixture f = make_client_fixture("setattr_mode");
+
+    /* Pre-create a regular file via fs API so we have a known fid to
+     * setattr against. */
+    static const uint8_t NAME[] = "f.txt";
+    uint64_t file_ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(f.fs, /*ds=*/1u, f.root_ino,
+                                       NAME, (uint8_t)(sizeof NAME - 1),
+                                       /*mode=*/0644u, 0, 0, &file_ino));
+    STM_ASSERT_OK(stm_fs_commit(f.fs));
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    /* Walk to f.txt → fid 101. */
+    const char *names[] = { (const char *)NAME };
+    stm_9p_qid wqids[1];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 1, names, wqids, &walked));
+    STM_ASSERT_EQ(walked, 1u);
+
+    /* Confirm starting mode is 0644 (low 12 bits). */
+    stm_9p_attr a = {0};
+    STM_ASSERT_OK(stm_9p_getattr(c, 101, STM_9P_GETATTR_BASIC, &a));
+    STM_ASSERT_EQ((a.mode & 07777u), 0644u);
+
+    /* Setattr MODE → 0600. */
+    stm_9p_setattr_in in = {0};
+    in.valid = STM_9P_SETATTR_MODE;
+    in.mode  = 0600u;
+    STM_ASSERT_OK(stm_9p_setattr(c, 101, &in));
+
+    /* Re-getattr; mode should now reflect the change. */
+    memset(&a, 0, sizeof a);
+    STM_ASSERT_OK(stm_9p_getattr(c, 101, STM_9P_GETATTR_BASIC, &a));
+    STM_ASSERT_EQ((a.mode & 07777u), 0600u);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Tsetattr — SIZE truncate on a regular file then read shows zero
+ * bytes. Exercises the SIZE branch + verify_fid_fresh refresh after
+ * truncate (server-side gen bump). */
+STM_TEST(p9_client_setattr_size_truncate)
+{
+    client_fixture f = make_client_fixture("setattr_size");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    /* Clone root → 101, lcreate, write, then truncate via setattr. */
+    stm_9p_qid clone_qids[STM_9P_MAX_WALK];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 0, NULL, clone_qids, &walked));
+
+    stm_9p_qid lq;
+    STM_ASSERT_OK(stm_9p_lcreate(c, 101, "tr.txt",
+                                    STM_9P_O_RDWR, 0644u, 0, &lq, NULL));
+
+    static const uint8_t DATA[] = "abcdefghij";
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, 101, 0, DATA, sizeof DATA - 1, &written));
+    STM_ASSERT_EQ(written, sizeof DATA - 1);
+
+    /* Truncate to 0. */
+    stm_9p_setattr_in in = {0};
+    in.valid = STM_9P_SETATTR_SIZE;
+    in.size  = 0;
+    STM_ASSERT_OK(stm_9p_setattr(c, 101, &in));
+
+    /* Getattr — size should be 0 now. */
+    stm_9p_attr a = {0};
+    STM_ASSERT_OK(stm_9p_getattr(c, 101, STM_9P_GETATTR_BASIC, &a));
+    STM_ASSERT_EQ(a.size, 0u);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Tsetattr — NULL `in` → STM_EINVAL (lib-side, no round-trip). */
+STM_TEST(p9_client_setattr_null_in_einval)
+{
+    client_fixture f = make_client_fixture("setattr_null");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    STM_ASSERT_EQ(stm_9p_setattr(c, 100, NULL), STM_EINVAL);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Trenameat — rename a file in the same directory (oldfid == newfid). */
+STM_TEST(p9_client_renameat_same_dir)
+{
+    client_fixture f = make_client_fixture("rename_same");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    /* Clone root → 101, lcreate "old.txt". */
+    stm_9p_qid clone_qids[STM_9P_MAX_WALK];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 0, NULL, clone_qids, &walked));
+    stm_9p_qid lq;
+    STM_ASSERT_OK(stm_9p_lcreate(c, 101, "old.txt",
+                                    STM_9P_O_RDWR, 0644u, 0, &lq, NULL));
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+
+    /* Rename old.txt → new.txt (both in root fid 100). */
+    STM_ASSERT_OK(stm_9p_renameat(c, 100, "old.txt", 100, "new.txt"));
+
+    /* old.txt should no longer exist; new.txt should. */
+    const char *old_names[] = { "old.txt" };
+    stm_9p_qid wqids[1];
+    STM_ASSERT_EQ(stm_9p_walk(c, 100, 102, 1, old_names, wqids, &walked),
+                    STM_ENOENT);
+
+    const char *new_names[] = { "new.txt" };
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 103, 1, new_names, wqids, &walked));
+    STM_ASSERT_EQ(walked, 1u);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 103));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Trenameat — rename across directories. */
+STM_TEST(p9_client_renameat_cross_dir)
+{
+    client_fixture f = make_client_fixture("rename_cross");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    /* mkdir src and dst in root. */
+    stm_9p_qid mq;
+    STM_ASSERT_OK(stm_9p_mkdir(c, 100, "src", 0755u, 0, &mq));
+    STM_ASSERT_OK(stm_9p_mkdir(c, 100, "dst", 0755u, 0, &mq));
+
+    /* Walk into src → 101, lcreate "f.txt". */
+    const char *src_names[] = { "src" };
+    stm_9p_qid wqids[1];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 1, src_names, wqids, &walked));
+    /* clone 101 → 102 so we can keep a parent fid bound. */
+    stm_9p_qid clone_qids[STM_9P_MAX_WALK];
+    STM_ASSERT_OK(stm_9p_walk(c, 101, 102, 0, NULL, clone_qids, &walked));
+    stm_9p_qid lq;
+    STM_ASSERT_OK(stm_9p_lcreate(c, 102, "f.txt",
+                                    STM_9P_O_RDWR, 0644u, 0, &lq, NULL));
+    STM_ASSERT_OK(stm_9p_clunk(c, 102));
+
+    /* Walk into dst → 103. */
+    const char *dst_names[] = { "dst" };
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 103, 1, dst_names, wqids, &walked));
+
+    /* Rename src/f.txt → dst/g.txt. */
+    STM_ASSERT_OK(stm_9p_renameat(c, 101, "f.txt", 103, "g.txt"));
+
+    /* src/f.txt no longer exists. */
+    const char *src_f[] = { "f.txt" };
+    STM_ASSERT_EQ(stm_9p_walk(c, 101, 104, 1, src_f, wqids, &walked),
+                    STM_ENOENT);
+
+    /* dst/g.txt exists. */
+    const char *dst_g[] = { "g.txt" };
+    STM_ASSERT_OK(stm_9p_walk(c, 103, 105, 1, dst_g, wqids, &walked));
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 105));
+    STM_ASSERT_OK(stm_9p_clunk(c, 103));
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Trenameat — invalid names → STM_EINVAL (lib-side). */
+STM_TEST(p9_client_renameat_invalid_names_einval)
+{
+    client_fixture f = make_client_fixture("rename_inv");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    STM_ASSERT_EQ(stm_9p_renameat(c, 100, NULL, 100, "x"), STM_EINVAL);
+    STM_ASSERT_EQ(stm_9p_renameat(c, 100, "x", 100, NULL), STM_EINVAL);
+    STM_ASSERT_EQ(stm_9p_renameat(c, 100, "", 100, "x"),  STM_EINVAL);
+    STM_ASSERT_EQ(stm_9p_renameat(c, 100, ".", 100, "x"), STM_EINVAL);
+    STM_ASSERT_EQ(stm_9p_renameat(c, 100, "..", 100, "x"), STM_EINVAL);
+    STM_ASSERT_EQ(stm_9p_renameat(c, 100, "a/b", 100, "x"), STM_EINVAL);
+    STM_ASSERT_EQ(stm_9p_renameat(c, 100, "x", 100, ""),  STM_EINVAL);
+    STM_ASSERT_EQ(stm_9p_renameat(c, 100, "x", 100, "a/b"), STM_EINVAL);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Tsymlink + Treadlink — round-trip. Create symlink "link" pointing
+ * at "/etc/passwd"-shape target; readlink-back returns same string. */
+STM_TEST(p9_client_symlink_readlink_round_trip)
+{
+    client_fixture f = make_client_fixture("symlink_rt");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    static const char TARGET[] = "../some/where/over/the/rainbow";
+    stm_9p_qid sq;
+    STM_ASSERT_OK(stm_9p_symlink(c, 100, "link", TARGET, 0, &sq));
+    STM_ASSERT_EQ((sq.type & STM_9P_QTSYMLINK), STM_9P_QTSYMLINK);
+
+    /* Walk to "link" → 101. */
+    const char *names[] = { "link" };
+    stm_9p_qid wqids[1];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 1, names, wqids, &walked));
+
+    /* Readlink → expect TARGET back. */
+    char buf[128];
+    size_t got = 0;
+    STM_ASSERT_OK(stm_9p_readlink(c, 101, buf, sizeof buf, &got));
+    STM_ASSERT_EQ(got, sizeof TARGET - 1);
+    STM_ASSERT(strcmp(buf, TARGET) == 0);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Tsymlink — invalid `name` and `target` paths → STM_EINVAL. */
+STM_TEST(p9_client_symlink_invalid_args_einval)
+{
+    client_fixture f = make_client_fixture("symlink_inv");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    /* NULL / empty / dot / dotdot / slash names. */
+    STM_ASSERT_EQ(stm_9p_symlink(c, 100, NULL, "tgt", 0, NULL), STM_EINVAL);
+    STM_ASSERT_EQ(stm_9p_symlink(c, 100, "",   "tgt", 0, NULL), STM_EINVAL);
+    STM_ASSERT_EQ(stm_9p_symlink(c, 100, ".",  "tgt", 0, NULL), STM_EINVAL);
+    STM_ASSERT_EQ(stm_9p_symlink(c, 100, "..", "tgt", 0, NULL), STM_EINVAL);
+    STM_ASSERT_EQ(stm_9p_symlink(c, 100, "a/b","tgt", 0, NULL), STM_EINVAL);
+    /* NULL or empty target. */
+    STM_ASSERT_EQ(stm_9p_symlink(c, 100, "ok", NULL, 0, NULL), STM_EINVAL);
+    STM_ASSERT_EQ(stm_9p_symlink(c, 100, "ok", "",   0, NULL), STM_EINVAL);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Treadlink — buffer too small → STM_ERANGE + *out_len reports
+ * required size so the caller can resize and retry. */
+STM_TEST(p9_client_readlink_buf_too_small_erange)
+{
+    client_fixture f = make_client_fixture("readlink_small");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    static const char TARGET[] = "this-target-is-longer-than-eight-bytes";
+    stm_9p_qid sq;
+    STM_ASSERT_OK(stm_9p_symlink(c, 100, "ll", TARGET, 0, &sq));
+
+    const char *names[] = { "ll" };
+    stm_9p_qid wqids[1];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 1, names, wqids, &walked));
+
+    char small[8];
+    size_t got = 0;
+    STM_ASSERT_EQ(stm_9p_readlink(c, 101, small, sizeof small, &got),
+                    STM_ERANGE);
+    STM_ASSERT_EQ(got, sizeof TARGET - 1);
+
+    /* Resize and retry — succeeds. */
+    char big[64];
+    STM_ASSERT_OK(stm_9p_readlink(c, 101, big, sizeof big, &got));
+    STM_ASSERT_EQ(got, sizeof TARGET - 1);
+    STM_ASSERT(strcmp(big, TARGET) == 0);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Treadlink — NULL buf or buf_cap=0 → STM_EINVAL. */
+STM_TEST(p9_client_readlink_invalid_args_einval)
+{
+    client_fixture f = make_client_fixture("readlink_inv");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    char buf[16];
+    size_t got = 0;
+    STM_ASSERT_EQ(stm_9p_readlink(c, 100, NULL, sizeof buf, &got),
+                    STM_EINVAL);
+    STM_ASSERT_EQ(stm_9p_readlink(c, 100, buf, 0, &got), STM_EINVAL);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Treadlink on a non-symlink (regular file) → server returns EINVAL,
+ * mapped to STM_EINVAL by the lib. */
+STM_TEST(p9_client_readlink_on_non_symlink_einval)
+{
+    client_fixture f = make_client_fixture("readlink_notsym");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    /* Create a regular file via lcreate. */
+    stm_9p_qid clone_qids[STM_9P_MAX_WALK];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 0, NULL, clone_qids, &walked));
+    stm_9p_qid lq;
+    STM_ASSERT_OK(stm_9p_lcreate(c, 101, "regular.txt",
+                                    STM_9P_O_RDWR, 0644u, 0, &lq, NULL));
+
+    /* Readlink on the regular file → STM_EINVAL (server). */
+    char buf[64];
+    size_t got = 0;
+    STM_ASSERT_EQ(stm_9p_readlink(c, 101, buf, sizeof buf, &got),
+                    STM_EINVAL);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Tfsync — happy path. Datasync=0 is a full fsync; v2.0 server-side
+ * routes through stm_fs_commit. */
+STM_TEST(p9_client_fsync_round_trip)
+{
+    client_fixture f = make_client_fixture("fsync");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    /* Create a file, write, then fsync. */
+    stm_9p_qid clone_qids[STM_9P_MAX_WALK];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 0, NULL, clone_qids, &walked));
+    stm_9p_qid lq;
+    STM_ASSERT_OK(stm_9p_lcreate(c, 101, "syncme.txt",
+                                    STM_9P_O_RDWR, 0644u, 0, &lq, NULL));
+    static const uint8_t DATA[] = "fsync test";
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, 101, 0, DATA, sizeof DATA - 1, &written));
+
+    /* Datasync=0 (full fsync). */
+    STM_ASSERT_OK(stm_9p_fsync(c, 101, /*datasync=*/0));
+    /* Datasync=1 (data-only fsync; v2.0 server treats same as 0). */
+    STM_ASSERT_OK(stm_9p_fsync(c, 101, /*datasync=*/1));
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
 STM_TEST_MAIN("9p_client")

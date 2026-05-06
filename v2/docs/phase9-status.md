@@ -859,11 +859,43 @@ language bindings, future kernel module) is a 9P consumer.
       into-newly-mkdired-dir + EEXIST; unlinkat removes file,
       AT_REMOVEDIR semantics (without-flag-on-dir refused, with-
       flag-empty succeeds, with-flag-non-empty → EBUSY).
-      Foundation ready for CLI mkdir/touch/rm/rmdir. Remaining
-      write-side ops (Tsetattr, Trenameat, Tsymlink, Tlink,
-      Treadlink, Tfsync, + Stratum-ext Tsync/Treflink/
-      Tfallocate/Tfadvise) are natural follow-up chunks.
-      test_9p_client 19 → 27.
+      Foundation ready for CLI mkdir/touch/rm/rmdir. test_9p_client
+      19 → 27.
+
+      **P9-LIB-1d 5-op write-side completion** (audit-light): adds
+      the remaining POSIX-shape write-side primitives:
+      stm_9p_setattr (Tsetattr — uses new public struct
+      stm_9p_setattr_in for the 9-field mask + values),
+      stm_9p_renameat (Trenameat — same-dir or cross-dir; refuses
+      cross-dataset → STM_EXDEV server-side), stm_9p_symlink
+      (Tsymlink — new validate_target_for_lib helper permits
+      '/'-containing paths but refuses NULL/empty/embedded-NUL
+      targets, capped at UINT16_MAX wire-field width),
+      stm_9p_readlink (Treadlink — buffer-too-small returns
+      STM_ERANGE with *out_len set to required size so callers can
+      resize-and-retry), stm_9p_fsync (Tfsync — datasync flag
+      plumbed for forward-compat though v2.0 server routes
+      everything through stm_fs_commit). Each inherits R111
+      doctrine: op_entry_check at entry, lib-side validation
+      (saves a round-trip + stable status), strict body-len
+      equality on every Rxx (Rsetattr/Rrenameat/Rfsync = 0 B,
+      Rsymlink = 13 B, Rreadlink = 2 + tlen B), caller-cap bound
+      on every server-supplied count used as a write target
+      (Treadlink's tlen vs caller's buf_cap). 12 new tests covering
+      setattr-mode/size, NULL-in EINVAL, renameat-same-dir,
+      renameat-cross-dir, renameat-invalid-names, symlink+readlink
+      round-trip, symlink-invalid-args, readlink-buf-too-small
+      STM_ERANGE with required-size reporting, readlink-NULL/zero-
+      cap EINVAL, readlink-on-non-symlink → server EINVAL, fsync
+      round-trip with datasync ∈ {0, 1}. **Tlink (hard link)
+      scoped OUT** — server-side h_link is not yet wired in
+      v2/src/9p/server.c (dispatcher returns ENOSYS); the client
+      primitive will land alongside the server handler in a
+      follow-on chunk. Other remaining ops (Txattrwalk,
+      Txattrcreate, Tlock, Tgetlock, Tstatfs) deferred to keep this
+      chunk POSIX-shape primitives only. Stratum-extension band
+      (Tsync/Treflink/Tfallocate/Tfadvise) is a separate scope.
+      test_9p_client 27 → 39.
 
 - [ ] **P9-LIB-2 libstratum-9p async API** — pending.
 
