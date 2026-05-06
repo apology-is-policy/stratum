@@ -4665,4 +4665,52 @@ STM_TEST(ctl_d8_hold_post_admin_refusals_log)
     destroy_scrub_trigger_fixture(f);
 }
 
+/* R108 P2-1 regression: hold persistence across mount cycles.
+ * The original chunk's docstring incorrectly claimed holds reset
+ * on remount; the auditor caught the doc-vs-code drift. snapshot.h
+ * documents hold_count at offset 40 of the snapshot record with
+ * "persists across mount, like ZFS holds"; stm_snapshot_hold sets
+ * idx->dirty so stm_sync_commit flushes the value.
+ *
+ * This test exercises the persistence end-to-end:
+ *   1. Format + mount + create snap.
+ *   2. Hold snap + commit.
+ *   3. Unmount.
+ *   4. Re-mount.
+ *   5. Attempt delete → STM_EBUSY (hold survived).
+ *   6. Release + commit + delete → STM_OK.
+ *
+ * Without the corrected commit-then-unmount step, a future
+ * regression that broke idx->dirty propagation would silently
+ * succeed. */
+STM_TEST(ctl_r108_p2_1_hold_persists_across_remount)
+{
+    make_tmp("ctl_r108_persist");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    /* Phase 1: create snap, hold, commit, unmount. */
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t snap_id = setup_snapshot(fs, 1, "persistent_hold");
+    STM_ASSERT_OK(stm_fs_hold_snapshot(fs, snap_id));
+    /* Commit flushes the dirty snapshot index to disk. */
+    STM_ASSERT_OK(stm_fs_commit(fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    /* Phase 2: re-mount; assert hold survived. */
+    fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Delete refused — hold persisted. */
+    STM_ASSERT_EQ(stm_fs_delete_snapshot(fs, snap_id, NULL), STM_EBUSY);
+
+    /* Release + delete succeeds. */
+    STM_ASSERT_OK(stm_fs_release_snapshot(fs, snap_id));
+    STM_ASSERT_OK(stm_fs_delete_snapshot(fs, snap_id, NULL));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
 STM_TEST_MAIN("ctl")

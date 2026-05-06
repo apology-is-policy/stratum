@@ -4488,8 +4488,16 @@ stm_status stm_fs_delete_snapshot(stm_fs *fs, uint64_t snapshot_id,
 
 /* P9-CTL-1d-actions-snapshot-hold: thin hold/release wrappers. Both
  * mutate the snapshot index's hold-count counter under fs->lock +
- * FS_GUARD_WRITE. Holds are in-RAM state per snapshot.h's contract;
- * they reset on remount. */
+ * FS_GUARD_WRITE.
+ *
+ * R108 P2-1 fix: hold_count IS persisted across mount cycles
+ * (snapshot.h's on-disk layout reserves offset 40 for it; snapshot.c
+ * sets idx->dirty = true on hold/release; stm_sync_commit flushes
+ * the index to disk; on next mount the encoded value is decoded
+ * back). An earlier docstring incorrectly claimed in-RAM-only
+ * semantics — corrected here and at the public-API site. Crash
+ * window: a hold taken after the last sync but before the next is
+ * lost on remount; operators wanting durable holds should commit. */
 stm_status stm_fs_hold_snapshot(stm_fs *fs, uint64_t snapshot_id)
 {
     if (!fs) return STM_EINVAL;

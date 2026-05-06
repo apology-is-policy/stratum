@@ -621,7 +621,17 @@ language bindings, future kernel module) is a 9P consumer.
                   multiple_holds_pair, release_without_hold_einval,
                   hold_nonexistent_enoent, wrapper_boundaries
                   (NULL/0/wedged), nonadmin_eacces, post_admin_
-                  refusals_log. R108 audit pending.
+                  refusals_log. **R108 close** YELLOW MERGE — 0 P0
+                  + 0 P1 + 1 P2 + 5 P3. P2-1 was a load-bearing
+                  doc-vs-code drift: chunk's docstrings claimed
+                  holds are "in-RAM only / reset on remount" but
+                  snapshot.h's on-disk format DOES persist
+                  hold_count (offset 40, "persists across mount,
+                  like ZFS holds"). Auditor caught + fix corrected
+                  5 sites + added ctl_r108_p2_1_hold_persists_
+                  across_remount regression. P3-1 added STM_EOVERFLOW
+                  to fs.h refusal list. P3-2/P3-3/P3-5 forward-noted
+                  to Phase 8.5 family cleanup. test_ctl 119 → 120.
             - [ ] **P9-CTL-1d-actions-snapshot-rollback** — pending;
                   higher-risk (mutates working tree); requires
                   snapshot-rollback invariant analysis. Check

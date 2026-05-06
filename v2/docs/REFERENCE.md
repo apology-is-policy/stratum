@@ -38,9 +38,26 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9-CTL-1d-actions-snapshot-hold substantive (this
-  commit). 43 ctest suites green default. test_ctl 119/119 (was
-  112 at R107 close; +7 -1d-actions-snapshot-hold). **P9-CTL-1d-
+- **Tip**: P9-CTL-1d-actions-snapshot-hold R108 close (this
+  commit) — YELLOW MERGE, 0 P0 + 0 P1 + 1 P2 + 5 P3. 43 ctest
+  suites green default. test_ctl 120/120 (was 112 at R107 close;
+  +7 -1d-actions-snapshot-hold + 1 R108 P2-1 regression test).
+  R108 close: P2-1 was a load-bearing doc-vs-code drift — the
+  chunk's docstrings + commit message asserted in 5 places that
+  hold counts are "in-RAM only / reset on remount", but
+  snapshot.h's on-disk format reserves offset 40 for hold_count
+  with explicit "persists across mount, like ZFS holds", and
+  snapshot.c sets idx->dirty so stm_sync_commit flushes the
+  value. Auditor caught the drift; fix corrected ALL 5 sites
+  (fs.h, fs.c, synfs.c, REFERENCE.md, phase9-status.md). Added
+  ctl_r108_p2_1_hold_persists_across_remount regression test
+  that exercises the persistence end-to-end (format → mount →
+  create snap → hold → commit → unmount → remount → assert
+  delete-refused-EBUSY → release → delete OK). P3-1 added STM_
+  EOVERFLOW to fs.h refusal list (saturate-not-wrap defense).
+  P3-2 (RO-mount untested), P3-3 (decorative dataset_id), P3-5
+  (result=err lacks rc) all forward-noted to Phase 8.5 family-
+  wide cleanup. The auditor's verdict was YELLOW MERGE. **P9-CTL-1d-
   actions-snapshot-hold** adds /datasets/<id>/hold-snapshot +
   /datasets/<id>/release-snapshot (admin-only mode 0200, symmetric
   pair). KIND_MAX = 25 (was 23); two new kinds. New public APIs

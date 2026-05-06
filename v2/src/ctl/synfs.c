@@ -2389,9 +2389,12 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
      * snapshot_id (1..UINT64_MAX), optionally with trailing
      * whitespace.
      *
-     * Hold/release are in-RAM operations on the snapshot_index's
-     * hold_count counter (snapshot.h: holds reset on remount).
-     * Hold gates delete via STM_EBUSY. */
+     * Hold/release mutate the snapshot_index's hold_count counter,
+     * which IS persisted on disk (R108 P2-1 fix — snapshot.h's
+     * on-disk layout puts hold_count at offset 40 of the snapshot
+     * record; stm_snapshot_hold/_release set idx->dirty so the next
+     * stm_sync_commit flushes the value). Hold gates delete via
+     * STM_EBUSY (snapshot.tla::HoldPreventsDelete). */
     if (k == KIND_DATASET_HOLD_SNAPSHOT
             || k == KIND_DATASET_RELEASE_SNAPSHOT) {
         const char *verb = (k == KIND_DATASET_HOLD_SNAPSHOT)

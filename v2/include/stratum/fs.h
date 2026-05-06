@@ -1531,19 +1531,32 @@ stm_status stm_fs_delete_snapshot(stm_fs *fs, uint64_t snapshot_id,
  * Multiple agents (operators, send/recv, replication) can hold the
  * same snapshot concurrently; each Hold pairs with a Release.
  *
- * Holds are in-RAM state on the snapshot_index; they reset on
- * remount. v2.0 does not persist hold counts across mount cycles.
+ * Persistence (R108 P2-1 fix — corrects an earlier docstring that
+ * incorrectly claimed holds reset on remount): hold_count is
+ * encoded into the snapshot record at offset 40 per snapshot.h's
+ * on-disk layout ("hold_count (le32) — persists across mount,
+ * like ZFS holds"). stm_snapshot_hold / _release set
+ * `idx->dirty = true`; the next stm_sync_commit flushes the index
+ * to disk. After commit, holds survive remount.
+ *
+ * Crash window: a hold taken after the last successful sync but
+ * before the next is lost on remount. Operators wanting durable
+ * holds should issue stm_fs_commit after the trigger; daemon
+ * integrations may auto-commit on hold/release.
  *
  * Holds fs->lock + FS_GUARD_WRITE for the dispatch (mutates the
  * snapshot index's hold-count counter; STM_EWEDGED + STM_EROFS
  * apply uniformly with the other write-shape wrappers).
  *
  * Refusals propagated from stm_snapshot_hold:
- *   STM_EINVAL  — NULL fs; snapshot_id == 0
- *   STM_ECORRUPT — snapshot index unavailable
- *   STM_ENOENT  — snapshot_id unknown / already-deleted
- *   STM_EWEDGED — fs is wedged
- *   STM_EROFS   — fs is read-only
+ *   STM_EINVAL    — NULL fs; snapshot_id == 0
+ *   STM_ECORRUPT  — snapshot index unavailable
+ *   STM_ENOENT    — snapshot_id unknown / already-deleted
+ *   STM_EOVERFLOW — hold_count saturated at UINT32_MAX (R108 P3-1
+ *                   carry — hostile caller hit the cap; saturate
+ *                   rather than wrap)
+ *   STM_EWEDGED   — fs is wedged
+ *   STM_EROFS     — fs is read-only
  */
 STM_MUST_USE
 stm_status stm_fs_hold_snapshot(stm_fs *fs, uint64_t snapshot_id);
