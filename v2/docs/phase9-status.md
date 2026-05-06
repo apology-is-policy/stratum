@@ -688,6 +688,35 @@ language bindings, future kernel module) is a 9P consumer.
             deferred — sidecar translator is the simplest path.
             Per-dataset op counters + latency histograms deferred
             to instrumentation hot-path work.
+            **R110 close** YELLOW — 0 P0 + 0 P1 + 1 P2 + 7 P3, all
+            addressed inline. P2-1 was a load-bearing wedged-fs
+            availability gap: stm_fs_dataset_count uses FS_GUARD_READ
+            (returns STM_EWEDGED on wedged fs) but the materializer
+            treated any non-OK as STM_EBACKEND, so the entire
+            endpoint denied — exactly when operators need to see
+            `stratum_pool_wedged{...} 1`. Fixed by treating
+            STM_EWEDGED specifically (dataset_count surfaces as 0;
+            rest of body still emits). Same wedged-OK doctrine as
+            /debug/allocator-state and /state. Regression test
+            ctl_e1_metrics_prometheus_wedged_emits_wedged_gauge
+            pins it. P3-2 added local _Static_asserts pinning per-
+            state/class/role loop bounds against enum cardinality
+            (tripwire for future enum extensions). P3-3 reworded
+            prom_appendf doc-comment about cap state on failure
+            branches. P3-4 reworded session_alloc_locked bulk_buf
+            comment from "carries over" to "already NULL after
+            memset, belt-and-suspenders". P3-5/P3-8 reworded
+            materializer lock-posture comment to clarify c->mu held
+            throughout, subsystem accessors run SERIALLY (not
+            nested), and noted fs/scrub locks are descriptive.
+            P3-6 restructured offset_resumption test to use ONE
+            Topen with two reads (was comparing two separate Topen
+            snapshots — would silently break if any future field
+            becomes monotonic between opens). P3-7 added pool-
+            only-no-fs regression test
+            (ctl_e1_metrics_prometheus_pool_only_omits_fs_gauges)
+            exercising the `if (have_fs)` omit-fs-section branch.
+            test_ctl 138 → 140 (+2 R110 tests). 43/43 ctest green.
 
 - [ ] **P9-CLI-1 stratum CLI** — pending; thin (~1000 LOC)
       wrapper over /ctl/. Subcommands: pool, dataset, snapshot,

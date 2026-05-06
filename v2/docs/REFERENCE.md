@@ -38,9 +38,37 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9-CTL-1e — /pools/<uuid>/metrics/prometheus per-pool
-  Prometheus exposition (this commit). 43 ctest suites green
-  default. test_ctl 138/138 (was 124 at R109 close; +14 -1e tests).
+- **Tip**: P9-CTL-1e R110 audit close (this commit). 43 ctest suites
+  green default. test_ctl 140/140 (was 138 at substantive; +2 R110
+  regression tests). **R110 close** YELLOW — 0 P0 + 0 P1 + 1 P2 + 7
+  P3, all addressed inline. **P2-1 (load-bearing wedged-fs
+  availability)**: `materialize_pool_metrics_prometheus` called
+  `stm_fs_dataset_count` which uses FS_GUARD_READ (STM_EWEDGED on
+  wedged fs); the materializer treated any non-OK as STM_EBACKEND so
+  the entire endpoint denied — exactly when operators most need to
+  see `stratum_pool_wedged{pool="..."} 1`. The two adjacent fs
+  accessors disagreed on wedged-readability (stm_fs_stats_get is
+  wedged-OK; stm_fs_dataset_count refuses on wedge). Fixed by
+  treating STM_EWEDGED specifically (dataset_count surfaces as 0;
+  rest of body still emits). Same wedged-OK doctrine as /debug/
+  allocator-state and /state. Regression test:
+  ctl_e1_metrics_prometheus_wedged_emits_wedged_gauge. **P3 polish
+  inline**: P3-2 added local _Static_asserts pinning per-state /
+  per-class / per-role loop bounds against the corresponding enum
+  cardinality (tripwire for future enum extensions); P3-3 reworded
+  prom_appendf doc-comment to be precise about cap state on failure
+  branches; P3-4 reworded session_alloc_locked bulk_buf comment from
+  "carries over" to "already NULL after memset, belt-and-suspenders";
+  P3-5/P3-8 reworded materializer lock-posture comment to clarify
+  c->mu is held throughout, subsystem accessors run SERIALLY (one at
+  a time, none nested), and noted fs/scrub locks are descriptive (not
+  public surfaces); P3-6 restructured offset_resumption test to use
+  ONE Topen with two reads (was comparing two separate Topen
+  snapshots which would silently break if any future field becomes
+  monotonic between opens); P3-7 added pool-only-no-fs regression
+  test (`ctl_e1_metrics_prometheus_pool_only_omits_fs_gauges`)
+  exercising the `if (have_fs)` omit-fs-section branch.
+
   **P9-CTL-1e** adds the per-pool /metrics/ subtree (ARCH §14.8.1):
   /pools/<uuid>/metrics/ + /pools/<uuid>/metrics/prometheus
   (world-readable mode 0444 — no admin gate, exposition is public).
@@ -55,23 +83,20 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   format kinds (debug tree-walk dumps, etc.) inherit the same
   pattern. New static helpers prom_grow (realloc-doubling, STM_
   ERANGE on cap exceed) + prom_appendf (vsnprintf-then-grow with
-  __attribute__((format(printf, 4, 5)))). Lock posture: each
-  subsystem accessor takes its own lock; no cross-subsystem lock
-  held concurrently. Trust boundary (CLAUDE.md clause 10): NO
-  user-supplied strings flow into Prometheus labels at v2.0 — only
-  UUIDs (36-char hex, no escaping needed) and enum-name strings
-  filtered through device_*_name / scrub_state_name. Forward-note:
-  per-dataset metrics MUST sanitize dataset names OR key labels by
-  dataset_id (R99 P2-1 line-injection class extends to label-value-
-  injection in the exposition format). 14 -1e tests cover listing,
-  mode/world-readable, body content (HELP+TYPE comments, pool/
-  device labels, fs gauges, scrub-omitted-when-unattached, scrub-
-  present-when-attached), per-device records, mode-gate (OWRITE→
-  EACCES), Tstat, offset-resumption snapshot consistency, body
-  fits-under-cap, all 7 device states present. R110 audit pending.
-  OTLP exposition (binary protobuf) deferred — sidecar translator
-  is the simplest path. Per-dataset op counters + latency
-  histograms deferred until instrumentation hot-path work.
+  __attribute__((format(printf, 4, 5)))). Trust boundary (CLAUDE.md
+  clause 10): NO user-supplied strings flow into Prometheus labels
+  at v2.0 — only UUIDs (36-char hex, no escaping needed) and
+  enum-name strings filtered through device_*_name / scrub_state_
+  name. Forward-note: per-dataset metrics MUST sanitize dataset
+  names OR key labels by dataset_id (R99 P2-1 line-injection class
+  extends to label-value-injection in the exposition format). OTLP
+  exposition (binary protobuf) deferred — sidecar translator is the
+  simplest path. Per-dataset op counters + latency histograms
+  deferred until instrumentation hot-path work.
+
+- **Pre-tip-1**: P9-CTL-1e substantive (was tip pre-R110). 138/138
+  test_ctl. R110 audit caught 1 P2 + 7 P3 forward-notes, all
+  addressed in the close commit above.
 
 - **Pre-tip-1**: P8.5 cleanup-2 — family-wide RO tests + result=err:rc
   enrichment. 43 ctest suites green default. test_ctl

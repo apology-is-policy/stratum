@@ -431,10 +431,10 @@ static ctl_session *session_alloc_locked(stm_ctl *c, uint32_t fid,
             s->len = 0;
             s->uses_event_buf = 0;
             s->snapshot_len = 0;
-            /* P9-CTL-1e: bulk_buf carries over from the prior
-             * free (memset of the full struct). Defensive null —
-             * a future maintainer changing session_free_locked must
-             * not break this invariant. */
+            /* P9-CTL-1e (R110 P3-4 polish): after session_free_locked's
+             * memset, bulk_buf is already NULL on this slot. Setting it
+             * explicitly is belt-and-suspenders against a future change
+             * to session_free_locked that drops the memset. */
             s->bulk_buf = NULL;
             s->bulk_len = 0;
             memset(s->buf, 0, sizeof s->buf);
@@ -1306,12 +1306,18 @@ static stm_status materialize_debug_alloc(stm_ctl *c, ctl_session *s)
  * /metrics/prometheus exceeds 1 KiB once per-device + scrub data are
  * emitted (~30 KiB on a 64-device pool with all sections active).
  *
- * Lock posture: each subsystem accessor takes its own lock; we don't
- * hold any cross-subsystem lock concurrently. Pool roster snapshot
- * captured under stm_pool_lock_shared, scrub status under sc->lock,
- * fs stats under fs->lock — independently. Output is computed from
- * the snapshots after the locks are released, so format-time errors
- * don't pin contended state.
+ * Lock posture (R110 P3-5 + P3-8 polish): we don't hold MULTIPLE
+ * subsystem locks concurrently. c->mu is held by the caller throughout
+ * (vops_open's session-alloc loop); within that, the pool / fs / scrub
+ * accessors each take their own internal lock SERIALLY (one at a time,
+ * none nested). Pool roster snapshot via stm_pool_lock_shared
+ * (released before the format pass), fs stats via stm_fs_stats_get +
+ * stm_fs_dataset_count (each takes fs's internal lock briefly), scrub
+ * status via stm_scrub_status_get (takes scrub's internal mutex). The
+ * fs / scrub internal locks are not part of the public surface; the
+ * names below are descriptive only. Output is computed from the
+ * captured snapshots after every subsystem lock is released, so
+ * format-time errors don't pin contended state.
  *
  * Trust boundaries:
  *   - Body MUST NOT leak secret bytes: only counters, UUIDs (public
@@ -1351,9 +1357,12 @@ static stm_status prom_grow(uint8_t **buf, uint32_t *cap, uint32_t want)
     return STM_OK;
 }
 
-/* vsnprintf-then-grow append. *len is updated on success; on failure
- * the buffer state is unchanged from the caller's perspective (cap
- * may have grown but len is preserved). */
+/* vsnprintf-then-grow append. On any failure return *len is unchanged.
+ * *cap is also unchanged in every failure mode except the rare
+ * second-vsnprintf-truncation branch (STM_EIO when wrote != n) where
+ * prom_grow already grew but the second write didn't complete; the
+ * grown allocation is preserved on the caller's buf, so a subsequent
+ * call benefits. R110 P3-3 polish. */
 static stm_status prom_appendf(uint8_t **buf, uint32_t *cap, uint32_t *len,
                                 const char *fmt, ...)
     __attribute__((format(printf, 4, 5)));
@@ -1448,9 +1457,22 @@ static stm_status materialize_pool_metrics_prometheus(stm_ctl *c,
             return STM_EBACKEND;
         }
         stm_status drc = stm_fs_dataset_count(c->fs, &dataset_count);
-        if (drc != STM_OK) {
-            /* Same treatment: refuse the read on backend failure
-             * rather than emit partial metrics. */
+        if (drc == STM_EWEDGED) {
+            /* R110 P2-1: wedged-fs availability gap. stm_fs_dataset_count
+             * uses FS_GUARD_READ which refuses on wedged fs, but
+             * stm_fs_stats_get above is wedged-OK. The two adjacent
+             * accessors disagree on wedged-readability. Treat
+             * STM_EWEDGED specifically at this site so the rest of the
+             * body can render — operators MUST be able to see
+             * `stratum_pool_wedged{...} 1` in the wedged state, since
+             * the gauge is the whole point of having wedged in the
+             * exposition. dataset_count surfaces as 0; the wedged gauge
+             * tells the operator why. Same wedged-OK doctrine as
+             * /debug/allocator-state and /state. */
+            dataset_count = 0;
+        } else if (drc != STM_OK) {
+            /* Real backend failure (not wedged): refuse the read rather
+             * than emit partial metrics. */
             return STM_EBACKEND;
         }
     }
@@ -1534,6 +1556,22 @@ static stm_status materialize_pool_metrics_prometheus(stm_ctl *c,
       "stratum_pool_size_bytes_live{pool=\"%s\"} %llu\n",
       pool_uuid_s, (unsigned long long)sum.live_size_bytes);
 
+    /* R110 P3-2: pin per-state/class/role iteration bounds against the
+     * pool_summary array sizes (which themselves are pinned to the enum
+     * cardinality at lines 814-819). The literal `7` / `5` / `5` below
+     * MUST equal the array sizes; static_asserts trip at build time if
+     * an enum extension (e.g., adding STM_DEV_STATE_NEW past EVACUATING)
+     * raises the cardinality without the corresponding loop bump. The
+     * line-1539-bounds-vs-line-814-array static_asserts pin the loop
+     * vs the per_state[] / per_class[] / per_role[] iteration. */
+    _Static_assert(STM_DEV_STATE_EVACUATING + 1 == 7,
+                   "synfs.c metrics loop iterates per_state[] count; "
+                   "extending stm_device_state past EVACUATING requires "
+                   "bumping the loop literal in lockstep");
+    _Static_assert(STM_DEV_CLASS_ZNS + 1 == 5,
+                   "synfs.c metrics loop iterates per_class[] count");
+    _Static_assert(STM_DEV_ROLE_SPARE + 1 == 5,
+                   "synfs.c metrics loop iterates per_role[] count");
     P("# HELP stratum_pool_devices_by_state Per-state device counts.\n"
       "# TYPE stratum_pool_devices_by_state gauge\n");
     for (uint8_t st = 0; st < 7; st++) {

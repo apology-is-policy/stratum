@@ -5180,42 +5180,54 @@ STM_TEST(ctl_e1_metrics_prometheus_tstat_reports_world_readable_file)
     destroy_metrics_fixture(f);
 }
 
-/* Read at a non-zero offset returns the same byte slice as a full read
- * starting from offset 0 — verifies the per-fid snapshot invariant
- * (the bulk_buf is captured at Topen and remains stable across reads). */
+/* Read at a non-zero offset returns the same byte slice as the same
+ * fid's offset-0 read — verifies the per-fid snapshot invariant (the
+ * bulk_buf is captured at Topen and remains stable across reads against
+ * the same fid). R110 P3-6: restructured to use ONE Topen + two reads
+ * (originally compared two separate Topens which would silently break
+ * if any future field becomes monotonic between the two opens). */
 STM_TEST(ctl_e1_metrics_prometheus_offset_resumption_consistent)
 {
     metrics_fixture f = make_metrics_fixture("ctl_e1_offset", 1000);
 
-    /* First open: read the full body in one go (small chunks via the
-     * helper, but the bulk_buf is one snapshot). */
-    char body_full[16 * 1024];
-    uint32_t full_len = read_prometheus_body(&f, 2, 11, body_full,
-                                                sizeof body_full);
-    STM_ASSERT(full_len > 200);
-
-    /* Second open: read with a deliberate large offset and compare. */
     uint8_t req[RBUF], resp[RBUF];
     uint32_t rlen = 0;
     const char *path[] = { "pools", f.uuid_hex, "metrics", "prometheus" };
-    uint32_t sz = build_twalk(req, 6, 10, 12, 4, path);
+    uint32_t sz = build_twalk(req, 2, 10, 11, 4, path);
     STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
     STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
 
-    sz = build_topen(req, 7, 12, STM_P9_OREAD);
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
     STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
     STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
 
-    /* Read 64 bytes starting at offset 100. */
-    sz = build_tread(req, 8, 12, 100, 64);
+    /* First read: drain the full body via the SAME fid (single Topen
+     * snapshot). */
+    char body_full[16 * 1024];
+    uint32_t total = 0;
+    while (total < sizeof body_full - 1) {
+        sz = build_tread(req, 4, 11, total, (uint32_t)(sizeof body_full - 1 - total));
+        STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+        STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+        uint32_t got_chunk = load_u32(resp + 7);
+        if (got_chunk == 0) break;
+        memcpy(body_full + total, resp + 11, got_chunk);
+        total += got_chunk;
+    }
+    STM_ASSERT(total > 200);
+
+    /* Second read on the same fid: 64 bytes starting at offset 100.
+     * The bulk_buf snapshot was taken at Topen and stays stable
+     * across reads against the same fid — that's the invariant. */
+    sz = build_tread(req, 5, 11, 100, 64);
     STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
     STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
     uint32_t got = load_u32(resp + 7);
     STM_ASSERT(got == 64);
-    /* The bytes from a fresh-snapshot Topen at offset 100 should match
-     * body_full[100..164]. Both opens snapshot at Topen but the
-     * content is deterministic for a fresh, idle fs. */
     STM_ASSERT(memcmp(resp + 11, body_full + 100, 64) == 0);
+
+    sz = build_tclunk(req, 6, 11);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
 
     destroy_metrics_fixture(f);
 }
@@ -5250,6 +5262,105 @@ STM_TEST(ctl_e1_metrics_prometheus_devices_by_state_complete)
     STM_ASSERT(strstr(body, "state=\"faulted\"") != NULL);
     STM_ASSERT(strstr(body, "state=\"removed\"") != NULL);
     STM_ASSERT(strstr(body, "state=\"evacuating\"") != NULL);
+
+    destroy_metrics_fixture(f);
+}
+
+/* R110 P3-7 carry: pool-only attachment (no fs) renders the body
+ * without fs gauges + without scrub gauges. Validates the
+ * `if (have_fs)` branch's omit-fs-section path. */
+STM_TEST(ctl_e1_metrics_prometheus_pool_only_omits_fs_gauges)
+{
+    ctl_pool_fixture pf = make_test_pool();
+
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));   /* fs intentionally NULL */
+    STM_ASSERT_OK(stm_ctl_attach_pool(c, pf.pool));
+    STM_ASSERT_OK(stm_ctl_set_caller(c, 1000, 1000));
+
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    /* Walk + open + read /pools/<uuid>/metrics/prometheus. The fixture
+     * uses CTL_TEST_POOL_UUID_HEX as the pool UUID. */
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = {
+        "pools", CTL_TEST_POOL_UUID_HEX, "metrics", "prometheus"
+    };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 4, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+
+    sz = build_topen(req, 3, 11, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+
+    char body[16 * 1024];
+    uint32_t total = 0;
+    while (total < sizeof body - 1) {
+        sz = build_tread(req, 4, 11, total,
+                            (uint32_t)(sizeof body - 1 - total));
+        STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+        STM_ASSERT_EQ(resp[4], STM_P9_RREAD);
+        uint32_t got_chunk = load_u32(resp + 7);
+        if (got_chunk == 0) break;
+        memcpy(body + total, resp + 11, got_chunk);
+        total += got_chunk;
+    }
+    body[total] = '\0';
+    STM_ASSERT(total > 0);
+
+    /* Pool roster gauges present. */
+    STM_ASSERT(strstr(body, "stratum_pool_devices_total{") != NULL);
+    STM_ASSERT(strstr(body, "stratum_device_size_bytes{") != NULL);
+
+    /* fs gauges absent (no fs attached). */
+    STM_ASSERT(strstr(body, "stratum_pool_data_total_blocks{") == NULL);
+    STM_ASSERT(strstr(body, "stratum_pool_current_gen{") == NULL);
+    STM_ASSERT(strstr(body, "stratum_pool_datasets_total{") == NULL);
+    STM_ASSERT(strstr(body, "stratum_pool_wedged{") == NULL);
+
+    /* scrub gauges absent (no scrub attached). */
+    STM_ASSERT(strstr(body, "stratum_scrub_state") == NULL);
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+    destroy_test_pool(pf);
+}
+
+/* R110 P2-1 regression: wedged fs MUST still render /metrics/prometheus
+ * — the entire point of `stratum_pool_wedged{...} 1` is to surface the
+ * wedged state to monitoring. Pre-fix, stm_fs_dataset_count returned
+ * STM_EWEDGED via FS_GUARD_READ and the materializer denied with
+ * STM_EBACKEND. Post-fix, dataset_count surfaces as 0 on wedge and the
+ * body emits with the wedged gauge set. */
+STM_TEST(ctl_e1_metrics_prometheus_wedged_emits_wedged_gauge)
+{
+    metrics_fixture f = make_metrics_fixture("ctl_e1_wedged", 1000);
+
+    stm_fs_mark_wedged(f.fs);
+
+    char body[16 * 1024];
+    uint32_t got = read_prometheus_body(&f, 2, 11, body, sizeof body);
+    STM_ASSERT(got > 0);
+
+    /* The wedged gauge MUST be visible at value=1. */
+    char want[256];
+    snprintf(want, sizeof want,
+             "stratum_pool_wedged{pool=\"%s\"} 1\n", f.uuid_hex);
+    STM_ASSERT(strstr(body, want) != NULL);
+
+    /* Datasets-total surfaces as 0 on wedged fs (the FS_GUARD_READ
+     * branch returns STM_EWEDGED; the materializer treats it as
+     * 0-with-no-error per the wedged-OK doctrine). */
+    snprintf(want, sizeof want,
+             "stratum_pool_datasets_total{pool=\"%s\"} 0\n", f.uuid_hex);
+    STM_ASSERT(strstr(body, want) != NULL);
+
+    /* Pool roster + per-device records also still present (pool layer
+     * is independent of fs->wedged state). */
+    STM_ASSERT(strstr(body, "stratum_device_size_bytes{") != NULL);
 
     destroy_metrics_fixture(f);
 }
