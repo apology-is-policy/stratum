@@ -22,6 +22,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -417,7 +418,7 @@ stm_status stm_stratumd_serve_ctl_client(int fd, stm_ctl *ctl,
      * itself clamps; we mirror so the per-conn buffer is sized to
      * hold any negotiable message. */
     if (msize_max < STM_LP9_MSIZE_MIN) msize_max = STM_LP9_MSIZE_MIN;
-    if (msize_max > (16u << 20)) msize_max = (16u << 20);
+    if (msize_max > STM_LP9_MSIZE_MAX) msize_max = STM_LP9_MSIZE_MAX;
 
     /* Idle timeout discipline mirrors stm_stratumd_serve_client
      * (R95 P2-1 carry). */
@@ -686,7 +687,32 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
         wctx.allow_unauthenticated_peer = opts->allow_unauthenticated_peer;
         wctx.stop_flag                  = opts->stop_flag;
         wctx.rc                         = STM_OK;
+        /* R113 P1-1: block SIGINT/SIGTERM/SIGHUP/SIGQUIT in the
+         * /ctl/ worker thread BEFORE pthread_create, then restore the
+         * calling thread's mask AFTER. POSIX delivers process-directed
+         * signals to ANY single thread that has the signal unmasked;
+         * without this, SIGINT/SIGTERM can land on the worker — its
+         * accept() returns EINTR + observes stop_flag + worker exits
+         * — but the FS accept_loop on the calling thread is NOT
+         * interrupted, so it blocks forever and run() never reaches
+         * the join + cleanup path. Net effect: ~50% of signal-driven
+         * shutdowns deadlock the daemon. The fix is to pin signals to
+         * the calling thread by masking them on the worker.
+         *
+         * The worker observes shutdown via the explicit
+         * shutdown(ctl_fd) issued from run() AFTER the FS loop
+         * returns — that surfaces as EBADF/EINVAL on accept, the
+         * stop_flag check fires (or shutdown alone is sufficient),
+         * and accept_ctl_loop returns cleanly. */
+        sigset_t worker_block, prev_mask;
+        sigemptyset(&worker_block);
+        sigaddset(&worker_block, SIGINT);
+        sigaddset(&worker_block, SIGTERM);
+        sigaddset(&worker_block, SIGHUP);
+        sigaddset(&worker_block, SIGQUIT);
+        (void)pthread_sigmask(SIG_BLOCK, &worker_block, &prev_mask);
         int prc = pthread_create(&ctl_tid, NULL, ctl_worker_main, &wctx);
+        (void)pthread_sigmask(SIG_SETMASK, &prev_mask, NULL);
         if (prc != 0) {
             fprintf(stderr,
                 "stratumd: pthread_create for /ctl/ failed (rc=%d)\n", prc);

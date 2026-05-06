@@ -157,6 +157,10 @@ enum {
 #define STM_LP9_NOFID          ((uint32_t)0xFFFFFFFF)
 #define STM_LP9_MSIZE_DEFAULT  (1u << 16)   /* 64 KiB */
 #define STM_LP9_MSIZE_MIN      1024u
+#define STM_LP9_MSIZE_MAX      (16u << 20)   /* 16 MiB; matches lp9
+                                             * server's clamp + the
+                                             * stratumd serve_ctl_client
+                                             * upper bound */
 #define STM_LP9_MAX_WALK       16u
 #define STM_LP9_NAME_MAX       255u    /* matches Linux NAME_MAX */
 

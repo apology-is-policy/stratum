@@ -85,31 +85,40 @@ typedef struct {
     pthread_t      worker;
 } ctl_socket_fixture;
 
-static ctl_socket_fixture make_ctl_fixture(const char *tag, uid_t admin_uid)
+/* R113 P3-2: take a caller-provided fixture by pointer rather than
+ * returning by value. Returning a struct with an embedded ctx that
+ * the worker thread holds &amp;ctx into is formally use-after-return UB
+ * (the callee's stack frame is gone by the time the caller uses
+ * &amp;original.ctx). x86_64 SysV ABI's sret hidden-pointer convention
+ * happens to make caller and callee share storage for &gt;16-byte
+ * structs, which is why ASan was clean — but that's an ABI accident.
+ * Pointer-in pattern matches tests/test_9p_socket.c. */
+static void setup_ctl_fixture(ctl_socket_fixture *f,
+                                const char *tag, uid_t admin_uid)
 {
-    ctl_socket_fixture f = {0};
+    memset(f, 0, sizeof *f);
     make_tmp(tag);
     build_sock_path(tag);
 
     stm_fs_format_opts fopts = default_format_opts();
     STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
     stm_fs_mount_opts mopts = rw_mount_opts();
-    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &f.fs));
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &f->fs));
 
-    STM_ASSERT_OK(stm_ctl_create(f.fs, &f.ctl));
+    STM_ASSERT_OK(stm_ctl_create(f->fs, &f->ctl));
     if (admin_uid != (uid_t)-1) {
-        STM_ASSERT_OK(stm_ctl_set_admin_uid(f.ctl, admin_uid));
+        STM_ASSERT_OK(stm_ctl_set_admin_uid(f->ctl, admin_uid));
     }
 
-    f.listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600);
-    STM_ASSERT_TRUE(f.listen_fd >= 0);
+    f->listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600);
+    STM_ASSERT_TRUE(f->listen_fd >= 0);
 
-    f.ctx.listen_fd  = f.listen_fd;
-    f.ctx.ctl        = f.ctl;
-    f.ctx.run_status = STM_EBACKEND;
-    atomic_init(&f.ctx.stop_flag, false);
-    STM_ASSERT_EQ(pthread_create(&f.worker, NULL, ctl_accept_thread, &f.ctx), 0);
-    return f;
+    f->ctx.listen_fd  = f->listen_fd;
+    f->ctx.ctl        = f->ctl;
+    f->ctx.run_status = STM_EBACKEND;
+    atomic_init(&f->ctx.stop_flag, false);
+    STM_ASSERT_EQ(pthread_create(&f->worker, NULL,
+                                    ctl_accept_thread, &f->ctx), 0);
 }
 
 static void destroy_ctl_fixture(ctl_socket_fixture *f)
@@ -174,7 +183,8 @@ static stm_status collect_dirent(const stm_9p_qid *qid,
 /* Dial + Tattach happy path. /ctl/ root is mode 0555, world-readable. */
 STM_TEST(stratumd_ctl_dial_attach_ok)
 {
-    ctl_socket_fixture f = make_ctl_fixture("dial_attach", (uid_t)-1);
+    ctl_socket_fixture f;
+    setup_ctl_fixture(&f,"dial_attach", (uid_t)-1);
 
     stm_9p_client *c = NULL;
     stm_9p_dial_opts opts = default_dial_opts(/*root_fid=*/100u);
@@ -189,7 +199,8 @@ STM_TEST(stratumd_ctl_dial_attach_ok)
  * "stratum-version: ..." line. */
 STM_TEST(stratumd_ctl_read_version)
 {
-    ctl_socket_fixture f = make_ctl_fixture("read_version", (uid_t)-1);
+    ctl_socket_fixture f;
+    setup_ctl_fixture(&f,"read_version", (uid_t)-1);
 
     stm_9p_client *c = NULL;
     stm_9p_dial_opts opts = default_dial_opts(/*root_fid=*/100u);
@@ -223,7 +234,8 @@ STM_TEST(stratumd_ctl_read_version)
 /* /events is world-readable mode 0444. */
 STM_TEST(stratumd_ctl_events_getattr_mode)
 {
-    ctl_socket_fixture f = make_ctl_fixture("events_getattr", (uid_t)-1);
+    ctl_socket_fixture f;
+    setup_ctl_fixture(&f,"events_getattr", (uid_t)-1);
 
     stm_9p_client *c = NULL;
     stm_9p_dial_opts opts = default_dial_opts(100u);
@@ -257,7 +269,8 @@ STM_TEST(stratumd_ctl_admin_gate_nonadmin_blocked)
     if (geteuid() == 0u) {
         return;
     }
-    ctl_socket_fixture f = make_ctl_fixture("admin_block", (uid_t)-1);
+    ctl_socket_fixture f;
+    setup_ctl_fixture(&f,"admin_block", (uid_t)-1);
 
     stm_9p_client *c = NULL;
     stm_9p_dial_opts opts = default_dial_opts(100u);
@@ -281,7 +294,8 @@ STM_TEST(stratumd_ctl_admin_gate_nonadmin_blocked)
  * succeeds; read returns the peer's uid line. */
 STM_TEST(stratumd_ctl_admin_gate_admin_allowed)
 {
-    ctl_socket_fixture f = make_ctl_fixture("admin_allow",
+    ctl_socket_fixture f;
+    setup_ctl_fixture(&f,"admin_allow",
                                               (uid_t)geteuid());
 
     stm_9p_client *c = NULL;
@@ -316,7 +330,8 @@ STM_TEST(stratumd_ctl_admin_gate_admin_allowed)
  * (R101 P1-1 / CLAUDE.md /ctl/ trigger row clause 7). */
 STM_TEST(stratumd_ctl_session_drain_between_connections)
 {
-    ctl_socket_fixture f = make_ctl_fixture("drain", (uid_t)-1);
+    ctl_socket_fixture f;
+    setup_ctl_fixture(&f,"drain", (uid_t)-1);
 
     /* Connection 1: walk + lopen /version under fid=101. */
     {
@@ -365,7 +380,8 @@ STM_TEST(stratumd_ctl_session_drain_between_connections)
  * directory should list dataset id 1. */
 STM_TEST(stratumd_ctl_datasets_readdir_lists_id1)
 {
-    ctl_socket_fixture f = make_ctl_fixture("ds_list", (uid_t)-1);
+    ctl_socket_fixture f;
+    setup_ctl_fixture(&f,"ds_list", (uid_t)-1);
 
     uint64_t root_ino = 0;
     STM_ASSERT_OK(stm_fs_init_dataset_root(f.fs, /*ds=*/1u, /*mode=*/0755u,
@@ -407,7 +423,8 @@ STM_TEST(stratumd_ctl_datasets_readdir_lists_id1)
  * chunk). */
 STM_TEST(stratumd_ctl_pools_readdir_empty)
 {
-    ctl_socket_fixture f = make_ctl_fixture("pools_empty", (uid_t)-1);
+    ctl_socket_fixture f;
+    setup_ctl_fixture(&f,"pools_empty", (uid_t)-1);
 
     stm_9p_client *c = NULL;
     stm_9p_dial_opts opts = default_dial_opts(100u);
