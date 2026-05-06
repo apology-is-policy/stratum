@@ -339,7 +339,29 @@ impl P9Client {
     /// v1 9P2000's bulk Tread on a dir — acceptable for panels with
     /// less than a few hundred entries. v1.1 forward-note: bulk-stat
     /// extension.
+    ///
+    /// v2 .L semantic-difference vs v1 9P2000: Treaddir requires the
+    /// fid have its `is_open` flag set (server-side check; any
+    /// successful Tlopen suffices, regardless of mode flags). v1
+    /// callers don't open the dir-fid before readdir (lax 9P2000
+    /// server), so the shim does it implicitly. Equivalent to v1's
+    /// internal `self.open(fid, OREAD)` at the top of its readdir
+    /// (see legacy tui/src/p9.rs:346).
     pub fn readdir(&mut self, fid: u32) -> Result<Vec<Stat>> {
+        let mut qid_open: ffi::stm_9p_qid = unsafe { std::mem::zeroed() };
+        let rc_open = unsafe {
+            ffi::stm_9p_lopen(
+                self.raw,
+                fid,
+                /*flags=*/OREAD as u32,
+                &mut qid_open,
+                std::ptr::null_mut(),
+            )
+        };
+        if rc_open != ffi::STM_OK {
+            bail!("readdir lopen: stm_status {rc_open}");
+        }
+
         // Phase 1: collect names via stm_9p_readdir.
         let mut entries: Vec<DirentRaw> = Vec::new();
         extern "C" fn cb(

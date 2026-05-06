@@ -17,14 +17,22 @@ use std::os::raw::{c_char, c_int};
 
 pub type stm_status = c_int;
 
+// Status codes — values mirror v2 include/stratum/types.h. Don't
+// mis-guess these; even an off-by-one breaks err mapping silently.
 pub const STM_OK: stm_status = 0;
-pub const STM_EINVAL: stm_status = -1;
-pub const STM_EIO: stm_status = -3;
-pub const STM_ENOENT: stm_status = -5;
-pub const STM_EACCES: stm_status = -6;
-pub const STM_EEXIST: stm_status = -7;
-pub const STM_EROFS: stm_status = -10;
-pub const STM_EBACKEND: stm_status = -16;
+pub const STM_EINVAL: stm_status = -22;
+pub const STM_ENOMEM: stm_status = -12;
+pub const STM_EIO: stm_status = -5;
+pub const STM_ENOENT: stm_status = -2;
+pub const STM_EEXIST: stm_status = -17;
+pub const STM_EACCES: stm_status = -13;
+pub const STM_EBUSY: stm_status = -16;
+pub const STM_EROFS: stm_status = -30;
+pub const STM_EXDEV: stm_status = -18;
+pub const STM_ENOTDIR: stm_status = -20;
+pub const STM_EWEDGED: stm_status = -204;
+pub const STM_ENOTSUPPORTED: stm_status = -205;
+pub const STM_EBACKEND: stm_status = -207;
 
 /// 9P qid type bits.
 pub const STM_9P_QTDIR: u8 = 0x80;
