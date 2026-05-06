@@ -4461,8 +4461,8 @@ STM_TEST(ctl_r107_scrub_trigger_post_admin_refusals_log)
     /* Both should appear in /events. */
     char ebody[8192];
     read_events_log(&f, 6, 12, ebody, sizeof ebody);
-    STM_ASSERT(strstr(ebody, "scrub-trigger uid=0 verb=<zero-byte> result=einval") != NULL);
-    STM_ASSERT(strstr(ebody, "scrub-trigger uid=0 verb=<whitespace-only> result=einval") != NULL);
+    STM_ASSERT(strstr(ebody, "scrub-trigger uid=0 verb=<zero-byte> result=err:einval") != NULL);
+    STM_ASSERT(strstr(ebody, "scrub-trigger uid=0 verb=<whitespace-only> result=err:einval") != NULL);
 
     destroy_scrub_trigger_fixture(f);
 }
@@ -4709,6 +4709,122 @@ STM_TEST(ctl_r108_p2_1_hold_persists_across_remount)
     /* Release + delete succeeds. */
     STM_ASSERT_OK(stm_fs_release_snapshot(fs, snap_id));
     STM_ASSERT_OK(stm_fs_delete_snapshot(fs, snap_id, NULL));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
+/* ── P8.5 cleanup-2: result=err:<rc> + RO mount tests ──────────── */
+
+/* R108 P3-5 close: enriched audit log distinguishes refusal codes.
+ * Delete-snapshot of a held snap → STM_EBUSY → "result=err:ebusy"
+ * (was "result=err" pre-fix). Pins the enriched format for the
+ * forensic-trail discriminator. */
+STM_TEST(ctl_r109_p3_5_delete_held_snap_logs_ebusy)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_r109_ebusy", 0);
+    uint64_t snap_id = setup_snapshot(f.fs, 1, "held");
+    STM_ASSERT_OK(stm_fs_hold_snapshot(f.fs, snap_id));
+
+    /* Delete via /ctl/ trigger → wire RERROR. */
+    open_delete_snapshot(&f, /*dataset_id=*/1, 2, 11);
+    char body[32];
+    int n = snprintf(body, sizeof body, "%llu",
+                      (unsigned long long)snap_id);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    uint32_t sz = build_twrite(req, 4, 11, 0, body, (uint32_t)n);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* Audit log records "result=err:ebusy" — operator can grep
+     * for the specific status code rather than "err" generically. */
+    char ebody[8192];
+    read_events_log(&f, 5, 12, ebody, sizeof ebody);
+    char want[128];
+    snprintf(want, sizeof want,
+        "delete-snapshot uid=0 dataset=1 snap-id=%llu freed-paddrs=0 result=err:ebusy",
+        (unsigned long long)snap_id);
+    STM_ASSERT(strstr(ebody, want) != NULL);
+
+    /* Release + delete succeeds — audit log records "result=ok". */
+    STM_ASSERT_OK(stm_fs_release_snapshot(f.fs, snap_id));
+    STM_ASSERT_OK(stm_fs_delete_snapshot(f.fs, snap_id, NULL));
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* R109 P3-5 close: hold of nonexistent snap → STM_ENOENT →
+ * "result=err:enoent" via /ctl/. */
+STM_TEST(ctl_r109_p3_5_hold_nonexistent_logs_enoent)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_r109_enoent", 0);
+    open_hold_release(&f, "hold-snapshot", 1, 2, 11);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    uint32_t sz = build_twrite(req, 4, 11, 0, "99999", 5);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    char ebody[8192];
+    read_events_log(&f, 5, 12, ebody, sizeof ebody);
+    STM_ASSERT(strstr(ebody, "hold-snapshot uid=0 dataset=1 snap-id=99999 result=err:enoent") != NULL);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* R108 P3-2 close: RO-mount gate for stm_fs_hold_snapshot.
+ * Mirror of R105 P3-4 / R106 P3-4. */
+STM_TEST(ctl_r109_p3_2_hold_readonly_erofs)
+{
+    make_tmp("ctl_r109_ro_hold");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    /* Create a snap in RW mode first so RO test has a target. */
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs_rw = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs_rw));
+    uint64_t snap_id = setup_snapshot(fs_rw, 1, "ro_hold_target");
+    STM_ASSERT_OK(stm_fs_commit(fs_rw));
+    STM_ASSERT_OK(stm_fs_unmount(fs_rw));
+
+    stm_fs_mount_opts ro = rw_mount_opts();
+    ro.read_only = true;
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &ro, &fs));
+
+    STM_ASSERT_EQ(stm_fs_hold_snapshot(fs, snap_id), STM_EROFS);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
+/* R108 P3-2 close: RO-mount gate for stm_fs_release_snapshot. */
+STM_TEST(ctl_r109_p3_2_release_readonly_erofs)
+{
+    make_tmp("ctl_r109_ro_release");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    /* Create + hold in RW so post-RO release has something to try. */
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs_rw = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs_rw));
+    uint64_t snap_id = setup_snapshot(fs_rw, 1, "ro_release_target");
+    STM_ASSERT_OK(stm_fs_hold_snapshot(fs_rw, snap_id));
+    STM_ASSERT_OK(stm_fs_commit(fs_rw));
+    STM_ASSERT_OK(stm_fs_unmount(fs_rw));
+
+    stm_fs_mount_opts ro = rw_mount_opts();
+    ro.read_only = true;
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &ro, &fs));
+
+    /* Release of a held snap on RO mount: refused with STM_EROFS
+     * (FS_GUARD_WRITE fires before the release primitive). The hold
+     * persists — any future RW remount can release. */
+    STM_ASSERT_EQ(stm_fs_release_snapshot(fs, snap_id), STM_EROFS);
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }

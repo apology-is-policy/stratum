@@ -641,6 +641,38 @@ static const char *device_state_name(stm_device_state state)
     return "unknown";
 }
 
+/* P8.5 cleanup-2 (R108 P3-5 carry): map common stm_status refusal
+ * codes to short tokens for /events audit-log forensic specificity.
+ * Operators reading /events can grep for `result=err:einval` /
+ * `result=err:ebusy` / etc. to triage failures without consulting
+ * stm_status.h.
+ *
+ * STM_OK returns "ok" so the format `result=%s%s` with conditional
+ * "err:" prefix renders cleanly: success → `result=ok`, failure →
+ * `result=err:<code>`. Default "err" fallback for codes outside the
+ * common refusal class (defense-in-depth — avoids silent
+ * "err:" with empty suffix). */
+static const char *status_short_name(stm_status s)
+{
+    switch (s) {
+    case STM_OK:        return "ok";
+    case STM_EINVAL:    return "einval";
+    case STM_ENOENT:    return "enoent";
+    case STM_EBUSY:     return "ebusy";
+    case STM_EROFS:     return "erofs";
+    case STM_EWEDGED:   return "ewedged";
+    case STM_EOVERFLOW: return "eoverflow";
+    case STM_EEXIST:    return "eexist";
+    case STM_ECORRUPT:  return "ecorrupt";
+    case STM_EBACKEND:  return "ebackend";
+    case STM_EIO:       return "eio";
+    case STM_EACCES:    return "eaccess";
+    case STM_ERANGE:    return "erange";
+    case STM_ENOMEM:    return "enomem";
+    default:            return "err";
+    }
+}
+
 /* R98 P3-4 lesson: trailing "unknown" return is LOAD-BEARING. While
  * stm_scrub_state values today are produced exclusively by scrub.c
  * under sc->lock (no on-disk parsing path that would skip range-check
@@ -2132,7 +2164,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
          * R105 P3-1 doctrine. */
         if (len == 0) {
             stm_ctl_log_event(c,
-                "scrub-trigger uid=%u verb=<zero-byte> result=einval",
+                "scrub-trigger uid=%u verb=<zero-byte> result=err:einval",
                 (unsigned)c->caller_uid);
             return STM_EINVAL;
         }
@@ -2172,7 +2204,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         if (end == 0) {
             /* whitespace-only body — R107 P8.5 carry: log per doctrine */
             stm_ctl_log_event(c,
-                "scrub-trigger uid=%u verb=<whitespace-only> result=einval",
+                "scrub-trigger uid=%u verb=<whitespace-only> result=err:einval",
                 (unsigned)c->caller_uid);
             return STM_EINVAL;
         }
@@ -2210,15 +2242,16 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         }
         if (!verb_op) {
             /* Unknown verb. Log + refuse. */
-            stm_ctl_log_event(c, "scrub-trigger uid=%u verb=<unknown> result=einval",
+            stm_ctl_log_event(c, "scrub-trigger uid=%u verb=<unknown> result=err:einval",
                                 (unsigned)c->caller_uid);
             return STM_EINVAL;
         }
 
         stm_status rc = verb_op(c->scrub);
-        stm_ctl_log_event(c, "scrub-trigger uid=%u verb=%s result=%s",
+        stm_ctl_log_event(c, "scrub-trigger uid=%u verb=%s result=%s%s",
                             (unsigned)c->caller_uid, verb_str,
-                            rc == STM_OK ? "ok" : "err");
+                            rc == STM_OK ? "" : "err:",
+                            status_short_name(rc));
         if (rc != STM_OK) return rc;
         *out_written = len;
         return STM_OK;
@@ -2266,7 +2299,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
          * post-admin. */
         if (len == 0) {
             stm_ctl_log_event(c,
-                "create-snapshot uid=%u dataset=%llu name-len=0 result=err",
+                "create-snapshot uid=%u dataset=%llu name-len=0 result=err:einval",
                 (unsigned)c->caller_uid, (unsigned long long)dsid);
             return STM_EINVAL;
         }
@@ -2282,7 +2315,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         if (end == 0) {
             /* whitespace-only body */
             stm_ctl_log_event(c,
-                "create-snapshot uid=%u dataset=%llu name-len=0 result=err",
+                "create-snapshot uid=%u dataset=%llu name-len=0 result=err:einval",
                 (unsigned)c->caller_uid, (unsigned long long)dsid);
             return STM_EINVAL;
         }
@@ -2293,7 +2326,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
          * (defense-in-depth). */
         if (end > STM_SNAP_NAME_MAX) {
             stm_ctl_log_event(c,
-                "create-snapshot uid=%u dataset=%llu name-len=%zu result=err",
+                "create-snapshot uid=%u dataset=%llu name-len=%zu result=err:einval",
                 (unsigned)c->caller_uid, (unsigned long long)dsid, end);
             return STM_EINVAL;
         }
@@ -2303,11 +2336,12 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
                                                   (const char *)buf, end,
                                                   &snap_id);
         stm_ctl_log_event(c,
-            "create-snapshot uid=%u dataset=%llu name-len=%zu result=%s snap-id=%llu",
+            "create-snapshot uid=%u dataset=%llu name-len=%zu result=%s%s snap-id=%llu",
             (unsigned)c->caller_uid,
             (unsigned long long)dsid,
             end,
-            rc == STM_OK ? "ok" : "err",
+            rc == STM_OK ? "" : "err:",
+            status_short_name(rc),
             (unsigned long long)snap_id);
         if (rc != STM_OK) return rc;
         *out_written = len;
@@ -2339,7 +2373,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
 
         if (len == 0) {
             stm_ctl_log_event(c,
-                "delete-snapshot uid=%u dataset=%llu snap-id=0 result=err",
+                "delete-snapshot uid=%u dataset=%llu snap-id=0 result=err:einval",
                 (unsigned)c->caller_uid, (unsigned long long)dsid);
             return STM_EINVAL;
         }
@@ -2354,7 +2388,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         }
         if (end == 0) {
             stm_ctl_log_event(c,
-                "delete-snapshot uid=%u dataset=%llu snap-id=0 result=err",
+                "delete-snapshot uid=%u dataset=%llu snap-id=0 result=err:einval",
                 (unsigned)c->caller_uid, (unsigned long long)dsid);
             return STM_EINVAL;
         }
@@ -2362,7 +2396,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         uint64_t snap_id = 0;
         if (parse_snapshot_id((const char *)buf, end, &snap_id) != 0) {
             stm_ctl_log_event(c,
-                "delete-snapshot uid=%u dataset=%llu snap-id=<bad-parse> result=err",
+                "delete-snapshot uid=%u dataset=%llu snap-id=<bad-parse> result=err:einval",
                 (unsigned)c->caller_uid, (unsigned long long)dsid);
             return STM_EINVAL;
         }
@@ -2370,12 +2404,13 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         size_t freed = 0;
         stm_status rc = stm_fs_delete_snapshot(c->fs, snap_id, &freed);
         stm_ctl_log_event(c,
-            "delete-snapshot uid=%u dataset=%llu snap-id=%llu freed-paddrs=%zu result=%s",
+            "delete-snapshot uid=%u dataset=%llu snap-id=%llu freed-paddrs=%zu result=%s%s",
             (unsigned)c->caller_uid,
             (unsigned long long)dsid,
             (unsigned long long)snap_id,
             freed,
-            rc == STM_OK ? "ok" : "err");
+            rc == STM_OK ? "" : "err:",
+            status_short_name(rc));
         if (rc != STM_OK) return rc;
         *out_written = len;
         return STM_OK;
@@ -2414,7 +2449,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
 
         if (len == 0) {
             stm_ctl_log_event(c,
-                "%s uid=%u dataset=%llu snap-id=0 result=err",
+                "%s uid=%u dataset=%llu snap-id=0 result=err:einval",
                 verb, (unsigned)c->caller_uid,
                 (unsigned long long)dsid);
             return STM_EINVAL;
@@ -2429,7 +2464,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         }
         if (end == 0) {
             stm_ctl_log_event(c,
-                "%s uid=%u dataset=%llu snap-id=0 result=err",
+                "%s uid=%u dataset=%llu snap-id=0 result=err:einval",
                 verb, (unsigned)c->caller_uid,
                 (unsigned long long)dsid);
             return STM_EINVAL;
@@ -2438,7 +2473,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         uint64_t snap_id = 0;
         if (parse_snapshot_id((const char *)buf, end, &snap_id) != 0) {
             stm_ctl_log_event(c,
-                "%s uid=%u dataset=%llu snap-id=<bad-parse> result=err",
+                "%s uid=%u dataset=%llu snap-id=<bad-parse> result=err:einval",
                 verb, (unsigned)c->caller_uid,
                 (unsigned long long)dsid);
             return STM_EINVAL;
@@ -2450,11 +2485,12 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         else
             rc = stm_fs_release_snapshot(c->fs, snap_id);
         stm_ctl_log_event(c,
-            "%s uid=%u dataset=%llu snap-id=%llu result=%s",
+            "%s uid=%u dataset=%llu snap-id=%llu result=%s%s",
             verb, (unsigned)c->caller_uid,
             (unsigned long long)dsid,
             (unsigned long long)snap_id,
-            rc == STM_OK ? "ok" : "err");
+            rc == STM_OK ? "" : "err:",
+            status_short_name(rc));
         if (rc != STM_OK) return rc;
         *out_written = len;
         return STM_OK;

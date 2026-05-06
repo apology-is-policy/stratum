@@ -38,8 +38,32 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9-CTL-1d-actions-snapshot-hold R108 close (this
-  commit) — YELLOW MERGE, 0 P0 + 0 P1 + 1 P2 + 5 P3. 43 ctest
+- **Tip**: P8.5 cleanup-2 — family-wide RO tests + result=err:rc
+  enrichment (this commit). 43 ctest suites green default. test_ctl
+  124/124 (was 120 at R108 close; +4 R109 cleanup tests). **R109
+  audit-light close** (isomorphic to R107 — direct doctrine carry,
+  no separate prosecutor). Closes R108 P3-2 + P3-5 forward-notes:
+  (P3-2) added RO-mount tests for hold + release wrappers — both
+  refuse with STM_EROFS via FS_GUARD_WRITE; (P3-5) audit log
+  format enriched from `result=err` to `result=err:<code>` where
+  code is one of the common refusal-class short names (einval,
+  enoent, ebusy, erofs, ewedged, eoverflow, eexist, ecorrupt,
+  ebackend, eio, eaccess, erange, enomem; default "err"). New
+  static helper status_short_name(stm_status). The 5 dispatch log
+  lines (scrub-trigger / create-snapshot / delete-snapshot / hold-
+  snapshot / release-snapshot) all use the helper uniformly. Pre-
+  validation refusal lines (zero-byte, whitespace-only, bad-parse,
+  unknown-verb) updated to use the new format. Existing strstr
+  tests against "result=err" still match (substring of "result=
+  err:einval"); existing tests against the older literal
+  "result=einval" updated to "result=err:einval". 2 R109 P3-5
+  forensic-trail regression tests pin the enriched format end-to-
+  end (delete-of-held → result=err:ebusy; hold-of-nonexistent →
+  result=err:enoent). 2 R109 P3-2 RO-mount regression tests for
+  hold + release.
+
+- **Pre-tip-1**: P9-CTL-1d-actions-snapshot-hold R108 close —
+  YELLOW MERGE, 0 P0 + 0 P1 + 1 P2 + 5 P3. 43 ctest
   suites green default. test_ctl 120/120 (was 112 at R107 close;
   +7 -1d-actions-snapshot-hold + 1 R108 P2-1 regression test).
   R108 close: P2-1 was a load-bearing doc-vs-code drift — the
