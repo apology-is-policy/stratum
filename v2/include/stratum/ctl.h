@@ -127,7 +127,7 @@ stm_status stm_ctl_create(struct stm_fs *fs, stm_ctl **out);
  * that uses this stm_ctl as `ctx`. The internal pool pointer is
  * not protected by the instance mutex on the vops read paths —
  * concurrent attach + vops dispatch is a C11 data race on
- * `c->pool`. The serial-server posture (one stm_p9_server at a
+ * `c->pool`. The serial-server posture (one stm_lp9_server at a
  * time, drained between accept iterations) makes this trivially
  * safe in practice; future concurrent-accept transports MUST
  * either complete attach before serving or extend the locking

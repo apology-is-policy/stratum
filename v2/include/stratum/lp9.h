@@ -39,6 +39,21 @@
  *      server clamps to msize-derived iounit; backend's `read` /
  *      `write` callbacks see already-clamped counts, never raw
  *      wire input.
+ *
+ * Partial-walk semantics (R112 P3-2 forward-note):
+ *   On a Twalk request that resolves SOME but not ALL components,
+ *   stm_lp9_server returns Rwalk with the resolved-prefix qids but
+ *   does NOT bind newfid (server.c:407 `if (walked == nname)` guard).
+ *   The .L spec arguably says newfid should be bound to the deepest
+ *   resolved qid; Stratum's lp9 deviates intentionally so that
+ *   a non-admin client cannot land newfid on a child of /admin/
+ *   or /debug/ via partial-walk through the dir's R100 P2-1 gate.
+ *   Real-world Linux v9fs clients tolerate this (they re-walk
+ *   if the next op fails). Forward-note: if a future consumer
+ *   needs spec-conformant partial-walk binding, the gate must
+ *   move into the backend (vops_walk would refuse to return a qid
+ *   for a child it doesn't want exposed) so the protocol-level
+ *   binding stays correct.
  */
 #ifndef STRATUM_V2_LP9_H
 #define STRATUM_V2_LP9_H
