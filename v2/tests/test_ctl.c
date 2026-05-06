@@ -3952,4 +3952,101 @@ STM_TEST(ctl_d6_create_snapshot_duplicate_name_eexists)
     destroy_scrub_trigger_fixture(f);
 }
 
+/* R105 P3-4 close: read-only fs refuses create-snapshot via
+ * FS_GUARD_WRITE → STM_EROFS → wire RERROR. Pins the runtime-gate
+ * contract through /ctl/. */
+STM_TEST(ctl_r105_p3_4_create_snapshot_readonly_erofs)
+{
+    /* Format + write something + unmount, then re-mount RO. */
+    make_tmp("ctl_r105_ro");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs_rw = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs_rw));
+    STM_ASSERT_OK(stm_fs_unmount(fs_rw));
+
+    stm_fs_mount_opts ro = rw_mount_opts();
+    ro.read_only = true;
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &ro, &fs));
+
+    /* Direct wrapper test — RO refuses with STM_EROFS. */
+    uint64_t snap_id = 0;
+    STM_ASSERT_EQ(stm_fs_create_snapshot(fs, 1, "ro_snap", 7, &snap_id),
+                  STM_EROFS);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
+/* R105 P3-4 close: wedged fs refuses create-snapshot via
+ * FS_GUARD_WRITE → STM_EWEDGED. Same pattern as the RO test;
+ * pins the runtime-gate contract. */
+STM_TEST(ctl_r105_p3_4_create_snapshot_wedged_ewedged)
+{
+    make_tmp("ctl_r105_wedge");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Force-wedge — subsequent writes refuse. */
+    stm_fs_mark_wedged(fs);
+
+    uint64_t snap_id = 0;
+    STM_ASSERT_EQ(stm_fs_create_snapshot(fs, 1, "wedge_snap", 10, &snap_id),
+                  STM_EWEDGED);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
+/* R105 P3-1 close: post-admin-gate refusals (zero-byte, whitespace-
+ * only, oversize, bogus name chars) MUST log to /events. The
+ * doctrine: pre-admin-gate refusals stay unlogged (DoS defense);
+ * post-admin-gate refusals leave a forensic trail. */
+STM_TEST(ctl_r105_p3_1_post_admin_refusals_logged)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_r105_log", 0);
+    open_create_snapshot(&f, /*dataset_id=*/1, 2, 11);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+
+    /* Zero-byte refusal. */
+    uint32_t sz = build_twrite(req, 4, 11, 0, "", 0);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* Whitespace-only refusal. */
+    sz = build_twrite(req, 5, 11, 0, "  \n\t", 4);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* Oversize name (256 bytes — past STM_SNAP_NAME_MAX = 255). */
+    char too_long[STM_SNAP_NAME_MAX + 1];
+    memset(too_long, 'a', sizeof too_long);
+    sz = build_twrite(req, 6, 11, 0, too_long, sizeof too_long);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* All three refusals should appear in /events. */
+    char ebody[8192];
+    read_events_log(&f, 7, 12, ebody, sizeof ebody);
+    /* Two zero-len refusals (zero-byte + whitespace-only). The match
+     * is loose since both produce the same shape. */
+    const char *p = strstr(ebody,
+        "create-snapshot uid=0 dataset=1 name-len=0 result=err");
+    STM_ASSERT(p != NULL);
+    /* Second occurrence proves whitespace-only also logged. */
+    STM_ASSERT(strstr(p + 1,
+        "create-snapshot uid=0 dataset=1 name-len=0 result=err") != NULL);
+    /* Oversize: name-len=256 (length pre-validation, post-trim). */
+    STM_ASSERT(strstr(ebody,
+        "name-len=256 result=err") != NULL);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
 STM_TEST_MAIN("ctl")

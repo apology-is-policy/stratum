@@ -2137,8 +2137,15 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
      * fires inside snapshot_create_inner. Same single-source-of-
      * truth posture as dataset.c's name validation. */
     if (k == KIND_DATASET_CREATE_SNAPSHOT) {
+        /* R100 admin gate is the trust boundary. R105 P3-1 doctrine
+         * (also see CLAUDE.md trigger entry clause 6): pre-admin-
+         * gate refusals do NOT log to /events — flooding the event
+         * log with non-admin denial-of-service noise would let an
+         * attacker burn the 8 MiB cap. Post-admin-gate refusals
+         * (zero-byte, whitespace-only, oversize, snapshot.c
+         * rejection, name collision, etc.) DO log so the operator
+         * has a forensic trail of every authorized attempt. */
         if (!ctl_caller_is_admin(c)) return STM_EACCES;
-        if (len == 0) return STM_EINVAL;
         if (!c->fs) return STM_EBACKEND;     /* gated at vops_open */
         pthread_mutex_lock(&c->mu);
         ctl_session *s = session_get_locked(c, fid);
@@ -2148,6 +2155,17 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         }
         pthread_mutex_unlock(&c->mu);
 
+        uint64_t dsid = qid_dataset_id(qid_path);
+
+        /* R101 P2-2: zero-byte refusal — but log first since it's
+         * post-admin. */
+        if (len == 0) {
+            stm_ctl_log_event(c,
+                "create-snapshot uid=%u dataset=%llu name-len=0 result=err",
+                (unsigned)c->caller_uid, (unsigned long long)dsid);
+            return STM_EINVAL;
+        }
+
         /* Trim trailing whitespace + newline. R104 carry. */
         size_t end = len;
         while (end > 0) {
@@ -2156,15 +2174,25 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
                 break;
             end--;
         }
-        if (end == 0) return STM_EINVAL;     /* whitespace-only body */
+        if (end == 0) {
+            /* whitespace-only body */
+            stm_ctl_log_event(c,
+                "create-snapshot uid=%u dataset=%llu name-len=0 result=err",
+                (unsigned)c->caller_uid, (unsigned long long)dsid);
+            return STM_EINVAL;
+        }
         /* Refuse names exceeding STM_SNAP_NAME_MAX up front so the
          * audit log distinguishes "obviously-too-long" from
          * "snapshot.c rejected" — both end up STM_EINVAL but the
          * cap check here is cheap. The wrapper validates again
          * (defense-in-depth). */
-        if (end > STM_SNAP_NAME_MAX) return STM_EINVAL;
+        if (end > STM_SNAP_NAME_MAX) {
+            stm_ctl_log_event(c,
+                "create-snapshot uid=%u dataset=%llu name-len=%zu result=err",
+                (unsigned)c->caller_uid, (unsigned long long)dsid, end);
+            return STM_EINVAL;
+        }
 
-        uint64_t dsid = qid_dataset_id(qid_path);
         uint64_t snap_id = 0;
         stm_status rc = stm_fs_create_snapshot(c->fs, dsid,
                                                   (const char *)buf, end,

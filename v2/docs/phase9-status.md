@@ -552,7 +552,20 @@ language bindings, future kernel module) is a 9P consumer.
                   ctl_d6_create_snapshot_nonadmin_eacces,
                   ctl_d6_create_snapshot_zero_byte_einval,
                   ctl_d6_create_snapshot_duplicate_name_eexists.
-                  R105 audit pending.
+                  **R105 close** GREEN — 0 P0 + 0 P1 + 0 P2 + 4 P3
+                  (verdict MERGE), all addressed inline. P3-1 audit
+                  log moved to fire on every post-admin-gate
+                  refusal (doctrine: pre-admin-gate refusals NOT
+                  logged for DoS defense; post-admin-gate refusals
+                  DO log for forensic trail). P3-2 added defensive
+                  stm_dataset_lookup to the wrapper (closes the
+                  orphan-snapshot vector for non-/ctl/ callers).
+                  P3-3 v2 snapshot.c added to CLAUDE.md trigger
+                  list with 5 trust-boundary clauses. P3-4 added 3
+                  regression tests (RO + wedged + post-admin-log).
+                  test_ctl 96 → 99. The line-injection attack vector
+                  (R99 P2-1 carry to snapshot names) is closed at
+                  the source.
             - [ ] **P9-CTL-1d-actions-snapshot-rollback** — pending;
                   rollback / promote action triggers. Higher-risk
                   (mutates working tree); requires snapshot-rollback

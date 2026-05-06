@@ -4347,6 +4347,30 @@ stm_status stm_fs_create_snapshot(stm_fs *fs, uint64_t dataset_id,
     pthread_mutex_lock(&fs->lock);
     FS_GUARD_WRITE(fs);
 
+    /* R105 P3-2: validate dataset_id is a PRESENT dataset before
+     * creating a snapshot for it. The underlying snapshot.c uses
+     * dataset_id as an opaque bucket-key without lookup; without
+     * this gate, non-/ctl/ callers (CLI, FUSE, direct embedders)
+     * could create orphan snapshot records keyed at never-registered
+     * or destroyed dataset_ids — internally consistent but
+     * occupying snapshot index slots and bumping current_txg
+     * unnecessarily.
+     *
+     * The /ctl/ vops_walk + vops_open paths already perform the
+     * lookup, so this gate is unreachable through /ctl/ today; it's
+     * defense-in-depth at the public-API trust boundary. */
+    stm_dataset_index *didx = stm_sync_dataset_index(fs->sync);
+    if (!didx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_ECORRUPT;
+    }
+    stm_dataset_entry tmp;
+    stm_status drc = stm_dataset_lookup(didx, dataset_id, &tmp);
+    if (drc != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return drc;     /* propagates STM_ENOENT for missing dataset */
+    }
+
     stm_snapshot_index *sidx = stm_sync_snapshot_index(fs->sync);
     if (!sidx) {
         pthread_mutex_unlock(&fs->lock);

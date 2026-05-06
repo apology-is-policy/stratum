@@ -38,9 +38,39 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9-CTL-1d-actions-snapshot-create substantive (this
-  commit). 43 ctest suites green default. test_ctl 96/96 (was 88
-  at R104 close; +8 -1d-actions-snapshot-create). **P9-CTL-1d-
+- **Tip**: P9-CTL-1d-actions-snapshot-create R105 close (this
+  commit) — GREEN, 0 P0 + 0 P1 + 0 P2 + 4 P3 (verdict MERGE),
+  all addressed inline. 43 ctest suites green default. test_ctl
+  99/99 (was 88 at R104 close; +8 -1d-actions-snapshot-create
+  + 3 R105). R105 close: P3-1 audit log moved to fire on every
+  post-admin-gate refusal path (zero-byte, whitespace-only,
+  oversize-name, snapshot.c rejection). Doctrine inline:
+  pre-admin-gate refusals NOT logged (DoS defense — non-admin
+  flooding /events would burn the 8 MiB cap); post-admin-gate
+  refusals DO log so operators have a forensic trail. P3-2
+  defensive stm_dataset_lookup added to stm_fs_create_snapshot
+  wrapper — closes the orphan-snapshot vector for non-/ctl/
+  callers (CLI, FUSE, direct embedders); /ctl/ vops_open already
+  validates so this is defense-in-depth at the public-API
+  boundary. P3-3 v2 snapshot.c added to CLAUDE.md trigger list
+  with 5 trust-boundary clauses (R29 P3-1 saturation, R40 P2-1
+  racing-creator, R99 P2-1 char-validation, dead-list ownership,
+  txg monotonicity). P3-4 added 3 regression tests:
+  ctl_r105_p3_4_create_snapshot_readonly_erofs (RO refuses with
+  STM_EROFS), ctl_r105_p3_4_create_snapshot_wedged_ewedged
+  (wedge refuses with STM_EWEDGED),
+  ctl_r105_p3_1_post_admin_refusals_logged (audit log captures
+  every post-admin refusal). Forward-noted: KIND_ADMIN_CLEAR_
+  EVENTS + KIND_POOL_SCRUB_TRIGGER also have the pre-fix audit-
+  log gap (logged success only, not pre-admin refusals); a
+  Phase 8.5 cleanup chunk should backport the P3-1 doctrine
+  uniformly. The /ctl/ writable-kind family now has 4 kinds:
+  clear-events, scrub-trigger, create-snapshot, and the existing
+  events-log self-trigger.
+
+- **Pre-tip-1**: P9-CTL-1d-actions-snapshot-create substantive.
+  test_ctl 96/96 (was 88 at R104 close; +8 -1d-actions-snapshot-
+  create). **P9-CTL-1d-
   actions-snapshot-create** adds /datasets/<id>/create-snapshot
   (admin-only mode 0200). First /ctl/ trigger that mutates
   PERSISTENT on-disk state — composes against -1d-uid admin gate
