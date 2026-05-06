@@ -4049,4 +4049,261 @@ STM_TEST(ctl_r105_p3_1_post_admin_refusals_logged)
     destroy_scrub_trigger_fixture(f);
 }
 
+/* ── P9-CTL-1d-actions-snapshot-delete ──────────────────────────── */
+
+/* Walk + open the delete-snapshot trigger under fid. */
+static void open_delete_snapshot(scrub_trigger_fixture *f, uint64_t dataset_id,
+                                    uint16_t tag, uint32_t fid)
+{
+    char ds_str[32];
+    snprintf(ds_str, sizeof ds_str, "%llu", (unsigned long long)dataset_id);
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "datasets", ds_str, "delete-snapshot" };
+    uint32_t sz = build_twalk(req, tag, 10, fid, 3, path);
+    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    sz = build_topen(req, (uint16_t)(tag + 1), fid, STM_P9_OWRITE);
+    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+}
+
+/* Helper: create a snapshot directly through the wrapper (bypasses
+ * the /ctl/ trigger). Used as setup for delete tests. */
+static uint64_t setup_snapshot(stm_fs *fs, uint64_t dataset_id,
+                                  const char *name)
+{
+    uint64_t snap_id = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, dataset_id, name, strlen(name),
+                                            &snap_id));
+    STM_ASSERT(snap_id != 0);
+    return snap_id;
+}
+
+/* admin Twrite "<id>" → snapshot deleted; /events records it. */
+STM_TEST(ctl_d7_delete_snapshot_admin_succeeds)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_d7_del", 0);
+    uint64_t snap_id = setup_snapshot(f.fs, 1, "to_delete");
+
+    open_delete_snapshot(&f, /*dataset_id=*/1, 2, 11);
+
+    char body[32];
+    int n = snprintf(body, sizeof body, "%llu",
+                      (unsigned long long)snap_id);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    uint32_t sz = build_twrite(req, 4, 11, 0, body, (uint32_t)n);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWRITE);
+    STM_ASSERT_EQ(load_u32(resp + 7), (uint32_t)n);
+
+    /* /events records the success. */
+    char ebody[8192];
+    read_events_log(&f, 5, 12, ebody, sizeof ebody);
+    char want[128];
+    snprintf(want, sizeof want,
+        "delete-snapshot uid=0 dataset=1 snap-id=%llu freed-paddrs=0 result=ok",
+        (unsigned long long)snap_id);
+    STM_ASSERT(strstr(ebody, want) != NULL);
+
+    /* Sanity: snapshot index now empty. */
+    stm_sync *sync = stm_fs_sync_for_test(f.fs);
+    stm_snapshot_index *sidx = stm_sync_snapshot_index(sync);
+    size_t cnt = 999;
+    STM_ASSERT_OK(stm_snapshot_count(sidx, &cnt));
+    STM_ASSERT_EQ(cnt, (size_t)0);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* Trailing newline stripped from the parser; out_written full count. */
+STM_TEST(ctl_d7_delete_snapshot_trailing_newline_stripped)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_d7_nl", 0);
+    uint64_t snap_id = setup_snapshot(f.fs, 1, "trailnewline");
+
+    open_delete_snapshot(&f, /*dataset_id=*/1, 2, 11);
+
+    char body[32];
+    int n = snprintf(body, sizeof body, "%llu\n",
+                      (unsigned long long)snap_id);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    uint32_t sz = build_twrite(req, 4, 11, 0, body, (uint32_t)n);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWRITE);
+    /* out_written returns the FULL byte count (R104 P3-2 carry). */
+    STM_ASSERT_EQ(load_u32(resp + 7), (uint32_t)n);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* Bogus snap-id parse: refused with STM_EINVAL → RERROR.
+ * Audit log records "<bad-parse>". */
+STM_TEST(ctl_d7_delete_snapshot_bad_parse_einval)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_d7_bad", 0);
+    open_delete_snapshot(&f, /*dataset_id=*/1, 2, 11);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+
+    /* Leading zero refused. */
+    uint32_t sz = build_twrite(req, 4, 11, 0, "01", 2);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* "0" refused. */
+    sz = build_twrite(req, 5, 11, 0, "0", 1);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* Non-numeric refused. */
+    sz = build_twrite(req, 6, 11, 0, "abc", 3);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* Audit log records all 3 refusals. */
+    char ebody[8192];
+    read_events_log(&f, 7, 12, ebody, sizeof ebody);
+    STM_ASSERT(strstr(ebody, "snap-id=<bad-parse> result=err") != NULL);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* Nonexistent snap-id → STM_ENOENT propagates from snapshot.c. */
+STM_TEST(ctl_d7_delete_snapshot_nonexistent_enoent)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_d7_no_snap", 0);
+    open_delete_snapshot(&f, /*dataset_id=*/1, 2, 11);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    /* snap-id 99999 doesn't exist (no snaps created). */
+    uint32_t sz = build_twrite(req, 4, 11, 0, "99999", 5);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* Audit log records the failure. */
+    char ebody[8192];
+    read_events_log(&f, 5, 12, ebody, sizeof ebody);
+    STM_ASSERT(strstr(ebody, "snap-id=99999 freed-paddrs=0 result=err") != NULL);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* Non-admin → EACCES (admin gate at vops_open). */
+STM_TEST(ctl_d7_delete_snapshot_nonadmin_eacces)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_d7_nadm", 1000);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "datasets", "1", "delete-snapshot" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 3, path);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+
+    sz = build_topen(req, 3, 11, STM_P9_OWRITE);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* Zero-byte body refused. */
+STM_TEST(ctl_d7_delete_snapshot_zero_byte_einval)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_d7_zero", 0);
+    open_delete_snapshot(&f, /*dataset_id=*/1, 2, 11);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    uint32_t sz = build_twrite(req, 4, 11, 0, "", 0);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* Audit log records snap-id=0 (the post-admin "0 means we
+     * never parsed" sentinel). */
+    char ebody[8192];
+    read_events_log(&f, 5, 12, ebody, sizeof ebody);
+    STM_ASSERT(strstr(ebody, "delete-snapshot uid=0 dataset=1 snap-id=0 result=err") != NULL);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* Whitespace-only body refused. */
+STM_TEST(ctl_d7_delete_snapshot_whitespace_only_einval)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_d7_ws", 0);
+    open_delete_snapshot(&f, /*dataset_id=*/1, 2, 11);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    uint32_t sz = build_twrite(req, 4, 11, 0, "  \n\t", 4);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* Direct wrapper test: stm_fs_delete_snapshot's runtime gates and
+ * boundary conditions independent of /ctl/. */
+STM_TEST(ctl_d7_delete_snapshot_wrapper_boundaries)
+{
+    make_tmp("ctl_d7_wrapper");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* NULL fs → STM_EINVAL. */
+    STM_ASSERT_EQ(stm_fs_delete_snapshot(NULL, 1, NULL), STM_EINVAL);
+    /* snap_id == 0 → STM_EINVAL. */
+    STM_ASSERT_EQ(stm_fs_delete_snapshot(fs, 0, NULL), STM_EINVAL);
+    /* nonexistent → STM_ENOENT. */
+    STM_ASSERT_EQ(stm_fs_delete_snapshot(fs, 1, NULL), STM_ENOENT);
+
+    /* Create snap then delete; out_freed_count populated. */
+    uint64_t snap_id = setup_snapshot(fs, 1, "to_del");
+    size_t freed = 999;
+    STM_ASSERT_OK(stm_fs_delete_snapshot(fs, snap_id, &freed));
+    /* Empty snap → no dead-list paddrs to reclaim. */
+    STM_ASSERT_EQ(freed, (size_t)0);
+
+    /* Re-delete same id → STM_ENOENT (already deleted). */
+    STM_ASSERT_EQ(stm_fs_delete_snapshot(fs, snap_id, NULL), STM_ENOENT);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
+/* Read-only fs refuses with STM_EROFS via FS_GUARD_WRITE. */
+STM_TEST(ctl_d7_delete_snapshot_readonly_erofs)
+{
+    make_tmp("ctl_d7_ro");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    /* Create a snap in RW mode first so RO test has something to
+     * try-and-fail to delete. */
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs_rw = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs_rw));
+    uint64_t snap_id = setup_snapshot(fs_rw, 1, "ro_target");
+    STM_ASSERT_OK(stm_fs_unmount(fs_rw));
+
+    stm_fs_mount_opts ro = rw_mount_opts();
+    ro.read_only = true;
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &ro, &fs));
+
+    STM_ASSERT_EQ(stm_fs_delete_snapshot(fs, snap_id, NULL), STM_EROFS);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
 STM_TEST_MAIN("ctl")

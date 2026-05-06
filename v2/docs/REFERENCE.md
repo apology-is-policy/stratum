@@ -38,8 +38,29 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9-CTL-1d-actions-snapshot-create R105 close (this
-  commit) — GREEN, 0 P0 + 0 P1 + 0 P2 + 4 P3 (verdict MERGE),
+- **Tip**: P9-CTL-1d-actions-snapshot-delete substantive (this
+  commit). 43 ctest suites green default. test_ctl 108/108 (was
+  99 at R105 close; +9 -1d-actions-snapshot-delete). **P9-CTL-1d-
+  actions-snapshot-delete** adds /datasets/<id>/delete-snapshot
+  (admin-only mode 0200). KIND_MAX = 23 (was 22); single new kind
+  KIND_DATASET_DELETE_SNAPSHOT. New public API stm_fs_delete_
+  snapshot(fs, snap_id, *out_freed_count) — handles the full
+  delete cycle: stm_snapshot_delete + dead-list reclaim
+  (per-device stm_alloc_free routing via stm_paddr_device) +
+  CAS cold-hash deref. Best-effort posture: first-failure tracked
+  but reclaim continues so the snap is fully gone even on
+  partial-leak; non-OK return signals "snap deleted, blocks may
+  have leaked from tracking" (operator-visible at next-mount
+  scrub). New parse_snapshot_id strict-canonical decimal parser
+  (1..UINT64_MAX, no leading zeros, 20-char cap). vops_open mode-
+  gate now enumerates 4 writable kinds. R105 P3-1 audit-log
+  doctrine carries: post-admin refusals always log; pre-admin
+  refusals don't. The /ctl/ writable-kind family now has 4
+  members (clear-events, scrub-trigger, create-snapshot, delete-
+  snapshot). R106 audit pending.
+
+- **Pre-tip-1**: P9-CTL-1d-actions-snapshot-create R105 close —
+  GREEN, 0 P0 + 0 P1 + 0 P2 + 4 P3 (verdict MERGE),
   all addressed inline. 43 ctest suites green default. test_ctl
   99/99 (was 88 at R104 close; +8 -1d-actions-snapshot-create
   + 3 R105). R105 close: P3-1 audit log moved to fire on every

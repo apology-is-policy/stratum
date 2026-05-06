@@ -566,10 +566,39 @@ language bindings, future kernel module) is a 9P consumer.
                   test_ctl 96 → 99. The line-injection attack vector
                   (R99 P2-1 carry to snapshot names) is closed at
                   the source.
+            - [x] **P9-CTL-1d-actions-snapshot-delete** — second
+                  /ctl/ trigger that mutates persistent on-disk
+                  state. Adds /datasets/<id>/delete-snapshot
+                  (admin-only mode 0200). KIND_MAX = 23 (was 22).
+                  New public API stm_fs_delete_snapshot(fs, snap_id,
+                  *out_freed_count) handles dead-list ownership
+                  transfer per snapshot.c trigger entry clause 4:
+                  routes freed paddrs through stm_paddr_device →
+                  stm_sync_alloc → stm_alloc_free, dereffs CAS
+                  cold-hashes via stm_cas_deref. Best-effort posture
+                  (first-failure tracked but reclaim continues —
+                  partial-leak signaled via non-OK return; snap is
+                  always gone on success). New parse_snapshot_id
+                  strict-canonical decimal parser (1..UINT64_MAX,
+                  no leading zeros, 20-char cap). R105 P3-1 audit-
+                  log doctrine carries (post-admin refusals always
+                  log). 9 -1d-actions-snapshot-delete tests in
+                  test_ctl.c (99 → 108):
+                  ctl_d7_delete_snapshot_admin_succeeds,
+                  ctl_d7_delete_snapshot_trailing_newline_stripped,
+                  ctl_d7_delete_snapshot_bad_parse_einval,
+                  ctl_d7_delete_snapshot_nonexistent_enoent,
+                  ctl_d7_delete_snapshot_nonadmin_eacces,
+                  ctl_d7_delete_snapshot_zero_byte_einval,
+                  ctl_d7_delete_snapshot_whitespace_only_einval,
+                  ctl_d7_delete_snapshot_wrapper_boundaries,
+                  ctl_d7_delete_snapshot_readonly_erofs.
+                  R106 audit pending.
             - [ ] **P9-CTL-1d-actions-snapshot-rollback** — pending;
-                  rollback / promote action triggers. Higher-risk
-                  (mutates working tree); requires snapshot-rollback
-                  invariant analysis.
+                  higher-risk (mutates working tree); requires
+                  snapshot-rollback invariant analysis. Check
+                  whether v2 has a stm_snap_rollback equivalent
+                  yet.
             - [ ] **P9-CTL-1d-tracing** — pending; /tracing/enable +
                   /tracing/sample-rate + /tracing/traces (ARCH §14.6).
       - [ ] **P9-CTL-1e /metrics/** — pending; Prometheus +

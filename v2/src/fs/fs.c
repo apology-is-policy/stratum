@@ -46,6 +46,7 @@
 #include <stratum/keyfile.h>
 #include <stratum/pool.h>
 #include <stratum/super.h>
+#include <stratum/cas.h>
 #include <stratum/snapshot.h>
 #include <stratum/sync.h>
 
@@ -4389,6 +4390,100 @@ stm_status stm_fs_create_snapshot(stm_fs *fs, uint64_t dataset_id,
                                           cur_gen, out_id);
     pthread_mutex_unlock(&fs->lock);
     return s;
+}
+
+/* P9-CTL-1d-actions-snapshot-delete: snapshot delete + dead-list
+ * reclamation in one wrapper call. Holds fs->lock for the entire
+ * cycle so no concurrent stm_sync_commit can race against the
+ * paddr reclaim — addresses snapshot.h's "MUST be reclaimed before
+ * next sync_commit" contract.
+ *
+ * Best-effort posture: if any individual stm_alloc_free or
+ * stm_cas_deref fails, the wrapper continues with the rest and
+ * returns the first non-OK status. The snapshot is GONE regardless;
+ * a non-OK return means "snap deleted, but some blocks may have
+ * leaked from tracking" — operator-visible at the next mount's
+ * scrub. */
+stm_status stm_fs_delete_snapshot(stm_fs *fs, uint64_t snapshot_id,
+                                     size_t *out_freed_count)
+{
+    if (out_freed_count) *out_freed_count = 0;
+    if (!fs) return STM_EINVAL;
+    if (snapshot_id == 0) return STM_EINVAL;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+
+    stm_snapshot_index *sidx = stm_sync_snapshot_index(fs->sync);
+    if (!sidx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_ECORRUPT;
+    }
+
+    uint64_t free_gen = stm_sync_current_gen(fs->sync);
+
+    uint64_t *freed = NULL;
+    size_t freed_n = 0;
+    uint8_t *cold_hashes = NULL;
+    size_t cold_n = 0;
+    stm_status del = stm_snapshot_delete(sidx, snapshot_id,
+                                            &freed, &freed_n,
+                                            &cold_hashes, &cold_n);
+    if (del != STM_OK) {
+        /* Snapshot.h contract: on non-OK return, both pairs are
+         * zero/NULL. Defensive free anyway. */
+        free(freed);
+        free(cold_hashes);
+        pthread_mutex_unlock(&fs->lock);
+        return del;
+    }
+
+    if (out_freed_count) *out_freed_count = freed_n;
+
+    /* First-failure status — propagated after the cleanup loop runs
+     * to completion (best-effort reclaim). */
+    stm_status first_err = STM_OK;
+
+    /* Route freed paddrs to per-device allocators. The paddr's high
+     * 16 bits encode the device id (super.h::stm_paddr_device); the
+     * sync layer's attach table maps device_id → stm_alloc *. */
+    for (size_t i = 0; i < freed_n; i++) {
+        uint16_t did = stm_paddr_device(freed[i]);
+        stm_alloc *a = stm_sync_alloc(fs->sync, did);
+        if (!a) {
+            /* Device unattached — paddr leaks from tracking. Record
+             * the failure but keep iterating; the operator's next-
+             * mount scrub catches the orphan. */
+            if (first_err == STM_OK) first_err = STM_ENOENT;
+            continue;
+        }
+        stm_status fr = stm_alloc_free(a, freed[i], free_gen);
+        if (fr != STM_OK && first_err == STM_OK) first_err = fr;
+    }
+
+    /* CAS dead-list: dereference each cold hash. Auto-GC at the
+     * next stm_sync_commit reclaims refcount=0 entries. If the
+     * fs has no CAS index attached (rare; v2 production paths
+     * mount with one), skip the deref loop. */
+    if (cold_hashes && cold_n > 0) {
+        stm_cas_index *cidx = stm_sync_cas_index(fs->sync);
+        if (cidx) {
+            for (size_t i = 0; i < cold_n; i++) {
+                stm_status dr = stm_cas_deref(cidx,
+                    &cold_hashes[i * STM_CAS_HASH_LEN]);
+                if (dr != STM_OK && first_err == STM_OK) first_err = dr;
+            }
+        } else if (first_err == STM_OK) {
+            /* Cold-hashes returned but no CAS index — leak. Same
+             * shape as device-unattached case above. */
+            first_err = STM_ENOENT;
+        }
+    }
+
+    free(freed);
+    free(cold_hashes);
+    pthread_mutex_unlock(&fs->lock);
+    return first_err;
 }
 
 stm_status stm_fs_set_dataset_pool_default(stm_fs *fs, stm_property prop,

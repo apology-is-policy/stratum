@@ -1478,6 +1478,49 @@ stm_status stm_fs_create_snapshot(stm_fs *fs, uint64_t dataset_id,
                                      uint64_t *out_id);
 
 /*
+ * P9-CTL-1d-actions-snapshot-delete: snapshot-delete wrapper.
+ * /ctl/datasets/<id>/delete-snapshot drives this; future surfaces
+ * (CLI, FUSE ioctl, etc.) compose against the same wrapper.
+ *
+ * Drives the full delete cycle including dead-list reclamation:
+ *   1. stm_snapshot_delete returns freed_paddrs + cold_hashes
+ *      (ownership transferred per snapshot.c trigger entry clause 4).
+ *   2. Each freed paddr routed to its per-device allocator via
+ *      stm_paddr_device → stm_sync_alloc → stm_alloc_free.
+ *   3. Each cold hash dereffed via stm_cas_deref (the auto-GC sweep
+ *      at stm_sync_commit reclaims refcount=0 paddrs).
+ *   4. Buffers freed before return.
+ *
+ * Holds fs->lock + FS_GUARD_WRITE for the duration so no concurrent
+ * sync_commit can race against the dead-list reclaim — addresses
+ * the "MUST be reclaimed before next sync_commit" contract from
+ * snapshot.h.
+ *
+ * Refusals propagated from stm_snapshot_delete:
+ *   STM_EINVAL  — NULL fs; snapshot_id == 0; index unavailable
+ *   STM_ENOENT  — snapshot_id unknown / already-deleted
+ *   STM_EBUSY   — hold_count > 0 OR clone-check cb reports a clone
+ *
+ * Refusals from FS_GUARD_WRITE:
+ *   STM_EWEDGED — fs is wedged
+ *   STM_EROFS   — fs is read-only
+ *
+ * Best-effort dead-list reclaim: if any individual stm_alloc_free
+ * or stm_cas_deref fails, the wrapper continues with the rest and
+ * returns the first non-OK status. The snapshot is GONE regardless;
+ * a non-OK return means "snap deleted, but some blocks may have
+ * leaked from tracking" — operator-visible at the next mount's
+ * scrub.
+ *
+ * `*out_freed_count` (optional) returns the count of paddrs the
+ * snapshot owned (the snap's dead-list size). Useful for telemetry
+ * but does not reflect reclamation success.
+ */
+STM_MUST_USE
+stm_status stm_fs_delete_snapshot(stm_fs *fs, uint64_t snapshot_id,
+                                     size_t *out_freed_count);
+
+/*
  * P7-16: stm_fs_reflink — POSIX-shape FICLONE. Replaces dst's empty
  * extent tree with a reflink-share of src's extent tree. Same
  * semantics as `ioctl(fd_dst, FICLONE, fd_src)` for a freshly-created
