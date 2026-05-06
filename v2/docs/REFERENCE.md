@@ -38,9 +38,49 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9-LIB-1 sync API foundation (this commit). 44 ctest suites
-  green default (43 → 44 with new test_9p_client). test_9p_client
-  12/12. **P9-LIB-1** ships the libstratum-9p public C ABI per ARCH
+- **Tip**: P9-LIB-1 R111 audit close (this commit). 44 ctest suites
+  green default. test_9p_client 13/13 (was 12; +1 R111 P0 F-1
+  regression test). **R111 close** RED → YELLOW MERGE: 1 P0 + 0 P1 +
+  3 P2 + 7 P3, all P0/P2 addressed inline + 4 P3 polish addressed +
+  3 P3 forward-noted. **P0 F-1** was a real OOB-write vulnerability:
+  `stm_9p_walk` wrote `nwqid` (server-supplied) entries into the
+  caller's `out_qids` buffer (sized for `n_names`) without bounding
+  `nwqid <= n_names`. A malicious server replying `Rwalk(nwqid=
+  5040)` with 65 KiB of qid blobs (fits in MSIZE_DEFAULT) would
+  OOB-write ~5040 attacker-controlled `stm_9p_qid` structs past the
+  caller's buffer. Same wire-bound omission shape as R11–R14 P0s on
+  the server side; first occurrence on the client side. Fixed with
+  one-line bound check before the write loop. Regression test
+  `p9_client_walk_malicious_nwqid_refused_no_oob` exercises a
+  hand-rolled mock server that replies `Rwalk(nwqid=99)` to a
+  Twalk(n_names=2); asserts the lib refuses with STM_EBACKEND AND
+  the canary byte past out_qids[1] is unchanged (proves no OOB
+  write). **P2 F-2** readdir cb name_len ambiguity: when a server
+  sends a name > STM_9P_NAME_MAX, the lib truncates namebuf to 255
+  but pre-fix passed the original wire length to the cb — a naive
+  cb's `memcpy(dst, name, name_len)` would OOB-read past the NUL
+  terminator. Fixed by clamping the reported `name_len` to match
+  the truncated copy. Defense against third-party 9P servers with
+  looser name limits; stratumd never emits names > NAME_MAX so
+  unreachable today. **P2 F-3** Treaddir doc referenced a nonexistent
+  `out_cb_status` parameter; cb-stop status is actually returned via
+  the function return value. Doc corrected with the disambiguation
+  guidance (use a status server-side stratumd never produces, e.g.
+  STM_ENOTSUPPORTED). **P2 F-4** Header claimed dial-failure errno
+  is preserved in `stm_9p_last_errno` but the client is freed on
+  every dial-failure path; doc corrected to direct callers to query
+  `errno` directly after STM_EIO returns. **P3 F-5** Comment drift
+  on STM_9P_NAME_MAX (was 63 — generic 9P; .L is 255). **P3 F-7**
+  msize cap added at STM_9P_MSIZE_MAX (1 MiB) at dial time; defense
+  against caller-misconfigured msize triggering absurd buf alloc.
+  **P3 F-9** doc-noted: last_errno is NOT reset on a successful op.
+  Forward-noted to a future P9-LIB-1 cleanup chunk: F-6 (NULL buf
+  with count > 0), F-8 (no connect/recv timeout — P9-LIB-2 async
+  API will address), F-10 (lax body-len strictness — Rclunk/Rwalk
+  silently accept extra trailing bytes), F-11 (connection-poisoned
+  posture is informational only; no `c->poisoned` flag enforces it).
+
+  **P9-LIB-1** ships the libstratum-9p public C ABI per ARCH
   §10.2 ("libstratum-9p is the stable public ABI; all language
   bindings wrap it"). Foundation chunk covers v2.0 read-side: dial
   (TVERSION + TATTACH), Twalk, TLopen, Tread, Tclunk, Tgetattr,

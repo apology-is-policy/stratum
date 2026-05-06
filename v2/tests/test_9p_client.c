@@ -539,4 +539,185 @@ STM_TEST(p9_client_read_offset_resumption)
     destroy_client_fixture(&f);
 }
 
+/* ────────────────────────────────────────────────────────────────────── */
+/* R111 P0 F-1 regression: malicious server replies with nwqid > nwname  */
+/* on a Twalk. Without the lib's bound check, the loop OOB-writes        */
+/* attacker-controlled qid blobs into the caller's out_qids buffer.      */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/* Minimal pack helpers for the mock server (mirrors test_9p_socket's). */
+static void mock_pack_u16(uint8_t *p, uint16_t v) {
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+}
+static void mock_pack_u32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v;         p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+
+/* Read one framed 9P message into buf. Returns the message size. */
+static int mock_recv_msg(int fd, uint8_t *buf, uint32_t cap, uint32_t *out_size)
+{
+    uint32_t done = 0;
+    while (done < 4u) {
+        ssize_t n = read(fd, buf + done, 4u - done);
+        if (n <= 0) return -1;
+        done += (uint32_t)n;
+    }
+    uint32_t size = (uint32_t)buf[0] | ((uint32_t)buf[1] << 8)
+                  | ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24);
+    if (size < 7u || size > cap) return -1;
+    while (done < size) {
+        ssize_t n = read(fd, buf + done, size - done);
+        if (n <= 0) return -1;
+        done += (uint32_t)n;
+    }
+    *out_size = size;
+    return 0;
+}
+
+static int mock_send_msg(int fd, const uint8_t *buf, uint32_t len)
+{
+    uint32_t done = 0;
+    while (done < len) {
+        ssize_t n = write(fd, buf + done, len - done);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;
+        done += (uint32_t)n;
+    }
+    return 0;
+}
+
+typedef struct {
+    int       listen_fd;
+    uint16_t  malicious_nwqid;
+    int       run_status;
+} mock_walk_ctx;
+
+static void *mock_walk_thread(void *arg)
+{
+    mock_walk_ctx *ctx = (mock_walk_ctx *)arg;
+    int cfd = accept(ctx->listen_fd, NULL, NULL);
+    if (cfd < 0) {
+        ctx->run_status = -1;
+        return NULL;
+    }
+
+    uint8_t buf[8192];
+    uint32_t size = 0;
+
+    /* 1. Tversion: reply with valid Rversion advertising "9P2000.L"
+     *    + caller's requested msize. */
+    if (mock_recv_msg(cfd, buf, sizeof buf, &size) != 0) goto fail;
+    if (size < 13u || buf[4] != STM_9P_TVERSION) goto fail;
+    uint32_t cmsize = (uint32_t)buf[7] | ((uint32_t)buf[8] << 8)
+                    | ((uint32_t)buf[9] << 16) | ((uint32_t)buf[10] << 24);
+    uint8_t  resp[64];
+    uint32_t rsz = 7u + 4u + 2u + 8u;       /* hdr + msize + vlen + "9P2000.L" */
+    mock_pack_u32(resp, rsz);
+    resp[4] = STM_9P_RVERSION;
+    mock_pack_u16(resp + 5, STM_9P_NOTAG);
+    mock_pack_u32(resp + 7, cmsize);
+    mock_pack_u16(resp + 11, 8);
+    memcpy(resp + 13, "9P2000.L", 8);
+    if (mock_send_msg(cfd, resp, rsz) != 0) goto fail;
+
+    /* 2. Tattach: reply with valid Rattach (qid). */
+    if (mock_recv_msg(cfd, buf, sizeof buf, &size) != 0) goto fail;
+    if (buf[4] != STM_9P_TATTACH) goto fail;
+    uint16_t att_tag = (uint16_t)((uint16_t)buf[5] | ((uint16_t)buf[6] << 8));
+    rsz = 7u + 13u;
+    mock_pack_u32(resp, rsz);
+    resp[4] = STM_9P_RATTACH;
+    mock_pack_u16(resp + 5, att_tag);
+    memset(resp + 7, 0, 13);                /* qid = zeroed */
+    if (mock_send_msg(cfd, resp, rsz) != 0) goto fail;
+
+    /* 3. Twalk: reply with malicious Rwalk(nwqid = ctx->malicious_nwqid). */
+    if (mock_recv_msg(cfd, buf, sizeof buf, &size) != 0) goto fail;
+    if (buf[4] != STM_9P_TWALK) goto fail;
+    uint16_t walk_tag = (uint16_t)((uint16_t)buf[5] | ((uint16_t)buf[6] << 8));
+    uint8_t  big_resp[8192];
+    uint16_t mn = ctx->malicious_nwqid;
+    rsz = 7u + 2u + (uint32_t)mn * 13u;
+    if (rsz > sizeof big_resp) goto fail;
+    mock_pack_u32(big_resp, rsz);
+    big_resp[4] = STM_9P_RWALK;
+    mock_pack_u16(big_resp + 5, walk_tag);
+    mock_pack_u16(big_resp + 7, mn);
+    /* Fill qids with attacker-controlled bytes (0xCC pattern). */
+    memset(big_resp + 9, 0xCC, (size_t)mn * 13u);
+    if (mock_send_msg(cfd, big_resp, rsz) != 0) goto fail;
+
+    /* 4. Tclunk: reply with Rlerror to short-circuit any further ops. */
+    if (mock_recv_msg(cfd, buf, sizeof buf, &size) == 0) {
+        uint16_t cl_tag = (uint16_t)((uint16_t)buf[5] | ((uint16_t)buf[6] << 8));
+        rsz = 7u + 4u;
+        mock_pack_u32(resp, rsz);
+        resp[4] = STM_9P_RLERROR;
+        mock_pack_u16(resp + 5, cl_tag);
+        mock_pack_u32(resp + 7, 5);          /* EIO */
+        (void)mock_send_msg(cfd, resp, rsz);
+    }
+
+    ctx->run_status = 0;
+    close(cfd);
+    return NULL;
+
+fail:
+    ctx->run_status = -1;
+    close(cfd);
+    return NULL;
+}
+
+/* The bug pre-fix: a malicious server replying nwqid=99 to a Twalk
+ * with n_names=2 would cause stm_9p_walk to OOB-write 99 stm_9p_qid
+ * structs into a caller's 2-entry buffer. Post-fix: the lib
+ * detects nwqid > n_names + returns STM_EBACKEND BEFORE any
+ * out_qids write.
+ *
+ * Test asserts: (a) the call returns STM_EBACKEND, (b) the canary
+ * bytes past the end of the legitimate out_qids[2] are unchanged
+ * (proves no OOB write occurred). */
+STM_TEST(p9_client_walk_malicious_nwqid_refused_no_oob)
+{
+    /* Set up a mock server (NOT stratumd — a hand-rolled accept loop
+     * that replies with malformed Rwalk). */
+    build_sock_path("walk_mal");
+    int listen_fd = stm_stratumd_listen_unix(g_sock_path, 4, 0600);
+    STM_ASSERT_TRUE(listen_fd >= 0);
+
+    mock_walk_ctx ctx = { .listen_fd = listen_fd, .malicious_nwqid = 99,
+                            .run_status = -1 };
+    pthread_t worker;
+    STM_ASSERT_EQ(pthread_create(&worker, NULL, mock_walk_thread, &ctx), 0);
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    /* Caller passes a small out_qids buffer (2 entries) + a canary
+     * after to detect any OOB write. The canary is a separate stack
+     * variable; if the buggy walk wrote past out_qids[1] it would
+     * also clobber `canary`. */
+    stm_9p_qid out_qids[2];
+    memset(out_qids, 0, sizeof out_qids);
+    uint64_t canary = 0xCAFEBABE12345678ULL;
+
+    const char *names[] = { "x", "y" };
+    uint16_t walked = 0;
+    stm_status rc = stm_9p_walk(c, /*fid=*/100, /*new_fid=*/101,
+                                   2, names, out_qids, &walked);
+    STM_ASSERT_EQ(rc, STM_EBACKEND);
+    /* Canary intact — proves no OOB write occurred. */
+    STM_ASSERT_EQ(canary, 0xCAFEBABE12345678ULL);
+
+    stm_9p_close(c);
+    pthread_join(worker, NULL);
+    close(listen_fd);
+    (void)unlink(g_sock_path);
+}
+
 STM_TEST_MAIN("9p_client")

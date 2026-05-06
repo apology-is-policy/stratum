@@ -177,8 +177,12 @@ typedef struct {
  *     STM_9P_MSIZE_MIN (1 KiB).
  *   - Any Rlerror's mapped status from the Tattach step.
  *
- * On failure *out is set to NULL and any partially-opened socket is
- * closed. */
+ * On failure *out is set to NULL and the partially-opened socket +
+ * client are closed. The caller has no observable handle to query
+ * errno on dial-failure (the client is destroyed); R111 P2 F-4: if
+ * detailed connect-time diagnostics matter, callers can `errno`
+ * directly after the dial returns STM_EIO (preserved by the lib's
+ * send_all/recv_all path on system-call failures). */
 STM_MUST_USE
 stm_status stm_9p_dial_unix(const char *socket_path,
                               const stm_9p_dial_opts *opts,
@@ -191,8 +195,13 @@ void stm_9p_close(stm_9p_client *c);
  * connected. */
 uint32_t stm_9p_msize(const stm_9p_client *c);
 
-/* errno from the last system call (connect/read/write). Useful for
- * surfacing OS-level diagnostics when the lib returns STM_EIO. */
+/* errno from the last system call (read/write) on this client.
+ * Useful for surfacing OS-level diagnostics when an op returns
+ * STM_EIO. NOT available for dial-time failures because the client
+ * is freed before the caller can read it (see stm_9p_dial_unix
+ * doc). The errno is NOT reset on a successful op (R111 P3 F-9
+ * forward-note); callers that depend on a "fresh" reading should
+ * compare against a snapshot taken before the call. */
 int stm_9p_last_errno(const stm_9p_client *c);
 
 /* Twalk: traverse from `fid` along `n_names` path components, binding
@@ -268,14 +277,23 @@ typedef stm_status (*stm_9p_dirent_cb)(const stm_9p_qid *qid,
  * cookie (or use the `out_next_offset` value) and call again until
  * the returned count is 0.
  *
- * `count` clamps the batch size; pass STM_9P_MSIZE_DEFAULT for
- * "as much as fits".
+ * `count` clamps the batch size; pass 0 for "iounit (msize-hdr-4)
+ * default".
  *
  * Returns:
- *   - STM_OK on success (cb may have returned non-OK to stop;
- *     iteration ends and the cb's status is returned via
- *     *out_cb_status).
- *   - STM_EINVAL on NULL cb. */
+ *   - STM_OK on success — every dirent in the batch was emitted to
+ *     the callback and the cb returned STM_OK for each.
+ *   - STM_EINVAL on NULL cb / NULL c.
+ *   - The cb's non-STM_OK return value, propagated unchanged.
+ *     Iteration stops at that dirent; out_entries reports how many
+ *     were emitted (including the cb-stop one) and out_next_offset
+ *     points at the cookie of the dirent the cb stopped on so
+ *     callers can resume. R111 P2 F-3: cb-stop status is the
+ *     function's RETURN value (no separate out_cb_status). Callers
+ *     wanting to disambiguate cb-stop from server-error should pick
+ *     a cb status that the server can't produce (e.g.
+ *     STM_ENOTSUPPORTED — server-side stratumd doesn't return it
+ *     for any 9P op). */
 STM_MUST_USE
 stm_status stm_9p_readdir(stm_9p_client *c, uint32_t fid,
                              uint64_t offset, uint32_t count,

@@ -408,6 +408,11 @@ stm_status stm_9p_dial_unix(const char *socket_path,
 
     uint32_t msize = opts->msize ? opts->msize : STM_9P_MSIZE_DEFAULT;
     if (msize < STM_9P_MSIZE_MIN) return STM_EINVAL;
+    /* R111 P3 F-7: cap caller-requested msize at STM_9P_MSIZE_MAX
+     * (1 MiB) so a misconfigured opts.msize doesn't trigger an
+     * absurd buf alloc. The Tversion negotiation will clamp further
+     * to whatever the server's msize_max reports. */
+    if (msize > STM_9P_MSIZE_MAX) msize = STM_9P_MSIZE_MAX;
 
     stm_9p_client *c = (stm_9p_client *)calloc(1, sizeof *c);
     if (!c) return STM_ENOMEM;
@@ -512,6 +517,20 @@ stm_status stm_9p_walk(stm_9p_client *c,
     }
     uint16_t nwqid = g_u16(body);
     if (body_len < 2u + (uint32_t)nwqid * STM_9P_QID_SIZE) {
+        c->last_errno = EPROTO;
+        return STM_EBACKEND;
+    }
+    /* R111 P0 F-1: bound nwqid against the caller-supplied n_names
+     * BEFORE any out_qids write. The 9P2000.L server contract says
+     * `nwqid <= nwname` (it can return fewer on partial walk, never
+     * more); the wire-side body_len check above doesn't enforce this
+     * — a malicious server could reply with nwqid up to ~5040 (qid
+     * blobs fit in MSIZE_DEFAULT) and the loop below would OOB-write
+     * into the caller's out_qids buffer (sized for n_names per the
+     * header doc). Same wire-bound discipline as R11-R14 server-side
+     * (every body field bound-checked against caller cap before
+     * use). */
+    if (nwqid > n_names) {
         c->last_errno = EPROTO;
         return STM_EBACKEND;
     }
@@ -790,15 +809,22 @@ stm_status stm_9p_readdir(stm_9p_client *c, uint32_t fid,
             c->last_errno = EPROTO;
             return STM_EBACKEND;
         }
-        /* NUL-terminate the name into a stack buffer (server bound:
-         * STM_9P_NAME_MAX = 63, plus dirent has its own bound). */
+        /* NUL-terminate the name into a stack buffer
+         * (STM_9P_NAME_MAX = 255 — Linux NAME_MAX). R111 P3 F-5:
+         * earlier comment claimed NAME_MAX = 63 from p9.h's generic
+         * server; the .L server uses 255 (matches POSIX). */
         char namebuf[STM_9P_NAME_MAX + 1];
+        size_t name_copy_len = nlen;
         if (nlen > STM_9P_NAME_MAX) {
-            /* Server returned a name > NAME_MAX: protocol violation
-             * for stratumd's surface, but we tolerate by truncating
-             * the stored copy + reporting the wire length so callers
-             * can decide. The cb gets the truncated NUL-terminated
-             * pointer but the original name_len. */
+            /* R111 P2 F-2: name_len passed to the cb MUST match the
+             * NUL-terminated namebuf the cb sees — passing the
+             * original wire length while truncating namebuf invites
+             * the cb's `memcpy(dst, name, name_len)` to OOB-read past
+             * the NUL terminator. Clamp BOTH the copy AND the
+             * reported length. Server-side stratumd never emits
+             * names > NAME_MAX, so this is defense against
+             * third-party 9P servers with looser limits. */
+            name_copy_len = STM_9P_NAME_MAX;
             memcpy(namebuf, p, STM_9P_NAME_MAX);
             namebuf[STM_9P_NAME_MAX] = '\0';
         } else {
@@ -807,7 +833,8 @@ stm_status stm_9p_readdir(stm_9p_client *c, uint32_t fid,
         }
         p += nlen;
         last_cookie = cookie;
-        stm_status cbrc = cb(&qid, cookie, dtype, namebuf, nlen, cb_ctx);
+        stm_status cbrc = cb(&qid, cookie, dtype, namebuf,
+                                name_copy_len, cb_ctx);
         n_emitted++;
         if (cbrc != STM_OK) {
             if (out_entries) *out_entries = n_emitted;

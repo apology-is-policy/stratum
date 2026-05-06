@@ -783,8 +783,31 @@ language bindings, future kernel module) is a 9P consumer.
       open+read+clunk round-trip; getattr BASIC mask; readdir root
       enumeration; offset-resumption (INLINE, since v2.0
       stm_sync_read_extent rejects partial-extent reads — single-
-      extent MVP). Builds + tests green at the chunk's tip. R111
-      audit pending.
+      extent MVP). Builds + tests green at the chunk's tip.
+      **R111 close** RED → YELLOW MERGE: 1 P0 + 0 P1 + 3 P2 + 7 P3.
+      P0 F-1 was a real OOB-write vulnerability — stm_9p_walk wrote
+      nwqid (server-supplied) entries into the caller's out_qids
+      buffer without bounding nwqid <= n_names; first wire-bound
+      omission on the client side (analogous to R11–R14 P0s on the
+      server side). Fixed with one-line bound check + regression
+      test p9_client_walk_malicious_nwqid_refused_no_oob using a
+      hand-rolled mock server that replies Rwalk(nwqid=99) to a
+      Twalk(n_names=2) and asserts both STM_EBACKEND AND a stack
+      canary past out_qids[1] is unchanged. P2s addressed: F-2
+      readdir cb name_len clamped to truncated namebuf length
+      (defense against third-party 9P servers); F-3 Treaddir doc
+      corrected (no out_cb_status; use a status server-side
+      stratumd never produces to disambiguate cb-stop vs server
+      error); F-4 dial-failure errno doc corrected (client is
+      freed; query errno directly). P3 polish inline: F-5 NAME_MAX
+      comment drift, F-7 msize cap at STM_9P_MSIZE_MAX. Forward-
+      noted: F-6 (NULL buf with count > 0), F-8 (no connect/recv
+      timeout — P9-LIB-2 async API will address), F-9 (last_errno
+      reset on success), F-10 (extra-trailing-bytes strictness on
+      Rclunk/Rwalk), F-11 (connection-poisoned posture is
+      informational only; no c->poisoned flag enforces it).
+      test_9p_client 12 → 13 (+1 R111 P0 regression). 44/44 ctest
+      green.
 
 - [ ] **P9-LIB-2 libstratum-9p async API** — pending.
 
