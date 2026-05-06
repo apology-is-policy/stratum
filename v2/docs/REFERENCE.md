@@ -38,7 +38,26 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9-LIB-1 cleanup chunk (this commit). 44 ctest suites
+- **Tip**: P9-LIB-1b Twrite primitive (this commit). 44 ctest suites
+  green. test_9p_client 15 → 19 (+4 Twrite tests). **P9-LIB-1b**
+  (audit-light, R111 doctrine carry) extends the lib's read-side
+  surface with stm_9p_write — the Twrite counterpart to Tread. Wire
+  shape: fid[4] + offset[8] + count[4] + data[count]. Returns
+  out_written count. New op inherits all R111 trust-boundary
+  doctrine: caller-cap bound on out_written (server-returned
+  written > requested → STM_EBACKEND), op_entry_check at entry,
+  strict body-len equality on Rwrite (must be exactly 4 bytes),
+  NULL buf with count > 0 → STM_EINVAL (count == 0 with NULL buf
+  is a legitimate "nudge" shape). count clamped to iounit so the
+  full Twrite (hdr + 16 + count) fits in one msize. Tests:
+  round-trip (write + read-back), NULL buf rejection, write to
+  RDONLY-opened fid → EACCES (per server's accmode gate),
+  sequential writes at offsets 0/30 (INLINE-mode file). Foundation
+  for the CLI's `echo X > /file` workflow + the future P9-LIB-1c
+  chunk that will add Tlcreate / Tmkdir / Tunlinkat / Trenameat /
+  Tsetattr / Tfsync etc.
+
+- **Pre-tip-1**: P9-LIB-1 cleanup. 44 ctest suites
   green. test_9p_client 13 → 15 (+1 F-6 regression + 1 F-11
   poison-flag regression). **P9-LIB-1 cleanup** (audit-light, R111
   doctrine carry) closes 4 of 5 P3 forward-notes from R111

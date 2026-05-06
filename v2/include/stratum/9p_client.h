@@ -259,6 +259,18 @@ STM_MUST_USE
 stm_status stm_9p_read(stm_9p_client *c, uint32_t fid, uint64_t offset,
                           void *buf, uint32_t count, uint32_t *out_count);
 
+/* Twrite: write up to `count` bytes from `buf` at `offset` to `fid`.
+ * `count` is clamped to iounit by the lib (so the request fits in
+ * one msize). *out_written reports actual bytes accepted by the
+ * server; may be < count (partial write). NULL buf with count > 0
+ * → STM_EINVAL. fid MUST be open with write access (TLopen with
+ * STM_9P_O_WRONLY or STM_9P_O_RDWR). The fid's open-mode is
+ * enforced server-side; the lib does not pre-check. */
+STM_MUST_USE
+stm_status stm_9p_write(stm_9p_client *c, uint32_t fid, uint64_t offset,
+                           const void *buf, uint32_t count,
+                           uint32_t *out_written);
+
 /* Tclunk: forget `fid`. The fid number becomes available for reuse
  * after this call returns OK. Even on error the fid SHOULD be
  * considered cleared (per 9P2000 convention). */

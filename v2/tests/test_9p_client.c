@@ -872,4 +872,188 @@ STM_TEST(p9_client_tag_mismatch_poisons_subsequent_ops_refused)
     (void)unlink(g_sock_path);
 }
 
+/* ────────────────────────────────────────────────────────────────────── */
+/* P9-LIB-1b: stm_9p_write tests.                                         */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/* Round-trip: lcreate-via-fs (since stm_9p_lcreate isn't implemented in
+ * the lib yet) → walk + lopen O_RDWR → write → read-back → assert
+ * content matches. */
+STM_TEST(p9_client_write_round_trip)
+{
+    client_fixture f = make_client_fixture("write_rt");
+
+    static const uint8_t NAME[] = "out.txt";
+    uint64_t file_ino = 0;
+    /* Create the file empty via the in-process fs API; the test
+     * exercises stm_9p_write to populate it. */
+    STM_ASSERT_OK(stm_fs_create_file(f.fs, /*ds=*/1u, f.root_ino,
+                                       NAME, (uint8_t)(sizeof NAME - 1),
+                                       /*mode=*/0644u, 0, 0, &file_ino));
+    STM_ASSERT_OK(stm_fs_commit(f.fs));
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    const char *names[] = { (const char *)NAME };
+    stm_9p_qid qids[1];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 1, names, qids, &walked));
+    STM_ASSERT_EQ(walked, 1u);
+    STM_ASSERT_OK(stm_9p_lopen(c, 101, STM_9P_O_RDWR, NULL, NULL));
+
+    static const uint8_t PAYLOAD[] = "Hello via libstratum-9p Twrite!\n";
+    static const uint32_t PLEN = (uint32_t)(sizeof PAYLOAD - 1);
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, 101, 0, PAYLOAD, PLEN, &written));
+    STM_ASSERT_EQ(written, PLEN);
+
+    /* Read it back via the same fid (RDWR). */
+    uint8_t rb[64];
+    uint32_t got = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 101, 0, rb, sizeof rb, &got));
+    STM_ASSERT_EQ(got, PLEN);
+    STM_ASSERT(memcmp(rb, PAYLOAD, PLEN) == 0);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* P9-LIB-1b R111 doctrine carry: NULL buf with count > 0 → EINVAL.
+ * count == 0 with NULL buf is a legitimate "nudge" (server
+ * may fsync or just ack; the lib passes through). */
+STM_TEST(p9_client_write_null_buf_with_count_einval)
+{
+    client_fixture f = make_client_fixture("write_null");
+
+    static const uint8_t NAME[] = "x.txt";
+    uint64_t file_ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(f.fs, /*ds=*/1u, f.root_ino,
+                                       NAME, (uint8_t)(sizeof NAME - 1),
+                                       /*mode=*/0644u, 0, 0, &file_ino));
+    STM_ASSERT_OK(stm_fs_commit(f.fs));
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    const char *names[] = { (const char *)NAME };
+    stm_9p_qid qids[1];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 1, names, qids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 101, STM_9P_O_RDWR, NULL, NULL));
+
+    /* NULL buf with count > 0 → STM_EINVAL. */
+    uint32_t written = 0xFFFFFFFF;
+    STM_ASSERT_EQ(stm_9p_write(c, 101, 0, NULL, 16, &written),
+                    STM_EINVAL);
+    STM_ASSERT_EQ(written, 0u);
+
+    /* NULL buf with count == 0: pass through OK; server may emit
+     * a 0-byte Rwrite. */
+    written = 0xFFFFFFFF;
+    STM_ASSERT_OK(stm_9p_write(c, 101, 0, NULL, 0, &written));
+    STM_ASSERT_EQ(written, 0u);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Server enforces O_RDONLY → write returns EACCES per h_write's
+ * accmode == RDONLY refusal. */
+STM_TEST(p9_client_write_to_rdonly_fid_eacces)
+{
+    client_fixture f = make_client_fixture("write_ro");
+
+    static const uint8_t NAME[] = "ro.txt";
+    static const uint8_t SEED[] = "seed";
+    uint64_t file_ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(f.fs, /*ds=*/1u, f.root_ino,
+                                       NAME, (uint8_t)(sizeof NAME - 1),
+                                       /*mode=*/0644u, 0, 0, &file_ino));
+    STM_ASSERT_OK(stm_fs_write(f.fs, 1u, file_ino, 0, SEED, sizeof SEED - 1));
+    STM_ASSERT_OK(stm_fs_commit(f.fs));
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    const char *names[] = { (const char *)NAME };
+    stm_9p_qid qids[1];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 1, names, qids, &walked));
+    /* Open RDONLY — write must refuse. */
+    STM_ASSERT_OK(stm_9p_lopen(c, 101, STM_9P_O_RDONLY, NULL, NULL));
+
+    uint32_t written = 0xFFFFFFFF;
+    stm_status rc = stm_9p_write(c, 101, 0, "Z", 1, &written);
+    /* Server's h_write maps O_RDONLY-on-write to ECODE_EACCES. */
+    STM_ASSERT_EQ(rc, STM_EACCES);
+    STM_ASSERT_EQ(written, 0u);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Sequential writes at increasing offsets — exercises the iounit-
+ * clamp + offset arithmetic on the write side. The file stays in
+ * INLINE mode (≤ STM_INODE_INLINE_MAX = 100 bytes) since the
+ * server's stm_fs_write requires recordsize-aligned writes for
+ * EXTENT mode (single-extent MVP). */
+STM_TEST(p9_client_write_sequential_offsets)
+{
+    client_fixture f = make_client_fixture("write_seq");
+
+    static const uint8_t NAME[] = "seq.txt";
+    uint64_t file_ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(f.fs, /*ds=*/1u, f.root_ino,
+                                       NAME, (uint8_t)(sizeof NAME - 1),
+                                       /*mode=*/0644u, 0, 0, &file_ino));
+    STM_ASSERT_OK(stm_fs_commit(f.fs));
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    const char *names[] = { (const char *)NAME };
+    stm_9p_qid qids[1];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 1, names, qids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 101, STM_9P_O_RDWR, NULL, NULL));
+
+    /* Two 30-byte writes appending — 60 bytes total in INLINE. */
+    uint8_t pa[30], pb[30];
+    for (size_t i = 0; i < 30; i++) {
+        pa[i] = (uint8_t)('a' + (int)(i % 26));
+        pb[i] = (uint8_t)('A' + (int)(i % 26));
+    }
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, 101, 0, pa, 30, &written));
+    STM_ASSERT_EQ(written, 30u);
+    STM_ASSERT_OK(stm_9p_write(c, 101, 30, pb, 30, &written));
+    STM_ASSERT_EQ(written, 30u);
+
+    /* Read back full 60 bytes via two reads. */
+    uint8_t rb[60];
+    uint32_t got = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 101, 0, rb, 30, &got));
+    STM_ASSERT_EQ(got, 30u);
+    STM_ASSERT(memcmp(rb, pa, 30) == 0);
+    STM_ASSERT_OK(stm_9p_read(c, 101, 30, rb + 30, 30, &got));
+    STM_ASSERT_EQ(got, 30u);
+    STM_ASSERT(memcmp(rb + 30, pb, 30) == 0);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
 STM_TEST_MAIN("9p_client")

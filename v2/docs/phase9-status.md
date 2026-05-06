@@ -830,6 +830,22 @@ language bindings, future kernel module) is a 9P consumer.
       cap bound, poison flag, and strict body-len equality.
       test_9p_client 13 → 15.
 
+      **P9-LIB-1b Twrite primitive** (audit-light): adds
+      `stm_9p_write(c, fid, offset, buf, count, *out_written)` —
+      the write-side counterpart to stm_9p_read. Wire: fid[4] +
+      offset[8] + count[4] + data[count]; reply: count[4]. Inherits
+      all R111 doctrine: caller-cap bound on returned written
+      (> requested → STM_EBACKEND), op_entry_check at entry,
+      strict body-len equality on Rwrite (must be exactly 4
+      bytes), NULL buf with count > 0 → STM_EINVAL (count == 0
+      with NULL buf is a legitimate "nudge"). count clamped to
+      iounit. 4 new tests: round-trip (write + read-back),
+      NULL-buf rejection, write to RDONLY fid → EACCES, sequential
+      writes at offsets 0/30 (INLINE). Foundation for the CLI's
+      `echo X > /file` workflow + future Tlcreate / Tmkdir /
+      Tunlinkat / Trenameat / Tsetattr / Tfsync ops in P9-LIB-1c.
+      test_9p_client 15 → 19.
+
 - [ ] **P9-LIB-2 libstratum-9p async API** — pending.
 
 - [ ] **P9-BIND-1/2/3 language bindings** — pending; Rust crate

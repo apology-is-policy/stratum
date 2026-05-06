@@ -703,6 +703,67 @@ stm_status stm_9p_read(stm_9p_client *c, uint32_t fid, uint64_t offset,
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
+/* Twrite.                                                                 */
+/* ────────────────────────────────────────────────────────────────────── */
+
+stm_status stm_9p_write(stm_9p_client *c, uint32_t fid, uint64_t offset,
+                           const void *buf, uint32_t count,
+                           uint32_t *out_written)
+{
+    if (out_written) *out_written = 0;
+    stm_status ec = op_entry_check(c);
+    if (ec != STM_OK) return ec;
+    /* P9-LIB-1b R111 doctrine carry: NULL buf with count > 0 →
+     * STM_EINVAL (mirrors stm_9p_read's F-6 fix). count == 0
+     * with NULL buf is a legitimate "nudge" shape (server may
+     * fsync or just acknowledge); pass through. */
+    if (count > 0 && !buf) return STM_EINVAL;
+    /* Clamp count to iounit so the entire Twrite (header + 4-byte
+     * count + data) fits in our msize buffer. */
+    if (count > c->iounit) count = c->iounit;
+
+    uint32_t msg_size = STM_9P_HDR_SIZE + 4u + 8u + 4u + count;
+    if (msg_size > c->buf_cap) return STM_ERANGE;
+    uint16_t tag = 0;
+    stm_status rc = alloc_tag(c, &tag);
+    if (rc != STM_OK) return rc;
+
+    uint8_t *wp = c->buf;
+    p_u32(wp, msg_size);
+    wp[4] = STM_9P_TWRITE;
+    p_u16(wp + 5, tag);
+    p_u32(wp + 7, fid);
+    p_u64(wp + 11, offset);
+    p_u32(wp + 19, count);
+    if (count > 0) memcpy(wp + 23, buf, count);
+    rc = send_msg(c, msg_size);
+    if (rc != STM_OK) return rc;
+
+    uint32_t reply_size = 0;
+    rc = recv_msg(c, &reply_size);
+    if (rc != STM_OK) return rc;
+    const uint8_t *body = NULL;
+    uint32_t body_len = 0;
+    rc = check_reply(c, reply_size, STM_9P_RWRITE, tag, &body, &body_len);
+    if (rc != STM_OK) return rc;
+    /* Rwrite body: count[4]. R111 P3 F-10 doctrine carry: strict
+     * equality refuses extra trailing bytes. */
+    if (body_len != 4u) {
+        c->last_errno = EPROTO;
+        return STM_EBACKEND;
+    }
+    uint32_t written = g_u32(body);
+    /* Caller-cap bound (R111 P0 F-1 lesson): server-returned count
+     * MUST NOT exceed our request. */
+    if (written > count) {
+        c->last_errno = EPROTO;
+        return STM_EBACKEND;
+    }
+    if (out_written) *out_written = written;
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
 /* Tclunk.                                                                 */
 /* ────────────────────────────────────────────────────────────────────── */
 
