@@ -1524,6 +1524,42 @@ stm_status stm_fs_delete_snapshot(stm_fs *fs, uint64_t snapshot_id,
                                      size_t *out_freed_count);
 
 /*
+ * P9-CTL-1d-actions-snapshot-hold: increment a snapshot's hold
+ * count. Holds prevent delete (snapshot.tla::HoldPreventsDelete);
+ * stm_fs_delete_snapshot returns STM_EBUSY while hold_count > 0.
+ *
+ * Multiple agents (operators, send/recv, replication) can hold the
+ * same snapshot concurrently; each Hold pairs with a Release.
+ *
+ * Holds are in-RAM state on the snapshot_index; they reset on
+ * remount. v2.0 does not persist hold counts across mount cycles.
+ *
+ * Holds fs->lock + FS_GUARD_WRITE for the dispatch (mutates the
+ * snapshot index's hold-count counter; STM_EWEDGED + STM_EROFS
+ * apply uniformly with the other write-shape wrappers).
+ *
+ * Refusals propagated from stm_snapshot_hold:
+ *   STM_EINVAL  — NULL fs; snapshot_id == 0
+ *   STM_ECORRUPT — snapshot index unavailable
+ *   STM_ENOENT  — snapshot_id unknown / already-deleted
+ *   STM_EWEDGED — fs is wedged
+ *   STM_EROFS   — fs is read-only
+ */
+STM_MUST_USE
+stm_status stm_fs_hold_snapshot(stm_fs *fs, uint64_t snapshot_id);
+
+/*
+ * Decrement a snapshot's hold count. Symmetric with
+ * stm_fs_hold_snapshot.
+ *
+ * Refusals (additional to the hold set):
+ *   STM_EINVAL  — hold_count was already 0 (no matching Hold to
+ *                 release; caller bug)
+ */
+STM_MUST_USE
+stm_status stm_fs_release_snapshot(stm_fs *fs, uint64_t snapshot_id);
+
+/*
  * P7-16: stm_fs_reflink — POSIX-shape FICLONE. Replaces dst's empty
  * extent tree with a reflink-share of src's extent tree. Same
  * semantics as `ioctl(fd_dst, FICLONE, fd_src)` for a freshly-created

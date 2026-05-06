@@ -605,6 +605,23 @@ language bindings, future kernel module) is a 9P consumer.
                   overwrite-induced dead-list entries — out_freed_
                   count >= 1). P3-4 added wedged-fs test mirror.
                   test_ctl 108 → 110.
+            - [x] **P9-CTL-1d-actions-snapshot-hold** — symmetric
+                  pair: /datasets/<id>/hold-snapshot + /datasets/
+                  <id>/release-snapshot (admin-only mode 0200).
+                  KIND_MAX = 25 (was 23). New public APIs
+                  stm_fs_hold_snapshot + stm_fs_release_snapshot —
+                  thin wrappers around stm_snapshot_hold/_release
+                  under fs->lock + FS_GUARD_WRITE. Holds gate
+                  delete via STM_EBUSY (snapshot.tla::Hold
+                  PreventsDelete). Multiple-hold/multiple-release
+                  pairing tested. R105 P3-1 audit-log doctrine
+                  carries: post-admin refusals all log. 7 -1d-
+                  actions-snapshot-hold tests in test_ctl.c
+                  (112 → 119): blocks_delete_release_unblocks,
+                  multiple_holds_pair, release_without_hold_einval,
+                  hold_nonexistent_enoent, wrapper_boundaries
+                  (NULL/0/wedged), nonadmin_eacces, post_admin_
+                  refusals_log. R108 audit pending.
             - [ ] **P9-CTL-1d-actions-snapshot-rollback** — pending;
                   higher-risk (mutates working tree); requires
                   snapshot-rollback invariant analysis. Check

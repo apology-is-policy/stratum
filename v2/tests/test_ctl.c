@@ -4467,4 +4467,202 @@ STM_TEST(ctl_r107_scrub_trigger_post_admin_refusals_log)
     destroy_scrub_trigger_fixture(f);
 }
 
+/* ── P9-CTL-1d-actions-snapshot-hold {hold,release}-snapshot ────── */
+
+/* Walk + open one of the two new triggers — pass kind name as
+ * "hold-snapshot" or "release-snapshot". */
+static void open_hold_release(scrub_trigger_fixture *f, const char *kind_name,
+                                 uint64_t dataset_id, uint16_t tag,
+                                 uint32_t fid)
+{
+    char ds_str[32];
+    snprintf(ds_str, sizeof ds_str, "%llu", (unsigned long long)dataset_id);
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[3];
+    path[0] = "datasets";
+    path[1] = ds_str;
+    path[2] = kind_name;
+    uint32_t sz = build_twalk(req, tag, 10, fid, 3, path);
+    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    sz = build_topen(req, (uint16_t)(tag + 1), fid, STM_P9_OWRITE);
+    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+}
+
+/* Hold a snapshot, then attempt delete → STM_EBUSY. Release the
+ * hold, retry delete → STM_OK. End-to-end of the hold contract. */
+STM_TEST(ctl_d8_hold_blocks_delete_release_unblocks)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_d8_block", 0);
+    uint64_t snap_id = setup_snapshot(f.fs, 1, "held_snap");
+
+    char body[32];
+    int n = snprintf(body, sizeof body, "%llu",
+                      (unsigned long long)snap_id);
+
+    /* Hold the snap via /ctl/. */
+    open_hold_release(&f, "hold-snapshot", 1, 2, 11);
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    uint32_t sz = build_twrite(req, 4, 11, 0, body, (uint32_t)n);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWRITE);
+
+    /* Attempt to delete — refused with STM_EBUSY → RERROR. */
+    STM_ASSERT_EQ(stm_fs_delete_snapshot(f.fs, snap_id, NULL), STM_EBUSY);
+
+    /* Release the hold. */
+    open_hold_release(&f, "release-snapshot", 1, 6, 12);
+    sz = build_twrite(req, 8, 12, 0, body, (uint32_t)n);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWRITE);
+
+    /* Now delete succeeds. */
+    STM_ASSERT_OK(stm_fs_delete_snapshot(f.fs, snap_id, NULL));
+
+    /* Audit log records hold + release + delete. */
+    char ebody[8192];
+    read_events_log(&f, 10, 13, ebody, sizeof ebody);
+    char want[128];
+    snprintf(want, sizeof want,
+        "hold-snapshot uid=0 dataset=1 snap-id=%llu result=ok",
+        (unsigned long long)snap_id);
+    STM_ASSERT(strstr(ebody, want) != NULL);
+    snprintf(want, sizeof want,
+        "release-snapshot uid=0 dataset=1 snap-id=%llu result=ok",
+        (unsigned long long)snap_id);
+    STM_ASSERT(strstr(ebody, want) != NULL);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* Multiple holds on the same snap: each hold/release pairs.
+ * Two holds + one release = still held; two holds + two releases =
+ * deletable. */
+STM_TEST(ctl_d8_multiple_holds_pair_with_releases)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_d8_multi", 0);
+    uint64_t snap_id = setup_snapshot(f.fs, 1, "multi_held");
+
+    /* Two holds via direct wrapper. */
+    STM_ASSERT_OK(stm_fs_hold_snapshot(f.fs, snap_id));
+    STM_ASSERT_OK(stm_fs_hold_snapshot(f.fs, snap_id));
+
+    /* One release — still held → delete refused. */
+    STM_ASSERT_OK(stm_fs_release_snapshot(f.fs, snap_id));
+    STM_ASSERT_EQ(stm_fs_delete_snapshot(f.fs, snap_id, NULL), STM_EBUSY);
+
+    /* Second release — count back to 0 → delete OK. */
+    STM_ASSERT_OK(stm_fs_release_snapshot(f.fs, snap_id));
+    STM_ASSERT_OK(stm_fs_delete_snapshot(f.fs, snap_id, NULL));
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* Release without matching hold → STM_EINVAL (caller bug). */
+STM_TEST(ctl_d8_release_without_hold_einval)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_d8_orphan", 0);
+    uint64_t snap_id = setup_snapshot(f.fs, 1, "orphan_release");
+
+    /* Direct wrapper — no /ctl/ needed for boundary tests. */
+    STM_ASSERT_EQ(stm_fs_release_snapshot(f.fs, snap_id), STM_EINVAL);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* Hold a nonexistent snap_id → STM_ENOENT. */
+STM_TEST(ctl_d8_hold_nonexistent_enoent)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_d8_no_snap", 0);
+
+    STM_ASSERT_EQ(stm_fs_hold_snapshot(f.fs, 99999), STM_ENOENT);
+    STM_ASSERT_EQ(stm_fs_release_snapshot(f.fs, 99999), STM_ENOENT);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* Wrapper boundary: NULL fs / snap_id == 0. */
+STM_TEST(ctl_d8_hold_release_wrapper_boundaries)
+{
+    /* NULL fs → STM_EINVAL. */
+    STM_ASSERT_EQ(stm_fs_hold_snapshot(NULL, 1), STM_EINVAL);
+    STM_ASSERT_EQ(stm_fs_release_snapshot(NULL, 1), STM_EINVAL);
+
+    make_tmp("ctl_d8_bound");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* snap_id == 0 → STM_EINVAL. */
+    STM_ASSERT_EQ(stm_fs_hold_snapshot(fs, 0), STM_EINVAL);
+    STM_ASSERT_EQ(stm_fs_release_snapshot(fs, 0), STM_EINVAL);
+
+    /* Wedged → STM_EWEDGED. */
+    uint64_t snap_id = setup_snapshot(fs, 1, "wedge_target");
+    stm_fs_mark_wedged(fs);
+    STM_ASSERT_EQ(stm_fs_hold_snapshot(fs, snap_id), STM_EWEDGED);
+    STM_ASSERT_EQ(stm_fs_release_snapshot(fs, snap_id), STM_EWEDGED);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
+/* Non-admin Topen of either trigger → EACCES. */
+STM_TEST(ctl_d8_hold_release_nonadmin_eacces)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_d8_nadm", 1000);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *paths[2][3] = {
+        { "datasets", "1", "hold-snapshot"    },
+        { "datasets", "1", "release-snapshot" },
+    };
+    for (int i = 0; i < 2; i++) {
+        uint32_t sz = build_twalk(req, (uint16_t)(2 + i*2), 10,
+                                     (uint32_t)(11 + i),
+                                     3, paths[i]);
+        STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+        STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+        sz = build_topen(req, (uint16_t)(3 + i*2), (uint32_t)(11 + i),
+                            STM_P9_OWRITE);
+        STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+        STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+    }
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* Bad-parse + zero-byte refused, both logged (R105 P3-1 doctrine). */
+STM_TEST(ctl_d8_hold_post_admin_refusals_log)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_d8_logs", 0);
+    open_hold_release(&f, "hold-snapshot", 1, 2, 11);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+
+    /* Zero-byte. */
+    uint32_t sz = build_twrite(req, 4, 11, 0, "", 0);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* Bad parse. */
+    sz = build_twrite(req, 5, 11, 0, "abc", 3);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* Audit log captures both. */
+    char ebody[8192];
+    read_events_log(&f, 6, 12, ebody, sizeof ebody);
+    STM_ASSERT(strstr(ebody, "hold-snapshot uid=0 dataset=1 snap-id=0 result=err") != NULL);
+    STM_ASSERT(strstr(ebody, "hold-snapshot uid=0 dataset=1 snap-id=<bad-parse> result=err") != NULL);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
 STM_TEST_MAIN("ctl")

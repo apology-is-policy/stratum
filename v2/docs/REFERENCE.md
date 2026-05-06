@@ -38,9 +38,26 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P8.5 audit-log doctrine backport (this commit). 43
-  ctest suites green default. test_ctl 112/112 (was 110 at R106
-  close; +2 R107 backport tests). **R107 backport (R105 P3-1
+- **Tip**: P9-CTL-1d-actions-snapshot-hold substantive (this
+  commit). 43 ctest suites green default. test_ctl 119/119 (was
+  112 at R107 close; +7 -1d-actions-snapshot-hold). **P9-CTL-1d-
+  actions-snapshot-hold** adds /datasets/<id>/hold-snapshot +
+  /datasets/<id>/release-snapshot (admin-only mode 0200, symmetric
+  pair). KIND_MAX = 25 (was 23); two new kinds. New public APIs
+  stm_fs_hold_snapshot + stm_fs_release_snapshot — thin wrappers
+  taking fs->lock + FS_GUARD_WRITE around stm_snapshot_hold/_
+  release. Composes against the writable-kind family (now 6
+  kinds). Hold gates delete via STM_EBUSY (snapshot.tla::Hold
+  PreventsDelete invariant); the chunk's headline test
+  ctl_d8_hold_blocks_delete_release_unblocks pins the round-trip
+  end-to-end through /ctl/. Multiple-hold/multiple-release
+  pairing is also tested. R108 audit pending. The /ctl/ writable-
+  kind family is now feature-complete for v2.0's snapshot
+  lifecycle: create + delete + hold + release.
+
+- **Pre-tip-1**: P8.5 audit-log doctrine backport. 43 ctest
+  suites green default. test_ctl 112/112 (was 110 at R106 close;
+  +2 R107 backport tests). **R107 backport (R105 P3-1
   doctrine carry)** extends the post-admin-gate-refusals-DO-log
   policy from create-snapshot + delete-snapshot to the prior
   writable kinds (KIND_ADMIN_CLEAR_EVENTS + KIND_POOL_SCRUB_

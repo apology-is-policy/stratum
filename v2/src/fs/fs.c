@@ -4486,6 +4486,48 @@ stm_status stm_fs_delete_snapshot(stm_fs *fs, uint64_t snapshot_id,
     return first_err;
 }
 
+/* P9-CTL-1d-actions-snapshot-hold: thin hold/release wrappers. Both
+ * mutate the snapshot index's hold-count counter under fs->lock +
+ * FS_GUARD_WRITE. Holds are in-RAM state per snapshot.h's contract;
+ * they reset on remount. */
+stm_status stm_fs_hold_snapshot(stm_fs *fs, uint64_t snapshot_id)
+{
+    if (!fs) return STM_EINVAL;
+    if (snapshot_id == 0) return STM_EINVAL;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+
+    stm_snapshot_index *sidx = stm_sync_snapshot_index(fs->sync);
+    if (!sidx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_ECORRUPT;
+    }
+
+    stm_status s = stm_snapshot_hold(sidx, snapshot_id);
+    pthread_mutex_unlock(&fs->lock);
+    return s;
+}
+
+stm_status stm_fs_release_snapshot(stm_fs *fs, uint64_t snapshot_id)
+{
+    if (!fs) return STM_EINVAL;
+    if (snapshot_id == 0) return STM_EINVAL;
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+
+    stm_snapshot_index *sidx = stm_sync_snapshot_index(fs->sync);
+    if (!sidx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_ECORRUPT;
+    }
+
+    stm_status s = stm_snapshot_release(sidx, snapshot_id);
+    pthread_mutex_unlock(&fs->lock);
+    return s;
+}
+
 stm_status stm_fs_set_dataset_pool_default(stm_fs *fs, stm_property prop,
                                               uint64_t value)
 {
