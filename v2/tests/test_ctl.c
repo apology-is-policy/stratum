@@ -19,6 +19,7 @@
 #include <stratum/p9.h>
 #include <stratum/pool.h>
 #include <stratum/scrub.h>          /* P9-CTL-1d-scrub-read */
+#include <stratum/snapshot.h>       /* P9-CTL-1d-actions-snapshot-create */
 #include <stratum/send_recv.h>     /* STM_SEND_VERSION */
 #include <stratum/super.h>          /* STM_UB_VERSION + STM_DEV_*_ */
 #include <stratum/sync.h>           /* stm_sync_pool */
@@ -3696,6 +3697,259 @@ STM_TEST(ctl_d5_scrub_trigger_omitted_when_unattached)
     stm_p9_server_destroy(s);
     stm_ctl_destroy(c);
     destroy_test_pool(f);
+}
+
+/* ── P9-CTL-1d-actions-snapshot-create ─────────────────────────── */
+
+/* Walk + open the create-snapshot trigger under the given fid. */
+static void open_create_snapshot(scrub_trigger_fixture *f, uint64_t dataset_id,
+                                    uint16_t tag, uint32_t fid)
+{
+    char ds_str[32];
+    snprintf(ds_str, sizeof ds_str, "%llu", (unsigned long long)dataset_id);
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "datasets", ds_str, "create-snapshot" };
+    uint32_t sz = build_twalk(req, tag, 10, fid, 3, path);
+    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+    sz = build_topen(req, (uint16_t)(tag + 1), fid, STM_P9_OWRITE);
+    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_ROPEN);
+}
+
+/* Read /events into body[]; helper for asserting audit log content. */
+static uint32_t read_events_log(scrub_trigger_fixture *f, uint16_t tag,
+                                   uint32_t fid, char *body, size_t cap)
+{
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "events" };
+    uint32_t sz = build_twalk(req, tag, 10, fid, 1, path);
+    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, (uint16_t)(tag + 1), fid, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_tread(req, (uint16_t)(tag + 2), fid, 0, (uint32_t)(cap - 1));
+    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    uint32_t count = load_u32(resp + 7);
+    STM_ASSERT(count < cap);
+    memcpy(body, resp + 11, count);
+    body[count] = '\0';
+    sz = build_tclunk(req, (uint16_t)(tag + 3), fid);
+    STM_ASSERT_OK(stm_p9_server_handle(f->s, req, sz, resp, sizeof resp, &rlen));
+    return count;
+}
+
+/* admin Twrite "snap_a" → snapshot index gains an entry; /events
+ * records uid + dataset + result + snap-id. */
+STM_TEST(ctl_d6_create_snapshot_admin_succeeds)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_d6_create", 0);
+    /* Root dataset id is 1 by convention (STM_DATASET_ROOT_ID). */
+    open_create_snapshot(&f, /*dataset_id=*/1, 2, 11);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    uint32_t sz = build_twrite(req, 4, 11, 0, "snap_a", 6);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWRITE);
+    STM_ASSERT_EQ(load_u32(resp + 7), 6u);
+
+    /* /events records the success. */
+    char ebody[8192];
+    read_events_log(&f, 5, 12, ebody, sizeof ebody);
+    STM_ASSERT(strstr(ebody, "create-snapshot uid=0 dataset=1 name-len=6 result=ok") != NULL);
+
+    /* Sanity: snapshot index now has a snap. Use the same snapshot
+     * index handle as the wrapper to assert. */
+    stm_sync *sync = stm_fs_sync_for_test(f.fs);
+    stm_snapshot_index *sidx = stm_sync_snapshot_index(sync);
+    size_t n = 0;
+    STM_ASSERT_OK(stm_snapshot_count(sidx, &n));
+    STM_ASSERT_EQ(n, (size_t)1);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* Trailing newline + whitespace is stripped from the verb-match.
+ * out_written returns the FULL byte count (R104 P3-2 carry). */
+STM_TEST(ctl_d6_create_snapshot_trailing_newline_stripped)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_d6_nl", 0);
+    open_create_snapshot(&f, /*dataset_id=*/1, 2, 11);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    /* "snap_b\n" — len=7, name=6 chars after trim. */
+    uint32_t sz = build_twrite(req, 4, 11, 0, "snap_b\n", 7);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWRITE);
+    STM_ASSERT_EQ(load_u32(resp + 7), 7u);
+
+    /* Audit log records name-len=6 (post-trim). */
+    char ebody[8192];
+    read_events_log(&f, 5, 12, ebody, sizeof ebody);
+    STM_ASSERT(strstr(ebody, "name-len=6 result=ok") != NULL);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* R99 P2-1 carry: snapshot name with embedded control byte refused
+ * by snapshot.c::stm_snap_name_chars_valid. The error propagates
+ * through stm_fs_create_snapshot as STM_EINVAL → wire RERROR. The
+ * audit log records the failure. */
+STM_TEST(ctl_d6_create_snapshot_control_char_rejected)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_d6_ctrl", 0);
+    open_create_snapshot(&f, /*dataset_id=*/1, 2, 11);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    /* Name with embedded \n — refused at snapshot_create_inner. */
+    uint32_t sz = build_twrite(req, 4, 11, 0, "evil\nflags: 0xdeadbeef", 22);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* Audit log records the failure but the embedded \n is in the
+     * count, not the verbatim — no line-injection because the log
+     * line uses name-len, not name content. */
+    char ebody[8192];
+    read_events_log(&f, 5, 12, ebody, sizeof ebody);
+    STM_ASSERT(strstr(ebody, "create-snapshot uid=0 dataset=1") != NULL);
+    STM_ASSERT(strstr(ebody, "result=err") != NULL);
+    /* The forged-line attack: the audit log MUST NOT contain the
+     * malicious "flags: 0xdeadbeef" string verbatim. */
+    STM_ASSERT(strstr(ebody, "flags: 0xdeadbeef") == NULL);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* Snapshot index now refuses control bytes at the source: a direct
+ * stm_fs_create_snapshot call with a control-byte name returns
+ * STM_EINVAL. Pins the wrapper's contract independent of the /ctl/
+ * presentation surface. */
+STM_TEST(ctl_d6_create_snapshot_wrapper_refuses_control_bytes)
+{
+    make_tmp("ctl_d6_wrapper");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t snap_id = 0;
+    /* Embedded \n. */
+    STM_ASSERT_EQ(stm_fs_create_snapshot(fs, 1, "bad\nname", 8, &snap_id),
+                  STM_EINVAL);
+    /* Embedded \t. */
+    STM_ASSERT_EQ(stm_fs_create_snapshot(fs, 1, "bad\tname", 8, &snap_id),
+                  STM_EINVAL);
+    /* Embedded NUL byte. */
+    STM_ASSERT_EQ(stm_fs_create_snapshot(fs, 1, "bad\0name", 8, &snap_id),
+                  STM_EINVAL);
+    /* DEL byte. */
+    STM_ASSERT_EQ(stm_fs_create_snapshot(fs, 1, "bad\x7Fname", 8, &snap_id),
+                  STM_EINVAL);
+    /* Empty name → STM_EINVAL (length gate). */
+    STM_ASSERT_EQ(stm_fs_create_snapshot(fs, 1, "", 0, &snap_id),
+                  STM_EINVAL);
+    /* dataset_id 0 → STM_EINVAL. */
+    STM_ASSERT_EQ(stm_fs_create_snapshot(fs, 0, "ok", 2, &snap_id),
+                  STM_EINVAL);
+    /* Name == 256 bytes → STM_EINVAL (cap STM_SNAP_NAME_MAX = 255). */
+    char too_long[STM_SNAP_NAME_MAX + 2];
+    memset(too_long, 'a', sizeof too_long);
+    STM_ASSERT_EQ(stm_fs_create_snapshot(fs, 1, too_long, sizeof too_long,
+                                            &snap_id), STM_EINVAL);
+
+    /* Valid: regular ASCII. */
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "good_name", 9, &snap_id));
+    STM_ASSERT(snap_id != 0);
+
+    /* Valid: UTF-8 multi-byte (≥ 0x80) — accepted unchanged. */
+    uint64_t snap2 = 0;
+    STM_ASSERT_OK(stm_fs_create_snapshot(fs, 1, "café", 5, &snap2));
+    STM_ASSERT(snap2 != 0 && snap2 != snap_id);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+}
+
+/* Twrite to a non-existent dataset returns STM_ENOENT (or
+ * STM_EINVAL — depends on dataset_id format). dsid=99999999 is
+ * past the root_id but within the parser's accept range. */
+STM_TEST(ctl_d6_create_snapshot_nonexistent_dataset_enoent)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_d6_no_ds", 0);
+
+    /* Walk to /datasets/99999999/create-snapshot fails at stat_at —
+     * dataset doesn't exist, so the walk returns RERROR before we
+     * even try to open. */
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "datasets", "99999999", "create-snapshot" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 3, path);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* Non-admin Topen of /datasets/<id>/create-snapshot refused with
+ * EACCES. The dirent itself is visible (Twalk succeeds) per the
+ * established posture. */
+STM_TEST(ctl_d6_create_snapshot_nonadmin_eacces)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_d6_nadm", 1000);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "datasets", "1", "create-snapshot" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 3, path);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWALK);
+
+    sz = build_topen(req, 3, 11, STM_P9_OWRITE);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* Zero-byte Twrite refused (R101 P2-2 carry). */
+STM_TEST(ctl_d6_create_snapshot_zero_byte_einval)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_d6_zero", 0);
+    open_create_snapshot(&f, /*dataset_id=*/1, 2, 11);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    uint32_t sz = build_twrite(req, 4, 11, 0, "", 0);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
+/* Duplicate name returns STM_EEXIST → RERROR; audit log records
+ * "result=err". */
+STM_TEST(ctl_d6_create_snapshot_duplicate_name_eexists)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_d6_dup", 0);
+    open_create_snapshot(&f, /*dataset_id=*/1, 2, 11);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    /* First create succeeds. */
+    uint32_t sz = build_twrite(req, 4, 11, 0, "snap_x", 6);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RWRITE);
+
+    /* Second with same name → RERROR (STM_EEXIST). */
+    sz = build_twrite(req, 5, 11, 0, "snap_x", 6);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    destroy_scrub_trigger_fixture(f);
 }
 
 STM_TEST_MAIN("ctl")

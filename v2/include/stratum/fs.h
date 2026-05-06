@@ -1435,6 +1435,49 @@ stm_status stm_fs_alloc_attached(const stm_fs *fs, uint16_t device_id,
                                     bool *out);
 
 /*
+ * P9-CTL-1d-actions-snapshot-create: snapshot-create wrapper.
+ * /ctl/datasets/<id>/create-snapshot drives this; future surfaces
+ * (CLI, FUSE ioctl, etc.) compose against the same wrapper.
+ *
+ * Resolves the snapshot index via stm_sync_snapshot_index, captures
+ * the current sync gen as extent_txg, and dispatches to
+ * stm_snapshot_create. Holds fs->lock + FS_GUARD_WRITE for the
+ * dispatch (creating a snapshot mutates the snapshot index, so
+ * STM_EWEDGED + STM_EROFS apply).
+ *
+ * Name validation: snapshot.c's stm_snap_name_chars_valid (mirror
+ * of dataset.c's R99 P2-1 gate) refuses bytes < 0x20 + 0x7F at
+ * snapshot_create_inner. The wrapper passes through; UTF-8
+ * multi-byte sequences (≥ 0x80) accepted unchanged.
+ *
+ * Wire interface (vs. stm_snapshot_create's NUL-terminated arg):
+ * the wrapper takes (name, name_len) so callers from /ctl/ can
+ * pass body-buffer slices without copying. Internally it
+ * NUL-terminates into a stack buffer to call into snapshot.c
+ * (STM_SNAP_NAME_MAX = 255 + NUL = 256 byte stack budget).
+ *
+ * Returns:
+ *   STM_EINVAL  — NULL fs/name/out_id; name_len 0 or > STM_SNAP_NAME_MAX;
+ *                 dataset_id == 0; name has control chars; chain
+ *                 ordering violation (R40 P2-1).
+ *   STM_EWEDGED — fs is wedged.
+ *   STM_EROFS   — fs is read-only.
+ *   STM_ECORRUPT — sync's snapshot_index unavailable.
+ *   STM_ENOENT  — dataset_id not present (refused by the underlying
+ *                 stm_snapshot_create's caller-side semantics —
+ *                 v2.0 doesn't validate dataset existence here, but
+ *                 callers SHOULD check via stm_fs_dataset_lookup
+ *                 before invoking).
+ *   STM_EEXIST  — name collides with another PRESENT snap of the
+ *                 same dataset.
+ *   STM_OK      — *out_id holds the new snapshot id.
+ */
+STM_MUST_USE
+stm_status stm_fs_create_snapshot(stm_fs *fs, uint64_t dataset_id,
+                                     const char *name, size_t name_len,
+                                     uint64_t *out_id);
+
+/*
  * P7-16: stm_fs_reflink — POSIX-shape FICLONE. Replaces dst's empty
  * extent tree with a reflink-share of src's extent tree. Same
  * semantics as `ioctl(fd_dst, FICLONE, fd_src)` for a freshly-created

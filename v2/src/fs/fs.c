@@ -46,6 +46,7 @@
 #include <stratum/keyfile.h>
 #include <stratum/pool.h>
 #include <stratum/super.h>
+#include <stratum/snapshot.h>
 #include <stratum/sync.h>
 
 #include <sys/stat.h>            /* S_IFMT / S_IFREG / S_IFDIR */
@@ -4294,6 +4295,76 @@ stm_status stm_fs_alloc_attached(const stm_fs *fs, uint16_t device_id,
     *out = (a != NULL);
     pthread_mutex_unlock(&mfs->lock);
     return STM_OK;
+}
+
+/* P9-CTL-1d-actions-snapshot-create: snapshot create wrapper.
+ * Resolves the snapshot index via stm_sync_snapshot_index, captures
+ * sync's current_gen as extent_txg, and dispatches to stm_snapshot_
+ * create. Holds fs->lock + FS_GUARD_WRITE — creating a snapshot
+ * mutates the snapshot index, so wedged + read-only states refuse.
+ *
+ * NUL-terminates the (name, name_len) slice into a STM_SNAP_NAME_MAX+1
+ * stack buffer so it can hand to stm_snapshot_create which uses
+ * strlen internally. The wrapper validates length BEFORE the copy
+ * (refuses 0 or > STM_SNAP_NAME_MAX) so the buffer is never
+ * overflowed.
+ *
+ * R99 P2-1 carry: snapshot.c's snapshot_create_inner now calls
+ * stm_snap_name_chars_valid which refuses bytes < 0x20 + 0x7F.
+ * The wrapper relies on that source-side gate — does not duplicate
+ * the check (single-source-of-truth posture per R99 P2-1's lesson). */
+stm_status stm_fs_create_snapshot(stm_fs *fs, uint64_t dataset_id,
+                                     const char *name, size_t name_len,
+                                     uint64_t *out_id)
+{
+    if (out_id) *out_id = 0;
+    if (!fs || !name || !out_id) return STM_EINVAL;
+    if (dataset_id == 0) return STM_EINVAL;
+    if (name_len == 0 || name_len > STM_SNAP_NAME_MAX) return STM_EINVAL;
+
+    /* Wrapper-side defense-in-depth: snapshot.c's char-validation
+     * runs after `strlen(name)` truncates at the first 0x00 byte.
+     * If the caller passes "bad\0name" with name_len=8, snapshot.c
+     * sees "bad" (3 chars) and accepts it — the embedded NUL has
+     * silently truncated the name. The wrapper's contract takes a
+     * (name, name_len) slice, so we MUST refuse embedded NULs
+     * here to prevent the caller from being surprised.
+     *
+     * Refusing the full <0x20 + 0x7F class at the wrapper too is
+     * defense-in-depth — the underlying check in snapshot.c is the
+     * source-of-truth, but this wrapper is a trust boundary that
+     * users (CLI, /ctl/, FUSE) call directly. Two checks make any
+     * future API drift harder to silently introduce. */
+    for (size_t i = 0; i < name_len; i++) {
+        uint8_t c = (uint8_t)name[i];
+        if (c < 0x20 || c == 0x7F) return STM_EINVAL;
+    }
+
+    char nbuf[STM_SNAP_NAME_MAX + 1];
+    memcpy(nbuf, name, name_len);
+    nbuf[name_len] = '\0';
+
+    pthread_mutex_lock(&fs->lock);
+    FS_GUARD_WRITE(fs);
+
+    stm_snapshot_index *sidx = stm_sync_snapshot_index(fs->sync);
+    if (!sidx) {
+        pthread_mutex_unlock(&fs->lock);
+        return STM_ECORRUPT;
+    }
+
+    uint64_t cur_gen = stm_sync_current_gen(fs->sync);
+    /* tree_root_paddr=0: dataset.h's stm_dataset_entry doesn't yet
+     * carry a per-dataset tree-root paddr (P6/P7 follow-on). v2.0's
+     * snapshot index records the value as opaque metadata; existing
+     * tests (test_send_recv.c:222) pass 0 too. When the per-dataset
+     * tree-root surface lands, this wrapper bumps to pass it
+     * through. */
+    stm_status s = stm_snapshot_create(sidx, dataset_id, nbuf,
+                                          /*tree_root_paddr=*/0,
+                                          cur_gen, out_id);
+    pthread_mutex_unlock(&fs->lock);
+    return s;
 }
 
 stm_status stm_fs_set_dataset_pool_default(stm_fs *fs, stm_property prop,

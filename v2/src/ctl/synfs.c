@@ -18,6 +18,7 @@
  *   /datasets/                              directory: registered datasets
  *   /datasets/<id>/                         directory: per-dataset
  *   /datasets/<id>/properties               read: combined entry+effective props
+ *   /datasets/<id>/create-snapshot          write: snapshot name (admin)
  *   /admin/                                 directory: admin-only (mode 0500)
  *   /admin/peer                             read: caller uid/gid+is-admin (admin)
  *   /admin/clear-events                     write: reset /events log (admin)
@@ -100,6 +101,7 @@
 #include <stratum/p9.h>
 #include <stratum/pool.h>
 #include <stratum/scrub.h>          /* stm_scrub_state, stm_scrub_status */
+#include <stratum/snapshot.h>       /* STM_SNAP_NAME_MAX */
 #include <stratum/send_recv.h>      /* STM_SEND_VERSION */
 #include <stratum/super.h>          /* STM_UB_VERSION + STM_DEV_*_ values */
 #include <stratum/sync.h>           /* STM_SYNC_DATASET_ID_MAX */
@@ -138,6 +140,7 @@ typedef enum {
     KIND_DEBUG_ALLOC          = 18,   /* /debug/allocator-state/<id> — admin-only file */
     KIND_POOL_SCRUB           = 19,   /* /pools/<uuid>/scrub — read state+counters */
     KIND_POOL_SCRUB_TRIGGER   = 20,   /* /pools/<uuid>/scrub-trigger — admin write */
+    KIND_DATASET_CREATE_SNAPSHOT = 21, /* /datasets/<id>/create-snapshot — admin write */
     KIND_MAX
 } ctl_kind;
 
@@ -170,6 +173,7 @@ static const ctl_kind_meta KIND_META[KIND_MAX] = {
     [KIND_DEBUG_ALLOC]        = { false, true,  0400, NULL              }, /* admin-only, dynamic device id */
     [KIND_POOL_SCRUB]         = { false, false, 0444, "scrub"           }, /* world-readable scrub state */
     [KIND_POOL_SCRUB_TRIGGER] = { false, true,  0200, "scrub-trigger"   }, /* admin write trigger */
+    [KIND_DATASET_CREATE_SNAPSHOT] = { false, true, 0200, "create-snapshot" }, /* admin write trigger */
 };
 
 /* R96 P3-2: pin every static-name literal length below STM_P9_NAME_MAX
@@ -196,6 +200,7 @@ _Static_assert(sizeof("allocator-state") - 1 <= STM_P9_NAME_MAX, "/ctl/ /debug/a
  * are 5-7 chars under STM_P9_NAME_MAX. */
 _Static_assert(sizeof("scrub") - 1     <= STM_P9_NAME_MAX, "/ctl/ /pools/.../scrub literal");
 _Static_assert(sizeof("scrub-trigger") - 1 <= STM_P9_NAME_MAX, "/ctl/ /pools/.../scrub-trigger literal");
+_Static_assert(sizeof("create-snapshot") - 1 <= STM_P9_NAME_MAX, "/ctl/ /datasets/.../create-snapshot literal");
 /* Dynamic names: pool-uuid hex (36 chars), decimal device-id (≤2
  * chars at v2.0's STM_POOL_DEVICES_MAX = 64 cap), decimal dataset-id
  * (≤9 chars at STM_SYNC_DATASET_ID_MAX = 0x0FFFFFFF ~= 268M = 9
@@ -206,7 +211,7 @@ _Static_assert(sizeof("scrub-trigger") - 1 <= STM_P9_NAME_MAX, "/ctl/ /pools/...
  * KIND_META[] trips this assert at build time, even if a downstream
  * build silently suppresses -Wmissing-field-initializers. Update the
  * literal in lockstep when growing the enum. */
-_Static_assert(KIND_MAX == 21,
+_Static_assert(KIND_MAX == 22,
                "KIND_META[KIND_MAX] sized to enum cardinality; "
                "update both ctl_kind enum + KIND_META[] in lockstep");
 
@@ -1194,6 +1199,7 @@ static stm_status materialize_locked(stm_ctl *c, ctl_session *s)
     case KIND_EVENTS:                 /* served direct from event_buf */
     case KIND_ADMIN_CLEAR_EVENTS:     /* write-only; no body to materialize */
     case KIND_POOL_SCRUB_TRIGGER:     /* write-only; no body to materialize */
+    case KIND_DATASET_CREATE_SNAPSHOT:/* write-only; no body to materialize */
     case KIND_MAX:
         break;
     }
@@ -1282,7 +1288,8 @@ static stm_status stat_at(stm_ctl *c, uint64_t qid_path,
     /* KIND_DATASETS_DIR is always accessible (just empty when fs is
      * unattached), matching the /pools/ posture. The fs check lives
      * on the per-dataset kinds below. */
-    if (k == KIND_DATASET_DIR || k == KIND_DATASET_PROPERTIES) {
+    if (k == KIND_DATASET_DIR || k == KIND_DATASET_PROPERTIES
+            || k == KIND_DATASET_CREATE_SNAPSHOT) {
         if (!c->fs) return STM_ENOENT;
         uint64_t dsid = qid_dataset_id(qid_path);
         /* Validate the dataset is PRESENT (i.e. not destroyed).
@@ -1440,12 +1447,16 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
 
     case KIND_DATASET_DIR: {
         if (!c->fs) return STM_ENOENT;
-        if (!str_eq(name, name_len,
-                     KIND_META[KIND_DATASET_PROPERTIES].static_name))
-            return STM_ENOENT;
         uint64_t dsid = qid_dataset_id(dir_qid_path);
-        return stat_at(c, qid_of(KIND_DATASET_PROPERTIES, 0, (uint32_t)dsid),
-                        out);
+        if (str_eq(name, name_len,
+                     KIND_META[KIND_DATASET_PROPERTIES].static_name))
+            return stat_at(c,
+                qid_of(KIND_DATASET_PROPERTIES, 0, (uint32_t)dsid), out);
+        if (str_eq(name, name_len,
+                     KIND_META[KIND_DATASET_CREATE_SNAPSHOT].static_name))
+            return stat_at(c,
+                qid_of(KIND_DATASET_CREATE_SNAPSHOT, 0, (uint32_t)dsid), out);
+        return STM_ENOENT;
     }
 
     case KIND_ADMIN_DIR:
@@ -1505,6 +1516,7 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
     case KIND_DEBUG_ALLOC:
     case KIND_POOL_SCRUB:
     case KIND_POOL_SCRUB_TRIGGER:
+    case KIND_DATASET_CREATE_SNAPSHOT:
     case KIND_MAX:
         break;
     }
@@ -1657,8 +1669,15 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
     case KIND_DATASET_DIR: {
         if (!c->fs) return STM_ENOENT;
         uint64_t dsid = qid_dataset_id(dir_qid_path);
-        return emit_entry(c, cb, cb_ctx,
+        rc = emit_entry(c, cb, cb_ctx,
             qid_of(KIND_DATASET_PROPERTIES, 0, (uint32_t)dsid));
+        if (rc != STM_OK) return rc;
+        /* The trigger entry is admin-only (mode 0200) but visible
+         * in readdir to non-admin per POSIX semantics — Tstat shows
+         * mode 0200; only Topen+Twrite gate on admin. Same posture
+         * as /pools/<uuid>/scrub-trigger. */
+        return emit_entry(c, cb, cb_ctx,
+            qid_of(KIND_DATASET_CREATE_SNAPSHOT, 0, (uint32_t)dsid));
     }
 
     case KIND_ADMIN_DIR:
@@ -1714,6 +1733,7 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
     case KIND_DEBUG_ALLOC:
     case KIND_POOL_SCRUB:
     case KIND_POOL_SCRUB_TRIGGER:
+    case KIND_DATASET_CREATE_SNAPSHOT:
     case KIND_MAX:
         break;
     }
@@ -1736,7 +1756,8 @@ static stm_status vops_open(void *ctx, uint32_t fid, uint64_t qid_path,
      * with two writable kinds we now have the family. The explicit
      * check below is still preferred since the kind list is small
      * and explicit-by-kind reads more clearly than a bitmask test. */
-    if (k == KIND_ADMIN_CLEAR_EVENTS || k == KIND_POOL_SCRUB_TRIGGER) {
+    if (k == KIND_ADMIN_CLEAR_EVENTS || k == KIND_POOL_SCRUB_TRIGGER
+            || k == KIND_DATASET_CREATE_SNAPSHOT) {
         if (mode != STM_P9_OWRITE) return STM_EACCES;
     } else {
         if (mode != STM_P9_OREAD) return STM_EACCES;
@@ -1792,6 +1813,15 @@ static stm_status vops_open(void *ctx, uint32_t fid, uint64_t qid_path,
     if ((k == KIND_POOL_STATUS || k == KIND_DEVICE_STATUS) && !c->pool)
         return STM_ENOENT;
     if ((k == KIND_DATASET_PROPERTIES) && !c->fs) return STM_ENOENT;
+    if (k == KIND_DATASET_CREATE_SNAPSHOT) {
+        if (!c->fs) return STM_ENOENT;
+        /* Dataset must still be PRESENT (R98 P2-1 carry — destroyed
+         * mid-walk-then-Topen returns ENOENT). */
+        uint64_t dsid = qid_dataset_id(qid_path);
+        stm_dataset_entry tmp;
+        stm_status drc = stm_fs_dataset_lookup(c->fs, dsid, &tmp);
+        if (drc != STM_OK) return drc;
+    }
     /* /pools/<uuid>/scrub + /pools/<uuid>/scrub-trigger both require
      * pool + scrub attached. The dual-gate mirrors stat_at — without
      * scrub, the file doesn't exist (consistent operator semantics). */
@@ -1837,7 +1867,8 @@ static stm_status vops_open(void *ctx, uint32_t fid, uint64_t qid_path,
     /* P9-CTL-1d-events + P9-CTL-1d-scrub-trigger: write-only trigger
      * kinds allocate a session for write tracking. Body buffer
      * unused; vops_write does the action dispatch. */
-    if (k == KIND_ADMIN_CLEAR_EVENTS || k == KIND_POOL_SCRUB_TRIGGER) {
+    if (k == KIND_ADMIN_CLEAR_EVENTS || k == KIND_POOL_SCRUB_TRIGGER
+            || k == KIND_DATASET_CREATE_SNAPSHOT) {
         pthread_mutex_lock(&c->mu);
         ctl_session *s = session_alloc_locked(c, fid, qid_path);
         if (!s) {
@@ -2083,6 +2114,68 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         stm_ctl_log_event(c, "scrub-trigger uid=%u verb=%s result=%s",
                             (unsigned)c->caller_uid, verb_str,
                             rc == STM_OK ? "ok" : "err");
+        if (rc != STM_OK) return rc;
+        *out_written = len;
+        return STM_OK;
+    }
+
+    /* P9-CTL-1d-actions-snapshot-create: KIND_DATASET_CREATE_SNAPSHOT
+     * — third writable kind. Body is the snapshot name (1..STM_SNAP_
+     * NAME_MAX bytes) optionally with trailing whitespace; the
+     * dataset_id comes from the qid_path.
+     *
+     * Carries the established writable-kind family discipline:
+     *   (a) admin gate at vops_open's meta->admin_required.
+     *   (b) defense-in-depth admin re-check at vops_write.
+     *   (c) zero-byte Twrite refusal (R101 P2-2).
+     *   (d) gate ordering: admin → zero-byte → fs-attached →
+     *       session-validate (R104 P3-5 carry).
+     *
+     * Name-char validation lives at snapshot.c::stm_snap_name_chars_
+     * valid (R99 P2-1 source-side carry — refuses bytes < 0x20 +
+     * 0x7F). The wrapper passes the body slice through; the gate
+     * fires inside snapshot_create_inner. Same single-source-of-
+     * truth posture as dataset.c's name validation. */
+    if (k == KIND_DATASET_CREATE_SNAPSHOT) {
+        if (!ctl_caller_is_admin(c)) return STM_EACCES;
+        if (len == 0) return STM_EINVAL;
+        if (!c->fs) return STM_EBACKEND;     /* gated at vops_open */
+        pthread_mutex_lock(&c->mu);
+        ctl_session *s = session_get_locked(c, fid);
+        if (!s || s->qid_path != qid_path) {
+            pthread_mutex_unlock(&c->mu);
+            return STM_EBACKEND;
+        }
+        pthread_mutex_unlock(&c->mu);
+
+        /* Trim trailing whitespace + newline. R104 carry. */
+        size_t end = len;
+        while (end > 0) {
+            uint8_t ch = ((const uint8_t *)buf)[end - 1];
+            if (ch != '\n' && ch != '\r' && ch != ' ' && ch != '\t')
+                break;
+            end--;
+        }
+        if (end == 0) return STM_EINVAL;     /* whitespace-only body */
+        /* Refuse names exceeding STM_SNAP_NAME_MAX up front so the
+         * audit log distinguishes "obviously-too-long" from
+         * "snapshot.c rejected" — both end up STM_EINVAL but the
+         * cap check here is cheap. The wrapper validates again
+         * (defense-in-depth). */
+        if (end > STM_SNAP_NAME_MAX) return STM_EINVAL;
+
+        uint64_t dsid = qid_dataset_id(qid_path);
+        uint64_t snap_id = 0;
+        stm_status rc = stm_fs_create_snapshot(c->fs, dsid,
+                                                  (const char *)buf, end,
+                                                  &snap_id);
+        stm_ctl_log_event(c,
+            "create-snapshot uid=%u dataset=%llu name-len=%zu result=%s snap-id=%llu",
+            (unsigned)c->caller_uid,
+            (unsigned long long)dsid,
+            end,
+            rc == STM_OK ? "ok" : "err",
+            (unsigned long long)snap_id);
         if (rc != STM_OK) return rc;
         *out_written = len;
         return STM_OK;

@@ -38,8 +38,29 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9-CTL-1d-scrub-trigger R104 close (this commit) —
-  YELLOW, 0 P0 + 0 P1 + 1 P2 + 6 P3 (verdict MERGE). 43 ctest
+- **Tip**: P9-CTL-1d-actions-snapshot-create substantive (this
+  commit). 43 ctest suites green default. test_ctl 96/96 (was 88
+  at R104 close; +8 -1d-actions-snapshot-create). **P9-CTL-1d-
+  actions-snapshot-create** adds /datasets/<id>/create-snapshot
+  (admin-only mode 0200). First /ctl/ trigger that mutates
+  PERSISTENT on-disk state — composes against -1d-uid admin gate
+  + -1d-events audit log + the writable-kind family pattern.
+  KIND_MAX = 22 (was 21); single new kind KIND_DATASET_CREATE_
+  SNAPSHOT. New public API stm_fs_create_snapshot(fs, dataset_id,
+  name, name_len, *out_id). Snapshot.c hardening: new static
+  helper stm_snap_name_chars_valid mirrors dataset.c's R99 P2-1
+  gate (refuses bytes < 0x20 + 0x7F at snapshot_create_inner).
+  Defense-in-depth: wrapper ALSO validates the (name, name_len)
+  slice before NUL-termination — required because stm_snapshot_
+  create uses strlen() and an embedded NUL would silently truncate
+  the name BEFORE the inner validation. Audit log records uid +
+  dataset + name-len + result + snap-id for every attempt
+  (success or failure). R105 audit pending. The line-injection
+  attack vector (R99 P2-1 carry to snapshot names) is now closed
+  at the source.
+
+- **Pre-tip-1**: P9-CTL-1d-scrub-trigger R104 close — YELLOW,
+  0 P0 + 0 P1 + 1 P2 + 6 P3 (verdict MERGE). 43 ctest
   suites green default. test_ctl 88/88 (close adds inline assertions
   to existing tests rather than new tests). R104 close: P2-1
   documented post-unlock dispatch contract + concurrent-accept

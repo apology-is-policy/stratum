@@ -526,10 +526,37 @@ language bindings, future kernel module) is a 9P consumer.
                   refactored verb if-chain to a static VERBS[] table
                   + STM_CTL_VERB_MAX define. P3-5 documented gate
                   ordering rationale. P3-6 cosmetic-only.
-            - [ ] **P9-CTL-1d-actions-snapshot** — pending; snapshot
-                  create / rollback write triggers. Composes against
-                  -1d-uid admin gate + -1d-events audit log; R99 P2-1
-                  name-validation pattern carries.
+            - [x] **P9-CTL-1d-actions-snapshot-create** — first
+                  /ctl/ trigger that mutates PERSISTENT on-disk
+                  state. Adds /datasets/<id>/create-snapshot
+                  (admin-only mode 0200). Body parses snapshot
+                  name; stripping trailing whitespace; STM_SNAP_
+                  NAME_MAX = 255 cap. KIND_MAX = 22 (was 21).
+                  New public API stm_fs_create_snapshot(fs,
+                  dataset_id, name, name_len, *out_id). Snapshot.c
+                  source-side hardening: stm_snap_name_chars_valid
+                  refuses bytes < 0x20 + 0x7F at snapshot_create_
+                  inner. Defense-in-depth: wrapper ALSO validates
+                  the slice before NUL-termination (required because
+                  stm_snapshot_create uses strlen which truncates
+                  at embedded NUL). Audit log records (uid, dataset,
+                  name-len, result, snap-id) for every attempt.
+                  R99 P2-1 line-injection attack vector closed for
+                  snapshot names too. 8 -1d-actions-snapshot-create
+                  tests in test_ctl.c (88 → 96):
+                  ctl_d6_create_snapshot_admin_succeeds,
+                  ctl_d6_create_snapshot_trailing_newline_stripped,
+                  ctl_d6_create_snapshot_control_char_rejected,
+                  ctl_d6_create_snapshot_wrapper_refuses_control_bytes,
+                  ctl_d6_create_snapshot_nonexistent_dataset_enoent,
+                  ctl_d6_create_snapshot_nonadmin_eacces,
+                  ctl_d6_create_snapshot_zero_byte_einval,
+                  ctl_d6_create_snapshot_duplicate_name_eexists.
+                  R105 audit pending.
+            - [ ] **P9-CTL-1d-actions-snapshot-rollback** — pending;
+                  rollback / promote action triggers. Higher-risk
+                  (mutates working tree); requires snapshot-rollback
+                  invariant analysis.
             - [ ] **P9-CTL-1d-tracing** — pending; /tracing/enable +
                   /tracing/sample-rate + /tracing/traces (ARCH §14.6).
       - [ ] **P9-CTL-1e /metrics/** — pending; Prometheus +

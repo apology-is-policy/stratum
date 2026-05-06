@@ -246,6 +246,26 @@ stm_status stm_snapshot_index_current_txg(const stm_snapshot_index *idx,
     return STM_OK;
 }
 
+/* P9-CTL-1d-actions-snapshot-create: snapshot-name char validation,
+ * mirror of dataset.c's name_chars_valid (R99 P2-1 carry). Refuses
+ * bytes < 0x20 (control chars including \n / \r / \t / \0) and
+ * == 0x7F (DEL). UTF-8 multi-byte sequences (≥ 0x80) accepted
+ * unchanged. Hardens every present and future surface that displays
+ * snapshot names in line-oriented format (a /ctl/ surface listing
+ * snapshot metadata is the immediate consumer; future /datasets/
+ * <id>/snapshots/<name>/properties etc. inherit). Without this gate
+ * a snapshot named "innocent\nflags: 0xdeadbeef" could inject a
+ * forged property line into any future presentation surface — same
+ * confused-deputy attack vector R99 P2-1 closed for dataset names. */
+static bool stm_snap_name_chars_valid(const uint8_t *name, size_t name_len)
+{
+    for (size_t i = 0; i < name_len; i++) {
+        uint8_t c = name[i];
+        if (c < 0x20 || c == 0x7F) return false;
+    }
+    return true;
+}
+
 /* P7-14: shared body for stm_snapshot_create + the test-only
  * stm_snapshot_create_for_test. R46 P3-2: the entire arg-
  * validation prelude lives here so a future check added to one
@@ -271,6 +291,12 @@ static stm_status snapshot_create_inner(stm_snapshot_index *idx,
     *out_id = 0;
     size_t name_len = strlen(name);
     if (name_len == 0 || name_len > STM_SNAP_NAME_MAX) return STM_EINVAL;
+    /* R99 P2-1 carry from dataset.c: refuse control chars + DEL.
+     * Validates BEFORE name-collision check so syntactically-bad
+     * names get a clean STM_EINVAL ("not even tried") rather than
+     * leaking existence info via STM_EEXIST. */
+    if (!stm_snap_name_chars_valid((const uint8_t *)name, name_len))
+        return STM_EINVAL;
 
     must_lock(&idx->lock);
 
