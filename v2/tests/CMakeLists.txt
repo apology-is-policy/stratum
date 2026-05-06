@@ -86,6 +86,8 @@ stm_add_test(test_lp9        test_lp9.c)
 target_link_libraries(test_lp9 PRIVATE stm_lp9)
 stm_add_test(test_stratum_fs test_stratum_fs.c test_fs_common.c)
 target_link_libraries(test_stratum_fs PRIVATE stm_stratumd)
+stm_add_test(test_stratumd_ctl test_stratumd_ctl.c test_fs_common.c)
+target_link_libraries(test_stratumd_ctl PRIVATE stm_stratumd stm_9p_client stm_lp9)
 # stratum-fs binary path passed in via env so the test can fork/exec it.
 set_tests_properties(test_stratum_fs PROPERTIES
     ENVIRONMENT "STM_STRATUM_FS_BIN=$<TARGET_FILE:stratum-fs>"

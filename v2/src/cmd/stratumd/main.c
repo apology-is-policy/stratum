@@ -88,8 +88,10 @@ static void usage(const char *argv0)
         "Usage: %s <fs-path> [options]\n"
         "\n"
         "Options:\n"
-        "  --listen <unix-path>     Unix socket path "
+        "  --listen <unix-path>     FS Unix socket path "
             "(default: " STM_STRATUMD_DEFAULT_SOCKET ")\n"
+        "  --ctl-listen <unix-path> /ctl/ Unix socket path "
+            "(opt-in; if unset, /ctl/ is disabled)\n"
         "  --keyfile <path>         Hybrid-wrap keypair file "
             "(legacy in-process unwrap)\n"
         "  --janus-socket <path>    janus-daemon Unix socket for unwrap "
@@ -127,6 +129,10 @@ int main(int argc, char **argv)
         }
         if (!strcmp(a, "--listen") && i + 1 < argc) {
             opts.socket_path = argv[++i];
+            continue;
+        }
+        if (!strcmp(a, "--ctl-listen") && i + 1 < argc) {
+            opts.ctl_socket_path = argv[++i];
             continue;
         }
         if (!strcmp(a, "--keyfile") && i + 1 < argc) {
@@ -203,6 +209,11 @@ int main(int argc, char **argv)
             opts.fs_path, opts.socket_path,
             opts.backlog, opts.msize_max, (unsigned long long)opts.root_dataset,
             (int)opts.read_only);
+    if (opts.ctl_socket_path) {
+        fprintf(stderr,
+                "stratumd: /ctl/ on %s\n",
+                opts.ctl_socket_path);
+    }
 
     stm_status rc = stm_stratumd_run(&opts);
     if (rc != STM_OK) {

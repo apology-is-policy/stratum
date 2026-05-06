@@ -15,7 +15,7 @@ target_include_directories(stm_stratumd PUBLIC
 
 target_link_libraries(stm_stratumd
     PRIVATE stm_warnings stm_sanitize stm_coverage
-    PUBLIC  stm_util stm_fs stm_9p)
+    PUBLIC  stm_util stm_fs stm_9p stm_lp9)
 
 find_package(Threads REQUIRED)
 target_link_libraries(stm_stratumd PUBLIC Threads::Threads)

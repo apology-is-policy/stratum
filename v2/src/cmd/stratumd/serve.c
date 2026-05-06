@@ -14,11 +14,14 @@
 #include <stratum/stratumd.h>
 
 #include <stratum/9p.h>
+#include <stratum/ctl.h>
 #include <stratum/fs.h>
+#include <stratum/lp9.h>
 #include <stratum/types.h>
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -397,8 +400,204 @@ stm_status stm_stratumd_accept_loop(int listen_fd, stm_fs *fs,
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
+/* /ctl/ transport (P9-CTL-2c).                                           */
+/* ────────────────────────────────────────────────────────────────────── */
+
+stm_status stm_stratumd_serve_ctl_client(int fd, stm_ctl *ctl,
+                                           uid_t peer_uid, gid_t peer_gid,
+                                           uint32_t msize_max,
+                                           uint32_t idle_timeout_ms)
+{
+    if (fd < 0 || !ctl) {
+        if (fd >= 0) close(fd);
+        return STM_EINVAL;
+    }
+
+    /* Clamp msize against lp9's negotiable range. The lp9 server
+     * itself clamps; we mirror so the per-conn buffer is sized to
+     * hold any negotiable message. */
+    if (msize_max < STM_LP9_MSIZE_MIN) msize_max = STM_LP9_MSIZE_MIN;
+    if (msize_max > (16u << 20)) msize_max = (16u << 20);
+
+    /* Idle timeout discipline mirrors stm_stratumd_serve_client
+     * (R95 P2-1 carry). */
+    if (idle_timeout_ms > 0u) {
+        struct timeval tv;
+        tv.tv_sec  = (time_t)(idle_timeout_ms / 1000u);
+        tv.tv_usec = (suseconds_t)((idle_timeout_ms % 1000u) * 1000u);
+        (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    }
+
+    /* Stamp peer credentials onto the stm_ctl BEFORE the first
+     * stm_lp9_server_handle (P9-CTL-1d-uid timing rule R97 P2-2).
+     * Without this, the admin gate fails-closed for every kind that
+     * declares admin_required — even root-launched clients can't
+     * read /admin/peer.
+     *
+     * stm_ctl_set_caller writes c->caller_uid + c->caller_gid; the
+     * stm_ctl trigger row's R97 P2-2 timing rule is satisfied by
+     * the strict pre-handle ordering here. */
+    stm_status set_rc = stm_ctl_set_caller(ctl, peer_uid, peer_gid);
+    if (set_rc != STM_OK) {
+        close(fd);
+        return set_rc;
+    }
+
+    stm_lp9_server *srv = NULL;
+    stm_status rc = stm_lp9_server_create(stm_ctl_vops(), ctl,
+                                              stm_ctl_root(ctl),
+                                              msize_max, &srv);
+    if (rc != STM_OK) {
+        /* Reset caller to unset sentinel before bailing — leaked
+         * credentials are a confused-deputy hole. */
+        (void)stm_ctl_set_caller(ctl, (uid_t)-1, (gid_t)-1);
+        close(fd);
+        return rc;
+    }
+
+    uint8_t *req  = malloc(msize_max);
+    uint8_t *resp = malloc(msize_max);
+    if (!req || !resp) {
+        free(req);
+        free(resp);
+        stm_lp9_server_destroy(srv);
+        (void)stm_ctl_set_caller(ctl, (uid_t)-1, (gid_t)-1);
+        close(fd);
+        return STM_ENOMEM;
+    }
+
+    rc = STM_OK;
+    while (1) {
+        int r = read_full(fd, req, 4u);
+        if (r == 1) { rc = STM_OK; break; }
+        if (r != 0) { rc = STM_EIO; break; }
+
+        uint32_t size = decode_le32(req);
+        if (size < STM_LP9_HDR_SIZE || size > msize_max) {
+            rc = STM_EPROTOCOL;
+            break;
+        }
+        r = read_full(fd, req + 4, size - 4u);
+        if (r != 0) { rc = STM_EIO; break; }
+
+        uint32_t resp_len = 0;
+        stm_status hrc = stm_lp9_server_handle(srv, req, size,
+                                                  resp, msize_max,
+                                                  &resp_len);
+        if (hrc != STM_OK || resp_len == 0u) {
+            rc = (hrc == STM_OK) ? STM_EPROTOCOL : hrc;
+            break;
+        }
+
+        if (write_full(fd, resp, resp_len) != 0) {
+            rc = STM_EIO;
+            break;
+        }
+    }
+
+    free(req);
+    free(resp);
+    stm_lp9_server_destroy(srv);
+
+    /* CLAUDE.md /ctl/ trigger row clause 7 (R101 P1-1): drop all
+     * sessions between connections so a leaked session from
+     * connection N can't pre-empt connection N+1's fid allocations.
+     * The clause documents this as MANDATORY for any sequential
+     * accept loop integrating /ctl/. */
+    stm_ctl_drop_all_sessions(ctl);
+
+    /* Reset caller to unset sentinel after serve returns — fail-
+     * closed posture for the brief window between connections.
+     * Without this, the next connection would see the previous
+     * peer's caller until set_caller fires again. The next accept's
+     * set_caller will overwrite, but defense-in-depth here covers
+     * a hypothetical bug where set_caller gets skipped. */
+    (void)stm_ctl_set_caller(ctl, (uid_t)-1, (gid_t)-1);
+
+    close(fd);
+    return rc;
+}
+
+stm_status stm_stratumd_accept_ctl_loop(int listen_fd, stm_ctl *ctl,
+                                          uint32_t msize_max,
+                                          uint32_t idle_timeout_ms,
+                                          bool allow_unauthenticated_peer,
+                                          atomic_bool *stop_flag)
+{
+    if (listen_fd < 0 || !ctl) return STM_EINVAL;
+
+    if (idle_timeout_ms == 0u)
+        idle_timeout_ms = STM_STRATUMD_DEFAULT_IDLE_MS;
+
+    while (1) {
+        if (stop_flag && atomic_load_explicit(stop_flag,
+                                                  memory_order_acquire))
+            break;
+
+        int client_fd = accept(listen_fd, NULL, NULL);
+        if (client_fd < 0) {
+            if (errno == EINTR || errno == ECONNABORTED) continue;
+            if (stop_flag && atomic_load_explicit(stop_flag,
+                                                      memory_order_acquire))
+                break;
+            return STM_EBACKEND;
+        }
+
+        uid_t peer_uid = (uid_t)-1;
+        gid_t peer_gid = (gid_t)-1;
+        int   pc_rc    = peer_creds(client_fd, &peer_uid, &peer_gid);
+        if (pc_rc != 0) {
+            /* R95 P2-2 carry — refuse on peer-credential failure
+             * unless the caller opted in. */
+            if (!allow_unauthenticated_peer) {
+                fprintf(stderr,
+                    "stratumd: refusing /ctl/ connection: "
+                    "peer credentials unavailable (errno=%d); "
+                    "set allow_unauthenticated_peer to opt in\n",
+                    -pc_rc);
+                close(client_fd);
+                continue;
+            }
+            peer_uid = (uid_t)getuid();
+            peer_gid = (gid_t)getgid();
+        }
+
+        (void)stm_stratumd_serve_ctl_client(client_fd, ctl,
+                                                peer_uid, peer_gid,
+                                                msize_max, idle_timeout_ms);
+    }
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
 /* stm_stratumd_run — full daemon lifecycle.                              */
 /* ────────────────────────────────────────────────────────────────────── */
+
+/* Worker-thread context for the /ctl/ accept loop. The FS accept
+ * loop runs on the calling thread of stm_stratumd_run; when /ctl/
+ * is enabled, the /ctl/ accept loop runs on a dedicated pthread
+ * spawned in run(). */
+typedef struct {
+    int           listen_fd;
+    stm_ctl      *ctl;
+    uint32_t      msize_max;
+    uint32_t      idle_timeout_ms;
+    bool          allow_unauthenticated_peer;
+    atomic_bool  *stop_flag;
+    stm_status    rc;        /* set by worker; read by parent after join */
+} ctl_worker_ctx;
+
+static void *ctl_worker_main(void *arg)
+{
+    ctl_worker_ctx *w = (ctl_worker_ctx *)arg;
+    w->rc = stm_stratumd_accept_ctl_loop(w->listen_fd, w->ctl,
+                                            w->msize_max,
+                                            w->idle_timeout_ms,
+                                            w->allow_unauthenticated_peer,
+                                            w->stop_flag);
+    return NULL;
+}
 
 stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
 {
@@ -419,15 +618,11 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
                                           : STM_STRATUMD_DEFAULT_BACKLOG;
     mode_t   mode    = opts->socket_mode != 0 ? opts->socket_mode
                                               : STM_STRATUMD_DEFAULT_SOCKET_MODE;
+
+    /* Bind FS listen socket. */
     int listen_fd = stm_stratumd_listen_unix(opts->socket_path,
                                                 backlog, mode);
     if (listen_fd < 0) {
-        /* R95 P3-4 — preserve the actual errno in the diagnostic so
-         * an operator can distinguish ENAMETOOLONG / EADDRINUSE /
-         * EACCES / EEXIST (non-socket clobber refusal) etc. The
-         * top-level return narrows to STM_EBACKEND for now (no
-         * dedicated error codes for socket / FS-perm errors yet); a
-         * future hardening can extend stm_status. */
         fprintf(stderr,
             "stratumd: listen on %s failed: %s\n",
             opts->socket_path, strerror(-listen_fd));
@@ -440,14 +635,101 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
     uint64_t root_ds   = opts->root_dataset > 0u ? opts->root_dataset
                                                   : 1u;
 
+    /* P9-CTL-2c: optional /ctl/ socket setup. Opt-in via
+     * opts->ctl_socket_path. The order is:
+     *   1. Create stm_ctl (attaches fs).
+     *   2. Stamp daemon's effective uid as admin_uid (so root-launched
+     *      stratumd grants its operator admin rights on /ctl/).
+     *   3. Bind /ctl/ socket.
+     *   4. Spawn /ctl/ accept loop on a worker pthread.
+     * Any failure tears down in reverse. */
+    stm_ctl       *ctl       = NULL;
+    int            ctl_fd    = -1;
+    pthread_t      ctl_tid   = 0;
+    bool           ctl_started = false;
+    ctl_worker_ctx wctx;
+    memset(&wctx, 0, sizeof wctx);
+
+    if (opts->ctl_socket_path) {
+        rc = stm_ctl_create(fs, &ctl);
+        if (rc != STM_OK) {
+            fprintf(stderr,
+                "stratumd: stm_ctl_create failed (rc=%d)\n", (int)rc);
+            close(listen_fd);
+            (void)unlink(opts->socket_path);
+            (void)stm_fs_unmount(fs);
+            return rc;
+        }
+        /* Stamp daemon's effective uid as admin so the operator who
+         * starts stratumd has admin access on /ctl/. Without this,
+         * only uid 0 would qualify even if the daemon runs under a
+         * non-root operator. */
+        (void)stm_ctl_set_admin_uid(ctl, (uid_t)geteuid());
+
+        ctl_fd = stm_stratumd_listen_unix(opts->ctl_socket_path,
+                                              backlog, mode);
+        if (ctl_fd < 0) {
+            fprintf(stderr,
+                "stratumd: listen on %s (/ctl/) failed: %s\n",
+                opts->ctl_socket_path, strerror(-ctl_fd));
+            stm_ctl_destroy(ctl);
+            close(listen_fd);
+            (void)unlink(opts->socket_path);
+            (void)stm_fs_unmount(fs);
+            return STM_EBACKEND;
+        }
+
+        wctx.listen_fd                  = ctl_fd;
+        wctx.ctl                        = ctl;
+        wctx.msize_max                  = msize_max;
+        wctx.idle_timeout_ms            = opts->idle_timeout_ms;
+        wctx.allow_unauthenticated_peer = opts->allow_unauthenticated_peer;
+        wctx.stop_flag                  = opts->stop_flag;
+        wctx.rc                         = STM_OK;
+        int prc = pthread_create(&ctl_tid, NULL, ctl_worker_main, &wctx);
+        if (prc != 0) {
+            fprintf(stderr,
+                "stratumd: pthread_create for /ctl/ failed (rc=%d)\n", prc);
+            close(ctl_fd);
+            (void)unlink(opts->ctl_socket_path);
+            stm_ctl_destroy(ctl);
+            close(listen_fd);
+            (void)unlink(opts->socket_path);
+            (void)stm_fs_unmount(fs);
+            return STM_EIO;
+        }
+        ctl_started = true;
+    }
+
+    /* Run FS accept loop on the calling thread. Returns when
+     * stop_flag is set (or on fatal accept error). */
     rc = stm_stratumd_accept_loop(listen_fd, fs, msize_max, root_ds,
                                        opts->idle_timeout_ms,
                                        opts->allow_unauthenticated_peer,
                                        opts->stop_flag);
 
-    /* Clean shutdown: close listen fd, unlink socket, unmount fs. */
+    /* /ctl/ worker shutdown: signal stop via shutdown(2) on the
+     * /ctl/ listen fd to unblock its accept(), then join the worker.
+     * The worker observes EBADF/EINVAL on accept after shutdown +
+     * checks stop_flag → returns STM_OK. */
+    if (ctl_started) {
+        (void)shutdown(ctl_fd, SHUT_RDWR);
+        (void)pthread_join(ctl_tid, NULL);
+        if (rc == STM_OK && wctx.rc != STM_OK) rc = wctx.rc;
+    }
+
+    /* Clean shutdown — close listen fds, unlink socket files,
+     * destroy stm_ctl (MUST happen AFTER /ctl/ worker join — the
+     * worker uses ctl as ctx; tearing down before join is a use-
+     * after-free per CLAUDE.md /ctl/ trigger row R96 P2-1), then
+     * unmount the fs. */
     close(listen_fd);
     (void)unlink(opts->socket_path);
+    if (ctl_fd >= 0) {
+        close(ctl_fd);
+        (void)unlink(opts->ctl_socket_path);
+    }
+    if (ctl) stm_ctl_destroy(ctl);
     stm_status urc = stm_fs_unmount(fs);
     if (rc == STM_OK) rc = urc;
     return rc;

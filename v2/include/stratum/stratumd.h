@@ -2,40 +2,68 @@
 /*
  * stratumd — Unix-socket transport for the Stratum 9P2000.L server.
  *
- * Architecture (ARCH §10.4 / ROADMAP-V2 §12 / Phase 9 P9-9P-4):
+ * Architecture (ARCH §10.4 / ROADMAP-V2 §12 / Phase 9 P9-9P-4 + P9-CTL-2c):
  *   - One stratumd process owns one mounted `stm_fs *`.
- *   - Listens on a single Unix socket (default `/var/run/stratum.sock`,
- *     or any caller-specified path).
- *   - Accept loop is SERIAL at v2.0 — accept() blocks; each connection
- *     is served to disconnect on the same thread; subsequent clients
- *     queue in the listen backlog. Concurrent multi-connection
- *     support (epoll / pthread-per-connection) is forward-noted to a
- *     future increment when the R94 P2-1 stat-after-mutation race
- *     class (h_lcreate / h_mkdir / h_renameat / h_reflink) gets its
- *     concurrent-connection reviewer pass.
- *   - Per-connection: spawn a fresh stm_9p_server (one fid namespace
- *     per connection per CLAUDE.md / 9p.h doctrine), serve until the
- *     client disconnects, then destroy the server.
+ *   - Listens on UP TO TWO Unix sockets (P9-CTL-2c):
+ *       a. FS socket (default `/var/run/stratum.sock`, or any caller-
+ *          specified path) — speaks 9P2000.L bound to the mounted
+ *          stm_fs. Per-connection stm_9p_server (FS-bound .L).
+ *       b. /ctl/ socket (caller-specified via `ctl_socket_path`,
+ *          opt-in) — speaks 9P2000.L against the operator-state
+ *          synthetic FS (stm_ctl). Per-connection stm_lp9_server
+ *          (generic .L).
+ *     Each socket has its own SERIAL accept loop running on a
+ *     dedicated pthread (P9-CTL-2c added the second loop). Within
+ *     each loop, only one connection is served at a time. Across
+ *     loops, the FS thread + /ctl/ thread run concurrently — but
+ *     they share state only via stm_fs (whose public API is
+ *     thread-safe) and via the wedged-flag (atomic). The /ctl/
+ *     instance is owned EXCLUSIVELY by the /ctl/ thread; the FS
+ *     thread never touches it. R94 P2-1 stat-after-mutation race
+ *     class still applies WITHIN each socket's serial timeline.
+ *   - Per-connection: spawn a fresh server (stm_9p_server for FS,
+ *     stm_lp9_server for /ctl/) — one fid namespace per connection
+ *     per CLAUDE.md / 9p.h / lp9.h doctrine. Serve until the client
+ *     disconnects, then destroy the server. The /ctl/ loop calls
+ *     `stm_ctl_drop_all_sessions(c)` between connections (R101 P1-1
+ *     doctrine — see CLAUDE.md /ctl/ trigger row clause 7).
  *   - Authentication is SO_PEERCRED-derived at v2.0: the connecting
  *     peer's uid/gid are read off the Unix socket and stamped onto
- *     stm_9p_server_create. Auth backend plug-ins (factotum / SASL /
- *     token per ARCH §10.10.3) are forward-noted.
+ *     stm_9p_server_create (FS) / stm_ctl_set_caller (CTL). Auth
+ *     backend plug-ins (factotum / SASL / token per ARCH §10.10.3)
+ *     are forward-noted.
+ *   - stm_ctl admin policy: stratumd calls
+ *     `stm_ctl_set_admin_uid(c, geteuid())` once at startup so the
+ *     daemon's effective uid is treated as admin. Per-connection,
+ *     `stm_ctl_set_caller(c, peer_uid, peer_gid)` is called BEFORE
+ *     the first stm_lp9_server_handle (P9-CTL-1d-uid timing rule
+ *     R97 P2-2 carry).
+ *
+ * /ctl/ scope deferral: stratumd at v2.0 attaches `stm_fs *` to
+ * stm_ctl_create but does NOT attach `stm_pool *` or `stm_scrub *`.
+ * Public getters for those (e.g., stm_fs_pool(fs)) are forward-noted
+ * to a future chunk; until then, /ctl/ over stratumd surfaces
+ * /version, /state, /datasets/, /admin/, /events, and /debug/ but
+ * NOT /pools/(uuid)/(pool roster, devices, scrub, metrics).
  *
  * Spec composition: every per-connection stm_9p_server composes
  * against `v2/specs/fid.tla` + `v2/specs/namespace.tla`. The accept
- * loop's serialization avoids any cross-server interleaving — at
- * v2.0, the multi-connection race class identified in R94 P2-1 is
- * structurally avoided because no two servers ever run handlers
- * concurrently. Future concurrent-accept implementations MUST
- * preserve fid.tla / namespace.tla composition under interleaving.
+ * loop's serialization avoids any cross-server interleaving WITHIN
+ * one socket; the /ctl/ thread is independently serial. Future
+ * concurrent-accept implementations MUST preserve fid.tla /
+ * namespace.tla composition under interleaving + extend stm_ctl's
+ * sessions[] key from `fid` to `(server_idx, fid)` to handle
+ * concurrent /ctl/ serving (CLAUDE.md trigger row R94 P2-1 / R97
+ * P2-2 forward-note class).
  *
  * Audit-trigger surface: this module joins CLAUDE.md's trigger list
- * at the P9-9P-4 substantive commit.
+ * at the P9-9P-4 substantive commit; updated for P9-CTL-2c.
  */
 #ifndef STRATUM_V2_STRATUMD_H
 #define STRATUM_V2_STRATUMD_H
 
 #include <stratum/9p.h>
+#include <stratum/ctl.h>
 #include <stratum/fs.h>
 #include <stratum/types.h>
 
@@ -84,7 +112,14 @@ typedef struct stm_stratumd_opts {
     bool        read_only;        /* mount read-only */
 
     /* Listen config. */
-    const char *socket_path;      /* required (Unix socket path) */
+    const char *socket_path;      /* required (FS Unix socket path) */
+    const char *ctl_socket_path;  /* P9-CTL-2c: optional /ctl/ socket
+                                   * path. NULL → /ctl/ disabled (FS
+                                   * socket only). When set, stratumd
+                                   * binds a second Unix socket and
+                                   * spawns a serial accept loop on
+                                   * its own pthread, serving the
+                                   * stm_lp9_server-backed stm_ctl. */
     int         backlog;          /* listen() backlog; clamped to ≥ 1 */
     mode_t      socket_mode;      /* socket-file mode (0 → DEFAULT 0600) */
 
@@ -199,6 +234,54 @@ stm_status stm_stratumd_accept_loop(int listen_fd, stm_fs *fs,
                                       uint32_t idle_timeout_ms,
                                       bool allow_unauthenticated_peer,
                                       atomic_bool *stop_flag);
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* /ctl/ transport (P9-CTL-2c).                                           */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/*
+ * Serve a single /ctl/ client connection until disconnect. Spawns a
+ * fresh stm_lp9_server bound to `ctl` as ctx. Frames messages over
+ * the fd (4-byte LE size prefix per 9P spec), dispatches each to the
+ * server, writes the response back. Returns STM_OK on clean
+ * disconnect, non-OK on framing/io error.
+ *
+ * Closes the fd before returning.
+ *
+ * peer_uid / peer_gid are stamped onto the stm_ctl via
+ * stm_ctl_set_caller BEFORE the first stm_lp9_server_handle (R97
+ * P2-2 timing rule), and reset to (uid_t)-1 / (gid_t)-1 (the unset
+ * sentinel — fail-closed for admin checks) AFTER serve returns so
+ * a stale caller ID can't leak between connections.
+ *
+ * Mirrors stm_stratumd_serve_client's idle-timeout discipline:
+ * SO_RCVTIMEO + SO_SNDTIMEO bound the time one connection holds the
+ * accept slot. idle_timeout_ms == 0 → no timeout (tests).
+ *
+ * Per CLAUDE.md /ctl/ trigger row clause 7: `stm_ctl_drop_all_sessions(c)`
+ * is called BEFORE return so leaked sessions can't pre-empt the next
+ * connection's fid allocations.
+ */
+STM_MUST_USE
+stm_status stm_stratumd_serve_ctl_client(int fd, stm_ctl *ctl,
+                                           uid_t peer_uid, gid_t peer_gid,
+                                           uint32_t msize_max,
+                                           uint32_t idle_timeout_ms);
+
+/*
+ * /ctl/ accept loop. Serially accept() each incoming connection on
+ * the /ctl/ socket, resolve peer credentials, call
+ * stm_stratumd_serve_ctl_client, repeat. Mirrors
+ * stm_stratumd_accept_loop's stop-flag discipline.
+ *
+ * Does NOT close listen_fd on return (caller's responsibility).
+ */
+STM_MUST_USE
+stm_status stm_stratumd_accept_ctl_loop(int listen_fd, stm_ctl *ctl,
+                                          uint32_t msize_max,
+                                          uint32_t idle_timeout_ms,
+                                          bool allow_unauthenticated_peer,
+                                          atomic_bool *stop_flag);
 
 #ifdef __cplusplus
 }
