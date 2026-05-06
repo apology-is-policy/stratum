@@ -38,8 +38,23 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9-CTL-1d-actions-snapshot-delete R106 close (this
-  commit) — GREEN, 0 P0 + 0 P1 + 0 P2 + 4 P3 (verdict MERGE), all
+- **Tip**: P8.5 audit-log doctrine backport (this commit). 43
+  ctest suites green default. test_ctl 112/112 (was 110 at R106
+  close; +2 R107 backport tests). **R107 backport (R105 P3-1
+  doctrine carry)** extends the post-admin-gate-refusals-DO-log
+  policy from create-snapshot + delete-snapshot to the prior
+  writable kinds (KIND_ADMIN_CLEAR_EVENTS + KIND_POOL_SCRUB_
+  TRIGGER). Three new log lines: "events log clear refused
+  (zero-byte)", "scrub-trigger uid=N verb=<zero-byte>",
+  "scrub-trigger uid=N verb=<whitespace-only>". The /ctl/
+  writable-kind family now has uniform forensic-trail behavior
+  across all 4 kinds. No code-correctness regression: the wire
+  responses are unchanged; only /events content gained the new
+  lines. R107 audit-light close (no separate prosecutor —
+  isomorphic to R105 P3-1 which passed audit).
+
+- **Pre-tip-1**: P9-CTL-1d-actions-snapshot-delete R106 close —
+  GREEN, 0 P0 + 0 P1 + 0 P2 + 4 P3 (verdict MERGE), all
   addressed inline. 43 ctest suites green default. test_ctl 110/110
   (was 99 at R105 close; +9 -1d-actions-snapshot-delete + 2 R106).
   R106 close: P3-1 fs.h docstring corrected (STM_ECORRUPT not

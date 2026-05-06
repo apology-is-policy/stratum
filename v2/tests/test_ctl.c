@@ -4386,4 +4386,85 @@ STM_TEST(ctl_r106_p3_4_delete_snapshot_wedged_ewedged)
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
 
+/* R107 (P8.5 audit-log doctrine backport) — pin the new logging
+ * behavior on KIND_ADMIN_CLEAR_EVENTS and KIND_POOL_SCRUB_TRIGGER.
+ *
+ * Doctrine (codified at R105 P3-1 for create-snapshot; R107
+ * extends to all writable kinds): post-admin-gate refusals MUST
+ * log to /events for forensic trail; pre-admin-gate refusals
+ * stay unlogged (DoS defense). */
+
+/* Zero-byte Twrite to /admin/clear-events: refuses + logs. */
+STM_TEST(ctl_r107_clear_events_zero_byte_logs)
+{
+    stm_ctl *c = NULL;
+    STM_ASSERT_OK(stm_ctl_create(NULL, &c));
+    STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));     /* root → admin */
+    /* Pre-seed an event so we can assert log is non-empty. */
+    stm_ctl_log_event(c, "pre-attempt sentinel");
+
+    stm_p9_server *s = make_ctl_server(c);
+    do_handshake(s, 10);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+    const char *path[] = { "admin", "clear-events" };
+    uint32_t sz = build_twalk(req, 2, 10, 11, 2, path);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 3, 11, STM_P9_OWRITE);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+
+    /* Zero-byte Twrite — refused + logs. */
+    sz = build_twrite(req, 4, 11, 0, "", 0);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* Read /events and assert the new log line appears. */
+    const char *epath[] = { "events" };
+    sz = build_twalk(req, 5, 10, 12, 1, epath);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_topen(req, 6, 12, STM_P9_OREAD);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    sz = build_tread(req, 7, 12, 0, 8192);
+    STM_ASSERT_OK(stm_p9_server_handle(s, req, sz, resp, sizeof resp, &rlen));
+    uint32_t count = load_u32(resp + 7);
+    char body[8192];
+    memcpy(body, resp + 11, count);
+    body[count] = '\0';
+    STM_ASSERT(strstr(body, "events log clear refused (zero-byte) by uid=0") != NULL);
+    STM_ASSERT(strstr(body, "pre-attempt sentinel") != NULL);   /* not cleared */
+
+    stm_p9_server_destroy(s);
+    stm_ctl_destroy(c);
+}
+
+/* Zero-byte + whitespace-only Twrite to /pools/<uuid>/scrub-trigger:
+ * each refused + logs. */
+STM_TEST(ctl_r107_scrub_trigger_post_admin_refusals_log)
+{
+    scrub_trigger_fixture f = make_scrub_trigger_fixture("ctl_r107_scrub", 0);
+    open_scrub_trigger(&f, 2, 11);
+
+    uint8_t req[RBUF], resp[RBUF];
+    uint32_t rlen = 0;
+
+    /* Zero-byte refusal. */
+    uint32_t sz = build_twrite(req, 4, 11, 0, "", 0);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* Whitespace-only refusal. */
+    sz = build_twrite(req, 5, 11, 0, "  \n\t", 4);
+    STM_ASSERT_OK(stm_p9_server_handle(f.s, req, sz, resp, sizeof resp, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_P9_RERROR);
+
+    /* Both should appear in /events. */
+    char ebody[8192];
+    read_events_log(&f, 6, 12, ebody, sizeof ebody);
+    STM_ASSERT(strstr(ebody, "scrub-trigger uid=0 verb=<zero-byte> result=einval") != NULL);
+    STM_ASSERT(strstr(ebody, "scrub-trigger uid=0 verb=<whitespace-only> result=einval") != NULL);
+
+    destroy_scrub_trigger_fixture(f);
+}
+
 STM_TEST_MAIN("ctl")

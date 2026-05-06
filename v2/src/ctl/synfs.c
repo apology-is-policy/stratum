@@ -2017,8 +2017,17 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
          * data triggers" — 0 bytes isn't data. POSIX `write(fd, _,
          * 0)` is well-defined as no-op-or-implementation-defined,
          * so accepting 0-byte writes as triggers is a UX surprise
-         * (`echo -n "" >...` would silently destroy the log). */
-        if (len == 0) return STM_EINVAL;
+         * (`echo -n "" >...` would silently destroy the log).
+         *
+         * R107 (P8.5 cleanup): post-admin refusal logged per the
+         * R105 P3-1 doctrine — operators see every authorized
+         * trigger attempt regardless of outcome. */
+        if (len == 0) {
+            stm_ctl_log_event(c,
+                "events log clear refused (zero-byte) by uid=%u",
+                (unsigned)c->caller_uid);
+            return STM_EINVAL;
+        }
         pthread_mutex_lock(&c->mu);
         ctl_session *s = session_get_locked(c, fid);
         if (!s || s->qid_path != qid_path) {
@@ -2082,7 +2091,14 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
      * client; the audit log captures the same. */
     if (k == KIND_POOL_SCRUB_TRIGGER) {
         if (!ctl_caller_is_admin(c)) return STM_EACCES;
-        if (len == 0) return STM_EINVAL;
+        /* R107 (P8.5 cleanup): post-admin refusals all log per
+         * R105 P3-1 doctrine. */
+        if (len == 0) {
+            stm_ctl_log_event(c,
+                "scrub-trigger uid=%u verb=<zero-byte> result=einval",
+                (unsigned)c->caller_uid);
+            return STM_EINVAL;
+        }
         if (!c->scrub) return STM_EBACKEND;     /* gated at vops_open */
         pthread_mutex_lock(&c->mu);
         ctl_session *s = session_get_locked(c, fid);
@@ -2116,7 +2132,13 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
                 break;
             end--;
         }
-        if (end == 0) return STM_EINVAL;     /* whitespace-only body */
+        if (end == 0) {
+            /* whitespace-only body — R107 P8.5 carry: log per doctrine */
+            stm_ctl_log_event(c,
+                "scrub-trigger uid=%u verb=<whitespace-only> result=einval",
+                (unsigned)c->caller_uid);
+            return STM_EINVAL;
+        }
 
         /* Cap the verb length at STM_CTL_VERB_MAX so a malicious 1
          * GiB body doesn't cause us to scan unbounded memory. The
