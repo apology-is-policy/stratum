@@ -1056,4 +1056,280 @@ STM_TEST(p9_client_write_sequential_offsets)
     destroy_client_fixture(&f);
 }
 
+/* ────────────────────────────────────────────────────────────────────── */
+/* P9-LIB-1c: Tlcreate + Tmkdir + Tunlinkat tests.                        */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/* Tlcreate happy path: clone root fid → lcreate "new.txt" with O_RDWR
+ * → write data → read-back. After lcreate, fid is REBOUND to the new
+ * file (per .L spec); the parent fid stays bound via the original
+ * root_fid (we cloned first). */
+STM_TEST(p9_client_lcreate_round_trip)
+{
+    client_fixture f = make_client_fixture("lcreate_rt");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    /* Clone root fid 100 → 101 so the lcreate doesn't clobber root. */
+    stm_9p_qid qids_walk[STM_9P_MAX_WALK];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 0, NULL, qids_walk, &walked));
+
+    stm_9p_qid lq;
+    uint32_t iounit = 0;
+    STM_ASSERT_OK(stm_9p_lcreate(c, 101, "new.txt",
+                                    STM_9P_O_RDWR, 0644u, 0, &lq, &iounit));
+    STM_ASSERT_EQ((lq.type & STM_9P_QTDIR), 0);   /* regular file */
+    STM_ASSERT(iounit > 0);
+
+    /* fid 101 is now bound to new.txt + opened RDWR — write directly. */
+    static const uint8_t DATA[] = "lcreated content";
+    static const uint32_t DLEN = (uint32_t)(sizeof DATA - 1);
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, 101, 0, DATA, DLEN, &written));
+    STM_ASSERT_EQ(written, DLEN);
+
+    uint8_t rb[64];
+    uint32_t got = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 101, 0, rb, sizeof rb, &got));
+    STM_ASSERT_EQ(got, DLEN);
+    STM_ASSERT(memcmp(rb, DATA, DLEN) == 0);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Tlcreate with a name that already exists → STM_EEXIST. */
+STM_TEST(p9_client_lcreate_eexist_when_name_exists)
+{
+    client_fixture f = make_client_fixture("lcreate_eexist");
+
+    /* Pre-create the file via fs API. */
+    static const uint8_t NAME[] = "dup.txt";
+    uint64_t file_ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(f.fs, /*ds=*/1u, f.root_ino,
+                                       NAME, (uint8_t)(sizeof NAME - 1),
+                                       /*mode=*/0644u, 0, 0, &file_ino));
+    STM_ASSERT_OK(stm_fs_commit(f.fs));
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    /* Clone root fid → 101 (lcreate would rebind on success). */
+    stm_9p_qid qids[STM_9P_MAX_WALK];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 0, NULL, qids, &walked));
+
+    stm_9p_qid lq;
+    stm_status rc = stm_9p_lcreate(c, 101, "dup.txt",
+                                      STM_9P_O_RDWR, 0644u, 0, &lq, NULL);
+    STM_ASSERT_EQ(rc, STM_EEXIST);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Tlcreate with bad names: empty / "." / ".." / containing '/' →
+ * STM_EINVAL (lib-side validation, no round-trip). */
+STM_TEST(p9_client_lcreate_invalid_names_einval)
+{
+    client_fixture f = make_client_fixture("lcreate_inv");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    stm_9p_qid lq;
+    /* NULL name. */
+    STM_ASSERT_EQ(stm_9p_lcreate(c, 100, NULL,
+                                    STM_9P_O_RDWR, 0644u, 0, &lq, NULL),
+                    STM_EINVAL);
+    /* Empty name. */
+    STM_ASSERT_EQ(stm_9p_lcreate(c, 100, "",
+                                    STM_9P_O_RDWR, 0644u, 0, &lq, NULL),
+                    STM_EINVAL);
+    /* "." */
+    STM_ASSERT_EQ(stm_9p_lcreate(c, 100, ".",
+                                    STM_9P_O_RDWR, 0644u, 0, &lq, NULL),
+                    STM_EINVAL);
+    /* ".." */
+    STM_ASSERT_EQ(stm_9p_lcreate(c, 100, "..",
+                                    STM_9P_O_RDWR, 0644u, 0, &lq, NULL),
+                    STM_EINVAL);
+    /* Contains '/'. */
+    STM_ASSERT_EQ(stm_9p_lcreate(c, 100, "a/b",
+                                    STM_9P_O_RDWR, 0644u, 0, &lq, NULL),
+                    STM_EINVAL);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Tmkdir: create a sub-directory, walk INTO it, lcreate a file inside,
+ * read-back. Exercises the dir-create + dir-walk + file-create chain. */
+STM_TEST(p9_client_mkdir_then_walk_into_and_lcreate)
+{
+    client_fixture f = make_client_fixture("mkdir_walk");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    stm_9p_qid mq;
+    STM_ASSERT_OK(stm_9p_mkdir(c, 100, "sub", 0755u, 0, &mq));
+    STM_ASSERT_EQ((mq.type & STM_9P_QTDIR), STM_9P_QTDIR);
+
+    /* Walk INTO sub via root fid 100 → 101. */
+    const char *names[] = { "sub" };
+    stm_9p_qid wqids[1];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 1, names, wqids, &walked));
+    STM_ASSERT_EQ(walked, 1u);
+    STM_ASSERT_EQ(wqids[0].path, mq.path);
+
+    /* lcreate inside sub: clone fid 101 → 102 first. */
+    stm_9p_qid clone_qids[STM_9P_MAX_WALK];
+    STM_ASSERT_OK(stm_9p_walk(c, 101, 102, 0, NULL, clone_qids, &walked));
+
+    stm_9p_qid lq;
+    STM_ASSERT_OK(stm_9p_lcreate(c, 102, "inner.txt",
+                                    STM_9P_O_RDWR, 0644u, 0, &lq, NULL));
+
+    static const uint8_t DATA[] = "nested";
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, 102, 0, DATA, sizeof DATA - 1, &written));
+    STM_ASSERT_EQ(written, sizeof DATA - 1);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 102));
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Tmkdir with name that already exists → STM_EEXIST. */
+STM_TEST(p9_client_mkdir_eexist_when_name_exists)
+{
+    client_fixture f = make_client_fixture("mkdir_dup");
+
+    /* Pre-create the dir via fs API. */
+    static const uint8_t NAME[] = "existing";
+    uint64_t dir_ino = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(f.fs, 1u, f.root_ino,
+                                  NAME, (uint8_t)(sizeof NAME - 1),
+                                  0755u, 0, 0, &dir_ino));
+    STM_ASSERT_OK(stm_fs_commit(f.fs));
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    stm_9p_qid mq;
+    STM_ASSERT_EQ(stm_9p_mkdir(c, 100, "existing", 0755u, 0, &mq),
+                    STM_EEXIST);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Tunlinkat happy path: lcreate file → unlinkat with flags=0 → walk
+ * to it returns ENOENT. */
+STM_TEST(p9_client_unlinkat_removes_file)
+{
+    client_fixture f = make_client_fixture("unlink_file");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    /* Create file. */
+    stm_9p_qid clone_qids[STM_9P_MAX_WALK];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 0, NULL, clone_qids, &walked));
+    stm_9p_qid lq;
+    STM_ASSERT_OK(stm_9p_lcreate(c, 101, "ephem.txt",
+                                    STM_9P_O_RDWR, 0644u, 0, &lq, NULL));
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+
+    /* Unlink it. */
+    STM_ASSERT_OK(stm_9p_unlinkat(c, 100, "ephem.txt", /*flags=*/0));
+
+    /* Walk to it should now fail with ENOENT. */
+    const char *names[] = { "ephem.txt" };
+    stm_9p_qid wqids[1];
+    STM_ASSERT_EQ(stm_9p_walk(c, 100, 102, 1, names, wqids, &walked),
+                    STM_ENOENT);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Tunlinkat without AT_REMOVEDIR on a directory → server refuses
+ * (it's a directory, not a regular file). The exact errno is
+ * server-policy; assert non-OK. */
+STM_TEST(p9_client_unlinkat_dir_without_removedir_flag_refused)
+{
+    client_fixture f = make_client_fixture("unlink_dir_noflag");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    stm_9p_qid mq;
+    STM_ASSERT_OK(stm_9p_mkdir(c, 100, "subdir", 0755u, 0, &mq));
+
+    /* Without AT_REMOVEDIR on a directory → server errors. */
+    stm_status rc = stm_9p_unlinkat(c, 100, "subdir", /*flags=*/0);
+    STM_ASSERT(rc != STM_OK);
+
+    /* With AT_REMOVEDIR → succeeds (dir is empty). */
+    STM_ASSERT_OK(stm_9p_unlinkat(c, 100, "subdir", STM_9P_AT_REMOVEDIR));
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Tunlinkat with AT_REMOVEDIR on non-empty dir → STM_EBUSY (Linux
+ * ENOTEMPTY mapped). */
+STM_TEST(p9_client_unlinkat_removedir_nonempty_ebusy)
+{
+    client_fixture f = make_client_fixture("unlink_nonempty");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    stm_9p_qid mq;
+    STM_ASSERT_OK(stm_9p_mkdir(c, 100, "nonemp", 0755u, 0, &mq));
+
+    /* Walk into nonemp + create child. */
+    const char *names[] = { "nonemp" };
+    stm_9p_qid wqids[1];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 1, names, wqids, &walked));
+    stm_9p_qid lq;
+    STM_ASSERT_OK(stm_9p_lcreate(c, 101, "child", STM_9P_O_RDWR,
+                                    0644u, 0, &lq, NULL));
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+
+    /* AT_REMOVEDIR on non-empty dir → server's stm_fs_rmdir refuses. */
+    stm_status rc = stm_9p_unlinkat(c, 100, "nonemp", STM_9P_AT_REMOVEDIR);
+    STM_ASSERT_EQ(rc, STM_EBUSY);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
 STM_TEST_MAIN("9p_client")

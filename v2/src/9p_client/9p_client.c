@@ -764,6 +764,182 @@ stm_status stm_9p_write(stm_9p_client *c, uint32_t fid, uint64_t offset,
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
+/* TLcreate / TMkdir / TUnlinkat — the mutation triad.                    */
+/*                                                                         */
+/* Each inherits the R111 doctrine: op_entry_check at entry, name length  */
+/* + content validation, caller-cap bounds on every server-supplied count, */
+/* strict body-len equality on the reply.                                  */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/* Validate a name before sending. Server enforces this server-side too,
+ * but pre-rejecting at the lib boundary saves a round-trip + gives a
+ * stable status (STM_EINVAL, not the server's mapped Rlerror). */
+static stm_status validate_name_for_lib(const char *name, size_t *out_len)
+{
+    if (!name) return STM_EINVAL;
+    size_t nl = strlen(name);
+    if (nl == 0 || nl > STM_9P_NAME_MAX) return STM_EINVAL;
+    /* "." and ".." are reserved per POSIX; the .L spec also refuses. */
+    if (nl == 1 && name[0] == '.') return STM_EINVAL;
+    if (nl == 2 && name[0] == '.' && name[1] == '.') return STM_EINVAL;
+    /* '/' inside a single name component is illegal — names are leaf
+     * components only. */
+    for (size_t i = 0; i < nl; i++) {
+        if (name[i] == '/' || name[i] == '\0') return STM_EINVAL;
+    }
+    *out_len = nl;
+    return STM_OK;
+}
+
+stm_status stm_9p_lcreate(stm_9p_client *c, uint32_t fid,
+                             const char *name, uint32_t flags,
+                             uint32_t mode, uint32_t gid,
+                             stm_9p_qid *out_qid, uint32_t *out_iounit)
+{
+    stm_status ec = op_entry_check(c);
+    if (ec != STM_OK) return ec;
+    size_t nl = 0;
+    ec = validate_name_for_lib(name, &nl);
+    if (ec != STM_OK) return ec;
+
+    /* Wire: hdr + fid(4) + nlen(2) + name(nl) + flags(4) + mode(4) + gid(4). */
+    uint32_t msg_size = STM_9P_HDR_SIZE + 4u + 2u + (uint32_t)nl + 4u + 4u + 4u;
+    if (msg_size > c->buf_cap) return STM_ERANGE;
+    uint16_t tag = 0;
+    stm_status rc = alloc_tag(c, &tag);
+    if (rc != STM_OK) return rc;
+
+    uint8_t *wp = c->buf;
+    p_u32(wp, msg_size);
+    wp[4] = STM_9P_TLCREATE;
+    p_u16(wp + 5, tag);
+    uint8_t *bp = wp + 7;
+    p_u32(bp, fid); bp += 4;
+    p_u16(bp, (uint16_t)nl); bp += 2;
+    memcpy(bp, name, nl); bp += nl;
+    p_u32(bp, flags); bp += 4;
+    p_u32(bp, mode);  bp += 4;
+    p_u32(bp, gid);   bp += 4;
+    rc = send_msg(c, msg_size);
+    if (rc != STM_OK) return rc;
+
+    uint32_t reply_size = 0;
+    rc = recv_msg(c, &reply_size);
+    if (rc != STM_OK) return rc;
+    const uint8_t *body = NULL;
+    uint32_t body_len = 0;
+    rc = check_reply(c, reply_size, STM_9P_RLCREATE, tag, &body, &body_len);
+    if (rc != STM_OK) return rc;
+    /* Rlcreate body: qid[13] + iounit[4] = 17 bytes. R111 P3 F-10
+     * doctrine: strict equality. */
+    if (body_len != STM_9P_QID_SIZE + 4u) {
+        c->last_errno = EPROTO;
+        return STM_EBACKEND;
+    }
+    if (out_qid) {
+        out_qid->type    = body[0];
+        out_qid->version = g_u32(body + 1);
+        out_qid->path    = g_u64(body + 5);
+    }
+    if (out_iounit) *out_iounit = g_u32(body + STM_9P_QID_SIZE);
+    return STM_OK;
+}
+
+stm_status stm_9p_mkdir(stm_9p_client *c, uint32_t dfid,
+                           const char *name, uint32_t mode, uint32_t gid,
+                           stm_9p_qid *out_qid)
+{
+    stm_status ec = op_entry_check(c);
+    if (ec != STM_OK) return ec;
+    size_t nl = 0;
+    ec = validate_name_for_lib(name, &nl);
+    if (ec != STM_OK) return ec;
+
+    /* Wire: hdr + dfid(4) + nlen(2) + name(nl) + mode(4) + gid(4). */
+    uint32_t msg_size = STM_9P_HDR_SIZE + 4u + 2u + (uint32_t)nl + 4u + 4u;
+    if (msg_size > c->buf_cap) return STM_ERANGE;
+    uint16_t tag = 0;
+    stm_status rc = alloc_tag(c, &tag);
+    if (rc != STM_OK) return rc;
+
+    uint8_t *wp = c->buf;
+    p_u32(wp, msg_size);
+    wp[4] = STM_9P_TMKDIR;
+    p_u16(wp + 5, tag);
+    uint8_t *bp = wp + 7;
+    p_u32(bp, dfid); bp += 4;
+    p_u16(bp, (uint16_t)nl); bp += 2;
+    memcpy(bp, name, nl); bp += nl;
+    p_u32(bp, mode); bp += 4;
+    p_u32(bp, gid);  bp += 4;
+    rc = send_msg(c, msg_size);
+    if (rc != STM_OK) return rc;
+
+    uint32_t reply_size = 0;
+    rc = recv_msg(c, &reply_size);
+    if (rc != STM_OK) return rc;
+    const uint8_t *body = NULL;
+    uint32_t body_len = 0;
+    rc = check_reply(c, reply_size, STM_9P_RMKDIR, tag, &body, &body_len);
+    if (rc != STM_OK) return rc;
+    /* Rmkdir body: qid[13] = 13 bytes. Strict equality. */
+    if (body_len != STM_9P_QID_SIZE) {
+        c->last_errno = EPROTO;
+        return STM_EBACKEND;
+    }
+    if (out_qid) {
+        out_qid->type    = body[0];
+        out_qid->version = g_u32(body + 1);
+        out_qid->path    = g_u64(body + 5);
+    }
+    return STM_OK;
+}
+
+stm_status stm_9p_unlinkat(stm_9p_client *c, uint32_t dirfd,
+                              const char *name, uint32_t flags)
+{
+    stm_status ec = op_entry_check(c);
+    if (ec != STM_OK) return ec;
+    size_t nl = 0;
+    ec = validate_name_for_lib(name, &nl);
+    if (ec != STM_OK) return ec;
+
+    /* Wire: hdr + dirfd(4) + nlen(2) + name(nl) + flags(4). */
+    uint32_t msg_size = STM_9P_HDR_SIZE + 4u + 2u + (uint32_t)nl + 4u;
+    if (msg_size > c->buf_cap) return STM_ERANGE;
+    uint16_t tag = 0;
+    stm_status rc = alloc_tag(c, &tag);
+    if (rc != STM_OK) return rc;
+
+    uint8_t *wp = c->buf;
+    p_u32(wp, msg_size);
+    wp[4] = STM_9P_TUNLINKAT;
+    p_u16(wp + 5, tag);
+    uint8_t *bp = wp + 7;
+    p_u32(bp, dirfd); bp += 4;
+    p_u16(bp, (uint16_t)nl); bp += 2;
+    memcpy(bp, name, nl); bp += nl;
+    p_u32(bp, flags); bp += 4;
+    rc = send_msg(c, msg_size);
+    if (rc != STM_OK) return rc;
+
+    uint32_t reply_size = 0;
+    rc = recv_msg(c, &reply_size);
+    if (rc != STM_OK) return rc;
+    const uint8_t *body = NULL;
+    uint32_t body_len = 0;
+    rc = check_reply(c, reply_size, STM_9P_RUNLINKAT, tag, &body, &body_len);
+    if (rc != STM_OK) return rc;
+    /* Runlinkat has NO body. Strict equality. */
+    if (body_len != 0u) {
+        c->last_errno = EPROTO;
+        return STM_EBACKEND;
+    }
+    (void)body;
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
 /* Tclunk.                                                                 */
 /* ────────────────────────────────────────────────────────────────────── */
 

@@ -38,7 +38,29 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9-LIB-1b Twrite primitive (this commit). 44 ctest suites
+- **Tip**: P9-LIB-1c mutation triad (this commit). 44 ctest suites
+  green. test_9p_client 19 → 27 (+8 mutation tests).
+  **P9-LIB-1c** (audit-light, R111 doctrine carry) extends the lib
+  with the file-mutation primitive set: stm_9p_lcreate (create
+  regular file in dir; rebinds fid to opened new file per .L
+  spec), stm_9p_mkdir (create directory; dfid stays bound), and
+  stm_9p_unlinkat (remove name, with optional STM_9P_AT_REMOVEDIR
+  flag for empty-dir removal). Each inherits all R111 doctrine:
+  op_entry_check at entry, name-content validation (NULL/"" / "."
+  / ".." / "/" all → STM_EINVAL via new static `validate_name_for_
+  lib`), strict body-len equality on every reply (Rlcreate = 17 B,
+  Rmkdir = 13 B, Runlinkat = 0 B), poison flag propagation. 8 new
+  tests cover round-trip + EEXIST + invalid-names + dir-walk-
+  into-newly-mkdired-dir + ENOTEMPTY (Linux) → STM_EBUSY mapping
+  + AT_REMOVEDIR semantics (without-flag-on-dir refused, with-
+  flag-empty-dir succeeds, with-flag-non-empty → EBUSY). Foundation
+  is now ready for the CLI's full mutation set
+  (`mkdir / touch / rm / rmdir`); the remaining write-side ops
+  (Tsetattr, Trenameat, Tsymlink, Tlink, Treadlink, Tfsync, +
+  Stratum-extension Tsync/Treflink/Tfallocate/Tfadvise) are
+  natural follow-up chunks.
+
+- **Pre-tip-1**: P9-LIB-1b Twrite primitive. 44 ctest suites
   green. test_9p_client 15 → 19 (+4 Twrite tests). **P9-LIB-1b**
   (audit-light, R111 doctrine carry) extends the lib's read-side
   surface with stm_9p_write — the Twrite counterpart to Tread. Wire

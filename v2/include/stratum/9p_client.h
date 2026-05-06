@@ -271,6 +271,72 @@ stm_status stm_9p_write(stm_9p_client *c, uint32_t fid, uint64_t offset,
                            const void *buf, uint32_t count,
                            uint32_t *out_written);
 
+/* TLcreate: create a regular file `name` in directory `fid`, then
+ * REBIND `fid` to the new file with the requested Linux open
+ * `flags`. The fid post-call is the OPENED file fid (no separate
+ * Tlopen needed). 9P2000.L semantics — the parent's binding is
+ * REPLACED, so callers wanting to keep the parent fid open MUST
+ * Twalk-clone it first (e.g. clone fid → newfid; lcreate on
+ * newfid).
+ *
+ * `mode` is the POSIX mode word: file-type bits (S_IFMT) MUST be
+ * 0 or S_IFREG (0100000); permission bits (07777) are stored.
+ * `gid` is the file's group id (.L extension; 0 typical).
+ *
+ * On success populates `*out_qid` (the new file's qid) and
+ * `*out_iounit` (server's preferred chunk size; 0 ⇒ use msize - hdr).
+ * Either may be NULL to discard.
+ *
+ * Returns:
+ *   - STM_OK on success.
+ *   - STM_EINVAL on NULL c, NULL name, name == "" / "." / "..",
+ *     or name length > STM_9P_NAME_MAX.
+ *   - STM_EEXIST if the name already exists in the parent.
+ *   - STM_EACCES if the parent's perms don't allow create.
+ *   - Any Rlerror's mapped status. */
+STM_MUST_USE
+stm_status stm_9p_lcreate(stm_9p_client *c, uint32_t fid,
+                             const char *name, uint32_t flags,
+                             uint32_t mode, uint32_t gid,
+                             stm_9p_qid *out_qid, uint32_t *out_iounit);
+
+/* TMkdir: create a directory `name` in parent directory `dfid`.
+ * Unlike Tlcreate, dfid stays bound to the parent (NOT rebound).
+ * The new directory is created empty (no `.` / `..` dirents
+ * stored).
+ *
+ * `mode` is the POSIX mode word: file-type bits (S_IFMT) MUST be
+ * 0 or S_IFDIR (0040000); permission bits (07777) are stored.
+ *
+ * On success populates `*out_qid` (the new directory's qid) if
+ * non-NULL.
+ *
+ * Returns:
+ *   - STM_OK on success.
+ *   - STM_EEXIST if the name already exists in the parent.
+ *   - Any Rlerror's mapped status. */
+STM_MUST_USE
+stm_status stm_9p_mkdir(stm_9p_client *c, uint32_t dfid,
+                           const char *name, uint32_t mode, uint32_t gid,
+                           stm_9p_qid *out_qid);
+
+/* TUnlinkat: remove `name` from directory `dirfd`.
+ *
+ * `flags` may include `STM_9P_AT_REMOVEDIR` (0x200) to remove an
+ * empty directory; without that flag, only regular files /
+ * symlinks / hard-links can be unlinked. Removing a non-empty
+ * directory returns STM_EBUSY (Linux ENOTEMPTY mapped).
+ *
+ * Returns:
+ *   - STM_OK on success.
+ *   - STM_ENOENT if the name doesn't exist.
+ *   - STM_EINVAL on bad name (empty / "." / "..").
+ *   - STM_EBUSY if removing a non-empty directory.
+ *   - Any Rlerror's mapped status. */
+STM_MUST_USE
+stm_status stm_9p_unlinkat(stm_9p_client *c, uint32_t dirfd,
+                              const char *name, uint32_t flags);
+
 /* Tclunk: forget `fid`. The fid number becomes available for reuse
  * after this call returns OK. Even on error the fid SHOULD be
  * considered cleared (per 9P2000 convention). */

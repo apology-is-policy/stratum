@@ -846,6 +846,25 @@ language bindings, future kernel module) is a 9P consumer.
       Tunlinkat / Trenameat / Tsetattr / Tfsync ops in P9-LIB-1c.
       test_9p_client 15 → 19.
 
+      **P9-LIB-1c mutation triad** (audit-light): adds
+      stm_9p_lcreate (create file in dir; rebinds fid to opened
+      new file per .L spec), stm_9p_mkdir (create dir; dfid
+      stays bound), stm_9p_unlinkat (remove name, optional
+      STM_9P_AT_REMOVEDIR for empty-dir removal). Each inherits
+      R111 doctrine: op_entry_check, name validation (new static
+      validate_name_for_lib rejects NULL/""/"."/".."/'/'),
+      strict body-len equality (Rlcreate=17B, Rmkdir=13B,
+      Runlinkat=0B), poison flag propagation. 8 new tests:
+      lcreate round-trip + EEXIST + invalid-names; mkdir + walk-
+      into-newly-mkdired-dir + EEXIST; unlinkat removes file,
+      AT_REMOVEDIR semantics (without-flag-on-dir refused, with-
+      flag-empty succeeds, with-flag-non-empty → EBUSY).
+      Foundation ready for CLI mkdir/touch/rm/rmdir. Remaining
+      write-side ops (Tsetattr, Trenameat, Tsymlink, Tlink,
+      Treadlink, Tfsync, + Stratum-ext Tsync/Treflink/
+      Tfallocate/Tfadvise) are natural follow-up chunks.
+      test_9p_client 19 → 27.
+
 - [ ] **P9-LIB-2 libstratum-9p async API** — pending.
 
 - [ ] **P9-BIND-1/2/3 language bindings** — pending; Rust crate
