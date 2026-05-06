@@ -38,7 +38,22 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: stratum-mkfs CLI (this commit). New artifact: `stratum-mkfs`
+- **Tip**: P9-CTL-2a stm_lp9_server (this commit). New library
+  `v2/src/lp9/` — generic vops-based 9P2000.L server, sibling to
+  `stm_p9_server` (9P2000 vops) but on the .L wire. v1.0 wire-handles
+  Tversion/Tattach/Twalk/Tlopen/Tread/Twrite/Tclunk/Tflush/Tgetattr/
+  Treaddir; optional ops return Rlerror(ENOSYS) when their vops slot
+  is NULL. Trust-boundary discipline lifted verbatim from
+  `v2/src/9p/server.c` (the FS-bound .L server). 5 unit tests in
+  `test_lp9.c` exercising the wire codec via direct
+  stm_lp9_server_handle calls with a tiny in-test 3-file synfs
+  vops. The library is the foundation for P9-CTL-2b (/ctl/
+  migration from 9P2000 to .L) + P9-SLATE-1 (slate daemon's synfs
+  server) — both build on top without touching this code. CLAUDE.md
+  trigger row added for the new wire-codec surface. 46/46 ctest
+  green (was 45; +test_lp9).
+
+- **Pre-tip-1**: stratum-mkfs CLI. New artifact: `stratum-mkfs`
   binary at `v2/src/cmd/stratum-mkfs/`. Wraps `stm_fs_format` +
   initial dataset-root setup so users can `stratum-mkfs vol.stm` and
   immediately point stratumd at the resulting image. Defaults: 64 MiB
