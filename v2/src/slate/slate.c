@@ -95,6 +95,18 @@ typedef enum {
     /* SLATE-3c-selection: per-panel multi-select. */
     SLATE_KIND_PANEL_L_SELECTION = 23,
     SLATE_KIND_PANEL_R_SELECTION = 24,
+    /* SLATE-4-confirm: /dialogs subtree. The DIALOG_* leaf kinds
+     * encode dialog id in the LOWER 56 bits of qid_path; the kind
+     * byte stays in the high byte. /dialogs and /dialogs/stack are
+     * static (id=0). */
+    SLATE_KIND_DIALOGS_DIR       = 25,  /* /dialogs */
+    SLATE_KIND_DIALOG_STACK      = 26,  /* /dialogs/stack (R) */
+    SLATE_KIND_DIALOG_DIR        = 27,  /* /dialogs/<id> (parent dir) */
+    SLATE_KIND_DIALOG_KIND       = 28,  /* /dialogs/<id>/kind */
+    SLATE_KIND_DIALOG_TITLE      = 29,  /* /dialogs/<id>/title */
+    SLATE_KIND_DIALOG_BODY       = 30,  /* /dialogs/<id>/body */
+    SLATE_KIND_DIALOG_OPTIONS    = 31,  /* /dialogs/<id>/options */
+    SLATE_KIND_DIALOG_RESULT     = 32,  /* /dialogs/<id>/result (W) */
     SLATE_KIND_MAX
 } slate_kind;
 
@@ -143,9 +155,21 @@ static const slate_kind_meta KIND_META[SLATE_KIND_MAX] = {
     /* SLATE-3c-selection: comma-separated entry indices, RW. */
     [SLATE_KIND_PANEL_L_SELECTION] = { false, 0644, "selection" },
     [SLATE_KIND_PANEL_R_SELECTION] = { false, 0644, "selection" },
+    /* SLATE-4-confirm: /dialogs subtree.
+     * /dialogs is mode 0555 (read-execute for walk + readdir).
+     * /dialogs/<id> dirs are mode 0555.
+     * Read-only leaves are 0444; result is 0200 (write-only). */
+    [SLATE_KIND_DIALOGS_DIR]       = { true,  0555, "dialogs"   },
+    [SLATE_KIND_DIALOG_STACK]      = { false, 0444, "stack"     },
+    [SLATE_KIND_DIALOG_DIR]        = { true,  0555, "<id>"      },
+    [SLATE_KIND_DIALOG_KIND]       = { false, 0444, "kind"      },
+    [SLATE_KIND_DIALOG_TITLE]      = { false, 0444, "title"     },
+    [SLATE_KIND_DIALOG_BODY]       = { false, 0444, "body"      },
+    [SLATE_KIND_DIALOG_OPTIONS]    = { false, 0444, "options"   },
+    [SLATE_KIND_DIALOG_RESULT]     = { false, 0200, "result"    },
 };
 
-_Static_assert(SLATE_KIND_MAX == 25, "KIND_META[] sized to enum cardinality");
+_Static_assert(SLATE_KIND_MAX == 33, "KIND_META[] sized to enum cardinality");
 _Static_assert(sizeof("version") - 1     <= STM_LP9_NAME_MAX, "/version literal");
 _Static_assert(sizeof("status") - 1      <= STM_LP9_NAME_MAX, "/status literal");
 _Static_assert(sizeof("event") - 1       <= STM_LP9_NAME_MAX, "/event literal");
@@ -165,6 +189,13 @@ _Static_assert(sizeof("entries") - 1     <= STM_LP9_NAME_MAX, "/panels/X/entries
 _Static_assert(sizeof("cursor") - 1      <= STM_LP9_NAME_MAX, "/panels/X/cursor");
 _Static_assert(sizeof("action") - 1      <= STM_LP9_NAME_MAX, "/panels/X/action");
 _Static_assert(sizeof("selection") - 1   <= STM_LP9_NAME_MAX, "/panels/X/selection");
+_Static_assert(sizeof("dialogs") - 1     <= STM_LP9_NAME_MAX, "/dialogs");
+_Static_assert(sizeof("stack") - 1       <= STM_LP9_NAME_MAX, "/dialogs/stack");
+_Static_assert(sizeof("kind") - 1        <= STM_LP9_NAME_MAX, "/dialogs/X/kind");
+_Static_assert(sizeof("title") - 1       <= STM_LP9_NAME_MAX, "/dialogs/X/title");
+_Static_assert(sizeof("body") - 1        <= STM_LP9_NAME_MAX, "/dialogs/X/body");
+_Static_assert(sizeof("options") - 1     <= STM_LP9_NAME_MAX, "/dialogs/X/options");
+_Static_assert(sizeof("result") - 1      <= STM_LP9_NAME_MAX, "/dialogs/X/result");
 
 /* Backend fid convention. The slate daemon is the SOLE 9P client of
  * its attached stratumd; the lib's caller-managed fid namespace is
@@ -198,6 +229,21 @@ static slate_kind qid_kind(uint64_t q)
 {
     uint8_t b = (uint8_t)(q >> 56);
     return (b < SLATE_KIND_MAX) ? (slate_kind)b : SLATE_KIND_MAX;
+}
+
+/* SLATE-4-confirm: dialog kinds encode the monotonic dialog id in
+ * the LOWER 56 bits of qid_path. /dialogs and /dialogs/stack are
+ * static (id=0). DIALOG_DIR + leaves carry the id. */
+#define SLATE_QID_ID_MASK  ((uint64_t)0x00FFFFFFFFFFFFFFull)
+
+static uint64_t qid_of_dialog(slate_kind k, uint64_t dialog_id)
+{
+    return (((uint64_t)(uint8_t)k) << 56) | (dialog_id & SLATE_QID_ID_MASK);
+}
+
+static uint64_t qid_dialog_id(uint64_t q)
+{
+    return q & SLATE_QID_ID_MASK;
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -247,6 +293,27 @@ typedef struct {
 #define SLATE_PANEL_RIGHT 1
 #define SLATE_PANEL_COUNT 2
 
+/* SLATE-4-confirm: dialog state. v1.0 single-dialog stack —
+ * `active` is true iff a dialog is up; `id` is the monotonic
+ * (never-reused) public id; kind is fixed at "confirm" for v1.
+ * Future SLATE-4b lifts this to an array of N dialogs. */
+typedef enum {
+    SLATE_DIALOG_KIND_NONE = 0,
+    SLATE_DIALOG_KIND_CONFIRM,
+} slate_dialog_kind;
+
+typedef struct {
+    bool                active;
+    uint64_t            id;       /* monotonic; 0 reserved for "no dialog" */
+    slate_dialog_kind   kind;
+    char                title[STM_SLATE_DIALOG_TITLE_MAX + 1];
+    size_t              title_len;
+    char                body[STM_SLATE_DIALOG_BODY_MAX + 1];
+    size_t              body_len;
+    char                options[STM_SLATE_DIALOG_OPTIONS_MAX + 1];
+    size_t              options_len;
+} slate_dialog;
+
 struct stm_slate {
     pthread_mutex_t mu;
     pthread_cond_t  cv;       /* broadcast on dispatch + on stop +
@@ -284,6 +351,13 @@ struct stm_slate {
     pthread_mutex_t backend_mu;       /* serialises every stm_9p_* call */
     stm_9p_client  *backend;          /* protected by `mu` for read,
                                        * by both for write (attach/dis) */
+
+    /* SLATE-4-confirm: single-dialog stack. v1.0 max one active
+     * dialog. next_dialog_id starts at 1; id 0 is reserved for
+     * "no active dialog". next_dialog_id is monotonic — never
+     * reused even after dismiss. */
+    slate_dialog    dialog;
+    uint64_t        next_dialog_id;
 
     /* Per-fid materialized bodies (mu-protected). */
     slate_session   sessions[STM_SLATE_MAX_SESSIONS];
@@ -366,6 +440,9 @@ stm_status stm_slate_create(stm_slate **out)
     s->version = 1u;
     /* PanelPathConsistent + ConnectionAtomic both hold by calloc:
      *   connected = false; socket_len = 0; panel[i].path_len = 0. */
+    /* SLATE-4-confirm: dialog ids start at 1; 0 reserved for "no
+     * active dialog" sentinel (see stm_slate_dialog_id). */
+    s->next_dialog_id = 1u;
     *out = s;
     return STM_OK;
 }
@@ -624,6 +701,96 @@ size_t stm_slate_socket(stm_slate *s, char *buf, size_t buf_cap)
     return n;
 }
 
+/* SLATE-4-confirm: validate that a string contains no control bytes
+ * (R115 P1-1 / R117 P1-1 doctrine carry). For dialog title and
+ * options, NO control bytes including '\n'. For body, '\n' is
+ * permitted (multi-line); other control bytes still refused. */
+static stm_status validate_dialog_string(const char *s, size_t len,
+                                              bool allow_newline)
+{
+    if (!s) return STM_EINVAL;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x20u) {
+            if (!(allow_newline && c == '\n')) return STM_EINVAL;
+        } else if (c == 0x7Fu) {
+            return STM_EINVAL;
+        }
+    }
+    return STM_OK;
+}
+
+stm_status stm_slate_open_confirm(stm_slate *s,
+                                       const char *title,   size_t title_len,
+                                       const char *body,    size_t body_len,
+                                       const char *options, size_t options_len,
+                                       uint64_t *out_id)
+{
+    if (!s || !title || !body || !options || !out_id) return STM_EINVAL;
+    if (title_len == 0u || title_len > STM_SLATE_DIALOG_TITLE_MAX)
+        return STM_EINVAL;
+    if (body_len > STM_SLATE_DIALOG_BODY_MAX) return STM_EINVAL;
+    if (options_len == 0u || options_len > STM_SLATE_DIALOG_OPTIONS_MAX)
+        return STM_EINVAL;
+    /* Title + options must be single-line. Body permits '\n'. */
+    if (validate_dialog_string(title, title_len, false) != STM_OK)
+        return STM_EINVAL;
+    if (validate_dialog_string(body, body_len, true) != STM_OK)
+        return STM_EINVAL;
+    if (validate_dialog_string(options, options_len, false) != STM_OK)
+        return STM_EINVAL;
+
+    pthread_mutex_lock(&s->mu);
+    if (s->dialog.active) {
+        pthread_mutex_unlock(&s->mu);
+        return STM_EBUSY;
+    }
+    s->dialog.active = true;
+    s->dialog.id = s->next_dialog_id;
+    if (s->next_dialog_id < UINT64_MAX) {
+        s->next_dialog_id++;
+    } else {
+        /* Saturation: refuse rather than wrap. R29 P3-1 doctrine
+         * carry — never reuse ids. */
+        s->dialog.active = false;
+        pthread_mutex_unlock(&s->mu);
+        return STM_EOVERFLOW;
+    }
+    s->dialog.kind = SLATE_DIALOG_KIND_CONFIRM;
+    memcpy(s->dialog.title, title, title_len);
+    s->dialog.title[title_len] = '\0';
+    s->dialog.title_len = title_len;
+    memcpy(s->dialog.body, body, body_len);
+    s->dialog.body[body_len] = '\0';
+    s->dialog.body_len = body_len;
+    memcpy(s->dialog.options, options, options_len);
+    s->dialog.options[options_len] = '\0';
+    s->dialog.options_len = options_len;
+    *out_id = s->dialog.id;
+    s->version++;
+    pthread_cond_broadcast(&s->cv);
+    pthread_mutex_unlock(&s->mu);
+    return STM_OK;
+}
+
+bool stm_slate_dialog_active(stm_slate *s)
+{
+    if (!s) return false;
+    pthread_mutex_lock(&s->mu);
+    bool a = s->dialog.active;
+    pthread_mutex_unlock(&s->mu);
+    return a;
+}
+
+uint64_t stm_slate_dialog_id(stm_slate *s)
+{
+    if (!s) return 0u;
+    pthread_mutex_lock(&s->mu);
+    uint64_t id = s->dialog.active ? s->dialog.id : 0u;
+    pthread_mutex_unlock(&s->mu);
+    return id;
+}
+
 size_t stm_slate_panel_path(stm_slate *s, int panel_idx,
                               char *buf, size_t buf_cap)
 {
@@ -781,6 +948,95 @@ static stm_status materialize_panel_selection_locked(stm_slate *s, slate_session
     ss->buf[off] = '\n';
     ss->len = (uint32_t)(off + 1u);
     return STM_OK;
+}
+
+/* SLATE-4-confirm: /dialogs/stack — comma-separated active dialog
+ * ids + newline. v1.0 stack of size 1, so emits "<id>\n" or "\n". */
+static stm_status materialize_dialog_stack_locked(stm_slate *s, slate_session *ss)
+{
+    if (!s->dialog.active) {
+        ss->buf[0] = '\n';
+        ss->len = 1u;
+        return STM_OK;
+    }
+    int n = snprintf((char *)ss->buf, sizeof ss->buf,
+                        "%llu\n", (unsigned long long)s->dialog.id);
+    if (n < 0 || n >= (int)sizeof ss->buf) return STM_ERANGE;
+    ss->len = (uint32_t)n;
+    return STM_OK;
+}
+
+/* SLATE-4-confirm: /dialogs/<id>/kind — kind name + newline.
+ * Caller has already verified id matches s->dialog.id under mu. */
+static stm_status materialize_dialog_kind_locked(stm_slate *s, slate_session *ss)
+{
+    const char *kind_name;
+    switch (s->dialog.kind) {
+    case SLATE_DIALOG_KIND_CONFIRM: kind_name = "confirm"; break;
+    default:                         return STM_EBACKEND;
+    }
+    int n = snprintf((char *)ss->buf, sizeof ss->buf, "%s\n", kind_name);
+    if (n < 0 || n >= (int)sizeof ss->buf) return STM_ERANGE;
+    ss->len = (uint32_t)n;
+    return STM_OK;
+}
+
+/* SLATE-4-confirm: /dialogs/<id>/title — single-line + newline. */
+static stm_status materialize_dialog_title_locked(stm_slate *s, slate_session *ss)
+{
+    if (s->dialog.title_len + 1u > sizeof ss->buf) return STM_ERANGE;
+    memcpy(ss->buf, s->dialog.title, s->dialog.title_len);
+    ss->buf[s->dialog.title_len] = '\n';
+    ss->len = (uint32_t)(s->dialog.title_len + 1u);
+    return STM_OK;
+}
+
+/* SLATE-4-confirm: /dialogs/<id>/body — multi-line + trailing
+ * newline (always appended; if body already ends with '\n', a
+ * second '\n' delimits end-of-body). */
+static stm_status materialize_dialog_body_locked(stm_slate *s, slate_session *ss)
+{
+    if (s->dialog.body_len + 1u > sizeof ss->buf) {
+        /* Body up to STM_SLATE_DIALOG_BODY_MAX (1024) + '\n' fits
+         * in STM_SLATE_BODY_MAX (4096). Defensive nonetheless. */
+        return STM_ERANGE;
+    }
+    memcpy(ss->buf, s->dialog.body, s->dialog.body_len);
+    ss->buf[s->dialog.body_len] = '\n';
+    ss->len = (uint32_t)(s->dialog.body_len + 1u);
+    return STM_OK;
+}
+
+/* SLATE-4-confirm: /dialogs/<id>/options — comma-separated + newline. */
+static stm_status materialize_dialog_options_locked(stm_slate *s, slate_session *ss)
+{
+    if (s->dialog.options_len + 1u > sizeof ss->buf) return STM_ERANGE;
+    memcpy(ss->buf, s->dialog.options, s->dialog.options_len);
+    ss->buf[s->dialog.options_len] = '\n';
+    ss->len = (uint32_t)(s->dialog.options_len + 1u);
+    return STM_OK;
+}
+
+/* SLATE-4-confirm: validate that `result` (already trimmed of
+ * trailing newline) is one of the comma-separated tokens in
+ * `options`. Returns STM_OK if found, STM_EINVAL otherwise. */
+static stm_status validate_dialog_result(const char *options, size_t options_len,
+                                              const char *result, size_t result_len)
+{
+    if (result_len == 0u) return STM_EINVAL;
+    /* Iterate options, splitting on ','. */
+    size_t i = 0;
+    while (i < options_len) {
+        size_t start = i;
+        while (i < options_len && options[i] != ',') i++;
+        size_t tok_len = i - start;
+        if (tok_len == result_len &&
+            memcmp(options + start, result, result_len) == 0) {
+            return STM_OK;
+        }
+        if (i < options_len) i++;  /* skip ',' */
+    }
+    return STM_EINVAL;
 }
 
 /* SLATE-3c-selection: parse a comma-separated decimal index list
@@ -1660,12 +1916,82 @@ static int str_eq(const char *s, size_t slen, const char *lit)
     return slen == lit_len && memcmp(s, lit, slen) == 0;
 }
 
+/* SLATE-4-confirm: parse a decimal name as uint64_t. Returns true
+ * iff the entire name is digits and the parsed value fits in
+ * uint64_t. Used by /dialogs walk to interpret child names as
+ * dialog ids. */
+static bool parse_decimal_u64(const char *name, size_t name_len,
+                                  uint64_t *out)
+{
+    if (name_len == 0u) return false;
+    /* Refuse leading zero (except literal "0"). */
+    if (name_len > 1u && name[0] == '0') return false;
+    uint64_t v = 0;
+    for (size_t i = 0; i < name_len; i++) {
+        char c = name[i];
+        if (c < '0' || c > '9') return false;
+        if (v > (UINT64_MAX - 9u) / 10u) return false;
+        v = v * 10u + (uint64_t)(c - '0');
+    }
+    *out = v;
+    return true;
+}
+
 static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
                               const char *name, size_t name_len,
                               stm_lp9_qid *out)
 {
-    (void)ctx;
+    stm_slate *s = ctx;
     slate_kind dk = qid_kind(dir_qid_path);
+
+    /* SLATE-4-confirm: /dialogs subtree has dynamic-id qids; the
+     * standard switch-on-name pattern below assumes static qids
+     * (kind only). Handle dialog walks first. */
+    if (dk == SLATE_KIND_DIALOGS_DIR) {
+        if (str_eq(name, name_len, "stack")) {
+            stm_lp9_attr a;
+            stm_status rc = getattr_at(qid_of(SLATE_KIND_DIALOG_STACK), &a);
+            if (rc != STM_OK) return rc;
+            *out = a.qid;
+            return STM_OK;
+        }
+        uint64_t did;
+        if (!parse_decimal_u64(name, name_len, &did)) return STM_ENOENT;
+        /* Verify id matches the currently active dialog. Stale ids
+         * (dismissed dialogs) return ENOENT. */
+        pthread_mutex_lock(&s->mu);
+        bool match = (s->dialog.active && s->dialog.id == did);
+        pthread_mutex_unlock(&s->mu);
+        if (!match) return STM_ENOENT;
+        stm_lp9_attr a;
+        stm_status rc = getattr_at(
+            qid_of_dialog(SLATE_KIND_DIALOG_DIR, did), &a);
+        if (rc != STM_OK) return rc;
+        *out = a.qid;
+        return STM_OK;
+    }
+    if (dk == SLATE_KIND_DIALOG_DIR) {
+        uint64_t did = qid_dialog_id(dir_qid_path);
+        /* Re-check freshness of the id (concurrent dismiss could
+         * have cleared the dialog). */
+        pthread_mutex_lock(&s->mu);
+        bool match = (s->dialog.active && s->dialog.id == did);
+        pthread_mutex_unlock(&s->mu);
+        if (!match) return STM_ENOENT;
+        slate_kind tk = SLATE_KIND_MAX;
+        if (str_eq(name, name_len, "kind"))         tk = SLATE_KIND_DIALOG_KIND;
+        else if (str_eq(name, name_len, "title"))   tk = SLATE_KIND_DIALOG_TITLE;
+        else if (str_eq(name, name_len, "body"))    tk = SLATE_KIND_DIALOG_BODY;
+        else if (str_eq(name, name_len, "options")) tk = SLATE_KIND_DIALOG_OPTIONS;
+        else if (str_eq(name, name_len, "result"))  tk = SLATE_KIND_DIALOG_RESULT;
+        else return STM_ENOENT;
+        stm_lp9_attr a;
+        stm_status rc = getattr_at(qid_of_dialog(tk, did), &a);
+        if (rc != STM_OK) return rc;
+        *out = a.qid;
+        return STM_OK;
+    }
+
     slate_kind target = SLATE_KIND_MAX;
 
     switch (dk) {
@@ -1677,6 +2003,7 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
         else if (str_eq(name, name_len, "log"))        target = SLATE_KIND_LOG_DIR;
         else if (str_eq(name, name_len, "connection")) target = SLATE_KIND_CONN_DIR;
         else if (str_eq(name, name_len, "panels"))     target = SLATE_KIND_PANELS_DIR;
+        else if (str_eq(name, name_len, "dialogs"))    target = SLATE_KIND_DIALOGS_DIR;
         break;
     case SLATE_KIND_LOG_DIR:
         if (str_eq(name, name_len, "tail"))            target = SLATE_KIND_LOG_TAIL;
@@ -1770,7 +2097,9 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
         if (rc != STM_OK) return rc;
         rc = emit_entry(SLATE_KIND_CONN_DIR, &em);
         if (rc != STM_OK) return rc;
-        return emit_entry(SLATE_KIND_PANELS_DIR, &em);
+        rc = emit_entry(SLATE_KIND_PANELS_DIR, &em);
+        if (rc != STM_OK) return rc;
+        return emit_entry(SLATE_KIND_DIALOGS_DIR, &em);
     case SLATE_KIND_LOG_DIR:
         rc = emit_entry(SLATE_KIND_LOG_TAIL, &em);
         if (rc != STM_OK) return rc;
@@ -1805,6 +2134,53 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
         rc = emit_entry(SLATE_KIND_PANEL_R_ACTION, &em);
         if (rc != STM_OK) return rc;
         return emit_entry(SLATE_KIND_PANEL_R_SELECTION, &em);
+    case SLATE_KIND_DIALOGS_DIR: {
+        /* SLATE-4-confirm: emit "stack" + the active dialog id (if
+         * any) as a decimal-name dirent. */
+        rc = emit_entry(SLATE_KIND_DIALOG_STACK, &em);
+        if (rc != STM_OK) return rc;
+        stm_slate *s = ctx;
+        pthread_mutex_lock(&s->mu);
+        bool have_dialog = s->dialog.active;
+        uint64_t did = s->dialog.id;
+        pthread_mutex_unlock(&s->mu);
+        if (!have_dialog) return STM_OK;
+        /* Emit a decimal-name dirent for the active dialog. */
+        uint64_t this_cookie = ++em.pos;
+        if (this_cookie <= em.offset) return STM_OK;
+        stm_lp9_dirent e;
+        memset(&e, 0, sizeof e);
+        stm_lp9_attr a;
+        rc = getattr_at(qid_of_dialog(SLATE_KIND_DIALOG_DIR, did), &a);
+        if (rc != STM_OK) return rc;
+        e.qid     = a.qid;
+        e.cookie  = this_cookie;
+        e.dt_type = 4u;  /* DT_DIR */
+        int n = snprintf(e.name, sizeof e.name, "%llu",
+                            (unsigned long long)did);
+        if (n < 0) return STM_EBACKEND;
+        if (n >= (int)sizeof e.name) n = (int)sizeof e.name - 1;
+        e.name_len = (uint16_t)n;
+        return em.cb(&e, em.cb_ctx);
+    }
+    case SLATE_KIND_DIALOG_DIR: {
+        /* SLATE-4-confirm: dialog children. Re-check id freshness. */
+        uint64_t did = qid_dialog_id(dir_qid_path);
+        stm_slate *s = ctx;
+        pthread_mutex_lock(&s->mu);
+        bool match = (s->dialog.active && s->dialog.id == did);
+        pthread_mutex_unlock(&s->mu);
+        if (!match) return STM_ENOENT;
+        rc = emit_entry(SLATE_KIND_DIALOG_KIND, &em);
+        if (rc != STM_OK) return rc;
+        rc = emit_entry(SLATE_KIND_DIALOG_TITLE, &em);
+        if (rc != STM_OK) return rc;
+        rc = emit_entry(SLATE_KIND_DIALOG_BODY, &em);
+        if (rc != STM_OK) return rc;
+        rc = emit_entry(SLATE_KIND_DIALOG_OPTIONS, &em);
+        if (rc != STM_OK) return rc;
+        return emit_entry(SLATE_KIND_DIALOG_RESULT, &em);
+    }
     default:
         return STM_ENOTDIR;
     }
@@ -1919,6 +2295,27 @@ static stm_status vops_lopen(void *ctx, uint32_t fid, uint64_t qid_path,
     case SLATE_KIND_PANEL_R_SELECTION:
         rc = materialize_panel_selection_locked(s, ss, SLATE_PANEL_RIGHT);
         break;
+    case SLATE_KIND_DIALOG_STACK:
+        rc = materialize_dialog_stack_locked(s, ss);
+        break;
+    case SLATE_KIND_DIALOG_KIND:
+    case SLATE_KIND_DIALOG_TITLE:
+    case SLATE_KIND_DIALOG_BODY:
+    case SLATE_KIND_DIALOG_OPTIONS: {
+        /* SLATE-4-confirm: verify the qid's dialog id matches the
+         * currently active dialog before materialising. R29 P3-1
+         * stale-id-as-ENOENT discipline. */
+        uint64_t did = qid_dialog_id(qid_path);
+        if (!s->dialog.active || s->dialog.id != did) {
+            rc = STM_ENOENT;
+            break;
+        }
+        if (k == SLATE_KIND_DIALOG_KIND)         rc = materialize_dialog_kind_locked(s, ss);
+        else if (k == SLATE_KIND_DIALOG_TITLE)   rc = materialize_dialog_title_locked(s, ss);
+        else if (k == SLATE_KIND_DIALOG_BODY)    rc = materialize_dialog_body_locked(s, ss);
+        else                                     rc = materialize_dialog_options_locked(s, ss);
+        break;
+    }
     default:
         rc = STM_EBACKEND;
         break;
@@ -2131,6 +2528,42 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
             s->version++;
             pthread_cond_broadcast(&s->cv);
         }
+        pthread_mutex_unlock(&s->mu);
+        *out_written = len;
+        return STM_OK;
+    }
+    if (k == SLATE_KIND_DIALOG_RESULT) {
+        /* SLATE-4-confirm: write a result label to dismiss the dialog.
+         * Body must equal one of the comma-separated tokens in
+         * dialog.options. R101 P2-2 carry: zero-byte refused. */
+        if (len == 0u) return STM_EINVAL;
+        if (len > STM_SLATE_DIALOG_OPTION_MAX) return STM_EINVAL;
+        size_t l = len;
+        if (l > 0u && ((const char *)buf)[l - 1u] == '\n') l--;
+        if (l == 0u) return STM_EINVAL;
+        /* Validate result has no control bytes. */
+        if (validate_dialog_string((const char *)buf, l, false) != STM_OK)
+            return STM_EINVAL;
+        uint64_t did = qid_dialog_id(qid_path);
+        pthread_mutex_lock(&s->mu);
+        if (!s->dialog.active || s->dialog.id != did) {
+            /* Stale id — dialog was already dismissed or never existed. */
+            pthread_mutex_unlock(&s->mu);
+            return STM_ENOENT;
+        }
+        stm_status vrc = validate_dialog_result(s->dialog.options,
+                                                       s->dialog.options_len,
+                                                       (const char *)buf, l);
+        if (vrc != STM_OK) {
+            pthread_mutex_unlock(&s->mu);
+            return vrc;
+        }
+        /* Dismiss: clear active flag. The id stays bumped via
+         * next_dialog_id, so a future dialog gets a fresh id. */
+        s->dialog.active = false;
+        s->dialog.kind = SLATE_DIALOG_KIND_NONE;
+        s->version++;
+        pthread_cond_broadcast(&s->cv);
         pthread_mutex_unlock(&s->mu);
         *out_written = len;
         return STM_OK;

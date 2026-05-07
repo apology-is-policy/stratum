@@ -196,6 +196,15 @@ extern "C" {
  * a SLATE-N concern). 200 × 320 = 64 KiB body, fits LOG_TAIL_MAX. */
 #define STM_SLATE_ENTRIES_MAX    200u
 
+/* SLATE-4-confirm: bounds for the /dialogs subtree.
+ * v1.0 ships a SINGLE-dialog stack (max 1 active dialog at a time);
+ * SLATE-4b will lift this to a multi-dialog stack. Dialog kinds
+ * supported at v1.0: "confirm". */
+#define STM_SLATE_DIALOG_TITLE_MAX    256u
+#define STM_SLATE_DIALOG_BODY_MAX     1024u
+#define STM_SLATE_DIALOG_OPTIONS_MAX  256u  /* raw comma-separated string */
+#define STM_SLATE_DIALOG_OPTION_MAX   64u   /* single option label */
+
 /* ────────────────────────────────────────────────────────────────────── */
 /* Lifecycle.                                                             */
 /* ────────────────────────────────────────────────────────────────────── */
@@ -319,6 +328,51 @@ size_t stm_slate_socket(stm_slate *s, char *buf, size_t buf_cap);
  */
 size_t stm_slate_panel_path(stm_slate *s, int panel_idx,
                               char *buf, size_t buf_cap);
+
+/*
+ * SLATE-4-confirm: open a confirm dialog.
+ * Renderer-facing: title is the dialog headline, body is multi-line
+ * descriptive text, options is comma-separated labels (e.g.,
+ * "ok,cancel" or "skip,overwrite,keepboth"). The dialog is pushed
+ * onto the stack; if a dialog is already active, returns STM_EBUSY
+ * (v1.0 single-dialog stack — SLATE-4b lifts this).
+ *
+ * On success, *out_id is set to the dialog's monotonic id (slate
+ * never reuses ids). The renderer reads /dialogs/stack to discover
+ * the id, then walks /dialogs/<id>/{kind,title,body,options} to
+ * present, and writes /dialogs/<id>/result with one of the option
+ * labels to dismiss.
+ *
+ * Trust boundary: every input string is sanitized — bytes < 0x20
+ * (other than '\n' in body) and == 0x7F are refused with STM_EINVAL
+ * (R115 P1-1 / R117 P1-1 doctrine carry; title/options must be
+ * single-line, body permits embedded '\n'). Bounds enforced.
+ *
+ * Returns:
+ *   - STM_OK on success.
+ *   - STM_EBUSY if a dialog is already active.
+ *   - STM_EINVAL on NULL args, oversize fields, or control bytes
+ *     in any input.
+ */
+STM_MUST_USE
+stm_status stm_slate_open_confirm(stm_slate *s,
+                                       const char *title,   size_t title_len,
+                                       const char *body,    size_t body_len,
+                                       const char *options, size_t options_len,
+                                       uint64_t *out_id);
+
+/*
+ * SLATE-4-confirm: query whether a dialog is currently active.
+ * Mu-protected; the value is the live state at the moment of call.
+ */
+bool stm_slate_dialog_active(stm_slate *s);
+
+/*
+ * SLATE-4-confirm: query the active dialog's id.
+ * Returns 0 if no dialog is active. (Dialog ids are monotonic and
+ * start at 1, so 0 is unambiguous as "no active dialog".)
+ */
+uint64_t stm_slate_dialog_id(stm_slate *s);
 
 /* ────────────────────────────────────────────────────────────────────── */
 /* lp9 vops.                                                              */

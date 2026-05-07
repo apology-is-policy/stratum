@@ -573,7 +573,7 @@ static void destroy_backend_fixture(slate_backend_fixture *f)
 
 STM_TEST(slate_socket_attach_to_backend_and_read_panel_entries)
 {
-    /* Backend slate (B). Its root has 7 entries (SLATE-1 + SLATE-2
+    /* Backend slate (B). Its root has 8 entries (SLATE-1 + SLATE-2 + SLATE-4)
      * surface): version, status, event, redraw, log, connection,
      * panels. */
     slate_backend_fixture be;
@@ -642,7 +642,7 @@ STM_TEST(slate_socket_attach_to_backend_and_read_panel_entries)
     ebuf[egot] = '\0';
     /* Each entry has a "TYPE MODE SIZE MTIME NAME" line ending '\n';
      * the backend root contains version/status/event/redraw/log/
-     * connection/panels (7 entries). Verify every name shows up. */
+     * connection/panels/dialogs (8 entries). Verify every name shows up. */
     STM_ASSERT(strstr(ebuf, " version\n")    != NULL);
     STM_ASSERT(strstr(ebuf, " status\n")     != NULL);
     STM_ASSERT(strstr(ebuf, " event\n")      != NULL);
@@ -650,6 +650,7 @@ STM_TEST(slate_socket_attach_to_backend_and_read_panel_entries)
     STM_ASSERT(strstr(ebuf, " log\n")        != NULL);
     STM_ASSERT(strstr(ebuf, " connection\n") != NULL);
     STM_ASSERT(strstr(ebuf, " panels\n")     != NULL);
+    STM_ASSERT(strstr(ebuf, " dialogs\n")    != NULL);
 
     /* R115 P1-1 structural invariant: every \n-terminated line in
      * the body MUST start with a TYPE char in {d, -, l, ?} followed
@@ -672,7 +673,7 @@ STM_TEST(slate_socket_attach_to_backend_and_read_panel_entries)
             lines++;
             p = nl + 1;
         }
-        STM_ASSERT_EQ(lines, 7u);
+        STM_ASSERT_EQ(lines, 8u);
     }
     STM_ASSERT_OK(stm_9p_clunk(c, 104u));
 

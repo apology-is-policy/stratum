@@ -327,9 +327,9 @@ STM_TEST(slate_root_readdir_emits_expected_entries)
     ent_collect cx = {0};
     STM_ASSERT_OK(v->readdir(s, stm_slate_root(s), /*cookie=*/0u,
                                 ent_cb, &cx));
-    /* SLATE-1 + SLATE-2: version, status, event, redraw, log,
-     * connection, panels. */
-    STM_ASSERT_EQ(cx.n, 7u);
+    /* SLATE-1 + SLATE-2 + SLATE-4-confirm: version, status, event,
+     * redraw, log, connection, panels, dialogs. */
+    STM_ASSERT_EQ(cx.n, 8u);
     STM_ASSERT_EQ(strcmp(cx.names[0], "version"),    0);
     STM_ASSERT_EQ(strcmp(cx.names[1], "status"),     0);
     STM_ASSERT_EQ(strcmp(cx.names[2], "event"),      0);
@@ -337,6 +337,7 @@ STM_TEST(slate_root_readdir_emits_expected_entries)
     STM_ASSERT_EQ(strcmp(cx.names[4], "log"),        0);
     STM_ASSERT_EQ(strcmp(cx.names[5], "connection"), 0);
     STM_ASSERT_EQ(strcmp(cx.names[6], "panels"),     0);
+    STM_ASSERT_EQ(strcmp(cx.names[7], "dialogs"),    0);
 
     stm_slate_destroy(s);
 }
@@ -1171,6 +1172,272 @@ STM_TEST(slate_panel_selection_redundant_write_no_version_bump)
     STM_ASSERT_OK(v->write(s, 79u, qp, 0u, "1,3,5", 5u, &written));
     v->clunk(s, 79u, qp);
     STM_ASSERT_EQ(stm_slate_version(s), v1);
+
+    stm_slate_destroy(s);
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* P9-SLATE-4-confirm: /dialogs subtree.                                  */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/* Initially no dialog active; /dialogs/stack reads "\n". */
+STM_TEST(slate_dialog_initial_no_active)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    STM_ASSERT_EQ((int)stm_slate_dialog_active(s), 0);
+    STM_ASSERT_EQ(stm_slate_dialog_id(s), 0u);
+
+    const stm_lp9_vops *v = stm_slate_vops();
+    /* /dialogs/stack qid: kind=26. */
+    uint64_t qp = ((uint64_t)26) << 56;
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/77u, qp, STM_LP9_O_RDONLY));
+    char buf[16];
+    uint32_t got = (uint32_t)sizeof buf;
+    STM_ASSERT_OK(v->read(s, 77u, qp, 0u, buf, &got));
+    STM_ASSERT_EQ(got, 1u);
+    STM_ASSERT_EQ(buf[0], '\n');
+    v->clunk(s, 77u, qp);
+
+    stm_slate_destroy(s);
+}
+
+/* Open + read fields + dismiss via API. */
+STM_TEST(slate_dialog_open_read_dismiss_via_api)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+
+    uint64_t v0 = stm_slate_version(s);
+    uint64_t id = 0;
+    const char *title = "File exists";
+    const char *body  = "Overwrite /foo/bar?";
+    const char *opts  = "skip,overwrite,keepboth";
+    STM_ASSERT_OK(stm_slate_open_confirm(s, title, strlen(title),
+                                              body, strlen(body),
+                                              opts, strlen(opts),
+                                              &id));
+    STM_ASSERT_EQ(id, 1u);
+    STM_ASSERT_EQ((int)stm_slate_dialog_active(s), 1);
+    STM_ASSERT_EQ(stm_slate_dialog_id(s), 1u);
+    uint64_t v1 = stm_slate_version(s);
+    STM_ASSERT(v1 > v0);
+
+    /* Re-open while one is active → STM_EBUSY. */
+    uint64_t id2 = 0;
+    STM_ASSERT_EQ(stm_slate_open_confirm(s, title, strlen(title),
+                                              body, strlen(body),
+                                              opts, strlen(opts), &id2),
+                     STM_EBUSY);
+
+    /* Read /dialogs/stack — should be "1\n". */
+    const stm_lp9_vops *v = stm_slate_vops();
+    uint64_t stack_qp = ((uint64_t)26) << 56;
+    STM_ASSERT_OK(v->lopen(s, 77u, stack_qp, STM_LP9_O_RDONLY));
+    char buf[16];
+    uint32_t got = (uint32_t)sizeof buf;
+    STM_ASSERT_OK(v->read(s, 77u, stack_qp, 0u, buf, &got));
+    buf[got] = '\0';
+    STM_ASSERT_EQ(strcmp(buf, "1\n"), 0);
+    v->clunk(s, 77u, stack_qp);
+
+    /* Read /dialogs/1/kind via direct qid construction. */
+    uint64_t kind_qp = (((uint64_t)28) << 56) | 1u;  /* DIALOG_KIND id=1 */
+    STM_ASSERT_OK(v->lopen(s, 78u, kind_qp, STM_LP9_O_RDONLY));
+    got = (uint32_t)sizeof buf;
+    STM_ASSERT_OK(v->read(s, 78u, kind_qp, 0u, buf, &got));
+    buf[got] = '\0';
+    STM_ASSERT_EQ(strcmp(buf, "confirm\n"), 0);
+    v->clunk(s, 78u, kind_qp);
+
+    /* Read /dialogs/1/title. */
+    uint64_t title_qp = (((uint64_t)29) << 56) | 1u;
+    STM_ASSERT_OK(v->lopen(s, 79u, title_qp, STM_LP9_O_RDONLY));
+    char tbuf[64];
+    got = (uint32_t)sizeof tbuf;
+    STM_ASSERT_OK(v->read(s, 79u, title_qp, 0u, tbuf, &got));
+    tbuf[got] = '\0';
+    STM_ASSERT_EQ(strcmp(tbuf, "File exists\n"), 0);
+    v->clunk(s, 79u, title_qp);
+
+    /* Read /dialogs/1/options. */
+    uint64_t opts_qp = (((uint64_t)31) << 56) | 1u;
+    STM_ASSERT_OK(v->lopen(s, 80u, opts_qp, STM_LP9_O_RDONLY));
+    char obuf[64];
+    got = (uint32_t)sizeof obuf;
+    STM_ASSERT_OK(v->read(s, 80u, opts_qp, 0u, obuf, &got));
+    obuf[got] = '\0';
+    STM_ASSERT_EQ(strcmp(obuf, "skip,overwrite,keepboth\n"), 0);
+    v->clunk(s, 80u, opts_qp);
+
+    /* Dismiss via /dialogs/1/result write. */
+    uint64_t res_qp = (((uint64_t)32) << 56) | 1u;
+    STM_ASSERT_OK(v->lopen(s, 81u, res_qp, STM_LP9_O_WRONLY));
+    uint32_t written = 0;
+    STM_ASSERT_OK(v->write(s, 81u, res_qp, 0u, "overwrite", 9u, &written));
+    v->clunk(s, 81u, res_qp);
+
+    STM_ASSERT_EQ((int)stm_slate_dialog_active(s), 0);
+    STM_ASSERT_EQ(stm_slate_dialog_id(s), 0u);
+
+    stm_slate_destroy(s);
+}
+
+/* Result write rejects strings not in options. */
+STM_TEST(slate_dialog_result_validates_against_options)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    uint64_t id = 0;
+    STM_ASSERT_OK(stm_slate_open_confirm(s, "T", 1u, "B", 1u,
+                                              "ok,cancel", 9u, &id));
+    const stm_lp9_vops *v = stm_slate_vops();
+    uint64_t res_qp = (((uint64_t)32) << 56) | 1u;
+    STM_ASSERT_OK(v->lopen(s, 77u, res_qp, STM_LP9_O_WRONLY));
+    uint32_t written = 0;
+    /* Not in options → EINVAL. */
+    STM_ASSERT_EQ(v->write(s, 77u, res_qp, 0u, "no", 2u, &written), STM_EINVAL);
+    /* Substring of option → EINVAL (token-match, not prefix). */
+    STM_ASSERT_EQ(v->write(s, 77u, res_qp, 0u, "ok!", 3u, &written), STM_EINVAL);
+    /* Empty body → EINVAL. */
+    STM_ASSERT_EQ(v->write(s, 77u, res_qp, 0u, "", 0u, &written), STM_EINVAL);
+    /* Valid options accepted. Trailing newline stripped. */
+    STM_ASSERT_OK(v->write(s, 77u, res_qp, 0u, "cancel", 6u, &written));
+    v->clunk(s, 77u, res_qp);
+    STM_ASSERT_EQ((int)stm_slate_dialog_active(s), 0);
+    stm_slate_destroy(s);
+}
+
+/* Dialog ids are monotonic — never reused. */
+STM_TEST(slate_dialog_ids_are_monotonic)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const stm_lp9_vops *v = stm_slate_vops();
+
+    uint64_t id1 = 0, id2 = 0, id3 = 0;
+    STM_ASSERT_OK(stm_slate_open_confirm(s, "T", 1u, "B", 1u,
+                                              "ok", 2u, &id1));
+    STM_ASSERT_EQ(id1, 1u);
+
+    /* Dismiss via /dialogs/1/result. */
+    uint64_t res1 = (((uint64_t)32) << 56) | 1u;
+    STM_ASSERT_OK(v->lopen(s, 77u, res1, STM_LP9_O_WRONLY));
+    uint32_t written = 0;
+    STM_ASSERT_OK(v->write(s, 77u, res1, 0u, "ok", 2u, &written));
+    v->clunk(s, 77u, res1);
+
+    STM_ASSERT_OK(stm_slate_open_confirm(s, "T", 1u, "B", 1u,
+                                              "ok", 2u, &id2));
+    STM_ASSERT_EQ(id2, 2u);  /* monotonic — never reuse 1 */
+
+    /* Dismiss again. */
+    uint64_t res2 = (((uint64_t)32) << 56) | 2u;
+    STM_ASSERT_OK(v->lopen(s, 78u, res2, STM_LP9_O_WRONLY));
+    STM_ASSERT_OK(v->write(s, 78u, res2, 0u, "ok", 2u, &written));
+    v->clunk(s, 78u, res2);
+
+    STM_ASSERT_OK(stm_slate_open_confirm(s, "T", 1u, "B", 1u,
+                                              "ok", 2u, &id3));
+    STM_ASSERT_EQ(id3, 3u);
+
+    stm_slate_destroy(s);
+}
+
+/* Open rejects oversize / empty / control-byte inputs. */
+STM_TEST(slate_dialog_open_rejects_invalid)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    uint64_t id = 0;
+
+    /* Empty title. */
+    STM_ASSERT_EQ(stm_slate_open_confirm(s, "", 0u, "B", 1u,
+                                              "ok", 2u, &id),
+                     STM_EINVAL);
+
+    /* Newline in title (single-line constraint). */
+    STM_ASSERT_EQ(stm_slate_open_confirm(s, "T\nX", 3u, "B", 1u,
+                                              "ok", 2u, &id),
+                     STM_EINVAL);
+
+    /* Newline in options (single-line constraint). */
+    STM_ASSERT_EQ(stm_slate_open_confirm(s, "T", 1u, "B", 1u,
+                                              "ok\ncancel", 9u, &id),
+                     STM_EINVAL);
+
+    /* Newline in body OK. */
+    STM_ASSERT_OK(stm_slate_open_confirm(s, "T", 1u, "B\nC", 3u,
+                                              "ok", 2u, &id));
+    /* Cleanup: dismiss. */
+    const stm_lp9_vops *v = stm_slate_vops();
+    uint64_t res_qp = (((uint64_t)32) << 56) | 1u;
+    STM_ASSERT_OK(v->lopen(s, 77u, res_qp, STM_LP9_O_WRONLY));
+    uint32_t written = 0;
+    STM_ASSERT_OK(v->write(s, 77u, res_qp, 0u, "ok", 2u, &written));
+    v->clunk(s, 77u, res_qp);
+
+    /* Control byte (DEL) in title. */
+    STM_ASSERT_EQ(stm_slate_open_confirm(s, "T\x7F", 2u, "B", 1u,
+                                              "ok", 2u, &id),
+                     STM_EINVAL);
+
+    /* Empty options. */
+    STM_ASSERT_EQ(stm_slate_open_confirm(s, "T", 1u, "B", 1u, "", 0u, &id),
+                     STM_EINVAL);
+
+    stm_slate_destroy(s);
+}
+
+/* /dialogs readdir lists "stack" + active dialog id. */
+STM_TEST(slate_dialogs_dir_readdir_emits_stack_and_active_id)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const stm_lp9_vops *v = stm_slate_vops();
+    /* /dialogs qid: kind = 25. */
+    uint64_t dqp = ((uint64_t)25) << 56;
+
+    /* No dialog: just "stack". */
+    ent_collect cx = {0};
+    STM_ASSERT_OK(v->readdir(s, dqp, /*cookie=*/0u, ent_cb, &cx));
+    STM_ASSERT_EQ(cx.n, 1u);
+    STM_ASSERT_EQ(strcmp(cx.names[0], "stack"), 0);
+
+    /* Open a dialog → readdir lists "stack" + "1". */
+    uint64_t id = 0;
+    STM_ASSERT_OK(stm_slate_open_confirm(s, "T", 1u, "B", 1u,
+                                              "ok", 2u, &id));
+    ent_collect cy = {0};
+    STM_ASSERT_OK(v->readdir(s, dqp, /*cookie=*/0u, ent_cb, &cy));
+    STM_ASSERT_EQ(cy.n, 2u);
+    STM_ASSERT_EQ(strcmp(cy.names[0], "stack"), 0);
+    STM_ASSERT_EQ(strcmp(cy.names[1], "1"),     0);
+
+    stm_slate_destroy(s);
+}
+
+/* Stale dialog id walks return ENOENT. */
+STM_TEST(slate_dialog_stale_id_walk_enoent)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const stm_lp9_vops *v = stm_slate_vops();
+
+    uint64_t id = 0;
+    STM_ASSERT_OK(stm_slate_open_confirm(s, "T", 1u, "B", 1u,
+                                              "ok", 2u, &id));
+    /* Dismiss. */
+    uint64_t res_qp = (((uint64_t)32) << 56) | 1u;
+    STM_ASSERT_OK(v->lopen(s, 77u, res_qp, STM_LP9_O_WRONLY));
+    uint32_t written = 0;
+    STM_ASSERT_OK(v->write(s, 77u, res_qp, 0u, "ok", 2u, &written));
+    v->clunk(s, 77u, res_qp);
+
+    /* Now walking /dialogs to "1" should ENOENT (stale id). */
+    uint64_t dqp = ((uint64_t)25) << 56;
+    stm_lp9_qid out_qid;
+    STM_ASSERT_EQ(v->walk(s, dqp, "1", 1u, &out_qid), STM_ENOENT);
 
     stm_slate_destroy(s);
 }
