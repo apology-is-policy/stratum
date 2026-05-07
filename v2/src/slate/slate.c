@@ -249,7 +249,15 @@ static slate_kind qid_kind(uint64_t q)
 
 /* SLATE-4-confirm: dialog kinds encode the monotonic dialog id in
  * the LOWER 56 bits of qid_path. /dialogs and /dialogs/stack are
- * static (id=0). DIALOG_DIR + leaves carry the id. */
+ * static (id=0). DIALOG_DIR + leaves carry the id.
+ *
+ * R121 P3-1: this mask is the structural cap on dialog ids — once
+ * `next_dialog_id > SLATE_QID_ID_MASK` (= 2^56-1), the id no
+ * longer round-trips through qid_dialog_id() unscathed, so the
+ * dialog becomes structurally unaddressable. The saturation
+ * check in dialog_open_locked refuses with STM_EOVERFLOW at this
+ * threshold (NOT at UINT64_MAX) to keep the "ids are monotonic
+ * and never reused" invariant honest. */
 #define SLATE_QID_ID_MASK  ((uint64_t)0x00FFFFFFFFFFFFFFull)
 
 static uint64_t qid_of_dialog(slate_kind k, uint64_t dialog_id)
@@ -448,6 +456,28 @@ static uint64_t dialog_top_id_locked(stm_slate *s)
         }
     }
     return top;
+}
+
+/* R121 P3-5: combined slot-lookup-with-top in a single scan.
+ * Returns slot index for `did` (or -1) AND top id via *out_top.
+ * Used by vops_write DIALOG_RESULT (the only caller that needs
+ * BOTH the slot and the top in one decision); other callers stick
+ * with the simpler dialog_slot_for_id_locked / dialog_top_id_locked
+ * helpers. With STM_SLATE_DIALOG_MAX_ACTIVE = 4 the savings are
+ * trivial; the consolidated form is forward-looking — once the
+ * cap is bumped (slate.h:233 forward-note) the constant matters. */
+static int dialog_lookup_and_top_locked(stm_slate *s, uint64_t did,
+                                              uint64_t *out_top)
+{
+    int slot = -1;
+    uint64_t top = 0u;
+    for (int i = 0; i < (int)STM_SLATE_DIALOG_MAX_ACTIVE; i++) {
+        if (!s->dialogs[i].active) continue;
+        if (s->dialogs[i].id == did) slot = i;
+        if (s->dialogs[i].id > top)  top = s->dialogs[i].id;
+    }
+    if (out_top) *out_top = top;
+    return slot;
 }
 
 /* Return the count of active dialogs (0..STM_SLATE_DIALOG_MAX_ACTIVE). */
@@ -852,9 +882,14 @@ static stm_status dialog_open_locked(stm_slate *s,
 {
     int slot = dialog_slot_free_locked(s);
     if (slot < 0) return STM_EBUSY;
-    if (s->next_dialog_id == UINT64_MAX) {
-        /* Saturation: refuse rather than wrap. R29 P3-1 doctrine
-         * carry — never reuse ids. */
+    if (s->next_dialog_id > SLATE_QID_ID_MASK) {
+        /* R121 P3-1: saturation threshold is the qid encoding's
+         * 56-bit mask, NOT UINT64_MAX. Beyond SLATE_QID_ID_MASK
+         * the id no longer round-trips through qid_dialog_id() —
+         * the dialog would be structurally unaddressable. R29
+         * P3-1 doctrine carry — never reuse ids; refuse cleanly
+         * with STM_EOVERFLOW rather than wrap or silently
+         * mis-address. */
         return STM_EOVERFLOW;
     }
     slate_dialog *d = &s->dialogs[slot];
@@ -1236,7 +1271,14 @@ static stm_status materialize_dialog_kind_locked(slate_dialog *d, slate_session 
     switch (d->kind) {
     case SLATE_DIALOG_KIND_CONFIRM: kind_name = "confirm"; break;
     case SLATE_DIALOG_KIND_INPUT:   kind_name = "input";   break;
-    default:                         return STM_EBACKEND;
+    default:
+        /* R121 P3-4: this branch is unreachable today — every
+         * active slot has CONFIRM or INPUT kind. STM_ECORRUPT
+         * (rather than STM_EBACKEND) communicates that an
+         * internal invariant has been violated rather than a
+         * remote 9P op failed; if a future kind is added without
+         * a switch arm here, the renderer error class is correct. */
+        return STM_ECORRUPT;
     }
     int n = snprintf((char *)ss->buf, sizeof ss->buf, "%s\n", kind_name);
     if (n < 0 || n >= (int)sizeof ss->buf) return STM_ERANGE;
@@ -2674,7 +2716,29 @@ static stm_status vops_lopen(void *ctx, uint32_t fid, uint64_t qid_path,
     }
     if (!open_for_read) {
         /* Write-only kind (event, log/append, conn/attach, action) —
-         * no body. */
+         * no body. R121 P3-6: for dynamic-id writable dialog kinds
+         * (DIALOG_RESULT + DIALOG_INPUT), validate the dialog id is
+         * STILL alive at lopen-time — symmetric with the read-capable
+         * path's stale-id discipline. The race between walk and
+         * lopen is small but real: walk binds the qid; concurrent
+         * dismiss frees the slot; lopen would otherwise return
+         * STM_OK on a stale fid and the failure mode would only
+         * surface at vops_write. Defense-in-depth at the lopen
+         * entry point closes the gap (CLAUDE.md slate row clause
+         * 22(g)). DIALOG_INPUT additionally re-checks kind == INPUT. */
+        if (k == SLATE_KIND_DIALOG_RESULT || k == SLATE_KIND_DIALOG_INPUT) {
+            uint64_t did = qid_dialog_id(qid_path);
+            int slot = dialog_slot_for_id_locked(s, did);
+            bool ok = (slot >= 0);
+            if (ok && k == SLATE_KIND_DIALOG_INPUT) {
+                ok = (s->dialogs[slot].kind == SLATE_DIALOG_KIND_INPUT);
+            }
+            if (!ok) {
+                session_free_locked(ss);
+                pthread_mutex_unlock(&s->mu);
+                return STM_ENOENT;
+            }
+        }
         pthread_mutex_unlock(&s->mu);
         return STM_OK;
     }
@@ -2973,7 +3037,12 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
             return STM_EINVAL;
         uint64_t did = qid_dialog_id(qid_path);
         pthread_mutex_lock(&s->mu);
-        int slot = dialog_slot_for_id_locked(s, did);
+        /* R121 P3-5: combined slot-lookup + top-id scan (single
+         * pass over the slot array). With STM_SLATE_DIALOG_MAX_ACTIVE
+         * = 4 the savings are trivial; the consolidated form is
+         * forward-looking. */
+        uint64_t top = 0u;
+        int slot = dialog_lookup_and_top_locked(s, did, &top);
         if (slot < 0) {
             /* Stale id — dialog was already dismissed or never existed. */
             pthread_mutex_unlock(&s->mu);
@@ -2983,7 +3052,6 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
          * dialog (highest active id) accepts result writes. Earlier
          * dialogs are visible (read-side) but result-write returns
          * STM_EBUSY — renderers must dismiss the topmost first. */
-        uint64_t top = dialog_top_id_locked(s);
         if (top != did) {
             pthread_mutex_unlock(&s->mu);
             return STM_EBUSY;

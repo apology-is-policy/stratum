@@ -1927,8 +1927,12 @@ STM_TEST(slate_4b_open_overflow_saturates)
     stm_slate_destroy(s);
 }
 
-/* Stale-id discipline: input-write to dismissed dialog returns ENOENT. */
-STM_TEST(slate_4b_input_write_to_dismissed_enoent)
+/* R121 P3-3: stale-id discipline at vops_write — defense-in-depth
+ * for both /input and /result. The unit test bypasses the lp9
+ * server, so we can lopen + dismiss-via-cancel + write to exercise
+ * the vops_write stale-id branch (vops_write must return ENOENT
+ * even though the lopen succeeded with a then-live id). */
+STM_TEST(slate_4b_input_write_after_cancel_enoent)
 {
     stm_slate *s = NULL;
     STM_ASSERT_OK(stm_slate_create(&s));
@@ -1937,21 +1941,96 @@ STM_TEST(slate_4b_input_write_to_dismissed_enoent)
     uint64_t id = 0;
     STM_ASSERT_OK(stm_slate_open_input(s, "T", 1u, "B", 1u,
                                             "ok", 2u, "", 0u, &id));
-    /* Dismiss. */
+    /* Open /input WRONLY while the dialog is still live. */
+    uint64_t input_qp = (((uint64_t)33) << 56) | 1u;
+    STM_ASSERT_OK(v->lopen(s, 77u, input_qp, STM_LP9_O_WRONLY));
+
+    /* Programmatically cancel the dialog (frees the slot but leaves
+     * the fid bound to a now-stale qid). */
+    STM_ASSERT_OK(stm_slate_dialog_cancel(s, id));
+    STM_ASSERT_EQ((int)stm_slate_dialog_active(s), 0);
+
+    /* Write to the stale fid → STM_ENOENT (vops_write
+     * defense-in-depth). */
+    uint32_t written = 0;
+    STM_ASSERT_EQ(v->write(s, 77u, input_qp, 0u, "x", 1u, &written),
+                     STM_ENOENT);
+    v->clunk(s, 77u, input_qp);
+
+    stm_slate_destroy(s);
+}
+
+/* R121 P3-3 sibling: same shape for DIALOG_RESULT. */
+STM_TEST(slate_4b_result_write_after_cancel_enoent)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const stm_lp9_vops *v = stm_slate_vops();
+
+    uint64_t id = 0;
+    STM_ASSERT_OK(stm_slate_open_confirm(s, "T", 1u, "B", 1u,
+                                              "ok", 2u, &id));
+    /* Open /result WRONLY while live. */
     uint64_t res_qp = (((uint64_t)32) << 56) | 1u;
     STM_ASSERT_OK(v->lopen(s, 77u, res_qp, STM_LP9_O_WRONLY));
+
+    /* Cancel. */
+    STM_ASSERT_OK(stm_slate_dialog_cancel(s, id));
+    STM_ASSERT_EQ((int)stm_slate_dialog_active(s), 0);
+
+    /* Write to the stale fid → STM_ENOENT. */
     uint32_t written = 0;
-    STM_ASSERT_OK(v->write(s, 77u, res_qp, 0u, "ok", 2u, &written));
+    STM_ASSERT_EQ(v->write(s, 77u, res_qp, 0u, "ok", 2u, &written),
+                     STM_ENOENT);
     v->clunk(s, 77u, res_qp);
 
-    /* Input-write to dismissed id → ENOENT (slot freed). */
+    stm_slate_destroy(s);
+}
+
+/* R121 P3-6: lopen on /result (write-only) for an already-stale id
+ * returns ENOENT. (The walk would have failed earlier in normal
+ * flow; this exercises the defense-in-depth lopen branch directly
+ * since unit tests bypass the lp9 server.) */
+STM_TEST(slate_4b_lopen_result_on_stale_id_enoent)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const stm_lp9_vops *v = stm_slate_vops();
+
+    uint64_t id = 0;
+    STM_ASSERT_OK(stm_slate_open_confirm(s, "T", 1u, "B", 1u,
+                                              "ok", 2u, &id));
+    STM_ASSERT_OK(stm_slate_dialog_cancel(s, id));
+
+    /* Construct a stale qid and try to lopen /result. */
+    uint64_t res_qp = (((uint64_t)32) << 56) | 1u;
+    STM_ASSERT_EQ(v->lopen(s, 77u, res_qp, STM_LP9_O_WRONLY), STM_ENOENT);
+
+    /* Same for /input on a stale id. */
     uint64_t input_qp = (((uint64_t)33) << 56) | 1u;
-    /* lopen would also fail on stale id — but also test the write
-     * path's defense-in-depth check. We can't open() a stale fid via
-     * the synfs (lopen does its own materialise check), so simulate
-     * by lopen-then-cancel-then-write. Skip this slice; the lopen
-     * path already enforces the stale-id discipline. */
-    (void)input_qp;
+    STM_ASSERT_EQ(v->lopen(s, 78u, input_qp, STM_LP9_O_WRONLY), STM_ENOENT);
+
+    stm_slate_destroy(s);
+}
+
+/* R121 P3-6 sibling: lopen of /input WRONLY on a confirm-kind
+ * dialog (kind != INPUT) returns ENOENT. The walk would also have
+ * failed (clause 22 e/g), but the lopen entry-point check closes
+ * the same-id-different-kind defense-in-depth gap. */
+STM_TEST(slate_4b_lopen_input_on_confirm_kind_enoent)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const stm_lp9_vops *v = stm_slate_vops();
+
+    uint64_t id = 0;
+    STM_ASSERT_OK(stm_slate_open_confirm(s, "T", 1u, "B", 1u,
+                                              "ok", 2u, &id));
+    /* Confirm-kind dialog: /input is not visible at walk; lopen of
+     * the synthesised qid should also refuse. */
+    uint64_t input_qp = (((uint64_t)33) << 56) | 1u;
+    STM_ASSERT_EQ(v->lopen(s, 77u, input_qp, STM_LP9_O_WRONLY), STM_ENOENT);
+
     stm_slate_destroy(s);
 }
 
