@@ -707,6 +707,148 @@ STM_TEST(slate_socket_attach_to_backend_and_read_panel_entries)
     destroy_backend_fixture(&be);
 }
 
+/* R116 P3-1 fix: real attach + disconnect (success path) exercises
+ * the cursor-reset clauses in attach_state_swap_locked +
+ * disconnect_state_swap_locked. The unit test covered the failed-
+ * attach negative path; this covers the positive path.
+ *
+ * Sequence:
+ *   1. Spawn backend slate (slate-B).
+ *   2. Spawn foreground slate (slate-F); dial F.
+ *   3. Set F's cursor to 7 via /panels/left/cursor.
+ *   4. Write B's socket path to F's /connection/attach (real attach
+ *      → attach_state_swap_locked fires → cursor reset to 0).
+ *   5. Read F's cursor — must be "0\n".
+ *   6. Set cursor to 5 again.
+ *   7. Disconnect via empty body to /connection/attach (real
+ *      disconnect → disconnect_state_swap_locked fires → cursor
+ *      reset to 0).
+ *   8. Read cursor — must be "0\n". */
+STM_TEST(slate_socket_panel_cursor_resets_on_real_attach_disconnect)
+{
+    slate_backend_fixture be;
+    setup_backend_fixture(&be, "be_cur");
+
+    slate_fixture f;
+    setup_fixture(&f, "fg_cur");
+
+    stm_9p_client *c = NULL;
+    stm_9p_dial_opts opts = default_dial_opts(100u);
+    STM_ASSERT_OK(retry_dial(g_sock_path, &opts, &c));
+
+    /* Set cursor=7 BEFORE attach. */
+    const char *cnames[] = { "panels", "left", "cursor" };
+    stm_9p_qid cqids[3];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 101u, 3u, cnames, cqids, &walked));
+    stm_9p_qid oqid;
+    uint32_t iounit = 0;
+    STM_ASSERT_OK(stm_9p_lopen(c, 101u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, 101u, 0u, "7", 1u, &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 101u));
+
+    /* Attach to backend — fires attach_state_swap_locked → cursor=0. */
+    const char *anames[] = { "connection", "attach" };
+    stm_9p_qid aqids[2];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 102u, 2u, anames, aqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 102u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    STM_ASSERT_OK(stm_9p_write(c, 102u, 0u, be.sock_path,
+                                  (uint32_t)strlen(be.sock_path), &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 102u));
+
+    /* Cursor must be 0 now (reset by attach). */
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 103u, 3u, cnames, cqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 103u, 0u, &oqid, &iounit));
+    char buf[16];
+    uint32_t got = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 103u, 0u, buf,
+                                  (uint32_t)(sizeof buf), &got));
+    STM_ASSERT_EQ(got, 2u);
+    STM_ASSERT_EQ(buf[0], '0');
+    STM_ASSERT_EQ(buf[1], '\n');
+    STM_ASSERT_OK(stm_9p_clunk(c, 103u));
+
+    /* Set cursor=5, then disconnect via empty body. */
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 104u, 3u, cnames, cqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 104u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    STM_ASSERT_OK(stm_9p_write(c, 104u, 0u, "5", 1u, &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 104u));
+
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 105u, 2u, anames, aqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 105u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    /* "\n" body → server strips the newline → empty → disconnect verb. */
+    STM_ASSERT_OK(stm_9p_write(c, 105u, 0u, "\n", 1u, &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 105u));
+
+    /* Cursor must be 0 (reset by disconnect). */
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 106u, 3u, cnames, cqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 106u, 0u, &oqid, &iounit));
+    got = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 106u, 0u, buf,
+                                  (uint32_t)(sizeof buf), &got));
+    STM_ASSERT_EQ(got, 2u);
+    STM_ASSERT_EQ(buf[0], '0');
+    STM_ASSERT_OK(stm_9p_clunk(c, 106u));
+
+    stm_9p_close(c);
+    destroy_fixture(&f);
+    destroy_backend_fixture(&be);
+}
+
+/* SLATE-3a smoke test over the wire: action verb dispatch + cursor
+ * read on a slate served via stm_lp9_server. R116 P3-4(c) closure. */
+STM_TEST(slate_socket_panel_action_key_down_via_wire)
+{
+    slate_fixture f;
+    setup_fixture(&f, "fg_act");
+
+    stm_9p_client *c = NULL;
+    stm_9p_dial_opts opts = default_dial_opts(100u);
+    STM_ASSERT_OK(retry_dial(g_sock_path, &opts, &c));
+
+    /* Walk to /panels/left/action; write "key Down". */
+    const char *anames[] = { "panels", "left", "action" };
+    stm_9p_qid aqids[3];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 101u, 3u, anames, aqids, &walked));
+    STM_ASSERT_EQ((unsigned)walked, 3u);
+    stm_9p_qid oqid;
+    uint32_t iounit = 0;
+    STM_ASSERT_OK(stm_9p_lopen(c, 101u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, 101u, 0u, "key Down", 8u, &written));
+    STM_ASSERT_EQ((unsigned)written, 8u);
+    STM_ASSERT_OK(stm_9p_clunk(c, 101u));
+
+    /* Read /panels/left/cursor — must be "1\n". */
+    const char *cnames[] = { "panels", "left", "cursor" };
+    stm_9p_qid cqids[3];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 102u, 3u, cnames, cqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 102u, 0u, &oqid, &iounit));
+    char buf[16];
+    uint32_t got = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 102u, 0u, buf,
+                                  (uint32_t)(sizeof buf), &got));
+    STM_ASSERT_EQ(got, 2u);
+    STM_ASSERT_EQ(buf[0], '1');
+    STM_ASSERT_EQ(buf[1], '\n');
+    STM_ASSERT_OK(stm_9p_clunk(c, 102u));
+
+    /* Unknown verb returns the lp9-mapped error (Linux ecode for
+     * STM_ENOTSUPPORTED is ENOSYS = 38; lib maps to STM_EBACKEND if
+     * not in err_map, else passes through). Just verify the write
+     * fails. */
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 103u, 3u, anames, aqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 103u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    stm_status rc = stm_9p_write(c, 103u, 0u, "key Bogus", 9u, &written);
+    STM_ASSERT(rc != STM_OK);
+    STM_ASSERT_OK(stm_9p_clunk(c, 103u));
+
+    stm_9p_close(c);
+    destroy_fixture(&f);
+}
+
 /* /event refuses zero-byte writes (parity with stm_slate_submit_event). */
 STM_TEST(slate_socket_event_zero_byte_einval)
 {

@@ -900,42 +900,66 @@ STM_TEST(slate_panel_cursor_action_version_bump_semantics)
     stm_slate_destroy(s);
 }
 
-/* Cursor reset on attach + disconnect via state-mutator API. */
-STM_TEST(slate_panel_cursor_resets_on_attach_disconnect)
+/* Cursor write of same value does NOT bump version (R116 P3-2). */
+STM_TEST(slate_panel_cursor_redundant_write_no_version_bump)
 {
     stm_slate *s = NULL;
     STM_ASSERT_OK(stm_slate_create(&s));
     const stm_lp9_vops *v = stm_slate_vops();
     uint64_t cqp = ((uint64_t)19) << 56;
 
-    /* Set cursor=10. */
+    /* Initial cursor = 0; write "0" — no-change → no version bump. */
+    uint64_t v0 = stm_slate_version(s);
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/77u, cqp, STM_LP9_O_WRONLY));
+    uint32_t written = 0;
+    STM_ASSERT_OK(v->write(s, 77u, cqp, 0u, "0", 1u, &written));
+    v->clunk(s, 77u, cqp);
+    STM_ASSERT_EQ(stm_slate_version(s), v0);
+
+    /* Now move cursor to 5; bumps. */
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/78u, cqp, STM_LP9_O_WRONLY));
+    STM_ASSERT_OK(v->write(s, 78u, cqp, 0u, "5", 1u, &written));
+    v->clunk(s, 78u, cqp);
+    uint64_t v1 = stm_slate_version(s);
+    STM_ASSERT(v1 > v0);
+
+    /* Write "5" again — no-change → no bump. */
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/79u, cqp, STM_LP9_O_WRONLY));
+    STM_ASSERT_OK(v->write(s, 79u, cqp, 0u, "5", 1u, &written));
+    v->clunk(s, 79u, cqp);
+    STM_ASSERT_EQ(stm_slate_version(s), v1);
+
+    stm_slate_destroy(s);
+}
+
+/* Failed attach leaves prior cursor state untouched. */
+STM_TEST(slate_panel_cursor_unchanged_on_failed_attach)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const stm_lp9_vops *v = stm_slate_vops();
+    uint64_t cqp = ((uint64_t)19) << 56;
+
+    /* Set cursor=10 from disconnected state. */
     STM_ASSERT_OK(v->lopen(s, /*fid=*/77u, cqp, STM_LP9_O_WRONLY));
     uint32_t written = 0;
     STM_ASSERT_OK(v->write(s, 77u, cqp, 0u, "10", 2u, &written));
     v->clunk(s, 77u, cqp);
 
-    /* Disconnect — cursor reset to 0. */
-    STM_ASSERT_OK(stm_slate_disconnect(s));
-    /* (already disconnected from create — no version bump but state
-     * is still cleared via initial create's calloc.) */
-
-    /* Set again, then attach with bogus path (which fails) — state
-     * stays disconnected so cursor still 0. */
-    STM_ASSERT_OK(v->lopen(s, /*fid=*/78u, cqp, STM_LP9_O_WRONLY));
-    STM_ASSERT_OK(v->write(s, 78u, cqp, 0u, "10", 2u, &written));
-    v->clunk(s, 78u, cqp);
     /* Attach with bogus path — fails. */
     stm_status arc = stm_slate_attach(s, "/tmp/stm_slate_no_such_dgkjs.sock",
                                           strlen("/tmp/stm_slate_no_such_dgkjs.sock"));
     STM_ASSERT(arc != STM_OK);
 
-    /* Cursor still 10 (failed attach left state untouched). */
-    STM_ASSERT_OK(v->lopen(s, /*fid=*/79u, cqp, STM_LP9_O_RDONLY));
+    /* Cursor still 10 (failed attach left state untouched). The
+     * successful-attach reset path is exercised in test_slate_socket
+     * via slate_socket_panel_cursor_resets_on_real_attach_disconnect. */
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/78u, cqp, STM_LP9_O_RDONLY));
     char buf[16];
     uint32_t got = (uint32_t)sizeof buf;
-    STM_ASSERT_OK(v->read(s, 79u, cqp, 0u, buf, &got));
+    STM_ASSERT_OK(v->read(s, 78u, cqp, 0u, buf, &got));
     STM_ASSERT_EQ(got, 3u);  /* "10\n" */
-    v->clunk(s, 79u, cqp);
+    v->clunk(s, 78u, cqp);
 
     stm_slate_destroy(s);
 }

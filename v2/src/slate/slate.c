@@ -1535,10 +1535,17 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         }
         int panel_idx = (k == SLATE_KIND_PANEL_L_CURSOR) ? SLATE_PANEL_LEFT
                                                          : SLATE_PANEL_RIGHT;
+        /* R116 P3-2: gate version bump on actual change. A redundant
+         * cursor write (same value) is a no-op — bumping version would
+         * wake every blocked /redraw reader for nothing, violating the
+         * "version changes only via real state mutation" doctrine
+         * (matches the action handler's `handled && moved` posture). */
         pthread_mutex_lock(&s->mu);
-        s->panel[panel_idx].cursor = (uint32_t)v;
-        s->version++;
-        pthread_cond_broadcast(&s->cv);
+        if (s->panel[panel_idx].cursor != (uint32_t)v) {
+            s->panel[panel_idx].cursor = (uint32_t)v;
+            s->version++;
+            pthread_cond_broadcast(&s->cv);
+        }
         pthread_mutex_unlock(&s->mu);
         *out_written = len;
         return STM_OK;
