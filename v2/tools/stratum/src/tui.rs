@@ -237,6 +237,12 @@ fn handle_key(
             action_verb(client, *focus, "key Backspace\n")?;
             return Ok(Action::Refresh);
         }
+        // SWISS-4d: F5 = copy active-panel cursor entry to inactive
+        // panel's CWD. v1.0 supports host→host only via std::fs;
+        // other routes forward-noted.
+        KeyCode::F(5) if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+            return run_copy(local_dialog, spawn, snap, *focus);
+        }
         KeyCode::F(n) if (1..=9).contains(&n) => {
             // SWISS-4b: Shift+F2 = host mount on ACTIVE panel.
             if key.modifiers.contains(KeyModifiers::SHIFT) && n == 2 {
@@ -734,6 +740,141 @@ fn mount_stm_volume(
             Ok(Action::Refresh)
         }
     }
+}
+
+/// SWISS-4d v1.0: copy active-panel cursor entry to inactive panel's
+/// CWD. Both panels must be host-fs at v1.0. Synchronous — blocks
+/// the TUI for the duration. Progress dialog + cross-backend
+/// (stm↔host) routes are forward-noted.
+fn run_copy(
+    local_dialog: &mut Option<LocalDialog>,
+    spawn: Option<&Arc<SpawnCtx>>,
+    snap: &UiState,
+    active: usize,
+) -> Result<Action> {
+    let sp = match spawn {
+        Some(s) => s,
+        None => {
+            *local_dialog = Some(error_dialog(
+                "Copy unavailable: spawn helper not present.",
+            ));
+            return Ok(Action::Refresh);
+        }
+    };
+
+    let inactive = 1 - active;
+    let src_meta = sp.panel_meta(active);
+    let dst_meta = sp.panel_meta(inactive);
+
+    let (src_root, dst_root) = match (&src_meta, &dst_meta) {
+        (BackendMeta::HostFs { root: s }, BackendMeta::HostFs { root: d }) => {
+            (s.clone(), d.clone())
+        }
+        _ => {
+            *local_dialog = Some(error_dialog(
+                "v1.0 copy supports host→host only.\n\
+                 Cross-backend routes (host↔stm, stm→stm) are forward-noted (SWISS-4d2).",
+            ));
+            return Ok(Action::Refresh);
+        }
+    };
+
+    // Resolve source: active panel's cursor entry.
+    let panel = &snap.panels[active];
+    if !panel.connected {
+        *local_dialog = Some(error_dialog("Active panel is not connected."));
+        return Ok(Action::Refresh);
+    }
+    let cursor = panel.cursor as usize;
+    let raw = match panel.raw_entries.get(cursor) {
+        Some(r) => r,
+        None => {
+            *local_dialog = Some(error_dialog("No entry at cursor."));
+            return Ok(Action::Refresh);
+        }
+    };
+    let mut parts = raw.splitn(5, ' ');
+    let kind = parts.next().unwrap_or("?");
+    let _ = parts.next();
+    let _ = parts.next();
+    let _ = parts.next();
+    let name = match parts.next() {
+        Some(n) if !n.is_empty() && n != ".." => n,
+        _ => {
+            *local_dialog = Some(error_dialog("Cannot copy '..' or empty entry."));
+            return Ok(Action::Refresh);
+        }
+    };
+
+    let mut src_path = src_root.clone();
+    let src_cwd = panel.path.trim_start_matches('/');
+    if !src_cwd.is_empty() {
+        src_path.push(src_cwd);
+    }
+    src_path.push(name);
+
+    let dst_panel = &snap.panels[inactive];
+    let mut dst_path = dst_root.clone();
+    let dst_cwd = dst_panel.path.trim_start_matches('/');
+    if !dst_cwd.is_empty() {
+        dst_path.push(dst_cwd);
+    }
+    dst_path.push(name);
+
+    if dst_path.exists() {
+        *local_dialog = Some(error_dialog(&format!(
+            "Destination exists:\n  {}\n\nConflict resolution (Skip/Overwrite/KeepBoth)\n\
+             is forward-noted (SWISS-4d-conflict).",
+            dst_path.display()
+        )));
+        return Ok(Action::Refresh);
+    }
+
+    // Perform the copy synchronously.
+    let result = if kind == "d" {
+        copy_dir_recursive(&src_path, &dst_path)
+    } else {
+        std::fs::copy(&src_path, &dst_path).map(|_| ())
+    };
+
+    match result {
+        Ok(()) => {
+            *local_dialog = Some(error_dialog(&format!(
+                "Copied:\n  {}\n  → {}",
+                src_path.display(),
+                dst_path.display()
+            )));
+            Ok(Action::Refresh)
+        }
+        Err(e) => {
+            *local_dialog = Some(error_dialog(&format!(
+                "Copy failed: {e}\n  src: {}\n  dst: {}",
+                src_path.display(),
+                dst_path.display()
+            )));
+            Ok(Action::Refresh)
+        }
+    }
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ftype = entry.file_type()?;
+        let s = entry.path();
+        let d = dst.join(entry.file_name());
+        if ftype.is_dir() {
+            copy_dir_recursive(&s, &d)?;
+        } else if ftype.is_symlink() {
+            // Read symlink target; recreate at dst. Don't follow.
+            let target = std::fs::read_link(&s)?;
+            std::os::unix::fs::symlink(target, &d)?;
+        } else {
+            std::fs::copy(&s, &d)?;
+        }
+    }
+    Ok(())
 }
 
 fn default_host_path() -> String {
