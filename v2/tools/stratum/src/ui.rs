@@ -47,6 +47,13 @@ const CLR_FKEY_NUM: Color = Color::White;
 const CLR_FKEY_LABEL_FG: Color = Color::Black;
 const CLR_FKEY_LABEL_BG: Color = Color::Cyan;
 
+// Shift+F-key row uses a more subdued palette so the eye prefers the
+// regular row but the modifier layer is legible at a glance — same
+// posture as v2/tui/src/ui.rs.
+const CLR_SHIFT_FKEY_NUM: Color = Color::DarkGray;
+const CLR_SHIFT_FKEY_LABEL_FG: Color = Color::Yellow;
+const CLR_SHIFT_FKEY_LABEL_BG: Color = Color::DarkGray;
+
 const CLR_POPUP_BG: Color = Color::Black;
 
 // ── display sanitization (R125 P1-1) ──────────────────────────────────
@@ -128,7 +135,8 @@ pub fn render(frame: &mut Frame<'_>, state: &UiState) {
         .constraints([
             Constraint::Min(6),     // panel area
             Constraint::Length(1),  // status
-            Constraint::Length(1),  // F-key bar
+            Constraint::Length(1),  // F-key bar (regular)
+            Constraint::Length(1),  // Shift+F-key bar
         ])
         .split(area);
 
@@ -142,6 +150,7 @@ pub fn render(frame: &mut Frame<'_>, state: &UiState) {
 
     draw_status(frame, rows[1], state);
     draw_fkey_bar(frame, rows[2]);
+    draw_shift_fkey_bar(frame, rows[3]);
 
     if state.editor_active {
         draw_editor_overlay(frame, area, state);
@@ -345,11 +354,11 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
 }
 
 fn draw_fkey_bar(frame: &mut Frame<'_>, area: Rect) {
-    // FAR Commander F-key layout, identical to v2/tui's labels. Slate
-    // v1.0 doesn't yet wire most of these (the verbs return
-    // STM_ENOTSUPPORTED server-side), but the visual cohesion matters
-    // and the renderer will route every press as `key F<N>` to
-    // /panels/X/action so future slate verbs light up automatically.
+    // FAR Commander F-key layout, mirrors v2/tui's labels exactly.
+    // Most verbs return STM_ENOTSUPPORTED at SWISS-1 (slate doesn't
+    // yet handle them); the renderer routes every press as
+    // `key F<N>` to /panels/X/action so future slate verbs light
+    // up automatically.
     let keys: &[(&str, &str)] = &[
         ("1", ""),
         ("2", "Mount"),
@@ -362,6 +371,40 @@ fn draw_fkey_bar(frame: &mut Frame<'_>, area: Rect) {
         ("9", "Snap"),
         ("10", "Quit"),
     ];
+    draw_keys_row(frame, area, keys, CLR_FKEY_NUM, CLR_FKEY_LABEL_FG, CLR_FKEY_LABEL_BG);
+}
+
+fn draw_shift_fkey_bar(frame: &mut Frame<'_>, area: Rect) {
+    // Shift+F-keys mirror v2/tui's layout: S2 Host (mount host
+    // filesystem to the inactive panel), S7 MkVol (create volume).
+    // Forward-noted as SWISS-N work — host-fs + mkvol verbs aren't
+    // wired to slate yet; pressing Shift+F2 sends `key Shift-F2` to
+    // /panels/X/action which slate refuses with STM_ENOTSUPPORTED
+    // until the host-fs subcommand + slate-side multi-attach lands.
+    let keys: &[(&str, &str)] = &[
+        ("S1", ""),
+        ("S2", "Host"),
+        ("S3", ""),
+        ("S4", ""),
+        ("S5", ""),
+        ("S6", ""),
+        ("S7", "MkVol"),
+        ("S8", ""),
+        ("S9", ""),
+        ("S10", ""),
+    ];
+    draw_keys_row(frame, area, keys,
+                  CLR_SHIFT_FKEY_NUM, CLR_SHIFT_FKEY_LABEL_FG, CLR_SHIFT_FKEY_LABEL_BG);
+}
+
+fn draw_keys_row(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    keys: &[(&str, &str)],
+    num_fg: Color,
+    label_fg: Color,
+    label_bg: Color,
+) {
     let n = keys.len();
     let total = area.width as usize;
     let base = total / n;
@@ -372,12 +415,12 @@ fn draw_fkey_bar(frame: &mut Frame<'_>, area: Rect) {
         let cw = base + if i < extra { 1 } else { 0 };
         spans.push(Span::styled(
             (*num).to_string(),
-            Style::default().fg(CLR_FKEY_NUM).bg(CLR_BG).bold(),
+            Style::default().fg(num_fg).bg(CLR_BG).bold(),
         ));
         let label_w = cw.saturating_sub(num.chars().count() + 1);
         spans.push(Span::styled(
             format!("{:<w$}", label, w = label_w),
-            Style::default().fg(CLR_FKEY_LABEL_FG).bg(CLR_FKEY_LABEL_BG).bold(),
+            Style::default().fg(label_fg).bg(label_bg).bold(),
         ));
         spans.push(Span::styled(" ", Style::default().bg(CLR_BG)));
     }

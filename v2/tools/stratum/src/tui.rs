@@ -165,7 +165,17 @@ fn handle_key(
         KeyCode::Enter => action_verb(client, *focus, "key Enter\n")?,
         KeyCode::Backspace => action_verb(client, *focus, "key Backspace\n")?,
         KeyCode::F(n) if (1..=9).contains(&n) => {
-            action_verb(client, *focus, &format!("key F{n}\n"))?;
+            // Shift+F<n> routes as "key Shift-F<N>" so slate can
+            // distinguish modifier-bearing presses from bare ones.
+            // Currently all unsupported by slate; renderer is
+            // forward-compat for SWISS-N wiring (Shift+F2 = Host
+            // mount, Shift+F7 = MkVol).
+            let verb = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                format!("key Shift-F{n}\n")
+            } else {
+                format!("key F{n}\n")
+            };
+            action_verb(client, *focus, &verb)?;
         }
         _ => return Ok(Action::Ignore),
     }
