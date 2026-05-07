@@ -292,11 +292,20 @@ uint64_t stm_host_fs_root(const stm_host_fs *h)
 /* vops.                                                                  */
 /* ────────────────────────────────────────────────────────────────────── */
 
-/* Containment check: ensure `path` is the root OR strictly under it. */
+/* Containment check: ensure `path` is the root OR strictly under it.
+ *
+ * R127 P1-2: root="/" was previously rejecting all subpaths because
+ * the `path[h->root_len] == '/'` check looked at index 1 (a non-'/'
+ * char) instead of treating "/" as a special case. Special-case
+ * here so `stratum host-fs /` works. */
 static bool path_within_root(const stm_host_fs *h, const char *path)
 {
     size_t plen = strlen(path);
     if (plen == h->root_len && strcmp(path, h->root) == 0) return true;
+    /* Root is "/": every absolute path is within. */
+    if (h->root_len == 1 && h->root[0] == '/') {
+        return path[0] == '/';
+    }
     if (plen > h->root_len + 1
         && strncmp(path, h->root, h->root_len) == 0
         && path[h->root_len] == '/') return true;
@@ -421,20 +430,25 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
         return (errno == ENOENT) ? STM_ENOENT : STM_EIO;
     }
 
-    /* Defense-in-depth: refuse if the resolved path leaves the root.
-     * realpath() the result and check the prefix. Symlinks pointing
-     * outside the root are caught here. */
+    /* R127 P1-1 / P2-2 closure: refuse-to-bind if the resolved path
+     * leaves the root, OR if realpath fails (broken symlink, EACCES,
+     * etc.). The previous "accept lstat'd path on realpath failure"
+     * branch enabled an attack where a broken-symlink walk binds the
+     * fid + a late-arriving target then makes vops_lopen's follow-
+     * symlink open(2) reach outside root. Refusing here closes that
+     * vector at the source. Real-world cost: dangling symlinks become
+     * unwalkable (Treaddir surfaces them; Twalk fails STM_EACCES). */
     char *resolved = realpath(child, NULL);
-    if (resolved) {
-        if (!path_within_root(h, resolved)) {
-            free(resolved);
-            free(child);
-            return STM_EACCES;
-        }
-        free(resolved);
+    if (!resolved) {
+        free(child);
+        return STM_EACCES;
     }
-    /* (If realpath failed we accept the lstat'd path — broken symlinks
-     * are still walkable in 9P; the next op will see ENOENT.) */
+    if (!path_within_root(h, resolved)) {
+        free(resolved);
+        free(child);
+        return STM_EACCES;
+    }
+    free(resolved);
 
     uint64_t cqid = qid_path_from_stat(&st);
     pthread_mutex_lock(&h->mu);
@@ -571,14 +585,27 @@ static stm_status vops_lopen(void *ctx, uint32_t fid, uint64_t qid_path,
         return STM_ENOENT;
     }
 
+    /* R127 P1-1: open WITHOUT following symlinks at the leaf. The
+     * walk-time containment check validated the resolved path, but
+     * a TOCTOU between walk and lopen could have replaced the file
+     * with a symlink-to-outside; or a broken-symlink walk-bind (now
+     * refused at walk time per P2-2) could have flipped to real.
+     * O_NOFOLLOW on open(2) returns ELOOP if the leaf is a symlink.
+     * For dirs, fdopendir(O_NOFOLLOW|O_DIRECTORY) gives the same
+     * protection. */
     if (S_ISDIR(st.st_mode)) {
-        DIR *d = opendir(copy);
-        if (!d) return STM_EIO;
+        int dfd = open(copy, O_RDONLY | O_NOFOLLOW | O_DIRECTORY);
+        if (dfd < 0) return STM_EIO;
+        DIR *d = fdopendir(dfd);
+        if (!d) {
+            close(dfd);
+            return STM_EIO;
+        }
         pthread_mutex_lock(&h->mu);
         f->dir = d;
         pthread_mutex_unlock(&h->mu);
     } else {
-        int fd = open(copy, O_RDONLY);
+        int fd = open(copy, O_RDONLY | O_NOFOLLOW);
         if (fd < 0) return STM_EIO;
         pthread_mutex_lock(&h->mu);
         f->fd = fd;

@@ -189,8 +189,16 @@ int stm_cmd_host_fs_main(int argc, char **argv)
         if (!strcmp(a, "--msize") && i + 1 < argc) {
             char *end = NULL;
             unsigned long v = strtoul(argv[++i], &end, 10);
-            if (!end || *end != '\0' || v == 0u || v > 0xFFFFFFFFul) {
-                fprintf(stderr, "stratum-host-fs: invalid --msize: %s\n", argv[i]);
+            /* R127 P2-3: clamp at CLI parse so `serve_one` doesn't
+             * malloc(unclamped) before the lp9 server's internal
+             * cap kicks in. 16 MiB matches stratum-slate. */
+            if (!end || *end != '\0' || v < STM_LP9_MSIZE_MIN
+                || v > (16u * 1024u * 1024u)) {
+                fprintf(stderr,
+                    "stratum-host-fs: invalid --msize: %s "
+                    "(must be in [%u, %u])\n",
+                    argv[i], (unsigned)STM_LP9_MSIZE_MIN,
+                    16u * 1024u * 1024u);
                 return 1;
             }
             msize = (uint32_t)v;
