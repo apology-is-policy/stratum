@@ -1433,10 +1433,22 @@ static stm_status descend_panel(stm_slate *s, int panel_idx)
         return STM_EBACKEND;  /* not connected — descend has no target */
     }
 
-    /* Walk to cwd, lopen for read, readdir until we find the
-     * cursor-th non-./.. entry. */
+    /* Walk to cwd, clone to CWD_FID for the post-readdir per-entry
+     * walk (R117 P3-2 closure — was previously a redundant
+     * walk_to_cwd(target_path) from ROOT in the confirm-dir step;
+     * cloning lets the confirm walk be a single-component walk from
+     * the cwd-bound CWD_FID). lopen WORK for readdir. CWD stays
+     * UNOPENED so the confirm-step Twalk from it is universally
+     * valid in 9P2000.L. */
     stm_status rc = walk_to_cwd(bc, cwd, SLATE_BACKEND_WORK_FID);
     if (rc != STM_OK) {
+        pthread_mutex_unlock(&s->backend_mu);
+        return rc;
+    }
+    rc = stm_9p_walk(bc, SLATE_BACKEND_WORK_FID, SLATE_BACKEND_CWD_FID,
+                        0u, NULL, NULL, NULL);
+    if (rc != STM_OK) {
+        (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
         pthread_mutex_unlock(&s->backend_mu);
         return rc;
     }
@@ -1444,6 +1456,7 @@ static stm_status descend_panel(stm_slate *s, int panel_idx)
                          STM_9P_O_RDONLY | STM_9P_O_DIRECTORY,
                          NULL, NULL);
     if (rc != STM_OK) {
+        (void)stm_9p_clunk(bc, SLATE_BACKEND_CWD_FID);
         (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
         pthread_mutex_unlock(&s->backend_mu);
         return rc;
@@ -1468,11 +1481,13 @@ static stm_status descend_panel(stm_slate *s, int panel_idx)
     }
     (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
     if (rc != STM_OK) {
+        (void)stm_9p_clunk(bc, SLATE_BACKEND_CWD_FID);
         pthread_mutex_unlock(&s->backend_mu);
         return rc;
     }
     if (!fc.found) {
         /* Cursor out of range relative to current entries. */
+        (void)stm_9p_clunk(bc, SLATE_BACKEND_CWD_FID);
         pthread_mutex_unlock(&s->backend_mu);
         return STM_EINVAL;
     }
@@ -1482,21 +1497,23 @@ static stm_status descend_panel(stm_slate *s, int panel_idx)
          * reads of /panels/X/path; sanitizing on storage would
          * diverge from the real backend name and break the entries
          * listing's walk_to_cwd lookup. */
+        (void)stm_9p_clunk(bc, SLATE_BACKEND_CWD_FID);
         pthread_mutex_unlock(&s->backend_mu);
         return STM_EINVAL;
     }
     if (fc.type != 4u /* DT_DIR */) {
         /* Not a directory — refuse descend. SLATE-3c will route
          * non-dir Enter to a "view as file" handler. */
+        (void)stm_9p_clunk(bc, SLATE_BACKEND_CWD_FID);
         pthread_mutex_unlock(&s->backend_mu);
         return STM_ENOTDIR;
     }
 
     /* Confirm the entry is actually a directory via Twalk + Tgetattr
-     * (defense against a stale dirent type bit). Walks from CWD_FID
-     * — but CWD_FID isn't bound here (panel_entries_render binds it,
-     * descend_panel doesn't). Use the per-walk-from-root pattern via
-     * walk_to_cwd into ENT_FID. */
+     * (defense against a stale dirent type bit). R117 P3-2 closure:
+     * walks from CWD_FID via single-component Twalk instead of the
+     * prior walk_to_cwd(target_path) double-walk-from-ROOT. CWD is
+     * already bound to the panel's cwd from the clone above. */
     {
         char target_path[STM_SLATE_PATH_MAX + 1];
         size_t target_path_len;
@@ -1504,11 +1521,15 @@ static stm_status descend_panel(stm_slate *s, int panel_idx)
                                        target_path, sizeof target_path,
                                        &target_path_len);
         if (rc != STM_OK) {
+            (void)stm_9p_clunk(bc, SLATE_BACKEND_CWD_FID);
             pthread_mutex_unlock(&s->backend_mu);
             return rc;
         }
-        rc = walk_to_cwd(bc, target_path, SLATE_BACKEND_ENT_FID);
+        const char *names_arr[1] = { fc.name };
+        rc = stm_9p_walk(bc, SLATE_BACKEND_CWD_FID, SLATE_BACKEND_ENT_FID,
+                            1u, names_arr, NULL, NULL);
         if (rc != STM_OK) {
+            (void)stm_9p_clunk(bc, SLATE_BACKEND_CWD_FID);
             pthread_mutex_unlock(&s->backend_mu);
             return rc;
         }
@@ -1517,6 +1538,7 @@ static stm_status descend_panel(stm_slate *s, int panel_idx)
         rc = stm_9p_getattr(bc, SLATE_BACKEND_ENT_FID,
                                 STM_9P_GETATTR_MODE, &a);
         (void)stm_9p_clunk(bc, SLATE_BACKEND_ENT_FID);
+        (void)stm_9p_clunk(bc, SLATE_BACKEND_CWD_FID);
         if (rc != STM_OK) {
             pthread_mutex_unlock(&s->backend_mu);
             return rc;
@@ -1527,12 +1549,7 @@ static stm_status descend_panel(stm_slate *s, int panel_idx)
             return STM_ENOTDIR;
         }
 
-        /* All checks passed — commit the new cwd under s->mu. Re-check
-         * connected (Disconnect could have raced; backend_mu prevents
-         * the backend ptr from changing, but s->connected can flip
-         * to false if Disconnect ran AFTER we checked above. Wait,
-         * Disconnect also takes backend_mu — so it's blocked behind us.
-         * Belt-and-suspenders re-check anyway.) */
+        /* All checks passed — commit the new cwd under s->mu. */
         pthread_mutex_lock(&s->mu);
         if (!s->connected) {
             pthread_mutex_unlock(&s->mu);
