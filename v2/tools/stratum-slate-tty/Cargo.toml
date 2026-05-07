@@ -1,0 +1,27 @@
+[package]
+name = "stratum-slate-tty"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# P9-SLATE-6: terminal renderer for the slate daemon.
+#
+# slate-tty is a 9P client that dials slate's Unix socket (NOT stratumd).
+# slate is the source-of-truth UI state; this crate reads /panels/*,
+# /dialogs/*, /editor/* and writes /event verbs.
+#
+# Architecture (docs/SLATE-DESIGN.md §5): two 9P client connections —
+# one for the main thread (state fetch + /event writes), one for the
+# /redraw blocking-read thread. libstratum-9p is one-op-at-a-time per
+# connection (see include/stratum/9p_client.h), so two clients are
+# the natural way to run a blocking-read in parallel with state ops.
+
+[dependencies]
+ratatui   = "0.29"
+crossterm = "0.28"
+anyhow    = "1"
+libc      = "0.2"
+
+[[bin]]
+name = "stratum-slate-tty"
+path = "src/main.rs"
