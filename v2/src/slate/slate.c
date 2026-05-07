@@ -1094,6 +1094,73 @@ static stm_status verb_key_enter(stm_slate *s, int panel_idx)
     return descend_panel(s, panel_idx);
 }
 
+/* SLATE-3c "key Backspace": ascend to parent dir. Pure state
+ * mutation — no backend op needed because the parent of any
+ * reachable path is itself reachable (we walked through it during
+ * descend). If the backend has since removed the parent, subsequent
+ * panel_entries_render's walk_to_cwd will fail and the entries
+ * listing will be empty — graceful degradation, not a soundness
+ * issue. Disconnected → STM_EBACKEND. Already at root → no-op
+ * (no version bump per "version changes only on real state mutation"
+ * doctrine). */
+static stm_status ascend_panel(stm_slate *s, int panel_idx)
+{
+    pthread_mutex_lock(&s->mu);
+    if (!s->connected) {
+        pthread_mutex_unlock(&s->mu);
+        return STM_EBACKEND;
+    }
+    size_t cwd_len = s->panel[panel_idx].path_len;
+    if (cwd_len == 0u) {
+        pthread_mutex_unlock(&s->mu);
+        return STM_EBACKEND;
+    }
+    /* Already at root — no-op. */
+    if (cwd_len == 1u && s->panel[panel_idx].path[0] == '/') {
+        pthread_mutex_unlock(&s->mu);
+        return STM_OK;
+    }
+    /* Find the last '/' — everything before it is the parent path.
+     * SLATE-3b's descend produces "/<a>" or "/<a>/<b>" etc., so the
+     * last '/' always exists and is at index ≥ 0. */
+    size_t last_slash = 0u;
+    bool found_slash = false;
+    for (size_t i = cwd_len; i > 0u; i--) {
+        if (s->panel[panel_idx].path[i - 1u] == '/') {
+            last_slash = i - 1u;
+            found_slash = true;
+            break;
+        }
+    }
+    if (!found_slash) {
+        /* Defensive — descend always produces leading-/ paths;
+         * a path without '/' would be a state-machine violation. */
+        pthread_mutex_unlock(&s->mu);
+        return STM_ERANGE;
+    }
+    if (last_slash == 0u) {
+        /* path was "/<single>" — parent is "/". */
+        s->panel[panel_idx].path[0] = '/';
+        s->panel[panel_idx].path[1] = '\0';
+        s->panel[panel_idx].path_len = 1u;
+    } else {
+        /* path was "/<a>/.../<x>" — truncate at last_slash, keeping
+         * the prefix as the new path. */
+        s->panel[panel_idx].path[last_slash] = '\0';
+        s->panel[panel_idx].path_len = last_slash;
+    }
+    s->panel[panel_idx].cursor = 0u;
+    s->version++;
+    pthread_cond_broadcast(&s->cv);
+    pthread_mutex_unlock(&s->mu);
+    return STM_OK;
+}
+
+static stm_status verb_key_backspace(stm_slate *s, int panel_idx)
+{
+    return ascend_panel(s, panel_idx);
+}
+
 typedef struct {
     const char  *verb;       /* literal — not NUL-terminated */
     size_t       verb_len;
@@ -1101,9 +1168,10 @@ typedef struct {
 } action_verb_row;
 
 static const action_verb_row ACTION_VERBS[] = {
-    { "key Up",    6u, verb_key_up    },
-    { "key Down",  8u, verb_key_down  },
-    { "key Enter", 9u, verb_key_enter },
+    { "key Up",        6u,  verb_key_up        },
+    { "key Down",      8u,  verb_key_down      },
+    { "key Enter",     9u,  verb_key_enter     },
+    { "key Backspace", 13u, verb_key_backspace },
 };
 
 #define ACTION_VERBS_COUNT (sizeof(ACTION_VERBS) / sizeof(ACTION_VERBS[0]))

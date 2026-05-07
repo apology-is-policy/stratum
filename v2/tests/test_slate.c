@@ -856,6 +856,11 @@ STM_TEST(slate_panel_action_unknown_verb_enotsup)
                      STM_ENOTSUPPORTED);
     STM_ASSERT_EQ(v->write(s, 77u, aqp, 0u, "key F3", 6u, &written),
                      STM_ENOTSUPPORTED);  /* F3 reserved for SLATE-3c */
+    /* SLATE-3c-ascend: "key Backspace" is a known verb but requires
+     * a connected backend; from disconnected state it returns
+     * STM_EBACKEND (not STM_ENOTSUPPORTED). */
+    STM_ASSERT_EQ(v->write(s, 77u, aqp, 0u, "key Backspace", 13u, &written),
+                     STM_EBACKEND);
     /* Empty body refused. */
     STM_ASSERT_EQ(v->write(s, 77u, aqp, 0u, "", 0u, &written), STM_EINVAL);
     v->clunk(s, 77u, aqp);

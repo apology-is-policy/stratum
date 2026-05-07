@@ -1010,6 +1010,163 @@ STM_TEST(slate_socket_action_key_enter_cursor_above_cap_refuses)
     destroy_backend_fixture(&be);
 }
 
+/* SLATE-3c-ascend: descend then ascend round-trips path back to "/".
+ * Verifies: (a) `key Backspace` ascends from /log to /; (b) cursor
+ * resets to 0 on ascend; (c) /panels/X/entries reads the correct
+ * directory after ascend (i.e., panel.path is consistent). */
+STM_TEST(slate_socket_action_key_backspace_ascends_to_root)
+{
+    slate_backend_fixture be;
+    setup_backend_fixture(&be, "be_asc");
+
+    slate_fixture f;
+    setup_fixture(&f, "fg_asc");
+
+    stm_9p_client *c = NULL;
+    stm_9p_dial_opts opts = default_dial_opts(100u);
+    STM_ASSERT_OK(retry_dial(g_sock_path, &opts, &c));
+
+    /* Attach. */
+    const char *anames[] = { "connection", "attach" };
+    stm_9p_qid aqids[2];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 101u, 2u, anames, aqids, &walked));
+    stm_9p_qid oqid;
+    uint32_t iounit = 0;
+    STM_ASSERT_OK(stm_9p_lopen(c, 101u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, 101u, 0u, be.sock_path,
+                                  (uint32_t)strlen(be.sock_path), &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 101u));
+
+    /* Set cursor=4 → descend into /log. */
+    const char *cnames[] = { "panels", "left", "cursor" };
+    stm_9p_qid cqids[3];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 102u, 3u, cnames, cqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 102u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    STM_ASSERT_OK(stm_9p_write(c, 102u, 0u, "4", 1u, &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 102u));
+
+    const char *acn[] = { "panels", "left", "action" };
+    stm_9p_qid acqids[3];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 103u, 3u, acn, acqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 103u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    STM_ASSERT_OK(stm_9p_write(c, 103u, 0u, "key Enter", 9u, &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 103u));
+
+    /* Set cursor=1 (just to verify ascend resets it). */
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 104u, 3u, cnames, cqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 104u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    STM_ASSERT_OK(stm_9p_write(c, 104u, 0u, "1", 1u, &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 104u));
+
+    /* Ascend. */
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 105u, 3u, acn, acqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 105u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    STM_ASSERT_OK(stm_9p_write(c, 105u, 0u, "key Backspace", 13u, &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 105u));
+
+    /* /panels/left/path must be "/\n" again. */
+    const char *pn[] = { "panels", "left", "path" };
+    stm_9p_qid pqids[3];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 106u, 3u, pn, pqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 106u, 0u, &oqid, &iounit));
+    char pbuf[16];
+    uint32_t pgot = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 106u, 0u, pbuf,
+                                  (uint32_t)(sizeof pbuf - 1u), &pgot));
+    pbuf[pgot] = '\0';
+    STM_ASSERT_EQ(strcmp(pbuf, "/\n"), 0);
+    STM_ASSERT_OK(stm_9p_clunk(c, 106u));
+
+    /* Cursor reset to 0. */
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 107u, 3u, cnames, cqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 107u, 0u, &oqid, &iounit));
+    char cbuf[16];
+    uint32_t cgot = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 107u, 0u, cbuf,
+                                  (uint32_t)(sizeof cbuf), &cgot));
+    STM_ASSERT_EQ(cgot, 2u);
+    STM_ASSERT_EQ(cbuf[0], '0');
+    STM_ASSERT_OK(stm_9p_clunk(c, 107u));
+
+    /* Entries from / again — must list backend root. */
+    const char *en[] = { "panels", "left", "entries" };
+    stm_9p_qid enqids[3];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 108u, 3u, en, enqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 108u, 0u, &oqid, &iounit));
+    char ebuf[2048];
+    uint32_t egot = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 108u, 0u, ebuf,
+                                  (uint32_t)(sizeof ebuf - 1u), &egot));
+    ebuf[egot] = '\0';
+    STM_ASSERT(strstr(ebuf, " version\n") != NULL);
+    STM_ASSERT(strstr(ebuf, " log\n")     != NULL);
+    STM_ASSERT_OK(stm_9p_clunk(c, 108u));
+
+    stm_9p_close(c);
+    destroy_fixture(&f);
+    destroy_backend_fixture(&be);
+}
+
+/* SLATE-3c-ascend: ascend at root is a no-op (no version bump). */
+STM_TEST(slate_socket_action_key_backspace_at_root_no_op)
+{
+    slate_backend_fixture be;
+    setup_backend_fixture(&be, "be_asr");
+
+    slate_fixture f;
+    setup_fixture(&f, "fg_asr");
+
+    stm_9p_client *c = NULL;
+    stm_9p_dial_opts opts = default_dial_opts(100u);
+    STM_ASSERT_OK(retry_dial(g_sock_path, &opts, &c));
+
+    /* Attach (path becomes "/", version bumps once). */
+    const char *anames[] = { "connection", "attach" };
+    stm_9p_qid aqids[2];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 101u, 2u, anames, aqids, &walked));
+    stm_9p_qid oqid;
+    uint32_t iounit = 0;
+    STM_ASSERT_OK(stm_9p_lopen(c, 101u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, 101u, 0u, be.sock_path,
+                                  (uint32_t)strlen(be.sock_path), &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 101u));
+
+    /* Snapshot version after attach. */
+    uint64_t v_before = stm_slate_version(f.slate);
+
+    /* Ascend at root. */
+    const char *acn[] = { "panels", "left", "action" };
+    stm_9p_qid acqids[3];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 102u, 3u, acn, acqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 102u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    STM_ASSERT_OK(stm_9p_write(c, 102u, 0u, "key Backspace", 13u, &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 102u));
+
+    /* Version unchanged (no-op). */
+    STM_ASSERT_EQ(stm_slate_version(f.slate), v_before);
+
+    /* Path still "/\n". */
+    const char *pn[] = { "panels", "left", "path" };
+    stm_9p_qid pqids[3];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 103u, 3u, pn, pqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 103u, 0u, &oqid, &iounit));
+    char pbuf[16];
+    uint32_t pgot = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 103u, 0u, pbuf,
+                                  (uint32_t)(sizeof pbuf - 1u), &pgot));
+    pbuf[pgot] = '\0';
+    STM_ASSERT_EQ(strcmp(pbuf, "/\n"), 0);
+    STM_ASSERT_OK(stm_9p_clunk(c, 103u));
+
+    stm_9p_close(c);
+    destroy_fixture(&f);
+    destroy_backend_fixture(&be);
+}
+
 /* "key Enter" on a non-dir entry returns STM_ENOTDIR over the wire
  * (lib maps to STM_EBACKEND for unknown ecodes; either is acceptable
  * — verify it's NOT OK). cursor=0 lands on "version" which is a file.  */
