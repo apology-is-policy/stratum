@@ -183,15 +183,17 @@ static const slate_kind_meta KIND_META[SLATE_KIND_MAX] = {
     [SLATE_KIND_DIALOG_OPTIONS]    = { false, 0444, "options"   },
     [SLATE_KIND_DIALOG_RESULT]     = { false, 0200, "result"    },
     [SLATE_KIND_DIALOG_INPUT]      = { false, 0644, "input"     },
-    /* SLATE-5a: /editor subtree.
+    /* SLATE-5a + SLATE-5b: /editor subtree.
      * /editor is mode 0555 (read-execute for walk + readdir).
-     * Read leaves are 0444; action is 0200 (write-only).
-     * SLATE-5b will lift content + cursor to RW (mode 0644). */
+     * SLATE-5a leaves: active/filename/modified are RO (0444);
+     * action is W (0200). SLATE-5b lifts content + cursor to RW
+     * (0644 — RDONLY/WRONLY/RDWR all accepted) and adds verbs
+     * save/quit/revert/save-and-quit at /editor/action. */
     [SLATE_KIND_EDITOR_DIR]        = { true,  0555, "editor"    },
     [SLATE_KIND_EDITOR_ACTIVE]     = { false, 0444, "active"    },
     [SLATE_KIND_EDITOR_FILENAME]   = { false, 0444, "filename"  },
-    [SLATE_KIND_EDITOR_CONTENT]    = { false, 0444, "content"   },
-    [SLATE_KIND_EDITOR_CURSOR]     = { false, 0444, "cursor"    },
+    [SLATE_KIND_EDITOR_CONTENT]    = { false, 0644, "content"   },
+    [SLATE_KIND_EDITOR_CURSOR]     = { false, 0644, "cursor"    },
     [SLATE_KIND_EDITOR_MODIFIED]   = { false, 0444, "modified"  },
     [SLATE_KIND_EDITOR_ACTION]     = { false, 0200, "action"    },
 };
@@ -465,9 +467,14 @@ struct stm_slate {
     size_t      editor_filename_len;
     uint8_t    *editor_content;
     size_t      editor_content_len;
-    uint32_t    editor_cursor_row;     /* v5a always 0 */
-    uint32_t    editor_cursor_col;     /* v5a always 0 */
-    bool        editor_modified;       /* v5a always false */
+    /* SLATE-5b: pristine baseline copied at open + at save. The
+     * /editor/modified flag is `memcmp(editor_content, editor_original)
+     * != 0 OR editor_content_len != editor_original_len`. */
+    uint8_t    *editor_original;
+    size_t      editor_original_len;
+    uint32_t    editor_cursor_row;
+    uint32_t    editor_cursor_col;
+    bool        editor_modified;       /* derived; cached for fast read */
 
     /* Per-fid materialized bodies (mu-protected). */
     slate_session   sessions[STM_SLATE_MAX_SESSIONS];
@@ -680,9 +687,12 @@ void stm_slate_destroy(stm_slate *s)
             s->sessions[i].bulk_buf = NULL;
         }
     }
-    /* SLATE-5a: free any heap-allocated editor content. */
+    /* SLATE-5a + SLATE-5b: free any heap-allocated editor content
+     * AND original baseline. */
     free(s->editor_content);
     s->editor_content = NULL;
+    free(s->editor_original);
+    s->editor_original = NULL;
     pthread_mutex_unlock(&s->mu);
     if (bc) stm_9p_close(bc);
     pthread_mutex_unlock(&s->backend_mu);
@@ -1178,6 +1188,10 @@ size_t stm_slate_dialog_count(stm_slate *s)
 static stm_status walk_to_cwd(stm_9p_client *bc, const char *cwd,
                                  uint32_t out_fid);
 
+/* SLATE-5b: forward decl for the modified-flag recomputer used by
+ * editor_save (defined later alongside the materialize functions). */
+static void editor_recompute_modified_locked(stm_slate *s);
+
 /* SLATE-5a: validate a path for "editor open". Bytes < 0x20 OR
  * == 0x7F are refused (R117 P1-1 doctrine — storage-as-key strings
  * cannot sanitize-on-display because the path is reused on save).
@@ -1344,13 +1358,32 @@ stm_status stm_slate_editor_open(stm_slate *s, const char *path, size_t path_len
     /* Phase 5: clunk WORK. */
     (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
 
-    /* Phase 6: atomic state swap under s->mu. */
+    /* Phase 6: SLATE-5b — clone `buf` into `editor_original` so the
+     * /editor/modified flag can compare against the pristine
+     * baseline. memcpy outside s->mu (we own buf + the new clone
+     * outside the critical section). On clone failure: free buf
+     * AND any prior editor state isn't touched. */
+    uint8_t *original = NULL;
+    if (got_total > 0u) {
+        original = malloc(got_total);
+        if (!original) {
+            free(buf);
+            pthread_mutex_unlock(&s->backend_mu);
+            return STM_ENOMEM;
+        }
+        memcpy(original, buf, got_total);
+    }
+
+    /* Phase 7: atomic state swap under s->mu. */
     pthread_mutex_lock(&s->mu);
-    /* Free any prior editor content (replacing one open editor with
-     * a new file is allowed; modified-state is dropped). */
+    /* Free any prior editor content + original (replacing one open
+     * editor with a new file is allowed; modified-state is dropped). */
     free(s->editor_content);
     s->editor_content = buf;
     s->editor_content_len = got_total;
+    free(s->editor_original);
+    s->editor_original = original;
+    s->editor_original_len = got_total;
     memcpy(s->editor_filename, path, path_len);
     s->editor_filename[path_len] = '\0';
     s->editor_filename_len = path_len;
@@ -1366,6 +1399,154 @@ stm_status stm_slate_editor_open(stm_slate *s, const char *path, size_t path_len
     return STM_OK;
 }
 
+/* SLATE-5b: write the editor buffer back to the backend file +
+ * fsync. Atomic-write style would use temp + rename; v1.0 uses
+ * Tlopen WRONLY|O_TRUNC + Twrite + Tfsync. Partial-write failures
+ * leave the file partially overwritten — acceptable for v1.0 (the
+ * editor's modified flag stays true so the user knows the save
+ * failed). v1.1 may switch to atomic temp-and-rename.
+ *
+ * On success: editor_modified=false; editor_original is replaced
+ * with the just-written content snapshot (so future memcmp
+ * correctly identifies further changes from the saved state). */
+stm_status stm_slate_editor_save(stm_slate *s)
+{
+    if (!s) return STM_EINVAL;
+
+    pthread_mutex_lock(&s->backend_mu);
+
+    /* Snapshot active state + filename + content under s->mu. */
+    pthread_mutex_lock(&s->mu);
+    stm_9p_client *bc = s->backend;
+    bool active = s->editor_active;
+    if (!active || !bc) {
+        pthread_mutex_unlock(&s->mu);
+        pthread_mutex_unlock(&s->backend_mu);
+        return active ? STM_EBACKEND : STM_ENOENT;
+    }
+    /* Copy filename + content to local heap for the backend op. */
+    char path[STM_SLATE_EDITOR_FILENAME_MAX + 1];
+    memcpy(path, s->editor_filename, s->editor_filename_len);
+    path[s->editor_filename_len] = '\0';
+    size_t content_len = s->editor_content_len;
+    uint8_t *content_snap = NULL;
+    if (content_len > 0u) {
+        content_snap = malloc(content_len);
+        if (!content_snap) {
+            pthread_mutex_unlock(&s->mu);
+            pthread_mutex_unlock(&s->backend_mu);
+            return STM_ENOMEM;
+        }
+        memcpy(content_snap, s->editor_content, content_len);
+    }
+    pthread_mutex_unlock(&s->mu);
+
+    /* Phase 1: walk to file. */
+    stm_status rc = walk_to_cwd(bc, path, SLATE_BACKEND_WORK_FID);
+    if (rc != STM_OK) {
+        free(content_snap);
+        pthread_mutex_unlock(&s->backend_mu);
+        return rc;
+    }
+    /* Phase 2: Tlopen WRONLY|TRUNC. */
+    stm_9p_qid oqid;
+    uint32_t iounit = 0;
+    rc = stm_9p_lopen(bc, SLATE_BACKEND_WORK_FID,
+                         STM_LP9_O_WRONLY | STM_LP9_O_TRUNC,
+                         &oqid, &iounit);
+    if (rc != STM_OK) {
+        (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
+        free(content_snap);
+        pthread_mutex_unlock(&s->backend_mu);
+        return rc;
+    }
+    /* Phase 3: Twrite chunked at iounit cap. */
+    size_t off = 0u;
+    while (off < content_len) {
+        size_t remaining = content_len - off;
+        uint32_t chunk = (iounit > 0u && iounit < remaining)
+                            ? iounit : (uint32_t)remaining;
+        uint32_t written = 0u;
+        rc = stm_9p_write(bc, SLATE_BACKEND_WORK_FID, off,
+                             content_snap + off, chunk, &written);
+        if (rc != STM_OK) {
+            (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
+            free(content_snap);
+            pthread_mutex_unlock(&s->backend_mu);
+            return rc;
+        }
+        if (written == 0u) {
+            /* Server wrote 0 bytes — treat as ENOSPC to surface the
+             * partial-save problem; modified flag stays true so the
+             * user re-saves. */
+            (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
+            free(content_snap);
+            pthread_mutex_unlock(&s->backend_mu);
+            return STM_ENOSPC;
+        }
+        off += written;
+    }
+    /* Phase 4: fsync. */
+    rc = stm_9p_fsync(bc, SLATE_BACKEND_WORK_FID, /*datasync=*/0u);
+    /* Clunk regardless of fsync result. */
+    (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
+    if (rc != STM_OK) {
+        free(content_snap);
+        pthread_mutex_unlock(&s->backend_mu);
+        return rc;
+    }
+
+    /* Phase 5: commit clean state under s->mu. content_snap becomes
+     * the new editor_original; the prior editor_original is freed.
+     * If the editor was closed/replaced concurrently (impossible
+     * given backend_mu is held — but defensive), the snap is freed. */
+    pthread_mutex_lock(&s->mu);
+    if (!s->editor_active) {
+        /* Concurrent editor_close fired between the Tfsync and now.
+         * The save still committed to the backend, but our local
+         * state is gone. Drop the snap. */
+        pthread_mutex_unlock(&s->mu);
+        free(content_snap);
+        pthread_mutex_unlock(&s->backend_mu);
+        return STM_OK;
+    }
+    free(s->editor_original);
+    s->editor_original = content_snap;
+    s->editor_original_len = content_len;
+    /* Recompute modified — should be false since content == new
+     * original. */
+    editor_recompute_modified_locked(s);
+    s->version++;
+    pthread_cond_broadcast(&s->cv);
+    pthread_mutex_unlock(&s->mu);
+
+    pthread_mutex_unlock(&s->backend_mu);
+    return STM_OK;
+}
+
+/* SLATE-5b: re-read the backend file into the editor buffer,
+ * dropping any unsaved edits. Effectively delegates to
+ * editor_open(filename) but preserves the cursor by clamping
+ * to the new content's bounds. */
+stm_status stm_slate_editor_revert(stm_slate *s)
+{
+    if (!s) return STM_EINVAL;
+    /* Snapshot current filename. */
+    char path[STM_SLATE_EDITOR_FILENAME_MAX + 1];
+    pthread_mutex_lock(&s->mu);
+    if (!s->editor_active) {
+        pthread_mutex_unlock(&s->mu);
+        return STM_ENOENT;
+    }
+    size_t plen = s->editor_filename_len;
+    memcpy(path, s->editor_filename, plen);
+    path[plen] = '\0';
+    pthread_mutex_unlock(&s->mu);
+    /* Re-open: this re-walks + re-reads + replaces content +
+     * resets cursor to 0,0 + clears modified. */
+    return stm_slate_editor_open(s, path, plen);
+}
+
 stm_status stm_slate_editor_close(stm_slate *s)
 {
     if (!s) return STM_EINVAL;
@@ -1374,6 +1555,9 @@ stm_status stm_slate_editor_close(stm_slate *s)
         free(s->editor_content);
         s->editor_content = NULL;
         s->editor_content_len = 0u;
+        free(s->editor_original);
+        s->editor_original = NULL;
+        s->editor_original_len = 0u;
         s->editor_filename[0] = '\0';
         s->editor_filename_len = 0u;
         s->editor_active = false;
@@ -1706,13 +1890,35 @@ static stm_status materialize_editor_cursor_locked(stm_slate *s, slate_session *
     return STM_OK;
 }
 
-/* SLATE-5a: /editor/modified — "1\n" or "0\n". v5a always "0\n". */
+/* SLATE-5a + SLATE-5b: /editor/modified — "1\n" or "0\n". The flag
+ * is a cached derivation of (content vs original); recomputed at
+ * every state-mutating editor op. */
 static stm_status materialize_editor_modified_locked(stm_slate *s, slate_session *ss)
 {
     ss->buf[0] = s->editor_modified ? '1' : '0';
     ss->buf[1] = '\n';
     ss->len = 2u;
     return STM_OK;
+}
+
+/* SLATE-5b: recompute the modified flag from the current content vs
+ * pristine original. Caller has s->mu. */
+static void editor_recompute_modified_locked(stm_slate *s)
+{
+    if (!s->editor_active) {
+        s->editor_modified = false;
+        return;
+    }
+    if (s->editor_content_len != s->editor_original_len) {
+        s->editor_modified = true;
+        return;
+    }
+    if (s->editor_content_len == 0u) {
+        s->editor_modified = false;
+        return;
+    }
+    s->editor_modified = (memcmp(s->editor_content, s->editor_original,
+                                  s->editor_content_len) != 0);
 }
 
 /* SLATE-5a: /editor/content — file contents. Uses bulk_buf because
@@ -3579,17 +3785,120 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         *out_written = len;
         return STM_OK;
     }
+    if (k == SLATE_KIND_EDITOR_CONTENT) {
+        /* SLATE-5b: write replaces the editor buffer entirely
+         * (clause 19 offset-ignored Twrite posture — every write
+         * is a complete payload). Bound at MAX. R101 P2-2 carry:
+         * zero-byte refused (clearing the buffer requires explicit
+         * "1\n" or other body — write of an empty file is via the
+         * caller's own choice; if they want empty, they should
+         * close + re-open or use action="revert" instead). */
+        if (len == 0u) return STM_EINVAL;
+        if (len > STM_SLATE_EDITOR_CONTENT_MAX) return STM_ERANGE;
+        /* No control-byte filter — files contain arbitrary bytes;
+         * the editor IS a text-editing UI. Sanitization happens
+         * at the renderer (CLAUDE.md slate row clause 23(g)). */
+        uint8_t *new_buf = malloc(len);
+        if (!new_buf) return STM_ENOMEM;
+        memcpy(new_buf, buf, len);
+        pthread_mutex_lock(&s->mu);
+        if (!s->editor_active) {
+            pthread_mutex_unlock(&s->mu);
+            free(new_buf);
+            return STM_ENOENT;
+        }
+        /* R116 P3-2: bump version only on real change. The whole-
+         * payload-replace model means "new content == current
+         * content" is the no-change case. */
+        bool changed = (len != s->editor_content_len) ||
+                       (len > 0u && memcmp(new_buf, s->editor_content,
+                                              len) != 0);
+        if (changed) {
+            free(s->editor_content);
+            s->editor_content = new_buf;
+            s->editor_content_len = len;
+            editor_recompute_modified_locked(s);
+            s->version++;
+            pthread_cond_broadcast(&s->cv);
+        } else {
+            free(new_buf);
+        }
+        pthread_mutex_unlock(&s->mu);
+        *out_written = (uint32_t)len;
+        return STM_OK;
+    }
+    if (k == SLATE_KIND_EDITOR_CURSOR) {
+        /* SLATE-5b: write parses "row,col" — both are decimal
+         * uint32_t. Trailing newline OK; empty body refused
+         * (R101 P2-2 carry); no leading sign or whitespace. */
+        if (len == 0u) return STM_EINVAL;
+        if (len > 32u) return STM_EINVAL;  /* "4294967295,4294967295\n" = 22 */
+        const char *p = (const char *)buf;
+        size_t l = len;
+        if (l > 0u && p[l - 1u] == '\n') l--;
+        if (l == 0u) return STM_EINVAL;
+        /* Find ','. */
+        size_t comma = SIZE_MAX;
+        for (size_t i = 0; i < l; i++) {
+            if (p[i] == ',') { comma = i; break; }
+        }
+        if (comma == SIZE_MAX || comma == 0u || comma == l - 1u) {
+            return STM_EINVAL;
+        }
+        uint32_t row = 0, col = 0;
+        for (size_t i = 0; i < comma; i++) {
+            char c = p[i];
+            if (c < '0' || c > '9') return STM_EINVAL;
+            if (row > (UINT32_MAX - 9u) / 10u) return STM_EINVAL;
+            row = row * 10u + (uint32_t)(c - '0');
+        }
+        for (size_t i = comma + 1u; i < l; i++) {
+            char c = p[i];
+            if (c < '0' || c > '9') return STM_EINVAL;
+            if (col > (UINT32_MAX - 9u) / 10u) return STM_EINVAL;
+            col = col * 10u + (uint32_t)(c - '0');
+        }
+        pthread_mutex_lock(&s->mu);
+        if (!s->editor_active) {
+            pthread_mutex_unlock(&s->mu);
+            return STM_ENOENT;
+        }
+        /* R116 P3-2: bump only on real change. */
+        if (row != s->editor_cursor_row || col != s->editor_cursor_col) {
+            s->editor_cursor_row = row;
+            s->editor_cursor_col = col;
+            s->version++;
+            pthread_cond_broadcast(&s->cv);
+        }
+        pthread_mutex_unlock(&s->mu);
+        *out_written = (uint32_t)len;
+        return STM_OK;
+    }
     if (k == SLATE_KIND_EDITOR_ACTION) {
-        /* SLATE-5a: editor action verbs land at SLATE-5b
-         * (save / quit / revert / save-and-quit). v5a accepts no
-         * verbs — every write is refused with STM_ENOTSUPPORTED so
-         * renderers using /editor/action prematurely get a clear
-         * "feature not yet implemented" signal. R101 P2-2 carry:
-         * zero-byte refused even at v5a since the verb dispatch
-         * would have refused it anyway. */
+        /* SLATE-5b: editor action verbs save / quit / revert /
+         * save-and-quit. R101 P2-2 carry: zero-byte refused. */
         if (len == 0u) return STM_EINVAL;
         if (len > STM_SLATE_EVENT_LINE_MAX) return STM_EINVAL;
-        return STM_ENOTSUPPORTED;
+        const char *p = (const char *)buf;
+        size_t l = len;
+        if (l > 0u && p[l - 1u] == '\n') l--;
+        if (l == 0u) return STM_EINVAL;
+        stm_status arc;
+        if (l == 4u && memcmp(p, "save", 4u) == 0) {
+            arc = stm_slate_editor_save(s);
+        } else if (l == 4u && memcmp(p, "quit", 4u) == 0) {
+            arc = stm_slate_editor_close(s);
+        } else if (l == 6u && memcmp(p, "revert", 6u) == 0) {
+            arc = stm_slate_editor_revert(s);
+        } else if (l == 13u && memcmp(p, "save-and-quit", 13u) == 0) {
+            arc = stm_slate_editor_save(s);
+            if (arc == STM_OK) arc = stm_slate_editor_close(s);
+        } else {
+            return STM_ENOTSUPPORTED;
+        }
+        if (arc != STM_OK) return arc;
+        *out_written = (uint32_t)len;
+        return STM_OK;
     }
     if (k == SLATE_KIND_PANEL_L_ACTION || k == SLATE_KIND_PANEL_R_ACTION) {
         /* SLATE-3a/3b: dispatch a panel action verb via a static verb

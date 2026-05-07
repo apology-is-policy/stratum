@@ -612,6 +612,43 @@ size_t stm_slate_editor_content_len(stm_slate *s);
 STM_MUST_USE
 stm_status stm_slate_editor_close(stm_slate *s);
 
+/*
+ * SLATE-5b: write the current editor buffer back to the backend
+ * file (Tlopen WRONLY|TRUNC + Twrite chunked at iounit + Tfsync).
+ * On success: editor_modified flips to false; the original-baseline
+ * snapshot is replaced with the just-saved content so subsequent
+ * memcmp tracks edits from the saved state.
+ *
+ * Partial-write failure leaves the file partially overwritten on
+ * the backend AND editor_modified stays true so the user knows
+ * the save failed (acceptable for v1.0; v1.1 may switch to atomic
+ * temp-and-rename).
+ *
+ * Returns:
+ *   - STM_OK on success.
+ *   - STM_ENOENT if no editor is open.
+ *   - STM_EBACKEND if not connected.
+ *   - STM_ENOSPC if a Twrite returns 0 bytes mid-loop.
+ *   - Any backend op error from walk/lopen/write/fsync.
+ */
+STM_MUST_USE
+stm_status stm_slate_editor_save(stm_slate *s);
+
+/*
+ * SLATE-5b: re-read the backend file into the editor buffer,
+ * dropping any unsaved edits. Cursor is reset to 0,0 (matches
+ * editor_open's contract). Equivalent to "discard local edits
+ * + re-open same path". Bumps version.
+ *
+ * Returns:
+ *   - STM_OK on success.
+ *   - STM_ENOENT if no editor is open.
+ *   - Any backend op error (file may have been deleted or
+ *     truncated since open).
+ */
+STM_MUST_USE
+stm_status stm_slate_editor_revert(stm_slate *s);
+
 /* ────────────────────────────────────────────────────────────────────── */
 /* lp9 vops.                                                              */
 /* ────────────────────────────────────────────────────────────────────── */

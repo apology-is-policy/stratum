@@ -254,7 +254,13 @@ P9-SLATE-4   dialogs (confirm + input). [SLATE-4-confirm shipped:
              results. Single-record completion store; v1.1 may add
              per-id queue.]
 
-P9-SLATE-5   editor/.
+P9-SLATE-5   editor/. [SLATE-5a shipped: scaffold + /event "editor open
+             <path>" / "editor close" verbs; /editor/{active,filename,
+             content,cursor,modified} read-only at v5a; backend Twalk +
+             Tlopen + Tread loop reads file into 1 MiB-bounded heap
+             buffer; /editor/action returns STM_ENOTSUPPORTED. SLATE-5b
+             will lift content + cursor to RW + add save/quit/revert/
+             save-and-quit action verbs.]
 
 P9-SLATE-6   stratum-slate-tty: terminal renderer. Reads /redraw,
              /panels/*, /dialogs/*; writes /event. Lifts ratatui

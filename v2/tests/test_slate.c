@@ -2156,8 +2156,11 @@ STM_TEST(slate_5a_open_rejects_invalid_paths)
     stm_slate_destroy(s);
 }
 
-/* /editor/action returns ENOTSUPPORTED for any verb at v5a. */
-STM_TEST(slate_5a_action_returns_enotsupported)
+/* SLATE-5a + SLATE-5b: /editor/action accepts known verbs (save,
+ * quit, revert, save-and-quit) at SLATE-5b; unknown verbs return
+ * STM_ENOTSUPPORTED. With no editor open, "save" + "revert" return
+ * STM_ENOENT, "quit" is a no-op (returns OK). */
+STM_TEST(slate_5a_action_no_editor_dispatch)
 {
     stm_slate *s = NULL;
     STM_ASSERT_OK(stm_slate_create(&s));
@@ -2166,11 +2169,16 @@ STM_TEST(slate_5a_action_returns_enotsupported)
     uint64_t aqp = ((uint64_t)40) << 56;
     STM_ASSERT_OK(v->lopen(s, 77u, aqp, STM_LP9_O_WRONLY));
     uint32_t written = 0;
-    STM_ASSERT_EQ(v->write(s, 77u, aqp, 0u, "save", 4u, &written),
+    /* Unknown verb → ENOTSUPPORTED. */
+    STM_ASSERT_EQ(v->write(s, 77u, aqp, 0u, "wibble", 6u, &written),
                      STM_ENOTSUPPORTED);
-    STM_ASSERT_EQ(v->write(s, 77u, aqp, 0u, "quit", 4u, &written),
-                     STM_ENOTSUPPORTED);
-    /* Zero-byte still refused with EINVAL (R101 P2-2 takes priority). */
+    /* save + revert with no editor active → ENOENT. */
+    STM_ASSERT_EQ(v->write(s, 77u, aqp, 0u, "save", 4u, &written), STM_ENOENT);
+    STM_ASSERT_EQ(v->write(s, 77u, aqp, 0u, "revert", 6u, &written),
+                     STM_ENOENT);
+    /* quit is no-op on inactive → OK. */
+    STM_ASSERT_OK(v->write(s, 77u, aqp, 0u, "quit", 4u, &written));
+    /* Zero-byte refused with EINVAL (R101 P2-2 takes priority). */
     STM_ASSERT_EQ(v->write(s, 77u, aqp, 0u, "", 0u, &written), STM_EINVAL);
     v->clunk(s, 77u, aqp);
     stm_slate_destroy(s);
@@ -2229,6 +2237,123 @@ STM_TEST(slate_5a_event_editor_unrelated_verbs_fall_through)
     /* "editor open" without a path should NOT match (prefix is "editor open ", with space). */
     const char *line3 = "editor open";
     STM_ASSERT_OK(stm_slate_submit_event(s, line3, strlen(line3)));
+    stm_slate_destroy(s);
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* P9-SLATE-5b: editor content + cursor RW; action verbs.                */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/* /editor/cursor RW: write "row,col" parses + updates. */
+STM_TEST(slate_5b_cursor_write_parses_row_col)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const stm_lp9_vops *v = stm_slate_vops();
+    /* /editor/cursor qid: kind=38. */
+    uint64_t cqp = ((uint64_t)38) << 56;
+    /* Write to cursor without an active editor → ENOENT. */
+    STM_ASSERT_OK(v->lopen(s, 77u, cqp, STM_LP9_O_WRONLY));
+    uint32_t written = 0;
+    STM_ASSERT_EQ(v->write(s, 77u, cqp, 0u, "5,7", 3u, &written), STM_ENOENT);
+    v->clunk(s, 77u, cqp);
+    stm_slate_destroy(s);
+}
+
+/* Cursor write rejects malformed input. */
+STM_TEST(slate_5b_cursor_write_rejects_malformed)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const stm_lp9_vops *v = stm_slate_vops();
+    uint64_t cqp = ((uint64_t)38) << 56;
+    STM_ASSERT_OK(v->lopen(s, 77u, cqp, STM_LP9_O_WRONLY));
+    uint32_t written = 0;
+    /* Empty body refused. */
+    STM_ASSERT_EQ(v->write(s, 77u, cqp, 0u, "", 0u, &written), STM_EINVAL);
+    /* Missing comma. */
+    STM_ASSERT_EQ(v->write(s, 77u, cqp, 0u, "5", 1u, &written), STM_EINVAL);
+    /* Empty row. */
+    STM_ASSERT_EQ(v->write(s, 77u, cqp, 0u, ",5", 2u, &written), STM_EINVAL);
+    /* Empty col. */
+    STM_ASSERT_EQ(v->write(s, 77u, cqp, 0u, "5,", 2u, &written), STM_EINVAL);
+    /* Non-digit. */
+    STM_ASSERT_EQ(v->write(s, 77u, cqp, 0u, "5a,7", 4u, &written), STM_EINVAL);
+    /* Trailing newline ignored — but missing data still EINVAL. */
+    STM_ASSERT_EQ(v->write(s, 77u, cqp, 0u, "\n", 1u, &written), STM_EINVAL);
+    /* Oversize. */
+    char big[40];
+    memset(big, '0', sizeof big);
+    big[20] = ',';
+    STM_ASSERT_EQ(v->write(s, 77u, cqp, 0u, big, sizeof big, &written),
+                     STM_EINVAL);
+    v->clunk(s, 77u, cqp);
+    stm_slate_destroy(s);
+}
+
+/* Content write requires editor active. */
+STM_TEST(slate_5b_content_write_no_editor_enoent)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const stm_lp9_vops *v = stm_slate_vops();
+    /* /editor/content qid: kind=37. */
+    uint64_t conqp = ((uint64_t)37) << 56;
+    STM_ASSERT_OK(v->lopen(s, 77u, conqp, STM_LP9_O_WRONLY));
+    uint32_t written = 0;
+    STM_ASSERT_EQ(v->write(s, 77u, conqp, 0u, "hello", 5u, &written),
+                     STM_ENOENT);
+    v->clunk(s, 77u, conqp);
+    stm_slate_destroy(s);
+}
+
+/* Content write zero-byte refused (R101 P2-2). */
+STM_TEST(slate_5b_content_write_zero_byte_einval)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const stm_lp9_vops *v = stm_slate_vops();
+    uint64_t conqp = ((uint64_t)37) << 56;
+    STM_ASSERT_OK(v->lopen(s, 77u, conqp, STM_LP9_O_WRONLY));
+    uint32_t written = 0;
+    STM_ASSERT_EQ(v->write(s, 77u, conqp, 0u, "", 0u, &written), STM_EINVAL);
+    v->clunk(s, 77u, conqp);
+    stm_slate_destroy(s);
+}
+
+/* Cursor / content kinds support both read AND write modes (RW). */
+STM_TEST(slate_5b_content_cursor_are_rw_kinds)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const stm_lp9_vops *v = stm_slate_vops();
+    uint64_t conqp = ((uint64_t)37) << 56;
+    uint64_t cqp = ((uint64_t)38) << 56;
+    /* RDONLY accepted on both. */
+    STM_ASSERT_OK(v->lopen(s, 77u, conqp, STM_LP9_O_RDONLY));
+    v->clunk(s, 77u, conqp);
+    STM_ASSERT_OK(v->lopen(s, 78u, cqp, STM_LP9_O_RDONLY));
+    v->clunk(s, 78u, cqp);
+    /* WRONLY accepted on both. */
+    STM_ASSERT_OK(v->lopen(s, 79u, conqp, STM_LP9_O_WRONLY));
+    v->clunk(s, 79u, conqp);
+    STM_ASSERT_OK(v->lopen(s, 80u, cqp, STM_LP9_O_WRONLY));
+    v->clunk(s, 80u, cqp);
+    /* RDWR accepted on both. */
+    STM_ASSERT_OK(v->lopen(s, 81u, conqp, STM_LP9_O_RDWR));
+    v->clunk(s, 81u, conqp);
+    STM_ASSERT_OK(v->lopen(s, 82u, cqp, STM_LP9_O_RDWR));
+    v->clunk(s, 82u, cqp);
+    stm_slate_destroy(s);
+}
+
+/* editor_save / editor_revert without an active editor → ENOENT. */
+STM_TEST(slate_5b_save_revert_no_editor_enoent)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    STM_ASSERT_EQ(stm_slate_editor_save(s), STM_ENOENT);
+    STM_ASSERT_EQ(stm_slate_editor_revert(s), STM_ENOENT);
     stm_slate_destroy(s);
 }
 
