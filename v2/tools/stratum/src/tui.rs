@@ -109,7 +109,7 @@ fn run_ui(client: &mut SlateClient, redraw_rx: &Receiver<u64>) -> Result<()> {
                 if event::poll(Duration::from_millis(100))? {
                     match event::read()? {
                         Event::Key(key) if key.kind == KeyEventKind::Press => {
-                            match handle_key(client, &mut focus, key)? {
+                            match handle_key(client, &mut focus, &snapshot, key)? {
                                 Action::Quit => return Ok(()),
                                 Action::Refresh => break,
                                 Action::Ignore => {}
@@ -145,6 +145,7 @@ enum Action {
 fn handle_key(
     client: &mut SlateClient,
     focus: &mut usize,
+    snap: &UiState,
     key: crossterm::event::KeyEvent,
 ) -> Result<Action> {
     if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -160,10 +161,34 @@ fn handle_key(
             *focus ^= 1;
             return Ok(Action::Refresh);
         }
-        KeyCode::Up => action_verb(client, *focus, "key Up\n")?,
-        KeyCode::Down => action_verb(client, *focus, "key Down\n")?,
-        KeyCode::Enter => action_verb(client, *focus, "key Enter\n")?,
-        KeyCode::Backspace => action_verb(client, *focus, "key Backspace\n")?,
+        KeyCode::Up => {
+            // Locally-clamped cursor — refuse to send "key Up" if
+            // already at top. Saves a round-trip + prevents slate's
+            // version bump on a no-op (R116 P3-2 doctrine).
+            if snap.panels[*focus].cursor > 0 {
+                action_verb(client, *focus, "key Up\n")?;
+                return Ok(Action::Refresh);
+            }
+        }
+        KeyCode::Down => {
+            // Bug #2: locally cap cursor at entries-count-1; otherwise
+            // slate's STM_ENOTSUPPORTED-on-overflow fallthrough lets
+            // cursor grow past the visible row, breaking the
+            // highlight + scroll math.
+            let n = snap.panels[*focus].raw_entries.len();
+            if n > 0 && (snap.panels[*focus].cursor as usize) < n - 1 {
+                action_verb(client, *focus, "key Down\n")?;
+                return Ok(Action::Refresh);
+            }
+        }
+        KeyCode::Enter => {
+            action_verb(client, *focus, "key Enter\n")?;
+            return Ok(Action::Refresh);
+        }
+        KeyCode::Backspace => {
+            action_verb(client, *focus, "key Backspace\n")?;
+            return Ok(Action::Refresh);
+        }
         KeyCode::F(n) if (1..=9).contains(&n) => {
             // Shift+F<n> routes as "key Shift-F<N>" so slate can
             // distinguish modifier-bearing presses from bare ones.
@@ -176,8 +201,9 @@ fn handle_key(
                 format!("key F{n}\n")
             };
             action_verb(client, *focus, &verb)?;
+            return Ok(Action::Refresh);
         }
-        _ => return Ok(Action::Ignore),
+        _ => {}
     }
     Ok(Action::Ignore)
 }
