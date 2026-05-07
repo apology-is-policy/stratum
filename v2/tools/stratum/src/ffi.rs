@@ -109,4 +109,5 @@ extern "C" {
     pub fn stm_cmd_slate_main   (argc: c_int, argv: *const *const c_char) -> c_int;
     pub fn stm_cmd_mkfs_main    (argc: c_int, argv: *const *const c_char) -> c_int;
     pub fn stm_cmd_fs_main      (argc: c_int, argv: *const *const c_char) -> c_int;
+    pub fn stm_cmd_host_fs_main (argc: c_int, argv: *const *const c_char) -> c_int;
 }

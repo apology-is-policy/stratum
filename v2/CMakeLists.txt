@@ -203,6 +203,7 @@ add_subdirectory(src/9p_client)
 add_subdirectory(src/lp9)
 add_subdirectory(src/ctl)
 add_subdirectory(src/slate)
+add_subdirectory(src/host_fs)
 add_subdirectory(src/cmd)
 
 # ---------------------------------------------------------------------------
@@ -244,7 +245,8 @@ target_link_libraries(stratum INTERFACE
     stm_xattr
     stm_locks
     stm_9p
-    stm_ctl)
+    stm_ctl
+    stm_host_fs)
 target_include_directories(stratum INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/include)
 

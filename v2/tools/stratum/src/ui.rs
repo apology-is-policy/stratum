@@ -35,6 +35,10 @@ const CLR_DIR: Color = Color::White;
 const CLR_FILE: Color = Color::Cyan;
 const CLR_LINK: Color = Color::Magenta;
 const CLR_OTHER: Color = Color::Gray;
+// SWISS-2: .stm volume files render in yellow — visual cue that
+// pressing Enter on them mounts the volume in the inactive panel.
+// Same color used in v1's TUI for the same purpose.
+const CLR_STM: Color = Color::Yellow;
 
 const CLR_CURSOR_FG: Color = Color::Black;
 const CLR_CURSOR_ACTIVE_BG: Color = Color::Blue;
@@ -266,11 +270,16 @@ fn draw_panel(frame: &mut Frame<'_>, panel: &PanelView, area: Rect, focused: boo
                 'l' => "@",
                 _ => " ",
             };
-            let base_clr = match entry.kind {
-                'd' => CLR_DIR,
-                'l' => CLR_LINK,
-                '-' => CLR_FILE,
-                _ => CLR_OTHER,
+            let is_stm = entry.kind == '-' && entry.name.ends_with(".stm");
+            let base_clr = if is_stm {
+                CLR_STM
+            } else {
+                match entry.kind {
+                    'd' => CLR_DIR,
+                    'l' => CLR_LINK,
+                    '-' => CLR_FILE,
+                    _ => CLR_OTHER,
+                }
             };
             let size_str = if entry.kind == 'd' {
                 "<DIR>".to_string()

@@ -61,6 +61,7 @@ int stm_cmd_stratumd_main(int argc, char **argv);
 int stm_cmd_slate_main   (int argc, char **argv);
 int stm_cmd_mkfs_main    (int argc, char **argv);
 int stm_cmd_fs_main      (int argc, char **argv);
+int stm_cmd_host_fs_main (int argc, char **argv);
 
 #ifdef __cplusplus
 }

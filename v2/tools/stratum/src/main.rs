@@ -54,6 +54,7 @@ fn dispatch(args: Vec<String>) -> Result<i32> {
         "slate" => ffi_dispatch("stratum-slate", &args[2..], ffi::stm_cmd_slate_main),
         "mkfs" => ffi_dispatch("stratum-mkfs", &args[2..], ffi::stm_cmd_mkfs_main),
         "fs" => ffi_dispatch("stratum-fs", &args[2..], ffi::stm_cmd_fs_main),
+        "host-fs" => ffi_dispatch("stratum-host-fs", &args[2..], ffi::stm_cmd_host_fs_main),
         other => {
             bail!("stratum: unknown subcommand: {other}\n(see `stratum --help`)");
         }
@@ -78,7 +79,8 @@ fn print_root_usage() {
            serve VOLUME...  Run as stratumd. Same flags as standalone.\n\
            slate ARGS...    Run as the slate UI-state daemon.\n\
            mkfs IMAGE...    Create a new .stm volume.\n\
-           fs CMD ARGS...   9P client CLI.\n\n\
+           fs CMD ARGS...   9P client CLI.\n\
+           host-fs PATH...  Export host directory as 9P read-only.\n\n\
          For per-subcommand help: `stratum <subcommand> -h`.\n\n\
          See v2/docs/SLATE-DESIGN.md §12 for the design rationale.\n"
     );
