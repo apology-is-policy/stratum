@@ -87,6 +87,11 @@ typedef enum {
     SLATE_KIND_PANEL_R_DIR      = 16,
     SLATE_KIND_PANEL_R_PATH     = 17,
     SLATE_KIND_PANEL_R_ENTRIES  = 18,
+    /* SLATE-3a: per-panel cursor + action. */
+    SLATE_KIND_PANEL_L_CURSOR   = 19,
+    SLATE_KIND_PANEL_L_ACTION   = 20,
+    SLATE_KIND_PANEL_R_CURSOR   = 21,
+    SLATE_KIND_PANEL_R_ACTION   = 22,
     SLATE_KIND_MAX
 } slate_kind;
 
@@ -126,9 +131,15 @@ static const slate_kind_meta KIND_META[SLATE_KIND_MAX] = {
     [SLATE_KIND_PANEL_R_DIR]      = { true,  0555, "right"      },
     [SLATE_KIND_PANEL_R_PATH]     = { false, 0444, "path"       },
     [SLATE_KIND_PANEL_R_ENTRIES]  = { false, 0444, "entries"    },
+    /* SLATE-3a: cursor is RW (mode 0644 — readable + writable);
+     * action is write-only (mode 0200). */
+    [SLATE_KIND_PANEL_L_CURSOR]   = { false, 0644, "cursor"     },
+    [SLATE_KIND_PANEL_L_ACTION]   = { false, 0200, "action"     },
+    [SLATE_KIND_PANEL_R_CURSOR]   = { false, 0644, "cursor"     },
+    [SLATE_KIND_PANEL_R_ACTION]   = { false, 0200, "action"     },
 };
 
-_Static_assert(SLATE_KIND_MAX == 19, "KIND_META[] sized to enum cardinality");
+_Static_assert(SLATE_KIND_MAX == 23, "KIND_META[] sized to enum cardinality");
 _Static_assert(sizeof("version") - 1     <= STM_LP9_NAME_MAX, "/version literal");
 _Static_assert(sizeof("status") - 1      <= STM_LP9_NAME_MAX, "/status literal");
 _Static_assert(sizeof("event") - 1       <= STM_LP9_NAME_MAX, "/event literal");
@@ -145,6 +156,8 @@ _Static_assert(sizeof("left") - 1        <= STM_LP9_NAME_MAX, "/panels/left lite
 _Static_assert(sizeof("right") - 1       <= STM_LP9_NAME_MAX, "/panels/right literal");
 _Static_assert(sizeof("path") - 1        <= STM_LP9_NAME_MAX, "/panels/X/path");
 _Static_assert(sizeof("entries") - 1     <= STM_LP9_NAME_MAX, "/panels/X/entries");
+_Static_assert(sizeof("cursor") - 1      <= STM_LP9_NAME_MAX, "/panels/X/cursor");
+_Static_assert(sizeof("action") - 1      <= STM_LP9_NAME_MAX, "/panels/X/action");
 
 /* Backend fid convention. The slate daemon is the SOLE 9P client of
  * its attached stratumd; the lib's caller-managed fid namespace is
@@ -194,10 +207,15 @@ typedef struct slate_session {
 /* The state.                                                             */
 /* ────────────────────────────────────────────────────────────────────── */
 
-/* SLATE-2: per-panel state. */
+/* SLATE-2 + SLATE-3a: per-panel state. */
 typedef struct {
-    char    path[STM_SLATE_PATH_MAX + 1];     /* NUL-terminated; "" disconnected */
-    size_t  path_len;
+    char     path[STM_SLATE_PATH_MAX + 1];     /* NUL-terminated; "" disconnected */
+    size_t   path_len;
+    /* SLATE-3a: cursor is a numeric index into the panel's current
+     * entries listing. Bounds-checking against the entry count is
+     * the renderer's responsibility — slate accepts any uint32_t.
+     * Reset to 0 on attach + disconnect + cwd change. */
+    uint32_t cursor;
 } slate_panel;
 
 #define SLATE_PANEL_LEFT  0
@@ -432,7 +450,8 @@ void stm_slate_drop_all_sessions(stm_slate *s)
 
 /* Mu held; perform the post-attach state swap atomically. ConnectionAtomic
  * + PanelPathConsistent both maintained: connected becomes TRUE, socket
- * is set, panel paths reset to "/", version bumps, cv broadcasts. */
+ * is set, panel paths reset to "/", panel cursors reset to 0, version
+ * bumps, cv broadcasts. */
 static void attach_state_swap_locked(stm_slate *s, const char *path, size_t len,
                                        stm_9p_client *new_bc, stm_9p_client **old_bc_out)
 {
@@ -446,6 +465,7 @@ static void attach_state_swap_locked(stm_slate *s, const char *path, size_t len,
         s->panel[i].path[0] = '/';
         s->panel[i].path[1] = '\0';
         s->panel[i].path_len = 1u;
+        s->panel[i].cursor = 0u;
     }
     s->version++;
     pthread_cond_broadcast(&s->cv);
@@ -453,7 +473,8 @@ static void attach_state_swap_locked(stm_slate *s, const char *path, size_t len,
 
 /* Mu held; perform the post-disconnect state swap. ConnectionAtomic
  * + PanelPathConsistent both maintained: connected becomes FALSE,
- * socket clears, panel paths clear, version bumps, cv broadcasts. */
+ * socket clears, panel paths clear, cursors reset, version bumps,
+ * cv broadcasts. */
 static void disconnect_state_swap_locked(stm_slate *s, stm_9p_client **old_bc_out)
 {
     *old_bc_out = s->backend;
@@ -464,6 +485,7 @@ static void disconnect_state_swap_locked(stm_slate *s, stm_9p_client **old_bc_ou
     for (int i = 0; i < SLATE_PANEL_COUNT; i++) {
         s->panel[i].path[0] = '\0';
         s->panel[i].path_len = 0;
+        s->panel[i].cursor = 0u;
     }
     s->version++;
     pthread_cond_broadcast(&s->cv);
@@ -690,6 +712,18 @@ static stm_status materialize_panel_path_locked(stm_slate *s, slate_session *ss,
     memcpy(ss->buf, s->panel[panel_idx].path, n);
     ss->buf[n] = '\n';
     ss->len = (uint32_t)(n + 1u);
+    return STM_OK;
+}
+
+/* SLATE-3a: /panels/X/cursor — current cursor index + newline.
+ * Decimal format; max 10 digits + '\n' + NUL fits in BODY_MAX. */
+static stm_status materialize_panel_cursor_locked(stm_slate *s, slate_session *ss,
+                                                      int panel_idx)
+{
+    int n = snprintf((char *)ss->buf, sizeof ss->buf,
+                        "%u\n", (unsigned)s->panel[panel_idx].cursor);
+    if (n < 0 || n >= (int)sizeof ss->buf) return STM_ERANGE;
+    ss->len = (uint32_t)n;
     return STM_OK;
 }
 
@@ -1112,10 +1146,14 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
     case SLATE_KIND_PANEL_L_DIR:
         if (str_eq(name, name_len, "path"))            target = SLATE_KIND_PANEL_L_PATH;
         else if (str_eq(name, name_len, "entries"))    target = SLATE_KIND_PANEL_L_ENTRIES;
+        else if (str_eq(name, name_len, "cursor"))     target = SLATE_KIND_PANEL_L_CURSOR;
+        else if (str_eq(name, name_len, "action"))     target = SLATE_KIND_PANEL_L_ACTION;
         break;
     case SLATE_KIND_PANEL_R_DIR:
         if (str_eq(name, name_len, "path"))            target = SLATE_KIND_PANEL_R_PATH;
         else if (str_eq(name, name_len, "entries"))    target = SLATE_KIND_PANEL_R_ENTRIES;
+        else if (str_eq(name, name_len, "cursor"))     target = SLATE_KIND_PANEL_R_CURSOR;
+        else if (str_eq(name, name_len, "action"))     target = SLATE_KIND_PANEL_R_ACTION;
         break;
     default:
         return STM_ENOENT;
@@ -1200,11 +1238,19 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
     case SLATE_KIND_PANEL_L_DIR:
         rc = emit_entry(SLATE_KIND_PANEL_L_PATH, &em);
         if (rc != STM_OK) return rc;
-        return emit_entry(SLATE_KIND_PANEL_L_ENTRIES, &em);
+        rc = emit_entry(SLATE_KIND_PANEL_L_ENTRIES, &em);
+        if (rc != STM_OK) return rc;
+        rc = emit_entry(SLATE_KIND_PANEL_L_CURSOR, &em);
+        if (rc != STM_OK) return rc;
+        return emit_entry(SLATE_KIND_PANEL_L_ACTION, &em);
     case SLATE_KIND_PANEL_R_DIR:
         rc = emit_entry(SLATE_KIND_PANEL_R_PATH, &em);
         if (rc != STM_OK) return rc;
-        return emit_entry(SLATE_KIND_PANEL_R_ENTRIES, &em);
+        rc = emit_entry(SLATE_KIND_PANEL_R_ENTRIES, &em);
+        if (rc != STM_OK) return rc;
+        rc = emit_entry(SLATE_KIND_PANEL_R_CURSOR, &em);
+        if (rc != STM_OK) return rc;
+        return emit_entry(SLATE_KIND_PANEL_R_ACTION, &em);
     default:
         return STM_ENOTDIR;
     }
@@ -1219,17 +1265,27 @@ static stm_status vops_lopen(void *ctx, uint32_t fid, uint64_t qid_path,
     const slate_kind_meta *meta = &KIND_META[k];
 
     /* Mode-vs-accmode check. lp9 server already gates dirs to RDONLY;
-     * here we map writable kinds (event, log/append, conn/attach) to
-     * O_WRONLY only, and read-only kinds to O_RDONLY only. */
+     * here we infer permission from KIND_META[k].mode and validate
+     * against the requested access mode. R/W kinds (e.g., SLATE-3a's
+     * /panels/X/cursor with mode 0644) accept O_RDONLY OR O_WRONLY OR
+     * O_RDWR; write-only kinds (mode 0200) accept only O_WRONLY;
+     * read-only kinds (mode 0444) accept only O_RDONLY. */
     uint32_t accmode = flags & STM_LP9_O_ACCMODE;
-    bool writable_kind = (k == SLATE_KIND_EVENT ||
-                          k == SLATE_KIND_LOG_APPEND ||
-                          k == SLATE_KIND_CONN_ATTACH);
-    if (writable_kind) {
-        if (accmode != STM_LP9_O_WRONLY) return STM_EACCES;
+    bool readable = (meta->mode & 0444u) != 0u;
+    bool writable = (meta->mode & 0222u) != 0u;
+    if (accmode == STM_LP9_O_RDONLY) {
+        if (!readable) return STM_EACCES;
+    } else if (accmode == STM_LP9_O_WRONLY) {
+        if (!writable) return STM_EACCES;
+    } else if (accmode == STM_LP9_O_RDWR) {
+        if (!(readable && writable)) return STM_EACCES;
     } else {
-        if (accmode != STM_LP9_O_RDONLY) return STM_EACCES;
+        return STM_EINVAL;
     }
+    /* Track whether this open intends to read — affects whether we
+     * materialise a body or just allocate a session for write. */
+    bool open_for_read = (accmode == STM_LP9_O_RDONLY ||
+                          accmode == STM_LP9_O_RDWR);
 
     if (meta->is_dir) {
         /* Dirs don't need session state; readdir is stateless. */
@@ -1258,24 +1314,21 @@ static stm_status vops_lopen(void *ctx, uint32_t fid, uint64_t qid_path,
         return STM_OK;
     }
 
-    /* Trigger files: allocate session, no body needed. */
-    if (writable_kind) {
-        pthread_mutex_lock(&s->mu);
-        slate_session *ss = session_alloc_locked(s, fid, qid_path);
-        if (!ss) {
-            pthread_mutex_unlock(&s->mu);
-            return STM_ENOMEM;
-        }
-        pthread_mutex_unlock(&s->mu);
-        return STM_OK;
-    }
-
-    /* Read-bodied kinds: snapshot state at lopen. */
+    /* Allocate session. For write-only opens, no body is materialised
+     * (vops_read on a write-only fid would fall through to the
+     * EBACKEND path; renderers don't read these). For read-capable
+     * opens, snapshot the body now. */
     pthread_mutex_lock(&s->mu);
     slate_session *ss = session_alloc_locked(s, fid, qid_path);
     if (!ss) {
         pthread_mutex_unlock(&s->mu);
         return STM_ENOMEM;
+    }
+    if (!open_for_read) {
+        /* Write-only kind (event, log/append, conn/attach, action) —
+         * no body. */
+        pthread_mutex_unlock(&s->mu);
+        return STM_OK;
     }
     stm_status rc = STM_OK;
     switch (k) {
@@ -1299,6 +1352,12 @@ static stm_status vops_lopen(void *ctx, uint32_t fid, uint64_t qid_path,
         break;
     case SLATE_KIND_PANEL_R_PATH:
         rc = materialize_panel_path_locked(s, ss, SLATE_PANEL_RIGHT);
+        break;
+    case SLATE_KIND_PANEL_L_CURSOR:
+        rc = materialize_panel_cursor_locked(s, ss, SLATE_PANEL_LEFT);
+        break;
+    case SLATE_KIND_PANEL_R_CURSOR:
+        rc = materialize_panel_cursor_locked(s, ss, SLATE_PANEL_RIGHT);
         break;
     default:
         rc = STM_EBACKEND;
@@ -1451,6 +1510,79 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
             rc = stm_slate_attach(s, (const char *)buf, l);
         }
         if (rc != STM_OK) return rc;
+        *out_written = len;
+        return STM_OK;
+    }
+    if (k == SLATE_KIND_PANEL_L_CURSOR || k == SLATE_KIND_PANEL_R_CURSOR) {
+        /* SLATE-3a: write a decimal cursor index to /panels/X/cursor.
+         * Format: "<N>" or "<N>\n". Bound by STM_SLATE_CURSOR_INPUT_MAX
+         * — 16 digits + newline + NUL covers any uint32. Empty body
+         * refused (use action verbs to adjust without picking a value). */
+        if (len == 0) return STM_EINVAL;
+        if (len > 16u) return STM_EINVAL;
+        char tmp[17];
+        memcpy(tmp, buf, len);
+        tmp[len] = '\0';
+        size_t l = len;
+        if (l > 0 && tmp[l - 1] == '\n') tmp[--l] = '\0';
+        if (l == 0) return STM_EINVAL;
+        /* Parse decimal — every character must be a digit. */
+        unsigned long long v = 0;
+        for (size_t i = 0; i < l; i++) {
+            if (tmp[i] < '0' || tmp[i] > '9') return STM_EINVAL;
+            v = v * 10ull + (unsigned long long)(tmp[i] - '0');
+            if (v > 0xFFFFFFFFull) return STM_EINVAL;
+        }
+        int panel_idx = (k == SLATE_KIND_PANEL_L_CURSOR) ? SLATE_PANEL_LEFT
+                                                         : SLATE_PANEL_RIGHT;
+        pthread_mutex_lock(&s->mu);
+        s->panel[panel_idx].cursor = (uint32_t)v;
+        s->version++;
+        pthread_cond_broadcast(&s->cv);
+        pthread_mutex_unlock(&s->mu);
+        *out_written = len;
+        return STM_OK;
+    }
+    if (k == SLATE_KIND_PANEL_L_ACTION || k == SLATE_KIND_PANEL_R_ACTION) {
+        /* SLATE-3a: dispatch a panel action verb. v1 supports just
+         * "key Up" / "key Down" — the cursor adjustment primitives.
+         * Other verbs reserved for SLATE-3b+ (Enter for descend,
+         * F3 for view, mouse for click). Empty body refused. */
+        if (len == 0) return STM_EINVAL;
+        if (len > STM_SLATE_EVENT_LINE_MAX) return STM_EINVAL;
+        size_t l = len;
+        if (l > 0 && ((const char *)buf)[l - 1] == '\n') l--;
+        if (l == 0) return STM_EINVAL;
+        const char *p = (const char *)buf;
+        int panel_idx = (k == SLATE_KIND_PANEL_L_ACTION) ? SLATE_PANEL_LEFT
+                                                         : SLATE_PANEL_RIGHT;
+        bool handled = false;
+        bool moved = false;
+        pthread_mutex_lock(&s->mu);
+        if (l == 6u && memcmp(p, "key Up", 6u) == 0) {
+            handled = true;
+            if (s->panel[panel_idx].cursor > 0u) {
+                s->panel[panel_idx].cursor--;
+                moved = true;
+            }
+        } else if (l == 8u && memcmp(p, "key Down", 8u) == 0) {
+            handled = true;
+            if (s->panel[panel_idx].cursor < UINT32_MAX) {
+                s->panel[panel_idx].cursor++;
+                moved = true;
+            }
+        }
+        if (handled && moved) {
+            s->version++;
+            pthread_cond_broadcast(&s->cv);
+        }
+        pthread_mutex_unlock(&s->mu);
+        if (!handled) {
+            /* Unknown verb — return ENOSYS so renderers know the
+             * action wasn't dispatched. SLATE-3b+ will add more
+             * verbs. */
+            return STM_ENOTSUPPORTED;
+        }
         *out_written = len;
         return STM_OK;
     }

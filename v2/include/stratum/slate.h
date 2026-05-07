@@ -44,6 +44,22 @@
  *                                 uniformly).
  *     /panels/right/...      (mirror of left).
  *
+ *   P9-SLATE-3a — panel cursor + action verb dispatch:
+ *     /panels/left/cursor    (RW) decimal cursor index (panel-local
+ *                                 view position into entries); writing
+ *                                 a number sets it. Reset to 0 on
+ *                                 attach/disconnect. Bounds-checking
+ *                                 against entries count is the
+ *                                 renderer's responsibility — slate
+ *                                 accepts any uint32_t.
+ *     /panels/left/action    (W)  fire a panel action verb. v1 supports
+ *                                 just "key Up" / "key Down" which
+ *                                 adjust cursor. Unknown verbs return
+ *                                 STM_ENOTSUPPORTED. SLATE-3b+ adds
+ *                                 "key Enter" (descend into dir) and
+ *                                 view/edit verbs.
+ *     /panels/right/...      (mirror of left).
+ *
  * State-machine spec: v2/specs/slate.tla. Invariants:
  *   VersionMonotonic    — version only ever advances.
  *   EventFIFO           — dispatched order = write order, no gaps.

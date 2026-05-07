@@ -572,13 +572,16 @@ STM_TEST(slate_panels_dir_readdir_emits_left_and_right)
     STM_ASSERT_EQ(strcmp(cx.names[0], "left"),  0);
     STM_ASSERT_EQ(strcmp(cx.names[1], "right"), 0);
 
-    /* /panels/left qid: kind = 13 — emits {path, entries}. */
+    /* /panels/left qid: kind = 13 — emits {path, entries, cursor, action}
+     * (SLATE-2 path/entries + SLATE-3a cursor/action). */
     uint64_t left_qp = ((uint64_t)13) << 56;
     ent_collect cl = {0};
     STM_ASSERT_OK(v->readdir(s, left_qp, /*cookie=*/0u, ent_cb, &cl));
-    STM_ASSERT_EQ(cl.n, 2u);
+    STM_ASSERT_EQ(cl.n, 4u);
     STM_ASSERT_EQ(strcmp(cl.names[0], "path"),    0);
     STM_ASSERT_EQ(strcmp(cl.names[1], "entries"), 0);
+    STM_ASSERT_EQ(strcmp(cl.names[2], "cursor"),  0);
+    STM_ASSERT_EQ(strcmp(cl.names[3], "action"),  0);
 
     stm_slate_destroy(s);
 }
@@ -683,6 +686,257 @@ STM_TEST(slate_conn_socket_wronly_open_eacces)
     const stm_lp9_vops *v = stm_slate_vops();
     uint64_t qp = ((uint64_t)9) << 56;
     STM_ASSERT_EQ(v->lopen(s, /*fid=*/77u, qp, STM_LP9_O_WRONLY), STM_EACCES);
+    stm_slate_destroy(s);
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* P9-SLATE-3a: panel cursor + action verbs.                              */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/* /panels/X/cursor accepts both RDONLY and WRONLY (RW kind). */
+STM_TEST(slate_panel_cursor_accepts_rdonly_and_wronly)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const stm_lp9_vops *v = stm_slate_vops();
+    /* /panels/left/cursor qid: kind = 19. */
+    uint64_t qp = ((uint64_t)19) << 56;
+
+    /* RDONLY open ok. */
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/77u, qp, STM_LP9_O_RDONLY));
+    v->clunk(s, 77u, qp);
+
+    /* WRONLY open ok. */
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/78u, qp, STM_LP9_O_WRONLY));
+    v->clunk(s, 78u, qp);
+
+    /* RDWR open ok. */
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/79u, qp, STM_LP9_O_RDWR));
+    v->clunk(s, 79u, qp);
+
+    stm_slate_destroy(s);
+}
+
+/* Initial cursor reads as "0\n". */
+STM_TEST(slate_panel_cursor_read_initial_zero)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const stm_lp9_vops *v = stm_slate_vops();
+    uint64_t qp = ((uint64_t)19) << 56;
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/77u, qp, STM_LP9_O_RDONLY));
+    char buf[16];
+    uint32_t got = (uint32_t)sizeof buf;
+    STM_ASSERT_OK(v->read(s, 77u, qp, 0u, buf, &got));
+    STM_ASSERT_EQ(got, 2u);
+    STM_ASSERT_EQ(buf[0], '0');
+    STM_ASSERT_EQ(buf[1], '\n');
+    v->clunk(s, 77u, qp);
+    stm_slate_destroy(s);
+}
+
+/* Writing decimal sets cursor; subsequent read returns the new value. */
+STM_TEST(slate_panel_cursor_write_then_read)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const stm_lp9_vops *v = stm_slate_vops();
+    uint64_t qp = ((uint64_t)19) << 56;
+
+    /* Write "42\n". */
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/77u, qp, STM_LP9_O_WRONLY));
+    uint32_t written = 0;
+    STM_ASSERT_OK(v->write(s, 77u, qp, 0u, "42\n", 3u, &written));
+    STM_ASSERT_EQ(written, 3u);
+    v->clunk(s, 77u, qp);
+
+    /* Read back via fresh fid. */
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/78u, qp, STM_LP9_O_RDONLY));
+    char buf[16];
+    uint32_t got = (uint32_t)sizeof buf;
+    STM_ASSERT_OK(v->read(s, 78u, qp, 0u, buf, &got));
+    STM_ASSERT_EQ(got, 3u);
+    buf[got] = '\0';
+    STM_ASSERT_EQ(strcmp(buf, "42\n"), 0);
+    v->clunk(s, 78u, qp);
+
+    stm_slate_destroy(s);
+}
+
+/* Writing non-decimal to cursor returns EINVAL; state unchanged. */
+STM_TEST(slate_panel_cursor_rejects_non_decimal)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const stm_lp9_vops *v = stm_slate_vops();
+    uint64_t qp = ((uint64_t)19) << 56;
+
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/77u, qp, STM_LP9_O_WRONLY));
+    uint32_t written = 0;
+    STM_ASSERT_EQ(v->write(s, 77u, qp, 0u, "abc", 3u, &written), STM_EINVAL);
+    STM_ASSERT_EQ(v->write(s, 77u, qp, 0u, "1a2", 3u, &written), STM_EINVAL);
+    STM_ASSERT_EQ(v->write(s, 77u, qp, 0u, "-1",  2u, &written), STM_EINVAL);
+    /* Empty body refused. */
+    STM_ASSERT_EQ(v->write(s, 77u, qp, 0u, "",    0u, &written), STM_EINVAL);
+    /* Oversized body refused. */
+    STM_ASSERT_EQ(v->write(s, 77u, qp, 0u,
+                              "12345678901234567", 17u, &written), STM_EINVAL);
+    /* uint32_t overflow refused. */
+    STM_ASSERT_EQ(v->write(s, 77u, qp, 0u,
+                              "9999999999", 10u, &written), STM_EINVAL);
+    v->clunk(s, 77u, qp);
+
+    stm_slate_destroy(s);
+}
+
+/* Action "key Down" increments cursor; "key Up" decrements; clamps at 0. */
+STM_TEST(slate_panel_action_key_up_down)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const stm_lp9_vops *v = stm_slate_vops();
+    /* /panels/left/action qid: kind = 20. */
+    uint64_t aqp = ((uint64_t)20) << 56;
+    /* /panels/left/cursor for verification. */
+    uint64_t cqp = ((uint64_t)19) << 56;
+
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/77u, aqp, STM_LP9_O_WRONLY));
+    uint32_t written = 0;
+    /* key Down 3 times → cursor = 3. */
+    STM_ASSERT_OK(v->write(s, 77u, aqp, 0u, "key Down", 8u, &written));
+    STM_ASSERT_OK(v->write(s, 77u, aqp, 0u, "key Down", 8u, &written));
+    STM_ASSERT_OK(v->write(s, 77u, aqp, 0u, "key Down", 8u, &written));
+    /* key Up 1 time → cursor = 2. */
+    STM_ASSERT_OK(v->write(s, 77u, aqp, 0u, "key Up", 6u, &written));
+    v->clunk(s, 77u, aqp);
+
+    /* Verify cursor = 2. */
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/78u, cqp, STM_LP9_O_RDONLY));
+    char buf[16];
+    uint32_t got = (uint32_t)sizeof buf;
+    STM_ASSERT_OK(v->read(s, 78u, cqp, 0u, buf, &got));
+    STM_ASSERT_EQ(got, 2u);
+    STM_ASSERT_EQ(buf[0], '2');
+    STM_ASSERT_EQ(buf[1], '\n');
+    v->clunk(s, 78u, cqp);
+
+    /* key Up enough to underflow — should clamp at 0, no error. */
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/79u, aqp, STM_LP9_O_WRONLY));
+    for (int i = 0; i < 5; i++) {
+        STM_ASSERT_OK(v->write(s, 79u, aqp, 0u, "key Up", 6u, &written));
+    }
+    v->clunk(s, 79u, aqp);
+
+    /* Cursor should now be 0. */
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/80u, cqp, STM_LP9_O_RDONLY));
+    got = (uint32_t)sizeof buf;
+    STM_ASSERT_OK(v->read(s, 80u, cqp, 0u, buf, &got));
+    STM_ASSERT_EQ(got, 2u);
+    STM_ASSERT_EQ(buf[0], '0');
+    v->clunk(s, 80u, cqp);
+
+    stm_slate_destroy(s);
+}
+
+/* Action with unknown verb returns ENOTSUPPORTED. */
+STM_TEST(slate_panel_action_unknown_verb_enotsup)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const stm_lp9_vops *v = stm_slate_vops();
+    uint64_t aqp = ((uint64_t)20) << 56;
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/77u, aqp, STM_LP9_O_WRONLY));
+    uint32_t written = 0;
+    STM_ASSERT_EQ(v->write(s, 77u, aqp, 0u, "key Enter", 9u, &written),
+                     STM_ENOTSUPPORTED);
+    STM_ASSERT_EQ(v->write(s, 77u, aqp, 0u, "noop", 4u, &written),
+                     STM_ENOTSUPPORTED);
+    /* Empty body refused. */
+    STM_ASSERT_EQ(v->write(s, 77u, aqp, 0u, "", 0u, &written), STM_EINVAL);
+    v->clunk(s, 77u, aqp);
+    stm_slate_destroy(s);
+}
+
+/* Cursor write bumps version; key Up at 0 (no-move) does NOT bump. */
+STM_TEST(slate_panel_cursor_action_version_bump_semantics)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const stm_lp9_vops *v = stm_slate_vops();
+    uint64_t cqp = ((uint64_t)19) << 56;
+    uint64_t aqp = ((uint64_t)20) << 56;
+
+    uint64_t v0 = stm_slate_version(s);
+
+    /* Write cursor=5 → bumps version. */
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/77u, cqp, STM_LP9_O_WRONLY));
+    uint32_t written = 0;
+    STM_ASSERT_OK(v->write(s, 77u, cqp, 0u, "5", 1u, &written));
+    v->clunk(s, 77u, cqp);
+    uint64_t v1 = stm_slate_version(s);
+    STM_ASSERT(v1 > v0);
+
+    /* key Down → bumps version. */
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/78u, aqp, STM_LP9_O_WRONLY));
+    STM_ASSERT_OK(v->write(s, 78u, aqp, 0u, "key Down", 8u, &written));
+    v->clunk(s, 78u, aqp);
+    uint64_t v2 = stm_slate_version(s);
+    STM_ASSERT(v2 > v1);
+
+    /* Reset cursor to 0. */
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/79u, cqp, STM_LP9_O_WRONLY));
+    STM_ASSERT_OK(v->write(s, 79u, cqp, 0u, "0", 1u, &written));
+    v->clunk(s, 79u, cqp);
+    uint64_t v3 = stm_slate_version(s);
+    STM_ASSERT(v3 > v2);
+
+    /* key Up at cursor=0 → no-move → version UNCHANGED. */
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/80u, aqp, STM_LP9_O_WRONLY));
+    STM_ASSERT_OK(v->write(s, 80u, aqp, 0u, "key Up", 6u, &written));
+    v->clunk(s, 80u, aqp);
+    uint64_t v4 = stm_slate_version(s);
+    STM_ASSERT_EQ(v4, v3);
+
+    stm_slate_destroy(s);
+}
+
+/* Cursor reset on attach + disconnect via state-mutator API. */
+STM_TEST(slate_panel_cursor_resets_on_attach_disconnect)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const stm_lp9_vops *v = stm_slate_vops();
+    uint64_t cqp = ((uint64_t)19) << 56;
+
+    /* Set cursor=10. */
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/77u, cqp, STM_LP9_O_WRONLY));
+    uint32_t written = 0;
+    STM_ASSERT_OK(v->write(s, 77u, cqp, 0u, "10", 2u, &written));
+    v->clunk(s, 77u, cqp);
+
+    /* Disconnect — cursor reset to 0. */
+    STM_ASSERT_OK(stm_slate_disconnect(s));
+    /* (already disconnected from create — no version bump but state
+     * is still cleared via initial create's calloc.) */
+
+    /* Set again, then attach with bogus path (which fails) — state
+     * stays disconnected so cursor still 0. */
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/78u, cqp, STM_LP9_O_WRONLY));
+    STM_ASSERT_OK(v->write(s, 78u, cqp, 0u, "10", 2u, &written));
+    v->clunk(s, 78u, cqp);
+    /* Attach with bogus path — fails. */
+    stm_status arc = stm_slate_attach(s, "/tmp/stm_slate_no_such_dgkjs.sock",
+                                          strlen("/tmp/stm_slate_no_such_dgkjs.sock"));
+    STM_ASSERT(arc != STM_OK);
+
+    /* Cursor still 10 (failed attach left state untouched). */
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/79u, cqp, STM_LP9_O_RDONLY));
+    char buf[16];
+    uint32_t got = (uint32_t)sizeof buf;
+    STM_ASSERT_OK(v->read(s, 79u, cqp, 0u, buf, &got));
+    STM_ASSERT_EQ(got, 3u);  /* "10\n" */
+    v->clunk(s, 79u, cqp);
+
     stm_slate_destroy(s);
 }
 
