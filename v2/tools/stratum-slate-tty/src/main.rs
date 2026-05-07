@@ -50,6 +50,21 @@ fn main() -> Result<()> {
     let mut main_client = SlateClient::dial(&opts.slate_sock)
         .with_context(|| format!("dial slate at {}", opts.slate_sock.display()))?;
 
+    // One-shot attach via /connection/attach if the user asked. This
+    // routes through slate's mu-guarded backend lifecycle (CLAUDE.md
+    // slate clause 10): slate dials the stratumd socket, swaps state
+    // atomically, bumps version. We do this BEFORE entering raw
+    // mode so any error message reaches the terminal cleanly.
+    if let Some(stratumd_sock) = opts.attach.as_ref() {
+        let path_bytes = stratumd_sock
+            .to_str()
+            .context("--attach path is not valid utf-8")?
+            .as_bytes();
+        main_client
+            .write_path("/connection/attach", path_bytes)
+            .with_context(|| format!("attach stratumd at {}", stratumd_sock.display()))?;
+    }
+
     // Spawn /redraw thread on its OWN connection.
     let (redraw_tx, redraw_rx): (Sender<u64>, Receiver<u64>) = mpsc::channel();
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -77,16 +92,22 @@ fn main() -> Result<()> {
 
 struct Opts {
     slate_sock: PathBuf,
+    attach: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Opts> {
     let mut slate_sock = PathBuf::from(DEFAULT_SLATE_SOCKET);
+    let mut attach: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--slate-sock" | "-s" => {
                 let v = args.next().context("--slate-sock requires a value")?;
                 slate_sock = PathBuf::from(v);
+            }
+            "--attach" | "-a" => {
+                let v = args.next().context("--attach requires a stratumd socket path")?;
+                attach = Some(PathBuf::from(v));
             }
             "-h" | "--help" => {
                 print_usage();
@@ -97,17 +118,23 @@ fn parse_args() -> Result<Opts> {
             }
         }
     }
-    Ok(Opts { slate_sock })
+    Ok(Opts { slate_sock, attach })
 }
 
 fn print_usage() {
     println!(
-        "Usage: stratum-slate-tty [--slate-sock PATH]\n\n\
+        "Usage: stratum-slate-tty [--slate-sock PATH] [--attach STRATUMD_SOCK]\n\n\
          Connects to a running stratum-slate daemon and renders its UI.\n\n\
          Options:\n\
-           -s, --slate-sock PATH   Slate Unix-socket path\n\
-                                   (default: {DEFAULT_SLATE_SOCKET})\n\
-           -h, --help              Show this message\n\n\
+           -s, --slate-sock PATH    Slate Unix-socket path\n\
+                                    (default: {DEFAULT_SLATE_SOCKET})\n\
+           -a, --attach STRATUMD    Before entering UI, write the\n\
+                                    stratumd socket path to slate's\n\
+                                    /connection/attach (one-shot).\n\
+                                    Equivalent to wiring slate up to\n\
+                                    a backend and useful for the\n\
+                                    no-arg demo workflow.\n\
+           -h, --help               Show this message\n\n\
          Keys:\n\
            Tab              switch focused panel\n\
            Up / Down        move cursor\n\
