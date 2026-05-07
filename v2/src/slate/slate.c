@@ -1095,9 +1095,9 @@ static stm_status verb_key_enter(stm_slate *s, int panel_idx)
 }
 
 /* SLATE-3c "key Backspace": ascend to parent dir. Pure state
- * mutation — no backend op needed because the parent of any
- * reachable path is itself reachable (we walked through it during
- * descend). If the backend has since removed the parent, subsequent
+ * mutation — no backend op needed because the parent of any path
+ * reached via descend was reachable AT DESCEND TIME (we walked
+ * through it then). If the backend has since removed it,
  * panel_entries_render's walk_to_cwd will fail and the entries
  * listing will be empty — graceful degradation, not a soundness
  * issue. Disconnected → STM_EBACKEND. Already at root → no-op
@@ -1114,6 +1114,17 @@ static stm_status ascend_panel(stm_slate *s, int panel_idx)
     if (cwd_len == 0u) {
         pthread_mutex_unlock(&s->mu);
         return STM_EBACKEND;
+    }
+    /* R118 P3-1 defense-in-depth: same bound check posture as
+     * descend_panel + lopen_panel_entries. Today's state machine
+     * never exceeds STM_SLATE_PATH_MAX (attach sets 1, descend caps
+     * at target_path_len, ascend only shrinks), but a future writable
+     * /panels/X/cwd or `goto` verb that bypasses the cap would let
+     * the loop below walk past the buffer end if path_len were
+     * corrupt. */
+    if (cwd_len > STM_SLATE_PATH_MAX) {
+        pthread_mutex_unlock(&s->mu);
+        return STM_ERANGE;
     }
     /* Already at root — no-op. */
     if (cwd_len == 1u && s->panel[panel_idx].path[0] == '/') {
