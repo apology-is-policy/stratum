@@ -20,6 +20,8 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -41,6 +43,13 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
     if !opts.volume.exists() {
         bail!("volume {} does not exist; run `stratum mkfs` first", opts.volume.display());
     }
+    // R126 P2-2: mask SIGINT/SIGTERM on the parent thread BEFORE
+    // spawning children. Without this, a Ctrl-C during the
+    // ~5-second wait_for_sock window kills the parent and leaves
+    // orphan daemons. We unmask BEFORE entering tui::run (which
+    // wants raw-mode Ctrl-C delivered as a key event) or
+    // run_headless (which sigwaits for clean shutdown).
+    let prev_mask = block_term_signals();
     let session_dir = make_session_dir()?;
     let stratumd_sock = session_dir.join("stratumd.sock");
     let slate_sock = session_dir.join("slate.sock");
@@ -73,6 +82,10 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
     let mut stratumd_child = Command::new(&me)
         .args(&stratumd_args)
         .stdout(Stdio::null())
+        // R126 P2-2: own process group, so terminal SIGINT
+        // doesn't propagate to the children. Parent reaps via
+        // explicit SIGTERM in teardown_child.
+        .process_group(0)
         .spawn()
         .with_context(|| format!("spawn stratumd via {}", me.display()))?;
     stratumd_args.clear(); // free.
@@ -98,6 +111,7 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
     let mut slate_child = match Command::new(&me)
         .args(&slate_args)
         .stdout(Stdio::null())
+        .process_group(0)
         .spawn()
     {
         Ok(c) => c,
@@ -117,15 +131,16 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         )));
     }
 
-    // Optional --print-env-to: surface socket paths to external tools
-    // (e.g. Claude can run `stratum fs -s "$STRATUM_SLATE_SOCK" ls /`).
+    // R126 P1-1 + P2-1: write env file with O_NOFOLLOW|O_CREAT|O_EXCL
+    // (refuse if exists) at mode 0600, AND shell-quote the values to
+    // tolerate shell metachars in XDG_RUNTIME_DIR or unusual paths.
     if let Some(env_path) = opts.print_env_to.as_ref() {
         let body = format!(
             "STRATUM_SLATE_SOCK={}\nSTRATUMD_SOCK={}\n",
-            slate_sock.display(),
-            stratumd_sock.display()
+            shell_quote(&slate_sock.to_string_lossy()),
+            shell_quote(&stratumd_sock.to_string_lossy())
         );
-        if let Err(e) = fs::write(env_path, body) {
+        if let Err(e) = write_env_file_safely(env_path, &body) {
             eprintln!(
                 "stratum: warning: --print-env-to {} failed: {e}",
                 env_path.display()
@@ -140,13 +155,19 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
     // immediately readable for external clients (e.g. Claude doing
     // `stratum fs -s "$STRATUM_SLATE_SOCK" ls /panels/left/entries`
     // before the user lands a single keystroke).
-    if let Err(e) = attach_slate(&slate_sock, &stratumd_sock) {
+    if let Err(e) = attach_slate_with_retry(&slate_sock, &stratumd_sock) {
         eprintln!("stratum: warning: pre-attach failed: {e}");
     }
 
     let result = if opts.headless {
-        run_headless(&slate_sock, &stratumd_sock)
+        run_headless(&slate_sock, &stratumd_sock, &prev_mask)
     } else {
+        // R126 P2-2: restore signals BEFORE entering raw mode. The
+        // TUI wants Ctrl-C delivered as a key event (terminal raw
+        // mode swallows it before signal-disposition kicks in), but
+        // unmasking now means a SIGINT from external `kill` reaches
+        // the parent and our cleanup path runs.
+        restore_signal_mask(&prev_mask);
         tui::run(tui::Opts {
             slate_sock: slate_sock.clone(),
             attach: None, // already attached above
@@ -160,36 +181,51 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
     result
 }
 
-fn attach_slate(slate_sock: &Path, stratumd_sock: &Path) -> Result<()> {
-    let mut c = crate::slate::SlateClient::dial(slate_sock)
-        .with_context(|| format!("dial slate at {}", slate_sock.display()))?;
+/// R126 P3-3: dial slate with a brief retry loop. Even after
+/// `wait_for_sock` (which only checks bind-time path existence),
+/// the slate accept loop may not have called accept() yet, and
+/// libstratum-9p's single-attempt dial returns STM_EIO. The C-side
+/// `stratum-fs` retries 50 × 10ms for the same reason.
+fn attach_slate_with_retry(slate_sock: &Path, stratumd_sock: &Path) -> Result<()> {
     let path = stratumd_sock
         .to_str()
         .context("stratumd socket path is not utf-8")?;
-    c.write_path("/connection/attach", path.as_bytes())
-        .with_context(|| format!("attach to {}", path))?;
-    Ok(())
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..50 {
+        match crate::slate::SlateClient::dial(slate_sock) {
+            Ok(mut c) => {
+                return c
+                    .write_path("/connection/attach", path.as_bytes())
+                    .with_context(|| format!("attach to {}", path));
+            }
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < 49 {
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("dial slate at {}: timeout", slate_sock.display())))
 }
 
 /// Headless mode — spawn daemons + sleep until SIGINT/SIGTERM. No TUI.
 /// Useful for: (a) Claude / scripts driving slate through `stratum fs
 /// -s "$STRATUM_SLATE_SOCK"`; (b) Halcyon panes attaching to a running
 /// instance; (c) integration tests that want the daemons up without
-/// a tty.
-fn run_headless(slate_sock: &Path, stratumd_sock: &Path) -> Result<()> {
+/// a tty. SIGINT/SIGTERM are already blocked at process startup
+/// (R126 P2-2 fix); we sigwait on them here.
+fn run_headless(slate_sock: &Path, stratumd_sock: &Path, _prev_mask: &libc::sigset_t) -> Result<()> {
     eprintln!("stratum: headless mode — daemons running.");
     eprintln!("        slate    socket: {}", slate_sock.display());
     eprintln!("        stratumd socket: {}", stratumd_sock.display());
     eprintln!("        send SIGTERM (Ctrl-C) to shut down.");
 
-    // Block on SIGINT/SIGTERM via signalfd-equivalent — use libc's
-    // sigwaitinfo on Linux, sigwait fallback for portability.
     let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
     unsafe {
         libc::sigemptyset(&mut set);
         libc::sigaddset(&mut set, libc::SIGINT);
         libc::sigaddset(&mut set, libc::SIGTERM);
-        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
     }
     let mut sig: i32 = 0;
     unsafe {
@@ -199,16 +235,92 @@ fn run_headless(slate_sock: &Path, stratumd_sock: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Allocate a per-pid session dir under $XDG_RUNTIME_DIR/stratum/<pid>/
-/// (Linux) or $TMPDIR/stratum-<pid>/ (macOS / fallback). Caller is
-/// responsible for cleanup.
+/// R126 P2-2: block SIGINT/SIGTERM on the calling thread + return
+/// the previous mask. Children spawned after this inherit the mask
+/// but can replace it via `sigprocmask` in their own startup
+/// (which stratumd / slate do via their `install_signal_handlers`).
+fn block_term_signals() -> libc::sigset_t {
+    let mut new_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+    let mut prev_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut new_mask);
+        libc::sigaddset(&mut new_mask, libc::SIGINT);
+        libc::sigaddset(&mut new_mask, libc::SIGTERM);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &new_mask, &mut prev_mask);
+    }
+    prev_mask
+}
+
+fn restore_signal_mask(prev: &libc::sigset_t) {
+    unsafe {
+        libc::pthread_sigmask(libc::SIG_SETMASK, prev, std::ptr::null_mut());
+    }
+}
+
+/// R126 P1-1: open the env-file path with O_NOFOLLOW|O_CREAT|O_EXCL
+/// at mode 0600. Refuses if path exists OR is a symlink — defeats
+/// pre-created-symlink-to-victim attacks (the canonical concern when
+/// an env file lands in a world-writable /tmp). On success the file
+/// is owned by the calling user, mode 0600.
+fn write_env_file_safely(path: &Path, body: &str) -> Result<()> {
+    use std::io::Write as _;
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)        // O_CREAT|O_EXCL — refuse if exists.
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(0o600)             // crate user only.
+        .open(path)
+        .with_context(|| format!("create_new {}", path.display()))?;
+    f.write_all(body.as_bytes())
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+/// R126 P2-1: shell-quote a string so it's safe to source from
+/// /bin/sh (POSIX). Single-quote the value, escape any single quotes
+/// inside as `'\''`. Idempotent for already-quote-safe inputs.
+fn shell_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            // Close, escape, re-open: 'X'\''Y'
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Allocate a per-pid session dir under $XDG_RUNTIME_DIR (Linux) or
+/// $TMPDIR (macOS / fallback). Caller is responsible for cleanup.
+///
+/// R126 P1-2 + P3-2: refuse-if-exists posture. PIDs collide on long-
+/// running systems, and the dir name is predictable enough that an
+/// attacker on the same host can pre-create a symlink to a victim
+/// directory. We use mkdir(O_EXCL semantics) — `fs::DirBuilder` with
+/// no `recursive(true)` returns Err if the path exists OR is a
+/// symlink to anything. Mode 0700 so only the calling user can see
+/// the sockets.
 fn make_session_dir() -> Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
     let pid = std::process::id();
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
+    // Ensure the BASE dir exists (XDG_RUNTIME_DIR is usually pre-
+    // created by systemd-logind; $TMPDIR always does). We only mkdir
+    // the per-pid LEAF with O_EXCL semantics.
+    if !base.exists() {
+        bail!("session dir parent {} does not exist", base.display());
+    }
     let dir = base.join(format!("stratum-{pid}"));
-    fs::create_dir_all(&dir).with_context(|| format!("mkdir -p {}", dir.display()))?;
+    let mut db = fs::DirBuilder::new();
+    db.mode(0o700);
+    db.create(&dir)
+        .with_context(|| format!("mkdir(O_EXCL) {}", dir.display()))?;
     Ok(dir)
 }
 

@@ -17,7 +17,6 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 use crate::embed;
-use crate::tui;
 
 pub fn run() -> Result<()> {
     let recents = recent_volumes();
@@ -168,9 +167,4 @@ fn add_to_recents(path: &std::path::Path) {
         .collect::<Vec<_>>()
         .join("\n");
     let _ = fs::write(&recents_path, body);
-    // Suppress unused: we use embed + tui above; this satisfies clippy.
-    let _ = tui::Opts {
-        slate_sock: PathBuf::new(),
-        attach: None,
-    };
 }

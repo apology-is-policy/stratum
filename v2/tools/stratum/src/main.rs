@@ -50,10 +50,10 @@ fn dispatch(args: Vec<String>) -> Result<i32> {
             Ok(0)
         }
         "tui" => tui_dispatch(&args[2..]),
-        "serve" => Ok(ffi_dispatch("stratumd", &args[2..], ffi::stm_cmd_stratumd_main)),
-        "slate" => Ok(ffi_dispatch("stratum-slate", &args[2..], ffi::stm_cmd_slate_main)),
-        "mkfs" => Ok(ffi_dispatch("stratum-mkfs", &args[2..], ffi::stm_cmd_mkfs_main)),
-        "fs" => Ok(ffi_dispatch("stratum-fs", &args[2..], ffi::stm_cmd_fs_main)),
+        "serve" => ffi_dispatch("stratumd", &args[2..], ffi::stm_cmd_stratumd_main),
+        "slate" => ffi_dispatch("stratum-slate", &args[2..], ffi::stm_cmd_slate_main),
+        "mkfs" => ffi_dispatch("stratum-mkfs", &args[2..], ffi::stm_cmd_mkfs_main),
+        "fs" => ffi_dispatch("stratum-fs", &args[2..], ffi::stm_cmd_fs_main),
         other => {
             bail!("stratum: unknown subcommand: {other}\n(see `stratum --help`)");
         }
@@ -89,7 +89,12 @@ type CmdMain = unsafe extern "C" fn(c_int, *const *const c_char) -> c_int;
 /// Translate Rust args into a C-style argv (with `argv0` as argv[0])
 /// and call the FFI entry point. The cstrs Vec keeps the CString
 /// backing memory alive for the duration of the call.
-fn ffi_dispatch(argv0: &str, args: &[String], cmd_main: CmdMain) -> i32 {
+///
+/// R126 P3-4: NUL in any arg returns Err instead of panic-unwinding
+/// across the FFI boundary (which is UB on stable Rust).
+/// R126 P3-5: argv.len() bound-checked against c_int range before
+/// the cast — prevents silent wrap on pathological argc.
+fn ffi_dispatch(argv0: &str, args: &[String], cmd_main: CmdMain) -> Result<i32> {
     let mut full = Vec::with_capacity(args.len() + 1);
     full.push(argv0.to_string());
     for a in args {
@@ -97,10 +102,13 @@ fn ffi_dispatch(argv0: &str, args: &[String], cmd_main: CmdMain) -> i32 {
     }
     let cstrs: Vec<CString> = full
         .iter()
-        .map(|s| CString::new(s.clone()).expect("argv contains NUL"))
-        .collect();
+        .map(|s| CString::new(s.clone()).map_err(|_| anyhow::anyhow!("argv contains NUL")))
+        .collect::<Result<_>>()?;
     let argv: Vec<*const c_char> = cstrs.iter().map(|s| s.as_ptr()).collect();
-    unsafe { cmd_main(argv.len() as c_int, argv.as_ptr()) }
+    if argv.len() > c_int::MAX as usize {
+        bail!("argc exceeds c_int range");
+    }
+    Ok(unsafe { cmd_main(argv.len() as c_int, argv.as_ptr()) })
 }
 
 fn tui_dispatch(args: &[String]) -> Result<i32> {

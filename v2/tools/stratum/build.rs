@@ -111,9 +111,16 @@ fn main() {
 
 /// Return the lib name (between `lib` prefix and `.a` suffix) if `f`
 /// looks like a static library we should link.
+///
+/// R126 P3-7 — policy: any test-only static lib MUST live under
+/// `v2/build/tests/` (which build.rs deliberately does NOT walk).
+/// Anything that ends up under `v2/build/src/**` is production. The
+/// `stm_testlib` skip is belt-and-braces for the one case where
+/// historical CMakeLists may have placed a test artifact under src/.
+/// If a future chunk introduces a new test-only static lib, place it
+/// under tests/ — do NOT add it to this skip list.
 fn parse_static_lib_name(f: &str) -> Option<String> {
     let stem = f.strip_prefix("lib")?.strip_suffix(".a")?;
-    // Skip the test-only lib; production binary doesn't want it.
     if stem == "stm_testlib" {
         return None;
     }

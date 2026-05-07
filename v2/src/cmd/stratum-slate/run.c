@@ -63,13 +63,10 @@
 /* Process-wide stop flag. Signal handler toggles. */
 static atomic_bool g_stop_flag = false;
 
-/* Process-wide slate state pointer. Used by the signal handler to
- * wake all blocked /redraw readers. The handler itself is ASync-
- * signal-safe under our use: stm_slate_stop just sets a bool and
- * cond_broadcasts (both lock-free per our build). For maximum
- * portability we set the stop_flag here and let the accept-loop
- * thread (post-accept-EINTR) call stm_slate_stop. */
-static atomic_uintptr_t g_slate_ptr = 0;
+/* R126 P3-1: g_slate_ptr removed — was written but never read.
+ * stop is signalled via g_stop_flag which the accept loop polls on
+ * EINTR. Wake-blocked-readers happens in the post-accept-loop
+ * teardown via stm_slate_stop, NOT from the signal handler. */
 
 _Static_assert(ATOMIC_BOOL_LOCK_FREE == 2,
                 "stratum-slate's stop_flag requires lock-free atomic_bool");
@@ -417,8 +414,6 @@ static int run_serve(const char *socket_path, uint32_t msize_max,
         fprintf(stderr, "stratum-slate: stm_slate_create failed\n");
         return 1;
     }
-    atomic_store_explicit(&g_slate_ptr, (uintptr_t)slate,
-                              memory_order_release);
 
     int listen_fd = stm_stratumd_listen_unix(socket_path,
                                                   DEFAULT_BACKLOG, 0600);
