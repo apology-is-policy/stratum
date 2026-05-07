@@ -1209,6 +1209,175 @@ STM_TEST(slate_socket_action_key_enter_on_file_refuses)
     destroy_backend_fixture(&be);
 }
 
+/* SLATE-3c-selection: socket-level smoke (R119 P3-3). Wire-encoded
+ * Twrite "1,3,5" → Tread of /panels/left/selection returns "1,3,5\n". */
+STM_TEST(slate_socket_panel_selection_write_then_read)
+{
+    slate_fixture f;
+    setup_fixture(&f, "fg_sel_smoke");
+
+    stm_9p_client *c = NULL;
+    stm_9p_dial_opts opts = default_dial_opts(100u);
+    STM_ASSERT_OK(retry_dial(g_sock_path, &opts, &c));
+
+    const char *names[] = { "panels", "left", "selection" };
+    stm_9p_qid qids[3];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 101u, 3u, names, qids, &walked));
+    stm_9p_qid oqid;
+    uint32_t iounit = 0;
+    STM_ASSERT_OK(stm_9p_lopen(c, 101u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, 101u, 0u, "1,3,5", 5u, &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 101u));
+
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 102u, 3u, names, qids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 102u, 0u, &oqid, &iounit));
+    char buf[32];
+    uint32_t got = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 102u, 0u, buf,
+                                  (uint32_t)(sizeof buf - 1u), &got));
+    buf[got] = '\0';
+    STM_ASSERT_EQ(strcmp(buf, "1,3,5\n"), 0);
+    STM_ASSERT_OK(stm_9p_clunk(c, 102u));
+
+    stm_9p_close(c);
+    destroy_fixture(&f);
+}
+
+/* SLATE-3c-selection R119 P3-2: reset-on-cwd-change discipline.
+ * Selection MUST clear at every cwd-changing transition: attach,
+ * disconnect, descend, ascend. A regression that drops the
+ * memset(selection, 0) from any of those paths surfaces here. */
+STM_TEST(slate_socket_panel_selection_resets_on_cwd_changes)
+{
+    slate_backend_fixture be;
+    setup_backend_fixture(&be, "be_sreset");
+
+    slate_fixture f;
+    setup_fixture(&f, "fg_sreset");
+
+    stm_9p_client *c = NULL;
+    stm_9p_dial_opts opts = default_dial_opts(100u);
+    STM_ASSERT_OK(retry_dial(g_sock_path, &opts, &c));
+
+    /* Helper: read /panels/left/selection and assert body matches expected. */
+    const char *snames[] = { "panels", "left", "selection" };
+    stm_9p_qid sqids[3];
+    uint16_t walked = 0;
+    stm_9p_qid oqid;
+    uint32_t iounit = 0;
+    char buf[32];
+    uint32_t fid = 200u;
+
+    /* (1) attach reset: pre-attach (disconnected), set selection,
+     * then attach to backend → selection must clear. */
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, fid, 3u, snames, sqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, fid, STM_LP9_O_WRONLY, &oqid, &iounit));
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, fid, 0u, "10,20", 5u, &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, fid)); fid++;
+
+    /* Verify selection is "10,20\n" pre-attach. */
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, fid, 3u, snames, sqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, fid, 0u, &oqid, &iounit));
+    uint32_t got = 0;
+    STM_ASSERT_OK(stm_9p_read(c, fid, 0u, buf, (uint32_t)(sizeof buf - 1u), &got));
+    buf[got] = '\0';
+    STM_ASSERT_EQ(strcmp(buf, "10,20\n"), 0);
+    STM_ASSERT_OK(stm_9p_clunk(c, fid)); fid++;
+
+    /* Attach. */
+    const char *anames[] = { "connection", "attach" };
+    stm_9p_qid aqids[2];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, fid, 2u, anames, aqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, fid, STM_LP9_O_WRONLY, &oqid, &iounit));
+    STM_ASSERT_OK(stm_9p_write(c, fid, 0u, be.sock_path,
+                                  (uint32_t)strlen(be.sock_path), &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, fid)); fid++;
+
+    /* Selection must be empty ("\n") after attach. */
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, fid, 3u, snames, sqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, fid, 0u, &oqid, &iounit));
+    got = 0;
+    STM_ASSERT_OK(stm_9p_read(c, fid, 0u, buf, (uint32_t)(sizeof buf - 1u), &got));
+    STM_ASSERT_EQ(got, 1u);
+    STM_ASSERT_EQ(buf[0], '\n');
+    STM_ASSERT_OK(stm_9p_clunk(c, fid)); fid++;
+
+    /* (2) descend reset: set selection, descend into /log → cleared. */
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, fid, 3u, snames, sqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, fid, STM_LP9_O_WRONLY, &oqid, &iounit));
+    STM_ASSERT_OK(stm_9p_write(c, fid, 0u, "1,2,3", 5u, &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, fid)); fid++;
+
+    const char *cnames[] = { "panels", "left", "cursor" };
+    stm_9p_qid cqids[3];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, fid, 3u, cnames, cqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, fid, STM_LP9_O_WRONLY, &oqid, &iounit));
+    STM_ASSERT_OK(stm_9p_write(c, fid, 0u, "4", 1u, &written));  /* "log" idx */
+    STM_ASSERT_OK(stm_9p_clunk(c, fid)); fid++;
+
+    const char *acn[] = { "panels", "left", "action" };
+    stm_9p_qid acqids[3];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, fid, 3u, acn, acqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, fid, STM_LP9_O_WRONLY, &oqid, &iounit));
+    STM_ASSERT_OK(stm_9p_write(c, fid, 0u, "key Enter", 9u, &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, fid)); fid++;
+
+    /* Selection cleared by descend. */
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, fid, 3u, snames, sqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, fid, 0u, &oqid, &iounit));
+    got = 0;
+    STM_ASSERT_OK(stm_9p_read(c, fid, 0u, buf, (uint32_t)(sizeof buf - 1u), &got));
+    STM_ASSERT_EQ(got, 1u);
+    STM_ASSERT_EQ(buf[0], '\n');
+    STM_ASSERT_OK(stm_9p_clunk(c, fid)); fid++;
+
+    /* (3) ascend reset: set selection at /log, ascend → cleared. */
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, fid, 3u, snames, sqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, fid, STM_LP9_O_WRONLY, &oqid, &iounit));
+    STM_ASSERT_OK(stm_9p_write(c, fid, 0u, "0,1", 3u, &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, fid)); fid++;
+
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, fid, 3u, acn, acqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, fid, STM_LP9_O_WRONLY, &oqid, &iounit));
+    STM_ASSERT_OK(stm_9p_write(c, fid, 0u, "key Backspace", 13u, &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, fid)); fid++;
+
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, fid, 3u, snames, sqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, fid, 0u, &oqid, &iounit));
+    got = 0;
+    STM_ASSERT_OK(stm_9p_read(c, fid, 0u, buf, (uint32_t)(sizeof buf - 1u), &got));
+    STM_ASSERT_EQ(got, 1u);
+    STM_ASSERT_EQ(buf[0], '\n');
+    STM_ASSERT_OK(stm_9p_clunk(c, fid)); fid++;
+
+    /* (4) disconnect reset: set selection, disconnect via empty body
+     *     → cleared. */
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, fid, 3u, snames, sqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, fid, STM_LP9_O_WRONLY, &oqid, &iounit));
+    STM_ASSERT_OK(stm_9p_write(c, fid, 0u, "5,6", 3u, &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, fid)); fid++;
+
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, fid, 2u, anames, aqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, fid, STM_LP9_O_WRONLY, &oqid, &iounit));
+    STM_ASSERT_OK(stm_9p_write(c, fid, 0u, "\n", 1u, &written));  /* disconnect */
+    STM_ASSERT_OK(stm_9p_clunk(c, fid)); fid++;
+
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, fid, 3u, snames, sqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, fid, 0u, &oqid, &iounit));
+    got = 0;
+    STM_ASSERT_OK(stm_9p_read(c, fid, 0u, buf, (uint32_t)(sizeof buf - 1u), &got));
+    STM_ASSERT_EQ(got, 1u);
+    STM_ASSERT_EQ(buf[0], '\n');
+    STM_ASSERT_OK(stm_9p_clunk(c, fid));
+
+    stm_9p_close(c);
+    destroy_fixture(&f);
+    destroy_backend_fixture(&be);
+}
+
 /* /event refuses zero-byte writes (parity with stm_slate_submit_event). */
 STM_TEST(slate_socket_event_zero_byte_einval)
 {
