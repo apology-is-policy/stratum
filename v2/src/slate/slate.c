@@ -221,6 +221,16 @@ _Static_assert(sizeof("input") - 1       <= STM_LP9_NAME_MAX, "/dialogs/X/input"
  * (walking from an opened fid is server-defined; from an unopened
  * fid is universal). */
 #define SLATE_BACKEND_CWD_FID   ((uint32_t)203u)
+/* P9-SLATE-3c-walk (R117 P3-3 closure): two ping-pong scratch fids
+ * for walk_to_cwd's iterative re-walk. Used only when cwd depth
+ * exceeds STM_9P_MAX_WALK (16) components. Each iterated batch
+ * walks from the current scratch fid into the next, with the
+ * previous scratch clunked. The LAST batch walks into out_fid
+ * (caller's intended destination — typically WORK_FID). Both walk
+ * fids live entirely within walk_to_cwd's call frame; the caller
+ * never observes them. */
+#define SLATE_BACKEND_WALK_A_FID ((uint32_t)204u)
+#define SLATE_BACKEND_WALK_B_FID ((uint32_t)205u)
 
 /* ────────────────────────────────────────────────────────────────────── */
 /* qid_path encoding — kind in high byte, sub-id in low bytes.            */
@@ -1439,42 +1449,137 @@ static stm_status collect_dirent_cb(const stm_9p_qid *qid, uint64_t cookie,
     return STM_OK;
 }
 
-/* Walk root → cwd into out_fid. Path is "/" or "/a/b/c". Empty path
- * is invalid (caller must short-circuit). Returns STM_OK on success.
- * On error, out_fid is NOT bound (per Twalk partial-walk semantics). */
+/* Walk root → cwd into out_fid. Path is "/" or "/a/b/c". Empty
+ * path is invalid (caller must short-circuit). Returns STM_OK on
+ * success. On error, out_fid is NOT bound (per Twalk partial-walk
+ * semantics).
+ *
+ * Path depth bound: cwd is bounded at STM_SLATE_PATH_MAX (1023);
+ * with single-char components this admits ~511 path components,
+ * well above 9P2000.L's STM_9P_MAX_WALK (16) per-Twalk cap. For
+ * cwd ≤ STM_9P_MAX_WALK components the walk fits in a single
+ * Twalk; for deeper paths we iterate, ping-ponging between two
+ * scratch fids and walking the LAST batch into out_fid (R117 P3-3
+ * closure — the SLATE-3 forward-note from CLAUDE.md slate row
+ * clause 13). The scratch fids (WALK_A_FID + WALK_B_FID) live
+ * entirely within this call; on success exactly one is clunked
+ * during iteration (the source of the final step) and the other
+ * is the now-bound out_fid (or nothing — the n_names ≤ 16 fast
+ * path uses neither). On error, intermediate scratch fids are
+ * clunked best-effort.
+ *
+ * Components are parsed into a heap-allocated buffer rather than
+ * stack — bounded at ~131 KB worst case (max_comps × 257 bytes)
+ * which would otherwise blow stack on slate's per-connection
+ * worker pthreads. */
 static stm_status walk_to_cwd(stm_9p_client *bc, const char *cwd,
                                  uint32_t out_fid)
 {
-    /* Parse path components. STM_9P_MAX_WALK = 16 — paths deeper
-     * than that need iterative re-walking; SLATE-2 only ever sees
-     * "/" so this short-circuits. SLATE-3 will need iterative walk. */
-    const char *names_arr[STM_9P_MAX_WALK];
-    char        names_buf[STM_9P_MAX_WALK][STM_LP9_NAME_MAX + 1];
-    uint16_t    n_names = 0;
+    if (!cwd || *cwd == '\0') return STM_EINVAL;
 
+    /* Upper-bound the component count by the slash count + 1. */
+    size_t max_comps = 1u;
+    for (const char *p = cwd; *p; p++) {
+        if (*p == '/') max_comps++;
+    }
+
+    const char **names_arr = NULL;
+    char *names_blob = NULL;
+    if (max_comps > 0u) {
+        names_arr = malloc(max_comps * sizeof(*names_arr));
+        names_blob = malloc(max_comps * (STM_LP9_NAME_MAX + 1u));
+        if (!names_arr || !names_blob) {
+            free(names_arr);
+            free(names_blob);
+            return STM_ENOMEM;
+        }
+    }
+
+    /* Parse cwd into NUL-terminated components into names_blob;
+     * names_arr[i] points at the i-th component's slot. */
+    size_t n_names = 0;
     const char *p = cwd;
     if (*p == '/') p++;
     while (*p) {
-        if (n_names >= STM_9P_MAX_WALK) return STM_EINVAL;
         const char *slash = strchr(p, '/');
         size_t comp_len = slash ? (size_t)(slash - p) : strlen(p);
-        if (comp_len == 0) {
-            /* "//" — skip the empty component. */
+        if (comp_len == 0u) {
+            /* "//" — skip the empty component (treat like normalised). */
             if (!slash) break;
             p = slash + 1;
             continue;
         }
-        if (comp_len > STM_LP9_NAME_MAX) return STM_EINVAL;
-        memcpy(names_buf[n_names], p, comp_len);
-        names_buf[n_names][comp_len] = '\0';
-        names_arr[n_names] = names_buf[n_names];
+        if (comp_len > STM_LP9_NAME_MAX) {
+            free(names_arr);
+            free(names_blob);
+            return STM_EINVAL;
+        }
+        char *dst = names_blob + n_names * (STM_LP9_NAME_MAX + 1u);
+        memcpy(dst, p, comp_len);
+        dst[comp_len] = '\0';
+        names_arr[n_names] = dst;
         n_names++;
         if (!slash) break;
         p = slash + 1;
     }
 
-    return stm_9p_walk(bc, SLATE_BACKEND_ROOT_FID, out_fid,
-                          n_names, names_arr, NULL, NULL);
+    stm_status rc;
+
+    /* Fast path: single Twalk handles all components. */
+    if (n_names <= STM_9P_MAX_WALK) {
+        rc = stm_9p_walk(bc, SLATE_BACKEND_ROOT_FID, out_fid,
+                            (uint16_t)n_names, names_arr, NULL, NULL);
+        free(names_arr);
+        free(names_blob);
+        return rc;
+    }
+
+    /* Iterative path: walk first STM_9P_MAX_WALK components from
+     * ROOT into WALK_A; then ping-pong walk subsequent batches
+     * (clunking the previous source after each step); the LAST
+     * batch walks into out_fid. */
+    rc = stm_9p_walk(bc, SLATE_BACKEND_ROOT_FID, SLATE_BACKEND_WALK_A_FID,
+                        STM_9P_MAX_WALK, names_arr, NULL, NULL);
+    if (rc != STM_OK) {
+        free(names_arr);
+        free(names_blob);
+        return rc;
+    }
+    uint32_t src = SLATE_BACKEND_WALK_A_FID;
+    uint32_t dst = SLATE_BACKEND_WALK_B_FID;
+    size_t off = STM_9P_MAX_WALK;
+    while (off < n_names) {
+        size_t remaining = n_names - off;
+        size_t batch = (remaining > STM_9P_MAX_WALK) ? STM_9P_MAX_WALK
+                                                      : remaining;
+        bool is_last = (off + batch == n_names);
+        uint32_t target = is_last ? out_fid : dst;
+        stm_status walk_rc = stm_9p_walk(bc, src, target, (uint16_t)batch,
+                                              &names_arr[off], NULL, NULL);
+        /* Always clunk src — once we've walked from it, it's spent
+         * regardless of the walk outcome. Best-effort; we don't
+         * propagate clunk errors over walk errors. */
+        (void)stm_9p_clunk(bc, src);
+        if (walk_rc != STM_OK) {
+            free(names_arr);
+            free(names_blob);
+            return walk_rc;
+        }
+        if (is_last) {
+            free(names_arr);
+            free(names_blob);
+            return STM_OK;
+        }
+        src = target;
+        dst = (dst == SLATE_BACKEND_WALK_A_FID) ? SLATE_BACKEND_WALK_B_FID
+                                                 : SLATE_BACKEND_WALK_A_FID;
+        off += batch;
+    }
+    /* Loop exits via is_last → unreachable unless n_names was
+     * miscounted. Defensive return. */
+    free(names_arr);
+    free(names_blob);
+    return STM_OK;
 }
 
 /* Render panel entries against the backend. Acquires + releases
