@@ -169,6 +169,14 @@ _Static_assert(sizeof("action") - 1      <= STM_LP9_NAME_MAX, "/panels/X/action"
 #define SLATE_BACKEND_ROOT_FID  ((uint32_t)200u)
 #define SLATE_BACKEND_WORK_FID  ((uint32_t)201u)
 #define SLATE_BACKEND_ENT_FID   ((uint32_t)202u)
+/* SLATE-3b: CWD_FID is a clone of WORK_FID bound to the panel's cwd
+ * before WORK is Tlopen'd. Per-entry Twalks issue from CWD_FID so a
+ * nested cwd ("/sub/...") resolves entry names to the correct
+ * directory rather than always to root. CWD stays UNOPENED so
+ * Twalk(CWD, ENT, [name]) is unambiguously valid in 9P2000.L
+ * (walking from an opened fid is server-defined; from an unopened
+ * fid is universal). */
+#define SLATE_BACKEND_CWD_FID   ((uint32_t)203u)
 
 /* ────────────────────────────────────────────────────────────────────── */
 /* qid_path encoding — kind in high byte, sub-id in low bytes.            */
@@ -881,10 +889,22 @@ static stm_status panel_entries_render(stm_slate *s, const char *cwd,
         return STM_OK;  /* disconnected → empty body. */
     }
 
-    /* Phase 1: walk to cwd, lopen for read, readdir batches into a
-     * collected name list. Clunk the work fid at end. */
+    /* Phase 1: walk to cwd, clone to CWD_FID for per-entry walks
+     * (R115 P3 + R116 P3 forward-note carry — supports nested cwd),
+     * lopen WORK for read, readdir batches into a collected name list.
+     * Clunk WORK after readdir; CWD lives until end of phase 2. */
     stm_status rc = walk_to_cwd(bc, cwd, SLATE_BACKEND_WORK_FID);
     if (rc != STM_OK) {
+        pthread_mutex_unlock(&s->backend_mu);
+        return rc;
+    }
+    /* Clone WORK to CWD_FID via Twalk(WORK, CWD, n_names=0) — both
+     * point at the panel's cwd, both unopened. Done BEFORE lopen
+     * on WORK so the source fid is unopened (clean walk semantics). */
+    rc = stm_9p_walk(bc, SLATE_BACKEND_WORK_FID, SLATE_BACKEND_CWD_FID,
+                        0u, NULL, NULL, NULL);
+    if (rc != STM_OK) {
+        (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
         pthread_mutex_unlock(&s->backend_mu);
         return rc;
     }
@@ -892,6 +912,7 @@ static stm_status panel_entries_render(stm_slate *s, const char *cwd,
                          STM_9P_O_RDONLY | STM_9P_O_DIRECTORY,
                          NULL, NULL);
     if (rc != STM_OK) {
+        (void)stm_9p_clunk(bc, SLATE_BACKEND_CWD_FID);
         (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
         pthread_mutex_unlock(&s->backend_mu);
         return rc;
@@ -923,16 +944,20 @@ static stm_status panel_entries_render(stm_slate *s, const char *cwd,
     }
     (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
     if (rc != STM_OK) {
+        (void)stm_9p_clunk(bc, SLATE_BACKEND_CWD_FID);
         free(arr);
         pthread_mutex_unlock(&s->backend_mu);
         return rc;
     }
 
-    /* Phase 2: per-entry walk + getattr. Use SLATE_BACKEND_ENT_FID.
-     * On any per-entry failure we record minimal info (mode=0,
-     * size=0, mtime=0); the listing remains usable. */
+    /* Phase 2: per-entry walk + getattr. Walks from CWD_FID (the
+     * panel's cwd) so nested cwds resolve correctly. Use
+     * SLATE_BACKEND_ENT_FID. On any per-entry failure we record
+     * minimal info (mode=0, size=0, mtime=0); the listing remains
+     * usable. */
     size_t body_cap = (size_t)dc.count * STM_SLATE_ENTRY_LINE_MAX + 1u;
     if (body_cap == 1u) {
+        (void)stm_9p_clunk(bc, SLATE_BACKEND_CWD_FID);
         free(arr);
         pthread_mutex_unlock(&s->backend_mu);
         return STM_OK;  /* empty dir → empty body */
@@ -940,6 +965,7 @@ static stm_status panel_entries_render(stm_slate *s, const char *cwd,
     if (body_cap > STM_SLATE_LOG_TAIL_MAX) body_cap = STM_SLATE_LOG_TAIL_MAX;
     uint8_t *body = malloc(body_cap);
     if (!body) {
+        (void)stm_9p_clunk(bc, SLATE_BACKEND_CWD_FID);
         free(arr);
         pthread_mutex_unlock(&s->backend_mu);
         return STM_ENOMEM;
@@ -953,18 +979,10 @@ static stm_status panel_entries_render(stm_slate *s, const char *cwd,
         uint64_t mtime = 0;
 
         const char *names_arr[1] = { de->name };
-        if (stm_9p_walk(bc, SLATE_BACKEND_ROOT_FID, SLATE_BACKEND_ENT_FID,
+        if (stm_9p_walk(bc, SLATE_BACKEND_CWD_FID, SLATE_BACKEND_ENT_FID,
                             1, names_arr, NULL, NULL) == STM_OK) {
             stm_9p_attr a;
             memset(&a, 0, sizeof a);
-            /* The walk above is from ROOT — it only resolves the
-             * direct child of root. For a nested cwd like "/a/b" we
-             * need to walk root→a→b→name. Fix: walk_to_cwd writes
-             * into WORK fid, which we already clunked. Re-walk for
-             * the entry into ENT fid via cwd + name. SLATE-2 always
-             * has cwd="/" so this short-circuits to a single-component
-             * walk from root. SLATE-3 (multi-component cwd + per-
-             * entry walk) MUST refactor this — forward-noted. */
             (void)stm_9p_getattr(bc, SLATE_BACKEND_ENT_FID,
                                     STM_9P_GETATTR_MODE | STM_9P_GETATTR_SIZE |
                                     STM_9P_GETATTR_MTIME, &a);
@@ -1017,11 +1035,299 @@ static stm_status panel_entries_render(stm_slate *s, const char *cwd,
         body_off += (size_t)n;
     }
 
+    (void)stm_9p_clunk(bc, SLATE_BACKEND_CWD_FID);
     free(arr);
     pthread_mutex_unlock(&s->backend_mu);
 
     *out_buf = body;
     *out_len = (uint32_t)body_off;
+    return STM_OK;
+}
+
+/* SLATE-3b: action verb dispatch. Table-driven (R104 doctrine + R116
+ * P3-3 carry) so SLATE-3c+'s additional verbs (key F3 view, mouse
+ * click, etc.) just append a row.
+ *
+ * Each verb's handler returns STM_OK on successful dispatch (whether
+ * or not state changed), or a non-OK status on failure. The handler
+ * is responsible for any version bump under s->mu.
+ *
+ * "key Up" / "key Down": cursor adjustment, no backend op required;
+ * implemented inline to avoid the overhead of a backend round-trip.
+ * "key Enter": calls descend_panel (forward declaration below). */
+static stm_status descend_panel(stm_slate *s, int panel_idx);
+
+static stm_status verb_key_up(stm_slate *s, int panel_idx)
+{
+    pthread_mutex_lock(&s->mu);
+    bool moved = false;
+    if (s->panel[panel_idx].cursor > 0u) {
+        s->panel[panel_idx].cursor--;
+        moved = true;
+    }
+    if (moved) {
+        s->version++;
+        pthread_cond_broadcast(&s->cv);
+    }
+    pthread_mutex_unlock(&s->mu);
+    return STM_OK;
+}
+
+static stm_status verb_key_down(stm_slate *s, int panel_idx)
+{
+    pthread_mutex_lock(&s->mu);
+    bool moved = false;
+    if (s->panel[panel_idx].cursor < UINT32_MAX) {
+        s->panel[panel_idx].cursor++;
+        moved = true;
+    }
+    if (moved) {
+        s->version++;
+        pthread_cond_broadcast(&s->cv);
+    }
+    pthread_mutex_unlock(&s->mu);
+    return STM_OK;
+}
+
+static stm_status verb_key_enter(stm_slate *s, int panel_idx)
+{
+    return descend_panel(s, panel_idx);
+}
+
+typedef struct {
+    const char  *verb;       /* literal — not NUL-terminated */
+    size_t       verb_len;
+    stm_status (*handler)(stm_slate *, int panel_idx);
+} action_verb_row;
+
+static const action_verb_row ACTION_VERBS[] = {
+    { "key Up",    6u, verb_key_up    },
+    { "key Down",  8u, verb_key_down  },
+    { "key Enter", 9u, verb_key_enter },
+};
+
+#define ACTION_VERBS_COUNT (sizeof(ACTION_VERBS) / sizeof(ACTION_VERBS[0]))
+
+static stm_status action_dispatch_verb(stm_slate *s, int panel_idx,
+                                            const char *body, size_t body_len)
+{
+    for (size_t i = 0; i < ACTION_VERBS_COUNT; i++) {
+        const action_verb_row *r = &ACTION_VERBS[i];
+        if (body_len == r->verb_len &&
+            memcmp(body, r->verb, r->verb_len) == 0) {
+            return r->handler(s, panel_idx);
+        }
+    }
+    return STM_ENOTSUPPORTED;
+}
+
+/* SLATE-3b "key Enter": descend into the cursor's entry if it's a
+ * directory. Snapshots cursor + cwd under s->mu, runs a backend
+ * walk + readdir + getattr to find entries[cursor], builds new
+ * cwd path, atomically swaps panel.path under s->mu (with cursor
+ * reset to 0). On failure (cursor out of range, entry not a dir,
+ * disconnected mid-op) returns the appropriate error and leaves
+ * panel state untouched. */
+typedef struct {
+    uint32_t target_idx;
+    uint32_t emitted;
+    bool     found;
+    char     name[STM_LP9_NAME_MAX + 1];
+    uint16_t name_len;
+    uint8_t  type;
+} descend_find_ctx;
+
+static stm_status descend_find_cb(const stm_9p_qid *qid, uint64_t cookie,
+                                       uint8_t type, const char *name,
+                                       size_t name_len, void *ctx)
+{
+    (void)qid; (void)cookie;
+    descend_find_ctx *fc = ctx;
+    /* Skip "." and "..". */
+    if ((name_len == 1 && name[0] == '.') ||
+        (name_len == 2 && name[0] == '.' && name[1] == '.')) {
+        return STM_OK;
+    }
+    if (fc->emitted == fc->target_idx) {
+        if (name_len > STM_LP9_NAME_MAX) name_len = STM_LP9_NAME_MAX;
+        memcpy(fc->name, name, name_len);
+        fc->name[name_len] = '\0';
+        fc->name_len = (uint16_t)name_len;
+        fc->type = type;
+        fc->found = true;
+        /* Stop iteration via R111 P2 F-3 sentinel. */
+        return STM_ENOTSUPPORTED;
+    }
+    fc->emitted++;
+    return STM_OK;
+}
+
+/* Build the post-descent cwd path. cwd is the current panel cwd
+ * (NUL-terminated, length cwd_len). entry is the entry name. Result
+ * lands in `out` (caller's buffer of size out_cap). Returns STM_OK
+ * on success (with `*out_len` set to the result length excluding
+ * NUL), STM_ERANGE if out is too small. */
+static stm_status build_descended_path(const char *cwd, size_t cwd_len,
+                                            const char *entry, size_t entry_len,
+                                            char *out, size_t out_cap,
+                                            size_t *out_len)
+{
+    /* Cases:
+     *   cwd = "/"      → out = "/" + entry
+     *   cwd = "/a/b/c" → out = cwd + "/" + entry
+     */
+    int n;
+    if (cwd_len == 1 && cwd[0] == '/') {
+        n = snprintf(out, out_cap, "/%.*s",
+                        (int)entry_len, entry);
+    } else {
+        n = snprintf(out, out_cap, "%.*s/%.*s",
+                        (int)cwd_len, cwd,
+                        (int)entry_len, entry);
+    }
+    if (n < 0 || (size_t)n >= out_cap) return STM_ERANGE;
+    *out_len = (size_t)n;
+    return STM_OK;
+}
+
+static stm_status descend_panel(stm_slate *s, int panel_idx)
+{
+    /* Snapshot cwd + cursor under s->mu. */
+    char cwd[STM_SLATE_PATH_MAX + 1];
+    size_t cwd_len;
+    uint32_t cursor;
+    pthread_mutex_lock(&s->mu);
+    if (!s->connected) {
+        pthread_mutex_unlock(&s->mu);
+        return STM_EBACKEND;  /* not connected — descend has no target */
+    }
+    cwd_len = s->panel[panel_idx].path_len;
+    if (cwd_len == 0u || cwd_len > STM_SLATE_PATH_MAX) {
+        pthread_mutex_unlock(&s->mu);
+        return STM_ERANGE;
+    }
+    memcpy(cwd, s->panel[panel_idx].path, cwd_len);
+    cwd[cwd_len] = '\0';
+    cursor = s->panel[panel_idx].cursor;
+    pthread_mutex_unlock(&s->mu);
+
+    /* Take backend_mu and snapshot the backend client. */
+    pthread_mutex_lock(&s->backend_mu);
+    pthread_mutex_lock(&s->mu);
+    stm_9p_client *bc = s->backend;
+    pthread_mutex_unlock(&s->mu);
+    if (!bc) {
+        pthread_mutex_unlock(&s->backend_mu);
+        return STM_EBACKEND;  /* not connected — descend has no target */
+    }
+
+    /* Walk to cwd, lopen for read, readdir until we find the
+     * cursor-th non-./.. entry. */
+    stm_status rc = walk_to_cwd(bc, cwd, SLATE_BACKEND_WORK_FID);
+    if (rc != STM_OK) {
+        pthread_mutex_unlock(&s->backend_mu);
+        return rc;
+    }
+    rc = stm_9p_lopen(bc, SLATE_BACKEND_WORK_FID,
+                         STM_9P_O_RDONLY | STM_9P_O_DIRECTORY,
+                         NULL, NULL);
+    if (rc != STM_OK) {
+        (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
+        pthread_mutex_unlock(&s->backend_mu);
+        return rc;
+    }
+
+    descend_find_ctx fc = { .target_idx = cursor, .emitted = 0,
+                              .found = false, .type = 0, .name_len = 0 };
+    uint64_t offset = 0;
+    while (1) {
+        uint32_t entries = 0;
+        uint64_t next_off = offset;
+        rc = stm_9p_readdir(bc, SLATE_BACKEND_WORK_FID,
+                               offset, 0u,
+                               descend_find_cb, &fc,
+                               &entries, &next_off);
+        if (rc == STM_ENOTSUPPORTED) { rc = STM_OK; break; }  /* found-stop */
+        if (rc != STM_OK) break;
+        if (entries == 0) break;        /* EOF */
+        if (next_off == offset) break;  /* defensive */
+        offset = next_off;
+        if (fc.found) break;
+    }
+    (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
+    if (rc != STM_OK) {
+        pthread_mutex_unlock(&s->backend_mu);
+        return rc;
+    }
+    if (!fc.found) {
+        /* Cursor out of range relative to current entries. */
+        pthread_mutex_unlock(&s->backend_mu);
+        return STM_EINVAL;
+    }
+    if (fc.type != 4u /* DT_DIR */) {
+        /* Not a directory — refuse descend. SLATE-3c will route
+         * non-dir Enter to a "view as file" handler. */
+        pthread_mutex_unlock(&s->backend_mu);
+        return STM_ENOTDIR;
+    }
+
+    /* Confirm the entry is actually a directory via Twalk + Tgetattr
+     * (defense against a stale dirent type bit). Walks from CWD_FID
+     * — but CWD_FID isn't bound here (panel_entries_render binds it,
+     * descend_panel doesn't). Use the per-walk-from-root pattern via
+     * walk_to_cwd into ENT_FID. */
+    {
+        char target_path[STM_SLATE_PATH_MAX + 1];
+        size_t target_path_len;
+        rc = build_descended_path(cwd, cwd_len, fc.name, fc.name_len,
+                                       target_path, sizeof target_path,
+                                       &target_path_len);
+        if (rc != STM_OK) {
+            pthread_mutex_unlock(&s->backend_mu);
+            return rc;
+        }
+        rc = walk_to_cwd(bc, target_path, SLATE_BACKEND_ENT_FID);
+        if (rc != STM_OK) {
+            pthread_mutex_unlock(&s->backend_mu);
+            return rc;
+        }
+        stm_9p_attr a;
+        memset(&a, 0, sizeof a);
+        rc = stm_9p_getattr(bc, SLATE_BACKEND_ENT_FID,
+                                STM_9P_GETATTR_MODE, &a);
+        (void)stm_9p_clunk(bc, SLATE_BACKEND_ENT_FID);
+        if (rc != STM_OK) {
+            pthread_mutex_unlock(&s->backend_mu);
+            return rc;
+        }
+        /* POSIX S_IFDIR = 0040000 in the high bits of mode. */
+        if ((a.mode & 0170000u) != 0040000u) {
+            pthread_mutex_unlock(&s->backend_mu);
+            return STM_ENOTDIR;
+        }
+
+        /* All checks passed — commit the new cwd under s->mu. Re-check
+         * connected (Disconnect could have raced; backend_mu prevents
+         * the backend ptr from changing, but s->connected can flip
+         * to false if Disconnect ran AFTER we checked above. Wait,
+         * Disconnect also takes backend_mu — so it's blocked behind us.
+         * Belt-and-suspenders re-check anyway.) */
+        pthread_mutex_lock(&s->mu);
+        if (!s->connected) {
+            pthread_mutex_unlock(&s->mu);
+            pthread_mutex_unlock(&s->backend_mu);
+            return STM_EBACKEND;  /* not connected — descend has no target */
+        }
+        memcpy(s->panel[panel_idx].path, target_path, target_path_len);
+        s->panel[panel_idx].path[target_path_len] = '\0';
+        s->panel[panel_idx].path_len = target_path_len;
+        s->panel[panel_idx].cursor = 0u;
+        s->version++;
+        pthread_cond_broadcast(&s->cv);
+        pthread_mutex_unlock(&s->mu);
+    }
+
+    pthread_mutex_unlock(&s->backend_mu);
     return STM_OK;
 }
 
@@ -1551,10 +1857,10 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         return STM_OK;
     }
     if (k == SLATE_KIND_PANEL_L_ACTION || k == SLATE_KIND_PANEL_R_ACTION) {
-        /* SLATE-3a: dispatch a panel action verb. v1 supports just
-         * "key Up" / "key Down" — the cursor adjustment primitives.
-         * Other verbs reserved for SLATE-3b+ (Enter for descend,
-         * F3 for view, mouse for click). Empty body refused. */
+        /* SLATE-3a/3b: dispatch a panel action verb via a static verb
+         * table (R104 P3-3+P3-4 doctrine + R116 P3-3 carry — table
+         * scales as SLATE-3c+ adds key F3 / mouse / etc.). Empty
+         * body refused. */
         if (len == 0) return STM_EINVAL;
         if (len > STM_SLATE_EVENT_LINE_MAX) return STM_EINVAL;
         size_t l = len;
@@ -1563,33 +1869,8 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         const char *p = (const char *)buf;
         int panel_idx = (k == SLATE_KIND_PANEL_L_ACTION) ? SLATE_PANEL_LEFT
                                                          : SLATE_PANEL_RIGHT;
-        bool handled = false;
-        bool moved = false;
-        pthread_mutex_lock(&s->mu);
-        if (l == 6u && memcmp(p, "key Up", 6u) == 0) {
-            handled = true;
-            if (s->panel[panel_idx].cursor > 0u) {
-                s->panel[panel_idx].cursor--;
-                moved = true;
-            }
-        } else if (l == 8u && memcmp(p, "key Down", 8u) == 0) {
-            handled = true;
-            if (s->panel[panel_idx].cursor < UINT32_MAX) {
-                s->panel[panel_idx].cursor++;
-                moved = true;
-            }
-        }
-        if (handled && moved) {
-            s->version++;
-            pthread_cond_broadcast(&s->cv);
-        }
-        pthread_mutex_unlock(&s->mu);
-        if (!handled) {
-            /* Unknown verb — return ENOSYS so renderers know the
-             * action wasn't dispatched. SLATE-3b+ will add more
-             * verbs. */
-            return STM_ENOTSUPPORTED;
-        }
+        stm_status verb_rc = action_dispatch_verb(s, panel_idx, p, l);
+        if (verb_rc != STM_OK) return verb_rc;
         *out_written = len;
         return STM_OK;
     }

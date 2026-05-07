@@ -849,6 +849,146 @@ STM_TEST(slate_socket_panel_action_key_down_via_wire)
     destroy_fixture(&f);
 }
 
+/* SLATE-3b: "key Enter" descends into a directory entry. Setup:
+ * slate-B is the backend; its root has a dir entry "log". Foreground
+ * F attaches to B, sets cursor to position the cursor on "log",
+ * fires "key Enter". F's panel.path must update to "/log" and cursor
+ * resets to 0.
+ *
+ * Identifying the cursor index of "log" in the rendered entries:
+ * slate-B's root readdir order is version (0), status (1), event (2),
+ * redraw (3), log (4 — DT_DIR), connection (5), panels (6). So
+ * cursor=4 lands on "log". */
+STM_TEST(slate_socket_action_key_enter_descends_into_dir)
+{
+    slate_backend_fixture be;
+    setup_backend_fixture(&be, "be_enter");
+
+    slate_fixture f;
+    setup_fixture(&f, "fg_enter");
+
+    stm_9p_client *c = NULL;
+    stm_9p_dial_opts opts = default_dial_opts(100u);
+    STM_ASSERT_OK(retry_dial(g_sock_path, &opts, &c));
+
+    /* Attach F to B. */
+    const char *anames[] = { "connection", "attach" };
+    stm_9p_qid aqids[2];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 101u, 2u, anames, aqids, &walked));
+    stm_9p_qid oqid;
+    uint32_t iounit = 0;
+    STM_ASSERT_OK(stm_9p_lopen(c, 101u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, 101u, 0u, be.sock_path,
+                                  (uint32_t)strlen(be.sock_path), &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 101u));
+
+    /* Set cursor=4 (positions on "log" — slate-B's only directory
+     * child of root). */
+    const char *cnames[] = { "panels", "left", "cursor" };
+    stm_9p_qid cqids[3];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 102u, 3u, cnames, cqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 102u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    STM_ASSERT_OK(stm_9p_write(c, 102u, 0u, "4", 1u, &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 102u));
+
+    /* Fire "key Enter". */
+    const char *acn[] = { "panels", "left", "action" };
+    stm_9p_qid acqids[3];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 103u, 3u, acn, acqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 103u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    STM_ASSERT_OK(stm_9p_write(c, 103u, 0u, "key Enter", 9u, &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 103u));
+
+    /* Read /panels/left/path — must be "/log\n". */
+    const char *pn[] = { "panels", "left", "path" };
+    stm_9p_qid pqids[3];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 104u, 3u, pn, pqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 104u, 0u, &oqid, &iounit));
+    char pbuf[32];
+    uint32_t pgot = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 104u, 0u, pbuf,
+                                  (uint32_t)(sizeof pbuf - 1u), &pgot));
+    pbuf[pgot] = '\0';
+    STM_ASSERT_EQ(strcmp(pbuf, "/log\n"), 0);
+    STM_ASSERT_OK(stm_9p_clunk(c, 104u));
+
+    /* Cursor must be 0 (reset by descend). */
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 105u, 3u, cnames, cqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 105u, 0u, &oqid, &iounit));
+    char cbuf[16];
+    uint32_t cgot = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 105u, 0u, cbuf,
+                                  (uint32_t)(sizeof cbuf), &cgot));
+    STM_ASSERT_EQ(cgot, 2u);
+    STM_ASSERT_EQ(cbuf[0], '0');
+    STM_ASSERT_EQ(cbuf[1], '\n');
+    STM_ASSERT_OK(stm_9p_clunk(c, 105u));
+
+    /* /panels/left/entries from /log on B should now list its 2
+     * children ("tail", "append"). Verify the structural invariant
+     * (R115 P1-1 line-format check) holds. */
+    const char *en[] = { "panels", "left", "entries" };
+    stm_9p_qid enqids[3];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 106u, 3u, en, enqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 106u, 0u, &oqid, &iounit));
+    char ebuf[1024];
+    uint32_t egot = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 106u, 0u, ebuf,
+                                  (uint32_t)(sizeof ebuf - 1u), &egot));
+    ebuf[egot] = '\0';
+    STM_ASSERT(strstr(ebuf, " tail\n")   != NULL);
+    STM_ASSERT(strstr(ebuf, " append\n") != NULL);
+    STM_ASSERT_OK(stm_9p_clunk(c, 106u));
+
+    stm_9p_close(c);
+    destroy_fixture(&f);
+    destroy_backend_fixture(&be);
+}
+
+/* "key Enter" on a non-dir entry returns STM_ENOTDIR over the wire
+ * (lib maps to STM_EBACKEND for unknown ecodes; either is acceptable
+ * — verify it's NOT OK). cursor=0 lands on "version" which is a file.  */
+STM_TEST(slate_socket_action_key_enter_on_file_refuses)
+{
+    slate_backend_fixture be;
+    setup_backend_fixture(&be, "be_efile");
+
+    slate_fixture f;
+    setup_fixture(&f, "fg_efile");
+
+    stm_9p_client *c = NULL;
+    stm_9p_dial_opts opts = default_dial_opts(100u);
+    STM_ASSERT_OK(retry_dial(g_sock_path, &opts, &c));
+
+    /* Attach. */
+    const char *anames[] = { "connection", "attach" };
+    stm_9p_qid aqids[2];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 101u, 2u, anames, aqids, &walked));
+    stm_9p_qid oqid;
+    uint32_t iounit = 0;
+    STM_ASSERT_OK(stm_9p_lopen(c, 101u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, 101u, 0u, be.sock_path,
+                                  (uint32_t)strlen(be.sock_path), &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 101u));
+
+    /* cursor=0 lands on "version" (a regular file). */
+    const char *acn[] = { "panels", "left", "action" };
+    stm_9p_qid acqids[3];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 102u, 3u, acn, acqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 102u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    stm_status rc = stm_9p_write(c, 102u, 0u, "key Enter", 9u, &written);
+    STM_ASSERT(rc != STM_OK);  /* non-dir → refused */
+    STM_ASSERT_OK(stm_9p_clunk(c, 102u));
+
+    stm_9p_close(c);
+    destroy_fixture(&f);
+    destroy_backend_fixture(&be);
+}
+
 /* /event refuses zero-byte writes (parity with stm_slate_submit_event). */
 STM_TEST(slate_socket_event_zero_byte_einval)
 {

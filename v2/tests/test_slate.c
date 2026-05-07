@@ -847,10 +847,15 @@ STM_TEST(slate_panel_action_unknown_verb_enotsup)
     uint64_t aqp = ((uint64_t)20) << 56;
     STM_ASSERT_OK(v->lopen(s, /*fid=*/77u, aqp, STM_LP9_O_WRONLY));
     uint32_t written = 0;
+    /* SLATE-3b: "key Enter" is now a known verb (descend); when not
+     * connected it returns STM_EBACKEND (can't descend without a
+     * backend). Genuinely unknown verbs still return STM_ENOTSUPPORTED. */
     STM_ASSERT_EQ(v->write(s, 77u, aqp, 0u, "key Enter", 9u, &written),
-                     STM_ENOTSUPPORTED);
+                     STM_EBACKEND);
     STM_ASSERT_EQ(v->write(s, 77u, aqp, 0u, "noop", 4u, &written),
                      STM_ENOTSUPPORTED);
+    STM_ASSERT_EQ(v->write(s, 77u, aqp, 0u, "key F3", 6u, &written),
+                     STM_ENOTSUPPORTED);  /* F3 reserved for SLATE-3c */
     /* Empty body refused. */
     STM_ASSERT_EQ(v->write(s, 77u, aqp, 0u, "", 0u, &written), STM_EINVAL);
     v->clunk(s, 77u, aqp);
