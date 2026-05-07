@@ -20,10 +20,22 @@ target_link_libraries(stm_stratumd
 find_package(Threads REQUIRED)
 target_link_libraries(stm_stratumd PUBLIC Threads::Threads)
 
-# Daemon binary.
+# Run-main lib: argv-driven CLI lifecycle. Factored out of main.c so the
+# swiss-army `stratum` Rust binary can FFI-dispatch into it.
+add_library(stm_cmd_stratumd STATIC
+    run.c)
+
+target_include_directories(stm_cmd_stratumd PUBLIC
+    ${CMAKE_SOURCE_DIR}/include)
+
+target_link_libraries(stm_cmd_stratumd
+    PRIVATE stm_warnings stm_sanitize stm_coverage
+    PUBLIC  stm_stratumd stratum)
+
+# Daemon binary — thin main.c wrapper.
 add_executable(stratumd
     main.c)
 
 target_link_libraries(stratumd
     PRIVATE stm_warnings stm_sanitize stm_coverage
-            stm_stratumd stratum)
+            stm_cmd_stratumd)

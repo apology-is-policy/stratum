@@ -316,3 +316,262 @@ that matter:
 - `DialogStackLIFO` — only the top dialog accepts results.
 - `EventFIFO` — events processed in arrival order.
 - `ReadConsistent` — the V0=V1 retry pattern is sound.
+
+## 12. Swiss-army monolith — `stratum` as a portable single binary
+
+Stratum's deployment shape converges on a single statically-linked
+binary, `stratum`, that bundles every cmd-line tool and the slate
+TUI into one executable. macOS and Linux are the targets.
+Veracrypt-shaped UX: drop the binary on any machine, double-click,
+browse + manage your stratum volumes — no shared libraries, no
+service installs, no PATH wiring.
+
+This is the deployment shape the v1 monolith already had (it could
+mount host FS via 9P wrapper, create encrypted .stm volume files,
+copy in/out, manage snapshots). Stratum v2 vastly extends what one
+binary can do — every subsystem we built since v1 (snapshots,
+scrub, integrity verify, send/recv, key rotation, debug
+introspection) is reachable from inside the same chrome.
+
+Critically, the synfs contract (slate's 9P tree) stays as the IPC.
+Even when stratumd + slate run as threads inside the same process,
+slate's tree is still the source of truth. Halcyon (Thylacine's
+graphical shell) and any external 9P consumer can subscribe to it
+without changing — they connect to the same Unix socket the
+embedded slate exposes.
+
+### 12.1 Binary surface
+
+```
+stratum                     no-arg landing screen (Veracrypt-shaped)
+stratum tui [--vol PATH]    interactive TUI (auto-spawns daemons
+                            in-process if --vol is given; otherwise
+                            connects to a running slate)
+stratum serve VOLUME        run as stratumd (long-lived FS daemon)
+stratum slate               run as slate (long-lived UI-state daemon)
+stratum mkfs IMAGE          create a new .stm volume
+stratum fs CMD ARGS         9P client CLI (ls, stat, read, write, ...)
+stratum send / recv         volume snapshot stream (forward-noted)
+stratum scrub VOLUME        one-shot integrity scan (forward-noted)
+stratum verify VOLUME       Merkle-chain verify (forward-noted)
+stratum keyrotate ...       PQ-hybrid key rotation (forward-noted)
+```
+
+Subcommands `serve`, `slate`, `mkfs`, `fs` are direct ports of today's
+standalone C binaries — same flags, same semantics, same exit codes.
+A user with shell muscle memory for `stratumd /tmp/x.stm --listen ...`
+types `stratum serve /tmp/x.stm --listen ...` instead.
+
+### 12.2 Embedded-mode `tui`
+
+The default no-fuss workflow is:
+
+```
+stratum mkfs /tmp/demo.stm --size 64M
+stratum tui --vol /tmp/demo.stm
+```
+
+`stratum tui --vol PATH` does not require the user to start daemons.
+Internally it:
+
+1. Opens the volume's keyfile (default `<PATH>.key`).
+2. Spawns `stm_stratumd_run_main(...)` on a JOINABLE pthread bound
+   to a per-process Unix socket (e.g., `$XDG_RUNTIME_DIR/stratum/<pid>/stratumd.sock`).
+3. Spawns `stm_slate_run_main(...)` on a second pthread bound to a
+   per-process slate socket.
+4. Dials slate, writes the stratumd socket path to `/connection/attach`.
+5. Runs the renderer in the foreground.
+6. On TUI exit, sets stop flags + joins both daemon pthreads cleanly
+   (R114 P2-1 doctrine carry — daemons drain their own worker pools).
+
+The slate socket is exposed at a discoverable path so external 9P
+clients (Halcyon, scripts, Claude) can attach concurrently — the
+embedded mode does NOT lock the user out of the synfs.
+
+### 12.3 Landing screen (no-arg invocation)
+
+`stratum` (no subcommand) shows a Veracrypt-shaped chooser:
+
+```
+              ╔═══════════════════════════════════════════╗
+              ║              Stratum v2.0                 ║
+              ║   PQ-encrypted COW filesystem, portable   ║
+              ╠═══════════════════════════════════════════╣
+              ║                                           ║
+              ║  [O] Open volume...                       ║
+              ║  [N] New volume...                        ║
+              ║  [H] Browse host filesystem               ║
+              ║                                           ║
+              ║  Recent volumes:                          ║
+              ║    ~/work/projects.stm                    ║
+              ║    /Volumes/External/backup.stm           ║
+              ║                                           ║
+              ║  [F1] Help    [F10] Quit                  ║
+              ╚═══════════════════════════════════════════╝
+```
+
+Selecting a volume runs the moral equivalent of `stratum tui --vol PATH`.
+"Browse host filesystem" attaches to a host-FS-as-9P shim (see §12.6).
+Recent volumes persist in a tiny config file under `~/.config/stratum/`.
+
+### 12.4 Capability matrix
+
+The TUI is organised around panes the user can switch between via
+F-keys (FAR-Commander idiom). Every pane reads slate's synfs;
+every action writes a slate verb that flows through the same
+mu-guarded dispatch. Below: pane → operations.
+
+| Pane | Operations |
+|---|---|
+| **Volume map** (F2)     | donut of used/free split by tier and dataset; snapshot timeline; integrity bar (last-scrub time + error count); compression / dedup ratio gauges. |
+| **Browse** (F3, default) | dual-pane navigate (left/right, focus toggle); host↔stratum copy with progress + conflict resolution; mkdir / mkfile / chmod / chown / xattr edit; view (cat) / edit (modal) / hex-view; hardlink / symlink / reflink (cross-volume reflink when target is also stratum). |
+| **Snapshots** (F4)      | list with creation-time + hold-count + send-mark; create (named or auto-tagged); delete; hold / release; rollback (with double-confirm); diff between two snaps; mount snap read-only as ghost-pane. |
+| **Integrity** (F5)      | scrub start/stop + live throughput + error count; Merkle-chain verify (full / spot); bad-block report with affected files; format check + UB-version probe; recover-from-torn-write. |
+| **Encryption** (F6)     | view key state (gen / slot count); add / remove keyslots; rotate master key (gen N → N+1); lock / unlock with passphrase; show wrap algorithm (PQ vs classical fallback); per-extent AEAD details. |
+| **Inspect** (F7, admin) | /debug/allocator-state map; btree shape (per-level); extent map (per-file); per-tier stats; 9P wire trace; audit-log browser. |
+| **Metrics** (F8)        | live IOPS / cache-hit / compression / dedup gauges; per-dataset usage donut. |
+| **Volume admin** (F9)   | create / open with passphrase / open with keyfile / open with janus-daemon; resize; convert (compression / dedup); send-stream / receive-stream; close. |
+
+`F10` quits. `Tab` / `Shift+Tab` switches focused pane within the
+current view. `Esc` returns to volume map (F2).
+
+### 12.5 Visualizations
+
+The six screens below are the "make Stratum legible" set — they
+turn novel-angle features (Merkle root, content-defined extents,
+three-phase sync, PQ-wrap) into things the user can watch.
+
+1. **Volume map** (F2). Single screen. Donut: used vs free by tier
+   (hot / cold) and by dataset. Bar: compression / dedup ratios.
+   Snapshot timeline (horizontal): created → now, deletion markers.
+   Integrity bar: scrub progress, last-verified time, error count.
+   This is the README screenshot.
+
+2. **Snapshot graph** (F4). Tree showing lineage (root → snap A → snap
+   B → branch C). Held / send-marked annotations. Hover or focus
+   shows that snapshot's stat block. Rollback target is marked.
+   Sells "snapshots branch like git."
+
+3. **Extent map per file** (F7 sub-view, opened on a file from F3).
+   Strip showing each extent — color-coded for dedup hit / unique /
+   cold-tier / encrypted / compressed (each with a glyph). Hover
+   shows extent metadata: paddr, write_gen, MAC. Sells **content-
+   defined extents** — identical bytes in two files visibly share
+   the same color block.
+
+4. **Sync phases live** (F8 sub-view). Three-phase sync (G+1
+   reservation → flush at G → G+2 final) as a horizontal three-
+   segment progress bar. Last 10 syncs as a strip. Current phase
+   pulses. Sells **provable crash-safety** — you watch the protocol
+   execute in real time.
+
+5. **Btree shape** (F7 sub-view). Each level horizontally; nodes
+   colored by recent-access heat. Cursor highlight: "the inode
+   you're inspecting lives in this node." Fanout numbers per level.
+   Sells **Bε-tree's lock-free metadata path**.
+
+6. **9P wire trace** (F7 sub-view). Live, scrolling. Every Tversion
+   / Tattach / Twalk / Tlopen / Tread / Twrite with timing. The
+   synfs is THE story; making the wire visible makes Plan-9 design
+   choices feel concrete.
+
+### 12.6 Host FS as 9P shim
+
+For host↔stratum copy in F3, the binary needs to read host paths.
+v1 did this via a bespoke 9P wrapper that fronted POSIX paths as a
+9P tree. v2 inherits the same idea: a `stratum host-fs <path>` mode
+exports a host directory tree as 9P on a per-process socket, and
+the TUI attaches a second slate panel to that socket. The host pane
+is read-only at v2.0 (paranoid default — the user doesn't want the
+TUI accidentally rm-rfing their home directory); writes are forward-
+noted.
+
+### 12.7 Architecture: one binary, three deployment modes
+
+```
+                  ┌────────────────── stratum (single binary) ───────────────┐
+                  │                                                          │
+                  │   tui mode (default w/ --vol):                           │
+                  │     ┌─────────────┐    ┌──────────────┐    ┌──────────┐  │
+                  │     │ pthread:    │◀──▶│ pthread:     │◀──▶│ main:    │  │
+                  │     │ stratumd    │    │ slate state  │    │ TUI loop │  │
+                  │     │             │    │   (synfs)    │    │          │  │
+                  │     └─────────────┘    └──────────────┘    └──────────┘  │
+                  │            ▲                  ▲                           │
+                  │            │ unix sock        │ unix sock                 │
+                  │            │                  │                           │
+                  │   external 9P clients (Halcyon, scripts) ─────────────────┼─▶
+                  │                                                          │
+                  │   serve / slate / mkfs / fs subcommands:                 │
+                  │     dispatch to stm_<name>_run_main(argc, argv)          │
+                  │     — same code path as standalone daemons               │
+                  └──────────────────────────────────────────────────────────┘
+```
+
+Three deployment modes the same binary supports:
+
+- **Personal**: `stratum tui --vol foo.stm` — daemons embedded as
+  pthreads. Good for desktop / laptop use, single user, single
+  volume at a time.
+- **Operator**: `stratum serve foo.stm --listen /var/run/stratum.sock` +
+  `stratum slate --listen /var/run/slate.sock` + `stratum tui` (or
+  Halcyon) — daemons run as separate processes, possibly on
+  different hosts. Good for servers, NAS, multi-user.
+- **Headless**: `stratum send src.stm | ssh dest stratum recv` —
+  one-shot subcommands. No TUI, no slate. Good for backups, CI.
+
+### 12.8 Build approach (SWISS-1 chunk)
+
+1. Refactor each cmd binary's `main()` into a public C entry point
+   `stm_<name>_run_main(int argc, char **argv)` with the existing
+   `main()` as a thin wrapper. Touched files:
+   `v2/src/cmd/stratumd/main.c`, `v2/src/cmd/stratum-slate/main.c`,
+   `v2/src/cmd/stratum-mkfs/main.c`, `v2/src/cmd/stratum-fs/main.c`.
+2. Expose the entry points in a new header `v2/include/stratum/cmds.h`.
+3. New Rust crate `v2/tools/stratum/`. `build.rs` enumerates every
+   `.a` file under `v2/build/src/**/lib*.a` and emits link directives.
+4. `src/main.rs` dispatches subcommands. For `serve` / `slate` / `mkfs` /
+   `fs`, FFI-call the C entry points. For `tui`, run the renderer
+   in pure Rust.
+5. `src/embed.rs` — auto-spawn mode: pthread-spawn stratumd + slate,
+   wait for sockets, dial, attach, run TUI; clean teardown on exit.
+6. `src/landing.rs` — Veracrypt-shaped no-arg landing screen.
+7. Lift the FAR-Commander chrome from `v2/tools/stratum-slate-tty/`.
+8. Verify end-to-end on Mac (Linux deferred to chunk N if it
+   regresses on the platform-specific bits — but no portability
+   concerns are anticipated).
+
+`v2/tools/stratum-slate-tty/` becomes redundant once `stratum tui`
+ships with the same chrome; keep it in tree until SWISS-1 is GREEN,
+then archive or delete.
+
+### 12.9 Subsequent chunks
+
+- **SWISS-2**: Volume map (F2) — first visualization screen. Read /ctl/
+  + /pools/<uuid>/metrics/prometheus through the embedded stratumd's
+  /ctl/ socket; render donut + snapshot timeline + integrity bar.
+- **SWISS-3**: Snapshot graph (F4). Composes against /ctl/-on-stratumd's
+  snapshot ops (already shipped at P9-CTL-1d-actions-snapshot-*).
+- **SWISS-4**: Browse pane (F3) substantive — host↔stratum copy with
+  progress dialog (lift from v1's copy_dialog).
+- **SWISS-5**: Integrity pane (F5) — scrub start/stop + live progress.
+  Composes against /ctl/-on-stratumd's scrub ops.
+- **SWISS-6**: Encryption pane (F6) — composes against keyrotate work
+  (forward-noted at the libfs level).
+- **SWISS-7**: Inspect (F7) — /debug/ subtree exposes allocator-state /
+  btree-shape / extent-map (some forward-noted at /ctl/).
+- **SWISS-8**: Metrics gauges (F8) — Prometheus exposition consumer.
+- **SWISS-9**: Volume admin (F9) — create/open/close/resize verbs.
+
+Each chunk is fat: schema design + slate-side surface (if needed)
++ Rust visualization + e2e test + audit. Per user policy 2026-05-07,
+no formal model for slate-side work.
+
+### 12.10 Naming and branding
+
+The single binary is `stratum`. The umbrella library that already
+aggregates everything (`add_library(stratum INTERFACE)` in
+`v2/CMakeLists.txt`) gives the binary its name. The user-facing
+brand: "Stratum is the filesystem you can see — every COW, every
+snapshot, every byte of ciphertext, every Merkle root, made
+legible." The visualizations (§12.5) are the proof.

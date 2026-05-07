@@ -1,0 +1,166 @@
+//! Stratum swiss-army monolith — single statically-linked binary that
+//! bundles every cmd-line tool (stratumd, stratum-slate, stratum-mkfs,
+//! stratum-fs) plus the FAR-Commander TUI into one executable.
+//!
+//! Subcommand dispatch:
+//!
+//!   stratum                   landing screen (Veracrypt-shaped)
+//!   stratum tui               TUI; requires --slate-sock OR --vol
+//!   stratum tui --vol PATH    auto-spawn daemons + run TUI
+//!   stratum serve VOLUME ...  same code path as the standalone
+//!                              `stratumd` binary (FFI)
+//!   stratum slate ...         same code path as `stratum-slate` (FFI)
+//!   stratum mkfs IMAGE ...    same code path as `stratum-mkfs` (FFI)
+//!   stratum fs CMD ARGS ...   same code path as `stratum-fs` (FFI)
+//!
+//! For the FFI subcommands, argv is reconstructed so that the C-side
+//! tool's usage messages still print under the original tool name
+//! (e.g., `stratum serve` with no args prints "Usage: stratumd ...").
+//! This is intentional — the C tools' error messages are the source
+//! of truth for their flags; rebranding would diverge the docs.
+
+use anyhow::{bail, Context, Result};
+use std::ffi::CString;
+use std::os::raw::{c_char, c_int};
+use std::path::PathBuf;
+
+mod embed;
+mod ffi;
+mod landing;
+mod slate;
+mod tui;
+mod ui;
+
+fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let exit_code = dispatch(args)?;
+    std::process::exit(exit_code);
+}
+
+fn dispatch(args: Vec<String>) -> Result<i32> {
+    if args.len() < 2 {
+        landing::run()?;
+        return Ok(0);
+    }
+
+    let sub = args[1].as_str();
+    match sub {
+        "-h" | "--help" | "help" => {
+            print_root_usage();
+            Ok(0)
+        }
+        "tui" => tui_dispatch(&args[2..]),
+        "serve" => Ok(ffi_dispatch("stratumd", &args[2..], ffi::stm_cmd_stratumd_main)),
+        "slate" => Ok(ffi_dispatch("stratum-slate", &args[2..], ffi::stm_cmd_slate_main)),
+        "mkfs" => Ok(ffi_dispatch("stratum-mkfs", &args[2..], ffi::stm_cmd_mkfs_main)),
+        "fs" => Ok(ffi_dispatch("stratum-fs", &args[2..], ffi::stm_cmd_fs_main)),
+        other => {
+            bail!("stratum: unknown subcommand: {other}\n(see `stratum --help`)");
+        }
+    }
+}
+
+fn print_root_usage() {
+    println!(
+        "Usage: stratum [SUBCOMMAND [ARGS...]]\n\n\
+         Subcommands:\n\
+           (no args)        Veracrypt-shaped landing screen.\n\
+           tui [OPTS]       Run the FAR-Commander TUI.\n\
+                            --slate-sock PATH   connect to a running slate.\n\
+                            --attach STRATUMD   attach a stratumd to slate.\n\
+                            --vol VOLUME        auto-spawn daemons.\n\
+                            --keyfile PATH      override keyfile path.\n\
+                            --print-env-to FILE write socket paths.\n\
+                            --headless          spawn daemons but skip\n\
+                                                the TUI; sleeps until\n\
+                                                SIGTERM. Useful for\n\
+                                                external 9P clients.\n\
+           serve VOLUME...  Run as stratumd. Same flags as standalone.\n\
+           slate ARGS...    Run as the slate UI-state daemon.\n\
+           mkfs IMAGE...    Create a new .stm volume.\n\
+           fs CMD ARGS...   9P client CLI.\n\n\
+         For per-subcommand help: `stratum <subcommand> -h`.\n\n\
+         See v2/docs/SLATE-DESIGN.md §12 for the design rationale.\n"
+    );
+}
+
+type CmdMain = unsafe extern "C" fn(c_int, *const *const c_char) -> c_int;
+
+/// Translate Rust args into a C-style argv (with `argv0` as argv[0])
+/// and call the FFI entry point. The cstrs Vec keeps the CString
+/// backing memory alive for the duration of the call.
+fn ffi_dispatch(argv0: &str, args: &[String], cmd_main: CmdMain) -> i32 {
+    let mut full = Vec::with_capacity(args.len() + 1);
+    full.push(argv0.to_string());
+    for a in args {
+        full.push(a.clone());
+    }
+    let cstrs: Vec<CString> = full
+        .iter()
+        .map(|s| CString::new(s.clone()).expect("argv contains NUL"))
+        .collect();
+    let argv: Vec<*const c_char> = cstrs.iter().map(|s| s.as_ptr()).collect();
+    unsafe { cmd_main(argv.len() as c_int, argv.as_ptr()) }
+}
+
+fn tui_dispatch(args: &[String]) -> Result<i32> {
+    let mut slate_sock: Option<PathBuf> = None;
+    let mut attach: Option<PathBuf> = None;
+    let mut vol: Option<PathBuf> = None;
+    let mut keyfile: Option<PathBuf> = None;
+    let mut print_env_to: Option<PathBuf> = None;
+    let mut headless = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        match a {
+            "-h" | "--help" => {
+                print_root_usage();
+                return Ok(0);
+            }
+            "--slate-sock" | "-s" => {
+                i += 1;
+                slate_sock = Some(PathBuf::from(args.get(i).context("--slate-sock requires a value")?));
+            }
+            "--attach" | "-a" => {
+                i += 1;
+                attach = Some(PathBuf::from(args.get(i).context("--attach requires a value")?));
+            }
+            "--vol" | "-v" => {
+                i += 1;
+                vol = Some(PathBuf::from(args.get(i).context("--vol requires a value")?));
+            }
+            "--keyfile" | "-k" => {
+                i += 1;
+                keyfile = Some(PathBuf::from(args.get(i).context("--keyfile requires a value")?));
+            }
+            "--print-env-to" => {
+                i += 1;
+                print_env_to = Some(PathBuf::from(args.get(i).context("--print-env-to requires a value")?));
+            }
+            "--headless" => {
+                headless = true;
+            }
+            other => bail!("stratum tui: unknown argument: {other}"),
+        }
+        i += 1;
+    }
+
+    if let Some(volume) = vol {
+        embed::run(embed::EmbedOpts {
+            volume,
+            keyfile,
+            print_env_to,
+            headless,
+        })?;
+        return Ok(0);
+    }
+    if headless {
+        bail!("--headless requires --vol (only meaningful in embedded mode)");
+    }
+
+    let slate_sock = slate_sock.unwrap_or_else(|| PathBuf::from("/tmp/stratum-slate.sock"));
+    tui::run(tui::Opts { slate_sock, attach })?;
+    Ok(0)
+}

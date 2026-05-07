@@ -1,0 +1,263 @@
+/* SPDX-License-Identifier: ISC */
+/*
+ * stratum-mkfs — create a fresh stratum volume image (v2).
+ *
+ * Wraps stm_fs_format + initial dataset-root setup so users can
+ * `stratum-mkfs vol.stm` and immediately point stratumd at it.
+ *
+ * Default behaviour:
+ *   - 64 MiB device size, 16 MiB bootstrap pool.
+ *   - Generates a fresh PQ-hybrid keyfile at <image>.key (override
+ *     via --keyfile PATH).
+ *   - Initialises dataset id=1 with a single root inode (mode 0755,
+ *     uid/gid 0). stratumd's --root-dataset defaults to 1, so the
+ *     resulting image is ready to serve.
+ *
+ * Volume identity: pool/device UUIDs derived from the current time +
+ * pid. Good enough for v1.0; cryptographic random UUIDs are a
+ * forward-note for v1.1.
+ *
+ * Usage:
+ *   stratum-mkfs IMAGE [--size SIZE] [--keyfile PATH]
+ *
+ *   --size SIZE     Image size; suffix K/M/G accepted.
+ *                   Default: 64M.
+ *   --keyfile PATH  Path to write the PQ-hybrid keyfile (or use an
+ *                   existing one if PATH already exists). Default:
+ *                   <IMAGE>.key.
+ *
+ * Exit codes:
+ *   0  success
+ *   1  usage error
+ *   2  format failed
+ */
+#include <stratum/cmds.h>
+#include <stratum/fs.h>
+#include <stratum/keyfile.h>
+#include <stratum/types.h>
+
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <time.h>
+#include <unistd.h>
+
+/* Default sizes — matches test scaffold defaults scaled up so a fresh
+ * image has comfortable headroom for browsing. */
+#define DEFAULT_DEVICE_BYTES     (UINT64_C(64) * 1024 * 1024)   /* 64 MiB */
+#define DEFAULT_BOOTSTRAP_BYTES  (UINT64_C(16) * 1024 * 1024)   /* 16 MiB */
+#define MIN_DEVICE_BYTES         (UINT64_C(16) * 1024 * 1024)   /* lower bound — bootstrap won't fit smaller */
+
+static void usage(void)
+{
+    fputs(
+"usage: stratum-mkfs IMAGE [options]\n"
+"\n"
+"Creates a fresh stratum volume image with one initial dataset (id=1).\n"
+"After mkfs, point stratumd at it:\n"
+"\n"
+"    stratumd IMAGE --listen unix:/tmp/stm.sock\n"
+"\n"
+"Options:\n"
+"  --size SIZE      Image size with K/M/G suffix. Default: 64M.\n"
+"  --keyfile PATH   Path to read/write the PQ-hybrid keyfile.\n"
+"                   If file exists, it's used as-is. If missing, one is\n"
+"                   generated. Default: IMAGE.key.\n"
+"  --bootstrap SIZE Bootstrap pool size. Default: 16M (auto-scaled to\n"
+"                   max(64MiB, device/1024) by libfs if 0).\n"
+"  -h, --help       Print this help.\n",
+        stderr);
+}
+
+/* Parse a size like "64M", "1G", "512K", "1048576". Returns 0 on
+ * failure. */
+static uint64_t parse_size(const char *s)
+{
+    if (!s || !*s) return 0;
+    char *end = NULL;
+    unsigned long long v = strtoull(s, &end, 10);
+    if (!end || end == s || v == 0) return 0;
+    /* Allow trailing K/M/G (case-insensitive). */
+    if (*end == 'K' || *end == 'k') { v *= 1024ULL;                end++; }
+    else if (*end == 'M' || *end == 'm') { v *= 1024ULL * 1024ULL; end++; }
+    else if (*end == 'G' || *end == 'g') { v *= 1024ULL * 1024ULL * 1024ULL; end++; }
+    if (*end != '\0') return 0;
+    return (uint64_t)v;
+}
+
+/* Derive a 128-bit UUID-shape value from current time + pid. Not
+ * cryptographically random; "unique enough" for early v2. */
+static void derive_uuid(uint64_t out[2], uint64_t salt)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    uint64_t pid = (uint64_t)getpid();
+    out[0] = ((uint64_t)ts.tv_sec << 32)
+           ^ ((uint64_t)ts.tv_nsec)
+           ^ (pid << 16)
+           ^ salt;
+    out[1] = ((uint64_t)ts.tv_nsec * 0x9e3779b97f4a7c15ULL)
+           ^ (pid * 0x100000001b3ULL)
+           ^ ~salt;
+}
+
+int stm_cmd_mkfs_main(int argc, char **argv)
+{
+    if (argc < 2) { usage(); return 1; }
+    if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
+        usage();
+        return 0;
+    }
+
+    const char *image_path = argv[1];
+    uint64_t   device_bytes   = DEFAULT_DEVICE_BYTES;
+    uint64_t   bootstrap_bytes = DEFAULT_BOOTSTRAP_BYTES;
+    const char *keyfile_path  = NULL;
+
+    /* Parse remaining flags. */
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--size") == 0) {
+            if (i + 1 >= argc) { fputs("--size requires an argument\n", stderr); return 1; }
+            uint64_t v = parse_size(argv[i + 1]);
+            if (v == 0) {
+                fprintf(stderr, "stratum-mkfs: bad --size: %s\n", argv[i + 1]);
+                return 1;
+            }
+            device_bytes = v;
+            i++;
+        } else if (strcmp(argv[i], "--bootstrap") == 0) {
+            if (i + 1 >= argc) { fputs("--bootstrap requires an argument\n", stderr); return 1; }
+            uint64_t v = parse_size(argv[i + 1]);
+            if (v == 0) {
+                fprintf(stderr, "stratum-mkfs: bad --bootstrap: %s\n", argv[i + 1]);
+                return 1;
+            }
+            bootstrap_bytes = v;
+            i++;
+        } else if (strcmp(argv[i], "--keyfile") == 0) {
+            if (i + 1 >= argc) { fputs("--keyfile requires an argument\n", stderr); return 1; }
+            keyfile_path = argv[i + 1];
+            i++;
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            usage();
+            return 0;
+        } else {
+            fprintf(stderr, "stratum-mkfs: unknown argument: %s\n", argv[i]);
+            usage();
+            return 1;
+        }
+    }
+
+    if (device_bytes < MIN_DEVICE_BYTES) {
+        fprintf(stderr,
+            "stratum-mkfs: --size %llu too small (minimum 16M to fit bootstrap pool)\n",
+            (unsigned long long)device_bytes);
+        return 1;
+    }
+    if (bootstrap_bytes >= device_bytes) {
+        fprintf(stderr,
+            "stratum-mkfs: --bootstrap %llu must be < --size %llu\n",
+            (unsigned long long)bootstrap_bytes,
+            (unsigned long long)device_bytes);
+        return 1;
+    }
+
+    /* Default keyfile path is <image>.key. */
+    char default_key_path[1024];
+    if (!keyfile_path) {
+        int n = snprintf(default_key_path, sizeof default_key_path,
+                          "%s.key", image_path);
+        if (n < 0 || (size_t)n >= sizeof default_key_path) {
+            fputs("stratum-mkfs: image path too long for default keyfile\n", stderr);
+            return 1;
+        }
+        keyfile_path = default_key_path;
+    }
+
+    /* Generate keyfile if missing. */
+    struct stat st;
+    if (stat(keyfile_path, &st) != 0) {
+        if (errno != ENOENT) {
+            fprintf(stderr, "stratum-mkfs: cannot stat keyfile %s: %s\n",
+                    keyfile_path, strerror(errno));
+            return 1;
+        }
+        stm_status rc = stm_keyfile_generate(keyfile_path);
+        if (rc != STM_OK) {
+            fprintf(stderr, "stratum-mkfs: stm_keyfile_generate(%s) failed: status=%d\n",
+                    keyfile_path, (int)rc);
+            return 2;
+        }
+        fprintf(stderr, "generated keyfile: %s\n", keyfile_path);
+    } else {
+        fprintf(stderr, "using existing keyfile: %s\n", keyfile_path);
+    }
+
+    /* Derive distinct UUIDs for pool + device with different salts. */
+    uint64_t pool_uuid[2], device_uuid[2];
+    derive_uuid(pool_uuid,   0x504F4F4C);  /* 'POOL' */
+    derive_uuid(device_uuid, 0x44455600);  /* 'DEV\0' */
+
+    stm_fs_format_opts fopts = {
+        .device_size_bytes    = device_bytes,
+        .bootstrap_size_bytes = bootstrap_bytes,
+        .pool_uuid            = { pool_uuid[0],   pool_uuid[1]   },
+        .device_uuid          = { device_uuid[0], device_uuid[1] },
+        .keyfile_path         = keyfile_path,
+    };
+
+    /* Phase 1: format. */
+    fprintf(stderr, "formatting %s (%llu bytes)...\n",
+            image_path, (unsigned long long)device_bytes);
+    stm_status rc = stm_fs_format(image_path, &fopts);
+    if (rc != STM_OK) {
+        fprintf(stderr, "stratum-mkfs: stm_fs_format failed: status=%d\n", (int)rc);
+        return 2;
+    }
+
+    /* Phase 2: mount, init dataset root id=1, unmount. */
+    stm_fs_mount_opts mopts = {
+        .read_only    = false,
+        .keyfile_path = keyfile_path,
+    };
+    stm_fs *fs = NULL;
+    rc = stm_fs_mount(image_path, &mopts, &fs);
+    if (rc != STM_OK) {
+        fprintf(stderr, "stratum-mkfs: stm_fs_mount post-format failed: status=%d\n",
+                (int)rc);
+        return 2;
+    }
+    uint64_t root_ino = 0;
+    rc = stm_fs_init_dataset_root(fs, /*ds=*/1u,
+                                       /*mode=*/0755u,
+                                       /*uid=*/0, /*gid=*/0,
+                                       &root_ino);
+    if (rc != STM_OK) {
+        fprintf(stderr, "stratum-mkfs: init_dataset_root failed: status=%d\n", (int)rc);
+        (void)stm_fs_unmount(fs);
+        return 2;
+    }
+    rc = stm_fs_commit(fs);
+    if (rc != STM_OK) {
+        fprintf(stderr, "stratum-mkfs: commit failed: status=%d\n", (int)rc);
+        (void)stm_fs_unmount(fs);
+        return 2;
+    }
+    rc = stm_fs_unmount(fs);
+    if (rc != STM_OK) {
+        fprintf(stderr, "stratum-mkfs: unmount failed: status=%d\n", (int)rc);
+        return 2;
+    }
+
+    fprintf(stderr,
+        "ok: %s ready (dataset 1 root ino=%llu)\n"
+        "    next: stratumd %s --listen unix:/tmp/stm.sock\n",
+        image_path,
+        (unsigned long long)root_ino,
+        image_path);
+    return 0;
+}

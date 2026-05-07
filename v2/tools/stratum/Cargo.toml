@@ -1,0 +1,31 @@
+[package]
+name = "stratum"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Stratum swiss-army monolith. Single statically-linked binary that
+# bundles every cmd-line tool (stratumd, stratum-slate, stratum-mkfs,
+# stratum-fs) plus the FAR-Commander TUI into one executable. Targets
+# macOS + Linux. Veracrypt-shaped UX: drop the binary on any machine,
+# run `stratum`, browse / manage your stratum volumes.
+#
+# Subcommand dispatch in src/main.rs routes:
+#   stratum                  → landing screen
+#   stratum tui [--vol PATH] → TUI (auto-spawns daemons if --vol)
+#   stratum serve VOLUME     → stratumd code path (FFI)
+#   stratum slate            → slate daemon code path (FFI)
+#   stratum mkfs IMAGE       → mkfs code path (FFI)
+#   stratum fs CMD ARGS      → 9P CLI code path (FFI)
+#
+# See v2/docs/SLATE-DESIGN.md §12 for the design rationale.
+
+[dependencies]
+ratatui   = "0.29"
+crossterm = "0.28"
+anyhow    = "1"
+libc      = "0.2"
+
+[[bin]]
+name = "stratum"
+path = "src/main.rs"
