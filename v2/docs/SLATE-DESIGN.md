@@ -547,25 +547,170 @@ then archive or delete.
 
 ### 12.9 Subsequent chunks
 
-- **SWISS-2**: Volume map (F2) — first visualization screen. Read /ctl/
-  + /pools/<uuid>/metrics/prometheus through the embedded stratumd's
-  /ctl/ socket; render donut + snapshot timeline + integrity bar.
-- **SWISS-3**: Snapshot graph (F4). Composes against /ctl/-on-stratumd's
-  snapshot ops (already shipped at P9-CTL-1d-actions-snapshot-*).
-- **SWISS-4**: Browse pane (F3) substantive — host↔stratum copy with
-  progress dialog (lift from v1's copy_dialog).
-- **SWISS-5**: Integrity pane (F5) — scrub start/stop + live progress.
-  Composes against /ctl/-on-stratumd's scrub ops.
-- **SWISS-6**: Encryption pane (F6) — composes against keyrotate work
-  (forward-noted at the libfs level).
-- **SWISS-7**: Inspect (F7) — /debug/ subtree exposes allocator-state /
-  btree-shape / extent-map (some forward-noted at /ctl/).
-- **SWISS-8**: Metrics gauges (F8) — Prometheus exposition consumer.
-- **SWISS-9**: Volume admin (F9) — create/open/close/resize verbs.
+The roadmap re-prioritised after live user testing of SWISS-1..3:
+the "swiss-army knife" that the user remembers from v1 (and that
+sells Stratum visually) is **dual-pane file management with copy
++ mkfs + edit operations**, NOT visualizations. The
+visualizations move to a later phase. v1 parity comes first.
 
-Each chunk is fat: schema design + slate-side surface (if needed)
-+ Rust visualization + e2e test + audit. Per user policy 2026-05-07,
-no formal model for slate-side work.
+#### SWISS-4 — v1 parity (fat sequence, broken into a/b/c/d/e)
+
+The canonical v1 TUI experience: dual-pane FAR-Commander layout
+with host on one side + stratum on the other, drag-drop-style
+copy, mkfs wizard, passphrase prompt, native editor.
+
+**SWISS-4a — slate per-panel multi-attach (the unblocker).**
+Until SWISS-3a, slate had a single backend pointer. Both panels
+showed the same backend. SWISS-4a splits state per-panel:
+
+- `s->panel[i].backend` (replaces single `s->backend`).
+- `s->panel[i].socket / connected / socket_len`.
+- `s->panel[i].entries_count` (cached at panel-entries materialise;
+  used by action verb's cursor clamp — closes user-reported bug #2
+  at the slate layer too, defense-in-depth on top of SWISS-3b's
+  TUI-side clamp).
+- Schema additions:
+  ```
+  /connection/
+    left/  (DIR — alias for top-level back-compat)
+      socket  / connected  / attach
+    right/ (DIR — new)
+      socket  / connected  / attach
+  ```
+  Top-level `/connection/{socket,connected,attach}` stays as a
+  legacy alias for the LEFT panel. slate-tty + TUI both speak
+  the new schema.
+- New API: `stm_slate_attach_panel(s, panel_idx, sock, len)`,
+  `stm_slate_disconnect_panel(s, panel_idx)`.
+  Existing `stm_slate_attach` becomes alias for `attach_panel(0)`.
+- ".." synthesis (user-reported bug #1): when `panel.path != "/"`,
+  the panel-entries materialiser prepends a synthetic
+  `d 0755 - 0 ..` line. Both backends benefit uniformly.
+- editor_open uses `panel[active_idx].backend` (active is passed
+  in the verb: `editor open left|right <path>`).
+
+Estimated 800-1200 LOC of slate.c + schema test updates + 3-4
+new socket tests + audit (R128).
+
+**SWISS-4b — Shift+F2 host mount + Enter-on-.stm volume mount.**
+
+Per user clarification 2026-05-07:
+- **Shift+F2** mounts host filesystem in the **active** panel.
+  TUI shows an input-dialog overlay prompting for host path.
+  On Enter: spawn `stratum host-fs PATH --listen <session>/host-N.sock`
+  + write socket path to `/connection/<active>/attach`.
+
+- **Enter on yellow `.stm` file** mounts that volume in the
+  **inactive** panel. The .stm file lives on the active panel's
+  backend (typically host-fs). To open it, TUI must reconstruct
+  the **host filesystem path** from the panel's backend kind +
+  the panel.path + entry.name. Track the panel's backend kind
+  in TUI-local state (not in slate; slate doesn't care about
+  "kind"). For host-fs panels, root-path is known (TUI spawned
+  it); for stratumd panels, .stm files inside don't make sense
+  to mount (forward-noted).
+
+- TUI passes the .stm host path to a spawned `stratum serve`
+  subprocess + attaches its socket to the inactive panel via
+  `/connection/<inactive>/attach`.
+
+- Passphrase prompt: if `<.stm>.key` doesn't exist (or stratumd
+  reports STM_EACCES on attach), TUI prompts via input dialog
+  for a passphrase + writes to a temp keyfile + retries the
+  spawn with `--keyfile <temp>`. Forward-note: the v1.0 keyfile
+  format isn't passphrase-derived; SWISS-4b ships a simple
+  KDF wrapper. v1.1 may use a proper PBKDF.
+
+Estimated 800-1500 LOC of TUI input dialog + spawn lifecycle +
+TUI's per-panel-backend-kind tracking + audit (R129). Lifts
+v1's `draw_input_dialog` from `v2/tui/src/ui.rs:371`.
+
+**SWISS-4c — Mkfs wizard (Shift+F7 = MkVol).**
+
+Lifts v1's `draw_mkvol_dialog` from `v2/tui/src/ui.rs:705`. A
+multi-field dialog (Name, Size with K/M/G, Encryption on/off,
+Passphrase, Compression algo lz4/zstd/none) + OK/Cancel buttons.
+On OK, TUI spawns `stratum mkfs PATH --size SIZE [--keyfile ...]`
+as a subprocess + waits for completion. Populates the active
+panel's cwd (or the user's chosen target path) with the new
+.stm file.
+
+Compression / encryption settings need new mkfs flags (forward-
+noted to a small mkfs CLI extension). Passphrase derives a
+keyfile via the SWISS-4b KDF wrapper.
+
+Estimated 600-1000 LOC of TUI multi-field dialog + mkfs CLI
+extension + audit (R130).
+
+**SWISS-4d — Copy operation (F5).**
+
+The headline feature. Lifts v1's `draw_copy_dialog` from
+`v2/tui/src/ui.rs:405` (filename + progress bar + throughput
+sparkline + ETA — the visual that sells the "watch your bytes
+move" experience).
+
+Selection-aware: if the active panel has selected files (via
+/panels/X/selection bitset, already in slate), F5 copies them
+all. Otherwise copies just the cursor entry.
+
+Conflict resolution: if any destination file already exists,
+shows v1's `draw_conflict_dialog` (Skip / Overwrite / KeepBoth +
+Apply-to-all-remaining) — lift from `v2/tui/src/ui.rs:865`.
+
+Routes:
+- **host → stm**: Tread from host-fs (active panel's backend) +
+  Twrite to stratumd (inactive panel's backend).
+- **stm → host**: requires host-fs WRITE support — forward-noted
+  to a SWISS-4d-host-rw sub-chunk; v1.0 of SWISS-4d ships
+  read-from-host + write-to-stratum only.
+- **host → host** + **stm → stm**: same shape, different
+  backend pointers.
+
+Each in-flight chunk reports throughput to the dialog
+(samples ringbuffer); chart renders last 60 samples as the
+v2/tui sparkline. ESC cancels (best-effort SIGTERM the
+in-flight Twrite + leave partials in place; same as v1).
+
+Estimated 1500-2500 LOC of TUI + audit (R131). The biggest
+single SWISS-4 sub-chunk.
+
+**SWISS-4e — Editor wiring (Enter on regular file / F4).**
+
+Slate already has /editor (open / content RW / save / quit /
+revert / save-and-quit verbs from SLATE-5b). TUI routes:
+- Enter on a non-yellow regular file → `/event "editor open <path>"`.
+- F4 → same.
+- Inside editor: arrow-key cursor navigation writes /editor/cursor;
+  printable chars + Backspace + Enter mutate /editor/content;
+  Ctrl-S → /editor/action save; Ctrl-Q → save-and-quit (with
+  confirm dialog if modified).
+
+The editor is full-screen (already drawn by SLATE-6's
+`draw_editor_overlay`); SWISS-4e wires interactive editing on
+top of the existing read-only view.
+
+Estimated 600-1000 LOC of TUI editor input handling + audit
+(R132).
+
+#### Visualizations (re-prioritised, post-v1-parity)
+
+After SWISS-4 the binary has dual-pane file ops parity with v1
++ better encryption + Plan-9 IPC. Then visualizations land:
+
+- **SWISS-5**: Volume map (F2) — donut + snapshot timeline +
+  integrity bar.
+- **SWISS-6**: Snapshot graph (F4 alternate-binding while no
+  edit; or move snapshots to F9). Tree of snapshots, hold marks.
+- **SWISS-7**: Integrity pane (F5 alternate; or move to F11) —
+  scrub progress + Merkle verify.
+- **SWISS-8**: Encryption pane — keyslots + rotation.
+- **SWISS-9**: Inspect (F7) — /debug/ subtree (allocator,
+  btree, extent map).
+- **SWISS-10**: Metrics gauges (F8) — Prometheus consumer.
+
+Each chunk: schema design + slate-side surface (if needed) +
+Rust visualization + e2e test + audit. Per user policy
+2026-05-07, no formal model for slate-side work.
 
 ### 12.10 Naming and branding
 
