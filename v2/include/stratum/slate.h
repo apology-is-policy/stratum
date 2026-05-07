@@ -60,6 +60,23 @@
  *                                 view/edit verbs.
  *     /panels/right/...      (mirror of left).
  *
+ *   P9-SLATE-4-confirm + P9-SLATE-4b — multi-dialog stack:
+ *     /dialogs/stack         (R)  comma-separated active dialog ids,
+ *                                 ascending (newest last). Empty
+ *                                 (just '\n') when no dialogs are up.
+ *     /dialogs/<id>/kind     (R)  "confirm" | "input"
+ *     /dialogs/<id>/title    (R)  single-line + '\n'
+ *     /dialogs/<id>/body     (R)  multi-line + '\n'
+ *     /dialogs/<id>/options  (R)  comma-separated labels + '\n'
+ *     /dialogs/<id>/input    (RW) editable string field (kind=input
+ *                                 only; absent for confirm). Renderer
+ *                                 updates as the user types.
+ *     /dialogs/<id>/result   (W)  write one of `options` to dismiss.
+ *                                 Per DialogStackLIFO (SLATE-DESIGN
+ *                                 §11), only the topmost dialog
+ *                                 (highest active id) accepts results;
+ *                                 others return STM_EBUSY.
+ *
  * State-machine spec: v2/specs/slate.tla. Invariants:
  *   VersionMonotonic    — version only ever advances.
  *   EventFIFO           — dispatched order = write order, no gaps.
@@ -71,6 +88,13 @@
  *                         state.
  *   PanelPathConsistent — every panel path is RootPath ("/") iff
  *                         connected, NoPath ("") iff disconnected.
+ *   DialogStackLIFO     — (SLATE-4b informal carry from
+ *                         SLATE-DESIGN §11) only the topmost dialog
+ *                         accepts result writes. Result writes to
+ *                         non-top dialogs return STM_EBUSY. Per user
+ *                         policy 2026-05-07, slate doesn't carry a
+ *                         formal-model spec extension for SLATE-4b —
+ *                         the invariant is enforced in code only.
  *
  * Concurrency model:
  *   stm_slate_state is shared across multiple per-connection lp9
@@ -197,13 +221,29 @@ extern "C" {
 #define STM_SLATE_ENTRIES_MAX    200u
 
 /* SLATE-4-confirm: bounds for the /dialogs subtree.
- * v1.0 ships a SINGLE-dialog stack (max 1 active dialog at a time);
- * SLATE-4b will lift this to a multi-dialog stack. Dialog kinds
- * supported at v1.0: "confirm". */
+ * Dialog kinds supported: "confirm" (SLATE-4-confirm) + "input"
+ * (SLATE-4b). */
 #define STM_SLATE_DIALOG_TITLE_MAX    256u
 #define STM_SLATE_DIALOG_BODY_MAX     1024u
 #define STM_SLATE_DIALOG_OPTIONS_MAX  256u  /* raw comma-separated string */
 #define STM_SLATE_DIALOG_OPTION_MAX   64u   /* single option label */
+
+/* SLATE-4b: bounds for the multi-dialog stack + input kind.
+ *
+ * STM_SLATE_DIALOG_MAX_ACTIVE is the upper bound on simultaneously-
+ * displayed dialogs. Once N dialogs are active, additional opens
+ * return STM_EBUSY. Sized small (4) — typical UI flows display one
+ * dialog at a time, occasionally two (a confirm-overwrite stacked
+ * onto an in-progress copy progress dialog). v1.1 may bump this if
+ * field experience shows it tight.
+ *
+ * STM_SLATE_DIALOG_INPUT_MAX is the per-input field cap. The input
+ * field is RW (renderer updates as the user types); the daemon
+ * snapshots its current value at result-write time into the
+ * single-record completion store queryable via
+ * stm_slate_dialog_consume. */
+#define STM_SLATE_DIALOG_MAX_ACTIVE   4u
+#define STM_SLATE_DIALOG_INPUT_MAX    256u
 
 /* ────────────────────────────────────────────────────────────────────── */
 /* Lifecycle.                                                             */
@@ -330,18 +370,20 @@ size_t stm_slate_panel_path(stm_slate *s, int panel_idx,
                               char *buf, size_t buf_cap);
 
 /*
- * SLATE-4-confirm: open a confirm dialog.
+ * SLATE-4-confirm + SLATE-4b: open a confirm dialog.
  * Renderer-facing: title is the dialog headline, body is multi-line
  * descriptive text, options is comma-separated labels (e.g.,
  * "ok,cancel" or "skip,overwrite,keepboth"). The dialog is pushed
- * onto the stack; if a dialog is already active, returns STM_EBUSY
- * (v1.0 single-dialog stack — SLATE-4b lifts this).
+ * onto the stack; if STM_SLATE_DIALOG_MAX_ACTIVE dialogs are
+ * already active, returns STM_EBUSY.
  *
  * On success, *out_id is set to the dialog's monotonic id (slate
  * never reuses ids). The renderer reads /dialogs/stack to discover
  * the id, then walks /dialogs/<id>/{kind,title,body,options} to
  * present, and writes /dialogs/<id>/result with one of the option
- * labels to dismiss.
+ * labels to dismiss. Per DialogStackLIFO (SLATE-DESIGN §11), only
+ * the topmost dialog (highest id) accepts results — earlier
+ * dialogs return STM_EBUSY on result-write.
  *
  * Trust boundary: every input string is sanitized — bytes < 0x20
  * (other than '\n' in body) and == 0x7F are refused with STM_EINVAL
@@ -350,9 +392,11 @@ size_t stm_slate_panel_path(stm_slate *s, int panel_idx,
  *
  * Returns:
  *   - STM_OK on success.
- *   - STM_EBUSY if a dialog is already active.
+ *   - STM_EBUSY if STM_SLATE_DIALOG_MAX_ACTIVE dialogs are active.
  *   - STM_EINVAL on NULL args, oversize fields, or control bytes
  *     in any input.
+ *   - STM_EOVERFLOW if next_dialog_id has saturated (UINT64_MAX
+ *     reached — operationally impossible in practice).
  */
 STM_MUST_USE
 stm_status stm_slate_open_confirm(stm_slate *s,
@@ -362,17 +406,104 @@ stm_status stm_slate_open_confirm(stm_slate *s,
                                        uint64_t *out_id);
 
 /*
- * SLATE-4-confirm: query whether a dialog is currently active.
- * Mu-protected; the value is the live state at the moment of call.
+ * SLATE-4b: open an input dialog. Same shape as open_confirm but
+ * with an additional editable string field /dialogs/<id>/input.
+ * `default_input` is the initial value of the input field (may be
+ * empty: pass len=0). Subsequent /input writes (RW kind) update
+ * the field as the user types. At result-write time, the daemon
+ * snapshots the current input value into the consume() record.
+ *
+ * Trust boundary: default_input must satisfy the same control-byte
+ * refusal as title/options (single-line, no control bytes; len
+ * bounded at STM_SLATE_DIALOG_INPUT_MAX). UTF-8 multi-byte
+ * sequences (≥ 0x80) pass through unchanged.
+ *
+ * Returns:
+ *   - STM_OK on success.
+ *   - STM_EBUSY if STM_SLATE_DIALOG_MAX_ACTIVE dialogs are active.
+ *   - STM_EINVAL on NULL args, oversize fields, or control bytes.
+ *   - STM_EOVERFLOW if next_dialog_id has saturated.
+ */
+STM_MUST_USE
+stm_status stm_slate_open_input(stm_slate *s,
+                                       const char *title,   size_t title_len,
+                                       const char *body,    size_t body_len,
+                                       const char *options, size_t options_len,
+                                       const char *default_input, size_t default_input_len,
+                                       uint64_t *out_id);
+
+/*
+ * SLATE-4b: programmatically cancel a still-active dialog by id
+ * (frees its slot WITHOUT writing to the consume() record). Used
+ * when the consumer's caller-context disappears (e.g., the
+ * background op that requested the dialog completes by some other
+ * route). Bumps version on real cancellation.
+ *
+ * Returns:
+ *   - STM_OK on success.
+ *   - STM_ENOENT if no active dialog has that id.
+ *   - STM_EINVAL on NULL `s` or id == 0.
+ */
+STM_MUST_USE
+stm_status stm_slate_dialog_cancel(stm_slate *s, uint64_t id);
+
+/*
+ * SLATE-4b: consume the most-recent dismiss record IF its dialog id
+ * matches `id`. On a match: copies the result label into result_buf
+ * (NUL-terminated; clamped to result_cap, full length returned in
+ * *out_result_len), copies the input field into input_buf (same
+ * semantics; *out_input_len returns 0 for confirm-kind dialogs),
+ * clears the record, and returns STM_OK. On a mismatch (record id
+ * != id, or no record): returns STM_ENOENT and the buffers are not
+ * modified.
+ *
+ * The single-record completion store is a documented v1.0
+ * limitation: rapid back-to-back dismisses can overwrite each
+ * other. Consumers expecting reliable pickup should consume()
+ * promptly after detecting dismiss via /redraw + /version. v1.1
+ * may add a per-id consumption queue.
+ *
+ * Buffers MAY be NULL if their cap is 0 (caller queries length
+ * only). out_result_len + out_input_len MUST be non-NULL.
+ *
+ * Returns:
+ *   - STM_OK on a matching record (record cleared).
+ *   - STM_ENOENT on no record OR id mismatch.
+ *   - STM_EINVAL on NULL s OR NULL out_*_len OR id == 0.
+ */
+STM_MUST_USE
+stm_status stm_slate_dialog_consume(stm_slate *s, uint64_t id,
+                                          char *result_buf, size_t result_cap, size_t *out_result_len,
+                                          char *input_buf,  size_t input_cap,  size_t *out_input_len);
+
+/*
+ * SLATE-4-confirm + SLATE-4b: query whether ANY dialog is currently
+ * active. Mu-protected; the value is the live state at the moment
+ * of call.
  */
 bool stm_slate_dialog_active(stm_slate *s);
 
 /*
- * SLATE-4-confirm: query the active dialog's id.
+ * SLATE-4b: query whether a SPECIFIC dialog id is currently active.
+ * Returns false if no slot for id is in the active state, OR if
+ * id == 0 (sentinel). Mu-protected.
+ */
+bool stm_slate_dialog_is_active(stm_slate *s, uint64_t id);
+
+/*
+ * SLATE-4-confirm + SLATE-4b: query the topmost dialog's id.
  * Returns 0 if no dialog is active. (Dialog ids are monotonic and
- * start at 1, so 0 is unambiguous as "no active dialog".)
+ * start at 1, so 0 is unambiguous as "no active dialog".) "Top" is
+ * defined as the active slot with the largest id (since ids are
+ * allocated monotonically, this matches "most-recently opened").
  */
 uint64_t stm_slate_dialog_id(stm_slate *s);
+
+/*
+ * SLATE-4b: query the number of currently-active dialogs.
+ * Range [0, STM_SLATE_DIALOG_MAX_ACTIVE]. Mu-protected.
+ */
+size_t stm_slate_dialog_count(stm_slate *s);
 
 /* ────────────────────────────────────────────────────────────────────── */
 /* lp9 vops.                                                              */

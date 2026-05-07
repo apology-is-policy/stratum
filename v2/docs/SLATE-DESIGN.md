@@ -246,7 +246,13 @@ P9-SLATE-2   /connection/attach + libstratum-9p plumbing.
 P9-SLATE-3   panel cursor + selection + action ("key F3" cat-style
              read; "key Enter" descend dir).
 
-P9-SLATE-4   dialogs (confirm + input).
+P9-SLATE-4   dialogs (confirm + input). [SLATE-4-confirm shipped:
+             single-dialog stack with confirm kind. SLATE-4b shipped:
+             multi-dialog stack (N=4) + input kind + dialog_consume()
+             API for dismiss-pickup. /dialogs/<id>/input is RW;
+             DialogStackLIFO enforced — only top of stack accepts
+             results. Single-record completion store; v1.1 may add
+             per-id queue.]
 
 P9-SLATE-5   editor/.
 

@@ -1482,6 +1482,182 @@ STM_TEST(slate_socket_dialog_open_dismiss_e2e)
     destroy_fixture(&f);
 }
 
+/* SLATE-4b: e2e multi-dialog stack via the wire. Open two dialogs,
+ * read /dialogs/stack ("1,2\n"), result-write to non-top returns
+ * EBUSY (DialogStackLIFO), result-write to top dismisses. */
+STM_TEST(slate_socket_4b_multi_dialog_lifo_e2e)
+{
+    slate_fixture f;
+    setup_fixture(&f, "fg_4b_lifo");
+
+    stm_9p_client *c = NULL;
+    stm_9p_dial_opts opts = default_dial_opts(100u);
+    STM_ASSERT_OK(retry_dial(g_sock_path, &opts, &c));
+
+    /* Server-side: open two confirm dialogs. */
+    uint64_t a = 0, b = 0;
+    STM_ASSERT_OK(stm_slate_open_confirm(f.slate, "A", 1u, "B", 1u,
+                                              "ok,cancel", 9u, &a));
+    STM_ASSERT_OK(stm_slate_open_confirm(f.slate, "B", 1u, "B", 1u,
+                                              "ok,cancel", 9u, &b));
+    STM_ASSERT_EQ(a, 1u);
+    STM_ASSERT_EQ(b, 2u);
+
+    /* Read /dialogs/stack — "1,2\n". */
+    const char *snames[] = { "dialogs", "stack" };
+    stm_9p_qid sqids[2];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 101u, 2u, snames, sqids, &walked));
+    stm_9p_qid oqid;
+    uint32_t iounit = 0;
+    STM_ASSERT_OK(stm_9p_lopen(c, 101u, 0u, &oqid, &iounit));
+    char sbuf[32];
+    uint32_t sgot = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 101u, 0u, sbuf,
+                                  (uint32_t)(sizeof sbuf - 1u), &sgot));
+    sbuf[sgot] = '\0';
+    STM_ASSERT_EQ(strcmp(sbuf, "1,2\n"), 0);
+    STM_ASSERT_OK(stm_9p_clunk(c, 101u));
+
+    /* Result-write to dialog 1 (NOT top) → EBUSY. */
+    const char *rnames_a[] = { "dialogs", "1", "result" };
+    stm_9p_qid rqids_a[3];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 102u, 3u, rnames_a, rqids_a, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 102u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    uint32_t written = 0;
+    stm_status rc = stm_9p_write(c, 102u, 0u, "ok", 2u, &written);
+    STM_ASSERT_EQ(rc, STM_EBUSY);
+    STM_ASSERT_OK(stm_9p_clunk(c, 102u));
+    /* Both dialogs still active. */
+    STM_ASSERT_EQ(stm_slate_dialog_count(f.slate), 2u);
+
+    /* Result-write to dialog 2 (top) → OK. */
+    const char *rnames_b[] = { "dialogs", "2", "result" };
+    stm_9p_qid rqids_b[3];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 103u, 3u, rnames_b, rqids_b, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 103u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    STM_ASSERT_OK(stm_9p_write(c, 103u, 0u, "ok", 2u, &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 103u));
+    STM_ASSERT_EQ(stm_slate_dialog_count(f.slate), 1u);
+    STM_ASSERT_EQ(stm_slate_dialog_id(f.slate), 1u);
+
+    /* Now dialog 1 IS the top. Result-write to it → OK. */
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 104u, 3u, rnames_a, rqids_a, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 104u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    STM_ASSERT_OK(stm_9p_write(c, 104u, 0u, "ok", 2u, &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 104u));
+    STM_ASSERT_EQ(stm_slate_dialog_count(f.slate), 0u);
+
+    stm_9p_close(c);
+    destroy_fixture(&f);
+}
+
+/* SLATE-4b: e2e input dialog with /input field RW + consume() pickup. */
+STM_TEST(slate_socket_4b_input_dialog_e2e)
+{
+    slate_fixture f;
+    setup_fixture(&f, "fg_4b_input");
+
+    stm_9p_client *c = NULL;
+    stm_9p_dial_opts opts = default_dial_opts(100u);
+    STM_ASSERT_OK(retry_dial(g_sock_path, &opts, &c));
+
+    uint64_t did = 0;
+    STM_ASSERT_OK(stm_slate_open_input(f.slate,
+        "What's your name?", 17u,
+        "Enter your username:", 20u,
+        "ok,cancel", 9u,
+        "Anonymous", 9u, &did));
+
+    /* Read /dialogs/<id>/kind — "input\n". */
+    const char *knames[] = { "dialogs", "1", "kind" };
+    stm_9p_qid kqids[3];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 101u, 3u, knames, kqids, &walked));
+    stm_9p_qid oqid;
+    uint32_t iounit = 0;
+    STM_ASSERT_OK(stm_9p_lopen(c, 101u, 0u, &oqid, &iounit));
+    char kbuf[16];
+    uint32_t kgot = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 101u, 0u, kbuf,
+                                  (uint32_t)(sizeof kbuf - 1u), &kgot));
+    kbuf[kgot] = '\0';
+    STM_ASSERT_EQ(strcmp(kbuf, "input\n"), 0);
+    STM_ASSERT_OK(stm_9p_clunk(c, 101u));
+
+    /* Read /dialogs/<id>/input — "Anonymous\n". */
+    const char *inames[] = { "dialogs", "1", "input" };
+    stm_9p_qid iqids[3];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 102u, 3u, inames, iqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 102u, 0u, &oqid, &iounit));
+    char ibuf[32];
+    uint32_t igot = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 102u, 0u, ibuf,
+                                  (uint32_t)(sizeof ibuf - 1u), &igot));
+    ibuf[igot] = '\0';
+    STM_ASSERT_EQ(strcmp(ibuf, "Anonymous\n"), 0);
+    STM_ASSERT_OK(stm_9p_clunk(c, 102u));
+
+    /* Write a new value to /input. */
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 103u, 3u, inames, iqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 103u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, 103u, 0u, "Carol", 5u, &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 103u));
+
+    /* Dismiss with "ok". */
+    const char *rnames[] = { "dialogs", "1", "result" };
+    stm_9p_qid rqids[3];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 104u, 3u, rnames, rqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 104u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    STM_ASSERT_OK(stm_9p_write(c, 104u, 0u, "ok", 2u, &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 104u));
+
+    /* Server-side: consume the dismiss record. */
+    char rbuf[16];
+    char ibuf2[16];
+    size_t rlen = 0, ilen = 0;
+    STM_ASSERT_OK(stm_slate_dialog_consume(f.slate, did,
+                                                rbuf, sizeof rbuf, &rlen,
+                                                ibuf2, sizeof ibuf2, &ilen));
+    STM_ASSERT_EQ(rlen, 2u);
+    STM_ASSERT_EQ(strcmp(rbuf, "ok"), 0);
+    STM_ASSERT_EQ(ilen, 5u);
+    STM_ASSERT_EQ(strcmp(ibuf2, "Carol"), 0);
+
+    stm_9p_close(c);
+    destroy_fixture(&f);
+}
+
+/* SLATE-4b: walk /dialogs/<id>/input on a confirm-kind dialog returns
+ * ENOENT (input field absent for confirm). */
+STM_TEST(slate_socket_4b_confirm_kind_no_input_field)
+{
+    slate_fixture f;
+    setup_fixture(&f, "fg_4b_no_input");
+
+    stm_9p_client *c = NULL;
+    stm_9p_dial_opts opts = default_dial_opts(100u);
+    STM_ASSERT_OK(retry_dial(g_sock_path, &opts, &c));
+
+    uint64_t did = 0;
+    STM_ASSERT_OK(stm_slate_open_confirm(f.slate, "T", 1u, "B", 1u,
+                                              "ok", 2u, &did));
+
+    /* Walk /dialogs/1/input — partial walk OR ENOENT (libstratum-9p
+     * may return STM_OK with walked < n_names on partial match). */
+    const char *inames[] = { "dialogs", "1", "input" };
+    stm_9p_qid iqids[3];
+    uint16_t walked = 0;
+    stm_status rc = stm_9p_walk(c, 100u, 101u, 3u, inames, iqids, &walked);
+    /* Either the walk failed outright OR partial-walked to "1" (2
+     * components) without the "input" leaf. */
+    STM_ASSERT(rc != STM_OK || walked < 3u);
+
+    stm_9p_close(c);
+    destroy_fixture(&f);
+}
+
 /* /event refuses zero-byte writes (parity with stm_slate_submit_event). */
 STM_TEST(slate_socket_event_zero_byte_einval)
 {
