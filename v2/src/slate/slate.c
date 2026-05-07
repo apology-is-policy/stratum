@@ -114,6 +114,12 @@ typedef struct slate_session {
     uint64_t  qid_path;
     uint8_t   buf[STM_SLATE_BODY_MAX];
     uint32_t  len;
+    /* R114 P1-1: bulk-format kinds (currently only /log/tail) live
+     * here — heap-allocated at lopen-materialize, freed at clunk
+     * BEFORE the memset (mirrors /ctl/'s P9-CTL-1e bulk_buf pattern).
+     * NULL on the bounded-body path. */
+    uint8_t  *bulk_buf;
+    uint32_t  bulk_len;
 } slate_session;
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -319,6 +325,10 @@ static slate_session *session_alloc_locked(stm_slate *s, uint32_t fid,
 static void session_free_locked(slate_session *ss)
 {
     if (!ss || !ss->active) return;
+    /* R114 P1-1: free bulk_buf BEFORE memset zeros the pointer.
+     * Mirrors /ctl/ P9-CTL-1e session_free_locked discipline; the
+     * order is load-bearing — reverse it and the alloc leaks. */
+    free(ss->bulk_buf);
     memset(ss, 0, sizeof *ss);
 }
 
@@ -345,19 +355,41 @@ static stm_status materialize_status_locked(stm_slate *s, slate_session *ss)
     return STM_OK;
 }
 
+/* R114 P1-1: /log/tail uses a per-fid heap-allocated bulk_buf so
+ * 100 × 321-byte log lines (~32 KiB worst case) can be served. The
+ * fixed-size ss->buf (4 KiB) covers /version + /status only.
+ * Mirrors /ctl/'s P9-CTL-1e Prometheus exposition pattern. */
 static stm_status materialize_log_tail_locked(stm_slate *s, slate_session *ss)
 {
+    /* Compute total size first so we malloc once. */
+    size_t total = 0;
+    for (uint32_t i = 0; i < s->log_count; i++) {
+        uint32_t idx = (s->log_head + i) % STM_SLATE_LOG_LINES;
+        total += s->log_len[idx] + 1u;     /* +1 for newline */
+    }
+    if (total > STM_SLATE_LOG_TAIL_MAX) return STM_ERANGE;
+
+    /* Empty body is fine — bulk_buf stays NULL, vops_read serves 0
+     * bytes from ss->buf (already zeroed). */
+    if (total == 0) {
+        ss->bulk_buf = NULL;
+        ss->bulk_len = 0;
+        return STM_OK;
+    }
+
+    uint8_t *buf = malloc(total);
+    if (!buf) return STM_ENOMEM;
+
     size_t off = 0;
     for (uint32_t i = 0; i < s->log_count; i++) {
         uint32_t idx = (s->log_head + i) % STM_SLATE_LOG_LINES;
         size_t llen = s->log_len[idx];
-        /* +1 for newline */
-        if (off + llen + 1u > sizeof ss->buf) return STM_ERANGE;
-        memcpy(ss->buf + off, s->log[idx], llen);
-        ss->buf[off + llen] = '\n';
+        memcpy(buf + off, s->log[idx], llen);
+        buf[off + llen] = '\n';
         off += llen + 1u;
     }
-    ss->len = (uint32_t)off;
+    ss->bulk_buf = buf;
+    ss->bulk_len = (uint32_t)total;
     return STM_OK;
 }
 
@@ -607,7 +639,9 @@ static stm_status vops_read(void *ctx, uint32_t fid, uint64_t qid_path,
         return STM_OK;
     }
 
-    /* Snapshot-bodied kinds: serve from session->buf. */
+    /* Snapshot-bodied kinds: serve from session->buf or bulk_buf
+     * (R114 P1-1: /log/tail uses heap-alloc bulk_buf since 100 ×
+     * 321 bytes exceeds STM_SLATE_BODY_MAX). */
     pthread_mutex_lock(&s->mu);
     slate_session *ss = session_get_locked(s, fid);
     if (!ss) {
@@ -620,6 +654,21 @@ static stm_status vops_read(void *ctx, uint32_t fid, uint64_t qid_path,
         *inout_len = 0;
         return STM_EBACKEND;
     }
+
+    /* Bulk-format kinds (currently only /log/tail). */
+    if (ss->bulk_buf) {
+        if (offset >= ss->bulk_len) {
+            *inout_len = 0;
+            pthread_mutex_unlock(&s->mu);
+            return STM_OK;
+        }
+        uint32_t avail = ss->bulk_len - (uint32_t)offset;
+        if (*inout_len > avail) *inout_len = avail;
+        memcpy(buf, ss->bulk_buf + offset, *inout_len);
+        pthread_mutex_unlock(&s->mu);
+        return STM_OK;
+    }
+
     if (offset >= ss->len) {
         *inout_len = 0;
         pthread_mutex_unlock(&s->mu);

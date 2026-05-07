@@ -96,15 +96,101 @@ static void install_signal_handlers(void)
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
-/* Per-connection worker (one detached pthread per accepted client).      */
+/* Per-connection worker pool (R114 P2-1 fix).                            */
+/*                                                                        */
+/* Workers are JOINABLE pthreads (not detached) tracked in a fixed-size   */
+/* array under `g_workers_mu`. On shutdown, run_serve walks the array,    */
+/* forces shutdown(2) on each active worker's client_fd to interrupt      */
+/* their blocking read_full, and pthread_join's each tid. Only AFTER all  */
+/* workers have joined does run_serve call stm_slate_destroy — without    */
+/* this drain, a worker mid-vops_read on /redraw (post-cond_wait,         */
+/* still holding s->mu) would race with pthread_mutex_destroy(&s->mu).    */
+/*                                                                        */
+/* The pool is capped at STM_SLATE_MAX_SESSIONS (64); if all slots are    */
+/* full, a new connection is refused (the client's lp9 dial sees EPIPE    */
+/* on the immediate close). This is the same concurrency cap the slate    */
+/* state machine uses for sessions[].                                     */
 /* ────────────────────────────────────────────────────────────────────── */
+
+#define MAX_WORKERS  ((int)STM_SLATE_MAX_SESSIONS)
+
+typedef struct {
+    pthread_t  tid;
+    int        fd;
+    int        active;
+} worker_slot;
+
+static pthread_mutex_t g_workers_mu = PTHREAD_MUTEX_INITIALIZER;
+static worker_slot     g_workers[MAX_WORKERS];
 
 typedef struct {
     int        fd;
     stm_slate *slate;
     uint32_t   msize_max;
     uint32_t   idle_timeout_ms;
+    int        slot;          /* index into g_workers; -1 = not pooled */
 } conn_ctx;
+
+/* Returns slot index ≥ 0 on success, -1 if pool is full. tid is set
+ * by the caller AFTER pthread_create succeeds. */
+static int worker_slot_alloc(int fd)
+{
+    pthread_mutex_lock(&g_workers_mu);
+    for (int i = 0; i < MAX_WORKERS; i++) {
+        if (!g_workers[i].active) {
+            g_workers[i].active = 1;
+            g_workers[i].fd     = fd;
+            /* tid filled in by caller. */
+            pthread_mutex_unlock(&g_workers_mu);
+            return i;
+        }
+    }
+    pthread_mutex_unlock(&g_workers_mu);
+    return -1;
+}
+
+static void worker_slot_set_tid(int slot, pthread_t tid)
+{
+    if (slot < 0) return;
+    pthread_mutex_lock(&g_workers_mu);
+    g_workers[slot].tid = tid;
+    pthread_mutex_unlock(&g_workers_mu);
+}
+
+/* Worker-side: clear our slot at clean exit. */
+static void worker_slot_clear(int slot)
+{
+    if (slot < 0) return;
+    pthread_mutex_lock(&g_workers_mu);
+    g_workers[slot].active = 0;
+    g_workers[slot].fd     = -1;
+    pthread_mutex_unlock(&g_workers_mu);
+}
+
+/* Drain all active workers: shutdown each client_fd to wake any
+ * blocked read_full, then pthread_join. Called once at shutdown
+ * AFTER stm_slate_stop has woken cond_wait readers. */
+static void worker_pool_drain(void)
+{
+    /* Snapshot tids + fds under lock so we can release before joins
+     * (workers self-clear when exiting). */
+    pthread_t tids[MAX_WORKERS];
+    int       n_tids = 0;
+    pthread_mutex_lock(&g_workers_mu);
+    for (int i = 0; i < MAX_WORKERS; i++) {
+        if (g_workers[i].active) {
+            tids[n_tids++] = g_workers[i].tid;
+            /* shutdown(2) on AF_UNIX wakes blocking read on the
+             * other end with EOF — the worker's read_full returns
+             * truncated, the msg loop breaks, conn_thread exits. */
+            (void)shutdown(g_workers[i].fd, SHUT_RDWR);
+        }
+    }
+    pthread_mutex_unlock(&g_workers_mu);
+    for (int i = 0; i < n_tids; i++) {
+        (void)pthread_join(tids[i], NULL);
+    }
+}
 
 /* Robust read/write — copied from stratumd's serve.c. EINTR retry. */
 static int read_full(int fd, void *buf, size_t len)
@@ -155,6 +241,7 @@ static void *conn_thread(void *arg)
     stm_slate *slate = cx->slate;
     uint32_t msize_max = cx->msize_max;
     uint32_t idle = cx->idle_timeout_ms;
+    int slot = cx->slot;
     free(cx);
 
     if (idle > 0u) {
@@ -173,6 +260,7 @@ static void *conn_thread(void *arg)
                                   stm_slate_root(slate),
                                   msize_max, &srv) != STM_OK) {
         close(fd);
+        worker_slot_clear(slot);
         return NULL;
     }
 
@@ -183,6 +271,7 @@ static void *conn_thread(void *arg)
         free(resp);
         stm_lp9_server_destroy(srv);
         close(fd);
+        worker_slot_clear(slot);
         return NULL;
     }
 
@@ -205,6 +294,7 @@ static void *conn_thread(void *arg)
     free(resp);
     stm_lp9_server_destroy(srv);
     close(fd);
+    worker_slot_clear(slot);
     return NULL;
 }
 
@@ -268,8 +358,21 @@ static stm_status accept_loop(int listen_fd, stm_slate *slate,
          * §7.1). */
         (void)peer_uid; (void)peer_gid;
 
+        /* R114 P2-1: allocate a worker slot so shutdown can drain.
+         * If pool is full, refuse the connection (close the fd; the
+         * client's dial sees EPIPE on next read). */
+        int slot = worker_slot_alloc(client_fd);
+        if (slot < 0) {
+            fprintf(stderr,
+                "stratum-slate: worker pool full (%u); refusing\n",
+                MAX_WORKERS);
+            close(client_fd);
+            continue;
+        }
+
         conn_ctx *cx = malloc(sizeof *cx);
         if (!cx) {
+            worker_slot_clear(slot);
             close(client_fd);
             continue;
         }
@@ -277,20 +380,24 @@ static stm_status accept_loop(int listen_fd, stm_slate *slate,
         cx->slate            = slate;
         cx->msize_max        = msize_max;
         cx->idle_timeout_ms  = idle_ms;
+        cx->slot             = slot;
 
         pthread_t tid;
         sigset_t prev_mask;
         (void)pthread_sigmask(SIG_BLOCK, &worker_block, &prev_mask);
+        /* R114 P2-1: workers are JOINABLE (no pthread_detach) so
+         * shutdown can pthread_join each before stm_slate_destroy. */
         int prc = pthread_create(&tid, NULL, conn_thread, cx);
         (void)pthread_sigmask(SIG_SETMASK, &prev_mask, NULL);
         if (prc != 0) {
             fprintf(stderr,
                 "stratum-slate: pthread_create failed (rc=%d)\n", prc);
+            worker_slot_clear(slot);
             close(client_fd);
             free(cx);
             continue;
         }
-        (void)pthread_detach(tid);
+        worker_slot_set_tid(slot, tid);
     }
     return STM_OK;
 }
@@ -329,18 +436,23 @@ static int run_serve(const char *socket_path, uint32_t msize_max,
     stm_status rc = accept_loop(listen_fd, slate, msize_max, idle_ms,
                                    allow_unauth);
 
-    /* Wake every blocked /redraw reader. Workers will drain shortly. */
-    stm_slate_stop(slate);
-    /* shutdown(2) the listen fd so any in-progress accept returns. */
-    (void)shutdown(listen_fd, SHUT_RDWR);
+    /* Shutdown sequence (R114 P2-1 fix):
+     *   1. close(listen_fd) — no new accepts.
+     *   2. stm_slate_stop — wakes any blocked /redraw cond_wait so
+     *      those workers can return from vops_read and re-enter
+     *      their msg loop's read_full.
+     *   3. worker_pool_drain — for each active worker, shutdown(2)
+     *      its client_fd to interrupt read_full → conn_thread
+     *      exits → pthread_join collects.
+     *   4. stm_slate_destroy — safe because no worker exists.
+     *
+     * The order matters: stm_slate_stop BEFORE drain so blocked
+     * cond_wait readers exit their critical section first; drain
+     * BEFORE destroy so no worker holds s->mu when mu is destroyed. */
     close(listen_fd);
     (void)unlink(socket_path);
-
-    /* SLATE-1 doesn't track per-connection threads (they're detached)
-     * — let the process tear them down on exit. Forward-noted: a
-     * future hardening pass could pthread_join each worker for a
-     * graceful drain (or shutdown each client_fd to force EOF on
-     * blocked /redraw reads + worker drain). */
+    stm_slate_stop(slate);
+    worker_pool_drain();
     stm_slate_destroy(slate);
     fprintf(stderr,
             "stratum-slate: clean shutdown (rc=%d)\n", (int)rc);

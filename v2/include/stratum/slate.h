@@ -76,8 +76,11 @@ extern "C" {
  * deliberately small so a malicious client can't queue a 1 GiB body. */
 #define STM_SLATE_EVENT_LINE_MAX 256u
 
-/* Per-fid materialized body cap (snapshots at lopen). Same shape as
- * /ctl/'s STM_CTL_BODY_MAX; bumps on need. */
+/* Per-fid materialized body cap for bounded kinds (snapshots at
+ * lopen). Same shape as /ctl/'s STM_CTL_BODY_MAX. /log/tail uses a
+ * SEPARATE per-fid heap-allocated bulk buffer (STM_SLATE_LOG_TAIL_MAX)
+ * because 100 × 320-byte log lines = 32 KiB worst case far exceeds
+ * this — see R114 P1-1. */
 #define STM_SLATE_BODY_MAX       4096u
 
 /* Log ring buffer: N most recent lines. */
@@ -85,6 +88,11 @@ extern "C" {
 
 /* Per-line cap inside the log ring. */
 #define STM_SLATE_LOG_LINE_MAX   320u   /* timestamp prefix + payload */
+
+/* Per-fid heap-allocated body cap for bulk kinds (currently only
+ * /log/tail). 100 × 321 = 32 KiB worst case + headroom. Mirrors
+ * /ctl/'s STM_CTL_METRICS_MAX (P9-CTL-1e R114 P1-1 fix). */
+#define STM_SLATE_LOG_TAIL_MAX   (64u * 1024u)
 
 /* Max concurrent renderers / scripts. Slate's typical use is 1 daemon
  * + 1 tty + 0–2 scripts. This caps fid-table allocs PER INSTANCE; per-

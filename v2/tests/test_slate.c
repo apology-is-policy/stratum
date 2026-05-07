@@ -386,6 +386,52 @@ static void *writer_thread(void *arg)
     return NULL;
 }
 
+/* R114 P1-1 regression: /log/tail must serve a full ring of long
+ * lines without STM_ERANGE — i.e. the bulk_buf path. The pre-fix
+ * implementation overflowed the 4 KiB ss->buf at ~30+ lines. */
+STM_TEST(slate_log_tail_full_ring_with_long_lines_renders)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+
+    /* Submit 100 events with ~80-byte payloads — fills the ring at
+     * ~106 bytes per emitted line (timestamp prefix ~26 + payload
+     * ~80). 100 × 107 ≈ 10.7 KiB, far past STM_SLATE_BODY_MAX (4 KiB)
+     * but under STM_SLATE_LOG_TAIL_MAX (64 KiB). The bulk_buf path
+     * MUST serve this; pre-R114-fix the materializer returned
+     * STM_ERANGE → vops_lopen failed → renderer couldn't read its
+     * own log under realistic load. */
+    char payload[80];
+    memset(payload, 'a', sizeof payload - 1);
+    payload[sizeof payload - 1] = '\0';
+    for (uint32_t i = 0; i < STM_SLATE_LOG_LINES; i++) {
+        payload[0] = (char)('a' + (i % 26));
+        payload[1] = (char)('0' + (i % 10));
+        STM_ASSERT_OK(stm_slate_submit_event(s, payload,
+                                                  sizeof payload - 1));
+    }
+
+    char buf[STM_SLATE_LOG_TAIL_MAX];
+    uint32_t got = 0;
+    STM_ASSERT_OK(read_log_tail(s, buf, sizeof buf, &got));
+    STM_ASSERT(got > 4096u);     /* exceeds the old STM_SLATE_BODY_MAX */
+    /* The most recent event payload is "%c%caaa..." — verify the
+     * last event is somewhere in the body. */
+    char wanted[16];
+    snprintf(wanted, sizeof wanted, "%c%caaa",
+             'a' + ((STM_SLATE_LOG_LINES - 1) % 26),
+             '0' + ((STM_SLATE_LOG_LINES - 1) % 10));
+    /* memmem is non-portable; do a manual scan. */
+    int found = 0;
+    size_t wlen = strlen(wanted);
+    for (uint32_t i = 0; i + wlen <= got; i++) {
+        if (memcmp(buf + i, wanted, wlen) == 0) { found = 1; break; }
+    }
+    STM_ASSERT(found);
+
+    stm_slate_destroy(s);
+}
+
 STM_TEST(slate_concurrent_writers_version_advances_exactly_n_times)
 {
     stm_slate *s = NULL;
