@@ -1,6 +1,13 @@
 //! TUI loop — lifted from stratum-slate-tty's main.rs core (run_ui +
 //! handle_key + fetch_snapshot). Same FAR-Commander chrome, same
 //! /event verb routing.
+//!
+//! SWISS-4b adds:
+//!   - LocalDialog::Input modal (rendered via ui.rs::draw_local_dialog).
+//!     Currently triggered by Shift+F2 ("Host directory:") and by
+//!     Enter on a yellow `.stm` entry when a keyfile prompt is needed.
+//!   - SpawnCtx integration so the TUI can spawn additional host-fs /
+//!     stratumd daemons and attach them to the inactive panel.
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -15,18 +22,25 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use std::thread;
 use std::time::Duration;
 
 use crate::slate::{read_lines, read_text_trim, SlateClient};
-use crate::ui::{self, PanelView, UiState};
+use crate::spawn::{BackendMeta, SpawnCtx};
+use crate::ui::{self, LocalDialog, LocalDialogKind, PanelView, UiState};
 
 pub struct Opts {
     pub slate_sock: PathBuf,
     pub attach: Option<PathBuf>,
+    /// SWISS-4b: spawn helper for mid-session daemon adds. None when
+    /// the TUI is attached to an already-running slate (the user
+    /// explicitly asked for that mode and is responsible for daemon
+    /// lifecycle). Shift+F2 / Enter-on-.stm display an error dialog
+    /// when spawn is None.
+    pub spawn: Option<Arc<SpawnCtx>>,
 }
 
 pub fn run(opts: Opts) -> Result<()> {
@@ -55,7 +69,7 @@ pub fn run(opts: Opts) -> Result<()> {
             .spawn(move || redraw_loop(sock, redraw_tx, stop))?
     };
 
-    let result = run_ui(&mut main_client, &redraw_rx);
+    let result = run_ui(&mut main_client, &redraw_rx, opts.spawn.clone());
 
     stop_flag.store(true, Ordering::SeqCst);
 
@@ -65,7 +79,7 @@ pub fn run(opts: Opts) -> Result<()> {
 fn redraw_loop(slate_sock: PathBuf, tx: Sender<u64>, stop: Arc<AtomicBool>) {
     let mut client = match SlateClient::dial(&slate_sock) {
         Ok(c) => c,
-        Err(_) => return, // R125 P3-5 — silent exit; raw mode is up.
+        Err(_) => return,
     };
     let mut last_version: u64 = 0;
     let mut consecutive_no_advance: u32 = 0;
@@ -94,7 +108,11 @@ fn redraw_loop(slate_sock: PathBuf, tx: Sender<u64>, stop: Arc<AtomicBool>) {
     }
 }
 
-fn run_ui(client: &mut SlateClient, redraw_rx: &Receiver<u64>) -> Result<()> {
+fn run_ui(
+    client: &mut SlateClient,
+    redraw_rx: &Receiver<u64>,
+    spawn: Option<Arc<SpawnCtx>>,
+) -> Result<()> {
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
@@ -103,15 +121,17 @@ fn run_ui(client: &mut SlateClient, redraw_rx: &Receiver<u64>) -> Result<()> {
     let mut terminal = Terminal::new(backend).context("create terminal")?;
 
     let mut focus: usize = 0;
+    let mut local_dialog: Option<LocalDialog> = None;
     let result = (|| -> Result<()> {
         loop {
-            let snapshot = fetch_snapshot(client, focus)?;
+            let snapshot = fetch_snapshot(client, focus, &local_dialog)?;
             terminal.draw(|frame| ui::render(frame, &snapshot))?;
             loop {
                 if event::poll(Duration::from_millis(100))? {
                     match event::read()? {
                         Event::Key(key) if key.kind == KeyEventKind::Press => {
-                            match handle_key(client, &mut focus, &snapshot, key)? {
+                            match handle_key(client, &mut focus, &mut local_dialog,
+                                              spawn.as_ref(), &snapshot, key)? {
                                 Action::Quit => return Ok(()),
                                 Action::Refresh => break,
                                 Action::Ignore => {}
@@ -147,9 +167,18 @@ enum Action {
 fn handle_key(
     client: &mut SlateClient,
     focus: &mut usize,
+    local_dialog: &mut Option<LocalDialog>,
+    spawn: Option<&Arc<SpawnCtx>>,
     snap: &UiState,
     key: crossterm::event::KeyEvent,
 ) -> Result<Action> {
+    // SWISS-4b: when a local dialog is up, route input through it
+    // FIRST. Esc cancels, Enter submits, Backspace edits, printable
+    // chars append. We don't forward to slate while modal.
+    if local_dialog.is_some() {
+        return handle_dialog_key(local_dialog, spawn, snap, key);
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && (matches!(key.code, KeyCode::Char('q') | KeyCode::Char('c')))
     {
@@ -164,19 +193,12 @@ fn handle_key(
             return Ok(Action::Refresh);
         }
         KeyCode::Up => {
-            // Locally-clamped cursor — refuse to send "key Up" if
-            // already at top. Saves a round-trip + prevents slate's
-            // version bump on a no-op (R116 P3-2 doctrine).
             if snap.panels[*focus].cursor > 0 {
                 action_verb(client, *focus, "key Up\n")?;
                 return Ok(Action::Refresh);
             }
         }
         KeyCode::Down => {
-            // Bug #2: locally cap cursor at entries-count-1; otherwise
-            // slate's STM_ENOTSUPPORTED-on-overflow fallthrough lets
-            // cursor grow past the visible row, breaking the
-            // highlight + scroll math.
             let n = snap.panels[*focus].raw_entries.len();
             if n > 0 && (snap.panels[*focus].cursor as usize) < n - 1 {
                 action_verb(client, *focus, "key Down\n")?;
@@ -184,6 +206,29 @@ fn handle_key(
             }
         }
         KeyCode::Enter => {
+            // SWISS-4b: Enter on a yellow `.stm` entry → mount the
+            // volume in the INACTIVE panel (other side). User decision
+            // 2026-05-07: "Shift+F2 mounts host in active panel; Enter
+            // on .stm mounts in the OTHER panel; FN commands operate
+            // on active panel."
+            if let Some(stm_path) = detect_stm_at_cursor(snap, *focus, spawn) {
+                if let Some(sp) = spawn {
+                    let inactive = 1 - *focus;
+                    return mount_stm_volume(local_dialog, sp, inactive, &stm_path);
+                } else {
+                    *local_dialog = Some(LocalDialog {
+                        kind: LocalDialogKind::Error,
+                        prompt: "Cannot mount: TUI was started with --slate-sock; \
+                                 spawn helper unavailable. Run `stratum tui --vol PATH` \
+                                 to use embedded mode.".into(),
+                        value: String::new(),
+                        is_password: false,
+                        is_error: true,
+                    });
+                    return Ok(Action::Refresh);
+                }
+            }
+            // Otherwise: descend (slate's default Enter verb).
             action_verb(client, *focus, "key Enter\n")?;
             return Ok(Action::Refresh);
         }
@@ -192,11 +237,18 @@ fn handle_key(
             return Ok(Action::Refresh);
         }
         KeyCode::F(n) if (1..=9).contains(&n) => {
-            // Shift+F<n> routes as "key Shift-F<N>" so slate can
-            // distinguish modifier-bearing presses from bare ones.
-            // Currently all unsupported by slate; renderer is
-            // forward-compat for SWISS-N wiring (Shift+F2 = Host
-            // mount, Shift+F7 = MkVol).
+            // SWISS-4b: Shift+F2 = host mount on ACTIVE panel.
+            if key.modifiers.contains(KeyModifiers::SHIFT) && n == 2 {
+                *local_dialog = Some(LocalDialog {
+                    kind: LocalDialogKind::HostMountInput { panel_idx: *focus },
+                    prompt: "Host directory to mount in this panel:".into(),
+                    value: default_host_path(),
+                    is_password: false,
+                    is_error: false,
+                });
+                return Ok(Action::Refresh);
+            }
+            // Other F-keys: forward to slate for forward-compat.
             let verb = if key.modifiers.contains(KeyModifiers::SHIFT) {
                 format!("key Shift-F{n}\n")
             } else {
@@ -210,6 +262,195 @@ fn handle_key(
     Ok(Action::Ignore)
 }
 
+/// SWISS-4b: dispatch keystrokes when a local dialog is active.
+fn handle_dialog_key(
+    local_dialog: &mut Option<LocalDialog>,
+    spawn: Option<&Arc<SpawnCtx>>,
+    _snap: &UiState,
+    key: crossterm::event::KeyEvent,
+) -> Result<Action> {
+    let Some(d) = local_dialog.as_mut() else {
+        return Ok(Action::Ignore);
+    };
+    match key.code {
+        KeyCode::Esc => {
+            *local_dialog = None;
+            return Ok(Action::Refresh);
+        }
+        KeyCode::Enter => {
+            // Submit. Take the dialog out so we can dispatch then
+            // clear without holding a borrow.
+            let dialog = local_dialog.take().unwrap();
+            return submit_dialog(local_dialog, spawn, dialog);
+        }
+        KeyCode::Backspace => {
+            d.value.pop();
+            return Ok(Action::Refresh);
+        }
+        KeyCode::Char(c) => {
+            // R125 P1-1 carry: refuse control bytes in dialog input.
+            // Most printable chars + UTF-8 multi-byte pass.
+            if (c as u32) >= 0x20 && c as u32 != 0x7F {
+                d.value.push(c);
+                return Ok(Action::Refresh);
+            }
+        }
+        _ => {}
+    }
+    Ok(Action::Ignore)
+}
+
+fn submit_dialog(
+    local_dialog: &mut Option<LocalDialog>,
+    spawn: Option<&Arc<SpawnCtx>>,
+    dialog: LocalDialog,
+) -> Result<Action> {
+    if dialog.is_error {
+        // Error dialogs are dismiss-only.
+        return Ok(Action::Refresh);
+    }
+    match dialog.kind {
+        LocalDialogKind::Error => {
+            // Same as is_error path.
+            Ok(Action::Refresh)
+        }
+        LocalDialogKind::HostMountInput { panel_idx } => {
+            let sp = match spawn {
+                Some(s) => s,
+                None => {
+                    *local_dialog = Some(error_dialog(
+                        "Cannot mount: spawn helper unavailable.",
+                    ));
+                    return Ok(Action::Refresh);
+                }
+            };
+            let path = PathBuf::from(dialog.value.trim());
+            match sp.spawn_host_fs(&path) {
+                Ok(sock) => {
+                    let meta = BackendMeta::HostFs {
+                        root: path.clone(),
+                    };
+                    if let Err(e) = sp.attach_panel(panel_idx, &sock, meta) {
+                        *local_dialog =
+                            Some(error_dialog(&format!("attach failed: {e}")));
+                        return Ok(Action::Refresh);
+                    }
+                    Ok(Action::Refresh)
+                }
+                Err(e) => {
+                    *local_dialog = Some(error_dialog(&format!("spawn host-fs: {e}")));
+                    Ok(Action::Refresh)
+                }
+            }
+        }
+        LocalDialogKind::PassphraseFor { volume: _ } => {
+            // Forward-noted: passphrase entry → derive keyfile +
+            // spawn stratumd. Not wired in v1.0 of SWISS-4b.
+            *local_dialog = Some(error_dialog(
+                "Passphrase entry is forward-noted (SWISS-4b1).\n\
+                 Place a companion <volume>.key beside the .stm file.",
+            ));
+            Ok(Action::Refresh)
+        }
+    }
+}
+
+fn error_dialog(msg: &str) -> LocalDialog {
+    LocalDialog {
+        kind: LocalDialogKind::Error,
+        prompt: msg.to_string(),
+        value: String::new(),
+        is_password: false,
+        is_error: true,
+    }
+}
+
+/// SWISS-4b: detect whether the cursor in `panel_idx` is on a yellow
+/// `.stm` entry AND the panel's backend is a host-fs. Returns the
+/// resolved on-disk path to the .stm file when both conditions hold.
+fn detect_stm_at_cursor(
+    snap: &UiState,
+    panel_idx: usize,
+    spawn: Option<&Arc<SpawnCtx>>,
+) -> Option<PathBuf> {
+    let panel = &snap.panels[panel_idx];
+    if !panel.connected {
+        return None;
+    }
+    let cursor = panel.cursor as usize;
+    let raw = panel.raw_entries.get(cursor)?;
+    // Format: "TYPE MODE SIZE MTIME NAME". Skip ".." entries.
+    let mut parts = raw.splitn(5, ' ');
+    let kind = parts.next()?;
+    let _mode = parts.next();
+    let _size = parts.next();
+    let _mtime = parts.next();
+    let name = parts.next()?;
+    if kind != "-" || !name.ends_with(".stm") || name == ".." {
+        return None;
+    }
+    let sp = spawn?;
+    let meta = sp.panel_meta(panel_idx);
+    let host_root = match meta {
+        BackendMeta::HostFs { root } => root,
+        _ => return None,
+    };
+    // 9P-style: panel.path is "/" or "/foo/bar"; entry name is the
+    // leaf. OS path = host_root + panel.path + "/" + name (with
+    // double-slash-collapsed).
+    let mut p = host_root.clone();
+    let cwd = panel.path.trim_start_matches('/');
+    if !cwd.is_empty() {
+        p.push(cwd);
+    }
+    p.push(name);
+    Some(p)
+}
+
+fn mount_stm_volume(
+    local_dialog: &mut Option<LocalDialog>,
+    spawn: &Arc<SpawnCtx>,
+    target_panel: usize,
+    stm_path: &Path,
+) -> Result<Action> {
+    match spawn.spawn_stratumd(stm_path, None) {
+        Ok(sock) => {
+            let meta = BackendMeta::Stratumd {
+                volume: stm_path.to_path_buf(),
+            };
+            if let Err(e) = spawn.attach_panel(target_panel, &sock, meta) {
+                *local_dialog =
+                    Some(error_dialog(&format!("attach stratumd: {e}")));
+            }
+            Ok(Action::Refresh)
+        }
+        Err(e) => {
+            // Most common failure: missing companion .key. Pop a
+            // passphrase prompt (forward-noted).
+            *local_dialog = Some(LocalDialog {
+                kind: LocalDialogKind::PassphraseFor {
+                    volume: stm_path.to_path_buf(),
+                },
+                prompt: format!(
+                    "Mount {} failed: {e}\n\nPassphrase prompt is forward-noted; \
+                     for now, place a <volume>.key beside the .stm file.",
+                    stm_path.display()
+                ),
+                value: String::new(),
+                is_password: true,
+                is_error: false,
+            });
+            Ok(Action::Refresh)
+        }
+    }
+}
+
+fn default_host_path() -> String {
+    std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "/".into())
+}
+
 fn action_verb(client: &mut SlateClient, focus: usize, verb: &str) -> Result<()> {
     let path = if focus == 0 {
         "/panels/left/action"
@@ -220,14 +461,15 @@ fn action_verb(client: &mut SlateClient, focus: usize, verb: &str) -> Result<()>
     Ok(())
 }
 
-fn fetch_snapshot(client: &mut SlateClient, focus: usize) -> Result<UiState> {
+fn fetch_snapshot(
+    client: &mut SlateClient,
+    focus: usize,
+    local_dialog: &Option<LocalDialog>,
+) -> Result<UiState> {
     let version: u64 = read_text_trim(client, "/version")?
         .parse()
         .unwrap_or(0);
     let status = read_text_trim(client, "/status").unwrap_or_default();
-    // SWISS-4a: each panel has its OWN connection. The top-level
-    // /connection/connected is the panel-0 (LEFT) back-compat alias;
-    // panel 1 (RIGHT) reads its own /connection/right/connected.
     let left_connected =
         read_text_trim(client, "/connection/left/connected").unwrap_or("0".into()) == "1";
     let right_connected =
@@ -273,6 +515,7 @@ fn fetch_snapshot(client: &mut SlateClient, focus: usize) -> Result<UiState> {
         editor_filename,
         editor_modified,
         editor_preview,
+        local_dialog: local_dialog.clone(),
     })
 }
 

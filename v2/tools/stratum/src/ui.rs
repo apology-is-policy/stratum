@@ -126,6 +126,37 @@ pub struct UiState {
     pub editor_filename: String,
     pub editor_modified: bool,
     pub editor_preview: Vec<String>,
+    /// SWISS-4b: TUI-local modal dialog (host-mount input, error,
+    /// passphrase prompt). Distinct from slate's /dialogs subtree
+    /// (which is for daemon→user prompts). When `Some`, render
+    /// overlays the panels and consumes keyboard input.
+    pub local_dialog: Option<LocalDialog>,
+}
+
+/// SWISS-4b: kind of modal dialog the TUI is currently displaying.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub enum LocalDialogKind {
+    /// User asked Shift+F2 → enter a host directory to mount in the
+    /// indicated panel (active panel at the time of press).
+    HostMountInput { panel_idx: usize },
+    /// User pressed Enter on a yellow `.stm` whose companion .key
+    /// is missing → prompt for passphrase (forward-noted as
+    /// SWISS-4b1; v1.0 shows error-style instructions only). The
+    /// volume field is read by the SWISS-4b1 sub-chunk that wires
+    /// passphrase entry → keyfile derivation → spawn_stratumd.
+    PassphraseFor { volume: std::path::PathBuf },
+    /// Error / informational; dismiss with Esc or Enter.
+    Error,
+}
+
+#[derive(Clone, Debug)]
+pub struct LocalDialog {
+    pub kind: LocalDialogKind,
+    pub prompt: String,
+    pub value: String,
+    pub is_password: bool,
+    pub is_error: bool,
 }
 
 // ── main draw ─────────────────────────────────────────────────────────
@@ -160,6 +191,12 @@ pub fn render(frame: &mut Frame<'_>, state: &UiState) {
         draw_editor_overlay(frame, area, state);
     } else if !state.dialog_stack.is_empty() {
         draw_dialog_overlay(frame, area, state);
+    }
+    // SWISS-4b: local modal dialog renders OVER any other surface
+    // so prompts are visible even when slate-side dialogs / editor
+    // are also active.
+    if let Some(d) = state.local_dialog.as_ref() {
+        draw_local_dialog(frame, area, d);
     }
 }
 
@@ -528,6 +565,82 @@ fn draw_dialog_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
 }
 
 // ── helpers ───────────────────────────────────────────────────────────
+
+// ── SWISS-4b: local dialog overlay ────────────────────────────────────
+//
+// Visual idiom lifted from the v1 TUI's draw_input_dialog (red border
+// for password prompts, yellow input cursor) — gives the user the
+// same affordance they had in v1.
+
+fn draw_local_dialog(frame: &mut Frame<'_>, area: Rect, d: &LocalDialog) {
+    let body_lines = d.prompt.lines().count() as u16;
+    let h = (5 + body_lines).min(area.height.saturating_sub(2));
+    let w = 70.min(area.width.saturating_sub(4));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+
+    let title = match (&d.kind, d.is_error) {
+        (_, true) => " Error ",
+        (LocalDialogKind::HostMountInput { .. }, _) => " Mount host directory ",
+        (LocalDialogKind::PassphraseFor { .. }, _) => " Passphrase ",
+        (LocalDialogKind::Error, _) => " Notice ",
+    };
+    let border_clr = if d.is_error { Color::Red } else { Color::Cyan };
+    let prompt_clr = if d.is_password { Color::Red } else { Color::White };
+
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(dbl_border())
+        .border_style(Style::default().fg(border_clr).bold())
+        .title(Line::from(Span::styled(
+            title.to_string(),
+            Style::default().fg(border_clr).bold(),
+        )))
+        .style(Style::default().bg(CLR_POPUP_BG));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    // Body: prompt (sanitized) + (if input) display + cursor + tail.
+    let mut lines: Vec<Line> = d
+        .prompt
+        .lines()
+        .map(|s| {
+            Line::from(Span::styled(
+                sanitize_for_display(s),
+                Style::default().fg(prompt_clr),
+            ))
+        })
+        .collect();
+    if !d.is_error {
+        lines.push(Line::from(""));
+        let display = if d.is_password {
+            "*".repeat(d.value.chars().count())
+        } else {
+            sanitize_for_display(&d.value)
+        };
+        lines.push(Line::from(Span::styled(
+            format!("> {display}_"),
+            Style::default().fg(Color::Yellow).bold(),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "[Enter] submit · [Esc] cancel",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "[Enter] / [Esc] dismiss",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        inner,
+    );
+}
 
 fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
     let v = Layout::default()

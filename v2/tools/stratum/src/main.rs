@@ -28,6 +28,7 @@ mod embed;
 mod ffi;
 mod landing;
 mod slate;
+mod spawn;
 mod tui;
 mod ui;
 
@@ -190,6 +191,10 @@ fn tui_dispatch(args: &[String]) -> Result<i32> {
     }
 
     let slate_sock = slate_sock.unwrap();
-    tui::run(tui::Opts { slate_sock, attach })?;
+    tui::run(tui::Opts {
+        slate_sock,
+        attach,
+        spawn: None,
+    })?;
     Ok(0)
 }

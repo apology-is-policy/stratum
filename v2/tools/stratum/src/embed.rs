@@ -24,9 +24,11 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::spawn::{BackendMeta, SpawnCtx};
 use crate::tui;
 
 pub struct EmbedOpts {
@@ -236,6 +238,25 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         eprintln!("stratum: warning: right-panel pre-attach failed: {e}");
     }
 
+    // SWISS-4b: build the SpawnCtx so the TUI can spawn additional
+    // host-fs / stratumd daemons mid-session (Shift+F2 + Enter-on-
+    // .stm). Initial per-panel BackendMeta records the panel's
+    // backend root so Enter-on-.stm can resolve the on-disk volume
+    // path by joining host_root + panel.path + entry name.
+    let initial_meta: [BackendMeta; 2] = [
+        match opts.volume.as_ref() {
+            Some(v) => BackendMeta::Stratumd { volume: v.clone() },
+            None => BackendMeta::HostFs { root: host_root.clone() },
+        },
+        BackendMeta::HostFs { root: host_root.clone() },
+    ];
+    let spawn_ctx = Arc::new(SpawnCtx::new(
+        session_dir.clone(),
+        me.clone(),
+        slate_sock.clone(),
+        initial_meta,
+    ));
+
     let result = if opts.headless {
         run_headless(&slate_sock, &left_plan.sock, &prev_mask)
     } else {
@@ -243,9 +264,11 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         tui::run(tui::Opts {
             slate_sock: slate_sock.clone(),
             attach: None,
+            spawn: Some(Arc::clone(&spawn_ctx)),
         })
     };
 
+    spawn_ctx.teardown();
     teardown_child(&mut slate_child, "slate");
     if let Some(mut c) = stratumd_child {
         teardown_child(&mut c, "stratumd");
