@@ -346,9 +346,22 @@ void stm_slate_destroy(stm_slate *s)
     pthread_mutex_lock(&s->mu);
     stm_9p_client *bc = s->backend;
     s->backend = NULL;
+    /* R115 P3-6: defensive sweep of any leftover heap-allocated
+     * bulk_buf in sessions. R96 P2-1 caller contract should have
+     * drained all sessions via vops_clunk → session_free_locked
+     * BEFORE we got here, but a future caller violating the contract
+     * (or a unit test bypassing the lp9 server) would leak otherwise.
+     * Free BEFORE the memset that clears the slot pointer (load-
+     * bearing order — same posture as session_free_locked). */
+    for (uint32_t i = 0; i < STM_SLATE_MAX_SESSIONS; i++) {
+        if (s->sessions[i].active && s->sessions[i].bulk_buf) {
+            free(s->sessions[i].bulk_buf);
+            s->sessions[i].bulk_buf = NULL;
+        }
+    }
     pthread_mutex_unlock(&s->mu);
-    pthread_mutex_unlock(&s->backend_mu);
     if (bc) stm_9p_close(bc);
+    pthread_mutex_unlock(&s->backend_mu);
 
     pthread_mutex_destroy(&s->backend_mu);
     pthread_mutex_destroy(&s->mu);
@@ -472,12 +485,15 @@ stm_status stm_slate_disconnect(stm_slate *s)
     stm_9p_client *old_bc = NULL;
     disconnect_state_swap_locked(s, &old_bc);
     pthread_mutex_unlock(&s->mu);
-    /* Close OUTSIDE s->mu but UNDER backend_mu — backend_mu pins the
-     * backend pointer for any concurrent panel-entries op so we don't
-     * close out from under it. backend_mu also serialises Disconnect
-     * against Attach so a re-attach can't race a close. */
-    pthread_mutex_unlock(&s->backend_mu);
+    /* R115 P2-1: close UNDER backend_mu (matches stm_slate_attach's
+     * close-then-unlock order). backend_mu pins the backend pointer
+     * for any concurrent panel-entries op so we don't close out from
+     * under it. Releasing backend_mu BEFORE close would let a new
+     * attach start dialing while old_bc is still being closed —
+     * inconsistent with attach's discipline and allows fd-exhaustion
+     * race under disconnect/attach storms. */
     if (old_bc) stm_9p_close(old_bc);
+    pthread_mutex_unlock(&s->backend_mu);
     return STM_OK;
 }
 
@@ -932,12 +948,34 @@ static stm_status panel_entries_render(stm_slate *s, const char *cwd,
             default:  tc = '?'; break;
         }
 
+        /* R115 P1-1: sanitize control bytes in entry name BEFORE
+         * snprintf'ing into the line-oriented body. stm_fs's
+         * `fs_validate_dirent_name` only rejects '/' and '\0' (POSIX
+         * permits any other byte in filenames); without this filter,
+         * a filename containing '\n' would split the rendered line
+         * and let a malicious or buggy backend forge entries that a
+         * line-by-line renderer treats as real files. R99 P2-1
+         * doctrine class — sanitize at the display surface since
+         * stm_fs cannot tighten its filter without breaking POSIX.
+         * Bytes < 0x20 OR == 0x7F replaced with '?'; UTF-8 multi-byte
+         * sequences (≥ 0x80) pass through unchanged. The ORIGINAL
+         * name is used for the per-entry Twalk above so we still
+         * resolve the real backend file. */
+        char safe_name[STM_LP9_NAME_MAX + 1];
+        size_t safe_len = de->name_len;
+        if (safe_len > STM_LP9_NAME_MAX) safe_len = STM_LP9_NAME_MAX;
+        for (size_t ni = 0; ni < safe_len; ni++) {
+            unsigned char c = (unsigned char)de->name[ni];
+            safe_name[ni] = (c < 0x20u || c == 0x7Fu) ? '?' : (char)c;
+        }
+        safe_name[safe_len] = '\0';
+
         char line[STM_SLATE_ENTRY_LINE_MAX + 1];
         int n = snprintf(line, sizeof line, "%c %04o %llu %llu %s\n",
                             tc, (unsigned)mode_lo,
                             (unsigned long long)size,
                             (unsigned long long)mtime,
-                            de->name);
+                            safe_name);
         if (n < 0) n = 0;
         if (n >= (int)sizeof line) n = (int)sizeof line - 1;
         if (body_off + (size_t)n > body_cap) break;  /* hard cap */
@@ -963,6 +1001,15 @@ static stm_status lopen_panel_entries(stm_slate *s, uint32_t fid,
     size_t path_len;
     pthread_mutex_lock(&s->mu);
     path_len = s->panel[panel_idx].path_len;
+    /* R115 P3-3: defense-in-depth bound. SLATE-2's state machine
+     * guarantees path_len ≤ STM_SLATE_PATH_MAX (only "/" or "" are
+     * set), but a SLATE-3 chunk introducing /panels/X/cwd writable
+     * would break this if the writer doesn't enforce the cap. Match
+     * materialize_panel_path_locked's defensive posture. */
+    if (path_len > STM_SLATE_PATH_MAX) {
+        pthread_mutex_unlock(&s->mu);
+        return STM_ERANGE;
+    }
     if (path_len > 0) {
         memcpy(path, s->panel[panel_idx].path, path_len);
     }

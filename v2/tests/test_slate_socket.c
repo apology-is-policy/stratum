@@ -650,6 +650,30 @@ STM_TEST(slate_socket_attach_to_backend_and_read_panel_entries)
     STM_ASSERT(strstr(ebuf, " log\n")        != NULL);
     STM_ASSERT(strstr(ebuf, " connection\n") != NULL);
     STM_ASSERT(strstr(ebuf, " panels\n")     != NULL);
+
+    /* R115 P1-1 structural invariant: every \n-terminated line in
+     * the body MUST start with a TYPE char in {d, -, l, ?} followed
+     * by ' '. This catches a regression where the entry-name
+     * sanitization is removed and a name with embedded '\n' slips
+     * through — the would-be-forged "second line" would fail this
+     * format check. (For SLATE-2's safe backend names this just
+     * verifies the format invariant on the happy path.) */
+    {
+        uint32_t lines = 0;
+        const char *p = ebuf;
+        const char *end = ebuf + egot;
+        while (p < end) {
+            const char *nl = memchr(p, '\n', (size_t)(end - p));
+            STM_ASSERT(nl != NULL);
+            STM_ASSERT(nl - p >= 2);
+            char tc = p[0];
+            STM_ASSERT(tc == 'd' || tc == '-' || tc == 'l' || tc == '?');
+            STM_ASSERT_EQ(p[1], ' ');
+            lines++;
+            p = nl + 1;
+        }
+        STM_ASSERT_EQ(lines, 7u);
+    }
     STM_ASSERT_OK(stm_9p_clunk(c, 104u));
 
     /* Step 5: disconnect via empty body to /connection/attach. */

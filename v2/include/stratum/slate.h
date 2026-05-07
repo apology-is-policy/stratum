@@ -24,18 +24,24 @@
  *                         implicitly written by the daemon on /event).
  *
  *   P9-SLATE-2 — backend connection + read-only panel state:
- *     /connection/socket     (R)  current backend socket path; empty
- *                                 when disconnected.
- *     /connection/connected  (R)  "1" | "0".
+ *     /connection/socket     (R)  current backend socket path + '\n';
+ *                                 just '\n' (1 byte) when disconnected.
+ *     /connection/connected  (R)  "1\n" | "0\n" (always 2 bytes).
  *     /connection/attach     (W)  write a stratumd Unix-socket path to
- *                                 dial; empty body disconnects.
- *     /panels/left/path      (R)  cwd in the left panel; "/" when
- *                                 connected, empty when not.
+ *                                 dial; empty body (or "\n" alone)
+ *                                 disconnects.
+ *     /panels/left/path      (R)  panel cwd + '\n'; "/\n" when connected,
+ *                                 just '\n' (1 byte) when disconnected.
  *     /panels/left/entries   (R)  one rendered line per entry in the
  *                                 left panel's cwd. Format per
  *                                 SLATE-DESIGN §3:
  *                                     "TYPE MODE SIZE MTIME NAME\n"
- *                                 Empty when disconnected.
+ *                                 Truly empty (0 bytes) when disconnected
+ *                                 (NOT a single '\n' — this is the only
+ *                                 SLATE-2 read kind that emits 0 bytes
+ *                                 on disconnect; the rest emit a single
+ *                                 newline so renderers can read-line
+ *                                 uniformly).
  *     /panels/right/...      (mirror of left).
  *
  * State-machine spec: v2/specs/slate.tla. Invariants:
