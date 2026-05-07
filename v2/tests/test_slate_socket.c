@@ -1796,6 +1796,88 @@ STM_TEST(slate_socket_5a_editor_close_e2e)
     destroy_backend_fixture(&be);
 }
 
+/* R123 P3-2: editor_open against a directory path returns STM_EISDIR. */
+STM_TEST(slate_socket_5a_editor_open_on_dir_eisdir)
+{
+    slate_backend_fixture be;
+    setup_backend_fixture(&be, "be_5a_dir");
+    slate_fixture f;
+    setup_fixture(&f, "fg_5a_dir");
+
+    stm_9p_client *c = NULL;
+    stm_9p_dial_opts opts = default_dial_opts(100u);
+    STM_ASSERT_OK(retry_dial(g_sock_path, &opts, &c));
+
+    /* Attach. */
+    const char *anames[] = { "connection", "attach" };
+    stm_9p_qid aqids[2];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 101u, 2u, anames, aqids, &walked));
+    stm_9p_qid oqid;
+    uint32_t iounit = 0;
+    STM_ASSERT_OK(stm_9p_lopen(c, 101u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, 101u, 0u, be.sock_path,
+                                  (uint32_t)strlen(be.sock_path), &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 101u));
+
+    /* Try to open slate-B's "/log" — a directory leaf in slate's
+     * synfs. editor_open should refuse with STM_EISDIR. */
+    STM_ASSERT_EQ(stm_slate_editor_open(f.slate, "/log", 4u), STM_EISDIR);
+    STM_ASSERT_EQ((int)stm_slate_editor_active(f.slate), 0);
+
+    stm_9p_close(c);
+    destroy_fixture(&f);
+    destroy_backend_fixture(&be);
+}
+
+/* R123 P3-4: sequential opens replace prior buffer + reset modified. */
+STM_TEST(slate_socket_5a_editor_sequential_opens_replace_buffer)
+{
+    slate_backend_fixture be;
+    setup_backend_fixture(&be, "be_5a_seq");
+    slate_fixture f;
+    setup_fixture(&f, "fg_5a_seq");
+
+    stm_9p_client *c = NULL;
+    stm_9p_dial_opts opts = default_dial_opts(100u);
+    STM_ASSERT_OK(retry_dial(g_sock_path, &opts, &c));
+
+    const char *anames[] = { "connection", "attach" };
+    stm_9p_qid aqids[2];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 101u, 2u, anames, aqids, &walked));
+    stm_9p_qid oqid;
+    uint32_t iounit = 0;
+    STM_ASSERT_OK(stm_9p_lopen(c, 101u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, 101u, 0u, be.sock_path,
+                                  (uint32_t)strlen(be.sock_path), &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 101u));
+
+    /* Open #1: /version. */
+    STM_ASSERT_OK(stm_slate_editor_open(f.slate, "/version", 8u));
+    STM_ASSERT_EQ((int)stm_slate_editor_active(f.slate), 1);
+    char fnbuf[64];
+    size_t fn1 = stm_slate_editor_filename(f.slate, fnbuf, sizeof fnbuf);
+    STM_ASSERT_EQ(fn1, 8u);
+    STM_ASSERT_EQ(strcmp(fnbuf, "/version"), 0);
+    uint64_t v1 = stm_slate_version(f.slate);
+
+    /* Open #2: /status (different leaf). Replaces buffer. */
+    STM_ASSERT_OK(stm_slate_editor_open(f.slate, "/status", 7u));
+    STM_ASSERT_EQ((int)stm_slate_editor_active(f.slate), 1);
+    size_t fn2 = stm_slate_editor_filename(f.slate, fnbuf, sizeof fnbuf);
+    STM_ASSERT_EQ(fn2, 7u);
+    STM_ASSERT_EQ(strcmp(fnbuf, "/status"), 0);
+    uint64_t v2 = stm_slate_version(f.slate);
+    STM_ASSERT(v2 > v1);
+
+    stm_9p_close(c);
+    destroy_fixture(&f);
+    destroy_backend_fixture(&be);
+}
+
 /* /event refuses zero-byte writes (parity with stm_slate_submit_event). */
 STM_TEST(slate_socket_event_zero_byte_einval)
 {

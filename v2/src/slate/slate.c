@@ -1937,6 +1937,17 @@ static stm_status materialize_editor_content_locked(stm_slate *s, slate_session 
         ss->len = 0u;
         return STM_OK;
     }
+    /* R123 P3-3: defense-in-depth cap check before bulk_buf alloc.
+     * editor_open + editor write paths already enforce
+     * editor_content_len ≤ STM_SLATE_EDITOR_CONTENT_MAX, but a future
+     * regression that lets the field grow past MAX would silently
+     * malloc that much and bypass the design's memory-budget. The
+     * single-point-of-failure nature of materialize argues for
+     * belt-and-braces here. STM_ERANGE matches the cap-overrun
+     * status used at the open/write paths. */
+    if (s->editor_content_len > STM_SLATE_EDITOR_CONTENT_MAX) {
+        return STM_ERANGE;
+    }
     /* Use bulk_buf for content; allocate exact size. */
     ss->bulk_buf = malloc(s->editor_content_len);
     if (!ss->bulk_buf) return STM_ENOMEM;
