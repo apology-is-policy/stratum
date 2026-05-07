@@ -126,8 +126,9 @@ fn prompt_new() -> Result<()> {
 fn open_volume(path: &std::path::Path) -> Result<()> {
     add_to_recents(path);
     embed::run(embed::EmbedOpts {
-        volume: path.to_path_buf(),
+        volume: Some(path.to_path_buf()),
         keyfile: None,
+        host: None,
         print_env_to: None,
         headless: false,
     })

@@ -69,7 +69,13 @@ fn print_root_usage() {
            tui [OPTS]       Run the FAR-Commander TUI.\n\
                             --slate-sock PATH   connect to a running slate.\n\
                             --attach STRATUMD   attach a stratumd to slate.\n\
-                            --vol VOLUME        auto-spawn daemons.\n\
+                            --vol VOLUME        auto-spawn daemons +\n\
+                                                attach a stratum volume.\n\
+                            --host PATH         auto-spawn daemons +\n\
+                                                mount a host directory\n\
+                                                read-only (mutually\n\
+                                                exclusive with --vol\n\
+                                                until SWISS-4).\n\
                             --keyfile PATH      override keyfile path.\n\
                             --print-env-to FILE write socket paths.\n\
                             --headless          spawn daemons but skip\n\
@@ -117,6 +123,7 @@ fn tui_dispatch(args: &[String]) -> Result<i32> {
     let mut slate_sock: Option<PathBuf> = None;
     let mut attach: Option<PathBuf> = None;
     let mut vol: Option<PathBuf> = None;
+    let mut host: Option<PathBuf> = None;
     let mut keyfile: Option<PathBuf> = None;
     let mut print_env_to: Option<PathBuf> = None;
     let mut headless = false;
@@ -141,6 +148,10 @@ fn tui_dispatch(args: &[String]) -> Result<i32> {
                 i += 1;
                 vol = Some(PathBuf::from(args.get(i).context("--vol requires a value")?));
             }
+            "--host" => {
+                i += 1;
+                host = Some(PathBuf::from(args.get(i).context("--host requires a value")?));
+            }
             "--keyfile" | "-k" => {
                 i += 1;
                 keyfile = Some(PathBuf::from(args.get(i).context("--keyfile requires a value")?));
@@ -157,17 +168,18 @@ fn tui_dispatch(args: &[String]) -> Result<i32> {
         i += 1;
     }
 
-    if let Some(volume) = vol {
+    if vol.is_some() || host.is_some() {
         embed::run(embed::EmbedOpts {
-            volume,
+            volume: vol,
             keyfile,
+            host,
             print_env_to,
             headless,
         })?;
         return Ok(0);
     }
     if headless {
-        bail!("--headless requires --vol (only meaningful in embedded mode)");
+        bail!("--headless requires --vol or --host (only meaningful in embedded mode)");
     }
 
     let slate_sock = slate_sock.unwrap_or_else(|| PathBuf::from("/tmp/stratum-slate.sock"));

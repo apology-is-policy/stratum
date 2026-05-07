@@ -30,9 +30,13 @@ use std::time::{Duration, Instant};
 use crate::tui;
 
 pub struct EmbedOpts {
-    pub volume: PathBuf,
+    pub volume: Option<PathBuf>,
     pub keyfile: Option<PathBuf>,
     pub print_env_to: Option<PathBuf>,
+    /// If Some(path), spawn `stratum host-fs PATH` as a sibling daemon
+    /// and attach IT (not stratumd) to slate. Mutually exclusive with
+    /// `volume` until SWISS-4 (slate per-panel multi-attach) lands.
+    pub host: Option<PathBuf>,
     /// If true, spawn daemons + write env file + wait for SIGINT/SIGTERM.
     /// No TUI. Lets external 9P clients (Claude, scripts, Halcyon)
     /// drive slate while the user keeps a normal terminal session.
@@ -40,9 +44,29 @@ pub struct EmbedOpts {
 }
 
 pub fn run(opts: EmbedOpts) -> Result<()> {
-    if !opts.volume.exists() {
-        bail!("volume {} does not exist; run `stratum mkfs` first", opts.volume.display());
+    // SWISS-3: exactly one backend source allowed at v1.0 (single-
+    // backend slate). --host and --vol are mutually exclusive until
+    // SWISS-4 lands per-panel multi-attach.
+    let backend_kind = match (opts.volume.is_some(), opts.host.is_some()) {
+        (true, true) => bail!(
+            "--vol and --host are mutually exclusive at v1.0 \
+             (single-backend constraint; SWISS-4 will lift this)"
+        ),
+        (true, false) => BackendKind::Stratumd,
+        (false, true) => BackendKind::HostFs,
+        (false, false) => bail!("--vol PATH or --host PATH required"),
+    };
+    if let Some(v) = opts.volume.as_ref() {
+        if !v.exists() {
+            bail!("volume {} does not exist; run `stratum mkfs` first", v.display());
+        }
     }
+    if let Some(h) = opts.host.as_ref() {
+        if !h.exists() || !h.is_dir() {
+            bail!("--host {} must exist and be a directory", h.display());
+        }
+    }
+
     // R126 P2-2: mask SIGINT/SIGTERM on the parent thread BEFORE
     // spawning children. Without this, a Ctrl-C during the
     // ~5-second wait_for_sock window kills the parent and leaves
@@ -51,52 +75,68 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
     // run_headless (which sigwaits for clean shutdown).
     let prev_mask = block_term_signals();
     let session_dir = make_session_dir()?;
-    let stratumd_sock = session_dir.join("stratumd.sock");
+    let backend_sock = match backend_kind {
+        BackendKind::Stratumd => session_dir.join("stratumd.sock"),
+        BackendKind::HostFs   => session_dir.join("host-fs.sock"),
+    };
     let slate_sock = session_dir.join("slate.sock");
 
     let me = std::env::current_exe().context("locate own binary")?;
 
-    // Spawn stratumd. Re-execs `stratum serve <volume> --listen
-    // <stratumd_sock> [--keyfile <keyfile>]`. Inherits stderr so the
-    // user sees the daemon's "serving …" line; stdout is /dev/null.
-    let keyfile = opts
-        .keyfile
-        .clone()
-        .unwrap_or_else(|| {
-            let mut p = opts.volume.clone();
-            let new_name = format!(
-                "{}.key",
-                p.file_name().unwrap_or_default().to_string_lossy()
-            );
-            p.set_file_name(new_name);
-            p
-        });
-    let mut stratumd_args: Vec<String> = vec![
-        "serve".into(),
-        opts.volume.to_string_lossy().into_owned(),
-        "--listen".into(),
-        stratumd_sock.to_string_lossy().into_owned(),
-        "--keyfile".into(),
-        keyfile.to_string_lossy().into_owned(),
-    ];
-    let mut stratumd_child = Command::new(&me)
-        .args(&stratumd_args)
+    // Spawn the backend daemon (stratumd OR host-fs depending on
+    // backend_kind). Both re-exec the same `stratum` binary with
+    // different subcommands. Inherits stderr so the user sees the
+    // daemon's "serving …" line; stdout is /dev/null.
+    let backend_args: Vec<String> = match backend_kind {
+        BackendKind::Stratumd => {
+            let volume = opts.volume.as_ref().unwrap();
+            let keyfile = opts.keyfile.clone().unwrap_or_else(|| {
+                let mut p = volume.clone();
+                let new_name = format!(
+                    "{}.key",
+                    p.file_name().unwrap_or_default().to_string_lossy()
+                );
+                p.set_file_name(new_name);
+                p
+            });
+            vec![
+                "serve".into(),
+                volume.to_string_lossy().into_owned(),
+                "--listen".into(),
+                backend_sock.to_string_lossy().into_owned(),
+                "--keyfile".into(),
+                keyfile.to_string_lossy().into_owned(),
+            ]
+        }
+        BackendKind::HostFs => {
+            let host = opts.host.as_ref().unwrap();
+            vec![
+                "host-fs".into(),
+                host.to_string_lossy().into_owned(),
+                "--listen".into(),
+                backend_sock.to_string_lossy().into_owned(),
+                "--allow-unauth".into(),
+            ]
+        }
+    };
+    let mut backend_child = Command::new(&me)
+        .args(&backend_args)
         .stdout(Stdio::null())
         // R126 P2-2: own process group, so terminal SIGINT
         // doesn't propagate to the children. Parent reaps via
         // explicit SIGTERM in teardown_child.
         .process_group(0)
         .spawn()
-        .with_context(|| format!("spawn stratumd via {}", me.display()))?;
-    stratumd_args.clear(); // free.
+        .with_context(|| format!("spawn {} via {}", backend_kind.name(), me.display()))?;
 
-    // Wait for stratumd's socket.
-    if let Err(e) = wait_for_sock(&stratumd_sock, Duration::from_secs(5)) {
-        let _ = stratumd_child.kill();
+    // Wait for backend's socket.
+    if let Err(e) = wait_for_sock(&backend_sock, Duration::from_secs(5)) {
+        let _ = backend_child.kill();
         let _ = cleanup_session_dir(&session_dir);
         return Err(e.context(format!(
-            "stratumd socket never appeared at {}",
-            stratumd_sock.display()
+            "{} socket never appeared at {}",
+            backend_kind.name(),
+            backend_sock.display()
         )));
     }
 
@@ -116,14 +156,14 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
     {
         Ok(c) => c,
         Err(e) => {
-            let _ = stratumd_child.kill();
+            let _ = backend_child.kill();
             let _ = cleanup_session_dir(&session_dir);
             return Err(anyhow!(e).context("spawn slate"));
         }
     };
     if let Err(e) = wait_for_sock(&slate_sock, Duration::from_secs(5)) {
         let _ = slate_child.kill();
-        let _ = stratumd_child.kill();
+        let _ = backend_child.kill();
         let _ = cleanup_session_dir(&session_dir);
         return Err(e.context(format!(
             "slate socket never appeared at {}",
@@ -135,10 +175,15 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
     // (refuse if exists) at mode 0600, AND shell-quote the values to
     // tolerate shell metachars in XDG_RUNTIME_DIR or unusual paths.
     if let Some(env_path) = opts.print_env_to.as_ref() {
+        let backend_var = match backend_kind {
+            BackendKind::Stratumd => "STRATUMD_SOCK",
+            BackendKind::HostFs   => "HOST_FS_SOCK",
+        };
         let body = format!(
-            "STRATUM_SLATE_SOCK={}\nSTRATUMD_SOCK={}\n",
+            "STRATUM_SLATE_SOCK={}\n{}={}\n",
             shell_quote(&slate_sock.to_string_lossy()),
-            shell_quote(&stratumd_sock.to_string_lossy())
+            backend_var,
+            shell_quote(&backend_sock.to_string_lossy())
         );
         if let Err(e) = write_env_file_safely(env_path, &body) {
             eprintln!(
@@ -155,12 +200,12 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
     // immediately readable for external clients (e.g. Claude doing
     // `stratum fs -s "$STRATUM_SLATE_SOCK" ls /panels/left/entries`
     // before the user lands a single keystroke).
-    if let Err(e) = attach_slate_with_retry(&slate_sock, &stratumd_sock) {
+    if let Err(e) = attach_slate_with_retry(&slate_sock, &backend_sock) {
         eprintln!("stratum: warning: pre-attach failed: {e}");
     }
 
     let result = if opts.headless {
-        run_headless(&slate_sock, &stratumd_sock, &prev_mask)
+        run_headless(&slate_sock, &backend_sock, &prev_mask)
     } else {
         // R126 P2-2: restore signals BEFORE entering raw mode. The
         // TUI wants Ctrl-C delivered as a key event (terminal raw
@@ -175,10 +220,25 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
     };
 
     teardown_child(&mut slate_child, "slate");
-    teardown_child(&mut stratumd_child, "stratumd");
+    teardown_child(&mut backend_child, backend_kind.name());
     let _ = cleanup_session_dir(&session_dir);
 
     result
+}
+
+#[derive(Clone, Copy)]
+enum BackendKind {
+    Stratumd,
+    HostFs,
+}
+
+impl BackendKind {
+    fn name(self) -> &'static str {
+        match self {
+            BackendKind::Stratumd => "stratumd",
+            BackendKind::HostFs => "host-fs",
+        }
+    }
 }
 
 /// R126 P3-3: dial slate with a brief retry loop. Even after
@@ -215,10 +275,10 @@ fn attach_slate_with_retry(slate_sock: &Path, stratumd_sock: &Path) -> Result<()
 /// instance; (c) integration tests that want the daemons up without
 /// a tty. SIGINT/SIGTERM are already blocked at process startup
 /// (R126 P2-2 fix); we sigwait on them here.
-fn run_headless(slate_sock: &Path, stratumd_sock: &Path, _prev_mask: &libc::sigset_t) -> Result<()> {
+fn run_headless(slate_sock: &Path, backend_sock: &Path, _prev_mask: &libc::sigset_t) -> Result<()> {
     eprintln!("stratum: headless mode — daemons running.");
     eprintln!("        slate    socket: {}", slate_sock.display());
-    eprintln!("        stratumd socket: {}", stratumd_sock.display());
+    eprintln!("        backend  socket: {}", backend_sock.display());
     eprintln!("        send SIGTERM (Ctrl-C) to shut down.");
 
     let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
