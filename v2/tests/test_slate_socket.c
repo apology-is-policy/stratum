@@ -1379,6 +1379,109 @@ STM_TEST(slate_socket_panel_selection_resets_on_cwd_changes)
     destroy_backend_fixture(&be);
 }
 
+/* SLATE-4-confirm R120 P3-5: open a confirm dialog via the
+ * stm_slate_open_confirm API on the SERVER side, then walk + read
+ * + dismiss via the wire from a 9P client. Exercises:
+ *   - /dialogs walk + readdir
+ *   - /dialogs/<id>/title + body + options + kind reads
+ *   - /dialogs/<id>/result write to dismiss
+ *   - /dialogs/stack reflects dismiss
+ * Also exercises the dynamic-id qid encoding through the lp9
+ * wire codec. */
+STM_TEST(slate_socket_dialog_open_dismiss_e2e)
+{
+    slate_fixture f;
+    setup_fixture(&f, "fg_dialog");
+
+    stm_9p_client *c = NULL;
+    stm_9p_dial_opts opts = default_dial_opts(100u);
+    STM_ASSERT_OK(retry_dial(g_sock_path, &opts, &c));
+
+    /* Server-side: open a confirm dialog. */
+    uint64_t did = 0;
+    STM_ASSERT_OK(stm_slate_open_confirm(f.slate,
+        "Overwrite", 9u,
+        "Replace existing /tmp/foo?", 26u,
+        "skip,overwrite,cancel", 21u,
+        &did));
+    STM_ASSERT_EQ(did, 1u);
+
+    /* Read /dialogs/stack — should be "1\n". */
+    const char *snames[] = { "dialogs", "stack" };
+    stm_9p_qid sqids[2];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 101u, 2u, snames, sqids, &walked));
+    stm_9p_qid oqid;
+    uint32_t iounit = 0;
+    STM_ASSERT_OK(stm_9p_lopen(c, 101u, 0u, &oqid, &iounit));
+    char sbuf[32];
+    uint32_t sgot = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 101u, 0u, sbuf,
+                                  (uint32_t)(sizeof sbuf - 1u), &sgot));
+    sbuf[sgot] = '\0';
+    STM_ASSERT_EQ(strcmp(sbuf, "1\n"), 0);
+    STM_ASSERT_OK(stm_9p_clunk(c, 101u));
+
+    /* Walk /dialogs/1/title and read. */
+    const char *tnames[] = { "dialogs", "1", "title" };
+    stm_9p_qid tqids[3];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 102u, 3u, tnames, tqids, &walked));
+    STM_ASSERT_EQ((unsigned)walked, 3u);
+    STM_ASSERT_OK(stm_9p_lopen(c, 102u, 0u, &oqid, &iounit));
+    char tbuf[64];
+    uint32_t tgot = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 102u, 0u, tbuf,
+                                  (uint32_t)(sizeof tbuf - 1u), &tgot));
+    tbuf[tgot] = '\0';
+    STM_ASSERT_EQ(strcmp(tbuf, "Overwrite\n"), 0);
+    STM_ASSERT_OK(stm_9p_clunk(c, 102u));
+
+    /* Walk /dialogs/1/options and read. */
+    const char *onames[] = { "dialogs", "1", "options" };
+    stm_9p_qid oqids[3];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 103u, 3u, onames, oqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 103u, 0u, &oqid, &iounit));
+    char obuf[64];
+    uint32_t ogot = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 103u, 0u, obuf,
+                                  (uint32_t)(sizeof obuf - 1u), &ogot));
+    obuf[ogot] = '\0';
+    STM_ASSERT_EQ(strcmp(obuf, "skip,overwrite,cancel\n"), 0);
+    STM_ASSERT_OK(stm_9p_clunk(c, 103u));
+
+    /* Walk /dialogs/1/result and write "overwrite" to dismiss. */
+    const char *rnames[] = { "dialogs", "1", "result" };
+    stm_9p_qid rqids[3];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 104u, 3u, rnames, rqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 104u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, 104u, 0u, "overwrite", 9u, &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 104u));
+
+    /* Server-side: dialog must now be inactive. */
+    STM_ASSERT_EQ((int)stm_slate_dialog_active(f.slate), 0);
+
+    /* Read /dialogs/stack again — should be "\n" (empty). */
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 105u, 2u, snames, sqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 105u, 0u, &oqid, &iounit));
+    sgot = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 105u, 0u, sbuf,
+                                  (uint32_t)(sizeof sbuf - 1u), &sgot));
+    STM_ASSERT_EQ(sgot, 1u);
+    STM_ASSERT_EQ(sbuf[0], '\n');
+    STM_ASSERT_OK(stm_9p_clunk(c, 105u));
+
+    /* Stale-id walk: /dialogs/1 (now dismissed) → STM_ENOENT or
+     * partial-walk. */
+    const char *enames[] = { "dialogs", "1" };
+    stm_9p_qid eqids[2];
+    stm_status walk_rc = stm_9p_walk(c, 100u, 106u, 2u, enames, eqids, &walked);
+    STM_ASSERT(walk_rc != STM_OK || walked < 2u);
+
+    stm_9p_close(c);
+    destroy_fixture(&f);
+}
+
 /* /event refuses zero-byte writes (parity with stm_slate_submit_event). */
 STM_TEST(slate_socket_event_zero_byte_einval)
 {

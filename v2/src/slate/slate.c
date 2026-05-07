@@ -751,8 +751,11 @@ stm_status stm_slate_open_confirm(stm_slate *s,
         s->next_dialog_id++;
     } else {
         /* Saturation: refuse rather than wrap. R29 P3-1 doctrine
-         * carry — never reuse ids. */
+         * carry — never reuse ids. R120 P3-3: rollback id alongside
+         * active so future code reading dialog.id without the
+         * active gate doesn't see a stale UINT64_MAX. */
         s->dialog.active = false;
+        s->dialog.id = 0u;
         pthread_mutex_unlock(&s->mu);
         return STM_EOVERFLOW;
     }
@@ -2051,6 +2054,34 @@ typedef struct {
     void             *cb_ctx;
 } readdir_emit;
 
+/* SLATE-4-confirm R120 P3-1: variant that encodes a dialog id into
+ * the emitted dirent's qid (low 56 bits). Used for /dialogs/<id>/
+ * children so a client storing the dirent qid as a cache key
+ * matches the qid bound by Twalk to the same name. */
+static stm_status emit_entry_with_id(slate_kind k, uint64_t did,
+                                          readdir_emit *em)
+{
+    const slate_kind_meta *meta = &KIND_META[k];
+
+    uint64_t this_cookie = ++em->pos;
+    if (this_cookie <= em->offset) return STM_OK;
+
+    stm_lp9_dirent e;
+    memset(&e, 0, sizeof e);
+    stm_lp9_attr a;
+    stm_status rc = getattr_at(qid_of_dialog(k, did), &a);
+    if (rc != STM_OK) return rc;
+    e.qid     = a.qid;
+    e.cookie  = this_cookie;
+    e.dt_type = meta->is_dir ? 4u : 8u;
+    size_t nl = strlen(meta->name);
+    if (nl > STM_LP9_NAME_MAX) nl = STM_LP9_NAME_MAX;
+    memcpy(e.name, meta->name, nl);
+    e.name[nl] = '\0';
+    e.name_len = (uint16_t)nl;
+    return em->cb(&e, em->cb_ctx);
+}
+
 static stm_status emit_entry(slate_kind k, readdir_emit *em)
 {
     const slate_kind_meta *meta = &KIND_META[k];
@@ -2164,22 +2195,25 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
         return em.cb(&e, em.cb_ctx);
     }
     case SLATE_KIND_DIALOG_DIR: {
-        /* SLATE-4-confirm: dialog children. Re-check id freshness. */
+        /* SLATE-4-confirm: dialog children. Re-check id freshness.
+         * R120 P3-1: emit dirents with id-bearing qids (kind |
+         * dialog_id) so client-side qid caching matches what
+         * Twalk(name) would bind. */
         uint64_t did = qid_dialog_id(dir_qid_path);
         stm_slate *s = ctx;
         pthread_mutex_lock(&s->mu);
         bool match = (s->dialog.active && s->dialog.id == did);
         pthread_mutex_unlock(&s->mu);
         if (!match) return STM_ENOENT;
-        rc = emit_entry(SLATE_KIND_DIALOG_KIND, &em);
+        rc = emit_entry_with_id(SLATE_KIND_DIALOG_KIND, did, &em);
         if (rc != STM_OK) return rc;
-        rc = emit_entry(SLATE_KIND_DIALOG_TITLE, &em);
+        rc = emit_entry_with_id(SLATE_KIND_DIALOG_TITLE, did, &em);
         if (rc != STM_OK) return rc;
-        rc = emit_entry(SLATE_KIND_DIALOG_BODY, &em);
+        rc = emit_entry_with_id(SLATE_KIND_DIALOG_BODY, did, &em);
         if (rc != STM_OK) return rc;
-        rc = emit_entry(SLATE_KIND_DIALOG_OPTIONS, &em);
+        rc = emit_entry_with_id(SLATE_KIND_DIALOG_OPTIONS, did, &em);
         if (rc != STM_OK) return rc;
-        return emit_entry(SLATE_KIND_DIALOG_RESULT, &em);
+        return emit_entry_with_id(SLATE_KIND_DIALOG_RESULT, did, &em);
     }
     default:
         return STM_ENOTDIR;
@@ -2555,6 +2589,9 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
                                                        s->dialog.options_len,
                                                        (const char *)buf, l);
         if (vrc != STM_OK) {
+            /* R120 P3-4: no version bump on validation failure
+             * (R116 P3-2 doctrine — version changes only on real
+             * state mutation). */
             pthread_mutex_unlock(&s->mu);
             return vrc;
         }
