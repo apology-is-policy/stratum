@@ -55,9 +55,16 @@ unsafe impl Send for SlateClient {}
 impl SlateClient {
     pub fn dial(socket_path: &Path) -> Result<Self> {
         // Reserve 16 fids per instance (root + scratch + 14 reserved
-        // headroom for future per-op fids). Wraps to 100 on saturation
-        // (with our 16-stride that means ~268 M instances before reuse).
+        // headroom for future per-op fids). With 16-stride that means
+        // ~268M instances before saturation — operationally never
+        // reached, but the consequence of wrap is that fid bases would
+        // recycle and cross-instance collision could re-emerge in
+        // slate's session table. R125 P3-1: refuse on wrap rather than
+        // silently degrade.
         let base = NEXT_FID_BASE.fetch_add(16, Ordering::Relaxed);
+        if base < 100 || base.checked_add(16).is_none() {
+            bail!("fid-base counter saturated; reconnect requires process restart");
+        }
         let root_fid = base;
         let scratch_fid = base + 1;
         let cpath = CString::new(socket_path.as_os_str().to_string_lossy().as_bytes())
@@ -91,7 +98,9 @@ impl SlateClient {
             .map(|n| CString::new(*n).map_err(|_| anyhow!("name {n} contains NUL")))
             .collect::<Result<_>>()?;
         let cptrs: Vec<*const c_char> = cnames.iter().map(|c| c.as_ptr()).collect();
-        let mut qids: [ffi::stm_9p_qid; 16] = unsafe { std::mem::zeroed() };
+        // R125 P3-6: Default::default() avoids the unsafe block;
+        // stm_9p_qid is a POD struct with derived Default.
+        let mut qids: [ffi::stm_9p_qid; 16] = [ffi::stm_9p_qid::default(); 16];
         let mut walked: u16 = 0;
         let rc = unsafe {
             ffi::stm_9p_walk(
@@ -107,11 +116,13 @@ impl SlateClient {
         if rc != ffi::STM_OK {
             bail!("walk: stm_status {rc}");
         }
-        if (walked as usize) != cnames.len() {
-            // Partial walk = not bound. clunk the dst (the lib didn't
-            // bind it on partial walk; this is defensive).
-            bail!("walk: partial — only {walked} of {} components found", cnames.len());
-        }
+        // R125 P3-7: per `9p_client.h:233-247`, partial walk surfaces
+        // as STM_ENOENT (return code) and dst_fid is not bound — the
+        // lib never returns STM_OK with walked < n_names. Keep the
+        // assert as a defense-in-depth check for future lib changes;
+        // it's effectively unreachable today.
+        debug_assert_eq!(walked as usize, cnames.len(),
+            "lib contract: STM_OK implies full walk");
         Ok(())
     }
 
@@ -147,9 +158,6 @@ impl SlateClient {
         let chunk_cap = std::cmp::min(self.msize.saturating_sub(64) as usize, 64 * 1024);
         let mut chunk = vec![0u8; chunk_cap];
         loop {
-            if out.len() > READ_CAP {
-                bail!("response too large (> {} bytes)", READ_CAP);
-            }
             let mut got: u32 = 0;
             let rc = unsafe {
                 ffi::stm_9p_read(
@@ -168,6 +176,11 @@ impl SlateClient {
                 break;
             }
             out.extend_from_slice(&chunk[..got as usize]);
+            // R125 P3-2: check AFTER append so the actual cap matches
+            // the documented READ_CAP. Trips before the next Tread.
+            if out.len() > READ_CAP {
+                bail!("response too large (> {} bytes)", READ_CAP);
+            }
         }
         Ok(out)
     }

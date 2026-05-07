@@ -24,7 +24,11 @@ pub const STM_9P_O_WRONLY: u32 = 1;
 pub const STM_9P_O_RDWR: u32 = 2;
 
 pub const STM_9P_MAX_WALK: u16 = 16;
-pub const STM_9P_MSIZE_DEFAULT: u32 = 64 * 1024;
+// R125 P2-2: must match `v2/include/stratum/9p.h` STM_9P_MSIZE_DEFAULT.
+// The lib uses this when caller passes `opts.msize == 0`; slate-tty
+// always passes the explicit value, so today this only matters for
+// future code that compares against the lib default. Keep in sync.
+pub const STM_9P_MSIZE_DEFAULT: u32 = 128 * 1024;
 pub const STM_9P_NOFID: u32 = 0xffffffff;
 
 #[repr(C)]

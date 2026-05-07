@@ -124,24 +124,47 @@ fn redraw_loop(
 ) {
     let mut client = match SlateClient::dial(&slate_sock) {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("redraw: dial failed: {e}");
+        Err(_) => {
+            // R125 P3-5: don't write to stderr from this thread —
+            // raw mode + alternate screen are likely in effect by
+            // now and the eprintln would garble the UI. Just exit;
+            // main's first state fetch will surface the dial failure
+            // through its own error path.
             return;
         }
     };
     let mut last_version: u64 = 0;
+    let mut consecutive_no_advance: u32 = 0;
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
         }
         match client.redraw_once(last_version) {
             Ok(Some(v)) => {
+                if v == last_version {
+                    // R125 P2-1: slate's /redraw doesn't return EOF
+                    // (got=0) on stop — it always emits the current
+                    // version. When `s->stopped` is true the wait
+                    // predicate short-circuits and we get the same
+                    // version back forever, spinning at 4 RTTs each
+                    // iteration. Detect "no advance" twice in a row
+                    // and exit gracefully — slate is either stopped
+                    // or wedged. main observes this via channel
+                    // closure (rx.try_recv → Disconnected) on the
+                    // next render pass.
+                    consecutive_no_advance = consecutive_no_advance.saturating_add(1);
+                    if consecutive_no_advance >= 2 {
+                        break;
+                    }
+                    continue;
+                }
+                consecutive_no_advance = 0;
                 last_version = v;
                 if tx.send(v).is_err() {
                     break; // main hung up
                 }
             }
-            Ok(None) => break, // daemon stopped
+            Ok(None) => break, // genuine EOF (server-side bytes==0)
             Err(_) => {
                 // Most often: connection closed mid-poll on shutdown.
                 // Exit quietly.
@@ -298,8 +321,10 @@ fn fetch_snapshot(
         .map(|s| s == "1")
         .unwrap_or(false);
     let editor_preview = if editor_active {
-        // Don't read the full /editor/content (could be 1 MiB); just
-        // show the first ~200 lines for v1.0.
+        // R125 P3-3: read_lines reads the full content (bounded by
+        // SlateClient::READ_CAP = 4 MiB; slate caps editor content
+        // at 1 MiB). We then take the first 200 lines for display.
+        // Reading less would require a streaming line-counter.
         read_lines(client, "/editor/content")
             .unwrap_or_default()
             .into_iter()

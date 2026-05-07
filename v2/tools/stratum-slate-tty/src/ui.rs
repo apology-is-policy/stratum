@@ -49,6 +49,51 @@ const CLR_FKEY_LABEL_BG: Color = Color::Cyan;
 
 const CLR_POPUP_BG: Color = Color::Black;
 
+// ── display sanitization (R125 P1-1) ──────────────────────────────────
+//
+// Server-supplied bytes flow through ratatui's Span::raw → crossterm
+// → terminal. crossterm renders bytes verbatim, so a raw ESC (0x1B)
+// in /editor/content, /status, or the attached /connection/socket
+// path is interpreted as the start of a CSI/OSC sequence by the
+// terminal. The escape can clear the screen, reposition the cursor,
+// re-enable cooked-mode echo, push attacker-controlled text into the
+// system clipboard via OSC 52, etc.
+//
+// Slate's own line-rendered surfaces (panels/X/entries) are already
+// sanitized server-side at the line-render step (R115 P1-1). Other
+// surfaces — /editor/content, /status, /connection/socket — are
+// transported faithfully by slate per CLAUDE.md slate clause 23(g)
+// ("Slate's responsibility is to faithfully transport the bytes").
+// slate-tty IS the renderer-layer where the sanitization MUST happen.
+//
+// Policy (mirrors slate's R115 P1-1 panel-entries posture):
+//   - bytes < 0x20 (control chars) become '?', EXCEPT '\n' and '\t'
+//     which the renderer handles natively (line breaks + tabs).
+//   - byte 0x7F (DEL) becomes '?'.
+//   - bytes ≥ 0x80 (UTF-8 multi-byte continuation + lead) pass through
+//     unchanged.
+//
+// Allowing '\n' lets the editor preview render multi-line content
+// correctly. Allowing '\t' is important — text files routinely
+// contain tabs. The trade-off: a malicious file CAN still embed
+// printable ASCII, but printable ASCII can't escape the rendered
+// cell.
+fn sanitize_for_display(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        let cp = ch as u32;
+        if (cp < 0x20 && ch != '\n' && ch != '\t') || cp == 0x7F {
+            out.push('?');
+        } else {
+            // Non-ASCII Unicode (cp ≥ 0x80) and printable ASCII pass
+            // through unchanged. Iterating by char (not byte) ensures
+            // UTF-8 multi-byte sequences emit one char each.
+            out.push(ch);
+        }
+    }
+    out
+}
+
 // ── types the renderer reads ──────────────────────────────────────────
 
 pub struct PanelView {
@@ -261,8 +306,12 @@ fn draw_panel(frame: &mut Frame<'_>, panel: &PanelView, area: Rect, focused: boo
 // ── status + F-key bar ────────────────────────────────────────────────
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
+    // R125 P1-1: sanitize backend_socket + status before rendering —
+    // both come from server-controlled paths/strings that are
+    // intentionally NOT sanitized server-side (CLAUDE.md slate
+    // clause 11 + clause 23(g) carry).
     let conn_marker = if state.connected {
-        format!(" stratumd={} ", state.backend_socket)
+        format!(" stratumd={} ", sanitize_for_display(&state.backend_socket))
     } else {
         " DISCONNECTED ".to_string()
     };
@@ -270,7 +319,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     let user_status = if state.status.is_empty() {
         " (slate is idle) ".to_string()
     } else {
-        format!(" {} ", state.status)
+        format!(" {} ", sanitize_for_display(&state.status))
     };
     let line = Line::from(vec![
         Span::styled(
@@ -367,12 +416,18 @@ fn draw_editor_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     let inner = block.inner(rows[0]);
     frame.render_widget(block, rows[0]);
 
+    // R125 P1-1: sanitize editor_preview lines before rendering. The
+    // editor IS a text-editing UI but the renderer-layer is the right
+    // boundary to filter terminal-control bytes (CLAUDE.md slate
+    // clause 23(g) carry — slate transports faithfully; we render
+    // safely). '\n' / '\t' pass through; everything < 0x20 + 0x7F
+    // becomes '?'.
     let visible = inner.height as usize;
     let lines: Vec<Line> = state
         .editor_preview
         .iter()
         .take(visible)
-        .map(|s| Line::from(s.clone()))
+        .map(|s| Line::from(sanitize_for_display(s)))
         .collect();
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 
@@ -409,9 +464,12 @@ fn draw_dialog_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         .style(Style::default().bg(CLR_POPUP_BG));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
+    // R125 P3-4: slate's actual path is /dialogs/.../result (no
+    // /slate/ prefix — slate is the daemon, the synfs root IS the
+    // slate tree).
     let body = format!(
-        "Active dialog ids: {}\n\nslate-tty v1.0 doesn't yet drive dialogs.\n\nDismiss from another client:\n  echo <option> > /slate/dialogs/<id>/result",
-        state.dialog_stack
+        "Active dialog ids: {}\n\nslate-tty v1.0 doesn't yet drive dialogs.\n\nDismiss from another client:\n  echo <option> > /dialogs/<id>/result",
+        sanitize_for_display(&state.dialog_stack)
     );
     let lines: Vec<Line> = body.lines().map(|s| Line::from(s.to_string())).collect();
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
@@ -523,4 +581,52 @@ fn format_timestamp(epoch: u32) -> String {
 
 fn is_leap(y: i32) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // R125 P1-1 regression: sanitize_for_display strips terminal
+    // control bytes from server-supplied strings before they reach
+    // ratatui / crossterm.
+    #[test]
+    fn sanitize_strips_csi_escape() {
+        assert_eq!(sanitize_for_display("\x1b[2J\x1b[H"), "?[2J?[H");
+    }
+
+    #[test]
+    fn sanitize_strips_del_byte() {
+        assert_eq!(sanitize_for_display("a\x7Fb"), "a?b");
+    }
+
+    #[test]
+    fn sanitize_passes_newline_and_tab() {
+        // \n and \t are needed for legitimate text rendering.
+        assert_eq!(sanitize_for_display("line1\nline2\tcol"), "line1\nline2\tcol");
+    }
+
+    #[test]
+    fn sanitize_passes_utf8_multibyte() {
+        // CJK + emoji + accented latin: cp ≥ 0x80 always passes.
+        assert_eq!(sanitize_for_display("héllo 世界 ✓"), "héllo 世界 ✓");
+    }
+
+    #[test]
+    fn sanitize_strips_low_ctrl_except_lf_tab() {
+        // 0x01..=0x1F all become '?', except \t (0x09) and \n (0x0A).
+        let mut input = String::new();
+        let mut expected = String::new();
+        for b in 0x01u8..=0x1F {
+            input.push(b as char);
+            expected.push(if b == b'\t' || b == b'\n' { b as char } else { '?' });
+        }
+        assert_eq!(sanitize_for_display(&input), expected);
+    }
+
+    #[test]
+    fn sanitize_passes_printable_ascii() {
+        let s = "abcXYZ012!@#$%^&*()_+-=[]{}|;:'\",.<>?/`~";
+        assert_eq!(sanitize_for_display(s), s);
+    }
 }
