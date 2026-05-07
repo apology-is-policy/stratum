@@ -1132,6 +1132,9 @@ typedef struct {
     uint32_t target_idx;
     uint32_t emitted;
     bool     found;
+    bool     bad_name;   /* R117 P1-1: target entry name contains a
+                          * control byte; descend MUST refuse to keep
+                          * panel.path consistent with backend names. */
     char     name[STM_LP9_NAME_MAX + 1];
     uint16_t name_len;
     uint8_t  type;
@@ -1155,6 +1158,24 @@ static stm_status descend_find_cb(const stm_9p_qid *qid, uint64_t cookie,
         fc->name_len = (uint16_t)name_len;
         fc->type = type;
         fc->found = true;
+        /* R117 P1-1: same R115 P1-1 line-injection class extended to
+         * the descend write-site. /panels/X/path is line-oriented; if
+         * an entry name embeds '\n' / '\r' / '\x7F' / any byte < 0x20,
+         * writing it into panel.path would forge multi-line reads of
+         * /panels/left/path. R115's solution (sanitize at display)
+         * doesn't apply here because panel.path is ALSO used as a
+         * KEY for subsequent backend ops (panel_entries_render's
+         * walk_to_cwd(path)) — sanitizing on storage would diverge
+         * from the real backend name and break the entries-listing.
+         * Instead: REFUSE descent into such entries. UTF-8 multi-byte
+         * sequences (≥ 0x80) pass through unchanged. */
+        for (uint16_t i = 0; i < fc->name_len; i++) {
+            unsigned char c = (unsigned char)fc->name[i];
+            if (c < 0x20u || c == 0x7Fu) {
+                fc->bad_name = true;
+                break;
+            }
+        }
         /* Stop iteration via R111 P2 F-3 sentinel. */
         return STM_ENOTSUPPORTED;
     }
@@ -1211,6 +1232,16 @@ static stm_status descend_panel(stm_slate *s, int panel_idx)
     cursor = s->panel[panel_idx].cursor;
     pthread_mutex_unlock(&s->mu);
 
+    /* R117 P3-1: cap cursor at STM_SLATE_ENTRIES_MAX so descend's
+     * readdir loop terminates promptly (parity with
+     * panel_entries_render's truncation cap). A cursor beyond the
+     * rendered cap can't possibly correspond to a user-visible
+     * entry; refuse early to bound the worst-case backend scan and
+     * the duration backend_mu is held. */
+    if (cursor >= STM_SLATE_ENTRIES_MAX) {
+        return STM_EINVAL;
+    }
+
     /* Take backend_mu and snapshot the backend client. */
     pthread_mutex_lock(&s->backend_mu);
     pthread_mutex_lock(&s->mu);
@@ -1261,6 +1292,15 @@ static stm_status descend_panel(stm_slate *s, int panel_idx)
     }
     if (!fc.found) {
         /* Cursor out of range relative to current entries. */
+        pthread_mutex_unlock(&s->backend_mu);
+        return STM_EINVAL;
+    }
+    if (fc.bad_name) {
+        /* R117 P1-1: entry name has control bytes — refuse descent.
+         * Writing the raw name into panel.path would forge multi-line
+         * reads of /panels/X/path; sanitizing on storage would
+         * diverge from the real backend name and break the entries
+         * listing's walk_to_cwd lookup. */
         pthread_mutex_unlock(&s->backend_mu);
         return STM_EINVAL;
     }

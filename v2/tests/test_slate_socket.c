@@ -947,6 +947,69 @@ STM_TEST(slate_socket_action_key_enter_descends_into_dir)
     destroy_backend_fixture(&be);
 }
 
+/* R117 P3-1 regression: descent with cursor ≥ STM_SLATE_ENTRIES_MAX
+ * (200) refuses early without scanning the entire backend dir. */
+STM_TEST(slate_socket_action_key_enter_cursor_above_cap_refuses)
+{
+    slate_backend_fixture be;
+    setup_backend_fixture(&be, "be_cap");
+
+    slate_fixture f;
+    setup_fixture(&f, "fg_cap");
+
+    stm_9p_client *c = NULL;
+    stm_9p_dial_opts opts = default_dial_opts(100u);
+    STM_ASSERT_OK(retry_dial(g_sock_path, &opts, &c));
+
+    /* Attach. */
+    const char *anames[] = { "connection", "attach" };
+    stm_9p_qid aqids[2];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 101u, 2u, anames, aqids, &walked));
+    stm_9p_qid oqid;
+    uint32_t iounit = 0;
+    STM_ASSERT_OK(stm_9p_lopen(c, 101u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, 101u, 0u, be.sock_path,
+                                  (uint32_t)strlen(be.sock_path), &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 101u));
+
+    /* Set cursor to a value beyond the rendered cap. STM_SLATE_ENTRIES_MAX
+     * is 200; 250 is comfortably above it. */
+    const char *cnames[] = { "panels", "left", "cursor" };
+    stm_9p_qid cqids[3];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 102u, 3u, cnames, cqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 102u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    STM_ASSERT_OK(stm_9p_write(c, 102u, 0u, "250", 3u, &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 102u));
+
+    /* Fire "key Enter" — must refuse without backend scan. */
+    const char *acn[] = { "panels", "left", "action" };
+    stm_9p_qid acqids[3];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 103u, 3u, acn, acqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 103u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    stm_status rc = stm_9p_write(c, 103u, 0u, "key Enter", 9u, &written);
+    STM_ASSERT(rc != STM_OK);
+    STM_ASSERT_OK(stm_9p_clunk(c, 103u));
+
+    /* Path still "/" (descend was refused). */
+    const char *pn[] = { "panels", "left", "path" };
+    stm_9p_qid pqids[3];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 104u, 3u, pn, pqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 104u, 0u, &oqid, &iounit));
+    char pbuf[16];
+    uint32_t pgot = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 104u, 0u, pbuf,
+                                  (uint32_t)(sizeof pbuf - 1u), &pgot));
+    pbuf[pgot] = '\0';
+    STM_ASSERT_EQ(strcmp(pbuf, "/\n"), 0);
+    STM_ASSERT_OK(stm_9p_clunk(c, 104u));
+
+    stm_9p_close(c);
+    destroy_fixture(&f);
+    destroy_backend_fixture(&be);
+}
+
 /* "key Enter" on a non-dir entry returns STM_ENOTDIR over the wire
  * (lib maps to STM_EBACKEND for unknown ecodes; either is acceptable
  * — verify it's NOT OK). cursor=0 lands on "version" which is a file.  */
