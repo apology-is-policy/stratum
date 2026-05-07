@@ -88,10 +88,13 @@ typedef enum {
     SLATE_KIND_PANEL_R_PATH     = 17,
     SLATE_KIND_PANEL_R_ENTRIES  = 18,
     /* SLATE-3a: per-panel cursor + action. */
-    SLATE_KIND_PANEL_L_CURSOR   = 19,
-    SLATE_KIND_PANEL_L_ACTION   = 20,
-    SLATE_KIND_PANEL_R_CURSOR   = 21,
-    SLATE_KIND_PANEL_R_ACTION   = 22,
+    SLATE_KIND_PANEL_L_CURSOR    = 19,
+    SLATE_KIND_PANEL_L_ACTION    = 20,
+    SLATE_KIND_PANEL_R_CURSOR    = 21,
+    SLATE_KIND_PANEL_R_ACTION    = 22,
+    /* SLATE-3c-selection: per-panel multi-select. */
+    SLATE_KIND_PANEL_L_SELECTION = 23,
+    SLATE_KIND_PANEL_R_SELECTION = 24,
     SLATE_KIND_MAX
 } slate_kind;
 
@@ -133,13 +136,16 @@ static const slate_kind_meta KIND_META[SLATE_KIND_MAX] = {
     [SLATE_KIND_PANEL_R_ENTRIES]  = { false, 0444, "entries"    },
     /* SLATE-3a: cursor is RW (mode 0644 — readable + writable);
      * action is write-only (mode 0200). */
-    [SLATE_KIND_PANEL_L_CURSOR]   = { false, 0644, "cursor"     },
-    [SLATE_KIND_PANEL_L_ACTION]   = { false, 0200, "action"     },
-    [SLATE_KIND_PANEL_R_CURSOR]   = { false, 0644, "cursor"     },
-    [SLATE_KIND_PANEL_R_ACTION]   = { false, 0200, "action"     },
+    [SLATE_KIND_PANEL_L_CURSOR]    = { false, 0644, "cursor"    },
+    [SLATE_KIND_PANEL_L_ACTION]    = { false, 0200, "action"    },
+    [SLATE_KIND_PANEL_R_CURSOR]    = { false, 0644, "cursor"    },
+    [SLATE_KIND_PANEL_R_ACTION]    = { false, 0200, "action"    },
+    /* SLATE-3c-selection: comma-separated entry indices, RW. */
+    [SLATE_KIND_PANEL_L_SELECTION] = { false, 0644, "selection" },
+    [SLATE_KIND_PANEL_R_SELECTION] = { false, 0644, "selection" },
 };
 
-_Static_assert(SLATE_KIND_MAX == 23, "KIND_META[] sized to enum cardinality");
+_Static_assert(SLATE_KIND_MAX == 25, "KIND_META[] sized to enum cardinality");
 _Static_assert(sizeof("version") - 1     <= STM_LP9_NAME_MAX, "/version literal");
 _Static_assert(sizeof("status") - 1      <= STM_LP9_NAME_MAX, "/status literal");
 _Static_assert(sizeof("event") - 1       <= STM_LP9_NAME_MAX, "/event literal");
@@ -158,6 +164,7 @@ _Static_assert(sizeof("path") - 1        <= STM_LP9_NAME_MAX, "/panels/X/path");
 _Static_assert(sizeof("entries") - 1     <= STM_LP9_NAME_MAX, "/panels/X/entries");
 _Static_assert(sizeof("cursor") - 1      <= STM_LP9_NAME_MAX, "/panels/X/cursor");
 _Static_assert(sizeof("action") - 1      <= STM_LP9_NAME_MAX, "/panels/X/action");
+_Static_assert(sizeof("selection") - 1   <= STM_LP9_NAME_MAX, "/panels/X/selection");
 
 /* Backend fid convention. The slate daemon is the SOLE 9P client of
  * its attached stratumd; the lib's caller-managed fid namespace is
@@ -215,7 +222,9 @@ typedef struct slate_session {
 /* The state.                                                             */
 /* ────────────────────────────────────────────────────────────────────── */
 
-/* SLATE-2 + SLATE-3a: per-panel state. */
+/* SLATE-2 + SLATE-3a + SLATE-3c-selection: per-panel state. */
+#define SLATE_SELECTION_BYTES ((STM_SLATE_ENTRIES_MAX + 7u) / 8u)
+
 typedef struct {
     char     path[STM_SLATE_PATH_MAX + 1];     /* NUL-terminated; "" disconnected */
     size_t   path_len;
@@ -224,6 +233,14 @@ typedef struct {
      * the renderer's responsibility — slate accepts any uint32_t.
      * Reset to 0 on attach + disconnect + cwd change. */
     uint32_t cursor;
+    /* SLATE-3c-selection: bitset of selected entry indices.
+     * Bit (idx % 8) of byte (idx / 8) is set iff entry `idx` is
+     * selected. STM_SLATE_ENTRIES_MAX (200) bits = 25 bytes.
+     * Reset to all-zero on attach + disconnect + descend + ascend.
+     * Indices ≥ STM_SLATE_ENTRIES_MAX are refused at write parse
+     * (parity with cursor cap; selection over invisible entries
+     * makes no sense). */
+    uint8_t  selection[SLATE_SELECTION_BYTES];
 } slate_panel;
 
 #define SLATE_PANEL_LEFT  0
@@ -474,6 +491,7 @@ static void attach_state_swap_locked(stm_slate *s, const char *path, size_t len,
         s->panel[i].path[1] = '\0';
         s->panel[i].path_len = 1u;
         s->panel[i].cursor = 0u;
+        memset(s->panel[i].selection, 0, sizeof s->panel[i].selection);
     }
     s->version++;
     pthread_cond_broadcast(&s->cv);
@@ -494,6 +512,7 @@ static void disconnect_state_swap_locked(stm_slate *s, stm_9p_client **old_bc_ou
         s->panel[i].path[0] = '\0';
         s->panel[i].path_len = 0;
         s->panel[i].cursor = 0u;
+        memset(s->panel[i].selection, 0, sizeof s->panel[i].selection);
     }
     s->version++;
     pthread_cond_broadcast(&s->cv);
@@ -732,6 +751,86 @@ static stm_status materialize_panel_cursor_locked(stm_slate *s, slate_session *s
                         "%u\n", (unsigned)s->panel[panel_idx].cursor);
     if (n < 0 || n >= (int)sizeof ss->buf) return STM_ERANGE;
     ss->len = (uint32_t)n;
+    return STM_OK;
+}
+
+/* SLATE-3c-selection: /panels/X/selection — comma-separated indices
+ * + newline, or just "\n" when empty. Worst case (all 200 bits set,
+ * indices 0..199 = "0,1,2,...,199") fits comfortably in BODY_MAX:
+ * average index width ~3 chars + comma = ~800 bytes < 4096.
+ * STM_SLATE_BODY_MAX. */
+static stm_status materialize_panel_selection_locked(stm_slate *s, slate_session *ss,
+                                                          int panel_idx)
+{
+    size_t off = 0;
+    bool first = true;
+    for (uint32_t idx = 0u; idx < STM_SLATE_ENTRIES_MAX; idx++) {
+        uint32_t byte = idx >> 3;
+        uint32_t bit  = idx & 7u;
+        if ((s->panel[panel_idx].selection[byte] & (1u << bit)) == 0u) {
+            continue;
+        }
+        int n = snprintf((char *)ss->buf + off, sizeof ss->buf - off,
+                            first ? "%u" : ",%u", (unsigned)idx);
+        if (n < 0) return STM_ERANGE;
+        if ((size_t)n >= sizeof ss->buf - off) return STM_ERANGE;
+        off += (size_t)n;
+        first = false;
+    }
+    if (off + 1u > sizeof ss->buf) return STM_ERANGE;
+    ss->buf[off] = '\n';
+    ss->len = (uint32_t)(off + 1u);
+    return STM_OK;
+}
+
+/* SLATE-3c-selection: parse a comma-separated decimal index list
+ * "1,3,5" into a bitset. Empty body (or just "\n") → empty selection.
+ * Strict format: digits and commas only; no whitespace, no leading
+ * zeros (except literal "0"), no trailing comma, no duplicate comma,
+ * no leading/trailing newlines beyond a single optional '\n' tail.
+ * Indices ≥ STM_SLATE_ENTRIES_MAX refused as STM_EINVAL.
+ *
+ * Output: on success, `out_bits` holds the parsed bitset. On any
+ * parse error or out-of-range index, returns the error WITHOUT
+ * modifying caller's bitset. */
+static stm_status parse_selection_bits(const char *body, size_t body_len,
+                                            uint8_t out_bits[SLATE_SELECTION_BYTES])
+{
+    /* Strip optional trailing newline. */
+    if (body_len > 0u && body[body_len - 1u] == '\n') body_len--;
+    /* Empty body → empty selection. */
+    uint8_t scratch[SLATE_SELECTION_BYTES];
+    memset(scratch, 0, sizeof scratch);
+    if (body_len == 0u) {
+        memcpy(out_bits, scratch, sizeof scratch);
+        return STM_OK;
+    }
+
+    size_t i = 0;
+    while (i < body_len) {
+        /* Parse one decimal index; first char must be a digit. */
+        if (body[i] < '0' || body[i] > '9') return STM_EINVAL;
+        unsigned long long v = 0;
+        size_t start = i;
+        while (i < body_len && body[i] >= '0' && body[i] <= '9') {
+            v = v * 10ull + (unsigned long long)(body[i] - '0');
+            if (v >= STM_SLATE_ENTRIES_MAX) return STM_EINVAL;
+            i++;
+        }
+        /* Refuse "01", "001", etc. — exactly one zero before non-zero
+         * leading digit means the value is "0" itself. */
+        if (i - start > 1u && body[start] == '0') return STM_EINVAL;
+        /* Set bit. */
+        uint32_t idx = (uint32_t)v;
+        scratch[idx >> 3] |= (uint8_t)(1u << (idx & 7u));
+        if (i == body_len) break;
+        /* Separator must be ','. */
+        if (body[i] != ',') return STM_EINVAL;
+        i++;
+        /* No trailing comma. */
+        if (i == body_len) return STM_EINVAL;
+    }
+    memcpy(out_bits, scratch, sizeof scratch);
     return STM_OK;
 }
 
@@ -1161,6 +1260,9 @@ static stm_status ascend_panel(stm_slate *s, int panel_idx)
         s->panel[panel_idx].path_len = last_slash;
     }
     s->panel[panel_idx].cursor = 0u;
+    /* SLATE-3c-selection: cwd change invalidates selection. */
+    memset(s->panel[panel_idx].selection, 0,
+              sizeof s->panel[panel_idx].selection);
     s->version++;
     pthread_cond_broadcast(&s->cv);
     pthread_mutex_unlock(&s->mu);
@@ -1441,6 +1543,10 @@ static stm_status descend_panel(stm_slate *s, int panel_idx)
         s->panel[panel_idx].path[target_path_len] = '\0';
         s->panel[panel_idx].path_len = target_path_len;
         s->panel[panel_idx].cursor = 0u;
+        /* SLATE-3c-selection: cwd change invalidates selection
+         * indices (they referenced the old directory's entries). */
+        memset(s->panel[panel_idx].selection, 0,
+                  sizeof s->panel[panel_idx].selection);
         s->version++;
         pthread_cond_broadcast(&s->cv);
         pthread_mutex_unlock(&s->mu);
@@ -1573,12 +1679,14 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
         else if (str_eq(name, name_len, "entries"))    target = SLATE_KIND_PANEL_L_ENTRIES;
         else if (str_eq(name, name_len, "cursor"))     target = SLATE_KIND_PANEL_L_CURSOR;
         else if (str_eq(name, name_len, "action"))     target = SLATE_KIND_PANEL_L_ACTION;
+        else if (str_eq(name, name_len, "selection"))  target = SLATE_KIND_PANEL_L_SELECTION;
         break;
     case SLATE_KIND_PANEL_R_DIR:
         if (str_eq(name, name_len, "path"))            target = SLATE_KIND_PANEL_R_PATH;
         else if (str_eq(name, name_len, "entries"))    target = SLATE_KIND_PANEL_R_ENTRIES;
         else if (str_eq(name, name_len, "cursor"))     target = SLATE_KIND_PANEL_R_CURSOR;
         else if (str_eq(name, name_len, "action"))     target = SLATE_KIND_PANEL_R_ACTION;
+        else if (str_eq(name, name_len, "selection"))  target = SLATE_KIND_PANEL_R_SELECTION;
         break;
     default:
         return STM_ENOENT;
@@ -1667,7 +1775,9 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
         if (rc != STM_OK) return rc;
         rc = emit_entry(SLATE_KIND_PANEL_L_CURSOR, &em);
         if (rc != STM_OK) return rc;
-        return emit_entry(SLATE_KIND_PANEL_L_ACTION, &em);
+        rc = emit_entry(SLATE_KIND_PANEL_L_ACTION, &em);
+        if (rc != STM_OK) return rc;
+        return emit_entry(SLATE_KIND_PANEL_L_SELECTION, &em);
     case SLATE_KIND_PANEL_R_DIR:
         rc = emit_entry(SLATE_KIND_PANEL_R_PATH, &em);
         if (rc != STM_OK) return rc;
@@ -1675,7 +1785,9 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
         if (rc != STM_OK) return rc;
         rc = emit_entry(SLATE_KIND_PANEL_R_CURSOR, &em);
         if (rc != STM_OK) return rc;
-        return emit_entry(SLATE_KIND_PANEL_R_ACTION, &em);
+        rc = emit_entry(SLATE_KIND_PANEL_R_ACTION, &em);
+        if (rc != STM_OK) return rc;
+        return emit_entry(SLATE_KIND_PANEL_R_SELECTION, &em);
     default:
         return STM_ENOTDIR;
     }
@@ -1783,6 +1895,12 @@ static stm_status vops_lopen(void *ctx, uint32_t fid, uint64_t qid_path,
         break;
     case SLATE_KIND_PANEL_R_CURSOR:
         rc = materialize_panel_cursor_locked(s, ss, SLATE_PANEL_RIGHT);
+        break;
+    case SLATE_KIND_PANEL_L_SELECTION:
+        rc = materialize_panel_selection_locked(s, ss, SLATE_PANEL_LEFT);
+        break;
+    case SLATE_KIND_PANEL_R_SELECTION:
+        rc = materialize_panel_selection_locked(s, ss, SLATE_PANEL_RIGHT);
         break;
     default:
         rc = STM_EBACKEND;
@@ -1968,6 +2086,31 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         pthread_mutex_lock(&s->mu);
         if (s->panel[panel_idx].cursor != (uint32_t)v) {
             s->panel[panel_idx].cursor = (uint32_t)v;
+            s->version++;
+            pthread_cond_broadcast(&s->cv);
+        }
+        pthread_mutex_unlock(&s->mu);
+        *out_written = len;
+        return STM_OK;
+    }
+    if (k == SLATE_KIND_PANEL_L_SELECTION || k == SLATE_KIND_PANEL_R_SELECTION) {
+        /* SLATE-3c-selection: write a comma-separated index list to
+         * /panels/X/selection. Empty body (or "\n" alone) clears the
+         * selection. Worst-case input is ~1000 bytes (200 indices ×
+         * up to 3 digits + commas + newline); STM_SLATE_BODY_MAX
+         * (4 KiB) is plenty. */
+        if (len > STM_SLATE_BODY_MAX) return STM_EINVAL;
+        uint8_t parsed[SLATE_SELECTION_BYTES];
+        stm_status rc = parse_selection_bits((const char *)buf, len, parsed);
+        if (rc != STM_OK) return rc;
+        int panel_idx = (k == SLATE_KIND_PANEL_L_SELECTION)
+                            ? SLATE_PANEL_LEFT : SLATE_PANEL_RIGHT;
+        pthread_mutex_lock(&s->mu);
+        /* R116 P3-2 doctrine: bump version only on real change. */
+        bool changed = (memcmp(s->panel[panel_idx].selection, parsed,
+                                  sizeof parsed) != 0);
+        if (changed) {
+            memcpy(s->panel[panel_idx].selection, parsed, sizeof parsed);
             s->version++;
             pthread_cond_broadcast(&s->cv);
         }

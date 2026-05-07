@@ -572,16 +572,17 @@ STM_TEST(slate_panels_dir_readdir_emits_left_and_right)
     STM_ASSERT_EQ(strcmp(cx.names[0], "left"),  0);
     STM_ASSERT_EQ(strcmp(cx.names[1], "right"), 0);
 
-    /* /panels/left qid: kind = 13 — emits {path, entries, cursor, action}
-     * (SLATE-2 path/entries + SLATE-3a cursor/action). */
+    /* /panels/left qid: kind = 13 — emits {path, entries, cursor,
+     * action, selection} (SLATE-2 + SLATE-3a + SLATE-3c-selection). */
     uint64_t left_qp = ((uint64_t)13) << 56;
     ent_collect cl = {0};
     STM_ASSERT_OK(v->readdir(s, left_qp, /*cookie=*/0u, ent_cb, &cl));
-    STM_ASSERT_EQ(cl.n, 4u);
-    STM_ASSERT_EQ(strcmp(cl.names[0], "path"),    0);
-    STM_ASSERT_EQ(strcmp(cl.names[1], "entries"), 0);
-    STM_ASSERT_EQ(strcmp(cl.names[2], "cursor"),  0);
-    STM_ASSERT_EQ(strcmp(cl.names[3], "action"),  0);
+    STM_ASSERT_EQ(cl.n, 5u);
+    STM_ASSERT_EQ(strcmp(cl.names[0], "path"),      0);
+    STM_ASSERT_EQ(strcmp(cl.names[1], "entries"),   0);
+    STM_ASSERT_EQ(strcmp(cl.names[2], "cursor"),    0);
+    STM_ASSERT_EQ(strcmp(cl.names[3], "action"),    0);
+    STM_ASSERT_EQ(strcmp(cl.names[4], "selection"), 0);
 
     stm_slate_destroy(s);
 }
@@ -970,6 +971,206 @@ STM_TEST(slate_panel_cursor_unchanged_on_failed_attach)
     STM_ASSERT_OK(v->read(s, 78u, cqp, 0u, buf, &got));
     STM_ASSERT_EQ(got, 3u);  /* "10\n" */
     v->clunk(s, 78u, cqp);
+
+    stm_slate_destroy(s);
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* P9-SLATE-3c-selection: /panels/X/selection RW.                          */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/* Initial selection reads as just "\n" (empty). */
+STM_TEST(slate_panel_selection_read_initial_empty)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const stm_lp9_vops *v = stm_slate_vops();
+    /* /panels/left/selection qid: kind = 23. */
+    uint64_t qp = ((uint64_t)23) << 56;
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/77u, qp, STM_LP9_O_RDONLY));
+    char buf[16];
+    uint32_t got = (uint32_t)sizeof buf;
+    STM_ASSERT_OK(v->read(s, 77u, qp, 0u, buf, &got));
+    STM_ASSERT_EQ(got, 1u);
+    STM_ASSERT_EQ(buf[0], '\n');
+    v->clunk(s, 77u, qp);
+    stm_slate_destroy(s);
+}
+
+/* Write "1,3,5" then read back "1,3,5\n". */
+STM_TEST(slate_panel_selection_write_then_read)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const stm_lp9_vops *v = stm_slate_vops();
+    uint64_t qp = ((uint64_t)23) << 56;
+
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/77u, qp, STM_LP9_O_WRONLY));
+    uint32_t written = 0;
+    STM_ASSERT_OK(v->write(s, 77u, qp, 0u, "1,3,5", 5u, &written));
+    STM_ASSERT_EQ(written, 5u);
+    v->clunk(s, 77u, qp);
+
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/78u, qp, STM_LP9_O_RDONLY));
+    char buf[32];
+    uint32_t got = (uint32_t)sizeof buf;
+    STM_ASSERT_OK(v->read(s, 78u, qp, 0u, buf, &got));
+    buf[got] = '\0';
+    STM_ASSERT_EQ(strcmp(buf, "1,3,5\n"), 0);
+    v->clunk(s, 78u, qp);
+
+    /* Trailing newline accepted on write (stripped). */
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/79u, qp, STM_LP9_O_WRONLY));
+    STM_ASSERT_OK(v->write(s, 79u, qp, 0u, "2,4\n", 4u, &written));
+    v->clunk(s, 79u, qp);
+
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/80u, qp, STM_LP9_O_RDONLY));
+    got = (uint32_t)sizeof buf;
+    STM_ASSERT_OK(v->read(s, 80u, qp, 0u, buf, &got));
+    buf[got] = '\0';
+    STM_ASSERT_EQ(strcmp(buf, "2,4\n"), 0);
+    v->clunk(s, 80u, qp);
+
+    stm_slate_destroy(s);
+}
+
+/* Empty body clears selection. */
+STM_TEST(slate_panel_selection_empty_body_clears)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const stm_lp9_vops *v = stm_slate_vops();
+    uint64_t qp = ((uint64_t)23) << 56;
+
+    /* Set non-empty first. */
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/77u, qp, STM_LP9_O_WRONLY));
+    uint32_t written = 0;
+    STM_ASSERT_OK(v->write(s, 77u, qp, 0u, "10", 2u, &written));
+    v->clunk(s, 77u, qp);
+
+    /* Now write empty (just "\n") to clear. */
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/78u, qp, STM_LP9_O_WRONLY));
+    STM_ASSERT_OK(v->write(s, 78u, qp, 0u, "\n", 1u, &written));
+    v->clunk(s, 78u, qp);
+
+    /* Read back: just newline. */
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/79u, qp, STM_LP9_O_RDONLY));
+    char buf[16];
+    uint32_t got = (uint32_t)sizeof buf;
+    STM_ASSERT_OK(v->read(s, 79u, qp, 0u, buf, &got));
+    STM_ASSERT_EQ(got, 1u);
+    STM_ASSERT_EQ(buf[0], '\n');
+    v->clunk(s, 79u, qp);
+
+    stm_slate_destroy(s);
+}
+
+/* Malformed selection writes are refused, state unchanged. */
+STM_TEST(slate_panel_selection_malformed_refused)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const stm_lp9_vops *v = stm_slate_vops();
+    uint64_t qp = ((uint64_t)23) << 56;
+
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/77u, qp, STM_LP9_O_WRONLY));
+    uint32_t written = 0;
+
+    /* Trailing comma. */
+    STM_ASSERT_EQ(v->write(s, 77u, qp, 0u, "1,", 2u, &written), STM_EINVAL);
+    /* Leading comma. */
+    STM_ASSERT_EQ(v->write(s, 77u, qp, 0u, ",1", 2u, &written), STM_EINVAL);
+    /* Double comma. */
+    STM_ASSERT_EQ(v->write(s, 77u, qp, 0u, "1,,2", 4u, &written), STM_EINVAL);
+    /* Whitespace. */
+    STM_ASSERT_EQ(v->write(s, 77u, qp, 0u, "1, 2", 4u, &written), STM_EINVAL);
+    /* Non-digit. */
+    STM_ASSERT_EQ(v->write(s, 77u, qp, 0u, "1,a,2", 5u, &written), STM_EINVAL);
+    /* Out-of-range index (≥ STM_SLATE_ENTRIES_MAX = 200). */
+    STM_ASSERT_EQ(v->write(s, 77u, qp, 0u, "200", 3u, &written), STM_EINVAL);
+    STM_ASSERT_EQ(v->write(s, 77u, qp, 0u, "999", 3u, &written), STM_EINVAL);
+    /* Leading zero. */
+    STM_ASSERT_EQ(v->write(s, 77u, qp, 0u, "01", 2u, &written), STM_EINVAL);
+    STM_ASSERT_EQ(v->write(s, 77u, qp, 0u, "001", 3u, &written), STM_EINVAL);
+
+    v->clunk(s, 77u, qp);
+
+    /* State unchanged: read returns "\n" (still empty). */
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/78u, qp, STM_LP9_O_RDONLY));
+    char buf[16];
+    uint32_t got = (uint32_t)sizeof buf;
+    STM_ASSERT_OK(v->read(s, 78u, qp, 0u, buf, &got));
+    STM_ASSERT_EQ(got, 1u);
+    STM_ASSERT_EQ(buf[0], '\n');
+    v->clunk(s, 78u, qp);
+
+    stm_slate_destroy(s);
+}
+
+/* Single index "0" + single index at the cap boundary "199". */
+STM_TEST(slate_panel_selection_boundary_indices)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const stm_lp9_vops *v = stm_slate_vops();
+    uint64_t qp = ((uint64_t)23) << 56;
+
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/77u, qp, STM_LP9_O_WRONLY));
+    uint32_t written = 0;
+    STM_ASSERT_OK(v->write(s, 77u, qp, 0u, "0", 1u, &written));
+    v->clunk(s, 77u, qp);
+
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/78u, qp, STM_LP9_O_RDONLY));
+    char buf[16];
+    uint32_t got = (uint32_t)sizeof buf;
+    STM_ASSERT_OK(v->read(s, 78u, qp, 0u, buf, &got));
+    buf[got] = '\0';
+    STM_ASSERT_EQ(strcmp(buf, "0\n"), 0);
+    v->clunk(s, 78u, qp);
+
+    /* Highest legal index. */
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/79u, qp, STM_LP9_O_WRONLY));
+    STM_ASSERT_OK(v->write(s, 79u, qp, 0u, "199", 3u, &written));
+    v->clunk(s, 79u, qp);
+
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/80u, qp, STM_LP9_O_RDONLY));
+    got = (uint32_t)sizeof buf;
+    STM_ASSERT_OK(v->read(s, 80u, qp, 0u, buf, &got));
+    buf[got] = '\0';
+    STM_ASSERT_EQ(strcmp(buf, "199\n"), 0);
+    v->clunk(s, 80u, qp);
+
+    stm_slate_destroy(s);
+}
+
+/* Selection writes bump version only on real change (R116 P3-2 doctrine). */
+STM_TEST(slate_panel_selection_redundant_write_no_version_bump)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const stm_lp9_vops *v = stm_slate_vops();
+    uint64_t qp = ((uint64_t)23) << 56;
+
+    /* Initial selection is empty. Writing empty body should be a no-op. */
+    uint64_t v0 = stm_slate_version(s);
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/77u, qp, STM_LP9_O_WRONLY));
+    uint32_t written = 0;
+    STM_ASSERT_OK(v->write(s, 77u, qp, 0u, "\n", 1u, &written));
+    v->clunk(s, 77u, qp);
+    STM_ASSERT_EQ(stm_slate_version(s), v0);
+
+    /* Set "1,3,5" — bumps. */
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/78u, qp, STM_LP9_O_WRONLY));
+    STM_ASSERT_OK(v->write(s, 78u, qp, 0u, "1,3,5", 5u, &written));
+    v->clunk(s, 78u, qp);
+    uint64_t v1 = stm_slate_version(s);
+    STM_ASSERT(v1 > v0);
+
+    /* Write same set again — no bump. */
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/79u, qp, STM_LP9_O_WRONLY));
+    STM_ASSERT_OK(v->write(s, 79u, qp, 0u, "1,3,5", 5u, &written));
+    v->clunk(s, 79u, qp);
+    STM_ASSERT_EQ(stm_slate_version(s), v1);
 
     stm_slate_destroy(s);
 }
