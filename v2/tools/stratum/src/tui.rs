@@ -44,6 +44,168 @@ pub struct Opts {
     pub spawn: Option<Arc<SpawnCtx>>,
 }
 
+/// SWISS-4e: TUI-local editor buffer. The TUI owns the source-of-
+/// truth for an open editor session; slate's /editor/content is
+/// pushed on save. Local-only buffer is fast for keystroke-level
+/// editing; pushing every keystroke to slate would mean a full
+/// /editor/content write per character (slate's R124 P3-2 carry —
+/// content is whole-payload-replace).
+///
+/// Lines are stored as Strings without trailing '\n'. The on-disk
+/// representation is `lines.join("\n")` (with optional trailing
+/// newline preserved at open + save; v1.0 always emits a trailing
+/// newline).
+struct EditorBuffer {
+    lines: Vec<String>,
+    row: usize,
+    col: usize,
+    /// Filename relative to the panel's backend root. Currently the
+    /// status bar pulls this from `snap.editor_filename` (slate's
+    /// view); kept on the buffer so SWISS-4e1 can render it locally
+    /// when the snapshot is mid-fetch.
+    #[allow(dead_code)]
+    filename: String,
+    modified: bool,
+    /// True iff slate's /editor/content was originally non-empty
+    /// AND ended with a newline. We preserve the trailing newline
+    /// at save (POSIX text-file convention).
+    trailing_newline: bool,
+}
+
+impl EditorBuffer {
+    fn from_content(content: &str, filename: String) -> Self {
+        let trailing_newline = content.ends_with('\n');
+        let body = if trailing_newline {
+            &content[..content.len() - 1]
+        } else {
+            content
+        };
+        let lines: Vec<String> = if body.is_empty() {
+            vec![String::new()]
+        } else {
+            body.split('\n').map(|s| s.to_string()).collect()
+        };
+        Self {
+            lines,
+            row: 0,
+            col: 0,
+            filename,
+            modified: false,
+            trailing_newline: trailing_newline || content.is_empty(),
+        }
+    }
+
+    fn serialize(&self) -> String {
+        let mut out = self.lines.join("\n");
+        if self.trailing_newline && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        let line = &mut self.lines[self.row];
+        let byte_idx = line
+            .char_indices()
+            .nth(self.col)
+            .map(|(b, _)| b)
+            .unwrap_or(line.len());
+        line.insert(byte_idx, ch);
+        self.col += 1;
+        self.modified = true;
+    }
+
+    fn insert_newline(&mut self) {
+        let line = self.lines[self.row].clone();
+        let byte_idx = line
+            .char_indices()
+            .nth(self.col)
+            .map(|(b, _)| b)
+            .unwrap_or(line.len());
+        let (left, right) = line.split_at(byte_idx);
+        self.lines[self.row] = left.to_string();
+        self.lines.insert(self.row + 1, right.to_string());
+        self.row += 1;
+        self.col = 0;
+        self.modified = true;
+    }
+
+    fn backspace(&mut self) {
+        if self.col > 0 {
+            // Remove char before cursor on current line.
+            let line = &mut self.lines[self.row];
+            let byte_idx = line
+                .char_indices()
+                .nth(self.col - 1)
+                .map(|(b, _)| b)
+                .unwrap_or(0);
+            let next_byte = line
+                .char_indices()
+                .nth(self.col)
+                .map(|(b, _)| b)
+                .unwrap_or(line.len());
+            line.replace_range(byte_idx..next_byte, "");
+            self.col -= 1;
+            self.modified = true;
+        } else if self.row > 0 {
+            // Merge with previous line.
+            let cur = self.lines.remove(self.row);
+            let prev_len_chars = self.lines[self.row - 1].chars().count();
+            self.lines[self.row - 1].push_str(&cur);
+            self.row -= 1;
+            self.col = prev_len_chars;
+            self.modified = true;
+        }
+    }
+
+    fn move_left(&mut self) {
+        if self.col > 0 {
+            self.col -= 1;
+        } else if self.row > 0 {
+            self.row -= 1;
+            self.col = self.lines[self.row].chars().count();
+        }
+    }
+
+    fn move_right(&mut self) {
+        let line_chars = self.lines[self.row].chars().count();
+        if self.col < line_chars {
+            self.col += 1;
+        } else if self.row + 1 < self.lines.len() {
+            self.row += 1;
+            self.col = 0;
+        }
+    }
+
+    fn move_up(&mut self) {
+        if self.row > 0 {
+            self.row -= 1;
+            let line_chars = self.lines[self.row].chars().count();
+            if self.col > line_chars {
+                self.col = line_chars;
+            }
+        }
+    }
+
+    fn move_down(&mut self) {
+        if self.row + 1 < self.lines.len() {
+            self.row += 1;
+            let line_chars = self.lines[self.row].chars().count();
+            if self.col > line_chars {
+                self.col = line_chars;
+            }
+        }
+    }
+
+    fn home(&mut self) {
+        self.col = 0;
+    }
+
+    fn end(&mut self) {
+        self.col = self.lines[self.row].chars().count();
+    }
+}
+
 pub fn run(opts: Opts) -> Result<()> {
     let mut main_client = SlateClient::dial(&opts.slate_sock)
         .with_context(|| format!("dial slate at {}", opts.slate_sock.display()))?;
@@ -123,16 +285,35 @@ fn run_ui(
 
     let mut focus: usize = 0;
     let mut local_dialog: Option<LocalDialog> = None;
+    let mut editor: Option<EditorBuffer> = None;
     let result = (|| -> Result<()> {
         loop {
-            let snapshot = fetch_snapshot(client, focus, &local_dialog)?;
+            let snapshot = fetch_snapshot(client, focus, &local_dialog, &editor)?;
+            // SWISS-4e: if slate flipped editor_active=true (e.g. via
+            // /event "editor open" issued by THIS tui or another
+            // client) and we don't yet have a local buffer, fetch
+            // the content + initialise the buffer.
+            if snapshot.editor_active && editor.is_none() {
+                let content =
+                    crate::slate::read_text(client, "/editor/content").unwrap_or_default();
+                editor = Some(EditorBuffer::from_content(
+                    &content,
+                    snapshot.editor_filename.clone(),
+                ));
+            }
+            // SWISS-4e: if slate dropped the editor (close from another
+            // client OR our own save-and-quit path), drop the buffer.
+            if !snapshot.editor_active && editor.is_some() {
+                editor = None;
+            }
             terminal.draw(|frame| ui::render(frame, &snapshot))?;
             loop {
                 if event::poll(Duration::from_millis(100))? {
                     match event::read()? {
                         Event::Key(key) if key.kind == KeyEventKind::Press => {
                             match handle_key(client, &mut focus, &mut local_dialog,
-                                              spawn.as_ref(), &snapshot, key)? {
+                                              &mut editor, spawn.as_ref(),
+                                              &snapshot, key)? {
                                 Action::Quit => return Ok(()),
                                 Action::Refresh => break,
                                 Action::Ignore => {}
@@ -169,15 +350,18 @@ fn handle_key(
     client: &mut SlateClient,
     focus: &mut usize,
     local_dialog: &mut Option<LocalDialog>,
+    editor: &mut Option<EditorBuffer>,
     spawn: Option<&Arc<SpawnCtx>>,
     snap: &UiState,
     key: crossterm::event::KeyEvent,
 ) -> Result<Action> {
-    // SWISS-4b: when a local dialog is up, route input through it
-    // FIRST. Esc cancels, Enter submits, Backspace edits, printable
-    // chars append. We don't forward to slate while modal.
+    // SWISS-4b: local-dialog modal layer takes priority.
     if local_dialog.is_some() {
         return handle_dialog_key(local_dialog, spawn, snap, key);
+    }
+    // SWISS-4e: editor modal layer (after dialog).
+    if editor.is_some() {
+        return handle_editor_key(client, editor, key);
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -208,26 +392,32 @@ fn handle_key(
         }
         KeyCode::Enter => {
             // SWISS-4b: Enter on a yellow `.stm` entry → mount the
-            // volume in the INACTIVE panel (other side). User decision
-            // 2026-05-07: "Shift+F2 mounts host in active panel; Enter
-            // on .stm mounts in the OTHER panel; FN commands operate
-            // on active panel."
+            // volume in the INACTIVE panel (other side).
             if let Some(stm_path) = detect_stm_at_cursor(snap, *focus, spawn) {
                 if let Some(sp) = spawn {
                     let inactive = 1 - *focus;
                     return mount_stm_volume(local_dialog, sp, inactive, &stm_path);
                 } else {
-                    *local_dialog = Some(LocalDialog {
-                        kind: LocalDialogKind::Error,
-                        prompt: "Cannot mount: TUI was started with --slate-sock; \
-                                 spawn helper unavailable. Run `stratum tui --vol PATH` \
-                                 to use embedded mode.".into(),
-                        value: String::new(),
-                        is_password: false,
-                        is_error: true,
-                    });
+                    *local_dialog = Some(error_dialog(
+                        "Cannot mount: TUI was started with --slate-sock; \
+                         spawn helper unavailable.",
+                    ));
                     return Ok(Action::Refresh);
                 }
+            }
+            // SWISS-4e: Enter on a regular (non-dir, non-yellow-.stm)
+            // file → open in editor via /event "editor open <path>".
+            // Path is the panel's current 9P path joined with entry
+            // name (relative to slate's view of the panel's backend
+            // root — slate handles the walk).
+            if let Some(panel_path) = detect_regular_file_at_cursor(snap, *focus) {
+                let event_line = format!("editor open {}\n", panel_path);
+                if let Err(_e) = client.write_path("/event", event_line.as_bytes()) {
+                    *local_dialog = Some(error_dialog(
+                        &format!("editor open failed; check slate is connected"),
+                    ));
+                }
+                return Ok(Action::Refresh);
             }
             // Otherwise: descend (slate's default Enter verb).
             action_verb(client, *focus, "key Enter\n")?;
@@ -236,6 +426,18 @@ fn handle_key(
         KeyCode::Backspace => {
             action_verb(client, *focus, "key Backspace\n")?;
             return Ok(Action::Refresh);
+        }
+        // SWISS-4e: F4 = open cursor entry in editor (force-edit
+        // even for yellow .stm — useful when the user wants to
+        // examine raw bytes).
+        KeyCode::F(4) if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+            if let Some(panel_path) = detect_regular_file_at_cursor(snap, *focus) {
+                let event_line = format!("editor open {}\n", panel_path);
+                let _ = client.write_path("/event", event_line.as_bytes());
+                return Ok(Action::Refresh);
+            }
+            // F4 on a directory → no-op (could be SWISS-4f tree view).
+            return Ok(Action::Ignore);
         }
         // SWISS-4d: F5 = copy active-panel cursor entry to inactive
         // panel's CWD. v1.0 supports host→host only via std::fs;
@@ -665,6 +867,40 @@ fn error_dialog(msg: &str) -> LocalDialog {
 /// SWISS-4b: detect whether the cursor in `panel_idx` is on a yellow
 /// `.stm` entry AND the panel's backend is a host-fs. Returns the
 /// resolved on-disk path to the .stm file when both conditions hold.
+/// SWISS-4e: detect when cursor is on a regular non-yellow-.stm
+/// non-".." file. Returns the panel-relative 9P path the editor
+/// should open. Returns None if cursor is on a directory, ".." ,
+/// a .stm volume (Enter on .stm is the SWISS-4b mount path), or
+/// an empty/non-existent entry.
+fn detect_regular_file_at_cursor(snap: &UiState, panel_idx: usize) -> Option<String> {
+    let panel = &snap.panels[panel_idx];
+    if !panel.connected {
+        return None;
+    }
+    let cursor = panel.cursor as usize;
+    let raw = panel.raw_entries.get(cursor)?;
+    let mut parts = raw.splitn(5, ' ');
+    let kind = parts.next()?;
+    let _ = parts.next();
+    let _ = parts.next();
+    let _ = parts.next();
+    let name = parts.next()?;
+    if kind != "-" || name == ".." || name.is_empty() {
+        return None;
+    }
+    if name.ends_with(".stm") {
+        // Enter on .stm is volume-mount, not edit.
+        return None;
+    }
+    // Construct panel-relative 9P path.
+    let cwd = panel.path.trim_end_matches('/');
+    if cwd.is_empty() || cwd == "/" {
+        Some(format!("/{name}"))
+    } else {
+        Some(format!("{cwd}/{name}"))
+    }
+}
+
 fn detect_stm_at_cursor(
     snap: &UiState,
     panel_idx: usize,
@@ -877,6 +1113,109 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// SWISS-4e: editor keypress handler. Mutates the local buffer +
+/// pushes /editor/content + /editor/cursor on every keystroke.
+/// Ctrl-S → save; Ctrl-Q → save-and-quit; Esc → quit (no save).
+/// Arrow keys + Home/End/Backspace mutate cursor + content.
+fn handle_editor_key(
+    client: &mut SlateClient,
+    editor: &mut Option<EditorBuffer>,
+    key: crossterm::event::KeyEvent,
+) -> Result<Action> {
+    let Some(buf) = editor.as_mut() else {
+        return Ok(Action::Ignore);
+    };
+
+    let mut content_changed = false;
+    let mut cursor_changed = false;
+
+    match key.code {
+        // Quit / save-and-quit / save shortcuts.
+        KeyCode::Esc => {
+            // Esc = quit without save (matches v1 editor convention).
+            // Push /editor/action quit; the daemon clears editor state;
+            // the next loop sees editor_active=false and drops buf.
+            let _ = client.write_path("/editor/action", b"quit\n");
+            *editor = None;
+            return Ok(Action::Refresh);
+        }
+        KeyCode::Char('q') | KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Ctrl-Q = save-and-quit.
+            let serialized = buf.serialize();
+            if !serialized.is_empty() {
+                let _ = client.write_path("/editor/content", serialized.as_bytes());
+            }
+            let _ = client.write_path("/editor/action", b"save-and-quit\n");
+            *editor = None;
+            return Ok(Action::Refresh);
+        }
+        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Ctrl-S = save (push content first, then trigger save).
+            let serialized = buf.serialize();
+            let _ = client.write_path("/editor/content", serialized.as_bytes());
+            let _ = client.write_path("/editor/action", b"save\n");
+            buf.modified = false;
+            return Ok(Action::Refresh);
+        }
+        // Movement keys.
+        KeyCode::Left => { buf.move_left(); cursor_changed = true; }
+        KeyCode::Right => { buf.move_right(); cursor_changed = true; }
+        KeyCode::Up => { buf.move_up(); cursor_changed = true; }
+        KeyCode::Down => { buf.move_down(); cursor_changed = true; }
+        KeyCode::Home => { buf.home(); cursor_changed = true; }
+        KeyCode::End => { buf.end(); cursor_changed = true; }
+        // Editing keys.
+        KeyCode::Backspace => {
+            buf.backspace();
+            content_changed = true;
+            cursor_changed = true;
+        }
+        KeyCode::Enter => {
+            buf.insert_newline();
+            content_changed = true;
+            cursor_changed = true;
+        }
+        KeyCode::Tab => {
+            // Insert real TAB; renderer will display it visually.
+            buf.insert_char('\t');
+            content_changed = true;
+            cursor_changed = true;
+        }
+        KeyCode::Char(c) => {
+            // Skip control bytes (already handled above for Ctrl-S/Q/C).
+            if (c as u32) < 0x20 || c as u32 == 0x7F {
+                return Ok(Action::Ignore);
+            }
+            buf.insert_char(c);
+            content_changed = true;
+            cursor_changed = true;
+        }
+        _ => {}
+    }
+
+    // Push state to slate. Per CLAUDE.md slate row clause 23 + R124
+    // P3-2: /editor/content is whole-payload-replace. We push the
+    // full serialized buffer on each edit. v1.0 of SWISS-4e accepts
+    // this cost; SWISS-4e1 may add throttling (push every Nms or on
+    // focus loss).
+    if content_changed {
+        let serialized = buf.serialize();
+        if serialized.is_empty() {
+            // /editor/content rejects len=0 writes (R101 P2-2).
+            // For the empty-buffer case, we just don't push;
+            // /editor/cursor still updates.
+        } else {
+            let _ = client.write_path("/editor/content", serialized.as_bytes());
+        }
+    }
+    if cursor_changed {
+        let line = format!("{},{}\n", buf.row, buf.col);
+        let _ = client.write_path("/editor/cursor", line.as_bytes());
+    }
+
+    Ok(Action::Refresh)
+}
+
 fn default_host_path() -> String {
     std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
@@ -897,6 +1236,7 @@ fn fetch_snapshot(
     client: &mut SlateClient,
     focus: usize,
     local_dialog: &Option<LocalDialog>,
+    editor: &Option<EditorBuffer>,
 ) -> Result<UiState> {
     let version: u64 = read_text_trim(client, "/version")?
         .parse()
@@ -925,7 +1265,12 @@ fn fetch_snapshot(
     let editor_modified = read_text_trim(client, "/editor/modified")
         .map(|s| s == "1")
         .unwrap_or(false);
-    let editor_preview = if editor_active {
+    // SWISS-4e: when the TUI owns a local editor buffer, prefer
+    // its in-memory state for rendering (zero-latency display of
+    // edits). Otherwise fall back to slate's /editor/content.
+    let editor_preview = if let Some(buf) = editor.as_ref() {
+        buf.lines.iter().take(200).cloned().collect()
+    } else if editor_active {
         read_lines(client, "/editor/content")
             .unwrap_or_default()
             .into_iter()

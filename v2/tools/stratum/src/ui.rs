@@ -503,28 +503,27 @@ fn draw_fkey_bar(frame: &mut Frame<'_>, area: Rect) {
     // yet handle them); the renderer routes every press as
     // `key F<N>` to /panels/X/action so future slate verbs light
     // up automatically.
+    // SWISS-4: F-key labels reflect actually-wired verbs.
+    //   F4 = Edit (Enter on regular file ALSO opens editor)
+    //   F5 = Copy (host→host, SWISS-4d v1.0)
+    //   F10 = Quit
     let keys: &[(&str, &str)] = &[
         ("1", ""),
-        ("2", "Mount"),
-        ("3", "View"),
+        ("2", ""),
+        ("3", ""),
         ("4", "Edit"),
         ("5", "Copy"),
         ("6", ""),
-        ("7", "MkDir"),
-        ("8", "Delete"),
-        ("9", "Snap"),
+        ("7", ""),
+        ("8", ""),
+        ("9", ""),
         ("10", "Quit"),
     ];
     draw_keys_row(frame, area, keys, CLR_FKEY_NUM, CLR_FKEY_LABEL_FG, CLR_FKEY_LABEL_BG);
 }
 
 fn draw_shift_fkey_bar(frame: &mut Frame<'_>, area: Rect) {
-    // Shift+F-keys mirror v2/tui's layout: S2 Host (mount host
-    // filesystem to the inactive panel), S7 MkVol (create volume).
-    // Forward-noted as SWISS-N work — host-fs + mkvol verbs aren't
-    // wired to slate yet; pressing Shift+F2 sends `key Shift-F2` to
-    // /panels/X/action which slate refuses with STM_ENOTSUPPORTED
-    // until the host-fs subcommand + slate-side multi-attach lands.
+    // SWISS-4: Shift+F2 + Shift+F7 are wired (host mount + MkVol).
     let keys: &[(&str, &str)] = &[
         ("S1", ""),
         ("S2", "Host"),

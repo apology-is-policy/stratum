@@ -297,6 +297,14 @@ pub fn read_text_trim(client: &mut SlateClient, path: &str) -> Result<String> {
     Ok(s.trim_end_matches('\n').to_string())
 }
 
+/// SWISS-4e: read a path as raw UTF-8 String, NO trimming. Used by
+/// the editor to pull /editor/content while preserving any trailing
+/// newline (POSIX text-file convention).
+pub fn read_text(client: &mut SlateClient, path: &str) -> Result<String> {
+    let bytes = client.read_path(path)?;
+    String::from_utf8(bytes).map_err(|_| anyhow!("{path}: not utf-8"))
+}
+
 /// Read a path and split on '\n' into lines (drops a single trailing empty line).
 pub fn read_lines(client: &mut SlateClient, path: &str) -> Result<Vec<String>> {
     let bytes = client.read_path(path)?;
