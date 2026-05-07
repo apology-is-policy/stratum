@@ -146,8 +146,102 @@ pub enum LocalDialogKind {
     /// volume field is read by the SWISS-4b1 sub-chunk that wires
     /// passphrase entry → keyfile derivation → spawn_stratumd.
     PassphraseFor { volume: std::path::PathBuf },
+    /// SWISS-4c: Shift+F7 mkfs wizard. Multi-field input; rendered
+    /// via draw_mkvol_dialog (lift of v1's draw_mkvol_dialog visual
+    /// idiom). Active-panel CWD is used as the directory the new
+    /// volume lands in.
+    MkVol(MkVolState),
     /// Error / informational; dismiss with Esc or Enter.
     Error,
+}
+
+/// SWISS-4c: state for the mkfs wizard. v1.0 collects only Name +
+/// Size (the fields mkfs CLI currently accepts). Encryption is
+/// always-on at v2.0 (the keyfile defaults to <volume>.key beside
+/// the volume file); compression flags are forward-noted to a
+/// future mkfs CLI extension. The Encrypt + Compression fields
+/// from v1's wizard remain in this struct as documentation +
+/// forward-note placeholders so SWISS-4c1 can wire them without
+/// reshaping the dialog.
+#[derive(Clone, Debug)]
+pub struct MkVolState {
+    /// Active panel at the time of Shift+F7 — the new volume is
+    /// created in this panel's CWD (resolved against the panel's
+    /// host_root via SpawnCtx::panel_meta).
+    pub panel_idx: usize,
+    /// Current focused field.
+    pub field: MkVolField,
+    pub name: String,
+    pub size: String,
+    /// Forward-noted as SWISS-4c1 (mkfs --encrypt flag).
+    pub encrypt: bool,
+    /// Forward-noted as SWISS-4c1.
+    pub passphrase: String,
+    /// Forward-noted as SWISS-4c1 (mkfs --compress flag).
+    pub compress: MkVolCompress,
+    /// Last error message, displayed in red.
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MkVolField {
+    Name,
+    Size,
+    Encrypt,
+    Passphrase,
+    Compress,
+    Ok,
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MkVolCompress {
+    Lz4,
+    Zstd,
+    None,
+}
+
+impl MkVolState {
+    pub fn new(panel_idx: usize) -> Self {
+        Self {
+            panel_idx,
+            field: MkVolField::Name,
+            name: String::new(),
+            size: "64M".to_string(),
+            encrypt: true,
+            passphrase: String::new(),
+            compress: MkVolCompress::Lz4,
+            error: None,
+        }
+    }
+
+    pub fn next_field(&mut self) {
+        self.field = match self.field {
+            MkVolField::Name => MkVolField::Size,
+            MkVolField::Size => MkVolField::Encrypt,
+            MkVolField::Encrypt => {
+                if self.encrypt { MkVolField::Passphrase } else { MkVolField::Compress }
+            }
+            MkVolField::Passphrase => MkVolField::Compress,
+            MkVolField::Compress => MkVolField::Ok,
+            MkVolField::Ok => MkVolField::Cancel,
+            MkVolField::Cancel => MkVolField::Name,
+        };
+    }
+
+    pub fn prev_field(&mut self) {
+        self.field = match self.field {
+            MkVolField::Name => MkVolField::Cancel,
+            MkVolField::Size => MkVolField::Name,
+            MkVolField::Encrypt => MkVolField::Size,
+            MkVolField::Passphrase => MkVolField::Encrypt,
+            MkVolField::Compress => {
+                if self.encrypt { MkVolField::Passphrase } else { MkVolField::Encrypt }
+            }
+            MkVolField::Ok => MkVolField::Compress,
+            MkVolField::Cancel => MkVolField::Ok,
+        };
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -192,11 +286,15 @@ pub fn render(frame: &mut Frame<'_>, state: &UiState) {
     } else if !state.dialog_stack.is_empty() {
         draw_dialog_overlay(frame, area, state);
     }
-    // SWISS-4b: local modal dialog renders OVER any other surface
-    // so prompts are visible even when slate-side dialogs / editor
-    // are also active.
+    // SWISS-4b: local modal dialog renders OVER any other surface.
     if let Some(d) = state.local_dialog.as_ref() {
-        draw_local_dialog(frame, area, d);
+        // SWISS-4c: dispatch on dialog kind. MkVol is its own
+        // multi-field wizard; the rest go through draw_local_dialog.
+        if let LocalDialogKind::MkVol(ref mk) = d.kind {
+            draw_mkvol_dialog(frame, area, mk);
+        } else {
+            draw_local_dialog(frame, area, d);
+        }
     }
 }
 
@@ -585,6 +683,9 @@ fn draw_local_dialog(frame: &mut Frame<'_>, area: Rect, d: &LocalDialog) {
         (LocalDialogKind::HostMountInput { .. }, _) => " Mount host directory ",
         (LocalDialogKind::PassphraseFor { .. }, _) => " Passphrase ",
         (LocalDialogKind::Error, _) => " Notice ",
+        // MkVol routes through draw_mkvol_dialog (caller dispatches),
+        // never lands here. Keep arm for exhaustiveness.
+        (LocalDialogKind::MkVol(_), _) => " Create Stratum Volume ",
     };
     let border_clr = if d.is_error { Color::Red } else { Color::Cyan };
     let prompt_clr = if d.is_password { Color::Red } else { Color::White };
@@ -639,6 +740,188 @@ fn draw_local_dialog(frame: &mut Frame<'_>, area: Rect, d: &LocalDialog) {
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }),
         inner,
+    );
+}
+
+// ── SWISS-4c: mkfs wizard ─────────────────────────────────────────────
+//
+// Visual idiom + state machine lifted from v1's draw_mkvol_dialog.
+// v1.0 of SWISS-4c collects Name + Size (the fields the v2 mkfs CLI
+// accepts); Encrypt + Passphrase + Compress are forward-noted as
+// SWISS-4c1 placeholder fields with a "always on (v2)" hint so the
+// reviewer sees the future shape.
+
+fn draw_mkvol_dialog(frame: &mut Frame<'_>, area: Rect, mk: &MkVolState) {
+    let w = 64u16.min(area.width.saturating_sub(4));
+    let h = 18u16.min(area.height.saturating_sub(4));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(dbl_border())
+        .border_style(Style::default().fg(Color::Cyan).bold())
+        .title(Line::from(Span::styled(
+            " Create Stratum Volume ",
+            Style::default().fg(Color::Cyan).bold(),
+        )))
+        .style(Style::default().bg(CLR_POPUP_BG));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),   // Name
+            Constraint::Length(1),   // Size
+            Constraint::Length(1),   // spacer
+            Constraint::Length(1),   // Encrypt
+            Constraint::Length(1),   // Passphrase
+            Constraint::Length(1),   // spacer
+            Constraint::Length(1),   // Compression
+            Constraint::Length(1),   // spacer
+            Constraint::Length(1),   // Error / tip
+            Constraint::Min(0),      // filler
+            Constraint::Length(1),   // buttons
+            Constraint::Length(1),   // hint
+        ])
+        .split(inner);
+
+    render_mkvol_field(frame, rows[0], "Name:", &mk.name,
+                       mk.field == MkVolField::Name, false);
+    render_mkvol_field(frame, rows[1], "Size:", &mk.size,
+                       mk.field == MkVolField::Size, false);
+
+    // Encrypt checkbox (forward-noted as SWISS-4c1).
+    {
+        let focused = mk.field == MkVolField::Encrypt;
+        let box_txt = if mk.encrypt { "[X]" } else { "[ ]" };
+        let lstyle = if focused { Style::default().fg(Color::Yellow).bold() }
+                     else { Style::default().fg(Color::White) };
+        let vstyle = if focused { Style::default().fg(Color::Black).bg(Color::Cyan) }
+                     else { Style::default().fg(Color::White) };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!(" {:<14}", "Encryption:"), lstyle),
+                Span::styled(
+                    format!(" {box_txt} {} (v2 always-on)",
+                            if mk.encrypt { "on " } else { "off" }),
+                    vstyle,
+                ),
+            ])),
+            rows[3],
+        );
+    }
+
+    // Passphrase row (forward-noted as SWISS-4c1).
+    if mk.encrypt {
+        render_mkvol_field(frame, rows[4], "Passphrase:", &mk.passphrase,
+                           mk.field == MkVolField::Passphrase, true);
+    } else {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " Passphrase:    (always on at v2.0; SWISS-4c1)",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            rows[4],
+        );
+    }
+
+    // Compression selector (forward-noted as SWISS-4c1).
+    {
+        let focused = mk.field == MkVolField::Compress;
+        let lstyle = if focused { Style::default().fg(Color::Yellow).bold() }
+                     else { Style::default().fg(Color::White) };
+        let mk_seg = |label: &'static str, is_sel: bool| {
+            let style = if is_sel {
+                if focused { Style::default().fg(Color::Black).bg(Color::Cyan).bold() }
+                else       { Style::default().fg(Color::Cyan).bold() }
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            Span::styled(format!(" {label} "), style)
+        };
+        let spans = vec![
+            Span::styled(format!(" {:<14}", "Compression:"), lstyle),
+            Span::raw(" "),
+            mk_seg("lz4",  mk.compress == MkVolCompress::Lz4),
+            mk_seg("zstd", mk.compress == MkVolCompress::Zstd),
+            mk_seg("none", mk.compress == MkVolCompress::None),
+        ];
+        frame.render_widget(Paragraph::new(Line::from(spans)), rows[6]);
+    }
+
+    if let Some(err) = mk.error.as_deref() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {err}"),
+                Style::default().fg(Color::Red).bold(),
+            ))),
+            rows[8],
+        );
+    }
+
+    // Buttons.
+    {
+        let ok_focused = mk.field == MkVolField::Ok;
+        let cancel_focused = mk.field == MkVolField::Cancel;
+        let btn = |focused: bool| if focused {
+            Style::default().fg(Color::Black).bg(Color::Cyan).bold()
+        } else {
+            Style::default().fg(Color::White).bold()
+        };
+        let spans = vec![
+            Span::raw("        "),
+            Span::styled("  OK  ", btn(ok_focused)),
+            Span::raw("    "),
+            Span::styled("  Cancel  ", btn(cancel_focused)),
+        ];
+        frame.render_widget(Paragraph::new(Line::from(spans)), rows[10]);
+    }
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " Tab/Shift-Tab: next/prev field   Space: toggle   Esc: cancel",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[11],
+    );
+}
+
+fn render_mkvol_field(
+    frame: &mut Frame<'_>,
+    row: Rect,
+    label: &str,
+    value: &str,
+    focused: bool,
+    masked: bool,
+) {
+    let label_w = 14usize;
+    let display = if masked {
+        "*".repeat(value.chars().count())
+    } else {
+        sanitize_for_display(value)
+    };
+    let cursor = if focused { "_" } else { "" };
+    let value_line = format!("{display}{cursor}");
+    let lstyle = if focused {
+        Style::default().fg(Color::Yellow).bold()
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let vstyle = if focused {
+        Style::default().fg(Color::Black).bg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::Cyan)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!(" {:<w$}", label, w = label_w), lstyle),
+            Span::styled(format!(" {value_line:<40} "), vstyle),
+        ])),
+        row,
     );
 }
 

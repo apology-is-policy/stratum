@@ -30,7 +30,8 @@ use std::time::Duration;
 
 use crate::slate::{read_lines, read_text_trim, SlateClient};
 use crate::spawn::{BackendMeta, SpawnCtx};
-use crate::ui::{self, LocalDialog, LocalDialogKind, PanelView, UiState};
+use crate::ui::{self, LocalDialog, LocalDialogKind, MkVolCompress, MkVolField, MkVolState,
+                PanelView, UiState};
 
 pub struct Opts {
     pub slate_sock: PathBuf,
@@ -248,6 +249,26 @@ fn handle_key(
                 });
                 return Ok(Action::Refresh);
             }
+            // SWISS-4c: Shift+F7 = mkfs wizard (create new volume in
+            // active panel's CWD).
+            if key.modifiers.contains(KeyModifiers::SHIFT) && n == 7 {
+                if spawn.is_none() {
+                    *local_dialog = Some(error_dialog(
+                        "MkVol unavailable: TUI was started with --slate-sock; \
+                         spawn helper unavailable. Use `stratum tui --vol PATH` \
+                         (or `stratum tui` for embedded mode).",
+                    ));
+                    return Ok(Action::Refresh);
+                }
+                *local_dialog = Some(LocalDialog {
+                    kind: LocalDialogKind::MkVol(MkVolState::new(*focus)),
+                    prompt: String::new(),
+                    value: String::new(),
+                    is_password: false,
+                    is_error: false,
+                });
+                return Ok(Action::Refresh);
+            }
             // Other F-keys: forward to slate for forward-compat.
             let verb = if key.modifiers.contains(KeyModifiers::SHIFT) {
                 format!("key Shift-F{n}\n")
@@ -263,12 +284,23 @@ fn handle_key(
 }
 
 /// SWISS-4b: dispatch keystrokes when a local dialog is active.
+/// SWISS-4c: MkVol dialog has its own multi-field state machine
+/// (Tab cycles fields; printable/Backspace mutate per-field; Enter
+/// on Ok submits via spawn_mkfs).
 fn handle_dialog_key(
     local_dialog: &mut Option<LocalDialog>,
     spawn: Option<&Arc<SpawnCtx>>,
-    _snap: &UiState,
+    snap: &UiState,
     key: crossterm::event::KeyEvent,
 ) -> Result<Action> {
+    // SWISS-4c: MkVol dispatch BEFORE the simple-input branch — it
+    // owns its own keyboard model.
+    if matches!(
+        local_dialog.as_ref().map(|d| &d.kind),
+        Some(LocalDialogKind::MkVol(_))
+    ) {
+        return handle_mkvol_key(local_dialog, spawn, snap, key);
+    }
     let Some(d) = local_dialog.as_mut() else {
         return Ok(Action::Ignore);
     };
@@ -278,8 +310,6 @@ fn handle_dialog_key(
             return Ok(Action::Refresh);
         }
         KeyCode::Enter => {
-            // Submit. Take the dialog out so we can dispatch then
-            // clear without holding a borrow.
             let dialog = local_dialog.take().unwrap();
             return submit_dialog(local_dialog, spawn, dialog);
         }
@@ -288,8 +318,6 @@ fn handle_dialog_key(
             return Ok(Action::Refresh);
         }
         KeyCode::Char(c) => {
-            // R125 P1-1 carry: refuse control bytes in dialog input.
-            // Most printable chars + UTF-8 multi-byte pass.
             if (c as u32) >= 0x20 && c as u32 != 0x7F {
                 d.value.push(c);
                 return Ok(Action::Refresh);
@@ -298,6 +326,262 @@ fn handle_dialog_key(
         _ => {}
     }
     Ok(Action::Ignore)
+}
+
+/// SWISS-4c: keyboard handler for MkVol wizard. Tab/Shift-Tab cycles
+/// fields; Space toggles Encrypt + cycles Compress; printable +
+/// Backspace mutate the focused text field. Enter on Ok runs the
+/// mkfs spawn; Esc or Cancel dismisses.
+fn handle_mkvol_key(
+    local_dialog: &mut Option<LocalDialog>,
+    spawn: Option<&Arc<SpawnCtx>>,
+    snap: &UiState,
+    key: crossterm::event::KeyEvent,
+) -> Result<Action> {
+    let dialog_kind = local_dialog.as_mut().map(|d| &mut d.kind);
+    let Some(LocalDialogKind::MkVol(mk)) = dialog_kind else {
+        return Ok(Action::Ignore);
+    };
+    match key.code {
+        KeyCode::Esc => {
+            *local_dialog = None;
+            return Ok(Action::Refresh);
+        }
+        KeyCode::Tab => {
+            mk.next_field();
+            return Ok(Action::Refresh);
+        }
+        KeyCode::BackTab => {
+            mk.prev_field();
+            return Ok(Action::Refresh);
+        }
+        KeyCode::Char(' ') => {
+            // Space toggles checkboxes / cycles segmented controls.
+            // For text fields, falls through to insert.
+            match mk.field {
+                MkVolField::Encrypt => {
+                    mk.encrypt = !mk.encrypt;
+                    return Ok(Action::Refresh);
+                }
+                MkVolField::Compress => {
+                    mk.compress = match mk.compress {
+                        MkVolCompress::Lz4 => MkVolCompress::Zstd,
+                        MkVolCompress::Zstd => MkVolCompress::None,
+                        MkVolCompress::None => MkVolCompress::Lz4,
+                    };
+                    return Ok(Action::Refresh);
+                }
+                _ => {} // fall through to text-insert
+            }
+        }
+        KeyCode::Enter => {
+            match mk.field {
+                MkVolField::Cancel => {
+                    *local_dialog = None;
+                    return Ok(Action::Refresh);
+                }
+                MkVolField::Ok => {
+                    return submit_mkvol(local_dialog, spawn, snap);
+                }
+                // Enter on a text field advances to next.
+                _ => {
+                    mk.next_field();
+                    return Ok(Action::Refresh);
+                }
+            }
+        }
+        KeyCode::Backspace => match mk.field {
+            MkVolField::Name => {
+                mk.name.pop();
+                return Ok(Action::Refresh);
+            }
+            MkVolField::Size => {
+                mk.size.pop();
+                return Ok(Action::Refresh);
+            }
+            MkVolField::Passphrase => {
+                mk.passphrase.pop();
+                return Ok(Action::Refresh);
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+    if let KeyCode::Char(c) = key.code {
+        if (c as u32) >= 0x20 && c as u32 != 0x7F {
+            match mk.field {
+                MkVolField::Name => {
+                    if mk.name.len() < 256 {
+                        mk.name.push(c);
+                        return Ok(Action::Refresh);
+                    }
+                }
+                MkVolField::Size => {
+                    if mk.size.len() < 32 {
+                        mk.size.push(c);
+                        return Ok(Action::Refresh);
+                    }
+                }
+                MkVolField::Passphrase => {
+                    if mk.passphrase.len() < 256 {
+                        mk.passphrase.push(c);
+                        return Ok(Action::Refresh);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(Action::Ignore)
+}
+
+fn submit_mkvol(
+    local_dialog: &mut Option<LocalDialog>,
+    spawn: Option<&Arc<SpawnCtx>>,
+    snap: &UiState,
+) -> Result<Action> {
+    let dialog = match local_dialog.take() {
+        Some(d) => d,
+        None => return Ok(Action::Ignore),
+    };
+    let LocalDialogKind::MkVol(mk) = &dialog.kind else {
+        return Ok(Action::Ignore);
+    };
+
+    let sp = match spawn {
+        Some(s) => s,
+        None => {
+            *local_dialog = Some(error_dialog("Spawn helper unavailable."));
+            return Ok(Action::Refresh);
+        }
+    };
+
+    // Validation.
+    let name = mk.name.trim();
+    if name.is_empty() {
+        let mut new_mk = mk.clone();
+        new_mk.error = Some("Name is required".into());
+        *local_dialog = Some(LocalDialog {
+            kind: LocalDialogKind::MkVol(new_mk),
+            ..dialog
+        });
+        return Ok(Action::Refresh);
+    }
+    let size = mk.size.trim();
+    if size.is_empty() {
+        let mut new_mk = mk.clone();
+        new_mk.error = Some("Size is required (e.g. 64M, 1G)".into());
+        *local_dialog = Some(LocalDialog {
+            kind: LocalDialogKind::MkVol(new_mk),
+            ..dialog
+        });
+        return Ok(Action::Refresh);
+    }
+    // Refuse control bytes / shell metacharacters in name (R129
+    // prep — name flows into a path argument, so we want no '/'
+    // either to keep the volume in the active panel's CWD).
+    if name.chars().any(|c| (c as u32) < 0x20 || c == '\u{7F}' || c == '/' || c == '\\') {
+        let mut new_mk = mk.clone();
+        new_mk.error = Some("Name must not contain '/' or control bytes".into());
+        *local_dialog = Some(LocalDialog {
+            kind: LocalDialogKind::MkVol(new_mk),
+            ..dialog
+        });
+        return Ok(Action::Refresh);
+    }
+
+    // Resolve the on-disk directory the volume should land in.
+    let panel_idx = mk.panel_idx;
+    let host_root = match sp.panel_meta(panel_idx) {
+        BackendMeta::HostFs { root } => root,
+        _ => {
+            let mut new_mk = mk.clone();
+            new_mk.error = Some(
+                "Active panel is not a host-fs panel (volumes must be created on host).".into(),
+            );
+            *local_dialog = Some(LocalDialog {
+                kind: LocalDialogKind::MkVol(new_mk),
+                ..dialog
+            });
+            return Ok(Action::Refresh);
+        }
+    };
+    let panel = &snap.panels[panel_idx];
+    let cwd = panel.path.trim_start_matches('/');
+    let mut volume_path = host_root.clone();
+    if !cwd.is_empty() {
+        volume_path.push(cwd);
+    }
+    // Append .stm if missing.
+    let leaf = if name.ends_with(".stm") {
+        name.to_string()
+    } else {
+        format!("{name}.stm")
+    };
+    volume_path.push(&leaf);
+
+    if volume_path.exists() {
+        let mut new_mk = mk.clone();
+        new_mk.error = Some(format!("File exists: {}", volume_path.display()));
+        *local_dialog = Some(LocalDialog {
+            kind: LocalDialogKind::MkVol(new_mk),
+            ..dialog
+        });
+        return Ok(Action::Refresh);
+    }
+
+    // Spawn `stratum mkfs` synchronously and wait for it to finish.
+    // mkfs is a one-shot; it doesn't open a socket. We use Command
+    // instead of SpawnCtx::spawn_inner for this reason.
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    let me = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("stratum"));
+    let mkfs_status = Command::new(&me)
+        .args(&[
+            "mkfs",
+            volume_path.to_string_lossy().as_ref(),
+            "--size",
+            size,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .output();
+    match mkfs_status {
+        Ok(out) if out.status.success() => {
+            // Volume created. The keyfile lives at <volume>.key.
+            // Don't auto-mount — let the user press Enter on the new
+            // .stm to mount it (preserves the SWISS-4b workflow).
+            *local_dialog = Some(error_dialog(&format!(
+                "Created {}. Press Enter on it to mount.",
+                volume_path.display()
+            )));
+            Ok(Action::Refresh)
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let mut new_mk = mk.clone();
+            new_mk.error = Some(format!(
+                "mkfs failed (exit {}): {}",
+                out.status.code().unwrap_or(-1),
+                stderr.lines().next().unwrap_or("(no detail)").trim()
+            ));
+            *local_dialog = Some(LocalDialog {
+                kind: LocalDialogKind::MkVol(new_mk),
+                ..dialog
+            });
+            Ok(Action::Refresh)
+        }
+        Err(e) => {
+            let mut new_mk = mk.clone();
+            new_mk.error = Some(format!("spawn mkfs: {e}"));
+            *local_dialog = Some(LocalDialog {
+                kind: LocalDialogKind::MkVol(new_mk),
+                ..dialog
+            });
+            Ok(Action::Refresh)
+        }
+    }
 }
 
 fn submit_dialog(
@@ -350,6 +634,13 @@ fn submit_dialog(
                 "Passphrase entry is forward-noted (SWISS-4b1).\n\
                  Place a companion <volume>.key beside the .stm file.",
             ));
+            Ok(Action::Refresh)
+        }
+        LocalDialogKind::MkVol(_) => {
+            // MkVol's submit goes through submit_mkvol; this branch
+            // handles the case where the simple-input pipe somehow
+            // gets a MkVol (defensive — handle_dialog_key dispatches
+            // to handle_mkvol_key first).
             Ok(Action::Refresh)
         }
     }
