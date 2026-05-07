@@ -806,7 +806,13 @@ void stm_slate_drop_all_sessions(stm_slate *s)
 /* Mu held; perform the post-attach state swap atomically. ConnectionAtomic
  * + PanelPathConsistent both maintained: connected becomes TRUE, socket
  * is set, panel paths reset to "/", panel cursors reset to 0, version
- * bumps, cv broadcasts. */
+ * bumps, cv broadcasts.
+ *
+ * R124 P3-5: attach ALSO clears the editor state. A re-attach to a
+ * different backend would otherwise leave editor.filename pointing
+ * at a path that no longer exists on the new backend; save would
+ * silently misroute. Cleared even on first-attach (no-op when
+ * editor_active was already false). */
 static void attach_state_swap_locked(stm_slate *s, const char *path, size_t len,
                                        stm_9p_client *new_bc, stm_9p_client **old_bc_out)
 {
@@ -823,6 +829,21 @@ static void attach_state_swap_locked(stm_slate *s, const char *path, size_t len,
         s->panel[i].cursor = 0u;
         memset(s->panel[i].selection, 0, sizeof s->panel[i].selection);
     }
+    /* R124 P3-5: clear editor state on attach (parity with disconnect). */
+    if (s->editor_active) {
+        free(s->editor_content);
+        s->editor_content = NULL;
+        s->editor_content_len = 0u;
+        free(s->editor_original);
+        s->editor_original = NULL;
+        s->editor_original_len = 0u;
+        s->editor_filename[0] = '\0';
+        s->editor_filename_len = 0u;
+        s->editor_active = false;
+        s->editor_cursor_row = 0u;
+        s->editor_cursor_col = 0u;
+        s->editor_modified = false;
+    }
     s->version++;
     pthread_cond_broadcast(&s->cv);
 }
@@ -830,7 +851,15 @@ static void attach_state_swap_locked(stm_slate *s, const char *path, size_t len,
 /* Mu held; perform the post-disconnect state swap. ConnectionAtomic
  * + PanelPathConsistent both maintained: connected becomes FALSE,
  * socket clears, panel paths clear, cursors reset, version bumps,
- * cv broadcasts. */
+ * cv broadcasts.
+ *
+ * R124 P3-5: disconnect ALSO clears the editor state. Editor state
+ * (filename + content) is meaningless without a backend — saving
+ * after a re-attach would walk the old filename against the NEW
+ * backend's filesystem, possibly creating files in unintended
+ * locations or saving into the wrong dataset. Closing on
+ * disconnect is the safer default (parity with /panels/X/selection
+ * reset-on-cwd-change posture from clause 17). */
 static void disconnect_state_swap_locked(stm_slate *s, stm_9p_client **old_bc_out)
 {
     *old_bc_out = s->backend;
@@ -843,6 +872,21 @@ static void disconnect_state_swap_locked(stm_slate *s, stm_9p_client **old_bc_ou
         s->panel[i].path_len = 0;
         s->panel[i].cursor = 0u;
         memset(s->panel[i].selection, 0, sizeof s->panel[i].selection);
+    }
+    /* R124 P3-5: clear editor state on disconnect. */
+    if (s->editor_active) {
+        free(s->editor_content);
+        s->editor_content = NULL;
+        s->editor_content_len = 0u;
+        free(s->editor_original);
+        s->editor_original = NULL;
+        s->editor_original_len = 0u;
+        s->editor_filename[0] = '\0';
+        s->editor_filename_len = 0u;
+        s->editor_active = false;
+        s->editor_cursor_row = 0u;
+        s->editor_cursor_col = 0u;
+        s->editor_modified = false;
     }
     s->version++;
     pthread_cond_broadcast(&s->cv);
@@ -1498,8 +1542,14 @@ stm_status stm_slate_editor_save(stm_slate *s)
 
     /* Phase 5: commit clean state under s->mu. content_snap becomes
      * the new editor_original; the prior editor_original is freed.
-     * If the editor was closed/replaced concurrently (impossible
-     * given backend_mu is held — but defensive), the snap is freed. */
+     *
+     * R124 P3-3: concurrent stm_slate_editor_close CAN fire between
+     * the Tfsync at Phase 4 and this Phase 5's s->mu acquire,
+     * because editor_close DOES NOT take backend_mu (only s->mu).
+     * The re-check below is genuinely necessary. The backend write
+     * already committed; if local state is gone, we drop the snap
+     * (the file on disk reflects the saved content, but slate has
+     * no local record of the editor). */
     pthread_mutex_lock(&s->mu);
     if (!s->editor_active) {
         /* Concurrent editor_close fired between the Tfsync and now.
@@ -3841,9 +3891,22 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
     if (k == SLATE_KIND_EDITOR_CURSOR) {
         /* SLATE-5b: write parses "row,col" — both are decimal
          * uint32_t. Trailing newline OK; empty body refused
-         * (R101 P2-2 carry); no leading sign or whitespace. */
+         * (R101 P2-2 carry); no leading sign or whitespace.
+         *
+         * R124 P3-6: cursor is NOT validated against current
+         * content bounds. Renderers handle bounds. This is
+         * intentional: cursor is a free-form marker (a renderer
+         * may use it as a logical scrollback position, a
+         * "remember where I was" anchor, etc), not a content-
+         * anchored offset. The renderer's display logic decides
+         * what to do with cursors that fall past EOF / past the
+         * last column of the row's actual content. */
         if (len == 0u) return STM_EINVAL;
-        if (len > 32u) return STM_EINVAL;  /* "4294967295,4294967295\n" = 22 */
+        /* R124 P3-2: tight upper bound — "4294967295,4294967295\n" = 22 bytes;
+         * any longer body is either malformed (extra leading zeros, garbage)
+         * or an integer overflow precursor. Tightening rejects a class of
+         * leading-zero-prefixed inputs without changing valid input space. */
+        if (len > 22u) return STM_EINVAL;
         const char *p = (const char *)buf;
         size_t l = len;
         if (l > 0u && p[l - 1u] == '\n') l--;
@@ -3857,17 +3920,28 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
             return STM_EINVAL;
         }
         uint32_t row = 0, col = 0;
+        /* R124 P3-1: digit-aware overflow check accepts values up to
+         * exactly UINT32_MAX. The previous gate `row > (UMAX-9)/10`
+         * rejected 4294967290..4294967295 which are valid uint32. */
         for (size_t i = 0; i < comma; i++) {
             char c = p[i];
             if (c < '0' || c > '9') return STM_EINVAL;
-            if (row > (UINT32_MAX - 9u) / 10u) return STM_EINVAL;
-            row = row * 10u + (uint32_t)(c - '0');
+            uint32_t digit = (uint32_t)(c - '0');
+            if (row > UINT32_MAX / 10u ||
+                (row == UINT32_MAX / 10u && digit > UINT32_MAX % 10u)) {
+                return STM_EINVAL;
+            }
+            row = row * 10u + digit;
         }
         for (size_t i = comma + 1u; i < l; i++) {
             char c = p[i];
             if (c < '0' || c > '9') return STM_EINVAL;
-            if (col > (UINT32_MAX - 9u) / 10u) return STM_EINVAL;
-            col = col * 10u + (uint32_t)(c - '0');
+            uint32_t digit = (uint32_t)(c - '0');
+            if (col > UINT32_MAX / 10u ||
+                (col == UINT32_MAX / 10u && digit > UINT32_MAX % 10u)) {
+                return STM_EINVAL;
+            }
+            col = col * 10u + digit;
         }
         pthread_mutex_lock(&s->mu);
         if (!s->editor_active) {
