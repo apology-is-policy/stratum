@@ -110,6 +110,17 @@ typedef enum {
     /* SLATE-4b: editable input field (kind=input only; absent at
      * walk + readdir for confirm-kind dialogs). */
     SLATE_KIND_DIALOG_INPUT      = 33,  /* /dialogs/<id>/input (RW) */
+    /* SLATE-5a: /editor subtree. Per SLATE-DESIGN §3 + §8. v5a is
+     * scaffolding + open verb (read-only across all leaves;
+     * action accepts no verbs yet). SLATE-5b will add content +
+     * cursor RW + save/quit/revert/save-and-quit actions. */
+    SLATE_KIND_EDITOR_DIR        = 34,  /* /editor */
+    SLATE_KIND_EDITOR_ACTIVE     = 35,  /* /editor/active */
+    SLATE_KIND_EDITOR_FILENAME   = 36,  /* /editor/filename */
+    SLATE_KIND_EDITOR_CONTENT    = 37,  /* /editor/content */
+    SLATE_KIND_EDITOR_CURSOR     = 38,  /* /editor/cursor */
+    SLATE_KIND_EDITOR_MODIFIED   = 39,  /* /editor/modified */
+    SLATE_KIND_EDITOR_ACTION     = 40,  /* /editor/action (W) */
     SLATE_KIND_MAX
 } slate_kind;
 
@@ -172,9 +183,20 @@ static const slate_kind_meta KIND_META[SLATE_KIND_MAX] = {
     [SLATE_KIND_DIALOG_OPTIONS]    = { false, 0444, "options"   },
     [SLATE_KIND_DIALOG_RESULT]     = { false, 0200, "result"    },
     [SLATE_KIND_DIALOG_INPUT]      = { false, 0644, "input"     },
+    /* SLATE-5a: /editor subtree.
+     * /editor is mode 0555 (read-execute for walk + readdir).
+     * Read leaves are 0444; action is 0200 (write-only).
+     * SLATE-5b will lift content + cursor to RW (mode 0644). */
+    [SLATE_KIND_EDITOR_DIR]        = { true,  0555, "editor"    },
+    [SLATE_KIND_EDITOR_ACTIVE]     = { false, 0444, "active"    },
+    [SLATE_KIND_EDITOR_FILENAME]   = { false, 0444, "filename"  },
+    [SLATE_KIND_EDITOR_CONTENT]    = { false, 0444, "content"   },
+    [SLATE_KIND_EDITOR_CURSOR]     = { false, 0444, "cursor"    },
+    [SLATE_KIND_EDITOR_MODIFIED]   = { false, 0444, "modified"  },
+    [SLATE_KIND_EDITOR_ACTION]     = { false, 0200, "action"    },
 };
 
-_Static_assert(SLATE_KIND_MAX == 34, "KIND_META[] sized to enum cardinality");
+_Static_assert(SLATE_KIND_MAX == 41, "KIND_META[] sized to enum cardinality");
 _Static_assert(sizeof("version") - 1     <= STM_LP9_NAME_MAX, "/version literal");
 _Static_assert(sizeof("status") - 1      <= STM_LP9_NAME_MAX, "/status literal");
 _Static_assert(sizeof("event") - 1       <= STM_LP9_NAME_MAX, "/event literal");
@@ -202,6 +224,11 @@ _Static_assert(sizeof("body") - 1        <= STM_LP9_NAME_MAX, "/dialogs/X/body")
 _Static_assert(sizeof("options") - 1     <= STM_LP9_NAME_MAX, "/dialogs/X/options");
 _Static_assert(sizeof("result") - 1      <= STM_LP9_NAME_MAX, "/dialogs/X/result");
 _Static_assert(sizeof("input") - 1       <= STM_LP9_NAME_MAX, "/dialogs/X/input");
+_Static_assert(sizeof("editor") - 1      <= STM_LP9_NAME_MAX, "/editor");
+_Static_assert(sizeof("active") - 1      <= STM_LP9_NAME_MAX, "/editor/active");
+_Static_assert(sizeof("filename") - 1    <= STM_LP9_NAME_MAX, "/editor/filename");
+_Static_assert(sizeof("content") - 1     <= STM_LP9_NAME_MAX, "/editor/content");
+_Static_assert(sizeof("modified") - 1    <= STM_LP9_NAME_MAX, "/editor/modified");
 
 /* Backend fid convention. The slate daemon is the SOLE 9P client of
  * its attached stratumd; the lib's caller-managed fid namespace is
@@ -416,6 +443,32 @@ struct stm_slate {
     uint64_t                next_dialog_id;
     slate_dialog_completion last_dismiss;
 
+    /* SLATE-5a: editor state. Single editor session at v5a (no
+     * multi-buffer at v1.0; SLATE-DESIGN §10 forward-notes
+     * multi-pane editor for v1.1+).
+     *
+     * State machine:
+     *   INACTIVE: editor_active = false; filename + content = "".
+     *   ACTIVE:   editor_active = true; populated by "editor open" verb;
+     *             cleared by "editor close" verb OR stm_slate_editor_close.
+     *
+     * editor_content is heap-allocated to avoid blowing s->mu's
+     * critical-section size in the open path; bounded at
+     * STM_SLATE_EDITOR_CONTENT_MAX. NULL when inactive.
+     *
+     * SLATE-5b will add: cursor mutation via /editor/cursor write,
+     * content mutation via /editor/content write, modified flag
+     * tracking (memcmp original vs current), action verbs save/quit/
+     * revert/save-and-quit. */
+    bool        editor_active;
+    char        editor_filename[STM_SLATE_EDITOR_FILENAME_MAX + 1];
+    size_t      editor_filename_len;
+    uint8_t    *editor_content;
+    size_t      editor_content_len;
+    uint32_t    editor_cursor_row;     /* v5a always 0 */
+    uint32_t    editor_cursor_col;     /* v5a always 0 */
+    bool        editor_modified;       /* v5a always false */
+
     /* Per-fid materialized bodies (mu-protected). */
     slate_session   sessions[STM_SLATE_MAX_SESSIONS];
 };
@@ -627,6 +680,9 @@ void stm_slate_destroy(stm_slate *s)
             s->sessions[i].bulk_buf = NULL;
         }
     }
+    /* SLATE-5a: free any heap-allocated editor content. */
+    free(s->editor_content);
+    s->editor_content = NULL;
     pthread_mutex_unlock(&s->mu);
     if (bc) stm_9p_close(bc);
     pthread_mutex_unlock(&s->backend_mu);
@@ -646,6 +702,28 @@ uint64_t stm_slate_version(stm_slate *s)
     return v;
 }
 
+/* SLATE-5a: parse "editor open <path>" — returns true if matches +
+ * sets *out_path, *out_path_len. Path is whatever follows the
+ * "editor open " prefix. The caller validates path bounds + bytes
+ * via validate_editor_path. */
+static bool parse_editor_open_verb(const char *line, size_t len,
+                                       const char **out_path, size_t *out_path_len)
+{
+    static const char prefix[] = "editor open ";
+    size_t prefix_len = sizeof(prefix) - 1u;
+    if (len <= prefix_len) return false;
+    if (memcmp(line, prefix, prefix_len) != 0) return false;
+    *out_path = line + prefix_len;
+    *out_path_len = len - prefix_len;
+    return true;
+}
+
+static bool parse_editor_close_verb(const char *line, size_t len)
+{
+    static const char verb[] = "editor close";
+    return len == sizeof(verb) - 1u && memcmp(line, verb, len) == 0;
+}
+
 stm_status stm_slate_submit_event(stm_slate *s, const char *line, size_t len)
 {
     if (!s || !line) return STM_EINVAL;
@@ -655,9 +733,26 @@ stm_status stm_slate_submit_event(stm_slate *s, const char *line, size_t len)
     if (len == 0) return STM_EINVAL;
     if (len > STM_SLATE_EVENT_LINE_MAX) return STM_EINVAL;
 
+    /* SLATE-5a: log the event line first (FIFO doctrine intact),
+     * then route backend-touching verbs to their public APIs. */
     pthread_mutex_lock(&s->mu);
     dispatch_event_locked(s, line, len);
     pthread_mutex_unlock(&s->mu);
+
+    /* SLATE-5a: editor verb routing. Every event line gets logged
+     * by dispatch above; subsequent verb routing returns the
+     * backend-op result so a caller writing to /event programmatically
+     * via stm_slate_submit_event can react to errors. (Renderers
+     * writing via Twrite to /event don't see the result; but they
+     * can read /editor/active afterward to detect success.) */
+    const char *epath = NULL;
+    size_t epath_len = 0;
+    if (parse_editor_open_verb(line, len, &epath, &epath_len)) {
+        return stm_slate_editor_open(s, epath, epath_len);
+    }
+    if (parse_editor_close_verb(line, len)) {
+        return stm_slate_editor_close(s);
+    }
     return STM_OK;
 }
 
@@ -1075,6 +1170,255 @@ size_t stm_slate_dialog_count(stm_slate *s)
     return n;
 }
 
+/* ────────────────────────────────────────────────────────────────────── */
+/* SLATE-5a: editor open / close.                                         */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/* Forward decl for stm_slate_editor_open's backend walk. */
+static stm_status walk_to_cwd(stm_9p_client *bc, const char *cwd,
+                                 uint32_t out_fid);
+
+/* SLATE-5a: validate a path for "editor open". Bytes < 0x20 OR
+ * == 0x7F are refused (R117 P1-1 doctrine — storage-as-key strings
+ * cannot sanitize-on-display because the path is reused on save).
+ * UTF-8 multi-byte (≥ 0x80) passes through. NUL embedded refused. */
+static stm_status validate_editor_path(const char *path, size_t len)
+{
+    if (!path) return STM_EINVAL;
+    if (len == 0u) return STM_EINVAL;
+    if (len > STM_SLATE_EDITOR_FILENAME_MAX) return STM_EINVAL;
+    if (path[0] != '/') return STM_EINVAL;  /* require absolute */
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)path[i];
+        if (c == 0x00u) return STM_EINVAL;
+        if (c < 0x20u || c == 0x7Fu) return STM_EINVAL;
+    }
+    return STM_OK;
+}
+
+stm_status stm_slate_editor_open(stm_slate *s, const char *path, size_t path_len)
+{
+    if (!s || !path) return STM_EINVAL;
+    stm_status vrc = validate_editor_path(path, path_len);
+    if (vrc != STM_OK) return vrc;
+
+    /* Copy `path` into a NUL-terminated local buffer. The caller's
+     * `path` is a (ptr, len) pair — typical when this is called
+     * from /event verb dispatch where `path` is a slice of a
+     * network read buffer. walk_to_cwd treats its argument as a
+     * C string (parsed up to '\0'), so we MUST NUL-terminate
+     * here to avoid reading beyond path_len into adjacent buffer
+     * memory. (Validation already enforced no embedded NULs.) */
+    char path_z[STM_SLATE_EDITOR_FILENAME_MAX + 1];
+    memcpy(path_z, path, path_len);
+    path_z[path_len] = '\0';
+
+    pthread_mutex_lock(&s->backend_mu);
+    pthread_mutex_lock(&s->mu);
+    stm_9p_client *bc = s->backend;
+    pthread_mutex_unlock(&s->mu);
+    if (!bc) {
+        pthread_mutex_unlock(&s->backend_mu);
+        return STM_EBACKEND;
+    }
+
+    /* Phase 1: walk root → path → WORK_FID. */
+    stm_status rc = walk_to_cwd(bc, path_z, SLATE_BACKEND_WORK_FID);
+    if (rc != STM_OK) {
+        pthread_mutex_unlock(&s->backend_mu);
+        return rc;
+    }
+
+    /* Phase 2: getattr to verify regular file. Size from getattr is
+     * a HINT only — synthetic-FS leaves (e.g., slate's own /version)
+     * may report size=0 because the body is materialized at Tlopen.
+     * The actual content size is determined by reading until EOF
+     * below, with the STM_SLATE_EDITOR_CONTENT_MAX cap enforced
+     * during the read loop. */
+    stm_9p_attr a;
+    memset(&a, 0, sizeof a);
+    rc = stm_9p_getattr(bc, SLATE_BACKEND_WORK_FID,
+                            STM_9P_GETATTR_MODE | STM_9P_GETATTR_SIZE, &a);
+    if (rc != STM_OK) {
+        (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
+        pthread_mutex_unlock(&s->backend_mu);
+        return rc;
+    }
+    if ((a.mode & 0170000u) != 0100000u) {
+        /* Not a regular file (could be dir, symlink, etc). */
+        (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
+        pthread_mutex_unlock(&s->backend_mu);
+        return STM_EISDIR;
+    }
+    /* Defensive cap on the getattr-reported size (catches obviously-
+     * pathological values up front). The real cap is enforced in
+     * the read loop below. */
+    if (a.size > STM_SLATE_EDITOR_CONTENT_MAX) {
+        (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
+        pthread_mutex_unlock(&s->backend_mu);
+        return STM_ERANGE;
+    }
+
+    /* Phase 3: Tlopen for read. */
+    stm_9p_qid oqid;
+    uint32_t iounit = 0;
+    rc = stm_9p_lopen(bc, SLATE_BACKEND_WORK_FID, 0u /* O_RDONLY */,
+                         &oqid, &iounit);
+    if (rc != STM_OK) {
+        (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
+        pthread_mutex_unlock(&s->backend_mu);
+        return rc;
+    }
+
+    /* Phase 4: read the full content into a growth-able heap
+     * buffer, doubling on demand and bounded by
+     * STM_SLATE_EDITOR_CONTENT_MAX. The getattr size is a hint
+     * (may be 0 for synthetic-FS leaves); read until Tread
+     * returns 0 (EOF). */
+    uint8_t *buf = NULL;
+    size_t cap = 0u;
+    size_t got_total = 0u;
+    /* Initial capacity: max(getattr_size, 4 KiB). A typical
+     * editor file is < 4 KiB; getattr_size > 0 (regular FS file)
+     * sizes the buffer exactly. */
+    size_t initial = (size_t)a.size;
+    if (initial < 4096u) initial = 4096u;
+    if (initial > STM_SLATE_EDITOR_CONTENT_MAX) {
+        initial = STM_SLATE_EDITOR_CONTENT_MAX;
+    }
+    buf = malloc(initial);
+    if (!buf) {
+        (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
+        pthread_mutex_unlock(&s->backend_mu);
+        return STM_ENOMEM;
+    }
+    cap = initial;
+    for (;;) {
+        if (got_total >= STM_SLATE_EDITOR_CONTENT_MAX) {
+            /* Hit the cap exactly OR reached it. If there's more
+             * to read, refuse with ERANGE — we don't truncate. */
+            uint8_t probe[1];
+            uint32_t probe_got = 0u;
+            stm_status pr = stm_9p_read(bc, SLATE_BACKEND_WORK_FID,
+                                              got_total, probe, 1u,
+                                              &probe_got);
+            if (pr == STM_OK && probe_got > 0u) {
+                free(buf);
+                (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
+                pthread_mutex_unlock(&s->backend_mu);
+                return STM_ERANGE;
+            }
+            break;  /* EOF or read error treated as EOF; drop probe. */
+        }
+        if (got_total == cap) {
+            /* Grow buffer (doubling, bounded). */
+            size_t new_cap = cap * 2u;
+            if (new_cap > STM_SLATE_EDITOR_CONTENT_MAX) {
+                new_cap = STM_SLATE_EDITOR_CONTENT_MAX;
+            }
+            uint8_t *nb = realloc(buf, new_cap);
+            if (!nb) {
+                free(buf);
+                (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
+                pthread_mutex_unlock(&s->backend_mu);
+                return STM_ENOMEM;
+            }
+            buf = nb;
+            cap = new_cap;
+        }
+        size_t remaining = cap - got_total;
+        uint32_t chunk = (iounit > 0u && iounit < remaining)
+                            ? iounit : (uint32_t)remaining;
+        uint32_t got_now = 0u;
+        rc = stm_9p_read(bc, SLATE_BACKEND_WORK_FID, got_total,
+                            buf + got_total, chunk, &got_now);
+        if (rc != STM_OK) {
+            free(buf);
+            (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
+            pthread_mutex_unlock(&s->backend_mu);
+            return rc;
+        }
+        if (got_now == 0u) break;  /* EOF */
+        got_total += got_now;
+    }
+    /* Phase 5: clunk WORK. */
+    (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
+
+    /* Phase 6: atomic state swap under s->mu. */
+    pthread_mutex_lock(&s->mu);
+    /* Free any prior editor content (replacing one open editor with
+     * a new file is allowed; modified-state is dropped). */
+    free(s->editor_content);
+    s->editor_content = buf;
+    s->editor_content_len = got_total;
+    memcpy(s->editor_filename, path, path_len);
+    s->editor_filename[path_len] = '\0';
+    s->editor_filename_len = path_len;
+    s->editor_active = true;
+    s->editor_cursor_row = 0u;
+    s->editor_cursor_col = 0u;
+    s->editor_modified = false;
+    s->version++;
+    pthread_cond_broadcast(&s->cv);
+    pthread_mutex_unlock(&s->mu);
+
+    pthread_mutex_unlock(&s->backend_mu);
+    return STM_OK;
+}
+
+stm_status stm_slate_editor_close(stm_slate *s)
+{
+    if (!s) return STM_EINVAL;
+    pthread_mutex_lock(&s->mu);
+    if (s->editor_active) {
+        free(s->editor_content);
+        s->editor_content = NULL;
+        s->editor_content_len = 0u;
+        s->editor_filename[0] = '\0';
+        s->editor_filename_len = 0u;
+        s->editor_active = false;
+        s->editor_cursor_row = 0u;
+        s->editor_cursor_col = 0u;
+        s->editor_modified = false;
+        s->version++;
+        pthread_cond_broadcast(&s->cv);
+    }
+    pthread_mutex_unlock(&s->mu);
+    return STM_OK;
+}
+
+bool stm_slate_editor_active(stm_slate *s)
+{
+    if (!s) return false;
+    pthread_mutex_lock(&s->mu);
+    bool a = s->editor_active;
+    pthread_mutex_unlock(&s->mu);
+    return a;
+}
+
+size_t stm_slate_editor_filename(stm_slate *s, char *buf, size_t buf_cap)
+{
+    if (!s) return 0u;
+    pthread_mutex_lock(&s->mu);
+    size_t n = s->editor_filename_len;
+    if (buf && buf_cap > 0u) {
+        size_t copy = (n < buf_cap - 1u) ? n : (buf_cap - 1u);
+        memcpy(buf, s->editor_filename, copy);
+        buf[copy] = '\0';
+    }
+    pthread_mutex_unlock(&s->mu);
+    return n;
+}
+
+size_t stm_slate_editor_content_len(stm_slate *s)
+{
+    if (!s) return 0u;
+    pthread_mutex_lock(&s->mu);
+    size_t n = s->editor_content_len;
+    pthread_mutex_unlock(&s->mu);
+    return n;
+}
+
 size_t stm_slate_panel_path(stm_slate *s, int panel_idx,
                               char *buf, size_t buf_cap)
 {
@@ -1328,6 +1672,70 @@ static stm_status materialize_dialog_input_locked(slate_dialog *d, slate_session
     memcpy(ss->buf, d->input, d->input_len);
     ss->buf[d->input_len] = '\n';
     ss->len = (uint32_t)(d->input_len + 1u);
+    return STM_OK;
+}
+
+/* SLATE-5a: /editor/active — "1\n" or "0\n" (always 2 bytes). */
+static stm_status materialize_editor_active_locked(stm_slate *s, slate_session *ss)
+{
+    ss->buf[0] = s->editor_active ? '1' : '0';
+    ss->buf[1] = '\n';
+    ss->len = 2u;
+    return STM_OK;
+}
+
+/* SLATE-5a: /editor/filename — filename + '\n'; just '\n' (1 byte)
+ * when no editor active. */
+static stm_status materialize_editor_filename_locked(stm_slate *s, slate_session *ss)
+{
+    if (s->editor_filename_len + 1u > sizeof ss->buf) return STM_ERANGE;
+    memcpy(ss->buf, s->editor_filename, s->editor_filename_len);
+    ss->buf[s->editor_filename_len] = '\n';
+    ss->len = (uint32_t)(s->editor_filename_len + 1u);
+    return STM_OK;
+}
+
+/* SLATE-5a: /editor/cursor — "row,col\n". v5a always "0,0\n". */
+static stm_status materialize_editor_cursor_locked(stm_slate *s, slate_session *ss)
+{
+    int n = snprintf((char *)ss->buf, sizeof ss->buf, "%u,%u\n",
+                        (unsigned)s->editor_cursor_row,
+                        (unsigned)s->editor_cursor_col);
+    if (n < 0 || n >= (int)sizeof ss->buf) return STM_ERANGE;
+    ss->len = (uint32_t)n;
+    return STM_OK;
+}
+
+/* SLATE-5a: /editor/modified — "1\n" or "0\n". v5a always "0\n". */
+static stm_status materialize_editor_modified_locked(stm_slate *s, slate_session *ss)
+{
+    ss->buf[0] = s->editor_modified ? '1' : '0';
+    ss->buf[1] = '\n';
+    ss->len = 2u;
+    return STM_OK;
+}
+
+/* SLATE-5a: /editor/content — file contents. Uses bulk_buf because
+ * content can exceed STM_SLATE_BODY_MAX (4 KiB) — bounded only by
+ * STM_SLATE_EDITOR_CONTENT_MAX (1 MiB). Snapshot at lopen, served
+ * on subsequent reads (R114 P1-1 doctrine carry; same posture as
+ * /log/tail and /panels/X/entries). NO sanitization — file
+ * contents are what they are; renderers decide how to display
+ * control bytes (this is a text-EDITING surface, not a line-
+ * oriented log). Empty body (0 bytes, NOT "\n") when no editor
+ * active — the editor IS the content; an inactive editor has
+ * literally no content to show. */
+static stm_status materialize_editor_content_locked(stm_slate *s, slate_session *ss)
+{
+    if (!s->editor_active || s->editor_content_len == 0u) {
+        ss->len = 0u;
+        return STM_OK;
+    }
+    /* Use bulk_buf for content; allocate exact size. */
+    ss->bulk_buf = malloc(s->editor_content_len);
+    if (!ss->bulk_buf) return STM_ENOMEM;
+    memcpy(ss->bulk_buf, s->editor_content, s->editor_content_len);
+    ss->bulk_len = (uint32_t)s->editor_content_len;
     return STM_OK;
 }
 
@@ -2420,6 +2828,7 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
         else if (str_eq(name, name_len, "connection")) target = SLATE_KIND_CONN_DIR;
         else if (str_eq(name, name_len, "panels"))     target = SLATE_KIND_PANELS_DIR;
         else if (str_eq(name, name_len, "dialogs"))    target = SLATE_KIND_DIALOGS_DIR;
+        else if (str_eq(name, name_len, "editor"))     target = SLATE_KIND_EDITOR_DIR;
         break;
     case SLATE_KIND_LOG_DIR:
         if (str_eq(name, name_len, "tail"))            target = SLATE_KIND_LOG_TAIL;
@@ -2440,6 +2849,14 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
         else if (str_eq(name, name_len, "cursor"))     target = SLATE_KIND_PANEL_L_CURSOR;
         else if (str_eq(name, name_len, "action"))     target = SLATE_KIND_PANEL_L_ACTION;
         else if (str_eq(name, name_len, "selection"))  target = SLATE_KIND_PANEL_L_SELECTION;
+        break;
+    case SLATE_KIND_EDITOR_DIR:
+        if (str_eq(name, name_len, "active"))          target = SLATE_KIND_EDITOR_ACTIVE;
+        else if (str_eq(name, name_len, "filename"))   target = SLATE_KIND_EDITOR_FILENAME;
+        else if (str_eq(name, name_len, "content"))    target = SLATE_KIND_EDITOR_CONTENT;
+        else if (str_eq(name, name_len, "cursor"))     target = SLATE_KIND_EDITOR_CURSOR;
+        else if (str_eq(name, name_len, "modified"))   target = SLATE_KIND_EDITOR_MODIFIED;
+        else if (str_eq(name, name_len, "action"))     target = SLATE_KIND_EDITOR_ACTION;
         break;
     case SLATE_KIND_PANEL_R_DIR:
         if (str_eq(name, name_len, "path"))            target = SLATE_KIND_PANEL_R_PATH;
@@ -2543,7 +2960,9 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
         if (rc != STM_OK) return rc;
         rc = emit_entry(SLATE_KIND_PANELS_DIR, &em);
         if (rc != STM_OK) return rc;
-        return emit_entry(SLATE_KIND_DIALOGS_DIR, &em);
+        rc = emit_entry(SLATE_KIND_DIALOGS_DIR, &em);
+        if (rc != STM_OK) return rc;
+        return emit_entry(SLATE_KIND_EDITOR_DIR, &em);
     case SLATE_KIND_LOG_DIR:
         rc = emit_entry(SLATE_KIND_LOG_TAIL, &em);
         if (rc != STM_OK) return rc;
@@ -2578,6 +2997,18 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
         rc = emit_entry(SLATE_KIND_PANEL_R_ACTION, &em);
         if (rc != STM_OK) return rc;
         return emit_entry(SLATE_KIND_PANEL_R_SELECTION, &em);
+    case SLATE_KIND_EDITOR_DIR:
+        rc = emit_entry(SLATE_KIND_EDITOR_ACTIVE, &em);
+        if (rc != STM_OK) return rc;
+        rc = emit_entry(SLATE_KIND_EDITOR_FILENAME, &em);
+        if (rc != STM_OK) return rc;
+        rc = emit_entry(SLATE_KIND_EDITOR_CONTENT, &em);
+        if (rc != STM_OK) return rc;
+        rc = emit_entry(SLATE_KIND_EDITOR_CURSOR, &em);
+        if (rc != STM_OK) return rc;
+        rc = emit_entry(SLATE_KIND_EDITOR_MODIFIED, &em);
+        if (rc != STM_OK) return rc;
+        return emit_entry(SLATE_KIND_EDITOR_ACTION, &em);
     case SLATE_KIND_DIALOGS_DIR: {
         /* SLATE-4b: emit "stack" + one decimal-name dirent per
          * active dialog id, sorted ascending. Snapshot the id list
@@ -2779,6 +3210,21 @@ static stm_status vops_lopen(void *ctx, uint32_t fid, uint64_t qid_path,
         break;
     case SLATE_KIND_DIALOG_STACK:
         rc = materialize_dialog_stack_locked(s, ss);
+        break;
+    case SLATE_KIND_EDITOR_ACTIVE:
+        rc = materialize_editor_active_locked(s, ss);
+        break;
+    case SLATE_KIND_EDITOR_FILENAME:
+        rc = materialize_editor_filename_locked(s, ss);
+        break;
+    case SLATE_KIND_EDITOR_CONTENT:
+        rc = materialize_editor_content_locked(s, ss);
+        break;
+    case SLATE_KIND_EDITOR_CURSOR:
+        rc = materialize_editor_cursor_locked(s, ss);
+        break;
+    case SLATE_KIND_EDITOR_MODIFIED:
+        rc = materialize_editor_modified_locked(s, ss);
         break;
     case SLATE_KIND_DIALOG_KIND:
     case SLATE_KIND_DIALOG_TITLE:
@@ -3132,6 +3578,18 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         pthread_mutex_unlock(&s->mu);
         *out_written = len;
         return STM_OK;
+    }
+    if (k == SLATE_KIND_EDITOR_ACTION) {
+        /* SLATE-5a: editor action verbs land at SLATE-5b
+         * (save / quit / revert / save-and-quit). v5a accepts no
+         * verbs — every write is refused with STM_ENOTSUPPORTED so
+         * renderers using /editor/action prematurely get a clear
+         * "feature not yet implemented" signal. R101 P2-2 carry:
+         * zero-byte refused even at v5a since the verb dispatch
+         * would have refused it anyway. */
+        if (len == 0u) return STM_EINVAL;
+        if (len > STM_SLATE_EVENT_LINE_MAX) return STM_EINVAL;
+        return STM_ENOTSUPPORTED;
     }
     if (k == SLATE_KIND_PANEL_L_ACTION || k == SLATE_KIND_PANEL_R_ACTION) {
         /* SLATE-3a/3b: dispatch a panel action verb via a static verb

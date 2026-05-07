@@ -327,9 +327,9 @@ STM_TEST(slate_root_readdir_emits_expected_entries)
     ent_collect cx = {0};
     STM_ASSERT_OK(v->readdir(s, stm_slate_root(s), /*cookie=*/0u,
                                 ent_cb, &cx));
-    /* SLATE-1 + SLATE-2 + SLATE-4-confirm: version, status, event,
-     * redraw, log, connection, panels, dialogs. */
-    STM_ASSERT_EQ(cx.n, 8u);
+    /* SLATE-1 + SLATE-2 + SLATE-4 + SLATE-5a: version, status, event,
+     * redraw, log, connection, panels, dialogs, editor. */
+    STM_ASSERT_EQ(cx.n, 9u);
     STM_ASSERT_EQ(strcmp(cx.names[0], "version"),    0);
     STM_ASSERT_EQ(strcmp(cx.names[1], "status"),     0);
     STM_ASSERT_EQ(strcmp(cx.names[2], "event"),      0);
@@ -338,6 +338,7 @@ STM_TEST(slate_root_readdir_emits_expected_entries)
     STM_ASSERT_EQ(strcmp(cx.names[5], "connection"), 0);
     STM_ASSERT_EQ(strcmp(cx.names[6], "panels"),     0);
     STM_ASSERT_EQ(strcmp(cx.names[7], "dialogs"),    0);
+    STM_ASSERT_EQ(strcmp(cx.names[8], "editor"),     0);
 
     stm_slate_destroy(s);
 }
@@ -2031,6 +2032,203 @@ STM_TEST(slate_4b_lopen_input_on_confirm_kind_enoent)
     uint64_t input_qp = (((uint64_t)33) << 56) | 1u;
     STM_ASSERT_EQ(v->lopen(s, 77u, input_qp, STM_LP9_O_WRONLY), STM_ENOENT);
 
+    stm_slate_destroy(s);
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* P9-SLATE-5a: editor scaffold — read-only state surface.               */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/* Initial state: editor inactive; all read paths return defaults. */
+STM_TEST(slate_5a_initial_inactive)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    STM_ASSERT_EQ((int)stm_slate_editor_active(s), 0);
+
+    const stm_lp9_vops *v = stm_slate_vops();
+    /* /editor/active reads "0\n". */
+    uint64_t qp = ((uint64_t)35) << 56;
+    STM_ASSERT_OK(v->lopen(s, 77u, qp, STM_LP9_O_RDONLY));
+    char buf[16];
+    uint32_t got = (uint32_t)sizeof buf;
+    STM_ASSERT_OK(v->read(s, 77u, qp, 0u, buf, &got));
+    STM_ASSERT_EQ(got, 2u);
+    STM_ASSERT_EQ(buf[0], '0');
+    STM_ASSERT_EQ(buf[1], '\n');
+    v->clunk(s, 77u, qp);
+
+    /* /editor/filename reads "\n" (just newline). */
+    uint64_t fqp = ((uint64_t)36) << 56;
+    STM_ASSERT_OK(v->lopen(s, 78u, fqp, STM_LP9_O_RDONLY));
+    got = (uint32_t)sizeof buf;
+    STM_ASSERT_OK(v->read(s, 78u, fqp, 0u, buf, &got));
+    STM_ASSERT_EQ(got, 1u);
+    STM_ASSERT_EQ(buf[0], '\n');
+    v->clunk(s, 78u, fqp);
+
+    /* /editor/cursor reads "0,0\n". */
+    uint64_t cqp = ((uint64_t)38) << 56;
+    STM_ASSERT_OK(v->lopen(s, 79u, cqp, STM_LP9_O_RDONLY));
+    got = (uint32_t)sizeof buf;
+    STM_ASSERT_OK(v->read(s, 79u, cqp, 0u, buf, &got));
+    buf[got] = '\0';
+    STM_ASSERT_EQ(strcmp(buf, "0,0\n"), 0);
+    v->clunk(s, 79u, cqp);
+
+    /* /editor/modified reads "0\n". */
+    uint64_t mqp = ((uint64_t)39) << 56;
+    STM_ASSERT_OK(v->lopen(s, 80u, mqp, STM_LP9_O_RDONLY));
+    got = (uint32_t)sizeof buf;
+    STM_ASSERT_OK(v->read(s, 80u, mqp, 0u, buf, &got));
+    STM_ASSERT_EQ(got, 2u);
+    STM_ASSERT_EQ(buf[0], '0');
+    STM_ASSERT_EQ(buf[1], '\n');
+    v->clunk(s, 80u, mqp);
+
+    /* /editor/content reads 0 bytes when inactive. */
+    uint64_t conqp = ((uint64_t)37) << 56;
+    STM_ASSERT_OK(v->lopen(s, 81u, conqp, STM_LP9_O_RDONLY));
+    got = (uint32_t)sizeof buf;
+    STM_ASSERT_OK(v->read(s, 81u, conqp, 0u, buf, &got));
+    STM_ASSERT_EQ(got, 0u);
+    v->clunk(s, 81u, conqp);
+
+    stm_slate_destroy(s);
+}
+
+/* /editor readdir lists 6 leaf entries. */
+STM_TEST(slate_5a_editor_dir_readdir)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const stm_lp9_vops *v = stm_slate_vops();
+
+    /* /editor qid: kind=34. */
+    uint64_t edqp = ((uint64_t)34) << 56;
+    ent_collect cx = {0};
+    STM_ASSERT_OK(v->readdir(s, edqp, /*cookie=*/0u, ent_cb, &cx));
+    STM_ASSERT_EQ(cx.n, 6u);
+    STM_ASSERT_EQ(strcmp(cx.names[0], "active"),   0);
+    STM_ASSERT_EQ(strcmp(cx.names[1], "filename"), 0);
+    STM_ASSERT_EQ(strcmp(cx.names[2], "content"),  0);
+    STM_ASSERT_EQ(strcmp(cx.names[3], "cursor"),   0);
+    STM_ASSERT_EQ(strcmp(cx.names[4], "modified"), 0);
+    STM_ASSERT_EQ(strcmp(cx.names[5], "action"),   0);
+
+    stm_slate_destroy(s);
+}
+
+/* editor_open returns STM_EBACKEND when disconnected. */
+STM_TEST(slate_5a_open_disconnected_returns_ebackend)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    /* No backend attached; open should fail with EBACKEND. */
+    STM_ASSERT_EQ(stm_slate_editor_open(s, "/foo", 4u), STM_EBACKEND);
+    STM_ASSERT_EQ((int)stm_slate_editor_active(s), 0);
+    stm_slate_destroy(s);
+}
+
+/* editor_open rejects invalid paths. */
+STM_TEST(slate_5a_open_rejects_invalid_paths)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    /* Empty. */
+    STM_ASSERT_EQ(stm_slate_editor_open(s, "", 0u), STM_EINVAL);
+    /* Non-absolute. */
+    STM_ASSERT_EQ(stm_slate_editor_open(s, "foo", 3u), STM_EINVAL);
+    /* Control byte. */
+    STM_ASSERT_EQ(stm_slate_editor_open(s, "/a\x01" "b", 4u), STM_EINVAL);
+    /* DEL. */
+    STM_ASSERT_EQ(stm_slate_editor_open(s, "/a\x7f" "b", 4u), STM_EINVAL);
+    /* NUL embedded. */
+    {
+        char path[5] = { '/', 'a', '\0', 'b', '\0' };
+        STM_ASSERT_EQ(stm_slate_editor_open(s, path, 4u), STM_EINVAL);
+    }
+    /* Oversize. */
+    char big[STM_SLATE_EDITOR_FILENAME_MAX + 2u];
+    memset(big, 'x', sizeof big);
+    big[0] = '/';
+    STM_ASSERT_EQ(stm_slate_editor_open(s, big, sizeof big), STM_EINVAL);
+    stm_slate_destroy(s);
+}
+
+/* /editor/action returns ENOTSUPPORTED for any verb at v5a. */
+STM_TEST(slate_5a_action_returns_enotsupported)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const stm_lp9_vops *v = stm_slate_vops();
+    /* /editor/action qid: kind=40. */
+    uint64_t aqp = ((uint64_t)40) << 56;
+    STM_ASSERT_OK(v->lopen(s, 77u, aqp, STM_LP9_O_WRONLY));
+    uint32_t written = 0;
+    STM_ASSERT_EQ(v->write(s, 77u, aqp, 0u, "save", 4u, &written),
+                     STM_ENOTSUPPORTED);
+    STM_ASSERT_EQ(v->write(s, 77u, aqp, 0u, "quit", 4u, &written),
+                     STM_ENOTSUPPORTED);
+    /* Zero-byte still refused with EINVAL (R101 P2-2 takes priority). */
+    STM_ASSERT_EQ(v->write(s, 77u, aqp, 0u, "", 0u, &written), STM_EINVAL);
+    v->clunk(s, 77u, aqp);
+    stm_slate_destroy(s);
+}
+
+/* editor_close while inactive is a no-op (no version bump). */
+STM_TEST(slate_5a_close_inactive_no_op)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    uint64_t v0 = stm_slate_version(s);
+    STM_ASSERT_OK(stm_slate_editor_close(s));
+    uint64_t v1 = stm_slate_version(s);
+    STM_ASSERT_EQ(v1, v0);
+    stm_slate_destroy(s);
+}
+
+/* /event "editor open" + disconnected → returns STM_EBACKEND
+ * (after logging). */
+STM_TEST(slate_5a_event_editor_open_dispatches_to_api)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const char *line = "editor open /foo";
+    /* Event verb dispatches to stm_slate_editor_open which returns
+     * STM_EBACKEND because we're disconnected. */
+    STM_ASSERT_EQ(stm_slate_submit_event(s, line, strlen(line)),
+                     STM_EBACKEND);
+    /* Event was still logged. */
+    STM_ASSERT(stm_slate_version(s) > 1u);
+    stm_slate_destroy(s);
+}
+
+/* /event "editor close" verb dispatch — no-op on inactive. */
+STM_TEST(slate_5a_event_editor_close_dispatches)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const char *line = "editor close";
+    STM_ASSERT_OK(stm_slate_submit_event(s, line, strlen(line)));
+    STM_ASSERT_EQ((int)stm_slate_editor_active(s), 0);
+    stm_slate_destroy(s);
+}
+
+/* Verb parser doesn't match prefixes that aren't followed by a space. */
+STM_TEST(slate_5a_event_editor_unrelated_verbs_fall_through)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    /* "editor closed" should NOT match "editor close". */
+    const char *line = "editor closed";
+    STM_ASSERT_OK(stm_slate_submit_event(s, line, strlen(line)));
+    /* "editorx open /foo" should NOT match "editor open". */
+    const char *line2 = "editorx open /foo";
+    STM_ASSERT_OK(stm_slate_submit_event(s, line2, strlen(line2)));
+    /* "editor open" without a path should NOT match (prefix is "editor open ", with space). */
+    const char *line3 = "editor open";
+    STM_ASSERT_OK(stm_slate_submit_event(s, line3, strlen(line3)));
     stm_slate_destroy(s);
 }
 

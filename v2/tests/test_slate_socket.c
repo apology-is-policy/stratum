@@ -673,7 +673,9 @@ STM_TEST(slate_socket_attach_to_backend_and_read_panel_entries)
             lines++;
             p = nl + 1;
         }
-        STM_ASSERT_EQ(lines, 8u);
+        /* Slate root: 9 entries — version, status, event, redraw, log,
+         * connection, panels, dialogs, editor (SLATE-1+2+4+5a). */
+        STM_ASSERT_EQ(lines, 9u);
     }
     STM_ASSERT_OK(stm_9p_clunk(c, 104u));
 
@@ -1656,6 +1658,142 @@ STM_TEST(slate_socket_4b_confirm_kind_no_input_field)
 
     stm_9p_close(c);
     destroy_fixture(&f);
+}
+
+/* SLATE-5a: e2e editor open against slate-B's /version (a regular
+ * file synfs leaf). Verifies the full backend walk + lopen + read +
+ * commit path. */
+STM_TEST(slate_socket_5a_editor_open_e2e)
+{
+    /* Backend slate (B). Its root has /version as a regular file
+     * containing "1\n" — perfect for a small editor open test. */
+    slate_backend_fixture be;
+    setup_backend_fixture(&be, "be_5a_open");
+
+    /* Foreground slate (F). */
+    slate_fixture f;
+    setup_fixture(&f, "fg_5a_open");
+
+    stm_9p_client *c = NULL;
+    stm_9p_dial_opts opts = default_dial_opts(100u);
+    STM_ASSERT_OK(retry_dial(g_sock_path, &opts, &c));
+
+    /* Step 1: attach F to B. */
+    const char *anames[] = { "connection", "attach" };
+    stm_9p_qid aqids[2];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 101u, 2u, anames, aqids, &walked));
+    stm_9p_qid oqid;
+    uint32_t iounit = 0;
+    STM_ASSERT_OK(stm_9p_lopen(c, 101u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, 101u, 0u, be.sock_path,
+                                  (uint32_t)strlen(be.sock_path), &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 101u));
+
+    /* Step 2: /event "editor open /version" — triggers F to walk +
+     * read slate-B's /version surface. */
+    const char *enames[] = { "event" };
+    stm_9p_qid eqids[1];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 102u, 1u, enames, eqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 102u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    const char *line = "editor open /version";
+    STM_ASSERT_OK(stm_9p_write(c, 102u, 0u, line,
+                                  (uint32_t)strlen(line), &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 102u));
+
+    /* Step 3: /editor/active reads "1\n". */
+    const char *acnames[] = { "editor", "active" };
+    stm_9p_qid acqids[2];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 103u, 2u, acnames, acqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 103u, 0u, &oqid, &iounit));
+    char abuf[8];
+    uint32_t agot = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 103u, 0u, abuf,
+                                  (uint32_t)(sizeof abuf), &agot));
+    STM_ASSERT_EQ(agot, 2u);
+    STM_ASSERT_EQ(abuf[0], '1');
+    STM_ASSERT_EQ(abuf[1], '\n');
+    STM_ASSERT_OK(stm_9p_clunk(c, 103u));
+
+    /* Step 4: /editor/filename reads "/version\n". */
+    const char *fnnames[] = { "editor", "filename" };
+    stm_9p_qid fnqids[2];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 104u, 2u, fnnames, fnqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 104u, 0u, &oqid, &iounit));
+    char fnbuf[64];
+    uint32_t fngot = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 104u, 0u, fnbuf,
+                                  (uint32_t)(sizeof fnbuf - 1u), &fngot));
+    fnbuf[fngot] = '\0';
+    STM_ASSERT_EQ(strcmp(fnbuf, "/version\n"), 0);
+    STM_ASSERT_OK(stm_9p_clunk(c, 104u));
+
+    /* Step 5: /editor/content reads slate-B's /version content
+     * (which is "<version>\n", typically "1\n" early in the
+     * fixture lifecycle but might be higher after attach +
+     * dispatch bumps). Just verify it's non-empty + ends with \n. */
+    const char *cnnames[] = { "editor", "content" };
+    stm_9p_qid cnqids[2];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 105u, 2u, cnnames, cnqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 105u, 0u, &oqid, &iounit));
+    char cnbuf[32];
+    uint32_t cngot = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 105u, 0u, cnbuf,
+                                  (uint32_t)(sizeof cnbuf - 1u), &cngot));
+    STM_ASSERT(cngot > 0u);
+    STM_ASSERT_EQ(cnbuf[cngot - 1u], '\n');
+    STM_ASSERT_OK(stm_9p_clunk(c, 105u));
+
+    stm_9p_close(c);
+    destroy_fixture(&f);
+    destroy_backend_fixture(&be);
+}
+
+/* SLATE-5a: editor close via /event verb. */
+STM_TEST(slate_socket_5a_editor_close_e2e)
+{
+    slate_backend_fixture be;
+    setup_backend_fixture(&be, "be_5a_close");
+
+    slate_fixture f;
+    setup_fixture(&f, "fg_5a_close");
+
+    stm_9p_client *c = NULL;
+    stm_9p_dial_opts opts = default_dial_opts(100u);
+    STM_ASSERT_OK(retry_dial(g_sock_path, &opts, &c));
+
+    /* Attach + open. */
+    const char *anames[] = { "connection", "attach" };
+    stm_9p_qid aqids[2];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 101u, 2u, anames, aqids, &walked));
+    stm_9p_qid oqid;
+    uint32_t iounit = 0;
+    STM_ASSERT_OK(stm_9p_lopen(c, 101u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, 101u, 0u, be.sock_path,
+                                  (uint32_t)strlen(be.sock_path), &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 101u));
+
+    STM_ASSERT_OK(stm_slate_editor_open(f.slate, "/version", 8u));
+    STM_ASSERT_EQ((int)stm_slate_editor_active(f.slate), 1);
+
+    /* /event "editor close" → editor inactive. */
+    const char *enames[] = { "event" };
+    stm_9p_qid eqids[1];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 102u, 1u, enames, eqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 102u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    const char *line = "editor close";
+    STM_ASSERT_OK(stm_9p_write(c, 102u, 0u, line,
+                                  (uint32_t)strlen(line), &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 102u));
+
+    STM_ASSERT_EQ((int)stm_slate_editor_active(f.slate), 0);
+
+    stm_9p_close(c);
+    destroy_fixture(&f);
+    destroy_backend_fixture(&be);
 }
 
 /* /event refuses zero-byte writes (parity with stm_slate_submit_event). */

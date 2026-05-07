@@ -77,6 +77,24 @@
  *                                 (highest active id) accepts results;
  *                                 others return STM_EBUSY.
  *
+ *   P9-SLATE-5a — editor scaffold + open verb:
+ *     /editor/active     (R)  "1" if an editor is open, "0" otherwise.
+ *     /editor/filename   (R)  filename being edited; empty when not active.
+ *     /editor/content    (R)  editor buffer (full text); v5a is read-
+ *                             only — RW lands at SLATE-5b.
+ *     /editor/cursor     (R)  "row,col" 0-indexed; v5a always "0,0".
+ *     /editor/modified   (R)  "1" | "0"; v5a always "0".
+ *     /editor/action     (W)  v5a accepts no verbs (returns
+ *                             STM_ENOTSUPPORTED); SLATE-5b adds
+ *                             save / quit / revert / save-and-quit.
+ *
+ *     New /event verbs (dispatched by stm_slate_submit_event):
+ *       "editor open <path>"   — walk + read backend file into the
+ *                                 buffer; populates filename + content;
+ *                                 fails STM_EBACKEND if disconnected
+ *                                 or the backend op fails.
+ *       "editor close"          — clear editor state (NO save).
+ *
  * State-machine spec: v2/specs/slate.tla. Invariants:
  *   VersionMonotonic    — version only ever advances.
  *   EventFIFO           — dispatched order = write order, no gaps.
@@ -244,6 +262,32 @@ extern "C" {
  * stm_slate_dialog_consume. */
 #define STM_SLATE_DIALOG_MAX_ACTIVE   4u
 #define STM_SLATE_DIALOG_INPUT_MAX    256u
+
+/* SLATE-5a: bounds for the /editor subtree.
+ *
+ * STM_SLATE_EDITOR_FILENAME_MAX caps the filename field. POSIX
+ * paths max at PATH_MAX (typically 4096) but we hold the path
+ * in-memory for /editor/filename's snprintf into a per-fid body;
+ * keep it bounded at STM_SLATE_PATH_MAX (1023) for parity with
+ * the panel path field.
+ *
+ * STM_SLATE_EDITOR_CONTENT_MAX caps the editable buffer. Sized
+ * for typical-config-file workloads (1 MiB); files larger than
+ * this refuse to open with STM_ERANGE. Renderers writing
+ * /editor/content must respect this cap. v1.1 may bump for
+ * larger source files; for v1.0 the cap matches the
+ * conservative "fits in process address space without surprise"
+ * heuristic and gives the daemon predictable memory pressure
+ * under N concurrent open editors. */
+#define STM_SLATE_EDITOR_FILENAME_MAX  STM_SLATE_PATH_MAX
+#define STM_SLATE_EDITOR_CONTENT_MAX   (1u * 1024u * 1024u)
+/* Per-line cap inside the editor body materialisation. The
+ * /editor/content surface is line-oriented like /panels/X/entries
+ * but multi-line; renderers MUST tolerate arbitrary content
+ * because file contents are not sanitized at this surface (the
+ * editor IS a text-editing UI; control bytes ARE part of the
+ * file). The trust boundary lives at the renderer (which decides
+ * what to display vs. interpret as control codes). */
 
 /* ────────────────────────────────────────────────────────────────────── */
 /* Lifecycle.                                                             */
@@ -504,6 +548,69 @@ uint64_t stm_slate_dialog_id(stm_slate *s);
  * Range [0, STM_SLATE_DIALOG_MAX_ACTIVE]. Mu-protected.
  */
 size_t stm_slate_dialog_count(stm_slate *s);
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* SLATE-5a: editor state accessors.                                      */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/*
+ * SLATE-5a: open a backend file as the active editor session.
+ *
+ * Atomically (under backend_mu): if any prior editor session is
+ * active, drops it; walks root → path via the attached backend;
+ * Tgetattrs to verify regular file + size ≤ STM_SLATE_EDITOR_CONTENT_MAX;
+ * Tlopens read-only; Treads the full content (chunked at iounit
+ * cap); Tclunks; commits the new editor state under s->mu, bumps
+ * version, broadcasts cv.
+ *
+ * `path` MUST be absolute (leading '/') and contain no control
+ * bytes (R117 P1-1 doctrine carry — storage-as-key). v5a
+ * snapshots content read-only; SLATE-5b lifts /editor/content to
+ * RW and adds save/quit/revert/save-and-quit actions.
+ *
+ * Returns:
+ *   - STM_OK on success.
+ *   - STM_EINVAL on NULL `s`/path, empty path, oversize path,
+ *     non-absolute path, or control bytes in path.
+ *   - STM_EBACKEND if not connected, or any backend op fails.
+ *   - STM_EISDIR if the path resolves to a directory (or other
+ *     non-regular type).
+ *   - STM_ERANGE if file size > STM_SLATE_EDITOR_CONTENT_MAX.
+ *   - STM_ENOMEM on alloc failure.
+ */
+STM_MUST_USE
+stm_status stm_slate_editor_open(stm_slate *s, const char *path, size_t path_len);
+
+/*
+ * SLATE-5a: query whether an editor session is open.
+ * Mu-protected; the value is the live state at the moment of call.
+ */
+bool stm_slate_editor_active(stm_slate *s);
+
+/*
+ * SLATE-5a: copy the current editor filename into `buf`. Returns the
+ * length the filename WOULD occupy regardless of buf_cap (so callers
+ * can detect truncation: caller-cap-bound applied). buf is always
+ * NUL-terminated when buf_cap > 0. buf_cap == 0 returns length without
+ * writing. Returns 0 when no editor is active.
+ */
+size_t stm_slate_editor_filename(stm_slate *s, char *buf, size_t buf_cap);
+
+/*
+ * SLATE-5a: query the current editor content length (excluding NUL).
+ * Returns 0 when no editor is active.
+ */
+size_t stm_slate_editor_content_len(stm_slate *s);
+
+/*
+ * SLATE-5a: programmatically close the current editor (without
+ * saving). Clears all /editor state back to inactive. Bumps
+ * version. No-op if no editor is open.
+ *
+ * Returns STM_OK always (in the no-op case and in the close case).
+ */
+STM_MUST_USE
+stm_status stm_slate_editor_close(stm_slate *s);
 
 /* ────────────────────────────────────────────────────────────────────── */
 /* lp9 vops.                                                              */
