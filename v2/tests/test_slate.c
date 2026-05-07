@@ -327,13 +327,16 @@ STM_TEST(slate_root_readdir_emits_expected_entries)
     ent_collect cx = {0};
     STM_ASSERT_OK(v->readdir(s, stm_slate_root(s), /*cookie=*/0u,
                                 ent_cb, &cx));
-    STM_ASSERT_EQ(cx.n, 5u);
-    /* version, status, event, redraw, log */
-    STM_ASSERT_EQ(strcmp(cx.names[0], "version"), 0);
-    STM_ASSERT_EQ(strcmp(cx.names[1], "status"),  0);
-    STM_ASSERT_EQ(strcmp(cx.names[2], "event"),   0);
-    STM_ASSERT_EQ(strcmp(cx.names[3], "redraw"),  0);
-    STM_ASSERT_EQ(strcmp(cx.names[4], "log"),     0);
+    /* SLATE-1 + SLATE-2: version, status, event, redraw, log,
+     * connection, panels. */
+    STM_ASSERT_EQ(cx.n, 7u);
+    STM_ASSERT_EQ(strcmp(cx.names[0], "version"),    0);
+    STM_ASSERT_EQ(strcmp(cx.names[1], "status"),     0);
+    STM_ASSERT_EQ(strcmp(cx.names[2], "event"),      0);
+    STM_ASSERT_EQ(strcmp(cx.names[3], "redraw"),     0);
+    STM_ASSERT_EQ(strcmp(cx.names[4], "log"),        0);
+    STM_ASSERT_EQ(strcmp(cx.names[5], "connection"), 0);
+    STM_ASSERT_EQ(strcmp(cx.names[6], "panels"),     0);
 
     stm_slate_destroy(s);
 }
@@ -453,6 +456,233 @@ STM_TEST(slate_concurrent_writers_version_advances_exactly_n_times)
     /* version advanced exactly N*per_thread times beyond initial 1. */
     STM_ASSERT_EQ(stm_slate_version(s), 1u + (uint64_t)(N * per_thread));
 
+    stm_slate_destroy(s);
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* P9-SLATE-2: connection + panel state.                                  */
+/* ────────────────────────────────────────────────────────────────────── */
+
+STM_TEST(slate_initial_state_disconnected)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+
+    STM_ASSERT_EQ((int)stm_slate_connected(s), 0);
+    char buf[64];
+    STM_ASSERT_EQ((unsigned)stm_slate_socket(s, buf, sizeof buf), 0u);
+    STM_ASSERT_EQ((unsigned)stm_slate_panel_path(s, 0, buf, sizeof buf), 0u);
+    STM_ASSERT_EQ((unsigned)stm_slate_panel_path(s, 1, buf, sizeof buf), 0u);
+
+    stm_slate_destroy(s);
+}
+
+STM_TEST(slate_attach_invalid_path_einval)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+
+    /* Oversize path. */
+    char big[STM_SLATE_SOCKET_MAX + 8];
+    memset(big, 'a', sizeof big);
+    STM_ASSERT_EQ(stm_slate_attach(s, big, sizeof big), STM_EINVAL);
+
+    /* Embedded NUL. */
+    char nul_path[16] = "/tmp/x\0extra";
+    STM_ASSERT_EQ(stm_slate_attach(s, nul_path, 12u), STM_EINVAL);
+
+    /* NULL path with non-zero len. */
+    STM_ASSERT_EQ(stm_slate_attach(s, NULL, 5u), STM_EINVAL);
+
+    /* State unchanged on every failed attach. */
+    STM_ASSERT_EQ((int)stm_slate_connected(s), 0);
+
+    stm_slate_destroy(s);
+}
+
+STM_TEST(slate_attach_empty_path_disconnects)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    /* Empty body is the disconnect verb. From disconnected state, no-op. */
+    STM_ASSERT_OK(stm_slate_attach(s, NULL, 0));
+    STM_ASSERT_EQ((int)stm_slate_connected(s), 0);
+    STM_ASSERT_EQ(stm_slate_version(s), 1u);  /* no-op did not bump */
+    stm_slate_destroy(s);
+}
+
+STM_TEST(slate_attach_nonexistent_socket_returns_io_or_backend)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+
+    const char *bogus = "/tmp/stm_slate_does_not_exist_test.sock";
+    /* Just be defensive: any error status is acceptable; what we
+     * really want to verify is that state STAYS disconnected after
+     * the failure (no half-attach). */
+    stm_status rc = stm_slate_attach(s, bogus, strlen(bogus));
+    STM_ASSERT(rc != STM_OK);
+    STM_ASSERT_EQ((int)stm_slate_connected(s), 0);
+    STM_ASSERT_EQ(stm_slate_version(s), 1u);  /* failed dial → no version bump */
+
+    stm_slate_destroy(s);
+}
+
+STM_TEST(slate_disconnect_idempotent_when_not_connected)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    STM_ASSERT_OK(stm_slate_disconnect(s));
+    STM_ASSERT_EQ((int)stm_slate_connected(s), 0);
+    STM_ASSERT_EQ(stm_slate_version(s), 1u);  /* no-op disconnect doesn't bump */
+    stm_slate_destroy(s);
+}
+
+/* /connection subtree readdir. */
+STM_TEST(slate_connection_dir_readdir_emits_socket_connected_attach)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+
+    const stm_lp9_vops *v = stm_slate_vops();
+    /* /connection qid: kind = 8. */
+    uint64_t conn_qp = ((uint64_t)8) << 56;
+    ent_collect cx = {0};
+    STM_ASSERT_OK(v->readdir(s, conn_qp, /*cookie=*/0u, ent_cb, &cx));
+    STM_ASSERT_EQ(cx.n, 3u);
+    STM_ASSERT_EQ(strcmp(cx.names[0], "socket"),    0);
+    STM_ASSERT_EQ(strcmp(cx.names[1], "connected"), 0);
+    STM_ASSERT_EQ(strcmp(cx.names[2], "attach"),    0);
+
+    stm_slate_destroy(s);
+}
+
+/* /panels subtree readdir. */
+STM_TEST(slate_panels_dir_readdir_emits_left_and_right)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+
+    const stm_lp9_vops *v = stm_slate_vops();
+    /* /panels qid: kind = 12. */
+    uint64_t panels_qp = ((uint64_t)12) << 56;
+    ent_collect cx = {0};
+    STM_ASSERT_OK(v->readdir(s, panels_qp, /*cookie=*/0u, ent_cb, &cx));
+    STM_ASSERT_EQ(cx.n, 2u);
+    STM_ASSERT_EQ(strcmp(cx.names[0], "left"),  0);
+    STM_ASSERT_EQ(strcmp(cx.names[1], "right"), 0);
+
+    /* /panels/left qid: kind = 13 — emits {path, entries}. */
+    uint64_t left_qp = ((uint64_t)13) << 56;
+    ent_collect cl = {0};
+    STM_ASSERT_OK(v->readdir(s, left_qp, /*cookie=*/0u, ent_cb, &cl));
+    STM_ASSERT_EQ(cl.n, 2u);
+    STM_ASSERT_EQ(strcmp(cl.names[0], "path"),    0);
+    STM_ASSERT_EQ(strcmp(cl.names[1], "entries"), 0);
+
+    stm_slate_destroy(s);
+}
+
+/* /connection/connected when disconnected reads "0\n". */
+STM_TEST(slate_connection_connected_read_returns_0_initially)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+
+    const stm_lp9_vops *v = stm_slate_vops();
+    /* /connection/connected qid: kind = 10. */
+    uint64_t qp = ((uint64_t)10) << 56;
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/77u, qp, STM_LP9_O_RDONLY));
+    char buf[8];
+    uint32_t got = (uint32_t)sizeof buf;
+    STM_ASSERT_OK(v->read(s, 77u, qp, 0u, buf, &got));
+    STM_ASSERT_EQ(got, 2u);
+    STM_ASSERT_EQ(buf[0], '0');
+    STM_ASSERT_EQ(buf[1], '\n');
+    v->clunk(s, 77u, qp);
+
+    stm_slate_destroy(s);
+}
+
+/* /connection/socket when disconnected reads just "\n" (one byte). */
+STM_TEST(slate_connection_socket_read_returns_newline_initially)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+
+    const stm_lp9_vops *v = stm_slate_vops();
+    /* /connection/socket qid: kind = 9. */
+    uint64_t qp = ((uint64_t)9) << 56;
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/77u, qp, STM_LP9_O_RDONLY));
+    char buf[16];
+    uint32_t got = (uint32_t)sizeof buf;
+    STM_ASSERT_OK(v->read(s, 77u, qp, 0u, buf, &got));
+    STM_ASSERT_EQ(got, 1u);
+    STM_ASSERT_EQ(buf[0], '\n');
+    v->clunk(s, 77u, qp);
+
+    stm_slate_destroy(s);
+}
+
+/* /panels/left/path when disconnected reads "\n". */
+STM_TEST(slate_panel_left_path_read_returns_newline_initially)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+
+    const stm_lp9_vops *v = stm_slate_vops();
+    /* /panels/left/path qid: kind = 14. */
+    uint64_t qp = ((uint64_t)14) << 56;
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/77u, qp, STM_LP9_O_RDONLY));
+    char buf[16];
+    uint32_t got = (uint32_t)sizeof buf;
+    STM_ASSERT_OK(v->read(s, 77u, qp, 0u, buf, &got));
+    STM_ASSERT_EQ(got, 1u);
+    STM_ASSERT_EQ(buf[0], '\n');
+    v->clunk(s, 77u, qp);
+
+    stm_slate_destroy(s);
+}
+
+/* /panels/left/entries when disconnected returns empty body. */
+STM_TEST(slate_panel_left_entries_read_returns_empty_when_disconnected)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+
+    const stm_lp9_vops *v = stm_slate_vops();
+    /* /panels/left/entries qid: kind = 15. */
+    uint64_t qp = ((uint64_t)15) << 56;
+    STM_ASSERT_OK(v->lopen(s, /*fid=*/77u, qp, STM_LP9_O_RDONLY));
+    char buf[64];
+    uint32_t got = (uint32_t)sizeof buf;
+    STM_ASSERT_OK(v->read(s, 77u, qp, 0u, buf, &got));
+    STM_ASSERT_EQ(got, 0u);
+    v->clunk(s, 77u, qp);
+
+    stm_slate_destroy(s);
+}
+
+/* /connection/attach refuses RDONLY open (write-only kind). */
+STM_TEST(slate_conn_attach_rdonly_open_eacces)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const stm_lp9_vops *v = stm_slate_vops();
+    /* /connection/attach qid: kind = 11. */
+    uint64_t qp = ((uint64_t)11) << 56;
+    STM_ASSERT_EQ(v->lopen(s, /*fid=*/77u, qp, STM_LP9_O_RDONLY), STM_EACCES);
+    stm_slate_destroy(s);
+}
+
+/* /connection/socket refuses WRONLY open (read-only kind). */
+STM_TEST(slate_conn_socket_wronly_open_eacces)
+{
+    stm_slate *s = NULL;
+    STM_ASSERT_OK(stm_slate_create(&s));
+    const stm_lp9_vops *v = stm_slate_vops();
+    uint64_t qp = ((uint64_t)9) << 56;
+    STM_ASSERT_EQ(v->lopen(s, /*fid=*/77u, qp, STM_LP9_O_WRONLY), STM_EACCES);
     stm_slate_destroy(s);
 }
 

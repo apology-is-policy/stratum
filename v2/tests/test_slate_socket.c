@@ -429,6 +429,260 @@ STM_TEST(slate_socket_redraw_wakes_on_event_from_other_connection)
     destroy_fixture(&f);
 }
 
+/* ────────────────────────────────────────────────────────────────────── */
+/* SLATE-2: connection + panel state over the wire.                       */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/* Walk to /connection/connected and read it — should be "0\n". */
+STM_TEST(slate_socket_connection_connected_reads_zero_initially)
+{
+    slate_fixture f;
+    setup_fixture(&f, "conn_zero");
+
+    stm_9p_client *c = NULL;
+    stm_9p_dial_opts opts = default_dial_opts(100u);
+    STM_ASSERT_OK(retry_dial(g_sock_path, &opts, &c));
+
+    const char *names[] = { "connection", "connected" };
+    stm_9p_qid qids[2];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 101u, 2u, names, qids, &walked));
+    STM_ASSERT_EQ((unsigned)walked, 2u);
+
+    stm_9p_qid oqid;
+    uint32_t iounit = 0;
+    STM_ASSERT_OK(stm_9p_lopen(c, 101u, 0u, &oqid, &iounit));
+    char buf[8];
+    uint32_t got = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 101u, 0u, buf,
+                                  (uint32_t)(sizeof buf), &got));
+    STM_ASSERT_EQ(got, 2u);
+    STM_ASSERT_EQ(buf[0], '0');
+    STM_ASSERT_EQ(buf[1], '\n');
+    STM_ASSERT_OK(stm_9p_clunk(c, 101u));
+    stm_9p_close(c);
+    destroy_fixture(&f);
+}
+
+/* Walk to /panels/left/path and read it — should be "\n" when disconnected. */
+STM_TEST(slate_socket_panel_left_path_disconnected)
+{
+    slate_fixture f;
+    setup_fixture(&f, "pl_path_dc");
+
+    stm_9p_client *c = NULL;
+    stm_9p_dial_opts opts = default_dial_opts(100u);
+    STM_ASSERT_OK(retry_dial(g_sock_path, &opts, &c));
+
+    const char *names[] = { "panels", "left", "path" };
+    stm_9p_qid qids[3];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 101u, 3u, names, qids, &walked));
+    STM_ASSERT_EQ((unsigned)walked, 3u);
+
+    stm_9p_qid oqid;
+    uint32_t iounit = 0;
+    STM_ASSERT_OK(stm_9p_lopen(c, 101u, 0u, &oqid, &iounit));
+    char buf[16];
+    uint32_t got = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 101u, 0u, buf,
+                                  (uint32_t)(sizeof buf), &got));
+    STM_ASSERT_EQ(got, 1u);
+    STM_ASSERT_EQ(buf[0], '\n');
+    STM_ASSERT_OK(stm_9p_clunk(c, 101u));
+    stm_9p_close(c);
+    destroy_fixture(&f);
+}
+
+/* Empty write to /connection/attach is no-op when already disconnected. */
+STM_TEST(slate_socket_attach_empty_body_is_disconnect_noop)
+{
+    slate_fixture f;
+    setup_fixture(&f, "attach_empty");
+
+    stm_9p_client *c = NULL;
+    stm_9p_dial_opts opts = default_dial_opts(100u);
+    STM_ASSERT_OK(retry_dial(g_sock_path, &opts, &c));
+
+    const char *names[] = { "connection", "attach" };
+    stm_9p_qid qids[2];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 101u, 2u, names, qids, &walked));
+    stm_9p_qid oqid;
+    uint32_t iounit = 0;
+    STM_ASSERT_OK(stm_9p_lopen(c, 101u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    /* SLATE-2 documents zero-byte writes on /connection/attach as the
+     * disconnect verb; from disconnected state it's a no-op (no
+     * version bump, no error). The client lib refuses zero-len
+     * writes at the lib boundary, so simulate via a "\n"-only body
+     * which the server treats as empty after newline strip. */
+    const char *line = "\n";
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, 101u, 0u, line, 1u, &written));
+    STM_ASSERT_EQ((unsigned)written, 1u);
+    STM_ASSERT_OK(stm_9p_clunk(c, 101u));
+    stm_9p_close(c);
+
+    /* No-op: connected stays "0". */
+    STM_ASSERT_EQ((int)stm_slate_connected(f.slate), 0);
+
+    destroy_fixture(&f);
+}
+
+/* Slate-A (backend) attached as the backend of slate-B (foreground)
+ * via /connection/attach. Read /panels/left/entries on B and verify
+ * it lists A's root entries (version, status, event, redraw, log,
+ * connection, panels). This is the load-bearing SLATE-2 e2e test:
+ * it exercises every backend op (dial+walk+lopen+readdir+walk+
+ * getattr+clunk) end-to-end. */
+typedef struct {
+    char         sock_path[256];
+    stm_slate   *slate;
+    int          listen_fd;
+    accept_ctx   ctx;
+    pthread_t    accept_tid;
+} slate_backend_fixture;
+
+static void setup_backend_fixture(slate_backend_fixture *f, const char *tag)
+{
+    memset(f, 0, sizeof *f);
+    snprintf(f->sock_path, sizeof f->sock_path,
+             "/tmp/stm_slate_be_%d_%s.sock", (int)getpid(), tag);
+    (void)unlink(f->sock_path);
+    STM_ASSERT_OK(stm_slate_create(&f->slate));
+    f->listen_fd = stm_stratumd_listen_unix(f->sock_path, 4, 0600);
+    STM_ASSERT_TRUE(f->listen_fd >= 0);
+    f->ctx.listen_fd = f->listen_fd;
+    f->ctx.slate     = f->slate;
+    atomic_init(&f->ctx.stop_flag, false);
+    STM_ASSERT_EQ(pthread_create(&f->accept_tid, NULL,
+                                    accept_thread, &f->ctx), 0);
+}
+
+static void destroy_backend_fixture(slate_backend_fixture *f)
+{
+    atomic_store_explicit(&f->ctx.stop_flag, true, memory_order_release);
+    int lf = f->listen_fd;
+    f->listen_fd = -1;
+    close(lf);
+    pthread_join(f->accept_tid, NULL);
+    stm_slate_stop(f->slate);
+    stm_slate_destroy(f->slate);
+    (void)unlink(f->sock_path);
+}
+
+STM_TEST(slate_socket_attach_to_backend_and_read_panel_entries)
+{
+    /* Backend slate (B). Its root has 7 entries (SLATE-1 + SLATE-2
+     * surface): version, status, event, redraw, log, connection,
+     * panels. */
+    slate_backend_fixture be;
+    setup_backend_fixture(&be, "be_a");
+
+    /* Foreground slate (F) — the one we drive over the wire. */
+    slate_fixture f;
+    setup_fixture(&f, "fg_a");
+
+    stm_9p_client *c = NULL;
+    stm_9p_dial_opts opts = default_dial_opts(100u);
+    STM_ASSERT_OK(retry_dial(g_sock_path, &opts, &c));
+
+    /* Step 1: write the backend socket path to /connection/attach. */
+    const char *anames[] = { "connection", "attach" };
+    stm_9p_qid aqids[2];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 101u, 2u, anames, aqids, &walked));
+    stm_9p_qid oqid;
+    uint32_t iounit = 0;
+    STM_ASSERT_OK(stm_9p_lopen(c, 101u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, 101u, 0u, be.sock_path,
+                                  (uint32_t)strlen(be.sock_path), &written));
+    STM_ASSERT_EQ((unsigned)written, (unsigned)strlen(be.sock_path));
+    STM_ASSERT_OK(stm_9p_clunk(c, 101u));
+
+    /* Step 2: /connection/connected should now read "1". */
+    const char *cnames[] = { "connection", "connected" };
+    stm_9p_qid cqids[2];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 102u, 2u, cnames, cqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 102u, 0u, &oqid, &iounit));
+    char cbuf[8];
+    uint32_t cgot = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 102u, 0u, cbuf,
+                                  (uint32_t)(sizeof cbuf), &cgot));
+    STM_ASSERT_EQ(cgot, 2u);
+    STM_ASSERT_EQ(cbuf[0], '1');
+    STM_ASSERT_EQ(cbuf[1], '\n');
+    STM_ASSERT_OK(stm_9p_clunk(c, 102u));
+
+    /* Step 3: /panels/left/path should read "/\n". */
+    const char *pnames[] = { "panels", "left", "path" };
+    stm_9p_qid pqids[3];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 103u, 3u, pnames, pqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 103u, 0u, &oqid, &iounit));
+    char pbuf[16];
+    uint32_t pgot = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 103u, 0u, pbuf,
+                                  (uint32_t)(sizeof pbuf), &pgot));
+    STM_ASSERT_EQ(pgot, 2u);
+    STM_ASSERT_EQ(pbuf[0], '/');
+    STM_ASSERT_EQ(pbuf[1], '\n');
+    STM_ASSERT_OK(stm_9p_clunk(c, 103u));
+
+    /* Step 4: /panels/left/entries should list the backend's root
+     * entries (rendered through the entries-line format). */
+    const char *enames[] = { "panels", "left", "entries" };
+    stm_9p_qid eqids[3];
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 104u, 3u, enames, eqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 104u, 0u, &oqid, &iounit));
+    char ebuf[8192];
+    uint32_t egot = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 104u, 0u, ebuf,
+                                  (uint32_t)(sizeof ebuf - 1u), &egot));
+    ebuf[egot] = '\0';
+    /* Each entry has a "TYPE MODE SIZE MTIME NAME" line ending '\n';
+     * the backend root contains version/status/event/redraw/log/
+     * connection/panels (7 entries). Verify every name shows up. */
+    STM_ASSERT(strstr(ebuf, " version\n")    != NULL);
+    STM_ASSERT(strstr(ebuf, " status\n")     != NULL);
+    STM_ASSERT(strstr(ebuf, " event\n")      != NULL);
+    STM_ASSERT(strstr(ebuf, " redraw\n")     != NULL);
+    STM_ASSERT(strstr(ebuf, " log\n")        != NULL);
+    STM_ASSERT(strstr(ebuf, " connection\n") != NULL);
+    STM_ASSERT(strstr(ebuf, " panels\n")     != NULL);
+    STM_ASSERT_OK(stm_9p_clunk(c, 104u));
+
+    /* Step 5: disconnect via empty body to /connection/attach. */
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 105u, 2u, anames, aqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 105u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    /* "\n" body → server strips the newline → empty → disconnect verb. */
+    STM_ASSERT_OK(stm_9p_write(c, 105u, 0u, "\n", 1u, &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 105u));
+
+    /* Step 6: /connection/connected reads "0" again, and a fresh
+     * /panels/left/entries reads empty. */
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 106u, 2u, cnames, cqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 106u, 0u, &oqid, &iounit));
+    cgot = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 106u, 0u, cbuf,
+                                  (uint32_t)(sizeof cbuf), &cgot));
+    STM_ASSERT_EQ(cgot, 2u);
+    STM_ASSERT_EQ(cbuf[0], '0');
+    STM_ASSERT_OK(stm_9p_clunk(c, 106u));
+
+    STM_ASSERT_OK(stm_9p_walk(c, 100u, 107u, 3u, enames, eqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 107u, 0u, &oqid, &iounit));
+    egot = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 107u, 0u, ebuf,
+                                  (uint32_t)(sizeof ebuf), &egot));
+    STM_ASSERT_EQ(egot, 0u);
+    STM_ASSERT_OK(stm_9p_clunk(c, 107u));
+
+    stm_9p_close(c);
+    destroy_fixture(&f);
+    destroy_backend_fixture(&be);
+}
+
 /* /event refuses zero-byte writes (parity with stm_slate_submit_event). */
 STM_TEST(slate_socket_event_zero_byte_einval)
 {

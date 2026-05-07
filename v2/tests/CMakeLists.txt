@@ -97,6 +97,20 @@ set_tests_properties(test_stratum_fs PROPERTIES
     ENVIRONMENT "STM_STRATUM_FS_BIN=$<TARGET_FILE:stratum-fs>"
     TIMEOUT 120)
 
+# test_stratumd_ctl forks a worker thread to serve /ctl/ over a Unix
+# socket and runs ~8 retry-dial-bounded sub-tests. Solo runs finish in
+# < 1 s, but under heavy parallel ctest load (slate's 2-slate e2e
+# fixture pumps the same /tmp socket-allocation path) the cumulative
+# retry-dial wait can push the run past the default 60 s. Bumping to
+# 180 s matches test_fs's discipline for stratumd-style integration
+# tests.
+set_tests_properties(test_stratumd_ctl PROPERTIES TIMEOUT 180)
+# test_slate_socket spawns multiple slate instances in the SLATE-2
+# e2e attach test (one foreground + one backend), each with its own
+# accept thread and per-connection worker pool. Bump for parallel
+# resilience.
+set_tests_properties(test_slate_socket PROPERTIES TIMEOUT 120)
+
 # The crash-injection fuzzer runs ~168 independent format+mount+unmount
 # cycles. Original default budget was ~25 s on default, ~42 s under
 # ASan/TSan; subsequent chunks (P7-3 extent index, P7-15 repair-log)

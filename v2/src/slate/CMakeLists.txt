@@ -1,4 +1,6 @@
 # P9-SLATE-1: slate daemon's per-process UI state + lp9 vops backend.
+# P9-SLATE-2: pulls in the 9P client library for /connection/attach
+# backend dialing + /panels/X/entries Treaddir.
 
 add_library(stm_slate STATIC slate.c)
 
@@ -7,7 +9,7 @@ target_include_directories(stm_slate PUBLIC
 
 target_link_libraries(stm_slate
     PRIVATE stm_warnings stm_sanitize stm_coverage
-    PUBLIC  stm_lp9)
+    PUBLIC  stm_lp9 stm_9p_client)
 
 find_package(Threads REQUIRED)
 target_link_libraries(stm_slate PUBLIC Threads::Threads)
