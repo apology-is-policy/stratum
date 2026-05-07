@@ -168,7 +168,10 @@ fn tui_dispatch(args: &[String]) -> Result<i32> {
         i += 1;
     }
 
-    if vol.is_some() || host.is_some() {
+    // SWISS-4a: enter embedded mode whenever --vol / --host is set OR
+    // when no slate-sock was given (no-arg → both panels host-fs at
+    // CWD; the user's small-ask 2026-05-07).
+    if vol.is_some() || host.is_some() || slate_sock.is_none() {
         embed::run(embed::EmbedOpts {
             volume: vol,
             keyfile,
@@ -178,11 +181,15 @@ fn tui_dispatch(args: &[String]) -> Result<i32> {
         })?;
         return Ok(0);
     }
+
+    // External-slate-sock path (when the user wants to attach the TUI
+    // to an already-running slate). Headless is meaningless here
+    // because we're not spawning daemons.
     if headless {
         bail!("--headless requires --vol or --host (only meaningful in embedded mode)");
     }
 
-    let slate_sock = slate_sock.unwrap_or_else(|| PathBuf::from("/tmp/stratum-slate.sock"));
+    let slate_sock = slate_sock.unwrap();
     tui::run(tui::Opts { slate_sock, attach })?;
     Ok(0)
 }

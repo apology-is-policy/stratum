@@ -405,7 +405,11 @@ static int cmd_write(stm_9p_client *c, int argc, char **argv)
     rc = stm_9p_lcreate(c, WORK_FID, name,
                             STM_9P_O_WRONLY | STM_9P_O_TRUNC,
                             0644u, (uint32_t)getgid(), &q, NULL);
-    if (rc == STM_EEXIST) {
+    /* SWISS-4a: synthetic-FS servers (slate, /ctl/) don't implement
+     * Tlcreate at all — they expose pre-existing virtual files only.
+     * Falling back to walk-then-lopen on ENOTSUPPORTED treats them
+     * the same as EEXIST does for real filesystems. */
+    if (rc == STM_EEXIST || rc == STM_ENOTSUPPORTED) {
         /* Already exists — clunk parent, walk to file, open + truncate. */
         (void)stm_9p_clunk(c, WORK_FID);
         path_t p_full;

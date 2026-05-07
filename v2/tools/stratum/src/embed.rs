@@ -33,111 +33,115 @@ pub struct EmbedOpts {
     pub volume: Option<PathBuf>,
     pub keyfile: Option<PathBuf>,
     pub print_env_to: Option<PathBuf>,
-    /// If Some(path), spawn `stratum host-fs PATH` as a sibling daemon
-    /// and attach IT (not stratumd) to slate. Mutually exclusive with
-    /// `volume` until SWISS-4 (slate per-panel multi-attach) lands.
+    /// SWISS-4a: --host PATH overrides the host-fs root (default CWD).
+    /// Both panels share one host-fs daemon at this root; each panel
+    /// has its own libstratum-9p connection.
     pub host: Option<PathBuf>,
     /// If true, spawn daemons + write env file + wait for SIGINT/SIGTERM.
-    /// No TUI. Lets external 9P clients (Claude, scripts, Halcyon)
-    /// drive slate while the user keeps a normal terminal session.
+    /// No TUI.
     pub headless: bool,
 }
 
+/// SWISS-4a panel-attach plan. The dual-pane experience binds each
+/// panel to its own backend; the source determines whether we need
+/// stratumd, host-fs, or both daemons spawned.
+struct PanelPlan {
+    /// Socket the panel will dial (resolved at spawn time).
+    sock: PathBuf,
+}
+
 pub fn run(opts: EmbedOpts) -> Result<()> {
-    // SWISS-3: exactly one backend source allowed at v1.0 (single-
-    // backend slate). --host and --vol are mutually exclusive until
-    // SWISS-4 lands per-panel multi-attach.
-    let backend_kind = match (opts.volume.is_some(), opts.host.is_some()) {
-        (true, true) => bail!(
-            "--vol and --host are mutually exclusive at v1.0 \
-             (single-backend constraint; SWISS-4 will lift this)"
-        ),
-        (true, false) => BackendKind::Stratumd,
-        (false, true) => BackendKind::HostFs,
-        (false, false) => bail!("--vol PATH or --host PATH required"),
-    };
     if let Some(v) = opts.volume.as_ref() {
         if !v.exists() {
             bail!("volume {} does not exist; run `stratum mkfs` first", v.display());
         }
     }
-    if let Some(h) = opts.host.as_ref() {
-        if !h.exists() || !h.is_dir() {
-            bail!("--host {} must exist and be a directory", h.display());
-        }
+    let host_root = opts
+        .host
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
+    if !host_root.exists() || !host_root.is_dir() {
+        bail!(
+            "--host {} must exist and be a directory",
+            host_root.display()
+        );
     }
 
     // R126 P2-2: mask SIGINT/SIGTERM on the parent thread BEFORE
-    // spawning children. Without this, a Ctrl-C during the
-    // ~5-second wait_for_sock window kills the parent and leaves
-    // orphan daemons. We unmask BEFORE entering tui::run (which
-    // wants raw-mode Ctrl-C delivered as a key event) or
-    // run_headless (which sigwaits for clean shutdown).
+    // spawning children.
     let prev_mask = block_term_signals();
     let session_dir = make_session_dir()?;
-    let backend_sock = match backend_kind {
-        BackendKind::Stratumd => session_dir.join("stratumd.sock"),
-        BackendKind::HostFs   => session_dir.join("host-fs.sock"),
-    };
     let slate_sock = session_dir.join("slate.sock");
+    let host_fs_sock = session_dir.join("host-fs.sock");
+    let stratumd_sock = session_dir.join("stratumd.sock");
 
     let me = std::env::current_exe().context("locate own binary")?;
 
-    // Spawn the backend daemon (stratumd OR host-fs depending on
-    // backend_kind). Both re-exec the same `stratum` binary with
-    // different subcommands. Inherits stderr so the user sees the
-    // daemon's "serving …" line; stdout is /dev/null.
-    let backend_args: Vec<String> = match backend_kind {
-        BackendKind::Stratumd => {
-            let volume = opts.volume.as_ref().unwrap();
-            let keyfile = opts.keyfile.clone().unwrap_or_else(|| {
-                let mut p = volume.clone();
-                let new_name = format!(
-                    "{}.key",
-                    p.file_name().unwrap_or_default().to_string_lossy()
-                );
-                p.set_file_name(new_name);
-                p
-            });
-            vec![
-                "serve".into(),
-                volume.to_string_lossy().into_owned(),
-                "--listen".into(),
-                backend_sock.to_string_lossy().into_owned(),
-                "--keyfile".into(),
-                keyfile.to_string_lossy().into_owned(),
-            ]
-        }
-        BackendKind::HostFs => {
-            let host = opts.host.as_ref().unwrap();
-            vec![
-                "host-fs".into(),
-                host.to_string_lossy().into_owned(),
-                "--listen".into(),
-                backend_sock.to_string_lossy().into_owned(),
-                "--allow-unauth".into(),
-            ]
-        }
-    };
-    let mut backend_child = Command::new(&me)
-        .args(&backend_args)
+    // SWISS-4a: every config spawns host-fs (as it backs at least
+    // the right panel — and the left panel too when --vol is unset).
+    // host-fs accepts multiple connections (serial accept loop), so
+    // both panels can dial it concurrently.
+    let host_fs_args: Vec<String> = vec![
+        "host-fs".into(),
+        host_root.to_string_lossy().into_owned(),
+        "--listen".into(),
+        host_fs_sock.to_string_lossy().into_owned(),
+        "--allow-unauth".into(),
+    ];
+    let mut host_fs_child = Command::new(&me)
+        .args(&host_fs_args)
         .stdout(Stdio::null())
-        // R126 P2-2: own process group, so terminal SIGINT
-        // doesn't propagate to the children. Parent reaps via
-        // explicit SIGTERM in teardown_child.
         .process_group(0)
         .spawn()
-        .with_context(|| format!("spawn {} via {}", backend_kind.name(), me.display()))?;
-
-    // Wait for backend's socket.
-    if let Err(e) = wait_for_sock(&backend_sock, Duration::from_secs(5)) {
-        let _ = backend_child.kill();
+        .with_context(|| format!("spawn host-fs via {}", me.display()))?;
+    if let Err(e) = wait_for_sock(&host_fs_sock, Duration::from_secs(5)) {
+        let _ = host_fs_child.kill();
         let _ = cleanup_session_dir(&session_dir);
         return Err(e.context(format!(
-            "{} socket never appeared at {}",
-            backend_kind.name(),
-            backend_sock.display()
+            "host-fs socket never appeared at {}",
+            host_fs_sock.display()
         )));
+    }
+
+    // SWISS-4a: spawn stratumd ONLY when --vol is set. The left panel
+    // attaches to stratumd; right panel always attaches to host-fs.
+    let mut stratumd_child: Option<Child> = None;
+    if let Some(vol) = opts.volume.as_ref() {
+        let keyfile = opts.keyfile.clone().unwrap_or_else(|| {
+            let mut p = vol.clone();
+            let new_name = format!(
+                "{}.key",
+                p.file_name().unwrap_or_default().to_string_lossy()
+            );
+            p.set_file_name(new_name);
+            p
+        });
+        let stratumd_args: Vec<String> = vec![
+            "serve".into(),
+            vol.to_string_lossy().into_owned(),
+            "--listen".into(),
+            stratumd_sock.to_string_lossy().into_owned(),
+            "--keyfile".into(),
+            keyfile.to_string_lossy().into_owned(),
+        ];
+        let child = Command::new(&me)
+            .args(&stratumd_args)
+            .stdout(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .with_context(|| format!("spawn stratumd via {}", me.display()))?;
+        stratumd_child = Some(child);
+        if let Err(e) = wait_for_sock(&stratumd_sock, Duration::from_secs(5)) {
+            if let Some(c) = stratumd_child.as_mut() {
+                let _ = c.kill();
+            }
+            let _ = host_fs_child.kill();
+            let _ = cleanup_session_dir(&session_dir);
+            return Err(e.context(format!(
+                "stratumd socket never appeared at {}",
+                stratumd_sock.display()
+            )));
+        }
     }
 
     // Spawn slate.
@@ -156,14 +160,20 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
     {
         Ok(c) => c,
         Err(e) => {
-            let _ = backend_child.kill();
+            if let Some(c) = stratumd_child.as_mut() {
+                let _ = c.kill();
+            }
+            let _ = host_fs_child.kill();
             let _ = cleanup_session_dir(&session_dir);
             return Err(anyhow!(e).context("spawn slate"));
         }
     };
     if let Err(e) = wait_for_sock(&slate_sock, Duration::from_secs(5)) {
         let _ = slate_child.kill();
-        let _ = backend_child.kill();
+        if let Some(c) = stratumd_child.as_mut() {
+            let _ = c.kill();
+        }
+        let _ = host_fs_child.kill();
         let _ = cleanup_session_dir(&session_dir);
         return Err(e.context(format!(
             "slate socket never appeared at {}",
@@ -171,20 +181,37 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         )));
     }
 
-    // R126 P1-1 + P2-1: write env file with O_NOFOLLOW|O_CREAT|O_EXCL
-    // (refuse if exists) at mode 0600, AND shell-quote the values to
-    // tolerate shell metachars in XDG_RUNTIME_DIR or unusual paths.
+    // SWISS-4a: per-panel attach plan. Left panel = stratumd if
+    // --vol is set, else host-fs (no-arg default). Right panel =
+    // host-fs always (the host CWD is the canonical "second pane").
+    let left_plan = if opts.volume.is_some() {
+        PanelPlan {
+            sock: stratumd_sock.clone(),
+        }
+    } else {
+        PanelPlan {
+            sock: host_fs_sock.clone(),
+        }
+    };
+    let right_plan = PanelPlan {
+        sock: host_fs_sock.clone(),
+    };
+
+    // R126 P1-1 + P2-1: write env file (mode 0600, O_NOFOLLOW|O_EXCL).
+    // SWISS-4a: emit BOTH stratumd + host-fs sock paths when
+    // applicable so external tools can drive either.
     if let Some(env_path) = opts.print_env_to.as_ref() {
-        let backend_var = match backend_kind {
-            BackendKind::Stratumd => "STRATUMD_SOCK",
-            BackendKind::HostFs   => "HOST_FS_SOCK",
-        };
-        let body = format!(
-            "STRATUM_SLATE_SOCK={}\n{}={}\n",
+        let mut body = format!(
+            "STRATUM_SLATE_SOCK={}\nHOST_FS_SOCK={}\n",
             shell_quote(&slate_sock.to_string_lossy()),
-            backend_var,
-            shell_quote(&backend_sock.to_string_lossy())
+            shell_quote(&host_fs_sock.to_string_lossy())
         );
+        if opts.volume.is_some() {
+            body.push_str(&format!(
+                "STRATUMD_SOCK={}\n",
+                shell_quote(&stratumd_sock.to_string_lossy())
+            ));
+        }
         if let Err(e) = write_env_file_safely(env_path, &body) {
             eprintln!(
                 "stratum: warning: --print-env-to {} failed: {e}",
@@ -193,70 +220,58 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         }
     }
 
-    // Auto-attach slate to stratumd ONCE, before either entering the
-    // TUI loop or going headless. In headless mode the user has no
-    // way to drive /connection/attach themselves; in TUI mode the
-    // TUI's own attach also runs, but doing it here makes /panels
-    // immediately readable for external clients (e.g. Claude doing
-    // `stratum fs -s "$STRATUM_SLATE_SOCK" ls /panels/left/entries`
-    // before the user lands a single keystroke).
-    if let Err(e) = attach_slate_with_retry(&slate_sock, &backend_sock) {
-        eprintln!("stratum: warning: pre-attach failed: {e}");
+    // SWISS-4a per-panel pre-attach. Both panel writes go through
+    // SlateClient; each writes its socket path to /connection/{left,
+    // right}/attach. Each attach uses an independent SlateClient
+    // (one libstratum-9p connection per attach call) — slate accepts
+    // concurrently, host-fs spawned with concurrent-accept (R128
+    // forward note), so this doesn't deadlock.
+    if let Err(e) = attach_panel_with_retry(&slate_sock, "/connection/left/attach", &left_plan.sock)
+    {
+        eprintln!("stratum: warning: left-panel pre-attach failed: {e}");
+    }
+    if let Err(e) =
+        attach_panel_with_retry(&slate_sock, "/connection/right/attach", &right_plan.sock)
+    {
+        eprintln!("stratum: warning: right-panel pre-attach failed: {e}");
     }
 
     let result = if opts.headless {
-        run_headless(&slate_sock, &backend_sock, &prev_mask)
+        run_headless(&slate_sock, &left_plan.sock, &prev_mask)
     } else {
-        // R126 P2-2: restore signals BEFORE entering raw mode. The
-        // TUI wants Ctrl-C delivered as a key event (terminal raw
-        // mode swallows it before signal-disposition kicks in), but
-        // unmasking now means a SIGINT from external `kill` reaches
-        // the parent and our cleanup path runs.
         restore_signal_mask(&prev_mask);
         tui::run(tui::Opts {
             slate_sock: slate_sock.clone(),
-            attach: None, // already attached above
+            attach: None,
         })
     };
 
     teardown_child(&mut slate_child, "slate");
-    teardown_child(&mut backend_child, backend_kind.name());
+    if let Some(mut c) = stratumd_child {
+        teardown_child(&mut c, "stratumd");
+    }
+    teardown_child(&mut host_fs_child, "host-fs");
     let _ = cleanup_session_dir(&session_dir);
 
     result
 }
 
-#[derive(Clone, Copy)]
-enum BackendKind {
-    Stratumd,
-    HostFs,
-}
-
-impl BackendKind {
-    fn name(self) -> &'static str {
-        match self {
-            BackendKind::Stratumd => "stratumd",
-            BackendKind::HostFs => "host-fs",
-        }
-    }
-}
-
-/// R126 P3-3: dial slate with a brief retry loop. Even after
-/// `wait_for_sock` (which only checks bind-time path existence),
-/// the slate accept loop may not have called accept() yet, and
-/// libstratum-9p's single-attempt dial returns STM_EIO. The C-side
-/// `stratum-fs` retries 50 × 10ms for the same reason.
-fn attach_slate_with_retry(slate_sock: &Path, stratumd_sock: &Path) -> Result<()> {
-    let path = stratumd_sock
+/// R126 P3-3: dial slate with a brief retry loop. SWISS-4a generalises
+/// to per-panel attach paths so caller passes "/connection/left/attach"
+/// or "/connection/right/attach". Each panel attaches a separate
+/// backend; libstratum-9p's one-op-per-connection model is preserved
+/// (each SlateClient only does one op).
+fn attach_panel_with_retry(slate_sock: &Path, attach_path: &str, target_sock: &Path) -> Result<()> {
+    let path = target_sock
         .to_str()
-        .context("stratumd socket path is not utf-8")?;
+        .context("target socket path is not utf-8")?;
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..50 {
         match crate::slate::SlateClient::dial(slate_sock) {
             Ok(mut c) => {
                 return c
-                    .write_path("/connection/attach", path.as_bytes())
-                    .with_context(|| format!("attach to {}", path));
+                    .write_path(attach_path, path.as_bytes())
+                    .with_context(|| format!("write {attach_path} <- {path}"));
             }
             Err(e) => {
                 last_err = Some(e);

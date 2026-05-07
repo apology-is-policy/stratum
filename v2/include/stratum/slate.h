@@ -223,6 +223,16 @@ extern "C" {
  * abstract namespace and forward-compat. */
 #define STM_SLATE_SOCKET_MAX     1023u
 
+/* SLATE-4a: panel indices. SLATE-4a moves the single-backend model
+ * to per-panel multi-attach so the dual-pane "host-on-one-side /
+ * stratum-on-the-other" workflow works (the prerequisite for
+ * SWISS-4b's Shift+F2 active-panel host mount + Enter-on-yellow-
+ * .stm volume mount on the OTHER panel). Each panel now binds its
+ * OWN backend client. */
+#define STM_SLATE_PANEL_LEFT     0
+#define STM_SLATE_PANEL_RIGHT    1
+#define STM_SLATE_PANEL_COUNT    2
+
 /* SLATE-2: per-panel current-directory path cap. Bounded to fit
  * STM_SLATE_BODY_MAX (path + newline ≤ 4096). */
 #define STM_SLATE_PATH_MAX       1023u
@@ -360,49 +370,72 @@ STM_MUST_USE
 stm_status stm_slate_set_status(stm_slate *s, const char *text, size_t len);
 
 /*
- * SLATE-2: dial a stratumd Unix socket and bind it as the backend.
- * Atomically (under backend_mu): if a backend is already attached,
- * close it; dial the new socket; on success swap state — backend =
- * new client, connected = true, socket = path, both panels reset to
- * "/", bump version, broadcast cv. On failure leave state untouched
- * and return the dial error.
+ * SLATE-4a: dial a stratumd Unix socket and bind it as the backend
+ * for `panel_idx` (STM_SLATE_PANEL_LEFT or STM_SLATE_PANEL_RIGHT).
+ *
+ * Atomically (under panel[i].backend_mu): if a backend is already
+ * attached on this panel, close it; dial the new socket; on success
+ * swap state — panel.backend = new client, panel.connected = true,
+ * panel.socket = path, panel.path = "/", panel.cursor = 0, bump
+ * version, broadcast cv. On failure leave state untouched and
+ * return the dial error.
  *
  * `len` is the path length (no trailing NUL required); zero len
- * triggers a Disconnect instead (matches /connection/attach wire
- * convention: empty body = disconnect).
+ * triggers a Disconnect on this panel (matches /connection/.../attach
+ * wire convention: empty body = disconnect).
+ *
+ * Each panel's backend is independent. Lock ordering across panels:
+ * NEVER take more than one panel's backend_mu at a time — future
+ * cross-panel ops (SWISS-4d copy across panels) MUST take them in
+ * a fixed order (panel 0 first, then panel 1) and never the reverse.
  *
  * Returns:
  *   - STM_OK on success.
- *   - STM_EINVAL on NULL `s`, oversize path, embedded NUL.
+ *   - STM_EINVAL on NULL `s`, bad panel_idx, oversize path, NUL.
  *   - Any stm_9p_dial_unix error if dial fails.
  *   - STM_ENOMEM on alloc failure.
  */
 STM_MUST_USE
-stm_status stm_slate_attach(stm_slate *s, const char *socket_path, size_t len);
+stm_status stm_slate_attach_panel(stm_slate *s, int panel_idx,
+                                       const char *socket_path, size_t len);
 
 /*
- * SLATE-2: detach the backend. If currently connected, closes the
- * backend client; clears socket, panel paths; sets connected =
- * false; bumps version; broadcasts cv. No-op if not connected
- * (returns STM_OK with no version bump).
- *
- * Returns STM_OK always (in the no-op case and in the success case).
+ * SLATE-4a: detach the backend on `panel_idx`. If currently
+ * connected, closes the backend; clears socket, panel path,
+ * cursor, selection; sets connected=false; bumps version. No-op
+ * if not connected (returns STM_OK with no version bump).
  */
+STM_MUST_USE
+stm_status stm_slate_disconnect_panel(stm_slate *s, int panel_idx);
+
+/*
+ * SLATE-4a: snapshot the connection state of `panel_idx`.
+ * Mu-protected. Returns false on bad panel_idx.
+ */
+bool stm_slate_panel_connected(stm_slate *s, int panel_idx);
+
+/*
+ * SLATE-4a: copy panel[i]'s socket path into `buf`. Same buf
+ * semantics as stm_slate_socket (returns full length; truncates
+ * if buf too small; NUL-terminated when buf_cap > 0; bad
+ * panel_idx returns 0).
+ */
+size_t stm_slate_panel_socket(stm_slate *s, int panel_idx,
+                                  char *buf, size_t buf_cap);
+
+/*
+ * SLATE-2 back-compat aliases — route to panel 0 (LEFT). Existing
+ * callers (tests + early TUI) keep working. Newly-written code
+ * SHOULD prefer the per-panel forms above.
+ */
+STM_MUST_USE
+stm_status stm_slate_attach(stm_slate *s, const char *socket_path, size_t len);
+
 STM_MUST_USE
 stm_status stm_slate_disconnect(stm_slate *s);
 
-/*
- * SLATE-2: snapshot the current connection state. Mu-protected.
- */
 bool stm_slate_connected(stm_slate *s);
 
-/*
- * SLATE-2: copy the current socket path into `buf`. Returns the
- * length the path WOULD occupy regardless of buf_cap (so callers
- * can detect truncation: caller-cap-bound applied). buf is always
- * NUL-terminated when buf_cap > 0. buf_cap == 0 returns length
- * without writing.
- */
 size_t stm_slate_socket(stm_slate *s, char *buf, size_t buf_cap);
 
 /*

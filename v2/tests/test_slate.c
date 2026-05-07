@@ -551,10 +551,15 @@ STM_TEST(slate_connection_dir_readdir_emits_socket_connected_attach)
     uint64_t conn_qp = ((uint64_t)8) << 56;
     ent_collect cx = {0};
     STM_ASSERT_OK(v->readdir(s, conn_qp, /*cookie=*/0u, ent_cb, &cx));
-    STM_ASSERT_EQ(cx.n, 3u);
+    /* SLATE-4a: top-level /connection contains the back-compat
+     * single-target leaves (socket/connected/attach — panel-0
+     * aliases) PLUS the per-panel subdirs (left/, right/). */
+    STM_ASSERT_EQ(cx.n, 5u);
     STM_ASSERT_EQ(strcmp(cx.names[0], "socket"),    0);
     STM_ASSERT_EQ(strcmp(cx.names[1], "connected"), 0);
     STM_ASSERT_EQ(strcmp(cx.names[2], "attach"),    0);
+    STM_ASSERT_EQ(strcmp(cx.names[3], "left"),      0);
+    STM_ASSERT_EQ(strcmp(cx.names[4], "right"),     0);
 
     stm_slate_destroy(s);
 }

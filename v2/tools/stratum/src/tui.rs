@@ -33,13 +33,15 @@ pub fn run(opts: Opts) -> Result<()> {
     let mut main_client = SlateClient::dial(&opts.slate_sock)
         .with_context(|| format!("dial slate at {}", opts.slate_sock.display()))?;
 
+    // SWISS-4a: legacy --attach targets the LEFT panel (back-compat).
+    // Embedded mode does its own per-panel pre-attach in embed.rs.
     if let Some(stratumd_sock) = opts.attach.as_ref() {
         let path_bytes = stratumd_sock
             .to_str()
             .context("--attach path is not valid utf-8")?
             .as_bytes();
         main_client
-            .write_path("/connection/attach", path_bytes)
+            .write_path("/connection/left/attach", path_bytes)
             .with_context(|| format!("attach stratumd at {}", stratumd_sock.display()))?;
     }
 
@@ -223,12 +225,18 @@ fn fetch_snapshot(client: &mut SlateClient, focus: usize) -> Result<UiState> {
         .parse()
         .unwrap_or(0);
     let status = read_text_trim(client, "/status").unwrap_or_default();
-    let connected_raw = read_text_trim(client, "/connection/connected").unwrap_or("0".into());
-    let connected = connected_raw == "1";
-    let backend_socket = read_text_trim(client, "/connection/socket").unwrap_or_default();
+    // SWISS-4a: each panel has its OWN connection. The top-level
+    // /connection/connected is the panel-0 (LEFT) back-compat alias;
+    // panel 1 (RIGHT) reads its own /connection/right/connected.
+    let left_connected =
+        read_text_trim(client, "/connection/left/connected").unwrap_or("0".into()) == "1";
+    let right_connected =
+        read_text_trim(client, "/connection/right/connected").unwrap_or("0".into()) == "1";
+    let connected = left_connected || right_connected;
+    let backend_socket = read_text_trim(client, "/connection/left/socket").unwrap_or_default();
 
-    let panel_left = read_panel(client, "/panels/left", connected)?;
-    let panel_right = read_panel(client, "/panels/right", connected)?;
+    let panel_left = read_panel(client, "/panels/left", left_connected)?;
+    let panel_right = read_panel(client, "/panels/right", right_connected)?;
 
     let dialog_stack = read_text_trim(client, "/dialogs/stack").unwrap_or_default();
 

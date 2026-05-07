@@ -121,6 +121,20 @@ typedef enum {
     SLATE_KIND_EDITOR_CURSOR     = 38,  /* /editor/cursor */
     SLATE_KIND_EDITOR_MODIFIED   = 39,  /* /editor/modified */
     SLATE_KIND_EDITOR_ACTION     = 40,  /* /editor/action (W) */
+    /* SLATE-4a: per-panel /connection/{left,right} subtree. The
+     * top-level /connection/{socket,connected,attach} kinds become
+     * back-compat aliases for panel 0 (LEFT). The newly-added
+     * per-panel kinds are the canonical surface and are required
+     * for the dual-pane host-on-one-side / stratum-on-the-other
+     * workflow. */
+    SLATE_KIND_CONN_L_DIR        = 41,
+    SLATE_KIND_CONN_L_SOCKET     = 42,
+    SLATE_KIND_CONN_L_CONNECTED  = 43,
+    SLATE_KIND_CONN_L_ATTACH     = 44,
+    SLATE_KIND_CONN_R_DIR        = 45,
+    SLATE_KIND_CONN_R_SOCKET     = 46,
+    SLATE_KIND_CONN_R_CONNECTED  = 47,
+    SLATE_KIND_CONN_R_ATTACH     = 48,
     SLATE_KIND_MAX
 } slate_kind;
 
@@ -196,9 +210,21 @@ static const slate_kind_meta KIND_META[SLATE_KIND_MAX] = {
     [SLATE_KIND_EDITOR_CURSOR]     = { false, 0644, "cursor"    },
     [SLATE_KIND_EDITOR_MODIFIED]   = { false, 0444, "modified"  },
     [SLATE_KIND_EDITOR_ACTION]     = { false, 0200, "action"    },
+    /* SLATE-4a: per-panel /connection/{left,right} subtree.  Same
+     * layout as the top-level /connection/{socket,connected,attach}
+     * (which retains the same KIND_META[] entries above as panel-0
+     * back-compat aliases). */
+    [SLATE_KIND_CONN_L_DIR]        = { true,  0555, "left"      },
+    [SLATE_KIND_CONN_L_SOCKET]     = { false, 0444, "socket"    },
+    [SLATE_KIND_CONN_L_CONNECTED]  = { false, 0444, "connected" },
+    [SLATE_KIND_CONN_L_ATTACH]     = { false, 0200, "attach"    },
+    [SLATE_KIND_CONN_R_DIR]        = { true,  0555, "right"     },
+    [SLATE_KIND_CONN_R_SOCKET]     = { false, 0444, "socket"    },
+    [SLATE_KIND_CONN_R_CONNECTED]  = { false, 0444, "connected" },
+    [SLATE_KIND_CONN_R_ATTACH]     = { false, 0200, "attach"    },
 };
 
-_Static_assert(SLATE_KIND_MAX == 41, "KIND_META[] sized to enum cardinality");
+_Static_assert(SLATE_KIND_MAX == 49, "KIND_META[] sized to enum cardinality");
 _Static_assert(sizeof("version") - 1     <= STM_LP9_NAME_MAX, "/version literal");
 _Static_assert(sizeof("status") - 1      <= STM_LP9_NAME_MAX, "/status literal");
 _Static_assert(sizeof("event") - 1       <= STM_LP9_NAME_MAX, "/event literal");
@@ -321,16 +347,42 @@ typedef struct slate_session {
 /* The state.                                                             */
 /* ────────────────────────────────────────────────────────────────────── */
 
-/* SLATE-2 + SLATE-3a + SLATE-3c-selection: per-panel state. */
+/* SLATE-2 + SLATE-3a + SLATE-3c-selection + SLATE-4a: per-panel
+ * state. */
 #define SLATE_SELECTION_BYTES ((STM_SLATE_ENTRIES_MAX + 7u) / 8u)
 
 typedef struct {
+    /* SLATE-4a: per-panel backend connection. The dual-pane host-on-
+     * one-side / stratum-on-the-other workflow needs each panel to
+     * bind its OWN backend client. backend_mu serializes ALL
+     * libstratum-9p ops on this panel (the lib is one-op-at-a-time
+     * per connection — see include/stratum/9p_client.h §Concurrency).
+     *
+     * Lock ordering: panel[i].backend_mu → s->mu. NEVER take more
+     * than one panel's backend_mu at a time. Future cross-panel ops
+     * (SWISS-4d copy across panels) MUST take them in a fixed order
+     * (panel 0 first, then panel 1) and never the reverse, OR
+     * release one before taking another.
+     *
+     * ConnectionAtomic per panel: connected == (socket_len > 0).
+     * PanelPathConsistent per panel: connected ⇒ path != ""; not
+     * connected ⇒ path == "".
+     */
+    pthread_mutex_t backend_mu;
+    stm_9p_client  *backend;
+    char            socket[STM_SLATE_SOCKET_MAX + 1];
+    size_t          socket_len;
+    bool            connected;
+
+    /* Panel cwd. */
     char     path[STM_SLATE_PATH_MAX + 1];     /* NUL-terminated; "" disconnected */
     size_t   path_len;
     /* SLATE-3a: cursor is a numeric index into the panel's current
      * entries listing. Bounds-checking against the entry count is
      * the renderer's responsibility — slate accepts any uint32_t.
-     * Reset to 0 on attach + disconnect + cwd change. */
+     * SLATE-4a adds defense-in-depth via entries_count cache (see
+     * below) so verb_key_down can clamp without a backend round-
+     * trip. Reset to 0 on attach + disconnect + cwd change. */
     uint32_t cursor;
     /* SLATE-3c-selection: bitset of selected entry indices.
      * Bit (idx % 8) of byte (idx / 8) is set iff entry `idx` is
@@ -340,11 +392,29 @@ typedef struct {
      * (parity with cursor cap; selection over invisible entries
      * makes no sense). */
     uint8_t  selection[SLATE_SELECTION_BYTES];
+    /* SLATE-4a entries-count cache: latest count of rendered
+     * entries from panel_entries_render, INCLUDING the synthesized
+     * ".." entry (which sits at index 0 when path != "/"). The
+     * cursor sees the same indices the renderer sees. Used by
+     * verb_key_down to clamp without a backend round-trip (defense-
+     * in-depth on top of the TUI's own clamp at SWISS-3b — fixes
+     * user-reported bug "you can scroll past the last file").
+     *
+     * Reset to 0 on every cwd-changing op (attach, disconnect,
+     * descend, ascend) — the cache is invalid until the next
+     * panel-entries materialise re-populates it. A panel that has
+     * never been opened on /entries has entries_count = 0, in
+     * which case verb_key_down skips the clamp (renderer hasn't
+     * rendered yet). */
+    uint32_t entries_count;
 } slate_panel;
 
-#define SLATE_PANEL_LEFT  0
-#define SLATE_PANEL_RIGHT 1
-#define SLATE_PANEL_COUNT 2
+/* SLATE-4a: panel index constants now live in the public header.
+ * Keep a private alias for the existing slate.c references that
+ * use the short SLATE_PANEL_* names for code-density. */
+#define SLATE_PANEL_LEFT   STM_SLATE_PANEL_LEFT
+#define SLATE_PANEL_RIGHT  STM_SLATE_PANEL_RIGHT
+#define SLATE_PANEL_COUNT  STM_SLATE_PANEL_COUNT
 
 /* SLATE-4-confirm + SLATE-4b: dialog slot state. The
  * stm_slate->dialogs[STM_SLATE_DIALOG_MAX_ACTIVE] array carries up
@@ -414,25 +484,13 @@ struct stm_slate {
     uint32_t        log_head;     /* index of oldest entry */
     uint32_t        log_count;    /* 0..STM_SLATE_LOG_LINES */
 
-    /* SLATE-2: connection state. ConnectionAtomic invariant:
-     *   connected == (socket_len > 0)
-     * is maintained at every transition. PanelPathConsistent:
-     *   connected => panel[i].path_len > 0 (path = "/")
-     *   ~connected => panel[i].path_len == 0
-     * Both invariants are touched only in attach/disconnect/destroy. */
-    bool            connected;
-    char            socket[STM_SLATE_SOCKET_MAX + 1];
-    size_t          socket_len;
+    /* SLATE-4a: per-panel state. ConnectionAtomic + PanelPathConsistent
+     * invariants now hold PER PANEL — see the slate_panel struct
+     * comment for details. The top-level /connection/{socket,connected,
+     * attach} synfs files become panel-0 back-compat aliases. Each
+     * panel has its OWN backend client + backend_mu so concurrent
+     * ops on the two panels don't serialise. */
     slate_panel     panel[SLATE_PANEL_COUNT];
-
-    /* SLATE-2: backend client. Allocated at attach, swapped/cleared
-     * under backend_mu. May be NULL (disconnected) or non-NULL
-     * (connected). When connected, root fid SLATE_BACKEND_ROOT_FID is
-     * bound to the attach root; working fids are allocated/clunked
-     * per backend op. */
-    pthread_mutex_t backend_mu;       /* serialises every stm_9p_* call */
-    stm_9p_client  *backend;          /* protected by `mu` for read,
-                                       * by both for write (attach/dis) */
 
     /* SLATE-4-confirm + SLATE-4b: multi-dialog stack. Up to
      * STM_SLATE_DIALOG_MAX_ACTIVE dialogs may be active simultaneously.
@@ -463,6 +521,13 @@ struct stm_slate {
      * tracking (memcmp original vs current), action verbs save/quit/
      * revert/save-and-quit. */
     bool        editor_active;
+    /* SLATE-4a: which panel's backend the editor is bound to.
+     * Defaults to SLATE_PANEL_LEFT on bare "editor open <path>"
+     * verbs; the panel-prefixed form "editor open <left|right>
+     * <path>" sets it explicitly. Save/revert use this index to
+     * pick the right backend. Disconnecting THIS panel clears the
+     * editor (R124 P3-5 doctrine carry to per-panel). */
+    int         editor_panel_idx;
     char        editor_filename[STM_SLATE_EDITOR_FILENAME_MAX + 1];
     size_t      editor_filename_len;
     uint8_t    *editor_content;
@@ -639,15 +704,27 @@ stm_status stm_slate_create(stm_slate **out)
         free(s);
         return STM_EIO;
     }
-    if (pthread_mutex_init(&s->backend_mu, NULL) != 0) {
-        pthread_cond_destroy(&s->cv);
-        pthread_mutex_destroy(&s->mu);
-        free(s);
-        return STM_EIO;
+    /* SLATE-4a: each panel has its own backend_mu. Initialize per-
+     * panel; tear down on any subsequent failure to keep the
+     * lifecycle clean. */
+    int initialized = 0;
+    for (int i = 0; i < SLATE_PANEL_COUNT; i++) {
+        if (pthread_mutex_init(&s->panel[i].backend_mu, NULL) != 0) {
+            for (int j = 0; j < initialized; j++) {
+                pthread_mutex_destroy(&s->panel[j].backend_mu);
+            }
+            pthread_cond_destroy(&s->cv);
+            pthread_mutex_destroy(&s->mu);
+            free(s);
+            return STM_EIO;
+        }
+        initialized++;
     }
     s->version = 1u;
     /* PanelPathConsistent + ConnectionAtomic both hold by calloc:
-     *   connected = false; socket_len = 0; panel[i].path_len = 0. */
+     *   panel[i].connected = false;
+     *   panel[i].socket_len = 0;
+     *   panel[i].path_len = 0. */
     /* SLATE-4-confirm: dialog ids start at 1; 0 reserved for "no
      * active dialog" sentinel (see stm_slate_dialog_id). */
     s->next_dialog_id = 1u;
@@ -667,13 +744,23 @@ void stm_slate_stop(stm_slate *s)
 void stm_slate_destroy(stm_slate *s)
 {
     if (!s) return;
-    /* Close the backend if held. Caller has already destroyed every
-     * lp9 server using this state (R96 P2-1 doctrine), so no
-     * concurrent backend op is possible at this point. */
-    pthread_mutex_lock(&s->backend_mu);
+    /* SLATE-4a: close each panel's backend if held. Caller has
+     * already destroyed every lp9 server using this state (R96 P2-1
+     * doctrine), so no concurrent backend op is possible at this
+     * point. Take each panel's backend_mu sequentially — never
+     * concurrently — to keep the "single panel backend_mu at a
+     * time" rule intact even at teardown. */
+    stm_9p_client *closed[SLATE_PANEL_COUNT] = {0};
+    for (int i = 0; i < SLATE_PANEL_COUNT; i++) {
+        pthread_mutex_lock(&s->panel[i].backend_mu);
+        pthread_mutex_lock(&s->mu);
+        closed[i] = s->panel[i].backend;
+        s->panel[i].backend = NULL;
+        pthread_mutex_unlock(&s->mu);
+        if (closed[i]) stm_9p_close(closed[i]);
+        pthread_mutex_unlock(&s->panel[i].backend_mu);
+    }
     pthread_mutex_lock(&s->mu);
-    stm_9p_client *bc = s->backend;
-    s->backend = NULL;
     /* R115 P3-6: defensive sweep of any leftover heap-allocated
      * bulk_buf in sessions. R96 P2-1 caller contract should have
      * drained all sessions via vops_clunk → session_free_locked
@@ -694,10 +781,10 @@ void stm_slate_destroy(stm_slate *s)
     free(s->editor_original);
     s->editor_original = NULL;
     pthread_mutex_unlock(&s->mu);
-    if (bc) stm_9p_close(bc);
-    pthread_mutex_unlock(&s->backend_mu);
 
-    pthread_mutex_destroy(&s->backend_mu);
+    for (int i = 0; i < SLATE_PANEL_COUNT; i++) {
+        pthread_mutex_destroy(&s->panel[i].backend_mu);
+    }
     pthread_mutex_destroy(&s->mu);
     pthread_cond_destroy(&s->cv);
     free(s);
@@ -803,199 +890,197 @@ void stm_slate_drop_all_sessions(stm_slate *s)
 /* SLATE-2: connection state mutators + accessors.                        */
 /* ────────────────────────────────────────────────────────────────────── */
 
-/* Mu held; perform the post-attach state swap atomically. ConnectionAtomic
- * + PanelPathConsistent both maintained: connected becomes TRUE, socket
- * is set, panel paths reset to "/", panel cursors reset to 0, version
- * bumps, cv broadcasts.
- *
- * R124 P3-5: attach ALSO clears the editor state. A re-attach to a
- * different backend would otherwise leave editor.filename pointing
- * at a path that no longer exists on the new backend; save would
- * silently misroute. Cleared even on first-attach (no-op when
- * editor_active was already false). */
-static void attach_state_swap_locked(stm_slate *s, const char *path, size_t len,
+/* SLATE-4a: helper — clear the editor state if active. Mu held by
+ * caller. Used at attach + disconnect on the editor's pinned panel.
+ * R124 P3-5 doctrine carries: editor state is meaningless without
+ * its bound panel's backend; save would otherwise walk a stale
+ * filename against the new backend's filesystem. */
+static void editor_clear_locked(stm_slate *s)
+{
+    if (!s->editor_active) return;
+    free(s->editor_content);
+    s->editor_content = NULL;
+    s->editor_content_len = 0u;
+    free(s->editor_original);
+    s->editor_original = NULL;
+    s->editor_original_len = 0u;
+    s->editor_filename[0] = '\0';
+    s->editor_filename_len = 0u;
+    s->editor_active = false;
+    s->editor_cursor_row = 0u;
+    s->editor_cursor_col = 0u;
+    s->editor_modified = false;
+    s->editor_panel_idx = 0;
+}
+
+/* SLATE-4a: per-panel attach state swap. Mu held. ConnectionAtomic
+ * + PanelPathConsistent both hold for the swapped panel: connected
+ * becomes TRUE, socket is set, panel path resets to "/", cursor
+ * resets to 0, selection clears, entries_count cache invalidates. */
+static void attach_state_swap_locked(stm_slate *s, int panel_idx,
+                                       const char *path, size_t len,
                                        stm_9p_client *new_bc, stm_9p_client **old_bc_out)
 {
-    *old_bc_out = s->backend;
-    s->backend = new_bc;
-    memcpy(s->socket, path, len);
-    s->socket[len] = '\0';
-    s->socket_len = len;
-    s->connected = true;
-    for (int i = 0; i < SLATE_PANEL_COUNT; i++) {
-        s->panel[i].path[0] = '/';
-        s->panel[i].path[1] = '\0';
-        s->panel[i].path_len = 1u;
-        s->panel[i].cursor = 0u;
-        memset(s->panel[i].selection, 0, sizeof s->panel[i].selection);
-    }
-    /* R124 P3-5: clear editor state on attach (parity with disconnect). */
-    if (s->editor_active) {
-        free(s->editor_content);
-        s->editor_content = NULL;
-        s->editor_content_len = 0u;
-        free(s->editor_original);
-        s->editor_original = NULL;
-        s->editor_original_len = 0u;
-        s->editor_filename[0] = '\0';
-        s->editor_filename_len = 0u;
-        s->editor_active = false;
-        s->editor_cursor_row = 0u;
-        s->editor_cursor_col = 0u;
-        s->editor_modified = false;
+    slate_panel *p = &s->panel[panel_idx];
+    *old_bc_out = p->backend;
+    p->backend = new_bc;
+    memcpy(p->socket, path, len);
+    p->socket[len] = '\0';
+    p->socket_len = len;
+    p->connected = true;
+    p->path[0] = '/';
+    p->path[1] = '\0';
+    p->path_len = 1u;
+    p->cursor = 0u;
+    p->entries_count = 0u;
+    memset(p->selection, 0, sizeof p->selection);
+    /* If the editor was bound to THIS panel, clear it (the underlying
+     * backend just got replaced; editor state is no longer valid). */
+    if (s->editor_active && s->editor_panel_idx == panel_idx) {
+        editor_clear_locked(s);
     }
     s->version++;
     pthread_cond_broadcast(&s->cv);
 }
 
-/* Mu held; perform the post-disconnect state swap. ConnectionAtomic
- * + PanelPathConsistent both maintained: connected becomes FALSE,
- * socket clears, panel paths clear, cursors reset, version bumps,
- * cv broadcasts.
- *
- * R124 P3-5: disconnect ALSO clears the editor state. Editor state
- * (filename + content) is meaningless without a backend — saving
- * after a re-attach would walk the old filename against the NEW
- * backend's filesystem, possibly creating files in unintended
- * locations or saving into the wrong dataset. Closing on
- * disconnect is the safer default (parity with /panels/X/selection
- * reset-on-cwd-change posture from clause 17). */
-static void disconnect_state_swap_locked(stm_slate *s, stm_9p_client **old_bc_out)
+/* SLATE-4a: per-panel disconnect state swap. Mu held. */
+static void disconnect_state_swap_locked(stm_slate *s, int panel_idx,
+                                              stm_9p_client **old_bc_out)
 {
-    *old_bc_out = s->backend;
-    s->backend = NULL;
-    s->socket[0] = '\0';
-    s->socket_len = 0;
-    s->connected = false;
-    for (int i = 0; i < SLATE_PANEL_COUNT; i++) {
-        s->panel[i].path[0] = '\0';
-        s->panel[i].path_len = 0;
-        s->panel[i].cursor = 0u;
-        memset(s->panel[i].selection, 0, sizeof s->panel[i].selection);
-    }
-    /* R124 P3-5: clear editor state on disconnect. */
-    if (s->editor_active) {
-        free(s->editor_content);
-        s->editor_content = NULL;
-        s->editor_content_len = 0u;
-        free(s->editor_original);
-        s->editor_original = NULL;
-        s->editor_original_len = 0u;
-        s->editor_filename[0] = '\0';
-        s->editor_filename_len = 0u;
-        s->editor_active = false;
-        s->editor_cursor_row = 0u;
-        s->editor_cursor_col = 0u;
-        s->editor_modified = false;
+    slate_panel *p = &s->panel[panel_idx];
+    *old_bc_out = p->backend;
+    p->backend = NULL;
+    p->socket[0] = '\0';
+    p->socket_len = 0;
+    p->connected = false;
+    p->path[0] = '\0';
+    p->path_len = 0;
+    p->cursor = 0u;
+    p->entries_count = 0u;
+    memset(p->selection, 0, sizeof p->selection);
+    /* If the editor was bound to THIS panel, clear it (the panel
+     * disconnect terminates the editor session — backend gone). */
+    if (s->editor_active && s->editor_panel_idx == panel_idx) {
+        editor_clear_locked(s);
     }
     s->version++;
     pthread_cond_broadcast(&s->cv);
 }
 
-stm_status stm_slate_disconnect(stm_slate *s)
+stm_status stm_slate_disconnect_panel(stm_slate *s, int panel_idx)
 {
     if (!s) return STM_EINVAL;
+    if (panel_idx < 0 || panel_idx >= SLATE_PANEL_COUNT) return STM_EINVAL;
 
-    pthread_mutex_lock(&s->backend_mu);
+    pthread_mutex_lock(&s->panel[panel_idx].backend_mu);
     pthread_mutex_lock(&s->mu);
-    if (!s->connected) {
-        /* No-op — leave version unchanged (matches "version changes
-         * only on real state mutation" doctrine). */
+    if (!s->panel[panel_idx].connected) {
+        /* No-op — version unchanged. */
         pthread_mutex_unlock(&s->mu);
-        pthread_mutex_unlock(&s->backend_mu);
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return STM_OK;
     }
     stm_9p_client *old_bc = NULL;
-    disconnect_state_swap_locked(s, &old_bc);
+    disconnect_state_swap_locked(s, panel_idx, &old_bc);
     pthread_mutex_unlock(&s->mu);
-    /* R115 P2-1: close UNDER backend_mu (matches stm_slate_attach's
-     * close-then-unlock order). backend_mu pins the backend pointer
-     * for any concurrent panel-entries op so we don't close out from
-     * under it. Releasing backend_mu BEFORE close would let a new
-     * attach start dialing while old_bc is still being closed —
-     * inconsistent with attach's discipline and allows fd-exhaustion
-     * race under disconnect/attach storms. */
+    /* R115 P2-1 carry: close UNDER backend_mu so concurrent ops on
+     * THIS panel can't race a use-after-free. Other panels'
+     * backend_mu are independent and unaffected. */
     if (old_bc) stm_9p_close(old_bc);
-    pthread_mutex_unlock(&s->backend_mu);
+    pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
     return STM_OK;
 }
 
-stm_status stm_slate_attach(stm_slate *s, const char *socket_path, size_t len)
+stm_status stm_slate_attach_panel(stm_slate *s, int panel_idx,
+                                       const char *socket_path, size_t len)
 {
     if (!s) return STM_EINVAL;
-    /* Empty body = disconnect. */
-    if (len == 0) return stm_slate_disconnect(s);
+    if (panel_idx < 0 || panel_idx >= SLATE_PANEL_COUNT) return STM_EINVAL;
+    /* Empty body = disconnect THIS panel. */
+    if (len == 0) return stm_slate_disconnect_panel(s, panel_idx);
     if (!socket_path) return STM_EINVAL;
     if (len > STM_SLATE_SOCKET_MAX) return STM_EINVAL;
-    /* Embedded NUL refused (paths to AF_UNIX sockets cannot contain
-     * NUL except for the abstract-namespace leading byte on Linux,
-     * which v2.0 doesn't support — forward-noted). */
     for (size_t i = 0; i < len; i++) {
         if (socket_path[i] == '\0') return STM_EINVAL;
     }
 
-    /* Make a NUL-terminated copy for stm_9p_dial_unix (the API takes
-     * a C string). */
     char path[STM_SLATE_SOCKET_MAX + 1];
     memcpy(path, socket_path, len);
     path[len] = '\0';
 
-    /* Take backend_mu — blocks any concurrent backend op AND any
-     * concurrent attach/disconnect. The dial happens UNDER
-     * backend_mu but NOT under s->mu so /event etc keep flowing. */
-    pthread_mutex_lock(&s->backend_mu);
+    pthread_mutex_lock(&s->panel[panel_idx].backend_mu);
 
     stm_9p_dial_opts opts;
     memset(&opts, 0, sizeof opts);
-    opts.msize    = 0;             /* default — server may downgrade */
-    opts.uname    = NULL;          /* "" */
-    opts.aname    = NULL;          /* default root dataset */
-    opts.n_uname  = (uint32_t)-1;  /* sentinel — server uses uid */
+    opts.msize    = 0;
+    opts.uname    = NULL;
+    opts.aname    = NULL;
+    opts.n_uname  = (uint32_t)-1;
     opts.root_fid = SLATE_BACKEND_ROOT_FID;
 
     stm_9p_client *new_bc = NULL;
     stm_status rc = stm_9p_dial_unix(path, &opts, &new_bc);
     if (rc != STM_OK) {
-        pthread_mutex_unlock(&s->backend_mu);
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return rc;
     }
 
-    /* Swap state under s->mu. */
     pthread_mutex_lock(&s->mu);
     stm_9p_client *old_bc = NULL;
-    attach_state_swap_locked(s, path, len, new_bc, &old_bc);
+    attach_state_swap_locked(s, panel_idx, path, len, new_bc, &old_bc);
     pthread_mutex_unlock(&s->mu);
 
-    /* Close the prior backend OUTSIDE s->mu (still UNDER backend_mu so
-     * no other op can have a reference to old_bc — they would have
-     * to take backend_mu first). */
     if (old_bc) stm_9p_close(old_bc);
 
-    pthread_mutex_unlock(&s->backend_mu);
+    pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
     return STM_OK;
 }
 
-bool stm_slate_connected(stm_slate *s)
+/* SLATE-2 back-compat aliases: route to panel 0 (LEFT). */
+stm_status stm_slate_attach(stm_slate *s, const char *socket_path, size_t len)
+{
+    return stm_slate_attach_panel(s, SLATE_PANEL_LEFT, socket_path, len);
+}
+
+stm_status stm_slate_disconnect(stm_slate *s)
+{
+    return stm_slate_disconnect_panel(s, SLATE_PANEL_LEFT);
+}
+
+bool stm_slate_panel_connected(stm_slate *s, int panel_idx)
 {
     if (!s) return false;
+    if (panel_idx < 0 || panel_idx >= SLATE_PANEL_COUNT) return false;
     pthread_mutex_lock(&s->mu);
-    bool v = s->connected;
+    bool v = s->panel[panel_idx].connected;
     pthread_mutex_unlock(&s->mu);
     return v;
 }
 
-size_t stm_slate_socket(stm_slate *s, char *buf, size_t buf_cap)
+bool stm_slate_connected(stm_slate *s)
+{
+    return stm_slate_panel_connected(s, SLATE_PANEL_LEFT);
+}
+
+size_t stm_slate_panel_socket(stm_slate *s, int panel_idx,
+                                  char *buf, size_t buf_cap)
 {
     if (!s) return 0;
+    if (panel_idx < 0 || panel_idx >= SLATE_PANEL_COUNT) return 0;
     pthread_mutex_lock(&s->mu);
-    size_t n = s->socket_len;
+    size_t n = s->panel[panel_idx].socket_len;
     if (buf && buf_cap > 0) {
         size_t copy = (n < buf_cap - 1) ? n : (buf_cap - 1);
-        memcpy(buf, s->socket, copy);
+        memcpy(buf, s->panel[panel_idx].socket, copy);
         buf[copy] = '\0';
     }
     pthread_mutex_unlock(&s->mu);
     return n;
+}
+
+size_t stm_slate_socket(stm_slate *s, char *buf, size_t buf_cap)
+{
+    return stm_slate_panel_socket(s, SLATE_PANEL_LEFT, buf, buf_cap);
 }
 
 /* SLATE-4-confirm: validate that a string contains no control bytes
@@ -1254,9 +1339,16 @@ static stm_status validate_editor_path(const char *path, size_t len)
     return STM_OK;
 }
 
-stm_status stm_slate_editor_open(stm_slate *s, const char *path, size_t path_len)
+/* SLATE-4a: panel-aware editor open. The bare public stm_slate_editor_open
+ * routes here with panel_idx=SLATE_PANEL_LEFT for back-compat;
+ * /event "editor open <left|right> <path>" sets the prefix
+ * explicitly. Save + revert read s->editor_panel_idx to pick the
+ * right backend. */
+static stm_status editor_open_panel(stm_slate *s, int panel_idx,
+                                         const char *path, size_t path_len)
 {
     if (!s || !path) return STM_EINVAL;
+    if (panel_idx < 0 || panel_idx >= SLATE_PANEL_COUNT) return STM_EINVAL;
     stm_status vrc = validate_editor_path(path, path_len);
     if (vrc != STM_OK) return vrc;
 
@@ -1271,49 +1363,40 @@ stm_status stm_slate_editor_open(stm_slate *s, const char *path, size_t path_len
     memcpy(path_z, path, path_len);
     path_z[path_len] = '\0';
 
-    pthread_mutex_lock(&s->backend_mu);
+    pthread_mutex_lock(&s->panel[panel_idx].backend_mu);
     pthread_mutex_lock(&s->mu);
-    stm_9p_client *bc = s->backend;
+    stm_9p_client *bc = s->panel[panel_idx].backend;
     pthread_mutex_unlock(&s->mu);
     if (!bc) {
-        pthread_mutex_unlock(&s->backend_mu);
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return STM_EBACKEND;
     }
 
     /* Phase 1: walk root → path → WORK_FID. */
     stm_status rc = walk_to_cwd(bc, path_z, SLATE_BACKEND_WORK_FID);
     if (rc != STM_OK) {
-        pthread_mutex_unlock(&s->backend_mu);
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return rc;
     }
 
-    /* Phase 2: getattr to verify regular file. Size from getattr is
-     * a HINT only — synthetic-FS leaves (e.g., slate's own /version)
-     * may report size=0 because the body is materialized at Tlopen.
-     * The actual content size is determined by reading until EOF
-     * below, with the STM_SLATE_EDITOR_CONTENT_MAX cap enforced
-     * during the read loop. */
+    /* Phase 2: getattr to verify regular file. */
     stm_9p_attr a;
     memset(&a, 0, sizeof a);
     rc = stm_9p_getattr(bc, SLATE_BACKEND_WORK_FID,
                             STM_9P_GETATTR_MODE | STM_9P_GETATTR_SIZE, &a);
     if (rc != STM_OK) {
         (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
-        pthread_mutex_unlock(&s->backend_mu);
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return rc;
     }
     if ((a.mode & 0170000u) != 0100000u) {
-        /* Not a regular file (could be dir, symlink, etc). */
         (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
-        pthread_mutex_unlock(&s->backend_mu);
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return STM_EISDIR;
     }
-    /* Defensive cap on the getattr-reported size (catches obviously-
-     * pathological values up front). The real cap is enforced in
-     * the read loop below. */
     if (a.size > STM_SLATE_EDITOR_CONTENT_MAX) {
         (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
-        pthread_mutex_unlock(&s->backend_mu);
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return STM_ERANGE;
     }
 
@@ -1324,21 +1407,14 @@ stm_status stm_slate_editor_open(stm_slate *s, const char *path, size_t path_len
                          &oqid, &iounit);
     if (rc != STM_OK) {
         (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
-        pthread_mutex_unlock(&s->backend_mu);
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return rc;
     }
 
-    /* Phase 4: read the full content into a growth-able heap
-     * buffer, doubling on demand and bounded by
-     * STM_SLATE_EDITOR_CONTENT_MAX. The getattr size is a hint
-     * (may be 0 for synthetic-FS leaves); read until Tread
-     * returns 0 (EOF). */
+    /* Phase 4: read full content into doubling-heap buffer. */
     uint8_t *buf = NULL;
     size_t cap = 0u;
     size_t got_total = 0u;
-    /* Initial capacity: max(getattr_size, 4 KiB). A typical
-     * editor file is < 4 KiB; getattr_size > 0 (regular FS file)
-     * sizes the buffer exactly. */
     size_t initial = (size_t)a.size;
     if (initial < 4096u) initial = 4096u;
     if (initial > STM_SLATE_EDITOR_CONTENT_MAX) {
@@ -1347,14 +1423,12 @@ stm_status stm_slate_editor_open(stm_slate *s, const char *path, size_t path_len
     buf = malloc(initial);
     if (!buf) {
         (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
-        pthread_mutex_unlock(&s->backend_mu);
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return STM_ENOMEM;
     }
     cap = initial;
     for (;;) {
         if (got_total >= STM_SLATE_EDITOR_CONTENT_MAX) {
-            /* Hit the cap exactly OR reached it. If there's more
-             * to read, refuse with ERANGE — we don't truncate. */
             uint8_t probe[1];
             uint32_t probe_got = 0u;
             stm_status pr = stm_9p_read(bc, SLATE_BACKEND_WORK_FID,
@@ -1363,13 +1437,12 @@ stm_status stm_slate_editor_open(stm_slate *s, const char *path, size_t path_len
             if (pr == STM_OK && probe_got > 0u) {
                 free(buf);
                 (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
-                pthread_mutex_unlock(&s->backend_mu);
+                pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
                 return STM_ERANGE;
             }
-            break;  /* EOF or read error treated as EOF; drop probe. */
+            break;
         }
         if (got_total == cap) {
-            /* Grow buffer (doubling, bounded). */
             size_t new_cap = cap * 2u;
             if (new_cap > STM_SLATE_EDITOR_CONTENT_MAX) {
                 new_cap = STM_SLATE_EDITOR_CONTENT_MAX;
@@ -1378,7 +1451,7 @@ stm_status stm_slate_editor_open(stm_slate *s, const char *path, size_t path_len
             if (!nb) {
                 free(buf);
                 (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
-                pthread_mutex_unlock(&s->backend_mu);
+                pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
                 return STM_ENOMEM;
             }
             buf = nb;
@@ -1393,26 +1466,22 @@ stm_status stm_slate_editor_open(stm_slate *s, const char *path, size_t path_len
         if (rc != STM_OK) {
             free(buf);
             (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
-            pthread_mutex_unlock(&s->backend_mu);
+            pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
             return rc;
         }
-        if (got_now == 0u) break;  /* EOF */
+        if (got_now == 0u) break;
         got_total += got_now;
     }
     /* Phase 5: clunk WORK. */
     (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
 
-    /* Phase 6: SLATE-5b — clone `buf` into `editor_original` so the
-     * /editor/modified flag can compare against the pristine
-     * baseline. memcpy outside s->mu (we own buf + the new clone
-     * outside the critical section). On clone failure: free buf
-     * AND any prior editor state isn't touched. */
+    /* Phase 6: clone buf into editor_original baseline. */
     uint8_t *original = NULL;
     if (got_total > 0u) {
         original = malloc(got_total);
         if (!original) {
             free(buf);
-            pthread_mutex_unlock(&s->backend_mu);
+            pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
             return STM_ENOMEM;
         }
         memcpy(original, buf, got_total);
@@ -1420,8 +1489,6 @@ stm_status stm_slate_editor_open(stm_slate *s, const char *path, size_t path_len
 
     /* Phase 7: atomic state swap under s->mu. */
     pthread_mutex_lock(&s->mu);
-    /* Free any prior editor content + original (replacing one open
-     * editor with a new file is allowed; modified-state is dropped). */
     free(s->editor_content);
     s->editor_content = buf;
     s->editor_content_len = got_total;
@@ -1432,6 +1499,7 @@ stm_status stm_slate_editor_open(stm_slate *s, const char *path, size_t path_len
     s->editor_filename[path_len] = '\0';
     s->editor_filename_len = path_len;
     s->editor_active = true;
+    s->editor_panel_idx = panel_idx;
     s->editor_cursor_row = 0u;
     s->editor_cursor_col = 0u;
     s->editor_modified = false;
@@ -1439,8 +1507,13 @@ stm_status stm_slate_editor_open(stm_slate *s, const char *path, size_t path_len
     pthread_cond_broadcast(&s->cv);
     pthread_mutex_unlock(&s->mu);
 
-    pthread_mutex_unlock(&s->backend_mu);
+    pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
     return STM_OK;
+}
+
+stm_status stm_slate_editor_open(stm_slate *s, const char *path, size_t path_len)
+{
+    return editor_open_panel(s, SLATE_PANEL_LEFT, path, path_len);
 }
 
 /* SLATE-5b: write the editor buffer back to the backend file +
@@ -1457,18 +1530,36 @@ stm_status stm_slate_editor_save(stm_slate *s)
 {
     if (!s) return STM_EINVAL;
 
-    pthread_mutex_lock(&s->backend_mu);
+    /* Snapshot panel_idx under mu BEFORE taking the panel's
+     * backend_mu — we don't know which lock to take yet. The
+     * editor_panel_idx field is set at editor_open time and only
+     * cleared by editor_clear_locked (which holds mu). */
+    pthread_mutex_lock(&s->mu);
+    if (!s->editor_active) {
+        pthread_mutex_unlock(&s->mu);
+        return STM_ENOENT;
+    }
+    int panel_idx = s->editor_panel_idx;
+    pthread_mutex_unlock(&s->mu);
+    if (panel_idx < 0 || panel_idx >= SLATE_PANEL_COUNT) return STM_ENOENT;
+
+    pthread_mutex_lock(&s->panel[panel_idx].backend_mu);
 
     /* Snapshot active state + filename + content under s->mu. */
     pthread_mutex_lock(&s->mu);
-    stm_9p_client *bc = s->backend;
-    bool active = s->editor_active;
-    if (!active || !bc) {
+    /* Re-check editor_active + editor_panel_idx — concurrent close
+     * could have fired between the snapshot above and now. */
+    if (!s->editor_active || s->editor_panel_idx != panel_idx) {
         pthread_mutex_unlock(&s->mu);
-        pthread_mutex_unlock(&s->backend_mu);
-        return active ? STM_EBACKEND : STM_ENOENT;
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
+        return STM_ENOENT;
     }
-    /* Copy filename + content to local heap for the backend op. */
+    stm_9p_client *bc = s->panel[panel_idx].backend;
+    if (!bc) {
+        pthread_mutex_unlock(&s->mu);
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
+        return STM_EBACKEND;
+    }
     char path[STM_SLATE_EDITOR_FILENAME_MAX + 1];
     memcpy(path, s->editor_filename, s->editor_filename_len);
     path[s->editor_filename_len] = '\0';
@@ -1478,7 +1569,7 @@ stm_status stm_slate_editor_save(stm_slate *s)
         content_snap = malloc(content_len);
         if (!content_snap) {
             pthread_mutex_unlock(&s->mu);
-            pthread_mutex_unlock(&s->backend_mu);
+            pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
             return STM_ENOMEM;
         }
         memcpy(content_snap, s->editor_content, content_len);
@@ -1489,7 +1580,7 @@ stm_status stm_slate_editor_save(stm_slate *s)
     stm_status rc = walk_to_cwd(bc, path, SLATE_BACKEND_WORK_FID);
     if (rc != STM_OK) {
         free(content_snap);
-        pthread_mutex_unlock(&s->backend_mu);
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return rc;
     }
     /* Phase 2: Tlopen WRONLY|TRUNC. */
@@ -1501,7 +1592,7 @@ stm_status stm_slate_editor_save(stm_slate *s)
     if (rc != STM_OK) {
         (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
         free(content_snap);
-        pthread_mutex_unlock(&s->backend_mu);
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return rc;
     }
     /* Phase 3: Twrite chunked at iounit cap. */
@@ -1516,61 +1607,46 @@ stm_status stm_slate_editor_save(stm_slate *s)
         if (rc != STM_OK) {
             (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
             free(content_snap);
-            pthread_mutex_unlock(&s->backend_mu);
+            pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
             return rc;
         }
         if (written == 0u) {
-            /* Server wrote 0 bytes — treat as ENOSPC to surface the
-             * partial-save problem; modified flag stays true so the
-             * user re-saves. */
             (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
             free(content_snap);
-            pthread_mutex_unlock(&s->backend_mu);
+            pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
             return STM_ENOSPC;
         }
         off += written;
     }
     /* Phase 4: fsync. */
     rc = stm_9p_fsync(bc, SLATE_BACKEND_WORK_FID, /*datasync=*/0u);
-    /* Clunk regardless of fsync result. */
     (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
     if (rc != STM_OK) {
         free(content_snap);
-        pthread_mutex_unlock(&s->backend_mu);
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return rc;
     }
 
-    /* Phase 5: commit clean state under s->mu. content_snap becomes
-     * the new editor_original; the prior editor_original is freed.
-     *
-     * R124 P3-3: concurrent stm_slate_editor_close CAN fire between
-     * the Tfsync at Phase 4 and this Phase 5's s->mu acquire,
-     * because editor_close DOES NOT take backend_mu (only s->mu).
-     * The re-check below is genuinely necessary. The backend write
-     * already committed; if local state is gone, we drop the snap
-     * (the file on disk reflects the saved content, but slate has
-     * no local record of the editor). */
+    /* Phase 5: commit clean state. R124 P3-3 carry: concurrent close
+     * could have fired between Phase 4 fsync and Phase 5 mu acquire;
+     * if local state is gone, drop the snap (backend was written but
+     * slate has no record). */
     pthread_mutex_lock(&s->mu);
-    if (!s->editor_active) {
-        /* Concurrent editor_close fired between the Tfsync and now.
-         * The save still committed to the backend, but our local
-         * state is gone. Drop the snap. */
+    if (!s->editor_active || s->editor_panel_idx != panel_idx) {
         pthread_mutex_unlock(&s->mu);
         free(content_snap);
-        pthread_mutex_unlock(&s->backend_mu);
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return STM_OK;
     }
     free(s->editor_original);
     s->editor_original = content_snap;
     s->editor_original_len = content_len;
-    /* Recompute modified — should be false since content == new
-     * original. */
     editor_recompute_modified_locked(s);
     s->version++;
     pthread_cond_broadcast(&s->cv);
     pthread_mutex_unlock(&s->mu);
 
-    pthread_mutex_unlock(&s->backend_mu);
+    pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
     return STM_OK;
 }
 
@@ -1581,8 +1657,9 @@ stm_status stm_slate_editor_save(stm_slate *s)
 stm_status stm_slate_editor_revert(stm_slate *s)
 {
     if (!s) return STM_EINVAL;
-    /* Snapshot current filename. */
+    /* Snapshot current filename + panel_idx. */
     char path[STM_SLATE_EDITOR_FILENAME_MAX + 1];
+    int panel_idx;
     pthread_mutex_lock(&s->mu);
     if (!s->editor_active) {
         pthread_mutex_unlock(&s->mu);
@@ -1591,10 +1668,11 @@ stm_status stm_slate_editor_revert(stm_slate *s)
     size_t plen = s->editor_filename_len;
     memcpy(path, s->editor_filename, plen);
     path[plen] = '\0';
+    panel_idx = s->editor_panel_idx;
     pthread_mutex_unlock(&s->mu);
-    /* Re-open: this re-walks + re-reads + replaces content +
-     * resets cursor to 0,0 + clears modified. */
-    return stm_slate_editor_open(s, path, plen);
+    /* Re-open against THIS editor's panel — this re-walks + re-reads
+     * + replaces content + resets cursor to 0,0 + clears modified. */
+    return editor_open_panel(s, panel_idx, path, plen);
 }
 
 stm_status stm_slate_editor_close(stm_slate *s)
@@ -1611,6 +1689,7 @@ stm_status stm_slate_editor_close(stm_slate *s)
         s->editor_filename[0] = '\0';
         s->editor_filename_len = 0u;
         s->editor_active = false;
+        s->editor_panel_idx = 0;
         s->editor_cursor_row = 0u;
         s->editor_cursor_col = 0u;
         s->editor_modified = false;
@@ -1737,22 +1816,27 @@ static stm_status materialize_status_locked(stm_slate *s, slate_session *ss)
     return STM_OK;
 }
 
-/* SLATE-2: /connection/socket — current backend socket path or empty
- * line. Always emits at least a trailing newline so readers see a
- * one-line file. */
-static stm_status materialize_conn_socket_locked(stm_slate *s, slate_session *ss)
+/* SLATE-4a: /connection/{left,right}/socket — panel[i]'s socket
+ * path or empty line. The top-level /connection/socket alias
+ * targets panel 0 (LEFT) — same materializer with panel_idx=0. */
+static stm_status materialize_conn_socket_locked(stm_slate *s,
+                                                       slate_session *ss,
+                                                       int panel_idx)
 {
-    if (s->socket_len + 1u > sizeof ss->buf) return STM_ERANGE;
-    memcpy(ss->buf, s->socket, s->socket_len);
-    ss->buf[s->socket_len] = '\n';
-    ss->len = (uint32_t)(s->socket_len + 1u);
+    size_t n = s->panel[panel_idx].socket_len;
+    if (n + 1u > sizeof ss->buf) return STM_ERANGE;
+    memcpy(ss->buf, s->panel[panel_idx].socket, n);
+    ss->buf[n] = '\n';
+    ss->len = (uint32_t)(n + 1u);
     return STM_OK;
 }
 
-/* SLATE-2: /connection/connected — "1\n" or "0\n". */
-static stm_status materialize_conn_connected_locked(stm_slate *s, slate_session *ss)
+/* SLATE-4a: /connection/{left,right}/connected — "1\n" or "0\n". */
+static stm_status materialize_conn_connected_locked(stm_slate *s,
+                                                          slate_session *ss,
+                                                          int panel_idx)
 {
-    ss->buf[0] = s->connected ? '1' : '0';
+    ss->buf[0] = s->panel[panel_idx].connected ? '1' : '0';
     ss->buf[1] = '\n';
     ss->len = 2u;
     return STM_OK;
@@ -2299,52 +2383,57 @@ static stm_status walk_to_cwd(stm_9p_client *bc, const char *cwd,
     return STM_OK;
 }
 
-/* Render panel entries against the backend. Acquires + releases
- * backend_mu. Briefly takes s->mu only to read the backend pointer.
+/* SLATE-4a: render panel entries against `panel_idx`'s backend.
+ * Acquires + releases panel[panel_idx].backend_mu. Briefly takes
+ * s->mu only to read the panel's backend pointer.
+ *
  * Returns:
  *   STM_OK + *out_buf=NULL + *out_len=0  → disconnected; serve empty
  *   STM_OK + *out_buf=heap + *out_len>0  → success; caller frees buf
  *   any other status                     → backend error; *out_buf=NULL
  *
  * Body format: one line per entry, "TYPE MODE SIZE MTIME NAME\n".
- * Truncated at STM_SLATE_ENTRIES_MAX entries. */
-static stm_status panel_entries_render(stm_slate *s, const char *cwd,
-                                            uint8_t **out_buf, uint32_t *out_len)
+ * Truncated at STM_SLATE_ENTRIES_MAX entries.
+ *
+ * SLATE-4a synthesizes a leading ".." entry when cwd != "/" so the
+ * cursor can land on it — pressing Enter on ".." ascends to the
+ * parent (handled by the descend verb's special-case for the
+ * synthetic name). The user-reported bug "missing .." closes via
+ * this single synthesis point so external 9P clients (Halcyon,
+ * scripts) see it too without each having to synthesise its own.
+ *
+ * out_count receives the rendered entries count (including the
+ * synthetic "..") and is cached into panel.entries_count by the
+ * caller for cursor-clamp defense-in-depth. */
+static stm_status panel_entries_render(stm_slate *s, int panel_idx,
+                                            const char *cwd,
+                                            uint8_t **out_buf, uint32_t *out_len,
+                                            uint32_t *out_count)
 {
     *out_buf = NULL;
     *out_len = 0;
+    *out_count = 0u;
 
-    pthread_mutex_lock(&s->backend_mu);
+    pthread_mutex_lock(&s->panel[panel_idx].backend_mu);
 
-    /* Snapshot backend pointer under s->mu (very brief). After we
-     * release s->mu, the backend pointer can't change because we
-     * still hold backend_mu (Disconnect / Attach also take backend_mu
-     * before mutating s->backend). */
     pthread_mutex_lock(&s->mu);
-    stm_9p_client *bc = s->backend;
+    stm_9p_client *bc = s->panel[panel_idx].backend;
     pthread_mutex_unlock(&s->mu);
     if (!bc) {
-        pthread_mutex_unlock(&s->backend_mu);
-        return STM_OK;  /* disconnected → empty body. */
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
+        return STM_OK;
     }
 
-    /* Phase 1: walk to cwd, clone to CWD_FID for per-entry walks
-     * (R115 P3 + R116 P3 forward-note carry — supports nested cwd),
-     * lopen WORK for read, readdir batches into a collected name list.
-     * Clunk WORK after readdir; CWD lives until end of phase 2. */
     stm_status rc = walk_to_cwd(bc, cwd, SLATE_BACKEND_WORK_FID);
     if (rc != STM_OK) {
-        pthread_mutex_unlock(&s->backend_mu);
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return rc;
     }
-    /* Clone WORK to CWD_FID via Twalk(WORK, CWD, n_names=0) — both
-     * point at the panel's cwd, both unopened. Done BEFORE lopen
-     * on WORK so the source fid is unopened (clean walk semantics). */
     rc = stm_9p_walk(bc, SLATE_BACKEND_WORK_FID, SLATE_BACKEND_CWD_FID,
                         0u, NULL, NULL, NULL);
     if (rc != STM_OK) {
         (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
-        pthread_mutex_unlock(&s->backend_mu);
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return rc;
     }
     rc = stm_9p_lopen(bc, SLATE_BACKEND_WORK_FID,
@@ -2353,19 +2442,18 @@ static stm_status panel_entries_render(stm_slate *s, const char *cwd,
     if (rc != STM_OK) {
         (void)stm_9p_clunk(bc, SLATE_BACKEND_CWD_FID);
         (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
-        pthread_mutex_unlock(&s->backend_mu);
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return rc;
     }
 
     slate_dirent *arr = calloc(STM_SLATE_ENTRIES_MAX, sizeof *arr);
     if (!arr) {
         (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
-        pthread_mutex_unlock(&s->backend_mu);
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return STM_ENOMEM;
     }
     slate_dir_collect dc = { arr, STM_SLATE_ENTRIES_MAX, 0 };
 
-    /* Loop Treaddir batches until count==0 (EOF) or cb-stop. */
     uint64_t offset = 0;
     while (1) {
         uint32_t entries = 0;
@@ -2374,43 +2462,62 @@ static stm_status panel_entries_render(stm_slate *s, const char *cwd,
                                offset, 0u,
                                collect_dirent_cb, &dc,
                                &entries, &next_off);
-        /* cb-stop → STM_ENOTSUPPORTED (truncation sentinel) — fine. */
         if (rc == STM_ENOTSUPPORTED) { rc = STM_OK; break; }
         if (rc != STM_OK) break;
-        if (entries == 0) break;        /* EOF */
-        if (next_off == offset) break;  /* defensive — server stuck */
+        if (entries == 0) break;
+        if (next_off == offset) break;
         offset = next_off;
     }
     (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
     if (rc != STM_OK) {
         (void)stm_9p_clunk(bc, SLATE_BACKEND_CWD_FID);
         free(arr);
-        pthread_mutex_unlock(&s->backend_mu);
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return rc;
     }
 
-    /* Phase 2: per-entry walk + getattr. Walks from CWD_FID (the
-     * panel's cwd) so nested cwds resolve correctly. Use
-     * SLATE_BACKEND_ENT_FID. On any per-entry failure we record
-     * minimal info (mode=0, size=0, mtime=0); the listing remains
-     * usable. */
-    size_t body_cap = (size_t)dc.count * STM_SLATE_ENTRY_LINE_MAX + 1u;
+    /* SLATE-4a: synthesize a leading ".." entry when cwd != "/".
+     * cwd_len > 1 ⇒ we're not at root (cwd is "/foo/.../x" or "/foo");
+     * cwd_len == 1 + cwd[0] == '/' ⇒ at root, no synthesis. */
+    bool synth_dotdot = !(cwd[0] == '/' && cwd[1] == '\0');
+
+    /* Per-entry walk + getattr. */
+    uint32_t emit_count = dc.count + (synth_dotdot ? 1u : 0u);
+    size_t body_cap = (size_t)emit_count * STM_SLATE_ENTRY_LINE_MAX + 1u;
     if (body_cap == 1u) {
         (void)stm_9p_clunk(bc, SLATE_BACKEND_CWD_FID);
         free(arr);
-        pthread_mutex_unlock(&s->backend_mu);
-        return STM_OK;  /* empty dir → empty body */
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
+        return STM_OK;
     }
     if (body_cap > STM_SLATE_LOG_TAIL_MAX) body_cap = STM_SLATE_LOG_TAIL_MAX;
     uint8_t *body = malloc(body_cap);
     if (!body) {
         (void)stm_9p_clunk(bc, SLATE_BACKEND_CWD_FID);
         free(arr);
-        pthread_mutex_unlock(&s->backend_mu);
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return STM_ENOMEM;
     }
 
     size_t body_off = 0;
+    uint32_t rendered = 0u;
+
+    /* Synthesised ".." at index 0 when not at root. Type=d, mode/size/
+     * mtime are zeroes — the renderer treats name == ".." specially
+     * (focus highlight / parent-icon). The descend verb's "key Enter
+     * on .." → ascend short-circuit handles navigation. */
+    if (synth_dotdot) {
+        char line[STM_SLATE_ENTRY_LINE_MAX + 1];
+        int n = snprintf(line, sizeof line, "d 0000 0 0 ..\n");
+        if (n < 0) n = 0;
+        if (n >= (int)sizeof line) n = (int)sizeof line - 1;
+        if (body_off + (size_t)n <= body_cap) {
+            memcpy(body + body_off, line, (size_t)n);
+            body_off += (size_t)n;
+            rendered++;
+        }
+    }
+
     for (uint32_t i = 0; i < dc.count; i++) {
         slate_dirent *de = &arr[i];
         uint32_t mode_lo = 0;
@@ -2474,12 +2581,16 @@ static stm_status panel_entries_render(stm_slate *s, const char *cwd,
         body_off += (size_t)n;
     }
 
+    /* Account for emitted backend entries (rendered counter only
+     * counts those whose snprintf succeeded + fit). */
+    rendered += dc.count;
     (void)stm_9p_clunk(bc, SLATE_BACKEND_CWD_FID);
     free(arr);
-    pthread_mutex_unlock(&s->backend_mu);
+    pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
 
     *out_buf = body;
     *out_len = (uint32_t)body_off;
+    *out_count = rendered;
     return STM_OK;
 }
 
@@ -2516,7 +2627,21 @@ static stm_status verb_key_down(stm_slate *s, int panel_idx)
 {
     pthread_mutex_lock(&s->mu);
     bool moved = false;
-    if (s->panel[panel_idx].cursor < UINT32_MAX) {
+    /* SLATE-4a slate-side cursor clamp (defense-in-depth on the
+     * TUI's own SWISS-3b clamp): if we have a fresh entries-count
+     * cache from a recent panel-entries materialise, refuse the
+     * advance when cursor is already at the last entry. The cache
+     * is invalidated to 0 on every cwd-changing op (attach,
+     * disconnect, descend, ascend) — when entries_count == 0 we
+     * fall back to the original UINT32_MAX cap so a panel that has
+     * never been opened on /entries doesn't get stuck. The fix
+     * targets the user-reported bug "you can scroll past the last
+     * file, breaks UI completely". */
+    uint32_t cap = s->panel[panel_idx].entries_count;
+    uint32_t cursor = s->panel[panel_idx].cursor;
+    bool can_advance = (cap > 0u) ? (cursor + 1u < cap)
+                                   : (cursor < UINT32_MAX);
+    if (can_advance) {
         s->panel[panel_idx].cursor++;
         moved = true;
     }
@@ -2545,7 +2670,7 @@ static stm_status verb_key_enter(stm_slate *s, int panel_idx)
 static stm_status ascend_panel(stm_slate *s, int panel_idx)
 {
     pthread_mutex_lock(&s->mu);
-    if (!s->connected) {
+    if (!s->panel[panel_idx].connected) {
         pthread_mutex_unlock(&s->mu);
         return STM_EBACKEND;
     }
@@ -2600,6 +2725,10 @@ static stm_status ascend_panel(stm_slate *s, int panel_idx)
         s->panel[panel_idx].path_len = last_slash;
     }
     s->panel[panel_idx].cursor = 0u;
+    /* SLATE-4a: cwd changed → invalidate cached entries_count
+     * (cursor clamp falls back to UINT32_MAX until the next
+     * panel-entries materialise repopulates it). */
+    s->panel[panel_idx].entries_count = 0u;
     /* SLATE-3c-selection: cwd change invalidates selection. */
     memset(s->panel[panel_idx].selection, 0,
               sizeof s->panel[panel_idx].selection);
@@ -2739,9 +2868,9 @@ static stm_status descend_panel(stm_slate *s, int panel_idx)
     size_t cwd_len;
     uint32_t cursor;
     pthread_mutex_lock(&s->mu);
-    if (!s->connected) {
+    if (!s->panel[panel_idx].connected) {
         pthread_mutex_unlock(&s->mu);
-        return STM_EBACKEND;  /* not connected — descend has no target */
+        return STM_EBACKEND;
     }
     cwd_len = s->panel[panel_idx].path_len;
     if (cwd_len == 0u || cwd_len > STM_SLATE_PATH_MAX) {
@@ -2753,43 +2882,41 @@ static stm_status descend_panel(stm_slate *s, int panel_idx)
     cursor = s->panel[panel_idx].cursor;
     pthread_mutex_unlock(&s->mu);
 
-    /* R117 P3-1: cap cursor at STM_SLATE_ENTRIES_MAX so descend's
-     * readdir loop terminates promptly (parity with
-     * panel_entries_render's truncation cap). A cursor beyond the
-     * rendered cap can't possibly correspond to a user-visible
-     * entry; refuse early to bound the worst-case backend scan and
-     * the duration backend_mu is held. */
-    if (cursor >= STM_SLATE_ENTRIES_MAX) {
+    /* SLATE-4a: synthetic ".." appears at index 0 when cwd != "/".
+     * Treat key Enter on it as ascend — same effect as Backspace. */
+    bool synth_dotdot_present = !(cwd[0] == '/' && cwd[1] == '\0');
+    if (synth_dotdot_present && cursor == 0u) {
+        return ascend_panel(s, panel_idx);
+    }
+
+    /* R117 P3-1 carry: cursor is in the user-visible index space;
+     * subtract the synthetic ".." offset (if present) to get the
+     * backend-relative target index. */
+    uint32_t backend_target = synth_dotdot_present ? (cursor - 1u) : cursor;
+
+    if (backend_target >= STM_SLATE_ENTRIES_MAX) {
         return STM_EINVAL;
     }
 
-    /* Take backend_mu and snapshot the backend client. */
-    pthread_mutex_lock(&s->backend_mu);
+    pthread_mutex_lock(&s->panel[panel_idx].backend_mu);
     pthread_mutex_lock(&s->mu);
-    stm_9p_client *bc = s->backend;
+    stm_9p_client *bc = s->panel[panel_idx].backend;
     pthread_mutex_unlock(&s->mu);
     if (!bc) {
-        pthread_mutex_unlock(&s->backend_mu);
-        return STM_EBACKEND;  /* not connected — descend has no target */
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
+        return STM_EBACKEND;
     }
 
-    /* Walk to cwd, clone to CWD_FID for the post-readdir per-entry
-     * walk (R117 P3-2 closure — was previously a redundant
-     * walk_to_cwd(target_path) from ROOT in the confirm-dir step;
-     * cloning lets the confirm walk be a single-component walk from
-     * the cwd-bound CWD_FID). lopen WORK for readdir. CWD stays
-     * UNOPENED so the confirm-step Twalk from it is universally
-     * valid in 9P2000.L. */
     stm_status rc = walk_to_cwd(bc, cwd, SLATE_BACKEND_WORK_FID);
     if (rc != STM_OK) {
-        pthread_mutex_unlock(&s->backend_mu);
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return rc;
     }
     rc = stm_9p_walk(bc, SLATE_BACKEND_WORK_FID, SLATE_BACKEND_CWD_FID,
                         0u, NULL, NULL, NULL);
     if (rc != STM_OK) {
         (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
-        pthread_mutex_unlock(&s->backend_mu);
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return rc;
     }
     rc = stm_9p_lopen(bc, SLATE_BACKEND_WORK_FID,
@@ -2798,11 +2925,11 @@ static stm_status descend_panel(stm_slate *s, int panel_idx)
     if (rc != STM_OK) {
         (void)stm_9p_clunk(bc, SLATE_BACKEND_CWD_FID);
         (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
-        pthread_mutex_unlock(&s->backend_mu);
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return rc;
     }
 
-    descend_find_ctx fc = { .target_idx = cursor, .emitted = 0,
+    descend_find_ctx fc = { .target_idx = backend_target, .emitted = 0,
                               .found = false, .type = 0, .name_len = 0 };
     uint64_t offset = 0;
     while (1) {
@@ -2812,48 +2939,35 @@ static stm_status descend_panel(stm_slate *s, int panel_idx)
                                offset, 0u,
                                descend_find_cb, &fc,
                                &entries, &next_off);
-        if (rc == STM_ENOTSUPPORTED) { rc = STM_OK; break; }  /* found-stop */
+        if (rc == STM_ENOTSUPPORTED) { rc = STM_OK; break; }
         if (rc != STM_OK) break;
-        if (entries == 0) break;        /* EOF */
-        if (next_off == offset) break;  /* defensive */
+        if (entries == 0) break;
+        if (next_off == offset) break;
         offset = next_off;
         if (fc.found) break;
     }
     (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
     if (rc != STM_OK) {
         (void)stm_9p_clunk(bc, SLATE_BACKEND_CWD_FID);
-        pthread_mutex_unlock(&s->backend_mu);
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return rc;
     }
     if (!fc.found) {
-        /* Cursor out of range relative to current entries. */
         (void)stm_9p_clunk(bc, SLATE_BACKEND_CWD_FID);
-        pthread_mutex_unlock(&s->backend_mu);
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return STM_EINVAL;
     }
     if (fc.bad_name) {
-        /* R117 P1-1: entry name has control bytes — refuse descent.
-         * Writing the raw name into panel.path would forge multi-line
-         * reads of /panels/X/path; sanitizing on storage would
-         * diverge from the real backend name and break the entries
-         * listing's walk_to_cwd lookup. */
         (void)stm_9p_clunk(bc, SLATE_BACKEND_CWD_FID);
-        pthread_mutex_unlock(&s->backend_mu);
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return STM_EINVAL;
     }
     if (fc.type != 4u /* DT_DIR */) {
-        /* Not a directory — refuse descend. SLATE-3c will route
-         * non-dir Enter to a "view as file" handler. */
         (void)stm_9p_clunk(bc, SLATE_BACKEND_CWD_FID);
-        pthread_mutex_unlock(&s->backend_mu);
+        pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return STM_ENOTDIR;
     }
 
-    /* Confirm the entry is actually a directory via Twalk + Tgetattr
-     * (defense against a stale dirent type bit). R117 P3-2 closure:
-     * walks from CWD_FID via single-component Twalk instead of the
-     * prior walk_to_cwd(target_path) double-walk-from-ROOT. CWD is
-     * already bound to the panel's cwd from the clone above. */
     {
         char target_path[STM_SLATE_PATH_MAX + 1];
         size_t target_path_len;
@@ -2862,7 +2976,7 @@ static stm_status descend_panel(stm_slate *s, int panel_idx)
                                        &target_path_len);
         if (rc != STM_OK) {
             (void)stm_9p_clunk(bc, SLATE_BACKEND_CWD_FID);
-            pthread_mutex_unlock(&s->backend_mu);
+            pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
             return rc;
         }
         const char *names_arr[1] = { fc.name };
@@ -2870,7 +2984,7 @@ static stm_status descend_panel(stm_slate *s, int panel_idx)
                             1u, names_arr, NULL, NULL);
         if (rc != STM_OK) {
             (void)stm_9p_clunk(bc, SLATE_BACKEND_CWD_FID);
-            pthread_mutex_unlock(&s->backend_mu);
+            pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
             return rc;
         }
         stm_9p_attr a;
@@ -2880,26 +2994,26 @@ static stm_status descend_panel(stm_slate *s, int panel_idx)
         (void)stm_9p_clunk(bc, SLATE_BACKEND_ENT_FID);
         (void)stm_9p_clunk(bc, SLATE_BACKEND_CWD_FID);
         if (rc != STM_OK) {
-            pthread_mutex_unlock(&s->backend_mu);
+            pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
             return rc;
         }
-        /* POSIX S_IFDIR = 0040000 in the high bits of mode. */
         if ((a.mode & 0170000u) != 0040000u) {
-            pthread_mutex_unlock(&s->backend_mu);
+            pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
             return STM_ENOTDIR;
         }
 
-        /* All checks passed — commit the new cwd under s->mu. */
         pthread_mutex_lock(&s->mu);
-        if (!s->connected) {
+        if (!s->panel[panel_idx].connected) {
             pthread_mutex_unlock(&s->mu);
-            pthread_mutex_unlock(&s->backend_mu);
-            return STM_EBACKEND;  /* not connected — descend has no target */
+            pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
+            return STM_EBACKEND;
         }
         memcpy(s->panel[panel_idx].path, target_path, target_path_len);
         s->panel[panel_idx].path[target_path_len] = '\0';
         s->panel[panel_idx].path_len = target_path_len;
         s->panel[panel_idx].cursor = 0u;
+        /* SLATE-4a: cwd changed → invalidate cached entries_count. */
+        s->panel[panel_idx].entries_count = 0u;
         /* SLATE-3c-selection: cwd change invalidates selection
          * indices (they referenced the old directory's entries). */
         memset(s->panel[panel_idx].selection, 0,
@@ -2909,7 +3023,7 @@ static stm_status descend_panel(stm_slate *s, int panel_idx)
         pthread_mutex_unlock(&s->mu);
     }
 
-    pthread_mutex_unlock(&s->backend_mu);
+    pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
     return STM_OK;
 }
 
@@ -2940,9 +3054,12 @@ static stm_status lopen_panel_entries(stm_slate *s, uint32_t fid,
 
     uint8_t *body = NULL;
     uint32_t body_len = 0;
+    uint32_t entries_count = 0u;
 
     if (path_len > 0) {
-        stm_status rc = panel_entries_render(s, path, &body, &body_len);
+        stm_status rc = panel_entries_render(s, panel_idx, path,
+                                                  &body, &body_len,
+                                                  &entries_count);
         if (rc != STM_OK) {
             free(body);
             return rc;
@@ -2959,6 +3076,11 @@ static stm_status lopen_panel_entries(stm_slate *s, uint32_t fid,
     }
     ss->bulk_buf = body;
     ss->bulk_len = body_len;
+    /* SLATE-4a: cache the rendered entries-count for slate-side
+     * cursor clamp (verb_key_down). Updated even when entries_count
+     * == 0 (empty dir) so a fresh-disconnect → fresh-attach sequence
+     * forgets stale counts from before. */
+    s->panel[panel_idx].entries_count = entries_count;
     pthread_mutex_unlock(&s->mu);
     return STM_OK;
 }
@@ -3105,6 +3227,18 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
         if (str_eq(name, name_len, "socket"))          target = SLATE_KIND_CONN_SOCKET;
         else if (str_eq(name, name_len, "connected"))  target = SLATE_KIND_CONN_CONNECTED;
         else if (str_eq(name, name_len, "attach"))     target = SLATE_KIND_CONN_ATTACH;
+        else if (str_eq(name, name_len, "left"))       target = SLATE_KIND_CONN_L_DIR;
+        else if (str_eq(name, name_len, "right"))      target = SLATE_KIND_CONN_R_DIR;
+        break;
+    case SLATE_KIND_CONN_L_DIR:
+        if (str_eq(name, name_len, "socket"))          target = SLATE_KIND_CONN_L_SOCKET;
+        else if (str_eq(name, name_len, "connected"))  target = SLATE_KIND_CONN_L_CONNECTED;
+        else if (str_eq(name, name_len, "attach"))     target = SLATE_KIND_CONN_L_ATTACH;
+        break;
+    case SLATE_KIND_CONN_R_DIR:
+        if (str_eq(name, name_len, "socket"))          target = SLATE_KIND_CONN_R_SOCKET;
+        else if (str_eq(name, name_len, "connected"))  target = SLATE_KIND_CONN_R_CONNECTED;
+        else if (str_eq(name, name_len, "attach"))     target = SLATE_KIND_CONN_R_ATTACH;
         break;
     case SLATE_KIND_PANELS_DIR:
         if (str_eq(name, name_len, "left"))            target = SLATE_KIND_PANEL_L_DIR;
@@ -3239,7 +3373,23 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
         if (rc != STM_OK) return rc;
         rc = emit_entry(SLATE_KIND_CONN_CONNECTED, &em);
         if (rc != STM_OK) return rc;
-        return emit_entry(SLATE_KIND_CONN_ATTACH, &em);
+        rc = emit_entry(SLATE_KIND_CONN_ATTACH, &em);
+        if (rc != STM_OK) return rc;
+        rc = emit_entry(SLATE_KIND_CONN_L_DIR, &em);
+        if (rc != STM_OK) return rc;
+        return emit_entry(SLATE_KIND_CONN_R_DIR, &em);
+    case SLATE_KIND_CONN_L_DIR:
+        rc = emit_entry(SLATE_KIND_CONN_L_SOCKET, &em);
+        if (rc != STM_OK) return rc;
+        rc = emit_entry(SLATE_KIND_CONN_L_CONNECTED, &em);
+        if (rc != STM_OK) return rc;
+        return emit_entry(SLATE_KIND_CONN_L_ATTACH, &em);
+    case SLATE_KIND_CONN_R_DIR:
+        rc = emit_entry(SLATE_KIND_CONN_R_SOCKET, &em);
+        if (rc != STM_OK) return rc;
+        rc = emit_entry(SLATE_KIND_CONN_R_CONNECTED, &em);
+        if (rc != STM_OK) return rc;
+        return emit_entry(SLATE_KIND_CONN_R_ATTACH, &em);
     case SLATE_KIND_PANELS_DIR:
         rc = emit_entry(SLATE_KIND_PANEL_L_DIR, &em);
         if (rc != STM_OK) return rc;
@@ -3452,10 +3602,22 @@ static stm_status vops_lopen(void *ctx, uint32_t fid, uint64_t qid_path,
         rc = materialize_log_tail_locked(s, ss);
         break;
     case SLATE_KIND_CONN_SOCKET:
-        rc = materialize_conn_socket_locked(s, ss);
+        rc = materialize_conn_socket_locked(s, ss, SLATE_PANEL_LEFT);
         break;
     case SLATE_KIND_CONN_CONNECTED:
-        rc = materialize_conn_connected_locked(s, ss);
+        rc = materialize_conn_connected_locked(s, ss, SLATE_PANEL_LEFT);
+        break;
+    case SLATE_KIND_CONN_L_SOCKET:
+        rc = materialize_conn_socket_locked(s, ss, SLATE_PANEL_LEFT);
+        break;
+    case SLATE_KIND_CONN_L_CONNECTED:
+        rc = materialize_conn_connected_locked(s, ss, SLATE_PANEL_LEFT);
+        break;
+    case SLATE_KIND_CONN_R_SOCKET:
+        rc = materialize_conn_socket_locked(s, ss, SLATE_PANEL_RIGHT);
+        break;
+    case SLATE_KIND_CONN_R_CONNECTED:
+        rc = materialize_conn_connected_locked(s, ss, SLATE_PANEL_RIGHT);
         break;
     case SLATE_KIND_PANEL_L_PATH:
         rc = materialize_panel_path_locked(s, ss, SLATE_PANEL_LEFT);
@@ -3653,20 +3815,26 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         *out_written = len;
         return STM_OK;
     }
-    if (k == SLATE_KIND_CONN_ATTACH) {
-        /* SLATE-2: write a stratumd socket path to dial; empty body
-         * (or whitespace-stripped empty) disconnects. R101 P2-2
-         * carry: zero-byte writes are NOT refused — empty payload is
-         * the documented disconnect verb. Bound the input at
-         * STM_SLATE_SOCKET_MAX. */
+    if (k == SLATE_KIND_CONN_ATTACH ||
+        k == SLATE_KIND_CONN_L_ATTACH ||
+        k == SLATE_KIND_CONN_R_ATTACH) {
+        /* SLATE-2 + SLATE-4a: write a stratumd socket path to dial;
+         * empty body disconnects. The top-level /connection/attach
+         * routes to panel 0 (LEFT) for back-compat; the per-panel
+         * /connection/{left,right}/attach surfaces are the canonical
+         * SLATE-4a forms. R101 P2-2 carry: zero-byte writes ARE
+         * accepted on attach (documented disconnect verb). */
         if (len > STM_SLATE_SOCKET_MAX) return STM_EINVAL;
         size_t l = len;
         if (l > 0 && ((const char *)buf)[l - 1] == '\n') l--;
+        int target_panel = (k == SLATE_KIND_CONN_R_ATTACH)
+                              ? SLATE_PANEL_RIGHT : SLATE_PANEL_LEFT;
         stm_status rc;
         if (l == 0) {
-            rc = stm_slate_disconnect(s);
+            rc = stm_slate_disconnect_panel(s, target_panel);
         } else {
-            rc = stm_slate_attach(s, (const char *)buf, l);
+            rc = stm_slate_attach_panel(s, target_panel,
+                                            (const char *)buf, l);
         }
         if (rc != STM_OK) return rc;
         *out_written = len;

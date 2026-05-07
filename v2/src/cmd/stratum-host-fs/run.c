@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -98,6 +99,32 @@ static uint32_t decode_le32(const uint8_t *p)
          | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+/* SWISS-4a R128 forward note: host-fs is now CONCURRENT-accept (one
+ * pthread per accepted client). The dual-pane TUI's "no-arg → both
+ * panels at CWD" mode opens TWO connections to the same host-fs;
+ * with the prior serial-accept regime, the second panel's dial
+ * blocked forever (host-fs was busy serving the first panel).
+ *
+ * Worker discipline:
+ *   - Each connection thread is DETACHED (not joined): host-fs has
+ *     no ordered-shutdown contract with workers (unlike slate which
+ *     has /redraw blockers needing wakeup); workers exit naturally
+ *     on EOF/error and the OS reclaims their stacks.
+ *   - SIGINT/SIGTERM are blocked in workers (R113 P1-1 carry):
+ *     signals route to the accept thread which observes g_stop_flag.
+ *   - On daemon shutdown, the accept loop exits via g_stop_flag;
+ *     in-flight workers continue serving their connections until
+ *     EOF, then exit. We don't track them in a slot table because
+ *     host-fs is read-only and worker pthreads have no shared state
+ *     beyond the host_fs handle (stm_host_fs_create per worker). */
+
+typedef struct {
+    int          client_fd;
+    char        *root_path;       /* heap-owned NUL-terminated dup */
+    uint32_t     msize_max;
+    uint32_t     idle_ms;
+} host_fs_worker_ctx;
+
 static stm_status serve_one(int client_fd, const char *root_path,
                               uint32_t msize_max)
 {
@@ -164,6 +191,24 @@ static void usage(const char *argv0)
         "                          can't be resolved (TESTING ONLY).\n"
         "  -h, --help              This message.\n",
         argv0);
+}
+
+/* SWISS-4a worker: serves one connection then frees ctx + closes fd. */
+static void *host_fs_worker(void *arg)
+{
+    host_fs_worker_ctx *ctx = arg;
+    if (ctx->idle_ms > 0u) {
+        struct timeval tv;
+        tv.tv_sec  = (time_t)(ctx->idle_ms / 1000u);
+        tv.tv_usec = (suseconds_t)((ctx->idle_ms % 1000u) * 1000u);
+        (void)setsockopt(ctx->client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        (void)setsockopt(ctx->client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    }
+    (void)serve_one(ctx->client_fd, ctx->root_path, ctx->msize_max);
+    close(ctx->client_fd);
+    free(ctx->root_path);
+    free(ctx);
+    return NULL;
 }
 
 int stm_cmd_host_fs_main(int argc, char **argv)
@@ -261,6 +306,16 @@ int stm_cmd_host_fs_main(int argc, char **argv)
         "stratum-host-fs: serving %s on %s (msize=%u, idle=%ums)\n",
         root_path, socket_path, msize, idle_ms);
 
+    /* SWISS-4a: signal mask discipline — block SIGINT/SIGTERM/SIGHUP/
+     * SIGQUIT in workers so signals route to the accept thread (R113
+     * P1-1 carry). Saved + restored around pthread_create. */
+    sigset_t worker_block;
+    sigemptyset(&worker_block);
+    sigaddset(&worker_block, SIGINT);
+    sigaddset(&worker_block, SIGTERM);
+    sigaddset(&worker_block, SIGHUP);
+    sigaddset(&worker_block, SIGQUIT);
+
     while (!atomic_load_explicit(&g_stop_flag, memory_order_acquire)) {
         int client_fd = accept(listen_fd, NULL, NULL);
         if (client_fd < 0) {
@@ -298,16 +353,38 @@ int stm_cmd_host_fs_main(int argc, char **argv)
         }
         (void)peer_uid; (void)peer_gid;
 
-        if (idle_ms > 0u) {
-            struct timeval tv;
-            tv.tv_sec  = (time_t)(idle_ms / 1000u);
-            tv.tv_usec = (suseconds_t)((idle_ms % 1000u) * 1000u);
-            (void)setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-            (void)setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+        /* SWISS-4a: spawn a worker pthread per connection. */
+        host_fs_worker_ctx *ctx = malloc(sizeof *ctx);
+        if (!ctx) {
+            close(client_fd);
+            continue;
         }
+        ctx->client_fd = client_fd;
+        ctx->root_path = strdup(root_path);
+        if (!ctx->root_path) {
+            close(client_fd);
+            free(ctx);
+            continue;
+        }
+        ctx->msize_max = msize;
+        ctx->idle_ms   = idle_ms;
 
-        (void)serve_one(client_fd, root_path, msize);
-        close(client_fd);
+        pthread_t tid;
+        sigset_t prev_mask;
+        (void)pthread_sigmask(SIG_BLOCK, &worker_block, &prev_mask);
+        int prc = pthread_create(&tid, NULL, host_fs_worker, ctx);
+        (void)pthread_sigmask(SIG_SETMASK, &prev_mask, NULL);
+        if (prc != 0) {
+            fprintf(stderr,
+                "stratum-host-fs: pthread_create failed (rc=%d)\n", prc);
+            close(client_fd);
+            free(ctx->root_path);
+            free(ctx);
+            continue;
+        }
+        /* Detach: host-fs has no ordered-shutdown contract with
+         * workers; they exit on EOF/error, OS reclaims stacks. */
+        (void)pthread_detach(tid);
     }
 
     close(listen_fd);
