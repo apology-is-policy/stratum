@@ -29,6 +29,7 @@
 #include <stratum/types.h>
 
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -63,6 +64,20 @@ static void install_signal_handlers(void)
     si.sa_handler = SIG_IGN;
     sigemptyset(&si.sa_mask);
     (void)sigaction(SIGPIPE, &si, NULL);
+
+    /* SWISS-4l (user-reported 2026-05-08 lost-data-on-TUI-close):
+     * Rust embed.rs blocks SIGINT/SIGTERM at startup for sigwait, then
+     * fork+exec's daemons. Children inherit the BLOCKED mask. Without
+     * this unblock, SIGTERM sent by the parent's teardown is queued
+     * but never delivered → stratumd runs past the 1s grace → SIGKILL
+     * → stm_fs_unmount never runs → final stm_sync_commit never
+     * runs → all writes since the last sync are lost. Explicitly
+     * unblock so stratumd shuts down cleanly under any parent. */
+    sigset_t unblock;
+    sigemptyset(&unblock);
+    sigaddset(&unblock, SIGINT);
+    sigaddset(&unblock, SIGTERM);
+    (void)pthread_sigmask(SIG_UNBLOCK, &unblock, NULL);
 }
 
 static void usage(const char *argv0)

@@ -59,6 +59,14 @@ static void install_signal_handlers(void)
     si.sa_handler = SIG_IGN;
     sigemptyset(&si.sa_mask);
     (void)sigaction(SIGPIPE, &si, NULL);
+
+    /* SWISS-4l: see stratumd/run.c — children inherit BLOCKED SIGTERM
+     * from the embed.rs Rust parent and never unblock without this. */
+    sigset_t unblock;
+    sigemptyset(&unblock);
+    sigaddset(&unblock, SIGINT);
+    sigaddset(&unblock, SIGTERM);
+    (void)pthread_sigmask(SIG_UNBLOCK, &unblock, NULL);
 }
 
 static int read_full(int fd, void *buf, size_t len)

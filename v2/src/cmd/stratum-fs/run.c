@@ -770,23 +770,24 @@ typedef struct {
     const char *name;
     cmd_fn      fn;
     const char *brief;
+    bool        mutates;       /* SWISS-4l: auto-fsync after success */
 } cmd_entry;
 
 static const cmd_entry CMDS[] = {
-    { "ls",       cmd_ls,       "list directory entries" },
-    { "stat",     cmd_stat,     "show inode metadata" },
-    { "read",     cmd_read,     "write file contents to stdout" },
-    { "write",    cmd_write,    "write stdin to file (creates / truncates)" },
-    { "mkdir",    cmd_mkdir,    "create directory" },
-    { "create",   cmd_create,   "create empty file (touch)" },
-    { "rm",       cmd_rm,       "remove file" },
-    { "rmdir",    cmd_rmdir,    "remove empty directory" },
-    { "chmod",    cmd_chmod,    "change permission bits (octal)" },
-    { "mv",       cmd_mv,       "rename" },
-    { "ln",       cmd_ln,       "hard link" },
-    { "lns",      cmd_lns,      "symbolic link" },
-    { "readlink", cmd_readlink, "read symlink target" },
-    { "sync",     cmd_sync,     "fsync (whole-pool commit)" },
+    { "ls",       cmd_ls,       "list directory entries",                        false },
+    { "stat",     cmd_stat,     "show inode metadata",                           false },
+    { "read",     cmd_read,     "write file contents to stdout",                 false },
+    { "write",    cmd_write,    "write stdin to file (creates / truncates)",     true  },
+    { "mkdir",    cmd_mkdir,    "create directory",                              true  },
+    { "create",   cmd_create,   "create empty file (touch)",                     true  },
+    { "rm",       cmd_rm,       "remove file",                                   true  },
+    { "rmdir",    cmd_rmdir,    "remove empty directory",                        true  },
+    { "chmod",    cmd_chmod,    "change permission bits (octal)",                true  },
+    { "mv",       cmd_mv,       "rename",                                        true  },
+    { "ln",       cmd_ln,       "hard link",                                     true  },
+    { "lns",      cmd_lns,      "symbolic link",                                 true  },
+    { "readlink", cmd_readlink, "read symlink target",                           false },
+    { "sync",     cmd_sync,     "fsync (whole-pool commit)",                     false },
 };
 
 #define N_CMDS (sizeof(CMDS) / sizeof(CMDS[0]))
@@ -846,14 +847,14 @@ int stm_cmd_fs_main(int argc, char **argv)
     }
 
     /* Look up subcommand. */
-    cmd_fn fn = NULL;
+    const cmd_entry *entry = NULL;
     for (size_t i = 0; i < N_CMDS; i++) {
         if (strcmp(subcmd, CMDS[i].name) == 0) {
-            fn = CMDS[i].fn;
+            entry = &CMDS[i];
             break;
         }
     }
-    if (!fn) {
+    if (!entry) {
         fprintf(stderr, "stratum-fs: unknown command %s\n", subcmd);
         print_usage();
         return EXIT_USAGE;
@@ -862,7 +863,42 @@ int stm_cmd_fs_main(int argc, char **argv)
     /* Open connection + dispatch. */
     stm_9p_client *c = open_connection(socket_path);
     if (!c) return EXIT_IO;
-    int rc = fn(c, argc - argi, argv + argi);
+    int rc = entry->fn(c, argc - argi, argv + argi);
+
+    /* SWISS-4l (user-reported 2026-05-08 lost-data-on-TUI-close +
+     * user request "flush after a completed operation"): every
+     * mutating subcommand gets an automatic Tfsync at the end. The
+     * server routes Tfsync to whole-pool stm_fs_commit, so a single
+     * call after the mutation makes the entire write durable on disk.
+     *
+     * This guarantees that every successful `stratum fs <mutator>`
+     * invocation leaves the volume in a state recoverable across:
+     *   - clean stratumd shutdown (already worked before, now reliable)
+     *   - SIGKILL of stratumd (data still lands because each mutating
+     *     CLI call has already issued a Tfsync that committed the
+     *     three-phase sync to disk)
+     *   - host crash (the last successful CLI call is the recovery
+     *     boundary; partial in-flight writes still under torn-write
+     *     recovery from the superblock + Merkle root)
+     *
+     * Cost: one extra round-trip + a 3-phase sync per mutating CLI
+     * call. For batch ops (multi-select F5) this is N syncs for N
+     * items. v1.0 acceptable; SWISS-4d2's BackendClient could batch
+     * the syncs if performance matters.
+     *
+     * Skipped on rc != 0 — the mutation didn't complete, no point
+     * forcing a sync. */
+    if (rc == 0 && entry->mutates) {
+        stm_status srv = stm_9p_fsync(c, ROOT_FID, /*datasync=*/0);
+        if (srv != STM_OK) {
+            fprintf(stderr,
+                "stratum-fs: post-op sync failed: status=%d "
+                "(your write succeeded but is NOT yet durable on disk)\n",
+                (int)srv);
+            rc = EXIT_IO;
+        }
+    }
+
     stm_9p_close(c);
     return rc;
 }

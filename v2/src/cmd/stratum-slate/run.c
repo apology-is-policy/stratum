@@ -91,6 +91,22 @@ static void install_signal_handlers(void)
     si.sa_handler = SIG_IGN;
     sigemptyset(&si.sa_mask);
     (void)sigaction(SIGPIPE, &si, NULL);
+
+    /* SWISS-4l (user-reported 2026-05-08 lost-data-on-TUI-close):
+     * the Rust embed.rs parent blocks SIGINT/SIGTERM at startup so its
+     * sigwait can catch them, then spawns daemons via fork+exec. The
+     * children inherit the BLOCKED signal mask. Without this unblock,
+     * SIGTERM sent to slate by the parent's teardown is queued but
+     * never delivered → slate runs past its 1-second grace window →
+     * SIGKILL fires → no graceful shutdown. Explicitly unblock the
+     * shutdown signals after installing handlers so daemons that run
+     * under embed.rs (or any parent with a blocked mask) still respond
+     * to SIGTERM cleanly. */
+    sigset_t unblock;
+    sigemptyset(&unblock);
+    sigaddset(&unblock, SIGINT);
+    sigaddset(&unblock, SIGTERM);
+    (void)pthread_sigmask(SIG_UNBLOCK, &unblock, NULL);
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
