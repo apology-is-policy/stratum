@@ -322,9 +322,29 @@ pub struct LocalDialog {
     pub is_error: bool,
 }
 
+/// SWISS-4j: snapshot of an in-progress CopyBatch for the progress
+/// overlay. Lifted from v1's CopyState shape; per-byte tracking
+/// (throughput sparkline) is forward-noted — current implementation
+/// uses subprocess + std::fs::copy, neither of which exposes a
+/// per-byte callback. File-level progress is the v1.0 surface.
+#[derive(Clone, Debug)]
+pub struct CopyProgress {
+    pub idx: usize,
+    pub total: usize,
+    pub current_name: String,
+    pub copied: usize,
+    pub skipped: usize,
+    pub failed: usize,
+}
+
 // ── main draw ─────────────────────────────────────────────────────────
 
-pub fn render(frame: &mut Frame<'_>, state: &UiState, editor: Option<&EditorState>) {
+pub fn render(
+    frame: &mut Frame<'_>,
+    state: &UiState,
+    editor: Option<&EditorState>,
+    copy_progress: Option<&CopyProgress>,
+) {
     let area = frame.area();
     frame.render_widget(Block::default().style(Style::default().bg(CLR_BG)), area);
 
@@ -370,6 +390,10 @@ pub fn render(frame: &mut Frame<'_>, state: &UiState, editor: Option<&EditorStat
             }
             _ => draw_local_dialog(frame, area, d),
         }
+    } else if let Some(cp) = copy_progress {
+        // SWISS-4j: copy progress overlay. Only when no dialog is up
+        // (a conflict dialog supersedes the progress display).
+        draw_copy_progress(frame, area, cp);
     }
 }
 
@@ -863,6 +887,100 @@ fn draw_local_dialog(frame: &mut Frame<'_>, area: Rect, d: &LocalDialog) {
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }),
         inner,
+    );
+}
+
+// ── SWISS-4j: copy progress overlay ───────────────────────────────────
+//
+// Visual idiom partially lifted from v1's draw_copy_dialog (cyan
+// double-line border, title " Copying ", file label "<name> (N/M)",
+// progress bar). v1's per-byte throughput sparkline is forward-
+// noted — current copy implementations don't surface per-byte
+// progress (subprocess pipe + std::fs::copy with no callback).
+// File-level progress + counters cover the v1 UX hump.
+
+fn draw_copy_progress(frame: &mut Frame<'_>, area: Rect, cp: &CopyProgress) {
+    let w = 64u16.min(area.width.saturating_sub(4));
+    let h = 9u16;
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(dbl_border())
+        .border_style(Style::default().fg(Color::Cyan).bold())
+        .title(Line::from(Span::styled(
+            " Copying ",
+            Style::default().fg(Color::Cyan).bold(),
+        )))
+        .style(Style::default().bg(CLR_POPUP_BG));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // file label
+            Constraint::Length(1), // bar
+            Constraint::Length(1), // counters
+            Constraint::Min(0),
+            Constraint::Length(1), // hint
+        ])
+        .split(inner);
+
+    let label = format!(
+        " {} ({}/{})",
+        sanitize_for_display(&cp.current_name),
+        cp.idx + 1,
+        cp.total
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            label,
+            Style::default().fg(Color::White).bold(),
+        ))),
+        rows[0],
+    );
+
+    // Progress bar (file-level). Aggregate "items completed" /
+    // "items total".
+    let bw = (rows[1].width as usize).saturating_sub(2);
+    let pct = if cp.total > 0 {
+        cp.idx * 100 / cp.total
+    } else {
+        0
+    };
+    let filled = if cp.total > 0 { bw * cp.idx / cp.total } else { 0 };
+    let bar = format!(
+        " {}{} ",
+        "\u{2588}".repeat(filled),
+        "\u{2591}".repeat(bw - filled)
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(bar, Style::default().fg(Color::Cyan))),
+        rows[1],
+    );
+
+    let counters = format!(
+        " {pct:>3}% · {} copied · {} skipped · {} failed",
+        cp.copied, cp.skipped, cp.failed
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            counters,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[2],
+    );
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " [Esc] cancel batch · per-byte progress forward-noted",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[4],
     );
 }
 

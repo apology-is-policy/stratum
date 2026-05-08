@@ -107,8 +107,8 @@ enum DeleteItem {
 use crate::editor::EditorState;
 use crate::slate::{read_lines, read_text_trim, SlateClient};
 use crate::spawn::{BackendMeta, SpawnCtx};
-use crate::ui::{self, ConfirmAction, LocalDialog, LocalDialogKind, MkVolCompress,
-                MkVolField, MkVolState, PanelView, UiState};
+use crate::ui::{self, ConfirmAction, CopyProgress, LocalDialog, LocalDialogKind,
+                MkVolCompress, MkVolField, MkVolState, PanelView, UiState};
 
 pub struct Opts {
     pub slate_sock: PathBuf,
@@ -263,7 +263,26 @@ fn run_ui(
             if !snapshot.editor_active && editor.is_some() {
                 editor = None;
             }
-            terminal.draw(|frame| ui::render(frame, &snapshot, editor.as_ref()))?;
+            // SWISS-4j: build a CopyProgress snapshot when a batch
+            // is in flight so the renderer can overlay file-level
+            // progress.
+            let cp_snapshot: Option<CopyProgress> = copy_batch.as_ref().map(|b| {
+                let current_name = b.items.get(b.idx)
+                    .and_then(|(_src, dst, _is_dir)| dst.file_name()
+                        .map(|s| s.to_string_lossy().into_owned()))
+                    .unwrap_or_default();
+                CopyProgress {
+                    idx: b.idx,
+                    total: b.items.len(),
+                    current_name,
+                    copied: b.copied,
+                    skipped: b.skipped,
+                    failed: b.failed,
+                }
+            });
+            terminal.draw(|frame| {
+                ui::render(frame, &snapshot, editor.as_ref(), cp_snapshot.as_ref())
+            })?;
             loop {
                 if event::poll(Duration::from_millis(100))? {
                     match event::read()? {
@@ -336,6 +355,25 @@ fn handle_key(
     }
     if matches!(key.code, KeyCode::F(10)) {
         return Ok(Action::Quit);
+    }
+    // SWISS-4j: Esc cancels an in-progress batch (no dialog, no
+    // editor). Marks remaining items as skipped via the conflict
+    // resolution channel; the batch's next tick observes Done.
+    if matches!(key.code, KeyCode::Esc) {
+        if copy_batch.is_some() {
+            CONFLICT_RESP.with(|c| {
+                *c.borrow_mut() = Some(ConflictResp {
+                    policy: None,
+                    sticky: false,
+                    cancel: true,
+                });
+            });
+            return Ok(Action::Refresh);
+        }
+        if delete_batch.is_some() {
+            DELETE_CANCEL.with(|c| c.set(true));
+            return Ok(Action::Refresh);
+        }
     }
     match key.code {
         KeyCode::Tab => {
@@ -2029,14 +2067,15 @@ fn advance_copy_batch(
     // Conflict path. dst exists?
     let dst_exists = match (&batch.dst_meta, &batch.dst_sock) {
         (BackendMeta::HostFs { .. }, _) => dst.exists(),
-        (BackendMeta::Stratumd { .. }, Some(_sock)) => {
-            // Probe via `stratum fs ls` on parent — too expensive
-            // per file. Instead, attempt the write/mkdir and let
-            // it fail on EEXIST. We check exists() for HOST dst
-            // only; stratum dst's "exists" check is the write's
-            // own EEXIST behaviour. v1.0 caveat: stratum-side
-            // conflicts surface as plain errors counted as failed.
-            false
+        (BackendMeta::Stratumd { .. }, Some(sock)) => {
+            // SWISS-4j: stratum-side dst exists-probe via `stratum
+            // fs stat`. stat exits 0 iff the path is reachable
+            // (file or dir). Adds one subprocess per item to the
+            // batch — measurable but acceptable; SWISS-4d2's Rust
+            // BackendClient could replace this with an in-process
+            // Twalk + Tgetattr.
+            let p9 = path_to_p9(&dst, &batch.dst_meta);
+            stratum_path_exists(sp, sock, &p9)
         }
         _ => false,
     };
@@ -2186,6 +2225,20 @@ fn perform_copy_one(
         }
         _ => Err(io::Error::new(io::ErrorKind::Other, "panel not connected")),
     }
+}
+
+/// SWISS-4j: probe whether a stratum path exists. Returns true iff
+/// `stratum fs stat <p9>` exits cleanly. Used by advance_copy_batch
+/// to surface conflict dialogs for stratum-side dsts. One subprocess
+/// per batch item — acceptable for v1.0 batches; SWISS-4d2 will
+/// replace with in-process Twalk + Tgetattr.
+fn stratum_path_exists(sp: &Arc<SpawnCtx>, sock: &Path, p9_path: &str) -> bool {
+    sp.run_stratum_fs(
+        sock,
+        &["stat", p9_path],
+        std::process::Stdio::null(),
+        std::process::Stdio::null(),
+    ).is_ok()
 }
 
 /// Convert a host PathBuf back to a 9P path relative to the panel's
