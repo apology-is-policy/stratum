@@ -21,6 +21,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -348,8 +349,21 @@ typedef struct {
 
 static void *stratumd_fs_worker(void *arg)
 {
+    /* SWISS-4g R128 (next round) carry: signal-mask discipline
+     * applied INSIDE the worker rather than churning the accept
+     * thread's mask around pthread_create — same outcome (worker's
+     * mask gets the 4 fatal signals blocked before it does any
+     * work) without disturbing the accept thread's signal state.
+     * (R113 P1-1 doctrine carry.) */
+    sigset_t block;
+    sigemptyset(&block);
+    sigaddset(&block, SIGINT);
+    sigaddset(&block, SIGTERM);
+    sigaddset(&block, SIGHUP);
+    sigaddset(&block, SIGQUIT);
+    (void)pthread_sigmask(SIG_BLOCK, &block, NULL);
+
     stratumd_fs_worker_ctx *ctx = arg;
-    /* serve_client closes client_fd internally. */
     (void)stm_stratumd_serve_client(ctx->client_fd, ctx->fs,
                                         ctx->peer_uid, ctx->peer_gid,
                                         ctx->msize_max, ctx->root_dataset,
@@ -370,25 +384,33 @@ stm_status stm_stratumd_accept_loop(int listen_fd, stm_fs *fs,
     if (idle_timeout_ms == 0u)
         idle_timeout_ms = STM_STRATUMD_DEFAULT_IDLE_MS;
 
-    /* SWISS-4g: signal-mask discipline (R113 P1-1 carry from
-     * stratumd's /ctl/ + slate's accept loops). Block SIGINT/
-     * SIGTERM/SIGHUP/SIGQUIT in workers so signals route to the
-     * accept thread which observes stop_flag. */
-    sigset_t worker_block;
-    sigemptyset(&worker_block);
-    sigaddset(&worker_block, SIGINT);
-    sigaddset(&worker_block, SIGTERM);
-    sigaddset(&worker_block, SIGHUP);
-    sigaddset(&worker_block, SIGQUIT);
-
     while (1) {
         if (stop_flag && atomic_load_explicit(stop_flag,
                                                   memory_order_acquire))
             break;
 
+        /* SWISS-4g: poll-then-accept. macOS's `shutdown(unix-listen-
+         * sock, SHUT_RDWR)` does not reliably unblock a long-blocked
+         * accept() (the kernel doesn't propagate the shutdown event
+         * through the AF_UNIX listen path on Darwin). We poll with a
+         * 200ms timeout and re-check stop_flag between iterations.
+         * shutdown still works via the POLLERR/POLLHUP path on the
+         * pollfd. Discovered while debugging test_9p_socket hangs
+         * after adding concurrent-accept (user 2026-05-08). */
+        struct pollfd pfd = { listen_fd, POLLIN, 0 };
+        int prc = poll(&pfd, 1, /*timeout_ms=*/200);
+        if (prc < 0) {
+            if (errno == EINTR) continue;
+            return STM_EBACKEND;
+        }
+        if (prc == 0) continue;
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) break;
+        if (!(pfd.revents & POLLIN)) continue;
+
         int client_fd = accept(listen_fd, NULL, NULL);
         if (client_fd < 0) {
             if (errno == EINTR || errno == ECONNABORTED) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
             if (stop_flag && atomic_load_explicit(stop_flag,
                                                       memory_order_acquire))
                 break;
@@ -432,13 +454,10 @@ stm_status stm_stratumd_accept_loop(int listen_fd, stm_fs *fs,
         ctx->idle_timeout_ms = idle_timeout_ms;
 
         pthread_t tid;
-        sigset_t prev_mask;
-        (void)pthread_sigmask(SIG_BLOCK, &worker_block, &prev_mask);
-        int prc = pthread_create(&tid, NULL, stratumd_fs_worker, ctx);
-        (void)pthread_sigmask(SIG_SETMASK, &prev_mask, NULL);
-        if (prc != 0) {
+        int wprc = pthread_create(&tid, NULL, stratumd_fs_worker, ctx);
+        if (wprc != 0) {
             fprintf(stderr,
-                "stratumd: pthread_create failed (rc=%d)\n", prc);
+                "stratumd: pthread_create failed (rc=%d)\n", wprc);
             close(client_fd);
             free(ctx);
             continue;
@@ -586,9 +605,28 @@ stm_status stm_stratumd_accept_ctl_loop(int listen_fd, stm_ctl *ctl,
                                                   memory_order_acquire))
             break;
 
+        /* SWISS-4g: poll-then-accept. macOS's `shutdown(unix-listen-
+         * sock, SHUT_RDWR)` does not reliably unblock a long-blocked
+         * accept() (the kernel doesn't propagate the shutdown event
+         * through the AF_UNIX listen path on Darwin). We poll with a
+         * 200ms timeout and re-check stop_flag between iterations.
+         * shutdown still works via the POLLERR/POLLHUP path on the
+         * pollfd. Discovered while debugging test_9p_socket hangs
+         * after adding concurrent-accept (user 2026-05-08). */
+        struct pollfd pfd = { listen_fd, POLLIN, 0 };
+        int prc = poll(&pfd, 1, /*timeout_ms=*/200);
+        if (prc < 0) {
+            if (errno == EINTR) continue;
+            return STM_EBACKEND;
+        }
+        if (prc == 0) continue;
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) break;
+        if (!(pfd.revents & POLLIN)) continue;
+
         int client_fd = accept(listen_fd, NULL, NULL);
         if (client_fd < 0) {
             if (errno == EINTR || errno == ECONNABORTED) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
             if (stop_flag && atomic_load_explicit(stop_flag,
                                                       memory_order_acquire))
                 break;
