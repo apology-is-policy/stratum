@@ -205,6 +205,102 @@ impl SpawnCtx {
         children.clear();
     }
 
+    /// SWISS-4g: dial the slate socket via SlateClient for ad-hoc
+    /// panel-state reads (e.g. /connection/right/socket). Each call
+    /// opens a fresh connection — slate accepts concurrently.
+    pub fn dial_slate(&self) -> Result<crate::slate::SlateClient> {
+        crate::slate::SlateClient::dial(&self.slate_sock)
+            .map_err(|e| anyhow!(e))
+    }
+
+    /// SWISS-4g: synchronously invoke `stratum fs -s SOCK ARGS`,
+    /// optionally piping a host file as stdin (host→stm write) or
+    /// capturing stdout to a host file (stm→host read). Returns
+    /// captured stderr on non-zero exit.
+    ///
+    /// Used by F7/F8/F5 when the active panel is a stratumd panel —
+    /// the TUI already has the panel's stratumd socket via
+    /// /connection/X/socket. Subprocess invocation lets us reuse
+    /// the C-side `stratum fs` CLI without writing a Rust 9P client
+    /// (forward-noted as SWISS-4d2 for performance-sensitive paths).
+    pub fn run_stratum_fs(
+        &self,
+        socket: &Path,
+        args: &[&str],
+        stdin: std::process::Stdio,
+        stdout: std::process::Stdio,
+    ) -> Result<()> {
+        use std::os::unix::process::CommandExt;
+        let sock_str = socket
+            .to_str()
+            .ok_or_else(|| anyhow!("socket path is not utf-8"))?;
+        let mut full = vec!["fs", "-s", sock_str];
+        full.extend_from_slice(args);
+        let out = Command::new(&self.me)
+            .args(&full)
+            .stdin(stdin)
+            .stdout(stdout)
+            .stderr(std::process::Stdio::piped())
+            .process_group(0)
+            .output()?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            bail!(
+                "stratum fs {:?} failed (exit {}): {}",
+                args,
+                out.status.code().unwrap_or(-1),
+                stderr.lines().next().unwrap_or("(no detail)").trim()
+            );
+        }
+        Ok(())
+    }
+
+    /// SWISS-4g: pipe `stratum fs read SRC` (on src_socket) into
+    /// `stratum fs write DST` (on dst_socket). Used for stm→stm
+    /// copy; both subprocesses run concurrently with their stdouts
+    /// / stdins connected via a kernel pipe.
+    pub fn pipe_stratum_fs(
+        &self,
+        src_socket: &Path,
+        src_path: &str,
+        dst_socket: &Path,
+        dst_path: &str,
+    ) -> Result<()> {
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+        let src_sock_str = src_socket.to_str().ok_or_else(|| anyhow!("src sock not utf-8"))?;
+        let dst_sock_str = dst_socket.to_str().ok_or_else(|| anyhow!("dst sock not utf-8"))?;
+        let mut reader = Command::new(&self.me)
+            .args(&["fs", "-s", src_sock_str, "read", src_path])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()?;
+        let reader_stdout = reader.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
+        let writer = Command::new(&self.me)
+            .args(&["fs", "-s", dst_sock_str, "write", dst_path])
+            .stdin(Stdio::from(reader_stdout))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()?;
+        let reader_status = reader.wait()?;
+        let writer_out = writer.wait_with_output()?;
+        if !reader_status.success() {
+            bail!("stratum fs read failed (exit {})", reader_status.code().unwrap_or(-1));
+        }
+        if !writer_out.status.success() {
+            let stderr = String::from_utf8_lossy(&writer_out.stderr);
+            bail!(
+                "stratum fs write failed (exit {}): {}",
+                writer_out.status.code().unwrap_or(-1),
+                stderr.lines().next().unwrap_or("(no detail)").trim()
+            );
+        }
+        Ok(())
+    }
+
     fn spawn_inner(&self, args: &[String]) -> Result<Child> {
         use std::os::unix::process::CommandExt;
         // Redirect stderr to a per-spawn log file (matching embed.rs's

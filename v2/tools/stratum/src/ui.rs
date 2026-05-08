@@ -179,9 +179,18 @@ pub enum LocalDialogKind {
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub enum ConfirmAction {
-    /// F8: delete cursor entry. host_path resolves to the on-disk
-    /// path (host-fs panel only at v1.0).
+    /// F8 host-fs panel: delete cursor entry. host_path resolves
+    /// to the on-disk path. Recursive directory delete via
+    /// std::fs::remove_dir_all.
     Delete { host_path: std::path::PathBuf, is_dir: bool },
+    /// SWISS-4g: F8 stratum panel: delete via `stratum fs rm`/`rmdir`
+    /// subprocess. Non-recursive at v1.0 (rmdir refuses non-empty);
+    /// recursive forward-noted to SWISS-4d2 (Rust BackendClient).
+    DeleteStratum {
+        socket: std::path::PathBuf,
+        p9_path: String,
+        is_dir: bool,
+    },
     /// F5 conflict resolution: dst exists. The TUI chose to
     /// Skip/Overwrite/KeepBoth and re-runs the copy with the
     /// resolution applied.

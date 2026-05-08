@@ -448,7 +448,7 @@ fn handle_dialog_key(
 /// one (calls into submit_confirm); Esc cancels.
 fn handle_confirm_key(
     local_dialog: &mut Option<LocalDialog>,
-    _spawn: Option<&Arc<SpawnCtx>>,
+    spawn: Option<&Arc<SpawnCtx>>,
     _snap: &UiState,
     key: crossterm::event::KeyEvent,
 ) -> Result<Action> {
@@ -479,7 +479,7 @@ fn handle_confirm_key(
         KeyCode::Enter => {
             let picked_idx = *selected;
             let dialog = local_dialog.take().unwrap();
-            return submit_confirm(local_dialog, dialog, picked_idx);
+            return submit_confirm(local_dialog, spawn, dialog, picked_idx);
         }
         _ => {}
     }
@@ -488,6 +488,7 @@ fn handle_confirm_key(
 
 fn submit_confirm(
     local_dialog: &mut Option<LocalDialog>,
+    spawn: Option<&Arc<SpawnCtx>>,
     dialog: LocalDialog,
     picked_idx: usize,
 ) -> Result<Action> {
@@ -510,6 +511,34 @@ fn submit_confirm(
                     "delete failed: {e}\n  {}",
                     host_path.display()
                 )));
+            }
+            Ok(Action::Refresh)
+        }
+        ConfirmAction::DeleteStratum { socket, p9_path, is_dir } => {
+            if label != "Yes" {
+                return Ok(Action::Refresh);
+            }
+            let sp = match spawn {
+                Some(s) => s,
+                None => {
+                    *local_dialog = Some(error_dialog(
+                        "Cannot delete: spawn helper unavailable.",
+                    ));
+                    return Ok(Action::Refresh);
+                }
+            };
+            // SWISS-4g v1.0: rmdir is non-recursive. Recursive on
+            // stratum forward-noted to SWISS-4d2 (Rust BackendClient
+            // gives us in-process readdir + per-entry unlinkat
+            // without subprocess fan-out).
+            let cmd = if is_dir { "rmdir" } else { "rm" };
+            if let Err(e) = sp.run_stratum_fs(
+                &socket,
+                &[cmd, &p9_path],
+                std::process::Stdio::null(),
+                std::process::Stdio::null(),
+            ) {
+                *local_dialog = Some(error_dialog(&format!("delete: {e}")));
             }
             Ok(Action::Refresh)
         }
@@ -905,37 +934,56 @@ fn submit_dialog(
                 *local_dialog = Some(error_dialog("Name is required."));
                 return Ok(Action::Refresh);
             }
-            // Refuse '/' and control bytes (R130 doctrine carry).
             if name.chars().any(|c| (c as u32) < 0x20 || c == '\u{7F}' || c == '/') {
                 *local_dialog = Some(error_dialog(
                     "Name must not contain '/' or control bytes.",
                 ));
                 return Ok(Action::Refresh);
             }
-            // Resolve panel CWD on disk. host-fs only at v1.0;
-            // stratum forward-noted (SWISS-4d2 BackendClient).
-            let host_root = match sp.panel_meta(panel_idx) {
-                BackendMeta::HostFs { root } => root,
-                _ => {
-                    *local_dialog = Some(error_dialog(
-                        "v1.0 mkdir supports host panels only.\n\
-                         Stratum-panel writes are forward-noted (SWISS-4d2).",
-                    ));
-                    return Ok(Action::Refresh);
-                }
-            };
-            // Resolve dst path: host_root + panel.path + name.
             let cwd = snap.panels[panel_idx].path.trim_start_matches('/');
-            let mut path = host_root.clone();
-            if !cwd.is_empty() {
-                path.push(cwd);
-            }
-            path.push(&name);
-            if let Err(e) = std::fs::create_dir(&path) {
-                *local_dialog = Some(error_dialog(&format!(
-                    "mkdir failed: {e}\n  {}",
-                    path.display()
-                )));
+            // SWISS-4g: dispatch on backend.
+            match sp.panel_meta(panel_idx) {
+                BackendMeta::HostFs { root } => {
+                    let mut path = root.clone();
+                    if !cwd.is_empty() {
+                        path.push(cwd);
+                    }
+                    path.push(&name);
+                    if let Err(e) = std::fs::create_dir(&path) {
+                        *local_dialog = Some(error_dialog(&format!(
+                            "mkdir failed: {e}\n  {}",
+                            path.display()
+                        )));
+                    }
+                }
+                BackendMeta::Stratumd { .. } => {
+                    // stratum fs -s SOCK mkdir <9p_path>
+                    let sock = match panel_socket_for(snap, sp, panel_idx) {
+                        Some(s) => s,
+                        None => {
+                            *local_dialog = Some(error_dialog(
+                                "Stratum panel has no socket recorded.",
+                            ));
+                            return Ok(Action::Refresh);
+                        }
+                    };
+                    let p9_path = if cwd.is_empty() {
+                        format!("/{name}")
+                    } else {
+                        format!("/{cwd}/{name}")
+                    };
+                    if let Err(e) = sp.run_stratum_fs(
+                        &sock,
+                        &["mkdir", &p9_path],
+                        std::process::Stdio::null(),
+                        std::process::Stdio::null(),
+                    ) {
+                        *local_dialog = Some(error_dialog(&format!("mkdir: {e}")));
+                    }
+                }
+                BackendMeta::None => {
+                    *local_dialog = Some(error_dialog("Panel not connected."));
+                }
             }
             Ok(Action::Refresh)
         }
@@ -1112,20 +1160,7 @@ fn run_copy(
     let src_meta = sp.panel_meta(active);
     let dst_meta = sp.panel_meta(inactive);
 
-    let (src_root, dst_root) = match (&src_meta, &dst_meta) {
-        (BackendMeta::HostFs { root: s }, BackendMeta::HostFs { root: d }) => {
-            (s.clone(), d.clone())
-        }
-        _ => {
-            *local_dialog = Some(error_dialog(
-                "v1.0 copy supports host→host only.\n\
-                 Cross-backend routes (host↔stm, stm→stm) are forward-noted (SWISS-4d2).",
-            ));
-            return Ok(Action::Refresh);
-        }
-    };
-
-    // Resolve source: active panel's cursor entry.
+    // Resolve source entry from active panel cursor.
     let panel = &snap.panels[active];
     if !panel.connected {
         *local_dialog = Some(error_dialog("Active panel is not connected."));
@@ -1152,73 +1187,188 @@ fn run_copy(
         }
     };
 
-    let mut src_path = src_root.clone();
+    let is_dir = kind == "d";
     let src_cwd = panel.path.trim_start_matches('/');
-    if !src_cwd.is_empty() {
-        src_path.push(src_cwd);
-    }
-    src_path.push(name);
-
     let dst_panel = &snap.panels[inactive];
-    let mut dst_path = dst_root.clone();
     let dst_cwd = dst_panel.path.trim_start_matches('/');
-    if !dst_cwd.is_empty() {
-        dst_path.push(dst_cwd);
-    }
-    dst_path.push(name);
 
-    if dst_path.exists() {
-        // SWISS-4f conflict dialog. v1's behaviour: prompt
-        // Skip/Overwrite/KeepBoth, then re-run the copy with the
-        // resolution applied. For directories we keep the same set
-        // (Overwrite recursively replaces; KeepBoth appends "-2").
-        let prompt = format!(
-            "Destination exists:\n  {}\n\nResolution?",
-            dst_path.display()
-        );
-        *local_dialog = Some(LocalDialog {
-            kind: LocalDialogKind::Confirm {
-                options: vec!["Skip".into(), "Overwrite".into(), "KeepBoth".into()],
-                selected: 0,
-                on_pick: ConfirmAction::CopyConflict {
-                    src: src_path,
-                    dst: dst_path,
-                    is_dir: kind == "d",
-                },
-            },
-            prompt,
-            value: String::new(),
-            is_password: false,
-            is_error: false,
-        });
-        return Ok(Action::Refresh);
-    }
-
-    // Perform the copy synchronously.
-    let result = if kind == "d" {
-        copy_dir_recursive(&src_path, &dst_path)
-    } else {
-        std::fs::copy(&src_path, &dst_path).map(|_| ())
-    };
-
-    match result {
-        Ok(()) => {
-            *local_dialog = Some(error_dialog(&format!(
-                "Copied:\n  {}\n  → {}",
-                src_path.display(),
-                dst_path.display()
-            )));
+    // SWISS-4g: dispatch on (src, dst) backend pair. Directory
+    // copies across backends are forward-noted (SWISS-4d2 — needs
+    // recursive 9P walks); v1.0 of SWISS-4g supports single files
+    // across all four backend pairs + host→host directories via
+    // std::fs.
+    match (&src_meta, &dst_meta) {
+        (BackendMeta::HostFs { root: s_root }, BackendMeta::HostFs { root: d_root }) => {
+            let mut src = s_root.clone();
+            if !src_cwd.is_empty() { src.push(src_cwd); }
+            src.push(name);
+            let mut dst = d_root.clone();
+            if !dst_cwd.is_empty() { dst.push(dst_cwd); }
+            dst.push(name);
+            if dst.exists() {
+                return open_copy_conflict(local_dialog, src, dst, is_dir);
+            }
+            let res = if is_dir {
+                copy_dir_recursive(&src, &dst)
+            } else {
+                std::fs::copy(&src, &dst).map(|_| ())
+            };
+            match res {
+                Ok(()) => *local_dialog = Some(error_dialog(&format!(
+                    "Copied:\n  {} → {}",
+                    src.display(), dst.display()
+                ))),
+                Err(e) => *local_dialog = Some(error_dialog(&format!("copy: {e}"))),
+            }
             Ok(Action::Refresh)
         }
-        Err(e) => {
-            *local_dialog = Some(error_dialog(&format!(
-                "Copy failed: {e}\n  src: {}\n  dst: {}",
-                src_path.display(),
-                dst_path.display()
-            )));
+        (BackendMeta::HostFs { root: s_root }, BackendMeta::Stratumd { .. }) => {
+            if is_dir {
+                *local_dialog = Some(error_dialog(
+                    "Cross-backend directory copy not yet supported (SWISS-4d2).",
+                ));
+                return Ok(Action::Refresh);
+            }
+            let mut src = s_root.clone();
+            if !src_cwd.is_empty() { src.push(src_cwd); }
+            src.push(name);
+            let dst_p9 = if dst_cwd.is_empty() {
+                format!("/{name}")
+            } else {
+                format!("/{dst_cwd}/{name}")
+            };
+            let dst_sock = match panel_socket_for(snap, sp, inactive) {
+                Some(s) => s,
+                None => {
+                    *local_dialog = Some(error_dialog("dst panel: no socket"));
+                    return Ok(Action::Refresh);
+                }
+            };
+            let f = match std::fs::File::open(&src) {
+                Ok(f) => f,
+                Err(e) => {
+                    *local_dialog = Some(error_dialog(&format!("open src: {e}")));
+                    return Ok(Action::Refresh);
+                }
+            };
+            if let Err(e) = sp.run_stratum_fs(
+                &dst_sock,
+                &["write", &dst_p9],
+                std::process::Stdio::from(f),
+                std::process::Stdio::null(),
+            ) {
+                *local_dialog = Some(error_dialog(&format!("copy host→stm: {e}")));
+            }
+            Ok(Action::Refresh)
+        }
+        (BackendMeta::Stratumd { .. }, BackendMeta::HostFs { root: d_root }) => {
+            if is_dir {
+                *local_dialog = Some(error_dialog(
+                    "Cross-backend directory copy not yet supported (SWISS-4d2).",
+                ));
+                return Ok(Action::Refresh);
+            }
+            let src_sock = match panel_socket_for(snap, sp, active) {
+                Some(s) => s,
+                None => {
+                    *local_dialog = Some(error_dialog("src panel: no socket"));
+                    return Ok(Action::Refresh);
+                }
+            };
+            let src_p9 = if src_cwd.is_empty() {
+                format!("/{name}")
+            } else {
+                format!("/{src_cwd}/{name}")
+            };
+            let mut dst = d_root.clone();
+            if !dst_cwd.is_empty() { dst.push(dst_cwd); }
+            dst.push(name);
+            if dst.exists() {
+                *local_dialog = Some(error_dialog(&format!(
+                    "Destination exists; conflict resolution forward-noted for stm→host:\n  {}",
+                    dst.display()
+                )));
+                return Ok(Action::Refresh);
+            }
+            let f = match std::fs::File::create(&dst) {
+                Ok(f) => f,
+                Err(e) => {
+                    *local_dialog = Some(error_dialog(&format!("create dst: {e}")));
+                    return Ok(Action::Refresh);
+                }
+            };
+            if let Err(e) = sp.run_stratum_fs(
+                &src_sock,
+                &["read", &src_p9],
+                std::process::Stdio::null(),
+                std::process::Stdio::from(f),
+            ) {
+                *local_dialog = Some(error_dialog(&format!("copy stm→host: {e}")));
+            }
+            Ok(Action::Refresh)
+        }
+        (BackendMeta::Stratumd { .. }, BackendMeta::Stratumd { .. }) => {
+            if is_dir {
+                *local_dialog = Some(error_dialog(
+                    "Cross-backend directory copy not yet supported (SWISS-4d2).",
+                ));
+                return Ok(Action::Refresh);
+            }
+            let src_sock = match panel_socket_for(snap, sp, active) {
+                Some(s) => s,
+                None => {
+                    *local_dialog = Some(error_dialog("src panel: no socket"));
+                    return Ok(Action::Refresh);
+                }
+            };
+            let dst_sock = match panel_socket_for(snap, sp, inactive) {
+                Some(s) => s,
+                None => {
+                    *local_dialog = Some(error_dialog("dst panel: no socket"));
+                    return Ok(Action::Refresh);
+                }
+            };
+            let src_p9 = if src_cwd.is_empty() {
+                format!("/{name}")
+            } else {
+                format!("/{src_cwd}/{name}")
+            };
+            let dst_p9 = if dst_cwd.is_empty() {
+                format!("/{name}")
+            } else {
+                format!("/{dst_cwd}/{name}")
+            };
+            if let Err(e) = sp.pipe_stratum_fs(&src_sock, &src_p9, &dst_sock, &dst_p9) {
+                *local_dialog = Some(error_dialog(&format!("copy stm→stm: {e}")));
+            }
+            Ok(Action::Refresh)
+        }
+        _ => {
+            *local_dialog = Some(error_dialog("One or both panels are not connected."));
             Ok(Action::Refresh)
         }
     }
+}
+
+fn open_copy_conflict(
+    local_dialog: &mut Option<LocalDialog>,
+    src: PathBuf,
+    dst: PathBuf,
+    is_dir: bool,
+) -> Result<Action> {
+    let prompt = format!("Destination exists:\n  {}\n\nResolution?", dst.display());
+    *local_dialog = Some(LocalDialog {
+        kind: LocalDialogKind::Confirm {
+            options: vec!["Skip".into(), "Overwrite".into(), "KeepBoth".into()],
+            selected: 0,
+            on_pick: ConfirmAction::CopyConflict { src, dst, is_dir },
+        },
+        prompt,
+        value: String::new(),
+        is_password: false,
+        is_error: false,
+    });
+    Ok(Action::Refresh)
 }
 
 /// SWISS-4f: F8 delete. Resolves the cursor entry's on-disk path
@@ -1236,17 +1386,6 @@ fn run_delete(
         None => {
             *local_dialog = Some(error_dialog(
                 "Delete unavailable: spawn helper unavailable.",
-            ));
-            return Ok(Action::Refresh);
-        }
-    };
-
-    let host_root = match sp.panel_meta(active) {
-        BackendMeta::HostFs { root } => root,
-        _ => {
-            *local_dialog = Some(error_dialog(
-                "v1.0 delete supports host panels only.\n\
-                 Stratum-panel writes are forward-noted (SWISS-4d2).",
             ));
             return Ok(Action::Refresh);
         }
@@ -1278,26 +1417,72 @@ fn run_delete(
         }
     };
 
-    let mut path = host_root.clone();
-    let cwd = panel.path.trim_start_matches('/');
-    if !cwd.is_empty() {
-        path.push(cwd);
-    }
-    path.push(name);
-
     let is_dir = kind == "d";
-    let label = if is_dir { "directory (recursive)" } else { "file" };
-    *local_dialog = Some(LocalDialog {
-        kind: LocalDialogKind::Confirm {
-            options: vec!["Yes".into(), "No".into()],
-            selected: 1,  // safer default: cursor on No
-            on_pick: ConfirmAction::Delete { host_path: path.clone(), is_dir },
-        },
-        prompt: format!("Delete this {label}?\n  {}", path.display()),
-        value: String::new(),
-        is_password: false,
-        is_error: false,
-    });
+    let cwd = panel.path.trim_start_matches('/');
+
+    match sp.panel_meta(active) {
+        BackendMeta::HostFs { root } => {
+            let mut path = root.clone();
+            if !cwd.is_empty() {
+                path.push(cwd);
+            }
+            path.push(name);
+            let label = if is_dir { "directory (recursive)" } else { "file" };
+            *local_dialog = Some(LocalDialog {
+                kind: LocalDialogKind::Confirm {
+                    options: vec!["Yes".into(), "No".into()],
+                    selected: 1,
+                    on_pick: ConfirmAction::Delete { host_path: path.clone(), is_dir },
+                },
+                prompt: format!("Delete this {label}?\n  {}", path.display()),
+                value: String::new(),
+                is_password: false,
+                is_error: false,
+            });
+        }
+        BackendMeta::Stratumd { .. } => {
+            // SWISS-4g: stratum-panel delete. Subprocess via
+            // `stratum fs -s SOCK rm/rmdir`. Recursive directory
+            // delete on stratum is forward-noted (SWISS-4d2).
+            let sock = match panel_socket_for(snap, sp, active) {
+                Some(s) => s,
+                None => {
+                    *local_dialog = Some(error_dialog(
+                        "Stratum panel has no socket recorded.",
+                    ));
+                    return Ok(Action::Refresh);
+                }
+            };
+            let p9_path = if cwd.is_empty() {
+                format!("/{name}")
+            } else {
+                format!("/{cwd}/{name}")
+            };
+            let label = if is_dir {
+                "directory (must be empty at v1.0)"
+            } else {
+                "file"
+            };
+            *local_dialog = Some(LocalDialog {
+                kind: LocalDialogKind::Confirm {
+                    options: vec!["Yes".into(), "No".into()],
+                    selected: 1,
+                    on_pick: ConfirmAction::DeleteStratum {
+                        socket: sock,
+                        p9_path: p9_path.clone(),
+                        is_dir,
+                    },
+                },
+                prompt: format!("Delete this {label}?\n  {p9_path}"),
+                value: String::new(),
+                is_password: false,
+                is_error: false,
+            });
+        }
+        BackendMeta::None => {
+            *local_dialog = Some(error_dialog("Panel not connected."));
+        }
+    }
     Ok(Action::Refresh)
 }
 
@@ -1369,6 +1554,41 @@ fn handle_editor_key(
     let _ = client.write_path("/editor/cursor", cursor_line.as_bytes());
 
     Ok(Action::Refresh)
+}
+
+/// SWISS-4g: resolve the stratumd Unix socket that a panel is
+/// attached to. Used for spawning `stratum fs -s SOCK ...` to
+/// drive stratum-panel mkdir/delete/copy.
+///
+/// Currently we read /connection/{left,right}/socket via a fresh
+/// SlateClient — slate already knows the socket because the TUI
+/// pre-attached it via SpawnCtx::attach_panel. For the LEFT panel
+/// the SpawnCtx::panel_meta also has the volume path, but not the
+/// socket; SLATE-2's /connection/X/socket is the canonical source.
+fn panel_socket_for(
+    snap: &UiState,
+    _spawn: &Arc<SpawnCtx>,
+    panel_idx: usize,
+) -> Option<PathBuf> {
+    // Snapshot already has /connection/left/socket as backend_socket
+    // for panel 0; panel 1's socket isn't currently in UiState. Use
+    // a fresh SlateClient round-trip to get either.
+    let path = if panel_idx == 0 {
+        if !snap.backend_socket.is_empty() {
+            return Some(PathBuf::from(&snap.backend_socket));
+        }
+        "/connection/left/socket"
+    } else {
+        "/connection/right/socket"
+    };
+    let mut client = match _spawn.dial_slate() {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+    crate::slate::read_text_trim(&mut client, path)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
 }
 
 fn default_host_path() -> String {
