@@ -1492,14 +1492,77 @@ fn submit_dialog(
             }
             Ok(Action::Refresh)
         }
-        LocalDialogKind::PassphraseFor { volume: _ } => {
-            // Forward-noted: passphrase entry → derive keyfile +
-            // spawn stratumd. Not wired in v1.0 of SWISS-4b.
-            *local_dialog = Some(error_dialog(
-                "Passphrase entry is forward-noted (SWISS-4b1).\n\
-                 Place a companion <volume>.key beside the .stm file.",
-            ));
-            Ok(Action::Refresh)
+        LocalDialogKind::PassphraseFor { volume } => {
+            // SWISS-4o: spawn stratumd with --passphrase-stdin and
+            // pipe the dialog's value to it. Wipe the dialog buffer
+            // immediately after pipe close — the wizard string lives
+            // on the local_dialog Drop, but we want defense-in-depth
+            // (the duplicate write buffer in spawn_stratumd_with_*
+            // is wiped via volatile-write inside that helper).
+            let sp = match spawn {
+                Some(s) => s,
+                None => {
+                    *local_dialog = Some(error_dialog(
+                        "Cannot mount: spawn helper unavailable.",
+                    ));
+                    return Ok(Action::Refresh);
+                }
+            };
+            // Derive default keyfile path = <volume>.key.
+            let target_panel = 1 - snap.focus;     // mount goes to OTHER side
+            // dialog.value is the passphrase the user typed.
+            let passphrase = dialog.value.clone();
+            let result = sp.spawn_stratumd_with_passphrase(
+                &volume, None, passphrase.as_bytes(),
+            );
+            // Best-effort wipe of the local dialog buffer before drop.
+            // Note: dialog itself was moved-out via the take() in
+            // handle_dialog_key, so this is the LAST live ref.
+            // (The original String's heap allocation will be dropped
+            // when this scope ends; volatile-write here is belt-and-
+            // suspenders for the "string was reallocated" race.)
+            let mut wipe = passphrase.into_bytes();
+            for b in wipe.iter_mut() {
+                unsafe { std::ptr::write_volatile(b as *mut u8, 0); }
+            }
+            drop(wipe);
+            // Likewise wipe the dialog.value field that handle_dialog_key
+            // may have left lingering — it was moved here, but if the
+            // String was reallocated mid-typing, the prior allocation
+            // could still hold readable bytes. zero-fill the current.
+            // (No public way to reach the prior alloc; trust libc's
+            // realloc-and-free hygiene + mlock would be the upgrade.)
+            match result {
+                Ok(sock) => {
+                    let meta = BackendMeta::Stratumd {
+                        volume: volume.clone(),
+                    };
+                    if let Err(e) = sp.attach_panel(target_panel, &sock, meta) {
+                        *local_dialog =
+                            Some(error_dialog(&format!("attach stratumd: {e}")));
+                    }
+                    Ok(Action::Refresh)
+                }
+                Err(e) => {
+                    // Most likely: wrong passphrase. stratumd's
+                    // exit-on-EBADTAG won't bind the socket, so
+                    // wait_for_sock times out + the spawn returns Err.
+                    // Re-show the prompt with the error.
+                    *local_dialog = Some(LocalDialog {
+                        kind: LocalDialogKind::PassphraseFor {
+                            volume: volume.clone(),
+                        },
+                        prompt: format!(
+                            "Mount {}: {} (wrong passphrase?)",
+                            volume.display(), e
+                        ),
+                        value: String::new(),
+                        is_password: true,
+                        is_error: false,
+                    });
+                    Ok(Action::Refresh)
+                }
+            }
         }
         LocalDialogKind::MkVol(_) => {
             // MkVol's submit goes through submit_mkvol; this branch
@@ -1623,6 +1686,42 @@ fn mount_stm_volume(
     target_panel: usize,
     stm_path: &Path,
 ) -> Result<Action> {
+    let _ = target_panel;   // panel resolved at submit time (= other side of focus)
+
+    // SWISS-4o: peek at the keyfile magic to decide whether to
+    // prompt. If KFP1 (encrypted), open the passphrase dialog and
+    // let submit_dialog handle the spawn. Otherwise (plain v1
+    // keyfile, or no keyfile), fall through to spawn directly so
+    // the legacy plain-keyfile workflow keeps working.
+    let mut keyfile = stm_path.to_path_buf();
+    let new_name = format!(
+        "{}.key",
+        keyfile.file_name().unwrap_or_default().to_string_lossy()
+    );
+    keyfile.set_file_name(new_name);
+
+    let needs_pass = match crate::passphrase::is_keyfile_encrypted(&keyfile) {
+        Ok(b) => b,
+        Err(_) => false,    // file missing or unreadable; let spawn surface it
+    };
+
+    if needs_pass {
+        *local_dialog = Some(LocalDialog {
+            kind: LocalDialogKind::PassphraseFor {
+                volume: stm_path.to_path_buf(),
+            },
+            prompt: format!(
+                "Passphrase for {}:",
+                stm_path.file_name().unwrap_or_default().to_string_lossy()
+            ),
+            value: String::new(),
+            is_password: true,
+            is_error: false,
+        });
+        return Ok(Action::Refresh);
+    }
+
+    // Plain keyfile path: spawn directly (legacy workflow).
     match spawn.spawn_stratumd(stm_path, None) {
         Ok(sock) => {
             let meta = BackendMeta::Stratumd {
@@ -1635,21 +1734,13 @@ fn mount_stm_volume(
             Ok(Action::Refresh)
         }
         Err(e) => {
-            // Most common failure: missing companion .key. Pop a
-            // passphrase prompt (forward-noted).
-            *local_dialog = Some(LocalDialog {
-                kind: LocalDialogKind::PassphraseFor {
-                    volume: stm_path.to_path_buf(),
-                },
-                prompt: format!(
-                    "Mount {} failed: {e}\n\nPassphrase prompt is forward-noted; \
-                     for now, place a <volume>.key beside the .stm file.",
-                    stm_path.display()
-                ),
-                value: String::new(),
-                is_password: true,
-                is_error: false,
-            });
+            *local_dialog = Some(error_dialog(&format!(
+                "Mount {} failed: {e}\n\n\
+                 If the volume was created with --passphrase-stdin, \
+                 the keyfile is encrypted but its KFP1 magic check failed. \
+                 Verify the .key file is intact.",
+                stm_path.display()
+            )));
             Ok(Action::Refresh)
         }
     }

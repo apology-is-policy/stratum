@@ -124,10 +124,39 @@ impl SpawnCtx {
 
     /// Spawn `stratum serve VOLUME --listen <new-sock> --keyfile KEY`,
     /// wait for the socket. The keyfile path is `<volume>.key` by
-    /// default (matching the v1 convention) unless the caller
-    /// overrides. SWISS-4b1 forward-note: passphrase prompt → derive
-    /// keyfile lazily; not in v1.0.
+    /// default unless the caller overrides. With `passphrase=Some(_)`
+    /// the daemon is launched with --passphrase-stdin and the bytes
+    /// are piped to its stdin (then the local copy is wiped via
+    /// volatile-write). Mirrors embed.rs's pre-TUI passphrase posture.
+    ///
+    /// SWISS-4o: this is the entry point for mid-session passphrase
+    /// opens (Enter on yellow .stm / Shift+F2 mounting an encrypted
+    /// volume). The caller is responsible for:
+    ///   1. Detecting whether the keyfile is KFP1 (encrypted) via
+    ///      crate::passphrase::is_keyfile_encrypted.
+    ///   2. Prompting the user (via the LocalDialog Input modal).
+    ///   3. Calling THIS variant with the prompt's value when the
+    ///      keyfile is encrypted, the no-passphrase form otherwise.
     pub fn spawn_stratumd(&self, volume: &Path, keyfile: Option<&Path>) -> Result<PathBuf> {
+        self.spawn_stratumd_inner(volume, keyfile, None)
+    }
+
+    pub fn spawn_stratumd_with_passphrase(
+        &self,
+        volume: &Path,
+        keyfile: Option<&Path>,
+        passphrase: &[u8],
+    ) -> Result<PathBuf> {
+        self.spawn_stratumd_inner(volume, keyfile, Some(passphrase))
+    }
+
+    fn spawn_stratumd_inner(
+        &self,
+        volume: &Path,
+        keyfile: Option<&Path>,
+        passphrase: Option<&[u8]>,
+    ) -> Result<PathBuf> {
+        use std::os::unix::process::CommandExt;
         if !volume.exists() {
             bail!("volume does not exist: {}", volume.display());
         }
@@ -145,13 +174,13 @@ impl SpawnCtx {
         };
         if !key.exists() {
             bail!(
-                "keyfile {} does not exist (passphrase entry forward-noted as SWISS-4b1)",
+                "keyfile {} does not exist",
                 key.display()
             );
         }
         let n = self.sock_seq.fetch_add(1, Ordering::SeqCst);
         let sock = self.session_dir.join(format!("stratumd-{}.sock", n + 100));
-        let args: Vec<String> = vec![
+        let mut args: Vec<String> = vec![
             "serve".into(),
             volume.to_string_lossy().into_owned(),
             "--listen".into(),
@@ -159,13 +188,60 @@ impl SpawnCtx {
             "--keyfile".into(),
             key.to_string_lossy().into_owned(),
         ];
-        let mut child = self
-            .spawn_inner(&args)
+        if passphrase.is_some() {
+            args.push("--passphrase-stdin".into());
+        }
+
+        // Open the per-spawn log file for stderr (matches spawn_inner's
+        // discipline; replicated here because we need a custom stdin).
+        let log_path = self
+            .session_dir
+            .join(format!("spawn-{}.log", self.children.lock().unwrap().len()));
+        let stderr_target = std::fs::OpenOptions::new()
+            .create(true).append(true).open(&log_path)
+            .map(Stdio::from)
+            .unwrap_or_else(|_| Stdio::null());
+        let stdin_setup = if passphrase.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        };
+        let mut child = Command::new(&self.me)
+            .args(&args)
+            .stdin(stdin_setup)
+            .stdout(Stdio::null())
+            .stderr(stderr_target)
+            .process_group(0)
+            .spawn()
             .with_context(|| format!("spawn stratumd for {}", volume.display()))?;
+
+        if let Some(pw) = passphrase {
+            use std::io::Write as _;
+            if let Some(mut sin) = child.stdin.take() {
+                let mut buf = Vec::with_capacity(pw.len() + 1);
+                buf.extend_from_slice(pw);
+                buf.push(b'\n');
+                let wr = sin.write_all(&buf);
+                // Wipe the duplicate write buffer immediately —
+                // matches embed.rs's posture for pre-TUI prompt.
+                for b in buf.iter_mut() {
+                    unsafe { std::ptr::write_volatile(b as *mut u8, 0); }
+                }
+                drop(sin);
+                if let Err(e) = wr {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(anyhow!(e).context("pipe passphrase to stratumd"));
+                }
+            }
+        }
+
         if let Err(e) = wait_for_sock(&sock, Duration::from_secs(5)) {
             let _ = child.kill();
+            let _ = child.wait();
             return Err(e.context(format!(
-                "stratumd socket never appeared at {}",
+                "stratumd socket never appeared at {} \
+                 (wrong passphrase? check session log)",
                 sock.display()
             )));
         }
