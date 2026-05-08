@@ -26,13 +26,101 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// SWISS-4f: F3-vs-F4 distinguishes view-readonly from edit. The
 /// /event verb pipeline routes BOTH through "editor open"; this
 /// flag tells the next snapshot loop to mark the local EditorState
 /// readonly when consumed. Cleared on consumption.
 static VIEW_INTENT: AtomicBool = AtomicBool::new(false);
+
+/// SWISS-4n: type-to-jump prefix-search state. Tracks what the user
+/// has typed since the last reset; the buffer auto-clears after 1s
+/// of idle. Behavior:
+///   - Each printable Char is appended; cursor jumps to the first
+///     entry whose name starts with the buffer (case-insensitive).
+///   - Backspace pops one char (and re-searches) IF the buffer is
+///     non-empty; otherwise falls through to the existing ascend
+///     verb. So the user can still navigate up after the search
+///     timeout has cleared the buffer.
+///   - Esc clears the buffer (no batch ops in flight).
+///   - Tab / Up / Down / Enter / F-keys reset the buffer — those
+///     are "real" navigation and the search context is broken.
+///   - Spacebar (selection toggle) is treated as a real navigation
+///     verb, NOT a search char (would be ambiguous + spaces in
+///     filenames are rare in real-world panels).
+///
+/// Pattern is the same as Finder / Total Commander / Windows
+/// Explorer — predictable prefix match. We deliberately don't do
+/// substring or fuzzy matching: typing "log" shouldn't jump to
+/// "catalog.txt", and a typo'd "phpto.jpg" shouldn't fuzzy-match
+/// to "photo.jpg" — file managers reward precision.
+struct SearchState {
+    buffer:     String,
+    last_input: Option<Instant>,
+}
+impl SearchState {
+    fn new() -> Self { Self { buffer: String::new(), last_input: None } }
+    fn clear(&mut self) {
+        self.buffer.clear();
+        self.last_input = None;
+    }
+    /// Reset the buffer if more than 1 second has passed since the
+    /// last keystroke. Called at the top of every key handler.
+    fn maybe_reset(&mut self) {
+        if let Some(t) = self.last_input {
+            if t.elapsed() > Duration::from_millis(1000) {
+                self.buffer.clear();
+                self.last_input = None;
+            }
+        }
+    }
+    fn push(&mut self, c: char) {
+        self.buffer.push(c);
+        self.last_input = Some(Instant::now());
+    }
+    /// Returns true iff a char was popped (i.e. buffer was non-empty).
+    fn pop(&mut self) -> bool {
+        if self.buffer.pop().is_some() {
+            self.last_input = Some(Instant::now());
+            true
+        } else {
+            false
+        }
+    }
+    fn is_empty(&self) -> bool { self.buffer.is_empty() }
+}
+
+/// SWISS-4n: scan a panel's raw_entries for the first entry whose
+/// name starts with `prefix` (case-insensitive). Skips the synthetic
+/// ".." entry when present. Returns the entry's index in
+/// raw_entries (suitable for /panels/X/cursor write).
+///
+/// raw_entries lines are "kind mode size mtime name" — splitn(5, ' ')
+/// preserves any spaces inside the filename verbatim.
+fn find_first_prefix_match(
+    raw_entries: &[String],
+    prefix: &str,
+) -> Option<u32> {
+    if prefix.is_empty() { return None; }
+    let prefix_lc = prefix.to_lowercase();
+    for (i, raw) in raw_entries.iter().enumerate() {
+        let mut parts = raw.splitn(5, ' ');
+        let _kind = parts.next();
+        let _mode = parts.next();
+        let _size = parts.next();
+        let _mt   = parts.next();
+        let name  = match parts.next() {
+            Some(n) if !n.is_empty() => n,
+            _ => continue,
+        };
+        if name == ".." { continue; }
+        if name.to_lowercase().starts_with(&prefix_lc) {
+            return Some(i as u32);
+        }
+    }
+    None
+}
 
 fn set_view_intent(v: bool) { VIEW_INTENT.store(v, Ordering::SeqCst); }
 fn take_view_intent() -> bool { VIEW_INTENT.swap(false, Ordering::SeqCst) }
@@ -206,6 +294,10 @@ fn run_ui(
     // SWISS-4h: in-progress batch ops driven by the main loop.
     let mut copy_batch: Option<CopyBatch> = None;
     let mut delete_batch: Option<DeleteBatch> = None;
+    // SWISS-4n: type-to-jump prefix-search state (see SearchState
+    // doc for behavior). Lives across handle_key calls so a user
+    // can type "ph" then "o" and have the cursor land on "photo.jpg".
+    let mut search = SearchState::new();
     let result = (|| -> Result<()> {
         loop {
             // SWISS-4h: advance batch ops one step per iteration when
@@ -243,7 +335,12 @@ fn run_ui(
                     }
                 }
             }
-            let snapshot = fetch_snapshot(client, focus, &local_dialog, &editor)?;
+            // SWISS-4n: refresh idle-timeout BEFORE building the
+            // snapshot so the rendered hint matches what the next
+            // keystroke will see (1s-since-last-input clears).
+            search.maybe_reset();
+            let mut snapshot = fetch_snapshot(client, focus, &local_dialog, &editor)?;
+            snapshot.search_buffer = search.buffer.clone();
             // SWISS-4e: editor open transition. Slate flipped
             // editor_active=true (via /event "editor open" issued by
             // THIS tui or another client) and we don't yet have a
@@ -289,7 +386,8 @@ fn run_ui(
                         Event::Key(key) if key.kind == KeyEventKind::Press => {
                             match handle_key(client, &mut focus, &mut local_dialog,
                                               &mut editor, &mut copy_batch,
-                                              &mut delete_batch, spawn.as_ref(),
+                                              &mut delete_batch, &mut search,
+                                              spawn.as_ref(),
                                               &snapshot, key)? {
                                 Action::Quit => return Ok(()),
                                 Action::Refresh => break,
@@ -335,18 +433,28 @@ fn handle_key(
     editor: &mut Option<EditorState>,
     copy_batch: &mut Option<CopyBatch>,
     delete_batch: &mut Option<DeleteBatch>,
+    search: &mut SearchState,
     spawn: Option<&Arc<SpawnCtx>>,
     snap: &UiState,
     key: crossterm::event::KeyEvent,
 ) -> Result<Action> {
     // SWISS-4b: local-dialog modal layer takes priority.
     if local_dialog.is_some() {
+        // Any input inside a dialog clears the panel's search buffer
+        // — the user has switched contexts.
+        search.clear();
         return handle_dialog_key(local_dialog, spawn, snap, key);
     }
     // SWISS-4e: editor modal layer (after dialog).
     if editor.is_some() {
+        search.clear();
         return handle_editor_key(client, editor, key);
     }
+
+    // SWISS-4n: idle-timeout reset. Every key handler runs after this
+    // — the user's "thinking pause" between letters auto-clears the
+    // search context if it exceeds 1s.
+    search.maybe_reset();
 
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && (matches!(key.code, KeyCode::Char('q') | KeyCode::Char('c')))
@@ -374,7 +482,63 @@ fn handle_key(
             DELETE_CANCEL.with(|c| c.set(true));
             return Ok(Action::Refresh);
         }
+        // SWISS-4n: Esc with no batch and a non-empty search buffer
+        // clears the buffer. Otherwise falls through (currently a
+        // no-op for top-level Esc).
+        if !search.is_empty() {
+            search.clear();
+            return Ok(Action::Refresh);
+        }
     }
+
+    // SWISS-4n: type-to-jump intercept. Printable Char keys (no
+    // Ctrl/Alt; spacebar excluded since that's selection-toggle)
+    // append to the search buffer and move the cursor. We allow
+    // letters, digits, and a small set of common filename punctuation.
+    // Anything else (Tab / Up / Down / Enter / F-keys / etc) falls
+    // through to the existing handlers AND clears the buffer (those
+    // are "real" navigation that breaks the search context).
+    if let KeyCode::Char(c) = key.code {
+        let is_modifier_combo = key.modifiers.contains(KeyModifiers::CONTROL)
+                              || key.modifiers.contains(KeyModifiers::ALT);
+        let is_searchable = !is_modifier_combo
+            && c != ' '   // spacebar is selection-toggle
+            && (c.is_alphanumeric()
+                || matches!(c, '.' | '_' | '-' | '+' | ',' | '~' | '@'
+                              | '#' | '$' | '%' | '&' | '!' | '(' | ')'
+                              | '[' | ']' | '{' | '}' | '\'' | '`'));
+        if is_searchable {
+            search.push(c);
+            if let Some(idx) = find_first_prefix_match(
+                &snap.panels[*focus].raw_entries,
+                &search.buffer,
+            ) {
+                set_cursor(client, *focus, idx);
+            }
+            return Ok(Action::Refresh);
+        }
+    }
+    // SWISS-4n: Backspace pops one search char IF the buffer is
+    // non-empty, then re-runs the search. If the buffer is empty,
+    // falls through to the existing ascend verb (key Backspace).
+    if matches!(key.code, KeyCode::Backspace) && !search.is_empty() {
+        search.pop();
+        if !search.is_empty() {
+            if let Some(idx) = find_first_prefix_match(
+                &snap.panels[*focus].raw_entries,
+                &search.buffer,
+            ) {
+                set_cursor(client, *focus, idx);
+            }
+        }
+        return Ok(Action::Refresh);
+    }
+
+    // SWISS-4n: any path past this point is "real" navigation that
+    // breaks the search context. The type-to-jump intercept above
+    // returns early on searchable Char + on Backspace-with-buffer;
+    // anything else reaching here clears the buffer.
+    search.clear();
     match key.code {
         KeyCode::Tab => {
             *focus ^= 1;
@@ -2519,6 +2683,20 @@ fn action_verb(client: &mut SlateClient, focus: usize, verb: &str) -> Result<()>
     Ok(())
 }
 
+/// SWISS-4n: write an absolute cursor index to /panels/X/cursor.
+/// Used by type-to-jump to move the highlighted row to the matched
+/// entry. Slate validates the index against the current entries
+/// snapshot — out-of-range writes are refused server-side.
+fn set_cursor(client: &mut SlateClient, focus: usize, idx: u32) {
+    let path = if focus == 0 {
+        "/panels/left/cursor"
+    } else {
+        "/panels/right/cursor"
+    };
+    let body = format!("{idx}\n");
+    let _ = client.write_path(path, body.as_bytes());
+}
+
 fn fetch_snapshot(
     client: &mut SlateClient,
     focus: usize,
@@ -2572,6 +2750,9 @@ fn fetch_snapshot(
         editor_filename,
         editor_modified,
         local_dialog: local_dialog.clone(),
+        // Patched in by run_ui after fetch_snapshot returns — see
+        // SearchState handling at the main loop draw site.
+        search_buffer: String::new(),
     })
 }
 
@@ -2601,3 +2782,77 @@ fn read_panel(
         .unwrap_or_default();
     Ok(PanelView { path, raw_entries, cursor, connected, selection })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_state_idle_reset() {
+        let mut s = SearchState::new();
+        s.push('a');
+        s.push('b');
+        assert_eq!(s.buffer, "ab");
+        // Force expiration by backdating last_input.
+        s.last_input = Some(Instant::now() - Duration::from_secs(2));
+        s.maybe_reset();
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn search_state_pop_returns_false_when_empty() {
+        let mut s = SearchState::new();
+        assert!(!s.pop());
+        s.push('x');
+        assert!(s.pop());
+        assert!(s.is_empty());
+    }
+
+    fn make_entries(names: &[(&str, &str)]) -> Vec<String> {
+        // "kind mode size mtime name"
+        names.iter()
+            .map(|(kind, name)| format!("{kind} 0644 0 0 {name}"))
+            .collect()
+    }
+
+    #[test]
+    fn prefix_match_skips_dotdot() {
+        let e = make_entries(&[("d", ".."), ("-", "alpha.txt"), ("-", "beta.txt")]);
+        // Empty prefix → None.
+        assert_eq!(find_first_prefix_match(&e, ""), None);
+        // "a" matches alpha; index 1, NOT 0 (skip ..).
+        assert_eq!(find_first_prefix_match(&e, "a"), Some(1));
+        assert_eq!(find_first_prefix_match(&e, "al"), Some(1));
+        assert_eq!(find_first_prefix_match(&e, "b"), Some(2));
+    }
+
+    #[test]
+    fn prefix_match_case_insensitive() {
+        let e = make_entries(&[("-", "Photo.jpg"), ("-", "document.pdf")]);
+        assert_eq!(find_first_prefix_match(&e, "pho"), Some(0));
+        assert_eq!(find_first_prefix_match(&e, "PHO"), Some(0));
+        assert_eq!(find_first_prefix_match(&e, "Doc"), Some(1));
+    }
+
+    #[test]
+    fn prefix_match_no_substring_match() {
+        // "log" should NOT match "catalog.txt" (substring would).
+        let e = make_entries(&[("-", "catalog.txt"), ("-", "log.txt")]);
+        assert_eq!(find_first_prefix_match(&e, "log"), Some(1));
+    }
+
+    #[test]
+    fn prefix_match_filename_with_spaces() {
+        // splitn(5, ' ') preserves spaces in the filename column.
+        let e = make_entries(&[("-", "my photo.jpg"), ("-", "other.txt")]);
+        assert_eq!(find_first_prefix_match(&e, "my"), Some(0));
+        assert_eq!(find_first_prefix_match(&e, "my photo"), Some(0));
+    }
+
+    #[test]
+    fn prefix_match_no_match_returns_none() {
+        let e = make_entries(&[("-", "alpha"), ("-", "beta")]);
+        assert_eq!(find_first_prefix_match(&e, "z"), None);
+    }
+}
+

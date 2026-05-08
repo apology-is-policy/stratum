@@ -143,6 +143,12 @@ pub struct UiState {
     /// (which is for daemon→user prompts). When `Some`, render
     /// overlays the panels and consumes keyboard input.
     pub local_dialog: Option<LocalDialog>,
+    /// SWISS-4n: type-to-jump search buffer. Non-empty when the user
+    /// has typed at least one character within the last 1s and isn't
+    /// in a dialog/editor. Rendered as a hint in the status line so
+    /// the user gets feedback even when the prefix doesn't match
+    /// (cursor stays in place, but the buffer reveals what they typed).
+    pub search_buffer: String,
 }
 
 /// SWISS-4b: kind of modal dialog the TUI is currently displaying.
@@ -574,10 +580,20 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         " DISCONNECTED ".to_string()
     };
     let v_marker = format!(" v={} ", state.version);
-    let user_status = if state.status.is_empty() {
+    // SWISS-4n: search-buffer hint. Visible while the user is typing
+    // a prefix; clears after the 1s idle timeout or any non-search
+    // keystroke. Bold + cyan to draw attention without screaming.
+    let user_status = if !state.search_buffer.is_empty() {
+        format!(" search: {}_ ", sanitize_for_display(&state.search_buffer))
+    } else if state.status.is_empty() {
         " (slate is idle) ".to_string()
     } else {
         format!(" {} ", sanitize_for_display(&state.status))
+    };
+    let user_status_style = if !state.search_buffer.is_empty() {
+        Style::default().fg(Color::Cyan).bg(CLR_STATUS_BG).bold()
+    } else {
+        Style::default().fg(CLR_STATUS_FG).bg(CLR_STATUS_BG)
     };
     let line = Line::from(vec![
         Span::styled(
@@ -587,10 +603,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
                 .bg(CLR_STATUS_BG)
                 .bold(),
         ),
-        Span::styled(
-            user_status,
-            Style::default().fg(CLR_STATUS_FG).bg(CLR_STATUS_BG),
-        ),
+        Span::styled(user_status, user_status_style),
         Span::styled(
             v_marker,
             Style::default().fg(Color::DarkGray).bg(CLR_STATUS_BG),
