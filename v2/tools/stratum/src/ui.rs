@@ -21,6 +21,8 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 
+use crate::editor::{EditorMode, EditorState};
+
 // ── color palette (lifted from v2/tui/src/ui.rs) ──────────────────────
 
 const CLR_BG: Color = Color::Black;
@@ -124,8 +126,13 @@ pub struct UiState {
     pub dialog_stack: String,
     pub editor_active: bool,
     pub editor_filename: String,
+    /// SWISS-4e v1.1: kept on UiState for symmetry with slate's
+    /// /editor/modified surface; the local EditorState owns the
+    /// authoritative flag during a session, so this is currently
+    /// only consulted when the editor is being externally observed
+    /// (no local buffer, e.g. a Halcyon pane attached to slate).
+    #[allow(dead_code)]
     pub editor_modified: bool,
-    pub editor_preview: Vec<String>,
     /// SWISS-4b: TUI-local modal dialog (host-mount input, error,
     /// passphrase prompt). Distinct from slate's /dialogs subtree
     /// (which is for daemon→user prompts). When `Some`, render
@@ -255,9 +262,17 @@ pub struct LocalDialog {
 
 // ── main draw ─────────────────────────────────────────────────────────
 
-pub fn render(frame: &mut Frame<'_>, state: &UiState) {
+pub fn render(frame: &mut Frame<'_>, state: &UiState, editor: Option<&EditorState>) {
     let area = frame.area();
     frame.render_widget(Block::default().style(Style::default().bg(CLR_BG)), area);
+
+    // SWISS-4e v1.1: when the editor is active, it takes over the
+    // full screen (matches v1 — `if let Some(ref ed) = app.editor {
+    // draw_editor(...); return; }`).
+    if let Some(ed) = editor {
+        draw_editor(frame, area, ed);
+        return;
+    }
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -281,15 +296,11 @@ pub fn render(frame: &mut Frame<'_>, state: &UiState) {
     draw_fkey_bar(frame, rows[2]);
     draw_shift_fkey_bar(frame, rows[3]);
 
-    if state.editor_active {
-        draw_editor_overlay(frame, area, state);
-    } else if !state.dialog_stack.is_empty() {
+    if !state.dialog_stack.is_empty() {
         draw_dialog_overlay(frame, area, state);
     }
     // SWISS-4b: local modal dialog renders OVER any other surface.
     if let Some(d) = state.local_dialog.as_ref() {
-        // SWISS-4c: dispatch on dialog kind. MkVol is its own
-        // multi-field wizard; the rest go through draw_local_dialog.
         if let LocalDialogKind::MkVol(ref mk) = d.kind {
             draw_mkvol_dialog(frame, area, mk);
         } else {
@@ -570,67 +581,103 @@ fn draw_keys_row(
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-// ── editor overlay ────────────────────────────────────────────────────
+// ── editor (full-screen, v1 visual parity) ────────────────────────────
+//
+// Lifted from v1's `tui/src/ui.rs::draw_editor`. The editor takes
+// over the entire screen (matches v1's `return; // editor takes over
+// the entire screen`); status bar at the bottom shows mode chip,
+// command buffer / status / hint, and 1-based row:col cursor
+// position (right-aligned).
 
-fn draw_editor_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
-    // Full-screen editor (matches v2/tui's editor layout).
+fn draw_editor(frame: &mut Frame<'_>, area: Rect, ed: &EditorState) {
     frame.render_widget(Clear, area);
     frame.render_widget(Block::default().style(Style::default().bg(CLR_BG)), area);
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(3),
-            Constraint::Length(1),
+            Constraint::Min(3),     // textarea
+            Constraint::Length(1),  // status bar
         ])
         .split(area);
 
-    let title_style = if state.editor_modified {
+    // Textarea with double-line border. Title color shifts on
+    // readonly + modified — same scheme as v1.
+    let title_style = if ed.readonly {
+        Style::default().fg(Color::DarkGray)
+    } else if ed.modified {
         Style::default().fg(Color::Yellow).bold()
     } else {
         Style::default().fg(Color::White).bold()
     };
-    let modified_mark = if state.editor_modified { " [+]" } else { "" };
-    let title = format!(" {}{modified_mark} ", state.editor_filename);
+
+    let modified_mark = if ed.modified { " [+]" } else { "" };
+    let title = format!(" {}{modified_mark} ", ed.filename);
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_set(dbl_border())
-        .border_style(Style::default().fg(CLR_BORDER_ACTIVE).bold())
+        .border_style(
+            Style::default()
+                .fg(if ed.readonly { Color::DarkGray } else { CLR_BORDER_ACTIVE })
+                .bold(),
+        )
         .title(Line::from(Span::styled(title, title_style)).centered())
         .style(Style::default().bg(CLR_BG));
+
     let inner = block.inner(rows[0]);
     frame.render_widget(block, rows[0]);
+    frame.render_widget(&ed.textarea, inner);
 
-    // R125 P1-1: sanitize editor_preview lines before rendering. The
-    // editor IS a text-editing UI but the renderer-layer is the right
-    // boundary to filter terminal-control bytes (CLAUDE.md slate
-    // clause 23(g) carry — slate transports faithfully; we render
-    // safely). '\n' / '\t' pass through; everything < 0x20 + 0x7F
-    // becomes '?'.
-    let visible = inner.height as usize;
-    let lines: Vec<Line> = state
-        .editor_preview
-        .iter()
-        .take(visible)
-        .map(|s| Line::from(sanitize_for_display(s)))
-        .collect();
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    // Status bar: mode chip | command buffer / status / hints | row:col.
+    let mode_clr = match ed.mode {
+        EditorMode::Normal => if ed.readonly { Color::DarkGray } else { Color::Green },
+        EditorMode::Insert => Color::Red,
+        EditorMode::Visual => Color::Blue,
+        EditorMode::Command(_) => Color::Yellow,
+    };
 
-    // Status bar (mirrors v2/tui's editor status bar shape).
-    let mode_lbl = if state.editor_modified { " EDIT*" } else { " VIEW " };
-    let mode_clr = if state.editor_modified { Color::Yellow } else { Color::DarkGray };
-    let spans = vec![
-        Span::styled(
-            mode_lbl,
-            Style::default().fg(Color::Black).bg(mode_clr).bold(),
-        ),
-        Span::styled(
-            "  [readonly preview]   close from another client: \
-             echo close > /editor/action",
+    let (cy, cx) = ed.textarea.cursor();
+    let mut spans = vec![Span::styled(
+        format!(" {} ", ed.mode_str()),
+        Style::default().fg(Color::Black).bg(mode_clr).bold(),
+    )];
+
+    if let Some(cmd) = ed.command_buf() {
+        spans.push(Span::styled(
+            format!(" {cmd}"),
+            Style::default().fg(Color::Yellow).bold(),
+        ));
+    } else if let Some(ref msg) = ed.status_msg {
+        spans.push(Span::styled(
+            format!(" {}", sanitize_for_display(msg)),
+            Style::default().fg(Color::Cyan),
+        ));
+    } else if ed.readonly {
+        spans.push(Span::styled(
+            " [readonly]  q/Esc to close",
             Style::default().fg(Color::DarkGray),
-        ),
-    ];
+        ));
+    } else {
+        spans.push(Span::styled(
+            " i:insert  v:select  p:paste  ::command",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    // Right-align the cursor position (1-based to match v1).
+    let pos_str = format!(" {}:{} ", cy + 1, cx + 1);
+    let used: usize = spans.iter().map(|s| s.content.len()).sum();
+    let pad = (area.width as usize).saturating_sub(used + pos_str.len());
+    spans.push(Span::styled(
+        " ".repeat(pad),
+        Style::default().bg(CLR_BG),
+    ));
+    spans.push(Span::styled(
+        pos_str,
+        Style::default().fg(Color::DarkGray),
+    ));
+
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(CLR_BG)),
         rows[1],

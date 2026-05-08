@@ -79,10 +79,28 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
 
     let me = std::env::current_exe().context("locate own binary")?;
 
+    // SWISS-4a-stderr: redirect daemon stderr to per-daemon log files
+    // in the session directory, NOT to inherited stderr — otherwise
+    // the daemons' "serving X on Y" startup messages collide with
+    // ratatui's screen paint when the TUI enters raw mode (user
+    // 2026-05-08). Headless mode keeps stderr inherited (no TUI to
+    // collide with). Logs are removed at session_dir cleanup.
+    let log_redirect = !opts.headless;
+    let open_log = |name: &str| -> Result<Stdio> {
+        if !log_redirect {
+            return Ok(Stdio::inherit());
+        }
+        let log_path = session_dir.join(format!("{name}.log"));
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .with_context(|| format!("open {} for daemon stderr", log_path.display()))?;
+        Ok(Stdio::from(f))
+    };
+
     // SWISS-4a: every config spawns host-fs (as it backs at least
     // the right panel — and the left panel too when --vol is unset).
-    // host-fs accepts multiple connections (serial accept loop), so
-    // both panels can dial it concurrently.
     let host_fs_args: Vec<String> = vec![
         "host-fs".into(),
         host_root.to_string_lossy().into_owned(),
@@ -93,6 +111,7 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
     let mut host_fs_child = Command::new(&me)
         .args(&host_fs_args)
         .stdout(Stdio::null())
+        .stderr(open_log("host-fs")?)
         .process_group(0)
         .spawn()
         .with_context(|| format!("spawn host-fs via {}", me.display()))?;
@@ -129,6 +148,7 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         let child = Command::new(&me)
             .args(&stratumd_args)
             .stdout(Stdio::null())
+            .stderr(open_log("stratumd")?)
             .process_group(0)
             .spawn()
             .with_context(|| format!("spawn stratumd via {}", me.display()))?;
@@ -157,6 +177,7 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
     let mut slate_child = match Command::new(&me)
         .args(&slate_args)
         .stdout(Stdio::null())
+        .stderr(open_log("slate")?)
         .process_group(0)
         .spawn()
     {

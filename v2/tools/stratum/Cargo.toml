@@ -21,10 +21,14 @@ publish = false
 # See v2/docs/SLATE-DESIGN.md §12 for the design rationale.
 
 [dependencies]
-ratatui   = "0.29"
-crossterm = "0.28"
-anyhow    = "1"
-libc      = "0.2"
+ratatui      = "0.29"
+crossterm    = "0.28"
+anyhow       = "1"
+libc         = "0.2"
+# SWISS-4e parity: v1 editor uses tui-textarea for its modal text area
+# (Helix-style Normal/Insert/Visual/Command modes). v2 lifts the same
+# crate so visuals + behaviour match.
+tui-textarea = "0.7"
 
 [[bin]]
 name = "stratum"

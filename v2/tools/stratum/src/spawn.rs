@@ -207,9 +207,23 @@ impl SpawnCtx {
 
     fn spawn_inner(&self, args: &[String]) -> Result<Child> {
         use std::os::unix::process::CommandExt;
+        // Redirect stderr to a per-spawn log file (matching embed.rs's
+        // discipline) so mid-session daemon spawns don't collide with
+        // ratatui paint. Best-effort; falls back to /dev/null if the
+        // log file open fails.
+        let log_path = self
+            .session_dir
+            .join(format!("spawn-{}.log", self.children.lock().unwrap().len()));
+        let stderr_target = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map(Stdio::from)
+            .unwrap_or_else(|_| Stdio::null());
         Command::new(&self.me)
             .args(args)
             .stdout(Stdio::null())
+            .stderr(stderr_target)
             .process_group(0)
             .spawn()
             .map_err(|e| anyhow!(e))

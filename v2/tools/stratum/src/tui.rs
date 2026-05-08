@@ -28,6 +28,7 @@ use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use std::thread;
 use std::time::Duration;
 
+use crate::editor::EditorState;
 use crate::slate::{read_lines, read_text_trim, SlateClient};
 use crate::spawn::{BackendMeta, SpawnCtx};
 use crate::ui::{self, LocalDialog, LocalDialogKind, MkVolCompress, MkVolField, MkVolState,
@@ -42,168 +43,6 @@ pub struct Opts {
     /// lifecycle). Shift+F2 / Enter-on-.stm display an error dialog
     /// when spawn is None.
     pub spawn: Option<Arc<SpawnCtx>>,
-}
-
-/// SWISS-4e: TUI-local editor buffer. The TUI owns the source-of-
-/// truth for an open editor session; slate's /editor/content is
-/// pushed on save. Local-only buffer is fast for keystroke-level
-/// editing; pushing every keystroke to slate would mean a full
-/// /editor/content write per character (slate's R124 P3-2 carry —
-/// content is whole-payload-replace).
-///
-/// Lines are stored as Strings without trailing '\n'. The on-disk
-/// representation is `lines.join("\n")` (with optional trailing
-/// newline preserved at open + save; v1.0 always emits a trailing
-/// newline).
-struct EditorBuffer {
-    lines: Vec<String>,
-    row: usize,
-    col: usize,
-    /// Filename relative to the panel's backend root. Currently the
-    /// status bar pulls this from `snap.editor_filename` (slate's
-    /// view); kept on the buffer so SWISS-4e1 can render it locally
-    /// when the snapshot is mid-fetch.
-    #[allow(dead_code)]
-    filename: String,
-    modified: bool,
-    /// True iff slate's /editor/content was originally non-empty
-    /// AND ended with a newline. We preserve the trailing newline
-    /// at save (POSIX text-file convention).
-    trailing_newline: bool,
-}
-
-impl EditorBuffer {
-    fn from_content(content: &str, filename: String) -> Self {
-        let trailing_newline = content.ends_with('\n');
-        let body = if trailing_newline {
-            &content[..content.len() - 1]
-        } else {
-            content
-        };
-        let lines: Vec<String> = if body.is_empty() {
-            vec![String::new()]
-        } else {
-            body.split('\n').map(|s| s.to_string()).collect()
-        };
-        Self {
-            lines,
-            row: 0,
-            col: 0,
-            filename,
-            modified: false,
-            trailing_newline: trailing_newline || content.is_empty(),
-        }
-    }
-
-    fn serialize(&self) -> String {
-        let mut out = self.lines.join("\n");
-        if self.trailing_newline && !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out
-    }
-
-    fn insert_char(&mut self, ch: char) {
-        let line = &mut self.lines[self.row];
-        let byte_idx = line
-            .char_indices()
-            .nth(self.col)
-            .map(|(b, _)| b)
-            .unwrap_or(line.len());
-        line.insert(byte_idx, ch);
-        self.col += 1;
-        self.modified = true;
-    }
-
-    fn insert_newline(&mut self) {
-        let line = self.lines[self.row].clone();
-        let byte_idx = line
-            .char_indices()
-            .nth(self.col)
-            .map(|(b, _)| b)
-            .unwrap_or(line.len());
-        let (left, right) = line.split_at(byte_idx);
-        self.lines[self.row] = left.to_string();
-        self.lines.insert(self.row + 1, right.to_string());
-        self.row += 1;
-        self.col = 0;
-        self.modified = true;
-    }
-
-    fn backspace(&mut self) {
-        if self.col > 0 {
-            // Remove char before cursor on current line.
-            let line = &mut self.lines[self.row];
-            let byte_idx = line
-                .char_indices()
-                .nth(self.col - 1)
-                .map(|(b, _)| b)
-                .unwrap_or(0);
-            let next_byte = line
-                .char_indices()
-                .nth(self.col)
-                .map(|(b, _)| b)
-                .unwrap_or(line.len());
-            line.replace_range(byte_idx..next_byte, "");
-            self.col -= 1;
-            self.modified = true;
-        } else if self.row > 0 {
-            // Merge with previous line.
-            let cur = self.lines.remove(self.row);
-            let prev_len_chars = self.lines[self.row - 1].chars().count();
-            self.lines[self.row - 1].push_str(&cur);
-            self.row -= 1;
-            self.col = prev_len_chars;
-            self.modified = true;
-        }
-    }
-
-    fn move_left(&mut self) {
-        if self.col > 0 {
-            self.col -= 1;
-        } else if self.row > 0 {
-            self.row -= 1;
-            self.col = self.lines[self.row].chars().count();
-        }
-    }
-
-    fn move_right(&mut self) {
-        let line_chars = self.lines[self.row].chars().count();
-        if self.col < line_chars {
-            self.col += 1;
-        } else if self.row + 1 < self.lines.len() {
-            self.row += 1;
-            self.col = 0;
-        }
-    }
-
-    fn move_up(&mut self) {
-        if self.row > 0 {
-            self.row -= 1;
-            let line_chars = self.lines[self.row].chars().count();
-            if self.col > line_chars {
-                self.col = line_chars;
-            }
-        }
-    }
-
-    fn move_down(&mut self) {
-        if self.row + 1 < self.lines.len() {
-            self.row += 1;
-            let line_chars = self.lines[self.row].chars().count();
-            if self.col > line_chars {
-                self.col = line_chars;
-            }
-        }
-    }
-
-    fn home(&mut self) {
-        self.col = 0;
-    }
-
-    fn end(&mut self) {
-        self.col = self.lines[self.row].chars().count();
-    }
 }
 
 pub fn run(opts: Opts) -> Result<()> {
@@ -285,28 +124,33 @@ fn run_ui(
 
     let mut focus: usize = 0;
     let mut local_dialog: Option<LocalDialog> = None;
-    let mut editor: Option<EditorBuffer> = None;
+    // SWISS-4e v1.1: EditorState (modal Helix-style) replaces the v1.0
+    // EditorBuffer. Same source-of-truth posture: TUI owns the buffer,
+    // pushes /editor/content + /editor/cursor on save_requested, sends
+    // /editor/action save / quit on quit_requested.
+    let mut editor: Option<EditorState> = None;
     let result = (|| -> Result<()> {
         loop {
             let snapshot = fetch_snapshot(client, focus, &local_dialog, &editor)?;
-            // SWISS-4e: if slate flipped editor_active=true (e.g. via
-            // /event "editor open" issued by THIS tui or another
-            // client) and we don't yet have a local buffer, fetch
-            // the content + initialise the buffer.
+            // SWISS-4e: editor open transition. Slate flipped
+            // editor_active=true (via /event "editor open" issued by
+            // THIS tui or another client) and we don't yet have a
+            // local buffer — fetch /editor/content and initialise.
             if snapshot.editor_active && editor.is_none() {
                 let content =
                     crate::slate::read_text(client, "/editor/content").unwrap_or_default();
-                editor = Some(EditorBuffer::from_content(
-                    &content,
+                editor = Some(EditorState::new(
                     snapshot.editor_filename.clone(),
+                    &content,
+                    /*readonly=*/ false,
                 ));
             }
-            // SWISS-4e: if slate dropped the editor (close from another
-            // client OR our own save-and-quit path), drop the buffer.
+            // SWISS-4e: external close — slate dropped the editor, e.g.
+            // another client wrote /editor/action close. Drop our buffer.
             if !snapshot.editor_active && editor.is_some() {
                 editor = None;
             }
-            terminal.draw(|frame| ui::render(frame, &snapshot))?;
+            terminal.draw(|frame| ui::render(frame, &snapshot, editor.as_ref()))?;
             loop {
                 if event::poll(Duration::from_millis(100))? {
                     match event::read()? {
@@ -350,7 +194,7 @@ fn handle_key(
     client: &mut SlateClient,
     focus: &mut usize,
     local_dialog: &mut Option<LocalDialog>,
-    editor: &mut Option<EditorBuffer>,
+    editor: &mut Option<EditorState>,
     spawn: Option<&Arc<SpawnCtx>>,
     snap: &UiState,
     key: crossterm::event::KeyEvent,
@@ -1113,105 +957,52 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// SWISS-4e: editor keypress handler. Mutates the local buffer +
-/// pushes /editor/content + /editor/cursor on every keystroke.
-/// Ctrl-S → save; Ctrl-Q → save-and-quit; Esc → quit (no save).
-/// Arrow keys + Home/End/Backspace mutate cursor + content.
+/// SWISS-4e v1.1: dispatch keystrokes through the modal editor.
+/// EditorState (lifted from v1's editor.rs) handles the Helix-shaped
+/// modal state machine internally; this function only routes the
+/// `save_requested` / `quit_requested` flags to slate's /editor/action
+/// + pushes the serialized content on save. v1's `:w` `:wq` `:q`
+/// `:q!` semantics are honoured exactly.
 fn handle_editor_key(
     client: &mut SlateClient,
-    editor: &mut Option<EditorBuffer>,
+    editor: &mut Option<EditorState>,
     key: crossterm::event::KeyEvent,
 ) -> Result<Action> {
-    let Some(buf) = editor.as_mut() else {
+    let Some(ed) = editor.as_mut() else {
         return Ok(Action::Ignore);
     };
 
-    let mut content_changed = false;
-    let mut cursor_changed = false;
+    // Hand the key to the modal state machine.
+    ed.handle_key(key);
 
-    match key.code {
-        // Quit / save-and-quit / save shortcuts.
-        KeyCode::Esc => {
-            // Esc = quit without save (matches v1 editor convention).
-            // Push /editor/action quit; the daemon clears editor state;
-            // the next loop sees editor_active=false and drops buf.
-            let _ = client.write_path("/editor/action", b"quit\n");
-            *editor = None;
-            return Ok(Action::Refresh);
+    // Drain save / quit flags. Save BEFORE quit so save-and-quit
+    // (`:wq`) writes content first, then issues the quit verb.
+    if ed.save_requested {
+        ed.save_requested = false;
+        let body = ed.content();
+        if !body.is_empty() {
+            let _ = client.write_path("/editor/content", body.as_bytes());
         }
-        KeyCode::Char('q') | KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            // Ctrl-Q = save-and-quit.
-            let serialized = buf.serialize();
-            if !serialized.is_empty() {
-                let _ = client.write_path("/editor/content", serialized.as_bytes());
-            }
-            let _ = client.write_path("/editor/action", b"save-and-quit\n");
-            *editor = None;
-            return Ok(Action::Refresh);
-        }
-        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            // Ctrl-S = save (push content first, then trigger save).
-            let serialized = buf.serialize();
-            let _ = client.write_path("/editor/content", serialized.as_bytes());
-            let _ = client.write_path("/editor/action", b"save\n");
-            buf.modified = false;
-            return Ok(Action::Refresh);
-        }
-        // Movement keys.
-        KeyCode::Left => { buf.move_left(); cursor_changed = true; }
-        KeyCode::Right => { buf.move_right(); cursor_changed = true; }
-        KeyCode::Up => { buf.move_up(); cursor_changed = true; }
-        KeyCode::Down => { buf.move_down(); cursor_changed = true; }
-        KeyCode::Home => { buf.home(); cursor_changed = true; }
-        KeyCode::End => { buf.end(); cursor_changed = true; }
-        // Editing keys.
-        KeyCode::Backspace => {
-            buf.backspace();
-            content_changed = true;
-            cursor_changed = true;
-        }
-        KeyCode::Enter => {
-            buf.insert_newline();
-            content_changed = true;
-            cursor_changed = true;
-        }
-        KeyCode::Tab => {
-            // Insert real TAB; renderer will display it visually.
-            buf.insert_char('\t');
-            content_changed = true;
-            cursor_changed = true;
-        }
-        KeyCode::Char(c) => {
-            // Skip control bytes (already handled above for Ctrl-S/Q/C).
-            if (c as u32) < 0x20 || c as u32 == 0x7F {
-                return Ok(Action::Ignore);
-            }
-            buf.insert_char(c);
-            content_changed = true;
-            cursor_changed = true;
-        }
-        _ => {}
+        let _ = client.write_path("/editor/action", b"save\n");
+    }
+    if ed.quit_requested {
+        // Push current cursor before quitting so external observers
+        // see the final position. /editor/cursor write is best-effort.
+        let (cy, cx) = ed.textarea.cursor();
+        let cursor_line = format!("{cy},{cx}\n");
+        let _ = client.write_path("/editor/cursor", cursor_line.as_bytes());
+        let _ = client.write_path("/editor/action", b"quit\n");
+        *editor = None;
+        return Ok(Action::Refresh);
     }
 
-    // Push state to slate. Per CLAUDE.md slate row clause 23 + R124
-    // P3-2: /editor/content is whole-payload-replace. We push the
-    // full serialized buffer on each edit. v1.0 of SWISS-4e accepts
-    // this cost; SWISS-4e1 may add throttling (push every Nms or on
-    // focus loss).
-    if content_changed {
-        let serialized = buf.serialize();
-        if serialized.is_empty() {
-            // /editor/content rejects len=0 writes (R101 P2-2).
-            // For the empty-buffer case, we just don't push;
-            // /editor/cursor still updates.
-        } else {
-            let _ = client.write_path("/editor/content", serialized.as_bytes());
-        }
-    }
-    if cursor_changed {
-        let line = format!("{},{}\n", buf.row, buf.col);
-        let _ = client.write_path("/editor/cursor", line.as_bytes());
-    }
+    // Mid-session: push the latest cursor on every keystroke so other
+    // observers (e.g. Halcyon panes) can mirror the cursor. Content
+    // pushes happen only on save_requested (avoids the per-keystroke
+    // 1 MiB write cost; SWISS-4e1's "throttle" forward-note resolved).
+    let (cy, cx) = ed.textarea.cursor();
+    let cursor_line = format!("{cy},{cx}\n");
+    let _ = client.write_path("/editor/cursor", cursor_line.as_bytes());
 
     Ok(Action::Refresh)
 }
@@ -1236,7 +1027,7 @@ fn fetch_snapshot(
     client: &mut SlateClient,
     focus: usize,
     local_dialog: &Option<LocalDialog>,
-    editor: &Option<EditorBuffer>,
+    editor: &Option<EditorState>,
 ) -> Result<UiState> {
     let version: u64 = read_text_trim(client, "/version")?
         .parse()
@@ -1265,20 +1056,13 @@ fn fetch_snapshot(
     let editor_modified = read_text_trim(client, "/editor/modified")
         .map(|s| s == "1")
         .unwrap_or(false);
-    // SWISS-4e: when the TUI owns a local editor buffer, prefer
-    // its in-memory state for rendering (zero-latency display of
-    // edits). Otherwise fall back to slate's /editor/content.
-    let editor_preview = if let Some(buf) = editor.as_ref() {
-        buf.lines.iter().take(200).cloned().collect()
-    } else if editor_active {
-        read_lines(client, "/editor/content")
-            .unwrap_or_default()
-            .into_iter()
-            .take(200)
-            .collect()
-    } else {
-        Vec::new()
-    };
+    // SWISS-4e v1.1: editor display is now driven by a live
+    // EditorState reference passed to ui::render alongside the
+    // UiState (textarea is a tui-textarea widget, not a line
+    // snapshot). UiState retains editor_active + editor_filename
+    // + editor_modified for the status bar; the textarea itself
+    // comes from the &EditorState borrow at render time.
+    let _ = editor;
 
     Ok(UiState {
         version,
@@ -1291,7 +1075,6 @@ fn fetch_snapshot(
         editor_active,
         editor_filename,
         editor_modified,
-        editor_preview,
         local_dialog: local_dialog.clone(),
     })
 }
