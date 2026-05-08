@@ -31,13 +31,78 @@ use std::time::Duration;
 /// SWISS-4f: F3-vs-F4 distinguishes view-readonly from edit. The
 /// /event verb pipeline routes BOTH through "editor open"; this
 /// flag tells the next snapshot loop to mark the local EditorState
-/// readonly when consumed. Cleared on consumption. Atomic because
-/// run_ui's loop reads + clears in different scopes from
-/// handle_key's write.
+/// readonly when consumed. Cleared on consumption.
 static VIEW_INTENT: AtomicBool = AtomicBool::new(false);
 
 fn set_view_intent(v: bool) { VIEW_INTENT.store(v, Ordering::SeqCst); }
 fn take_view_intent() -> bool { VIEW_INTENT.swap(false, Ordering::SeqCst) }
+
+/// SWISS-4h: cross-call channel from submit_confirm (which doesn't
+/// have a CopyBatch ref) to advance_copy_batch (which does). The
+/// dialog dismiss writes here; the next loop tick consumes.
+struct ConflictResp {
+    policy: Option<ConflictPolicy>,
+    sticky: bool,
+    cancel: bool,
+}
+thread_local! {
+    static CONFLICT_RESP: std::cell::RefCell<Option<ConflictResp>>
+        = std::cell::RefCell::new(None);
+    static DELETE_CANCEL: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+/// SWISS-4h: sticky conflict resolution policy carried across a
+/// batch copy. Set when the user picks one of the *All variants in
+/// the conflict dialog; consumed for every subsequent conflict in
+/// the same batch (no further dialog).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConflictPolicy {
+    Skip,
+    Overwrite,
+    KeepBoth,
+}
+
+/// SWISS-4h: in-progress batch copy. The TUI owns this state in
+/// run_ui; each main-loop iteration advances one file when no
+/// dialog is up. On conflict, opens the conflict dialog. On
+/// dismiss-with-policy, applies + advances. On Cancel, drops
+/// the batch.
+struct CopyBatch {
+    /// Resolved (src_path, dst_path, is_dir) tuples.
+    items: Vec<(PathBuf, PathBuf, bool)>,
+    idx: usize,
+    /// Backend kind for both panels (resolved at batch start).
+    src_meta: BackendMeta,
+    dst_meta: BackendMeta,
+    /// Source / destination panel sockets when a stratumd panel is
+    /// involved. None when the route is host→host.
+    src_sock: Option<PathBuf>,
+    dst_sock: Option<PathBuf>,
+    /// Sticky policy from a prior *All pick.
+    sticky: Option<ConflictPolicy>,
+    /// Counters for the post-batch summary toast.
+    copied: usize,
+    skipped: usize,
+    failed: usize,
+}
+
+/// SWISS-4h: in-progress batch delete. Simpler than CopyBatch — no
+/// per-file conflict resolution. Single-confirm at start; loop
+/// over items.
+struct DeleteBatch {
+    /// Per-item action: HostDel(path, is_dir) or StratumDel(socket,
+    /// p9_path, is_dir).
+    items: Vec<DeleteItem>,
+    idx: usize,
+    deleted: usize,
+    failed: usize,
+}
+
+#[derive(Clone, Debug)]
+enum DeleteItem {
+    Host { path: PathBuf, is_dir: bool },
+    Stratum { socket: PathBuf, p9_path: String, is_dir: bool },
+}
 
 use crate::editor::EditorState;
 use crate::slate::{read_lines, read_text_trim, SlateClient};
@@ -136,12 +201,48 @@ fn run_ui(
     let mut focus: usize = 0;
     let mut local_dialog: Option<LocalDialog> = None;
     // SWISS-4e v1.1: EditorState (modal Helix-style) replaces the v1.0
-    // EditorBuffer. Same source-of-truth posture: TUI owns the buffer,
-    // pushes /editor/content + /editor/cursor on save_requested, sends
-    // /editor/action save / quit on quit_requested.
+    // EditorBuffer.
     let mut editor: Option<EditorState> = None;
+    // SWISS-4h: in-progress batch ops driven by the main loop.
+    let mut copy_batch: Option<CopyBatch> = None;
+    let mut delete_batch: Option<DeleteBatch> = None;
     let result = (|| -> Result<()> {
         loop {
+            // SWISS-4h: advance batch ops one step per iteration when
+            // no dialog is up. Conflict (CopyBatch) opens a dialog
+            // that pauses the loop until user picks; the next
+            // iteration resumes.
+            if local_dialog.is_none() && editor.is_none() {
+                if let Some(ref mut batch) = copy_batch {
+                    if let Some(action) = advance_copy_batch(
+                        client, &mut local_dialog, spawn.as_ref(), batch,
+                    )? {
+                        if matches!(action, BatchTick::Done) {
+                            // Show summary, drop batch.
+                            let summary = format!(
+                                "Copy: {} copied · {} skipped · {} failed",
+                                batch.copied, batch.skipped, batch.failed
+                            );
+                            local_dialog = Some(error_dialog(&summary));
+                            copy_batch = None;
+                        }
+                    }
+                }
+                if let Some(ref mut batch) = delete_batch {
+                    if let Some(action) = advance_delete_batch(
+                        spawn.as_ref(), batch,
+                    )? {
+                        if matches!(action, BatchTick::Done) {
+                            let summary = format!(
+                                "Delete: {} deleted · {} failed",
+                                batch.deleted, batch.failed
+                            );
+                            local_dialog = Some(error_dialog(&summary));
+                            delete_batch = None;
+                        }
+                    }
+                }
+            }
             let snapshot = fetch_snapshot(client, focus, &local_dialog, &editor)?;
             // SWISS-4e: editor open transition. Slate flipped
             // editor_active=true (via /event "editor open" issued by
@@ -168,7 +269,8 @@ fn run_ui(
                     match event::read()? {
                         Event::Key(key) if key.kind == KeyEventKind::Press => {
                             match handle_key(client, &mut focus, &mut local_dialog,
-                                              &mut editor, spawn.as_ref(),
+                                              &mut editor, &mut copy_batch,
+                                              &mut delete_batch, spawn.as_ref(),
                                               &snapshot, key)? {
                                 Action::Quit => return Ok(()),
                                 Action::Refresh => break,
@@ -178,6 +280,11 @@ fn run_ui(
                         Event::Resize(_, _) => break,
                         _ => {}
                     }
+                }
+                // SWISS-4h: tick the main loop so a batch in progress
+                // can advance even without keyboard activity.
+                if copy_batch.is_some() || delete_batch.is_some() {
+                    break;
                 }
                 let mut woke = false;
                 while redraw_rx.try_recv().is_ok() {
@@ -207,6 +314,8 @@ fn handle_key(
     focus: &mut usize,
     local_dialog: &mut Option<LocalDialog>,
     editor: &mut Option<EditorState>,
+    copy_batch: &mut Option<CopyBatch>,
+    delete_batch: &mut Option<DeleteBatch>,
     spawn: Option<&Arc<SpawnCtx>>,
     snap: &UiState,
     key: crossterm::event::KeyEvent,
@@ -232,6 +341,12 @@ fn handle_key(
         KeyCode::Tab => {
             *focus ^= 1;
             return Ok(Action::Refresh);
+        }
+        // SWISS-4h: spacebar toggles cursor's selection bit. Skips
+        // the synthetic ".." entry at index 0 (selecting parent
+        // dir is meaningless).
+        KeyCode::Char(' ') => {
+            return toggle_selection(client, snap, *focus);
         }
         KeyCode::Up => {
             if snap.panels[*focus].cursor > 0 {
@@ -317,11 +432,10 @@ fn handle_key(
             }
             return Ok(Action::Ignore);
         }
-        // SWISS-4d: F5 = copy active-panel cursor entry to inactive
-        // panel's CWD. v1.0 supports host→host only via std::fs;
-        // other routes forward-noted.
+        // SWISS-4d: F5 = copy active-panel cursor entry (or
+        // selection set, SWISS-4h) to inactive panel's CWD.
         KeyCode::F(5) if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-            return run_copy(local_dialog, spawn, snap, *focus);
+            return start_f5(local_dialog, copy_batch, spawn, snap, *focus);
         }
         // SWISS-4f: F7 = make directory in active panel's CWD.
         // Host-fs only at v1.0; stratum forward-noted.
@@ -341,9 +455,9 @@ fn handle_key(
             });
             return Ok(Action::Refresh);
         }
-        // SWISS-4f: F8 = delete cursor entry. Confirms first.
+        // SWISS-4f / SWISS-4h: F8 = delete cursor entry OR selection.
         KeyCode::F(8) if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-            return run_delete(local_dialog, spawn, snap, *focus);
+            return start_f8(local_dialog, delete_batch, spawn, snap, *focus);
         }
         KeyCode::F(n) if (1..=9).contains(&n) => {
             // SWISS-4b: Shift+F2 = host mount on ACTIVE panel.
@@ -539,6 +653,30 @@ fn submit_confirm(
                 std::process::Stdio::null(),
             ) {
                 *local_dialog = Some(error_dialog(&format!("delete: {e}")));
+            }
+            Ok(Action::Refresh)
+        }
+        ConfirmAction::CopyConflictBatch { src: _, dst: _, is_dir: _ } => {
+            // SWISS-4h: stash the resolution; advance_copy_batch
+            // consumes it on the next loop tick.
+            let policy = match label.as_str() {
+                "Skip" | "SkipAll" => Some(ConflictPolicy::Skip),
+                "Overwrite" | "OverwriteAll" => Some(ConflictPolicy::Overwrite),
+                "KeepBoth" | "KeepBothAll" => Some(ConflictPolicy::KeepBoth),
+                "Cancel" | _ => None,
+            };
+            let sticky = label.ends_with("All");
+            let cancel = label == "Cancel";
+            CONFLICT_RESP.with(|c| {
+                *c.borrow_mut() = Some(ConflictResp { policy, sticky, cancel });
+            });
+            Ok(Action::Refresh)
+        }
+        ConfirmAction::DeleteBatch => {
+            // SWISS-4h: F8 batch confirm. On No, signal cancel; on
+            // Yes, the DeleteBatch (already populated) advances.
+            if label != "Yes" {
+                DELETE_CANCEL.with(|c| c.set(true));
             }
             Ok(Action::Refresh)
         }
@@ -1136,10 +1274,219 @@ fn mount_stm_volume(
     }
 }
 
+/// SWISS-4h: F5 entry point. If the active panel has a selection,
+/// build a CopyBatch and let the main loop advance it. Otherwise
+/// fall through to the single-cursor copy path (run_copy).
+fn start_f5(
+    local_dialog: &mut Option<LocalDialog>,
+    copy_batch: &mut Option<CopyBatch>,
+    spawn: Option<&Arc<SpawnCtx>>,
+    snap: &UiState,
+    active: usize,
+) -> Result<Action> {
+    let panel = &snap.panels[active];
+    if !panel.connected {
+        *local_dialog = Some(error_dialog("Active panel is not connected."));
+        return Ok(Action::Refresh);
+    }
+    if panel.selection.is_empty() {
+        return run_copy(local_dialog, spawn, snap, active);
+    }
+    let sp = match spawn {
+        Some(s) => s,
+        None => {
+            *local_dialog = Some(error_dialog("Spawn helper unavailable."));
+            return Ok(Action::Refresh);
+        }
+    };
+    let inactive = 1 - active;
+    let dst_panel = &snap.panels[inactive];
+    if !dst_panel.connected {
+        *local_dialog = Some(error_dialog("Destination panel is not connected."));
+        return Ok(Action::Refresh);
+    }
+    let src_meta = sp.panel_meta(active);
+    let dst_meta = sp.panel_meta(inactive);
+    let src_sock = match &src_meta {
+        BackendMeta::Stratumd { .. } => panel_socket_for(snap, sp, active),
+        _ => None,
+    };
+    let dst_sock = match &dst_meta {
+        BackendMeta::Stratumd { .. } => panel_socket_for(snap, sp, inactive),
+        _ => None,
+    };
+
+    let src_cwd = panel.path.trim_start_matches('/');
+    let dst_cwd = dst_panel.path.trim_start_matches('/');
+    let mut items: Vec<(PathBuf, PathBuf, bool)> = Vec::new();
+    for &idx in &panel.selection {
+        let raw = match panel.raw_entries.get(idx as usize) {
+            Some(r) => r,
+            None => continue,
+        };
+        let mut parts = raw.splitn(5, ' ');
+        let kind = parts.next().unwrap_or("?");
+        let _ = parts.next();
+        let _ = parts.next();
+        let _ = parts.next();
+        let name = match parts.next() {
+            Some(n) if !n.is_empty() && n != ".." => n.to_string(),
+            _ => continue,
+        };
+        let is_dir = kind == "d";
+        let src = match &src_meta {
+            BackendMeta::HostFs { root } => {
+                let mut p = root.clone();
+                if !src_cwd.is_empty() { p.push(src_cwd); }
+                p.push(&name);
+                p
+            }
+            BackendMeta::Stratumd { .. } => {
+                let s = if src_cwd.is_empty() {
+                    format!("/{name}")
+                } else {
+                    format!("/{src_cwd}/{name}")
+                };
+                PathBuf::from(s)
+            }
+            _ => continue,
+        };
+        let dst = match &dst_meta {
+            BackendMeta::HostFs { root } => {
+                let mut p = root.clone();
+                if !dst_cwd.is_empty() { p.push(dst_cwd); }
+                p.push(&name);
+                p
+            }
+            BackendMeta::Stratumd { .. } => {
+                let s = if dst_cwd.is_empty() {
+                    format!("/{name}")
+                } else {
+                    format!("/{dst_cwd}/{name}")
+                };
+                PathBuf::from(s)
+            }
+            _ => continue,
+        };
+        items.push((src, dst, is_dir));
+    }
+
+    if items.is_empty() {
+        *local_dialog = Some(error_dialog("Nothing valid in selection."));
+        return Ok(Action::Refresh);
+    }
+    *copy_batch = Some(CopyBatch {
+        items, idx: 0,
+        src_meta, dst_meta, src_sock, dst_sock,
+        sticky: None, copied: 0, skipped: 0, failed: 0,
+    });
+    Ok(Action::Refresh)
+}
+
+/// SWISS-4h: F8 entry point. If selection has indices, batch
+/// delete; else single-cursor delete (run_delete).
+fn start_f8(
+    local_dialog: &mut Option<LocalDialog>,
+    delete_batch: &mut Option<DeleteBatch>,
+    spawn: Option<&Arc<SpawnCtx>>,
+    snap: &UiState,
+    active: usize,
+) -> Result<Action> {
+    let panel = &snap.panels[active];
+    if !panel.connected {
+        *local_dialog = Some(error_dialog("Active panel is not connected."));
+        return Ok(Action::Refresh);
+    }
+    if panel.selection.is_empty() {
+        return run_delete(local_dialog, spawn, snap, active);
+    }
+    let sp = match spawn {
+        Some(s) => s,
+        None => {
+            *local_dialog = Some(error_dialog("Spawn helper unavailable."));
+            return Ok(Action::Refresh);
+        }
+    };
+    let cwd = panel.path.trim_start_matches('/');
+    let meta = sp.panel_meta(active);
+    let sock = match &meta {
+        BackendMeta::Stratumd { .. } => panel_socket_for(snap, sp, active),
+        _ => None,
+    };
+
+    let mut items: Vec<DeleteItem> = Vec::new();
+    let mut display_names: Vec<String> = Vec::new();
+    for &idx in &panel.selection {
+        let raw = match panel.raw_entries.get(idx as usize) {
+            Some(r) => r,
+            None => continue,
+        };
+        let mut parts = raw.splitn(5, ' ');
+        let kind = parts.next().unwrap_or("?");
+        let _ = parts.next();
+        let _ = parts.next();
+        let _ = parts.next();
+        let name = match parts.next() {
+            Some(n) if !n.is_empty() && n != ".." => n.to_string(),
+            _ => continue,
+        };
+        let is_dir = kind == "d";
+        match &meta {
+            BackendMeta::HostFs { root } => {
+                let mut p = root.clone();
+                if !cwd.is_empty() { p.push(cwd); }
+                p.push(&name);
+                items.push(DeleteItem::Host { path: p, is_dir });
+            }
+            BackendMeta::Stratumd { .. } => {
+                let s = match &sock {
+                    Some(s) => s.clone(),
+                    None => continue,
+                };
+                let p9 = if cwd.is_empty() {
+                    format!("/{name}")
+                } else {
+                    format!("/{cwd}/{name}")
+                };
+                items.push(DeleteItem::Stratum { socket: s, p9_path: p9, is_dir });
+            }
+            _ => continue,
+        }
+        display_names.push(name);
+    }
+    if items.is_empty() {
+        *local_dialog = Some(error_dialog("Nothing valid in selection."));
+        return Ok(Action::Refresh);
+    }
+    let n = items.len();
+    let preview = display_names.iter()
+        .take(5)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let prompt = if n <= 5 {
+        format!("Delete {n} items?\n  {preview}")
+    } else {
+        format!("Delete {n} items?\n  {preview}, ... +{}", n - 5)
+    };
+    *delete_batch = Some(DeleteBatch { items, idx: 0, deleted: 0, failed: 0 });
+    *local_dialog = Some(LocalDialog {
+        kind: LocalDialogKind::Confirm {
+            options: vec!["Yes".into(), "No".into()],
+            selected: 1,
+            on_pick: ConfirmAction::DeleteBatch,
+        },
+        prompt,
+        value: String::new(),
+        is_password: false,
+        is_error: false,
+    });
+    Ok(Action::Refresh)
+}
+
 /// SWISS-4d v1.0: copy active-panel cursor entry to inactive panel's
-/// CWD. Both panels must be host-fs at v1.0. Synchronous — blocks
-/// the TUI for the duration. Progress dialog + cross-backend
-/// (stm↔host) routes are forward-noted.
+/// CWD. Synchronous — blocks the TUI for the duration. Progress
+/// dialog + multi-select forward-noted.
 fn run_copy(
     local_dialog: &mut Option<LocalDialog>,
     spawn: Option<&Arc<SpawnCtx>>,
@@ -1486,6 +1833,313 @@ fn run_delete(
     Ok(Action::Refresh)
 }
 
+/// SWISS-4h: ticking advancer for batch ops. Returns Done when the
+/// batch is finished, More otherwise.
+enum BatchTick { More, Done }
+
+/// SWISS-4h: advance a CopyBatch by one item. If the next item
+/// doesn't conflict (or has a sticky policy resolution), executes
+/// it and increments idx. If it conflicts and no sticky is set,
+/// opens the conflict dialog and returns More (caller pauses
+/// until user picks).
+fn advance_copy_batch(
+    _client: &mut SlateClient,
+    local_dialog: &mut Option<LocalDialog>,
+    spawn: Option<&Arc<SpawnCtx>>,
+    batch: &mut CopyBatch,
+) -> Result<Option<BatchTick>> {
+    // SWISS-4h: consume any pending dialog response. If it was
+    // Cancel, we mark the rest as skipped + finish. If it set a
+    // sticky policy, we apply it. The current item (the one whose
+    // conflict triggered the dialog) is at batch.idx; we apply
+    // policy + advance idx.
+    let resp = CONFLICT_RESP.with(|c| c.borrow_mut().take());
+    if let Some(r) = resp {
+        if r.cancel {
+            // Mark all remaining as skipped and finish.
+            let remaining = batch.items.len() - batch.idx;
+            batch.skipped += remaining;
+            batch.idx = batch.items.len();
+            return Ok(Some(BatchTick::Done));
+        }
+        if let Some(policy) = r.policy {
+            // Apply policy to the current item; if sticky, also
+            // store on the batch for subsequent conflicts.
+            if r.sticky {
+                batch.sticky = Some(policy);
+            }
+            if batch.idx < batch.items.len() {
+                let sp = match spawn {
+                    Some(s) => s,
+                    None => {
+                        batch.failed += 1;
+                        batch.idx += 1;
+                        return Ok(Some(BatchTick::More));
+                    }
+                };
+                let (src, dst, is_dir) = batch.items[batch.idx].clone();
+                let res = perform_copy_one(sp, &batch.src_meta,
+                    batch.src_sock.as_deref(), &src, &batch.dst_meta,
+                    batch.dst_sock.as_deref(), &dst, is_dir, Some(policy));
+                match res {
+                    Ok(CopyOutcome::Copied) => batch.copied += 1,
+                    Ok(CopyOutcome::Skipped) => batch.skipped += 1,
+                    Err(_) => batch.failed += 1,
+                }
+                batch.idx += 1;
+            }
+            return Ok(Some(BatchTick::More));
+        }
+    }
+
+    if batch.idx >= batch.items.len() {
+        return Ok(Some(BatchTick::Done));
+    }
+    let sp = match spawn {
+        Some(s) => s,
+        None => {
+            batch.failed += 1;
+            batch.idx += 1;
+            return Ok(Some(BatchTick::More));
+        }
+    };
+    let (src, dst, is_dir) = batch.items[batch.idx].clone();
+
+    // Conflict path. dst exists?
+    let dst_exists = match (&batch.dst_meta, &batch.dst_sock) {
+        (BackendMeta::HostFs { .. }, _) => dst.exists(),
+        (BackendMeta::Stratumd { .. }, Some(_sock)) => {
+            // Probe via `stratum fs ls` on parent — too expensive
+            // per file. Instead, attempt the write/mkdir and let
+            // it fail on EEXIST. We check exists() for HOST dst
+            // only; stratum dst's "exists" check is the write's
+            // own EEXIST behaviour. v1.0 caveat: stratum-side
+            // conflicts surface as plain errors counted as failed.
+            false
+        }
+        _ => false,
+    };
+
+    if dst_exists && batch.sticky.is_none() {
+        // Pause + open dialog.
+        let prompt = format!(
+            "Destination exists ({}/{}):\n  {}\n\nResolution?",
+            batch.idx + 1,
+            batch.items.len(),
+            dst.display()
+        );
+        *local_dialog = Some(LocalDialog {
+            kind: LocalDialogKind::Confirm {
+                options: vec![
+                    "Skip".into(), "SkipAll".into(),
+                    "Overwrite".into(), "OverwriteAll".into(),
+                    "KeepBoth".into(), "KeepBothAll".into(),
+                    "Cancel".into(),
+                ],
+                selected: 0,
+                on_pick: ConfirmAction::CopyConflictBatch {
+                    src: src.clone(),
+                    dst: dst.clone(),
+                    is_dir,
+                },
+            },
+            prompt,
+            value: String::new(),
+            is_password: false,
+            is_error: false,
+        });
+        return Ok(Some(BatchTick::More));
+    }
+
+    // Apply sticky policy if it triggers, or just copy.
+    let policy = if dst_exists {
+        batch.sticky
+    } else {
+        None
+    };
+    let res = perform_copy_one(sp, &batch.src_meta, batch.src_sock.as_deref(),
+                                &src, &batch.dst_meta, batch.dst_sock.as_deref(),
+                                &dst, is_dir, policy);
+    match res {
+        Ok(CopyOutcome::Copied) => batch.copied += 1,
+        Ok(CopyOutcome::Skipped) => batch.skipped += 1,
+        Err(_) => batch.failed += 1,
+    }
+    batch.idx += 1;
+    Ok(Some(BatchTick::More))
+}
+
+#[derive(Debug)]
+enum CopyOutcome { Copied, Skipped }
+
+fn perform_copy_one(
+    sp: &Arc<SpawnCtx>,
+    src_meta: &BackendMeta,
+    src_sock: Option<&Path>,
+    src: &Path,
+    dst_meta: &BackendMeta,
+    dst_sock: Option<&Path>,
+    dst: &Path,
+    is_dir: bool,
+    policy: Option<ConflictPolicy>,
+) -> std::io::Result<CopyOutcome> {
+    use std::io;
+    // Resolve actual dst path (may be derived for KeepBoth on host).
+    let dst_path = match policy {
+        Some(ConflictPolicy::Skip) => return Ok(CopyOutcome::Skipped),
+        Some(ConflictPolicy::Overwrite) => {
+            if let BackendMeta::HostFs { .. } = dst_meta {
+                if dst.exists() {
+                    if is_dir { let _ = std::fs::remove_dir_all(dst); }
+                    else { let _ = std::fs::remove_file(dst); }
+                }
+            }
+            dst.to_path_buf()
+        }
+        Some(ConflictPolicy::KeepBoth) => {
+            if let BackendMeta::HostFs { .. } = dst_meta {
+                derive_unique_path(dst)
+            } else {
+                // stratum-side KeepBoth not yet wired (subprocess
+                // would need an exists-probe). Use plain dst — let
+                // the write fail on EEXIST and count as failed.
+                dst.to_path_buf()
+            }
+        }
+        None => dst.to_path_buf(),
+    };
+
+    match (src_meta, dst_meta) {
+        (BackendMeta::HostFs { .. }, BackendMeta::HostFs { .. }) => {
+            if is_dir {
+                copy_dir_recursive(src, &dst_path)?;
+            } else {
+                std::fs::copy(src, &dst_path)?;
+            }
+            Ok(CopyOutcome::Copied)
+        }
+        (BackendMeta::HostFs { .. }, BackendMeta::Stratumd { .. }) => {
+            if is_dir {
+                return Err(io::Error::new(io::ErrorKind::Unsupported,
+                    "cross-backend dir copy"));
+            }
+            let sock = dst_sock.ok_or_else(||
+                io::Error::new(io::ErrorKind::Other, "dst sock missing"))?;
+            let f = std::fs::File::open(src)?;
+            let p9 = path_to_p9(&dst_path, dst_meta);
+            sp.run_stratum_fs(sock, &["write", &p9],
+                               std::process::Stdio::from(f),
+                               std::process::Stdio::null())
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            Ok(CopyOutcome::Copied)
+        }
+        (BackendMeta::Stratumd { .. }, BackendMeta::HostFs { .. }) => {
+            if is_dir {
+                return Err(io::Error::new(io::ErrorKind::Unsupported,
+                    "cross-backend dir copy"));
+            }
+            let sock = src_sock.ok_or_else(||
+                io::Error::new(io::ErrorKind::Other, "src sock missing"))?;
+            let p9 = path_to_p9(src, src_meta);
+            let f = std::fs::File::create(&dst_path)?;
+            sp.run_stratum_fs(sock, &["read", &p9],
+                               std::process::Stdio::null(),
+                               std::process::Stdio::from(f))
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            Ok(CopyOutcome::Copied)
+        }
+        (BackendMeta::Stratumd { .. }, BackendMeta::Stratumd { .. }) => {
+            if is_dir {
+                return Err(io::Error::new(io::ErrorKind::Unsupported,
+                    "cross-backend dir copy"));
+            }
+            let s_sock = src_sock.ok_or_else(||
+                io::Error::new(io::ErrorKind::Other, "src sock missing"))?;
+            let d_sock = dst_sock.ok_or_else(||
+                io::Error::new(io::ErrorKind::Other, "dst sock missing"))?;
+            let s_p9 = path_to_p9(src, src_meta);
+            let d_p9 = path_to_p9(&dst_path, dst_meta);
+            sp.pipe_stratum_fs(s_sock, &s_p9, d_sock, &d_p9)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            Ok(CopyOutcome::Copied)
+        }
+        _ => Err(io::Error::new(io::ErrorKind::Other, "panel not connected")),
+    }
+}
+
+/// Convert a host PathBuf back to a 9P path relative to the panel's
+/// backend root. For host paths we strip the host_root prefix; for
+/// stratum the path IS already 9P-shaped (we constructed it that
+/// way at gather time).
+fn path_to_p9(p: &Path, meta: &BackendMeta) -> String {
+    match meta {
+        BackendMeta::Stratumd { .. } => {
+            // Path was built as a 9P string then put into PathBuf —
+            // round-trip via to_string_lossy.
+            let s = p.to_string_lossy();
+            if s.starts_with('/') { s.into_owned() }
+            else { format!("/{s}") }
+        }
+        BackendMeta::HostFs { root } => {
+            // Strip the root prefix.
+            let stripped = p.strip_prefix(root).unwrap_or(p);
+            let s = stripped.to_string_lossy();
+            if s.starts_with('/') { s.into_owned() }
+            else { format!("/{s}") }
+        }
+        BackendMeta::None => "/".to_string(),
+    }
+}
+
+/// SWISS-4h: advance a DeleteBatch by one item. Returns Done when
+/// finished. No conflict resolution — delete is idempotent in
+/// terms of UI flow.
+fn advance_delete_batch(
+    spawn: Option<&Arc<SpawnCtx>>,
+    batch: &mut DeleteBatch,
+) -> Result<Option<BatchTick>> {
+    // SWISS-4h: cancellation flag from the F8 No-pick.
+    if DELETE_CANCEL.with(|c| {
+        let v = c.get();
+        c.set(false);
+        v
+    }) {
+        // Cancelled before deletion started — mark all as skipped
+        // (failed=0 since we didn't try). idx==0 → Done immediately.
+        batch.idx = batch.items.len();
+        return Ok(Some(BatchTick::Done));
+    }
+    if batch.idx >= batch.items.len() {
+        return Ok(Some(BatchTick::Done));
+    }
+    let item = batch.items[batch.idx].clone();
+    let res: std::io::Result<()> = match item {
+        DeleteItem::Host { path, is_dir } => {
+            if is_dir {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            }
+        }
+        DeleteItem::Stratum { socket, p9_path, is_dir } => {
+            let sp = spawn.ok_or_else(|| std::io::Error::new(
+                std::io::ErrorKind::Other, "spawn missing"))?;
+            let cmd = if is_dir { "rmdir" } else { "rm" };
+            sp.run_stratum_fs(&socket, &[cmd, &p9_path],
+                               std::process::Stdio::null(),
+                               std::process::Stdio::null())
+                .map_err(|e| std::io::Error::new(
+                    std::io::ErrorKind::Other, e.to_string()))
+        }
+    };
+    match res {
+        Ok(()) => batch.deleted += 1,
+        Err(_) => batch.failed += 1,
+    }
+    batch.idx += 1;
+    Ok(Some(BatchTick::More))
+}
+
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::create_dir(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -1591,6 +2245,48 @@ fn panel_socket_for(
         .map(PathBuf::from)
 }
 
+/// SWISS-4h: spacebar handler. Reads /panels/X/selection, toggles
+/// the cursor index, writes back. Refuses to toggle index 0 if it
+/// represents the synthetic ".." (panel.path != "/") — selecting
+/// the parent dir is meaningless.
+fn toggle_selection(
+    client: &mut SlateClient,
+    snap: &UiState,
+    focus: usize,
+) -> Result<Action> {
+    let panel = &snap.panels[focus];
+    if !panel.connected {
+        return Ok(Action::Ignore);
+    }
+    let cursor = panel.cursor;
+    // Refuse to toggle synthetic ".." at index 0 when path != "/".
+    let has_dotdot = !panel.path.is_empty() && panel.path != "/";
+    if has_dotdot && cursor == 0 {
+        return Ok(Action::Ignore);
+    }
+    // Read current selection from snap (already parsed).
+    let mut sel: Vec<u32> = panel.selection.clone();
+    if let Some(pos) = sel.iter().position(|&x| x == cursor) {
+        sel.remove(pos);
+    } else {
+        sel.push(cursor);
+        sel.sort_unstable();
+    }
+    let body = if sel.is_empty() {
+        String::from("\n")
+    } else {
+        let parts: Vec<String> = sel.iter().map(|x| x.to_string()).collect();
+        format!("{}\n", parts.join(","))
+    };
+    let path = if focus == 0 {
+        "/panels/left/selection"
+    } else {
+        "/panels/right/selection"
+    };
+    let _ = client.write_path(path, body.as_bytes());
+    Ok(Action::Refresh)
+}
+
 fn default_host_path() -> String {
     std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
@@ -1674,5 +2370,18 @@ fn read_panel(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    Ok(PanelView { path, raw_entries, cursor, connected })
+    // SWISS-4h: parse comma-separated index list from
+    // /panels/X/selection.
+    let selection: Vec<u32> = read_text_trim(client, &format!("{base}/selection"))
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .filter_map(|tok| {
+                    let t = tok.trim();
+                    if t.is_empty() { None } else { t.parse().ok() }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(PanelView { path, raw_entries, cursor, connected, selection })
 }

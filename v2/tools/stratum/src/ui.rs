@@ -114,6 +114,11 @@ pub struct PanelView {
     pub raw_entries: Vec<String>,
     pub cursor: u32,
     pub connected: bool,
+    /// SWISS-4h: indices into `raw_entries` that are currently
+    /// selected (toggled via spacebar). Sourced from
+    /// /panels/X/selection. Used to highlight rows and to drive
+    /// batch F5 / F8 operations.
+    pub selection: Vec<u32>,
 }
 
 pub struct UiState {
@@ -191,14 +196,27 @@ pub enum ConfirmAction {
         p9_path: String,
         is_dir: bool,
     },
-    /// F5 conflict resolution: dst exists. The TUI chose to
-    /// Skip/Overwrite/KeepBoth and re-runs the copy with the
+    /// F5 conflict resolution (single-file path; F5 with no selection).
+    /// User picks Skip/Overwrite/KeepBoth, runs the copy with the
     /// resolution applied.
     CopyConflict {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
         is_dir: bool,
     },
+    /// SWISS-4h: F5 batch conflict. The advancing CopyBatch hit a
+    /// conflict. User picks one of 7 options (Skip/SkipAll/Overwrite/
+    /// OverwriteAll/KeepBoth/KeepBothAll/Cancel). The dispatcher in
+    /// submit_confirm sets the sticky policy on CopyBatch when
+    /// the *All variant is picked, then resumes the batch.
+    CopyConflictBatch {
+        src: std::path::PathBuf,
+        dst: std::path::PathBuf,
+        is_dir: bool,
+    },
+    /// SWISS-4h: F8 batch delete. One confirm at start; on Yes,
+    /// the DeleteBatch advances through items.
+    DeleteBatch,
 }
 
 /// SWISS-4c: state for the mkfs wizard. v1.0 collects only Name +
@@ -496,8 +514,14 @@ fn draw_panel(frame: &mut Frame<'_>, panel: &PanelView, area: Rect, focused: boo
                 nc = name_col, dc = date_col, sc = size_col,
             );
 
+            // SWISS-4h: selection highlight. Selected rows show
+            // yellow text on a darker bg so they stand out without
+            // colliding with the cursor highlight.
+            let is_selected = panel.selection.iter().any(|s| *s as usize == i);
             let style = if i == cursor {
                 Style::default().fg(CLR_CURSOR_FG).bg(cursor_bg).bold()
+            } else if is_selected {
+                Style::default().fg(Color::Yellow).bg(CLR_BG).bold()
             } else {
                 Style::default().fg(base_clr).bg(CLR_BG)
             };
