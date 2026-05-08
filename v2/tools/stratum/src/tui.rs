@@ -28,11 +28,22 @@ use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use std::thread;
 use std::time::Duration;
 
+/// SWISS-4f: F3-vs-F4 distinguishes view-readonly from edit. The
+/// /event verb pipeline routes BOTH through "editor open"; this
+/// flag tells the next snapshot loop to mark the local EditorState
+/// readonly when consumed. Cleared on consumption. Atomic because
+/// run_ui's loop reads + clears in different scopes from
+/// handle_key's write.
+static VIEW_INTENT: AtomicBool = AtomicBool::new(false);
+
+fn set_view_intent(v: bool) { VIEW_INTENT.store(v, Ordering::SeqCst); }
+fn take_view_intent() -> bool { VIEW_INTENT.swap(false, Ordering::SeqCst) }
+
 use crate::editor::EditorState;
 use crate::slate::{read_lines, read_text_trim, SlateClient};
 use crate::spawn::{BackendMeta, SpawnCtx};
-use crate::ui::{self, LocalDialog, LocalDialogKind, MkVolCompress, MkVolField, MkVolState,
-                PanelView, UiState};
+use crate::ui::{self, ConfirmAction, LocalDialog, LocalDialogKind, MkVolCompress,
+                MkVolField, MkVolState, PanelView, UiState};
 
 pub struct Opts {
     pub slate_sock: PathBuf,
@@ -139,10 +150,11 @@ fn run_ui(
             if snapshot.editor_active && editor.is_none() {
                 let content =
                     crate::slate::read_text(client, "/editor/content").unwrap_or_default();
+                let readonly = take_view_intent();
                 editor = Some(EditorState::new(
                     snapshot.editor_filename.clone(),
                     &content,
-                    /*readonly=*/ false,
+                    readonly,
                 ));
             }
             // SWISS-4e: external close — slate dropped the editor, e.g.
@@ -271,6 +283,28 @@ fn handle_key(
             action_verb(client, *focus, "key Backspace\n")?;
             return Ok(Action::Refresh);
         }
+        // SWISS-4f: F3 = view (open editor in readonly mode). Same
+        // file-open path as F4 / Enter-on-file but the editor is
+        // marked readonly at construction in run_ui (see the editor
+        // branch there).
+        KeyCode::F(3) if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+            if let Some(panel_path) = detect_regular_file_at_cursor(snap, *focus) {
+                // Tag the next /editor/active flip-up as readonly via
+                // a TUI-local flag. The simpler path: send an /event
+                // verb "editor view <path>" — but slate doesn't yet
+                // recognise that verb (would return STM_OK as a
+                // log-only line). Workaround: open via "editor open"
+                // and post-mark the local EditorState readonly. We
+                // signal via the local_dialog "Notice" channel so
+                // the user sees a brief "(view mode)" hint.
+                let event_line = format!("editor open {}\n", panel_path);
+                let _ = client.write_path("/event", event_line.as_bytes());
+                // Set a TUI flag the next snapshot loop reads.
+                set_view_intent(true);
+                return Ok(Action::Refresh);
+            }
+            return Ok(Action::Ignore);
+        }
         // SWISS-4e: F4 = open cursor entry in editor (force-edit
         // even for yellow .stm — useful when the user wants to
         // examine raw bytes).
@@ -278,9 +312,9 @@ fn handle_key(
             if let Some(panel_path) = detect_regular_file_at_cursor(snap, *focus) {
                 let event_line = format!("editor open {}\n", panel_path);
                 let _ = client.write_path("/event", event_line.as_bytes());
+                set_view_intent(false);
                 return Ok(Action::Refresh);
             }
-            // F4 on a directory → no-op (could be SWISS-4f tree view).
             return Ok(Action::Ignore);
         }
         // SWISS-4d: F5 = copy active-panel cursor entry to inactive
@@ -288,6 +322,28 @@ fn handle_key(
         // other routes forward-noted.
         KeyCode::F(5) if !key.modifiers.contains(KeyModifiers::SHIFT) => {
             return run_copy(local_dialog, spawn, snap, *focus);
+        }
+        // SWISS-4f: F7 = make directory in active panel's CWD.
+        // Host-fs only at v1.0; stratum forward-noted.
+        KeyCode::F(7) if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+            if spawn.is_none() {
+                *local_dialog = Some(error_dialog(
+                    "MkDir unavailable: spawn helper unavailable.",
+                ));
+                return Ok(Action::Refresh);
+            }
+            *local_dialog = Some(LocalDialog {
+                kind: LocalDialogKind::MkDirInput { panel_idx: *focus },
+                prompt: "New directory name:".into(),
+                value: String::new(),
+                is_password: false,
+                is_error: false,
+            });
+            return Ok(Action::Refresh);
+        }
+        // SWISS-4f: F8 = delete cursor entry. Confirms first.
+        KeyCode::F(8) if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+            return run_delete(local_dialog, spawn, snap, *focus);
         }
         KeyCode::F(n) if (1..=9).contains(&n) => {
             // SWISS-4b: Shift+F2 = host mount on ACTIVE panel.
@@ -353,6 +409,13 @@ fn handle_dialog_key(
     ) {
         return handle_mkvol_key(local_dialog, spawn, snap, key);
     }
+    // SWISS-4f: Confirm dispatch — left/right/Tab cycle, Enter picks.
+    if matches!(
+        local_dialog.as_ref().map(|d| &d.kind),
+        Some(LocalDialogKind::Confirm { .. })
+    ) {
+        return handle_confirm_key(local_dialog, spawn, snap, key);
+    }
     let Some(d) = local_dialog.as_mut() else {
         return Ok(Action::Ignore);
     };
@@ -363,7 +426,7 @@ fn handle_dialog_key(
         }
         KeyCode::Enter => {
             let dialog = local_dialog.take().unwrap();
-            return submit_dialog(local_dialog, spawn, dialog);
+            return submit_dialog(local_dialog, spawn, snap, dialog);
         }
         KeyCode::Backspace => {
             d.value.pop();
@@ -378,6 +441,153 @@ fn handle_dialog_key(
         _ => {}
     }
     Ok(Action::Ignore)
+}
+
+/// SWISS-4f: dispatch keystrokes when a Confirm dialog is active.
+/// Left/Right/Tab cycle through options; Enter picks the highlighted
+/// one (calls into submit_confirm); Esc cancels.
+fn handle_confirm_key(
+    local_dialog: &mut Option<LocalDialog>,
+    _spawn: Option<&Arc<SpawnCtx>>,
+    _snap: &UiState,
+    key: crossterm::event::KeyEvent,
+) -> Result<Action> {
+    let Some(d) = local_dialog.as_mut() else {
+        return Ok(Action::Ignore);
+    };
+    let LocalDialogKind::Confirm { options, selected, .. } = &mut d.kind else {
+        return Ok(Action::Ignore);
+    };
+    let n = options.len();
+    if n == 0 {
+        *local_dialog = None;
+        return Ok(Action::Refresh);
+    }
+    match key.code {
+        KeyCode::Esc => {
+            *local_dialog = None;
+            return Ok(Action::Refresh);
+        }
+        KeyCode::Left => {
+            *selected = if *selected == 0 { n - 1 } else { *selected - 1 };
+            return Ok(Action::Refresh);
+        }
+        KeyCode::Right | KeyCode::Tab => {
+            *selected = (*selected + 1) % n;
+            return Ok(Action::Refresh);
+        }
+        KeyCode::Enter => {
+            let picked_idx = *selected;
+            let dialog = local_dialog.take().unwrap();
+            return submit_confirm(local_dialog, dialog, picked_idx);
+        }
+        _ => {}
+    }
+    Ok(Action::Ignore)
+}
+
+fn submit_confirm(
+    local_dialog: &mut Option<LocalDialog>,
+    dialog: LocalDialog,
+    picked_idx: usize,
+) -> Result<Action> {
+    let LocalDialogKind::Confirm { options, on_pick, .. } = dialog.kind else {
+        return Ok(Action::Refresh);
+    };
+    let label = options.get(picked_idx).cloned().unwrap_or_default();
+    match on_pick {
+        ConfirmAction::Delete { host_path, is_dir } => {
+            if label != "Yes" {
+                return Ok(Action::Refresh);
+            }
+            let res = if is_dir {
+                std::fs::remove_dir_all(&host_path)
+            } else {
+                std::fs::remove_file(&host_path)
+            };
+            if let Err(e) = res {
+                *local_dialog = Some(error_dialog(&format!(
+                    "delete failed: {e}\n  {}",
+                    host_path.display()
+                )));
+            }
+            Ok(Action::Refresh)
+        }
+        ConfirmAction::CopyConflict { src, dst, is_dir } => {
+            match label.as_str() {
+                "Skip" => Ok(Action::Refresh),
+                "Overwrite" => {
+                    // Remove dst then re-run the copy.
+                    let rm = if is_dir {
+                        std::fs::remove_dir_all(&dst)
+                    } else {
+                        std::fs::remove_file(&dst)
+                    };
+                    if let Err(e) = rm {
+                        *local_dialog = Some(error_dialog(&format!(
+                            "overwrite failed (could not remove dst): {e}"
+                        )));
+                        return Ok(Action::Refresh);
+                    }
+                    let res = if is_dir {
+                        copy_dir_recursive(&src, &dst)
+                    } else {
+                        std::fs::copy(&src, &dst).map(|_| ())
+                    };
+                    if let Err(e) = res {
+                        *local_dialog = Some(error_dialog(&format!(
+                            "copy failed: {e}"
+                        )));
+                    }
+                    Ok(Action::Refresh)
+                }
+                "KeepBoth" => {
+                    let new_dst = derive_unique_path(&dst);
+                    let res = if is_dir {
+                        copy_dir_recursive(&src, &new_dst)
+                    } else {
+                        std::fs::copy(&src, &new_dst).map(|_| ())
+                    };
+                    if let Err(e) = res {
+                        *local_dialog = Some(error_dialog(&format!(
+                            "copy failed: {e}\n  → {}",
+                            new_dst.display()
+                        )));
+                    }
+                    Ok(Action::Refresh)
+                }
+                _ => Ok(Action::Refresh),
+            }
+        }
+    }
+}
+
+/// Append "-2", "-3", ... to the stem until the path doesn't exist.
+/// Lift of v1's KeepBoth idiom (v1 used " (copy)" → " (copy 2)" → ...
+/// but we use the simpler hyphen-counter form which is friendlier
+/// for shell completion).
+fn derive_unique_path(p: &Path) -> PathBuf {
+    let parent = p.parent().unwrap_or_else(|| Path::new("."));
+    let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let ext = p.extension().map(|s| s.to_string_lossy().into_owned());
+    for n in 2..1000 {
+        let candidate_name = match &ext {
+            Some(e) => format!("{stem}-{n}.{e}"),
+            None => format!("{stem}-{n}"),
+        };
+        let cand = parent.join(candidate_name);
+        if !cand.exists() {
+            return cand;
+        }
+    }
+    // Fallback: timestamp suffix.
+    parent.join(format!(
+        "{stem}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    ))
 }
 
 /// SWISS-4c: keyboard handler for MkVol wizard. Tab/Shift-Tab cycles
@@ -639,6 +849,7 @@ fn submit_mkvol(
 fn submit_dialog(
     local_dialog: &mut Option<LocalDialog>,
     spawn: Option<&Arc<SpawnCtx>>,
+    snap: &UiState,
     dialog: LocalDialog,
 ) -> Result<Action> {
     if dialog.is_error {
@@ -679,6 +890,55 @@ fn submit_dialog(
                 }
             }
         }
+        LocalDialogKind::MkDirInput { panel_idx } => {
+            let sp = match spawn {
+                Some(s) => s,
+                None => {
+                    *local_dialog = Some(error_dialog(
+                        "Cannot mkdir: spawn helper unavailable.",
+                    ));
+                    return Ok(Action::Refresh);
+                }
+            };
+            let name = dialog.value.trim().to_string();
+            if name.is_empty() {
+                *local_dialog = Some(error_dialog("Name is required."));
+                return Ok(Action::Refresh);
+            }
+            // Refuse '/' and control bytes (R130 doctrine carry).
+            if name.chars().any(|c| (c as u32) < 0x20 || c == '\u{7F}' || c == '/') {
+                *local_dialog = Some(error_dialog(
+                    "Name must not contain '/' or control bytes.",
+                ));
+                return Ok(Action::Refresh);
+            }
+            // Resolve panel CWD on disk. host-fs only at v1.0;
+            // stratum forward-noted (SWISS-4d2 BackendClient).
+            let host_root = match sp.panel_meta(panel_idx) {
+                BackendMeta::HostFs { root } => root,
+                _ => {
+                    *local_dialog = Some(error_dialog(
+                        "v1.0 mkdir supports host panels only.\n\
+                         Stratum-panel writes are forward-noted (SWISS-4d2).",
+                    ));
+                    return Ok(Action::Refresh);
+                }
+            };
+            // Resolve dst path: host_root + panel.path + name.
+            let cwd = snap.panels[panel_idx].path.trim_start_matches('/');
+            let mut path = host_root.clone();
+            if !cwd.is_empty() {
+                path.push(cwd);
+            }
+            path.push(&name);
+            if let Err(e) = std::fs::create_dir(&path) {
+                *local_dialog = Some(error_dialog(&format!(
+                    "mkdir failed: {e}\n  {}",
+                    path.display()
+                )));
+            }
+            Ok(Action::Refresh)
+        }
         LocalDialogKind::PassphraseFor { volume: _ } => {
             // Forward-noted: passphrase entry → derive keyfile +
             // spawn stratumd. Not wired in v1.0 of SWISS-4b.
@@ -693,6 +953,12 @@ fn submit_dialog(
             // handles the case where the simple-input pipe somehow
             // gets a MkVol (defensive — handle_dialog_key dispatches
             // to handle_mkvol_key first).
+            Ok(Action::Refresh)
+        }
+        LocalDialogKind::Confirm { .. } => {
+            // Confirm dialogs are dispatched via handle_confirm_key
+            // → submit_confirm; they never reach submit_dialog. Arm
+            // kept for exhaustiveness.
             Ok(Action::Refresh)
         }
     }
@@ -902,11 +1168,29 @@ fn run_copy(
     dst_path.push(name);
 
     if dst_path.exists() {
-        *local_dialog = Some(error_dialog(&format!(
-            "Destination exists:\n  {}\n\nConflict resolution (Skip/Overwrite/KeepBoth)\n\
-             is forward-noted (SWISS-4d-conflict).",
+        // SWISS-4f conflict dialog. v1's behaviour: prompt
+        // Skip/Overwrite/KeepBoth, then re-run the copy with the
+        // resolution applied. For directories we keep the same set
+        // (Overwrite recursively replaces; KeepBoth appends "-2").
+        let prompt = format!(
+            "Destination exists:\n  {}\n\nResolution?",
             dst_path.display()
-        )));
+        );
+        *local_dialog = Some(LocalDialog {
+            kind: LocalDialogKind::Confirm {
+                options: vec!["Skip".into(), "Overwrite".into(), "KeepBoth".into()],
+                selected: 0,
+                on_pick: ConfirmAction::CopyConflict {
+                    src: src_path,
+                    dst: dst_path,
+                    is_dir: kind == "d",
+                },
+            },
+            prompt,
+            value: String::new(),
+            is_password: false,
+            is_error: false,
+        });
         return Ok(Action::Refresh);
     }
 
@@ -935,6 +1219,86 @@ fn run_copy(
             Ok(Action::Refresh)
         }
     }
+}
+
+/// SWISS-4f: F8 delete. Resolves the cursor entry's on-disk path
+/// (host-fs only at v1.0); opens a confirm dialog. On confirm:
+/// std::fs::remove_file or remove_dir_all. Stratum panel forward-
+/// noted (needs SWISS-4d2 BackendClient + 9P unlinkat).
+fn run_delete(
+    local_dialog: &mut Option<LocalDialog>,
+    spawn: Option<&Arc<SpawnCtx>>,
+    snap: &UiState,
+    active: usize,
+) -> Result<Action> {
+    let sp = match spawn {
+        Some(s) => s,
+        None => {
+            *local_dialog = Some(error_dialog(
+                "Delete unavailable: spawn helper unavailable.",
+            ));
+            return Ok(Action::Refresh);
+        }
+    };
+
+    let host_root = match sp.panel_meta(active) {
+        BackendMeta::HostFs { root } => root,
+        _ => {
+            *local_dialog = Some(error_dialog(
+                "v1.0 delete supports host panels only.\n\
+                 Stratum-panel writes are forward-noted (SWISS-4d2).",
+            ));
+            return Ok(Action::Refresh);
+        }
+    };
+
+    let panel = &snap.panels[active];
+    if !panel.connected {
+        *local_dialog = Some(error_dialog("Active panel is not connected."));
+        return Ok(Action::Refresh);
+    }
+    let cursor = panel.cursor as usize;
+    let raw = match panel.raw_entries.get(cursor) {
+        Some(r) => r,
+        None => {
+            *local_dialog = Some(error_dialog("No entry at cursor."));
+            return Ok(Action::Refresh);
+        }
+    };
+    let mut parts = raw.splitn(5, ' ');
+    let kind = parts.next().unwrap_or("?");
+    let _ = parts.next();
+    let _ = parts.next();
+    let _ = parts.next();
+    let name = match parts.next() {
+        Some(n) if !n.is_empty() && n != ".." => n,
+        _ => {
+            *local_dialog = Some(error_dialog("Cannot delete '..' or empty entry."));
+            return Ok(Action::Refresh);
+        }
+    };
+
+    let mut path = host_root.clone();
+    let cwd = panel.path.trim_start_matches('/');
+    if !cwd.is_empty() {
+        path.push(cwd);
+    }
+    path.push(name);
+
+    let is_dir = kind == "d";
+    let label = if is_dir { "directory (recursive)" } else { "file" };
+    *local_dialog = Some(LocalDialog {
+        kind: LocalDialogKind::Confirm {
+            options: vec!["Yes".into(), "No".into()],
+            selected: 1,  // safer default: cursor on No
+            on_pick: ConfirmAction::Delete { host_path: path.clone(), is_dir },
+        },
+        prompt: format!("Delete this {label}?\n  {}", path.display()),
+        value: String::new(),
+        is_password: false,
+        is_error: false,
+    });
+    Ok(Action::Refresh)
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {

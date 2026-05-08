@@ -147,6 +147,10 @@ pub enum LocalDialogKind {
     /// User asked Shift+F2 → enter a host directory to mount in the
     /// indicated panel (active panel at the time of press).
     HostMountInput { panel_idx: usize },
+    /// SWISS-4f: F7 mkdir prompt → enter a new directory name.
+    /// Created in the active panel's CWD (host-only at v1.0;
+    /// stratum panel forward-noted as SWISS-4d2).
+    MkDirInput { panel_idx: usize },
     /// User pressed Enter on a yellow `.stm` whose companion .key
     /// is missing → prompt for passphrase (forward-noted as
     /// SWISS-4b1; v1.0 shows error-style instructions only). The
@@ -158,8 +162,34 @@ pub enum LocalDialogKind {
     /// idiom). Active-panel CWD is used as the directory the new
     /// volume lands in.
     MkVol(MkVolState),
+    /// SWISS-4f: confirm dialog. Vec of options (lift of v1's
+    /// draw_confirm_dialog idiom — comma-separated label list with
+    /// arrow-key cycling). On_pick carries the post-confirm action.
+    Confirm {
+        options: Vec<String>,
+        selected: usize,
+        on_pick: ConfirmAction,
+    },
     /// Error / informational; dismiss with Esc or Enter.
     Error,
+}
+
+/// SWISS-4f: post-confirm action carried in LocalDialogKind::Confirm.
+/// The TUI's submit_dialog dispatches based on this on Enter.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub enum ConfirmAction {
+    /// F8: delete cursor entry. host_path resolves to the on-disk
+    /// path (host-fs panel only at v1.0).
+    Delete { host_path: std::path::PathBuf, is_dir: bool },
+    /// F5 conflict resolution: dst exists. The TUI chose to
+    /// Skip/Overwrite/KeepBoth and re-runs the copy with the
+    /// resolution applied.
+    CopyConflict {
+        src: std::path::PathBuf,
+        dst: std::path::PathBuf,
+        is_dir: bool,
+    },
 }
 
 /// SWISS-4c: state for the mkfs wizard. v1.0 collects only Name +
@@ -301,10 +331,12 @@ pub fn render(frame: &mut Frame<'_>, state: &UiState, editor: Option<&EditorStat
     }
     // SWISS-4b: local modal dialog renders OVER any other surface.
     if let Some(d) = state.local_dialog.as_ref() {
-        if let LocalDialogKind::MkVol(ref mk) = d.kind {
-            draw_mkvol_dialog(frame, area, mk);
-        } else {
-            draw_local_dialog(frame, area, d);
+        match &d.kind {
+            LocalDialogKind::MkVol(mk) => draw_mkvol_dialog(frame, area, mk),
+            LocalDialogKind::Confirm { options, selected, .. } => {
+                draw_confirm_dialog(frame, area, &d.prompt, options, *selected);
+            }
+            _ => draw_local_dialog(frame, area, d),
         }
     }
 }
@@ -514,19 +546,22 @@ fn draw_fkey_bar(frame: &mut Frame<'_>, area: Rect) {
     // yet handle them); the renderer routes every press as
     // `key F<N>` to /panels/X/action so future slate verbs light
     // up automatically.
-    // SWISS-4: F-key labels reflect actually-wired verbs.
+    // SWISS-4f: F-key labels match v1.
+    //   F3 = View (open editor in readonly mode)
     //   F4 = Edit (Enter on regular file ALSO opens editor)
     //   F5 = Copy (host→host, SWISS-4d v1.0)
+    //   F7 = MkDir (host panel only at v1.0; stratum forward-noted)
+    //   F8 = Delete (same constraint)
     //   F10 = Quit
     let keys: &[(&str, &str)] = &[
         ("1", ""),
         ("2", ""),
-        ("3", ""),
+        ("3", "View"),
         ("4", "Edit"),
         ("5", "Copy"),
         ("6", ""),
-        ("7", ""),
-        ("8", ""),
+        ("7", "MkDir"),
+        ("8", "Delete"),
         ("9", ""),
         ("10", "Quit"),
     ];
@@ -727,11 +762,14 @@ fn draw_local_dialog(frame: &mut Frame<'_>, area: Rect, d: &LocalDialog) {
     let title = match (&d.kind, d.is_error) {
         (_, true) => " Error ",
         (LocalDialogKind::HostMountInput { .. }, _) => " Mount host directory ",
+        (LocalDialogKind::MkDirInput { .. }, _) => " Make directory ",
         (LocalDialogKind::PassphraseFor { .. }, _) => " Passphrase ",
         (LocalDialogKind::Error, _) => " Notice ",
-        // MkVol routes through draw_mkvol_dialog (caller dispatches),
-        // never lands here. Keep arm for exhaustiveness.
+        // MkVol + Confirm route through their own draw_* helpers
+        // (caller dispatches by kind); these arms are unreachable
+        // but kept for exhaustiveness.
         (LocalDialogKind::MkVol(_), _) => " Create Stratum Volume ",
+        (LocalDialogKind::Confirm { .. }, _) => " Confirm ",
     };
     let border_clr = if d.is_error { Color::Red } else { Color::Cyan };
     let prompt_clr = if d.is_password { Color::Red } else { Color::White };
@@ -783,6 +821,74 @@ fn draw_local_dialog(frame: &mut Frame<'_>, area: Rect, d: &LocalDialog) {
             Style::default().fg(Color::DarkGray),
         )));
     }
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
+// ── SWISS-4f: confirm dialog ──────────────────────────────────────────
+//
+// Lift of v1's draw_confirm_dialog visual (cyan border, prompt, row
+// of buttons with the focused one inverted). Used by F8 delete and
+// F5 conflict resolution.
+
+fn draw_confirm_dialog(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    prompt: &str,
+    options: &[String],
+    selected: usize,
+) {
+    let body_lines = prompt.lines().count() as u16;
+    let h = (5 + body_lines).min(area.height.saturating_sub(2));
+    let w = 70.min(area.width.saturating_sub(4));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(dbl_border())
+        .border_style(Style::default().fg(Color::Cyan).bold())
+        .title(Line::from(Span::styled(
+            " Confirm ",
+            Style::default().fg(Color::Cyan).bold(),
+        )))
+        .style(Style::default().bg(CLR_POPUP_BG));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let mut lines: Vec<Line> = prompt
+        .lines()
+        .map(|s| {
+            Line::from(Span::styled(
+                sanitize_for_display(s),
+                Style::default().fg(Color::White),
+            ))
+        })
+        .collect();
+    lines.push(Line::from(""));
+
+    // Buttons row, focused option inverted (cyan bg + black fg).
+    let mut spans: Vec<Span> = vec![Span::raw("  ")];
+    for (i, opt) in options.iter().enumerate() {
+        let style = if i == selected {
+            Style::default().fg(Color::Black).bg(Color::Cyan).bold()
+        } else {
+            Style::default().fg(Color::White).bold()
+        };
+        spans.push(Span::styled(format!("  {opt}  "), style));
+        spans.push(Span::raw("  "));
+    }
+    lines.push(Line::from(spans));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "[←/→/Tab] cycle · [Enter] confirm · [Esc] cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }),
         inner,
