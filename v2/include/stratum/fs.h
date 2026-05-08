@@ -97,6 +97,11 @@ typedef struct {
      * pool path in v2. Janus (P4-4b) supersedes this with
      * process-boundary-protected backends. */
     const char *keyfile_path;
+
+    /* SWISS-4m: optional passphrase if `keyfile_path` is a KFP1
+     * (encrypted) keyfile. NULL = plaintext keyfile. */
+    const char *keyfile_passphrase;
+    size_t      keyfile_passphrase_len;
 } stm_fs_format_opts;
 
 /*
@@ -126,6 +131,15 @@ typedef struct {
      * the raw DEK arrives over 9P. Mutually exclusive with
      * `keyfile_path` — exactly one must be set. */
     const char *janus_socket;
+
+    /* SWISS-4m: optional passphrase for an encrypted (KFP1) keyfile.
+     * When set, fs_mount uses stm_keyfile_load_passphrase instead of
+     * stm_keyfile_load. The passphrase buffer is held just long
+     * enough for the KDF + AEAD-decrypt step, then no longer
+     * referenced by the FS — caller is responsible for memzero-ing
+     * the buffer after fs_mount returns. NULL = plaintext keyfile. */
+    const char *keyfile_passphrase;
+    size_t      keyfile_passphrase_len;
 } stm_fs_mount_opts;
 
 /*

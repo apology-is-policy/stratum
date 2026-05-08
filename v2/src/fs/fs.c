@@ -56,6 +56,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 
 /* ========================================================================= */
 /* In-RAM state.                                                              */
@@ -81,6 +82,19 @@ struct stm_fs {
      * mount source removes the footgun by construction. */
     char *keyfile_path;      /* owned */
     char *janus_socket;      /* owned */
+
+    /* SWISS-4m: cached passphrase for KFP1-encrypted keyfiles. NULL
+     * if the keyfile is plaintext. Held in RAM for the lifetime of
+     * the mount so stm_fs_create_dataset can re-wrap dataset DEKs
+     * without re-prompting. mlock'd best-effort; wiped + freed at
+     * unmount. Forward-note (SWISS-4m1): a cleaner architecture
+     * caches the UNWRAPPED hybrid keypair on fs and never re-reads
+     * the keyfile post-mount, eliminating this caveat — defer to
+     * a refactor chunk. The current shape preserves the existing
+     * stm_keyfile_load contract on each mutate. */
+    uint8_t *keyfile_passphrase;     /* owned (malloc + mlock) */
+    size_t   keyfile_passphrase_len;
+    size_t   keyfile_passphrase_cap; /* allocation size — for unlock + memzero */
 
     bool read_only;
     bool wedged;
@@ -237,9 +251,15 @@ stm_status stm_fs_format(const char *path, const stm_fs_format_opts *opts)
     if (!opts->keyfile_path) return STM_EINVAL;
 
     /* Load wrap keys up-front so an unreadable keyfile fails BEFORE
-     * we touch the pool device. */
+     * we touch the pool device. SWISS-4m: passphrase-aware variant
+     * if caller supplied one (KFP1 keyfile). */
     stm_hybrid_keys wk;
-    stm_status ks = stm_keyfile_load(opts->keyfile_path, &wk);
+    stm_status ks = (opts->keyfile_passphrase && opts->keyfile_passphrase_len > 0)
+        ? stm_keyfile_load_passphrase(opts->keyfile_path,
+                                          opts->keyfile_passphrase,
+                                          opts->keyfile_passphrase_len,
+                                          &wk)
+        : stm_keyfile_load(opts->keyfile_path, &wk);
     if (ks != STM_OK) return ks;
 
     stm_bdev_open_opts bopts = stm_bdev_open_opts_default();
@@ -374,7 +394,14 @@ stm_status stm_fs_mount(const char *path,
     stm_janus_client *janus = NULL;
 
     if (have_kf) {
-        stm_status ks = stm_keyfile_load(opts->keyfile_path, &wk);
+        /* SWISS-4m: if caller supplied a passphrase, the keyfile is
+         * KFP1-encrypted. Otherwise legacy plaintext path. */
+        stm_status ks = (opts->keyfile_passphrase && opts->keyfile_passphrase_len > 0)
+            ? stm_keyfile_load_passphrase(opts->keyfile_path,
+                                              opts->keyfile_passphrase,
+                                              opts->keyfile_passphrase_len,
+                                              &wk)
+            : stm_keyfile_load(opts->keyfile_path, &wk);
         if (ks != STM_OK) return ks;
     } else {
         stm_status js = stm_janus_client_connect(opts->janus_socket, &janus);
@@ -487,6 +514,26 @@ stm_status stm_fs_mount(const char *path,
         return STM_ENOMEM;
     }
 
+    /* SWISS-4m: cache the passphrase for later create_dataset reloads.
+     * Best-effort mlock to keep the page out of swap. Caller's buffer
+     * is NOT freed — they're responsible for memzero-ing it after
+     * mount returns. */
+    if (opts->keyfile_passphrase && opts->keyfile_passphrase_len > 0) {
+        size_t cap = opts->keyfile_passphrase_len;
+        uint8_t *p = malloc(cap);
+        if (!p) {
+            (void)stm_fs_unmount(fs);
+            stm_hybrid_keys_wipe(&wk);
+            if (janus) stm_janus_client_disconnect(janus);
+            return STM_ENOMEM;
+        }
+        (void)mlock(p, cap);    /* best-effort */
+        memcpy(p, opts->keyfile_passphrase, cap);
+        fs->keyfile_passphrase     = p;
+        fs->keyfile_passphrase_len = cap;
+        fs->keyfile_passphrase_cap = cap;
+    }
+
     *out_fs = fs;
     /* The raw DEK is already installed in the allocator's crypt ctx —
      * the client is no longer needed. Disconnect after sync_open; the
@@ -525,6 +572,13 @@ stm_status stm_fs_unmount(stm_fs *fs)
     pthread_mutex_destroy(&fs->lock);
     free(fs->keyfile_path);
     free(fs->janus_socket);
+    /* SWISS-4m: wipe + munlock + free the cached passphrase on unmount.
+     * Wipe BEFORE munlock so memzero hits the still-pinned page. */
+    if (fs->keyfile_passphrase) {
+        stm_ct_memzero(fs->keyfile_passphrase, fs->keyfile_passphrase_cap);
+        (void)munlock(fs->keyfile_passphrase, fs->keyfile_passphrase_cap);
+        free(fs->keyfile_passphrase);
+    }
     free(fs);
 
     return commit_status;
@@ -4122,7 +4176,13 @@ stm_status stm_fs_create_dataset(stm_fs *fs, uint64_t parent_id,
     stm_hybrid_keys   wk    = {0};
     stm_janus_client *janus = NULL;
     if (have_kf) {
-        stm_status ks = stm_keyfile_load(fs->keyfile_path, &wk);
+        /* SWISS-4m: use cached passphrase for KFP1 keyfiles. */
+        stm_status ks = (fs->keyfile_passphrase && fs->keyfile_passphrase_len > 0)
+            ? stm_keyfile_load_passphrase(fs->keyfile_path,
+                                              (const char *)fs->keyfile_passphrase,
+                                              fs->keyfile_passphrase_len,
+                                              &wk)
+            : stm_keyfile_load(fs->keyfile_path, &wk);
         if (ks != STM_OK) return ks;
     } else {
         stm_status js = stm_janus_client_connect(fs->janus_socket, &janus);

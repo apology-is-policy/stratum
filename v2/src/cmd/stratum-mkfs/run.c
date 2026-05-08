@@ -36,6 +36,8 @@
 #include <stratum/keyfile.h>
 #include <stratum/types.h>
 
+#include "../cli_passphrase.h"
+
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -67,6 +69,10 @@ static void usage(void)
 "  --keyfile PATH   Path to read/write the PQ-hybrid keyfile.\n"
 "                   If file exists, it's used as-is. If missing, one is\n"
 "                   generated. Default: IMAGE.key.\n"
+"  --passphrase-stdin  Read a passphrase line from stdin and use it to\n"
+"                   wrap the keyfile (KFP1 format). The passphrase is\n"
+"                   required at every stratumd open after this. Mutually\n"
+"                   exclusive with the unencrypted-keyfile path.\n"
 "  --bootstrap SIZE Bootstrap pool size. Default: 16M (auto-scaled to\n"
 "                   max(64MiB, device/1024) by libfs if 0).\n"
 "  -h, --help       Print this help.\n",
@@ -117,6 +123,7 @@ int stm_cmd_mkfs_main(int argc, char **argv)
     uint64_t   device_bytes   = DEFAULT_DEVICE_BYTES;
     uint64_t   bootstrap_bytes = DEFAULT_BOOTSTRAP_BYTES;
     const char *keyfile_path  = NULL;
+    bool       passphrase_stdin = false;
 
     /* Parse remaining flags. */
     for (int i = 2; i < argc; i++) {
@@ -142,6 +149,8 @@ int stm_cmd_mkfs_main(int argc, char **argv)
             if (i + 1 >= argc) { fputs("--keyfile requires an argument\n", stderr); return 1; }
             keyfile_path = argv[i + 1];
             i++;
+        } else if (strcmp(argv[i], "--passphrase-stdin") == 0) {
+            passphrase_stdin = true;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage();
             return 0;
@@ -178,9 +187,44 @@ int stm_cmd_mkfs_main(int argc, char **argv)
         keyfile_path = default_key_path;
     }
 
-    /* Generate keyfile if missing. */
+    /* SWISS-4m: passphrase buffer kept across format + post-mount
+     * + dataset-init + commit + unmount. Wiped once at function
+     * exit. */
+    char   passbuf[STM_CLI_PASSPHRASE_MAX + 1];
+    size_t plen = 0;
+    bool   have_pass = false;
+    if (passphrase_stdin) {
+        stm_cli_passphrase_lock_best_effort(passbuf, sizeof passbuf);
+        stm_status rs = stm_cli_read_passphrase_stdin(passbuf, sizeof passbuf, &plen);
+        if (rs != STM_OK || plen == 0) {
+            stm_ct_memzero(passbuf, sizeof passbuf);
+            stm_cli_passphrase_unlock(passbuf, sizeof passbuf);
+            fprintf(stderr,
+                "stratum-mkfs: failed to read passphrase from stdin "
+                "(empty or > %u bytes)\n",
+                (unsigned)STM_CLI_PASSPHRASE_MAX);
+            return 1;
+        }
+        have_pass = true;
+    }
+
+    /* Generate keyfile if missing. With --passphrase-stdin, we ALWAYS
+     * generate a fresh KFP1-encrypted file (refusing to overwrite
+     * pre-existing would surprise the user). */
     struct stat st;
-    if (stat(keyfile_path, &st) != 0) {
+    if (have_pass) {
+        stm_status rc = stm_keyfile_generate_passphrase(keyfile_path,
+                                                              passbuf, plen);
+        if (rc != STM_OK) {
+            stm_ct_memzero(passbuf, sizeof passbuf);
+            stm_cli_passphrase_unlock(passbuf, sizeof passbuf);
+            fprintf(stderr,
+                "stratum-mkfs: stm_keyfile_generate_passphrase(%s) failed: "
+                "status=%d\n", keyfile_path, (int)rc);
+            return 2;
+        }
+        fprintf(stderr, "generated encrypted keyfile: %s\n", keyfile_path);
+    } else if (stat(keyfile_path, &st) != 0) {
         if (errno != ENOENT) {
             fprintf(stderr, "stratum-mkfs: cannot stat keyfile %s: %s\n",
                     keyfile_path, strerror(errno));
@@ -203,33 +247,40 @@ int stm_cmd_mkfs_main(int argc, char **argv)
     derive_uuid(device_uuid, 0x44455600);  /* 'DEV\0' */
 
     stm_fs_format_opts fopts = {
-        .device_size_bytes    = device_bytes,
-        .bootstrap_size_bytes = bootstrap_bytes,
-        .pool_uuid            = { pool_uuid[0],   pool_uuid[1]   },
-        .device_uuid          = { device_uuid[0], device_uuid[1] },
-        .keyfile_path         = keyfile_path,
+        .device_size_bytes        = device_bytes,
+        .bootstrap_size_bytes     = bootstrap_bytes,
+        .pool_uuid                = { pool_uuid[0],   pool_uuid[1]   },
+        .device_uuid              = { device_uuid[0], device_uuid[1] },
+        .keyfile_path             = keyfile_path,
+        .keyfile_passphrase       = have_pass ? passbuf : NULL,
+        .keyfile_passphrase_len   = have_pass ? plen    : 0,
     };
 
     /* Phase 1: format. */
+    int exit_code = 0;
     fprintf(stderr, "formatting %s (%llu bytes)...\n",
             image_path, (unsigned long long)device_bytes);
     stm_status rc = stm_fs_format(image_path, &fopts);
     if (rc != STM_OK) {
         fprintf(stderr, "stratum-mkfs: stm_fs_format failed: status=%d\n", (int)rc);
-        return 2;
+        exit_code = 2;
+        goto cleanup;
     }
 
     /* Phase 2: mount, init dataset root id=1, unmount. */
     stm_fs_mount_opts mopts = {
-        .read_only    = false,
-        .keyfile_path = keyfile_path,
+        .read_only                = false,
+        .keyfile_path             = keyfile_path,
+        .keyfile_passphrase       = have_pass ? passbuf : NULL,
+        .keyfile_passphrase_len   = have_pass ? plen    : 0,
     };
     stm_fs *fs = NULL;
     rc = stm_fs_mount(image_path, &mopts, &fs);
     if (rc != STM_OK) {
         fprintf(stderr, "stratum-mkfs: stm_fs_mount post-format failed: status=%d\n",
                 (int)rc);
-        return 2;
+        exit_code = 2;
+        goto cleanup;
     }
     uint64_t root_ino = 0;
     rc = stm_fs_init_dataset_root(fs, /*ds=*/1u,
@@ -239,18 +290,21 @@ int stm_cmd_mkfs_main(int argc, char **argv)
     if (rc != STM_OK) {
         fprintf(stderr, "stratum-mkfs: init_dataset_root failed: status=%d\n", (int)rc);
         (void)stm_fs_unmount(fs);
-        return 2;
+        exit_code = 2;
+        goto cleanup;
     }
     rc = stm_fs_commit(fs);
     if (rc != STM_OK) {
         fprintf(stderr, "stratum-mkfs: commit failed: status=%d\n", (int)rc);
         (void)stm_fs_unmount(fs);
-        return 2;
+        exit_code = 2;
+        goto cleanup;
     }
     rc = stm_fs_unmount(fs);
     if (rc != STM_OK) {
         fprintf(stderr, "stratum-mkfs: unmount failed: status=%d\n", (int)rc);
-        return 2;
+        exit_code = 2;
+        goto cleanup;
     }
 
     fprintf(stderr,
@@ -259,5 +313,14 @@ int stm_cmd_mkfs_main(int argc, char **argv)
         image_path,
         (unsigned long long)root_ino,
         image_path);
-    return 0;
+
+cleanup:
+    /* SWISS-4m: wipe + munlock the passphrase buffer regardless of
+     * exit path. Stack-allocated, so munlock + memzero is enough —
+     * the storage is freed when this stack frame unwinds. */
+    if (have_pass) {
+        stm_ct_memzero(passbuf, sizeof passbuf);
+        stm_cli_passphrase_unlock(passbuf, sizeof passbuf);
+    }
+    return exit_code;
 }

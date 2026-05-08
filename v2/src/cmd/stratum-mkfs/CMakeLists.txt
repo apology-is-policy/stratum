@@ -10,7 +10,7 @@ target_include_directories(stm_cmd_mkfs PUBLIC
 
 target_link_libraries(stm_cmd_mkfs
     PRIVATE stm_warnings stm_sanitize stm_coverage
-    PUBLIC  stratum)
+    PUBLIC  stratum stm_cli_passphrase)
 
 add_executable(stratum-mkfs
     main.c)

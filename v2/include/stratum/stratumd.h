@@ -111,6 +111,14 @@ typedef struct stm_stratumd_opts {
     const char *janus_socket;     /* janus-daemon-routed unwrap */
     bool        read_only;        /* mount read-only */
 
+    /* SWISS-4m: optional passphrase for KFP1-encrypted keyfiles.
+     * When non-NULL, stratumd uses the passphrase-aware mount path.
+     * Forwarded into stm_fs_mount_opts; daemon caches it for the
+     * mount's lifetime so create_dataset can re-wrap. Buffer is
+     * caller-owned; daemon does NOT wipe it. */
+    const char *keyfile_passphrase;
+    size_t      keyfile_passphrase_len;
+
     /* Listen config. */
     const char *socket_path;      /* required (FS Unix socket path) */
     const char *ctl_socket_path;  /* P9-CTL-2c: optional /ctl/ socket

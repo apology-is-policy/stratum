@@ -694,9 +694,11 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
         return STM_EINVAL;
 
     stm_fs_mount_opts mopts = {
-        .read_only    = opts->read_only,
-        .keyfile_path = opts->keyfile_path,
-        .janus_socket = opts->janus_socket,
+        .read_only             = opts->read_only,
+        .keyfile_path          = opts->keyfile_path,
+        .janus_socket          = opts->janus_socket,
+        .keyfile_passphrase     = opts->keyfile_passphrase,
+        .keyfile_passphrase_len = opts->keyfile_passphrase_len,
     };
 
     stm_fs *fs = NULL;

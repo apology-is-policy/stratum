@@ -28,6 +28,7 @@ mod editor;
 mod embed;
 mod ffi;
 mod landing;
+mod passphrase;
 mod slate;
 mod spawn;
 mod tui;

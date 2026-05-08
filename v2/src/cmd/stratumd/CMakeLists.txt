@@ -30,7 +30,7 @@ target_include_directories(stm_cmd_stratumd PUBLIC
 
 target_link_libraries(stm_cmd_stratumd
     PRIVATE stm_warnings stm_sanitize stm_coverage
-    PUBLIC  stm_stratumd stratum)
+    PUBLIC  stm_stratumd stratum stm_cli_passphrase)
 
 # Daemon binary — thin main.c wrapper.
 add_executable(stratumd

@@ -24,9 +24,12 @@
  */
 
 #include <stratum/cmds.h>
+#include <stratum/crypto.h>
 #include <stratum/stratumd.h>
 #include <stratum/sync.h>
 #include <stratum/types.h>
+
+#include "../cli_passphrase.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -92,6 +95,8 @@ static void usage(const char *argv0)
             "(opt-in; if unset, /ctl/ is disabled)\n"
         "  --keyfile <path>         Hybrid-wrap keypair file "
             "(legacy in-process unwrap)\n"
+        "  --passphrase-stdin       Read a passphrase from stdin to unlock\n"
+        "                           a KFP1-encrypted keyfile (SWISS-4m)\n"
         "  --janus-socket <path>    janus-daemon Unix socket for unwrap "
             "(mutually exclusive with --keyfile)\n"
         "  --read-only              Mount the filesystem read-only\n"
@@ -119,6 +124,8 @@ int stm_cmd_stratumd_main(int argc, char **argv)
     opts.root_dataset = 1u;
     opts.stop_flag    = &g_stop_flag;
 
+    bool want_passphrase_stdin = false;
+
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
@@ -135,6 +142,10 @@ int stm_cmd_stratumd_main(int argc, char **argv)
         }
         if (!strcmp(a, "--keyfile") && i + 1 < argc) {
             opts.keyfile_path = argv[++i];
+            continue;
+        }
+        if (!strcmp(a, "--passphrase-stdin")) {
+            want_passphrase_stdin = true;
             continue;
         }
         if (!strcmp(a, "--janus-socket") && i + 1 < argc) {
@@ -202,6 +213,41 @@ int stm_cmd_stratumd_main(int argc, char **argv)
 
     install_signal_handlers();
 
+    /* SWISS-4m: read passphrase from stdin BEFORE printing "serving"
+     * banner — that way the user's terminal redirects stdin cleanly
+     * (e.g., `printf 'pw\n' | stratum serve …`). Buffer is heap-
+     * allocated, mlock'd best-effort, and freed/wiped at the end of
+     * this function so the passphrase doesn't outlive the daemon
+     * lifecycle from this entry point. (The fs handle ALSO caches
+     * its own copy for the mount lifetime — see stm_fs.c. Both
+     * copies are wiped at their respective scope ends.) */
+    uint8_t *passbuf = NULL;
+    size_t   passlen = 0;
+    size_t   passcap = 0;
+    if (want_passphrase_stdin) {
+        passcap = STM_CLI_PASSPHRASE_MAX + 1;
+        passbuf = malloc(passcap);
+        if (!passbuf) {
+            fprintf(stderr, "stratumd: out of memory for passphrase buffer\n");
+            return 2;
+        }
+        stm_cli_passphrase_lock_best_effort(passbuf, passcap);
+        stm_status pr = stm_cli_read_passphrase_stdin((char *)passbuf,
+                                                            passcap, &passlen);
+        if (pr != STM_OK || passlen == 0) {
+            stm_ct_memzero(passbuf, passcap);
+            stm_cli_passphrase_unlock(passbuf, passcap);
+            free(passbuf);
+            fprintf(stderr,
+                "stratumd: failed to read passphrase from stdin "
+                "(empty or > %u bytes)\n",
+                (unsigned)STM_CLI_PASSPHRASE_MAX);
+            return 1;
+        }
+        opts.keyfile_passphrase     = (const char *)passbuf;
+        opts.keyfile_passphrase_len = passlen;
+    }
+
     fprintf(stderr,
             "stratumd: serving %s on %s (backlog=%d, msize=%u, ds=%llu, ro=%d)\n",
             opts.fs_path, opts.socket_path,
@@ -214,6 +260,16 @@ int stm_cmd_stratumd_main(int argc, char **argv)
     }
 
     stm_status rc = stm_stratumd_run(&opts);
+
+    /* Wipe + free our local passphrase buffer regardless of rc.
+     * stm_fs already cached its own copy at mount time, so wiping
+     * here doesn't break runtime ops. */
+    if (passbuf) {
+        stm_ct_memzero(passbuf, passcap);
+        stm_cli_passphrase_unlock(passbuf, passcap);
+        free(passbuf);
+    }
+
     if (rc != STM_OK) {
         fprintf(stderr, "stratumd: run failed (rc=%d)\n", (int)rc);
         return 2;

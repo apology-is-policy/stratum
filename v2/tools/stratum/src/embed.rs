@@ -58,10 +58,16 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
             bail!("volume {} does not exist; run `stratum mkfs` first", v.display());
         }
     }
+    /* SWISS-4m: default host-fs root is `/` so the entire host
+     * filesystem is browsable. The previous CWD-as-root behavior
+     * implicitly restricted what the user could navigate to and
+     * had no parent-directory escape (panel.path is host-fs-rooted).
+     * Rooting at `/` removes the artificial restriction without
+     * adding any new escape vector — `/` IS the universal parent. */
     let host_root = opts
         .host
         .clone()
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
+        .unwrap_or_else(|| PathBuf::from("/"));
     if !host_root.exists() || !host_root.is_dir() {
         bail!(
             "--host {} must exist and be a directory",
@@ -138,7 +144,40 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
             p.set_file_name(new_name);
             p
         });
-        let stratumd_args: Vec<String> = vec![
+
+        // SWISS-4m: detect KFP1-encrypted keyfile and prompt for the
+        // passphrase BEFORE entering the TUI. The prompt happens on
+        // /dev/tty (echo OFF), then the passphrase is piped into
+        // stratumd's stdin via --passphrase-stdin. The Rust-side
+        // buffer is wiped on drop via the Zeroizing wrapper.
+        let needs_passphrase = match crate::passphrase::is_keyfile_encrypted(&keyfile) {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = host_fs_child.kill();
+                let _ = cleanup_session_dir(&session_dir);
+                return Err(e.context(format!(
+                    "inspect keyfile {}", keyfile.display()
+                )));
+            }
+        };
+        let passphrase = if needs_passphrase {
+            let label = format!(
+                "Passphrase for {}: ",
+                vol.file_name().unwrap_or_default().to_string_lossy()
+            );
+            match crate::passphrase::prompt_passphrase(&label) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    let _ = host_fs_child.kill();
+                    let _ = cleanup_session_dir(&session_dir);
+                    return Err(e.context("read passphrase"));
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut stratumd_args: Vec<String> = vec![
             "serve".into(),
             vol.to_string_lossy().into_owned(),
             "--listen".into(),
@@ -154,13 +193,52 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
             "--ctl-listen".into(),
             session_dir.join("stratumd-ctl.sock").to_string_lossy().into_owned(),
         ];
-        let child = Command::new(&me)
+        if passphrase.is_some() {
+            stratumd_args.push("--passphrase-stdin".into());
+        }
+        let stdin_setup = if passphrase.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        };
+        let mut child = Command::new(&me)
             .args(&stratumd_args)
+            .stdin(stdin_setup)
             .stdout(Stdio::null())
             .stderr(open_log("stratumd")?)
             .process_group(0)
             .spawn()
             .with_context(|| format!("spawn stratumd via {}", me.display()))?;
+
+        // Pipe passphrase to stratumd's stdin then close. Stratumd's
+        // run.c reads ONE line so we append '\n'. The Rust-side
+        // buffer's Zeroizing wrapper wipes when the binding goes
+        // out of scope at the end of the `if let Some(vol)` block.
+        if let Some(pass) = passphrase.as_ref() {
+            use std::io::Write as _;
+            if let Some(mut sin) = child.stdin.take() {
+                let mut to_write = Vec::with_capacity(pass.len() + 1);
+                to_write.extend_from_slice(pass.as_bytes());
+                to_write.push(b'\n');
+                let wr = sin.write_all(&to_write);
+                // Wipe the local copy NOW (the original Zeroizing
+                // wrapper still wipes on drop, but the duplicate
+                // would otherwise linger past pipe-close).
+                for b in to_write.iter_mut() {
+                    unsafe { std::ptr::write_volatile(b as *mut u8, 0); }
+                }
+                drop(sin);
+                if let Err(e) = wr {
+                    let _ = child.kill();
+                    let _ = host_fs_child.kill();
+                    let _ = cleanup_session_dir(&session_dir);
+                    return Err(anyhow!(e).context("pipe passphrase to stratumd"));
+                }
+            }
+        }
+        // `passphrase` (Zeroizing) drops here, wiping its buffer.
+        drop(passphrase);
+
         stratumd_child = Some(child);
         if let Err(e) = wait_for_sock(&stratumd_sock, Duration::from_secs(5)) {
             if let Some(c) = stratumd_child.as_mut() {
