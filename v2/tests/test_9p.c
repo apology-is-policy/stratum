@@ -1006,6 +1006,43 @@ STM_TEST(p9_lopen_dir_with_wronly_returns_eisdir) {
     unlink(g_key_path);
 }
 
+STM_TEST(p9_lopen_dir_with_o_trunc_returns_eisdir) {
+    /* R128 P1-1 (user-reported 2026-05-08): O_TRUNC on a directory
+     * surfaced as EINVAL (cryptic "status=-22" client-side) when
+     * stratum-fs's cmd_write fell back to lopen+TRUNC after lcreate→
+     * EEXIST on a path that existed as a dir. Server now returns
+     * EISDIR (POSIX-correct), letting the client distinguish "wrong
+     * type at destination" from "malformed flags".
+     *
+     * This test pins the regression: Tlopen on root (a dir) with
+     * STM_9P_O_WRONLY | STM_9P_O_TRUNC must return Rlerror EISDIR. */
+    make_tmp("9p_lopen_dir_trunc");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    uint64_t root = 0;
+    p9_alloc_root_dir(fs, &root);
+
+    stm_9p_server *s = make_server(fs);
+    do_version_attach(s, 100);
+
+    uint8_t *req = malloc(RBUF), *resp = malloc(RBUF);
+    uint32_t rlen = 0;
+    uint32_t sz = build_tlopen(req, 2, 100,
+                                  STM_9P_O_WRONLY | STM_9P_O_TRUNC);
+    STM_ASSERT_OK(stm_9p_server_handle(s, req, sz, resp, RBUF, &rlen));
+    STM_ASSERT_EQ(resp[4], STM_9P_RLERROR);
+    STM_ASSERT_EQ(load_u32(resp + 7), STM_9P_ECODE_EISDIR);
+
+    free(req); free(resp);
+    stm_9p_server_destroy(s);
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST(p9_lopen_o_directory_on_file_returns_enotdir) {
     make_tmp("9p_lopen_odir_on_file");
     stm_fs_format_opts fopts = default_format_opts();

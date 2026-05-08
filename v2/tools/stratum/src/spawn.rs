@@ -251,12 +251,22 @@ impl SpawnCtx {
             .process_group(0)
             .output()?;
         if !out.status.success() {
+            // R128 P3-1: prefer stratum-fs's own stderr line as the
+            // user-facing message — it already starts with the "stratum-fs:"
+            // prefix and (post-R128) carries clear messages like
+            // "X is a directory; refusing to overwrite with file" or
+            // "walk parent: status=-2". The args list debug-print is
+            // noisy in dialog overlays; only surface it when stderr is
+            // empty (rare — would mean the binary segfaulted).
             let stderr = String::from_utf8_lossy(&out.stderr);
+            let first = stderr.lines().next().unwrap_or("").trim();
+            if !first.is_empty() {
+                bail!("{} (exit {})", first, out.status.code().unwrap_or(-1));
+            }
             bail!(
-                "stratum fs {:?} failed (exit {}): {}",
+                "stratum fs {:?} failed (exit {}, no stderr)",
                 args,
-                out.status.code().unwrap_or(-1),
-                stderr.lines().next().unwrap_or("(no detail)").trim()
+                out.status.code().unwrap_or(-1)
             );
         }
         Ok(())

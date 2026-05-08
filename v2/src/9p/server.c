@@ -1591,9 +1591,19 @@ static stm_status h_lopen(stm_9p_server *s,
         return reply_rlerror(resp, resp_cap, resp_len, tag, STM_9P_ECODE_EISDIR);
 
     /* O_TRUNC on a regular file: truncate to 0. Refused on dirs +
-     * symlinks (Linux behavior). For RO opens, EACCES. */
+     * symlinks. POSIX-correct error mapping (R128 P1-1 — user-reported
+     * 2026-05-08 status=-22 confusion when copying a host file to a
+     * stratum path that already exists as a directory): O_TRUNC on a
+     * directory must surface as EISDIR (not EINVAL), so callers can
+     * distinguish "wrong type at destination" from "malformed flags".
+     * O_TRUNC on a symlink stays EINVAL (Linux POSIX behavior; we
+     * never follow symlinks at the 9P server boundary). RO opens
+     * with O_TRUNC are EACCES per Linux. */
     if (flags & STM_9P_O_TRUNC) {
-        if (is_dir || (mode & 0170000u) == 0120000u)
+        if (is_dir)
+            return reply_rlerror(resp, resp_cap, resp_len, tag,
+                                  STM_9P_ECODE_EISDIR);
+        if ((mode & 0170000u) == 0120000u)
             return reply_rlerror(resp, resp_cap, resp_len, tag,
                                   STM_9P_ECODE_EINVAL);
         if (accmode == STM_9P_O_RDONLY)

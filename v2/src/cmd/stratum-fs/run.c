@@ -410,13 +410,46 @@ static int cmd_write(stm_9p_client *c, int argc, char **argv)
      * Falling back to walk-then-lopen on ENOTSUPPORTED treats them
      * the same as EEXIST does for real filesystems. */
     if (rc == STM_EEXIST || rc == STM_ENOTSUPPORTED) {
-        /* Already exists — clunk parent, walk to file, open + truncate. */
+        /* Already exists — clunk parent, walk to file, open + truncate.
+         *
+         * R128 P1-1 (user-reported 2026-05-08 EINVAL on host→stm copy
+         * when destination existed as a directory): before lopen with
+         * O_TRUNC, getattr to verify the existing entry is a regular
+         * file. If it's a dir or symlink, surface a clean error
+         * BEFORE the server's TRUNC-on-non-regular path fires. The
+         * server's posture (with this commit) returns EISDIR on dir,
+         * but the client-side pre-check gives a friendlier message
+         * AND saves a round-trip on the always-failing path. Symlinks
+         * stay EINVAL (Linux behavior: O_TRUNC on symlink is unspec). */
         (void)stm_9p_clunk(c, WORK_FID);
         path_t p_full;
         if (parse_path(argv[0], &p_full) < 0) return EXIT_USAGE;
         rc = stm_9p_walk(c, ROOT_FID, WORK_FID,
                              p_full.count, p_full.names, qids, &walked);
         if (rc != STM_OK) { perr("walk file", rc); return status_to_exit(rc); }
+        stm_9p_attr a;
+        rc = stm_9p_getattr(c, WORK_FID, STM_9P_GETATTR_MODE, &a);
+        if (rc != STM_OK) {
+            perr("getattr", rc);
+            (void)stm_9p_clunk(c, WORK_FID);
+            return status_to_exit(rc);
+        }
+        uint32_t typ = a.mode & 0170000u;
+        if (typ == 0040000u) {                      /* S_IFDIR */
+            fprintf(stderr,
+                "stratum-fs: %s is a directory; refusing to overwrite with file\n",
+                argv[0]);
+            (void)stm_9p_clunk(c, WORK_FID);
+            return EXIT_IO;
+        }
+        if (typ != 0100000u && typ != 0u) {         /* not S_IFREG */
+            fprintf(stderr,
+                "stratum-fs: %s is not a regular file (mode=0%o); "
+                "refusing to overwrite\n",
+                argv[0], a.mode);
+            (void)stm_9p_clunk(c, WORK_FID);
+            return EXIT_IO;
+        }
         rc = stm_9p_lopen(c, WORK_FID,
                               STM_9P_O_WRONLY | STM_9P_O_TRUNC, &q, NULL);
         if (rc != STM_OK) {
