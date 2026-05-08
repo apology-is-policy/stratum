@@ -291,14 +291,16 @@ impl MkVolState {
     }
 
     pub fn next_field(&mut self) {
+        // SWISS-4n1: Compress field is hidden until mkfs accepts a
+        // compression flag — skip it in the cycle.
         self.field = match self.field {
             MkVolField::Name => MkVolField::Size,
             MkVolField::Size => MkVolField::Encrypt,
             MkVolField::Encrypt => {
-                if self.encrypt { MkVolField::Passphrase } else { MkVolField::Compress }
+                if self.encrypt { MkVolField::Passphrase } else { MkVolField::Ok }
             }
-            MkVolField::Passphrase => MkVolField::Compress,
-            MkVolField::Compress => MkVolField::Ok,
+            MkVolField::Passphrase => MkVolField::Ok,
+            MkVolField::Compress => MkVolField::Ok,    // unreachable but tidy
             MkVolField::Ok => MkVolField::Cancel,
             MkVolField::Cancel => MkVolField::Name,
         };
@@ -310,10 +312,10 @@ impl MkVolState {
             MkVolField::Size => MkVolField::Name,
             MkVolField::Encrypt => MkVolField::Size,
             MkVolField::Passphrase => MkVolField::Encrypt,
-            MkVolField::Compress => {
+            MkVolField::Compress => MkVolField::Encrypt,
+            MkVolField::Ok => {
                 if self.encrypt { MkVolField::Passphrase } else { MkVolField::Encrypt }
             }
-            MkVolField::Ok => MkVolField::Compress,
             MkVolField::Cancel => MkVolField::Ok,
         };
     }
@@ -811,7 +813,7 @@ fn draw_dialog_overlay(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     // /slate/ prefix — slate is the daemon, the synfs root IS the
     // slate tree).
     let body = format!(
-        "Active dialog ids: {}\n\nslate-tty v1.0 doesn't yet drive dialogs.\n\nDismiss from another client:\n  echo <option> > /dialogs/<id>/result",
+        "Active dialog ids: {}\n\nDialog input not yet wired into the TUI.\n\nDismiss from another client:\n  echo <option> > /dialogs/<id>/result",
         sanitize_for_display(&state.dialog_stack)
     );
     let lines: Vec<Line> = body.lines().map(|s| Line::from(s.to_string())).collect();
@@ -1099,10 +1101,8 @@ fn draw_mkvol_dialog(frame: &mut Frame<'_>, area: Rect, mk: &MkVolState) {
             Constraint::Length(1),   // Name
             Constraint::Length(1),   // Size
             Constraint::Length(1),   // spacer
-            Constraint::Length(1),   // Encrypt
-            Constraint::Length(1),   // Passphrase
-            Constraint::Length(1),   // spacer
-            Constraint::Length(1),   // Compression
+            Constraint::Length(1),   // Use passphrase
+            Constraint::Length(1),   // Passphrase (when on)
             Constraint::Length(1),   // spacer
             Constraint::Length(1),   // Error / tip
             Constraint::Min(0),      // filler
@@ -1116,7 +1116,10 @@ fn draw_mkvol_dialog(frame: &mut Frame<'_>, area: Rect, mk: &MkVolState) {
     render_mkvol_field(frame, rows[1], "Size:", &mk.size,
                        mk.field == MkVolField::Size, false);
 
-    // Encrypt checkbox (forward-noted as SWISS-4c1).
+    // SWISS-4n1: rename "Encryption" → "Use passphrase". Volumes are
+    // always encrypted at the AEAD layer; the user's only choice is
+    // whether to wrap the keyfile under a KDF-derived KEK (passphrase
+    // protection) or leave it as a plaintext file beside the volume.
     {
         let focused = mk.field == MkVolField::Encrypt;
         let box_txt = if mk.encrypt { "[X]" } else { "[ ]" };
@@ -1126,10 +1129,10 @@ fn draw_mkvol_dialog(frame: &mut Frame<'_>, area: Rect, mk: &MkVolState) {
                      else { Style::default().fg(Color::White) };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(format!(" {:<14}", "Encryption:"), lstyle),
+                Span::styled(format!(" {:<14}", "Use passphrase:"), lstyle),
                 Span::styled(
-                    format!(" {box_txt} {} (v2 always-on)",
-                            if mk.encrypt { "on " } else { "off" }),
+                    format!(" {box_txt} {}",
+                            if mk.encrypt { "yes" } else { "no" }),
                     vstyle,
                 ),
             ])),
@@ -1137,43 +1140,23 @@ fn draw_mkvol_dialog(frame: &mut Frame<'_>, area: Rect, mk: &MkVolState) {
         );
     }
 
-    // Passphrase row (forward-noted as SWISS-4c1).
+    // Passphrase row — visible only when "Use passphrase" is on.
     if mk.encrypt {
         render_mkvol_field(frame, rows[4], "Passphrase:", &mk.passphrase,
                            mk.field == MkVolField::Passphrase, true);
     } else {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                " Passphrase:    (always on at v2.0; SWISS-4c1)",
+                " Passphrase:    (skipped — keyfile stored unencrypted)",
                 Style::default().fg(Color::DarkGray),
             ))),
             rows[4],
         );
     }
-
-    // Compression selector (forward-noted as SWISS-4c1).
-    {
-        let focused = mk.field == MkVolField::Compress;
-        let lstyle = if focused { Style::default().fg(Color::Yellow).bold() }
-                     else { Style::default().fg(Color::White) };
-        let mk_seg = |label: &'static str, is_sel: bool| {
-            let style = if is_sel {
-                if focused { Style::default().fg(Color::Black).bg(Color::Cyan).bold() }
-                else       { Style::default().fg(Color::Cyan).bold() }
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            Span::styled(format!(" {label} "), style)
-        };
-        let spans = vec![
-            Span::styled(format!(" {:<14}", "Compression:"), lstyle),
-            Span::raw(" "),
-            mk_seg("lz4",  mk.compress == MkVolCompress::Lz4),
-            mk_seg("zstd", mk.compress == MkVolCompress::Zstd),
-            mk_seg("none", mk.compress == MkVolCompress::None),
-        ];
-        frame.render_widget(Paragraph::new(Line::from(spans)), rows[6]);
-    }
+    // SWISS-4n1 forward-note: compression selector hidden until mkfs
+    // can set per-dataset compression at format time. Today the user
+    // can change compression after mount via dataset properties; the
+    // wizard offering algos that mkfs ignored was misleading.
 
     if let Some(err) = mk.error.as_deref() {
         frame.render_widget(
@@ -1181,7 +1164,7 @@ fn draw_mkvol_dialog(frame: &mut Frame<'_>, area: Rect, mk: &MkVolState) {
                 format!(" {err}"),
                 Style::default().fg(Color::Red).bold(),
             ))),
-            rows[8],
+            rows[6],
         );
     }
 
@@ -1200,7 +1183,7 @@ fn draw_mkvol_dialog(frame: &mut Frame<'_>, area: Rect, mk: &MkVolState) {
             Span::raw("    "),
             Span::styled("  Cancel  ", btn(cancel_focused)),
         ];
-        frame.render_widget(Paragraph::new(Line::from(spans)), rows[10]);
+        frame.render_widget(Paragraph::new(Line::from(spans)), rows[8]);
     }
 
     frame.render_widget(
@@ -1208,7 +1191,7 @@ fn draw_mkvol_dialog(frame: &mut Frame<'_>, area: Rect, mk: &MkVolState) {
             " Tab/Shift-Tab: next/prev field   Space: toggle   Esc: cancel",
             Style::default().fg(Color::DarkGray),
         ))),
-        rows[11],
+        rows[9],
     );
 }
 

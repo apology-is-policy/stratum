@@ -315,7 +315,14 @@ fn run_ui(
                                 "Copy: {} copied · {} skipped · {} failed",
                                 batch.copied, batch.skipped, batch.failed
                             );
-                            local_dialog = Some(error_dialog(&summary));
+                            // SWISS-4n1: success summary uses info_dialog
+                            // (green) unless something actually failed.
+                            let dlg = if batch.failed == 0 {
+                                info_dialog(&summary)
+                            } else {
+                                error_dialog(&summary)
+                            };
+                            local_dialog = Some(dlg);
                             copy_batch = None;
                         }
                     }
@@ -329,7 +336,12 @@ fn run_ui(
                                 "Delete: {} deleted · {} failed",
                                 batch.deleted, batch.failed
                             );
-                            local_dialog = Some(error_dialog(&summary));
+                            let dlg = if batch.failed == 0 {
+                                info_dialog(&summary)
+                            } else {
+                                error_dialog(&summary)
+                            };
+                            local_dialog = Some(dlg);
                             delete_batch = None;
                         }
                     }
@@ -1203,26 +1215,53 @@ fn submit_mkvol(
     // Spawn `stratum mkfs` synchronously and wait for it to finish.
     // mkfs is a one-shot; it doesn't open a socket. We use Command
     // instead of SpawnCtx::spawn_inner for this reason.
+    //
+    // SWISS-4n1: when the user enabled "Use passphrase", append
+    // --passphrase-stdin and pipe the passphrase via child stdin.
+    // The duplicate write buffer is wiped immediately after pipe
+    // close; the wizard's own MkVolState.passphrase dies with the
+    // dialog when this function returns.
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     let me = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("stratum"));
-    let mkfs_status = Command::new(&me)
-        .args(&[
-            "mkfs",
-            volume_path.to_string_lossy().as_ref(),
-            "--size",
-            size,
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .output();
+
+    let want_passphrase = mk.encrypt && !mk.passphrase.is_empty();
+    let mkfs_status = (|| -> std::io::Result<std::process::Output> {
+        let mut cmd = Command::new(&me);
+        cmd.arg("mkfs")
+            .arg(volume_path.to_string_lossy().as_ref())
+            .arg("--size").arg(size)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        if want_passphrase {
+            cmd.arg("--passphrase-stdin").stdin(Stdio::piped());
+        } else {
+            cmd.stdin(Stdio::null());
+        }
+        let mut child = cmd.spawn()?;
+        if want_passphrase {
+            use std::io::Write as _;
+            if let Some(mut sin) = child.stdin.take() {
+                let mut buf = Vec::with_capacity(mk.passphrase.len() + 1);
+                buf.extend_from_slice(mk.passphrase.as_bytes());
+                buf.push(b'\n');
+                let wr = sin.write_all(&buf);
+                for b in buf.iter_mut() {
+                    unsafe { std::ptr::write_volatile(b as *mut u8, 0); }
+                }
+                drop(sin);
+                wr?;
+            }
+        }
+        child.wait_with_output()
+    })();
     match mkfs_status {
         Ok(out) if out.status.success() => {
             // Volume created. The keyfile lives at <volume>.key.
             // Don't auto-mount — let the user press Enter on the new
             // .stm to mount it (preserves the SWISS-4b workflow).
-            *local_dialog = Some(error_dialog(&format!(
+            *local_dialog = Some(info_dialog(&format!(
                 "Created {}. Press Enter on it to mount.",
                 volume_path.display()
             )));
@@ -1480,6 +1519,20 @@ fn error_dialog(msg: &str) -> LocalDialog {
         value: String::new(),
         is_password: false,
         is_error: true,
+    }
+}
+
+/// SWISS-4n1: counterpart for non-error informational dialogs.
+/// Same layout as `error_dialog` but `is_error=false` flips the
+/// border/heading style green so users don't confuse "Copy: 5 copied"
+/// summary surfaces with actual failures.
+fn info_dialog(msg: &str) -> LocalDialog {
+    LocalDialog {
+        kind: LocalDialogKind::Error,    // shape only — see is_error
+        prompt: msg.to_string(),
+        value: String::new(),
+        is_password: false,
+        is_error: false,
     }
 }
 
@@ -1884,7 +1937,7 @@ fn run_copy(
                 std::fs::copy(&src, &dst).map(|_| ())
             };
             match res {
-                Ok(()) => *local_dialog = Some(error_dialog(&format!(
+                Ok(()) => *local_dialog = Some(info_dialog(&format!(
                     "Copied:\n  {} → {}",
                     src.display(), dst.display()
                 ))),
