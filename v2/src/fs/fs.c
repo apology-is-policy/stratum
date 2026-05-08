@@ -83,18 +83,22 @@ struct stm_fs {
     char *keyfile_path;      /* owned */
     char *janus_socket;      /* owned */
 
-    /* SWISS-4m: cached passphrase for KFP1-encrypted keyfiles. NULL
-     * if the keyfile is plaintext. Held in RAM for the lifetime of
-     * the mount so stm_fs_create_dataset can re-wrap dataset DEKs
-     * without re-prompting. mlock'd best-effort; wiped + freed at
-     * unmount. Forward-note (SWISS-4m1): a cleaner architecture
-     * caches the UNWRAPPED hybrid keypair on fs and never re-reads
-     * the keyfile post-mount, eliminating this caveat — defer to
-     * a refactor chunk. The current shape preserves the existing
-     * stm_keyfile_load contract on each mutate. */
-    uint8_t *keyfile_passphrase;     /* owned (malloc + mlock) */
-    size_t   keyfile_passphrase_len;
-    size_t   keyfile_passphrase_cap; /* allocation size — for unlock + memzero */
+    /* SWISS-4m1: cached UNWRAPPED hybrid wrap keys for any subsequent
+     * stm_fs_create_dataset (or other future mutate-needing path).
+     * Populated at mount AFTER the keyfile has been loaded + the
+     * pool/sync layers have taken what they need; wiped + freed at
+     * unmount. This replaces SWISS-4m's cached-passphrase posture:
+     * the plaintext passphrase no longer lives past stm_fs_mount's
+     * KDF call — only the (still-secret) hybrid keypair survives,
+     * which the caller would have had to keep alive anyway. mlock'd
+     * best-effort.
+     *
+     * The struct's storage is heap-allocated so the wipe + munlock
+     * pair at unmount can target an exact extent. NULL when the fs
+     * was mounted via janus (the daemon owns the unwrap path; no
+     * keyfile-load reload is needed for create_dataset since the
+     * janus client connects fresh each time). */
+    stm_hybrid_keys *cached_keys;    /* owned (malloc + mlock) */
 
     bool read_only;
     bool wedged;
@@ -514,24 +518,27 @@ stm_status stm_fs_mount(const char *path,
         return STM_ENOMEM;
     }
 
-    /* SWISS-4m: cache the passphrase for later create_dataset reloads.
-     * Best-effort mlock to keep the page out of swap. Caller's buffer
-     * is NOT freed — they're responsible for memzero-ing it after
-     * mount returns. */
-    if (opts->keyfile_passphrase && opts->keyfile_passphrase_len > 0) {
-        size_t cap = opts->keyfile_passphrase_len;
-        uint8_t *p = malloc(cap);
-        if (!p) {
+    /* SWISS-4m1: cache the UNWRAPPED hybrid keypair for later
+     * stm_fs_create_dataset reloads. Eliminates the SWISS-4m cached-
+     * passphrase posture — plaintext bytes no longer survive past the
+     * mount's KDF call. The wrap keys are exactly as sensitive as
+     * the dataset DEKs they wrap, so no new exposure here.
+     * Best-effort mlock to keep the page out of swap.
+     *
+     * Skipped for janus-routed mounts: the janus client reconnects
+     * fresh on each create_dataset call; no fs-side cache needed. */
+    if (have_kf) {
+        stm_hybrid_keys *cached = malloc(sizeof *cached);
+        if (!cached) {
             (void)stm_fs_unmount(fs);
             stm_hybrid_keys_wipe(&wk);
             if (janus) stm_janus_client_disconnect(janus);
             return STM_ENOMEM;
         }
-        (void)mlock(p, cap);    /* best-effort */
-        memcpy(p, opts->keyfile_passphrase, cap);
-        fs->keyfile_passphrase     = p;
-        fs->keyfile_passphrase_len = cap;
-        fs->keyfile_passphrase_cap = cap;
+        (void)mlock(cached, sizeof *cached);
+        memcpy(cached->pk, wk.pk, sizeof wk.pk);
+        memcpy(cached->sk, wk.sk, sizeof wk.sk);
+        fs->cached_keys = cached;
     }
 
     *out_fs = fs;
@@ -572,12 +579,13 @@ stm_status stm_fs_unmount(stm_fs *fs)
     pthread_mutex_destroy(&fs->lock);
     free(fs->keyfile_path);
     free(fs->janus_socket);
-    /* SWISS-4m: wipe + munlock + free the cached passphrase on unmount.
-     * Wipe BEFORE munlock so memzero hits the still-pinned page. */
-    if (fs->keyfile_passphrase) {
-        stm_ct_memzero(fs->keyfile_passphrase, fs->keyfile_passphrase_cap);
-        (void)munlock(fs->keyfile_passphrase, fs->keyfile_passphrase_cap);
-        free(fs->keyfile_passphrase);
+    /* SWISS-4m1: wipe + munlock + free the cached hybrid keys on
+     * unmount. Wipe BEFORE munlock so memzero hits the still-pinned
+     * page. */
+    if (fs->cached_keys) {
+        stm_hybrid_keys_wipe(fs->cached_keys);
+        (void)munlock(fs->cached_keys, sizeof *fs->cached_keys);
+        free(fs->cached_keys);
     }
     free(fs);
 
@@ -4176,14 +4184,20 @@ stm_status stm_fs_create_dataset(stm_fs *fs, uint64_t parent_id,
     stm_hybrid_keys   wk    = {0};
     stm_janus_client *janus = NULL;
     if (have_kf) {
-        /* SWISS-4m: use cached passphrase for KFP1 keyfiles. */
-        stm_status ks = (fs->keyfile_passphrase && fs->keyfile_passphrase_len > 0)
-            ? stm_keyfile_load_passphrase(fs->keyfile_path,
-                                              (const char *)fs->keyfile_passphrase,
-                                              fs->keyfile_passphrase_len,
-                                              &wk)
-            : stm_keyfile_load(fs->keyfile_path, &wk);
-        if (ks != STM_OK) return ks;
+        /* SWISS-4m1: use cached UNWRAPPED keypair installed at mount.
+         * No reload-from-disk; no plaintext passphrase needed
+         * post-mount. Falls back to plaintext keyfile load if the
+         * cache is missing — defensive (cached_keys SHOULD always be
+         * non-NULL post-mount when have_kf is true; this fallback
+         * preserves the old contract for any future code path that
+         * fs_new's without going through stm_fs_mount). */
+        if (fs->cached_keys) {
+            memcpy(wk.pk, fs->cached_keys->pk, sizeof wk.pk);
+            memcpy(wk.sk, fs->cached_keys->sk, sizeof wk.sk);
+        } else {
+            stm_status ks = stm_keyfile_load(fs->keyfile_path, &wk);
+            if (ks != STM_OK) return ks;
+        }
     } else {
         stm_status js = stm_janus_client_connect(fs->janus_socket, &janus);
         if (js != STM_OK) return js;
