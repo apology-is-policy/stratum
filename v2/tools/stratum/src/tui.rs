@@ -172,6 +172,8 @@ struct CopyBatch {
     copied: usize,
     skipped: usize,
     failed: usize,
+    /// SWISS-4n2: clock origin for throughput display.
+    start_time: Instant,
 }
 
 /// SWISS-4h: in-progress batch delete. Simpler than CopyBatch — no
@@ -380,6 +382,7 @@ fn run_ui(
                     .and_then(|(_src, dst, _is_dir)| dst.file_name()
                         .map(|s| s.to_string_lossy().into_owned()))
                     .unwrap_or_default();
+                let elapsed_secs = b.start_time.elapsed().as_secs_f64();
                 CopyProgress {
                     idx: b.idx,
                     total: b.items.len(),
@@ -387,6 +390,8 @@ fn run_ui(
                     copied: b.copied,
                     skipped: b.skipped,
                     failed: b.failed,
+                    bytes_done: read_bytes_done(),
+                    elapsed_secs,
                 }
             });
             terminal.draw(|frame| {
@@ -1751,10 +1756,19 @@ fn start_f5(
         *local_dialog = Some(error_dialog("Nothing valid in selection."));
         return Ok(Action::Refresh);
     }
+    // SWISS-4n2: expand directory items into a flat list of leaves +
+    // intermediate dirs (top-down). Preserves the existing per-item
+    // conflict-resolution flow — sticky policy continues to apply
+    // across all items, including expanded children.
+    let expanded = expand_dirs_in_items(&sp, &src_meta, src_sock.as_deref(),
+                                            &dst_meta, items);
+    // SWISS-4n2: reset bytes-done counter for the new batch.
+    reset_bytes_done();
     *copy_batch = Some(CopyBatch {
-        items, idx: 0,
+        items: expanded, idx: 0,
         src_meta, dst_meta, src_sock, dst_sock,
         sticky: None, copied: 0, skipped: 0, failed: 0,
+        start_time: Instant::now(),
     });
     Ok(Action::Refresh)
 }
@@ -2389,58 +2403,254 @@ fn perform_copy_one(
     match (src_meta, dst_meta) {
         (BackendMeta::HostFs { .. }, BackendMeta::HostFs { .. }) => {
             if is_dir {
-                copy_dir_recursive(src, &dst_path)?;
+                // SWISS-4n2: directory items are now expanded at
+                // start_f5; per-item dir = mkdir only. Children
+                // arrive as separate items.
+                std::fs::create_dir_all(&dst_path)?;
             } else {
                 std::fs::copy(src, &dst_path)?;
+                bump_bytes(dst_path.metadata().ok().map(|m| m.len()).unwrap_or(0));
             }
             Ok(CopyOutcome::Copied)
         }
         (BackendMeta::HostFs { .. }, BackendMeta::Stratumd { .. }) => {
-            if is_dir {
-                return Err(io::Error::new(io::ErrorKind::Unsupported,
-                    "cross-backend dir copy"));
-            }
             let sock = dst_sock.ok_or_else(||
                 io::Error::new(io::ErrorKind::Other, "dst sock missing"))?;
-            let f = std::fs::File::open(src)?;
-            let p9 = path_to_p9(&dst_path, dst_meta);
-            sp.run_stratum_fs(sock, &["write", &p9],
-                               std::process::Stdio::from(f),
-                               std::process::Stdio::null())
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            if is_dir {
+                let p9 = path_to_p9(&dst_path, dst_meta);
+                // mkdir is idempotent enough for our usage — ignore
+                // STM_EEXIST silently when the dir already exists
+                // (Overwrite policy = "merge into existing dir").
+                let _ = sp.run_stratum_fs(sock, &["mkdir", &p9],
+                    std::process::Stdio::null(),
+                    std::process::Stdio::null());
+            } else {
+                let sz = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+                let f = std::fs::File::open(src)?;
+                let p9 = path_to_p9(&dst_path, dst_meta);
+                sp.run_stratum_fs(sock, &["write", &p9],
+                                   std::process::Stdio::from(f),
+                                   std::process::Stdio::null())
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                bump_bytes(sz);
+            }
             Ok(CopyOutcome::Copied)
         }
         (BackendMeta::Stratumd { .. }, BackendMeta::HostFs { .. }) => {
-            if is_dir {
-                return Err(io::Error::new(io::ErrorKind::Unsupported,
-                    "cross-backend dir copy"));
-            }
             let sock = src_sock.ok_or_else(||
                 io::Error::new(io::ErrorKind::Other, "src sock missing"))?;
-            let p9 = path_to_p9(src, src_meta);
-            let f = std::fs::File::create(&dst_path)?;
-            sp.run_stratum_fs(sock, &["read", &p9],
-                               std::process::Stdio::null(),
-                               std::process::Stdio::from(f))
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            if is_dir {
+                std::fs::create_dir_all(&dst_path)?;
+            } else {
+                let p9 = path_to_p9(src, src_meta);
+                let f = std::fs::File::create(&dst_path)?;
+                sp.run_stratum_fs(sock, &["read", &p9],
+                                   std::process::Stdio::null(),
+                                   std::process::Stdio::from(f))
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                let sz = std::fs::metadata(&dst_path).map(|m| m.len()).unwrap_or(0);
+                bump_bytes(sz);
+            }
             Ok(CopyOutcome::Copied)
         }
         (BackendMeta::Stratumd { .. }, BackendMeta::Stratumd { .. }) => {
-            if is_dir {
-                return Err(io::Error::new(io::ErrorKind::Unsupported,
-                    "cross-backend dir copy"));
-            }
             let s_sock = src_sock.ok_or_else(||
                 io::Error::new(io::ErrorKind::Other, "src sock missing"))?;
             let d_sock = dst_sock.ok_or_else(||
                 io::Error::new(io::ErrorKind::Other, "dst sock missing"))?;
-            let s_p9 = path_to_p9(src, src_meta);
-            let d_p9 = path_to_p9(&dst_path, dst_meta);
-            sp.pipe_stratum_fs(s_sock, &s_p9, d_sock, &d_p9)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            if is_dir {
+                let p9 = path_to_p9(&dst_path, dst_meta);
+                let _ = sp.run_stratum_fs(d_sock, &["mkdir", &p9],
+                    std::process::Stdio::null(),
+                    std::process::Stdio::null());
+                let _ = s_sock; // unused for the mkdir path
+            } else {
+                let s_p9 = path_to_p9(src, src_meta);
+                let d_p9 = path_to_p9(&dst_path, dst_meta);
+                sp.pipe_stratum_fs(s_sock, &s_p9, d_sock, &d_p9)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                // Stat the destination for throughput accounting.
+                if let Ok(out) = sp.run_stratum_fs_capture(
+                    d_sock, &["stat", &d_p9]) {
+                    bump_bytes(parse_stratum_stat_size(&out));
+                }
+            }
             Ok(CopyOutcome::Copied)
         }
         _ => Err(io::Error::new(io::ErrorKind::Other, "panel not connected")),
+    }
+}
+
+// ── SWISS-4n2: directory expansion + bytes counter ──────────────────
+//
+// `expand_dirs_in_items` walks every directory entry in `items`
+// top-down (mkdir before children) and produces a flat list of
+// (src, dst, is_dir) tuples. The existing batch loop drives each
+// tuple through perform_copy_one; conflict resolution + sticky
+// policy continue to apply per-item, which is what the user
+// expects: pick "OverwriteAll" once and the rest of the recursive
+// copy proceeds without further prompts.
+//
+// Subprocess fan-out: each stm directory listing spawns
+// `stratum fs ls`; sizes for stm-side throughput estimation
+// require a second `stratum fs stat`. Acceptable for v1.0;
+// SWISS-4d2 (Rust BackendClient) is the perf upgrade.
+
+thread_local! {
+    pub static COPY_BYTES_DONE: std::cell::Cell<u64> = std::cell::Cell::new(0);
+}
+fn bump_bytes(n: u64) {
+    COPY_BYTES_DONE.with(|c| c.set(c.get().saturating_add(n)));
+}
+fn read_bytes_done() -> u64 {
+    COPY_BYTES_DONE.with(|c| c.get())
+}
+fn reset_bytes_done() {
+    COPY_BYTES_DONE.with(|c| c.set(0));
+}
+
+/// Parse `stratum fs ls` output ("kind name\n" per entry). Skips
+/// "." / "..".
+fn parse_stratum_ls(stdout: &[u8]) -> Vec<(char, String)> {
+    let s = String::from_utf8_lossy(stdout);
+    let mut out = Vec::new();
+    for line in s.lines() {
+        let mut parts = line.splitn(2, ' ');
+        let kind = match parts.next() {
+            Some(k) => k.chars().next().unwrap_or('?'),
+            None => continue,
+        };
+        let name = match parts.next() {
+            Some(n) if !n.is_empty() => n,
+            _ => continue,
+        };
+        if name == "." || name == ".." { continue; }
+        out.push((kind, name.to_string()));
+    }
+    out
+}
+
+/// Parse `stratum fs stat` output for the size field.
+fn parse_stratum_stat_size(stdout: &[u8]) -> u64 {
+    let s = String::from_utf8_lossy(stdout);
+    for line in s.lines() {
+        if let Some(rest) = line.trim().strip_prefix("size:") {
+            if let Ok(v) = rest.trim().parse::<u64>() {
+                return v;
+            }
+        }
+    }
+    0
+}
+
+/// SWISS-4n2: expand any directory items in `items` into a flat list
+/// of (intermediate_dirs + leaf_files) tuples. Non-directory items
+/// pass through unchanged. The caller's expanded list is suitable
+/// for direct use as CopyBatch.items — the batch loop's per-item
+/// conflict + sticky machinery handles each entry uniformly.
+fn expand_dirs_in_items(
+    sp: &Arc<SpawnCtx>,
+    src_meta: &BackendMeta,
+    src_sock: Option<&Path>,
+    dst_meta: &BackendMeta,
+    items: Vec<(PathBuf, PathBuf, bool)>,
+) -> Vec<(PathBuf, PathBuf, bool)> {
+    let mut out = Vec::with_capacity(items.len());
+    for (src, dst, is_dir) in items {
+        if !is_dir {
+            out.push((src, dst, false));
+            continue;
+        }
+        // Push the dir itself first (top-down ordering).
+        out.push((src.clone(), dst.clone(), true));
+        // Then walk children.
+        match src_meta {
+            BackendMeta::HostFs { .. } => {
+                walk_host_subtree(&src, &dst, &mut out);
+            }
+            BackendMeta::Stratumd { .. } => {
+                if let Some(sock) = src_sock {
+                    walk_stm_subtree(sp, sock, src_meta, &src,
+                                       dst_meta, &dst, &mut out);
+                }
+                // Without a src sock, we can't enumerate — drop
+                // the children. The dir itself was already pushed,
+                // so the user gets at least the empty dir created.
+            }
+            BackendMeta::None => {}
+        }
+    }
+    out
+}
+
+/// Walk a host-fs subtree top-down; append (src_path, dst_path,
+/// is_dir) tuples to `out`. The `dst_path` is interpreted by the
+/// destination backend at copy time (host PathBuf or stm-style
+/// 9P-string-as-PathBuf).
+fn walk_host_subtree(
+    src: &Path,
+    dst: &Path,
+    out: &mut Vec<(PathBuf, PathBuf, bool)>,
+) {
+    let read_dir = match std::fs::read_dir(src) {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    for entry in read_dir.flatten() {
+        let name = entry.file_name();
+        let mut sub_src = src.to_path_buf(); sub_src.push(&name);
+        // dst is either a host PathBuf or a 9P-shape string-in-PathBuf.
+        // Either way Path::join with the entry name DTRTs (forward
+        // slash on Unix).
+        let mut sub_dst = dst.to_path_buf(); sub_dst.push(&name);
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.is_dir() {
+            out.push((sub_src.clone(), sub_dst.clone(), true));
+            walk_host_subtree(&sub_src, &sub_dst, out);
+        } else if meta.is_file() {
+            out.push((sub_src, sub_dst, false));
+        }
+        // symlinks / sockets / fifos skipped — cross-backend
+        // semantics undefined at v1.0.
+    }
+}
+
+/// Walk a stratumd subtree top-down via subprocess `stratum fs ls`.
+/// Same output shape as walk_host_subtree; the src PathBuf is the
+/// 9P path string round-tripped through PathBuf for uniformity with
+/// the rest of the batch flow.
+fn walk_stm_subtree(
+    sp: &Arc<SpawnCtx>,
+    sock: &Path,
+    src_meta: &BackendMeta,
+    src: &Path,
+    dst_meta: &BackendMeta,
+    dst: &Path,
+    out: &mut Vec<(PathBuf, PathBuf, bool)>,
+) {
+    let p9_root = path_to_p9(src, src_meta);
+    let listing = match sp.run_stratum_fs_capture(sock, &["ls", &p9_root]) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    for (kind, name) in parse_stratum_ls(&listing) {
+        let sub_p9 = format!("{}/{}", p9_root.trim_end_matches('/'), name);
+        let sub_src = PathBuf::from(&sub_p9);
+        let mut sub_dst = dst.to_path_buf(); sub_dst.push(&name);
+        match kind {
+            'd' => {
+                out.push((sub_src.clone(), sub_dst.clone(), true));
+                walk_stm_subtree(sp, sock, src_meta, &sub_src,
+                                   dst_meta, &sub_dst, out);
+            }
+            '-' | 'l' | 'f' => {
+                out.push((sub_src, sub_dst, false));
+            }
+            _ => {}
+        }
     }
 }
 

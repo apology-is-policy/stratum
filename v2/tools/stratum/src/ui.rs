@@ -343,6 +343,13 @@ pub struct CopyProgress {
     pub copied: usize,
     pub skipped: usize,
     pub failed: usize,
+    /// SWISS-4n2: bytes completed in this batch (sum of host-side
+    /// file sizes for cross-backend; std::fs::copy result for host→
+    /// host). Drives the throughput line. 0 when no bytes have
+    /// landed yet (early items still in flight).
+    pub bytes_done: u64,
+    /// Seconds since the batch started. Used for rate calc.
+    pub elapsed_secs: f64,
 }
 
 // ── main draw ─────────────────────────────────────────────────────────
@@ -915,8 +922,8 @@ fn draw_local_dialog(frame: &mut Frame<'_>, area: Rect, d: &LocalDialog) {
 // File-level progress + counters cover the v1 UX hump.
 
 fn draw_copy_progress(frame: &mut Frame<'_>, area: Rect, cp: &CopyProgress) {
-    let w = 64u16.min(area.width.saturating_sub(4));
-    let h = 9u16;
+    let w = 70u16.min(area.width.saturating_sub(4));
+    let h = 10u16;
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let rect = Rect::new(x, y, w, h);
@@ -940,6 +947,7 @@ fn draw_copy_progress(frame: &mut Frame<'_>, area: Rect, cp: &CopyProgress) {
             Constraint::Length(1), // file label
             Constraint::Length(1), // bar
             Constraint::Length(1), // counters
+            Constraint::Length(1), // SWISS-4n2: throughput/ETA line
             Constraint::Min(0),
             Constraint::Length(1), // hint
         ])
@@ -990,13 +998,69 @@ fn draw_copy_progress(frame: &mut Frame<'_>, area: Rect, cp: &CopyProgress) {
         rows[2],
     );
 
+    // SWISS-4n2: throughput line.
+    //   - "1.2 MB/s · 4.5 MB · 3.7s" when bytes have started flowing
+    //   - "starting…" when no bytes yet (early items still in flight)
+    let throughput_line = if cp.bytes_done > 0 && cp.elapsed_secs > 0.05 {
+        let rate = (cp.bytes_done as f64) / cp.elapsed_secs;
+        format!(
+            " {} · {} · elapsed {}",
+            format_rate(rate),
+            format_bytes(cp.bytes_done),
+            format_secs(cp.elapsed_secs),
+        )
+    } else {
+        " starting…".to_string()
+    };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            " [Esc] cancel batch · per-byte progress forward-noted",
+            throughput_line,
+            Style::default().fg(Color::Cyan),
+        ))),
+        rows[3],
+    );
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " [Esc] cancel batch",
             Style::default().fg(Color::DarkGray),
         ))),
-        rows[4],
+        rows[5],
     );
+}
+
+/// SWISS-4n2: pretty-print a byte count. Cuts at three significant
+/// digits (1.23 MB, 12.3 GB, etc).
+fn format_bytes(n: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const TB: f64 = 1024.0 * 1024.0 * 1024.0 * 1024.0;
+    let v = n as f64;
+    if v < KB         { format!("{n} B")          }
+    else if v < MB    { format!("{:.1} KB", v / KB) }
+    else if v < GB    { format!("{:.1} MB", v / MB) }
+    else if v < TB    { format!("{:.2} GB", v / GB) }
+    else              { format!("{:.2} TB", v / TB) }
+}
+
+fn format_rate(bytes_per_sec: f64) -> String {
+    let label = format_bytes(bytes_per_sec as u64);
+    format!("{label}/s")
+}
+
+fn format_secs(s: f64) -> String {
+    if s < 60.0 {
+        format!("{s:.1}s")
+    } else if s < 3600.0 {
+        let m = (s / 60.0) as u64;
+        let rs = s - (m as f64) * 60.0;
+        format!("{m}m {rs:.0}s")
+    } else {
+        let h = (s / 3600.0) as u64;
+        let rm = ((s - (h as f64) * 3600.0) / 60.0) as u64;
+        format!("{h}h {rm}m")
+    }
 }
 
 // ── SWISS-4f: confirm dialog ──────────────────────────────────────────

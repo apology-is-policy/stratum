@@ -272,6 +272,43 @@ impl SpawnCtx {
         Ok(())
     }
 
+    /// SWISS-4n2: capture stdout of `stratum fs -s SOCK ARGS` for
+    /// callers that need to parse the output (e.g., `ls` for the
+    /// recursive walker). Returns the stdout bytes on success;
+    /// surfaces stratum-fs's stderr line on failure.
+    pub fn run_stratum_fs_capture(
+        &self,
+        socket: &Path,
+        args: &[&str],
+    ) -> Result<Vec<u8>> {
+        use std::os::unix::process::CommandExt;
+        let sock_str = socket
+            .to_str()
+            .ok_or_else(|| anyhow!("socket path is not utf-8"))?;
+        let mut full = vec!["fs", "-s", sock_str];
+        full.extend_from_slice(args);
+        let out = Command::new(&self.me)
+            .args(&full)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0)
+            .output()?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let first = stderr.lines().next().unwrap_or("").trim();
+            if !first.is_empty() {
+                bail!("{} (exit {})", first, out.status.code().unwrap_or(-1));
+            }
+            bail!(
+                "stratum fs {:?} failed (exit {}, no stderr)",
+                args,
+                out.status.code().unwrap_or(-1)
+            );
+        }
+        Ok(out.stdout)
+    }
+
     /// SWISS-4g: pipe `stratum fs read SRC` (on src_socket) into
     /// `stratum fs write DST` (on dst_socket). Used for stm→stm
     /// copy; both subprocesses run concurrently with their stdouts
