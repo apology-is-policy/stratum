@@ -49,6 +49,11 @@ pub struct SpawnCtx {
     /// Slate socket — every panel attach goes through SlateClient
     /// dialing this.
     pub slate_sock: PathBuf,
+    /// SWISS-4i: stratumd's /ctl/ socket (separate from the FS
+    /// socket). Set when embed.rs spawns stratumd with --ctl-listen.
+    /// None when no stratumd is running (no-arg or --host-only TUI
+    /// modes). Used by F9 snapshot create.
+    pub stratumd_ctl_sock: Option<PathBuf>,
     /// Children spawned BY the TUI (via Shift+F2 / Enter-on-.stm).
     /// embed.rs's startup children (the initial host-fs / stratumd /
     /// slate) live in run() — they're killed in run() too. This Vec
@@ -65,12 +70,14 @@ impl SpawnCtx {
         session_dir: PathBuf,
         me: PathBuf,
         slate_sock: PathBuf,
+        stratumd_ctl_sock: Option<PathBuf>,
         initial_meta: [BackendMeta; 2],
     ) -> Self {
         Self {
             session_dir,
             me,
             slate_sock,
+            stratumd_ctl_sock,
             children: Mutex::new(Vec::new()),
             panel_meta: Mutex::new(initial_meta),
             sock_seq: AtomicU64::new(0),

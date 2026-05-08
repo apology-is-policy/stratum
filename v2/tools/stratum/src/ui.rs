@@ -156,6 +156,11 @@ pub enum LocalDialogKind {
     /// Created in the active panel's CWD (host-only at v1.0;
     /// stratum panel forward-noted as SWISS-4d2).
     MkDirInput { panel_idx: usize },
+    /// SWISS-4i: F9 snapshot prompt → enter a snapshot name.
+    /// Sent as `stratum fs -s CTL_SOCK write
+    /// /datasets/1/create-snapshot NAME` against the panel's
+    /// stratumd /ctl/ socket.
+    SnapInput { panel_idx: usize, dataset_id: u64 },
     /// User pressed Enter on a yellow `.stm` whose companion .key
     /// is missing → prompt for passphrase (forward-noted as
     /// SWISS-4b1; v1.0 shows error-style instructions only). The
@@ -595,7 +600,7 @@ fn draw_fkey_bar(frame: &mut Frame<'_>, area: Rect) {
         ("6", ""),
         ("7", "MkDir"),
         ("8", "Delete"),
-        ("9", ""),
+        ("9", "Snap"),
         ("10", "Quit"),
     ];
     draw_keys_row(frame, area, keys, CLR_FKEY_NUM, CLR_FKEY_LABEL_FG, CLR_FKEY_LABEL_BG);
@@ -796,6 +801,7 @@ fn draw_local_dialog(frame: &mut Frame<'_>, area: Rect, d: &LocalDialog) {
         (_, true) => " Error ",
         (LocalDialogKind::HostMountInput { .. }, _) => " Mount host directory ",
         (LocalDialogKind::MkDirInput { .. }, _) => " Make directory ",
+        (LocalDialogKind::SnapInput { .. }, _) => " Create snapshot ",
         (LocalDialogKind::PassphraseFor { .. }, _) => " Passphrase ",
         (LocalDialogKind::Error, _) => " Notice ",
         // MkVol + Confirm route through their own draw_* helpers

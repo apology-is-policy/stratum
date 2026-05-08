@@ -76,6 +76,7 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
     let slate_sock = session_dir.join("slate.sock");
     let host_fs_sock = session_dir.join("host-fs.sock");
     let stratumd_sock = session_dir.join("stratumd.sock");
+    let stratumd_ctl_sock = session_dir.join("stratumd-ctl.sock");
 
     let me = std::env::current_exe().context("locate own binary")?;
 
@@ -144,6 +145,14 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
             stratumd_sock.to_string_lossy().into_owned(),
             "--keyfile".into(),
             keyfile.to_string_lossy().into_owned(),
+            // SWISS-4i (F9): expose /ctl/ on a sibling Unix socket
+            // so the TUI can drive admin verbs (snapshot create,
+            // scrub trigger) via `stratum fs -s CTL_SOCK ...`.
+            // Auto-admin: stratumd stamps admin_uid = geteuid()
+            // at startup; our SO_PEERCRED is the same uid, so the
+            // admin gate fires-true.
+            "--ctl-listen".into(),
+            session_dir.join("stratumd-ctl.sock").to_string_lossy().into_owned(),
         ];
         let child = Command::new(&me)
             .args(&stratumd_args)
@@ -275,6 +284,7 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
         session_dir.clone(),
         me.clone(),
         slate_sock.clone(),
+        if opts.volume.is_some() { Some(stratumd_ctl_sock.clone()) } else { None },
         initial_meta,
     ));
 

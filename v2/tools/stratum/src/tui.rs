@@ -459,6 +459,45 @@ fn handle_key(
         KeyCode::F(8) if !key.modifiers.contains(KeyModifiers::SHIFT) => {
             return start_f8(local_dialog, delete_batch, spawn, snap, *focus);
         }
+        // SWISS-4i: F9 = create snapshot on active stratum panel.
+        // No-op on host panel (snapshots are a stratum concept).
+        KeyCode::F(9) if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+            let sp = match spawn {
+                Some(s) => s,
+                None => {
+                    *local_dialog = Some(error_dialog(
+                        "Snap unavailable: spawn helper unavailable.",
+                    ));
+                    return Ok(Action::Refresh);
+                }
+            };
+            match sp.panel_meta(*focus) {
+                BackendMeta::Stratumd { .. } => {}
+                _ => {
+                    *local_dialog = Some(error_dialog(
+                        "Snap requires a stratum panel (active panel is not a .stm volume).",
+                    ));
+                    return Ok(Action::Refresh);
+                }
+            }
+            if sp.stratumd_ctl_sock.is_none() {
+                *local_dialog = Some(error_dialog(
+                    "Stratum /ctl/ socket missing — daemon was not spawned with --ctl-listen.",
+                ));
+                return Ok(Action::Refresh);
+            }
+            *local_dialog = Some(LocalDialog {
+                kind: LocalDialogKind::SnapInput {
+                    panel_idx: *focus,
+                    dataset_id: 1, // v1.0: dataset id 1 only
+                },
+                prompt: "Snapshot name (date-time auto-suggested):".into(),
+                value: default_snap_name(),
+                is_password: false,
+                is_error: false,
+            });
+            return Ok(Action::Refresh);
+        }
         KeyCode::F(n) if (1..=9).contains(&n) => {
             // SWISS-4b: Shift+F2 = host mount on ACTIVE panel.
             if key.modifiers.contains(KeyModifiers::SHIFT) && n == 2 {
@@ -1121,6 +1160,88 @@ fn submit_dialog(
                 }
                 BackendMeta::None => {
                     *local_dialog = Some(error_dialog("Panel not connected."));
+                }
+            }
+            Ok(Action::Refresh)
+        }
+        LocalDialogKind::SnapInput { panel_idx: _, dataset_id } => {
+            // SWISS-4i: F9 snapshot. Pipe the name as stdin to
+            // `stratum fs -s CTL_SOCK write /datasets/<id>/create-
+            // snapshot`. /ctl/'s create-snapshot kind expects the
+            // body to be the snapshot name (control-byte refused
+            // server-side per R99 P2-1).
+            let sp = match spawn {
+                Some(s) => s,
+                None => {
+                    *local_dialog = Some(error_dialog(
+                        "Cannot snap: spawn helper unavailable.",
+                    ));
+                    return Ok(Action::Refresh);
+                }
+            };
+            let ctl_sock = match sp.stratumd_ctl_sock.as_ref() {
+                Some(p) => p.clone(),
+                None => {
+                    *local_dialog = Some(error_dialog(
+                        "Cannot snap: stratum /ctl/ socket missing.",
+                    ));
+                    return Ok(Action::Refresh);
+                }
+            };
+            let name = dialog.value.trim().to_string();
+            if name.is_empty() {
+                *local_dialog = Some(error_dialog("Snapshot name is required."));
+                return Ok(Action::Refresh);
+            }
+            if name.chars().any(|c| (c as u32) < 0x20 || c == '\u{7F}' || c == '/') {
+                *local_dialog = Some(error_dialog(
+                    "Snapshot name must not contain '/' or control bytes.",
+                ));
+                return Ok(Action::Refresh);
+            }
+            let p9_path = format!("/datasets/{dataset_id}/create-snapshot");
+            use std::io::Write;
+            use std::os::unix::process::CommandExt;
+            use std::process::{Command, Stdio};
+            let me = std::env::current_exe()
+                .unwrap_or_else(|_| std::path::PathBuf::from("stratum"));
+            let mut child = match Command::new(&me)
+                .args(&[
+                    "fs", "-s", ctl_sock.to_string_lossy().as_ref(),
+                    "write", &p9_path,
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .process_group(0)
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    *local_dialog = Some(error_dialog(&format!("snap spawn: {e}")));
+                    return Ok(Action::Refresh);
+                }
+            };
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(name.as_bytes());
+            }
+            drop(child.stdin.take());
+            match child.wait_with_output() {
+                Ok(out) if out.status.success() => {
+                    *local_dialog = Some(error_dialog(&format!(
+                        "Snapshot created: {name}"
+                    )));
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    *local_dialog = Some(error_dialog(&format!(
+                        "snap failed (exit {}): {}",
+                        out.status.code().unwrap_or(-1),
+                        stderr.lines().next().unwrap_or("(no detail)").trim()
+                    )));
+                }
+                Err(e) => {
+                    *local_dialog = Some(error_dialog(&format!("snap wait: {e}")));
                 }
             }
             Ok(Action::Refresh)
@@ -2291,6 +2412,48 @@ fn default_host_path() -> String {
     std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "/".into())
+}
+
+/// SWISS-4i: default snapshot name = current date+time. v1's mental
+/// model: snapshots are "moment markers"; a sortable name is the
+/// best default (user can override).
+fn default_snap_name() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // YYYYMMDDhhmmss in UTC. Avoid heavy chrono dep — compute by
+    // hand with the same is_leap logic used in ui.rs.
+    let mut rem = secs as i64;
+    let day_secs = 86400;
+    let days = rem / day_secs;
+    rem -= days * day_secs;
+    let h = (rem / 3600) as u32;
+    let m = ((rem % 3600) / 60) as u32;
+    let s = (rem % 60) as u32;
+    let mut y = 1970i32;
+    let mut d = days;
+    loop {
+        let ydays = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+            366i64
+        } else {
+            365i64
+        };
+        if d < ydays { break; }
+        d -= ydays;
+        y += 1;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let mdays: [i64; 12] = [
+        31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+    ];
+    let mut mo = 0usize;
+    for md in &mdays {
+        if d < *md { break; }
+        d -= md;
+        mo += 1;
+    }
+    format!("snap-{:04}{:02}{:02}-{:02}{:02}{:02}", y, mo + 1, d + 1, h, m, s)
 }
 
 fn action_verb(client: &mut SlateClient, focus: usize, verb: &str) -> Result<()> {
