@@ -872,7 +872,12 @@ fn draw_local_dialog(frame: &mut Frame<'_>, area: Rect, d: &LocalDialog) {
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
-    // Body: prompt (sanitized) + (if input) display + cursor + tail.
+    // SWISS-4n3: input field is gated on the DIALOG KIND, not on
+    // is_error. Earlier code keyed on is_error, but info_dialog (also
+    // routed through LocalDialogKind::Error with is_error=false) was
+    // getting an input field — so the post-mkfs "Created X" toast
+    // showed an unwanted text-input prompt instead of just acknowledge.
+    let wants_input = !matches!(d.kind, LocalDialogKind::Error);
     let mut lines: Vec<Line> = d
         .prompt
         .lines()
@@ -883,7 +888,7 @@ fn draw_local_dialog(frame: &mut Frame<'_>, area: Rect, d: &LocalDialog) {
             ))
         })
         .collect();
-    if !d.is_error {
+    if wants_input {
         lines.push(Line::from(""));
         let display = if d.is_password {
             "*".repeat(d.value.chars().count())

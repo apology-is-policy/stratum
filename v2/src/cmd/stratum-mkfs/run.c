@@ -51,8 +51,37 @@
 /* Default sizes — matches test scaffold defaults scaled up so a fresh
  * image has comfortable headroom for browsing. */
 #define DEFAULT_DEVICE_BYTES     (UINT64_C(64) * 1024 * 1024)   /* 64 MiB */
-#define DEFAULT_BOOTSTRAP_BYTES  (UINT64_C(16) * 1024 * 1024)   /* 16 MiB */
 #define MIN_DEVICE_BYTES         (UINT64_C(16) * 1024 * 1024)   /* lower bound — bootstrap won't fit smaller */
+/* SWISS-4n3 (user-reported 2026-05-08 ENOMEM/-12 + ENOSPC/-28 on a
+ * 500 MB write to a 3 GB volume): the bootstrap pool holds the
+ * allocator + extent + inode metadata btrees. A hardcoded 16 MiB
+ * default exhausted on any non-trivial write because it didn't scale
+ * with volume size. Auto-scale instead: floor of 8 MiB, ceiling of
+ * 256 MiB, target = device/64. For 3 GB → 48 MiB, for 64 GiB →
+ * 256 MiB capped, for tiny test volumes (16-64 MiB) → 8 MiB floor.
+ *
+ * The `--bootstrap` flag still allows manual override for users
+ * who want to tune for very-many-small-files workloads. */
+static uint64_t default_bootstrap_for(uint64_t device_bytes)
+{
+    /* SWISS-4n3 v2: bumped target ratio from /64 to /16 because /64
+     * caused STM_EOVERFLOW on a 1.5 GB write to a 3 GB volume (the
+     * extent btree's per-inode metadata grew past what 48 MiB could
+     * index). /16 with a 256 MiB ceiling tracks better:
+     *   - 32 MiB device     → 8 MiB  (floor)
+     *   - 1 GiB device      → 64 MiB
+     *   - 3 GiB device      → 192 MiB
+     *   - 16 GiB device     → 256 MiB (ceiling — usually enough)
+     * Forward-noted: server-side metadata-density work (larger
+     * default extents, btree fanout tuning) is the proper fix; this
+     * is just the closest knob the CLI controls. */
+    const uint64_t MIN_BOOT = UINT64_C(8)   * 1024 * 1024;   /*  8 MiB */
+    const uint64_t MAX_BOOT = UINT64_C(256) * 1024 * 1024;   /* 256 MiB */
+    uint64_t target = device_bytes / 16u;
+    if (target < MIN_BOOT) target = MIN_BOOT;
+    if (target > MAX_BOOT) target = MAX_BOOT;
+    return target;
+}
 
 static void usage(void)
 {
@@ -120,10 +149,10 @@ int stm_cmd_mkfs_main(int argc, char **argv)
     }
 
     const char *image_path = argv[1];
-    uint64_t   device_bytes   = DEFAULT_DEVICE_BYTES;
-    uint64_t   bootstrap_bytes = DEFAULT_BOOTSTRAP_BYTES;
-    const char *keyfile_path  = NULL;
-    bool       passphrase_stdin = false;
+    uint64_t   device_bytes      = DEFAULT_DEVICE_BYTES;
+    uint64_t   bootstrap_bytes   = 0;   /* 0 = auto from device_bytes */
+    const char *keyfile_path     = NULL;
+    bool       passphrase_stdin  = false;
 
     /* Parse remaining flags. */
     for (int i = 2; i < argc; i++) {
@@ -166,6 +195,14 @@ int stm_cmd_mkfs_main(int argc, char **argv)
             "stratum-mkfs: --size %llu too small (minimum 16M to fit bootstrap pool)\n",
             (unsigned long long)device_bytes);
         return 1;
+    }
+    /* SWISS-4n3: derive bootstrap-pool size from --size when the user
+     * didn't specify --bootstrap explicitly. The libfs heuristic
+     * (max(64 MiB, dev/1024)) is too generous for tiny test volumes
+     * (would refuse 16-MiB images); ours scales floor → 8 MiB,
+     * ceiling → 256 MiB, target → device/64. */
+    if (bootstrap_bytes == 0) {
+        bootstrap_bytes = default_bootstrap_for(device_bytes);
     }
     if (bootstrap_bytes >= device_bytes) {
         fprintf(stderr,

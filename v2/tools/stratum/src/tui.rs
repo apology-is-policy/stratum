@@ -172,6 +172,11 @@ struct CopyBatch {
     copied: usize,
     skipped: usize,
     failed: usize,
+    /// SWISS-4n3: most recent error message + the item it happened
+    /// on. Surfaced in the summary dialog when failed > 0 so users
+    /// see WHY a copy failed (was: silent swallow → "1 failed" with
+    /// no detail → user reported "no dialog shown" with status -12).
+    last_error: Option<String>,
     /// SWISS-4n2: clock origin for throughput display.
     start_time: Instant,
 }
@@ -312,13 +317,22 @@ fn run_ui(
                         client, &mut local_dialog, spawn.as_ref(), batch,
                     )? {
                         if matches!(action, BatchTick::Done) {
-                            // Show summary, drop batch.
-                            let summary = format!(
+                            // SWISS-4n3: include the last error
+                            // message in the summary when failed > 0.
+                            // Earlier code silently swallowed the
+                            // perform_copy_one Err, so the user saw
+                            // "1 failed" with no detail (reported
+                            // 2026-05-08: 1.8GB → stm volume failed
+                            // with status -12, no dialog showed why).
+                            let mut summary = format!(
                                 "Copy: {} copied · {} skipped · {} failed",
                                 batch.copied, batch.skipped, batch.failed
                             );
-                            // SWISS-4n1: success summary uses info_dialog
-                            // (green) unless something actually failed.
+                            if batch.failed > 0 {
+                                if let Some(e) = batch.last_error.as_deref() {
+                                    summary.push_str(&format!("\n\n{e}"));
+                                }
+                            }
                             let dlg = if batch.failed == 0 {
                                 info_dialog(&summary)
                             } else {
@@ -1859,6 +1873,7 @@ fn start_f5(
         items: expanded, idx: 0,
         src_meta, dst_meta, src_sock, dst_sock,
         sticky: None, copied: 0, skipped: 0, failed: 0,
+        last_error: None,
         start_time: Instant::now(),
     });
     Ok(Action::Refresh)
@@ -2365,7 +2380,15 @@ fn advance_copy_batch(
                 match res {
                     Ok(CopyOutcome::Copied) => batch.copied += 1,
                     Ok(CopyOutcome::Skipped) => batch.skipped += 1,
-                    Err(_) => batch.failed += 1,
+                    Err(e) => {
+                        batch.failed += 1;
+                        batch.last_error = Some(format!(
+                            "{}: {e}",
+                            dst.file_name()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| dst.display().to_string())
+                        ));
+                    }
                 }
                 batch.idx += 1;
             }
@@ -2445,7 +2468,15 @@ fn advance_copy_batch(
     match res {
         Ok(CopyOutcome::Copied) => batch.copied += 1,
         Ok(CopyOutcome::Skipped) => batch.skipped += 1,
-        Err(_) => batch.failed += 1,
+        Err(e) => {
+            batch.failed += 1;
+            batch.last_error = Some(format!(
+                "{}: {e}",
+                dst.file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| dst.display().to_string())
+            ));
+        }
     }
     batch.idx += 1;
     Ok(Some(BatchTick::More))
