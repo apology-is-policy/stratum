@@ -328,6 +328,36 @@ stm_status stm_stratumd_serve_client(int fd, stm_fs *fs,
 /* accept_loop.                                                           */
 /* ────────────────────────────────────────────────────────────────────── */
 
+/* SWISS-4g: per-connection worker context for concurrent accept.
+ * The accept loop spawns a detached pthread per accepted client;
+ * each worker calls stm_stratumd_serve_client and exits when the
+ * client disconnects. stm_fs's public API is documented as
+ * thread-safe (R94 P2-1 stat-after-mutation race notwithstanding —
+ * that's a pre-existing concurrency surface that the host-fs
+ * concurrent-accept upgrade also depends on, see CLAUDE.md
+ * stratumd row clause (3)). */
+typedef struct {
+    int       client_fd;
+    stm_fs   *fs;
+    uid_t     peer_uid;
+    gid_t     peer_gid;
+    uint32_t  msize_max;
+    uint64_t  root_dataset;
+    uint32_t  idle_timeout_ms;
+} stratumd_fs_worker_ctx;
+
+static void *stratumd_fs_worker(void *arg)
+{
+    stratumd_fs_worker_ctx *ctx = arg;
+    /* serve_client closes client_fd internally. */
+    (void)stm_stratumd_serve_client(ctx->client_fd, ctx->fs,
+                                        ctx->peer_uid, ctx->peer_gid,
+                                        ctx->msize_max, ctx->root_dataset,
+                                        ctx->idle_timeout_ms);
+    free(ctx);
+    return NULL;
+}
+
 stm_status stm_stratumd_accept_loop(int listen_fd, stm_fs *fs,
                                       uint32_t msize_max,
                                       uint64_t root_dataset,
@@ -337,18 +367,21 @@ stm_status stm_stratumd_accept_loop(int listen_fd, stm_fs *fs,
 {
     if (listen_fd < 0 || !fs) return STM_EINVAL;
 
-    /* idle_timeout_ms == 0 here is interpreted as "use default";
-     * tests that explicitly want no timeout pass it directly to
-     * stm_stratumd_serve_client and bypass the loop. */
     if (idle_timeout_ms == 0u)
         idle_timeout_ms = STM_STRATUMD_DEFAULT_IDLE_MS;
 
+    /* SWISS-4g: signal-mask discipline (R113 P1-1 carry from
+     * stratumd's /ctl/ + slate's accept loops). Block SIGINT/
+     * SIGTERM/SIGHUP/SIGQUIT in workers so signals route to the
+     * accept thread which observes stop_flag. */
+    sigset_t worker_block;
+    sigemptyset(&worker_block);
+    sigaddset(&worker_block, SIGINT);
+    sigaddset(&worker_block, SIGTERM);
+    sigaddset(&worker_block, SIGHUP);
+    sigaddset(&worker_block, SIGQUIT);
+
     while (1) {
-        /* Stop-flag check happens BEFORE accept blocks. The
-         * controlling thread sets stop_flag = true and (typically)
-         * either shuts down the listen fd or sends a signal to
-         * unblock accept. We re-check after EINTR returns from
-         * accept. */
         if (stop_flag && atomic_load_explicit(stop_flag,
                                                   memory_order_acquire))
             break;
@@ -356,10 +389,6 @@ stm_status stm_stratumd_accept_loop(int listen_fd, stm_fs *fs,
         int client_fd = accept(listen_fd, NULL, NULL);
         if (client_fd < 0) {
             if (errno == EINTR || errno == ECONNABORTED) continue;
-            /* Stop-flag re-check after error: a SIGINT-driven test
-             * may toggle stop_flag and shutdown(listen_fd) which
-             * surfaces as EBADF / EINVAL on accept. Treat those as
-             * stop-on-stop-flag, surface else. */
             if (stop_flag && atomic_load_explicit(stop_flag,
                                                       memory_order_acquire))
                 break;
@@ -370,14 +399,6 @@ stm_status stm_stratumd_accept_loop(int listen_fd, stm_fs *fs,
         gid_t peer_gid = (gid_t)-1;
         int   pc_rc    = peer_creds(client_fd, &peer_uid, &peer_gid);
         if (pc_rc != 0) {
-            /* R95 P2-2 — peer-credential resolution failed. Default
-             * is to REFUSE the connection: the daemon has no way to
-             * attribute the peer, and falling back to the daemon's
-             * own uid/gid is a confused-deputy hole. The opt-in
-             * `allow_unauthenticated_peer` flag exists for testing
-             * on platforms without SO_PEERCRED / getpeereid (the
-             * #else arm of peer_creds) but defaults off in
-             * production. Mirror janus's R11 P1-2 strict posture. */
             if (!allow_unauthenticated_peer) {
                 fprintf(stderr,
                     "stratumd: refusing connection: "
@@ -391,11 +412,40 @@ stm_status stm_stratumd_accept_loop(int listen_fd, stm_fs *fs,
             peer_gid = (gid_t)getgid();
         }
 
-        /* Serve to disconnect; closes client_fd internally. */
-        (void)stm_stratumd_serve_client(client_fd, fs,
-                                            peer_uid, peer_gid,
-                                            msize_max, root_dataset,
-                                            idle_timeout_ms);
+        /* SWISS-4g: spawn a worker pthread per connection. Required
+         * because slate holds the FS connection long-term while a
+         * panel is attached; without concurrent accept, every
+         * external `stratum fs` dial blocks until slate disconnects.
+         * Discovered while debugging F5 host→stm copy "freezes for
+         * 30s then fails" (user 2026-05-08). */
+        stratumd_fs_worker_ctx *ctx = malloc(sizeof *ctx);
+        if (!ctx) {
+            close(client_fd);
+            continue;
+        }
+        ctx->client_fd       = client_fd;
+        ctx->fs              = fs;
+        ctx->peer_uid        = peer_uid;
+        ctx->peer_gid        = peer_gid;
+        ctx->msize_max       = msize_max;
+        ctx->root_dataset    = root_dataset;
+        ctx->idle_timeout_ms = idle_timeout_ms;
+
+        pthread_t tid;
+        sigset_t prev_mask;
+        (void)pthread_sigmask(SIG_BLOCK, &worker_block, &prev_mask);
+        int prc = pthread_create(&tid, NULL, stratumd_fs_worker, ctx);
+        (void)pthread_sigmask(SIG_SETMASK, &prev_mask, NULL);
+        if (prc != 0) {
+            fprintf(stderr,
+                "stratumd: pthread_create failed (rc=%d)\n", prc);
+            close(client_fd);
+            free(ctx);
+            continue;
+        }
+        /* Detached: stratumd has no ordered-shutdown contract with
+         * workers. They exit on EOF/error; OS reclaims stacks. */
+        (void)pthread_detach(tid);
     }
     return STM_OK;
 }
