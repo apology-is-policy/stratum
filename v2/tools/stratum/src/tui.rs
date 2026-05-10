@@ -1812,6 +1812,16 @@ fn start_f5(
         *local_dialog = Some(error_dialog("Active panel is not connected."));
         return Ok(Action::Refresh);
     }
+    // SWISS-4q P1: ALWAYS route through the batch path so the user
+    // sees the progress dialog during long copies. Pre-fix, no-
+    // selection F5 went through run_copy which is synchronous —
+    // a 1.8 GB copy froze the UI for 5+ seconds with no visible
+    // feedback. The batch path's per-tick advance lets the dialog
+    // render, and the throughput chart picks up samples. Per-byte
+    // progress for a single big file is forward-noted (needs
+    // either chunked subprocess or worker thread; see SWISS-4q-
+    // bytes).
+    //
     // SWISS-4r-8: cursor-on-directory cross-backend copy.
     // No selection AND cursor on a dir AND src/dst are different
     // backends → use the batch path (which goes through
@@ -1827,21 +1837,15 @@ fn start_f5(
     // condition fires.
     let synthetic_selection: Vec<u32>;
     let effective_selection: &Vec<u32> = if panel.selection.is_empty() {
+        // SWISS-4q P1: any cursor-on-entry F5 routes through batch.
+        // Skip when cursor is on the synthesised ".." (entry index 0
+        // with path != "/"); otherwise build a 1-element selection.
         let cursor_idx = panel.cursor as usize;
-        let trigger = panel.raw_entries.get(cursor_idx)
-            .map(|raw| {
-                let kind = raw.splitn(5, ' ').next().unwrap_or("?");
-                let dst_meta = spawn.map(|sp| sp.panel_meta(1 - active));
-                let src_meta = spawn.map(|sp| sp.panel_meta(active));
-                let cross_backend = match (&src_meta, &dst_meta) {
-                    (Some(s), Some(d)) =>
-                        std::mem::discriminant(s) != std::mem::discriminant(d),
-                    _ => false,
-                };
-                kind == "d" && cross_backend
-            })
+        let raw = panel.raw_entries.get(cursor_idx);
+        let name_is_dotdot = raw
+            .map(|r| r.splitn(5, ' ').nth(4) == Some(".."))
             .unwrap_or(false);
-        if !trigger {
+        if raw.is_none() || name_is_dotdot {
             return run_copy(local_dialog, spawn, snap, active);
         }
         synthetic_selection = vec![panel.cursor];
@@ -2376,11 +2380,10 @@ fn run_delete(
             } else {
                 format!("/{cwd}/{name}")
             };
-            let label = if is_dir {
-                "directory (must be empty at v1.0)"
-            } else {
-                "file"
-            };
+            // SWISS-4q P1: stm-side dir delete uses `stratum fs rmtree`
+            // (SWISS-4r-9), so the v1 "must be empty" caveat no longer
+            // applies. Match the host-side wording.
+            let label = if is_dir { "directory (recursive)" } else { "file" };
             *local_dialog = Some(LocalDialog {
                 kind: LocalDialogKind::Confirm {
                     options: vec!["Yes".into(), "No".into()],
@@ -3252,6 +3255,20 @@ fn read_panel(
                 .collect()
         })
         .unwrap_or_default();
+    // SWISS-4q P1: clamp cursor to entries.len()-1 so the highlight
+    // never goes off-screen after the user deletes the last item.
+    // Slate's verb_key_down also clamps, but slate doesn't update
+    // the cursor on writes (delete, mkdir → directory shrunk/grew)
+    // — only the renderer sees the new entries length, so the
+    // clamp belongs at fetch_snapshot time. Empty dir → cursor 0.
+    let n = raw_entries.len() as u32;
+    let cursor = if n == 0 {
+        0
+    } else if cursor >= n {
+        n - 1
+    } else {
+        cursor
+    };
     Ok(PanelView { path, raw_entries, cursor, connected, selection })
 }
 

@@ -471,6 +471,27 @@ fn copy_500kb_file() {
 }
 
 #[test]
+fn write_unaligned_tail_4623_bytes() {
+    // SWISS-4q P1 regression: real video files (and most real
+    // workloads) have a logical size that isn't a multiple of
+    // 4 KiB. Pre-fix, stm_sync_write_extent rejected the final
+    // sub-block chunk with STM_EINVAL; user reported a 1.8 GB
+    // video copy failing after the body had already streamed
+    // through. fs_write_regular_locked now does read-modify-write
+    // on the boundary block with a zeroed scratch.
+    //
+    // Smaller volume (8 MiB body + 4623 bytes) keeps the test fast.
+    let s = session();
+    let mut body = vec![0xACu8; 8 * 1024 * 1024];
+    let tail: Vec<u8> = (0..4623u32).map(|i| (i & 0xff) as u8).collect();
+    body.extend_from_slice(&tail);
+    s.fs_write_bytes(&s.stratumd_sock, "/odd.bin", &body).unwrap();
+    let read = s.fs_read(&s.stratumd_sock, "/odd.bin").unwrap();
+    assert_eq!(read.len(), body.len(), "size mismatch");
+    assert_eq!(read, body, "content mismatch on unaligned tail");
+}
+
+#[test]
 fn copy_200mb_file_roundtrip() {
     // SWISS-4q P0: a 200 MB file should write + read back clean
     // with throughput well above 100 MB/s on local disk. The

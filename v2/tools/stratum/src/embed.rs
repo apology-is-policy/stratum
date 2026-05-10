@@ -192,6 +192,20 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
             // admin gate fires-true.
             "--ctl-listen".into(),
             session_dir.join("stratumd-ctl.sock").to_string_lossy().into_owned(),
+            // SWISS-4q P1: disable per-connection idle timeout. Slate
+            // holds a long-lived 9P connection to stratumd that idles
+            // when the TUI is in the background. The default 30 s
+            // SO_RCVTIMEO would close the connection during any user
+            // pause longer than 30 seconds, after which the .stm panel
+            // appears empty until the user restarts the TUI (the slate
+            // backend doesn't auto-reconnect). User-reported 2026-05-
+            // 10: "after some period of inactivity, switching in and
+            // out of the terminal emulator, the stm volume panel just
+            // loses all items". Embed mode is single-user IPC over a
+            // session-private socket — the R95 P2-1 slow-loris guard
+            // is unnecessary here.
+            "--idle-timeout".into(),
+            "0".into(),
         ];
         if passphrase.is_some() {
             stratumd_args.push("--passphrase-stdin".into());
@@ -241,13 +255,45 @@ pub fn run(opts: EmbedOpts) -> Result<()> {
 
         stratumd_child = Some(child);
         if let Err(e) = wait_for_sock(&stratumd_sock, Duration::from_secs(5)) {
+            // SWISS-4q P1: surface stratumd's actual error instead of
+            // the generic "socket never appeared" message. The most
+            // common cause is a wrong passphrase — stratumd's stderr
+            // log already contains the specific stm_status; pull it
+            // out and embed in the user-facing error so they know
+            // what to retry.
+            let log_path = session_dir.join("stratumd.log");
+            let log_tail = std::fs::read_to_string(&log_path)
+                .ok()
+                .and_then(|s| {
+                    let lines: Vec<&str> = s.lines().rev().take(8).collect();
+                    if lines.is_empty() {
+                        None
+                    } else {
+                        let mut rev: Vec<&str> = lines.into_iter().rev().collect();
+                        // Drop the noisy "serving X on Y" startup banner.
+                        rev.retain(|l| !l.contains("serving "));
+                        Some(rev.join("\n  "))
+                    }
+                })
+                .unwrap_or_default();
             if let Some(c) = stratumd_child.as_mut() {
                 let _ = c.kill();
             }
             let _ = host_fs_child.kill();
             let _ = cleanup_session_dir(&session_dir);
+            // Friendly message for the wrong-passphrase case.
+            let hint = if log_tail.contains("status=-201")
+                || log_tail.contains("EBADTAG")
+                || log_tail.contains("status=-202")
+                || log_tail.contains("EBADVERSION")
+            {
+                "  (most likely cause: WRONG PASSPHRASE for this volume)\n"
+            } else {
+                ""
+            };
             return Err(e.context(format!(
-                "stratumd socket never appeared at {}",
+                "stratumd failed to start (socket never appeared at {})\n{hint}\
+                 stratumd log:\n  {log_tail}",
                 stratumd_sock.display()
             )));
         }

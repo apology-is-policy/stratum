@@ -201,6 +201,29 @@ int stm_cmd_stratumd_main(int argc, char **argv)
             opts.backlog = (int)v;
             continue;
         }
+        if (!strcmp(a, "--idle-timeout") && i + 1 < argc) {
+            /* SWISS-4q P1: per-connection idle timeout in milliseconds.
+             * 0 disables (mapped to UINT32_MAX so accept_loop's
+             * "0 = use default" sentinel doesn't override). Default
+             * is 30 s; embed mode (TUI auto-spawn) passes 0 because
+             * the slate→stratumd backend connection is long-lived
+             * and idles when the TUI is in the background — without
+             * this, every focus-switch over 30 s killed the
+             * connection and the .stm panel went empty until the
+             * TUI reconnected. */
+            char *end = NULL;
+            long v = strtol(argv[++i], &end, 10);
+            if (!end || *end != '\0' || v < 0) {
+                fprintf(stderr,
+                    "stratumd: invalid --idle-timeout: %s\n", argv[i]);
+                return 1;
+            }
+            /* User 0 → "disabled" → pass UINT32_MAX (49 days, longer
+             * than any plausible session, effectively no timeout).
+             * Any positive value is the literal ms timeout. */
+            opts.idle_timeout_ms = (v == 0) ? UINT32_MAX : (uint32_t)v;
+            continue;
+        }
         if (a[0] == '-') {
             fprintf(stderr, "stratumd: unknown option: %s\n", a);
             usage(argv[0]);

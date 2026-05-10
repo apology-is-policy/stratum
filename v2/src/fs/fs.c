@@ -808,9 +808,82 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
     }
 
     if (kind == STM_DATA_EXTENT) {
-        /* Pure extent path. */
-        stm_status ws = stm_sync_write_extent(fs->sync, ds, ino, off, buf, len);
-        if (ws != STM_OK) return ws;
+        /* SWISS-4q P1: pad sub-block writes for the file-tail case.
+         * stm_sync_write_extent requires (off, len) both 4 KiB-aligned;
+         * a real-file tail (not a multiple of 4 KiB) goes through this
+         * path with an unaligned len AND/OR off, and the bare call
+         * returns STM_EINVAL.
+         *
+         * User-reported 2026-05-10: copying a 1.8 GB + 4623 bytes file
+         * (real video, non-aligned tail) failed with EINVAL after
+         * 1800 MiB had already streamed in. The body wrote OK; only
+         * the last sub-block chunk was rejected.
+         *
+         * Strategy:
+         *   - aligned_off = off rounded DOWN to BLK
+         *   - aligned_end = (off + len) rounded UP to BLK
+         *   - aligned_len = aligned_end - aligned_off
+         *   - Build a BLK-aligned scratch buffer.
+         *   - For the head padding (aligned_off..off): if there's an
+         *     existing extent covering this range, read it; else zero
+         *     (file was extended into a hole).
+         *   - Copy user bytes at offset (off - aligned_off).
+         *   - For the tail padding ((off+len)..aligned_end): same
+         *     read-existing-or-zero logic.
+         *   - Write the scratch via stm_sync_write_extent(aligned_off,
+         *     aligned_len).
+         * si_size set to the LOGICAL end_off so reads see POSIX-EOF
+         * (the read path's R76 P2-1 clamp by si_size handles the
+         * trailing zeros).
+         *
+         * Aligned writes (the common case for sequential-1MiB chunks)
+         * skip the read-modify-write entirely. */
+        const uint64_t BLK = 4096u;
+        bool aligned = (off % BLK == 0u) && (len % BLK == 0u);
+        if (aligned) {
+            stm_status ws = stm_sync_write_extent(fs->sync, ds, ino, off, buf, len);
+            if (ws != STM_OK) return ws;
+        } else {
+            uint64_t aligned_off = off & ~(BLK - 1u);
+            uint64_t aligned_end = (end_off + BLK - 1u) & ~(BLK - 1u);
+            if (aligned_end > (uint64_t)STM_FS_RECORDSIZE_MAX
+                + aligned_off) {
+                /* Single-call extent layer caps at recordsize. The
+                 * caller (cmd_write / 9p server) splits sequential
+                 * writes into iounit-bound chunks; only the final
+                 * chunk can be sub-block, and its aligned_len ≤
+                 * 1 MiB (caller's chunk + ≤ 4 KiB pad). This
+                 * defensive check is for future codepaths that
+                 * pass huge sub-block writes. */
+                return STM_ERANGE;
+            }
+            uint64_t aligned_len = aligned_end - aligned_off;
+            uint8_t *scratch = (uint8_t *)calloc(1, (size_t)aligned_len);
+            if (!scratch) return STM_ENOMEM;
+
+            /* Read the existing aligned region (if any) so head/tail
+             * padding preserves prior bytes. read_extent reads only
+             * what's reachable; gaps return as zeros (already in
+             * scratch). */
+            size_t got = 0;
+            stm_status rs = stm_sync_read_extent(fs->sync, ds, ino,
+                                                       aligned_off,
+                                                       scratch,
+                                                       (size_t)aligned_len,
+                                                       &got);
+            if (rs != STM_OK && rs != STM_ENOENT) {
+                free(scratch);
+                return rs;
+            }
+            /* Overlay the user's bytes. */
+            memcpy(scratch + (off - aligned_off), buf, len);
+            stm_status ws = stm_sync_write_extent(fs->sync, ds, ino,
+                                                       aligned_off,
+                                                       scratch,
+                                                       (size_t)aligned_len);
+            free(scratch);
+            if (ws != STM_OK) return ws;
+        }
         uint64_t cur_size = stm_load_le64(iv->si_size);
         if (end_off > cur_size) {
             iv->si_size = stm_store_le64(end_off);
