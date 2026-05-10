@@ -155,7 +155,12 @@ static int split_parent_name(const char *path, path_t *out_parent,
 static stm_9p_client *open_connection(const char *socket_path)
 {
     stm_9p_dial_opts o = {0};
-    o.msize    = STM_9P_MSIZE_DEFAULT;
+    /* SWISS-4r-11: ask for the max msize at handshake (server downgrades
+     * if it negotiates lower). Combined with cmd_write's 1 MiB stdio
+     * buffer, this drops per-write extent count by ~8× vs the prior
+     * 128 KiB default — a measurable bandaid before SWISS-4q lands a
+     * proper writeback-aggregation layer. */
+    o.msize    = STM_9P_MSIZE_MAX;
     o.uname    = "";
     o.aname    = "";
     o.n_uname  = (uint32_t)-1;
@@ -197,9 +202,61 @@ static int status_to_exit(stm_status rc)
     return EXIT_IO;
 }
 
+/* SWISS-4r-12: short human-readable explanation for an stm_status.
+ * Used by perr() so subprocess stderr surfaces a hint instead of
+ * just a numeric code. The TUI's run_stratum_fs surfaces this
+ * stderr as the dialog body, so the user sees the explanation.
+ *
+ * Keep these messages SHORT (one line each) — they get embedded
+ * into dialog overlays. Keep them user-facing — error codes are
+ * the developer surface; these are the user surface. */
+static const char *status_explain(stm_status rc)
+{
+    switch (rc) {
+    case STM_OK:               return "OK";
+    case STM_EINVAL:           return "EINVAL: invalid argument or unsupported flag";
+    case STM_ENOMEM:           return "ENOMEM: out of memory";
+    case STM_ENOSPC:           return "ENOSPC: no space left on the volume";
+    case STM_EOVERFLOW:        return "EOVERFLOW: extent or metadata budget exhausted "
+                                       "(SWISS-4q is the architectural fix; "
+                                       "for now: shrink the file or grow the volume)";
+    case STM_ERANGE:           return "ERANGE: value out of range";
+    case STM_EIO:              return "EIO: backend I/O error";
+    case STM_ENOENT:           return "ENOENT: no such file or directory";
+    case STM_EEXIST:           return "EEXIST: file already exists";
+    case STM_EACCES:           return "EACCES: permission denied";
+    case STM_EBUSY:            return "EBUSY: resource busy";
+    case STM_EAGAIN:           return "EAGAIN: try again";
+    case STM_ENODEV:           return "ENODEV: no such device";
+    case STM_EROFS:            return "EROFS: read-only filesystem";
+    case STM_EXDEV:            return "EXDEV: cross-device link/reflink refused";
+    case STM_ENOTDIR:          return "ENOTDIR: a path component is not a directory";
+    case STM_EISDIR:           return "EISDIR: target is a directory (expected a file)";
+    case STM_ENOTEMPTY:        return "ENOTEMPTY: directory not empty "
+                                       "(use 'stratum fs rmtree' to remove recursively)";
+    case STM_ENAMETOOLONG:     return "ENAMETOOLONG: name or path too long";
+    case STM_ENODATA:          return "ENODATA: xattr name not present";
+    case STM_EPERM:            return "EPERM: operation not permitted";
+    case STM_ESTALE:           return "ESTALE: stale handle (file was unlinked or replaced)";
+    case STM_ECORRUPT:         return "ECORRUPT: on-disk integrity check failed";
+    case STM_EBADTAG:          return "EBADTAG: AEAD tag verification failed "
+                                       "(wrong key or corruption)";
+    case STM_EBADVERSION:      return "EBADVERSION: format version unsupported";
+    case STM_EBADFEATURE:      return "EBADFEATURE: required feature flag unknown";
+    case STM_EWEDGED:          return "EWEDGED: filesystem is wedged "
+                                       "(unmount + remount to recover)";
+    case STM_ENOTSUPPORTED:    return "ENOTSUPPORTED: operation not supported";
+    case STM_EPROTOCOL:        return "EPROTOCOL: 9P wire protocol violation";
+    case STM_EBACKEND:         return "EBACKEND: backend reported an opaque failure";
+    case STM_EQUORUM:          return "EQUORUM: multi-device commit/mount lacked quorum";
+    default:                   return "(unrecognized status code)";
+    }
+}
+
 static void perr(const char *op, stm_status rc)
 {
-    fprintf(stderr, "stratum-fs: %s: status=%d\n", op, (int)rc);
+    fprintf(stderr, "stratum-fs: %s: %s (status=%d)\n",
+            op, status_explain(rc), (int)rc);
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -463,11 +520,35 @@ static int cmd_write(stm_9p_client *c, int argc, char **argv)
         return status_to_exit(rc);
     }
 
-    /* Stream stdin → fid. */
+    /* Stream stdin → fid.
+     *
+     * SWISS-4r-11: bumped from 8 KiB to 1 MiB. Each Twrite generates
+     * an extent record on the server side; smaller chunks → ~125×
+     * more extents per byte written → metadata exhaustion (-75
+     * STM_EOVERFLOW or -28 STM_ENOSPC) on workloads as small as
+     * 500 KB before this. The bump is a bandaid — SWISS-4q's
+     * writeback-aggregation layer is the architectural fix — but
+     * it pushes the pain threshold from ~hundreds-of-KB to
+     * ~hundreds-of-MB on default 64 MB volumes, which covers the
+     * basic-CRUD scenarios the user is currently testing.
+     *
+     * Heap-allocate so the 1 MiB doesn't blow stratum-fs's stack
+     * frame when invoked from spawn fanouts. The actual chunk
+     * sent over the wire is bounded by the negotiated msize
+     * minus headers (typically ~120 KiB at 128 KiB msize); the
+     * bigger client buffer reduces fread() syscalls + amortises
+     * stdin pipe latency. R128 doctrine carry — perr() on err.
+     */
+    enum { CMD_WRITE_BUF = 1u << 20 };  /* 1 MiB */
+    uint8_t *buf = (uint8_t *)malloc(CMD_WRITE_BUF);
+    if (!buf) {
+        fprintf(stderr, "stratum-fs: write: alloc buffer failed\n");
+        (void)stm_9p_clunk(c, WORK_FID);
+        return EXIT_IO;
+    }
     uint64_t offset = 0;
-    uint8_t  buf[8192];
     while (1) {
-        size_t got = fread(buf, 1, sizeof buf, stdin);
+        size_t got = fread(buf, 1, CMD_WRITE_BUF, stdin);
         if (got == 0) break;
         uint32_t pos = 0;
         while (pos < (uint32_t)got) {
@@ -476,11 +557,13 @@ static int cmd_write(stm_9p_client *c, int argc, char **argv)
                                   buf + pos, (uint32_t)got - pos, &written);
             if (rc != STM_OK) {
                 perr("write", rc);
+                free(buf);
                 (void)stm_9p_clunk(c, WORK_FID);
                 return status_to_exit(rc);
             }
             if (written == 0) {
                 fprintf(stderr, "stratum-fs: server returned written=0\n");
+                free(buf);
                 (void)stm_9p_clunk(c, WORK_FID);
                 return EXIT_IO;
             }
@@ -488,6 +571,7 @@ static int cmd_write(stm_9p_client *c, int argc, char **argv)
         }
         offset += got;
     }
+    free(buf);
     (void)stm_9p_clunk(c, WORK_FID);
     return 0;
 }
@@ -586,6 +670,207 @@ static int cmd_rmdir(stm_9p_client *c, int argc, char **argv)
         return EXIT_USAGE;
     }
     return unlink_with_flag(c, argv[0], STM_9P_AT_REMOVEDIR, "rmdir");
+}
+
+/* SWISS-4r-9: recursive remove of dir tree. Mirrors `rm -rf` —
+ * never asks for confirmation; bails on first child failure with
+ * a partial-deletion-state on the volume. The TUI's batch-delete
+ * F8 path now invokes this for stm-side dirs (host side uses
+ * std::fs::remove_dir_all). Without this, the prior TUI path
+ * dispatched plain `rm` on a dir, the server returned STM_EISDIR,
+ * the 9P-client mapped it to STM_EINVAL (pre-SWISS-4r-7), and the
+ * user saw "status=-22" with no clear path forward.
+ *
+ * Recursion uses dir entries via Treaddir. Each pass: walk to
+ * dir, lopen+readdir, accumulate entries into a heap list, clunk;
+ * then for each child — if dir, recurse; if file/link, unlinkat.
+ * After children: rmdir self (parent walk + Tunlinkat with
+ * AT_REMOVEDIR). Bail on first non-OK status; do NOT continue
+ * past partial failure (caller decides retry).
+ *
+ * Bounded depth: STM_9P_MAX_WALK (16) limit applies per descent
+ * step but the recursion itself is unbounded by stack depth —
+ * each level pushes one stm_9p_walk call; deep trees would smash
+ * the stack. v1.0 cap: 32-deep. Forward-noted: switch to
+ * iterative-with-heap-stack for arbitrary depth.
+ */
+
+#define RMTREE_MAX_DEPTH  32u
+#define RMTREE_FID_BASE   200u   /* per-depth scratch fid pool */
+
+typedef struct {
+    char  *name;
+    size_t name_len;
+    bool   is_dir;
+    bool   is_link;
+} rmtree_ent;
+
+typedef struct {
+    rmtree_ent *items;
+    size_t      count;
+    size_t      cap;
+} rmtree_list;
+
+static stm_status rmtree_collect_cb(const stm_9p_qid *qid, uint64_t cookie,
+                                          uint8_t type, const char *name,
+                                          size_t name_len, void *ctx)
+{
+    (void)cookie;
+    rmtree_list *L = (rmtree_list *)ctx;
+    if (name_len == 1u && name[0] == '.') return STM_OK;
+    if (name_len == 2u && name[0] == '.' && name[1] == '.') return STM_OK;
+    if (L->count == L->cap) {
+        size_t nc = L->cap == 0 ? 32 : L->cap * 2;
+        rmtree_ent *ne = (rmtree_ent *)realloc(L->items, nc * sizeof(rmtree_ent));
+        if (!ne) return STM_ENOMEM;
+        L->items = ne;
+        L->cap = nc;
+    }
+    char *nm = (char *)malloc(name_len + 1);
+    if (!nm) return STM_ENOMEM;
+    memcpy(nm, name, name_len);
+    nm[name_len] = '\0';
+    L->items[L->count].name = nm;
+    L->items[L->count].name_len = name_len;
+    L->items[L->count].is_dir =
+        (type == 4u) || ((qid->type & STM_9P_QTDIR) != 0u);
+    L->items[L->count].is_link =
+        (type == 10u) || ((qid->type & STM_9P_QTSYMLINK) != 0u);
+    L->count++;
+    return STM_OK;
+}
+
+static void rmtree_list_free(rmtree_list *L)
+{
+    for (size_t i = 0; i < L->count; i++) free(L->items[i].name);
+    free(L->items);
+    L->items = NULL;
+    L->count = 0;
+    L->cap = 0;
+}
+
+/* Walk root → dir_fid for `path`, lopen+readdir into `out_list`,
+ * clunk dir_fid. */
+static stm_status rmtree_list_dir(stm_9p_client *c, const char *path,
+                                        uint32_t dir_fid, rmtree_list *out_list)
+{
+    path_t p;
+    if (parse_path(path, &p) < 0) return STM_EINVAL;
+    stm_9p_qid qids[STM_9P_MAX_WALK];
+    uint16_t walked = 0;
+    stm_status rc = stm_9p_walk(c, ROOT_FID, dir_fid,
+                                       p.count, p.names, qids, &walked);
+    if (rc != STM_OK) return rc;
+    stm_9p_qid q;
+    rc = stm_9p_lopen(c, dir_fid, STM_9P_O_RDONLY | STM_9P_O_DIRECTORY,
+                          &q, NULL);
+    if (rc != STM_OK) {
+        (void)stm_9p_clunk(c, dir_fid);
+        return rc;
+    }
+    uint64_t cursor = 0;
+    for (int iter = 0; iter < 1024; iter++) {
+        uint64_t next = 0;
+        uint32_t emitted = 0;
+        rc = stm_9p_readdir(c, dir_fid, cursor, 64u * 1024u,
+                                rmtree_collect_cb, out_list,
+                                &emitted, &next);
+        if (rc != STM_OK) break;
+        if (emitted == 0u) break;       /* exhausted */
+        if (next == cursor) break;       /* defensive: no progress */
+        cursor = next;
+    }
+    (void)stm_9p_clunk(c, dir_fid);
+    return rc;
+}
+
+/* Recursively remove `path` (must be a dir). depth is the current
+ * recursion depth (caller passes 0). */
+static stm_status rmtree_recurse(stm_9p_client *c, const char *path, unsigned depth)
+{
+    if (depth >= RMTREE_MAX_DEPTH) return STM_EOVERFLOW;
+    uint32_t my_fid = RMTREE_FID_BASE + depth;
+    rmtree_list L = {0};
+    stm_status rc = rmtree_list_dir(c, path, my_fid, &L);
+    if (rc != STM_OK) {
+        rmtree_list_free(&L);
+        return rc;
+    }
+    /* Walk children. Build per-child path "<path>/<name>" for nested
+     * recursion + unlinkat. */
+    size_t plen = strlen(path);
+    bool path_is_root = (plen == 1 && path[0] == '/');
+    for (size_t i = 0; i < L.count; i++) {
+        size_t need = plen + 1 + L.items[i].name_len + 1;
+        char *cp = (char *)malloc(need);
+        if (!cp) { rc = STM_ENOMEM; break; }
+        if (path_is_root) {
+            cp[0] = '/';
+            memcpy(cp + 1, L.items[i].name, L.items[i].name_len);
+            cp[1 + L.items[i].name_len] = '\0';
+        } else {
+            memcpy(cp, path, plen);
+            cp[plen] = '/';
+            memcpy(cp + plen + 1, L.items[i].name, L.items[i].name_len);
+            cp[plen + 1 + L.items[i].name_len] = '\0';
+        }
+        if (L.items[i].is_dir && !L.items[i].is_link) {
+            rc = rmtree_recurse(c, cp, depth + 1u);
+        } else {
+            rc = (stm_status)unlink_with_flag(c, cp, /*flags=*/0, "rm");
+            if (rc != 0) {
+                /* unlink_with_flag returned an EXIT_* code; map to a
+                 * non-OK status so the upper recursion bails. */
+                rc = STM_EIO;
+            } else {
+                rc = STM_OK;
+            }
+        }
+        free(cp);
+        if (rc != STM_OK) break;
+    }
+    rmtree_list_free(&L);
+    if (rc != STM_OK) return rc;
+    /* Now rmdir self (don't rmdir "/"). */
+    if (!path_is_root) {
+        int xrc = unlink_with_flag(c, path, STM_9P_AT_REMOVEDIR, "rmdir");
+        if (xrc != 0) return STM_EIO;
+    }
+    return STM_OK;
+}
+
+static int cmd_rmtree(stm_9p_client *c, int argc, char **argv)
+{
+    if (argc != 1) {
+        fprintf(stderr, "usage: stratum-fs rmtree PATH\n");
+        return EXIT_USAGE;
+    }
+    /* Refuse to rmtree "/" — too easy to footgun. The TUI never
+     * targets root for delete (cwd-relative selection bounds it). */
+    if (strcmp(argv[0], "/") == 0) {
+        fprintf(stderr, "stratum-fs: refusing to rmtree /\n");
+        return EXIT_IO;
+    }
+    /* If the target is a regular file, just rm it (idempotent shape:
+     * caller can pass any path and rmtree handles it). */
+    path_t p_full;
+    if (parse_path(argv[0], &p_full) < 0) return EXIT_USAGE;
+    stm_9p_qid qids[STM_9P_MAX_WALK];
+    uint16_t walked = 0;
+    stm_status rc = stm_9p_walk(c, ROOT_FID, WORK_FID,
+                                       p_full.count, p_full.names, qids, &walked);
+    if (rc != STM_OK) { perr("walk", rc); return status_to_exit(rc); }
+    stm_9p_attr a;
+    rc = stm_9p_getattr(c, WORK_FID, STM_9P_GETATTR_MODE, &a);
+    (void)stm_9p_clunk(c, WORK_FID);
+    if (rc != STM_OK) { perr("getattr", rc); return status_to_exit(rc); }
+    if ((a.mode & 0170000u) == 0040000u) {
+        rc = rmtree_recurse(c, argv[0], 0u);
+        if (rc != STM_OK) { perr("rmtree", rc); return status_to_exit(rc); }
+        return 0;
+    }
+    /* Non-dir: plain rm. */
+    return unlink_with_flag(c, argv[0], 0u, "rm");
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -782,6 +1067,7 @@ static const cmd_entry CMDS[] = {
     { "create",   cmd_create,   "create empty file (touch)",                     true  },
     { "rm",       cmd_rm,       "remove file",                                   true  },
     { "rmdir",    cmd_rmdir,    "remove empty directory",                        true  },
+    { "rmtree",   cmd_rmtree,   "recursively remove file or dir tree (rm -rf)",  true  },
     { "chmod",    cmd_chmod,    "change permission bits (octal)",                true  },
     { "mv",       cmd_mv,       "rename",                                        true  },
     { "ln",       cmd_ln,       "hard link",                                     true  },

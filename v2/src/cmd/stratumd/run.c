@@ -23,6 +23,7 @@
  * Rust process owns SIGINT/SIGTERM in that case.
  */
 
+#include <stratum/9p.h>
 #include <stratum/cmds.h>
 #include <stratum/crypto.h>
 #include <stratum/stratumd.h>
@@ -123,6 +124,14 @@ int stm_cmd_stratumd_main(int argc, char **argv)
     opts.backlog      = STM_STRATUMD_DEFAULT_BACKLOG;
     opts.root_dataset = 1u;
     opts.stop_flag    = &g_stop_flag;
+    /* SWISS-4r-11: default msize_max to MAX (1 MiB) so clients that
+     * dial without explicit --msize get the bigger negotiation. The
+     * prior default-zero clamp to MIN (4 KiB) was the source of the
+     * "metadata exhaustion at 500 KB" symptom — every Twrite emits
+     * one extent record, so 4 KiB chunks blow through bootstrap
+     * pool budget on tiny workloads. SWISS-4q's writeback-aggregation
+     * layer is the architectural fix; this is the bandaid. */
+    opts.msize_max    = STM_9P_MSIZE_MAX;
 
     bool want_passphrase_stdin = false;
 

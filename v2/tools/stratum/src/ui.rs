@@ -335,6 +335,17 @@ pub struct LocalDialog {
 /// (throughput sparkline) is forward-noted — current implementation
 /// uses subprocess + std::fs::copy, neither of which exposes a
 /// per-byte callback. File-level progress is the v1.0 surface.
+/// SWISS-4r-3: per-second throughput sample for the copy chart.
+/// Mirrors v1 `tui::app::ThroughputSample`. The window is bounded
+/// (drop oldest when len > SAMPLE_WINDOW); render samples newest-
+/// last in the chart so the rightmost bar is "right now".
+#[derive(Clone, Debug)]
+pub struct ThroughputSample {
+    pub bytes_per_sec: f64,
+}
+
+pub const SAMPLE_WINDOW: usize = 60;
+
 #[derive(Clone, Debug)]
 pub struct CopyProgress {
     pub idx: usize,
@@ -350,6 +361,13 @@ pub struct CopyProgress {
     pub bytes_done: u64,
     /// Seconds since the batch started. Used for rate calc.
     pub elapsed_secs: f64,
+    /// SWISS-4r-3: rolling window of bytes_per_sec samples for the
+    /// throughput chart. Caller pushes via the `record_sample`
+    /// helper at every loop tick (~50ms). Capped at SAMPLE_WINDOW
+    /// (60) so the chart shows the last ~3s of activity. Rendering
+    /// in draw_copy_progress fills the chart row with vertical bars
+    /// scaled to the max sample.
+    pub samples: Vec<ThroughputSample>,
 }
 
 // ── main draw ─────────────────────────────────────────────────────────
@@ -927,8 +945,12 @@ fn draw_local_dialog(frame: &mut Frame<'_>, area: Rect, d: &LocalDialog) {
 // File-level progress + counters cover the v1 UX hump.
 
 fn draw_copy_progress(frame: &mut Frame<'_>, area: Rect, cp: &CopyProgress) {
+    // SWISS-4r-3: bigger dialog so the throughput chart fits below
+    // the existing rows (mirrors v1's draw_copy_dialog layout, just
+    // with v2's double-line border + cyan accent).
     let w = 70u16.min(area.width.saturating_sub(4));
-    let h = 10u16;
+    let chart_rows: u16 = 8;
+    let h: u16 = 10 + chart_rows;
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let rect = Rect::new(x, y, w, h);
@@ -953,6 +975,7 @@ fn draw_copy_progress(frame: &mut Frame<'_>, area: Rect, cp: &CopyProgress) {
             Constraint::Length(1), // bar
             Constraint::Length(1), // counters
             Constraint::Length(1), // SWISS-4n2: throughput/ETA line
+            Constraint::Length(chart_rows + 2), // SWISS-4r-3: chart frame
             Constraint::Min(0),
             Constraint::Length(1), // hint
         ])
@@ -1025,12 +1048,74 @@ fn draw_copy_progress(frame: &mut Frame<'_>, area: Rect, cp: &CopyProgress) {
         rows[3],
     );
 
+    // SWISS-4r-3: throughput chart (port of v1 draw_copy_dialog
+    // chart). Each column = one sample; height = bytes_per_sec
+    // scaled against the window's max. Color codes:
+    //   green = top 30% of window's max throughput
+    //   yellow = middle 40%
+    //   red = bottom 30%
+    // When fewer than 2 samples, render "Waiting for data...".
+    {
+        let chart_block = Block::default()
+            .borders(Borders::ALL)
+            .border_set(dbl_border())
+            .border_style(Style::default().fg(Color::White))
+            .title(Line::from(Span::styled(
+                " Throughput ",
+                Style::default().fg(Color::White),
+            )))
+            .style(Style::default().bg(CLR_POPUP_BG));
+        let ci = chart_block.inner(rows[4]);
+        frame.render_widget(chart_block, rows[4]);
+        if cp.samples.len() >= 2 {
+            let cw = ci.width as usize;
+            let ch = ci.height as usize;
+            let n = cp.samples.len().min(cw);
+            let display = &cp.samples[cp.samples.len() - n..];
+            let max_bps = display
+                .iter()
+                .map(|s| s.bytes_per_sec)
+                .fold(1.0f64, f64::max);
+            let mut lines = Vec::with_capacity(ch);
+            for row in 0..ch {
+                let threshold = max_bps * (ch - row) as f64 / ch as f64;
+                let spans: Vec<Span> = display
+                    .iter()
+                    .map(|s| {
+                        if s.bytes_per_sec >= threshold {
+                            let clr = if s.bytes_per_sec > max_bps * 0.7 {
+                                Color::LightGreen
+                            } else if s.bytes_per_sec > max_bps * 0.3 {
+                                Color::LightYellow
+                            } else {
+                                Color::LightRed
+                            };
+                            Span::styled("\u{2588}", Style::default().fg(clr))
+                        } else {
+                            Span::raw(" ")
+                        }
+                    })
+                    .collect();
+                lines.push(Line::from(spans));
+            }
+            frame.render_widget(Paragraph::new(lines), ci);
+        } else {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    " Waiting for data...",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                ci,
+            );
+        }
+    }
+
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             " [Esc] cancel batch",
             Style::default().fg(Color::DarkGray),
         ))),
-        rows[5],
+        rows[6],
     );
 }
 

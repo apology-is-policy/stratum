@@ -300,9 +300,16 @@ pub fn read_text_trim(client: &mut SlateClient, path: &str) -> Result<String> {
 /// SWISS-4e: read a path as raw UTF-8 String, NO trimming. Used by
 /// the editor to pull /editor/content while preserving any trailing
 /// newline (POSIX text-file convention).
+///
+/// SWISS-4r-5: lossy decode — invalid UTF-8 sequences become U+FFFD.
+/// The editor IS a text editor; binary files render as garbage but
+/// at least open. Strict UTF-8 errors made F3/F4 silently no-op on
+/// any non-text file (empty buffer + no error). Better to show
+/// replacement characters and let the user see what they're poking
+/// at than to swallow the open silently.
 pub fn read_text(client: &mut SlateClient, path: &str) -> Result<String> {
     let bytes = client.read_path(path)?;
-    String::from_utf8(bytes).map_err(|_| anyhow!("{path}: not utf-8"))
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Read a path and split on '\n' into lines (drops a single trailing empty line).

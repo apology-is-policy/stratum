@@ -1300,9 +1300,12 @@ STM_TEST(p9_client_unlinkat_dir_without_removedir_flag_refused)
     destroy_client_fixture(&f);
 }
 
-/* Tunlinkat with AT_REMOVEDIR on non-empty dir → STM_EBUSY (Linux
- * ENOTEMPTY mapped). */
-STM_TEST(p9_client_unlinkat_removedir_nonempty_ebusy)
+/* Tunlinkat with AT_REMOVEDIR on non-empty dir → STM_ENOTEMPTY.
+ * SWISS-4r-7: previously err_map collapsed Linux ENOTEMPTY into
+ * STM_EBUSY, which mis-attributed the failure mode and made TUI
+ * batch delete unable to distinguish "directory has children"
+ * from "device busy". The test now asserts the faithful mapping. */
+STM_TEST(p9_client_unlinkat_removedir_nonempty_enotempty)
 {
     client_fixture f = make_client_fixture("unlink_nonempty");
 
@@ -1323,9 +1326,11 @@ STM_TEST(p9_client_unlinkat_removedir_nonempty_ebusy)
                                     0644u, 0, &lq, NULL));
     STM_ASSERT_OK(stm_9p_clunk(c, 101));
 
-    /* AT_REMOVEDIR on non-empty dir → server's stm_fs_rmdir refuses. */
+    /* AT_REMOVEDIR on non-empty dir → server's stm_fs_rmdir refuses
+     * with STM_ENOTEMPTY; client's err_map preserves it (post
+     * SWISS-4r-7). */
     stm_status rc = stm_9p_unlinkat(c, 100, "nonemp", STM_9P_AT_REMOVEDIR);
-    STM_ASSERT_EQ(rc, STM_EBUSY);
+    STM_ASSERT_EQ(rc, STM_ENOTEMPTY);
 
     STM_ASSERT_OK(stm_9p_clunk(c, 100));
     stm_9p_close(c);
@@ -1763,12 +1768,12 @@ STM_TEST(p9_client_link_on_directory_eperm)
     uint16_t walked = 0;
     STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 1, names, wqids, &walked));
 
-    /* Tlink fid=101 (the dir) into root with name "alias" → STM_EPERM. */
+    /* Tlink fid=101 (the dir) into root with name "alias" → STM_EPERM.
+     * SWISS-4r-7: err_map preserves POSIX EPERM faithfully now (was
+     * collapsed to STM_EACCES; the two are different POSIX symbols
+     * for "permission denied" vs "operation not permitted"). */
     stm_status rc = stm_9p_link(c, 100, 101, "alias");
-    STM_ASSERT_EQ(rc, STM_EACCES);
-    /* err_map maps STM_9P_ECODE_EPERM → STM_EACCES. The lib's status
-     * surface collapses POSIX EPERM and EACCES into one symbol — both
-     * are "access denied". This matches the lib's err_map design. */
+    STM_ASSERT_EQ(rc, STM_EPERM);
 
     STM_ASSERT_OK(stm_9p_clunk(c, 101));
     STM_ASSERT_OK(stm_9p_clunk(c, 100));

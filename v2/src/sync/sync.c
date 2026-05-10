@@ -4984,10 +4984,42 @@ static stm_status stm_sync_read_extent_locked(stm_sync *s,
     }
     if (ls != STM_OK) return ls;
 
-    /* Extent must start at our requested off (single-extent MVP) and
-     * cover at least `len` bytes from off. */
-    if (rec.off != off) return STM_EINVAL;
-    if (len > rec.len) return STM_EINVAL;
+    /* SWISS-4r-7: support partial-extent reads. The prior MVP
+     * required reads to start exactly at the extent's offset AND
+     * fit within rec.len; that's why a 500 KB write followed by an
+     * 8 KB read at offset 8192 returned STM_EINVAL despite the
+     * server-side data being intact. POSIX read(2) doesn't have an
+     * extent-alignment contract — callers ask for [off, off+len)
+     * and the FS satisfies what's reachable. The 9P client + TUI
+     * both rely on per-iounit reads (8 KiB stratum-fs default), so
+     * any production read path immediately hits this boundary as
+     * soon as a single extent is bigger than iounit.
+     *
+     * Implementation: extent at rec.off with length rec.len covers
+     * the byte range [rec.off, rec.off + rec.len). The caller's
+     * requested range [off, off + len) overlaps this extent at
+     * slice_off = off - rec.off (within [0, rec.len)). We decrypt
+     * the FULL extent into a temp buffer (AEAD verifies the whole
+     * ciphertext) and memcpy the slice. *out_read = min(len,
+     * rec.len - slice_off). The caller (stm_fs_read) loops on
+     * partial returns to satisfy the full request from successive
+     * extents.
+     *
+     * Performance note: decrypting a 500 KB extent for an 8 KB
+     * read is 60× wasted work. SWISS-4q's writeback-aggregation
+     * layer + a per-extent decrypt cache would address this; for
+     * now the simplest-correct path is what users observe vs. the
+     * EINVAL bug they hit at every backend op above iounit size. */
+    if (off < rec.off) return STM_EINVAL;     /* lookup_at invariant violation */
+    uint64_t slice_off = off - rec.off;
+    if (slice_off >= rec.len) {
+        /* Past end of this extent — POSIX-EOF for this segment. */
+        *out_read = 0;
+        return STM_OK;
+    }
+    size_t slice_len = (len < (size_t)(rec.len - slice_off))
+                            ? len
+                            : (size_t)(rec.len - slice_off);
 
     /* P7-CAS-2: COLD-extent read. Resolve content_hash → CAS index
      * entry → AEAD-decrypt one of the replicas under stm_ad_cas
@@ -5078,7 +5110,7 @@ static stm_status stm_sync_read_extent_locked(stm_sync *s,
             free(cpbuf);
             return clast_err;
         }
-        memcpy(buf, cpbuf, len);
+        memcpy(buf, (uint8_t *)cpbuf + slice_off, slice_len);
         stm_ct_memzero(cpbuf, rec.len);
         free(cpbuf);
 
@@ -5113,7 +5145,7 @@ static stm_status stm_sync_read_extent_locked(stm_sync *s,
                     s->current_gen, decay_window);
         }
 
-        *out_read = len;
+        *out_read = slice_len;
         return STM_OK;
     }
 
@@ -5209,10 +5241,10 @@ static stm_status stm_sync_read_extent_locked(stm_sync *s,
         return last_err;
     }
 
-    memcpy(buf, pbuf, len);
+    memcpy(buf, (uint8_t *)pbuf + slice_off, slice_len);
     stm_ct_memzero(pbuf, rec.len);
     free(pbuf);
-    *out_read = len;
+    *out_read = slice_len;
     return STM_OK;
 }
 

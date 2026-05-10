@@ -179,6 +179,13 @@ struct CopyBatch {
     last_error: Option<String>,
     /// SWISS-4n2: clock origin for throughput display.
     start_time: Instant,
+    /// SWISS-4r-3: rolling per-tick throughput samples for the
+    /// chart. record_sample() pushes a new entry every loop tick;
+    /// capped at SAMPLE_WINDOW (60). last_sample_bytes / _instant
+    /// are the prior tick's reading; the delta drives bytes_per_sec.
+    samples: Vec<crate::ui::ThroughputSample>,
+    last_sample_bytes: u64,
+    last_sample_instant: Instant,
 }
 
 /// SWISS-4h: in-progress batch delete. Simpler than CopyBatch — no
@@ -391,6 +398,27 @@ fn run_ui(
             // SWISS-4j: build a CopyProgress snapshot when a batch
             // is in flight so the renderer can overlay file-level
             // progress.
+            //
+            // SWISS-4r-3: also append a throughput sample to the
+            // batch's rolling window. Sampling at every redraw tick
+            // (~50–100ms) gives the chart enough density without
+            // burning frames on the rate calc.
+            if let Some(b) = copy_batch.as_mut() {
+                let now = Instant::now();
+                let dt = now.duration_since(b.last_sample_instant)
+                    .as_secs_f64();
+                if dt >= 0.05 {
+                    let cur_bytes = read_bytes_done();
+                    let db = cur_bytes.saturating_sub(b.last_sample_bytes) as f64;
+                    let bps = if dt > 0.0 { db / dt } else { 0.0 };
+                    b.samples.push(crate::ui::ThroughputSample { bytes_per_sec: bps });
+                    if b.samples.len() > crate::ui::SAMPLE_WINDOW {
+                        b.samples.remove(0);
+                    }
+                    b.last_sample_bytes = cur_bytes;
+                    b.last_sample_instant = now;
+                }
+            }
             let cp_snapshot: Option<CopyProgress> = copy_batch.as_ref().map(|b| {
                 let current_name = b.items.get(b.idx)
                     .and_then(|(_src, dst, _is_dir)| dst.file_name()
@@ -406,6 +434,7 @@ fn run_ui(
                     failed: b.failed,
                     bytes_done: read_bytes_done(),
                     elapsed_secs,
+                    samples: b.samples.clone(),
                 }
             });
             terminal.draw(|frame| {
@@ -615,7 +644,8 @@ fn handle_key(
             // name (relative to slate's view of the panel's backend
             // root — slate handles the walk).
             if let Some(panel_path) = detect_regular_file_at_cursor(snap, *focus) {
-                let event_line = format!("editor open {}\n", panel_path);
+                let panel_label = if *focus == 0 { "left" } else { "right" };
+                let event_line = format!("editor open {} {}\n", panel_label, panel_path);
                 if let Err(_e) = client.write_path("/event", event_line.as_bytes()) {
                     *local_dialog = Some(error_dialog(
                         &format!("editor open failed; check slate is connected"),
@@ -645,7 +675,8 @@ fn handle_key(
                 // and post-mark the local EditorState readonly. We
                 // signal via the local_dialog "Notice" channel so
                 // the user sees a brief "(view mode)" hint.
-                let event_line = format!("editor open {}\n", panel_path);
+                let panel_label = if *focus == 0 { "left" } else { "right" };
+                let event_line = format!("editor open {} {}\n", panel_label, panel_path);
                 let _ = client.write_path("/event", event_line.as_bytes());
                 // Set a TUI flag the next snapshot loop reads.
                 set_view_intent(true);
@@ -658,7 +689,8 @@ fn handle_key(
         // examine raw bytes).
         KeyCode::F(4) if !key.modifiers.contains(KeyModifiers::SHIFT) => {
             if let Some(panel_path) = detect_regular_file_at_cursor(snap, *focus) {
-                let event_line = format!("editor open {}\n", panel_path);
+                let panel_label = if *focus == 0 { "left" } else { "right" };
+                let event_line = format!("editor open {} {}\n", panel_label, panel_path);
                 let _ = client.write_path("/event", event_line.as_bytes());
                 set_view_intent(false);
                 return Ok(Action::Refresh);
@@ -917,7 +949,12 @@ fn submit_confirm(
             // stratum forward-noted to SWISS-4d2 (Rust BackendClient
             // gives us in-process readdir + per-entry unlinkat
             // without subprocess fan-out).
-            let cmd = if is_dir { "rmdir" } else { "rm" };
+            // SWISS-4r-9: use rmtree for dirs (recursively removes
+            // children + the dir itself). Plain `rmdir` requires the
+            // dir be empty AND surfaces STM_ENOTEMPTY → user has no
+            // path forward. rmtree mirrors `rm -rf` and is what the
+            // F8 batch-delete UX expects.
+            let cmd = if is_dir { "rmtree" } else { "rm" };
             if let Err(e) = sp.run_stratum_fs(
                 &socket,
                 &[cmd, &p9_path],
@@ -1775,9 +1812,43 @@ fn start_f5(
         *local_dialog = Some(error_dialog("Active panel is not connected."));
         return Ok(Action::Refresh);
     }
-    if panel.selection.is_empty() {
-        return run_copy(local_dialog, spawn, snap, active);
-    }
+    // SWISS-4r-8: cursor-on-directory cross-backend copy.
+    // No selection AND cursor on a dir AND src/dst are different
+    // backends → use the batch path (which goes through
+    // expand_dirs_in_items and recursively copies). Without this
+    // shortcut, run_copy refused with "Cross-backend directory copy
+    // not yet supported (SWISS-4d2)" — the workaround was Space
+    // then F5, which is unintuitive and surprised the user.
+    //
+    // Synthesize the selection vec inline so the loop below treats
+    // the cursor as if the user had spacebar-selected it. We DON'T
+    // mutate `snap.panels[active].selection` (UiState isn't Clone);
+    // instead we shadow `panel.selection` via an owned Vec when the
+    // condition fires.
+    let synthetic_selection: Vec<u32>;
+    let effective_selection: &Vec<u32> = if panel.selection.is_empty() {
+        let cursor_idx = panel.cursor as usize;
+        let trigger = panel.raw_entries.get(cursor_idx)
+            .map(|raw| {
+                let kind = raw.splitn(5, ' ').next().unwrap_or("?");
+                let dst_meta = spawn.map(|sp| sp.panel_meta(1 - active));
+                let src_meta = spawn.map(|sp| sp.panel_meta(active));
+                let cross_backend = match (&src_meta, &dst_meta) {
+                    (Some(s), Some(d)) =>
+                        std::mem::discriminant(s) != std::mem::discriminant(d),
+                    _ => false,
+                };
+                kind == "d" && cross_backend
+            })
+            .unwrap_or(false);
+        if !trigger {
+            return run_copy(local_dialog, spawn, snap, active);
+        }
+        synthetic_selection = vec![panel.cursor];
+        &synthetic_selection
+    } else {
+        &panel.selection
+    };
     let sp = match spawn {
         Some(s) => s,
         None => {
@@ -1805,7 +1876,7 @@ fn start_f5(
     let src_cwd = panel.path.trim_start_matches('/');
     let dst_cwd = dst_panel.path.trim_start_matches('/');
     let mut items: Vec<(PathBuf, PathBuf, bool)> = Vec::new();
-    for &idx in &panel.selection {
+    for &idx in effective_selection {
         let raw = match panel.raw_entries.get(idx as usize) {
             Some(r) => r,
             None => continue,
@@ -1869,12 +1940,16 @@ fn start_f5(
                                             &dst_meta, items);
     // SWISS-4n2: reset bytes-done counter for the new batch.
     reset_bytes_done();
+    let now = Instant::now();
     *copy_batch = Some(CopyBatch {
         items: expanded, idx: 0,
         src_meta, dst_meta, src_sock, dst_sock,
         sticky: None, copied: 0, skipped: 0, failed: 0,
         last_error: None,
-        start_time: Instant::now(),
+        start_time: now,
+        samples: Vec::with_capacity(crate::ui::SAMPLE_WINDOW),
+        last_sample_bytes: 0,
+        last_sample_instant: now,
     });
     Ok(Action::Refresh)
 }
@@ -2847,7 +2922,12 @@ fn advance_delete_batch(
         DeleteItem::Stratum { socket, p9_path, is_dir } => {
             let sp = spawn.ok_or_else(|| std::io::Error::new(
                 std::io::ErrorKind::Other, "spawn missing"))?;
-            let cmd = if is_dir { "rmdir" } else { "rm" };
+            // SWISS-4r-9: use rmtree for dirs (recursively removes
+            // children + the dir itself). Plain `rmdir` requires the
+            // dir be empty AND surfaces STM_ENOTEMPTY → user has no
+            // path forward. rmtree mirrors `rm -rf` and is what the
+            // F8 batch-delete UX expects.
+            let cmd = if is_dir { "rmtree" } else { "rm" };
             sp.run_stratum_fs(&socket, &[cmd, &p9_path],
                                std::process::Stdio::null(),
                                std::process::Stdio::null())
@@ -3007,6 +3087,13 @@ fn toggle_selection(
         "/panels/right/selection"
     };
     let _ = client.write_path(path, body.as_bytes());
+    // SWISS-4r-2: Total/Far Commander parity — Space toggles AND
+    // advances cursor by one row. Slate clamps at last entry so
+    // the verb is safe at the bottom.
+    let n = panel.raw_entries.len() as u32;
+    if n > 0 && cursor + 1 < n {
+        let _ = action_verb(client, focus, "key Down\n");
+    }
     Ok(Action::Refresh)
 }
 

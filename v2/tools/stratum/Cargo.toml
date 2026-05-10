@@ -30,6 +30,20 @@ libc         = "0.2"
 # crate so visuals + behaviour match.
 tui-textarea = "0.7"
 
+[dev-dependencies]
+tempfile = "3"
+
 [[bin]]
 name = "stratum"
 path = "src/main.rs"
+
+# SWISS-4r-10: end-to-end stability tests. Each test spawns its own
+# stratumd + slate + host-fs trio in a tempdir and drives scenarios
+# through the same surfaces the TUI uses: slate's /event verbs +
+# /panels/X/action + stratum-fs CLI subprocess. Goal: lock in CRUD
+# correctness BEFORE adding more features. User-explicit ask
+# (2026-05-10): "We must work tirelessly, construct every possible
+# test case, and test it."
+[[test]]
+name = "e2e_crud"
+path = "tests/e2e_crud.rs"

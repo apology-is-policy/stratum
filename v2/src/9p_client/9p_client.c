@@ -75,6 +75,26 @@ static uint64_t g_u64(const uint8_t *p) {
 /* Linux ecode → stm_status mapping. Keeps the lib's status set closed. */
 /* ────────────────────────────────────────────────────────────────────── */
 
+/*
+ * SWISS-4r-7: faithful Linux-ecode → stm_status mapping.
+ *
+ * Prior versions collapsed ENOTDIR/EISDIR/ENOTEMPTY/ENAMETOOLONG/
+ * ENODATA/EPERM/EBADF into coarser POSIX-shape codes, which lost
+ * information at the 9P client boundary. Concretely:
+ *   - rm of a directory returned STM_EINVAL instead of STM_EISDIR,
+ *     so stratum-fs's "rm" command surfaced "status=-22" and
+ *     callers (TUI batch delete, integration tests) couldn't
+ *     distinguish "wrong type" from "malformed flags".
+ *   - User-reported 2026-05-10: "Conflict resolution doesn't work
+ *     — just shows error -22 when the file is already present"
+ *     and ".git directory cannot be deleted from stm".
+ *
+ * Every Linux ecode now maps to its stm_status counterpart when
+ * one exists; coarse mappings are the exception, not the rule.
+ * Callers that need POSIX-shape sentinels still get the right ones
+ * (STM_EISDIR == -21 is the same numeric value as Linux EISDIR
+ *  via the stm_status assertions in types.h).
+ */
 static stm_status err_map(uint32_t ecode)
 {
     switch (ecode) {
@@ -83,27 +103,27 @@ static stm_status err_map(uint32_t ecode)
     case STM_9P_ECODE_EBUSY:        return STM_EBUSY;
     case STM_9P_ECODE_EEXIST:       return STM_EEXIST;
     case STM_9P_ECODE_EXDEV:        return STM_EXDEV;
-    case STM_9P_ECODE_ENOTDIR:      return STM_ENOENT;
-    case STM_9P_ECODE_EISDIR:       return STM_EINVAL;
+    case STM_9P_ECODE_ENOTDIR:      return STM_ENOTDIR;
+    case STM_9P_ECODE_EISDIR:       return STM_EISDIR;
     case STM_9P_ECODE_EINVAL:       return STM_EINVAL;
     case STM_9P_ECODE_ENOMEM:       return STM_ENOMEM;
-    case STM_9P_ECODE_ENOSPC:       return STM_ENOMEM;
+    case STM_9P_ECODE_ENOSPC:       return STM_ENOSPC;
     case STM_9P_ECODE_EROFS:        return STM_EROFS;
     case STM_9P_ECODE_ERANGE:       return STM_ERANGE;
     case STM_9P_ECODE_EOVERFLOW:    return STM_EOVERFLOW;
     case STM_9P_ECODE_ENOTSUP:      return STM_ENOTSUPPORTED;
-    case STM_9P_ECODE_ESTALE:       return STM_ENOENT;
+    case STM_9P_ECODE_ESTALE:       return STM_ESTALE;
     case STM_9P_ECODE_EIO:          return STM_EIO;
-    case STM_9P_ECODE_EBADF:        return STM_EINVAL;
-    case STM_9P_ECODE_EPROTO:       return STM_EBACKEND;
+    case STM_9P_ECODE_EBADF:        return STM_EINVAL;  /* no STM_EBADF; fid-mismatch surfaces as EINVAL */
+    case STM_9P_ECODE_EPROTO:       return STM_EPROTOCOL;
     case STM_9P_ECODE_ENOSYS:       return STM_ENOTSUPPORTED;
-    case STM_9P_ECODE_ENAMETOOLONG: return STM_ERANGE;
-    case STM_9P_ECODE_ENOTEMPTY:    return STM_EBUSY;
-    case STM_9P_ECODE_ENODATA:      return STM_ENOENT;
+    case STM_9P_ECODE_ENAMETOOLONG: return STM_ENAMETOOLONG;
+    case STM_9P_ECODE_ENOTEMPTY:    return STM_ENOTEMPTY;
+    case STM_9P_ECODE_ENODATA:      return STM_ENODATA;
     case STM_9P_ECODE_EFBIG:        return STM_EOVERFLOW;
-    case STM_9P_ECODE_EPERM:        return STM_EACCES;
-    case STM_9P_ECODE_EAGAIN:       return STM_EBUSY;
-    case STM_9P_ECODE_ENODEV:       return STM_EBACKEND;
+    case STM_9P_ECODE_EPERM:        return STM_EPERM;
+    case STM_9P_ECODE_EAGAIN:       return STM_EAGAIN;
+    case STM_9P_ECODE_ENODEV:       return STM_ENODEV;
     default:                         return STM_EBACKEND;
     }
 }

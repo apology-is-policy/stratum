@@ -799,19 +799,54 @@ uint64_t stm_slate_version(stm_slate *s)
     return v;
 }
 
+/* SWISS-4r-4: forward decl for the panel-aware editor open routed
+ * via /event verb dispatch (parse_editor_open_verb returns the
+ * panel index). Defined later alongside the other editor APIs. */
+static stm_status editor_open_panel(stm_slate *s, int panel_idx,
+                                         const char *path, size_t path_len);
+
 /* SLATE-5a: parse "editor open <path>" — returns true if matches +
  * sets *out_path, *out_path_len. Path is whatever follows the
  * "editor open " prefix. The caller validates path bounds + bytes
- * via validate_editor_path. */
+ * via validate_editor_path.
+ *
+ * SWISS-4r-4: extended to optionally accept a panel prefix:
+ *   "editor open left <path>"  → out_panel = SLATE_PANEL_LEFT
+ *   "editor open right <path>" → out_panel = SLATE_PANEL_RIGHT
+ *   "editor open <path>"       → out_panel = SLATE_PANEL_LEFT (back-compat)
+ * The TUI's F3/F4 handlers MUST emit the panel prefix; without it
+ * the editor binds to the LEFT panel's backend even when the user
+ * is focused on RIGHT (host-fs vs stratum-vol confusion: F4 on a
+ * host-fs README.md was walking the .stm volume → STM_ENOENT).
+ */
 static bool parse_editor_open_verb(const char *line, size_t len,
-                                       const char **out_path, size_t *out_path_len)
+                                       int *out_panel,
+                                       const char **out_path,
+                                       size_t *out_path_len)
 {
     static const char prefix[] = "editor open ";
     size_t prefix_len = sizeof(prefix) - 1u;
     if (len <= prefix_len) return false;
     if (memcmp(line, prefix, prefix_len) != 0) return false;
-    *out_path = line + prefix_len;
-    *out_path_len = len - prefix_len;
+    const char *rest = line + prefix_len;
+    size_t rest_len = len - prefix_len;
+    /* Try "left <path>" / "right <path>" first. */
+    if (rest_len > 5u && memcmp(rest, "left ", 5u) == 0) {
+        *out_panel = SLATE_PANEL_LEFT;
+        *out_path = rest + 5u;
+        *out_path_len = rest_len - 5u;
+        return true;
+    }
+    if (rest_len > 6u && memcmp(rest, "right ", 6u) == 0) {
+        *out_panel = SLATE_PANEL_RIGHT;
+        *out_path = rest + 6u;
+        *out_path_len = rest_len - 6u;
+        return true;
+    }
+    /* Bare form: panel defaults to LEFT (back-compat). */
+    *out_panel = SLATE_PANEL_LEFT;
+    *out_path = rest;
+    *out_path_len = rest_len;
     return true;
 }
 
@@ -844,8 +879,9 @@ stm_status stm_slate_submit_event(stm_slate *s, const char *line, size_t len)
      * can read /editor/active afterward to detect success.) */
     const char *epath = NULL;
     size_t epath_len = 0;
-    if (parse_editor_open_verb(line, len, &epath, &epath_len)) {
-        return stm_slate_editor_open(s, epath, epath_len);
+    int epanel = SLATE_PANEL_LEFT;
+    if (parse_editor_open_verb(line, len, &epanel, &epath, &epath_len)) {
+        return editor_open_panel(s, epanel, epath, epath_len);
     }
     if (parse_editor_close_verb(line, len)) {
         return stm_slate_editor_close(s);
