@@ -738,9 +738,52 @@ stm_status stm_9p_write(stm_9p_client *c, uint32_t fid, uint64_t offset,
      * with NULL buf is a legitimate "nudge" shape (server may
      * fsync or just acknowledge); pass through. */
     if (count > 0 && !buf) return STM_EINVAL;
-    /* Clamp count to iounit so the entire Twrite (header + 4-byte
-     * count + data) fits in our msize buffer. */
-    if (count > c->iounit) count = c->iounit;
+    /* SWISS-4q P0-1: clamp count so Twrite's full preamble +
+     * payload fits in c->buf. Twrite preamble is HDR + fid(4) +
+     * offset(8) + count(4) = HDR + 16; the public iounit field
+     * is sized for Tread (HDR + 4 reply preamble), which leaves
+     * 12 bytes too few for Twrite.
+     *
+     * SWISS-4q P0-2: ALSO round count down to a 4 KiB multiple
+     * so the server's stm_sync_write_extent (which requires len %
+     * 4096 == 0) accepts the payload. Without this, the trimmed-
+     * to-fit count was 1048553 bytes (== buf_cap - HDR - 16, not
+     * 4 KiB-aligned), and every first-Twrite of a sequential
+     * stream surfaced as STM_EINVAL on the server side.
+     *
+     * The 4 KiB rounding loses up to 4 KiB per Twrite; with the
+     * 8 MiB MSIZE_MAX cap each Twrite still carries ~8 MiB minus
+     * the 4 KiB tail. For unaligned file tails, the caller
+     * (cmd_write) sends a smaller chunk last; the server's
+     * fs_write_regular_locked pads sub-block writes via the
+     * INLINE-cap-transition path. This sequence:
+     *   - All-but-last chunk: 4 KiB-aligned, len ≤ rounded_max.
+     *   - Last chunk: arbitrary length (incl. < 4 KiB).
+     * The last-chunk case relies on the server's tail-pad logic;
+     * tracked separately as SWISS-4q-tail.
+     *
+     * User-reported 2026-05-10: "copying a single 2 GB file to
+     * an empty 3 GB drive triggers this bug" → manifests now as
+     * EINVAL on first 1 MB write before this fix. */
+    const uint32_t BLK = 4096u;
+    uint32_t max_write_count = c->buf_cap - STM_9P_HDR_SIZE - 16u;
+    /* Round down to 4 KiB so any sub-msize-cap chunk sent in
+     * sequential mode lands on the server as an aligned write. */
+    uint32_t aligned_max = (max_write_count / BLK) * BLK;
+    /* If the caller's count itself is a 4 KiB multiple, we
+     * preserve that exactly (allows the typical 1 MiB / 8 MiB
+     * stdio-buffer chunks to flow straight through); else we
+     * keep the caller's request as-is so the server can apply
+     * its tail-pad logic (the only legitimate sub-block write
+     * is the file's logical end). */
+    bool caller_aligned = (count != 0u) && ((count % BLK) == 0u);
+    if (caller_aligned) {
+        if (count > aligned_max) count = aligned_max;
+    } else if (count > max_write_count) {
+        count = aligned_max;  /* truncated → MUST land aligned */
+    }
+    /* (else: caller passed an unaligned count that fits — pass
+     * through; the server pads + records logical len.) */
 
     uint32_t msg_size = STM_9P_HDR_SIZE + 4u + 8u + 4u + count;
     if (msg_size > c->buf_cap) return STM_ERANGE;

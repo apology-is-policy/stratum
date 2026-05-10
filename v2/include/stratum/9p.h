@@ -133,11 +133,23 @@ enum {
 #define STM_9P_NOTAG           ((uint16_t)0xFFFFu)
 
 /* msize negotiation. Minimum bounded so Tread/Twrite arithmetic can't
- * underflow. Default 128 KiB matches diod's default. Cap at 1 MiB to
- * keep per-request buffers reasonable. */
+ * underflow. Default 128 KiB matches diod's default.
+ *
+ * SWISS-4q P0-2: cap raised from 1 MiB → 8 MiB. Every Twrite emits
+ * one extent record on the server (until the writeback-aggregation
+ * layer lands), so the per-extent payload bound dominates metadata
+ * density. STM_FS_RECORDSIZE_MAX = 8 MiB on the FS side; matching
+ * MSIZE_MAX brings the wire ceiling up to that limit so a 1 GB
+ * sequential write produces ~128 extents instead of ~1024.
+ *
+ * Per-connection buffers are heap-allocated at msize_max so the
+ * 8 MiB cap costs ~16 MiB per connection (req + resp). With
+ * stratumd's per-connection-pthread model and v2.0 single-client
+ * regime that's negligible; revisit if/when concurrent-accept
+ * grows the connection-count above ~16. */
 #define STM_9P_MSIZE_MIN       (4u * 1024u)
 #define STM_9P_MSIZE_DEFAULT   (128u * 1024u)
-#define STM_9P_MSIZE_MAX       (1u * 1024u * 1024u)
+#define STM_9P_MSIZE_MAX       (8u * 1024u * 1024u)
 
 /* Twalk caps + name length cap (matches Linux NAME_MAX). */
 #define STM_9P_MAX_WALK        16u

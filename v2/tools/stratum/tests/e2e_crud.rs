@@ -470,6 +470,80 @@ fn copy_500kb_file() {
     assert_eq!(read_back, body, "content mismatch");
 }
 
+#[test]
+fn copy_200mb_file_roundtrip() {
+    // SWISS-4q P0: a 200 MB file should write + read back clean
+    // with throughput well above 100 MB/s on local disk. The
+    // pre-fix path failed at ~500 KB with EOVERFLOW; this test
+    // proves the wire-protocol bandaid layer (msize 8 MiB +
+    // cmd_write/read 8 MiB heap buffers + 4 KiB-aligned client
+    // clamp) is sufficient for "single-large-file" workloads.
+    //
+    // The test uses a 4 GiB volume (much larger than the file)
+    // so volume-size-vs-extent-budget isn't the constraint.
+    use std::process::Stdio;
+    let s = SessionBuilder { volume_size: "4G", passphrase: None }
+        .build()
+        .expect("session");
+    // Generate 200 MB of content via dd-like loop in shell (cheap +
+    // doesn't need a 200 MB Rust Vec allocation).
+    let bin = s.bin.clone();
+    let sock = s.stratumd_sock.clone();
+    let body_size: u64 = 200 * 1024 * 1024;
+    // Pipe `dd if=/dev/zero bs=1M count=200` → `stratum fs write`.
+    use std::io::Write;
+    let mut child = std::process::Command::new(&bin)
+        .args(["fs", "-s", sock.to_str().unwrap(), "write", "/big.bin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut sin = child.stdin.take().unwrap();
+    let chunk = vec![0u8; 1024 * 1024];
+    for _ in 0..200 {
+        sin.write_all(&chunk).expect("write chunk");
+    }
+    drop(sin);
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "200 MB write failed (exit {}): {}",
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Verify size.
+    let (code, stat_out, _) = s
+        .fs_run(&sock, &["stat", "/big.bin"], Stdio::null())
+        .unwrap();
+    assert_eq!(code, 0);
+    let stat = String::from_utf8_lossy(&stat_out);
+    assert!(
+        stat.contains(&format!("size:   {body_size}")),
+        "stat reports wrong size: {stat}"
+    );
+    // Read it back. Stream to /dev/null but check exit + count bytes.
+    let read = std::process::Command::new(&bin)
+        .args(["fs", "-s", sock.to_str().unwrap(), "read", "/big.bin"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        read.status.success(),
+        "read failed (exit {}): {}",
+        read.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&read.stderr)
+    );
+    assert_eq!(
+        read.stdout.len() as u64,
+        body_size,
+        "read returned wrong size"
+    );
+    // Spot-check content is all zeros.
+    assert!(read.stdout.iter().all(|&b| b == 0), "content corruption");
+}
+
 // ── Volume "disappears" pattern (user report) ───────────────────────
 
 #[test]

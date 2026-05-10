@@ -409,24 +409,43 @@ static int cmd_read(stm_9p_client *c, int argc, char **argv)
         return status_to_exit(rc);
     }
 
+    /* SWISS-4q P0-3: 8 MiB heap-allocated read buffer. The previous
+     * 8 KiB stack buffer caused two problems:
+     *   - Each Tread = 8 KiB. For a 2 GB file: 262 144 reads.
+     *   - For sub-extent reads, stm_sync_read_extent_locked
+     *     decrypts the FULL extent (~ recordsize) for any read
+     *     within it. With 8 MiB extents and 8 KiB reads,
+     *     decryption work is amplified ~1000×.
+     * Bumping to 8 MiB matches MSIZE_MAX so each Tread aligns
+     * with one extent's worth of decrypted plaintext. */
+    enum { CMD_READ_BUF = 8u << 20 };  /* 8 MiB */
+    uint8_t *rbuf = (uint8_t *)malloc(CMD_READ_BUF);
+    if (!rbuf) {
+        fprintf(stderr, "stratum-fs: read: alloc buffer failed\n");
+        (void)stm_9p_clunk(c, WORK_FID);
+        return EXIT_IO;
+    }
     uint64_t offset = 0;
-    uint8_t  buf[8192];
     while (1) {
         uint32_t got = 0;
-        rc = stm_9p_read(c, WORK_FID, offset, buf, sizeof buf, &got);
+        rc = stm_9p_read(c, WORK_FID, offset, rbuf,
+                              (uint32_t)CMD_READ_BUF, &got);
         if (rc != STM_OK) {
             perr("read", rc);
+            free(rbuf);
             (void)stm_9p_clunk(c, WORK_FID);
             return status_to_exit(rc);
         }
         if (got == 0) break;
-        if (fwrite(buf, 1, got, stdout) != got) {
+        if (fwrite(rbuf, 1, got, stdout) != got) {
             fprintf(stderr, "stratum-fs: short stdout write\n");
+            free(rbuf);
             (void)stm_9p_clunk(c, WORK_FID);
             return EXIT_IO;
         }
         offset += got;
     }
+    free(rbuf);
     (void)stm_9p_clunk(c, WORK_FID);
     return 0;
 }
@@ -539,7 +558,12 @@ static int cmd_write(stm_9p_client *c, int argc, char **argv)
      * bigger client buffer reduces fread() syscalls + amortises
      * stdin pipe latency. R128 doctrine carry — perr() on err.
      */
-    enum { CMD_WRITE_BUF = 1u << 20 };  /* 1 MiB */
+    /* SWISS-4q P0-3: 8 MiB heap buffer matching MSIZE_MAX so each
+     * fread → one Twrite (no inner-loop chunking). Combined with
+     * the 4 KiB-aligned client clamp, every Twrite produces ONE
+     * server-side extent of up to ~8 MiB. 2 GB sequential write
+     * → ~256 extents (vs 16384 at the prior 1 MiB cap). */
+    enum { CMD_WRITE_BUF = 8u << 20 };  /* 8 MiB */
     uint8_t *buf = (uint8_t *)malloc(CMD_WRITE_BUF);
     if (!buf) {
         fprintf(stderr, "stratum-fs: write: alloc buffer failed\n");
