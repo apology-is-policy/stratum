@@ -318,6 +318,36 @@ stm_status stm_dirty_buffer_lookup(stm_dirty_buffer *buf,
     return STM_OK;
 }
 
+void stm_dirty_buffer_overlay(stm_dirty_buffer *buf,
+                                  uint64_t dataset_id, uint64_t ino,
+                                  uint64_t req_off, size_t req_len,
+                                  void *out_buf)
+{
+    if (!buf || !out_buf || req_len == 0) return;
+    if (req_off > UINT64_MAX - req_len) return;
+
+    pthread_mutex_lock(&buf->mu);
+    stm_dbuf_inode *e = find_inode_locked(buf, dataset_id, ino);
+    if (!e) {
+        pthread_mutex_unlock(&buf->mu);
+        return;
+    }
+    uint8_t *dst = (uint8_t *)out_buf;
+    uint64_t req_end = req_off + req_len;
+    for (stm_dbuf_range *r = e->head; r; r = r->next) {
+        if (r->off >= req_end) break;          /* list sorted; no more overlap */
+        if (r->off + r->len <= req_off) continue; /* range fully before req */
+        uint64_t s  = (r->off > req_off) ? r->off : req_off;
+        uint64_t en = (r->off + r->len < req_end) ? (r->off + r->len) : req_end;
+        if (en <= s) continue;
+        uint64_t take_len = en - s;
+        uint64_t dst_off  = s - req_off;
+        uint64_t src_off  = s - r->off;
+        memcpy(dst + dst_off, r->data + src_off, (size_t)take_len);
+    }
+    pthread_mutex_unlock(&buf->mu);
+}
+
 stm_status stm_dirty_buffer_drain_ino(stm_dirty_buffer *buf,
                                           uint64_t dataset_id, uint64_t ino,
                                           stm_dirty_buffer_drain_cb cb,

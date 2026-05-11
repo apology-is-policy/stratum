@@ -70,6 +70,17 @@
 #define STM_FLUSH_INODE_CAP_BYTES   (8u * 1024u * 1024u)
 #define STM_FLUSH_GLOBAL_CAP_BYTES  (256u * 1024u * 1024u)
 
+/* SWISS-4q-flush: direct-write threshold. Writes ≥ this size bypass
+ * the dirty buffer and go straight to the extent layer — they're
+ * already large enough that buffering adds a memcpy without a real
+ * coalescing win. Sized just below recordsize so a fragment-aligned
+ * 1 MiB chunk still buffers (rare but possible — gives the next
+ * adjacent fragment a chance to merge with it).
+ *
+ * v2 forward-note: tunable via a per-fs setting once the mount-opts
+ * surface gets one. */
+#define STM_FLUSH_DIRECT_THRESHOLD_BYTES  (1u * 1024u * 1024u)
+
 struct stm_fs {
     pthread_mutex_t lock;
 
@@ -362,6 +373,11 @@ stm_status stm_fs_format(const char *path, const stm_fs_format_opts *opts)
 /* Mount.                                                                     */
 /* ========================================================================= */
 
+/* SWISS-4q-flush forward decls — referenced by stm_fs_commit /
+ * stm_fs_unmount BEFORE the static definitions below. */
+static stm_status fs_flush_ino_locked(stm_fs *fs, uint64_t ds, uint64_t ino);
+static stm_status fs_flush_all_locked(stm_fs *fs);
+
 static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
                        stm_alloc *a, stm_sync *sync, bool ro,
                        const char *keyfile_path,
@@ -601,9 +617,17 @@ stm_status stm_fs_unmount(stm_fs *fs)
 
     stm_status commit_status = STM_OK;
     if (!fs->read_only && !fs->wedged) {
-        /* Final commit makes everything durable. Propagate its
-         * status so the caller knows if the unmount lost data. */
-        commit_status = stm_sync_commit(fs->sync);
+        /* SWISS-4q-flush: drain dirty buffer before final commit so
+         * every buffered write becomes a committed extent in the
+         * three-phase sync. If drain fails, propagate but skip
+         * sync_commit — partial-flush state is the caller's signal
+         * that not everything made it durable. */
+        commit_status = fs_flush_all_locked(fs);
+        if (commit_status == STM_OK) {
+            /* Final commit makes everything durable. Propagate its
+             * status so the caller knows if the unmount lost data. */
+            commit_status = stm_sync_commit(fs->sync);
+        }
     }
 
     /* Close the stack regardless of commit result. Order matters:
@@ -670,6 +694,18 @@ stm_status stm_fs_commit(stm_fs *fs)
     if (!fs) return STM_EINVAL;
     pthread_mutex_lock(&fs->lock);
     FS_GUARD_WRITE(fs);
+    /* SWISS-4q-flush: drain the dirty buffer FIRST so every buffered
+     * write becomes a committed extent before the three-phase sync
+     * makes everything durable. Per writeback.tla::Commit, this is the
+     * "flush all inodes then advance durability" sequence. If the
+     * drain fails (e.g., allocator out of space mid-flush), the inode's
+     * buffered ranges remain in-RAM for retry — the caller sees the
+     * failure and can decide whether to fsync again. */
+    stm_status fr = fs_flush_all_locked(fs);
+    if (fr != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return fr;
+    }
     stm_status s = stm_sync_commit(fs->sync);
     pthread_mutex_unlock(&fs->lock);
     return s;
@@ -715,6 +751,78 @@ static void fs_inode_bump_size(struct stm_inode_value *iv, uint64_t end_off)
 {
     uint64_t cur_size = stm_load_le64(iv->si_size);
     if (end_off > cur_size) iv->si_size = stm_store_le64(end_off);
+}
+
+/* SWISS-4q-flush helper: 4 KiB-aligned extent write with auto-RMW for
+ * non-aligned (off, len). Does NOT update si_size or stamp timestamps
+ * — that's the caller's responsibility (different for direct writes
+ * vs. flush-callback writes). Used by both fs_write_regular_locked's
+ * direct branch AND the dirty-buffer drain callback at flush time.
+ *
+ * Realizes the alignment-RMW logic SWISS-4q P1 introduced for the
+ * file-tail case (extent layer requires (off, len) ≡ 0 mod 4 KiB).
+ *
+ * Caller holds fs->lock. */
+static stm_status fs_write_extent_aligned_locked(stm_fs *fs,
+                                                       uint64_t ds, uint64_t ino,
+                                                       uint64_t off,
+                                                       const void *buf,
+                                                       size_t len)
+{
+    if (len == 0u) return STM_OK;
+    const uint64_t BLK = 4096u;
+    uint64_t end_off = off + (uint64_t)len;
+    bool aligned = (off % BLK == 0u) && ((uint64_t)len % BLK == 0u);
+    if (aligned) {
+        return stm_sync_write_extent(fs->sync, ds, ino, off, buf, len);
+    }
+    uint64_t aligned_off = off & ~(BLK - 1u);
+    uint64_t aligned_end = (end_off + BLK - 1u) & ~(BLK - 1u);
+    if (aligned_end > (uint64_t)STM_FS_RECORDSIZE_MAX + aligned_off) {
+        return STM_ERANGE;
+    }
+    uint64_t aligned_len = aligned_end - aligned_off;
+    uint8_t *scratch = (uint8_t *)calloc(1, (size_t)aligned_len);
+    if (!scratch) return STM_ENOMEM;
+    size_t got = 0;
+    stm_status rs = stm_sync_read_extent(fs->sync, ds, ino, aligned_off,
+                                               scratch, (size_t)aligned_len, &got);
+    if (rs != STM_OK && rs != STM_ENOENT) {
+        free(scratch);
+        return rs;
+    }
+    memcpy(scratch + (off - aligned_off), buf, len);
+    stm_status ws = stm_sync_write_extent(fs->sync, ds, ino, aligned_off,
+                                              scratch, (size_t)aligned_len);
+    free(scratch);
+    return ws;
+}
+
+/* SWISS-4q-flush drain callback: each buffered range becomes one
+ * stm_sync_write_extent via fs_write_extent_aligned_locked. The
+ * callback runs under stm_dirty_buffer's internal mutex AND under
+ * fs->lock (the caller's lock). The aligned helper takes sync->lock
+ * internally; lock order fs->lock → dbuf->mu → sync->lock holds. */
+static stm_status fs_flush_drain_cb(void *user, uint64_t ds, uint64_t ino,
+                                        uint64_t off, uint64_t len,
+                                        const void *data)
+{
+    stm_fs *fs = (stm_fs *)user;
+    return fs_write_extent_aligned_locked(fs, ds, ino, off, data, (size_t)len);
+}
+
+/* Flush one inode's buffered ranges. Caller holds fs->lock. */
+static stm_status fs_flush_ino_locked(stm_fs *fs, uint64_t ds, uint64_t ino)
+{
+    return stm_dirty_buffer_drain_ino(fs->dirty_buffer, ds, ino,
+                                            fs_flush_drain_cb, fs);
+}
+
+/* Flush every inode's buffered ranges. Caller holds fs->lock. */
+static stm_status fs_flush_all_locked(stm_fs *fs)
+{
+    return stm_dirty_buffer_drain_all(fs->dirty_buffer,
+                                            fs_flush_drain_cb, fs);
 }
 
 /* Inline-aware write for S_IFREG inode `iv` at (ds, ino). On entry:
@@ -856,94 +964,61 @@ static stm_status fs_write_regular_locked(stm_fs *fs, stm_inode_index *iidx,
     }
 
     if (kind == STM_DATA_EXTENT) {
-        /* SWISS-4q P1: pad sub-block writes for the file-tail case.
-         * stm_sync_write_extent requires (off, len) both 4 KiB-aligned;
-         * a real-file tail (not a multiple of 4 KiB) goes through this
-         * path with an unaligned len AND/OR off, and the bare call
-         * returns STM_EINVAL.
+        /* SWISS-4q-flush activation: small writes (< STM_FLUSH_DIRECT_
+         * THRESHOLD_BYTES) land in the dirty buffer. Large writes go
+         * straight to the extent layer. Per writeback.tla, the buffer
+         * absorbs many-small-writes (tarball unpack, code build, etc.)
+         * and emits them as fewer/larger extents at flush time.
          *
-         * User-reported 2026-05-10: copying a 1.8 GB + 4623 bytes file
-         * (real video, non-aligned tail) failed with EINVAL after
-         * 1800 MiB had already streamed in. The body wrote OK; only
-         * the last sub-block chunk was rejected.
-         *
-         * Strategy:
-         *   - aligned_off = off rounded DOWN to BLK
-         *   - aligned_end = (off + len) rounded UP to BLK
-         *   - aligned_len = aligned_end - aligned_off
-         *   - Build a BLK-aligned scratch buffer.
-         *   - For the head padding (aligned_off..off): if there's an
-         *     existing extent covering this range, read it; else zero
-         *     (file was extended into a hole).
-         *   - Copy user bytes at offset (off - aligned_off).
-         *   - For the tail padding ((off+len)..aligned_end): same
-         *     read-existing-or-zero logic.
-         *   - Write the scratch via stm_sync_write_extent(aligned_off,
-         *     aligned_len).
-         * si_size set to the LOGICAL end_off so reads see POSIX-EOF
-         * (the read path's R76 P2-1 clamp by si_size handles the
-         * trailing zeros).
-         *
-         * Aligned writes (the common case for sequential-1MiB chunks)
-         * skip the read-modify-write entirely. */
-        const uint64_t BLK = 4096u;
-        bool aligned = (off % BLK == 0u) && (len % BLK == 0u);
-        if (aligned) {
-            stm_status ws = stm_sync_write_extent(fs->sync, ds, ino, off, buf, len);
-            if (ws != STM_OK) return ws;
+         * Direct writes pre-flush the inode's buffered ranges so a
+         * stale buffered range doesn't shadow newer direct data
+         * post-overlay. */
+        if (len < STM_FLUSH_DIRECT_THRESHOLD_BYTES) {
+            stm_status ic = stm_dirty_buffer_insert(fs->dirty_buffer,
+                                                        ds, ino, off,
+                                                        (uint64_t)len, buf);
+            if (ic == STM_ENOSPC) {
+                /* Per writeback.tla::BufferBoundedSize retry-on-ENOSPC
+                 * dance: flush this inode, retry; if still ENOSPC the
+                 * global cap is the issue, flush every inode + retry. */
+                stm_status fr = fs_flush_ino_locked(fs, ds, ino);
+                if (fr == STM_OK) {
+                    ic = stm_dirty_buffer_insert(fs->dirty_buffer,
+                                                    ds, ino, off,
+                                                    (uint64_t)len, buf);
+                }
+                if (ic == STM_ENOSPC) {
+                    fr = fs_flush_all_locked(fs);
+                    if (fr == STM_OK) {
+                        ic = stm_dirty_buffer_insert(fs->dirty_buffer,
+                                                        ds, ino, off,
+                                                        (uint64_t)len, buf);
+                    }
+                }
+            }
+            if (ic != STM_OK) return ic;
         } else {
-            uint64_t aligned_off = off & ~(BLK - 1u);
-            uint64_t aligned_end = (end_off + BLK - 1u) & ~(BLK - 1u);
-            if (aligned_end > (uint64_t)STM_FS_RECORDSIZE_MAX
-                + aligned_off) {
-                /* Single-call extent layer caps at recordsize. The
-                 * caller (cmd_write / 9p server) splits sequential
-                 * writes into iounit-bound chunks; only the final
-                 * chunk can be sub-block, and its aligned_len ≤
-                 * 1 MiB (caller's chunk + ≤ 4 KiB pad). This
-                 * defensive check is for future codepaths that
-                 * pass huge sub-block writes. */
-                return STM_ERANGE;
-            }
-            uint64_t aligned_len = aligned_end - aligned_off;
-            uint8_t *scratch = (uint8_t *)calloc(1, (size_t)aligned_len);
-            if (!scratch) return STM_ENOMEM;
-
-            /* Read the existing aligned region (if any) so head/tail
-             * padding preserves prior bytes. read_extent reads only
-             * what's reachable; gaps return as zeros (already in
-             * scratch). */
-            size_t got = 0;
-            stm_status rs = stm_sync_read_extent(fs->sync, ds, ino,
-                                                       aligned_off,
-                                                       scratch,
-                                                       (size_t)aligned_len,
-                                                       &got);
-            if (rs != STM_OK && rs != STM_ENOENT) {
-                free(scratch);
-                return rs;
-            }
-            /* Overlay the user's bytes. */
-            memcpy(scratch + (off - aligned_off), buf, len);
-            stm_status ws = stm_sync_write_extent(fs->sync, ds, ino,
-                                                       aligned_off,
-                                                       scratch,
-                                                       (size_t)aligned_len);
-            free(scratch);
+            /* Direct path: pre-flush this inode's buffered ranges so
+             * the overlay at read-after-direct-write doesn't shadow
+             * the just-written direct extent. */
+            stm_status fr = fs_flush_ino_locked(fs, ds, ino);
+            if (fr != STM_OK) return fr;
+            stm_status ws = fs_write_extent_aligned_locked(fs, ds, ino,
+                                                                off, buf, len);
             if (ws != STM_OK) return ws;
         }
+        /* Size + timestamp update — common to both buffered and direct
+         * paths. The buffered write's bytes aren't on-disk yet, but
+         * the inode metadata records the LOGICAL post-write state and
+         * the buffer overlay surfaces those bytes on subsequent reads.
+         * Crash before sync_commit loses both the buffer AND the
+         * in-memory inode update; on remount, neither has happened. */
         uint64_t cur_size = stm_load_le64(iv->si_size);
         if (end_off > cur_size) {
             iv->si_size = stm_store_le64(end_off);
         }
         /* P8-POSIX-7a: stamp mtime + ctime on every successful extent
-         * write — including the no-grow case (overwrite-within-bounds
-         * is still a content modification per POSIX). The no-grow
-         * branch previously returned STM_OK without calling
-         * stm_inode_set; post-7a, every write goes through set so
-         * the timestamp persists. The cost is one inode-tree write
-         * per fs_write call; trade-off accepted for POSIX compliance.
-         * R76 P3-2: lock-posture infallibility argument applies. */
+         * write — same posture for buffered + direct. */
         fs_stamp_mtime_ctime_now(iv);
         return stm_inode_set(iidx, ds, ino, iv);
     }
@@ -995,15 +1070,42 @@ static stm_status fs_read_regular_locked(stm_fs *fs,
             if (out_read) *out_read = 0;
             return STM_OK;
         }
-        stm_status rs = stm_sync_read_extent(fs->sync, ds, ino, off,
-                                                buf, len, out_read);
-        if (rs == STM_OK && out_read) {
-            uint64_t logical_avail = cur_size - off;
-            if ((uint64_t)*out_read > logical_avail) {
-                *out_read = (size_t)logical_avail;
+        /* SWISS-4q-flush: probe the dirty buffer. If this inode has
+         * buffered ranges, we take the buffered read path; otherwise
+         * preserve the original (non-buffer) behavior verbatim. */
+        bool buffer_has_data =
+            stm_dirty_buffer_has_ino(fs->dirty_buffer, ds, ino);
+        if (!buffer_has_data) {
+            stm_status rs = stm_sync_read_extent(fs->sync, ds, ino, off,
+                                                    buf, len, out_read);
+            if (rs == STM_OK && out_read) {
+                uint64_t logical_avail = cur_size - off;
+                if ((uint64_t)*out_read > logical_avail) {
+                    *out_read = (size_t)logical_avail;
+                }
             }
+            return rs;
         }
-        return rs;
+        /* Buffered path: zero-fill the effective range so holes +
+         * buffer-only ranges read as zeros (POSIX hole semantics),
+         * then read the extent layer (fills what it has, leaves the
+         * rest zero), then overlay the buffer's newer bytes on top
+         * (writeback.tla::ReadHidesFlushOrder). Always returns
+         * effective_len so the caller's loop sees the full POSIX
+         * range — a buffer-only range past the extent edge is
+         * surfaced via overlay. */
+        uint64_t logical_avail = cur_size - off;
+        size_t effective_len = ((uint64_t)len < logical_avail)
+                                  ? len : (size_t)logical_avail;
+        if (effective_len > 0u) memset(buf, 0, effective_len);
+        size_t got_ext = 0;
+        stm_status rs = stm_sync_read_extent(fs->sync, ds, ino, off,
+                                                buf, effective_len, &got_ext);
+        if (rs != STM_OK && rs != STM_ENOENT) return rs;
+        stm_dirty_buffer_overlay(fs->dirty_buffer, ds, ino, off,
+                                    effective_len, buf);
+        if (out_read) *out_read = effective_len;
+        return STM_OK;
     }
     return STM_ENOTSUPPORTED;
 }
@@ -2317,6 +2419,20 @@ stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
 
     pthread_mutex_lock(&fs->lock);
     FS_GUARD_WRITE(fs);
+
+    /* SWISS-4q-flush: truncate operates on the extent tree directly
+     * (drops extents past new_size, may rewrite a crossing extent).
+     * Pre-flush the inode's buffered ranges so the extent layer
+     * reflects all issued writes before the truncate acts. After
+     * the flush, drop any buffered ranges past new_size (the post-
+     * truncate read should NOT see them). */
+    {
+        stm_status fr = fs_flush_ino_locked(fs, dataset_id, ino);
+        if (fr != STM_OK) {
+            pthread_mutex_unlock(&fs->lock);
+            return fr;
+        }
+    }
 
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
     if (!iidx) {
@@ -3791,6 +3907,18 @@ stm_status stm_fs_reflink(stm_fs *fs,
     if (!fs) return STM_EINVAL;
     pthread_mutex_lock(&fs->lock);
     FS_GUARD_WRITE(fs);
+    /* SWISS-4q-flush: reflink shares extents from src → dst. Both
+     * inodes' buffered ranges must be in the extent tree first:
+     *   - src: reflink iterates src's extent tree; buffered ranges
+     *     wouldn't be included → silent data loss on the dst side.
+     *   - dst: dst's buffered ranges would conflict with the new
+     *     reflinked extents (latest-write-wins ambiguity). */
+    {
+        stm_status fr = fs_flush_ino_locked(fs, src_dataset_id, src_ino);
+        if (fr != STM_OK) { pthread_mutex_unlock(&fs->lock); return fr; }
+        fr = fs_flush_ino_locked(fs, dst_dataset_id, dst_ino);
+        if (fr != STM_OK) { pthread_mutex_unlock(&fs->lock); return fr; }
+    }
     stm_status s = fs_reflink_locked(fs, src_dataset_id, src_ino,
                                           dst_dataset_id, dst_ino);
     pthread_mutex_unlock(&fs->lock);
@@ -5023,6 +5151,20 @@ stm_status stm_fs_fallocate(stm_fs *fs,
 
     pthread_mutex_lock(&fs->lock);
     FS_GUARD_WRITE(fs);
+
+    /* SWISS-4q-flush: fallocate operates on the extent tree directly
+     * (PUNCH_HOLE drops extents, COLLAPSE/INSERT shifts extent keys,
+     * etc.). Any buffered ranges for this inode are invisible to those
+     * ops and would survive PUNCH_HOLE / get out of sync with shifted
+     * extents. Pre-flush this inode so the extent layer reflects all
+     * issued writes before fallocate acts. */
+    {
+        stm_status fr = fs_flush_ino_locked(fs, dataset_id, ino);
+        if (fr != STM_OK) {
+            pthread_mutex_unlock(&fs->lock);
+            return fr;
+        }
+    }
 
     struct stm_inode_value iv = {0};
     stm_status vs = fs_fallocate_validate_target(fs, dataset_id, ino, &iv);

@@ -336,6 +336,57 @@ STM_TEST(dbuf_two_inodes_isolated)
     stm_dirty_buffer_destroy(b);
 }
 
+STM_TEST(dbuf_overlay_multiple_ranges)
+{
+    /* Read-overlay pattern: caller pre-fills out_buf with extent data,
+     * then calls overlay to apply buffered writes on top. */
+    stm_dirty_buffer *b = NULL;
+    STM_ASSERT_OK(stm_dirty_buffer_create(INO_CAP_8MIB, GLOBAL_CAP_64M, &b));
+
+    /* Two non-overlapping buffered ranges: [0, 5) and [10, 15). */
+    uint8_t a[5] = {0xa1, 0xa2, 0xa3, 0xa4, 0xa5};
+    uint8_t b2[5] = {0xb1, 0xb2, 0xb3, 0xb4, 0xb5};
+    STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 1, 0, 5, a));
+    STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 1, 10, 5, b2));
+
+    /* Pre-fill out_buf with placeholder "extent" data 0xff. */
+    uint8_t out[20];
+    memset(out, 0xff, sizeof out);
+
+    /* Overlay req [0, 20). Expected:
+     *   [0, 5)   = 0xa1..0xa5  (overlaid from buffer)
+     *   [5, 10)  = 0xff x 5    (gap, unchanged)
+     *   [10, 15) = 0xb1..0xb5  (overlaid)
+     *   [15, 20) = 0xff x 5    (after end, unchanged) */
+    stm_dirty_buffer_overlay(b, 1, 1, 0, 20, out);
+
+    STM_ASSERT_EQ((int)out[0], 0xa1);
+    STM_ASSERT_EQ((int)out[4], 0xa5);
+    STM_ASSERT_EQ((int)out[5], 0xff);
+    STM_ASSERT_EQ((int)out[9], 0xff);
+    STM_ASSERT_EQ((int)out[10], 0xb1);
+    STM_ASSERT_EQ((int)out[14], 0xb5);
+    STM_ASSERT_EQ((int)out[15], 0xff);
+
+    /* Partial-range overlay [3, 13): should overlay [3, 5) and [10, 13). */
+    memset(out, 0xee, sizeof out);
+    stm_dirty_buffer_overlay(b, 1, 1, 3, 10, out);
+    STM_ASSERT_EQ((int)out[0], 0xa4);  /* offset 3 in src → 0xa4 */
+    STM_ASSERT_EQ((int)out[1], 0xa5);
+    STM_ASSERT_EQ((int)out[2], 0xee);  /* gap */
+    STM_ASSERT_EQ((int)out[6], 0xee);
+    STM_ASSERT_EQ((int)out[7], 0xb1);  /* offset 10 in src → 0xb1 */
+    STM_ASSERT_EQ((int)out[9], 0xb3);
+
+    /* Missing-inode overlay: no-op. */
+    memset(out, 0x42, sizeof out);
+    stm_dirty_buffer_overlay(b, 99, 99, 0, 20, out);
+    STM_ASSERT_EQ((int)out[0], 0x42);
+    STM_ASSERT_EQ((int)out[19], 0x42);
+
+    stm_dirty_buffer_destroy(b);
+}
+
 STM_TEST(dbuf_arg_validation)
 {
     stm_dirty_buffer *b = NULL;

@@ -145,6 +145,24 @@ stm_status stm_dirty_buffer_lookup(stm_dirty_buffer *buf,
                                        size_t  *out_covered);
 
 /*
+ * Read overlay: for every buffered range of (dataset_id, ino) that
+ * overlaps [req_off, req_off+req_len), memcpy the overlap bytes from
+ * the buffer onto the corresponding positions in `out_buf`. Positions
+ * NOT covered by any buffered range are LEFT UNCHANGED — the typical
+ * caller pre-fills `out_buf` with extent-layer data, then calls this
+ * to overlay the in-RAM newer bytes (writeback.tla::ReadHidesFlushOrder).
+ *
+ * Best-effort, no return value: a NULL buffer / inode-not-present /
+ * zero-length request is a no-op.
+ *
+ * Concurrency: takes buf->mu internally.
+ */
+void stm_dirty_buffer_overlay(stm_dirty_buffer *buf,
+                                  uint64_t dataset_id, uint64_t ino,
+                                  uint64_t req_off, size_t req_len,
+                                  void    *out_buf);
+
+/*
  * Per-range callback passed to drain_ino / drain_all. The callback's
  * responsibility is to encrypt + write the range to the extent layer
  * (stm_sync_write_extent or similar). The buffer-owned `data` is valid
