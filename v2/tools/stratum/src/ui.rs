@@ -1038,16 +1038,17 @@ fn draw_fkey_bar(frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn draw_shift_fkey_bar(frame: &mut Frame<'_>, area: Rect) {
-    // SWISS-4: Shift+F2 + Shift+F7 are wired (host mount + MkVol).
+    // SWISS-4: Shift+F2 + Shift+F7 wired (host mount + MkVol).
+    // SWISS-8b: Shift+F3 / F5 / F6 / F8 wired (F2View pre-selection).
     let keys: &[(&str, &str)] = &[
         ("S1", ""),
         ("S2", "Host"),
-        ("S3", ""),
+        ("S3", "Snaps"),
         ("S4", ""),
-        ("S5", ""),
-        ("S6", ""),
+        ("S5", "Health"),
+        ("S6", "Encryp"),
         ("S7", "MkVol"),
-        ("S8", ""),
+        ("S8", "Metrics"),
         ("S9", ""),
         ("S10", ""),
     ];

@@ -1072,6 +1072,39 @@ fn handle_key(
                 });
                 return Ok(Action::Refresh);
             }
+            // SWISS-8b: Shift+F<n> pre-selection shortcuts to F2View.
+            // Each binding opens F2View with a specific pane already
+            // selected (parity with the F2-then-arrow-down workflow).
+            //   Shift+F3 → Snapshot Graph
+            //   Shift+F5 → Integrity
+            //   Shift+F6 → Encryption (placeholder pane)
+            //   Shift+F8 → Metrics (placeholder pane)
+            // Shift+F1/F4/F9 are still forwarded to slate as "key
+            // Shift-F<n>" for forward-compat (no v1.0 binding).
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                if let Some(pane) = match n {
+                    3 => Some(ui::F2Pane::SnapshotGraph),
+                    5 => Some(ui::F2Pane::Integrity),
+                    6 => Some(ui::F2Pane::Encryption),
+                    8 => Some(ui::F2Pane::Metrics),
+                    _ => None,
+                } {
+                    // Same R129 P2-1 modal-active gate as F2 toggle.
+                    if local_dialog.is_none()
+                        && editor.is_none()
+                        && copy_batch.is_none()
+                        && delete_batch.is_none()
+                    {
+                        *view_mode = ViewMode::F2View;
+                        *f2_state = ui::F2State::with_pane(pane);
+                        *snapgraph_cursor = 0;
+                        *snapgraph_filter = None;
+                        snapgraph_marks.clear();
+                        search.clear();
+                    }
+                    return Ok(Action::Refresh);
+                }
+            }
             // Other F-keys: forward to slate for forward-compat.
             let verb = if key.modifiers.contains(KeyModifiers::SHIFT) {
                 format!("key Shift-F{n}\n")
