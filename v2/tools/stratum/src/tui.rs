@@ -390,6 +390,12 @@ fn run_ui(
     // into SnapshotGraph mode so the user always lands on the first
     // (oldest) snap.
     let mut snapgraph_cursor: u32 = 0;
+    // SWISS-6 v1.1a: SnapshotGraph per-dataset filter. None = "All";
+    // Some(id) = restrict to that dataset_id. F3 in SnapshotGraph
+    // cycles None → ds[0] → ds[1] → ... → None. Reset to None on
+    // every transition into SnapshotGraph for predictable UX (same
+    // posture as snapgraph_cursor).
+    let mut snapgraph_filter: Option<u64> = None;
     let result = (|| -> Result<()> {
         loop {
             // SWISS-4h: advance batch ops one step per iteration when
@@ -602,10 +608,20 @@ fn run_ui(
             terminal.draw(|frame| {
                 let volmap_snap = volmap_poller.as_ref().map(|p| p.snapshot());
                 let snapgraph_snap = snapgraph_poller.as_ref().map(|p| p.snapshot());
-                // Clamp cursor against current snap count — state can
-                // shrink between ticks if a snap was deleted.
+                // Clamp cursor against the filtered visible count — state
+                // can shrink between ticks if a snap was deleted OR the
+                // user's filter excludes more entries than before.
+                // SWISS-6 v1.1a: also drop a stale filter id if its
+                // dataset no longer has any snaps (e.g. all of its snaps
+                // were deleted between ticks) — wraps to None (All).
                 if let Some(sg) = snapgraph_snap.as_ref() {
-                    let max = sg.snaps.len().saturating_sub(1) as u32;
+                    if let Some(fid) = snapgraph_filter {
+                        if sg.filtered_count(Some(fid)) == 0 && !sg.snaps.is_empty() {
+                            snapgraph_filter = None;
+                        }
+                    }
+                    let visible = sg.filtered_count(snapgraph_filter);
+                    let max = visible.saturating_sub(1) as u32;
                     if snapgraph_cursor > max {
                         snapgraph_cursor = max;
                     }
@@ -619,6 +635,7 @@ fn run_ui(
                     volmap_snap.as_ref(),
                     snapgraph_snap.as_ref(),
                     snapgraph_cursor,
+                    snapgraph_filter,
                 )
             })?;
             loop {
@@ -632,6 +649,7 @@ fn run_ui(
                                               &mut delete_batch, &mut search,
                                               &mut view_mode,
                                               &mut snapgraph_cursor,
+                                              &mut snapgraph_filter,
                                               snapgraph_snap_for_key.as_ref(),
                                               spawn.as_ref(),
                                               &snapshot, key)? {
@@ -682,6 +700,7 @@ fn handle_key(
     search: &mut SearchState,
     view_mode: &mut ViewMode,
     snapgraph_cursor: &mut u32,
+    snapgraph_filter: &mut Option<u64>,
     snapgraph_state: Option<&SnapshotGraphState>,
     spawn: Option<&Arc<SpawnCtx>>,
     snap: &UiState,
@@ -748,6 +767,10 @@ fn handle_key(
             };
             search.clear();
             *snapgraph_cursor = 0;
+            // SWISS-6 v1.1a: reset per-dataset filter on every view
+            // transition so the user re-enters SnapshotGraph with a
+            // predictable "All" view (parity with snapgraph_cursor).
+            *snapgraph_filter = None;
         }
         return Ok(Action::Refresh);
     }
@@ -772,6 +795,7 @@ fn handle_key(
         {
             *view_mode = ViewMode::SnapshotGraph;
             *snapgraph_cursor = 0;
+            *snapgraph_filter = None;
             search.clear();
         }
         return Ok(Action::Refresh);
@@ -804,15 +828,31 @@ fn handle_key(
         if matches!(key.code, KeyCode::Esc) {
             *view_mode = ViewMode::VolumeMap;
             *snapgraph_cursor = 0;
+            *snapgraph_filter = None;
             return Ok(Action::Refresh);
         }
-        // Cursor navigation. State count comes from the poller's
-        // snapshot; if no poller, the graph is empty and all nav
-        // keys are no-ops (cursor stays at 0).
-        let snap_count: u32 = snapgraph_state
-            .map(|s| s.snaps.len() as u32)
+        // SWISS-6 v1.1a: F3 cycles the per-dataset filter
+        // None → ds[0] → ds[1] → ... → None. The cycle order matches
+        // dataset_ids() ascending. Cursor resets to 0 on cycle so
+        // the user always lands on the first visible snap after a
+        // filter change (parity with mode-transition reset). If the
+        // state is None (no poller), F3 is a no-op.
+        if matches!(key.code, KeyCode::F(3))
+            && !key.modifiers.contains(KeyModifiers::SHIFT)
+        {
+            if let Some(sg) = snapgraph_state {
+                *snapgraph_filter = sg.next_filter(*snapgraph_filter);
+                *snapgraph_cursor = 0;
+            }
+            return Ok(Action::Refresh);
+        }
+        // Cursor navigation. Visible count comes from the poller's
+        // snapshot under the current filter; if no poller, the graph
+        // is empty and all nav keys are no-ops (cursor stays at 0).
+        let visible_count: u32 = snapgraph_state
+            .map(|s| s.filtered_count(*snapgraph_filter) as u32)
             .unwrap_or(0);
-        let max_idx: u32 = snap_count.saturating_sub(1);
+        let max_idx: u32 = visible_count.saturating_sub(1);
         match key.code {
             KeyCode::Up => {
                 *snapgraph_cursor = snapgraph_cursor.saturating_sub(1);

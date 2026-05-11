@@ -36,9 +36,22 @@ const CLR_CURSOR_FG: Color = Color::White;
 
 /// Render the snapshot graph into `area`. Caller (ui.rs::render) is
 /// responsible for the cursor bounds invariant — `cursor` must be
-/// `< state.snaps.len()` OR `state.snaps` must be empty (in which
-/// case cursor is ignored).
-pub fn render(f: &mut Frame, area: Rect, state: &SnapshotGraphState, cursor: u32) {
+/// `< state.filtered_count(filter)` OR the filtered view must be empty
+/// (in which case cursor is ignored).
+///
+/// `filter` is the SWISS-6 v1.1a per-dataset filter (F3 cycle):
+/// `None` means "show all snaps"; `Some(id)` means "show only snaps
+/// whose dataset_id matches id". The filter is applied to the rendered
+/// rows + the cursor index; lineage_depth still walks the FULL chain
+/// (across all datasets) so a parent that lives outside the filtered
+/// view is still found — this preserves the visual lineage indent.
+pub fn render(
+    f: &mut Frame,
+    area: Rect,
+    state: &SnapshotGraphState,
+    cursor: u32,
+    filter: Option<u64>,
+) {
     let outer = Block::default()
         .borders(Borders::ALL)
         .border_set(border::DOUBLE)
@@ -67,14 +80,32 @@ pub fn render(f: &mut Frame, area: Rect, state: &SnapshotGraphState, cursor: u32
         ])
         .split(inner);
 
-    render_header(f, chunks[0], state);
-    render_list(f, chunks[1], state, cursor);
-    render_detail(f, chunks[2], state, cursor);
+    let visible: Vec<usize> = match filter {
+        None => (0..state.snaps.len()).collect(),
+        Some(id) => state
+            .snaps
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.dataset_id == id)
+            .map(|(idx, _)| idx)
+            .collect(),
+    };
+
+    render_header(f, chunks[0], state, filter, &visible);
+    render_list(f, chunks[1], state, cursor, &visible);
+    render_detail(f, chunks[2], state, cursor, &visible);
     render_footer(f, chunks[3]);
 }
 
-fn render_header(f: &mut Frame, area: Rect, state: &SnapshotGraphState) {
+fn render_header(
+    f: &mut Frame,
+    area: Rect,
+    state: &SnapshotGraphState,
+    filter: Option<u64>,
+    visible: &[usize],
+) {
     let total = state.snaps.len();
+    let shown = visible.len();
     let held = state.held_count();
     let mut spans = vec![
         Span::styled("Total: ", Style::default().fg(CLR_LABEL)),
@@ -88,6 +119,18 @@ fn render_header(f: &mut Frame, area: Rect, state: &SnapshotGraphState) {
             format!("{held}"),
             Style::default().fg(CLR_HELD).add_modifier(Modifier::BOLD),
         ),
+        Span::raw("    "),
+        Span::styled("Filter: ", Style::default().fg(CLR_LABEL)),
+        match filter {
+            None => Span::styled(
+                "All",
+                Style::default().fg(CLR_VALUE).add_modifier(Modifier::BOLD),
+            ),
+            Some(id) => Span::styled(
+                format!("dataset {id} ({shown}/{total})"),
+                Style::default().fg(CLR_HELD).add_modifier(Modifier::BOLD),
+            ),
+        },
     ];
     if state.truncated {
         spans.push(Span::raw("    "));
@@ -173,12 +216,20 @@ fn snap_row_line(snap: &SnapshotInfo, depth: u32, selected: bool) -> Line<'stati
     Line::from(vec![Span::styled(base, style)])
 }
 
-fn render_list(f: &mut Frame, area: Rect, state: &SnapshotGraphState, cursor: u32) {
-    if state.snaps.is_empty() {
+fn render_list(
+    f: &mut Frame,
+    area: Rect,
+    state: &SnapshotGraphState,
+    cursor: u32,
+    visible: &[usize],
+) {
+    if visible.is_empty() {
         let msg = if state.last_error.is_some() {
             "(no snapshots — see error above)"
-        } else {
+        } else if state.snaps.is_empty() {
             "(no snapshots yet — use stratum-fs snapshot to create one)"
+        } else {
+            "(no snapshots in this filter — press F3 to cycle)"
         };
         f.render_widget(
             Paragraph::new(msg)
@@ -189,21 +240,21 @@ fn render_list(f: &mut Frame, area: Rect, state: &SnapshotGraphState, cursor: u3
         return;
     }
 
-    let cursor_idx = (cursor as usize).min(state.snaps.len().saturating_sub(1));
+    let cursor_visible = (cursor as usize).min(visible.len().saturating_sub(1));
 
-    let items: Vec<ListItem> = state
-        .snaps
+    let items: Vec<ListItem> = visible
         .iter()
         .enumerate()
-        .map(|(idx, snap)| {
-            let depth = state.lineage_depth(idx);
-            let selected = idx == cursor_idx;
+        .map(|(visible_idx, &orig_idx)| {
+            let snap = &state.snaps[orig_idx];
+            let depth = state.lineage_depth(orig_idx);
+            let selected = visible_idx == cursor_visible;
             ListItem::new(snap_row_line(snap, depth, selected))
         })
         .collect();
 
     let mut list_state = ListState::default();
-    list_state.select(Some(cursor_idx));
+    list_state.select(Some(cursor_visible));
 
     let list = List::new(items)
         .style(Style::default().bg(CLR_BG))
@@ -211,7 +262,13 @@ fn render_list(f: &mut Frame, area: Rect, state: &SnapshotGraphState, cursor: u3
     f.render_stateful_widget(list, area, &mut list_state);
 }
 
-fn render_detail(f: &mut Frame, area: Rect, state: &SnapshotGraphState, cursor: u32) {
+fn render_detail(
+    f: &mut Frame,
+    area: Rect,
+    state: &SnapshotGraphState,
+    cursor: u32,
+    visible: &[usize],
+) {
     let detail_block = Block::default()
         .borders(Borders::TOP)
         .border_style(Style::default().fg(CLR_DIM))
@@ -219,11 +276,11 @@ fn render_detail(f: &mut Frame, area: Rect, state: &SnapshotGraphState, cursor: 
     let inner = detail_block.inner(area);
     f.render_widget(detail_block, area);
 
-    if state.snaps.is_empty() {
+    if visible.is_empty() {
         return;
     }
-    let cursor_idx = (cursor as usize).min(state.snaps.len().saturating_sub(1));
-    let snap = &state.snaps[cursor_idx];
+    let cursor_visible = (cursor as usize).min(visible.len().saturating_sub(1));
+    let snap = &state.snaps[visible[cursor_visible]];
     let name = sanitize_name(&snap.name);
 
     let line1 = Line::from(vec![
@@ -278,8 +335,8 @@ fn render_footer(f: &mut Frame, area: Rect) {
     let spans = vec![
         Span::styled(" F2 ", Style::default().bg(CLR_CURSOR_BG).fg(CLR_CURSOR_FG)),
         Span::styled(" Back  ", Style::default().fg(CLR_VALUE)),
-        Span::styled(" Esc ", Style::default().bg(CLR_CURSOR_BG).fg(CLR_CURSOR_FG)),
-        Span::styled(" Back  ", Style::default().fg(CLR_VALUE)),
+        Span::styled(" F3 ", Style::default().bg(CLR_CURSOR_BG).fg(CLR_CURSOR_FG)),
+        Span::styled(" Filter  ", Style::default().fg(CLR_VALUE)),
         Span::styled(" ↑↓ ", Style::default().bg(CLR_CURSOR_BG).fg(CLR_CURSOR_FG)),
         Span::styled(" Move  ", Style::default().fg(CLR_VALUE)),
         Span::styled(" PgUp/PgDn ", Style::default().bg(CLR_CURSOR_BG).fg(CLR_CURSOR_FG)),
@@ -320,7 +377,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                render(f, area, &state, 0);
+                render(f, area, &state, 0, None);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -344,7 +401,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                render(f, area, &state, 0);
+                render(f, area, &state, 0, None);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -368,7 +425,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                render(f, area, &state, 0);
+                render(f, area, &state, 0, None);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -387,12 +444,67 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                render(f, area, &state, 0);
+                render(f, area, &state, 0, None);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let dump = format!("{buffer:?}");
         assert!(dump.contains("error:"));
         assert!(dump.contains("dial failed"));
+    }
+
+    #[test]
+    fn render_with_filter_restricts_visible_rows() {
+        // 3 snaps in ds=1 ("alpha" / "beta" / "gamma"), 1 in ds=2 ("zeta").
+        // Filter to ds=2 → only "zeta" visible; "alpha" / "beta" / "gamma"
+        // must NOT appear; header must show "dataset 2 (1/4)".
+        let snap_ds2 = SnapshotInfo { dataset_id: 2, ..mk_snap(4, 0, "zeta", 0) };
+        let state = SnapshotGraphState {
+            snaps: vec![
+                mk_snap(1, 0, "alpha", 0),
+                mk_snap(2, 1, "beta", 0),
+                mk_snap(3, 2, "gamma", 0),
+                snap_ds2,
+            ],
+            ..Default::default()
+        };
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render(f, area, &state, 0, Some(2));
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let dump = format!("{buffer:?}");
+        assert!(dump.contains("zeta"), "expected zeta visible under filter; got:\n{dump}");
+        assert!(!dump.contains("alpha"), "alpha must not appear under ds=2 filter");
+        assert!(!dump.contains("beta"));
+        assert!(!dump.contains("gamma"));
+        // Header shows dataset 2 (visible/total).
+        assert!(dump.contains("dataset 2"), "filter indicator missing:\n{dump}");
+        assert!(dump.contains("1/4"));
+    }
+
+    #[test]
+    fn render_with_filter_no_match_shows_message() {
+        let state = SnapshotGraphState {
+            snaps: vec![mk_snap(1, 0, "alpha", 0)],
+            ..Default::default()
+        };
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render(f, area, &state, 0, Some(99));
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let dump = format!("{buffer:?}");
+        assert!(dump.contains("no snapshots in this filter"), "expected filter-empty message; got:\n{dump}");
+        // alpha exists in the state but isn't in the filter → not rendered.
+        assert!(!dump.contains("alpha"));
     }
 }

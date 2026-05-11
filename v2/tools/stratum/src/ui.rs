@@ -426,6 +426,7 @@ pub fn render(
     volmap: Option<&VolumeMapState>,
     snapgraph: Option<&SnapshotGraphState>,
     snapgraph_cursor: u32,
+    snapgraph_filter: Option<u64>,
 ) {
     let area = frame.area();
     frame.render_widget(Block::default().style(Style::default().bg(CLR_BG)), area);
@@ -503,7 +504,7 @@ pub fn render(
             .split(area);
         let default_state = SnapshotGraphState::default();
         let render_state = snapgraph.unwrap_or(&default_state);
-        crate::swiss6_view::render(frame, rows[0], render_state, snapgraph_cursor);
+        crate::swiss6_view::render(frame, rows[0], render_state, snapgraph_cursor, snapgraph_filter);
         draw_fkey_bar(frame, rows[1]);
         draw_shift_fkey_bar(frame, rows[2]);
         if !state.dialog_stack.is_empty() {

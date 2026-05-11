@@ -93,6 +93,50 @@ impl SnapshotGraphState {
     pub fn held_count(&self) -> usize {
         self.snaps.iter().filter(|s| s.is_held()).count()
     }
+
+    /// SWISS-6 v1.1a: distinct dataset ids in the snapshot set, sorted
+    /// ascending. Used by the F3-cycle filter UI to enumerate the
+    /// available datasets the user can scope the view to.
+    pub fn dataset_ids(&self) -> Vec<u64> {
+        let mut set: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        for s in &self.snaps {
+            set.insert(s.dataset_id);
+        }
+        set.into_iter().collect()
+    }
+
+    /// SWISS-6 v1.1a: count of snaps visible under `filter`. `None`
+    /// means "no filter — all snaps"; `Some(id)` means "only snaps
+    /// whose dataset_id matches".
+    pub fn filtered_count(&self, filter: Option<u64>) -> usize {
+        match filter {
+            None => self.snaps.len(),
+            Some(id) => self.snaps.iter().filter(|s| s.dataset_id == id).count(),
+        }
+    }
+
+    /// SWISS-6 v1.1a: advance the filter cycle.
+    ///
+    /// Order: None (All) → dataset_ids[0] → dataset_ids[1] → ... → None.
+    /// If the current filter id is no longer present (snap deleted
+    /// between ticks), the next cycle wraps to None and then proceeds
+    /// from the start.
+    pub fn next_filter(&self, current: Option<u64>) -> Option<u64> {
+        let ids = self.dataset_ids();
+        if ids.is_empty() {
+            return None;
+        }
+        match current {
+            None => Some(ids[0]),
+            Some(cur) => {
+                match ids.iter().position(|&d| d == cur) {
+                    Some(pos) if pos + 1 < ids.len() => Some(ids[pos + 1]),
+                    Some(_) => None,  // cycled past last → All
+                    None => None,     // current id gone → wrap to All
+                }
+            }
+        }
+    }
 }
 
 /// Parse the line-oriented snapshot body produced by
@@ -496,6 +540,92 @@ future-field: some-new-value
         assert_eq!(sanitize_name("with\ttab"), "with?tab");
         assert_eq!(sanitize_name("with\nnewline"), "with?newline");
         assert_eq!(sanitize_name("with\x7fdel"), "with?del");
+    }
+
+    #[test]
+    fn dataset_ids_empty_state() {
+        let state = SnapshotGraphState::default();
+        assert!(state.dataset_ids().is_empty());
+    }
+
+    #[test]
+    fn dataset_ids_sorted_unique() {
+        // Datasets 3, 1, 1, 2 → distinct + sorted ascending.
+        let state = SnapshotGraphState {
+            snaps: vec![
+                SnapshotInfo { dataset_id: 3, ..make_snap(1, 0) },
+                SnapshotInfo { dataset_id: 1, ..make_snap(2, 0) },
+                SnapshotInfo { dataset_id: 1, ..make_snap(3, 0) },
+                SnapshotInfo { dataset_id: 2, ..make_snap(4, 0) },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(state.dataset_ids(), vec![1u64, 2, 3]);
+    }
+
+    #[test]
+    fn filtered_count_none_returns_all() {
+        let state = SnapshotGraphState {
+            snaps: vec![
+                SnapshotInfo { dataset_id: 1, ..make_snap(1, 0) },
+                SnapshotInfo { dataset_id: 2, ..make_snap(2, 0) },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(state.filtered_count(None), 2);
+    }
+
+    #[test]
+    fn filtered_count_some_restricts_to_dataset() {
+        let state = SnapshotGraphState {
+            snaps: vec![
+                SnapshotInfo { dataset_id: 1, ..make_snap(1, 0) },
+                SnapshotInfo { dataset_id: 1, ..make_snap(2, 0) },
+                SnapshotInfo { dataset_id: 2, ..make_snap(3, 0) },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(state.filtered_count(Some(1)), 2);
+        assert_eq!(state.filtered_count(Some(2)), 1);
+        // Filter on a dataset that has no snaps:
+        assert_eq!(state.filtered_count(Some(99)), 0);
+    }
+
+    #[test]
+    fn next_filter_cycles_through_datasets() {
+        let state = SnapshotGraphState {
+            snaps: vec![
+                SnapshotInfo { dataset_id: 1, ..make_snap(1, 0) },
+                SnapshotInfo { dataset_id: 2, ..make_snap(2, 0) },
+                SnapshotInfo { dataset_id: 3, ..make_snap(3, 0) },
+            ],
+            ..Default::default()
+        };
+        // None → 1 → 2 → 3 → None.
+        assert_eq!(state.next_filter(None), Some(1));
+        assert_eq!(state.next_filter(Some(1)), Some(2));
+        assert_eq!(state.next_filter(Some(2)), Some(3));
+        assert_eq!(state.next_filter(Some(3)), None);
+    }
+
+    #[test]
+    fn next_filter_empty_state_returns_none() {
+        let state = SnapshotGraphState::default();
+        assert_eq!(state.next_filter(None), None);
+        assert_eq!(state.next_filter(Some(42)), None);
+    }
+
+    #[test]
+    fn next_filter_unknown_current_wraps_to_none() {
+        // A snap from dataset 7 was deleted between ticks; the current
+        // filter still points to it. next_filter should wrap to None.
+        let state = SnapshotGraphState {
+            snaps: vec![
+                SnapshotInfo { dataset_id: 1, ..make_snap(1, 0) },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(state.next_filter(Some(7)), None);
     }
 
     #[test]
