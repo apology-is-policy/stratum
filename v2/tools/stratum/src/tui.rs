@@ -364,10 +364,14 @@ fn run_ui(
     // doc for behavior). Lives across handle_key calls so a user
     // can type "ph" then "o" and have the cursor land on "photo.jpg".
     let mut search = SearchState::new();
-    // SWISS-5: top-level view toggle (Files <-> VolumeMap). F2
-    // (no modifiers) flips between the two. Defaults to Files —
-    // the user lands on the dual-pane file browser as before.
+    // SWISS-8a: top-level view toggle (Files <-> F2View). F2 (no
+    // modifiers) flips between the two; Esc inside F2View also
+    // closes back to Files. Defaults to Files — the user lands on
+    // the dual-pane file browser as before. F2View carries a
+    // separate F2State (which pane is selected + which side has
+    // focus); Shift+F<n> shortcuts pre-select a specific pane.
     let mut view_mode: ViewMode = ViewMode::Files;
+    let mut f2_state: ui::F2State = ui::F2State::default();
     // SWISS-5: VolumeMap poller — spawned at run_ui entry IFF a
     // SpawnCtx is attached AND it carries a stratumd /ctl/ socket.
     // The poller dials /ctl/ once per REFRESH_INTERVAL (1 s) and
@@ -639,6 +643,7 @@ fn run_ui(
                     editor.as_ref(),
                     cp_snapshot.as_ref(),
                     view_mode,
+                    f2_state,
                     volmap_snap.as_ref(),
                     snapgraph_snap.as_ref(),
                     snapgraph_cursor,
@@ -656,6 +661,7 @@ fn run_ui(
                                               &mut editor, &mut copy_batch,
                                               &mut delete_batch, &mut search,
                                               &mut view_mode,
+                                              &mut f2_state,
                                               &mut snapgraph_cursor,
                                               &mut snapgraph_filter,
                                               &mut snapgraph_marks,
@@ -708,6 +714,7 @@ fn handle_key(
     delete_batch: &mut Option<DeleteBatch>,
     search: &mut SearchState,
     view_mode: &mut ViewMode,
+    f2_state: &mut ui::F2State,
     snapgraph_cursor: &mut u32,
     snapgraph_filter: &mut Option<u64>,
     snapgraph_marks: &mut Vec<u64>,
@@ -743,279 +750,54 @@ fn handle_key(
         return Ok(Action::Quit);
     }
 
-    // SWISS-5 (R129 P2-1 + P2-2): F2 toggles between Files and
-    // VolumeMap views. This is handled BEFORE the per-mode key
-    // dispatch below so the user can always escape back to Files
-    // from VolumeMap. The toggle itself is gated on "no active
-    // modal/batch" — without that, a stuck dialog could persist
-    // across the toggle and the VolumeMap render path (which
-    // currently skips dialog overlays) would leave it invisible.
-    //
-    // Shift+F2 still falls through to the F(n)-with-SHIFT path for
-    // host-mount; we only intercept the no-modifiers case.
+    // SWISS-8a: F2 toggles between Files and the unified F2View.
+    // Same R129 P2-1 doctrine — refuses when ANY modal/batch is up
+    // so the user can't transition with a stuck dialog. Shift+F2
+    // falls through to the host-mount handler below (it's a
+    // file-browser verb).
     if matches!(key.code, KeyCode::F(2))
         && !key.modifiers.contains(KeyModifiers::SHIFT)
     {
-        // Refuse the toggle when ANY modal/batch is active. The
-        // dialog overlay isn't rendered in VolumeMap mode, so the
-        // user would lose the ability to see / dismiss it. (Even
-        // if rendering were added, batch-progress overlays carry
-        // implicit context — better to land the user back on Files
-        // first.)
         if local_dialog.is_none()
             && editor.is_none()
             && copy_batch.is_none()
             && delete_batch.is_none()
         {
-            // SWISS-6/7: from SnapshotGraph or Integrity, F2 returns
-            // to VolumeMap (the "back" stop). From Files / VolumeMap,
-            // F2 toggles between the two as before.
             *view_mode = match *view_mode {
-                ViewMode::Files => ViewMode::VolumeMap,
-                ViewMode::VolumeMap => ViewMode::Files,
-                ViewMode::SnapshotGraph => ViewMode::VolumeMap,
-                ViewMode::Integrity => ViewMode::VolumeMap,
+                ViewMode::Files => ViewMode::F2View,
+                ViewMode::F2View => ViewMode::Files,
             };
             search.clear();
+            // Reset SnapshotGraph state on every transition so the
+            // user re-enters with a predictable empty cursor / no
+            // filter / no marks (same posture as the prior F4/F5
+            // drill-downs, just simpler).
             *snapgraph_cursor = 0;
-            // SWISS-6 v1.1a: reset per-dataset filter on every view
-            // transition so the user re-enters SnapshotGraph with a
-            // predictable "All" view (parity with snapgraph_cursor).
             *snapgraph_filter = None;
-            // SWISS-6 v1.1b: reset marks on every view transition
-            // (parity with cursor + filter). Marks belong to a single
-            // session of SnapshotGraph use.
             snapgraph_marks.clear();
+            // F2 always lands on the default pane (Map) with focus
+            // on the Menu so the user sees the menu cursor.
+            // Shift+F<n> shortcuts (SWISS-8b) override this with a
+            // pre-selected pane.
+            if *view_mode == ViewMode::F2View {
+                *f2_state = ui::F2State::default();
+            }
         }
         return Ok(Action::Refresh);
     }
 
-    // SWISS-6: F4 from VolumeMap drills into SnapshotGraph. This is the
-    // "alternate-binding" — in Files mode F4 opens the editor (handled
-    // in the file-browser branch below); in VolumeMap mode F4 opens
-    // SnapshotGraph (the snapshot lineage view). The transition is
-    // gated on no-active-modal/batch by the same posture as the F2
-    // toggle so a dialog can't get stuck invisible under the graph
-    // (ui::render renders dialog/copy overlays in SnapshotGraph mode
-    // as defense-in-depth, but transitioning into the view with a
-    // modal alive is still confusing UX).
-    if *view_mode == ViewMode::VolumeMap
-        && matches!(key.code, KeyCode::F(4))
-        && !key.modifiers.contains(KeyModifiers::SHIFT)
-    {
-        if local_dialog.is_none()
-            && editor.is_none()
-            && copy_batch.is_none()
-            && delete_batch.is_none()
-        {
-            *view_mode = ViewMode::SnapshotGraph;
-            *snapgraph_cursor = 0;
-            *snapgraph_filter = None;
-            snapgraph_marks.clear();
-            search.clear();
-        }
-        return Ok(Action::Refresh);
-    }
-
-    // SWISS-7: F5 from VolumeMap drills into Integrity. Same R129
-    // P2-1 toggle gate as F4: refuses on modal-active so a dialog
-    // can't get stuck invisible. Same allow-list discipline as the
-    // other view-mode drill-downs.
-    if *view_mode == ViewMode::VolumeMap
-        && matches!(key.code, KeyCode::F(5))
-        && !key.modifiers.contains(KeyModifiers::SHIFT)
-    {
-        if local_dialog.is_none()
-            && editor.is_none()
-            && copy_batch.is_none()
-            && delete_batch.is_none()
-        {
-            *view_mode = ViewMode::Integrity;
-            search.clear();
-        }
-        return Ok(Action::Refresh);
-    }
-
-    // SWISS-5 (R129 P2-2): in VolumeMap view, drop every key that
-    // isn't a quit verb (handled above), the F2 toggle (handled
-    // above), or the F4/F5-to-drill-down (handled just above).
-    // Without this gate, F-keys (F7/F8/etc.), spacebar, Tab, Enter,
-    // Backspace, and printable chars would all dispatch to the
-    // file-browser handlers and mutate panel state behind the
-    // invisible map. Most dangerously, F8 would open a delete
-    // confirm dialog that's not rendered (ui::render skips dialog
-    // overlay in VolumeMap mode); Enter on that invisible dialog
-    // would confirm the delete.
-    if *view_mode == ViewMode::VolumeMap {
-        return Ok(Action::Ignore);
-    }
-
-    // SWISS-7: in-Integrity key gate. The Integrity pane is a pure
-    // status display at v1.0 — no cursor, no selection, no writable
-    // verbs. Only F2 / Esc (handled in the F2 block above + below)
-    // and quit verbs (handled at the top) escape. Every other key
-    // drops via Action::Ignore. Future v1.1 verbs (e.g., F8 trigger-
-    // scrub) MUST be added via an explicit allow-list extension —
-    // never via fall-through to file-browser handlers — and MUST
-    // be admin-gated client-side BEFORE issuing the /ctl/ write.
-    if *view_mode == ViewMode::Integrity {
-        if matches!(key.code, KeyCode::Esc) {
-            *view_mode = ViewMode::VolumeMap;
-            return Ok(Action::Refresh);
-        }
-        return Ok(Action::Ignore);
-    }
-
-    // SWISS-6: in-SnapshotGraph key gate. Same R129 P2-2 doctrine as
-    // the VolumeMap gate — drop file-browser verbs that would mutate
-    // panel state behind the graph view. The SnapshotGraph mode only
-    // dispatches navigation keys (Up/Down/PgUp/PgDn/Home/End) +
-    // back-out verbs (F2 + Esc, handled above + below). All other
-    // keys (F-keys, spacebar, Tab, Enter, printable) drop. Future
-    // SWISS-6 v1.1 chunks will add F8 rollback + spacebar select +
-    // F5 diff verbs via an explicit per-key allow-list extension.
-    if *view_mode == ViewMode::SnapshotGraph {
-        // Esc returns to VolumeMap (parity with F2).
-        if matches!(key.code, KeyCode::Esc) {
-            *view_mode = ViewMode::VolumeMap;
-            *snapgraph_cursor = 0;
-            *snapgraph_filter = None;
-            snapgraph_marks.clear();
-            return Ok(Action::Refresh);
-        }
-        // SWISS-6 v1.1a: F3 cycles the per-dataset filter
-        // None → ds[0] → ds[1] → ... → None. The cycle order matches
-        // dataset_ids() ascending. Cursor resets to 0 on cycle so
-        // the user always lands on the first visible snap after a
-        // filter change (parity with mode-transition reset). If the
-        // state is None (no poller), F3 is a no-op.
-        if matches!(key.code, KeyCode::F(3))
-            && !key.modifiers.contains(KeyModifiers::SHIFT)
-        {
-            if let Some(sg) = snapgraph_state {
-                *snapgraph_filter = sg.next_filter(*snapgraph_filter);
-                *snapgraph_cursor = 0;
-                // SWISS-6 v1.1b: filter cycle clears marks. The new
-                // filter changes the visible set of snaps; previously-
-                // marked snaps may now be hidden, which would render
-                // confusingly (header reads "Marks: 2/2" but the user
-                // sees zero ✓ glyphs). Clearing marks at the cycle
-                // boundary keeps the visible + header state coherent.
-                snapgraph_marks.clear();
-            }
-            return Ok(Action::Refresh);
-        }
-        // SWISS-6 v1.1b: spacebar toggles a mark on the cursor's snap.
-        // Marks are bounded at 2 entries; the third press is refused
-        // (the user must unmark one first). Marks are keyed by
-        // snapshot_id (NOT visible index) so they survive snap
-        // additions/deletions between ticks. F5 diffs the marked pair.
-        if matches!(key.code, KeyCode::Char(' '))
-            && !key.modifiers.contains(KeyModifiers::CONTROL)
-            && !key.modifiers.contains(KeyModifiers::ALT)
-        {
-            if let Some(sg) = snapgraph_state {
-                let visible: Vec<&crate::snapgraph::SnapshotInfo> = sg
-                    .snaps
-                    .iter()
-                    .filter(|s| match *snapgraph_filter {
-                        None => true,
-                        Some(id) => s.dataset_id == id,
-                    })
-                    .collect();
-                let cursor_visible = (*snapgraph_cursor as usize)
-                    .min(visible.len().saturating_sub(1));
-                if !visible.is_empty() && cursor_visible < visible.len() {
-                    let snap_id = visible[cursor_visible].snapshot_id;
-                    if let Some(pos) =
-                        snapgraph_marks.iter().position(|&m| m == snap_id)
-                    {
-                        snapgraph_marks.remove(pos);
-                    } else if snapgraph_marks.len() < 2 {
-                        snapgraph_marks.push(snap_id);
-                    }
-                    // Already 2 marks AND current isn't one of them →
-                    // refuse. The user must unmark before adding a 3rd.
-                }
-            }
-            return Ok(Action::Refresh);
-        }
-        // SWISS-6 v1.1b: F5 diffs the marked pair. If !=2 marks, open
-        // an info dialog. If exactly 2, look both snaps up in the
-        // current state, compute diff_summary, surface in an info
-        // dialog. The state lookup can fail if a marked snap was
-        // deleted between the mark + the F5 — handle gracefully.
-        if matches!(key.code, KeyCode::F(5))
-            && !key.modifiers.contains(KeyModifiers::SHIFT)
-        {
-            if snapgraph_marks.len() != 2 {
-                *local_dialog = Some(info_dialog(&format!(
-                    "Diff requires exactly 2 marked snapshots (currently {}).\n\
-                     Use Spacebar to mark snapshots; F5 again to diff.",
-                    snapgraph_marks.len()
-                )));
-                return Ok(Action::Refresh);
-            }
-            let sg = match snapgraph_state {
-                Some(s) => s,
-                None => {
-                    *local_dialog = Some(info_dialog(
-                        "No snapshot state available (poller not running).",
-                    ));
-                    return Ok(Action::Refresh);
-                }
-            };
-            let a = sg.snaps.iter().find(|s| s.snapshot_id == snapgraph_marks[0]);
-            let b = sg.snaps.iter().find(|s| s.snapshot_id == snapgraph_marks[1]);
-            match (a, b) {
-                (Some(a), Some(b)) => {
-                    let body = crate::snapgraph::diff_summary(a, b);
-                    *local_dialog = Some(info_dialog(&body));
-                }
-                _ => {
-                    *local_dialog = Some(info_dialog(
-                        "One of the marked snapshots is no longer present \
-                         (deleted between mark and diff).",
-                    ));
-                    snapgraph_marks.clear();
-                }
-            }
-            return Ok(Action::Refresh);
-        }
-        // Cursor navigation. Visible count comes from the poller's
-        // snapshot under the current filter; if no poller, the graph
-        // is empty and all nav keys are no-ops (cursor stays at 0).
-        let visible_count: u32 = snapgraph_state
-            .map(|s| s.filtered_count(*snapgraph_filter) as u32)
-            .unwrap_or(0);
-        let max_idx: u32 = visible_count.saturating_sub(1);
-        match key.code {
-            KeyCode::Up => {
-                *snapgraph_cursor = snapgraph_cursor.saturating_sub(1);
-                return Ok(Action::Refresh);
-            }
-            KeyCode::Down => {
-                *snapgraph_cursor = (*snapgraph_cursor + 1).min(max_idx);
-                return Ok(Action::Refresh);
-            }
-            KeyCode::PageUp => {
-                *snapgraph_cursor = snapgraph_cursor.saturating_sub(10);
-                return Ok(Action::Refresh);
-            }
-            KeyCode::PageDown => {
-                *snapgraph_cursor = (*snapgraph_cursor + 10).min(max_idx);
-                return Ok(Action::Refresh);
-            }
-            KeyCode::Home => {
-                *snapgraph_cursor = 0;
-                return Ok(Action::Refresh);
-            }
-            KeyCode::End => {
-                *snapgraph_cursor = max_idx;
-                return Ok(Action::Refresh);
-            }
-            _ => return Ok(Action::Ignore),
-        }
+    // SWISS-8a: in F2View, route every key through the focus + pane
+    // dispatch. Tab cycles focus Menu↔Content; Esc closes back to
+    // Files; Up/Down moves the menu cursor (focus=Menu) OR forwards
+    // to per-pane handler (focus=Content). All other keys drop via
+    // Action::Ignore (R129 P2-2 doctrine carried — never fall
+    // through to file-browser handlers from inside F2View).
+    if *view_mode == ViewMode::F2View {
+        return handle_f2view_key(
+            local_dialog, view_mode, f2_state,
+            snapgraph_cursor, snapgraph_filter, snapgraph_marks,
+            snapgraph_state, key,
+        );
     }
     // SWISS-4j: Esc cancels an in-progress batch (no dialog, no
     // editor). Marks remaining items as skipped via the conflict
@@ -1302,6 +1084,253 @@ fn handle_key(
         _ => {}
     }
     Ok(Action::Ignore)
+}
+
+/// SWISS-8a: dispatch keystrokes when view_mode == F2View.
+///
+/// Tab cycles focus between Menu (left) and Content (right). Esc
+/// closes back to Files. Up/Down/PgUp/PgDn/Home/End operate on the
+/// menu cursor when focus=Menu, or on the per-pane state when
+/// focus=Content (only Snapshot Graph actually consumes cursor nav
+/// at v1.0; Map / Integrity / placeholders have no cursor). Other
+/// pane-specific verbs (F3 filter, Spc mark, F5 diff for Snapshot
+/// Graph) only fire when focus=Content + pane=SnapshotGraph.
+///
+/// Every key not in the above list returns Action::Ignore — never
+/// fall-through to the file-browser handlers (R129 P2-2 doctrine
+/// carried). Quit verbs (Ctrl-Q/Ctrl-C/F10) and F2-toggle are
+/// handled upstream in handle_key before this function is called.
+fn handle_f2view_key(
+    local_dialog: &mut Option<LocalDialog>,
+    view_mode: &mut ViewMode,
+    f2_state: &mut ui::F2State,
+    snapgraph_cursor: &mut u32,
+    snapgraph_filter: &mut Option<u64>,
+    snapgraph_marks: &mut Vec<u64>,
+    snapgraph_state: Option<&SnapshotGraphState>,
+    key: crossterm::event::KeyEvent,
+) -> Result<Action> {
+    // Esc closes back to Files. Higher priority than any focus-
+    // specific dispatch so the user can always escape.
+    if matches!(key.code, KeyCode::Esc) {
+        *view_mode = ViewMode::Files;
+        *snapgraph_cursor = 0;
+        *snapgraph_filter = None;
+        snapgraph_marks.clear();
+        return Ok(Action::Refresh);
+    }
+
+    // Tab cycles focus Menu ↔ Content. Works regardless of which
+    // pane is selected. Shift+Tab is reserved for future "previous
+    // focus" semantics — at v1.0 we have only 2 panes so it doesn't
+    // matter; treat both directions identically.
+    if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        f2_state.focus = match f2_state.focus {
+            ui::F2Focus::Menu => ui::F2Focus::Content,
+            ui::F2Focus::Content => ui::F2Focus::Menu,
+        };
+        return Ok(Action::Refresh);
+    }
+
+    match f2_state.focus {
+        ui::F2Focus::Menu => handle_f2view_menu_key(f2_state, snapgraph_cursor, snapgraph_filter, snapgraph_marks, key),
+        ui::F2Focus::Content => handle_f2view_content_key(
+            local_dialog, f2_state, snapgraph_cursor, snapgraph_filter, snapgraph_marks, snapgraph_state, key,
+        ),
+    }
+}
+
+fn handle_f2view_menu_key(
+    f2_state: &mut ui::F2State,
+    snapgraph_cursor: &mut u32,
+    snapgraph_filter: &mut Option<u64>,
+    snapgraph_marks: &mut Vec<u64>,
+    key: crossterm::event::KeyEvent,
+) -> Result<Action> {
+    let n_items = ui::F2State::menu_items().len();
+    match key.code {
+        KeyCode::Up => {
+            f2_state.move_cursor(-1);
+            reset_per_pane_state(snapgraph_cursor, snapgraph_filter, snapgraph_marks);
+            Ok(Action::Refresh)
+        }
+        KeyCode::Down => {
+            f2_state.move_cursor(1);
+            reset_per_pane_state(snapgraph_cursor, snapgraph_filter, snapgraph_marks);
+            Ok(Action::Refresh)
+        }
+        KeyCode::Home | KeyCode::PageUp => {
+            f2_state.set_pane_by_idx(0);
+            reset_per_pane_state(snapgraph_cursor, snapgraph_filter, snapgraph_marks);
+            Ok(Action::Refresh)
+        }
+        KeyCode::End | KeyCode::PageDown => {
+            f2_state.set_pane_by_idx(n_items - 1);
+            reset_per_pane_state(snapgraph_cursor, snapgraph_filter, snapgraph_marks);
+            Ok(Action::Refresh)
+        }
+        // Enter on a menu item moves focus to Content (so the user
+        // can immediately interact with the selected pane).
+        KeyCode::Enter => {
+            f2_state.focus = ui::F2Focus::Content;
+            Ok(Action::Refresh)
+        }
+        _ => Ok(Action::Ignore),
+    }
+}
+
+/// Reset per-pane state when the menu cursor moves to a different
+/// pane. The selected pane changes (so what was "cursor=3 in Snapshot
+/// Graph" is now meaningless because the user is looking at a different
+/// pane), so we wipe SnapshotGraph cursor / filter / marks.
+fn reset_per_pane_state(
+    snapgraph_cursor: &mut u32,
+    snapgraph_filter: &mut Option<u64>,
+    snapgraph_marks: &mut Vec<u64>,
+) {
+    *snapgraph_cursor = 0;
+    *snapgraph_filter = None;
+    snapgraph_marks.clear();
+}
+
+fn handle_f2view_content_key(
+    local_dialog: &mut Option<LocalDialog>,
+    f2_state: &mut ui::F2State,
+    snapgraph_cursor: &mut u32,
+    snapgraph_filter: &mut Option<u64>,
+    snapgraph_marks: &mut Vec<u64>,
+    snapgraph_state: Option<&SnapshotGraphState>,
+    key: crossterm::event::KeyEvent,
+) -> Result<Action> {
+    // Per-pane dispatch. Only Snapshot Graph has interactive keys at
+    // v1.0; the other panes drop every key (focus=Content is still a
+    // meaningful state visually — the right border highlights — but
+    // there's nothing to navigate).
+    match f2_state.pane {
+        ui::F2Pane::SnapshotGraph => handle_snapgraph_content_key(
+            local_dialog, snapgraph_cursor, snapgraph_filter, snapgraph_marks,
+            snapgraph_state, key,
+        ),
+        _ => Ok(Action::Ignore),
+    }
+}
+
+fn handle_snapgraph_content_key(
+    local_dialog: &mut Option<LocalDialog>,
+    snapgraph_cursor: &mut u32,
+    snapgraph_filter: &mut Option<u64>,
+    snapgraph_marks: &mut Vec<u64>,
+    snapgraph_state: Option<&SnapshotGraphState>,
+    key: crossterm::event::KeyEvent,
+) -> Result<Action> {
+    // F3 cycles per-dataset filter (SWISS-6 v1.1a).
+    if matches!(key.code, KeyCode::F(3))
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+    {
+        if let Some(sg) = snapgraph_state {
+            *snapgraph_filter = sg.next_filter(*snapgraph_filter);
+            *snapgraph_cursor = 0;
+            snapgraph_marks.clear();
+        }
+        return Ok(Action::Refresh);
+    }
+    // Spacebar toggles a mark on the cursor's snap (SWISS-6 v1.1b).
+    if matches!(key.code, KeyCode::Char(' '))
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+    {
+        if let Some(sg) = snapgraph_state {
+            let visible: Vec<&crate::snapgraph::SnapshotInfo> = sg
+                .snaps
+                .iter()
+                .filter(|s| match *snapgraph_filter {
+                    None => true,
+                    Some(id) => s.dataset_id == id,
+                })
+                .collect();
+            let cursor_visible = (*snapgraph_cursor as usize)
+                .min(visible.len().saturating_sub(1));
+            if !visible.is_empty() && cursor_visible < visible.len() {
+                let snap_id = visible[cursor_visible].snapshot_id;
+                if let Some(pos) = snapgraph_marks.iter().position(|&m| m == snap_id) {
+                    snapgraph_marks.remove(pos);
+                } else if snapgraph_marks.len() < 2 {
+                    snapgraph_marks.push(snap_id);
+                }
+            }
+        }
+        return Ok(Action::Refresh);
+    }
+    // F5 diffs the marked pair (SWISS-6 v1.1b).
+    if matches!(key.code, KeyCode::F(5))
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+    {
+        if snapgraph_marks.len() != 2 {
+            *local_dialog = Some(info_dialog(&format!(
+                "Diff requires exactly 2 marked snapshots (currently {}).\n\
+                 Use Spacebar to mark snapshots; F5 again to diff.",
+                snapgraph_marks.len()
+            )));
+            return Ok(Action::Refresh);
+        }
+        let sg = match snapgraph_state {
+            Some(s) => s,
+            None => {
+                *local_dialog = Some(info_dialog(
+                    "No snapshot state available (poller not running).",
+                ));
+                return Ok(Action::Refresh);
+            }
+        };
+        let a = sg.snaps.iter().find(|s| s.snapshot_id == snapgraph_marks[0]);
+        let b = sg.snaps.iter().find(|s| s.snapshot_id == snapgraph_marks[1]);
+        match (a, b) {
+            (Some(a), Some(b)) => {
+                let body = crate::snapgraph::diff_summary(a, b);
+                *local_dialog = Some(info_dialog(&body));
+            }
+            _ => {
+                *local_dialog = Some(info_dialog(
+                    "One of the marked snapshots is no longer present \
+                     (deleted between mark and diff).",
+                ));
+                snapgraph_marks.clear();
+            }
+        }
+        return Ok(Action::Refresh);
+    }
+    // Cursor navigation.
+    let visible_count: u32 = snapgraph_state
+        .map(|s| s.filtered_count(*snapgraph_filter) as u32)
+        .unwrap_or(0);
+    let max_idx: u32 = visible_count.saturating_sub(1);
+    match key.code {
+        KeyCode::Up => {
+            *snapgraph_cursor = snapgraph_cursor.saturating_sub(1);
+            Ok(Action::Refresh)
+        }
+        KeyCode::Down => {
+            *snapgraph_cursor = (*snapgraph_cursor + 1).min(max_idx);
+            Ok(Action::Refresh)
+        }
+        KeyCode::PageUp => {
+            *snapgraph_cursor = snapgraph_cursor.saturating_sub(10);
+            Ok(Action::Refresh)
+        }
+        KeyCode::PageDown => {
+            *snapgraph_cursor = (*snapgraph_cursor + 10).min(max_idx);
+            Ok(Action::Refresh)
+        }
+        KeyCode::Home => {
+            *snapgraph_cursor = 0;
+            Ok(Action::Refresh)
+        }
+        KeyCode::End => {
+            *snapgraph_cursor = max_idx;
+            Ok(Action::Refresh)
+        }
+        _ => Ok(Action::Ignore),
+    }
 }
 
 /// SWISS-4b: dispatch keystrokes when a local dialog is active.

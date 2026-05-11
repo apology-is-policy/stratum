@@ -401,20 +401,103 @@ pub fn spinner_glyph(elapsed_secs: f64) -> char {
 
 // ── view modes ────────────────────────────────────────────────────────
 
-/// SWISS-5 / SWISS-6 / SWISS-7: the top-level TUI view. F2 toggles
-/// between Files (the dual-pane file browser) and VolumeMap (the F2
-/// storage overview). From VolumeMap, F4 drills into SnapshotGraph
-/// (lineage view); F5 drills into Integrity (health/scrub/devices
-/// view). F2 or Esc returns to VolumeMap from either drill-down. The
-/// editor is still a separate state, but it lives in the global
+/// SWISS-5/6/7/8: the top-level TUI view. Two states:
+///   - `Files`: the dual-pane file browser (default).
+///   - `F2View`: the unified "Volume View" — a vertical-split screen
+///     with a menu pane on the left and a content pane on the right.
+///     Each menu item corresponds to one read-only inspection surface
+///     (Map / Snapshot Graph / Integrity / Encryption / Inspect /
+///     Metrics).
+///
+/// F2 toggles between Files and F2View; Esc inside F2View closes back
+/// to Files. The editor is still a separate state living in the global
 /// `Option<EditorState>` (renders full-screen when present, regardless
-/// of view_mode) — opening / closing the editor is its own transition.
+/// of view_mode).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ViewMode {
     Files,
-    VolumeMap,
+    F2View,
+}
+
+/// One menu item inside F2View. Each variant maps to a content
+/// renderer in the right pane. v1.0 implements Map / SnapshotGraph /
+/// Integrity; Encryption / Inspect / Metrics are placeholder panes
+/// that render "Coming soon" content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum F2Pane {
+    Map,
     SnapshotGraph,
     Integrity,
+    Encryption,
+    Inspect,
+    Metrics,
+}
+
+/// Which pane in F2View has keyboard focus. Tab cycles between Menu
+/// and Content. Menu-focus drives the per-pane selection (Up/Down);
+/// Content-focus drives the selected pane's own keys (e.g., cursor
+/// nav in SnapshotGraph).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum F2Focus {
+    Menu,
+    Content,
+}
+
+/// State for F2View. Owned by the TUI loop in `tui.rs::run_ui`.
+#[derive(Clone, Copy, Debug)]
+pub struct F2State {
+    pub pane: F2Pane,
+    pub focus: F2Focus,
+}
+
+impl Default for F2State {
+    fn default() -> Self {
+        Self { pane: F2Pane::Map, focus: F2Focus::Menu }
+    }
+}
+
+impl F2State {
+    /// Open F2View at a specific pane (used by Shift+Fx pre-selection
+    /// shortcuts). Always lands with focus on Menu so the user can
+    /// see the menu cursor on their chosen pane.
+    pub fn with_pane(pane: F2Pane) -> Self {
+        Self { pane, focus: F2Focus::Menu }
+    }
+
+    /// Ordered list of menu items rendered in the left pane. The
+    /// `usize` returned by `pane_idx` indexes into this list.
+    pub fn menu_items() -> &'static [(F2Pane, &'static str)] {
+        &[
+            (F2Pane::Map,           "Map"),
+            (F2Pane::SnapshotGraph, "Snapshot Graph"),
+            (F2Pane::Integrity,     "Integrity"),
+            (F2Pane::Encryption,    "Encryption"),
+            (F2Pane::Inspect,       "Inspect"),
+            (F2Pane::Metrics,       "Metrics"),
+        ]
+    }
+
+    pub fn pane_idx(&self) -> usize {
+        Self::menu_items()
+            .iter()
+            .position(|(p, _)| *p == self.pane)
+            .unwrap_or(0)
+    }
+
+    pub fn set_pane_by_idx(&mut self, idx: usize) {
+        if let Some((p, _)) = Self::menu_items().get(idx) {
+            self.pane = *p;
+        }
+    }
+
+    /// Move the menu cursor by `delta` (clamped, no wrap). Negative
+    /// delta moves up the menu, positive moves down.
+    pub fn move_cursor(&mut self, delta: i32) {
+        let n = Self::menu_items().len() as i32;
+        let cur = self.pane_idx() as i32;
+        let next = (cur + delta).clamp(0, n - 1);
+        self.set_pane_by_idx(next as usize);
+    }
 }
 
 // ── main draw ─────────────────────────────────────────────────────────
@@ -425,6 +508,7 @@ pub fn render(
     editor: Option<&EditorState>,
     copy_progress: Option<&CopyProgress>,
     view_mode: ViewMode,
+    f2_state: F2State,
     volmap: Option<&VolumeMapState>,
     snapgraph: Option<&SnapshotGraphState>,
     snapgraph_cursor: u32,
@@ -444,107 +528,29 @@ pub fn render(
         return;
     }
 
-    // SWISS-5: volume-map view takes over the screen below the
-    // F-key bar. When no volmap snapshot is available (stratumd /ctl/
-    // not attached, e.g. host-fs-only TUI mode), swiss5_view::render
-    // renders an empty placeholder state.
-    if view_mode == ViewMode::VolumeMap {
-        // Reserve 2 lines at the bottom for the F-key bars; the
-        // status line stays implicit (volmap has its own footer).
+    // F2View: vertical-split menu + content. Tab cycles focus
+    // between Menu (left) and Content (right). Esc closes back to
+    // Files. Always renders dialog/copy-progress overlays for
+    // defense-in-depth, mirroring the prior view modes' posture.
+    if view_mode == ViewMode::F2View {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(6),     // map body
-                Constraint::Length(1),  // F-key bar (regular)
-                Constraint::Length(1),  // Shift+F-key bar
+                Constraint::Min(6),     // F2View body
+                Constraint::Length(1),  // footer (Tab/↑↓/Esc/F10)
             ])
             .split(area);
-        let default_state = VolumeMapState::default();
-        let render_state = volmap.unwrap_or(&default_state);
-        swiss5_view::render(frame, rows[0], render_state);
-        draw_fkey_bar(frame, rows[1]);
-        draw_shift_fkey_bar(frame, rows[2]);
-        // R129 P2-1 defense-in-depth: render dialog/copy-progress
-        // overlays here too. Today's tui.rs F2-toggle gate prevents
-        // entering VolumeMap when a modal is active, AND the
-        // VolumeMap-mode key gate refuses anything that would open
-        // a new modal — so neither overlay should be present here in
-        // normal flow. But future code paths (e.g., a slate-side
-        // /dialogs/ pop-up driven by a remote actor) could surface
-        // a dialog asynchronously; rendering it here makes it
-        // visible + dismissible instead of stuck-invisible.
-        if !state.dialog_stack.is_empty() {
-            draw_dialog_overlay(frame, area, state);
-        }
-        if let Some(d) = state.local_dialog.as_ref() {
-            match &d.kind {
-                LocalDialogKind::MkVol(mk) => draw_mkvol_dialog(frame, area, mk),
-                LocalDialogKind::Confirm { options, selected, .. } => {
-                    draw_confirm_dialog(frame, area, &d.prompt, options, *selected);
-                }
-                _ => draw_local_dialog(frame, area, d),
-            }
-        } else if let Some(cp) = copy_progress {
-            draw_copy_progress(frame, area, cp);
-        }
-        return;
-    }
-
-    // SWISS-7: Integrity drill-down from VolumeMap (F5-from-VolumeMap).
-    // Reuses the VolumeMapPoller's state (same /ctl/ surfaces); the
-    // renderer just re-projects it with health emphasis. Same R129
-    // dialog/copy-progress overlay defense as the other drill-downs.
-    if view_mode == ViewMode::Integrity {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(6),     // integrity body
-                Constraint::Length(1),  // F-key bar (regular)
-                Constraint::Length(1),  // Shift+F-key bar
-            ])
-            .split(area);
-        let default_state = VolumeMapState::default();
-        let render_state = volmap.unwrap_or(&default_state);
-        crate::swiss7_view::render(frame, rows[0], render_state);
-        draw_fkey_bar(frame, rows[1]);
-        draw_shift_fkey_bar(frame, rows[2]);
-        if !state.dialog_stack.is_empty() {
-            draw_dialog_overlay(frame, area, state);
-        }
-        if let Some(d) = state.local_dialog.as_ref() {
-            match &d.kind {
-                LocalDialogKind::MkVol(mk) => draw_mkvol_dialog(frame, area, mk),
-                LocalDialogKind::Confirm { options, selected, .. } => {
-                    draw_confirm_dialog(frame, area, &d.prompt, options, *selected);
-                }
-                _ => draw_local_dialog(frame, area, d),
-            }
-        } else if let Some(cp) = copy_progress {
-            draw_copy_progress(frame, area, cp);
-        }
-        return;
-    }
-
-    // SWISS-6: snapshot graph drill-down from VolumeMap (F4-from-
-    // VolumeMap). Same dialog/copy-progress overlay defense as the
-    // VolumeMap branch — the in-SnapshotGraph key gate in tui.rs
-    // refuses anything that would open a new modal, but a future
-    // async modal source (e.g., remote-driven slate dialog) renders
-    // correctly here as defense-in-depth.
-    if view_mode == ViewMode::SnapshotGraph {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(6),     // graph body
-                Constraint::Length(1),  // F-key bar (regular)
-                Constraint::Length(1),  // Shift+F-key bar
-            ])
-            .split(area);
-        let default_state = SnapshotGraphState::default();
-        let render_state = snapgraph.unwrap_or(&default_state);
-        crate::swiss6_view::render(frame, rows[0], render_state, snapgraph_cursor, snapgraph_filter, snapgraph_marks);
-        draw_fkey_bar(frame, rows[1]);
-        draw_shift_fkey_bar(frame, rows[2]);
+        draw_f2_view(
+            frame,
+            rows[0],
+            f2_state,
+            volmap,
+            snapgraph,
+            snapgraph_cursor,
+            snapgraph_filter,
+            snapgraph_marks,
+        );
+        draw_f2_footer(frame, rows[1], f2_state);
         if !state.dialog_stack.is_empty() {
             draw_dialog_overlay(frame, area, state);
         }
@@ -811,6 +817,194 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     ]);
     frame.render_widget(
         Paragraph::new(line).style(Style::default().bg(CLR_STATUS_BG)),
+        area,
+    );
+}
+
+/// Render the F2View screen — vertical split, menu on the left (~22
+/// cols), content on the right. The currently-selected pane drives
+/// the content renderer; focus drives which border is brightened so
+/// the user knows where keyboard input goes.
+fn draw_f2_view(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    f2: F2State,
+    volmap: Option<&VolumeMapState>,
+    snapgraph: Option<&SnapshotGraphState>,
+    snapgraph_cursor: u32,
+    snapgraph_filter: Option<u64>,
+    snapgraph_marks: &[u64],
+) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(22), Constraint::Min(20)])
+        .split(area);
+
+    draw_f2_menu(frame, cols[0], f2);
+    draw_f2_content(
+        frame, cols[1], f2,
+        volmap, snapgraph, snapgraph_cursor, snapgraph_filter, snapgraph_marks,
+    );
+}
+
+fn draw_f2_menu(frame: &mut Frame<'_>, area: Rect, f2: F2State) {
+    let focused = f2.focus == F2Focus::Menu;
+    let border_color = if focused { CLR_BORDER_ACTIVE } else { CLR_BORDER_INACTIVE };
+    let title_color = if focused { CLR_TITLE_ACTIVE } else { CLR_TITLE_INACTIVE };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(dbl_border())
+        .border_style(Style::default().fg(border_color))
+        .title(Line::from(Span::styled(
+            " Menu ",
+            Style::default().fg(title_color).bold(),
+        )))
+        .style(Style::default().bg(CLR_BG));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let active_idx = f2.pane_idx();
+    let items: Vec<ListItem> = F2State::menu_items()
+        .iter()
+        .enumerate()
+        .map(|(idx, (_pane, label))| {
+            let is_active = idx == active_idx;
+            let marker = if is_active { "▶ " } else { "  " };
+            let style = if is_active && focused {
+                Style::default().bg(CLR_CURSOR_ACTIVE_BG).fg(Color::White).bold()
+            } else if is_active {
+                Style::default().fg(CLR_HEADER).bold()
+            } else {
+                Style::default().fg(CLR_DIR)
+            };
+            ListItem::new(Line::from(vec![Span::styled(
+                format!("{marker}{label}"),
+                style,
+            )]))
+        })
+        .collect();
+    frame.render_widget(List::new(items), inner);
+}
+
+fn draw_f2_content(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    f2: F2State,
+    volmap: Option<&VolumeMapState>,
+    snapgraph: Option<&SnapshotGraphState>,
+    snapgraph_cursor: u32,
+    snapgraph_filter: Option<u64>,
+    snapgraph_marks: &[u64],
+) {
+    let focused = f2.focus == F2Focus::Content;
+    let border_color = if focused { CLR_BORDER_ACTIVE } else { CLR_BORDER_INACTIVE };
+    let title_color = if focused { CLR_TITLE_ACTIVE } else { CLR_TITLE_INACTIVE };
+    let title = match f2.pane {
+        F2Pane::Map => " Map ",
+        F2Pane::SnapshotGraph => " Snapshot Graph ",
+        F2Pane::Integrity => " Integrity ",
+        F2Pane::Encryption => " Encryption ",
+        F2Pane::Inspect => " Inspect ",
+        F2Pane::Metrics => " Metrics ",
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(dbl_border())
+        .border_style(Style::default().fg(border_color))
+        .title(Line::from(Span::styled(
+            title.to_string(),
+            Style::default().fg(title_color).bold(),
+        )))
+        .style(Style::default().bg(CLR_BG));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Pane dispatch. Map / Integrity reuse volmap state; SnapshotGraph
+    // uses its own poller; the rest render a "Coming soon" placeholder.
+    match f2.pane {
+        F2Pane::Map => {
+            let default_state = VolumeMapState::default();
+            let render_state = volmap.unwrap_or(&default_state);
+            swiss5_view::render(frame, inner, render_state);
+        }
+        F2Pane::SnapshotGraph => {
+            let default_state = SnapshotGraphState::default();
+            let render_state = snapgraph.unwrap_or(&default_state);
+            crate::swiss6_view::render(
+                frame, inner, render_state,
+                snapgraph_cursor, snapgraph_filter, snapgraph_marks,
+            );
+        }
+        F2Pane::Integrity => {
+            let default_state = VolumeMapState::default();
+            let render_state = volmap.unwrap_or(&default_state);
+            crate::swiss7_view::render(frame, inner, render_state);
+        }
+        F2Pane::Encryption | F2Pane::Inspect | F2Pane::Metrics => {
+            draw_f2_placeholder(frame, inner, f2.pane);
+        }
+    }
+}
+
+fn draw_f2_placeholder(frame: &mut Frame<'_>, area: Rect, pane: F2Pane) {
+    let (label, hint) = match pane {
+        F2Pane::Encryption => (
+            "Encryption",
+            "Per-dataset key state, AEAD config, key-rotation surface.",
+        ),
+        F2Pane::Inspect => (
+            "Inspect (admin)",
+            "Allocator state, tree-walk, extent-map, integrity-verify.",
+        ),
+        F2Pane::Metrics => (
+            "Metrics",
+            "Per-dataset op counters + latency histograms + throughput gauges.",
+        ),
+        _ => ("", ""),
+    };
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {label}"),
+            Style::default().fg(CLR_HEADER).bold(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  (Coming soon — placeholder pane.)",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {hint}"),
+            Style::default().fg(CLR_DIR),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(CLR_BG))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn draw_f2_footer(frame: &mut Frame<'_>, area: Rect, _f2: F2State) {
+    // Footer keybindings — distinct from the file-browser F-key bar.
+    // Shows only the F2View verbs; per-pane verbs (F3 filter / Spc
+    // mark / F5 diff for Snapshot Graph) are documented in the pane
+    // body itself (the swiss6_view footer remains rendered inside
+    // the content area).
+    let spans = vec![
+        Span::styled(" Tab ", Style::default().bg(CLR_CURSOR_ACTIVE_BG).fg(Color::White)),
+        Span::styled(" Swap pane  ", Style::default().fg(CLR_FILE)),
+        Span::styled(" ↑↓ ", Style::default().bg(CLR_CURSOR_ACTIVE_BG).fg(Color::White)),
+        Span::styled(" Menu nav  ", Style::default().fg(CLR_FILE)),
+        Span::styled(" Esc ", Style::default().bg(CLR_CURSOR_ACTIVE_BG).fg(Color::White)),
+        Span::styled(" Back to Files  ", Style::default().fg(CLR_FILE)),
+        Span::styled(" F10 ", Style::default().bg(CLR_CURSOR_ACTIVE_BG).fg(Color::White)),
+        Span::styled(" Quit", Style::default().fg(CLR_FILE)),
+    ];
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(CLR_BG)),
         area,
     );
 }
@@ -1699,6 +1893,78 @@ fn is_leap(y: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // SWISS-8a: F2State menu navigation.
+    #[test]
+    fn f2state_default_lands_on_map_with_menu_focus() {
+        let s = F2State::default();
+        assert_eq!(s.pane, F2Pane::Map);
+        assert_eq!(s.focus, F2Focus::Menu);
+        assert_eq!(s.pane_idx(), 0);
+    }
+
+    #[test]
+    fn f2state_with_pane_preselects_correctly() {
+        let s = F2State::with_pane(F2Pane::Integrity);
+        assert_eq!(s.pane, F2Pane::Integrity);
+        assert_eq!(s.focus, F2Focus::Menu);
+        // Integrity is the 3rd menu item (idx 2).
+        assert_eq!(s.pane_idx(), 2);
+    }
+
+    #[test]
+    fn f2state_move_cursor_down_advances_pane() {
+        let mut s = F2State::default();
+        s.move_cursor(1);
+        assert_eq!(s.pane, F2Pane::SnapshotGraph);
+        s.move_cursor(1);
+        assert_eq!(s.pane, F2Pane::Integrity);
+    }
+
+    #[test]
+    fn f2state_move_cursor_clamps_at_top() {
+        let mut s = F2State::default();
+        s.move_cursor(-1);
+        // Clamp at top — still Map.
+        assert_eq!(s.pane, F2Pane::Map);
+    }
+
+    #[test]
+    fn f2state_move_cursor_clamps_at_bottom() {
+        let mut s = F2State::with_pane(F2Pane::Metrics);
+        s.move_cursor(1);
+        // Clamp at bottom — still Metrics.
+        assert_eq!(s.pane, F2Pane::Metrics);
+    }
+
+    #[test]
+    fn f2state_set_pane_by_idx_in_range() {
+        let mut s = F2State::default();
+        s.set_pane_by_idx(2);
+        assert_eq!(s.pane, F2Pane::Integrity);
+    }
+
+    #[test]
+    fn f2state_set_pane_by_idx_out_of_range_noop() {
+        let mut s = F2State::default();
+        s.set_pane_by_idx(100);
+        // No change on out-of-range idx.
+        assert_eq!(s.pane, F2Pane::Map);
+    }
+
+    #[test]
+    fn f2state_menu_items_complete_coverage() {
+        let items = F2State::menu_items();
+        // 6 panes at v1.0.
+        assert_eq!(items.len(), 6);
+        let panes: Vec<F2Pane> = items.iter().map(|(p, _)| *p).collect();
+        assert!(panes.contains(&F2Pane::Map));
+        assert!(panes.contains(&F2Pane::SnapshotGraph));
+        assert!(panes.contains(&F2Pane::Integrity));
+        assert!(panes.contains(&F2Pane::Encryption));
+        assert!(panes.contains(&F2Pane::Inspect));
+        assert!(panes.contains(&F2Pane::Metrics));
+    }
 
     // R125 P1-1 regression: sanitize_for_display strips terminal
     // control bytes from server-supplied strings before they reach
