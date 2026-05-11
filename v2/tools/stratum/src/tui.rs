@@ -726,8 +726,15 @@ fn run_ui(
                 // SWISS-8g: same for in-progress /ctl/ admin jobs —
                 // their completion (over an mpsc channel) needs to
                 // surface as a dialog replacement.
+                // SWISS-8i: F2View pollers update state continuously
+                // in the background; if we sleep waiting for keys,
+                // the renderer doesn't pick them up. Break the inner
+                // wait on each 100 ms event::poll tick while we're
+                // in F2View so the pollers' VolumeMapState /
+                // SnapshotGraphState changes redraw within ≤ 100 ms.
                 if copy_batch.is_some() || delete_batch.is_some()
                     || ctl_job.is_some()
+                    || view_mode == ui::ViewMode::F2View
                 {
                     break;
                 }

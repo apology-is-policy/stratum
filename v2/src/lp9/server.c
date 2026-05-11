@@ -611,6 +611,51 @@ static stm_status h_clunk(stm_lp9_server *s,
     return STM_OK;
 }
 
+/* Tfsync: fid[4] datasync[4]
+ * Rfsync: (empty)
+ *
+ * Backends declare fsync via the optional vops->fsync slot. When the
+ * slot is NULL (synthetic-FS backends like /ctl/ whose writes commit
+ * synchronously inside the Twrite handler), we return Rfsync as a
+ * no-op success — the data is already durable as far as the backend
+ * is concerned.
+ *
+ * Returning Rlerror(ENOSYS) here would cause `stratum fs <mutating>`
+ * to fail with EXIT_IO after a successful write (the CLI emits a
+ * post-op Tfsync on ROOT_FID); on /ctl/ surfaces that's a misleading
+ * failure since the admin verb already committed. */
+static stm_status h_fsync(stm_lp9_server *s,
+                            const uint8_t *body, uint32_t body_len,
+                            uint16_t tag,
+                            uint8_t *resp, uint32_t resp_cap,
+                            uint32_t *resp_len)
+{
+    if (body_len < 4 + 4)
+        return reply_rlerror(resp, resp_cap, resp_len, tag, STM_LP9_ECODE_EPROTO);
+    uint32_t fid      = lp_g32(body);
+    uint32_t datasync = lp_g32(body + 4);
+
+    lp_fid *f = fid_get(s, fid);
+    if (!f) return reply_rlerror(resp, resp_cap, resp_len, tag, STM_LP9_ECODE_EBADF);
+
+    if (s->vops->fsync) {
+        stm_status rc = s->vops->fsync(s->ctx, fid, f->qid_path, datasync);
+        if (rc != STM_OK)
+            return reply_rlerror_status(resp, resp_cap, resp_len, tag, rc);
+    }
+    /* No vops->fsync: treat as no-op success for synchronous-write
+     * surfaces. Same posture matches Linux fsync on a synthetic FS
+     * mount (procfs, sysfs, etc.) which returns 0. */
+
+    uint32_t need = STM_LP9_HDR_SIZE;
+    if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
+    uint8_t *wp = resp + 4;
+    *wp++ = STM_LP9_RFSYNC;
+    lp_p16(wp, tag); wp += 2;
+    resp_finish(resp, resp_len, wp);
+    return STM_OK;
+}
+
 /* Tgetattr: fid[4] request_mask[8]
  * Rgetattr: valid[8] qid[13] mode[4] uid[4] gid[4] nlink[8] rdev[8]
  *           size[8] blksize[8] blocks[8]
@@ -830,6 +875,7 @@ stm_status stm_lp9_server_handle(stm_lp9_server *s,
     case STM_LP9_TCLUNK:   return h_clunk  (s, body, body_len, tag, resp, resp_cap, resp_len);
     case STM_LP9_TGETATTR: return h_getattr(s, body, body_len, tag, resp, resp_cap, resp_len);
     case STM_LP9_TREADDIR: return h_readdir(s, body, body_len, tag, resp, resp_cap, resp_len);
+    case STM_LP9_TFSYNC:   return h_fsync  (s, body, body_len, tag, resp, resp_cap, resp_len);
     default:
         /* Optional ops + everything we don't implement → ENOSYS. The
          * client gets a proper Rlerror so the connection stays open. */
