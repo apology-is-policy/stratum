@@ -38,6 +38,7 @@
 #include <stratum/bootstrap.h>
 #include <stratum/dataset.h>
 #include <stratum/dirent.h>
+#include <stratum/dirty_buffer.h>
 #include <stratum/extent.h>
 #include <stratum/inode.h>
 #include <stratum/locks.h>
@@ -63,6 +64,12 @@
 /* In-RAM state.                                                              */
 /* ========================================================================= */
 
+/* SWISS-4q-flush: dirty-buffer caps. Per-inode cap matches recordsize
+ * (the natural upper bound on a single coalesced extent); global cap
+ * sized for a daily-driver workstation. See dirty_buffer.h. */
+#define STM_FLUSH_INODE_CAP_BYTES   (8u * 1024u * 1024u)
+#define STM_FLUSH_GLOBAL_CAP_BYTES  (256u * 1024u * 1024u)
+
 struct stm_fs {
     pthread_mutex_t lock;
 
@@ -71,6 +78,22 @@ struct stm_fs {
     stm_alloc *alloc;        /* owned */
     stm_sync  *sync;         /* owned */
     stm_lock_table *locks;   /* P8-POSIX-7d: in-RAM advisory lock table */
+
+    /* SWISS-4q-flush: per-inode plaintext write buffer. Realizes the
+     * writeback.tla state machine — small writes land in this buffer
+     * and emit as fewer/larger extents at flush time (= stm_fs_commit
+     * + stm_fs_unmount). Reads check this overlay BEFORE consulting
+     * the extent layer.
+     *
+     * This commit (SWISS-4q-flush-fs step 1) plumbs the buffer in
+     * without activating it: create+destroy at lifecycle boundaries,
+     * drop-on-unlink for safety. Write/read/commit hookup is the next
+     * chunk. Until then this is a quiescent allocation.
+     *
+     * Caps: STM_FLUSH_INODE_CAP_BYTES per-inode + STM_FLUSH_GLOBAL_
+     * CAP_BYTES global. See dirty_buffer.h for the spec-to-code
+     * mapping. */
+    stm_dirty_buffer *dirty_buffer;     /* owned */
 
     /* P7-13 R45 P2-1: mount-time wrap-key source. Exactly one is
      * non-NULL; both freed at unmount. Retained so
@@ -379,6 +402,21 @@ static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
         free(fs);
         return NULL;
     }
+    /* SWISS-4q-flush: per-fs dirty buffer (writeback.tla state).
+     * Quiescent at v1 step 1 — created here, drop_ino called on
+     * unlink/truncate, destroyed at unmount, never inserted. Next
+     * chunk activates writes + reads + commit-flush. */
+    stm_status dbuf_rc = stm_dirty_buffer_create(STM_FLUSH_INODE_CAP_BYTES,
+                                                  STM_FLUSH_GLOBAL_CAP_BYTES,
+                                                  &fs->dirty_buffer);
+    if (dbuf_rc != STM_OK) {
+        stm_lock_table_close(fs->locks);
+        free(fs->janus_socket);
+        free(fs->keyfile_path);
+        pthread_mutex_destroy(&fs->lock);
+        free(fs);
+        return NULL;
+    }
     fs->read_only = ro;
     fs->wedged    = false;
     return fs;
@@ -575,6 +613,15 @@ stm_status stm_fs_unmount(stm_fs *fs)
     stm_pool_close(fs->pool);
     stm_bdev_close(fs->bdev);
     stm_lock_table_close(fs->locks);
+    /* SWISS-4q-flush: dirty buffer must outlive sync_commit (above)
+     * because the flush callback writes through sync; but its plaintext
+     * pages are pure RAM and don't touch the now-closed pool. Free
+     * after sync_close — any remaining bytes are silently dropped
+     * (this is correct: stm_sync_commit was called and either succeeded
+     * — in which case there's nothing buffered post-flush — or failed
+     * — in which case the fs is wedged and the data wasn't durable
+     * anyway). */
+    stm_dirty_buffer_destroy(fs->dirty_buffer);
 
     pthread_mutex_unlock(&fs->lock);
     pthread_mutex_destroy(&fs->lock);
@@ -1632,6 +1679,16 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
         bool is_extent = (cv.si_data_kind == STM_DATA_EXTENT);
         uint32_t cur_nlink = stm_load_le32(cv.si_nlink);
         if (is_reg && is_extent && cur_nlink == 1u) {
+            /* SWISS-4q-flush: drop any buffered ranges for this inode
+             * BEFORE the extent-layer truncate. Once the inode is
+             * gone, buffered plaintext for it is unreachable —
+             * destroying it here keeps total_bytes accurate AND
+             * prevents a future flush from emitting extents under
+             * a freed inode. v1 step 1 has no inserts so this is
+             * a no-op; the call is in place for the activation
+             * chunk. */
+            stm_dirty_buffer_drop_ino(fs->dirty_buffer,
+                                          dataset_id, child_ino);
             (void)stm_sync_truncate(fs->sync, dataset_id, child_ino,
                                          /*new_size=*/0u);
         }
