@@ -387,7 +387,10 @@ pub struct SnapshotGraphPoller {
 }
 
 impl SnapshotGraphPoller {
-    pub fn start(socket_path: PathBuf) -> Self {
+    /// SWISS-8d: see VolumeMapPoller::start. Takes a SHARED Arc<RwLock>
+    /// path field so mid-session stratumd attaches are observed by the
+    /// next 1 s tick.
+    pub fn start(socket_path: Arc<RwLock<Option<PathBuf>>>) -> Self {
         let state = Arc::new(RwLock::new(SnapshotGraphState::default()));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let state_for_thread = state.clone();
@@ -416,15 +419,39 @@ impl Drop for SnapshotGraphPoller {
 }
 
 fn poll_loop(
-    socket_path: PathBuf,
+    socket_path: Arc<RwLock<Option<PathBuf>>>,
     state: Arc<RwLock<SnapshotGraphState>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut client: Option<CtlClient> = None;
+    let mut current_path: Option<PathBuf> = None;
     while !stop.load(std::sync::atomic::Ordering::Acquire) {
         let tick_start = Instant::now();
+        // SWISS-8d: see volmap::poll_loop. Re-read path each tick;
+        // None means no stratumd attached yet — idle without error.
+        let desired = socket_path.read().unwrap().clone();
+        let desired = match desired {
+            Some(p) => p,
+            None => {
+                if client.is_some() {
+                    client = None;
+                    current_path = None;
+                }
+                if let Ok(mut guard) = state.write() {
+                    guard.last_error = None;
+                    guard.snaps.clear();
+                    guard.truncated = false;
+                }
+                sleep_until(tick_start, REFRESH_INTERVAL, &stop);
+                continue;
+            }
+        };
+        if current_path.as_deref() != Some(desired.as_path()) {
+            client = None;
+            current_path = Some(desired.clone());
+        }
         if client.is_none() {
-            match CtlClient::dial(&socket_path) {
+            match CtlClient::dial(&desired) {
                 Ok(c) => client = Some(c),
                 Err(e) => {
                     record_error(&state, format!("dial: {e}"));

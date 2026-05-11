@@ -23,7 +23,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
@@ -49,11 +49,17 @@ pub struct SpawnCtx {
     /// Slate socket — every panel attach goes through SlateClient
     /// dialing this.
     pub slate_sock: PathBuf,
-    /// SWISS-4i: stratumd's /ctl/ socket (separate from the FS
-    /// socket). Set when embed.rs spawns stratumd with --ctl-listen.
-    /// None when no stratumd is running (no-arg or --host-only TUI
-    /// modes). Used by F9 snapshot create.
-    pub stratumd_ctl_sock: Option<PathBuf>,
+    /// SWISS-4i / SWISS-8d: stratumd's /ctl/ socket. RwLock'd so
+    /// mid-session daemons spawned via Enter-on-.stm can swap their
+    /// own /ctl/ socket into the slot, and the F2 pollers see the
+    /// fresh path on their next 1 s tick. None when no stratumd is
+    /// running yet (host-fs-only launch).
+    ///
+    /// **Discipline**: every spawn_stratumd call passes --ctl-listen
+    /// for a sibling socket AND updates this field. The pollers spin
+    /// on a None value (sleep + retry) rather than fail; once Some,
+    /// they reconnect.
+    pub stratumd_ctl_sock: Arc<RwLock<Option<PathBuf>>>,
     /// Children spawned BY the TUI (via Shift+F2 / Enter-on-.stm).
     /// embed.rs's startup children (the initial host-fs / stratumd /
     /// slate) live in run() — they're killed in run() too. This Vec
@@ -77,11 +83,33 @@ impl SpawnCtx {
             session_dir,
             me,
             slate_sock,
-            stratumd_ctl_sock,
+            stratumd_ctl_sock: Arc::new(RwLock::new(stratumd_ctl_sock)),
             children: Mutex::new(Vec::new()),
             panel_meta: Mutex::new(initial_meta),
             sock_seq: AtomicU64::new(0),
         }
+    }
+
+    /// SWISS-8d: clone the Arc<RwLock<...>> handle to the /ctl/
+    /// socket field so the F2 pollers can hold their own reference
+    /// and observe mid-session writes from spawn_stratumd_inner.
+    pub fn stratumd_ctl_sock_handle(&self) -> Arc<RwLock<Option<PathBuf>>> {
+        self.stratumd_ctl_sock.clone()
+    }
+
+    /// SWISS-8d: read the current /ctl/ socket path. Used by the F9
+    /// snapshot list / create / delete paths which need a one-shot
+    /// snapshot of the current value.
+    pub fn current_ctl_sock(&self) -> Option<PathBuf> {
+        self.stratumd_ctl_sock.read().unwrap().clone()
+    }
+
+    /// SWISS-8d: update the /ctl/ socket path. Called by
+    /// spawn_stratumd_inner after a new daemon binds successfully.
+    /// "Last attached wins" — the most recent stratumd's /ctl/ is
+    /// the one the F2 view reflects.
+    fn set_ctl_sock(&self, path: PathBuf) {
+        *self.stratumd_ctl_sock.write().unwrap() = Some(path);
     }
 
     pub fn panel_meta(&self, panel_idx: usize) -> BackendMeta {
@@ -180,6 +208,16 @@ impl SpawnCtx {
         }
         let n = self.sock_seq.fetch_add(1, Ordering::SeqCst);
         let sock = self.session_dir.join(format!("stratumd-{}.sock", n + 100));
+        // SWISS-8d: mid-session stratumd spawns now expose /ctl/ on a
+        // sibling Unix socket so the F2 view's pollers can dial them
+        // and surface volume state (pool / scrub / devices / snapshots).
+        // Prior to SWISS-8d, only the launch-time `stratum tui --vol`
+        // path passed --ctl-listen — mid-session opens via Enter-on-
+        // .stm produced a daemon with no /ctl/, and the F2 view kept
+        // showing "fs not attached".
+        let ctl_sock = self
+            .session_dir
+            .join(format!("stratumd-ctl-{}.sock", n + 100));
         let mut args: Vec<String> = vec![
             "serve".into(),
             volume.to_string_lossy().into_owned(),
@@ -187,6 +225,8 @@ impl SpawnCtx {
             sock.to_string_lossy().into_owned(),
             "--keyfile".into(),
             key.to_string_lossy().into_owned(),
+            "--ctl-listen".into(),
+            ctl_sock.to_string_lossy().into_owned(),
         ];
         if passphrase.is_some() {
             args.push("--passphrase-stdin".into());
@@ -245,6 +285,14 @@ impl SpawnCtx {
                 sock.display()
             )));
         }
+        // SWISS-8d: also wait briefly for the /ctl/ socket so the F2
+        // pollers see a connectable endpoint on their first tick.
+        // Non-fatal if it doesn't appear — stratumd may have bound the
+        // FS socket without /ctl/ in some edge case (e.g., old binary
+        // mid-upgrade); the F2 view will surface that via its error
+        // line rather than blocking the daemon launch.
+        let _ = wait_for_sock(&ctl_sock, Duration::from_secs(2));
+        self.set_ctl_sock(ctl_sock);
         self.children.lock().unwrap().push(child);
         Ok(sock)
     }

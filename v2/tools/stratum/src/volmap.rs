@@ -320,10 +320,13 @@ pub struct VolumeMapPoller {
 }
 
 impl VolumeMapPoller {
-    /// Spawn a poll thread that dials stratumd's /ctl/ socket every
-    /// `REFRESH_INTERVAL` and updates the shared state. Returns
-    /// immediately; first poll happens asynchronously.
-    pub fn start(socket_path: PathBuf) -> Self {
+    /// SWISS-8d: spawn a poll thread that observes a SHARED Arc<RwLock>
+    /// socket-path field. The field can be mutated mid-session (e.g.
+    /// when a new stratumd daemon attaches and SpawnCtx::set_ctl_sock
+    /// fires). On each tick, the worker re-reads the current path and
+    /// reconnects if it changed. When the path is None, the worker
+    /// sleeps and retries without surfacing an error.
+    pub fn start(socket_path: Arc<RwLock<Option<PathBuf>>>) -> Self {
         let state = Arc::new(RwLock::new(VolumeMapState::default()));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let state_for_thread = state.clone();
@@ -356,17 +359,52 @@ impl Drop for VolumeMapPoller {
 }
 
 fn poll_loop(
-    socket_path: PathBuf,
+    socket_path: Arc<RwLock<Option<PathBuf>>>,
     state: Arc<RwLock<VolumeMapState>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut client: Option<CtlClient> = None;
     let mut pool_uuid: Option<String> = None;
+    // SWISS-8d: remember the path our current client dialed against
+    // so we can detect mid-session swaps (a new stratumd attached →
+    // SpawnCtx::set_ctl_sock fired → next tick observes a different
+    // path → drop the stale client + reconnect).
+    let mut current_path: Option<PathBuf> = None;
     while !stop.load(std::sync::atomic::Ordering::Acquire) {
         let tick_start = Instant::now();
+        // SWISS-8d: read the current path under the RwLock. None means
+        // no stratumd is attached yet — sleep + retry without poisoning
+        // the state with an error.
+        let desired = socket_path.read().unwrap().clone();
+        let desired = match desired {
+            Some(p) => p,
+            None => {
+                // No path yet — clear any stale state line and idle.
+                if client.is_some() {
+                    client = None;
+                    current_path = None;
+                    pool_uuid = None;
+                }
+                if let Ok(mut guard) = state.write() {
+                    guard.last_error = None;
+                    guard.pool_uuid = None;
+                    guard.fs.attached = false;
+                    guard.roster.attached = false;
+                    guard.scrub.attached = false;
+                }
+                sleep_until(tick_start, REFRESH_INTERVAL, &stop);
+                continue;
+            }
+        };
+        // Path swap: drop the stale client + UUID cache.
+        if current_path.as_deref() != Some(desired.as_path()) {
+            client = None;
+            pool_uuid = None;
+            current_path = Some(desired.clone());
+        }
         // Reconnect on absence — first tick or after a connection error.
         if client.is_none() {
-            match CtlClient::dial(&socket_path) {
+            match CtlClient::dial(&desired) {
                 Ok(c) => client = Some(c),
                 Err(e) => {
                     record_error(&state, format!("dial: {e}"));

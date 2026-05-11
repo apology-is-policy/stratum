@@ -378,18 +378,17 @@ fn run_ui(
     // populates an Arc<RwLock<VolumeMapState>> the renderer reads
     // from. When None, the F2 view still renders a placeholder
     // (no-pool state) so the user sees an explanatory message.
+    // SWISS-8d: spawn pollers unconditionally IFF a SpawnCtx is
+    // attached. They observe SpawnCtx.stratumd_ctl_sock via shared
+    // Arc<RwLock<...>>; mid-session Enter-on-.stm spawns mutate the
+    // path and the pollers pick it up on their next 1 s tick. When
+    // the path is None they idle (no error in state). Prior to
+    // SWISS-8d the pollers were keyed at launch time and didn't see
+    // mid-session daemon attaches.
     let volmap_poller: Option<VolumeMapPoller> =
-        spawn.as_ref()
-            .and_then(|sc| sc.stratumd_ctl_sock.clone())
-            .map(VolumeMapPoller::start);
-    // SWISS-6: SnapshotGraph poller — spawned at run_ui entry IFF the
-    // VolumeMap poller can also be spawned. Same lifecycle posture as
-    // volmap_poller. When None, the F4-from-VolumeMap transition still
-    // renders a placeholder ("no snapshots yet…").
+        spawn.as_ref().map(|sc| VolumeMapPoller::start(sc.stratumd_ctl_sock_handle()));
     let snapgraph_poller: Option<SnapshotGraphPoller> =
-        spawn.as_ref()
-            .and_then(|sc| sc.stratumd_ctl_sock.clone())
-            .map(SnapshotGraphPoller::start);
+        spawn.as_ref().map(|sc| SnapshotGraphPoller::start(sc.stratumd_ctl_sock_handle()));
     // SWISS-6: SnapshotGraph cursor. Reset to 0 on every transition
     // into SnapshotGraph mode so the user always lands on the first
     // (oldest) snap.
@@ -1681,8 +1680,8 @@ fn submit_confirm(
                     return Ok(Action::Refresh);
                 }
             };
-            let ctl_sock = match sp.stratumd_ctl_sock.as_ref() {
-                Some(p) => p.clone(),
+            let ctl_sock = match sp.current_ctl_sock() {
+                Some(p) => p,
                 None => {
                     *local_dialog = Some(error_dialog(
                         "Delete failed: stratum /ctl/ socket missing.",
@@ -2224,8 +2223,8 @@ fn submit_dialog(
                     return Ok(Action::Refresh);
                 }
             };
-            let ctl_sock = match sp.stratumd_ctl_sock.as_ref() {
-                Some(p) => p.clone(),
+            let ctl_sock = match sp.current_ctl_sock() {
+                Some(p) => p,
                 None => {
                     *local_dialog = Some(error_dialog(
                         "Cannot snap: stratum /ctl/ socket missing.",
