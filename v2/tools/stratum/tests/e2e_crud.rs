@@ -1039,3 +1039,96 @@ fn ctl_metrics_prometheus_renders_after_attach() {
         "S5-PRE-A: pool-attached metrics MUST surface device/pool gauges; got:\n{}",
         text);
 }
+
+/// SWISS-6 S6-TEST: snapshot lineage round-trip.
+///
+/// Create three snapshots in sequence + verify that the /ctl/ snapshot
+/// info body carries a coherent lineage chain — each snap's prev-snap-id
+/// is either 0 (root) or references a snap that exists in the listing.
+/// Confirms the data layer surface that `snapgraph.rs::parse_snap_body`
+/// + `lineage_depth` consume actually carries the information they need.
+#[test]
+fn ctl_snapshots_lineage_chain_coherent() {
+    let s = session();
+    use std::process::Command;
+    let create = |name: &[u8]| {
+        let mut child = Command::new(&s.bin)
+            .args(["fs", "-s", s.stratumd_ctl_sock.to_str().unwrap(),
+                   "write", "/datasets/1/create-snapshot"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn stratum fs write");
+        use std::io::Write as _;
+        if let Some(mut sin) = child.stdin.take() {
+            sin.write_all(name).unwrap();
+        }
+        let out = child.wait_with_output().expect("wait");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !out.status.success() && !stderr.contains("status=-205") {
+            panic!("create-snapshot failed (exit {:?}): {}",
+                out.status.code(), stderr);
+        }
+    };
+    create(b"base\n");
+    create(b"child-1\n");
+    create(b"child-2\n");
+
+    let entries = s.fs_ls(&s.stratumd_ctl_sock, "/datasets/1/snapshots")
+        .expect("readdir /datasets/1/snapshots");
+    assert_eq!(entries.len(), 3, "expected three snaps; got {:?}", entries);
+
+    // Materialize each entry + parse the snapshot-id + prev-snap-id
+    // fields. Build a (id, prev) map; assert each prev is either 0 or
+    // references one of the ids we just saw.
+    let mut by_id: std::collections::HashMap<u64, u64> = Default::default();
+    let mut names: std::collections::HashMap<u64, String> = Default::default();
+    for (_, sid_str) in &entries {
+        let body = s.fs_read(
+            &s.stratumd_ctl_sock,
+            &format!("/datasets/1/snapshots/{}", sid_str),
+        ).expect("read snapshot info");
+        let text = String::from_utf8_lossy(&body);
+        let mut snap_id: Option<u64> = None;
+        let mut prev: Option<u64> = None;
+        let mut name: Option<String> = None;
+        for line in text.lines() {
+            if let Some(v) = line.strip_prefix("snapshot-id: ") {
+                snap_id = v.parse().ok();
+            } else if let Some(v) = line.strip_prefix("prev-snap-id: ") {
+                prev = v.parse().ok();
+            } else if let Some(v) = line.strip_prefix("name: ") {
+                name = Some(v.to_string());
+            }
+        }
+        let id = snap_id.expect("snapshot-id missing");
+        let p = prev.expect("prev-snap-id missing");
+        by_id.insert(id, p);
+        names.insert(id, name.expect("name missing"));
+    }
+    assert_eq!(by_id.len(), 3);
+
+    // Lineage coherence: each prev is either 0 or references a snap id
+    // we observed in this listing. (The renderer's `lineage_depth`
+    // treats missing-parent as "root", but the underlying surface MUST
+    // carry consistent pointers within a single dataset's snap set.)
+    let observed: std::collections::HashSet<u64> = by_id.keys().copied().collect();
+    let mut root_count = 0;
+    for (id, prev) in &by_id {
+        if *prev == 0 {
+            root_count += 1;
+        } else {
+            assert!(observed.contains(prev),
+                "snap {} (name {:?}) carries prev-snap-id {} which is not in the dataset's snap set",
+                id, names.get(id), prev);
+            assert!(prev < id,
+                "prev-snap-id {} must be < snapshot-id {} (allocator is monotonic per R29 P3-1)",
+                prev, id);
+        }
+    }
+    // At least one snap is a root (the first one created); typical
+    // posture under stratum's default chain shape is exactly one root.
+    assert!(root_count >= 1,
+        "at least one snap MUST be a root (prev-snap-id 0); got root_count={}", root_count);
+}

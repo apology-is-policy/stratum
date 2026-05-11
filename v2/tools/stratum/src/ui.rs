@@ -23,6 +23,7 @@ use ratatui::{
 
 use crate::editor::{EditorMode, EditorState};
 use crate::swiss5_view;
+use crate::snapgraph::SnapshotGraphState;
 use crate::volmap::VolumeMapState;
 
 // ── color palette (lifted from v2/tui/src/ui.rs) ──────────────────────
@@ -400,15 +401,18 @@ pub fn spinner_glyph(elapsed_secs: f64) -> char {
 
 // ── view modes ────────────────────────────────────────────────────────
 
-/// SWISS-5: the top-level TUI view. F2 toggles between Files (the
-/// dual-pane file browser) and VolumeMap (the F2 storage overview).
-/// The editor is still a third state, but it lives in the global
-/// `Option<EditorState>` (renders full-screen when present, regardless
-/// of view_mode) — opening / closing the editor is its own transition.
+/// SWISS-5 / SWISS-6: the top-level TUI view. F2 toggles between Files
+/// (the dual-pane file browser) and VolumeMap (the F2 storage overview).
+/// SnapshotGraph is reached by drilling down from VolumeMap via F4; F2
+/// or Esc returns to VolumeMap. The editor is still a separate state,
+/// but it lives in the global `Option<EditorState>` (renders full-screen
+/// when present, regardless of view_mode) — opening / closing the editor
+/// is its own transition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ViewMode {
     Files,
     VolumeMap,
+    SnapshotGraph,
 }
 
 // ── main draw ─────────────────────────────────────────────────────────
@@ -420,6 +424,8 @@ pub fn render(
     copy_progress: Option<&CopyProgress>,
     view_mode: ViewMode,
     volmap: Option<&VolumeMapState>,
+    snapgraph: Option<&SnapshotGraphState>,
+    snapgraph_cursor: u32,
 ) {
     let area = frame.area();
     frame.render_widget(Block::default().style(Style::default().bg(CLR_BG)), area);
@@ -463,6 +469,43 @@ pub fn render(
         // /dialogs/ pop-up driven by a remote actor) could surface
         // a dialog asynchronously; rendering it here makes it
         // visible + dismissible instead of stuck-invisible.
+        if !state.dialog_stack.is_empty() {
+            draw_dialog_overlay(frame, area, state);
+        }
+        if let Some(d) = state.local_dialog.as_ref() {
+            match &d.kind {
+                LocalDialogKind::MkVol(mk) => draw_mkvol_dialog(frame, area, mk),
+                LocalDialogKind::Confirm { options, selected, .. } => {
+                    draw_confirm_dialog(frame, area, &d.prompt, options, *selected);
+                }
+                _ => draw_local_dialog(frame, area, d),
+            }
+        } else if let Some(cp) = copy_progress {
+            draw_copy_progress(frame, area, cp);
+        }
+        return;
+    }
+
+    // SWISS-6: snapshot graph drill-down from VolumeMap (F4-from-
+    // VolumeMap). Same dialog/copy-progress overlay defense as the
+    // VolumeMap branch — the in-SnapshotGraph key gate in tui.rs
+    // refuses anything that would open a new modal, but a future
+    // async modal source (e.g., remote-driven slate dialog) renders
+    // correctly here as defense-in-depth.
+    if view_mode == ViewMode::SnapshotGraph {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(6),     // graph body
+                Constraint::Length(1),  // F-key bar (regular)
+                Constraint::Length(1),  // Shift+F-key bar
+            ])
+            .split(area);
+        let default_state = SnapshotGraphState::default();
+        let render_state = snapgraph.unwrap_or(&default_state);
+        crate::swiss6_view::render(frame, rows[0], render_state, snapgraph_cursor);
+        draw_fkey_bar(frame, rows[1]);
+        draw_shift_fkey_bar(frame, rows[2]);
         if !state.dialog_stack.is_empty() {
             draw_dialog_overlay(frame, area, state);
         }

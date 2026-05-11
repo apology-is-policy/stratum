@@ -261,6 +261,7 @@ use crate::spawn::{BackendMeta, SpawnCtx};
 use crate::ui::{self, BatchKind, ConfirmAction, CopyProgress, LocalDialog,
                 LocalDialogKind, MkVolCompress, MkVolField, MkVolState,
                 PanelView, UiState, ViewMode};
+use crate::snapgraph::{SnapshotGraphPoller, SnapshotGraphState};
 use crate::volmap::VolumeMapPoller;
 
 pub struct Opts {
@@ -377,6 +378,18 @@ fn run_ui(
         spawn.as_ref()
             .and_then(|sc| sc.stratumd_ctl_sock.clone())
             .map(VolumeMapPoller::start);
+    // SWISS-6: SnapshotGraph poller — spawned at run_ui entry IFF the
+    // VolumeMap poller can also be spawned. Same lifecycle posture as
+    // volmap_poller. When None, the F4-from-VolumeMap transition still
+    // renders a placeholder ("no snapshots yet…").
+    let snapgraph_poller: Option<SnapshotGraphPoller> =
+        spawn.as_ref()
+            .and_then(|sc| sc.stratumd_ctl_sock.clone())
+            .map(SnapshotGraphPoller::start);
+    // SWISS-6: SnapshotGraph cursor. Reset to 0 on every transition
+    // into SnapshotGraph mode so the user always lands on the first
+    // (oldest) snap.
+    let mut snapgraph_cursor: u32 = 0;
     let result = (|| -> Result<()> {
         loop {
             // SWISS-4h: advance batch ops one step per iteration when
@@ -588,6 +601,15 @@ fn run_ui(
             };
             terminal.draw(|frame| {
                 let volmap_snap = volmap_poller.as_ref().map(|p| p.snapshot());
+                let snapgraph_snap = snapgraph_poller.as_ref().map(|p| p.snapshot());
+                // Clamp cursor against current snap count — state can
+                // shrink between ticks if a snap was deleted.
+                if let Some(sg) = snapgraph_snap.as_ref() {
+                    let max = sg.snaps.len().saturating_sub(1) as u32;
+                    if snapgraph_cursor > max {
+                        snapgraph_cursor = max;
+                    }
+                }
                 ui::render(
                     frame,
                     &snapshot,
@@ -595,16 +617,22 @@ fn run_ui(
                     cp_snapshot.as_ref(),
                     view_mode,
                     volmap_snap.as_ref(),
+                    snapgraph_snap.as_ref(),
+                    snapgraph_cursor,
                 )
             })?;
             loop {
                 if event::poll(Duration::from_millis(100))? {
                     match event::read()? {
                         Event::Key(key) if key.kind == KeyEventKind::Press => {
+                            let snapgraph_snap_for_key =
+                                snapgraph_poller.as_ref().map(|p| p.snapshot());
                             match handle_key(client, &mut focus, &mut local_dialog,
                                               &mut editor, &mut copy_batch,
                                               &mut delete_batch, &mut search,
                                               &mut view_mode,
+                                              &mut snapgraph_cursor,
+                                              snapgraph_snap_for_key.as_ref(),
                                               spawn.as_ref(),
                                               &snapshot, key)? {
                                 Action::Quit => return Ok(()),
@@ -653,6 +681,8 @@ fn handle_key(
     delete_batch: &mut Option<DeleteBatch>,
     search: &mut SearchState,
     view_mode: &mut ViewMode,
+    snapgraph_cursor: &mut u32,
+    snapgraph_state: Option<&SnapshotGraphState>,
     spawn: Option<&Arc<SpawnCtx>>,
     snap: &UiState,
     key: crossterm::event::KeyEvent,
@@ -708,18 +738,49 @@ fn handle_key(
             && copy_batch.is_none()
             && delete_batch.is_none()
         {
+            // SWISS-6: from SnapshotGraph, F2 returns to VolumeMap
+            // (the "back" stop). From Files / VolumeMap, F2 toggles
+            // between the two as before.
             *view_mode = match *view_mode {
                 ViewMode::Files => ViewMode::VolumeMap,
                 ViewMode::VolumeMap => ViewMode::Files,
+                ViewMode::SnapshotGraph => ViewMode::VolumeMap,
             };
+            search.clear();
+            *snapgraph_cursor = 0;
+        }
+        return Ok(Action::Refresh);
+    }
+
+    // SWISS-6: F4 from VolumeMap drills into SnapshotGraph. This is the
+    // "alternate-binding" — in Files mode F4 opens the editor (handled
+    // in the file-browser branch below); in VolumeMap mode F4 opens
+    // SnapshotGraph (the snapshot lineage view). The transition is
+    // gated on no-active-modal/batch by the same posture as the F2
+    // toggle so a dialog can't get stuck invisible under the graph
+    // (ui::render renders dialog/copy overlays in SnapshotGraph mode
+    // as defense-in-depth, but transitioning into the view with a
+    // modal alive is still confusing UX).
+    if *view_mode == ViewMode::VolumeMap
+        && matches!(key.code, KeyCode::F(4))
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+    {
+        if local_dialog.is_none()
+            && editor.is_none()
+            && copy_batch.is_none()
+            && delete_batch.is_none()
+        {
+            *view_mode = ViewMode::SnapshotGraph;
+            *snapgraph_cursor = 0;
             search.clear();
         }
         return Ok(Action::Refresh);
     }
 
     // SWISS-5 (R129 P2-2): in VolumeMap view, drop every key that
-    // isn't a quit verb (handled above) or the F2 toggle (handled
-    // just above). Without this, F-keys (F5/F7/F8/etc.), spacebar,
+    // isn't a quit verb (handled above), the F2 toggle (handled
+    // above), or the F4-to-SnapshotGraph drill-down (handled just
+    // above). Without this gate, F-keys (F5/F7/F8/etc.), spacebar,
     // Tab, Enter, Backspace, and printable chars would all dispatch
     // to the file-browser handlers and mutate panel state behind
     // the invisible map. Most dangerously, F8 would open a delete
@@ -728,6 +789,57 @@ fn handle_key(
     // would confirm the delete.
     if *view_mode == ViewMode::VolumeMap {
         return Ok(Action::Ignore);
+    }
+
+    // SWISS-6: in-SnapshotGraph key gate. Same R129 P2-2 doctrine as
+    // the VolumeMap gate — drop file-browser verbs that would mutate
+    // panel state behind the graph view. The SnapshotGraph mode only
+    // dispatches navigation keys (Up/Down/PgUp/PgDn/Home/End) +
+    // back-out verbs (F2 + Esc, handled above + below). All other
+    // keys (F-keys, spacebar, Tab, Enter, printable) drop. Future
+    // SWISS-6 v1.1 chunks will add F8 rollback + spacebar select +
+    // F5 diff verbs via an explicit per-key allow-list extension.
+    if *view_mode == ViewMode::SnapshotGraph {
+        // Esc returns to VolumeMap (parity with F2).
+        if matches!(key.code, KeyCode::Esc) {
+            *view_mode = ViewMode::VolumeMap;
+            *snapgraph_cursor = 0;
+            return Ok(Action::Refresh);
+        }
+        // Cursor navigation. State count comes from the poller's
+        // snapshot; if no poller, the graph is empty and all nav
+        // keys are no-ops (cursor stays at 0).
+        let snap_count: u32 = snapgraph_state
+            .map(|s| s.snaps.len() as u32)
+            .unwrap_or(0);
+        let max_idx: u32 = snap_count.saturating_sub(1);
+        match key.code {
+            KeyCode::Up => {
+                *snapgraph_cursor = snapgraph_cursor.saturating_sub(1);
+                return Ok(Action::Refresh);
+            }
+            KeyCode::Down => {
+                *snapgraph_cursor = (*snapgraph_cursor + 1).min(max_idx);
+                return Ok(Action::Refresh);
+            }
+            KeyCode::PageUp => {
+                *snapgraph_cursor = snapgraph_cursor.saturating_sub(10);
+                return Ok(Action::Refresh);
+            }
+            KeyCode::PageDown => {
+                *snapgraph_cursor = (*snapgraph_cursor + 10).min(max_idx);
+                return Ok(Action::Refresh);
+            }
+            KeyCode::Home => {
+                *snapgraph_cursor = 0;
+                return Ok(Action::Refresh);
+            }
+            KeyCode::End => {
+                *snapgraph_cursor = max_idx;
+                return Ok(Action::Refresh);
+            }
+            _ => return Ok(Action::Ignore),
+        }
     }
     // SWISS-4j: Esc cancels an in-progress batch (no dialog, no
     // editor). Marks remaining items as skipped via the conflict
