@@ -24,7 +24,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
+use std::sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -150,6 +150,26 @@ enum ConflictPolicy {
     KeepBoth,
 }
 
+/// SWISS-4q-worker: in-flight copy of a single batch item. The thread
+/// runs perform_copy_one synchronously; the main loop polls
+/// `handle.is_finished()` each tick. When done, the main loop joins
+/// the handle, extracts the result, and advances the batch index.
+///
+/// `dst_name` is kept on the handle so the progress dialog can show
+/// "Copying X..." even before the worker has bumped bytes_done.
+struct CopyWorker {
+    handle: thread::JoinHandle<std::io::Result<CopyOutcome>>,
+    dst_name: String,
+}
+
+/// SWISS-4q-worker: in-flight delete of a single batch item. Same
+/// shape as CopyWorker; no conflict probe (delete has no overwrite
+/// semantics in this UI).
+struct DeleteWorker {
+    handle: thread::JoinHandle<std::io::Result<()>>,
+    item_name: String,
+}
+
 /// SWISS-4h: in-progress batch copy. The TUI owns this state in
 /// run_ui; each main-loop iteration advances one file when no
 /// dialog is up. On conflict, opens the conflict dialog. On
@@ -175,6 +195,11 @@ struct CopyBatch {
     /// created a new one; the TUI kept the selection indices and the
     /// next F5 copied different files".
     src_focus: usize,
+    /// SWISS-4q-worker: in-flight worker thread for the CURRENT item
+    /// (= items[idx]). None when no worker is running (the next tick
+    /// will spawn one, or the batch is complete). The main loop polls
+    /// handle.is_finished() each tick; when done, joins + accumulates.
+    worker: Option<CopyWorker>,
     /// Sticky policy from a prior *All pick.
     sticky: Option<ConflictPolicy>,
     /// Counters for the post-batch summary toast.
@@ -209,6 +234,12 @@ struct DeleteBatch {
     failed: usize,
     /// SWISS-4r-sel-clear: source panel focus (see CopyBatch doc).
     src_focus: usize,
+    /// SWISS-4q-worker: in-flight worker thread for the CURRENT item.
+    /// Same lifecycle as CopyBatch::worker.
+    worker: Option<DeleteWorker>,
+    /// SWISS-4q-worker: clock origin for the progress dialog's
+    /// spinner phase + elapsed time display.
+    start_time: Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -220,8 +251,9 @@ enum DeleteItem {
 use crate::editor::EditorState;
 use crate::slate::{read_lines, read_text_trim, SlateClient};
 use crate::spawn::{BackendMeta, SpawnCtx};
-use crate::ui::{self, ConfirmAction, CopyProgress, LocalDialog, LocalDialogKind,
-                MkVolCompress, MkVolField, MkVolState, PanelView, UiState};
+use crate::ui::{self, BatchKind, ConfirmAction, CopyProgress, LocalDialog,
+                LocalDialogKind, MkVolCompress, MkVolField, MkVolState,
+                PanelView, UiState};
 
 pub struct Opts {
     pub slate_sock: PathBuf,
@@ -324,28 +356,20 @@ fn run_ui(
     // can type "ph" then "o" and have the cursor land on "photo.jpg".
     let mut search = SearchState::new();
     let result = (|| -> Result<()> {
-        // SWISS-4q P2: skip the first advance of a freshly-started
-        // batch so the loop draws the progress dialog BEFORE the
-        // synchronous perform_copy_one blocks the loop. Pre-fix the
-        // user saw the screen freeze with no feedback during a
-        // multi-GB copy, then a brief flash of the summary; now they
-        // see the dialog throughout the freeze. Forward-noted SWISS-
-        // 4q-bytes for true per-byte progress (needs chunked sub-
-        // process OR worker thread).
-        let mut copy_batch_pre_draw = copy_batch.is_some();
-        let mut delete_batch_pre_draw = delete_batch.is_some();
         loop {
             // SWISS-4h: advance batch ops one step per iteration when
             // no dialog is up. Conflict (CopyBatch) opens a dialog
             // that pauses the loop until user picks; the next
             // iteration resumes.
+            //
+            // SWISS-4q-worker (post-c60b9e9): the SWISS-4q P2 pre-
+            // draw skip is no longer needed — workers spawn instantly
+            // and run off-main-thread, so the first advance_*_batch
+            // tick returns immediately after spawning the worker; the
+            // dialog renders normally on the very next draw.
             if local_dialog.is_none() && editor.is_none() {
                 if let Some(ref mut batch) = copy_batch {
-                    // SWISS-4q P2: yield one draw cycle on
-                    // newly-started batches before blocking.
-                    if !copy_batch_pre_draw {
-                        copy_batch_pre_draw = true;
-                    } else if let Some(action) = advance_copy_batch(
+                    if let Some(action) = advance_copy_batch(
                         client, &mut local_dialog, spawn.as_ref(), batch,
                     )? {
                         if matches!(action, BatchTick::Done) {
@@ -383,9 +407,7 @@ fn run_ui(
                     }
                 }
                 if let Some(ref mut batch) = delete_batch {
-                    if !delete_batch_pre_draw {
-                        delete_batch_pre_draw = true;
-                    } else if let Some(action) = advance_delete_batch(
+                    if let Some(action) = advance_delete_batch(
                         spawn.as_ref(), batch,
                     )? {
                         if matches!(action, BatchTick::Done) {
@@ -456,13 +478,22 @@ fn run_ui(
                     b.last_sample_instant = now;
                 }
             }
-            let cp_snapshot: Option<CopyProgress> = copy_batch.as_ref().map(|b| {
-                let current_name = b.items.get(b.idx)
-                    .and_then(|(_src, dst, _is_dir)| dst.file_name()
-                        .map(|s| s.to_string_lossy().into_owned()))
+            let cp_snapshot: Option<CopyProgress> = if let Some(b) =
+                copy_batch.as_ref()
+            {
+                /* SWISS-4q-worker: prefer the in-flight worker's dst
+                 * name so the dialog says "Copying X..." even when
+                 * idx hasn't advanced yet. Falls back to items[idx]
+                 * for the first-tick pre-spawn case. */
+                let current_name = b.worker.as_ref()
+                    .map(|w| w.dst_name.clone())
+                    .or_else(|| b.items.get(b.idx)
+                        .and_then(|(_s, dst, _d)| dst.file_name()
+                            .map(|s| s.to_string_lossy().into_owned())))
                     .unwrap_or_default();
                 let elapsed_secs = b.start_time.elapsed().as_secs_f64();
-                CopyProgress {
+                Some(CopyProgress {
+                    kind: BatchKind::Copy,
                     idx: b.idx,
                     total: b.items.len(),
                     current_name,
@@ -472,8 +503,45 @@ fn run_ui(
                     bytes_done: read_bytes_done(),
                     elapsed_secs,
                     samples: b.samples.clone(),
-                }
-            });
+                })
+            } else if let Some(b) = delete_batch.as_ref() {
+                /* SWISS-4q-worker: delete batches get the same
+                 * progress dialog with BatchKind::Delete. No bytes,
+                 * no chart — just spinner + counters. */
+                let current_name = b.worker.as_ref()
+                    .map(|w| w.item_name.clone())
+                    .or_else(|| {
+                        b.items.get(b.idx).map(|it| match it {
+                            DeleteItem::Host { path, .. } => path
+                                .file_name()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| path.display().to_string()),
+                            DeleteItem::Stratum { p9_path, .. } => p9_path
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or(p9_path)
+                                .to_string(),
+                        })
+                    })
+                    .unwrap_or_default();
+                let elapsed_secs = b.start_time.elapsed().as_secs_f64();
+                Some(CopyProgress {
+                    kind: BatchKind::Delete,
+                    idx: b.idx,
+                    total: b.items.len(),
+                    current_name,
+                    /* `copied` slot doubles as "deleted" for the
+                     * delete renderer. */
+                    copied: b.deleted,
+                    skipped: 0,
+                    failed: b.failed,
+                    bytes_done: 0,
+                    elapsed_secs,
+                    samples: Vec::new(),
+                })
+            } else {
+                None
+            };
             terminal.draw(|frame| {
                 ui::render(frame, &snapshot, editor.as_ref(), cp_snapshot.as_ref())
             })?;
@@ -1992,6 +2060,7 @@ fn start_f5(
         samples: Vec::with_capacity(crate::ui::SAMPLE_WINDOW),
         last_sample_bytes: 0,
         last_sample_instant: now,
+        worker: None,
     });
     Ok(Action::Refresh)
 }
@@ -2085,6 +2154,8 @@ fn start_f8(
     *delete_batch = Some(DeleteBatch {
         items, idx: 0, deleted: 0, failed: 0,
         src_focus: active,
+        worker: None,
+        start_time: Instant::now(),
     });
     *local_dialog = Some(LocalDialog {
         kind: LocalDialogKind::Confirm {
@@ -2452,37 +2523,59 @@ fn run_delete(
 /// batch is finished, More otherwise.
 enum BatchTick { More, Done }
 
-/// SWISS-4h: advance a CopyBatch by one item. If the next item
-/// doesn't conflict (or has a sticky policy resolution), executes
-/// it and increments idx. If it conflicts and no sticky is set,
-/// opens the conflict dialog and returns More (caller pauses
-/// until user picks).
+/// SWISS-4h / SWISS-4q-worker: advance a CopyBatch.
+///
+/// Worker-thread model: the per-item perform_copy_one runs on a
+/// dedicated thread (CopyBatch::worker). The main loop polls
+/// handle.is_finished() each tick; when done, we accumulate the
+/// result and spawn the next worker. The UI redraws between ticks
+/// regardless of how long the worker takes, so large copies no
+/// longer freeze the renderer.
+///
+/// Conflict resolution stays synchronous (open dialog → pause →
+/// resume on user pick) because the conflict probe is fast (host
+/// path.exists() is ~µs; stratum-fs stat is ~10ms — tolerated until
+/// the SWISS-4d2 Rust BackendClient lands).
 fn advance_copy_batch(
     _client: &mut SlateClient,
     local_dialog: &mut Option<LocalDialog>,
     spawn: Option<&Arc<SpawnCtx>>,
     batch: &mut CopyBatch,
 ) -> Result<Option<BatchTick>> {
-    // SWISS-4h: consume any pending dialog response. If it was
-    // Cancel, we mark the rest as skipped + finish. If it set a
-    // sticky policy, we apply it. The current item (the one whose
-    // conflict triggered the dialog) is at batch.idx; we apply
-    // policy + advance idx.
+    /* Step 1: a worker is in flight — check if it's done. */
+    if let Some(w) = batch.worker.as_ref() {
+        if !w.handle.is_finished() {
+            return Ok(Some(BatchTick::More));
+        }
+        /* Worker done — join + accumulate. */
+        let w = batch.worker.take().unwrap();
+        let res = w.handle.join().unwrap_or_else(|_| {
+            Err(std::io::Error::new(std::io::ErrorKind::Other,
+                                          "copy worker panicked"))
+        });
+        match res {
+            Ok(CopyOutcome::Copied) => batch.copied += 1,
+            Ok(CopyOutcome::Skipped) => batch.skipped += 1,
+            Err(e) => {
+                batch.failed += 1;
+                batch.last_error = Some(format!("{}: {e}", w.dst_name));
+            }
+        }
+        batch.idx += 1;
+        return Ok(Some(BatchTick::More));
+    }
+
+    /* Step 2: pending conflict response — apply + spawn worker. */
     let resp = CONFLICT_RESP.with(|c| c.borrow_mut().take());
     if let Some(r) = resp {
         if r.cancel {
-            // Mark all remaining as skipped and finish.
             let remaining = batch.items.len() - batch.idx;
             batch.skipped += remaining;
             batch.idx = batch.items.len();
             return Ok(Some(BatchTick::Done));
         }
         if let Some(policy) = r.policy {
-            // Apply policy to the current item; if sticky, also
-            // store on the batch for subsequent conflicts.
-            if r.sticky {
-                batch.sticky = Some(policy);
-            }
+            if r.sticky { batch.sticky = Some(policy); }
             if batch.idx < batch.items.len() {
                 let sp = match spawn {
                     Some(s) => s,
@@ -2492,32 +2585,17 @@ fn advance_copy_batch(
                         return Ok(Some(BatchTick::More));
                     }
                 };
-                let (src, dst, is_dir) = batch.items[batch.idx].clone();
-                let res = perform_copy_one(sp, &batch.src_meta,
-                    batch.src_sock.as_deref(), &src, &batch.dst_meta,
-                    batch.dst_sock.as_deref(), &dst, is_dir, Some(policy));
-                match res {
-                    Ok(CopyOutcome::Copied) => batch.copied += 1,
-                    Ok(CopyOutcome::Skipped) => batch.skipped += 1,
-                    Err(e) => {
-                        batch.failed += 1;
-                        batch.last_error = Some(format!(
-                            "{}: {e}",
-                            dst.file_name()
-                                .map(|s| s.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| dst.display().to_string())
-                        ));
-                    }
-                }
-                batch.idx += 1;
+                spawn_copy_worker(batch, sp, Some(policy));
             }
             return Ok(Some(BatchTick::More));
         }
     }
 
+    /* Step 3: any items left? */
     if batch.idx >= batch.items.len() {
         return Ok(Some(BatchTick::Done));
     }
+
     let sp = match spawn {
         Some(s) => s,
         None => {
@@ -2526,18 +2604,17 @@ fn advance_copy_batch(
             return Ok(Some(BatchTick::More));
         }
     };
-    let (src, dst, is_dir) = batch.items[batch.idx].clone();
+    let (_src, dst, _is_dir) = batch.items[batch.idx].clone();
 
-    // Conflict path. dst exists?
+    /* Step 4: conflict probe — synchronous (see fn doc).
+     *
+     * SWISS-4j: stratum-side dst exists-probe via `stratum fs stat`.
+     * stat exits 0 iff the path is reachable. Adds one subprocess
+     * per item to the batch — acceptable until SWISS-4d2 swaps for
+     * an in-process Twalk + Tgetattr. */
     let dst_exists = match (&batch.dst_meta, &batch.dst_sock) {
         (BackendMeta::HostFs { .. }, _) => dst.exists(),
         (BackendMeta::Stratumd { .. }, Some(sock)) => {
-            // SWISS-4j: stratum-side dst exists-probe via `stratum
-            // fs stat`. stat exits 0 iff the path is reachable
-            // (file or dir). Adds one subprocess per item to the
-            // batch — measurable but acceptable; SWISS-4d2's Rust
-            // BackendClient could replace this with an in-process
-            // Twalk + Tgetattr.
             let p9 = path_to_p9(&dst, &batch.dst_meta);
             stratum_path_exists(sp, sock, &p9)
         }
@@ -2545,13 +2622,14 @@ fn advance_copy_batch(
     };
 
     if dst_exists && batch.sticky.is_none() {
-        // Pause + open dialog.
         let prompt = format!(
             "Destination exists ({}/{}):\n  {}\n\nResolution?",
             batch.idx + 1,
             batch.items.len(),
             dst.display()
         );
+        let (src_for_dialog, dst_for_dialog, is_dir_for_dialog) =
+            batch.items[batch.idx].clone();
         *local_dialog = Some(LocalDialog {
             kind: LocalDialogKind::Confirm {
                 options: vec![
@@ -2562,9 +2640,9 @@ fn advance_copy_batch(
                 ],
                 selected: 0,
                 on_pick: ConfirmAction::CopyConflictBatch {
-                    src: src.clone(),
-                    dst: dst.clone(),
-                    is_dir,
+                    src: src_for_dialog,
+                    dst: dst_for_dialog,
+                    is_dir: is_dir_for_dialog,
                 },
             },
             prompt,
@@ -2575,30 +2653,41 @@ fn advance_copy_batch(
         return Ok(Some(BatchTick::More));
     }
 
-    // Apply sticky policy if it triggers, or just copy.
-    let policy = if dst_exists {
-        batch.sticky
-    } else {
-        None
-    };
-    let res = perform_copy_one(sp, &batch.src_meta, batch.src_sock.as_deref(),
-                                &src, &batch.dst_meta, batch.dst_sock.as_deref(),
-                                &dst, is_dir, policy);
-    match res {
-        Ok(CopyOutcome::Copied) => batch.copied += 1,
-        Ok(CopyOutcome::Skipped) => batch.skipped += 1,
-        Err(e) => {
-            batch.failed += 1;
-            batch.last_error = Some(format!(
-                "{}: {e}",
-                dst.file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| dst.display().to_string())
-            ));
-        }
-    }
-    batch.idx += 1;
+    /* Step 5: no conflict (or sticky policy applies) — spawn worker. */
+    let policy = if dst_exists { batch.sticky } else { None };
+    spawn_copy_worker(batch, sp, policy);
     Ok(Some(BatchTick::More))
+}
+
+/// SWISS-4q-worker: spawn the per-item copy thread. Caller already
+/// resolved any conflict policy. Clones all needed state into the
+/// worker. Stores the handle on batch.worker; the main loop polls
+/// it next tick.
+fn spawn_copy_worker(
+    batch: &mut CopyBatch,
+    sp: &Arc<SpawnCtx>,
+    policy: Option<ConflictPolicy>,
+) {
+    let sp = Arc::clone(sp);
+    let (src, dst, is_dir) = batch.items[batch.idx].clone();
+    let src_meta = batch.src_meta.clone();
+    let dst_meta = batch.dst_meta.clone();
+    let src_sock = batch.src_sock.clone();
+    let dst_sock = batch.dst_sock.clone();
+    let dst_name = dst
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dst.display().to_string());
+    let handle = thread::Builder::new()
+        .name("stratum-copy".into())
+        .spawn(move || {
+            perform_copy_one(
+                &sp, &src_meta, src_sock.as_deref(), &src,
+                &dst_meta, dst_sock.as_deref(), &dst, is_dir, policy,
+            )
+        })
+        .expect("spawn copy worker");
+    batch.worker = Some(CopyWorker { handle, dst_name });
 }
 
 #[derive(Debug)]
@@ -2737,17 +2826,20 @@ fn perform_copy_one(
 // require a second `stratum fs stat`. Acceptable for v1.0;
 // SWISS-4d2 (Rust BackendClient) is the perf upgrade.
 
-thread_local! {
-    pub static COPY_BYTES_DONE: std::cell::Cell<u64> = std::cell::Cell::new(0);
-}
+/// SWISS-4q-worker: cumulative bytes completed in the current
+/// CopyBatch, shared between the main loop and the worker thread.
+/// Worker bumps; main loop reads at every redraw tick. Process-
+/// global because we only ever run one batch at a time.
+static COPY_BYTES_DONE: AtomicU64 = AtomicU64::new(0);
+
 fn bump_bytes(n: u64) {
-    COPY_BYTES_DONE.with(|c| c.set(c.get().saturating_add(n)));
+    COPY_BYTES_DONE.fetch_add(n, Ordering::Relaxed);
 }
 fn read_bytes_done() -> u64 {
-    COPY_BYTES_DONE.with(|c| c.get())
+    COPY_BYTES_DONE.load(Ordering::Relaxed)
 }
 fn reset_bytes_done() {
-    COPY_BYTES_DONE.with(|c| c.set(0));
+    COPY_BYTES_DONE.store(0, Ordering::Relaxed);
 }
 
 /// Parse `stratum fs ls` output ("kind name\n" per entry). Skips
@@ -2936,54 +3028,103 @@ fn path_to_p9(p: &Path, meta: &BackendMeta) -> String {
 /// SWISS-4h: advance a DeleteBatch by one item. Returns Done when
 /// finished. No conflict resolution — delete is idempotent in
 /// terms of UI flow.
+/// SWISS-4q-worker: advance a DeleteBatch using a per-item worker
+/// thread. Same poll-handle.is_finished() pattern as copy. No
+/// conflict-probe overhead — delete is unconditional in this UI.
 fn advance_delete_batch(
     spawn: Option<&Arc<SpawnCtx>>,
     batch: &mut DeleteBatch,
 ) -> Result<Option<BatchTick>> {
-    // SWISS-4h: cancellation flag from the F8 No-pick.
+    /* Cancellation flag from the F8 No-pick. Checked before any
+     * worker spawn so we don't waste a thread. */
     if DELETE_CANCEL.with(|c| {
         let v = c.get();
         c.set(false);
         v
     }) {
-        // Cancelled before deletion started — mark all as skipped
-        // (failed=0 since we didn't try). idx==0 → Done immediately.
+        /* Wait for any in-flight worker to finish (we can't cancel
+         * mid-subprocess). After that, mark the rest as skipped. */
+        if let Some(w) = batch.worker.as_ref() {
+            if !w.handle.is_finished() {
+                return Ok(Some(BatchTick::More));
+            }
+            let w = batch.worker.take().unwrap();
+            let _ = w.handle.join();
+        }
         batch.idx = batch.items.len();
         return Ok(Some(BatchTick::Done));
     }
+
+    /* Step 1: worker in flight? */
+    if let Some(w) = batch.worker.as_ref() {
+        if !w.handle.is_finished() {
+            return Ok(Some(BatchTick::More));
+        }
+        let w = batch.worker.take().unwrap();
+        let res = w.handle.join().unwrap_or_else(|_| {
+            Err(std::io::Error::new(std::io::ErrorKind::Other,
+                                          "delete worker panicked"))
+        });
+        match res {
+            Ok(()) => batch.deleted += 1,
+            Err(_) => batch.failed += 1,
+        }
+        batch.idx += 1;
+        return Ok(Some(BatchTick::More));
+    }
+
+    /* Step 2: done? */
     if batch.idx >= batch.items.len() {
         return Ok(Some(BatchTick::Done));
     }
+
+    /* Step 3: spawn next worker. */
     let item = batch.items[batch.idx].clone();
-    let res: std::io::Result<()> = match item {
-        DeleteItem::Host { path, is_dir } => {
-            if is_dir {
-                std::fs::remove_dir_all(&path)
-            } else {
-                std::fs::remove_file(&path)
-            }
-        }
-        DeleteItem::Stratum { socket, p9_path, is_dir } => {
-            let sp = spawn.ok_or_else(|| std::io::Error::new(
-                std::io::ErrorKind::Other, "spawn missing"))?;
-            // SWISS-4r-9: use rmtree for dirs (recursively removes
-            // children + the dir itself). Plain `rmdir` requires the
-            // dir be empty AND surfaces STM_ENOTEMPTY → user has no
-            // path forward. rmtree mirrors `rm -rf` and is what the
-            // F8 batch-delete UX expects.
-            let cmd = if is_dir { "rmtree" } else { "rm" };
-            sp.run_stratum_fs(&socket, &[cmd, &p9_path],
-                               std::process::Stdio::null(),
-                               std::process::Stdio::null())
-                .map_err(|e| std::io::Error::new(
-                    std::io::ErrorKind::Other, e.to_string()))
-        }
+    let item_name = match &item {
+        DeleteItem::Host { path, .. } => path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string()),
+        DeleteItem::Stratum { p9_path, .. } => p9_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(p9_path)
+            .to_string(),
     };
-    match res {
-        Ok(()) => batch.deleted += 1,
-        Err(_) => batch.failed += 1,
-    }
-    batch.idx += 1;
+    let sp_for_thread = spawn.cloned();
+    let handle = thread::Builder::new()
+        .name("stratum-delete".into())
+        .spawn(move || -> std::io::Result<()> {
+            match item {
+                DeleteItem::Host { path, is_dir } => {
+                    if is_dir {
+                        std::fs::remove_dir_all(&path)
+                    } else {
+                        std::fs::remove_file(&path)
+                    }
+                }
+                DeleteItem::Stratum { socket, p9_path, is_dir } => {
+                    let sp = sp_for_thread.ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "spawn missing",
+                        )
+                    })?;
+                    /* SWISS-4r-9: rmtree for dirs (recursive). */
+                    let cmd = if is_dir { "rmtree" } else { "rm" };
+                    sp.run_stratum_fs(
+                        &socket, &[cmd, &p9_path],
+                        std::process::Stdio::null(),
+                        std::process::Stdio::null(),
+                    )
+                    .map_err(|e| std::io::Error::new(
+                        std::io::ErrorKind::Other, e.to_string(),
+                    ))
+                }
+            }
+        })
+        .expect("spawn delete worker");
+    batch.worker = Some(DeleteWorker { handle, item_name });
     Ok(Some(BatchTick::More))
 }
 

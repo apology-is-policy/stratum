@@ -346,8 +346,20 @@ pub struct ThroughputSample {
 
 pub const SAMPLE_WINDOW: usize = 60;
 
+/// SWISS-4q-worker: batch kind discriminates the progress dialog —
+/// Copy shows file-level counters + throughput chart; Delete shows
+/// only counters + a spinner (deletes don't have a meaningful byte
+/// rate at v1, and the chart noise hurts readability).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchKind {
+    Copy,
+    Delete,
+}
+
 #[derive(Clone, Debug)]
 pub struct CopyProgress {
+    /// SWISS-4q-worker: copy vs delete; selects renderer shape.
+    pub kind: BatchKind,
     pub idx: usize,
     pub total: usize,
     pub current_name: String,
@@ -359,15 +371,29 @@ pub struct CopyProgress {
     /// host). Drives the throughput line. 0 when no bytes have
     /// landed yet (early items still in flight).
     pub bytes_done: u64,
-    /// Seconds since the batch started. Used for rate calc.
+    /// Seconds since the batch started. Used for rate calc + spinner
+    /// phase.
     pub elapsed_secs: f64,
     /// SWISS-4r-3: rolling window of bytes_per_sec samples for the
     /// throughput chart. Caller pushes via the `record_sample`
     /// helper at every loop tick (~50ms). Capped at SAMPLE_WINDOW
     /// (60) so the chart shows the last ~3s of activity. Rendering
     /// in draw_copy_progress fills the chart row with vertical bars
-    /// scaled to the max sample.
+    /// scaled to the max sample. Unused when kind == Delete.
     pub samples: Vec<ThroughputSample>,
+}
+
+/// SWISS-4q-worker: braille spinner glyph for the current elapsed
+/// time. 10 frames at ~12 fps so the spin feels alive without
+/// stealing attention. The glyph rotates deterministically by
+/// elapsed_secs — no extra state needed on the caller.
+pub fn spinner_glyph(elapsed_secs: f64) -> char {
+    const FRAMES: &[char] = &[
+        '\u{280B}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283C}',
+        '\u{2834}', '\u{2826}', '\u{2827}', '\u{2807}', '\u{280F}',
+    ];
+    let idx = ((elapsed_secs.max(0.0) * 12.0) as usize) % FRAMES.len();
+    FRAMES[idx]
 }
 
 // ── main draw ─────────────────────────────────────────────────────────
@@ -945,23 +971,32 @@ fn draw_local_dialog(frame: &mut Frame<'_>, area: Rect, d: &LocalDialog) {
 // File-level progress + counters cover the v1 UX hump.
 
 fn draw_copy_progress(frame: &mut Frame<'_>, area: Rect, cp: &CopyProgress) {
-    // SWISS-4r-3: bigger dialog so the throughput chart fits below
-    // the existing rows (mirrors v1's draw_copy_dialog layout, just
-    // with v2's double-line border + cyan accent).
+    // SWISS-4r-3 / SWISS-4q-worker: dialog shape adapts to BatchKind.
+    // Copy: file label + bar + counters + throughput line + chart.
+    // Delete: file label + bar + counters + spinner line (no chart).
     let w = 70u16.min(area.width.saturating_sub(4));
-    let chart_rows: u16 = 8;
-    let h: u16 = 10 + chart_rows;
+    let chart_rows: u16 = match cp.kind {
+        BatchKind::Copy => 8,
+        BatchKind::Delete => 0,
+    };
+    let extra_chart_rows = if chart_rows > 0 { chart_rows + 2 } else { 0 };
+    let h: u16 = 10 + extra_chart_rows;
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let rect = Rect::new(x, y, w, h);
 
     frame.render_widget(Clear, rect);
+    let spinner = spinner_glyph(cp.elapsed_secs);
+    let title = match cp.kind {
+        BatchKind::Copy => format!(" {spinner} Copying "),
+        BatchKind::Delete => format!(" {spinner} Deleting "),
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_set(dbl_border())
         .border_style(Style::default().fg(Color::Cyan).bold())
         .title(Line::from(Span::styled(
-            " Copying ",
+            title,
             Style::default().fg(Color::Cyan).bold(),
         )))
         .style(Style::default().bg(CLR_POPUP_BG));
@@ -974,8 +1009,8 @@ fn draw_copy_progress(frame: &mut Frame<'_>, area: Rect, cp: &CopyProgress) {
             Constraint::Length(1), // file label
             Constraint::Length(1), // bar
             Constraint::Length(1), // counters
-            Constraint::Length(1), // SWISS-4n2: throughput/ETA line
-            Constraint::Length(chart_rows + 2), // SWISS-4r-3: chart frame
+            Constraint::Length(1), // SWISS-4n2: throughput/ETA / spinner line
+            Constraint::Length(extra_chart_rows), // chart (Copy only)
             Constraint::Min(0),
             Constraint::Length(1), // hint
         ])
@@ -1014,10 +1049,17 @@ fn draw_copy_progress(frame: &mut Frame<'_>, area: Rect, cp: &CopyProgress) {
         rows[1],
     );
 
-    let counters = format!(
-        " {pct:>3}% · {} copied · {} skipped · {} failed",
-        cp.copied, cp.skipped, cp.failed
-    );
+    let counters = match cp.kind {
+        BatchKind::Copy => format!(
+            " {pct:>3}% · {} copied · {} skipped · {} failed",
+            cp.copied, cp.skipped, cp.failed
+        ),
+        BatchKind::Delete => format!(
+            " {pct:>3}% · {} deleted · {} failed",
+            cp.copied,    // copied counter doubles as deleted (caller fills both)
+            cp.failed
+        ),
+    };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             counters,
@@ -1026,10 +1068,14 @@ fn draw_copy_progress(frame: &mut Frame<'_>, area: Rect, cp: &CopyProgress) {
         rows[2],
     );
 
-    // SWISS-4n2: throughput line.
-    //   - "1.2 MB/s · 4.5 MB · 3.7s" when bytes have started flowing
-    //   - "starting…" when no bytes yet (early items still in flight)
-    let throughput_line = if cp.bytes_done > 0 && cp.elapsed_secs > 0.05 {
+    // SWISS-4n2 + SWISS-4q-worker: throughput / spinner line.
+    //   - Copy with bytes flowing: "1.2 MB/s · 4.5 MB · 3.7s"
+    //   - Copy without bytes yet: "⠋ starting…"
+    //   - Delete: "⠋ working… (elapsed 3.7s)"
+    let throughput_line = if cp.kind == BatchKind::Delete {
+        format!(" {spinner} working… (elapsed {})",
+                format_secs(cp.elapsed_secs))
+    } else if cp.bytes_done > 0 && cp.elapsed_secs > 0.05 {
         let rate = (cp.bytes_done as f64) / cp.elapsed_secs;
         format!(
             " {} · {} · elapsed {}",
@@ -1038,7 +1084,7 @@ fn draw_copy_progress(frame: &mut Frame<'_>, area: Rect, cp: &CopyProgress) {
             format_secs(cp.elapsed_secs),
         )
     } else {
-        " starting…".to_string()
+        format!(" {spinner} starting…")
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -1047,6 +1093,19 @@ fn draw_copy_progress(frame: &mut Frame<'_>, area: Rect, cp: &CopyProgress) {
         ))),
         rows[3],
     );
+
+    /* SWISS-4q-worker: skip the chart for Delete (no throughput
+     * data, the spinner above already conveys "still working"). */
+    if cp.kind == BatchKind::Delete {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " [Esc] cancel batch",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            rows[6],
+        );
+        return;
+    }
 
     // SWISS-4r-3: throughput chart (port of v1 draw_copy_dialog
     // chart). Each column = one sample; height = bytes_per_sec
