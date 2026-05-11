@@ -865,3 +865,177 @@ mod slate_state {
         let _c = LP9::dial(&s.slate_sock).expect("dial slate");
     }
 }
+
+// ── S5-PRE-A: /ctl/ pool subtree visible after attach ────────────────
+
+/// SWISS-5 S5-PRE-A regression: after stratumd attaches the fs's
+/// pool + a sibling scrub to its /ctl/ instance, the readdir of
+/// /pools/ MUST return exactly one entry (the volume's pool UUID)
+/// and /pools/<uuid>/ MUST list scrub + metrics + devices.
+///
+/// Pre-S5-PRE-A, /pools/ readdir returned EMPTY because stratumd
+/// never called stm_ctl_attach_pool. This test would fail with
+/// `entries.is_empty()` against the prior binary.
+#[test]
+fn ctl_pool_subtree_visible_after_attach() {
+    let s = session();
+    let entries = s.fs_ls(&s.stratumd_ctl_sock, "/pools")
+        .expect("readdir /pools");
+    assert_eq!(entries.len(), 1,
+        "S5-PRE-A: /pools/ MUST list exactly one pool (the attached one). \
+         entries={:?}", entries);
+    let (kind, uuid) = &entries[0];
+    assert_eq!(*kind, 'd', "/pools/<uuid> must be a directory");
+    assert_eq!(uuid.len(), 36,
+        "pool UUID dirent should be 36-char canonical hex; got {:?}", uuid);
+
+    // /pools/<uuid>/ now has scrub + metrics + devices entries.
+    let pool_entries = s.fs_ls(&s.stratumd_ctl_sock, &format!("/pools/{uuid}"))
+        .expect("readdir /pools/<uuid>");
+    let names: Vec<&str> = pool_entries.iter().map(|(_, n)| n.as_str()).collect();
+    assert!(names.contains(&"scrub"),
+        "S5-PRE-A: /pools/<uuid>/scrub MUST appear post-attach_scrub. \
+         entries={:?}", names);
+    assert!(names.contains(&"metrics"),
+        "/pools/<uuid>/metrics/ subtree MUST appear when pool attached");
+    assert!(names.contains(&"devices"),
+        "/pools/<uuid>/devices/ subtree MUST appear when pool attached");
+}
+
+/// SWISS-5 S5-PRE-C: /datasets/<id>/snapshots/ readdir lists every
+/// snap for the dataset; per-snap leaf materializes id/name/txg/etc.
+///
+/// Spawn the session (root dataset = 1), create two snapshots via
+/// /datasets/1/create-snapshot writes, then verify:
+///   - /datasets/1/snapshots/ readdir returns exactly 2 entries
+///   - each entry's name is decimal snap_id
+///   - the leaf file's body contains the expected name and txg lines
+#[test]
+fn ctl_snapshots_subtree_lists_and_materializes() {
+    let s = session();
+    // Use stratum fs to drive /ctl/ writes. The session's stratumd
+    // is launched with --ctl-listen so we can dial it for both
+    // reads + writes. write-path writes "name\n" to create-snapshot
+    // (per P9-CTL-1d-actions-snapshot-create's contract).
+    //
+    // Note: `stratum fs write` always Tfsyncs the ROOT_FID after
+    // the write. /ctl/'s lp9 server returns STM_ENOTSUPPORTED for
+    // fsync — this is correct (/ctl/ is a synthetic FS with no
+    // backing storage to flush). The write itself completed
+    // successfully BEFORE the fsync was attempted; the snapshot is
+    // already created. We tolerate the non-zero exit + ENOTSUPPORTED
+    // stderr below by NOT using fs_write_bytes (which fails the
+    // call on non-zero exit). Direct Command::spawn handles it.
+    use std::process::Command;
+    let create = |name: &[u8]| {
+        let mut child = Command::new(&s.bin)
+            .args(["fs", "-s", s.stratumd_ctl_sock.to_str().unwrap(),
+                   "write", "/datasets/1/create-snapshot"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn stratum fs write");
+        use std::io::Write as _;
+        if let Some(mut sin) = child.stdin.take() {
+            sin.write_all(name).unwrap();
+        }
+        let out = child.wait_with_output().expect("wait");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // Only acceptable failure is the post-op fsync ENOTSUPPORTED
+        // ("status=-205"). Anything else is a real test failure.
+        if !out.status.success() && !stderr.contains("status=-205") {
+            panic!("create-snapshot failed (exit {:?}): {}",
+                out.status.code(), stderr);
+        }
+    };
+    create(b"alpha\n");
+    create(b"beta\n");
+
+    // Readdir the /datasets/1/snapshots/ subtree.
+    let entries = s.fs_ls(&s.stratumd_ctl_sock, "/datasets/1/snapshots")
+        .expect("readdir /datasets/1/snapshots");
+    assert_eq!(entries.len(), 2,
+        "S5-PRE-C: /datasets/1/snapshots/ MUST list both created snaps. \
+         entries={:?}", entries);
+    for (kind, name) in &entries {
+        assert_eq!(*kind, '-', "snapshot info leaf must be a regular file");
+        // Name must be all-digits (decimal snap_id).
+        assert!(!name.is_empty(), "empty snap_id name");
+        assert!(name.chars().all(|c| c.is_ascii_digit()),
+            "snap dirent must be decimal snap_id, got {:?}", name);
+    }
+
+    // Materialize each leaf and verify the body contains both
+    // "snapshot-id:" and "name:" lines.
+    let mut seen_names: Vec<String> = Vec::new();
+    for (_, sid) in &entries {
+        let body = s.fs_read(
+            &s.stratumd_ctl_sock,
+            &format!("/datasets/1/snapshots/{}", sid),
+        ).expect("read snapshot info");
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("snapshot-id: "),
+            "leaf body MUST contain 'snapshot-id: '; got:\n{}", text);
+        assert!(text.contains("dataset-id: 1\n"),
+            "leaf body MUST contain 'dataset-id: 1'; got:\n{}", text);
+        assert!(text.contains("name: "),
+            "leaf body MUST contain 'name: '; got:\n{}", text);
+        assert!(text.contains("hold-count: 0\n"),
+            "fresh snap has hold-count 0; got:\n{}", text);
+        // Extract name field for cross-validation.
+        if let Some(name_line) = text.lines().find(|l| l.starts_with("name: ")) {
+            seen_names.push(name_line[6..].to_string());
+        }
+    }
+    assert_eq!(seen_names.len(), 2);
+    seen_names.sort();
+    assert_eq!(seen_names, vec!["alpha".to_string(), "beta".to_string()],
+        "MUST see both snap names; got {:?}", seen_names);
+}
+
+/// SWISS-5 S5-PRE-C: snap_id must be a valid PRESENT snap belonging
+/// to the queried dataset. Walking /datasets/<id>/snapshots/<bogus_id>
+/// MUST return ENOENT (the walk-side guard binds dataset_id).
+#[test]
+fn ctl_snapshots_walk_refuses_unknown_id() {
+    let s = session();
+    // Don't create any snaps. Direct walk to a fabricated id.
+    let r = s.fs_stat(&s.stratumd_ctl_sock,
+        "/datasets/1/snapshots/9999999");
+    assert!(!r, "walk to non-existent snap MUST fail");
+}
+
+/// SWISS-5 S5-PRE-A: the Prometheus exposition is the renderer's
+/// primary data source. Verify it returns a non-empty body containing
+/// the expected stratum_* gauge lines AFTER stratumd attaches pool +
+/// scrub. Pre-S5-PRE-A this readdir would have failed with ENOENT
+/// since /metrics/ lives under /pools/<uuid>/ which was invisible.
+#[test]
+fn ctl_metrics_prometheus_renders_after_attach() {
+    let s = session();
+    let entries = s.fs_ls(&s.stratumd_ctl_sock, "/pools")
+        .expect("readdir /pools");
+    assert_eq!(entries.len(), 1, "expected one pool");
+    let uuid = &entries[0].1;
+    let body = s.fs_read(
+        &s.stratumd_ctl_sock,
+        &format!("/pools/{uuid}/metrics/prometheus"),
+    ).expect("read /pools/<uuid>/metrics/prometheus");
+    let text = String::from_utf8_lossy(&body);
+    // Sanity: non-empty + line-oriented ASCII + at least one stratum_*
+    // gauge present. The specific gauges depend on attached subsystems
+    // (S5-PRE-A attaches both fs + pool + scrub, so all three sections
+    // should render).
+    assert!(!body.is_empty(),
+        "/pools/<uuid>/metrics/prometheus must render non-empty");
+    assert!(text.contains("stratum_"),
+        "S5-PRE-A: Prometheus body MUST contain stratum_* gauges; got:\n{}",
+        text);
+    // Specific gauges that S5-PRE-A unlocks via pool + scrub attach:
+    // device gauges (was unavailable when pool was None) and scrub
+    // gauges (was unavailable when scrub was None).
+    assert!(text.contains("stratum_device") || text.contains("stratum_pool"),
+        "S5-PRE-A: pool-attached metrics MUST surface device/pool gauges; got:\n{}",
+        text);
+}

@@ -39,12 +39,17 @@
  *     the first stm_lp9_server_handle (P9-CTL-1d-uid timing rule
  *     R97 P2-2 carry).
  *
- * /ctl/ scope deferral: stratumd at v2.0 attaches `stm_fs *` to
- * stm_ctl_create but does NOT attach `stm_pool *` or `stm_scrub *`.
- * Public getters for those (e.g., stm_fs_pool(fs)) are forward-noted
- * to a future chunk; until then, /ctl/ over stratumd surfaces
- * /version, /state, /datasets/, /admin/, /events, and /debug/ but
- * NOT /pools/(uuid)/(pool roster, devices, scrub, metrics).
+ * /ctl/ scope (S5-PRE-A): stratumd attaches `stm_fs *` at
+ * stm_ctl_create, attaches `stm_fs_pool(fs)` via
+ * stm_ctl_attach_pool, AND creates a sibling `stm_scrub *` via
+ * stm_scrub_create(stm_fs_sync(fs), ...) that it attaches via
+ * stm_ctl_attach_scrub. The production verify cb is installed on
+ * the fs's sync so /pools/<uuid>/scrub-trigger has a real verify
+ * path. Lifecycle ordering at shutdown is servers → ctl → scrub →
+ * sync (R26 P3-4 + ctl.h Lifetime contract). Net result: /ctl/
+ * over stratumd surfaces /version, /state, /datasets/, /admin/,
+ * /events, /debug/, AND /pools/<uuid>/{devices/, scrub,
+ * metrics/prometheus} starting at S5-PRE-A.
  *
  * Spec composition: every per-connection stm_9p_server composes
  * against `v2/specs/fid.tla` + `v2/specs/namespace.tla`. The accept

@@ -24,6 +24,7 @@ use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
 use std::path::PathBuf;
 
+mod ctl;
 mod editor;
 mod embed;
 mod ffi;
@@ -31,8 +32,10 @@ mod landing;
 mod passphrase;
 mod slate;
 mod spawn;
+mod swiss5_view;
 mod tui;
 mod ui;
+mod volmap;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();

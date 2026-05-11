@@ -53,6 +53,13 @@ extern "C" {
 /* Opaque handle + stats.                                                     */
 /* ========================================================================= */
 
+/* Forward decls — full layouts in <stratum/pool.h> / <stratum/sync.h>.
+ * These let the inspection accessors below (stm_fs_pool, stm_fs_sync)
+ * return typed borrowed pointers without pulling pool.h / sync.h into
+ * every translation unit that consumes fs.h. */
+struct stm_pool;
+struct stm_sync;
+
 typedef struct stm_fs stm_fs;
 
 typedef struct {
@@ -2378,6 +2385,44 @@ stm_status stm_fs_verify(const stm_fs *fs);
  * prefer to preserve on-disk state for forensic inspection rather
  * than risk further writes. */
 void stm_fs_mark_wedged(stm_fs *fs);
+
+/* ========================================================================= */
+/* Borrowed-pointer accessors (S5-PRE-A).                                     */
+/* ========================================================================= */
+
+/*
+ * Borrow a pointer to the stm_pool that backs this fs. The returned
+ * pointer is owned by the stm_fs and is valid only until
+ * stm_fs_unmount returns. Intended for daemon code (stratumd) that
+ * surfaces pool state at /ctl/pools/.
+ *
+ * Thread-safety: the pool pointer is set at mount time and is
+ * IMMUTABLE for the lifetime of the stm_fs handle (no rebind path).
+ * Reading it through this accessor is safe from any thread without
+ * holding fs->lock. The returned pool's own thread-safety contract
+ * applies to subsequent calls against it.
+ *
+ * Returns NULL if `fs` is NULL.
+ */
+struct stm_pool *stm_fs_pool(stm_fs *fs);
+
+/*
+ * Borrow a pointer to the stm_sync handle of a mounted stm_fs.
+ * Intended for daemon code that constructs a stm_scrub against the
+ * fs's sync (e.g., stratumd surfaces scrub state at
+ * /ctl/pools/<uuid>/scrub by creating a sibling scrub instance).
+ *
+ * Thread-safety + lifetime: same posture as stm_fs_pool — pointer set
+ * at mount, never rebound; safe to read concurrently; valid only
+ * until stm_fs_unmount returns.
+ *
+ * Production-shape counterpart to the test-only stm_fs_sync_for_test
+ * in <stratum/fs_testing.h>. The test seam remains in place; new
+ * non-test callers should use this one.
+ *
+ * Returns NULL if `fs` is NULL.
+ */
+struct stm_sync *stm_fs_sync(stm_fs *fs);
 
 #ifdef __cplusplus
 }

@@ -10,7 +10,7 @@
 #![allow(dead_code)]
 #![allow(non_camel_case_types)]
 
-use std::os::raw::{c_char, c_int};
+use std::os::raw::{c_char, c_int, c_void};
 
 pub type stm_status = c_int;
 
@@ -100,7 +100,31 @@ extern "C" {
     ) -> stm_status;
 
     pub fn stm_9p_clunk(c: *mut stm_9p_client, fid: u32) -> stm_status;
+
+    pub fn stm_9p_readdir(
+        c: *mut stm_9p_client,
+        fid: u32,
+        offset: u64,
+        count: u32,
+        cb: stm_9p_dirent_cb,
+        cb_ctx: *mut c_void,
+        out_entries: *mut u32,
+        out_next_offset: *mut u64,
+    ) -> stm_status;
 }
+
+/// Treaddir per-entry callback. Return STM_OK to continue, anything
+/// else to stop iteration (status propagates as readdir's return value).
+/// `name` is NUL-terminated and lives only for the cb's duration —
+/// copy out before returning. See `v2/include/stratum/9p_client.h:507`.
+pub type stm_9p_dirent_cb = unsafe extern "C" fn(
+    qid: *const stm_9p_qid,
+    cookie: u64,
+    typ: u8,
+    name: *const c_char,
+    name_len: usize,
+    ctx: *mut c_void,
+) -> stm_status;
 
 // ── cmd run-main entry points (from v2/include/stratum/cmds.h) ────────
 

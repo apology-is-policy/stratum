@@ -22,6 +22,8 @@ use ratatui::{
 };
 
 use crate::editor::{EditorMode, EditorState};
+use crate::swiss5_view;
+use crate::volmap::VolumeMapState;
 
 // ── color palette (lifted from v2/tui/src/ui.rs) ──────────────────────
 
@@ -396,6 +398,19 @@ pub fn spinner_glyph(elapsed_secs: f64) -> char {
     FRAMES[idx]
 }
 
+// ── view modes ────────────────────────────────────────────────────────
+
+/// SWISS-5: the top-level TUI view. F2 toggles between Files (the
+/// dual-pane file browser) and VolumeMap (the F2 storage overview).
+/// The editor is still a third state, but it lives in the global
+/// `Option<EditorState>` (renders full-screen when present, regardless
+/// of view_mode) — opening / closing the editor is its own transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewMode {
+    Files,
+    VolumeMap,
+}
+
 // ── main draw ─────────────────────────────────────────────────────────
 
 pub fn render(
@@ -403,15 +418,65 @@ pub fn render(
     state: &UiState,
     editor: Option<&EditorState>,
     copy_progress: Option<&CopyProgress>,
+    view_mode: ViewMode,
+    volmap: Option<&VolumeMapState>,
 ) {
     let area = frame.area();
     frame.render_widget(Block::default().style(Style::default().bg(CLR_BG)), area);
 
     // SWISS-4e v1.1: when the editor is active, it takes over the
     // full screen (matches v1 — `if let Some(ref ed) = app.editor {
-    // draw_editor(...); return; }`).
+    // draw_editor(...); return; }`). The editor pre-empts BOTH file
+    // and volume-map views — opening the editor switches focus
+    // independently of view_mode.
     if let Some(ed) = editor {
         draw_editor(frame, area, ed);
+        return;
+    }
+
+    // SWISS-5: volume-map view takes over the screen below the
+    // F-key bar. When no volmap snapshot is available (stratumd /ctl/
+    // not attached, e.g. host-fs-only TUI mode), swiss5_view::render
+    // renders an empty placeholder state.
+    if view_mode == ViewMode::VolumeMap {
+        // Reserve 2 lines at the bottom for the F-key bars; the
+        // status line stays implicit (volmap has its own footer).
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(6),     // map body
+                Constraint::Length(1),  // F-key bar (regular)
+                Constraint::Length(1),  // Shift+F-key bar
+            ])
+            .split(area);
+        let default_state = VolumeMapState::default();
+        let render_state = volmap.unwrap_or(&default_state);
+        swiss5_view::render(frame, rows[0], render_state);
+        draw_fkey_bar(frame, rows[1]);
+        draw_shift_fkey_bar(frame, rows[2]);
+        // R129 P2-1 defense-in-depth: render dialog/copy-progress
+        // overlays here too. Today's tui.rs F2-toggle gate prevents
+        // entering VolumeMap when a modal is active, AND the
+        // VolumeMap-mode key gate refuses anything that would open
+        // a new modal — so neither overlay should be present here in
+        // normal flow. But future code paths (e.g., a slate-side
+        // /dialogs/ pop-up driven by a remote actor) could surface
+        // a dialog asynchronously; rendering it here makes it
+        // visible + dismissible instead of stuck-invisible.
+        if !state.dialog_stack.is_empty() {
+            draw_dialog_overlay(frame, area, state);
+        }
+        if let Some(d) = state.local_dialog.as_ref() {
+            match &d.kind {
+                LocalDialogKind::MkVol(mk) => draw_mkvol_dialog(frame, area, mk),
+                LocalDialogKind::Confirm { options, selected, .. } => {
+                    draw_confirm_dialog(frame, area, &d.prompt, options, *selected);
+                }
+                _ => draw_local_dialog(frame, area, d),
+            }
+        } else if let Some(cp) = copy_progress {
+            draw_copy_progress(frame, area, cp);
+        }
         return;
     }
 
@@ -683,7 +748,7 @@ fn draw_fkey_bar(frame: &mut Frame<'_>, area: Rect) {
     //   F10 = Quit
     let keys: &[(&str, &str)] = &[
         ("1", ""),
-        ("2", ""),
+        ("2", "Map"),       /* SWISS-5: toggle Volume Map view */
         ("3", "View"),
         ("4", "Edit"),
         ("5", "Copy"),

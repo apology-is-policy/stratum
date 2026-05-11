@@ -260,7 +260,8 @@ use crate::slate::{read_lines, read_text_trim, SlateClient};
 use crate::spawn::{BackendMeta, SpawnCtx};
 use crate::ui::{self, BatchKind, ConfirmAction, CopyProgress, LocalDialog,
                 LocalDialogKind, MkVolCompress, MkVolField, MkVolState,
-                PanelView, UiState};
+                PanelView, UiState, ViewMode};
+use crate::volmap::VolumeMapPoller;
 
 pub struct Opts {
     pub slate_sock: PathBuf,
@@ -362,6 +363,20 @@ fn run_ui(
     // doc for behavior). Lives across handle_key calls so a user
     // can type "ph" then "o" and have the cursor land on "photo.jpg".
     let mut search = SearchState::new();
+    // SWISS-5: top-level view toggle (Files <-> VolumeMap). F2
+    // (no modifiers) flips between the two. Defaults to Files —
+    // the user lands on the dual-pane file browser as before.
+    let mut view_mode: ViewMode = ViewMode::Files;
+    // SWISS-5: VolumeMap poller — spawned at run_ui entry IFF a
+    // SpawnCtx is attached AND it carries a stratumd /ctl/ socket.
+    // The poller dials /ctl/ once per REFRESH_INTERVAL (1 s) and
+    // populates an Arc<RwLock<VolumeMapState>> the renderer reads
+    // from. When None, the F2 view still renders a placeholder
+    // (no-pool state) so the user sees an explanatory message.
+    let volmap_poller: Option<VolumeMapPoller> =
+        spawn.as_ref()
+            .and_then(|sc| sc.stratumd_ctl_sock.clone())
+            .map(VolumeMapPoller::start);
     let result = (|| -> Result<()> {
         loop {
             // SWISS-4h: advance batch ops one step per iteration when
@@ -572,7 +587,15 @@ fn run_ui(
                 None
             };
             terminal.draw(|frame| {
-                ui::render(frame, &snapshot, editor.as_ref(), cp_snapshot.as_ref())
+                let volmap_snap = volmap_poller.as_ref().map(|p| p.snapshot());
+                ui::render(
+                    frame,
+                    &snapshot,
+                    editor.as_ref(),
+                    cp_snapshot.as_ref(),
+                    view_mode,
+                    volmap_snap.as_ref(),
+                )
             })?;
             loop {
                 if event::poll(Duration::from_millis(100))? {
@@ -581,6 +604,7 @@ fn run_ui(
                             match handle_key(client, &mut focus, &mut local_dialog,
                                               &mut editor, &mut copy_batch,
                                               &mut delete_batch, &mut search,
+                                              &mut view_mode,
                                               spawn.as_ref(),
                                               &snapshot, key)? {
                                 Action::Quit => return Ok(()),
@@ -628,6 +652,7 @@ fn handle_key(
     copy_batch: &mut Option<CopyBatch>,
     delete_batch: &mut Option<DeleteBatch>,
     search: &mut SearchState,
+    view_mode: &mut ViewMode,
     spawn: Option<&Arc<SpawnCtx>>,
     snap: &UiState,
     key: crossterm::event::KeyEvent,
@@ -657,6 +682,52 @@ fn handle_key(
     }
     if matches!(key.code, KeyCode::F(10)) {
         return Ok(Action::Quit);
+    }
+
+    // SWISS-5 (R129 P2-1 + P2-2): F2 toggles between Files and
+    // VolumeMap views. This is handled BEFORE the per-mode key
+    // dispatch below so the user can always escape back to Files
+    // from VolumeMap. The toggle itself is gated on "no active
+    // modal/batch" — without that, a stuck dialog could persist
+    // across the toggle and the VolumeMap render path (which
+    // currently skips dialog overlays) would leave it invisible.
+    //
+    // Shift+F2 still falls through to the F(n)-with-SHIFT path for
+    // host-mount; we only intercept the no-modifiers case.
+    if matches!(key.code, KeyCode::F(2))
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+    {
+        // Refuse the toggle when ANY modal/batch is active. The
+        // dialog overlay isn't rendered in VolumeMap mode, so the
+        // user would lose the ability to see / dismiss it. (Even
+        // if rendering were added, batch-progress overlays carry
+        // implicit context — better to land the user back on Files
+        // first.)
+        if local_dialog.is_none()
+            && editor.is_none()
+            && copy_batch.is_none()
+            && delete_batch.is_none()
+        {
+            *view_mode = match *view_mode {
+                ViewMode::Files => ViewMode::VolumeMap,
+                ViewMode::VolumeMap => ViewMode::Files,
+            };
+            search.clear();
+        }
+        return Ok(Action::Refresh);
+    }
+
+    // SWISS-5 (R129 P2-2): in VolumeMap view, drop every key that
+    // isn't a quit verb (handled above) or the F2 toggle (handled
+    // just above). Without this, F-keys (F5/F7/F8/etc.), spacebar,
+    // Tab, Enter, Backspace, and printable chars would all dispatch
+    // to the file-browser handlers and mutate panel state behind
+    // the invisible map. Most dangerously, F8 would open a delete
+    // confirm dialog that's not rendered (ui::render skips dialog
+    // overlay in VolumeMap mode); Enter on that invisible dialog
+    // would confirm the delete.
+    if *view_mode == ViewMode::VolumeMap {
+        return Ok(Action::Ignore);
     }
     // SWISS-4j: Esc cancels an in-progress batch (no dialog, no
     // editor). Marks remaining items as skipped via the conflict
@@ -797,6 +868,8 @@ fn handle_key(
         }
         // SWISS-4f: F3 = view (open editor in readonly mode). Same
         // file-open path as F4 / Enter-on-file but the editor is
+        // (SWISS-5 F2 handler moved above the dispatch table — handled
+        //  at top of handle_key for view-mode-toggle correctness.)
         // marked readonly at construction in run_ui (see the editor
         // branch there).
         KeyCode::F(3) if !key.modifiers.contains(KeyModifiers::SHIFT) => {

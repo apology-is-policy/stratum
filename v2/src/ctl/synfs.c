@@ -149,6 +149,8 @@ typedef enum {
     KIND_DATASET_RELEASE_SNAPSHOT = 24, /* /datasets/<id>/release-snapshot — admin write */
     KIND_POOL_METRICS_DIR        = 25, /* /pools/<uuid>/metrics/ — observability subtree */
     KIND_POOL_METRICS_PROMETHEUS = 26, /* /pools/<uuid>/metrics/prometheus — bulk exposition */
+    KIND_DATASET_SNAPSHOTS_DIR   = 27, /* /datasets/<id>/snapshots/ — read-only snap list (S5-PRE-C) */
+    KIND_DATASET_SNAPSHOT_INFO   = 28, /* /datasets/<id>/snapshots/<sid> — per-snap info file */
     KIND_MAX
 } ctl_kind;
 
@@ -189,6 +191,8 @@ static const ctl_kind_meta KIND_META[KIND_MAX] = {
     [KIND_DATASET_RELEASE_SNAPSHOT] = { false, true, 0200, "release-snapshot" }, /* admin write trigger */
     [KIND_POOL_METRICS_DIR]        = { true,  false, 0555, "metrics"    }, /* world-readable observability dir */
     [KIND_POOL_METRICS_PROMETHEUS] = { false, false, 0444, "prometheus" }, /* world-readable bulk exposition */
+    [KIND_DATASET_SNAPSHOTS_DIR]   = { true,  false, 0555, "snapshots"  }, /* S5-PRE-C: world-readable snap list dir */
+    [KIND_DATASET_SNAPSHOT_INFO]   = { false, false, 0444, NULL         }, /* dynamic snap id (decimal) */
 };
 
 /* R96 P3-2: pin every static-name literal length below STM_LP9_NAME_MAX
@@ -221,6 +225,7 @@ _Static_assert(sizeof("hold-snapshot") - 1   <= STM_LP9_NAME_MAX, "/ctl/ /datase
 _Static_assert(sizeof("release-snapshot") - 1 <= STM_LP9_NAME_MAX, "/ctl/ /datasets/.../release-snapshot literal");
 _Static_assert(sizeof("metrics") - 1    <= STM_LP9_NAME_MAX, "/ctl/ /pools/.../metrics literal");
 _Static_assert(sizeof("prometheus") - 1 <= STM_LP9_NAME_MAX, "/ctl/ /pools/.../metrics/prometheus literal");
+_Static_assert(sizeof("snapshots") - 1  <= STM_LP9_NAME_MAX, "/ctl/ /datasets/.../snapshots literal");
 /* Dynamic names: pool-uuid hex (36 chars), decimal device-id (≤2
  * chars at v2.0's STM_POOL_DEVICES_MAX = 64 cap), decimal dataset-id
  * (≤9 chars at STM_SYNC_DATASET_ID_MAX = 0x0FFFFFFF ~= 268M = 9
@@ -231,7 +236,7 @@ _Static_assert(sizeof("prometheus") - 1 <= STM_LP9_NAME_MAX, "/ctl/ /pools/.../m
  * KIND_META[] trips this assert at build time, even if a downstream
  * build silently suppresses -Wmissing-field-initializers. Update the
  * literal in lockstep when growing the enum. */
-_Static_assert(KIND_MAX == 27,
+_Static_assert(KIND_MAX == 29,
                "KIND_META[KIND_MAX] sized to enum cardinality; "
                "update both ctl_kind enum + KIND_META[] in lockstep");
 
@@ -287,6 +292,28 @@ _Static_assert(STM_SYNC_DATASET_ID_MAX <= UINT32_MAX,
 static uint64_t qid_dataset_id(uint64_t q)
 {
     return q & DEVICE_ID_MASK;
+}
+
+/* S5-PRE-C: snapshot info kind encodes snap_id in the qid's low 56 bits.
+ * Dataset binding is NOT embedded in the qid — the materializer resolves
+ * snap_id → snap entry via stm_snapshot_lookup AND surfaces entry.dataset_id
+ * to the caller (the renderer reads it from the materialized body). The
+ * walk side enforces (dataset_id, snap_id) consistency by refusing to bind
+ * the leaf qid when the looked-up snap's dataset_id ≠ parent's dataset_id.
+ *
+ * 56 bits ≈ 7.2e16, far above any realistic snap_id (R29 P3-1 saturates
+ * at UINT64_MAX; the truncation guard at qid_of_snap refuses snap_ids
+ * that would alias). */
+#define SNAP_ID_QID_MASK   0x00FFFFFFFFFFFFFFull
+
+static uint64_t qid_of_snap(ctl_kind kind, uint64_t snap_id)
+{
+    return ((uint64_t)(uint8_t)kind << 56) | (snap_id & SNAP_ID_QID_MASK);
+}
+
+static uint64_t qid_snap_id(uint64_t q)
+{
+    return q & SNAP_ID_QID_MASK;
 }
 
 /* ── per-fid materialized body ──────────────────────────────────────── */
@@ -630,6 +657,39 @@ static bool ds_collect_cb(const stm_dataset_entry *entry, void *ctx_v)
     ds_collect_ctx *ctx = ctx_v;
     if (*ctx->n >= ctx->cap) return false;     /* stop iteration */
     ctx->out[(*ctx->n)++] = entry->id;
+    return true;
+}
+
+/* S5-PRE-C: per-dataset snapshot collect for /datasets/<id>/snapshots/
+ * readdir. Same shape as ds_collect_ctx but filters by dataset_id —
+ * stm_snapshot_iter walks every PRESENT snap globally, so we drop
+ * snaps belonging to other datasets. Bounded by `cap`; on overflow,
+ * iteration stops and readdir truncates (forward-noted along with the
+ * dataset readdir cap to a future paginated-readdir chunk).
+ *
+ * Cap = 1024 covers typical operational sizes; pools with >1024 snaps
+ * per dataset would see truncated readdir. Stack footprint = 8 KiB. */
+#define STM_CTL_SNAPSHOT_LIST_CAP  1024u
+
+typedef struct {
+    uint64_t *out;
+    size_t   *n;
+    size_t    cap;
+    uint64_t  dataset_id;   /* filter — only emit snaps with this dataset_id */
+} snap_collect_ctx;
+
+static bool snap_collect_cb(const stm_snapshot_entry *entry, void *ctx_v)
+{
+    snap_collect_ctx *ctx = ctx_v;
+    if (entry->dataset_id != ctx->dataset_id) return true;  /* skip, continue */
+    if (*ctx->n >= ctx->cap) return false;     /* stop iteration */
+    /* Truncate snaps whose id wouldn't fit in qid_of_snap's 56-bit
+     * encoding — same R29 P3-1 doctrine carry as the walk-side guard.
+     * Today's pools won't hit this (R29 P3-1 saturation refuses
+     * next_id past UINT64_MAX, far below 2^56). */
+    if (entry->snapshot_id != (entry->snapshot_id & SNAP_ID_QID_MASK))
+        return true;
+    ctx->out[(*ctx->n)++] = entry->snapshot_id;
     return true;
 }
 
@@ -1070,6 +1130,63 @@ static stm_status materialize_dataset_properties(stm_ctl *c, ctl_session *s)
         (unsigned long long)encryption,
         (unsigned long long)tiering,
         (unsigned long long)promote_decay);
+    if (n < 0) return STM_EIO;
+    if ((size_t)n >= sizeof s->buf) return STM_ERANGE;
+    s->len = (uint32_t)n;
+    return STM_OK;
+}
+
+/* S5-PRE-C: materialize /datasets/<id>/snapshots/<sid>.
+ *
+ * Surfaces (id, dataset_id, name, created_txg, extent_txg, hold_count)
+ * for a single snapshot, one line per field. Used by the SWISS-5 TUI
+ * to populate the snapshot timeline (F2 view).
+ *
+ * Body cap: 6 fields × ~32 bytes each + 255-byte name + line decoration
+ * ≈ 480 bytes. Well under STM_CTL_BODY_MAX (1 KiB).
+ *
+ * Name safety (R99 P2-1 carry): snapshot.c::stm_snap_name_chars_valid
+ * refuses bytes < 0x20 + 0x7F at create, so the `name: %.*s\n`
+ * formatter cannot embed a forged `\nflags: ...` line. UTF-8
+ * multi-byte (≥ 0x80) is accepted unchanged.
+ *
+ * Stale-fid race (R29 P3-1 doctrine carry): walk-side resolved the
+ * snap but a concurrent /delete-snapshot may have removed it before
+ * materialization. stm_snapshot_lookup returns STM_ENOENT in that
+ * case — surface it directly to the client (Tlopen failure). The
+ * fid is not auto-invalidated because /ctl/'s session model doesn't
+ * carry an inode-gen-stamp; the next walk would also ENOENT. */
+static stm_status materialize_dataset_snapshot_info(stm_ctl *c, ctl_session *s)
+{
+    if (!c->fs) return STM_EBACKEND;     /* gated at vops_lopen */
+    uint64_t snap_id = qid_snap_id(s->qid_path);
+
+    stm_sync *sync = stm_fs_sync(c->fs);
+    if (!sync) return STM_EBACKEND;
+    stm_snapshot_index *idx = stm_sync_snapshot_index(sync);
+    if (!idx) return STM_EBACKEND;
+
+    stm_snapshot_entry e;
+    stm_status rc = stm_snapshot_lookup(idx, snap_id, &e);
+    if (rc != STM_OK) return rc;  /* ENOENT propagates per R29 P3-1 */
+
+    int n = snprintf((char *)s->buf, sizeof s->buf,
+        "snapshot-id: %llu\n"
+        "dataset-id: %llu\n"
+        "name: %.*s\n"
+        "created-txg: %llu\n"
+        "extent-txg: %llu\n"
+        "prev-snap-id: %llu\n"
+        "hold-count: %u\n"
+        "flags: 0x%08x\n",
+        (unsigned long long)e.snapshot_id,
+        (unsigned long long)e.dataset_id,
+        (int)e.name_len, (const char *)e.name,
+        (unsigned long long)e.created_txg,
+        (unsigned long long)e.extent_txg,
+        (unsigned long long)e.prev_snap_id,
+        (unsigned)e.hold_count,
+        (unsigned)e.flags);
     if (n < 0) return STM_EIO;
     if ((size_t)n >= sizeof s->buf) return STM_ERANGE;
     s->len = (uint32_t)n;
@@ -1676,6 +1793,7 @@ static stm_status materialize_locked(stm_ctl *c, ctl_session *s)
     case KIND_POOL_STATUS:        return materialize_pool_status(c, s);
     case KIND_DEVICE_STATUS:      return materialize_device_status(c, s);
     case KIND_DATASET_PROPERTIES: return materialize_dataset_properties(c, s);
+    case KIND_DATASET_SNAPSHOT_INFO: return materialize_dataset_snapshot_info(c, s);
     case KIND_ADMIN_PEER:         return materialize_admin_peer(c, s);
     case KIND_DEBUG_ALLOC:        return materialize_debug_alloc(c, s);
     case KIND_POOL_SCRUB:         return materialize_pool_scrub(c, s);
@@ -1688,6 +1806,7 @@ static stm_status materialize_locked(stm_ctl *c, ctl_session *s)
     case KIND_DEVICE_DIR:
     case KIND_DATASETS_DIR:
     case KIND_DATASET_DIR:
+    case KIND_DATASET_SNAPSHOTS_DIR:  /* dir; no body */
     case KIND_ADMIN_DIR:
     case KIND_DEBUG_DIR:
     case KIND_DEBUG_ALLOC_DIR:
@@ -1810,7 +1929,8 @@ static stm_status getattr_at(stm_ctl *c, uint64_t qid_path,
             || k == KIND_DATASET_CREATE_SNAPSHOT
             || k == KIND_DATASET_DELETE_SNAPSHOT
             || k == KIND_DATASET_HOLD_SNAPSHOT
-            || k == KIND_DATASET_RELEASE_SNAPSHOT) {
+            || k == KIND_DATASET_RELEASE_SNAPSHOT
+            || k == KIND_DATASET_SNAPSHOTS_DIR) {
         if (!c->fs) return STM_ENOENT;
         uint64_t dsid = qid_dataset_id(qid_path);
         /* Validate the dataset is PRESENT (i.e. not destroyed).
@@ -1828,6 +1948,29 @@ static stm_status getattr_at(stm_ctl *c, uint64_t qid_path,
             name = dyn_name;
             name_len = (size_t)n;
         }
+    }
+
+    /* S5-PRE-C: KIND_DATASET_SNAPSHOT_INFO existence-check. Snap-id is
+     * encoded in the qid's low 56 bits; the lookup confirms it's
+     * PRESENT AND surfaces the dynamic name (decimal snap_id) for
+     * the readdir emit path. Snap can disappear between walk and
+     * stat/lopen via concurrent /delete-snapshot — surface as
+     * STM_ENOENT (R29 P3-1 doctrine carry, same shape as
+     * KIND_DATASET_DIR's lookup gate). */
+    if (k == KIND_DATASET_SNAPSHOT_INFO) {
+        if (!c->fs) return STM_ENOENT;
+        stm_sync *sync = stm_fs_sync(c->fs);
+        if (!sync) return STM_ENOENT;
+        stm_snapshot_index *sidx = stm_sync_snapshot_index(sync);
+        if (!sidx) return STM_ENOENT;
+        uint64_t sid = qid_snap_id(qid_path);
+        stm_snapshot_entry se;
+        if (stm_snapshot_lookup(sidx, sid, &se) != STM_OK) return STM_ENOENT;
+        int n = snprintf(dyn_name, sizeof dyn_name, "%llu",
+                          (unsigned long long)sid);
+        if (n < 0 || n >= (int)sizeof dyn_name) return STM_EIO;
+        name = dyn_name;
+        name_len = (size_t)n;
     }
 
     /* /debug/ subtree (P9-CTL-1d-debug). KIND_DEBUG_DIR itself is
@@ -2025,7 +2168,36 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
                      KIND_META[KIND_DATASET_RELEASE_SNAPSHOT].static_name))
             return walk_to_qid(c,
                 qid_of(KIND_DATASET_RELEASE_SNAPSHOT, 0, (uint32_t)dsid), out);
+        if (str_eq(name, name_len,
+                     KIND_META[KIND_DATASET_SNAPSHOTS_DIR].static_name))
+            return walk_to_qid(c,
+                qid_of(KIND_DATASET_SNAPSHOTS_DIR, 0, (uint32_t)dsid), out);
         return STM_ENOENT;
+    }
+
+    case KIND_DATASET_SNAPSHOTS_DIR: {
+        /* S5-PRE-C: walk /datasets/<id>/snapshots/<snap_id>. The
+         * child name is decimal snap_id; we parse, look it up, and
+         * confirm the snap's stored dataset_id matches the parent's
+         * encoded dataset_id. A snap with a mismatched dataset_id
+         * MUST return ENOENT (it's not actually in THIS dataset's
+         * subtree even if the snap_id is valid globally). */
+        if (!c->fs) return STM_ENOENT;
+        uint64_t parent_dsid = qid_dataset_id(dir_qid_path);
+        uint64_t sid = 0;
+        if (parse_dataset_id(name, name_len, &sid) != 0) return STM_ENOENT;
+        /* parse_dataset_id reuses the same decimal parser; rename is
+         * cosmetic. Refuse aliased snap_ids that would collide on the
+         * 56-bit qid encoding (R29 P3-1 doctrine carry). */
+        if (sid != (sid & SNAP_ID_QID_MASK)) return STM_ENOENT;
+        stm_sync *sync = stm_fs_sync(c->fs);
+        if (!sync) return STM_ENOENT;
+        stm_snapshot_index *sidx = stm_sync_snapshot_index(sync);
+        if (!sidx) return STM_ENOENT;
+        stm_snapshot_entry e;
+        if (stm_snapshot_lookup(sidx, sid, &e) != STM_OK) return STM_ENOENT;
+        if (e.dataset_id != parent_dsid) return STM_ENOENT;
+        return walk_to_qid(c, qid_of_snap(KIND_DATASET_SNAPSHOT_INFO, sid), out);
     }
 
     case KIND_ADMIN_DIR:
@@ -2090,6 +2262,7 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
     case KIND_DATASET_HOLD_SNAPSHOT:
     case KIND_DATASET_RELEASE_SNAPSHOT:
     case KIND_POOL_METRICS_PROMETHEUS:
+    case KIND_DATASET_SNAPSHOT_INFO:  /* leaf; no children */
     case KIND_MAX:
         break;
     }
@@ -2307,8 +2480,53 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
         rc = emit_entry(c, &em,
             qid_of(KIND_DATASET_HOLD_SNAPSHOT, 0, (uint32_t)dsid));
         if (rc != STM_OK) return rc;
-        return emit_entry(c, &em,
+        rc = emit_entry(c, &em,
             qid_of(KIND_DATASET_RELEASE_SNAPSHOT, 0, (uint32_t)dsid));
+        if (rc != STM_OK) return rc;
+        /* S5-PRE-C: emit /datasets/<id>/snapshots/ subtree dirent. */
+        return emit_entry(c, &em,
+            qid_of(KIND_DATASET_SNAPSHOTS_DIR, 0, (uint32_t)dsid));
+    }
+
+    case KIND_DATASET_SNAPSHOTS_DIR: {
+        /* S5-PRE-C: iterate every PRESENT snapshot in the index,
+         * filter by dataset_id == parent's dataset_id, emit one
+         * dirent per matching snap (named by decimal snap_id).
+         *
+         * Same collect-then-emit pattern as /datasets/ readdir (R98
+         * P2-1 lesson carry): the iter callback runs under the
+         * snapshot index's internal mutex; emit_entry → getattr_at
+         * → stm_snapshot_lookup re-acquires that mutex, which would
+         * deadlock (ERRORCHECK reentry). Collect ids first, release
+         * the index lock, then emit_entry per id.
+         *
+         * The window between collect and emit allows a concurrent
+         * delete to remove a snap, in which case emit_entry's
+         * getattr_at returns STM_ENOENT — skip and continue. */
+        if (!c->fs) return STM_OK;
+        uint64_t parent_dsid = qid_dataset_id(dir_qid_path);
+        stm_sync *sync = stm_fs_sync(c->fs);
+        if (!sync) return STM_OK;
+        stm_snapshot_index *sidx = stm_sync_snapshot_index(sync);
+        if (!sidx) return STM_OK;
+
+        uint64_t collected[STM_CTL_SNAPSHOT_LIST_CAP];
+        size_t n_collected = 0;
+        snap_collect_ctx collect_ctx = {
+            .out = collected,
+            .n = &n_collected,
+            .cap = STM_CTL_SNAPSHOT_LIST_CAP,
+            .dataset_id = parent_dsid,
+        };
+        rc = stm_snapshot_iter(sidx, snap_collect_cb, &collect_ctx);
+        if (rc != STM_OK) return rc;
+        for (size_t i = 0; i < n_collected; i++) {
+            stm_status erc = emit_entry(c, &em,
+                qid_of_snap(KIND_DATASET_SNAPSHOT_INFO, collected[i]));
+            if (erc == STM_ENOENT) continue;
+            if (erc != STM_OK) return erc;
+        }
+        return STM_OK;
     }
 
     case KIND_ADMIN_DIR:
@@ -2369,6 +2587,7 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
     case KIND_DATASET_HOLD_SNAPSHOT:
     case KIND_DATASET_RELEASE_SNAPSHOT:
     case KIND_POOL_METRICS_PROMETHEUS:
+    case KIND_DATASET_SNAPSHOT_INFO:  /* leaf — no readdir */
     case KIND_MAX:
         break;
     }

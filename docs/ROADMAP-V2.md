@@ -52,6 +52,13 @@ Phase 8 ─ POSIX surface                        (~3 months)
 Phase 9 ─ Client interfaces                    (~2 months)
           9P server + FUSE shim + CLI + /ctl/ + bindings
 
+Phase 9.5 ─ Concurrent 9P API                  (~1 month)
+          stratumd concurrent-accept + compound-op race
+          class + fs->lock granularity. Exposes the
+          lock-free Bε-tree (Phase 2) through to clients.
+          Gating chunk for kernel-9P-mount as a production
+          backing store for a POSIX OS.
+
 Phase 10 ─ Hardening                           (~2 months)
           Fuzzers, audits, benchmarks, docs
 
@@ -62,7 +69,7 @@ Post-v2.0 (v2.1, v2.2+)                        (ongoing)
           Kernel driver, learned tiering, Windows, zoned storage, …
 ```
 
-Total Phase 1 → Phase 11: **~29 months** from design-freeze to v2.0. Aggressive but bounded. Some phases can overlap (notes per-phase). Phase 8 (POSIX surface) was inserted post-Phase-7 in 2026-04-30 once the gap was surfaced — the prior 10-phase plan implicitly assumed POSIX semantics existed but had no chunk for them; APIs (now Phase 9) are necessarily downstream.
+Total Phase 1 → Phase 11: **~30 months** from design-freeze to v2.0. Aggressive but bounded. Some phases can overlap (notes per-phase). Phase 8 (POSIX surface) was inserted post-Phase-7 in 2026-04-30 once the gap was surfaced — the prior 10-phase plan implicitly assumed POSIX semantics existed but had no chunk for them; APIs (now Phase 9) are necessarily downstream. Phase 9.5 (Concurrent 9P API) was inserted post-SLATE in 2026-05-11 once the kernel-9P-mount target became near-term — Phase 9 shipped the protocol; 9.5 makes it scale across clients by lifting `fs->lock` granularity to expose the Phase-2 lock-free Bε-tree end-to-end.
 
 ## 3. Principles that apply throughout
 
@@ -888,13 +895,106 @@ ARCHITECTURE §11 specifies the on-disk shape; this phase implements it. Phase 7
 
 ---
 
-## 13. Phase 10: Hardening
+## 13. Phase 9.5: Concurrent 9P API
+
+(inserted 2026-05-11 post-SLATE; subsequent sections renumbered)
+
+**Scope**: lift the kernel-9P-mount path from "serially correct" to "concurrent-fast." Phase 9 shipped the protocol (9P2000.L server, libstratum-9p, /ctl/, slate, swiss). Today every kernel-9P client and every stratumd connection serializes — first at the accept loop (one connection at a time per socket), and then at `fs->lock` (a single `pthread_mutex_t` above the lock-free Bε-tree). Phase 2 already shipped the lock-free metadata layer with ≥90% linear read scaling (exit §5.2); Phase 9.5 propagates that property up through the FS-API wrapper so two clients reading two different files actually run in parallel down to the metal.
+
+This is a gating chunk for using Stratum as a **production backing store for a POSIX-compliant OS over kernel 9P** (the Thylacine target). Without it, Stratum is single-client-fast and multi-client-slow; with it, the lock-free property is observable end-to-end.
+
+### 13.1 Deliverables
+
+- **P9.5-PARALLEL-1: stratumd concurrent-accept**:
+  - Replace the per-socket serial accept loop with either (a) pthread-per-connection bounded by a configurable cap, or (b) `epoll(7)` / `kqueue(2)` event loop with a worker pool. Pick (a) initially for symmetry with the slate daemon's per-connection thread model (already established under CLAUDE.md slate row clause 9 — JOINABLE pthread per accepted connection per R114 P2-1).
+  - Signal-mask discipline carries forward from CLAUDE.md stratumd row: SIGINT/SIGTERM/SIGHUP/SIGQUIT blocked on worker threads; main thread is the signal handler.
+  - Per-connection `stm_9p_server` lifecycle stays intact — one fid namespace per connection per 9p.h doctrine.
+  - Mount lifecycle stays at the daemon level (one `stm_fs *` shared across N connections, exactly as today's `/ctl/` thread + FS thread share it).
+  - Same shape for `stm_lp9_server` on the /ctl/ socket.
+  - Test scaffold: N concurrent `libstratum-9p` clients issuing Tread/Twrite/Tgetattr concurrently against the same dataset; correctness + throughput baseline.
+
+- **P9.5-PARALLEL-2: Compound-op race-class audit + fixes** (R94 P2-1 doctrine carry):
+  - CLAUDE.md stratumd row already calls this out: *"concurrent serving against one `stm_fs *` is the regime under which R94 P2-1 (h_reflink stat-after-mutation) and the same-shape patterns at h_lcreate / h_mkdir / h_renameat become observable. Reviewer of any concurrent-accept upgrade MUST address that whole stat-after-mutation class."*
+  - Audit every 9P handler in `v2/src/9p/server.c` (h_lcreate, h_mkdir, h_renameat, h_reflink, h_lcreate-style at /ctl/'s synfs, ...) for the shape `stm_fs_X() THEN stm_fs_getattr()` — the inter-call window is racy under concurrent accept.
+  - Three remediation patterns:
+    1. **Hoist into stm_fs**: add `stm_fs_X_with_stat(...)` that returns the post-mutation stat atomically under the same internal lock. Preferred where the API surface stays clean.
+    2. **Local handler lock**: take the inode's per-inode lock (lands as part of P9.5-PARALLEL-3) across the compound at the 9P-handler layer.
+    3. **Snapshot at mutation time**: have `stm_fs_X` return the post-mutation values via out-params so no second call is needed.
+  - Land regression tests that fire the race under concurrent-accept stress before R128a closes.
+
+- **P9.5-PARALLEL-3: `fs->lock` granularity**:
+  - Today `fs->lock` is a single `pthread_mutex_t` (fs.c:85) that coordinates compound POSIX ops at the public API level. Below it, the Bε-tree is lock-free + MVCC + EBR.
+  - Split `fs->lock` into per-inode locks (or finer — e.g., per-(dataset, inode) for cross-dataset operations). Compound POSIX ops on different inodes no longer serialize; only ops that genuinely touch the same inode do.
+  - Lock ordering discipline: when a compound op touches two inodes (rename, link, exchange), establish a deterministic order (sorted by `(dataset_id, ino)`) to avoid deadlock.
+  - The fs.c writeback path already takes `dbuf->mu` per-bucket (256 buckets) — that pattern extends naturally. Lock-order doctrine (`fs->lock` outer → `dbuf->mu` middle → `sync->lock` inner) reorganizes to: per-inode lock → `dbuf->mu` → `sync->lock`.
+  - Read paths benefit immediately — `stm_fs_lookup` / `stm_fs_read` / `stm_fs_getattr` on different inodes parallelize end-to-end.
+  - Sync-vs-write coordination stays at the `sync->lock` layer (already finer-grained than fs->lock).
+  - Likely involves extending or adding a TLA+ spec — `fs.tla`? — to pin compound-op atomicity under split locks. Spec-first policy applies.
+
+- **P9.5-POLISH-1: Stratum 9P extensions for missing-POSIX surfaces**:
+  - Linux's `v9fs` driver doesn't carry every POSIX feature over 9P2000.L wire — `F_SEAL_*` is the obvious gap (stratum honors seals against direct callers; via v9fs, seals are not surfaced through `fcntl`). `O_TMPFILE` round-trip may also leak depending on v9fs version.
+  - Audit which POSIX features land cleanly through v9fs and which need a 9P extension verb. P9-9P-3 already scaffolded the Stratum extension verb mechanism — extend it.
+  - Stretch: add a small kernel-side helper (or document the userspace bridge) so `fcntl(F_ADD_SEALS)` against a stratum mount round-trips correctly. May defer to a v2.1 chunk if the bridge is invasive.
+
+- **P9.5-POLISH-2: kernel-9P-mount integration tests**:
+  - CI job that boots a Linux VM, mounts stratumd via `mount -t 9p`, runs a defined workload (file create / read / write / xattr / chmod / hardlink / readdir).
+  - Stretch: xfstests actual run against a stratum mount. CLAUDE.md Phase 8 already noted "the xfstests prep closed but no one's pointed an xfstests instance at a stratum mount yet" — this chunk closes that.
+
+- **P9.5-POLISH-3: Performance baseline**:
+  - Measure: single-client throughput (read + write + metadata-ops/sec), multi-client throughput (concurrent read scaling, write scaling, mixed workload), latency p50/p99/p99.9, vs ext4 + btrfs + ZFS on the same hardware.
+  - Document in `docs/BENCHMARKS-v9.5.md` (or fold into Phase 10's `docs/BENCHMARKS.md`).
+  - Workloads: kernel tarball unpack + build (the practical canary), fio random-read + random-write, dbench, mailbench.
+
+- **TLA+**: spec extension for split-lock compound-op atomicity (likely a new `fs.tla` or extension to `concurrency.tla`). Buggy configs that enumerate the failure modes of (a) lock-order violation between two inodes, (b) missed-wakeup under lock split, (c) compound-op torn visibility under reader entering between sub-steps.
+
+- **Audit**: R128 audit closes the SWISS-4q-flush series + TUI worker commits (already pending from the prior session). Phase 9.5 spawns its own audit round per chunk: R-P9.5-1, R-P9.5-2, R-P9.5-3 cover PARALLEL-1, 2, 3 respectively, with the compound-op race-class being the highest-stakes round of the phase.
+
+### 13.2 Exit criteria
+
+- [ ] Two `libstratum-9p` clients reading two different files run truly in parallel — verified by perf benchmark showing aggregate read throughput on N clients ≥ (0.85 × N × single-client throughput), bounded by physical core count and protocol overhead, **NOT** by `fs->lock` contention.
+- [ ] R94 P2-1-class audit closes with zero P0/P1/P2 findings. Every compound-op handler with `stm_fs_X() THEN stm_fs_getattr()` shape either hoists into stm_fs OR takes a per-inode lock across the compound. Regression test under concurrent-accept stress is part of CI.
+- [ ] `fs->lock` granularity audit: every public `stm_fs_*` op documents whether it takes a per-inode lock (and which one(s) in what order) or none. Cross-inode compounds use sorted lock acquisition.
+- [ ] Linux v9fs mount works for: file create / read / write / unlink / rename / hardlink / symlink / readdir / mkdir / rmdir / xattr / chmod / chown / truncate / fallocate / fsync.
+- [ ] kernel-9P-mount integration test runs in CI and passes deterministically.
+- [ ] xfstests subset (file/dir/xattr/ACL portion) green on a v9fs-mounted stratum filesystem.
+- [ ] `F_SEAL_*` round-trips correctly via Stratum 9P extension or documented bridge. (Or: explicit decision-recorded carve-out that seals are direct-API-only and won't ride 9P.)
+- [ ] Performance baseline document committed; numbers compared against ext4 + btrfs + ZFS on the same hardware. Targets per VISION §4 (p50/p99/p99.9 budgets).
+- [ ] Updated CLAUDE.md trigger rows: stratumd row reflects concurrent-accept doctrine; fs.c row reflects per-inode lock granularity.
+
+### 13.3 Risks
+
+- **Medium-high**: compound-op race class is genuinely subtle. Audit posture is critical here — most race-class bugs are not caught by tests. Spec-first work on split-lock atomicity is the right hedge.
+- **Medium**: per-inode lock granularity touches every `stm_fs_*` op. Methodical chunk-by-chunk migration (start with read paths, then single-inode writes, then compound ops with lock-ordering) keeps the blast radius small.
+- **Low**: stratumd concurrent-accept itself is mechanical. Signal-mask + lifecycle discipline are already established at the slate daemon (CLAUDE.md slate row clause 9); apply the same pattern.
+- **Low-medium**: 9P extension verbs for `F_SEAL_*` may require a kernel-side patch to v9fs OR a userspace bridge daemon. Forward-noted; not a blocker for the rest of the phase.
+
+### 13.4 Dependencies
+
+- **Phase 2 complete** ✅ (lock-free Bε-tree + MVCC + EBR).
+- **Phase 8 complete** ✅ (POSIX surface — the thing being concurrent).
+- **Phase 9 substantively complete**: SLATE shipped through P9-SLATE-6 + SWISS-4q stability series + writeback aggregation. SLATE-7 (admin views) is the natural pre-9.5 close-out chunk.
+- TLA+ environment.
+
+### 13.5 Parallel opportunities
+
+- PARALLEL-1 (stratumd accept loop) and POLISH-1 (Stratum 9P extensions) are independent — different layers.
+- PARALLEL-2 (compound-op audit) and PARALLEL-3 (fs->lock granularity) are sequenced: the audit informs which compound ops are highest-risk, and the granularity chunk provides the lock infrastructure the audit's fixes need. Don't parallelize.
+- POLISH-2 (kernel-9P integration tests) and POLISH-3 (performance baseline) can run alongside the audit work — they don't gate on it.
+
+### 13.6 Phase 9.5 carry-over candidates
+
+- **MVCC reader path through stm_fs**: Phase 9.5 splits `fs->lock` per-inode but readers still take a lock per op. The fully lock-free read path — readers entering via `epoch_enter`, pinning a snapshot, no lock taken at all — is mission item #4's final form. May land as part of P9.5-PARALLEL-3 if the impl shapes naturally, or as a follow-on chunk in Phase 10 (Hardening's performance-tuning slice).
+- **9P async pipelining** in libstratum-9p (P9-LIB-2 was forward-noted at P9-LIB-1 close): synchronous one-op-at-a-time per connection is fine for single-client kernel mounts but limits multi-client throughput on a single connection. Forward-noted as a v2.1 candidate unless the perf baseline forces it earlier.
+
+---
+
+## 14. Phase 10: Hardening
 
 (was Phase 9 in the prior 10-phase numbering)
 
 **Scope**: fuzzer expansion, audit passes, benchmarks, documentation, pre-release polish.
 
-### 13.1 Deliverables
+### 14.1 Deliverables
 
 - **Fuzzer expansion**:
   - Extended crash-injection fuzzer.
@@ -914,7 +1014,7 @@ ARCHITECTURE §11 specifies the on-disk shape; this phase implements it. Phase 7
   - Fix p99.9 outliers.
   - Optimize hot paths identified by profiling.
 
-### 13.2 Exit criteria
+### 14.2 Exit criteria
 
 - [ ] Fuzzers run for 1,000+ CPU-hours without finding new correctness bugs.
 - [ ] All audit rounds converge with zero P0/P1/P2 findings.
@@ -922,30 +1022,30 @@ ARCHITECTURE §11 specifies the on-disk shape; this phase implements it. Phase 7
 - [ ] Throughput targets met.
 - [ ] Documentation reviewed end-to-end.
 
-### 13.3 Risks
+### 14.3 Risks
 
 - Low by design — this phase is about confidence, not features.
 
-### 13.4 Dependencies
+### 14.4 Dependencies
 
 - All prior phases complete.
 
 ---
 
-## 14. Phase 11: v2.0 release
+## 15. Phase 11: v2.0 release
 
 (was Phase 10 in the prior numbering)
 
 **Scope**: final audit, format freeze, tag, announce.
 
-### 14.1 Deliverables
+### 15.1 Deliverables
 
 - **Final audit**: comprehensive pass across every audit-trigger surface, with findings < P2.
 - **Format freeze**: tag the on-disk format as "v2.0 stable." No further changes to field layouts without feature flags.
 - **Release artifacts**: binaries (stratum, stratum-fuse, stratum-keyagent, stratum-cli), debug packages, source tarball.
 - **Announcement**: blog post, release notes, benchmark summary.
 
-### 14.2 Exit criteria
+### 15.2 Exit criteria
 
 - [ ] Stratum v2.0 tagged in git.
 - [ ] Binaries reproducibly built.
@@ -954,9 +1054,9 @@ ARCHITECTURE §11 specifies the on-disk shape; this phase implements it. Phase 7
 
 ---
 
-## 15. Post-v2.0 roadmap
+## 16. Post-v2.0 roadmap
 
-### 15.1 v2.1 candidates (6–12 months post-v2.0)
+### 16.1 v2.1 candidates (6–12 months post-v2.0)
 
 - **Reed-Solomon erasure coding** (Phase 5 §8.6 deferral):
   ships as a new `stm_redundancy_profile` variant alongside
@@ -973,7 +1073,7 @@ ARCHITECTURE §11 specifies the on-disk shape; this phase implements it. Phase 7
 - **Zero-copy receive** (`MSG_ZEROCOPY`, AF_XDP): true zero-copy write path.
 - **Wavelet-tree succinct refinement**: target 5 MiB/TiB allocator RAM (from 25 MiB/TiB at v2.0).
 
-### 15.2 v2.2+ candidates (12–24+ months)
+### 16.2 v2.2+ candidates (12–24+ months)
 
 - **LRC (Local Reconstruction Codes)** (Phase 5 §8.6 deferral):
   layered on top of v2.1 RS. Decode-locality optimization for
@@ -986,7 +1086,7 @@ ARCHITECTURE §11 specifies the on-disk shape; this phase implements it. Phase 7
 - **Coq / Lean verification** of specific subsystems (allocator data structures).
 - **NFSv4 ACLs** (alternative to POSIX ACLs).
 
-### 15.3 Ruled out
+### 16.3 Ruled out
 
 Per VISION §6 non-goals:
 
@@ -999,9 +1099,9 @@ Per VISION §6 non-goals:
 
 ---
 
-## 16. Cross-phase concerns
+## 17. Cross-phase concerns
 
-### 16.1 Git workflow
+### 17.1 Git workflow
 
 - Main branch: `main`, always passes CI.
 - Feature branches: `phase-N-<feature>`.
@@ -1009,13 +1109,13 @@ Per VISION §6 non-goals:
 - CI required: all tests pass, ASAN/TSAN/UBSAN clean, linter clean.
 - Audit-triggered PRs require additional approval from the audit subagent.
 
-### 16.2 Versioning during development
+### 17.2 Versioning during development
 
 - `main` HEAD: "v2.0-dev".
 - Phase exits tagged: `phase-N-complete`.
 - No API stability promise until v2.0 release.
 
-### 16.3 Telemetry / feedback
+### 17.3 Telemetry / feedback
 
 During the development phases, internal deployments generate telemetry that guides tuning:
 
@@ -1023,7 +1123,7 @@ During the development phases, internal deployments generate telemetry that guid
 - Collect performance + reliability metrics via `/ctl/`.
 - Feed back into fuzzer corpus + benchmark baselines.
 
-### 16.4 Contributor onboarding
+### 17.4 Contributor onboarding
 
 Expected team size: 3–5 core contributors at v2.0 trajectory. Each phase has a "driver" who owns it; reviewers rotate.
 
@@ -1035,7 +1135,7 @@ Expected team size: 3–5 core contributors at v2.0 trajectory. Each phase has a
 
 ---
 
-## 17. Risk register
+## 18. Risk register
 
 A consolidated view of risks across phases, ordered by severity.
 
@@ -1058,7 +1158,7 @@ HIGH-risk items dominate: everything else is bounded by the "fallback is defined
 
 ---
 
-## 18. Timeline
+## 19. Timeline
 
 Estimates are guidance, not commitments. Each phase's duration assumes full-time engineering on the driver role + reasonable reviewer availability.
 
@@ -1088,7 +1188,7 @@ Our 28-month target assumes: we're starting from a solid v1 foundation + formal 
 
 ---
 
-## 19. Summary
+## 20. Summary
 
 Stratum v2 is an 11-phase implementation journey from "design complete" to "v2.0 released":
 

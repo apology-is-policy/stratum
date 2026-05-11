@@ -17,6 +17,8 @@
 #include <stratum/ctl.h>
 #include <stratum/fs.h>
 #include <stratum/lp9.h>
+#include <stratum/scrub.h>
+#include <stratum/sync.h>
 #include <stratum/types.h>
 
 #include <errno.h>
@@ -735,6 +737,7 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
      *   4. Spawn /ctl/ accept loop on a worker pthread.
      * Any failure tears down in reverse. */
     stm_ctl       *ctl       = NULL;
+    stm_scrub     *scrub     = NULL;
     int            ctl_fd    = -1;
     pthread_t      ctl_tid   = 0;
     bool           ctl_started = false;
@@ -757,6 +760,68 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
          * non-root operator. */
         (void)stm_ctl_set_admin_uid(ctl, (uid_t)geteuid());
 
+        /* S5-PRE-A: attach pool + scrub so /ctl/pools/<uuid>/ becomes
+         * non-empty (devices/, scrub, metrics). The pool pointer is
+         * borrowed from the fs (same lifetime); the scrub is owned by
+         * stratumd here — created via stm_scrub_create(fs's sync) and
+         * closed AFTER stm_ctl_destroy at shutdown (scrub.h
+         * "Borrowed references" + ctl.h R26 P3-4 ordering: servers →
+         * ctl → scrub → sync).
+         *
+         * R97 P2-2 timing rule: both attach calls MUST happen BEFORE
+         * the worker thread starts serving (i.e., before
+         * pthread_create below). The internal pool / scrub pointers
+         * on stm_ctl are read by vops without c->mu and depend on
+         * happens-before from the pthread_create barrier.
+         *
+         * The verify cb install hooks the scrub up to the production
+         * AEAD verify path against stm_sync; without it, scrub-trigger
+         * /pools/<uuid>/scrub-trigger would run scrub but blocks would
+         * have no verify path. */
+        rc = stm_ctl_attach_pool(ctl, stm_fs_pool(fs));
+        if (rc != STM_OK) {
+            fprintf(stderr,
+                "stratumd: stm_ctl_attach_pool failed (rc=%d)\n", (int)rc);
+            stm_ctl_destroy(ctl);
+            close(listen_fd);
+            (void)unlink(opts->socket_path);
+            (void)stm_fs_unmount(fs);
+            return rc;
+        }
+        rc = stm_scrub_create(stm_fs_sync(fs), &scrub);
+        if (rc != STM_OK) {
+            fprintf(stderr,
+                "stratumd: stm_scrub_create failed (rc=%d)\n", (int)rc);
+            stm_ctl_destroy(ctl);
+            close(listen_fd);
+            (void)unlink(opts->socket_path);
+            (void)stm_fs_unmount(fs);
+            return rc;
+        }
+        rc = stm_sync_scrub_install_production_cb(stm_fs_sync(fs), scrub);
+        if (rc != STM_OK) {
+            fprintf(stderr,
+                "stratumd: stm_sync_scrub_install_production_cb failed (rc=%d)\n",
+                (int)rc);
+            stm_scrub_close(scrub);
+            stm_ctl_destroy(ctl);
+            close(listen_fd);
+            (void)unlink(opts->socket_path);
+            (void)stm_fs_unmount(fs);
+            return rc;
+        }
+        rc = stm_ctl_attach_scrub(ctl, scrub);
+        if (rc != STM_OK) {
+            fprintf(stderr,
+                "stratumd: stm_ctl_attach_scrub failed (rc=%d)\n", (int)rc);
+            stm_scrub_close(scrub);
+            stm_ctl_destroy(ctl);
+            close(listen_fd);
+            (void)unlink(opts->socket_path);
+            (void)stm_fs_unmount(fs);
+            return rc;
+        }
+
         ctl_fd = stm_stratumd_listen_unix(opts->ctl_socket_path,
                                               backlog, mode);
         if (ctl_fd < 0) {
@@ -764,6 +829,7 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
                 "stratumd: listen on %s (/ctl/) failed: %s\n",
                 opts->ctl_socket_path, strerror(-ctl_fd));
             stm_ctl_destroy(ctl);
+            stm_scrub_close(scrub);
             close(listen_fd);
             (void)unlink(opts->socket_path);
             (void)stm_fs_unmount(fs);
@@ -809,6 +875,7 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
             close(ctl_fd);
             (void)unlink(opts->ctl_socket_path);
             stm_ctl_destroy(ctl);
+            stm_scrub_close(scrub);
             close(listen_fd);
             (void)unlink(opts->socket_path);
             (void)stm_fs_unmount(fs);
@@ -837,8 +904,11 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
     /* Clean shutdown — close listen fds, unlink socket files,
      * destroy stm_ctl (MUST happen AFTER /ctl/ worker join — the
      * worker uses ctl as ctx; tearing down before join is a use-
-     * after-free per CLAUDE.md /ctl/ trigger row R96 P2-1), then
-     * unmount the fs. */
+     * after-free per CLAUDE.md /ctl/ trigger row R96 P2-1), close
+     * scrub (S5-PRE-A: scrub borrows sync, so close it AFTER ctl
+     * (which references scrub) and BEFORE fs_unmount which closes
+     * sync — per scrub.h "Borrowed references" + ctl.h R26 P3-4
+     * ordering: servers → ctl → scrub → sync), then unmount the fs. */
     close(listen_fd);
     (void)unlink(opts->socket_path);
     if (ctl_fd >= 0) {
@@ -846,6 +916,7 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
         (void)unlink(opts->ctl_socket_path);
     }
     if (ctl) stm_ctl_destroy(ctl);
+    if (scrub) stm_scrub_close(scrub);
     stm_status urc = stm_fs_unmount(fs);
     if (rc == STM_OK) rc = urc;
     return rc;
