@@ -471,6 +471,34 @@ fn copy_500kb_file() {
 }
 
 #[test]
+fn space_reclaim_across_write_rm_cycles() {
+    // SWISS-4q P2 regression: pre-fix, unlink only mutated the
+    // inode index — extent paddrs leaked. After one full-pool
+    // write + rm cycle, the second write hit ENOSPC because the
+    // allocator never saw the freed blocks. User-reported 2026-
+    // 05-11: "copy 1.8 GB video to 3 GB stm volume, rm, repeat,
+    // ENOSPC after one cycle".
+    //
+    // The fix: fs_unlink_inode_and_dirent now calls stm_sync_
+    // truncate(ino, 0) before stm_inode_unlink to drop the
+    // extents AND double-commits at the end so the allocator's
+    // PENDING sweep predicate (`free_gen < committed_gen`)
+    // reclaims the freed blocks before the next mutator.
+    let s = session();
+    let body = vec![0xCDu8; 30 * 1024 * 1024]; // 30 MB
+    for cycle in 1u32..=5 {
+        s.fs_write_bytes(&s.stratumd_sock, "/file", &body)
+            .unwrap_or_else(|e| panic!("cycle {cycle} write: {e}"));
+        s.fs_rm(&s.stratumd_sock, "/file")
+            .unwrap_or_else(|e| panic!("cycle {cycle} rm: {e}"));
+    }
+    // Volume should still accept a fresh write after 5 cycles.
+    s.fs_write_bytes(&s.stratumd_sock, "/final.bin", &body).unwrap();
+    let read = s.fs_read(&s.stratumd_sock, "/final.bin").unwrap();
+    assert_eq!(read.len(), body.len());
+}
+
+#[test]
 fn write_unaligned_tail_4623_bytes() {
     // SWISS-4q P1 regression: real video files (and most real
     // workloads) have a logical size that isn't a multiple of

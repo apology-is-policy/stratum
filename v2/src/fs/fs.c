@@ -54,6 +54,7 @@
 #include <time.h>                /* clock_gettime / CLOCK_REALTIME */
 
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -1598,6 +1599,44 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
         (void)stm_dirent_drop_for_dir(didx, dataset_id, child_ino, NULL);
     }
 
+    /* SWISS-4q P2: drop the inode's extents BEFORE the inode-unlink
+     * cascade-frees the inode. stm_inode_unlink only mutates the
+     * inode-index record (nlink-- + transition to FREED at nlink=0);
+     * it does NOT walk the extent index. Without this drop, every
+     * extent record + every paddr the inode owned LEAKS — the
+     * allocator never reclaims the blocks, and the volume hits
+     * ENOSPC after one cycle of "write 1.8 GB / rm" on a 3 GB
+     * pool (user-reported 2026-05-10).
+     *
+     * Conditions for the drop:
+     *   1. Regular file (S_IFREG) — dirs hold no extent data;
+     *      symlinks store the target inline; devices have no data.
+     *   2. EXTENT data_kind — INLINE data lives inside the inode
+     *      record itself and is freed when the inode transitions
+     *      to FREED.
+     *   3. nlink == 1 — this is the LAST link. With future hard
+     *      links (nlink > 1), unlinking one dirent leaves the
+     *      others reachable; we must NOT drop extents until the
+     *      last link goes away.
+     *
+     * stm_sync_truncate(ds, ino, 0) is the right primitive: it
+     * walks the extent index for (ds, ino) and routes every paddr
+     * through sync_drop_paddr_locked → allocator's free path. The
+     * call is best-effort — a failure here leaves leaked extents
+     * (worse: the inode also gets freed by the unlink below, so
+     * the leak is permanent until offline scrub) but doesn't break
+     * the unlink itself. Returns STM_OK on a fresh-inode no-extent
+     * case (nothing to drop). */
+    {
+        bool is_reg = ((cmode & (uint32_t)S_IFMT) == (uint32_t)S_IFREG);
+        bool is_extent = (cv.si_data_kind == STM_DATA_EXTENT);
+        uint32_t cur_nlink = stm_load_le32(cv.si_nlink);
+        if (is_reg && is_extent && cur_nlink == 1u) {
+            (void)stm_sync_truncate(fs->sync, dataset_id, child_ino,
+                                         /*new_size=*/0u);
+        }
+    }
+
     /* P8-POSIX-3: nlink-aware unlink. Decrement nlink; cascade-free
      * triggers atomically when nlink reaches 0. For the MVP-single-
      * link case (no hard links yet, every alloc has nlink=1) this
@@ -1618,6 +1657,35 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
             fs_stamp_ctime_now(&cv2);
             (void)stm_inode_set(iidx, dataset_id, child_ino, &cv2);
         }
+    }
+
+    /* SWISS-4q P2 reclaim trigger: when we just freed an inode AND
+     * dropped its extents (the truncate-to-0 above), the allocator
+     * now holds PENDING entries with free_gen=current_gen. The
+     * allocator's sweep predicate is `free_gen < committed_gen`
+     * (sync.c:2412); a single commit at target_gen=current_gen
+     * persists the PENDING entries but does NOT reclaim them — the
+     * sweep skips because free_gen == committed_gen (strict less-
+     * than). The NEXT commit at committed_gen+2 catches them.
+     *
+     * Without this double-commit, blocks freed via unlink remain
+     * PENDING for the rest of the stratumd session; the next
+     * allocation hits ENOSPC even though the volume "looks empty"
+     * to the user. User-reported 2026-05-10: "copy 1.8 GB to stm,
+     * delete, repeat → ENOSPC after one cycle."
+     *
+     * The double commit is wired here (NOT in stm_fs_commit) so
+     * the public commit semantics (gen advance by 2 per call)
+     * remain unchanged for tests that pin it. The unlink path is
+     * the only mutator that drops extents AND assumes they're
+     * immediately reusable.
+     *
+     * Cost: each unlink-of-regular-file takes ~2× longer for the
+     * Tfsync that comes from auto-fsync. Acceptable; without this
+     * the volume is unusable past one cycle. */
+    if (freed) {
+        (void)stm_sync_commit(fs->sync);
+        (void)stm_sync_commit(fs->sync);
     }
 
     pthread_mutex_unlock(&fs->lock);

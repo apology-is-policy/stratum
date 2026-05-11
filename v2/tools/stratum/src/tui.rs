@@ -313,6 +313,16 @@ fn run_ui(
     // can type "ph" then "o" and have the cursor land on "photo.jpg".
     let mut search = SearchState::new();
     let result = (|| -> Result<()> {
+        // SWISS-4q P2: skip the first advance of a freshly-started
+        // batch so the loop draws the progress dialog BEFORE the
+        // synchronous perform_copy_one blocks the loop. Pre-fix the
+        // user saw the screen freeze with no feedback during a
+        // multi-GB copy, then a brief flash of the summary; now they
+        // see the dialog throughout the freeze. Forward-noted SWISS-
+        // 4q-bytes for true per-byte progress (needs chunked sub-
+        // process OR worker thread).
+        let mut copy_batch_pre_draw = copy_batch.is_some();
+        let mut delete_batch_pre_draw = delete_batch.is_some();
         loop {
             // SWISS-4h: advance batch ops one step per iteration when
             // no dialog is up. Conflict (CopyBatch) opens a dialog
@@ -320,7 +330,11 @@ fn run_ui(
             // iteration resumes.
             if local_dialog.is_none() && editor.is_none() {
                 if let Some(ref mut batch) = copy_batch {
-                    if let Some(action) = advance_copy_batch(
+                    // SWISS-4q P2: yield one draw cycle on
+                    // newly-started batches before blocking.
+                    if !copy_batch_pre_draw {
+                        copy_batch_pre_draw = true;
+                    } else if let Some(action) = advance_copy_batch(
                         client, &mut local_dialog, spawn.as_ref(), batch,
                     )? {
                         if matches!(action, BatchTick::Done) {
@@ -351,7 +365,9 @@ fn run_ui(
                     }
                 }
                 if let Some(ref mut batch) = delete_batch {
-                    if let Some(action) = advance_delete_batch(
+                    if !delete_batch_pre_draw {
+                        delete_batch_pre_draw = true;
+                    } else if let Some(action) = advance_delete_batch(
                         spawn.as_ref(), batch,
                     )? {
                         if matches!(action, BatchTick::Done) {
