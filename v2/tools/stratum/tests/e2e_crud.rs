@@ -672,6 +672,74 @@ fn many_concurrent_clients_against_one_daemon() {
     assert_eq!(entries.len(), 60, "60 files from 6×10 concurrent clients");
 }
 
+// ── Writeback amplification regression (user-reported small→2.8 GB) ──
+
+#[test]
+fn writeback_partial_drain_does_not_amplify_disk_usage() {
+    // User-reported 2026-05-11 (post-c60b9e9 writeback activation):
+    // copying a small file to a near-full volume cycled, blowing it
+    // up to fill the entire 3 GB volume. Root cause: drain_ino on
+    // partial cb failure left ALL ranges in the buffer; subsequent
+    // commits re-emitted the already-written ranges as duplicate
+    // extents, each iteration amplifying space usage.
+    //
+    // Repro shape:
+    //   - 64 MB volume.
+    //   - Write many sub-MiB files; most should succeed; eventually
+    //     ENOSPC at the extent layer.
+    //   - The number of successful files should be BOUNDED by the
+    //     volume size / per-file size + reasonable metadata overhead,
+    //     NOT magnified by the bug.
+    //   - After rm-ing the successful files, fresh writes succeed
+    //     again (allocator reclaims the dropped extents).
+    let s = session();
+    let body = vec![0xABu8; 512 * 1024]; // 512 KB per file (sub-1 MiB → buffered)
+    let mut ok_names: Vec<String> = Vec::new();
+    let mut last_err: Option<String> = None;
+    // 64 MB / 512 KB = 128 files in the perfect case; bail at 200 to bound.
+    for i in 0..200 {
+        let name = format!("/f{:03}", i);
+        match s.fs_write_bytes(&s.stratumd_sock, &name, &body) {
+            Ok(_) => ok_names.push(name),
+            Err(e) => {
+                last_err = Some(e.to_string());
+                break;
+            }
+        }
+    }
+    // Sanity: some writes succeeded.
+    assert!(
+        ok_names.len() > 0,
+        "expected at least some writes to succeed before ENOSPC; last_err={last_err:?}"
+    );
+    // We should hit ENOSPC before exhausting our 200-file budget — the
+    // 64 MB volume can't hold that much.
+    assert!(
+        ok_names.len() < 200,
+        "expected to hit ENOSPC at some point within 200 small files"
+    );
+    // Pre-fix: with amplification, ok_names.len() could be tiny (each
+    // "success" wrote N extents on disk). Post-fix: each ~512 KB write
+    // → ~1 extent → ~128 writes fit. Allow 50% slack for metadata.
+    assert!(
+        ok_names.len() >= 60,
+        "writeback amplification suspected: only {} writes succeeded \
+         to a 64 MB volume (expected ≥ 60). \
+         last_err={last_err:?}",
+        ok_names.len()
+    );
+    // Recovery: rm everything we wrote, fresh write should succeed.
+    for n in &ok_names {
+        s.fs_rm(&s.stratumd_sock, n).unwrap_or_else(|e| {
+            panic!("rm {n} after fill: {e}");
+        });
+    }
+    s.fs_write_bytes(&s.stratumd_sock, "/recovery.bin", &body)
+        .expect("post-rm fresh write should succeed");
+    let read = s.fs_read(&s.stratumd_sock, "/recovery.bin").unwrap();
+    assert_eq!(read.len(), body.len(), "recovery write size mismatch");
+}
+
 // ── Slate connection layer (panel state) ────────────────────────────
 
 mod slate_state {

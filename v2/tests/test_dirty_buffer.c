@@ -249,15 +249,20 @@ STM_TEST(dbuf_drain_ino_full_drain_clears_buffer)
     stm_dirty_buffer_destroy(b);
 }
 
-STM_TEST(dbuf_drain_ino_callback_failure_leaves_buffer_intact)
+STM_TEST(dbuf_drain_ino_pops_succeeded_keeps_failed)
 {
-    /* writeback.tla::Flush is all-or-nothing: on cb failure, the buffer
-     * is LEFT INTACT so caller can retry. */
+    /* SWISS-4q-flush bug-fix (post-c60b9e9): on callback failure
+     * mid-drain, the SUCCEEDED ranges are popped from the buffer
+     * (they're now on disk as extents) but the FAILED + UN-TRIED
+     * ranges remain. Without this, the next drain attempt would
+     * re-emit the succeeded ranges → duplicate extents → space
+     * amplification (the user-reported "small file cycled to fill
+     * the volume" symptom). */
     stm_dirty_buffer *b = NULL;
     STM_ASSERT_OK(stm_dirty_buffer_create(INO_CAP_8MIB, GLOBAL_CAP_64M, &b));
 
     uint8_t pad[10] = {1};
-    STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 5, 0, 10, pad));
+    STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 5,  0, 10, pad));
     STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 5, 20, 10, pad));
     STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 5, 40, 10, pad));
 
@@ -266,11 +271,54 @@ STM_TEST(dbuf_drain_ino_callback_failure_leaves_buffer_intact)
     stm_status rc = stm_dirty_buffer_drain_ino(b, 1, 5,
                                                   drain_record_cb, &rec);
     STM_ASSERT_EQ((int)rc, (int)STM_EIO);
-    STM_ASSERT_EQ(rec.count, 1);   /* 1st callback recorded before 2nd failed */
+    STM_ASSERT_EQ(rec.count, 1);   /* 1st callback recorded; 2nd failed */
 
-    /* Per-inode buffer is INTACT (all 3 ranges still there). */
-    STM_ASSERT_EQ(stm_dirty_buffer_inode_bytes(b, 1, 5), (size_t)30);
+    /* Buffer keeps only the FAILED + UN-TRIED ranges: 2nd [20, 30)
+     * and 3rd [40, 50). The 1st [0, 10) was POPPED. */
+    STM_ASSERT_EQ(stm_dirty_buffer_inode_bytes(b, 1, 5), (size_t)20);
     STM_ASSERT_TRUE(stm_dirty_buffer_has_ino(b, 1, 5));
+
+    stm_dirty_buffer_destroy(b);
+}
+
+STM_TEST(dbuf_drain_retry_does_not_double_emit)
+{
+    /* Regression for the user-reported "small file cycled to 2.8 GB"
+     * symptom. Insert N ranges. First drain succeeds on K, fails on
+     * K+1. Retry drain. Total cb invocations across both attempts
+     * should be N (or N+1 if K+1 fails again then succeeds on retry),
+     * NOT 2*K. Pre-fix this test would observe K + N invocations
+     * (the K succeeded ranges get re-emitted on retry → 2K + (N-K)). */
+    stm_dirty_buffer *b = NULL;
+    STM_ASSERT_OK(stm_dirty_buffer_create(INO_CAP_8MIB, GLOBAL_CAP_64M, &b));
+
+    uint8_t pad[10] = {1};
+    STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 5,  0, 10, pad));
+    STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 5, 20, 10, pad));
+    STM_ASSERT_OK(stm_dirty_buffer_insert(b, 1, 5, 40, 10, pad));
+
+    /* First drain: callback fails on 2nd call. 1st pops, 2nd stays. */
+    drain_recorder rec1 = {0};
+    rec1.fail_at = 2;
+    STM_ASSERT_EQ((int)stm_dirty_buffer_drain_ino(b, 1, 5,
+                                                     drain_record_cb, &rec1),
+                    (int)STM_EIO);
+    STM_ASSERT_EQ(rec1.count, 1);
+    STM_ASSERT_EQ((unsigned long long)rec1.off[0], 0ull);
+
+    /* Retry with success-always callback. Should emit ONLY the
+     * remaining 2 ranges [20, 30) and [40, 50). The 1st range
+     * [0, 10) was already popped → MUST NOT be re-emitted. */
+    drain_recorder rec2 = {0};
+    STM_ASSERT_OK(stm_dirty_buffer_drain_ino(b, 1, 5,
+                                                drain_record_cb, &rec2));
+    STM_ASSERT_EQ(rec2.count, 2);
+    STM_ASSERT_EQ((unsigned long long)rec2.off[0], 20ull);
+    STM_ASSERT_EQ((unsigned long long)rec2.off[1], 40ull);
+
+    /* Buffer is now empty. */
+    STM_ASSERT_FALSE(stm_dirty_buffer_has_ino(b, 1, 5));
+    STM_ASSERT_EQ(stm_dirty_buffer_total_bytes(b), (size_t)0);
 
     stm_dirty_buffer_destroy(b);
 }

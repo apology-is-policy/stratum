@@ -360,25 +360,47 @@ stm_status stm_dirty_buffer_drain_ino(stm_dirty_buffer *buf,
         pthread_mutex_unlock(&buf->mu);
         return STM_OK;
     }
-    /* All-or-nothing per writeback.tla::Flush:
-     *   - We walk the list, invoking the callback for each range.
-     *   - On first non-OK return, we STOP and leave the unhandled
-     *     ranges + the already-callback-completed ranges intact in
-     *     the buffer (the spec's "Flush is all-or-nothing per call;
-     *     partial-success caller can re-flush and see the same
-     *     ranges, which extent.tla::Overwrite resolves via last-
-     *     writer-wins).
-     *   - On all-OK, we clear every range and the inode_entry itself. */
+    /* SWISS-4q-flush BUG-FIX (post-c60b9e9): pop-on-success.
+     *
+     * Each successful callback CONSUMES the range from the buffer
+     * IMMEDIATELY. On callback failure (e.g., ENOSPC at the extent
+     * layer), the failed range and all subsequent un-tried ranges
+     * remain in the buffer; the SUCCEEDED-SO-FAR ranges are gone.
+     *
+     * The original "all-or-nothing per writeback.tla::Flush"
+     * semantics kept ALL ranges in the buffer on any failure —
+     * which created a CYCLE: range 1 succeeds → extent written →
+     * but buffer still contains range 1 → next drain re-emits
+     * range 1 → second extent (duplicate). Each retry doubled the
+     * extent count, amplifying user-visible storage usage.
+     *
+     * The spec's Flush models a single atomic state transition;
+     * the impl realizes that transition iteratively across N
+     * range emissions, each of which IS an independent state
+     * transition at the extent layer. Popping on success is the
+     * faithful impl translation. v2 of writeback.tla will split
+     * Flush into a per-range PerRangeFlush action; v1's Flush
+     * covers the all-success case, and the impl's partial-success
+     * is a degenerate prefix of the spec's reachable states. */
     stm_status rc = STM_OK;
-    for (stm_dbuf_range *r = e->head; r; r = r->next) {
-        stm_status crc = cb(user, dataset_id, ino, r->off, r->len, r->data);
+    while (e->head) {
+        stm_dbuf_range *r = e->head;
+        uint64_t r_off = r->off;
+        uint64_t r_len = r->len;
+        stm_status crc = cb(user, dataset_id, ino, r_off, r_len, r->data);
         if (crc != STM_OK) {
             rc = crc;
             break;
         }
+        /* Successful flush — remove this range from the buffer
+         * before the next iteration. */
+        e->head = r->next;
+        e->bytes -= r_len;
+        buf->total_bytes -= r_len;
+        free_range(r);
     }
-    if (rc == STM_OK) {
-        /* Successful full drain — destroy the inode entry. */
+    if (e->head == NULL) {
+        /* Fully drained — destroy entry. */
         destroy_inode_locked(buf, e);
     }
     pthread_mutex_unlock(&buf->mu);
@@ -392,17 +414,27 @@ stm_status stm_dirty_buffer_drain_all(stm_dirty_buffer *buf,
     if (!buf || !cb) return STM_EINVAL;
     pthread_mutex_lock(&buf->mu);
     stm_status first_err = STM_OK;
+    /* Per-inode iteration uses the same pop-on-success semantics as
+     * drain_ino — see the comment block there for the rationale. */
     for (uint32_t b = 0; b < STM_DBUF_BUCKETS; b++) {
         stm_dbuf_inode *e = buf->buckets[b];
         while (e) {
             stm_dbuf_inode *next = e->bucket_next;
             stm_status rc = STM_OK;
-            for (stm_dbuf_range *r = e->head; r; r = r->next) {
+            while (e->head) {
+                stm_dbuf_range *r = e->head;
+                uint64_t r_off = r->off;
+                uint64_t r_len = r->len;
                 stm_status crc = cb(user, e->dataset_id, e->ino,
-                                       r->off, r->len, r->data);
+                                       r_off, r_len, r->data);
                 if (crc != STM_OK) { rc = crc; break; }
+                /* Pop on success. */
+                e->head = r->next;
+                e->bytes -= r_len;
+                buf->total_bytes -= r_len;
+                free_range(r);
             }
-            if (rc == STM_OK) {
+            if (e->head == NULL) {
                 destroy_inode_locked(buf, e);
             } else {
                 if (first_err == STM_OK) first_err = rc;
