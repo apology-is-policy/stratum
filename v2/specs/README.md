@@ -18,6 +18,7 @@ is exercised by TLC in CI.
 | `merge.tla`      | empty-leaf reabsorb   | landed  | P2    | §3.5            |
 | `allocator.tla`  | refcount + deferred-free | landed | P3 | §6.4, §6.7      |
 | `namespace.tla`  | per-conn isolation    | stub    | P8    | §8.8            |
+| `writeback.tla`  | dirty buffer + flush  | landed (v1) | SWISS-4q-flush | (forward-note in ARCH) |
 
 ## Running TLC locally
 
