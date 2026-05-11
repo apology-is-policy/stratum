@@ -401,18 +401,20 @@ pub fn spinner_glyph(elapsed_secs: f64) -> char {
 
 // ── view modes ────────────────────────────────────────────────────────
 
-/// SWISS-5 / SWISS-6: the top-level TUI view. F2 toggles between Files
-/// (the dual-pane file browser) and VolumeMap (the F2 storage overview).
-/// SnapshotGraph is reached by drilling down from VolumeMap via F4; F2
-/// or Esc returns to VolumeMap. The editor is still a separate state,
-/// but it lives in the global `Option<EditorState>` (renders full-screen
-/// when present, regardless of view_mode) — opening / closing the editor
-/// is its own transition.
+/// SWISS-5 / SWISS-6 / SWISS-7: the top-level TUI view. F2 toggles
+/// between Files (the dual-pane file browser) and VolumeMap (the F2
+/// storage overview). From VolumeMap, F4 drills into SnapshotGraph
+/// (lineage view); F5 drills into Integrity (health/scrub/devices
+/// view). F2 or Esc returns to VolumeMap from either drill-down. The
+/// editor is still a separate state, but it lives in the global
+/// `Option<EditorState>` (renders full-screen when present, regardless
+/// of view_mode) — opening / closing the editor is its own transition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ViewMode {
     Files,
     VolumeMap,
     SnapshotGraph,
+    Integrity,
 }
 
 // ── main draw ─────────────────────────────────────────────────────────
@@ -471,6 +473,41 @@ pub fn render(
         // /dialogs/ pop-up driven by a remote actor) could surface
         // a dialog asynchronously; rendering it here makes it
         // visible + dismissible instead of stuck-invisible.
+        if !state.dialog_stack.is_empty() {
+            draw_dialog_overlay(frame, area, state);
+        }
+        if let Some(d) = state.local_dialog.as_ref() {
+            match &d.kind {
+                LocalDialogKind::MkVol(mk) => draw_mkvol_dialog(frame, area, mk),
+                LocalDialogKind::Confirm { options, selected, .. } => {
+                    draw_confirm_dialog(frame, area, &d.prompt, options, *selected);
+                }
+                _ => draw_local_dialog(frame, area, d),
+            }
+        } else if let Some(cp) = copy_progress {
+            draw_copy_progress(frame, area, cp);
+        }
+        return;
+    }
+
+    // SWISS-7: Integrity drill-down from VolumeMap (F5-from-VolumeMap).
+    // Reuses the VolumeMapPoller's state (same /ctl/ surfaces); the
+    // renderer just re-projects it with health emphasis. Same R129
+    // dialog/copy-progress overlay defense as the other drill-downs.
+    if view_mode == ViewMode::Integrity {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(6),     // integrity body
+                Constraint::Length(1),  // F-key bar (regular)
+                Constraint::Length(1),  // Shift+F-key bar
+            ])
+            .split(area);
+        let default_state = VolumeMapState::default();
+        let render_state = volmap.unwrap_or(&default_state);
+        crate::swiss7_view::render(frame, rows[0], render_state);
+        draw_fkey_bar(frame, rows[1]);
+        draw_shift_fkey_bar(frame, rows[2]);
         if !state.dialog_stack.is_empty() {
             draw_dialog_overlay(frame, area, state);
         }

@@ -767,13 +767,14 @@ fn handle_key(
             && copy_batch.is_none()
             && delete_batch.is_none()
         {
-            // SWISS-6: from SnapshotGraph, F2 returns to VolumeMap
-            // (the "back" stop). From Files / VolumeMap, F2 toggles
-            // between the two as before.
+            // SWISS-6/7: from SnapshotGraph or Integrity, F2 returns
+            // to VolumeMap (the "back" stop). From Files / VolumeMap,
+            // F2 toggles between the two as before.
             *view_mode = match *view_mode {
                 ViewMode::Files => ViewMode::VolumeMap,
                 ViewMode::VolumeMap => ViewMode::Files,
                 ViewMode::SnapshotGraph => ViewMode::VolumeMap,
+                ViewMode::Integrity => ViewMode::VolumeMap,
             };
             search.clear();
             *snapgraph_cursor = 0;
@@ -816,17 +817,52 @@ fn handle_key(
         return Ok(Action::Refresh);
     }
 
+    // SWISS-7: F5 from VolumeMap drills into Integrity. Same R129
+    // P2-1 toggle gate as F4: refuses on modal-active so a dialog
+    // can't get stuck invisible. Same allow-list discipline as the
+    // other view-mode drill-downs.
+    if *view_mode == ViewMode::VolumeMap
+        && matches!(key.code, KeyCode::F(5))
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+    {
+        if local_dialog.is_none()
+            && editor.is_none()
+            && copy_batch.is_none()
+            && delete_batch.is_none()
+        {
+            *view_mode = ViewMode::Integrity;
+            search.clear();
+        }
+        return Ok(Action::Refresh);
+    }
+
     // SWISS-5 (R129 P2-2): in VolumeMap view, drop every key that
     // isn't a quit verb (handled above), the F2 toggle (handled
-    // above), or the F4-to-SnapshotGraph drill-down (handled just
-    // above). Without this gate, F-keys (F5/F7/F8/etc.), spacebar,
-    // Tab, Enter, Backspace, and printable chars would all dispatch
-    // to the file-browser handlers and mutate panel state behind
-    // the invisible map. Most dangerously, F8 would open a delete
+    // above), or the F4/F5-to-drill-down (handled just above).
+    // Without this gate, F-keys (F7/F8/etc.), spacebar, Tab, Enter,
+    // Backspace, and printable chars would all dispatch to the
+    // file-browser handlers and mutate panel state behind the
+    // invisible map. Most dangerously, F8 would open a delete
     // confirm dialog that's not rendered (ui::render skips dialog
     // overlay in VolumeMap mode); Enter on that invisible dialog
     // would confirm the delete.
     if *view_mode == ViewMode::VolumeMap {
+        return Ok(Action::Ignore);
+    }
+
+    // SWISS-7: in-Integrity key gate. The Integrity pane is a pure
+    // status display at v1.0 — no cursor, no selection, no writable
+    // verbs. Only F2 / Esc (handled in the F2 block above + below)
+    // and quit verbs (handled at the top) escape. Every other key
+    // drops via Action::Ignore. Future v1.1 verbs (e.g., F8 trigger-
+    // scrub) MUST be added via an explicit allow-list extension —
+    // never via fall-through to file-browser handlers — and MUST
+    // be admin-gated client-side BEFORE issuing the /ctl/ write.
+    if *view_mode == ViewMode::Integrity {
+        if matches!(key.code, KeyCode::Esc) {
+            *view_mode = ViewMode::VolumeMap;
+            return Ok(Action::Refresh);
+        }
         return Ok(Action::Ignore);
     }
 

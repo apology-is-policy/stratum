@@ -35,6 +35,7 @@ mod snapgraph;
 mod spawn;
 mod swiss5_view;
 mod swiss6_view;
+mod swiss7_view;
 mod tui;
 mod ui;
 mod volmap;
