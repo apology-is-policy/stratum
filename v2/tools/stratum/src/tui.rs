@@ -166,6 +166,15 @@ struct CopyBatch {
     /// involved. None when the route is host→host.
     src_sock: Option<PathBuf>,
     dst_sock: Option<PathBuf>,
+    /// SWISS-4r-sel-clear: source panel focus (0=left, 1=right). At
+    /// batch completion the TUI clears /panels/<src_focus>/selection
+    /// so a stale bitset doesn't latch onto unrelated entries at the
+    /// same indices after the next refresh (the file at the old index
+    /// may have changed identity post-delete / post-rename / post-
+    /// remount). Pre-fix the user reported: "deleted the old volume,
+    /// created a new one; the TUI kept the selection indices and the
+    /// next F5 copied different files".
+    src_focus: usize,
     /// Sticky policy from a prior *All pick.
     sticky: Option<ConflictPolicy>,
     /// Counters for the post-batch summary toast.
@@ -198,6 +207,8 @@ struct DeleteBatch {
     idx: usize,
     deleted: usize,
     failed: usize,
+    /// SWISS-4r-sel-clear: source panel focus (see CopyBatch doc).
+    src_focus: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -360,6 +371,13 @@ fn run_ui(
                                 error_dialog(&summary)
                             };
                             local_dialog = Some(dlg);
+                            // SWISS-4r-sel-clear: drop source-panel
+                            // selection before the next refresh so
+                            // stale indices can't grab unrelated
+                            // entries (user-reported 2026-05-11:
+                            // post-delete + remount, a kept bitset
+                            // copied the wrong files).
+                            clear_panel_selection(client, batch.src_focus);
                             copy_batch = None;
                         }
                     }
@@ -381,6 +399,9 @@ fn run_ui(
                                 error_dialog(&summary)
                             };
                             local_dialog = Some(dlg);
+                            /* SWISS-4r-sel-clear: see copy_batch's
+                             * analogous clear comment above. */
+                            clear_panel_selection(client, batch.src_focus);
                             delete_batch = None;
                         }
                     }
@@ -1964,6 +1985,7 @@ fn start_f5(
     *copy_batch = Some(CopyBatch {
         items: expanded, idx: 0,
         src_meta, dst_meta, src_sock, dst_sock,
+        src_focus: active,
         sticky: None, copied: 0, skipped: 0, failed: 0,
         last_error: None,
         start_time: now,
@@ -2060,7 +2082,10 @@ fn start_f8(
     } else {
         format!("Delete {n} items?\n  {preview}, ... +{}", n - 5)
     };
-    *delete_batch = Some(DeleteBatch { items, idx: 0, deleted: 0, failed: 0 });
+    *delete_batch = Some(DeleteBatch {
+        items, idx: 0, deleted: 0, failed: 0,
+        src_focus: active,
+    });
     *local_dialog = Some(LocalDialog {
         kind: LocalDialogKind::Confirm {
             options: vec!["Yes".into(), "No".into()],
@@ -3162,6 +3187,21 @@ fn default_snap_name() -> String {
         mo += 1;
     }
     format!("snap-{:04}{:02}{:02}-{:02}{:02}{:02}", y, mo + 1, d + 1, h, m, s)
+}
+
+/// SWISS-4r-sel-clear: clear /panels/<focus>/selection. Used at batch
+/// completion (copy + delete) so a stale bitset doesn't latch onto
+/// unrelated entries at the same indices after the next refresh.
+/// Per slate's CLAUDE.md row clause 17, the bitset is reset to all-
+/// zero on cwd-changing ops only; batch ops don't change cwd so the
+/// renderer is responsible for clearing.
+fn clear_panel_selection(client: &mut SlateClient, focus: usize) {
+    let path = if focus == 0 {
+        "/panels/left/selection"
+    } else {
+        "/panels/right/selection"
+    };
+    let _ = client.write_path(path, b"\n");
 }
 
 fn action_verb(client: &mut SlateClient, focus: usize, verb: &str) -> Result<()> {
