@@ -686,6 +686,53 @@ static void dispatch_event_locked(stm_slate *s, const char *line, size_t len)
     pthread_cond_broadcast(&s->cv);
 }
 
+/* SWISS-4q-supervise: shared by every backend-touching read path that
+ * wants to self-heal via auto-reconnect on broken connections. The
+ * three statuses below are what stm_9p_client surfaces when the
+ * Unix-domain socket has died (EBACKEND = poisoned wire / protocol-
+ * unrecoverable, EIO = socket EPIPE/EOF, EPROTOCOL = server returned
+ * Rlerror with EPROTO). Application-level errors like ENOENT or
+ * EACCES are NOT in this set — those mean "the server is alive and
+ * told us no". */
+static bool is_conn_broken_status(stm_status rc)
+{
+    return rc == STM_EBACKEND || rc == STM_EIO || rc == STM_EPROTOCOL;
+}
+
+/* SWISS-4q-supervise: diagnostic log helper for backend-touching code
+ * paths. Acquires s->mu internally; safe to call from any lock state
+ * EXCEPT while holding s->mu (would deadlock on re-acquire). The
+ * intended call sites hold panel[i].backend_mu (which precedes s->mu
+ * in the canonical lock order) — that's fine. Format the line into a
+ * STM_SLATE_LOG_LINE_MAX-bounded buffer, then append + bump version
+ * + broadcast cv so /log/tail readers wake immediately. */
+static void log_panel_event(stm_slate *s, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+static void log_panel_event(stm_slate *s, const char *fmt, ...)
+{
+    if (!s) return;
+    char line[STM_SLATE_LOG_LINE_MAX + 1];
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    int hdr = snprintf(line, sizeof line, "%lld.%09ld panel: ",
+                       (long long)ts.tv_sec, (long)ts.tv_nsec);
+    if (hdr < 0) hdr = 0;
+    if ((size_t)hdr >= sizeof line) hdr = (int)sizeof line - 1;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(line + (size_t)hdr,
+                      sizeof line - (size_t)hdr, fmt, ap);
+    va_end(ap);
+    if (n < 0) n = 0;
+    size_t total = (size_t)hdr + (size_t)n;
+    if (total > STM_SLATE_LOG_LINE_MAX) total = STM_SLATE_LOG_LINE_MAX;
+    pthread_mutex_lock(&s->mu);
+    log_append_locked(s, line, total);
+    s->version++;
+    pthread_cond_broadcast(&s->cv);
+    pthread_mutex_unlock(&s->mu);
+}
+
 /* ────────────────────────────────────────────────────────────────────── */
 /* Public state API.                                                      */
 /* ────────────────────────────────────────────────────────────────────── */
@@ -1001,6 +1048,79 @@ static void disconnect_state_swap_locked(stm_slate *s, int panel_idx,
     }
     s->version++;
     pthread_cond_broadcast(&s->cv);
+}
+
+/* SWISS-4q-supervise: auto-reconnect for a single panel.
+ *
+ * Caller MUST hold panel[panel_idx].backend_mu. Internally takes +
+ * releases s->mu to snapshot the stored socket path, install the
+ * new client, and broadcast cv. The blocking stm_9p_dial_unix call
+ * happens with NEITHER mu nor backend_mu held — backend_mu is
+ * released across the dial and reacquired on return, so this helper
+ * is NOT safe to call from inside a backend op sequence that depends
+ * on the held backend_mu. (Today's only caller is panel_entries_render
+ * which never holds an in-flight server-side fid across the
+ * reconnect — the goto-retry restarts from walk_to_cwd, which binds
+ * fresh fids on the new client.) Wait — actually backend_mu IS held
+ * across the dial here because we cannot release it without risking
+ * a concurrent attach racing us. Re-reading: the helper is called
+ * UNDER backend_mu and the dial is a network syscall on a fresh
+ * socket fd that does NOT touch the old (dead) client; holding
+ * backend_mu blocks new attaches but those are user-initiated and
+ * rare. Acceptable.
+ *
+ * Preserves panel state (path, cursor, entries_count, selection) so
+ * the auto-reconnect is invisible to the user — they see the panel
+ * re-populate at the same cwd. If the stored path no longer exists
+ * on the freshly-dialed backend, the retry's walk_to_cwd will fail
+ * and the caller will surface the original error.
+ *
+ * Returns STM_OK on successful redial + swap. Caller MUST re-read
+ * s->panel[panel_idx].backend after this returns OK — the local bc
+ * pointer is stale. Returns non-OK if (a) panel has no stored socket
+ * path (was never attached), or (b) dial failed; in either case the
+ * panel's backend is left in place (still pointing at the dead
+ * client). */
+static stm_status panel_reconnect_locked(stm_slate *s, int panel_idx)
+{
+    char path[STM_SLATE_SOCKET_MAX + 1];
+    size_t plen;
+    pthread_mutex_lock(&s->mu);
+    plen = s->panel[panel_idx].socket_len;
+    if (plen == 0 || plen > STM_SLATE_SOCKET_MAX) {
+        pthread_mutex_unlock(&s->mu);
+        return STM_EBACKEND;
+    }
+    memcpy(path, s->panel[panel_idx].socket, plen);
+    path[plen] = '\0';
+    pthread_mutex_unlock(&s->mu);
+
+    stm_9p_dial_opts opts;
+    memset(&opts, 0, sizeof opts);
+    opts.msize    = 0;
+    opts.uname    = NULL;
+    opts.aname    = NULL;
+    opts.n_uname  = (uint32_t)-1;
+    opts.root_fid = SLATE_BACKEND_ROOT_FID;
+
+    stm_9p_client *new_bc = NULL;
+    stm_status rc = stm_9p_dial_unix(path, &opts, &new_bc);
+    if (rc != STM_OK) return rc;
+
+    stm_9p_client *old_bc = NULL;
+    pthread_mutex_lock(&s->mu);
+    old_bc = s->panel[panel_idx].backend;
+    s->panel[panel_idx].backend = new_bc;
+    /* Do NOT reset path / cursor / entries_count / selection —
+     * auto-reconnect should be invisible to the user. The retry's
+     * walk_to_cwd lands them back at their previous cwd if the path
+     * still exists. */
+    s->version++;
+    pthread_cond_broadcast(&s->cv);
+    pthread_mutex_unlock(&s->mu);
+
+    if (old_bc) stm_9p_close(old_bc);
+    return STM_OK;
 }
 
 stm_status stm_slate_disconnect_panel(stm_slate *s, int panel_idx)
@@ -2452,23 +2572,66 @@ static stm_status panel_entries_render(stm_slate *s, int panel_idx,
 
     pthread_mutex_lock(&s->panel[panel_idx].backend_mu);
 
+    /* SWISS-4q-supervise: bounded retry on conn-broken status.
+     * First conn-broken from ANY of walk_to_cwd / clone-walk / lopen /
+     * readdir triggers a single reconnect attempt + goto retry. The
+     * retry restarts from the bc-snapshot — all server-side fids
+     * (WORK / CWD / ENT / WALK_A / WALK_B) get freshly rebound on
+     * the new client because the goto reruns walk_to_cwd. The attempts
+     * counter caps retries at 1; if the second attempt also hits a
+     * conn-broken status, the function returns the error to the
+     * caller (renderer will surface "no entries" but at least the
+     * log records what happened). */
+    int attempts = 0;
+    stm_9p_client *bc;
+    stm_status rc;
+    slate_dirent *arr = NULL;
+    slate_dir_collect dc;
+
+retry:
+    if (arr) { free(arr); arr = NULL; }
     pthread_mutex_lock(&s->mu);
-    stm_9p_client *bc = s->panel[panel_idx].backend;
+    bc = s->panel[panel_idx].backend;
     pthread_mutex_unlock(&s->mu);
     if (!bc) {
         pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return STM_OK;
     }
+    attempts++;
 
-    stm_status rc = walk_to_cwd(bc, cwd, SLATE_BACKEND_WORK_FID);
+    rc = walk_to_cwd(bc, cwd, SLATE_BACKEND_WORK_FID);
     if (rc != STM_OK) {
+        log_panel_event(s, "panel %d entries: walk_to_cwd(\"%s\") status=%d",
+                        panel_idx, cwd ? cwd : "(null)", (int)rc);
+        if (is_conn_broken_status(rc) && attempts == 1) {
+            stm_status rr = panel_reconnect_locked(s, panel_idx);
+            if (rr == STM_OK) {
+                log_panel_event(s, "panel %d reconnect ok — retrying render",
+                                panel_idx);
+                goto retry;
+            }
+            log_panel_event(s, "panel %d reconnect failed status=%d",
+                            panel_idx, (int)rr);
+        }
         pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return rc;
     }
     rc = stm_9p_walk(bc, SLATE_BACKEND_WORK_FID, SLATE_BACKEND_CWD_FID,
                         0u, NULL, NULL, NULL);
     if (rc != STM_OK) {
+        log_panel_event(s, "panel %d entries: clone-walk status=%d",
+                        panel_idx, (int)rc);
         (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
+        if (is_conn_broken_status(rc) && attempts == 1) {
+            stm_status rr = panel_reconnect_locked(s, panel_idx);
+            if (rr == STM_OK) {
+                log_panel_event(s, "panel %d reconnect ok — retrying render",
+                                panel_idx);
+                goto retry;
+            }
+            log_panel_event(s, "panel %d reconnect failed status=%d",
+                            panel_idx, (int)rr);
+        }
         pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return rc;
     }
@@ -2476,37 +2639,64 @@ static stm_status panel_entries_render(stm_slate *s, int panel_idx,
                          STM_9P_O_RDONLY | STM_9P_O_DIRECTORY,
                          NULL, NULL);
     if (rc != STM_OK) {
+        log_panel_event(s, "panel %d entries: lopen status=%d",
+                        panel_idx, (int)rc);
         (void)stm_9p_clunk(bc, SLATE_BACKEND_CWD_FID);
         (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
+        if (is_conn_broken_status(rc) && attempts == 1) {
+            stm_status rr = panel_reconnect_locked(s, panel_idx);
+            if (rr == STM_OK) {
+                log_panel_event(s, "panel %d reconnect ok — retrying render",
+                                panel_idx);
+                goto retry;
+            }
+            log_panel_event(s, "panel %d reconnect failed status=%d",
+                            panel_idx, (int)rr);
+        }
         pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return rc;
     }
 
-    slate_dirent *arr = calloc(STM_SLATE_ENTRIES_MAX, sizeof *arr);
+    arr = calloc(STM_SLATE_ENTRIES_MAX, sizeof *arr);
     if (!arr) {
+        (void)stm_9p_clunk(bc, SLATE_BACKEND_CWD_FID);
         (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
         pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return STM_ENOMEM;
     }
-    slate_dir_collect dc = { arr, STM_SLATE_ENTRIES_MAX, 0 };
+    dc = (slate_dir_collect){ arr, STM_SLATE_ENTRIES_MAX, 0 };
 
-    uint64_t offset = 0;
-    while (1) {
-        uint32_t entries = 0;
-        uint64_t next_off = offset;
-        rc = stm_9p_readdir(bc, SLATE_BACKEND_WORK_FID,
-                               offset, 0u,
-                               collect_dirent_cb, &dc,
-                               &entries, &next_off);
-        if (rc == STM_ENOTSUPPORTED) { rc = STM_OK; break; }
-        if (rc != STM_OK) break;
-        if (entries == 0) break;
-        if (next_off == offset) break;
-        offset = next_off;
+    {
+        uint64_t offset = 0;
+        while (1) {
+            uint32_t entries = 0;
+            uint64_t next_off = offset;
+            rc = stm_9p_readdir(bc, SLATE_BACKEND_WORK_FID,
+                                   offset, 0u,
+                                   collect_dirent_cb, &dc,
+                                   &entries, &next_off);
+            if (rc == STM_ENOTSUPPORTED) { rc = STM_OK; break; }
+            if (rc != STM_OK) break;
+            if (entries == 0) break;
+            if (next_off == offset) break;
+            offset = next_off;
+        }
     }
     (void)stm_9p_clunk(bc, SLATE_BACKEND_WORK_FID);
     if (rc != STM_OK) {
+        log_panel_event(s, "panel %d entries: readdir status=%d",
+                        panel_idx, (int)rc);
         (void)stm_9p_clunk(bc, SLATE_BACKEND_CWD_FID);
+        if (is_conn_broken_status(rc) && attempts == 1) {
+            stm_status rr = panel_reconnect_locked(s, panel_idx);
+            if (rr == STM_OK) {
+                log_panel_event(s, "panel %d reconnect ok — retrying render",
+                                panel_idx);
+                goto retry;
+            }
+            log_panel_event(s, "panel %d reconnect failed status=%d",
+                            panel_idx, (int)rr);
+        }
         free(arr);
         pthread_mutex_unlock(&s->panel[panel_idx].backend_mu);
         return rc;

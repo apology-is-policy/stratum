@@ -21,6 +21,7 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1903,6 +1904,122 @@ STM_TEST(slate_socket_event_zero_byte_einval)
 
     STM_ASSERT_OK(stm_9p_clunk(c, 101u));
     stm_9p_close(c);
+    destroy_fixture(&f);
+}
+
+/* SWISS-4q-supervise smoke test: post-destroy + respawn sequence on
+ * the SAME socket path still serves entries (whether via stale-worker
+ * happy path OR via auto-reconnect; both surface as a successful Tread
+ * with B's root entries). The "auto-reconnect fires" claim is
+ * intentionally NOT asserted at the wire layer because the test
+ * harness's per-conn worker pthreads on the backend slate are detached
+ * (see destroy_backend_fixture comment above) — they outlive the
+ * stm_slate_destroy() and continue serving F's persistent bc fd from
+ * (technically) freed memory until either side closes. In practice on
+ * macOS, the brief window means F's panel_entries_render sees the
+ * stale worker as still functional and never triggers reconnect.
+ *
+ * What this test DOES verify:
+ *   - Post-destroy + respawn at same path doesn't crash (no SIGPIPE,
+ *     no use-after-free abort).
+ *   - SIGPIPE doesn't kill the test on writes to broken sockets.
+ *   - The /panels/left/entries materializer is exercised end-to-end
+ *     under the new goto-retry structure.
+ *
+ * What this test does NOT verify (needs manual repro per
+ * SWISS-4q-supervise next-session notes):
+ *   - That auto-reconnect actually fires when the persistent bc
+ *     write returns EPIPE. To test this rigorously we'd need a
+ *     test-only API to forcibly close the panel's bc fd (close from
+ *     inside slate.c, since bc->fd is a lib internal). Forward-noted
+ *     as part of P9-SLATE-FIX-SESSIONS / SWISS-4q-supervise-test.
+ *   - That /log/tail captures the reconnect lines. Manual repro
+ *     remains the validation path. */
+STM_TEST(slate_socket_panel_entries_after_backend_respawn_smoke)
+{
+    struct sigaction sa = {0};
+    sa.sa_handler = SIG_IGN;
+    sigaction(SIGPIPE, &sa, NULL);
+
+    slate_backend_fixture be;
+    setup_backend_fixture(&be, "rc_be");
+
+    slate_fixture f;
+    setup_fixture(&f, "rc_fg");
+
+    stm_9p_client *c = NULL;
+    stm_9p_dial_opts opts = default_dial_opts(200u);
+    STM_ASSERT_OK(retry_dial(g_sock_path, &opts, &c));
+
+    /* Attach F to B. */
+    const char *anames[] = { "connection", "attach" };
+    stm_9p_qid aqids[2];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 200u, 201u, 2u, anames, aqids, &walked));
+    stm_9p_qid oqid;
+    uint32_t iounit = 0;
+    STM_ASSERT_OK(stm_9p_lopen(c, 201u, STM_LP9_O_WRONLY, &oqid, &iounit));
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, 201u, 0u, be.sock_path,
+                                  (uint32_t)strlen(be.sock_path),
+                                  &written));
+    STM_ASSERT_EQ((unsigned)written, (unsigned)strlen(be.sock_path));
+    STM_ASSERT_OK(stm_9p_clunk(c, 201u));
+
+    /* Sanity read of /panels/left/entries — succeeds, lists B's root. */
+    const char *enames[] = { "panels", "left", "entries" };
+    stm_9p_qid eqids[3];
+    STM_ASSERT_OK(stm_9p_walk(c, 200u, 202u, 3u, enames, eqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 202u, 0u, &oqid, &iounit));
+    char ebuf[4096];
+    uint32_t egot = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 202u, 0u, ebuf,
+                                  (uint32_t)(sizeof ebuf - 1u), &egot));
+    ebuf[egot] = '\0';
+    STM_ASSERT(strstr(ebuf, " version\n") != NULL);
+    STM_ASSERT_OK(stm_9p_clunk(c, 202u));
+
+    /* Save B's socket path; tear down B (simulating "the backend
+     * died" — though per the comment above, the per-conn worker
+     * may outlive this on the test harness side). */
+    char be_path[256];
+    size_t be_path_len = strlen(be.sock_path);
+    STM_ASSERT(be_path_len < sizeof be_path);
+    memcpy(be_path, be.sock_path, be_path_len);
+    be_path[be_path_len] = '\0';
+    destroy_backend_fixture(&be);
+
+    /* Spawn B' at the SAME socket path. */
+    slate_backend_fixture be2;
+    memset(&be2, 0, sizeof be2);
+    memcpy(be2.sock_path, be_path, be_path_len);
+    be2.sock_path[be_path_len] = '\0';
+    (void)unlink(be2.sock_path);
+    STM_ASSERT_OK(stm_slate_create(&be2.slate));
+    be2.listen_fd = stm_stratumd_listen_unix(be2.sock_path, 4, 0600);
+    STM_ASSERT_TRUE(be2.listen_fd >= 0);
+    be2.ctx.listen_fd = be2.listen_fd;
+    be2.ctx.slate     = be2.slate;
+    atomic_init(&be2.ctx.stop_flag, false);
+    STM_ASSERT_EQ(pthread_create(&be2.accept_tid, NULL,
+                                    accept_thread, &be2.ctx), 0);
+
+    /* Read entries again. Either: (a) auto-reconnect fires, dials B',
+     * retries against the fresh client, returns its root; or (b)
+     * stale B worker keeps serving from freed memory and returns
+     * the same content. Both surfaces produce a valid Tread; the
+     * test only asserts non-crash + non-empty content. */
+    STM_ASSERT_OK(stm_9p_walk(c, 200u, 203u, 3u, enames, eqids, &walked));
+    STM_ASSERT_OK(stm_9p_lopen(c, 203u, 0u, &oqid, &iounit));
+    uint32_t egot2 = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 203u, 0u, ebuf,
+                                  (uint32_t)(sizeof ebuf - 1u), &egot2));
+    ebuf[egot2] = '\0';
+    STM_ASSERT(strstr(ebuf, " version\n") != NULL);
+    STM_ASSERT_OK(stm_9p_clunk(c, 203u));
+
+    stm_9p_close(c);
+    destroy_backend_fixture(&be2);
     destroy_fixture(&f);
 }
 
