@@ -1001,40 +1001,34 @@ fn handle_key(
         KeyCode::F(8) if !key.modifiers.contains(KeyModifiers::SHIFT) => {
             return start_f8(local_dialog, delete_batch, spawn, snap, *focus);
         }
-        // SWISS-4i: F9 = create snapshot on active stratum panel.
-        // No-op on host panel (snapshots are a stratum concept).
+        // SWISS-4i / SWISS-8c: F9 = snapshot list modal (v1 port).
+        // Open the list dialog regardless of /ctl/ state — empty list
+        // is fine, and the "Snap unavailable" error only fires when
+        // the user presses N/D inside the dialog (the read path
+        // already needs /ctl/, but the snapgraph_state snapshot we
+        // pre-populate from is None when /ctl/ is missing, so the
+        // list just shows "(no snapshots — press N to create)").
         KeyCode::F(9) if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-            let sp = match spawn {
-                Some(s) => s,
-                None => {
-                    *local_dialog = Some(error_dialog(
-                        "Snap unavailable: spawn helper unavailable.",
-                    ));
-                    return Ok(Action::Refresh);
-                }
-            };
-            match sp.panel_meta(*focus) {
-                BackendMeta::Stratumd { .. } => {}
-                _ => {
-                    *local_dialog = Some(error_dialog(
-                        "Snap requires a stratum panel (active panel is not a .stm volume).",
-                    ));
-                    return Ok(Action::Refresh);
-                }
-            }
-            if sp.stratumd_ctl_sock.is_none() {
-                *local_dialog = Some(error_dialog(
-                    "Stratum /ctl/ socket missing — daemon was not spawned with --ctl-listen.",
-                ));
-                return Ok(Action::Refresh);
-            }
+            // v1.0: filter to dataset_id=1 only. v1.1 may add a
+            // dataset picker / per-panel dataset routing.
+            let dataset_id: u64 = 1;
+            let snaps: Vec<crate::snapgraph::SnapshotInfo> = snapgraph_state
+                .map(|sg| {
+                    sg.snaps
+                        .iter()
+                        .filter(|s| s.dataset_id == dataset_id)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
             *local_dialog = Some(LocalDialog {
-                kind: LocalDialogKind::SnapInput {
-                    panel_idx: *focus,
-                    dataset_id: 1, // v1.0: dataset id 1 only
+                kind: LocalDialogKind::SnapshotList {
+                    snaps,
+                    cursor: 0,
+                    dataset_id,
                 },
-                prompt: "Snapshot name (date-time auto-suggested):".into(),
-                value: default_snap_name(),
+                prompt: String::new(),
+                value: String::new(),
                 is_password: false,
                 is_error: false,
             });
@@ -1391,6 +1385,13 @@ fn handle_dialog_key(
     ) {
         return handle_confirm_key(local_dialog, spawn, snap, key);
     }
+    // SWISS-8c: SnapshotList dispatch — Up/Down nav, N/D/R/Enter verbs.
+    if matches!(
+        local_dialog.as_ref().map(|d| &d.kind),
+        Some(LocalDialogKind::SnapshotList { .. })
+    ) {
+        return handle_snap_list_key(local_dialog, spawn, key);
+    }
     let Some(d) = local_dialog.as_mut() else {
         return Ok(Action::Ignore);
     };
@@ -1455,6 +1456,125 @@ fn handle_confirm_key(
             let picked_idx = *selected;
             let dialog = local_dialog.take().unwrap();
             return submit_confirm(local_dialog, spawn, dialog, picked_idx);
+        }
+        _ => {}
+    }
+    Ok(Action::Ignore)
+}
+
+/// SWISS-8c: dispatch keystrokes when SnapshotList dialog is active.
+///
+/// Verbs mirror v1:
+///   Up/Down/PgUp/PgDn/Home/End: move cursor within list
+///   N: open SnapInput sub-dialog (existing path) to create a snap
+///   D: open Confirm("Delete snapshot <name>?") → DeleteSnapshot
+///   R/Enter: stubbed — info_dialog explains rollback is gated on
+///            SWISS-6 v1.1c (which is multi-chunk).
+///   Esc: close
+fn handle_snap_list_key(
+    local_dialog: &mut Option<LocalDialog>,
+    _spawn: Option<&Arc<SpawnCtx>>,
+    key: crossterm::event::KeyEvent,
+) -> Result<Action> {
+    let Some(d) = local_dialog.as_mut() else {
+        return Ok(Action::Ignore);
+    };
+    let LocalDialogKind::SnapshotList { snaps, cursor, dataset_id } = &mut d.kind else {
+        return Ok(Action::Ignore);
+    };
+    let max_idx = snaps.len().saturating_sub(1);
+    let snap_count = snaps.len();
+    let dsid = *dataset_id;
+
+    match key.code {
+        KeyCode::Esc => {
+            *local_dialog = None;
+            return Ok(Action::Refresh);
+        }
+        KeyCode::Up => {
+            if *cursor > 0 {
+                *cursor -= 1;
+            }
+            return Ok(Action::Refresh);
+        }
+        KeyCode::Down => {
+            if *cursor < max_idx {
+                *cursor += 1;
+            }
+            return Ok(Action::Refresh);
+        }
+        KeyCode::PageUp => {
+            *cursor = cursor.saturating_sub(10);
+            return Ok(Action::Refresh);
+        }
+        KeyCode::PageDown => {
+            *cursor = (*cursor + 10).min(max_idx);
+            return Ok(Action::Refresh);
+        }
+        KeyCode::Home => {
+            *cursor = 0;
+            return Ok(Action::Refresh);
+        }
+        KeyCode::End => {
+            *cursor = max_idx;
+            return Ok(Action::Refresh);
+        }
+        // N → open create-snapshot input dialog (existing path).
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            *local_dialog = Some(LocalDialog {
+                kind: LocalDialogKind::SnapInput {
+                    panel_idx: 0,    // unused at submit time
+                    dataset_id: dsid,
+                },
+                prompt: "Snapshot name (date-time auto-suggested):".into(),
+                value: default_snap_name(),
+                is_password: false,
+                is_error: false,
+            });
+            return Ok(Action::Refresh);
+        }
+        // D → confirm delete of the cursor's snapshot.
+        KeyCode::Char('d') | KeyCode::Char('D') => {
+            if snap_count == 0 || *cursor >= snap_count {
+                // No snapshot under cursor — drop silently.
+                return Ok(Action::Ignore);
+            }
+            let snap = &snaps[*cursor];
+            let snap_id = snap.snapshot_id;
+            let name = snap.name.clone();
+            // Defensive copy of name for the confirm prompt.
+            let prompt = format!(
+                "Delete snapshot {name} (#{snap_id})?\n\
+                 This is irreversible."
+            );
+            *local_dialog = Some(LocalDialog {
+                kind: LocalDialogKind::Confirm {
+                    options: vec!["No".to_string(), "Yes".to_string()],
+                    selected: 0, // default to No — destructive default-safe
+                    on_pick: ConfirmAction::DeleteSnapshot {
+                        dataset_id: dsid,
+                        snap_id,
+                        name,
+                    },
+                },
+                prompt,
+                value: String::new(),
+                is_password: false,
+                is_error: false,
+            });
+            return Ok(Action::Refresh);
+        }
+        // R or Enter → rollback (forward-noted to SWISS-6 v1.1c).
+        KeyCode::Char('r') | KeyCode::Char('R') | KeyCode::Enter => {
+            *local_dialog = Some(info_dialog(
+                "Rollback is not yet implemented in v1.0.\n\
+                 \n\
+                 Rolling back to a snapshot is destructive (it discards\n\
+                 all data + snapshots newer than the target). Stratum\n\
+                 v1.1c will add the verb with a double-confirm gate\n\
+                 after the underlying C-side API + spec extension land.",
+            ));
+            return Ok(Action::Refresh);
         }
         _ => {}
     }
@@ -1543,6 +1663,77 @@ fn submit_confirm(
             // Yes, the DeleteBatch (already populated) advances.
             if label != "Yes" {
                 DELETE_CANCEL.with(|c| c.set(true));
+            }
+            Ok(Action::Refresh)
+        }
+        ConfirmAction::DeleteSnapshot { dataset_id, snap_id, name } => {
+            // SWISS-8c: F9 → D → confirm. On Yes, write snap_id to
+            // /ctl/datasets/<id>/delete-snapshot (admin write).
+            if label != "Yes" {
+                return Ok(Action::Refresh);
+            }
+            let sp = match spawn {
+                Some(s) => s,
+                None => {
+                    *local_dialog = Some(error_dialog(
+                        "Delete failed: spawn helper unavailable.",
+                    ));
+                    return Ok(Action::Refresh);
+                }
+            };
+            let ctl_sock = match sp.stratumd_ctl_sock.as_ref() {
+                Some(p) => p.clone(),
+                None => {
+                    *local_dialog = Some(error_dialog(
+                        "Delete failed: stratum /ctl/ socket missing.",
+                    ));
+                    return Ok(Action::Refresh);
+                }
+            };
+            let p9_path = format!("/datasets/{dataset_id}/delete-snapshot");
+            use std::io::Write;
+            use std::os::unix::process::CommandExt;
+            use std::process::{Command, Stdio};
+            let me = std::env::current_exe()
+                .unwrap_or_else(|_| std::path::PathBuf::from("stratum"));
+            let mut child = match Command::new(&me)
+                .args(&[
+                    "fs", "-s", ctl_sock.to_string_lossy().as_ref(),
+                    "write", &p9_path,
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .process_group(0)
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    *local_dialog = Some(error_dialog(&format!("delete spawn: {e}")));
+                    return Ok(Action::Refresh);
+                }
+            };
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(format!("{snap_id}").as_bytes());
+            }
+            drop(child.stdin.take());
+            match child.wait_with_output() {
+                Ok(out) if out.status.success() => {
+                    *local_dialog = Some(info_dialog(&format!(
+                        "Snapshot deleted: {name} (#{snap_id})"
+                    )));
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    *local_dialog = Some(error_dialog(&format!(
+                        "delete failed (exit {}): {}",
+                        out.status.code().unwrap_or(-1),
+                        stderr.lines().next().unwrap_or("(no detail)").trim()
+                    )));
+                }
+                Err(e) => {
+                    *local_dialog = Some(error_dialog(&format!("delete wait: {e}")));
+                }
             }
             Ok(Action::Refresh)
         }
@@ -2183,6 +2374,11 @@ fn submit_dialog(
             // Confirm dialogs are dispatched via handle_confirm_key
             // → submit_confirm; they never reach submit_dialog. Arm
             // kept for exhaustiveness.
+            Ok(Action::Refresh)
+        }
+        LocalDialogKind::SnapshotList { .. } => {
+            // SnapshotList dialogs are dispatched via handle_snap_list_key;
+            // they never reach submit_dialog. Arm kept for exhaustiveness.
             Ok(Action::Refresh)
         }
     }

@@ -191,6 +191,14 @@ pub enum LocalDialogKind {
     },
     /// Error / informational; dismiss with Esc or Enter.
     Error,
+    /// SWISS-8c: snapshot list modal (port of v1's F9 dialog).
+    /// Renders a scrollable list of existing snapshots for one
+    /// dataset, with N/D/R verb shortcuts.
+    SnapshotList {
+        snaps: Vec<crate::snapgraph::SnapshotInfo>,
+        cursor: usize,
+        dataset_id: u64,
+    },
 }
 
 /// SWISS-4f: post-confirm action carried in LocalDialogKind::Confirm.
@@ -231,6 +239,13 @@ pub enum ConfirmAction {
     /// SWISS-4h: F8 batch delete. One confirm at start; on Yes,
     /// the DeleteBatch advances through items.
     DeleteBatch,
+    /// SWISS-8c: F9 snapshot dialog → D: delete one snapshot via
+    /// /ctl/datasets/<id>/delete-snapshot (admin write).
+    DeleteSnapshot {
+        dataset_id: u64,
+        snap_id: u64,
+        name: String,
+    },
 }
 
 /// SWISS-4c: state for the mkfs wizard. v1.0 collects only Name +
@@ -560,6 +575,9 @@ pub fn render(
                 LocalDialogKind::Confirm { options, selected, .. } => {
                     draw_confirm_dialog(frame, area, &d.prompt, options, *selected);
                 }
+                LocalDialogKind::SnapshotList { snaps, cursor, .. } => {
+                    draw_snap_dialog(frame, area, snaps, *cursor);
+                }
                 _ => draw_local_dialog(frame, area, d),
             }
         } else if let Some(cp) = copy_progress {
@@ -599,6 +617,9 @@ pub fn render(
             LocalDialogKind::MkVol(mk) => draw_mkvol_dialog(frame, area, mk),
             LocalDialogKind::Confirm { options, selected, .. } => {
                 draw_confirm_dialog(frame, area, &d.prompt, options, *selected);
+            }
+            LocalDialogKind::SnapshotList { snaps, cursor, .. } => {
+                draw_snap_dialog(frame, area, snaps, *cursor);
             }
             _ => draw_local_dialog(frame, area, d),
         }
@@ -1241,6 +1262,7 @@ fn draw_local_dialog(frame: &mut Frame<'_>, area: Rect, d: &LocalDialog) {
         // but kept for exhaustiveness.
         (LocalDialogKind::MkVol(_), _) => " Create Stratum Volume ",
         (LocalDialogKind::Confirm { .. }, _) => " Confirm ",
+        (LocalDialogKind::SnapshotList { .. }, _) => " Snapshots ",
     };
     let border_clr = if d.is_error { Color::Red } else { Color::Cyan };
     let prompt_clr = if d.is_password { Color::Red } else { Color::White };
@@ -1300,6 +1322,111 @@ fn draw_local_dialog(frame: &mut Frame<'_>, area: Rect, d: &LocalDialog) {
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }),
         inner,
+    );
+}
+
+// ── SWISS-8c: F9 snapshot list dialog (port of v1) ────────────────────
+
+/// SWISS-8c: render the F9 snapshot list dialog. Visual port of v1's
+/// `draw_snap_dialog` (v1/tui/src/ui.rs): 70×20 centered modal with
+/// double-line cyan border, " Snapshots " title, 3-column header
+/// (ID / Gen / Name), scrollable cursor-highlighted list, footer
+/// hint "N:new  R/Enter:rollback  D:delete  Esc:close".
+///
+/// v1 fields → v2 mapping:
+///   - id  ← snapshot_id
+///   - gen ← created_txg (v2's equivalent of v1's snapshot generation)
+///   - name ← name (sanitized via snapgraph::sanitize_name)
+///
+/// Scroll: if cursor >= visible_rows, scroll so the cursor row is the
+/// last visible row. Matches v1's saturating scroll computation.
+fn draw_snap_dialog(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snaps: &[crate::snapgraph::SnapshotInfo],
+    cursor: usize,
+) {
+    let w = 70u16.min(area.width.saturating_sub(4));
+    let h = 20u16.min(area.height.saturating_sub(4));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(dbl_border())
+        .border_style(Style::default().fg(Color::Cyan).bold())
+        .title(Line::from(Span::styled(
+            " Snapshots ",
+            Style::default().fg(Color::Cyan).bold(),
+        )))
+        .style(Style::default().bg(CLR_POPUP_BG));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // header
+            Constraint::Min(3),    // list
+            Constraint::Length(1), // hint
+        ])
+        .split(inner);
+
+    // Header row — yellow bold.
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {:<8} {:<12} {:<}", "ID", "Gen", "Name"),
+            Style::default().fg(CLR_HEADER).bold(),
+        ))),
+        rows[0],
+    );
+
+    // List body. v1 fell through to a "(no snapshots — press N to
+    // create)" body when empty. We mirror that exactly.
+    if snaps.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  (no snapshots — press N to create)",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            rows[1],
+        );
+    } else {
+        let visible = rows[1].height as usize;
+        let cursor = cursor.min(snaps.len().saturating_sub(1));
+        let scroll = if cursor >= visible {
+            cursor + 1 - visible
+        } else {
+            0
+        };
+        let items: Vec<ListItem> = snaps
+            .iter()
+            .enumerate()
+            .skip(scroll)
+            .take(visible)
+            .map(|(i, s)| {
+                let name = crate::snapgraph::sanitize_name(&s.name);
+                let line = format!(" {:<8} {:<12} {}", s.snapshot_id, s.created_txg, name);
+                let style = if i == cursor {
+                    Style::default().fg(Color::Black).bg(Color::Blue).bold()
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                ListItem::new(line).style(style)
+            })
+            .collect();
+        frame.render_widget(List::new(items), rows[1]);
+    }
+
+    // Footer hint — dark gray, same wording as v1.
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " N:new  R/Enter:rollback  D:delete  Esc:close",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[2],
     );
 }
 
@@ -1894,6 +2021,95 @@ fn is_leap(y: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // SWISS-8c: F9 snapshot dialog port from v1.
+    #[test]
+    fn snap_dialog_empty_shows_no_snapshots_hint() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let snaps: Vec<crate::snapgraph::SnapshotInfo> = Vec::new();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                draw_snap_dialog(f, area, &snaps, 0);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let dump = format!("{buffer:?}");
+        assert!(dump.contains("no snapshots"), "expected empty hint in:\n{dump}");
+        // v1's footer hint is preserved.
+        assert!(dump.contains("N:new"));
+        assert!(dump.contains("R/Enter:rollback"));
+        assert!(dump.contains("D:delete"));
+        assert!(dump.contains("Esc:close"));
+    }
+
+    #[test]
+    fn snap_dialog_with_snaps_lists_rows() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let snaps = vec![
+            crate::snapgraph::SnapshotInfo {
+                snapshot_id: 1,
+                dataset_id: 1,
+                name: "alpha".to_string(),
+                created_txg: 5,
+                ..Default::default()
+            },
+            crate::snapgraph::SnapshotInfo {
+                snapshot_id: 2,
+                dataset_id: 1,
+                name: "beta".to_string(),
+                created_txg: 10,
+                ..Default::default()
+            },
+        ];
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                draw_snap_dialog(f, area, &snaps, 1);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let dump = format!("{buffer:?}");
+        // Header columns are present.
+        assert!(dump.contains("ID"));
+        assert!(dump.contains("Gen"));
+        assert!(dump.contains("Name"));
+        // Both snap rows are rendered.
+        assert!(dump.contains("alpha"));
+        assert!(dump.contains("beta"));
+    }
+
+    #[test]
+    fn snap_dialog_sanitizes_control_bytes_in_name() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let snaps = vec![crate::snapgraph::SnapshotInfo {
+            snapshot_id: 1,
+            dataset_id: 1,
+            name: "evil\x1bname".to_string(),
+            created_txg: 1,
+            ..Default::default()
+        }];
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                draw_snap_dialog(f, area, &snaps, 0);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let dump = format!("{buffer:?}");
+        // R115 P1-1 carry: control byte (ESC) replaced with '?'.
+        assert!(dump.contains("evil?name"), "expected sanitized name in:\n{dump}");
+        assert!(!dump.contains('\x1b'));
+    }
 
     // SWISS-8a: F2State menu navigation.
     #[test]
