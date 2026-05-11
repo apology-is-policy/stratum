@@ -483,6 +483,11 @@ fn poll_loop(
                 client = None;
             }
         }
+        // SWISS-8k: drop the /ctl/ connection at the end of each
+        // tick. See volmap::poll_loop for rationale (stratumd /ctl/
+        // is serial-per-socket; long-lived poller connection starves
+        // siblings).
+        client = None;
         sleep_until(tick_start, REFRESH_INTERVAL, &stop);
     }
 }
