@@ -154,6 +154,13 @@ pub struct VolumeMapState {
     pub roster: RosterGauges,
     pub scrub: ScrubGauges,
     pub devices: Vec<DeviceInfo>,
+    /// SWISS-8f: poller has no /ctl/ socket path yet — distinguishes
+    /// "no Stratum volume mounted yet" (no_path = true) from "poller
+    /// is dialing / hasn't completed first tick" (no_path = false,
+    /// last_update = None). The renderer shows different copy for
+    /// each case so the user understands whether to open a volume or
+    /// wait for the next refresh.
+    pub no_path: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -379,7 +386,9 @@ fn poll_loop(
         let desired = match desired {
             Some(p) => p,
             None => {
-                // No path yet — clear any stale state line and idle.
+                // SWISS-8f: no path yet — set no_path so the renderer
+                // shows "(no volume mounted)" instead of the stale
+                // "Awaiting first refresh…" copy. Clear state otherwise.
                 if client.is_some() {
                     client = None;
                     current_path = None;
@@ -391,11 +400,17 @@ fn poll_loop(
                     guard.fs.attached = false;
                     guard.roster.attached = false;
                     guard.scrub.attached = false;
+                    guard.no_path = true;
                 }
                 sleep_until(tick_start, REFRESH_INTERVAL, &stop);
                 continue;
             }
         };
+        // SWISS-8f: path is Some — clear no_path so the renderer
+        // distinguishes "dialing in progress" from "no volume yet".
+        if let Ok(mut guard) = state.write() {
+            guard.no_path = false;
+        }
         // Path swap: drop the stale client + UUID cache.
         if current_path.as_deref() != Some(desired.as_path()) {
             client = None;

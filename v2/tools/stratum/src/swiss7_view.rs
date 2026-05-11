@@ -69,14 +69,12 @@ pub fn render(f: &mut Frame, area: Rect, state: &VolumeMapState) {
             Constraint::Length(4),  // pool summary
             Constraint::Length(9),  // scrub block
             Constraint::Min(5),     // device table
-            Constraint::Length(1),  // footer
         ])
         .split(inner);
 
     render_pool_summary(f, chunks[0], state);
     render_scrub(f, chunks[1], state);
     render_devices(f, chunks[2], state);
-    render_footer(f, chunks[3]);
 }
 
 fn render_pool_summary(f: &mut Frame, area: Rect, state: &VolumeMapState) {
@@ -132,6 +130,24 @@ fn render_pool_summary(f: &mut Frame, area: Rect, state: &VolumeMapState) {
             Style::default().fg(wedged_color).add_modifier(Modifier::BOLD),
         ),
     ]);
+
+    // SWISS-8f: no Stratum volume mounted yet — render a friendly
+    // hint instead of error-style "(not attached)" lines.
+    if state.no_path {
+        let lines = vec![
+            line1,
+            line2,
+            Line::from(vec![Span::styled(
+                "(no volume mounted — press Esc, then Enter on a .stm file in a panel)",
+                Style::default().fg(CLR_DIM),
+            )]),
+        ];
+        f.render_widget(
+            Paragraph::new(lines).style(Style::default().bg(CLR_BG)),
+            area,
+        );
+        return;
+    }
 
     // Last update + error line.
     let line3 = match &state.last_error {
@@ -336,21 +352,6 @@ fn render_devices(f: &mut Frame, area: Rect, state: &VolumeMapState) {
     );
 }
 
-fn render_footer(f: &mut Frame, area: Rect) {
-    let spans = vec![
-        Span::styled(" F2 ", Style::default().bg(CLR_CURSOR_BG).fg(CLR_CURSOR_FG)),
-        Span::styled(" Back  ", Style::default().fg(CLR_VALUE)),
-        Span::styled(" Esc ", Style::default().bg(CLR_CURSOR_BG).fg(CLR_CURSOR_FG)),
-        Span::styled(" Back  ", Style::default().fg(CLR_VALUE)),
-        Span::styled(" F10 ", Style::default().bg(CLR_CURSOR_BG).fg(CLR_CURSOR_FG)),
-        Span::styled(" Quit", Style::default().fg(CLR_VALUE)),
-    ];
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(CLR_BG)),
-        area,
-    );
-}
-
 // ── helpers ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -512,6 +513,7 @@ mod tests {
                 ranges_processed: 50,
             },
             devices,
+            no_path: false,
         }
     }
 
@@ -668,6 +670,31 @@ mod tests {
         let dump = format!("{buffer:?}");
         assert!(dump.contains("ERR"));
         assert!(dump.contains("FAULTED"));
+    }
+
+    #[test]
+    fn render_with_no_path_shows_friendly_hint() {
+        // SWISS-8f: poller has no /ctl/ socket path yet — renderer
+        // should surface "(no volume mounted…)" instead of error-style
+        // "(not attached)" lines.
+        let state = VolumeMapState {
+            no_path: true,
+            ..Default::default()
+        };
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render(f, area, &state);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let dump = format!("{buffer:?}");
+        assert!(
+            dump.contains("no volume mounted"),
+            "expected friendly hint when no_path=true; got:\n{dump}"
+        );
     }
 
     #[test]

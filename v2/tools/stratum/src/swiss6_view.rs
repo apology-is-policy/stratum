@@ -77,7 +77,6 @@ pub fn render(
             Constraint::Length(2),  // header
             Constraint::Min(5),     // list
             Constraint::Length(5),  // detail pane
-            Constraint::Length(1),  // footer
         ])
         .split(inner);
 
@@ -95,7 +94,6 @@ pub fn render(
     render_header(f, chunks[0], state, filter, &visible, marks);
     render_list(f, chunks[1], state, cursor, &visible, marks);
     render_detail(f, chunks[2], state, cursor, &visible);
-    render_footer(f, chunks[3]);
 }
 
 fn render_header(
@@ -244,10 +242,12 @@ fn render_list(
     marks: &[u64],
 ) {
     if visible.is_empty() {
-        let msg = if state.last_error.is_some() {
+        let msg = if state.no_path {
+            "(no volume mounted — press Esc, then Enter on a .stm file in a panel)"
+        } else if state.last_error.is_some() {
             "(no snapshots — see error above)"
         } else if state.snaps.is_empty() {
-            "(no snapshots yet — use stratum-fs snapshot to create one)"
+            "(no snapshots yet — press F9 in the file browser to create one)"
         } else {
             "(no snapshots in this filter — press F3 to cycle)"
         };
@@ -349,27 +349,6 @@ fn render_detail(
             .style(Style::default().bg(CLR_BG))
             .wrap(Wrap { trim: false }),
         inner,
-    );
-}
-
-fn render_footer(f: &mut Frame, area: Rect) {
-    let spans = vec![
-        Span::styled(" F2 ", Style::default().bg(CLR_CURSOR_BG).fg(CLR_CURSOR_FG)),
-        Span::styled(" Back  ", Style::default().fg(CLR_VALUE)),
-        Span::styled(" F3 ", Style::default().bg(CLR_CURSOR_BG).fg(CLR_CURSOR_FG)),
-        Span::styled(" Filter  ", Style::default().fg(CLR_VALUE)),
-        Span::styled(" Spc ", Style::default().bg(CLR_CURSOR_BG).fg(CLR_CURSOR_FG)),
-        Span::styled(" Mark  ", Style::default().fg(CLR_VALUE)),
-        Span::styled(" F5 ", Style::default().bg(CLR_CURSOR_BG).fg(CLR_CURSOR_FG)),
-        Span::styled(" Diff  ", Style::default().fg(CLR_VALUE)),
-        Span::styled(" ↑↓ ", Style::default().bg(CLR_CURSOR_BG).fg(CLR_CURSOR_FG)),
-        Span::styled(" Move  ", Style::default().fg(CLR_VALUE)),
-        Span::styled(" F10 ", Style::default().bg(CLR_CURSOR_BG).fg(CLR_CURSOR_FG)),
-        Span::styled(" Quit", Style::default().fg(CLR_VALUE)),
-    ];
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(CLR_BG)),
-        area,
     );
 }
 

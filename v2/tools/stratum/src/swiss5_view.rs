@@ -72,7 +72,6 @@ pub fn render(f: &mut Frame, area: Rect, state: &VolumeMapState) {
             Constraint::Length(1),  // spacer
             Constraint::Min(4),     // devices list
             Constraint::Length(3),  // scrub
-            Constraint::Length(1),  // footer
         ])
         .split(inner);
 
@@ -82,7 +81,6 @@ pub fn render(f: &mut Frame, area: Rect, state: &VolumeMapState) {
     render_datasets_count(f, chunks[3], state);
     render_devices(f, chunks[5], state);
     render_scrub(f, chunks[6], state);
-    render_footer(f, chunks[7], state);
 }
 
 fn render_header(f: &mut Frame, area: Rect, state: &VolumeMapState) {
@@ -113,17 +111,27 @@ fn render_header(f: &mut Frame, area: Rect, state: &VolumeMapState) {
         Span::styled(format!("{}", state.fs.current_gen), Style::default().fg(CLR_VALUE)),
     ]);
 
-    let last_update_line = match (&state.last_update, &state.last_error) {
-        (_, Some(err)) => Line::from(vec![
-            Span::styled("⚠ ", Style::default().fg(CLR_WARN)),
-            Span::styled(err.clone(), Style::default().fg(CLR_DIM)),
-        ]),
-        (Some(_), None) => Line::from(vec![
-            Span::styled("Last refresh: now", Style::default().fg(CLR_DIM)),
-        ]),
-        (None, None) => Line::from(vec![
-            Span::styled("Awaiting first refresh…", Style::default().fg(CLR_DIM)),
-        ]),
+    let last_update_line = if state.no_path {
+        // SWISS-8f: no Stratum volume has been mounted in this session
+        // yet. Tell the user how to make data appear here.
+        Line::from(vec![Span::styled(
+            "(no volume mounted — press Esc, then Enter on a .stm file in a panel)",
+            Style::default().fg(CLR_DIM),
+        )])
+    } else {
+        match (&state.last_update, &state.last_error) {
+            (_, Some(err)) => Line::from(vec![
+                Span::styled("⚠ ", Style::default().fg(CLR_WARN)),
+                Span::styled(err.clone(), Style::default().fg(CLR_DIM)),
+            ]),
+            (Some(_), None) => Line::from(vec![
+                Span::styled("Last refresh: now", Style::default().fg(CLR_DIM)),
+            ]),
+            (None, None) => Line::from(vec![Span::styled(
+                "Awaiting first refresh…",
+                Style::default().fg(CLR_DIM),
+            )]),
+        }
     };
 
     let p = Paragraph::new(vec![line, last_update_line])
@@ -272,14 +280,6 @@ fn render_scrub(f: &mut Frame, area: Rect, state: &VolumeMapState) {
         ]),
     ];
     f.render_widget(Paragraph::new(lines), area);
-}
-
-fn render_footer(f: &mut Frame, area: Rect, _state: &VolumeMapState) {
-    let line = Line::from(vec![
-        Span::styled("[F3] browse  [F4] snapshots  [F5] integrity  [F6] keys  [F10] quit",
-                     Style::default().fg(CLR_DIM)),
-    ]);
-    f.render_widget(Paragraph::new(line).alignment(Alignment::Center), area);
 }
 
 fn fmt_bytes(b: u64) -> String {

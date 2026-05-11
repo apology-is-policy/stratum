@@ -65,6 +65,8 @@ pub struct SnapshotGraphState {
     pub truncated: bool,
     pub last_refresh_unix: u64,
     pub last_error: Option<String>,
+    /// SWISS-8f: poller has no /ctl/ socket path yet.
+    pub no_path: bool,
 }
 
 impl SnapshotGraphState {
@@ -441,11 +443,15 @@ fn poll_loop(
                     guard.last_error = None;
                     guard.snaps.clear();
                     guard.truncated = false;
+                    guard.no_path = true;
                 }
                 sleep_until(tick_start, REFRESH_INTERVAL, &stop);
                 continue;
             }
         };
+        if let Ok(mut guard) = state.write() {
+            guard.no_path = false;
+        }
         if current_path.as_deref() != Some(desired.as_path()) {
             client = None;
             current_path = Some(desired.clone());
