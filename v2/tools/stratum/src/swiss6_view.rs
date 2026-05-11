@@ -51,6 +51,7 @@ pub fn render(
     state: &SnapshotGraphState,
     cursor: u32,
     filter: Option<u64>,
+    marks: &[u64],
 ) {
     let outer = Block::default()
         .borders(Borders::ALL)
@@ -91,8 +92,8 @@ pub fn render(
             .collect(),
     };
 
-    render_header(f, chunks[0], state, filter, &visible);
-    render_list(f, chunks[1], state, cursor, &visible);
+    render_header(f, chunks[0], state, filter, &visible, marks);
+    render_list(f, chunks[1], state, cursor, &visible, marks);
     render_detail(f, chunks[2], state, cursor, &visible);
     render_footer(f, chunks[3]);
 }
@@ -103,6 +104,7 @@ fn render_header(
     state: &SnapshotGraphState,
     filter: Option<u64>,
     visible: &[usize],
+    marks: &[u64],
 ) {
     let total = state.snaps.len();
     let shown = visible.len();
@@ -131,6 +133,14 @@ fn render_header(
                 Style::default().fg(CLR_HELD).add_modifier(Modifier::BOLD),
             ),
         },
+        Span::raw("    "),
+        Span::styled("Marks: ", Style::default().fg(CLR_LABEL)),
+        Span::styled(
+            format!("{}/2", marks.len()),
+            Style::default()
+                .fg(if marks.len() == 2 { CLR_HELD } else { CLR_VALUE })
+                .add_modifier(Modifier::BOLD),
+        ),
     ];
     if state.truncated {
         spans.push(Span::raw("    "));
@@ -158,7 +168,7 @@ fn render_header(
 
 /// Compose one displayable row for a snap. The tree-glyph indent is
 /// derived from `depth` (the lineage chain length).
-fn snap_row_line(snap: &SnapshotInfo, depth: u32, selected: bool) -> Line<'static> {
+fn snap_row_line(snap: &SnapshotInfo, depth: u32, selected: bool, marked: bool) -> Line<'static> {
     // Indent: 2 spaces per depth level; cap at 12 for renderer-side
     // sanity (deeper chains still show but at depth=6 fixed indent).
     let visual_depth = depth.min(6) as usize;
@@ -192,10 +202,17 @@ fn snap_row_line(snap: &SnapshotInfo, depth: u32, selected: bool) -> Line<'stati
         format!("0x{:>03x}", snap.flags & 0xFFF)
     };
 
-    let cursor_marker = if selected { "▶ " } else { "  " };
+    // SWISS-6 v1.1b: 2-char leading marker. First char = cursor highlight
+    // (▶ when selected, blank otherwise); second char = mark glyph
+    // (✓ when this row's snap is in the marks set, blank otherwise).
+    // The two glyphs are independent — a row can be cursor + marked
+    // simultaneously ("▶ ✓ ...") which is the common F5 confirm UX.
+    let cursor_marker = if selected { "▶" } else { " " };
+    let mark_marker = if marked { "✓" } else { " " };
     let base = format!(
-        "{}{:>4}  {:>2}  {}{}  txg {:>6}  {}  {:>5}  {}  {}",
+        "{}{} {:>4}  {:>2}  {}{}  txg {:>6}  {}  {:>5}  {}  {}",
         cursor_marker,
+        mark_marker,
         snap.snapshot_id,
         snap.dataset_id,
         indent,
@@ -210,6 +227,8 @@ fn snap_row_line(snap: &SnapshotInfo, depth: u32, selected: bool) -> Line<'stati
 
     let style = if selected {
         Style::default().bg(CLR_CURSOR_BG).fg(CLR_CURSOR_FG)
+    } else if marked {
+        Style::default().fg(CLR_HELD).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(CLR_VALUE)
     };
@@ -222,6 +241,7 @@ fn render_list(
     state: &SnapshotGraphState,
     cursor: u32,
     visible: &[usize],
+    marks: &[u64],
 ) {
     if visible.is_empty() {
         let msg = if state.last_error.is_some() {
@@ -249,7 +269,8 @@ fn render_list(
             let snap = &state.snaps[orig_idx];
             let depth = state.lineage_depth(orig_idx);
             let selected = visible_idx == cursor_visible;
-            ListItem::new(snap_row_line(snap, depth, selected))
+            let marked = marks.contains(&snap.snapshot_id);
+            ListItem::new(snap_row_line(snap, depth, selected, marked))
         })
         .collect();
 
@@ -337,10 +358,12 @@ fn render_footer(f: &mut Frame, area: Rect) {
         Span::styled(" Back  ", Style::default().fg(CLR_VALUE)),
         Span::styled(" F3 ", Style::default().bg(CLR_CURSOR_BG).fg(CLR_CURSOR_FG)),
         Span::styled(" Filter  ", Style::default().fg(CLR_VALUE)),
+        Span::styled(" Spc ", Style::default().bg(CLR_CURSOR_BG).fg(CLR_CURSOR_FG)),
+        Span::styled(" Mark  ", Style::default().fg(CLR_VALUE)),
+        Span::styled(" F5 ", Style::default().bg(CLR_CURSOR_BG).fg(CLR_CURSOR_FG)),
+        Span::styled(" Diff  ", Style::default().fg(CLR_VALUE)),
         Span::styled(" ↑↓ ", Style::default().bg(CLR_CURSOR_BG).fg(CLR_CURSOR_FG)),
         Span::styled(" Move  ", Style::default().fg(CLR_VALUE)),
-        Span::styled(" PgUp/PgDn ", Style::default().bg(CLR_CURSOR_BG).fg(CLR_CURSOR_FG)),
-        Span::styled(" Page  ", Style::default().fg(CLR_VALUE)),
         Span::styled(" F10 ", Style::default().bg(CLR_CURSOR_BG).fg(CLR_CURSOR_FG)),
         Span::styled(" Quit", Style::default().fg(CLR_VALUE)),
     ];
@@ -377,7 +400,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                render(f, area, &state, 0, None);
+                render(f, area, &state, 0, None, &[]);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -401,7 +424,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                render(f, area, &state, 0, None);
+                render(f, area, &state, 0, None, &[]);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -425,7 +448,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                render(f, area, &state, 0, None);
+                render(f, area, &state, 0, None, &[]);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -444,7 +467,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                render(f, area, &state, 0, None);
+                render(f, area, &state, 0, None, &[]);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -473,7 +496,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                render(f, area, &state, 0, Some(2));
+                render(f, area, &state, 0, Some(2), &[]);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -488,6 +511,35 @@ mod tests {
     }
 
     #[test]
+    fn render_with_marks_shows_marker_glyph_and_count() {
+        let state = SnapshotGraphState {
+            snaps: vec![
+                mk_snap(1, 0, "alpha", 0),
+                mk_snap(2, 1, "beta", 0),
+                mk_snap(3, 2, "gamma", 0),
+            ],
+            ..Default::default()
+        };
+        let marks = vec![1u64, 3u64];
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render(f, area, &state, 0, None, &marks);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let dump = format!("{buffer:?}");
+        // The ✓ glyph must appear at least twice (one for snap 1, one for snap 3).
+        let check_count = dump.matches('✓').count();
+        assert!(check_count >= 2, "expected ≥ 2 check glyphs; got {check_count}\n{dump}");
+        // Header shows "Marks: 2/2".
+        assert!(dump.contains("Marks:"));
+        assert!(dump.contains("2/2"));
+    }
+
+    #[test]
     fn render_with_filter_no_match_shows_message() {
         let state = SnapshotGraphState {
             snaps: vec![mk_snap(1, 0, "alpha", 0)],
@@ -498,7 +550,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                render(f, area, &state, 0, Some(99));
+                render(f, area, &state, 0, Some(99), &[]);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();

@@ -206,6 +206,115 @@ pub fn parse_snap_body(body: &str) -> Result<SnapshotInfo> {
     Ok(info)
 }
 
+/// SWISS-6 v1.1b: human-readable diff between two snapshots.
+///
+/// Used by the F5 verb in SnapshotGraph view when exactly 2 snaps are
+/// marked (spacebar). Output is a multi-line string suitable for a
+/// LocalDialogKind::Error popup body (line-oriented; ≤ 80 cols).
+///
+/// Ordering: the snap with the smaller `snapshot_id` is treated as
+/// "A" (older); the larger as "B" (newer). Snapshot ids are
+/// monotonically allocated (R29 P3-1 doctrine) so snap_id ordering
+/// equals creation ordering.
+///
+/// Returned content (each line ≤ 60 cols for the 70-col dialog body):
+///   - header: "Diff: <name_a> (#<id_a>) -> <name_b> (#<id_b>)"
+///   - dataset relationship: same dataset (id) OR cross-dataset note
+///   - txg deltas: created-txg diff + extent-txg diff
+///   - lineage: parent ids + whether they share a parent
+///   - hold delta: hold-counts
+///   - flag delta: XOR'd bits with hex display
+pub fn diff_summary(a: &SnapshotInfo, b: &SnapshotInfo) -> String {
+    let (older, newer) = if a.snapshot_id <= b.snapshot_id { (a, b) } else { (b, a) };
+    let mut out = String::with_capacity(512);
+    let name_a = sanitize_name(&older.name);
+    let name_b = sanitize_name(&newer.name);
+    out.push_str(&format!(
+        "Diff: {} (#{}) -> {} (#{})\n",
+        name_a, older.snapshot_id, name_b, newer.snapshot_id
+    ));
+    out.push('\n');
+
+    // Dataset relationship.
+    if older.dataset_id == newer.dataset_id {
+        out.push_str(&format!("Dataset: {}\n", older.dataset_id));
+    } else {
+        out.push_str(&format!(
+            "Dataset: {} -> {} (cross-dataset!)\n",
+            older.dataset_id, newer.dataset_id
+        ));
+    }
+
+    // Txg deltas. Both fields are u64 — older.X <= newer.X is the
+    // expected order for snaps on the same dataset, but cross-dataset
+    // snaps can violate it. Use checked_sub to surface either case.
+    out.push_str(&format!(
+        "created-txg: {} -> {}  (delta {})\n",
+        older.created_txg,
+        newer.created_txg,
+        signed_delta(older.created_txg, newer.created_txg),
+    ));
+    out.push_str(&format!(
+        "extent-txg:  {} -> {}  (delta {})\n",
+        older.extent_txg,
+        newer.extent_txg,
+        signed_delta(older.extent_txg, newer.extent_txg),
+    ));
+
+    // Lineage / parent relationship.
+    if older.prev_snap_id == newer.prev_snap_id {
+        if older.prev_snap_id == 0 {
+            out.push_str("Lineage: both roots (no parent)\n");
+        } else {
+            out.push_str(&format!(
+                "Lineage: shared parent #{}\n",
+                older.prev_snap_id
+            ));
+        }
+    } else if newer.prev_snap_id == older.snapshot_id {
+        out.push_str(&format!(
+            "Lineage: {} is the immediate parent of {}\n",
+            name_a, name_b
+        ));
+    } else {
+        out.push_str(&format!(
+            "Lineage: parents differ (#{}  vs  #{})\n",
+            older.prev_snap_id, newer.prev_snap_id
+        ));
+    }
+
+    // Hold delta.
+    out.push_str(&format!(
+        "hold-count: {} -> {}\n",
+        older.hold_count, newer.hold_count
+    ));
+
+    // Flag delta. XOR exposes the bits that changed; equal flags show
+    // as "(unchanged)" so the most common case is terse.
+    let xor = older.flags ^ newer.flags;
+    if xor == 0 {
+        out.push_str(&format!("flags: 0x{:08x} (unchanged)\n", older.flags));
+    } else {
+        out.push_str(&format!(
+            "flags: 0x{:08x} -> 0x{:08x}  (changed bits 0x{:08x})\n",
+            older.flags, newer.flags, xor
+        ));
+    }
+
+    out
+}
+
+/// Format a signed difference between two u64s. Output is "+N" or "-N"
+/// (or "0"). Avoids panicking on subtraction underflow.
+fn signed_delta(a: u64, b: u64) -> String {
+    if b >= a {
+        let d = b - a;
+        if d == 0 { "0".to_string() } else { format!("+{}", d) }
+    } else {
+        format!("-{}", a - b)
+    }
+}
+
 /// Sanitize a snapshot name for line-oriented display.
 ///
 /// R115 P1-1 doctrine carry — defense-in-depth even though storage
@@ -532,6 +641,92 @@ future-field: some-new-value
             ..Default::default()
         };
         assert_eq!(state.held_count(), 2);
+    }
+
+    #[test]
+    fn diff_summary_immediate_parent() {
+        // a is the immediate parent of b: prev_snap_id of b == id of a.
+        let a = SnapshotInfo { hold_count: 0, ..make_snap(3, 0) };
+        let b = SnapshotInfo {
+            hold_count: 1,
+            flags: 0x4,
+            ..make_snap(5, 3)
+        };
+        let out = diff_summary(&a, &b);
+        // Older id 3 comes first regardless of argument order.
+        assert!(out.starts_with("Diff: snap-3 (#3) -> snap-5 (#5)"));
+        // Immediate-parent lineage detected.
+        assert!(out.contains("is the immediate parent"));
+        // Same dataset (both 1 from make_snap).
+        assert!(out.contains("Dataset: 1\n"));
+        // Hold delta visible.
+        assert!(out.contains("hold-count: 0 -> 1"));
+        // Flag delta surfaces the changed bits.
+        assert!(out.contains("changed bits 0x00000004"));
+    }
+
+    #[test]
+    fn diff_summary_swaps_when_argument_order_inverted() {
+        let a = make_snap(3, 0);
+        let b = make_snap(5, 3);
+        // Pass them in (newer, older) order — function should normalize.
+        let out_ba = diff_summary(&b, &a);
+        let out_ab = diff_summary(&a, &b);
+        assert_eq!(out_ba, out_ab);
+    }
+
+    #[test]
+    fn diff_summary_shared_parent() {
+        let a = make_snap(4, 1);
+        let b = make_snap(5, 1);
+        let out = diff_summary(&a, &b);
+        assert!(out.contains("shared parent #1"));
+    }
+
+    #[test]
+    fn diff_summary_both_roots() {
+        let a = make_snap(1, 0);
+        let b = make_snap(2, 0);
+        let out = diff_summary(&a, &b);
+        assert!(out.contains("both roots"));
+    }
+
+    #[test]
+    fn diff_summary_parents_differ() {
+        let a = make_snap(3, 1);
+        let b = make_snap(5, 2);
+        let out = diff_summary(&a, &b);
+        assert!(out.contains("parents differ"));
+        assert!(out.contains("#1"));
+        assert!(out.contains("#2"));
+    }
+
+    #[test]
+    fn diff_summary_cross_dataset_warning() {
+        let a = SnapshotInfo { dataset_id: 1, ..make_snap(1, 0) };
+        let b = SnapshotInfo { dataset_id: 2, ..make_snap(2, 0) };
+        let out = diff_summary(&a, &b);
+        assert!(out.contains("cross-dataset"), "expected cross-dataset note; got:\n{out}");
+    }
+
+    #[test]
+    fn diff_summary_flags_unchanged_terse() {
+        let a = SnapshotInfo { flags: 0x7, ..make_snap(1, 0) };
+        let b = SnapshotInfo { flags: 0x7, ..make_snap(2, 1) };
+        let out = diff_summary(&a, &b);
+        assert!(out.contains("flags: 0x00000007 (unchanged)"));
+    }
+
+    #[test]
+    fn diff_summary_name_sanitized() {
+        let mut a = make_snap(1, 0);
+        a.name = "evil\x1bname".to_string();
+        let b = make_snap(2, 1);
+        let out = diff_summary(&a, &b);
+        // Control byte replaced with '?'.
+        assert!(out.contains("evil?name"));
+        // The raw ESC byte (0x1B) must NOT survive.
+        assert!(!out.contains('\x1b'));
     }
 
     #[test]

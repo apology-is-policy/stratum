@@ -396,6 +396,13 @@ fn run_ui(
     // every transition into SnapshotGraph for predictable UX (same
     // posture as snapgraph_cursor).
     let mut snapgraph_filter: Option<u64> = None;
+    // SWISS-6 v1.1b: SnapshotGraph marks (spacebar). Vec of
+    // snapshot_ids, NOT indices — references survive snapshot
+    // additions/deletions between ticks. Capped at 2 entries; F5
+    // diffs them when both are present. Cleared on EVERY transition
+    // (F2 toggle, F4 entry, Esc back, F3 filter cycle) so the user
+    // never carries stale marks across view changes.
+    let mut snapgraph_marks: Vec<u64> = Vec::with_capacity(2);
     let result = (|| -> Result<()> {
         loop {
             // SWISS-4h: advance batch ops one step per iteration when
@@ -636,6 +643,7 @@ fn run_ui(
                     snapgraph_snap.as_ref(),
                     snapgraph_cursor,
                     snapgraph_filter,
+                    &snapgraph_marks,
                 )
             })?;
             loop {
@@ -650,6 +658,7 @@ fn run_ui(
                                               &mut view_mode,
                                               &mut snapgraph_cursor,
                                               &mut snapgraph_filter,
+                                              &mut snapgraph_marks,
                                               snapgraph_snap_for_key.as_ref(),
                                               spawn.as_ref(),
                                               &snapshot, key)? {
@@ -701,6 +710,7 @@ fn handle_key(
     view_mode: &mut ViewMode,
     snapgraph_cursor: &mut u32,
     snapgraph_filter: &mut Option<u64>,
+    snapgraph_marks: &mut Vec<u64>,
     snapgraph_state: Option<&SnapshotGraphState>,
     spawn: Option<&Arc<SpawnCtx>>,
     snap: &UiState,
@@ -771,6 +781,10 @@ fn handle_key(
             // transition so the user re-enters SnapshotGraph with a
             // predictable "All" view (parity with snapgraph_cursor).
             *snapgraph_filter = None;
+            // SWISS-6 v1.1b: reset marks on every view transition
+            // (parity with cursor + filter). Marks belong to a single
+            // session of SnapshotGraph use.
+            snapgraph_marks.clear();
         }
         return Ok(Action::Refresh);
     }
@@ -796,6 +810,7 @@ fn handle_key(
             *view_mode = ViewMode::SnapshotGraph;
             *snapgraph_cursor = 0;
             *snapgraph_filter = None;
+            snapgraph_marks.clear();
             search.clear();
         }
         return Ok(Action::Refresh);
@@ -829,6 +844,7 @@ fn handle_key(
             *view_mode = ViewMode::VolumeMap;
             *snapgraph_cursor = 0;
             *snapgraph_filter = None;
+            snapgraph_marks.clear();
             return Ok(Action::Refresh);
         }
         // SWISS-6 v1.1a: F3 cycles the per-dataset filter
@@ -843,6 +859,90 @@ fn handle_key(
             if let Some(sg) = snapgraph_state {
                 *snapgraph_filter = sg.next_filter(*snapgraph_filter);
                 *snapgraph_cursor = 0;
+                // SWISS-6 v1.1b: filter cycle clears marks. The new
+                // filter changes the visible set of snaps; previously-
+                // marked snaps may now be hidden, which would render
+                // confusingly (header reads "Marks: 2/2" but the user
+                // sees zero ✓ glyphs). Clearing marks at the cycle
+                // boundary keeps the visible + header state coherent.
+                snapgraph_marks.clear();
+            }
+            return Ok(Action::Refresh);
+        }
+        // SWISS-6 v1.1b: spacebar toggles a mark on the cursor's snap.
+        // Marks are bounded at 2 entries; the third press is refused
+        // (the user must unmark one first). Marks are keyed by
+        // snapshot_id (NOT visible index) so they survive snap
+        // additions/deletions between ticks. F5 diffs the marked pair.
+        if matches!(key.code, KeyCode::Char(' '))
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+        {
+            if let Some(sg) = snapgraph_state {
+                let visible: Vec<&crate::snapgraph::SnapshotInfo> = sg
+                    .snaps
+                    .iter()
+                    .filter(|s| match *snapgraph_filter {
+                        None => true,
+                        Some(id) => s.dataset_id == id,
+                    })
+                    .collect();
+                let cursor_visible = (*snapgraph_cursor as usize)
+                    .min(visible.len().saturating_sub(1));
+                if !visible.is_empty() && cursor_visible < visible.len() {
+                    let snap_id = visible[cursor_visible].snapshot_id;
+                    if let Some(pos) =
+                        snapgraph_marks.iter().position(|&m| m == snap_id)
+                    {
+                        snapgraph_marks.remove(pos);
+                    } else if snapgraph_marks.len() < 2 {
+                        snapgraph_marks.push(snap_id);
+                    }
+                    // Already 2 marks AND current isn't one of them →
+                    // refuse. The user must unmark before adding a 3rd.
+                }
+            }
+            return Ok(Action::Refresh);
+        }
+        // SWISS-6 v1.1b: F5 diffs the marked pair. If !=2 marks, open
+        // an info dialog. If exactly 2, look both snaps up in the
+        // current state, compute diff_summary, surface in an info
+        // dialog. The state lookup can fail if a marked snap was
+        // deleted between the mark + the F5 — handle gracefully.
+        if matches!(key.code, KeyCode::F(5))
+            && !key.modifiers.contains(KeyModifiers::SHIFT)
+        {
+            if snapgraph_marks.len() != 2 {
+                *local_dialog = Some(info_dialog(&format!(
+                    "Diff requires exactly 2 marked snapshots (currently {}).\n\
+                     Use Spacebar to mark snapshots; F5 again to diff.",
+                    snapgraph_marks.len()
+                )));
+                return Ok(Action::Refresh);
+            }
+            let sg = match snapgraph_state {
+                Some(s) => s,
+                None => {
+                    *local_dialog = Some(info_dialog(
+                        "No snapshot state available (poller not running).",
+                    ));
+                    return Ok(Action::Refresh);
+                }
+            };
+            let a = sg.snaps.iter().find(|s| s.snapshot_id == snapgraph_marks[0]);
+            let b = sg.snaps.iter().find(|s| s.snapshot_id == snapgraph_marks[1]);
+            match (a, b) {
+                (Some(a), Some(b)) => {
+                    let body = crate::snapgraph::diff_summary(a, b);
+                    *local_dialog = Some(info_dialog(&body));
+                }
+                _ => {
+                    *local_dialog = Some(info_dialog(
+                        "One of the marked snapshots is no longer present \
+                         (deleted between mark and diff).",
+                    ));
+                    snapgraph_marks.clear();
+                }
             }
             return Ok(Action::Refresh);
         }
