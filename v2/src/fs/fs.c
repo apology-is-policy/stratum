@@ -377,6 +377,15 @@ stm_status stm_fs_format(const char *path, const stm_fs_format_opts *opts)
  * stm_fs_unmount BEFORE the static definitions below. */
 static stm_status fs_flush_ino_locked(stm_fs *fs, uint64_t ds, uint64_t ino);
 static stm_status fs_flush_all_locked(stm_fs *fs);
+/* R128 P1-1 + P1-2 helpers. The pre returns true iff it actually
+ * truncated extents (i.e., reclaim work is pending); callers gate the
+ * post-reclaim double-commit on that signal so inodes with no extent
+ * payload (directories, symlinks, fresh-anon-then-unlinked, inline-
+ * data-only files) skip the ~200 ms commit pair entirely. */
+static bool fs_pre_inode_free_cleanup_locked(stm_fs *fs, uint64_t ds,
+                                                  uint64_t ino,
+                                                  const struct stm_inode_value *cv);
+static void fs_post_inode_free_reclaim_locked(stm_fs *fs);
 
 static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
                        stm_alloc *a, stm_sync *sync, bool ro,
@@ -1612,12 +1621,34 @@ stm_status stm_fs_unlink_anon(stm_fs *fs, uint64_t dataset_id,
         return STM_EINVAL;
     }
 
+    /* R128 P1-2: orphan-free has no nlink check (anonymous inodes
+     * always have nlink=0 when reachable via this entry point). Drop
+     * the dirty-buffer entry AND truncate the inode's extents BEFORE
+     * the free; otherwise the buffer's (ds, ino) entry outlives the
+     * inode slot's free and surfaces as a confused-deputy write into
+     * whatever inode reuses the slot. Same shape as the canonical
+     * unlink path and rename's overwrite branch. */
+    bool cleanup_did_truncate =
+        fs_pre_inode_free_cleanup_locked(fs, dataset_id, ino, &iv);
+
     /* stm_inode_free transitions ALLOCATED → FREED, sets FREED flag,
      * clears nlink. The ORPHAN flag survives in si_flags but is moot
      * (FREED records aren't readable via lookup). The next AllocReused
      * on this slot's records[] entry will memset the value, clearing
      * both flags. */
     stm_status fs_free = stm_inode_free(iidx, dataset_id, ino);
+
+    /* R128 P1-2 close: reclaim trigger. Same R50 P2-1 strict-less-than
+     * shape as the canonical unlink path's reclaim. Gate on (a) the
+     * pre-cleanup actually truncated extents (otherwise nothing
+     * PENDING needs reclaiming — anon-inode-with-no-data, inline-
+     * only files, directories, symlinks ALL skip the ~200ms commit
+     * pair) AND (b) fs_free == STM_OK so a failed free doesn't
+     * commit half-baked state. */
+    if (cleanup_did_truncate && fs_free == STM_OK) {
+        fs_post_inode_free_reclaim_locked(fs);
+    }
+
     pthread_mutex_unlock(&fs->lock);
     return fs_free;
 }
@@ -1639,6 +1670,59 @@ stm_status stm_fs_mkdir(stm_fs *fs, uint64_t dataset_id,
                                        name, name_len, mode, uid, gid,
                                        (uint32_t)S_IFDIR, STM_DT_DIR,
                                        out_child_ino);
+}
+
+/* R128 P1-1 + P1-2: pre-free cleanup helper. Drops the dirty_buffer
+ * entry for (ds, ino) AND truncates the inode's extents to 0. Caller
+ * MUST hold fs->lock, have looked up `cv`, and be about to free the
+ * inode (via stm_inode_unlink-with-cascade OR direct stm_inode_free).
+ *
+ * The helper is the load-bearing fix for the audit's P1 class: the
+ * dirty buffer is keyed by (dataset_id, ino) ONLY — no si_gen — so
+ * a buffered range that outlives its inode's free path will surface
+ * as a stale write to whatever inode reuses the slot next. Every
+ * inode-freeing site MUST call this BEFORE the free.
+ *
+ * Gates internally on (regular file, EXTENT data kind). nlink check
+ * is the caller's responsibility — fs_unlink_inode_and_dirent guards
+ * with `nlink == 1u` (about-to-cascade-free); stm_fs_unlink_anon does
+ * NO guard (orphan-free is direct); stm_fs_rename's overwrite branch
+ * guards via `dst_freed_unused`'s precondition (nlink == 1 → unlink
+ * cascades).
+ *
+ * Best-effort: a stm_sync_truncate failure here leaves leaked paddrs
+ * but doesn't break the free. Returns nothing.
+ */
+static bool fs_pre_inode_free_cleanup_locked(stm_fs *fs,
+                                                  uint64_t dataset_id,
+                                                  uint64_t ino,
+                                                  const struct stm_inode_value *cv)
+{
+    if (!cv) return false;
+    uint32_t cmode = stm_load_le32(cv->si_mode);
+    bool is_reg = ((cmode & (uint32_t)S_IFMT) == (uint32_t)S_IFREG);
+    bool is_extent = (cv->si_data_kind == STM_DATA_EXTENT);
+    if (is_reg && is_extent) {
+        stm_dirty_buffer_drop_ino(fs->dirty_buffer, dataset_id, ino);
+        (void)stm_sync_truncate(fs->sync, dataset_id, ino, /*new_size=*/0u);
+        return true;
+    }
+    return false;
+}
+
+/* R128 P1-1 + P1-2: post-free reclaim helper. Double-commit to step
+ * the allocator's free_gen past committed_gen (R50 P2-1 strict-less-
+ * than predicate). Caller MUST hold fs->lock. Same posture as the
+ * inline double-commit at the original unlink path's reclaim trigger
+ * (SWISS-4q P2). Extracted so rename + unlink_anon can reuse it.
+ *
+ * Cost: two stm_sync_commit calls (~10-50 ms each on local NVMe).
+ * Acceptable; the alternative is permanent PENDING leak per cycle.
+ */
+static void fs_post_inode_free_reclaim_locked(stm_fs *fs)
+{
+    (void)stm_sync_commit(fs->sync);
+    (void)stm_sync_commit(fs->sync);
 }
 
 /* Common path for unlink / rmdir. `expect_dir` selects the type
@@ -1776,23 +1860,23 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
      * the leak is permanent until offline scrub) but doesn't break
      * the unlink itself. Returns STM_OK on a fresh-inode no-extent
      * case (nothing to drop). */
+    bool cleanup_did_truncate = false;
     {
-        bool is_reg = ((cmode & (uint32_t)S_IFMT) == (uint32_t)S_IFREG);
-        bool is_extent = (cv.si_data_kind == STM_DATA_EXTENT);
         uint32_t cur_nlink = stm_load_le32(cv.si_nlink);
-        if (is_reg && is_extent && cur_nlink == 1u) {
+        if (cur_nlink == 1u) {
             /* SWISS-4q-flush: drop any buffered ranges for this inode
              * BEFORE the extent-layer truncate. Once the inode is
              * gone, buffered plaintext for it is unreachable —
              * destroying it here keeps total_bytes accurate AND
              * prevents a future flush from emitting extents under
-             * a freed inode. v1 step 1 has no inserts so this is
-             * a no-op; the call is in place for the activation
-             * chunk. */
-            stm_dirty_buffer_drop_ino(fs->dirty_buffer,
-                                          dataset_id, child_ino);
-            (void)stm_sync_truncate(fs->sync, dataset_id, child_ino,
-                                         /*new_size=*/0u);
+             * a freed inode. R128 P1-1 close: helper extracted so
+             * rename's overwrite branch + stm_fs_unlink_anon share
+             * the same cleanup. Helper returns true iff it truncated
+             * extents — the post-reclaim double-commit below gates on
+             * that signal so dir/symlink/inline-only unlinks skip the
+             * ~200 ms commit pair entirely. */
+            cleanup_did_truncate = fs_pre_inode_free_cleanup_locked(
+                fs, dataset_id, child_ino, &cv);
         }
     }
 
@@ -1841,10 +1925,19 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
      *
      * Cost: each unlink-of-regular-file takes ~2× longer for the
      * Tfsync that comes from auto-fsync. Acceptable; without this
-     * the volume is unusable past one cycle. */
-    if (freed) {
-        (void)stm_sync_commit(fs->sync);
-        (void)stm_sync_commit(fs->sync);
+     * the volume is unusable past one cycle.
+     *
+     * R128 P1-1 close: helper extracted; rename + unlink_anon share.
+     *
+     * R130 fix: only fire the double-commit when (a) we actually freed
+     * the inode AND (b) the pre-cleanup truncated extents — i.e.,
+     * there's reclaim work pending. Pre-R130 the gate was just
+     * `if (freed)`, so dir/symlink/inline-only files paid the ~200ms
+     * commit pair per unlink even though they had no extents to
+     * reclaim. Triggered by ctest's parallel-4 timeouts when test_fs's
+     * 159 tests each ran a few unlinks. */
+    if (freed && cleanup_did_truncate) {
+        fs_post_inode_free_reclaim_locked(fs);
     }
 
     pthread_mutex_unlock(&fs->lock);
@@ -3106,7 +3199,28 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
      * the chain probes deterministically by hash, so subsequent
      * lookups of dst_name will find the new record). */
     bool dst_freed_unused = false;
+    bool dst_cleanup_did_truncate = false;
     if (dst_exists) {
+        /* R128 P1-1: if dst is about to cascade-free (nlink==1), drop
+         * its dirty-buffer entry AND truncate its extents BEFORE the
+         * inode-unlink. Otherwise the buffer's (ds, dst_ino) entry
+         * outlives the inode slot's free and a future flush emits
+         * extents under whatever inode reuses the slot at a bumped
+         * si_gen — confused-deputy-class data corruption. Same posture
+         * as fs_unlink_inode_and_dirent. Inode lookup is best-effort;
+         * if it fails (e.g., dst_ino already gone — should not happen
+         * since dst_exists is true), the helper is skipped. The
+         * returned truncate-flag gates the post-reclaim double-commit
+         * below (R130 perf: skip the ~200ms commit pair when the
+         * overwritten dst has no extents to reclaim). */
+        struct stm_inode_value dcv = {0};
+        if (stm_inode_lookup(iidx, dataset_id, dst_ino, &dcv) == STM_OK) {
+            uint32_t dst_cur_nlink = stm_load_le32(dcv.si_nlink);
+            if (dst_cur_nlink == 1u) {
+                dst_cleanup_did_truncate = fs_pre_inode_free_cleanup_locked(
+                    fs, dataset_id, dst_ino, &dcv);
+            }
+        }
         stm_status du = stm_dirent_unlink(didx, dataset_id, dst_parent_ino,
                                                 dst_name, dst_name_len);
         if (du != STM_OK) {
@@ -3239,6 +3353,23 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
                 (void)stm_inode_set(iidx, dataset_id, dst_parent_ino, &dpv2);
             }
         }
+    }
+
+    /* R128 P1-1 close: reclaim trigger for the overwrite-cascade-free
+     * path. If dst was overwritten + cascade-freed (dst_freed_unused
+     * is true), its extents were truncated above via
+     * fs_pre_inode_free_cleanup_locked. The allocator now holds
+     * PENDING entries with free_gen=current_gen; without the double-
+     * commit, R50 P2-1's strict-less-than predicate skips the sweep
+     * and the blocks leak as PENDING for the session.
+     *
+     * Same posture as fs_unlink_inode_and_dirent's reclaim. The
+     * non-overwrite rename path (no dst_freed_unused) doesn't free
+     * any extents; skip the reclaim. R130: also gate on whether the
+     * pre-cleanup truncated extents — overwriting a directory or
+     * symlink target (no extents) skips the ~200 ms commit pair. */
+    if (dst_freed_unused && dst_cleanup_did_truncate) {
+        fs_post_inode_free_reclaim_locked(fs);
     }
 
     pthread_mutex_unlock(&fs->lock);
@@ -3959,6 +4090,23 @@ stm_status stm_fs_copy_file_range(stm_fs *fs,
     pthread_mutex_lock(&fs->lock);
     FS_GUARD_WRITE(fs);
 
+    /* R128 P2-1: pre-flush BOTH src and dst before the extent-layer
+     * reflink. fs_reflink_locked iterates src's extent tree to copy
+     * records into dst; buffered ranges on src are NOT in the extent
+     * tree → silently dropped. Same posture as stm_fs_reflink. */
+    {
+        stm_status fr = fs_flush_ino_locked(fs, src_dataset_id, src_ino);
+        if (fr != STM_OK) {
+            pthread_mutex_unlock(&fs->lock);
+            return fr;
+        }
+        fr = fs_flush_ino_locked(fs, dst_dataset_id, dst_ino);
+        if (fr != STM_OK) {
+            pthread_mutex_unlock(&fs->lock);
+            return fr;
+        }
+    }
+
     /* Validate that len matches src's size + delegate to the locked
      * helper — all under the SAME fs->lock acquisition (R84 P2-1). */
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
@@ -3997,6 +4145,15 @@ stm_status stm_fs_migrate_to_cold(stm_fs *fs,
     if (!fs) return STM_EINVAL;
     pthread_mutex_lock(&fs->lock);
     FS_GUARD_WRITE(fs);
+    /* R128 P2-2: pre-flush before the extent-layer migrate. Without
+     * this, buffered ranges aren't visible to stm_sync_migrate_to_cold
+     * (which iterates extent_idx); they'd get flushed AFTER the migrate
+     * as HOT extents, leaving the file partially-cold. */
+    stm_status fr = fs_flush_ino_locked(fs, dataset_id, ino);
+    if (fr != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return fr;
+    }
     stm_status s = stm_sync_migrate_to_cold(fs->sync, dataset_id, ino);
     pthread_mutex_unlock(&fs->lock);
     return s;
@@ -4284,6 +4441,17 @@ stm_status stm_fs_promote_to_hot(stm_fs *fs,
 
     pthread_mutex_lock(&fs->lock);
     FS_GUARD_WRITE(fs);
+    /* R128 P2-2: pre-flush before the extent-layer promote. Without
+     * this, buffered ranges aren't visible to stm_sync_promote_to_hot;
+     * they'd flush AFTER as HOT extents — net-benign if the default
+     * tier IS hot, but the contract "this inode is now fully hot" is
+     * violated if any buffered range sits in flight. Symmetric with
+     * stm_fs_migrate_to_cold. */
+    stm_status fr = fs_flush_ino_locked(fs, dataset_id, ino);
+    if (fr != STM_OK) {
+        pthread_mutex_unlock(&fs->lock);
+        return fr;
+    }
     stm_status rc = stm_sync_promote_to_hot(fs->sync, dataset_id, ino);
     pthread_mutex_unlock(&fs->lock);
     return rc;
@@ -4849,6 +5017,23 @@ stm_status stm_fs_create_snapshot(stm_fs *fs, uint64_t dataset_id,
 
     pthread_mutex_lock(&fs->lock);
     FS_GUARD_WRITE(fs);
+
+    /* R128 P2-3 + SWISS-4q-flush-snapshot close: drain ALL buffered
+     * ranges before the snapshot's extent-tree snapshot point. Without
+     * this, buffered plaintext doesn't reach the extent tree until a
+     * later flush — the snapshot's recorded txg captures only what's
+     * already in extents, missing the user's most recent writes.
+     *
+     * v1.0: over-flushes (every dataset, every inode). Snapshots are
+     * infrequent so the cost is acceptable. v1.1 may add a dataset-
+     * scoped drain (stm_dirty_buffer_drain_dataset). */
+    {
+        stm_status fr = fs_flush_all_locked(fs);
+        if (fr != STM_OK) {
+            pthread_mutex_unlock(&fs->lock);
+            return fr;
+        }
+    }
 
     /* R105 P3-2: validate dataset_id is a PRESENT dataset before
      * creating a snapshot for it. The underlying snapshot.c uses
@@ -5623,6 +5808,24 @@ stm_bdev *stm_fs_bdev_for_test(stm_fs *fs)
 /* P7-4: tests that drive the snapshot/dataset/extent indices need
  * the sync handle. Same lifetime contract as the bdev accessor. */
 stm_sync *stm_fs_sync_for_test(stm_fs *fs)
+{
+    return fs ? fs->sync : NULL;
+}
+
+/* S5-PRE-A: production-shape pool accessor. Borrowed pointer, same
+ * lifetime as the fs handle (set at mount, never rebound). Daemon
+ * code (stratumd) uses this to call stm_ctl_attach_pool against the
+ * /ctl/ instance it surfaces over the wire. */
+stm_pool *stm_fs_pool(stm_fs *fs)
+{
+    return fs ? fs->pool : NULL;
+}
+
+/* S5-PRE-A: production-shape sync accessor. Counterpart to
+ * stm_fs_sync_for_test. Daemon code uses this to construct a
+ * sibling stm_scrub against the fs's sync handle for surface at
+ * /ctl/pools/<uuid>/scrub. */
+stm_sync *stm_fs_sync(stm_fs *fs)
 {
     return fs ? fs->sync : NULL;
 }

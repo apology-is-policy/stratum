@@ -499,6 +499,49 @@ fn space_reclaim_across_write_rm_cycles() {
 }
 
 #[test]
+fn rename_overwrite_reclaims_dst_extents() {
+    // R128 P1-1 regression: rename's overwrite branch used to skip
+    // the drop_ino + truncate + double-commit sequence that the
+    // canonical unlink path performs. Pre-fix, every rename-overwrite
+    // leaked the dst's extents (paddrs stayed PENDING for the session)
+    // AND any dirty-buffer entry keyed at (ds, dst_ino) outlived its
+    // inode → confused-deputy class bug.
+    //
+    // The fix: stm_fs_rename's overwrite branch now calls
+    // fs_pre_inode_free_cleanup_locked + fs_post_inode_free_reclaim_locked
+    // when dst is about to cascade-free (nlink==1 → unlink cascades).
+    //
+    // This test exercises path (b): the paddr-leak shape. Mirrors
+    // space_reclaim_across_write_rm_cycles but uses rename-overwrite.
+    // Without the fix, the first rename leaks ~30 MB of dst's blocks
+    // permanently; after ~5 cycles the volume hits ENOSPC.
+    let s = session();
+    // Two concurrent files must fit (src + dst before rename) in the
+    // default 64 MiB test volume. 20 MB each leaves headroom for
+    // metadata + buffers. Per-cycle churn = 40 MB.
+    let body_a = vec![0xCDu8; 20 * 1024 * 1024]; // 20 MB
+    let body_b = vec![0xABu8; 20 * 1024 * 1024]; // 20 MB
+    for cycle in 1u32..=5 {
+        // Set up: write dst with body_a, write src with body_b.
+        s.fs_write_bytes(&s.stratumd_sock, "/dst", &body_a)
+            .unwrap_or_else(|e| panic!("cycle {cycle} dst write: {e}"));
+        s.fs_write_bytes(&s.stratumd_sock, "/src", &body_b)
+            .unwrap_or_else(|e| panic!("cycle {cycle} src write: {e}"));
+        // Rename src → dst (overwrites dst). Pre-fix: dst's blocks
+        // leak. Post-fix: dst's blocks reclaim via the double-commit.
+        s.fs_run(&s.stratumd_sock, &["mv", "/src", "/dst"], Stdio::null())
+            .unwrap_or_else(|e| panic!("cycle {cycle} mv: {e}"));
+        // Clean up for next iteration.
+        s.fs_rm(&s.stratumd_sock, "/dst")
+            .unwrap_or_else(|e| panic!("cycle {cycle} cleanup rm: {e}"));
+    }
+    // Final write should succeed — total churn was 5 × 2 × 30 MB = 300 MB.
+    s.fs_write_bytes(&s.stratumd_sock, "/final.bin", &body_a).unwrap();
+    let read = s.fs_read(&s.stratumd_sock, "/final.bin").unwrap();
+    assert_eq!(read.len(), body_a.len());
+}
+
+#[test]
 fn write_unaligned_tail_4623_bytes() {
     // SWISS-4q P1 regression: real video files (and most real
     // workloads) have a logical size that isn't a multiple of
