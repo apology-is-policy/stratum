@@ -246,6 +246,14 @@ pub enum ConfirmAction {
         snap_id: u64,
         name: String,
     },
+    /// SWISS-8h: F8 in the Integrity pane → trigger a pool scrub
+    /// via /ctl/pools/<uuid>/scrub-trigger (admin write).
+    /// Body is the verb: "start" / "pause" / "resume" / "abort".
+    /// v1.0 only wires "start"; future v1.1 may add pause/resume.
+    ScrubTrigger {
+        pool_uuid: String,
+        verb: String,
+    },
 }
 
 /// SWISS-4c: state for the mkfs wizard. v1.0 collects only Name +

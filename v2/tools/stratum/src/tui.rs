@@ -177,6 +177,33 @@ struct DeleteWorker {
     item_name: String,
 }
 
+/// SWISS-8g: in-progress async /ctl/ admin job. Spawned on a
+/// background thread so the UI stays responsive while stratumd
+/// processes a slow write (snapshot create can flush dirty buffers
+/// → seconds-long pause). The main loop polls `rx` for completion;
+/// while in flight, `local_dialog` shows an info_dialog with the
+/// `working_msg`.
+struct CtlJob {
+    /// Channel receiving the (exit_status, stderr) tuple from the
+    /// background thread.
+    rx: std::sync::mpsc::Receiver<CtlJobResult>,
+    /// Dialog message shown on success (info_dialog).
+    success_msg: String,
+    /// Background thread handle. Not joined — process exit reclaims.
+    _join: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Debug)]
+enum CtlJobResult {
+    /// Process exited cleanly (status.success()).
+    Ok,
+    /// Process exited non-zero. Includes the first stderr line for
+    /// user-facing display.
+    Err(String),
+    /// Process failed to spawn or wait.
+    SpawnErr(String),
+}
+
 /// SWISS-4h: in-progress batch copy. The TUI owns this state in
 /// run_ui; each main-loop iteration advances one file when no
 /// dialog is up. On conflict, opens the conflict dialog. On
@@ -360,6 +387,12 @@ fn run_ui(
     // SWISS-4h: in-progress batch ops driven by the main loop.
     let mut copy_batch: Option<CopyBatch> = None;
     let mut delete_batch: Option<DeleteBatch> = None;
+    // SWISS-8g: in-progress /ctl/ admin job (snapshot create/delete /
+    // scrub trigger). Runs on a background thread so the UI stays
+    // responsive while stratumd processes the write. The main loop
+    // polls completion via advance_ctl_job; while in flight the
+    // user sees an info_dialog "Working…" message.
+    let mut ctl_job: Option<CtlJob> = None;
     // SWISS-4n: type-to-jump prefix-search state (see SearchState
     // doc for behavior). Lives across handle_key calls so a user
     // can type "ph" then "o" and have the cursor land on "photo.jpg".
@@ -408,6 +441,14 @@ fn run_ui(
     let mut snapgraph_marks: Vec<u64> = Vec::with_capacity(2);
     let result = (|| -> Result<()> {
         loop {
+            // SWISS-8g: tick the in-progress /ctl/ admin job (if any)
+            // FIRST so completion swaps in a success/error dialog
+            // BEFORE the rest of the loop runs. Ticked even when a
+            // local_dialog is up — the "Working…" dialog IS the dialog
+            // we want to replace.
+            if ctl_job.is_some() {
+                advance_ctl_job(&mut local_dialog, &mut ctl_job);
+            }
             // SWISS-4h: advance batch ops one step per iteration when
             // no dialog is up. Conflict (CopyBatch) opens a dialog
             // that pauses the loop until user picks; the next
@@ -656,6 +697,8 @@ fn run_ui(
                         Event::Key(key) if key.kind == KeyEventKind::Press => {
                             let snapgraph_snap_for_key =
                                 snapgraph_poller.as_ref().map(|p| p.snapshot());
+                            let volmap_snap_for_key =
+                                volmap_poller.as_ref().map(|p| p.snapshot());
                             match handle_key(client, &mut focus, &mut local_dialog,
                                               &mut editor, &mut copy_batch,
                                               &mut delete_batch, &mut search,
@@ -664,7 +707,9 @@ fn run_ui(
                                               &mut snapgraph_cursor,
                                               &mut snapgraph_filter,
                                               &mut snapgraph_marks,
+                                              &mut ctl_job,
                                               snapgraph_snap_for_key.as_ref(),
+                                              volmap_snap_for_key.as_ref(),
                                               spawn.as_ref(),
                                               &snapshot, key)? {
                                 Action::Quit => return Ok(()),
@@ -678,7 +723,12 @@ fn run_ui(
                 }
                 // SWISS-4h: tick the main loop so a batch in progress
                 // can advance even without keyboard activity.
-                if copy_batch.is_some() || delete_batch.is_some() {
+                // SWISS-8g: same for in-progress /ctl/ admin jobs —
+                // their completion (over an mpsc channel) needs to
+                // surface as a dialog replacement.
+                if copy_batch.is_some() || delete_batch.is_some()
+                    || ctl_job.is_some()
+                {
                     break;
                 }
                 let mut woke = false;
@@ -717,7 +767,9 @@ fn handle_key(
     snapgraph_cursor: &mut u32,
     snapgraph_filter: &mut Option<u64>,
     snapgraph_marks: &mut Vec<u64>,
+    ctl_job: &mut Option<CtlJob>,
     snapgraph_state: Option<&SnapshotGraphState>,
+    volmap_state: Option<&crate::volmap::VolumeMapState>,
     spawn: Option<&Arc<SpawnCtx>>,
     snap: &UiState,
     key: crossterm::event::KeyEvent,
@@ -727,7 +779,7 @@ fn handle_key(
         // Any input inside a dialog clears the panel's search buffer
         // — the user has switched contexts.
         search.clear();
-        return handle_dialog_key(local_dialog, spawn, snap, key);
+        return handle_dialog_key(local_dialog, ctl_job, spawn, snap, key);
     }
     // SWISS-4e: editor modal layer (after dialog).
     if editor.is_some() {
@@ -795,7 +847,7 @@ fn handle_key(
         return handle_f2view_key(
             local_dialog, view_mode, f2_state,
             snapgraph_cursor, snapgraph_filter, snapgraph_marks,
-            snapgraph_state, key,
+            snapgraph_state, volmap_state, key,
         );
     }
     // SWISS-4j: Esc cancels an in-progress batch (no dialog, no
@@ -1134,6 +1186,7 @@ fn handle_f2view_key(
     snapgraph_filter: &mut Option<u64>,
     snapgraph_marks: &mut Vec<u64>,
     snapgraph_state: Option<&SnapshotGraphState>,
+    volmap_state: Option<&crate::volmap::VolumeMapState>,
     key: crossterm::event::KeyEvent,
 ) -> Result<Action> {
     // Esc closes back to Files. Higher priority than any focus-
@@ -1161,7 +1214,8 @@ fn handle_f2view_key(
     match f2_state.focus {
         ui::F2Focus::Menu => handle_f2view_menu_key(f2_state, snapgraph_cursor, snapgraph_filter, snapgraph_marks, key),
         ui::F2Focus::Content => handle_f2view_content_key(
-            local_dialog, f2_state, snapgraph_cursor, snapgraph_filter, snapgraph_marks, snapgraph_state, key,
+            local_dialog, f2_state, snapgraph_cursor, snapgraph_filter, snapgraph_marks,
+            snapgraph_state, volmap_state, key,
         ),
     }
 }
@@ -1226,19 +1280,72 @@ fn handle_f2view_content_key(
     snapgraph_filter: &mut Option<u64>,
     snapgraph_marks: &mut Vec<u64>,
     snapgraph_state: Option<&SnapshotGraphState>,
+    volmap_state: Option<&crate::volmap::VolumeMapState>,
     key: crossterm::event::KeyEvent,
 ) -> Result<Action> {
-    // Per-pane dispatch. Only Snapshot Graph has interactive keys at
-    // v1.0; the other panes drop every key (focus=Content is still a
-    // meaningful state visually — the right border highlights — but
-    // there's nothing to navigate).
+    // Per-pane dispatch.
     match f2_state.pane {
         ui::F2Pane::SnapshotGraph => handle_snapgraph_content_key(
             local_dialog, snapgraph_cursor, snapgraph_filter, snapgraph_marks,
             snapgraph_state, key,
         ),
+        ui::F2Pane::Integrity => handle_integrity_content_key(
+            local_dialog, volmap_state, key,
+        ),
         _ => Ok(Action::Ignore),
     }
+}
+
+/// SWISS-8h: in-Integrity key dispatcher. v1.0 wires:
+///   F8 → confirm + trigger scrub start.
+/// Future v1.1 may add pause/resume/abort (each via the same /ctl/
+/// scrub-trigger admin verb with a different body).
+fn handle_integrity_content_key(
+    local_dialog: &mut Option<LocalDialog>,
+    volmap_state: Option<&crate::volmap::VolumeMapState>,
+    key: crossterm::event::KeyEvent,
+) -> Result<Action> {
+    if matches!(key.code, KeyCode::F(8))
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+    {
+        let pool_uuid = match volmap_state.and_then(|s| s.pool_uuid.clone()) {
+            Some(u) => u,
+            None => {
+                *local_dialog = Some(error_dialog(
+                    "Cannot start scrub: pool not attached yet.\n\
+                     Open a Stratum volume first, then retry.",
+                ));
+                return Ok(Action::Refresh);
+            }
+        };
+        // Pre-confirm prompt. Default selection is "No" — destructive-
+        // adjacent: a scrub is read-only at the data layer but kicks
+        // off a multi-hour I/O scan, and users shouldn't fire it
+        // accidentally.
+        *local_dialog = Some(LocalDialog {
+            kind: LocalDialogKind::Confirm {
+                options: vec!["No".to_string(), "Yes".to_string()],
+                selected: 0,
+                on_pick: ConfirmAction::ScrubTrigger {
+                    pool_uuid,
+                    verb: "start".to_string(),
+                },
+            },
+            prompt:
+                "Start a pool scrub now?\n\
+                 \n\
+                 Scrub verifies every committed block against its\n\
+                 stored Merkle hash + repairs blocks that fail. It\n\
+                 can take minutes to hours on large pools; progress\n\
+                 is visible here in the Integrity pane."
+                .to_string(),
+            value: String::new(),
+            is_password: false,
+            is_error: false,
+        });
+        return Ok(Action::Refresh);
+    }
+    Ok(Action::Ignore)
 }
 
 fn handle_snapgraph_content_key(
@@ -1365,6 +1472,7 @@ fn handle_snapgraph_content_key(
 /// on Ok submits via spawn_mkfs).
 fn handle_dialog_key(
     local_dialog: &mut Option<LocalDialog>,
+    ctl_job: &mut Option<CtlJob>,
     spawn: Option<&Arc<SpawnCtx>>,
     snap: &UiState,
     key: crossterm::event::KeyEvent,
@@ -1382,7 +1490,7 @@ fn handle_dialog_key(
         local_dialog.as_ref().map(|d| &d.kind),
         Some(LocalDialogKind::Confirm { .. })
     ) {
-        return handle_confirm_key(local_dialog, spawn, snap, key);
+        return handle_confirm_key(local_dialog, ctl_job, spawn, snap, key);
     }
     // SWISS-8c: SnapshotList dispatch — Up/Down nav, N/D/R/Enter verbs.
     if matches!(
@@ -1401,7 +1509,7 @@ fn handle_dialog_key(
         }
         KeyCode::Enter => {
             let dialog = local_dialog.take().unwrap();
-            return submit_dialog(local_dialog, spawn, snap, dialog);
+            return submit_dialog(local_dialog, ctl_job, spawn, snap, dialog);
         }
         KeyCode::Backspace => {
             d.value.pop();
@@ -1423,6 +1531,7 @@ fn handle_dialog_key(
 /// one (calls into submit_confirm); Esc cancels.
 fn handle_confirm_key(
     local_dialog: &mut Option<LocalDialog>,
+    ctl_job: &mut Option<CtlJob>,
     spawn: Option<&Arc<SpawnCtx>>,
     _snap: &UiState,
     key: crossterm::event::KeyEvent,
@@ -1454,7 +1563,7 @@ fn handle_confirm_key(
         KeyCode::Enter => {
             let picked_idx = *selected;
             let dialog = local_dialog.take().unwrap();
-            return submit_confirm(local_dialog, spawn, dialog, picked_idx);
+            return submit_confirm(local_dialog, ctl_job, spawn, dialog, picked_idx);
         }
         _ => {}
     }
@@ -1580,8 +1689,121 @@ fn handle_snap_list_key(
     Ok(Action::Ignore)
 }
 
+/// SWISS-8g: spawn an async /ctl/ admin write on a background thread.
+///
+/// Returns a CtlJob the caller stashes into `run_ui`'s state; the
+/// main loop polls `advance_ctl_job` each iteration. While the job
+/// runs, `local_dialog` should display an info_dialog "Working…"
+/// message so the user understands the UI is intentionally paused
+/// on this one screen.
+///
+/// `body` is piped to the child's stdin then EOF; the child writes
+/// it to `p9_path` via `stratum fs -s <ctl_sock> write <p9_path>`.
+/// On success, the CtlJob's `success_msg` is shown in an
+/// info_dialog; on non-zero exit, the first line of stderr is shown
+/// in error_dialog form.
+fn spawn_ctl_job(
+    ctl_sock: PathBuf,
+    p9_path: String,
+    body: Vec<u8>,
+    success_msg: String,
+) -> CtlJob {
+    use std::sync::mpsc;
+    let (tx, rx) = mpsc::channel();
+    let me = std::env::current_exe()
+        .unwrap_or_else(|_| std::path::PathBuf::from("stratum"));
+    let join = std::thread::spawn(move || {
+        use std::io::Write;
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        let mut child = match Command::new(&me)
+            .args(&[
+                "fs", "-s",
+                ctl_sock.to_string_lossy().as_ref(),
+                "write", &p9_path,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tx.send(CtlJobResult::SpawnErr(format!("{e}")));
+                return;
+            }
+        };
+        if let Some(stdin) = child.stdin.as_mut() {
+            let _ = stdin.write_all(&body);
+        }
+        drop(child.stdin.take());
+        match child.wait_with_output() {
+            Ok(out) if out.status.success() => {
+                let _ = tx.send(CtlJobResult::Ok);
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let first = stderr.lines().next().unwrap_or("(no detail)").trim().to_string();
+                let _ = tx.send(CtlJobResult::Err(format!(
+                    "exit {}: {}",
+                    out.status.code().unwrap_or(-1),
+                    first
+                )));
+            }
+            Err(e) => {
+                let _ = tx.send(CtlJobResult::SpawnErr(format!("wait: {e}")));
+            }
+        }
+    });
+    CtlJob {
+        rx,
+        success_msg,
+        _join: Some(join),
+    }
+}
+
+/// SWISS-8g: drive an in-progress CtlJob from the main loop. Polls
+/// the channel; on completion, replaces `local_dialog` with the
+/// success / error message + clears the job. Returns `Some(())`
+/// when the job completed this tick (caller should clear its own
+/// reference) or `None` if still running.
+fn advance_ctl_job(
+    local_dialog: &mut Option<LocalDialog>,
+    ctl_job: &mut Option<CtlJob>,
+) -> Option<()> {
+    let job = ctl_job.as_ref()?;
+    match job.rx.try_recv() {
+        Ok(CtlJobResult::Ok) => {
+            let msg = job.success_msg.clone();
+            *local_dialog = Some(info_dialog(&msg));
+            *ctl_job = None;
+            Some(())
+        }
+        Ok(CtlJobResult::Err(detail)) => {
+            *local_dialog = Some(error_dialog(&detail));
+            *ctl_job = None;
+            Some(())
+        }
+        Ok(CtlJobResult::SpawnErr(detail)) => {
+            *local_dialog = Some(error_dialog(&format!("ctl-job: {detail}")));
+            *ctl_job = None;
+            Some(())
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty) => None,
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            *local_dialog = Some(error_dialog(
+                "ctl-job: background thread disconnected without sending result",
+            ));
+            *ctl_job = None;
+            Some(())
+        }
+    }
+}
+
 fn submit_confirm(
     local_dialog: &mut Option<LocalDialog>,
+    ctl_job: &mut Option<CtlJob>,
     spawn: Option<&Arc<SpawnCtx>>,
     dialog: LocalDialog,
     picked_idx: usize,
@@ -1689,51 +1911,56 @@ fn submit_confirm(
                     return Ok(Action::Refresh);
                 }
             };
+            // SWISS-8g: dispatch as async ctl_job.
             let p9_path = format!("/datasets/{dataset_id}/delete-snapshot");
-            use std::io::Write;
-            use std::os::unix::process::CommandExt;
-            use std::process::{Command, Stdio};
-            let me = std::env::current_exe()
-                .unwrap_or_else(|_| std::path::PathBuf::from("stratum"));
-            let mut child = match Command::new(&me)
-                .args(&[
-                    "fs", "-s", ctl_sock.to_string_lossy().as_ref(),
-                    "write", &p9_path,
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .process_group(0)
-                .spawn()
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    *local_dialog = Some(error_dialog(&format!("delete spawn: {e}")));
+            *ctl_job = Some(spawn_ctl_job(
+                ctl_sock,
+                p9_path,
+                format!("{snap_id}").into_bytes(),
+                format!("Snapshot deleted: {name} (#{snap_id})"),
+            ));
+            *local_dialog = Some(info_dialog(&format!(
+                "Deleting snapshot \"{name}\" (#{snap_id})…\n\
+                 \n\
+                 stratumd is updating the snapshot chain + freeing\n\
+                 unreferenced extents. This usually takes < 1 s but\n\
+                 can be longer on a heavily-snapshotted volume."
+            )));
+            Ok(Action::Refresh)
+        }
+        ConfirmAction::ScrubTrigger { pool_uuid, verb } => {
+            // SWISS-8h: F8 in Integrity → confirm → trigger scrub.
+            if label != "Yes" {
+                return Ok(Action::Refresh);
+            }
+            let sp = match spawn {
+                Some(s) => s,
+                None => {
+                    *local_dialog = Some(error_dialog(
+                        "Scrub failed: spawn helper unavailable.",
+                    ));
                     return Ok(Action::Refresh);
                 }
             };
-            if let Some(stdin) = child.stdin.as_mut() {
-                let _ = stdin.write_all(format!("{snap_id}").as_bytes());
-            }
-            drop(child.stdin.take());
-            match child.wait_with_output() {
-                Ok(out) if out.status.success() => {
-                    *local_dialog = Some(info_dialog(&format!(
-                        "Snapshot deleted: {name} (#{snap_id})"
-                    )));
+            let ctl_sock = match sp.current_ctl_sock() {
+                Some(p) => p,
+                None => {
+                    *local_dialog = Some(error_dialog(
+                        "Scrub failed: stratum /ctl/ socket missing.",
+                    ));
+                    return Ok(Action::Refresh);
                 }
-                Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    *local_dialog = Some(error_dialog(&format!(
-                        "delete failed (exit {}): {}",
-                        out.status.code().unwrap_or(-1),
-                        stderr.lines().next().unwrap_or("(no detail)").trim()
-                    )));
-                }
-                Err(e) => {
-                    *local_dialog = Some(error_dialog(&format!("delete wait: {e}")));
-                }
-            }
+            };
+            let p9_path = format!("/pools/{pool_uuid}/scrub-trigger");
+            *ctl_job = Some(spawn_ctl_job(
+                ctl_sock,
+                p9_path,
+                verb.as_bytes().to_vec(),
+                format!("Scrub {verb}: queued. Watch the Integrity pane for progress."),
+            ));
+            *local_dialog = Some(info_dialog(&format!(
+                "Sending scrub {verb} request…"
+            )));
             Ok(Action::Refresh)
         }
         ConfirmAction::CopyConflict { src, dst, is_dir } => {
@@ -2098,6 +2325,7 @@ fn submit_mkvol(
 
 fn submit_dialog(
     local_dialog: &mut Option<LocalDialog>,
+    ctl_job: &mut Option<CtlJob>,
     spawn: Option<&Arc<SpawnCtx>>,
     snap: &UiState,
     dialog: LocalDialog,
@@ -2243,51 +2471,23 @@ fn submit_dialog(
                 ));
                 return Ok(Action::Refresh);
             }
+            // SWISS-8g: dispatch as async ctl_job — the wait was
+            // freezing the UI when stratumd took >1 s (snapshot
+            // create flushes the dirty buffer, which can be slow).
             let p9_path = format!("/datasets/{dataset_id}/create-snapshot");
-            use std::io::Write;
-            use std::os::unix::process::CommandExt;
-            use std::process::{Command, Stdio};
-            let me = std::env::current_exe()
-                .unwrap_or_else(|_| std::path::PathBuf::from("stratum"));
-            let mut child = match Command::new(&me)
-                .args(&[
-                    "fs", "-s", ctl_sock.to_string_lossy().as_ref(),
-                    "write", &p9_path,
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .process_group(0)
-                .spawn()
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    *local_dialog = Some(error_dialog(&format!("snap spawn: {e}")));
-                    return Ok(Action::Refresh);
-                }
-            };
-            if let Some(stdin) = child.stdin.as_mut() {
-                let _ = stdin.write_all(name.as_bytes());
-            }
-            drop(child.stdin.take());
-            match child.wait_with_output() {
-                Ok(out) if out.status.success() => {
-                    *local_dialog = Some(error_dialog(&format!(
-                        "Snapshot created: {name}"
-                    )));
-                }
-                Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    *local_dialog = Some(error_dialog(&format!(
-                        "snap failed (exit {}): {}",
-                        out.status.code().unwrap_or(-1),
-                        stderr.lines().next().unwrap_or("(no detail)").trim()
-                    )));
-                }
-                Err(e) => {
-                    *local_dialog = Some(error_dialog(&format!("snap wait: {e}")));
-                }
-            }
+            *ctl_job = Some(spawn_ctl_job(
+                ctl_sock,
+                p9_path,
+                name.as_bytes().to_vec(),
+                format!("Snapshot created: {name}"),
+            ));
+            *local_dialog = Some(info_dialog(&format!(
+                "Creating snapshot \"{name}\"…\n\
+                 \n\
+                 stratumd is flushing the dirty buffer + writing the\n\
+                 snapshot record. This usually takes < 1 s but can be\n\
+                 longer on a busy volume."
+            )));
             Ok(Action::Refresh)
         }
         LocalDialogKind::PassphraseFor { volume } => {
