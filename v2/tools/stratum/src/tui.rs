@@ -157,9 +157,16 @@ enum ConflictPolicy {
 ///
 /// `dst_name` is kept on the handle so the progress dialog can show
 /// "Copying X..." even before the worker has bumped bytes_done.
+///
+/// `dst_poll_path` is Some(host_path) when the dst is on the host
+/// filesystem — the main loop stats it every tick to surface intra-
+/// file progress (host stat is ~10μs; polling cost is negligible).
+/// None for stratum-fs dst (stat-via-subprocess is too expensive
+/// for the hot path); those copies fall back to the spinner.
 struct CopyWorker {
     handle: thread::JoinHandle<std::io::Result<CopyOutcome>>,
     dst_name: String,
+    dst_poll_path: Option<PathBuf>,
 }
 
 /// SWISS-4q-worker: in-flight delete of a single batch item. Same
@@ -462,12 +469,30 @@ fn run_ui(
             // batch's rolling window. Sampling at every redraw tick
             // (~50–100ms) gives the chart enough density without
             // burning frames on the rate calc.
+            /* SWISS-4q-worker-bytes: poll the in-flight worker's
+             * host-fs dst file size each tick. Cheap stat (~10μs);
+             * surfaces intra-file progress so a single-large-file
+             * copy gets a moving percentage instead of staying at
+             * 0% until the file completes. Stratum-fs dst skips
+             * the poll (dst_poll_path is None there) and falls
+             * back to the spinner. */
+            if let Some(b) = copy_batch.as_ref() {
+                if let Some(w) = b.worker.as_ref() {
+                    if let Some(path) = w.dst_poll_path.as_deref() {
+                        let sz = std::fs::metadata(path)
+                            .map(|m| m.len())
+                            .unwrap_or(0);
+                        set_intra_file_bytes(sz);
+                    }
+                }
+            }
             if let Some(b) = copy_batch.as_mut() {
                 let now = Instant::now();
                 let dt = now.duration_since(b.last_sample_instant)
                     .as_secs_f64();
                 if dt >= 0.05 {
-                    let cur_bytes = read_bytes_done();
+                    let cur_bytes = read_bytes_done()
+                        + read_intra_file_bytes();
                     let db = cur_bytes.saturating_sub(b.last_sample_bytes) as f64;
                     let bps = if dt > 0.0 { db / dt } else { 0.0 };
                     b.samples.push(crate::ui::ThroughputSample { bytes_per_sec: bps });
@@ -500,7 +525,11 @@ fn run_ui(
                     copied: b.copied,
                     skipped: b.skipped,
                     failed: b.failed,
-                    bytes_done: read_bytes_done(),
+                    /* SWISS-4q-worker-bytes: cumulative completed
+                     * + in-flight bytes (the latter only non-zero
+                     * for host-fs dst). */
+                    bytes_done: read_bytes_done()
+                        + read_intra_file_bytes(),
                     elapsed_secs,
                     samples: b.samples.clone(),
                 })
@@ -2547,7 +2576,19 @@ fn advance_copy_batch(
         if !w.handle.is_finished() {
             return Ok(Some(BatchTick::More));
         }
-        /* Worker done — join + accumulate. */
+        /* Worker done. Bytes accounting:
+         *   - host-fs dst (dst_poll_path set): the worker did NOT
+         *     bump COPY_BYTES_DONE; promote INTRA_FILE_BYTES (the
+         *     last polled file size, ≈ final size) into
+         *     COPY_BYTES_DONE in one shot, then clear intra.
+         *   - stratum-fs dst: the worker already bumped at completion.
+         *     Just clear intra (it was always 0 since no polling). */
+        if let Some(w) = batch.worker.as_ref() {
+            if w.dst_poll_path.is_some() {
+                bump_bytes(read_intra_file_bytes());
+            }
+        }
+        set_intra_file_bytes(0);
         let w = batch.worker.take().unwrap();
         let res = w.handle.join().unwrap_or_else(|_| {
             Err(std::io::Error::new(std::io::ErrorKind::Other,
@@ -2678,6 +2719,17 @@ fn spawn_copy_worker(
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| dst.display().to_string());
+    /* SWISS-4q-worker-bytes: capture the host-fs dst path for cheap
+     * mid-copy stat polling. Only set when dst is on host-fs AND
+     * the item is a file (directory copies don't have a meaningful
+     * file size; mkdir is instant anyway). */
+    let dst_poll_path = match (&dst_meta, is_dir) {
+        (BackendMeta::HostFs { .. }, false) => Some(dst.clone()),
+        _ => None,
+    };
+    /* Reset intra counter at every spawn so a previous file's
+     * trailing read doesn't bleed into this file's progress. */
+    set_intra_file_bytes(0);
     let handle = thread::Builder::new()
         .name("stratum-copy".into())
         .spawn(move || {
@@ -2687,7 +2739,7 @@ fn spawn_copy_worker(
             )
         })
         .expect("spawn copy worker");
-    batch.worker = Some(CopyWorker { handle, dst_name });
+    batch.worker = Some(CopyWorker { handle, dst_name, dst_poll_path });
 }
 
 #[derive(Debug)]
@@ -2730,6 +2782,17 @@ fn perform_copy_one(
         None => dst.to_path_buf(),
     };
 
+    /* SWISS-4q-worker-bytes accounting rule:
+     *   - Stratum-fs dst: the worker bumps COPY_BYTES_DONE here at
+     *     completion, because the main loop CANNOT cheaply poll dst
+     *     size mid-copy (stat-via-subprocess is too expensive).
+     *   - Host-fs dst: the worker does NOT bump here. The main loop
+     *     polls the dst path every tick → INTRA_FILE_BYTES tracks
+     *     the live size. When the worker completes the main loop
+     *     consumes intra into COPY_BYTES_DONE in one shot. This
+     *     avoids the brief "bytes_done + intra = 2× size" blip that
+     *     would happen if both the worker AND the main-loop poll
+     *     contributed at the moment the worker returned. */
     match (src_meta, dst_meta) {
         (BackendMeta::HostFs { .. }, BackendMeta::HostFs { .. }) => {
             if is_dir {
@@ -2739,7 +2802,7 @@ fn perform_copy_one(
                 std::fs::create_dir_all(&dst_path)?;
             } else {
                 std::fs::copy(src, &dst_path)?;
-                bump_bytes(dst_path.metadata().ok().map(|m| m.len()).unwrap_or(0));
+                /* host-fs dst → main loop handles bytes accounting. */
             }
             Ok(CopyOutcome::Copied)
         }
@@ -2762,7 +2825,7 @@ fn perform_copy_one(
                                    std::process::Stdio::from(f),
                                    std::process::Stdio::null())
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-                bump_bytes(sz);
+                bump_bytes(sz);     /* stratum-fs dst → worker bumps. */
             }
             Ok(CopyOutcome::Copied)
         }
@@ -2778,8 +2841,7 @@ fn perform_copy_one(
                                    std::process::Stdio::null(),
                                    std::process::Stdio::from(f))
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-                let sz = std::fs::metadata(&dst_path).map(|m| m.len()).unwrap_or(0);
-                bump_bytes(sz);
+                /* host-fs dst → main loop handles bytes accounting. */
             }
             Ok(CopyOutcome::Copied)
         }
@@ -2828,9 +2890,22 @@ fn perform_copy_one(
 
 /// SWISS-4q-worker: cumulative bytes completed in the current
 /// CopyBatch, shared between the main loop and the worker thread.
-/// Worker bumps; main loop reads at every redraw tick. Process-
-/// global because we only ever run one batch at a time.
+/// Worker bumps at file-completion; main loop reads at every redraw
+/// tick. Process-global because we only ever run one batch at a time.
 static COPY_BYTES_DONE: AtomicU64 = AtomicU64::new(0);
+
+/// SWISS-4q-worker-bytes: in-flight bytes for the CURRENT file in
+/// the active copy worker. Updated by the main loop via a periodic
+/// stat() on the worker's host-fs dst path. Zeroed when the worker
+/// completes (the worker's bump_bytes call to COPY_BYTES_DONE takes
+/// over the accounting).
+///
+/// Polling discipline:
+///   - host-fs dst: stat() is ~10μs → poll every redraw tick (~100 ms).
+///     Net cost ~0.1 ms/sec, negligible vs the copy itself.
+///   - stratum-fs dst: stat is a subprocess (~10 ms) → DO NOT poll
+///     in the hot path. The dialog falls back to the spinner.
+static INTRA_FILE_BYTES: AtomicU64 = AtomicU64::new(0);
 
 fn bump_bytes(n: u64) {
     COPY_BYTES_DONE.fetch_add(n, Ordering::Relaxed);
@@ -2838,8 +2913,15 @@ fn bump_bytes(n: u64) {
 fn read_bytes_done() -> u64 {
     COPY_BYTES_DONE.load(Ordering::Relaxed)
 }
+fn read_intra_file_bytes() -> u64 {
+    INTRA_FILE_BYTES.load(Ordering::Relaxed)
+}
+fn set_intra_file_bytes(n: u64) {
+    INTRA_FILE_BYTES.store(n, Ordering::Relaxed);
+}
 fn reset_bytes_done() {
     COPY_BYTES_DONE.store(0, Ordering::Relaxed);
+    INTRA_FILE_BYTES.store(0, Ordering::Relaxed);
 }
 
 /// Parse `stratum fs ls` output ("kind name\n" per entry). Skips
