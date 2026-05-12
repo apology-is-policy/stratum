@@ -844,4 +844,132 @@ STM_TEST(per_inode_rename_shared_parents_opposite_direction) {
     unlink(g_key_path);
 }
 
+/* ── PARALLEL-3 impl-4: reflink/cfr 2-inode concurrency ──────────────── */
+
+#define REFLINK_ITERATIONS  100u
+
+typedef struct {
+    stm_fs *fs;
+    uint64_t dataset_id;
+    uint64_t parent_ino;
+    const char *src_prefix;     /* fresh-src file per iteration */
+    const char *dst_prefix;     /* fresh-dst file per iteration */
+    unsigned iterations;
+    atomic_int err;
+    atomic_uint completed;
+    atomic_bool done;
+} reflink_ctx;
+
+/* Each iteration: create src + dst (both regular files), copy_file_range
+ * src → dst (whole file, MVP scope), then unlink both. */
+static void *reflink_thread(void *arg)
+{
+    reflink_ctx *s = (reflink_ctx *)arg;
+    for (unsigned i = 0; i < s->iterations; i++) {
+        char src_name[64], dst_name[64];
+        snprintf(src_name, sizeof src_name, "%s_%u", s->src_prefix, i);
+        snprintf(dst_name, sizeof dst_name, "%s_%u", s->dst_prefix, i);
+        size_t src_len = strlen(src_name);
+        size_t dst_len = strlen(dst_name);
+
+        uint64_t src_ino = 0;
+        stm_status rc = stm_fs_create_file(s->fs, s->dataset_id,
+                                              s->parent_ino,
+                                              (const uint8_t *)src_name,
+                                              (uint8_t)src_len,
+                                              0100644, 0, 0, &src_ino);
+        if (rc != STM_OK) { atomic_store(&s->err, (int)rc); break; }
+        /* No write — src stays at size 0; copy_file_range len=0 is a
+         * legal POSIX no-op. We exercise reflink directly. */
+        uint64_t dst_ino = 0;
+        rc = stm_fs_create_file(s->fs, s->dataset_id, s->parent_ino,
+                                   (const uint8_t *)dst_name,
+                                   (uint8_t)dst_len,
+                                   0100644, 0, 0, &dst_ino);
+        if (rc != STM_OK) { atomic_store(&s->err, (int)rc); break; }
+
+        /* Empty-src reflink: sync_reflink installs empty share; dst's
+         * fs_reflink_locked stamps mtime/ctime. Exercises the 2-inode
+         * pin path. */
+        rc = stm_fs_reflink(s->fs, s->dataset_id, src_ino,
+                                s->dataset_id, dst_ino);
+        if (rc != STM_OK) { atomic_store(&s->err, (int)rc); break; }
+
+        /* Clean up so allocator doesn't blow up under N iterations. */
+        rc = stm_fs_unlink(s->fs, s->dataset_id, s->parent_ino,
+                              (const uint8_t *)dst_name, (uint8_t)dst_len);
+        if (rc != STM_OK) { atomic_store(&s->err, (int)rc); break; }
+        rc = stm_fs_unlink(s->fs, s->dataset_id, s->parent_ino,
+                              (const uint8_t *)src_name, (uint8_t)src_len);
+        if (rc != STM_OK) { atomic_store(&s->err, (int)rc); break; }
+        atomic_fetch_add(&s->completed, 1u);
+    }
+    atomic_store(&s->done, true);
+    return NULL;
+}
+
+static bool wait_two_reflink(const reflink_ctx *a, const reflink_ctx *b,
+                                  pthread_t at, pthread_t bt)
+{
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (;;) {
+        if (atomic_load(&a->done) && atomic_load(&b->done)) break;
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec - start.tv_sec > DEADLINE_SECONDS) return false;
+        struct timespec ns = { 0, 10 * 1000 * 1000 };
+        nanosleep(&ns, NULL);
+    }
+    (void)pthread_join(at, NULL);
+    (void)pthread_join(bt, NULL);
+    return true;
+}
+
+/* Two writers sharing the same parent dir but with DISJOINT name
+ * prefixes — each iteration's src+dst pin set is disjoint from the
+ * other thread's. Exercises the 2-inode pin path under the parent-
+ * pin contention introduced by per-iteration create+unlink (which
+ * pin the parent dir; parent is shared between threads). */
+STM_TEST(per_inode_reflink_disjoint_files_shared_parent) {
+    make_tmp("per_inode_reflink_disjoint");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t ds_id = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "ref_ds", &ds_id));
+    uint64_t root_ino = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, ds_id, 0755u, 0, 0, &root_ino));
+    STM_ASSERT_EQ(root_ino, 1u);
+
+    reflink_ctx ca = { 0 }, cb = { 0 };
+    ca.fs = fs; ca.dataset_id = ds_id;
+    ca.parent_ino = 1u;
+    ca.src_prefix = "sa"; ca.dst_prefix = "da";
+    ca.iterations = REFLINK_ITERATIONS;
+    cb.fs = fs; cb.dataset_id = ds_id;
+    cb.parent_ino = 1u;
+    cb.src_prefix = "sb"; cb.dst_prefix = "db";
+    cb.iterations = REFLINK_ITERATIONS;
+
+    pthread_t at, bt;
+    STM_ASSERT_EQ(0, pthread_create(&at, NULL, reflink_thread, &ca));
+    STM_ASSERT_EQ(0, pthread_create(&bt, NULL, reflink_thread, &cb));
+
+    STM_ASSERT(wait_two_reflink(&ca, &cb, at, bt));
+
+    STM_ASSERT_EQ(0, atomic_load(&ca.err));
+    STM_ASSERT_EQ(0, atomic_load(&cb.err));
+    STM_ASSERT_EQ(REFLINK_ITERATIONS, atomic_load(&ca.completed));
+    STM_ASSERT_EQ(REFLINK_ITERATIONS, atomic_load(&cb.completed));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("test_compound_ops_concurrent")

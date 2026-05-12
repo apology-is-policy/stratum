@@ -4666,22 +4666,66 @@ stm_status stm_fs_reflink(stm_fs *fs,
                             uint64_t dst_dataset_id, uint64_t dst_ino)
 {
     if (!fs) return STM_EINVAL;
+    if (src_dataset_id == 0u || src_ino == 0u) return STM_EINVAL;
+    if (dst_dataset_id == 0u || dst_ino == 0u) return STM_EINVAL;
+    /* Same-(ds, ino) refused upfront with STM_EINVAL. Required to
+     * preserve test_9p.c::p9_r94_p3_2_reflink_src_eq_dst_returns_einval
+     * semantics + matches stm_sync_reflink's own guard. */
+    if (src_dataset_id == dst_dataset_id && src_ino == dst_ino) {
+        return STM_EINVAL;
+    }
+
+    /* P9.5-PARALLEL-3 impl-4: try SH (rdlock) + per-inode pin on (src,
+     * dst). Falls back to EX (wrlock — pre-impl-4 posture) when either
+     * inode has no index record (legacy direct-extent path: some tests
+     * + some non-POSIX writers go through stm_sync_write_extent without
+     * registering an inode record — see stm_fs_write's fall-through at
+     * line 1227). pin_two requires both inodes to exist in the index;
+     * absent that, the legacy mode still requires full big-lock
+     * serialization because there's no per-inode mutex to acquire. */
+    pthread_rwlock_rdlock(&fs->global);
+    FS_GUARD_WRITE(fs);
+    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+    if (iidx) {
+        stm_inode_handle *h_src = NULL, *h_dst = NULL;
+        stm_status ps = stm_inode_pin_two(iidx,
+                                              src_dataset_id, src_ino,
+                                              dst_dataset_id, dst_ino,
+                                              &h_src, &h_dst);
+        if (ps == STM_OK) {
+            /* SH+pin happy path. */
+            stm_status s = fs_flush_ino_locked(fs, src_dataset_id, src_ino);
+            if (s == STM_OK) {
+                s = fs_flush_ino_locked(fs, dst_dataset_id, dst_ino);
+            }
+            if (s == STM_OK) {
+                s = fs_reflink_locked(fs, src_dataset_id, src_ino,
+                                          dst_dataset_id, dst_ino);
+            }
+            stm_inode_unpin(iidx, h_dst);
+            stm_inode_unpin(iidx, h_src);
+            pthread_rwlock_unlock(&fs->global);
+            return s;
+        }
+        /* STM_ENOENT (either inode missing from index) ⇒ legacy mode;
+         * other errors propagate. */
+        if (ps != STM_ENOENT) {
+            pthread_rwlock_unlock(&fs->global);
+            return ps;
+        }
+    }
+    /* Legacy / transitional EX path: release SH and reacquire EX. */
+    pthread_rwlock_unlock(&fs->global);
     pthread_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
-    /* SWISS-4q-flush: reflink shares extents from src → dst. Both
-     * inodes' buffered ranges must be in the extent tree first:
-     *   - src: reflink iterates src's extent tree; buffered ranges
-     *     wouldn't be included → silent data loss on the dst side.
-     *   - dst: dst's buffered ranges would conflict with the new
-     *     reflinked extents (latest-write-wins ambiguity). */
-    {
-        stm_status fr = fs_flush_ino_locked(fs, src_dataset_id, src_ino);
-        if (fr != STM_OK) { pthread_rwlock_unlock(&fs->global); return fr; }
-        fr = fs_flush_ino_locked(fs, dst_dataset_id, dst_ino);
-        if (fr != STM_OK) { pthread_rwlock_unlock(&fs->global); return fr; }
+    stm_status s = fs_flush_ino_locked(fs, src_dataset_id, src_ino);
+    if (s == STM_OK) {
+        s = fs_flush_ino_locked(fs, dst_dataset_id, dst_ino);
     }
-    stm_status s = fs_reflink_locked(fs, src_dataset_id, src_ino,
-                                          dst_dataset_id, dst_ino);
+    if (s == STM_OK) {
+        s = fs_reflink_locked(fs, src_dataset_id, src_ino,
+                                  dst_dataset_id, dst_ino);
+    }
     pthread_rwlock_unlock(&fs->global);
     return s;
 }
@@ -4717,50 +4761,88 @@ stm_status stm_fs_copy_file_range(stm_fs *fs,
     if (src_off != 0u || dst_off != 0u) return STM_ENOTSUPPORTED;
     if (len == 0u) return STM_OK;
 
+    /* Same-(ds, ino) refused upfront — same posture as stm_fs_reflink. */
+    if (src_dataset_id == dst_dataset_id && src_ino == dst_ino) {
+        return STM_EINVAL;
+    }
+
+    /* P9.5-PARALLEL-3 impl-4: try SH+pin_two; fall back to EX for
+     * legacy direct-extent inodes (see stm_fs_reflink for the same
+     * pattern + rationale). */
+    pthread_rwlock_rdlock(&fs->global);
+    FS_GUARD_WRITE(fs);
+
+    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+    uint64_t src_size = 0;
+    if (iidx) {
+        stm_inode_handle *h_src = NULL, *h_dst = NULL;
+        stm_status ps = stm_inode_pin_two(iidx,
+                                              src_dataset_id, src_ino,
+                                              dst_dataset_id, dst_ino,
+                                              &h_src, &h_dst);
+        if (ps == STM_OK) {
+            /* SH+pin happy path. R128 P2-1 pre-flush + R84 P2-1 TOCTOU
+             * size-check under the pins. */
+            stm_status s = fs_flush_ino_locked(fs, src_dataset_id, src_ino);
+            if (s == STM_OK) {
+                s = fs_flush_ino_locked(fs, dst_dataset_id, dst_ino);
+            }
+            if (s == STM_OK) {
+                struct stm_inode_value siv = {0};
+                s = stm_inode_lookup(iidx, src_dataset_id, src_ino, &siv);
+                if (s == STM_OK) {
+                    src_size = stm_load_le64(siv.si_size);
+                    if (len != src_size) s = STM_ENOTSUPPORTED;
+                }
+            }
+            if (s == STM_OK) {
+                s = fs_reflink_locked(fs, src_dataset_id, src_ino,
+                                          dst_dataset_id, dst_ino);
+            }
+            stm_inode_unpin(iidx, h_dst);
+            stm_inode_unpin(iidx, h_src);
+            pthread_rwlock_unlock(&fs->global);
+            if (s != STM_OK) return s;
+            if (out_copied) *out_copied = src_size;
+            return STM_OK;
+        }
+        if (ps != STM_ENOENT) {
+            pthread_rwlock_unlock(&fs->global);
+            return ps;
+        }
+    }
+
+    /* Legacy / transitional EX path. */
+    pthread_rwlock_unlock(&fs->global);
     pthread_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
-    /* R128 P2-1: pre-flush BOTH src and dst before the extent-layer
-     * reflink. fs_reflink_locked iterates src's extent tree to copy
-     * records into dst; buffered ranges on src are NOT in the extent
-     * tree → silently dropped. Same posture as stm_fs_reflink. */
-    {
-        stm_status fr = fs_flush_ino_locked(fs, src_dataset_id, src_ino);
-        if (fr != STM_OK) {
+    stm_status s = fs_flush_ino_locked(fs, src_dataset_id, src_ino);
+    if (s == STM_OK) {
+        s = fs_flush_ino_locked(fs, dst_dataset_id, dst_ino);
+    }
+    if (s == STM_OK) {
+        iidx = stm_sync_inode_index(fs->sync);
+        if (!iidx) {
             pthread_rwlock_unlock(&fs->global);
-            return fr;
+            return STM_EINVAL;
         }
-        fr = fs_flush_ino_locked(fs, dst_dataset_id, dst_ino);
-        if (fr != STM_OK) {
+        struct stm_inode_value siv = {0};
+        stm_status sls = stm_inode_lookup(iidx, src_dataset_id, src_ino, &siv);
+        if (sls != STM_OK) {
             pthread_rwlock_unlock(&fs->global);
-            return fr;
+            return sls;
         }
+        src_size = stm_load_le64(siv.si_size);
+        if (len != src_size) {
+            pthread_rwlock_unlock(&fs->global);
+            return STM_ENOTSUPPORTED;
+        }
+        s = fs_reflink_locked(fs, src_dataset_id, src_ino,
+                                  dst_dataset_id, dst_ino);
     }
-
-    /* Validate that len matches src's size + delegate to the locked
-     * helper — all under the SAME fs->lock acquisition (R84 P2-1). */
-    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
-    if (!iidx) {
-        pthread_rwlock_unlock(&fs->global);
-        return STM_EINVAL;
-    }
-    struct stm_inode_value siv = {0};
-    stm_status sls = stm_inode_lookup(iidx, src_dataset_id, src_ino, &siv);
-    if (sls != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
-        return sls;
-    }
-    uint64_t src_size = stm_load_le64(siv.si_size);
-    if (len != src_size) {
-        pthread_rwlock_unlock(&fs->global);
-        return STM_ENOTSUPPORTED;
-    }
-
-    stm_status s = fs_reflink_locked(fs, src_dataset_id, src_ino,
-                                          dst_dataset_id, dst_ino);
     pthread_rwlock_unlock(&fs->global);
     if (s != STM_OK) return s;
-
     if (out_copied) *out_copied = src_size;
     return STM_OK;
 }

@@ -295,7 +295,18 @@ duration of a per-inode compound op:
     Direct `pin_many` unit-test coverage shipped in `test_inode.c`
     (arg validation, duplicate refusal, N=1/4/16 roundtrip, rollback-
     on-missing, cross-dataset sort key).
-  - impl-4..5 (forward): cross-dataset ops + drop residual EX takes
+  - impl-4: `stm_fs_reflink` + `stm_fs_copy_file_range` — try SH+pin_two
+    happy path; fall back to EX (pre-impl-4 posture) on STM_ENOENT
+    when either inode has no index record (legacy direct-extent path
+    via `stm_sync_write_extent`). Same-(ds, ino) refused upfront with
+    STM_EINVAL. R128 P2-1 pre-flush runs UNDER the pins (happy path)
+    or under EX (legacy path). R84 P2-1 size-validation TOCTOU on cfr
+    runs UNDER the pin. Cross-dataset shape is supported by
+    `pin_two`'s `(ds, ino)` sort key but still gated at sync layer
+    with STM_EXDEV (sync.c:5749) pending matching-encryption-keys
+    work.
+  - impl-5 (forward): drop residual EX takes (RO ops + remaining
+    single-inode mutators not yet ported)
 
 Spec composition realizes the `inode_lock_holder[i] = w` action of
 `compound_ops_per_inode.tla`.
