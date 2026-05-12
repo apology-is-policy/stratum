@@ -416,6 +416,15 @@ static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
         }
     }
     fs->bdev      = d;
+    /* fs->pool and fs->sync are SET ONCE here and IMMUTABLE for the
+     * lifetime of the stm_fs handle (no rebind path — mount creates a
+     * fresh stm_fs; remount via mount-bump runs at sync layer). This
+     * is the no-lock contract that stm_fs_pool() and stm_fs_sync()
+     * depend on (R129 P3-4 doc carry): concurrent /ctl/ threads and
+     * 9P FS threads read these accessors without fs->lock because
+     * the pointers can't move. Any future code path that would
+     * mutate either pointer post-mount MUST take fs->lock AND lift
+     * the no-lock claim from the accessors' headers (fs.h L2389+). */
     fs->pool      = pool;
     fs->alloc     = a;
     fs->sync      = sync;
@@ -649,11 +658,17 @@ stm_status stm_fs_unmount(stm_fs *fs)
     /* SWISS-4q-flush: dirty buffer must outlive sync_commit (above)
      * because the flush callback writes through sync; but its plaintext
      * pages are pure RAM and don't touch the now-closed pool. Free
-     * after sync_close — any remaining bytes are silently dropped
-     * (this is correct: stm_sync_commit was called and either succeeded
-     * — in which case there's nothing buffered post-flush — or failed
-     * — in which case the fs is wedged and the data wasn't durable
-     * anyway). */
+     * after sync_close — any remaining bytes are silently dropped.
+     *
+     * R128 P3-1 doc fix: prior comment claimed "failed → fs is wedged
+     * and the data wasn't durable anyway". That's wrong:
+     * `fs_flush_all_locked` failure does NOT auto-wedge the fs.
+     * Accurate posture: either fs_flush_all_locked + sync_commit
+     * succeeded (nothing buffered post-flush) OR one of them returned
+     * non-OK (partially-drained ranges are gone from RAM; the caller's
+     * commit_status return is the only signal of loss). The wedge
+     * transition lives on a separate code path (`stm_fs_mark_wedged`)
+     * that unmount does not invoke. */
     stm_dirty_buffer_destroy(fs->dirty_buffer);
 
     pthread_mutex_unlock(&fs->lock);

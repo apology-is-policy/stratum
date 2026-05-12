@@ -859,6 +859,14 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
             fprintf(stderr,
                 "stratumd: stm_sync_scrub_install_production_cb failed (rc=%d)\n",
                 (int)rc);
+            /* R129 P3-3 doc: cleanup order is scrub_close → ctl_destroy
+             * here, which inverts the canonical "ctl_destroy BEFORE
+             * scrub_close" rule (ctl.h R26 P3-4). Harmless at this
+             * point because stm_ctl_attach_scrub has NOT been called
+             * yet (it's below) — ctl holds no scrub pointer. The
+             * canonical order applies only post-attach (see the four
+             * cleanup paths below from stm_ctl_attach_scrub onward,
+             * which all use ctl_destroy first). */
             stm_scrub_close(scrub);
             stm_ctl_destroy(ctl);
             close(listen_fd);

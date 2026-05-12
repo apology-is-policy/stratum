@@ -187,21 +187,28 @@ typedef stm_status (*stm_dirty_buffer_drain_cb)(
  * Drain all buffered ranges for one inode via `cb`. Ranges are emitted
  * in ASCENDING off order so the callback sees a sorted stream.
  *
- * Per writeback.tla::Flush, this is all-or-nothing: if ANY callback
- * call returns non-OK, the partially-drained ranges are RESTORED to
- * the buffer (the callback's prior successful writes are NOT reverted
- * — they remain in the extent layer; the inode just keeps its buffer
- * coherent for further writes). Returns the first non-OK status if
- * one occurred, else STM_OK.
+ * Drain discipline (R128 P3-8 close — superseded the pre-d687666
+ * all-or-nothing model): each successful callback call POPS its range
+ * from the buffer immediately. On callback failure, the failed range
+ * AND every un-tried range remain in the buffer; the SUCCEEDED-SO-FAR
+ * ranges are gone from the buffer (they're in the extent layer). The
+ * caller can retry by re-invoking drain_ino — pop-on-success prevents
+ * the 2.8 GB amplification cycle that triggered the d687666 hotfix
+ * (succeeded-then-failed ranges getting duplicated on every retry).
  *
- * Note on partial-success semantics: the C impl's all-or-nothing
- * guarantee covers BUFFER coherence — it does NOT undo extent-layer
- * side effects. If the callback writes 2 extents successfully and the
- * 3rd fails, the 2 extents remain written; the buffer keeps all 3
- * ranges (so re-flush emits the 2 again, producing duplicates that
- * extent.tla::Overwrite will resolve). The user-visible read returns
- * the same bytes either way (latest-writer-wins via src_seq), so the
- * spec's ReadHidesFlushOrder holds.
+ * Returns the first non-OK status if one occurred, else STM_OK.
+ *
+ * Note on partial-success semantics: pop-on-success covers BUFFER
+ * coherence — it does NOT undo extent-layer side effects. If the
+ * callback writes 2 extents successfully and the 3rd fails, the 2
+ * extents remain written; the buffer keeps just the failed-and-untried
+ * range(s). Re-flush emits only those (no duplicates). The user-
+ * visible read returns the latest-writer-wins bytes via src_seq, so
+ * the spec's ReadHidesFlushOrder holds.
+ *
+ * writeback.tla v1 still pins the old all-or-nothing model; a v2
+ * extension capturing pop-on-success is forward-noted (see
+ * v2/src/dirty_buffer/dirty_buffer.c's drain_ino comment block).
  *
  * Concurrency: takes buf->mu for the duration of the drain. Callback
  * runs UNDER buf->mu; the callback MUST NOT call back into the buffer
