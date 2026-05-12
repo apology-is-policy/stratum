@@ -301,6 +301,29 @@ R99 P2-1 line-injection class closed inside
 `stm_snap_name_chars_valid` (snapshot create refuses control bytes;
 this listing surface inherits the closure).
 
+### Saturation discipline (R131 P3-4 + P3-5)
+
+Two monotonic counters on `stm_ctl` refuse with `STM_EOVERFLOW`
+rather than wrapping (R29 P3-1 doctrine class):
+
+- `worker_count` (uint32_t) at `stm_ctl_conn_create` — saturation
+  would break the LifecycleNoUAF refcount (decrement-past-zero on
+  the next destroy could prematurely unblock `stm_ctl_destroy`
+  while live conns still dereference the shared ctl). Refused at
+  `UINT32_MAX`. Unreachable under realistic fd limits but the
+  refusal closes the doctrine gap.
+- `event_gen` (uint64_t) at `/admin/clear-events` — saturation
+  would spuriously match a stale snapshot's
+  `snapshot_event_gen` captured in the distant past, leaking
+  pre-clear bytes through the gen-check. Refused at `UINT64_MAX`.
+  Unreachable in human time, but doctrine carry.
+
+The refused-clear path STILL logs the refusal via
+`stm_ctl_log_event` (R107 doctrine: post-admin refusals are
+audit-logged regardless of outcome) — the log append uses
+`event_append_locked` directly and does NOT bump `event_gen`, so
+the saturation guard is the unique source of `event_gen` mutation.
+
 ## Spec cross-reference
 
 `v2/specs/ctl_conn.tla` pins the PARALLEL-1 isolation contract:
@@ -364,6 +387,7 @@ Three buggy configs (`ctl_conn_shared_caller_buggy.cfg`,
 | /datasets/<id>/snapshots/<sid> (S5-PRE-C) | LIVE | Read-only listing with stale-id discipline |
 | stm_ctl_conn state-isolation (PARALLEL-1) | LIVE | Process-wide ctl + per-conn cn |
 | Concurrent-accept worker_cv drain (PARALLEL-1) | LIVE | LifecycleNoUAF |
+| worker_count + event_gen saturation refusal (R131 P3-4/P3-5) | LIVE | STM_EOVERFLOW at UINT32/64_MAX |
 | Per-dataset metrics (op counters + latency histograms) | DEFERRED | Needs instrumentation hot-path |
 | OTLP exposition (binary protobuf) | DEFERRED | Sidecar translator path |
 | TLC verify ctl_conn.tla green | PENDING | #958 — tooling-gated |

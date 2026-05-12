@@ -235,7 +235,11 @@ void stm_ctl_destroy(stm_ctl *c);
  * shared destroy unblocks, and the FS shutdown sequence proceeds.
  *
  * Returns STM_EINVAL if `ctl` or `out` is NULL; STM_ENOMEM on alloc
- * failure.
+ * failure; STM_EOVERFLOW if the shared `ctl`'s worker_count is at
+ * UINT32_MAX (R131 P3-4 closure — R29 P3-1 saturation doctrine
+ * carry; fd limits make this unreachable in practice but the
+ * refusal closes the LifecycleNoUAF doctrine gap that would
+ * otherwise let a future destroy unblock prematurely).
  */
 STM_MUST_USE
 stm_status stm_ctl_conn_create(stm_ctl *ctl,

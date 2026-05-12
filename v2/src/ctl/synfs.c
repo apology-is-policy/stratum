@@ -3005,8 +3005,24 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
          * gen check is the load-bearing invalidation primitive instead).
          *
          * Any data the client sent is ignored — the trigger is the act
-         * of writing, not the content. */
+         * of writing, not the content.
+         *
+         * R131 P3-5 closure (R29 P3-1 doctrine carry): refuse with
+         * STM_EOVERFLOW at UINT64_MAX rather than wrapping. Wrap would
+         * spuriously match a stale snapshot's `snapshot_event_gen`
+         * captured in the distant past, leaking pre-clear bytes through
+         * the gen-check. UINT64_MAX is unreachable in human time, but
+         * the saturation refusal closes the doctrine gap. The log
+         * remains zero-able only when gen has room to advance. */
         pthread_mutex_lock(&c->event_mu);
+        if (c->event_gen == UINT64_MAX) {
+            pthread_mutex_unlock(&c->event_mu);
+            stm_ctl_log_event(c,
+                "events log clear refused (gen saturated) by uid=%u",
+                (unsigned)cn->caller_uid);
+            *out_written = 0;
+            return STM_EOVERFLOW;
+        }
         if (c->event_buf) {
             stm_ct_memzero(c->event_buf, c->event_cap);
             c->event_len = 0;
@@ -3487,8 +3503,23 @@ stm_status stm_ctl_conn_create(stm_ctl *ctl,
      * worker_count. stm_ctl_destroy will block on worker_cv until
      * every live conn has decremented via stm_ctl_conn_destroy, so a
      * detached worker reading cn->ctl->{fs,pool,event_buf} after the
-     * daemon's shutdown sequence reached stm_ctl_destroy can't UAF. */
+     * daemon's shutdown sequence reached stm_ctl_destroy can't UAF.
+     *
+     * R131 P3-4 closure (R29 P3-1 doctrine carry): refuse with
+     * STM_EOVERFLOW at UINT32_MAX rather than wrapping. Wrap would
+     * silently break the LifecycleNoUAF invariant — `worker_count`
+     * could decrement past zero on the next destroy, prematurely
+     * unblocking `stm_ctl_destroy` while live conns still hold
+     * cn->ctl pointers. UINT32_MAX concurrent /ctl/ connections is
+     * unreachable in practice (fd limits cap orders-of-magnitude
+     * lower), but the saturation refusal closes the doctrine gap. */
     pthread_mutex_lock(&ctl->worker_mu);
+    if (ctl->worker_count == UINT32_MAX) {
+        pthread_mutex_unlock(&ctl->worker_mu);
+        pthread_mutex_destroy(&cn->mu);
+        free(cn);
+        return STM_EOVERFLOW;
+    }
     ctl->worker_count++;
     pthread_mutex_unlock(&ctl->worker_mu);
 
