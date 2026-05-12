@@ -2602,7 +2602,8 @@ static stm_status h_setattr(stm_9p_server *s,
 /*           files[8] ffree[8] fsid[8] namelen[4]                           */
 /* ────────────────────────────────────────────────────────────────────── */
 
-#define STM_9P_FS_MAGIC  0x53545241u   /* "STRA" — Stratum FS magic. */
+/* STM_9P_FS_MAGIC moved to <stratum/9p.h> for cross-file consistency
+ * with libstratum-9p's stm_9p_statfs_out.type comparison. */
 
 static stm_status h_statfs(stm_9p_server *s,
                              const uint8_t *body, uint32_t body_len,
@@ -2636,7 +2637,8 @@ static stm_status h_statfs(stm_9p_server *s,
     uint64_t files  = UINT64_C(1) << 56;
     uint64_t ffree  = files - 1u;       /* ~all free */
 
-    uint32_t need = STM_9P_HDR_SIZE + 4u + 4u + 8u*5u + 4u;
+    /* hdr + type(4) + bsize(4) + blocks/bfree/bavail/files/ffree/fsid(8x6) + namelen(4) = 60 + hdr. */
+    uint32_t need = STM_9P_HDR_SIZE + 4u + 4u + 8u*6u + 4u;
     if (resp_cap < need) { *resp_len = 0; return STM_EINVAL; }
     uint8_t *wp = resp + 4;
     *wp++ = STM_9P_RSTATFS;

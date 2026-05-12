@@ -2182,4 +2182,233 @@ STM_TEST(p9_client_lock_oversize_client_id_einval)
     destroy_client_fixture(&f);
 }
 
+/* ────────────────────────────────────────────────────────────────────── */
+/* P9.5-POLISH-1: Tstatfs + Stratum extensions                            */
+/* (Tsync / Treflink / Tfallocate / Tfadvise).                            */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/* Tstatfs against the root fid returns a populated stat block. */
+STM_TEST(p9_client_statfs_round_trip)
+{
+    client_fixture f = make_client_fixture("statfs_rt");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    stm_9p_statfs_out s = {0};
+    STM_ASSERT_OK(stm_9p_statfs(c, 100, &s));
+    STM_ASSERT_EQ(s.type, STM_9P_FS_MAGIC);
+    STM_ASSERT_EQ(s.bsize, 4096u);
+    /* Server caps namelen at STM_9P_NAME_MAX (255). */
+    STM_ASSERT_EQ(s.namelen, (uint32_t)STM_9P_NAME_MAX);
+    /* Files is roughly-unlimited per server policy; just sanity-check
+     * that it's nonzero. */
+    STM_ASSERT_TRUE(s.files > 0);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Tstatfs NULL out → STM_EINVAL (lib boundary). */
+STM_TEST(p9_client_statfs_null_out_einval)
+{
+    client_fixture f = make_client_fixture("statfs_inv");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    STM_ASSERT_EQ(stm_9p_statfs(c, 100, NULL), STM_EINVAL);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Tsync — empty-body request, empty-body reply. */
+STM_TEST(p9_client_sync_round_trip)
+{
+    client_fixture f = make_client_fixture("sync_rt");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    /* Create some state, then explicit sync. */
+    stm_9p_qid clone_qids[STM_9P_MAX_WALK];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 0, NULL, clone_qids, &walked));
+    stm_9p_qid lq;
+    STM_ASSERT_OK(stm_9p_lcreate(c, 101, "sync.txt",
+                                    STM_9P_O_RDWR, 0644u, 0, &lq, NULL));
+    static const uint8_t DATA[] = "sync-extension";
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, 101, 0, DATA, sizeof DATA - 1, &written));
+
+    STM_ASSERT_OK(stm_9p_sync(c));
+    /* Idempotent — second call still OK. */
+    STM_ASSERT_OK(stm_9p_sync(c));
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Treflink: src has data; dst is empty; after reflink, dst's size matches
+ * src and its qid is returned. */
+STM_TEST(p9_client_reflink_round_trip)
+{
+    client_fixture f = make_client_fixture("reflink_rt");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    /* Create "src.txt" with content > STM_INODE_INLINE_MAX (100 bytes)
+     * so it transitions to EXTENT mode — reflink refuses INLINE src. */
+    stm_9p_qid clone_qids[STM_9P_MAX_WALK];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 0, NULL, clone_qids, &walked));
+    stm_9p_qid lq;
+    STM_ASSERT_OK(stm_9p_lcreate(c, 101, "src.txt",
+                                    STM_9P_O_RDWR, 0644u, 0, &lq, NULL));
+    uint8_t SRC_DATA[256];
+    memset(SRC_DATA, 'X', sizeof SRC_DATA);
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, 101, 0, SRC_DATA, sizeof SRC_DATA, &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+
+    /* Create empty "dst.txt". */
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 0, NULL, clone_qids, &walked));
+    STM_ASSERT_OK(stm_9p_lcreate(c, 101, "dst.txt",
+                                    STM_9P_O_RDWR, 0644u, 0, &lq, NULL));
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+
+    /* Walk fresh fids to both files. */
+    const char *src_names[] = { "src.txt" };
+    stm_9p_qid src_wqids[1];
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 102, 1, src_names, src_wqids, &walked));
+    const char *dst_names[] = { "dst.txt" };
+    stm_9p_qid dst_wqids[1];
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 103, 1, dst_names, dst_wqids, &walked));
+
+    /* Reflink. */
+    stm_9p_qid post_qid = {0};
+    STM_ASSERT_OK(stm_9p_reflink(c, /*src=*/102, /*dst=*/103, &post_qid));
+    /* Post-reflink qid path should match dst's pre-reflink qid path
+     * (same inode). */
+    STM_ASSERT_EQ(post_qid.path, dst_wqids[0].path);
+
+    /* Verify content via fresh walk (qid version unchanged per R94 P3-1
+     * doc, but the underlying extent is now shared with src). */
+    stm_9p_attr a = {0};
+    STM_ASSERT_OK(stm_9p_getattr(c, 103, STM_9P_GETATTR_BASIC, &a));
+    STM_ASSERT_EQ(a.size, sizeof SRC_DATA);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 103));
+    STM_ASSERT_OK(stm_9p_clunk(c, 102));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Tfallocate: allocate 4 KiB at offset 0 with KEEP_SIZE; size should
+ * remain 0 (per FALLOC_FL_KEEP_SIZE semantics). */
+STM_TEST(p9_client_fallocate_keep_size)
+{
+    client_fixture f = make_client_fixture("fallocate_rt");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    stm_9p_qid clone_qids[STM_9P_MAX_WALK];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 0, NULL, clone_qids, &walked));
+    stm_9p_qid lq;
+    STM_ASSERT_OK(stm_9p_lcreate(c, 101, "falloc.txt",
+                                    STM_9P_O_RDWR, 0644u, 0, &lq, NULL));
+
+    /* KEEP_SIZE preserves logical size; reservation is internal. */
+    STM_ASSERT_OK(stm_9p_fallocate(c, 101,
+                                     STM_9P_FALLOC_FL_KEEP_SIZE,
+                                     /*offset=*/0, /*length=*/4096u));
+    stm_9p_attr a = {0};
+    STM_ASSERT_OK(stm_9p_getattr(c, 101, STM_9P_GETATTR_BASIC, &a));
+    STM_ASSERT_EQ(a.size, 0u);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Tfallocate without KEEP_SIZE grows the file. The file MUST be in
+ * EXTENT mode first (INLINE files refuse with STM_ERANGE when grown
+ * past STM_INODE_INLINE_MAX = 100 bytes — by-design per fs.h doc).
+ * Write 200 bytes to force the INLINE→EXTENT transition. */
+STM_TEST(p9_client_fallocate_grows_size)
+{
+    client_fixture f = make_client_fixture("fallocate_grow");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    stm_9p_qid clone_qids[STM_9P_MAX_WALK];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 0, NULL, clone_qids, &walked));
+    stm_9p_qid lq;
+    STM_ASSERT_OK(stm_9p_lcreate(c, 101, "grow.txt",
+                                    STM_9P_O_RDWR, 0644u, 0, &lq, NULL));
+
+    /* Force EXTENT mode via a > inline-cap write. */
+    uint8_t seed[200];
+    memset(seed, 'A', sizeof seed);
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, 101, 0, seed, sizeof seed, &written));
+
+    STM_ASSERT_OK(stm_9p_fallocate(c, 101, /*flags=*/0,
+                                     /*offset=*/0, /*length=*/8192u));
+    stm_9p_attr a = {0};
+    STM_ASSERT_OK(stm_9p_getattr(c, 101, STM_9P_GETATTR_BASIC, &a));
+    STM_ASSERT_EQ(a.size, 8192u);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Tfadvise: WILLNEED is accepted as a no-op hint at v2.0. */
+STM_TEST(p9_client_fadvise_willneed_ok)
+{
+    client_fixture f = make_client_fixture("fadvise_rt");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    stm_9p_qid clone_qids[STM_9P_MAX_WALK];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 0, NULL, clone_qids, &walked));
+    stm_9p_qid lq;
+    STM_ASSERT_OK(stm_9p_lcreate(c, 101, "advise.txt",
+                                    STM_9P_O_RDWR, 0644u, 0, &lq, NULL));
+
+    STM_ASSERT_OK(stm_9p_fadvise(c, 101, /*off=*/0, /*len=*/4096u,
+                                    STM_9P_FADV_WILLNEED));
+    /* SEQUENTIAL is also valid. */
+    STM_ASSERT_OK(stm_9p_fadvise(c, 101, /*off=*/0, /*len=*/0,
+                                    STM_9P_FADV_SEQUENTIAL));
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
 STM_TEST_MAIN("9p_client")

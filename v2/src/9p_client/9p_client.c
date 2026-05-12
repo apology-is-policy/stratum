@@ -1509,6 +1509,232 @@ stm_status stm_9p_getlock(stm_9p_client *c, uint32_t fid,
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
+/* Tstatfs (P9.5-POLISH-1).                                                */
+/* ────────────────────────────────────────────────────────────────────── */
+
+stm_status stm_9p_statfs(stm_9p_client *c, uint32_t fid,
+                            stm_9p_statfs_out *out)
+{
+    stm_status ec = op_entry_check(c);
+    if (ec != STM_OK) return ec;
+    if (!out) return STM_EINVAL;
+
+    /* Wire: hdr + fid(4). */
+    uint32_t msg_size = STM_9P_HDR_SIZE + 4u;
+    if (msg_size > c->buf_cap) return STM_ERANGE;
+    uint16_t tag = 0;
+    stm_status rc = alloc_tag(c, &tag);
+    if (rc != STM_OK) return rc;
+
+    uint8_t *wp = c->buf;
+    p_u32(wp, msg_size);
+    wp[4] = STM_9P_TSTATFS;
+    p_u16(wp + 5, tag);
+    p_u32(wp + 7, fid);
+    rc = send_msg(c, msg_size);
+    if (rc != STM_OK) return rc;
+
+    uint32_t reply_size = 0;
+    rc = recv_msg(c, &reply_size);
+    if (rc != STM_OK) return rc;
+    const uint8_t *body = NULL;
+    uint32_t body_len = 0;
+    rc = check_reply(c, reply_size, STM_9P_RSTATFS, tag, &body, &body_len);
+    if (rc != STM_OK) return rc;
+    /* Rstatfs body: type(4) bsize(4) blocks(8) bfree(8) bavail(8)
+     * files(8) ffree(8) fsid(8) namelen(4) = 4+4+8*6+4 = 60 bytes.
+     * Strict equality (R111 P3 F-10). */
+    if (body_len != 60u) {
+        c->last_errno = EPROTO;
+        return STM_EBACKEND;
+    }
+    out->type    = g_u32(body);
+    out->bsize   = g_u32(body + 4);
+    out->blocks  = g_u64(body + 8);
+    out->bfree   = g_u64(body + 16);
+    out->bavail  = g_u64(body + 24);
+    out->files   = g_u64(body + 32);
+    out->ffree   = g_u64(body + 40);
+    out->fsid    = g_u64(body + 48);
+    out->namelen = g_u32(body + 56);
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* Tsync (Stratum extension, P9.5-POLISH-1).                               */
+/* ────────────────────────────────────────────────────────────────────── */
+
+stm_status stm_9p_sync(stm_9p_client *c)
+{
+    stm_status ec = op_entry_check(c);
+    if (ec != STM_OK) return ec;
+
+    /* Wire: hdr only (no body). */
+    uint32_t msg_size = STM_9P_HDR_SIZE;
+    if (msg_size > c->buf_cap) return STM_ERANGE;
+    uint16_t tag = 0;
+    stm_status rc = alloc_tag(c, &tag);
+    if (rc != STM_OK) return rc;
+
+    uint8_t *wp = c->buf;
+    p_u32(wp, msg_size);
+    wp[4] = STM_9P_TSYNC;
+    p_u16(wp + 5, tag);
+    rc = send_msg(c, msg_size);
+    if (rc != STM_OK) return rc;
+
+    uint32_t reply_size = 0;
+    rc = recv_msg(c, &reply_size);
+    if (rc != STM_OK) return rc;
+    const uint8_t *body = NULL;
+    uint32_t body_len = 0;
+    rc = check_reply(c, reply_size, STM_9P_RSYNC, tag, &body, &body_len);
+    if (rc != STM_OK) return rc;
+    /* Rsync has NO body. Strict equality (R111 P3 F-10). */
+    if (body_len != 0u) {
+        c->last_errno = EPROTO;
+        return STM_EBACKEND;
+    }
+    (void)body;
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* Treflink (Stratum extension, P9.5-POLISH-1).                            */
+/* ────────────────────────────────────────────────────────────────────── */
+
+stm_status stm_9p_reflink(stm_9p_client *c,
+                             uint32_t src_fid, uint32_t dst_fid,
+                             stm_9p_qid *out_qid)
+{
+    stm_status ec = op_entry_check(c);
+    if (ec != STM_OK) return ec;
+
+    /* Wire: hdr + src_fid(4) + dst_fid(4). */
+    uint32_t msg_size = STM_9P_HDR_SIZE + 4u + 4u;
+    if (msg_size > c->buf_cap) return STM_ERANGE;
+    uint16_t tag = 0;
+    stm_status rc = alloc_tag(c, &tag);
+    if (rc != STM_OK) return rc;
+
+    uint8_t *wp = c->buf;
+    p_u32(wp, msg_size);
+    wp[4] = STM_9P_TREFLINK;
+    p_u16(wp + 5, tag);
+    p_u32(wp + 7, src_fid);
+    p_u32(wp + 11, dst_fid);
+    rc = send_msg(c, msg_size);
+    if (rc != STM_OK) return rc;
+
+    uint32_t reply_size = 0;
+    rc = recv_msg(c, &reply_size);
+    if (rc != STM_OK) return rc;
+    const uint8_t *body = NULL;
+    uint32_t body_len = 0;
+    rc = check_reply(c, reply_size, STM_9P_RREFLINK, tag, &body, &body_len);
+    if (rc != STM_OK) return rc;
+    /* Rreflink body: dst_qid(13). Strict equality. */
+    if (body_len != 13u) {
+        c->last_errno = EPROTO;
+        return STM_EBACKEND;
+    }
+    if (out_qid) {
+        out_qid->type    = body[0];
+        out_qid->version = g_u32(body + 1);
+        out_qid->path    = g_u64(body + 5);
+    }
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* Tfallocate (Stratum extension, P9.5-POLISH-1).                          */
+/* ────────────────────────────────────────────────────────────────────── */
+
+stm_status stm_9p_fallocate(stm_9p_client *c, uint32_t fid,
+                               uint32_t flags,
+                               uint64_t offset, uint64_t length)
+{
+    stm_status ec = op_entry_check(c);
+    if (ec != STM_OK) return ec;
+
+    /* Wire: hdr + fid(4) + flags(4) + offset(8) + length(8). */
+    uint32_t msg_size = STM_9P_HDR_SIZE + 4u + 4u + 8u + 8u;
+    if (msg_size > c->buf_cap) return STM_ERANGE;
+    uint16_t tag = 0;
+    stm_status rc = alloc_tag(c, &tag);
+    if (rc != STM_OK) return rc;
+
+    uint8_t *wp = c->buf;
+    p_u32(wp, msg_size);
+    wp[4] = STM_9P_TFALLOCATE;
+    p_u16(wp + 5, tag);
+    p_u32(wp + 7, fid);
+    p_u32(wp + 11, flags);
+    p_u64(wp + 15, offset);
+    p_u64(wp + 23, length);
+    rc = send_msg(c, msg_size);
+    if (rc != STM_OK) return rc;
+
+    uint32_t reply_size = 0;
+    rc = recv_msg(c, &reply_size);
+    if (rc != STM_OK) return rc;
+    const uint8_t *body = NULL;
+    uint32_t body_len = 0;
+    rc = check_reply(c, reply_size, STM_9P_RFALLOCATE, tag, &body, &body_len);
+    if (rc != STM_OK) return rc;
+    if (body_len != 0u) {
+        c->last_errno = EPROTO;
+        return STM_EBACKEND;
+    }
+    (void)body;
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* Tfadvise (Stratum extension, P9.5-POLISH-1).                            */
+/* ────────────────────────────────────────────────────────────────────── */
+
+stm_status stm_9p_fadvise(stm_9p_client *c, uint32_t fid,
+                             uint64_t offset, uint64_t length,
+                             uint32_t advice)
+{
+    stm_status ec = op_entry_check(c);
+    if (ec != STM_OK) return ec;
+
+    /* Wire: hdr + fid(4) + offset(8) + length(8) + advice(4). */
+    uint32_t msg_size = STM_9P_HDR_SIZE + 4u + 8u + 8u + 4u;
+    if (msg_size > c->buf_cap) return STM_ERANGE;
+    uint16_t tag = 0;
+    stm_status rc = alloc_tag(c, &tag);
+    if (rc != STM_OK) return rc;
+
+    uint8_t *wp = c->buf;
+    p_u32(wp, msg_size);
+    wp[4] = STM_9P_TFADVISE;
+    p_u16(wp + 5, tag);
+    p_u32(wp + 7, fid);
+    p_u64(wp + 11, offset);
+    p_u64(wp + 19, length);
+    p_u32(wp + 27, advice);
+    rc = send_msg(c, msg_size);
+    if (rc != STM_OK) return rc;
+
+    uint32_t reply_size = 0;
+    rc = recv_msg(c, &reply_size);
+    if (rc != STM_OK) return rc;
+    const uint8_t *body = NULL;
+    uint32_t body_len = 0;
+    rc = check_reply(c, reply_size, STM_9P_RFADVISE, tag, &body, &body_len);
+    if (rc != STM_OK) return rc;
+    if (body_len != 0u) {
+        c->last_errno = EPROTO;
+        return STM_EBACKEND;
+    }
+    (void)body;
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
 /* Tclunk.                                                                 */
 /* ────────────────────────────────────────────────────────────────────── */
 

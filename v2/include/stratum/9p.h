@@ -291,6 +291,9 @@ enum {
 /* asserted via _Static_assert in src/9p/server.c.                        */
 /* ────────────────────────────────────────────────────────────────────── */
 
+/* Rstatfs `type` field (filesystem magic). Stable across versions. */
+#define STM_9P_FS_MAGIC                  0x53545241u  /* "STRA" */
+
 /* Tfallocate flags. Match `<linux/falloc.h>` AND STM_FS_FALLOC_FL_*. */
 #define STM_9P_FALLOC_FL_KEEP_SIZE       0x01u
 #define STM_9P_FALLOC_FL_PUNCH_HOLE      0x02u

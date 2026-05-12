@@ -16,6 +16,9 @@
  *   - Write-side: Twrite (1b), Tlcreate / Tmkdir / Tunlinkat (1c),
  *     Tsetattr / Trenameat / Tsymlink / Treadlink / Tfsync (1d).
  *   - Advisory locking: Tlock / Tgetlock (P9.5-POLISH-1).
+ *   - Filesystem stats: Tstatfs (P9.5-POLISH-1).
+ *   - Stratum extensions: Tsync / Treflink / Tfallocate / Tfadvise
+ *     (P9.5-POLISH-1; server-side P9-9P-3).
  *   - Synchronous one-op-at-a-time client: each call sends a Tmsg
  *     and blocks on the matching Rmsg. Single-threaded by design;
  *     callers wanting concurrent ops open multiple connections.
@@ -32,13 +35,10 @@
  *     primitive will land alongside the server handler in a follow-on
  *     chunk (P9-LIB-1e or whichever ships first).
  *   - Txattrwalk / Txattrcreate (server present, client deferred to
- *     keep this chunk POSIX-shape primitives only).
- *   - Tstatfs (filesystem statistics; CLI-helpful but small —
- *     bundled with /ctl/-on-stratumd or a separate tail chunk).
+ *     a follow-on POLISH-1 chunk pairing with the aux-fid lifecycle
+ *     contract).
  *   - Async API (P9-LIB-2): pipelined Txx with reply matching by tag,
  *     io_uring transport, callback-based completion.
- *   - Stratum-extension opcodes (Tsync/Treflink/Tfallocate/Tfadvise
- *     from the 124-159 band).
  *   - Tflush for cancellation. v2.0 sync client doesn't need it
  *     (every Tmsg has its Rmsg before the next is sent).
  *   - 9P2000 (non-.L) dialect support. v2.0 lib speaks .L only since
@@ -605,6 +605,108 @@ STM_MUST_USE
 stm_status stm_9p_getlock(stm_9p_client *c, uint32_t fid,
                              const stm_9p_getlock_args *args,
                              stm_9p_getlock_out *out);
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* Tstatfs (P9.5-POLISH-1).                                                */
+/*                                                                         */
+/* Linux statfs(2)-shaped filesystem-level stats. Used by `df` and the     */
+/* kernel v9fs vfs_statfs path. fid identifies a mount point (typically    */
+/* the root fid from Tattach, but any NODE fid in the dataset works).      */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/* Rstatfs payload. Mirrors the .L wire shape in struct form. */
+typedef struct {
+    uint32_t type;       /* FS magic — STM_9P_FS_MAGIC (0x53545241 = "STRA") */
+    uint32_t bsize;      /* block size in bytes */
+    uint64_t blocks;     /* total data blocks */
+    uint64_t bfree;      /* free blocks */
+    uint64_t bavail;     /* free blocks for unprivileged users */
+    uint64_t files;      /* total inodes (≈ unlimited at v2.0) */
+    uint64_t ffree;      /* free inodes */
+    uint64_t fsid;       /* filesystem id (server-derived; stable per mount) */
+    uint32_t namelen;    /* max filename length (STM_9P_NAME_MAX) */
+} stm_9p_statfs_out;
+
+/* Tstatfs: fetch filesystem stats for the mount containing `fid`. fid
+ * MUST be a bound NODE fid (Tattach/Twalk); fid does NOT need to be
+ * Topen'd.
+ *
+ * Returns:
+ *   - STM_OK on success; *out populated.
+ *   - STM_EINVAL on NULL c / out.
+ *   - Any Rlerror's mapped status. */
+STM_MUST_USE
+stm_status stm_9p_statfs(stm_9p_client *c, uint32_t fid,
+                            stm_9p_statfs_out *out);
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* Stratum extensions: Tsync / Treflink / Tfallocate / Tfadvise.           */
+/*                                                                         */
+/* P9.5-POLISH-1 client glue for the P9-9P-3 server-side extension opcodes */
+/* in the 124-159 band. Wire constants in <stratum/9p.h>:                  */
+/*   - STM_9P_FALLOC_FL_* (matches Linux <linux/falloc.h>)                */
+/*   - STM_9P_FADV_*       (matches Linux <linux/fadvise.h> generic)      */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/* Tsync: whole-pool commit. Distinct from Tfsync (which takes a fid and
+ * routes to the same primitive). Use this when you want a barrier without
+ * needing an open fid.
+ *
+ * Returns:
+ *   - STM_OK on success.
+ *   - STM_EINVAL on NULL c.
+ *   - Any Rlerror's mapped status (e.g. STM_EIO on commit failure). */
+STM_MUST_USE
+stm_status stm_9p_sync(stm_9p_client *c);
+
+/* Treflink: FICLONE-shape. Share src_fid's extents into dst_fid by
+ * refcount. dst MUST be empty (size 0, no extents) at server side;
+ * cross-dataset is STM_EXDEV. Both fids must be bound NODE fids.
+ *
+ * On success, *out_qid (if non-NULL) is populated with dst's post-
+ * reflink qid. Note (R94 P3-1): server v2.0 does NOT bump dst's
+ * si_gen on reflink, so the qid version is unchanged — clients
+ * keying cache invalidation on qid.version should re-open dst after
+ * reflink (see server.c h_reflink doc).
+ *
+ * Returns:
+ *   - STM_OK on success.
+ *   - STM_EINVAL on NULL c.
+ *   - STM_EXDEV on cross-dataset reflink.
+ *   - Any Rlerror's mapped status (e.g. STM_EBUSY on non-empty dst). */
+STM_MUST_USE
+stm_status stm_9p_reflink(stm_9p_client *c,
+                             uint32_t src_fid, uint32_t dst_fid,
+                             stm_9p_qid *out_qid);
+
+/* Tfallocate: invoke server-side fallocate(2). `flags` is a bitmask of
+ * STM_9P_FALLOC_FL_* — match Linux <linux/falloc.h> verbatim so a
+ * binding can pass kernel-supplied flags through. `offset` + `length`
+ * specify the affected range.
+ *
+ * Returns:
+ *   - STM_OK on success.
+ *   - STM_EINVAL on NULL c.
+ *   - Any Rlerror's mapped status (e.g. STM_ENOSPC, STM_EINVAL on
+ *     unsupported flag combinations). */
+STM_MUST_USE
+stm_status stm_9p_fallocate(stm_9p_client *c, uint32_t fid,
+                               uint32_t flags,
+                               uint64_t offset, uint64_t length);
+
+/* Tfadvise: invoke server-side posix_fadvise(2). `advice` is one of
+ * STM_9P_FADV_* — generic Linux numbering (see header doc for s390
+ * caveat). v2.0 server treats advice as inode-granularity hint;
+ * offset+length are advisory but not enforced.
+ *
+ * Returns:
+ *   - STM_OK on success.
+ *   - STM_EINVAL on NULL c.
+ *   - Any Rlerror's mapped status. */
+STM_MUST_USE
+stm_status stm_9p_fadvise(stm_9p_client *c, uint32_t fid,
+                             uint64_t offset, uint64_t length,
+                             uint32_t advice);
 
 /* Tgetattr: fetch Linux-stat attributes for `fid`. `request_mask`
  * specifies which fields to populate; common values are

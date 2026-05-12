@@ -10,7 +10,7 @@ server on a Unix socket (`stratumd`); the FUSE shim, CLI tools (
 Go/Python/Zig bindings are all 9P clients of that server. This
 header is the C surface every consumer compiles against.
 
-Scope at v2.0 (cumulative through P9.5-POLISH-1 Tlock/Tgetlock):
+Scope at v2.0 (cumulative through P9.5-POLISH-1 batch):
 
 - Sync one-op-at-a-time client (Tmsg + matching Rmsg blocking call).
 - 9P2000.L dialect only — stratumd serves .L only. /ctl/-over-the-
@@ -21,9 +21,13 @@ Scope at v2.0 (cumulative through P9.5-POLISH-1 Tlock/Tgetlock):
 - Caller-managed fid namespace except for the dial-time root fid.
 - Advisory byte-range locking (Tlock/Tgetlock) with owner-id derived
   per-fid by the server — kernel v9fs critical path.
+- Filesystem stats (Tstatfs) for df / vfs_statfs.
+- Stratum extensions: Tsync (pool-wide commit without a fid),
+  Treflink (FICLONE-shape), Tfallocate (Linux fallocate(2)),
+  Tfadvise (Linux posix_fadvise(2)).
 
-Header: `v2/include/stratum/9p_client.h` (663 lines).
-Impl: `v2/src/9p_client/9p_client.c` (1720 lines).
+Header: `v2/include/stratum/9p_client.h` (765 lines).
+Impl: `v2/src/9p_client/9p_client.c` (1946 lines).
 No dedicated TLA+ spec — composes against the server's `fid.tla` +
 `namespace.tla` per connection.
 
@@ -121,6 +125,56 @@ The server's `owner_id` is `(lock_owner_base | fid)`; the client's
 locks on the same inode (POSIX OFD-lock semantics), Twalk-clone the
 fid and lock through the clones. Tclunk auto-releases every lock held
 by the clunked fid's owner_id (server-side `stm_fs_release_lock_owner`).
+
+### Filesystem stats (P9.5-POLISH-1)
+
+```c
+typedef struct {
+    uint32_t type;       /* STM_9P_FS_MAGIC (0x53545241 = "STRA") */
+    uint32_t bsize;      /* 4096 at v2.0 */
+    uint64_t blocks;     /* total data blocks */
+    uint64_t bfree;      /* free blocks */
+    uint64_t bavail;     /* free blocks for unprivileged users */
+    uint64_t files;      /* ≈ unlimited at v2.0 */
+    uint64_t ffree;      /* free inodes */
+    uint64_t fsid;       /* server-derived, stable per mount */
+    uint32_t namelen;    /* STM_9P_NAME_MAX (255) */
+} stm_9p_statfs_out;
+
+stm_status stm_9p_statfs(c, fid, out *);
+```
+
+fid identifies a mount point (typically the Tattach root fid).
+Server v2.0 derives `fsid` from the server instance's
+`lock_owner_base` — stable for the server's lifetime; v2.1+ may
+switch to the pool UUID.
+
+### Stratum extensions (P9.5-POLISH-1)
+
+```c
+stm_status stm_9p_sync     (c);
+stm_status stm_9p_reflink  (c, src_fid, dst_fid, out_qid *);
+stm_status stm_9p_fallocate(c, fid, flags, offset, length);
+stm_status stm_9p_fadvise  (c, fid, offset, length, advice);
+```
+
+`Tsync` is a whole-pool barrier without an open fid (distinct from
+Tfsync which threads through a fid; both route to `stm_fs_commit`).
+
+`Treflink` is FICLONE-shape: src's extents reflink-share into dst's
+inode. dst MUST be empty; cross-dataset is STM_EXDEV. Server v2.0
+does NOT bump dst's si_gen on reflink (R94 P3-1) — clients keying
+cache invalidation on qid.version must re-open dst after reflink.
+
+`Tfallocate` flags match Linux `<linux/falloc.h>` (STM_9P_FALLOC_FL_*):
+KEEP_SIZE / PUNCH_HOLE / COLLAPSE_RANGE / ZERO_RANGE / INSERT_RANGE /
+UNSHARE_RANGE. Files in INLINE mode (≤ 100 bytes, no extents) refuse
+fallocate-grow with STM_ERANGE — callers must transition to EXTENT
+mode first via a write > 100 bytes or `stm_9p_setattr` truncate-up.
+
+`Tfadvise` advice values match Linux `<linux/fadvise.h>` generic
+numbering (STM_9P_FADV_*). v2.0 server treats advice as inode-
+granularity hint — offset/length are advisory but not enforced.
 
 ### Deferred from v2.0 (forward-noted)
 
@@ -290,6 +344,8 @@ the SERVER's correctness viewed through the wire:
 | `AcquireLock` / `ReleaseLock` (locks.tla) | `stm_9p_lock` | same |
 | `GetLock` (locks.tla) | `stm_9p_getlock` | same |
 | `ReleaseOwner` on Tclunk | (automatic — server-side) | `v2/src/9p/server.c::fid_release_locked` |
+| `Statfs` | `stm_9p_statfs` | same |
+| `Sync` / `Reflink` / `Fallocate` / `Fadvise` (Stratum extensions, server-side P9-9P-3) | `stm_9p_sync` / `stm_9p_reflink` / `stm_9p_fallocate` / `stm_9p_fadvise` | same |
 
 ## Tests
 
@@ -319,6 +375,8 @@ the SERVER's correctness viewed through the wire:
 | Connection-poisoned flag on tag-mismatch (R111 P3 F-11) | LIVE | op_entry_check at entry |
 | Strict body-length equality (R111 P3 F-10) | LIVE | All Rxx parsers |
 | Tlock / Tgetlock (P9.5-POLISH-1) | LIVE | Owner-id derived per-fid by server; SUCCESS ⇒ STM_OK, BLOCKED ⇒ STM_EAGAIN; Tclunk auto-releases |
+| Tstatfs (P9.5-POLISH-1) | LIVE | df / vfs_statfs critical path |
+| Tsync / Treflink / Tfallocate / Tfadvise (P9.5-POLISH-1) | LIVE | Stratum extensions; server-side P9-9P-3 |
 | Txattrwalk / Txattrcreate | DEFERRED | Tail chunk |
 | Tstatfs | DEFERRED | Bundled with /ctl/-on-stratumd |
 | Tflush | DEFERRED | Sync client doesn't need it |
