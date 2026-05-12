@@ -1221,4 +1221,143 @@ STM_TEST(inode_alloc_anon_arg_validation) {
     stm_inode_index_close(idx);
 }
 
+/* ------------------------------------------------------------------ */
+/* Per-inode locks — P9.5-PARALLEL-3 impl-1.                          */
+/*                                                                     */
+/* Single-threaded tests on the pin/unpin surface. Cross-thread        */
+/* concurrency (two writers + disjoint inodes proceed in parallel; same*/
+/* inode serializes) is exercised by test_compound_ops_concurrent.c.   */
+/* ------------------------------------------------------------------ */
+
+STM_TEST(inode_pin_roundtrip) {
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
+
+    stm_inode_handle *h = NULL;
+    STM_ASSERT_OK(stm_inode_pin(idx, 1, ino, &h));
+    STM_ASSERT_TRUE(h != NULL);
+    stm_inode_unpin(idx, h);
+
+    stm_inode_index_close(idx);
+}
+
+STM_TEST(inode_pin_missing_returns_enoent) {
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    stm_inode_handle *h = NULL;
+    STM_ASSERT_ERR(stm_inode_pin(idx, 1, 42, &h), STM_ENOENT);
+    STM_ASSERT_TRUE(h == NULL);
+
+    stm_inode_index_close(idx);
+}
+
+STM_TEST(inode_pin_freed_returns_enoent) {
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
+    STM_ASSERT_OK(stm_inode_free(idx, 1, ino));
+
+    stm_inode_handle *h = NULL;
+    STM_ASSERT_ERR(stm_inode_pin(idx, 1, ino, &h), STM_ENOENT);
+
+    stm_inode_index_close(idx);
+}
+
+STM_TEST(inode_pin_arg_validation) {
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    stm_inode_handle *h = NULL;
+    /* NULL idx. */
+    STM_ASSERT_ERR(stm_inode_pin(NULL, 1, 1, &h), STM_EINVAL);
+    /* NULL out_handle. */
+    STM_ASSERT_ERR(stm_inode_pin(idx, 1, 1, NULL), STM_EINVAL);
+    /* dataset_id == 0 reserved. */
+    STM_ASSERT_ERR(stm_inode_pin(idx, 0, 1, &h), STM_EINVAL);
+    /* ino == 0 reserved. */
+    STM_ASSERT_ERR(stm_inode_pin(idx, 1, 0, &h), STM_EINVAL);
+
+    /* unpin is NULL-safe (no abort). */
+    stm_inode_unpin(idx, NULL);
+    stm_inode_unpin(NULL, NULL);
+
+    stm_inode_index_close(idx);
+}
+
+STM_TEST(inode_pin_disjoint_inodes_independent) {
+    /* Two different inodes can be pinned by the same thread without
+     * deadlock — the per-inode locks are independent. (A single-thread
+     * smoke test for the spec's WriterAtomicPerInode invariant: at most
+     * one writer per inode; different inodes are different writers'
+     * domains.) */
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    uint64_t ino1 = 0, ino2 = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino1));
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino2));
+    STM_ASSERT_TRUE(ino1 != ino2);
+
+    stm_inode_handle *h1 = NULL, *h2 = NULL;
+    STM_ASSERT_OK(stm_inode_pin(idx, 1, ino1, &h1));
+    STM_ASSERT_OK(stm_inode_pin(idx, 1, ino2, &h2));
+    stm_inode_unpin(idx, h2);
+    stm_inode_unpin(idx, h1);
+
+    /* Re-pin in opposite order — fresh slot allocs after release. */
+    STM_ASSERT_OK(stm_inode_pin(idx, 1, ino2, &h2));
+    STM_ASSERT_OK(stm_inode_pin(idx, 1, ino1, &h1));
+    stm_inode_unpin(idx, h1);
+    stm_inode_unpin(idx, h2);
+
+    stm_inode_index_close(idx);
+}
+
+STM_TEST(inode_pin_per_dataset_isolated) {
+    /* The lock key is (dataset_id, ino). Different datasets with the
+     * same ino are distinct lock slots; pinning both in the same thread
+     * proves they don't collide on the bucket. */
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    uint64_t ino_ds1 = 0, ino_ds2 = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino_ds1));
+    STM_ASSERT_OK(stm_inode_alloc(idx, 2, 0100644, 0, 0, &ino_ds2));
+    STM_ASSERT_EQ(ino_ds1, ino_ds2);   /* both freshly = 1 per dataset */
+
+    stm_inode_handle *h1 = NULL, *h2 = NULL;
+    STM_ASSERT_OK(stm_inode_pin(idx, 1, ino_ds1, &h1));
+    STM_ASSERT_OK(stm_inode_pin(idx, 2, ino_ds2, &h2));
+    stm_inode_unpin(idx, h1);
+    stm_inode_unpin(idx, h2);
+
+    stm_inode_index_close(idx);
+}
+
+STM_TEST(inode_pin_slot_reused_after_unpin) {
+    /* After unpin drops refcount to 0, the slot is freed. A subsequent
+     * pin on the same (ds, ino) gets a FRESH slot. We can't observe
+     * the slot pointer directly, but we can verify the lifecycle
+     * produces no leaks (close runs the drain). */
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
+
+    for (int i = 0; i < 8; i++) {
+        stm_inode_handle *h = NULL;
+        STM_ASSERT_OK(stm_inode_pin(idx, 1, ino, &h));
+        stm_inode_unpin(idx, h);
+    }
+
+    stm_inode_index_close(idx);
+}
+
 STM_TEST_MAIN("test_inode")

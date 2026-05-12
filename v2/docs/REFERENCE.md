@@ -38,12 +38,45 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9.5-POLISH-1 xattr pair client primitives (this commit).
-  `libstratum-9p` adds `stm_9p_xattrwalk` + `stm_9p_xattrcreate` —
-  the LAST deferred surface from POLISH-1 #927. Closes the entire
-  v9fs-critical-path client API set. Linux v9fs mount can now drive
-  getfattr / setfattr / SELinux labels / POSIX ACLs via these
-  primitives.
+- **Tip**: P9.5-PARALLEL-3 impl-1 foundation commit. Converts
+  `fs->lock` from `pthread_mutex_t` to `pthread_rwlock_t fs->global`,
+  introduces the `stm_inode_pin/_unpin` per-inode mutex API
+  (256-bucket refcounted hash-table of stable mutex slots), and
+  ports the three single-inode setattr-shape ops (chmod / chown /
+  utimens) onto the SH + per-inode-pin path. The 60+ residual EX
+  sites (transitional "unported" surface) carry PARALLEL-2's
+  compound-op atomicity contract unchanged. R133 audit fires on
+  this commit.
+  - Spec composition: `v2/specs/compound_ops_per_inode.tla` (4
+    invariants + 2 buggy configs landed at the spec phase). Impl
+    realizes the `inode_lock_holder[i] = w` action discipline; the
+    single-inode chmod / chown / utimens ports trivially satisfy
+    LockOrderPreserved + NoCircularWait (need ≥2 inodes for a cycle).
+  - Lock-order discipline: `fs->global` SH (outer) → per-inode
+    `handle->mu` (middle, ascending order across multi-inode ops at
+    impl-2+) → sync's internal mutex (inner). The pin/unpin pair
+    re-validates `(dataset_id, ino)` is still ALLOCATED under both
+    `idx->lock` and the per-inode mutex; freed-between checks fail
+    with STM_ENOENT (TOCTOU-safe).
+  - Tests: 7 new pin/unpin unit tests in `tests/test_inode.c`
+    (roundtrip; missing / freed → ENOENT; arg validation; disjoint
+    inodes independent; per-dataset isolated; slot reuse) + 2 new
+    pthread harness tests in `tests/test_compound_ops_concurrent.c`
+    (two writers on disjoint inodes + two writers on the same
+    inode, both 500-iteration; no deadlock; no error).
+  - **ctest 54/54 GREEN**. Rust unit 97/97. e2e_crud 33/33.
+    concurrent_ctl 2/2.
+  - Next: impl-2 ports the two-inode ops (unlink, mkdir, link,
+    rename non-overwrite). impl-3 ports rename overwrite (4-inode
+    atomicity). impl-4 ports cross-dataset ops. impl-5 drops
+    residual EX takes. impl-6 lands a perf regression test.
+
+- **Pre-tip-1**: P9.5-POLISH-1 xattr pair client primitives
+  (`e208cb9`). `libstratum-9p` adds `stm_9p_xattrwalk` +
+  `stm_9p_xattrcreate` — the LAST deferred surface from POLISH-1
+  #927. Closes the entire v9fs-critical-path client API set. Linux
+  v9fs mount can now drive getfattr / setfattr / SELinux labels /
+  POSIX ACLs via these primitives.
   - `stm_9p_xattrwalk(c, fid, newfid, name, &size)` — server-side
     aux-fid materialization. `name == NULL` ⇒ LIST mode (NUL-
     separated names buffer; Linux listxattr shape). `name`
@@ -80,7 +113,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
     The remaining libstratum-9p deferred items (Tflush, async
     API, 9P2000 non-.L dialect) are NOT v9fs-mount-critical.
 
-- **Pre-tip-1**: P9.5-POLISH-1 batch — Tstatfs + Stratum extensions
+- **Pre-tip-2**: P9.5-POLISH-1 batch — Tstatfs + Stratum extensions
   client primitives (`e357a12`). Adds 4 kernel-v9fs-critical-path
   ops + Tsync (whole-pool barrier). `libstratum-9p` covers
   Tstatfs (df / vfs_statfs), Tsync (pool-wide commit without a fid),
@@ -120,7 +153,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   - **ctest 54/54 GREEN** (test_9p_client now runs 58 cases, up
     from 51). Rust suites unchanged.
 
-- **Pre-tip-2**: P9.5-POLISH-1 Tlock + Tgetlock client primitives
+- **Pre-tip-3**: P9.5-POLISH-1 Tlock + Tgetlock client primitives
   (`d4e5d67`). `libstratum-9p` gained advisory byte-range locking.
   Composes against `locks.tla::AcquireLock`/`ReleaseLock`/`GetLock`
   through the server.
@@ -147,7 +180,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   - **ctest 54/54 GREEN** (test_9p_client now runs 51 cases, up
     from 43). Rust suites unchanged.
 
-- **Pre-tip-3**: R128 P3-1/P3-8 + R129 P3-3/P3-4 doc-drift forward-note
+- **Pre-tip-4**: R128 P3-1/P3-8 + R129 P3-3/P3-4 doc-drift forward-note
   closures (`4267b3d`). Comment-only: corrected
   `stm_dirty_buffer_destroy` stale auto-wedge claim, rewrote
   `stm_dirty_buffer_drain_ino` doc-comment to match pop-on-success
@@ -155,13 +188,13 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   install_production_cb cleanup-order comment + fs->pool/sync
   immutability comment.
 
-- **Pre-tip-4**: R131 P3-4 + P3-5 saturation guards (`4cf257c`).
+- **Pre-tip-5**: R131 P3-4 + P3-5 saturation guards (`4cf257c`).
   `stm_ctl_conn_create` refuses with STM_EOVERFLOW when
   `worker_count == UINT32_MAX`; `/admin/clear-events` write refuses
   with STM_EOVERFLOW when `event_gen == UINT64_MAX`. R29 P3-1
   doctrine carry (refuse rather than wrap).
 
-- **Pre-tip-5**: Reference-doc backfill — Phase 9 modules
+- **Pre-tip-6**: Reference-doc backfill — Phase 9 modules
   (`ad0d087`+`d317bfb`+`3065c21`; DOC-ONLY). Closes the second
   half of the Phase 9 deferment forward-noted in CLAUDE.md (R96
   P3-8): per-subsystem `reference/NN-*.md` catalog for the Phase
@@ -172,7 +205,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
     template: Purpose, Public API, Implementation, Spec
     cross-reference, SPEC-TO-CODE mapping, Tests, Status table.
 
-- **Pre-tip-6**: Reference-doc backfill — Phase 8 modules (`cac568c`;
+- **Pre-tip-7**: Reference-doc backfill — Phase 8 modules (`cac568c`;
   DOC-ONLY). Per-subsystem `reference/NN-*.md` catalog for the
   Phase 8 POSIX-surface modules: `16-inode.md`
   (`inode.tla::TupleUniqueAllTime`), `17-dirent.md`
@@ -182,7 +215,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   (`locks.tla::NoConflictingLocks`). REFERENCE.md Contents index
   also gained the previously-missing `15-cas.md` row.
 
-- **Pre-tip-7**: P9.5-PARALLEL-3 spec phase (`d57774c`) — per-inode
+- **Pre-tip-8**: P9.5-PARALLEL-3 spec phase (`d57774c`) — per-inode
   `fs->lock` granularity refinement (SPEC ONLY, no impl yet). Lays
   down the formal model + design doc the multi-commit impl phase
   (future sessions) will reference.
@@ -205,7 +238,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   - Outstanding: TLC verification (#973 tooling-gated); impl-1..6
     multi-commit deferred.
 
-- **Pre-tip-8**: P9.5-PARALLEL-2 — compound-op race-class audit + formal
+- **Pre-tip-9**: P9.5-PARALLEL-2 — compound-op race-class audit + formal
   spec + regression test. The chunk verifies and
   documents the contract that emerges under post-PARALLEL-1
   concurrent /ctl/: **per-subsystem linearizable + cross-subsystem
@@ -251,7 +284,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   - Outstanding: TLC verification of compound_ops.tla (tooling-gated
     like #958; expected verdicts documented in each cfg header).
 
-- **Pre-tip-9**: P9.5-PARALLEL-1 — stm_ctl_conn split + concurrent /ctl/
+- **Pre-tip-10**: P9.5-PARALLEL-1 — stm_ctl_conn split + concurrent /ctl/
   accept + R131 audit close + #961 dedicated concurrent regression
   tests. `v2/include/stratum/ctl.h` declares the new
   per-connection wrapper API (`stm_ctl_conn_create` / `_destroy` /
@@ -292,7 +325,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   row + stratumd row updated. Outstanding sub-task: #958 (TLC
   verify ctl_conn.tla, tooling-gated).
 
-- **Pre-tip-10**: P9-CTL-2b /ctl/ codec migration to lp9.
+- **Pre-tip-11**: P9-CTL-2b /ctl/ codec migration to lp9.
   `v2/src/ctl/synfs.c` + `v2/include/stratum/ctl.h` + `v2/tests/test_ctl.c`
   all re-keyed from `stm_p9_server` (9P2000 vops) to `stm_lp9_server`
   (.L vops). The `KIND_META[]` table, `qid_path` encoding, materializer

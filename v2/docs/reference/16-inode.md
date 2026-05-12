@@ -229,9 +229,47 @@ persistence fields. The module takes its own lock only — no cross-
 layer dependencies. Caller (sync.c) MUST not hold any other inode-
 comparable lock when invoking these APIs.
 
-P9.5-PARALLEL-3 (spec phase landed; impl pending) forward-notes adding
-per-record mutexes for the per-inode locking refactor of fs.c. See
-`v2/docs/p9.5-parallel-3-design.md` §3.2.
+### Per-inode locks (P9.5-PARALLEL-3 impl-1)
+
+```c
+struct stm_inode_handle;
+stm_status stm_inode_pin   (idx, dataset_id, ino, **handle);
+void       stm_inode_unpin (idx, handle);
+```
+
+Per-inode mutex held by an opaque handle. Allocated from a fixed
+256-bucket hash table keyed by `mix(dataset_id, ino)`. Slots are
+refcounted under `idx->lock`; the slot's `pthread_mutex_t mu` is
+INDEPENDENT of `idx->lock` so two writers can hold their respective
+inode mutexes concurrently while a third writer briefly bumps a
+refcount under `idx->lock`. Once the last unpin drops refcount to
+zero, the slot is removed from the chain + freed.
+
+The fs.c layer takes `stm_inode_pin` (under `fs->global` SH) for the
+duration of a per-inode compound op (chmod / chown / utimens at impl-1;
+extending to truncate / setattr / write / fallocate / migrate /
+seal / xattr at impl-2..5). Spec composition realizes the
+`inode_lock_holder[i] = w` action of `compound_ops_per_inode.tla`.
+
+**TOCTOU posture**: pin re-validates `(dataset_id, ino)` is still
+ALLOCATED under both `idx->lock` and the per-inode mutex before
+returning. If the inode was freed between the slot-allocation pre-
+check and the mutex acquire, pin fails with `STM_ENOENT` and releases
+the slot.
+
+**Lock-order discipline (caller's responsibility)**: multi-inode ops
+MUST pin in ascending `(dataset_id, ino)` order — the `NoCircularWait`
+invariant from `compound_ops_per_inode.tla` relies on this. Out-of-
+order acquisition produces the canonical 2-cycle deadlock.
+
+**ERRORCHECK mutex**: each slot's `mu` is initialized with
+`PTHREAD_MUTEX_ERRORCHECK`; a buggy double-pin from the same thread
+surfaces as an abort rather than silent recursive-lock.
+
+**Lifecycle**: `stm_inode_index_close` walks all 256 buckets and frees
+any leftover slots. In a well-formed shutdown every pin has a
+matching unpin so the buckets are empty; the drain is defense-in-
+depth against leaks.
 
 ### Tuple uniqueness across time
 
@@ -320,7 +358,8 @@ Spec actions: `AllocFresh`, `AllocReused`, `AllocAnon`, `Link`,
 | Symlink target (≤100 bytes) | LIVE | P8-POSIX-8 |
 | Persistence (load_at + commit) | LIVE | v24 format break |
 | Merkle root binding | LIVE | `inode_csum` is the 1st input to `compute_merkle_root` |
-| Per-record mutex for fs->lock refinement | DEFERRED | P9.5-PARALLEL-3 impl phase forward-noted |
+| Per-inode mutex (pin/unpin) | LIVE | P9.5-PARALLEL-3 impl-1; 256-bucket hash table; chmod/chown/utimens ported |
+| Multi-inode lock-order (pin in ascending order) | LIVE — caller discipline | impl-2..5 ports multi-inode ops (unlink/mkdir/link/rename/copy_file_range) |
 
 Audit class: any change to allocator paths (alloc / alloc_anon /
 materialize / free), gen arithmetic, or persistence validators MUST

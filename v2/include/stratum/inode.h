@@ -241,6 +241,22 @@ struct stm_inode_index;
 typedef struct stm_inode_index stm_inode_index;
 
 /*
+ * P9.5-PARALLEL-3 impl-1: opaque per-inode lock handle.
+ *
+ * `stm_inode_pin` returns a handle that holds a stable mutex for the
+ * named inode. The fs.c layer uses this to serialize compound ops on
+ * the same inode while allowing concurrent compound ops on disjoint
+ * inodes to proceed in parallel.
+ *
+ * The handle's mutex storage is owned by the inode index — pin bumps
+ * its refcount, unpin drops it; when the refcount hits zero, the
+ * mutex slot is destroyed and reclaimed. Callers do not free the
+ * handle directly.
+ */
+struct stm_inode_handle;
+typedef struct stm_inode_handle stm_inode_handle;
+
+/*
  * Create an empty inode index. The returned handle owns its lock and
  * its records array; callers must `stm_inode_index_close` to free.
  *
@@ -433,6 +449,67 @@ STM_MUST_USE
 stm_status stm_inode_set(stm_inode_index *idx, uint64_t dataset_id,
                             uint64_t ino,
                             const struct stm_inode_value *in_value);
+
+/* ========================================================================= */
+/* Per-inode locks (P9.5-PARALLEL-3 impl-1).                                 */
+/*                                                                            */
+/* `stm_inode_pin` acquires a per-inode mutex for (dataset_id, ino) and       */
+/* returns an opaque handle. While the handle is held, no other pin on the    */
+/* SAME (dataset_id, ino) succeeds — pins on disjoint inodes proceed in       */
+/* parallel. The handle's mutex is allocated from a hash-keyed slot pool      */
+/* owned by the inode index; slots are refcounted and reclaimed when the      */
+/* last unpin drops the refcount to zero.                                     */
+/*                                                                            */
+/* Spec composition: realizes the `inode_lock_holder[i] = w` action of        */
+/* `v2/specs/compound_ops_per_inode.tla` — the writer acquires the per-inode  */
+/* lock and HOLDS it for the full body of the compound op.                   */
+/*                                                                            */
+/* Lock-order discipline (caller's responsibility): for multi-inode ops the   */
+/* caller MUST pin in ASCENDING (dataset_id, ino) order. The spec's           */
+/* `NoCircularWait` invariant relies on this discipline; out-of-order         */
+/* acquisition produces the canonical 2-cycle deadlock between writers.       */
+/*                                                                            */
+/* TOCTOU posture: pin re-validates (dataset_id, ino) exists AND is not       */
+/* FREED while holding both the inode index's internal lock AND the per-     */
+/* inode mutex. A successful pin guarantees that, until the matching         */
+/* unpin, no other writer can mutate the inode's value via stm_inode_set     */
+/* (the writer-must-hold-inode-lock-for-mutation discipline).                 */
+/* ========================================================================= */
+
+/*
+ * Acquire the per-inode mutex for (dataset_id, ino) and return a handle
+ * via `*out_handle`.
+ *
+ * Blocks if another caller holds the lock for the same (dataset_id, ino);
+ * proceeds immediately if a different inode's lock is held by another
+ * caller.
+ *
+ * Refusals:
+ *   - NULL idx OR NULL out_handle (STM_EINVAL).
+ *   - dataset_id == 0 OR ino == 0 (STM_EINVAL).
+ *   - No record at (dataset_id, ino) OR record FREED (STM_ENOENT).
+ *   - STM_ENOMEM if the lock-slot pool can't grow.
+ *
+ * Lock-order: this function takes idx's internal mutex briefly to bump
+ * the slot's refcount, releases it, then acquires the per-inode mutex,
+ * then re-takes idx's mutex briefly to verify the inode is still
+ * allocated. The full pin DOES NOT compose with any caller-held lock
+ * (it must be the outermost layer of any compound op's lock chain
+ * INSIDE fs->global SH).
+ */
+STM_MUST_USE
+stm_status stm_inode_pin(stm_inode_index *idx, uint64_t dataset_id,
+                            uint64_t ino, stm_inode_handle **out_handle);
+
+/*
+ * Release the per-inode mutex held by `handle`. Safe with NULL handle
+ * (no-op). After return the handle is invalid — do not dereference.
+ *
+ * If this unpin drops the slot's refcount to zero, the slot is freed.
+ * If other pinners hold references (refcount > 0 after decrement), the
+ * slot remains for them; their unpin will eventually reclaim it.
+ */
+void stm_inode_unpin(stm_inode_index *idx, stm_inode_handle *handle);
 
 /*
  * Count ALLOCATED inodes in `dataset_id`. FREED records are excluded.

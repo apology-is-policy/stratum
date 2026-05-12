@@ -341,4 +341,148 @@ STM_TEST(compound_ops_concurrent_writer_reader_no_deadlock_no_tear) {
  * which will exercise every compound op under a finer-grained
  * locking refinement. */
 
+/* ── PARALLEL-3 impl-1: per-inode chmod concurrency ─────────────────── */
+
+#define PER_INODE_ITERATIONS    500u
+
+typedef struct {
+    stm_fs *fs;
+    uint64_t dataset_id;
+    uint64_t ino;
+    uint32_t base_mode;          /* mode the thread cycles through */
+    unsigned iterations;
+    atomic_int err;
+    atomic_uint completed;
+    atomic_bool done;
+} setattr_ctx;
+
+static void *setattr_thread(void *arg)
+{
+    setattr_ctx *s = (setattr_ctx *)arg;
+    for (unsigned i = 0; i < s->iterations; i++) {
+        uint32_t mode = s->base_mode | (i & 0777u);
+        stm_status rc = stm_fs_chmod(s->fs, s->dataset_id, s->ino, mode);
+        if (rc != STM_OK) {
+            atomic_store(&s->err, (int)rc);
+            break;
+        }
+        atomic_fetch_add(&s->completed, 1u);
+    }
+    atomic_store(&s->done, true);
+    return NULL;
+}
+
+static bool wait_two_threads(const setattr_ctx *a, const setattr_ctx *b,
+                                pthread_t at, pthread_t bt)
+{
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (;;) {
+        if (atomic_load(&a->done) && atomic_load(&b->done)) break;
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec - start.tv_sec > DEADLINE_SECONDS) return false;
+        struct timespec ns = { 0, 10 * 1000 * 1000 };  /* 10 ms */
+        nanosleep(&ns, NULL);
+    }
+    (void)pthread_join(at, NULL);
+    (void)pthread_join(bt, NULL);
+    return true;
+}
+
+/* Two writers, DIFFERENT inodes — exercises the design's promise that
+ * per-inode locking allows disjoint-inode ops to proceed in parallel.
+ * No correctness check beyond "both complete without error and without
+ * deadlock"; perf measurement is left to PARALLEL-3's impl-6 regression
+ * test. The interesting failure modes this catches: (a) the per-inode
+ * mutex is mis-initialized (thread aborts); (b) the pin/unpin pair
+ * leaks slots (close drains them; absence of crash on close is the
+ * check); (c) fs->global SH semantics break (writers serialize even
+ * though they should be concurrent — surfaces as deadlock if
+ * misconfigured, but is still functionally correct). */
+STM_TEST(per_inode_chmod_disjoint_inodes_no_deadlock) {
+    make_tmp("per_inode_chmod_disjoint");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    /* Create a child dataset and two files in it. */
+    uint64_t ds_id = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "per_inode_ds", &ds_id));
+    uint64_t ino_a = 0, ino_b = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, ds_id, /*parent=*/1, (const uint8_t *)"a", 1,
+                                        0100644, 0, 0, &ino_a));
+    STM_ASSERT_OK(stm_fs_create_file(fs, ds_id, /*parent=*/1, (const uint8_t *)"b", 1,
+                                        0100644, 0, 0, &ino_b));
+    STM_ASSERT_TRUE(ino_a != ino_b);
+
+    setattr_ctx ca = { 0 }, cb = { 0 };
+    ca.fs = fs; ca.dataset_id = ds_id; ca.ino = ino_a;
+    ca.base_mode = 0100600u; ca.iterations = PER_INODE_ITERATIONS;
+    cb.fs = fs; cb.dataset_id = ds_id; cb.ino = ino_b;
+    cb.base_mode = 0100644u; cb.iterations = PER_INODE_ITERATIONS;
+
+    pthread_t at, bt;
+    STM_ASSERT_EQ(0, pthread_create(&at, NULL, setattr_thread, &ca));
+    STM_ASSERT_EQ(0, pthread_create(&bt, NULL, setattr_thread, &cb));
+
+    STM_ASSERT(wait_two_threads(&ca, &cb, at, bt));
+
+    STM_ASSERT_EQ(0, atomic_load(&ca.err));
+    STM_ASSERT_EQ(0, atomic_load(&cb.err));
+    STM_ASSERT_EQ(PER_INODE_ITERATIONS, atomic_load(&ca.completed));
+    STM_ASSERT_EQ(PER_INODE_ITERATIONS, atomic_load(&cb.completed));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* Two writers, SAME inode — exercises that the per-inode mutex
+ * serializes them correctly. The chmod calls all succeed (no
+ * STM_ENOENT, no STM_EINVAL, no torn state). Without the per-inode
+ * mutex, stm_inode_lookup + stm_inode_set could lose updates, but
+ * the public API itself stays functional — so the test is mostly a
+ * shape check (no deadlock, no error from the inode layer's
+ * ERRORCHECK mutex if we accidentally double-locked). */
+STM_TEST(per_inode_chmod_same_inode_serializes) {
+    make_tmp("per_inode_chmod_same");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t ds_id = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "per_inode_same_ds", &ds_id));
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_fs_create_file(fs, ds_id, /*parent=*/1, (const uint8_t *)"shared", 6,
+                                        0100644, 0, 0, &ino));
+
+    setattr_ctx ca = { 0 }, cb = { 0 };
+    ca.fs = fs; ca.dataset_id = ds_id; ca.ino = ino;
+    ca.base_mode = 0100600u; ca.iterations = PER_INODE_ITERATIONS;
+    cb.fs = fs; cb.dataset_id = ds_id; cb.ino = ino;
+    cb.base_mode = 0100644u; cb.iterations = PER_INODE_ITERATIONS;
+
+    pthread_t at, bt;
+    STM_ASSERT_EQ(0, pthread_create(&at, NULL, setattr_thread, &ca));
+    STM_ASSERT_EQ(0, pthread_create(&bt, NULL, setattr_thread, &cb));
+
+    STM_ASSERT(wait_two_threads(&ca, &cb, at, bt));
+
+    STM_ASSERT_EQ(0, atomic_load(&ca.err));
+    STM_ASSERT_EQ(0, atomic_load(&cb.err));
+    STM_ASSERT_EQ(PER_INODE_ITERATIONS, atomic_load(&ca.completed));
+    STM_ASSERT_EQ(PER_INODE_ITERATIONS, atomic_load(&cb.completed));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("test_compound_ops_concurrent")

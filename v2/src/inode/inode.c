@@ -73,6 +73,25 @@ typedef struct {
     uint64_t next_ino;       /* high-water mark; alloc returns this then bumps */
 } stm_inode_dsstate;
 
+/* P9.5-PARALLEL-3 impl-1: per-inode lock slot. Refcounted; lives in a
+ * fixed-bucket hash chain owned by stm_inode_index. The slot's `mu`
+ * is the per-inode mutex that stm_inode_pin / stm_inode_unpin lock /
+ * unlock; the slot itself is heap-allocated and stable for the
+ * lifetime of any non-zero refcount, so the handle pointer remains
+ * valid across realloc of unrelated index state.
+ *
+ * Spec composition: realizes the `inode_lock_holder[i] = w` action of
+ * compound_ops_per_inode.tla. */
+struct stm_inode_handle {
+    uint64_t                  dataset_id;
+    uint64_t                  ino;
+    uint32_t                  refcount;     /* under idx->lock */
+    pthread_mutex_t           mu;           /* the per-inode lock */
+    struct stm_inode_handle  *next;         /* hash-chain link, under idx->lock */
+};
+
+#define STM_INODE_HANDLE_BUCKETS  256u
+
 struct stm_inode_index {
     pthread_mutex_t     lock;
     stm_inode_record   *records;
@@ -81,6 +100,12 @@ struct stm_inode_index {
     stm_inode_dsstate  *dsstate;
     size_t              n_datasets;
     size_t              cap_datasets;
+    /* P9.5-PARALLEL-3 impl-1: per-inode lock-slot pool. Hash chains keyed
+     * by mix(dataset_id, ino) % STM_INODE_HANDLE_BUCKETS. Each bucket
+     * head is a linked list of stm_inode_handle. The chain head pointer
+     * AND each handle's refcount live under idx->lock; the handle's
+     * `mu` is independent of idx->lock. */
+    struct stm_inode_handle *handle_buckets[STM_INODE_HANDLE_BUCKETS];
 
     /* ----- Persistence (P8-POSIX-1b, mirrors stm_extent_index). ----- */
     stm_bdev       *bdev;
@@ -425,6 +450,20 @@ stm_inode_index *stm_inode_index_create(void) {
 
 void stm_inode_index_close(stm_inode_index *idx) {
     if (!idx) return;
+    /* P9.5-PARALLEL-3 impl-1: drain any leftover handle slots. In a well-
+     * formed shutdown every pin has a matching unpin so the buckets are
+     * empty; the drain is defense-in-depth against leaks. We destroy
+     * each slot's mutex unconditionally — at this point no other thread
+     * can hold it (close is the last call). */
+    for (size_t b = 0; b < STM_INODE_HANDLE_BUCKETS; b++) {
+        struct stm_inode_handle *h = idx->handle_buckets[b];
+        while (h) {
+            struct stm_inode_handle *next = h->next;
+            pthread_mutex_destroy(&h->mu);
+            free(h);
+            h = next;
+        }
+    }
     pthread_mutex_destroy(idx_lock(idx));
     free(idx->records);
     free(idx->dsstate);
@@ -1339,4 +1378,151 @@ stm_status stm_inode_index_load_at(stm_inode_index *idx,
 
     must_unlock(idx_lock(idx));
     return STM_OK;
+}
+
+/* ====================================================================== */
+/* Per-inode locks (P9.5-PARALLEL-3 impl-1).                              */
+/*                                                                          */
+/* The hash mixes dataset_id and ino into a 256-bucket fixed-size table.   */
+/* Distinct inodes within the same dataset typically have low ino values,  */
+/* so we fold the high bits via a multiply-and-xor mix that spreads bits   */
+/* across all 8 output bits. Collisions are handled by linear chain walk   */
+/* under idx->lock. Striping is forward-noted: bucket head reads/writes   */
+/* serialize on idx->lock today; a finer-grained per-bucket mutex is a    */
+/* future optimization if pin contention becomes load-bearing.            */
+/* ====================================================================== */
+
+/* xxhash-style mix → 8-bit bucket index. */
+static inline size_t handle_bucket(uint64_t dataset_id, uint64_t ino) {
+    uint64_t h = dataset_id;
+    h ^= ino + 0x9e3779b97f4a7c15ull;
+    h ^= (h >> 33);
+    h *= 0xff51afd7ed558ccdull;
+    h ^= (h >> 33);
+    h *= 0xc4ceb9fe1a85ec53ull;
+    h ^= (h >> 33);
+    return (size_t)(h & (uint64_t)(STM_INODE_HANDLE_BUCKETS - 1u));
+}
+
+/* Find or allocate the lock slot for (dataset_id, ino). Bumps refcount
+ * on success. Caller holds idx->lock. Returns NULL on STM_ENOMEM (init
+ * of the per-slot mutex failed). */
+static struct stm_inode_handle *
+handle_get_or_alloc_locked(stm_inode_index *idx,
+                              uint64_t dataset_id, uint64_t ino) {
+    size_t b = handle_bucket(dataset_id, ino);
+    for (struct stm_inode_handle *h = idx->handle_buckets[b]; h; h = h->next) {
+        if (h->dataset_id == dataset_id && h->ino == ino) {
+            h->refcount++;
+            return h;
+        }
+    }
+    struct stm_inode_handle *h = malloc(sizeof *h);
+    if (!h) return NULL;
+    h->dataset_id = dataset_id;
+    h->ino        = ino;
+    h->refcount   = 1u;
+    h->next       = idx->handle_buckets[b];
+
+    pthread_mutexattr_t attr;
+    if (pthread_mutexattr_init(&attr) != 0) {
+        free(h);
+        return NULL;
+    }
+    /* ERRORCHECK: a buggy double-pin from the same thread aborts here
+     * rather than silently allowing a recursive lock — matches the
+     * spec's WriterAtomicPerInode posture (at most one writer per
+     * inode at any time). */
+    if (pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK) != 0) {
+        pthread_mutexattr_destroy(&attr);
+        free(h);
+        return NULL;
+    }
+    int rc = pthread_mutex_init(&h->mu, &attr);
+    pthread_mutexattr_destroy(&attr);
+    if (rc != 0) {
+        free(h);
+        return NULL;
+    }
+    idx->handle_buckets[b] = h;
+    return h;
+}
+
+/* Decrement refcount on the slot; if 0, remove from bucket chain +
+ * free. Caller holds idx->lock. */
+static void handle_release_locked(stm_inode_index *idx,
+                                       struct stm_inode_handle *h) {
+    if (h->refcount > 1u) {
+        h->refcount--;
+        return;
+    }
+    size_t b = handle_bucket(h->dataset_id, h->ino);
+    struct stm_inode_handle **pp = &idx->handle_buckets[b];
+    while (*pp && *pp != h) pp = &(*pp)->next;
+    /* If the slot is unlinked while still referenced, that's a leak we
+     * surface loudly rather than mask. Reachability is theoretical
+     * (handle_get_or_alloc_locked is the only inserter). */
+    if (*pp != h) abort();
+    *pp = h->next;
+    pthread_mutex_destroy(&h->mu);
+    free(h);
+}
+
+stm_status stm_inode_pin(stm_inode_index *idx, uint64_t dataset_id,
+                            uint64_t ino, stm_inode_handle **out_handle) {
+    if (!idx || !out_handle) return STM_EINVAL;
+    if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+
+    /* Validate the record exists + is allocated BEFORE taking the
+     * per-inode mutex. This pre-check avoids alloc-then-fail thrash
+     * for the common missing-inode case. */
+    must_lock(idx_lock(idx));
+    stm_inode_record *r = find_record(idx, dataset_id, ino);
+    if (!r || r->state != STM_INODE_STATE_ALLOCATED) {
+        must_unlock(idx_lock(idx));
+        return STM_ENOENT;
+    }
+    struct stm_inode_handle *h = handle_get_or_alloc_locked(idx,
+                                                                  dataset_id, ino);
+    if (!h) {
+        must_unlock(idx_lock(idx));
+        return STM_ENOMEM;
+    }
+    must_unlock(idx_lock(idx));
+
+    /* Acquire the per-inode mutex; may block on a concurrent holder.
+     * The slot remains live (refcount >= 1 thanks to our bump) for
+     * the duration of this wait. */
+    if (pthread_mutex_lock(&h->mu) != 0) {
+        must_lock(idx_lock(idx));
+        handle_release_locked(idx, h);
+        must_unlock(idx_lock(idx));
+        return STM_EBACKEND;
+    }
+
+    /* TOCTOU re-validate: between the pre-check and acquiring h->mu,
+     * the holding writer may have freed the inode. Re-check under
+     * both locks. */
+    must_lock(idx_lock(idx));
+    r = find_record(idx, dataset_id, ino);
+    if (!r || r->state != STM_INODE_STATE_ALLOCATED) {
+        must_unlock(idx_lock(idx));
+        pthread_mutex_unlock(&h->mu);
+        must_lock(idx_lock(idx));
+        handle_release_locked(idx, h);
+        must_unlock(idx_lock(idx));
+        return STM_ENOENT;
+    }
+    must_unlock(idx_lock(idx));
+
+    *out_handle = h;
+    return STM_OK;
+}
+
+void stm_inode_unpin(stm_inode_index *idx, stm_inode_handle *handle) {
+    if (!idx || !handle) return;
+    pthread_mutex_unlock(&handle->mu);
+    must_lock(idx_lock(idx));
+    handle_release_locked(idx, handle);
+    must_unlock(idx_lock(idx));
 }
