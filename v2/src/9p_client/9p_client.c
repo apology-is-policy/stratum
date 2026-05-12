@@ -1328,6 +1328,187 @@ stm_status stm_9p_fsync(stm_9p_client *c, uint32_t fid, uint32_t datasync)
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
+/* Tlock / Tgetlock — advisory byte-range locking (P9.5-POLISH-1).         */
+/*                                                                         */
+/* Server-side handlers in v2/src/9p/server.c (h_lock / h_getlock); both   */
+/* derive owner_id from the request's fid via lock_owner_base | fid.       */
+/*                                                                         */
+/* Trust posture (R111 doctrine):                                          */
+/*   - body_len strict-equality on Rlock (= 1 byte).                       */
+/*   - Rgetlock's variable cid_len is bound-checked against body_len before*/
+/*     consume; cid bytes are read but discarded at v2.0 (caller doesn't   */
+/*     consume the server's echo). R111 P0 F-1 caller-cap-bound is moot    */
+/*     here since we don't write server-supplied bytes into a caller-      */
+/*     supplied buffer; the bound is purely a wire-shape correctness gate. */
+/* ────────────────────────────────────────────────────────────────────── */
+
+static stm_status validate_lock_args_type(uint8_t type)
+{
+    switch (type) {
+    case STM_9P_LOCK_TYPE_RDLCK:
+    case STM_9P_LOCK_TYPE_WRLCK:
+    case STM_9P_LOCK_TYPE_UNLCK:
+        return STM_OK;
+    default:
+        return STM_EINVAL;
+    }
+}
+
+static stm_status validate_client_id_len(const char *client_id, size_t *out_len)
+{
+    if (!client_id) { *out_len = 0; return STM_OK; }
+    size_t n = strlen(client_id);
+    if (n > STM_9P_NAME_MAX) return STM_EINVAL;
+    *out_len = n;
+    return STM_OK;
+}
+
+stm_status stm_9p_lock(stm_9p_client *c, uint32_t fid,
+                          const stm_9p_lock_args *args)
+{
+    stm_status ec = op_entry_check(c);
+    if (ec != STM_OK) return ec;
+    if (!args) return STM_EINVAL;
+    ec = validate_lock_args_type(args->type);
+    if (ec != STM_OK) return ec;
+    size_t cid_len = 0;
+    ec = validate_client_id_len(args->client_id, &cid_len);
+    if (ec != STM_OK) return ec;
+
+    /* Wire: hdr + fid(4) + type(1) + flags(4) + start(8) + length(8) +
+     *       proc_id(4) + cid_len(2) + cid(cid_len). */
+    uint32_t msg_size = STM_9P_HDR_SIZE + 4u + 1u + 4u + 8u + 8u + 4u + 2u
+                       + (uint32_t)cid_len;
+    if (msg_size > c->buf_cap) return STM_ERANGE;
+    uint16_t tag = 0;
+    stm_status rc = alloc_tag(c, &tag);
+    if (rc != STM_OK) return rc;
+
+    uint8_t *wp = c->buf;
+    p_u32(wp, msg_size);
+    wp[4] = STM_9P_TLOCK;
+    p_u16(wp + 5, tag);
+    uint8_t *bp = wp + 7;
+    p_u32(bp, fid);              bp += 4;
+    *bp++ = args->type;
+    p_u32(bp, args->flags);      bp += 4;
+    p_u64(bp, args->start);      bp += 8;
+    p_u64(bp, args->length);     bp += 8;
+    p_u32(bp, args->proc_id);    bp += 4;
+    p_u16(bp, (uint16_t)cid_len); bp += 2;
+    if (cid_len) {
+        memcpy(bp, args->client_id, cid_len);
+        bp += cid_len;
+    }
+    rc = send_msg(c, msg_size);
+    if (rc != STM_OK) return rc;
+
+    uint32_t reply_size = 0;
+    rc = recv_msg(c, &reply_size);
+    if (rc != STM_OK) return rc;
+    const uint8_t *body = NULL;
+    uint32_t body_len = 0;
+    rc = check_reply(c, reply_size, STM_9P_RLOCK, tag, &body, &body_len);
+    if (rc != STM_OK) return rc;
+    /* Rlock body is exactly 1 byte (status). R111 P3 F-10 strict
+     * equality refuses any trailing bytes. */
+    if (body_len != 1u) {
+        c->last_errno = EPROTO;
+        return STM_EBACKEND;
+    }
+    uint8_t status = body[0];
+    switch (status) {
+    case STM_9P_LOCK_SUCCESS:
+        return STM_OK;
+    case STM_9P_LOCK_BLOCKED:
+        /* Conflict. Surface as EAGAIN matching POSIX F_SETLK non-block
+         * semantics. Clients implementing F_SETLKW sleep+retry on this. */
+        return STM_EAGAIN;
+    case STM_9P_LOCK_ERROR:
+    case STM_9P_LOCK_GRACE:
+    default:
+        /* Server-side anomaly. STM_EBACKEND so the caller knows the
+         * lock state is undefined; reconnect is the safe move. */
+        c->last_errno = EPROTO;
+        return STM_EBACKEND;
+    }
+}
+
+stm_status stm_9p_getlock(stm_9p_client *c, uint32_t fid,
+                             const stm_9p_getlock_args *args,
+                             stm_9p_getlock_out *out)
+{
+    stm_status ec = op_entry_check(c);
+    if (ec != STM_OK) return ec;
+    if (!args || !out) return STM_EINVAL;
+    ec = validate_lock_args_type(args->type);
+    if (ec != STM_OK) return ec;
+    size_t cid_len = 0;
+    ec = validate_client_id_len(args->client_id, &cid_len);
+    if (ec != STM_OK) return ec;
+
+    /* Wire: hdr + fid(4) + type(1) + start(8) + length(8) + proc_id(4) +
+     *       cid_len(2) + cid(cid_len). */
+    uint32_t msg_size = STM_9P_HDR_SIZE + 4u + 1u + 8u + 8u + 4u + 2u
+                       + (uint32_t)cid_len;
+    if (msg_size > c->buf_cap) return STM_ERANGE;
+    uint16_t tag = 0;
+    stm_status rc = alloc_tag(c, &tag);
+    if (rc != STM_OK) return rc;
+
+    uint8_t *wp = c->buf;
+    p_u32(wp, msg_size);
+    wp[4] = STM_9P_TGETLOCK;
+    p_u16(wp + 5, tag);
+    uint8_t *bp = wp + 7;
+    p_u32(bp, fid);              bp += 4;
+    *bp++ = args->type;
+    p_u64(bp, args->start);      bp += 8;
+    p_u64(bp, args->length);     bp += 8;
+    p_u32(bp, args->proc_id);    bp += 4;
+    p_u16(bp, (uint16_t)cid_len); bp += 2;
+    if (cid_len) {
+        memcpy(bp, args->client_id, cid_len);
+        bp += cid_len;
+    }
+    rc = send_msg(c, msg_size);
+    if (rc != STM_OK) return rc;
+
+    uint32_t reply_size = 0;
+    rc = recv_msg(c, &reply_size);
+    if (rc != STM_OK) return rc;
+    const uint8_t *body = NULL;
+    uint32_t body_len = 0;
+    rc = check_reply(c, reply_size, STM_9P_RGETLOCK, tag, &body, &body_len);
+    if (rc != STM_OK) return rc;
+    /* Rgetlock body: type(1) + start(8) + length(8) + proc_id(4) +
+     * cid_len(2) + cid(cid_len). Fixed prefix = 23 bytes. */
+    if (body_len < 23u) {
+        c->last_errno = EPROTO;
+        return STM_EBACKEND;
+    }
+    uint8_t  r_type    = body[0];
+    uint64_t r_start   = g_u64(body + 1);
+    uint64_t r_length  = g_u64(body + 9);
+    uint32_t r_proc    = g_u32(body + 17);
+    uint16_t r_cid_len = g_u16(body + 21);
+    /* R111 P3 F-10 strict equality: body_len MUST equal the fixed prefix
+     * plus the server-supplied cid_len. Defends against a future server
+     * bug emitting hidden extra payload. */
+    if ((uint32_t)23u + (uint32_t)r_cid_len != body_len) {
+        c->last_errno = EPROTO;
+        return STM_EBACKEND;
+    }
+    /* cid bytes echoed back are advisory; v2.0 client discards them.
+     * Server v2.0 echoes the request's cid verbatim. */
+    out->type    = r_type;
+    out->start   = r_start;
+    out->length  = r_length;
+    out->proc_id = r_proc;
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
 /* Tclunk.                                                                 */
 /* ────────────────────────────────────────────────────────────────────── */
 

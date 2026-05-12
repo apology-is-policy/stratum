@@ -1872,4 +1872,314 @@ STM_TEST(p9_client_fsync_round_trip)
     destroy_client_fixture(&f);
 }
 
+/* ────────────────────────────────────────────────────────────────────── */
+/* P9.5-POLISH-1: Tlock + Tgetlock client primitives.                     */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/* Helper: lcreate a file in root via cloned fid, clunk the create fid,
+ * walk a fresh fid bound to the new file. Returns the fid bound to the
+ * file. Caller must Tclunk the returned fid. */
+static uint32_t lock_test_make_file(stm_9p_client *c, const char *name,
+                                    uint32_t target_fid)
+{
+    stm_9p_qid clone_qids[STM_9P_MAX_WALK];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 199, 0, NULL, clone_qids, &walked));
+    stm_9p_qid lq;
+    STM_ASSERT_OK(stm_9p_lcreate(c, 199, name,
+                                    STM_9P_O_RDWR, 0644u, 0, &lq, NULL));
+    STM_ASSERT_OK(stm_9p_clunk(c, 199));
+    const char *names[] = { name };
+    stm_9p_qid wqids[1];
+    STM_ASSERT_OK(stm_9p_walk(c, 100, target_fid, 1, names, wqids, &walked));
+    return target_fid;
+}
+
+/* Acquire WRLCK then UNLCK on the same fid, same range. Both succeed. */
+STM_TEST(p9_client_lock_acquire_release_round_trip)
+{
+    client_fixture f = make_client_fixture("lock_rt");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    (void)lock_test_make_file(c, "locked.txt", 101);
+
+    stm_9p_lock_args a = {
+        .type = STM_9P_LOCK_TYPE_WRLCK,
+        .flags = 0,
+        .start = 0,
+        .length = 0,    /* to EOF */
+        .proc_id = 4321,
+        .client_id = "test-client",
+    };
+    STM_ASSERT_OK(stm_9p_lock(c, 101, &a));
+
+    /* Release. */
+    a.type = STM_9P_LOCK_TYPE_UNLCK;
+    STM_ASSERT_OK(stm_9p_lock(c, 101, &a));
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Same fid acquires the same range twice → both succeed (POSIX same-
+ * owner re-lock semantics). */
+STM_TEST(p9_client_lock_same_owner_relock_ok)
+{
+    client_fixture f = make_client_fixture("lock_same");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    (void)lock_test_make_file(c, "ro.txt", 101);
+
+    stm_9p_lock_args a = {
+        .type = STM_9P_LOCK_TYPE_RDLCK,
+        .flags = 0,
+        .start = 100,
+        .length = 200,
+        .proc_id = 0,
+        .client_id = NULL,
+    };
+    STM_ASSERT_OK(stm_9p_lock(c, 101, &a));
+    STM_ASSERT_OK(stm_9p_lock(c, 101, &a));      /* same owner ⇒ OK */
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Two fids (different owners — same connection, different fid numbers)
+ * both try to take an exclusive lock on the same range; the second one
+ * returns STM_EAGAIN. */
+STM_TEST(p9_client_lock_conflict_returns_eagain)
+{
+    client_fixture f = make_client_fixture("lock_conflict");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    (void)lock_test_make_file(c, "shared.txt", 101);
+
+    /* Clone fid 101 → 102 (independent owner via fid number diff). */
+    stm_9p_qid wqids[STM_9P_MAX_WALK];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 101, 102, 0, NULL, wqids, &walked));
+
+    stm_9p_lock_args a = {
+        .type = STM_9P_LOCK_TYPE_WRLCK,
+        .flags = 0,
+        .start = 0,
+        .length = 1024,
+        .proc_id = 1,
+        .client_id = NULL,
+    };
+    STM_ASSERT_OK(stm_9p_lock(c, 101, &a));     /* fid 101 acquires */
+    a.proc_id = 2;
+    stm_status rc = stm_9p_lock(c, 102, &a);    /* fid 102 conflicts */
+    STM_ASSERT_EQ(rc, STM_EAGAIN);
+
+    /* Release on fid 101; fid 102 can now acquire. */
+    a.type = STM_9P_LOCK_TYPE_UNLCK;
+    a.proc_id = 1;
+    STM_ASSERT_OK(stm_9p_lock(c, 101, &a));
+    a.type = STM_9P_LOCK_TYPE_WRLCK;
+    a.proc_id = 2;
+    STM_ASSERT_OK(stm_9p_lock(c, 102, &a));
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 102));
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Tclunk on a lock-holding fid auto-releases the lock so a fresh fid
+ * can re-acquire. */
+STM_TEST(p9_client_lock_clunk_auto_releases)
+{
+    client_fixture f = make_client_fixture("lock_clunk");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    (void)lock_test_make_file(c, "ephem.txt", 101);
+
+    stm_9p_lock_args a = {
+        .type = STM_9P_LOCK_TYPE_WRLCK,
+        .flags = 0,
+        .start = 0,
+        .length = 0,
+        .proc_id = 0,
+        .client_id = NULL,
+    };
+    STM_ASSERT_OK(stm_9p_lock(c, 101, &a));
+
+    /* Clunk the holder — server auto-releases via stm_fs_release_lock_owner. */
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+
+    /* Fresh walk to the same file via fid 102. Acquire same range —
+     * succeeds since fid 101's lock was auto-released. */
+    const char *names[] = { "ephem.txt" };
+    stm_9p_qid wqids[1];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 102, 1, names, wqids, &walked));
+    STM_ASSERT_OK(stm_9p_lock(c, 102, &a));
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 102));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Tgetlock on a clean range returns UNLCK (would-grant). */
+STM_TEST(p9_client_getlock_no_conflict_returns_unlck)
+{
+    client_fixture f = make_client_fixture("getlock_clean");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    (void)lock_test_make_file(c, "clean.txt", 101);
+
+    stm_9p_getlock_args q = {
+        .type = STM_9P_LOCK_TYPE_WRLCK,
+        .start = 0,
+        .length = 0,
+        .proc_id = 99,
+        .client_id = "tester",
+    };
+    stm_9p_getlock_out out = {0};
+    STM_ASSERT_OK(stm_9p_getlock(c, 101, &q, &out));
+    STM_ASSERT_EQ(out.type, STM_9P_LOCK_TYPE_UNLCK);
+    STM_ASSERT_EQ(out.start, 0u);
+    STM_ASSERT_EQ(out.length, 0u);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Tgetlock from a different-owner fid on a held range reports conflict
+ * (type != UNLCK). */
+STM_TEST(p9_client_getlock_conflict_returns_non_unlck)
+{
+    client_fixture f = make_client_fixture("getlock_conflict");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    (void)lock_test_make_file(c, "held.txt", 101);
+
+    /* Clone fid 101 → 102 (different owner). */
+    stm_9p_qid wqids[STM_9P_MAX_WALK];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 101, 102, 0, NULL, wqids, &walked));
+
+    /* fid 101 holds WRLCK [0, 4096). */
+    stm_9p_lock_args a = {
+        .type = STM_9P_LOCK_TYPE_WRLCK,
+        .flags = 0,
+        .start = 0,
+        .length = 4096,
+        .proc_id = 1,
+        .client_id = NULL,
+    };
+    STM_ASSERT_OK(stm_9p_lock(c, 101, &a));
+
+    /* fid 102 queries [0, 4096) — conflict. */
+    stm_9p_getlock_args q = {
+        .type = STM_9P_LOCK_TYPE_WRLCK,
+        .start = 0,
+        .length = 4096,
+        .proc_id = 2,
+        .client_id = NULL,
+    };
+    stm_9p_getlock_out out = {0};
+    STM_ASSERT_OK(stm_9p_getlock(c, 102, &q, &out));
+    /* Server v2.0 reports WRLCK conservatively on conflict. */
+    STM_ASSERT_EQ(out.type, STM_9P_LOCK_TYPE_WRLCK);
+
+    /* Same-owner Tgetlock through fid 101 sees own-lock as no conflict. */
+    out = (stm_9p_getlock_out){0};
+    STM_ASSERT_OK(stm_9p_getlock(c, 101, &q, &out));
+    STM_ASSERT_EQ(out.type, STM_9P_LOCK_TYPE_UNLCK);
+
+    /* Cleanup. */
+    a.type = STM_9P_LOCK_TYPE_UNLCK;
+    STM_ASSERT_OK(stm_9p_lock(c, 101, &a));
+    STM_ASSERT_OK(stm_9p_clunk(c, 102));
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Lib-side validation: NULL args, NULL c, bogus type → STM_EINVAL. */
+STM_TEST(p9_client_lock_invalid_args_einval)
+{
+    client_fixture f = make_client_fixture("lock_inv");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    stm_9p_lock_args a = {
+        .type = 99,   /* bogus */
+        .flags = 0, .start = 0, .length = 0, .proc_id = 0,
+        .client_id = NULL,
+    };
+    STM_ASSERT_EQ(stm_9p_lock(c, 100, NULL), STM_EINVAL);
+    STM_ASSERT_EQ(stm_9p_lock(c, 100, &a),   STM_EINVAL);
+
+    stm_9p_getlock_args q = {
+        .type = 99, .start = 0, .length = 0, .proc_id = 0,
+        .client_id = NULL,
+    };
+    stm_9p_getlock_out out = {0};
+    STM_ASSERT_EQ(stm_9p_getlock(c, 100, NULL, &out),  STM_EINVAL);
+    STM_ASSERT_EQ(stm_9p_getlock(c, 100, &q, NULL),    STM_EINVAL);
+    STM_ASSERT_EQ(stm_9p_getlock(c, 100, &q, &out),    STM_EINVAL);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Lib-side validation: oversize client_id → STM_EINVAL. */
+STM_TEST(p9_client_lock_oversize_client_id_einval)
+{
+    client_fixture f = make_client_fixture("lock_oversz");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    char oversize[STM_9P_NAME_MAX + 2];
+    memset(oversize, 'x', sizeof oversize - 1);
+    oversize[sizeof oversize - 1] = '\0';   /* len = STM_9P_NAME_MAX + 1 */
+
+    stm_9p_lock_args a = {
+        .type = STM_9P_LOCK_TYPE_RDLCK, .flags = 0,
+        .start = 0, .length = 0, .proc_id = 0,
+        .client_id = oversize,
+    };
+    STM_ASSERT_EQ(stm_9p_lock(c, 100, &a), STM_EINVAL);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
 STM_TEST_MAIN("9p_client")

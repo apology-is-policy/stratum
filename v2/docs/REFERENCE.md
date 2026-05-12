@@ -38,38 +38,60 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: Reference-doc backfill — Phase 9 modules (this commit;
-  DOC-ONLY). Closes the second half of the Phase 9 deferment
-  forward-noted in CLAUDE.md (R96 P3-8): per-subsystem
-  `reference/NN-*.md` catalog for the Phase 9 9P-server + transport
-  + /ctl/ + client modules. With this commit, the catalog is
-  complete through index 23.
-  - New: `v2/docs/reference/20-9p.md` (filesystem-bound 9P2000.L
-    server; `fid.tla::IOReject` staleness gate; `namespace.tla`
-    per-connection bindings; Stratum extensions 124..139; 8 MiB
-    msize ceiling).
-  - New: `v2/docs/reference/21-stratumd.md` (Unix-socket daemon
-    transport; concurrent accept on FS + /ctl/ sockets per
-    PARALLEL-1; SO_PEERCRED + 0600 mode; R113 P1-1 signal-mask
-    discipline; shutdown ordering servers → ctl_destroy →
-    scrub_close → fs_unmount).
-  - New: `v2/docs/reference/22-ctl.md` (operator-state synthetic
-    FS on top of `stm_lp9_server`; 29-kind table; admin gate;
-    audit log; PARALLEL-1 `stm_ctl_conn` state split;
-    bulk-format `bulk_buf` pattern; stale-id discipline at
-    every walk + lopen + getattr).
-  - New: `v2/docs/reference/23-9p_client.md` (synchronous .L
-    libstratum-9p; tag auto-allocation; connection-poisoned
-    flag; caller-cap bound on every server-supplied count —
-    R111 doctrine; closed Linux-errno → stm_status mapping).
-  - Updated: `v2/docs/REFERENCE.md` Contents index now lists the
-    four new 20..23 entries. Each follows the existing template:
-    Purpose, Public API, Implementation, Spec cross-reference,
-    SPEC-TO-CODE mapping, Tests, Status table.
-  - **No code change in this commit** — pure documentation;
-    ctest unchanged 54/54 GREEN.
+- **Tip**: P9.5-POLISH-1 Tlock + Tgetlock client primitives (this
+  commit). `libstratum-9p` gains advisory byte-range locking — the
+  last missing surface for kernel v9fs mount (Linux v9fs client uses
+  Tlock/Tgetlock for flock(2)/fcntl(2)). Composes against
+  `locks.tla::AcquireLock`/`ReleaseLock`/`GetLock` through the server.
+  - New: `stm_9p_lock(c, fid, args)` — SUCCESS ⇒ STM_OK; BLOCKED ⇒
+    STM_EAGAIN (POSIX F_SETLK non-block semantics); ERROR/GRACE ⇒
+    STM_EBACKEND. UNLCK type releases.
+  - New: `stm_9p_getlock(c, fid, args, out)` — F_GETLK shape; sets
+    `out->type = UNLCK` when the requested range would grant, else
+    reports conflict type/range/proc_id.
+  - Owner-id is derived server-side per-fid as
+    `(lock_owner_base | fid)`; clients take separate-owner locks by
+    Twalk-cloning the fid. Tclunk auto-releases every lock held by
+    the clunked fid's owner_id (server-side
+    `fid_release_locked` → `stm_fs_release_lock_owner`).
+  - Trust posture (R111 doctrine carries): `op_entry_check` at
+    entry; type-bitmap validation at lib boundary; strict body-len
+    equality on Rlock (= 1 byte) AND on Rgetlock (23-byte fixed
+    prefix + server-supplied cid_len); cid bytes consumed but
+    discarded at v2.0 (server echoes the caller's input).
+  - Tests: 8 new in `tests/test_9p_client.c` — round-trip,
+    same-owner relock, two-owner conflict→EAGAIN, Tclunk
+    auto-release, Tgetlock no-conflict/conflict, NULL+bogus args
+    EINVAL, oversize client_id EINVAL.
+  - **ctest 54/54 GREEN** (test_9p_client now runs 51 cases, up
+    from 43). Rust suites unchanged.
 
-- **Pre-tip-1**: Reference-doc backfill — Phase 8 modules (`cac568c`;
+- **Pre-tip-1**: R128 P3-1/P3-8 + R129 P3-3/P3-4 doc-drift forward-note
+  closures (`4267b3d`). Comment-only: corrected
+  `stm_dirty_buffer_destroy` stale auto-wedge claim, rewrote
+  `stm_dirty_buffer_drain_ino` doc-comment to match pop-on-success
+  behavior (the `d687666` hotfix), added
+  install_production_cb cleanup-order comment + fs->pool/sync
+  immutability comment.
+
+- **Pre-tip-2**: R131 P3-4 + P3-5 saturation guards (`4cf257c`).
+  `stm_ctl_conn_create` refuses with STM_EOVERFLOW when
+  `worker_count == UINT32_MAX`; `/admin/clear-events` write refuses
+  with STM_EOVERFLOW when `event_gen == UINT64_MAX`. R29 P3-1
+  doctrine carry (refuse rather than wrap).
+
+- **Pre-tip-3**: Reference-doc backfill — Phase 9 modules
+  (`ad0d087`+`d317bfb`+`3065c21`; DOC-ONLY). Closes the second
+  half of the Phase 9 deferment forward-noted in CLAUDE.md (R96
+  P3-8): per-subsystem `reference/NN-*.md` catalog for the Phase
+  9 9P-server + transport + /ctl/ + client modules. With this
+  commit, the catalog is complete through index 23.
+  - New: `v2/docs/reference/20-9p.md` / `21-stratumd.md` /
+    `22-ctl.md` / `23-9p_client.md`. Each follows the existing
+    template: Purpose, Public API, Implementation, Spec
+    cross-reference, SPEC-TO-CODE mapping, Tests, Status table.
+
+- **Pre-tip-4**: Reference-doc backfill — Phase 8 modules (`cac568c`;
   DOC-ONLY). Per-subsystem `reference/NN-*.md` catalog for the
   Phase 8 POSIX-surface modules: `16-inode.md`
   (`inode.tla::TupleUniqueAllTime`), `17-dirent.md`
@@ -79,7 +101,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   (`locks.tla::NoConflictingLocks`). REFERENCE.md Contents index
   also gained the previously-missing `15-cas.md` row.
 
-- **Pre-tip-2**: P9.5-PARALLEL-3 spec phase (`d57774c`) — per-inode
+- **Pre-tip-5**: P9.5-PARALLEL-3 spec phase (`d57774c`) — per-inode
   `fs->lock` granularity refinement (SPEC ONLY, no impl yet). Lays
   down the formal model + design doc the multi-commit impl phase
   (future sessions) will reference.
@@ -102,7 +124,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   - Outstanding: TLC verification (#973 tooling-gated); impl-1..6
     multi-commit deferred.
 
-- **Pre-tip-3**: P9.5-PARALLEL-2 — compound-op race-class audit + formal
+- **Pre-tip-6**: P9.5-PARALLEL-2 — compound-op race-class audit + formal
   spec + regression test. The chunk verifies and
   documents the contract that emerges under post-PARALLEL-1
   concurrent /ctl/: **per-subsystem linearizable + cross-subsystem
@@ -148,7 +170,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   - Outstanding: TLC verification of compound_ops.tla (tooling-gated
     like #958; expected verdicts documented in each cfg header).
 
-- **Pre-tip-4**: P9.5-PARALLEL-1 — stm_ctl_conn split + concurrent /ctl/
+- **Pre-tip-7**: P9.5-PARALLEL-1 — stm_ctl_conn split + concurrent /ctl/
   accept + R131 audit close + #961 dedicated concurrent regression
   tests. `v2/include/stratum/ctl.h` declares the new
   per-connection wrapper API (`stm_ctl_conn_create` / `_destroy` /
@@ -189,7 +211,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   row + stratumd row updated. Outstanding sub-task: #958 (TLC
   verify ctl_conn.tla, tooling-gated).
 
-- **Pre-tip-5**: P9-CTL-2b /ctl/ codec migration to lp9.
+- **Pre-tip-8**: P9-CTL-2b /ctl/ codec migration to lp9.
   `v2/src/ctl/synfs.c` + `v2/include/stratum/ctl.h` + `v2/tests/test_ctl.c`
   all re-keyed from `stm_p9_server` (9P2000 vops) to `stm_lp9_server`
   (.L vops). The `KIND_META[]` table, `qid_path` encoding, materializer

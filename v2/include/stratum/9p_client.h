@@ -15,6 +15,7 @@
  *   - Read-side: Twalk + TLopen + Tread + Tclunk + Tgetattr + Treaddir.
  *   - Write-side: Twrite (1b), Tlcreate / Tmkdir / Tunlinkat (1c),
  *     Tsetattr / Trenameat / Tsymlink / Treadlink / Tfsync (1d).
+ *   - Advisory locking: Tlock / Tgetlock (P9.5-POLISH-1).
  *   - Synchronous one-op-at-a-time client: each call sends a Tmsg
  *     and blocks on the matching Rmsg. Single-threaded by design;
  *     callers wanting concurrent ops open multiple connections.
@@ -32,9 +33,6 @@
  *     chunk (P9-LIB-1e or whichever ships first).
  *   - Txattrwalk / Txattrcreate (server present, client deferred to
  *     keep this chunk POSIX-shape primitives only).
- *   - Tlock / Tgetlock (advisory locking; relies on owner-id
- *     plumbing tied to per-process state, less useful for the CLI
- *     than for FUSE).
  *   - Tstatfs (filesystem statistics; CLI-helpful but small —
  *     bundled with /ctl/-on-stratumd or a separate tail chunk).
  *   - Async API (P9-LIB-2): pipelined Txx with reply matching by tag,
@@ -488,6 +486,125 @@ stm_status stm_9p_fsync(stm_9p_client *c, uint32_t fid, uint32_t datasync);
  * considered cleared (per 9P2000 convention). */
 STM_MUST_USE
 stm_status stm_9p_clunk(stm_9p_client *c, uint32_t fid);
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* Tlock / Tgetlock (P9.5-POLISH-1).                                      */
+/*                                                                         */
+/* 9P2000.L advisory byte-range locking. Composes against locks.tla       */
+/* through the server: the server's owner_id is derived per-fid as        */
+/* (lock_owner_base | fid), so the LIB's "owner" is implicit in which fid */
+/* you lock through. To take multiple locks under the same logical owner, */
+/* use the SAME fid for all of them. To take separate-owner locks on the  */
+/* same inode (POSIX OFD-lock semantics), Twalk-clone the fid first and   */
+/* lock through the clones.                                                */
+/*                                                                         */
+/* Server-side Tclunk auto-releases every byte-range lock held by the     */
+/* clunked fid's owner_id; client-side stm_9p_clunk preserves this.       */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/* Tlock request fields. Types and flags match 9P2000.L wire constants
+ * defined in <stratum/9p.h> (STM_9P_LOCK_TYPE_* / STM_9P_LOCK_FLAG_*).
+ *
+ * type ∈ {STM_9P_LOCK_TYPE_RDLCK, WRLCK, UNLCK}.
+ *
+ * flags is the bitwise-OR of STM_9P_LOCK_FLAG_BLOCK (caller wants
+ * blocking semantics — at v2.0 the server still answers BLOCKED
+ * synchronously without blocking on the kernel side; clients
+ * implementing blocking F_SETLKW should sleep + retry on STM_EAGAIN)
+ * and STM_9P_LOCK_FLAG_RECLAIM (advisory: this is a reclaim after a
+ * crash/reconnect; server v2.0 ignores).
+ *
+ * `length == 0` means "lock to EOF" per Linux fcntl(2) convention.
+ * The server normalises this internally.
+ *
+ * proc_id is advisory and not consulted by the server at v2.0 (the
+ * server's owner identity is per-fid). Passing 0 is fine; clients
+ * that proxy fcntl(2) typically pass the requesting process pid.
+ *
+ * client_id may be NULL (treated as empty string) or a NUL-terminated
+ * UTF-8 string of length ≤ STM_9P_NAME_MAX. Advisory diagnostic
+ * label echoed back on Rgetlock; never consulted for ownership. */
+typedef struct {
+    uint8_t   type;        /* STM_9P_LOCK_TYPE_RDLCK / WRLCK / UNLCK */
+    uint32_t  flags;       /* STM_9P_LOCK_FLAG_* bitmask */
+    uint64_t  start;
+    uint64_t  length;      /* 0 ⇒ to EOF */
+    uint32_t  proc_id;     /* advisory (server v2.0 ignores) */
+    const char *client_id; /* advisory; NULL ⇒ "" */
+} stm_9p_lock_args;
+
+/* Tlock: acquire / release an advisory byte-range lock on `fid`'s
+ * inode. fid MUST be bound (Tattach/Twalk); fid does NOT need to be
+ * Topen'd.
+ *
+ * Returns:
+ *   - STM_OK on Rlock(SUCCESS) — lock state mutated as requested.
+ *   - STM_EAGAIN on Rlock(BLOCKED) — conflicting lock present;
+ *     applicable to RDLCK / WRLCK acquire only. UNLCK never returns
+ *     EAGAIN. Callers wanting blocking F_SETLKW semantics should sleep
+ *     and retry; v2.0 server is non-blocking.
+ *   - STM_EBACKEND on Rlock(ERROR), Rlock(GRACE), or unknown status —
+ *     server-side anomaly; caller should treat the lock state as
+ *     undefined and reconnect.
+ *   - STM_EINVAL on NULL c, NULL args, type out of {RDLCK, WRLCK,
+ *     UNLCK}, or client_id length > STM_9P_NAME_MAX.
+ *   - Any Rlerror's mapped status (e.g. STM_ESTALE on fid-gen mismatch). */
+STM_MUST_USE
+stm_status stm_9p_lock(stm_9p_client *c, uint32_t fid,
+                          const stm_9p_lock_args *args);
+
+/* Tgetlock request fields. Mirrors stm_9p_lock_args minus the flags
+ * field (Tgetlock has no blocking semantics). */
+typedef struct {
+    uint8_t   type;        /* STM_9P_LOCK_TYPE_RDLCK / WRLCK / UNLCK */
+    uint64_t  start;
+    uint64_t  length;      /* 0 ⇒ to EOF */
+    uint32_t  proc_id;     /* advisory */
+    const char *client_id; /* advisory; NULL ⇒ "" */
+} stm_9p_getlock_args;
+
+/* Tgetlock reply payload (subset that callers typically consume).
+ *
+ * type:
+ *   - STM_9P_LOCK_TYPE_UNLCK ⇒ no conflict; an Acquire of the requested
+ *     range would succeed.
+ *   - STM_9P_LOCK_TYPE_RDLCK / WRLCK ⇒ a conflicting lock is present;
+ *     server v2.0 reports WRLCK conservatively (does not track whether
+ *     the conflict is shared vs. exclusive — Rgetlock's conflict-type
+ *     field is advisory).
+ *
+ * start / length echo the request's range (server v2.0 does not track
+ * the conflicting lock's range; it reports the caller's query range).
+ *
+ * proc_id on conflict carries the SERVER-side conflicting owner_id
+ * truncated to 32 bits (fid number). Useful for diagnostics; callers
+ * that need full 64-bit owner identity should call stm_fs_lock_test
+ * directly or extend the protocol. */
+typedef struct {
+    uint8_t   type;        /* RDLCK/WRLCK = conflict; UNLCK = would-grant */
+    uint64_t  start;
+    uint64_t  length;
+    uint32_t  proc_id;     /* on conflict: low-32-bits of conflict owner */
+} stm_9p_getlock_out;
+
+/* Tgetlock: F_GETLK shape. Does NOT acquire — reports whether the
+ * requested range would conflict with an existing lock.
+ *
+ * On STM_OK, *out is populated; type=UNLCK means "would grant", any
+ * other value means "conflict detected". Server v2.0 server-side
+ * stm_fs_lock_test takes the same fid-derived owner_id as Tlock; a
+ * caller's own locks therefore appear as "no conflict" when queried
+ * through the same fid (POSIX same-owner re-lock semantics).
+ *
+ * Returns:
+ *   - STM_OK on success (with or without conflict; check out->type).
+ *   - STM_EINVAL on NULL c / args / out, type out of {RDLCK, WRLCK,
+ *     UNLCK}, or client_id length > STM_9P_NAME_MAX.
+ *   - Any Rlerror's mapped status. */
+STM_MUST_USE
+stm_status stm_9p_getlock(stm_9p_client *c, uint32_t fid,
+                             const stm_9p_getlock_args *args,
+                             stm_9p_getlock_out *out);
 
 /* Tgetattr: fetch Linux-stat attributes for `fid`. `request_mask`
  * specifies which fields to populate; common values are

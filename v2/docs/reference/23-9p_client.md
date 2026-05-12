@@ -10,7 +10,7 @@ server on a Unix socket (`stratumd`); the FUSE shim, CLI tools (
 Go/Python/Zig bindings are all 9P clients of that server. This
 header is the C surface every consumer compiles against.
 
-Scope at v2.0 (cumulative through P9-LIB-1d-link):
+Scope at v2.0 (cumulative through P9.5-POLISH-1 Tlock/Tgetlock):
 
 - Sync one-op-at-a-time client (Tmsg + matching Rmsg blocking call).
 - 9P2000.L dialect only — stratumd serves .L only. /ctl/-over-the-
@@ -19,9 +19,11 @@ Scope at v2.0 (cumulative through P9-LIB-1d-link):
 - Per-call malloc avoided: per-connection buffer pre-sized to msize
   at dial time.
 - Caller-managed fid namespace except for the dial-time root fid.
+- Advisory byte-range locking (Tlock/Tgetlock) with owner-id derived
+  per-fid by the server — kernel v9fs critical path.
 
-Header: `v2/include/stratum/9p_client.h` (547 lines).
-Impl: `v2/src/9p_client/9p_client.c` (1539 lines).
+Header: `v2/include/stratum/9p_client.h` (663 lines).
+Impl: `v2/src/9p_client/9p_client.c` (1720 lines).
 No dedicated TLA+ spec — composes against the server's `fid.tla` +
 `namespace.tla` per connection.
 
@@ -83,10 +85,45 @@ stm_status stm_9p_link     (c, dfid, fid, name);        /* same-dataset only */
 stm_status stm_9p_fsync    (c, fid, datasync);
 ```
 
+### Advisory byte-range locking (P9.5-POLISH-1)
+
+```c
+typedef struct {
+    uint8_t   type;        /* STM_9P_LOCK_TYPE_RDLCK / WRLCK / UNLCK */
+    uint32_t  flags;       /* STM_9P_LOCK_FLAG_BLOCK | RECLAIM */
+    uint64_t  start;
+    uint64_t  length;      /* 0 ⇒ to EOF */
+    uint32_t  proc_id;     /* advisory; server v2.0 ignores */
+    const char *client_id; /* advisory; NULL ⇒ "" */
+} stm_9p_lock_args;
+
+typedef struct {
+    uint8_t   type;
+    uint64_t  start;
+    uint64_t  length;
+    uint32_t  proc_id;     /* advisory */
+    const char *client_id; /* advisory; NULL ⇒ "" */
+} stm_9p_getlock_args;
+
+typedef struct {
+    uint8_t   type;        /* UNLCK ⇒ would-grant; else conflict */
+    uint64_t  start;
+    uint64_t  length;
+    uint32_t  proc_id;     /* on conflict: low-32-bits of conflict owner */
+} stm_9p_getlock_out;
+
+stm_status stm_9p_lock     (c, fid, lock_args *);                /* SUCCESS ⇒ STM_OK; BLOCKED ⇒ STM_EAGAIN */
+stm_status stm_9p_getlock  (c, fid, getlock_args *, out *);      /* out->type reports conflict */
+```
+
+The server's `owner_id` is `(lock_owner_base | fid)`; the client's
+"lock owner" is therefore implicit in the fid. To take separate-owner
+locks on the same inode (POSIX OFD-lock semantics), Twalk-clone the
+fid and lock through the clones. Tclunk auto-releases every lock held
+by the clunked fid's owner_id (server-side `stm_fs_release_lock_owner`).
+
 ### Deferred from v2.0 (forward-noted)
 
-- **Tlock / Tgetlock** — relies on owner-id plumbing tied to per-
-  process state; less useful for the CLI than for FUSE. P9.5-POLISH-1.
 - **Txattrwalk / Txattrcreate** — server present, client deferred to
   keep the chunk POSIX-shape primitives only.
 - **Tstatfs** — CLI-helpful; bundled with /ctl/-on-stratumd or a
@@ -232,8 +269,9 @@ the SERVER's correctness viewed through the wire:
 - `namespace.tla` — Tbind/Tunbind on the server's per-connection
   table. The lib doesn't yet expose Tbind/Tunbind (forward-noted);
   when it does it inherits the spec.
-- `locks.tla` — when Tlock/Tgetlock land (P9.5-POLISH-1), the
-  client's owner-id discipline composes against ReleaseOwner.
+- `locks.tla` — Tlock/Tgetlock client primitives (P9.5-POLISH-1) compose
+  against AcquireLock / ReleaseLock / GetLock with owner_id derived
+  per-fid by the server. Tclunk auto-release maps to ReleaseOwner.
 
 ## SPEC-TO-CODE mapping
 
@@ -249,6 +287,9 @@ the SERVER's correctness viewed through the wire:
 | `Readlink` | `stm_9p_readlink` (caller-cap bound — R111 P0) | same |
 | `Getattr` / `Readdir` | `stm_9p_getattr` / `stm_9p_readdir` | same |
 | `Fsync` | `stm_9p_fsync` | same |
+| `AcquireLock` / `ReleaseLock` (locks.tla) | `stm_9p_lock` | same |
+| `GetLock` (locks.tla) | `stm_9p_getlock` | same |
+| `ReleaseOwner` on Tclunk | (automatic — server-side) | `v2/src/9p/server.c::fid_release_locked` |
 
 ## Tests
 
@@ -277,7 +318,7 @@ the SERVER's correctness viewed through the wire:
 | Caller-cap bound on every server-supplied count (R111 P0) | LIVE | All ops |
 | Connection-poisoned flag on tag-mismatch (R111 P3 F-11) | LIVE | op_entry_check at entry |
 | Strict body-length equality (R111 P3 F-10) | LIVE | All Rxx parsers |
-| Tlock / Tgetlock | DEFERRED | P9.5-POLISH-1 (#927) |
+| Tlock / Tgetlock (P9.5-POLISH-1) | LIVE | Owner-id derived per-fid by server; SUCCESS ⇒ STM_OK, BLOCKED ⇒ STM_EAGAIN; Tclunk auto-releases |
 | Txattrwalk / Txattrcreate | DEFERRED | Tail chunk |
 | Tstatfs | DEFERRED | Bundled with /ctl/-on-stratumd |
 | Tflush | DEFERRED | Sync client doesn't need it |
