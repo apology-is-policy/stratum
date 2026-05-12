@@ -80,7 +80,8 @@ struct stm_fs;
 struct stm_pool;
 struct stm_scrub;
 
-typedef struct stm_ctl stm_ctl;
+typedef struct stm_ctl      stm_ctl;
+typedef struct stm_ctl_conn stm_ctl_conn;
 
 /*
  * Create a /ctl/ instance. `fs` is the filesystem whose state /ctl/
@@ -194,32 +195,70 @@ stm_status stm_ctl_attach_scrub(stm_ctl *c, struct stm_scrub *scrub);
 void stm_ctl_destroy(stm_ctl *c);
 
 /*
- * Stamp the connecting peer's credentials into the /ctl/ instance.
- * Used by the admin gate (`is_admin`) to decide whether
- * admin-required kinds are accessible. The default (unset) caller
- * is treated as non-admin.
+ * P9.5-PARALLEL-1: Allocate a per-connection wrapper that pins the
+ * peer's identity AND owns the per-fid session table for the
+ * lifetime of one /ctl/ connection.
  *
- * Stratumd typically calls this once per accept, between the
- * SO_PEERCRED / getpeereid lookup and the first
- * `stm_lp9_server_handle` invocation. Mirrors stratumd's existing
- * peer-cred default-deny posture (R95 P2-2): if the daemon can't
- * resolve the peer's uid, it should refuse the connection rather
- * than calling set_caller with a placeholder.
+ * Caller's responsibility: keep `ctl` alive longer than every
+ * `stm_ctl_conn` that holds it. The conn does NOT take ownership
+ * of ctl. caller_uid / caller_gid stamp the peer's identity for
+ * the lifetime of the conn and are IMMUTABLE thereafter.
  *
- * Timing (P9-CTL-1d-uid): same posture as stm_ctl_attach_pool's
- * timing rule (R97 P2-2). MUST be called BEFORE the first
- * stm_lp9_server_handle invocation. Caller fields are not mu-
- * protected on the vops read paths; concurrent set_caller +
- * vops dispatch is a C11 data race. v2.0's serial-accept posture
- * makes this safe.
+ * Under concurrent regime the conn is the vops `ctx` (cast to
+ * `stm_ctl_conn *` inside vops) — never `stm_ctl *`. Two
+ * `stm_ctl_conn` referencing the same `stm_ctl` see independent
+ * sessions[] tables, independent caller credentials, and share
+ * only the immutable subsystem pointers + the `event_buf` audit
+ * log (which has its own mutex).
  *
- * The instance is one-server-one-stm_ctl under concurrent accept
- * (sessions[] keyed by fid alone — same R96 lesson). Per-server
- * caller stamps mean per-connection peer identity; cross-server
- * sharing of one stm_ctl + per-fid caller stamping is a future
- * concurrent-accept extension.
+ * Lifecycle refcount: each live `stm_ctl_conn` increments a
+ * worker-count on `stm_ctl`. `stm_ctl_destroy` blocks until the
+ * count drops to zero — ensuring no in-flight vops dispatch can
+ * dereference a torn-down ctl. Detached workers thus don't need
+ * pthread_join: their conn's destroy decrements the count, the
+ * shared destroy unblocks, and the FS shutdown sequence proceeds.
  *
- * Returns STM_EINVAL if `c` is NULL.
+ * Returns STM_EINVAL if `ctl` or `out` is NULL; STM_ENOMEM on alloc
+ * failure.
+ */
+STM_MUST_USE
+stm_status stm_ctl_conn_create(stm_ctl *ctl,
+                                uid_t caller_uid, gid_t caller_gid,
+                                stm_ctl_conn **out);
+
+/*
+ * Free a per-connection wrapper. Walks the per-conn sessions[]
+ * freeing every still-active slot (defensive — the lp9 server's
+ * destroy issues vops_clunk for every open fid before this point,
+ * but a forced disconnect mid-operation might skip clunks).
+ * Decrements the shared `stm_ctl`'s worker-count and broadcasts
+ * the worker_cv so `stm_ctl_destroy` can unblock.
+ *
+ * Safe on NULL.
+ */
+void stm_ctl_conn_destroy(stm_ctl_conn *cn);
+
+/*
+ * Read the peer uid bound at conn-create time. Useful for tests
+ * + audit-log shaping. Returns (uid_t)-1 if cn is NULL.
+ */
+uid_t stm_ctl_conn_caller_uid(const stm_ctl_conn *cn);
+
+/*
+ * DEPRECATED (P9.5-PARALLEL-1): caller credentials are now bound at
+ * `stm_ctl_conn_create` time and IMMUTABLE for the conn's lifetime.
+ * This function is preserved as a no-op stub so out-of-tree callers
+ * still link; it returns STM_ENOSYS to surface the contract change
+ * loudly. The pre-P9.5 admin gate read `c->caller_uid` from the
+ * shared stm_ctl, which under concurrent accept was a confused-
+ * deputy hole (last-writer-wins across connections — see
+ * `v2/docs/p9.5-parallel-1-design.md` §2.1).
+ *
+ * Migration: stratumd's per-accept code calls
+ * `stm_ctl_conn_create(ctl, peer_uid, peer_gid, &cn)` and passes
+ * `cn` (not `ctl`) as the vops ctx via `stm_lp9_server_create`.
+ *
+ * Returns STM_ENOTSUPPORTED unconditionally.
  */
 STM_MUST_USE
 stm_status stm_ctl_set_caller(stm_ctl *c, uid_t caller_uid, gid_t caller_gid);
@@ -245,21 +284,16 @@ STM_MUST_USE
 stm_status stm_ctl_set_admin_uid(stm_ctl *c, uid_t admin_uid);
 
 /*
- * Drop all active per-fid sessions on this stm_ctl (R101 P1-1).
- * stratumd's serial-accept loop MUST call this between connections
- * (typically right after stm_lp9_server_destroy + before the next
- * accept) so that a leaked session from connection N can't leak
- * into connection N+1's view.
+ * DEPRECATED (P9.5-PARALLEL-1): sessions[] now live on
+ * `stm_ctl_conn`, NOT on shared `stm_ctl`. Per-conn sessions die
+ * with the conn via `stm_ctl_conn_destroy`; the "drop_all between
+ * sequential connections" idiom is obsolete.
  *
- * Without this hook, the chunk's "safe across SEQUENTIAL
- * stm_lp9_server use" claim breaks down: when conn-N+1 reuses the
- * same fid number that conn-N's session occupied, the session-
- * lookup pre-empts the new alloc and conn-N+1 reads conn-N's
- * stale snapshot_len. Worse, conn-N+1's Tclunk frees conn-N's
- * slot and orphans its own — STM_CTL_MAX_SESSIONS depletes
- * permanently.
- *
- * Mirrors janus_synfs_drop_all_sessions (R12 P3-5).
+ * Preserved as a no-op so out-of-tree callers still link. The
+ * pre-P9.5 implementation walked the shared sessions[] and freed
+ * every active slot — under concurrent accept this would free
+ * sibling-connection state and trip UAF on the next vops dispatch
+ * (see `v2/docs/p9.5-parallel-1-design.md` §2.3).
  *
  * Safe on NULL c.
  */

@@ -485,14 +485,11 @@ fn poll_loop(
             guard.pool_uuid = Some(uuid.clone());
             guard.ingest(&metrics);
         }
-        // SWISS-8k: drop the /ctl/ connection at the end of each
-        // successful tick. Stratumd's /ctl/ worker is serial-per-
-        // socket (one accept+serve at a time); a long-lived poller
-        // connection would starve the snapgraph poller (and any F9
-        // subprocess) of /ctl/ slot access. Per-tick reconnect is
-        // ~4 ms — cheap. Proper fix is concurrent-accept on
-        // stratumd (Phase 9.5 PARALLEL-1).
-        client = None;
+        // P9.5-PARALLEL-1: stratumd now accepts /ctl/ concurrently
+        // (detached pthread per accept). Long-lived poller connections
+        // are safe; sibling pollers + F9 subprocess + Prometheus
+        // scrapers all see independent /ctl/ workers. SWISS-8k's
+        // disconnect-between-ticks workaround retired here.
         sleep_until(tick_start, REFRESH_INTERVAL, &stop);
     }
 }

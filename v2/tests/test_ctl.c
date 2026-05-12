@@ -240,12 +240,39 @@ static __attribute__((unused)) uint32_t rlerror_ecode(const uint8_t *resp)
 
 /* ── server helpers ─────────────────────────────────────────────────── */
 
-static stm_lp9_server *make_ctl_server(stm_ctl *c)
+/* P9.5-PARALLEL-1: every test creates a stm_ctl_conn (the per-connection
+ * wrapper that carries caller_uid + sessions[]) and passes that as the
+ * vops ctx — never the bare stm_ctl. The `out_conn` MUST be destroyed
+ * AFTER stm_lp9_server_destroy and BEFORE stm_ctl_destroy. */
+static stm_lp9_server *make_ctl_server_for(stm_ctl *c,
+                                              uid_t caller_uid, gid_t caller_gid,
+                                              stm_ctl_conn **out_conn)
 {
+    stm_ctl_conn *cn = NULL;
+    STM_ASSERT_OK(stm_ctl_conn_create(c, caller_uid, caller_gid, &cn));
+    *out_conn = cn;
     stm_lp9_server *s = NULL;
-    STM_ASSERT_OK(stm_lp9_server_create(stm_ctl_vops(), c, stm_ctl_root(c),
+    STM_ASSERT_OK(stm_lp9_server_create(stm_ctl_vops(), cn, stm_ctl_root(c),
                                           STM_LP9_MSIZE_DEFAULT, &s));
     return s;
+}
+
+/* Internal forward decl (defined in src/ctl/synfs.c) — reads the uid
+ * stm_ctl_set_caller stashed onto the shared stm_ctl. Test-only path
+ * for the migration window; production code never goes through it. */
+void stm_ctl_pending_caller(const stm_ctl *c, uid_t *out_uid, gid_t *out_gid);
+
+static stm_lp9_server *make_ctl_server(stm_ctl *c, stm_ctl_conn **out_conn)
+{
+    /* Honor whatever stm_ctl_set_caller stashed onto the ctl (including
+     * the (uid_t)-1 sentinel meaning "unset → non-admin"). Tests that
+     * didn't call set_caller see the post-stm_ctl_create default which
+     * is also (uid_t)-1, preserving the prior semantics where "no
+     * set_caller" meant "anonymous non-admin." */
+    uid_t uid = (uid_t)-1;
+    gid_t gid = (gid_t)-1;
+    stm_ctl_pending_caller(c, &uid, &gid);
+    return make_ctl_server_for(c, uid, gid, out_conn);
 }
 
 static void do_handshake(stm_lp9_server *s, uint32_t root_fid)
@@ -296,11 +323,13 @@ STM_TEST(ctl_version_attach)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
 
     do_handshake(s, 10);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -308,7 +337,8 @@ STM_TEST(ctl_walk_version_reads_versions)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     char body[1024];
@@ -332,6 +362,7 @@ STM_TEST(ctl_walk_version_reads_versions)
     STM_ASSERT(strstr(body, want_send) != NULL);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -339,7 +370,8 @@ STM_TEST(ctl_walk_state_unattached_says_no)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     char body[1024];
@@ -351,6 +383,7 @@ STM_TEST(ctl_walk_state_unattached_says_no)
     STM_ASSERT(strstr(body, "data-total-blocks") == NULL);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -365,7 +398,8 @@ STM_TEST(ctl_walk_state_attached_reports_counters)
 
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(fs, &c));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     char body[1024];
@@ -380,6 +414,7 @@ STM_TEST(ctl_walk_state_attached_reports_counters)
     STM_ASSERT(strstr(body, "data-free-blocks: ") != NULL);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
@@ -388,7 +423,8 @@ STM_TEST(ctl_readdir_root_lists_entries)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     /* Open the root fid for read, then Treaddir to enumerate the
@@ -423,6 +459,7 @@ STM_TEST(ctl_readdir_root_lists_entries)
     STM_ASSERT_TRUE(saw_state);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -430,7 +467,8 @@ STM_TEST(ctl_walk_missing_returns_enoent)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -441,6 +479,7 @@ STM_TEST(ctl_walk_missing_returns_enoent)
     STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -448,7 +487,8 @@ STM_TEST(ctl_write_to_version_rejected)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -472,6 +512,7 @@ STM_TEST(ctl_write_to_version_rejected)
     STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -479,7 +520,8 @@ STM_TEST(ctl_clunk_releases_session_slot)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -502,6 +544,7 @@ STM_TEST(ctl_clunk_releases_session_slot)
     }
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -509,7 +552,8 @@ STM_TEST(ctl_read_past_eof_returns_zero)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -534,6 +578,7 @@ STM_TEST(ctl_read_past_eof_returns_zero)
     STM_ASSERT_EQ(load_u32(resp + 7), 0);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -554,7 +599,8 @@ STM_TEST(ctl_r96_p2_3_session_pool_exhaustion)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -593,6 +639,7 @@ STM_TEST(ctl_r96_p2_3_session_pool_exhaustion)
     STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -633,7 +680,8 @@ STM_TEST(ctl_r96_p2_3_read_last_byte_only)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -663,6 +711,7 @@ STM_TEST(ctl_r96_p2_3_read_last_byte_only)
     STM_ASSERT_EQ(load_u32(resp + 7), 1u);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -731,7 +780,8 @@ STM_TEST(ctl_b1_pools_appears_in_root_listing)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -758,6 +808,7 @@ STM_TEST(ctl_b1_pools_appears_in_root_listing)
     STM_ASSERT_TRUE(saw_pools);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -765,7 +816,8 @@ STM_TEST(ctl_b1_pools_dir_empty_when_no_pool)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -785,6 +837,7 @@ STM_TEST(ctl_b1_pools_dir_empty_when_no_pool)
     STM_ASSERT_EQ(load_u32(resp + 7), 0u);   /* empty dir = zero entry bytes */
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -792,7 +845,8 @@ STM_TEST(ctl_b1_walk_pool_uuid_enoent_when_no_pool)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -803,6 +857,7 @@ STM_TEST(ctl_b1_walk_pool_uuid_enoent_when_no_pool)
     ASSERT_WALK_FAILED(resp, 2);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -814,7 +869,8 @@ STM_TEST(ctl_b1_attach_pool_then_walk_succeeds)
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
 
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -826,6 +882,7 @@ STM_TEST(ctl_b1_attach_pool_then_walk_succeeds)
     STM_ASSERT_EQ(load_u16(resp + 7), 3u);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
     destroy_test_pool(f);
 }
@@ -838,7 +895,8 @@ STM_TEST(ctl_b1_pool_status_reports_uuid_and_counts)
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
 
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -874,6 +932,7 @@ STM_TEST(ctl_b1_pool_status_reports_uuid_and_counts)
     STM_ASSERT(strstr(body, "roster-hash: 0x") != NULL);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
     destroy_test_pool(f);
 }
@@ -930,7 +989,8 @@ STM_TEST(ctl_b1_pools_readdir_lists_attached_pool)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -962,6 +1022,7 @@ STM_TEST(ctl_b1_pools_readdir_lists_attached_pool)
     STM_ASSERT_TRUE(saw_pool);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
     destroy_test_pool(f);
 }
@@ -973,7 +1034,8 @@ STM_TEST(ctl_b1_walk_wrong_uuid_enoent)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -991,6 +1053,7 @@ STM_TEST(ctl_b1_walk_wrong_uuid_enoent)
     ASSERT_WALK_FAILED(resp, 2);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
     destroy_test_pool(f);
 }
@@ -1002,7 +1065,8 @@ STM_TEST(ctl_b1_pool_status_write_rejected)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -1017,6 +1081,7 @@ STM_TEST(ctl_b1_pool_status_write_rejected)
     ASSERT_WALK_FAILED(resp, 3);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
     destroy_test_pool(f);
 }
@@ -1050,7 +1115,8 @@ STM_TEST(ctl_r97_p3_6_36char_malformed_uuid_rejected)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -1082,6 +1148,7 @@ STM_TEST(ctl_r97_p3_6_36char_malformed_uuid_rejected)
     STM_ASSERT_EQ(resp[4], STM_LP9_RWALK);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
     destroy_test_pool(f);
 }
@@ -1095,7 +1162,8 @@ STM_TEST(ctl_b1p_devices_dir_appears_under_pool)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -1130,6 +1198,7 @@ STM_TEST(ctl_b1p_devices_dir_appears_under_pool)
     STM_ASSERT_TRUE(saw_devices);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
     destroy_test_pool(f);
 }
@@ -1141,7 +1210,8 @@ STM_TEST(ctl_b1p_devices_readdir_lists_one_slot)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -1173,6 +1243,7 @@ STM_TEST(ctl_b1p_devices_readdir_lists_one_slot)
     STM_ASSERT_TRUE(saw_zero);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
     destroy_test_pool(f);
 }
@@ -1184,7 +1255,8 @@ STM_TEST(ctl_b1p_device_status_reports_class_role_state)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -1228,6 +1300,7 @@ STM_TEST(ctl_b1p_device_status_reports_class_role_state)
     STM_ASSERT(strstr(body, "state: online\n") != NULL);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
     destroy_test_pool(f);
 }
@@ -1239,7 +1312,8 @@ STM_TEST(ctl_b1p_device_dir_oob_enoent)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -1282,6 +1356,7 @@ STM_TEST(ctl_b1p_device_dir_oob_enoent)
     ASSERT_WALK_FAILED(resp, 4);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
     destroy_test_pool(f);
 }
@@ -1293,7 +1368,8 @@ STM_TEST(ctl_b1p_device_status_write_rejected)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -1309,6 +1385,7 @@ STM_TEST(ctl_b1p_device_status_write_rejected)
     ASSERT_WALK_FAILED(resp, 5);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
     destroy_test_pool(f);
 }
@@ -1324,7 +1401,8 @@ STM_TEST(ctl_c1_datasets_in_root_listing)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -1351,6 +1429,7 @@ STM_TEST(ctl_c1_datasets_in_root_listing)
     STM_ASSERT_TRUE(saw_datasets);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -1358,7 +1437,8 @@ STM_TEST(ctl_c1_datasets_dir_empty_when_no_fs)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -1378,6 +1458,7 @@ STM_TEST(ctl_c1_datasets_dir_empty_when_no_fs)
     STM_ASSERT_EQ(load_u32(resp + 7), 0u);  /* empty dir */
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -1392,7 +1473,8 @@ STM_TEST(ctl_c1_datasets_readdir_lists_root_dataset)
 
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(fs, &c));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -1423,6 +1505,7 @@ STM_TEST(ctl_c1_datasets_readdir_lists_root_dataset)
     STM_ASSERT_TRUE(saw_root);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
@@ -1438,7 +1521,8 @@ STM_TEST(ctl_c1_dataset_properties_reports_root_metadata)
 
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(fs, &c));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -1476,6 +1560,7 @@ STM_TEST(ctl_c1_dataset_properties_reports_root_metadata)
     STM_ASSERT(strstr(body, "promote-decay-window: ")        != NULL);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
@@ -1491,7 +1576,8 @@ STM_TEST(ctl_c1_walk_nonexistent_dataset_id_enoent)
 
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(fs, &c));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -1522,6 +1608,7 @@ STM_TEST(ctl_c1_walk_nonexistent_dataset_id_enoent)
     ASSERT_WALK_FAILED(resp, 2);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
@@ -1583,7 +1670,8 @@ STM_TEST(ctl_r99_p3_2_dataset_id_zero_rejected_at_parser)
 
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(fs, &c));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -1594,6 +1682,7 @@ STM_TEST(ctl_r99_p3_2_dataset_id_zero_rejected_at_parser)
     ASSERT_WALK_FAILED(resp, 2);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
@@ -1609,7 +1698,8 @@ STM_TEST(ctl_c1_dataset_properties_write_rejected)
 
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(fs, &c));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -1623,6 +1713,7 @@ STM_TEST(ctl_c1_dataset_properties_write_rejected)
     ASSERT_WALK_FAILED(resp, 3);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
@@ -1637,7 +1728,8 @@ STM_TEST(ctl_d1_admin_dir_listed_to_all)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     /* Caller is unset → non-admin. */
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -1664,6 +1756,7 @@ STM_TEST(ctl_d1_admin_dir_listed_to_all)
     STM_ASSERT_TRUE(saw_admin);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -1672,7 +1765,8 @@ STM_TEST(ctl_d1_admin_topen_nonadmin_eacces)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     /* No set_caller → caller_uid is unset (sentinel) → non-admin. */
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -1688,6 +1782,7 @@ STM_TEST(ctl_d1_admin_topen_nonadmin_eacces)
     STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -1697,7 +1792,8 @@ STM_TEST(ctl_d1_admin_peer_admin_succeeds)
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     /* Stamp uid 0 → admin per the v2.0 baseline policy. */
     STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -1727,6 +1823,7 @@ STM_TEST(ctl_d1_admin_peer_admin_succeeds)
     STM_ASSERT(strstr(body, "is-admin: yes\n")  != NULL);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -1737,7 +1834,8 @@ STM_TEST(ctl_d1_admin_peer_nonroot_admin_via_admin_uid)
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_set_admin_uid(c, 1000));
     STM_ASSERT_OK(stm_ctl_set_caller(c, 1000, 1000));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -1765,6 +1863,7 @@ STM_TEST(ctl_d1_admin_peer_nonroot_admin_via_admin_uid)
     STM_ASSERT(strstr(body, "is-admin: yes\n")     != NULL);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -1779,7 +1878,8 @@ STM_TEST(ctl_d1_admin_peer_nonadmin_walk_rejected)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_set_caller(c, 1000, 1000));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -1791,6 +1891,7 @@ STM_TEST(ctl_d1_admin_peer_nonadmin_walk_rejected)
     ASSERT_WALK_FAILED(resp, 2);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -1800,7 +1901,8 @@ STM_TEST(ctl_d1_admin_peer_unset_caller_eacces)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     /* Note: we deliberately DO NOT call stm_ctl_set_caller. */
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -1814,6 +1916,7 @@ STM_TEST(ctl_d1_admin_peer_unset_caller_eacces)
     ASSERT_WALK_FAILED(resp, 2);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -1838,7 +1941,8 @@ STM_TEST(ctl_r100_p2_1_admin_walk_through_blocks_nonadmin)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_set_caller(c, 1000, 1000));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -1874,6 +1978,7 @@ STM_TEST(ctl_r100_p2_1_admin_walk_through_blocks_nonadmin)
     STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -1888,7 +1993,8 @@ STM_TEST(ctl_r100_p3_1_unset_admin_uid_renders_unset)
     STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));
     /* Deliberately do NOT call stm_ctl_set_admin_uid — admin_uid
      * stays at the (uid_t)-1 sentinel. */
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -1913,6 +2019,7 @@ STM_TEST(ctl_r100_p3_1_unset_admin_uid_renders_unset)
     STM_ASSERT(strstr(body, "is-admin: yes\n")      != NULL);  /* root */
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -1927,7 +2034,8 @@ STM_TEST(ctl_r100_p3_2_root_beats_admin_uid)
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_set_admin_uid(c, 1000));
     STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -1951,6 +2059,7 @@ STM_TEST(ctl_r100_p3_2_root_beats_admin_uid)
     STM_ASSERT(strstr(body, "admin-uid: 1000\n")  != NULL);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -1964,7 +2073,8 @@ STM_TEST(ctl_d2_events_in_root_listing)
 {
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -1991,6 +2101,7 @@ STM_TEST(ctl_d2_events_in_root_listing)
     STM_ASSERT_TRUE(saw_events);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -1999,7 +2110,8 @@ STM_TEST(ctl_d2_events_empty_when_no_log)
     /* Fresh stm_ctl: event log empty; /events read returns zero bytes. */
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -2019,6 +2131,7 @@ STM_TEST(ctl_d2_events_empty_when_no_log)
     STM_ASSERT_EQ(load_u32(resp + 7), 0u);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -2030,7 +2143,8 @@ STM_TEST(ctl_d2_log_event_then_read_back)
     stm_ctl_log_event(c, "first event id=42");
     stm_ctl_log_event(c, "second event delta=%llu", (unsigned long long)100);
 
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -2057,6 +2171,7 @@ STM_TEST(ctl_d2_log_event_then_read_back)
     STM_ASSERT(strstr(body, "second event delta=100\n") != NULL);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -2067,7 +2182,8 @@ STM_TEST(ctl_d2_clear_events_admin_succeeds)
     STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));   /* root */
     stm_ctl_log_event(c, "before clear");
 
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -2107,6 +2223,7 @@ STM_TEST(ctl_d2_clear_events_admin_succeeds)
     STM_ASSERT(strstr(body, "events log cleared by uid=0") != NULL);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -2117,7 +2234,8 @@ STM_TEST(ctl_d2_clear_events_nonadmin_eacces)
     STM_ASSERT_OK(stm_ctl_set_caller(c, 1000, 1000));    /* non-admin */
     stm_ctl_log_event(c, "should survive non-admin attempt");
 
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -2145,6 +2263,7 @@ STM_TEST(ctl_d2_clear_events_nonadmin_eacces)
     STM_ASSERT(strstr(body, "should survive non-admin attempt") != NULL);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -2157,7 +2276,8 @@ STM_TEST(ctl_d2_events_snapshot_at_topen)
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
 
     stm_ctl_log_event(c, "before topen");
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -2183,6 +2303,7 @@ STM_TEST(ctl_d2_events_snapshot_at_topen)
     STM_ASSERT(strstr(body, "after topen")  == NULL);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -2200,7 +2321,8 @@ STM_TEST(ctl_d2_log_event_truncation_keeps_newline)
     stm_ctl_log_event(c, "%s", huge);
     stm_ctl_log_event(c, "next line");
 
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -2227,6 +2349,7 @@ STM_TEST(ctl_d2_log_event_truncation_keeps_newline)
     STM_ASSERT(strstr(body, "AAAnext") == NULL);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -2241,7 +2364,8 @@ STM_TEST(ctl_r100_p3_3_set_admin_uid_can_reset)
     /* Reset admin_uid back to unset. */
     STM_ASSERT_OK(stm_ctl_set_admin_uid(c, (uid_t)-1));
 
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -2253,6 +2377,7 @@ STM_TEST(ctl_r100_p3_3_set_admin_uid_can_reset)
     ASSERT_WALK_FAILED(resp, 2);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -2268,12 +2393,21 @@ STM_TEST(ctl_r100_p3_3_set_admin_uid_can_reset)
  * prior session would pre-empt the new alloc. */
 STM_TEST(ctl_r101_p1_1_drop_all_sessions_releases_slots)
 {
+    /* P9.5-PARALLEL-1: the original R101 P1-1 test guarded against
+     * leaked sessions persisting across SEQUENTIAL stm_lp9_server use
+     * on a SHARED stm_ctl::sessions[]. Under the new design the
+     * sessions table lives on stm_ctl_conn (per-connection), so a
+     * leaked session from conn1 cannot collide with conn2 — they're
+     * structurally isolated. The invariant we verify here is the
+     * NEW one: conn2 sees its own clean sessions[] regardless of what
+     * conn1 did (or didn't) clunk before destroy. */
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     stm_ctl_log_event(c, "first event");
 
-    /* Conn 1: open /events on fid 11. */
-    stm_lp9_server *s1 = make_ctl_server(c);
+    /* Conn 1: open /events on fid 11, then destroy without Tclunk. */
+    stm_ctl_conn *cn1 = NULL;
+    stm_lp9_server *s1 = make_ctl_server(c, &cn1);
     do_handshake(s1, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -2285,16 +2419,19 @@ STM_TEST(ctl_r101_p1_1_drop_all_sessions_releases_slots)
     STM_ASSERT_OK(stm_lp9_server_handle(s1, req, sz, resp, sizeof resp, &rlen));
     STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
-    /* Tear down conn 1 WITHOUT a Tclunk — leaks the session. */
+    /* Tear down conn 1 WITHOUT a Tclunk — server destroy issues an
+     * implicit clunk via vops_clunk; if it doesn't, stm_ctl_conn_destroy's
+     * defensive sweep frees the slot. Either way conn 2 sees clean state. */
     stm_lp9_server_destroy(s1);
+    stm_ctl_conn_destroy(cn1);
 
-    /* Without drop_all_sessions, the leaked slot would interfere
-     * with conn 2's reuse of fid 11. Drain it. */
+    /* Legacy no-op (validates the deprecated API still links). */
     stm_ctl_drop_all_sessions(c);
 
-    /* Conn 2 with a fresh server on the same stm_ctl. */
+    /* Conn 2 with a fresh conn + server on the same stm_ctl. */
     stm_ctl_log_event(c, "second event");
-    stm_lp9_server *s2 = make_ctl_server(c);
+    stm_ctl_conn *cn2 = NULL;
+    stm_lp9_server *s2 = make_ctl_server(c, &cn2);
     do_handshake(s2, 10);
 
     sz = build_twalk(req, 2, 10, 11, 1, path);
@@ -2314,6 +2451,7 @@ STM_TEST(ctl_r101_p1_1_drop_all_sessions_releases_slots)
     STM_ASSERT(strstr(body, "second event") != NULL);
 
     stm_lp9_server_destroy(s2);
+    stm_ctl_conn_destroy(cn2);
     stm_ctl_destroy(c);
 }
 
@@ -2334,7 +2472,8 @@ STM_TEST(ctl_r101_p2_1_clear_invalidates_active_event_snapshots)
     STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));    /* root */
     stm_ctl_log_event(c, "before clear: this should not leak");
 
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -2366,6 +2505,7 @@ STM_TEST(ctl_r101_p2_1_clear_invalidates_active_event_snapshots)
     STM_ASSERT_EQ(load_u32(resp + 7), 0u);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -2379,7 +2519,8 @@ STM_TEST(ctl_r101_p2_2_zero_byte_clear_refused)
     STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));
     stm_ctl_log_event(c, "this must survive a 0-byte clear attempt");
 
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -2413,6 +2554,7 @@ STM_TEST(ctl_r101_p2_2_zero_byte_clear_refused)
                 != NULL);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -2426,7 +2568,8 @@ STM_TEST(ctl_d3_debug_dir_in_root_listing)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     /* No caller stamped → not-admin → still sees /debug at root. */
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -2455,6 +2598,7 @@ STM_TEST(ctl_d3_debug_dir_in_root_listing)
     STM_ASSERT_TRUE(saw_debug);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -2467,7 +2611,8 @@ STM_TEST(ctl_d3_debug_topen_nonadmin_eacces)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_set_caller(c, 1000, 1000));   /* not admin */
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -2482,6 +2627,7 @@ STM_TEST(ctl_d3_debug_topen_nonadmin_eacces)
     STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -2493,7 +2639,8 @@ STM_TEST(ctl_d3_debug_walk_through_nonadmin_rejected)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_set_caller(c, 1000, 1000));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -2504,6 +2651,7 @@ STM_TEST(ctl_d3_debug_walk_through_nonadmin_rejected)
     ASSERT_WALK_FAILED(resp, 2);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -2521,7 +2669,8 @@ STM_TEST(ctl_d3_debug_alloc_admin_reads_stats)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(fs, &c));
     STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));     /* root → admin */
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -2562,6 +2711,7 @@ STM_TEST(ctl_d3_debug_alloc_admin_reads_stats)
     STM_ASSERT(strstr(body, "n-pending-ranges: ") != NULL);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
@@ -2581,7 +2731,8 @@ STM_TEST(ctl_d3_debug_alloc_dir_lists_attached_devices)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(fs, &c));
     STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -2617,6 +2768,7 @@ STM_TEST(ctl_d3_debug_alloc_dir_lists_attached_devices)
     STM_ASSERT_TRUE(!saw_other);    /* single-device fs */
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
@@ -2635,7 +2787,8 @@ STM_TEST(ctl_d3_debug_alloc_oob_device_enoent)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(fs, &c));
     STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -2655,6 +2808,7 @@ STM_TEST(ctl_d3_debug_alloc_oob_device_enoent)
     ASSERT_WALK_FAILED(resp, 3);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
@@ -2673,7 +2827,8 @@ STM_TEST(ctl_d3_debug_alloc_leading_zero_rejected)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(fs, &c));
     STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -2684,6 +2839,7 @@ STM_TEST(ctl_d3_debug_alloc_leading_zero_rejected)
     ASSERT_WALK_FAILED(resp, 3);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
     STM_ASSERT_OK(stm_fs_unmount(fs));
 }
@@ -2697,7 +2853,8 @@ STM_TEST(ctl_d3_debug_alloc_dir_unattached_fs_walks_then_topen_enoent)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_set_caller(c, 0, 0));
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -2712,6 +2869,7 @@ STM_TEST(ctl_d3_debug_alloc_dir_unattached_fs_walks_then_topen_enoent)
     ASSERT_WALK_FAILED(resp, 2);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -2762,7 +2920,8 @@ STM_TEST(ctl_r102_p3_5_debug_dir_stat_for_nonadmin)
     stm_ctl *c = NULL;
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_set_caller(c, 1000, 1000));    /* not admin */
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -2789,6 +2948,7 @@ STM_TEST(ctl_r102_p3_5_debug_dir_stat_for_nonadmin)
     ASSERT_WALK_FAILED(resp, 2);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -2889,7 +3049,8 @@ STM_TEST(ctl_d4_scrub_omitted_from_readdir_when_unattached)
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
 
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -2928,6 +3089,7 @@ STM_TEST(ctl_d4_scrub_omitted_from_readdir_when_unattached)
     ASSERT_WALK_FAILED(resp, 3);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
     destroy_test_pool(f);
 }
@@ -2955,7 +3117,8 @@ STM_TEST(ctl_d4_scrub_listed_and_reads_idle)
     STM_ASSERT_OK(stm_ctl_attach_pool(c, pool));
     STM_ASSERT_OK(stm_ctl_attach_scrub(c, sc));
 
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     /* Resolve the formatted pool uuid hex from the live pool. */
@@ -3035,6 +3198,7 @@ STM_TEST(ctl_d4_scrub_listed_and_reads_idle)
     STM_ASSERT_TRUE(saw_scrub);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
     stm_scrub_close(sc);
     STM_ASSERT_OK(stm_fs_unmount(fs));
@@ -3064,7 +3228,8 @@ STM_TEST(ctl_d4_scrub_state_running_after_start)
      * reflect that state. */
     STM_ASSERT_OK(stm_scrub_start(sc));
 
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     const uint64_t *uuid_words = stm_pool_uuid(pool);
@@ -3116,6 +3281,7 @@ STM_TEST(ctl_d4_scrub_state_running_after_start)
     STM_ASSERT(strstr(body, "state: paused\n") != NULL);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
     stm_scrub_close(sc);
     STM_ASSERT_OK(stm_fs_unmount(fs));
@@ -3143,7 +3309,8 @@ STM_TEST(ctl_d4_scrub_world_readable_nonadmin_succeeds)
     STM_ASSERT_OK(stm_ctl_attach_scrub(c, sc));
     STM_ASSERT_OK(stm_ctl_set_caller(c, 1000, 1000));    /* not admin */
 
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     const uint64_t *uuid_words = stm_pool_uuid(pool);
@@ -3178,6 +3345,7 @@ STM_TEST(ctl_d4_scrub_world_readable_nonadmin_succeeds)
     STM_ASSERT(count > 0);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
     stm_scrub_close(sc);
     STM_ASSERT_OK(stm_fs_unmount(fs));
@@ -3208,7 +3376,8 @@ STM_TEST(ctl_r103_p3_1_scrub_topen_rdwr_eacces)
     STM_ASSERT_OK(stm_ctl_attach_pool(c, pool));
     STM_ASSERT_OK(stm_ctl_attach_scrub(c, sc));
 
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     const uint64_t *uuid_words = stm_pool_uuid(pool);
@@ -3249,6 +3418,7 @@ STM_TEST(ctl_r103_p3_1_scrub_topen_rdwr_eacces)
     STM_ASSERT_EQ(resp[4], STM_LP9_RLOPEN);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
     stm_scrub_close(sc);
     STM_ASSERT_OK(stm_fs_unmount(fs));
@@ -3277,7 +3447,8 @@ STM_TEST(ctl_r103_p3_1_scrub_twrite_eacces)
     STM_ASSERT_OK(stm_ctl_attach_pool(c, pool));
     STM_ASSERT_OK(stm_ctl_attach_scrub(c, sc));
 
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     const uint64_t *uuid_words = stm_pool_uuid(pool);
@@ -3315,6 +3486,7 @@ STM_TEST(ctl_r103_p3_1_scrub_twrite_eacces)
     STM_ASSERT_EQ(resp[4], STM_LP9_RLERROR);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
     stm_scrub_close(sc);
     STM_ASSERT_OK(stm_fs_unmount(fs));
@@ -3343,7 +3515,8 @@ STM_TEST(ctl_r103_p3_1_scrub_tstat_reports_0444)
     STM_ASSERT_OK(stm_ctl_attach_pool(c, pool));
     STM_ASSERT_OK(stm_ctl_attach_scrub(c, sc));
 
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     const uint64_t *uuid_words = stm_pool_uuid(pool);
@@ -3384,6 +3557,7 @@ STM_TEST(ctl_r103_p3_1_scrub_tstat_reports_0444)
     STM_ASSERT_EQ(mode & 0777u, 0444u);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
     stm_scrub_close(sc);
     STM_ASSERT_OK(stm_fs_unmount(fs));
@@ -3419,6 +3593,7 @@ typedef struct {
     stm_scrub     *sc;
     stm_pool      *pool;
     stm_ctl       *c;
+    stm_ctl_conn  *cn;
     stm_lp9_server *s;
     char           uuid_hex[64];
 } scrub_trigger_fixture;
@@ -3441,9 +3616,8 @@ static scrub_trigger_fixture make_scrub_trigger_fixture(const char *tag, uid_t u
     STM_ASSERT_OK(stm_ctl_create(f.fs, &f.c));
     STM_ASSERT_OK(stm_ctl_attach_pool(f.c, f.pool));
     STM_ASSERT_OK(stm_ctl_attach_scrub(f.c, f.sc));
-    STM_ASSERT_OK(stm_ctl_set_caller(f.c, uid, uid));
 
-    f.s = make_ctl_server(f.c);
+    f.s = make_ctl_server_for(f.c, uid, uid, &f.cn);
     do_handshake(f.s, 10);
 
     format_pool_uuid_hex(f.pool, f.uuid_hex);
@@ -3453,6 +3627,7 @@ static scrub_trigger_fixture make_scrub_trigger_fixture(const char *tag, uid_t u
 static void destroy_scrub_trigger_fixture(scrub_trigger_fixture f)
 {
     stm_lp9_server_destroy(f.s);
+    stm_ctl_conn_destroy(f.cn);
     stm_ctl_destroy(f.c);
     stm_scrub_close(f.sc);
     STM_ASSERT_OK(stm_fs_unmount(f.fs));
@@ -3708,7 +3883,8 @@ STM_TEST(ctl_d5_scrub_trigger_omitted_when_unattached)
     STM_ASSERT_OK(stm_ctl_create(NULL, &c));
     STM_ASSERT_OK(stm_ctl_attach_pool(c, f.pool));
 
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -3742,6 +3918,7 @@ STM_TEST(ctl_d5_scrub_trigger_omitted_when_unattached)
     ASSERT_WALK_FAILED(resp, 3);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
     destroy_test_pool(f);
 }
@@ -4450,7 +4627,8 @@ STM_TEST(ctl_r107_clear_events_zero_byte_logs)
     /* Pre-seed an event so we can assert log is non-empty. */
     stm_ctl_log_event(c, "pre-attempt sentinel");
 
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     uint8_t req[RBUF], resp[RBUF];
@@ -4482,6 +4660,7 @@ STM_TEST(ctl_r107_clear_events_zero_byte_logs)
     STM_ASSERT(strstr(body, "pre-attempt sentinel") != NULL);   /* not cleared */
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
 }
 
@@ -4890,6 +5069,7 @@ typedef struct {
     stm_fs        *fs;
     stm_pool      *pool;
     stm_ctl       *c;
+    stm_ctl_conn  *cn;
     stm_lp9_server *s;
     char           uuid_hex[64];
 } metrics_fixture;
@@ -4910,9 +5090,8 @@ static metrics_fixture make_metrics_fixture(const char *tag, uid_t uid)
 
     STM_ASSERT_OK(stm_ctl_create(f.fs, &f.c));
     STM_ASSERT_OK(stm_ctl_attach_pool(f.c, f.pool));
-    STM_ASSERT_OK(stm_ctl_set_caller(f.c, uid, uid));
 
-    f.s = make_ctl_server(f.c);
+    f.s = make_ctl_server_for(f.c, uid, uid, &f.cn);
     do_handshake(f.s, 10);
 
     format_pool_uuid_hex(f.pool, f.uuid_hex);
@@ -4922,6 +5101,7 @@ static metrics_fixture make_metrics_fixture(const char *tag, uid_t uid)
 static void destroy_metrics_fixture(metrics_fixture f)
 {
     stm_lp9_server_destroy(f.s);
+    stm_ctl_conn_destroy(f.cn);
     stm_ctl_destroy(f.c);
     STM_ASSERT_OK(stm_fs_unmount(f.fs));
 }
@@ -5156,8 +5336,13 @@ STM_TEST(ctl_e1_metrics_prometheus_body_includes_scrub_when_attached)
     STM_ASSERT(strstr(body, "stratum_scrub_blocks_verified{") != NULL);
     STM_ASSERT(strstr(body, "stratum_scrub_ranges_processed{") != NULL);
 
-    /* Tear down scrub before fixture (matches the lifetime contract). */
+    /* Tear down scrub before fixture (matches the lifetime contract).
+     * P9.5-PARALLEL-1: conn destroy MUST come between server destroy
+     * (which uses cn via vops_clunk) and ctl destroy (which blocks on
+     * worker_cv until worker_count drops to 0). Skipping conn destroy
+     * deadlocks at ctl destroy. */
     stm_lp9_server_destroy(f.s);
+    stm_ctl_conn_destroy(f.cn);
     stm_ctl_destroy(f.c);
     stm_scrub_close(sc);
     STM_ASSERT_OK(stm_fs_unmount(f.fs));
@@ -5329,7 +5514,8 @@ STM_TEST(ctl_e1_metrics_prometheus_pool_only_omits_fs_gauges)
     STM_ASSERT_OK(stm_ctl_attach_pool(c, pf.pool));
     STM_ASSERT_OK(stm_ctl_set_caller(c, 1000, 1000));
 
-    stm_lp9_server *s = make_ctl_server(c);
+    stm_ctl_conn *cn = NULL;
+    stm_lp9_server *s = make_ctl_server(c, &cn);
     do_handshake(s, 10);
 
     /* Walk + open + read /pools/<uuid>/metrics/prometheus. The fixture
@@ -5376,6 +5562,7 @@ STM_TEST(ctl_e1_metrics_prometheus_pool_only_omits_fs_gauges)
     STM_ASSERT(strstr(body, "stratum_scrub_state") == NULL);
 
     stm_lp9_server_destroy(s);
+    stm_ctl_conn_destroy(cn);
     stm_ctl_destroy(c);
     destroy_test_pool(pf);
 }

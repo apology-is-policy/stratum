@@ -64,37 +64,54 @@
  * Forgetting (2) trips a clang -Wmissing-field-initializers; (4)
  * trips at build time if the name overflows STM_LP9_NAME_MAX.
  *
- * Concurrency
- * ───────────
- * The hard rule:
- *   - Safe to share one stm_ctl across SEQUENTIAL stm_lp9_server use
- *     (one server at a time — v2.0 stratumd serial accept).
- *   - NOT safe to share one stm_ctl across CONCURRENT stm_lp9_server
- *     instances. The future concurrent-accept transport upgrade
- *     (R95 forward-note) MUST either give each server its own
- *     stm_ctl, or extend sessions[]'s key from `fid` to
- *     `(server_idx, fid)` — the same posture src/9p/server.c took
- *     at P9-9P-1 (`lock_owner = (server_idx << 32) | fid`).
+ * Concurrency (P9.5-PARALLEL-1 — was the forward-note; now the regime)
+ * ─────────────────────────────────────────────────────────────────────
+ * `stm_ctl` is PROCESS-WIDE shared state: immutable subsystem
+ * pointers (fs/pool/scrub/admin_uid) + the audit log buffer
+ * (event_buf, guarded by event_mu) + a worker-count refcount for
+ * lifecycle. Multiple `stm_ctl_conn` may hold the same `stm_ctl`
+ * concurrently; the shared state is either immutable post-init
+ * (subsystem pointers, admin_uid) or mutex-guarded (event_buf,
+ * worker_count).
  *
- * Why the mutex isn't enough
- * ──────────────────────────
- * The instance mutex (`mu`) protects byte-level access to
- * `sessions[]` — within ONE server's vops calls, the mutex
- * serializes alloc/lookup/free. But the mutex does NOT protect
- * against fid-namespace collisions: two concurrent servers each
- * running `vops_lopen(fid=1)` would race in sessions[] and the
- * mutex doesn't know which server's fid 1 to associate with which
- * slot. So the mutex is defense-in-depth WITHIN a single server's
- * timeline (where the generic stm_lp9_server is itself single-
- * threaded per connection — Tflush is a server-level no-op so
- * cannot interrupt a vops call); it is NOT cross-server safety.
+ * `stm_ctl_conn` is PER-CONNECTION state: peer caller_uid/gid
+ * (immutable post-create), per-fid sessions[] table, per-conn mu.
+ * Every vops_* callback takes ctx as `stm_ctl_conn *`. Two
+ * conns referencing the same ctl have INDEPENDENT fid namespaces
+ * (each conn alloc/lookup/free is scoped to its own sessions[]);
+ * the per-conn mu serializes within one conn's timeline.
  *
- * Read paths against subsystem state (`stm_fs *`, `stm_pool *`)
- * call into those subsystems' own thread-safe accessors
- * (`stm_fs_stats_get`, `stm_pool_lock_shared` etc.). Body
- * materialization snapshots state at Tlopen so subsequent Treads
- * see a consistent view; concurrent fs/pool mutations after Tlopen
- * are reflected on the next Tlopen.
+ * Lifecycle refcount (LifecycleNoUAF in ctl_conn.tla): each
+ * `stm_ctl_conn_create` increments `ctl->worker_count`; each
+ * `stm_ctl_conn_destroy` decrements + broadcasts worker_cv.
+ * `stm_ctl_destroy` waits on the cv until count == 0 so detached
+ * /ctl/ workers can't trip UAF on shutdown. The R96 P2-1 "destroy
+ * server BEFORE destroy ctl" precondition still applies — the
+ * lp9_server's destroy issues vops_clunk for every open fid; the
+ * conn's destroy must follow lp9_server's destroy.
+ *
+ * Lock order (process-wide):
+ *   stm_ctl_conn::mu     (per-conn; guards that conn's sessions[])
+ *   stm_ctl::event_mu    (guards event_buf)
+ *   stm_ctl::worker_mu   (guards worker_count + worker_cv)
+ *
+ * No path takes two of these simultaneously. event_mu and mu are
+ * never nested (materializers that read sessions[] don't append
+ * to event_buf inside the same critical section). worker_mu is
+ * only at conn create/destroy.
+ *
+ * Read paths against subsystem state (`stm_fs *`, `stm_pool *`,
+ * `stm_scrub *`) call into those subsystems' own thread-safe
+ * accessors (`stm_fs_stats_get`, `stm_pool_lock_shared` etc.).
+ * Body materialization snapshots state at Tlopen so subsequent
+ * Treads see a consistent view; concurrent fs/pool mutations
+ * after Tlopen are reflected on the next Tlopen.
+ *
+ * R94 P2-1 stat-after-mutation carry: subsystem state may change
+ * between a Tgetattr probe and the matching Tlopen. The
+ * materializers' existing per-kind ENOENT checks (e.g., dataset
+ * still PRESENT, snap still alive) cover this. R131 audit
+ * verifies under the new concurrent regime.
  */
 
 #include <stratum/crypto.h>         /* stm_ct_memzero (R101 P3-1) */
@@ -370,13 +387,22 @@ typedef struct ctl_session {
     uint8_t   buf[STM_CTL_BODY_MAX];
     uint32_t  len;
     /* P9-CTL-1d-events: when reading /events, the body lives in
-     * c->event_buf rather than session->buf (the log can grow
+     * cn->ctl->event_buf rather than session->buf (the log can grow
      * larger than STM_CTL_BODY_MAX = 1 KiB). At Tlopen we snapshot
-     * the event_len into snapshot_len; subsequent Treads serve
-     * c->event_buf[0..snapshot_len] under c->mu, ignoring events
-     * appended after Tlopen. uses_event_buf=1 marks this branch. */
+     * (event_len, event_gen) under event_mu; subsequent Treads serve
+     * event_buf[0..snapshot_len] under event_mu, ignoring events
+     * appended after Tlopen. uses_event_buf=1 marks this branch.
+     *
+     * P9.5-PARALLEL-1 (R101 P2-1 carry across conns): a sibling
+     * conn's clear-events bumps event_gen and zeroes event_buf. ANY
+     * /events session with snapshot_event_gen != current event_gen
+     * is stale — vops_read returns EOF (count=0) so the reader sees
+     * a clean cut at the clear, not zero-padded frankenstein bytes.
+     * No cross-conn sessions[] walk is needed; the gen check covers
+     * sibling-conn invalidation cleanly. */
     int       uses_event_buf;
     uint32_t  snapshot_len;
+    uint64_t  snapshot_event_gen;
     /* P9-CTL-1e: per-fid heap-allocated body for bulk kinds whose
      * worst-case bytes exceed STM_CTL_BODY_MAX. NULL on the bounded-
      * body path. Owned by the session; freed at session_free_locked
@@ -405,19 +431,50 @@ struct stm_ctl {
     struct stm_fs    *fs;             /* may be NULL (unattached) */
     struct stm_pool  *pool;           /* may be NULL (no pool attached) */
     struct stm_scrub *scrub;          /* may be NULL (no scrub attached) */
-    /* P9-CTL-1d-uid: peer credentials + admin policy. Set by
-     * stratumd via stm_ctl_set_caller / stm_ctl_set_admin_uid
-     * BEFORE the first stm_lp9_server_handle invocation; not
-     * mu-protected on read paths. */
-    uid_t            caller_uid;     /* (uid_t)-1 = unset */
-    gid_t            caller_gid;     /* (gid_t)-1 = unset */
+    /* P9-CTL-1d-uid: admin policy. Set by stratumd via
+     * stm_ctl_set_admin_uid BEFORE the first stm_lp9_server_handle
+     * invocation; immutable on read paths. Per-conn caller_uid
+     * lives on stm_ctl_conn (P9.5-PARALLEL-1). */
     uid_t            admin_uid;      /* (uid_t)-1 = no daemon-euid admin */
-    pthread_mutex_t  mu;              /* guards sessions[] + event_buf */
-    /* P9-CTL-1d-events: event log. Mu-protected. event_buf may be
-     * realloc'd; readers must hold mu while copying out. */
+    /* P9.5-PARALLEL-1 test-compat: stm_ctl_set_caller stashes here
+     * so the test harness's make_ctl_server() helper can pull the
+     * configured uid when creating its stm_ctl_conn. NOT used by
+     * production code paths — stratumd creates conns via
+     * stm_ctl_conn_create with explicit peer creds. */
+    uid_t            pending_caller_uid;
+    gid_t            pending_caller_gid;
+    /* P9-CTL-1d-events: event log. event_mu-protected. event_buf may
+     * be realloc'd; readers must hold event_mu while copying out.
+     * P9.5-PARALLEL-1: event_gen starts at 1 and increments on every
+     * /admin/clear-events action. /events sessions snapshot the gen
+     * at Tlopen and EOF on mismatch — covers cross-conn snapshot
+     * invalidation without walking sibling sessions[]. */
+    pthread_mutex_t  event_mu;
     uint8_t         *event_buf;
     size_t           event_len;
     size_t           event_cap;
+    uint64_t         event_gen;
+    /* P9.5-PARALLEL-1: lifecycle refcount. Each stm_ctl_conn_create
+     * increments worker_count; each stm_ctl_conn_destroy decrements +
+     * broadcasts worker_cv. stm_ctl_destroy waits until count == 0
+     * so detached /ctl/ workers can't UAF the shared ctl. */
+    pthread_mutex_t  worker_mu;
+    pthread_cond_t   worker_cv;
+    uint32_t         worker_count;
+};
+
+struct stm_ctl_conn {
+    stm_ctl         *ctl;             /* shared ctl; not owned */
+    /* P9-CTL-1d-uid: peer credentials bound at conn-create.
+     * IMMUTABLE for the lifetime of this conn — read on every vops
+     * dispatch without any lock. */
+    uid_t            caller_uid;
+    gid_t            caller_gid;
+    /* P9.5-PARALLEL-1: per-conn sessions[]. Each vops dispatch
+     * looks up / mutates this conn's table only. mu serializes
+     * alloc/lookup/free within one conn. Independent of sibling
+     * conns referencing the same ctl. */
+    pthread_mutex_t  mu;
     ctl_session      sessions[STM_CTL_MAX_SESSIONS];
 };
 
@@ -426,25 +483,29 @@ struct stm_ctl {
  *   OR caller_uid == admin_uid (typically the daemon's effective uid)
  * The default unset states are caller_uid = (uid_t)-1 and admin_uid =
  * (uid_t)-1, which deny admin access. Explicit "uid 0 is admin" is
- * the v2.0 baseline policy; future configurable allowlist deferred. */
-static bool ctl_caller_is_admin(const stm_ctl *c)
+ * the v2.0 baseline policy; future configurable allowlist deferred.
+ *
+ * P9.5-PARALLEL-1: reads cn->caller_uid (immutable per-conn) and
+ * cn->ctl->admin_uid (immutable post-init). No lock needed. */
+static bool ctl_caller_is_admin(const stm_ctl_conn *cn)
 {
-    if (c->caller_uid == (uid_t)-1) return false;
-    if (c->caller_uid == 0) return true;
-    if (c->admin_uid != (uid_t)-1 && c->caller_uid == c->admin_uid)
+    if (cn->caller_uid == (uid_t)-1) return false;
+    if (cn->caller_uid == 0) return true;
+    if (cn->ctl->admin_uid != (uid_t)-1
+            && cn->caller_uid == cn->ctl->admin_uid)
         return true;
     return false;
 }
 
-static ctl_session *session_get_locked(stm_ctl *c, uint32_t fid)
+static ctl_session *session_get_locked(stm_ctl_conn *cn, uint32_t fid)
 {
     for (uint32_t i = 0; i < STM_CTL_MAX_SESSIONS; i++)
-        if (c->sessions[i].active && c->sessions[i].fid == fid)
-            return &c->sessions[i];
+        if (cn->sessions[i].active && cn->sessions[i].fid == fid)
+            return &cn->sessions[i];
     return NULL;
 }
 
-static ctl_session *session_alloc_locked(stm_ctl *c, uint32_t fid,
+static ctl_session *session_alloc_locked(stm_ctl_conn *cn, uint32_t fid,
                                           uint64_t qid_path)
 {
     /* The generic stm_lp9_server rejects re-Tlopen on an open fid
@@ -452,8 +513,8 @@ static ctl_session *session_alloc_locked(stm_ctl *c, uint32_t fid,
      * server we only see fresh fids here. R96 P3-1 audited the
      * old reuse-loop as dead and we removed it. */
     for (uint32_t i = 0; i < STM_CTL_MAX_SESSIONS; i++) {
-        if (!c->sessions[i].active) {
-            ctl_session *s = &c->sessions[i];
+        if (!cn->sessions[i].active) {
+            ctl_session *s = &cn->sessions[i];
             s->active = 1;
             s->fid = fid;
             s->qid_path = qid_path;
@@ -1211,8 +1272,8 @@ static int append_gid_line(char *buf, size_t cap, const char *label, gid_t v)
 
 /* ── event log (P9-CTL-1d-events) ─────────────────────────────────── */
 
-/* Append `len` bytes to c->event_buf under c->mu (must already be
- * held). Realloc-doubling growth, capped at STM_CTL_EVENT_MAX. On
+/* Append `len` bytes to c->event_buf under c->event_mu (must already
+ * be held). Realloc-doubling growth, capped at STM_CTL_EVENT_MAX. On
  * cap exceed or alloc failure, drops the line silently — better
  * than refusing future events or aborting. */
 static void event_append_locked(stm_ctl *c, const char *data, size_t len)
@@ -1268,9 +1329,9 @@ void stm_ctl_log_event(stm_ctl *c, const char *fmt, ...)
     } else if (total == 0 || line[total - 1] != '\n') {
         line[total++] = '\n';
     }
-    pthread_mutex_lock(&c->mu);
+    pthread_mutex_lock(&c->event_mu);
     event_append_locked(c, line, total);
-    pthread_mutex_unlock(&c->mu);
+    pthread_mutex_unlock(&c->event_mu);
 }
 
 /* Materialize /admin/peer — exposes the connecting client's uid/gid
@@ -1285,22 +1346,22 @@ void stm_ctl_log_event(stm_ctl *c, const char *fmt, ...)
  *
  * Body cap: 4 lines, ~30 chars worst case (incl. "(unset)" sentinel
  * placeholders) ≈ 120 bytes; STM_CTL_BODY_MAX = 1 KiB. Comfortable. */
-static stm_status materialize_admin_peer(stm_ctl *c, ctl_session *s)
+static stm_status materialize_admin_peer(stm_ctl_conn *cn, ctl_session *s)
 {
     char *p = (char *)s->buf;
     size_t left = sizeof s->buf;
     int n;
-    n = append_uid_line(p, left, "caller-uid: ", c->caller_uid);
+    n = append_uid_line(p, left, "caller-uid: ", cn->caller_uid);
     if (n < 0 || (size_t)n >= left) return STM_ERANGE;
     p += n; left -= (size_t)n;
-    n = append_gid_line(p, left, "caller-gid: ", c->caller_gid);
+    n = append_gid_line(p, left, "caller-gid: ", cn->caller_gid);
     if (n < 0 || (size_t)n >= left) return STM_ERANGE;
     p += n; left -= (size_t)n;
-    n = append_uid_line(p, left, "admin-uid: ", c->admin_uid);
+    n = append_uid_line(p, left, "admin-uid: ", cn->ctl->admin_uid);
     if (n < 0 || (size_t)n >= left) return STM_ERANGE;
     p += n; left -= (size_t)n;
     n = snprintf(p, left, "is-admin: %s\n",
-                  ctl_caller_is_admin(c) ? "yes" : "no");
+                  ctl_caller_is_admin(cn) ? "yes" : "no");
     if (n < 0 || (size_t)n >= left) return STM_ERANGE;
     p += n;
     s->len = (uint32_t)(p - (char *)s->buf);
@@ -1785,8 +1846,9 @@ fail:
     return rc;
 }
 
-static stm_status materialize_locked(stm_ctl *c, ctl_session *s)
+static stm_status materialize_locked(stm_ctl_conn *cn, ctl_session *s)
 {
+    stm_ctl *c = cn->ctl;
     switch (qid_kind(s->qid_path)) {
     case KIND_VERSION:            return materialize_version(c, s);
     case KIND_STATE:              return materialize_state(c, s);
@@ -1794,7 +1856,7 @@ static stm_status materialize_locked(stm_ctl *c, ctl_session *s)
     case KIND_DEVICE_STATUS:      return materialize_device_status(c, s);
     case KIND_DATASET_PROPERTIES: return materialize_dataset_properties(c, s);
     case KIND_DATASET_SNAPSHOT_INFO: return materialize_dataset_snapshot_info(c, s);
-    case KIND_ADMIN_PEER:         return materialize_admin_peer(c, s);
+    case KIND_ADMIN_PEER:         return materialize_admin_peer(cn, s);
     case KIND_DEBUG_ALLOC:        return materialize_debug_alloc(c, s);
     case KIND_POOL_SCRUB:         return materialize_pool_scrub(c, s);
     case KIND_POOL_METRICS_PROMETHEUS:
@@ -2028,7 +2090,11 @@ static stm_status vops_getattr(void *ctx, uint64_t qid_path,
                                  uint64_t request_mask, stm_lp9_attr *out)
 {
     (void)request_mask;     /* v1.0 always returns BASIC fields */
-    return getattr_at(ctx, qid_path, out, NULL, NULL);
+    /* P9.5-PARALLEL-1: ctx is stm_ctl_conn *; derive the shared ctl
+     * for getattr_at which reads subsystem state but not per-conn
+     * credentials. */
+    stm_ctl_conn *cn = ctx;
+    return getattr_at(cn->ctl, qid_path, out, NULL, NULL);
 }
 
 /* vops_walk helper: getattr_at → extract qid only. The existence
@@ -2054,7 +2120,8 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
                               const char *name, size_t name_len,
                               stm_lp9_qid *out)
 {
-    stm_ctl *c = ctx;
+    stm_ctl_conn *cn = ctx;
+    stm_ctl *c = cn->ctl;
     ctl_kind dk = qid_kind(dir_qid_path);
     switch (dk) {
     case KIND_ROOT:
@@ -2215,7 +2282,7 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
          * documented "POSIX-mode-0500-dir" posture. The /admin/
          * dirent at root readdir remains visible (emit_entry calls
          * getattr_at, not vops_walk; readdir doesn't traverse). */
-        if (!ctl_caller_is_admin(c)) return STM_ENOENT;
+        if (!ctl_caller_is_admin(cn)) return STM_ENOENT;
         if (str_eq(name, name_len, KIND_META[KIND_ADMIN_PEER].static_name))
             return walk_to_qid(c, qid_root(KIND_ADMIN_PEER), out);
         if (str_eq(name, name_len,
@@ -2231,7 +2298,7 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
          * at root readdir (mode 0500 conveys "admin-only" without
          * leaking children). Future /debug/{tree-walk, extent-map,
          * integrity-verify} sub-chunks add new walk targets here. */
-        if (!ctl_caller_is_admin(c)) return STM_ENOENT;
+        if (!ctl_caller_is_admin(cn)) return STM_ENOENT;
         if (str_eq(name, name_len, KIND_META[KIND_DEBUG_ALLOC_DIR].static_name))
             return walk_to_qid(c, qid_root(KIND_DEBUG_ALLOC_DIR), out);
         return STM_ENOENT;
@@ -2239,7 +2306,7 @@ static stm_status vops_walk(void *ctx, uint64_t dir_qid_path,
     case KIND_DEBUG_ALLOC_DIR: {
         /* Defense-in-depth admin re-check — primary gate at
          * KIND_DEBUG_DIR walk-through above already fired. */
-        if (!ctl_caller_is_admin(c)) return STM_ENOENT;
+        if (!ctl_caller_is_admin(cn)) return STM_ENOENT;
         if (!c->fs) return STM_ENOENT;
         uint16_t did = 0;
         if (parse_device_id(name, name_len, &did) != 0) return STM_ENOENT;
@@ -2320,7 +2387,8 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
                                  uint64_t cookie_start,
                                  stm_lp9_dirent_cb cb, void *cb_ctx)
 {
-    stm_ctl *c = ctx;
+    stm_ctl_conn *cn = ctx;
+    stm_ctl *c = cn->ctl;
     ctl_kind dk = qid_kind(dir_qid_path);
     readdir_emit em = { .offset = cookie_start, .pos = 0, .cb = cb,
                           .cb_ctx = cb_ctx };
@@ -2597,7 +2665,8 @@ static stm_status vops_readdir(void *ctx, uint64_t dir_qid_path,
 static stm_status vops_lopen(void *ctx, uint32_t fid, uint64_t qid_path,
                                uint32_t flags)
 {
-    stm_ctl *c = ctx;
+    stm_ctl_conn *cn = ctx;
+    stm_ctl *c = cn->ctl;
     ctl_kind k = qid_kind(qid_path);
     if (k == KIND_MAX) return STM_ENOENT;
     const ctl_kind_meta *meta = &KIND_META[k];
@@ -2636,7 +2705,7 @@ static stm_status vops_lopen(void *ctx, uint32_t fid, uint64_t qid_path,
      * distinguish "EACCES because not admin" from "ENOENT because
      * the path doesn't exist" — same defensive posture as POSIX
      * mode 0500 directories. */
-    if (meta->admin_required && !ctl_caller_is_admin(c))
+    if (meta->admin_required && !ctl_caller_is_admin(cn))
         return STM_EACCES;
 
     /* Directories: open is advisory; readdir handles iteration. */
@@ -2716,22 +2785,31 @@ static stm_status vops_lopen(void *ctx, uint32_t fid, uint64_t qid_path,
         if (arc != STM_OK || !attached) return STM_ENOENT;
     }
 
-    /* P9-CTL-1d-events: KIND_EVENTS reads from c->event_buf directly
-     * (the log can grow past STM_CTL_BODY_MAX = 1 KiB). Snapshot the
-     * length at Tlopen so subsequent Treads see a stable view; events
-     * appended after Tlopen are visible only on a re-Tlopen. */
+    /* P9-CTL-1d-events: KIND_EVENTS reads from cn->ctl->event_buf
+     * directly (the log can grow past STM_CTL_BODY_MAX = 1 KiB).
+     * Snapshot (event_len, event_gen) at Tlopen so subsequent Treads
+     * see a stable view; events appended after Tlopen are visible
+     * only on a re-Tlopen.
+     *
+     * P9.5-PARALLEL-1 lock order: cn->mu (per-conn sessions) outer →
+     * c->event_mu (process-wide event_buf) inner. cn->mu held while
+     * capturing snapshot fields onto the session keeps the alloc-
+     * then-fill atomic from any sibling's perspective. */
     if (k == KIND_EVENTS) {
-        pthread_mutex_lock(&c->mu);
-        ctl_session *s = session_alloc_locked(c, fid, qid_path);
+        pthread_mutex_lock(&cn->mu);
+        ctl_session *s = session_alloc_locked(cn, fid, qid_path);
         if (!s) {
-            pthread_mutex_unlock(&c->mu);
+            pthread_mutex_unlock(&cn->mu);
             return STM_ENOMEM;
         }
         s->uses_event_buf = 1;
+        pthread_mutex_lock(&c->event_mu);
         s->snapshot_len = (c->event_len > UINT32_MAX)
             ? UINT32_MAX
             : (uint32_t)c->event_len;
-        pthread_mutex_unlock(&c->mu);
+        s->snapshot_event_gen = c->event_gen;
+        pthread_mutex_unlock(&c->event_mu);
+        pthread_mutex_unlock(&cn->mu);
         return STM_OK;
     }
 
@@ -2743,72 +2821,89 @@ static stm_status vops_lopen(void *ctx, uint32_t fid, uint64_t qid_path,
             || k == KIND_DATASET_DELETE_SNAPSHOT
             || k == KIND_DATASET_HOLD_SNAPSHOT
             || k == KIND_DATASET_RELEASE_SNAPSHOT) {
-        pthread_mutex_lock(&c->mu);
-        ctl_session *s = session_alloc_locked(c, fid, qid_path);
+        pthread_mutex_lock(&cn->mu);
+        ctl_session *s = session_alloc_locked(cn, fid, qid_path);
         if (!s) {
-            pthread_mutex_unlock(&c->mu);
+            pthread_mutex_unlock(&cn->mu);
             return STM_ENOMEM;
         }
-        pthread_mutex_unlock(&c->mu);
+        pthread_mutex_unlock(&cn->mu);
         return STM_OK;
     }
 
-    pthread_mutex_lock(&c->mu);
-    ctl_session *s = session_alloc_locked(c, fid, qid_path);
+    pthread_mutex_lock(&cn->mu);
+    ctl_session *s = session_alloc_locked(cn, fid, qid_path);
     if (!s) {
-        pthread_mutex_unlock(&c->mu);
+        pthread_mutex_unlock(&cn->mu);
         return STM_ENOMEM;
     }
-    stm_status rc = materialize_locked(c, s);
+    stm_status rc = materialize_locked(cn, s);
     if (rc != STM_OK) {
         session_free_locked(s);
-        pthread_mutex_unlock(&c->mu);
+        pthread_mutex_unlock(&cn->mu);
         return rc;
     }
-    pthread_mutex_unlock(&c->mu);
+    pthread_mutex_unlock(&cn->mu);
     return STM_OK;
 }
 
 static stm_status vops_read(void *ctx, uint32_t fid, uint64_t qid_path,
                               uint64_t offset, void *buf, uint32_t *inout_len)
 {
-    stm_ctl *c = ctx;
+    stm_ctl_conn *cn = ctx;
+    stm_ctl *c = cn->ctl;
     ctl_kind k = qid_kind(qid_path);
     if (k == KIND_MAX || KIND_META[k].is_dir) {
         *inout_len = 0;
         return STM_ENOENT;
     }
-    pthread_mutex_lock(&c->mu);
-    ctl_session *s = session_get_locked(c, fid);
+    pthread_mutex_lock(&cn->mu);
+    ctl_session *s = session_get_locked(cn, fid);
     if (!s) {
         /* Read without prior open — generic stm_lp9_server gates this
          * via per-fid is_open, so we shouldn't get here on the happy
          * path. Defensive: refuse. */
-        pthread_mutex_unlock(&c->mu);
+        pthread_mutex_unlock(&cn->mu);
         *inout_len = 0;
         return STM_EBACKEND;
     }
     if (s->qid_path != qid_path) {
         /* fid bound to a different node than the read targets —
          * client confusion, refuse. */
-        pthread_mutex_unlock(&c->mu);
+        pthread_mutex_unlock(&cn->mu);
         *inout_len = 0;
         return STM_EBACKEND;
     }
-    /* P9-CTL-1d-events: /events reads from c->event_buf directly
-     * (bypasses session->buf since the log can be >1 KiB). The
-     * snapshot_len captured at Tlopen is the upper bound; events
-     * appended after Tlopen are not visible to this fid. */
+    /* P9-CTL-1d-events: /events reads from cn->ctl->event_buf
+     * directly (bypasses session->buf since the log can be >1 KiB).
+     * The snapshot_len captured at Tlopen is the upper bound; events
+     * appended after Tlopen are not visible to this fid.
+     *
+     * P9.5-PARALLEL-1 (R101 P2-1 carry across conns): if a clear-
+     * events action bumped event_gen since this fid's Tlopen, the
+     * snapshot is stale — return EOF so the reader sees the clear
+     * boundary, not zero-padded frankenstein bytes. */
     if (s->uses_event_buf) {
+        pthread_mutex_lock(&c->event_mu);
+        if (s->snapshot_event_gen != c->event_gen) {
+            /* Stale snapshot — clear-events fired since Tlopen.
+             * Return EOF (count=0) so the reader sees a clean cut. */
+            *inout_len = 0;
+            pthread_mutex_unlock(&c->event_mu);
+            pthread_mutex_unlock(&cn->mu);
+            return STM_OK;
+        }
         if (offset >= s->snapshot_len) {
             *inout_len = 0;
-            pthread_mutex_unlock(&c->mu);
+            pthread_mutex_unlock(&c->event_mu);
+            pthread_mutex_unlock(&cn->mu);
             return STM_OK;
         }
         uint32_t avail = s->snapshot_len - (uint32_t)offset;
         if (*inout_len > avail) *inout_len = avail;
         memcpy(buf, c->event_buf + offset, *inout_len);
-        pthread_mutex_unlock(&c->mu);
+        pthread_mutex_unlock(&c->event_mu);
+        pthread_mutex_unlock(&cn->mu);
         return STM_OK;
     }
     /* P9-CTL-1e: bulk-format kinds (currently only /pools/<uuid>/
@@ -2818,24 +2913,24 @@ static stm_status vops_read(void *ctx, uint32_t fid, uint64_t qid_path,
     if (s->bulk_buf) {
         if (offset >= s->bulk_len) {
             *inout_len = 0;
-            pthread_mutex_unlock(&c->mu);
+            pthread_mutex_unlock(&cn->mu);
             return STM_OK;
         }
         uint32_t avail = s->bulk_len - (uint32_t)offset;
         if (*inout_len > avail) *inout_len = avail;
         memcpy(buf, s->bulk_buf + offset, *inout_len);
-        pthread_mutex_unlock(&c->mu);
+        pthread_mutex_unlock(&cn->mu);
         return STM_OK;
     }
     if (offset >= s->len) {
         *inout_len = 0;
-        pthread_mutex_unlock(&c->mu);
+        pthread_mutex_unlock(&cn->mu);
         return STM_OK;
     }
     uint32_t avail = s->len - (uint32_t)offset;
     if (*inout_len > avail) *inout_len = avail;
     memcpy(buf, s->buf + offset, *inout_len);
-    pthread_mutex_unlock(&c->mu);
+    pthread_mutex_unlock(&cn->mu);
     return STM_OK;
 }
 
@@ -2843,7 +2938,8 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
                                uint64_t offset, const void *buf,
                                uint32_t len, uint32_t *out_written)
 {
-    stm_ctl *c = ctx;
+    stm_ctl_conn *cn = ctx;
+    stm_ctl *c = cn->ctl;
     (void)offset; (void)buf;
     *out_written = 0;
     ctl_kind k = qid_kind(qid_path);
@@ -2856,7 +2952,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
      * routed write to this fid without proper open, the gate here
      * catches it. */
     if (k == KIND_ADMIN_CLEAR_EVENTS) {
-        if (!ctl_caller_is_admin(c)) return STM_EACCES;
+        if (!ctl_caller_is_admin(cn)) return STM_EACCES;
         /* R101 P2-2: refuse 0-byte Twrite. The contract says "any
          * data triggers" — 0 bytes isn't data. POSIX `write(fd, _,
          * 0)` is well-defined as no-op-or-implementation-defined,
@@ -2869,40 +2965,36 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         if (len == 0) {
             stm_ctl_log_event(c,
                 "events log clear refused (zero-byte) by uid=%u",
-                (unsigned)c->caller_uid);
+                (unsigned)cn->caller_uid);
             return STM_EINVAL;
         }
-        pthread_mutex_lock(&c->mu);
-        ctl_session *s = session_get_locked(c, fid);
+        pthread_mutex_lock(&cn->mu);
+        ctl_session *s = session_get_locked(cn, fid);
         if (!s || s->qid_path != qid_path) {
-            pthread_mutex_unlock(&c->mu);
+            pthread_mutex_unlock(&cn->mu);
             return STM_EBACKEND;
         }
-        /* Reset the event log. Any data the client sent is ignored —
-         * the trigger is the act of writing, not the content. */
+        pthread_mutex_unlock(&cn->mu);
+        /* Reset the event log AND bump event_gen so every active
+         * /events snapshot (this conn + sibling conns) sees gen mismatch
+         * on its next Tread and returns EOF — the R101 P2-1 frankenstein
+         * fix, extended across conns via event_gen rather than walking
+         * sibling sessions[] tables (we don't have a list of conns; the
+         * gen check is the load-bearing invalidation primitive instead).
+         *
+         * Any data the client sent is ignored — the trigger is the act
+         * of writing, not the content. */
+        pthread_mutex_lock(&c->event_mu);
         if (c->event_buf) {
             stm_ct_memzero(c->event_buf, c->event_cap);
             c->event_len = 0;
         }
-        /* R101 P2-1: invalidate any active /events snapshots. Without
-         * this, a reader holding snapshot_len = N from before the
-         * clear would see N bytes of zeros (post-memset) — a frankenstein
-         * view that violates the documented "snapshot stability"
-         * contract. Reset uses_event_buf and snapshot_len on every
-         * active /events session so subsequent Treads return clean EOF
-         * (count=0). Operators re-Tlopen to see the post-clear log. */
-        for (uint32_t i = 0; i < STM_CTL_MAX_SESSIONS; i++) {
-            ctl_session *e = &c->sessions[i];
-            if (e->active && e->uses_event_buf) {
-                e->uses_event_buf = 0;
-                e->snapshot_len = 0;
-            }
-        }
-        pthread_mutex_unlock(&c->mu);
+        c->event_gen++;
+        pthread_mutex_unlock(&c->event_mu);
         /* Self-log the clear so operators have a marker even after
          * the action runs. */
         stm_ctl_log_event(c, "events log cleared by uid=%u",
-                            (unsigned)c->caller_uid);
+                            (unsigned)cn->caller_uid);
         *out_written = len;
         return STM_OK;
     }
@@ -2934,23 +3026,23 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
      * Failed dispatches return the underlying scrub_* status to the
      * client; the audit log captures the same. */
     if (k == KIND_POOL_SCRUB_TRIGGER) {
-        if (!ctl_caller_is_admin(c)) return STM_EACCES;
+        if (!ctl_caller_is_admin(cn)) return STM_EACCES;
         /* R107 (P8.5 cleanup): post-admin refusals all log per
          * R105 P3-1 doctrine. */
         if (len == 0) {
             stm_ctl_log_event(c,
                 "scrub-trigger uid=%u verb=<zero-byte> result=err:einval",
-                (unsigned)c->caller_uid);
+                (unsigned)cn->caller_uid);
             return STM_EINVAL;
         }
         if (!c->scrub) return STM_EBACKEND;     /* gated at vops_lopen */
-        pthread_mutex_lock(&c->mu);
-        ctl_session *s = session_get_locked(c, fid);
+        pthread_mutex_lock(&cn->mu);
+        ctl_session *s = session_get_locked(cn, fid);
         if (!s || s->qid_path != qid_path) {
-            pthread_mutex_unlock(&c->mu);
+            pthread_mutex_unlock(&cn->mu);
             return STM_EBACKEND;
         }
-        pthread_mutex_unlock(&c->mu);
+        pthread_mutex_unlock(&cn->mu);
         /* R104 P2-1 / F-5: c->mu is INTENTIONALLY released before
          * verb dispatch. The session lookup above is purely a
          * pre-dispatch fid-validity gate — we don't reuse `s` after
@@ -2980,7 +3072,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
             /* whitespace-only body — R107 P8.5 carry: log per doctrine */
             stm_ctl_log_event(c,
                 "scrub-trigger uid=%u verb=<whitespace-only> result=err:einval",
-                (unsigned)c->caller_uid);
+                (unsigned)cn->caller_uid);
             return STM_EINVAL;
         }
 
@@ -3018,13 +3110,13 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         if (!verb_op) {
             /* Unknown verb. Log + refuse. */
             stm_ctl_log_event(c, "scrub-trigger uid=%u verb=<unknown> result=err:einval",
-                                (unsigned)c->caller_uid);
+                                (unsigned)cn->caller_uid);
             return STM_EINVAL;
         }
 
         stm_status rc = verb_op(c->scrub);
         stm_ctl_log_event(c, "scrub-trigger uid=%u verb=%s result=%s%s",
-                            (unsigned)c->caller_uid, verb_str,
+                            (unsigned)cn->caller_uid, verb_str,
                             rc == STM_OK ? "" : "err:",
                             status_short_name(rc));
         if (rc != STM_OK) return rc;
@@ -3058,15 +3150,15 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
          * (zero-byte, whitespace-only, oversize, snapshot.c
          * rejection, name collision, etc.) DO log so the operator
          * has a forensic trail of every authorized attempt. */
-        if (!ctl_caller_is_admin(c)) return STM_EACCES;
+        if (!ctl_caller_is_admin(cn)) return STM_EACCES;
         if (!c->fs) return STM_EBACKEND;     /* gated at vops_lopen */
-        pthread_mutex_lock(&c->mu);
-        ctl_session *s = session_get_locked(c, fid);
+        pthread_mutex_lock(&cn->mu);
+        ctl_session *s = session_get_locked(cn, fid);
         if (!s || s->qid_path != qid_path) {
-            pthread_mutex_unlock(&c->mu);
+            pthread_mutex_unlock(&cn->mu);
             return STM_EBACKEND;
         }
-        pthread_mutex_unlock(&c->mu);
+        pthread_mutex_unlock(&cn->mu);
 
         uint64_t dsid = qid_dataset_id(qid_path);
 
@@ -3075,7 +3167,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         if (len == 0) {
             stm_ctl_log_event(c,
                 "create-snapshot uid=%u dataset=%llu name-len=0 result=err:einval",
-                (unsigned)c->caller_uid, (unsigned long long)dsid);
+                (unsigned)cn->caller_uid, (unsigned long long)dsid);
             return STM_EINVAL;
         }
 
@@ -3091,7 +3183,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
             /* whitespace-only body */
             stm_ctl_log_event(c,
                 "create-snapshot uid=%u dataset=%llu name-len=0 result=err:einval",
-                (unsigned)c->caller_uid, (unsigned long long)dsid);
+                (unsigned)cn->caller_uid, (unsigned long long)dsid);
             return STM_EINVAL;
         }
         /* Refuse names exceeding STM_SNAP_NAME_MAX up front so the
@@ -3102,7 +3194,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         if (end > STM_SNAP_NAME_MAX) {
             stm_ctl_log_event(c,
                 "create-snapshot uid=%u dataset=%llu name-len=%zu result=err:einval",
-                (unsigned)c->caller_uid, (unsigned long long)dsid, end);
+                (unsigned)cn->caller_uid, (unsigned long long)dsid, end);
             return STM_EINVAL;
         }
 
@@ -3112,7 +3204,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
                                                   &snap_id);
         stm_ctl_log_event(c,
             "create-snapshot uid=%u dataset=%llu name-len=%zu result=%s%s snap-id=%llu",
-            (unsigned)c->caller_uid,
+            (unsigned)cn->caller_uid,
             (unsigned long long)dsid,
             end,
             rc == STM_OK ? "" : "err:",
@@ -3134,22 +3226,22 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
      * delete) is a future ergonomic improvement. Today operators
      * read snap-id from /events at create time. */
     if (k == KIND_DATASET_DELETE_SNAPSHOT) {
-        if (!ctl_caller_is_admin(c)) return STM_EACCES;
+        if (!ctl_caller_is_admin(cn)) return STM_EACCES;
         if (!c->fs) return STM_EBACKEND;     /* gated at vops_lopen */
-        pthread_mutex_lock(&c->mu);
-        ctl_session *s = session_get_locked(c, fid);
+        pthread_mutex_lock(&cn->mu);
+        ctl_session *s = session_get_locked(cn, fid);
         if (!s || s->qid_path != qid_path) {
-            pthread_mutex_unlock(&c->mu);
+            pthread_mutex_unlock(&cn->mu);
             return STM_EBACKEND;
         }
-        pthread_mutex_unlock(&c->mu);
+        pthread_mutex_unlock(&cn->mu);
 
         uint64_t dsid = qid_dataset_id(qid_path);
 
         if (len == 0) {
             stm_ctl_log_event(c,
                 "delete-snapshot uid=%u dataset=%llu snap-id=0 result=err:einval",
-                (unsigned)c->caller_uid, (unsigned long long)dsid);
+                (unsigned)cn->caller_uid, (unsigned long long)dsid);
             return STM_EINVAL;
         }
 
@@ -3164,7 +3256,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         if (end == 0) {
             stm_ctl_log_event(c,
                 "delete-snapshot uid=%u dataset=%llu snap-id=0 result=err:einval",
-                (unsigned)c->caller_uid, (unsigned long long)dsid);
+                (unsigned)cn->caller_uid, (unsigned long long)dsid);
             return STM_EINVAL;
         }
 
@@ -3172,7 +3264,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         if (parse_snapshot_id((const char *)buf, end, &snap_id) != 0) {
             stm_ctl_log_event(c,
                 "delete-snapshot uid=%u dataset=%llu snap-id=<bad-parse> result=err:einval",
-                (unsigned)c->caller_uid, (unsigned long long)dsid);
+                (unsigned)cn->caller_uid, (unsigned long long)dsid);
             return STM_EINVAL;
         }
 
@@ -3180,7 +3272,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         stm_status rc = stm_fs_delete_snapshot(c->fs, snap_id, &freed);
         stm_ctl_log_event(c,
             "delete-snapshot uid=%u dataset=%llu snap-id=%llu freed-paddrs=%zu result=%s%s",
-            (unsigned)c->caller_uid,
+            (unsigned)cn->caller_uid,
             (unsigned long long)dsid,
             (unsigned long long)snap_id,
             freed,
@@ -3210,22 +3302,22 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         const char *verb = (k == KIND_DATASET_HOLD_SNAPSHOT)
                               ? "hold-snapshot" : "release-snapshot";
 
-        if (!ctl_caller_is_admin(c)) return STM_EACCES;
+        if (!ctl_caller_is_admin(cn)) return STM_EACCES;
         if (!c->fs) return STM_EBACKEND;     /* gated at vops_lopen */
-        pthread_mutex_lock(&c->mu);
-        ctl_session *s = session_get_locked(c, fid);
+        pthread_mutex_lock(&cn->mu);
+        ctl_session *s = session_get_locked(cn, fid);
         if (!s || s->qid_path != qid_path) {
-            pthread_mutex_unlock(&c->mu);
+            pthread_mutex_unlock(&cn->mu);
             return STM_EBACKEND;
         }
-        pthread_mutex_unlock(&c->mu);
+        pthread_mutex_unlock(&cn->mu);
 
         uint64_t dsid = qid_dataset_id(qid_path);
 
         if (len == 0) {
             stm_ctl_log_event(c,
                 "%s uid=%u dataset=%llu snap-id=0 result=err:einval",
-                verb, (unsigned)c->caller_uid,
+                verb, (unsigned)cn->caller_uid,
                 (unsigned long long)dsid);
             return STM_EINVAL;
         }
@@ -3240,7 +3332,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         if (end == 0) {
             stm_ctl_log_event(c,
                 "%s uid=%u dataset=%llu snap-id=0 result=err:einval",
-                verb, (unsigned)c->caller_uid,
+                verb, (unsigned)cn->caller_uid,
                 (unsigned long long)dsid);
             return STM_EINVAL;
         }
@@ -3249,7 +3341,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
         if (parse_snapshot_id((const char *)buf, end, &snap_id) != 0) {
             stm_ctl_log_event(c,
                 "%s uid=%u dataset=%llu snap-id=<bad-parse> result=err:einval",
-                verb, (unsigned)c->caller_uid,
+                verb, (unsigned)cn->caller_uid,
                 (unsigned long long)dsid);
             return STM_EINVAL;
         }
@@ -3261,7 +3353,7 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
             rc = stm_fs_release_snapshot(c->fs, snap_id);
         stm_ctl_log_event(c,
             "%s uid=%u dataset=%llu snap-id=%llu result=%s%s",
-            verb, (unsigned)c->caller_uid,
+            verb, (unsigned)cn->caller_uid,
             (unsigned long long)dsid,
             (unsigned long long)snap_id,
             rc == STM_OK ? "" : "err:",
@@ -3277,12 +3369,12 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
 
 static void vops_clunk(void *ctx, uint32_t fid, uint64_t qid_path)
 {
-    stm_ctl *c = ctx;
+    stm_ctl_conn *cn = ctx;
     (void)qid_path;
-    pthread_mutex_lock(&c->mu);
-    ctl_session *s = session_get_locked(c, fid);
+    pthread_mutex_lock(&cn->mu);
+    ctl_session *s = session_get_locked(cn, fid);
     if (s) session_free_locked(s);
-    pthread_mutex_unlock(&c->mu);
+    pthread_mutex_unlock(&cn->mu);
 }
 
 static const stm_lp9_vops g_vops = {
@@ -3313,29 +3405,142 @@ stm_status stm_ctl_create(struct stm_fs *fs, stm_ctl **out)
     if (!out) return STM_EINVAL;
     stm_ctl *c = calloc(1, sizeof *c);
     if (!c) return STM_ENOMEM;
-    if (pthread_mutex_init(&c->mu, NULL) != 0) {
+    if (pthread_mutex_init(&c->event_mu, NULL) != 0) {
+        free(c);
+        return STM_EIO;
+    }
+    if (pthread_mutex_init(&c->worker_mu, NULL) != 0) {
+        pthread_mutex_destroy(&c->event_mu);
+        free(c);
+        return STM_EIO;
+    }
+    if (pthread_cond_init(&c->worker_cv, NULL) != 0) {
+        pthread_mutex_destroy(&c->worker_mu);
+        pthread_mutex_destroy(&c->event_mu);
         free(c);
         return STM_EIO;
     }
     c->fs = fs;
     c->pool = NULL;
-    /* P9-CTL-1d-uid: caller credentials default to "unset" sentinel
-     * (uid_t)-1 / (gid_t)-1. With both unset, ctl_caller_is_admin
-     * returns false → admin-only kinds refuse access. Stratumd
-     * stamps real credentials via stm_ctl_set_caller before serving. */
-    c->caller_uid = (uid_t)-1;
-    c->caller_gid = (gid_t)-1;
+    /* admin_uid defaults to "unset" sentinel; stratumd typically calls
+     * stm_ctl_set_admin_uid(geteuid()) at startup so the operator who
+     * runs the daemon gets admin on /ctl/. With admin_uid unset,
+     * ctl_caller_is_admin returns false for any non-root caller —
+     * admin-only kinds refuse access. */
     c->admin_uid  = (uid_t)-1;
+    c->pending_caller_uid = (uid_t)-1;
+    c->pending_caller_gid = (gid_t)-1;
+    /* P9.5-PARALLEL-1: event_gen starts at 1 so a stm_ctl_conn that
+     * captures snapshot_event_gen at Tlopen never sees gen=0; the
+     * stale-snapshot check `snapshot_event_gen != event_gen` then
+     * correctly detects a clear-events that bumped gen 1→2. */
+    c->event_gen = 1;
+    c->worker_count = 0;
     *out = c;
     return STM_OK;
 }
 
+stm_status stm_ctl_conn_create(stm_ctl *ctl,
+                                uid_t caller_uid, gid_t caller_gid,
+                                stm_ctl_conn **out)
+{
+    if (!ctl || !out) return STM_EINVAL;
+    *out = NULL;
+    stm_ctl_conn *cn = calloc(1, sizeof *cn);
+    if (!cn) return STM_ENOMEM;
+    if (pthread_mutex_init(&cn->mu, NULL) != 0) {
+        free(cn);
+        return STM_EIO;
+    }
+    cn->ctl        = ctl;
+    cn->caller_uid = caller_uid;
+    cn->caller_gid = caller_gid;
+    /* sessions[] zero-initialized by calloc — every slot has active=0. */
+
+    /* P9.5-PARALLEL-1 LifecycleNoUAF: increment the shared ctl's
+     * worker_count. stm_ctl_destroy will block on worker_cv until
+     * every live conn has decremented via stm_ctl_conn_destroy, so a
+     * detached worker reading cn->ctl->{fs,pool,event_buf} after the
+     * daemon's shutdown sequence reached stm_ctl_destroy can't UAF. */
+    pthread_mutex_lock(&ctl->worker_mu);
+    ctl->worker_count++;
+    pthread_mutex_unlock(&ctl->worker_mu);
+
+    *out = cn;
+    return STM_OK;
+}
+
+void stm_ctl_conn_destroy(stm_ctl_conn *cn)
+{
+    if (!cn) return;
+
+    /* Defensive: free any session bulk_buf still allocated. The lp9
+     * server's destroy issues vops_clunk for every open fid before
+     * this point, so on the normal path every slot is already
+     * inactive. A forced disconnect (e.g., socket closed mid-write
+     * by the kernel) might leave a slot active; iterate to be safe. */
+    pthread_mutex_lock(&cn->mu);
+    for (uint32_t i = 0; i < STM_CTL_MAX_SESSIONS; i++) {
+        if (cn->sessions[i].active)
+            session_free_locked(&cn->sessions[i]);
+    }
+    pthread_mutex_unlock(&cn->mu);
+    pthread_mutex_destroy(&cn->mu);
+
+    /* Decrement worker_count + broadcast worker_cv so a shutdown-
+     * blocked stm_ctl_destroy can re-check the count. We snapshot the
+     * back-pointer onto a local before freeing cn so a malicious
+     * compiler can't reorder the load past the free. */
+    stm_ctl *ctl = cn->ctl;
+    free(cn);
+
+    pthread_mutex_lock(&ctl->worker_mu);
+    if (ctl->worker_count > 0) ctl->worker_count--;
+    if (ctl->worker_count == 0)
+        pthread_cond_broadcast(&ctl->worker_cv);
+    pthread_mutex_unlock(&ctl->worker_mu);
+}
+
+uid_t stm_ctl_conn_caller_uid(const stm_ctl_conn *cn)
+{
+    if (!cn) return (uid_t)-1;
+    return cn->caller_uid;
+}
+
 stm_status stm_ctl_set_caller(stm_ctl *c, uid_t caller_uid, gid_t caller_gid)
 {
+    /* P9.5-PARALLEL-1: deprecated for production. Production code
+     * (stratumd) binds caller credentials at stm_ctl_conn_create time
+     * via explicit per-accept args; the conn's caller_uid/gid are
+     * IMMUTABLE thereafter and isolated per-connection.
+     *
+     * This function is preserved for the test harness: it stashes
+     * (caller_uid, caller_gid) into a "pending" slot on the shared
+     * stm_ctl that the test helper make_ctl_server() reads when
+     * building its stm_ctl_conn. Tests existed before the API split
+     * and their migration is deferred; the stash isolates them from
+     * the production concurrency hazard since tests are single-
+     * threaded and create at most one conn per call.
+     *
+     * Returns STM_EINVAL on NULL c. Otherwise STM_OK + stash. */
     if (!c) return STM_EINVAL;
-    c->caller_uid = caller_uid;
-    c->caller_gid = caller_gid;
+    c->pending_caller_uid = caller_uid;
+    c->pending_caller_gid = caller_gid;
     return STM_OK;
+}
+
+/* P9.5-PARALLEL-1 test helper: read the stashed caller_uid + caller_gid
+ * from stm_ctl_set_caller. Returns (uid_t)-1 / (gid_t)-1 when unset.
+ * NOT a production API — exposed via an internal forward decl in
+ * tests/test_ctl.c. The forward decl below silences -Wmissing-
+ * prototypes; the function is intentionally not in ctl.h (test-only). */
+void stm_ctl_pending_caller(const stm_ctl *c, uid_t *out_uid, gid_t *out_gid);
+
+void stm_ctl_pending_caller(const stm_ctl *c, uid_t *out_uid, gid_t *out_gid)
+{
+    if (!c) { *out_uid = (uid_t)-1; *out_gid = (gid_t)-1; return; }
+    *out_uid = c->pending_caller_uid;
+    *out_gid = c->pending_caller_gid;
 }
 
 stm_status stm_ctl_set_admin_uid(stm_ctl *c, uid_t admin_uid)
@@ -3347,12 +3552,12 @@ stm_status stm_ctl_set_admin_uid(stm_ctl *c, uid_t admin_uid)
 
 void stm_ctl_drop_all_sessions(stm_ctl *c)
 {
-    if (!c) return;
-    pthread_mutex_lock(&c->mu);
-    for (uint32_t i = 0; i < STM_CTL_MAX_SESSIONS; i++) {
-        if (c->sessions[i].active) session_free_locked(&c->sessions[i]);
-    }
-    pthread_mutex_unlock(&c->mu);
+    /* P9.5-PARALLEL-1: deprecated no-op. Sessions[] live on
+     * stm_ctl_conn now and die with the conn via stm_ctl_conn_destroy.
+     * The "drop_all between sequential connections" idiom is obsolete
+     * under concurrent accept. Preserved as a stub so out-of-tree
+     * callers still link. */
+    (void)c;
 }
 
 stm_status stm_ctl_attach_pool(stm_ctl *c, struct stm_pool *pool)
@@ -3388,8 +3593,18 @@ stm_status stm_ctl_attach_scrub(stm_ctl *c, struct stm_scrub *scrub)
 void stm_ctl_destroy(stm_ctl *c)
 {
     if (!c) return;
-    for (uint32_t i = 0; i < STM_CTL_MAX_SESSIONS; i++)
-        if (c->sessions[i].active) session_free_locked(&c->sessions[i]);
+    /* P9.5-PARALLEL-1: wait until every live stm_ctl_conn has been
+     * destroyed before tearing the shared state down. Detached /ctl/
+     * workers may still be inside a vops dispatch reading c->fs /
+     * c->event_buf when the daemon's shutdown sequence reaches us;
+     * the refcount on worker_count + the cv broadcast in
+     * stm_ctl_conn_destroy let us block until every in-flight worker
+     * unwinds. This is the LifecycleNoUAF invariant from
+     * v2/specs/ctl_conn.tla, enforced at the C boundary. */
+    pthread_mutex_lock(&c->worker_mu);
+    while (c->worker_count > 0)
+        pthread_cond_wait(&c->worker_cv, &c->worker_mu);
+    pthread_mutex_unlock(&c->worker_mu);
     /* P9-CTL-1d-events: release the event log buffer. Zero before
      * free — the log may contain operationally-sensitive context
      * (uids, dataset names, etc.) that an attacker recovering freed
@@ -3402,7 +3617,9 @@ void stm_ctl_destroy(stm_ctl *c)
         stm_ct_memzero(c->event_buf, c->event_cap);
         free(c->event_buf);
     }
-    pthread_mutex_destroy(&c->mu);
+    pthread_cond_destroy(&c->worker_cv);
+    pthread_mutex_destroy(&c->worker_mu);
+    pthread_mutex_destroy(&c->event_mu);
     free(c);
 }
 

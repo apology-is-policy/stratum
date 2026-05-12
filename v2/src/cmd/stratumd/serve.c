@@ -501,29 +501,29 @@ stm_status stm_stratumd_serve_ctl_client(int fd, stm_ctl *ctl,
         (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
     }
 
-    /* Stamp peer credentials onto the stm_ctl BEFORE the first
-     * stm_lp9_server_handle (P9-CTL-1d-uid timing rule R97 P2-2).
-     * Without this, the admin gate fails-closed for every kind that
-     * declares admin_required — even root-launched clients can't
-     * read /admin/peer.
-     *
-     * stm_ctl_set_caller writes c->caller_uid + c->caller_gid; the
-     * stm_ctl trigger row's R97 P2-2 timing rule is satisfied by
-     * the strict pre-handle ordering here. */
-    stm_status set_rc = stm_ctl_set_caller(ctl, peer_uid, peer_gid);
-    if (set_rc != STM_OK) {
+    /* P9.5-PARALLEL-1: allocate a per-connection wrapper that pins the
+     * peer's identity AND owns the per-fid sessions[] table for this
+     * /ctl/ connection. The conn's caller_uid/gid are IMMUTABLE
+     * thereafter; concurrent /ctl/ accept (the chunk's goal) is then
+     * confused-deputy-safe because no shared scalar is overwritten
+     * per-connection. The shared stm_ctl exposes only immutable
+     * subsystem pointers (fs/pool/scrub/admin_uid) + the audit log
+     * (event_buf, event_mu-guarded) + the worker-count refcount
+     * (worker_mu / worker_cv that this destroy-time of stm_ctl waits
+     * on). */
+    stm_ctl_conn *cn = NULL;
+    stm_status rc = stm_ctl_conn_create(ctl, peer_uid, peer_gid, &cn);
+    if (rc != STM_OK) {
         close(fd);
-        return set_rc;
+        return rc;
     }
 
     stm_lp9_server *srv = NULL;
-    stm_status rc = stm_lp9_server_create(stm_ctl_vops(), ctl,
-                                              stm_ctl_root(ctl),
-                                              msize_max, &srv);
+    rc = stm_lp9_server_create(stm_ctl_vops(), cn,
+                                  stm_ctl_root(ctl),
+                                  msize_max, &srv);
     if (rc != STM_OK) {
-        /* Reset caller to unset sentinel before bailing — leaked
-         * credentials are a confused-deputy hole. */
-        (void)stm_ctl_set_caller(ctl, (uid_t)-1, (gid_t)-1);
+        stm_ctl_conn_destroy(cn);
         close(fd);
         return rc;
     }
@@ -534,7 +534,7 @@ stm_status stm_stratumd_serve_ctl_client(int fd, stm_ctl *ctl,
         free(req);
         free(resp);
         stm_lp9_server_destroy(srv);
-        (void)stm_ctl_set_caller(ctl, (uid_t)-1, (gid_t)-1);
+        stm_ctl_conn_destroy(cn);
         close(fd);
         return STM_ENOMEM;
     }
@@ -570,25 +570,53 @@ stm_status stm_stratumd_serve_ctl_client(int fd, stm_ctl *ctl,
 
     free(req);
     free(resp);
+    /* Destroy order matters: server FIRST (issues vops_clunk on every
+     * open fid; those vops still need the conn alive), then conn
+     * (which decrements stm_ctl::worker_count and broadcasts
+     * worker_cv so a shutdown-blocked stm_ctl_destroy can unblock). */
     stm_lp9_server_destroy(srv);
-
-    /* CLAUDE.md /ctl/ trigger row clause 7 (R101 P1-1): drop all
-     * sessions between connections so a leaked session from
-     * connection N can't pre-empt connection N+1's fid allocations.
-     * The clause documents this as MANDATORY for any sequential
-     * accept loop integrating /ctl/. */
-    stm_ctl_drop_all_sessions(ctl);
-
-    /* Reset caller to unset sentinel after serve returns — fail-
-     * closed posture for the brief window between connections.
-     * Without this, the next connection would see the previous
-     * peer's caller until set_caller fires again. The next accept's
-     * set_caller will overwrite, but defense-in-depth here covers
-     * a hypothetical bug where set_caller gets skipped. */
-    (void)stm_ctl_set_caller(ctl, (uid_t)-1, (gid_t)-1);
+    stm_ctl_conn_destroy(cn);
 
     close(fd);
     return rc;
+}
+
+/* P9.5-PARALLEL-1: per-connection worker context for the concurrent
+ * /ctl/ accept loop. Mirrors stratumd_fs_worker_ctx (SWISS-4g) — every
+ * accepted client gets a detached pthread that runs serve_ctl_client
+ * to completion. The stm_ctl::worker_count refcount bracketing of
+ * stm_ctl_conn_create/_destroy makes daemon shutdown wait until every
+ * in-flight worker drains before tearing the shared ctl down. */
+typedef struct {
+    int       client_fd;
+    stm_ctl  *ctl;
+    uid_t     peer_uid;
+    gid_t     peer_gid;
+    uint32_t  msize_max;
+    uint32_t  idle_timeout_ms;
+} stratumd_ctl_worker_ctx;
+
+static void *stratumd_ctl_worker(void *arg)
+{
+    /* R113 P1-1 carry: block fatal signals inside the worker so
+     * SIGINT/SIGTERM/SIGHUP/SIGQUIT route to the daemon's main
+     * thread (which observes stop_flag → drives shutdown). Same
+     * posture as stratumd_fs_worker above. */
+    sigset_t block;
+    sigemptyset(&block);
+    sigaddset(&block, SIGINT);
+    sigaddset(&block, SIGTERM);
+    sigaddset(&block, SIGHUP);
+    sigaddset(&block, SIGQUIT);
+    (void)pthread_sigmask(SIG_BLOCK, &block, NULL);
+
+    stratumd_ctl_worker_ctx *ctx = arg;
+    (void)stm_stratumd_serve_ctl_client(ctx->client_fd, ctx->ctl,
+                                            ctx->peer_uid, ctx->peer_gid,
+                                            ctx->msize_max,
+                                            ctx->idle_timeout_ms);
+    free(ctx);
+    return NULL;
 }
 
 stm_status stm_stratumd_accept_ctl_loop(int listen_fd, stm_ctl *ctl,
@@ -654,9 +682,37 @@ stm_status stm_stratumd_accept_ctl_loop(int listen_fd, stm_ctl *ctl,
             peer_gid = (gid_t)getgid();
         }
 
-        (void)stm_stratumd_serve_ctl_client(client_fd, ctl,
-                                                peer_uid, peer_gid,
-                                                msize_max, idle_timeout_ms);
+        /* P9.5-PARALLEL-1: spawn a detached pthread per /ctl/ connection
+         * (mirror SWISS-4g FS pattern). Required because long-lived
+         * /ctl/ clients (TUI pollers, Prometheus scrapers, future
+         * kernel-9P mounts) previously starved each other on the
+         * single serial accept slot — see
+         * v2/docs/p9.5-parallel-1-design.md §1. */
+        stratumd_ctl_worker_ctx *wctx = malloc(sizeof *wctx);
+        if (!wctx) {
+            close(client_fd);
+            continue;
+        }
+        wctx->client_fd       = client_fd;
+        wctx->ctl             = ctl;
+        wctx->peer_uid        = peer_uid;
+        wctx->peer_gid        = peer_gid;
+        wctx->msize_max       = msize_max;
+        wctx->idle_timeout_ms = idle_timeout_ms;
+
+        pthread_t tid;
+        int wprc = pthread_create(&tid, NULL, stratumd_ctl_worker, wctx);
+        if (wprc != 0) {
+            fprintf(stderr,
+                "stratumd: pthread_create for /ctl/ worker failed (rc=%d)\n",
+                wprc);
+            close(client_fd);
+            free(wctx);
+            continue;
+        }
+        /* Detached: stm_ctl::worker_count + stm_ctl_destroy's wait-on-
+         * worker_cv handle the shutdown ordering. No join needed. */
+        (void)pthread_detach(tid);
     }
     return STM_OK;
 }
