@@ -38,7 +38,48 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9-CTL-2b /ctl/ codec migration to lp9 (this commit).
+- **Tip**: P9.5-PARALLEL-1 — stm_ctl_conn split + concurrent /ctl/
+  accept + R131 audit close + #961 dedicated concurrent regression
+  tests (this commit). `v2/include/stratum/ctl.h` declares the new
+  per-connection wrapper API (`stm_ctl_conn_create` / `_destroy` /
+  `_caller_uid`); `v2/src/ctl/synfs.c` splits `stm_ctl` into a
+  shared core (immutable subsystem pointers + event_buf+event_gen
+  under event_mu + worker-count refcount under worker_mu/worker_cv)
+  and a per-connection `stm_ctl_conn` (immutable caller_uid +
+  per-conn sessions[] under per-conn mu). Every vops_* now takes
+  ctx as `stm_ctl_conn *`. `stm_ctl_destroy` blocks on worker_cv
+  until every live conn has destroyed (LifecycleNoUAF from
+  `v2/specs/ctl_conn.tla`). stratumd's `serve_ctl_client` calls
+  `stm_ctl_conn_create(ctl, peer_uid, peer_gid, &cn)` per accept,
+  passes `cn` as vops ctx; `stm_stratumd_accept_ctl_loop` spawns
+  a DETACHED pthread per accept (SWISS-4g pattern extended from
+  FS to /ctl/). R113 P1-1 signal-mask discipline applies to BOTH
+  worker types. The /admin/clear-events handler bumps a process-
+  wide `event_gen` counter so concurrent /events readers across
+  sibling conns observe a stale-snapshot EOF (no zero-padded
+  frankenstein bytes); replaces the pre-P9.5 cross-conn
+  sessions[] walk. Test gates: `tests/test_ctl_concurrent.c` (5
+  in-process tests for caller isolation + per-conn fid namespace
+  + cross-conn event_gen invalidation + 4-way no-collision +
+  create-input validation), `tests/test_ctl_conn_lifecycle.c` (6
+  tests — destroy-blocks-on-cv + many short conns + NULL safety
+  + caller_uid accessor), `v2/tools/stratum/tests/concurrent_ctl.rs`
+  e2e (2 tests for two-client + three-client wall-time bounds).
+  SWISS-8k disconnect-between-ticks workaround retired in
+  `v2/tools/stratum/src/{volmap,snapgraph}.rs` — TUI pollers
+  hold long-lived /ctl/ connections again. R131 audit found 0
+  P0/P1; 3 P2 doc-drift items closed inline (ctl.h Concurrency
+  docstring rewritten to describe stm_ctl_conn split,
+  stm_ctl_set_caller docstring updated to describe actual STM_OK
+  test-stash behavior, synfs.c lock-order doctrine extended with
+  the `cn->mu → event_mu` nesting on /events snapshot-capture
+  paths). 53/53 ctest GREEN (+2 new binaries: test_ctl_concurrent
+  + test_ctl_conn_lifecycle, 11 new tests total); 97/97 Rust
+  unit + 33/33 e2e_crud + 2/2 concurrent_ctl. CLAUDE.md /ctl/
+  row + stratumd row updated. Outstanding sub-task: #958 (TLC
+  verify ctl_conn.tla, tooling-gated).
+
+- **Pre-tip-1**: P9-CTL-2b /ctl/ codec migration to lp9.
   `v2/src/ctl/synfs.c` + `v2/include/stratum/ctl.h` + `v2/tests/test_ctl.c`
   all re-keyed from `stm_p9_server` (9P2000 vops) to `stm_lp9_server`
   (.L vops). The `KIND_META[]` table, `qid_path` encoding, materializer

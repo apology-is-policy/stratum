@@ -2,7 +2,8 @@
 /*
  * stratumd — Unix-socket transport for the Stratum 9P2000.L server.
  *
- * Architecture (ARCH §10.4 / ROADMAP-V2 §12 / Phase 9 P9-9P-4 + P9-CTL-2c):
+ * Architecture (ARCH §10.4 / ROADMAP-V2 §12 / Phase 9 P9-9P-4 +
+ *                P9-CTL-2c + P9.5-PARALLEL-1):
  *   - One stratumd process owns one mounted `stm_fs *`.
  *   - Listens on UP TO TWO Unix sockets (P9-CTL-2c):
  *       a. FS socket (default `/var/run/stratum.sock`, or any caller-
@@ -10,34 +11,37 @@
  *          stm_fs. Per-connection stm_9p_server (FS-bound .L).
  *       b. /ctl/ socket (caller-specified via `ctl_socket_path`,
  *          opt-in) — speaks 9P2000.L against the operator-state
- *          synthetic FS (stm_ctl). Per-connection stm_lp9_server
- *          (generic .L).
- *     Each socket has its own SERIAL accept loop running on a
- *     dedicated pthread (P9-CTL-2c added the second loop). Within
- *     each loop, only one connection is served at a time. Across
- *     loops, the FS thread + /ctl/ thread run concurrently — but
- *     they share state only via stm_fs (whose public API is
- *     thread-safe) and via the wedged-flag (atomic). The /ctl/
- *     instance is owned EXCLUSIVELY by the /ctl/ thread; the FS
- *     thread never touches it. R94 P2-1 stat-after-mutation race
- *     class still applies WITHIN each socket's serial timeline.
- *   - Per-connection: spawn a fresh server (stm_9p_server for FS,
- *     stm_lp9_server for /ctl/) — one fid namespace per connection
- *     per CLAUDE.md / 9p.h / lp9.h doctrine. Serve until the client
- *     disconnects, then destroy the server. The /ctl/ loop calls
- *     `stm_ctl_drop_all_sessions(c)` between connections (R101 P1-1
- *     doctrine — see CLAUDE.md /ctl/ trigger row clause 7).
- *   - Authentication is SO_PEERCRED-derived at v2.0: the connecting
- *     peer's uid/gid are read off the Unix socket and stamped onto
- *     stm_9p_server_create (FS) / stm_ctl_set_caller (CTL). Auth
- *     backend plug-ins (factotum / SASL / token per ARCH §10.10.3)
- *     are forward-noted.
+ *          synthetic FS (stm_ctl). Per-connection stm_lp9_server +
+ *          per-connection stm_ctl_conn (generic .L).
+ *   - CONCURRENT accept on BOTH sockets (P9.5-PARALLEL-1): each
+ *     accept spawns a DETACHED pthread (SWISS-4g pattern) so
+ *     long-lived clients (TUI pollers, Prometheus scrapers,
+ *     Thylacine kernel-9P mounts) don't serialize. v2.0 → v2.1
+ *     swap: pre-P9.5 the /ctl/ loop served one client at a time;
+ *     P9.5-PARALLEL-1 retired that. Workers run independently
+ *     against shared `stm_fs *` / `stm_ctl *`; state-isolation
+ *     invariants from `v2/specs/ctl_conn.tla` (CallerScopedPerConn
+ *     + NoClunkSpillover + LifecycleNoUAF) hold across workers.
+ *   - Per-connection FS: spawn a fresh stm_9p_server — one fid
+ *     namespace per connection (9p.h doctrine).
+ *   - Per-connection /ctl/: allocate a fresh stm_ctl_conn via
+ *     `stm_ctl_conn_create(ctl, peer_uid, peer_gid, &cn)` BEFORE
+ *     stm_lp9_server_create; pass `cn` (not the shared `ctl`) as
+ *     the vops ctx. The conn carries caller credentials + the
+ *     conn's sessions[] table. The shared `stm_ctl *` carries
+ *     immutable subsystem pointers + the audit log + the worker
+ *     refcount. On disconnect: stm_lp9_server_destroy, then
+ *     stm_ctl_conn_destroy (which decrements ctl->worker_count and
+ *     broadcasts ctl->worker_cv).
+ *   - Authentication is SO_PEERCRED-derived at v2.0: the peer's
+ *     uid/gid are read off the Unix socket and stamped onto
+ *     stm_9p_server_create (FS) / stm_ctl_conn_create (/ctl/).
+ *     Auth backend plug-ins (factotum / SASL / token per ARCH
+ *     §10.10.3) are forward-noted.
  *   - stm_ctl admin policy: stratumd calls
- *     `stm_ctl_set_admin_uid(c, geteuid())` once at startup so the
- *     daemon's effective uid is treated as admin. Per-connection,
- *     `stm_ctl_set_caller(c, peer_uid, peer_gid)` is called BEFORE
- *     the first stm_lp9_server_handle (P9-CTL-1d-uid timing rule
- *     R97 P2-2 carry).
+ *     `stm_ctl_set_admin_uid(c, geteuid())` ONCE at startup, BEFORE
+ *     any worker pthread spawn. The pthread_create barrier
+ *     guarantees workers see the post-set value (R97 P2-2 carry).
  *
  * /ctl/ scope (S5-PRE-A): stratumd attaches `stm_fs *` at
  * stm_ctl_create, attaches `stm_fs_pool(fs)` via
@@ -45,24 +49,34 @@
  * stm_scrub_create(stm_fs_sync(fs), ...) that it attaches via
  * stm_ctl_attach_scrub. The production verify cb is installed on
  * the fs's sync so /pools/<uuid>/scrub-trigger has a real verify
- * path. Lifecycle ordering at shutdown is servers → ctl → scrub →
- * sync (R26 P3-4 + ctl.h Lifetime contract). Net result: /ctl/
- * over stratumd surfaces /version, /state, /datasets/, /admin/,
- * /events, /debug/, AND /pools/<uuid>/{devices/, scrub,
- * metrics/prometheus} starting at S5-PRE-A.
+ * path. All attaches MUST complete BEFORE the accept-loop pthread
+ * is spawned (R97 P2-2 carry — worker reads of c->fs / c->pool /
+ * c->scrub are unsynchronised under the concurrent regime,
+ * happens-before-ordered only by the pthread_create barrier).
+ *
+ * Lifecycle ordering at shutdown:
+ *   1. stop_flag observed; FS accept loop exits, /ctl/ accept-
+ *      loop pthread joined after shutdown(2) on the listen fd.
+ *   2. stm_ctl_destroy — blocks on worker_cv until every live
+ *      stm_ctl_conn destroys (LifecycleNoUAF in
+ *      `v2/specs/ctl_conn.tla`). Detached workers each fire
+ *      stm_lp9_server_destroy → stm_ctl_conn_destroy on natural
+ *      client-disconnect, decrementing the count.
+ *   3. stm_scrub_close.
+ *   4. stm_fs_unmount (closes sync).
+ * The scrub_close MUST come BETWEEN ctl_destroy and fs_unmount
+ * (R26 P3-4 + ctl.h Lifetime contract).
  *
  * Spec composition: every per-connection stm_9p_server composes
- * against `v2/specs/fid.tla` + `v2/specs/namespace.tla`. The accept
- * loop's serialization avoids any cross-server interleaving WITHIN
- * one socket; the /ctl/ thread is independently serial. Future
- * concurrent-accept implementations MUST preserve fid.tla /
- * namespace.tla composition under interleaving + extend stm_ctl's
- * sessions[] key from `fid` to `(server_idx, fid)` to handle
- * concurrent /ctl/ serving (CLAUDE.md trigger row R94 P2-1 / R97
- * P2-2 forward-note class).
+ * against `v2/specs/fid.tla` + `v2/specs/namespace.tla`. The
+ * /ctl/ side additionally composes against
+ * `v2/specs/ctl_conn.tla`. Workers run concurrently within and
+ * across sockets; the spec invariants hold by the per-conn
+ * state-isolation discipline + the worker_count refcount.
  *
  * Audit-trigger surface: this module joins CLAUDE.md's trigger list
- * at the P9-9P-4 substantive commit; updated for P9-CTL-2c.
+ * at the P9-9P-4 substantive commit; updated for P9-CTL-2c +
+ * P9.5-PARALLEL-1.
  */
 #ifndef STRATUM_V2_STRATUMD_H
 #define STRATUM_V2_STRATUMD_H

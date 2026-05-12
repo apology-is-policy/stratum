@@ -90,15 +90,36 @@
  * lp9_server's destroy issues vops_clunk for every open fid; the
  * conn's destroy must follow lp9_server's destroy.
  *
- * Lock order (process-wide):
- *   stm_ctl_conn::mu     (per-conn; guards that conn's sessions[])
- *   stm_ctl::event_mu    (guards event_buf)
- *   stm_ctl::worker_mu   (guards worker_count + worker_cv)
+ * Lock order (process-wide, load-bearing):
+ *   stm_ctl_conn::mu     (per-conn; guards that conn's sessions[])      OUTER
+ *   stm_ctl::event_mu    (guards event_buf + event_gen)                  INNER
+ *   stm_ctl::worker_mu   (guards worker_count + worker_cv)               (alone)
  *
- * No path takes two of these simultaneously. event_mu and mu are
- * never nested (materializers that read sessions[] don't append
- * to event_buf inside the same critical section). worker_mu is
- * only at conn create/destroy.
+ * `cn->mu → event_mu` IS NESTED on TWO snapshot-capture paths:
+ *   - vops_lopen for KIND_EVENTS: alloc-session-then-snapshot
+ *     (event_len + event_gen captured into the session under
+ *     event_mu while cn->mu is still held).
+ *   - vops_read for KIND_EVENTS: stale-snapshot recheck + memcpy
+ *     out of event_buf under event_mu while cn->mu is still held.
+ * Both paths take the locks in the ABOVE order; reversing would
+ * deadlock against a future writable kind that takes event_mu
+ * first (e.g., admin/clear-events bumps event_gen under event_mu
+ * but does NOT touch sessions[], so no conflict today).
+ *
+ * worker_mu is taken alone at conn create / destroy + at the
+ * stm_ctl_destroy drain (waits on worker_cv until count == 0).
+ * Never nested with cn->mu or event_mu.
+ *
+ * Subsystem-internal locks (stm_fs->lock, stm_pool::lock,
+ * stm_scrub::lock, stm_snapshot::idx_mu) MAY be acquired
+ * underneath cn->mu by materializers — they're at a lower
+ * lock-order layer and no subsystem calls back into /ctl/, so
+ * no cycle is reachable.
+ *
+ * Future writable kinds that log audit lines from inside a
+ * sessions[]-touching critical section MUST follow the same
+ * order: take cn->mu first, then event_mu (via
+ * stm_ctl_log_event's internal event_mu acquisition).
  *
  * Read paths against subsystem state (`stm_fs *`, `stm_pool *`,
  * `stm_scrub *`) call into those subsystems' own thread-safe
@@ -1486,18 +1507,19 @@ static stm_status materialize_debug_alloc(stm_ctl *c, ctl_session *s)
  * /metrics/prometheus exceeds 1 KiB once per-device + scrub data are
  * emitted (~30 KiB on a 64-device pool with all sections active).
  *
- * Lock posture (R110 P3-5 + P3-8 polish): we don't hold MULTIPLE
- * subsystem locks concurrently. c->mu is held by the caller throughout
- * (vops_lopen's session-alloc loop); within that, the pool / fs / scrub
- * accessors each take their own internal lock SERIALLY (one at a time,
- * none nested). Pool roster snapshot via stm_pool_lock_shared
- * (released before the format pass), fs stats via stm_fs_stats_get +
- * stm_fs_dataset_count (each takes fs's internal lock briefly), scrub
- * status via stm_scrub_status_get (takes scrub's internal mutex). The
- * fs / scrub internal locks are not part of the public surface; the
- * names below are descriptive only. Output is computed from the
- * captured snapshots after every subsystem lock is released, so
- * format-time errors don't pin contended state.
+ * Lock posture (R110 P3-5 + P3-8 polish; P9.5-PARALLEL-1 carry): we
+ * don't hold MULTIPLE subsystem locks concurrently. The per-conn
+ * `cn->mu` is held by the caller throughout (vops_lopen's
+ * session-alloc loop); within that, the pool / fs / scrub accessors
+ * each take their own internal lock SERIALLY (one at a time, none
+ * nested). Pool roster snapshot via stm_pool_lock_shared (released
+ * before the format pass), fs stats via stm_fs_stats_get +
+ * stm_fs_dataset_count (each takes fs's internal lock briefly),
+ * scrub status via stm_scrub_status_get (takes scrub's internal
+ * mutex). The fs / scrub internal locks are not part of the public
+ * surface; the names below are descriptive only. Output is computed
+ * from the captured snapshots after every subsystem lock is
+ * released, so format-time errors don't pin contended state.
  *
  * Trust boundaries:
  *   - Body MUST NOT leak secret bytes: only counters, UUIDs (public
@@ -3043,19 +3065,23 @@ static stm_status vops_write(void *ctx, uint32_t fid, uint64_t qid_path,
             return STM_EBACKEND;
         }
         pthread_mutex_unlock(&cn->mu);
-        /* R104 P2-1 / F-5: c->mu is INTENTIONALLY released before
-         * verb dispatch. The session lookup above is purely a
-         * pre-dispatch fid-validity gate — we don't reuse `s` after
-         * unlock. Releasing c->mu before invoking verb_op keeps the
-         * scrub's internal sc->lock from nesting under c->mu (which
-         * stm_ctl_log_event also takes); the lock order is therefore
-         * sc->lock → release → c->mu. Under v2.0's serial-server
-         * posture this is trivially safe (no concurrent dispatch can
-         * race against `stm_ctl_drop_all_sessions`, which would also
-         * take c->mu). Concurrent-accept upgrades MUST re-strengthen
-         * the validation gate (e.g., per-session refcount that
-         * drop_all_sessions waits on) — same R94 P2-1 / R97 P2-2
-         * forward-note class. */
+        /* R104 P2-1 / F-5 (P9.5-PARALLEL-1 update): cn->mu is
+         * INTENTIONALLY released before verb dispatch. The session
+         * lookup above is purely a pre-dispatch fid-validity gate —
+         * we don't reuse `s` after unlock. Releasing cn->mu before
+         * invoking verb_op keeps the scrub's internal sc->lock out
+         * from under cn->mu so a future audit-log path (which takes
+         * event_mu under cn->mu per the file's top doctrine) can't
+         * end up nesting sc->lock → event_mu in any order.
+         *
+         * Under the concurrent regime, `stm_ctl_drop_all_sessions`
+         * is a no-op (sessions die with their conn at
+         * `stm_ctl_conn_destroy`), so the pre-P9.5 cross-conn race
+         * the old doctrine warned about is unreachable. The
+         * per-conn cn->mu still serializes sibling dispatches
+         * within the SAME conn — verb_op observers may race a
+         * concurrent fid clunk on the same conn, but the verb's
+         * own backend (stm_scrub) does its own consistency checks. */
 
         /* Trim trailing whitespace + newline. The verb table is
          * matched against the trimmed slice. Bound the comparison

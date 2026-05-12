@@ -349,8 +349,11 @@ STM_TEST(stratumd_ctl_session_drain_between_connections)
         stm_9p_close(c);
     }
 
-    /* Connection 2: same path. With drop_all_sessions applied between
-     * connections, conn-2 sees a fresh slate. */
+    /* Connection 2: same path. Per-conn sessions die with the conn
+     * (P9.5-PARALLEL-1: stm_ctl_conn_destroy frees the sessions[] at
+     * connection close; pre-P9.5 this was the drop_all_sessions
+     * doctrine, but the verified end-state is the same — conn-2 sees
+     * a fresh slate, no leaked fids from conn-1). */
     {
         stm_9p_client *c = NULL;
         stm_9p_dial_opts opts = default_dial_opts(100u);

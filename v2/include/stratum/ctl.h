@@ -24,22 +24,38 @@
  * lifecycle, and audit-log doctrine ALL stayed identical — only
  * the wire codec + vops adapter shape changed.
  *
- * Concurrency:
- *   - Internal state (per-fid materialization buffers) is mutex-
- *     guarded.
- *   - Reads of attached subsystem state (stm_fs *) call into those
- *     subsystems' own thread-safe accessors (stm_fs_stats_get).
- *   - A single stm_ctl instance is safe to share across SEQUENTIAL
- *     stm_lp9_server instances (one server at a time, e.g. v2.0
- *     stratumd serial accept). It is NOT safe to share across
- *     CONCURRENT servers: per-fid sessions[] is keyed by fid
- *     alone, and two concurrently-active servers can each issue
- *     fid=1 (server-local namespaces don't dedupe). Future
- *     concurrent-accept transports MUST either give each server a
- *     dedicated stm_ctl, or extend the key to (server_id, fid) —
- *     the same posture src/9p/server.c took at P9-9P-1 with
- *     `lock_owner = (server_idx << 32) | fid`. R94 P2-1 / R95
- *     forward-note class.
+ * Concurrency (P9.5-PARALLEL-1 — stm_ctl_conn split is the regime):
+ *   - `stm_ctl` is PROCESS-WIDE SHARED state: immutable subsystem
+ *     pointers (fs/pool/scrub/admin_uid post-init) + the audit log
+ *     buffer (`event_buf`, guarded by `event_mu` + bump-counter
+ *     `event_gen`) + a worker-count refcount (`worker_count`/
+ *     `worker_mu`/`worker_cv`) used by `stm_ctl_destroy` to block
+ *     until every live conn has drained.
+ *   - `stm_ctl_conn` (allocate via `stm_ctl_conn_create`) is
+ *     PER-CONNECTION state: peer caller_uid/gid (immutable
+ *     post-create), per-fid sessions[] table, per-conn mutex.
+ *     Multiple `stm_ctl_conn` MAY share one `stm_ctl` concurrently;
+ *     each vops dispatch operates on its conn's own sessions[]
+ *     without seeing siblings.
+ *   - Vops dispatch (`stm_ctl_vops`) takes ctx as `stm_ctl_conn *`,
+ *     never `stm_ctl *`. Transports MUST pass the conn pointer
+ *     into `stm_lp9_server_create` as the ctx field.
+ *   - Lifecycle: `stm_ctl_destroy` is safe to call after the last
+ *     server's destroy AND after the last `stm_ctl_conn_destroy`;
+ *     if any conn is still alive when destroy fires, destroy blocks
+ *     on `worker_cv` until the count drops to zero (LifecycleNoUAF
+ *     in `v2/specs/ctl_conn.tla`).
+ *   - Reads of attached subsystem state (stm_fs *, stm_pool *,
+ *     stm_scrub *) call into those subsystems' own thread-safe
+ *     accessors. The attach setters (`stm_ctl_attach_pool` /
+ *     `stm_ctl_attach_scrub`) MUST run BEFORE any worker pthread
+ *     is spawned — the pthread_create barrier provides the
+ *     happens-before for subsequent unsynchronised reads of
+ *     `c->pool` / `c->scrub` from worker threads (R97 P2-2 carry,
+ *     adapted to the concurrent-accept regime).
+ *
+ * Design rationale + state-isolation invariants:
+ *   `v2/specs/ctl_conn.tla` + `v2/docs/p9.5-parallel-1-design.md`.
  *
  * Phase 9 P9-CTL-1 scope (this header):
  *   /                   directory
@@ -247,18 +263,31 @@ uid_t stm_ctl_conn_caller_uid(const stm_ctl_conn *cn);
 /*
  * DEPRECATED (P9.5-PARALLEL-1): caller credentials are now bound at
  * `stm_ctl_conn_create` time and IMMUTABLE for the conn's lifetime.
- * This function is preserved as a no-op stub so out-of-tree callers
- * still link; it returns STM_ENOSYS to surface the contract change
- * loudly. The pre-P9.5 admin gate read `c->caller_uid` from the
- * shared stm_ctl, which under concurrent accept was a confused-
- * deputy hole (last-writer-wins across connections — see
- * `v2/docs/p9.5-parallel-1-design.md` §2.1).
+ * Production code (stratumd) calls `stm_ctl_conn_create(ctl,
+ * peer_uid, peer_gid, &cn)` per accept and passes `cn` (not `ctl`)
+ * as the vops ctx via `stm_lp9_server_create`.
  *
- * Migration: stratumd's per-accept code calls
- * `stm_ctl_conn_create(ctl, peer_uid, peer_gid, &cn)` and passes
- * `cn` (not `ctl`) as the vops ctx via `stm_lp9_server_create`.
+ * Why the pre-P9.5 shape was a hazard: the admin gate read
+ * `c->caller_uid` from the shared stm_ctl, which under concurrent
+ * accept was a confused-deputy hole (last-writer-wins across
+ * connections — see `v2/docs/p9.5-parallel-1-design.md` §2.1).
  *
- * Returns STM_ENOTSUPPORTED unconditionally.
+ * Current behavior: this entry point is RETAINED solely for the
+ * single-threaded test harness migration window. It stashes
+ * (caller_uid, caller_gid) into a transitional slot on the shared
+ * `stm_ctl` so the existing `make_ctl_server(c, &cn)` helper in
+ * `tests/test_ctl.c` can pull the configured uid into a fresh
+ * `stm_ctl_conn`. Production code MUST NOT depend on this stash —
+ * it is single-threaded only.
+ *
+ * Returns:
+ *   STM_EINVAL  on NULL `c`.
+ *   STM_OK      otherwise, with the stash updated.
+ *
+ * Forward-note: when the test harness is migrated to call
+ * `stm_ctl_conn_create` directly with explicit per-test uids, this
+ * function and its stash field SHOULD be removed entirely (and the
+ * `pending_caller_*` fields dropped from `stm_ctl`).
  */
 STM_MUST_USE
 stm_status stm_ctl_set_caller(stm_ctl *c, uid_t caller_uid, gid_t caller_gid);
