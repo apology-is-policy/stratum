@@ -38,8 +38,46 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9.5-PARALLEL-2 — compound-op race-class audit + formal
-  spec + regression test (this commit). The chunk verifies and
+- **Tip**: P9.5-PARALLEL-3 spec phase — per-inode `fs->lock`
+  granularity refinement (this commit; SPEC ONLY, no impl yet). The
+  chunk lays down the formal model + design doc that the multi-commit
+  impl phase (future sessions) will reference.
+  - `v2/docs/p9.5-parallel-3-design.md` enumerates the refinement
+    strategy: three-tier locking (fs->global SH/EX → per-dataset (future)
+    → per-inode mutex), ascending `(dataset_id, ino)` lock acquisition
+    order, classification of every public `stm_fs_*` mutating function
+    into single-inode / 2-inode / 3-inode / 4-inode (rename) /
+    dataset-wide buckets. PARALLEL-2's contract (per-sub linearizable
+    + cross-sub eventually-consistent) is PRESERVED; what changes is
+    `WriterCompoundOpAtomicVsWriter` (one big-fs-lock) refines to
+    `WriterAtomicPerInode` (one writer per inode lock).
+  - `v2/specs/compound_ops_per_inode.tla` extends `compound_ops.tla`
+    with `Inodes` constant + `inode_lock_holder` map + per-writer
+    `op_targets`/`held` sets. 6 invariants: TypeOK,
+    WriterAtomicPerInode, LockOrderPreserved (held is a prefix of
+    op_targets sorted ascending), NoCircularWait (no 2-cycle in the
+    wait-for graph; sufficient for the minimal deadlock counterexample),
+    PerSubsystemLinearizable (inherited), NoNegativeCounters (inherited).
+  - 3 cfgs: main healthy + `compound_ops_per_inode_out_of_order_buggy`
+    (BuggyOutOfOrderAcquire=TRUE; trips LockOrderPreserved /
+    NoCircularWait) + `compound_ops_per_inode_release_one_inode_mid_buggy`
+    (BuggyReleaseOneInodeMid=TRUE; trips LockOrderPreserved). Each cfg
+    header documents the expected TLC verdict.
+  - Bounds: Writers={w1,w2}, NumInodes=2, MaxOps=2, MaxStepsPerOp=1.
+    The 2-inode × 2-writer model is the minimal counterexample for
+    cyclic-wait deadlock under out-of-order acquisition.
+  - **No CLAUDE.md change in this commit** — the audit-trigger
+    surfaces are still under the big-fs-lock regime; future impl
+    commits will update CLAUDE.md per the chunk plan in design doc §6.
+  - **No code change in this commit** — fs.c, inode.c, REFERENCE.md
+    only see the spec + design doc land. ctest unchanged 54/54 GREEN.
+  - Outstanding sub-tasks: TLC verification of
+    `compound_ops_per_inode.tla` (tooling-gated like #958/#966); the
+    impl phase (steps 2-9 in design doc §6) is multi-commit and
+    deferred to fresh sessions.
+
+- **Pre-tip-1**: P9.5-PARALLEL-2 — compound-op race-class audit + formal
+  spec + regression test. The chunk verifies and
   documents the contract that emerges under post-PARALLEL-1
   concurrent /ctl/: **per-subsystem linearizable + cross-subsystem
   eventually-consistent** reads.
@@ -84,7 +122,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   - Outstanding: TLC verification of compound_ops.tla (tooling-gated
     like #958; expected verdicts documented in each cfg header).
 
-- **Pre-tip-1**: P9.5-PARALLEL-1 — stm_ctl_conn split + concurrent /ctl/
+- **Pre-tip-2**: P9.5-PARALLEL-1 — stm_ctl_conn split + concurrent /ctl/
   accept + R131 audit close + #961 dedicated concurrent regression
   tests. `v2/include/stratum/ctl.h` declares the new
   per-connection wrapper API (`stm_ctl_conn_create` / `_destroy` /
@@ -125,7 +163,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   row + stratumd row updated. Outstanding sub-task: #958 (TLC
   verify ctl_conn.tla, tooling-gated).
 
-- **Pre-tip-1**: P9-CTL-2b /ctl/ codec migration to lp9.
+- **Pre-tip-3**: P9-CTL-2b /ctl/ codec migration to lp9.
   `v2/src/ctl/synfs.c` + `v2/include/stratum/ctl.h` + `v2/tests/test_ctl.c`
   all re-keyed from `stm_p9_server` (9P2000 vops) to `stm_lp9_server`
   (.L vops). The `KIND_META[]` table, `qid_path` encoding, materializer
