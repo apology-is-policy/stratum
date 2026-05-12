@@ -229,12 +229,13 @@ persistence fields. The module takes its own lock only — no cross-
 layer dependencies. Caller (sync.c) MUST not hold any other inode-
 comparable lock when invoking these APIs.
 
-### Per-inode locks (P9.5-PARALLEL-3 impl-1)
+### Per-inode locks (P9.5-PARALLEL-3 impl-1, impl-2)
 
 ```c
 struct stm_inode_handle;
-stm_status stm_inode_pin   (idx, dataset_id, ino, **handle);
-void       stm_inode_unpin (idx, handle);
+stm_status stm_inode_pin     (idx, dataset_id, ino, **handle);
+void       stm_inode_unpin   (idx, handle);
+stm_status stm_inode_pin_two (idx, ds_a, ino_a, ds_b, ino_b, **out_a, **out_b);
 ```
 
 Per-inode mutex held by an opaque handle. Allocated from a fixed
@@ -245,11 +246,28 @@ inode mutexes concurrently while a third writer briefly bumps a
 refcount under `idx->lock`. Once the last unpin drops refcount to
 zero, the slot is removed from the chain + freed.
 
+`stm_inode_pin_two` (impl-2) acquires two inode pins in canonical
+ASCENDING `(dataset_id, ino)` order regardless of caller-specified
+slot order; handles return in caller slot order. Same-(ds, ino) call
+refused with STM_EINVAL (would deadlock on the ERRORCHECK mutex's
+double-lock check otherwise). The ascending-order rule is the
+canonical Linux vnode lock-ordering discipline; two writers pinning
+the same pair via this helper cannot cycle.
+
 The fs.c layer takes `stm_inode_pin` (under `fs->global` SH) for the
-duration of a per-inode compound op (chmod / chown / utimens at impl-1;
-extending to truncate / setattr / write / fallocate / migrate /
-seal / xattr at impl-2..5). Spec composition realizes the
-`inode_lock_holder[i] = w` action of `compound_ops_per_inode.tla`.
+duration of a per-inode compound op:
+
+  - impl-1: chmod / chown / utimens (single-inode setattr)
+  - impl-2: unlink / rmdir / create_file / mkdir / symlink /
+    linkat_anon / unlink_anon / create_anon / link / link_by_ino
+    (2-inode parent+child OR src+dst; create-shape uses parent-pin
+    then fresh-child-pin per design doc §3.4; delete-shape uses the
+    TOCTOU lookup-pin-reverify loop per §3.3)
+  - impl-3..5 (forward): rename overwrite + cross-dataset ops +
+    drop residual EX takes
+
+Spec composition realizes the `inode_lock_holder[i] = w` action of
+`compound_ops_per_inode.tla`.
 
 **TOCTOU posture**: pin re-validates `(dataset_id, ino)` is still
 ALLOCATED under both `idx->lock` and the per-inode mutex before
@@ -359,7 +377,9 @@ Spec actions: `AllocFresh`, `AllocReused`, `AllocAnon`, `Link`,
 | Persistence (load_at + commit) | LIVE | v24 format break |
 | Merkle root binding | LIVE | `inode_csum` is the 1st input to `compute_merkle_root` |
 | Per-inode mutex (pin/unpin) | LIVE | P9.5-PARALLEL-3 impl-1; 256-bucket hash table; chmod/chown/utimens ported |
-| Multi-inode lock-order (pin in ascending order) | LIVE — caller discipline | impl-2..5 ports multi-inode ops (unlink/mkdir/link/rename/copy_file_range) |
+| stm_inode_pin_two (sorted 2-inode pin) | LIVE | P9.5-PARALLEL-3 impl-2; ascending-order helper |
+| 2-inode ops ported (parent+child OR src+dst) | LIVE | impl-2: unlink/rmdir/create_file/mkdir/symlink/linkat_anon/unlink_anon/create_anon/link/link_by_ino |
+| Multi-inode lock-order (pin in ascending order) | LIVE — caller discipline | impl-3..5 ports remaining (rename overwrite / cross-dataset ops) |
 
 Audit class: any change to allocator paths (alloc / alloc_anon /
 materialize / free), gen arithmetic, or persistence validators MUST

@@ -412,6 +412,9 @@ STM_TEST(per_inode_chmod_disjoint_inodes_no_deadlock) {
     /* Create a child dataset and two files in it. */
     uint64_t ds_id = 0;
     STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "per_inode_ds", &ds_id));
+    uint64_t root_ino = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, ds_id, 0755u, 0, 0, &root_ino));
+    STM_ASSERT_EQ(root_ino, 1u);
     uint64_t ino_a = 0, ino_b = 0;
     STM_ASSERT_OK(stm_fs_create_file(fs, ds_id, /*parent=*/1, (const uint8_t *)"a", 1,
                                         0100644, 0, 0, &ino_a));
@@ -459,6 +462,9 @@ STM_TEST(per_inode_chmod_same_inode_serializes) {
 
     uint64_t ds_id = 0;
     STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "per_inode_same_ds", &ds_id));
+    uint64_t root_ino = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, ds_id, 0755u, 0, 0, &root_ino));
+    STM_ASSERT_EQ(root_ino, 1u);
     uint64_t ino = 0;
     STM_ASSERT_OK(stm_fs_create_file(fs, ds_id, /*parent=*/1, (const uint8_t *)"shared", 6,
                                         0100644, 0, 0, &ino));
@@ -479,6 +485,116 @@ STM_TEST(per_inode_chmod_same_inode_serializes) {
     STM_ASSERT_EQ(0, atomic_load(&cb.err));
     STM_ASSERT_EQ(PER_INODE_ITERATIONS, atomic_load(&ca.completed));
     STM_ASSERT_EQ(PER_INODE_ITERATIONS, atomic_load(&cb.completed));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* ── PARALLEL-3 impl-2: 2-inode op concurrency ──────────────────────── */
+
+#define UNLINK_ITERATIONS    200u
+
+typedef struct {
+    stm_fs *fs;
+    uint64_t dataset_id;
+    uint64_t parent_ino;
+    const char *name_prefix;     /* each thread uses its own prefix */
+    unsigned iterations;
+    atomic_int err;
+    atomic_uint completed;
+    atomic_bool done;
+} create_unlink_ctx;
+
+static void *create_unlink_thread(void *arg)
+{
+    create_unlink_ctx *s = (create_unlink_ctx *)arg;
+    for (unsigned i = 0; i < s->iterations; i++) {
+        char name[64];
+        snprintf(name, sizeof name, "%s_%u", s->name_prefix, i);
+        size_t name_len = strlen(name);
+
+        uint64_t new_ino = 0;
+        stm_status rc = stm_fs_create_file(s->fs, s->dataset_id,
+                                              s->parent_ino,
+                                              (const uint8_t *)name,
+                                              (uint8_t)name_len,
+                                              0100644, 0, 0, &new_ino);
+        if (rc != STM_OK) {
+            atomic_store(&s->err, (int)rc);
+            break;
+        }
+        rc = stm_fs_unlink(s->fs, s->dataset_id, s->parent_ino,
+                              (const uint8_t *)name, (uint8_t)name_len);
+        if (rc != STM_OK) {
+            atomic_store(&s->err, (int)rc);
+            break;
+        }
+        atomic_fetch_add(&s->completed, 1u);
+    }
+    atomic_store(&s->done, true);
+    return NULL;
+}
+
+static bool wait_two_cu(const create_unlink_ctx *a, const create_unlink_ctx *b,
+                            pthread_t at, pthread_t bt)
+{
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (;;) {
+        if (atomic_load(&a->done) && atomic_load(&b->done)) break;
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec - start.tv_sec > DEADLINE_SECONDS) return false;
+        struct timespec ns = { 0, 10 * 1000 * 1000 };
+        nanosleep(&ns, NULL);
+    }
+    (void)pthread_join(at, NULL);
+    (void)pthread_join(bt, NULL);
+    return true;
+}
+
+/* Two writers, each churning create+unlink under the SAME parent dir
+ * but with DISJOINT name prefixes. Their dirent installs and removes
+ * touch the same parent (parent-pin contention) but distinct children
+ * (child-pin disjoint). The TOCTOU re-verify loop in unlink fires
+ * naturally as the two threads's dirent_alloc / dirent_unlink calls
+ * interleave under the dirent layer's internal mutex.
+ *
+ * Catches regressions in: ascending-lock-order in pin_two; TOCTOU
+ * re-verify loop bounds (livelock); R128 P1-1 pre-cleanup composition
+ * under SH+pin; R130 post-reclaim gate. */
+STM_TEST(per_inode_create_unlink_same_parent_disjoint_names) {
+    make_tmp("per_inode_create_unlink_same_parent");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t ds_id = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "cu_ds", &ds_id));
+    uint64_t root_ino = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, ds_id, 0755u, 0, 0, &root_ino));
+    STM_ASSERT_EQ(root_ino, 1u);
+
+    create_unlink_ctx ca = { 0 }, cb = { 0 };
+    ca.fs = fs; ca.dataset_id = ds_id; ca.parent_ino = 1u;
+    ca.name_prefix = "thrA"; ca.iterations = UNLINK_ITERATIONS;
+    cb.fs = fs; cb.dataset_id = ds_id; cb.parent_ino = 1u;
+    cb.name_prefix = "thrB"; cb.iterations = UNLINK_ITERATIONS;
+
+    pthread_t at, bt;
+    STM_ASSERT_EQ(0, pthread_create(&at, NULL, create_unlink_thread, &ca));
+    STM_ASSERT_EQ(0, pthread_create(&bt, NULL, create_unlink_thread, &cb));
+
+    STM_ASSERT(wait_two_cu(&ca, &cb, at, bt));
+
+    STM_ASSERT_EQ(0, atomic_load(&ca.err));
+    STM_ASSERT_EQ(0, atomic_load(&cb.err));
+    STM_ASSERT_EQ(UNLINK_ITERATIONS, atomic_load(&ca.completed));
+    STM_ASSERT_EQ(UNLINK_ITERATIONS, atomic_load(&cb.completed));
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);

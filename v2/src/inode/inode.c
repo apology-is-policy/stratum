@@ -1526,3 +1526,59 @@ void stm_inode_unpin(stm_inode_index *idx, stm_inode_handle *handle) {
     handle_release_locked(idx, handle);
     must_unlock(idx_lock(idx));
 }
+
+/* P9.5-PARALLEL-3 impl-2: pin two inodes in canonical ascending
+ * (dataset_id, ino) order. The caller passes them in arbitrary order;
+ * the helper sorts internally, pins the lower one first, then the
+ * higher. Returns handles in CALLER-SPECIFIED slot order — `*out_a`
+ * corresponds to `(ds_a, ino_a)` regardless of which one got pinned
+ * first.
+ *
+ * On second-pin failure, the first pin is rolled back so the caller
+ * sees an atomic success/fail. */
+stm_status stm_inode_pin_two(stm_inode_index *idx,
+                                uint64_t ds_a, uint64_t ino_a,
+                                uint64_t ds_b, uint64_t ino_b,
+                                stm_inode_handle **out_a,
+                                stm_inode_handle **out_b) {
+    if (!idx || !out_a || !out_b) return STM_EINVAL;
+    if (ds_a == 0u || ino_a == 0u) return STM_EINVAL;
+    if (ds_b == 0u || ino_b == 0u) return STM_EINVAL;
+    if (ds_a == ds_b && ino_a == ino_b) return STM_EINVAL;
+
+    *out_a = NULL;
+    *out_b = NULL;
+
+    /* Determine ascending order on (dataset_id, ino) lex key. */
+    bool a_first = (ds_a < ds_b) || (ds_a == ds_b && ino_a < ino_b);
+
+    uint64_t ds_lo, ino_lo, ds_hi, ino_hi;
+    if (a_first) {
+        ds_lo = ds_a; ino_lo = ino_a;
+        ds_hi = ds_b; ino_hi = ino_b;
+    } else {
+        ds_lo = ds_b; ino_lo = ino_b;
+        ds_hi = ds_a; ino_hi = ino_a;
+    }
+
+    stm_inode_handle *h_lo = NULL;
+    stm_status sl = stm_inode_pin(idx, ds_lo, ino_lo, &h_lo);
+    if (sl != STM_OK) return sl;
+
+    stm_inode_handle *h_hi = NULL;
+    stm_status sh = stm_inode_pin(idx, ds_hi, ino_hi, &h_hi);
+    if (sh != STM_OK) {
+        stm_inode_unpin(idx, h_lo);
+        return sh;
+    }
+
+    /* Distribute handles back to caller's slot order. */
+    if (a_first) {
+        *out_a = h_lo;
+        *out_b = h_hi;
+    } else {
+        *out_a = h_hi;
+        *out_b = h_lo;
+    }
+    return STM_OK;
+}

@@ -512,6 +512,48 @@ stm_status stm_inode_pin(stm_inode_index *idx, uint64_t dataset_id,
 void stm_inode_unpin(stm_inode_index *idx, stm_inode_handle *handle);
 
 /*
+ * P9.5-PARALLEL-3 impl-2: pin two inodes safely.
+ *
+ * Acquires per-inode mutexes for BOTH `(ds_a, ino_a)` AND `(ds_b, ino_b)`
+ * in canonical ASCENDING `(dataset_id, ino)` order, regardless of the
+ * order the caller specifies them. Returns the handles in the order the
+ * caller passed: `*out_a` corresponds to `(ds_a, ino_a)` and `*out_b` to
+ * `(ds_b, ino_b)`.
+ *
+ * The ascending-order rule is the canonical Linux vnode lock-ordering
+ * discipline (matches `lock_two_inodes` in `fs/inode.c`). Two writers
+ * pinning the same pair via this helper cannot cycle — they both
+ * acquire `ino_min` before `ino_max`, so a 2-cycle is impossible.
+ *
+ * Spec composition: realizes the `compound_ops_per_inode.tla` lock-
+ * acquisition rule that writers acquire each target inode in ascending
+ * order from their `op_targets[w]` set. Single-call helper for the
+ * common 2-inode case (unlink, mkdir, link).
+ *
+ * Permitted SAME-(ds, ino) call: when `ds_a == ds_b AND ino_a == ino_b`
+ * this is REFUSED with STM_EINVAL — the caller would otherwise deadlock
+ * on the second pin (same slot mutex, same thread, ERRORCHECK aborts).
+ * Use a single `stm_inode_pin` for that case.
+ *
+ * Refusals:
+ *   - NULL idx OR NULL out_a OR NULL out_b (STM_EINVAL).
+ *   - dataset_id == 0 OR ino == 0 on either pair (STM_EINVAL).
+ *   - ds_a == ds_b AND ino_a == ino_b (STM_EINVAL — see above).
+ *   - Either record missing or FREED (STM_ENOENT; the function rolls
+ *     back the first pin on second-pin failure).
+ *   - STM_ENOMEM if the lock-slot pool can't grow.
+ *
+ * On any non-OK return, BOTH `*out_a` and `*out_b` are set to NULL and
+ * no pin is held.
+ */
+STM_MUST_USE
+stm_status stm_inode_pin_two(stm_inode_index *idx,
+                                uint64_t ds_a, uint64_t ino_a,
+                                uint64_t ds_b, uint64_t ino_b,
+                                stm_inode_handle **out_a,
+                                stm_inode_handle **out_b);
+
+/*
  * Count ALLOCATED inodes in `dataset_id`. FREED records are excluded.
  *
  * Refusals:

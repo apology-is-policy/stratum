@@ -1334,7 +1334,12 @@ static stm_status fs_create_inode_and_link(stm_fs *fs,
                                                 uint8_t  child_dt_type,
                                                 uint64_t *out_child_ino)
 {
-    pthread_rwlock_wrlock(&fs->global);
+    /* PARALLEL-3 impl-2 CREATE-shape: SH + parent pin + fresh-child pin.
+     * The new_ino isn't known until after alloc, but design doc §3.4
+     * notes that pinning new_ino out-of-order is safe — no other
+     * writer can have a reference until we publish via the dirent.
+     * The pin on new_ino is uncontended by construction. */
+    pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
@@ -1344,9 +1349,19 @@ static stm_status fs_create_inode_and_link(stm_fs *fs,
         return STM_EINVAL;
     }
 
+    /* Pin parent first so its type + dirent set are stable across
+     * the alloc + dirent install. */
+    stm_inode_handle *h_parent = NULL;
+    stm_status pp = stm_inode_pin(iidx, dataset_id, parent_ino, &h_parent);
+    if (pp != STM_OK) {
+        pthread_rwlock_unlock(&fs->global);
+        return pp;
+    }
+
     struct stm_inode_value pv = {0};
     stm_status ps = fs_load_parent_dir(iidx, dataset_id, parent_ino, &pv);
     if (ps != STM_OK) {
+        stm_inode_unpin(iidx, h_parent);
         pthread_rwlock_unlock(&fs->global);
         return ps;
     }
@@ -1359,8 +1374,21 @@ static stm_status fs_create_inode_and_link(stm_fs *fs,
     stm_status as = stm_inode_alloc(iidx, dataset_id, full_mode, uid, gid,
                                        &child_ino);
     if (as != STM_OK) {
+        stm_inode_unpin(iidx, h_parent);
         pthread_rwlock_unlock(&fs->global);
         return as;
+    }
+
+    /* Pin the freshly-allocated inode. Until the dirent below
+     * publishes it, no other writer can resolve to it, so this pin
+     * is uncontended (design doc §3.4). */
+    stm_inode_handle *h_child = NULL;
+    stm_status cp = stm_inode_pin(iidx, dataset_id, child_ino, &h_child);
+    if (cp != STM_OK) {
+        (void)stm_inode_free(iidx, dataset_id, child_ino);
+        stm_inode_unpin(iidx, h_parent);
+        pthread_rwlock_unlock(&fs->global);
+        return cp;
     }
 
     /* Read back the alloc'd inode's gen for the dirent's child_gen
@@ -1371,7 +1399,9 @@ static stm_status fs_create_inode_and_link(stm_fs *fs,
     stm_status cs = stm_inode_lookup(iidx, dataset_id, child_ino, &cv);
     if (cs != STM_OK) {
         /* Defensive: should never happen right after alloc. Roll back. */
+        stm_inode_unpin(iidx, h_child);
         (void)stm_inode_free(iidx, dataset_id, child_ino);
+        stm_inode_unpin(iidx, h_parent);
         pthread_rwlock_unlock(&fs->global);
         return cs;
     }
@@ -1388,12 +1418,15 @@ static stm_status fs_create_inode_and_link(stm_fs *fs,
      * inode entirely. Lock-posture infallibility: stm_inode_set
      * cannot fail here (R76 P3-1 / R78 P3-1 argument — every
      * STM_E* return presupposes a state mutation only the
-     * alloc/free path can perform; fs->lock holding excludes
-     * concurrent allocator activity). */
+     * alloc/free path can perform; under our parent + child pin
+     * no other writer can race with the allocator's published state
+     * for this child). */
     fs_stamp_create_times(&cv);
     stm_status ts = stm_inode_set(iidx, dataset_id, child_ino, &cv);
     if (ts != STM_OK) {
+        stm_inode_unpin(iidx, h_child);
         (void)stm_inode_free(iidx, dataset_id, child_ino);
+        stm_inode_unpin(iidx, h_parent);
         pthread_rwlock_unlock(&fs->global);
         return ts;
     }
@@ -1403,12 +1436,16 @@ static stm_status fs_create_inode_and_link(stm_fs *fs,
                                           name, name_len,
                                           child_ino, child_gen, child_dt_type);
     if (ds != STM_OK) {
+        stm_inode_unpin(iidx, h_child);
         (void)stm_inode_free(iidx, dataset_id, child_ino);
+        stm_inode_unpin(iidx, h_parent);
         pthread_rwlock_unlock(&fs->global);
         return ds;
     }
 
     *out_child_ino = child_ino;
+    stm_inode_unpin(iidx, h_child);
+    stm_inode_unpin(iidx, h_parent);
     pthread_rwlock_unlock(&fs->global);
     return STM_OK;
 }
@@ -1520,7 +1557,12 @@ stm_status stm_fs_create_anon(stm_fs *fs, uint64_t dataset_id,
     if (mtype != 0u && mtype != (uint32_t)S_IFREG) return STM_EINVAL;
     uint32_t effective_mode = (mode & 07777u) | (uint32_t)S_IFREG;
 
-    pthread_rwlock_wrlock(&fs->global);
+    /* PARALLEL-3 impl-2: orphan-create is fundamentally just an
+     * allocator action — no other inode is involved, and the new_ino
+     * is unreachable to other writers until the caller publishes it.
+     * SH is sufficient; no pin is needed (no other writer can
+     * resolve to a brand-new orphan that hasn't been linked yet). */
+    pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
@@ -1569,7 +1611,10 @@ stm_status stm_fs_linkat_anon(stm_fs *fs, uint64_t dataset_id,
     stm_status nv = fs_validate_dirent_name(name, name_len);
     if (nv != STM_OK) return nv;
 
-    pthread_rwlock_wrlock(&fs->global);
+    /* PARALLEL-3 impl-2: 2-inode op (parent + existing orphan). Both
+     * ids known upfront — use sorted pin to prevent the 2-cycle
+     * deadlock with a concurrent linkat_anon on the swapped pair. */
+    pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
@@ -1579,10 +1624,30 @@ stm_status stm_fs_linkat_anon(stm_fs *fs, uint64_t dataset_id,
         return STM_EINVAL;
     }
 
+    /* Refuse the degenerate ino == parent_ino case BEFORE pin_two
+     * (which refuses it with STM_EINVAL anyway — keep the message
+     * surface stable). */
+    if (ino == parent_ino) {
+        pthread_rwlock_unlock(&fs->global);
+        return STM_EINVAL;
+    }
+
+    stm_inode_handle *h_parent = NULL;
+    stm_inode_handle *h_child  = NULL;
+    stm_status ps2 = stm_inode_pin_two(iidx, dataset_id, parent_ino,
+                                            dataset_id, ino,
+                                            &h_parent, &h_child);
+    if (ps2 != STM_OK) {
+        pthread_rwlock_unlock(&fs->global);
+        return ps2;
+    }
+
     /* Validate parent is a directory. */
     struct stm_inode_value pv = {0};
     stm_status ps = fs_load_parent_dir(iidx, dataset_id, parent_ino, &pv);
     if (ps != STM_OK) {
+        stm_inode_unpin(iidx, h_parent);
+        stm_inode_unpin(iidx, h_child);
         pthread_rwlock_unlock(&fs->global);
         return ps;
     }
@@ -1594,11 +1659,15 @@ stm_status stm_fs_linkat_anon(stm_fs *fs, uint64_t dataset_id,
     struct stm_inode_value iv = {0};
     stm_status ls = stm_inode_lookup(iidx, dataset_id, ino, &iv);
     if (ls != STM_OK) {
+        stm_inode_unpin(iidx, h_parent);
+        stm_inode_unpin(iidx, h_child);
         pthread_rwlock_unlock(&fs->global);
         return ls;
     }
     uint32_t flags = stm_load_le32(iv.si_flags);
     if (!(flags & STM_INO_FLAG_ORPHAN)) {
+        stm_inode_unpin(iidx, h_parent);
+        stm_inode_unpin(iidx, h_child);
         pthread_rwlock_unlock(&fs->global);
         return STM_EINVAL;
     }
@@ -1607,7 +1676,7 @@ stm_status stm_fs_linkat_anon(stm_fs *fs, uint64_t dataset_id,
     /* Two-step atomicity: install the dirent FIRST (so a failed
      * dirent_alloc leaves the orphan unchanged + caller can retry).
      * On dirent_alloc success, materialize the inode (cannot fail
-     * under fs->lock per R76 P3-1 / R78 P3-1 lock-posture argument).
+     * under our pin per R76 P3-1 / R78 P3-1 lock-posture argument).
      * On a hypothetical post-materialize-rollback we'd need to undo
      * the dirent — but materialize is provably infallible here (no
      * gen / nlink / FREED race), so no rollback path needed. */
@@ -1615,6 +1684,8 @@ stm_status stm_fs_linkat_anon(stm_fs *fs, uint64_t dataset_id,
                                           name, name_len,
                                           ino, child_gen, STM_DT_REG);
     if (das != STM_OK) {
+        stm_inode_unpin(iidx, h_parent);
+        stm_inode_unpin(iidx, h_child);
         pthread_rwlock_unlock(&fs->global);
         return das;
     }
@@ -1623,6 +1694,8 @@ stm_status stm_fs_linkat_anon(stm_fs *fs, uint64_t dataset_id,
         /* Defense-in-depth — best-effort rollback (should never fire). */
         (void)stm_dirent_unlink(didx, dataset_id, parent_ino,
                                      name, name_len);
+        stm_inode_unpin(iidx, h_parent);
+        stm_inode_unpin(iidx, h_child);
         pthread_rwlock_unlock(&fs->global);
         stm_fs_mark_wedged(fs);
         return ms;
@@ -1638,6 +1711,8 @@ stm_status stm_fs_linkat_anon(stm_fs *fs, uint64_t dataset_id,
         (void)stm_inode_set(iidx, dataset_id, ino, &iv2);
     }
 
+    stm_inode_unpin(iidx, h_parent);
+    stm_inode_unpin(iidx, h_child);
     pthread_rwlock_unlock(&fs->global);
     return STM_OK;
 }
@@ -1650,7 +1725,8 @@ stm_status stm_fs_unlink_anon(stm_fs *fs, uint64_t dataset_id,
     if (!fs) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
 
-    pthread_rwlock_wrlock(&fs->global);
+    /* PARALLEL-3 impl-2: single-inode op (just the orphan). SH + pin. */
+    pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
@@ -1659,16 +1735,25 @@ stm_status stm_fs_unlink_anon(stm_fs *fs, uint64_t dataset_id,
         return STM_EINVAL;
     }
 
+    stm_inode_handle *h = NULL;
+    stm_status pp = stm_inode_pin(iidx, dataset_id, ino, &h);
+    if (pp != STM_OK) {
+        pthread_rwlock_unlock(&fs->global);
+        return pp;
+    }
+
     /* Validate the target is an orphan before freeing — caller must
      * use stm_fs_unlink for linked inodes. */
     struct stm_inode_value iv = {0};
     stm_status ls = stm_inode_lookup(iidx, dataset_id, ino, &iv);
     if (ls != STM_OK) {
+        stm_inode_unpin(iidx, h);
         pthread_rwlock_unlock(&fs->global);
         return ls;
     }
     uint32_t flags = stm_load_le32(iv.si_flags);
     if (!(flags & STM_INO_FLAG_ORPHAN)) {
+        stm_inode_unpin(iidx, h);
         pthread_rwlock_unlock(&fs->global);
         return STM_EINVAL;
     }
@@ -1701,6 +1786,7 @@ stm_status stm_fs_unlink_anon(stm_fs *fs, uint64_t dataset_id,
         fs_post_inode_free_reclaim_locked(fs);
     }
 
+    stm_inode_unpin(iidx, h);
     pthread_rwlock_unlock(&fs->global);
     return fs_free;
 }
@@ -1781,6 +1867,13 @@ static void fs_post_inode_free_reclaim_locked(stm_fs *fs)
  * filter: true → child must be S_IFDIR (rmdir), false → child must
  * NOT be S_IFDIR (unlink). On the rmdir path the child must also be
  * empty (count_for_dir == 0). */
+/* P9.5-PARALLEL-3 impl-2: bound retries for the TOCTOU re-validation
+ * loop in fs_unlink_inode_and_dirent. Under high contention a racing
+ * rename could repeatedly change which inode the dirent points at;
+ * cap re-attempts to avoid livelock. 16 attempts is wildly conservative —
+ * the canonical case completes on the first try. */
+#define FS_UNLINK_MAX_ATTEMPTS  16
+
 static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
                                                   uint64_t dataset_id,
                                                   uint64_t parent_ino,
@@ -1788,7 +1881,7 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
                                                   uint8_t name_len,
                                                   bool expect_dir)
 {
-    pthread_rwlock_wrlock(&fs->global);
+    pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
@@ -1798,41 +1891,100 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
         return STM_EINVAL;
     }
 
-    struct stm_inode_value pv = {0};
-    stm_status ps = fs_load_parent_dir(iidx, dataset_id, parent_ino, &pv);
-    if (ps != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
-        return ps;
-    }
-
-    /* Resolve child_ino via dirent lookup. */
+    /* PARALLEL-3 impl-2 lookup-pin-reverify loop. We need to pin BOTH
+     * parent AND child in ascending (ds, ino) order, but child_ino is
+     * only discoverable via a dirent lookup. The pre-pin lookup is
+     * advisory — between it and our pin, a concurrent writer (under
+     * its own pin) could rename the entry to point elsewhere. We
+     * therefore lookup-pin-reverify with bounded retries. */
+    stm_inode_handle *h_parent = NULL;
+    stm_inode_handle *h_child  = NULL;
     uint64_t child_ino = 0;
-    stm_status ds = stm_dirent_lookup(didx, dataset_id, parent_ino,
-                                          name, name_len,
-                                          &child_ino, NULL, NULL);
-    if (ds != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
-        return ds;       /* STM_ENOENT if not linked */
-    }
-
-    /* Verify type. Read child's inode for both type discrimination
-     * AND the rmdir empty-check. */
     struct stm_inode_value cv = {0};
-    stm_status cs = stm_inode_lookup(iidx, dataset_id, child_ino, &cv);
-    if (cs != STM_OK) {
-        /* Dirent points at a missing inode — corruption. Refuse rather
-         * than silently unlink the dirent (which would orphan the
-         * dirent's slot). The pool needs scrub-level recovery. */
-        pthread_rwlock_unlock(&fs->global);
-        return cs;
+    int attempts = 0;
+
+    for (;;) {
+        if (attempts++ >= FS_UNLINK_MAX_ATTEMPTS) {
+            pthread_rwlock_unlock(&fs->global);
+            return STM_EAGAIN;
+        }
+
+        /* Pre-pin lookup. */
+        uint64_t observed_child = 0;
+        stm_status ds = stm_dirent_lookup(didx, dataset_id, parent_ino,
+                                              name, name_len,
+                                              &observed_child, NULL, NULL);
+        if (ds != STM_OK) {
+            pthread_rwlock_unlock(&fs->global);
+            return ds;       /* STM_ENOENT if not linked */
+        }
+
+        /* Pin parent + child in ascending (ds, ino) order. */
+        stm_status ps = stm_inode_pin_two(iidx,
+                                              dataset_id, parent_ino,
+                                              dataset_id, observed_child,
+                                              &h_parent, &h_child);
+        if (ps != STM_OK) {
+            pthread_rwlock_unlock(&fs->global);
+            return ps;       /* STM_ENOENT if parent or child gone */
+        }
+
+        /* Under both pins: re-validate parent is still a dir AND the
+         * dirent still points to observed_child. */
+        struct stm_inode_value pv = {0};
+        stm_status pls = fs_load_parent_dir(iidx, dataset_id, parent_ino, &pv);
+        if (pls != STM_OK) {
+            stm_inode_unpin(iidx, h_parent);
+            stm_inode_unpin(iidx, h_child);
+            pthread_rwlock_unlock(&fs->global);
+            return pls;
+        }
+
+        uint64_t revalidated_child = 0;
+        stm_status rds = stm_dirent_lookup(didx, dataset_id, parent_ino,
+                                                name, name_len,
+                                                &revalidated_child, NULL, NULL);
+        if (rds != STM_OK || revalidated_child != observed_child) {
+            /* Dirent changed between pre-pin lookup and pin. Drop pins
+             * and retry. Common cause: a racing rename swapped the
+             * entry. */
+            stm_inode_unpin(iidx, h_parent);
+            stm_inode_unpin(iidx, h_child);
+            h_parent = NULL;
+            h_child  = NULL;
+            if (rds != STM_OK) {
+                pthread_rwlock_unlock(&fs->global);
+                return rds;
+            }
+            continue;
+        }
+
+        child_ino = observed_child;
+        /* Load child inode value (for type discrimination + empty-check). */
+        stm_status cs = stm_inode_lookup(iidx, dataset_id, child_ino, &cv);
+        if (cs != STM_OK) {
+            /* Dirent points at a missing inode — corruption. Pin
+             * succeeded earlier, so the inode WAS allocated then —
+             * a freed-between-pin-and-load is impossible under our
+             * own pin. Surface the error. */
+            stm_inode_unpin(iidx, h_parent);
+            stm_inode_unpin(iidx, h_child);
+            pthread_rwlock_unlock(&fs->global);
+            return cs;
+        }
+        break;  /* All locks held; cv loaded; proceed below. */
     }
     uint32_t cmode = stm_load_le32(cv.si_mode);
     bool child_is_dir = ((cmode & (uint32_t)S_IFMT) == (uint32_t)S_IFDIR);
     if (expect_dir && !child_is_dir) {
+        stm_inode_unpin(iidx, h_parent);
+        stm_inode_unpin(iidx, h_child);
         pthread_rwlock_unlock(&fs->global);
         return STM_ENOTDIR;
     }
     if (!expect_dir && child_is_dir) {
+        stm_inode_unpin(iidx, h_parent);
+        stm_inode_unpin(iidx, h_child);
         pthread_rwlock_unlock(&fs->global);
         return STM_EISDIR;
     }
@@ -1840,10 +1992,14 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
         size_t n = 0;
         stm_status cn = stm_dirent_count_for_dir(didx, dataset_id, child_ino, &n);
         if (cn != STM_OK) {
+            stm_inode_unpin(iidx, h_parent);
+            stm_inode_unpin(iidx, h_child);
             pthread_rwlock_unlock(&fs->global);
             return cn;
         }
         if (n != 0u) {
+            stm_inode_unpin(iidx, h_parent);
+            stm_inode_unpin(iidx, h_child);
             pthread_rwlock_unlock(&fs->global);
             return STM_ENOTEMPTY;
         }
@@ -1862,6 +2018,8 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
     stm_status us = stm_dirent_unlink(didx, dataset_id, parent_ino,
                                           name, name_len);
     if (us != STM_OK) {
+        stm_inode_unpin(iidx, h_parent);
+        stm_inode_unpin(iidx, h_child);
         pthread_rwlock_unlock(&fs->global);
         return us;
     }
@@ -1992,6 +2150,8 @@ static stm_status fs_unlink_inode_and_dirent(stm_fs *fs,
         fs_post_inode_free_reclaim_locked(fs);
     }
 
+    stm_inode_unpin(iidx, h_parent);
+    stm_inode_unpin(iidx, h_child);
     pthread_rwlock_unlock(&fs->global);
     return STM_OK;
 }
@@ -2243,7 +2403,13 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
     stm_status nv2 = fs_validate_dirent_name(dst_name, dst_name_len);
     if (nv2 != STM_OK) return nv2;
 
-    pthread_rwlock_wrlock(&fs->global);
+    /* PARALLEL-3 impl-2: link is effectively a 2-inode mutation —
+     * src_ino's nlink bumps, dst_parent_ino gets a new dirent.
+     * src_parent_ino is only READ (dirent lookup) and stays under
+     * its own dirent layer's internal mutex protection. Since
+     * src_ino is discovered via dirent lookup, use the TOCTOU
+     * re-verify loop pattern from fs_unlink_inode_and_dirent. */
+    pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
@@ -2253,7 +2419,8 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
         return STM_EINVAL;
     }
 
-    /* Both parents must be directories. */
+    /* Both parents must be directories. Pre-pin check; re-verified
+     * via dirent lookup under pin below. */
     struct stm_inode_value spv = {0};
     stm_status ps1 = fs_load_parent_dir(iidx, dataset_id, src_parent_ino, &spv);
     if (ps1 != STM_OK) {
@@ -2271,16 +2438,79 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
         }
     }
 
-    /* Resolve src dirent → child_ino. */
+    /* Lookup-pin-reverify: src_ino is discovered via dirent lookup,
+     * so a racing rename could move the entry between the pre-pin
+     * lookup and our pin. Bounded retries via the same MAX_ATTEMPTS
+     * cap as fs_unlink_inode_and_dirent. */
+    stm_inode_handle *h_child  = NULL;
+    stm_inode_handle *h_dst_p  = NULL;
     uint64_t child_ino = 0;
     uint64_t child_gen = 0;
     uint8_t  child_type = 0;
-    stm_status ds = stm_dirent_lookup(didx, dataset_id, src_parent_ino,
-                                          src_name, src_name_len,
-                                          &child_ino, &child_gen, &child_type);
-    if (ds != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
-        return ds;     /* STM_ENOENT if src not linked */
+    int attempts = 0;
+
+    for (;;) {
+        if (attempts++ >= FS_UNLINK_MAX_ATTEMPTS) {
+            pthread_rwlock_unlock(&fs->global);
+            return STM_EAGAIN;
+        }
+
+        uint64_t observed_child = 0;
+        uint64_t observed_gen = 0;
+        uint8_t  observed_type = 0;
+        stm_status ds = stm_dirent_lookup(didx, dataset_id, src_parent_ino,
+                                              src_name, src_name_len,
+                                              &observed_child, &observed_gen,
+                                              &observed_type);
+        if (ds != STM_OK) {
+            pthread_rwlock_unlock(&fs->global);
+            return ds;     /* STM_ENOENT if src not linked */
+        }
+        /* Degenerate self-link case (covered by EPERM below since src
+         * would have to be a dir for src == dst_parent_ino to hold —
+         * S_IFDIR refuses regardless). Refuse early so pin_two doesn't
+         * trip on its duplicate guard. */
+        if (observed_child == dst_parent_ino) {
+            pthread_rwlock_unlock(&fs->global);
+            return STM_EINVAL;
+        }
+
+        stm_status ps2 = stm_inode_pin_two(iidx,
+                                                dataset_id, observed_child,
+                                                dataset_id, dst_parent_ino,
+                                                &h_child, &h_dst_p);
+        if (ps2 != STM_OK) {
+            pthread_rwlock_unlock(&fs->global);
+            return ps2;
+        }
+
+        /* TOCTOU re-verify under pins. */
+        uint64_t revalidated_child = 0;
+        uint64_t revalidated_gen = 0;
+        uint8_t  revalidated_type = 0;
+        stm_status rds = stm_dirent_lookup(didx, dataset_id, src_parent_ino,
+                                                src_name, src_name_len,
+                                                &revalidated_child,
+                                                &revalidated_gen,
+                                                &revalidated_type);
+        if (rds != STM_OK || revalidated_child != observed_child ||
+            revalidated_gen != observed_gen ||
+            revalidated_type != observed_type) {
+            stm_inode_unpin(iidx, h_child);
+            stm_inode_unpin(iidx, h_dst_p);
+            h_child = NULL;
+            h_dst_p = NULL;
+            if (rds != STM_OK) {
+                pthread_rwlock_unlock(&fs->global);
+                return rds;
+            }
+            continue;
+        }
+
+        child_ino  = observed_child;
+        child_gen  = observed_gen;
+        child_type = observed_type;
+        break;
     }
 
     /* POSIX forbids hard-link-on-directory; Linux link(2) returns EPERM.
@@ -2292,6 +2522,8 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
      * 9P/FUSE binding layer can now route the EPERM branch directly
      * without a translation hop. */
     if (child_type == STM_DT_DIR) {
+        stm_inode_unpin(iidx, h_child);
+        stm_inode_unpin(iidx, h_dst_p);
         pthread_rwlock_unlock(&fs->global);
         return STM_EPERM;
     }
@@ -2299,6 +2531,8 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
     /* Bump nlink first; rollback if dirent install fails. */
     stm_status ils = stm_inode_link(iidx, dataset_id, child_ino);
     if (ils != STM_OK) {
+        stm_inode_unpin(iidx, h_child);
+        stm_inode_unpin(iidx, h_dst_p);
         pthread_rwlock_unlock(&fs->global);
         return ils;
     }
@@ -2310,7 +2544,7 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
          * doesn't fire here because nlink was just bumped above 1.
          * R74 P3-3 forward-note: the rollback's `(void)`-cast on
          * stm_inode_unlink could theoretically swallow a STM_ECORRUPT
-         * (nlink underflow). Under fs->lock held throughout, the
+         * (nlink underflow). Under child's pin held throughout, the
          * rollback can't actually fail — child_ino was just looked
          * up + linked above, so it's still ALLOCATED with nlink ≥ 2.
          * If the unreachable failure ever triggers, future-us should
@@ -2319,6 +2553,8 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
          * from inode.tla). */
         bool freed_unused = false;
         (void)stm_inode_unlink(iidx, dataset_id, child_ino, &freed_unused);
+        stm_inode_unpin(iidx, h_child);
+        stm_inode_unpin(iidx, h_dst_p);
         pthread_rwlock_unlock(&fs->global);
         return das;       /* STM_EEXIST if name already linked, etc. */
     }
@@ -2330,7 +2566,7 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
      * back nlink but left the bumped ctime persisted (POSIX divergence
      * — Linux ext4 doesn't bump ctime on failed link(2)). Lock-
      * posture infallibility applies (R76 P3-1 argument): under
-     * fs->lock the inode_lookup cannot fail. */
+     * child's pin the inode_lookup cannot fail. */
     {
         struct stm_inode_value cv2 = {0};
         stm_status ls2 = stm_inode_lookup(iidx, dataset_id, child_ino, &cv2);
@@ -2340,6 +2576,8 @@ stm_status stm_fs_link(stm_fs *fs, uint64_t dataset_id,
         }
     }
 
+    stm_inode_unpin(iidx, h_child);
+    stm_inode_unpin(iidx, h_dst_p);
     pthread_rwlock_unlock(&fs->global);
     return STM_OK;
 }
@@ -2366,7 +2604,9 @@ stm_status stm_fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
     stm_status nv = fs_validate_dirent_name(dst_name, dst_name_len);
     if (nv != STM_OK) return nv;
 
-    pthread_rwlock_wrlock(&fs->global);
+    /* PARALLEL-3 impl-2: 2-inode op (src + dst_parent) with both ids
+     * known upfront. SH + sorted pin. */
+    pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
@@ -2376,10 +2616,32 @@ stm_status stm_fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
         return STM_EINVAL;
     }
 
+    /* Same-inode case: src_ino == dst_parent_ino means linking an
+     * inode into itself as a parent — directories are refused below
+     * (S_IFDIR → STM_EPERM), and regular files / symlinks can't be
+     * a parent dir, so this is degenerate. Refuse with STM_EINVAL
+     * (pin_two would otherwise refuse the duplicate too). */
+    if (src_ino == dst_parent_ino) {
+        pthread_rwlock_unlock(&fs->global);
+        return STM_EINVAL;
+    }
+
+    stm_inode_handle *h_src   = NULL;
+    stm_inode_handle *h_dst_p = NULL;
+    stm_status ps2 = stm_inode_pin_two(iidx, dataset_id, src_ino,
+                                            dataset_id, dst_parent_ino,
+                                            &h_src, &h_dst_p);
+    if (ps2 != STM_OK) {
+        pthread_rwlock_unlock(&fs->global);
+        return ps2;
+    }
+
     /* Verify dst_parent is a directory. */
     struct stm_inode_value dpv = {0};
     stm_status ps = fs_load_parent_dir(iidx, dataset_id, dst_parent_ino, &dpv);
     if (ps != STM_OK) {
+        stm_inode_unpin(iidx, h_src);
+        stm_inode_unpin(iidx, h_dst_p);
         pthread_rwlock_unlock(&fs->global);
         return ps;
     }
@@ -2388,6 +2650,8 @@ stm_status stm_fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
     struct stm_inode_value siv = {0};
     stm_status sl = stm_inode_lookup(iidx, dataset_id, src_ino, &siv);
     if (sl != STM_OK) {
+        stm_inode_unpin(iidx, h_src);
+        stm_inode_unpin(iidx, h_dst_p);
         pthread_rwlock_unlock(&fs->global);
         return sl;     /* STM_ENOENT */
     }
@@ -2397,6 +2661,8 @@ stm_status stm_fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
     /* POSIX forbids hard-link-on-directory; Linux link(2) → EPERM.
      * Mirrors stm_fs_link's R82 P2-1 STM_EPERM mapping. */
     if ((src_mode & 0170000u) == 0040000u) {       /* S_IFDIR */
+        stm_inode_unpin(iidx, h_src);
+        stm_inode_unpin(iidx, h_dst_p);
         pthread_rwlock_unlock(&fs->global);
         return STM_EPERM;
     } else if ((src_mode & 0170000u) == 0100000u) {/* S_IFREG */
@@ -2407,6 +2673,8 @@ stm_status stm_fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
         /* Other types (chr/blk/fifo/sock) are unreachable at v2.0 — the
          * fs API only creates regs / dirs / symlinks. Defense-in-depth:
          * refuse to link any unsupported type. */
+        stm_inode_unpin(iidx, h_src);
+        stm_inode_unpin(iidx, h_dst_p);
         pthread_rwlock_unlock(&fs->global);
         return STM_EPERM;
     }
@@ -2416,6 +2684,8 @@ stm_status stm_fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
      * applies). */
     stm_status ils = stm_inode_link(iidx, dataset_id, src_ino);
     if (ils != STM_OK) {
+        stm_inode_unpin(iidx, h_src);
+        stm_inode_unpin(iidx, h_dst_p);
         pthread_rwlock_unlock(&fs->global);
         return ils;     /* STM_EOVERFLOW on UINT32_MAX */
     }
@@ -2425,13 +2695,15 @@ stm_status stm_fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
     if (das != STM_OK) {
         bool freed_unused = false;
         (void)stm_inode_unlink(iidx, dataset_id, src_ino, &freed_unused);
+        stm_inode_unpin(iidx, h_src);
+        stm_inode_unpin(iidx, h_dst_p);
         pthread_rwlock_unlock(&fs->global);
         return das;       /* STM_EEXIST if name already linked, etc. */
     }
 
     /* R81 P3-1: stamp ctime to "now" AFTER dirent_alloc succeeds.
      * Lock-posture infallibility argument applies (R76 P3-1) — under
-     * fs->lock the inode_lookup cannot fail since src_ino was just
+     * our src pin the inode_lookup cannot fail since src_ino was just
      * linked above. */
     {
         struct stm_inode_value cv2 = {0};
@@ -2442,6 +2714,8 @@ stm_status stm_fs_link_by_ino(stm_fs *fs, uint64_t dataset_id,
         }
     }
 
+    stm_inode_unpin(iidx, h_src);
+    stm_inode_unpin(iidx, h_dst_p);
     pthread_rwlock_unlock(&fs->global);
     return STM_OK;
 }
@@ -2477,7 +2751,9 @@ stm_status stm_fs_symlink(stm_fs *fs, uint64_t dataset_id,
         if (target[i] == 0u) return STM_EINVAL;
     }
 
-    pthread_rwlock_wrlock(&fs->global);
+    /* PARALLEL-3 impl-2: CREATE-shape — SH + parent pin + fresh-child pin
+     * (same posture as fs_create_inode_and_link). */
+    pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
@@ -2487,9 +2763,17 @@ stm_status stm_fs_symlink(stm_fs *fs, uint64_t dataset_id,
         return STM_EINVAL;
     }
 
+    stm_inode_handle *h_parent = NULL;
+    stm_status pp = stm_inode_pin(iidx, dataset_id, parent_ino, &h_parent);
+    if (pp != STM_OK) {
+        pthread_rwlock_unlock(&fs->global);
+        return pp;
+    }
+
     struct stm_inode_value pv = {0};
     stm_status ps = fs_load_parent_dir(iidx, dataset_id, parent_ino, &pv);
     if (ps != STM_OK) {
+        stm_inode_unpin(iidx, h_parent);
         pthread_rwlock_unlock(&fs->global);
         return ps;
     }
@@ -2502,8 +2786,18 @@ stm_status stm_fs_symlink(stm_fs *fs, uint64_t dataset_id,
     stm_status as = stm_inode_alloc(iidx, dataset_id, full_mode, uid, gid,
                                        &child_ino);
     if (as != STM_OK) {
+        stm_inode_unpin(iidx, h_parent);
         pthread_rwlock_unlock(&fs->global);
         return as;
+    }
+
+    stm_inode_handle *h_child = NULL;
+    stm_status cp = stm_inode_pin(iidx, dataset_id, child_ino, &h_child);
+    if (cp != STM_OK) {
+        (void)stm_inode_free(iidx, dataset_id, child_ino);
+        stm_inode_unpin(iidx, h_parent);
+        pthread_rwlock_unlock(&fs->global);
+        return cp;
     }
 
     /* Stamp the symlink target into the inode's data union. The
@@ -2512,7 +2806,9 @@ stm_status stm_fs_symlink(stm_fs *fs, uint64_t dataset_id,
     struct stm_inode_value cv = {0};
     stm_status cs = stm_inode_lookup(iidx, dataset_id, child_ino, &cv);
     if (cs != STM_OK) {
+        stm_inode_unpin(iidx, h_child);
         (void)stm_inode_free(iidx, dataset_id, child_ino);
+        stm_inode_unpin(iidx, h_parent);
         pthread_rwlock_unlock(&fs->global);
         return cs;
     }
@@ -2525,7 +2821,9 @@ stm_status stm_fs_symlink(stm_fs *fs, uint64_t dataset_id,
     fs_stamp_create_times(&cv);
     stm_status sse = stm_inode_set(iidx, dataset_id, child_ino, &cv);
     if (sse != STM_OK) {
+        stm_inode_unpin(iidx, h_child);
         (void)stm_inode_free(iidx, dataset_id, child_ino);
+        stm_inode_unpin(iidx, h_parent);
         pthread_rwlock_unlock(&fs->global);
         return sse;
     }
@@ -2537,12 +2835,16 @@ stm_status stm_fs_symlink(stm_fs *fs, uint64_t dataset_id,
                                           name, name_len,
                                           child_ino, child_gen, STM_DT_LNK);
     if (ds != STM_OK) {
+        stm_inode_unpin(iidx, h_child);
         (void)stm_inode_free(iidx, dataset_id, child_ino);
+        stm_inode_unpin(iidx, h_parent);
         pthread_rwlock_unlock(&fs->global);
         return ds;
     }
 
     *out_child_ino = child_ino;
+    stm_inode_unpin(iidx, h_child);
+    stm_inode_unpin(iidx, h_parent);
     pthread_rwlock_unlock(&fs->global);
     return STM_OK;
 }
