@@ -316,9 +316,9 @@ this listing surface inherits the closure).
   until every live `stm_ctl_conn` has destroyed; no in-flight vops
   can dereference a torn-down ctl.
 
-Three buggy configs (`ctl_conn_caller_scope_buggy.cfg`,
-`ctl_conn_clunk_spillover_buggy.cfg`,
-`ctl_conn_lifecycle_uaf_buggy.cfg`) each trip exactly one invariant.
+Three buggy configs (`ctl_conn_shared_caller_buggy.cfg`,
+`ctl_conn_shared_sessions_buggy.cfg`,
+`ctl_conn_destroy_uaf_buggy.cfg`) each trip exactly one invariant.
 
 ## SPEC-TO-CODE mapping
 
