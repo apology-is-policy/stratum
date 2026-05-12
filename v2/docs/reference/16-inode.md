@@ -302,9 +302,8 @@ Spec actions: `AllocFresh`, `AllocReused`, `AllocAnon`, `Link`,
   canonical (Alloc → Free → AllocReused → check gen bumped) scenarios
   + orphan lifecycle (alloc_anon → materialize → unlink → cascade-free)
   + hard-link nlink arithmetic + cascade-free at nlink=0 + reserved-ino
-  refusals + persistence (load_at + commit roundtrip).
-- `tests/test_inode_persist.c` — load_at / commit roundtrip including
-  FREED records + ORPHAN records preserved across mount.
+  refusals + persistence (load_at + commit roundtrip; FREED records +
+  ORPHAN records preserved across mount).
 - `tests/test_fs.c` — composes with fs.c wrappers (`stm_fs_create_file`,
   `_mkdir`, `_unlink`, `_rmdir`, `_link`, `_stat`, `_chmod`, `_chown`,
   `_utimens`, `_add_seals`, etc.).

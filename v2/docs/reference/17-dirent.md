@@ -244,9 +244,8 @@ LookupStopsOnTombstone). Each trips its targeted invariant.
 
 - `tests/test_dirent.c` — direct unit coverage. Every action + the
   canonical chain-integrity scenarios + readdir cursor stability +
-  swap atomicity + whiteout vs tombstone semantic split.
-- `tests/test_dirent_persist.c` — load_at / commit roundtrip
-  including tombstone + whiteout preservation across mount.
+  swap atomicity + whiteout vs tombstone semantic split +
+  load_at / commit roundtrip preserving tombstones + whiteouts.
 - `tests/test_fs.c` — composes with fs.c wrappers (`stm_fs_lookup` /
   `_create_file` / `_mkdir` / `_unlink` / `_rmdir` / `_rename` /
   `_link` / `_readdir`).

@@ -164,7 +164,7 @@ typedef struct {
 /* Connection options for stm_9p_dial_unix. */
 typedef struct {
     /* Maximum message size to negotiate. Pass 0 to use
-     * STM_9P_MSIZE_DEFAULT (64 KiB). The server may downgrade. */
+     * STM_9P_MSIZE_DEFAULT (128 KiB). The server may downgrade. */
     uint32_t msize;
 
     /* Tattach uname (effective Linux user name; "" means use

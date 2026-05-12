@@ -202,9 +202,8 @@ LookupStopsOnTombstone) — each trips its targeted invariant within
 - `tests/test_xattr.c` — direct unit coverage. Set / Get / Remove /
   List / DropForIno happy paths + every refusal + the canonical
   chain-integrity scenarios (collide-on-hash + tombstone-preserves-
-  reachability + replace-in-place + listxattr-skips-tombstones).
-- `tests/test_xattr_persist.c` — load_at / commit roundtrip including
-  tombstone preservation across mount.
+  reachability + replace-in-place + listxattr-skips-tombstones) +
+  load_at / commit roundtrip preserving tombstones across mount.
 - `tests/test_fs.c` — composes with fs.c wrappers
   (`stm_fs_setxattr` / `_get` / `_list` / `_remove`) including the
   POSIX namespace gating.
