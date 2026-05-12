@@ -254,6 +254,17 @@ double-lock check otherwise). The ascending-order rule is the
 canonical Linux vnode lock-ordering discipline; two writers pinning
 the same pair via this helper cannot cycle.
 
+`stm_inode_pin_many` (impl-3) generalises `pin_two` to up to
+`STM_INODE_PIN_MANY_MAX = 16` simultaneous pins. Caller supplies a
+`(dataset_id, ino)` array; the helper sorts internally, refuses
+duplicates upfront, pins in ascending order, and maps handles back
+into caller slot order. Used by `stm_fs_rename` for the 4-inode set
+(src_parent + dst_parent + src_ino + [dst_ino if overwrite/EXCHANGE])
+and reserved for the impl-4 cross-dataset ops. The same ascending-
+order discipline scales to arbitrary N: two writers pinning OVERLAPPING
+target sets cannot cycle because every pair on both writers'
+acquisition stacks is ascending.
+
 The fs.c layer takes `stm_inode_pin` (under `fs->global` SH) for the
 duration of a per-inode compound op:
 
@@ -268,8 +279,13 @@ duration of a per-inode compound op:
     the pin under the "uncontended-by-construction" argument; pinning
     closes a latent race surface should a future feature expose
     new_ino mid-create
-  - impl-3..5 (forward): rename overwrite + cross-dataset ops +
-    drop residual EX takes
+  - impl-3: `stm_fs_rename` — 4-inode atomicity on the overwrite branch
+    (src_parent + dst_parent + src_ino + dst_ino) via `pin_many`. Same
+    pin set on the EXCHANGE branch. TOCTOU re-verify loop covers BOTH
+    src and dst dirents simultaneously (generalises the DELETE-shape
+    single-dirent pattern from impl-2). R128/R130 wiring on dst
+    cascade-free preserved verbatim. R133 P1-2 wedge-defer preserved.
+  - impl-4..5 (forward): cross-dataset ops + drop residual EX takes
 
 Spec composition realizes the `inode_lock_holder[i] = w` action of
 `compound_ops_per_inode.tla`.
@@ -384,7 +400,9 @@ Spec actions: `AllocFresh`, `AllocReused`, `AllocAnon`, `Link`,
 | Per-inode mutex (pin/unpin) | LIVE | P9.5-PARALLEL-3 impl-1; 256-bucket hash table; chmod/chown/utimens ported |
 | stm_inode_pin_two (sorted 2-inode pin) | LIVE | P9.5-PARALLEL-3 impl-2; ascending-order helper |
 | 2-inode ops ported (parent+child OR src+dst) | LIVE | impl-2: unlink/rmdir/create_file/mkdir/symlink/linkat_anon/unlink_anon/create_anon/link/link_by_ino |
-| Multi-inode lock-order (pin in ascending order) | LIVE — caller discipline | impl-3..5 ports remaining (rename overwrite / cross-dataset ops) |
+| stm_inode_pin_many (sorted N-inode pin) | LIVE | P9.5-PARALLEL-3 impl-3; generalises pin_two; cap STM_INODE_PIN_MANY_MAX=16 |
+| 4-inode ops ported (rename overwrite/EXCHANGE) | LIVE | impl-3: stm_fs_rename — TOCTOU re-verify covers both src+dst dirents; R128/R130 wiring preserved on dst cascade-free |
+| Multi-inode lock-order (pin in ascending order) | LIVE — caller discipline | impl-4..5 ports remaining (cross-dataset ops / drop residual EX) |
 
 Audit class: any change to allocator paths (alloc / alloc_anon /
 materialize / free), gen arithmetic, or persistence validators MUST

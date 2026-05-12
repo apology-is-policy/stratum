@@ -3500,14 +3500,20 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
 
     /* R133 P1-2: capture wedge-intent through rollback failures and
      * fire the actual mark_wedged AFTER pthread_rwlock_unlock. Calling
-     * stm_fs_mark_wedged from inside the held wrlock would self-
-     * deadlock on glibc rwlocks (POSIX: same-thread recursive wrlock
-     * is undefined). The wedge sites below are all "should not fire
-     * in current code-paths" defense-in-depth, but the latent
-     * deadlock was real. */
+     * stm_fs_mark_wedged from inside the held rdlock would self-
+     * deadlock on glibc rwlocks (POSIX: same-thread recursive lock is
+     * undefined; readers waiting on a queued writer block here). The
+     * wedge sites below are all "should not fire in current code-
+     * paths" defense-in-depth, but the latent deadlock was real. */
     bool should_wedge = false;
 
-    pthread_rwlock_wrlock(&fs->global);
+    /* PARALLEL-3 impl-3: SH path. Pin up to four inodes
+     * (src_parent + dst_parent + src_ino + dst_ino if overwrite/
+     * EXCHANGE) in canonical ascending (dataset_id, ino) order via
+     * stm_inode_pin_many — the first place NoCircularWait in
+     * compound_ops_per_inode.tla becomes load-bearing under more
+     * than 2 inodes. */
+    pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
     stm_inode_index  *iidx = stm_sync_inode_index(fs->sync);
@@ -3517,102 +3523,273 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
         return STM_EINVAL;
     }
 
-    /* Validate src parent + dst parent are directories. */
+    /* Pre-pin parent validation — fast-path STM_ENOENT/STM_ENOTDIR
+     * before pinning. Post-pin we re-load both parents under pin and
+     * re-check si_mode (TOCTOU defense — between this load and the
+     * pin acquisition a concurrent writer holding the parent's pin
+     * could rmdir it). */
     struct stm_inode_value spv = {0};
     stm_status sps = fs_load_parent_dir(iidx, dataset_id, src_parent_ino, &spv);
     if (sps != STM_OK) {
         pthread_rwlock_unlock(&fs->global);
         return sps;
     }
-    struct stm_inode_value dpv = {0};
-    stm_status dps = fs_load_parent_dir(iidx, dataset_id, dst_parent_ino, &dpv);
-    if (dps != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
-        return dps;
+    if (src_parent_ino != dst_parent_ino) {
+        struct stm_inode_value dpv = {0};
+        stm_status dps = fs_load_parent_dir(iidx, dataset_id,
+                                                dst_parent_ino, &dpv);
+        if (dps != STM_OK) {
+            pthread_rwlock_unlock(&fs->global);
+            return dps;
+        }
     }
 
-    /* Lookup src dirent — must exist. */
+    /* Retry-restart loop for TOCTOU re-verify of src + dst dirents
+     * under pin. Matches fs_unlink_inode_and_dirent's discipline
+     * (PARALLEL-3 impl-2 lookup-pin-reverify), generalised to the
+     * two-dirent case. FS_UNLINK_MAX_ATTEMPTS bounds livelock
+     * potential under high contention. */
     uint64_t src_ino = 0, src_gen = 0;
     uint8_t  src_type = 0;
-    stm_status srs = stm_dirent_lookup(didx, dataset_id, src_parent_ino,
-                                            src_name, src_name_len,
-                                            &src_ino, &src_gen, &src_type);
-    if (srs != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
-        return srs;       /* STM_ENOENT */
-    }
-
-    /* Lookup dst dirent — may or may not exist. */
     uint64_t dst_ino = 0, dst_gen = 0;
     uint8_t  dst_type = 0;
-    stm_status drs = stm_dirent_lookup(didx, dataset_id, dst_parent_ino,
-                                            dst_name, dst_name_len,
-                                            &dst_ino, &dst_gen, &dst_type);
-    bool dst_exists = (drs == STM_OK);
-    if (drs != STM_OK && drs != STM_ENOENT) {
-        pthread_rwlock_unlock(&fs->global);
-        return drs;
-    }
+    bool dst_exists = false;
+    stm_inode_handle *handles[4] = {0};
+    size_t n_handles = 0;
+    int attempts = 0;
 
-    if (dst_exists && (flags & STM_FS_RENAME_NOREPLACE)) {
-        pthread_rwlock_unlock(&fs->global);
-        return STM_EEXIST;
-    }
+    for (;;) {
+        if (attempts++ >= FS_UNLINK_MAX_ATTEMPTS) {
+            pthread_rwlock_unlock(&fs->global);
+            return STM_EAGAIN;
+        }
 
-    /* P8-POSIX-9b: RENAME_EXCHANGE — both src + dst MUST exist.
-     * Atomically swap their (ino, gen, type) at the dirent layer
-     * via stm_dirent_swap_two. Stamp ctime on both swapped inodes
-     * (POSIX rename ctime semantics — the operation modifies inode
-     * metadata: the directory entry's ino reference). NO inode is
-     * created or freed; nlink unchanged on both sides. Composes
-     * over dirent.tla::Swap. */
-    if (flags & STM_FS_RENAME_EXCHANGE) {
-        if (!dst_exists) {
+        /* Pre-pin lookup of src. */
+        uint64_t src_ino_obs = 0, src_gen_obs = 0;
+        uint8_t  src_type_obs = 0;
+        stm_status srs = stm_dirent_lookup(didx, dataset_id, src_parent_ino,
+                                                src_name, src_name_len,
+                                                &src_ino_obs, &src_gen_obs,
+                                                &src_type_obs);
+        if (srs != STM_OK) {
+            pthread_rwlock_unlock(&fs->global);
+            return srs;
+        }
+
+        /* Pre-pin lookup of dst. */
+        uint64_t dst_ino_obs = 0, dst_gen_obs = 0;
+        uint8_t  dst_type_obs = 0;
+        stm_status drs = stm_dirent_lookup(didx, dataset_id, dst_parent_ino,
+                                                dst_name, dst_name_len,
+                                                &dst_ino_obs, &dst_gen_obs,
+                                                &dst_type_obs);
+        bool dst_exists_obs = (drs == STM_OK);
+        if (drs != STM_OK && drs != STM_ENOENT) {
+            pthread_rwlock_unlock(&fs->global);
+            return drs;
+        }
+
+        /* Pre-pin flag checks that don't depend on inode state. */
+        if (dst_exists_obs && (flags & STM_FS_RENAME_NOREPLACE)) {
+            pthread_rwlock_unlock(&fs->global);
+            return STM_EEXIST;
+        }
+        if ((flags & STM_FS_RENAME_EXCHANGE) && !dst_exists_obs) {
             pthread_rwlock_unlock(&fs->global);
             return STM_ENOENT;
         }
+
+        /* Build the pin set, deduplicating against earlier entries.
+         * In canonical-output ordering: src_parent, dst_parent (if
+         * distinct), src_ino (if distinct from parents), dst_ino (if
+         * dst_exists_obs && distinct). The pin_many helper sorts
+         * internally; we only need correctness of the set + the
+         * de-dup. We rely on caller-side dedup because pin_many
+         * refuses duplicate (ds, ino) pairs with STM_EINVAL. */
+        struct stm_inode_pin_request reqs[4];
+        size_t n_reqs = 0;
+        reqs[n_reqs].dataset_id = dataset_id;
+        reqs[n_reqs].ino        = src_parent_ino;
+        n_reqs++;
+        if (dst_parent_ino != src_parent_ino) {
+            reqs[n_reqs].dataset_id = dataset_id;
+            reqs[n_reqs].ino        = dst_parent_ino;
+            n_reqs++;
+        }
+        {
+            bool seen = false;
+            for (size_t i = 0u; i < n_reqs; i++) {
+                if (reqs[i].ino == src_ino_obs) { seen = true; break; }
+            }
+            if (!seen) {
+                reqs[n_reqs].dataset_id = dataset_id;
+                reqs[n_reqs].ino        = src_ino_obs;
+                n_reqs++;
+            }
+        }
+        if (dst_exists_obs) {
+            bool seen = false;
+            for (size_t i = 0u; i < n_reqs; i++) {
+                if (reqs[i].ino == dst_ino_obs) { seen = true; break; }
+            }
+            if (!seen) {
+                reqs[n_reqs].dataset_id = dataset_id;
+                reqs[n_reqs].ino        = dst_ino_obs;
+                n_reqs++;
+            }
+        }
+
+        stm_inode_handle *new_handles[4] = {0};
+        stm_status pp = stm_inode_pin_many(iidx, reqs, n_reqs, new_handles);
+        if (pp == STM_ENOENT) {
+            /* Some target inode disappeared between lookup and pin —
+             * retry from lookup (the dirent may now resolve to a
+             * different inode, or src/dst may have moved). */
+            continue;
+        }
+        if (pp != STM_OK) {
+            pthread_rwlock_unlock(&fs->global);
+            return pp;
+        }
+
+        /* Re-verify under pin: re-lookup src + dst, confirm they
+         * resolve to the same (ino, gen, type) we observed pre-pin.
+         * Any divergence means a concurrent writer mutated between
+         * our lookup + pin — unpin + retry. */
+        uint64_t src_ino_chk = 0, src_gen_chk = 0;
+        uint8_t  src_type_chk = 0;
+        stm_status srs_chk = stm_dirent_lookup(didx, dataset_id,
+                                                    src_parent_ino,
+                                                    src_name, src_name_len,
+                                                    &src_ino_chk, &src_gen_chk,
+                                                    &src_type_chk);
+        if (srs_chk != STM_OK || src_ino_chk != src_ino_obs ||
+            src_gen_chk != src_gen_obs || src_type_chk != src_type_obs) {
+            for (size_t i = 0u; i < n_reqs; i++) {
+                stm_inode_unpin(iidx, new_handles[i]);
+            }
+            if (srs_chk != STM_OK && srs_chk != STM_ENOENT) {
+                pthread_rwlock_unlock(&fs->global);
+                return srs_chk;
+            }
+            continue;
+        }
+        uint64_t dst_ino_chk = 0, dst_gen_chk = 0;
+        uint8_t  dst_type_chk = 0;
+        stm_status drs_chk = stm_dirent_lookup(didx, dataset_id,
+                                                    dst_parent_ino,
+                                                    dst_name, dst_name_len,
+                                                    &dst_ino_chk, &dst_gen_chk,
+                                                    &dst_type_chk);
+        bool dst_exists_chk = (drs_chk == STM_OK);
+        if ((drs_chk != STM_OK && drs_chk != STM_ENOENT) ||
+            dst_exists_chk != dst_exists_obs ||
+            (dst_exists_chk && (dst_ino_chk != dst_ino_obs ||
+                                 dst_gen_chk != dst_gen_obs ||
+                                 dst_type_chk != dst_type_obs))) {
+            for (size_t i = 0u; i < n_reqs; i++) {
+                stm_inode_unpin(iidx, new_handles[i]);
+            }
+            if (drs_chk != STM_OK && drs_chk != STM_ENOENT) {
+                pthread_rwlock_unlock(&fs->global);
+                return drs_chk;
+            }
+            continue;
+        }
+
+        /* Re-verify parents are still dirs under their pins. */
+        struct stm_inode_value spv_chk = {0};
+        stm_status sp_chk = fs_load_parent_dir(iidx, dataset_id,
+                                                    src_parent_ino, &spv_chk);
+        if (sp_chk != STM_OK) {
+            for (size_t i = 0u; i < n_reqs; i++) {
+                stm_inode_unpin(iidx, new_handles[i]);
+            }
+            if (sp_chk == STM_ENOENT) continue;
+            pthread_rwlock_unlock(&fs->global);
+            return sp_chk;
+        }
+        if (src_parent_ino != dst_parent_ino) {
+            struct stm_inode_value dpv_chk = {0};
+            stm_status dp_chk = fs_load_parent_dir(iidx, dataset_id,
+                                                        dst_parent_ino,
+                                                        &dpv_chk);
+            if (dp_chk != STM_OK) {
+                for (size_t i = 0u; i < n_reqs; i++) {
+                    stm_inode_unpin(iidx, new_handles[i]);
+                }
+                if (dp_chk == STM_ENOENT) continue;
+                pthread_rwlock_unlock(&fs->global);
+                return dp_chk;
+            }
+        }
+
+        /* TOCTOU re-verify passed; commit to this set of pins. */
+        src_ino    = src_ino_obs;
+        src_gen    = src_gen_obs;
+        src_type   = src_type_obs;
+        dst_ino    = dst_ino_obs;
+        dst_gen    = dst_gen_obs;
+        dst_type   = dst_type_obs;
+        dst_exists = dst_exists_obs;
+        for (size_t i = 0u; i < n_reqs; i++) {
+            handles[i] = new_handles[i];
+        }
+        n_handles = n_reqs;
+        break;
+    }
+
+    /* Helper macro: unpin every successfully-acquired handle in
+     * handles[0..n_handles). Defensive against duplicates: pin_many
+     * refused them upfront, so each slot is unique. */
+    #define FS_RENAME_UNPIN_ALL()                              \
+        do {                                                    \
+            for (size_t _i = 0u; _i < n_handles; _i++) {        \
+                stm_inode_unpin(iidx, handles[_i]);             \
+                handles[_i] = NULL;                             \
+            }                                                   \
+            n_handles = 0u;                                     \
+        } while (0)
+
+    /* P8-POSIX-9b: RENAME_EXCHANGE — both src + dst MUST exist.
+     * Atomically swap their (ino, gen, type) at the dirent layer
+     * via stm_dirent_swap_two. NO inode is created or freed; nlink
+     * unchanged on both sides. Composes over dirent.tla::Swap. */
+    if (flags & STM_FS_RENAME_EXCHANGE) {
         /* R86 P2-1 (P11 close): immediate-parent directory-cycle
          * detection. EXCHANGE of two directories where one is the
          * IMMEDIATE parent of the other creates a cycle: post-
          * exchange, the parent's slot points to the (former) child
          * dir, while the child's slot points to the (former) parent
          * — which now contains itself transitively. Refuse with
-         * STM_EINVAL (POSIX-aligned: Linux returns EINVAL for the
-         * cycle case).
+         * STM_EINVAL.
          *
-         * Forward-note: deeper-ancestor cycle detection (e.g.,
-         * EXCHANGE(/A, /A/sub/sub)) requires ancestor-walk via
-         * dirent traversal, which is O(depth) and lacks an
-         * indexed parent_ino field on the inode (would be a
-         * format break to add). The immediate-parent check
-         * catches the most common abuse case; deeper cycles are
-         * forward-noted for a future hardening chunk that adds
-         * either a parent_ino index or ancestor-walk via reverse-
-         * dirent lookup. */
+         * Forward-note: deeper-ancestor cycle detection requires
+         * O(depth) ancestor-walk via dirent traversal; not yet
+         * implemented. The immediate-parent check catches the most
+         * common abuse case. */
         bool src_is_dir = (src_type == STM_DT_DIR);
         bool dst_is_dir = (dst_type == STM_DT_DIR);
         if (src_is_dir && dst_is_dir) {
             if (src_ino == dst_parent_ino || dst_ino == src_parent_ino) {
+                FS_RENAME_UNPIN_ALL();
                 pthread_rwlock_unlock(&fs->global);
                 return STM_EINVAL;
             }
         }
-        /* Atomically swap. */
         stm_status ws = stm_dirent_swap_two(didx, dataset_id,
                                                  src_parent_ino,
                                                  src_name, src_name_len,
                                                  dst_parent_ino,
                                                  dst_name, dst_name_len);
         if (ws != STM_OK) {
+            FS_RENAME_UNPIN_ALL();
             pthread_rwlock_unlock(&fs->global);
             return ws;
         }
-        /* Stamp ctime on both inodes (post-swap). The two inodes
-         * have ALREADY been swapped at the dirent layer; src_ino
-         * + dst_ino are the inos that were originally at src and
-         * dst. Both still exist (Swap preserves nlink). Failure
-         * to stamp is best-effort under R76 P3-1 / R78 P3-1
-         * lock-posture infallibility — only ctime mutates. */
+        /* Stamp ctime on both inodes (post-swap). Best-effort under
+         * R76 P3-1 / R78 P3-1 lock-posture infallibility — only
+         * ctime mutates. Both inodes are pinned. */
         struct stm_inode_value siv2 = {0};
         if (stm_inode_lookup(iidx, dataset_id, src_ino, &siv2) == STM_OK) {
             fs_stamp_ctime_now(&siv2);
@@ -3623,6 +3800,7 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
             fs_stamp_ctime_now(&div2);
             (void)stm_inode_set(iidx, dataset_id, dst_ino, &div2);
         }
+        FS_RENAME_UNPIN_ALL();
         pthread_rwlock_unlock(&fs->global);
         return STM_OK;
     }
@@ -3635,10 +3813,12 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
         bool src_is_dir = (src_type == STM_DT_DIR);
         bool dst_is_dir = (dst_type == STM_DT_DIR);
         if (src_is_dir && !dst_is_dir) {
+            FS_RENAME_UNPIN_ALL();
             pthread_rwlock_unlock(&fs->global);
             return STM_ENOTDIR;
         }
         if (!src_is_dir && dst_is_dir) {
+            FS_RENAME_UNPIN_ALL();
             pthread_rwlock_unlock(&fs->global);
             return STM_EISDIR;
         }
@@ -3647,6 +3827,7 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
             stm_status cs = stm_dirent_count_for_dir(didx, dataset_id,
                                                           dst_ino, &n);
             if (cs == STM_OK && n > 0u) {
+                FS_RENAME_UNPIN_ALL();
                 pthread_rwlock_unlock(&fs->global);
                 return STM_ENOTEMPTY;
             }
@@ -3668,13 +3849,11 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
          * inode-unlink. Otherwise the buffer's (ds, dst_ino) entry
          * outlives the inode slot's free and a future flush emits
          * extents under whatever inode reuses the slot at a bumped
-         * si_gen — confused-deputy-class data corruption. Same posture
-         * as fs_unlink_inode_and_dirent. Inode lookup is best-effort;
-         * if it fails (e.g., dst_ino already gone — should not happen
-         * since dst_exists is true), the helper is skipped. The
-         * returned truncate-flag gates the post-reclaim double-commit
-         * below (R130 perf: skip the ~200ms commit pair when the
-         * overwritten dst has no extents to reclaim). */
+         * si_gen — confused-deputy-class data corruption. Inode lookup
+         * is best-effort; the returned truncate-flag gates the post-
+         * reclaim double-commit below (R130 perf: skip the ~200ms
+         * commit pair when the overwritten dst has no extents). Runs
+         * under dst_ino's pin (acquired above via pin_many). */
         struct stm_inode_value dcv = {0};
         if (stm_inode_lookup(iidx, dataset_id, dst_ino, &dcv) == STM_OK) {
             uint32_t dst_cur_nlink = stm_load_le32(dcv.si_nlink);
@@ -3686,19 +3865,22 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
         stm_status du = stm_dirent_unlink(didx, dataset_id, dst_parent_ino,
                                                 dst_name, dst_name_len);
         if (du != STM_OK) {
-            /* Should not happen — we just looked up the entry. */
+            /* Should not happen — we just looked up the entry under
+             * the parent's pin AND re-verified it under pin. */
+            FS_RENAME_UNPIN_ALL();
             pthread_rwlock_unlock(&fs->global);
             return du;
         }
         stm_status iu = stm_inode_unlink(iidx, dataset_id, dst_ino,
                                             &dst_freed_unused);
         if (iu != STM_OK) {
-            /* Rollback: re-create dst dirent. Under fs->lock-held
-             * posture, this should succeed (the slot is still a
-             * tombstone we just created; alloc reuses it). */
+            /* Rollback: re-create dst dirent. Under dst_parent's pin
+             * the slot is still a tombstone we just created; alloc
+             * reuses it. */
             (void)stm_dirent_alloc(didx, dataset_id, dst_parent_ino,
                                        dst_name, dst_name_len,
                                        dst_ino, dst_gen, dst_type);
+            FS_RENAME_UNPIN_ALL();
             pthread_rwlock_unlock(&fs->global);
             return iu;
         }
@@ -3710,10 +3892,8 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
                                           src_ino, src_gen, src_type);
     if (as != STM_OK) {
         /* Rollback the dst-overwrite: re-create dst dirent + bump
-         * dst inode's nlink back. If the rollback fails (memory
-         * pressure / pathological state), wedge the volume — the
-         * on-disk state is now incompatible with the cached invariants
-         * (orphan inode that nothing points to + missing dst dirent). */
+         * dst inode's nlink back. R133 P1-2 captures wedge intent
+         * here; the actual mark_wedged fires AFTER unlock. */
         if (dst_exists) {
             stm_status r1 = stm_dirent_alloc(didx, dataset_id, dst_parent_ino,
                                                   dst_name, dst_name_len,
@@ -3725,29 +3905,26 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
                 /* dst inode was cascade-freed — can't bring it back
                  * without an alloc-reuse cycle (gen bump required).
                  * Wedge: data loss has already occurred from the
-                 * caller's perspective (dst's content is gone) and
-                 * the original alloc was unrecoverable. */
+                 * caller's perspective. */
                 should_wedge = true;
             }
             if (r1 != STM_OK || r2 != STM_OK) {
                 should_wedge = true;
             }
         }
+        FS_RENAME_UNPIN_ALL();
         pthread_rwlock_unlock(&fs->global);
         if (should_wedge) stm_fs_mark_wedged(fs);
         return as;
     }
 
-    /* Drop src dirent. Under fs->lock-held posture, this is the
-     * straightforward write to a tombstone — should not fail.
+    /* Drop src dirent (or convert to whiteout). Under src_parent's
+     * pin this is the straightforward write to a tombstone — should
+     * not fail.
      *
      * P8-POSIX-9b RENAME_WHITEOUT: instead of unlinking src (which
      * leaves a TOMBSTONE invisible to readdir), convert src to a
-     * WHITEOUT marker (visible to readdir as STM_DT_WHITEOUT with
-     * child_ino=0 — overlayfs userspace interprets the marker as
-     * "hide the lower layer's same name"). Both the unlink and
-     * the whiteout primitives operate on the same chain slot;
-     * chain integrity is preserved by either path. */
+     * WHITEOUT marker. */
     stm_status su;
     if (flags & STM_FS_RENAME_WHITEOUT) {
         su = stm_dirent_whiteout(didx, dataset_id, src_parent_ino,
@@ -3758,17 +3935,8 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
     }
     if (su != STM_OK) {
         /* Defensive rollback: drop the dst dirent we just created
-         * and re-link the original (if overwrite). On any rollback
-         * failure, wedge.
-         *
-         * R79 P3-1: capture the rollback dst_unlink return so the
-         * "drop the freshly-installed dst" leg's failure (silent
-         * 1-dirent / 2-reference desync if dst_exists=false)
-         * triggers the wedge guard. In current code-paths this
-         * cannot fire — we just dirent_alloc'd at dst_name, so
-         * unlink will find it — but capturing the rv is defense-
-         * in-depth for any future refactor that breaks the
-         * invariant. */
+         * and re-link the original (if overwrite). R79 P3-1 + R133
+         * P1-2: capture wedge intent. */
         stm_status r0 = stm_dirent_unlink(didx, dataset_id, dst_parent_ino,
                                                 dst_name, dst_name_len);
         if (r0 != STM_OK) should_wedge = true;
@@ -3780,10 +3948,10 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
                 stm_status r2 = stm_inode_link(iidx, dataset_id, dst_ino);
                 if (r1 != STM_OK || r2 != STM_OK) should_wedge = true;
             } else {
-                /* dst inode gone; can't restore. */
                 should_wedge = true;
             }
         }
+        FS_RENAME_UNPIN_ALL();
         pthread_rwlock_unlock(&fs->global);
         if (should_wedge) stm_fs_mark_wedged(fs);
         return su;
@@ -3791,13 +3959,12 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
 
     /* P8-POSIX-7a: rename mutates the moved inode's parent + name,
      * which POSIX models as a metadata change → ctime auto-stamps to
-     * "now" on src_ino. mtime + btime preserved. Best-effort, same
-     * shape as setxattr's stamp.
+     * "now" on src_ino. mtime + btime preserved.
      *
      * R86 P2-2 (P11 close): also stamp src_parent + dst_parent
      * directories' mtime + ctime — POSIX says rename modifies both
-     * parent directories (their dirent contents change). For
-     * same-parent rename (src_parent == dst_parent), stamp once. */
+     * parent directories. For same-parent rename, stamp once. All
+     * targets are pinned. */
     {
         struct stm_inode_value iv2 = {0};
         if (stm_inode_lookup(iidx, dataset_id, src_ino, &iv2) == STM_OK) {
@@ -3825,19 +3992,18 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
      * fs_pre_inode_free_cleanup_locked. The allocator now holds
      * PENDING entries with free_gen=current_gen; without the double-
      * commit, R50 P2-1's strict-less-than predicate skips the sweep
-     * and the blocks leak as PENDING for the session.
-     *
-     * Same posture as fs_unlink_inode_and_dirent's reclaim. The
-     * non-overwrite rename path (no dst_freed_unused) doesn't free
-     * any extents; skip the reclaim. R130: also gate on whether the
-     * pre-cleanup truncated extents — overwriting a directory or
-     * symlink target (no extents) skips the ~200 ms commit pair. */
+     * and the blocks leak as PENDING for the session. R130: also
+     * gate on whether the pre-cleanup truncated extents — overwriting
+     * a directory or symlink target (no extents) skips the ~200 ms
+     * commit pair. */
     if (dst_freed_unused && dst_cleanup_did_truncate) {
         fs_post_inode_free_reclaim_locked(fs);
     }
 
+    FS_RENAME_UNPIN_ALL();
     pthread_rwlock_unlock(&fs->global);
     return STM_OK;
+    #undef FS_RENAME_UNPIN_ALL
 }
 
 /* ========================================================================= */

@@ -554,6 +554,58 @@ stm_status stm_inode_pin_two(stm_inode_index *idx,
                                 stm_inode_handle **out_b);
 
 /*
+ * P9.5-PARALLEL-3 impl-3: pin N inodes safely (generalised pin_two).
+ *
+ * Caller provides `requests[]` of length `n`; the function pins each
+ * `(dataset_id, ino)` in canonical ASCENDING `(dataset_id, ino)` order
+ * regardless of the order they appear in `requests[]`, and returns
+ * `out_handles[]` in CALLER SLOT ORDER (i.e., `out_handles[k]` is the
+ * handle for `requests[k]`).
+ *
+ * The ascending-order rule scales pin_two's canonical Linux vnode
+ * lock-ordering discipline to arbitrary N. Two writers pinning the
+ * SAME `requests[]` set (in any order) cannot deadlock — they both
+ * acquire in (ds, ino) ascending order from their set. Writers with
+ * different but OVERLAPPING sets cannot cycle either, because every
+ * pair on both writers' acquisition stacks is ascending.
+ *
+ * Permitted N: `1 <= n <= STM_INODE_PIN_MANY_MAX` (defined below as
+ * 16; ample for the 4-inode rename case + any forward-noted op).
+ *
+ * Refusals:
+ *   - NULL idx, NULL requests, NULL out_handles (STM_EINVAL).
+ *   - n == 0 OR n > STM_INODE_PIN_MANY_MAX (STM_EINVAL).
+ *   - dataset_id == 0 OR ino == 0 on ANY request (STM_EINVAL).
+ *   - DUPLICATE `(dataset_id, ino)` pair in `requests[]` (STM_EINVAL —
+ *     same posture as pin_two; the caller would deadlock on the
+ *     duplicate's per-slot ERRORCHECK mutex). Callers MUST dedupe
+ *     upstream (the rename impl does this when src_parent ==
+ *     dst_parent OR ino_a == ino_b).
+ *   - Any record missing or FREED at pin time (STM_ENOENT; previously-
+ *     acquired pins are released).
+ *   - STM_ENOMEM if the lock-slot pool can't grow.
+ *
+ * On any non-OK return, EVERY entry in `out_handles[0..n-1]` is set to
+ * NULL and no pin is held.
+ *
+ * For N=2 callers should prefer `stm_inode_pin_two` (more readable, no
+ * internal sort). For N=1, prefer `stm_inode_pin`. This helper exists
+ * for N=3 and N=4 (rename) + future ops.
+ */
+#define STM_INODE_PIN_MANY_MAX 16u
+
+struct stm_inode_pin_request {
+    uint64_t dataset_id;
+    uint64_t ino;
+};
+
+STM_MUST_USE
+stm_status stm_inode_pin_many(stm_inode_index *idx,
+                                 const struct stm_inode_pin_request *requests,
+                                 size_t n,
+                                 stm_inode_handle **out_handles);
+
+/*
  * Count ALLOCATED inodes in `dataset_id`. FREED records are excluded.
  *
  * Refusals:

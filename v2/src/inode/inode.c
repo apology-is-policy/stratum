@@ -1582,3 +1582,101 @@ stm_status stm_inode_pin_two(stm_inode_index *idx,
     }
     return STM_OK;
 }
+
+/*
+ * stm_inode_pin_many — generalised pin_two for N up to
+ * STM_INODE_PIN_MANY_MAX (16).
+ *
+ * Algorithm:
+ *   1. Validate args + bounds.
+ *   2. Build a permutation `order[0..n-1]` such that
+ *      `(requests[order[k]].dataset_id, requests[order[k]].ino)` is
+ *      strictly ascending in `k`.
+ *   3. Refuse if any two adjacent entries in the sorted order have
+ *      the same (ds, ino) pair (duplicate detection).
+ *   4. Pin in sorted order. On any pin failure, release all
+ *      previously-acquired pins (in reverse order — doesn't matter
+ *      semantically but matches conventional unwinding).
+ *   5. Map handles back into caller slot order via the inverse
+ *      permutation.
+ *
+ * N is small (≤ 16) so an O(N²) selection sort is fine and avoids
+ * heap allocation. Stack-only.
+ */
+stm_status stm_inode_pin_many(stm_inode_index *idx,
+                                 const struct stm_inode_pin_request *requests,
+                                 size_t n,
+                                 stm_inode_handle **out_handles) {
+    if (!idx || !requests || !out_handles) return STM_EINVAL;
+    if (n == 0u || n > STM_INODE_PIN_MANY_MAX) return STM_EINVAL;
+    for (size_t k = 0u; k < n; k++) {
+        if (requests[k].dataset_id == 0u || requests[k].ino == 0u) {
+            return STM_EINVAL;
+        }
+    }
+
+    /* Zero all output slots up front. */
+    for (size_t k = 0u; k < n; k++) {
+        out_handles[k] = NULL;
+    }
+
+    /* order[k] = index into requests[] for the k-th element in ascending
+     * (ds, ino) order. Initialize identity, then selection-sort. */
+    size_t order[STM_INODE_PIN_MANY_MAX];
+    for (size_t k = 0u; k < n; k++) order[k] = k;
+
+    /* Selection sort on order[] by (requests[order[k]].dataset_id,
+     * requests[order[k]].ino) ascending. O(N²) but N ≤ 16. */
+    for (size_t i = 0u; i + 1u < n; i++) {
+        size_t min_pos = i;
+        for (size_t j = i + 1u; j < n; j++) {
+            const struct stm_inode_pin_request *a = &requests[order[min_pos]];
+            const struct stm_inode_pin_request *b = &requests[order[j]];
+            if (b->dataset_id < a->dataset_id ||
+                (b->dataset_id == a->dataset_id && b->ino < a->ino)) {
+                min_pos = j;
+            }
+        }
+        if (min_pos != i) {
+            size_t tmp = order[i];
+            order[i] = order[min_pos];
+            order[min_pos] = tmp;
+        }
+    }
+
+    /* Duplicate detection on the sorted run: adjacent entries with
+     * equal (ds, ino) → STM_EINVAL. Pinning a duplicate would deadlock
+     * on the per-slot ERRORCHECK mutex. */
+    for (size_t k = 1u; k < n; k++) {
+        const struct stm_inode_pin_request *prev = &requests[order[k - 1u]];
+        const struct stm_inode_pin_request *curr = &requests[order[k]];
+        if (prev->dataset_id == curr->dataset_id && prev->ino == curr->ino) {
+            return STM_EINVAL;
+        }
+    }
+
+    /* Pin in ascending order. handles_sorted[k] receives the handle
+     * for requests[order[k]]; we map back to caller slot order at the
+     * end. */
+    stm_inode_handle *handles_sorted[STM_INODE_PIN_MANY_MAX] = {0};
+    for (size_t k = 0u; k < n; k++) {
+        const struct stm_inode_pin_request *req = &requests[order[k]];
+        stm_status ps = stm_inode_pin(idx, req->dataset_id, req->ino,
+                                          &handles_sorted[k]);
+        if (ps != STM_OK) {
+            /* Roll back every previously-acquired pin (sorted order
+             * 0..k-1; unpin order is conventionally reverse). */
+            for (size_t j = k; j > 0u; j--) {
+                stm_inode_unpin(idx, handles_sorted[j - 1u]);
+            }
+            return ps;
+        }
+    }
+
+    /* Map handles back into caller slot order:
+     * out_handles[order[k]] = handles_sorted[k]. */
+    for (size_t k = 0u; k < n; k++) {
+        out_handles[order[k]] = handles_sorted[k];
+    }
+    return STM_OK;
+}

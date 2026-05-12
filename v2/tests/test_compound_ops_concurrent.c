@@ -601,4 +601,169 @@ STM_TEST(per_inode_create_unlink_same_parent_disjoint_names) {
     unlink(g_key_path);
 }
 
+/* ── PARALLEL-3 impl-3: 4-inode rename overwrite concurrency ───────── */
+
+#define RENAME_ITERATIONS    150u
+
+typedef struct {
+    stm_fs *fs;
+    uint64_t dataset_id;
+    uint64_t parent_a_ino;       /* one of two parent dirs */
+    uint64_t parent_b_ino;       /* the OTHER parent dir (forces a-to-b rename) */
+    const char *src_prefix;      /* under parent_a */
+    const char *dst_prefix;      /* under parent_b — pre-populated each iter */
+    unsigned iterations;
+    atomic_int err;
+    atomic_uint completed;
+    atomic_bool done;
+} rename_ctx;
+
+/* Per iteration: create dst under parent_b (target of rename overwrite),
+ * create src under parent_a, then rename src to dst (overwrite). Result:
+ * dst's inode is cascade-freed; src's inode now lives under dst's name.
+ * Then unlink the moved inode. This exercises the 4-inode pin set
+ * (src_parent + dst_parent + src_ino + dst_ino) on the overwrite branch
+ * with R128/R130 wiring active (src_ino has no extents so cascade-free
+ * of dst_ino is exactly the R130-gated double-commit case). */
+static void *rename_thread(void *arg)
+{
+    rename_ctx *s = (rename_ctx *)arg;
+    for (unsigned i = 0; i < s->iterations; i++) {
+        char src_name[64], dst_name[64];
+        snprintf(src_name, sizeof src_name, "%s_%u", s->src_prefix, i);
+        snprintf(dst_name, sizeof dst_name, "%s_%u", s->dst_prefix, i);
+        size_t src_len = strlen(src_name);
+        size_t dst_len = strlen(dst_name);
+
+        uint64_t dst_ino_pre = 0;
+        stm_status rc = stm_fs_create_file(s->fs, s->dataset_id,
+                                              s->parent_b_ino,
+                                              (const uint8_t *)dst_name,
+                                              (uint8_t)dst_len,
+                                              0100644, 0, 0, &dst_ino_pre);
+        if (rc != STM_OK) {
+            atomic_store(&s->err, (int)rc);
+            break;
+        }
+        uint64_t src_ino = 0;
+        rc = stm_fs_create_file(s->fs, s->dataset_id, s->parent_a_ino,
+                                   (const uint8_t *)src_name,
+                                   (uint8_t)src_len,
+                                   0100644, 0, 0, &src_ino);
+        if (rc != STM_OK) {
+            atomic_store(&s->err, (int)rc);
+            break;
+        }
+        /* Rename src → dst (overwrite). After this, dst_ino is freed +
+         * dst_name resolves to src_ino under parent_b. */
+        rc = stm_fs_rename(s->fs, s->dataset_id,
+                              s->parent_a_ino,
+                              (const uint8_t *)src_name, (uint8_t)src_len,
+                              s->parent_b_ino,
+                              (const uint8_t *)dst_name, (uint8_t)dst_len,
+                              0u);
+        if (rc != STM_OK) {
+            atomic_store(&s->err, (int)rc);
+            break;
+        }
+        /* Clean up: unlink the moved inode at its new location. */
+        rc = stm_fs_unlink(s->fs, s->dataset_id, s->parent_b_ino,
+                              (const uint8_t *)dst_name, (uint8_t)dst_len);
+        if (rc != STM_OK) {
+            atomic_store(&s->err, (int)rc);
+            break;
+        }
+        atomic_fetch_add(&s->completed, 1u);
+    }
+    atomic_store(&s->done, true);
+    return NULL;
+}
+
+static bool wait_two_rename(const rename_ctx *a, const rename_ctx *b,
+                                 pthread_t at, pthread_t bt)
+{
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (;;) {
+        if (atomic_load(&a->done) && atomic_load(&b->done)) break;
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec - start.tv_sec > DEADLINE_SECONDS) return false;
+        struct timespec ns = { 0, 10 * 1000 * 1000 };
+        nanosleep(&ns, NULL);
+    }
+    (void)pthread_join(at, NULL);
+    (void)pthread_join(bt, NULL);
+    return true;
+}
+
+/* Two writers, each churning create+create+rename(overwrite)+unlink
+ * across DISJOINT pairs of parent dirs but using the same 4-inode
+ * code path. The 4-inode pin set forces NoCircularWait to be load-
+ * bearing — if pin_many doesn't sort properly, two threads' opposite-
+ * direction (parent_X → parent_Y vs parent_Y → parent_X) renames
+ * would deadlock. Catches: stm_inode_pin_many ascending-order
+ * regression; TOCTOU re-verify loop on both src + dst dirents; R128
+ * P1-1 pre-cleanup under SH+pin on dst cascade-free path; R130 post-
+ * reclaim gate; R133 P1-2 wedge-defer preservation. */
+STM_TEST(per_inode_rename_overwrite_cross_parent_disjoint) {
+    make_tmp("per_inode_rename_overwrite");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t ds_id = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "ren_ds", &ds_id));
+    uint64_t root_ino = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, ds_id, 0755u, 0, 0, &root_ino));
+    STM_ASSERT_EQ(root_ino, 1u);
+
+    /* Create FOUR sub-directories under root. Each thread renames
+     * between its own pair (no cross-thread sharing of parent dirs),
+     * so contention is purely on the pin-acquisition order of the
+     * 4-inode set. */
+    uint64_t pa1 = 0, pb1 = 0, pa2 = 0, pb2 = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, ds_id, 1u, (const uint8_t *)"a1", 2,
+                                  0755, 0, 0, &pa1));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, ds_id, 1u, (const uint8_t *)"b1", 2,
+                                  0755, 0, 0, &pb1));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, ds_id, 1u, (const uint8_t *)"a2", 2,
+                                  0755, 0, 0, &pa2));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, ds_id, 1u, (const uint8_t *)"b2", 2,
+                                  0755, 0, 0, &pb2));
+
+    rename_ctx ca = { 0 }, cb = { 0 };
+    ca.fs = fs; ca.dataset_id = ds_id;
+    ca.parent_a_ino = pa1; ca.parent_b_ino = pb1;
+    ca.src_prefix = "srcA"; ca.dst_prefix = "dstA";
+    ca.iterations = RENAME_ITERATIONS;
+    cb.fs = fs; cb.dataset_id = ds_id;
+    /* Thread B uses opposite-direction parents to provoke any
+     * lock-ordering regression: A pins (a1, b1) ascending; B pins
+     * (b2, a2). If pin_many didn't sort properly, the two threads
+     * could grab inodes in opposite orders and deadlock under the
+     * dirent layer's internal contention. */
+    cb.parent_a_ino = pb2; cb.parent_b_ino = pa2;
+    cb.src_prefix = "srcB"; cb.dst_prefix = "dstB";
+    cb.iterations = RENAME_ITERATIONS;
+
+    pthread_t at, bt;
+    STM_ASSERT_EQ(0, pthread_create(&at, NULL, rename_thread, &ca));
+    STM_ASSERT_EQ(0, pthread_create(&bt, NULL, rename_thread, &cb));
+
+    STM_ASSERT(wait_two_rename(&ca, &cb, at, bt));
+
+    STM_ASSERT_EQ(0, atomic_load(&ca.err));
+    STM_ASSERT_EQ(0, atomic_load(&cb.err));
+    STM_ASSERT_EQ(RENAME_ITERATIONS, atomic_load(&ca.completed));
+    STM_ASSERT_EQ(RENAME_ITERATIONS, atomic_load(&cb.completed));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("test_compound_ops_concurrent")
