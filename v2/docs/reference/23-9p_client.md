@@ -25,9 +25,12 @@ Scope at v2.0 (cumulative through P9.5-POLISH-1 batch):
 - Stratum extensions: Tsync (pool-wide commit without a fid),
   Treflink (FICLONE-shape), Tfallocate (Linux fallocate(2)),
   Tfadvise (Linux posix_fadvise(2)).
+- Extended attributes: Txattrwalk (LIST + VALUE-read aux fids) +
+  Txattrcreate (in-place fid repurpose for atomic VALUE-write at
+  Tclunk).
 
-Header: `v2/include/stratum/9p_client.h` (765 lines).
-Impl: `v2/src/9p_client/9p_client.c` (1946 lines).
+Header: `v2/include/stratum/9p_client.h` (836 lines).
+Impl: `v2/src/9p_client/9p_client.c` (2066 lines).
 No dedicated TLA+ spec — composes against the server's `fid.tla` +
 `namespace.tla` per connection.
 
@@ -176,12 +179,51 @@ mode first via a write > 100 bytes or `stm_9p_setattr` truncate-up.
 numbering (STM_9P_FADV_*). v2.0 server treats advice as inode-
 granularity hint — offset/length are advisory but not enforced.
 
+### Extended attributes (P9.5-POLISH-1)
+
+```c
+stm_status stm_9p_xattrwalk  (c, fid, newfid, name, out_size *);
+stm_status stm_9p_xattrcreate(c, fid, name, attr_size, flags);
+```
+
+Read flow (Txattrwalk):
+
+  1. `stm_9p_xattrwalk(c, fid, newfid, name, &size)`. If `name` is
+     NULL or empty → LIST mode (newfid binds to a NUL-separated
+     names buffer, Linux listxattr shape). Else → VALUE-read mode
+     (newfid binds to the named xattr's value).
+  2. `stm_9p_read(c, newfid, off, …)` drains the buffer.
+  3. `stm_9p_clunk(c, newfid)` releases the aux fid.
+
+Write flow (Txattrcreate):
+
+  1. `stm_9p_xattrcreate(c, fid, name, attr_size, flags)`. Repurposes
+     `fid` IN PLACE into an AUX_XATTR_WRITE collector. flags is
+     `XATTR_CREATE` / `XATTR_REPLACE` (Linux semantics; enforced
+     server-side via `stm_fs_setxattr`).
+  2. `stm_9p_write(c, fid, off, value, count, …)` accumulates the
+     value. Twrite on the AUX_XATTR_WRITE fid is APPEND-ONLY — the
+     caller MUST pass `off == current accumulated length` (start at
+     0; increment by `*out_written` after each chunk). The server
+     refuses non-append offsets with STM_EINVAL.
+  3. `stm_9p_clunk(c, fid)` atomically commits via
+     `stm_fs_setxattr` IFF the accumulated size equals `attr_size`.
+     Mismatched size discards the buffered bytes (no commit).
+     Commit failures surface via the Tclunk reply's Rlerror.
+
+Lifecycle caveat: Txattrcreate repurposes the SAME fid slot (no
+newfid). Callers that need to preserve a NODE binding to the inode
+MUST Twalk-clone the navigation fid BEFORE calling Txattrcreate.
+
+Trust posture (R111 doctrine carry): lib-boundary refusal of
+`newfid == fid` (mirrors the server-side gate); lib-boundary refusal
+of oversize name (server caps at 255 bytes); embedded-NUL refusal
+in xattrcreate name. Caller-cap-bound is not applicable here —
+Rxattrwalk returns a single u64 `size`, and the actual value bytes
+flow through `stm_9p_read` which already carries R111 P0 F-1.
+
 ### Deferred from v2.0 (forward-noted)
 
-- **Txattrwalk / Txattrcreate** — server present, client deferred to
-  keep the chunk POSIX-shape primitives only.
-- **Tstatfs** — CLI-helpful; bundled with /ctl/-on-stratumd or a
-  separate tail chunk.
 - **Tflush** — sync client doesn't need it (every Tmsg has its Rmsg
   before the next is sent).
 - **Async API (P9-LIB-2)** — pipelined Txx with reply matching by
@@ -377,8 +419,7 @@ the SERVER's correctness viewed through the wire:
 | Tlock / Tgetlock (P9.5-POLISH-1) | LIVE | Owner-id derived per-fid by server; SUCCESS ⇒ STM_OK, BLOCKED ⇒ STM_EAGAIN; Tclunk auto-releases |
 | Tstatfs (P9.5-POLISH-1) | LIVE | df / vfs_statfs critical path |
 | Tsync / Treflink / Tfallocate / Tfadvise (P9.5-POLISH-1) | LIVE | Stratum extensions; server-side P9-9P-3 |
-| Txattrwalk / Txattrcreate | DEFERRED | Tail chunk |
-| Tstatfs | DEFERRED | Bundled with /ctl/-on-stratumd |
+| Txattrwalk / Txattrcreate (P9.5-POLISH-1) | LIVE | Aux-fid lifecycle: walk-then-read for fetch; in-place fid repurpose + clunk-time commit for set |
 | Tflush | DEFERRED | Sync client doesn't need it |
 | Async API (P9-LIB-2) | DEFERRED | Pipelined; io_uring transport |
 | Stratum-extension opcodes (Tsync/Treflink/Tfallocate/Tfadvise) | DEFERRED | Tail chunk |

@@ -2411,4 +2411,185 @@ STM_TEST(p9_client_fadvise_willneed_ok)
     destroy_client_fixture(&f);
 }
 
+/* ────────────────────────────────────────────────────────────────────── */
+/* P9.5-POLISH-1: Txattrwalk + Txattrcreate                                */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/* Create xattr via Txattrcreate + Twrite + Tclunk, then read it back via
+ * Txattrwalk + Tread. End-to-end round trip. */
+STM_TEST(p9_client_xattrcreate_then_xattrwalk_round_trip)
+{
+    client_fixture f = make_client_fixture("xattr_rt");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    /* Create the target file. */
+    stm_9p_qid clone_qids[STM_9P_MAX_WALK];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 0, NULL, clone_qids, &walked));
+    stm_9p_qid lq;
+    STM_ASSERT_OK(stm_9p_lcreate(c, 101, "x.txt",
+                                    STM_9P_O_RDWR, 0644u, 0, &lq, NULL));
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+
+    /* Walk a fresh fid to the file for the xattr-create flow. */
+    const char *target_names[] = { "x.txt" };
+    stm_9p_qid target_qids[1];
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 102, 1, target_names, target_qids, &walked));
+
+    /* Txattrcreate: repurpose fid 102 as a write buffer for "user.test". */
+    static const uint8_t VALUE[] = "stratum-rocks";
+    STM_ASSERT_OK(stm_9p_xattrcreate(c, 102, "user.test",
+                                        /*attr_size=*/sizeof VALUE - 1,
+                                        /*flags=*/0));
+    /* Twrite the value bytes (must be append-only — offset must equal
+     * the current accumulated length). */
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, 102, /*off=*/0, VALUE, sizeof VALUE - 1, &written));
+    /* Tclunk atomically commits via stm_fs_setxattr. */
+    STM_ASSERT_OK(stm_9p_clunk(c, 102));
+
+    /* Read it back. Re-walk a fresh fid to the file. */
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 102, 1, target_names, target_qids, &walked));
+    uint64_t xattr_size = 0;
+    STM_ASSERT_OK(stm_9p_xattrwalk(c, /*fid=*/102, /*newfid=*/103,
+                                     "user.test", &xattr_size));
+    STM_ASSERT_EQ(xattr_size, sizeof VALUE - 1);
+
+    /* Drain the value via stm_9p_read on the newfid. */
+    uint8_t buf[64] = {0};
+    uint32_t got = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 103, 0, buf, sizeof buf, &got));
+    STM_ASSERT_EQ(got, sizeof VALUE - 1);
+    STM_ASSERT_TRUE(memcmp(buf, VALUE, sizeof VALUE - 1) == 0);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 103));
+    STM_ASSERT_OK(stm_9p_clunk(c, 102));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Txattrwalk with empty name → LIST mode. After creating two xattrs, the
+ * returned buffer is the NUL-separated names list. */
+STM_TEST(p9_client_xattrwalk_list_mode)
+{
+    client_fixture f = make_client_fixture("xattr_list");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    /* Create target. */
+    stm_9p_qid clone_qids[STM_9P_MAX_WALK];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 0, NULL, clone_qids, &walked));
+    stm_9p_qid lq;
+    STM_ASSERT_OK(stm_9p_lcreate(c, 101, "y.txt",
+                                    STM_9P_O_RDWR, 0644u, 0, &lq, NULL));
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+
+    /* Set "user.a" = "1" via fresh fid 102. */
+    const char *names[] = { "y.txt" };
+    stm_9p_qid wqids[1];
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 102, 1, names, wqids, &walked));
+    STM_ASSERT_OK(stm_9p_xattrcreate(c, 102, "user.a", 1, 0));
+    uint32_t written = 0;
+    STM_ASSERT_OK(stm_9p_write(c, 102, 0, (const uint8_t *)"1", 1, &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 102));
+
+    /* Set "user.b" = "22" via fresh fid 102. */
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 102, 1, names, wqids, &walked));
+    STM_ASSERT_OK(stm_9p_xattrcreate(c, 102, "user.b", 2, 0));
+    STM_ASSERT_OK(stm_9p_write(c, 102, 0, (const uint8_t *)"22", 2, &written));
+    STM_ASSERT_OK(stm_9p_clunk(c, 102));
+
+    /* Txattrwalk with empty name → LIST. */
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 102, 1, names, wqids, &walked));
+    uint64_t list_size = 0;
+    STM_ASSERT_OK(stm_9p_xattrwalk(c, 102, 103, /*name=*/NULL, &list_size));
+    /* Expect "user.a\0user.b\0" = 14 bytes. */
+    STM_ASSERT_EQ(list_size, 14u);
+
+    /* Drain. */
+    uint8_t buf[64] = {0};
+    uint32_t got = 0;
+    STM_ASSERT_OK(stm_9p_read(c, 103, 0, buf, sizeof buf, &got));
+    STM_ASSERT_EQ(got, 14u);
+    /* Names are NUL-separated; both must appear (server iteration order
+     * is implementation-defined, so check both possibilities). */
+    bool a_then_b = memcmp(buf, "user.a\0user.b\0", 14) == 0;
+    bool b_then_a = memcmp(buf, "user.b\0user.a\0", 14) == 0;
+    STM_ASSERT_TRUE(a_then_b || b_then_a);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 103));
+    STM_ASSERT_OK(stm_9p_clunk(c, 102));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Txattrwalk on a non-existent xattr → STM_ENODATA. */
+STM_TEST(p9_client_xattrwalk_missing_xattr_enodata)
+{
+    client_fixture f = make_client_fixture("xattr_miss");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    /* Create empty target. */
+    stm_9p_qid clone_qids[STM_9P_MAX_WALK];
+    uint16_t walked = 0;
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 101, 0, NULL, clone_qids, &walked));
+    stm_9p_qid lq;
+    STM_ASSERT_OK(stm_9p_lcreate(c, 101, "empty.txt",
+                                    STM_9P_O_RDWR, 0644u, 0, &lq, NULL));
+    STM_ASSERT_OK(stm_9p_clunk(c, 101));
+
+    const char *names[] = { "empty.txt" };
+    stm_9p_qid wqids[1];
+    STM_ASSERT_OK(stm_9p_walk(c, 100, 102, 1, names, wqids, &walked));
+    uint64_t sz = 0;
+    stm_status rc = stm_9p_xattrwalk(c, 102, 103, "user.nope", &sz);
+    STM_ASSERT_EQ(rc, STM_ENODATA);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 102));
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
+/* Lib-side validation: newfid == fid refused; NULL out_size refused;
+ * oversize name refused. */
+STM_TEST(p9_client_xattrwalk_invalid_args_einval)
+{
+    client_fixture f = make_client_fixture("xattr_inv");
+
+    stm_9p_dial_opts o = default_dial_opts(100);
+    stm_9p_client *c = NULL;
+    STM_ASSERT_OK(retry_dial(g_sock_path, &o, &c));
+
+    uint64_t sz = 0;
+    STM_ASSERT_EQ(stm_9p_xattrwalk(c, 100, 100, "user.x", &sz), STM_EINVAL);
+    STM_ASSERT_EQ(stm_9p_xattrwalk(c, 100, 101, "user.x", NULL), STM_EINVAL);
+
+    /* Oversize name. */
+    char oversize[STM_9P_NAME_MAX + 2];
+    memset(oversize, 'x', sizeof oversize - 1);
+    oversize[sizeof oversize - 1] = '\0';
+    STM_ASSERT_EQ(stm_9p_xattrwalk(c, 100, 101, oversize, &sz), STM_EINVAL);
+
+    /* xattrcreate: NULL or empty name. */
+    STM_ASSERT_EQ(stm_9p_xattrcreate(c, 100, NULL, 1, 0), STM_EINVAL);
+    STM_ASSERT_EQ(stm_9p_xattrcreate(c, 100, "",   1, 0), STM_EINVAL);
+    STM_ASSERT_EQ(stm_9p_xattrcreate(c, 100, oversize, 1, 0), STM_EINVAL);
+
+    STM_ASSERT_OK(stm_9p_clunk(c, 100));
+    stm_9p_close(c);
+    destroy_client_fixture(&f);
+}
+
 STM_TEST_MAIN("9p_client")

@@ -1735,6 +1735,126 @@ stm_status stm_9p_fadvise(stm_9p_client *c, uint32_t fid,
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
+/* Txattrwalk / Txattrcreate (P9.5-POLISH-1).                              */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/* Validate an xattr name. Differs from validate_name_for_lib:
+ *   - Caller-empty name is OK (LIST-mode signal for Txattrwalk).
+ *   - "." / ".." are valid xattr names (no POSIX-path constraints).
+ *   - Embedded NUL still refused; max length still STM_9P_NAME_MAX.
+ * Returns *out_len = nlen (0 for empty). */
+static stm_status validate_xattr_name(const char *name, size_t *out_len)
+{
+    if (!name) { *out_len = 0; return STM_OK; }
+    size_t nl = strlen(name);
+    if (nl > STM_9P_NAME_MAX) return STM_EINVAL;
+    *out_len = nl;
+    return STM_OK;
+}
+
+stm_status stm_9p_xattrwalk(stm_9p_client *c,
+                               uint32_t fid, uint32_t newfid,
+                               const char *name,
+                               uint64_t *out_size)
+{
+    stm_status ec = op_entry_check(c);
+    if (ec != STM_OK) return ec;
+    if (!out_size) return STM_EINVAL;
+    if (newfid == fid) return STM_EINVAL;
+    size_t nl = 0;
+    ec = validate_xattr_name(name, &nl);
+    if (ec != STM_OK) return ec;
+
+    /* Wire: hdr + fid(4) + newfid(4) + nlen(2) + name(nl). */
+    uint32_t msg_size = STM_9P_HDR_SIZE + 4u + 4u + 2u + (uint32_t)nl;
+    if (msg_size > c->buf_cap) return STM_ERANGE;
+    uint16_t tag = 0;
+    stm_status rc = alloc_tag(c, &tag);
+    if (rc != STM_OK) return rc;
+
+    uint8_t *wp = c->buf;
+    p_u32(wp, msg_size);
+    wp[4] = STM_9P_TXATTRWALK;
+    p_u16(wp + 5, tag);
+    uint8_t *bp = wp + 7;
+    p_u32(bp, fid);              bp += 4;
+    p_u32(bp, newfid);           bp += 4;
+    p_u16(bp, (uint16_t)nl);     bp += 2;
+    if (nl) {
+        memcpy(bp, name, nl);
+        bp += nl;
+    }
+    rc = send_msg(c, msg_size);
+    if (rc != STM_OK) return rc;
+
+    uint32_t reply_size = 0;
+    rc = recv_msg(c, &reply_size);
+    if (rc != STM_OK) return rc;
+    const uint8_t *body = NULL;
+    uint32_t body_len = 0;
+    rc = check_reply(c, reply_size, STM_9P_RXATTRWALK, tag, &body, &body_len);
+    if (rc != STM_OK) return rc;
+    /* Rxattrwalk body: size(8). Strict equality. */
+    if (body_len != 8u) {
+        c->last_errno = EPROTO;
+        return STM_EBACKEND;
+    }
+    *out_size = g_u64(body);
+    return STM_OK;
+}
+
+stm_status stm_9p_xattrcreate(stm_9p_client *c, uint32_t fid,
+                                 const char *name,
+                                 uint64_t attr_size, uint32_t flags)
+{
+    stm_status ec = op_entry_check(c);
+    if (ec != STM_OK) return ec;
+    if (!name) return STM_EINVAL;
+    size_t nl = strlen(name);
+    if (nl == 0 || nl > STM_9P_NAME_MAX) return STM_EINVAL;
+    /* Refuse embedded NUL pre-flight (strlen would have already stopped
+     * at the first NUL; this defends against a future caller passing a
+     * (ptr, len) pair through a wrapper). */
+    for (size_t i = 0; i < nl; i++) {
+        if (name[i] == '\0') return STM_EINVAL;
+    }
+
+    /* Wire: hdr + fid(4) + nlen(2) + name(nl) + attr_size(8) + flags(4). */
+    uint32_t msg_size = STM_9P_HDR_SIZE + 4u + 2u + (uint32_t)nl + 8u + 4u;
+    if (msg_size > c->buf_cap) return STM_ERANGE;
+    uint16_t tag = 0;
+    stm_status rc = alloc_tag(c, &tag);
+    if (rc != STM_OK) return rc;
+
+    uint8_t *wp = c->buf;
+    p_u32(wp, msg_size);
+    wp[4] = STM_9P_TXATTRCREATE;
+    p_u16(wp + 5, tag);
+    uint8_t *bp = wp + 7;
+    p_u32(bp, fid);              bp += 4;
+    p_u16(bp, (uint16_t)nl);     bp += 2;
+    memcpy(bp, name, nl);        bp += nl;
+    p_u64(bp, attr_size);        bp += 8;
+    p_u32(bp, flags);            bp += 4;
+    rc = send_msg(c, msg_size);
+    if (rc != STM_OK) return rc;
+
+    uint32_t reply_size = 0;
+    rc = recv_msg(c, &reply_size);
+    if (rc != STM_OK) return rc;
+    const uint8_t *body = NULL;
+    uint32_t body_len = 0;
+    rc = check_reply(c, reply_size, STM_9P_RXATTRCREATE, tag, &body, &body_len);
+    if (rc != STM_OK) return rc;
+    if (body_len != 0u) {
+        c->last_errno = EPROTO;
+        return STM_EBACKEND;
+    }
+    (void)body;
+    return STM_OK;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
 /* Tclunk.                                                                 */
 /* ────────────────────────────────────────────────────────────────────── */
 

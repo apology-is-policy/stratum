@@ -19,6 +19,9 @@
  *   - Filesystem stats: Tstatfs (P9.5-POLISH-1).
  *   - Stratum extensions: Tsync / Treflink / Tfallocate / Tfadvise
  *     (P9.5-POLISH-1; server-side P9-9P-3).
+ *   - Extended attributes: Txattrwalk (LIST + VALUE-read aux fids) +
+ *     Txattrcreate (in-place fid repurpose for atomic VALUE-write at
+ *     Tclunk; P9.5-POLISH-1).
  *   - Synchronous one-op-at-a-time client: each call sends a Tmsg
  *     and blocks on the matching Rmsg. Single-threaded by design;
  *     callers wanting concurrent ops open multiple connections.
@@ -34,9 +37,6 @@
  *     v2/src/9p/server.c (dispatcher returns ENOSYS); the client
  *     primitive will land alongside the server handler in a follow-on
  *     chunk (P9-LIB-1e or whichever ships first).
- *   - Txattrwalk / Txattrcreate (server present, client deferred to
- *     a follow-on POLISH-1 chunk pairing with the aux-fid lifecycle
- *     contract).
  *   - Async API (P9-LIB-2): pipelined Txx with reply matching by tag,
  *     io_uring transport, callback-based completion.
  *   - Tflush for cancellation. v2.0 sync client doesn't need it
@@ -707,6 +707,77 @@ STM_MUST_USE
 stm_status stm_9p_fadvise(stm_9p_client *c, uint32_t fid,
                              uint64_t offset, uint64_t length,
                              uint32_t advice);
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* Txattrwalk / Txattrcreate (P9.5-POLISH-1).                              */
+/*                                                                         */
+/* Linux extended-attribute access. Two flavors:                          */
+/*   - Txattrwalk: read side. Binds `newfid` to an aux fid that holds a   */
+/*     server-materialized buffer:                                         */
+/*       * `name == NULL` or empty → LIST mode (NUL-separated xattr names */
+/*         buffer; Linux listxattr shape).                                 */
+/*       * `name != NULL` non-empty → VALUE-read mode (the named xattr's  */
+/*         value).                                                         */
+/*     `*out_size` reports the buffer's byte length. Caller drains via    */
+/*     `stm_9p_read(c, newfid, offset, …)` and `stm_9p_clunk(c, newfid)`. */
+/*   - Txattrcreate: write side. Repurposes `fid` (an existing NODE fid)  */
+/*     IN PLACE into an AUX_XATTR_WRITE buffer that accumulates           */
+/*     `attr_size` bytes via subsequent `stm_9p_write(c, fid, …)` calls.  */
+/*     `stm_9p_clunk(c, fid)` atomically commits via `stm_fs_setxattr` if */
+/*     the announced size has been fully filled (else discards). Tread   */
+/*     on the write-flavor fid returns EINVAL.                            */
+/*                                                                         */
+/* Aux-fid lifecycle: a Txattrwalk-allocated newfid is a separate fid     */
+/* slot (no NODE rebind); caller MUST Tclunk it. A Txattrcreate-          */
+/* repurposed fid is the SAME slot as input — caller MUST Twalk-clone the */
+/* node fid first if it wants to preserve a NODE binding to the inode.   */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/* Txattrwalk: bind `newfid` to a server-materialized xattr buffer for the
+ * inode bound at `fid`. `name == NULL` is treated as "" (LIST mode).
+ *
+ * Server v2.0 caps xattr name length at 255 bytes; over-cap names return
+ * STM_ENAMETOOLONG. Empty `name` is the LIST flavor.
+ *
+ * On success `*out_size` is populated with the buffer's byte length;
+ * caller drains via stm_9p_read on `newfid`. `*out_size` may be 0
+ * (empty list / empty value).
+ *
+ * Returns:
+ *   - STM_OK on success.
+ *   - STM_EINVAL on NULL c / out_size, name contains embedded NUL,
+ *     `newfid == fid`, or name length > STM_9P_NAME_MAX.
+ *   - STM_ENODATA if VALUE flavor and the named xattr doesn't exist.
+ *   - Any Rlerror's mapped status. */
+STM_MUST_USE
+stm_status stm_9p_xattrwalk(stm_9p_client *c,
+                               uint32_t fid, uint32_t newfid,
+                               const char *name,
+                               uint64_t *out_size);
+
+/* Txattrcreate: repurpose `fid` into an AUX_XATTR_WRITE buffer for the
+ * named xattr. The caller MUST then write exactly `attr_size` bytes
+ * via stm_9p_write at sequential offsets (append-only — Twrite at any
+ * offset other than the current accumulated length returns STM_EINVAL),
+ * then stm_9p_clunk to atomically commit via stm_fs_setxattr.
+ *
+ * `flags` is a Linux XATTR_CREATE (0x1) / XATTR_REPLACE (0x2) bitmask;
+ * server-side stm_fs_setxattr enforces.
+ *
+ * After this call returns OK, `fid` is no longer usable as a NODE fid
+ * (until a subsequent Tclunk + re-bind). Callers that need to keep a
+ * navigation binding to the inode MUST Twalk-clone first.
+ *
+ * Returns:
+ *   - STM_OK on success — fid repurposed; caller must Twrite + Tclunk.
+ *   - STM_EINVAL on NULL c / NULL or empty name, embedded NUL in name,
+ *     or name length > STM_9P_NAME_MAX.
+ *   - STM_EFBIG if attr_size > 64 KiB (server's STM_FS_XATTR_VALUE_MAX).
+ *   - Any Rlerror's mapped status. */
+STM_MUST_USE
+stm_status stm_9p_xattrcreate(stm_9p_client *c, uint32_t fid,
+                                 const char *name,
+                                 uint64_t attr_size, uint32_t flags);
 
 /* Tgetattr: fetch Linux-stat attributes for `fid`. `request_mask`
  * specifies which fields to populate; common values are
