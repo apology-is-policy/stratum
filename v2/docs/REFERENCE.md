@@ -38,45 +38,59 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9.5-PARALLEL-3 spec phase — per-inode `fs->lock`
-  granularity refinement (this commit; SPEC ONLY, no impl yet). The
-  chunk lays down the formal model + design doc that the multi-commit
-  impl phase (future sessions) will reference.
-  - `v2/docs/p9.5-parallel-3-design.md` enumerates the refinement
-    strategy: three-tier locking (fs->global SH/EX → per-dataset (future)
-    → per-inode mutex), ascending `(dataset_id, ino)` lock acquisition
-    order, classification of every public `stm_fs_*` mutating function
-    into single-inode / 2-inode / 3-inode / 4-inode (rename) /
-    dataset-wide buckets. PARALLEL-2's contract (per-sub linearizable
-    + cross-sub eventually-consistent) is PRESERVED; what changes is
+- **Tip**: Reference-doc backfill — Phase 8 modules (this commit;
+  DOC-ONLY). Closes the Phase 9 deferment forward-noted in CLAUDE.md
+  (R96 P3-8): per-subsystem `reference/NN-*.md` catalog for the
+  Phase 8 POSIX-surface modules.
+  - New: `v2/docs/reference/16-inode.md` (inode allocator + index;
+    `inode.tla::TupleUniqueAllTime`; AllocReused gen-bump; orphan
+    O_TMPFILE lifecycle; persistence + Merkle root binding).
+  - New: `v2/docs/reference/17-dirent.md` (open-addressing dirent
+    layer; `dirent.tla::Reachable` + `NoColliderShadowing`;
+    TOMBSTONE-vs-WHITEOUT semantic split; readdir cursor stability;
+    Swap atomicity).
+  - New: `v2/docs/reference/18-xattr.md` (open-addressing xattr
+    layer; structurally isomorphic to dirent write-side keyed on
+    `ino` instead of `dir_ino`; R71 P1-1 + R77 P1-1 doctrine;
+    `xattr_csum` is the 10th input to the Merkle root).
+  - New: `v2/docs/reference/19-locks.md` (advisory lock table;
+    `locks.tla::NoConflictingLocks`; per-fs in-RAM; non-blocking
+    F_SETLK; F_SETLKW deferred).
+  - Updated: `v2/docs/REFERENCE.md` Contents index now lists
+    15-cas.md (was missing) + the four new 16..19 entries. Each
+    entry follows the existing template: Purpose, Public API,
+    Implementation, Spec cross-reference, SPEC-TO-CODE mapping,
+    Tests, Status table.
+  - Phase 9 modules (`9p/`, `lp9/`, `cmd/stratumd/`, `ctl/`,
+    `9p_client/`) remain forward-noted; a follow-on session
+    backfills 20..23 along the same template.
+  - **No code change in this commit** — pure documentation;
+    ctest unchanged 54/54 GREEN.
+
+- **Pre-tip-1**: P9.5-PARALLEL-3 spec phase (`d57774c`) — per-inode
+  `fs->lock` granularity refinement (SPEC ONLY, no impl yet). Lays
+  down the formal model + design doc the multi-commit impl phase
+  (future sessions) will reference.
+  - `v2/docs/p9.5-parallel-3-design.md` enumerates three-tier
+    locking (fs->global SH/EX → per-dataset (future) → per-inode
+    mutex), ascending `(dataset_id, ino)` lock acquisition order,
+    classification of every public `stm_fs_*` mutating function
+    into single/2/3/4-inode + dataset-wide buckets. PARALLEL-2's
+    contract (per-sub linearizable + cross-sub eventually-
+    consistent) is PRESERVED; what changes is
     `WriterCompoundOpAtomicVsWriter` (one big-fs-lock) refines to
     `WriterAtomicPerInode` (one writer per inode lock).
   - `v2/specs/compound_ops_per_inode.tla` extends `compound_ops.tla`
     with `Inodes` constant + `inode_lock_holder` map + per-writer
     `op_targets`/`held` sets. 6 invariants: TypeOK,
-    WriterAtomicPerInode, LockOrderPreserved (held is a prefix of
-    op_targets sorted ascending), NoCircularWait (no 2-cycle in the
-    wait-for graph; sufficient for the minimal deadlock counterexample),
-    PerSubsystemLinearizable (inherited), NoNegativeCounters (inherited).
-  - 3 cfgs: main healthy + `compound_ops_per_inode_out_of_order_buggy`
-    (BuggyOutOfOrderAcquire=TRUE; trips LockOrderPreserved /
-    NoCircularWait) + `compound_ops_per_inode_release_one_inode_mid_buggy`
-    (BuggyReleaseOneInodeMid=TRUE; trips LockOrderPreserved). Each cfg
-    header documents the expected TLC verdict.
-  - Bounds: Writers={w1,w2}, NumInodes=2, MaxOps=2, MaxStepsPerOp=1.
-    The 2-inode × 2-writer model is the minimal counterexample for
-    cyclic-wait deadlock under out-of-order acquisition.
-  - **No CLAUDE.md change in this commit** — the audit-trigger
-    surfaces are still under the big-fs-lock regime; future impl
-    commits will update CLAUDE.md per the chunk plan in design doc §6.
-  - **No code change in this commit** — fs.c, inode.c, REFERENCE.md
-    only see the spec + design doc land. ctest unchanged 54/54 GREEN.
-  - Outstanding sub-tasks: TLC verification of
-    `compound_ops_per_inode.tla` (tooling-gated like #958/#966); the
-    impl phase (steps 2-9 in design doc §6) is multi-commit and
-    deferred to fresh sessions.
+    WriterAtomicPerInode, LockOrderPreserved, NoCircularWait,
+    PerSubsystemLinearizable (inherited), NoNegativeCounters
+    (inherited). 3 cfgs: main + out-of-order buggy + release-one-
+    inode-mid buggy.
+  - Outstanding: TLC verification (#973 tooling-gated); impl-1..6
+    multi-commit deferred.
 
-- **Pre-tip-1**: P9.5-PARALLEL-2 — compound-op race-class audit + formal
+- **Pre-tip-2**: P9.5-PARALLEL-2 — compound-op race-class audit + formal
   spec + regression test. The chunk verifies and
   documents the contract that emerges under post-PARALLEL-1
   concurrent /ctl/: **per-subsystem linearizable + cross-subsystem
@@ -122,7 +136,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   - Outstanding: TLC verification of compound_ops.tla (tooling-gated
     like #958; expected verdicts documented in each cfg header).
 
-- **Pre-tip-2**: P9.5-PARALLEL-1 — stm_ctl_conn split + concurrent /ctl/
+- **Pre-tip-3**: P9.5-PARALLEL-1 — stm_ctl_conn split + concurrent /ctl/
   accept + R131 audit close + #961 dedicated concurrent regression
   tests. `v2/include/stratum/ctl.h` declares the new
   per-connection wrapper API (`stm_ctl_conn_create` / `_destroy` /
@@ -163,7 +177,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   row + stratumd row updated. Outstanding sub-task: #958 (TLC
   verify ctl_conn.tla, tooling-gated).
 
-- **Pre-tip-3**: P9-CTL-2b /ctl/ codec migration to lp9.
+- **Pre-tip-4**: P9-CTL-2b /ctl/ codec migration to lp9.
   `v2/src/ctl/synfs.c` + `v2/include/stratum/ctl.h` + `v2/tests/test_ctl.c`
   all re-keyed from `stm_p9_server` (9P2000 vops) to `stm_lp9_server`
   (.L vops). The `KIND_META[]` table, `qid_path` encoding, materializer
@@ -2119,6 +2133,11 @@ reference below covers the as-built layers in bottom-up order.
 | [12-dataset.md](reference/12-dataset.md) | Dataset hierarchy + properties + clones | large |
 | [13-snapshot.md](reference/13-snapshot.md) | Snapshot index + clone-check hook | medium |
 | [14-extent.md](reference/14-extent.md) | Extent index (P7-2 MVP + P7-3 persistence + P7-4 fs/sync COW path) | medium |
+| [15-cas.md](reference/15-cas.md) | CAS cold-tier index (P7-CAS, v18+) | large |
+| [16-inode.md](reference/16-inode.md) | Inode allocator + index (P8-POSIX-1+1b, v24) | large |
+| [17-dirent.md](reference/17-dirent.md) | Dirent index (open-addressing; P8-POSIX-2, v25) | large |
+| [18-xattr.md](reference/18-xattr.md) | Xattr index (open-addressing; P8-POSIX-6, v26) | medium |
+| [19-locks.md](reference/19-locks.md) | Advisory lock table (P8-POSIX-7d) | small |
 
 This is a live document — every phase-chunk commit that touches a
 subsystem updates the corresponding section in the same PR.
