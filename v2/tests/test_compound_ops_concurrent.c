@@ -860,8 +860,8 @@ typedef struct {
     atomic_bool done;
 } reflink_ctx;
 
-/* Each iteration: create src + dst (both regular files), copy_file_range
- * src → dst (whole file, MVP scope), then unlink both. */
+/* Each iteration: create src + dst (both regular files), reflink
+ * src → dst (empty-extent share), then unlink both. */
 static void *reflink_thread(void *arg)
 {
     reflink_ctx *s = (reflink_ctx *)arg;
@@ -879,8 +879,8 @@ static void *reflink_thread(void *arg)
                                               (uint8_t)src_len,
                                               0100644, 0, 0, &src_ino);
         if (rc != STM_OK) { atomic_store(&s->err, (int)rc); break; }
-        /* No write — src stays at size 0; copy_file_range len=0 is a
-         * legal POSIX no-op. We exercise reflink directly. */
+        /* No write — src stays at size 0. Exercises the empty-extent
+         * reflink share path under SH+pin. */
         uint64_t dst_ino = 0;
         rc = stm_fs_create_file(s->fs, s->dataset_id, s->parent_ino,
                                    (const uint8_t *)dst_name,
@@ -966,6 +966,116 @@ STM_TEST(per_inode_reflink_disjoint_files_shared_parent) {
     STM_ASSERT_EQ(0, atomic_load(&cb.err));
     STM_ASSERT_EQ(REFLINK_ITERATIONS, atomic_load(&ca.completed));
     STM_ASSERT_EQ(REFLINK_ITERATIONS, atomic_load(&cb.completed));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* ── PARALLEL-3 impl-4 R135 P2-2: cfr concurrency ──────────────────── */
+
+/* Each iteration: create src (regular file) + write 1 KiB to it (so
+ * src has a real extent; size > 0 means cfr's size-validation path
+ * fires AND the SH+pin happy path runs end-to-end, including the R84
+ * P2-1 TOCTOU size-check under the pin), create dst, copy_file_range
+ * src → dst (len=1024), then unlink both. */
+static void *cfr_thread(void *arg)
+{
+    reflink_ctx *s = (reflink_ctx *)arg;
+    static const size_t CFR_BYTES = 1024u;
+    uint8_t payload[1024];
+    for (size_t i = 0; i < sizeof payload; i++) payload[i] = (uint8_t)(i & 0xFF);
+
+    for (unsigned i = 0; i < s->iterations; i++) {
+        char src_name[64], dst_name[64];
+        snprintf(src_name, sizeof src_name, "%s_%u", s->src_prefix, i);
+        snprintf(dst_name, sizeof dst_name, "%s_%u", s->dst_prefix, i);
+        size_t src_len = strlen(src_name);
+        size_t dst_len = strlen(dst_name);
+
+        uint64_t src_ino = 0;
+        stm_status rc = stm_fs_create_file(s->fs, s->dataset_id,
+                                              s->parent_ino,
+                                              (const uint8_t *)src_name,
+                                              (uint8_t)src_len,
+                                              0100644, 0, 0, &src_ino);
+        if (rc != STM_OK) { atomic_store(&s->err, (int)rc); break; }
+        rc = stm_fs_write(s->fs, s->dataset_id, src_ino, 0,
+                              payload, CFR_BYTES);
+        if (rc != STM_OK) { atomic_store(&s->err, (int)rc); break; }
+
+        uint64_t dst_ino = 0;
+        rc = stm_fs_create_file(s->fs, s->dataset_id, s->parent_ino,
+                                   (const uint8_t *)dst_name,
+                                   (uint8_t)dst_len,
+                                   0100644, 0, 0, &dst_ino);
+        if (rc != STM_OK) { atomic_store(&s->err, (int)rc); break; }
+
+        uint64_t copied = 0;
+        rc = stm_fs_copy_file_range(s->fs,
+                                        s->dataset_id, src_ino, 0,
+                                        s->dataset_id, dst_ino, 0,
+                                        CFR_BYTES, &copied);
+        if (rc != STM_OK) { atomic_store(&s->err, (int)rc); break; }
+        if (copied != CFR_BYTES) {
+            atomic_store(&s->err, (int)STM_ECORRUPT);
+            break;
+        }
+
+        rc = stm_fs_unlink(s->fs, s->dataset_id, s->parent_ino,
+                              (const uint8_t *)dst_name, (uint8_t)dst_len);
+        if (rc != STM_OK) { atomic_store(&s->err, (int)rc); break; }
+        rc = stm_fs_unlink(s->fs, s->dataset_id, s->parent_ino,
+                              (const uint8_t *)src_name, (uint8_t)src_len);
+        if (rc != STM_OK) { atomic_store(&s->err, (int)rc); break; }
+        atomic_fetch_add(&s->completed, 1u);
+    }
+    atomic_store(&s->done, true);
+    return NULL;
+}
+
+/* Two writers churning create+write+create+cfr+unlink against the SAME
+ * parent dir with DISJOINT name prefixes. Exercises the SH+pin happy
+ * path of stm_fs_copy_file_range (which has the R84 P2-1 size-
+ * validation TOCTOU step in addition to the reflink machinery). */
+STM_TEST(per_inode_cfr_disjoint_files_shared_parent) {
+    make_tmp("per_inode_cfr_disjoint");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t ds_id = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "cfr_ds", &ds_id));
+    uint64_t root_ino = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, ds_id, 0755u, 0, 0, &root_ino));
+    STM_ASSERT_EQ(root_ino, 1u);
+
+    /* Use fewer iterations than reflink test — each cfr iter does an
+     * extra write + the size-validation lookup, so wall-time is higher
+     * per-iter. 50 × 2 threads is plenty for race-class coverage. */
+    reflink_ctx ca = { 0 }, cb = { 0 };
+    ca.fs = fs; ca.dataset_id = ds_id;
+    ca.parent_ino = 1u;
+    ca.src_prefix = "sa"; ca.dst_prefix = "da";
+    ca.iterations = 50u;
+    cb.fs = fs; cb.dataset_id = ds_id;
+    cb.parent_ino = 1u;
+    cb.src_prefix = "sb"; cb.dst_prefix = "db";
+    cb.iterations = 50u;
+
+    pthread_t at, bt;
+    STM_ASSERT_EQ(0, pthread_create(&at, NULL, cfr_thread, &ca));
+    STM_ASSERT_EQ(0, pthread_create(&bt, NULL, cfr_thread, &cb));
+
+    STM_ASSERT(wait_two_reflink(&ca, &cb, at, bt));
+
+    STM_ASSERT_EQ(0, atomic_load(&ca.err));
+    STM_ASSERT_EQ(0, atomic_load(&cb.err));
+    STM_ASSERT_EQ(50u, atomic_load(&ca.completed));
+    STM_ASSERT_EQ(50u, atomic_load(&cb.completed));
 
     STM_ASSERT_OK(stm_fs_unmount(fs));
     unlink(g_tmp_path);

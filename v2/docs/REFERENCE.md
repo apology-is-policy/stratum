@@ -59,15 +59,26 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   - **`fs_reflink_locked` unchanged**: seal enforcement + non-EXTENT-
     source refusal + post-success stamping still runs serially under
     the caller's lock context (now SH+pins instead of EX).
-  - **Regression test**: new `per_inode_reflink_disjoint_files_shared_parent`
-    in test_compound_ops_concurrent — two writers create+reflink+unlink
-    against the SAME parent dir with DISJOINT file-name prefixes.
-  - **ctest 54/54 GREEN** (test_compound_ops_concurrent now 7 cases).
-    Rust unit 97/97. e2e_crud 33/33. concurrent_ctl 2/2.
+  - **Regression tests**: `per_inode_reflink_disjoint_files_shared_parent`
+    (empty-extent reflink share path under SH+pin) +
+    `per_inode_cfr_disjoint_files_shared_parent` (cfr SH+pin happy path
+    including R84 P2-1 size-validation TOCTOU step + out_copied
+    contract; added at R135 close per P2-2) +
+    `fs_reflink_einval_preempts_erofs_on_rofs` in test_fs.c (pins the
+    arg-shape-validation-pre-empts-EROFS priority posture per R135 P2-1).
+  - **R135 audit close** (this commit): 0 P0, 0 P1, 3 P2 — all
+    test/doc-drift. P2-1 (priority shift on wedged/RO + invalid-arg)
+    documented + pinned via the new test. P2-2 (cfr SH+pin path had no
+    concurrent coverage) closed by the new cfr test. P2-3 (docstring
+    said "copy_file_range" but original test used reflink) closed
+    inline.
+  - **ctest 54/54 GREEN** (test_compound_ops_concurrent now 8 cases;
+    test_fs now 160 cases). Rust unit 97/97. e2e_crud 33/33.
+    concurrent_ctl 2/2.
   - **Next**: impl-5 retires the residual EX-takers (read-only ops
     + single-inode mutators not yet ported: truncate/fallocate/write/
     migrate_to_cold/promote_to_hot/create_snapshot/...). impl-6 lands
-    the perf regression test. R135 audit candidate after impl-5.
+    the perf regression test. R136 audit candidate after impl-5.
 
 - **Pre-tip-1**: R134 audit close (`2a117e9`). 0 P0, 0 P1, 3 P2 — all
   test/doc-drift; no impl correctness issue. Closed by adding

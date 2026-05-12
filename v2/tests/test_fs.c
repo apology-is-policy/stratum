@@ -1894,6 +1894,47 @@ STM_TEST(fs_reflink_snap_dual_overwrite_no_wedge) {
     unlink(g_key_path);
 }
 
+/* R135 P2-1: pin the priority of arg-shape validation over fs-state
+ * guards. impl-4 hoisted the (ds==0)/(ino==0)/(same-(ds,ino)) refusals
+ * BEFORE the rdlock + FS_GUARD_WRITE — so a wedged/RO fs receiving an
+ * invalid arg shape now returns STM_EINVAL (not STM_EWEDGED/EROFS).
+ * This is the documented posture: POSIX precedent has EINVAL pre-empt
+ * EROFS for arg-shape errors. Without pinning, a future refactor that
+ * re-orders the checks would silently change the surfaced error code. */
+STM_TEST(fs_reflink_einval_preempts_erofs_on_rofs) {
+    make_tmp("rl_priority");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    stm_fs_mount_opts ro = rw_mount_opts();
+    ro.read_only = true;
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &ro, &fs));
+
+    /* Arg-shape failures fire BEFORE the FS_GUARD_WRITE — so STM_EINVAL
+     * pre-empts STM_EROFS even on a read-only mount. */
+    STM_ASSERT_ERR(stm_fs_reflink(fs, 0, 1, 1, 2), STM_EINVAL);   /* src_ds == 0 */
+    STM_ASSERT_ERR(stm_fs_reflink(fs, 1, 0, 1, 2), STM_EINVAL);   /* src_ino == 0 */
+    STM_ASSERT_ERR(stm_fs_reflink(fs, 1, 1, 0, 2), STM_EINVAL);   /* dst_ds == 0 */
+    STM_ASSERT_ERR(stm_fs_reflink(fs, 1, 1, 1, 0), STM_EINVAL);   /* dst_ino == 0 */
+    STM_ASSERT_ERR(stm_fs_reflink(fs, 1, 1, 1, 1), STM_EINVAL);   /* same (ds, ino) */
+
+    /* copy_file_range inherits the same priority. */
+    uint64_t copied = 0;
+    STM_ASSERT_ERR(stm_fs_copy_file_range(fs, 0, 1, 0, 1, 2, 0, 4096, &copied),
+                        STM_EINVAL);
+    STM_ASSERT_EQ(copied, 0u);
+    STM_ASSERT_ERR(stm_fs_copy_file_range(fs, 1, 1, 0, 1, 1, 0, 4096, &copied),
+                        STM_EINVAL);
+    STM_ASSERT_EQ(copied, 0u);
+
+    /* A VALID-shape mutation on the RO fs still surfaces STM_EROFS. */
+    STM_ASSERT_ERR(stm_fs_reflink(fs, 1, 1, 1, 2), STM_EROFS);
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST(fs_reflink_rofs_refused) {
     /* RO mount → STM_EROFS at the FS_GUARD_WRITE. */
     make_tmp("rl_rofs");
