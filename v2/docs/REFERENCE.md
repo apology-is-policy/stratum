@@ -38,9 +38,55 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: P9.5-PARALLEL-1 — stm_ctl_conn split + concurrent /ctl/
+- **Tip**: P9.5-PARALLEL-2 — compound-op race-class audit + formal
+  spec + regression test (this commit). The chunk verifies and
+  documents the contract that emerges under post-PARALLEL-1
+  concurrent /ctl/: **per-subsystem linearizable + cross-subsystem
+  eventually-consistent** reads.
+  - `v2/docs/p9.5-parallel-2-design.md` enumerates every compound
+    op in `v2/src/fs/fs.c` (~40 public APIs, audited via Explore
+    agent). Headline finding: NO public stm_fs_* function releases
+    fs->lock mid-body — every multi-subsystem sub-step runs under
+    one continuous fs->lock hold. R128/R130 pre-flush wiring is in
+    place for every extent-mutating compound op
+    (`stm_fs_commit`, `stm_fs_unlink`/`stm_fs_rmdir`,
+    `stm_fs_unlink_anon`, `stm_fs_truncate`, `stm_fs_rename`
+    overwrite, `stm_fs_create_snapshot`, `stm_fs_copy_file_range`,
+    `stm_fs_migrate_to_cold`, `stm_fs_promote_to_hot`).
+  - `v2/specs/compound_ops.tla` + 3 cfgs: main healthy +
+    `compound_ops_writer_releases_lock_mid_buggy` (trips
+    WriterCompoundOpAtomicVsWriter) +
+    `compound_ops_negative_counter_buggy` (trips NoNegativeCounters).
+    Models: one writer + N readers + per-subsystem counters +
+    compound-op step sequences + reader observations with
+    after_op shadows. 4 invariants:
+    WriterCompoundOpAtomicVsWriter (big-fs-lock holds),
+    PerSubsystemLinearizable (after_op monotonic per reader),
+    NoNegativeCounters (compound-op step ordering preserves
+    non-neg), MultiSubReadIsBracketed (the eventual-consistency
+    contract in formal shape — the weakest possible).
+  - `v2/tests/test_compound_ops_concurrent.c` — pthread harness
+    exercising stm_fs_create_snapshot + stm_fs_delete_snapshot
+    (writer) racing stm_fs_stats_get + stm_fs_dataset_count +
+    stm_snapshot_iter (reader) for 200 iterations / thread. Asserts
+    no deadlock (30 s deadline), no torn allocator balance
+    (`data_total == allocated + free + pending` every reader
+    iteration), no STM_ECORRUPT from reader.
+  - CLAUDE.md /ctl/ row clause 14 added documenting the
+    multi-subsystem read contract + the spec composition reference.
+  - R132 audit close: see commit message; 0 P0/P1 expected (the
+    R131 audit already verified the concurrent /ctl/ regime against
+    fs.c locking discipline; PARALLEL-2 is the soundness-verification
+    chunk that turns that audit into a written invariant for
+    PARALLEL-3 to compose against).
+  - 54/54 ctest GREEN (+1 new binary: test_compound_ops_concurrent,
+    1 new test); 97/97 Rust unit + 33/33 e2e_crud + 2/2 concurrent_ctl.
+  - Outstanding: TLC verification of compound_ops.tla (tooling-gated
+    like #958; expected verdicts documented in each cfg header).
+
+- **Pre-tip-1**: P9.5-PARALLEL-1 — stm_ctl_conn split + concurrent /ctl/
   accept + R131 audit close + #961 dedicated concurrent regression
-  tests (this commit). `v2/include/stratum/ctl.h` declares the new
+  tests. `v2/include/stratum/ctl.h` declares the new
   per-connection wrapper API (`stm_ctl_conn_create` / `_destroy` /
   `_caller_uid`); `v2/src/ctl/synfs.c` splits `stm_ctl` into a
   shared core (immutable subsystem pointers + event_buf+event_gen

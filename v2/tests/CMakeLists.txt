@@ -89,6 +89,8 @@ stm_add_test(test_ctl_concurrent test_ctl_concurrent.c)
 target_link_libraries(test_ctl_concurrent PRIVATE stm_lp9)
 stm_add_test(test_ctl_conn_lifecycle test_ctl_conn_lifecycle.c)
 target_link_libraries(test_ctl_conn_lifecycle PRIVATE stm_lp9)
+stm_add_test(test_compound_ops_concurrent
+             test_compound_ops_concurrent.c test_fs_common.c)
 stm_add_test(test_lp9        test_lp9.c)
 target_link_libraries(test_lp9 PRIVATE stm_lp9)
 stm_add_test(test_stratum_fs test_stratum_fs.c test_fs_common.c)
