@@ -38,36 +38,48 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
 
 ## Snapshot
 
-- **Tip**: Reference-doc backfill — Phase 8 modules (this commit;
-  DOC-ONLY). Closes the Phase 9 deferment forward-noted in CLAUDE.md
-  (R96 P3-8): per-subsystem `reference/NN-*.md` catalog for the
-  Phase 8 POSIX-surface modules.
-  - New: `v2/docs/reference/16-inode.md` (inode allocator + index;
-    `inode.tla::TupleUniqueAllTime`; AllocReused gen-bump; orphan
-    O_TMPFILE lifecycle; persistence + Merkle root binding).
-  - New: `v2/docs/reference/17-dirent.md` (open-addressing dirent
-    layer; `dirent.tla::Reachable` + `NoColliderShadowing`;
-    TOMBSTONE-vs-WHITEOUT semantic split; readdir cursor stability;
-    Swap atomicity).
-  - New: `v2/docs/reference/18-xattr.md` (open-addressing xattr
-    layer; structurally isomorphic to dirent write-side keyed on
-    `ino` instead of `dir_ino`; R71 P1-1 + R77 P1-1 doctrine;
-    `xattr_csum` is the 10th input to the Merkle root).
-  - New: `v2/docs/reference/19-locks.md` (advisory lock table;
-    `locks.tla::NoConflictingLocks`; per-fs in-RAM; non-blocking
-    F_SETLK; F_SETLKW deferred).
-  - Updated: `v2/docs/REFERENCE.md` Contents index now lists
-    15-cas.md (was missing) + the four new 16..19 entries. Each
-    entry follows the existing template: Purpose, Public API,
-    Implementation, Spec cross-reference, SPEC-TO-CODE mapping,
-    Tests, Status table.
-  - Phase 9 modules (`9p/`, `lp9/`, `cmd/stratumd/`, `ctl/`,
-    `9p_client/`) remain forward-noted; a follow-on session
-    backfills 20..23 along the same template.
+- **Tip**: Reference-doc backfill — Phase 9 modules (this commit;
+  DOC-ONLY). Closes the second half of the Phase 9 deferment
+  forward-noted in CLAUDE.md (R96 P3-8): per-subsystem
+  `reference/NN-*.md` catalog for the Phase 9 9P-server + transport
+  + /ctl/ + client modules. With this commit, the catalog is
+  complete through index 23.
+  - New: `v2/docs/reference/20-9p.md` (filesystem-bound 9P2000.L
+    server; `fid.tla::IOReject` staleness gate; `namespace.tla`
+    per-connection bindings; Stratum extensions 124..139; 8 MiB
+    msize ceiling).
+  - New: `v2/docs/reference/21-stratumd.md` (Unix-socket daemon
+    transport; concurrent accept on FS + /ctl/ sockets per
+    PARALLEL-1; SO_PEERCRED + 0600 mode; R113 P1-1 signal-mask
+    discipline; shutdown ordering servers → ctl_destroy →
+    scrub_close → fs_unmount).
+  - New: `v2/docs/reference/22-ctl.md` (operator-state synthetic
+    FS on top of `stm_lp9_server`; 29-kind table; admin gate;
+    audit log; PARALLEL-1 `stm_ctl_conn` state split;
+    bulk-format `bulk_buf` pattern; stale-id discipline at
+    every walk + lopen + getattr).
+  - New: `v2/docs/reference/23-9p_client.md` (synchronous .L
+    libstratum-9p; tag auto-allocation; connection-poisoned
+    flag; caller-cap bound on every server-supplied count —
+    R111 doctrine; closed Linux-errno → stm_status mapping).
+  - Updated: `v2/docs/REFERENCE.md` Contents index now lists the
+    four new 20..23 entries. Each follows the existing template:
+    Purpose, Public API, Implementation, Spec cross-reference,
+    SPEC-TO-CODE mapping, Tests, Status table.
   - **No code change in this commit** — pure documentation;
     ctest unchanged 54/54 GREEN.
 
-- **Pre-tip-1**: P9.5-PARALLEL-3 spec phase (`d57774c`) — per-inode
+- **Pre-tip-1**: Reference-doc backfill — Phase 8 modules (`cac568c`;
+  DOC-ONLY). Per-subsystem `reference/NN-*.md` catalog for the
+  Phase 8 POSIX-surface modules: `16-inode.md`
+  (`inode.tla::TupleUniqueAllTime`), `17-dirent.md`
+  (`dirent.tla::Reachable` + `NoColliderShadowing`; TOMBSTONE vs
+  WHITEOUT), `18-xattr.md` (isomorphic to dirent write-side keyed
+  on `ino`; R71 P1-1 + R77 P1-1 doctrine), `19-locks.md`
+  (`locks.tla::NoConflictingLocks`). REFERENCE.md Contents index
+  also gained the previously-missing `15-cas.md` row.
+
+- **Pre-tip-2**: P9.5-PARALLEL-3 spec phase (`d57774c`) — per-inode
   `fs->lock` granularity refinement (SPEC ONLY, no impl yet). Lays
   down the formal model + design doc the multi-commit impl phase
   (future sessions) will reference.
@@ -90,7 +102,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   - Outstanding: TLC verification (#973 tooling-gated); impl-1..6
     multi-commit deferred.
 
-- **Pre-tip-2**: P9.5-PARALLEL-2 — compound-op race-class audit + formal
+- **Pre-tip-3**: P9.5-PARALLEL-2 — compound-op race-class audit + formal
   spec + regression test. The chunk verifies and
   documents the contract that emerges under post-PARALLEL-1
   concurrent /ctl/: **per-subsystem linearizable + cross-subsystem
@@ -136,7 +148,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   - Outstanding: TLC verification of compound_ops.tla (tooling-gated
     like #958; expected verdicts documented in each cfg header).
 
-- **Pre-tip-3**: P9.5-PARALLEL-1 — stm_ctl_conn split + concurrent /ctl/
+- **Pre-tip-4**: P9.5-PARALLEL-1 — stm_ctl_conn split + concurrent /ctl/
   accept + R131 audit close + #961 dedicated concurrent regression
   tests. `v2/include/stratum/ctl.h` declares the new
   per-connection wrapper API (`stm_ctl_conn_create` / `_destroy` /
@@ -177,7 +189,7 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
   row + stratumd row updated. Outstanding sub-task: #958 (TLC
   verify ctl_conn.tla, tooling-gated).
 
-- **Pre-tip-4**: P9-CTL-2b /ctl/ codec migration to lp9.
+- **Pre-tip-5**: P9-CTL-2b /ctl/ codec migration to lp9.
   `v2/src/ctl/synfs.c` + `v2/include/stratum/ctl.h` + `v2/tests/test_ctl.c`
   all re-keyed from `stm_p9_server` (9P2000 vops) to `stm_lp9_server`
   (.L vops). The `KIND_META[]` table, `qid_path` encoding, materializer
@@ -2138,6 +2150,10 @@ reference below covers the as-built layers in bottom-up order.
 | [17-dirent.md](reference/17-dirent.md) | Dirent index (open-addressing; P8-POSIX-2, v25) | large |
 | [18-xattr.md](reference/18-xattr.md) | Xattr index (open-addressing; P8-POSIX-6, v26) | medium |
 | [19-locks.md](reference/19-locks.md) | Advisory lock table (P8-POSIX-7d) | small |
+| [20-9p.md](reference/20-9p.md) | 9P2000.L filesystem server (P9-9P-1..3 + lib/transport co-spec) | large |
+| [21-stratumd.md](reference/21-stratumd.md) | Unix-socket daemon transport (P9-9P-4 + P9-CTL-2c + P9.5-PARALLEL-1) | medium |
+| [22-ctl.md](reference/22-ctl.md) | /ctl/ synthetic FS (P9-CTL-1..1e + P9.5-PARALLEL-1) | large |
+| [23-9p_client.md](reference/23-9p_client.md) | libstratum-9p — synchronous 9P2000.L client (P9-LIB-1..1d) | medium |
 
 This is a live document — every phase-chunk commit that touches a
 subsystem updates the corresponding section in the same PR.
