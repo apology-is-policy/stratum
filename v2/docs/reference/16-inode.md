@@ -263,6 +263,11 @@ duration of a per-inode compound op:
     (2-inode parent+child OR src+dst; create-shape uses parent-pin
     then fresh-child-pin per design doc §3.4; delete-shape uses the
     TOCTOU lookup-pin-reverify loop per §3.3)
+  - R133 close: `create_anon` now also pins its fresh new_ino for
+    defense-in-depth (P2-1) — was the lone impl-2 port that skipped
+    the pin under the "uncontended-by-construction" argument; pinning
+    closes a latent race surface should a future feature expose
+    new_ino mid-create
   - impl-3..5 (forward): rename overwrite + cross-dataset ops +
     drop residual EX takes
 

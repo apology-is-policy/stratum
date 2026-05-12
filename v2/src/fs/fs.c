@@ -22,9 +22,17 @@
  *
  * Lock hierarchy (held in this order, never reversed):
  *
- *   fs->global (rwlock, EX or SH) →
+ *   fs->global (rwlock, EX or SH; writer-preference attr on glibc
+ *               per R133 P1-1 to prevent EX-taker starvation under
+ *               sustained SH-traffic) →
  *      [per-inode handle->mu  →]      (PARALLEL-3 impl-1: SH path only)
  *      sync->lock  →  alloc->lock  →  alloc's btree rwlock
+ *
+ * NEVER call stm_fs_mark_wedged from inside a held fs->global wrlock —
+ * recursive same-thread wrlock is POSIX-undefined and deadlocks on
+ * glibc. R133 P1-2 fixed the latent rename rollback path; future
+ * compound ops with internal wedge-on-failure paths MUST capture the
+ * intent into a local bool and fire mark_wedged AFTER unlock.
  *
  * Public stm_fs entries:
  *   - Pre-PARALLEL-3 ops (the residual EX surface): take fs->global EX
@@ -431,7 +439,24 @@ static stm_fs *fs_new(stm_bdev *d, stm_pool *pool,
 {
     stm_fs *fs = calloc(1, sizeof *fs);
     if (!fs) return NULL;
-    if (pthread_rwlock_init(&fs->global, NULL) != 0) {
+    /* R133 P1-1: glibc default rwlock attribute is reader-preference;
+     * a continuous stream of SH-takers (the new PARALLEL-3 ported ops)
+     * can starve a queued EX-taker (stm_fs_unmount, stm_fs_commit,
+     * stm_fs_mark_wedged, every still-unported op) indefinitely. Set
+     * writer-preference where the attr is available (Linux/glibc).
+     * macOS / other POSIX: default attrs already give reasonable
+     * scheduler fairness; pass NULL. Same posture as pool.c:274. */
+#if defined(__linux__) && defined(PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP)
+    pthread_rwlockattr_t rwattr;
+    pthread_rwlockattr_init(&rwattr);
+    pthread_rwlockattr_setkind_np(&rwattr,
+        PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+    int rwrc = pthread_rwlock_init(&fs->global, &rwattr);
+    pthread_rwlockattr_destroy(&rwattr);
+#else
+    int rwrc = pthread_rwlock_init(&fs->global, NULL);
+#endif
+    if (rwrc != 0) {
         free(fs);
         return NULL;
     }
@@ -1560,8 +1585,18 @@ stm_status stm_fs_create_anon(stm_fs *fs, uint64_t dataset_id,
     /* PARALLEL-3 impl-2: orphan-create is fundamentally just an
      * allocator action — no other inode is involved, and the new_ino
      * is unreachable to other writers until the caller publishes it.
-     * SH is sufficient; no pin is needed (no other writer can
-     * resolve to a brand-new orphan that hasn't been linked yet). */
+     * SH is sufficient.
+     *
+     * R133 P2-1 (R133 close): defense-in-depth — also pin the
+     * fresh new_ino across the stamp+set sequence. Matches the
+     * design doc §3.4 posture used by every other CREATE-shape
+     * port (fs_create_inode_and_link, stm_fs_symlink). The pin
+     * is uncontended by construction (no dirent points to new_ino
+     * yet, and the caller hasn't published it) but keeps the per-
+     * inode-mutex invariant uniform across the create surface so
+     * a future feature that exposes new_ino mid-create (e.g., a
+     * fid-bind hook for janus/9p before stamp completes) doesn't
+     * become a latent race. */
     pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
@@ -1579,6 +1614,16 @@ stm_status stm_fs_create_anon(stm_fs *fs, uint64_t dataset_id,
         return as;
     }
 
+    /* Pin the freshly-allocated orphan inode (R133 P2-1). Uncontended
+     * by construction per design §3.4. */
+    stm_inode_handle *h_child = NULL;
+    stm_status cp = stm_inode_pin(iidx, dataset_id, new_ino, &h_child);
+    if (cp != STM_OK) {
+        (void)stm_inode_free(iidx, dataset_id, new_ino);
+        pthread_rwlock_unlock(&fs->global);
+        return cp;
+    }
+
     /* Stamp creation timestamps + persist. The fresh-allocated record
      * is read back, stamped, and committed via stm_inode_set so the
      * post-create state is consistent (mirrors the regular
@@ -1594,6 +1639,7 @@ stm_status stm_fs_create_anon(stm_fs *fs, uint64_t dataset_id,
     }
 
     *out_child_ino = new_ino;
+    stm_inode_unpin(iidx, h_child);
     pthread_rwlock_unlock(&fs->global);
     return STM_OK;
 }
@@ -3452,6 +3498,15 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
         return STM_OK;
     }
 
+    /* R133 P1-2: capture wedge-intent through rollback failures and
+     * fire the actual mark_wedged AFTER pthread_rwlock_unlock. Calling
+     * stm_fs_mark_wedged from inside the held wrlock would self-
+     * deadlock on glibc rwlocks (POSIX: same-thread recursive wrlock
+     * is undefined). The wedge sites below are all "should not fire
+     * in current code-paths" defense-in-depth, but the latent
+     * deadlock was real. */
+    bool should_wedge = false;
+
     pthread_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
 
@@ -3672,13 +3727,14 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
                  * Wedge: data loss has already occurred from the
                  * caller's perspective (dst's content is gone) and
                  * the original alloc was unrecoverable. */
-                stm_fs_mark_wedged(fs);
+                should_wedge = true;
             }
             if (r1 != STM_OK || r2 != STM_OK) {
-                stm_fs_mark_wedged(fs);
+                should_wedge = true;
             }
         }
         pthread_rwlock_unlock(&fs->global);
+        if (should_wedge) stm_fs_mark_wedged(fs);
         return as;
     }
 
@@ -3715,20 +3771,21 @@ stm_status stm_fs_rename(stm_fs *fs, uint64_t dataset_id,
          * invariant. */
         stm_status r0 = stm_dirent_unlink(didx, dataset_id, dst_parent_ino,
                                                 dst_name, dst_name_len);
-        if (r0 != STM_OK) stm_fs_mark_wedged(fs);
+        if (r0 != STM_OK) should_wedge = true;
         if (dst_exists) {
             stm_status r1 = stm_dirent_alloc(didx, dataset_id, dst_parent_ino,
                                                   dst_name, dst_name_len,
                                                   dst_ino, dst_gen, dst_type);
             if (!dst_freed_unused) {
                 stm_status r2 = stm_inode_link(iidx, dataset_id, dst_ino);
-                if (r1 != STM_OK || r2 != STM_OK) stm_fs_mark_wedged(fs);
+                if (r1 != STM_OK || r2 != STM_OK) should_wedge = true;
             } else {
                 /* dst inode gone; can't restore. */
-                stm_fs_mark_wedged(fs);
+                should_wedge = true;
             }
         }
         pthread_rwlock_unlock(&fs->global);
+        if (should_wedge) stm_fs_mark_wedged(fs);
         return su;
     }
 
