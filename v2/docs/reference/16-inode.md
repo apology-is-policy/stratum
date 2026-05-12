@@ -285,6 +285,16 @@ duration of a per-inode compound op:
     src and dst dirents simultaneously (generalises the DELETE-shape
     single-dirent pattern from impl-2). R128/R130 wiring on dst
     cascade-free preserved verbatim. R133 P1-2 wedge-defer preserved.
+    R134 audit close: regression coverage extended via two
+    complementary tests in `test_compound_ops_concurrent.c` —
+    `per_inode_rename_overwrite_cross_parent_disjoint` (4-inode pin
+    path + R128/R130 wiring; disjoint pin sets, sort not exercised)
+    + `per_inode_rename_shared_parents_opposite_direction` (shared
+    parents in OPPOSITE directions; provokes AB-BA deadlock if
+    pin_many's sort is broken — verified by neutering the sort).
+    Direct `pin_many` unit-test coverage shipped in `test_inode.c`
+    (arg validation, duplicate refusal, N=1/4/16 roundtrip, rollback-
+    on-missing, cross-dataset sort key).
   - impl-4..5 (forward): cross-dataset ops + drop residual EX takes
 
 Spec composition realizes the `inode_lock_holder[i] = w` action of

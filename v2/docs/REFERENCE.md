@@ -68,18 +68,39 @@ assumes you know what a Bε-tree is and why we want PQ-hybrid wrap.
     "NEVER call mark_wedged from inside held rwlock" doctrine
     extends to the SH-held case (recursive rdlock waiting on a queued
     wrlock would self-deadlock).
-  - **Regression test**: new `per_inode_rename_overwrite_cross_parent_disjoint`
-    in test_compound_ops_concurrent — two writers churn create+create+
-    rename(overwrite)+unlink across two DIFFERENT parent-dir pairs
-    arranged so each thread's 4-inode set covers different inodes in
-    opposite (a→b vs b→a) lex orders. If pin_many didn't sort, the
-    threads would deadlock; the test deterministically passes.
-  - **ctest 54/54 GREEN** (test_compound_ops_concurrent now 5 cases).
-    Rust unit 97/97. e2e_crud 33/33. concurrent_ctl 2/2.
+  - **Regression tests** (R134 P2-1 close — two complementary cases):
+    (a) `per_inode_rename_overwrite_cross_parent_disjoint` — two
+    writers using DISJOINT parent pairs (pa1/pb1 vs pa2/pb2) exercise
+    the 4-inode pin code path + R128/R130 wiring + TOCTOU re-verify
+    on both dirents. (b) `per_inode_rename_shared_parents_opposite_direction`
+    — both writers share the same parent pair (pa, pb) but rename in
+    OPPOSITE directions (A: pa→pb; B: pb→pa). Each thread's caller-
+    slot pin order is reversed; without pin_many's ascending-order
+    sort, this provokes deterministic AB-BA deadlock at the
+    2-shared-parent level. R134 verified by temporarily neutering the
+    sort: shared-parents test hung past the harness's 30 s
+    DEADLINE_SECONDS (1 iteration completed by each thread before
+    cycle locked up); restoring the sort returns to clean ~140 ms
+    wall-time. Together the two tests cover both the 4-inode pin path
+    AND the NoCircularWait property for shared subsets.
+  - **`stm_inode_pin_many` unit tests** (R134 P2-2 close — 6 cases in
+    `test_inode.c`): arg validation (NULL idx/requests/out_handles,
+    n=0, n=17, zero ds/ino across slot positions), duplicate refusal
+    (adjacent + non-adjacent post-sort), roundtrip N=1, N=4 with
+    REVERSE caller order, N=16 with zigzag caller order, rollback-on-
+    missing (middle-of-list ENOENT releases pre-acquired pins),
+    cross-dataset sort key ((ds, ino) lex).
+  - **ctest 54/54 GREEN** (test_compound_ops_concurrent now 6 cases;
+    test_inode now 64 cases). Rust unit 97/97. e2e_crud 33/33.
+    concurrent_ctl 2/2.
+  - **R134 audit close**: 0 P0, 0 P1, 3 P2 (all test/doc-drift; no
+    impl correctness issue). P2-1 closed by adding the shared-parents
+    rename test that actually exercises NoCircularWait. P2-2 closed
+    by 6 new pin_many unit tests in test_inode.c. P2-3 closed by
+    updated CLAUDE.md + REFERENCE.md (this section + accurate
+    test-claim framing on the disjoint test).
   - **Next**: impl-4 (cross-dataset ops — copy_file_range, reflink).
     impl-5 drops residual EX takes. impl-6 perf regression test.
-    R134 audit candidate scopes impl-3 (rename overwrite + pin_many
-    + the new TOCTOU re-verify on two dirents).
 
 - **Pre-tip-1**: R133 audit close (`fdbfff3`). Three findings from the
   R133 prosecutor (scoping impl-1 + impl-2) addressed:

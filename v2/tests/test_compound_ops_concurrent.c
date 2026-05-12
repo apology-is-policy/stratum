@@ -698,14 +698,18 @@ static bool wait_two_rename(const rename_ctx *a, const rename_ctx *b,
 }
 
 /* Two writers, each churning create+create+rename(overwrite)+unlink
- * across DISJOINT pairs of parent dirs but using the same 4-inode
- * code path. The 4-inode pin set forces NoCircularWait to be load-
- * bearing — if pin_many doesn't sort properly, two threads' opposite-
- * direction (parent_X → parent_Y vs parent_Y → parent_X) renames
- * would deadlock. Catches: stm_inode_pin_many ascending-order
- * regression; TOCTOU re-verify loop on both src + dst dirents; R128
- * P1-1 pre-cleanup under SH+pin on dst cascade-free path; R130 post-
- * reclaim gate; R133 P1-2 wedge-defer preservation. */
+ * across DISJOINT pairs of parent dirs. Smoke test for the 4-inode
+ * pin path: both threads exercise stm_inode_pin_many with N=4 under
+ * contention on the inode-index bucket-allocation locks (the 256
+ * hash buckets in stm_inode_index), but their pin SETS are disjoint
+ * — no per-(ds, ino) mutex is contended cross-thread. Catches: R128
+ * P1-1 pre-cleanup + R130 post-reclaim gate under SH+pin; R133 P1-2
+ * wedge-defer preservation; TOCTOU re-verify on both src + dst
+ * dirents.
+ *
+ * Does NOT exercise stm_inode_pin_many's ascending-order sort
+ * (NoCircularWait); for that, see
+ * per_inode_rename_shared_parents_opposite_direction below. */
 STM_TEST(per_inode_rename_overwrite_cross_parent_disjoint) {
     make_tmp("per_inode_rename_overwrite");
     stm_fs_format_opts fopts = default_format_opts();
@@ -754,6 +758,80 @@ STM_TEST(per_inode_rename_overwrite_cross_parent_disjoint) {
     STM_ASSERT_EQ(0, pthread_create(&at, NULL, rename_thread, &ca));
     STM_ASSERT_EQ(0, pthread_create(&bt, NULL, rename_thread, &cb));
 
+    STM_ASSERT(wait_two_rename(&ca, &cb, at, bt));
+
+    STM_ASSERT_EQ(0, atomic_load(&ca.err));
+    STM_ASSERT_EQ(0, atomic_load(&cb.err));
+    STM_ASSERT_EQ(RENAME_ITERATIONS, atomic_load(&ca.completed));
+    STM_ASSERT_EQ(RENAME_ITERATIONS, atomic_load(&cb.completed));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
+/* Two writers sharing the SAME pair of parent dirs (pa, pb) but renaming
+ * in OPPOSITE directions (A: pa → pb; B: pb → pa). Each thread's
+ * 4-inode pin set is {pa, pb, its_src_ino, its_dst_ino} — pa and pb
+ * are SHARED between the two threads, while the file inos remain
+ * disjoint (different name prefixes). This is the cycle-provocation
+ * regime for stm_inode_pin_many's ascending-order sort:
+ *
+ *   Thread A caller-slot order:  src_parent=pa, dst_parent=pb, ...
+ *   Thread B caller-slot order:  src_parent=pb, dst_parent=pa, ...
+ *
+ * Without the sort, thread A would lock pa first then await pb; thread
+ * B would lock pb first then await pa — classic AB-BA deadlock at
+ * iteration boundaries when contention is high. WITH the sort, both
+ * threads acquire in ascending (ds, ino) order regardless of caller
+ * slot, so pa < pb implies both threads lock pa first → no cycle.
+ *
+ * R134 P2-1 close: provoking and verifying NoCircularWait at the
+ * 2-shared-parent level. (A separate test could provoke the
+ * 4-shared-inode level via an EXCHANGE between two threads racing
+ * against the same dirent pair, but the 2-shared-parent variant is
+ * sufficient — pin_many's sort property doesn't bifurcate on N=2 vs
+ * N=4 of the shared set.) */
+STM_TEST(per_inode_rename_shared_parents_opposite_direction) {
+    make_tmp("per_inode_rename_shared_parents");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t ds_id = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "ren_shared_ds", &ds_id));
+    uint64_t root_ino = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, ds_id, 0755u, 0, 0, &root_ino));
+    STM_ASSERT_EQ(root_ino, 1u);
+
+    /* TWO sub-directories shared between both threads. */
+    uint64_t pa = 0, pb = 0;
+    STM_ASSERT_OK(stm_fs_mkdir(fs, ds_id, 1u, (const uint8_t *)"pa", 2,
+                                  0755, 0, 0, &pa));
+    STM_ASSERT_OK(stm_fs_mkdir(fs, ds_id, 1u, (const uint8_t *)"pb", 2,
+                                  0755, 0, 0, &pb));
+
+    rename_ctx ca = { 0 }, cb = { 0 };
+    ca.fs = fs; ca.dataset_id = ds_id;
+    /* Thread A: pa → pb. */
+    ca.parent_a_ino = pa; ca.parent_b_ino = pb;
+    ca.src_prefix = "srcA"; ca.dst_prefix = "dstA";
+    ca.iterations = RENAME_ITERATIONS;
+    cb.fs = fs; cb.dataset_id = ds_id;
+    /* Thread B: pb → pa (OPPOSITE caller-slot order on the parents). */
+    cb.parent_a_ino = pb; cb.parent_b_ino = pa;
+    cb.src_prefix = "srcB"; cb.dst_prefix = "dstB";
+    cb.iterations = RENAME_ITERATIONS;
+
+    pthread_t at, bt;
+    STM_ASSERT_EQ(0, pthread_create(&at, NULL, rename_thread, &ca));
+    STM_ASSERT_EQ(0, pthread_create(&bt, NULL, rename_thread, &cb));
+
+    /* Use the standard rename deadline waiter. If pin_many didn't sort,
+     * the threads would deadlock and the wait would time out. */
     STM_ASSERT(wait_two_rename(&ca, &cb, at, bt));
 
     STM_ASSERT_EQ(0, atomic_load(&ca.err));

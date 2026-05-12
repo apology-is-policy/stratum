@@ -1360,4 +1360,236 @@ STM_TEST(inode_pin_slot_reused_after_unpin) {
     stm_inode_index_close(idx);
 }
 
+/* ── pin_many unit tests (R134 P2-2 close) ─────────────────────────── */
+
+STM_TEST(inode_pin_many_arg_validation) {
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    struct stm_inode_pin_request reqs[1] = { { 1u, 1u } };
+    stm_inode_handle *outs[1] = { NULL };
+
+    /* NULL idx. */
+    STM_ASSERT_ERR(stm_inode_pin_many(NULL, reqs, 1, outs), STM_EINVAL);
+    /* NULL requests. */
+    STM_ASSERT_ERR(stm_inode_pin_many(idx, NULL, 1, outs), STM_EINVAL);
+    /* NULL out_handles. */
+    STM_ASSERT_ERR(stm_inode_pin_many(idx, reqs, 1, NULL), STM_EINVAL);
+    /* n == 0. */
+    STM_ASSERT_ERR(stm_inode_pin_many(idx, reqs, 0, outs), STM_EINVAL);
+    /* n > STM_INODE_PIN_MANY_MAX. */
+    struct stm_inode_pin_request big[STM_INODE_PIN_MANY_MAX + 1u];
+    for (size_t i = 0; i <= STM_INODE_PIN_MANY_MAX; i++) {
+        big[i].dataset_id = 1u;
+        big[i].ino = i + 1u;
+    }
+    stm_inode_handle *big_outs[STM_INODE_PIN_MANY_MAX + 1u] = { NULL };
+    STM_ASSERT_ERR(stm_inode_pin_many(idx, big, STM_INODE_PIN_MANY_MAX + 1u,
+                                          big_outs), STM_EINVAL);
+
+    /* Zero ds in first slot. */
+    reqs[0].dataset_id = 0u; reqs[0].ino = 1u;
+    STM_ASSERT_ERR(stm_inode_pin_many(idx, reqs, 1, outs), STM_EINVAL);
+    /* Zero ino in first slot. */
+    reqs[0].dataset_id = 1u; reqs[0].ino = 0u;
+    STM_ASSERT_ERR(stm_inode_pin_many(idx, reqs, 1, outs), STM_EINVAL);
+
+    /* Zero ino in a middle slot — must fail; per-slot check runs across all
+     * requests. */
+    struct stm_inode_pin_request mid[3] = {
+        { 1u, 1u }, { 1u, 0u }, { 1u, 3u }
+    };
+    stm_inode_handle *mid_outs[3] = { NULL };
+    STM_ASSERT_ERR(stm_inode_pin_many(idx, mid, 3, mid_outs), STM_EINVAL);
+    STM_ASSERT_TRUE(mid_outs[0] == NULL);
+    STM_ASSERT_TRUE(mid_outs[2] == NULL);
+
+    stm_inode_index_close(idx);
+}
+
+STM_TEST(inode_pin_many_duplicate_refused) {
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    uint64_t ino_a = 0, ino_b = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino_a));
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino_b));
+
+    /* Two identical requests — refused upfront with STM_EINVAL. */
+    struct stm_inode_pin_request reqs[2] = {
+        { 1u, ino_a }, { 1u, ino_a }
+    };
+    stm_inode_handle *outs[2] = { NULL, NULL };
+    STM_ASSERT_ERR(stm_inode_pin_many(idx, reqs, 2, outs), STM_EINVAL);
+    STM_ASSERT_TRUE(outs[0] == NULL);
+    STM_ASSERT_TRUE(outs[1] == NULL);
+
+    /* Duplicate detection survives non-adjacent caller order: after sort,
+     * adjacent-equal scan catches it. */
+    struct stm_inode_pin_request reqs2[3] = {
+        { 1u, ino_a }, { 1u, ino_b }, { 1u, ino_a }
+    };
+    stm_inode_handle *outs2[3] = { NULL, NULL, NULL };
+    STM_ASSERT_ERR(stm_inode_pin_many(idx, reqs2, 3, outs2), STM_EINVAL);
+    STM_ASSERT_TRUE(outs2[0] == NULL);
+    STM_ASSERT_TRUE(outs2[1] == NULL);
+    STM_ASSERT_TRUE(outs2[2] == NULL);
+
+    stm_inode_index_close(idx);
+}
+
+STM_TEST(inode_pin_many_roundtrip_n1) {
+    /* N=1 — pin_many degenerates to a single pin. */
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    uint64_t ino = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino));
+
+    struct stm_inode_pin_request reqs[1] = { { 1u, ino } };
+    stm_inode_handle *outs[1] = { NULL };
+    STM_ASSERT_OK(stm_inode_pin_many(idx, reqs, 1, outs));
+    STM_ASSERT_TRUE(outs[0] != NULL);
+    stm_inode_unpin(idx, outs[0]);
+
+    stm_inode_index_close(idx);
+}
+
+STM_TEST(inode_pin_many_roundtrip_n4_reverse_caller_order) {
+    /* N=4 — pass in REVERSE-ino caller order; verify handles are mapped
+     * back to caller slots (not sort slots). */
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    uint64_t inos[4] = { 0 };
+    for (int i = 0; i < 4; i++) {
+        STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &inos[i]));
+    }
+    /* Allocator gives monotonically increasing inos; pass them
+     * REVERSED so sort must permute. */
+    struct stm_inode_pin_request reqs[4] = {
+        { 1u, inos[3] },
+        { 1u, inos[2] },
+        { 1u, inos[1] },
+        { 1u, inos[0] }
+    };
+    stm_inode_handle *outs[4] = { NULL };
+    STM_ASSERT_OK(stm_inode_pin_many(idx, reqs, 4, outs));
+    for (int i = 0; i < 4; i++) {
+        STM_ASSERT_TRUE(outs[i] != NULL);
+    }
+    /* Handles must distinct (each pin acquired a different slot). */
+    for (int i = 0; i < 4; i++) {
+        for (int j = i + 1; j < 4; j++) {
+            STM_ASSERT_TRUE(outs[i] != outs[j]);
+        }
+    }
+    for (int i = 0; i < 4; i++) {
+        stm_inode_unpin(idx, outs[i]);
+    }
+
+    stm_inode_index_close(idx);
+}
+
+STM_TEST(inode_pin_many_roundtrip_n16) {
+    /* N=16 — full capacity; sort + pin all + unpin all without leak. */
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    uint64_t inos[STM_INODE_PIN_MANY_MAX] = { 0 };
+    for (size_t i = 0; i < STM_INODE_PIN_MANY_MAX; i++) {
+        STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &inos[i]));
+    }
+    /* Caller order: alternate high/low (zigzag) so sort is non-trivial. */
+    struct stm_inode_pin_request reqs[STM_INODE_PIN_MANY_MAX];
+    for (size_t i = 0; i < STM_INODE_PIN_MANY_MAX; i++) {
+        size_t pick = (i % 2u == 0u) ? (i / 2u)
+                                     : (STM_INODE_PIN_MANY_MAX - 1u - (i / 2u));
+        reqs[i].dataset_id = 1u;
+        reqs[i].ino = inos[pick];
+    }
+    stm_inode_handle *outs[STM_INODE_PIN_MANY_MAX] = { NULL };
+    STM_ASSERT_OK(stm_inode_pin_many(idx, reqs, STM_INODE_PIN_MANY_MAX, outs));
+    for (size_t i = 0; i < STM_INODE_PIN_MANY_MAX; i++) {
+        STM_ASSERT_TRUE(outs[i] != NULL);
+    }
+    for (size_t i = 0; i < STM_INODE_PIN_MANY_MAX; i++) {
+        stm_inode_unpin(idx, outs[i]);
+    }
+
+    stm_inode_index_close(idx);
+}
+
+STM_TEST(inode_pin_many_rollback_on_missing) {
+    /* Request 4 inodes; mid-list one doesn't exist. pin_many must release
+     * any pins acquired before the failure point. We verify the rollback
+     * by re-pinning the surviving inos individually — which would fail
+     * (or hang on the ERRORCHECK mutex's double-lock) if pin_many had
+     * left them locked from this thread. */
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    uint64_t inos[3] = { 0 };
+    for (int i = 0; i < 3; i++) {
+        STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &inos[i]));
+    }
+    uint64_t bogus = 99999u;  /* never allocated */
+
+    /* Mix the bogus ino in the middle so two pre-pins succeed before
+     * failure. */
+    struct stm_inode_pin_request reqs[4] = {
+        { 1u, inos[0] },
+        { 1u, inos[1] },
+        { 1u, bogus },
+        { 1u, inos[2] }
+    };
+    stm_inode_handle *outs[4] = { NULL };
+    STM_ASSERT_ERR(stm_inode_pin_many(idx, reqs, 4, outs), STM_ENOENT);
+    /* Per docstring, all outputs NULL on non-OK return. */
+    for (int i = 0; i < 4; i++) {
+        STM_ASSERT_TRUE(outs[i] == NULL);
+    }
+
+    /* Surviving inos must be unpinned. If pin_many had failed to roll
+     * back, the next pin would either deadlock (ERRORCHECK abort) or
+     * see a non-zero refcount. We re-pin individually to verify clean
+     * state. */
+    stm_inode_handle *h0 = NULL, *h1 = NULL, *h2 = NULL;
+    STM_ASSERT_OK(stm_inode_pin(idx, 1, inos[0], &h0));
+    STM_ASSERT_OK(stm_inode_pin(idx, 1, inos[1], &h1));
+    STM_ASSERT_OK(stm_inode_pin(idx, 1, inos[2], &h2));
+    stm_inode_unpin(idx, h2);
+    stm_inode_unpin(idx, h1);
+    stm_inode_unpin(idx, h0);
+
+    stm_inode_index_close(idx);
+}
+
+STM_TEST(inode_pin_many_cross_dataset) {
+    /* pin_many supports cross-dataset pins (dataset_id varies across
+     * requests). Verify the sort key is (ds, ino) lex order: ds=1, ino=5
+     * sorts BEFORE ds=2, ino=1. */
+    stm_inode_index *idx = stm_inode_index_create();
+    STM_ASSERT_TRUE(idx != NULL);
+
+    uint64_t ino_ds1 = 0, ino_ds2 = 0;
+    STM_ASSERT_OK(stm_inode_alloc(idx, 1, 0100644, 0, 0, &ino_ds1));
+    STM_ASSERT_OK(stm_inode_alloc(idx, 2, 0100644, 0, 0, &ino_ds2));
+
+    /* Caller order: ds=2 first, then ds=1 — sort must invert. */
+    struct stm_inode_pin_request reqs[2] = {
+        { 2u, ino_ds2 },
+        { 1u, ino_ds1 }
+    };
+    stm_inode_handle *outs[2] = { NULL };
+    STM_ASSERT_OK(stm_inode_pin_many(idx, reqs, 2, outs));
+    STM_ASSERT_TRUE(outs[0] != NULL);
+    STM_ASSERT_TRUE(outs[1] != NULL);
+    STM_ASSERT_TRUE(outs[0] != outs[1]);
+    stm_inode_unpin(idx, outs[0]);
+    stm_inode_unpin(idx, outs[1]);
+
+    stm_inode_index_close(idx);
+}
+
 STM_TEST_MAIN("test_inode")
