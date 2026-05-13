@@ -887,8 +887,13 @@ static stm_status fs_write_extent_aligned_locked(stm_fs *fs,
 /* SWISS-4q-flush drain callback: each buffered range becomes one
  * stm_sync_write_extent via fs_write_extent_aligned_locked. The
  * callback runs under stm_dirty_buffer's internal mutex AND under
- * fs->lock (the caller's lock). The aligned helper takes sync->lock
- * internally; lock order fs->lock → dbuf->mu → sync->lock holds. */
+ * the caller's outer fs lock context. Post-PARALLEL-3 impl-5 the
+ * outer can be either fs->global EX (pre-impl-1 ops; commit / sync
+ * paths) OR fs->global SH + per-inode pin (impl-1..5 ports —
+ * truncate/fallocate/migrate/promote/write call this UNDER the
+ * target inode's pin). The aligned helper takes sync->lock
+ * internally; lock order fs->global → per-inode-mutex → dbuf->mu
+ * → sync->lock holds. See header doctrine block lines 23-39. */
 static stm_status fs_flush_drain_cb(void *user, uint64_t ds, uint64_t ino,
                                         uint64_t off, uint64_t len,
                                         const void *data)
@@ -897,14 +902,19 @@ static stm_status fs_flush_drain_cb(void *user, uint64_t ds, uint64_t ino,
     return fs_write_extent_aligned_locked(fs, ds, ino, off, data, (size_t)len);
 }
 
-/* Flush one inode's buffered ranges. Caller holds fs->lock. */
+/* Flush one inode's buffered ranges. Caller holds the outer fs lock
+ * (fs->global EX, or fs->global SH + this (ds,ino)'s pin per impl-1..5
+ * doctrine). */
 static stm_status fs_flush_ino_locked(stm_fs *fs, uint64_t ds, uint64_t ino)
 {
     return stm_dirty_buffer_drain_ino(fs->dirty_buffer, ds, ino,
                                             fs_flush_drain_cb, fs);
 }
 
-/* Flush every inode's buffered ranges. Caller holds fs->lock. */
+/* Flush every inode's buffered ranges. Caller holds fs->global
+ * (EX or SH; SH callers do NOT need to pin every inode — dbuf->mu
+ * serializes the drain itself, and the drained extents land at the
+ * sync layer's own mutex). */
 static stm_status fs_flush_all_locked(stm_fs *fs)
 {
     return stm_dirty_buffer_drain_all(fs->dirty_buffer,

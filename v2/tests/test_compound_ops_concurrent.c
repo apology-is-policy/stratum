@@ -1127,8 +1127,12 @@ static void *write_trunc_falloc_thread(void *arg)
                                               0100644, 0, 0, &ino);
         if (rc != STM_OK) { atomic_store(&s->err, (int)rc); break; }
 
-        /* Write 4 KiB — exceeds STM_FLUSH_DIRECT_THRESHOLD so goes to
-         * direct extent path through fs_write_regular_locked. */
+        /* Write 4 KiB — BELOW STM_FLUSH_DIRECT_THRESHOLD (1 MiB) so
+         * routes through the dirty-buffer buffered path in
+         * fs_write_regular_locked. The subsequent truncate calls
+         * fs_flush_ino_locked under the SH+pin which drains the buffer
+         * to the extent layer. R136 P2-1 forward-note: direct-path
+         * (> 1 MiB) write under SH+pin not directly exercised here. */
         rc = stm_fs_write(s->fs, s->dataset_id, ino, 0,
                               payload, W_BYTES);
         if (rc != STM_OK) { atomic_store(&s->err, (int)rc); break; }
