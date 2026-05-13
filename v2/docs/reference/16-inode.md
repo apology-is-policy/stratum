@@ -305,8 +305,34 @@ duration of a per-inode compound op:
     `pin_two`'s `(ds, ino)` sort key but still gated at sync layer
     with STM_EXDEV (sync.c:5749) pending matching-encryption-keys
     work.
-  - impl-5 (forward): drop residual EX takes (RO ops + remaining
-    single-inode mutators not yet ported)
+  - impl-5: `stm_fs_truncate` + `stm_fs_fallocate` (iidx-required —
+    no legacy fallback; STM_ENOENT from pin propagates verbatim) +
+    `stm_fs_write` + `stm_fs_migrate_to_cold` + `stm_fs_promote_to_hot`
+    (iidx-with-legacy-fallback — try SH+pin happy path; on
+    STM_ENOENT from pin OR (for stm_fs_write) on non-S_IFREG kind,
+    release SH and reacquire EX + run pre-impl-5 posture verbatim).
+    Single-exit `goto out;` pattern in the long ones so every
+    refusal path unpins through one label (`stm_fs_truncate` uses
+    `out:`; `stm_fs_fallocate` uses `falloc_out:`); without this
+    discipline a forgotten unpin leaks the slot's refcount AND
+    leaves the ERRORCHECK mutex locked → next pin from same thread
+    on same (ds,ino) returns STM_EBACKEND via EDEADLK. R128 P2-1
+    pre-flush wiring preserved under the per-inode pin (truncate /
+    fallocate / migrate / promote pre-flush their target inode);
+    R130 post-reclaim gate not relevant to impl-5's port set (the
+    affected sites are unlink + rename overwrite, both already
+    ported pre-impl-5). UNSHARE_RANGE branch in stm_fs_fallocate
+    unpins + drops SH BEFORE chaining into stm_fs_promote_to_hot to
+    avoid ERRORCHECK EDEADLK on the recursive pin.
+  - impl-6 (forward): drop residual EX takes — RO ops
+    (stm_fs_read/stat/lookup/readlink/readdir/get_seals/getxattr/
+    listxattr/fadvise) MAY convert to SH-only (no pins needed —
+    READ contract); xattr mutators (setxattr/removexattr/add_seals)
+    MAY port to SH+pin; snapshot ops + create_dataset stay EX
+    (dataset-wide); commit + reserve + free + lock-table ops stay
+    EX (sync-level / fs-wide); migrate/promote policy steps already
+    compose over per-ino so the iteration drops fs->lock between
+    candidates as today.
 
 Spec composition realizes the `inode_lock_holder[i] = w` action of
 `compound_ops_per_inode.tla`.
@@ -423,7 +449,9 @@ Spec actions: `AllocFresh`, `AllocReused`, `AllocAnon`, `Link`,
 | 2-inode ops ported (parent+child OR src+dst) | LIVE | impl-2: unlink/rmdir/create_file/mkdir/symlink/linkat_anon/unlink_anon/create_anon/link/link_by_ino |
 | stm_inode_pin_many (sorted N-inode pin) | LIVE | P9.5-PARALLEL-3 impl-3; generalises pin_two; cap STM_INODE_PIN_MANY_MAX=16 |
 | 4-inode ops ported (rename overwrite/EXCHANGE) | LIVE | impl-3: stm_fs_rename — TOCTOU re-verify covers both src+dst dirents; R128/R130 wiring preserved on dst cascade-free |
-| Multi-inode lock-order (pin in ascending order) | LIVE — caller discipline | impl-4..5 ports remaining (cross-dataset ops / drop residual EX) |
+| 2-inode cross-dataset ops ported | LIVE | impl-4: stm_fs_reflink + stm_fs_copy_file_range; SH+pin_two happy path with EX fallback for legacy direct-extent inodes |
+| Single-inode mutators ported | LIVE | impl-5: stm_fs_truncate/fallocate (iidx-required), stm_fs_write/migrate_to_cold/promote_to_hot (iidx-with-legacy-EX-fallback); single-exit goto pattern; R128 P2-1 pre-flush under pin |
+| Multi-inode lock-order (pin in ascending order) | LIVE — caller discipline | impl-6 ports remaining (RO ops + xattr mutators OR keep selectively-EX) |
 
 Audit class: any change to allocator paths (alloc / alloc_anon /
 materialize / free), gen arithmetic, or persistence validators MUST

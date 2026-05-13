@@ -1082,4 +1082,129 @@ STM_TEST(per_inode_cfr_disjoint_files_shared_parent) {
     unlink(g_key_path);
 }
 
+/* ===========================================================================
+ * P9.5-PARALLEL-3 impl-5 (single-inode mutators) regression coverage.
+ *
+ * stm_fs_write / stm_fs_truncate / stm_fs_fallocate now hold fs->global SH
+ * (rdlock) + per-inode pin instead of the EX wrlock. Two writers operating
+ * on DISJOINT inodes must not deadlock and must not corrupt allocator
+ * balance. The test below churns create+write+truncate+fallocate+unlink
+ * against the same parent dir with disjoint child names; both threads pin
+ * their own child inodes while contending on the parent's create+unlink
+ * dirent ops (which are already impl-2-ported).
+ *
+ * Sized to a wall-time budget similar to the cfr test — 50 × 2 threads
+ * = 100 compound ops covering the write/truncate/fallocate trio.
+ * =========================================================================== */
+typedef struct {
+    stm_fs    *fs;
+    uint64_t   dataset_id;
+    uint64_t   parent_ino;
+    const char *name_prefix;
+    unsigned   iterations;
+    atomic_int err;
+    atomic_uint completed;
+    atomic_bool done;
+} wtf_ctx;
+
+static void *write_trunc_falloc_thread(void *arg)
+{
+    wtf_ctx *s = (wtf_ctx *)arg;
+    static const size_t W_BYTES = 4096u;
+    uint8_t payload[4096];
+    for (size_t i = 0; i < sizeof payload; i++) payload[i] = (uint8_t)(i & 0xFF);
+
+    for (unsigned i = 0; i < s->iterations; i++) {
+        char name[64];
+        snprintf(name, sizeof name, "%s_%u", s->name_prefix, i);
+        size_t name_len = strlen(name);
+
+        uint64_t ino = 0;
+        stm_status rc = stm_fs_create_file(s->fs, s->dataset_id,
+                                              s->parent_ino,
+                                              (const uint8_t *)name,
+                                              (uint8_t)name_len,
+                                              0100644, 0, 0, &ino);
+        if (rc != STM_OK) { atomic_store(&s->err, (int)rc); break; }
+
+        /* Write 4 KiB — exceeds STM_FLUSH_DIRECT_THRESHOLD so goes to
+         * direct extent path through fs_write_regular_locked. */
+        rc = stm_fs_write(s->fs, s->dataset_id, ino, 0,
+                              payload, W_BYTES);
+        if (rc != STM_OK) { atomic_store(&s->err, (int)rc); break; }
+
+        /* Truncate to 8 KiB (grow) — extents stay; si_size bumps. */
+        rc = stm_fs_truncate(s->fs, s->dataset_id, ino, 8192u);
+        if (rc != STM_OK) { atomic_store(&s->err, (int)rc); break; }
+
+        /* Default-preallocate via fallocate; KEEP_SIZE so si_size unchanged. */
+        rc = stm_fs_fallocate(s->fs, s->dataset_id, ino, 0, 8192u,
+                                  STM_FS_FALLOC_FL_KEEP_SIZE);
+        if (rc != STM_OK) { atomic_store(&s->err, (int)rc); break; }
+
+        /* Shrink back to 4 KiB. */
+        rc = stm_fs_truncate(s->fs, s->dataset_id, ino, 4096u);
+        if (rc != STM_OK) { atomic_store(&s->err, (int)rc); break; }
+
+        rc = stm_fs_unlink(s->fs, s->dataset_id, s->parent_ino,
+                              (const uint8_t *)name, (uint8_t)name_len);
+        if (rc != STM_OK) { atomic_store(&s->err, (int)rc); break; }
+        atomic_fetch_add(&s->completed, 1u);
+    }
+    atomic_store(&s->done, true);
+    return NULL;
+}
+
+static bool wait_two_wtf(wtf_ctx *a, wtf_ctx *b, pthread_t at, pthread_t bt)
+{
+    int sec = 0;
+    while (sec < 30 && (!atomic_load(&a->done) || !atomic_load(&b->done))) {
+        sleep(1); sec++;
+    }
+    pthread_join(at, NULL);
+    pthread_join(bt, NULL);
+    return atomic_load(&a->done) && atomic_load(&b->done);
+}
+
+STM_TEST(per_inode_write_truncate_fallocate_disjoint_inodes) {
+    make_tmp("per_inode_wtf_disjoint");
+    stm_fs_format_opts fopts = default_format_opts();
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+
+    uint64_t ds_id = 0;
+    STM_ASSERT_OK(stm_fs_create_dataset(fs, 1, "wtf_ds", &ds_id));
+    uint64_t root_ino = 0;
+    STM_ASSERT_OK(stm_fs_init_dataset_root(fs, ds_id, 0755u, 0, 0, &root_ino));
+    STM_ASSERT_EQ(root_ino, 1u);
+
+    wtf_ctx ca = { 0 }, cb = { 0 };
+    ca.fs = fs; ca.dataset_id = ds_id;
+    ca.parent_ino = 1u;
+    ca.name_prefix = "wa";
+    ca.iterations = 50u;
+    cb.fs = fs; cb.dataset_id = ds_id;
+    cb.parent_ino = 1u;
+    cb.name_prefix = "wb";
+    cb.iterations = 50u;
+
+    pthread_t at, bt;
+    STM_ASSERT_EQ(0, pthread_create(&at, NULL, write_trunc_falloc_thread, &ca));
+    STM_ASSERT_EQ(0, pthread_create(&bt, NULL, write_trunc_falloc_thread, &cb));
+
+    STM_ASSERT(wait_two_wtf(&ca, &cb, at, bt));
+
+    STM_ASSERT_EQ(0, atomic_load(&ca.err));
+    STM_ASSERT_EQ(0, atomic_load(&cb.err));
+    STM_ASSERT_EQ(50u, atomic_load(&ca.completed));
+    STM_ASSERT_EQ(50u, atomic_load(&cb.completed));
+
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+    unlink(g_tmp_path);
+    unlink(g_key_path);
+}
+
 STM_TEST_MAIN("test_compound_ops_concurrent")

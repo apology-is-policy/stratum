@@ -1200,33 +1200,47 @@ stm_status stm_fs_write(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                           uint64_t off, const void *buf, size_t len)
 {
     if (!fs) return STM_EINVAL;
-    pthread_rwlock_wrlock(&fs->global);
-    FS_GUARD_WRITE(fs);
 
-    /* Inline-aware dispatch only when (a) inode index is bound, (b)
-     * the (ds, ino) names a real inode in the index, and (c) the
-     * inode is a regular file (S_IFREG). Otherwise fall through to
-     * the legacy direct-extent path so older tests + non-regular-
-     * file writers (e.g., the dataset metadata test seam) keep
-     * working. */
+    /* P9.5-PARALLEL-3 impl-5: SH (rdlock) + per-inode pin happy path
+     * for regular files in the inode index. Falls back to EX (wrlock —
+     * pre-impl-5 posture) on STM_ENOENT from pin OR on non-regular
+     * inodes so legacy direct-extent callers (older tests + dataset
+     * metadata test seam) and non-S_IFREG inode kinds keep going
+     * through the unbuffered stm_sync_write_extent path verbatim. */
+    pthread_rwlock_rdlock(&fs->global);
+    FS_GUARD_WRITE(fs);
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
     if (iidx) {
-        struct stm_inode_value iv = {0};
-        stm_status ls = stm_inode_lookup(iidx, dataset_id, ino, &iv);
-        if (ls == STM_OK) {
-            uint32_t mode = stm_load_le32(iv.si_mode);
-            if ((mode & (uint32_t)S_IFMT) == (uint32_t)S_IFREG) {
-                stm_status rs = fs_write_regular_locked(fs, iidx,
-                                                              dataset_id, ino,
-                                                              &iv, off, buf, len);
-                pthread_rwlock_unlock(&fs->global);
-                return rs;
+        stm_inode_handle *h = NULL;
+        stm_status pp = stm_inode_pin(iidx, dataset_id, ino, &h);
+        if (pp == STM_OK) {
+            struct stm_inode_value iv = {0};
+            stm_status ls = stm_inode_lookup(iidx, dataset_id, ino, &iv);
+            if (ls == STM_OK) {
+                uint32_t mode = stm_load_le32(iv.si_mode);
+                if ((mode & (uint32_t)S_IFMT) == (uint32_t)S_IFREG) {
+                    stm_status rs = fs_write_regular_locked(fs, iidx,
+                                                                  dataset_id, ino,
+                                                                  &iv, off, buf, len);
+                    stm_inode_unpin(iidx, h);
+                    pthread_rwlock_unlock(&fs->global);
+                    return rs;
+                }
+                /* Not a regular file — drop SH and fall through to EX. */
             }
-            /* Not a regular file — fall through. */
+            stm_inode_unpin(iidx, h);
+        } else if (pp != STM_ENOENT) {
+            pthread_rwlock_unlock(&fs->global);
+            return pp;
         }
-        /* Inode not found — fall through. */
+        /* STM_ENOENT or non-S_IFREG — fall through to legacy EX path. */
     }
-
+    /* Legacy direct-extent / non-regular fallback: release SH and
+     * reacquire EX so concurrent unported writers still serialize.
+     * Same shape as impl-4 reflink/cfr. */
+    pthread_rwlock_unlock(&fs->global);
+    pthread_rwlock_wrlock(&fs->global);
+    FS_GUARD_WRITE(fs);
     stm_status s = stm_sync_write_extent(fs->sync, dataset_id, ino, off,
                                             buf, len);
     pthread_rwlock_unlock(&fs->global);
@@ -2963,22 +2977,15 @@ stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
     if (!fs) return STM_EINVAL;
     if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
 
-    pthread_rwlock_wrlock(&fs->global);
+    /* P9.5-PARALLEL-3 impl-5: SH (rdlock) + per-inode pin. truncate is
+     * a single-inode mutator — the (load + size-check + flush + extent
+     * mutate + inode_set) compound serializes per-inode on the pin
+     * mutex; two truncates on disjoint inodes run in parallel. The
+     * inode index is required (legacy direct-extent inodes can't be
+     * truncated — they have no si_size to update). On STM_ENOENT from
+     * pin, surface ENOENT (preserves the pre-impl-5 contract). */
+    pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
-
-    /* SWISS-4q-flush: truncate operates on the extent tree directly
-     * (drops extents past new_size, may rewrite a crossing extent).
-     * Pre-flush the inode's buffered ranges so the extent layer
-     * reflects all issued writes before the truncate acts. After
-     * the flush, drop any buffered ranges past new_size (the post-
-     * truncate read should NOT see them). */
-    {
-        stm_status fr = fs_flush_ino_locked(fs, dataset_id, ino);
-        if (fr != STM_OK) {
-            pthread_rwlock_unlock(&fs->global);
-            return fr;
-        }
-    }
 
     stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
     if (!iidx) {
@@ -2986,59 +2993,62 @@ stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
         return STM_EINVAL;
     }
 
+    stm_inode_handle *h = NULL;
+    stm_status pp = stm_inode_pin(iidx, dataset_id, ino, &h);
+    if (pp != STM_OK) {
+        pthread_rwlock_unlock(&fs->global);
+        return pp;       /* STM_ENOENT */
+    }
+
+    /* SWISS-4q-flush: truncate operates on the extent tree directly
+     * (drops extents past new_size, may rewrite a crossing extent).
+     * Pre-flush the inode's buffered ranges so the extent layer
+     * reflects all issued writes before the truncate acts. */
+    {
+        stm_status fr = fs_flush_ino_locked(fs, dataset_id, ino);
+        if (fr != STM_OK) {
+            stm_inode_unpin(iidx, h);
+            pthread_rwlock_unlock(&fs->global);
+            return fr;
+        }
+    }
+
+    /* Single-exit pattern (impl-5): every path below sets `rs` and
+     * jumps to `out` which unpins + unlocks. */
+    stm_status rs = STM_OK;
+
     struct stm_inode_value iv = {0};
     stm_status ls = stm_inode_lookup(iidx, dataset_id, ino, &iv);
-    if (ls != STM_OK) {
-        pthread_rwlock_unlock(&fs->global);
-        return ls;       /* STM_ENOENT */
-    }
+    if (ls != STM_OK) { rs = ls; goto out; }       /* STM_ENOENT */
 
     uint32_t mode = stm_load_le32(iv.si_mode);
     uint32_t ifmt = mode & (uint32_t)S_IFMT;
-    if (ifmt == (uint32_t)S_IFDIR) {
-        pthread_rwlock_unlock(&fs->global);
-        return STM_EISDIR;       /* POSIX truncate(2): EISDIR */
-    }
-    if (ifmt != (uint32_t)S_IFREG) {
-        pthread_rwlock_unlock(&fs->global);
-        return STM_EINVAL;       /* symlink / device / etc. */
-    }
+    if (ifmt == (uint32_t)S_IFDIR) { rs = STM_EISDIR; goto out; }
+    if (ifmt != (uint32_t)S_IFREG) { rs = STM_EINVAL; goto out; }
 
     /* R77 P1-1 defense-in-depth — bound si_data_len. */
     if (iv.si_data_kind == STM_DATA_INLINE &&
         iv.si_data_len > STM_INODE_INLINE_MAX) {
-        pthread_rwlock_unlock(&fs->global);
-        return STM_ECORRUPT;
+        rs = STM_ECORRUPT; goto out;
     }
 
     uint64_t cur_size = stm_load_le64(iv.si_size);
-    if (new_size == cur_size) {
-        pthread_rwlock_unlock(&fs->global);
-        return STM_OK;       /* no-op */
-    }
+    if (new_size == cur_size) { rs = STM_OK; goto out; }       /* no-op */
 
     /* P8-POSIX-7a-seals: refuse the truncate per the inode's seal mask
-     * BEFORE any state mutation. The size delta is already known
-     * (new_size != cur_size) — branch on the direction and the
-     * applicable seals. SEAL_WRITE / SEAL_FUTURE_WRITE block all
-     * size-changing truncate (Linux fcntl(2) F_SEAL_WRITE refuses
-     * truncate(2) outright); SEAL_GROW blocks new_size > cur_size;
-     * SEAL_SHRINK blocks new_size < cur_size. The same-size no-op
-     * branch returned earlier above so we do NOT need to defend it
-     * here. Refusal is STM_EPERM. */
+     * BEFORE any state mutation. SEAL_WRITE / SEAL_FUTURE_WRITE block
+     * all size-changing truncate; SEAL_GROW blocks new_size > cur_size;
+     * SEAL_SHRINK blocks new_size < cur_size. Refusal is STM_EPERM. */
     {
         uint32_t flags = stm_load_le32(iv.si_flags);
         if (flags & (STM_INO_FLAG_SEAL_WRITE | STM_INO_FLAG_SEAL_FUTURE_WRITE)) {
-            pthread_rwlock_unlock(&fs->global);
-            return STM_EPERM;
+            rs = STM_EPERM; goto out;
         }
         if (new_size > cur_size && (flags & STM_INO_FLAG_SEAL_GROW)) {
-            pthread_rwlock_unlock(&fs->global);
-            return STM_EPERM;
+            rs = STM_EPERM; goto out;
         }
         if (new_size < cur_size && (flags & STM_INO_FLAG_SEAL_SHRINK)) {
-            pthread_rwlock_unlock(&fs->global);
-            return STM_EPERM;
+            rs = STM_EPERM; goto out;
         }
     }
 
@@ -3053,14 +3063,11 @@ stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
             }
             iv.si_data_len = (uint8_t)new_size;
             iv.si_size     = stm_store_le64(new_size);
-            /* P8-POSIX-7a: truncate is a content + size change →
-             * stamp mtime + ctime. */
             fs_stamp_mtime_ctime_now(&iv);
             /* R76 P3-1 / R78 P3-1: stm_inode_set infallible in this
              * lock posture (see fs_write_regular_locked's annotation). */
-            stm_status rs = stm_inode_set(iidx, dataset_id, ino, &iv);
-            pthread_rwlock_unlock(&fs->global);
-            return rs;
+            rs = stm_inode_set(iidx, dataset_id, ino, &iv);
+            goto out;
         }
 
         /* Grow past inline cap → transition to EXTENT. Build a
@@ -3068,8 +3075,7 @@ stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
          * + zero pad to next 4 KiB boundary). Same shape as
          * fs_write_regular_locked's transition path. */
         if (new_size > (uint64_t)STM_FS_RECORDSIZE_MAX) {
-            pthread_rwlock_unlock(&fs->global);
-            return STM_ERANGE;
+            rs = STM_ERANGE; goto out;
         }
 
         const uint64_t BLK = 4096u;
@@ -3077,10 +3083,7 @@ stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
         if (aligned_size == 0u) aligned_size = BLK;
 
         uint8_t *combined = calloc(1, (size_t)aligned_size);
-        if (!combined) {
-            pthread_rwlock_unlock(&fs->global);
-            return STM_ENOMEM;
-        }
+        if (!combined) { rs = STM_ENOMEM; goto out; }
         if (iv.si_data_len > 0u) {
             memcpy(combined, iv.si_data.inline_data, iv.si_data_len);
         }
@@ -3089,24 +3092,15 @@ stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
                                                   combined,
                                                   (size_t)aligned_size);
         free(combined);
-        if (ws != STM_OK) {
-            pthread_rwlock_unlock(&fs->global);
-            return ws;
-        }
+        if (ws != STM_OK) { rs = ws; goto out; }
 
         iv.si_data_kind = STM_DATA_EXTENT;
         iv.si_data_len  = 0;
         memset(&iv.si_data, 0, sizeof iv.si_data);
         iv.si_size      = stm_store_le64(new_size);
-        /* P8-POSIX-7a: truncate transition is a content + size + kind
-         * change → stamp mtime + ctime. */
         fs_stamp_mtime_ctime_now(&iv);
-        /* R76 P3-1 / R78 P3-1: stm_inode_set infallible in this lock
-         * posture — fs->lock excludes every alloc/free path that
-         * could mutate (state, gen, nlink, kind) behind our back. */
-        stm_status rs = stm_inode_set(iidx, dataset_id, ino, &iv);
-        pthread_rwlock_unlock(&fs->global);
-        return rs;
+        rs = stm_inode_set(iidx, dataset_id, ino, &iv);
+        goto out;
     }
 
     if (kind == STM_DATA_EXTENT) {
@@ -3116,40 +3110,32 @@ stm_status stm_fs_truncate(stm_fs *fs, uint64_t dataset_id, uint64_t ino,
         if ((new_size & (BLK - 1u)) != 0u) {
             /* Sub-block truncate not supported. POSIX truncate(2) accepts
              * arbitrary new_size; sync_truncate's MVP requires 4 KiB
-             * alignment. Caller must align the truncate point. */
-            pthread_rwlock_unlock(&fs->global);
-            return STM_EINVAL;
+             * alignment. */
+            rs = STM_EINVAL; goto out;
         }
 
         if (new_size < cur_size) {
-            /* Shrink: drop past-EOF extents. */
             stm_status ts = stm_sync_truncate(fs->sync, dataset_id, ino,
                                                  new_size);
-            if (ts != STM_OK) {
-                pthread_rwlock_unlock(&fs->global);
-                return ts;
-            }
+            if (ts != STM_OK) { rs = ts; goto out; }
         }
         /* Grow case: just update si_size. The extent layer's sparse-
          * read semantics return 0 for offsets in [cur_size, new_size)
          * that have no extent record — POSIX-correct zero-fill. */
 
         iv.si_size = stm_store_le64(new_size);
-        /* P8-POSIX-7a: truncate is a size change → stamp mtime + ctime
-         * (per POSIX truncate(2): mtime + ctime are updated even on
-         * grow; only no-op size==cur_size leaves them alone, and that
-         * path returned earlier above). */
         fs_stamp_mtime_ctime_now(&iv);
-        /* R76 P3-2 / R78 P3-1: stm_inode_set infallible — same lock-
-         * posture argument. Only mutated field is si_size + ts. */
-        stm_status rs = stm_inode_set(iidx, dataset_id, ino, &iv);
-        pthread_rwlock_unlock(&fs->global);
-        return rs;
+        rs = stm_inode_set(iidx, dataset_id, ino, &iv);
+        goto out;
     }
 
     /* SYMLINK / DEVICE — not a regular-file kind; rejected. */
+    rs = STM_ENOTSUPPORTED;
+
+out:
+    stm_inode_unpin(iidx, h);
     pthread_rwlock_unlock(&fs->global);
-    return STM_ENOTSUPPORTED;
+    return rs;
 }
 
 /* ========================================================================= */
@@ -4855,12 +4841,39 @@ stm_status stm_fs_migrate_to_cold(stm_fs *fs,
                                      uint64_t dataset_id, uint64_t ino)
 {
     if (!fs) return STM_EINVAL;
+    if (dataset_id == 0u || ino == 0u) return STM_EINVAL;
+
+    /* P9.5-PARALLEL-3 impl-5: SH (rdlock) + per-inode pin. Migrate is
+     * a single-inode mutator (extent-layer flip + per-extent rewrite).
+     * Falls back to EX (wrlock — pre-impl-5 posture) on STM_ENOENT
+     * from pin so legacy direct-extent inodes (no index record) keep
+     * working — same shape as impl-4 reflink/cfr. */
+    pthread_rwlock_rdlock(&fs->global);
+    FS_GUARD_WRITE(fs);
+    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+    if (iidx) {
+        stm_inode_handle *h = NULL;
+        stm_status pp = stm_inode_pin(iidx, dataset_id, ino, &h);
+        if (pp == STM_OK) {
+            /* R128 P2-2 pre-flush: buffered ranges must reach the
+             * extent layer before migrate-to-cold iterates extent_idx. */
+            stm_status fr = fs_flush_ino_locked(fs, dataset_id, ino);
+            stm_status s = (fr == STM_OK)
+                ? stm_sync_migrate_to_cold(fs->sync, dataset_id, ino)
+                : fr;
+            stm_inode_unpin(iidx, h);
+            pthread_rwlock_unlock(&fs->global);
+            return s;
+        }
+        if (pp != STM_ENOENT) {
+            pthread_rwlock_unlock(&fs->global);
+            return pp;
+        }
+    }
+    /* Legacy / transitional EX path. */
+    pthread_rwlock_unlock(&fs->global);
     pthread_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
-    /* R128 P2-2: pre-flush before the extent-layer migrate. Without
-     * this, buffered ranges aren't visible to stm_sync_migrate_to_cold
-     * (which iterates extent_idx); they'd get flushed AFTER the migrate
-     * as HOT extents, leaving the file partially-cold. */
     stm_status fr = fs_flush_ino_locked(fs, dataset_id, ino);
     if (fr != STM_OK) {
         pthread_rwlock_unlock(&fs->global);
@@ -5151,14 +5164,34 @@ stm_status stm_fs_promote_to_hot(stm_fs *fs,
     if (dataset_id == 0u)     return STM_EINVAL;
     if (ino == 0u)            return STM_EINVAL;
 
+    /* P9.5-PARALLEL-3 impl-5: SH (rdlock) + per-inode pin. Symmetric
+     * with stm_fs_migrate_to_cold (clause 18 of CLAUDE.md inode-alloc
+     * row carries; impl-5 adds the migrate/promote pair). Legacy EX
+     * fallback on STM_ENOENT from pin. */
+    pthread_rwlock_rdlock(&fs->global);
+    FS_GUARD_WRITE(fs);
+    stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
+    if (iidx) {
+        stm_inode_handle *h = NULL;
+        stm_status pp = stm_inode_pin(iidx, dataset_id, ino, &h);
+        if (pp == STM_OK) {
+            stm_status fr = fs_flush_ino_locked(fs, dataset_id, ino);
+            stm_status rc = (fr == STM_OK)
+                ? stm_sync_promote_to_hot(fs->sync, dataset_id, ino)
+                : fr;
+            stm_inode_unpin(iidx, h);
+            pthread_rwlock_unlock(&fs->global);
+            return rc;
+        }
+        if (pp != STM_ENOENT) {
+            pthread_rwlock_unlock(&fs->global);
+            return pp;
+        }
+    }
+    /* Legacy / transitional EX path. */
+    pthread_rwlock_unlock(&fs->global);
     pthread_rwlock_wrlock(&fs->global);
     FS_GUARD_WRITE(fs);
-    /* R128 P2-2: pre-flush before the extent-layer promote. Without
-     * this, buffered ranges aren't visible to stm_sync_promote_to_hot;
-     * they'd flush AFTER as HOT extents — net-benign if the default
-     * tier IS hot, but the contract "this inode is now fully hot" is
-     * violated if any buffered range sits in flight. Symmetric with
-     * stm_fs_migrate_to_cold. */
     stm_status fr = fs_flush_ino_locked(fs, dataset_id, ino);
     if (fr != STM_OK) {
         pthread_rwlock_unlock(&fs->global);
@@ -6046,8 +6079,28 @@ stm_status stm_fs_fallocate(stm_fs *fs,
         return STM_EINVAL;
     }
 
-    pthread_rwlock_wrlock(&fs->global);
+    /* P9.5-PARALLEL-3 impl-5: SH (rdlock) + per-inode pin. fallocate is
+     * a single-inode mutator — the (load + validate + flush + extent
+     * mutate + inode_set) compound serializes per-inode on the pin
+     * mutex; fallocate on disjoint inodes runs in parallel. iidx is
+     * required (legacy direct-extent inodes have no si_size to update).
+     *
+     * UNSHARE_RANGE drops the lock + pin BEFORE chaining into
+     * stm_fs_promote_to_hot — see that branch below. */
+    pthread_rwlock_rdlock(&fs->global);
     FS_GUARD_WRITE(fs);
+
+    stm_inode_index *iidx_pin = stm_sync_inode_index(fs->sync);
+    if (!iidx_pin) {
+        pthread_rwlock_unlock(&fs->global);
+        return STM_EINVAL;
+    }
+    stm_inode_handle *h_falloc = NULL;
+    stm_status pp_falloc = stm_inode_pin(iidx_pin, dataset_id, ino, &h_falloc);
+    if (pp_falloc != STM_OK) {
+        pthread_rwlock_unlock(&fs->global);
+        return pp_falloc;       /* STM_ENOENT */
+    }
 
     /* SWISS-4q-flush: fallocate operates on the extent tree directly
      * (PUNCH_HOLE drops extents, COLLAPSE/INSERT shifts extent keys,
@@ -6058,6 +6111,7 @@ stm_status stm_fs_fallocate(stm_fs *fs,
     {
         stm_status fr = fs_flush_ino_locked(fs, dataset_id, ino);
         if (fr != STM_OK) {
+            stm_inode_unpin(iidx_pin, h_falloc);
             pthread_rwlock_unlock(&fs->global);
             return fr;
         }
@@ -6066,6 +6120,7 @@ stm_status stm_fs_fallocate(stm_fs *fs,
     struct stm_inode_value iv = {0};
     stm_status vs = fs_fallocate_validate_target(fs, dataset_id, ino, &iv);
     if (vs != STM_OK) {
+        stm_inode_unpin(iidx_pin, h_falloc);
         pthread_rwlock_unlock(&fs->global);
         return vs;
     }
@@ -6087,40 +6142,35 @@ stm_status stm_fs_fallocate(stm_fs *fs,
      * fallocate on INLINE files must transition the file to
      * EXTENT first via `stm_fs_truncate` (which has the
      * INLINE→EXTENT transition path baked in). */
+    /* impl-5 single-exit: every refusal below uses `goto falloc_out`
+     * which unpins + unlocks (the labels live at end of function). */
+    stm_status s = STM_OK;
+
     uint8_t kind = iv.si_data_kind;
     if (kind == STM_DATA_INLINE) {
-        if (any_range_op) {
-            pthread_rwlock_unlock(&fs->global);
-            return STM_ENOTSUPPORTED;
-        }
+        if (any_range_op) { s = STM_ENOTSUPPORTED; goto falloc_out; }
         /* Default preallocate on INLINE: allow ONLY if not extending
          * past the inline cap. Otherwise refuse — caller must
          * truncate-up first to trigger the INLINE→EXTENT transition. */
         if (!keep_size && (off + len) > (uint64_t)STM_INODE_INLINE_MAX) {
-            pthread_rwlock_unlock(&fs->global);
-            return STM_ERANGE;
+            s = STM_ERANGE; goto falloc_out;
         }
     }
 
     /* Sealed-file enforcement: F_SEAL_WRITE / FUTURE_WRITE block
      * every fallocate op (mutates content); F_SEAL_GROW blocks ops
-     * that would extend the file (default preallocate without
-     * KEEP_SIZE, INSERT_RANGE, ZERO_RANGE without KEEP_SIZE);
-     * F_SEAL_SHRINK blocks ops that would shrink (COLLAPSE_RANGE,
-     * PUNCH_HOLE without KEEP_SIZE — but we already required
-     * KEEP_SIZE for PUNCH_HOLE so PUNCH never shrinks logical
-     * size). Match Linux fallocate(2)'s seal enforcement at the
-     * kernel-VFS layer. */
+     * that would extend the file; F_SEAL_SHRINK blocks ops that
+     * would shrink. Match Linux fallocate(2)'s seal enforcement at
+     * the kernel-VFS layer. */
     uint32_t cur_flags = stm_load_le32(iv.si_flags);
+
     if (cur_flags & (uint32_t)(STM_INO_FLAG_SEAL_WRITE |
                                 STM_INO_FLAG_SEAL_FUTURE_WRITE)) {
-        pthread_rwlock_unlock(&fs->global);
-        return STM_EPERM;
+        s = STM_EPERM; goto falloc_out;
     }
     uint64_t cur_size = stm_load_le64(iv.si_size);
     bool would_grow = false;
     if (!any_range_op && !keep_size) {
-        /* Default preallocate: bump si_size to off+len if extending. */
         if (off + len > cur_size) would_grow = true;
     } else if (insert) {
         would_grow = true;
@@ -6129,21 +6179,14 @@ stm_status stm_fs_fallocate(stm_fs *fs,
     }
     bool would_shrink = collapse;
     if (would_grow && (cur_flags & (uint32_t)STM_INO_FLAG_SEAL_GROW)) {
-        pthread_rwlock_unlock(&fs->global);
-        return STM_EPERM;
+        s = STM_EPERM; goto falloc_out;
     }
     if (would_shrink && (cur_flags & (uint32_t)STM_INO_FLAG_SEAL_SHRINK)) {
-        pthread_rwlock_unlock(&fs->global);
-        return STM_EPERM;
+        s = STM_EPERM; goto falloc_out;
     }
 
     stm_extent_index *eidx = stm_sync_extent_index(fs->sync);
-    if (!eidx) {
-        pthread_rwlock_unlock(&fs->global);
-        return STM_EINVAL;
-    }
-
-    stm_status s = STM_OK;
+    if (!eidx) { s = STM_EINVAL; goto falloc_out; }
 
     if (punch) {
         /* PUNCH_HOLE | KEEP_SIZE: route through stm_sync_punch_range
@@ -6153,8 +6196,7 @@ stm_status stm_fs_fallocate(stm_fs *fs,
         s = stm_sync_punch_range(fs->sync, dataset_id, ino, off, len);
         if (s == STM_OK) {
             fs_stamp_mtime_ctime_now(&iv);
-            stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
-            (void)stm_inode_set(iidx, dataset_id, ino, &iv);
+            (void)stm_inode_set(iidx_pin, dataset_id, ino, &iv);
         }
     } else if (collapse) {
         /* COLLAPSE_RANGE: range must already be empty + no crossing
@@ -6162,12 +6204,8 @@ stm_status stm_fs_fallocate(stm_fs *fs,
          * extents above off+len down by len. Shrink si_size by len.
          *
          * R89 P2-1: Linux fallocate(2) refuses with EINVAL when
-         * `off + len >= cur_size` (collapse beyond EOF is
-         * undefined). Mirror that. */
-        if (off + len > cur_size) {
-            pthread_rwlock_unlock(&fs->global);
-            return STM_EINVAL;
-        }
+         * `off + len >= cur_size` (collapse beyond EOF is undefined). */
+        if (off + len > cur_size) { s = STM_EINVAL; goto falloc_out; }
         s = stm_extent_shift_range_keys(eidx, dataset_id, ino,
                                              off + len,
                                              -(int64_t)len);
@@ -6175,8 +6213,7 @@ stm_status stm_fs_fallocate(stm_fs *fs,
             uint64_t new_size = cur_size - len;
             iv.si_size = stm_store_le64(new_size);
             fs_stamp_mtime_ctime_now(&iv);
-            stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
-            (void)stm_inode_set(iidx, dataset_id, ino, &iv);
+            (void)stm_inode_set(iidx_pin, dataset_id, ino, &iv);
         }
     } else if (insert) {
         /* INSERT_RANGE: shift extents at off' >= off up by len.
@@ -6184,50 +6221,41 @@ stm_status stm_fs_fallocate(stm_fs *fs,
          * si_size grows by len.
          *
          * R89 P2-2: Linux fallocate(2) refuses with EINVAL when
-         * `off >= cur_size` (inserting past EOF is undefined —
-         * inserting at exactly cur_size is also refused since
-         * that's just appending). */
-        if (off >= cur_size) {
-            pthread_rwlock_unlock(&fs->global);
-            return STM_EINVAL;
-        }
+         * `off >= cur_size` (inserting past EOF is undefined). */
+        if (off >= cur_size) { s = STM_EINVAL; goto falloc_out; }
         if (cur_size > UINT64_MAX - len) {
-            pthread_rwlock_unlock(&fs->global);
-            return STM_EOVERFLOW;
+            s = STM_EOVERFLOW; goto falloc_out;
         }
         s = stm_extent_shift_range_keys(eidx, dataset_id, ino,
                                              off, (int64_t)len);
         if (s == STM_OK) {
             iv.si_size = stm_store_le64(cur_size + len);
             fs_stamp_mtime_ctime_now(&iv);
-            stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
-            (void)stm_inode_set(iidx, dataset_id, ino, &iv);
+            (void)stm_inode_set(iidx_pin, dataset_id, ino, &iv);
         }
     } else if (zero_r) {
         /* ZERO_RANGE: punch via stm_sync_punch_range (R89 P0-4
          * paddr-routing fix) + (if !keep_size and would_grow) bump
-         * si_size. MVP: equivalent to PUNCH_HOLE structurally — the
-         * extent slots are dropped; subsequent reads return zeros
-         * via sparse-extent semantics. */
+         * si_size. */
         s = stm_sync_punch_range(fs->sync, dataset_id, ino, off, len);
         if (s == STM_OK) {
             if (!keep_size && (off + len) > cur_size) {
                 iv.si_size = stm_store_le64(off + len);
             }
             fs_stamp_mtime_ctime_now(&iv);
-            stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
-            (void)stm_inode_set(iidx, dataset_id, ino, &iv);
+            (void)stm_inode_set(iidx_pin, dataset_id, ino, &iv);
         }
     } else if (unshare) {
         /* UNSHARE_RANGE: composes via stm_fs_promote_to_hot —
          * promote_to_hot promotes EVERY COLD extent at the ino
          * (broader than POSIX requires for a partial range, but
-         * correct + conservative). Drop fs->lock first since
-         * promote_to_hot takes fs->lock. */
+         * correct + conservative). Drop pin + SH BEFORE chaining
+         * since stm_fs_promote_to_hot takes both fresh. */
+        stm_inode_unpin(iidx_pin, h_falloc);
         pthread_rwlock_unlock(&fs->global);
         stm_status ps = stm_fs_promote_to_hot(fs, dataset_id, ino);
         /* STM_ENOENT is "no COLD extents to promote" — already
-         * unshared, return OK. Other errors bubble up. */
+         * unshared, return OK. */
         if (ps == STM_ENOENT) return STM_OK;
         return ps;
     } else {
@@ -6239,13 +6267,14 @@ stm_status stm_fs_fallocate(stm_fs *fs,
             if ((off + len) > cur_size) {
                 iv.si_size = stm_store_le64(off + len);
                 fs_stamp_mtime_ctime_now(&iv);
-                stm_inode_index *iidx = stm_sync_inode_index(fs->sync);
-                (void)stm_inode_set(iidx, dataset_id, ino, &iv);
+                (void)stm_inode_set(iidx_pin, dataset_id, ino, &iv);
             }
         }
         s = STM_OK;
     }
 
+falloc_out:
+    stm_inode_unpin(iidx_pin, h_falloc);
     pthread_rwlock_unlock(&fs->global);
     return s;
 }
