@@ -1659,6 +1659,67 @@ rather than gating it. R138 audit verified the C impl honours the
 invariants by construction; the formal TLC verification is
 tooling-gated alongside #958/#966/#973.
 
+### `multi_stratumd.tla` — multi-stratumd-per-pool (TLY-A2 entry)
+
+Spec-first scaffold for the TLY-A2 / STRATUM-API-V1.md §4 ask: per-user
+stratumds as clients of a single coordinator daemon, with bilateral
+auth at Tattach (per-user-stratumd pattern set + coord per-uid policy),
+per-client fid namespace isolation, and crash isolation. The CORVUS-
+DESIGN.md §3 D4 + invariant F16 mitigation: killing `stratumd-michael`
+evicts michael's DEK by construction (separate process = separate
+address space), but this requires that one client's crash doesn't
+propagate to the others.
+
+State variables: `live_clients`, `attached`, `coord_wedged`,
+`wedge_cause` (NoCause / "CoordWedge" / "Crash"), `last_op_client`,
+`last_op_dataset`, `last_op_wedged` (audit shadows).
+
+Actions: `ClientDial` / `AttachGood` / `AttachWithoutCoordCheck` /
+`OpGood` / `CrossClientOp` / `CrashGood` / `CrashWedgesCoord` /
+`CoordWedge` / `WedgedOp`.
+
+Headline invariants:
+
+- `TattachPatternEnforced` — every (c, ds) in attached satisfies BOTH
+  client_pattern[c] AND coord_policy[client_uid[c]].
+- `CrossClientIsolation` — every audit_op shadow records the firing
+  client as the binding-owner (no fid-aliasing across clients).
+- `ClientCrashIsolation` — `wedge_cause = "Crash"` is unreachable
+  (the buggy `CrashWedgesCoord` transition is the only path to that
+  value; the good cfg never reaches it).
+- `WedgeObservability` — audit shadow's `last_op_wedged` type
+  invariant; the action guards on `WedgedOp` enforce the firing
+  semantics.
+
+Buggy variants:
+
+- `multi_stratumd_pattern_skipped_buggy.cfg` — coord-side policy
+  elided; client-side check only. Trips `TattachPatternEnforced`.
+- `multi_stratumd_aliased_fids_buggy.cfg` — cross-client op simulated
+  via shared downstream fid aliasing. Trips `CrossClientIsolation`.
+- `multi_stratumd_crash_propagates_buggy.cfg` — client crash flips
+  coord_wedged. Trips `ClientCrashIsolation`.
+
+Spec-to-code mapping (impl phase — TLY-A2-impl-1..5):
+
+- `stratumd_check_tattach` (`v2/src/cmd/stratumd/serve.c`) realises
+  `AttachGood`'s coord-side check (TLY-A2-impl-1, shipped at
+  `ad55173`). `stm_ds_policy_admits` (`dataset_pattern.c`) realises
+  `CoordAdmitsDataset(c, ds)`.
+- TLY-A2-impl-2 will introduce the per-user stratumd's client-side
+  pattern check (the `ClientAdmitsDataset` predicate, realised
+  against the matcher in `--datasets-allowed`).
+- TLY-A2-impl-3 wires SO_PEERCRED on the downstream side so coord's
+  enforcement runs against the dialing client's uid.
+- TLY-A2-impl-4 covers `ClientCrashIsolation` — verifies that a
+  crashing client doesn't propagate wedge state.
+- TLY-A2-impl-5 is the stress sweep.
+
+State-space estimate: small (Clients={c1,c2}, Datasets={sys,m,s},
+MaxAttaches=1..2); good cfg under 10K reachable states; buggy
+configs fire within tens. TLC verify tooling-gated (folds into
+#958/#966/#973 forward-noted list).
+
 ## Running TLC
 
 ```bash
