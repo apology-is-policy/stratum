@@ -70,6 +70,7 @@
 #include <stratum/super.h>
 #include <stratum/cas.h>
 #include <stratum/snapshot.h>
+#include <stratum/crypto.h>          /* TLY-A1: stm_random_bytes */
 #include <stratum/sync.h>
 
 #include <sys/stat.h>            /* S_IFMT / S_IFREG / S_IFDIR */
@@ -392,6 +393,24 @@ stm_status stm_fs_format(const char *path, const stm_fs_format_opts *opts)
     s = stm_sync_create(pool, a, &wk, NULL, &sync);
     if (s != STM_OK) { stm_pool_close(pool); stm_alloc_close(a); stm_bdev_close(d); stm_hybrid_keys_wipe(&wk); return s; }
 
+    /* TLY-A1: bind the pool_serial BEFORE the first commit so it
+     * lands in the initial uberblock. If caller passed all-zero (or
+     * zero-init'd opts), CSPRNG-generate 16 bytes AND write them back
+     * into `opts->pool_serial` so the caller can read the bound
+     * value (the Thylacine-installer flow per §3.5 of the API spec).
+     * Caller's explicit non-zero value passes through unchanged. */
+    {
+        stm_fs_format_opts *mopts = (stm_fs_format_opts *)opts;
+        bool all_zero = true;
+        for (int i = 0; i < 16; i++) {
+            if (mopts->pool_serial[i] != 0) { all_zero = false; break; }
+        }
+        if (all_zero) {
+            stm_random_bytes(mopts->pool_serial, 16);
+        }
+        stm_sync_set_pool_serial(sync, mopts->pool_serial);
+    }
+
     /* First commit: lays down the initial uberblock at gen=1 so a
      * subsequent stm_fs_mount finds something to read. */
     s = stm_sync_commit(sync);
@@ -573,6 +592,64 @@ stm_status stm_fs_mount(const char *path,
             return s;
         }
     }
+
+    /* TLY-A1: pool_serial binding check, before any further state
+     * touches. STRATUM-API-V1.md §3.3 comparison matrix:
+     *   - opts->expected_pool_serial == NULL:
+     *       mount succeeds regardless of on-disk value (caller did
+     *       not ask for binding).
+     *   - both on-disk and expected all-zero:
+     *       mount succeeds (legitimate unbound pool, caller passed
+     *       all-zero — vacuously satisfied).
+     *   - on-disk all-zero, expected non-zero:
+     *       STM_ESERIAL (don't silently mount an unbound pool when
+     *       binding was requested — the spec's explicit guarantee).
+     *   - both non-zero, equal:
+     *       mount succeeds.
+     *   - both non-zero, unequal:
+     *       STM_ESERIAL.
+     *
+     * Constant-time compare via stm_ct_memequal would be overkill —
+     * this isn't a secret; the attacker model is "tampered device,"
+     * not "side-channel on a running process." memcmp is fine. */
+    if (opts->expected_pool_serial) {
+        const uint8_t *exp = opts->expected_pool_serial;
+        bool exp_zero  = true;
+        bool disk_zero = true;
+        for (int i = 0; i < 16; i++) {
+            if (exp[i] != 0)                   exp_zero = false;
+            if (peek_ub.ub_pool_serial[i] != 0) disk_zero = false;
+        }
+        bool refused = false;
+        if (disk_zero && !exp_zero) {
+            /* "on-disk all-zero but arg non-zero: mount fails with
+             * STM_ESERIAL (don't silently mount an unbound pool
+             * when binding was requested)" — §3.3 of the API spec. */
+            refused = true;
+        } else if (!disk_zero && !exp_zero) {
+            if (memcmp(peek_ub.ub_pool_serial, exp, 16) != 0) {
+                refused = true;
+            }
+        }
+        /* (disk_zero && exp_zero) and (!disk_zero && exp_zero) both
+         * succeed: the first is "unbound pool, caller didn't bind"
+         * (vacuous OK); the second is "bound pool, caller didn't ask
+         * to check" — but we got here via expected_pool_serial != NULL,
+         * so we DO want to check. The all-zero arg case has to mean
+         * something explicit. The spec's row "all-zero arg vs bound
+         * pool: STM_ESERIAL" makes this concrete — caller's all-zero
+         * is NOT a wildcard. */
+        if (!disk_zero && exp_zero) {
+            refused = true;
+        }
+        if (refused) {
+            stm_bdev_close(d);
+            stm_hybrid_keys_wipe(&wk);
+            if (janus) stm_janus_client_disconnect(janus);
+            return STM_ESERIAL;
+        }
+    }
+
     uint16_t peek_device_count = stm_load_le16(peek_ub.ub_device_count);
     uint16_t peek_device_id    = stm_load_le16(peek_ub.ub_device_id);
     if (peek_device_count == 0 ||

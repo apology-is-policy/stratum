@@ -138,6 +138,16 @@ typedef struct stm_stratumd_opts {
     const char *keyfile_passphrase;
     size_t      keyfile_passphrase_len;
 
+    /* TLY-A1: expected pool_serial (16 raw bytes). When `bind_pool_serial`
+     * is true, the daemon forwards `pool_serial` to stm_fs_mount as
+     * `expected_pool_serial`, which compares against the on-disk value
+     * per the STRATUM-API-V1.md §3.3 matrix. Mismatch → STM_ESERIAL,
+     * surfaced as a non-zero exit + a stderr line ("pool serial
+     * mismatch ..."). Default (bind_pool_serial=false) ignores the
+     * field — back-compat for non-Thylacine deployments. */
+    bool        bind_pool_serial;
+    uint8_t     pool_serial[16];
+
     /* Listen config. */
     const char *socket_path;      /* required (FS Unix socket path) */
     const char *ctl_socket_path;  /* P9-CTL-2c: optional /ctl/ socket

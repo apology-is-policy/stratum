@@ -703,8 +703,19 @@ typedef struct {
      * (P8-POSIX-6, v26). Same semantics as `ub_dirent_root_gen`. */
     le64    ub_xattr_root_gen;                  /* 3496 :  8 */
 
+    /* TLY-A1: 128-bit pool identifier written once at format. Bound
+     * by stratumd's --bind-pool-serial CLI to defeat the evil-maid
+     * swap-the-disk attack on integrity-only system pools (Thylacine
+     * CORVUS-DESIGN.md §3 D2 + invariant C-14). All-zero means
+     * "unbound" — mount semantics carved out in stm_fs_mount per
+     * STRATUM-API-V1.md §3.3 comparison matrix. Covered by ub_csum
+     * (inherits tamper-detection for free). Field is read BEFORE
+     * any pool/sync/alloc construction so a serial mismatch fails
+     * the mount before any other state is touched. */
+    uint8_t ub_pool_serial[16];                 /* 3504 :  16 */
+
     /* Reserved for future fields + alignment to csum. */
-    uint8_t ub_reserved[560];                   /* 3504 : 560 */
+    uint8_t ub_reserved[544];                   /* 3520 : 544 */
 
     /* Checksum: BLAKE3-256 over the rest of the uberblock with this
      * field zeroed. Self-verifying; a blob whose first 4064 bytes
@@ -747,8 +758,11 @@ _Static_assert(offsetof(stm_uberblock, ub_xattr_root) == 3432,
                "ub_xattr_root must be at offset 3432 (v26 layout)");
 _Static_assert(offsetof(stm_uberblock, ub_xattr_root_gen) == 3496,
                "ub_xattr_root_gen must be at offset 3496 (v26 layout)");
-_Static_assert(offsetof(stm_uberblock, ub_reserved) == 3504,
-               "ub_reserved must be at offset 3504 (v26 layout)");
+_Static_assert(offsetof(stm_uberblock, ub_pool_serial) == 3504,
+               "ub_pool_serial must be at offset 3504 (TLY-A1 layout)");
+_Static_assert(offsetof(stm_uberblock, ub_reserved) == 3520,
+               "ub_reserved must be at offset 3520 (TLY-A1 layout; "
+               "carved 16 bytes for ub_pool_serial from head of prior 560-byte block)");
 _Static_assert(offsetof(stm_uberblock, ub_csum) == 4064,
                "ub_csum must be at offset 4064");
 

@@ -109,6 +109,16 @@ typedef struct {
      * (encrypted) keyfile. NULL = plaintext keyfile. */
     const char *keyfile_passphrase;
     size_t      keyfile_passphrase_len;
+
+    /* TLY-A1: 16-byte binding anchor written into the uberblock at
+     * format. If all-zero (or omitted by zero-init), stm_fs_format
+     * CSPRNG-generates a fresh value AND writes it back into this
+     * field so the caller can read it post-format (Thylacine's
+     * installer flow per STRATUM-API-V1.md §3.5). All-zero on-disk
+     * means the pool is "unbound" — any --bind-pool-serial value
+     * supplied at mount returns STM_ESERIAL (don't silently mount
+     * an unbound pool when binding was requested). */
+    uint8_t     pool_serial[16];
 } stm_fs_format_opts;
 
 /*
@@ -147,6 +157,16 @@ typedef struct {
      * the buffer after fs_mount returns. NULL = plaintext keyfile. */
     const char *keyfile_passphrase;
     size_t      keyfile_passphrase_len;
+
+    /* TLY-A1: expected pool_serial (16 bytes). NULL = no check; mount
+     * succeeds regardless of on-disk value. Non-NULL drives the
+     * comparison matrix from STRATUM-API-V1.md §3.3:
+     *   - both all-zero (unbound): succeed with a warning;
+     *   - on-disk all-zero but expected non-zero: STM_ESERIAL;
+     *   - both non-zero and equal: succeed;
+     *   - both non-zero and unequal: STM_ESERIAL.
+     * Compared byte-for-byte BEFORE pool/sync/alloc construction. */
+    const uint8_t *expected_pool_serial;
 } stm_fs_mount_opts;
 
 /*

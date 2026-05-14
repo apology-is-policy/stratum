@@ -107,8 +107,36 @@ static void usage(const char *argv0)
             "(default: 1)\n"
         "  --backlog <n>            listen() backlog "
             "(default: %d)\n"
+        "  --bind-pool-serial <hex> 32-hex-char (16-byte) pool_serial "
+            "that the on-disk superblock must match. Refuses to mount on "
+            "mismatch (STRATUM-API-V1.md §3.3 — TLY-A1).\n"
         "  -h, --help               This message\n",
         argv0, STM_STRATUMD_DEFAULT_BACKLOG);
+}
+
+/* TLY-A1: parse 32 hex chars (case-insensitive) into 16 raw bytes.
+ * Returns 0 on success, -1 on length mismatch / non-hex character. */
+static int parse_hex16(const char *hex, uint8_t out[16])
+{
+    if (!hex) return -1;
+    size_t n = 0;
+    while (hex[n] != '\0') n++;
+    if (n != 32) return -1;
+    for (int i = 0; i < 16; i++) {
+        int hi = hex[2*i];
+        int lo = hex[2*i + 1];
+        int hv =
+            (hi >= '0' && hi <= '9') ? hi - '0' :
+            (hi >= 'a' && hi <= 'f') ? hi - 'a' + 10 :
+            (hi >= 'A' && hi <= 'F') ? hi - 'A' + 10 : -1;
+        int lv =
+            (lo >= '0' && lo <= '9') ? lo - '0' :
+            (lo >= 'a' && lo <= 'f') ? lo - 'a' + 10 :
+            (lo >= 'A' && lo <= 'F') ? lo - 'A' + 10 : -1;
+        if (hv < 0 || lv < 0) return -1;
+        out[i] = (uint8_t)((hv << 4) | lv);
+    }
+    return 0;
 }
 
 int stm_cmd_stratumd_main(int argc, char **argv)
@@ -163,6 +191,19 @@ int stm_cmd_stratumd_main(int argc, char **argv)
         }
         if (!strcmp(a, "--read-only")) {
             opts.read_only = true;
+            continue;
+        }
+        if (!strcmp(a, "--bind-pool-serial") && i + 1 < argc) {
+            /* TLY-A1: 32-hex-char → 16 raw bytes; refuse anything
+             * else loudly so a fat-fingered installer doesn't
+             * silently slip through with the wrong binding. */
+            if (parse_hex16(argv[++i], opts.pool_serial) != 0) {
+                fprintf(stderr,
+                    "stratumd: invalid --bind-pool-serial: %s "
+                    "(expected exactly 32 hex chars)\n", argv[i]);
+                return 1;
+            }
+            opts.bind_pool_serial = true;
             continue;
         }
         if (!strcmp(a, "--msize") && i + 1 < argc) {

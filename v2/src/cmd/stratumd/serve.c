@@ -757,11 +757,31 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
         .janus_socket          = opts->janus_socket,
         .keyfile_passphrase     = opts->keyfile_passphrase,
         .keyfile_passphrase_len = opts->keyfile_passphrase_len,
+        /* TLY-A1: forward pool_serial if --bind-pool-serial was set. */
+        .expected_pool_serial   = opts->bind_pool_serial
+                                    ? opts->pool_serial : NULL,
     };
 
     stm_fs *fs = NULL;
     stm_status rc = stm_fs_mount(opts->fs_path, &mopts, &fs);
-    if (rc != STM_OK) return rc;
+    if (rc != STM_OK) {
+        if (rc == STM_ESERIAL && opts->bind_pool_serial) {
+            /* TLY-A1: log the truncated observed serial + truncated
+             * expected serial. Full values stay out of the public
+             * stderr surface (confidentiality per §3.4 of the spec).
+             * Future /ctl/events surface gets the full pair. */
+            char exp_hex[9] = {0};
+            for (int i = 0; i < 4; i++) {
+                snprintf(exp_hex + 2*i, 3, "%02x",
+                         opts->pool_serial[i]);
+            }
+            fprintf(stderr,
+                "stratumd: pool serial mismatch (expected=%s...); "
+                "refusing to mount per --bind-pool-serial discipline\n",
+                exp_hex);
+        }
+        return rc;
+    }
 
     int      backlog = opts->backlog > 0 ? opts->backlog
                                           : STM_STRATUMD_DEFAULT_BACKLOG;

@@ -168,6 +168,21 @@ stm_status stm_sync_create(stm_pool *p, stm_alloc *a,
                             const stm_redundancy_profile *profile,
                             stm_sync **out_sync);
 
+/* TLY-A1: set the pool's 16-byte binding anchor. Must be called
+ * AFTER stm_sync_create + BEFORE stm_sync_commit so the value lands
+ * in the first uberblock. Caller passes 16 bytes (typically CSPRNG-
+ * generated; all-zero is legal and means "unbound" — back-compat
+ * with pre-Thylacine pools). Post-commit, the field is write-once;
+ * subsequent calls on the same handle replace the in-RAM cache but
+ * the on-disk value persists from the first commit forward. NULL
+ * `s` or `serial` is a no-op. */
+void stm_sync_set_pool_serial(stm_sync *s, const uint8_t serial[16]);
+
+/* Accessor: copies the 16-byte pool_serial last written to / read from
+ * the uberblock into `out`. NULL fs/out is a no-op. Surfaces the
+ * binding anchor for /ctl/ admin views per TLY-A1. */
+void stm_sync_pool_serial(const stm_sync *s, uint8_t out[16]);
+
 /*
  * Mount-time open. Scans all labels × commit ring slots, picks the
  * authoritative uberblock (highest valid gen), and:
