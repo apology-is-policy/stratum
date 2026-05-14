@@ -110,6 +110,17 @@ static void usage(const char *argv0)
         "  --bind-pool-serial <hex> 32-hex-char (16-byte) pool_serial "
             "that the on-disk superblock must match. Refuses to mount on "
             "mismatch (STRATUM-API-V1.md §3.3 — TLY-A1).\n"
+        "  --corvus-user <name>     Subscribe to corvus SESSION_CLOSED notify "
+            "for this user (TLY-A4). When matching frame arrives, stratumd "
+            "shuts down cleanly. STRATUM-API-V1.md §6.\n"
+        "  --corvus-notify-socket <path>\n"
+            "                           Path to corvus notify socket "
+            "(default: /srv/corvus/notify)\n"
+        "  --corvus-notify-mode {strict,tolerant}\n"
+            "                           Behaviour on corvus EOF (default: tolerant)\n"
+        "  --corvus-notify-timeout <seconds>\n"
+            "                           Tolerant-mode reconnect window "
+            "(default: 30)\n"
         "  -h, --help               This message\n",
         argv0, STM_STRATUMD_DEFAULT_BACKLOG);
 }
@@ -195,6 +206,40 @@ int stm_cmd_stratumd_main(int argc, char **argv)
         }
         if (!strcmp(a, "--read-only")) {
             opts.read_only = true;
+            continue;
+        }
+        if (!strcmp(a, "--corvus-user") && i + 1 < argc) {
+            opts.corvus_user = argv[++i];
+            continue;
+        }
+        if (!strcmp(a, "--corvus-notify-socket") && i + 1 < argc) {
+            opts.corvus_notify_socket = argv[++i];
+            continue;
+        }
+        if (!strcmp(a, "--corvus-notify-mode") && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (!strcmp(m, "strict")) {
+                opts.corvus_notify_strict = true;
+            } else if (!strcmp(m, "tolerant")) {
+                opts.corvus_notify_strict = false;
+            } else {
+                fprintf(stderr,
+                    "stratumd: invalid --corvus-notify-mode: %s "
+                    "(expected 'strict' or 'tolerant')\n", m);
+                return 1;
+            }
+            continue;
+        }
+        if (!strcmp(a, "--corvus-notify-timeout") && i + 1 < argc) {
+            char *end = NULL;
+            unsigned long v = strtoul(argv[++i], &end, 10);
+            if (!end || *end != '\0' || v > (UINT32_MAX / 1000u)) {
+                fprintf(stderr,
+                    "stratumd: invalid --corvus-notify-timeout: %s\n",
+                    argv[i]);
+                return 1;
+            }
+            opts.corvus_notify_timeout_ms = (uint32_t)(v * 1000u);
             continue;
         }
         if (!strcmp(a, "--bind-pool-serial") && i + 1 < argc) {

@@ -90,6 +90,7 @@ typedef enum {
     STM_EBACKEND        = -207,   /* backend reported an opaque failure    */
     STM_EQUORUM         = -208,   /* multi-device commit/mount lacked quorum confirmations */
     STM_ESERIAL         = -209,   /* pool_serial mismatch vs --bind-pool-serial expected value (TLY-A1) */
+    STM_ECORVUSGONE     = -210,   /* corvus notify socket EOF + tolerant-mode timeout expired (TLY-A4) */
 
     /* P8-POSIX-2b: dirent / directory-shape errors. POSIX-aligned values
      * (matches Linux errno.h) so callers can interpret without translation. */

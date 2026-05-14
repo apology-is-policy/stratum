@@ -167,6 +167,25 @@ typedef struct stm_stratumd_opts {
                                    * applied to accepted client fds via
                                    * SO_RCVTIMEO + SO_SNDTIMEO */
 
+    /* TLY-A4: corvus SESSION_CLOSED notify consumer. When `corvus_user`
+     * is non-NULL, stratumd spawns a consumer thread that subscribes
+     * to `corvus_notify_socket` (default "/srv/corvus/notify") and
+     * watches for SESSION_CLOSED frames whose user field equals
+     * `corvus_user`. On match, the consumer sets the daemon's
+     * stop_flag → clean shutdown → unmount → DEK zero (per
+     * STRATUM-API-V1.md §6 + `v2/specs/eviction.tla`).
+     *
+     * `corvus_notify_socket` may be NULL — defaults to
+     * "/srv/corvus/notify" inside the consumer.
+     *
+     * `corvus_notify_strict` selects between strict (any EOF →
+     * immediate ECORVUSGONE-flagged shutdown) and tolerant (default;
+     * `corvus_notify_timeout_ms` reconnect window). */
+    const char *corvus_user;
+    const char *corvus_notify_socket;
+    bool        corvus_notify_strict;
+    uint32_t    corvus_notify_timeout_ms;
+
     /* Auth fallback policy (R95 P2-2). When peer-credential
      * resolution fails (platform without SO_PEERCRED / getpeereid),
      * the default behavior is to REFUSE the connection — the daemon

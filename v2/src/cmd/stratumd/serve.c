@@ -13,6 +13,8 @@
 
 #include <stratum/stratumd.h>
 
+#include "corvus_notify.h"
+
 #include <stratum/9p.h>
 #include <stratum/ctl.h>
 #include <stratum/fs.h>
@@ -968,12 +970,72 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
         ctl_started = true;
     }
 
+    /* TLY-A4: corvus SESSION_CLOSED consumer. Spawn AFTER /ctl/
+     * setup so the consumer can log into /ctl/events from the very
+     * first frame; if /ctl/ wasn't opted into, the consumer logs
+     * are silently dropped (ctl == NULL → log_event no-op).
+     *
+     * The consumer is opt-in: NULL corvus_user means stratumd never
+     * touches /srv/corvus/notify (back-compat for non-Thylacine
+     * deployments). When set, the consumer shares the daemon's
+     * stop_flag — if corvus disappears past the tolerant window OR
+     * a matching SESSION_CLOSED arrives, the consumer flips
+     * stop_flag, which the FS accept loop observes next iteration. */
+    stm_corvus_notify_consumer *cnc = NULL;
+    if (opts->corvus_user && opts->stop_flag) {
+        stm_corvus_notify_opts cnopts;
+        memset(&cnopts, 0, sizeof cnopts);
+        cnopts.socket_path = opts->corvus_notify_socket
+                                ? opts->corvus_notify_socket
+                                : "/srv/corvus/notify";
+        cnopts.corvus_user = opts->corvus_user;
+        cnopts.mode        = opts->corvus_notify_strict
+                                ? STM_CORVUS_NOTIFY_STRICT
+                                : STM_CORVUS_NOTIFY_TOLERANT;
+        cnopts.notify_timeout_ms = opts->corvus_notify_timeout_ms;
+        cnopts.stop_flag         = opts->stop_flag;
+        cnopts.ctl               = ctl; /* may be NULL */
+        stm_status crc = stm_corvus_notify_start(&cnopts, &cnc);
+        if (crc != STM_OK) {
+            fprintf(stderr,
+                "stratumd: failed to start corvus notify consumer (rc=%d)\n",
+                (int)crc);
+            /* Fatal: a Thylacine-bound stratumd MUST run the consumer.
+             * Tear everything down. */
+            if (ctl_started) {
+                (void)shutdown(ctl_fd, SHUT_RDWR);
+                (void)pthread_join(ctl_tid, NULL);
+            }
+            close(listen_fd);
+            (void)unlink(opts->socket_path);
+            if (ctl_fd >= 0) {
+                close(ctl_fd);
+                (void)unlink(opts->ctl_socket_path);
+            }
+            if (ctl) stm_ctl_destroy(ctl);
+            if (scrub) stm_scrub_close(scrub);
+            (void)stm_fs_unmount(fs);
+            return crc;
+        }
+    }
+
     /* Run FS accept loop on the calling thread. Returns when
      * stop_flag is set (or on fatal accept error). */
     rc = stm_stratumd_accept_loop(listen_fd, fs, msize_max, root_ds,
                                        opts->idle_timeout_ms,
                                        opts->allow_unauthenticated_peer,
                                        opts->stop_flag);
+
+    /* TLY-A4: stop the corvus notify consumer FIRST so its log lines
+     * (consumer-exiting) land in /ctl/events BEFORE stm_ctl_destroy
+     * drains the audit log. The consumer's stop is cooperative — its
+     * thread observes the same stop_flag we just exited on. Capture
+     * its rc so a ECORVUSGONE shutdown bubbles up to the daemon's
+     * exit code. */
+    if (cnc) {
+        stm_status crc = stm_corvus_notify_stop(cnc);
+        if (rc == STM_OK && crc != STM_OK) rc = crc;
+    }
 
     /* /ctl/ worker shutdown: signal stop via shutdown(2) on the
      * /ctl/ listen fd to unblock its accept(), then join the worker.

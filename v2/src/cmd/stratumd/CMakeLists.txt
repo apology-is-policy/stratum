@@ -8,7 +8,8 @@
 #                   stm_stratumd_run.
 
 add_library(stm_stratumd STATIC
-    serve.c)
+    serve.c
+    corvus_notify.c)
 
 target_include_directories(stm_stratumd PUBLIC
     ${CMAKE_SOURCE_DIR}/include)
