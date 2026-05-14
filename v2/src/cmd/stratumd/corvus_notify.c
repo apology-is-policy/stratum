@@ -11,6 +11,7 @@
 
 #include "corvus_notify.h"
 
+#include <stratum/crypto.h>
 #include <stratum/ctl.h>
 #include <stratum/types.h>
 
@@ -228,14 +229,21 @@ static int try_connect(const char *path)
     return fd;
 }
 
-/* Open with retry, capped by `budget_ms` (0 = infinite). Returns:
+/* Open with retry, capped by `budget_ms` (0 = infinite) OR refused
+ * after a single failed attempt when `single_attempt` is true.
+ * Returns:
  *   fd ≥ 0       → connected
  *   -1           → stop_flag observed during retry
- *   -2           → budget exhausted
+ *   -2           → budget exhausted OR single_attempt failed
  *   -errno       → non-retryable error
- */
+ *
+ * R138 P2-2 close: the single_attempt flag distinguishes strict-mode
+ * "one shot" from tolerant-mode "retry within a window". Previously,
+ * strict mode passed budget_ms=1 — which `open_with_retry` treated
+ * as a 1 ms wall-clock window, allowing ~2 attempts before bailing.
+ * The explicit flag now refuses-after-first-fail unambiguously. */
 static int open_with_retry(const stm_corvus_notify_consumer *c,
-                              uint32_t budget_ms)
+                              uint32_t budget_ms, bool single_attempt)
 {
     uint32_t spent = 0u;
     while (1) {
@@ -248,6 +256,7 @@ static int open_with_retry(const stm_corvus_notify_consumer *c,
                 fd != -EAGAIN && fd != -EINTR) {
             return fd;
         }
+        if (single_attempt) return -2;
         if (budget_ms > 0u && spent >= budget_ms) return -2;
 
         /* Sleep CORVUS_OPEN_RETRY_INTERVAL_MS in poll-tick chunks
@@ -399,8 +408,21 @@ static stm_status read_one_frame(stm_corvus_notify_consumer *c, int fd)
         if (rrc != 0)              return STM_EBACKEND;
     }
 
-    return process_frame(c, frame,
-                            STM_CORVUS_NOTIFY_HDR_LEN + payload_len);
+    stm_status frc = process_frame(c, frame,
+                                       STM_CORVUS_NOTIFY_HDR_LEN + payload_len);
+
+    /* R138 P1-1: wipe the session token from the stack buffer before
+     * the frame goes out of scope. STRATUM-API-V1.md §3.4 explicitly
+     * requires explicit_bzero discipline for session tokens; without
+     * this wipe, the 33-byte token bytes at frame[3..36) sit in the
+     * consumer thread's stack indefinitely (a core dump, debugger, OR
+     * a future use-after-free elsewhere in stratumd could read them
+     * back). The compiler-barrier wipe of the whole frame (not just
+     * the token slice) is cheaper than a slice + harmonises with the
+     * "no plaintext credentials in stack memory beyond their use"
+     * doctrine. */
+    stm_ct_memzero(frame, sizeof frame);
+    return frc;
 }
 
 /* Top-level consumer loop. Returns when stop_flag is observed OR
@@ -415,22 +437,19 @@ static stm_status read_one_frame(stm_corvus_notify_consumer *c, int fd)
  * `v2/specs/eviction.tla`. */
 static stm_status consumer_loop(stm_corvus_notify_consumer *c)
 {
-    /* Initial connect with a budget bounded by tolerant timeout —
-     * if corvus is unreachable for `notify_timeout_ms`, the consumer
-     * declares ECORVUSGONE + sets stop_flag (the strict-mode posture
-     * for the initial-connect class). Strict mode shortens the
-     * budget to one attempt. */
-    uint32_t budget = c->timeout_ms;
-    if (c->mode == STM_CORVUS_NOTIFY_STRICT) {
-        /* Single-attempt budget; if corvus isn't there yet we fail. */
-        budget = 1u;
-    }
+    /* Initial connect. Strict mode: refuse-after-first-fail (R138 P2-2
+     * close — explicit single_attempt flag, no more "budget=1ms"
+     * masquerade). Tolerant mode: budget bounded by notify_timeout_ms;
+     * if corvus is unreachable for the entire window, the consumer
+     * declares ECORVUSGONE + sets stop_flag. */
+    bool     single_attempt = (c->mode == STM_CORVUS_NOTIFY_STRICT);
+    uint32_t budget         = single_attempt ? 0u : c->timeout_ms;
 
     log_event(c, "stratumd: corvus notify: consumer starting (path=%s, mode=%s)",
               c->socket_path,
               c->mode == STM_CORVUS_NOTIFY_STRICT ? "strict" : "tolerant");
 
-    int fd = open_with_retry(c, budget);
+    int fd = open_with_retry(c, budget, single_attempt);
     if (fd == -1) {
         /* stop_flag observed before connect succeeded; benign exit. */
         return STM_OK;
@@ -461,7 +480,8 @@ static stm_status consumer_loop(stm_corvus_notify_consumer *c)
                 signal_stop(c);
                 return STM_ECORVUSGONE;
             }
-            int newfd = open_with_retry(c, c->timeout_ms);
+            int newfd = open_with_retry(c, c->timeout_ms,
+                                          /*single_attempt=*/false);
             if (newfd == -1) break; /* stop observed during retry */
             if (newfd == -2 || newfd < 0) {
                 log_event(c, "stratumd: corvus notify: reconnect "
@@ -482,7 +502,8 @@ static stm_status consumer_loop(stm_corvus_notify_consumer *c)
             signal_stop(c);
             return STM_ECORVUSGONE;
         }
-        int newfd = open_with_retry(c, c->timeout_ms);
+        int newfd = open_with_retry(c, c->timeout_ms,
+                                      /*single_attempt=*/false);
         if (newfd == -1) break;
         if (newfd == -2 || newfd < 0) {
             signal_stop(c);
@@ -582,16 +603,24 @@ stm_status stm_corvus_notify_start(const stm_corvus_notify_opts *opts,
     c->ctl        = opts->ctl;
     c->rc         = STM_OK;
 
-    atomic_store_explicit(&c->started, false, memory_order_relaxed);
+    /* R138 P2-4 close: publish started=true BEFORE pthread_create so
+     * the store synchronises through the pthread_create barrier (R97
+     * P2-2 attach-before-create pattern). A concurrent stop() call on
+     * the same handle from a sibling thread would otherwise see
+     * started=false during the window between pthread_create return
+     * and the post-create store, skip the join, free `c`, and the
+     * worker would UAF. With this ordering, any thread that observes
+     * the handle (via *out below) is guaranteed to see started=true. */
+    atomic_store_explicit(&c->started, true, memory_order_release);
 
     int prc = pthread_create(&c->tid, NULL, consumer_main, c);
     if (prc != 0) {
+        atomic_store_explicit(&c->started, false, memory_order_release);
         free(c->socket_path);
         free(c->corvus_user);
         free(c);
         return STM_EIO;
     }
-    atomic_store_explicit(&c->started, true, memory_order_release);
 
     *out = c;
     return STM_OK;

@@ -1574,6 +1574,91 @@ lock-release-on-clunk (P9-9P-1 substantive — the owner_id ←→ fid
 mapping is documented in the substantive comments rather than
 specced as a separate invariant).
 
+### `eviction.tla` — corvus SESSION_CLOSED notify + clean-shutdown ordering (TLY-A4 entry)
+
+Spec-first scaffold for the TLY-A4 / STRATUM-API-V1.md §6 ask: the
+stratumd ↔ corvus notify-Spoor consumer that triggers daemon
+shutdown on a matching SESSION_CLOSED frame. The "data sealed at
+logout" invariant from CORVUS-DESIGN.md §13.3 / invariant C-5 hinges
+on a specific ordering: consumer sets `stop_flag`; main thread
+observes; drains accept loops; unmounts; DEK is zeroed via
+`stm_sync_close`'s `stm_ct_memzero` discipline; process exits.
+
+Pin: a buggy implementation that unmounts BEFORE setting stop_flag,
+OR that elides the workload drain, OR that never escalates on a
+persistent tolerant-mode EOF, breaks the bilateral contract Thylacine
+relies on for logout integrity.
+
+State variables:
+
+- `notify_state` ∈ {"Disconnected", "Connected", "Eofed"} —
+  consumer's notify-socket state machine.
+- `timeout_elapsed` — tolerant-mode timeout flag.
+- `stop_flag` — the daemon's shutdown signal (consumer writes;
+  main thread reads).
+- `main_state` ∈ {"Serving", "Stopping", "Unmounted", "Exited"}.
+- `drain_pending` — in-flight write workload modeled abstractly.
+- `dek_state` ∈ {"Live", "Zeroed"}.
+- `history_unmount_saw_stop` — shadow capturing `stop_flag` at
+  every Unmount transition.
+
+Actions: `ConsumerConnect` / `ConsumerSessionClosedMatch` /
+`ConsumerSessionClosedOther` / `NotifySocketEOF` /
+`ConsumerStrictEofEscalate` / `TolerantTimeoutElapse` /
+`ConsumerTolerantEscalate` / `WorkloadEnqueueWrite` /
+`WorkloadFlush` / `MainObserveStop` / `Unmount` / `Exit`. Buggy
+alternates: `UnmountBeforeStop`, `UnmountWithoutDrain`,
+`TolerantEofNoEscalate`.
+
+Headline invariants:
+
+- `DataSealedOnExit` — `main_state = "Exited"` ⇒
+  `dek_state = "Zeroed" /\ stop_flag`. The end-to-end safety
+  property: process must not exit while the DEK is still live.
+- `StopBeforeUnmount` — `main_state ∈ {"Unmounted","Exited"}` ⇒
+  `history_unmount_saw_stop`. The eviction-ordering invariant.
+- `InFlightWritesDrainBeforeUnmount` — Unmount fires from a state
+  with `drain_pending = FALSE`. Composes with the R128 P2
+  pre-flush + R130 perf-gate doctrine on the C side.
+- `ConsumerAlwaysEscalatesOnPersistedEOF` (TLA+ liveness:
+  `(Eofed /\ timeout_elapsed) ~> stop_flag`) — tolerant mode
+  must eventually fail closed when corvus is observably gone.
+
+Buggy variants:
+
+- `eviction_ordering_buggy.cfg` — `BuggyOrdering = TRUE` enables
+  `UnmountBeforeStop`. Trips `StopBeforeUnmount` within a few
+  states.
+- `eviction_no_drain_buggy.cfg` — `BuggyNoDrain = TRUE` enables
+  `UnmountWithoutDrain`. Trips `InFlightWritesDrainBeforeUnmount`.
+- `eviction_tolerant_no_escalate_buggy.cfg` —
+  `BuggyToleratNoEscalate = TRUE` disables the good
+  `ConsumerTolerantEscalate` transition. Trips the liveness
+  property `ConsumerAlwaysEscalatesOnPersistedEOF` (safety
+  invariants still hold; the failure is purely liveness).
+
+Spec-to-code mapping:
+
+- `consumer_loop` (`v2/src/cmd/stratumd/corvus_notify.c`) realises
+  `ConsumerConnect` / `ConsumerSessionClosedMatch` / `NotifySocketEOF`
+  / `ConsumerStrictEofEscalate` / `TolerantTimeoutElapse` /
+  `ConsumerTolerantEscalate`.
+- `signal_stop` is the consumer-side `stop_flag := TRUE` action.
+- `stm_stratumd_run`'s FS + /ctl/ accept-loop exit + `stm_ctl_destroy`
+  + `stm_scrub_close` + `stm_fs_unmount` chain realises
+  `MainObserveStop` → workload-drain → `Unmount` → DEK zero.
+- The R128 P2 pre-flush wiring at `stm_fs_unmount` realises
+  `WorkloadFlush` upstream of `Unmount`.
+
+State-space estimate: small (under 10K reachable states); TLC check
+completes in seconds.
+
+Per the bilateral plan in `v2/docs/THYLACINE-V1-PLAN.md §3`, this is
+a "soft spec-first" chunk — the spec landed alongside the impl
+rather than gating it. R138 audit verified the C impl honours the
+invariants by construction; the formal TLC verification is
+tooling-gated alongside #958/#966/#973.
+
 ## Running TLC
 
 ```bash

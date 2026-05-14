@@ -982,6 +982,32 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
      * a matching SESSION_CLOSED arrives, the consumer flips
      * stop_flag, which the FS accept loop observes next iteration. */
     stm_corvus_notify_consumer *cnc = NULL;
+    /* R138 P2-3: when corvus_user is set but stop_flag is NULL, the
+     * consumer can't signal shutdown — invariant C-5 (DEK gone on
+     * SESSION_CLOSED) would be silently violated. Refuse loudly. The
+     * standalone stratumd CLI path always wires stop_flag = &g_stop_flag
+     * (run.c); this gate catches FFI consumers (the Rust `stratum`
+     * umbrella, future SDK callers) that forget. */
+    if (opts->corvus_user && !opts->stop_flag) {
+        fprintf(stderr,
+            "stratumd: --corvus-user set but no stop_flag provided; "
+            "the SESSION_CLOSED consumer cannot signal shutdown "
+            "(invariant C-5 / STRATUM-API-V1.md §6) — refusing to start\n");
+        if (ctl_started) {
+            (void)shutdown(ctl_fd, SHUT_RDWR);
+            (void)pthread_join(ctl_tid, NULL);
+        }
+        close(listen_fd);
+        (void)unlink(opts->socket_path);
+        if (ctl_fd >= 0) {
+            close(ctl_fd);
+            (void)unlink(opts->ctl_socket_path);
+        }
+        if (ctl) stm_ctl_destroy(ctl);
+        if (scrub) stm_scrub_close(scrub);
+        (void)stm_fs_unmount(fs);
+        return STM_EINVAL;
+    }
     if (opts->corvus_user && opts->stop_flag) {
         stm_corvus_notify_opts cnopts;
         memset(&cnopts, 0, sizeof cnopts);

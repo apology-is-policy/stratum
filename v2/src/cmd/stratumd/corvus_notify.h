@@ -180,9 +180,13 @@ stm_status stm_corvus_notify_start(const stm_corvus_notify_opts *opts,
  *                       exited (rare; e.g. STM_EPROTOCOL on a
  *                       malformed frame the parser couldn't tolerate).
  *
- * The stop_flag (from opts->stop_flag at start) is NOT modified by
- * this function — the caller manages its lifecycle. If the consumer
- * already exited (e.g. on its own ECORVUSGONE), this just joins.
+ * The stop_flag (from opts->stop_flag at start) IS set to true here
+ * to force-unblock the worker, idempotently — safe to call even if
+ * the caller already raised the flag for another reason. Callers
+ * that need to distinguish caller-initiated vs consumer-initiated
+ * shutdown MUST snapshot the flag value BEFORE calling stop().
+ * (R138 P2-1 close: doc aligned with impl.) If the consumer already
+ * exited (e.g. on its own ECORVUSGONE), this just joins.
  *
  * Safe on NULL consumer (no-op, returns STM_OK).
  */

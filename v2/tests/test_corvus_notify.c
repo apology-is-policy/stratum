@@ -478,6 +478,45 @@ STM_TEST(corvus_consumer_no_filter_any_match)
     free(frame);
 }
 
+STM_TEST(corvus_stop_sets_stop_flag)
+{
+    /* R138 P2-1 close: pin the contract that stm_corvus_notify_stop
+     * sets the stop_flag (so callers who want to distinguish caller-
+     * initiated vs consumer-initiated must snapshot the flag BEFORE
+     * calling stop). */
+    fake_corvus fc;
+    STM_ASSERT(fake_corvus_start(&fc, "stop_sets_flag") == 0);
+    fc.n_frames = 0;
+
+    pthread_t tid;
+    pthread_create(&tid, NULL, fake_corvus_thread, &fc);
+
+    atomic_bool stop = false;
+
+    stm_corvus_notify_opts opts;
+    memset(&opts, 0, sizeof opts);
+    opts.socket_path       = fc.sock_path;
+    opts.corvus_user       = "michael";
+    opts.mode              = STM_CORVUS_NOTIFY_TOLERANT;
+    opts.notify_timeout_ms = 2000u;
+    opts.stop_flag         = &stop;
+
+    stm_corvus_notify_consumer *cnc = NULL;
+    STM_ASSERT_OK(stm_corvus_notify_start(&opts, &cnc));
+
+    /* Give consumer time to settle into steady state. */
+    usleep(200 * 1000);
+    /* Caller has NOT raised stop_flag. */
+    STM_ASSERT(atomic_load_explicit(&stop, memory_order_acquire) == false);
+
+    /* stop() should set the flag itself (R138 P2-1). */
+    STM_ASSERT_OK(stm_corvus_notify_stop(cnc));
+    STM_ASSERT(atomic_load_explicit(&stop, memory_order_acquire) == true);
+
+    pthread_join(tid, NULL);
+    fake_corvus_stop(&fc);
+}
+
 STM_TEST(corvus_start_arg_validation)
 {
     stm_corvus_notify_consumer *cnc = NULL;
