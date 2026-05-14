@@ -43,6 +43,27 @@ struct stm_bdev *stm_fs_bdev_for_test(struct stm_fs *fs);
  */
 struct stm_sync *stm_fs_sync_for_test(struct stm_fs *fs);
 
+/*
+ * TLY-A1 (R137 P2-2 close): clear the on-disk ub_pool_serial field
+ * in EVERY committed uberblock at `path`, simulating a pre-Thylacine
+ * pool that was never bound. The path must NOT be mounted.
+ *
+ * Mechanism: open the bdev, walk every label × commit-slot position
+ * via stm_sb_label_read, decode the UB, zero its ub_pool_serial,
+ * re-encode (which recomputes the BLAKE3 csum), write back.
+ * Slots that don't decode (blank / STM_ENOENT, wrong version /
+ * STM_EBADVERSION, corrupt / STM_ECORRUPT) are left untouched.
+ *
+ * Used to exercise the "both all-zero, succeed" matrix-row in
+ * STRATUM-API-V1.md §3.3 that production format-time CSPRNG-fill
+ * normally prevents.
+ *
+ * NULL path returns STM_EINVAL. Bdev / decode / encode errors that
+ * are NOT one of {STM_ENOENT, STM_EBADVERSION, STM_ECORRUPT}
+ * propagate.
+ */
+stm_status stm_fs_test_clear_pool_serial(const char *path);
+
 #ifdef __cplusplus
 }
 #endif

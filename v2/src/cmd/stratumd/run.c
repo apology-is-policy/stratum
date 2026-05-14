@@ -114,11 +114,15 @@ static void usage(const char *argv0)
         argv0, STM_STRATUMD_DEFAULT_BACKLOG);
 }
 
-/* TLY-A1: parse 32 hex chars (case-insensitive) into 16 raw bytes.
- * Returns 0 on success, -1 on length mismatch / non-hex character. */
-static int parse_hex16(const char *hex, uint8_t out[16])
+/* TLY-A1 (R137 P2-1 close): un-static'd and namespaced so tests can
+ * link against it directly. Public declaration in stratum/stratumd.h.
+ * Parses exactly 32 hex chars (case-insensitive) into 16 raw bytes.
+ * Returns 0 on success, -1 on any length mismatch / non-hex character
+ * (including embedded NUL, which terminates the length scan early and
+ * fails the n == 32 check). */
+int stm_stratumd_parse_pool_serial_hex(const char *hex, uint8_t out[16])
 {
-    if (!hex) return -1;
+    if (!hex || !out) return -1;
     size_t n = 0;
     while (hex[n] != '\0') n++;
     if (n != 32) return -1;
@@ -197,7 +201,8 @@ int stm_cmd_stratumd_main(int argc, char **argv)
             /* TLY-A1: 32-hex-char → 16 raw bytes; refuse anything
              * else loudly so a fat-fingered installer doesn't
              * silently slip through with the wrong binding. */
-            if (parse_hex16(argv[++i], opts.pool_serial) != 0) {
+            if (stm_stratumd_parse_pool_serial_hex(argv[++i],
+                                                        opts.pool_serial) != 0) {
                 fprintf(stderr,
                     "stratumd: invalid --bind-pool-serial: %s "
                     "(expected exactly 32 hex chars)\n", argv[i]);

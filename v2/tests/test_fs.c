@@ -29,6 +29,7 @@
 #include <stratum/scrub.h>
 #include <stratum/snapshot.h>
 #include <stratum/snapshot_testing.h>
+#include <stratum/stratumd.h>     /* TLY-A1 R137 P2-1: parse_pool_serial_hex */
 #include <stratum/sync.h>
 #include <stratum/sync_testing.h>
 #include <stratum/types.h>
@@ -7170,14 +7171,14 @@ STM_TEST(fs_p7cas17_partial_migrated_file_falls_back_to_per_extent) {
 /* ===========================================================================
  * TLY-A1 — pool serial binding regression matrix.
  *
- * Seven cases from STRATUM-API-V1.md §3.6, plus the static-asserted
- * layout invariant. Each test goes through stm_fs_format + stm_fs_mount
- * round-trip to exercise the persisted field and the comparison gate.
+ * Cases from STRATUM-API-V1.md §3.6 + R137 P2-1/P2-2 close additions
+ * (hex parser failure modes, unbound-on-disk path via test seam).
+ * Each round-trips stm_fs_format + stm_fs_mount to exercise the
+ * persisted field and the comparison gate.
  * =========================================================================== */
 
-/* Helper: format a pool with caller-supplied (or zero) serial; capture
- * the on-disk serial via a separate read-only mount so we can compare
- * against the expected value WITHOUT going through the bind gate. */
+/* Helper: read the on-disk pool_serial via the public stm_fs_pool_serial
+ * accessor (TLY-A1 R137 P3-2 close — no longer an extern hack). */
 static stm_status tly_a1_read_serial(const char *path, uint8_t out[16])
 {
     stm_fs_mount_opts mopts = rw_mount_opts();
@@ -7185,10 +7186,7 @@ static stm_status tly_a1_read_serial(const char *path, uint8_t out[16])
     stm_fs *fs = NULL;
     stm_status rc = stm_fs_mount(path, &mopts, &fs);
     if (rc != STM_OK) return rc;
-    /* The mount succeeded; read via the in-process sync handle. */
-    extern void stm_sync_pool_serial(const stm_sync *, uint8_t [16]);
-    /* No public accessor on stm_fs yet; reach through stm_fs_sync(). */
-    stm_sync_pool_serial(stm_fs_sync(fs), out);
+    stm_fs_pool_serial(fs, out);
     return stm_fs_unmount(fs);
 }
 
@@ -7309,18 +7307,116 @@ STM_TEST(tly_a1_serial_persists_across_remount) {
     unlink(g_tmp_path); unlink(g_key_path);
 }
 
-STM_TEST(tly_a1_invalid_hex_refused_at_cli) {
-    /* CLI-side validation: 32 hex chars required. Test the parser
-     * directly via the public-ish entry point — stratumd's main
-     * accepts --bind-pool-serial and returns 1 on bad input. We
-     * cover the parser separately via a stand-in: the parse_hex16
-     * helper is static, so the test stays at the CLI semantic level
-     * by asserting that stratumd's --help mentions the flag (smoke
-     * check that the surface is wired). */
-    /* This is intentionally a soft check; the parse logic itself is
-     * trivial and exercised indirectly by the bound_mount_happy
-     * test (which DOES round-trip through serialization). */
-    STM_ASSERT(true);
+/* R137 P2-1 close: real parser tests now that parse_hex16 is exposed
+ * as stm_stratumd_parse_pool_serial_hex. */
+STM_TEST(tly_a1_hex_parser_happy_lowercase) {
+    uint8_t out[16] = {0xFF};   /* poison */
+    int rc = stm_stratumd_parse_pool_serial_hex(
+        "deadbeef00112233445566778899aabb", out);
+    STM_ASSERT_EQ(0, rc);
+    STM_ASSERT_EQ(0xde, out[0]);
+    STM_ASSERT_EQ(0xad, out[1]);
+    STM_ASSERT_EQ(0xbe, out[2]);
+    STM_ASSERT_EQ(0xef, out[3]);
+    STM_ASSERT_EQ(0xbb, out[15]);
+}
+
+STM_TEST(tly_a1_hex_parser_happy_uppercase_and_mixed) {
+    uint8_t out[16] = {0};
+    int rc = stm_stratumd_parse_pool_serial_hex(
+        "DEADBEEF00112233445566778899AABB", out);
+    STM_ASSERT_EQ(0, rc);
+    STM_ASSERT_EQ(0xde, out[0]);
+    STM_ASSERT_EQ(0xbb, out[15]);
+    /* Mixed case. */
+    rc = stm_stratumd_parse_pool_serial_hex(
+        "DeAdBeEf00112233445566778899aaBB", out);
+    STM_ASSERT_EQ(0, rc);
+    STM_ASSERT_EQ(0xde, out[0]);
+}
+
+STM_TEST(tly_a1_hex_parser_refuses_short) {
+    uint8_t out[16];
+    memset(out, 0xCC, 16);   /* poison; verify untouched on -1 */
+    int rc = stm_stratumd_parse_pool_serial_hex("deadbeef", out);
+    STM_ASSERT_EQ(-1, rc);
+    /* (R137 doctrine: on error, the impl writes nothing to out
+     * BEFORE the loop fails — the length check fires at the head.
+     * Verify out wasn't touched.) */
+    STM_ASSERT_EQ(0xCC, out[0]);
+}
+
+STM_TEST(tly_a1_hex_parser_refuses_long) {
+    uint8_t out[16];
+    int rc = stm_stratumd_parse_pool_serial_hex(
+        "deadbeef00112233445566778899aabbcc", out);   /* 34 chars */
+    STM_ASSERT_EQ(-1, rc);
+}
+
+STM_TEST(tly_a1_hex_parser_refuses_non_hex_char) {
+    uint8_t out[16];
+    int rc = stm_stratumd_parse_pool_serial_hex(
+        "deadbeefGG112233445566778899aabb", out);   /* 'G' is non-hex */
+    STM_ASSERT_EQ(-1, rc);
+    /* Also try space, NUL-equivalent (high-bit), other non-hex. */
+    rc = stm_stratumd_parse_pool_serial_hex(
+        "deadbeef 0112233445566778899aabb", out);
+    STM_ASSERT_EQ(-1, rc);
+}
+
+STM_TEST(tly_a1_hex_parser_refuses_null_args) {
+    uint8_t out[16];
+    STM_ASSERT_EQ(-1, stm_stratumd_parse_pool_serial_hex(NULL, out));
+    STM_ASSERT_EQ(-1, stm_stratumd_parse_pool_serial_hex("deadbeef", NULL));
+}
+
+STM_TEST(tly_a1_hex_parser_refuses_embedded_nul) {
+    /* Embedded NUL terminates the length scan early — n < 32 fails. */
+    char buf[33];
+    memcpy(buf, "deadbeef00112233445566778899aabb", 32);
+    buf[32] = '\0';
+    buf[16] = '\0';   /* embed a NUL at position 16 */
+    uint8_t out[16];
+    STM_ASSERT_EQ(-1, stm_stratumd_parse_pool_serial_hex(buf, out));
+}
+
+/* R137 P2-2 close: exercises the "both all-zero, mount succeeds"
+ * matrix row by fabricating an unbound on-disk pool via the
+ * test-only seam. Format normally fills the serial via CSPRNG; the
+ * seam zeros every committed slot's ub_pool_serial AND recomputes
+ * the csum so the on-disk image still validates. */
+STM_TEST(tly_a1_unbound_on_disk_with_zero_arg_mounts) {
+    make_tmp("tly_a1_unbound_on_disk");
+    stm_fs_format_opts fopts = default_format_opts();
+    memset(fopts.pool_serial, 0, 16);
+    STM_ASSERT_OK(stm_fs_format(g_tmp_path, &fopts));
+    /* Post-format the in-memory opts has the CSPRNG-filled value;
+     * the on-disk slot has the same value. Now zero every slot. */
+    STM_ASSERT_OK(stm_fs_test_clear_pool_serial(g_tmp_path));
+    /* Sanity: read-back the on-disk value, must be all-zero now. */
+    uint8_t observed[16];
+    STM_ASSERT_OK(tly_a1_read_serial(g_tmp_path, observed));
+    for (int i = 0; i < 16; i++) STM_ASSERT_EQ(0, observed[i]);
+
+    /* Matrix row: both-all-zero (caller passes 16 zero bytes;
+     * on-disk is also all-zero). Per §3.3 this succeeds (vacuous
+     * match — unbound pool, caller didn't require a non-zero bind). */
+    uint8_t zero_arg[16] = {0};
+    stm_fs_mount_opts mopts = rw_mount_opts();
+    mopts.expected_pool_serial = zero_arg;
+    stm_fs *fs = NULL;
+    STM_ASSERT_OK(stm_fs_mount(g_tmp_path, &mopts, &fs));
+    STM_ASSERT_OK(stm_fs_unmount(fs));
+
+    /* And: unbound pool + non-zero arg = STM_ESERIAL (the
+     * "don't silently mount an unbound pool when binding was
+     * requested" row). */
+    uint8_t nonzero_arg[16];
+    for (int i = 0; i < 16; i++) nonzero_arg[i] = (uint8_t)(0x42 + i);
+    mopts.expected_pool_serial = nonzero_arg;
+    STM_ASSERT_ERR(stm_fs_mount(g_tmp_path, &mopts, &fs), STM_ESERIAL);
+
+    unlink(g_tmp_path); unlink(g_key_path);
 }
 
 STM_TEST_MAIN("fs")

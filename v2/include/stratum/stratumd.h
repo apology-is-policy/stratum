@@ -204,6 +204,18 @@ typedef struct stm_stratumd_opts {
 STM_MUST_USE
 stm_status stm_stratumd_run(const stm_stratumd_opts *opts);
 
+/* TLY-A1 (R137 P2-1 close): parse exactly 32 hex chars (case-
+ * insensitive) into 16 raw bytes. Used by the stratumd CLI to
+ * decode --bind-pool-serial; exposed via this header so tests can
+ * exercise it directly (the original `static` parser was unreachable
+ * from test_fs.c).
+ *
+ * Returns 0 on success, -1 on any of: NULL `hex` or `out`; length
+ * not exactly 32; any non-hex char (including embedded NUL — the
+ * length scan stops there and fails the n==32 check). On error
+ * `out` is unchanged. */
+int stm_stratumd_parse_pool_serial_hex(const char *hex, uint8_t out[16]);
+
 /* ────────────────────────────────────────────────────────────────────── */
 /* Lower-level building blocks (exposed for testing + custom drivers).    */
 /* ────────────────────────────────────────────────────────────────────── */

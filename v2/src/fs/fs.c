@@ -329,7 +329,7 @@ static stm_status format_wipe_labels(stm_bdev *d, uint64_t device_bytes)
     return stm_bdev_fsync(d);
 }
 
-stm_status stm_fs_format(const char *path, const stm_fs_format_opts *opts)
+stm_status stm_fs_format(const char *path, stm_fs_format_opts *opts)
 {
     if (!path || !opts) return STM_EINVAL;
     /* P4-4a: keyfile is mandatory. */
@@ -398,17 +398,19 @@ stm_status stm_fs_format(const char *path, const stm_fs_format_opts *opts)
      * zero-init'd opts), CSPRNG-generate 16 bytes AND write them back
      * into `opts->pool_serial` so the caller can read the bound
      * value (the Thylacine-installer flow per §3.5 of the API spec).
-     * Caller's explicit non-zero value passes through unchanged. */
+     * Caller's explicit non-zero value passes through unchanged.
+     *
+     * R137 P2-3 close: `opts` is now non-const at the signature so
+     * the write-back is documented in the type system. */
     {
-        stm_fs_format_opts *mopts = (stm_fs_format_opts *)opts;
         bool all_zero = true;
         for (int i = 0; i < 16; i++) {
-            if (mopts->pool_serial[i] != 0) { all_zero = false; break; }
+            if (opts->pool_serial[i] != 0) { all_zero = false; break; }
         }
         if (all_zero) {
-            stm_random_bytes(mopts->pool_serial, 16);
+            stm_random_bytes(opts->pool_serial, 16);
         }
-        stm_sync_set_pool_serial(sync, mopts->pool_serial);
+        stm_sync_set_pool_serial(sync, opts->pool_serial);
     }
 
     /* First commit: lays down the initial uberblock at gen=1 so a
@@ -6640,6 +6642,54 @@ stm_sync *stm_fs_sync_for_test(stm_fs *fs)
     return fs ? fs->sync : NULL;
 }
 
+/* TLY-A1 (R137 P2-2 close): zero the on-disk ub_pool_serial in every
+ * committed slot at `path`, recomputing each slot's BLAKE3 csum so
+ * the on-disk image still validates at mount. Used to fabricate the
+ * "unbound pool" back-compat carve-out — production format-time
+ * always CSPRNG-fills, so there's no other way to test the
+ * (disk_zero && exp_zero) success path in the §3.3 matrix.
+ *
+ * Walks STM_LABELS_PER_DEVICE × STM_UB_SLOTS_PER_LABEL slots. Skips
+ * the mirror slot (consistent with stm_sb_mount_scan). Slots that
+ * fail to decode (blank / wrong-version / corrupt) are left alone —
+ * we only rewrite slots that currently hold a valid UB. */
+stm_status stm_fs_test_clear_pool_serial(const char *path)
+{
+    if (!path) return STM_EINVAL;
+    stm_bdev_open_opts bopts = stm_bdev_open_opts_default();
+    bopts.read_only = false;
+    stm_bdev *d = NULL;
+    stm_status s = stm_bdev_open(path, &bopts, &d);
+    if (s != STM_OK) return s;
+
+    for (uint32_t lbl = 0; lbl < STM_LABELS_PER_DEVICE; lbl++) {
+        for (uint32_t slot = 0; slot < STM_UB_SLOTS_PER_LABEL; slot++) {
+            stm_uberblock ub;
+            stm_status rs = stm_sb_label_read(d, lbl, slot, &ub);
+            if (rs == STM_ENOENT || rs == STM_EBADVERSION ||
+                rs == STM_ECORRUPT) {
+                continue;  /* blank / wrong-version / corrupt — skip. */
+            }
+            if (rs != STM_OK) {
+                stm_bdev_close(d);
+                return rs;
+            }
+            memset(ub.ub_pool_serial, 0, 16);
+            /* stm_sb_label_write re-encodes (recomputes the csum)
+             * before issuing the bdev write, so the on-disk slot
+             * stays csum-valid after the field is zeroed. */
+            rs = stm_sb_label_write(d, lbl, slot, &ub);
+            if (rs != STM_OK) {
+                stm_bdev_close(d);
+                return rs;
+            }
+        }
+    }
+
+    stm_bdev_close(d);
+    return STM_OK;
+}
+
 /* S5-PRE-A: production-shape pool accessor. Borrowed pointer, same
  * lifetime as the fs handle (set at mount, never rebound). Daemon
  * code (stratumd) uses this to call stm_ctl_attach_pool against the
@@ -6656,4 +6706,12 @@ stm_pool *stm_fs_pool(stm_fs *fs)
 stm_sync *stm_fs_sync(stm_fs *fs)
 {
     return fs ? fs->sync : NULL;
+}
+
+void stm_fs_pool_serial(stm_fs *fs, uint8_t out[16])
+{
+    /* TLY-A1 (R137 P3-2 close): public surface delegating to the
+     * sync-level accessor. NULL fs/out are no-ops. */
+    if (!fs || !out) return;
+    stm_sync_pool_serial(fs->sync, out);
 }

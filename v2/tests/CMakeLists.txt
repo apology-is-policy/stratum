@@ -95,6 +95,7 @@ stm_add_test(test_lp9        test_lp9.c)
 target_link_libraries(test_lp9 PRIVATE stm_lp9)
 stm_add_test(test_stratum_fs test_stratum_fs.c test_fs_common.c)
 target_link_libraries(test_stratum_fs PRIVATE stm_stratumd)
+target_link_libraries(test_fs PRIVATE stm_cmd_stratumd) # TLY-A1 R137 P2-1
 stm_add_test(test_stratumd_ctl test_stratumd_ctl.c test_fs_common.c)
 target_link_libraries(test_stratumd_ctl PRIVATE stm_stratumd stm_9p_client stm_lp9)
 stm_add_test(test_slate test_slate.c)

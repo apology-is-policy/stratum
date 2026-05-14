@@ -131,8 +131,16 @@ typedef struct {
  * anything at `path`. Callers must ensure they're operating on the
  * intended target.
  */
+/* TLY-A1 (R137 P2-3): `opts` is intentionally NON-CONST. When
+ * caller-supplied `opts->pool_serial` is all-zero, stm_fs_format
+ * CSPRNG-fills the field IN PLACE and the caller can read the bound
+ * value after the call returns (installer flow per STRATUM-API-V1.md
+ * §3.5). Passing a `.rodata`-allocated opts struct would SIGSEGV at
+ * the write-back; pass a mutable stack/heap allocation. The previous
+ * `const`-qualified signature was misleading; dropping const moves
+ * the API contract honestly into the type system. */
 STM_MUST_USE
-stm_status stm_fs_format(const char *path, const stm_fs_format_opts *opts);
+stm_status stm_fs_format(const char *path, stm_fs_format_opts *opts);
 
 typedef struct {
     /* If true, no mutating API is permitted. Useful for inspection
@@ -161,11 +169,19 @@ typedef struct {
     /* TLY-A1: expected pool_serial (16 bytes). NULL = no check; mount
      * succeeds regardless of on-disk value. Non-NULL drives the
      * comparison matrix from STRATUM-API-V1.md §3.3:
-     *   - both all-zero (unbound): succeed with a warning;
-     *   - on-disk all-zero but expected non-zero: STM_ESERIAL;
+     *   - both all-zero (unbound, caller passed all-zero buffer): succeed;
+     *   - on-disk all-zero but expected non-zero: STM_ESERIAL
+     *     (caller asked for binding; on-disk pool is unbound; don't
+     *     silently allow a downgrade);
      *   - both non-zero and equal: succeed;
-     *   - both non-zero and unequal: STM_ESERIAL.
-     * Compared byte-for-byte BEFORE pool/sync/alloc construction. */
+     *   - both non-zero and unequal: STM_ESERIAL;
+     *   - on-disk non-zero but expected all-zero: STM_ESERIAL
+     *     (caller's all-zero is NOT a wildcard).
+     * Compared byte-for-byte BEFORE pool/sync/alloc construction.
+     * R137 P2-4 close: the "succeed with a warning" phrase that was
+     * in this comment originally was aspirational; no warning is
+     * emitted in the unbound-success path. /ctl/events surface
+     * (forward-noted, TLY-A1b chunk) will fold that telemetry. */
     const uint8_t *expected_pool_serial;
 } stm_fs_mount_opts;
 
@@ -2443,6 +2459,17 @@ struct stm_pool *stm_fs_pool(stm_fs *fs);
  * Returns NULL if `fs` is NULL.
  */
 struct stm_sync *stm_fs_sync(stm_fs *fs);
+
+/*
+ * TLY-A1 (R137 P3-2 close): public surface for the 16-byte
+ * pool_serial that the underlying sync handle cached at mount.
+ * Copies the value into the caller-supplied buffer. NULL `fs` or
+ * `out` is a no-op. The /ctl/pools/<uuid>/serial-info kind (forward-
+ * noted; TLY-A1b chunk) uses this; future external tools (an
+ * installer's verify pass, a diagnostic CLI) consume this directly
+ * without reaching into stm_fs_sync.
+ */
+void stm_fs_pool_serial(stm_fs *fs, uint8_t out[16]);
 
 #ifdef __cplusplus
 }
