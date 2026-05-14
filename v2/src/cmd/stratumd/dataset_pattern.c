@@ -146,8 +146,17 @@ bool stm_ds_pattern_matches(const char *pattern, const char *name)
     if (name_len == 0) return false;
 
     /* Pattern is operator-supplied + already-validated at parse time;
-     * we re-check name here only. */
-    if (!name_chars_valid(name, name_len)) return false;
+     * we re-check name here only.
+     *
+     * R139 P2-3 close (option 2 — documented contract): the matcher
+     * takes a NUL-terminated C string. Callers MUST refuse embedded
+     * NUL in their wire-derived input BEFORE invoking the matcher
+     * (strnlen truncates at the first NUL; bytes past it are
+     * invisible to the matcher's name_chars_valid check). The
+     * primary refusal lives at serve.c::stratumd_check_tattach
+     * (R139 P0-2 close). Future callers — e.g., TLY-A2-impl-2's
+     * `--datasets-allowed` matcher invocation from the per-user
+     * stratumd's raw-frame proxy — MUST inherit the same posture. */
 
     return match_recursive(pattern, 0, pat_len, name, 0, name_len);
 }

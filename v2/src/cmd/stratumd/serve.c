@@ -116,12 +116,19 @@ static uint32_t decode_le32(const uint8_t *p)
  *   fid[4] afid[4] uname[s] aname[s] n_uname[4]
  *   where s = u16 LE length + bytes.
  *
- * On any parse failure (truncated body, oversize aname, length
- * mismatch), we DEFER to the canonical 9P server handler — let
- * stm_9p_server_handle's existing Rlerror(EPROTO) machinery emit
- * the wire-format reply. This keeps the policy gate single-purpose
- * (refuse-on-pattern-mismatch) and uniform with the rest of the
- * pre-dispatch flow. */
+ * Refuse-don't-defer posture (R139 P0-1 close): once policy is
+ * non-empty AND type == Tattach, the wrapper OWNS the admission
+ * decision. Any parse anomaly (truncated body, oversize aname,
+ * length mismatch, embedded NUL, empty / "/" aname) is refused
+ * with Rlerror(EACCES). Deferring would create a parser-confusion
+ * attack between the wrapper's strict parser + the canonical
+ * handler's permissive parser (which truncates short body fields
+ * to empty + admits ANAME_DEFAULT). The attacker controls the wire
+ * bytes; under deferral they pick a frame the wrapper can't parse
+ * but the canonical handler admits with no policy check.
+ *
+ * Non-Tattach types AND no-policy configurations pass through
+ * unchanged. */
 static bool stratumd_check_tattach(const uint8_t *req, uint32_t req_len,
                                      uid_t peer_uid,
                                      const struct stm_ds_policy_table *policy,
@@ -141,47 +148,52 @@ static bool stratumd_check_tattach(const uint8_t *req, uint32_t req_len,
     const uint8_t *body = req + STM_9P_HDR_SIZE;
     uint32_t blen = req_len - STM_9P_HDR_SIZE;
 
-    /* Need at least fid(4) + afid(4) + uname_len(2). */
-    if (blen < 10u) return false; /* defer to handler */
+    /* R139 P0-1 close: every parse-failure path below refuses with
+     * Rlerror(EACCES) rather than deferring to the canonical handler.
+     * The canonical handler's permissive truncation tolerance
+     * (uname/aname p9l_gstr returning empty on under-read → ANAME_
+     * DEFAULT admit) was the policy-bypass surface. */
+    if (blen < 10u) goto refuse;
 
     const uint8_t *p = body + 8; /* skip fid + afid */
     const uint8_t *end = body + blen;
 
     /* uname: skip its bytes. */
-    if ((size_t)(end - p) < 2u) return false;
+    if ((size_t)(end - p) < 2u) goto refuse;
     uint16_t ulen = (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
     p += 2;
-    if ((size_t)(end - p) < (size_t)ulen) return false;
+    if ((size_t)(end - p) < (size_t)ulen) goto refuse;
     p += ulen;
 
     /* aname: capture. */
-    if ((size_t)(end - p) < 2u) return false;
+    if ((size_t)(end - p) < 2u) goto refuse;
     uint16_t alen = (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
     p += 2;
-    if ((size_t)(end - p) < (size_t)alen) return false;
+    if ((size_t)(end - p) < (size_t)alen) goto refuse;
     const uint8_t *aname_bytes = p;
     /* (p advanced past aname for completeness; n_uname follows but
      * we don't need it.) */
 
-    /* aname semantics per server.c h_attach: empty / "/" is the
-     * default attach (root of root_dataset). Treat these as the
-     * "default" dataset name. The bilateral contract's pattern set
-     * is keyed by NAMED datasets (e.g., "users/michael"); a default
-     * Tattach with empty/`/` aname matches no pattern and would
-     * therefore refuse. That's wrong for an admin-policy stratumd
-     * with no datasets configured — but exactly right for a
-     * Thylacine per-uid policy stratumd where the admin must
-     * explicitly authorise every dataset the user can mount.
-     *
-     * Decision: refuse empty/`/` Tattach under policy enforcement;
-     * the Thylacine model requires named datasets. Pre-Thylacine
-     * deployments don't configure --user-policy at all, so policy
-     * is NULL and the gate doesn't fire. */
-    if (alen == 0u) {
-        goto refuse;
-    }
+    /* R139 P1-1 close: refuse empty AND "/" aname uniformly under
+     * policy enforcement. The Thylacine model requires named
+     * datasets; both shapes resolve to ANAME_DEFAULT (root of
+     * root_dataset) on the canonical side. Pre-Thylacine deployments
+     * don't set --user-policy at all, so the gate doesn't fire. */
+    if (alen == 0u) goto refuse;
+    if (alen == 1u && aname_bytes[0] == '/') goto refuse;
+
     /* Reject if oversize for the matcher's cap. */
     if (alen > STM_DS_PATTERN_NAME_MAX) goto refuse;
+
+    /* R139 P0-2 close: refuse embedded NUL in aname BEFORE the
+     * matcher's strnlen sees a truncated view. The two-parser
+     * (wrapper-strict + canonical-permissive) confusion class is
+     * the same shape as P0-1; this refusal makes the policy
+     * decision operate on the SAME bytes the canonical handler
+     * would see. */
+    for (uint16_t i = 0; i < alen; i++) {
+        if (aname_bytes[i] == 0u) goto refuse;
+    }
 
     /* Copy aname into a NUL-terminated stack buffer for the matcher
      * (matcher requires C-string). Per R123 lesson — never pass a

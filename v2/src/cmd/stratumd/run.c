@@ -131,7 +131,10 @@ static void usage(const char *argv0)
             "                           policy (TLY-A2-impl-1, repeatable). When\n"
             "                           any --user-policy is set, ALL Tattach\n"
             "                           requests are gated; uid-without-policy\n"
-            "                           refuses every aname.\n"
+            "                           refuses every aname. Pattern + aname are\n"
+            "                           each bounded at 256 bytes; longer anames\n"
+            "                           (spec:/abs forms) are refused under\n"
+            "                           policy enforcement (R139 P2-1).\n"
         "  -h, --help               This message\n",
         argv0, STM_STRATUMD_DEFAULT_BACKLOG);
 }
