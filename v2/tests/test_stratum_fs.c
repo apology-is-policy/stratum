@@ -57,7 +57,7 @@ static void *accept_loop_thread(void *arg)
                                                   /*root_dataset=*/1u,
                                                   /*idle_timeout_ms=*/0,
                                                   /*allow_unauth=*/false,
-                                                  &ctx->stop_flag);
+                                                  &ctx->stop_flag, NULL);
     return NULL;
 }
 

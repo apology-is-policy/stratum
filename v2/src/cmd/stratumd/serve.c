@@ -14,6 +14,7 @@
 #include <stratum/stratumd.h>
 
 #include "corvus_notify.h"
+#include "dataset_pattern.h"
 
 #include <stratum/9p.h>
 #include <stratum/ctl.h>
@@ -99,6 +100,117 @@ static uint32_t decode_le32(const uint8_t *p)
            ((uint32_t)p[1] << 8) |
            ((uint32_t)p[2] << 16) |
            ((uint32_t)p[3] << 24);
+}
+
+/* TLY-A2-impl-1: pre-dispatch Tattach enforcement.
+ *
+ * Peek the Txx frame at `req` (`req_len` bytes; caller guarantees
+ * req_len >= STM_9P_HDR_SIZE). If the type is Tattach AND a non-empty
+ * user_policy is present, parse the `aname` field and validate it
+ * against the peer's policy entry. On refusal, populate `resp` with
+ * a well-formed Rlerror(EACCES) and return true. On admission (or
+ * non-Tattach types), return false — caller forwards to
+ * stm_9p_server_handle.
+ *
+ * Wire format (Tattach body after 7-byte header):
+ *   fid[4] afid[4] uname[s] aname[s] n_uname[4]
+ *   where s = u16 LE length + bytes.
+ *
+ * On any parse failure (truncated body, oversize aname, length
+ * mismatch), we DEFER to the canonical 9P server handler — let
+ * stm_9p_server_handle's existing Rlerror(EPROTO) machinery emit
+ * the wire-format reply. This keeps the policy gate single-purpose
+ * (refuse-on-pattern-mismatch) and uniform with the rest of the
+ * pre-dispatch flow. */
+static bool stratumd_check_tattach(const uint8_t *req, uint32_t req_len,
+                                     uid_t peer_uid,
+                                     const struct stm_ds_policy_table *policy,
+                                     uint8_t *resp, uint32_t resp_cap,
+                                     uint32_t *resp_len)
+{
+    if (!policy || ((const stm_ds_policy_table *)policy)->n_entries == 0u)
+        return false;
+    if (req_len < STM_9P_HDR_SIZE) return false;
+
+    uint8_t type = req[4];
+    if (type != STM_9P_TATTACH) return false;
+
+    /* Tag at req[5..7], body at req[7..req_len). */
+    uint16_t tag = (uint16_t)((uint16_t)req[5] | ((uint16_t)req[6] << 8));
+
+    const uint8_t *body = req + STM_9P_HDR_SIZE;
+    uint32_t blen = req_len - STM_9P_HDR_SIZE;
+
+    /* Need at least fid(4) + afid(4) + uname_len(2). */
+    if (blen < 10u) return false; /* defer to handler */
+
+    const uint8_t *p = body + 8; /* skip fid + afid */
+    const uint8_t *end = body + blen;
+
+    /* uname: skip its bytes. */
+    if ((size_t)(end - p) < 2u) return false;
+    uint16_t ulen = (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+    p += 2;
+    if ((size_t)(end - p) < (size_t)ulen) return false;
+    p += ulen;
+
+    /* aname: capture. */
+    if ((size_t)(end - p) < 2u) return false;
+    uint16_t alen = (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+    p += 2;
+    if ((size_t)(end - p) < (size_t)alen) return false;
+    const uint8_t *aname_bytes = p;
+    /* (p advanced past aname for completeness; n_uname follows but
+     * we don't need it.) */
+
+    /* aname semantics per server.c h_attach: empty / "/" is the
+     * default attach (root of root_dataset). Treat these as the
+     * "default" dataset name. The bilateral contract's pattern set
+     * is keyed by NAMED datasets (e.g., "users/michael"); a default
+     * Tattach with empty/`/` aname matches no pattern and would
+     * therefore refuse. That's wrong for an admin-policy stratumd
+     * with no datasets configured — but exactly right for a
+     * Thylacine per-uid policy stratumd where the admin must
+     * explicitly authorise every dataset the user can mount.
+     *
+     * Decision: refuse empty/`/` Tattach under policy enforcement;
+     * the Thylacine model requires named datasets. Pre-Thylacine
+     * deployments don't configure --user-policy at all, so policy
+     * is NULL and the gate doesn't fire. */
+    if (alen == 0u) {
+        goto refuse;
+    }
+    /* Reject if oversize for the matcher's cap. */
+    if (alen > STM_DS_PATTERN_NAME_MAX) goto refuse;
+
+    /* Copy aname into a NUL-terminated stack buffer for the matcher
+     * (matcher requires C-string). Per R123 lesson — never pass a
+     * wire-slice directly to a NUL-terminated API. */
+    char namebuf[STM_DS_PATTERN_NAME_MAX + 1u];
+    memcpy(namebuf, aname_bytes, alen);
+    namebuf[alen] = '\0';
+
+    if (stm_ds_policy_admits((const stm_ds_policy_table *)policy,
+                                 peer_uid, namebuf)) {
+        return false; /* admitted — pass to handler */
+    }
+
+refuse:
+    /* Emit Rlerror(EACCES). Wire: size(4) + type(1) + tag(2) +
+     * ecode(4). Total = 11 bytes. */
+    if (resp_cap < 11u) {
+        /* Pathological — caller passed an msize-undersized buf.
+         * Surface as connection-fatal. */
+        return false;
+    }
+    resp[0] = 11; resp[1] = 0; resp[2] = 0; resp[3] = 0;
+    resp[4] = STM_9P_RLERROR;
+    resp[5] = (uint8_t)(tag & 0xFFu);
+    resp[6] = (uint8_t)((tag >> 8) & 0xFFu);
+    /* EACCES = 13 (Linux errno.h; matches the .L wire convention). */
+    resp[7] = 13; resp[8] = 0; resp[9] = 0; resp[10] = 0;
+    *resp_len = 11u;
+    return true;
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -228,7 +340,8 @@ stm_status stm_stratumd_serve_client(int fd, stm_fs *fs,
                                        uid_t peer_uid, gid_t peer_gid,
                                        uint32_t msize_max,
                                        uint64_t root_dataset,
-                                       uint32_t idle_timeout_ms)
+                                       uint32_t idle_timeout_ms,
+                                       const struct stm_ds_policy_table *user_policy)
 {
     if (fd < 0 || !fs) {
         if (fd >= 0) close(fd);
@@ -306,14 +419,24 @@ stm_status stm_stratumd_serve_client(int fd, stm_fs *fs,
         }
 
         uint32_t resp_len = 0;
-        stm_status hrc = stm_9p_server_handle(srv, req, size,
-                                                  resp, msize_max,
-                                                  &resp_len);
-        if (hrc != STM_OK || resp_len == 0u) {
-            /* Fatal protocol error per stm_9p_server_handle's
-             * contract — caller should close. */
-            rc = (hrc == STM_OK) ? STM_EPROTOCOL : hrc;
-            break;
+        /* TLY-A2-impl-1: pre-dispatch Tattach pattern enforcement.
+         * On refusal, `resp_len` is populated with a well-formed
+         * Rlerror(EACCES); skip the canonical dispatcher and pipe
+         * that out directly. */
+        bool refused = stratumd_check_tattach(req, size, peer_uid,
+                                                user_policy,
+                                                resp, msize_max,
+                                                &resp_len);
+        if (!refused) {
+            stm_status hrc = stm_9p_server_handle(srv, req, size,
+                                                      resp, msize_max,
+                                                      &resp_len);
+            if (hrc != STM_OK || resp_len == 0u) {
+                /* Fatal protocol error per stm_9p_server_handle's
+                 * contract — caller should close. */
+                rc = (hrc == STM_OK) ? STM_EPROTOCOL : hrc;
+                break;
+            }
         }
 
         if (write_full(fd, resp, resp_len) != 0) {
@@ -349,6 +472,8 @@ typedef struct {
     uint32_t  msize_max;
     uint64_t  root_dataset;
     uint32_t  idle_timeout_ms;
+    /* TLY-A2-impl-1: borrowed policy table — caller (run.c) owns. */
+    const struct stm_ds_policy_table *user_policy;
 } stratumd_fs_worker_ctx;
 
 static void *stratumd_fs_worker(void *arg)
@@ -371,7 +496,8 @@ static void *stratumd_fs_worker(void *arg)
     (void)stm_stratumd_serve_client(ctx->client_fd, ctx->fs,
                                         ctx->peer_uid, ctx->peer_gid,
                                         ctx->msize_max, ctx->root_dataset,
-                                        ctx->idle_timeout_ms);
+                                        ctx->idle_timeout_ms,
+                                        ctx->user_policy);
     free(ctx);
     return NULL;
 }
@@ -381,7 +507,8 @@ stm_status stm_stratumd_accept_loop(int listen_fd, stm_fs *fs,
                                       uint64_t root_dataset,
                                       uint32_t idle_timeout_ms,
                                       bool allow_unauthenticated_peer,
-                                      atomic_bool *stop_flag)
+                                      atomic_bool *stop_flag,
+                                      const struct stm_ds_policy_table *user_policy)
 {
     if (listen_fd < 0 || !fs) return STM_EINVAL;
 
@@ -456,6 +583,7 @@ stm_status stm_stratumd_accept_loop(int listen_fd, stm_fs *fs,
         ctx->msize_max       = msize_max;
         ctx->root_dataset    = root_dataset;
         ctx->idle_timeout_ms = idle_timeout_ms;
+        ctx->user_policy     = user_policy;
 
         pthread_t tid;
         int wprc = pthread_create(&tid, NULL, stratumd_fs_worker, ctx);
@@ -1050,7 +1178,8 @@ stm_status stm_stratumd_run(const stm_stratumd_opts *opts)
     rc = stm_stratumd_accept_loop(listen_fd, fs, msize_max, root_ds,
                                        opts->idle_timeout_ms,
                                        opts->allow_unauthenticated_peer,
-                                       opts->stop_flag);
+                                       opts->stop_flag,
+                                       opts->user_policy);
 
     /* TLY-A4: stop the corvus notify consumer FIRST so its log lines
      * (consumer-exiting) land in /ctl/events BEFORE stm_ctl_destroy

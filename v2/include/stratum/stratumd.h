@@ -86,6 +86,11 @@
 #include <stratum/fs.h>
 #include <stratum/types.h>
 
+struct stm_ds_policy_table;     /* fwd-decl; defined in
+                                  * src/cmd/stratumd/dataset_pattern.h
+                                  * to avoid pulling the matcher header
+                                  * into the public stratumd surface. */
+
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -166,6 +171,19 @@ typedef struct stm_stratumd_opts {
     uint32_t    idle_timeout_ms;  /* per-conn idle timeout (0 → DEFAULT 30s);
                                    * applied to accepted client fds via
                                    * SO_RCVTIMEO + SO_SNDTIMEO */
+
+    /* TLY-A2 (impl-1): coordinator mode — per-uid Tattach pattern
+     * enforcement. `user_policy` is a borrowed pointer; caller owns
+     * the table (its lifetime must outlive `stm_stratumd_run`). When
+     * non-NULL AND non-empty, the FS-socket accept path validates
+     * every Tattach's `aname` against the policy entry for the
+     * SO_PEERCRED-derived peer uid; refusal returns Rlerror(EACCES).
+     *
+     * NULL OR empty table = back-compat: no per-uid enforcement
+     * (today's single-process stratumd posture, no Thylacine multi-
+     * stratumd context). Composes against
+     * `v2/specs/multi_stratumd.tla::TattachPatternEnforced`. */
+    const struct stm_ds_policy_table *user_policy;
 
     /* TLY-A4: corvus SESSION_CLOSED notify consumer. When `corvus_user`
      * is non-NULL, stratumd spawns a consumer thread that subscribes
@@ -278,7 +296,8 @@ stm_status stm_stratumd_serve_client(int fd, stm_fs *fs,
                                        uid_t peer_uid, gid_t peer_gid,
                                        uint32_t msize_max,
                                        uint64_t root_dataset,
-                                       uint32_t idle_timeout_ms);
+                                       uint32_t idle_timeout_ms,
+                                       const struct stm_ds_policy_table *user_policy);
 
 /*
  * Accept loop. Serially accept() each incoming connection, resolve
@@ -301,7 +320,8 @@ stm_status stm_stratumd_accept_loop(int listen_fd, stm_fs *fs,
                                       uint64_t root_dataset,
                                       uint32_t idle_timeout_ms,
                                       bool allow_unauthenticated_peer,
-                                      atomic_bool *stop_flag);
+                                      atomic_bool *stop_flag,
+                                      const struct stm_ds_policy_table *user_policy);
 
 /* ────────────────────────────────────────────────────────────────────── */
 /* /ctl/ transport (P9-CTL-2c).                                           */

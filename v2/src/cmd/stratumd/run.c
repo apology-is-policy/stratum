@@ -31,6 +31,7 @@
 #include <stratum/types.h>
 
 #include "../cli_passphrase.h"
+#include "dataset_pattern.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -121,6 +122,16 @@ static void usage(const char *argv0)
         "  --corvus-notify-timeout <seconds>\n"
             "                           Tolerant-mode reconnect window "
             "(default: 30)\n"
+        "  --role {coord,client}    Stratumd role (default: coord). client mode\n"
+            "                           is reserved for TLY-A2-impl-2; v2.0 accepts\n"
+            "                           the flag for forward-compat but refuses\n"
+            "                           --role client.\n"
+        "  --user-policy uid=N:pat1,pat2,...\n"
+            "                           Coordinator-side per-uid Tattach pattern\n"
+            "                           policy (TLY-A2-impl-1, repeatable). When\n"
+            "                           any --user-policy is set, ALL Tattach\n"
+            "                           requests are gated; uid-without-policy\n"
+            "                           refuses every aname.\n"
         "  -h, --help               This message\n",
         argv0, STM_STRATUMD_DEFAULT_BACKLOG);
 }
@@ -178,6 +189,12 @@ int stm_cmd_stratumd_main(int argc, char **argv)
 
     bool want_passphrase_stdin = false;
 
+    /* TLY-A2-impl-1: per-uid policy table, populated by repeated
+     * --user-policy flags. Owned by this function; freed before
+     * return regardless of rc. */
+    stm_ds_policy_table user_policy_table;
+    memset(&user_policy_table, 0, sizeof user_policy_table);
+
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
@@ -206,6 +223,36 @@ int stm_cmd_stratumd_main(int argc, char **argv)
         }
         if (!strcmp(a, "--read-only")) {
             opts.read_only = true;
+            continue;
+        }
+        if (!strcmp(a, "--role") && i + 1 < argc) {
+            const char *r = argv[++i];
+            if (!strcmp(r, "coord")) {
+                /* Default. No-op. */
+            } else if (!strcmp(r, "client")) {
+                fprintf(stderr,
+                    "stratumd: --role client is reserved for "
+                    "TLY-A2-impl-2; not yet implemented\n");
+                stm_ds_policy_table_close(&user_policy_table);
+                return 1;
+            } else {
+                fprintf(stderr, "stratumd: invalid --role: %s "
+                                "(expected 'coord' or 'client')\n", r);
+                stm_ds_policy_table_close(&user_policy_table);
+                return 1;
+            }
+            continue;
+        }
+        if (!strcmp(a, "--user-policy") && i + 1 < argc) {
+            stm_status pp = stm_ds_policy_parse_cli(&user_policy_table,
+                                                      argv[++i]);
+            if (pp != STM_OK) {
+                fprintf(stderr,
+                    "stratumd: invalid --user-policy: %s (rc=%d)\n",
+                    argv[i], (int)pp);
+                stm_ds_policy_table_close(&user_policy_table);
+                return 1;
+            }
             continue;
         }
         if (!strcmp(a, "--corvus-user") && i + 1 < argc) {
@@ -331,7 +378,14 @@ int stm_cmd_stratumd_main(int argc, char **argv)
 
     if (!opts.fs_path) {
         usage(argv[0]);
+        stm_ds_policy_table_close(&user_policy_table);
         return 1;
+    }
+
+    /* TLY-A2-impl-1: thread the (possibly empty) policy table into
+     * the daemon. NULL/empty = back-compat single-process mode. */
+    if (user_policy_table.n_entries > 0u) {
+        opts.user_policy = &user_policy_table;
     }
 
     install_signal_handlers();
@@ -392,6 +446,9 @@ int stm_cmd_stratumd_main(int argc, char **argv)
         stm_cli_passphrase_unlock(passbuf, passcap);
         free(passbuf);
     }
+
+    /* TLY-A2-impl-1: free policy table after run returns. */
+    stm_ds_policy_table_close(&user_policy_table);
 
     if (rc != STM_OK) {
         fprintf(stderr, "stratumd: run failed (rc=%d)\n", (int)rc);
