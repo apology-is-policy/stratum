@@ -254,24 +254,55 @@ Not needed for the codec itself. The DEK lifecycle invariant (cached → evicted
 
 ## 6. A5 — Snapshot rollback compromise marking
 
-### Scope
+> **2026-05-15 revision — premise correction.** An earlier draft of
+> this section claimed "Stratum's snapshot rollback machinery exists
+> at the C API level (`stm_snap_rollback` carry from v1); the v2
+> surfacing is pending." **That is false.** `stm_snap_rollback` is a
+> **v1-only** function. v2 has NO snapshot rollback — `snapshot.h`
+> lists it as explicitly out-of-scope, and v2's metadata lives in
+> *pool-global* trees keyed by `(dataset_id, …)` (`ub_inode_root`,
+> `ub_dirent_root`, `ub_xattr_root`, `ub_extent_root`), NOT the
+> per-dataset `di_tree_root` that `ARCHITECTURE.md` §8.5/§12.6
+> assumes. v2 snapshots today capture only `extent_txg` (a
+> generation number) with `tree_root_paddr = 0` — they do birth-txg
+> accounting for *delete* but root no recoverable past tree. Real
+> per-dataset rollback needs per-dataset metadata trees, which is a
+> foundational re-architecture — see the post-TLY phase in
+> `docs/ROADMAP-V2.md`. **A5 therefore ships marker-first with a
+> stubbed rollback verb** (decision 2026-05-15).
 
-A new per-snapshot flag in snapshot metadata + an admin verb to set it + integration into the rollback flow.
+### Scope (marker-first)
 
-### Dependency
+A5 ships the **compromise marker** — the security-relevant deliverable
+— in full, and the **rollback verb surface** with a stubbed backend.
+The marker is what Thylacine's F13 concern needs: a way to flag a
+snapshot as compromised so a future rollback refuses it. The marker,
+the mark/unmark verbs, the corvus-principal gate, and the
+rollback-verb's marker-consultation gate are all REAL and tested. The
+rollback verb's *data mutation* is a stub (`stm_fs_rollback_snapshot`
+returns `STM_ENOTSUPPORTED`); the marker-consultation gate fires
+before the stub, so the `rollback-blocked-iff-compromised` invariant
+is genuinely exercised.
 
-Stratum's snapshot rollback machinery exists at the C API level (`stm_snap_rollback` carry from v1). The **v2 surfacing** (admin verb + `/ctl/` kind) is pending — that's SWISS-6 v1.1c (task #947). A5 must land EITHER after SWISS-6 v1.1c OR fold v1.1c into A5.
-
-**Recommendation**: fold SWISS-6 v1.1c into TLY-A5-impl-1 (the rollback verb itself); TLY-A5-impl-2 adds the marker.
+Real rollback lands in the post-TLY **Snapshot Completion** phase
+(per-dataset metadata trees + O(1) rollback per `ARCHITECTURE.md`
+§8.5/§12.6). When it lands, only the stub body is replaced — the
+`/ctl/` verb surface, admin gate, marker consultation, force-prefix
+parsing, and TUI double-confirm are all already in place from A5.
 
 ### Stratum-side design decisions
 
-- **Marker storage**: extend `stm_snapshot_record` with `sr_flags` (or extend the existing flags field) to include `STM_SNAP_FLAG_ROLLBACK_COMPROMISED`. Persistent in the snapshot index.
-- **Optional reason text**: store in a small new sidecar btree keyed by snap_id, value is up to 256 bytes. Skipped if no reason supplied.
+- **Marker storage**: a bit in the existing `stm_snapshot_entry.flags`
+  field (`STM_SNAP_FLAG_ROLLBACK_COMPROMISED`) — no on-disk format
+  change, no UB-version bump. Persistent in the snapshot index.
+- **Reason text**: NOT stored in a new on-disk structure. The
+  mark-compromised reason flows to the `/ctl/events` audit log (which
+  already exists) — the persistent state is just the flag bit. (Final
+  call in TLY-A5-design.)
 - **Admin verbs** (new `/ctl/` kinds, admin-gated):
   - `/ctl/datasets/<id>/snapshots/<sid>/mark-compromised` — write `<reason-text>` to mark.
   - `/ctl/datasets/<id>/snapshots/<sid>/unmark-compromised` — write `force` to unmark (Q15).
-  - `/ctl/datasets/<id>/rollback-snapshot` — write `<sid>` to rollback. If marked, refuses unless body is `force <sid>` (Q15 force-rollback semantics).
+  - `/ctl/datasets/<id>/rollback-snapshot` — write `<sid>` to roll back. If the snap is marked, refuses unless body is `force <sid>` (Q15). v1.0: on a non-marked / forced request the backend stub returns `STM_ENOTSUPPORTED` with a clear message.
 - **Listing**: extends the existing `/ctl/datasets/<id>/snapshots/<sid>` info kind with a "compromised" line.
 - **Corvus principal** (Q16): new CLI arg `--corvus-admin-uid <uid>`. The mark-compromised kind admits writes from THAT uid in addition to the regular admin uid. No other caller is admitted.
 
@@ -279,16 +310,22 @@ Stratum's snapshot rollback machinery exists at the C API level (`stm_snap_rollb
 
 | Chunk | Deliverable |
 |---|---|
-| **TLY-A5-impl-1** | Rollback verb (folds SWISS-6 v1.1c — `/ctl/datasets/<id>/rollback-snapshot` admin kind + TUI double-confirm). |
-| **TLY-A5-impl-2** | Compromise marker field + mark/unmark admin verbs + corvus principal gate. |
-| **TLY-A5-impl-3** | Rollback-flow consultation: refuses on marked snap unless `force` prefix. |
-| **TLY-A5-test** | 5 tests from ask §7.6. |
-| **TLY-A5-docs** | Update `OS-INTEGRATION.md` §8 (snapshots) + `reference/snapshot.tla` doc. |
-| **R145** | Audit. Categories: marker-bypass (rollback path doesn't consult), unauthorised mark (attacker writes mark), corvus principal scope. |
+| **TLY-A5-design** | Design doc — marker-first scope; records the snapshot-substrate gap + the post-TLY Snapshot Completion phase. |
+| **TLY-A5-spec** | `snapshot.tla` extension — `rollback-blocked-iff-compromised` invariant + the unmark-races-rollback case + marker non-perturbation of existing invariants. |
+| **TLY-A5-impl-1** | Compromise marker — `flags` bit + `mark-compromised` / `unmark-compromised` admin verbs + corvus-principal gate (`--corvus-admin-uid`) + the snapshots info-kind "compromised" line. |
+| **TLY-A5-impl-2** | `/ctl/datasets/<id>/rollback-snapshot` verb surface — admin gate + marker consultation (refuse-on-marked-unless-`force`) + `stm_fs_rollback_snapshot` STUB (`STM_ENOTSUPPORTED`) + TUI double-confirm (replaces the SWISS-6 v1.1c stub dialog). |
+| **TLY-A5-test** | tests from ask §7.6 (adapted — rollback success cases become stub-return assertions). |
+| **TLY-A5-docs** | Update `OS-INTEGRATION.md` §8 (snapshots) + reference docs. |
+| **R146** | Audit. Categories: marker-bypass (rollback path doesn't consult the flag), unauthorised mark (attacker writes mark), corvus-principal scope, the stub's fail-safe posture. |
 
 ### Spec-first verdict
 
-**Soft yes** for the marker→rollback consultation atomicity. Snapshot.tla already exists; an extension covering the `rollback-blocked-iff-compromised` invariant + the unmark-races-rollback case is ~half a day of TLA+.
+**Yes.** `snapshot.tla` already exists; the extension covers the
+`rollback-blocked-iff-compromised` invariant + the unmark-races-rollback
+case + confirms the marker flag does not perturb the existing
+chain/hold/txg invariants. The rollback *mechanism* itself is NOT
+specced here — that spec belongs to the post-TLY Snapshot Completion
+phase, where the per-dataset-tree rollback algorithm is designed.
 
 ---
 
