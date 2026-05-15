@@ -6137,6 +6137,46 @@ stm_status stm_fs_release_snapshot(stm_fs *fs, uint64_t snapshot_id)
     return s;
 }
 
+stm_status stm_fs_mark_snapshot_compromised(stm_fs *fs,
+                                              uint64_t snapshot_id)
+{
+    if (!fs) return STM_EINVAL;
+    if (snapshot_id == 0) return STM_EINVAL;
+
+    pthread_rwlock_wrlock(&fs->global);
+    FS_GUARD_WRITE(fs);
+
+    stm_snapshot_index *sidx = stm_sync_snapshot_index(fs->sync);
+    if (!sidx) {
+        pthread_rwlock_unlock(&fs->global);
+        return STM_ECORRUPT;
+    }
+
+    stm_status s = stm_snapshot_mark_compromised(sidx, snapshot_id);
+    pthread_rwlock_unlock(&fs->global);
+    return s;
+}
+
+stm_status stm_fs_unmark_snapshot_compromised(stm_fs *fs,
+                                                uint64_t snapshot_id)
+{
+    if (!fs) return STM_EINVAL;
+    if (snapshot_id == 0) return STM_EINVAL;
+
+    pthread_rwlock_wrlock(&fs->global);
+    FS_GUARD_WRITE(fs);
+
+    stm_snapshot_index *sidx = stm_sync_snapshot_index(fs->sync);
+    if (!sidx) {
+        pthread_rwlock_unlock(&fs->global);
+        return STM_ECORRUPT;
+    }
+
+    stm_status s = stm_snapshot_unmark_compromised(sidx, snapshot_id);
+    pthread_rwlock_unlock(&fs->global);
+    return s;
+}
+
 stm_status stm_fs_set_dataset_pool_default(stm_fs *fs, stm_property prop,
                                               uint64_t value)
 {

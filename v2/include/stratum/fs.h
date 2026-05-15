@@ -1676,6 +1676,30 @@ STM_MUST_USE
 stm_status stm_fs_release_snapshot(stm_fs *fs, uint64_t snapshot_id);
 
 /*
+ * TLY-A5: set / clear the rollback-compromised marker on a snapshot
+ * (STM_SNAP_FLAG_ROLLBACK_COMPROMISED). A marked snapshot is one
+ * taken under keys corvus has flagged as possibly compromised; a
+ * rollback to it is refused-by-default (see stm_fs_rollback_snapshot,
+ * TLY-A5-impl-2).
+ *
+ * Mutates only the in-RAM snapshot index (sets its dirty flag) — like
+ * stm_fs_hold_snapshot, the bit becomes durable at the next
+ * stm_fs_commit; the caller (e.g. the /ctl/ admin verb) is
+ * responsible for committing. Idempotent — marking an already-marked
+ * snap is STM_OK and leaves the index clean.
+ *
+ * Refusals: STM_EINVAL (NULL fs / snapshot_id == 0), STM_ECORRUPT
+ * (snapshot index unavailable), STM_ENOENT (snapshot unknown /
+ * deleted), STM_EWEDGED, STM_EROFS.
+ */
+STM_MUST_USE
+stm_status stm_fs_mark_snapshot_compromised(stm_fs *fs, uint64_t snapshot_id);
+
+STM_MUST_USE
+stm_status stm_fs_unmark_snapshot_compromised(stm_fs *fs,
+                                                uint64_t snapshot_id);
+
+/*
  * P7-16: stm_fs_reflink — POSIX-shape FICLONE. Replaces dst's empty
  * extent tree with a reflink-share of src's extent tree. Same
  * semantics as `ioctl(fd_dst, FICLONE, fd_src)` for a freshly-created

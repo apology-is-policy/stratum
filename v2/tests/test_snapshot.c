@@ -250,6 +250,56 @@ STM_TEST(snap_hold_on_unknown_id_rejected) {
 }
 
 /* ------------------------------------------------------------------ */
+/* TLY-A5 — rollback-compromised marker.                               */
+/* ------------------------------------------------------------------ */
+
+STM_TEST(snap_mark_compromised_roundtrip) {
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    uint64_t s = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, 0, &s));
+
+    stm_snapshot_entry e;
+    /* Fresh snap: not compromised. */
+    STM_ASSERT_OK(stm_snapshot_lookup(idx, s, &e));
+    STM_ASSERT_EQ(e.flags & STM_SNAP_FLAG_ROLLBACK_COMPROMISED, 0u);
+
+    /* Mark → flag set. */
+    STM_ASSERT_OK(stm_snapshot_mark_compromised(idx, s));
+    STM_ASSERT_OK(stm_snapshot_lookup(idx, s, &e));
+    STM_ASSERT(e.flags & STM_SNAP_FLAG_ROLLBACK_COMPROMISED);
+
+    /* Idempotent re-mark — still STM_OK, flag still set. */
+    STM_ASSERT_OK(stm_snapshot_mark_compromised(idx, s));
+    STM_ASSERT_OK(stm_snapshot_lookup(idx, s, &e));
+    STM_ASSERT(e.flags & STM_SNAP_FLAG_ROLLBACK_COMPROMISED);
+
+    /* Unmark → flag clear. */
+    STM_ASSERT_OK(stm_snapshot_unmark_compromised(idx, s));
+    STM_ASSERT_OK(stm_snapshot_lookup(idx, s, &e));
+    STM_ASSERT_EQ(e.flags & STM_SNAP_FLAG_ROLLBACK_COMPROMISED, 0u);
+
+    /* Idempotent re-unmark. */
+    STM_ASSERT_OK(stm_snapshot_unmark_compromised(idx, s));
+
+    stm_snapshot_index_close(idx);
+}
+
+STM_TEST(snap_mark_compromised_unknown_id_rejected) {
+    stm_snapshot_index *idx = NULL;
+    STM_ASSERT_OK(stm_snapshot_index_create(0, &idx));
+    STM_ASSERT_ERR(stm_snapshot_mark_compromised(idx, 9999u), STM_ENOENT);
+    STM_ASSERT_ERR(stm_snapshot_unmark_compromised(idx, 9999u), STM_ENOENT);
+    /* And on an already-deleted snap. */
+    uint64_t s = 0;
+    STM_ASSERT_OK(stm_snapshot_create(idx, 1, "a", 0, 0, &s));
+    STM_ASSERT_OK(snap_delete_simple(idx, s));
+    STM_ASSERT_ERR(stm_snapshot_mark_compromised(idx, s), STM_ENOENT);
+    STM_ASSERT_ERR(stm_snapshot_unmark_compromised(idx, s), STM_ENOENT);
+    stm_snapshot_index_close(idx);
+}
+
+/* ------------------------------------------------------------------ */
 /* TreeRootImmutable — captured value never changes.                   */
 /* ------------------------------------------------------------------ */
 

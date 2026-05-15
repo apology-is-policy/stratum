@@ -63,6 +63,15 @@ struct stm_bootstrap;  typedef struct stm_bootstrap  stm_bootstrap;
 
 #define STM_SNAP_NO_PREV         ((uint64_t)0)
 #define STM_SNAP_NAME_MAX        255u
+
+/* TLY-A5: stm_snapshot_entry.flags bits. Bit 0 — the snapshot is
+ * marked rollback-compromised: it was taken under keys corvus has
+ * since flagged as possibly compromised, so a rollback to it must be
+ * refused-by-default (CORVUS-DESIGN §4.5 F13). The flag is a bit in
+ * the EXISTING `flags` field — no on-disk format change. Future bits
+ * stay reserved; readers MUST mask for the bit they care about
+ * rather than testing the whole field (tamper-resilience). */
+#define STM_SNAP_FLAG_ROLLBACK_COMPROMISED  ((uint32_t)0x1u)
 /* Sentinel for "no captured tree_root yet" — reserved for the
  * persistent-storage chunk where on-disk encode/decode needs a
  * distinguished value for unfilled-on-disk entries. R29 P3-4.
@@ -431,6 +440,28 @@ stm_status stm_snapshot_hold(stm_snapshot_index *idx,
 STM_MUST_USE
 stm_status stm_snapshot_release(stm_snapshot_index *idx,
                                   uint64_t snapshot_id);
+
+/*
+ * TLY-A5: set / clear STM_SNAP_FLAG_ROLLBACK_COMPROMISED on a
+ * PRESENT snapshot. STM_ENOENT if the snap is unknown / ABSENT.
+ *
+ * Idempotent: marking an already-marked snap (or unmarking an
+ * unmarked one) returns STM_OK and leaves the index clean — the
+ * dirty flag is set ONLY when the bit actually changes, so a no-op
+ * mark does not force a needless commit. Models
+ * snapshot.tla::MarkCompromised / UnmarkCompromised.
+ *
+ * The flag is persisted at the next stm_snapshot_index_commit (the
+ * bit lives in the existing on-disk `flags` field); these calls
+ * mutate only in-RAM state, exactly like stm_snapshot_hold.
+ */
+STM_MUST_USE
+stm_status stm_snapshot_mark_compromised(stm_snapshot_index *idx,
+                                           uint64_t snapshot_id);
+
+STM_MUST_USE
+stm_status stm_snapshot_unmark_compromised(stm_snapshot_index *idx,
+                                             uint64_t snapshot_id);
 
 /*
  * Look up snapshot by id. *out filled on success. STM_ENOENT if

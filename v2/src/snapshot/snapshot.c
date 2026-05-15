@@ -764,6 +764,41 @@ stm_status stm_snapshot_release(stm_snapshot_index *idx,
     return STM_OK;
 }
 
+/* TLY-A5: toggle STM_SNAP_FLAG_ROLLBACK_COMPROMISED. Shared body for
+ * mark (set=true) and unmark (set=false). Idempotent — dirty is set
+ * only on a real bit change. */
+static stm_status snapshot_set_compromised(stm_snapshot_index *idx,
+                                             uint64_t snapshot_id,
+                                             bool set) {
+    if (!idx) return STM_EINVAL;
+    must_lock(&idx->lock);
+    size_t s = find_slot_locked(idx, snapshot_id);
+    if (s == (size_t)-1 || !idx->slots[s].present) {
+        must_unlock(&idx->lock);
+        return STM_ENOENT;
+    }
+    uint32_t old_flags = idx->slots[s].e.flags;
+    uint32_t new_flags = set
+        ? (old_flags |  STM_SNAP_FLAG_ROLLBACK_COMPROMISED)
+        : (old_flags & ~STM_SNAP_FLAG_ROLLBACK_COMPROMISED);
+    if (new_flags != old_flags) {
+        idx->slots[s].e.flags = new_flags;
+        idx->dirty = true;
+    }
+    must_unlock(&idx->lock);
+    return STM_OK;
+}
+
+stm_status stm_snapshot_mark_compromised(stm_snapshot_index *idx,
+                                           uint64_t snapshot_id) {
+    return snapshot_set_compromised(idx, snapshot_id, true);
+}
+
+stm_status stm_snapshot_unmark_compromised(stm_snapshot_index *idx,
+                                             uint64_t snapshot_id) {
+    return snapshot_set_compromised(idx, snapshot_id, false);
+}
+
 stm_status stm_snapshot_lookup(const stm_snapshot_index *idx,
                                  uint64_t snapshot_id,
                                  stm_snapshot_entry *out) {
