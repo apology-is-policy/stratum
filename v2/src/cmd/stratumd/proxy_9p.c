@@ -29,6 +29,10 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#if defined(__linux__)
+#  include <sys/socket.h>     /* SO_PEERCRED */
+#endif
+
 /* ────────────────────────────────────────────────────────────────────── */
 /* read/write helpers — duplicated from serve.c to keep the lib trim.     */
 /* (R140 P3 candidate: extract to a shared header if a third user lands.) */
@@ -78,6 +82,32 @@ static uint32_t decode_le32(const uint8_t *p)
          | ((uint32_t)p[1] << 8)
          | ((uint32_t)p[2] << 16)
          | ((uint32_t)p[3] << 24);
+}
+
+/* Resolve peer credentials on a connected Unix-domain socket.
+ * Duplicated from serve.c (R140 P3-1 carry — extract on third
+ * user). 0 on success, -errno on failure. */
+static int peer_creds(int fd, uid_t *out_uid, gid_t *out_gid)
+{
+#if defined(__linux__)
+    struct ucred uc;
+    socklen_t    len = sizeof uc;
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &uc, &len) < 0)
+        return -errno;
+    *out_uid = uc.uid;
+    *out_gid = uc.gid;
+    return 0;
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) \
+   || defined(__NetBSD__) || defined(__DragonFly__)
+    if (getpeereid(fd, out_uid, out_gid) < 0)
+        return -errno;
+    return 0;
+#else
+    (void)fd;
+    *out_uid = (uid_t)-1;
+    *out_gid = (gid_t)-1;
+    return -ENOSYS;
+#endif
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -252,7 +282,9 @@ stm_status stm_proxy_9p_serve_client(int upstream_fd,
                                        size_t n_datasets_allowed,
                                        uid_t peer_uid, gid_t peer_gid,
                                        uint32_t msize_max,
-                                       uint32_t idle_timeout_ms)
+                                       uint32_t idle_timeout_ms,
+                                       bool coord_uid_check_enabled,
+                                       uid_t coord_uid)
 {
     (void)peer_uid;
     (void)peer_gid;
@@ -293,6 +325,43 @@ stm_status stm_proxy_9p_serve_client(int upstream_fd,
             coord_socket_path, -coord_fd);
         close(upstream_fd);
         return STM_EBACKEND;
+    }
+
+    /* TLY-A2-impl-3: downstream-side SO_PEERCRED check. Verifies
+     * the dialed coord socket's peer uid matches the operator-
+     * configured `coord_uid`. Defense against socket-bind
+     * impersonation: a malicious local user could pre-bind a fake
+     * socket at the configured coord path before the real coord
+     * starts. The platform peer-cred API is the same one used by
+     * the upstream accept loop (Linux SO_PEERCRED, BSD/macOS
+     * getpeereid). Fail-closed on resolution error (R95 P2-2
+     * doctrine carry). Skipped when not enabled — back-compat /
+     * test posture. */
+    if (coord_uid_check_enabled) {
+        uid_t got_uid = (uid_t)-1;
+        gid_t got_gid = (gid_t)-1;
+        int rc = peer_creds(coord_fd, &got_uid, &got_gid);
+        if (rc != 0) {
+            fprintf(stderr,
+                "stratumd: proxy: refusing coord conn — peer "
+                "credentials unavailable (errno=%d; "
+                "--coordinator-uid set but cannot verify)\n",
+                -rc);
+            close(coord_fd);
+            close(upstream_fd);
+            return STM_EBACKEND;
+        }
+        if (got_uid != coord_uid) {
+            fprintf(stderr,
+                "stratumd: proxy: refusing coord conn at %s — "
+                "peer uid %u does not match expected %u "
+                "(--coordinator-uid)\n",
+                coord_socket_path,
+                (unsigned)got_uid, (unsigned)coord_uid);
+            close(coord_fd);
+            close(upstream_fd);
+            return STM_EBACKEND;
+        }
     }
     if (idle_timeout_ms > 0u) {
         struct timeval tv;

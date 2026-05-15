@@ -223,8 +223,13 @@ static size_t build_tattach(uint8_t *out, size_t out_cap,
 
 STM_TEST(stratumd_user_policy_refuses_truncated_body_tattach)
 {
+    /* Use runner-uid keyed entry — TLY-A2-impl-3 added accept-time
+     * refusal of unknown uids, so a uid=0 entry would close the
+     * conn before the Tattach we're testing ever fires. */
+    char policy[64];
+    snprintf(policy, sizeof policy, "uid=%u:users/michael", (unsigned)getuid());
     udp_fixture f;
-    udp_fixture_init(&f, "p01_trunc", "uid=0:users/michael");
+    udp_fixture_init(&f, "p01_trunc", policy);
     int fd = dial_and_version(STM_9P_MSIZE_DEFAULT);
     STM_ASSERT(fd >= 0);
 
@@ -255,8 +260,10 @@ STM_TEST(stratumd_user_policy_refuses_truncated_body_tattach)
 
 STM_TEST(stratumd_user_policy_refuses_embedded_nul_aname)
 {
+    char policy[64];
+    snprintf(policy, sizeof policy, "uid=%u:users/michael", (unsigned)getuid());
     udp_fixture f;
-    udp_fixture_init(&f, "p02_nul", "uid=0:users/michael");
+    udp_fixture_init(&f, "p02_nul", policy);
     int fd = dial_and_version(STM_9P_MSIZE_DEFAULT);
     STM_ASSERT(fd >= 0);
 
@@ -287,8 +294,10 @@ STM_TEST(stratumd_user_policy_refuses_embedded_nul_aname)
 
 STM_TEST(stratumd_user_policy_refuses_slash_aname_under_catchall)
 {
+    char policy[64];
+    snprintf(policy, sizeof policy, "uid=%u:**", (unsigned)getuid());
     udp_fixture f;
-    udp_fixture_init(&f, "p11_slash", "uid=0:**");
+    udp_fixture_init(&f, "p11_slash", policy);
     int fd = dial_and_version(STM_9P_MSIZE_DEFAULT);
     STM_ASSERT(fd >= 0);
 
@@ -360,8 +369,10 @@ STM_TEST(stratumd_user_policy_refuses_non_nul_control_byte_aname)
      * catch-all `**` policy, a pre-R140 wrapper would forward to
      * the matcher, which would admit (matcher only refuses NUL
      * via strnlen). Post-R140: wrapper refuses with EACCES. */
+    char policy[64];
+    snprintf(policy, sizeof policy, "uid=%u:**", (unsigned)getuid());
     udp_fixture f;
-    udp_fixture_init(&f, "ctlbyte", "uid=0:**");
+    udp_fixture_init(&f, "ctlbyte", policy);
     int fd = dial_and_version(STM_9P_MSIZE_DEFAULT);
     STM_ASSERT(fd >= 0);
 
@@ -381,10 +392,38 @@ STM_TEST(stratumd_user_policy_refuses_non_nul_control_byte_aname)
     udp_fixture_teardown(&f);
 }
 
+/* ────────────────────────────────────────────────────────────────────── */
+/* TLY-A2-impl-3 — coord refuses unknown-uid at accept (not just Tattach). */
+/* ────────────────────────────────────────────────────────────────────── */
+
+STM_TEST(stratumd_user_policy_refuses_unknown_uid_at_accept)
+{
+    /* Policy entry for a uid that is NOT the test runner. The
+     * connecting peer's actual uid has no entry → accept-time
+     * refusal closes the conn BEFORE Tversion completes. The
+     * client's read returns EOF or RST. */
+    char policy[64];
+    /* Pick a uid we know is not the runner (UID_MAX-1; safe sentinel
+     * for the entry's keying — getuid() is always less). */
+    unsigned int other = ((unsigned int)getuid() == 12345u) ? 12346u : 12345u;
+    snprintf(policy, sizeof policy, "uid=%u:users/x", other);
+    udp_fixture f;
+    udp_fixture_init(&f, "unkuid", policy);
+
+    /* Try to dial + Tversion. Expect the conn to die before Rversion
+     * (server closes mid-handshake). dial_and_version returns -1. */
+    int fd = dial_and_version(STM_9P_MSIZE_DEFAULT);
+    STM_ASSERT_EQ(fd, -1);
+
+    udp_fixture_teardown(&f);
+}
+
 STM_TEST(stratumd_user_policy_refuses_mismatched_aname)
 {
+    char policy[64];
+    snprintf(policy, sizeof policy, "uid=%u:users/michael", (unsigned)getuid());
     udp_fixture f;
-    udp_fixture_init(&f, "refuse", "uid=0:users/michael");
+    udp_fixture_init(&f, "refuse", policy);
     int fd = dial_and_version(STM_9P_MSIZE_DEFAULT);
     STM_ASSERT(fd >= 0);
 

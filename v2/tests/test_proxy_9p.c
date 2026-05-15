@@ -246,6 +246,9 @@ typedef struct {
     const char         *coord_path;
     const char *const  *patterns;
     size_t              n_patterns;
+    /* TLY-A2-impl-3: optional downstream-side SO_PEERCRED check. */
+    bool                coord_uid_check_enabled;
+    uid_t               coord_uid;
     atomic_bool         stop_flag;
 } proxy_ctx;
 
@@ -268,7 +271,9 @@ static void *proxy_main(void *arg)
                                             /*peer_uid=*/(uid_t)getuid(),
                                             /*peer_gid=*/(gid_t)getgid(),
                                             STM_9P_MSIZE_DEFAULT,
-                                            /*idle_timeout_ms=*/0);
+                                            /*idle_timeout_ms=*/0,
+                                            p->coord_uid_check_enabled,
+                                            p->coord_uid);
     }
     return NULL;
 }
@@ -281,9 +286,28 @@ typedef struct {
     stm_fs       *fs;
 } bilateral_fixture;
 
+static void bilateral_init_with_uid_check(bilateral_fixture *f,
+                                              const char *tag,
+                                              const char *const *patterns,
+                                              size_t n_patterns,
+                                              bool coord_uid_check_enabled,
+                                              uid_t coord_uid);
+
 static void bilateral_init(bilateral_fixture *f, const char *tag,
                               const char *const *patterns,
                               size_t n_patterns)
+{
+    bilateral_init_with_uid_check(f, tag, patterns, n_patterns,
+                                       /*coord_uid_check_enabled=*/false,
+                                       /*coord_uid=*/(uid_t)-1);
+}
+
+static void bilateral_init_with_uid_check(bilateral_fixture *f,
+                                              const char *tag,
+                                              const char *const *patterns,
+                                              size_t n_patterns,
+                                              bool coord_uid_check_enabled,
+                                              uid_t coord_uid)
 {
     memset(f, 0, sizeof *f);
     make_tmp(tag);
@@ -307,6 +331,8 @@ static void bilateral_init(bilateral_fixture *f, const char *tag,
     f->pc.coord_path = g_coord_sock;
     f->pc.patterns   = patterns;
     f->pc.n_patterns = n_patterns;
+    f->pc.coord_uid_check_enabled = coord_uid_check_enabled;
+    f->pc.coord_uid               = coord_uid;
     atomic_init(&f->pc.stop_flag, false);
     pthread_create(&f->proxy_tid, NULL, proxy_main, &f->pc);
 }
@@ -469,6 +495,64 @@ STM_TEST(proxy_9p_e2e_empty_allowlist_admits_all_anames)
     }
 
     close(fd);
+    bilateral_teardown(&f);
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* TLY-A2-impl-3 — downstream-side SO_PEERCRED check.                     */
+/* ────────────────────────────────────────────────────────────────────── */
+
+STM_TEST(proxy_9p_e2e_coord_uid_match_admits)
+{
+    /* coord runs as the test runner's uid → match → proxy admits. */
+    const char *pats[] = { "users/michael", "users/michael/**" };
+    bilateral_fixture f;
+    bilateral_init_with_uid_check(&f, "uidmatch", pats, 2,
+                                       /*enabled=*/true,
+                                       /*coord_uid=*/(uid_t)getuid());
+
+    int fd = dial_proxy_version();
+    STM_ASSERT(fd >= 0);
+
+    const char *aname = "users/michael";
+    uint8_t frame[64];
+    size_t n = build_tattach(frame, sizeof frame,
+                                 (const uint8_t *)aname, strlen(aname));
+    STM_ASSERT(n > 0);
+
+    uint8_t type; uint32_t ecode;
+    STM_ASSERT_EQ(send_tattach_and_get_type(fd, frame, n, &type, &ecode), 0);
+    /* Same posture as the existing admit test: not-EACCES means
+     * the proxy forwarded after passing both the aname gate AND
+     * the coord-uid match. */
+    if (type == STM_9P_RLERROR) {
+        STM_ASSERT_NE((long long)ecode, 13LL);
+    }
+
+    close(fd);
+    bilateral_teardown(&f);
+}
+
+STM_TEST(proxy_9p_e2e_coord_uid_mismatch_refused)
+{
+    /* coord runs as the test runner's uid, but proxy expects a
+     * different uid. Proxy must refuse on dial; upstream sees the
+     * connection drop. dial_proxy_version reads back the proxy's
+     * Rversion — but here the proxy never even forwards Tversion
+     * because the coord-uid check fires immediately after dial,
+     * so dial_proxy_version sees EOF on its read. Returns -1. */
+    const char *pats[] = { "users/michael" };
+    /* Pick a uid we know is NOT the test runner. */
+    uid_t wrong = ((uid_t)getuid() == 12345u) ? (uid_t)12346u : (uid_t)12345u;
+
+    bilateral_fixture f;
+    bilateral_init_with_uid_check(&f, "uidmismatch", pats, 1,
+                                       /*enabled=*/true,
+                                       /*coord_uid=*/wrong);
+
+    int fd = dial_proxy_version();
+    STM_ASSERT_EQ(fd, -1);
+
     bilateral_teardown(&f);
 }
 

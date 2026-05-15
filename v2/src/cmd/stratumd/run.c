@@ -142,6 +142,13 @@ static void usage(const char *argv0)
             "                           Opt in to running --role client with no\n"
             "                           --datasets-allowed (open relay; tests +\n"
             "                           non-Thylacine deployments only).\n"
+        "  --coordinator-uid <N>    Verify the dialed coordinator socket's peer\n"
+            "                           uid equals N via SO_PEERCRED after\n"
+            "                           connect (TLY-A2-impl-3; client mode\n"
+            "                           only). Mismatch refuses the conn. Use\n"
+            "                           when the coord socket lives in a\n"
+            "                           shared-writable directory; prevents\n"
+            "                           socket-bind impersonation.\n"
         "  --user-policy uid=N:pat1,pat2,...\n"
             "                           Coordinator-side per-uid Tattach pattern\n"
             "                           policy (TLY-A2-impl-1, repeatable). When\n"
@@ -283,6 +290,21 @@ int stm_cmd_stratumd_main(int argc, char **argv)
         }
         if (!strcmp(a, "--allow-empty-datasets-allowed")) {
             allow_empty_datasets = true;
+            continue;
+        }
+        if (!strcmp(a, "--coordinator-uid") && i + 1 < argc) {
+            char *end = NULL;
+            unsigned long long v = strtoull(argv[++i], &end, 10);
+            if (!end || *end != '\0'
+                || v > (unsigned long long)((uid_t)-2)) {
+                fprintf(stderr,
+                    "stratumd: invalid --coordinator-uid: %s\n",
+                    argv[i]);
+                stm_ds_policy_table_close(&user_policy_table);
+                return 1;
+            }
+            opts.coordinator_uid = (uid_t)v;
+            opts.coordinator_uid_check_enabled = true;
             continue;
         }
         if (!strcmp(a, "--datasets-allowed") && i + 1 < argc) {

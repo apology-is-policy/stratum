@@ -103,6 +103,13 @@ extern "C" {
  *   close — pre-R140 dial was blocking with no timeout, hanging
  *   the worker if coord's accept loop was wedged). `0` = no bound
  *   (test posture).
+ * `coord_uid_check_enabled` / `coord_uid` — TLY-A2-impl-3: when
+ *   true, the proxy verifies the dialed coord socket's peer uid
+ *   equals `coord_uid` via SO_PEERCRED (or getpeereid() on BSD).
+ *   Mismatch → close + STM_EBACKEND. Defense against a malicious
+ *   local user binding a fake socket at the configured coord path
+ *   before the real coord starts. Default false = no check
+ *   (back-compat / tests).
  *
  * Returns STM_OK on clean disconnect (EOF on either side), non-OK
  * on framing / io / dial error. Always closes both fds before
@@ -115,7 +122,9 @@ stm_status stm_proxy_9p_serve_client(int upstream_fd,
                                        size_t n_datasets_allowed,
                                        uid_t peer_uid, gid_t peer_gid,
                                        uint32_t msize_max,
-                                       uint32_t idle_timeout_ms);
+                                       uint32_t idle_timeout_ms,
+                                       bool coord_uid_check_enabled,
+                                       uid_t coord_uid);
 
 /*
  * Test-only: parse a Tattach frame's `aname` field. On success,

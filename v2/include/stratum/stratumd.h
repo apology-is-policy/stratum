@@ -211,6 +211,20 @@ typedef struct stm_stratumd_opts {
     const char *const *datasets_allowed;
     size_t      n_datasets_allowed;
 
+    /* TLY-A2-impl-3: optional downstream-side SO_PEERCRED check.
+     * When `coordinator_uid_check_enabled` is true (default false
+     * for back-compat / tests), the proxy verifies the dialed
+     * coord socket's peer uid equals `coordinator_uid` after
+     * connect; mismatch → close + STM_EBACKEND. Useful when the
+     * coord socket path lives in a directory writable by multiple
+     * uids, where a malicious local user could pre-bind a fake
+     * socket at the configured path before the real coord starts.
+     * Composes against
+     * `v2/specs/multi_stratumd.tla::ClientCrashIsolation` (the
+     * downstream peer's identity is part of the per-client state). */
+    bool        coordinator_uid_check_enabled;
+    uid_t       coordinator_uid;
+
     /* TLY-A4: corvus SESSION_CLOSED notify consumer. When `corvus_user`
      * is non-NULL, stratumd spawns a consumer thread that subscribes
      * to `corvus_notify_socket` (default "/srv/corvus/notify") and

@@ -588,6 +588,29 @@ stm_status stm_stratumd_accept_loop(int listen_fd, stm_fs *fs,
             peer_gid = (gid_t)getgid();
         }
 
+        /* TLY-A2-impl-3: coordinator-side early refusal of
+         * unknown-uid clients. When `user_policy` is set AND the
+         * peer's uid has no entry in the table, refuse-at-accept
+         * with a stderr log; don't spawn a worker for a connection
+         * whose every Tattach will EACCES anyway. Per design §4:
+         * "the dialing client's uid MUST match a configured
+         * per-user-uid allow-list". uid 0 has no special bypass —
+         * the operator MUST add a `uid=0:...` entry explicitly for
+         * `stratumd-system`. NULL/empty policy → no gate (back-
+         * compat single-process). */
+        if (user_policy
+            && ((const stm_ds_policy_table *)user_policy)->n_entries > 0u
+            && stm_ds_policy_lookup(
+                    (const stm_ds_policy_table *)user_policy,
+                    peer_uid) == NULL) {
+            fprintf(stderr,
+                "stratumd: refusing connection at accept: "
+                "peer uid %u has no --user-policy entry\n",
+                (unsigned)peer_uid);
+            close(client_fd);
+            continue;
+        }
+
         /* SWISS-4g: spawn a worker pthread per connection. Required
          * because slate holds the FS connection long-term while a
          * panel is attached; without concurrent accept, every
@@ -641,6 +664,9 @@ typedef struct {
     gid_t        peer_gid;
     uint32_t     msize_max;
     uint32_t     idle_timeout_ms;
+    /* TLY-A2-impl-3: borrowed from stm_stratumd_opts. */
+    bool         coord_uid_check_enabled;
+    uid_t        coord_uid;
 } stratumd_proxy_worker_ctx;
 
 static void *stratumd_proxy_worker(void *arg)
@@ -662,7 +688,9 @@ static void *stratumd_proxy_worker(void *arg)
                                        ctx->n_datasets_allowed,
                                        ctx->peer_uid, ctx->peer_gid,
                                        ctx->msize_max,
-                                       ctx->idle_timeout_ms);
+                                       ctx->idle_timeout_ms,
+                                       ctx->coord_uid_check_enabled,
+                                       ctx->coord_uid);
     free(ctx);
     return NULL;
 }
@@ -679,7 +707,9 @@ static stm_status stratumd_accept_proxy_loop(int listen_fd,
                                                 uint32_t msize_max,
                                                 uint32_t idle_timeout_ms,
                                                 bool allow_unauthenticated_peer,
-                                                atomic_bool *stop_flag)
+                                                atomic_bool *stop_flag,
+                                                bool coord_uid_check_enabled,
+                                                uid_t coord_uid)
 {
     if (listen_fd < 0 || !coord_socket_path) return STM_EINVAL;
 
@@ -741,6 +771,8 @@ static stm_status stratumd_accept_proxy_loop(int listen_fd,
         ctx->peer_gid           = peer_gid;
         ctx->msize_max          = msize_max;
         ctx->idle_timeout_ms    = idle_timeout_ms;
+        ctx->coord_uid_check_enabled = coord_uid_check_enabled;
+        ctx->coord_uid          = coord_uid;
 
         pthread_t tid;
         int wprc = pthread_create(&tid, NULL, stratumd_proxy_worker, ctx);
@@ -1136,7 +1168,9 @@ static stm_status stratumd_run_client(const stm_stratumd_opts *opts)
                                                   msize_max,
                                                   opts->idle_timeout_ms,
                                                   opts->allow_unauthenticated_peer,
-                                                  opts->stop_flag);
+                                                  opts->stop_flag,
+                                                  opts->coordinator_uid_check_enabled,
+                                                  opts->coordinator_uid);
 
     close(listen_fd);
     (void)unlink(opts->socket_path);
