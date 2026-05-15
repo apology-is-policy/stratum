@@ -116,18 +116,31 @@ dataset-scope, not per-inode; see CLAUDE.md PARALLEL-3 impl-5 residual
 EX-takers list). They drain nothing (no extent-tree touch) and commit
 via the standard `stm_sync_commit` path so the flag bit is durable.
 
-## 6. /ctl/ kinds (TLY-A5-impl-1 + impl-2)
+## 6. /ctl/ kinds (TLY-A5-impl-1b + impl-2)
 
-Three new writable kinds, all admin-gated, inheriting the P9-CTL-1d
-writable-kind doctrine (admin gate at vops_lopen + defense-in-depth
-re-check at vops_write + zero-byte Twrite refusal + KIND_META mode
-bits + per-conn sessions die-with-conn):
+Three new writable kinds, all **dataset-level write-only files**
+(see refinement note below), inheriting the P9-CTL-1d writable-kind
+doctrine (admin gate at vops_lopen + defense-in-depth re-check at
+vops_write + zero-byte Twrite refusal + KIND_META mode bits +
+per-conn sessions die-with-conn):
 
 | Kind | Path | Body | Gate |
 |---|---|---|---|
-| `mark-compromised` | `/ctl/datasets/<id>/snapshots/<sid>/mark-compromised` | `<reason-text>` | admin **OR** corvus-admin-uid |
-| `unmark-compromised` | `/ctl/datasets/<id>/snapshots/<sid>/unmark-compromised` | `force` | admin only |
+| `mark-snapshot-compromised` | `/ctl/datasets/<id>/mark-snapshot-compromised` | `<sid>` or `<sid> <reason>` | admin **OR** corvus-admin-uid |
+| `unmark-snapshot-compromised` | `/ctl/datasets/<id>/unmark-snapshot-compromised` | `force <sid>` | admin only |
 | `rollback-snapshot` | `/ctl/datasets/<id>/rollback-snapshot` | `<sid>` or `force <sid>` | admin only |
+
+> **2026-05-15 impl-1b refinement.** An earlier draft put the verbs
+> under a per-snapshot directory
+> (`/ctl/datasets/<id>/snapshots/<sid>/mark-compromised`). But every
+> existing snapshot verb in `/ctl/` — `create-snapshot`,
+> `delete-snapshot`, `hold-snapshot`, `release-snapshot` — is a
+> dataset-level write-only file that takes the snap id in the body;
+> `/ctl/datasets/<id>/snapshots/<sid>` is a *leaf* info file, not a
+> directory. Making `<sid>` a directory would be a tree-shape change
+> against the grain of the whole surface. A5 uses the dataset-level
+> form — `mark-snapshot-compromised` clones the `hold-snapshot` kind
+> exactly. (`rollback-snapshot` was already dataset-level.)
 
 The existing `KIND_DATASET_SNAPSHOT_INFO` (kind 28, S5-PRE-C)
 materializer gains a `compromised: yes|no` line.
@@ -228,7 +241,9 @@ request.
 |---|---|
 | **TLY-A5-design** | This doc. |
 | **TLY-A5-spec** | `snapshot.tla` extension (§10) + buggy config. |
-| **TLY-A5-impl-1** | Marker: flag + `stm_snapshot_{mark,unmark}_compromised` + fs.c wrappers + `mark`/`unmark` `/ctl/` kinds + corvus-principal gate + info-kind line. |
+| **TLY-A5-impl-1a** ✓ (`2829c59`) | Marker C API: `STM_SNAP_FLAG_ROLLBACK_COMPROMISED` + `stm_snapshot_{mark,unmark}_compromised` + fs.c wrappers + unit tests. |
+| **TLY-A5-impl-1b** | `mark-snapshot-compromised` / `unmark-snapshot-compromised` dataset-level `/ctl/` kinds (clone `hold-snapshot`) + the `KIND_DATASET_SNAPSHOT_INFO` "compromised" line. |
+| **TLY-A5-impl-1c** | corvus-principal gate — `--corvus-admin-uid` CLI → `stm_ctl::corvus_admin_uid` → `mark-snapshot-compromised` admits that uid in addition to admin. |
 | **TLY-A5-impl-2** | `rollback-snapshot` `/ctl/` kind + consultation gate + `stm_fs_rollback_snapshot` stub + `STM_ECOMPROMISED` + TUI double-confirm. |
 | **TLY-A5-test** | Marker round-trip; mark/unmark gate; corvus-principal admit/refuse; consultation gate (marked-refused, force-allowed-reaches-stub); stub returns ENOTSUPPORTED. |
 | **TLY-A5-docs** | `OS-INTEGRATION.md` §8 + `reference/13-snapshot.md` + `reference/22-ctl.md` + CLAUDE.md /ctl/ row. |
