@@ -344,6 +344,17 @@ complementary gates:
 | TLY-A2-impl-3: bilateral SO_PEERCRED (accept-time + `--coordinator-uid`) | LIVE | `0c16d91` + R141 audit |
 | TLY-A2-impl-4: crash recovery sweep tests | LIVE | `test_multi_stratumd_crash.c` (3 scenarios) + R142 audit |
 | TLY-A2-impl-5: 72-hour stress | DEFERRED | GCP-gated; 4 clients concurrent for long-form sweep |
+| TLY-A3-impl-1: corvus UNWRAP codec + token loader | LIVE | `v2/src/corvus_client/` — pure codec (`1eb7480`) |
+| TLY-A3-impl-2: corvus UNWRAP transport + retry | LIVE | `stm_corvus_unwrap_once` + `stm_corvus_unwrap` (Q9 backoff); raw AF_UNIX (`58a7253`) |
+| TLY-A3-impl-3: mount-time UNWRAP data-flow + CLI | PENDING | needs per-dataset `{key_id, wrapped_dek}` storage decision first — see THYLACINE-V1-PLAN.md §5 |
+
+The corvus UNWRAP client (`v2/src/corvus_client/`) is a standalone
+library, NOT part of stratumd's transport, but is listed here because
+it is consumed by stratumd at mount time (TLY-A3-impl-3). Its
+audit-trigger surface is the "corvus UNWRAP client (v2)" row in
+CLAUDE.md's trigger list. A dedicated `reference/24-corvus_client.md`
+section folds in at TLY-A3-impl-3 close (when the module is as-built
+complete with the mount path wired).
 
 Audit class: changes to wire framing, peer-cred resolution, socket
 binding, the lifecycle ordering, or signal-mask discipline MUST be

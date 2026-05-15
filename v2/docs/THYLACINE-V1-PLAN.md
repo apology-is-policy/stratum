@@ -239,11 +239,12 @@ A new key-agent client library that speaks the corvus binary wire format. Wires 
 
 | Chunk | Deliverable |
 |---|---|
-| **TLY-A3-impl-1** | `libstratum-corvus.a` codec + token loader. Unit tests for frame encode/decode, bound checks, token loading. |
-| **TLY-A3-impl-2** | Mount-time integration. CLI args. Retry policy. Error matrix from ask §5.5. |
-| **TLY-A3-test** | 7 tests from ask §5.7 (faked corvus). |
-| **TLY-A3-docs** | Update `OS-INTEGRATION.md` §5 with the corvus integration path. |
-| **R144** | Audit. Categories: wire-format injection, session-token leak, DEK lifetime. |
+| **TLY-A3-impl-1** | ✓ `libstratum-corvus.a` codec + token loader. Unit tests for frame encode/decode, bound checks, token loading. (`1eb7480`) |
+| **TLY-A3-impl-2** | ✓ Transport (`stm_corvus_unwrap_once`) + retry policy (`stm_corvus_unwrap`, Q9 backoff schedule). Error matrix from ask §5.5. Fake-corvus pthread harness, 13 transport/retry tests. (`58a7253`) |
+| **TLY-A3-impl-3** | **Mount-time integration + CLI args.** Re-scoped out of impl-2 — the §5.3 data-flow ("`stm_fs_mount` consults a per-dataset wrapped-DEK blob → UNWRAP → DEK feeds AEAD") needs a prerequisite that does NOT yet exist: a place to store the per-dataset `{key_id, wrapped_dek}`. Stratum's current encryption derives DEKs from a master key + dataset_id; there is no per-dataset wrapped-DEK store. impl-3 must FIRST make a design micro-decision (corvus-style keyfile variant vs new dataset-metadata field), THEN wire the mount path + CLI args (`--corvus-socket`, `--corvus-session-token-file`). |
+| **TLY-A3-test** | 7 tests from ask §5.7 (faked corvus) — happy path / wrong-user / bad-token / offline / restart / wire-edge / large-blob. Folds into impl-3 (needs the mount path). The transport/retry layer's 13 tests already cover the wire-format-edge + offline + restart classes at the primitive level. |
+| **TLY-A3-docs** | Update `OS-INTEGRATION.md` §5 with the corvus integration path. Folds into impl-3. |
+| **R144** | Audit. Categories: wire-format injection, session-token leak, DEK lifetime. Scopes impl-1 + impl-2 (codec + transport); re-runs against impl-3 when the mount path lands. |
 
 ### Spec-first verdict
 
